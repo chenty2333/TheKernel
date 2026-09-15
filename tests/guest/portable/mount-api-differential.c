@@ -112,6 +112,96 @@ _Static_assert(sizeof(struct statmount) == 512, "statmount prefix is 512 bytes")
 #define Q_XGETNEXTQUOTA 0x5809U
 #define USRQUOTA 0
 #define QFMT_VFS_V1 4
+#define NR_MOUNT 165
+#define MS_REMOUNT 32U
+/* include/uapi/linux/quota.h:88-93 and include/uapi/linux/dqblk_xfs.h:9-23
+ * selectors; the VFS translates them one for one in copy_from_xfs_dqblk()
+ * (fs/quota/quota.c:566-591). */
+#define QIF_BLIMITS 0x1U
+#define QIF_ILIMITS 0x4U
+#define FS_DQ_ISOFT (1U << 0)
+#define FS_DQ_IHARD (1U << 1)
+#define FS_DQ_BSOFT (1U << 2)
+#define FS_DQ_BHARD (1U << 3)
+#define FS_DQ_RTBSOFT (1U << 4)
+#define FS_DQ_RTBHARD (1U << 5)
+#define FS_DQ_BTIMER (1U << 6)
+#define FS_DQ_ITIMER (1U << 7)
+#define FS_DQ_RTBTIMER (1U << 8)
+#define FS_DQ_BWARNS (1U << 9)
+#define FS_DQ_IWARNS (1U << 10)
+#define FS_DQ_RTBWARNS (1U << 11)
+#define FS_DQ_BCOUNT (1U << 12)
+#define FS_DQ_ICOUNT (1U << 13)
+#define FS_DQ_RTBCOUNT (1U << 14)
+#define FS_DQ_BIGTIME (1U << 15)
+/* The identifier space is searchable only once a record exists in the quota
+ * file's tree, so the fixtures below use this one identifier. */
+#define QUOTA_ID 1000U
+/* struct if_dqblk, struct if_dqinfo and struct if_nextdqblk
+ * (include/uapi/linux/quota.h:25-70) and struct fs_disk_quota
+ * (include/uapi/linux/dqblk_xfs.h:28-70); the syscall copies whichever view the
+ * command selects, with no translation of the caller's layout. */
+struct if_dqblk {
+    uint64_t dqb_bhardlimit;
+    uint64_t dqb_bsoftlimit;
+    uint64_t dqb_curspace;
+    uint64_t dqb_ihardlimit;
+    uint64_t dqb_isoftlimit;
+    uint64_t dqb_curinodes;
+    uint64_t dqb_btime;
+    uint64_t dqb_itime;
+    uint32_t dqb_valid;
+    uint32_t dqb_pad;
+};
+struct if_dqinfo {
+    uint64_t dqi_bgrace;
+    uint64_t dqi_igrace;
+    uint32_t dqi_flags;
+    uint32_t dqi_valid;
+};
+struct if_nextdqblk {
+    uint64_t dqb_bhardlimit;
+    uint64_t dqb_bsoftlimit;
+    uint64_t dqb_curspace;
+    uint64_t dqb_ihardlimit;
+    uint64_t dqb_isoftlimit;
+    uint64_t dqb_curinodes;
+    uint64_t dqb_btime;
+    uint64_t dqb_itime;
+    uint32_t dqb_valid;
+    uint32_t dqb_id;
+};
+struct fs_disk_quota {
+    int8_t d_version;
+    int8_t d_flags;
+    uint16_t d_fieldmask;
+    uint32_t d_id;
+    uint64_t d_blk_hardlimit;
+    uint64_t d_blk_softlimit;
+    uint64_t d_ino_hardlimit;
+    uint64_t d_ino_softlimit;
+    uint64_t d_bcount;
+    uint64_t d_icount;
+    int32_t d_itimer;
+    int32_t d_btimer;
+    uint16_t d_iwarns;
+    uint16_t d_bwarns;
+    int8_t d_itimer_hi;
+    int8_t d_btimer_hi;
+    int8_t d_rtbtimer_hi;
+    int8_t d_padding2;
+    uint64_t d_rtb_hardlimit;
+    uint64_t d_rtb_softlimit;
+    uint64_t d_rtbcount;
+    int32_t d_rtbtimer;
+    uint16_t d_rtbwarns;
+    int16_t d_padding3;
+    int8_t d_padding4[8];
+};
+_Static_assert(sizeof(struct if_dqblk) == 72 && sizeof(struct if_dqinfo) == 24 &&
+                   sizeof(struct if_nextdqblk) == 72 && sizeof(struct fs_disk_quota) == 112,
+               "quota UAPI structures must match the native layouts");
 #define FAN_CLOEXEC 0x1U
 #define FAN_CLASS_NOTIF 0U
 #define FAN_CLASS_CONTENT 0x4U
@@ -256,6 +346,37 @@ static void body_quota_xgetqstat(void) {
 static int unprivileged_errno(void (*body)(void)) {
     int reported = unprivileged_child(body);
     return reported < 0 ? -reported : 0;
+}
+
+/* The smallest QFMT_VFS_V1 quota file both providers accept: the v2 header
+ * (magic and version at 0), the info block with dqi_blocks = 2, and the empty
+ * root pointer block behind it (fs/quota/quotaio_v2.h:12-40,
+ * fs/quota/quota_v2.c:96-160).  The reference provider validates exactly this
+ * shape in v2_check_quota_file()/v2_read_file_info() before it enables the
+ * type, and the same header carries the grace periods Q_GETINFO reports.
+ *
+ * The second block must be zero: it is the trie root whose entries are block
+ * references, and every reference is range-checked against
+ * `[QT_TREEOFF, dqi_blocks - 1]` before it is followed
+ * (fs/quota/quota_tree.c:80-88), so a stray value there makes
+ * dquot_acquire()-time tree insertion fail with EUCLEAN. */
+static int write_quota_file(const char *path) {
+    uint8_t block[1024];
+    /* magic, version, dqi_bgrace, dqi_igrace, dqi_flags, dqi_blocks. */
+    const uint32_t header[6] = { 0xd9c01f11U, 1U, 604800U, 604800U, 0U, 2U };
+    memset(block, 0, sizeof(block));
+    memcpy(block, header, sizeof(header));
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    ssize_t first = write(fd, block, sizeof(block));
+    memset(block, 0, sizeof(block));
+    ssize_t second = write(fd, block, sizeof(block));
+    if (close(fd) != 0) {
+        return -1;
+    }
+    return first == (ssize_t)sizeof(block) && second == (ssize_t)sizeof(block) ? 0 : -1;
 }
 
 int main(void) {
@@ -444,6 +565,167 @@ int main(void) {
     check(syscall(NR_QUOTACTL, QCMD(Q_SYNC, USRQUOTA), NULL, 0, NULL) == 0, "sync-all");
     check(syscall(NR_QUOTACTL, QCMD(Q_SYNC, 1), NULL, 0, NULL) == 0, "sync-all-group");
     mark("SYNC_ALL_WITHOUT_SPECIAL");
+
+    /* Every remaining property of the quota provider is only observable on an
+     * active type, so enable one and put it back afterwards: the reference
+     * provider refuses Q_QUOTAON on a filesystem which was not mounted with
+     * `usrquota` (ext4_quota_on() -> test_opt(sb, QUOTA) -> -EINVAL), which is
+     * why the already-mounted root is reconfigured first.  That call's own
+     * result is deliberately not compared: TheKernel's provider has no such
+     * mount-option gate, so only the active state it produces is shared. */
+    char quota_file[sizeof(dir) + 16];
+    check(snprintf(quota_file, sizeof(quota_file), "%s/aquota.user", dir) > 0, "quota-path");
+    check(write_quota_file(quota_file) == 0, "quota-file");
+    (void)syscall(NR_MOUNT, "none", "/", NULL, MS_REMOUNT, "usrquota");
+    check(syscall(NR_QUOTACTL, QCMD(Q_QUOTAON, USRQUOTA), "/dev/vda", QFMT_VFS_V1, quota_file) == 0,
+          "quotaon");
+    format = 0;
+    check(syscall(NR_QUOTACTL, QCMD(Q_GETFMT, USRQUOTA), "/dev/vda", 0, &format) == 0 &&
+              format == QFMT_VFS_V1,
+          "getfmt-active");
+    mark("QUOTA_TYPE_ACTIVATION");
+
+    struct fs_disk_quota xdq;
+    struct if_dqblk idq;
+    struct if_nextdqblk next;
+    /* struct fs_disk_quota counts 512-byte basic blocks, struct if_dqblk
+     * counts 1024-byte quota blocks, and the provider holds bytes:
+     * quota_bbtob()/quota_btobb() and qbtos()/stoqb() are the two views of one
+     * limit (fs/quota/quota.c:177-185, :529-537).  A one-block limit is the
+     * value a lossy conversion turns into "no limit". */
+    memset(&xdq, 0, sizeof(xdq));
+    xdq.d_version = 1;
+    xdq.d_fieldmask = FS_DQ_BHARD | FS_DQ_IHARD;
+    xdq.d_blk_hardlimit = 1;
+    xdq.d_ino_hardlimit = 10;
+    check(syscall(NR_QUOTACTL, QCMD(Q_XSETQLIM, USRQUOTA), "/dev/vda", QUOTA_ID, &xdq) == 0,
+          "xsetqlim");
+    memset(&xdq, 0, sizeof(xdq));
+    check(syscall(NR_QUOTACTL, QCMD(Q_XGETQUOTA, USRQUOTA), "/dev/vda", QUOTA_ID, &xdq) == 0 &&
+              xdq.d_id == QUOTA_ID && xdq.d_blk_hardlimit == 1 && xdq.d_ino_hardlimit == 10,
+          "xgetquota-one-block");
+    memset(&idq, 0, sizeof(idq));
+    check(syscall(NR_QUOTACTL, QCMD(Q_GETQUOTA, USRQUOTA), "/dev/vda", QUOTA_ID, &idq) == 0 &&
+              idq.dqb_bhardlimit == 1 && idq.dqb_ihardlimit == 10,
+          "getquota-one-block");
+    /* Three 1024-byte quota blocks are six 512-byte basic blocks. */
+    memset(&idq, 0, sizeof(idq));
+    idq.dqb_valid = QIF_BLIMITS;
+    idq.dqb_bhardlimit = 3;
+    check(syscall(NR_QUOTACTL, QCMD(Q_SETQUOTA, USRQUOTA), "/dev/vda", QUOTA_ID, &idq) == 0,
+          "setquota-blocks");
+    memset(&xdq, 0, sizeof(xdq));
+    check(syscall(NR_QUOTACTL, QCMD(Q_XGETQUOTA, USRQUOTA), "/dev/vda", QUOTA_ID, &xdq) == 0 &&
+              xdq.d_blk_hardlimit == 6,
+          "xgetquota-setquota-blocks");
+    mark("QUOTA_LIMIT_UNITS");
+
+    /* find_next_id() starts at `__get_index(info, *id, depth)`, which is `*id`
+     * itself at the root of the tree, so the search is `>= id`
+     * (fs/quota/quota_tree.c:792-844) as both UAPIs document it
+     * (include/uapi/linux/quota.h:70-74, include/uapi/linux/dqblk_xfs.h:41-44). */
+    memset(&xdq, 0, sizeof(xdq));
+    check(syscall(NR_QUOTACTL, QCMD(Q_XGETNEXTQUOTA, USRQUOTA), "/dev/vda", QUOTA_ID, &xdq) == 0 &&
+              xdq.d_id == QUOTA_ID,
+          "xgetnextquota-at-id");
+    memset(&next, 0, sizeof(next));
+    check(syscall(NR_QUOTACTL, QCMD(Q_GETNEXTQUOTA, USRQUOTA), "/dev/vda", QUOTA_ID, &next) == 0 &&
+              next.dqb_id == QUOTA_ID,
+          "getnextquota-at-id");
+    memset(&xdq, 0, sizeof(xdq));
+    check(syscall(NR_QUOTACTL, QCMD(Q_XGETNEXTQUOTA, USRQUOTA), "/dev/vda", QUOTA_ID - 1, &xdq) == 0 &&
+              xdq.d_id == QUOTA_ID,
+          "xgetnextquota-below-id");
+    mark("QUOTA_NEXT_ID_INCLUSIVE");
+
+    /* An identifier of 0 which selects a grace period or a warning count is
+     * the superblock-wide default, so it goes to ->set_info() and is stripped
+     * from the field mask before the dquot is touched
+     * (fs/quota/quota.c:632-668); the ID-0 dquot's own timer stays untouched. */
+    struct if_dqinfo info;
+    memset(&xdq, 0, sizeof(xdq));
+    xdq.d_version = 1;
+    xdq.d_fieldmask = FS_DQ_BTIMER;
+    xdq.d_btimer = 4242;
+    check(syscall(NR_QUOTACTL, QCMD(Q_XSETQLIM, USRQUOTA), "/dev/vda", 0, &xdq) == 0,
+          "xsetqlim-id0-timer");
+    memset(&info, 0, sizeof(info));
+    check(syscall(NR_QUOTACTL, QCMD(Q_GETINFO, USRQUOTA), "/dev/vda", 0, &info) == 0 &&
+              info.dqi_bgrace == 4242,
+          "getinfo-grace");
+    memset(&idq, 0, sizeof(idq));
+    check(syscall(NR_QUOTACTL, QCMD(Q_GETQUOTA, USRQUOTA), "/dev/vda", 0, &idq) == 0 &&
+              idq.dqb_btime == 0,
+          "getquota-id0-btime");
+    mark("QUOTA_ID_ZERO_INFO_ROUTING");
+
+    /* The warning counts and the realtime timer have no superblock-wide
+     * default, so dquot_set_dqinfo() rejects the same shape with EINVAL
+     * (fs/quota/dquot.c:2893-2897); for any other identifier the selectors
+     * outside VFS_QC_MASK are EINVAL in do_set_dqblk()
+     * (fs/quota/dquot.c:2740-2753). */
+    memset(&xdq, 0, sizeof(xdq));
+    xdq.d_version = 1;
+    xdq.d_fieldmask = FS_DQ_BWARNS;
+    xdq.d_bwarns = 7;
+    ERROR(syscall(NR_QUOTACTL, QCMD(Q_XSETQLIM, USRQUOTA), "/dev/vda", 0, &xdq), EINVAL,
+          "id0-warns");
+    memset(&xdq, 0, sizeof(xdq));
+    xdq.d_version = 1;
+    xdq.d_fieldmask = FS_DQ_RTBTIMER;
+    xdq.d_rtbtimer = 11;
+    ERROR(syscall(NR_QUOTACTL, QCMD(Q_XSETQLIM, USRQUOTA), "/dev/vda", 0, &xdq), EINVAL,
+          "id0-realtime-timer");
+    memset(&xdq, 0, sizeof(xdq));
+    xdq.d_version = 1;
+    xdq.d_fieldmask = FS_DQ_BWARNS;
+    xdq.d_bwarns = 7;
+    ERROR(syscall(NR_QUOTACTL, QCMD(Q_XSETQLIM, USRQUOTA), "/dev/vda", QUOTA_ID, &xdq), EINVAL,
+          "warns");
+    memset(&xdq, 0, sizeof(xdq));
+    xdq.d_version = 1;
+    xdq.d_fieldmask = FS_DQ_RTBHARD;
+    xdq.d_rtb_hardlimit = 5;
+    ERROR(syscall(NR_QUOTACTL, QCMD(Q_XSETQLIM, USRQUOTA), "/dev/vda", QUOTA_ID, &xdq), EINVAL,
+          "realtime-blocks");
+    mark("QUOTA_UNHANDLED_SELECTORS_EINVAL");
+
+    /* A selected limit above the format's maximum is ERANGE before anything is
+     * stored (fs/quota/dquot.c:2757-2763); QFMT_VFS_V1 installs 2^63-1 as both
+     * ceilings (fs/quota/quota_v2.c:140-141), so its neighbour is accepted. */
+    memset(&idq, 0, sizeof(idq));
+    idq.dqb_valid = QIF_ILIMITS;
+    idq.dqb_ihardlimit = 0x8000000000000000ULL;
+    ERROR(syscall(NR_QUOTACTL, QCMD(Q_SETQUOTA, USRQUOTA), "/dev/vda", 2000, &idq), ERANGE,
+          "setquota-over-max");
+    memset(&xdq, 0, sizeof(xdq));
+    xdq.d_version = 1;
+    xdq.d_fieldmask = FS_DQ_IHARD;
+    xdq.d_ino_hardlimit = 0x8000000000000000ULL;
+    ERROR(syscall(NR_QUOTACTL, QCMD(Q_XSETQLIM, USRQUOTA), "/dev/vda", 2000, &xdq), ERANGE,
+          "xsetqlim-over-max");
+    memset(&idq, 0, sizeof(idq));
+    idq.dqb_valid = QIF_ILIMITS;
+    idq.dqb_ihardlimit = 0x7fffffffffffffffULL;
+    check(syscall(NR_QUOTACTL, QCMD(Q_SETQUOTA, USRQUOTA), "/dev/vda", 2000, &idq) == 0,
+          "setquota-at-max");
+    memset(&idq, 0, sizeof(idq));
+    check(syscall(NR_QUOTACTL, QCMD(Q_GETQUOTA, USRQUOTA), "/dev/vda", 2000, &idq) == 0 &&
+              idq.dqb_ihardlimit == 0x7fffffffffffffffULL,
+          "getquota-at-max");
+    mark("QUOTA_OVER_MAXIMUM_ERANGE");
+
+    /* dquot_disable() drops the active state, so Q_GETFMT reports ESRCH again
+     * and the cases below see the same inactive provider the registered
+     * assertions were written against. */
+    check(syscall(NR_QUOTACTL, QCMD(Q_QUOTAOFF, USRQUOTA), "/dev/vda", 0, NULL) == 0, "quotaoff");
+    format = 0;
+    ERROR(syscall(NR_QUOTACTL, QCMD(Q_GETFMT, USRQUOTA), "/dev/vda", 0, &format), ESRCH,
+          "getfmt-inactive");
+    /* The quota file lives in the shared scratch directory every case uses, so
+     * it has to be gone by the time the last case removes that directory. */
+    check(unlink(quota_file) == 0, "quota-file-unlink");
+    mark("QUOTA_TYPE_DEACTIVATION");
     done();
 
     /* 443: SYSCALL_DEFINE4(quotactl_fd) reads the descriptor first, then the

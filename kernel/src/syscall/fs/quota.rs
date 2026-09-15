@@ -84,6 +84,11 @@ const FS_QSTAT_VERSION: i8 = 1;
 // `quota_btobb()`/`quota_bbtob()`: fs_disk_quota counts 512-byte basic blocks
 // while the VFS quota structures count bytes (fs/quota/quota.c:522-532).
 const XFS_BB_SHIFT: u32 = 9;
+// `QIF_DQBLKSIZE_BITS` / `QIF_DQBLKSIZE` (include/uapi/linux/quota.h:84-85):
+// `struct if_dqblk` counts 1024-byte quota blocks where `qc_dqblk` and the
+// quota file both count bytes.
+const QIF_DQBLKSIZE_BITS: u32 = 10;
+const QIF_DQBLKSIZE: u64 = 1 << QIF_DQBLKSIZE_BITS;
 const QFMT_VFS_V1: u32 = 4;
 const QFMT_VFS_OLD: u32 = 1;
 const QIF_BLIMITS: u32 = 1;
@@ -95,6 +100,61 @@ const QIF_ITIME: u32 = 32;
 const QIF_BGRACE: u32 = 1;
 const QIF_IGRACE: u32 = 2;
 const QIF_FLAGS: u32 = 4;
+// The kernel-internal `QC_*` field specifiers both wire protocols translate
+// into (include/linux/quota.h:369-389).  These are the bits `do_set_dqblk()`
+// and `dquot_set_dqinfo()` actually test.
+const QC_INO_SOFT: u32 = 1 << 0;
+const QC_INO_HARD: u32 = 1 << 1;
+const QC_SPC_SOFT: u32 = 1 << 2;
+const QC_SPC_HARD: u32 = 1 << 3;
+const QC_RT_SPC_SOFT: u32 = 1 << 4;
+const QC_RT_SPC_HARD: u32 = 1 << 5;
+const QC_SPC_TIMER: u32 = 1 << 6;
+const QC_INO_TIMER: u32 = 1 << 7;
+const QC_RT_SPC_TIMER: u32 = 1 << 8;
+const QC_SPC_WARNS: u32 = 1 << 9;
+const QC_INO_WARNS: u32 = 1 << 10;
+const QC_RT_SPC_WARNS: u32 = 1 << 11;
+const QC_SPACE: u32 = 1 << 12;
+const QC_INO_COUNT: u32 = 1 << 13;
+const QC_RT_SPACE: u32 = 1 << 14;
+const QC_FLAGS: u32 = 1 << 15;
+const QC_WARNS_MASK: u32 = QC_SPC_WARNS | QC_INO_WARNS | QC_RT_SPC_WARNS;
+/// `VFS_QC_MASK` (fs/quota/dquot.c:2740-2743): every selector the generic
+/// dquot provider accepts.
+const VFS_QC_MASK: u32 = QC_SPACE
+    | QC_SPC_SOFT
+    | QC_SPC_HARD
+    | QC_INO_COUNT
+    | QC_INO_SOFT
+    | QC_INO_HARD
+    | QC_SPC_TIMER
+    | QC_INO_TIMER;
+/// `FS_DQ_WARNS_MASK` / `FS_DQ_TIMER_MASK`
+/// (include/uapi/linux/dqblk_xfs.h:108-113): the two groups
+/// `quota_setxquota()` diverts to `->set_info()` for the superuser dquot.
+const FS_DQ_TIMER_MASK: u32 = FS_DQ_BTIMER | FS_DQ_ITIMER | FS_DQ_RTBTIMER;
+const FS_DQ_WARNS_MASK: u32 = FS_DQ_BWARNS | FS_DQ_IWARNS | FS_DQ_RTBWARNS;
+/// `copy_from_xfs_dqblk()`'s selector table, in the order that function tests
+/// them (fs/quota/quota.c:571-597).  `FS_DQ_BIGTIME` is deliberately absent:
+/// it is a timer-width flag, not a field selector, so it selects nothing.
+const XFS_QC_SELECTORS: [(u32, u32); 15] = [
+    (FS_DQ_ISOFT, QC_INO_SOFT),
+    (FS_DQ_IHARD, QC_INO_HARD),
+    (FS_DQ_BSOFT, QC_SPC_SOFT),
+    (FS_DQ_BHARD, QC_SPC_HARD),
+    (FS_DQ_RTBSOFT, QC_RT_SPC_SOFT),
+    (FS_DQ_RTBHARD, QC_RT_SPC_HARD),
+    (FS_DQ_BTIMER, QC_SPC_TIMER),
+    (FS_DQ_ITIMER, QC_INO_TIMER),
+    (FS_DQ_RTBTIMER, QC_RT_SPC_TIMER),
+    (FS_DQ_BWARNS, QC_SPC_WARNS),
+    (FS_DQ_IWARNS, QC_INO_WARNS),
+    (FS_DQ_RTBWARNS, QC_RT_SPC_WARNS),
+    (FS_DQ_BCOUNT, QC_SPACE),
+    (FS_DQ_ICOUNT, QC_INO_COUNT),
+    (FS_DQ_RTBCOUNT, QC_RT_SPACE),
+];
 const DQBLK_VALID_MASK: u32 =
     QIF_BLIMITS | QIF_SPACE | QIF_ILIMITS | QIF_INODES | QIF_BTIME | QIF_ITIME;
 const DQINFO_VALID_MASK: u32 = QIF_BGRACE | QIF_IGRACE | QIF_FLAGS;
@@ -343,8 +403,19 @@ fn encode_state(data: &QuotaData, ty: usize) -> AxResult<Vec<u8>> {
         put64(&mut bytes, off + V2_LEAF_HEAD + 8, record.ihardlimit);
         put64(&mut bytes, off + V2_LEAF_HEAD + 16, record.isoftlimit);
         put64(&mut bytes, off + V2_LEAF_HEAD + 24, record.curinodes);
-        put64(&mut bytes, off + V2_LEAF_HEAD + 32, record.bhardlimit);
-        put64(&mut bytes, off + V2_LEAF_HEAD + 40, record.bsoftlimit);
+        // `v2r1_mem2diskdqb()` stores the byte limits as whole QUOTABLOCK
+        // (1024-byte) counts and everything else verbatim
+        // (fs/quota/quota_v2.c:302-321); `v2_stoqb()` is `stoqb()`.
+        put64(
+            &mut bytes,
+            off + V2_LEAF_HEAD + 32,
+            stoqb(record.bhardlimit),
+        );
+        put64(
+            &mut bytes,
+            off + V2_LEAF_HEAD + 40,
+            stoqb(record.bsoftlimit),
+        );
         put64(&mut bytes, off + V2_LEAF_HEAD + 48, record.curspace);
         put64(&mut bytes, off + V2_LEAF_HEAD + 56, record.btime);
         put64(&mut bytes, off + V2_LEAF_HEAD + 64, record.itime);
@@ -380,8 +451,15 @@ fn encode_v1(data: &QuotaData, ty: usize) -> AxResult<Vec<u8>> {
     );
     for (&(_, id), r) in data.records.range((ty as u8, 0)..=(ty as u8, u32::MAX)) {
         let o = id as usize * 32;
-        put32(&mut bytes, o, r.bhardlimit.min(u32::MAX as u64) as u32);
-        put32(&mut bytes, o + 4, r.bsoftlimit.min(u32::MAX as u64) as u32);
+        // `v1_mem2diskdqblk()` stores the byte limits as whole QUOTABLOCK
+        // counts and the usage as a QUOTABLOCK count of `dqb_curspace`
+        // (fs/quota/quota_v1.c:44-57).
+        put32(&mut bytes, o, stoqb(r.bhardlimit).min(u32::MAX as u64) as u32);
+        put32(
+            &mut bytes,
+            o + 4,
+            stoqb(r.bsoftlimit).min(u32::MAX as u64) as u32,
+        );
         put32(
             &mut bytes,
             o + 8,
@@ -489,8 +567,11 @@ fn decode_state(bytes: &[u8], data: &mut QuotaData, ty: usize) -> AxResult<()> {
                                 ihardlimit: get64(bytes, e + 8)?,
                                 isoftlimit: get64(bytes, e + 16)?,
                                 curinodes: get64(bytes, e + 24)?,
-                                bhardlimit: get64(bytes, e + 32)?,
-                                bsoftlimit: get64(bytes, e + 40)?,
+                                // `v2r1_disk2memdqb()` expands the QUOTABLOCK
+                                // counts back into bytes
+                                // (fs/quota/quota_v2.c:281-300).
+                                bhardlimit: qbtos(get64(bytes, e + 32)?),
+                                bsoftlimit: qbtos(get64(bytes, e + 40)?),
                                 curspace: get64(bytes, e + 48)?,
                                 btime: get64(bytes, e + 56)?,
                                 itime: get64(bytes, e + 64)?,
@@ -519,8 +600,10 @@ fn decode_v1(bytes: &[u8], data: &mut QuotaData, ty: usize) -> AxResult<()> {
     for id in 0..bytes.len() / 32 {
         let o = id * 32;
         let r = IfDqblk {
-            bhardlimit: get32(bytes, o)? as u64,
-            bsoftlimit: get32(bytes, o + 4)? as u64,
+            // `v1_disk2memdqblk()`: `dqb_bhardlimit = v1_qbtos(...)`
+            // (fs/quota/quota_v1.c:34-43).
+            bhardlimit: qbtos(get32(bytes, o)? as u64),
+            bsoftlimit: qbtos(get32(bytes, o + 4)? as u64),
             curspace: (get32(bytes, o + 8)? as u64) * 1024,
             ihardlimit: get32(bytes, o + 12)? as u64,
             isoftlimit: get32(bytes, o + 16)? as u64,
@@ -600,6 +683,20 @@ fn merge_record(old: &mut IfDqblk, new: IfDqblk) {
         old.itime = new.itime;
     }
     old.valid |= valid;
+}
+/// `qtree_get_next_id()` (fs/quota/quota_tree.c:792-844) for a live snapshot:
+/// the smallest identifier the type has a record for at or after `id`, with
+/// that record.  `find_next_id()` starts at `__get_index(info, *id, depth)`,
+/// which is `*id` itself, so the search is inclusive -- the uapi comment on
+/// both `Q_GETNEXTQUOTA` and `Q_XGETNEXTQUOTA` reads "get disk limits and
+/// usage >= ID" (include/uapi/linux/quota.h:70-74,
+/// include/uapi/linux/dqblk_xfs.h:41-44).  Running out of the tree is ENOENT.
+fn next_quota_record(data: &QuotaData, ty: usize, id: u32) -> AxResult<(u32, IfDqblk)> {
+    data.records
+        .range((ty as u8, id)..)
+        .find(|((kind, _), _)| *kind == ty as u8)
+        .map(|(&(_, next), record)| (next, *record))
+        .ok_or_else(|| LinuxError::ENOENT.into())
 }
 fn merge_info(old: &mut IfDqinfo, new: IfDqinfo) {
     let valid = new.valid;
@@ -754,11 +851,12 @@ fn limit_reached(record: &mut IfDqblk, info: IfDqinfo, space: i128, inodes: i128
         return Err(AxError::BadState);
     }
     let check = |next: u64, hard: u64, soft: u64, time: &mut u64, grace: u64| -> AxResult<()> {
-        // VFS v1 limits are expressed in KiB while curspace is bytes.
-        if hard != 0 && next > hard.saturating_mul(1024) {
+        // `mem_dqblk` counts bytes (`qsize_t`), so a limit and the usage it
+        // bounds are directly comparable.
+        if hard != 0 && next > hard {
             return Err(LinuxError::EDQUOT.into());
         }
-        if soft != 0 && next > soft.saturating_mul(1024) {
+        if soft != 0 && next > soft {
             if *time == 0 {
                 *time = now.saturating_add(grace);
             } else if now >= *time {
@@ -991,16 +1089,97 @@ const fn xfs_blocks_from_bytes(bytes: u64) -> u64 {
 const fn xfs_bytes_from_blocks(blocks: u64) -> u64 {
     blocks << XFS_BB_SHIFT
 }
-/// `copy_to_if_dqblk()` (fs/quota/quota.c) reports the VFS quota block limits
-/// in KiB while `fs_disk_quota` carries 512-byte blocks, so the wire form of a
-/// KiB limit is exactly twice its value.
-const fn if_dqblk_limit_to_xfs(kib: u64) -> u64 {
-    kib * 2
+/// `stoqb()` (fs/quota/quota.c:182-185): bytes as whole 1024-byte quota
+/// blocks, rounding up.  Linux's `space + QIF_DQBLKSIZE - 1` can only wrap for
+/// a limit which `do_set_dqblk()`'s ERANGE check already rejected, so the
+/// round-up form is exact everywhere it is reachable.
+const fn stoqb(bytes: u64) -> u64 {
+    (bytes + QIF_DQBLKSIZE - 1) >> QIF_DQBLKSIZE_BITS
 }
-/// `copy_from_if_dqblk()`: `d_spc_hardlimit = (u64)dqb_bhardlimit << 10`, which
-/// `copy_to_if_dqblk()` reverses with a truncating `/ 1024`.
-const fn xfs_limit_to_if_dqblk(blocks: u64) -> u64 {
-    xfs_bytes_from_blocks(blocks) / 1024
+/// `qbtos()` (fs/quota/quota.c:177-180): whole quota blocks back to bytes.
+/// The shift truncates exactly like Linux's, including for a request whose
+/// high bits fall off the end.
+const fn qbtos(blocks: u64) -> u64 {
+    blocks << QIF_DQBLKSIZE_BITS
+}
+/// `dqi_max_spc_limit` and `dqi_max_ino_limit`, as each format's
+/// `read_file_info()` installs them.  The legacy format stores unsigned
+/// 32-bit quota-block counts, so its space ceiling is `0xffffffff` blocks, not
+/// `0xffffffff` bytes (fs/quota/quota_v1.c:177-178, and the same pair for the
+/// version-0 v2 format in fs/quota/quota_v2.c:134-145); the current format
+/// stores 64-bit byte counts and ceilings both at `2^63-1`
+/// (fs/quota/quota_v2.c:141-142).
+const fn max_limits(format: QuotaFormat) -> (u64, u64) {
+    match format {
+        QuotaFormat::OldV1 => (0xffff_ffffu64 << QIF_DQBLKSIZE_BITS, 0xffff_ffff),
+        QuotaFormat::V2 => (0x7fff_ffff_ffff_ffff, 0x7fff_ffff_ffff_ffff),
+    }
+}
+/// `do_set_dqblk()`'s `if (di->d_fieldmask & ~VFS_QC_MASK) return -EINVAL;`
+/// (fs/quota/dquot.c:2740-2754) seen through `copy_from_xfs_dqblk()`
+/// (fs/quota/quota.c:546-597), which translates each XFS selector into one
+/// `QC_*` bit.  `VFS_QC_MASK` is exactly the block- and inode-limit, accounting
+/// and grace selectors, so the realtime groups, every warning count and the
+/// realtime block count are rejected instead of silently accepted.
+/// `FS_DQ_BIGTIME` is a timer-width flag rather than a selector and maps to no
+/// `QC_*` bit, which is why it is allowed through.
+fn qc_mask_from_xfs(fieldmask: u16) -> u32 {
+    let fieldmask = u32::from(fieldmask);
+    let mut qc = 0;
+    for (xfs, bit) in XFS_QC_SELECTORS {
+        if fieldmask & xfs != 0 {
+            qc |= bit;
+        }
+    }
+    qc
+}
+/// `copy_from_if_dqblk()`'s fieldmask translation
+/// (fs/quota/quota.c:213-224).  A set bit which `struct if_dqblk` does not
+/// define selects nothing, exactly like Linux.
+fn qc_mask_from_if(valid: u32) -> u32 {
+    let mut qc = 0;
+    if valid & QIF_BLIMITS != 0 {
+        qc |= QC_SPC_SOFT | QC_SPC_HARD;
+    }
+    if valid & QIF_SPACE != 0 {
+        qc |= QC_SPACE;
+    }
+    if valid & QIF_ILIMITS != 0 {
+        qc |= QC_INO_SOFT | QC_INO_HARD;
+    }
+    if valid & QIF_INODES != 0 {
+        qc |= QC_INO_COUNT;
+    }
+    if valid & QIF_BTIME != 0 {
+        qc |= QC_SPC_TIMER;
+    }
+    if valid & QIF_ITIME != 0 {
+        qc |= QC_INO_TIMER;
+    }
+    qc
+}
+/// `do_set_dqblk()`'s validation half (fs/quota/dquot.c:2753-2762): a selector
+/// with no meaning in the VFS domain is EINVAL, and a limit the request
+/// actually selected above the format's maximum is ERANGE rather than a silent
+/// truncation.  Both decisions are taken before anything is stored.
+fn check_set_dqblk(qc: u32, record: &IfDqblk, format: QuotaFormat) -> AxResult<()> {
+    if qc & !VFS_QC_MASK != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let (max_spc, max_ino) = max_limits(format);
+    if qc & QC_SPC_SOFT != 0 && record.bsoftlimit > max_spc {
+        return Err(LinuxError::ERANGE.into());
+    }
+    if qc & QC_SPC_HARD != 0 && record.bhardlimit > max_spc {
+        return Err(LinuxError::ERANGE.into());
+    }
+    if qc & QC_INO_SOFT != 0 && record.isoftlimit > max_ino {
+        return Err(LinuxError::ERANGE.into());
+    }
+    if qc & QC_INO_HARD != 0 && record.ihardlimit > max_ino {
+        return Err(LinuxError::ERANGE.into());
+    }
+    Ok(())
 }
 /// `copy_from_xfs_dqblk_ts()` (fs/quota/quota.c:539-545): a 40-bit quota timer
 /// is `(u32)timer | (s64)timer_hi << 32` only when `FS_DQ_BIGTIME` is set;
@@ -1042,8 +1221,8 @@ const fn qif_valid_from_xfs(fieldmask: u32) -> u32 {
 /// `copy_from_xfs_dqblk()` as a whole (fs/quota/quota.c:546-597).
 fn if_dqblk_from_xfs(src: &XfsDiskQuota) -> IfDqblk {
     IfDqblk {
-        bhardlimit: xfs_limit_to_if_dqblk(src.d_blk_hardlimit),
-        bsoftlimit: xfs_limit_to_if_dqblk(src.d_blk_softlimit),
+        bhardlimit: xfs_bytes_from_blocks(src.d_blk_hardlimit),
+        bsoftlimit: xfs_bytes_from_blocks(src.d_blk_softlimit),
         curspace: xfs_bytes_from_blocks(src.d_bcount),
         ihardlimit: src.d_ino_hardlimit,
         isoftlimit: src.d_ino_softlimit,
@@ -1052,6 +1231,45 @@ fn if_dqblk_from_xfs(src: &XfsDiskQuota) -> IfDqblk {
         itime: xfs_timer_from_wire(src.d_itimer, src.d_itimer_hi, src.d_fieldmask),
         valid: qif_valid_from_xfs(src.d_fieldmask as u32),
         _pad: 0,
+    }
+}
+/// `copy_to_if_dqblk()` (fs/quota/quota.c:186-198) publishes the byte-unit
+/// block limits as whole 1024-byte quota blocks (`stoqb()`); every other field
+/// is already in the unit `struct if_dqblk` declares.
+fn if_dqblk_wire(record: &IfDqblk) -> IfDqblk {
+    IfDqblk {
+        bhardlimit: stoqb(record.bhardlimit),
+        bsoftlimit: stoqb(record.bsoftlimit),
+        ..*record
+    }
+}
+/// `copy_from_if_dqblk()` (fs/quota/quota.c:200-224) for a `Q_SETQUOTA`
+/// request.  `d_fieldmask` is rebuilt from `dqb_valid` only, so a set bit with
+/// no meaning in `struct if_dqblk` is dropped rather than rejected, and the
+/// block limits arrive in 1024-byte units.
+fn if_dqblk_from_wire(wire: IfDqblk) -> IfDqblk {
+    IfDqblk {
+        bhardlimit: qbtos(wire.bhardlimit),
+        bsoftlimit: qbtos(wire.bsoftlimit),
+        ..wire
+    }
+}
+/// `quota_getnextquota()`'s output (fs/quota/quota.c:377-399): "struct
+/// if_nextdqblk is a superset of struct if_dqblk", so the same conversion
+/// applies and only the identifier is added.
+fn if_next_dqblk_wire(record: &IfDqblk, id: u32) -> IfNextDqblk {
+    let wire = if_dqblk_wire(record);
+    IfNextDqblk {
+        bhardlimit: wire.bhardlimit,
+        bsoftlimit: wire.bsoftlimit,
+        curspace: wire.curspace,
+        ihardlimit: wire.ihardlimit,
+        isoftlimit: wire.isoftlimit,
+        curinodes: wire.curinodes,
+        btime: wire.btime,
+        itime: wire.itime,
+        valid: DQBLK_VALID_MASK,
+        id,
     }
 }
 /// `copy_to_xfs_dqblk()` (fs/quota/quota.c:672-701).
@@ -1079,8 +1297,8 @@ fn xfs_disk_quota(data: &QuotaData, ty: usize, id: u32) -> XfsDiskQuota {
         },
         d_fieldmask: if bigtime { FS_DQ_BIGTIME as u16 } else { 0 },
         d_id: id,
-        d_blk_hardlimit: if_dqblk_limit_to_xfs(record.bhardlimit),
-        d_blk_softlimit: if_dqblk_limit_to_xfs(record.bsoftlimit),
+        d_blk_hardlimit: xfs_blocks_from_bytes(record.bhardlimit),
+        d_blk_softlimit: xfs_blocks_from_bytes(record.bsoftlimit),
         d_ino_hardlimit: record.ihardlimit,
         d_ino_softlimit: record.isoftlimit,
         d_bcount: xfs_blocks_from_bytes(record.curspace),
@@ -1376,12 +1594,13 @@ fn quotactl<M: UserMemory + ?Sized>(
             if !q.enabled[ty] {
                 return Err(LinuxError::ESRCH.into());
             }
+            let record = q.records.get(&(ty as u8, id)).copied().unwrap_or_default();
             write_struct(
                 memory,
                 addr,
                 &IfDqblk {
                     valid: DQBLK_VALID_MASK,
-                    ..q.records.get(&(ty as u8, id)).copied().unwrap_or_default()
+                    ..if_dqblk_wire(&record)
                 },
             )?;
             Ok(0)
@@ -1389,12 +1608,18 @@ fn quotactl<M: UserMemory + ?Sized>(
         Q_SETQUOTA => {
             // quota_setquota() copies the structure first; unknown `dqb_valid`
             // bits are ignored rather than rejected.
-            let record: IfDqblk = read_struct(memory, addr)?;
+            let wire: IfDqblk = read_struct(memory, addr)?;
+            let record = if_dqblk_from_wire(wire);
             let mut q = state.0.lock();
             // dquot_set_dqblk() -> dqget() -> ESRCH when the type is inactive.
             if !q.enabled[ty] {
                 return Err(LinuxError::ESRCH.into());
             }
+            // do_set_dqblk() checks the field mask, then the format's maximum,
+            // and only then applies anything (fs/quota/dquot.c:2753-2762).
+            // `Q_SETQUOTA` can only select the six `QIF_*` groups
+            // `copy_from_if_dqblk()` maps, which never trip the mask check.
+            check_set_dqblk(qc_mask_from_if(record.valid), &record, q.formats[ty])?;
             merge_record(q.records.entry((ty as u8, id)).or_default(), record);
             q.dirty = true;
             Ok(0)
@@ -1407,29 +1632,8 @@ fn quotactl<M: UserMemory + ?Sized>(
             // qtree_get_next_id() walks from the requested identifier and
             // reports the smallest entry at or after it; running out of the
             // tree is ENOENT, not ESRCH.
-            let Some((&(_, next), record)) = q
-                .records
-                .range((ty as u8, id)..)
-                .find(|((kind, _), _)| *kind == ty as u8)
-            else {
-                return Err(LinuxError::ENOENT.into());
-            };
-            write_struct(
-                memory,
-                addr,
-                &IfNextDqblk {
-                    bhardlimit: record.bhardlimit,
-                    bsoftlimit: record.bsoftlimit,
-                    curspace: record.curspace,
-                    ihardlimit: record.ihardlimit,
-                    isoftlimit: record.isoftlimit,
-                    curinodes: record.curinodes,
-                    btime: record.btime,
-                    itime: record.itime,
-                    valid: DQBLK_VALID_MASK,
-                    id: next,
-                },
-            )?;
+            let (next, record) = next_quota_record(&q, ty, id)?;
+            write_struct(memory, addr, &if_next_dqblk_wire(&record, next))?;
             Ok(0)
         }
         // The XFS family (`XQM_CMD`) is a distinct wire protocol over the same
@@ -1510,19 +1714,11 @@ fn quotactl<M: UserMemory + ?Sized>(
             if !q.enabled[ty] {
                 return Err(LinuxError::ESRCH.into());
             }
-            // `dquot_get_next_id()` reports the smallest identifier strictly
-            // greater than the requested one, so the search starts after it,
-            // and exhaustion is ENOENT rather than ESRCH.
-            let Some(start) = id.checked_add(1) else {
-                return Err(LinuxError::ENOENT.into());
-            };
-            let Some((&(_, next), _)) = q
-                .records
-                .range((ty as u8, start)..)
-                .find(|((kind, _), _)| *kind == ty as u8)
-            else {
-                return Err(LinuxError::ENOENT.into());
-            };
+            // qtree_get_next_id() -> find_next_id() starts at
+            // `__get_index(info, *id, depth)`, which is `*id` itself at the
+            // root (fs/quota/quota_tree.c:792-844), so the search is
+            // `>= id`; exhaustion is ENOENT rather than ESRCH.
+            let (next, _) = next_quota_record(&q, ty, id)?;
             write_struct(memory, addr, &xfs_disk_quota(&q, ty, next))?;
             Ok(0)
         }
@@ -1530,16 +1726,46 @@ fn quotactl<M: UserMemory + ?Sized>(
             // quota_setxquota() reserves the whole wire structure before it
             // validates anything, then maps the identifier and reports ESRCH
             // from `dquot_set_dqblk()` for an inactive type
-            // (fs/quota/quota.c:624-670).
-            let new: XfsDiskQuota = read_struct(memory, addr)?;
+            // (fs/quota/quota.c:632-668).
+            let mut new: XfsDiskQuota = read_struct(memory, addr)?;
             let mut q = state.0.lock();
+            if id == 0 && u32::from(new.d_fieldmask) & (FS_DQ_WARNS_MASK | FS_DQ_TIMER_MASK) != 0 {
+                // "Are we actually setting timer / warning limits for all
+                // users?": the superuser dquot's grace periods and warning
+                // counts are the superblock-wide defaults, so they go to
+                // `->set_info()` and are then removed from the field mask.
+                // Linux returns that call's own errno, which `dquot_set_dqinfo()`
+                // decides before it looks at the active state
+                // (fs/quota/dquot.c:2893-2899): the warning counts and the
+                // realtime timer are EINVAL, and only then is an inactive type
+                // ESRCH.
+                let qinfo = qc_mask_from_xfs(new.d_fieldmask);
+                if qinfo & (QC_WARNS_MASK | QC_RT_SPC_TIMER) != 0 {
+                    return Err(AxError::InvalidInput);
+                }
+                if !q.enabled[ty] {
+                    return Err(LinuxError::ESRCH.into());
+                }
+                // `struct qc_info` carries 32-bit limits, so the timer is the
+                // low half of `d_btimer`/`d_itimer` (fs/quota/quota.c:600-614).
+                if qinfo & QC_SPC_TIMER != 0 {
+                    q.info[ty].bgrace = u64::from(new.d_btimer as u32);
+                }
+                if qinfo & QC_INO_TIMER != 0 {
+                    q.info[ty].igrace = u64::from(new.d_itimer as u32);
+                }
+                q.dirty = true;
+                new.d_fieldmask &=
+                    !((FS_DQ_WARNS_MASK | FS_DQ_TIMER_MASK) as u16);
+            }
+            // dquot_set_dqblk() resolves the dquot first: an inactive type is
+            // ESRCH before do_set_dqblk() sees the request at all.
             if !q.enabled[ty] {
                 return Err(LinuxError::ESRCH.into());
             }
-            merge_record(
-                q.records.entry((ty as u8, id)).or_default(),
-                if_dqblk_from_xfs(&new),
-            );
+            let record = if_dqblk_from_xfs(&new);
+            check_set_dqblk(qc_mask_from_xfs(new.d_fieldmask), &record, q.formats[ty])?;
+            merge_record(q.records.entry((ty as u8, id)).or_default(), record);
             q.dirty = true;
             Ok(0)
         }
@@ -1637,16 +1863,135 @@ mod tests {
     }
 
     #[test]
-    fn hard_limits_use_vfs_v1_kib_units() {
+    fn hard_limits_are_byte_counts() {
+        // `mem_dqblk` stores `qsize_t` bytes, so a 1 KiB limit admits exactly
+        // one KiB and refuses the next byte.
         let mut record = IfDqblk {
-            bhardlimit: 1,
+            bhardlimit: stoqb(1024) * 1024,
             ..Default::default()
         };
+        assert_eq!(record.bhardlimit, 1024);
         assert!(limit_reached(&mut record, IfDqinfo::default(), 1024, 0).is_ok());
         assert_eq!(
             limit_reached(&mut record, IfDqinfo::default(), 1, 0),
             Err(LinuxError::EDQUOT.into())
         );
+    }
+
+    #[test]
+    fn one_basic_block_limit_survives_both_wire_round_trips() {
+        // `Q_XSETQLIM` speaks 512-byte basic blocks and `Q_XGETQUOTA` reports
+        // the same unit, so the smallest non-zero limit must not collapse into
+        // the zero which means "unlimited".
+        let set = XfsDiskQuota {
+            d_fieldmask: (FS_DQ_BHARD | FS_DQ_BSOFT) as u16,
+            d_blk_hardlimit: 1,
+            d_blk_softlimit: 1,
+            ..Default::default()
+        };
+        let record = if_dqblk_from_xfs(&set);
+        assert_eq!((record.bhardlimit, record.bsoftlimit), (512, 512));
+        let mut data = QuotaData::default();
+        data.records.insert((0, 1000), record);
+        let out = xfs_disk_quota(&data, 0, 1000);
+        assert_eq!((out.d_blk_hardlimit, out.d_blk_softlimit), (1, 1));
+        // The same limit on the `struct if_dqblk` wire is one 1024-byte quota
+        // block, which is also how `quota tools` spell it.
+        let wire = if_dqblk_wire(&record);
+        assert_eq!((wire.bhardlimit, wire.bsoftlimit), (1, 1));
+        assert_eq!(if_dqblk_from_wire(wire).bhardlimit, 1024);
+    }
+
+    #[test]
+    fn set_dqblk_rejects_unhandled_selectors_and_over_maximum_limits() {
+        let empty = IfDqblk::default();
+        // The realtime groups and every warning count reach `do_set_dqblk()`
+        // as `QC_*` bits outside `VFS_QC_MASK`.
+        for fieldmask in [
+            FS_DQ_RTBSOFT,
+            FS_DQ_RTBHARD,
+            FS_DQ_RTBTIMER,
+            FS_DQ_RTBWARNS,
+            FS_DQ_RTBCOUNT,
+        ] {
+            assert_eq!(
+                check_set_dqblk(qc_mask_from_xfs(fieldmask as u16), &empty, QuotaFormat::V2),
+                Err(AxError::InvalidInput),
+                "fieldmask {fieldmask:#x}"
+            );
+        }
+        for fieldmask in [FS_DQ_BWARNS, FS_DQ_IWARNS] {
+            assert_eq!(
+                check_set_dqblk(qc_mask_from_xfs(fieldmask as u16), &empty, QuotaFormat::V2),
+                Err(AxError::InvalidInput),
+                "fieldmask {fieldmask:#x}"
+            );
+        }
+        // `FS_DQ_BIGTIME` is a timer-width flag, not a selector.
+        assert!(
+            check_set_dqblk(qc_mask_from_xfs(FS_DQ_BIGTIME as u16), &empty, QuotaFormat::V2)
+                .is_ok()
+        );
+        // 2^63 is one past the current format's inode maximum...
+        let over = IfDqblk {
+            ihardlimit: 0x8000_0000_0000_0000,
+            valid: QIF_ILIMITS,
+            ..Default::default()
+        };
+        assert_eq!(
+            check_set_dqblk(qc_mask_from_if(over.valid), &over, QuotaFormat::V2),
+            Err(LinuxError::ERANGE.into())
+        );
+        // ... while the legacy format caps space at 0xffffffff quota blocks.
+        let legacy = IfDqblk {
+            bhardlimit: 0xffff_ffffu64 * 1024 + 1,
+            valid: QIF_BLIMITS,
+            ..Default::default()
+        };
+        assert_eq!(
+            check_set_dqblk(qc_mask_from_if(legacy.valid), &legacy, QuotaFormat::OldV1),
+            Err(LinuxError::ERANGE.into())
+        );
+        assert!(
+            check_set_dqblk(qc_mask_from_if(legacy.valid), &legacy, QuotaFormat::V2).is_ok()
+        );
+        // An unselected field is never range checked: only the selector the
+        // request asked for bounds the value.
+        let unselected = IfDqblk {
+            bhardlimit: 0xffff_ffffu64 * 1024 + 1,
+            isoftlimit: 5,
+            valid: QIF_ILIMITS,
+            ..Default::default()
+        };
+        assert!(
+            check_set_dqblk(
+                qc_mask_from_if(unselected.valid),
+                &unselected,
+                QuotaFormat::OldV1
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn quota_file_limits_use_quota_blocks() {
+        // `v2r1_mem2diskdqb()` and `v1_mem2diskdqblk()` both store the byte
+        // limits as whole QUOTABLOCK counts, so a sub-KiB limit is preserved
+        // only up to that format's granularity.
+        let mut data = QuotaData::default();
+        data.records.insert(
+            (0, 5),
+            IfDqblk {
+                bhardlimit: 512,
+                ..Default::default()
+            },
+        );
+        let mut v2 = QuotaData::default();
+        decode_state(&encode_state(&data, 0).unwrap(), &mut v2, 0).unwrap();
+        assert_eq!(v2.records[&(0, 5)].bhardlimit, 1024);
+        let mut v1 = QuotaData::default();
+        decode_v1(&encode_v1(&data, 0).unwrap(), &mut v1, 0).unwrap();
+        assert_eq!(v1.records[&(0, 5)].bhardlimit, 1024);
     }
 
     #[test]
@@ -1659,6 +2004,26 @@ mod tests {
         assert_eq!(
             limit_reached(&mut record, IfDqinfo::default(), 0, 1),
             Err(LinuxError::EDQUOT.into())
+        );
+    }
+
+    #[test]
+    fn next_quota_search_starts_at_the_requested_id() {
+        // `qtree_get_next_id()` is inclusive on both wire protocols: the
+        // requested identifier is a candidate answer, not a lower bound to
+        // search past, and exhaustion is ENOENT.
+        let mut data = QuotaData::default();
+        data.records.insert((0, 1000), IfDqblk::default());
+        assert_eq!(next_quota_record(&data, 0, 1000).map(|(id, _)| id), Ok(1000));
+        assert_eq!(next_quota_record(&data, 0, 999).map(|(id, _)| id), Ok(1000));
+        assert_eq!(
+            next_quota_record(&data, 0, 1001).map(|(id, _)| id),
+            Err(LinuxError::ENOENT.into())
+        );
+        // A record of another type is not an answer.
+        assert_eq!(
+            next_quota_record(&data, 1, 0).map(|(id, _)| id),
+            Err(LinuxError::ENOENT.into())
         );
     }
 
@@ -1748,7 +2113,8 @@ mod tests {
         data.records.insert(
             (0, 3),
             IfDqblk {
-                bhardlimit: 9,
+                // Limits are held in bytes, so nine QUOTABLOCKs is 9 * 1024.
+                bhardlimit: 9 * 1024,
                 curspace: 1025,
                 ..Default::default()
             },
@@ -1758,6 +2124,8 @@ mod tests {
         decode_v1(&bytes, &mut restored, 0).unwrap();
         assert_eq!(restored.info[0].bgrace, 60);
         assert_eq!(restored.records[&(0, 3)].curspace, 2048);
+        // The legacy file stores the limit as a QUOTABLOCK count.
+        assert_eq!(restored.records[&(0, 3)].bhardlimit, 9 * 1024);
         assert_eq!(
             decode_v1(&bytes[..bytes.len() - 1], &mut restored, 0),
             Err(AxError::InvalidInput)
