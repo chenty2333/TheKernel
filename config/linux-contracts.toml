@@ -4065,7 +4065,7 @@ contract = "linux-mlock"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_mlock"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
-validation_gaps = ["New lock-prefix and population-error differential cases await current paired Linux7.2.3 and TheKernel execution"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4088,7 +4088,7 @@ contract = "linux-mlock2"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_mlock2"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
-validation_gaps = ["New lock-prefix and population-error differential cases await current paired Linux7.2.3 and TheKernel execution"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4111,7 +4111,7 @@ contract = "linux-munlock"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_munlock"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
-validation_gaps = ["New lock-prefix and population-error differential cases await current paired Linux7.2.3 and TheKernel execution"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4134,7 +4134,7 @@ contract = "linux-mlockall"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_mlockall"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
-validation_gaps = ["New lock-prefix and population-error differential cases await current paired Linux7.2.3 and TheKernel execution"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
