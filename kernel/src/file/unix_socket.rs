@@ -1,6 +1,6 @@
 use alloc::{sync::Arc, vec::Vec};
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FsContext;
 use axfs_ng_vfs::{
     CreateDisposition, FsName, FsNameBuf, FsPath, InitialNodeData, NamedCreateOptions,
@@ -44,6 +44,48 @@ fn check_bind_name_available(parent: &axfs_ng_vfs::Location, name: &FsName) -> A
     }
 }
 
+/// The `sk_type` of a pathname UNIX socket.
+///
+/// Linux `unix_find_bsd()` compares the connecting socket's type with the
+/// bound socket's type before it runs `security_unix_find()`, so a mismatch is
+/// `-EPROTOTYPE` rather than a Landlock `-EACCES`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnixPeerKind {
+    Stream,
+    Datagram,
+    Seqpacket,
+}
+
+impl UnixPeerKind {
+    pub(crate) fn of(socket: &UnixSocket) -> Self {
+        if socket.is_datagram() {
+            Self::Datagram
+        } else if socket.is_seqpacket() {
+            Self::Seqpacket
+        } else {
+            Self::Stream
+        }
+    }
+}
+
+/// Filesystem-node payload of one bound pathname UNIX socket.
+///
+/// Linux keeps the creating socket file's `f_cred` alive in `struct socket`, so
+/// `hook_unix_find()` can compare the connecting domain with the domain of the
+/// process that created the listening socket.  The kernel-side socket object
+/// already retains that snapshot (`Socket::creator_security`); the inode this
+/// module creates carries it for as long as the name stays resolvable, so a
+/// later `close`, rename, or unlink cannot retarget the comparison.
+struct PathnameSocketData {
+    slot: Arc<BindSlot>,
+    creator_domain: crate::task::security::LandlockDomain,
+    kind: UnixPeerKind,
+}
+
+fn pathname_socket_data(location: &axfs_ng_vfs::Location) -> Option<Arc<PathnameSocketData>> {
+    location.user_data().get::<PathnameSocketData>()
+}
+
 /// Creates and binds a Linux pathname Unix socket with one frozen credential
 /// view. Transport admission is private and reversible until the filesystem
 /// backend has initialized the exact slot and atomically published the name.
@@ -51,6 +93,7 @@ pub(crate) fn bind_path<G>(
     socket: &UnixSocket,
     path: Arc<Vec<u8>>,
     security: &VfsSecurityContext,
+    creator_domain: crate::task::security::LandlockDomain,
     requested_mode: NodePermission,
     umask: u32,
     prepare: impl FnOnce(axnet::unix::UnixEndpointIdentity) -> AxResult<G>,
@@ -59,7 +102,18 @@ pub(crate) fn bind_path<G>(
     let result = with_path_fs(
         AT_FDCWD,
         FsPath::new(lookup_path.as_slice()),
-        |fs| bind_path_in_fs(fs, path, socket, security, requested_mode, umask, prepare),
+        |fs| {
+            bind_path_in_fs(
+                fs,
+                path,
+                socket,
+                security,
+                creator_domain,
+                requested_mode,
+                umask,
+                prepare,
+            )
+        },
     );
     result.map_err(map_bind_create_error)
 }
@@ -69,6 +123,7 @@ fn bind_path_in_fs<G>(
     path: Arc<Vec<u8>>,
     socket: &UnixSocket,
     security: &VfsSecurityContext,
+    creator_domain: crate::task::security::LandlockDomain,
     requested_mode: NodePermission,
     umask: u32,
     prepare: impl FnOnce(axnet::unix::UnixEndpointIdentity) -> AxResult<G>,
@@ -126,7 +181,16 @@ fn bind_path_in_fs<G>(
     let reservation: UnixBindReservation<'_> = socket.reserve_bind(target)?;
     let endpoint = reservation.target_endpoint_identity()?;
     let prepared = prepare(endpoint)?;
-    let initial_data = InitialNodeData::from_shared(slot);
+    // The payload is allocated before the name becomes visible: publication
+    // may not fail, and a later resolver must observe the creator's domain.
+    let initial_data = InitialNodeData::from_shared(
+        Arc::try_new(PathnameSocketData {
+            slot,
+            creator_domain,
+            kind: UnixPeerKind::of(socket),
+        })
+        .map_err(|_| AxError::NoMemory)?,
+    );
     let (project_id, project_inherit) =
         super::inode_flags::prepare_inherited_project_id(&parent, false)?;
     let (access_acl, default_acl) =
@@ -170,12 +234,13 @@ fn bind_path_in_fs<G>(
 pub(crate) fn resolve_peer(
     path: Arc<Vec<u8>>,
     security: &VfsSecurityContext,
+    kind: UnixPeerKind,
 ) -> AxResult<UnixSocketTarget> {
     let lookup_path = path.clone();
     with_path_fs(
         AT_FDCWD,
         FsPath::new(lookup_path.as_slice()),
-        |fs| resolve_peer_in_fs(fs, path, security),
+        |fs| resolve_peer_in_fs(fs, path, security, kind),
     )
 }
 
@@ -183,6 +248,7 @@ fn resolve_peer_in_fs(
     fs: &FsContext,
     path: Arc<Vec<u8>>,
     security: &VfsSecurityContext,
+    kind: UnixPeerKind,
 ) -> AxResult<UnixSocketTarget> {
     let path_ref = FsPath::new(path.as_slice());
     validate_pathname(path_ref)?;
@@ -197,10 +263,19 @@ fn resolve_peer_in_fs(
     if location.metadata()?.node_type != NodeType::Socket {
         return Err(AxError::ConnectionRefused);
     }
-    let slot = location
-        .user_data()
-        .get::<BindSlot>()
-        .ok_or(AxError::ConnectionRefused)?;
+    let data = pathname_socket_data(&location).ok_or(AxError::ConnectionRefused)?;
+    // Linux `unix_find_bsd()` checks `sk->sk_type != type` (EPROTOTYPE) before
+    // it reaches `security_unix_find()`.
+    if data.kind != kind {
+        return Err(LinuxError::EPROTOTYPE.into());
+    }
+    // Linux `security_unix_find()` runs inside `unix_find_bsd()` after the
+    // socket inode is found and the transport type matches, and before atime
+    // is touched, so a non-socket or unreachable peer keeps ECONNREFUSED and
+    // a Landlock denial is EACCES.
+    if let Some(domain) = security.landlock_domain() {
+        domain.check_unix_socket_resolution(&location, Some(&data.creator_domain))?;
+    }
 
     // Linux touches atime after resolving a usable pathname socket. Failure to
     // update atime does not invalidate the already admitted connection.
@@ -210,7 +285,7 @@ fn resolve_peer_in_fs(
             ..Default::default()
         });
     }
-    UnixSocketTarget::from_bound(slot)
+    UnixSocketTarget::from_bound(data.slot.clone())
 }
 
 #[cfg(test)]
@@ -294,13 +369,37 @@ mod tests {
         let client = make_socket();
         let path = Arc::new(b"/log".to_vec());
         let mode = NodePermission::from_bits_truncate(0o666);
-        assert!(matches!(bind_path_in_fs(&fs, path.clone(), &old_server, &security, mode, 0,
-            |_| Err::<(), _>(AxError::NoMemory)), Err(AxError::NoMemory)));
+        let creator = crate::task::security::LandlockDomain::default();
+        assert!(matches!(
+            bind_path_in_fs(
+                &fs,
+                path.clone(),
+                &old_server,
+                &security,
+                creator.clone(),
+                mode,
+                0,
+                |_| Err::<(), _>(AxError::NoMemory)
+            ),
+            Err(AxError::NoMemory)
+        ));
         assert!(matches!(root.lookup_no_follow(FsName::new(b"log")), Err(AxError::NotFound)));
         let mut published = None;
-        bind_path_in_fs(&fs, path.clone(), &old_server, &security, mode, 0,
-            |identity| { published = Some(identity); Ok(()) }).unwrap();
-        let old_target = resolve_peer_in_fs(&fs, path.clone(), &security).unwrap();
+        bind_path_in_fs(
+            &fs,
+            path.clone(),
+            &old_server,
+            &security,
+            creator.clone(),
+            mode,
+            0,
+            |identity| {
+                published = Some(identity);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let old_target = resolve_peer_in_fs(&fs, path.clone(), &security, UnixPeerKind::Datagram).unwrap();
         assert_eq!(published, Some(old_target.endpoint_identity().unwrap()));
         let old_node = root.lookup_no_follow(FsName::new(b"log")).unwrap();
         assert_eq!(old_node.metadata().unwrap().node_type, NodeType::Socket);
@@ -320,12 +419,13 @@ mod tests {
         };
         exchange(old_target.clone(), &old_server, 1);
         root.unlink(FsName::new(b"log"), false).unwrap();
-        assert!(matches!(resolve_peer_in_fs(&fs, path.clone(), &security),
+        assert!(matches!(resolve_peer_in_fs(&fs, path.clone(), &security, UnixPeerKind::Datagram),
             Err(AxError::NotFound)));
         exchange(old_target.clone(), &old_server, 2);
 
-        bind_path_in_fs(&fs, path.clone(), &new_server, &security, mode, 0, |_| Ok(())).unwrap();
-        let new_target = resolve_peer_in_fs(&fs, path.clone(), &security).unwrap();
+        bind_path_in_fs(&fs, path.clone(), &new_server, &security, creator, mode, 0, |_| Ok(()))
+            .unwrap();
+        let new_target = resolve_peer_in_fs(&fs, path.clone(), &security, UnixPeerKind::Datagram).unwrap();
         let new_node = root.lookup_no_follow(FsName::new(b"log")).unwrap();
         assert!(!old_node.same_node(&new_node));
         assert_ne!(old_target.endpoint_identity().unwrap(), new_target.endpoint_identity().unwrap());

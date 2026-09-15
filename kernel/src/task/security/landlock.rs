@@ -31,8 +31,11 @@ pub(crate) const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
 pub(crate) const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
 pub(crate) const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 pub(crate) const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
+pub(crate) const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
 pub(crate) const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
 pub(crate) const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+pub(crate) const LANDLOCK_ACCESS_NET_BIND_UDP: u64 = 1 << 2;
+pub(crate) const LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP: u64 = 1 << 3;
 pub(crate) const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
 pub(crate) const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 1;
 
@@ -41,9 +44,15 @@ const LANDLOCK_MAX_NUM_LAYERS: usize = 16;
 pub(crate) const LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF: u32 = 1 << 0;
 pub(crate) const LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON: u32 = 1 << 1;
 pub(crate) const LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF: u32 = 1 << 2;
+/// `LANDLOCK_RESTRICT_SELF_TSYNC`: apply the new configuration to every thread
+/// of the calling process.
+pub(crate) const LANDLOCK_RESTRICT_SELF_TSYNC: u32 = 1 << 3;
 pub(crate) const LANDLOCK_RESTRICT_SELF_LOG_MASK: u32 = LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF
     | LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON
     | LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF;
+/// `LANDLOCK_MASK_RESTRICT_SELF` from `security/landlock/limits.h`.
+pub(crate) const LANDLOCK_RESTRICT_SELF_MASK: u32 =
+    LANDLOCK_RESTRICT_SELF_LOG_MASK | LANDLOCK_RESTRICT_SELF_TSYNC;
 static NEXT_LANDLOCK_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Kernel-owned resolver adapter for an immutable Landlock ruleset.  The
@@ -53,12 +62,27 @@ pub(crate) trait LandlockPolicy: Send + Sync {
     fn scoped(&self) -> u64;
     fn allows_path(&self, target: &axfs_ng_vfs::Location, access: u64) -> bool;
     fn allows_net_port(&self, port: u16, access: u64) -> bool;
+    /// Whether this ruleset layer claims responsibility for `access`.
+    ///
+    /// Linux `landlock_init_layer_masks()` only lets a layer deny an access
+    /// right that its `handled_access_*` mask contains, so a layer that does
+    /// not handle a right can never deny it.
+    fn handles_fs_access(&self, access: u64) -> bool;
     fn destination_is_no_less_restrictive(
         &self,
         source: &axfs_ng_vfs::Location,
         destination: &axfs_ng_vfs::Location,
         access: u64,
     ) -> bool;
+    /// Linux `landlock_log_denial()`: whether this layer's rules for `target`
+    /// carry `LANDLOCK_ADD_RULE_QUIET` and cover every `access` bit with its
+    /// `quiet_access_fs` mask.
+    fn quiets_path_denial(&self, target: &axfs_ng_vfs::Location, access: u64) -> bool;
+    /// The network equivalent of [`Self::quiets_path_denial`], matched by port.
+    fn quiets_net_denial(&self, port: u16, access: u64) -> bool;
+    /// Linux `landlock_log_denial()`: scope denials consult only the layer's
+    /// `quiet_scoped` mask, never a per-object flag.
+    fn quiets_scope_denial(&self, scope: u64) -> bool;
 }
 
 /// Network operations do not have a VFS object to carry through the generic
@@ -216,6 +240,19 @@ impl LandlockDomain {
                 .collect(),
         }
     }
+    /// Fallible [`Clone`] used by `LANDLOCK_RESTRICT_SELF_TSYNC`.
+    ///
+    /// The thread-group commit may not fail once it has started, so every
+    /// allocation for every target thread is performed up front with
+    /// `try_reserve_exact` instead of `Vec::clone`'s aborting allocation.
+    pub(crate) fn try_clone(&self) -> AxResult<Self> {
+        let mut stack = Vec::new();
+        stack
+            .try_reserve_exact(self.stack.len())
+            .map_err(|_| AxError::NoMemory)?;
+        stack.extend(self.stack.iter().cloned());
+        Ok(Self { stack })
+    }
     pub(crate) fn after_exec(&self) -> Self {
         Self {
             stack: self
@@ -249,9 +286,12 @@ impl LandlockDomain {
             .all(|layer| layer.ruleset.allows_path(target, access))
     }
     pub(crate) fn report_path_denial(&self, target: &axfs_ng_vfs::Location, access: u64) {
-        self.report_denial(access, "path", |layer| {
-            !layer.ruleset.allows_path(target, access)
-        });
+        self.report_denial(
+            access,
+            "path",
+            |layer| !layer.ruleset.allows_path(target, access),
+            |layer| layer.ruleset.quiets_path_denial(target, access),
+        );
     }
     pub(crate) fn allows_net_port(&self, port: u16, access: u64) -> bool {
         self.stack
@@ -262,16 +302,31 @@ impl LandlockDomain {
         if self.allows_net_port(port, access) {
             return Ok(());
         }
-        self.report_denial(access, "net", |layer| {
-            !layer.ruleset.allows_net_port(port, access)
-        });
+        self.report_denial(
+            access,
+            "net",
+            |layer| !layer.ruleset.allows_net_port(port, access),
+            |layer| layer.ruleset.quiets_net_denial(port, access),
+        );
         Err(AxError::PermissionDenied)
+    }
+    /// Linux `landlock_log_denial()`: a scope denial increments the youngest
+    /// denying layer's counter and is logged unless that layer set the
+    /// matching `quiet_scoped` bit.
+    pub(crate) fn report_scope_denial(&self, scope: u64, blocker: &'static str) {
+        self.report_denial(
+            scope,
+            blocker,
+            |layer| layer.ruleset.scoped() & scope != 0,
+            |layer| layer.ruleset.quiets_scope_denial(scope),
+        );
     }
     fn report_denial(
         &self,
         access: u64,
         blocker: &'static str,
         denies: impl Fn(&LandlockLayer) -> bool,
+        quiets: impl Fn(&LandlockLayer) -> bool,
     ) {
         // The youngest denying layer is the one Linux attributes to this
         // request: exactly one increment and exactly one audit event.
@@ -291,7 +346,10 @@ impl LandlockDomain {
                 layer.log_new_exec
             } else {
                 layer.log_same_exec
-            };
+            }
+            // LANDLOCK_ADD_RULE_QUIET wins over every logging flag, exactly as
+            // in `landlock_log_denial()`'s `quiet_applicable_to_access` test.
+            && !quiets(layer);
         if log {
             emit_landlock_denial(AuditLandlockDenied {
                 domain_id: layer.id,
@@ -312,6 +370,54 @@ impl LandlockDomain {
                 .ruleset
                 .destination_is_no_less_restrictive(source, destination, access)
         })
+    }
+
+    /// Linux `hook_unix_find()`: may this domain look up the pathname UNIX
+    /// socket at `target`?
+    ///
+    /// `security/landlock/fs.c:hook_unix_find()` resolves
+    /// `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` through the ordinary path rules and
+    /// then calls `unmask_scoped_access()`, which clears the right in every
+    /// layer depth where the connecting and the creating domain share one
+    /// hierarchy node.  `server` is the domain retained by the process that
+    /// created the listening socket (Linux reads it from the socket file's
+    /// `f_cred`); a server outside any domain is a different domain for every
+    /// layer.  Layers are aligned from the oldest one, and a connecting
+    /// domain with layers the creating domain never reached stays denied.
+    pub(crate) fn allows_unix_socket_resolution(
+        &self,
+        target: &axfs_ng_vfs::Location,
+        server: Option<&Self>,
+    ) -> bool {
+        self.stack.iter().enumerate().all(|(index, layer)| {
+            tk_linux_landlock::unix_resolution_layer_allows(
+                layer
+                    .ruleset
+                    .handles_fs_access(LANDLOCK_ACCESS_FS_RESOLVE_UNIX),
+                layer
+                    .ruleset
+                    .allows_path(target, LANDLOCK_ACCESS_FS_RESOLVE_UNIX),
+                server.is_some_and(|server| {
+                    server
+                        .stack
+                        .get(index)
+                        .is_some_and(|peer| Arc::ptr_eq(&layer.identity, &peer.identity))
+                }),
+            )
+        })
+    }
+
+    /// Denies a pathname UNIX socket lookup with Linux's `-EACCES`.
+    pub(crate) fn check_unix_socket_resolution(
+        &self,
+        target: &axfs_ng_vfs::Location,
+        server: Option<&Self>,
+    ) -> AxResult {
+        if self.allows_unix_socket_resolution(target, server) {
+            return Ok(());
+        }
+        self.report_path_denial(target, LANDLOCK_ACCESS_FS_RESOLVE_UNIX);
+        Err(AxError::PermissionDenied)
     }
 
     /// A scoped layer can reach only the same hierarchy node or its children.
