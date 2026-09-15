@@ -40,8 +40,8 @@ use crate::{
             SchedulerSecurityOperation, SecuritySchedulerContext, SecurityTaskGetSchedulerContext,
             dispatch_scheduler, dispatch_task_getscheduler,
         },
-        try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
-        ZombieSchedulerSnapshot,
+        set_zombie_nice, try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns,
+        zombie_scheduler_state, ZombieSchedulerSnapshot,
     },
     time::TimeValueLike,
 };
@@ -1912,6 +1912,57 @@ fn setpriority_one(
     record_setpriority_result(result, attempt);
 }
 
+/// `set_one_prio()` applied to an unreaped zombie.
+///
+/// Linux reaches a zombie through `find_task_by_vpid()`/`do_each_pid_thread()`
+/// because the `task_struct` outlives the exit, so `setpriority(2)` can still
+/// authorize and store its nice value. TheKernel has no live scheduler entity
+/// to update by then, so the retained terminal transaction is written instead.
+///
+/// Authorization uses the credentials frozen in the zombie snapshot, which is
+/// what `p->cred` still points at in Linux, and the *retained* nice value for
+/// `can_nice()`, so a lowering request is judged against the value
+/// `getpriority(2)` would report.
+fn setpriority_one_zombie(
+    result: &mut AxResult<()>,
+    actor_task: &AxTaskRef,
+    actor_cred: &Arc<Cred>,
+    process: &Arc<Process>,
+    new_nice: i8,
+) {
+    let attempt = (|| -> AxResult<()> {
+        let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+        let current_nice = zombie_scheduler_state(process)?.nice;
+        let rlimit_nice = actor_task.as_thread().proc_data.rlim.read()[RLIMIT_NICE].current;
+        SchedulerAuthoritySnapshot::new(actor_cred.clone(), snapshot.credential.clone())
+            .authorize(SchedulerSecurityOperation::SetNice {
+                current_nice,
+                requested_nice: new_nice,
+                rlimit_nice,
+            })?;
+        set_zombie_nice(process, new_nice)
+    })();
+    record_setpriority_result(result, attempt);
+}
+
+/// Finds the authoritative unreaped zombie whose visible PID is `who`.
+fn zombie_target_for_setpriority(
+    who: Pid,
+    caller_pid_ns: &Arc<PidNamespace>,
+) -> Option<Arc<Process>> {
+    process_domain()
+        .ok()?
+        .registry()
+        .processes()
+        .find(|process| {
+            process.is_zombie()
+                && zombie_pid_ns(process).is_some_and(|target_pid_ns| {
+                    visible_process_pid_in_namespace(process.pid(), &target_pid_ns, caller_pid_ns)
+                        == Some(who)
+                })
+        })
+}
+
 pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize> {
     let which = syscall_c_int(which);
     let who = syscall_c_int(who);
@@ -1927,15 +1978,22 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
     let mut result = Err(AxError::NoSuchProcess);
     match which as u32 {
         PRIO_PROCESS => {
-            let task = if who == 0 {
-                actor_task.clone()
+            // `who ? find_task_by_vpid(who) : current`: the lookup has no state
+            // filter, so an unreaped zombie is a valid target.
+            if who == 0 {
+                setpriority_one(&mut result, &actor_task, &actor_cred, actor_task.clone(), new_nice);
             } else if who > 0 {
-                visible_live_task_for_getpriority(who as Pid, &caller_pid_ns)
-                    .ok_or(AxError::NoSuchProcess)?
+                if let Some(task) = visible_live_task_for_getpriority(who as Pid, &caller_pid_ns) {
+                    setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
+                } else if let Some(process) = zombie_target_for_setpriority(who as Pid, &caller_pid_ns)
+                {
+                    setpriority_one_zombie(&mut result, &actor_task, &actor_cred, &process, new_nice);
+                } else {
+                    return Err(AxError::NoSuchProcess);
+                }
             } else {
                 return Err(AxError::NoSuchProcess);
-            };
-            setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
+            }
         }
         PRIO_PGRP => {
             if who < 0 {
@@ -1945,10 +2003,10 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
             let target_group = if who == 0 {
                 Some(actor_task.as_thread().proc_data.proc.group())
             } else {
+                // `find_vpid(who)` resolves a process group with no state
+                // filter, so a group named only by zombies still resolves.
                 registry.processes().find_map(|process| {
-                    (!process.is_zombie())
-                        .then(|| process_pid_ns_for_getpriority(&process))
-                        .flatten()
+                    process_pid_ns_for_getpriority(&process)
                         .filter(|pid_ns| {
                             visible_process_pid_in_namespace(
                                 process.group().pgid(),
@@ -1961,7 +2019,20 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
             };
             let target_group = target_group.ok_or(AxError::NoSuchProcess)?;
             for process in registry.processes() {
-                if process.is_zombie() || !Arc::ptr_eq(&process.group(), &target_group) {
+                if !Arc::ptr_eq(&process.group(), &target_group) {
+                    continue;
+                }
+                // `do_each_pid_thread()` yields every task in the group,
+                // including a zombie leader, which `set_one_prio()` then
+                // updates in place.
+                if process.is_zombie() {
+                    setpriority_one_zombie(
+                        &mut result,
+                        &actor_task,
+                        &actor_cred,
+                        &process,
+                        new_nice,
+                    );
                     continue;
                 }
                 for tid in process.thread_ids() {
@@ -1984,7 +2055,24 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                     .ok_or(AxError::NoSuchProcess)?
             };
             for process in process_domain()?.registry().processes() {
+                // `for_each_process_thread()` walks every task, and the
+                // `task_pid_vnr(p)` guard below only skips a task with no ID
+                // in the caller's namespace -- a zombie leader clears it.
                 if process.is_zombie() {
+                    if zombie_pid_ns(&process)
+                        .is_some_and(|pid_ns| caller_pid_ns.contains(&pid_ns))
+                        && process
+                            .zombie_payload()
+                            .is_some_and(|snapshot| snapshot.credential.ids().ruid == uid)
+                    {
+                        setpriority_one_zombie(
+                            &mut result,
+                            &actor_task,
+                            &actor_cred,
+                            &process,
+                            new_nice,
+                        );
+                    }
                     continue;
                 }
                 for tid in process.thread_ids() {
@@ -1992,7 +2080,9 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                         continue;
                     };
                     let thread = task.as_thread();
-                    if thread.pending_exit() || !caller_pid_ns.contains(&thread.pid_ns()) {
+                    // `task_pid_vnr(p)` is zero for a task invisible from the
+                    // caller's namespace, which is what excludes it.
+                    if !caller_pid_ns.contains(&thread.pid_ns()) {
                         continue;
                     }
                     if thread.current_cred().ids().ruid == uid {

@@ -587,6 +587,28 @@ pub(crate) fn set_zombie_affinity(process: &Process, affinity: AxCpuMask) -> AxR
     Ok(())
 }
 
+/// Updates the nice value retained for an authoritative unreaped zombie.
+///
+/// This is the `set_user_nice()` half of Linux's `set_one_prio()`: Linux
+/// resolves a zombie through `find_task_by_vpid()` and writes `p->static_prio`
+/// in place, because nothing about a `task_struct`'s scheduling fields is
+/// retired before `release_task()`. TheKernel's live scheduler entity is gone,
+/// so the retained transaction is what carries the new value to
+/// `getpriority(2)`. Like `set_zombie_affinity()`, the reap edge is the
+/// serialization point: a reap that wins this lock turns the update into ESRCH
+/// rather than mutating a registry entry that is no longer authoritative.
+pub(crate) fn set_zombie_nice(process: &Process, nice: i8) -> AxResult<()> {
+    ensure_authoritative_zombie(process)?;
+    let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+    let owner = snapshot.reap_owner.lock();
+    let scheduler = owner
+        .as_ref()
+        .and_then(|identity| identity.scheduler.as_ref())
+        .ok_or(AxError::NoSuchProcess)?;
+    scheduler.lock().nice = nice;
+    Ok(())
+}
+
 /// Returns the PID namespace retained by an unreaped zombie process.
 pub(crate) fn zombie_pid_ns(process: &Process) -> Option<Arc<PidNamespace>> {
     let current = process_domain().ok()?.registry().get(process.pid())?;
