@@ -3270,6 +3270,12 @@ pub(super) fn madvise_behavior_valid(advice: u32) -> bool {
 /// and the walk continues with the rest of the range.  This helper returns one
 /// such clip, or `None` when the walk is over.
 ///
+/// The continuation is `vma = find_vma(mm, vma ? vma->vm_end : range->end)`
+/// (`mm/madvise.c:1730`), so a cursor that lands in a hole has to fall forward
+/// to the next VMA *after* the hole rather than end the walk: `MemorySet::find`
+/// only answers for an address inside a VMA, so an unmapped cursor used to
+/// stop the range at the first gap and leave every later VMA un-advised.
+///
 /// `mlock(2)` publishes `VM_LOCKED` by splitting the VMA at the boundaries of
 /// the locked range (`mm/mlock.c:mlock_fixup()`), so a requested range that
 /// straddles a lock boundary is two VMAs in Linux and has to be two steps
@@ -3280,7 +3286,12 @@ fn next_madvise_run(
     cursor: VirtAddr,
     end: VirtAddr,
 ) -> Option<(VirtAddr, VirtAddr, bool)> {
-    let area = aspace.find_area(cursor)?;
+    let area = match aspace.find_area(cursor) {
+        Some(area) => area,
+        None => aspace
+            .areas_overlapping(VirtAddrRange::new(cursor, end))
+            .next()?,
+    };
     let gap = area.start() > cursor;
     let start = area.start().max(cursor);
     let run_end = area.end().min(end);
@@ -4863,6 +4874,47 @@ mod tests {
         let info = classify_madvise_backend(&backend);
         assert!(!info.all_private_anonymous);
         assert!(!info.has_shared_mapping);
+    }
+
+    #[test]
+    fn madvise_walk_reaches_the_vmas_after_a_hole() {
+        // `madvise_walk_vmas()` records a gap as `unmapped_error = -ENOMEM`
+        // and carries on from `find_vma(mm, vma ? vma->vm_end : range->end)`
+        // (mm/madvise.c:1693-1704 and :1730), so every VMA the range covers
+        // is still visited -- the hole only shows up in the return value.  A
+        // walk that stops at the gap leaves the VMAs after it un-advised,
+        // which MADV_WIPEONFORK over a hole exposed: the child of a fork kept
+        // the parent's byte.
+        let base = VirtAddr::from(0x4000);
+        let mut aspace = AddrSpace::new_empty(base, PAGE_SIZE_4K * 3).unwrap();
+        let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        for offset in [0, 2 * PAGE_SIZE_4K] {
+            let start = base + offset;
+            aspace
+                .map(
+                    start,
+                    PAGE_SIZE_4K,
+                    flags,
+                    false,
+                    Backend::new_alloc(start, PageSize::Size4K),
+                )
+                .unwrap();
+        }
+        let end = base + 3 * PAGE_SIZE_4K;
+        assert_eq!(
+            next_madvise_run(&aspace, base, end),
+            Some((base, base + PAGE_SIZE_4K, false))
+        );
+        // The cursor sits in the hole: the next clip is the VMA after it, and
+        // `gap` tells the caller to report -ENOMEM once the walk is over.
+        assert_eq!(
+            next_madvise_run(&aspace, base + PAGE_SIZE_4K, end),
+            Some((base + 2 * PAGE_SIZE_4K, end, true))
+        );
+        assert_eq!(
+            next_madvise_run(&aspace, base + 2 * PAGE_SIZE_4K, end),
+            Some((base + 2 * PAGE_SIZE_4K, end, false))
+        );
     }
 
     #[test]
