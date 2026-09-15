@@ -129,18 +129,16 @@ fn registered_key_type(type_name: &str) -> AxResult<KeyTypeKind> {
     KeyTypeKind::from_name(type_name).ok_or(AxError::from(LinuxError::ENOKEY))
 }
 
-/// `add_key()`'s extra rule: a description-private keyring name is `-EPERM`.
+/// `add_key()`'s inline private-name rule: a `.`-prefixed description for a
+/// `keyring`-prefixed type is `-EPERM`.
 ///
 /// Linux tests `strncmp(type, "keyring", 7) == 0`, so every `keyring`-prefixed
-/// type name takes part.
-fn parse_add_key_kind(type_name: &str, description: Option<&str>) -> AxResult<KeyTypeKind> {
-    validate_key_type_encoding(type_name)?;
-    // `add_key()` runs the private-name check before `key_create_or_update()`
-    // resolves the type, so it wins even for an unregistered name.
-    if type_name.starts_with("keyring") && description.is_some_and(|desc| desc.starts_with('.')) {
-        return Err(AxError::OperationNotPermitted);
-    }
-    KeyTypeKind::from_name(type_name).ok_or(AxError::NoSuchDevice)
+/// type name takes part, registered or not. The rule lives in `add_key()`
+/// itself (`keyctl.c:104-108`, the `else if` on the description's first
+/// character), before the payload copy and therefore long
+/// before `key_create_or_update()` resolves the type.
+fn add_key_name_is_private(type_name: &str, description: Option<&str>) -> bool {
+    type_name.starts_with("keyring") && description.is_some_and(|desc| desc.starts_with('.'))
 }
 
 fn current_key_actor() -> KeyActor {
@@ -160,38 +158,6 @@ fn current_key_actor() -> KeyActor {
         has_sys_admin,
         has_setuid,
     )
-}
-
-fn validate_key_payload<M: UserMemory + ?Sized>(
-    memory: &mut UserMemoryContext<'_, M>,
-    kind: KeyTypeKind,
-    description: &str,
-    payload: *const u8,
-    plen: usize,
-) -> AxResult<Vec<u8>> {
-    match kind {
-        KeyTypeKind::Keyring => {
-            if plen != 0 {
-                return Err(AxError::InvalidInput);
-            }
-            Ok(Vec::new())
-        }
-        KeyTypeKind::User | KeyTypeKind::Logon => {
-            if plen == 0 || plen > kind.payload_limit() {
-                return Err(AxError::InvalidInput);
-            }
-            if kind == KeyTypeKind::Logon && description.find(':').is_none_or(|colon| colon == 0) {
-                return Err(AxError::InvalidInput);
-            }
-            load_payload(memory, payload, plen)
-        }
-        KeyTypeKind::BigKey => {
-            if plen == 0 || plen > kind.payload_limit() {
-                return Err(AxError::InvalidInput);
-            }
-            load_payload(memory, payload, plen)
-        }
-    }
 }
 
 fn load_payload<M: UserMemory + ?Sized>(
@@ -280,6 +246,9 @@ pub fn sys_add_key<M: UserMemory + ?Sized>(
         return Err(AxError::InvalidInput);
     }
     let type_name = load_user_string(memory, type_name, KEY_TYPE_STRING_MAX)?;
+    // `key_get_type_from_user()` validates the name it copied before the
+    // description is read at all: empty is -EINVAL, a leading dot is -EPERM.
+    validate_key_type_encoding(&type_name)?;
     let description = if description.is_null() {
         None
     } else {
@@ -289,15 +258,28 @@ pub fn sys_add_key<M: UserMemory + ?Sized>(
             KEY_DESCRIPTION_STRING_MAX,
         )?)
     };
-    let kind = parse_add_key_kind(&type_name, description.as_deref())?;
-    // Linux normalizes an empty description to NULL and then reaches
+    // `add_key()` runs the private-name rule inline, before it copies the
+    // payload and before `key_create_or_update()` looks the type up, so it
+    // outranks both the -EFAULT below and the unknown-type -ENODEV.
+    if add_key_name_is_private(&type_name, description.as_deref()) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    // Linux normalizes an empty description to NULL here and only later reaches
     // `key_alloc()`, which rejects a missing description with -EINVAL. Every
-    // key type this kernel implements needs one.
-    let description = description
-        .filter(|description| !description.is_empty())
-        .ok_or(AxError::InvalidInput)?;
-    let payload = validate_key_payload(memory, kind, &description, payload, plen)?;
-    keyring::add_key(&current_key_actor(), kind, description, payload, keyring)
+    // key type this kernel implements needs one, so the absence is decided by
+    // the keyring manager, after the payload copy and the keyring lookup.
+    let description = description.filter(|description| !description.is_empty());
+    // The payload is copied before `lookup_user_key()` and before the type is
+    // resolved, so an unreadable payload is -EFAULT even when the type or the
+    // destination keyring is itself invalid (`keyctl.c:114-123`).
+    let payload = load_payload(memory, payload, plen)?;
+    keyring::add_key(
+        &current_key_actor(),
+        &type_name,
+        description,
+        payload,
+        keyring,
+    )
 }
 
 pub fn sys_request_key<M: UserMemory + ?Sized>(
@@ -566,21 +548,16 @@ mod tests {
 
     #[test]
     fn add_key_adapter_rejects_private_keyring_prefix_before_type_lookup() {
-        assert_eq!(
-            parse_add_key_kind("keyring", Some(".private")),
-            Err(AxError::OperationNotPermitted)
-        );
-        assert_eq!(
-            parse_add_key_kind("keyring.invalid", Some(".private")),
-            Err(AxError::OperationNotPermitted)
-        );
-        assert_eq!(
-            parse_add_key_kind("user", Some(".public-to-keyring-core")),
-            Ok(KeyTypeKind::User)
-        );
-        assert_eq!(parse_add_key_kind("keyring", Some("")), Ok(KeyTypeKind::Keyring));
-        // A missing description cannot carry the private-name rule.
-        assert_eq!(parse_add_key_kind("keyring", None), Ok(KeyTypeKind::Keyring));
+        assert!(add_key_name_is_private("keyring", Some(".private")));
+        assert!(add_key_name_is_private("keyring.invalid", Some(".private")));
+        assert!(!add_key_name_is_private(
+            "user",
+            Some(".public-to-keyring-core")
+        ));
+        // An empty description is normalized to NULL, so it cannot carry the
+        // private-name rule.
+        assert!(!add_key_name_is_private("keyring", Some("")));
+        assert!(!add_key_name_is_private("keyring", None));
     }
 
     #[test]
@@ -593,18 +570,9 @@ mod tests {
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(validate_key_type_encoding("logon"), Ok(()));
-        assert_eq!(parse_add_key_kind("", None), Err(AxError::InvalidInput));
-        assert_eq!(
-            parse_add_key_kind(".hidden", None),
-            Err(AxError::OperationNotPermitted)
-        );
         // `add_key(2)` is the one entry point that rewrites the registry's
-        // -ENOKEY into -ENODEV.
-        assert_eq!(
-            parse_add_key_kind("bogus", None),
-            Err(AxError::NoSuchDevice)
-        );
-        assert_eq!(parse_add_key_kind("user", None), Ok(KeyTypeKind::User));
+        // -ENOKEY into -ENODEV; the rewrite happens in the keyring manager,
+        // after the destination keyring has been resolved.
         assert_eq!(
             registered_key_type("bogus"),
             Err(AxError::from(LinuxError::ENOKEY))
@@ -627,41 +595,25 @@ mod tests {
     }
 
     #[test]
-    fn big_key_payload_must_be_nonempty() {
+    fn add_key_copies_the_payload_before_the_type_or_keyring_is_resolved() {
+        // `add_key()` copies the payload (`keyctl.c:114-123`) before it
+        // resolves the destination keyring and before `key_create_or_update()`
+        // rewrites the registry's -ENOKEY as -ENODEV, so an unreadable payload
+        // is -EFAULT even when the type and the destination are both invalid.
+        // Every read fails here, which is exactly the unreadable-payload shape
+        // the ordering rule is about. The type-specific length rules now live
+        // in the keyring manager, behind that copy.
         let mut provider = NoMemory;
         let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            validate_key_payload(&mut memory, KeyTypeKind::BigKey, "key", ptr::null(), 0),
-            Err(AxError::InvalidInput)
+            load_payload(&mut memory, ptr::null(), 8),
+            Err(AxError::BadAddress)
         );
-    }
-
-    #[test]
-    fn user_and_logon_payloads_must_be_nonempty() {
-        for kind in [KeyTypeKind::User, KeyTypeKind::Logon] {
-            let mut provider = NoMemory;
-            let mut memory = UserMemoryContext::new(&mut provider);
-            assert_eq!(
-                validate_key_payload(&mut memory, kind, "name:field", ptr::null(), 0),
-                Err(AxError::InvalidInput)
-            );
-        }
-    }
-
-    #[test]
-    fn logon_description_requires_a_nonempty_prefix() {
-        let mut provider = NoMemory;
-        let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            validate_key_payload(
-                &mut memory,
-                KeyTypeKind::Logon,
-                ":secret",
-                [1_u8].as_ptr(),
-                1
-            ),
-            Err(AxError::InvalidInput)
+            load_payload(&mut memory, 0x1000 as *const u8, 32768),
+            Err(AxError::BadAddress)
         );
+        assert_eq!(load_payload(&mut memory, ptr::null(), 0), Ok(Vec::new()));
     }
 
     #[test]

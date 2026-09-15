@@ -4,7 +4,10 @@ use alloc::{string::String, vec};
 
 use tk_linux_cred::{CAPABILITY_WORDS, GroupInfo};
 
-use super::syscall::{valid_rejection_error, validate_instantiated_payload};
+use super::syscall::{
+    valid_rejection_error, validate_created_description, validate_created_payload,
+    validate_instantiated_payload,
+};
 use super::*;
 
 fn actor(tid: u32, pid: u32, uid: u32, gid: u32) -> KeyActor {
@@ -245,8 +248,8 @@ fn initial_special_keyrings_use_real_ids_after_fsids_diverge() {
     let ordinary = manager
         .add_key(
             &owner,
-            KeyTypeKind::User,
-            "fs-owner".to_string(),
+            "user",
+            Some("fs-owner".to_string()),
             vec![1],
             KEY_SPEC_THREAD_KEYRING,
         )
@@ -1167,8 +1170,8 @@ fn public_operations_validate_and_prune_the_actor_namespace_once() {
     let serial = manager
         .add_key(
             &owner,
-            KeyTypeKind::User,
-            "single-ensure".to_string(),
+            "user",
+            Some("single-ensure".to_string()),
             vec![1],
             KEY_SPEC_THREAD_KEYRING,
         )
@@ -1318,8 +1321,8 @@ fn named_join_does_not_reuse_a_possessor_only_keyring() {
     let possessor_only = manager
         .add_key(
             &owner,
-            KeyTypeKind::Keyring,
-            "direct-search-required".to_string(),
+            "keyring",
+            Some("direct-search-required".to_string()),
             Vec::new(),
             KEY_SPEC_THREAD_KEYRING,
         )
@@ -1381,8 +1384,8 @@ fn named_join_skips_quota_owners_unmapped_in_the_publication_namespace() {
     let original = manager
         .add_key(
             &first,
-            KeyTypeKind::Keyring,
-            "mapped-owner".to_string(),
+            "keyring",
+            Some("mapped-owner".to_string()),
             Vec::new(),
             KEY_SPEC_THREAD_KEYRING,
         )
@@ -1433,22 +1436,35 @@ fn public_keyring_names_allow_duplicates_choose_oldest_and_rollback_failures() {
         .special_keyring(KEY_SPEC_PROCESS_KEYRING, &owner, true)
         .unwrap();
 
-    let empty = manager
-        .add_key(
+    // `add_key()` normalizes an empty description to NULL, and `key_alloc()`
+    // rejects a missing description outright, so `add_key()` can never create
+    // an unnamed keyring (security/keys/key.c:235-237).
+    assert_eq!(
+        manager.add_key(
             &owner,
-            KeyTypeKind::Keyring,
-            String::new(),
+            "keyring",
+            Some(String::new()),
             Vec::new(),
             KEY_SPEC_THREAD_KEYRING,
-        )
-        .unwrap() as i32;
-    assert_eq!(manager.keys[&empty].published_name, None);
+        ),
+        Err(AxError::InvalidInput)
+    );
+    assert_eq!(
+        manager.add_key(
+            &owner,
+            "keyring",
+            None,
+            Vec::new(),
+            KEY_SPEC_THREAD_KEYRING,
+        ),
+        Err(AxError::InvalidInput)
+    );
 
     let first = manager
         .add_key(
             &owner,
-            KeyTypeKind::Keyring,
-            "duplicate".to_string(),
+            "keyring",
+            Some("duplicate".to_string()),
             Vec::new(),
             KEY_SPEC_THREAD_KEYRING,
         )
@@ -1456,8 +1472,8 @@ fn public_keyring_names_allow_duplicates_choose_oldest_and_rollback_failures() {
     let second = manager
         .add_key(
             &owner,
-            KeyTypeKind::Keyring,
-            "duplicate".to_string(),
+            "keyring",
+            Some("duplicate".to_string()),
             Vec::new(),
             KEY_SPEC_PROCESS_KEYRING,
         )
@@ -1506,8 +1522,8 @@ fn public_keyring_names_allow_duplicates_choose_oldest_and_rollback_failures() {
     let private = manager
         .add_key(
             &owner,
-            KeyTypeKind::Keyring,
-            ".private".to_string(),
+            "keyring",
+            Some(".private".to_string()),
             Vec::new(),
             KEY_SPEC_THREAD_KEYRING,
         )
@@ -1523,8 +1539,8 @@ fn public_keyring_names_allow_duplicates_choose_oldest_and_rollback_failures() {
     assert_eq!(
         manager.add_key(
             &owner,
-            KeyTypeKind::Keyring,
-            "order-exhausted".to_string(),
+            "keyring",
+            Some("order-exhausted".to_string()),
             Vec::new(),
             KEY_SPEC_THREAD_KEYRING,
         ),
@@ -3113,3 +3129,122 @@ fn exiting_constructor_retires_key_and_both_authority_indexes() {
             Ok(())
         );
     }
+
+
+#[test]
+fn add_key_resolves_the_destination_before_the_key_type() {
+    // `add_key()` resolves the target keyring with `lookup_user_key()`
+    // (security/keys/keyctl.c:126) and only then calls
+    // `key_create_or_update()`, which rewrites the registry's -ENOKEY as
+    // -ENODEV (security/keys/key.c:828-831). A missing destination therefore
+    // outranks an unknown type, and the unknown type outranks every payload
+    // rule below it.
+    let owner = actor(40, 40, 1000, 1000);
+    let mut manager = KeyManager::new();
+
+    // No such keyring serial: -ENOKEY, whatever the type name says.
+    assert_eq!(
+        manager.add_key(&owner, "bogus", Some("d".to_string()), vec![1], 0x7fff_fff0),
+        Err(LinuxError::ENOKEY.into())
+    );
+    // A resolvable keyring: the unknown type is -ENODEV.
+    assert_eq!(
+        manager.add_key(
+            &owner,
+            "bogus",
+            Some("d".to_string()),
+            vec![1],
+            KEY_SPEC_THREAD_KEYRING,
+        ),
+        Err(AxError::NoSuchDevice)
+    );
+    // The payload rule is judged after the type: a `keyring` with a payload is
+    // -EINVAL even though the type itself is known.
+    assert_eq!(
+        manager.add_key(
+            &owner,
+            "keyring",
+            Some("ring".to_string()),
+            vec![1],
+            KEY_SPEC_THREAD_KEYRING,
+        ),
+        Err(AxError::InvalidInput)
+    );
+    // A missing description is judged after all of them.
+    assert_eq!(
+        manager.add_key(&owner, "keyring", None, Vec::new(), 0x7fff_fff0),
+        Err(LinuxError::ENOKEY.into())
+    );
+    assert_eq!(
+        manager.add_key(&owner, "bogus", None, Vec::new(), KEY_SPEC_THREAD_KEYRING),
+        Err(AxError::NoSuchDevice)
+    );
+    assert_eq!(
+        manager.add_key(&owner, "user", None, vec![1], KEY_SPEC_THREAD_KEYRING),
+        Err(AxError::InvalidInput)
+    );
+}
+
+#[test]
+fn created_payload_follows_the_key_type_preparse_rules() {
+    // `keyring_preparse()`, `user_preparse()` and the `big_key` rule, as
+    // `key_create_or_update()` applies them before `key_alloc()`.
+    assert_eq!(
+        validate_created_payload(KeyTypeKind::User, 0),
+        Err(AxError::InvalidInput)
+    );
+    assert_eq!(validate_created_payload(KeyTypeKind::User, 1), Ok(()));
+    assert_eq!(validate_created_payload(KeyTypeKind::User, 32767), Ok(()));
+    assert_eq!(
+        validate_created_payload(KeyTypeKind::User, 32768),
+        Err(AxError::InvalidInput)
+    );
+    assert_eq!(
+        validate_created_payload(KeyTypeKind::Logon, 0),
+        Err(AxError::InvalidInput)
+    );
+    assert_eq!(validate_created_payload(KeyTypeKind::Logon, 1), Ok(()));
+    assert_eq!(
+        validate_created_payload(KeyTypeKind::BigKey, 0),
+        Err(AxError::InvalidInput)
+    );
+    assert_eq!(
+        validate_created_payload(KeyTypeKind::BigKey, 1 << 20),
+        Ok(())
+    );
+    assert_eq!(
+        validate_created_payload(KeyTypeKind::BigKey, (1 << 20) + 1),
+        Err(AxError::InvalidInput)
+    );
+    // `keyring_preparse()` rejects any payload at all.
+    assert_eq!(validate_created_payload(KeyTypeKind::Keyring, 0), Ok(()));
+    assert_eq!(
+        validate_created_payload(KeyTypeKind::Keyring, 1),
+        Err(AxError::InvalidInput)
+    );
+}
+
+#[test]
+fn created_description_follows_key_alloc_and_logon_vet_description() {
+    assert_eq!(
+        validate_created_description(KeyTypeKind::User, "name"),
+        Ok(())
+    );
+    assert_eq!(
+        validate_created_description(KeyTypeKind::User, ""),
+        Err(AxError::InvalidInput)
+    );
+    // `logon_vet_description()` requires a ':' that is not the first byte.
+    assert_eq!(
+        validate_created_description(KeyTypeKind::Logon, "name"),
+        Err(AxError::InvalidInput)
+    );
+    assert_eq!(
+        validate_created_description(KeyTypeKind::Logon, ":secret"),
+        Err(AxError::InvalidInput)
+    );
+    assert_eq!(
+        validate_created_description(KeyTypeKind::Logon, "service:secret"),
+        Ok(())
+    );
+}

@@ -48,6 +48,63 @@ pub(super) fn validate_instantiated_payload(kind: KeyTypeKind, payload: &[u8]) -
     Ok(())
 }
 
+/// The key type's payload rule as `key_create_or_update()` applies it.
+///
+/// `__key_create_or_update()` looks the type up and calls
+/// `index_key.type->preparse()` before the update search and before
+/// `key_alloc()`, so the payload length is judged after the destination
+/// keyring has been resolved and the type has been looked up:
+///
+/// ```text
+/// index_key.type = key_type_lookup(type);              // key.c:828
+/// if (IS_ERR(index_key.type)) { key_ref = ERR_PTR(-ENODEV); ... } // key.c:830
+/// ...
+/// if (index_key.type->preparse) {                      // key.c:856
+///         ret = index_key.type->preparse(&prep);       // key.c:857
+/// ```
+///
+/// `keyring_preparse()` rejects any payload at all (`keyring.c:123-126`:
+/// `return prep->datalen != 0 ? -EINVAL : 0;`), `user_preparse()` — installed
+/// by both the `user` and the `logon` type — rejects
+/// `datalen == 0 || datalen > 32767` (`user_defined.c:64`), and
+/// `big_key_preparse()` rejects `datalen == 0 || datalen > 1024 * 1024`
+/// (`big_key.c:69-70`).
+pub(super) fn validate_created_payload(kind: KeyTypeKind, plen: usize) -> AxResult<()> {
+    match kind {
+        KeyTypeKind::Keyring => {
+            if plen != 0 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        KeyTypeKind::User | KeyTypeKind::Logon | KeyTypeKind::BigKey => {
+            if plen == 0 || plen > kind.payload_limit() {
+                return Err(AxError::InvalidInput);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `key_alloc()`'s description rules for a newly created key.
+///
+/// `key_alloc()` rejects a missing or empty description outright
+/// (`key.c:235-237`: `key = ERR_PTR(-EINVAL); if (!desc || !*desc) goto
+/// error;`), and the `logon` type then vets the description through
+/// `logon_vet_description()` (`key.c:239-245`), which requires a `:` that is
+/// not the first character (`user_defined.c:193-207`).
+pub(super) fn validate_created_description(
+    kind: KeyTypeKind,
+    description: &str,
+) -> AxResult<()> {
+    if description.is_empty() {
+        return Err(AxError::InvalidInput);
+    }
+    if kind == KeyTypeKind::Logon && description.find(':').is_none_or(|colon| colon == 0) {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
 impl KeyManager {
     fn complete_construction(
         &mut self,
@@ -113,11 +170,19 @@ impl KeyManager {
         crate::keyring::service::notify_request_key_waiters();
         Ok(())
     }
+    /// `add_key()`'s `key_create_or_update()` with Linux's argument order.
+    ///
+    /// The destination keyring is resolved first (`keyctl.c:126`:
+    /// `keyring_ref = lookup_user_key(ringid, KEY_LOOKUP_CREATE,
+    /// KEY_NEED_WRITE);`), and only then does `__key_create_or_update()` look
+    /// the type up and rewrite the registry's `-ENOKEY` as `-ENODEV`
+    /// (`key.c:828-832`). The payload shape and the description are judged
+    /// last, in the order `preparse()` then `key_alloc()` apply them.
     pub(in crate::keyring) fn add_key(
         &mut self,
         actor: &KeyActor,
-        kind: KeyTypeKind,
-        description: String,
+        type_name: &str,
+        description: Option<String>,
         payload: Vec<u8>,
         keyring: i32,
     ) -> AxResult<isize> {
@@ -127,6 +192,14 @@ impl KeyManager {
         if !manager.keyring_has_write(keyring, actor)? {
             return Err(LinuxError::EACCES.into());
         }
+        let kind = KeyTypeKind::from_name(type_name).ok_or(AxError::NoSuchDevice)?;
+        validate_created_payload(kind, payload.len())?;
+        // Linux normalizes an empty description to NULL in `add_key()` and
+        // reaches `key_alloc()` with no description at all.
+        let description = description
+            .filter(|description| !description.is_empty())
+            .ok_or(AxError::InvalidInput)?;
+        validate_created_description(kind, &description)?;
         if kind.supports_payload_update()
             && let Some(serial) = manager.find_linked_key(keyring.serial, kind, &description)
         {
@@ -137,9 +210,7 @@ impl KeyManager {
             return Ok(serial as isize);
         }
 
-        let publish_name = kind == KeyTypeKind::Keyring
-            && !description.is_empty()
-            && !description.starts_with('.');
+        let publish_name = kind == KeyTypeKind::Keyring && !description.starts_with('.');
 
         manager.check_link_destination(keyring.serial)?;
         let key = Key::positive(

@@ -33,8 +33,14 @@
  *                 - plen > 1024*1024-1 is -EINVAL before any user access
  *                 - the type name is empty (-EINVAL), dot-prefixed (-EPERM)
  *                   or unknown (-ENODEV)
- *                 - a private "keyring.*" description is -EPERM
- *                 - a "user" payload must be 1..=32767 bytes
+ *                 - a private "keyring.*" description is -EPERM, before the
+ *                   payload copy and before the type is looked up
+ *                 - the payload is copied before the destination keyring is
+ *                   resolved, so an unreadable payload is -EFAULT whatever
+ *                   else is wrong; a missing keyring is -ENOKEY and outranks
+ *                   the unknown-type -ENODEV
+ *                 - a "user" payload must be 1..=32767 bytes, a rule the copy
+ *                   comes first for
  *   request_key(2) security/keys/keyctl.c
  *                 - a NULL callout_info with no cached key is -ENOKEY and
  *                   never starts an upcall
@@ -56,6 +62,11 @@
  *                   -ENOENT
  *                 - KEYCTL_UPDATE is -EINVAL above one page
  *                 - KEYCTL_JOIN_SESSION_KEYRING rejects an empty name
+ *
+ * KEYCTL_GET_SECURITY, KEYCTL_DH_COMPUTE and KEYCTL_WATCH_KEY are
+ * deliberately absent: their answers depend on the build configuration (LSM
+ * choice, CONFIG_KEY_DH_OPERATIONS, CONFIG_KEY_NOTIFICATIONS) rather than on
+ * a rule of the ABI, so no portable assertion exists for them.
  */
 
 #define KEY_SPEC_PROCESS_KEYRING (-2)
@@ -241,6 +252,40 @@ static int test_add_key_validation(void) {
                      do_add_key("keyring", ".kr-private", payload, 0,
                                 KEY_SPEC_PROCESS_KEYRING),
                      EPERM))
+        return 1;
+    /* The inline private-name rule runs before the payload copy
+     * (security/keys/keyctl.c:104-108), before `lookup_user_key()` resolves
+     * the destination (:126) and before `key_create_or_update()` looks the
+     * type up, so it survives both. */
+    errno = 0;
+    if (expect_errno("add-key-private-keyring-missing-destination",
+                     do_add_key("keyring", ".kr-private", NULL, 0, 0x7ffffff0),
+                     EPERM))
+        return 1;
+    /* The payload is copied before `lookup_user_key()`, so an unreadable
+     * payload is -EFAULT even for an unknown type. */
+    errno = 0;
+    if (expect_errno("add-key-unreadable-payload-unknown-type",
+                     do_add_key("kr-bogus-type", "kr-desc", NULL, 8,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EFAULT))
+        return 1;
+    /* The 32767-byte `user` ceiling lives in `user_preparse()`, which runs
+     * inside `key_create_or_update()`: the copy comes first, so an unreadable
+     * oversized payload is -EFAULT rather than -EINVAL. */
+    errno = 0;
+    if (expect_errno("add-key-unreadable-oversized-payload",
+                     do_add_key("user", "kr-desc", NULL, 32768,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EFAULT))
+        return 1;
+    /* The destination keyring is resolved before `key_create_or_update()`
+     * rewrites the registry's -ENOKEY as -ENODEV, so a missing keyring wins. */
+    errno = 0;
+    if (expect_errno("add-key-missing-keyring-unknown-type",
+                     do_add_key("kr-bogus-type", "kr-desc", payload, 1,
+                                0x7ffffff0),
+                     ENOKEY))
         return 1;
     key = do_add_key("user", "kr-alpha", payload, 8, KEY_SPEC_PROCESS_KEYRING);
     if (key <= 0)
@@ -452,6 +497,15 @@ static int test_keyctl_validation(void) {
                                (unsigned long)(uintptr_t)"", 0, 0, 0), EINVAL))
         return 1;
 
+    /* KEYCTL_DH_COMPUTE and KEYCTL_WATCH_KEY are deliberately not asserted:
+     * their answers are configuration dependent, not ABI constants.  Both
+     * commands are compiled out only when the kernel is built without
+     * CONFIG_KEY_DH_OPERATIONS and CONFIG_KEY_NOTIFICATIONS (the latter
+     * depends on CONFIG_WATCH_QUEUE), in which case their stubs return
+     * -EOPNOTSUPP before looking at an argument (security/keys/internal.h:
+     * 292-298 and :352-358).  With those options enabled the same call
+     * reaches the real implementation, so no single errno is portable. */
+    (void)ring;
     return 0;
 }
 
