@@ -680,13 +680,37 @@ impl MountTopology {
         Ok(visible)
     }
 
+    /// Clones this namespace's mount ledger into a new namespace.
+    ///
     /// CLONE_NEWNS copies the mount graph while sharing superblocks and
     /// immutable idmap objects.  Subsequent prepare/commit operations mutate
     /// only the returned namespace's ledger.
+    ///
+    /// `empty` selects `copy_mnt_ns()`'s `CLONE_EMPTY_MNTNS` shape, which
+    /// holds a clone of the namespace root and no submounts:
+    ///
+    /// ```c
+    /// 	if (flags & CLONE_EMPTY_MNTNS)
+    /// 		copy_flags = 0;
+    /// 	else
+    /// 		copy_flags = CL_COPY_UNBINDABLE | CL_EXPIRE;
+    /// 	...
+    /// 	if (flags & CLONE_EMPTY_MNTNS)
+    /// 		new = clone_mnt(old, old->mnt.mnt_root, copy_flags);
+    /// 	else
+    /// 		new = copy_tree(old, old->mnt.mnt_root, copy_flags);
+    /// ```
+    ///
+    /// (`fs/namespace.c`:4258-4270).  `clone_mnt()` copies one vfsmount, so
+    /// the result has no child mounts; the caller then re-points
+    /// `fs->root`/`fs->pwd` at the clone (`:4279-4291`), which is what
+    /// `visible_root_location()` already answers for a namespace whose root has
+    /// nothing stacked on it.
     pub(crate) fn try_prepare_clone_namespace(
         &self,
         namespace_id: u64,
         lock_mounts: bool,
+        empty: bool,
     ) -> AxResult<PreparedMountTopologyClone> {
         // Materialize both the ledger and its per-mount authority from one
         // topology generation.  A separate `try_records()` lock acquisition
@@ -750,10 +774,17 @@ impl MountTopology {
         // mount layered on top of it, so the resolution root is replaced by
         // that mount's clone as soon as it is attached (see below).
         let mut context = axfs::FsContext::new(root_clone.root_location());
-        let mut pending = source
-            .into_iter()
-            .filter(|record| record.parent_id != 0)
-            .collect::<Vec<_>>();
+        // `CLONE_EMPTY_MNTNS` stops after the namespace root: the cloned
+        // namespace holds exactly the mount `ns->root` named, and every other
+        // record this topology carries stays behind in the source namespace.
+        let mut pending = if empty {
+            Vec::new()
+        } else {
+            source
+                .into_iter()
+                .filter(|record| record.parent_id != 0)
+                .collect::<Vec<_>>()
+        };
         while !pending.is_empty() {
             let before = pending.len();
             let mut next = Vec::new();
@@ -4460,7 +4491,7 @@ mod tests {
             .map(|record| Mount::try_from_record(record, None).unwrap())
             .collect();
         let source = MountTopology::try_new(41, mounts).unwrap();
-        let clone = source.try_prepare_clone_namespace(42, false).unwrap();
+        let clone = source.try_prepare_clone_namespace(42, false, false).unwrap();
         let copied = clone.topology().try_records().unwrap();
         let root = copied.iter().find(|record| record.parent_id == 0).unwrap();
         let child = copied.iter().find(|record| record.parent_id != 0).unwrap();
@@ -4474,6 +4505,46 @@ mod tests {
             .lookup_no_follow(axfs_ng_vfs::FsName::new(b"newroot"))
             .unwrap();
         assert_eq!(resolved.mountpoint().mount_id(), child.mount_id);
+        assert!(old_root.is_root());
+        assert_eq!(
+            old_child.location().unwrap().mountpoint().mount_id(),
+            old_root.mount_id()
+        );
+    }
+
+    #[test]
+    fn empty_namespace_clone_keeps_only_the_namespace_root() {
+        let _context = crate::test_support::scheduler_test_context();
+        let _operation = namespace_operation();
+        let (old_root, old_child, records) = mounted_root_with_child();
+        let mounts = records
+            .iter()
+            .map(|record| Mount::try_from_record(record, None).unwrap())
+            .collect();
+        let source = MountTopology::try_new(44, mounts).unwrap();
+        // `copy_mnt_ns()`'s CLONE_EMPTY_MNTNS shape: `clone_mnt()` of
+        // `ns->root` with no submounts, and the caller re-points root and pwd
+        // at that clone (`fs/namespace.c`:4258-4291).
+        let clone = source.try_prepare_clone_namespace(45, false, true).unwrap();
+        let copied = clone.topology().try_records().unwrap();
+        assert_eq!(copied.len(), 1);
+        let root = &copied[0];
+        assert_eq!(root.parent_id, 0);
+        assert_ne!(root.mount_id, old_root.mount_id());
+        // The child mount of the source namespace stayed behind, so the
+        // cloned root is the only mount a task entering it can reach.
+        assert!(!copied.iter().any(|record| record.mount_id == old_child.mount_id()));
+        let visible = clone.topology().visible_root_location().unwrap();
+        assert_eq!(visible.mountpoint().mount_id(), root.mount_id);
+        // The directory the child mount covered still exists on the root
+        // mount's own filesystem -- the clone shares its superblock -- but it
+        // is not a mount any more: resolution stays on the cloned root.
+        let resolved = visible
+            .lookup_no_follow(axfs_ng_vfs::FsName::new(b"newroot"))
+            .unwrap();
+        assert_eq!(resolved.mountpoint().mount_id(), root.mount_id);
+        // The source namespace is untouched: its child still hangs off its
+        // own root.
         assert!(old_root.is_root());
         assert_eq!(
             old_child.location().unwrap().mountpoint().mount_id(),

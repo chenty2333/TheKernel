@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/statfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -96,8 +97,16 @@
 #define CLONE_THREAD 0x00010000UL
 #define CLONE_SIGHAND 0x00000800UL
 #define CLONE_VM 0x00000100UL
+#define CLONE_FS 0x00000200UL
 #define CLONE_PARENT 0x00008000UL
 #define CLONE_AUTOREAP (1UL << 34)
+/* include/uapi/linux/sched.h:42.  Above the 32-bit window clone(2) reads its
+ * flags from (`lower_32_bits(clone_flags)`, kernel/fork.c:2880), so only
+ * clone3(2) can ask for it. */
+#define CLONE_EMPTY_MNTNS (1UL << 37)
+/* include/uapi/linux/magic.h:107, the magic `nullfs_fs_fill_super()` installs
+ * (fs/nullfs.c:18) and `simple_statfs()` reports as f_type. */
+#define NULL_FS_MAGIC 0x4E554C4CUL
 
 #define CAP_VERSION_3 0x20080522U
 #define NR_MOVE_PAGES 279
@@ -595,6 +604,97 @@ static long clone3_call(struct clone_args_wire *args, unsigned long size) {
     return syscall(SYS_clone3, args, size);
 }
 
+/* What a `CLONE_EMPTY_MNTNS` child is born into.
+ *
+ * `kernel_clone()` turns the flag into CLONE_NEWNS before `copy_process()`
+ * validates anything (kernel/fork.c:2703-2711), `copy_fs()` has already given
+ * the child its own fs_struct when `copy_namespaces()` runs
+ * (kernel/fork.c:2280,2292), and `copy_mnt_ns()` then clones only the
+ * namespace root -- the immutable nullfs (fs/namespace.c:6185-6212) -- rather
+ * than copying the tree, re-pointing the child's fs->root and fs->pwd at that
+ * clone (fs/namespace.c:4279-4291).
+ *
+ * So the child's "/" is the cloned nullfs: reachable, a directory, reporting
+ * NULL_FS_MAGIC, with pwd reset to it -- and every path that lived on a
+ * submount of the parent's namespace (the whole rootfs, /proc) is -ENOENT.  A
+ * clone that merely copied the parent's tree would still report the rootfs
+ * magic and still resolve those paths.
+ *
+ * One bit per observation, so the parent can assert each group separately:
+ *   2  "/" resolves and its statfs() magic is NULL_FS_MAGIC
+ *   4  "/" opens as a directory, so the cloned root mount is usable
+ *   8  getcwd() is "/"
+ *   16 a path that exists in the parent namespace is -ENOENT
+ *   32 /proc/uptime, a submount of the parent namespace, is -ENOENT
+ * 16 and 32 are only set when the path really was reachable before the clone,
+ * so a missing probe target can never be mistaken for a namespace that dropped
+ * it. */
+/* A diagnostic, never an assertion: the records this case registers are the
+ * ASSERT tokens the parent prints, so an observation that fails here still has
+ * to fail through them.  stderr is a descriptor, not a path, so this works from
+ * inside an empty mount namespace. */
+static void probe_note(const char *what, int error) {
+    fprintf(stderr, "THEKERNEL_EMPTY_MNTNS_PROBE %s errno=%d (%s)\n", what, error,
+            strerror(error));
+}
+
+/* The child is already inside the empty namespace when this runs, so whether
+ * the two probe targets were reachable has to be answered by the parent and
+ * passed down: asking again here would report every namespace as having
+ * dropped paths that were never visible to the child. */
+static int empty_namespace_observations(const char *rootfs_path, int rootfs_was_reachable,
+                                        int proc_was_reachable) {
+    int observed = 0;
+    struct statfs root_fs;
+    char cwd[8];
+    int fd;
+
+    errno = 0;
+    if (statfs("/", &root_fs) == 0) {
+        if ((unsigned long)root_fs.f_type == NULL_FS_MAGIC) {
+            observed |= 2;
+        } else {
+            fprintf(stderr, "THEKERNEL_EMPTY_MNTNS_PROBE statfs-root magic=0x%lx\n",
+                    (unsigned long)root_fs.f_type);
+        }
+    } else {
+        probe_note("statfs-root", errno);
+    }
+    errno = 0;
+    fd = open("/", O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) {
+        observed |= 4;
+        close(fd);
+    } else {
+        probe_note("open-root", errno);
+    }
+    errno = 0;
+    if (getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/") == 0) {
+        observed |= 8;
+    } else {
+        probe_note("getcwd", errno);
+    }
+    errno = 0;
+    if (rootfs_was_reachable && access(rootfs_path, F_OK) == -1 && errno == ENOENT) {
+        observed |= 16;
+    } else if (rootfs_was_reachable) {
+        probe_note("rootfs-still-reachable", errno);
+    }
+    errno = 0;
+    if (proc_was_reachable && access("/proc/uptime", F_OK) == -1 && errno == ENOENT) {
+        observed |= 32;
+    } else if (proc_was_reachable) {
+        probe_note("proc-still-reachable", errno);
+    }
+    if (!rootfs_was_reachable) {
+        probe_note("rootfs-probe-absent", ENOENT);
+    }
+    if (!proc_was_reachable) {
+        probe_note("proc-probe-absent", ENOENT);
+    }
+    return observed;
+}
+
 /* clone3 refuses sizes below the known prefix, an untruncated exit signal in
  * the flag word, deprecated CLONE_DETACHED, and the autoreap combinations
  * that copy_process() rejects. CLONE_NEWTIME is a flag clone3 alone can
@@ -659,6 +759,69 @@ static void clone3_case(void) {
               "autoreap-child-not-waitable");
     }
     mark("AUTOREAP");
+
+    /* CLONE_EMPTY_MNTNS: a mount namespace holding a clone of the parent's
+     * namespace root and nothing else.  The empty namespace belongs to the
+     * child alone, so -- unlike the unshare(2) spelling -- the probe does not
+     * disturb the parent, and the child reports its observations through its
+     * exit status. */
+    static const char *const rootfs_probes[] = {
+        "/opt/thekernel-tests/portable/task-control-differential",
+        "/bin/busybox",
+        "/etc/passwd",
+    };
+    const char *rootfs_probe = NULL;
+    int observed = 0;
+
+    for (size_t index = 0; index < sizeof(rootfs_probes) / sizeof(rootfs_probes[0]); ++index) {
+        if (access(rootfs_probes[index], F_OK) == 0) {
+            rootfs_probe = rootfs_probes[index];
+            break;
+        }
+    }
+    /* The implication is applied before validation: `copy_process()` refuses
+     * CLONE_NEWNS|CLONE_FS (kernel/fork.c:2011-2012), and by then
+     * CLONE_EMPTY_MNTNS has already become CLONE_NEWNS
+     * (kernel/fork.c:2703-2711). */
+    args.flags = CLONE_EMPTY_MNTNS | CLONE_FS;
+    args.exit_signal = 0;
+    check(clone3_call(&args, sizeof(args)) == -1 && errno == EINVAL,
+          "empty-mntns-implies-a-new-namespace");
+
+    /* Both targets have to be reachable in the parent's namespace, or "gone in
+     * the child" would say nothing; the child is a copy of this process and
+     * reads the answers from here. */
+    int rootfs_was_reachable = rootfs_probe != NULL && access(rootfs_probe, F_OK) == 0;
+    int proc_was_reachable = access("/proc/uptime", F_OK) == 0;
+
+    args.flags = CLONE_EMPTY_MNTNS;
+    args.exit_signal = 17;
+    fflush(stdout);
+    child = clone3_call(&args, sizeof(args));
+    if (child == 0) {
+        _exit(empty_namespace_observations(rootfs_probe, rootfs_was_reachable,
+                                           proc_was_reachable));
+    }
+    if (child < 0) {
+        /* A guest without CAP_SYS_ADMIN cannot create a mount namespace. Both
+         * kernels must then refuse the request as EPERM, not as EINVAL: the
+         * flag itself is admitted either way. */
+        check(errno == EPERM, "empty-mntns-without-capability");
+    } else {
+        check(waitpid((pid_t)child, &status, 0) == (pid_t)child && WIFEXITED(status),
+              "empty-mntns-child-exits");
+        if (WIFEXITED(status)) {
+            observed = WEXITSTATUS(status);
+        }
+    }
+    if (child > 0) {
+        errno = observed;
+        check((observed & (2 | 4 | 8)) == (2 | 4 | 8),
+              "empty-mntns-child-root-is-namespace-root");
+        errno = observed;
+        check((observed & (16 | 32)) == (16 | 32), "empty-mntns-child-drops-submounts");
+    }
+    mark("EMPTY_MNTNS");
     done();
 }
 

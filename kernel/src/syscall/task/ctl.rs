@@ -109,6 +109,18 @@ struct KcmpEpollSlot {
     tfd: u32,
     toff: u32,
 }
+/// `UNSHARE_EMPTY_MNTNS`, unshare(2)'s own spelling of "new mount namespace,
+/// but empty" (`include/uapi/linux/sched.h`:54):
+///
+/// ```c
+/// #define UNSHARE_EMPTY_MNTNS 0x00100000 /* Unshare an empty mount namespace. */
+/// ```
+///
+/// It is bit 20, the same bit as `CLONE_PARENT_SETTID`, because unshare(2)
+/// shares the clone flag space but not every clone flag meaning.  `clone3(2)`
+/// spells the same request as `CLONE_EMPTY_MNTNS`, a 64-bit bit
+/// (`include/uapi/linux/sched.h`:42).
+const UNSHARE_EMPTY_MNTNS: u32 = 0x0010_0000;
 const UNSHARE_SUPPORTED_FLAGS: u32 = CLONE_FILES
     | CLONE_FS
     | CLONE_NEWNS
@@ -119,7 +131,8 @@ const UNSHARE_SUPPORTED_FLAGS: u32 = CLONE_FILES
     | CLONE_NEWUTS
     | CLONE_NEWTIME
     | CLONE_NEWPID
-    | CLONE_SYSVSEM;
+    | CLONE_SYSVSEM
+    | UNSHARE_EMPTY_MNTNS;
 /// `CLONE_THREAD`, `CLONE_SIGHAND` and `CLONE_VM` are *recognised but inert*:
 /// `check_unshare_flags()` accepts them and then nothing in `ksys_unshare()`
 /// consumes them, so a single-threaded caller gets a successful no-op.  They
@@ -137,23 +150,23 @@ const UNSHARE_INERT_FLAGS: u32 = CLONE_THREAD | CLONE_SIGHAND | CLONE_VM;
 ///
 /// `CLONE_NS_ALL` is `CLONE_NEWTIME|CLONE_NEWNS|CLONE_NEWCGROUP|CLONE_NEWUTS|
 /// CLONE_NEWIPC|CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET`, all of which are
-/// listed literally in `UNSHARE_SUPPORTED_FLAGS`.  `UNSHARE_EMPTY_MNTNS` is
-/// the one member of the Linux mask TheKernel still rejects, and it is the
-/// 32-bit *unshare-only* spelling at `include/uapi/linux/sched.h:54`:
+/// listed literally in `UNSHARE_SUPPORTED_FLAGS`, as is `UNSHARE_EMPTY_MNTNS`.
+/// The 64-bit `CLONE_EMPTY_MNTNS` (`1ULL << 37`, sched.h:42) is *not* in that
+/// mask, and the argument-width check above rejects it for unshare(2) exactly
+/// as Linux's `check_unshare_flags()` mask does: `unshare(2)` reads the flag as
+/// the 32-bit `UNSHARE_EMPTY_MNTNS` instead.  `unshare_nsproxy_namespaces()`
+/// performs that translation, dropping the alias bit as it does so:
 ///
 /// ```c
-/// #define UNSHARE_EMPTY_MNTNS 0x00100000 /* Unshare an empty mount namespace. */
+/// 	if (flags & UNSHARE_EMPTY_MNTNS) {
+/// 		flags &= ~(u64)UNSHARE_EMPTY_MNTNS;
+/// 		flags |= CLONE_EMPTY_MNTNS;
+/// 	}
 /// ```
 ///
-/// It is not `CLONE_EMPTY_MNTNS` (`1ULL << 37`, sched.h:42), which is a
-/// `clone3`-only 64-bit flag and is rejected by the argument-width check above
-/// exactly as Linux's `check_unshare_flags()` mask rejects it.  Linux accepts
-/// `UNSHARE_EMPTY_MNTNS` (it aliases `CLONE_PARENT_SETTID`) and converts it to
-/// `CLONE_EMPTY_MNTNS` in `unshare_nsproxy_namespaces()` (kernel/nsproxy.c);
-/// `copy_mnt_ns()` then builds a namespace holding only a clone of the current
-/// root mount and resets `fs->root`/`fs->pwd` to it (fs/namespace.c).  TheKernel
-/// has no root-mount-only mount-namespace constructor, so it still refuses the
-/// bit with -EINVAL instead of creating that namespace.
+/// (`kernel/nsproxy.c`:226-232).  `copy_mnt_ns()` then builds a namespace
+/// holding only a clone of the current root mount and resets
+/// `fs->root`/`fs->pwd` to it (`fs/namespace.c`:4258-4291).
 const UNSHARE_RECOGNIZED_FLAGS: u32 =
     UNSHARE_SUPPORTED_FLAGS | UNSHARE_INERT_FLAGS;
 const SETNS_PIDFD_ALLOWED_FLAGS: u32 = CLONE_NEWNS
@@ -755,6 +768,14 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
     // The implications matter because the *implied* CLONE_THREAD is what makes
     // `unshare(CLONE_VM)` and `unshare(CLONE_NEWUSER)` fail with -EINVAL in a
     // multithreaded caller: the thread-group check below tests the union.
+    // `UNSHARE_EMPTY_MNTNS` is the one flag that has to survive this block on
+    // its own: it is 32-bit bit 20, so it cannot be carried into the 64-bit
+    // `CLONE_EMPTY_MNTNS` bit the mount code reads, and the width check above
+    // would reject that spelling.  Take the request out of the flag word here
+    // and hand it to the mount-namespace clone, which is where
+    // `unshare_nsproxy_namespaces()`'s translation lands as well
+    // (`kernel/nsproxy.c`:226-232).
+    let empty_mount_namespace = flags & UNSHARE_EMPTY_MNTNS != 0;
     let flags = {
         let mut flags = flags;
         if flags & CLONE_NEWUSER != 0 {
@@ -765,6 +786,17 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
         }
         if flags & CLONE_SIGHAND != 0 {
             flags |= CLONE_THREAD;
+        }
+        // 	if (unshare_flags & UNSHARE_EMPTY_MNTNS)
+        // 		unshare_flags |= CLONE_NEWNS;
+        // 	if (unshare_flags & CLONE_NEWNS)
+        // 		unshare_flags |= CLONE_FS;
+        //
+        // (`kernel/fork.c`:3245-3248).  The implied CLONE_FS is what makes the
+        // caller's `fs_struct` private before its root and pwd are re-pointed
+        // into the empty namespace.
+        if empty_mount_namespace {
+            flags |= CLONE_NEWNS;
         }
         if flags & CLONE_NEWNS != 0 {
             flags |= CLONE_FS;
@@ -876,7 +908,9 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
                 // namespace/fs publication below: that commit is independent
                 // of topology mutation and may drop old filesystem objects.
                 let _topology_snapshot = crate::mounts::namespace_operation();
-                let mount_ns = thread.mount_ns().try_fork(namespace_owner.clone())?;
+                let mount_ns = thread
+                    .mount_ns()
+                    .try_fork(namespace_owner.clone(), empty_mount_namespace)?;
                 let root = mount_ns.root_location()?;
                 // CLONE_NEWNS clones a mount topology; it is neither chroot(2)
                 // nor chdir(2).  The cloned topology has distinct VFS mount
@@ -886,7 +920,16 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
                 // namespace proxy or fs_struct is published.  This also
                 // retains the caller's umask/security view while authority
                 // for every mount idmap remains in the cloned topology.
-                let fs_context = thread.prepare_fs_context_for_cloned_mount_namespace(root)?;
+                let fs_context = if empty_mount_namespace {
+                    // An empty namespace holds nothing but a clone of the
+                    // namespace root, so the caller's old root and pwd paths
+                    // cannot be looked up in it: `copy_mnt_ns()` re-points both
+                    // at the cloned root mount instead (`fs/namespace.c`:
+                    // 4279-4291), which is the re-pointing setns performs.
+                    thread.prepare_fs_context_for_mount_namespace(root)?
+                } else {
+                    thread.prepare_fs_context_for_cloned_mount_namespace(root)?
+                };
                 (Some(mount_ns), Some(fs_context))
             } else {
                 (None, None)

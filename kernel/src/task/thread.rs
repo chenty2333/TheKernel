@@ -2201,6 +2201,35 @@ impl Thread {
     /// namespace being entered.  No task slot is replaced here: setns can
     /// therefore complete every fallible path-resolution update before its
     /// namespace/credential commit becomes visible.
+    ///
+    /// Both halves of the pair move together because this is what Linux does
+    /// whenever a task acquires a mount namespace it did not inherit a usable
+    /// root for: `mntns_install()` resolves the new namespace's root and makes
+    /// it the task's root *and* pwd, and `copy_mnt_ns()` does the same for a
+    /// `CLONE_EMPTY_MNTNS` child, whose namespace holds nothing but a clone of
+    /// the old `ns->root`:
+    ///
+    /// ```c
+    /// 	if (flags & CLONE_EMPTY_MNTNS) {
+    /// 		/*
+    /// 		 * Empty mount namespace: only the root mount exists.
+    /// 		 * Reset root and pwd to the cloned mount's root dentry.
+    /// 		 */
+    /// 		if (new_fs) {
+    /// 			old_root = new_fs->root;
+    /// 			old_pwd = new_fs->pwd;
+    ///
+    /// 			new_fs->root.mnt = mntget(&new->mnt);
+    /// 			new_fs->root.dentry = dget(new->mnt.mnt_root);
+    ///
+    /// 			new_fs->pwd.mnt = mntget(&new->mnt);
+    /// 			new_fs->pwd.dentry = dget(new->mnt.mnt_root);
+    /// 		}
+    /// ```
+    ///
+    /// (`fs/namespace.c`:4279-4291).  The caller's old root and pwd paths are
+    /// deliberately *not* looked up in the new namespace: an empty namespace
+    /// contains nothing that could resolve them.
     pub(crate) fn prepare_fs_context_for_mount_namespace(
         &self,
         root: axfs_ng_vfs::Location,

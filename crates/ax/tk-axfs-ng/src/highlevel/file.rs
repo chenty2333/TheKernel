@@ -12754,6 +12754,38 @@ mod tests {
     #[cfg(feature = "ext4")]
     use super::{PhysicalIoEffect, PhysicalIoResetProof};
 
+    /// The empty mount namespace makes the immutable nullfs the visible root,
+    /// so `open("/", O_RDONLY | O_DIRECTORY)` reaches a filesystem node that no
+    /// other boot path opens.  `NullDir` is a read-only directory whose root
+    /// inode is `S_IMMUTABLE` (fs/nullfs.c:7-34), and Linux still opens it.
+    ///
+    /// Constructing the open file description then samples the node's
+    /// writeback errseq, so the root has to answer that like any other inode
+    /// of a trivial superblock instead of reporting `EOPNOTSUPP`.
+    #[test]
+    fn nullfs_root_directory_opens() {
+        let fs = axfs_ng_vfs::nullfs::filesystem().unwrap();
+        let root = Mountpoint::new_root(&fs);
+        let context = crate::FsContext::new(root.root_location());
+        let mut options = OpenOptions::new();
+        options.read(true).directory(true);
+        let opened = match options.open(&context, FsPath::new(b"/")) {
+            Ok(opened) => opened,
+            Err(error) => panic!("opening the nullfs root failed: {error:?}"),
+        };
+        let crate::OpenResult::Dir(directory) = opened else {
+            panic!("the nullfs root opened as a non-directory");
+        };
+        let (location, _handle) = directory.into_parts();
+        assert_eq!(location.node_type(), NodeType::Directory);
+        let state = location
+            .writeback_error_state()
+            .expect("the nullfs root must expose the superblock errseq");
+        assert_eq!(state.sample(), fs.writeback_error_state().sample());
+        let filesystem = location.mountpoint().filesystem_handle();
+        assert_eq!(state.sample(), filesystem.writeback_error_state().sample());
+    }
+
     #[cfg(feature = "ext4")]
     #[test]
     fn prepared_physical_effect_is_worker_send() {

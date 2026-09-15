@@ -892,7 +892,17 @@ impl MountNamespace {
         Ok(namespace)
     }
 
-    pub(crate) fn try_fork(&self, owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+    /// Forks this namespace's mounts into a new mount namespace.
+    ///
+    /// `empty` asks for `CLONE_EMPTY_MNTNS`: the new namespace holds only a
+    /// clone of the namespace root and no submounts (`fs/namespace.c`:
+    /// 4258-4271), so a task that enters it cannot reach `/proc`, `/sys` or the
+    /// mutable rootfs until it mounts something itself.
+    pub(crate) fn try_fork(
+        &self,
+        owner_user_ns: Arc<UserNamespace>,
+        empty: bool,
+    ) -> AxResult<Arc<Self>> {
         let id = try_allocate_proc_namespace_id()?;
         // A CLONE_NEWNS/UNSHARE_NEWNS paired with a new user namespace must
         // retain the copied mounts but lock their placement-sensitive state.
@@ -900,7 +910,7 @@ impl MountNamespace {
         // policy bit; it therefore belongs to topology construction and is
         // preserved by later namespace clones.
         let lock_mounts = !Arc::ptr_eq(&self.owner_user_ns, &owner_user_ns);
-        let mut topology = self.topology.try_prepare_clone_namespace(id, lock_mounts)?;
+        let mut topology = self.topology.try_prepare_clone_namespace(id, lock_mounts, empty)?;
         let namespace = Arc::try_new(Self {
             id,
             owner_user_ns,

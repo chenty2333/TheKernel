@@ -561,16 +561,14 @@ impl CloneArgs {
             ProcessAbiError::PermissionDenied => AxError::OperationNotPermitted,
             _ => AxError::InvalidInput,
         })?;
-        // Residual gaps, reported rather than papered over: these three flags
-        // are admitted by Linux but have no complete lifecycle here, so a
-        // request that uses one is refused instead of being accepted and then
-        // ignored. CLONE_NNP must publish a child credential that differs from
-        // the parent's, and the fork publication path requires a bit-identical
-        // pending credential; CLONE_PIDFD_AUTOKILL must kill the child when
-        // its pidfd is released; CLONE_EMPTY_MNTNS must install a mount
-        // namespace that is empty rather than a copy of the parent's.
-        if flags.intersects(CloneFlags::NNP | CloneFlags::PIDFD_AUTOKILL | CloneFlags::EMPTY_MNTNS)
-        {
+        // Residual gaps, reported rather than papered over: these flags are
+        // admitted by Linux but have no complete lifecycle here, so a request
+        // that uses one is refused instead of being accepted and then ignored.
+        // CLONE_NNP must publish a child credential that differs from the
+        // parent's, and the fork publication path requires a bit-identical
+        // pending credential; CLONE_PIDFD_AUTOKILL must kill the child when its
+        // pidfd is released.
+        if flags.intersects(CloneFlags::NNP | CloneFlags::PIDFD_AUTOKILL) {
             return Err(AxError::InvalidInput);
         }
 
@@ -894,11 +892,26 @@ impl CloneArgs {
         let (mut prepared_clone_mount_ns, prepared_clone_mount_fs_context) =
             if flags.contains(CloneFlags::NEWNS) {
                 let topology_snapshot = crate::mounts::namespace_operation();
+                // `kernel_clone()` turned CLONE_EMPTY_MNTNS into CLONE_NEWNS
+                // before this point (`kernel/fork.c`:2703-2711); the bit itself
+                // decides whether the clone keeps the parent's mount tree or
+                // only a clone of the namespace root (`fs/namespace.c`:
+                // 4258-4271).
+                let empty = flags.contains(CloneFlags::EMPTY_MNTNS);
                 let mount_ns = calling_thread
                     .mount_ns()
-                    .try_fork(namespace_owner.clone())?;
+                    .try_fork(namespace_owner.clone(), empty)?;
                 let prepared = mount_ns.root_location().and_then(|root| {
-                    calling_thread.prepare_fs_context_for_cloned_mount_namespace(root)
+                    if empty {
+                        // An empty namespace holds only that clone, so the
+                        // caller's root and pwd paths cannot be looked up in
+                        // it; `copy_mnt_ns()` re-points both at the cloned
+                        // root mount instead (`fs/namespace.c`:4279-4291),
+                        // which is the same re-pointing setns performs.
+                        calling_thread.prepare_fs_context_for_mount_namespace(root)
+                    } else {
+                        calling_thread.prepare_fs_context_for_cloned_mount_namespace(root)
+                    }
                 });
                 // Never drop a newly cloned topology or fs_struct under the
                 // non-reentrant topology guard.  This also ends the source
