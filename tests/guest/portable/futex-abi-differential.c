@@ -36,11 +36,13 @@
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -195,6 +197,14 @@
 #endif
 #endif
 
+#ifndef SYS_tgkill
+#ifdef __NR_tgkill
+#define SYS_tgkill __NR_tgkill
+#else
+#define SYS_tgkill 234
+#endif
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Bounds.  All values are pure safety nets; correct runs never wait. */
 /* ------------------------------------------------------------------ */
@@ -229,6 +239,27 @@ static long sys_futex_wait(uint32_t *uaddr, uint32_t val, uint32_t mask,
                            int clockid) {
     return syscall(SYS_futex_wait, uaddr, (unsigned long)val,
                    (unsigned long)mask, flags, timeout, clockid);
+}
+
+/* `struct futex_waitv` from include/uapi/linux/futex.h, spelled locally so a
+ * build host header cannot change the layout the syscall parses. */
+struct local_futex_waitv {
+    uint64_t val;
+    uint64_t uaddr;
+    uint32_t flags;
+    uint32_t reserved;
+};
+
+_Static_assert(sizeof(struct local_futex_waitv) == 24,
+               "futex_waitv ABI layout must remain 24 bytes");
+
+/* Linux futex2: SYSCALL_DEFINE5(futex_waitv, waiters, nr_futexes, flags,
+ *                               timeout, clockid). */
+static long sys_futex_waitv(const struct local_futex_waitv *waiters,
+                            unsigned int nr_futexes, unsigned int flags,
+                            const struct timespec *timeout, int clockid) {
+    return syscall(SYS_futex_waitv, waiters, nr_futexes, flags, timeout,
+                   clockid);
 }
 
 /* ------------------------------------------------------------------ */
@@ -412,6 +443,26 @@ static int join_blocked(struct blocked_thread *blocked, const char *stage) {
     return 0;
 }
 
+/* Bounded variant of join_blocked() for waits whose wakeup the kernel is
+ * under test for: a lost wakeup must fail the case with a diagnostic instead
+ * of hanging the whole differential behind an unbounded pthread_join(). */
+static int await_blocked(struct blocked_thread *blocked, const char *stage) {
+    int64_t start = monotonic_ns();
+    if (start < 0) {
+        return fail(stage, errno != 0 ? errno : EPROTO);
+    }
+    for (;;) {
+        if (atomic_load_explicit(&blocked->done, memory_order_acquire) != 0) {
+            return join_blocked(blocked, stage);
+        }
+        int64_t now = monotonic_ns();
+        if (now < 0 || now - start >= BLOCK_BOUND_NS) {
+            return fail(stage, ETIMEDOUT);
+        }
+        sched_yield();
+    }
+}
+
 struct futex_waiter {
     struct blocked_thread blocked;
     uint32_t *uaddr;
@@ -558,7 +609,23 @@ static int test_opcode_validation(void) {
         return fail("opcode-lock-pi2-clock-realtime",
                     result == -1 ? saved : EPROTO);
     }
+    /* A free word with no waiters and no FUTEX_OWNER_DIED is taken over with
+     * the caller's TID.  Linux, kernel/futex/pi.c:
+     *
+     *     u32 uval, newval, vpid = task_pid_vnr(task);
+     *     ...
+     *     newval = uval & FUTEX_OWNER_DIED;
+     *     newval |= vpid;
+     *
+     * so the word holds task_pid_vnr(), the same number gettid() returns.
+     * case D's `pi-lock-deadlock-word` compares the whole word and covers the
+     * remaining bits. */
     if ((word & FUTEX_TID_MASK) != self) {
+        printf("THEKERNEL_FUTEX_ABI_DIFFERENTIAL_PI_WORD_RAW case=lock-pi2-realtime "
+               "word=0x%08x word_tid=%u gettid=%u pid=%u\n",
+               word, (unsigned)(word & FUTEX_TID_MASK), (unsigned)self,
+               (unsigned)getpid());
+        fflush(stdout);
         return fail("opcode-lock-pi2-clock-realtime-word", EPROTO);
     }
     if (expect_futex_zero("opcode-lock-pi2-clock-realtime-unlock", &word,
@@ -1054,14 +1121,26 @@ static int test_pi_timeout(void) {
         return fail("pi2-holder-word", EPROTO);
     }
 
-    struct timespec past;
-    if (clock_gettime(CLOCK_MONOTONIC, &past) != 0) {
-        return fail("pi2-past-clock", errno);
-    }
-    past.tv_sec -= 1;
+    /* An absolute deadline that has already elapsed must be ETIMEDOUT, not
+     * EINVAL and not a wait.  `{0, 0}` is the epoch of both clocks, so it is
+     * always in the past on every machine; "now - 1s" is *not* usable here
+     * because a timespec with a negative tv_sec is rejected with EINVAL
+     * before any deadline comparison (see the probe below). */
+    const struct timespec past = {0, 0};
     if (expect_futex_errno("pi2-contended-past-monotonic", &free_word,
                            FUTEX_LOCK_PI2 | PRIVATE, 0, &past, NULL, 0,
                            ETIMEDOUT) != 0) {
+        return 1;
+    }
+
+    /* The timespec is validated before the wait begins: a negative tv_sec is
+     * a malformed *time*, not an elapsed deadline, so it is EINVAL even
+     * though it would compare as expired.  Verified against the reference
+     * kernel for FUTEX_LOCK_PI2, FUTEX_LOCK_PI and FUTEX_WAIT_BITSET. */
+    const struct timespec negative = {-1, 0};
+    if (expect_futex_errno("pi2-contended-negative-monotonic", &free_word,
+                           FUTEX_LOCK_PI2 | PRIVATE, 0, &negative, NULL, 0,
+                           EINVAL) != 0) {
         return 1;
     }
 
@@ -1085,9 +1164,9 @@ static int test_pi_timeout(void) {
     }
 
     record("futex-abi-pi-timeout",
-           "ETIMEDOUT LOCKPI2",
+           "ETIMEDOUT LOCKPI2 NEGATIVE_TS_EINVAL",
            "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_PI_TIMEOUT_OK etimedout=1 "
-           "lockpi2=1");
+           "lockpi2=1 negative_ts_einval=1");
     return 0;
 }
 
@@ -1371,39 +1450,527 @@ static int test_futex2_flags(void) {
     return 0;
 }
 
-int main(void) {
+/* ------------------------------------------------------------------ */
+/* H. futex_waitv per-entry FUTEX2_NUMA protocol                      */
+/* ------------------------------------------------------------------ */
+
+/* `futex_wait_multiple_setup()` resolves one `get_futex_key()` per entry
+ * before it compares any value, and the `FUTEX2_NUMA` protocol lives inside
+ * `get_futex_key()` (`kernel/futex/core.c:522-567`): the futex is
+ * `futex_size()` wide and twice that for `FLAGS_NUMA`, so the natural
+ * alignment rule covers eight bytes; the node word is then read, any
+ * impossible node is rejected, and `FUTEX_NO_NODE` is replaced with the
+ * resolved node.
+ *
+ * Every entry below carries a value that cannot match, so a kernel that skips
+ * the node protocol falls through to the comparison pass and reports
+ * EWOULDBLOCK where this kernel reports the node protocol's EINVAL/EFAULT.
+ * The deadline is still armed so that a defect cannot hang the guest. */
+static int test_waitv_numa(void) {
+    struct futex2_pair {
+        uint32_t val;
+        uint32_t node;
+    };
+    static _Alignas(8) struct futex2_pair pairs[3];
+    struct local_futex_waitv entry;
+    struct timespec bound;
+    const unsigned int flags = (unsigned int)(FUTEX_32 | PRIVATE | FUTEX2_NUMA);
+    long result;
+    int saved;
+
+    if (absolute_bound(&bound, WAIT_BOUND_NS) != 0) {
+        return fail("waitv-numa-clock", errno);
+    }
+
+    /* A zero-entry call is rejected before the array is read, so an
+     * unimplemented syscall is never misread as a flag rejection. */
+    errno = 0;
+    result = sys_futex_waitv(NULL, 0, 0, NULL, CLOCK_MONOTONIC);
+    if (result != -1 || errno != EINVAL) {
+        return fail("waitv-numa-probe", result == -1 ? errno : EPROTO);
+    }
+
+    memset(&entry, 0, sizeof(entry));
+    entry.val = 0;
+    entry.flags = flags;
+
+    /* FUTEX_NO_NODE is written back as the resolved node even though the
+     * mismatched value then makes the call report EWOULDBLOCK. */
+    pairs[0].val = 1;
+    pairs[0].node = (uint32_t)-1;
+    entry.uaddr = (uint64_t)(uintptr_t)&pairs[0].val;
+    errno = 0;
+    result = sys_futex_waitv(&entry, 1, 0, &bound, CLOCK_MONOTONIC);
+    saved = errno;
+    if (result != -1 || saved != EWOULDBLOCK) {
+        return fail("waitv-numa-nowait", result == -1 ? saved : EPROTO);
+    }
+    if (pairs[0].node != 0) {
+        return fail("waitv-numa-node-writeback", EPROTO);
+    }
+
+    /* A NUMA futex is eight byte aligned: four byte alignment is EINVAL
+     * before the node word is read. */
+    pairs[1].val = 0;
+    pairs[1].node = 1;
+    entry.uaddr = (uint64_t)(uintptr_t)((char *)&pairs[1].val + 4);
+    errno = 0;
+    result = sys_futex_waitv(&entry, 1, 0, &bound, CLOCK_MONOTONIC);
+    saved = errno;
+    if (result != -1 || saved != EINVAL) {
+        return fail("waitv-numa-misaligned", result == -1 ? saved : EPROTO);
+    }
+
+    /* A node that cannot exist on this machine is EINVAL, and that check
+     * precedes the value comparison. */
+    pairs[2].val = 1;
+    pairs[2].node = 1;
+    entry.uaddr = (uint64_t)(uintptr_t)&pairs[2].val;
+    errno = 0;
+    result = sys_futex_waitv(&entry, 1, 0, &bound, CLOCK_MONOTONIC);
+    saved = errno;
+    if (result != -1 || saved != EINVAL) {
+        return fail("waitv-numa-bad-node", result == -1 ? saved : EPROTO);
+    }
+
+    /* Resolving FUTEX_NO_NODE writes the node word, so a read-only mapping
+     * reports EFAULT from that write.  An eight byte aligned NUMA futex
+     * cannot have an unmapped node word on a page granular mapping: the node
+     * word shares the futex word's eight byte unit, and therefore its page. */
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return fail("waitv-numa-page-size", errno != 0 ? errno : EPROTO);
+    }
+    void *region = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region == MAP_FAILED) {
+        return fail("waitv-numa-mmap", errno);
+    }
+    struct futex2_pair *readonly = region;
+    readonly->val = 1;
+    readonly->node = (uint32_t)-1;
+    if (mprotect(region, (size_t)page_size, PROT_READ) != 0) {
+        return fail("waitv-numa-mprotect", errno);
+    }
+    entry.uaddr = (uint64_t)(uintptr_t)&readonly->val;
+    errno = 0;
+    result = sys_futex_waitv(&entry, 1, 0, &bound, CLOCK_MONOTONIC);
+    saved = errno;
+    if (munmap(region, (size_t)page_size) != 0) {
+        return fail("waitv-numa-munmap", errno);
+    }
+    if (result != -1 || saved != EFAULT) {
+        return fail("waitv-numa-readonly-node", result == -1 ? saved : EPROTO);
+    }
+
+    record("futex-abi-waitv-numa",
+           "PROBE_EINVAL NO_NODE_WRITEBACK ALIGN_EINVAL BAD_NODE_EINVAL "
+           "RO_NODE_EFAULT",
+           "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_WAITV_NUMA_OK probe_einval=1 "
+           "no_node_writeback=1 align_einval=1 bad_node_einval=1 "
+           "ro_node_efault=1");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* I. Signal interruption of a priority-inheritance wait              */
+/* ------------------------------------------------------------------ */
+
+static _Atomic int sigusr1_count;
+
+static void sigusr1_handler(int signo) {
+    (void)signo;
+    atomic_fetch_add_explicit(&sigusr1_count, 1, memory_order_relaxed);
+}
+
+static int install_sigusr1(int restartable, const char *stage) {
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = sigusr1_handler;
+    action.sa_flags = restartable ? SA_RESTART : 0;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGUSR1, &action, NULL) != 0) {
+        return fail(stage, errno);
+    }
+    atomic_store_explicit(&sigusr1_count, 0, memory_order_relaxed);
+    return 0;
+}
+
+/* Bounded wait for the handler of an already delivered signal to run. */
+static int wait_for_signal(int expected, const char *stage) {
+    int64_t start = monotonic_ns();
+    if (start < 0) {
+        return fail(stage, errno != 0 ? errno : EPROTO);
+    }
+    for (;;) {
+        if (atomic_load_explicit(&sigusr1_count, memory_order_acquire) >=
+            expected) {
+            return 0;
+        }
+        int64_t now = monotonic_ns();
+        if (now < 0 || now - start >= BLOCK_BOUND_NS) {
+            return fail(stage, ETIMEDOUT);
+        }
+        sched_yield();
+    }
+}
+
+struct pi_signal_case {
+    struct blocked_thread blocked;
+    uint32_t *futex;
+    uint32_t control;
+    long lock_result;
+    int lock_errno;
+    long control_result;
+    int control_errno;
+    long unlock_result;
+    int unlock_errno;
+};
+
+static void *pi_signal_waiter_main(void *opaque) {
+    struct pi_signal_case *test = opaque;
+    struct timespec bound = relative_bound(WAIT_BOUND_NS);
+
+    atomic_store_explicit(&test->blocked.tid, (int)syscall(SYS_gettid),
+                          memory_order_release);
+    atomic_store_explicit(&test->blocked.entered, 1, memory_order_release);
+    errno = 0;
+    test->lock_result =
+        sys_futex(test->futex, FUTEX_LOCK_PI | PRIVATE, 0, NULL, NULL, 0);
+    test->lock_errno = test->lock_result == -1 ? errno : 0;
+    if (test->lock_result == 0) {
+        /* Hold the futex until the main thread has sampled the word, then
+         * give it back.  The expected value check makes the release order
+         * irrelevant. */
+        errno = 0;
+        test->control_result =
+            sys_futex(&test->control, FUTEX_WAIT | PRIVATE, 0, &bound, NULL, 0);
+        test->control_errno = test->control_result == -1 ? errno : 0;
+        errno = 0;
+        test->unlock_result = sys_futex(test->futex, FUTEX_UNLOCK_PI | PRIVATE,
+                                        0, NULL, NULL, 0);
+        test->unlock_errno = test->unlock_result == -1 ? errno : 0;
+    }
+    atomic_store_explicit(&test->blocked.done, 1, memory_order_release);
+    return NULL;
+}
+
+/* `futex_lock_pi()` ends with `return ret != -EINTR ? ret : -ERESTARTNOINTR;`
+ * (`kernel/futex/pi.c:1198`), and x86_64's `handle_signal()` rewinds the
+ * syscall instruction for `-ERESTARTNOINTR` whether or not the handler set
+ * `SA_RESTART` (`arch/x86/kernel/signal.c:277-281`).  An interrupted
+ * FUTEX_LOCK_PI therefore resumes instead of reporting EINTR, and the resumed
+ * call takes the futex when the owner hands it over. */
+static int test_pi_signal_restart(void) {
+    uint32_t word = 0;
+    struct pi_signal_case test;
+
+    if (install_sigusr1(1, "pi-signal-sigaction") != 0) {
+        return 1;
+    }
+
+    memset(&test, 0, sizeof(test));
+    test.futex = &word;
+    errno = 0;
+    if (sys_futex(&word, FUTEX_LOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return fail("pi-signal-owner-lock", errno);
+    }
+    if ((word & FUTEX_TID_MASK) != (uint32_t)syscall(SYS_gettid)) {
+        return fail("pi-signal-owner-word", EPROTO);
+    }
+
+    if (start_blocked(&test.blocked, pi_signal_waiter_main, &test,
+                      "pi-signal-create") != 0) {
+        return 1;
+    }
+    if (wait_until_blocked(&test.blocked, "pi-signal-handshake") != 0) {
+        return 1;
+    }
+    if (word == 0 || (word & FUTEX_WAITERS) == 0) {
+        return fail("pi-signal-precondition", EPROTO);
+    }
+
+    if (syscall(SYS_tgkill, getpid(),
+                (pid_t)atomic_load_explicit(&test.blocked.tid,
+                                            memory_order_acquire),
+                SIGUSR1) != 0) {
+        return fail("pi-signal-tgkill", errno);
+    }
+    if (wait_for_signal(1, "pi-signal-handler") != 0) {
+        return 1;
+    }
+
+    /* Hand the futex over.  A kernel that returned EINTR to userspace stops
+     * here with the waiter's lock_errno set instead. */
+    errno = 0;
+    if (sys_futex(&word, FUTEX_UNLOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return fail("pi-signal-owner-unlock", errno);
+    }
+    if (release_parked_thread(&test.control, "pi-signal-release") != 0) {
+        return 1;
+    }
+    /* The restarted LOCK_PI must have been handed the futex by UNLOCK_PI.
+     * Bounded: a kernel that drops that wakeup reports ETIMEDOUT here. */
+    if (await_blocked(&test.blocked, "pi-signal-resume") != 0) {
+        return 1;
+    }
+    if (test.lock_result != 0 || test.unlock_result != 0 ||
+        !parked_wait_succeeded(test.control_result, test.control_errno)) {
+        return fail("pi-signal-lock-pi",
+                    test.lock_errno != 0      ? test.lock_errno
+                    : test.unlock_errno != 0  ? test.unlock_errno
+                    : test.control_errno != 0 ? test.control_errno
+                                              : EPROTO);
+    }
+    if (word != 0) {
+        return fail("pi-signal-word", EPROTO);
+    }
+
+    record("futex-abi-pi-signal", "LOCK_PI_SA_RESTART_RESUMES",
+           "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_PI_SIGNAL_OK "
+           "lock_pi_sa_restart_resumes=1");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* J. Signal interruption of an already requeued PI waiter            */
+/* ------------------------------------------------------------------ */
+
+struct requeue_pi_signal_waiter {
+    struct blocked_thread blocked;
+    struct requeue_pi_signal_case *owner;
+    long wait_result;
+    int wait_errno;
+    long control_result;
+    int control_errno;
+    long unlock_result;
+    int unlock_errno;
+};
+
+struct requeue_pi_signal_case {
+    struct requeue_pi_signal_waiter waiters[2];
+    uint32_t *source;
+    uint32_t *target;
+    uint32_t control[2];
+    struct timespec timeout;
+};
+
+static void *requeue_pi_signal_waiter_main(void *opaque) {
+    struct requeue_pi_signal_waiter *waiter = opaque;
+    struct requeue_pi_signal_case *owner = waiter->owner;
+    int index = (int)(waiter - owner->waiters);
+    struct timespec bound = relative_bound(WAIT_BOUND_NS);
+
+    atomic_store_explicit(&waiter->blocked.tid, (int)syscall(SYS_gettid),
+                          memory_order_release);
+    atomic_store_explicit(&waiter->blocked.entered, 1, memory_order_release);
+    errno = 0;
+    waiter->wait_result =
+        sys_futex(owner->source, FUTEX_WAIT_REQUEUE_PI | PRIVATE, 0,
+                  &owner->timeout, owner->target, FUTEX_BITSET_MATCH_ANY);
+    waiter->wait_errno = waiter->wait_result == -1 ? errno : 0;
+    if (waiter->wait_result == 0) {
+        /* FUTEX_CMP_REQUEUE_PI handed this thread *target.  Hold it until the
+         * main thread has observed the word and the moved waiter has left the
+         * target queue. */
+        errno = 0;
+        waiter->control_result = sys_futex(&owner->control[index],
+                                           FUTEX_WAIT | PRIVATE, 0, &bound,
+                                           NULL, 0);
+        waiter->control_errno = waiter->control_result == -1 ? errno : 0;
+        errno = 0;
+        waiter->unlock_result = sys_futex(owner->target,
+                                          FUTEX_UNLOCK_PI | PRIVATE, 0, NULL,
+                                          NULL, 0);
+        waiter->unlock_errno = waiter->unlock_result == -1 ? errno : 0;
+    }
+    atomic_store_explicit(&waiter->blocked.done, 1, memory_order_release);
+    return NULL;
+}
+
+/* `futex_wait_requeue_pi()` distinguishes the two interruptions by the
+ * waiter's `requeue_state` (`kernel/futex/requeue.c:881-903`): a signal that
+ * arrives after `FUTEX_CMP_REQUEUE_PI` moved the waiter onto the target's
+ * rt_mutex leaves `rt_mutex_wait_proxy_lock()` reporting -EINTR, and
+ * `futex_wait_requeue_pi()` rewrites that to -EWOULDBLOCK -- restarting would
+ * re-read *uaddr and refuse the wait.  The SIGUSR1 handler here is
+ * deliberately *not* installed with SA_RESTART, so the reported errno is the
+ * syscall's own and not a restarted wait. */
+static int test_requeue_pi_signal(void) {
+    uint32_t source = 0;
+    uint32_t target = 0;
+    struct requeue_pi_signal_case test;
+    int index;
+
+    if (install_sigusr1(0, "requeue-pi-signal-sigaction") != 0) {
+        return 1;
+    }
+
+    memset(&test, 0, sizeof(test));
+    test.source = &source;
+    test.target = &target;
+    if (absolute_bound(&test.timeout, WAIT_BOUND_NS) != 0) {
+        return fail("requeue-pi-signal-timeout-clock", errno);
+    }
+    for (index = 0; index < 2; index++) {
+        test.waiters[index].owner = &test;
+        if (start_blocked(&test.waiters[index].blocked,
+                          requeue_pi_signal_waiter_main, &test.waiters[index],
+                          "requeue-pi-signal-create") != 0) {
+            return 1;
+        }
+        if (wait_until_blocked(&test.waiters[index].blocked,
+                               "requeue-pi-signal-handshake") != 0) {
+            return 1;
+        }
+    }
+    if (source != 0 || target != 0) {
+        return fail("requeue-pi-signal-precondition", EPROTO);
+    }
+
+    /* Wake one waiter and move the other onto *target's queue. */
+    errno = 0;
+    long requeued = sys_futex(&source, FUTEX_CMP_REQUEUE_PI | PRIVATE, 1,
+                              (const struct timespec *)(uintptr_t)1, &target,
+                              0);
+    int saved = errno;
+    if (requeued != 2) {
+        return fail("requeue-pi-signal-requeue",
+                    requeued == -1 ? saved : EPROTO);
+    }
+
+    /* Whichever waiter the word names was handed the PI futex; the other one
+     * is the requeued waiter this section is about. */
+    const uint32_t owner_tid = target & FUTEX_TID_MASK;
+    int moved = -1;
+    for (index = 0; index < 2; index++) {
+        uint32_t tid = (uint32_t)atomic_load_explicit(
+            &test.waiters[index].blocked.tid, memory_order_acquire);
+        if (tid != owner_tid) {
+            moved = index;
+        }
+    }
+    if (moved < 0) {
+        return fail("requeue-pi-signal-owner", EPROTO);
+    }
+    const int owner_index = moved == 0 ? 1 : 0;
+
+    if (syscall(SYS_tgkill, getpid(),
+                (pid_t)atomic_load_explicit(&test.waiters[moved].blocked.tid,
+                                            memory_order_acquire),
+                SIGUSR1) != 0) {
+        return fail("requeue-pi-signal-tgkill", errno);
+    }
+
+    /* The moved waiter must report EWOULDBLOCK, which also removes it from
+     * the target queue before the new owner gives the futex back. */
+    if (await_blocked(&test.waiters[moved].blocked,
+                      "requeue-pi-signal-join-moved") != 0) {
+        return 1;
+    }
+    if (test.waiters[moved].wait_result != -1 ||
+        test.waiters[moved].wait_errno != EWOULDBLOCK) {
+        return fail("requeue-pi-signal-ewouldblock",
+                    test.waiters[moved].wait_errno != 0
+                        ? test.waiters[moved].wait_errno
+                        : EPROTO);
+    }
+
+    if (release_parked_thread(&test.control[owner_index],
+                              "requeue-pi-signal-release") != 0) {
+        return 1;
+    }
+    if (await_blocked(&test.waiters[owner_index].blocked,
+                      "requeue-pi-signal-join-owner") != 0) {
+        return 1;
+    }
+    if (test.waiters[owner_index].wait_result != 0 ||
+        test.waiters[owner_index].unlock_result != 0 ||
+        !parked_wait_succeeded(test.waiters[owner_index].control_result,
+                               test.waiters[owner_index].control_errno)) {
+        return fail("requeue-pi-signal-owner-result",
+                    test.waiters[owner_index].wait_errno != 0
+                        ? test.waiters[owner_index].wait_errno
+                    : test.waiters[owner_index].unlock_errno != 0
+                        ? test.waiters[owner_index].unlock_errno
+                    : test.waiters[owner_index].control_errno != 0
+                        ? test.waiters[owner_index].control_errno
+                        : EPROTO);
+    }
+    if (target != 0) {
+        return fail("requeue-pi-signal-target-unlocked", EPROTO);
+    }
+
+    record("futex-abi-requeue-pi-signal", "REQUEUED_WAITER_EWOULDBLOCK",
+           "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_SIGNAL_OK "
+           "requeued_waiter_ewouldblock=1");
+    return 0;
+}
+
+/* Optional single-case selection: `futex-abi-differential <case>` runs only
+ * that case.  The differential harness never passes an argument, so the
+ * registered run still executes every case in order and still stops at the
+ * first failure; the selector exists so one case can be exercised in
+ * isolation while bisecting a kernel change. */
+static const char *selected_case;
+
+static int want_case(const char *name) {
+    return selected_case == NULL || strcmp(selected_case, name) == 0;
+}
+
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
-
-    int result = test_opcode_validation();
-    if (result != 0) {
-        return result;
-    }
-    result = test_wake_zero();
-    if (result != 0) {
-        return result;
-    }
-    result = test_cmp_requeue();
-    if (result != 0) {
-        return result;
-    }
-    result = test_pi_word_states();
-    if (result != 0) {
-        return result;
-    }
-    result = test_pi_timeout();
-    if (result != 0) {
-        return result;
-    }
-    result = test_requeue_pi();
-    if (result != 0) {
-        return result;
-    }
-    result = test_futex2_flags();
-    if (result != 0) {
-        return result;
+    if (argc > 1) {
+        selected_case = argv[1];
     }
 
+    int result = want_case("opcode") ? test_opcode_validation() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("wake-zero") ? test_wake_zero() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("requeue") ? test_cmp_requeue() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("pi-word") ? test_pi_word_states() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("pi-timeout") ? test_pi_timeout() : 0;
+    if (result != 0) {
+        return result;
+    }
+    /* The coverage added with the futex fixes runs before the pre-existing
+     * PI requeue case so that neither an unrelated earlier failure nor the
+     * unbounded spin that case can trigger on a waiter-less source can mask
+     * it.  `pi-signal` is last among them: it is the one whose assertion can
+     * be blocked by a second, unrelated kernel defect. */
+    result = want_case("waitv-numa") ? test_waitv_numa() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("requeue-pi-signal") ? test_requeue_pi_signal() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("pi-signal") ? test_pi_signal_restart() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("futex2-flags") ? test_futex2_flags() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("requeue-pi") ? test_requeue_pi() : 0;
+    if (result != 0) {
+        return result;
+    }
     marker("THEKERNEL_FUTEX_ABI_DIFFERENTIAL_OK");
     return 0;
 }
