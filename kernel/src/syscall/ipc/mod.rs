@@ -450,8 +450,24 @@ enum IpcAccess {
 struct IpcAuthority {
     access_override: bool,
     control_override: bool,
+    /// `capable(CAP_SYS_RESOURCE)` - privilege measured against the **initial**
+    /// user namespace, which is what Linux's plain `capable()` checks
+    /// (`kernel/capability.c:414-417` routes it to `ns_capable(&init_user_ns,
+    /// cap)`).  `ipc/msg.c:434-435` uses exactly that form for the `msg_qbytes`
+    /// ceiling, so membership of the IPC namespace's own user namespace is not
+    /// enough.
     resource_override: bool,
     lock_override: bool,
+}
+
+/// Linux `capable(cap)`: a capability check against the initial user
+/// namespace.
+fn initial_user_namespace_capable(actor: &Cred, capability: u32) -> bool {
+    let mut root = actor.user_ns().clone();
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    ns_capable(actor, &root, capability)
 }
 
 impl IpcAuthority {
@@ -504,7 +520,7 @@ impl IpcAccessContext {
         let authority = IpcAuthority {
             access_override: ns_capable(&actor, &governing_user_ns, CAP_IPC_OWNER),
             control_override: ns_capable(&actor, &governing_user_ns, CAP_SYS_ADMIN),
-            resource_override: ns_capable(&actor, &governing_user_ns, CAP_SYS_RESOURCE),
+            resource_override: initial_user_namespace_capable(&actor, CAP_SYS_RESOURCE),
             lock_override: ns_capable(&actor, &governing_user_ns, CAP_IPC_LOCK),
         };
         Self {
