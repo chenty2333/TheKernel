@@ -1836,12 +1836,15 @@ pub fn sys_set_mempolicy<M: UserMemory + ?Sized>(
     let nodes = read_nodemask(memory, nodemask, maxnode)?;
     let request = tk_linux_mm::validate(mode, nodes, !nodemask.is_null(), current_allowed_nodemask())
         .map_err(mempolicy_error)?;
-    let (mode, nodes) = tk_linux_mm::effective_policy(request);
-    // The stored policy keeps the sanitized mode flags and the caller's own
-    // mask, which is what `get_mempolicy(2)` reports back for a
-    // `MPOL_F_STATIC_NODES`/`MPOL_F_RELATIVE_NODES` policy.
+    let effective = tk_linux_mm::effective_policy(request);
+    // The stored policy is the one `mpol_new()` built: it keeps the sanitized
+    // mode flags and the caller's own mask — which is what `get_mempolicy(2)`
+    // reports back for a `MPOL_F_STATIC_NODES`/`MPOL_F_RELATIVE_NODES` policy —
+    // and for `MPOL_DEFAULT` it keeps none of them, because `mpol_new()`
+    // returns NULL there.
     current().as_thread().proc_data.set_mempolicy(
-        Mempolicy::new(mode, nodes).with_request_flags(request.mode_flags, request.user_nodes),
+        Mempolicy::new(effective.mode, effective.nodes)
+            .with_request_flags(effective.mode_flags, effective.user_nodemask),
     );
     Ok(0)
 }
@@ -1892,9 +1895,9 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     // user-nodemask flags and the intersection with the allowed set.
     let request = tk_linux_mm::validate(mode, nodes, !nodemask.is_null(), current_allowed_nodemask())
         .map_err(mempolicy_error)?;
-    let (policy_mode, policy_nodes) = tk_linux_mm::effective_policy(request);
-    let policy = Mempolicy::new(policy_mode, policy_nodes)
-        .with_request_flags(request.mode_flags, request.user_nodes);
+    let effective = tk_linux_mm::effective_policy(request);
+    let policy = Mempolicy::new(effective.mode, effective.nodes)
+        .with_request_flags(effective.mode_flags, effective.user_nodemask);
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
