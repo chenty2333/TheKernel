@@ -1224,28 +1224,53 @@ impl TransportOps for StreamTransport {
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {
+        // `unix_shutdown()` (net/unix/af_unix.c:3193-3243) never fails on an
+        // unconnected socket: it records `sk->sk_shutdown |= mode`, wakes the
+        // peer only when one exists, and returns 0.
+        //     ++mode;
+        //     unix_state_lock(sk);
+        //     WRITE_ONCE(sk->sk_shutdown, sk->sk_shutdown | mode);
+        //     other = unix_peer(sk);
+        //     ...
+        //     return 0;
+        // `shutdown()` is therefore a local half-close flag even for a stream
+        // with no peer, and the flags it records are what later `poll()` and
+        // `recv()` consult.
         let (retired_tx, retired_segments_tx, poll_update) = {
             let mut channel = self.channel.lock();
-            let channel = channel.as_mut().ok_or(AxError::NotConnected)?;
             if how.has_read() {
                 self.rx_closed.store(true, Ordering::Release);
-                channel.publish_read_close();
-                // Keep already queued bytes and their ancillary intervals.
-                // The peer observes read-close and cannot enqueue more bytes.
             }
             let retired_tx = if how.has_write() {
                 self.tx_closed.store(true, Ordering::Release);
-                channel.publish_write_close();
-                channel.tx.take()
+                channel.as_mut().and_then(|channel| {
+                    channel.publish_write_close();
+                    channel.tx.take()
+                })
             } else {
                 None
             };
-            let (_, retired_segments_tx) = channel.retire_ancillary(false, how.has_write());
-            (retired_tx, retired_segments_tx, channel.poll_update.clone())
+            let (retired_segments_tx, poll_update) = match channel.as_mut() {
+                Some(channel) => {
+                    if how.has_read() {
+                        channel.publish_read_close();
+                        // Keep already queued bytes and their ancillary
+                        // intervals.  The peer observes read-close and cannot
+                        // enqueue more bytes.
+                    }
+                    let (_, retired_segments_tx) =
+                        channel.retire_ancillary(false, how.has_write());
+                    (retired_segments_tx, Some(channel.poll_update.clone()))
+                }
+                None => (None, None),
+            };
+            (retired_tx, retired_segments_tx, poll_update)
         };
         drop(retired_tx);
         drop(retired_segments_tx);
-        poll_update.wake();
+        if let Some(poll_update) = poll_update {
+            poll_update.wake();
+        }
         self.poll_state.wake();
         Ok(())
     }

@@ -464,11 +464,15 @@ impl TransportOps for SeqPacketTransport {
             .recv(dst, options)
     }
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {
-        self.data
-            .lock()
-            .as_ref()
-            .ok_or(AxError::NotConnected)?
-            .shutdown(how)
+        // `unix_shutdown()` (net/unix/af_unix.c:3193-3243) records
+        // `sk->sk_shutdown |= mode` and returns 0 without ever consulting the
+        // peer, so a `SOCK_SEQPACKET` socket with no connection accepts every
+        // valid mode just as the stream and datagram transports do.  Only a
+        // connected socket has half-close work to hand to the record channel.
+        match self.data.lock().as_ref() {
+            Some(data) => data.shutdown(how),
+            None => Ok(()),
+        }
     }
 }
 impl Pollable for SeqPacketTransport {

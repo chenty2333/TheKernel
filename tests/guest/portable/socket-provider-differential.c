@@ -644,6 +644,37 @@ static void null_operations(void) {
     mark("SOCKETPAIR_FLAG_MASK_EINVAL", socketpair(AF_UNIX, SOCK_STREAM | 0x40, 0, pair) == -1
          && errno == EINVAL);
 
+    /* `inet_shutdown()` (net/ipv4/af_inet.c:899-953) maps the direction to
+     * RCV_SHUTDOWN/SEND_SHUTDOWN and returns -ENOTCONN only for TCP_CLOSE:
+     *     if (sk->sk_state == TCP_LISTEN) {
+     *             if (!(how & RCV_SHUTDOWN))
+     *                     break;                       <- SHUT_WR answers 0
+     *             inet_csk_shutdown(sk, how);
+     *             ...
+     * so shutting down the write side of a listening socket succeeds, and the
+     * read side takes the `disconnect()` path. */
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    check("LISTENER_SOCKET", listener >= 0);
+    struct sockaddr_in loopback;
+    memset(&loopback, 0, sizeof(loopback));
+    loopback.sin_family = AF_INET;
+    loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    loopback.sin_port = 0;
+    check("LISTENER_BIND", bind(listener, (struct sockaddr *)&loopback, sizeof(loopback)) == 0);
+    check("LISTENER_LISTEN", listen(listener, 1) == 0);
+    check("LISTENER_SHUTDOWN_WR", shutdown(listener, SHUT_WR) == 0);
+    check("LISTENER_SHUTDOWN_RD", shutdown(listener, SHUT_RD) == 0);
+    check("LISTENER_CLOSE", close(listener) == 0);
+
+    /* `unix_shutdown()` (net/unix/af_unix.c:3193-3243) validates the direction
+     * and records it in `sk_shutdown`; a socket with no peer still returns 0. */
+    int unconnected = socket(AF_UNIX, SOCK_STREAM, 0);
+    check("UNIX_STREAM_SOCKET", unconnected >= 0);
+    check("UNIX_UNCONNECTED_SHUTDOWN_WR", shutdown(unconnected, SHUT_WR) == 0);
+    check("UNIX_UNCONNECTED_SHUTDOWN_RD", shutdown(unconnected, SHUT_RD) == 0);
+    check("UNIX_UNCONNECTED_SHUTDOWN_RDWR", shutdown(unconnected, SHUT_RDWR) == 0);
+    check("UNIX_UNCONNECTED_CLOSE", close(unconnected) == 0);
+
     /* `__sys_accept4` resolves the descriptor before it validates the flag
      * mask (`net/socket.c:1917-1930`), so a bad descriptor outranks a bad
      * flag.  `__sys_socketpair` reserves both descriptors with
