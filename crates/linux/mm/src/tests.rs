@@ -482,6 +482,49 @@ fn madvise_advice_table_refuses_unavailable_linux_advice() {
 }
 
 #[test]
+fn only_the_two_policy_clearing_advices_are_refused_on_droppable() {
+    // mm/madvise.c:madvise_behavior(): `MADV_KEEPONFORK` and `MADV_DODUMP`
+    // are the only arms that test VM_DROPPABLE.  Every other advice keeps its
+    // ordinary behaviour on a droppable VMA, including the two that *set* the
+    // derived policies again (`MADV_WIPEONFORK`, `MADV_DONTDUMP`) and the two
+    // that reach the reclaim path (`MADV_COLD`, `MADV_PAGEOUT`).
+    assert!(advice_refused_on_droppable(MADV_KEEPONFORK));
+    assert!(advice_refused_on_droppable(MADV_DODUMP));
+
+    for advice in [
+        MADV_NORMAL,
+        MADV_RANDOM,
+        MADV_SEQUENTIAL,
+        MADV_WILLNEED,
+        MADV_DONTNEED,
+        MADV_FREE,
+        MADV_REMOVE,
+        MADV_DONTFORK,
+        MADV_DOFORK,
+        MADV_DONTDUMP,
+        MADV_WIPEONFORK,
+        MADV_COLD,
+        MADV_PAGEOUT,
+        MADV_POPULATE_READ,
+        MADV_POPULATE_WRITE,
+        MADV_DONTNEED_LOCKED,
+        MADV_GUARD_INSTALL,
+        MADV_GUARD_REMOVE,
+    ] {
+        assert!(
+            !advice_refused_on_droppable(advice),
+            "advice {advice} must keep its behaviour on a droppable VMA"
+        );
+    }
+
+    // The refusal is independent of availability: both names stay valid
+    // advice values, they are merely rejected for this VMA.
+    assert!(advice_valid(MADV_KEEPONFORK) && advice_valid(MADV_DODUMP));
+    assert!(advice_refused_on_droppable(Advice::KeepOnFork.raw()));
+    assert!(advice_refused_on_droppable(Advice::DoDump.raw()));
+}
+
+#[test]
 fn memfd_sanitize_flags_matches_linux_sysctl_matrix() {
     let scope = |value: u8| value;
     // Unknown bits -> EINVAL; huge-size bits need MFD_HUGETLB.

@@ -1434,6 +1434,20 @@ pub fn sys_mmap(
             let growdown_private_anon = map_flags.contains(MmapFlags::GROWDOWN)
                 && map_type == MmapFlags::PRIVATE
                 && is_anonymous_mapping;
+            // `VM_DROPPABLE` is a property of the VMA, not a pair of one-shot
+            // annotations: Linux writes it into `vm_flags` once
+            // (`mm/mmap.c:521`) and every later decision — `MADV_KEEPONFORK`
+            // and `MADV_DODUMP` rejection (`mm/madvise.c:1396-1406`), the
+            // `UFFDIO_REGISTER` refusal (`mm/userfaultfd.c:2114`) and the
+            // reclaim rule that droppable folios are dropped instead of
+            // written out (`mm/rmap.c:1652-1655`) — reads that bit back.
+            // Installing it on the backend keeps it attached to the VMA
+            // through splits, remaps and fork.
+            let backend = if map_type == MmapFlags::DROPPABLE {
+                backend.with_droppable()
+            } else {
+                backend
+            };
             let backend = match file_mapping {
                 Some(file_mapping) => backend.with_file_mapping(file_mapping),
                 None => backend,
@@ -1574,16 +1588,22 @@ pub fn sys_mmap(
             if growdown_private_anon {
                 aspace.mark_growdown(start);
             }
-            if map_type == MmapFlags::DROPPABLE {
-                // Linux `mm/mmap.c:533`: `vm_flags |= VM_WIPEONFORK |
-                // VM_DONTDUMP;`.  Both are mm-side annotations here, so they
-                // are installed while the freshly published mapping is still
-                // protected by the address-space mutex — a fork or a coredump
-                // that observed the VMA without them would copy or dump pages
-                // Linux guarantees to be gone.
-                aspace.set_wipe_on_fork(start, length, true)?;
-                aspace.set_dontdump(start, length, true)?;
-            }
+            // Linux `mm/mmap.c:533` sets `VM_WIPEONFORK | VM_DONTDUMP`
+            // together with `VM_DROPPABLE`.  They are consequences of the
+            // VMA property, not independent annotations: `fork_fragment_count`,
+            // the fork commit loop and `coredump_segments` all read
+            // `Backend::is_droppable()` back, so there is no window in which a
+            // fork or a coredump could observe the VMA without the derived
+            // policy.  Keeping the flag on the backend also means the two
+            // derived policies follow the VMA through splits, remaps and fork
+            // instead of having to be re-annotated at each of those points.
+            debug_assert!(
+                map_type != MmapFlags::DROPPABLE
+                    || aspace
+                        .find_area(start)
+                        .is_some_and(|area| area.backend().is_droppable()),
+                "MAP_DROPPABLE must publish VM_DROPPABLE on the VMA"
+            );
             if populate && !best_effort_secret_populate {
                 drop(aspace);
                 // Linux publishes mmap first and then invokes mm_populate() after
@@ -3312,6 +3332,17 @@ fn next_madvise_run(
     Some((start, run_end, gap))
 }
 
+/// Whether the VMA covering `start` carries `VM_DROPPABLE`.
+///
+/// Every `apply_madvise_run` call handles one clipped VMA (or one locked
+/// sub-segment of one VMA), so a single lookup answers Linux's
+/// `vma->vm_flags & VM_DROPPABLE` test for the whole advice call.
+fn vma_is_droppable(aspace: &AddrSpace, start: VirtAddr) -> bool {
+    aspace
+        .find_area(start)
+        .is_some_and(|area| area.backend().is_droppable())
+}
+
 /// Applies one advice to exactly one VMA clip.
 ///
 /// This is Linux's `madvise_vma_behavior()` for the `vma`/`start`/`end` triple
@@ -3480,7 +3511,16 @@ pub(super) fn apply_madvise_run(
         // KSM is not configured. They must not report success, because a
         // caller that believed its pages were merged would go on to rely on
         // the sharing and on `MADV_UNMERGEABLE` splitting it again.
-        MADV_DONTDUMP | MADV_DODUMP => aspace.set_dontdump(start, length, advice == MADV_DONTDUMP),
+        MADV_DONTDUMP | MADV_DODUMP => {
+            // `mm/madvise.c:1403-1406`: `MADV_DODUMP` refuses a droppable VMA
+            // because Linux granted `VM_DONTDUMP` with the mapping itself
+            // (`mm/mmap.c:533`) and lets nothing clear it again.  `MADV_DONTDUMP`
+            // stays legal — it re-asserts the derived policy.
+            if advice == MADV_DODUMP && vma_is_droppable(&aspace, start) {
+                return Err(AxError::InvalidInput);
+            }
+            aspace.set_dontdump(start, length, advice == MADV_DONTDUMP)
+        }
         MADV_REMOVE => {
             let targets = collect_madvise_remove_targets(&aspace, start, length)?;
             let security = current_vfs_security();
@@ -3507,15 +3547,24 @@ pub(super) fn apply_madvise_run(
             Ok(())
         }
         MADV_WIPEONFORK | MADV_KEEPONFORK => {
+            let area = aspace.find_area(start).ok_or(AxError::NoMemory)?;
+            // `mm/madvise.c:1395-1397`: `MADV_KEEPONFORK` refuses a droppable
+            // VMA, because clearing the `VM_WIPEONFORK` that `mm/mmap.c:533`
+            // installed with it would make a later fork copy exactly the pages
+            // the mapping promises may be dropped at any time.
+            // `MADV_WIPEONFORK` itself remains legal and merely re-asserts the
+            // derived policy.
+            if tk_linux_mm::advice_refused_on_droppable(advice) && area.backend().is_droppable() {
+                return Err(AxError::InvalidInput);
+            }
             // Linux applies WIPEONFORK only to private anonymous VMAs
             // (`madvise_willneed()`'s sibling
             // `madvise_behavior` → `madvise_wipeonfork()` returns `-EINVAL`
             // for anything else); KEEPONFORK clears the flag on any VMA.
-            if advice == MADV_WIPEONFORK {
-                let area = aspace.find_area(start).ok_or(AxError::NoMemory)?;
-                if area.start() > start || !area.backend().is_private_anonymous() {
-                    return Err(AxError::InvalidInput);
-                }
+            if advice == MADV_WIPEONFORK
+                && (area.start() > start || !area.backend().is_private_anonymous())
+            {
+                return Err(AxError::InvalidInput);
             }
             aspace.ensure_4k_granularity(start, length)?;
             aspace.set_wipe_on_fork(start, length, advice == MADV_WIPEONFORK)

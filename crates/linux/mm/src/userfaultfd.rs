@@ -18,6 +18,35 @@ pub const UFFD_O_CLOEXEC: u32 = 0x8_0000;
 
 const UFFD_CREATE_VALID_FLAGS: u32 = UFFD_USER_MODE_ONLY | UFFD_O_NONBLOCK | UFFD_O_CLOEXEC;
 
+/// Whether a VMA that may lose its pages at any time can be registered.
+///
+/// Linux v7.2.3 `mm/userfaultfd.c:vma_can_userfault()`:
+///
+/// ```c
+/// static bool vma_can_userfault(struct vm_area_struct *vma, vm_flags_t vm_flags,
+/// 		       bool wp_async)
+/// {
+/// 	const struct vm_uffd_ops *ops = vma_uffd_ops(vma);
+///
+/// 	if (vma->vm_flags & (VM_DROPPABLE | VM_SHADOW_STACK))
+/// 		return false;
+/// ```
+///
+/// Both `UFFDIO_REGISTER` (`mm/userfaultfd.c:3659-3661`) and
+/// `UFFDIO_UNREGISTER` (`mm/userfaultfd.c:3819-3827`) walk every VMA of the
+/// requested range and answer `-EINVAL` as soon as one of them is refused, so
+/// this is a property of the *range*, not only of the registered part.
+///
+/// The refusal is what keeps userfaultfd's contract intact: the handler is
+/// promised a fault for every page the application has not supplied, and a
+/// droppable mapping is allowed to lose a resident page without any fault
+/// being generated at all.  `VM_SHADOW_STACK` is the sibling refusal; this
+/// kernel models shadow stacks as kernel-only special mappings rather than as
+/// a per-VMA flag, so it has no separate input here.
+pub const fn uffd_can_register_droppable_vma(droppable: bool) -> bool {
+    !droppable
+}
+
 /// Checked creation flags for the Linux v6.12 userfaultfd(2) entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UffdCreateFlags(u32);

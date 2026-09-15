@@ -351,10 +351,20 @@ fn cold_demotes_a_shared_huge_leaf_before_walking_partial_range() {
 
 #[test]
 fn wipe_on_fork_child_keeps_parent_seal_without_its_backing() {
-    let child = wipe_on_fork_backend(VirtAddr::from(0x4000), PageSize::Size4K, true);
+    let child = wipe_on_fork_backend(VirtAddr::from(0x4000), PageSize::Size4K, true, false);
     assert!(child.is_sealed());
     assert!(child.is_private_anonymous());
     assert!(child.file_mapping().is_none());
+    assert!(!child.is_droppable());
+}
+
+#[test]
+fn wipe_on_fork_child_keeps_the_parent_droppable_flag() {
+    // `dup_mmap()` copies `vm_flags` (`mm/mmap.c:1130-1140`), so the child of a
+    // `MAP_DROPPABLE` mapping is droppable too even though its pages are fresh.
+    let child = wipe_on_fork_backend(VirtAddr::from(0x4000), PageSize::Size4K, false, true);
+    assert!(child.is_droppable());
+    assert!(child.is_private_anonymous());
 }
 
 #[test]

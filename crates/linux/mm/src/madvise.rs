@@ -278,3 +278,33 @@ pub const fn process_madvise_remote_valid(advice: u32) -> bool {
         MADV_COLD | MADV_PAGEOUT | MADV_WILLNEED | MADV_COLLAPSE
     )
 }
+
+/// Whether this advice value is refused on a `VM_DROPPABLE` VMA.
+///
+/// Linux v7.2.3 `mm/madvise.c:madvise_behavior()`:
+///
+/// ```c
+/// 	case MADV_KEEPONFORK:
+/// 		if (new_flags & VM_DROPPABLE)
+/// 			return -EINVAL;
+/// 		new_flags &= ~VM_WIPEONFORK;
+/// 		break;
+/// ...
+/// 	case MADV_DODUMP:
+/// 		if ((!is_vm_hugetlb_page(vma) && (new_flags & VM_SPECIAL)) ||
+/// 		    (new_flags & VM_DROPPABLE))
+/// 			return -EINVAL;
+/// 		new_flags &= ~VM_DONTDUMP;
+/// 		break;
+/// ```
+///
+/// The refusal is what makes `MAP_DROPPABLE` a one-way property.  Both advices
+/// exist to *clear* a per-VMA policy bit, and Linux granted both of those bits
+/// with the mapping itself (`mm/mmap.c:533` `vm_flags |= VM_WIPEONFORK |
+/// VM_DONTDUMP;`).  Allowing the clear would silently turn a mapping that may
+/// lose its pages at any time into one that a fork copies and a coredump
+/// writes to disk.
+pub const fn advice_refused_on_droppable(advice: u32) -> bool {
+    matches!(advice, MADV_KEEPONFORK | MADV_DODUMP)
+}
+

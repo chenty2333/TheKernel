@@ -231,10 +231,24 @@ fn adds_execute_permission(old_flags: MappingFlags, new_flags: MappingFlags) -> 
     new_flags.contains(MappingFlags::EXECUTE) && !old_flags.contains(MappingFlags::EXECUTE)
 }
 
-fn wipe_on_fork_backend(start: VirtAddr, page_size: PageSize, sealed: bool) -> Backend {
+/// Builds the child-side backend for one `VM_WIPEONFORK` fragment.
+///
+/// `dup_mmap()` copies `vm_flags` wholesale (`mm/mmap.c:1130-1140`), so a
+/// droppable parent VMA yields a droppable child VMA as well; the child keeps
+/// refusing `MADV_KEEPONFORK`/`MADV_DODUMP` and keeps discarding its leaves
+/// under reclaim.  Only the *pages* are replaced by a fresh zero page.
+fn wipe_on_fork_backend(
+    start: VirtAddr,
+    page_size: PageSize,
+    sealed: bool,
+    droppable: bool,
+) -> Backend {
     let mut backend = Backend::new_alloc(start, page_size);
     if sealed {
         backend.set_sealed();
+    }
+    if droppable {
+        backend = backend.with_droppable();
     }
     backend
 }
@@ -2979,7 +2993,15 @@ impl AddrSpace {
                 }
 
                 let mut segment_end = area.end();
-                if let Some(wipe_end) =
+                // `VM_DROPPABLE` is derived, not annotated: Linux keeps the
+                // whole VMA out of the child by way of the `VM_WIPEONFORK`
+                // flag it set at `mm/mmap.c:533`, so a droppable area needs no
+                // sidecar entry and contributes no fragment boundary of its
+                // own.
+                if area.backend().is_droppable() {
+                    // A `MADV_DONTFORK` hole inside the area still splits it;
+                    // `dup_mmap()` skips that range entirely.
+                } else if let Some(wipe_end) =
                     Self::interval_end_covering(&self.wipe_on_fork_ranges, cursor)
                 {
                     segment_end = segment_end.min(wipe_end);
@@ -3194,6 +3216,11 @@ impl AddrSpace {
     /// Materializes the exact PT_LOAD ranges eligible for a core image.
     /// MADV_DONTDUMP may cover only part of one VMA, so filtering whole areas
     /// would either leak excluded bytes or lose adjacent dumpable bytes.
+    ///
+    /// `VM_DROPPABLE` excludes a whole area the same way: Linux installs
+    /// `VM_DONTDUMP` with it and `MADV_DODUMP` refuses to clear the exclusion
+    /// again (`mm/madvise.c:1403-1406`), so no partial-range sidecar can ever
+    /// re-admit one of its bytes.
     pub(crate) fn coredump_segments(&self) -> AxResult<Vec<(VirtAddr, usize, MappingFlags)>> {
         let mut segments = Vec::new();
         segments
@@ -3202,6 +3229,7 @@ impl AddrSpace {
         for area in self.areas.iter().filter(|area| {
             area.flags().contains(MappingFlags::USER)
                 && !area.backend().is_secret()
+                && !area.backend().is_droppable()
                 && !area
                     .backend()
                     .file_like_mapping()
@@ -3373,8 +3401,17 @@ impl AddrSpace {
                     })
             })
         });
+        // `VM_DROPPABLE` is one of the flags khugepaged refuses to collapse
+        // (`mm/khugepaged.c:715`, `mm/khugepaged.c:1700` compare it against
+        // `vma->vm_flags`), so a droppable area counts as having a fork
+        // policy here even though no sidecar range records it.
         let has_fork_policy = Self::interval_overlaps(&self.wipe_on_fork_ranges, start, end)
-            || Self::interval_overlaps(&self.dontfork_ranges, start, end);
+            || Self::interval_overlaps(&self.dontfork_ranges, start, end)
+            || self.areas.iter().any(|area| {
+                area.backend().is_droppable()
+                    && area.start() < end
+                    && area.end() > start
+            });
         collapse_2m_candidate_eligible(Collapse2MCandidateFacts {
             start: start.as_usize(),
             length,
@@ -5399,6 +5436,17 @@ impl AddrSpace {
     ) -> AxResult {
         let scan_range = uffd_vma_scan_range(range, self.base(), self.end())?;
         for area in self.areas.iter_overlapping(scan_range) {
+            // Linux's ioctl loops test `vma_can_userfault()` on every VMA they
+            // walk and answer `-EINVAL` for the first refusal, before any
+            // registration state is touched (`mm/userfaultfd.c:3659-3661`
+            // for `UFFDIO_REGISTER`, `:3819-3827` for `UFFDIO_UNREGISTER`).
+            // `VM_DROPPABLE` is the first test in that predicate
+            // (`mm/userfaultfd.c:2114`): a mapping whose pages may be dropped
+            // without a fault cannot promise the handler that it will see
+            // every page it did not supply itself.
+            if !tk_linux_mm::uffd_can_register_droppable_vma(area.backend().is_droppable()) {
+                return Err(AxError::InvalidInput);
+            }
             validate_uffd_missing_backend_granule(area.backend().page_size())?;
             if snapshots.len() == snapshots.capacity() {
                 return Err(AxError::NoMemory);
@@ -8989,6 +9037,9 @@ impl AddrSpace {
     /// `Backend::swap_reclaimable`), which is the local equivalent of Linux's
     /// `folio_mapcount() == 1` isolated-LRU admission; anything else is left
     /// resident rather than being discarded.
+    ///
+    /// A `MAP_DROPPABLE` leaf is dropped instead of written out, so it needs
+    /// no active swap area and never becomes a swap entry.
     pub(crate) fn reclaim_anonymous_pages_in_range(
         &mut self,
         start: VirtAddr,
@@ -8999,12 +9050,13 @@ impl AddrSpace {
         let mut reclaimed = 0;
         while page < end {
             match self.reclaim_anonymous_page_at(page)? {
-                AnonymousReclaim::Reclaimed => reclaimed += 1,
+                AnonymousReclaim::Reclaimed | AnonymousReclaim::Dropped => reclaimed += 1,
                 AnonymousReclaim::NotEligible => {}
                 // Without an active swap area Linux's `pageout()` finds no
                 // swap slot, keeps every leaf resident, and still returns
                 // success; stopping here avoids walking a large range for
-                // nothing.
+                // nothing.  Droppable leaves never reach this arm: they are
+                // discarded without allocating a slot.
                 AnonymousReclaim::NoSwapArea => break,
             }
             page += PAGE_SIZE_4K;
@@ -9017,14 +9069,21 @@ impl AddrSpace {
     /// modify bytes while they are copied to swap.  A failed pageout restores
     /// the original leaf before returning.
     ///
+    /// A `MAP_DROPPABLE` leaf takes Linux's discard arm instead: it is freed
+    /// without being written to swap.
+    ///
     /// The pageout I/O itself runs under this address space's lock on purpose.
     /// Linux holds the mmap read lock across `pageout()` for the same reason:
     /// the swap entry must be recorded before the lock is dropped, because a
     /// fault on the just-invalidated address would otherwise repopulate it with
     /// a fresh zero page and silently lose the saved bytes.
     fn reclaim_anonymous_page_at(&mut self, page: VirtAddr) -> AxResult<AnonymousReclaim> {
-        let (backend, area_page_size) = match self.areas.find(page) {
-            Some(area) => (area.backend().clone(), area.backend().page_size()),
+        let (backend, area_page_size, droppable) = match self.areas.find(page) {
+            Some(area) => (
+                area.backend().clone(),
+                area.backend().page_size(),
+                area.backend().is_droppable(),
+            ),
             None => return Ok(AnonymousReclaim::NotEligible),
         };
         if area_page_size != PageSize::Size4K {
@@ -9050,6 +9109,21 @@ impl AddrSpace {
             return Err(AxError::BadState);
         }
         drop(self.synchronize_tlb_after_mutation());
+        if droppable {
+            // Linux never marks a droppable folio swapbacked
+            // (`mm/rmap.c:1652-1655` records that the flag is the difference
+            // between `MADV_FREE` and `MADV_DROPPABLE` pages), so
+            // `try_to_unmap_one()` reaches its `discard` arm
+            // (`mm/rmap.c:2287`) instead of building a swap entry: the PTE is
+            // cleared and the folio is freed outright.  The bytes are gone and
+            // the next fault reads a fresh zero page, which is exactly what
+            // `MAP_DROPPABLE` promises — and why this arm needs no swap area
+            // while the pageout arm does.
+            let grace = self.synchronize_tlb_after_mutation();
+            backend.release_swapped_frame(paddr);
+            drop(grace);
+            return Ok(AnonymousReclaim::Dropped);
+        }
         let bytes =
             unsafe { core::slice::from_raw_parts(phys_to_virt(paddr).as_ptr(), PAGE_SIZE_4K) };
         let entry = match crate::mm::pageout(bytes) {
@@ -9690,12 +9764,34 @@ impl AddrSpace {
                     continue;
                 }
 
-                if let Some(wipe_end) = Self::interval_end_covering(&wipe_on_fork_ranges, cursor) {
+                // `MAP_DROPPABLE` is derived here rather than recorded in the
+                // wipe sidecar: Linux reaches `dup_mmap()`'s wipe branch
+                // through the `VM_WIPEONFORK` flag it installed with
+                // `VM_DROPPABLE` (`mm/mmap.c:533`, `mm/mmap.c:1796-1801`), so
+                // the whole droppable area starts absent in the child.  A
+                // `MADV_DONTFORK` hole still clips the fragment because
+                // `dup_mmap()` skips such ranges outright.
+                let derived_wipe_end = if area.backend().is_droppable() {
+                    Some(
+                        Self::next_interval_start(&dontfork_ranges, cursor, area.end())
+                            .unwrap_or_else(|| area.end()),
+                    )
+                } else {
+                    None
+                };
+                if let Some(wipe_end) = derived_wipe_end
+                    .or_else(|| Self::interval_end_covering(&wipe_on_fork_ranges, cursor))
+                {
                     let segment_end = wipe_end.min(area.end());
                     let wipe_size = segment_end.sub_addr(cursor);
                     debug_assert!(page_size.is_aligned(wipe_size));
                     let child_backend =
-                        wipe_on_fork_backend(cursor, page_size, area.backend().is_sealed());
+                        wipe_on_fork_backend(
+                            cursor,
+                            page_size,
+                            area.backend().is_sealed(),
+                            area.backend().is_droppable(),
+                        );
                     let new_area = MemoryArea::new_with_lineage(
                         cursor,
                         wipe_size,
@@ -10506,6 +10602,9 @@ impl Drop for AddrSpace {
 enum AnonymousReclaim {
     /// The leaf was written to swap and its frame retired.
     Reclaimed,
+    /// The leaf belonged to a `MAP_DROPPABLE` mapping: its frame was retired
+    /// and the bytes were dropped without being written anywhere.
+    Dropped,
     /// The leaf is not exclusively owned, not 4 KiB, not resident, or could
     /// not be paged out; it stays resident.
     NotEligible,

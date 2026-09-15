@@ -50,7 +50,7 @@ pub use madvise::{
     MADV_GUARD_REMOVE, MADV_HUGEPAGE, MADV_HWPOISON, MADV_KEEPONFORK, MADV_MERGEABLE,
     MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_POPULATE_READ, MADV_POPULATE_WRITE,
     MADV_RANDOM, MADV_REMOVE, MADV_SEQUENTIAL, MADV_SOFT_OFFLINE, MADV_UNMERGEABLE, MADV_WILLNEED,
-    MADV_WIPEONFORK, advice_valid, process_madvise_remote_valid,
+    MADV_WIPEONFORK, advice_refused_on_droppable, advice_valid, process_madvise_remote_valid,
 };
 pub use mapping::{
     ExpectedMapping, InvalidationRange, InvalidationReason, MappingAccess, MappingKind,
@@ -100,6 +100,7 @@ pub use userfaultfd::{
     UffdRegistrationId, UffdRegistrationIntent, UffdRegistrationPlan, UffdRegistrationReplacement,
     UffdRegistrationRequest, UffdRegistrationTable, UffdResolverOutcome, UffdResolverResult,
     UffdZeroPageMode, UffdZeroPageRequest, admit_creation, admit_raw_creation,
+    uffd_can_register_droppable_vma,
 };
 
 #[cfg(test)]
