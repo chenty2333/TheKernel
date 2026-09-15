@@ -16,6 +16,9 @@ pub enum UapiError {
     Unsupported,
     TooBig,
     NotFound,
+    /// A capability the syscall's own order requires before it looks at any
+    /// user pointer or descriptor: `-EPERM`.
+    Permission,
 }
 
 pub const FSOPEN_CLOEXEC: u32 = 0x0000_0001;
@@ -364,17 +367,94 @@ pub const fn validate_fsconfig_shape(
         Err(UapiError::Invalid)
     }
 }
-/// `SYSCALL_DEFINE3(fsmount, ...)` / `SYSCALL_DEFINE3(fsopen, ...)` share this
-/// admission for the descriptor flags.  Linux's own table is
-/// `FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE` (include/uapi/linux/mount.h).
-pub const fn validate_fsmount(flags: u32, attrs: u32) -> Result<bool, UapiError> {
-    if flags & !(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE) != 0
-        || attrs & !(MOUNT_ATTR_SUPPORTED & !MOUNT_ATTR_IDMAP) != 0
-        || !valid_atime_set(attrs)
-    {
+/// The flag-word half of `SYSCALL_DEFINE3(fsmount, ...)`, which is the first
+/// statement of the syscall (`fs/namespace.c` v7.2.3:4447-4448):
+///
+/// ```text
+///     if (flags & ~(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE))
+///         return -EINVAL;
+/// ```
+pub const fn validate_fsmount_flags(flags: u32) -> Result<bool, UapiError> {
+    if flags & !(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE) != 0 {
         Err(UapiError::Invalid)
     } else {
         Ok(flags & FSMOUNT_CLOEXEC != 0)
+    }
+}
+/// The attribute-word half of `fsmount(2)`, which Linux applies *after* the
+/// namespace capability decision (`fs/namespace.c`:4458-4471):
+///
+/// ```text
+///     if (attr_flags & ~FSMOUNT_VALID_FLAGS)
+///         return -EINVAL;
+///
+///     switch (attr_flags & MOUNT_ATTR__ATIME) {
+///     case MOUNT_ATTR_RELATIME:
+///     case MOUNT_ATTR_NOATIME:
+///     case MOUNT_ATTR_STRICTATIME:
+///         break;
+///     default:
+///         return -EINVAL;
+///     }
+/// ```
+///
+/// `FSMOUNT_VALID_FLAGS` (`:4401-4404`) is `MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID
+/// | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC | MOUNT_ATTR__ATIME |
+/// MOUNT_ATTR_NODIRATIME | MOUNT_ATTR_NOSYMFOLLOW`, so `MOUNT_ATTR_IDMAP` is
+/// rejected here even though `mount_setattr(2)` accepts it through the wider
+/// `MOUNT_SETATTR_VALID_FLAGS` (`:4406`).
+pub const fn validate_fsmount_attrs(attrs: u32) -> Result<(), UapiError> {
+    if attrs & !(MOUNT_ATTR_SUPPORTED & !MOUNT_ATTR_IDMAP) != 0 || !valid_atime_set(attrs) {
+        Err(UapiError::Invalid)
+    } else {
+        Ok(())
+    }
+}
+/// The ordered scalar admission of `SYSCALL_DEFINE3(fsmount, ...)`, which runs
+/// entirely before the syscall looks at the fs_context descriptor
+/// (`fs/namespace.c` v7.2.3:4435-4471):
+///
+/// ```text
+///     if (flags & ~(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE))
+///         return -EINVAL;
+///     if ((flags & FSMOUNT_NAMESPACE) &&
+///         !ns_capable(current_user_ns(), CAP_SYS_ADMIN))
+///         return -EPERM;
+///     if (!(flags & FSMOUNT_NAMESPACE) && !may_mount())
+///         return -EPERM;
+///     if (attr_flags & ~FSMOUNT_VALID_FLAGS)
+///         return -EINVAL;
+///     switch (attr_flags & MOUNT_ATTR__ATIME) { ... default: return -EINVAL; }
+/// ```
+///
+/// The two capability tests are different domains and cannot be collapsed:
+/// `FSMOUNT_NAMESPACE` needs `CAP_SYS_ADMIN` in the caller's *own* user
+/// namespace (`current_user_namespace_admin`), because the new namespace is
+/// owned by it, while the plain form needs `may_mount()`, which is
+/// `ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN)`
+/// (`fs/namespace.c`:2007-2010) — `mount_ns_owner_admin` here.  The capability
+/// test therefore precedes attribute validation, so an unprivileged caller
+/// with a malformed attribute word gets `EPERM`, not `EINVAL`.
+pub const fn admit_fsmount(
+    flags: u32,
+    attrs: u32,
+    current_user_namespace_admin: bool,
+    mount_ns_owner_admin: bool,
+) -> Result<bool, UapiError> {
+    let cloexec = match validate_fsmount_flags(flags) {
+        Ok(cloexec) => cloexec,
+        Err(error) => return Err(error),
+    };
+    if flags & FSMOUNT_NAMESPACE != 0 {
+        if !current_user_namespace_admin {
+            return Err(UapiError::Permission);
+        }
+    } else if !mount_ns_owner_admin {
+        return Err(UapiError::Permission);
+    }
+    match validate_fsmount_attrs(attrs) {
+        Ok(()) => Ok(cloexec),
+        Err(error) => Err(error),
     }
 }
 /// `vfs_open_tree()` in `fs/namespace.c` rejects, in this order, any bit
@@ -391,6 +471,45 @@ pub const fn validate_open_tree(flags: u32) -> Result<bool, UapiError> {
     } else {
         Ok(flags & OPEN_TREE_CLOEXEC != 0)
     }
+}
+/// The capability half of `vfs_open_tree()`, which Linux applies after the
+/// flag-word rules and before the pathname copy (`fs/namespace.c`
+/// v7.2.3:3220-3233):
+///
+/// ```text
+///     /*
+///      * If we create a new mount namespace with the cloned mount tree we
+///      * just care about being privileged over our current user namespace.
+///      * The new mount namespace will be owned by it.
+///      */
+///     if ((flags & OPEN_TREE_NAMESPACE) &&
+///         !ns_capable(current_user_ns(), CAP_SYS_ADMIN))
+///         return ERR_PTR(-EPERM);
+///
+///     if ((flags & OPEN_TREE_CLONE) && !may_mount())
+///         return ERR_PTR(-EPERM);
+/// ```
+///
+/// `OPEN_TREE_NAMESPACE` deliberately does *not* consult `may_mount()`: a
+/// caller that holds `CAP_SYS_ADMIN` in its own user namespace may create a
+/// namespace owned by that user namespace even while `may_mount()` is false
+/// for the mount namespace it currently lives in.
+pub const fn admit_open_tree(
+    flags: u32,
+    current_user_namespace_admin: bool,
+    mount_ns_owner_admin: bool,
+) -> Result<bool, UapiError> {
+    let cloexec = match validate_open_tree(flags) {
+        Ok(cloexec) => cloexec,
+        Err(error) => return Err(error),
+    };
+    if flags & OPEN_TREE_NAMESPACE != 0 && !current_user_namespace_admin {
+        return Err(UapiError::Permission);
+    }
+    if flags & OPEN_TREE_CLONE != 0 && !mount_ns_owner_admin {
+        return Err(UapiError::Permission);
+    }
+    Ok(cloexec)
 }
 pub const fn validate_move_mount(
     flags: u32,
@@ -424,9 +543,9 @@ pub const fn validate_mount_setattr_flags(flags: u32, size: usize) -> Result<(),
 /// before it even loads the pathname:
 ///
 /// ```text
-/// 	// basic validity checks done first
-/// 	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
-/// 		return -EINVAL;
+///     // basic validity checks done first
+///     if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+///         return -EINVAL;
 /// ```
 ///
 /// The `MNT_EXPIRE` combination rule lives in `do_umount()`, which only runs
@@ -442,12 +561,12 @@ pub const fn validate_umount_flags(flags: i32) -> Result<(), UapiError> {
 /// one test:
 ///
 /// ```text
-/// 	/* Basic sanity checks */
-/// 	if (data_page)
-/// 		((char *)data_page)[PAGE_SIZE - 1] = 0;
+///     /* Basic sanity checks */
+///     if (data_page)
+///         ((char *)data_page)[PAGE_SIZE - 1] = 0;
 ///
-/// 	if (flags & MS_NOUSER)
-/// 		return -EINVAL;
+///     if (flags & MS_NOUSER)
+///         return -EINVAL;
 /// ```
 ///
 /// Nothing else is refused: `MS_SYNCHRONOUS`, `MS_DIRSYNC`, `MS_POSIXACL`,
@@ -977,7 +1096,11 @@ mod tests {
             validate_open_tree(OPEN_TREE_CLOEXEC | (1 << 31)),
             Err(UapiError::Invalid)
         );
-        assert_eq!(validate_fsmount(0, MOUNT_ATTR_NODIRATIME), Ok(false));
+        assert_eq!(
+            validate_fsmount_attrs(MOUNT_ATTR_NODIRATIME),
+            Ok(())
+        );
+        assert_eq!(admit_fsmount(0, MOUNT_ATTR_NODIRATIME, false, true), Ok(false));
         assert_eq!(
             apply_mount_attr_flags(0, MOUNT_ATTR_NODIRATIME as u64, 0, 0, 0),
             Ok(MS_NODIRATIME)
@@ -1029,26 +1152,104 @@ mod tests {
     }
 
     /// `SYSCALL_DEFINE3(fsmount, ...)` — `FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE`
-    /// plus `FSMOUNT_VALID_FLAGS` and the `MOUNT_ATTR__ATIME` enum switch.
+    /// plus `FSMOUNT_VALID_FLAGS` and the `MOUNT_ATTR__ATIME` enum switch,
+    /// which are applied after the capability decision at `fs/namespace.c`:
+    /// 4449-4456 and before the descriptor lookup at `:4473`.
     #[test]
     fn fsmount_admits_namespace_flag_and_linux_mount_attributes() {
-        assert_eq!(validate_fsmount(FSMOUNT_NAMESPACE, 0), Ok(false));
         assert_eq!(
-            validate_fsmount(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE, 0),
-            Ok(true)
-        );
-        assert_eq!(validate_fsmount(0x4, 0), Err(UapiError::Invalid));
-        // FSMOUNT_VALID_FLAGS excludes MOUNT_ATTR_IDMAP.
-        assert_eq!(
-            validate_fsmount(0, MOUNT_ATTR_IDMAP),
-            Err(UapiError::Invalid)
-        );
-        assert_eq!(validate_fsmount(0, MOUNT_ATTR_RDONLY), Ok(false));
-        assert_eq!(validate_fsmount(0, MOUNT_ATTR_ATIME), Err(UapiError::Invalid));
-        assert_eq!(
-            validate_fsmount(0, MOUNT_ATTR_NOATIME | MOUNT_ATTR_NODIRATIME),
+            admit_fsmount(FSMOUNT_NAMESPACE, 0, true, false),
             Ok(false)
         );
+        assert_eq!(
+            admit_fsmount(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE, 0, true, false),
+            Ok(true)
+        );
+        assert_eq!(
+            admit_fsmount(0x4, 0, true, true),
+            Err(UapiError::Invalid)
+        );
+        // FSMOUNT_VALID_FLAGS excludes MOUNT_ATTR_IDMAP.
+        assert_eq!(
+            admit_fsmount(0, MOUNT_ATTR_IDMAP, true, true),
+            Err(UapiError::Invalid)
+        );
+        assert_eq!(admit_fsmount(0, MOUNT_ATTR_RDONLY, true, true), Ok(false));
+        assert_eq!(
+            admit_fsmount(0, MOUNT_ATTR_ATIME, true, true),
+            Err(UapiError::Invalid)
+        );
+        assert_eq!(
+            admit_fsmount(0, MOUNT_ATTR_NOATIME | MOUNT_ATTR_NODIRATIME, true, true),
+            Ok(false)
+        );
+    }
+
+    /// The capability decision precedes attribute validation, and the two
+    /// flag forms use different capability domains: `FSMOUNT_NAMESPACE` needs
+    /// `ns_capable(current_user_ns(), CAP_SYS_ADMIN)` (`fs/namespace.c`:4451-4453)
+    /// and the plain form needs `may_mount()` (`:4455-4456`, `:2007-2010`).
+    #[test]
+    fn fsmount_checks_capability_before_attributes() {
+        const BAD_ATTRS: u32 = 0x8000_0000;
+        // `MOUNT_ATTR_RELATIME` is 0, so the invalid combination is a pair of
+        // non-zero atime selectors (`MOUNT_ATTR_NOATIME | MOUNT_ATTR_STRICTATIME`
+        // is 0x30, which is neither of the three cases in the switch).
+        const BAD_ATIME: u32 = MOUNT_ATTR_NOATIME | MOUNT_ATTR_STRICTATIME;
+        for attrs in [BAD_ATTRS, BAD_ATIME] {
+            // The namespace form ignores `may_mount()` in both directions.
+            assert_eq!(
+                admit_fsmount(FSMOUNT_NAMESPACE, attrs, false, true),
+                Err(UapiError::Permission)
+            );
+            assert_eq!(
+                admit_fsmount(FSMOUNT_NAMESPACE, attrs, true, false),
+                Err(UapiError::Invalid)
+            );
+            // The plain form ignores the caller's own user namespace.
+            assert_eq!(
+                admit_fsmount(0, attrs, true, false),
+                Err(UapiError::Permission)
+            );
+            assert_eq!(
+                admit_fsmount(0, attrs, false, true),
+                Err(UapiError::Invalid)
+            );
+        }
+        // A malformed flag word still outranks the capability test.
+        assert_eq!(
+            admit_fsmount(0x4000_0000, BAD_ATTRS, false, false),
+            Err(UapiError::Invalid)
+        );
+        assert_eq!(admit_fsmount(0, 0, false, true), Ok(false));
+    }
+
+    /// `vfs_open_tree()` applies the same two capability domains to its flag
+    /// word (`fs/namespace.c`:3224-3233) after the flag-word rules.
+    #[test]
+    fn open_tree_capability_domains_match_vfs_open_tree() {
+        assert_eq!(admit_open_tree(OPEN_TREE_CLONE, false, true), Ok(false));
+        assert_eq!(
+            admit_open_tree(OPEN_TREE_CLONE, false, false),
+            Err(UapiError::Permission)
+        );
+        assert_eq!(
+            admit_open_tree(OPEN_TREE_NAMESPACE, true, false),
+            Ok(false)
+        );
+        assert_eq!(
+            admit_open_tree(OPEN_TREE_NAMESPACE, false, true),
+            Err(UapiError::Permission)
+        );
+        // A plain path descriptor needs no capability at all.
+        assert_eq!(admit_open_tree(0, false, false), Ok(false));
+        assert_eq!(admit_open_tree(OPEN_TREE_CLOEXEC, false, false), Ok(true));
+        // The flag-word rules still run first.
+        assert_eq!(
+            admit_open_tree(OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE, false, false),
+            Err(UapiError::Invalid)
+        );
+        assert_eq!(admit_open_tree(AT_RECURSIVE, false, false), Err(UapiError::Invalid));
     }
 
     /// `copy_mnt_id_req()` (fs/namespace.c) — the descriptor form forbids the

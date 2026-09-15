@@ -1170,6 +1170,7 @@ fn map_topology_uapi_error(error: tk_linux_mount::UapiError) -> AxError {
         tk_linux_mount::UapiError::Unsupported => AxError::OperationNotSupported,
         tk_linux_mount::UapiError::TooBig => axerrno::LinuxError::E2BIG.into(),
         tk_linux_mount::UapiError::NotFound => AxError::NotFound,
+        tk_linux_mount::UapiError::Permission => axerrno::LinuxError::EPERM.into(),
     }
 }
 
