@@ -28,8 +28,9 @@ mod uapi;
 mod userfaultfd;
 
 pub use brk::{
-    BrkAdmission, align_up, check_data_rlimit, classify_brk, data_segment_size,
-    growth_fits_task_size, growth_start_in_range,
+    BrkAdmission, STACK_GUARD_GAP_DEFAULT, StartGap, align_up, check_data_rlimit, classify_brk,
+    data_segment_size, growth_crosses_next_guard_gap, growth_fits_task_size,
+    growth_start_in_range, vm_start_gap,
 };
 pub use charge::{
     ReservePlan, ReserveRequest, derive_accountable, derive_noreserve, mapping_kind_is_shared,

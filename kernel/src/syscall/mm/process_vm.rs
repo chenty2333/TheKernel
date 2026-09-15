@@ -485,9 +485,45 @@ pub fn sys_process_madvise(
     let caller = UserMemoryCapability::new(caller_aspace);
     let (remote, total_len) = read_process_madvise_iovecs(&caller, iovs, iovcnt)?;
 
-    let pidfd = PidFd::from_fd(pidfd)?;
-    let target = pidfd.process_data()?;
-    let target_image = pidfd.image_access_snapshot()?;
+    // `kernel/pid.c:pidfd_get_task()` resolves the descriptor before any
+    // address-space work, and `fs/pidfs.c:pidfd_pid()` answers `-EBADF` for a
+    // descriptor that is not a pidfs file:
+    //
+    // ```c
+    // struct pid *pidfd_pid(const struct file *file)
+    // {
+    // 	if (file->f_op != &pidfs_file_operations)
+    // 		return ERR_PTR(-EBADF);
+    // 	return file_inode(file)->i_private;
+    // }
+    // ```
+    //
+    // so a *valid* descriptor of any other type is `-EBADF` here, not the
+    // `-EINVAL` this kernel's typed-file lookup reports for a type mismatch.
+    let pidfd = match tk_linux_fd::pidfd_task_target(pidfd) {
+        tk_linux_fd::PidfdTaskTarget::SelfThread
+        | tk_linux_fd::PidfdTaskTarget::SelfThreadGroup => None,
+        tk_linux_fd::PidfdTaskTarget::Descriptor => Some(
+            PidFd::from_fd(pidfd).map_err(|error| match error {
+                AxError::InvalidInput => AxError::BadFileDescriptor,
+                error => error,
+            })?,
+        ),
+    };
+    let (target, target_image) = match &pidfd {
+        Some(pidfd) => (pidfd.process_data()?, pidfd.image_access_snapshot()?),
+        None => {
+            // `kernel/pid.c:pidfd_get_task()` resolves both `PIDFD_SELF_*`
+            // identifiers to the calling task before any descriptor lookup, so
+            // the target mm is the caller's own and `mm != current->mm` below
+            // is false.
+            let thread = current().clone();
+            let thread_ref = thread.as_thread();
+            let target = thread_ref.proc_data.clone();
+            let image = target.thread_image_access_snapshot(thread_ref)?;
+            (target, image)
+        }
+    };
     check_current_ptrace_image_snapshot(&target, &target_image, PtraceAccessMode::ReadFs)?;
     // `mm/madvise.c:SYSCALL_DEFINE5(process_madvise, ...)` calls
     // `madvise_behavior_valid(behavior)` for the same-mm case too, before the
@@ -586,8 +622,22 @@ pub fn sys_process_mrelease(pidfd: i32, flags: u32) -> AxResult<isize> {
     }
 
     // Preserve pidfd_get_task-style descriptor/type/liveness errors exactly.
-    let pidfd = PidFd::from_fd(pidfd)?;
-    let target = pidfd.process_data()?;
+    // `fs/pidfs.c:pidfd_pid()` answers `-EBADF` for a valid descriptor that is
+    // not a pidfs file, and the two `PIDFD_SELF_*` identifiers address the
+    // calling task without touching the fd table at all — which then reaches
+    // the eligibility check below with a live mm, i.e. `-EINVAL` for a process
+    // that is not dying, exactly as Linux does.
+    let target = match tk_linux_fd::pidfd_task_target(pidfd) {
+        tk_linux_fd::PidfdTaskTarget::SelfThread
+        | tk_linux_fd::PidfdTaskTarget::SelfThreadGroup => current().as_thread().proc_data.clone(),
+        tk_linux_fd::PidfdTaskTarget::Descriptor => {
+            let pidfd = PidFd::from_fd(pidfd).map_err(|error| match error {
+                AxError::InvalidInput => AxError::BadFileDescriptor,
+                error => error,
+            })?;
+            pidfd.process_data()?
+        }
+    };
     // Linux `__do_sys_process_mrelease()` resolves the mm owner with
     // `find_lock_task_mm()` *before* asking `task_will_free_mem()`, so a
     // target whose threads have all detached the mm reports -ESRCH even when

@@ -186,23 +186,54 @@ impl Advice {
 
     /// Whether this kernel accepts the advice value.
     ///
-    /// `MADV_MERGEABLE`/`MADV_UNMERGEABLE` are inside
-    /// `#ifdef CONFIG_KSM` in `mm/madvise.c:madvise_behavior_valid()`, so a
-    /// kernel built without KSM answers `-EINVAL`; `mm/ksm.h`'s
-    /// `!CONFIG_KSM` `ksm_madvise()` stub returning 0 is unreachable from
-    /// `madvise(2)` for exactly that reason.  This kernel has no KSM page
-    /// merging, so KSM advice cannot be claimed.
+    /// Linux `mm/madvise.c:madvise_behavior_valid()` compiles advice values out
+    /// of its accepted table with `#ifdef`s, and a compiled-out value reaches
+    /// `do_madvise()`'s
     ///
-    /// `MADV_SOFT_OFFLINE` is inside `#ifdef CONFIG_MEMORY_FAILURE` and its
-    /// effect is `soft_offline_page()`, which preserves the page's contents by
-    /// migrating the folio.  This kernel has no page-migration mechanism and
-    /// must not answer success: the only local primitive retires resident
-    /// pages, which would silently destroy user data that Linux preserves.
+    /// ```c
+    /// 	if (!madvise_behavior_valid(behavior))
+    /// 		return -EINVAL;
+    /// ```
+    ///
+    /// so it is `-EINVAL`, never a silent success.  The reference oracle runs
+    /// with `CONFIG_KSM=n`, `CONFIG_TRANSPARENT_HUGEPAGE=n` and
+    /// `CONFIG_MEMORY_FAILURE=n`, so the compiled-out set is exactly:
+    ///
+    /// ```c
+    /// #ifdef CONFIG_KSM
+    /// 	case MADV_MERGEABLE:
+    /// 	case MADV_UNMERGEABLE:
+    /// #endif
+    /// #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+    /// 	case MADV_HUGEPAGE:
+    /// 	case MADV_NOHUGEPAGE:
+    /// 	case MADV_COLLAPSE:
+    /// #endif
+    /// #ifdef CONFIG_MEMORY_FAILURE
+    /// 	case MADV_SOFT_OFFLINE:
+    /// 	case MADV_HWPOISON:
+    /// #endif
+    /// ```
+    ///
+    /// The stubs those configurations leave behind are unreachable from
+    /// `madvise(2)`: `mm/ksm.h`'s `!CONFIG_KSM` `ksm_madvise()` and
+    /// `mm/madvise.c`'s `!CONFIG_MEMORY_FAILURE` `madvise_inject_error()` both
+    /// return 0, but neither is called because the behavior table already
+    /// rejected the value first.  Reporting success here would be the
+    /// dangerous half of that pair: a caller that believed `MADV_HWPOISON` had
+    /// injected an error would mis-attribute a later `SIGBUS`, and one that
+    /// believed `MADV_SOFT_OFFLINE` had preserved a page would lose the
+    /// contents this kernel's only local primitive (retire the resident pages)
+    /// destroys.
     pub const fn availability(self) -> AdviceAvailability {
         match self {
-            Self::Mergeable | Self::Unmergeable | Self::SoftOffline => {
-                AdviceAvailability::Unavailable
-            }
+            Self::Mergeable
+            | Self::Unmergeable
+            | Self::HugePage
+            | Self::NoHugePage
+            | Self::Collapse
+            | Self::HwPoison
+            | Self::SoftOffline => AdviceAvailability::Unavailable,
             _ => AdviceAvailability::Impl,
         }
     }

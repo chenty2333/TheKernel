@@ -627,6 +627,23 @@ where
     true
 }
 
+/// Recognises the process heap VMA that `brk` owns.
+///
+/// Linux `SYSCALL_DEFINE1(brk)` never has to name this VMA: the iterator that
+/// both the stack-guard-gap probe and `do_brk_flags()` use starts at the old
+/// break, so a VMA that ends there is already behind it.  This kernel's heap
+/// can also be *entirely* absent (the range was `munmap`ed), which is why the
+/// growth path has to look for a mergeable tail separately, and its address
+/// space is a flat area list, so the exemption has to be spelled out.  The
+/// area is identified by the same three properties the merge path requires:
+/// it starts at the heap base, it is private anonymous storage, and it belongs
+/// to user space.
+fn is_brk_heap_area(area: &MemoryArea<Backend>, heap_base: VirtAddr) -> bool {
+    area.start() == heap_base
+        && area.backend().is_private_anonymous()
+        && area.flags().contains(MappingFlags::USER)
+}
+
 fn lineage_is_contained_in_range<B>(
     areas: &MemorySet<B>,
     lineage: MappingLineage,
@@ -6095,15 +6112,74 @@ impl AddrSpace {
                 break;
             }
 
-            let is_heap_area = area.start() == heap_base
-                && area.backend().is_private_anonymous()
-                && area.flags().contains(MappingFlags::USER);
-            if !is_heap_area {
+            if !is_brk_heap_area(area, heap_base) {
                 return true;
             }
         }
 
         false
+    }
+
+    /// Linux `SYSCALL_DEFINE1(brk)`'s stack-guard-gap rejection.
+    ///
+    /// Linux v7.2.3 `mm/mmap.c`:
+    ///
+    /// ```c
+    /// 	/*
+    /// 	 * Only check if the next VMA is within the stack_guard_gap of the
+    /// 	 * expansion area
+    /// 	 */
+    /// 	vma_iter_init(&vmi, mm, oldbrk);
+    /// 	next = vma_find(&vmi, newbrk + PAGE_SIZE + stack_guard_gap);
+    /// 	if (next && newbrk + PAGE_SIZE > vm_start_gap(next))
+    /// 		goto out;
+    /// ```
+    ///
+    /// `vma_iter_init(&vmi, mm, oldbrk)` starts the search at the old break, so
+    /// a VMA that merely *ends* at the old break — the brk VMA itself, and the
+    /// area `brk_growth_collides` exempts — is never `next`; only a VMA that
+    /// extends past `oldbrk` can be.  `expand_start` is this kernel's effective
+    /// growth start (`max(initial_heap_end, oldbrk)`) and the heap area below it
+    /// is skipped for the same reason.  Everything else mirrors the search
+    /// bound `newbrk + PAGE_SIZE + stack_guard_gap` and the strict `>` against
+    /// `vm_start_gap()`.
+    ///
+    /// Unlike `brk_growth_collides`, this predicate is not about the mapping a
+    /// growth would overwrite: a `VM_GROWSDOWN` VMA (or a shadow stack) above
+    /// the new break owns reserved address space *below* its start, and Linux
+    /// refuses a break that would grow into it.
+    pub fn brk_growth_crosses_next_guard_gap(
+        &self,
+        expand_start: VirtAddr,
+        new_brk: VirtAddr,
+        heap_base: VirtAddr,
+    ) -> bool {
+        let Some(window_end) = new_brk
+            .as_usize()
+            .checked_add(PAGE_SIZE_4K + tk_linux_mm::STACK_GUARD_GAP_DEFAULT as usize)
+        else {
+            return true;
+        };
+        let Some(next) = self.areas.iter().find(|area| {
+            area.start() >= expand_start
+                && area.start().as_usize() < window_end
+                && !is_brk_heap_area(area, heap_base)
+        }) else {
+            return false;
+        };
+        let gap = if self.growdown_starts.contains(&next.start()) {
+            tk_linux_mm::StartGap::GrowDown
+        } else if next.flags().contains(MappingFlags::SHADOW_STACK) {
+            tk_linux_mm::StartGap::ShadowStack
+        } else {
+            tk_linux_mm::StartGap::None
+        };
+        tk_linux_mm::growth_crosses_next_guard_gap(
+            new_brk.as_usize() as u64,
+            next.start().as_usize() as u64,
+            gap,
+            tk_linux_mm::STACK_GUARD_GAP_DEFAULT,
+        )
     }
 
     /// Add a new linear mapping.

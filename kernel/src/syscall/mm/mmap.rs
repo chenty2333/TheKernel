@@ -89,6 +89,35 @@ enum MadviseRemoveTarget {
 /// Captures exact backing ownership while the VMA topology is stable.  The
 /// retained file handles and shared-page Arcs survive fd close, VMA splits and
 /// the lock drop required before filesystem mutation.
+///
+/// Linux v7.2.3 `mm/madvise.c:madvise_remove()` decides in this order:
+///
+/// ```c
+/// 	if (vma->vm_flags & VM_LOCKED)
+/// 		return -EINVAL;
+///
+/// 	f = vma->vm_file;
+///
+/// 	if (!f || !f->f_mapping || !f->f_mapping->host) {
+/// 		/*
+/// 		 * If there is no file, then there is nothing to remove...
+/// 		 */
+/// 		return -EINVAL;
+/// 	}
+///
+/// 	if (!vma_is_shared_maywrite(vma))
+/// 		return -EACCES;
+/// ```
+///
+/// `vma_is_shared_maywrite()` is
+/// `(vm_flags & (VM_SHARED | VM_MAYWRITE)) == (VM_SHARED | VM_MAYWRITE)`, and
+/// `do_mmap()` clears both bits for a shared mapping of a file that was not
+/// opened for writing (`mm/mmap.c:464-466`).  A private file mapping therefore
+/// answers `-EACCES` — it has a file but may not write through it — while a
+/// private anonymous mapping has no file at all and answers `-EINVAL`.  Every
+/// one of these is decided before any hole is punched, and the caller has
+/// already split the request at lock boundaries so that an unlocked prefix
+/// keeps its punch.
 fn collect_madvise_remove_targets(
     aspace: &AddrSpace,
     start: VirtAddr,
@@ -105,12 +134,20 @@ fn collect_madvise_remove_targets(
         }
         let segment_end = area.end().min(end);
         let segment_length = segment_end.sub_addr(cursor);
+        if aspace.range_is_locked(cursor, segment_length) {
+            return Err(AxError::InvalidInput);
+        }
+        let lease = area.backend().file_mapping();
+        let shared_maywrite = lease.is_some_and(|lease| {
+            lease.sharing() == FileMappingSharing::Shared
+                && lease.access_flags().contains(FileFlags::WRITE)
+        });
         match area.backend() {
             Backend::File(_) => {
-                let lease = area.backend().file_mapping().ok_or(AxError::InvalidInput)?;
-                if lease.sharing() != FileMappingSharing::Shared {
-                    return Err(AxError::InvalidInput);
+                if !shared_maywrite {
+                    return Err(AxError::PermissionDenied);
                 }
+                let lease = lease.ok_or(AxError::InvalidInput)?;
                 let offset = lease.file_offset_at(cursor).ok_or(AxError::InvalidInput)?;
                 let length = u64::try_from(segment_length).map_err(|_| AxError::InvalidInput)?;
                 targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
@@ -134,6 +171,8 @@ fn collect_madvise_remove_targets(
                     length: segment_length,
                 });
             }
+            // A private file mapping has an inode but is not shared-writable.
+            Backend::Cow(_) if lease.is_some() => return Err(AxError::PermissionDenied),
             Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => {
                 return Err(AxError::InvalidInput);
             }
@@ -784,6 +823,21 @@ bitflags::bitflags! {
         const SHARED_VALIDATE = MAP_SHARED_VALIDATE as usize;
         /// Changes private; copy pages on write.
         const PRIVATE = MAP_PRIVATE as usize;
+        /// Zero memory under memory pressure.
+        ///
+        /// `include/uapi/linux/mman.h`:
+        ///
+        /// ```c
+        /// #define MAP_SHARED	0x01		/* Share changes */
+        /// #define MAP_PRIVATE	0x02		/* Changes are private */
+        /// #define MAP_SHARED_VALIDATE 0x03	/* share + validate extension flags */
+        /// #define MAP_DROPPABLE	0x08		/* Zero memory under memory pressure. */
+        /// ```
+        ///
+        /// It belongs to the `MAP_TYPE` group, so it shares the low nibble with
+        /// the sharing modes; `MAP_TYPE` is `0x0f` in
+        /// `arch/x86/include/uapi/asm/mman.h`'s `asm-generic/mman-common.h`.
+        const DROPPABLE = MAP_DROPPABLE as usize;
         /// Stack-like mapping that may expand downward on demand.
         const GROWDOWN = MAP_GROWSDOWN as usize;
         /// Map address must be exactly as requested, no matter whether it is available.
@@ -827,10 +881,22 @@ pub fn sys_mmap(
     fd: i32,
     offset: isize,
 ) -> AxResult<isize> {
-    let permission_flags = MmapProt::from_bits(prot).ok_or(AxError::InvalidInput)?;
-    if permission_flags.intersects(MmapProt::GROWDOWN | MmapProt::GROWSUP) {
-        return Err(AxError::InvalidInput);
-    }
+    // Linux `mm/mmap.c:do_mmap()` performs no `prot` validation of its own —
+    // `arch_validate_prot()` is called only from
+    // `mm/mprotect.c:do_mprotect_pkey()` — and it never rejects
+    // `PROT_GROWSDOWN`/`PROT_GROWSUP` either: the request is consumed by
+    //
+    // ```c
+    // 	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(file, flags) |
+    // 			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+    // ```
+    //
+    // which maps PROT_READ/PROT_WRITE/PROT_EXEC and ignores every other bit.
+    // On x86-64 `arch_calc_vm_prot_bits()` only contributes protection-key
+    // bits, so `PROT_GROWSDOWN` on `mmap` is inert — unlike `mprotect`, where
+    // it extends the range downwards.  An undefined bit such as 0x80000000
+    // therefore maps PROT_NONE instead of failing with EINVAL.
+    let permission_flags = MmapProt::from_bits_truncate(prot);
     let map_flags = match MmapFlags::from_bits(flags) {
         Some(flags) => flags,
         None => {
@@ -844,19 +910,65 @@ pub fn sys_mmap(
     let map_type = map_flags & MmapFlags::TYPE;
     if !matches!(
         map_type,
-        MmapFlags::PRIVATE | MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE
+        MmapFlags::PRIVATE
+            | MmapFlags::SHARED
+            | MmapFlags::SHARED_VALIDATE
+            | MmapFlags::DROPPABLE
     ) {
         return Err(AxError::InvalidInput);
     }
     let is_anonymous_mapping = map_flags.contains(MmapFlags::ANONYMOUS);
+    if map_type == MmapFlags::DROPPABLE {
+        // Linux `mm/mmap.c:505-543`.  `MAP_DROPPABLE` is a member of the
+        // `MAP_TYPE` group and is handled in the branch taken when *no* file is
+        // behind the mapping; the `if (file)` branch's `switch (flags &
+        // MAP_TYPE)` has no case for it and returns `-EINVAL` from `default:`.
+        //
+        // ```c
+        // 		case MAP_DROPPABLE:
+        // 			if (VM_DROPPABLE == VM_NONE)
+        // 				return -EOPNOTSUPP;
+        // 			if (flags & (MAP_LOCKED | MAP_HUGETLB))
+        // 			        return -EINVAL;
+        // 			if (vm_flags & (VM_GROWSDOWN | VM_GROWSUP))
+        // 			        return -EINVAL;
+        // 			vm_flags |= VM_DROPPABLE;
+        // 			vm_flags |= VM_NORESERVE;
+        // 			vm_flags |= VM_WIPEONFORK | VM_DONTDUMP;
+        // 			fallthrough;
+        // 		case MAP_PRIVATE:
+        // 			pgoff = addr >> PAGE_SHIFT;
+        // ```
+        //
+        // `VM_DROPPABLE` is `INIT_VM_FLAG(DROPPABLE)` for `CONFIG_64BIT`, so on
+        // x86-64 the `-EOPNOTSUPP` arm is dead.  The rest of the behaviour is
+        // carried by the mapping below: private anonymous storage that is never
+        // reserved, is wiped on fork and never dumped.
+        if !is_anonymous_mapping {
+            return Err(AxError::InvalidInput);
+        }
+        if map_flags.intersects(MmapFlags::LOCKED | MmapFlags::HUGE)
+            || map_flags.contains(MmapFlags::GROWDOWN)
+        {
+            return Err(AxError::InvalidInput);
+        }
+    }
+    // Linux `mm/mmap.c:497-498` and `:479-480` refuse a growdown shared or
+    // file mapping with `-EINVAL`:
+    //
+    // ```c
+    // 		case MAP_SHARED:
+    // 			if (vm_flags & (VM_GROWSDOWN|VM_GROWSUP))
+    // 				return -EINVAL;
+    // ```
+    //
+    // Growdown is only meaningful for a private anonymous mapping, which is
+    // what this kernel implements; the reject is `-EINVAL`, not `-EOPNOTSUPP`.
     if map_flags.contains(MmapFlags::GROWDOWN)
         && (map_type != MmapFlags::PRIVATE
             || !is_anonymous_mapping
             || map_flags.contains(MmapFlags::HUGE))
     {
-        return Err(AxError::OperationNotSupported);
-    }
-    if is_anonymous_mapping && offset != 0 {
         return Err(AxError::InvalidInput);
     }
     let pinned_fd = if !is_anonymous_mapping {
@@ -870,6 +982,20 @@ pub fn sys_mmap(
     if length == 0 {
         return Err(AxError::InvalidInput);
     }
+    // `arch/x86/kernel/sys_x86_64.c:SYSCALL_DEFINE6(mmap, ...)`:
+    //
+    // ```c
+    // 	if (off & ~PAGE_MASK)
+    // 		return -EINVAL;
+    //
+    // 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+    // ```
+    //
+    // The byte offset must be page-aligned for every mapping, but the page
+    // offset itself is ignored for an anonymous one: `do_mmap()`'s
+    // `case MAP_PRIVATE:` sets `pgoff = addr >> PAGE_SHIFT` and the
+    // `case MAP_SHARED:` arm says `/* Ignore pgoff. */ pgoff = 0;`, so only the
+    // file branch ever reads the value.
     let offset: usize = offset.try_into().map_err(|_| AxError::InvalidInput)?;
     if !PageSize::Size4K.is_aligned(offset) {
         return Err(AxError::InvalidInput);
@@ -1016,7 +1142,7 @@ pub fn sys_mmap(
     // deliberately ignores the hint.  The earlier form of this check tested
     // only anonymous mappings and dropped `MAP_NORESERVE` entirely.
     let mapping_kind = match (is_anonymous_mapping, map_type) {
-        (true, MmapFlags::PRIVATE) => MappingKind::AnonymousPrivate,
+        (true, MmapFlags::PRIVATE | MmapFlags::DROPPABLE) => MappingKind::AnonymousPrivate,
         (true, _) => MappingKind::AnonymousShared,
         (false, MmapFlags::PRIVATE) => MappingKind::FilePrivate,
         (false, _) => MappingKind::FileShared,
@@ -1030,7 +1156,9 @@ pub fn sys_mmap(
             writable: permission_flags.contains(MmapProt::WRITE),
             map_noreserve: map_flags.contains(MmapFlags::NORESERVE),
             file_is_hugepages,
-            droppable: false,
+            // Linux `mm/mmap.c:527`: `vm_flags |= VM_NORESERVE;` — droppable
+            // pages may vanish at any time, so reserving them is pointless.
+            droppable: map_type == MmapFlags::DROPPABLE,
         },
         overcommit_memory_policy() == 2,
     );
@@ -1297,7 +1425,9 @@ pub fn sys_mmap(
                             ),
                         )
                     }
-                    None if map_type == MmapFlags::PRIVATE => Backend::new_alloc(start, page_size),
+                    None if matches!(map_type, MmapFlags::PRIVATE | MmapFlags::DROPPABLE) => {
+                        Backend::new_alloc(start, page_size)
+                    }
                     None => return Err(AxError::InvalidInput),
                 }
             };
@@ -1320,7 +1450,18 @@ pub fn sys_mmap(
                 || map_flags.contains(MmapFlags::LOCKED)
                 || aspace.locks_future_mappings();
             if locked_mapping {
-                check_mmap_memlock_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
+                // Linux `mm/mmap.c:417-422` answers two different errnos for the
+                // same zeroed limit: `can_do_mlock()` (EPERM) is consulted only
+                // for the explicit `MAP_LOCKED` flag, while `mlock_future_ok()`
+                // (EAGAIN) also covers `MCL_FUTURE` via `mm->def_flags`.
+                check_mmap_memlock_limit(
+                    proc_data,
+                    has_ipc_lock,
+                    map_flags.contains(MmapFlags::LOCKED),
+                    &aspace,
+                    start,
+                    length,
+                )?;
             }
 
             let populate = (map_flags.contains(MmapFlags::POPULATE)
@@ -1432,6 +1573,16 @@ pub fn sys_mmap(
             }
             if growdown_private_anon {
                 aspace.mark_growdown(start);
+            }
+            if map_type == MmapFlags::DROPPABLE {
+                // Linux `mm/mmap.c:533`: `vm_flags |= VM_WIPEONFORK |
+                // VM_DONTDUMP;`.  Both are mm-side annotations here, so they
+                // are installed while the freshly published mapping is still
+                // protected by the address-space mutex — a fork or a coredump
+                // that observed the VMA without them would copy or dump pages
+                // Linux guarantees to be gone.
+                aspace.set_wipe_on_fork(start, length, true)?;
+                aspace.set_dontdump(start, length, true)?;
             }
             if populate && !best_effort_secret_populate {
                 drop(aspace);
@@ -3105,20 +3256,70 @@ pub(super) fn madvise_behavior_valid(advice: u32) -> bool {
     advice_valid(advice)
 }
 
-pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
-    debug!("sys_madvise <= addr: {addr:#x}, length: {length:x}, advice: {advice:#x}");
-
-    if !madvise_behavior_valid(advice) || !addr.is_multiple_of(PageSize::Size4K as usize) {
-        return Err(AxError::InvalidInput);
+/// The next VMA clip Linux's `madvise()` walk would visit.
+///
+/// Linux v7.2.3 `mm/madvise.c:madvise_walk_vmas()` iterates `find_vma()`
+/// results in ascending order and clips each one to the requested range:
+///
+/// ```c
+/// 		/* Here vma->vm_start <= range->start < (last_end|vma->vm_end) */
+/// 		range->end = min(vma->vm_end, last_end);
+/// ```
+///
+/// A gap in front of the VMA is *not* fatal there — it sets `unmapped_error`
+/// and the walk continues with the rest of the range.  This helper returns one
+/// such clip, or `None` when the walk is over.
+///
+/// `mlock(2)` publishes `VM_LOCKED` by splitting the VMA at the boundaries of
+/// the locked range (`mm/mlock.c:mlock_fixup()`), so a requested range that
+/// straddles a lock boundary is two VMAs in Linux and has to be two steps
+/// here as well: behaviours such as `MADV_DONTNEED` answer `-EINVAL` for the
+/// locked half only *after* the unlocked half has been applied.
+fn next_madvise_run(
+    aspace: &AddrSpace,
+    cursor: VirtAddr,
+    end: VirtAddr,
+) -> Option<(VirtAddr, VirtAddr, bool)> {
+    let area = aspace.find_area(cursor)?;
+    let gap = area.start() > cursor;
+    let start = area.start().max(cursor);
+    let run_end = area.end().min(end);
+    if start >= run_end {
+        return None;
     }
-    if length == 0 {
-        return Ok(0);
+    if let Some(&(segment_start, segment_len)) =
+        aspace.locked_segments_in_range(start, run_end.sub_addr(start)).first()
+    {
+        let segment_end = segment_start + segment_len;
+        if segment_start > start {
+            return Some((start, segment_start, gap));
+        }
+        if segment_end < run_end {
+            return Some((start, segment_end, gap));
+        }
     }
+    Some((start, run_end, gap))
+}
 
-    let curr = current();
-    let aspace_handle = curr.as_thread().proc_data.aspace();
+/// Applies one advice to exactly one VMA clip.
+///
+/// This is Linux's `madvise_vma_behavior()` for the `vma`/`start`/`end` triple
+/// the walk selected, including the per-VMA `VM_SEALED` rejection that precedes
+/// the behaviour switch:
+///
+/// ```c
+/// 	if (!can_madvise_modify(vma, behavior, &new_flags))
+/// 		return -EPERM;
+/// ```
+pub(super) fn apply_madvise_run(
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    start: VirtAddr,
+    length: usize,
+    advice: u32,
+    has_cap_sys_admin: bool,
+) -> AxResult<()> {
+    let addr = start.as_usize();
     let mut aspace = aspace_handle.lock();
-    let (start, length) = validate_page_aligned_range(addr, length)?;
 
     if madvise_discard_behavior(advice) && aspace.sealed_ro_anon_in_range(start, length) {
         return Err(AxError::OperationNotPermitted);
@@ -3131,14 +3332,17 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
         // doing real readahead.  Anonymous mappings remain a validated no-op
         // in Backend::prefetch_file_backed, matching Linux's advisory model.
         drop(aspace);
-        process_madvise_willneed(&aspace_handle, addr, length)?;
-        return Ok(0);
+        return process_madvise_willneed(aspace_handle, addr, length);
     }
 
     if advice == MADV_COLLAPSE {
+        // Unreachable through `madvise(2)` on this kernel:
+        // `madvise_behavior_valid()` refuses MADV_COLLAPSE because
+        // CONFIG_TRANSPARENT_HUGEPAGE is off in the configuration this ABI is
+        // measured against.  The behaviour is kept intact for a kernel built
+        // with transparent huge pages.
         drop(aspace);
-        process_madvise_collapse(&aspace_handle, addr, length)?;
-        return Ok(0);
+        return process_madvise_collapse(aspace_handle, addr, length);
     }
 
     if advice == MADV_PAGEOUT {
@@ -3151,7 +3355,7 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
         for (backend, range) in work {
             backend.pageout_file_pages(range)?;
         }
-        return Ok(0);
+        return Ok(());
     }
 
     if advice == MADV_GUARD_INSTALL {
@@ -3159,18 +3363,22 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
         // it discards any resident anonymous pages and turns later faults
         // into access denials until an explicit GUARD_REMOVE.
         aspace.install_madvise_guard(start, length)?;
-        return Ok(0);
+        return Ok(());
     }
     if advice == MADV_GUARD_REMOVE {
         aspace.remove_madvise_guard(start, length)?;
-        return Ok(0);
+        return Ok(());
     }
     if advice == MADV_HWPOISON {
-        if !curr.as_thread().has_effective_capability(CAP_SYS_ADMIN) {
+        // Also unreachable through this kernel's advice table
+        // (CONFIG_MEMORY_FAILURE is off in the measured configuration); the
+        // capability check and the injection stay for a kernel that enables
+        // the behaviour.
+        if !has_cap_sys_admin {
             return Err(AxError::OperationNotPermitted);
         }
         aspace.install_madvise_hwpoison(start, length)?;
-        return Ok(0);
+        return Ok(());
     }
     if matches!(advice, MADV_POPULATE_READ | MADV_POPULATE_WRITE) {
         let access = if advice == MADV_POPULATE_READ {
@@ -3182,67 +3390,70 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
         // this mm lock before reclaim and re-run the complete range/permission
         // check for every retry.
         drop(aspace);
-        populate_explicit_with_reclaim(&aspace_handle, start, length, access, |aspace| {
+        populate_explicit_with_reclaim(aspace_handle, start, length, access, |aspace| {
             inspect_madvise_range(aspace, start, length).map(|_| ())
         })?;
-        return Ok(0);
+        return Ok(());
     }
 
     match advice {
         MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL => {
-            inspect_madvise_range(&aspace, start, length)?;
             let policy = match advice {
                 MADV_NORMAL => MadviseReadahead::Normal,
                 MADV_RANDOM => MadviseReadahead::Random,
                 MADV_SEQUENTIAL => MadviseReadahead::Sequential,
                 _ => unreachable!("madvise readahead behavior was matched above"),
             };
-            aspace.set_madvise_readahead(start, length, policy)?;
-            Ok(0)
+            aspace.set_madvise_readahead(start, length, policy)
         }
         MADV_DONTFORK | MADV_DOFORK => {
-            inspect_madvise_range(&aspace, start, length)?;
             // Fork policy ranges can split a PMD.  Establish 4 KiB geometry
             // first, rather than leaving later fork/duplicate transactions
             // with a policy boundary through one huge COW leaf.
             aspace.ensure_4k_granularity(start, length)?;
-            aspace.set_dontfork(start, length, advice == MADV_DONTFORK)?;
-            Ok(0)
+            aspace.set_dontfork(start, length, advice == MADV_DONTFORK)
         }
         MADV_POPULATE_READ | MADV_POPULATE_WRITE => unreachable!("handled above"),
-        MADV_DONTNEED => {
+        MADV_DONTNEED | MADV_DONTNEED_LOCKED => {
+            // Linux `mm/madvise.c:madvise_dontneed_free_valid_vma()`:
+            //
+            // ```c
+            // 	unsigned int forbidden = VM_PFNMAP;
+            //
+            // 	if (behavior != MADV_DONTNEED_LOCKED)
+            // 		forbidden |= VM_LOCKED;
+            //
+            // 	return !(vma->vm_flags & forbidden);
+            // ```
+            //
+            // i.e. both behaviours refuse a physical (VM_PFNMAP) mapping, but
+            // only plain MADV_DONTNEED refuses a locked one — DONTNEED_LOCKED
+            // exists precisely to discard a locked range without unlocking it.
             let info = inspect_madvise_range(&aspace, start, length)?;
-            if info.has_physical_mapping || aspace.range_is_locked(start, length) {
+            if info.has_physical_mapping
+                || (advice == MADV_DONTNEED && aspace.range_is_locked(start, length))
+            {
                 return Err(AxError::InvalidInput);
             }
-            aspace.discard_pages(start, length)?;
-            Ok(0)
+            aspace.discard_pages(start, length)
         }
         MADV_FREE => {
+            // MADV_FREE shares `madvise_dontneed_free_valid_vma()` with
+            // MADV_DONTNEED, so a locked VMA is `-EINVAL` here too — not the
+            // `-EBUSY` that `MS_INVALIDATE` reports for the same state.
             let info = inspect_madvise_range(&aspace, start, length)?;
-            if !info.all_private_anonymous {
+            if !info.all_private_anonymous || info.has_physical_mapping {
                 return Err(AxError::InvalidInput);
             }
             if aspace.range_is_locked(start, length) {
-                return Err(AxError::ResourceBusy);
-            }
-            aspace.mark_madvise_free(start, length)?;
-            Ok(0)
-        }
-        MADV_COLD => {
-            process_madvise_cold(&mut aspace, addr, length)?;
-            Ok(0)
-        }
-        MADV_DONTNEED_LOCKED => {
-            let info = inspect_madvise_range(&aspace, start, length)?;
-            if info.has_shared_mapping {
                 return Err(AxError::InvalidInput);
             }
-            aspace.discard_pages(start, length)?;
-            Ok(0)
+            aspace.mark_madvise_free(start, length)
         }
+        MADV_COLD => process_madvise_cold(&mut aspace, addr, length),
         MADV_HUGEPAGE | MADV_NOHUGEPAGE => {
-            inspect_madvise_range(&aspace, start, length)?;
+            // Unreachable through this kernel's advice table: both are inside
+            // `#ifdef CONFIG_TRANSPARENT_HUGEPAGE`.
             aspace.set_madvise_thp(
                 start,
                 length,
@@ -3251,19 +3462,14 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
                 } else {
                     MadviseThp::NoHuge
                 },
-            )?;
-            Ok(0)
+            )
         }
         // `MADV_MERGEABLE`/`MADV_UNMERGEABLE` never reach this match:
         // `madvise_behavior_valid()` rejects them, exactly as Linux does when
         // KSM is not configured. They must not report success, because a
         // caller that believed its pages were merged would go on to rely on
         // the sharing and on `MADV_UNMERGEABLE` splitting it again.
-        MADV_DONTDUMP | MADV_DODUMP => {
-            inspect_madvise_range(&aspace, start, length)?;
-            aspace.set_dontdump(start, length, advice == MADV_DONTDUMP)?;
-            Ok(0)
-        }
+        MADV_DONTDUMP | MADV_DODUMP => aspace.set_dontdump(start, length, advice == MADV_DONTDUMP),
         MADV_REMOVE => {
             let targets = collect_madvise_remove_targets(&aspace, start, length)?;
             let security = current_vfs_security();
@@ -3280,42 +3486,97 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
                         offset,
                         length,
                     } => remove_anonymous_shared_across_aliases(
-                        &aspace_handle,
+                        aspace_handle,
                         pages,
                         offset,
                         length,
                     )?,
                 }
             }
-            Ok(0)
+            Ok(())
         }
-        MADV_WIPEONFORK => {
-            let end = start + length;
-            let mut cursor = start;
-            while cursor < end {
-                let Some(area) = aspace.find_area(cursor) else {
-                    return Err(AxError::NoMemory);
-                };
-                if area.start() > cursor {
-                    return Err(AxError::NoMemory);
-                }
-                if !area.backend().is_private_anonymous() {
+        MADV_WIPEONFORK | MADV_KEEPONFORK => {
+            // Linux applies WIPEONFORK only to private anonymous VMAs
+            // (`madvise_willneed()`'s sibling
+            // `madvise_behavior` → `madvise_wipeonfork()` returns `-EINVAL`
+            // for anything else); KEEPONFORK clears the flag on any VMA.
+            if advice == MADV_WIPEONFORK {
+                let area = aspace.find_area(start).ok_or(AxError::NoMemory)?;
+                if area.start() > start || !area.backend().is_private_anonymous() {
                     return Err(AxError::InvalidInput);
                 }
-                cursor = area.end().min(end);
             }
             aspace.ensure_4k_granularity(start, length)?;
-            aspace.set_wipe_on_fork(start, length, advice == MADV_WIPEONFORK)?;
-            Ok(0)
-        }
-        MADV_KEEPONFORK => {
-            inspect_madvise_range(&aspace, start, length)?;
-            aspace.ensure_4k_granularity(start, length)?;
-            aspace.set_wipe_on_fork(start, length, false)?;
-            Ok(0)
+            aspace.set_wipe_on_fork(start, length, advice == MADV_WIPEONFORK)
         }
         _ => Err(AxError::InvalidInput),
     }
+}
+
+pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
+    debug!("sys_madvise <= addr: {addr:#x}, length: {length:x}, advice: {advice:#x}");
+
+    if !madvise_behavior_valid(advice) || !addr.is_multiple_of(PageSize::Size4K as usize) {
+        return Err(AxError::InvalidInput);
+    }
+    if length == 0 {
+        return Ok(0);
+    }
+
+    let curr = current();
+    let has_cap_sys_admin = curr.as_thread().has_effective_capability(CAP_SYS_ADMIN);
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let (start, length) = validate_page_aligned_range(addr, length)?;
+    let end = start + length;
+
+    // Linux v7.2.3 `mm/madvise.c:madvise_walk_vmas()` applies the advice to
+    // each VMA of the range in address order and stops at the first behaviour
+    // error, leaving the already-processed prefix applied:
+    //
+    // ```c
+    // 		madv_behavior->prev = prev;
+    // 		madv_behavior->vma = vma;
+    // 		error = madvise_vma_behavior(madv_behavior);
+    // 		if (error)
+    // 			return error;
+    // ```
+    //
+    // A gap between two VMAs is not an abort: it records `-ENOMEM` and the walk
+    // continues, so `madvise(2)` over a range with a hole still applies the
+    // advice to every mapping it covers and *then* reports `-ENOMEM`.  Answering
+    // a whole-range `-ENOMEM` preflight instead loses that prefix.
+    let mut cursor = start;
+    let mut unmapped = false;
+    while cursor < end {
+        let run = {
+            let aspace = aspace_handle.lock();
+            next_madvise_run(&aspace, cursor, end)
+        };
+        let Some((run_start, run_end, gap)) = run else {
+            // `if (!vma) return -ENOMEM;` — nothing mapped at or after the
+            // cursor, so the rest of the range is a hole.
+            unmapped = true;
+            break;
+        };
+        if gap {
+            // `unmapped_error = -ENOMEM; range->start = vma->vm_start;`
+            unmapped = true;
+        }
+        apply_madvise_run(
+            &aspace_handle,
+            run_start,
+            run_end.sub_addr(run_start),
+            advice,
+            has_cap_sys_admin,
+        )?;
+        cursor = run_end;
+    }
+
+    // `return error ? error : unmapped_error;`
+    if unmapped {
+        return Err(AxError::NoMemory);
+    }
+    Ok(0)
 }
 
 pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
@@ -3378,14 +3639,16 @@ fn msync_address_space(
                         break;
                     }
                 }
-                // `vma->vm_flags & VM_LOCKED` is a per-VMA property, so any
-                // overlap with a locked VMA decides the whole request.  This
-                // kernel stores lock coverage as ranges rather than as a VMA
-                // flag, so querying the requested overlap is the closest
-                // equivalent; when `mlock` covered a whole VMA — the case
-                // Linux turns into `VM_LOCKED` — the two agree exactly.
+                // `vma->vm_flags & VM_LOCKED` is a per-VMA property, and Linux
+                // reaches it by *splitting* the VMA at the boundaries of the
+                // locked range: `mm/mlock.c:mlock_fixup()` sets `VM_LOCKED` on
+                // the piece it locked and leaves the rest alone.  This kernel
+                // stores lock coverage as ranges rather than as a VMA flag, so
+                // the walk has to split the same way — one `msync` step per
+                // maximal sub-range of uniform lock state.  Probing the whole
+                // area instead reported EBUSY before flushing the unlocked
+                // prefix that Linux flushes first.
                 let overlap_end = area.end().min(end);
-                let locked = aspace.range_is_locked(cursor, overlap_end.sub_addr(cursor));
                 // Linux only calls vfs_fsync_range for MS_SYNC VM_SHARED file
                 // mappings.  In particular, MS_ASYNC starts no I/O and a
                 // private file COW mapping must not flush its source inode
@@ -3394,28 +3657,49 @@ fn msync_address_space(
                     .backend()
                     .file_mapping()
                     .is_some_and(|lease| lease.sharing() == FileMappingSharing::Shared);
-                match msync_step(flags, false, locked, shared_file) {
-                    MsyncStep::Hole { .. } => return Err(AxError::BadState),
-                    MsyncStep::Busy => {
-                        busy = true;
-                        break;
+                let locked_segments =
+                    aspace.locked_segments_in_range(cursor, overlap_end.sub_addr(cursor));
+                let mut step = cursor;
+                while step < overlap_end {
+                    let (step_end, locked) = match locked_segments
+                        .iter()
+                        .find(|(segment_start, _)| *segment_start >= step)
+                    {
+                        Some(&(segment_start, _)) if segment_start > step => {
+                            (segment_start, false)
+                        }
+                        Some(&(segment_start, segment_len)) => {
+                            ((segment_start + segment_len).min(overlap_end), true)
+                        }
+                        None => (overlap_end, false),
+                    };
+                    match msync_step(flags, false, locked, shared_file) {
+                        MsyncStep::Hole { .. } => return Err(AxError::BadState),
+                        MsyncStep::Busy => {
+                            busy = true;
+                            break;
+                        }
+                        MsyncStep::Flush => {
+                            backends.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                            let offset = area
+                                .backend()
+                                .file_mapping()
+                                .and_then(|lease| lease.file_offset_at(step))
+                                .ok_or(AxError::BadState)?;
+                            backends.push((
+                                area.backend().clone(),
+                                offset,
+                                step_end.sub_addr(step) as u64,
+                            ));
+                        }
+                        MsyncStep::Continue => {}
                     }
-                    MsyncStep::Flush => {
-                        backends.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                        let offset = area
-                            .backend()
-                            .file_mapping()
-                            .and_then(|lease| lease.file_offset_at(cursor))
-                            .ok_or(AxError::BadState)?;
-                        backends.push((
-                            area.backend().clone(),
-                            offset,
-                            overlap_end.sub_addr(cursor) as u64,
-                        ));
-                        cursor = overlap_end;
-                    }
-                    MsyncStep::Continue => cursor = overlap_end,
+                    step = step_end;
                 }
+                if busy {
+                    break;
+                }
+                cursor = overlap_end;
             }
             if !busy && cursor < end {
                 // Trailing unmapped tail, same Linux branch as an interior gap.
@@ -3435,7 +3719,12 @@ fn msync_address_space(
     // reached yet.
     if flags & MS_SYNC != 0 {
         for (backend, offset, sync_length) in backends {
-            backend.sync_range(offset, sync_length, false)?;
+            // Linux `mm/msync.c:92-96` writes back with
+            // `vfs_fsync_range(file, fstart, fend, 1)`: the trailing `1` is
+            // `datasync`, so msync(MS_SYNC) must not demand full metadata
+            // persistence the way fsync(2) does.  `data_only` is this
+            // backend's spelling of the same distinction.
+            backend.sync_range(offset, sync_length, true)?;
         }
     }
 
@@ -3516,16 +3805,51 @@ fn check_mlock_range_limit(
 pub(super) fn check_mmap_memlock_limit(
     proc_data: &ProcessData,
     has_ipc_lock: bool,
+    map_locked: bool,
     aspace: &AddrSpace,
     start: VirtAddr,
     length: usize,
 ) -> AxResult {
-    let limit_error = AxError::from(LinuxError::EAGAIN);
+    // Linux `mm/mmap.c:417-422`:
+    //
+    // ```c
+    // 	if (flags & MAP_LOCKED)
+    // 		if (!can_do_mlock())
+    // 			return -EPERM;
+    //
+    // 	if (!mlock_future_ok(mm, vm_flags & VM_LOCKED, len))
+    // 		return -EAGAIN;
+    // ```
+    //
+    // with `mm/mlock.c:can_do_mlock()`:
+    //
+    // ```c
+    // bool can_do_mlock(void)
+    // {
+    // 	if (rlimit(RLIMIT_MEMLOCK) != 0)
+    // 		return true;
+    // 	if (capable(CAP_IPC_LOCK))
+    // 		return true;
+    // 	return false;
+    // }
+    // ```
+    //
+    // So an explicit `MAP_LOCKED` under a zero limit is `-EPERM`, while the
+    // same zero limit reached through `MCL_FUTURE` (which `mlock_future_ok()`
+    // sees only as `VM_LOCKED` in `mm->def_flags`) is `-EAGAIN`.  A *nonzero*
+    // limit that the request exceeds is `-EAGAIN` for `MAP_LOCKED` too: that
+    // answer comes from `mlock_future_ok()`, which runs for both cases.
+    let zero_limit_error = if map_locked && !has_ipc_lock {
+        AxError::OperationNotPermitted
+    } else {
+        AxError::from(LinuxError::EAGAIN)
+    };
+    let over_limit_error = AxError::from(LinuxError::EAGAIN);
     if !has_ipc_lock && proc_data.rlim.read()[RLIMIT_MEMLOCK].current == 0 {
-        return Err(limit_error);
+        return Err(zero_limit_error);
     }
-    let locked_bytes = locked_bytes_after_range(aspace, start, length, limit_error)?;
-    check_memlock_total(proc_data, has_ipc_lock, locked_bytes, limit_error)
+    let locked_bytes = locked_bytes_after_range(aspace, start, length, over_limit_error)?;
+    check_memlock_total(proc_data, has_ipc_lock, locked_bytes, over_limit_error)
 }
 
 fn check_mlockall_current_limit(

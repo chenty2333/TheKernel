@@ -34,8 +34,8 @@ pub use eventfd::{
 pub use ofd::{ExternalOffset, OfdOffsetError, OpenFileDescriptionState};
 pub use pidfd::{
     PIDFD_SELF_THREAD, PIDFD_SELF_THREAD_GROUP, PIDFD_SEND_SIGNAL_FLAGS, PIDFD_SIGNAL_PROCESS_GROUP,
-    PIDFD_SIGNAL_THREAD, PIDFD_SIGNAL_THREAD_GROUP, PidfdSignalError, PidfdSignalPlan, SignalScope,
-    SignalTarget, pidfd_signal_plan,
+    PIDFD_SIGNAL_THREAD, PIDFD_SIGNAL_THREAD_GROUP, PidfdSignalError, PidfdSignalPlan,
+    PidfdTaskTarget, SignalScope, SignalTarget, pidfd_signal_plan, pidfd_task_target,
 };
 pub use setfl::{
     O_APPEND, O_DIRECT, O_NDELAY, O_NOATIME, O_NONBLOCK, SETFL_MASK, SetFlError, SetFlPlan,

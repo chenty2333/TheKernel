@@ -225,6 +225,80 @@ fn brk_classification_orders_minimum_rlimit_shrink_and_task_size() {
 }
 
 #[test]
+fn brk_growth_respects_the_following_vma_guard_gap() {
+    // mm/mmap.c:184-191 rejects growth when the first VMA at or after the new
+    // break sits inside its own `vm_start_gap()`:
+    //   next = vma_find(&vmi, newbrk + PAGE_SIZE + stack_guard_gap);
+    //   if (next && newbrk + PAGE_SIZE > vm_start_gap(next)) goto out;
+    let brk = 0x4000_0000u64;
+    let gap = STACK_GUARD_GAP_DEFAULT;
+    assert_eq!(gap, 1 << 20);
+
+    // A GROWSDOWN VMA reserves the whole gap below its start, so growth is
+    // refused while `newbrk + PAGE_SIZE` lands inside that reservation...
+    let growdown = StartGap::GrowDown;
+    let start = brk + 0x20_0000;
+    assert!(growth_crosses_next_guard_gap(brk + 0x10_0000, start, growdown, gap));
+    // ...and allowed once it stops at the guarded start exactly.
+    assert!(!growth_crosses_next_guard_gap(
+        start - gap - PAGE as u64,
+        start,
+        growdown,
+        gap
+    ));
+    // One page higher crosses again: the comparison is `>` not `>=`.
+    assert!(growth_crosses_next_guard_gap(
+        start - gap,
+        start,
+        growdown,
+        gap
+    ));
+
+    // An ordinary VMA reserves nothing, so only a real overlap is refused.
+    assert!(!growth_crosses_next_guard_gap(
+        start - PAGE as u64,
+        start,
+        StartGap::None,
+        gap
+    ));
+    assert!(growth_crosses_next_guard_gap(
+        start - 0x800,
+        start,
+        StartGap::None,
+        gap
+    ));
+
+    // A shadow stack reserves exactly one page.
+    assert!(!growth_crosses_next_guard_gap(
+        start - 2 * PAGE as u64,
+        start,
+        StartGap::ShadowStack,
+        gap
+    ));
+    assert!(growth_crosses_next_guard_gap(
+        start - PAGE as u64,
+        start,
+        StartGap::ShadowStack,
+        gap
+    ));
+
+    // vm_start_gap() saturates at zero instead of wrapping.
+    assert_eq!(vm_start_gap(0, StartGap::GrowDown, gap), 0);
+    assert_eq!(vm_start_gap(0x1000, StartGap::GrowDown, gap), 0);
+    assert_eq!(vm_start_gap(start, StartGap::GrowDown, gap), start - gap);
+    assert_eq!(vm_start_gap(start, StartGap::ShadowStack, gap), start - PAGE as u64);
+    assert_eq!(vm_start_gap(start, StartGap::None, gap), start);
+
+    // An unrepresentable `newbrk + PAGE_SIZE` is conservative, not a wrap.
+    assert!(growth_crosses_next_guard_gap(
+        u64::MAX,
+        start,
+        StartGap::None,
+        gap
+    ));
+}
+
+#[test]
 fn mmap_reserve_plan_matches_accountable_mapping() {
     let private_anon = ReserveRequest {
         kind: MappingKind::AnonymousPrivate,
@@ -339,12 +413,21 @@ fn madvise_advice_table_refuses_unavailable_linux_advice() {
     assert_eq!(Advice::from_raw(7), None);
     assert_eq!(Advice::from_raw(104), None);
 
-    // No KSM: mm/madvise.c lists these inside #ifdef CONFIG_KSM, so the
-    // syscall answers -EINVAL instead of a nominal success.
+    // CONFIG_KSM=n: mm/madvise.c lists these inside #ifdef CONFIG_KSM, so the
+    // syscall answers -EINVAL instead of the 0 that ksm_madvise()'s stub would
+    // have returned had it ever been reached.
     assert!(!advice_valid(MADV_MERGEABLE));
     assert!(!advice_valid(MADV_UNMERGEABLE));
-    // No page migration: soft offline cannot preserve contents, so the
-    // destructive local primitive must not be reachable from this advice.
+    // CONFIG_TRANSPARENT_HUGEPAGE=n: `#ifdef CONFIG_TRANSPARENT_HUGEPAGE`
+    // lists MADV_HUGEPAGE, MADV_NOHUGEPAGE and MADV_COLLAPSE, so a kernel
+    // whose oracle never sets VMA_HUGEPAGE_BIT answers -EINVAL to all three.
+    assert!(!advice_valid(MADV_HUGEPAGE));
+    assert!(!advice_valid(MADV_NOHUGEPAGE));
+    assert!(!advice_valid(MADV_COLLAPSE));
+    // CONFIG_MEMORY_FAILURE=n: `#ifdef CONFIG_MEMORY_FAILURE` lists both, so
+    // MADV_HWPOISON may not silently discard a page and MADV_SOFT_OFFLINE may
+    // not claim the content-preserving migration this kernel lacks.
+    assert!(!advice_valid(MADV_HWPOISON));
     assert!(!advice_valid(MADV_SOFT_OFFLINE));
     for advice in [
         MADV_NORMAL,
@@ -359,16 +442,29 @@ fn madvise_advice_table_refuses_unavailable_linux_advice() {
         MADV_PAGEOUT,
         MADV_POPULATE_READ,
         MADV_POPULATE_WRITE,
-        MADV_COLLAPSE,
-        MADV_HWPOISON,
+        MADV_DONTFORK,
+        MADV_DOFORK,
+        MADV_DONTDUMP,
+        MADV_DODUMP,
+        MADV_WIPEONFORK,
+        MADV_KEEPONFORK,
+        MADV_GUARD_INSTALL,
+        MADV_GUARD_REMOVE,
     ] {
         assert!(advice_valid(advice), "advice {advice} must stay valid");
     }
     assert_eq!(Advice::Cold.raw(), MADV_COLD);
-    assert_eq!(
-        Advice::SoftOffline.availability(),
-        AdviceAvailability::Unavailable
-    );
+    for advice in [
+        Advice::Mergeable,
+        Advice::Unmergeable,
+        Advice::HugePage,
+        Advice::NoHugePage,
+        Advice::Collapse,
+        Advice::HwPoison,
+        Advice::SoftOffline,
+    ] {
+        assert_eq!(advice.availability(), AdviceAvailability::Unavailable);
+    }
 
     // mm/madvise.c:process_madvise_remote_valid()
     for advice in [MADV_COLD, MADV_PAGEOUT, MADV_WILLNEED, MADV_COLLAPSE] {
