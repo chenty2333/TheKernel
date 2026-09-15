@@ -13,8 +13,9 @@ use axtask::current;
 use linux_raw_sys::{
     general::*,
     ioctl::{
-        FIGETBSZ, FIFREEZE, FITHAW, FIONBIO, FIONREAD, NS_GET_NSTYPE, NS_GET_OWNER_UID,
-        NS_GET_PARENT, NS_GET_USERNS, TIOCGWINSZ, TIOCINQ,
+        FICLONE, FICLONERANGE, FIGETBSZ, FIFREEZE, FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD,
+        FIOQSIZE, FITHAW, FS_IOC_FIEMAP, FS_IOC_FSGETXATTR, FS_IOC_GETFLAGS, NS_GET_NSTYPE,
+        NS_GET_OWNER_UID, NS_GET_PARENT, NS_GET_USERNS, TIOCGWINSZ, TIOCINQ,
     },
 };
 use tk_linux_cred::{InodeSetattrProposal, InodeTimestampIntent, InodeTimestampValue};
@@ -75,8 +76,9 @@ const GETDENTS_NAME_PATH_MAX: usize = 4096;
 const SYSFS_NAME_PATH_MAX: usize = 4096;
 
 /// `_IOR(0x15, 0, struct fsuuid2)` from include/uapi/linux/fs.h, where
-/// `struct fsuuid2 { __u8 len; __u8 uuid[16]; }` is 17 bytes.
-const FS_IOC_GETFSUUID: u32 = 0x8011_1150;
+/// `struct fsuuid2 { __u8 len; __u8 uuid[16]; }` is 17 bytes: type `0x15`,
+/// sequence 0, size 17.
+const FS_IOC_GETFSUUID: u32 = 0x8011_1500;
 /// `_IOR(0x15, 1, struct fs_sysfs_path)` from include/uapi/linux/fs.h, where
 /// `struct fs_sysfs_path { __u8 len; char name[128]; }` is 129 bytes.
 const FS_IOC_GETFSSYSFSPATH: u32 = 0x8081_1501;
@@ -507,22 +509,99 @@ const fn fionbio_enabled(value: c_int) -> bool {
     value != 0
 }
 
+/// `FIBMAP` — `_IO(0x00, 1)`, answered by `file_ioctl()` (fs/ioctl.c:325-326)
+/// for a regular, non-anonymous inode only.
+const FIBMAP: u32 = 0x0000_0001;
+
+/// The legacy XFS space-reservation commands that `file_ioctl()`
+/// (fs/ioctl.c:328-336) forwards to `ioctl_preallocate()`:
+///
+///     case FS_IOC_RESVSP:
+///     case FS_IOC_RESVSP64:
+///             return ioctl_preallocate(filp, 0, p);
+///     case FS_IOC_UNRESVSP:
+///     case FS_IOC_UNRESVSP64:
+///             return ioctl_preallocate(filp, FALLOC_FL_PUNCH_HOLE, p);
+///     case FS_IOC_ZERO_RANGE:
+///             return ioctl_preallocate(filp, FALLOC_FL_ZERO_RANGE, p);
+///
+/// `include/linux/falloc.h:22-26` encodes all five with `struct space_resv`,
+/// and on x86_64 every one of them uses the native 48-byte layout; only the
+/// 32-bit compat entry point (fs/ioctl.c:295-317) takes `struct space_resv_32`.
+const FS_IOC_RESVSP: u32 = 0x4030_5828;
+const FS_IOC_UNRESVSP: u32 = 0x4030_5829;
+const FS_IOC_RESVSP64: u32 = 0x4030_582a;
+const FS_IOC_UNRESVSP64: u32 = 0x4030_582b;
+const FS_IOC_ZERO_RANGE: u32 = 0x4030_5839;
+
+/// `SEEK_SET`, `SEEK_CUR` and `SEEK_END` as `struct space_resv` carries them:
+/// `l_whence` is `__s16`, and `ioctl_preallocate()` resolves `l_start` against
+/// it (fs/ioctl.c:272-282).
+const SPACE_RESV_SEEK_SET: i32 = SEEK_SET as i32;
+const SPACE_RESV_SEEK_CUR: i32 = SEEK_CUR as i32;
+const SPACE_RESV_SEEK_END: i32 = SEEK_END as i32;
+
+/// Size of `struct space_resv` (include/linux/falloc.h:12-20) as the x86_64
+/// kernel reads it: two `__s16` fields, two `__s64` fields, an `__s32`, a
+/// `__u32` and four reserved `__s32` words.
+const SPACE_RESV_SIZE: usize = 48;
+
+/// The `l_whence`/`l_start`/`l_len` fields of a `struct space_resv`, which is
+/// all `ioctl_preallocate()` uses (fs/ioctl.c:261-266).
+#[derive(Clone, Copy)]
+struct SpaceResv {
+    whence: i32,
+    start: i64,
+    len: i64,
+}
+
+impl SpaceResv {
+    /// Parses the three used fields out of the 48 user bytes.
+    fn parse(raw: &[u8; SPACE_RESV_SIZE]) -> Self {
+        let mut start = [0u8; 8];
+        start.copy_from_slice(&raw[8..16]);
+        let mut len = [0u8; 8];
+        len.copy_from_slice(&raw[16..24]);
+        Self {
+            whence: i16::from_ne_bytes([raw[2], raw[3]]) as i32,
+            start: i64::from_ne_bytes(start),
+            len: i64::from_ne_bytes(len),
+        }
+    }
+}
+
+/// Returns the `vfs_fallocate()` mode that `ioctl_preallocate()` derives from
+/// a legacy space-reservation command (fs/ioctl.c:328-336), or `None` when the
+/// command is not one of them.
+///
+/// `ioctl_preallocate()` always adds `FALLOC_FL_KEEP_SIZE` before calling
+/// `vfs_fallocate()`, which is why these commands never change `i_size`.
+fn preallocate_mode(cmd: u32) -> Option<u32> {
+    match cmd {
+        FS_IOC_RESVSP | FS_IOC_RESVSP64 => Some(0),
+        FS_IOC_UNRESVSP | FS_IOC_UNRESVSP64 => Some(FALLOC_FL_PUNCH_HOLE),
+        FS_IOC_ZERO_RANGE => Some(FALLOC_FL_ZERO_RANGE),
+        _ => None,
+    }
+}
+
+/// Returns the VFS inode type of the object behind a descriptor.
+///
+/// Linux's generic ioctl layer classifies the *inode* (`file_inode(filp)`),
+/// not the `file_operations` table, which is why commands such as `FIOQSIZE`
+/// or `FIBMAP` answer differently for a directory and for a pipe even though
+/// both enter `do_vfs_ioctl()`.  Objects with no VFS inode are the
+/// pipefs/sockfs/anon_inodefs/pidfs pseudo files, whose `inode->i_op` carries
+/// no `fiemap` and whose superblock has no block size.
+fn ioctl_inode_type(f: &crate::file::FileHandle<dyn FileLike>) -> Option<NodeType> {
+    f.vfs_location().map(Location::node_type)
+}
+
 pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
     debug!("sys_ioctl <= fd: {fd}, cmd: {cmd}, arg: {arg}");
     let f = context.get_file_like(fd)?;
-    // O_PATH exposes pathname metadata, not the underlying object's ioctl
-    // surface. Reject before FIONBIO reads its userspace argument.
-    f.check_io_access()?;
-    if cmd == FIONBIO {
-        // Linux FIONBIO consumes an `int *`; every nonzero value enables the
-        // flag. Reading the complete word also preserves cross-page EFAULT.
-        let val: c_int = context
-            .user_memory()
-            .read_value(arg as *const c_int)
-            .map_err(map_usercopy_error)?;
-        f.set_nonblocking_status(fionbio_enabled(val))?;
-        return Ok(0);
-    }
+    // `sys_ioctl()` reaches the LSM hook `security_file_ioctl()` before
+    // `do_vfs_ioctl()` and therefore before every generic command below.
     if let Some(file) = f.downcast_ref::<File>()
         && matches!(
             file.inner().location().node_type(),
@@ -536,15 +615,95 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
         );
         return Err(AxError::PermissionDenied);
     }
-    if let Some(file) = f.downcast_ref::<File>()
-        && let Some(result) = proc_namespace_ioctl(context, file.inner().location(), cmd, arg)
-    {
-        return result;
+    // ------------------------------------------------------------------
+    // Commands `do_vfs_ioctl()` answers without consulting the provider
+    // (fs/ioctl.c:492-581).
+    //
+    // `sys_ioctl()` runs `do_vfs_ioctl()` before it ever calls
+    // `->unlocked_ioctl`, and `do_dentry_open()` installs an empty
+    // `file_operations` table for every `O_PATH` description
+    // (fs/open.c:888-901).  These commands are therefore available on an
+    // `O_PATH` descriptor: only a command that falls through to the provider
+    // is refused by that empty table.  They are reproduced here at the same
+    // point of the generic layer, ahead of `check_io_access()`.
+    // ------------------------------------------------------------------
+    let inode_type = ioctl_inode_type(&f);
+    if cmd == FIOCLEX || cmd == FIONCLEX {
+        // fs/ioctl.c:
+        //     case FIOCLEX:
+        //             set_close_on_exec(fd, 1);
+        //             return 0;
+        //
+        //     case FIONCLEX:
+        //             set_close_on_exec(fd, 0);
+        //             return 0;
+        context.files().set_cloexec(fd, cmd == FIOCLEX)?;
+        return Ok(0);
     }
-    // Linux `do_vfs_ioctl()` decides these commands itself, before it ever
-    // reaches `->unlocked_ioctl`, so they are available on every inode rather
-    // than only on the regular-file provider.  They are reproduced at the same
-    // point of the generic layer here.
+    if cmd == FIONBIO {
+        // Linux FIONBIO consumes an `int *`; every nonzero value enables the
+        // flag. Reading the complete word also preserves cross-page EFAULT.
+        let val: c_int = context
+            .user_memory()
+            .read_value(arg as *const c_int)
+            .map_err(map_usercopy_error)?;
+        f.set_nonblocking_status(fionbio_enabled(val))?;
+        return Ok(0);
+    }
+    if cmd == FIOASYNC {
+        // fs/ioctl.c `ioctl_fioasync()`:
+        //     error = get_user(on, argp);
+        //     flag = on ? FASYNC : 0;
+        //     if ((flag ^ filp->f_flags) & FASYNC) {
+        //             if (filp->f_op->fasync)
+        //                     error = filp->f_op->fasync(fd, filp, on);
+        //             else
+        //                     error = -ENOTTY;
+        //     }
+        //     return error < 0 ? error : 0;
+        let val: c_int = context
+            .user_memory()
+            .read_value(arg as *const c_int)
+            .map_err(map_usercopy_error)?;
+        super::fd_ops::ioctl_fioasync(context, fd, fionbio_enabled(val))?;
+        return Ok(0);
+    }
+    if cmd == FIOQSIZE {
+        // fs/ioctl.c:
+        //     case FIOQSIZE:                           /* fs/ioctl.c:513-522 */
+        //             if (S_ISDIR(inode->i_mode) ||
+        //                 (S_ISREG(inode->i_mode) && !IS_ANON_FILE(inode)) ||
+        //                 S_ISLNK(inode->i_mode)) {
+        //                     loff_t res = inode_get_bytes(inode);
+        //                     return copy_to_user(argp, &res, sizeof(res)) ?
+        //                                 -EFAULT : 0;
+        //             }
+        //
+        //             return -ENOTTY;
+        // The anonymous-regular exclusion is not reproduced: this kernel has no
+        // `IS_ANON_FILE` predicate for the descriptors that reach here.
+        // `inode_get_bytes()` is `(i_blocks << 9) + i_bytes` (fs/stat.c), and
+        // the remaining byte count `i_bytes` is part of the inode size that
+        // `i_blocks` already covers for every layout this kernel implements.
+        match inode_type {
+            Some(NodeType::Directory | NodeType::RegularFile | NodeType::Symlink) => {
+                let blocks = match f.vfs_location() {
+                    Some(location) => location.metadata()?.blocks,
+                    None => 0,
+                };
+                let bytes = blocks
+                    .checked_mul(512)
+                    .and_then(|bytes| i64::try_from(bytes).ok())
+                    .ok_or(AxError::InvalidInput)?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &bytes.to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
+                return Ok(0);
+            }
+            _ => return Err(AxError::NotATty),
+        }
+    }
     if cmd == FIGETBSZ {
         // fs/ioctl.c:
         //     case FIGETBSZ:
@@ -598,12 +757,127 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
         });
     }
     if cmd == FS_IOC_GETFSUUID || cmd == FS_IOC_GETFSSYSFSPATH {
-        // fs/ioctl.c `ioctl_getfsuuid()` returns -ENOTTY when
-        // `sb->s_uuid_len == 0`, and `ioctl_get_fs_sysfs_path()` returns
-        // -ENOTTY when `strlen(sb->s_sysfs_name) == 0`.  This kernel populates
-        // neither attribute, so both commands are unknown here exactly as they
-        // are for a Linux superblock that carries neither.
+        // fs/ioctl.c:455-466 `ioctl_getfsuuid()` returns
+        //     if (!sb->s_uuid_len)
+        //             return -ENOTTY;
+        // and fs/ioctl.c:468-480 `ioctl_get_fs_sysfs_path()` returns
+        //     if (!strlen(sb->s_sysfs_name))
+        //             return -ENOTTY;
+        // This kernel maintains neither superblock attribute, so both commands
+        // are unknown here exactly as they are for a Linux superblock that
+        // carries neither.  A provider-visible `s_uuid`/`s_sysfs_name` pair is
+        // the missing primitive for the ext4 case.
         return Err(AxError::NotATty);
+    }
+    if cmd == FS_IOC_FIEMAP
+        && matches!(
+            inode_type,
+            None | Some(
+                NodeType::Fifo
+                    | NodeType::Socket
+                    | NodeType::CharacterDevice
+                    | NodeType::BlockDevice
+            )
+        )
+    {
+        // fs/ioctl.c `ioctl_fiemap()` starts with (fs/ioctl.c:206-207)
+        //     if (!inode->i_op->fiemap)
+        //             return -EOPNOTSUPP;
+        // A pipe, socket or anonymous inode lives on a pseudo-superblock whose
+        // `i_op` table carries no `fiemap` at all, and the special inodes of a
+        // disk filesystem do not either (`ext4_special_inode_operations`,
+        // fs/ext4/namei.c:4243-4249), so those commands are unsupported rather
+        // than unknown.  Directories are deliberately left to the provider:
+        // ext4 does register `->fiemap` for them (fs/ext4/namei.c:4238), which
+        // this kernel's directory provider cannot serve yet.
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    if matches!(cmd, FICLONE | FICLONERANGE) {
+        // `do_vfs_ioctl()` reaches `ioctl_file_clone()` (fs/ioctl.c:230-248)
+        // for every descriptor, and `vfs_clone_file_range()` then classifies
+        // the two inodes in `generic_file_rw_checks()`
+        // (fs/read_write.c:1785-1801):
+        //     if (S_ISDIR(inode_in->i_mode) || S_ISDIR(inode_out->i_mode))
+        //             return -EISDIR;
+        //     if (!S_ISREG(inode_in->i_mode) || !S_ISREG(inode_out->i_mode))
+        //             return -EINVAL;
+        // The source side of that test needs the descriptor named by `arg` and
+        // stays with the provider; the destination side is decided here so a
+        // directory or a FIFO destination is no longer reported as an unknown
+        // command.
+        match inode_type {
+            Some(NodeType::Directory) => return Err(AxError::IsADirectory),
+            Some(NodeType::RegularFile) | None => {}
+            Some(_) => return Err(AxError::InvalidInput),
+        }
+    }
+    if inode_type == Some(NodeType::RegularFile) {
+        // `do_vfs_ioctl()`'s default arm only reaches `file_ioctl()` for
+        // `S_ISREG(inode->i_mode) && !IS_ANON_FILE(inode)`.
+        if cmd == FIBMAP {
+            // fs/ioctl.c `ioctl_fibmap()` opens with (fs/ioctl.c:58-63)
+            //     if (!capable(CAP_SYS_RAWIO))
+            //             return -EPERM;
+            //     error = get_user(ur_block, p);
+            if !current().as_thread().has_effective_capability(CAP_SYS_RAWIO) {
+                return Err(AxError::OperationNotPermitted);
+            }
+        } else if let Some(mode) = preallocate_mode(cmd) {
+            // fs/ioctl.c `ioctl_preallocate()` (fs/ioctl.c:268-289) copies a
+            // `struct space_resv`, resolves its offset against
+            // `SEEK_SET`/`SEEK_CUR`/`SEEK_END` and forwards to
+            //     return vfs_fallocate(filp, mode | FALLOC_FL_KEEP_SIZE, sr.l_start,
+            //                     sr.l_len);
+            let raw: [u8; SPACE_RESV_SIZE] = context
+                .user_memory()
+                .read_value(arg as *const [u8; SPACE_RESV_SIZE])
+                .map_err(map_usercopy_error)?;
+            let sr = SpaceResv::parse(&raw);
+            let metadata = f
+                .vfs_location()
+                .ok_or(AxError::InvalidInput)?
+                .metadata()?;
+            let base = match sr.whence {
+                SPACE_RESV_SEEK_SET => 0,
+                SPACE_RESV_SEEK_CUR => {
+                    super::io::seek_file_like(&f, 0, SPACE_RESV_SEEK_CUR)? as i64
+                }
+                SPACE_RESV_SEEK_END => {
+                    i64::try_from(metadata.size).map_err(|_| AxError::InvalidInput)?
+                }
+                _ => return Err(AxError::InvalidInput),
+            };
+            let offset = base.checked_add(sr.start).ok_or(AxError::InvalidInput)?;
+            let security = VfsSecurityContext::new(context.caller_cred().clone());
+            super::io::fallocate_file_like(
+                &f,
+                &security,
+                mode | FALLOC_FL_KEEP_SIZE,
+                offset,
+                sr.len,
+            )?;
+            return Ok(0);
+        }
+    }
+    // A command that `do_vfs_ioctl()` answers itself has already returned.  The
+    // remaining cases of its default arm enter the provider or an inode
+    // operation through the generic layer, so the empty `O_PATH` table does not
+    // stop all of them: `ioctl_fiemap()` and `ioctl_getflags()` never test
+    // `f_mode`, while `ioctl_file_clone()` and `ioctl_preallocate()` fail with
+    // their own `-EBADF` (`generic_file_rw_checks()`, `vfs_fallocate()`), which
+    // `check_io_access()` reports here as well.  Every other command is a
+    // provider command and is refused on an `O_PATH` descriptor exactly like
+    // Linux's empty `file_operations`.
+    let reaches_object = matches!(cmd, FS_IOC_FIEMAP | FS_IOC_GETFLAGS | FS_IOC_FSGETXATTR)
+        || (inode_type == Some(NodeType::RegularFile)
+            && (cmd == FIBMAP || preallocate_mode(cmd).is_some()));
+    if !reaches_object {
+        f.check_io_access()?;
+    }
+    if let Some(file) = f.downcast_ref::<File>()
+        && let Some(result) = proc_namespace_ioctl(context, file.inner().location(), cmd, arg)
+    {
+        return result;
     }
     let result = f.ioctl(context, cmd, arg).inspect_err(|err| {
         if *err == AxError::NotATty {

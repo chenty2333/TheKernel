@@ -35,10 +35,37 @@
 #define O_NOTIFICATION_PIPE O_EXCL /* include/uapi/linux/pipe_fs_i.h */
 
 #define FIGETBSZ 0x00000002UL   /* _IO(0x00, 2) */
+#define FIBMAP 0x00000001UL     /* _IO(0x00, 1) */
+/* <sys/ioctl.h> already defines the four 'T' commands; the guest build is
+ * -Werror, so only add what the C library leaves out. */
+#ifndef FIOCLEX
+#define FIOCLEX 0x5451UL        /* _IO('T', 81) */
+#endif
+#ifndef FIONCLEX
+#define FIONCLEX 0x5450UL       /* _IO('T', 80) */
+#endif
+#ifndef FIONBIO
+#define FIONBIO 0x5421UL        /* _IOW('T', 33, int) */
+#endif
+#ifndef FIOASYNC
+#define FIOASYNC 0x5452UL       /* _IOW('T', 82, int) */
+#endif
+#ifndef FIOQSIZE
+#define FIOQSIZE 0x5460UL       /* include/uapi/asm-generic/ioctls.h */
+#endif
+#ifndef FICLONE
+#define FICLONE 0x40049409UL    /* _IOW(0x94, 9, int) */
+#endif
+#ifndef FS_IOC_FIEMAP
+#define FS_IOC_FIEMAP 0xC020660BUL /* _IOWR('f', 11, struct fiemap) */
+#endif
+#ifndef FS_IOC_RESVSP
+#define FS_IOC_RESVSP 0x40305828UL /* _IOW('X', 40, struct space_resv) */
+#endif
 #define FIFREEZE 0xC0045877UL   /* _IOWR('X', 119, int) */
 #define FITHAW 0xC0045878UL     /* _IOWR('X', 120, int) */
-#define FS_IOC_GETFSUUID 0x80111150UL
-#define FS_IOC_GETFSSYSFSPATH 0x80811501UL
+#define FS_IOC_GETFSUUID 0x80111500UL /* _IOR(0x15, 0, struct fsuuid2) */
+#define FS_IOC_GETFSSYSFSPATH 0x80811501UL /* _IOR(0x15, 1, struct fs_sysfs_path) */
 
 #define MS_RDONLY 1UL
 #define MS_SYNCHRONOUS 16UL
@@ -350,7 +377,7 @@ int main(void) {
     done();
 
     /* ------------------------------------------------------------------ *
-     * ioctl(2) -- fs/ioctl.c do_vfs_ioctl() before ->unlocked_ioctl:
+     * ioctl(2) -- fs/ioctl.c:492-581 do_vfs_ioctl() before ->unlocked_ioctl:
      *     case FIGETBSZ:  get_user(b, &inode->i_sb->s_blocksize)
      *     case FIFREEZE:  ioctl_fsfreeze()  EPERM (no CAP_SYS_ADMIN in
      *                     sb->s_user_ns) then EOPNOTSUPP when the superblock
@@ -405,6 +432,99 @@ int main(void) {
         check(waitpid(child, &status, 0) == child, "waitpid");
         check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "privilege");
         mark("FREEZE_AND_THAW_EPERM_UNPRIVILEGED");
+        /* `do_vfs_ioctl()` runs its own commands before `->unlocked_ioctl`
+         * (fs/ioctl.c:492-581) and never tests `f_mode`, so an O_PATH
+         * descriptor -- which installs `empty_fops` (fs/open.c:888-901) --
+         * still reaches FIOCLEX/FIONCLEX (:499-505), FIONBIO (:507-508),
+         * FIOQSIZE (:513-522) and FIGETBSZ (:533-538). */
+        int pathfd = openat(dirfd, "file", O_PATH | O_CLOEXEC);
+        check(pathfd >= 0, "opath-open");
+        block_size = 0;
+        check(ioctl(pathfd, FIGETBSZ, &block_size) == 0 && block_size >= 512,
+              "opath-figetbsz");
+        long long qsize = -1;
+        check(ioctl(pathfd, FIOQSIZE, &qsize) == 0 && qsize >= 0 && qsize % 512 == 0,
+              "opath-fioqsize");
+        check((fcntl(pathfd, F_GETFD) & FD_CLOEXEC) != 0, "opath-cloexec-baseline");
+        check(ioctl(pathfd, FIONCLEX) == 0 && (fcntl(pathfd, F_GETFD) & FD_CLOEXEC) == 0,
+              "opath-fionclex");
+        check(ioctl(pathfd, FIOCLEX) == 0 && (fcntl(pathfd, F_GETFD) & FD_CLOEXEC) != 0,
+              "opath-fioclex");
+        int on = 1;
+        check(ioctl(pathfd, FIONBIO, &on) == 0, "opath-fionbio");
+        check((fcntl(pathfd, F_GETFL) & O_NONBLOCK) != 0, "opath-fionbio-visible");
+        on = 0;
+        check(ioctl(pathfd, FIONBIO, &on) == 0, "opath-fionbio-clear");
+        /* FIOQSIZE is defined only for directories, symlinks and non-anonymous
+         * regular files, while FIOASYNC consults `->fasync` only when the
+         * request changes the bit: pipefops has one, a regular file does not. */
+        errno = 0;
+        check(ioctl(pp[0], FIOQSIZE, &qsize) == -1 && errno == ENOTTY, "pipe-fioqsize");
+        on = 1;
+        check(ioctl(pp[0], FIOASYNC, &on) == 0, "pipe-fioasync");
+        on = 0;
+        check(ioctl(pp[0], FIOASYNC, &on) == 0, "pipe-fioasync-clear");
+        on = 1;
+        errno = 0;
+        check(ioctl(file, FIOASYNC, &on) == -1 && errno == ENOTTY, "file-fioasync");
+        check(close(pathfd) == 0, "opath-close");
+        /* FICLONE classifies both inodes before the provider sees the command
+         * (`vfs_clone_file_range` -> `generic_file_rw_checks`, fs/remap_range.c):
+         * a directory on either side is EISDIR, any other non-regular file is
+         * EINVAL. */
+        errno = 0;
+        check(ioctl(dirfd, FICLONE, file) == -1 && errno == EISDIR,
+              "clone-into-directory");
+        errno = 0;
+        check(ioctl(fifo, FICLONE, file) == -1 && errno == EINVAL, "clone-into-fifo");
+        /* FIEMAP asks the inode for `->fiemap` first, so a provider without one
+         * answers EOPNOTSUPP before any user memory is touched. */
+        struct fsabi_fiemap fiemap;
+        memset(&fiemap, 0, sizeof(fiemap));
+        fiemap.fm_length = 4096;
+        fiemap.fm_extent_count = 1;
+        errno = 0;
+        check(ioctl(pp[0], FS_IOC_FIEMAP, &fiemap) == -1 && errno == EOPNOTSUPP,
+              "pipe-fiemap");
+        errno = 0;
+        check(ioctl(fifo, FS_IOC_FIEMAP, &fiemap) == -1 && errno == EOPNOTSUPP,
+              "fifo-fiemap");
+        errno = 0;
+        check(ioctl(sock[0], FS_IOC_FIEMAP, &fiemap) == -1 && errno == EOPNOTSUPP,
+              "socket-fiemap");
+        /* The legacy pre-allocation ioctls are `FALLOC_FL_KEEP_SIZE` on an
+         * inode-resolved range: the reservation is visible in st_blocks while
+         * the file size is unchanged. */
+        struct fsabi_space_resv resv;
+        struct stat before, after;
+        memset(&resv, 0, sizeof(resv));
+        check(fstat(file, &before) == 0, "resvsp-stat-before");
+        resv.l_whence = SEEK_SET;
+        resv.l_start = 8192;
+        resv.l_len = 8192;
+        errno = 0;
+        check(ioctl(file, FS_IOC_RESVSP, &resv) == 0, "resvsp");
+        check(fstat(file, &after) == 0, "resvsp-stat-after");
+        check(after.st_blocks > before.st_blocks, "resvsp-blocks");
+        check(after.st_size == before.st_size, "resvsp-keeps-size");
+        /* FIBMAP requires CAP_SYS_RAWIO before it even reads the block number,
+         * so an unprivileged caller sees EPERM and not EFAULT. */
+        child = fork();
+        check(child >= 0, "fibmap-fork");
+        if (child == 0) {
+            drops_to();
+            int block = 0;
+            errno = 0;
+            long a = ioctl(file, FIBMAP, &block);
+            int permitted = (a == -1 && errno == EPERM);
+            errno = 0;
+            long b = ioctl(file, FIBMAP, BADPTR);
+            int before_copy = (b == -1 && errno == EPERM);
+            _exit(permitted && before_copy ? 0 : 1);
+        }
+        status = 0;
+        check(waitpid(child, &status, 0) == child, "fibmap-waitpid");
+        check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "fibmap-privilege");
         close(pp[0]);
         close(pp[1]);
     }

@@ -37,7 +37,8 @@ use super::admit_resize;
 use crate::{
     file::{
         AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, File, FileDescription,
-        FileLike, Pipe, ReservedFd, close_file_like, current_fd_table, dnotify, executable,
+        FileLike, IoctlContext, Pipe, ReservedFd, close_file_like, current_fd_table, dnotify,
+        executable,
         flock::{self, RecordLockOwner},
         get_file_description, get_file_like, get_typed_file, inode_flags,
         inotify::{
@@ -252,6 +253,58 @@ fn sync_async_io_to_file_flags(description: &FileDescription, fd: c_int, flags: 
     } else if let Some(pipe) = description.inner.downcast_ref::<NamedPipe>() {
         pipe.set_async_io(enabled, state, fd);
     }
+}
+
+/// Applies `FIOASYNC` through the open file description's `FASYNC` status bit.
+///
+/// fs/ioctl.c `ioctl_fioasync()`:
+///     error = get_user(on, argp);
+///     flag = on ? FASYNC : 0;
+///     if ((flag ^ filp->f_flags) & FASYNC) {
+///             if (filp->f_op->fasync)
+///                     error = filp->f_op->fasync(fd, filp, on);
+///             else
+///                     error = -ENOTTY;
+///     }
+///     return error < 0 ? error : 0;
+///
+/// The provider test is deliberately not "the status bit is writable": only the
+/// objects whose signal delivery this kernel implements may publish `FASYNC`,
+/// because a registration no provider honours would silently change the
+/// descriptor's asynchronous-I/O behaviour.  Regular files, directories and the
+/// remaining objects therefore answer `-ENOTTY`, exactly as Linux's ext4 and
+/// `empty_fops` providers do.
+pub(crate) fn ioctl_fioasync(context: &IoctlContext, fd: c_int, on: bool) -> AxResult<()> {
+    let description = context.files().get_description(fd)?;
+    let current = description.io_status_snapshot();
+    if (current.raw() & FASYNC != 0) == on {
+        // Linux consults `->fasync` only when the request changes the bit.
+        return Ok(());
+    }
+    if description.is_path_only() {
+        // `O_PATH` installs `empty_fops` (fs/open.c:886-892), which carries no
+        // `->fasync`.
+        return Err(AxError::NotATty);
+    }
+    if description.inner.downcast_ref::<Pipe>().is_none()
+        && description.inner.downcast_ref::<NamedPipe>().is_none()
+    {
+        return Err(AxError::NotATty);
+    }
+    description.transition_status_flags(
+        |old| {
+            if on {
+                old.raw() | FASYNC
+            } else {
+                old.raw() & !FASYNC
+            }
+        },
+        |_old, new| {
+            sync_async_io_to_file_flags(&description, fd, new.raw());
+            Ok(())
+        },
+    )?;
+    Ok(())
 }
 
 fn trailing_slash_requires_directory(path: &FsPath) -> bool {
