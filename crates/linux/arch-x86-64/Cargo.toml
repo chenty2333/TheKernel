@@ -1,6 +1,6 @@
 [package]
 repository.workspace = true
-publish.workspace = true
+publish = ["crates-io"]
 name = "tk-linux-arch-x86-64"
 version = "0.1.0"
 edition = "2024"

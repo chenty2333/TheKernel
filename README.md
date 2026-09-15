@@ -229,8 +229,9 @@ The `tk-*` series starts at `0.1.0`, independently of upstream version numbers;
 future component versions follow their own API changes. The top-level product
 keeps its separate version. Internal packages inherit `publish = false`: a
 crate boundary does not imply a separately released public product.
-`tk-axcbpf` is the first approved public component and permits only crates.io;
-other components remain internal until separately validated and approved.
+Release-ready components explicitly permit only crates.io after package and
+independent-consumer validation. Other packages retain the private default;
+publication follows dependency order rather than the workspace directory order.
 Repository metadata points here; upstream licenses and attribution remain intact.
 
 Keep integration in `kernel/` and adapters, rather than making lower layers

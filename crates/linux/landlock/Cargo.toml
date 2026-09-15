@@ -4,7 +4,7 @@ name = "tk-linux-landlock"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
-publish.workspace = true
+publish = ["crates-io"]
 description = "Bounded immutable filesystem access-policy planning for TheKernel"
 license = "Apache-2.0"
 

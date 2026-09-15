@@ -9,7 +9,7 @@
 # will likely look very different (and much more reasonable).
 
 [package]
-publish.workspace = true
+publish = ["crates-io"]
 rust-version.workspace = true
 edition = "2024"
 name = "tk-lwext4-rust"

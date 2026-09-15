@@ -16,9 +16,6 @@ ALLOWED = {
     "integration": {"integration", "platform", "linux_abi", "mechanism"},
 }
 
-# Only independently validated, explicitly approved components may be uploaded.
-PUBLISHED_COMPONENTS = {"tk-axcbpf"}
-
 
 def violations(data: dict, root: Path) -> list[str]:
     packages = data["packages"]
@@ -66,10 +63,13 @@ def workspace_policy_violations(data: dict, root: Path) -> list[str]:
         if name != "thekernel" and not name.startswith("tk-"):
             errors.append(f"{name}: component package must use the tk- prefix")
         for field, expected in (("rust_version", policy["rust-version"]),
-                                ("repository", policy["repository"]),
-                                ("publish", ["crates-io"] if name in PUBLISHED_COMPONENTS else [])):
+                                ("repository", policy["repository"])):
             if package.get(field) != expected:
                 errors.append(f"{name}: {field} differs from workspace policy")
+        # The default stays private. Release-ready packages explicitly opt in
+        # to crates.io, never to an implicit or alternate registry.
+        if package.get("publish") not in ([], ["crates-io"]):
+            errors.append(f"{name}: publish differs from workspace policy")
         directory = Path(package["manifest_path"]).resolve().parent
         while directory != root and root in directory.parents:
             for filename in ("rust-toolchain", "rust-toolchain.toml"):
