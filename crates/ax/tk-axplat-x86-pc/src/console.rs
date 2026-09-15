@@ -74,9 +74,29 @@ pub fn putchar(c: u8) {
 
 /// TTY output has already passed through termios. Do not expand LF or erase
 /// bytes again (SerialPort::send would expand both LF and backspace).
+///
+/// One call is one uninterrupted transmission: the port lock is held across
+/// the whole slice.  Taking it per byte would let a concurrent writer -- the
+/// line discipline echoing typed input, a second terminal endpoint, or another
+/// process' `write` -- interleave its bytes inside this one, which no reader
+/// of the serial line can undo.
 pub fn write_tty_bytes(bytes: &[u8]) {
     if !available() { return; }
-    for &byte in bytes { COM1.lock().send_raw(byte); }
+    write_locked(&COM1, bytes, |port, byte| port.send_raw(byte));
+}
+
+/// Sends one slice while holding `port`'s lock exactly once.
+///
+/// The lock *scope* is the invariant this function exists to state, and the
+/// reason it is a function rather than a loop inside [`write_tty_bytes`]: a
+/// host has no I/O ports to write to, so the only way to test that a slice
+/// cannot be cut in half by another writer is to hand the same scope a port
+/// that records what it was asked to send.
+fn write_locked<P>(port: &SpinNoIrq<P>, bytes: &[u8], mut send: impl FnMut(&mut P, u8)) {
+    let mut port = port.lock();
+    for &byte in bytes {
+        send(&mut port, byte);
+    }
 }
 
 /// Reads a byte from the console.
@@ -434,6 +454,166 @@ mod diagnostic_tests {
         assert!(!available());
         assert_eq!(getchar(), None);
         putchar(b'x');
+    }
+
+    /// The two flags the raced writers use to find each other.
+    #[derive(Clone)]
+    struct Rendezvous {
+        entered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Rendezvous {
+        fn new() -> Self {
+            Self {
+                entered: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                joined: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        /// Announces that this writer is inside its slice, then waits a
+        /// bounded time for the other writer to join it there.  Whether the
+        /// other writer can get in is decided by the lock scope the slice
+        /// holds *at this moment* -- which is what these tests observe.
+        fn announce(&self) {
+            use std::sync::atomic::Ordering;
+
+            self.entered.store(true, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + JOIN_BUDGET;
+            while !self.joined.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+        }
+
+        fn join(&self) {
+            self.joined
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// How long the announcing writer waits for the joining one.  Long enough
+    /// that a slice holding the lock keeps the other writer out for the whole
+    /// wait, short enough not to slow the suite down.
+    const JOIN_BUDGET: core::time::Duration = core::time::Duration::from_millis(50);
+
+    /// Bytes each raced writer sends.  Long enough that a slice which takes
+    /// the lock per byte cannot win every lock it needs back before the other
+    /// writer wins one, so the detector does not depend on one lucky schedule.
+    const SLICE: usize = 4096;
+
+    /// A port that records what it was asked to send.
+    struct RacingPort {
+        log: std::sync::Mutex<std::vec::Vec<u8>>,
+    }
+
+    impl RacingPort {
+        fn new() -> Self {
+            Self {
+                log: std::sync::Mutex::new(std::vec::Vec::new()),
+            }
+        }
+
+        fn send(&mut self, byte: u8) {
+            self.log.lock().unwrap().push(byte);
+        }
+    }
+
+    /// Runs one two-writer race through `send_slice` and returns the bytes the
+    /// port recorded, in the order it recorded them.
+    ///
+    /// The second writer starts only once the first one is inside its slice,
+    /// so what is raced is the two slices and not the two thread spawns.  Both
+    /// writers spin on the port lock while they are kept out, so a slice that
+    /// releases the lock between bytes hands it to the other writer.
+    fn race(
+        send_slice: impl Fn(&SpinNoIrq<RacingPort>, &Rendezvous, &[u8], bool) + Sync,
+    ) -> std::vec::Vec<u8> {
+        let rendezvous = Rendezvous::new();
+        let port = SpinNoIrq::new(RacingPort::new());
+        let second = [b'b'; SLICE];
+        std::thread::scope(|scope| {
+            let port = &port;
+            let sender = &send_slice;
+            let entering = rendezvous.clone();
+            let first = [b'a'; SLICE];
+            let first_writer = scope.spawn(move || sender(port, &entering, &first, true));
+            while !rendezvous.entered.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            sender(port, &rendezvous, &second, false);
+            first_writer.join().unwrap();
+        });
+        port.lock().log.lock().unwrap().clone()
+    }
+
+    /// Whether the recorded bytes are one writer's whole slice followed by the
+    /// other's, which is what a reader of the serial line needs to see.
+    fn is_one_slice_then_the_other(recorded: &[u8]) -> bool {
+        recorded.len() == 2 * SLICE
+            && (recorded[..SLICE].iter().all(|&byte| byte == b'a')
+                || recorded[..SLICE].iter().all(|&byte| byte == b'b'))
+    }
+
+    /// The console's port lock is only a lock with `kspin/smp`: without that
+    /// feature `kspin` compiles to no lock at all, so there is nothing for
+    /// these two tests to observe and they would be reporting on the test
+    /// harness instead of on the console.
+    #[cfg(feature = "smp")]
+    #[test]
+    fn one_console_write_is_never_cut_in_half_by_another_writer() {
+        // The announcing writer waits from inside the slice, so a slice whose
+        // lock covers the whole slice keeps the other writer out for the whole
+        // wait and cannot be cut in half.
+        let recorded = race(|port, rendezvous, bytes, announcing| {
+            let mut announced = false;
+            write_locked(port, bytes, |port, byte| {
+                if announcing {
+                    if !announced {
+                        announced = true;
+                        rendezvous.announce();
+                    }
+                    // Slow the announcing writer down between bytes.  Holding
+                    // the lock throughout costs nothing here; a slice that
+                    // released it per byte would hand it to the other writer,
+                    // which is spinning on it.
+                    std::thread::yield_now();
+                }
+                port.send(byte);
+            });
+        });
+        assert!(
+            is_one_slice_then_the_other(&recorded),
+            "concurrent console writes interleaved: {recorded:02x?}"
+        );
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn the_race_detects_a_lock_that_does_not_cover_the_slice() {
+        // The shape this console had before the lock moved outside the loop:
+        // one lock per byte, released in between.  The announcing writer waits
+        // in one of those gaps, which is where the other writer gets in.
+        // Proving the harness catches that is what makes the test above mean
+        // something -- a harness that could not see interleaving would pass
+        // either way.
+        let recorded = race(|port, rendezvous, bytes, announcing| {
+            for (index, &byte) in bytes.iter().enumerate() {
+                port.lock().send(byte);
+                if index != 0 {
+                    continue;
+                }
+                if announcing {
+                    rendezvous.announce();
+                } else {
+                    rendezvous.join();
+                }
+            }
+            rendezvous.join();
+        });
+        assert!(
+            !is_one_slice_then_the_other(&recorded),
+            "a lock released between bytes did not interleave: {recorded:02x?}"
+        );
     }
 }
 

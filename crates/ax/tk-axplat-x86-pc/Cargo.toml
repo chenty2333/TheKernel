@@ -135,3 +135,6 @@ layer = "platform"
 # explicitly because the platform layer is otherwise outside the host suite.
 [package.metadata.thekernel.host-test]
 selected = true
+# `SpinNoIrq` compiles to no lock at all without `kspin/smp`, and the console
+# tests race two writers through one.
+features = ["smp"]
