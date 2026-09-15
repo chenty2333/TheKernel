@@ -509,8 +509,9 @@ const LANDLOCK_TSYNC_DISCOVERY_ATTEMPTS: usize = 8;
 /// and only after the last one has prepared does the group commit, so a
 /// failure can never leave the group half-restricted.  This implementation
 /// reaches the same property by completing every fallible step -- thread
-/// discovery, target pinning, and one domain clone per target -- before the
-/// first thread slot is written; the commit itself is infallible.
+/// discovery, target pinning, one domain clone per target, and one credential
+/// transition per target that still needs the caller's `no_new_privs` bit --
+/// before the first thread slot is written; the commit itself is infallible.
 ///
 /// Returns whether the group-leader identity slot must follow the new domain.
 fn restrict_sibling_threads(
@@ -570,14 +571,47 @@ fn restrict_sibling_threads(
             prepared.push(domain.try_clone()?);
         }
         let caller_domain = domain.try_clone()?;
+        // The mandatory `no_new_privs` propagation of the TSYNC path:
+        //
+        // 	if (ctx->set_no_new_privs)
+        // 		task_set_no_new_privs(current);
+        //
+        // with the bit sampled once from the caller by
+        // `shared_ctx.set_no_new_privs = task_no_new_privs(current);`
+        // (security/landlock/tsync.c).  A sibling that lacks the bit would drop
+        // the new domain at its next execve(2), because a domain survives an
+        // exec only under `no_new_privs` (security/landlock/domain.c
+        // `landlock_cred_security` is re-evaluated against
+        // `task_no_new_privs()`), so the caller's bit is copied to every
+        // sibling.  Only siblings: Linux leaves the caller's own bit -- set
+        // already, or unset because the caller used CAP_SYS_ADMIN -- alone.
+        let propagate_no_new_privs = caller.no_new_privs();
+        let mut prepared_no_new_privs = Vec::new();
+        if propagate_no_new_privs {
+            prepared_no_new_privs
+                .try_reserve_exact(targets.len())
+                .map_err(|_| AxError::NoMemory)?;
+            for task in &targets {
+                let thread = task
+                    .try_as_thread()
+                    .expect("TSYNC targets were validated as threads");
+                prepared_no_new_privs.push(thread.prepare_no_new_privs()?);
+            }
+        }
         // Infallible commit: no allocation and no failure path, so the group
         // is never left with only some threads synchronized.
         let mut leader_synced = caller.kernel_tid() == leader_tid;
         caller.replace_landlock_domain(caller_domain);
+        let mut no_new_privs = prepared_no_new_privs.into_iter();
         for (task, value) in targets.iter().zip(prepared) {
             let thread = task
                 .try_as_thread()
                 .expect("TSYNC targets were validated as threads");
+            if let Some(transition) = no_new_privs.next().flatten() {
+                // Linux updates the credential before it publishes the new
+                // one, so the bit is visible no later than the domain.
+                thread.commit_no_new_privs(transition);
+            }
             if thread.kernel_tid() == leader_tid {
                 leader_synced = true;
             }

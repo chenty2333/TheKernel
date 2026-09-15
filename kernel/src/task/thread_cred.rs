@@ -229,13 +229,43 @@ impl Thread {
     }
 
     pub fn set_no_new_privs(&self) -> AxResult<()> {
+        if let Some(transition) = self.prepare_no_new_privs()? {
+            self.commit_no_new_privs(transition);
+        }
+        Ok(())
+    }
+
+    /// Prepares, without publishing, this thread's `no_new_privs` transition.
+    /// `Ok(None)` means the bit is already set and nothing needs to happen.
+    ///
+    /// The value holds this thread's credential update lock until it is
+    /// committed, so a group-wide operation can finish every fallible step for
+    /// every thread before the first thread's state changes.  Linux gets the
+    /// same property from `prepare_creds()` per sibling
+    /// (`security/landlock/tsync.c`), where `task_set_no_new_privs()` itself
+    /// cannot fail.
+    pub(crate) fn prepare_no_new_privs(&self) -> AxResult<Option<PreparedCred<'_>>> {
         let mut update = self.credential.prepare();
         if update.old().no_new_privs() {
-            return Ok(());
+            return Ok(None);
         }
         update.builder.no_new_privs = true;
-        self.commit_credential(update.finish()?)?;
-        Ok(())
+        Ok(Some(update.finish()?))
+    }
+
+    /// Publishes one value from `prepare_no_new_privs()`.
+    ///
+    /// The transition changes only the `no_new_privs` bit, so
+    /// `commit_credential()`'s single fallible step -- the keyring fsid
+    /// precommit, which runs only when fsuid or fsgid changes -- cannot fail
+    /// here, and publication itself is infallible.  Callers that must not have
+    /// a failure path after their first state change rely on this.
+    pub(crate) fn commit_no_new_privs(&self, prepared: PreparedCred<'_>) {
+        debug_assert!(!prepared.old_arc().no_new_privs());
+        debug_assert!(prepared.proposed_arc().no_new_privs());
+        let committed = self.commit_credential(prepared);
+        debug_assert!(committed.is_ok());
+        let _ = committed;
     }
 }
 
