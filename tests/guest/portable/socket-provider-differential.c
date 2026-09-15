@@ -253,6 +253,52 @@ static void netlink_policy(void) {
     mark("ROUTE_PEER_POLICY", net_admin ? result == 0 : (result == -1 && errno == EPERM));
     close(fd);
 
+    /* `netlink_getsockbyportid()` refuses a destination that is connected to
+     * another port ID, and accepts one whose connected peer is the sender:
+     * `if (READ_ONCE(sock->sk_state) == NETLINK_CONNECTED &&
+     * READ_ONCE(nlk->dst_portid) != nlk_sk(ssk)->portid) return
+     * ERR_PTR(-ECONNREFUSED);` (`net/netlink/af_netlink.c:1147-1153`).  A
+     * usersock socket may connect without CAP_NET_ADMIN because NL_CFG_F_NONROOT_SEND
+     * is registered for it. */
+    int target = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+    check("REFUSAL_TARGET_SOCKET", target >= 0);
+    struct sockaddr_nl target_name = {.nl_family = AF_NETLINK};
+    socklen_t target_length = sizeof(target_name);
+    mark("REFUSAL_TARGET_BIND",
+         bind(target, (struct sockaddr *)&target_name, sizeof(target_name)) == 0 &&
+             getsockname(target, (struct sockaddr *)&target_name, &target_length) == 0 &&
+             target_name.nl_pid != 0);
+
+    struct sockaddr_nl connected_peer = {.nl_family = AF_NETLINK, .nl_pid = 12345};
+    errno = 0;
+    mark("REFUSAL_TARGET_CONNECT",
+         connect(target, (struct sockaddr *)&connected_peer, sizeof(connected_peer)) == 0);
+
+    struct sockaddr_nl destination = {.nl_family = AF_NETLINK, .nl_pid = target_name.nl_pid};
+    struct sockaddr_nl foreign = {.nl_family = AF_NETLINK, .nl_pid = 54321};
+    int sender = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+    check("REFUSAL_SENDER_SOCKET", sender >= 0);
+    mark("REFUSAL_SENDER_BIND", bind(sender, (struct sockaddr *)&foreign, sizeof(foreign)) == 0);
+    errno = 0;
+    mark("NETLINK_CONNECT_REFUSES_OTHER_SENDER",
+         sendto(sender, "x", 1, 0, (struct sockaddr *)&destination, sizeof(destination)) == -1
+             && errno == ECONNREFUSED);
+    close(sender);
+
+    struct sockaddr_nl accepted_peer = {.nl_family = AF_NETLINK, .nl_pid = 12345};
+    int connected = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+    check("REFUSAL_PEER_SOCKET", connected >= 0);
+    mark("REFUSAL_PEER_BIND",
+         bind(connected, (struct sockaddr *)&accepted_peer, sizeof(accepted_peer)) == 0);
+    errno = 0;
+    mark("NETLINK_CONNECT_ACCEPTS_PEER",
+         sendto(connected, "y", 1, 0, (struct sockaddr *)&destination, sizeof(destination)) == 1);
+    char refusal_record[4] = {0};
+    mark("NETLINK_CONNECT_PEER_DELIVERED",
+         recv(target, refusal_record, sizeof(refusal_record), 0) == 1 && refusal_record[0] == 'y');
+    close(connected);
+    close(target);
+
     fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
     check("USERSOCK_GROUP_SOCKET", fd >= 0);
     errno = 0;
@@ -410,6 +456,57 @@ static void sol_socket_table(void) {
     errno = 0;
     mark("GET_BAD_LEVEL_ENOPROTOOPT",
          getsockopt(fd, SOL_IP, SO_REUSEADDR, &value, &length) == -1 && errno == ENOPROTOOPT);
+
+    /* `do_sock_setsockopt()` rejects a negative length before any protocol
+     * sees the option (`net/socket.c:2342-2343`). */
+    value = 4096;
+    errno = 0;
+    mark("SET_NEGATIVE_OPTLEN_EINVAL",
+         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, (socklen_t)-1) == -1 && errno == EINVAL);
+
+    /* `SO_SNDBUF`/`SO_RCVBUF` never fail on a negative request: the unsigned
+     * `min_t(u32, val, sysctl_*mem_max)` clamp turns it into the sysctl
+     * maximum, which `sk_sndbuf`/`sk_rcvbuf` then double
+     * (`net/core/sock.c:1342-1352`, `:1374`).  The getter reports that stored
+     * value, so both options read back as 8388608. */
+    value = -1;
+    errno = 0;
+    mark("NEGATIVE_SNDBUF_CLAMPS",
+         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) == 0);
+    expected = 0;
+    length = sizeof(expected);
+    mark("NEGATIVE_SNDBUF_READS_MAX",
+         getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &expected, &length) == 0 && expected == 8388608);
+    value = -1;
+    errno = 0;
+    mark("NEGATIVE_RCVBUF_CLAMPS",
+         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, sizeof(value)) == 0);
+    expected = 0;
+    length = sizeof(expected);
+    mark("NEGATIVE_RCVBUF_READS_MAX",
+         getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &expected, &length) == 0 && expected == 8388608);
+    close(fd);
+
+    /* The same arithmetic for an internet socket, whose transports own the
+     * buffer and report it back through their own capacity. */
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    check("SOL_SOCKET_INET", fd >= 0);
+    value = -1;
+    errno = 0;
+    mark("INET_NEGATIVE_SNDBUF_CLAMPS",
+         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) == 0);
+    expected = 0;
+    length = sizeof(expected);
+    mark("INET_NEGATIVE_SNDBUF_READS_MAX",
+         getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &expected, &length) == 0 && expected == 8388608);
+    value = -1;
+    errno = 0;
+    mark("INET_NEGATIVE_RCVBUF_CLAMPS",
+         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, sizeof(value)) == 0);
+    expected = 0;
+    length = sizeof(expected);
+    mark("INET_NEGATIVE_RCVBUF_READS_MAX",
+         getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &expected, &length) == 0 && expected == 8388608);
     close(fd);
 }
 
@@ -546,41 +643,190 @@ static void null_operations(void) {
     errno = 0;
     mark("SOCKETPAIR_FLAG_MASK_EINVAL", socketpair(AF_UNIX, SOCK_STREAM | 0x40, 0, pair) == -1
          && errno == EINVAL);
+
+    /* `__sys_accept4` resolves the descriptor before it validates the flag
+     * mask (`net/socket.c:1917-1930`), so a bad descriptor outranks a bad
+     * flag.  `__sys_socketpair` reserves both descriptors with
+     * `get_unused_fd_flags` and writes them into `usockvec` before it creates
+     * either socket, and the failure path releases them again
+     * (`:1817-1899`), so a pair request that cannot be satisfied still leaves
+     * two numbers in the caller's array. */
+    errno = 0;
+    mark("ACCEPT4_BADFD_BADFLAG", accept4(-1, NULL, NULL, 0x40) == -1 && errno == EBADF);
+    pair[0] = -1;
+    pair[1] = -1;
+    errno = 0;
+    mark("SOCKETPAIR_RESERVES_FDS",
+         socketpair(AF_INET, SOCK_STREAM, 0, pair) == -1 && errno == EOPNOTSUPP &&
+             pair[0] >= 0 && pair[1] >= 0 && pair[0] != pair[1]);
 }
 
-int main(void) {
+/* `__sys_getsockname`/`__sys_getpeername` run the family's `getname` before
+ * `move_addr_to_user` reads `*addrlen` (`net/socket.c:1849-1876`), so a
+ * provider error survives an unusable length pointer while a successful
+ * provider call still reports the copy-out fault.  The inet record is
+ * `struct sockaddr_in` with the bound port and address (`inet_getname`), and a
+ * two-byte AF_UNIX bind autobinds through `unix_autobind()`, whose abstract
+ * `%05x` name `unix_getname()` reports with an eight-byte length
+ * (`net/unix/af_unix.c:1463-1471`, `:1236-1244`). */
+static void name_record(void) {
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    struct sockaddr_in record;
+    socklen_t length = sizeof(record);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    check("NAME_SOCKET", fd >= 0);
+    memset(&record, 0xa5, sizeof(record));
+    errno = 0;
+    mark("GETSOCKNAME_UNBOUND_ZERO",
+         getsockname(fd, (struct sockaddr *)&record, &length) == 0 &&
+             length == sizeof(record) && record.sin_family == AF_INET && record.sin_port == 0 &&
+             record.sin_addr.s_addr == 0);
+    mark("NAME_BIND", bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0);
+    memset(&record, 0, sizeof(record));
+    length = sizeof(record);
+    errno = 0;
+    mark("GETSOCKNAME_BOUND_PORT",
+         getsockname(fd, (struct sockaddr *)&record, &length) == 0 &&
+             length == sizeof(record) && record.sin_family == AF_INET && record.sin_port != 0 &&
+             record.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    errno = 0;
+    mark("GETPEERNAME_UNCONNECTED_ENOTCONN", getpeername(fd, NULL, (socklen_t *)0x1) == -1
+         && errno == ENOTCONN);
+    errno = 0;
+    mark("GETSOCKNAME_BADLEN_EFAULT",
+         getsockname(fd, NULL, (socklen_t *)0x1) == -1 && errno == EFAULT);
+    /* The provider's own length is reported even when the copy faults, because
+     * `move_addr_to_user()` writes `klen` back before `copy_to_user()`
+     * (`net/socket.c:288-303`); the four-byte request is only a destination
+     * capacity, so a truncating request still reports the whole record. */
+    length = 4;
+    errno = 0;
+    mark("GETSOCKNAME_LENGTH_BEFORE_FAULT",
+         getsockname(fd, (struct sockaddr *)0x1, &length) == -1 && errno == EFAULT &&
+             length == sizeof(struct sockaddr_in));
+    close(fd);
+
+    /* `move_addr_to_user()` is also the tail that exports a receive source
+     * address (`__sys_recvfrom()` -> `sock_recvmsg()` -> `move_addr_to_user()`,
+     * `net/socket.c:2280-2300`), so a faulting source-address copy reports the
+     * provider's length in the same way. */
+    int receiver = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in loopback;
+    memset(&loopback, 0, sizeof(loopback));
+    loopback.sin_family = AF_INET;
+    loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t loopback_length = sizeof(loopback);
+    int receiver_ready = receiver >= 0 &&
+                         bind(receiver, (struct sockaddr *)&loopback, sizeof(loopback)) == 0 &&
+                         getsockname(receiver, (struct sockaddr *)&loopback, &loopback_length) == 0 &&
+                         loopback_length == sizeof(loopback);
+    mark("RECVFROM_NAME_SOCKET", receiver_ready);
+    if (receiver_ready) {
+        char payload = 'q';
+        ssize_t sent = sendto(receiver, &payload, 1, 0, (struct sockaddr *)&loopback,
+                              sizeof(loopback));
+        char buffer[8];
+        socklen_t source_length = 4;
+        errno = 0;
+        ssize_t received = recvfrom(receiver, buffer, sizeof(buffer), 0,
+                                    (struct sockaddr *)0x1, &source_length);
+        mark("RECVFROM_LENGTH_BEFORE_FAULT",
+             sent == 1 && received == -1 && errno == EFAULT &&
+                 source_length == sizeof(struct sockaddr_in));
+    }
+    close(receiver);
+
+    int unix_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+    check("AUTOBIND_NAME_SOCKET", unix_socket >= 0);
+    struct sockaddr_un request;
+    memset(&request, 0, sizeof(request));
+    request.sun_family = AF_UNIX;
+    mark("AUTOBIND_NAME_BIND", bind(unix_socket, (struct sockaddr *)&request, 2) == 0);
+    struct sockaddr_un name;
+    memset(&name, 0xa5, sizeof(name));
+    length = sizeof(name);
+    errno = 0;
+    int shape = getsockname(unix_socket, (struct sockaddr *)&name, &length) == 0 && length == 8 &&
+                name.sun_family == AF_UNIX && name.sun_path[0] == '\0';
+    for (int index = 1; shape && index <= 5; index++) {
+        char digit = name.sun_path[index];
+        if (!((digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'))) {
+            shape = 0;
+        }
+    }
+    mark("UNIX_AUTOBIND_NAME_RECORD", shape);
+    close(unix_socket);
+}
+
+static const char *only_case;
+
+/* Development affordance: an optional first argument names one case (the
+ * `PROGRAM_CASES` spelling from the differential runner), so a single
+ * divergence can be inspected without the fail-fast `mark()` aborting an
+ * earlier case of the same program.  The registered differential run passes no
+ * argument and therefore still executes and reports every case exactly once. */
+static int case_selected(const char *name) {
+    return only_case == NULL || strcmp(only_case, name) == 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        only_case = argv[1];
+    }
     alarm(30);
-    begin("socket_creation_order.portable-differential");
-    creation_order();
-    done();
+    if (case_selected("socket_creation_order")) {
+        begin("socket_creation_order.portable-differential");
+        creation_order();
+        done();
+    }
 
-    begin("socket_unix_creation.portable-differential");
-    unix_creation();
-    done();
+    if (case_selected("socket_unix_creation")) {
+        begin("socket_unix_creation.portable-differential");
+        unix_creation();
+        done();
+    }
 
-    begin("socket_netlink_creation.portable-differential");
-    netlink_creation();
-    done();
+    if (case_selected("socket_netlink_creation")) {
+        begin("socket_netlink_creation.portable-differential");
+        netlink_creation();
+        done();
+    }
 
-    begin("socket_netlink_policy.portable-differential");
-    netlink_policy();
-    done();
+    if (case_selected("socket_netlink_policy")) {
+        begin("socket_netlink_policy.portable-differential");
+        netlink_policy();
+        done();
+    }
 
-    begin("socket_address_lengths.portable-differential");
-    address_lengths();
-    done();
+    if (case_selected("socket_address_lengths")) {
+        begin("socket_address_lengths.portable-differential");
+        address_lengths();
+        done();
+    }
 
-    begin("socket_sol_socket_table.portable-differential");
-    sol_socket_table();
-    done();
+    if (case_selected("socket_name_record")) {
+        begin("socket_name_record.portable-differential");
+        name_record();
+        done();
+    }
 
-    begin("socket_netlink_option_table.portable-differential");
-    netlink_option_table();
-    done();
+    if (case_selected("socket_sol_socket_table")) {
+        begin("socket_sol_socket_table.portable-differential");
+        sol_socket_table();
+        done();
+    }
 
-    begin("socket_null_operations.portable-differential");
-    null_operations();
-    done();
+    if (case_selected("socket_netlink_option_table")) {
+        begin("socket_netlink_option_table.portable-differential");
+        netlink_option_table();
+        done();
+    }
+
+    if (case_selected("socket_null_operations")) {
+        begin("socket_null_operations.portable-differential");
+        null_operations();
+        done();
+    }
 
     puts("THEKERNEL_SOCKET_PROVIDER_PASS");
     return 0;
