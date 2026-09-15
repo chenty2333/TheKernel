@@ -370,18 +370,28 @@ fn select_wait_event(
 ) -> Option<WaitEvent> {
     let selection = selection_for(options, wait_exited);
     for candidate in candidates {
-        let Ok(proc_data) = get_process_data(candidate.process.pid()) else {
-            continue;
-        };
+        // The exit path must not require process data. A process that has
+        // exited but not yet been reaped is no longer registered, so
+        // `get_process_data()` fails for exactly the candidates this loop is
+        // most often called to report; skipping them strands the zombie and
+        // hangs the parent in `wait4(2)` forever. Only the stop and continued
+        // events need the registry entry, and a missing entry means neither is
+        // reportable.
+        let proc_data = get_process_data(candidate.process.pid()).ok();
+
         // A stop is reportable when it belongs to this waiter's ptrace session
         // (if any) and either it is a ptrace stop — which is always reported —
         // or the caller asked for job-control stops with `WUNTRACED`. This is
         // `wait_task_stopped()`'s `if (!ptrace && !(wo->wo_flags & WUNTRACED))
         // return 0;`, with `ptrace` derived from the same session identity.
-        let stop = proc_data
-            .peek_stop_status(candidate.expected_ptrace_session)
-            .filter(|stop| wait_candidate_accepts_stop(candidate.expected_ptrace_session, *stop))
-            .filter(|stop| stop.traced() || selection.stopped);
+        let stop = proc_data.as_ref().and_then(|proc_data| {
+            proc_data
+                .peek_stop_status(candidate.expected_ptrace_session)
+                .filter(|stop| {
+                    wait_candidate_accepts_stop(candidate.expected_ptrace_session, *stop)
+                })
+                .filter(|stop| stop.traced() || selection.stopped)
+        });
 
         // `delay_group_leader()`: a zombie group leader is held back while any
         // of its threads is still alive, so its exit is reported only once the
@@ -399,7 +409,10 @@ fn select_wait_event(
             tk_linux_process::WaitEventState {
                 exited: candidate.allow_exit && zombie.is_some(),
                 stopped: stop.is_some() && selection.stopped,
-                continued: proc_data.peek_continued() && selection.continued,
+                continued: proc_data
+                    .as_ref()
+                    .is_some_and(|proc_data| proc_data.peek_continued())
+                    && selection.continued,
             },
             selection,
         );
@@ -416,13 +429,13 @@ fn select_wait_event(
                 return Some(WaitEvent::Stopped {
                     pid: candidate.visible_pid,
                     stop: stop?,
-                    proc_data,
+                    proc_data: proc_data?,
                 });
             }
             Some(tk_linux_process::WaitEventKind::Continued) => {
                 return Some(WaitEvent::Continued {
                     pid: candidate.visible_pid,
-                    proc_data,
+                    proc_data: proc_data?,
                 });
             }
             None => {}

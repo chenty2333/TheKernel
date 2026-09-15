@@ -39,6 +39,11 @@ static long raw_pause(void)
     return syscall(SYS_pause);
 }
 
+static long raw_sigsuspend(const sigset_t *mask)
+{
+    return syscall(SYS_rt_sigsuspend, mask, _NSIG / 8);
+}
+
 static long raw_kill(pid_t pid, int signo)
 {
     return syscall(SYS_kill, pid, signo);
@@ -107,11 +112,23 @@ static int test_handler_eintr(void)
     int status;
     long result;
     int saved_errno;
+    sigset_t old_mask;
 
+    /* SIGUSR1 is blocked across the fork so the child cannot win the race
+     * against the parent's sleep. With the signal unblocked, a child that
+     * delivered it before the parent reached `pause` would consume the only
+     * wake-up this case waits for and leave the parent sleeping forever; the
+     * failure looks like a hung kernel and is not one. `rt_sigsuspend`
+     * atomically restores the mask and enters the same interruptible sleep
+     * `pause` does, so the EINTR path under test is unchanged. */
+    if (sigprocmask(SIG_BLOCK, &usr1_mask, &old_mask) != 0)
+        return fail("restart-block");
     usr1_seen = 0;
     child = (pid_t)raw_fork();
-    if (child < 0)
+    if (child < 0) {
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
         return fail("restart-fork");
+    }
     if (child == 0) {
         if (raw_kill((pid_t)syscall(SYS_getppid), SIGUSR1) != 0)
             child_exit(2);
@@ -119,8 +136,10 @@ static int test_handler_eintr(void)
     }
 
     errno = 0;
-    result = raw_pause();
+    result = raw_sigsuspend(&old_mask);
     saved_errno = errno;
+    if (sigprocmask(SIG_SETMASK, &old_mask, NULL) != 0)
+        return fail("restart-restore");
     if (wait_child(child, &status, "restart-wait") != 0)
         return 1;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || result != -1 ||
