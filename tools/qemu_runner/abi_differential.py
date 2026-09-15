@@ -239,7 +239,32 @@ PROGRAM_CASES = {
     "sysv-ipc": ("sysvipc-ids", "sysvipc-stat", "sysvipc-info", "sysvipc-sem", "sysvipc-sem-undo", "sysvipc-control", "sysvipc-shm-lock", "sysvipc-shm-hugetlb", "sysvipc-shm-dest", "sysvipc-errno", "sysvipc-msg"),
     "posix-mqueue": ("mq-open", "mq-unlink", "mq-timedsend", "mq-timedreceive", "mq-notify"),
 }
+# The registry is static: the gate reads it to decide whether a claimed
+# syscall names a program this runner really executes.
 PROGRAMS = tuple(PROGRAM_CASES)
+
+
+def selected_programs() -> tuple[str, ...]:
+    """The guest programs the current run exercises.
+
+    ``THEKERNEL_ABI_PROGRAMS`` narrows the set to a comma-separated list so a
+    single failing program can be reproduced without paying for a boot that
+    runs every other one first.  The comparison stays meaningful because both
+    guests run the same narrowed list and every assertion of every selected
+    program is still required.  Unset means every registered program, which is
+    what the gate always sees because it does not run a guest.
+    """
+    requested = os.environ.get("THEKERNEL_ABI_PROGRAMS")
+    if requested is None:
+        return PROGRAMS
+    selected = tuple(name.strip() for name in requested.split(",") if name.strip())
+    unknown = [name for name in selected if name not in PROGRAM_CASES]
+    if unknown or not selected:
+        raise RunnerError(
+            "THEKERNEL_ABI_PROGRAMS must name registered programs; "
+            f"unknown={unknown or requested!r}"
+        )
+    return selected
 PROGRAM_SUCCESS = {
     "tty-job-control": "THEKERNEL_TTY_JOB_CONTROL_OK",
     "tty-termios": "THEKERNEL_TTY_TERMIOS_OK",
@@ -393,9 +418,12 @@ class AbiConfig:
     timeout: float = 1800.0
 
 
-def expected_records() -> list[str]:
+def expected_records(programs: tuple[str, ...] | None = None) -> list[str]:
+    wanted = {case for name in (PROGRAMS if programs is None else programs) for case in PROGRAM_CASES[name]}
     records = []
     for name, (suffix, outcome, assertions) in CONTRACTS.items():
+        if name not in wanted:
+            continue
         case = f"{name}.{suffix}"
         records.append(f"THEKERNEL_ABI_CASE {case}")
         records.extend(f"THEKERNEL_ABI_ASSERT {case} {assertion} {outcome}" for assertion in assertions.split())
@@ -403,22 +431,25 @@ def expected_records() -> list[str]:
     return records
 
 
-def parse_abi_log(path: Path, *, linux: bool = False) -> Counter:
+def parse_abi_log(path: Path, *, linux: bool = False, programs: tuple[str, ...] | None = None) -> Counter:
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
+    if programs is None:
+        programs = PROGRAMS
+    completions = tuple(PROGRAM_SUCCESS[name] for name in programs)
     if lines.count(COMPLETE_MARKER) != 1:
         raise RunnerError(f"ABI guest did not complete exactly once: {path}")
-    if any(lines.count(marker) != 1 for marker in PROGRAM_COMPLETIONS):
+    if any(lines.count(marker) != 1 for marker in completions):
         raise RunnerError(f"ABI program completion is missing or duplicated: {path}")
-    if any(lines.index(marker) > lines.index(COMPLETE_MARKER) for marker in PROGRAM_COMPLETIONS):
+    if any(lines.index(marker) > lines.index(COMPLETE_MARKER) for marker in completions):
         raise RunnerError(f"ABI aggregate completion precedes a program completion: {path}")
     if re.search(r"^THEKERNEL_\S*(?:FAIL|SKIP)(?:\s|$)", text, re.MULTILINE):
         raise RunnerError(f"ABI guest reported a failure or skip: {path}")
     intervals = [line for line in lines if line.startswith("# THEKERNEL_TEST_")]
-    if len(intervals) != 2 * len(PROGRAMS):
+    if len(intervals) != 2 * len(programs):
         raise RunnerError(f"ABI watchdog intervals are missing or duplicated: {path}")
     owned_record_count = 0
-    for index, name in enumerate(PROGRAMS, 1):
+    for index, name in enumerate(programs, 1):
         begin = rf"# THEKERNEL_TEST_BEGIN {index} abi-{re.escape(name)} timeout_seconds=[1-9][0-9]*"
         end = f"# THEKERNEL_TEST_END {index} abi-{name} result=0"
         if not re.fullmatch(begin, intervals[2 * (index - 1)]) or intervals[2 * index - 1] != end:
@@ -438,7 +469,7 @@ def parse_abi_log(path: Path, *, linux: bool = False) -> Counter:
     if owned_record_count != len(ordered) - 1:
         raise RunnerError(f"ABI case records escaped their program watchdog interval: {path}")
     records = Counter(ordered)
-    expected = Counter(expected_records() + [COMPLETE_MARKER])
+    expected = Counter(expected_records(programs) + [COMPLETE_MARKER])
     if records != expected:
         raise RunnerError(f"ABI assertions missing, duplicated or unexpected: {path}; missing={list((expected - records).elements())}; unexpected={list((records - expected).elements())}")
     active = None
@@ -466,6 +497,7 @@ def run_abi_differential(config: AbiConfig) -> Path:
     for path in (config.rootfs, *(p for target in config.targets for p in (target.kernel, target.esp))):
         if not path.is_file() or not path.stat().st_size:
             raise RunnerError(f"ABI input is missing or empty: {path}")
+    programs = selected_programs()
     config.workdir.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="abi-", dir=config.workdir))
     base = directory / "rootfs-base.img"
@@ -490,7 +522,7 @@ def run_abi_differential(config: AbiConfig) -> Path:
             commands = current / "commands"
             workloads = []
             case_timeout = min(120, max(1, math.ceil(config.timeout)))
-            for index, name in enumerate(PROGRAMS, 1):
+            for index, name in enumerate(programs, 1):
                 command = f"/opt/thekernel-tests/portable/{name}-differential"
                 if name == "unix-write-credentials":
                     command += " --require-id-change"
@@ -536,7 +568,7 @@ def run_abi_differential(config: AbiConfig) -> Path:
                 if (not result.guest_clean_shutdown or result.error_message is not None
                         or result.runner_termination_reason is not None):
                     raise RunnerError(f"ABI guest failed: {target.name}; log={result.log_path}")
-                observations.append(parse_abi_log(result.log_path, linux=target.name == "linux"))
+                observations.append(parse_abi_log(result.log_path, linux=target.name == "linux", programs=programs))
             finally:
                 rootfs.unlink(missing_ok=True)
     finally:
