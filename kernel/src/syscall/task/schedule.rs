@@ -1439,11 +1439,18 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
                 tail_nonzero,
             },
             before,
+            // `SCHED_FLAG_RECLAIM` and `SCHED_FLAG_DL_OVERRUN` are accepted:
+            // `__sched_setscheduler()` only rejects bits outside
+            // `SCHED_FLAG_ALL | SCHED_FLAG_SUGOV`, and `__checkparam_dl()` does
+            // not look at `sched_flags`. The EEVDF core has no reclaim
+            // bandwidth accounting and no overrun report, so the bits are
+            // stored and reported back rather than acted on -- which is what
+            // `__setparam_dl()`/`__getparam_dl()` make observable.
             linux_sched::FeatureSet {
                 deadline: true,
                 util_clamp: true,
-                reclaim: false,
-                dl_overrun: false,
+                reclaim: true,
+                dl_overrun: true,
             },
         )
         .map_err(map_sched_reject)?;
@@ -1515,6 +1522,9 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
         };
         let deadline = if matches!(class, SchedClass::Deadline) {
             if attr.sched_flags & linux_sched::SCHED_FLAG_KEEP_PARAMS != 0 {
+                // `__setscheduler_params()` skips `__setparam_dl()` entirely
+                // for KEEP_PARAMS, so both the reservation and `dl_se->flags`
+                // keep their previous values.
                 old.deadline
             } else {
                 let deadline = plan.deadline.expect("deadline planner returned parameters");
@@ -1522,10 +1532,16 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
                     runtime_ns: deadline.runtime,
                     deadline_ns: deadline.deadline,
                     period_ns: deadline.period,
+                    flags: dl_flags_from_plan(&plan),
                 }
             }
         } else {
-            DeadlineParameters::default()
+            // Leaving the deadline class cannot clear `dl_se->flags` in Linux
+            // either: `__setscheduler_params()` only calls `__setparam_dl()`
+            // for a deadline policy, and `get_params()` only reports the flags
+            // for one. Retain them so re-entering SCHED_DEADLINE without an
+            // explicit flag round-trips what Linux would still hold.
+            old.deadline
         };
         let uclamp = axtask::UclampRequest {
             minimum: plan.uclamp.min as u16,
@@ -1552,6 +1568,22 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
     }
 }
 
+/// `__setparam_dl()`'s `dl_se->flags = attr->sched_flags & SCHED_DL_FLAGS`.
+///
+/// `SCHED_DL_FLAGS` is `SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN |
+/// SCHED_FLAG_SUGOV`; `SCHED_FLAG_SUGOV` is kernel-internal and rejected for
+/// userspace callers, so only the two public bits can appear here.
+fn dl_flags_from_plan(plan: &linux_sched::SchedUpdatePlan) -> u32 {
+    let mut flags = 0u32;
+    if plan.reclaim {
+        flags |= linux_sched::SCHED_FLAG_RECLAIM as u32;
+    }
+    if plan.dl_overrun {
+        flags |= linux_sched::SCHED_FLAG_DL_OVERRUN as u32;
+    }
+    flags
+}
+
 type SchedAttrSnapshot = (SchedState, bool, u64, u64, u64, u64, u32, u32);
 
 enum SchedGetAttrTarget {
@@ -1570,6 +1602,29 @@ impl SchedGetAttrTarget {
                 .zombie_payload()
                 .ok_or(AxError::NoSuchProcess)
                 .map(|snapshot| snapshot.credential.clone()),
+        }
+    }
+
+    /// `get_params()`'s deadline branch, read from the same scheduler
+    /// transaction as `snapshot()`.
+    ///
+    /// Linux reports `dl_se->flags` only through `__getparam_dl()`, so a
+    /// non-deadline target contributes nothing here even though the retained
+    /// bits may still be present.
+    fn deadline_flags(&self) -> AxResult<u64> {
+        match self {
+            Self::Live(task) => task_scheduling_snapshot(task)
+                .map(|snapshot| u64::from(snapshot.deadline.flags))
+                .map_err(|error| match error {
+                    TaskSchedError::TaskExited => AxError::NoSuchProcess,
+                    TaskSchedError::Unsupported => AxError::OperationNotSupported,
+                    TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
+                        AxError::NoSuchProcess
+                    }
+                }),
+            Self::Zombie(process) => {
+                zombie_scheduler_state(process).map(|snapshot| u64::from(snapshot.dl_flags))
+            }
         }
     }
 
@@ -1628,7 +1683,7 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
         || pid < 0
         || !(linux_sched::SCHED_ATTR_SIZE_VER0 as usize..=linux_sched::SCHED_ATTR_MAX_SIZE as usize)
             .contains(&out_size)
-        || flags != 0
+        || flags & !linux_sched::SCHED_GETATTR_FLAG_DL_DYNAMIC != 0
     {
         return Err(AxError::InvalidInput);
     }
@@ -1643,6 +1698,13 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
             SchedGetAttrTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
         }
     };
+    // `if (flags) { if (!task_has_dl_policy(p) || flags !=
+    // SCHED_GETATTR_FLAG_DL_DYNAMIC) return -EINVAL; }` -- the check needs the
+    // resolved target, so it runs after the task lookup and before the
+    // security hook, exactly as in `SYSCALL_DEFINE5(sched_getattr)`.
+    if flags != 0 && !matches!(target.snapshot()?.0.class, SchedClass::Deadline) {
+        return Err(AxError::InvalidInput);
+    }
     let (_, actor_cred) = scheduler_actor_snapshot();
     let target_cred = target.credential()?;
     dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
@@ -1659,14 +1721,29 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
         util_min,
         util_max,
     ) = target.snapshot()?;
+    // `get_params()` only consults the deadline entity for a deadline policy;
+    // every other class leaves the `SCHED_DL_FLAGS` bits clear.
+    //
+    // `SCHED_GETATTR_FLAG_DL_DYNAMIC` asks `__getparam_dl()` for the running
+    // budget and the absolute deadline instead of the configured reservation.
+    // This kernel's EEVDF deadline core has no exposed per-entity runtime
+    // clock, so the configured values below are reported for that flag too;
+    // the flag is accepted so the argument contract matches Linux.
+    let dl_flags = if matches!(state.class, SchedClass::Deadline) {
+        target.deadline_flags()?
+            & (linux_sched::SCHED_FLAG_RECLAIM | linux_sched::SCHED_FLAG_DL_OVERRUN)
+    } else {
+        0
+    };
     let mut out = SchedAttr {
         size: out_size.min(size_of::<SchedAttr>()) as u32,
         sched_policy: linux_policy_from_state(state, reset_on_fork) as u32 & !SCHED_RESET_ON_FORK,
-        sched_flags: if reset_on_fork {
-            linux_sched::SCHED_FLAG_RESET_ON_FORK
-        } else {
-            0
-        },
+        sched_flags: dl_flags
+            | if reset_on_fork {
+                linux_sched::SCHED_FLAG_RESET_ON_FORK
+            } else {
+                0
+            },
         sched_nice: state_nice(state),
         sched_priority: state_static_priority(state) as u32,
         sched_runtime: if matches!(state.class, SchedClass::Deadline) {
@@ -2365,19 +2442,25 @@ fn visible_process_pid_in_namespace(
 /// different global PID; it still scans the authoritative task table rather
 /// than inventing a second task registry.
 fn visible_task_for_ioprio(who: Pid, caller_pid_ns: &Arc<PidNamespace>) -> AxResult<AxTaskRef> {
+    // Linux resolves `IOPRIO_WHO_PROCESS` with `find_task_by_vpid()`, which
+    // matches on identity alone. `PF_EXITING` is therefore not a filter here:
+    // a task between setting `PF_EXITING` and being published as a zombie is
+    // still findable, and `IoprioTarget` already reports the CLASS_NONE default
+    // for that lifecycle window -- `exit_io_context()` has dropped the live
+    // `io_context` by then, so Linux would find the task and read no priority
+    // rather than report ESRCH.
+    //
+    // `get_visible_task()` would hide that window because it excludes
+    // `pending_exit`, so the scan below is the authoritative lookup.
     if let Ok(task) = get_visible_task(who)
         && visible_tid_in_namespace(&task, caller_pid_ns) == Some(who)
-        && !task.as_thread().pending_exit()
     {
         return Ok(task);
     }
 
     try_tasks()?
         .into_iter()
-        .find(|task| {
-            !task.as_thread().pending_exit()
-                && visible_tid_in_namespace(task, caller_pid_ns) == Some(who)
-        })
+        .find(|task| visible_tid_in_namespace(task, caller_pid_ns) == Some(who))
         .ok_or(AxError::NoSuchProcess)
 }
 
@@ -2483,7 +2566,10 @@ fn ioprio_multi_targets(
             let target_group = target_group.ok_or(AxError::NoSuchProcess)?;
             for task in tasks {
                 let thread = task.as_thread();
-                if thread.pending_exit() || !caller_pid_ns.contains(&thread.pid_ns()) {
+                // `do_each_pid_thread()` yields every task in the group with no
+                // `PF_EXITING` filter; `IoprioTarget` already reports the
+                // CLASS_NONE default for a task whose `io_context` is gone.
+                if !caller_pid_ns.contains(&thread.pid_ns()) {
                     continue;
                 }
                 let group = thread.proc_data.proc.group();
@@ -2522,10 +2608,9 @@ fn ioprio_multi_targets(
             };
             for task in tasks {
                 let thread = task.as_thread();
-                if !thread.pending_exit()
-                    && caller_pid_ns.contains(&thread.pid_ns())
-                    && thread.real_uid() == uid
-                {
+                // `for_each_process_thread()` applies only the
+                // `task_pid_vnr(p)` visibility guard, never `PF_EXITING`.
+                if caller_pid_ns.contains(&thread.pid_ns()) && thread.real_uid() == uid {
                     targets.push(IoprioTarget::Live(task));
                 }
             }

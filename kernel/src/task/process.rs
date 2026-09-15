@@ -204,6 +204,10 @@ pub(crate) struct ZombieSchedulerSnapshot {
     /// Linux's policy query exposes this flag as part of the returned policy,
     /// including while the group leader is an unreaped zombie.
     pub(crate) reset_on_fork: bool,
+    /// Linux's `sched_dl_entity::flags` (`SCHED_DL_FLAGS`), which
+    /// `__getparam_dl()` reports through `sched_getattr(2)` for a deadline
+    /// task. Retained so a zombie still answers with the bits it held.
+    pub(crate) dl_flags: u32,
     /// Raw uclamp request plus per-side ownership retained after the live
     /// scheduler entity disappears.
     pub(crate) uclamp_min: u16,
@@ -230,6 +234,7 @@ impl Default for ZombieSchedulerSnapshot {
             nice: 0,
             rt_priority: 0,
             reset_on_fork: false,
+            dl_flags: 0,
             uclamp_min: 0,
             uclamp_max: 1024,
             uclamp_min_user_defined: false,
@@ -254,6 +259,7 @@ impl From<SchedState> for ZombieSchedulerSnapshot {
             nice: state.nice,
             rt_priority: state.rt_priority,
             reset_on_fork: false,
+            dl_flags: 0,
             uclamp_min: 0,
             uclamp_max: 1024,
             uclamp_min_user_defined: false,
@@ -2842,6 +2848,7 @@ impl GroupLeaderIdentityBinding {
                 identity_epoch: epoch,
                 version: commit.version,
                 reset_on_fork: commit.reset_on_spawn,
+                dl_flags: commit.deadline.flags,
                 uclamp_min: commit.uclamp.minimum,
                 uclamp_max: commit.uclamp.maximum,
                 uclamp_min_user_defined: commit.uclamp.minimum_user_defined,
@@ -2928,6 +2935,7 @@ impl GroupLeaderIdentityBinding {
                     identity_epoch: *epoch,
                     version: commit.version,
                     reset_on_fork: commit.reset_on_spawn,
+                    dl_flags: commit.deadline.flags,
                     uclamp_min: commit.uclamp.minimum,
                     uclamp_max: commit.uclamp.maximum,
                     uclamp_min_user_defined: commit.uclamp.minimum_user_defined,

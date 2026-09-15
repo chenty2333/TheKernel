@@ -19,6 +19,13 @@ pub const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
 pub const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
 pub const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
 pub const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x40;
+/// The only value `sched_getattr(2)`'s `flags` argument may take.
+///
+/// `SYSCALL_DEFINE5(sched_getattr)` permits non-zero `flags` only when the
+/// target has a deadline policy and the value is exactly this flag, which asks
+/// `__getparam_dl()` for the *currently running* budget and absolute deadline
+/// instead of the configured reservation.
+pub const SCHED_GETATTR_FLAG_DL_DYNAMIC: u32 = 0x1;
 pub const SCHED_FLAG_ALL: u64 = SCHED_FLAG_RESET_ON_FORK
     | SCHED_FLAG_RECLAIM
     | SCHED_FLAG_DL_OVERRUN
@@ -329,6 +336,127 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dl_input(flags: u64) -> SchedInput {
+        SchedInput {
+            attr: SchedAttr {
+                size: SCHED_ATTR_SIZE,
+                policy: SCHED_DEADLINE,
+                flags,
+                nice: 0,
+                priority: 0,
+                runtime: 1_000_000,
+                deadline: 5_000_000,
+                period: 10_000_000,
+                util_min: 0,
+                util_max: UCLAMP_SCALE,
+            },
+            supplied_size: SCHED_ATTR_SIZE,
+            tail_nonzero: false,
+        }
+    }
+
+    fn dl_snapshot() -> SchedSnapshot {
+        SchedSnapshot {
+            policy: SCHED_DEADLINE,
+            nice: 0,
+            priority: 0,
+            reset_on_fork: false,
+            util_min: 0,
+            util_max: UCLAMP_SCALE,
+            util_min_user_defined: false,
+            util_max_user_defined: false,
+        }
+    }
+
+    fn features(reclaim: bool, dl_overrun: bool) -> FeatureSet {
+        FeatureSet {
+            deadline: true,
+            util_clamp: true,
+            reclaim,
+            dl_overrun,
+        }
+    }
+
+    #[test]
+    fn reclaim_and_dl_overrun_are_stored_when_the_class_implements_them() {
+        let plan = plan(
+            dl_input(SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN),
+            dl_snapshot(),
+            features(true, true),
+        )
+        .expect("deadline flags must be admitted");
+        assert!(plan.reclaim);
+        assert!(plan.dl_overrun);
+    }
+
+    #[test]
+    fn reclaim_and_dl_overrun_are_rejected_while_unimplemented() {
+        // `__sched_setscheduler()` rejects bits outside
+        // `SCHED_FLAG_ALL | SCHED_FLAG_SUGOV`, so the ABI admits these bits and
+        // only the implementation gate may refuse them.
+        assert_eq!(
+            plan(
+                dl_input(SCHED_FLAG_RECLAIM),
+                dl_snapshot(),
+                features(false, true)
+            ),
+            Err(Reject::UnsupportedFlag)
+        );
+        assert_eq!(
+            plan(
+                dl_input(SCHED_FLAG_DL_OVERRUN),
+                dl_snapshot(),
+                features(true, false)
+            ),
+            Err(Reject::UnsupportedFlag)
+        );
+    }
+
+    #[test]
+    fn the_two_deadline_flags_are_independent() {
+        let plan = plan(
+            dl_input(SCHED_FLAG_RECLAIM),
+            dl_snapshot(),
+            features(true, true),
+        )
+        .expect("reclaim alone must be admitted");
+        assert!(plan.reclaim);
+        assert!(!plan.dl_overrun);
+    }
+
+    #[test]
+    fn dl_flags_are_not_gated_on_the_policy_being_deadline() {
+        // Linux stores `sched_flags & SCHED_DL_FLAGS` whenever the *resulting*
+        // policy is a deadline policy, and `__setscheduler_params()` is what
+        // decides. The planner therefore records the request for any policy it
+        // is admitted for; the kernel keeps the previous entity flags when the
+        // resulting policy is not deadline.
+        let plan = plan(
+            dl_input(SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN),
+            dl_snapshot(),
+            features(true, true),
+        )
+        .expect("flags must be admitted");
+        assert_eq!(plan.policy, SCHED_DEADLINE);
+    }
+
+    #[test]
+    fn the_sched_flag_table_matches_linux_uapi() {
+        // include/uapi/linux/sched.h, v7.2.3.
+        assert_eq!(SCHED_FLAG_RESET_ON_FORK, 0x01);
+        assert_eq!(SCHED_FLAG_RECLAIM, 0x02);
+        assert_eq!(SCHED_FLAG_DL_OVERRUN, 0x04);
+        assert_eq!(SCHED_FLAG_KEEP_POLICY, 0x08);
+        assert_eq!(SCHED_FLAG_KEEP_PARAMS, 0x10);
+        assert_eq!(SCHED_FLAG_UTIL_CLAMP_MIN, 0x20);
+        assert_eq!(SCHED_FLAG_UTIL_CLAMP_MAX, 0x40);
+        assert_eq!(SCHED_FLAG_ALL, 0x7f);
+        // `SCHED_GETATTR_FLAG_DL_DYNAMIC` is a *separate* namespace for
+        // `sched_getattr(2)`'s flags argument and shares the value 0x01 with
+        // `SCHED_FLAG_RESET_ON_FORK` on purpose.
+        assert_eq!(SCHED_GETATTR_FLAG_DL_DYNAMIC, 0x01);
+    }
     fn snap() -> SchedSnapshot {
         SchedSnapshot {
             policy: SCHED_NORMAL,
