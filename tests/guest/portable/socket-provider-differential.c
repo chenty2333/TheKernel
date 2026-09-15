@@ -566,6 +566,36 @@ static void sol_socket_table(void) {
     mark("SET_NEGATIVE_OPTLEN_EINVAL",
          setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, (socklen_t)-1) == -1 && errno == EINVAL);
 
+    /* The getter has no such early site: `do_sock_getsockopt()` copies the
+     * caller's `int len` and discards the result (`net/socket.c:2450-2451`),
+     * so only a provider that goes on to use the value reports a bad length.
+     * `sk_getsockopt()` does that for every SOL_SOCKET name
+     * (`net/core/sock.c:1751-1754`), while an AF_UNIX `proto_ops` has no
+     * `->getsockopt` at all (`net/unix/af_unix.c:967-990`), so any other level
+     * is the dispatcher's -EOPNOTSUPP (`net/socket.c:2476-2477`) with user
+     * memory left untouched. */
+    length = (socklen_t) -1;
+    errno = 0;
+    mark("GET_NEGATIVE_OPTLEN_EINVAL",
+         getsockopt(fd, SOL_SOCKET, SO_TYPE, &value, &length) == -1 && errno == EINVAL);
+    errno = 0;
+    mark("GET_UNREADABLE_OPTLEN_EFAULT",
+         getsockopt(fd, SOL_SOCKET, SO_TYPE, &value, NULL) == -1 && errno == EFAULT);
+    int unix_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    check("TABLE_UNIX_SOCKET", unix_fd >= 0);
+    length = (socklen_t) -1;
+    errno = 0;
+    mark("GET_UNKNOWN_LEVEL_NEGATIVE_OPTLEN_EOPNOTSUPP",
+         getsockopt(unix_fd, 999, 999, &value, &length) == -1 && errno == EOPNOTSUPP);
+    errno = 0;
+    mark("GET_UNKNOWN_LEVEL_UNREADABLE_OPTLEN_EOPNOTSUPP",
+         getsockopt(unix_fd, 999, 999, &value, NULL) == -1 && errno == EOPNOTSUPP);
+    length = sizeof(value);
+    errno = 0;
+    mark("GET_UNKNOWN_LEVEL_EOPNOTSUPP",
+         getsockopt(unix_fd, 999, 999, &value, &length) == -1 && errno == EOPNOTSUPP);
+    close(unix_fd);
+
     /* `SO_SNDBUF`/`SO_RCVBUF` never fail on a negative request: the unsigned
      * `min_t(u32, val, sysctl_*mem_max)` clamp turns it into the sysctl
      * maximum, which `sk_sndbuf`/`sk_rcvbuf` then double

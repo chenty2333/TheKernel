@@ -31,7 +31,7 @@ use tk_linux_packet::{
     PacketSocketType, SetPacketOption,
 };
 
-use super::{SocketSyscallSnapshot, import_socket_output_after_policy};
+use super::SocketSyscallSnapshot;
 #[cfg(feature = "bpf")]
 use crate::file::FileLike;
 use crate::{
@@ -319,6 +319,22 @@ fn packet_option_copy_len(requested: socklen_t, available: usize) -> usize {
 
 fn option_copy_len(requested: socklen_t, available: usize) -> usize {
     (requested as usize).min(available)
+}
+
+/// Linux's `if (len < 0) return -EINVAL;` for a `getsockopt` length.
+///
+/// `optlen` is a `socklen_t`, which is unsigned in the ABI, while every kernel
+/// reader copies it into an `int`: `sk_getsockopt()` at
+/// `net/core/sock.c:1751-1754`, `sockptr_to_sockopt()` at
+/// `net/socket.c:2416-2420`, and each protocol handler in between.  This is
+/// exactly `do_sock_setsockopt()`'s `if (optlen < 0) return -EINVAL;`
+/// (`net/socket.c:2342-2343`) applied to the value the getter imported.
+fn admitted_option_length(optlen: socklen_t) -> AxResult<socklen_t> {
+    if tk_linux_net::option_length_admitted(optlen) {
+        Ok(optlen)
+    } else {
+        Err(AxError::InvalidInput)
+    }
 }
 
 pub(super) const fn socket_fault_error(fault: axnet::options::SocketFault) -> LinuxError {
@@ -1163,33 +1179,38 @@ pub fn sys_getsockopt(
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket_ref = pinned.security_ref()?;
-    let mut optlen = import_socket_output_after_policy(
-        || {
-            dispatch_socket(&SocketSecurityContext::get_option(
-                snapshot.actor(),
-                &socket_ref,
-                SocketOption::new(level as i32, optname as i32),
-            ))
-        },
-        || {
-            capability
-                .read_value(optlen_ptr.address().as_usize() as *const socklen_t)
-                .map_err(map_usercopy_error)
-        },
-    )?;
+    // `do_sock_getsockopt()` runs the security hook before any provider sees
+    // the request, and its own
+    // `copy_from_sockptr(&max_optlen, optlen, sizeof(int))`
+    // (`net/socket.c:2450-2451`) discards the result: an unreadable `optlen`
+    // is not an error there.  Each provider below therefore imports the
+    // caller's length exactly where its Linux mirror does, and a level the
+    // provider rejects is answered without user memory being touched.
+    dispatch_socket(&SocketSecurityContext::get_option(
+        snapshot.actor(),
+        &socket_ref,
+        SocketOption::new(level as i32, optname as i32),
+    ))?;
     debug!(
-        "sys_getsockopt <= fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {}",
+        "sys_getsockopt <= fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {:?}",
         fd,
         level,
         optname,
         optval.address(),
-        optlen,
+        optlen_ptr.address(),
     );
+    let import_option_length = || -> AxResult<socklen_t> {
+        capability
+            .read_value(optlen_ptr.address().as_usize() as *const socklen_t)
+            .map_err(map_usercopy_error)
+    };
 
-    if optlen > i32::MAX as socklen_t {
-        return Err(AxError::InvalidInput);
-    }
     if pinned.backend()? == SocketBackendKind::Xdp {
+        // `xsk_getsockopt` is an `ops->getsockopt_iter`, so
+        // `sockptr_to_sockopt()` (`net/socket.c:2411-2420`) copies and rejects
+        // a negative length before `xsk_getsockopt()` tests the level
+        // (`net/xdp/xsk.c:1931-1943`).
+        let mut optlen = admitted_option_length(import_option_length()?)?;
         if level != af_xdp::SOL_XDP || optname != 8 {
             return Err(LinuxError::ENOPROTOOPT.into());
         }
@@ -1209,7 +1230,12 @@ pub fn sys_getsockopt(
         // `do_sock_getsockopt` tests `level == SOL_SOCKET` before it consults
         // `ops->getsockopt_iter`, so the generic `sk_getsockopt` table serves
         // netlink endpoints too.  `netlink_getsockopt` then answers everything
-        // outside `SOL_NETLINK` with `ENOPROTOOPT`.
+        // outside `SOL_NETLINK` with `ENOPROTOOPT` — but only after
+        // `sockptr_to_sockopt()` has already copied and validated the length
+        // in `do_sock_getsockopt` (`net/socket.c:2456-2457`), which is why an
+        // unknown level reports EINVAL or EFAULT for a length Linux cannot use
+        // instead of ENOPROTOOPT (`net/netlink/af_netlink.c:1733-1738`).
+        let mut optlen = admitted_option_length(import_option_length()?)?;
         let value = if level == SOL_SOCKET {
             socket.get_sol_socket_option(optname)?
         } else if level == SOL_NETLINK {
@@ -1225,6 +1251,10 @@ pub fn sys_getsockopt(
     }
 
     if pinned.backend()? == SocketBackendKind::Packet {
+        // AF_PACKET is the other `getsockopt_iter` endpoint, so the same
+        // `sockptr_to_sockopt()` import precedes `packet_getsockopt`'s own
+        // `level != SOL_PACKET` test (`net/packet/af_packet.c:4098-4104`).
+        let mut optlen = admitted_option_length(import_option_length()?)?;
         if level == SOL_SOCKET {
             let value = if optname == SO_LOCK_FILTER {
                 i32::from(pinned.packet()?.filter_locked())
@@ -1299,6 +1329,27 @@ pub fn sys_getsockopt(
     }
 
     let socket = pinned.network()?;
+    // Only a level whose Linux handler copies the caller's `int len` may
+    // report a length problem.  `sk_getsockopt()` does it for every
+    // `SOL_SOCKET` name (`net/core/sock.c:1751-1754`) and
+    // `do_ip_getsockopt()` for `SOL_IP` (`net/ipv4/ip_sockglue.c:1515-1524`),
+    // both of which this path serves for every endpoint kind.  The remaining
+    // protocol levels belong to AF_INET/AF_INET6 endpoints:
+    // `do_tcp_getsockopt()` copies the length itself
+    // (`net/ipv4/tcp.c:4490-4494`) and `do_ipv6_getsockopt()` is only reached
+    // for `SOL_IPV6`.  An AF_UNIX endpoint's `proto_ops`
+    // (`net/unix/af_unix.c:967-990`) leaves `->getsockopt` NULL, so every
+    // other level is the dispatcher's `-EOPNOTSUPP`
+    // (`net/socket.c:2476-2477`) and the caller's length is never read.
+    let length_reading_level = level == SOL_SOCKET as u32
+        || level == PROTO_IP
+        || (socket.inet_identity().is_some()
+            && matches!(level, PROTO_TCP | SOL_IPV6 | SOL_SCTP | SOL_DCCP));
+    let mut optlen = if length_reading_level {
+        admitted_option_length(import_option_length()?)?
+    } else {
+        0
+    };
     // `SO_DOMAIN`, `SO_TYPE`, and `SO_PROTOCOL` describe the creation
     // request, not the raw endpoint's current bind/connect state.  DCCP in
     // particular remains unbound while these values must already be visible.

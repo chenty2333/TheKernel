@@ -337,19 +337,23 @@ pub const fn address_import_admitted(addrlen: i32) -> bool {
     addrlen >= 0 && (addrlen as usize) <= SOCKADDR_STORAGE_LEN
 }
 
-/// `net/socket.c:do_sock_setsockopt()` / `do_sock_getsockopt()` reject a
-/// negative option length before any protocol runs:
+/// `do_sock_setsockopt()` rejects a negative option length before any protocol
+/// runs:
 ///
 /// ```c
 /// 	if (optlen < 0)
 /// 		return -EINVAL;
 /// ```
 ///
-/// `setsockopt` reaches it at `:2342-2343` and `getsockopt` at `:2366-2367`;
-/// the descriptor lookup that precedes both reports EBADF first.  Because
-/// `socklen_t` is unsigned in the ABI, a caller can pass `(socklen_t)-1`, which
-/// every lower-bound test in the option table would otherwise read as a 4 GiB
-/// buffer.
+/// `setsockopt` reaches it at `net/socket.c:2342-2343`; the descriptor lookup
+/// that precedes it reports EBADF first.  `getsockopt` has no such site: its
+/// own `copy_from_sockptr(&max_optlen, optlen, sizeof(int))`
+/// (`net/socket.c:2450-2451`) discards the result, and each provider that uses
+/// the length applies the same `len < 0` test where it reads it —
+/// `sk_getsockopt()` (`net/core/sock.c:1751-1754`) and `sockptr_to_sockopt()`
+/// (`net/socket.c:2416-2420`).  Because `socklen_t` is unsigned in the ABI, a
+/// caller can pass `(socklen_t)-1`, which every lower-bound test in the option
+/// table would otherwise read as a 4 GiB buffer.
 pub const fn option_length_admitted(optlen: u32) -> bool {
     (optlen as i32) >= 0
 }
