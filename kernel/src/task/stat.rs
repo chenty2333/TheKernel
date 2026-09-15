@@ -1,4 +1,4 @@
-use alloc::{borrow::ToOwned, format, string::String};
+use alloc::{format, string::String, vec::Vec};
 
 use axerrno::{AxError, AxResult};
 use axtask::{AxTaskRef, SchedClass, TaskState, sched_state};
@@ -106,7 +106,7 @@ pub fn render_task_stat(
     task: &AxTaskRef,
     pid_ns: &PidNamespace,
     process_view: bool,
-) -> AxResult<String> {
+) -> AxResult<Vec<u8>> {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
     let proc = &proc_data.proc;
@@ -118,10 +118,15 @@ pub fn render_task_stat(
         })
         .ok_or(AxError::NoSuchProcess)?;
     // `/proc/<pid>/stat` prints `task_struct::comm` verbatim through
-    // `proc_task_name()`, so a name that is not valid UTF-8 must still be
-    // readable here rather than failing the whole file.
-    let comm = String::from_utf8_lossy(task.comm().as_bytes()).into_owned();
-    let comm = comm[..comm.len().min(16)].to_owned();
+    // `proc_task_name()` (`fs/proc/array.c:100-119`, called with
+    // `escape = false` from `do_task_stat()` at `:588-590`), so the field is
+    // spliced in as raw bytes. It must not be routed through `str` at all:
+    // `from_utf8_lossy()` rewrites a trailing partial UTF-8 sequence as
+    // U+FFFD, which both fabricates bytes Linux never prints and can make a
+    // fifteen-byte name exceed the sixteen-byte field, so a later byte slice
+    // would panic on the replacement character's boundary.
+    let task_comm = task.comm();
+    let comm = tk_linux_process::proc_stat_comm_field(task_comm.as_bytes());
     let state = task_state(task);
     let ppid = proc
         .parent()
@@ -147,8 +152,12 @@ pub fn render_task_stat(
     let exit_signal = proc.exit_signal().unwrap_or(Signo::SIGCHLD as u8);
     let exit_code = proc.exit_code();
 
-    Ok(format!(
-        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {utime} {stime} {cutime} \
+    // The numeric fields are rendered as text and the raw `comm` bytes are
+    // spliced between the two halves, so the field cannot be re-encoded. The
+    // parentheses come from `do_task_stat()` (`fs/proc/array.c:588-590`).
+    let head = format!("{pid} (");
+    let tail = format!(
+        ") {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {utime} {stime} {cutime} \
          {cstime} {priority} {nice} {num_threads} 0 {starttime} {vsize} {rss} {rsslim} \
          {start_code} {end_code} {start_stack} 0 0 0 0 0 0 0 0 0 {exit_signal} {processor} \
          {rt_priority} {policy} {iowait_ticks} 0 0 {start_data} {end_data} {start_brk} \
@@ -167,7 +176,12 @@ pub fn render_task_stat(
         arg_end = mm.arg_end,
         env_start = mm.env_start,
         env_end = mm.env_end,
-    ))
+    );
+    let mut stat = Vec::with_capacity(head.len() + comm.len() + tail.len());
+    stat.extend_from_slice(head.as_bytes());
+    stat.extend_from_slice(comm);
+    stat.extend_from_slice(tail.as_bytes());
+    Ok(stat)
 }
 
 pub fn render_zombie_stat(process: &Process, pid_ns: &PidNamespace) -> AxResult<String> {

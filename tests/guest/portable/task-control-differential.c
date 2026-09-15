@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -133,6 +134,44 @@ static void done(void) {
     printf("THEKERNEL_ABI_RESULT %s pass\n", active);
 }
 
+/* The bytes `/proc/<pid>/stat` prints between its parentheses, or -1 when the
+ * file cannot be read.  Linux formats that field in `do_task_stat()`
+ * (`fs/proc/array.c`):
+ *
+ *	seq_puts(m, " (");
+ *	proc_task_name(m, task, false);
+ *	seq_puts(m, ") ");
+ *
+ * and with `escape = false` `proc_task_name()` ends in
+ * `seq_printf(m, "%.64s", tcomm)`, so the field is the raw `task_struct::comm`
+ * image: bytes that do not form UTF-8 are neither replaced nor dropped. */
+static long stat_comm(const char *path, unsigned char *out, size_t capacity) {
+    char buffer[512];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    ssize_t count = read(fd, buffer, sizeof(buffer) - 1);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    if (count <= 0) {
+        return -1;
+    }
+    buffer[count] = '\0';
+    const char *open_paren = strchr(buffer, '(');
+    const char *close_paren = strrchr(buffer, ')');
+    if (open_paren == NULL || close_paren == NULL || close_paren <= open_paren) {
+        return -1;
+    }
+    size_t length = (size_t)(close_paren - open_paren - 1);
+    if (length > capacity) {
+        return -1;
+    }
+    memcpy(out, open_paren + 1, length);
+    return (long)length;
+}
+
 /* Linux's task comm is a raw 16-byte array, so PR_SET_NAME must truncate at
  * fifteen bytes, keep bytes that are not valid UTF-8, and never fail on a
  * long name; PR_GET_NAME copies all sixteen bytes. */
@@ -168,6 +207,27 @@ static void prctl_name_case(void) {
     ERROR(syscall(SYS_prctl, PR_GET_NAME, (void *)0, 0, 0, 0), EFAULT, "get-name-null");
     ERROR(syscall(SYS_prctl, PR_SET_NAME, (void *)0, 0, 0, 0), EFAULT, "set-name-null");
     mark("NAME_BYTES");
+
+    /* A fifteen-byte name whose final byte starts a UTF-8 sequence is a legal
+     * `comm`: PR_SET_NAME copies bytes, not characters.  `/proc/<pid>/stat`
+     * does not escape the field, so it must come back as exactly those fifteen
+     * bytes.  Rendering the name through a lossy UTF-8 conversion first would
+     * instead produce fourteen 'a' bytes followed by U+FFFD, which is three
+     * bytes long -- more than the fifteen that fit in the field. */
+    static const unsigned char partial[16] = {
+        'a', 'a', 'a', 'a', 'a', 'a', 'a', 'a',
+        'a', 'a', 'a', 'a', 'a', 'a', 0xc3, 0,
+    };
+    unsigned char comm[64];
+    memset(name, 0, sizeof(name));
+    memcpy(name, partial, 15);
+    check(syscall(SYS_prctl, PR_SET_NAME, name, 0, 0, 0) == 0, "set-partial-utf8-name");
+    memset(comm, 0xaa, sizeof(comm));
+    long comm_length = stat_comm("/proc/self/stat", comm, sizeof(comm));
+    check(comm_length == 15, "stat-comm-length");
+    check(comm_length == 15 && memcmp(comm, partial, 15) == 0,
+          "stat-comm-keeps-partial-utf8-bytes");
+    mark("STAT_COMM_RAW_BYTES");
     done();
 }
 
