@@ -708,13 +708,6 @@ impl SocketOps for TcpSocket {
     }
 
     fn recv(&self, mut dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize> {
-        if options.flags.contains(RecvFlags::OOB) {
-            // `tcp_recvmsg_locked()` sends `MSG_OOB` to `recv_urg`
-            // (`net/ipv4/tcp.c:2680-2681`).  There is no urgent-data queue in
-            // this transport, so reporting EOPNOTSUPP is the honest answer
-            // instead of returning ordinary stream bytes.
-            return Err(AxError::OperationNotSupported);
-        }
         if self.rx_closed.load(Ordering::Acquire) {
             return Ok(0);
         }

@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/netlink.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -264,6 +265,129 @@ static void case_send_flags(void) {
 
     close(receiver);
     close(sender);
+
+    /* MSG_OOB is not a socket-layer refusal: `__sys_sendto()` clears only
+     * MSG_INTERNAL_SENDMSG_FLAGS and forwards the rest
+     * (`net/socket.c:2248-2252`), so each protocol answers for itself.
+     * `tcp_sendmsg_locked()` consumes the bit through `tcp_mark_urg()` and
+     * still sends the octets (`net/ipv4/tcp.c:715-718`), `udp_sendmsg()`
+     * mirrors the BSD EOPNOTSUPP (`net/ipv4/udp.c:1259-1261`), and an AF_UNIX
+     * stream built with CONFIG_AF_UNIX_OOB reserves the last octet for
+     * `queue_oob()` and counts it as sent (`net/unix/af_unix.c:2392-2400`,
+     * `:2496-2502`). */
+    struct sockaddr_in stream_address = {.sin_family = AF_INET,
+                                         .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t stream_length = sizeof(stream_address);
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    int connected = -1;
+    int stream_ready =
+        listener >= 0 && bind(listener, (struct sockaddr *)&stream_address, sizeof(stream_address)) == 0 &&
+        listen(listener, 1) == 0 &&
+        getsockname(listener, (struct sockaddr *)&stream_address, &stream_length) == 0 &&
+        (connected = socket(AF_INET, SOCK_STREAM, 0)) >= 0 &&
+        connect(connected, (struct sockaddr *)&stream_address, stream_length) == 0;
+    errno = 0;
+    mark("OOB_SENDTO_STREAM_BYTES", stream_ready && send(connected, "i", 1, MSG_OOB) == 1);
+    struct iovec oob_vector = {.iov_base = (void *)"j", .iov_len = 1};
+    struct msghdr oob_header = {.msg_iov = &oob_vector, .msg_iovlen = 1};
+    errno = 0;
+    mark("OOB_SENDMSG_STREAM_BYTES", stream_ready && sendmsg(connected, &oob_header, MSG_OOB) == 1);
+
+    int datagram = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in datagram_address = {.sin_family = AF_INET,
+                                           .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t datagram_length = sizeof(datagram_address);
+    errno = 0;
+    mark("OOB_SENDTO_DATAGRAM_EOPNOTSUPP",
+         datagram >= 0 &&
+             bind(datagram, (struct sockaddr *)&datagram_address, sizeof(datagram_address)) == 0 &&
+             getsockname(datagram, (struct sockaddr *)&datagram_address, &datagram_length) == 0 &&
+             sendto(datagram, "k", 1, MSG_OOB, (struct sockaddr *)&datagram_address,
+                    sizeof(datagram_address)) == -1 &&
+             errno == EOPNOTSUPP);
+
+    int unix_pair[2] = {-1, -1};
+    int unix_ready = socketpair(AF_UNIX, SOCK_STREAM, 0, unix_pair) == 0;
+    errno = 0;
+    mark("OOB_SENDTO_UNIX_STREAM_BYTES", unix_ready && send(unix_pair[0], "l", 1, MSG_OOB) == 1);
+
+    /* The receive half.  `tcp_recvmsg_locked()` diverts the bit to `recv_urg`
+     * before anything else (`net/ipv4/tcp.c:2679-2681`) and `tcp_recv_urg()`
+     * answers -EINVAL while this endpoint has no urgent byte pending
+     * (`:1480-1483`); `udp_recvmsg()` never reads the bit, so the datagram is
+     * delivered normally; `unix_dgram_recvmsg()` refuses it outright
+     * (`net/unix/af_unix.c:2572-2576`); an AF_UNIX stream under
+     * CONFIG_AF_UNIX_OOB answers -EINVAL through `unix_stream_recv_urg()`
+     * while its `oob_skb` is NULL (`net/unix/af_unix.c:2929-2934`,
+     * `:2771-2776`). */
+    char oob_buffer[8] = {0};
+    errno = 0;
+    mark("OOB_RECV_STREAM_EINVAL",
+         stream_ready && recv(connected, oob_buffer, sizeof(oob_buffer), MSG_OOB) == -1 &&
+             errno == EINVAL);
+    struct iovec recv_vector = {.iov_base = oob_buffer, .iov_len = sizeof(oob_buffer)};
+    struct msghdr recv_header = {.msg_iov = &recv_vector, .msg_iovlen = 1};
+    errno = 0;
+    mark("OOB_RECVMSG_STREAM_EINVAL",
+         stream_ready && recvmsg(connected, &recv_header, MSG_OOB) == -1 && errno == EINVAL);
+    errno = 0;
+    mark("OOB_RECV_DATAGRAM_IGNORED",
+         sendto(datagram, "m", 1, 0, (struct sockaddr *)&datagram_address,
+                sizeof(datagram_address)) == 1 &&
+             recv(datagram, oob_buffer, sizeof(oob_buffer), MSG_OOB) == 1 && oob_buffer[0] == 'm');
+    int unix_datagram_pair[2] = {-1, -1};
+    int unix_datagram_ready =
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, unix_datagram_pair) == 0;
+    errno = 0;
+    mark("OOB_RECV_UNIX_DATAGRAM_EOPNOTSUPP",
+         unix_datagram_ready &&
+             recv(unix_datagram_pair[1], oob_buffer, sizeof(oob_buffer), MSG_OOB | MSG_DONTWAIT) ==
+                 -1 &&
+             errno == EOPNOTSUPP);
+    /* A second stream pair, because the first one's peer already holds the
+     * octet `queue_oob()` reserved: an urgent byte *is* pending there, and a
+     * receive of it is a different Linux answer. */
+    int quiet_pair[2] = {-1, -1};
+    int quiet_ready = socketpair(AF_UNIX, SOCK_STREAM, 0, quiet_pair) == 0;
+    errno = 0;
+    mark("OOB_RECV_UNIX_STREAM_EINVAL",
+         quiet_ready &&
+             recv(quiet_pair[1], oob_buffer, sizeof(oob_buffer), MSG_OOB | MSG_DONTWAIT) == -1 &&
+             errno == EINVAL);
+
+    /* `netlink_recvmsg()` tests MSG_OOB before it looks at the receive queue
+     * at all (`net/netlink/af_netlink.c:1915-1917`). */
+    int netlink = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    errno = 0;
+    mark("OOB_RECV_NETLINK_EOPNOTSUPP",
+         netlink >= 0 &&
+             recv(netlink, oob_buffer, sizeof(oob_buffer), MSG_OOB | MSG_DONTWAIT) == -1 &&
+             errno == EOPNOTSUPP);
+
+    if (netlink >= 0) {
+        close(netlink);
+    }
+    if (quiet_ready) {
+        close(quiet_pair[0]);
+        close(quiet_pair[1]);
+    }
+    if (unix_datagram_ready) {
+        close(unix_datagram_pair[0]);
+        close(unix_datagram_pair[1]);
+    }
+    if (unix_ready) {
+        close(unix_pair[0]);
+        close(unix_pair[1]);
+    }
+    if (datagram >= 0) {
+        close(datagram);
+    }
+    if (connected >= 0) {
+        close(connected);
+    }
+    if (listener >= 0) {
+        close(listener);
+    }
     done();
 }
 
@@ -334,6 +458,39 @@ static void case_sendmmsg_flags(void) {
 
     close(receiver);
     close(sender);
+
+    /* A batch reaches the same protocol entry point per message, so the
+     * per-transport MSG_OOB answer is unchanged: `tcp_sendmsg_locked()`
+     * consumes the bit and still sends the octet (`net/ipv4/tcp.c:715-718`),
+     * and `____sys_sendmsg()` only substitutes the call flags for the
+     * per-message word (`net/socket.c:2628-2678`). */
+    struct sockaddr_in stream_address = {.sin_family = AF_INET,
+                                         .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t stream_length = sizeof(stream_address);
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    int connected = -1;
+    int stream_ready =
+        listener >= 0 && bind(listener, (struct sockaddr *)&stream_address, sizeof(stream_address)) == 0 &&
+        listen(listener, 1) == 0 &&
+        getsockname(listener, (struct sockaddr *)&stream_address, &stream_length) == 0 &&
+        (connected = socket(AF_INET, SOCK_STREAM, 0)) >= 0 &&
+        connect(connected, (struct sockaddr *)&stream_address, stream_length) == 0;
+    char urgent = 'n';
+    struct iovec urgent_vector = {.iov_base = &urgent, .iov_len = 1};
+    struct mmsghdr urgent_batch;
+    memset(&urgent_batch, 0, sizeof(urgent_batch));
+    urgent_batch.msg_hdr.msg_iov = &urgent_vector;
+    urgent_batch.msg_hdr.msg_iovlen = 1;
+    errno = 0;
+    mark("OOB_SENDMMSG_STREAM_BYTES",
+         stream_ready && sendmmsg(connected, &urgent_batch, 1, MSG_OOB) == 1 &&
+             urgent_batch.msg_len == 1);
+    if (connected >= 0) {
+        close(connected);
+    }
+    if (listener >= 0) {
+        close(listener);
+    }
     done();
 }
 
@@ -633,6 +790,34 @@ static void case_recvmmsg_deadline(void) {
     }
     close(receiver);
     close(sender);
+
+    /* `do_recvmmsg()` hands the call flags to every message, so the batch
+     * primitive reports the same per-transport MSG_OOB answer as `recvmsg`:
+     * `tcp_recvmsg_locked()` diverts the bit to `recv_urg`
+     * (`net/ipv4/tcp.c:2679-2681`) and `tcp_recv_urg()` answers -EINVAL while
+     * no urgent byte is pending on this endpoint (`:1480-1483`). */
+    struct sockaddr_in stream_address = {.sin_family = AF_INET,
+                                         .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t stream_length = sizeof(stream_address);
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    int connected = -1;
+    int stream_ready =
+        listener >= 0 && bind(listener, (struct sockaddr *)&stream_address, sizeof(stream_address)) == 0 &&
+        listen(listener, 1) == 0 &&
+        getsockname(listener, (struct sockaddr *)&stream_address, &stream_length) == 0 &&
+        (connected = socket(AF_INET, SOCK_STREAM, 0)) >= 0 &&
+        connect(connected, (struct sockaddr *)&stream_address, stream_length) == 0;
+    reset_batch(&batch);
+    errno = 0;
+    count = recvmmsg(connected, batch.entries, 1, MSG_OOB | MSG_DONTWAIT, NULL);
+    mark("OOB_RECVMMSG_STREAM_EINVAL",
+         stream_ready && count == -1 && errno == EINVAL);
+    if (connected >= 0) {
+        close(connected);
+    }
+    if (listener >= 0) {
+        close(listener);
+    }
     done();
 }
 
