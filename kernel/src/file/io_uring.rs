@@ -70,7 +70,13 @@ use crate::mm::{
 pub(crate) const RING_WAITER_SLOTS: usize = 64;
 const PAGE_BYTES: usize = PageSize::Size4K as usize;
 const IO_URING_GLOBAL_REQUEST_SLOTS: usize = 65_536;
-const IO_URING_GLOBAL_FIXED_FILE_SLOTS: usize = 65_536;
+/// Profile-wide fixed-file slot budget.  It equals Linux's per-ring
+/// `IORING_MAX_FIXED_FILES` so that every count one ring may legally register
+/// is within budget; only several rings holding that many slots at once can
+/// exceed it, and the refusal then reports Linux's own allocation-failure
+/// errno (`-ENOMEM`) instead of `-ENFILE`, which
+/// `io_sqe_files_register()` never returns.
+const IO_URING_GLOBAL_FIXED_FILE_SLOTS: usize = IORING_MAX_FIXED_FILES as usize;
 const IO_URING_GLOBAL_REGISTERED_BUFFER_SLOTS: usize = 65_536;
 
 const IO_URING_PHYSICAL_MAX_QD: usize = 32;
