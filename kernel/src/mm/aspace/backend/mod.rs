@@ -1005,6 +1005,17 @@ impl Backend {
         self.mapping_status_mut().clear_sealed();
     }
 
+    /// Whether this VMA is `MAP_DROPPABLE` (`VM_DROPPABLE`).
+    pub(crate) fn is_droppable(&self) -> bool {
+        self.mapping_status().is_droppable()
+    }
+
+    /// Installs `VM_DROPPABLE` on this VMA while it is being created.
+    pub(crate) fn with_droppable(mut self) -> Self {
+        self.mapping_status_mut().set_droppable();
+        self
+    }
+
     pub(crate) fn madvise_readahead(&self) -> MadviseReadahead {
         self.mapping_status().madvise_readahead()
     }

@@ -376,6 +376,18 @@ pub(super) struct MappingStatus {
     madvise_readahead: MadviseReadahead,
     madvise_thp: MadviseThp,
     sealed: bool,
+    /// `VM_DROPPABLE`: the mapping may lose its pages at any time.
+    ///
+    /// Linux records this as a VMA flag (`mm/mmap.c:521`
+    /// `vm_flags |= VM_DROPPABLE;`) and derives every other consequence from
+    /// it: droppable folios are never marked swapbacked
+    /// (`mm/rmap.c:1652-1655`), fork and coredump exclusion are installed
+    /// together with it (`mm/mmap.c:533` `vm_flags |= VM_WIPEONFORK |
+    /// VM_DONTDUMP;`), and `MADV_KEEPONFORK`, `MADV_DODUMP` and
+    /// `UFFDIO_REGISTER` consult it directly (`mm/madvise.c:1396-1406`,
+    /// `mm/userfaultfd.c:2114`).  Keeping the bit on the VMA is what makes it
+    /// survive every split, clone and remap the way the other VMA flags do.
+    droppable: bool,
     /// Kernel-only identity for an immutable special VMA.  It is deliberately
     /// VMA metadata rather than an address convention, so user MAP_FIXED
     /// mappings can never impersonate it.
@@ -451,6 +463,21 @@ impl MappingStatus {
         self.sealed = false;
     }
 
+    /// Whether this VMA carries `VM_DROPPABLE`.
+    pub(super) const fn is_droppable(&self) -> bool {
+        self.droppable
+    }
+
+    /// Installs `VM_DROPPABLE` on this VMA.
+    ///
+    /// The flag is only ever set while the mapping is created (`mm/mmap.c:521`
+    /// is the single writer in Linux); no `madvise(2)` or `mprotect(2)`
+    /// behaviour clears it, because `MADV_KEEPONFORK`/`MADV_DODUMP` refuse a
+    /// droppable VMA instead.
+    pub(super) fn set_droppable(&mut self) {
+        self.droppable = true;
+    }
+
     pub(super) const fn special_token(&self) -> Option<u64> {
         self.special_token
     }
@@ -475,6 +502,7 @@ impl MappingStatus {
             madvise_readahead: self.madvise_readahead,
             madvise_thp: self.madvise_thp,
             sealed: self.sealed,
+            droppable: self.droppable,
             special_token: self.special_token,
         })
     }
@@ -492,6 +520,7 @@ impl MappingStatus {
             madvise_readahead: self.madvise_readahead,
             madvise_thp: self.madvise_thp,
             sealed: self.sealed,
+            droppable: self.droppable,
             special_token: self.special_token,
         })
     }
@@ -518,6 +547,7 @@ impl MappingStatus {
             && self.madvise_readahead == other.madvise_readahead
             && self.madvise_thp == other.madvise_thp
             && self.sealed == other.sealed
+            && self.droppable == other.droppable
             && self.special_token == other.special_token
     }
 }
