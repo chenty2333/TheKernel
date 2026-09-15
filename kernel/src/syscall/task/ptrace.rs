@@ -5,6 +5,17 @@ use axtask::{
 };
 use tk_linux_arch_x86_64::{ARCH_SHSTK_UNLOCK, NT_X86_SHSTK, X86ShstkRegset};
 use tk_linux_process_adapter::Pid;
+/// `PTRACE_O_MASK`, the two eventless option bits and the shared
+/// `check_ptrace_options()` ladder live in `tk_linux_process` because both the
+/// `PTRACE_SEIZE` and the `PTRACE_SETOPTIONS` spelling of the request word must
+/// run the *same* admission.
+use tk_linux_process::ptrace_options::{PtraceOptionReject, SuspendSeccompAdmission};
+// Only the request-decoding test spells the two eventless bits out by name; the
+// syscall path takes the whole mask from the same crate.
+#[cfg(test)]
+use tk_linux_process::ptrace_options::{
+    EXITKILL as PTRACE_O_EXITKILL, SUSPEND_SECCOMP as PTRACE_O_SUSPEND_SECCOMP,
+};
 use tk_linux_seccomp::SeccompMode;
 use tk_linux_signal::{SignalInfo, Signo};
 
@@ -65,9 +76,7 @@ const PTRACE_GET_SYSCALL_INFO: u32 = 0x420e;
 // TRACEEXEC, TRACEVFORKDONE, TRACEEXIT and TRACESECCOMP.
 // The previous value (0x2f_ffff) admitted bits 16..21 -- none of which Linux
 // defines -- and rejected PTRACE_O_EXITKILL (1 << 20).
-const PTRACE_O_MASK: usize = 0x0000_00ff | PTRACE_O_EXITKILL | PTRACE_O_SUSPEND_SECCOMP;
-const PTRACE_O_EXITKILL: usize = 1 << 20;
-const PTRACE_O_SUSPEND_SECCOMP: usize = 1 << 21;
+const PTRACE_O_MASK: usize = tk_linux_process::ptrace_options::MASK as usize;
 
 /// `AUDIT_ARCH_X86_64` (include/uapi/linux/audit.h) =
 /// `EM_X86_64(62) | __AUDIT_ARCH_64BIT(0x8000_0000) | __AUDIT_ARCH_LE(0x4000_0000)`.
@@ -806,6 +815,63 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
     }
 }
 
+/// Linux `check_ptrace_options()` (`kernel/ptrace.c`), run by *both* request
+/// spellings that carry an option word.
+///
+/// The option ladder itself -- the mask, and the `PTRACE_O_SUSPEND_SECCOMP`
+/// configuration/capability/seccomp-state tests -- lives in
+/// [`tk_linux_process::ptrace_options::check`]; this supplies the tracer-side
+/// facts and Linux's errno mapping:
+///
+/// ```c
+/// static int check_ptrace_options(unsigned long data)
+/// {
+/// 	if (data & ~(unsigned long)PTRACE_O_MASK)
+/// 		return -EINVAL;
+/// 	if (unlikely(data & PTRACE_O_SUSPEND_SECCOMP)) {
+/// 		if (!IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) ||
+/// 		    !IS_ENABLED(CONFIG_SECCOMP))
+/// 			return -EINVAL;
+/// 		if (!capable(CAP_SYS_ADMIN))
+/// 			return -EPERM;
+/// 		if (seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED ||
+/// 		    current->ptrace & PT_SUSPEND_SECCOMP)
+/// 			return -EPERM;
+/// 	}
+/// 	return 0;
+/// }
+/// ```
+///
+/// TheKernel declares `CONFIG_CHECKPOINT_RESTORE=y` together with its real
+/// `CONFIG_SECCOMP=y`, so the `-EINVAL` configuration branch is not taken here,
+/// and the suspension itself is implemented: `PTRACE_O_SUSPEND_SECCOMP` is
+/// stored in the relationship's option word, where
+/// `ProcessData::ptrace_seccomp_suspended()` reads it for
+/// `__secure_computing()`, and `current->ptrace & PT_SUSPEND_SECCOMP` becomes
+/// the tracer's own process state.
+fn check_ptrace_options(data: u32) -> AxResult<()> {
+    let tracer = current();
+    let tracer = tracer.as_thread();
+    let admission = SuspendSeccompAdmission {
+        configured: true,
+        // `capable(CAP_SYS_ADMIN)` is the *initial* user namespace check,
+        // matching Linux `capable()` -> `ns_capable(&init_user_ns, ...)`.
+        cap_sys_admin: tracer.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN),
+        // `seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED`.
+        filtered: tracer.seccomp_mode() != SeccompMode::Disabled,
+        // `current->ptrace & PT_SUSPEND_SECCOMP`: the tracer is itself a tracee
+        // whose tracer suspended its policy.
+        already_suspended: tracer.proc_data.ptrace_seccomp_suspended(),
+    };
+    match tk_linux_process::ptrace_options::check(data, admission) {
+        Ok(()) => Ok(()),
+        Err(PtraceOptionReject::Unknown | PtraceOptionReject::Unsupported) => {
+            Err(AxError::InvalidInput)
+        }
+        Err(PtraceOptionReject::NotPermitted) => Err(AxError::OperationNotPermitted),
+    }
+}
+
 fn sys_ptrace_for_target(
     tracer_memory: &UserMemoryCapability,
     request: u32,
@@ -844,6 +910,15 @@ fn sys_ptrace_for_target(
                 // 		ret = check_ptrace_options(flags);
                 return Err(ptrace_io_error());
             }
+            // The very next statement in that branch is the *shared*
+            // `check_ptrace_options()` call, so `PTRACE_SEIZE` must run exactly
+            // the same option admission as `PTRACE_SETOPTIONS` rather than only
+            // the unknown-bits duplicate above:
+            //
+            // 	retval = check_ptrace_options(flags);
+            // 	if (retval)
+            // 		return retval;
+            check_ptrace_options(data as u32)?;
             return do_attach(target_thread, true, data as u32);
         }
         _ => {}
@@ -910,53 +985,22 @@ fn sys_ptrace_for_target(
         // request: kernel/ptrace.c decodes both in one arm.
         PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => {
             let session = check_inactive_tracee(&target)?;
-            // kernel/ptrace.c `check_ptrace_options()`:
+            // kernel/ptrace.c `ptrace_setoptions()` is the whole body of this
+            // arm:
             //
             // 	if (data & ~(unsigned long)PTRACE_O_MASK)
             // 		return -EINVAL;
+            // 	ret = check_ptrace_options(data);
+            // 	if (ret)
+            // 		return ret;
+            // 	child->ptrace = ... options ...;
             //
-            // 	if (unlikely(data & PTRACE_O_SUSPEND_SECCOMP)) {
-            // 		if (!IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) ||
-            // 		    !IS_ENABLED(CONFIG_SECCOMP))
-            // 			return -EINVAL;
-            //
-            // 		if (!capable(CAP_SYS_ADMIN))
-            // 			return -EPERM;
-            //
-            // 		if (seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED ||
-            // 		    current->ptrace & PT_SUSPEND_SECCOMP)
-            // 			return -EPERM;
-            // 	}
-            // 	return 0;
-            //
-            // Note that `current` here is the *tracer*: the option is only
-            // meaningful when the tracer itself runs unfiltered, and
-            // PT_SUSPEND_SECCOMP is the tracer's own flag bit, so a tracer that
-            // is already suspended cannot suspend again.
+            // The option word itself is admitted by the same helper
+            // `PTRACE_SEIZE` runs, so the two spellings cannot drift.
             if data & !PTRACE_O_MASK != 0 {
                 return Err(AxError::InvalidInput);
             }
-            if data & PTRACE_O_SUSPEND_SECCOMP != 0 {
-                // `capable(CAP_SYS_ADMIN)` is the *initial* user namespace
-                // check, matching Linux `capable()` -> `ns_capable(&init_user_ns, ...)`.
-                if !current()
-                    .as_thread()
-                    .has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN)
-                {
-                    return Err(AxError::OperationNotPermitted);
-                }
-                // `seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED`.
-                // The remaining Linux sub-condition, `current->ptrace &
-                // PT_SUSPEND_SECCOMP`, is the tracer's own opt-flag copy of this
-                // same bit; TheKernel keeps ptrace options per relationship
-                // rather than as a bit on the traced task, so a tracer that is
-                // itself suspended cannot be detected here. Suspending the
-                // tracee's filters is likewise not implemented, so the bit is
-                // recorded but does not alter seccomp evaluation.
-                if current().as_thread().seccomp_mode() != SeccompMode::Disabled {
-                    return Err(AxError::OperationNotPermitted);
-                }
-            }
+            check_ptrace_options(data as u32)?;
             if !target.ptrace_set_options(session, data as u32) {
                 return Err(AxError::NoSuchProcess);
             }
@@ -1138,7 +1182,7 @@ mod tests {
         );
         // Both bits are accepted by PTRACE_SETOPTIONS...
         for option in [super::PTRACE_O_EXITKILL, super::PTRACE_O_SUSPEND_SECCOMP] {
-            assert_eq!(super::PTRACE_O_MASK & option, option);
+            assert_eq!(super::PTRACE_O_MASK & option as usize, option as usize);
         }
         // ...and the undefined bits the old mask admitted are not.
         for bogus in [1 << 16, 1 << 17, 1 << 18, 1 << 19] {

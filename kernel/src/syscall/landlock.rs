@@ -436,10 +436,24 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
                 Ok(()) => {}
             }
             let mut rules = ruleset.paths.lock();
-            // Bound retained inode references and fallible storage per ruleset.
-            if rules.len() >= 4096 {
-                return Err(LinuxError::E2BIG.into());
-            }
+            // Linux has no per-ruleset rule cap: `insert_rule()` reports -E2BIG
+            // only once `ruleset->num_rules >= LANDLOCK_MAX_NUM_RULES`, and
+            // that limit is U32_MAX (security/landlock/ruleset.c:281,
+            // security/landlock/limits.h:20):
+            //
+            // 	/* There is no match for @id. */
+            // 	build_check_ruleset();
+            // 	if (ruleset->num_rules >= LANDLOCK_MAX_NUM_RULES)
+            // 		return -E2BIG;
+            // 	new_rule = create_rule(id, layers, num_layers, NULL);
+            // 	if (IS_ERR(new_rule))
+            // 		return PTR_ERR(new_rule);
+            //
+            // The only way to fail before that boundary is `create_rule()`'s
+            // allocation, i.e. -ENOMEM -- which is what the fallible reservation
+            // below reports.  The previous fixed limit of 4096 rules answered
+            // -E2BIG long before Linux would, with an errno Linux reserves for
+            // a count that cannot be represented.
             rules.try_reserve(1).map_err(|_| AxError::NoMemory)?;
             rules.push(PathRule {
                 allowed: a.allowed,
@@ -467,10 +481,8 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
                 Ok(()) => {}
             }
             let mut rules = ruleset.ports.lock();
-            // Bound retained inode references and fallible storage per ruleset.
-            if rules.len() >= 4096 {
-                return Err(LinuxError::E2BIG.into());
-            }
+            // Same rule count as the path case: -E2BIG belongs to the U32_MAX
+            // boundary, not to a capacity this kernel invented.
             rules.try_reserve(1).map_err(|_| AxError::NoMemory)?;
             rules.push(NetRule {
                 allowed: a.allowed,
@@ -497,8 +509,9 @@ const LANDLOCK_TSYNC_DISCOVERY_ATTEMPTS: usize = 8;
 /// and only after the last one has prepared does the group commit, so a
 /// failure can never leave the group half-restricted.  This implementation
 /// reaches the same property by completing every fallible step -- thread
-/// discovery, target pinning, and one domain clone per target -- before the
-/// first thread slot is written; the commit itself is infallible.
+/// discovery, target pinning, one domain clone per target, and one credential
+/// transition per target that still needs the caller's `no_new_privs` bit --
+/// before the first thread slot is written; the commit itself is infallible.
 ///
 /// Returns whether the group-leader identity slot must follow the new domain.
 fn restrict_sibling_threads(
@@ -558,14 +571,47 @@ fn restrict_sibling_threads(
             prepared.push(domain.try_clone()?);
         }
         let caller_domain = domain.try_clone()?;
+        // The mandatory `no_new_privs` propagation of the TSYNC path:
+        //
+        // 	if (ctx->set_no_new_privs)
+        // 		task_set_no_new_privs(current);
+        //
+        // with the bit sampled once from the caller by
+        // `shared_ctx.set_no_new_privs = task_no_new_privs(current);`
+        // (security/landlock/tsync.c).  A sibling that lacks the bit would drop
+        // the new domain at its next execve(2), because a domain survives an
+        // exec only under `no_new_privs` (security/landlock/domain.c
+        // `landlock_cred_security` is re-evaluated against
+        // `task_no_new_privs()`), so the caller's bit is copied to every
+        // sibling.  Only siblings: Linux leaves the caller's own bit -- set
+        // already, or unset because the caller used CAP_SYS_ADMIN -- alone.
+        let propagate_no_new_privs = caller.no_new_privs();
+        let mut prepared_no_new_privs = Vec::new();
+        if propagate_no_new_privs {
+            prepared_no_new_privs
+                .try_reserve_exact(targets.len())
+                .map_err(|_| AxError::NoMemory)?;
+            for task in &targets {
+                let thread = task
+                    .try_as_thread()
+                    .expect("TSYNC targets were validated as threads");
+                prepared_no_new_privs.push(thread.prepare_no_new_privs()?);
+            }
+        }
         // Infallible commit: no allocation and no failure path, so the group
         // is never left with only some threads synchronized.
         let mut leader_synced = caller.kernel_tid() == leader_tid;
         caller.replace_landlock_domain(caller_domain);
+        let mut no_new_privs = prepared_no_new_privs.into_iter();
         for (task, value) in targets.iter().zip(prepared) {
             let thread = task
                 .try_as_thread()
                 .expect("TSYNC targets were validated as threads");
+            if let Some(transition) = no_new_privs.next().flatten() {
+                // Linux updates the credential before it publishes the new
+                // one, so the bit is visible no later than the domain.
+                thread.commit_no_new_privs(transition);
+            }
             if thread.kernel_tid() == leader_tid {
                 leader_synced = true;
             }

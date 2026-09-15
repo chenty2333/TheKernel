@@ -311,7 +311,10 @@ fn get_action_available<M: UserMemory + ?Sized>(
         .vm_read(memory)
         .map_err(map_usercopy_error)?;
     // The advertised set is owned by the policy crate so it can never drift
-    // from the actions `enforce_syscall_seccomp` below actually performs.
+    // from the action table `enforce_syscall_seccomp` below dispatches on:
+    // every advertised action has a classified arm there, `SECCOMP_RET_TRACE`
+    // included, whose arm produces the -ENOSYS verdict Linux gives a tracee
+    // whose tracer did not request `PTRACE_EVENT_SECCOMP`.
     if tk_linux_seccomp::action_is_available(action) {
         Ok(0)
     } else {
@@ -434,6 +437,21 @@ pub(super) fn enforce_syscall_seccomp(uctx: &mut UserContext) -> bool {
     // pointer load is only a fast-bit hint; the optional RCU read below is
     // authoritative and closes publication-versus-evaluation races.
     if !thread.seccomp_active() {
+        return true;
+    }
+
+    // kernel/seccomp.c `__secure_computing()` suspends a policy before it even
+    // reads the mode, so a tracer's `PTRACE_O_SUSPEND_SECCOMP` outranks strict
+    // mode and every filter:
+    //
+    // 	if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) &&
+    // 	    unlikely(current->ptrace & PT_SUSPEND_SECCOMP))
+    // 		return 0;
+    //
+    // `PT_SUSPEND_SECCOMP` is the tracee-side copy of the tracer's option, and
+    // the relationship's option word is cleared when the relationship ends, so
+    // a detach resumes enforcement without a second bookkeeping step.
+    if thread.proc_data.ptrace_seccomp_suspended() {
         return true;
     }
 

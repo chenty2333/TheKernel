@@ -1,12 +1,16 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <sched.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/uio.h>
 #include <sys/swap.h>
@@ -39,9 +43,32 @@
 #ifndef PTRACE_O_SUSPEND_SECCOMP
 #define PTRACE_O_SUSPEND_SECCOMP (1 << 21)
 #endif
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1U
+#endif
+#ifndef SECCOMP_RET_ERRNO
+#define SECCOMP_RET_ERRNO 0x00050000U
+#endif
+#ifndef SECCOMP_RET_ALLOW
+#define SECCOMP_RET_ALLOW 0x7fff0000U
+#endif
+#ifndef SECCOMP_RET_DATA
+#define SECCOMP_RET_DATA 0x0000ffffU
+#endif
+#ifndef PR_SET_NO_NEW_PRIVS
+#define PR_SET_NO_NEW_PRIVS 38
+#endif
+#ifndef SYS_seccomp
+#define SYS_seccomp 317
+#endif
+#ifndef SYS_getpid
+#define SYS_getpid 39
+#endif
+#ifndef AUDIT_ARCH_X86_64
+#define AUDIT_ARCH_X86_64 0xc000003eU
+#endif
 
 #define PTRACE_SYSCALL_INFO_NONE 0
-#define AUDIT_ARCH_X86_64 0xc000003eU
 
 /* struct ptrace_syscall_info (include/uapi/linux/ptrace.h); 88 bytes. */
 struct ptrace_syscall_info {
@@ -111,14 +138,308 @@ static void expect_value(const char *kase, const char *assertion, long result,
 #define SWAP_CASE "sysadmin-abi.swap-flags.raw-differential"
 #define MODULE_CASE "sysadmin-abi.module-image.raw-differential"
 
+/* Bounded wait for a stop or an exit of `pid`.
+ *
+ * Returns 0 when `waitpid` reported the child, -1 when it failed, and 1 when
+ * the deadline passed first.  A tracer that never sees the stop it is entitled
+ * to must be reported as a failed assertion: an unbounded wait would hang the
+ * whole differential runner instead. */
+static int wait_bounded(pid_t pid, int *status, int attempts) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        pid_t done = waitpid(pid, status, WNOHANG);
+
+        if (done == pid) {
+            return 0;
+        }
+        if (done < 0) {
+            return -1;
+        }
+        usleep(10000);
+    }
+    errno = 0;
+    return 1;
+}
+
+/* --- PTRACE_O_EXITKILL, observed through its effect --------------------- */
+
+/* A stored option word and an honoured one look identical at the syscall
+ * boundary, so the assertion is the documented effect instead:
+ *
+ * 	list_for_each_entry_safe(p, n, &tracer->ptraced, ptrace_entry) {
+ * 		if (unlikely(p->ptrace & PT_EXITKILL))
+ * 			send_sig_info(SIGKILL, SEND_SIG_PRIV, p);
+ *
+ * 		if (__ptrace_detach(tracer, p))
+ * 			list_add(&p->ptrace_entry, dead);
+ * 	}
+ *
+ * (kernel/ptrace.c `exit_ptrace()`, run from `exit_notify()` when the tracer
+ * exits).  The tracer asks for the option in the `PTRACE_SEIZE` option word --
+ * the second spelling of `check_ptrace_options()` -- and then exits, while the
+ * tracee blocks on a pipe so that only SIGKILL can end it.  A tracee that
+ * outlives its tracer, or that exits through the pipe with status 42, proves
+ * the bit was recorded without being honoured.
+ *
+ * Returns 0 when the tracee died from SIGKILL, 1 when it survived. */
+static int exitkill_effect(void) {
+    int release[2];
+    pid_t tracee;
+    pid_t tracer;
+    int status = 0;
+
+    if (pipe(release) != 0) {
+        return -1;
+    }
+    tracee = fork();
+    if (tracee < 0) {
+        return -1;
+    }
+    if (tracee == 0) {
+        char byte;
+
+        (void)close(release[1]);
+        while (read(release[0], &byte, 1) < 0 && errno == EINTR) {
+        }
+        _exit(42);
+    }
+    tracer = fork();
+    if (tracer < 0) {
+        return -1;
+    }
+    if (tracer == 0) {
+        (void)close(release[0]);
+        (void)close(release[1]);
+        if (do_ptrace(PTRACE_SEIZE, tracee, 0, PTRACE_O_EXITKILL) != 0) {
+            _exit(1);
+        }
+        _exit(0);
+    }
+    if (wait_bounded(tracer, &status, 500) != 0 || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        /* The tracer could not seize the tracee with the option: release the
+         * tracee so the failure is reported instead of hanging. */
+        (void)close(release[1]);
+        (void)wait_bounded(tracee, &status, 500);
+        return -1;
+    }
+    /* `exit_ptrace()` runs before the tracer becomes reapable, so by now the
+     * tracee is either killed or detached. */
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        pid_t done = waitpid(tracee, &status, WNOHANG);
+
+        if (done == tracee) {
+            (void)close(release[1]);
+            errno = 0;
+            return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL ? 0 : 1;
+        }
+        if (done < 0) {
+            break;
+        }
+        usleep(10000);
+    }
+    (void)close(release[1]);
+    (void)wait_bounded(tracee, &status, 500);
+    errno = 0;
+    return 1;
+}
+
+/* --- the seize spelling of the option gate ------------------------------ */
+
+/* `PTRACE_SEIZE` carries the option word too, and Linux runs the same ladder on
+ * it (kernel/ptrace.c `ptrace_attach()`):
+ *
+ * 	} else if (request == PTRACE_SEIZE) {
+ * 		if (addr)
+ * 			return -EIO;
+ * 		if (flags & ~(unsigned long)PTRACE_O_MASK)
+ * 			return -EIO;
+ * 		ret = check_ptrace_options(flags);
+ * 		if (retval)
+ * 			return retval;
+ *
+ * The ladder refuses `PTRACE_O_SUSPEND_SECCOMP` for a tracer that is itself
+ * filtered (kernel/ptrace.c `check_ptrace_options()`):
+ *
+ * 	if (seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED ||
+ * 	    current->ptrace & PT_SUSPEND_SECCOMP)
+ * 		return -EPERM;
+ *
+ * so the tracer here installs an allow-everything filter and then seizes its
+ * own child with the option.  -EPERM is the filtered-tracer answer and -EINVAL
+ * the answer of a kernel built without CONFIG_CHECKPOINT_RESTORE (the pinned
+ * oracle); a kernel whose seize path never ran the ladder admits the request
+ * and is reported as a failure instead.
+ *
+ * Returns 0 when the filtered tracer was refused, 1 when it was admitted. */
+static int seize_suspend_seccomp_gate(void) {
+    struct sock_filter instructions[] = {
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    int release[2];
+    pid_t tracer;
+    int status = 0;
+
+    if (pipe(release) != 0) {
+        return -1;
+    }
+    tracer = fork();
+    if (tracer < 0) {
+        return -1;
+    }
+    if (tracer == 0) {
+        struct sock_fprog program = {
+            .len = 1,
+            .filter = instructions,
+        };
+        pid_t tracee = fork();
+        long result;
+        int refused;
+
+        if (tracee < 0) {
+            _exit(4);
+        }
+        if (tracee == 0) {
+            char sink;
+
+            (void)close(release[1]);
+            while (read(release[0], &sink, 1) < 0 && errno == EINTR) {
+            }
+            _exit(0);
+        }
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1UL, 0UL, 0UL, 0UL) != 0) {
+            _exit(2);
+        }
+        if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0U, &program) != 0) {
+            _exit(3);
+        }
+        errno = 0;
+        result = do_ptrace(PTRACE_SEIZE, tracee, 0, PTRACE_O_SUSPEND_SECCOMP);
+        refused = result == -1 && (errno == EPERM || errno == EINVAL);
+        /* Closing the write end releases the tracee, whether or not it was
+         * seized, and the tracer is the process that must reap it. */
+        (void)close(release[0]);
+        (void)close(release[1]);
+        while (waitpid(tracee, &status, 0) < 0 && errno == EINTR) {
+        }
+        _exit(refused ? 0 : 1);
+    }
+    (void)close(release[0]);
+    (void)close(release[1]);
+    if (wait_bounded(tracer, &status, 500) != 0 || !WIFEXITED(status)) {
+        return -1;
+    }
+    return WEXITSTATUS(status);
+}
+
+/* --- PTRACE_O_SUSPEND_SECCOMP, observed through its effect -------------- */
+
+static int install_getpid_denial(void) {
+    struct sock_filter instructions[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_getpid, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog program = {
+        .len = (unsigned short)(sizeof(instructions) / sizeof(instructions[0])),
+        .filter = instructions,
+    };
+
+    return syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0U, &program);
+}
+
+/* Linux suspends the *tracee's* policy while the relationship carries
+ * PTRACE_O_SUSPEND_SECCOMP:
+ *
+ * 	if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) &&
+ * 	    unlikely(current->ptrace & PT_SUSPEND_SECCOMP))
+ * 		return 0;
+ *
+ * (kernel/seccomp.c `__secure_computing()`, tested before the seccomp mode is
+ * read).  The tracee installs a filter that turns `getpid` into -EPERM and
+ * exits 7 when the denial is still enforced, so an admitted option word that
+ * changes nothing is visible as a failure rather than as a successful call.
+ *
+ * Returns 0 when the suspended tracee's `getpid` succeeded. */
+static int suspend_seccomp_effect(void) {
+    int ready[2];
+    int release[2];
+    pid_t tracee;
+    int status = 0;
+    char byte = 'x';
+
+    if (pipe(ready) != 0 || pipe(release) != 0) {
+        return -1;
+    }
+    tracee = fork();
+    if (tracee < 0) {
+        return -1;
+    }
+    if (tracee == 0) {
+        (void)close(ready[0]);
+        (void)close(release[1]);
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1UL, 0UL, 0UL, 0UL) != 0) {
+            _exit(3);
+        }
+        if (install_getpid_denial() != 0) {
+            _exit(4);
+        }
+        /* The filter is installed before the tracer is told to attach. */
+        if (write(ready[1], &byte, 1) != 1) {
+            _exit(5);
+        }
+        while (read(release[0], &byte, 1) < 0 && errno == EINTR) {
+        }
+        long result = syscall(SYS_getpid);
+
+        _exit(result > 0 ? 0 : 7);
+    }
+    (void)close(ready[1]);
+    (void)close(release[0]);
+    if (read(ready[0], &byte, 1) != 1) {
+        (void)close(release[1]);
+        (void)kill(tracee, SIGKILL);
+        (void)wait_bounded(tracee, &status, 500);
+        return -1;
+    }
+    if (do_ptrace(PTRACE_ATTACH, tracee, 0, 0) != 0 ||
+        wait_bounded(tracee, &status, 500) != 0 || !WIFSTOPPED(status)) {
+        (void)close(release[1]);
+        (void)kill(tracee, SIGKILL);
+        (void)wait_bounded(tracee, &status, 500);
+        return -1;
+    }
+    if (do_ptrace(PTRACE_SETOPTIONS, tracee, 0, PTRACE_O_SUSPEND_SECCOMP) != 0) {
+        (void)close(release[1]);
+        (void)do_ptrace(PTRACE_CONT, tracee, 0, 0);
+        (void)wait_bounded(tracee, &status, 500);
+        return -1;
+    }
+    if (write(release[1], &byte, 1) != 1 ||
+        do_ptrace(PTRACE_CONT, tracee, 0, 0) != 0 ||
+        wait_bounded(tracee, &status, 500) != 0) {
+        (void)kill(tracee, SIGKILL);
+        (void)wait_bounded(tracee, &status, 500);
+        return -1;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
+}
+
 /* --- ptrace request decoding ------------------------------------------- */
 
 static void ptrace_request_case(void) {
     int status = 0;
-    pid_t child = fork();
+    pid_t child;
 
+    /* The banner is emitted before the fork: the runner compares the record
+     * multiset exactly, so a child that printed it too would duplicate it. */
     puts("THEKERNEL_ABI_CASE sysadmin-abi.ptrace-requests.raw-differential");
 
+    child = fork();
     if (child < 0) {
         report_failure("PTRACE_FORK", -1, errno);
         return;
@@ -153,19 +474,63 @@ static void ptrace_request_case(void) {
                  0);
 
     /* PTRACE_O_EXITKILL is (1 << 20) and is part of PTRACE_O_MASK; the old
-     * TheKernel mask (0x2fffff) rejected it. */
+     * TheKernel mask (0x2fffff) rejected it.  Acceptance is checked on the
+     * relationship this process already owns... */
     errno = 0;
-    expect_value(PTRACE_CASE, "PTRACE_EXITKILL_ACCEPTED",
+    expect_value(PTRACE_CASE, "PTRACE_SETOPTIONS_EXITKILL_ACCEPTED",
                  do_ptrace(PTRACE_SETOPTIONS, child, 0, PTRACE_O_EXITKILL), 0);
 
-    /* PTRACE_O_SUSPEND_SECCOMP is admitted for a tracer that holds
-     * CAP_SYS_ADMIN and is not itself in seccomp mode (this program is root
-     * and unfiltered). */
+    /* ...and the option itself is checked through the effect `exit_ptrace()`
+     * gives it, because a stored bit that never kills the tracee satisfies the
+     * request word without implementing it. */
     errno = 0;
-    expect_value(PTRACE_CASE, "PTRACE_SUSPEND_SECCOMP_ADMITTED",
-                 do_ptrace(PTRACE_SETOPTIONS, child, 0,
-                           PTRACE_O_SUSPEND_SECCOMP),
-                 0);
+    expect_value(PTRACE_CASE, "PTRACE_EXITKILL_ACCEPTED", exitkill_effect(), 0);
+
+    /* PTRACE_O_SUSPEND_SECCOMP is gated by `check_ptrace_options()`:
+     *
+     * 	if (unlikely(data & PTRACE_O_SUSPEND_SECCOMP)) {
+     * 		if (!IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) ||
+     * 		    !IS_ENABLED(CONFIG_SECCOMP))
+     * 			return -EINVAL;
+     * 		if (!capable(CAP_SYS_ADMIN))
+     * 			return -EPERM;
+     * 		if (seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED ||
+     * 		    current->ptrace & PT_SUSPEND_SECCOMP)
+     * 			return -EPERM;
+     * 	}
+     *
+     * The pinned Linux oracle is built without CONFIG_CHECKPOINT_RESTORE and
+     * rejects the bit with -EINVAL for every caller, while a kernel built with
+     * it admits the request from this unfiltered privileged tracer.  The
+     * answer is therefore probed, and an admitted bit must also show its
+     * documented effect: the tracee's own filter stops being evaluated. */
+    errno = 0;
+    {
+        long admitted = do_ptrace(PTRACE_SETOPTIONS, child, 0,
+                                  PTRACE_O_SUSPEND_SECCOMP);
+        int admission_errno = errno;
+
+        if (admitted != 0) {
+            /* -EINVAL means the configuration gate, -EPERM the capability or
+             * seccomp-state gate; both are pinned answers, so e.g. an
+             * accepted-but-ignored bit or an -EIO cannot pass here. */
+            errno = admission_errno;
+            expect_errno(PTRACE_CASE, "PTRACE_SUSPEND_SECCOMP_ADMITTED",
+                         admitted, admission_errno == EINVAL ? EINVAL : EPERM);
+        } else {
+            errno = 0;
+            expect_value(PTRACE_CASE, "PTRACE_SUSPEND_SECCOMP_ADMITTED",
+                         suspend_seccomp_effect(), 0);
+        }
+    }
+
+    /* The same gate on the *other* spelling of the option word: PTRACE_SEIZE
+     * used to skip the ladder entirely, so this is the assertion that fails on
+     * the pre-change code even though PTRACE_O_MASK already contained the
+     * bit. */
+    errno = 0;
+    expect_value(PTRACE_CASE, "PTRACE_SEIZE_SUSPEND_SECCOMP_GATE",
+                 seize_suspend_seccomp_gate(), 0);
 
     /* kernel/ptrace.c `ptrace_request()` initialises `int ret = -EIO;` and
      * leaves it untouched for an unrecognised request. */
@@ -318,37 +683,77 @@ static void swap_flag_case(void) {
 #define SYS_delete_module 176
 #endif
 
+static int modules_absent;
+
+/* The answer each module syscall gives when the kernel in front of the test has
+ * no module support at all. */
+#define MODULE_ANSWER(present) (modules_absent ? ENOSYS : (present))
+
 static void module_image_case(void) {
     puts("THEKERNEL_ABI_CASE sysadmin-abi.module-image.raw-differential");
+
+    /* kernel/sys_ni.c: with CONFIG_MODULES=n the three module syscalls are
+     * unconditional -ENOSYS stubs, and the pinned Linux oracle is built that
+     * way (`# CONFIG_MODULES is not set`), so the answer is probed once and
+     * every assertion keeps its name while expecting the configuration's own
+     * answer.  TheKernel implements them, so the same records come from the
+     * present-facility answers below. */
+    errno = 0;
+    {
+        long probe = syscall(SYS_delete_module, "thekernel_probe_absent", 0U);
+
+        modules_absent = probe == -1 && errno == ENOSYS;
+    }
 
     /* kernel/module/main.c `copy_module_from_user()`: an image shorter than
      * `sizeof(Elf_Ehdr)` (64 on x86_64) is -ENOEXEC, including a zero length,
      * and the capability check comes first. */
     errno = 0;
     expect_errno(MODULE_CASE, "INIT_MODULE_ZERO_LEN_ENOEXEC",
-                 syscall(SYS_init_module, (void *)0, 0UL, (void *)0), ENOEXEC);
+                 syscall(SYS_init_module, (void *)0, 0UL, (void *)0),
+                 MODULE_ANSWER(ENOEXEC));
     errno = 0;
     expect_errno(MODULE_CASE, "INIT_MODULE_SHORT_IMAGE_ENOEXEC",
-                 syscall(SYS_init_module, (void *)0, 63UL, (void *)0), ENOEXEC);
+                 syscall(SYS_init_module, (void *)0, 63UL, (void *)0),
+                 MODULE_ANSWER(ENOEXEC));
     /* At exactly the header size the copy is attempted, so a NULL source is
      * -EFAULT rather than -EINVAL. */
     errno = 0;
     expect_errno(MODULE_CASE, "INIT_MODULE_HEADER_SIZE_NULL_EFAULT",
-                 syscall(SYS_init_module, (void *)0, 64UL, (void *)0), EFAULT);
+                 syscall(SYS_init_module, (void *)0, 64UL, (void *)0),
+                 MODULE_ANSWER(EFAULT));
+    /* `load_module()` reads the parameter string only after the image has been
+     * validated (kernel/module/main.c:3526):
+     *
+     * 	mod->args = strndup_user(uargs, ~0UL >> 1);
+     *
+     * so a readable but malformed image is -ENOEXEC even when the parameter
+     * pointer cannot be read at all.  A kernel that copies the parameters
+     * first reports the -EFAULT of the pointer instead, which is what the
+     * pre-change code did. */
+    {
+        unsigned char garbage[64] = {0};
+
+        errno = 0;
+        expect_errno(MODULE_CASE, "INIT_MODULE_BAD_IMAGE_PRECEDES_BAD_PARAMS",
+                     syscall(SYS_init_module, garbage, sizeof(garbage),
+                             (void *)(uintptr_t)1),
+                     MODULE_ANSWER(ENOEXEC));
+    }
 
     /* `delete_module` has no flag table: stray bits are ignored, and an empty
      * or unknown name is -ENOENT. */
     errno = 0;
     expect_errno(MODULE_CASE, "DELETE_MODULE_EMPTY_NAME_ENOENT",
-                 syscall(SYS_delete_module, "", 0U), ENOENT);
+                 syscall(SYS_delete_module, "", 0U), MODULE_ANSWER(ENOENT));
     errno = 0;
     expect_errno(MODULE_CASE, "DELETE_MODULE_UNKNOWN_NAME_ENOENT",
                  syscall(SYS_delete_module, "thekernel_no_such_module", 0U),
-                 ENOENT);
+                 MODULE_ANSWER(ENOENT));
     errno = 0;
     expect_errno(MODULE_CASE, "DELETE_MODULE_STRAY_FLAGS_STILL_ENOENT",
                  syscall(SYS_delete_module, "thekernel_no_such_module", 0x1000U),
-                 ENOENT);
+                 MODULE_ANSWER(ENOENT));
 
     puts("THEKERNEL_ABI_RESULT sysadmin-abi.module-image pass");
 }

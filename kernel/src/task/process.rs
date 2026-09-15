@@ -5282,6 +5282,47 @@ impl ProcessData {
         true
     }
 
+    /// Reports whether the tracer of one exact relationship asked for
+    /// `PTRACE_O_EXITKILL`.
+    ///
+    /// Linux stores the option as `PT_EXITKILL` in the *tracee's* `ptrace` word
+    /// and `exit_ptrace()` tests it while the relationship is still published:
+    ///
+    /// ```c
+    /// 	list_for_each_entry_safe(p, n, &tracer->ptraced, ptrace_entry) {
+    /// 		if (unlikely(p->ptrace & PT_EXITKILL))
+    /// 			send_sig_info(SIGKILL, SEND_SIG_PRIV, p);
+    /// ```
+    ///
+    /// Sampling under the same guard that retires the relationship keeps a
+    /// detach/reattach by the same numeric tracer from making the new
+    /// relationship inherit the old request.
+    pub(crate) fn ptrace_exitkill_requested(&self, session: PtraceSession) -> bool {
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        ptrace_ctl.active_session() == Some(session)
+            && ptrace_ctl.options & tk_linux_process::ptrace_options::EXITKILL != 0
+    }
+
+    /// Reports whether the active relationship's tracer suspended this task's
+    /// seccomp policy with `PTRACE_O_SUSPEND_SECCOMP`.
+    ///
+    /// Linux keeps the option in the *tracee's* `ptrace` word as
+    /// `PT_SUSPEND_SECCOMP`, and `__secure_computing()` tests it before it
+    /// looks at the seccomp mode at all (kernel/seccomp.c):
+    ///
+    /// ```c
+    /// 	if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) &&
+    /// 	    unlikely(current->ptrace & PT_SUSPEND_SECCOMP))
+    /// 		return 0;
+    /// ```
+    ///
+    /// Deriving the answer from the relationship's option word is what makes a
+    /// detach resume enforcement: `clear_session()` zeroes `options` when the
+    /// relationship ends, so no separate bookkeeping can go stale.
+    pub(crate) fn ptrace_seccomp_suspended(&self) -> bool {
+        self.ptrace_ctl.lock().options & tk_linux_process::ptrace_options::SUSPEND_SECCOMP != 0
+    }
+
     pub(crate) fn ptrace_event_message(&self, session: PtraceSession) -> Option<usize> {
         let ptrace_ctl = self.ptrace_ctl.lock();
         let job_ctl = self.job_ctl.lock();

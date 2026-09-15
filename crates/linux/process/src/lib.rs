@@ -24,7 +24,7 @@ pub use linux_abi::{
     AT_VECTOR_SIZE, AT_VECTOR_SIZE_ARCH, AT_VECTOR_SIZE_BASE, CLONE3_ONLY_FLAGS, Clone3Args,
     Clone3Plan, ClonePlan, PidfdPlan, ProcessAbiError, Rusage, RusageSelector, SAVED_AUXV_BYTES,
     SetTidPlan, TASK_COMM_LEN, TaskComm, TimeVal, UsageSnapshot, clone_flag_admission,
-    prctl_set_name_read_bound, saved_auxv_image,
+    prctl_set_name_read_bound, ptrace_options, saved_auxv_image,
 };
 pub use process::{
     CommittedProcessExit, CreatedSession, ExitOutcome, InitialProcessAdmission,

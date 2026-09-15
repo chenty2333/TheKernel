@@ -1121,8 +1121,32 @@ fn detach_ptrace_reverse_links(
             return None;
         };
         let ptrace_action = tracee_data.lock_ptrace_actions();
+        // kernel/ptrace.c `exit_ptrace()`, which is the tracer-side teardown
+        // `forget_original_parent()` runs from `exit_notify()`:
+        //
+        // 	list_for_each_entry_safe(p, n, &tracer->ptraced, ptrace_entry) {
+        // 		if (unlikely(p->ptrace & PT_EXITKILL))
+        // 			send_sig_info(SIGKILL, SEND_SIG_PRIV, p);
+        //
+        // 		if (__ptrace_detach(tracer, p))
+        // 			list_add(&p->ptrace_entry, dead);
+        // 	}
+        //
+        // `PT_EXITKILL` is the tracee-side copy of the tracer's
+        // `PTRACE_O_EXITKILL` option, so the request has to be sampled from
+        // this exact relationship before it is retired.  The fatal signal is
+        // delivered only after every ptrace guard is released: it wakes the
+        // tracee and queues a signal, neither of which may happen under a spin
+        // lock.
+        let exitkill = tracee_data.ptrace_exitkill_requested(link.session());
         let retired_relationship = tracee_data.end_ptrace(link.session());
         drop(ptrace_action);
+        if exitkill {
+            let _ = send_signal_to_process(
+                link.tracee(),
+                Some(SignalInfo::new_kernel(Signo::SIGKILL)),
+            );
+        }
         retired_relationship
     }) {}
     links

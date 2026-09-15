@@ -599,22 +599,27 @@ static int test_strict_kill(void) {
 }
 
 static int test_unsupported_lifecycles(void) {
+    /* Linux `seccomp_get_action_avail()` answers 0 for SECCOMP_RET_TRACE: the
+     * action table does not depend on whether a tracer is waiting, and a TRACE
+     * verdict with no tracer attached takes the documented "no tracer
+     * attached" path -- the syscall fails with ENOSYS -- instead
+     * (kernel/seccomp.c `__seccomp_filter()`).  Both kernels answer this query
+     * identically, so it runs in portable mode as well. */
+    uint32_t action = SECCOMP_RET_TRACE;
+    errno = 0;
+    if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0U, &action) != 0) {
+        return fail("trace-action-available");
+    }
+    action = SECCOMP_RET_USER_NOTIF;
+    errno = 0;
+    if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0U, &action) != 0) {
+        return fail("user-notif-action-available");
+    }
     if (!require_exact_path_limit) {
         marker("THEKERNEL_SECCOMP_UNSUPPORTED_PORTABLE_OK");
         return 0;
     }
 
-    uint32_t action = SECCOMP_RET_TRACE;
-    errno = 0;
-    if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0U, &action) != -1 ||
-        errno != EOPNOTSUPP) {
-        return fail("unsupported-trace-query");
-    }
-    action = SECCOMP_RET_USER_NOTIF;
-    errno = 0;
-    if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0U, &action) != 0) {
-        return fail("user-notif-query");
-    }
     struct seccomp_notif_sizes sizes = {0};
     if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0U, &sizes) != 0 ||
         sizes.seccomp_notif != sizeof(struct seccomp_notif) ||
