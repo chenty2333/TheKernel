@@ -598,6 +598,185 @@ int main(void)
                   && (attr.sched_flags & SCHED_FLAG_RESET_ON_FORK) == 0);
     }
 
+    /* ---------------- diagnostics (THEKERNEL_SCHED_PROBE) ---------------- *
+     * Not ABI records: the runner ignores every line that is not a
+     * THEKERNEL_ABI_* record, so these run on both guests and their values can
+     * be compared before any assertion name is registered. Measured
+     * divergence as of this program's revision, reported rather than asserted
+     * because no TheKernel-side fix is landed yet: the two guests disagree on
+     * both counts below (Linux refuses over-capacity reservations with EBUSY
+     * and reports the *remaining* CBS budget for SCHED_GETATTR_FLAG_DL_DYNAMIC,
+     * TheKernel accepts them and reports the configured reservation). */
+    {
+        /* Deadline bandwidth admission: six children race to reserve a full
+         * CPU each (runtime == period), so at least one request must exceed the
+         * root domain's DL bandwidth. Linux answers EBUSY
+         * (kernel/sched/syscalls.c:653-654). The children spin for a bounded
+         * time and exit on their own, so no blocked task is ever woken. */
+        enum { DL_PROBE_CHILDREN = 6 };
+        const uint64_t span = 1000000000ULL;
+        int release[2];
+        int reports[DL_PROBE_CHILDREN];
+        pid_t kids[DL_PROBE_CHILDREN];
+        int nkids = 0, accepted = 0, refused = 0, first_refused_errno = 0, i;
+        if (pipe(release) != 0) {
+            printf("THEKERNEL_SCHED_PROBE deadline_admission pipe_failed=1\n");
+        } else {
+            for (i = 0; i < DL_PROBE_CHILDREN; i++) {
+                int report[2];
+                if (pipe(report) != 0) break;
+                {
+                    pid_t kid = fork();
+                    if (kid == 0) {
+                        struct sched_attr_local dl;
+                        struct {
+                            long rc;
+                            int err;
+                        } rep;
+                        char gate = 0;
+                        close(report[0]);
+                        close(release[1]);
+                        if (read(release[0], &gate, 1) != 1) _exit(1);
+                        close(release[0]);
+                        memset(&dl, 0, sizeof(dl));
+                        dl.size = sizeof(dl);
+                        dl.sched_policy = SCHED_DEADLINE;
+                        dl.sched_runtime = span;
+                        dl.sched_deadline = span;
+                        dl.sched_period = span;
+                        errno = 0;
+                        rep.rc = syscall(SYS_sched_setattr, 0, &dl, 0);
+                        rep.err = errno;
+                        if (write(report[1], &rep, sizeof(rep)) != (ssize_t)sizeof(rep))
+                            _exit(1);
+                        close(report[1]);
+                        {
+                            struct timespec t0, t1;
+                            clock_gettime(CLOCK_MONOTONIC, &t0);
+                            for (;;) {
+                                clock_gettime(CLOCK_MONOTONIC, &t1);
+                                if ((t1.tv_sec - t0.tv_sec) * 1000000000L
+                                        + (t1.tv_nsec - t0.tv_nsec) > 200000000L)
+                                    break;
+                            }
+                        }
+                        _exit(0);
+                    }
+                    close(report[1]);
+                    if (kid < 0) {
+                        close(report[0]);
+                        break;
+                    }
+                    kids[nkids] = kid;
+                    reports[nkids] = report[0];
+                    nkids++;
+                }
+            }
+            for (i = 0; i < nkids; i++) {
+                char gate = 'D';
+                if (write(release[1], &gate, 1) != 1) break;
+            }
+            close(release[1]);
+            close(release[0]);
+            for (i = 0; i < nkids; i++) {
+                struct {
+                    long rc;
+                    int err;
+                } rep;
+                memset(&rep, 0, sizeof(rep));
+                if (read(reports[i], &rep, sizeof(rep)) == (ssize_t)sizeof(rep)) {
+                    if (rep.rc == 0) {
+                        accepted++;
+                    } else {
+                        refused++;
+                        if (!first_refused_errno) first_refused_errno = rep.err;
+                    }
+                }
+                close(reports[i]);
+            }
+            printf("THEKERNEL_SCHED_PROBE deadline_admission children=%d accepted=%d refused=%d"
+                   " first_refused_errno=%d\n",
+                   nkids, accepted, refused, first_refused_errno);
+            for (i = 0; i < nkids; i++) collect(kids[i]);
+        }
+    }
+    {
+        /* SCHED_GETATTR_FLAG_DL_DYNAMIC: the running budget and the absolute
+         * deadline instead of the configured reservation
+         * (kernel/sched/deadline.c:3855-3878). */
+        int ready[2];
+        if (pipe(ready) != 0) {
+            printf("THEKERNEL_SCHED_PROBE dl_dynamic pipe_failed=1\n");
+        } else {
+            pid_t target = fork();
+            if (target == 0) {
+                close(ready[0]);
+                for (;;) {
+                    struct timespec t0, t1;
+                    clock_gettime(CLOCK_MONOTONIC, &t0);
+                    for (;;) {
+                        clock_gettime(CLOCK_MONOTONIC, &t1);
+                        if ((t1.tv_sec - t0.tv_sec) * 1000000000L
+                                + (t1.tv_nsec - t0.tv_nsec) > 400000000L)
+                            break;
+                    }
+                }
+                _exit(0);
+            }
+            close(ready[1]);
+            if (target < 0) {
+                close(ready[0]);
+                printf("THEKERNEL_SCHED_PROBE dl_dynamic fork_failed=1\n");
+            } else {
+                struct sched_attr_local dl;
+                struct sched_attr_local plain;
+                struct sched_attr_local dynamic;
+                long set_rc, plain_rc, dynamic_rc;
+                int set_errno = 0, plain_errno = 0, dynamic_errno = 0;
+                close(ready[0]);
+                memset(&dl, 0, sizeof(dl));
+                dl.size = 48;
+                dl.sched_policy = SCHED_DEADLINE;
+                dl.sched_runtime = 1000000ULL;
+                dl.sched_deadline = 100000000ULL;
+                dl.sched_period = 500000000ULL;
+                errno = 0;
+                set_rc = syscall(SYS_sched_setattr, target, &dl, 0);
+                set_errno = errno;
+                if (set_rc == 0) {
+                    struct timespec t0, t1;
+                    clock_gettime(CLOCK_MONOTONIC, &t0);
+                    for (;;) {
+                        clock_gettime(CLOCK_MONOTONIC, &t1);
+                        if ((t1.tv_sec - t0.tv_sec) * 1000000000L
+                                + (t1.tv_nsec - t0.tv_nsec) > 40000000L)
+                            break;
+                    }
+                }
+                memset(&plain, 0, sizeof(plain));
+                memset(&dynamic, 0, sizeof(dynamic));
+                errno = 0;
+                plain_rc = syscall(SYS_sched_getattr, target, &plain, 56, 0);
+                plain_errno = errno;
+                errno = 0;
+                dynamic_rc = syscall(SYS_sched_getattr, target, &dynamic, 56, 1);
+                dynamic_errno = errno;
+                printf("THEKERNEL_SCHED_PROBE dl_dynamic set_rc=%ld set_errno=%d plain_rc=%ld"
+                       " plain_errno=%d plain_runtime=%llu plain_deadline=%llu"
+                       " plain_period=%llu dynamic_rc=%ld dynamic_errno=%d"
+                       " dynamic_runtime=%llu dynamic_deadline=%llu dynamic_period=%llu\n",
+                       set_rc, set_errno, plain_rc, plain_errno,
+                       (unsigned long long)plain.sched_runtime,
+                       (unsigned long long)plain.sched_deadline,
+                       (unsigned long long)plain.sched_period, dynamic_rc, dynamic_errno,
+                       (unsigned long long)dynamic.sched_runtime,
+                       (unsigned long long)dynamic.sched_deadline,
+                       (unsigned long long)dynamic.sched_period);
+                collect(target);
+            }
+        }
+    }
+
     done();
 
     /* ---------------- mbind(2)/set_mempolicy(2)/get_mempolicy(2) ---------- */
