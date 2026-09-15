@@ -2572,6 +2572,48 @@ mod tests {
     }
 
     #[test]
+    fn lazily_detaching_the_filesystem_root_keeps_held_locations_usable() {
+        // `umount2("/", MNT_DETACH)` against the two-mount initial namespace:
+        // `umount_tree(mnt, UMOUNT_PROPAGATE)` (`fs/namespace.c`:1954-1956)
+        // unhashes the rootfs from the namespace, but the tree, its dentries
+        // and its superblock stay alive for every reference already held, so
+        // the caller's own `fs->root` keeps resolving inside it.  That is the
+        // half of the detach the switch_root(8) recipe depends on.
+        let nullfs_filesystem = Filesystem::new(LookupTestFs::new(60));
+        let namespace_root_mount = Mountpoint::new_root(&nullfs_filesystem);
+        let namespace_root = namespace_root_mount.root_location();
+        let rootfs_filesystem = Filesystem::new(LookupTestFs::new(120));
+        let rootfs_mount = Mountpoint::new_detached(&rootfs_filesystem).unwrap();
+        rootfs_mount.attach_to(&namespace_root).unwrap();
+        let rootfs = rootfs_mount.root_location();
+        let child = rootfs
+            .lookup_no_follow_in_mount(FsName::new(b"child"))
+            .unwrap();
+
+        rootfs.lazy_unmount().unwrap();
+
+        // Only the rootfs left the tree; the namespace root has no parent to
+        // begin with and never had one.
+        assert!(rootfs_mount.location().is_none());
+        assert!(!rootfs_mount.is_attached());
+        assert!(namespace_root_mount.location().is_none());
+        // The held reference to the detached root still names the same dentry
+        // and still reports `/` as its absolute path, because `__d_path()`
+        // stops at the root it was handed rather than walking above it.
+        assert!(rootfs.ptr_eq(&rootfs_mount.root_location()));
+        assert_eq!(rootfs.absolute_path().unwrap().as_bytes(), b"/");
+        // Lookups through it still cross into the detached tree.
+        assert!(
+            rootfs
+                .lookup_no_follow(FsName::new(b"child"))
+                .unwrap()
+                .same_mount(&rootfs)
+        );
+        assert!(child.same_mount(&rootfs));
+        assert_eq!(namespace_root.absolute_path().unwrap().as_bytes(), b"/");
+    }
+
+    #[test]
     fn rename_ancestry_preflight_preserves_both_trap_error_classes() {
         let filesystem = Filesystem::new(LookupTestFs::new(300));
         let mount = Mountpoint::new_root(&filesystem);
