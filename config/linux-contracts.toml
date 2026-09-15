@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 315
-implemented = 296
+resolved = 318
+implemented = 299
 explicit_enosys = 19
 fallback = 0
-partial = 70
+partial = 67
 unknown = 0
 
 [[contract]]
@@ -6457,8 +6457,8 @@ contract = "linux-pidfd_send_signal"
 handler = "kernel/src/syscall/fs/pidfd.rs:sys_pidfd_send_signal"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/pidfd.rs:process_pidfd_identity_rejects_reap_and_pid_reuse", "tests/guest/portable/fs-abi-differential.c:main"]
-validation_gaps = ["The flag, self-identifier and type rules are exercised by the fs-abi raw differential; the process-group scope has no test"]
-limitations = ["PIDFD_SIGNAL_PROCESS_GROUP is rejected with EOPNOTSUPP because the shared signal-delivery scope contract carries only thread and thread-group scopes"]
+validation_gaps = ["PROCESS_GROUP_PROBE_OK, PROCESS_GROUP_DELIVERS_SIGUSR1, PROCESS_GROUP_ZOMBIE_LEADER_OK, PROCESS_GROUP_REAPED_ESRCH, PROCESS_GROUP_ABSENT_ESRCH and PROCESS_GROUP_SELF_THREAD_OK exercise the flag, the delivery, the zombie leader, the detached-group ESRCH and the self-thread scope; no case covers a group that keeps its number after its leader is reaped"]
+limitations = ["the process group is resolved from the target's visible PID under exact_process_is_published rather than from a pinned struct pid, so a descriptor whose target process was already reaped reports ESRCH even when the group still has live members under that number, where Linux's kill_pgrp_info walks the struct pid's task list and delivers; the faithful fix retains the led Arc<ProcessGroup> in the durable identity, updated on setpgid(0,0) and setsid"]
 
 [[contract]]
 id = "linux-cachestat"
@@ -7234,13 +7234,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 143
 name = "sched_getparam"
-status = "partial"
+status = "implemented"
 contract = "linux-sched_getparam"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_getparam"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["No registered differential case exercises this query; the change is covered by source agreement with Linux v7.2.3 and module tests"]
-limitations = ["a task that is exiting but not yet a zombie still reports ESRCH instead of the retained scheduler state"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-sched_getscheduler"
@@ -7263,7 +7263,7 @@ handler = "kernel/src/syscall/task/schedule.rs:sys_sched_getscheduler"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["No registered differential case exercises this query; the change is covered by source agreement with Linux v7.2.3 and module tests"]
-limitations = ["a task that is exiting but not yet a zombie still reports ESRCH instead of the retained scheduler state"]
+limitations = ["a task that has started exiting but is not yet a zombie still reports ESRCH instead of its last policy with SCHED_RESET_ON_FORK: the flag comes from task_scheduling_snapshot(), which returns TaskSchedError::TaskExited once the task is terminalizing or Exited, while Linux reads p->sched_reset_on_fork from the still-addressable task_struct"]
 
 [[contract]]
 id = "linux-sched_rr_get_interval"
@@ -7280,13 +7280,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 148
 name = "sched_rr_get_interval"
-status = "partial"
+status = "implemented"
 contract = "linux-sched_rr_get_interval"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_rr_get_interval"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["No registered differential case exercises this query; the change is covered by source agreement with Linux v7.2.3 and module tests"]
-limitations = ["a task that is exiting but not yet a zombie still reports ESRCH instead of the retained scheduler state"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-sched_get_priority_max"
@@ -7372,13 +7372,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 141
 name = "setpriority"
-status = "partial"
+status = "implemented"
 contract = "linux-setpriority"
 handler = "kernel/src/syscall/task/schedule.rs:sys_setpriority"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
-validation_gaps = ["the guest case covers the live target and the CAP_SYS_NICE override"]
-limitations = ["a zombie target cannot report its own RLIMIT_NICE because the ProcessData that owns rlim is retired, so the caller's limit is consulted instead; Linux reads task_rlimit(target)"]
+validation_gaps = ["the guest case covers the live target and the CAP_SYS_NICE override and now also the unreaped zombie target; prlimit64(2) on an unreaped zombie still resolves ProcessData and fails, which belongs to the prlimit64 cell"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-clock_nanosleep"
@@ -8504,8 +8504,8 @@ contract = "linux-wait4"
 handler = "kernel/src/syscall/task/wait.rs:sys_waitpid"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/vfork-smoke.c:wait_success", "tests/guest/portable/wait-abi-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["__WNOTHREAD is accepted but consumed nowhere, because children are tracked per process, so Linux's per-thread ECHILD is unrepresentable"]
+validation_gaps = ["the wait-abi raw differential exercises the same-thread, sibling-thread, any-live, own-live and zombie-group verdicts"]
+limitations = ["when several threads of the reaper process are live, the retained replacement identity is the lowest TID, where Linux's find_alive_thread() takes the first non-PF_EXITING thread in creation order; the two agree unless the lowest-TID thread is itself exiting, so a child reparented to such a process can be visible to a different set of waiters than Linux would choose"]
 
 [[contract]]
 id = "linux-waitid"
