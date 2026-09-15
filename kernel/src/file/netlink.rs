@@ -592,6 +592,24 @@ impl<'a> NetlinkWritePermit<'a> {
         }
     }
 
+    /// `sk_rcvbuf` as read from the state guard this permit already owns.
+    ///
+    /// The permit's `state` guard *is* the socket's state lock, and that lock
+    /// is not reentrant, so a kernel-originated queue admission must read the
+    /// budget from the guard instead of calling `NetlinkSocket`'s state-locking
+    /// accessor.  Linux reads the same `sk_rcvbuf` field while holding the
+    /// socket lock in `netlink_attachskb()` (`net/netlink/af_netlink.c:1218`).
+    fn receive_buffer_limit(&self) -> usize {
+        match self {
+            Self::Route { state, .. }
+            | Self::Generic { state, .. }
+            | Self::Netfilter { state, .. }
+            | Self::Audit { state, .. }
+            | Self::Uevent { state, .. }
+            | Self::SockDiag { state, .. } => usize::try_from(state.sock.rcvbuf).unwrap_or(0),
+        }
+    }
+
     fn nft_tables(&mut self) -> Option<&mut Vec<NftNamespaceTables>> {
         match self {
             Self::Netfilter { tables, .. } => Some(tables),
@@ -2350,9 +2368,11 @@ impl NetlinkSocket {
 
     fn enqueue_kernel_permitted(&self, permit: &mut NetlinkWritePermit<'_>, data: Vec<u8>) {
         let suppress_enobufs = permit.suppress_enobufs();
-        // Read the receiver's budget before the queue lock is taken: the state
-        // lock is a different lock and must never be acquired underneath it.
-        let rcvbuf = self.receive_buffer_limit();
+        // Read the receiver's budget from the permit's own state guard: the
+        // socket state lock is not reentrant, so taking it here would
+        // self-deadlock.  The queue lock is still taken afterwards, matching
+        // the state-before-queue order every other enqueue path uses.
+        let rcvbuf = permit.receive_buffer_limit();
         let queue = permit.queue();
         if admit_netlink_queue(
             queue.datagrams.len(),
@@ -6761,7 +6781,6 @@ mod tests {
     #[test]
     fn netlink_queue_rejects_messages_past_its_byte_limit() {
         let _context = crate::test_support::scheduler_test_context();
-        let _context = crate::test_support::scheduler_test_context();
         let socket = route_socket();
         // `netlink_attachskb` admits the first datagram of an empty queue
         // whatever its size (`net/netlink/af_netlink.c:1218-1223`), so a drop
@@ -6779,7 +6798,6 @@ mod tests {
     #[test]
     fn netlink_queue_admits_an_oversized_first_datagram() {
         let _context = crate::test_support::scheduler_test_context();
-        let _context = crate::test_support::scheduler_test_context();
         let socket = route_socket();
         socket.enqueue_kernel(alloc::vec![7; SYSCTL_RMEM_DEFAULT as usize + 4096]);
         let mut bytes = [0_u8; 1];
@@ -6793,7 +6811,6 @@ mod tests {
 
     #[test]
     fn netlink_send_budget_follows_the_sockets_own_sndbuf() {
-        let _context = crate::test_support::scheduler_test_context();
         let _context = crate::test_support::scheduler_test_context();
         // `netlink_sendmsg` measures the datagram against `sk_sndbuf`
         // (`net/netlink/af_netlink.c:1868-1873`), which `SO_SNDBUF` sets.
@@ -6830,7 +6847,6 @@ mod tests {
 
     #[test]
     fn sol_socket_timeout_options_store_jiffies_and_report_linux_bytes() {
-        let _context = crate::test_support::scheduler_test_context();
         let _context = crate::test_support::scheduler_test_context();
         let socket = route_socket();
         // `sock_init_data_uid` seeds both timeouts with `MAX_SCHEDULE_TIMEOUT`
@@ -6908,7 +6924,6 @@ mod tests {
 
     #[test]
     fn sol_socket_privileged_and_inert_names_keep_their_linux_answers() {
-        let _context = crate::test_support::scheduler_test_context();
         let _context = crate::test_support::scheduler_test_context();
         let socket = route_socket();
         let authority = NetlinkOptionAuthority::testing();

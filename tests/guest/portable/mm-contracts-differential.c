@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
@@ -50,9 +51,28 @@ struct cap_data { uint32_t effective, permitted, inheritable; };
 #ifndef MADV_GUARD_INSTALL
 #define MADV_GUARD_INSTALL 102
 #endif
-#ifndef MADV_GUARD_REMOVE
-#define MADV_GUARD_REMOVE 103
+#ifndef MADV_DODUMP
+#define MADV_DODUMP 17
 #endif
+#ifndef MADV_KEEPONFORK
+#define MADV_KEEPONFORK 19
+#endif
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
+/* Native x86_64 userfaultfd numbers and layouts from
+   include/uapi/linux/userfaultfd.h: UFFD_API is 0xAA, and both ioctl numbers
+   are _IOWR(0xAA, nr, size) for the structures below (24 and 32 bytes). */
+enum { NR_USERFAULTFD = 323 };
+#define UFFD_API_VALUE 0xAAULL
+/* `#define UFFD_USER_MODE_ONLY 1` (include/uapi/linux/userfaultfd.h:384). */
+#define UFFD_USER_MODE_ONLY 1
+#define UFFDIO_REGISTER_MODE_MISSING 1ULL
+#define UFFDIO_API_CMD 0xC018AA3FUL
+#define UFFDIO_REGISTER_CMD 0xC020AA00UL
+struct uffdio_range { uint64_t start, len; };
+struct uffdio_api { uint64_t api, features, ioctls; };
+struct uffdio_register { struct uffdio_range range; uint64_t mode, ioctls; };
 /* include/uapi/linux/memfd.h and include/uapi/linux/fcntl.h. */
 #ifndef MFD_ALLOW_SEALING
 #define MFD_ALLOW_SEALING 0x0002U
@@ -859,6 +879,125 @@ static void madvise_extra_case(void) {
           "madvise-wipeonfork-child-zero-pages");
     check(munmap(w, 3 * PAGE) == 0, "madvise-hole-cleanup");
     mark("WIPEONFORK_HOLE");
+
+    /* MAP_DROPPABLE is a persistent VMA property, not a pair of one-shot side
+       effects applied at mmap time.  `mm/mmap.c:505-543` installs
+       VM_DROPPABLE|VM_NORESERVE|VM_WIPEONFORK|VM_DONTDUMP, and the two
+       advices that would clear the derived fork/dump policy refuse the VMA
+       instead of silently undoing the mapping's contract:
+
+       ```c
+       	case MADV_KEEPONFORK:
+       		if (new_flags & VM_DROPPABLE)
+       			return -EINVAL;
+       ```
+       (`mm/madvise.c:1395-1397`), and
+
+       ```c
+       	case MADV_DODUMP:
+       		if ((!is_vm_hugetlb_page(vma) && (new_flags & VM_SPECIAL)) ||
+       		    (new_flags & VM_DROPPABLE))
+       			return -EINVAL;
+       ```
+       (`mm/madvise.c:1402-1406`). */
+    unsigned char *drop = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                               MAP_ANONYMOUS | MAP_DROPPABLE, -1, 0);
+    check(drop != MAP_FAILED, "madvise-droppable-mmap");
+    drop[0] = 0x5a;
+    ERROR(syscall(NR_MADVISE, drop, PAGE, MADV_KEEPONFORK), EINVAL,
+          "madvise-droppable-keeponfork");
+    mark("DROPPABLE_KEEPONFORK_EINVAL");
+    ERROR(syscall(NR_MADVISE, drop, PAGE, MADV_DODUMP), EINVAL,
+          "madvise-droppable-dodump");
+    mark("DROPPABLE_DODUMP_EINVAL");
+    /* The same two advices still succeed on an ordinary anonymous VMA, so the
+       refusals above are the droppable property and not a blanket refusal. */
+    unsigned char *plain = pages(1);
+    plain[0] = 0x5a;
+    check(syscall(NR_MADVISE, plain, PAGE, MADV_KEEPONFORK) == 0,
+          "madvise-plain-keeponfork");
+    check(syscall(NR_MADVISE, plain, PAGE, MADV_DODUMP) == 0,
+          "madvise-plain-dodump");
+    /* A droppable folio is never marked swapbacked (`mm/rmap.c:1652-1656`),
+       so reclaim discards it instead of writing it out, and the dirty-page
+       restore in `try_to_unmap_one()` explicitly exempts it:
+
+       ```c
+       			if (folio_test_dirty(folio) && !(vma->vm_flags & VM_DROPPABLE)) {
+       ```
+       (`mm/rmap.c:2258`).  MADV_PAGEOUT is the only guest-visible route into
+       that decision, and the dropped page reads back as a fresh zero page
+       while the same advice leaves an ordinary anonymous page intact when no
+       swap slot can be allocated. */
+    check(syscall(NR_MADVISE, drop, PAGE, MADV_PAGEOUT) == 0,
+          "madvise-droppable-pageout");
+    check(drop[0] == 0, "madvise-droppable-pageout-drops-content");
+    mark("DROPPABLE_PAGEOUT_DROPS");
+    check(syscall(NR_MADVISE, plain, PAGE, MADV_PAGEOUT) == 0,
+          "madvise-plain-pageout");
+    check(plain[0] == 0x5a, "madvise-plain-pageout-keeps-content");
+    mark("PLAIN_PAGEOUT_KEEPS");
+    check(munmap(drop, PAGE) == 0, "madvise-droppable-cleanup");
+    check(munmap(plain, PAGE) == 0, "madvise-plain-cleanup");
+    /* `vma_can_userfault()` refuses a droppable VMA outright
+       (`mm/userfaultfd.c:2114`), and `userfaultfd_register()` turns that into
+       `-EINVAL` (`mm/userfaultfd.c:3658-3661`), so a userfaultfd context can
+       never be attached to memory the kernel may drop at any time.
+       `UFFD_USER_MODE_ONLY` is used so the creation itself is allowed without
+       `CAP_SYS_PTRACE` or a permissive `vm.unprivileged_userfaultfd`:
+
+       ```c
+       	if (flags & UFFD_USER_MODE_ONLY)
+       		return true;
+       ```
+
+       (`mm/userfaultfd.c:4481-4494`), which lets this assertion reach the
+       registration decision instead of stopping at the creation gate.  The
+       oracle kernel is built without CONFIG_USERFAULTFD
+       (`# CONFIG_USERFAULTFD is not set`), where userfaultfd(2) is ENOSYS from
+       the syscall stub whatever the flags are, so only there does the
+       unavailable-syscall branch run, and the note line records it. */
+    {
+        int uffd = (int)syscall(NR_USERFAULTFD,
+                                O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        if (uffd < 0) {
+            check(errno == ENOSYS || errno == EPERM,
+                  "madvise-droppable-uffd-unavailable");
+            printf("THEKERNEL_MM_NOTE droppable-uffd-unavailable errno=%d\n",
+                   errno);
+        } else {
+            struct uffdio_api api;
+            memset(&api, 0, sizeof(api));
+            api.api = UFFD_API_VALUE;
+            check(ioctl(uffd, UFFDIO_API_CMD, &api) == 0,
+                  "madvise-droppable-uffd-api");
+            unsigned char *watch = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                                        MAP_ANONYMOUS | MAP_DROPPABLE, -1, 0);
+            check(watch != MAP_FAILED, "madvise-droppable-uffd-mmap");
+            /* An ordinary anonymous VMA registers, so the refusal below is
+               the droppable property and not a broken registration call. */
+            unsigned char *control = pages(1);
+            struct uffdio_register reg;
+            memset(&reg, 0, sizeof(reg));
+            reg.range.start = (uint64_t)(uintptr_t)control;
+            reg.range.len = PAGE;
+            reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+            check(ioctl(uffd, UFFDIO_REGISTER_CMD, &reg) == 0,
+                  "madvise-plain-uffd-register");
+            memset(&reg, 0, sizeof(reg));
+            reg.range.start = (uint64_t)(uintptr_t)watch;
+            reg.range.len = PAGE;
+            reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+            ERROR(ioctl(uffd, UFFDIO_REGISTER_CMD, &reg), EINVAL,
+                  "madvise-droppable-uffd-register");
+            check(munmap(control, PAGE) == 0, "madvise-plain-uffd-cleanup");
+            check(munmap(watch, PAGE) == 0, "madvise-droppable-uffd-cleanup");
+            check(close(uffd) == 0, "madvise-droppable-uffd-close");
+        }
+    }
+    /* "refused" rather than "EINVAL" because the assertion covers both the
+       live-syscall arm (EINVAL) and the unavailable-syscall arm. */
+    mark("DROPPABLE_UFFDIO_REGISTER_REFUSED");
     done();
 }
 

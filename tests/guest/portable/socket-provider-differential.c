@@ -29,6 +29,32 @@
 #ifndef NETLINK_USERSOCK
 #define NETLINK_USERSOCK 2
 #endif
+/* include/uapi/asm-generic/socket.h names this program issues by number so it
+   does not depend on the guest libc's header revision. */
+#ifndef SO_BSDCOMPAT
+#define SO_BSDCOMPAT 14
+#endif
+#ifndef SO_RCVTIMEO_OLD
+#define SO_RCVTIMEO_OLD 20
+#endif
+#ifndef SO_SNDTIMEO_OLD
+#define SO_SNDTIMEO_OLD 21
+#endif
+#ifndef SO_SNDBUFFORCE
+#define SO_SNDBUFFORCE 32
+#endif
+#ifndef SO_RCVBUFFORCE
+#define SO_RCVBUFFORCE 33
+#endif
+#ifndef SO_PEEK_OFF
+#define SO_PEEK_OFF 42
+#endif
+#ifndef SO_RCVTIMEO_NEW
+#define SO_RCVTIMEO_NEW 66
+#endif
+#ifndef SO_SNDTIMEO_NEW
+#define SO_SNDTIMEO_NEW 67
+#endif
 
 static const char *active;
 static void begin(const char *name) { active = name; printf("THEKERNEL_ABI_CASE %s\n", name); }
@@ -311,6 +337,82 @@ static void netlink_policy(void) {
     errno = 0;
     mark("ROUTE_GROUP_ALLOWED", bind(fd, (struct sockaddr *)&groups, sizeof(groups)) == 0);
     close(fd);
+
+    /* `netlink_sendmsg()` derives `dst_group = ffs(addr->nl_groups)` and
+     * `dst_portid = addr->nl_pid`, broadcasts when a group is named, and then
+     * *always* hands the same skb to `netlink_unicast()` for `dst_portid`:
+     *
+     *     if (dst_group) {
+     *             refcount_inc(&skb->users);
+     *             netlink_broadcast(sk, skb, dst_portid, dst_group, GFP_KERNEL);
+     *     }
+     *     err = netlink_unicast(sk, skb, dst_portid, msg->msg_flags & MSG_DONTWAIT);
+     *
+     * (`net/netlink/af_netlink.c:1848-1849`, `:1894-1899`).  `do_one_broadcast()`
+     * skips the
+     * sender (`p->exclude_sk`) and the socket the address names
+     * (`nlk->portid == p->portid`, `:1430-1435`), which is what keeps
+     * `{nl_pid, nl_groups}` at exactly one copy for the named socket while the
+     * rest of the group still gets the broadcast copy.  A zero port ID has no
+     * peer to hand that copy to: `netlink_getsockbyportid()` looks the port up
+     * in the protocol's hash, `NETLINK_USERSOCK` registers no kernel socket
+     * (`netlink_add_usersock_entry()`, `:2850-2867`), and the missing socket is
+     * ECONNREFUSED (`:1140-1145`) even though the broadcast was delivered. */
+    {
+        int named = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+        check("GROUP_NAMED_SOCKET", named >= 0);
+        struct sockaddr_nl named_name = {.nl_family = AF_NETLINK,
+                                         .nl_groups = net_admin ? 1U : 0U};
+        socklen_t named_length = sizeof(named_name);
+        mark("GROUP_NAMED_BIND",
+             bind(named, (struct sockaddr *)&named_name, sizeof(named_name)) == 0 &&
+                 getsockname(named, (struct sockaddr *)&named_name, &named_length) == 0 &&
+                 named_name.nl_pid != 0);
+        int listener = -1;
+        if (net_admin) {
+            listener = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+            check("GROUP_LISTENER_SOCKET", listener >= 0);
+            struct sockaddr_nl listener_name = {.nl_family = AF_NETLINK, .nl_groups = 1};
+            check("GROUP_LISTENER_BIND",
+                  bind(listener, (struct sockaddr *)&listener_name, sizeof(listener_name)) == 0);
+        }
+        struct sockaddr_nl named_destination = {.nl_family = AF_NETLINK,
+                                                .nl_pid = named_name.nl_pid, .nl_groups = 1};
+        struct sockaddr_nl port_zero_destination = {.nl_family = AF_NETLINK,
+                                                    .nl_pid = 0, .nl_groups = 1};
+        int group_sender = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+        check("GROUP_SENDER_SOCKET", group_sender >= 0);
+        errno = 0;
+        mark("GROUP_NAMED_ADDRESS_DELIVERED",
+             sendto(group_sender, "g", 1, 0, (struct sockaddr *)&named_destination,
+                    sizeof(named_destination)) == 1);
+        char group_record[2] = {0, 0};
+        errno = 0;
+        mark("GROUP_NAMED_SINGLE_COPY",
+             recv(named, group_record, sizeof(group_record), MSG_DONTWAIT) == 1 &&
+                 group_record[0] == 'g' &&
+                 recv(named, group_record, sizeof(group_record), MSG_DONTWAIT) == -1 &&
+                 errno == EAGAIN);
+        if (listener >= 0) {
+            errno = 0;
+            mark("GROUP_LISTENER_LOOPBACK",
+                 net_admin && recv(listener, group_record, 1, MSG_DONTWAIT) == 1 &&
+                     group_record[0] == 'g');
+            close(listener);
+        } else {
+            /* Without CAP_NET_ADMIN no group subscription can exist at all,
+               which is what USERSOCK_GROUP_POLICY already asserts; the record
+               is still emitted so the case's assertion set does not depend on
+               the caller's capability set. */
+            mark("GROUP_LISTENER_LOOPBACK", !net_admin);
+        }
+        errno = 0;
+        mark("GROUP_PORT_ZERO_ECONNREFUSED",
+             sendto(group_sender, "h", 1, 0, (struct sockaddr *)&port_zero_destination,
+                    sizeof(port_zero_destination)) == -1 && errno == ECONNREFUSED);
+        close(group_sender);
+        close(named);
+    }
 }
 
 /* `sk_getsockopt` reports the `struct sock` state `sock_init_data_uid` seeds,
@@ -318,7 +420,7 @@ static void netlink_policy(void) {
  * hold on every configuration are asserted: the buffer values themselves come
  * from sysctl_, and the minima from CONFIG_ tunables. */
 static void sol_socket_table(void) {
-    int value = 0, expected = 0;
+    int value = 0, expected = 0, result = 0;
     socklen_t length = sizeof(value);
     struct linger linger = {0};
     int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -508,6 +610,208 @@ static void sol_socket_table(void) {
     mark("INET_NEGATIVE_RCVBUF_READS_MAX",
          getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &expected, &length) == 0 && expected == 8388608);
     close(fd);
+
+    /* `SO_RCVTIMEO`/`SO_SNDTIMEO` are seeded with the `MAX_SCHEDULE_TIMEOUT`
+     * sentinel, which `sock_get_timeout()` reports as `{0, 0}`
+     * (`net/core/sock.c:362-371`; `sock_init_data()` at `:3778-3785`).  A
+     * storing setter keeps the value in jiffies, `DIV_ROUND_UP`s a partial
+     * jiffy (`:449-452`) and both `_OLD`/`_NEW` spellings are the same state on
+     * x86_64, where `struct __kernel_old_timeval` is also 16 bytes
+     * (`:406-421`).  `tv_usec` outside `[0, USEC_PER_SEC)` is EDOM and a
+     * negative `tv_sec` stores the zero timeout instead of failing
+     * (`:432-444`). */
+    int net_admin = effective_capability(CAP_NET_ADMIN);
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("TIMEOUT_SOCKET", fd >= 0);
+    {
+        struct { long tv_sec, tv_usec; } tv;
+        socklen_t tvlen = sizeof(tv);
+        memset(&tv, 0xff, sizeof(tv));
+        mark("RCVTIMEO_FRESH_ZERO",
+             getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &tvlen) == 0 &&
+                 tvlen == sizeof(tv) && tv.tv_sec == 0 && tv.tv_usec == 0);
+        memset(&tv, 0xff, sizeof(tv));
+        tvlen = sizeof(tv);
+        mark("SNDTIMEO_FRESH_ZERO",
+             getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, &tvlen) == 0 &&
+                 tvlen == sizeof(tv) && tv.tv_sec == 0 && tv.tv_usec == 0);
+        tv.tv_sec = 0; tv.tv_usec = 1500;
+        check("RCVTIMEO_SET_NEW",
+              setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO_NEW, &tv, sizeof(tv)) == 0);
+        tv.tv_sec = 3; tv.tv_usec = 0;
+        check("SNDTIMEO_SET_OLD",
+              setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO_OLD, &tv, sizeof(tv)) == 0);
+        tvlen = sizeof(tv);
+        mark("RCVTIMEO_JIFFY_ROUND_TRIP",
+             getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO_OLD, &tv, &tvlen) == 0 &&
+                 tvlen == sizeof(tv) && tv.tv_sec == 0 && tv.tv_usec == 2000);
+        tvlen = sizeof(tv);
+        mark("SNDTIMEO_ROUND_TRIP",
+             getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO_NEW, &tv, &tvlen) == 0 &&
+                 tvlen == sizeof(tv) && tv.tv_sec == 3 && tv.tv_usec == 0);
+        tv.tv_sec = 0; tv.tv_usec = 1000000;
+        errno = 0;
+        mark("RCVTIMEO_INVALID_USEC_EDOM",
+             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == -1 && errno == EDOM);
+        tv.tv_sec = -1; tv.tv_usec = 0;
+        check("RCVTIMEO_NEGATIVE_SECONDS",
+              setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+        tvlen = sizeof(tv);
+        mark("RCVTIMEO_NEGATIVE_SECONDS_ZERO",
+             getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, &tvlen) == 0 &&
+                 tv.tv_sec == 0 && tv.tv_usec == 0);
+        errno = 0;
+        mark("RCVTIMEO_SHORT_LEN_EINVAL",
+             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv) - 1) == -1 &&
+                 errno == EINVAL);
+    }
+    /* `SO_BSDCOMPAT` is a `break` in both tables: the setter accepts and
+     * ignores the value and the getter's zeroed union reports zero
+     * (`net/core/sock.c:1425-1426`, `:1827-1828`). */
+    value = 1;
+    check("BSDCOMPAT_SET", setsockopt(fd, SOL_SOCKET, SO_BSDCOMPAT, &value, sizeof(value)) == 0);
+    value = -1; length = sizeof(value);
+    mark("BSDCOMPAT_READS_ZERO", getsockopt(fd, SOL_SOCKET, SO_BSDCOMPAT, &value, &length) == 0
+         && length == sizeof(value) && value == 0);
+    /* `SO_PEEK_OFF` is in the table but `netlink_ops` has no `set_peek_off`, so
+     * both directions answer EOPNOTSUPP rather than ENOPROTOOPT
+     * (`net/core/sock.c:1286-1295`, `:2033-2038`; `net/netlink/af_netlink.c`). */
+    value = 0;
+    errno = 0;
+    mark("PEEK_OFF_SET_EOPNOTSUPP",
+         setsockopt(fd, SOL_SOCKET, SO_PEEK_OFF, &value, sizeof(value)) == -1 &&
+             errno == EOPNOTSUPP);
+    value = -1; length = sizeof(value);
+    errno = 0;
+    mark("PEEK_OFF_GET_EOPNOTSUPP",
+         getsockopt(fd, SOL_SOCKET, SO_PEEK_OFF, &value, &length) == -1 && errno == EOPNOTSUPP);
+    close(fd);
+
+    /* The `*BUFFORCE` pair skips the `sysctl_*mem_max` clamp and needs only
+     * `sockopt_capable(CAP_NET_ADMIN)` (`net/core/sock.c:1355-1365`,
+     * `:1377-1385`), so a privileged caller stores twice one byte past the
+     * 4 MiB maximum.  An unprivileged one is refused with EPERM before any
+     * value is stored. */
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("FORCE_SOCKET", fd >= 0);
+    value = 4194305;
+    errno = 0;
+    result = setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &value, sizeof(value));
+    if (net_admin) {
+        expected = 0; length = sizeof(expected);
+        mark("RCVBUFFORCE_UNCLAMPED",
+             result == 0 && getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &expected, &length) == 0 &&
+                 expected == 8388610);
+    } else {
+        mark("RCVBUFFORCE_UNCLAMPED", result == -1 && errno == EPERM);
+    }
+    value = 4194305;
+    errno = 0;
+    result = setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &value, sizeof(value));
+    if (net_admin) {
+        expected = 0; length = sizeof(expected);
+        mark("SNDBUFFORCE_UNCLAMPED",
+             result == 0 && getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &expected, &length) == 0 &&
+                 expected == 8388610);
+    } else {
+        mark("SNDBUFFORCE_UNCLAMPED", result == -1 && errno == EPERM);
+    }
+    close(fd);
+
+    /* `netlink_sendmsg()` measures the datagram against the sending socket's
+     * own `sk_sndbuf` rather than a constant shared by every netlink socket:
+     *
+     *     err = -EMSGSIZE;
+     *     if (len > sk->sk_sndbuf - 32)
+     *             goto out;
+     *
+     * (`net/netlink/af_netlink.c:1868-1871`).  The check precedes
+     * `netlink_unicast()`, so an unbound destination port proves the budget on
+     * its own: a length inside the budget reaches the port lookup and reports
+     * ECONNREFUSED, one byte past it reports EMSGSIZE.  `SO_SNDBUF` stores
+     * `max(val * 2, SOCK_MIN_SNDBUF)` (`net/core/sock.c:1342-1352`). */
+    {
+        struct sockaddr_nl absent = {.nl_family = AF_NETLINK, .nl_pid = 990001};
+        char *payload = malloc(400000);
+        check("SNDBUF_PAYLOAD", payload != NULL);
+        memset(payload, 0x41, 400000);
+
+        int sender = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+        check("SNDBUF_SENDER_SOCKET", sender >= 0);
+        errno = 0;
+        mark("SNDBUF_DEFAULT_ADMITS_212960",
+             sendto(sender, payload, 212960, MSG_DONTWAIT, (struct sockaddr *)&absent,
+                    sizeof(absent)) == -1 && errno == ECONNREFUSED);
+        errno = 0;
+        mark("SNDBUF_DEFAULT_REFUSES_212961",
+             sendto(sender, payload, 212961, MSG_DONTWAIT, (struct sockaddr *)&absent,
+                    sizeof(absent)) == -1 && errno == EMSGSIZE);
+        value = 262144;
+        check("SNDBUF_RAISE", setsockopt(sender, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) == 0);
+        errno = 0;
+        mark("SNDBUF_RAISED_ADMITS_400000",
+             sendto(sender, payload, 400000, MSG_DONTWAIT, (struct sockaddr *)&absent,
+                    sizeof(absent)) == -1 && errno == ECONNREFUSED);
+        close(sender);
+
+        sender = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+        check("SNDBUF_FLOOR_SOCKET", sender >= 0);
+        value = 2048;
+        check("SNDBUF_FLOOR_SET", setsockopt(sender, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) == 0);
+        expected = 0; length = sizeof(expected);
+        mark("SNDBUF_FLOOR_4608",
+             getsockopt(sender, SOL_SOCKET, SO_SNDBUF, &expected, &length) == 0 && expected == 4608);
+        errno = 0;
+        mark("SNDBUF_FLOOR_ADMITS_4576",
+             sendto(sender, payload, 4576, MSG_DONTWAIT, (struct sockaddr *)&absent,
+                    sizeof(absent)) == -1 && errno == ECONNREFUSED);
+        errno = 0;
+        mark("SNDBUF_FLOOR_REFUSES_4577",
+             sendto(sender, payload, 4577, MSG_DONTWAIT, (struct sockaddr *)&absent,
+                    sizeof(absent)) == -1 && errno == EMSGSIZE);
+        close(sender);
+        free(payload);
+    }
+
+    /* A receive queue accounts against the receiving socket's `sk_rcvbuf`,
+     * but `netlink_attachskb()` exempts the first datagram of an empty queue
+     * so a datagram that already passed the sender's budget is never lost to
+     * EAGAIN:
+     *
+     *     if ((rmem == skb->truesize || rmem <= READ_ONCE(sk->sk_rcvbuf)) &&
+     *         !test_bit(NETLINK_S_CONGESTED, &nlk->state)) {
+     *
+     * (`net/netlink/af_netlink.c:1216-1223`).  With `sk_rcvbuf` shrunk to
+     * 4096 the first 16 KiB datagram is admitted and the second is refused
+     * with EAGAIN by the non-blocking send (`:1230-1236`). */
+    {
+        struct sockaddr_nl receiver_name = {.nl_family = AF_NETLINK};
+        socklen_t receiver_length = sizeof(receiver_name);
+        int receiver = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+        check("RCVBUF_RECEIVER_SOCKET", receiver >= 0);
+        check("RCVBUF_RECEIVER_BIND",
+              bind(receiver, (struct sockaddr *)&receiver_name, sizeof(receiver_name)) == 0 &&
+                  getsockname(receiver, (struct sockaddr *)&receiver_name, &receiver_length) == 0);
+        value = 2048;
+        check("RCVBUF_SHRINK", setsockopt(receiver, SOL_SOCKET, SO_RCVBUF, &value, sizeof(value)) == 0);
+        struct sockaddr_nl destination = {.nl_family = AF_NETLINK, .nl_pid = receiver_name.nl_pid};
+        int sender = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+        check("RCVBUF_SENDER_SOCKET", sender >= 0);
+        char *payload = malloc(16384);
+        check("RCVBUF_PAYLOAD", payload != NULL);
+        memset(payload, 0x42, 16384);
+        errno = 0;
+        mark("RCVBUF_FIRST_DATAGRAM_ADMITTED",
+             sendto(sender, payload, 16384, MSG_DONTWAIT, (struct sockaddr *)&destination,
+                    sizeof(destination)) == 16384);
+        errno = 0;
+        mark("RCVBUF_SECOND_DATAGRAM_EAGAIN",
+             sendto(sender, payload, 16384, MSG_DONTWAIT, (struct sockaddr *)&destination,
+                    sizeof(destination)) == -1 && errno == EAGAIN);
+        free(payload);
+        close(sender);
+        close(receiver);
+    }
 }
 
 /* `netlink_setsockopt`/`netlink_getsockopt` own SOL_NETLINK.  The boolean
