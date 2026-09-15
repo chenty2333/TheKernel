@@ -70,7 +70,13 @@ use crate::mm::{
 pub(crate) const RING_WAITER_SLOTS: usize = 64;
 const PAGE_BYTES: usize = PageSize::Size4K as usize;
 const IO_URING_GLOBAL_REQUEST_SLOTS: usize = 65_536;
-const IO_URING_GLOBAL_FIXED_FILE_SLOTS: usize = 65_536;
+/// Profile-wide fixed-file slot budget.  It equals Linux's per-ring
+/// `IORING_MAX_FIXED_FILES` so that every count one ring may legally register
+/// is within budget; only several rings holding that many slots at once can
+/// exceed it, and the refusal then reports Linux's own allocation-failure
+/// errno (`-ENOMEM`) instead of `-ENFILE`, which
+/// `io_sqe_files_register()` never returns.
+const IO_URING_GLOBAL_FIXED_FILE_SLOTS: usize = IORING_MAX_FIXED_FILES as usize;
 const IO_URING_GLOBAL_REGISTERED_BUFFER_SLOTS: usize = 65_536;
 
 const IO_URING_PHYSICAL_MAX_QD: usize = 32;
@@ -1060,6 +1066,15 @@ impl IoUring {
     pub(crate) const fn sqpoll_enabled(&self) -> bool {
         self.sqpoll
     }
+    /// Whether a failed SQE leaves the rest of the batch for the next enter.
+    ///
+    /// `io_submit_sqes()` keeps consuming SQEs after a request whose
+    /// `io_init_req()` failed only when the ring carries
+    /// `IORING_SETUP_SUBMIT_ALL` (`io_uring/io_uring.c:2053-2062`).
+    pub(crate) const fn continues_batch_after_failure(&self) -> bool {
+        self.layout.setup_flags().contains(SetupFlags::SUBMIT_ALL)
+    }
+
     pub(crate) const fn iopoll_enabled(&self) -> bool {
         self.iopoll
     }
@@ -1362,7 +1377,9 @@ impl IoUring {
         self.sqes.read_bytes(offset, &mut bytes)?;
         let copied = CopiedSubmission::new(bytes);
         let descriptor = copied.descriptor();
-        let parsed = copied.parse();
+        let parsed = copied.parse_in(tk_linux_io_uring::SubmissionContext::new(
+            self.iopoll_enabled(),
+        ));
 
         let mut state = self.state.lock();
         let reservation = match state.requests.reserve(descriptor) {

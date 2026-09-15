@@ -26,15 +26,19 @@ pub(super) struct FixedFileSlotCharge(usize);
 
 impl FixedFileSlotCharge {
     pub(super) fn try_new(slots: usize) -> AxResult<Self> {
-        if slots > crate::task::AX_FILE_LIMIT {
-            return Err(AxError::from(LinuxError::EMFILE));
-        }
+        // The fixed-file table is not the process descriptor table: Linux
+        // bounds one ring's table by `IORING_MAX_FIXED_FILES` and the
+        // caller's `RLIMIT_NOFILE` alone (`io_uring/rsrc.c:624-631`, both
+        // applied by `admit_registered_files()`), never by the descriptor
+        // table's own size.  Only the profile-wide slot budget below can
+        // still refuse a count that Linux would accept, and it can only do so
+        // once that many slots are already held across every ring.
         IO_URING_FIXED_FILE_SLOTS
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(slots)
                     .filter(|next| *next <= IO_URING_GLOBAL_FIXED_FILE_SLOTS)
             })
-            .map_err(|_| AxError::from(LinuxError::ENFILE))?;
+            .map_err(|_| AxError::NoMemory)?;
         Ok(Self(slots))
     }
 }
@@ -847,6 +851,15 @@ impl IoUring {
         }
         state.completion_eventfd = Some(eventfd);
         Ok(())
+    }
+
+    /// Whether a completion eventfd is already published.
+    ///
+    /// `io_eventfd_register()` reads this state, and answers `-EBUSY` from it,
+    /// before it copies the caller's descriptor or resolves it
+    /// (`io_uring/eventfd.c:127-134`).
+    pub(crate) fn completion_eventfd_registered(&self) -> bool {
+        self.state.lock().completion_eventfd.is_some()
     }
 
     pub(crate) fn unregister_completion_eventfd(&self) -> AxResult<()> {

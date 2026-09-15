@@ -9,6 +9,18 @@ const IOSQE_IO_LINK: u8 = 1 << 2;
 const IOSQE_IO_HARDLINK: u8 = 1 << 3;
 /// The SQE selects one lease from `buf_group` instead of using `addr`.
 const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
+const IOSQE_CQE_SKIP_SUCCESS: u8 = 1 << 6;
+/// `SQE_VALID_FLAGS` (`io_uring/io_uring.h:86-92`): every flag bit
+/// `io_init_req()` accepts.  A bit outside this mask is rejected with
+/// `-EINVAL` before any per-opcode rule runs
+/// (`io_uring/io_uring.c:1774-1777`).
+const SQE_VALID_FLAGS: u8 = IOSQE_FIXED_FILE
+    | IOSQE_IO_DRAIN
+    | IOSQE_IO_LINK
+    | IOSQE_IO_HARDLINK
+    | (1 << 4)
+    | IOSQE_BUFFER_SELECT
+    | IOSQE_CQE_SKIP_SUCCESS;
 
 const IORING_OP_NOP: u8 = 0;
 const IORING_OP_READV: u8 = 1;
@@ -35,6 +47,50 @@ const IORING_OP_OPENAT2: u8 = 28;
 const IORING_OP_PROVIDE_BUFFERS: u8 = 31;
 const IORING_OP_REMOVE_BUFFERS: u8 = 32;
 const IORING_OP_URING_CMD: u8 = 46;
+
+// Linux v7.2.3 `enum io_uring_op` (`include/uapi/linux/io_uring.h`), in
+// opcode order: the crate names every opcode of the pinned UAPI enum so
+// classification and validation cannot be narrower than the kernel's.
+const IORING_OP_SENDMSG: u8 = 9;
+const IORING_OP_RECVMSG: u8 = 10;
+const IORING_OP_LINK_TIMEOUT: u8 = 15;
+const IORING_OP_CONNECT: u8 = 16;
+const IORING_OP_OPENAT: u8 = 18;
+const IORING_OP_FILES_UPDATE: u8 = 20;
+const IORING_OP_STATX: u8 = 21;
+const IORING_OP_MADVISE: u8 = 25;
+const IORING_OP_EPOLL_CTL: u8 = 29;
+const IORING_OP_SPLICE: u8 = 30;
+const IORING_OP_TEE: u8 = 33;
+const IORING_OP_RENAMEAT: u8 = 35;
+const IORING_OP_UNLINKAT: u8 = 36;
+const IORING_OP_MKDIRAT: u8 = 37;
+const IORING_OP_SYMLINKAT: u8 = 38;
+const IORING_OP_LINKAT: u8 = 39;
+const IORING_OP_MSG_RING: u8 = 40;
+const IORING_OP_FSETXATTR: u8 = 41;
+const IORING_OP_SETXATTR: u8 = 42;
+const IORING_OP_FGETXATTR: u8 = 43;
+const IORING_OP_GETXATTR: u8 = 44;
+const IORING_OP_SOCKET: u8 = 45;
+const IORING_OP_SEND_ZC: u8 = 47;
+const IORING_OP_SENDMSG_ZC: u8 = 48;
+const IORING_OP_READ_MULTISHOT: u8 = 49;
+const IORING_OP_WAITID: u8 = 50;
+const IORING_OP_FUTEX_WAIT: u8 = 51;
+const IORING_OP_FUTEX_WAKE: u8 = 52;
+const IORING_OP_FUTEX_WAITV: u8 = 53;
+const IORING_OP_FIXED_FD_INSTALL: u8 = 54;
+const IORING_OP_FTRUNCATE: u8 = 55;
+const IORING_OP_BIND: u8 = 56;
+const IORING_OP_LISTEN: u8 = 57;
+const IORING_OP_RECV_ZC: u8 = 58;
+const IORING_OP_EPOLL_WAIT: u8 = 59;
+const IORING_OP_READV_FIXED: u8 = 60;
+const IORING_OP_WRITEV_FIXED: u8 = 61;
+const IORING_OP_PIPE: u8 = 62;
+const IORING_OP_NOP128: u8 = 63;
+const IORING_OP_URING_CMD128: u8 = 64;
 /// First opcode outside the Linux v7.2.3 UAPI enum.
 pub const PINNED_IORING_OP_LAST: u8 = 65;
 
@@ -66,9 +122,9 @@ pub struct SubmissionDependencies {
 
 impl SubmissionDependencies {
     const fn parse(bits: u8) -> Result<Self, IoUringError> {
-        if bits & IOSQE_IO_LINK != 0 && bits & IOSQE_IO_HARDLINK != 0 {
-            return Err(IoUringError::UnsupportedSubmissionFlags);
-        }
+        // Both link bits at once are a tolerated state in Linux, where the
+        // hard link survives and the extra link bit is ignored
+        // (`io_uring/io_uring.c:1660-1668`: "Extra REQ_F_LINK is tolerated").
         Ok(Self {
             drain: bits & IOSQE_IO_DRAIN != 0,
             link: if bits & IOSQE_IO_HARDLINK != 0 {
@@ -85,6 +141,99 @@ impl SubmissionDependencies {
     }
     pub const fn link(self) -> SubmissionLink {
         self.link
+    }
+}
+
+/// Ring and opcode properties `io_init_req()` consults before any `prep`
+/// handler runs.
+///
+/// Linux reads `ctx->flags` and `io_issue_defs[opcode]` first
+/// (`io_uring/io_uring.c:1730-1843`), so these rules apply to every opcode and
+/// outrank every operation-specific field check.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SubmissionContext {
+    iopoll: bool,
+}
+
+impl SubmissionContext {
+    /// Context of a ring whose `IORING_SETUP_IOPOLL` bit is `iopoll`.
+    pub const fn new(iopoll: bool) -> Self {
+        Self { iopoll }
+    }
+
+    /// Whether a non-polled opcode must be rejected on this ring.
+    pub const fn iopoll(self) -> bool {
+        self.iopoll
+    }
+}
+
+/// The `io_issue_defs[]` fields that decide `io_init_req()`'s own errnos.
+///
+/// Each field is `true` exactly when Linux sets it for that opcode in
+/// `io_uring/opdef.c`'s `io_issue_defs[]`, whose `[IORING_OP_NOP]`
+/// initializer begins at line 55 and whose `[IORING_OP_URING_CMD128]`
+/// initializer begins at line 584.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpcodeDefinition {
+    /// `.buffer_select`: `IOSQE_BUFFER_SELECT` is accepted only here
+    /// (`io_uring/io_uring.c:1778-1780`).
+    pub buffer_select: bool,
+    /// `.ioprio`: a non-zero `sqe->ioprio` is accepted only here
+    /// (`io_uring/io_uring.c:1805-1806`).
+    pub ioprio: bool,
+    /// `.iopoll`: the opcode is legal on an `IORING_SETUP_IOPOLL` ring
+    /// (`io_uring/io_uring.c:1807-1808`).
+    pub iopoll: bool,
+    /// `.is_128`: the operation occupies two SQEs and needs
+    /// `IORING_SETUP_SQE128` or `IORING_SETUP_SQE_MIXED`
+    /// (`io_uring/io_uring.c:1756-1763`).
+    pub is_128: bool,
+}
+
+/// Returns the v7.2.3 `io_issue_defs[]` flags of one opcode.
+pub const fn opcode_definition(opcode: u8) -> OpcodeDefinition {
+    let (buffer_select, ioprio, iopoll, is_128) = match opcode {
+            IORING_OP_READV | IORING_OP_READ
+            => (true, true, true, false),
+            IORING_OP_RECVMSG | IORING_OP_SEND | IORING_OP_RECV
+            => (true, true, false, false),
+            IORING_OP_URING_CMD
+            => (true, false, true, false),
+            IORING_OP_URING_CMD128
+            => (true, false, true, true),
+            IORING_OP_READ_MULTISHOT
+            => (true, false, false, false),
+            IORING_OP_WRITEV | IORING_OP_READ_FIXED | IORING_OP_WRITE_FIXED | IORING_OP_WRITE |
+            IORING_OP_READV_FIXED | IORING_OP_WRITEV_FIXED
+            => (false, true, true, false),
+            IORING_OP_SENDMSG | IORING_OP_ACCEPT | IORING_OP_SEND_ZC | IORING_OP_SENDMSG_ZC |
+            IORING_OP_RECV_ZC
+            => (false, true, false, false),
+            IORING_OP_NOP | IORING_OP_FILES_UPDATE | IORING_OP_PROVIDE_BUFFERS |
+            IORING_OP_REMOVE_BUFFERS | IORING_OP_MSG_RING
+            => (false, false, true, false),
+            IORING_OP_NOP128
+            => (false, false, true, true),
+            IORING_OP_FSYNC | IORING_OP_POLL_ADD | IORING_OP_POLL_REMOVE |
+            IORING_OP_SYNC_FILE_RANGE | IORING_OP_TIMEOUT | IORING_OP_TIMEOUT_REMOVE |
+            IORING_OP_ASYNC_CANCEL | IORING_OP_LINK_TIMEOUT | IORING_OP_CONNECT |
+            IORING_OP_FALLOCATE | IORING_OP_OPENAT | IORING_OP_CLOSE | IORING_OP_STATX |
+            IORING_OP_FADVISE | IORING_OP_MADVISE | IORING_OP_OPENAT2 | IORING_OP_EPOLL_CTL |
+            IORING_OP_SPLICE | IORING_OP_TEE | IORING_OP_SHUTDOWN | IORING_OP_RENAMEAT |
+            IORING_OP_UNLINKAT | IORING_OP_MKDIRAT | IORING_OP_SYMLINKAT | IORING_OP_LINKAT |
+            IORING_OP_FSETXATTR | IORING_OP_SETXATTR | IORING_OP_FGETXATTR |
+            IORING_OP_GETXATTR | IORING_OP_SOCKET | IORING_OP_WAITID | IORING_OP_FUTEX_WAIT |
+            IORING_OP_FUTEX_WAKE | IORING_OP_FUTEX_WAITV | IORING_OP_FIXED_FD_INSTALL |
+            IORING_OP_FTRUNCATE | IORING_OP_BIND | IORING_OP_LISTEN | IORING_OP_EPOLL_WAIT |
+            IORING_OP_PIPE
+            => (false, false, false, false),
+            _ => (false, false, false, false),
+    };
+    OpcodeDefinition {
+        buffer_select,
+        ioprio,
+        iopoll,
+        is_128,
     }
 }
 
@@ -650,9 +799,14 @@ impl CopiedSubmission {
         RequestDescriptor::new(self.user_data(), operation)
     }
 
-    /// Strictly decodes the private copy.
+    /// Strictly decodes the private copy of a ring without extra setup flags.
     pub fn parse(self) -> Result<ParsedSubmission, IoUringError> {
-        ParsedSubmission::parse_copied(self.bytes)
+        self.parse_in(SubmissionContext::default())
+    }
+
+    /// Strictly decodes the private copy under `context`.
+    pub fn parse_in(self, context: SubmissionContext) -> Result<ParsedSubmission, IoUringError> {
+        ParsedSubmission::parse_copied(self.bytes, context)
     }
 }
 
@@ -666,10 +820,59 @@ impl ParsedSubmission {
         CopiedSubmission::new(bytes).parse()
     }
 
-    fn parse_copied(bytes: [u8; SQE_BYTES as usize]) -> Result<Self, IoUringError> {
+    /// Parses an already copied SQE of a ring described by `context`.
+    pub fn parse_in(
+        bytes: [u8; SQE_BYTES as usize],
+        context: SubmissionContext,
+    ) -> Result<Self, IoUringError> {
+        CopiedSubmission::new(bytes).parse_in(context)
+    }
+
+    fn parse_copied(
+        bytes: [u8; SQE_BYTES as usize],
+        context: SubmissionContext,
+    ) -> Result<Self, IoUringError> {
         let raw = RawSubmissionEntry::new(bytes).decode();
         let opcode = raw.opcode;
         let original_sqe_flags = raw.flags;
+        // `io_init_req()` judges the opcode, the ring's SQE size, the flag
+        // vocabulary and the three per-opcode `io_issue_defs[]` fields before
+        // any `prep` handler runs (`io_uring/io_uring.c:1749-1808`):
+        //
+        //     if (unlikely(req->opcode >= IORING_OP_LAST)) return -EINVAL;
+        //     if (def->is_128 && !(ctx->flags & IORING_SETUP_SQE128)) ...
+        //     if (sqe_flags & ~SQE_VALID_FLAGS) return -EINVAL;
+        //     if (sqe_flags & IOSQE_BUFFER_SELECT && !def->buffer_select)
+        //             return -EOPNOTSUPP;
+        //     if (!def->ioprio && sqe->ioprio) return -EINVAL;
+        //     if (!def->iopoll && (ctx->flags & IORING_SETUP_IOPOLL))
+        //             return -EINVAL;
+        //
+        // The opcode range is judged first so that an opcode outside the enum
+        // keeps -EINVAL even when its other fields are malformed.
+        if opcode >= PINNED_IORING_OP_LAST {
+            return Err(IoUringError::UnknownOpcode);
+        }
+        let definition = opcode_definition(opcode);
+        if definition.is_128 {
+            // A 128-byte operation needs `IORING_SETUP_SQE128`, or
+            // `IORING_SETUP_SQE_MIXED` plus a second free SQ entry; this
+            // profile accepts neither ring flag, so the second half of such an
+            // operation can never be read.
+            return Err(IoUringError::InvalidSubmission);
+        }
+        if original_sqe_flags & !SQE_VALID_FLAGS != 0 {
+            return Err(IoUringError::InvalidSubmission);
+        }
+        if original_sqe_flags & IOSQE_BUFFER_SELECT != 0 && !definition.buffer_select {
+            return Err(IoUringError::UnsupportedSubmissionFlags);
+        }
+        if raw.ioprio != 0 && !definition.ioprio {
+            return Err(IoUringError::InvalidSubmission);
+        }
+        if context.iopoll() && !definition.iopoll {
+            return Err(IoUringError::InvalidSubmission);
+        }
         let dependencies = SubmissionDependencies::parse(original_sqe_flags)?;
         let sqe_flags = original_sqe_flags & !(IOSQE_IO_DRAIN | IOSQE_IO_LINK | IOSQE_IO_HARDLINK);
         let ioprio = raw.ioprio;
@@ -1137,10 +1340,10 @@ impl ParsedSubmission {
                     target_user_data: address,
                 }
             }
-            opcode if opcode < PINNED_IORING_OP_LAST => {
-                return Err(IoUringError::UnsupportedOpcode);
-            }
-            _ => return Err(IoUringError::UnknownOpcode),
+            // Every remaining v7.2.3 opcode is recognized but not implemented
+            // by this profile, so it needs an answer from the point of no
+            // return rather than a decode-time rejection.
+            _ => return Err(IoUringError::UnsupportedOpcode),
         };
 
         Ok(Self {
@@ -1280,8 +1483,11 @@ mod tests {
 
     #[test]
     fn pinned_known_and_unknown_opcodes_are_distinct() {
+        // IORING_OP_SPLICE (30) is inside the pinned v7.2.3 enum and is not
+        // implemented, so it is decoded and answered at the point of no
+        // return; only an opcode outside the enum is a decode rejection.
         assert_eq!(
-            ParsedSubmission::parse(sqe(PINNED_IORING_OP_LAST - 1, 1)),
+            ParsedSubmission::parse(sqe(IORING_OP_SPLICE, 1)),
             Err(IoUringError::UnsupportedOpcode)
         );
         assert_eq!(
@@ -1291,6 +1497,72 @@ mod tests {
         assert_eq!(
             classify_submission_opcode(PINNED_IORING_OP_LAST),
             SubmissionOpcodeSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn io_init_req_rejects_before_any_opcode_body() {
+        // `if (def->is_128 && !(ctx->flags & IORING_SETUP_SQE128))` is -EINVAL
+        // (`io_uring/io_uring.c:1756-1763`), and this profile accepts neither
+        // `IORING_SETUP_SQE128` nor `IORING_SETUP_SQE_MIXED`.
+        for opcode in [IORING_OP_NOP128, IORING_OP_URING_CMD128] {
+            assert_eq!(
+                ParsedSubmission::parse(sqe(opcode, 1)),
+                Err(IoUringError::InvalidSubmission)
+            );
+        }
+        // `if (sqe_flags & ~SQE_VALID_FLAGS) return -EINVAL;`
+        // (`io_uring/io_uring.c:1774-1777`) holds for every opcode, including
+        // the ones this profile does not implement.
+        let mut bytes = sqe(IORING_OP_SPLICE, 1);
+        bytes[1] = 1 << 7;
+        assert_eq!(
+            ParsedSubmission::parse(bytes),
+            Err(IoUringError::InvalidSubmission)
+        );
+        // `if (sqe_flags & IOSQE_BUFFER_SELECT && !def->buffer_select)
+        // return -EOPNOTSUPP;` (`io_uring/io_uring.c:1778-1780`): WRITE has no
+        // provided-buffer support in `io_issue_defs[]`.
+        let mut bytes = sqe(IORING_OP_WRITE, 1);
+        bytes[1] = IOSQE_BUFFER_SELECT;
+        assert_eq!(
+            ParsedSubmission::parse(bytes),
+            Err(IoUringError::UnsupportedSubmissionFlags)
+        );
+        // `if (!def->ioprio && sqe->ioprio) return -EINVAL;`
+        // (`io_uring/io_uring.c:1805-1806`): NOP carries no io priority field.
+        let mut bytes = sqe(IORING_OP_NOP, 1);
+        bytes[2..4].copy_from_slice(&7_u16.to_le_bytes());
+        assert_eq!(
+            ParsedSubmission::parse(bytes),
+            Err(IoUringError::InvalidSubmission)
+        );
+        // `if (!def->iopoll && (ctx->flags & IORING_SETUP_IOPOLL))
+        // return -EINVAL;` (`io_uring/io_uring.c:1807-1808`): NOP is pollable,
+        // FSYNC is not.
+        let iopoll = SubmissionContext::new(true);
+        assert!(ParsedSubmission::parse_in(sqe(IORING_OP_NOP, 1), iopoll).is_ok());
+        assert_eq!(
+            ParsedSubmission::parse_in(sqe(IORING_OP_FSYNC, 1), iopoll),
+            Err(IoUringError::InvalidSubmission)
+        );
+        // The same FSYNC is valid on a ring without IORING_SETUP_IOPOLL.
+        assert!(ParsedSubmission::parse(sqe(IORING_OP_FSYNC, 1)).is_ok());
+    }
+
+    #[test]
+    fn both_link_flags_select_the_hard_link() {
+        // `io_uring/io_uring.c:1660-1668` keeps both REQ_F_LINK and
+        // REQ_F_HARDLINK and lets the hard link survive.
+        let mut bytes = sqe(IORING_OP_NOP, 1);
+        bytes[1] = IOSQE_IO_LINK | IOSQE_IO_HARDLINK;
+        let parsed = ParsedSubmission::parse(bytes).unwrap();
+        assert_eq!(parsed.dependencies().link(), SubmissionLink::Hard);
+
+        bytes[1] = IOSQE_IO_LINK;
+        assert_eq!(
+            ParsedSubmission::parse(bytes).unwrap().dependencies().link(),
+            SubmissionLink::Soft
         );
     }
 

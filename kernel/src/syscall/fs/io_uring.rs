@@ -29,7 +29,8 @@ use tk_linux_io_uring::{
     BufferSlot, EnterFlags, EnterRequest, FeatureFlags, FileTarget, IO_URING_PARAMS_BYTES,
     IoUringError, IoUringGeteventsArg, IoUringParams, LegacySignalMask, ParsedSubmission,
     PreparedRequest, ReadWriteRequest, RegistrationOperation, RegistrationRequest, SetupRequest,
-    SubmissionOperation, TerminalCause, encode_probe, probe_output_bytes,
+    RegistrationDispatch, SubmissionOperation, TerminalCause, UnsupportedOutcome,
+    UnsupportedRegistration, encode_probe, probe_output_bytes,
 };
 use tk_linux_signal::SignalSet;
 
@@ -164,6 +165,11 @@ fn validate_mem_region_user_range(address: usize, length: usize) -> AxResult<()>
     Ok(())
 }
 
+/// Largest fixed-size registration record Linux copies before a body runs:
+/// `struct zcrx_ctrl` and `struct io_uring_bpf` are both eight bytes wider than
+/// the resource records.
+const IO_URING_CONTROL_RECORD_BYTES: usize = 72;
+
 fn map_policy_error(error: IoUringError) -> AxError {
     use IoUringError::*;
 
@@ -188,6 +194,13 @@ fn map_policy_error(error: IoUringError) -> AxError {
         | CurrentPositionUnsupported
         | UnsupportedRegistration => AxError::OperationNotSupported,
         Overflow | GenerationExhausted => AxError::OutOfRange,
+        // `check_add_overflow(offset, nr_args)` in `io_register_files_update()`
+        // and `io_register_rsrc_update()` is Linux's -EOVERFLOW, which is not
+        // this profile's own range error.
+        RegistrationRangeOverflow => AxError::from(LinuxError::EOVERFLOW),
+        // A reserved registration field Linux rejects as a fault, such as
+        // `zcrx_ctrl.__resv` (`io_uring/zcrx.c:1434-1435`).
+        RegistrationFault => AxError::BadAddress,
         _ => AxError::InvalidInput,
     }
 }
@@ -741,10 +754,29 @@ pub fn sys_io_uring_register(
     nr_args: u32,
 ) -> AxResult<isize> {
     let request = RegistrationRequest::new(opcode, arg as u64, nr_args);
-    // Linux rejects opcodes beyond the fixed v6.18 enum before fd lookup.
+    // Linux rejects opcodes beyond the fixed v7.2.3 enum before fd lookup.
     // For every recognized opcode, resolve the requested normal/registered
     // ring first so EBADF/EOPNOTSUPP outrank operation-body EINVAL/EFAULT.
     request.validate_envelope().map_err(map_policy_error)?;
+    // "Blind" registration opcodes are dispatched without a ring and every
+    // other opcode supplied with `fd == -1` is -EINVAL:
+    //
+    //     if (fd == -1)
+    //             return io_uring_register_blind(opcode, arg, nr_args);
+    //
+    // (`io_uring/register.c:1029-1030`, `:998-1013`).
+    let dispatch = if fd == -1 {
+        if !request.blind() {
+            return Err(AxError::from(LinuxError::EINVAL));
+        }
+        RegistrationDispatch::Blind
+    } else {
+        RegistrationDispatch::Ring
+    };
+    if dispatch == RegistrationDispatch::Blind {
+        let operation = request.decode(dispatch).map_err(map_policy_error)?;
+        return blind_registration(&capability, operation);
+    }
     let ring = if request.use_registered_ring() {
         registered_ring(fd)?
     } else {
@@ -752,7 +784,7 @@ pub fn sys_io_uring_register(
     };
     let world = axtask::current().as_thread().proc_data.world;
     ring.admit_world(world)?;
-    let operation = request.decode().map_err(map_policy_error)?;
+    let operation = request.decode(dispatch).map_err(map_policy_error)?;
     match operation {
         RegistrationOperation::RegisterBuffers { argument, count } => {
             let buffers = copy_registered_buffers(&capability, argument, count)?;
@@ -778,8 +810,19 @@ pub fn sys_io_uring_register(
             ring.register_files(files)?;
         }
         RegistrationOperation::UnregisterFiles => ring.unregister_files()?,
-        RegistrationOperation::RegisterEventFd { fd } => {
-            ring.register_completion_eventfd(get_typed_file::<EventFd>(fd)?)?
+        RegistrationOperation::RegisterEventFd { address } => {
+            // `io_eventfd_register()` answers -EBUSY from the published
+            // eventfd before it reads the caller's descriptor
+            // (`io_uring/eventfd.c:127-134`), then takes that descriptor
+            // through `copy_from_user()` as an `__s32` pointer, so the
+            // argument is an address and `eventfd_ctx_fdget()` owns -EBADF.
+            if ring.completion_eventfd_registered() {
+                return Err(AxError::ResourceBusy);
+            }
+            ring.register_completion_eventfd(get_typed_file::<EventFd>(copy_registration_fd(
+                &capability,
+                address,
+            )?)?)?
         }
         RegistrationOperation::UnregisterEventFd => ring.unregister_completion_eventfd()?,
         RegistrationOperation::Probe {
@@ -802,8 +845,86 @@ pub fn sys_io_uring_register(
                 ring.wake_sqpoll();
             }
         }
+        // `io_query()` walks a NULL chain head and returns zero
+        // (`io_uring/query.c:125-131`), with or without a ring.
+        RegistrationOperation::QueryEmpty => return Ok(0),
+        RegistrationOperation::Unsupported(unsupported) => {
+            return Err(unsupported_registration(&capability, unsupported));
+        }
     }
     Ok(0)
+}
+
+/// Answers one registration record dispatched without a ring.
+///
+/// Linux's ring-less entry handles `IORING_REGISTER_SEND_MSG_RING`,
+/// `IORING_REGISTER_QUERY`, `IORING_REGISTER_RESTRICTIONS` and
+/// `IORING_REGISTER_BPF_FILTER` and answers every other opcode with -EINVAL
+/// (`io_uring/register.c:998-1013`).  None of those four bodies exists in this
+/// profile, but each still applies its own record shape first: `io_query()`
+/// requires a zero `nr_args` (`io_uring/query.c:129-130`), the blind MSG_RING
+/// entry requires `arg && nr_args == 1` (`io_uring/register.c:979-980`), and
+/// the task restriction and BPF filter paths reject a malformed record before
+/// they allocate anything.
+fn blind_registration(
+    capability: &UserMemoryCapability,
+    operation: RegistrationOperation,
+) -> AxResult<isize> {
+    match operation {
+        RegistrationOperation::QueryEmpty => Ok(0),
+        RegistrationOperation::Unsupported(unsupported) => {
+            Err(unsupported_registration(capability, unsupported))
+        }
+        _ => Err(AxError::InvalidInput),
+    }
+}
+
+/// Applies the pre-body header of a registration opcode this profile cannot
+/// service and then reports the unsupported body.
+///
+/// Linux reads its fixed-size request record before it judges the record's
+/// fields, so an unreadable or nil record is -EFAULT while only a readable
+/// record can be -EINVAL/EOVERFLOW (`io_uring/rsrc.c:395-418`, `:439-453`,
+/// `:455-464`).  Returning -EOPNOTSUPP here without that copy would let a
+/// malformed call observe a different errno than Linux.
+fn unsupported_registration(
+    capability: &UserMemoryCapability,
+    unsupported: UnsupportedRegistration,
+) -> AxError {
+    let bytes = unsupported.header().bytes();
+    if bytes != 0 {
+        let address = match usize::try_from(unsupported.argument()) {
+            Ok(address) => address,
+            // The value cannot name this address space, which Linux reports
+            // as the same fault its copy_from_user() would raise.
+            Err(_) => return AxError::BadAddress,
+        };
+        let mut record = [MaybeUninit::<u8>::uninit(); IO_URING_CONTROL_RECORD_BYTES];
+        if let Err(error) = capability.read_bytes(address, &mut record[..bytes]) {
+            return map_usercopy_error(error);
+        }
+        // SAFETY: `read_bytes` initialized exactly the copied prefix.
+        let record = unsafe {
+            core::slice::from_raw_parts(record.as_ptr().cast::<u8>(), bytes)
+        };
+        if let Err(error) = unsupported.validate_header(record) {
+            return map_policy_error(error);
+        }
+    }
+    match unsupported.outcome() {
+        // `io_zcrx_ctrl()` reports an unknown `zcrx_id`; no zcrx context can
+        // exist here because `IORING_REGISTER_ZCRX_IFQ` is refused.
+        UnsupportedOutcome::ZcrxIdNotFound => AxError::from(LinuxError::ENXIO),
+        UnsupportedOutcome::Unsupported => AxError::OperationNotSupported,
+    }
+}
+
+/// Copies one `__s32` registration descriptor from the caller's array.
+fn copy_registration_fd(capability: &UserMemoryCapability, address: u64) -> AxResult<i32> {
+    let address = usize::try_from(address).map_err(|_| AxError::BadAddress)?;
+    capability
+        .read_value(address as *const i32)
+        .map_err(map_usercopy_error)
 }
 
 fn submission_file(parsed: ParsedSubmission) -> Option<FileTarget> {
@@ -2503,6 +2624,11 @@ fn submit_entries(
     let mut completion_batch = SubmissionCompletionBatch::new(ring);
     let mut examined = 0;
     let mut submitted = 0;
+    // `io_submit_sqes()` stops consuming SQEs after the first request whose
+    // `io_init_req()` failed unless the ring carries
+    // `IORING_SETUP_SUBMIT_ALL`; the failed SQE itself stays consumed and its
+    // CQE is still posted (`io_uring/io_uring.c:2053-2070`).
+    let submit_all = ring.continues_batch_after_failure();
     while examined < requested {
         let dispatch = {
             let step = {
@@ -2979,7 +3105,10 @@ fn submit_entries(
             #[cfg(feature = "io-submit-batch")]
             Some(&mut completion_batch),
         ) {
-            Ok(outcome) if outcome.stops_default_batch() => {
+            // The only outcome a `SUBMIT_ALL` ring keeps consuming SQEs past:
+            // its own CQE is already published by the dispatch above
+            // (`io_uring/io_uring.c:2053-2062`).
+            Ok(outcome) if outcome.stops_default_batch() && !submit_all => {
                 return Ok((submitted, false));
             }
             Ok(_) => {}

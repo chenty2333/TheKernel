@@ -70,6 +70,10 @@ impl SetupFlags {
     /// Start disabled so resources may be registered before submissions are
     /// admitted; `REGISTER_ENABLE_RINGS` performs the one-way transition.
     pub const R_DISABLED: Self = Self(1 << 6);
+    /// A failed SQE does not stop the current submission batch.  Without it
+    /// Linux consumes SQEs up to and including the first failed one and leaves
+    /// the rest for the next enter (`io_uring/io_uring.c:2053-2062`).
+    pub const SUBMIT_ALL: Self = Self(1 << 7);
     /// Every flag implemented by this version.
     pub const SUPPORTED: Self = Self(
         Self::CQSIZE.0
@@ -81,7 +85,43 @@ impl SetupFlags {
             | Self::DEFER_TASKRUN.0
             | Self::COOP_TASKRUN.0
             | Self::SINGLE_ISSUER.0
-            | Self::R_DISABLED.0,
+            | Self::R_DISABLED.0
+            | Self::SUBMIT_ALL.0,
+    );
+
+    /// Linux v7.2.3 setup bits this profile cannot honour.
+    ///
+    /// `IORING_SETUP_FLAGS` (`io_uring/io_uring.h:54-74`) is the complete
+    /// vocabulary `io_uring_sanitise_params()` accepts
+    /// (`io_uring/io_uring.c:2801-2803`).  Each bit below makes Linux build a
+    /// ring whose geometry or wakeup contract this profile does not implement,
+    /// and `io_uring_setup()` has no `-EOPNOTSUPP` answer, so the request is
+    /// refused with `-EINVAL` instead of returning a ring that would silently
+    /// differ from the one Linux hands back:
+    ///
+    /// * `1 << 5` `IORING_SETUP_ATTACH_WQ`: shares another ring's SQPOLL
+    ///   worker through `wq_fd` (`io_uring/sqpoll.c:442-450`).
+    /// * `1 << 9` `IORING_SETUP_TASKRUN_FLAG`: publishes `IORING_SQ_TASKRUN`
+    ///   in the SQ flags word.
+    /// * `1 << 10` `IORING_SETUP_SQE128`: 128-byte SQEs
+    ///   (`io_get_sqe()`, `io_uring/io_uring.c:2022-2024`).
+    /// * `1 << 11` `IORING_SETUP_CQE32`: 32-byte CQEs
+    ///   (`rings_size()`, `io_uring/memmap.c`).
+    /// * `1 << 14` `IORING_SETUP_NO_MMAP`: user-provided ring and SQE memory
+    ///   (`io_allocate_scq_urings()`, `io_uring/io_uring.c:2738-2758`).
+    /// * `1 << 15` `IORING_SETUP_REGISTERED_FD_ONLY`: ring reachable only
+    ///   through `IORING_REGISTER_RING_FDS` (`io_uring/io_uring.c:3085-3090`).
+    /// * `1 << 17` `IORING_SETUP_HYBRID_IOPOLL`: polled and interrupt-driven
+    ///   completion on one ring (`io_uring/io_uring.c:2830-2832`).
+    /// * `1 << 18` `IORING_SETUP_CQE_MIXED`: per-request CQE size.
+    /// * `1 << 19` `IORING_SETUP_SQE_MIXED`: per-request SQE size
+    ///   (`io_uring/io_uring.c:1756-1763`).
+    /// * `1 << 20` `IORING_SETUP_SQ_REWIND`: the SQ ring restarts from index
+    ///   zero after `sq_entries` (`io_uring/io_uring.c:2805-2810`).
+    pub const UNSUPPORTED_BITS: Self = Self(
+        (1 << 5) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 14) | (1 << 15) | (1 << 17) | (1 << 18)
+            | (1 << 19)
+            | (1 << 20),
     );
 
     /// Strictly decodes setup bits before any allocation occurs.
@@ -196,7 +236,14 @@ impl SetupRequest {
             Ok(flags) => flags,
             Err(error) => return Err(error),
         };
+        // `io_uring_sanitise_params()` (`io_uring/io_uring.c:2797-2856`) and
+        // `io_sq_offload_create()` (`io_uring/sqpoll.c:527-530`) reject these
+        // combinations with -EINVAL; the checks run in that order, and each
+        // reports the same errno, so only the outcome is observable.
         if (flags.contains(SetupFlags::SQ_AFF) && !flags.contains(SetupFlags::SQPOLL))
+            || (flags.contains(SetupFlags::SQPOLL)
+                && (flags.contains(SetupFlags::COOP_TASKRUN)
+                    || flags.contains(SetupFlags::DEFER_TASKRUN)))
             || (flags.contains(SetupFlags::DEFER_TASKRUN)
                 && !flags.contains(SetupFlags::SINGLE_ISSUER))
             || reserved[0] != 0
@@ -689,9 +736,76 @@ mod tests {
         .unwrap();
         assert_eq!(polling.sq_thread_cpu(), 2);
         assert_eq!(polling.sq_thread_idle(), 100);
+        // `IORING_SETUP_SUBMIT_ALL` is part of the setup vocabulary and is
+        // now honoured, so it decodes; every bit this profile cannot honour is
+        // named by `SetupFlags::UNSUPPORTED_BITS`.
         assert_eq!(
-            SetupFlags::from_bits(1 << 7),
-            Err(IoUringError::UnsupportedSetupFlags)
+            SetupFlags::from_bits(SetupFlags::SUBMIT_ALL.bits()).unwrap(),
+            SetupFlags::SUBMIT_ALL
+        );
+        // Linux v7.2.3 names setup bits 0..=20
+        // (`IORING_SETUP_FLAGS`, `io_uring/io_uring.h:54-74`); every bit this
+        // profile refuses is one of them and every other bit stays unknown.
+        assert_eq!(
+            SetupFlags::SUPPORTED.bits() & SetupFlags::UNSUPPORTED_BITS.bits(),
+            0
+        );
+        for bit in 0..32 {
+            let mask = 1_u32 << bit;
+            let expected = if SetupFlags::SUPPORTED.bits() & mask != 0 {
+                Ok(SetupFlags(mask))
+            } else {
+                Err(IoUringError::UnsupportedSetupFlags)
+            };
+            assert_eq!(SetupFlags::from_bits(mask), expected, "bit {bit}");
+            if bit > 20 {
+                assert_eq!(
+                    SetupFlags::UNSUPPORTED_BITS.bits() & mask,
+                    0,
+                    "bit {bit} is outside Linux's setup vocabulary"
+                );
+            }
+        }
+        // SANITISE: an SQPOLL ring cannot take the IPI-free task-work flags
+        // (`io_uring/io_uring.c:2815-2821`).
+        assert_eq!(
+            SetupRequest::from_raw(
+                1,
+                0,
+                SetupFlags::SQPOLL.bits() | SetupFlags::COOP_TASKRUN.bits(),
+                0,
+                0,
+                0,
+                [0; 3],
+            ),
+            Err(IoUringError::ReservedFieldNonZero)
+        );
+        assert_eq!(
+            SetupRequest::from_raw(
+                1,
+                0,
+                SetupFlags::SQPOLL.bits()
+                    | SetupFlags::DEFER_TASKRUN.bits()
+                    | SetupFlags::SINGLE_ISSUER.bits(),
+                0,
+                0,
+                0,
+                [0; 3],
+            ),
+            Err(IoUringError::ReservedFieldNonZero)
+        );
+        // The same flags are legal without SQPOLL.
+        assert!(
+            SetupRequest::from_raw(
+                1,
+                0,
+                SetupFlags::DEFER_TASKRUN.bits() | SetupFlags::SINGLE_ISSUER.bits(),
+                0,
+                0,
+                0,
+                [0; 3],
+            )
+            .is_ok()
         );
     }
 }
