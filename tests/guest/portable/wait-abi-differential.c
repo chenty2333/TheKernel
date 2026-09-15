@@ -54,7 +54,11 @@
 #define MPOL_PREFERRED 1
 #define MPOL_BIND 2
 #define MPOL_INTERLEAVE 3
-#define MPOL_WEIGHTED_INTERLEAVE 4
+/* include/uapi/linux/mempolicy.h: MPOL_LOCAL is 4 and
+ * MPOL_WEIGHTED_INTERLEAVE is 6; MPOL_PREFERRED_MANY is the 5 that sits
+ * between them. */
+#define MPOL_LOCAL 4
+#define MPOL_WEIGHTED_INTERLEAVE 6
 #define MPOL_PREFERRED_MANY 5
 #define MPOL_F_NUMA_BALANCING (1 << 13)
 #define MPOL_F_RELATIVE_NODES (1 << 14)
