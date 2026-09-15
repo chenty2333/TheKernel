@@ -63,6 +63,20 @@ fn may_mount(security: &VfsSecurityContext) -> bool {
     ns_capable(security.actor(), mount_ns.owner_user_ns(), CAP_SYS_ADMIN)
 }
 
+/// Linux's `mount_capable()` (fs/super.c:695-701), which `vfs_cmd_create()`
+/// runs before it builds a superblock:
+///     if (!(fc->fs_type->fs_flags & FS_USERNS_MOUNT))
+///             return capable(CAP_SYS_ADMIN);
+///     else
+///             return ns_capable(fc->user_ns, CAP_SYS_ADMIN);
+/// TheKernel has no `FS_USERNS_MOUNT` filesystem type and its fs_contexts are
+/// always created in the caller's own user namespace, so both arms reduce to
+/// `capable(CAP_SYS_ADMIN)` -- the test in the *initial* user namespace, which
+/// is stricter than the `may_mount()` gate fsopen(2) already applied.
+fn mount_capable() -> bool {
+    current().as_thread().has_effective_capability(CAP_SYS_ADMIN)
+}
+
 fn current_may_mount() -> bool {
     let curr = current();
     let mount_ns = curr.as_thread().mount_ns();
@@ -1140,12 +1154,34 @@ fn try_string(value: &str) -> AxResult<String> {
     Ok(owned)
 }
 
+/// `struct fs_context::phase` (include/linux/fs_context.h:39-45) reduced to the
+/// states the fsopen(2) family can observe from userspace.  The two
+/// transitional phases (`FS_CONTEXT_CREATING`, `FS_CONTEXT_RECONFIGURING`),
+/// `FS_CONTEXT_AWAITING_RECONF` (the state `vfs_clean_context()` leaves behind
+/// after a successful reconfigure) and `FS_CONTEXT_FAILED` are each entered and
+/// left inside a single syscall or belong to the submount path, so a later call
+/// never observes them: this kernel builds the superblock in fsmount(2) rather
+/// than in `FSCONFIG_CMD_CREATE`, which is the only place `FS_CONTEXT_FAILED`
+/// could become visible.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FsContextPhase {
+    /// `FS_CONTEXT_CREATE_PARAMS`: fsopen(2) returned a context that is
+    /// collecting parameters for a new superblock.
+    CreateParams,
+    /// `FS_CONTEXT_RECONF_PARAMS`: fspick(2) returned a context bound to an
+    /// existing superblock that is collecting reconfiguration parameters.
+    ReconfParams,
+    /// `FS_CONTEXT_AWAITING_MOUNT`: `FSCONFIG_CMD_CREATE` succeeded and the
+    /// superblock awaits fsmount(2).
+    AwaitingMount,
+}
+
 struct FsOpenState {
     fs_type: String,
     source: Option<FsPathBuf>,
     data: String,
     config_len: usize,
-    created: bool,
+    phase: FsContextPhase,
     /// `/dev/fuse` is an OFD, so fsconfig retains its connection directly;
     /// a numeric fd must never be re-resolved after the caller closes or
     /// reuses that descriptor.
@@ -2717,7 +2753,7 @@ pub fn sys_fsopen<M: UserMemory + ?Sized>(
         source: None,
         data: String::new(),
         config_len: 0,
-        created: false,
+        phase: FsContextPhase::CreateParams,
         fuse_connection: None,
         nfs_transport: None,
         nfs_options: {
@@ -2783,21 +2819,26 @@ pub fn sys_fsconfig<M: UserMemory + ?Sized>(
         .ok_or(AxError::InvalidInput)?;
     let mut state = fsopen.0.lock();
 
-    // A context returned by fspick is already bound to a superblock but is
-    // specifically allowed to accept reconfiguration parameters.  A created
-    // fsopen context, in contrast, is sealed against further SET commands.
-    if state.created
-        && state.reconfigure_mount.is_none()
-        && matches!(
-            cmd,
-            FSCONFIG_SET_FLAG
-                | FSCONFIG_SET_STRING
-                | FSCONFIG_SET_BINARY
-                | FSCONFIG_SET_PATH
-                | FSCONFIG_SET_PATH_EMPTY
-                | FSCONFIG_SET_FD
-        )
-    {
+    // `vfs_fsconfig_locked()` admits a SET command only while the context is
+    // still collecting parameters (fs/fsopen.c:299-304):
+    //     default:
+    //             if (fc->phase != FS_CONTEXT_CREATE_PARAMS &&
+    //                 fc->phase != FS_CONTEXT_RECONF_PARAMS)
+    //                     return -EBUSY;
+    // so a context that already ran `FSCONFIG_CMD_CREATE` is sealed, while one
+    // returned by fspick(2) is still open for reconfiguration parameters.
+    if matches!(
+        cmd,
+        FSCONFIG_SET_FLAG
+            | FSCONFIG_SET_STRING
+            | FSCONFIG_SET_BINARY
+            | FSCONFIG_SET_PATH
+            | FSCONFIG_SET_PATH_EMPTY
+            | FSCONFIG_SET_FD
+    ) && !matches!(
+        state.phase,
+        FsContextPhase::CreateParams | FsContextPhase::ReconfParams
+    ) {
         return Err(AxError::ResourceBusy);
     }
 
@@ -3083,13 +3124,44 @@ pub fn sys_fsconfig<M: UserMemory + ?Sized>(
             Ok(0)
         }
         FSCONFIG_CMD_CREATE | FSCONFIG_CMD_CREATE_EXCL => {
-            if state.created {
+            // fs/fsopen.c `vfs_cmd_create()` (fs/fsopen.c:217-248):
+            //     if (fc->phase != FS_CONTEXT_CREATE_PARAMS)      /* :222 */
+            //             return -EBUSY;
+            //
+            //     if (!mount_capable(fc))                         /* :225 */
+            //             return -EPERM;
+            //
+            //     ret = vfs_get_tree(fc);
+            //     if (ret) {
+            //             fc->phase = FS_CONTEXT_FAILED;          /* :234 */
+            //             return ret;
+            //     }
+            //     ...
+            //     fc->phase = FS_CONTEXT_AWAITING_MOUNT;          /* :247 */
+            // A capability failure returns before the phase moves and leaves
+            // the context at `FS_CONTEXT_CREATE_PARAMS`.
+            if state.phase != FsContextPhase::CreateParams {
                 return Err(AxError::ResourceBusy);
             }
-            state.created = true;
+            if !mount_capable() {
+                return Err(LinuxError::EPERM.into());
+            }
+            // TheKernel defers superblock construction to fsmount(2), so
+            // reaching `FS_CONTEXT_AWAITING_MOUNT` is what makes the context
+            // mountable.
+            state.phase = FsContextPhase::AwaitingMount;
             Ok(0)
         }
         FSCONFIG_CMD_RECONFIGURE => {
+            // fs/fsopen.c `vfs_cmd_reconfigure()` (fs/fsopen.c:251-277)
+            // requires `FS_CONTEXT_RECONF_PARAMS` first (and reports `-EBUSY`,
+            // not `-EINVAL`, for a context that is still collecting creation
+            // parameters), then checks `CAP_SYS_ADMIN` in the superblock's
+            // user namespace (`:261`) before running the provider's
+            // reconfigure.
+            if state.phase != FsContextPhase::ReconfParams {
+                return Err(AxError::ResourceBusy);
+            }
             // Keep the target topology, option ledger snapshot, and remount
             // commit in one namespace operation.  In particular an overlay
             // must not validate old lower/upper mounts and publish against a
@@ -3152,16 +3224,14 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
         current_may_mount(),
     )
     .map_err(map_mount_uapi)?;
-    if flags & FSMOUNT_NAMESPACE != 0 {
-        // Both capability tests above have passed.  `create_new_namespace()`
-        // then has to allocate an nsfs descriptor for the new namespace, and
-        // TheKernel has no nsfs descriptor provider to allocate from; report
-        // the well-formed request as unsupported rather than as a malformed
-        // one.  This is the residual named by the `fsmount` cell: the errno is
-        // TheKernel's, not Linux's.
-        return Err(AxError::OperationNotSupported);
-    }
 
+    // The descriptor is read only after both flag words (fs/namespace.c:4474-4480):
+    //     CLASS(fd, f)(fs_fd);
+    //     if (fd_empty(f))
+    //             return -EBADF;
+    //     if (fd_file(f)->f_op != &fscontext_fops)
+    //             return -EINVAL;
+    // so an invalid descriptor is `-EBADF` even for the FSMOUNT_NAMESPACE form.
     let file = get_file_like(fd)?;
     // A descriptor that is not an fs_context is `-EINVAL`, not `-EBADF`.
     let fsopen = file
@@ -3169,11 +3239,32 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
         .ok_or(AxError::InvalidInput)?;
     let state = fsopen.0.lock();
 
-    // `fc->root == NULL` means fsconfig(FSCONFIG_CMD_CREATE) never completed
-    // for this context, which Linux reports as `-EINVAL` before it examines
-    // the context phase.
-    if !state.created {
+    // `!fc->root` (fs/namespace.c:4493-4495) is the context that never reached
+    // `FSCONFIG_CMD_CREATE`: it has no superblock, so `-EINVAL`.  For a context
+    // picked by fspick(2) the root exists and the phase test below decides.
+    if state.phase == FsContextPhase::CreateParams {
         return Err(AxError::InvalidInput);
+    }
+    // fs/namespace.c:4499-4501:
+    //     ret = -EBUSY;
+    //     if (fc->phase != FS_CONTEXT_AWAITING_MOUNT)
+    //             return ret;
+    // An fspick(2) context is still loading reconfiguration parameters and
+    // must not be mounted as if `FSCONFIG_CMD_CREATE` had run.
+    if state.phase != FsContextPhase::AwaitingMount {
+        return Err(AxError::ResourceBusy);
+    }
+    if flags & FSMOUNT_NAMESPACE != 0 {
+        // Both capability tests above have passed, the descriptor is a
+        // well-formed fs_context, the root exists and the phase is
+        // `FS_CONTEXT_AWAITING_MOUNT`, so Linux would now enter
+        // `create_new_namespace()` and allocate an nsfs descriptor for the new
+        // mount namespace.  TheKernel has no nsfs descriptor provider to
+        // allocate from, so the well-formed request is reported as unsupported
+        // rather than as a malformed one.  This is the residual named by the
+        // `fsmount` cell: the errno is TheKernel's, not Linux's, and every
+        // verdict that precedes namespace creation now matches Linux.
+        return Err(AxError::OperationNotSupported);
     }
     let source = match state.source.as_deref() {
         Some(source) => FsPathBuf::from_vec(source.as_bytes().to_vec()),
@@ -3513,7 +3604,7 @@ pub fn sys_fspick<M: UserMemory + ?Sized>(
         config_len: 0,
         // fspick produces a reconfiguration context, not an unconfigured
         // fsopen.  fsconfig can change it and fsmount can materialize it.
-        created: true,
+        phase: FsContextPhase::ReconfParams,
         fuse_connection,
         nfs_transport,
         nfs_options,
