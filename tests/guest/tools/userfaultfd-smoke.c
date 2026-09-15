@@ -764,10 +764,47 @@ static int test_executable_copy(int uffd, size_t page_size)
     return 0;
 }
 
+/* mm/userfaultfd.c:userfaultfd_syscall_allowed() runs before flag validation:
+   UFFD_USER_MODE_ONLY is allowed without CAP_SYS_PTRACE, and any bit outside
+   UFFD_USER_MODE_ONLY|O_CLOEXEC|O_NONBLOCK is then rejected with EINVAL.  A
+   creation without UFFD_USER_MODE_ONLY is deliberately not probed here: its
+   answer depends on CAP_SYS_PTRACE and vm.unprivileged_userfaultfd. */
+static int test_creation_admission(void)
+{
+    long user_only = syscall(SYS_userfaultfd, UFFD_USER_MODE_ONLY);
+    if (user_only < 0) {
+        return fail("user-mode-only-create");
+    }
+    if (close((int)user_only) != 0) {
+        return fail("user-mode-only-close");
+    }
+
+    long blocking = syscall(SYS_userfaultfd, UFFD_USER_MODE_ONLY | O_NONBLOCK);
+    if (blocking < 0) {
+        return fail("user-mode-only-nonblocking-create");
+    }
+    if (close((int)blocking) != 0) {
+        return fail("user-mode-only-nonblocking-close");
+    }
+
+    errno = 0;
+    if (syscall(SYS_userfaultfd, UFFD_USER_MODE_ONLY | (1U << 20)) != -1 ||
+        errno != EINVAL) {
+        return fail("unknown-flag-bit");
+    }
+
+    puts("THEKERNEL_USERFAULTFD_ADMISSION_OK");
+    return 0;
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+
+    if (test_creation_admission() != 0) {
+        return 1;
+    }
 
     long host_page_size = sysconf(_SC_PAGESIZE);
     if (host_page_size != (long)TEST_PAGE_SIZE) {
