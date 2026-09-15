@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 282
-implemented = 263
+resolved = 285
+implemented = 266
 explicit_enosys = 19
 fallback = 0
-partial = 103
+partial = 100
 unknown = 0
 
 [[contract]]
@@ -656,13 +656,13 @@ teardown = ["teardown:ruleset fd and domain references retain VFS locations unti
 [[cell]]
 number = 445
 name = "landlock_add_rule"
-status = "partial"
+status = "implemented"
 contract = "linux-landlock_add_rule"
 handler = "kernel/src/syscall/landlock.rs:sys_landlock_add_rule"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/landlock.rs:masks_exclude_unknown_bits", "tests/guest/portable/landlock-abi-differential.c:main"]
-validation_gaps = ["landlock_add_rule is driven by the landlock-abi differential, but the rule-count ceiling is covered by source agreement only"]
-limitations = ["the rule count is capped at 4096 with E2BIG, which is not a Linux limit: LANDLOCK_MAX_NUM_RULES is UINT_MAX"]
+validation_gaps = ["the E2BIG boundary cannot be reached by a test because identical rules merge, so the absence of a rule-count ceiling is source agreement only"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-landlock_restrict_self"
@@ -679,13 +679,13 @@ teardown = ["teardown:ruleset fd and domain references retain VFS locations unti
 [[cell]]
 number = 446
 name = "landlock_restrict_self"
-status = "partial"
+status = "implemented"
 contract = "linux-landlock_restrict_self"
 handler = "kernel/src/syscall/landlock.rs:sys_landlock_restrict_self"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/landlock.rs:abi_shapes_are_linux_612", "tests/guest/portable/landlock-abi-differential.c:main"]
-validation_gaps = ["landlock_restrict_self is driven by the landlock-abi differential, but the sibling no_new_privs propagation is covered by source agreement only"]
-limitations = ["TSYNC copies the domain to sibling threads but not the no_new_privs bit, which Linux sets on every sibling, so a synchronised sibling still reports no_new_privs clear and can gain privilege through execve"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-memfd_create"
@@ -776,8 +776,8 @@ contract = "linux-seccomp"
 handler = "kernel/src/syscall/seccomp.rs:sys_seccomp"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/seccomp.rs:strict_allowlist_is_exact", "tests/guest/portable/seccomp-smoke.c:main"]
-validation_gaps = ["SECCOMP_RET_TRACE has no ptrace ownership lifecycle, so a TRACE verdict can only take the no-tracer ENOSYS path; LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET enforcement and scope audit records are also missing"]
-limitations = ["SECCOMP_GET_ACTION_AVAIL under-reports: it answers EOPNOTSUPP for SECCOMP_RET_TRACE where Linux returns 0, and the seccomp smoke test hard-codes that divergence as the expected answer"]
+validation_gaps = ["SECCOMP_RET_TRACE availability and PTRACE_O_SUSPEND_SECCOMP are asserted by seccomp-smoke; PTRACE_EVENT_SECCOMP delivery has no registered case"]
+limitations = ["PTRACE_EVENT_SECCOMP delivery is missing: a SECCOMP_RET_TRACE verdict from a tracer that asked for PTRACE_O_TRACESECCOMP takes the no-tracer ENOSYS path"]
 
 [[contract]]
 id = "linux-mmap"
@@ -7953,7 +7953,7 @@ handler = "kernel/src/syscall/task/ctl.rs:sys_unshare"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/sysadmin-abi-differential.c:main"]
 validation_gaps = ["The flag implication chain and thread-group constraints are exercised by the sysadmin raw differential; CLONE_EMPTY_MNTNS has no assertion"]
-limitations = ["the CLONE_NEWIPC|CLONE_SYSVSEM pair is rejected with EINVAL before the CAP_SYS_ADMIN admission, so an unprivileged caller sees EINVAL where Linux reports EPERM from create_new_namespaces"]
+limitations = ["unshare(UNSHARE_EMPTY_MNTNS) (0x00100000, include/uapi/linux/sched.h:54) is still EINVAL: there is no root-mount-only mount-namespace constructor behind the flag"]
 
 [[contract]]
 id = "linux-setns"
@@ -8085,13 +8085,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 101
 name = "ptrace"
-status = "partial"
+status = "implemented"
 contract = "linux-ptrace"
 handler = "kernel/src/syscall/task/ptrace.rs:sys_ptrace"
 conditional = "explicit-none"
 tests = ["kernel/src/task/access.rs:process_access_ptrace_enforces_dumpability_image_owner_and_commoncap", "tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["The request-admission matrix is exercised by the sysadmin raw differential; the PEEKUSER, POKEUSER, LISTEN, SYSEMU, regset and PEEKSIGINFO paths have no portable assertion"]
-limitations = ["PTRACE_O_EXITKILL is accepted and stored but never kills the tracee when the tracer exits, and PTRACE_SEIZE does not run check_ptrace_options, so PTRACE_O_SUSPEND_SECCOMP is admitted there without CAP_SYS_ADMIN while PTRACE_SETOPTIONS requires it"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-acct"
@@ -8182,8 +8182,8 @@ contract = "linux-init_module"
 handler = "kernel/src/syscall/task/module.rs:sys_init_module"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["The length and errno rules are exercised by the sysadmin raw differential; the copy order and vermagic gaps have no assertion"]
-limitations = ["Parameter strings are copied before the module image rather than after image validation; MODULE_RELEASE remains 6.12.103 and vermagic validation only compares its first token"]
+validation_gaps = ["the oracle has CONFIG_MODULES unset, so its three module syscalls answer ENOSYS and the case compares each kernel's configuration answer rather than module semantics"]
+limitations = ["the kernel stamps no Linux configuration tokens, so an image whose release matches is accepted whenever it carries crcs; the release compared is this kernel's own UTS_RELEASE"]
 
 [[contract]]
 id = "linux-finit_module"
@@ -8205,8 +8205,8 @@ contract = "linux-finit_module"
 handler = "kernel/src/syscall/task/module.rs:sys_finit_module"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["The length and errno rules are exercised by the sysadmin raw differential; the copy order and vermagic gaps have no assertion"]
-limitations = ["Parameter string copying precedes invalid-fd rejection; module identity uses the stale 6.12.103 release and incomplete vermagic matching"]
+validation_gaps = ["the oracle has CONFIG_MODULES unset, so its three module syscalls answer ENOSYS and the case compares each kernel's configuration answer rather than module semantics"]
+limitations = ["the kernel stamps no Linux configuration tokens, so an image whose release matches is accepted whenever it carries crcs; the release compared is this kernel's own UTS_RELEASE"]
 
 [[contract]]
 id = "linux-delete_module"
@@ -8228,8 +8228,8 @@ contract = "linux-delete_module"
 handler = "kernel/src/syscall/task/module.rs:sys_delete_module"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["The name and errno rules are exercised by the sysadmin raw differential; forced unload has no assertion"]
-limitations = ["O_TRUNC always enables force-unload rather than respecting the CONFIG_MODULE_FORCE_UNLOAD admission Linux applies"]
+validation_gaps = ["the oracle has CONFIG_MODULES unset, so its three module syscalls answer ENOSYS and the case compares each kernel's configuration answer rather than module semantics"]
+limitations = ["O_TRUNC cannot force an unload: without CONFIG_MODULE_FORCE_UNLOAD the request is refused with EBUSY or EWOULDBLOCK instead of forcing and tainting"]
 
 [[contract]]
 id = "linux-kexec_load"
@@ -8252,7 +8252,7 @@ handler = "kernel/src/syscall/task/kexec.rs:sys_kexec_load"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/kexec.rs:bzimage_requires_64_bit_boot_contract_and_cmdline_capacity", "tests/guest/portable/sysadmin-abi-differential.c:main"]
 validation_gaps = ["kexec_load has no registered differential case; the admitted flag set is covered by host tests only"]
-limitations = ["an entry outside a destination segment is EINVAL where Linux stores it unchecked, an unaligned or out-of-RAM destination is EINVAL where Linux reports EADDRNOTAVAIL, the total-size cap is ENOMEM where Linux is EINVAL, and KEXEC_PRESERVE_CONTEXT is admitted but never read"]
+limitations = ["an out-of-RAM and a zero-length destination are EINVAL here where Linux defers them to the allocator, and the crash-image entry and destinations are not checked against crashk_res (kernel/kexec.c:29-36)"]
 
 [[contract]]
 id = "linux-kexec_file_load"
