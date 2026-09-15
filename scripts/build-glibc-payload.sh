@@ -83,13 +83,13 @@ fi
 [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
 mkdir -p "$SOURCE_CACHE"
 
-STATE_ROOT=${THEKERNEL_STATE_DIR:-$(cd -- "$REPO_ROOT" && pwd)/.state}
+STATE_ROOT=${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}
 mkdir -p "$STATE_ROOT"
 
 log() { printf 'build-glibc-payload: %s\n' "$*" >&2; }
 die() { printf 'build-glibc-payload: %s\n' "$*" >&2; exit 1; }
 
-for command in curl rpm2cpio cpio tar gcc sha256sum; do
+for command in dnf rpm2cpio cpio tar gcc sha256sum readelf od; do
     command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
 done
 
@@ -97,24 +97,6 @@ done
 #
 # The same cache and the same policy as the other payloads: a file that is not
 # already cached is downloaded once, and every use is checked against the pin.
-fetch_source() {
-    local url=$1 file=$2 expected=$3
-    local path="$SOURCE_CACHE/$file"
-    if [ ! -f "$path" ]; then
-        log "downloading $file"
-        curl --fail --location --silent --show-error --output "$path.part" "$url" ||
-            die "cannot download $url"
-        mv "$path.part" "$path"
-    fi
-    local actual
-    actual=$(sha256sum "$path" | cut -d' ' -f1)
-    [ "$actual" = "$expected" ] ||
-        die "checksum mismatch for $file:
-  expected $expected
-  actual   $actual"
-    printf '%s\n' "$path"
-}
-
 # Fedora RPMs come through dnf, which knows the mirror layout; the file name
 # and hash are still what decides whether the cached copy is usable.
 fetch_rpm() {
@@ -123,19 +105,32 @@ fetch_rpm() {
     # under `set -u` that is a hard failure rather than an empty string.
     local dir="$SOURCE_CACHE/rpm"
     local path="$dir/$file"
-    if [ ! -f "$path" ]; then
-        mkdir -p "$dir"
-        log "downloading $package"
-        # dnf's progress output is *not* silenced: a download that stalls is a
-        # thing worth seeing.  It does have to be kept off stdout, though,
-        # because stdout of this function is the result.
-        ( cd "$dir" && dnf download --destdir . "$package" ) >&2 || true
-        [ -f "$path" ] || die "cannot download $package into $dir"
-    fi
-    local actual
-    actual=$(sha256sum "$path" | cut -d' ' -f1)
+    local actual attempt
+    for attempt in 1 2; do
+        if [ ! -f "$path" ]; then
+            mkdir -p "$dir"
+            log "downloading $package"
+            # dnf's progress output is *not* silenced: a download that stalls is a
+            # thing worth seeing.  It does have to be kept off stdout, though,
+            # because stdout of this function is the result.
+            ( cd "$dir" && dnf download --destdir . "$package" ) >&2 || true
+            # dnf resolves the bare package name to the NVR the mirrors carry
+            # today, so once the pin has rolled off this is not a network error:
+            # the download succeeds and the pinned file is simply absent.
+            [ -f "$path" ] || die "cannot download $package into $dir
+  the pinned $file may have rolled off the mirrors; fetch it from koji or a
+  Fedora archive mirror and place it there"
+        fi
+        actual=$(sha256sum "$path" | cut -d' ' -f1)
+        [ "$actual" = "$expected" ] && break
+        # An interrupted download leaves a truncated file that passes the
+        # existence check above on every later run, so a mismatch is deleted
+        # and fetched once more before it is reported as fatal.
+        log "checksum mismatch for $file; discarding it and re-downloading"
+        rm -f "$path"
+    done
     [ "$actual" = "$expected" ] ||
-        die "checksum mismatch for $file:
+        die "checksum mismatch for $file, which is corrupt:
   expected $expected
   actual   $actual"
     printf '%s\n' "$path"
@@ -163,7 +158,16 @@ glibc_rpm=$(cat "$glibc_rpm_path")
 if [ ! -e "$RPM_TREE$RPM_LOADER_PATH" ] || [ ! -e "$RPM_TREE$RPM_LIBC_PATH" ]; then
     rm -rf "$RPM_TREE"
     mkdir -p "$RPM_TREE"
-    ( cd "$RPM_TREE" && rpm2cpio "$glibc_rpm" | cpio -idm --quiet )
+    # Not a pipe: cpio stops reading at the archive trailer and exits, and
+    # rpm2cpio can still have the final padding write in flight when it does --
+    # an intermittent SIGPIPE (exit 141) with nothing actually wrong, which
+    # pipefail then reports as a failed unpack.  The detour through a file
+    # gives each step its own exit status as a bonus.
+    rpm2cpio "$glibc_rpm" > "$RPM_TREE/.payload.cpio" ||
+        die "rpm2cpio failed for glibc"
+    ( cd "$RPM_TREE" && cpio -idm --quiet < .payload.cpio ) ||
+        die "cpio could not unpack glibc"
+    rm -f "$RPM_TREE/.payload.cpio"
 fi
 
 [ -f "$RPM_TREE$RPM_LOADER_PATH" ] || die "the RPM contains no $RPM_LOADER_PATH"
@@ -305,7 +309,12 @@ int main(void) {
 EOF
 
 log "building the dynamically linked smoke program"
-gcc -O2 -Wall -Wextra -o "$BUILD_ROOT/smoke/glibc-smoke" "$BUILD_ROOT/smoke/glibc-smoke.c"
+# Baseline ISA, for the same reason the loader is not rebuilt (see the header):
+# the host's gcc may default to a newer -march, and a binary using instructions
+# below the guest's ISA level dies with SIGILL in a shape that reads as a
+# kernel bug.
+gcc -O2 -Wall -Wextra -march=x86-64 -mtune=generic \
+    -o "$BUILD_ROOT/smoke/glibc-smoke" "$BUILD_ROOT/smoke/glibc-smoke.c"
 
 # The whole point is that this binary needs a loader.  A static one would run
 # even in an image with no /lib64 at all, so it would certify nothing.
@@ -324,6 +333,19 @@ needed=$(readelf -dW "$BUILD_ROOT/smoke/glibc-smoke" |
 printf '%s\n' "$needed" >"$BUILD_ROOT/smoke/needed.txt"
 [ "$(printf '%s\n' "$needed" | tr -d '\n')" = "libc.so.6" ] ||
     die "the smoke program needs [$needed]; this payload stages only libc.so.6"
+
+# The smoke binary is compiled against the host's glibc, which may be newer
+# than the staged one.  A symbol versioned past the pinned release links here
+# and then fails version lookup in the guest, where the staged glibc is the
+# only libc there is -- again in a shape that reads as a loader bug.
+highest_glibc=$(readelf -V "$BUILD_ROOT/smoke/glibc-smoke" |
+    grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -1)
+pinned_glibc=${GLIBC_RPM_RELEASE%%-*}
+if [ -n "$highest_glibc" ] &&
+    [ "$(printf '%s\n%s\n' "$pinned_glibc" "${highest_glibc#GLIBC_}" |
+        sort -V | tail -1)" != "$pinned_glibc" ]; then
+    die "the smoke program requires $highest_glibc, newer than the staged glibc $pinned_glibc"
+fi
 
 # --- 3. stage ---------------------------------------------------------------
 #

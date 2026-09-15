@@ -114,13 +114,13 @@ fi
 [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
 mkdir -p "$SOURCE_CACHE"
 
-STATE_ROOT=${THEKERNEL_STATE_DIR:-$(cd -- "$REPO_ROOT" && pwd)/.state}
+STATE_ROOT=${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}
 mkdir -p "$STATE_ROOT"
 
 log() { printf 'build-gcc-payload: %s\n' "$*" >&2; }
 die() { printf 'build-gcc-payload: %s\n' "$*" >&2; exit 1; }
 
-for command in curl rpm2cpio cpio tar gcc sha256sum readelf; do
+for command in dnf rpm2cpio cpio gcc sha256sum readelf; do
     command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
 done
 
@@ -132,19 +132,32 @@ fetch_rpm() {
     # under `set -u` that is a hard failure rather than an empty string.
     local dir="$SOURCE_CACHE/rpm"
     local path="$dir/$file"
-    if [ ! -f "$path" ]; then
-        mkdir -p "$dir"
-        log "downloading $package"
-        # dnf's progress output is *not* silenced: a download that stalls is a
-        # thing worth seeing.  It does have to be kept off stdout, though,
-        # because stdout of this function is the result.
-        ( cd "$dir" && dnf download --destdir . "$package" ) >&2 || true
-        [ -f "$path" ] || die "cannot download $package into $dir"
-    fi
-    local actual
-    actual=$(sha256sum "$path" | cut -d' ' -f1)
+    local actual attempt
+    for attempt in 1 2; do
+        if [ ! -f "$path" ]; then
+            mkdir -p "$dir"
+            log "downloading $package"
+            # dnf's progress output is *not* silenced: a download that stalls is a
+            # thing worth seeing.  It does have to be kept off stdout, though,
+            # because stdout of this function is the result.
+            ( cd "$dir" && dnf download --destdir . "$package" ) >&2 || true
+            # dnf resolves the bare package name to the NVR the mirrors carry
+            # today, so once the pin has rolled off this is not a network error:
+            # the download succeeds and the pinned file is simply absent.
+            [ -f "$path" ] || die "cannot download $package into $dir
+  the pinned $file may have rolled off the mirrors; fetch it from koji or a
+  Fedora archive mirror and place it there"
+        fi
+        actual=$(sha256sum "$path" | cut -d' ' -f1)
+        [ "$actual" = "$expected" ] && break
+        # An interrupted download leaves a truncated file that passes the
+        # existence check above on every later run, so a mismatch is deleted
+        # and fetched once more before it is reported as fatal.
+        log "checksum mismatch for $file; discarding it and re-downloading"
+        rm -f "$path"
+    done
     [ "$actual" = "$expected" ] ||
-        die "checksum mismatch for $file:
+        die "checksum mismatch for $file, which is corrupt:
   expected $expected
   actual   $actual"
     printf '%s\n' "$path"
@@ -193,7 +206,16 @@ for pin in "${RPM_PINS[@]}"; do
         log "unpacking $package-$release"
         rm -rf "$tree"
         mkdir -p "$tree"
-        ( cd "$tree" && rpm2cpio "$rpm" | cpio --quiet -idmu --no-absolute-filenames )
+        # Not a pipe: cpio stops reading at the archive trailer and exits, and
+        # rpm2cpio can still have the final padding write in flight when it
+        # does -- an intermittent SIGPIPE (exit 141) with nothing actually
+        # wrong, which pipefail then reports as a failed unpack.  The detour
+        # through a file gives each step its own exit status as a bonus.
+        rpm2cpio "$rpm" > "$tree/.payload.cpio" ||
+            die "rpm2cpio failed for $package-$release"
+        ( cd "$tree" && cpio --quiet -idmu --no-absolute-filenames < .payload.cpio ) ||
+            die "cpio could not unpack $package-$release"
+        rm -f "$tree/.payload.cpio"
         : > "$tree/.unpacked"
     fi
     rpm_trees+=("$package:$tree")
@@ -272,10 +294,9 @@ log "staging gcc's support files"
 cp -a "$T_GCC$GCC_LIB_DIR/." "$OUTPUT$GCC_LIB_DIR/"
 rm -rf "$OUTPUT$GCC_LIB_DIR/32"
 
-# GCC's private headers, which are not in /usr/include.  Without them the very
-# first #include fails: /usr/include/stdio.h includes <stddef.h>, which only
-# exists here.
-cp -a "$T_GCC$GCC_LIB_DIR/include" "$OUTPUT$GCC_LIB_DIR/include"
+# GCC's private headers came along with that copy, at $GCC_LIB_DIR/include.
+# They are not in /usr/include, and without them the very first #include fails:
+# /usr/include/stdio.h includes <stddef.h>, which only exists there.
 
 # 3. glibc's startup objects, its linker scripts, and the headers.
 log "staging glibc's startup objects and headers"
@@ -291,7 +312,12 @@ cp -a "$T_KERNEL_HEADERS/usr/include/." "$OUTPUT/usr/include/"
 # absolutely, and gcc's specs reach it through -latomic on *every* link.  So
 # this file is not optional even for a program that uses no atomics: without it
 # every link fails with "cannot find /usr/lib64/libatomic.so.1.2.0".
-install -m 0755 "$(tree_of libatomic)/usr/lib64/libatomic.so.1.2.0" \
+#
+# The tree lookup is its own statement: inside `install "$(tree_of ...)"` a
+# `die` would exit only the command substitution's subshell, and the install
+# would then run against a path with an empty prefix.
+libatomic_tree=$(tree_of libatomic)
+install -m 0755 "$libatomic_tree/usr/lib64/libatomic.so.1.2.0" \
     "$OUTPUT/usr/lib64/libatomic.so.1.2.0"
 
 # 4. The shared-library closure, each file under the name the loader looks for.
@@ -353,9 +379,13 @@ stage_library binutils /usr/lib64/libsframe.so.3.0.0 libsframe.so.3
 # The compiler is driven with explicit -B and -isystem flags rather than
 # through chroot: a chroot needs a shell inside the staging tree, which would
 # mean staging one and its closure, and it needs privileges that not every
-# build host grants.  The flags below are exactly the guest's own search paths,
-# since in the guest these directories *are* the system ones, so a tree that
-# compiles here compiles there.
+# build host grants.  The flags below name the same directories the guest
+# searches, since in the guest these directories *are* the system ones.  Two
+# more things keep the host out of the result: PATH leads with the staged
+# usr/bin so the driver runs the staged `as` and `ld` rather than the host's,
+# and --sysroot makes the absolute paths in glibc's linker scripts (libc.so
+# names /lib64/libc.so.6) resolve inside the staging tree -- without it ld
+# resolves them against the host's root, which may have no /lib64 at all.
 log "validating: compiling and running a program with the staged toolchain"
 VALIDATE_DIR="$BUILD_ROOT/validate"
 rm -rf "$VALIDATE_DIR"
@@ -399,9 +429,11 @@ int main(void) {
 }
 PROBE
 
-"$OUTPUT/usr/bin/gcc" -O2 -o "$VALIDATE_DIR/probe" "$VALIDATE_DIR/probe.c" -lm \
+PATH="$OUTPUT/usr/bin:$PATH" \
+    "$OUTPUT/usr/bin/gcc" -O2 -o "$VALIDATE_DIR/probe" "$VALIDATE_DIR/probe.c" -lm \
     -B "$OUTPUT/usr/lib64/" -B "$OUTPUT$GCC_LIB_DIR/" \
-    -isystem "$OUTPUT/usr/include" -isystem "$OUTPUT$GCC_LIB_DIR/include" ||
+    -isystem "$OUTPUT/usr/include" -isystem "$OUTPUT$GCC_LIB_DIR/include" \
+    -Wl,--sysroot="$OUTPUT" ||
     die "the staged toolchain could not compile a program"
 
 # And the product has to run, through the *staged* loader and the staged
@@ -433,8 +465,11 @@ mkdir -p "$OUTPUT/opt/thekernel-tools"
     printf 'kernel-headers %s\n' "$KERNEL_HEADERS_RELEASE"
     printf '# path size sha256\n'
     # Relative paths, so the manifest describes the payload and not the
-    # directory it happened to be built in.
-    ( cd "$OUTPUT" && find . -type f -printf '%P\n' | LC_ALL=C sort |
+    # directory it happened to be built in.  The manifest itself is excluded:
+    # this block truncates it before the find runs, so listing it would record
+    # the hash of a partially written file that can never match.
+    ( cd "$OUTPUT" && find . -type f ! -path './opt/thekernel-tools/MANIFEST' \
+        -printf '%P\n' | LC_ALL=C sort |
         while read -r file; do
             printf '%s %s %s\n' "$file" "$(stat -c %s "$file")" \
                 "$(sha256sum "$file" | cut -d' ' -f1)"
