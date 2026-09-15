@@ -1857,6 +1857,11 @@ pub fn sys_set_mempolicy<M: UserMemory + ?Sized>(
 /// come last: a zero-length range with a mask that names no allowed node is
 /// `0`, and `MPOL_MF_MOVE_ALL` without `CAP_SYS_NICE` is `EPERM` whatever the
 /// mask says.
+///
+/// The hole verdict is [`mbind_range_rejects_hole`]'s, and it is decided
+/// before any page is examined because `queue_pages_range()` reports a hole
+/// from its `test_walk` callback, ahead of the page scan of the VMA that
+/// callback was entered for.
 pub fn sys_mbind<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     start: usize,
@@ -1891,6 +1896,25 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     let policy = Mempolicy::new(policy_mode, policy_nodes)
         .with_request_flags(request.mode_flags, request.user_nodes);
 
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
+    let end = plan.start + plan.len;
+    // `do_mbind()` marks a range that only spans holes as acceptable when
+    // `mpol_new()` returned NULL, and that is `MPOL_DEFAULT` alone
+    // (`mm/mempolicy.c:1519-1528`).  The verdict comes first because
+    // `queue_pages_range()`'s `test_walk` reports the hole before the page
+    // scan of the VMA it was entered for.
+    let discontig_ok = sanitized_mode == tk_linux_mm::MPOL_DEFAULT;
+    if mbind_range_rejects_hole(&aspace_handle.lock(), plan.start, end, discontig_ok) {
+        return Err(AxError::BadAddress);
+    }
+
+    // With `ALLOWED_NODEMASK == {0}` every admitted policy's target mask
+    // contains node 0, the only node a resident page can be on, so
+    // `queue_pages_range()`'s `-EIO` for a misplaced page is unreachable and
+    // the walk's hole verdict and its page scan cannot be observed out of
+    // order.
     if plan.flags & tk_linux_mm::MPOL_MF_STRICT != 0
         && plan.flags & (tk_linux_mm::MPOL_MF_MOVE | tk_linux_mm::MPOL_MF_MOVE_ALL) == 0
     {
@@ -1901,15 +1925,60 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     // home-node path below does: address-space topology first, then policy
     // intervals.  Revalidate while holding that order so an unmap cannot
     // leave a freshly published policy for a vanished VMA.
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let aspace_handle = proc_data.aspace();
     let aspace = aspace_handle.lock();
-    if !aspace.can_access_range(VirtAddr::from(plan.start), plan.len, MappingFlags::USER) {
+    if mbind_range_rejects_hole(&aspace, plan.start, end, discontig_ok) {
         return Err(AxError::BadAddress);
     }
     proc_data.bind_mempolicy_range(plan.start, plan.len, policy);
     Ok(0)
+}
+
+/// `queue_pages_test_walk()` and `queue_pages_range()`'s hole verdict for the
+/// range `[start, end)`.
+///
+/// `queue_pages_test_walk()` (`mm/mempolicy.c:910-932`) walks the VMAs of the
+/// range in address order and returns `-EFAULT` for a hole at the head of the
+/// range (`qp->start < vma->vm_start` on the first VMA it visits) or after a
+/// visited VMA that does not reach `qp->end`
+/// (`vma->vm_end < qp->end && (!next || vma->vm_end < next->vm_start)`), and
+/// `queue_pages_range()` adds the same error when the walk visited no VMA at
+/// all (`if (!qp.first) err = -EFAULT;`, `mm/mempolicy.c:998-1000`).
+/// `MPOL_MF_DISCONTIG_OK` suppresses the per-VMA reports — so a range with a
+/// hole and at least one VMA is accepted for `MPOL_DEFAULT` — but never the
+/// whole-range one.
+fn mbind_range_rejects_hole(
+    aspace: &AddrSpace,
+    start: usize,
+    end: usize,
+    discontig_ok: bool,
+) -> bool {
+    let mut cursor = start;
+    let mut visited = false;
+    while cursor < end {
+        let Some(area) = aspace
+            .areas()
+            .find(|area| area.end() > VirtAddr::from(cursor))
+        else {
+            break;
+        };
+        let area_start = area.start().as_usize();
+        // The walk stops at the range end, so an area at or past it is not a
+        // VMA of this range at all.
+        if area_start >= end {
+            break;
+        }
+        // The first VMA starting after `start` is the head hole, and a later
+        // one starting after the previous VMA ended is a middle hole.
+        if !discontig_ok && area_start > cursor {
+            return true;
+        }
+        visited = true;
+        cursor = area.end().as_usize().min(end);
+    }
+    // A range no VMA covers at all is `-EFAULT` for every policy; a last VMA
+    // ending before `end` leaves the tail hole that only
+    // `MPOL_MF_DISCONTIG_OK` tolerates.
+    !visited || (!discontig_ok && cursor < end)
 }
 
 /// Linux 6.12 `set_mempolicy_home_node(2)`.
