@@ -944,6 +944,71 @@ int main(void)
             }
         }
     }
+    /* The same `task_rlimit(p, RLIMIT_NICE)` read must still reach a target
+     * that has already exited: `p->signal` outlives `do_exit()` until
+     * `release_task()`, so a caller with a narrow limit of its own succeeds
+     * against a zombie that kept a generous one, and is refused for a value
+     * the zombie's own limit excludes. */
+    {
+        pid_t zombie = fork();
+        if (zombie == 0) {
+            struct rlimit thirty = {30, 30};
+            if (prlimit(0, RLIMIT_NICE, &thirty, NULL) != 0) _exit(1);
+            if (setresuid(1000, 1000, 1000) != 0) _exit(1);
+            _exit(0);
+        }
+        if (zombie < 0) {
+            check("setpriority-zombie-fork", 0);
+        } else {
+            siginfo_t info;
+            int status = -1;
+            int reaped;
+            memset(&info, 0, sizeof(info));
+            errno = 0;
+            long waited = syscall(SYS_waitid, P_PID, zombie, &info, WEXITED | WNOWAIT, NULL);
+            check("setpriority-zombie-exited", waited == 0 && info.si_pid == zombie);
+            /* A caller that lowered its own limit to zero and dropped
+             * CAP_SYS_NICE: only the target's retained limit can authorize the
+             * reduction, so 20 - (-5) = 25 <= 30 succeeds. */
+            pid_t caller = fork();
+            if (caller == 0) {
+                struct rlimit none = {0, 0};
+                if (prlimit(0, RLIMIT_NICE, &none, NULL) != 0) _exit(2);
+                if (setresuid(1000, 1000, 1000) != 0) _exit(2);
+                errno = 0;
+                _exit(setpriority(PRIO_PROCESS, zombie, -5) == 0 ? 0 : 1);
+            }
+            do {
+                reaped = waitpid(caller, &status, 0);
+            } while (reaped < 0 && errno == EINTR);
+            check("setpriority-zombie-target-rlimit-nice",
+                  reaped == caller && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+            /* The reduction landed on the retained value.  libc's
+             * `getpriority(2)` undoes the kernel's `nice_to_rlimit()` mapping
+             * (`include/linux/sched/prio.h:33`, `20 - nice`), so the observable
+             * result is the nice value itself, exactly as in `setpriority(2)`. */
+            errno = 0;
+            long prio = getpriority(PRIO_PROCESS, zombie);
+            check("getpriority-zombie-lowered-nice", prio == -5);
+            /* The zombie's own limit is also its ceiling: 20 - (-15) = 35. */
+            pid_t narrow = fork();
+            if (narrow == 0) {
+                struct rlimit none = {0, 0};
+                if (prlimit(0, RLIMIT_NICE, &none, NULL) != 0) _exit(2);
+                if (setresuid(1000, 1000, 1000) != 0) _exit(2);
+                errno = 0;
+                _exit(setpriority(PRIO_PROCESS, zombie, -15) == -1 && errno == EACCES
+                          ? 0
+                          : 1);
+            }
+            do {
+                reaped = waitpid(narrow, &status, 0);
+            } while (reaped < 0 && errno == EINTR);
+            check("setpriority-zombie-above-target-rlimit-eacces",
+                  reaped == narrow && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+            collect(zombie);
+        }
+    }
     done();
 
     /* ---------------- ioprio_set(2)/ioprio_get(2) contract ---------------- */

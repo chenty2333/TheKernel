@@ -323,6 +323,8 @@ pub(crate) struct GroupLeaderSignalIdentity {
     /// Shared with the durable group-leader binding so an exec replacement is
     /// reflected in the owner retained by a zombie payload.
     landlock: Arc<SpinNoIrq<LandlockDomain>>,
+    /// The process's resource limits, shared with the live `ProcessData`.
+    rlimits: Arc<RwLock<Rlimits>>,
 }
 
 impl GroupLeaderSignalIdentity {
@@ -334,6 +336,7 @@ impl GroupLeaderSignalIdentity {
             scheduler: None,
             scheduler_identity_token: 0,
             landlock: Arc::new(SpinNoIrq::new(LandlockDomain::default())),
+            rlimits: Arc::new(RwLock::default()),
         }
     }
 
@@ -343,6 +346,7 @@ impl GroupLeaderSignalIdentity {
         pid_ns: Option<Arc<PidNamespace>>,
         scheduler: Arc<SpinNoIrq<ZombieSchedulerSnapshot>>,
         landlock: Arc<SpinNoIrq<LandlockDomain>>,
+        rlimits: Arc<RwLock<Rlimits>>,
     ) -> Self {
         Self {
             registration_tid,
@@ -351,6 +355,7 @@ impl GroupLeaderSignalIdentity {
             scheduler: Some(scheduler),
             scheduler_identity_token: 0,
             landlock,
+            rlimits,
         }
     }
 
@@ -709,6 +714,25 @@ pub(crate) fn zombie_scheduler_state(process: &Process) -> AxResult<ZombieSchedu
         .and_then(|identity| identity.scheduler.as_ref())
         .map(|scheduler| *scheduler.lock())
         .ok_or(AxError::NoSuchProcess)
+}
+
+/// Returns the resource limit an authoritative unreaped zombie retained.
+///
+/// Linux reads `task_rlimit(p, resource)`, i.e. `p->signal->rlim[resource]`,
+/// which `release_task()` is what finally drops
+/// (`include/linux/sched/signal.h:758-762`); the durable owner identity keeps
+/// the same cell alive for the whole zombie lifetime.
+pub(crate) fn zombie_rlimit(process: &Process, resource: u32) -> AxResult<u64> {
+    ensure_authoritative_zombie(process)?;
+    let limits = process
+        .zombie_payload()
+        .ok_or(AxError::NoSuchProcess)?
+        .reap_owner
+        .lock()
+        .as_ref()
+        .map(|identity| identity.rlimits.clone())
+        .ok_or(AxError::NoSuchProcess)?;
+    Ok(limits.read()[resource].current)
 }
 
 fn ensure_authoritative_zombie(process: &Process) -> AxResult<()> {
@@ -2743,6 +2767,16 @@ struct GroupLeaderIdentityBinding {
     identity_token: AtomicU64,
     /// The process PID namespace copied into the durable owner identity.
     pid_ns: Option<Arc<PidNamespace>>,
+    /// `signal_struct::rlim`, shared with the live `ProcessData` that serves
+    /// `prlimit64(2)` and retained through the durable owner identity.
+    ///
+    /// Linux keeps the resource limits on the `signal_struct`, which outlives
+    /// `do_exit()` until `release_task()`, so a lookup that reaches an
+    /// unreaped zombie through `find_task_by_vpid()` still reads the target's
+    /// own limits (`include/linux/sched/signal.h:758-762`, `kernel/sys.c:243`).
+    /// Sharing one cell instead of copying the values keeps every live writer
+    /// authoritative without a second update path.
+    rlimits: Arc<RwLock<Rlimits>>,
     /// Changes with each replacement of the private endpoint that owns the
     /// process's group-leader identity. Access is serialized with `current`
     /// and `signal`, which makes a handoff and its scheduler reseed one
@@ -2766,6 +2800,7 @@ impl GroupLeaderIdentityBinding {
             signal: Arc::try_new(SpinNoIrq::new(None)).map_err(|_| AxError::NoMemory)?,
             landlock: Arc::try_new(SpinNoIrq::new(LandlockDomain::default()))
                 .map_err(|_| AxError::NoMemory)?,
+            rlimits: Arc::try_new(RwLock::default()).map_err(|_| AxError::NoMemory)?,
             identity_token: AtomicU64::new(1),
             pid_ns,
             scheduler_identity_epoch: SpinNoIrq::new(0),
@@ -2802,6 +2837,7 @@ impl GroupLeaderIdentityBinding {
             self.pid_ns.clone(),
             self.scheduler.clone(),
             self.landlock.clone(),
+            self.rlimits.clone(),
         ));
         Ok(())
     }
@@ -2987,6 +3023,9 @@ impl GroupLeaderIdentityBinding {
         let signal = signal.map(|mut signal| {
             signal.pid_ns = self.pid_ns.clone();
             signal.scheduler = Some(self.scheduler.clone());
+            // Exec keeps the process's resource limits, so the replacement
+            // leader endpoint must keep pointing at the same shared cell.
+            signal.rlimits = self.rlimits.clone();
             signal
         });
         let mut current = self.current.lock();
@@ -3623,8 +3662,9 @@ pub struct ProcessData {
     /// parent's `SIGCHLD` disposition is.
     autoreap: AtomicBool,
 
-    /// The resource limits
-    pub rlim: RwLock<Rlimits>,
+    /// The resource limits, shared with the durable group-leader identity so
+    /// an unreaped zombie still reports the target's own limits.
+    pub rlim: Arc<RwLock<Rlimits>>,
 
     /// The child exit wait event
     pub child_exit_event: Arc<PollSet>,
@@ -4137,6 +4177,7 @@ impl ProcessData {
             image.merge_resident_highwater(image.resident_user_bytes() as u64 / 1024);
             image.tlb_state()
         };
+        let rlimits = group_leader_identity.rlimits.clone();
         let data = Self {
             world,
             proc,
@@ -4162,7 +4203,7 @@ impl ProcessData {
             timer_restore_ids: AtomicBool::new(false),
             autoreap: AtomicBool::new(false),
 
-            rlim: RwLock::default(),
+            rlim: rlimits,
 
             child_exit_event,
             exit_event,

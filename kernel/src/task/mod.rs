@@ -68,7 +68,7 @@ pub(crate) use self::{
         UserNamespaceId, UtsNamespace, ZombieSchedulerSnapshot, ZombieSnapshot, init_process_domain,
         is_exact_child_of_thread, prepare_session_sid_binding, process_domain, process_error,
         process_identity_pid_ns, reap_process, release_dead_session_sid_binding, set_zombie_ioprio,
-        set_zombie_nice, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
+        set_zombie_nice, zombie_ioprio, zombie_pid_ns, zombie_rlimit, zombie_scheduler_state,
     },
     restart::*,
     rseq::{AT_RSEQ_ALIGN, AT_RSEQ_FEATURE_SIZE},
