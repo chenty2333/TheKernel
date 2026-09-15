@@ -1,6 +1,115 @@
 //! Pure clone, rusage and pidfd ABI policy.
 #![allow(missing_docs)]
+use alloc::vec::Vec;
+
 use crate::Pid;
+
+/// Linux `TASK_COMM_LEN` from include/linux/sched.h.
+pub const TASK_COMM_LEN: usize = 16;
+
+/// The raw image Linux keeps in `task_struct::comm`.
+///
+/// `task_struct::comm` is a plain byte array, not a string: `PR_SET_NAME`
+/// copies bytes straight out of userspace and `/proc/<pid>/stat` prints them
+/// back verbatim, so a task name is allowed to be non-UTF-8 and must survive a
+/// round trip unchanged. The image is always NUL-terminated within
+/// `TASK_COMM_LEN` bytes, which is what `strscpy_pad()` in
+/// `__set_task_comm()` (kernel/fork.c) guarantees.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskComm {
+    bytes: [u8; TASK_COMM_LEN],
+}
+
+impl TaskComm {
+    /// The empty name, as `strscpy_pad()` produces for a zero-length source.
+    pub const EMPTY: Self = Self {
+        bytes: [0; TASK_COMM_LEN],
+    };
+
+    /// Builds the `comm` image from an already-copied prefix.
+    ///
+    /// Matches `set_task_comm()` -> `__set_task_comm()` ->
+    /// `strscpy_pad(tsk->comm, from, TASK_COMM_LEN)` in kernel/fork.c: at most
+    /// `TASK_COMM_LEN - 1` bytes are kept, the copy stops at the first NUL, and
+    /// the remainder of the array stays zero.
+    pub const fn from_prefix(prefix: &[u8]) -> Self {
+        let mut bytes = [0; TASK_COMM_LEN];
+        let mut index = 0;
+        while index < TASK_COMM_LEN - 1 && index < prefix.len() {
+            if prefix[index] == 0 {
+                break;
+            }
+            bytes[index] = prefix[index];
+            index += 1;
+        }
+        Self { bytes }
+    }
+
+    /// Wraps an on-the-wire `comm` image read back from a task.
+    pub const fn from_raw(bytes: [u8; TASK_COMM_LEN]) -> Self {
+        Self { bytes }
+    }
+
+    /// The full NUL-padded image, which is what `PR_GET_NAME` copies out.
+    pub const fn raw(&self) -> [u8; TASK_COMM_LEN] {
+        self.bytes
+    }
+
+    /// The bytes before the first NUL, or every byte when the array is full.
+    pub fn as_bytes(&self) -> &[u8] {
+        let len = self
+            .bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(TASK_COMM_LEN);
+        &self.bytes[..len]
+    }
+}
+
+/// `AT_VECTOR_SIZE_BASE` from include/linux/auxvec.h.
+pub const AT_VECTOR_SIZE_BASE: usize = 24;
+
+/// `AT_VECTOR_SIZE_ARCH` for x86-64 without `CONFIG_IA32_EMULATION`.
+///
+/// arch/x86/include/uapi/asm/auxvec.h selects 3 entries for a compat kernel
+/// and 2 otherwise; this kernel has no 32-bit personality, so it is 2.
+pub const AT_VECTOR_SIZE_ARCH: usize = 2;
+
+/// `AT_VECTOR_SIZE` from include/linux/mm_types.h.
+pub const AT_VECTOR_SIZE: usize = 2 * (AT_VECTOR_SIZE_ARCH + AT_VECTOR_SIZE_BASE + 1);
+
+/// `sizeof(mm->saved_auxv)`, the image `PR_GET_AUXV` reports.
+pub const SAVED_AUXV_BYTES: usize = AT_VECTOR_SIZE * size_of::<usize>();
+
+/// Serializes an exec-time auxiliary vector the way Linux stores it.
+///
+/// `create_elf_tables()` writes the pairs straight into
+/// `mm_struct::saved_auxv`, a `SAVED_AUXV_BYTES` array that the mm allocator
+/// zeroed first, so a vector shorter than the array leaves a zero tail that
+/// `PR_GET_AUXV` copies out verbatim. Serializing the same way keeps that tail
+/// byte-identical, and an oversized vector is truncated the way the fixed
+/// array would be.
+pub fn saved_auxv_image(entries: impl IntoIterator<Item = (usize, usize)>) -> Vec<u8> {
+    let mut image = Vec::new();
+    for (kind, value) in entries {
+        if image.len() + 2 * size_of::<usize>() > SAVED_AUXV_BYTES {
+            break;
+        }
+        image.extend_from_slice(&(kind as u64).to_ne_bytes());
+        image.extend_from_slice(&(value as u64).to_ne_bytes());
+    }
+    image
+}
+
+/// How many bytes `PR_SET_NAME` copies out of userspace.
+///
+/// `SYSCALL_DEFINE5(prctl, ...)` in kernel/sys.c clears `comm[TASK_COMM_LEN-1]`
+/// and then calls `strncpy_from_user(comm, arg2, TASK_COMM_LEN - 1)`, so the
+/// read stops after 15 bytes even when the user string is longer.
+pub const fn prctl_set_name_read_bound() -> usize {
+    TASK_COMM_LEN - 1
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessAbiError {
     InvalidFlags,
@@ -43,6 +152,18 @@ pub mod clone_flags {
     pub const CLEAR_SIGHAND: u64 = 0x1_0000_0000;
     pub const INTO_CGROUP: u64 = 0x2_0000_0000;
     pub const DETACHED: u64 = 0x0040_0000;
+    /// `CLONE_NEWTIME`. Occupies bit 7, the only `CSIGNAL` bit that `clone3`
+    /// reuses; `clone(2)` cannot express it because the low byte is the exit
+    /// signal there.
+    pub const NEWTIME: u64 = 0x0000_0080;
+    /// `CLONE_AUTOREAP`: the child is reaped as it exits and sends nothing.
+    pub const AUTOREAP: u64 = 1 << 34;
+    /// `CLONE_NNP`: the child starts with `no_new_privs` set.
+    pub const NNP: u64 = 1 << 35;
+    /// `CLONE_PIDFD_AUTOKILL`: the child dies with its pidfd.
+    pub const PIDFD_AUTOKILL: u64 = 1 << 36;
+    /// `CLONE_EMPTY_MNTNS`: the child receives an empty mount namespace.
+    pub const EMPTY_MNTNS: u64 = 1 << 37;
     pub const KNOWN: u64 = VM
         | FS
         | FILES
@@ -68,7 +189,72 @@ pub mod clone_flags {
         | UNTRACED
         | CLEAR_SIGHAND
         | INTO_CGROUP
-        | DETACHED;
+        | DETACHED
+        | NEWTIME
+        | AUTOREAP
+        | NNP
+        | PIDFD_AUTOKILL
+        | EMPTY_MNTNS;
+}
+
+/// Flags `clone3` accepts that `clone(2)` cannot express.
+///
+/// `clone3_args_valid()` in kernel/fork.c allows `CLONE_LEGACY_FLAGS` plus
+/// these four; everything else is an unknown flag and reports `EINVAL`.
+pub const CLONE3_ONLY_FLAGS: u64 = clone_flags::CLEAR_SIGHAND
+    | clone_flags::INTO_CGROUP
+    | clone_flags::AUTOREAP
+    | clone_flags::NNP
+    | clone_flags::PIDFD_AUTOKILL
+    | clone_flags::EMPTY_MNTNS;
+
+/// Rejects the flag and exit-signal combinations `copy_process()` refuses.
+///
+/// This is the part of `copy_process()` that depends only on the request:
+/// the `CLONE_PIDFD_AUTOKILL` capability rule is folded in as
+/// `has_cap_sys_admin` so the whole precedence order stays testable.
+/// `clone3_args_valid()` has already run, so these checks see admitted flags
+/// only. Order matters: Linux evaluates every `CLONE_AUTOREAP` rule before
+/// the `CLONE_NNP` and `CLONE_PIDFD_AUTOKILL` ones.
+pub const fn clone_flag_admission(
+    flags: u64,
+    exit_signal: u8,
+    caller_autoreap: bool,
+    has_cap_sys_admin: bool,
+) -> Result<(), ProcessAbiError> {
+    use clone_flags::*;
+    if flags & AUTOREAP != 0 {
+        if flags & THREAD != 0 {
+            return Err(ProcessAbiError::InvalidFlags);
+        }
+        if flags & PARENT != 0 {
+            return Err(ProcessAbiError::InvalidFlags);
+        }
+        if exit_signal != 0 {
+            return Err(ProcessAbiError::InvalidExitSignal);
+        }
+    }
+    if flags & PARENT != 0 && caller_autoreap {
+        return Err(ProcessAbiError::InvalidFlags);
+    }
+    if flags & NNP != 0 && flags & THREAD != 0 {
+        return Err(ProcessAbiError::InvalidFlags);
+    }
+    if flags & PIDFD_AUTOKILL != 0 {
+        if flags & PIDFD == 0 {
+            return Err(ProcessAbiError::InvalidFlags);
+        }
+        if flags & AUTOREAP == 0 {
+            return Err(ProcessAbiError::InvalidFlags);
+        }
+        if flags & THREAD != 0 {
+            return Err(ProcessAbiError::InvalidFlags);
+        }
+        if flags & NNP == 0 && !has_cap_sys_admin {
+            return Err(ProcessAbiError::PermissionDenied);
+        }
+    }
+    Ok(())
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClonePlan {
@@ -422,6 +608,139 @@ impl PidfdPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prctl_set_name_truncates_at_fifteen_bytes_and_keeps_raw_bytes() {
+        assert_eq!(prctl_set_name_read_bound(), 15);
+
+        // strscpy_pad() keeps at most TASK_COMM_LEN - 1 bytes and zero-fills
+        // the rest, so a 15-byte name leaves the terminator in the last slot.
+        let fifteen = b"abcdefghijklmno";
+        let comm = TaskComm::from_prefix(fifteen);
+        assert_eq!(comm.as_bytes(), fifteen);
+        assert_eq!(comm.raw()[15], 0);
+        assert_eq!(&comm.raw()[..15], fifteen);
+
+        // A longer user string is truncated, not rejected.
+        let comm = TaskComm::from_prefix(b"abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(comm.as_bytes(), fifteen);
+        assert_eq!(comm.raw()[15], 0);
+
+        // Non-UTF-8 bytes survive verbatim; Linux never validates the name.
+        let raw = [0xff, 0xfe, 0x80, b'x'];
+        let comm = TaskComm::from_prefix(&raw);
+        assert_eq!(comm.as_bytes(), &raw);
+        assert_eq!(&comm.raw()[..4], &raw);
+        assert_eq!(&comm.raw()[4..], &[0; 12]);
+
+        // The image always terminates inside the array, even when the source
+        // is exactly TASK_COMM_LEN bytes long.
+        let comm = TaskComm::from_prefix(&[b'z'; TASK_COMM_LEN]);
+        assert_eq!(comm.as_bytes().len(), TASK_COMM_LEN - 1);
+        assert_eq!(comm.raw()[TASK_COMM_LEN - 1], 0);
+
+        assert_eq!(TaskComm::EMPTY.as_bytes(), b"");
+        assert_eq!(TaskComm::EMPTY.raw(), [0; TASK_COMM_LEN]);
+        assert_eq!(TaskComm::from_raw(comm.raw()), comm);
+    }
+
+    #[test]
+    fn clone3_only_flags_are_admitted_but_keep_their_rules() {
+        use clone_flags::*;
+
+        // CLONE_NEWTIME is bit 7, which `clone(2)` spends on the exit signal.
+        assert_eq!(NEWTIME, 0x80);
+        // Every flag clone3 adds beyond the legacy mask is listed.
+        for flag in [
+            CLEAR_SIGHAND,
+            INTO_CGROUP,
+            AUTOREAP,
+            NNP,
+            PIDFD_AUTOKILL,
+            EMPTY_MNTNS,
+        ] {
+            assert_eq!(CLONE3_ONLY_FLAGS & flag, flag);
+            assert_eq!(KNOWN & flag, flag);
+            assert_eq!(flag & !255, flag);
+        }
+
+        // An admitted flag alone is fine; the combination rules are what bite.
+        assert_eq!(clone_flag_admission(NEWTIME, 0, false, false), Ok(()));
+        assert_eq!(clone_flag_admission(NNP, 0, false, false), Ok(()));
+        assert_eq!(clone_flag_admission(AUTOREAP, 0, false, false), Ok(()));
+        assert_eq!(
+            clone_flag_admission(EMPTY_MNTNS | NEWNS, 0, false, false),
+            Ok(())
+        );
+
+        // CLONE_AUTOREAP owns a thread group's reaping, so it cannot ask for a
+        // thread, a reparented child, or an exit signal.
+        for flags in [AUTOREAP | THREAD, AUTOREAP | PARENT] {
+            assert_eq!(
+                clone_flag_admission(flags, 0, false, false),
+                Err(ProcessAbiError::InvalidFlags)
+            );
+        }
+        assert_eq!(
+            clone_flag_admission(AUTOREAP, 17, false, false),
+            Err(ProcessAbiError::InvalidExitSignal)
+        );
+        // A process that is itself auto-reaped cannot reparent to its parent.
+        assert_eq!(
+            clone_flag_admission(PARENT, 0, true, true),
+            Err(ProcessAbiError::InvalidFlags)
+        );
+
+        assert_eq!(
+            clone_flag_admission(NNP | THREAD, 0, false, false),
+            Err(ProcessAbiError::InvalidFlags)
+        );
+
+        // CLONE_PIDFD_AUTOKILL needs a pidfd and an auto-reaped child, and
+        // without CLONE_NNP it needs CAP_SYS_ADMIN rather than EINVAL.
+        let autokill = PIDFD_AUTOKILL | PIDFD | AUTOREAP;
+        assert_eq!(
+            clone_flag_admission(PIDFD_AUTOKILL, 0, false, true),
+            Err(ProcessAbiError::InvalidFlags)
+        );
+        assert_eq!(
+            clone_flag_admission(PIDFD_AUTOKILL | PIDFD, 0, false, true),
+            Err(ProcessAbiError::InvalidFlags)
+        );
+        assert_eq!(
+            clone_flag_admission(autokill | THREAD, 0, false, true),
+            Err(ProcessAbiError::InvalidFlags)
+        );
+        assert_eq!(
+            clone_flag_admission(autokill, 0, false, false),
+            Err(ProcessAbiError::PermissionDenied)
+        );
+        assert_eq!(clone_flag_admission(autokill, 0, false, true), Ok(()));
+        assert_eq!(
+            clone_flag_admission(autokill | NNP, 0, false, false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn saved_auxv_is_a_fixed_size_image_with_a_zero_tail() {
+        // x86-64 without IA32 emulation: 2 * (2 + 24 + 1) entries of 8 bytes.
+        assert_eq!(AT_VECTOR_SIZE, 54);
+        assert_eq!(SAVED_AUXV_BYTES, 432);
+
+        let image = saved_auxv_image([(6, 4096), (9, 0x401000), (0, 0)]);
+        assert_eq!(image.len(), 48);
+        assert_eq!(u64::from_ne_bytes(image[0..8].try_into().unwrap()), 6);
+        assert_eq!(u64::from_ne_bytes(image[8..16].try_into().unwrap()), 4096);
+        // Everything past the serialized entries reads back as zero, which is
+        // what an mm-allocated `saved_auxv` array contains.
+        assert!(image.len() < SAVED_AUXV_BYTES);
+
+        // A vector that would not fit is truncated at the array bound.
+        let oversized = saved_auxv_image((0..100).map(|index| (index, index)));
+        assert_eq!(oversized.len(), SAVED_AUXV_BYTES);
+    }
+
     #[test]
     fn edges() {
         assert_eq!(

@@ -246,6 +246,40 @@ impl CapsetRequest {
     }
 }
 
+/// The `pid` field of a `capget(2)`/`capset(2)` header.
+///
+/// The two syscalls disagree about a foreign pid, and the difference is
+/// observable, so the rule lives here rather than in a shared lookup helper:
+///
+/// * `SYSCALL_DEFINE2(capset, ...)` in kernel/capability.c rejects every pid
+///   that is neither 0 nor `task_pid_vnr(current)` with `-EPERM` *before* it
+///   looks the pid up. A negative, nonexistent, or foreign pid is therefore
+///   `-EPERM`, never `-EINVAL` and never `-ESRCH`.
+/// * `SYSCALL_DEFINE2(capget, ...)` rejects a negative pid with `-EINVAL` and
+///   an unresolvable one with `-ESRCH`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityHeaderPid(i32);
+
+impl CapabilityHeaderPid {
+    /// Wraps the raw header field without validating it.
+    pub const fn new(pid: i32) -> Self {
+        Self(pid)
+    }
+
+    /// Returns the raw header field.
+    pub const fn pid(self) -> i32 {
+        self.0
+    }
+
+    /// Reports whether `capset(2)` may act on this header at all.
+    ///
+    /// `current_tid` is the caller's own TID *as visible in its PID
+    /// namespace*, matching `task_pid_vnr(current)`.
+    pub const fn authorizes_capset(self, current_tid: u32) -> bool {
+        self.0 == 0 || self.0 as u32 == current_tid && self.0 > 0
+    }
+}
+
 /// Planned user-ID transition bound to one borrowed old credential.
 #[must_use = "a user-ID plan has no effect until the consumer prepares and publishes it"]
 pub struct UserIdTransitionPlan<'a, N: UserNamespaceView> {
@@ -841,6 +875,19 @@ mod tests {
         SECBIT_EXEC_RESTRICT_FILE, SECBIT_EXEC_RESTRICT_FILE_LOCKED, SECBIT_KEEP_CAPS_LOCKED,
         SECBIT_NOROOT, SECURE_ALL_UNPRIVILEGED,
     };
+
+    #[test]
+    fn capset_header_only_accepts_zero_or_the_calling_tid() {
+        let current_tid = 4242;
+        assert!(CapabilityHeaderPid::new(0).authorizes_capset(current_tid));
+        assert!(CapabilityHeaderPid::new(current_tid as i32).authorizes_capset(current_tid));
+        // A foreign, nonexistent, or negative pid is -EPERM before lookup;
+        // capget(2) is the syscall that reports -ESRCH / -EINVAL instead.
+        assert!(!CapabilityHeaderPid::new(1).authorizes_capset(current_tid));
+        assert!(!CapabilityHeaderPid::new(-1).authorizes_capset(current_tid));
+        assert!(!CapabilityHeaderPid::new(i32::MIN).authorizes_capset(current_tid));
+        assert_eq!(CapabilityHeaderPid::new(-7).pid(), -7);
+    }
 
     struct TestNamespace {
         root: Option<Kuid>,
