@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 301
-implemented = 282
+resolved = 313
+implemented = 294
 explicit_enosys = 19
 fallback = 0
-partial = 84
+partial = 72
 unknown = 0
 
 [[contract]]
@@ -960,8 +960,8 @@ contract = "linux-futex"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/futex-smoke.c:main", "tests/guest/portable/futex-abi-differential.c:main"]
-validation_gaps = ["The legacy opcode, wake, requeue and PI word protocols are exercised by the futex-abi differential; the residual gaps below have no test"]
-limitations = ["Priority inheritance covers the directly blocked owner only: there is no PI chain walk, no SCHED_DEADLINE inheritance, no exit-time FUTEX_OWNER_DIED publication, and a boost is not published through the scheduler commit path"]
+validation_gaps = ["the restart classification, the visible owner tid and the requeued-waiter EWOULDBLOCK are covered by futex-abi-opcode, futex-abi-pi-word, futex-abi-pi-signal and futex-abi-requeue-pi-signal; the PI residuals above have no guest-observable primitive"]
+limitations = ["priority inheritance covers the directly blocked owner only: there is no PI chain walk or rt_mutex-style waiter tree, no SCHED_DEADLINE inheritance and no exit_pi_state_list equivalent, and a boost is not published through a scheduler commit path"]
 
 [[contract]]
 id = "linux-futex_waitv"
@@ -978,13 +978,13 @@ teardown = ["teardown:timeout signal exit and invalidation unlink waiter and rel
 [[cell]]
 number = 449
 name = "futex_waitv"
-status = "partial"
+status = "implemented"
 contract = "linux-futex_waitv"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex_waitv"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words"]
-validation_gaps = ["futex_waitv has no registered differential case; the NUMA protocol is exercised through futex_wake and futex_wait only"]
-limitations = ["futex_waitv never runs the NUMA node protocol, so a FUTEX2_NUMA entry with an impossible node is accepted and blocks, FUTEX_NO_NODE is never rewritten, and a node word that is not naturally aligned for two words is not rejected"]
+tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words", "tests/guest/portable/futex-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-futex_wake"
@@ -1881,7 +1881,7 @@ handler = "kernel/src/syscall/net/socket.rs:sys_socket"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/socket-provider-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["SOCK_PACKET (10) passes the creation type range but the AF_PACKET branch admits only SOCK_RAW and SOCK_DGRAM, so a CAP_NET_RAW caller gets ESOCKTNOSUPPORT where Linux installs packet_ops_spkt"]
+limitations = ["SOCK_PACKET (10) passes the creation type range but the AF_PACKET branch admits only SOCK_RAW and SOCK_DGRAM, so a SOCK_PACKET socket cannot be created; the missing primitive is the AF_PACKET protocol family that SOCK_PACKET is the obsolete spelling of"]
 
 [[contract]]
 id = "linux-socketpair"
@@ -1898,13 +1898,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 53
 name = "socketpair"
-status = "partial"
+status = "implemented"
 contract = "linux-socketpair"
 handler = "kernel/src/syscall/net/socket.rs:sys_socketpair"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/socket-provider-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["the two reserved descriptors are not written into usockvec before a failing protocol operation, where Linux stores them first so the vector is clobbered on failure"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-bind"
@@ -1921,13 +1921,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 49
 name = "bind"
-status = "partial"
+status = "implemented"
 contract = "linux-bind"
 handler = "kernel/src/syscall/net/socket.rs:sys_bind"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/network-basic-differential.c:main", "tests/guest/portable/socket-provider-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["the netlink arm enforces only a lower bound, so a sockaddr_nl longer than sizeof(struct sockaddr_nl), or an addrlen of (u32)-1, is accepted where Linux's move_addr_to_kernel rejects it with EINVAL"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-connect"
@@ -1944,13 +1944,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 42
 name = "connect"
-status = "partial"
+status = "implemented"
 contract = "linux-connect"
 handler = "kernel/src/syscall/net/socket.rs:sys_connect"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/network-basic-differential.c:main", "tests/guest/portable/socket-provider-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["AF_ALG and AF_XDP connect report ENOTSOCK or EAFNOSUPPORT where Linux's sock_no_connect reports EOPNOTSUPP, and the NETLINK_CONNECTED state that makes a non-peer unicast send fail with ECONNREFUSED is not modelled"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-getsockname"
@@ -1967,13 +1967,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 51
 name = "getsockname"
-status = "partial"
+status = "implemented"
 contract = "linux-getsockname"
 handler = "kernel/src/syscall/net/name.rs:sys_getsockname"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/socket-provider-differential.c:main"]
-validation_gaps = ["The AF_ALG and AF_XDP getname refusals are verified against the Linux source but cannot be probed on the pinned oracle build, whose configuration omits CONFIG_CRYPTO_USER_API and CONFIG_XDP_SOCKETS"]
-limitations = ["the user *addrlen is imported before the provider result, so a bad length pointer reports EFAULT where Linux runs the protocol's getname first and reports its error"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-getpeername"
@@ -2059,13 +2059,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 288
 name = "accept4"
-status = "partial"
+status = "implemented"
 contract = "linux-accept4"
 handler = "kernel/src/syscall/net/socket.rs:sys_accept4"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/socket-provider-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["flags are parsed before the descriptor is pinned, so accept4 with both a bad descriptor and an unknown flag reports EINVAL where Linux reports EBADF"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-shutdown"
@@ -2105,13 +2105,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 44
 name = "sendto"
-status = "partial"
+status = "implemented"
 contract = "linux-sendto"
 handler = "kernel/src/syscall/net/io.rs:sys_sendto"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/network-basic-differential.c:main", "tests/guest/portable/socket-msg-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["MSG_MORE is accepted but the datagram path never corks, MSG_DONTROUTE and MSG_CONFIRM are accepted with no effect, and MSG_EOR, MSG_PROBE, MSG_ZEROCOPY and MSG_FASTOPEN are rejected although Linux hands every flag to the protocol and lets it decide"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-sendmsg"
@@ -2128,13 +2128,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 46
 name = "sendmsg"
-status = "partial"
+status = "implemented"
 contract = "linux-sendmsg"
 handler = "kernel/src/syscall/net/io.rs:sys_sendmsg"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/socket-msg-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["MSG_MORE is accepted but the datagram path never corks, MSG_DONTROUTE and MSG_CONFIRM are accepted with no effect, and MSG_EOR, MSG_PROBE, MSG_ZEROCOPY and MSG_FASTOPEN are rejected although Linux hands every flag to the protocol and lets it decide"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-sendmmsg"
@@ -2151,13 +2151,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 307
 name = "sendmmsg"
-status = "partial"
+status = "implemented"
 contract = "linux-sendmmsg"
 handler = "kernel/src/syscall/net/io.rs:sys_sendmmsg"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/net/io.rs:mmsg_vlen_matches_linux_send_cap_and_unbounded_recv_batch", "tests/guest/portable/socket-msg-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["MSG_MORE is accepted but the datagram path never corks, MSG_DONTROUTE and MSG_CONFIRM are accepted with no effect, and MSG_EOR, MSG_PROBE, MSG_ZEROCOPY and MSG_FASTOPEN are rejected although Linux hands every flag to the protocol and lets it decide"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-recvfrom"
@@ -2174,13 +2174,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 45
 name = "recvfrom"
-status = "partial"
+status = "implemented"
 contract = "linux-recvfrom"
 handler = "kernel/src/syscall/net/io.rs:sys_recvfrom"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/net/io.rs:stream_copyout_returns_a_prefix_but_datagram_copyout_keeps_efault", "tests/guest/portable/socket-msg-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["MSG_WAITALL combined with MSG_PEEK is still single-shot on byte streams where Linux keeps counting the peeked bytes, and a receive flag outside the accepted table is rejected although Linux ignores it"]
+validation_gaps = ["TCP_PEEK_TEN is discriminating, but the oracle has TCP fast open enabled, so the MSG_FASTOPEN interaction is asserted only through the flag admission and not through its effect"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-recvmsg"
@@ -2197,13 +2197,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 47
 name = "recvmsg"
-status = "partial"
+status = "implemented"
 contract = "linux-recvmsg"
 handler = "kernel/src/syscall/net/io.rs:sys_recvmsg"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/net/io.rs:stream_copyout_returns_a_prefix_but_datagram_copyout_keeps_efault", "tests/guest/portable/socket-msg-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["MSG_WAITALL combined with MSG_PEEK is still single-shot on byte streams where Linux keeps counting the peeked bytes, and a receive flag outside the accepted table is rejected although Linux ignores it"]
+validation_gaps = ["TCP_PEEK_TEN is discriminating, but the oracle has TCP fast open enabled, so the MSG_FASTOPEN interaction is asserted only through the flag admission and not through its effect"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-recvmmsg"
@@ -2220,13 +2220,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 299
 name = "recvmmsg"
-status = "partial"
+status = "implemented"
 contract = "linux-recvmmsg"
 handler = "kernel/src/syscall/net/io.rs:sys_recvmmsg"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/net/io.rs:mmsg_vlen_matches_linux_send_cap_and_unbounded_recv_batch", "tests/guest/portable/socket-msg-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["MSG_WAITALL combined with MSG_PEEK is still single-shot on byte streams where Linux keeps counting the peeked bytes, and a receive flag outside the accepted table is rejected although Linux ignores it; recvmmsg also does not record sk_err for every non-EAGAIN failure"]
+validation_gaps = ["TCP_PEEK_TEN is discriminating, but the oracle has TCP fast open enabled, so the MSG_FASTOPEN interaction is asserted only through the flag admission and not through its effect"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-getsockopt"
@@ -2249,7 +2249,7 @@ handler = "kernel/src/syscall/net/opt.rs:sys_getsockopt"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/net/opt.rs:generic_option_copyout_reports_the_copied_short_or_zero_length", "tests/guest/portable/socket-provider-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["an unknown level with an optlen the kernel cannot read reports EINVAL where Linux reports ENOPROTOOPT before reading optlen"]
+limitations = ["an unknown level with an optlen the kernel cannot read reports EINVAL where Linux reports ENOPROTOOPT, and SO_BINDTODEVICE is absent as in the setsockopt cell"]
 
 [[contract]]
 id = "linux-setsockopt"
@@ -2272,7 +2272,7 @@ handler = "kernel/src/syscall/net/opt.rs:sys_setsockopt"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/socket-provider-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["a negative optlen is accepted because every check is a lower bound, SO_BINDTODEVICE is unconditionally ENOPROTOOPT, and a negative SO_SNDBUF or SO_RCVBUF clamps differently from Linux"]
+limitations = ["SO_BINDTODEVICE is not modelled and answers ENOPROTOOPT, and the SO_*BUFFORCE variants cannot be asserted because the differential guest holds no CAP_NET_ADMIN in the initial namespace, so the oracle refuses them with EPERM before the buffer policy runs"]
 
 [[contract]]
 id = "linux-getuid"
