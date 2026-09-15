@@ -42,11 +42,38 @@
  * of the few _IO commands that takes an argument (`_IO(0x00,2)`, so its
  * encoding carries neither direction nor size); a `_IOR(0x00, 2, int)`
  * spelling addresses a different, unallocated command instead. */
-#define FIGETBSZ 0x00000002UL               /* _IO(0x00, 2) */
-#define FIFREEZE 0xC0045877UL               /* _IOWR('X', 119, int) */
-#define FITHAW 0xC0045878UL                 /* _IOWR('X', 120, int) */
-#define FS_IOC_GETFSUUID 0x80111500UL       /* _IOR(0x15, 0, struct fsuuid2) */
-#define FS_IOC_GETFSSYSFSPATH 0x80811501UL  /* _IOR(0x15, 1, struct fs_sysfs_path) */
+#define FIGETBSZ 0x00000002UL   /* _IO(0x00, 2) */
+#define FIBMAP 0x00000001UL     /* _IO(0x00, 1) */
+/* <sys/ioctl.h> already defines the four 'T' commands; the guest build is
+ * -Werror, so only add what the C library leaves out. */
+#ifndef FIOCLEX
+#define FIOCLEX 0x5451UL        /* _IO('T', 81) */
+#endif
+#ifndef FIONCLEX
+#define FIONCLEX 0x5450UL       /* _IO('T', 80) */
+#endif
+#ifndef FIONBIO
+#define FIONBIO 0x5421UL        /* _IOW('T', 33, int) */
+#endif
+#ifndef FIOASYNC
+#define FIOASYNC 0x5452UL       /* _IOW('T', 82, int) */
+#endif
+#ifndef FIOQSIZE
+#define FIOQSIZE 0x5460UL       /* include/uapi/asm-generic/ioctls.h */
+#endif
+#ifndef FICLONE
+#define FICLONE 0x40049409UL    /* _IOW(0x94, 9, int) */
+#endif
+#ifndef FS_IOC_FIEMAP
+#define FS_IOC_FIEMAP 0xC020660BUL /* _IOWR('f', 11, struct fiemap) */
+#endif
+#ifndef FS_IOC_RESVSP
+#define FS_IOC_RESVSP 0x40305828UL /* _IOW('X', 40, struct space_resv) */
+#endif
+#define FIFREEZE 0xC0045877UL   /* _IOWR('X', 119, int) */
+#define FITHAW 0xC0045878UL     /* _IOWR('X', 120, int) */
+#define FS_IOC_GETFSUUID 0x80111500UL /* _IOR(0x15, 0, struct fsuuid2) */
+#define FS_IOC_GETFSSYSFSPATH 0x80811501UL /* _IOR(0x15, 1, struct fs_sysfs_path) */
 
 #define MS_RDONLY 1UL
 #define MS_SYNCHRONOUS 16UL
@@ -420,17 +447,17 @@ int main(void) {
          * a restricted action only through `capable(CAP_SYSLOG)`; CAP_SYS_ADMIN
          * is not an alternative, and SYSLOG_ACTION_SIZE_UNREAD is restricted
          * because it is neither READ_ALL nor SIZE_BUFFER. */
-        pid_t child = fork();
-        check(child >= 0, "syslog-fork");
-        if (child == 0) {
+        pid_t cap_child = fork();
+        check(cap_child >= 0, "syslog-fork");
+        if (cap_child == 0) {
             int dropped = drop_capability(CAP_SYSLOG);
             errno = 0;
             long r = syscall(SYS_syslog, SYSLOG_ACTION_SIZE_UNREAD, NULL, 0);
             _exit(dropped == 0 && r == -1 && errno == EPERM ? 0 : 1);
         }
-        int status = 0;
-        check(waitpid(child, &status, 0) == child, "syslog-waitpid");
-        check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "syslog-cap-syslog-only");
+        int cap_status = 0;
+        check(waitpid(cap_child, &cap_status, 0) == cap_child, "syslog-waitpid");
+        check(WIFEXITED(cap_status) && WEXITSTATUS(cap_status) == 0, "syslog-cap-syslog-only");
     }
     done();
 
