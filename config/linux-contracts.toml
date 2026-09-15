@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 313
-implemented = 294
+resolved = 312
+implemented = 293
 explicit_enosys = 19
 fallback = 0
-partial = 72
+partial = 73
 unknown = 0
 
 [[contract]]
@@ -3485,13 +3485,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 228
 name = "clock_gettime"
-status = "implemented"
+status = "partial"
 contract = "linux-clock_gettime"
 handler = "kernel/src/syscall/time.rs:sys_clock_gettime"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/time.rs:clock_domain_accepts_linux_encoded_cpu_clock_ids", "tests/guest/portable/time-abi-differential.c:main"]
-validation_gaps = ["CLOCK_MONOTONIC_RAW is read only outside a time namespace, so MONOTONIC_RAW_SHARES_MONOTONIC_OFFSET compares zero with zero and the time-namespace offset is covered by no run"]
-limitations = ["explicit-none"]
+tests = ["kernel/src/syscall/time.rs:clock_domain_accepts_linux_encoded_cpu_clock_ids", "tests/guest/portable/time-abi-differential.c:main", "tests/guest/portable/clock-abi-differential.c:main"]
+validation_gaps = ["RAW_TRACKS_MONOTONIC compares zero with zero because no time namespace is mounted, so a kernel that dropped the offset would still agree on both guests"]
+limitations = ["CLOCK_MONOTONIC_RAW does not apply the time-namespace offset that Linux's posix_get_monotonic_raw() adds (kernel/time/posix-timers.c:222-227), and clock-abi.raw-differential can only compare the offset as zero with zero because the differential guest runs in no time namespace; the rest of the clock contract is covered by that case, including the epoch, the timespec normalisation, the boottime floor, the sleep delta and the spin delta"]
 
 [[contract]]
 id = "linux-clock_getres"

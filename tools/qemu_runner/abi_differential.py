@@ -224,6 +224,7 @@ CONTRACTS.update({
     "aio": ("portable-differential", "pass", "IO_SETUP_VALIDATION IO_SUBMIT_OPCODE_VALIDATION IO_CANCEL_VALIDATION IO_CANCEL_PENDING_REQUEST IO_DESTROY_VALIDATION"),
     "io-uring-register": ("portable-differential", "pass", "FILES_COUNT_LIMITS"),
     "console_integrity": ("raw-differential", "pass", "INTERLEAVED_WRITERS"),
+    "clock-abi": ("portable-differential", "pass", "MONOTONIC_EPOCH TIMESPEC_NORMALIZED BOOTTIME_NOT_BELOW_MONOTONIC REALTIME_WALL_CLOCK UPTIME_IS_BOOTTIME MONOTONIC_ADVANCES RAW_TRACKS_MONOTONIC SLEEP_ADVANCES_MONOTONIC"),
     "brk": ("raw-differential", "pass", "BREAK_ALIGNMENT SHRINK_KEEPS_BREAK GROW_INTO_HOLE GUARD_GAP_BOUNDARY"),
     "mmap": ("raw-differential", "pass", "ANON_OFFSET_IGNORED PROT_GROWSDOWN_UP DROPPABLE_MATRIX LOCKED_LIMIT_ERRNOS"),
     "madvise": ("raw-differential", "pass", "DONTNEED_LOCKED REMOVE_BY_MAPPING_TYPE FREE_LOCKED_EINVAL UNAVAILABLE_ADVICES GUARD_AND_DONTDUMP WIPEONFORK_HOLE"),
@@ -259,6 +260,7 @@ PROGRAM_CASES = {
     "sysv-ipc": ("sysvipc-ids", "sysvipc-stat", "sysvipc-info", "sysvipc-sem", "sysvipc-sem-undo", "sysvipc-control", "sysvipc-shm-lock", "sysvipc-shm-hugetlb", "sysvipc-shm-dest", "sysvipc-errno", "sysvipc-msg"),
     "posix-mqueue": ("mq_open", "mq_unlink", "mq_timedsend", "mq_timedreceive", "mq_notify"),
     "console-integrity": ("console_integrity",),
+    "clock-abi": ("clock-abi",),
     "aio": ("aio",),
     "io-uring-register": ("io-uring-register",),
 }
@@ -316,6 +318,7 @@ PROGRAM_SUCCESS = {
     "sysv-ipc": "THEKERNEL_SYSVIPC_OK",
     "posix-mqueue": "THEKERNEL_POSIX_MQUEUE_OK",
     "console-integrity": "THEKERNEL_CONSOLE_INTEGRITY_OK",
+    "clock-abi": "THEKERNEL_CLOCK_ABI_DIFFERENTIAL_OK",
     "aio": "THEKERNEL_AIO_OK",
     "io-uring-register": "THEKERNEL_IO_URING_REGISTER_OK",
 }

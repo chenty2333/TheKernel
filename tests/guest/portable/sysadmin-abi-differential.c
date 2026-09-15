@@ -598,7 +598,7 @@ static void ptrace_request_case(void) {
         report_failure("PTRACE_TRACEE_EXIT_STATUS", -1, errno);
     }
 
-    puts("THEKERNEL_ABI_RESULT sysadmin-abi.ptrace-requests pass");
+    puts("THEKERNEL_ABI_RESULT sysadmin-abi.ptrace-requests.raw-differential pass");
 }
 
 /* --- unshare flag admission -------------------------------------------- */
