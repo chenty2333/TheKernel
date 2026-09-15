@@ -74,7 +74,6 @@
 
 #define TRANSCRIPT_BYTES 16384U
 #define TRANSCRIPT_HARD_LIMIT (1U << 20)
-#define TRANSCRIPT_LINE_BYTES 512U
 #define PATH_BUFFER_BYTES 4096U
 
 /* ELF values, spelled out locally: this helper is compiled once with the host
