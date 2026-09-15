@@ -4639,8 +4639,8 @@ status = "implemented"
 contract = "linux-openat"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_openat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias"]
-validation_gaps = ["Existing source/helper coverage does not establish the full openat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4731,8 +4731,8 @@ status = "implemented"
 contract = "linux-close"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_close"
 conditional = "explicit-none"
-tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork"]
-validation_gaps = ["Existing source/helper coverage does not establish the full close raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4777,8 +4777,8 @@ status = "implemented"
 contract = "linux-dup"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_dup"
 conditional = "explicit-none"
-tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork"]
-validation_gaps = ["Existing source/helper coverage does not establish the full dup raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4800,8 +4800,8 @@ status = "implemented"
 contract = "linux-dup2"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_dup2"
 conditional = "explicit-none"
-tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork"]
-validation_gaps = ["Existing source/helper coverage does not establish the full dup2 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4823,8 +4823,8 @@ status = "implemented"
 contract = "linux-dup3"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_dup3"
 conditional = "explicit-none"
-tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork"]
-validation_gaps = ["Existing source/helper coverage does not establish the full dup3 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5053,8 +5053,8 @@ status = "implemented"
 contract = "linux-getdents64"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_getdents64"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full getdents64 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5720,8 +5720,8 @@ status = "implemented"
 contract = "linux-read"
 handler = "kernel/src/syscall/fs/io.rs:sys_read"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full read raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5743,8 +5743,8 @@ status = "implemented"
 contract = "linux-write"
 handler = "kernel/src/syscall/fs/io.rs:sys_write"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full write raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5766,8 +5766,8 @@ status = "implemented"
 contract = "linux-readv"
 handler = "kernel/src/syscall/fs/io.rs:sys_readv"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full readv raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5789,8 +5789,8 @@ status = "implemented"
 contract = "linux-writev"
 handler = "kernel/src/syscall/fs/io.rs:sys_writev"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full writev raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5812,8 +5812,8 @@ status = "implemented"
 contract = "linux-lseek"
 handler = "kernel/src/syscall/fs/io.rs:sys_lseek"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full lseek raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5835,8 +5835,8 @@ status = "implemented"
 contract = "linux-pread64"
 handler = "kernel/src/syscall/fs/io.rs:sys_pread64"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full pread64 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5858,8 +5858,8 @@ status = "implemented"
 contract = "linux-pwrite64"
 handler = "kernel/src/syscall/fs/io.rs:sys_pwrite64"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full pwrite64 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5996,8 +5996,8 @@ status = "implemented"
 contract = "linux-fsync"
 handler = "kernel/src/syscall/fs/io.rs:sys_fsync"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fsync raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6019,8 +6019,8 @@ status = "implemented"
 contract = "linux-fdatasync"
 handler = "kernel/src/syscall/fs/io.rs:sys_fdatasync"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fdatasync raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6042,8 +6042,8 @@ status = "implemented"
 contract = "linux-truncate"
 handler = "kernel/src/syscall/fs/io.rs:sys_truncate"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full truncate raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6065,8 +6065,8 @@ status = "implemented"
 contract = "linux-ftruncate"
 handler = "kernel/src/syscall/fs/io.rs:sys_ftruncate"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full ftruncate raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6088,8 +6088,8 @@ status = "implemented"
 contract = "linux-fadvise64"
 handler = "kernel/src/syscall/fs/io.rs:sys_fadvise64"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fadvise64 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
