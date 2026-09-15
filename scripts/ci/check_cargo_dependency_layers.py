@@ -16,6 +16,9 @@ ALLOWED = {
     "integration": {"integration", "platform", "linux_abi", "mechanism"},
 }
 
+# Only independently validated, explicitly approved components may be uploaded.
+PUBLISHED_COMPONENTS = {"tk-axcbpf"}
+
 
 def violations(data: dict, root: Path) -> list[str]:
     packages = data["packages"]
@@ -64,7 +67,7 @@ def workspace_policy_violations(data: dict, root: Path) -> list[str]:
             errors.append(f"{name}: component package must use the tk- prefix")
         for field, expected in (("rust_version", policy["rust-version"]),
                                 ("repository", policy["repository"]),
-                                ("publish", [] if policy["publish"] is False else policy["publish"])):
+                                ("publish", ["crates-io"] if name in PUBLISHED_COMPONENTS else [])):
             if package.get(field) != expected:
                 errors.append(f"{name}: {field} differs from workspace policy")
         directory = Path(package["manifest_path"]).resolve().parent

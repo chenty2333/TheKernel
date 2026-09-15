@@ -1,5 +1,5 @@
 [package]
-publish.workspace = true
+publish = ["crates-io"]
 name = "tk-axcbpf"
 version = "0.1.0"
 edition = "2024"
@@ -9,6 +9,9 @@ description = "Verified classic-BPF mechanism for no_std operating systems"
 license = "Apache-2.0"
 repository.workspace = true
 readme = "README.md"
+documentation = "https://docs.rs/tk-axcbpf"
+keywords = ["bpf", "cbpf", "no-std", "jit"]
+categories = ["no-std", "compilers"]
 
 [lib]
 name = "axcbpf"

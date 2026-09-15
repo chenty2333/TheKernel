@@ -3,7 +3,7 @@ publish.workspace = true
 rust-version.workspace = true
 edition = "2024"
 name = "tk-axfeat"
-version = "0.3.0-preview.2"
+version = "0.1.0"
 authors = ["Yuekai Jia <equation618@gmail.com>"]
 description = "Top-level feature selection for ArceOS"
 license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
@@ -147,18 +147,18 @@ name = "axfeat"
 path = "src/lib.rs"
 
 [dependencies]
-axalloc = { package = "tk-axalloc", path = "../tk-axalloc", version = "=0.3.0-preview.2", optional = true }
+axalloc = { package = "tk-axalloc", path = "../tk-axalloc", version = "0.1.0", optional = true }
 axbacktrace = "0.1"
 axconfig = { version = "=0.3.0-preview.2", optional = true }
-axdisplay = { package = "tk-axdisplay", path = "../tk-axdisplay", version = "=0.3.0-preview.2", optional = true }
-axdriver = { package = "tk-axdriver", path = "../tk-axdriver", version = "=0.3.0-preview.2", optional = true }
-axfs-ng = { package = "tk-axfs-ng", path = "../tk-axfs-ng", version = "=0.3.0-preview.2", optional = true }
-axhal = { package = "tk-axhal", path = "../tk-axhal", version = "=0.3.0-preview.2" }
-axinput = { package = "tk-axinput", path = "../tk-axinput", version = "=0.3.0-preview.2", optional = true }
+axdisplay = { package = "tk-axdisplay", path = "../tk-axdisplay", version = "0.1.0", optional = true }
+axdriver = { package = "tk-axdriver", path = "../tk-axdriver", version = "0.1.0", optional = true }
+axfs-ng = { package = "tk-axfs-ng", path = "../tk-axfs-ng", version = "0.1.0", optional = true }
+axhal = { package = "tk-axhal", path = "../tk-axhal", version = "0.1.0" }
+axinput = { package = "tk-axinput", path = "../tk-axinput", version = "0.1.0", optional = true }
 axlog = { version = "=0.3.0-preview.2" }
-axruntime = { package = "tk-axruntime", path = "../tk-axruntime", version = "=0.3.0-preview.2" }
-axsync = { package = "tk-axsync", path = "../tk-axsync", version = "=0.3.0-preview.2", optional = true }
-axtask = { package = "tk-axtask", path = "../tk-axtask", version = "=0.1.0", optional = true }
+axruntime = { package = "tk-axruntime", path = "../tk-axruntime", version = "0.1.0" }
+axsync = { package = "tk-axsync", path = "../tk-axsync", version = "0.1.0", optional = true }
+axtask = { package = "tk-axtask", path = "../tk-axtask", version = "0.1.0", optional = true }
 kspin = { version = "0.1", optional = true }
 
 [package.metadata.thekernel]

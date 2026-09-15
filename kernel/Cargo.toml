@@ -2,7 +2,7 @@
 publish.workspace = true
 rust-version.workspace = true
 name = "tk-kernel"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 description.workspace = true
 authors.workspace = true

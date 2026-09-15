@@ -24,7 +24,7 @@ linux-raw-sys = { version = "0.12", default-features = false, features = ["gener
 log = "0.4"
 spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
 strum = { version = "0.27", default-features = false, features = ["derive"] }
-tk-linux-usercopy = { path = "../usercopy", version = "0.1" }
+tk-linux-usercopy = { path = "../usercopy", version = "0.1.0" }
 x86_64 = { version = "=0.15.5", default-features = false }
 
 [package.metadata.docs.rs]

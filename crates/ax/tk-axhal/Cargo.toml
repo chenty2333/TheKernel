@@ -13,7 +13,7 @@ publish.workspace = true
 rust-version.workspace = true
 edition = "2024"
 name = "tk-axhal"
-version = "0.3.0-preview.2"
+version = "0.1.0"
 authors = ["Yuekai Jia <equation618@gmail.com>"]
 build = "build.rs"
 autolib = false
@@ -88,7 +88,7 @@ path = "src/lib.rs"
 [dependencies.axalloc]
 package = "tk-axalloc"
 path = "../tk-axalloc"
-version = "=0.3.0-preview.2"
+version = "0.1.0"
 optional = true
 
 [dependencies.axconfig]
@@ -97,13 +97,13 @@ version = "=0.3.0-preview.2"
 [dependencies.axgpu]
 package = "tk-axgpu"
 path = "../tk-axgpu"
-version = "=0.1.0"
+version = "0.1.0"
 default-features = false
 
 [dependencies.axcpu]
 package = "tk-axcpu"
 path = "../tk-axcpu"
-version = "=0.3.0-preview.8"
+version = "0.1.0"
 
 [dependencies.axplat]
 version = "0.3.1-pre.6"
@@ -133,7 +133,7 @@ version = "0.4"
 [dependencies.page_table_multiarch]
 package = "tk-page-table-multiarch"
 path = "../tk-page-table-multiarch"
-version = "0.6"
+version = "0.1.0"
 features = ["axerrno"]
 optional = true
 
@@ -153,7 +153,7 @@ version = "=0.3.0-preview.2"
 [target.'cfg(target_arch = "x86_64")'.dependencies.axplat-x86-pc]
 package = "tk-axplat-x86-pc"
 path = "../tk-axplat-x86-pc"
-version = "0.3.1-pre.6"
+version = "0.1.0"
 optional = true
 
 [package.metadata.thekernel]

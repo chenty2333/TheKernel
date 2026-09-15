@@ -13,7 +13,7 @@ publish.workspace = true
 rust-version.workspace = true
 edition = "2021"
 name = "tk-axdriver-virtio"
-version = "0.1.4-preview.3"
+version = "0.1.0"
 authors = [
     "Yuekai Jia <equation618@gmail.com>",
     "朝倉水希 <asakuramizu111@gmail.com>",
@@ -75,48 +75,48 @@ path = "src/lib.rs"
 [dependencies.axdriver_base]
 package = "tk-axdriver-base"
 path = "../tk-axdriver-base"
-version = "0.1.4-preview.3"
+version = "0.1.0"
 
 [dependencies.axdriver_block]
 package = "tk-axdriver-block"
 path = "../tk-axdriver-block"
-version = "0.1.4-preview.3"
+version = "0.1.0"
 optional = true
 
 [dependencies.axdriver_display]
 package = "tk-axdriver-display"
 path = "../tk-axdriver-display"
-version = "0.1.4-preview.3"
+version = "0.1.0"
 optional = true
 
 [dependencies.axdriver_input]
 package = "tk-axdriver-input"
 path = "../tk-axdriver-input"
-version = "0.1.4-preview.3"
+version = "0.1.0"
 optional = true
 
 [dependencies.axdriver_net]
 package = "tk-axdriver-net"
 path = "../tk-axdriver-net"
-version = "0.1.4-preview.3"
+version = "0.1.0"
 optional = true
 
 [dependencies.axdriver_vsock]
 package = "tk-axdriver-vsock"
 path = "../tk-axdriver-vsock"
-version = "0.1.4-preview.3"
+version = "0.1.0"
 optional = true
 
 [dependencies.axhal]
 package = "tk-axhal"
 path = "../tk-axhal"
-version = "=0.3.0-preview.2"
+version = "0.1.0"
 optional = true
 
 [dependencies.axtask]
 package = "tk-axtask"
 path = "../tk-axtask"
-version = "=0.1.0"
+version = "0.1.0"
 features = ["multitask"]
 optional = true
 
@@ -129,7 +129,7 @@ version = "0.9"
 [dependencies.virtio-drivers]
 package = "tk-virtio-drivers"
 path = "../tk-virtio-drivers"
-version = "0.7.4"
+version = "0.1.0"
 default-features = false
 
 [package.metadata.thekernel]

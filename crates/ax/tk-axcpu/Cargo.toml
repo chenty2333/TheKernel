@@ -13,7 +13,7 @@ publish.workspace = true
 edition = "2021"
 rust-version.workspace = true
 name = "tk-axcpu"
-version = "0.3.0-preview.8"
+version = "0.1.0"
 authors = [
     "Yuekai Jia <equation618@gmail.com>",
     "Youjie Zheng <Azure_stars@126.com>",
@@ -76,7 +76,7 @@ version = "0.1"
 [dependencies.axpmu]
 package = "tk-axpmu"
 path = "../tk-axpmu"
-version = "=0.1.0"
+version = "0.1.0"
 optional = true
 default-features = false
 
@@ -95,7 +95,7 @@ version = "0.4"
 [dependencies.page_table_entry]
 package = "tk-page-table-entry"
 path = "../tk-page-table-entry"
-version = "0.6"
+version = "0.1.0"
 
 [dependencies.static_assertions]
 version = "1.1"

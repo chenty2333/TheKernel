@@ -13,7 +13,7 @@ publish.workspace = true
 rust-version.workspace = true
 edition = "2024"
 name = "tk-axalloc"
-version = "0.3.0-preview.2"
+version = "0.1.0"
 authors = ["Yuekai Jia <equation618@gmail.com>"]
 build = false
 autolib = false
@@ -73,7 +73,7 @@ path = "src/lib.rs"
 [dependencies.axallocator]
 package = "tk-axallocator"
 path = "../tk-axallocator"
-version = "0.2"
+version = "0.1.0"
 features = [
     "axerrno",
     "bitmap",

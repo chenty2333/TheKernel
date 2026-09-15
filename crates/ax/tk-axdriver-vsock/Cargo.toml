@@ -2,7 +2,7 @@
 publish.workspace = true
 rust-version.workspace = true
 name = "tk-axdriver-vsock"
-version = "0.1.4-preview.3"
+version = "0.1.0"
 edition = "2021"
 authors = ["Yuekai Jia <equation618@gmail.com>", "朝倉水希 <asakuramizu111@gmail.com>", "Yu Chen <yuchen@tsinghua.edu.cn>"]
 description = "Common traits and types for vsock drivers"
@@ -18,7 +18,7 @@ name = "axdriver_vsock"
 path = "src/lib.rs"
 
 [dependencies]
-axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base", version = "0.1.4-preview.3" }
+axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base", version = "0.1.0" }
 log = "0.4"
 
 [package.metadata.thekernel]

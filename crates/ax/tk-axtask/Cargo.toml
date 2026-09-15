@@ -82,7 +82,7 @@ test = ["percpu?/sp-naive"]
 [dependencies]
 axconfig = { version = "=0.3.0-preview.2", optional = true }
 axerrno = "0.2"
-axhal = { package = "tk-axhal", path = "../tk-axhal", version = "=0.3.0-preview.2" }
+axhal = { package = "tk-axhal", path = "../tk-axhal", version = "0.1.0" }
 axpoll = { package = "tk-axpoll", path = "../tk-axpoll", version = "0.1.0", optional = true }
 axsched = { package = "tk-axsched", path = "../tk-axsched", version = "0.1.0", optional = true }
 cfg-if = "1.0"
@@ -103,7 +103,7 @@ percpu = { version = "0.2.3-preview.1", features = ["non-zero-vma"], optional = 
 spin = { version = "0.10", optional = true }
 
 [dev-dependencies]
-axhal = { package = "tk-axhal", path = "../tk-axhal", version = "=0.3.0-preview.2", features = ["fp-simd"] }
+axhal = { package = "tk-axhal", path = "../tk-axhal", version = "0.1.0", features = ["fp-simd"] }
 axsched = { package = "tk-axsched", path = "../tk-axsched", version = "0.1.0", features = ["test-utils"] }
 
 # Rust 1.99's nightly `Step` contract requires the implementation added in

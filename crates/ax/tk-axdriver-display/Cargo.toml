@@ -4,13 +4,13 @@ repository.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 name = "tk-axdriver-display"
-version = "0.1.4-preview.3"
+version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
 
 [dependencies]
-axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base", version = "0.1.4-preview.3" }
-axgpu = { package = "tk-axgpu", path = "../tk-axgpu", version = "=0.1.0", default-features = false }
+axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base", version = "0.1.0" }
+axgpu = { package = "tk-axgpu", path = "../tk-axgpu", version = "0.1.0", default-features = false }
 
 [package.metadata.thekernel]
 layer = "mechanism"

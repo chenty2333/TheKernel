@@ -60,69 +60,69 @@ homepage = "https://github.com/chenty2333/TheKernel"
 repository = "https://github.com/chenty2333/TheKernel"
 
 [workspace.dependencies]
-axfeat = { package = "tk-axfeat", path = "crates/ax/tk-axfeat", version = "0.3.0-preview.2" }
+axfeat = { package = "tk-axfeat", path = "crates/ax/tk-axfeat", version = "0.1.0" }
 
-axalloc = { package = "tk-axalloc", path = "crates/ax/tk-axalloc", version = "0.3.0-preview.2" }
+axalloc = { package = "tk-axalloc", path = "crates/ax/tk-axalloc", version = "0.1.0" }
 axconfig = { version = "0.3.0-preview.2" }
-axdisplay = { package = "tk-axdisplay", path = "crates/ax/tk-axdisplay", version = "0.3.0-preview.2" }
-axdriver = { package = "tk-axdriver", path = "crates/ax/tk-axdriver", version = "0.3.0-preview.2" }
-axdriver_display = { package = "tk-axdriver-display", path = "crates/ax/tk-axdriver-display", version = "0.1.4-preview.3" }
-axfs = { package = "tk-axfs-ng", path = "crates/ax/tk-axfs-ng", version = "0.3.0-preview.2", features = ["btrfs", "overlay", "xfs"] }
-axhal = { package = "tk-axhal", path = "crates/ax/tk-axhal", version = "0.3.0-preview.2" }
-axinput = { package = "tk-axinput", path = "crates/ax/tk-axinput", version = "0.3.0-preview.2" }
+axdisplay = { package = "tk-axdisplay", path = "crates/ax/tk-axdisplay", version = "0.1.0" }
+axdriver = { package = "tk-axdriver", path = "crates/ax/tk-axdriver", version = "0.1.0" }
+axdriver_display = { package = "tk-axdriver-display", path = "crates/ax/tk-axdriver-display", version = "0.1.0" }
+axfs = { package = "tk-axfs-ng", path = "crates/ax/tk-axfs-ng", version = "0.1.0", features = ["btrfs", "overlay", "xfs"] }
+axhal = { package = "tk-axhal", path = "crates/ax/tk-axhal", version = "0.1.0" }
+axinput = { package = "tk-axinput", path = "crates/ax/tk-axinput", version = "0.1.0" }
 axlog = { version = "0.3.0-preview.2" }
-axmm = { package = "tk-axmm", path = "crates/ax/tk-axmm", version = "0.3.0-preview.2" }
-axnet = { package = "tk-axnet-ng", path = "crates/ax/tk-axnet-ng", version = "0.3.0-preview.2" }
-axruntime = { package = "tk-axruntime", path = "crates/ax/tk-axruntime", version = "0.3.0-preview.2" }
-axsync = { package = "tk-axsync", path = "crates/ax/tk-axsync", version = "0.3.0-preview.2" }
-axio = { package = "tk-axio", path = "crates/ax/tk-axio", version = "0.3.0-pre.1" }
-axfs-ng-vfs = { package = "tk-axfs-ng-vfs", path = "crates/ax/tk-axfs-ng-vfs", version = "0.1.1" }
-axcpu = { package = "tk-axcpu", path = "crates/ax/tk-axcpu", version = "0.3.0-preview.8" }
-kernel-elf-parser = { package = "tk-kernel-elf-parser", path = "crates/ax/tk-kernel-elf-parser", version = "0.3.4" }
-memory_set = { package = "tk-memory-set", path = "crates/ax/tk-memory-set", version = "0.4.1" }
-page_table_multiarch = { package = "tk-page-table-multiarch", path = "crates/ax/tk-page-table-multiarch", version = "0.6.1" }
-scope-local = { package = "tk-scope-local", path = "crates/ax/tk-scope-local", version = "0.1.2" }
-axpoll = { package = "tk-readiness-adapter", version = "=0.1.0", path = "crates/readiness-adapter" }
-axcbpf = { package = "tk-axcbpf", path = "crates/ax/tk-axcbpf", version = "=0.1.0" }
-axfault = { package = "tk-axfault", path = "crates/ax/tk-axfault", version = "=0.1.0" }
-axrcu = { package = "tk-axrcu", path = "crates/ax/tk-axrcu", version = "=0.1.0" }
-axpmu = { package = "tk-axpmu", path = "crates/ax/tk-axpmu", version = "=0.1.0", default-features = false }
-axbpf = { package = "tk-axbpf", path = "crates/ax/tk-axbpf", version = "=0.1.0", default-features = false }
-axexec = { package = "tk-axexec", path = "crates/ax/tk-axexec", version = "=0.1.0", default-features = false }
-axgpu = { package = "tk-axgpu", path = "crates/ax/tk-axgpu", version = "=0.1.0", default-features = false }
-axrandom = { package = "tk-axrandom", path = "crates/ax/tk-axrandom", version = "=0.1.0", default-features = false }
-axtask = { package = "tk-axtask", path = "crates/ax/tk-axtask", version = "=0.1.0" }
-linux-vfs = { package = "tk-linux-vfs", path = "crates/linux/vfs", version = "=0.1.0" }
-tk-linux-cred = { path = "crates/linux/cred", version = "=0.1.0", default-features = false }
-tk-linux-fd = { path = "crates/linux/fd", version = "=0.1.0" }
-tk-linux-io-uring = { path = "crates/linux/io-uring", version = "=0.1.0", default-features = false }
-tk-linux-mm = { path = "crates/linux/mm", version = "=0.1.0", default-features = false }
-tk-linux-packet = { path = "crates/linux/packet", version = "=0.1.0", default-features = false }
-tk-linux-process = { path = "crates/linux/process", version = "=0.1.0", default-features = false }
-tk-linux-rseq = { path = "crates/linux/rseq", version = "=0.1.0", default-features = false }
-tk-linux-seccomp = { path = "crates/linux/seccomp", version = "=0.1.0", default-features = false }
-tk-linux-signal = { path = "crates/linux/signal", version = "=0.1.0", default-features = false }
-tk-linux-usercopy = { path = "crates/linux/usercopy", version = "=0.1.0", default-features = false }
-tk-linux-sched = { path = "crates/linux/sched", version = "=0.1.0", default-features = false }
-tk-linux-perf = { path = "crates/linux/perf", version = "=0.1.0", default-features = false }
-tk-linux-time = { path = "crates/linux/time", version = "=0.1.0", default-features = false }
-tk-linux-net = { path = "crates/linux/net", version = "=0.1.0", default-features = false }
-tk-linux-futex = { path = "crates/linux/futex", version = "=0.1.0", default-features = false }
-tk-linux-ipc = { path = "crates/linux/ipc", version = "=0.1.0", default-features = false }
-tk-linux-arch-x86-64 = { path = "crates/linux/arch-x86-64", version = "=0.1.0", default-features = false }
-tk-linux-bpf = { path = "crates/linux/bpf", version = "=0.1.0", default-features = false }
-tk-linux-keyring = { path = "crates/linux/keyring", version = "=0.1.0", default-features = false }
-tk-linux-landlock = { path = "crates/linux/landlock", version = "=0.1.0", default-features = false }
-tk-linux-fsnotify = { path = "crates/linux/fsnotify", version = "=0.1.0", default-features = false }
-tk-linux-mount = { path = "crates/linux/mount", version = "=0.1.0", default-features = false }
-tk-linux-drm = { path = "crates/linux/drm", version = "=0.1.0", default-features = false }
-tk-linux-aio = { path = "crates/linux/aio", version = "=0.1.0", default-features = false }
-tk-linux-syslog = { path = "crates/linux/syslog", version = "=0.1.0", default-features = false }
-axtlb = { package = "tk-axtlb", path = "crates/ax/tk-axtlb", version = "=0.1.0", default-features = false }
-tk-linux-process-adapter = { version = "=0.1.0", path = "crates/process-adapter" }
-tk-linux-profile = { path = "crates/linux/profile", version = "=0.1.0" }
+axmm = { package = "tk-axmm", path = "crates/ax/tk-axmm", version = "0.1.0" }
+axnet = { package = "tk-axnet-ng", path = "crates/ax/tk-axnet-ng", version = "0.1.0" }
+axruntime = { package = "tk-axruntime", path = "crates/ax/tk-axruntime", version = "0.1.0" }
+axsync = { package = "tk-axsync", path = "crates/ax/tk-axsync", version = "0.1.0" }
+axio = { package = "tk-axio", path = "crates/ax/tk-axio", version = "0.1.0" }
+axfs-ng-vfs = { package = "tk-axfs-ng-vfs", path = "crates/ax/tk-axfs-ng-vfs", version = "0.1.0" }
+axcpu = { package = "tk-axcpu", path = "crates/ax/tk-axcpu", version = "0.1.0" }
+kernel-elf-parser = { package = "tk-kernel-elf-parser", path = "crates/ax/tk-kernel-elf-parser", version = "0.1.0" }
+memory_set = { package = "tk-memory-set", path = "crates/ax/tk-memory-set", version = "0.1.0" }
+page_table_multiarch = { package = "tk-page-table-multiarch", path = "crates/ax/tk-page-table-multiarch", version = "0.1.0" }
+scope-local = { package = "tk-scope-local", path = "crates/ax/tk-scope-local", version = "0.1.0" }
+axpoll = { package = "tk-readiness-adapter", version = "0.1.0", path = "crates/readiness-adapter" }
+axcbpf = { package = "tk-axcbpf", path = "crates/ax/tk-axcbpf", version = "0.1.0" }
+axfault = { package = "tk-axfault", path = "crates/ax/tk-axfault", version = "0.1.0" }
+axrcu = { package = "tk-axrcu", path = "crates/ax/tk-axrcu", version = "0.1.0" }
+axpmu = { package = "tk-axpmu", path = "crates/ax/tk-axpmu", version = "0.1.0", default-features = false }
+axbpf = { package = "tk-axbpf", path = "crates/ax/tk-axbpf", version = "0.1.0", default-features = false }
+axexec = { package = "tk-axexec", path = "crates/ax/tk-axexec", version = "0.1.0", default-features = false }
+axgpu = { package = "tk-axgpu", path = "crates/ax/tk-axgpu", version = "0.1.0", default-features = false }
+axrandom = { package = "tk-axrandom", path = "crates/ax/tk-axrandom", version = "0.1.0", default-features = false }
+axtask = { package = "tk-axtask", path = "crates/ax/tk-axtask", version = "0.1.0" }
+linux-vfs = { package = "tk-linux-vfs", path = "crates/linux/vfs", version = "0.1.0" }
+tk-linux-cred = { path = "crates/linux/cred", version = "0.1.0", default-features = false }
+tk-linux-fd = { path = "crates/linux/fd", version = "0.1.0" }
+tk-linux-io-uring = { path = "crates/linux/io-uring", version = "0.1.0", default-features = false }
+tk-linux-mm = { path = "crates/linux/mm", version = "0.1.0", default-features = false }
+tk-linux-packet = { path = "crates/linux/packet", version = "0.1.0", default-features = false }
+tk-linux-process = { path = "crates/linux/process", version = "0.1.0", default-features = false }
+tk-linux-rseq = { path = "crates/linux/rseq", version = "0.1.0", default-features = false }
+tk-linux-seccomp = { path = "crates/linux/seccomp", version = "0.1.0", default-features = false }
+tk-linux-signal = { path = "crates/linux/signal", version = "0.1.0", default-features = false }
+tk-linux-usercopy = { path = "crates/linux/usercopy", version = "0.1.0", default-features = false }
+tk-linux-sched = { path = "crates/linux/sched", version = "0.1.0", default-features = false }
+tk-linux-perf = { path = "crates/linux/perf", version = "0.1.0", default-features = false }
+tk-linux-time = { path = "crates/linux/time", version = "0.1.0", default-features = false }
+tk-linux-net = { path = "crates/linux/net", version = "0.1.0", default-features = false }
+tk-linux-futex = { path = "crates/linux/futex", version = "0.1.0", default-features = false }
+tk-linux-ipc = { path = "crates/linux/ipc", version = "0.1.0", default-features = false }
+tk-linux-arch-x86-64 = { path = "crates/linux/arch-x86-64", version = "0.1.0", default-features = false }
+tk-linux-bpf = { path = "crates/linux/bpf", version = "0.1.0", default-features = false }
+tk-linux-keyring = { path = "crates/linux/keyring", version = "0.1.0", default-features = false }
+tk-linux-landlock = { path = "crates/linux/landlock", version = "0.1.0", default-features = false }
+tk-linux-fsnotify = { path = "crates/linux/fsnotify", version = "0.1.0", default-features = false }
+tk-linux-mount = { path = "crates/linux/mount", version = "0.1.0", default-features = false }
+tk-linux-drm = { path = "crates/linux/drm", version = "0.1.0", default-features = false }
+tk-linux-aio = { path = "crates/linux/aio", version = "0.1.0", default-features = false }
+tk-linux-syslog = { path = "crates/linux/syslog", version = "0.1.0", default-features = false }
+axtlb = { package = "tk-axtlb", path = "crates/ax/tk-axtlb", version = "0.1.0", default-features = false }
+tk-linux-process-adapter = { version = "0.1.0", path = "crates/process-adapter" }
+tk-linux-profile = { path = "crates/linux/profile", version = "0.1.0" }
 
-tk-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
+tk-kernel = { path = "kernel", version = "0.1.0" }
 
 log = "0.4"
 rdif-base = { version = "0.8.3" }

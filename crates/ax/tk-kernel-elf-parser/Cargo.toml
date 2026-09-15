@@ -13,7 +13,7 @@ publish.workspace = true
 rust-version.workspace = true
 edition = "2024"
 name = "tk-kernel-elf-parser"
-version = "0.3.4"
+version = "0.1.0"
 authors = [
     "Youjie Zheng <zyj578335934@gmail.com>",
     "Yu Chen <yuchen@tsinghua.edu.cn>",

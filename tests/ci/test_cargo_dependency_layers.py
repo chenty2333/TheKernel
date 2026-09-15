@@ -65,6 +65,12 @@ class WorkspacePolicyTests(unittest.TestCase):
     def test_shared_policy_accepted(self):
         self.assertEqual(self.check(), [])
 
+    def test_approved_component_can_publish_only_to_crates_io(self):
+        self.package.update(name="tk-axcbpf", publish=["crates-io"])
+        self.assertEqual(self.check(), [])
+        self.package["publish"] = None
+        self.assertIn("publish differs", self.check()[0])
+
     def test_compiler_release_and_repository_drift_rejected(self):
         self.package.update(rust_version="1.85", publish=None, repository="old")
         self.assertEqual(len(self.check()), 3)

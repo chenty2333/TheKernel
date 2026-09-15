@@ -5,6 +5,18 @@ interpreter for operating-system mechanism layers. It accepts the ordinary
 classic instruction set, including absolute and indirect loads, sixteen scratch
 words, forward jumps, and 32-bit arithmetic.
 
+## Installation
+
+```toml
+[dependencies]
+axcbpf = { package = "tk-axcbpf", version = "0.1.0" }
+```
+
+The Rust library name is `axcbpf`. This release is tested on x86_64 with
+`nightly-2026-08-23` (`rustc 1.100.0-nightly`). Its Cargo `rust-version = "1.100"`
+is a numeric compiler floor, not a stable-toolchain compatibility guarantee.
+An allocator is required even though the library is `no_std`.
+
 ## Contract
 
 `Program::verify` rejects empty or over-4096-instruction programs, unsupported

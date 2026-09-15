@@ -13,7 +13,7 @@ publish.workspace = true
 rust-version.workspace = true
 edition = "2024"
 name = "tk-axfs-ng-vfs"
-version = "0.1.1"
+version = "0.1.0"
 authors = [
     "Mivik <mivikq@gmail.com>",
     "朝倉水希 <asakuramizu111@gmail.com>",
@@ -45,7 +45,7 @@ version = "0.2"
 [dependencies.axpoll]
 package = "tk-axpoll"
 path = "../tk-axpoll"
-version = "=0.1.0"
+version = "0.1.0"
 
 [dependencies.bitflags]
 version = "2.10"

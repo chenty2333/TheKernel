@@ -225,10 +225,12 @@ Do not add component-local toolchain overrides or separate MSRV matrices.
 Component package names use `tk-` (for example `tk-axcbpf` and
 `tk-linux-vfs`); the top-level product remains `thekernel`. Existing short
 library names such as `axcbpf` are intentional, not legacy package aliases.
-All workspace packages currently inherit `publish = false`: being a crate
-boundary does not imply being a separately released public product.
-`tk-axcbpf` is the initial standalone packaging candidate; publication and
-registry names must be decided explicitly before enabling uploads.
+The `tk-*` series starts at `0.1.0`, independently of upstream version numbers;
+future component versions follow their own API changes. The top-level product
+keeps its separate version. Internal packages inherit `publish = false`: a
+crate boundary does not imply a separately released public product.
+`tk-axcbpf` is the first approved public component and permits only crates.io;
+other components remain internal until separately validated and approved.
 Repository metadata points here; upstream licenses and attribution remain intact.
 
 Keep integration in `kernel/` and adapters, rather than making lower layers
