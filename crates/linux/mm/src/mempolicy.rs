@@ -43,6 +43,10 @@ pub const MPOL_F_NUMA_BALANCING: u32 = 1 << 13;
 /// `MPOL_MODE_FLAGS`: every mode flag an `int` mode argument may carry.
 pub const MPOL_MODE_FLAGS: u32 =
     MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES | MPOL_F_NUMA_BALANCING;
+/// `MPOL_USER_NODEMASK_FLAGS`: the flags for which Linux keeps the caller's
+/// own mask in `pol->w.user_nodemask` and reports *that* from
+/// `get_mempolicy(2)` instead of the intersected `pol->nodes`.
+pub const MPOL_USER_NODEMASK_FLAGS: u32 = MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES;
 
 /// `MPOL_F_NODE` for `get_mempolicy(2)`: return a node id, not a policy.
 pub const MPOL_F_NODE: usize = 1 << 0;
@@ -274,9 +278,19 @@ pub fn validate(
             }
         }
         MPOL_PREFERRED => {
-            // An empty list is Linux's `MPOL_LOCAL` fallback unless a
-            // user-nodemask flag made the emptiness explicit.
-            if effective_empty && mode_flags & (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES) != 0 {
+            // `mpol_new()` inspects only the *user* mask when it decides to
+            // rewrite an empty `MPOL_PREFERRED` into `MPOL_LOCAL`, and a
+            // user-nodemask flag makes that emptiness an explicit error. The
+            // rewritten (or surviving) preferred policy is then built by
+            // `mpol_new_preferred()` from the mask *intersected* with the
+            // allowed set, which rejects an empty intersection -- so a mask
+            // naming only nodes the caller may not use is `EINVAL` even
+            // without `MPOL_F_STATIC_NODES`.
+            if !has_nodes || requested == 0 {
+                if mode_flags & (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES) != 0 {
+                    return Err(MempolicyError::EmptyNodeMask);
+                }
+            } else if nodes == 0 {
                 return Err(MempolicyError::EmptyNodeMask);
             }
         }
@@ -321,6 +335,26 @@ pub const fn effective_policy(request: MempolicyRequest) -> (u32, usize) {
         return (MPOL_PREFERRED, request.nodes & request.nodes.wrapping_neg());
     }
     (request.mode, request.nodes)
+}
+
+/// `mpol_store_user_nodemask()`: whether `get_mempolicy(2)` reports the
+/// caller's own mask.
+///
+/// `mpol_set_nodemask()` stores `*nodes` in `pol->w.user_nodemask` for a
+/// policy carrying `MPOL_F_STATIC_NODES` or `MPOL_F_RELATIVE_NODES`, and
+/// `do_get_mempolicy()` then reports that stored mask rather than the
+/// intersected `pol->nodes`.
+pub const fn stores_user_nodemask(mode_flags: u32) -> bool {
+    mode_flags & MPOL_USER_NODEMASK_FLAGS != 0
+}
+
+/// The `*policy` value `do_get_mempolicy()` reports for a stored policy.
+///
+/// Linux stores `*policy = pol->mode; *policy |= (pol->flags & MPOL_MODE_FLAGS)`,
+/// so the shaping flags the caller passed to `set_mempolicy(2)` or `mbind(2)`
+/// come back together with the mode instead of being dropped.
+pub const fn reported_policy(mode: u32, mode_flags: u32) -> u32 {
+    mode | (mode_flags & MPOL_MODE_FLAGS)
 }
 
 /// `kernel_mbind()`'s argument order, minus the user memory access.
@@ -401,13 +435,14 @@ pub enum GetMempolicyError {
 /// `kernel_get_mempolicy()` then `do_get_mempolicy()` argument validation.
 ///
 /// Order, and therefore errno precedence, is Linux's:
-/// 1. `do_get_mempolicy()` rejects an unknown flag bit or an out-of-range
+/// 1. `kernel_get_mempolicy()` rejects a supplied `nodemask` whose `maxnode` is
+///    below `nr_node_ids` before `do_get_mempolicy()` is entered at all, so
+///    even `MPOL_F_MEMS_ALLOWED` reports it.
+/// 2. `do_get_mempolicy()` rejects an unknown flag bit or an out-of-range
 ///    combination (only `MPOL_F_MEMS_ALLOWED`, `MPOL_F_ADDR` and `MPOL_F_NODE`
 ///    are accepted together).
-/// 2. `MPOL_F_MEMS_ALLOWED` returns immediately with the allowed set; it
-///    deliberately skips the `maxnode` and address checks.
-/// 3. `kernel_get_mempolicy()` rejects a supplied `nodemask` whose `maxnode` is
-///    below `nr_node_ids`, before `do_get_mempolicy()` looks at the address.
+/// 3. `MPOL_F_MEMS_ALLOWED` returns immediately with the allowed set; it skips
+///    the address check, but not the wrapper's `maxnode` check above.
 /// 4. `MPOL_F_ADDR` selects by address; a non-zero `addr` without it is
 ///    `EINVAL`.
 pub fn validate_get(
@@ -417,6 +452,9 @@ pub fn validate_get(
     addr: usize,
     nr_node_ids: usize,
 ) -> Result<(), GetMempolicyError> {
+    if nodemask_supplied && maxnode < nr_node_ids {
+        return Err(GetMempolicyError::NodeMaskTooShort);
+    }
     if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 {
         return Err(GetMempolicyError::InvalidFlags);
     }
@@ -425,9 +463,6 @@ pub fn validate_get(
             return Err(GetMempolicyError::InvalidFlags);
         }
         return Ok(());
-    }
-    if nodemask_supplied && maxnode < nr_node_ids {
-        return Err(GetMempolicyError::NodeMaskTooShort);
     }
     if flags & MPOL_F_ADDR == 0 && addr != 0 {
         return Err(GetMempolicyError::UnexpectedAddress);
@@ -554,14 +589,48 @@ mod tests {
             Err(MempolicyError::EmptyNodeMask)
         );
         // A mask naming only a node outside the allowed set intersects to
-        // nothing. Plain MPOL_PREFERRED still degenerates to MPOL_LOCAL
-        // (`mpol_new()` only inspects the *user* mask); a user-nodemask flag
-        // makes the same emptiness an explicit error.
-        assert!(validate(MPOL_PREFERRED, 2, true, ALLOWED).is_ok());
+        // nothing. `mpol_new()` only inspects the *user* mask when it decides
+        // whether an empty `MPOL_PREFERRED` becomes `MPOL_LOCAL`, but the
+        // surviving preferred policy is then created by
+        // `mpol_new_preferred()` from the intersected mask, which rejects an
+        // empty result -- so this is EINVAL with or without a user-nodemask
+        // flag (Linux v7.2.3 `mm/mempolicy.c` `mpol_new()` +
+        // `mpol_set_nodemask()`).
+        assert_eq!(
+            validate(MPOL_PREFERRED, 2, true, ALLOWED),
+            Err(MempolicyError::EmptyNodeMask)
+        );
         assert_eq!(
             validate(MPOL_PREFERRED | MPOL_F_STATIC_NODES, 2, true, ALLOWED),
             Err(MempolicyError::EmptyNodeMask)
         );
+        // A non-empty intersection still narrows to its first allowed node.
+        assert_eq!(
+            effective_policy(validate(MPOL_PREFERRED, 3, true, ALLOWED).unwrap()),
+            (MPOL_PREFERRED, 1)
+        );
+    }
+
+    #[test]
+    fn reported_policy_keeps_the_mode_flags() {
+        // `*policy |= (pol->flags & MPOL_MODE_FLAGS)`.
+        assert_eq!(
+            reported_policy(MPOL_BIND, MPOL_F_NUMA_BALANCING),
+            MPOL_BIND | MPOL_F_NUMA_BALANCING
+        );
+        assert_eq!(
+            reported_policy(MPOL_INTERLEAVE, MPOL_F_RELATIVE_NODES),
+            MPOL_INTERLEAVE | MPOL_F_RELATIVE_NODES
+        );
+        assert_eq!(reported_policy(MPOL_LOCAL, 0), MPOL_LOCAL);
+        // `MPOL_F_NODE`/`MPOL_F_ADDR`/`MPOL_F_MEMS_ALLOWED` are query flags,
+        // not mode flags, so they can never appear in the reported policy.
+        assert_eq!(reported_policy(MPOL_BIND, MPOL_F_NODE as u32), MPOL_BIND);
+        // Only STATIC/RELATIVE make Linux store and report `w.user_nodemask`.
+        assert!(stores_user_nodemask(MPOL_F_STATIC_NODES));
+        assert!(stores_user_nodemask(MPOL_F_RELATIVE_NODES));
+        assert!(!stores_user_nodemask(MPOL_F_NUMA_BALANCING));
+        assert!(!stores_user_nodemask(0));
     }
 
     #[test]
@@ -770,9 +839,16 @@ mod tests {
     }
 
     #[test]
-    fn get_mempolicy_rejects_unknown_flags_before_everything_else() {
+    fn get_mempolicy_rejects_unknown_flags() {
+        // `kernel_get_mempolicy()`'s `maxnode` check runs before
+        // `do_get_mempolicy()` reads the flags, so a supplied mask below
+        // `nr_node_ids` masks an unknown flag with the wrapper's own error.
         assert_eq!(
             validate_get(1 << 3, true, 0, 0xdead, 1),
+            Err(GetMempolicyError::NodeMaskTooShort)
+        );
+        assert_eq!(
+            validate_get(1 << 3, false, 0, 0xdead, 1),
             Err(GetMempolicyError::InvalidFlags)
         );
         assert_eq!(
@@ -786,11 +862,23 @@ mod tests {
     }
 
     #[test]
-    fn mems_allowed_skips_the_maxnode_and_address_checks() {
-        // Linux returns the allowed set before `kernel_get_mempolicy()`
-        // examines `nmask`, `maxnode` or `addr`.
+    fn mems_allowed_skips_the_address_check_but_not_the_wrapper_maxnode_check() {
+        // The `maxnode` check is in `kernel_get_mempolicy()`, *before*
+        // `do_get_mempolicy()` can take its `MPOL_F_MEMS_ALLOWED` early return,
+        // while the address check lives inside `do_get_mempolicy()` and is
+        // therefore skipped.
         assert_eq!(
             validate_get(MPOL_F_MEMS_ALLOWED, true, 0, 0xdead, NR_NODE_IDS),
+            Err(GetMempolicyError::NodeMaskTooShort)
+        );
+        assert_eq!(
+            validate_get(
+                MPOL_F_MEMS_ALLOWED,
+                true,
+                NR_NODE_IDS,
+                0xdead,
+                NR_NODE_IDS
+            ),
             Ok(())
         );
         assert_eq!(
