@@ -285,7 +285,15 @@ def run_abi_differential(config: AbiConfig) -> Path:
                 ("echo 3 > /proc/sys/kernel/printk || failed=1\n"
                  # The shell init has no network service. UDP error-queue
                  # contracts require the same usable loopback as TheKernel.
-                 "ip link set lo up || failed=1\n" if target.name == "linux" else "") +
+                 "ip link set lo up || failed=1\n"
+                 # The shell init is not a full init, so nothing mounts
+                 # devpts and a Unix98 PTY slave has no /dev/pts/<N> to open;
+                 # grantpt() fails with ENOENT before any tty semantics can be
+                 # compared. TheKernel's pseudofs always exposes the PTY
+                 # namespace, so mount devpts here to keep both guests
+                 # equivalent.
+                 "mkdir -p /dev/pts && mount -t devpts devpts /dev/pts || failed=1\n"
+                 if target.name == "linux" else "") +
                 "\n".join(workloads) + "\n" +
                 f'[ "$failed" = 0 ] && echo {COMPLETE_MARKER}\n'
                 "/bin/busybox poweroff -f\nexit\n", encoding="utf-8")
