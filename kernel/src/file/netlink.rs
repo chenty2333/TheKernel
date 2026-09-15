@@ -6303,7 +6303,7 @@ mod tests {
         assert_eq!(
             socket.get_option(9, 3).unwrap(),
             NetlinkOptionValue::Memberships {
-                words: [1, 0],
+                words: [0, 0],
                 reported: 8
             }
         );
