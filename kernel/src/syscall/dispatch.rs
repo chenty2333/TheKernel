@@ -1486,12 +1486,19 @@ pub(super) fn dispatch_syscall(
         Sysno::sysinfo => {
             with_user_memory(aspace(), |memory| sys_sysinfo(memory, uctx.arg0() as _))
         }
+        // `SYSCALL_DEFINE3(syslog, int type, char __user *, buf, int len)` takes
+        // the length as a C `int`, so the register is truncated to its low 32
+        // bits before `do_syslog()`'s `len < 0` test.  Without the truncation a
+        // caller that passes a negative `int` -- which the x86-64 ABI lets
+        // arrive zero-extended -- is read as a huge positive length, so it
+        // reaches the accessibility check and yields EFAULT where Linux's
+        // negative-length test yields EINVAL.
         Sysno::syslog => with_user_memory(aspace(), |memory| {
             sys_syslog(
                 memory,
                 uctx.arg0() as _,
                 uctx.arg1() as _,
-                uctx.arg2() as isize,
+                uctx.arg2() as u32 as i32 as isize,
             )
         }),
         Sysno::getrandom => with_user_memory(aspace(), |memory| {
