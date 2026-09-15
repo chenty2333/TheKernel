@@ -257,7 +257,9 @@ fn monotonic_duration() -> Duration {
 pub struct SemidDs {
     pub sem_perm: IpcPerm,
     pub sem_otime: __kernel_time_t,
+    pub unused1: c_ulong,
     pub sem_ctime: __kernel_time_t,
+    pub unused2: c_ulong,
     pub sem_nsems: c_ulong,
     pub unused3: c_ulong,
     pub unused4: c_ulong,
@@ -266,6 +268,13 @@ pub struct SemidDs {
 // These System V semaphore records contain Linux ABI padding through their
 // embedded `IpcPerm`.  Keep the x86_64 layout checked and serialize a zeroed
 // copy for output so implicit alignment bytes never escape to userspace.
+//
+// The two `__unused` words after `sem_otime` and `sem_ctime` are not
+// decoration: `arch/x86/include/uapi/asm/sembuf.h` carries them on x86_64
+// ("x86_64 and x32 incorrectly added padding here, so the structures are
+// still incompatible with the padding on x86"), which is why Linux's
+// `semid64_ds` is 104 bytes with `sem_ctime` at 64 and `sem_nsems` at 80
+// rather than the 88 bytes a packed reading would give.
 const _: () = {
     assert!(align_of::<IpcPerm>() == 8);
     assert!(size_of::<IpcPerm>() == 48);
@@ -274,13 +283,15 @@ const _: () = {
     assert!(offset_of!(IpcPerm, unused0) == 32);
     assert!(offset_of!(IpcPerm, unused1) == 40);
     assert!(align_of::<SemidDs>() == 8);
-    assert!(size_of::<SemidDs>() == 88);
+    assert!(size_of::<SemidDs>() == 104);
     assert!(offset_of!(SemidDs, sem_perm) == 0);
     assert!(offset_of!(SemidDs, sem_otime) == 48);
-    assert!(offset_of!(SemidDs, sem_ctime) == 56);
-    assert!(offset_of!(SemidDs, sem_nsems) == 64);
-    assert!(offset_of!(SemidDs, unused3) == 72);
-    assert!(offset_of!(SemidDs, unused4) == 80);
+    assert!(offset_of!(SemidDs, unused1) == 56);
+    assert!(offset_of!(SemidDs, sem_ctime) == 64);
+    assert!(offset_of!(SemidDs, unused2) == 72);
+    assert!(offset_of!(SemidDs, sem_nsems) == 80);
+    assert!(offset_of!(SemidDs, unused3) == 88);
+    assert!(offset_of!(SemidDs, unused4) == 96);
 };
 
 fn initialized_semid_ds(value: SemidDs) -> SemidDs {
@@ -301,7 +312,9 @@ fn initialized_semid_ds(value: SemidDs) -> SemidDs {
     perm.unused1 = value.sem_perm.unused1;
     result.sem_perm = perm;
     result.sem_otime = value.sem_otime;
+    result.unused1 = value.unused1;
     result.sem_ctime = value.sem_ctime;
+    result.unused2 = value.unused2;
     result.sem_nsems = value.sem_nsems;
     result.unused3 = value.unused3;
     result.unused4 = value.unused4;
@@ -356,7 +369,9 @@ impl SemidDs {
                 unused1: 0,
             },
             sem_otime: 0,
+            unused1: 0,
             sem_ctime: ipc_time_secs(),
+            unused2: 0,
             sem_nsems: nsems as c_ulong,
             unused3: 0,
             unused4: 0,

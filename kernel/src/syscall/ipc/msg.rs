@@ -14,7 +14,10 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axsync::Mutex;
 use axtask::current;
 use bytemuck::AnyBitPattern;
-use linux_raw_sys::general::*;
+use linux_raw_sys::{
+    ctypes::{c_ulong, c_ushort},
+    general::*,
+};
 use tk_linux_ipc::{
     IpcId, IpcIdTable, MessageSelection, ipcid_compose, ipcid_is_stale, ipcid_to_idx,
     select_message,
@@ -62,12 +65,20 @@ pub struct msqid_ds {
     pub msg_lspid: __kernel_pid_t,
     /// pid of last msgrcv()
     pub msg_lrpid: __kernel_pid_t,
+    unused4: c_ulong,
+    unused5: c_ulong,
 }
 
 // These IPC records contain explicit Linux ABI padding (and `IpcPerm` has an
 // alignment hole before its two native-word fields).  Keep the x86_64 layout
 // checked and materialize a zeroed copy before the audited unchecked copyout
 // so no Rust padding bytes escape to userspace.
+//
+// `msqid64_ds` ends with two native-word placeholders - the comment above it in
+// `include/uapi/asm-generic/msgbuf.h` reads "Pad space is left for: - 2
+// miscellaneous 32-bit values" - so the record is 120 bytes, not the 104 that
+// the used fields alone would occupy.  The kernel copies the whole 120-byte
+// object out (`ipc/msg.c:ksys_msgctl()`, `copy_msqid_to_user()`).
 const _: () = {
     assert!(align_of::<IpcPerm>() == 8);
     assert!(size_of::<IpcPerm>() == 48);
@@ -76,7 +87,7 @@ const _: () = {
     assert!(offset_of!(IpcPerm, unused0) == 32);
     assert!(offset_of!(IpcPerm, unused1) == 40);
     assert!(align_of::<msqid_ds>() == 8);
-    assert!(size_of::<msqid_ds>() == 104);
+    assert!(size_of::<msqid_ds>() == 120);
     assert!(offset_of!(msqid_ds, msg_perm) == 0);
     assert!(offset_of!(msqid_ds, msg_stime) == 48);
     assert!(offset_of!(msqid_ds, msg_rtime) == 56);
@@ -86,6 +97,8 @@ const _: () = {
     assert!(offset_of!(msqid_ds, msg_qbytes) == 88);
     assert!(offset_of!(msqid_ds, msg_lspid) == 96);
     assert!(offset_of!(msqid_ds, msg_lrpid) == 100);
+    assert!(offset_of!(msqid_ds, unused4) == 104);
+    assert!(offset_of!(msqid_ds, unused5) == 112);
 };
 
 fn initialized_msqid_ds(value: msqid_ds) -> msqid_ds {
@@ -115,6 +128,8 @@ fn initialized_msqid_ds(value: msqid_ds) -> msqid_ds {
     result.msg_qbytes = value.msg_qbytes;
     result.msg_lspid = value.msg_lspid;
     result.msg_lrpid = value.msg_lrpid;
+    result.unused4 = value.unused4;
+    result.unused5 = value.unused5;
     result
 }
 
@@ -154,6 +169,8 @@ impl msqid_ds {
             msg_qbytes: MSGMNB as __kernel_size_t,
             msg_lspid: 0,
             msg_lrpid: 0,
+            unused4: 0,
+            unused5: 0,
         }
     }
 }
