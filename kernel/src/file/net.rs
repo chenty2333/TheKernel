@@ -2,7 +2,7 @@ use alloc::{borrow::Cow, sync::Arc};
 use core::{
     ffi::c_int,
     ops::Deref,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicI32, AtomicU64, Ordering},
     task::Context,
 };
 
@@ -67,6 +67,10 @@ pub struct Socket {
     /// SO_ATTACH_BPF or link replacement.
     bpf_filter_lock: Mutex<()>,
     bpf_filter_generation: AtomicU64,
+    /// `sk->sk_bound_dev_if`: the interface index `SO_BINDTODEVICE` stores
+    /// (`net/core/sock.c:650`) and `sock_getbindtodevice()` reads back
+    /// (`:731`).  Zero means "not bound".
+    bound_dev_if: AtomicI32,
 }
 
 #[derive(Clone, Copy)]
@@ -96,11 +100,25 @@ impl Socket {
             inet_identity: None,
             bpf_filter_lock: Mutex::new(()),
             bpf_filter_generation: AtomicU64::new(0),
+            bound_dev_if: AtomicI32::new(0),
         }
     }
 
     pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
         &self.net_ns
+    }
+
+    /// The `sk_bound_dev_if` this socket currently carries.  Linux keeps it in
+    /// the `struct sock`, so `dup(2)` and `fork(2)` observe one value.
+    pub(crate) fn bound_device_index(&self) -> i32 {
+        self.bound_dev_if.load(Ordering::Acquire)
+    }
+
+    /// `WRITE_ONCE(sk->sk_bound_dev_if, ifindex)` performed by
+    /// `sock_bindtoindex_locked()` under the socket lock
+    /// (`net/core/sock.c:650`).
+    pub(crate) fn set_bound_device_index(&self, index: i32) {
+        self.bound_dev_if.store(index, Ordering::Release);
     }
 
     /// Records this inet OFD in the namespace-local SOCK_DIAG registry.  The
