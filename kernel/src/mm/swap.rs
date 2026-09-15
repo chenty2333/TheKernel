@@ -20,8 +20,17 @@ use super::{AddrSpace, SharedPages};
 
 const PAGE: usize = 4096;
 const SWAP_SIGNATURE: &[u8] = b"SWAPSPACE2";
-const SWAP_FLAG_PREFER: u32 = 0x8000;
-const SWAP_FLAGS_VALID: u32 = 0x7ffff;
+/// include/uapi/linux/swap.h: `SWAP_FLAG_PREFER 0x8000`,
+/// `SWAP_FLAG_PRIO_MASK 0x7fff`, `SWAP_FLAG_DISCARD 0x10000`,
+/// `SWAP_FLAG_DISCARD_ONCE 0x20000`, `SWAP_FLAG_DISCARD_PAGES 0x40000`.
+/// `SWAP_FLAGS_VALID` is their union (`SWAP_FLAG_PRIO_MASK|SWAP_FLAG_PREFER|
+/// SWAP_FLAG_DISCARD|SWAP_FLAG_DISCARD_ONCE|SWAP_FLAG_DISCARD_PAGES`).
+pub(crate) const SWAP_FLAG_PREFER: u32 = 0x8000;
+pub(crate) const SWAP_FLAG_PRIO_MASK: u32 = 0x7fff;
+pub(crate) const SWAP_FLAG_DISCARD: u32 = 0x10000;
+pub(crate) const SWAP_FLAGS_VALID: u32 = 0x7ffff;
+/// mm/swapfile.c:77 `#define DEF_SWAP_PRIO -1`.
+pub(crate) const DEF_SWAP_PRIO: i16 = -1;
 
 struct SwapArea {
     id: u16,
@@ -316,6 +325,28 @@ fn path_key(location: &Location) -> AxResult<Vec<u8>> {
     Ok(key)
 }
 
+/// mm/swapfile.c:
+///
+/// ```c
+/// 	prio = DEF_SWAP_PRIO;
+/// 	if (swap_flags & SWAP_FLAG_PREFER)
+/// 		prio = swap_flags & SWAP_FLAG_PRIO_MASK;
+/// ```
+///
+/// with `#define DEF_SWAP_PRIO -1` (mm/swapfile.c:77).  Every area created
+/// without `SWAP_FLAG_PREFER` therefore gets exactly -1; the kernel never hands
+/// out descending priorities -1, -2, -3, ... and never consults the priorities
+/// of the areas that are already active.  `SWAP_FLAG_PREFER` is 0x8000 and
+/// `SWAP_FLAG_PRIO_MASK` is 0x7fff, so the same `& SWAP_FLAG_PRIO_MASK`
+/// expression masks the PREFER bit off as well.
+pub(crate) const fn effective_priority(swap_flags: u32) -> i16 {
+    if swap_flags & SWAP_FLAG_PREFER != 0 {
+        (swap_flags & SWAP_FLAG_PRIO_MASK) as i16
+    } else {
+        DEF_SWAP_PRIO
+    }
+}
+
 /// Validates a Linux v1 swap header and publishes an empty slot map atomically.
 pub fn activate(location: Location, flags: i32) -> AxResult<()> {
     if (flags as u32) & !SWAP_FLAGS_VALID != 0 || location.node_type() != NodeType::RegularFile {
@@ -355,19 +386,21 @@ pub fn activate(location: Location, flags: i32) -> AxResult<()> {
         return Err(LinuxError::ENOSPC.into());
     }
     swaps.next_id += 1;
-    let flags = flags as u32;
-    let priority = if flags & SWAP_FLAG_PREFER != 0 {
-        (flags & 0x7fff) as i16
-    } else {
-        swaps
-            .areas
-            .values()
-            .filter(|area| area.priority < 0)
-            .map(|area| area.priority)
-            .min()
-            .unwrap_or(0)
-            .saturating_sub(1)
-    };
+    // mm/swapfile.c:
+    //
+    // 	prio = DEF_SWAP_PRIO;
+    // 	if (swap_flags & SWAP_FLAG_PREFER)
+    // 		prio = swap_flags & SWAP_FLAG_PRIO_MASK;
+    //
+    // with `#define DEF_SWAP_PRIO -1` (mm/swapfile.c:77).  Every area without
+    // SWAP_FLAG_PREFER therefore gets exactly -1; the kernel never hands out
+    // descending priorities -1, -2, -3, ... and never consults the priorities
+    // of areas already active.  TheKernel used to compute a descending default,
+    // which made the priority of a new area depend on insertion history.
+    //
+    // SWAP_FLAG_PREFER is 0x8000 and SWAP_FLAG_PRIO_MASK is 0x7fff, so the
+    // `SWAP_FLAG_PREFER` bit is masked off by the same expression.
+    let priority = effective_priority(flags as u32);
     swaps.areas.insert(
         key,
         SwapArea {
@@ -607,6 +640,45 @@ pub fn pagein(entry: SwapPte, page: &mut [u8]) -> AxResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_priority_follows_linux_flag_rule() {
+        // mm/swapfile.c: `prio = DEF_SWAP_PRIO;` then `if (swap_flags &
+        // SWAP_FLAG_PREFER) prio = swap_flags & SWAP_FLAG_PRIO_MASK;`.
+        assert_eq!(effective_priority(0), -1);
+        assert_eq!(effective_priority(SWAP_FLAG_DISCARD as u32), -1);
+        // Every SWAP_FLAGS_VALID bit except PREFER leaves the default alone,
+        // which is what makes the priority independent of insertion history.
+        assert_eq!(
+            effective_priority(SWAP_FLAGS_VALID & !SWAP_FLAG_PREFER),
+            -1
+        );
+        // With PREFER, the priority is the low 15 bits and the PREFER bit itself
+        // is masked away.
+        assert_eq!(effective_priority(SWAP_FLAG_PREFER), 0);
+        assert_eq!(effective_priority(SWAP_FLAG_PREFER | 1), 1);
+        assert_eq!(effective_priority(SWAP_FLAG_PREFER | 0x7fff), 0x7fff);
+        assert_eq!(
+            effective_priority(SWAP_FLAG_PREFER | SWAP_FLAG_DISCARD | 7),
+            7
+        );
+    }
+
+    #[test]
+    fn swap_flag_constants_match_linux_uapi() {
+        // include/uapi/linux/swap.h.
+        assert_eq!(SWAP_FLAG_PREFER, 0x8000);
+        assert_eq!(SWAP_FLAG_PRIO_MASK, 0x7fff);
+        assert_eq!(SWAP_FLAGS_VALID, 0x7ffff);
+        assert_eq!(DEF_SWAP_PRIO, -1);
+        // SWAP_FLAGS_VALID is exactly the union Linux validates against:
+        // SWAP_FLAG_PRIO_MASK | SWAP_FLAG_PREFER | SWAP_FLAG_DISCARD |
+        // SWAP_FLAG_DISCARD_ONCE | SWAP_FLAG_DISCARD_PAGES.
+        assert_eq!(
+            SWAP_FLAGS_VALID,
+            SWAP_FLAG_PRIO_MASK | SWAP_FLAG_PREFER | 0x10000 | 0x20000 | 0x40000
+        );
+    }
 
     #[test]
     fn mutation_gate_linearizes_writers_mappings_and_activation() {

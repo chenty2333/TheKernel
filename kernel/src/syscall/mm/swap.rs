@@ -12,7 +12,7 @@ use crate::{
         permission::{VfsSecurityContext, check_open_permissions_with_security},
         resolve_at_with_security,
     },
-    mm::{activate, deactivate, map_usercopy_error},
+    mm::{SWAP_FLAGS_VALID, activate, deactivate, map_usercopy_error},
     syscall::validate_pathname,
     task::AsThread,
 };
@@ -45,6 +45,21 @@ pub fn sys_swapon<M: UserMemory + ?Sized>(
     specialfile: *const c_char,
     swap_flags: i32,
 ) -> AxResult<isize> {
+    // mm/swapfile.c `SYSCALL_DEFINE2(swapon, ...)` validates the flag word
+    // before anything else:
+    //
+    // 	if (swap_flags & ~SWAP_FLAGS_VALID)
+    // 		return -EINVAL;
+    //
+    // 	if (!capable(CAP_SYS_ADMIN))
+    // 		return -EPERM;
+    //
+    // so an unprivileged caller passing a bad flag bit must see -EINVAL, not
+    // -EPERM.  TheKernel used to run the capability check first and let
+    // `activate()` discover the bad flags afterwards.
+    if (swap_flags as u32) & !SWAP_FLAGS_VALID != 0 {
+        return Err(AxError::InvalidInput);
+    }
     admin()?;
     let location = resolve(memory, specialfile)?;
     let security = VfsSecurityContext::new(current().as_thread().current_cred());
