@@ -1327,6 +1327,22 @@ pub fn sys_io_submit<M: UserMemory + ?Sized>(
                 err,
             );
         }
+        // `__io_submit_one()` opens the descriptor before it looks at the
+        // RESFD eventfd and before it writes `KIOCB_KEY` back
+        // (`fs/aio.c:2026-2046`), so a closed `aio_fildes` is -EBADF even when
+        // `aio_resfd` is also invalid or `aio_key` is also unwritable.  The
+        // per-opcode paths below re-resolve the descriptor because they also
+        // apply the type, mode and placement rules; this probe only fixes the
+        // order in which the failures are reported.
+        if let Err(err) = get_file_like(iocb.aio_fildes as i32).map(drop) {
+            return fail_io_submit(
+                &context,
+                reserved.saturating_sub(retained),
+                completions,
+                submitted,
+                err,
+            );
+        }
         let resfd = match resfd_file(&iocb) {
             Ok(resfd) => resfd,
             Err(err) => {

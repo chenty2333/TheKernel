@@ -6250,8 +6250,8 @@ contract = "linux-io_submit"
 handler = "kernel/src/syscall/fs/aio.rs:sys_io_submit"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero", "tests/guest/portable/aio-differential.c:main"]
-validation_gaps = ["IO_SUBMIT_OPCODE_VALIDATION exercises the nr, context, NULL iocb, opcode and descriptor rules"]
-limitations = ["a negative aio_offset is rejected at submission with EINVAL where Linux validates only aio_nbytes and aio_buf and reports the failure in the completion event; the descriptor is opened after the RESFD eventfd lookup and the aio_key write-back, so a closed descriptor combined with an unreadable iocb or a bad resfd reports that error where Linux reports EBADF"]
+validation_gaps = ["IO_SUBMIT_OPCODE_VALIDATION exercises the nr, context, NULL iocb, opcode and descriptor rules, but no case combines a closed descriptor with a second out-of-order failure"]
+limitations = ["the descriptor is opened after the RESFD eventfd lookup, the aio_key write-back and the per-opcode argument validation, where Linux's __io_submit_one does fget() before all three (fs/aio.c:2026-2046), so a closed aio_fildes combined with an invalid aio_resfd, an unwritable aio_key or a negative aio_offset reports that other error where Linux reports EBADF"]
 
 [[contract]]
 id = "linux-io_getevents"

@@ -3662,21 +3662,25 @@ pub(crate) fn prepare_classic_aio_operation(
     flags: u32,
     ioprio: u16,
 ) -> AxResult<ClassicAioOperation> {
-    if nbytes > isize::MAX as u64 || offset < 0 {
-        return Err(AxError::InvalidInput);
-    }
     // `__io_submit_one()` opens the descriptor *before* it dispatches on the
-    // opcode (`fs/aio.c:2026-2029`):
+    // opcode (`fs/aio.c:2022-2028`):
     //
     //     req->ki_filp = fget(iocb->aio_fildes);
     //     if (unlikely(!req->ki_filp))
     //             return -EBADF;
     //
     // so a closed descriptor is -EBADF for every opcode, including the ones
-    // this kernel does not dispatch.  The per-opcode lookups below stay
-    // because they also apply the type, mode and placement rules that
-    // `aio_read()`/`aio_write()`/`aio_fsync()` apply after their own `fget()`.
+    // this kernel does not dispatch, and it is -EBADF even when a numeric
+    // argument is also out of range: the length and offset rules are applied
+    // much later, by `rw_verify_area()` inside `aio_read()`/`aio_write()`
+    // (`fs/aio.c:1654`, `:1682`), which only runs once `fget()` has
+    // succeeded.  The per-opcode lookups below stay because they also apply
+    // the type, mode and placement rules that `aio_read()`/`aio_write()`/
+    // `aio_fsync()` apply after their own lookup.
     drop(get_file_like(fd)?);
+    if nbytes > isize::MAX as u64 || offset < 0 {
+        return Err(AxError::InvalidInput);
+    }
     let len = nbytes as usize;
     match opcode {
         0 => {
