@@ -2711,6 +2711,15 @@ impl FileLike for FsMountFd {
         Ok(Cow::Owned(self.root.absolute_path()?))
     }
 
+    fn syncfs_filesystem(&self) -> Option<Filesystem> {
+        // The fsmount(2) descriptor is `dentry_open(&new_path, O_PATH, ...)`
+        // on `fc->root` (fs/namespace.c:4537-4540), so `syncfs(2)` resolves
+        // `fd_file(f)->f_path.dentry->d_sb` (fs/sync.c:148-157) to the
+        // *detached* superblock and really flushes it, exactly as it would
+        // through a path in the mount namespace.
+        Some(self.root.mountpoint().filesystem_handle())
+    }
+
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
         // This detached mount handle has no blocking data operation.
         Ok(())
