@@ -1301,14 +1301,24 @@ static int test_requeue_pi(void) {
         return 1;
     }
 
-    /* Recording only, never asserted: the return value with no waiters on
-     * the source is an implementation detail shared by the two kernels. */
+    /* A source queue with no waiter to promote is not an error and not a
+     * retry: futex_requeue() skips the chain walk and returns task_count,
+     * which is zero.  This is enforced rather than recorded: the defect it
+     * guards against is an unbounded retry inside the kernel, which would
+     * hang this case before either marker below could be printed. */
     errno = 0;
     long no_waiters = sys_futex(&empty_source,
                                 FUTEX_CMP_REQUEUE_PI | PRIVATE, 1,
                                 (const struct timespec *)(uintptr_t)1,
                                 &empty_target, 0);
     int no_waiters_errno = errno;
+    if (no_waiters != 0) {
+        return fail("requeue-pi-no-waiters",
+                    no_waiters == -1 ? no_waiters_errno : EPROTO);
+    }
+    if (empty_source != 0 || empty_target != 0) {
+        return fail("requeue-pi-no-waiters-word", EPROTO);
+    }
 
     record("futex-abi-requeue-pi",
            "REQUEUED WAITER_RC TARGET_WORD UNLOCKED EINVAL_SELF EINVAL_WAKE2",

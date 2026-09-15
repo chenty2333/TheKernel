@@ -331,6 +331,29 @@ pub enum PiUnlockOutcome {
     Aborted,
 }
 
+/// Result of a queue-gated PI requeue publication.
+///
+/// `futex_requeue()` (`kernel/futex/requeue.c:544-902`) distinguishes the case
+/// where the source queue holds no waiter to promote from the case where the
+/// publication raced against userspace: the first ends the syscall with the
+/// waiter count it managed to move, and only the second loops back to `retry`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PiRequeueOutcome {
+    /// The source queue has no live PI waiter, so there is nothing to promote
+    /// and nothing to move. `futex_requeue()` skips the chain walk and returns
+    /// its `task_count`, which is 0.
+    NoWaiters,
+    /// The publication lost the race against userspace; retry the operation.
+    Retry,
+    /// The top waiter was woken and `moved` further waiters were requeued.
+    Done {
+        /// Waiters woken on the source queue (Linux `task_count`).
+        woke: usize,
+        /// Waiters moved onto the target queue (Linux `task_count`).
+        moved: usize,
+    },
+}
+
 /// Outcome of a priority-inheritance wait.
 ///
 /// Linux tells the two interruptions of `FUTEX_WAIT_REQUEUE_PI` apart by the
@@ -1456,20 +1479,32 @@ impl WaitQueue {
     /// word while both gates are held — and up to `nr_requeue` of the remaining
     /// PI waiters are moved onto `target`'s queue, where they keep their own
     /// `rt_mutex_waiter` payload and block until `target`'s unlock hands the
-    /// futex to the strongest of them. Returns `(woken, moved)`, or `None` when
-    /// `publish` lost the race against userspace.
+    /// futex to the strongest of them.
+    ///
+    /// The three outcomes mirror the three ways `futex_requeue()` can leave its
+    /// `retry` loop. `NoWaiters` is `futex_proxy_trylock_atomic()` returning 0
+    /// because `futex_top_waiter()` found nothing to promote; `Retry` is the
+    /// loop's own `goto retry` after a lost publication race; `Done` is the
+    /// completed move. Reporting the first two as one value makes a source
+    /// queue that will never have a waiter indistinguishable from a race that
+    /// resolves itself, and the caller then retries forever.
     pub fn pi_requeue<P>(
         &self,
         target: &WaitQueue,
         target_owner: WaiterOwner,
         nr_requeue: usize,
         mut publish: P,
-    ) -> Option<(usize, usize)>
+    ) -> PiRequeueOutcome
     where
         P: FnMut(u32) -> bool,
     {
         if core::ptr::eq(self, target) {
-            return None;
+            // Unreachable: `futex_requeue()` rejects `key1 == key2` with
+            // `-EINVAL` before it ever reaches the retry loop, so a caller
+            // that gets here has already reported an error and this arm only
+            // preserves "nothing was published, the caller must not report
+            // success".
+            return PiRequeueOutcome::Retry;
         }
         let mut pending_wakers = WakeBatch::default();
         // Waiters are either woken or moved; none is retired here.
@@ -1477,9 +1512,11 @@ impl WaitQueue {
         let result = Self::with_two_gates(self, target, || {
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
-            let (top, pi) = Self::pi_top_locked(&src)?;
+            let Some((top, pi)) = Self::pi_top_locked(&src) else {
+                return PiRequeueOutcome::NoWaiters;
+            };
             if !publish(pi.tid) {
-                return None;
+                return PiRequeueOutcome::Retry;
             }
             let initial_len = src.len;
             let mut woke = 0;
@@ -1520,7 +1557,7 @@ impl WaitQueue {
                     src.push_back(waiter);
                 }
             }
-            Some((woke, moved))
+            PiRequeueOutcome::Done { woke, moved }
         });
         pending_wakers.finish();
         retired.finish();
