@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 313
-implemented = 294
+resolved = 314
+implemented = 295
 explicit_enosys = 19
 fallback = 0
-partial = 72
+partial = 71
 unknown = 0
 
 [[contract]]
@@ -892,7 +892,7 @@ handler = "kernel/src/syscall/fs/io_uring.rs:sys_io_uring_setup"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/io_uring.rs:policy_failures_keep_malformed_and_buffer_range_distinct", "tests/guest/tools/io-uring-smoke.c:main"]
 validation_gaps = ["The full setup/enter/registration opcode matrix lacks Linux7.2.3 differential coverage"]
-limitations = ["setup rejects Linux SQE128 CQE32 ATTACH_WQ NO_MMAP and other flags outside the declared subset with EINVAL"]
+limitations = ["ring is created for the declared setup subset (IOPOLL SQPOLL SQ_AFF CQSIZE CLAMP R_DISABLED SUBMIT_ALL COOP_TASKRUN SINGLE_ISSUER DEFER_TASKRUN NO_SQARRAY) with Linux 7.2.3 geometry and batch-stop semantics; the remaining v7.2.3 setup bits (ATTACH_WQ TASKRUN_FLAG SQE128 CQE32 NO_MMAP REGISTERED_FD_ONLY HYBRID_IOPOLL CQE_MIXED SQE_MIXED SQ_REWIND) and their ring geometry, wakeup and user-memory contracts are unimplemented and refused with EINVAL because io_uring_setup has no EOPNOTSUPP answer"]
 
 [[contract]]
 id = "linux-io_uring_enter"
@@ -915,7 +915,7 @@ handler = "kernel/src/syscall/fs/io_uring.rs:sys_io_uring_enter"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/io_uring.rs:fixed_submission_keeps_registration_address_space", "tests/guest/tools/io-uring-smoke.c:main"]
 validation_gaps = ["The full setup/enter/registration opcode matrix lacks Linux7.2.3 differential coverage"]
-limitations = ["SQE decoder omits SENDMSG RECVMSG CONNECT OPENAT STATX SPLICE and other valid Linux7.2.3 opcodes; unsupported SQEs complete with EOPNOTSUPP"]
+limitations = ["the io_init_req envelope matches Linux 7.2.3 for all 65 opcodes (opcode range, SQE128/mixed, SQE_VALID_FLAGS, buffer_select, ioprio, iopoll) and 25 opcodes are implemented; the other 40 are recognised but unimplemented and complete with EOPNOTSUPP from the point of no return; also unimplemented: I/O priority values on opcodes that accept them, IOSQE_ASYNC, IOSQE_CQE_SKIP_SUCCESS (and its DRAIN_DISABLED state), provided-buffer SEND/RECVMSG/READV, SQE128/CQE32/mixed rings, shared io-wq, and an out-of-range SQ-array index leaves later SQEs eligible where Linux stops the batch"]
 
 [[contract]]
 id = "linux-io_uring_register"
@@ -938,7 +938,7 @@ handler = "kernel/src/syscall/fs/io_uring.rs:sys_io_uring_register"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/io_uring.rs:registered_buffer_count_keeps_null_usercopy_precedence_bounded", "tests/guest/tools/io-uring-smoke.c:main", "tests/guest/portable/io-uring-register-differential.c:main"]
 validation_gaps = ["FILES_COUNT_LIMITS exercises the NULL array, the zero count, both ceilings, the lowered RLIMIT_NOFILE ceiling and the EBUSY ordering"]
-limitations = ["the fixed-file table is capped at 1024 slots by FixedFileSlotCharge, so a count between that cap and the caller's soft RLIMIT_NOFILE is refused with EMFILE where Linux accepts up to min(1<<20, rlimit)"]
+limitations = ["all 38 v7.2.3 registration opcodes are decoded with their dispatcher arg/nr_args verdicts and record sizes, and an unreadable record is EFAULT before any body verdict; opcodes whose bodies are unimplemented complete with EOPNOTSUPP after the record is copied, where Linux may succeed or return a body errno (EVENTFD_ASYNC, PBUF_RING, CLONE_BUFFERS, NAPI, ZCRX_IFQ/CTRL bodies, RESIZE_RINGS, MEM_REGION, FILE_ALLOC_RANGE, CLOCK, SEND_MSG_RING, BPF_FILTER, RESTRICTIONS execution); ring RESTRICTIONS state checks (EBADFD/EBUSY) are not modelled"]
 
 [[contract]]
 id = "linux-futex"
@@ -4336,13 +4336,13 @@ teardown = ["teardown:release poll registrations or temporary mapping capabiliti
 [[cell]]
 number = 440
 name = "process_madvise"
-status = "partial"
+status = "implemented"
 contract = "linux-process_madvise"
 handler = "kernel/src/syscall/mm/process_vm.rs:sys_process_madvise"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["the remote path returns ENOMEM at the first hole instead of recording unmapped_error and carrying on, so advice after a hole is skipped where Linux applies it and returns -ENOMEM afterwards; no advice that reaches that path has an observable effect in the guest, so the divergence is recorded rather than asserted"]
+tests = ["tests/guest/portable/mm-contracts-differential.c:main", "kernel/src/syscall/mm/mmap.rs:process_madvise_walk_reaches_the_vmas_after_a_hole"]
+validation_gaps = ["no advice that reaches the remote path has an observable effect in either guest, so the interior-hole rule is covered by kernel/src/syscall/mm/mmap.rs:process_madvise_walk_reaches_the_vmas_after_a_hole rather than by a guest assertion"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-map_shadow_stack"
