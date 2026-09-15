@@ -851,9 +851,41 @@ pub enum NetlinkWriteAdmission {
     MessageTooLarge,
 }
 
-/// Decides whether a datagram fits the Linux default netlink send budget.
-/// It does not copy payload bytes or allocate an skb.
-pub const fn admit_netlink_write(len: usize) -> NetlinkWriteAdmission {
+/// Decides whether a datagram fits the *sender's own* netlink send budget.
+///
+/// Linux v7.2.3 `net/netlink/af_netlink.c:1868-1873`:
+///
+/// ```c
+/// 	if (len > sk->sk_sndbuf - 32)
+/// 		goto out;
+/// ...
+/// out:
+/// 	return err;
+/// ```
+///
+/// with `err` still `-EMSGSIZE` from the prologue, so the budget is the
+/// socket's `sk_sndbuf` (which `SO_SNDBUF`/`SO_SNDBUFFORCE` set) and not a
+/// constant shared by every netlink socket.  The C comparison is performed in
+/// `size_t` because `len` is one, so a (never reachable, `sk_sndbuf` floors at
+/// `SOCK_MIN_SNDBUF`) negative right-hand side would admit every length.
+pub const fn admit_netlink_write(len: usize, sndbuf: i32) -> NetlinkWriteAdmission {
+    let budget = sndbuf as i64 - NETLINK_SEND_BUFFER_OVERHEAD as i64;
+    if budget < 0 || len as u64 <= budget as u64 {
+        NetlinkWriteAdmission::Admit
+    } else {
+        NetlinkWriteAdmission::MessageTooLarge
+    }
+}
+
+/// Decides whether a *kernel-generated* netlink message fits the framing cap.
+///
+/// Kernel senders have no socket budget to consult: the
+/// `len > sk->sk_sndbuf - 32` check above lives in `netlink_sendmsg()`, the
+/// userspace entry point, while `kobject_uevent()` reaches receivers through
+/// `netlink_broadcast()`/`netlink_broadcast_filtered()`, which never look at a
+/// sender's `sk_sndbuf`.  The bound kept here is the historical default-sized
+/// framing cap, not a socket option.
+pub const fn admit_kernel_netlink_message(len: usize) -> NetlinkWriteAdmission {
     if len > NETLINK_MAX_MESSAGE_BYTES {
         NetlinkWriteAdmission::MessageTooLarge
     } else {
@@ -872,6 +904,29 @@ pub enum NetlinkQueueAdmission {
 /// Decides whether another datagram can be retained by a bounded netlink
 /// receiver queue. `queued_bytes` may be corrupt or stale; saturating
 /// subtraction conservatively rejects rather than wrapping.
+///
+/// Linux v7.2.3 `net/netlink/af_netlink.c:1210-1232` (unicast,
+/// `netlink_attachskb`) and `:1389-1407` (multicast,
+/// `netlink_broadcast_deliver`) both admit against the *receiving* socket's
+/// `sk_rcvbuf`:
+///
+/// ```c
+/// 	rmem = atomic_add_return(skb->truesize, &sk->sk_rmem_alloc);
+///
+/// 	if ((rmem == skb->truesize || rmem <= READ_ONCE(sk->sk_rcvbuf)) &&
+/// 	    !test_bit(NETLINK_S_CONGESTED, &nlk->state)) {
+/// 		netlink_skb_set_owner_r(skb, sk);
+/// 		return 0;
+/// 	}
+/// ```
+///
+/// `rmem == skb->truesize` is the empty-queue case: the first datagram in a
+/// queue is admitted whatever its size, so an empty queue never reports
+/// `EAGAIN` for a datagram that already passed the sender's own budget.
+/// `queued_messages == 0` is the same test here, since this queue accounts one
+/// entry per datagram.  The congestion bit that can also refuse admission is
+/// not modelled: it is only set once a datagram has already been dropped, and
+/// this kernel reports that loss through `ENOBUFS` on the next receive.
 pub const fn admit_netlink_queue(
     queued_messages: usize,
     queued_bytes: usize,
@@ -879,10 +934,13 @@ pub const fn admit_netlink_queue(
     message_limit: usize,
     byte_limit: usize,
 ) -> NetlinkQueueAdmission {
-    if queued_messages >= message_limit || message_len > byte_limit.saturating_sub(queued_bytes) {
-        NetlinkQueueAdmission::Drop
-    } else {
+    if queued_messages >= message_limit {
+        return NetlinkQueueAdmission::Drop;
+    }
+    if queued_messages == 0 || message_len <= byte_limit.saturating_sub(queued_bytes) {
         NetlinkQueueAdmission::Enqueue
+    } else {
+        NetlinkQueueAdmission::Drop
     }
 }
 
@@ -1691,19 +1749,81 @@ mod tests {
     #[test]
     fn netlink_admission_preserves_limit_and_overflow_boundaries() {
         assert_eq!(
-            admit_netlink_write(NETLINK_MAX_MESSAGE_BYTES),
+            admit_netlink_write(NETLINK_MAX_MESSAGE_BYTES, SYSCTL_WMEM_DEFAULT),
             NetlinkWriteAdmission::Admit
         );
         assert_eq!(
-            admit_netlink_write(NETLINK_MAX_MESSAGE_BYTES.saturating_add(1)),
+            admit_netlink_write(
+                NETLINK_MAX_MESSAGE_BYTES.saturating_add(1),
+                SYSCTL_WMEM_DEFAULT
+            ),
             NetlinkWriteAdmission::MessageTooLarge
         );
+        // `net/netlink/af_netlink.c:1868-1873` measures against the socket's
+        // own `sk_sndbuf`, so a raised SO_SNDBUF admits what the default
+        // budget refuses and a lowered one refuses what it admitted.
+        assert_eq!(
+            admit_netlink_write(400_000, SYSCTL_WMEM_MAX),
+            NetlinkWriteAdmission::Admit
+        );
+        assert_eq!(
+            admit_netlink_write(400_000, SYSCTL_WMEM_DEFAULT),
+            NetlinkWriteAdmission::MessageTooLarge
+        );
+        assert_eq!(
+            admit_netlink_write(16 * 1024, SOCK_MIN_SNDBUF),
+            NetlinkWriteAdmission::MessageTooLarge
+        );
+        assert_eq!(
+            admit_netlink_write(16 * 1024, decode_send_buffer(4 * 1024)),
+            NetlinkWriteAdmission::MessageTooLarge
+        );
+        // The exact boundary is `len <= sk_sndbuf - 32`
+        // (`net/netlink/af_netlink.c:1869`), so the minimum send buffer admits
+        // 4576 bytes and refuses 4577.
+        assert_eq!(
+            admit_netlink_write(SOCK_MIN_SNDBUF as usize - NETLINK_SEND_BUFFER_OVERHEAD, SOCK_MIN_SNDBUF),
+            NetlinkWriteAdmission::Admit
+        );
+        assert_eq!(
+            admit_netlink_write(
+                SOCK_MIN_SNDBUF as usize - NETLINK_SEND_BUFFER_OVERHEAD + 1,
+                SOCK_MIN_SNDBUF
+            ),
+            NetlinkWriteAdmission::MessageTooLarge
+        );
+        // Kernel-generated messages never consult a socket budget.
+        assert_eq!(
+            admit_kernel_netlink_message(NETLINK_MAX_MESSAGE_BYTES),
+            NetlinkWriteAdmission::Admit
+        );
+        assert_eq!(
+            admit_kernel_netlink_message(NETLINK_MAX_MESSAGE_BYTES.saturating_add(1)),
+            NetlinkWriteAdmission::MessageTooLarge
+        );
+
         assert_eq!(
             admit_netlink_queue(128, 0, 1, 128, 16),
             NetlinkQueueAdmission::Drop
         );
+        // The empty queue admits its first datagram whatever its size
+        // (`rmem == skb->truesize`), including with corrupt byte accounting.
         assert_eq!(
             admit_netlink_queue(0, usize::MAX, 1, 128, 16),
+            NetlinkQueueAdmission::Enqueue
+        );
+        // A non-empty queue is bounded by the receiver's `sk_rcvbuf`.
+        assert_eq!(
+            admit_netlink_queue(1, 16, 1, 128, 16),
+            NetlinkQueueAdmission::Drop
+        );
+        assert_eq!(
+            admit_netlink_queue(1, 15, 1, 128, 16),
+            NetlinkQueueAdmission::Enqueue
+        );
+        // A queue that already holds more than the budget admits nothing.
+        assert_eq!(
+            admit_netlink_queue(1, 100 * 1024, 16 * 1024, 128, 4 * 1024),
             NetlinkQueueAdmission::Drop
         );
     }

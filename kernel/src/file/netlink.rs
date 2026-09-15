@@ -31,10 +31,11 @@ use spin::{Lazy, Mutex, MutexGuard};
 #[cfg(test)]
 use tk_linux_net::NETLINK_MAX_MESSAGE_BYTES;
 use tk_linux_net::{
-    NETLINK_DEFAULT_SEND_BUFFER_BYTES, NL_CFG_F_NONROOT_RECV, NL_CFG_F_NONROOT_SEND,
+    NL_CFG_F_NONROOT_RECV, NL_CFG_F_NONROOT_SEND,
     NetlinkQueueAdmission, NetlinkWriteAdmission, SYSCTL_RMEM_DEFAULT, SYSCTL_RMEM_MAX,
-    SYSCTL_WMEM_DEFAULT, SYSCTL_WMEM_MAX, admit_netlink_queue, admit_netlink_write,
-    netlink_allowed, netlink_group_bind_permitted, netlink_protocol_group_capacity,
+    SYSCTL_WMEM_DEFAULT, SYSCTL_WMEM_MAX, admit_kernel_netlink_message, admit_netlink_queue,
+    admit_netlink_write, netlink_allowed, netlink_group_bind_permitted,
+    netlink_protocol_group_capacity,
 };
 
 use crate::{
@@ -49,7 +50,6 @@ use crate::{
 
 const NETLINK_MAX_PROTOCOL: u32 = 31;
 const NETLINK_QUEUE_LIMIT: usize = 128;
-const NETLINK_QUEUE_LIMIT_BYTES: usize = NETLINK_DEFAULT_SEND_BUFFER_BYTES;
 const NETLINK_ROUTE: u32 = 0;
 /// `NETLINK_USERSOCK` (`include/uapi/linux/netlink.h`).  `netlink_proto_init`
 /// registers it with `NL_CFG_F_NONROOT_SEND`, so unprivileged sockets may
@@ -564,6 +564,24 @@ impl<'a> NetlinkWritePermit<'a> {
             | Self::Audit { state, .. }
             | Self::Uevent { state, .. }
             | Self::SockDiag { state, .. } => state.groups & u64::from(group) != 0,
+        }
+    }
+
+    /// `sk_rcvbuf` as read from the state guard this permit already owns.
+    ///
+    /// The permit's `state` guard *is* the socket's state lock, and that lock
+    /// is not reentrant, so a kernel-originated queue admission must read the
+    /// budget from the guard instead of calling `NetlinkSocket`'s state-locking
+    /// accessor.  Linux reads the same `sk_rcvbuf` field while holding the
+    /// socket lock in `netlink_attachskb()` (`net/netlink/af_netlink.c:1218`).
+    fn receive_buffer_limit(&self) -> usize {
+        match self {
+            Self::Route { state, .. }
+            | Self::Generic { state, .. }
+            | Self::Netfilter { state, .. }
+            | Self::Audit { state, .. }
+            | Self::Uevent { state, .. }
+            | Self::SockDiag { state, .. } => usize::try_from(state.sock.rcvbuf).unwrap_or(0),
         }
     }
 
@@ -2139,6 +2157,19 @@ impl NetlinkSocket {
         self.state.lock().passcred
     }
 
+    /// `sk_sndbuf`, the budget `netlink_sendmsg` measures a userspace datagram
+    /// against (`net/netlink/af_netlink.c:1868-1873`).
+    fn send_buffer_limit(&self) -> i32 {
+        self.state.lock().sock.sndbuf
+    }
+
+    /// `sk_rcvbuf`, the ceiling `netlink_attachskb` and
+    /// `netlink_broadcast_deliver` account this socket's receive queue
+    /// against (`net/netlink/af_netlink.c:1218`, `:1392-1395`).
+    fn receive_buffer_limit(&self) -> usize {
+        usize::try_from(self.state.lock().sock.rcvbuf).unwrap_or(0)
+    }
+
     /// `nlk->nl_groups[0]`, the multicast mask `netlink_getname` and
     /// `NETLINK_LIST_MEMBERSHIPS` both report.
     #[cfg(test)]
@@ -2245,13 +2276,18 @@ impl NetlinkSocket {
 
     fn enqueue_kernel_permitted(&self, permit: &mut NetlinkWritePermit<'_>, data: Vec<u8>) {
         let suppress_enobufs = permit.suppress_enobufs();
+        // Read the receiver's budget from the permit's own state guard: the
+        // socket state lock is not reentrant, so taking it here would
+        // self-deadlock.  The queue lock is still taken afterwards, matching
+        // the state-before-queue order every other enqueue path uses.
+        let rcvbuf = permit.receive_buffer_limit();
         let queue = permit.queue();
         if admit_netlink_queue(
             queue.datagrams.len(),
             queue.bytes,
             data.len(),
             NETLINK_QUEUE_LIMIT,
-            NETLINK_QUEUE_LIMIT_BYTES,
+            rcvbuf,
         ) == NetlinkQueueAdmission::Drop
         {
             if !suppress_enobufs {
@@ -2276,13 +2312,14 @@ impl NetlinkSocket {
         source_groups: u32,
         credentials: Option<NetlinkCredentials>,
     ) {
+        let rcvbuf = self.receive_buffer_limit();
         let mut queue = self.queue.lock();
         if admit_netlink_queue(
             queue.datagrams.len(),
             queue.bytes,
             data.len(),
             NETLINK_QUEUE_LIMIT,
-            NETLINK_QUEUE_LIMIT_BYTES,
+            rcvbuf,
         ) == NetlinkQueueAdmission::Drop
         {
             drop(queue);
@@ -2307,6 +2344,7 @@ impl NetlinkSocket {
         credentials: NetlinkCredentials,
         nowait: bool,
     ) -> AxResult {
+        let rcvbuf = self.receive_buffer_limit();
         let mut queue = if nowait {
             self.queue.try_lock().ok_or(AxError::WouldBlock)?
         } else {
@@ -2317,7 +2355,7 @@ impl NetlinkSocket {
             queue.bytes,
             data.len(),
             NETLINK_QUEUE_LIMIT,
-            NETLINK_QUEUE_LIMIT_BYTES,
+            rcvbuf,
         ) == NetlinkQueueAdmission::Drop
         {
             return Err(AxError::WouldBlock);
@@ -2640,7 +2678,9 @@ impl NetlinkSocket {
         if len == 0 {
             return Err(LinuxError::ENODATA.into());
         }
-        if admit_netlink_write(len) == NetlinkWriteAdmission::MessageTooLarge {
+        if admit_netlink_write(len, self.send_buffer_limit())
+            == NetlinkWriteAdmission::MessageTooLarge
+        {
             return Err(LinuxError::EMSGSIZE.into());
         }
         // `netlink_sendmsg` autobinds before it publishes the datagram, so a
@@ -2684,7 +2724,9 @@ impl NetlinkSocket {
         if len == 0 {
             return Err(LinuxError::ENODATA.into());
         }
-        if admit_netlink_write(len) == NetlinkWriteAdmission::MessageTooLarge {
+        if admit_netlink_write(len, self.send_buffer_limit())
+            == NetlinkWriteAdmission::MessageTooLarge
+        {
             return Err(LinuxError::EMSGSIZE.into());
         }
         // sendto(2) autobinds an unbound netlink socket before it publishes a
@@ -2762,7 +2804,9 @@ impl NetlinkSocket {
         nowait: bool,
     ) -> AxResult<usize> {
         let len = src.remaining();
-        if admit_netlink_write(len) == NetlinkWriteAdmission::MessageTooLarge {
+        if admit_netlink_write(len, self.send_buffer_limit())
+            == NetlinkWriteAdmission::MessageTooLarge
+        {
             return Err(LinuxError::EMSGSIZE.into());
         }
 
@@ -2797,7 +2841,9 @@ impl NetlinkSocket {
         let thread = current.as_thread();
         let actor = thread.current_cred();
         let len = src.remaining();
-        if admit_netlink_write(len) == NetlinkWriteAdmission::MessageTooLarge {
+        if admit_netlink_write(len, self.send_buffer_limit())
+            == NetlinkWriteAdmission::MessageTooLarge
+        {
             return Err(LinuxError::EMSGSIZE.into());
         }
         if nowait && self.protocol == NETLINK_KOBJECT_UEVENT {
@@ -4346,7 +4392,7 @@ pub(crate) fn emit_kobject_uevent(
             .and_then(|len| len.checked_add(1))
             .ok_or(AxError::NoMemory)?;
     }
-    if admit_netlink_write(payload_len) == NetlinkWriteAdmission::MessageTooLarge {
+    if admit_kernel_netlink_message(payload_len) == NetlinkWriteAdmission::MessageTooLarge {
         return Err(LinuxError::EMSGSIZE.into());
     }
     let mut payload = Vec::new();
@@ -4400,7 +4446,7 @@ fn broadcast_user_uevent_locked(
         .len()
         .checked_add(suffix_len)
         .ok_or(AxError::NoMemory)?;
-    if admit_netlink_write(message_len) == NetlinkWriteAdmission::MessageTooLarge {
+    if admit_kernel_netlink_message(message_len) == NetlinkWriteAdmission::MessageTooLarge {
         return Err(LinuxError::EMSGSIZE.into());
     }
     let mut message = Vec::new();
@@ -4436,7 +4482,7 @@ fn broadcast_user_uevent_nowait_locked(
         .len()
         .checked_add(suffix_len)
         .ok_or(AxError::NoMemory)?;
-    if admit_netlink_write(message_len) == NetlinkWriteAdmission::MessageTooLarge {
+    if admit_kernel_netlink_message(message_len) == NetlinkWriteAdmission::MessageTooLarge {
         return Err(LinuxError::EMSGSIZE.into());
     }
     let mut message = Vec::new();
@@ -4463,6 +4509,7 @@ fn broadcast_user_uevent_nowait_locked(
         };
         let subscribed = state.groups & u64::from(KOBJECT_UEVENT_GROUP) != 0;
         let suppress_enobufs = state.option_flags & (1 << NETLINK_NO_ENOBUFS) != 0;
+        let rcvbuf = usize::try_from(state.sock.rcvbuf).unwrap_or(0);
         drop(state);
         if !subscribed {
             return true;
@@ -4479,7 +4526,7 @@ fn broadcast_user_uevent_nowait_locked(
             queue.bytes,
             message.len(),
             NETLINK_QUEUE_LIMIT,
-            NETLINK_QUEUE_LIMIT_BYTES,
+            rcvbuf,
         ) == NetlinkQueueAdmission::Drop
         {
             if !suppress_enobufs {
@@ -4556,6 +4603,7 @@ fn broadcast_uevent_to_namespace(
         };
         let subscribed = state.groups & u64::from(KOBJECT_UEVENT_GROUP) != 0;
         let suppress_enobufs = state.option_flags & (1 << NETLINK_NO_ENOBUFS) != 0;
+        let rcvbuf = usize::try_from(state.sock.rcvbuf).unwrap_or(0);
         drop(state);
         if !subscribed {
             continue;
@@ -4572,7 +4620,7 @@ fn broadcast_uevent_to_namespace(
             queue.bytes,
             payload.len(),
             NETLINK_QUEUE_LIMIT,
-            NETLINK_QUEUE_LIMIT_BYTES,
+            rcvbuf,
         ) == NetlinkQueueAdmission::Drop
         {
             if !suppress_enobufs {
