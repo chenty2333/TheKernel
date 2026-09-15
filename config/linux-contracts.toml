@@ -40,7 +40,7 @@ concurrency = ["explicit-none"]
 teardown = ["explicit-none"]
 
 [[contract]]
-id = "linux-bpf-routing-partial"
+id = "linux-bpf"
 flags = ["flag:bpf-command"]
 structs = ["struct:bpf_attr"]
 multiplexer_commands = ["mux:BPF_CMD"]
@@ -175,12 +175,12 @@ limitations = ["explicit-none"]
 number = 321
 name = "bpf"
 status = "partial"
-contract = "linux-bpf-routing-partial"
+contract = "linux-bpf"
 handler = "kernel/src/syscall/bpf/mod.rs:sys_bpf"
 conditional = "bpf"
 tests = []
-validation_gaps = ["BPF command families lack a complete Linux 7.2.3 differential matrix"]
-limitations = ["BPF map creation rejects inner-map NUMA and BTF spin-lock attributes; map-in-map types are not supported", "program verifier accepts a bounded raw-context and LSM type set; helper support is limited to map lookup/update/delete, ktime, pid/uid/comm and ringbuf", "batch operations support only selected hash array and LPM map types; unsupported map-operation pairs return EOPNOTSUPP"]
+validation_gaps = ["BPF command families lack a complete Linux 7.2.3 differential matrix and the product-build ENOSYS path for syscall 321 has no test"]
+limitations = ["The bpf feature is absent from kernel_features() and the dispatch arm is guarded by #[cfg(feature = \"bpf\")], so product and guest builds route syscall 321 to the default arm and return ENOSYS exactly as a deliberately unimplemented number does; only host-test builds reach the handler", "Map creation admits 16 map types and rejects every BTF-described map outside struct_ops, every nonzero numa_node and inner_map_fd, and every map flag except LPM_TRIE|BPF_F_NO_PREALLOC; ARRAY_OF_MAPS, HASH_OF_MAPS and LRU_PERCPU_HASH are unrepresentable", "PROG_LOAD admits 11 program types and 18 helper IDs, four of them only for particular program types, and the verifier rejects every back-edge because allow_loops is false where Linux admits bounded loops for a capable caller", "Batch commands cover the hash family plus generic array, percpu-array and LPM-trie lookup and update; unsupported type-operation pairs fail with EOPNOTSUPP (95) where Linux fails with ENOTSUPP (524), and elem_flags must be zero so the per-CPU BPF_F_CPU and BPF_F_ALL_CPUS batch forms are unavailable"]
 
 [[cell]]
 number = 335
