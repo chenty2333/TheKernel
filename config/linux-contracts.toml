@@ -1741,8 +1741,8 @@ status = "implemented"
 contract = "linux-ustat"
 handler = "kernel/src/syscall/fs/stat.rs:sys_ustat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/stat.rs:ustat_has_complete_zeroed_native_layout"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry and provider/error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/fs/stat.rs:ustat_has_complete_zeroed_native_layout", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
