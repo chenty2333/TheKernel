@@ -18,10 +18,21 @@ MUSL_PREFIX="$MUSL_ROOT/usr/x86_64-linux-musl"
 
 mkdir -p "$MUSL_ROOT"
 for package in "${MUSL_RPM_PACKAGES[@]}"; do
-    rpm_path=$(fetch_rpm "$package" "${MUSL_RPM_FILE[$package]}" "${MUSL_RPM_SHA256[$package]}")
+    # The `if !` guard is load-bearing: a bare `rpm_path=$(fetch_rpm ...)`
+    # assignment would let a failure inside fetch_rpm exit only the command
+    # substitution's subshell, and the build would continue with an empty path.
+    if ! rpm_path=$(fetch_rpm "$package" "${MUSL_RPM_FILE[$package]}" "${MUSL_RPM_SHA256[$package]}"); then
+        return 1
+    fi
     # The extraction is idempotent: the sysroot only needs to exist once.
     if [ ! -e "$MUSL_PREFIX/lib64/libc.a" ]; then
-        ( cd "$MUSL_ROOT" && rpm2cpio "$rpm_path" | cpio -idm --quiet )
+        # Not a pipe: cpio stops reading at the archive trailer and exits, and
+        # rpm2cpio can still have the final padding write in flight when it
+        # does -- an intermittent SIGPIPE (exit 141) with nothing actually
+        # wrong, which pipefail then reports as a failed unpack.
+        rpm2cpio "$rpm_path" > "$MUSL_ROOT/.payload.cpio" || return 1
+        ( cd "$MUSL_ROOT" && cpio -idm --quiet < .payload.cpio ) || return 1
+        rm -f "$MUSL_ROOT/.payload.cpio"
     fi
 done
 

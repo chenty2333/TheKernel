@@ -222,15 +222,20 @@ exec "$@"
 EOF
 chmod 0755 "$EXE_WRAPPER"
 
-# The cross file is regenerated on every run, so it deliberately does *not*
-# live in the build tree: ninja tracks it as an input to build.ninja, and a
-# newer cross file therefore makes ninja regenerate the build files and re-run
-# every meson configure check on each build -- which is slow, and on this host
-# fails outright the second time.  It names only stable paths ($SYSROOT and the
-# musl wrapper), and the payload is checked below for any trace of this
-# per-run directory, so nothing from here can reach the emulator.
-CROSS_FILE="$WORK_ROOT/musl-cross.ini"
-cat >"$CROSS_FILE" <<EOF
+# The cross file lives at a stable path under the build root and is replaced
+# only when its content changes.  ninja tracks it as an input to build.ninja,
+# so a per-run path means the *second* run finds the recorded input gone --
+# the trap below removes the per-run directory -- and ninja's regeneration of
+# build.ninja dies inside meson with "Unhandled python OSError" (a
+# FileNotFoundError for the old cross file).  Measured: every second run
+# failed this way once the build tree was reused.  Even a fresh mtime on an
+# unchanged file would trigger the same regeneration needlessly, hence the
+# content compare.  The file names only stable paths ($SYSROOT, the musl
+# wrapper, and now its own), and the payload is checked below for any trace of
+# the per-run directory, so nothing from here can reach the emulator.
+CROSS_FILE="$BUILD_ROOT/musl-cross.ini"
+cross_new="$WORK_ROOT/musl-cross.ini.new"
+cat >"$cross_new" <<EOF
 # Meson cross file: x86_64-linux-musl, fully static.
 [binaries]
 c = '$MUSL_CC'
@@ -254,6 +259,9 @@ default_library = 'static'
 c_args = ['-O2', '-isystem', '$SYSROOT/kernel-uapi']
 c_link_args = ['-static', '-L$SYSROOT/lib']
 EOF
+if ! cmp -s "$cross_new" "$CROSS_FILE"; then
+    mv "$cross_new" "$CROSS_FILE"
+fi
 
 export PKG_CONFIG_LIBDIR="$SYSROOT/lib/pkgconfig:$SYSROOT/share/pkgconfig"
 export PKG_CONFIG_PATH="$PKG_CONFIG_LIBDIR"
@@ -319,12 +327,13 @@ GLIB_BUILD="$BUILD_ROOT/glib-build"
 # short-circuit, not a cache that can go stale: the install below fails if the
 # build directory was not the one that produced the sysroot.
 # The build tree is reused across runs, which is what makes a repeat build a
-# relink instead of ten minutes of compilation.  Meson regenerates its build
-# file when ninja runs and something it tracks has moved, and that
-# regeneration re-runs every configure check: on this host the second run dies
-# inside them with a meson "Unhandled python OSError".  The tree is configured
-# here, by this script, and nothing else touches it, so once the marker below
-# exists the tree is used as it stands.
+# relink instead of ten minutes of compilation.  Meson may still regenerate
+# its build file when ninja runs and something it tracks has changed; that
+# regeneration used to die with a meson "Unhandled python OSError" because the
+# cross file it re-reads lived under the per-run WORK_ROOT, and it now lives
+# at the stable path above, so the regen path works when it is needed.  The
+# tree is configured here, by this script, and nothing else touches it, so
+# once the marker below exists the tree is used as it stands.
 GLIB_SETUP_OK="$GLIB_BUILD/.thekernel-setup-ok"
 GLIB_NINJA_FLAGS=()
 if [ -f "$GLIB_SETUP_OK" ] && [ -f "$GLIB_BUILD/build.ninja" ]; then

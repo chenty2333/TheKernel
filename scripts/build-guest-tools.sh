@@ -51,15 +51,16 @@ JOBS=${CARGO_BUILD_JOBS:-$(nproc)}
 
 usage() {
     cat <<'EOF'
-Usage: scripts/build-guest-tools.sh --payload {none,tcc} --output DIR [options]
+Usage: scripts/build-guest-tools.sh --payload {none,tcc,nested,glibc,gcc} --output DIR
 
 Stage the optional guest tool payload into DIR, for build-rootfs.sh to copy
-into the image.
+into the image.  `nested`, `glibc` and `gcc` are delegated to their own
+builders (build-nested-payload.sh, build-glibc-payload.sh,
+build-gcc-payload.sh), which own their pins.
 
 Options:
   --payload NAME     payload to build; `none` stages nothing (default)
   --output DIR       staging tree to populate
-  --size-mb N        informational: suggest an image size for this payload
   -h, --help         show this help
 
 Environment:
@@ -74,7 +75,6 @@ while (($#)); do
     case "$1" in
         --payload) PAYLOAD=${2:-}; shift 2 ;;
         --output) OUTPUT=${2:-}; shift 2 ;;
-        --size-mb) SUGGESTED_SIZE_MB=${2:-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -171,10 +171,23 @@ fetch_rpm() {
 
 mkdir -p "$MUSL_ROOT"
 for package in "${MUSL_RPM_PACKAGES[@]}"; do
-    rpm_path=$(fetch_rpm "$package" "${MUSL_RPM_FILE[$package]}" "${MUSL_RPM_SHA256[$package]}")
+    # The `if !` guard is load-bearing: a bare `rpm_path=$(fetch_rpm ...)`
+    # assignment would let a failure inside fetch_rpm exit only the command
+    # substitution's subshell, and the build would continue with an empty path.
+    if ! rpm_path=$(fetch_rpm "$package" "${MUSL_RPM_FILE[$package]}" "${MUSL_RPM_SHA256[$package]}"); then
+        exit 1
+    fi
     # The extraction is idempotent: the sysroot only needs to exist once.
     if [ ! -e "$MUSL_PREFIX/lib64/libc.a" ]; then
-        ( cd "$MUSL_ROOT" && rpm2cpio "$rpm_path" | cpio -idm --quiet )
+        # Not a pipe: cpio stops reading at the archive trailer and exits, and
+        # rpm2cpio can still have the final padding write in flight when it
+        # does -- an intermittent SIGPIPE (exit 141) with nothing actually
+        # wrong, which pipefail then reports as a failed unpack.
+        rpm2cpio "$rpm_path" > "$MUSL_ROOT/.payload.cpio" ||
+            { printf 'rpm2cpio failed for %s\n' "$package" >&2; exit 1; }
+        ( cd "$MUSL_ROOT" && cpio -idm --quiet < .payload.cpio ) ||
+            { printf 'cpio could not unpack %s\n' "$package" >&2; exit 1; }
+        rm -f "$MUSL_ROOT/.payload.cpio"
     fi
 done
 
