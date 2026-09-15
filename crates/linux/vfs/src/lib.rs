@@ -12,6 +12,7 @@
 mod context;
 mod dac;
 mod fiemap;
+mod getcwd;
 mod linux_abi;
 mod path;
 mod setattr;
@@ -27,6 +28,7 @@ pub use fiemap::{
     FIEMAP_MAX_EXTENTS, FIEMAP_STREAM_BATCH_EXTENTS, FIEMAP_SUPPORTED_FLAGS, Fiemap, FiemapExtent,
     FiemapExtentState, FiemapRequestError,
 };
+pub use getcwd::{GETCWD_UNREACHABLE_PREFIX, GetcwdError, PATH_MAX, getcwd_user_len};
 pub use linux_abi::{
     AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, CacheStat, CachestatAdmissionError, CachestatPageRange,
     CachestatRange, FILE_AT_FLAGS, FILE_ATTR_SIZE_LATEST, FILE_ATTR_SIZE_VER0,
