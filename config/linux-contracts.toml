@@ -2778,7 +2778,7 @@ handler = "kernel/src/syscall/ipc/msg.rs:sys_msgget"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object"]
+limitations = ["msgmni is a single process-global value clamped to >= 1 rather than a per-IPC-namespace limit clamped to [0, ipc_mni] (ipc/util.c:287-291), and msgget() can return EIDRM in the IPC_RMID race window where Linux only produces the id, EACCES, EEXIST or ENOENT (ipc/util.c:397-433, :447-452)"]
 
 [[contract]]
 id = "linux-msgsnd"
@@ -2801,7 +2801,7 @@ handler = "kernel/src/syscall/ipc/msg.rs:sys_msgsnd"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object"]
+limitations = ["a message addressed to a blocked receiver is enqueued and every waiter is woken, so a racing third task can consume it where Linux hands it straight to the blocked receiver (ipc/msg.c:816-846, :939-946); the sleeping syscall has no ERESTARTNOHAND restart class and reports EINTR (ipc/msg.c:929-932)"]
 
 [[contract]]
 id = "linux-msgrcv"
@@ -2824,7 +2824,7 @@ handler = "kernel/src/syscall/ipc/msg.rs:sys_msgrcv"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/ipc/msg.rs:receive_fault_consumes_normal_message_before_copyout", "kernel/src/syscall/ipc/msg.rs:msg_copy_fault_leaves_message_queued"]
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object"]
+limitations = ["MSG_COPY with MSG_NOERROR and msgsz < m_ts returns a truncated copy where Linux returns EINVAL (ipc/msg.c:1150-1161 with ipc/msgutil.c:132-133); msg_lspid/msg_lrpid publish the global pid instead of pid_vnr() (ipc/msg.c:574-575)"]
 
 [[contract]]
 id = "linux-msgctl"
@@ -2847,7 +2847,7 @@ handler = "kernel/src/syscall/ipc/msg.rs:sys_msgctl"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/ipc/msg.rs:credential_caller_msg_set_resource_failure_rolls_back_every_field"]
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object", "STAT/STAT_ANY treat the input as a complete flat identifier rather than Linux IDR index; INFO maximum-index reporting shares this representation"]
+limitations = ["IPC_SET tests the msg_qbytes ceiling with CAP_SYS_RESOURCE in the IPC namespace's user namespace where Linux uses capable() against the initial user namespace (ipc/msg.c:434-435, kernel/capability.c:414-417); msg_lspid/msg_lrpid publish the global pid instead of pid_vnr() (ipc/msg.c:574-575); a queue marked for removal reports EIDRM before the read-permission test where Linux is EACCES first (ipc/msg.c:544-560)"]
 
 [[contract]]
 id = "linux-semget"
@@ -2870,7 +2870,7 @@ handler = "kernel/src/syscall/ipc/sem.rs:sys_semget"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object"]
+limitations = ["nsems is bounded by SEMMSL only on the create path, so an oversized request against an existing or absent key reports EEXIST/ENOENT where Linux reports EINVAL (ipc/sem.c:614-621); SEMMNI/SEMMNS default to 128/4096000 and are process-global rather than per-namespace 32000/1024000000 (include/uapi/linux/sem.h:80-85, ipc/sem.c:249-257)"]
 
 [[contract]]
 id = "linux-semop"
@@ -2893,7 +2893,7 @@ handler = "kernel/src/syscall/ipc/sem.rs:sys_semop"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object"]
+limitations = ["blocked operations are broadcast-woken and re-race the array lock instead of being completed in FIFO order by update_queue (ipc/sem.c:52-55, :974-992); a signal arriving after the waker already completed the operation is reported as EINTR instead of the completed result (ipc/sem.c:2191-2211); SEM_UNDO entries are capped thread-wide at SEMUME with ENOSPC where Linux sizes the adapter by the set and only fails with ENOMEM (ipc/sem.c:1941-1945)"]
 
 [[contract]]
 id = "linux-semctl"
@@ -2916,7 +2916,7 @@ handler = "kernel/src/syscall/ipc/sem.rs:sys_semctl"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/ipc/sem.rs:setval_clears_all_prior_owners_only_for_the_selected_semaphore", "kernel/src/syscall/ipc/sem.rs:setall_clears_every_prior_undo_adjustment"]
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object", "STAT/STAT_ANY treat the input as a complete flat identifier rather than Linux IDR index; INFO maximum-index reporting shares this representation"]
+limitations = ["blocked operations are broadcast-woken and re-race the array lock instead of being completed in FIFO order by update_queue (ipc/sem.c:52-55, :974-992); a signal arriving after the waker already completed the operation is reported as EINTR instead of the completed result (ipc/sem.c:2191-2211); SEM_UNDO entries are capped thread-wide at SEMUME with ENOSPC where Linux sizes the adapter by the set and only fails with ENOMEM (ipc/sem.c:1941-1945); semctl(GETPID) returns the global pid instead of pid_vnr() (ipc/sem.c:1548-1550), and exit-time undo updates sem_ctime instead of sem_otime and never republishes sempid (ipc/sem.c:2430-2438)"]
 
 [[contract]]
 id = "linux-semtimedop"
@@ -2939,7 +2939,7 @@ handler = "kernel/src/syscall/ipc/sem.rs:sys_semtimedop"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object"]
+limitations = ["blocked operations are broadcast-woken and re-race the array lock instead of being completed in FIFO order by update_queue (ipc/sem.c:52-55, :974-992); a signal arriving after the waker already completed the operation is reported as EINTR instead of the completed result (ipc/sem.c:2191-2211); SEM_UNDO entries are capped thread-wide at SEMUME with ENOSPC where Linux sizes the adapter by the set and only fails with ENOMEM (ipc/sem.c:1941-1945)"]
 
 [[contract]]
 id = "linux-shmget"
@@ -2962,7 +2962,7 @@ handler = "kernel/src/syscall/ipc/shm.rs:sys_shmget"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object", "SHM_HUGETLB returns EINVAL and SHM_NORESERVE reservation policy is not implemented"]
+limitations = ["SHM_HUGETLB returns EINVAL and SHM_NORESERVE reservation policy is not implemented - no hugetlb hstate pool and no overcommit accounting exist (ipc/shm.c:743-758, fs/hugetlbfs/inode.c:1515-1541); SHMMAX/SHMALL default to 0xFFFF_FFFF instead of ULONG_MAX-(1<<24), so IPC_INFO reports the wrong limits and shmget(size >= 2^32) is EINVAL rather than lazily backed (include/uapi/linux/shm.h:20-21, ipc/shm.c:112-113); the numpages<<PAGE_SHIFT overflow guard is absent, so a wrapped size can reach an unchecked align_up (ipc/shm.c:720-721); shm_rmid_forced does not exist, so a creator's exit never destroys an unattached segment (ipc/shm.c:358-363, :447-540)"]
 
 [[contract]]
 id = "linux-shmat"
@@ -2985,7 +2985,7 @@ handler = "kernel/src/syscall/ipc/shm.rs:sys_shmat"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object"]
+limitations = ["shm_nattch/shm_atime/shm_lpid count attachment records rather than VMAs, so a partial unmap or mprotect split is invisible (mm/vma.c:543-544, ipc/shm.c:293-299); an address above TASK_SIZE is EINVAL where Linux is ENOMEM (mm/mmap.c:858-859); re-attaching at a base whose record survived a partial unmap is EEXIST"]
 
 [[contract]]
 id = "linux-shmctl"
@@ -3008,7 +3008,7 @@ handler = "kernel/src/syscall/ipc/shm.rs:sys_shmctl"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest creation/removal/reuse, permissions and operation state matrix remains unexecuted"]
-limitations = ["Flat IPC identifiers can be reused without sequence validation; a stale identifier can resolve to a successor object", "STAT/STAT_ANY treat the input as a complete flat identifier rather than Linux IDR index; INFO maximum-index reporting shares this representation", "SHM_INFO reports reserved pages as resident pages instead of actual residency"]
+limitations = ["SHM_INFO reports reserved pages as resident pages instead of actual residency (the first shmat eagerly allocates every frame and resident_page_count() counts the whole segment, against inode->i_mapping->nrpages, ipc/shm.c:952); SHM_LOCK skips the RLIMIT_MEMLOCK==0 EPERM when a charge already exists and its budget is per IPC-namespace+real-uid (ipc/shm.c:1194-1206, mm/mlock.c:797-822); shm_rmid_forced is absent; /proc/sysvipc/shm masks SHM_DEST/SHM_LOCKED out of the perms column and prints whole-segment rss (ipc/shm.c:1860-1882)"]
 
 [[contract]]
 id = "linux-shmdt"
