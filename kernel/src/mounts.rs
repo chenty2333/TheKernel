@@ -662,26 +662,22 @@ impl MountTopology {
     /// 				"/", LOOKUP_DOWN, &root);
     /// ```
     ///
-    /// (`fs/namespace.c`:3699-3702).  `LOOKUP_DOWN` lands on the mount stacked
-    /// on top of the namespace root, which `init_mount_tree()` makes the
-    /// mutable rootfs.  A namespace with nothing stacked on top
+    /// (`fs/namespace.c`:6505, `mntns_install()`).  `LOOKUP_DOWN` lands on the
+    /// mount stacked on top of the namespace root, which `init_mount_tree()`
+    /// makes the mutable rootfs.  A namespace with nothing stacked on top
     /// (`CLONE_EMPTY_MNTNS`) roots its tasks at the namespace root itself.
+    ///
+    /// The walk follows the VFS attachment chain rather than the mount ledger:
+    /// a freshly cloned topology has no published records yet
+    /// (`try_prepare_clone_namespace()` commits them later), while
+    /// `clone(CLONE_NEWNS)` and `unshare(CLONE_NEWNS)` need this answer before
+    /// that commit.
     pub fn visible_root_location(&self) -> AxResult<Location> {
-        let snapshot = self.try_snapshot()?;
-        let top = snapshot
-            .mounts
-            .iter()
-            .find(|mount| mount.parent.is_none())
-            .ok_or(AxError::Io)?;
-        let visible = snapshot
-            .mounts
-            .iter()
-            .filter(|mount| mount.parent == Some(top.id))
-            .min_by_key(|mount| mount.id);
-        match visible {
-            Some(visible) => Ok(visible.mountpoint()?.root_location()),
-            None => Ok(top.mountpoint()?.root_location()),
+        let mut visible = self.root_location()?;
+        while let Some(covered) = visible.mounted_child() {
+            visible = covered.root_location();
         }
+        Ok(visible)
     }
 
     /// CLONE_NEWNS copies the mount graph while sharing superblocks and
