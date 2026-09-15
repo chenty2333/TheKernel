@@ -436,10 +436,24 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
                 Ok(()) => {}
             }
             let mut rules = ruleset.paths.lock();
-            // Bound retained inode references and fallible storage per ruleset.
-            if rules.len() >= 4096 {
-                return Err(LinuxError::E2BIG.into());
-            }
+            // Linux has no per-ruleset rule cap: `insert_rule()` reports -E2BIG
+            // only once `ruleset->num_rules >= LANDLOCK_MAX_NUM_RULES`, and
+            // that limit is U32_MAX (security/landlock/ruleset.c:281,
+            // security/landlock/limits.h:20):
+            //
+            // 	/* There is no match for @id. */
+            // 	build_check_ruleset();
+            // 	if (ruleset->num_rules >= LANDLOCK_MAX_NUM_RULES)
+            // 		return -E2BIG;
+            // 	new_rule = create_rule(id, layers, num_layers, NULL);
+            // 	if (IS_ERR(new_rule))
+            // 		return PTR_ERR(new_rule);
+            //
+            // The only way to fail before that boundary is `create_rule()`'s
+            // allocation, i.e. -ENOMEM -- which is what the fallible reservation
+            // below reports.  The previous fixed limit of 4096 rules answered
+            // -E2BIG long before Linux would, with an errno Linux reserves for
+            // a count that cannot be represented.
             rules.try_reserve(1).map_err(|_| AxError::NoMemory)?;
             rules.push(PathRule {
                 allowed: a.allowed,
@@ -467,10 +481,8 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
                 Ok(()) => {}
             }
             let mut rules = ruleset.ports.lock();
-            // Bound retained inode references and fallible storage per ruleset.
-            if rules.len() >= 4096 {
-                return Err(LinuxError::E2BIG.into());
-            }
+            // Same rule count as the path case: -E2BIG belongs to the U32_MAX
+            // boundary, not to a capacity this kernel invented.
             rules.try_reserve(1).map_err(|_| AxError::NoMemory)?;
             rules.push(NetRule {
                 allowed: a.allowed,
