@@ -62,6 +62,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
 
     def test_common_config_builds_an_ext2_image_against_linux_6_12_headers(self) -> None:
         common = self.read("common.config")
+        self.assertIn('BR2_TAR_OPTIONS="--no-same-owner"', common)
         self.assertIn("BR2_TARGET_ROOTFS_EXT2=y", common)
         self.assertNotIn("BR2_ROOTFS_EXT2=y", common)
         # The guest UAPI oracles must compile against the same 6.12 headers as
