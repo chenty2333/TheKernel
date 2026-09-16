@@ -690,6 +690,11 @@ pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo, pi
         if adjustment.serial != array.serial {
             continue;
         }
+        // `exit_sem()` skips entries whose adjustment is zero before it
+        // updates `sempid` or stamps `sem_otime` (`ipc/sem.c:continue`).
+        if adjustment.value == 0 {
+            continue;
+        }
         let changed = {
             let Some(sem) = array.sems.get_mut(semnum as usize) else {
                 continue;
@@ -1639,6 +1644,12 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
                 serial: array.serial,
                 staged: Vec::new(),
             };
+            // Every staged entry is bounded by the operation vector, so a
+            // single reservation keeps the push in `check()` infallible.
+            undo_check
+                .staged
+                .try_reserve(ops.len())
+                .map_err(|_| AxError::NoMemory)?;
             match try_apply_semops(&mut array, &ops, current_pid, &mut undo_check)? {
                 SemTryResult::Ready => {
                     if let Some(undo) = undo_guard.as_deref_mut() {

@@ -259,10 +259,15 @@ fn write_shmid_ds<M: UserMemory + ?Sized>(
     ptr: *mut ShmidDs,
     value: &ShmidDs,
 ) -> AxResult<()> {
+    // `shm_cpid`/`shm_lpid` are stored as kernel-wide task-group identities
+    // and rendered with `pid_vnr()` for the *reader's* PID namespace
+    // (`ipc/shm.c` shmctl IPC_STAT).
+    let mut value = initialized_shmid_ds(value);
+    value.shm_cpid = super::render_task_pid(value.shm_cpid as Pid);
+    value.shm_lpid = super::render_task_pid(value.shm_lpid as Pid);
     // SAFETY: `initialized_shmid_ds` zeroes every padding byte and the layout
     // assertions above cover the complete Linux object extent.
-    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_shmid_ds(value)) }
-        .map_err(map_usercopy_error)
+    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, value) }.map_err(map_usercopy_error)
 }
 
 fn write_ipc_info<M: UserMemory + ?Sized>(
@@ -2557,8 +2562,8 @@ pub(crate) fn sysvipc_shm_snapshot() -> AxResult<String> {
             shmid,
             ds.shm_perm.mode & 0o777,
             ds.shm_segsz,
-            ds.shm_cpid,
-            ds.shm_lpid,
+            super::render_task_pid(ds.shm_cpid as Pid),
+            super::render_task_pid(ds.shm_lpid as Pid),
             ds.shm_nattch,
             ds.shm_perm.uid,
             ds.shm_perm.gid,

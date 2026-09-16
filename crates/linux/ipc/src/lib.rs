@@ -494,7 +494,7 @@ impl IpcIdTable {
             .ok_or(IpcError::NoSpace)?;
         if index <= self.last_index {
             self.sequence += 1;
-            if self.sequence >= IPCID_SEQ_MAX {
+            if self.sequence > IPCID_SEQ_MAX {
                 self.sequence = 0;
             }
         }

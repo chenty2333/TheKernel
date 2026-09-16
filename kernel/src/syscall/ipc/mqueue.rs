@@ -1764,7 +1764,9 @@ fn try_mq_receive<M: UserMemory + ?Sized>(
     if !msg_prio.is_null() {
         VmMutPtr::vm_write(msg_prio, memory, message.priority).map_err(map_usercopy_error)?;
     }
-    vm_write_slice(memory, msg_ptr, &message.data).map_err(map_usercopy_error)?;
+    if !msg_ptr.is_null() {
+        vm_write_slice(memory, msg_ptr, &message.data).map_err(map_usercopy_error)?;
+    }
     Ok(message.data.len() as isize)
 }
 
@@ -1785,9 +1787,11 @@ pub fn sys_mq_timedreceive<M: UserMemory + ?Sized>(
         // Linux checks `msg_len < info->attr.mq_msgsize` before it takes
         // `info->lock`, so a buffer that cannot hold the queue's maximum
         // message is `-EMSGSIZE` even on an empty queue where `O_NONBLOCK`
-        // would otherwise report `-EAGAIN`.
+        // would otherwise report `-EAGAIN`. `do_mq_timedreceive()` waives the
+        // check when both the buffer pointer and the length are absent
+        // (`msg_ptr || msg_len`), letting a receive discard the payload.
         let queue = file.queue.lock();
-        if msg_len < queue.msgsize {
+        if msg_len < queue.msgsize && (!msg_ptr.is_null() || msg_len != 0) {
             return Err(AxError::from(LinuxError::EMSGSIZE));
         }
     }
