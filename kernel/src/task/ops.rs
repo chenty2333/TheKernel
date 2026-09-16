@@ -2463,16 +2463,26 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     let exit_memory = UserMemoryCapability::new(thr.proc_data.aspace());
     let clear_child_tid = thr.clear_child_tid() as *mut u32;
     if !clear_child_tid.is_null() {
-        // Linux attempts FUTEX_WAKE even when clearing the user word faults.
-        // Both operations are best-effort during terminal task teardown.
-        let _ = exit_memory
-            .write_value(clear_child_tid, 0u32)
-            .map_err(map_usercopy_error);
-        let key = FutexKey::new_current(clear_child_tid as usize);
-        let table = futex_table_for(&key);
-        let guard = table.get(&key);
-        if let Some(futex) = guard {
-            futex.wq.wake(1, u32::MAX);
+        // Linux `kernel/fork.c:mm_release()` publishes the tid word and wakes
+        // its futex only while another user still holds the mm
+        // (`mm_users > 1`); the last user's address space is being destroyed,
+        // so its word is left intact for whoever else maps it. A non-final
+        // exit still has a live sibling thread, and a live `CLONE_VM` peer
+        // process is one owner beyond the image binding and the borrowed
+        // `exit_memory` handle that a sole owner holds.
+        let mm_shared = final_exit.is_none() || Arc::strong_count(exit_memory.address_space()) > 2;
+        if mm_shared {
+            // Linux attempts FUTEX_WAKE even when clearing the user word
+            // faults. Both operations are best-effort during teardown.
+            let _ = exit_memory
+                .write_value(clear_child_tid, 0u32)
+                .map_err(map_usercopy_error);
+            let key = FutexKey::new_current(clear_child_tid as usize);
+            let table = futex_table_for(&key);
+            let guard = table.get(&key);
+            if let Some(futex) = guard {
+                futex.wq.wake(1, u32::MAX);
+            }
         }
     }
     let head = thr.robust_list_head() as *const RobustListHead;
