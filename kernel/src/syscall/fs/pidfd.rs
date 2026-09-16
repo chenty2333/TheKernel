@@ -2,13 +2,13 @@ use alloc::sync::Arc;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::{AxTaskRef, current};
-use linux_raw_sys::general::SI_TKILL;
+use linux_raw_sys::general::{O_EXCL, O_NONBLOCK, O_RDWR, SI_TKILL};
 use tk_linux_process::{Pid, PidfdPlan};
 use tk_linux_signal::{SignalInfo, api::ThreadSignalManager};
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
 use crate::{
-    file::{Directory, FileHandle, FileLike, PidFd, add_file_description},
+    file::{Directory, FileHandle, FileLike, PidFd, add_file_description, add_file_like_with_flags},
     mm::map_usercopy_error,
     pseudofs::{ProcDirProcess, process_data_from_proc_dir},
     syscall::signal::{
@@ -448,6 +448,13 @@ fn check_pidfd_getfd_permission(
     }
     let target_image = pidfd.image_access_snapshot()?;
     check_current_ptrace_image_snapshot(target, &target_image, PtraceAccessMode::AttachReal)?;
+    // kernel/pid.c:889-893: the ptrace verdict precedes the exit verdict, and
+    // an exiting target is ESRCH because its descriptor table is no longer a
+    // valid source (kernel/pid.c:905-907 maps the freed files_struct to ESRCH
+    // too).
+    if target.proc.is_zombie() {
+        return Err(AxError::NoSuchProcess);
+    }
     Ok(target_image)
 }
 
@@ -468,13 +475,35 @@ pub fn sys_pidfd_open(pid: i32, flags: u32) -> AxResult<isize> {
         let task = get_visible_task(target)?;
         PidFd::new_thread(&task)?
     } else {
-        PidFd::new_process(&get_process_data(target)?)
+        match get_process_data(target) {
+            Ok(process) => PidFd::new_process(&process),
+            // kernel/fork.c:1911-1919: a reaped pid is ESRCH, but a live pid
+            // that is not a thread-group leader has no process pidfd and is
+            // reported as ENOENT unless PIDFD_THREAD was requested.
+            Err(error) => {
+                if error == AxError::NoSuchProcess && get_visible_task(target).is_ok() {
+                    return Err(AxError::NotFound);
+                }
+                return Err(error);
+            }
+        }
     };
     if plan.nonblocking {
         fd.set_nonblocking(true)?;
     }
 
-    fd.add_to_fd_table(true).map(|fd| fd as _)
+    // fs/pidfs.c:932-944: the descriptor is created with O_RDWR, PIDFD_THREAD
+    // is carried as O_EXCL, and PIDFD_NONBLOCK is carried as O_NONBLOCK, so
+    // F_GETFL reproduces the requested flags exactly.
+    let mut status = O_RDWR;
+    if plan.nonblocking {
+        status |= O_NONBLOCK;
+    }
+    if plan.thread {
+        status |= O_EXCL;
+    }
+    let file = Arc::try_new(fd).map_err(|_| AxError::NoMemory)?;
+    add_file_like_with_flags(file, true, status).map(|fd| fd as _)
 }
 
 pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize> {
@@ -483,7 +512,13 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize
     if flags != 0 {
         return Err(AxError::InvalidInput);
     }
-    let pidfd = PidFd::from_fd(pidfd)?;
+    // fs/pidfs.c:706-711 pidfd_pid() reports EBADF for any descriptor whose
+    // file operations are not pidfs, exactly like the fd_empty() EBADF at
+    // kernel/pid.c:967-969 for a closed descriptor.
+    let pidfd = PidFd::from_fd(pidfd).map_err(|error| match error {
+        AxError::InvalidInput => AxError::BadFileDescriptor,
+        error => error,
+    })?;
     let proc_data = pidfd.process_data()?;
     let authorized_image = check_pidfd_getfd_permission(&pidfd, &proc_data)?.into_aspace();
     let target = match pidfd.signal_thread_task()? {
