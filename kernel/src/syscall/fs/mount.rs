@@ -4730,6 +4730,15 @@ fn move_attached_mount(source: &Location, target: &Location, flags: u32) -> AxRe
     if !source.is_root_of_mount() {
         return Err(AxError::InvalidInput);
     }
+    // `do_move_mount()` (fs/namespace.c:3642-3643) compares the directory-ness
+    // of the placement pair before any namespace admission:
+    //     if (d_is_dir(new_path->dentry) != d_is_dir(old_path->dentry))
+    //             return -EINVAL;
+    // A directory mount placed on a regular file (and the reverse) is EINVAL,
+    // not the EIO an unusable placement path would otherwise report.
+    if source.is_dir() != target.is_dir() {
+        return Err(AxError::InvalidInput);
+    }
     ensure_current_move_mount_location(source)?;
     ensure_current_move_mount_location(target)?;
     if flags & MOVE_MOUNT_SET_GROUP != 0 {
@@ -4810,6 +4819,12 @@ pub fn sys_move_mount<M: UserMemory + ?Sized>(
                     return Ok(0);
                 }
                 if flags & MOVE_MOUNT_SET_GROUP != 0 {
+                    return Err(AxError::InvalidInput);
+                }
+                // A detached tree carries its own root, so `do_move_mount()`'s
+                // directory-ness comparison (fs/namespace.c:3642-3643) applies
+                // to the descriptor rather than to a namespace path.
+                if mount_fd.root.is_dir() != target.is_dir() {
                     return Err(AxError::InvalidInput);
                 }
                 let target = if flags & MOVE_MOUNT_BENEATH != 0 {
