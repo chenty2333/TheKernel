@@ -2509,9 +2509,14 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         // Sample first: discarding private pages below must not erase the
         // process high-water mark that Linux retains in its signal struct.
         let _ = thr.proc_data.sample_maxrss_kb();
-        let aspace = thr.proc_data.aspace();
-        if Arc::strong_count(&aspace) == 2 {
-            let mut aspace = aspace.lock();
+        // Count through `exit_memory` rather than through a fresh handle: the
+        // process image binding holds one reference and `exit_memory` holds the
+        // other, so a sole owner counts exactly two, the same two that
+        // `mm_shared` above sees.  Taking `thr.proc_data.aspace()` here would
+        // add a third reference of its own and make this branch unreachable, so
+        // a zombie's private pages would stay resident until it was reaped.
+        if Arc::strong_count(exit_memory.address_space()) == 2 {
+            let mut aspace = exit_memory.address_space().lock();
             if let Ok(true) = aspace.begin_oom_reap() {
                 let _ = aspace.oom_reap_private_pages();
                 aspace.finish_oom_reap();
