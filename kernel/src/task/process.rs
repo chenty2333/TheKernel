@@ -3652,6 +3652,11 @@ pub struct ProcessData {
     exit_fd_table: Arc<FdTable>,
     /// Authoritative Linux ABI memory layout. See [`ProcessMmLayout`].
     mm_layout: RwLock<ProcessMmLayout>,
+    /// Serializes a whole `brk` transaction — limit classification, VMA
+    /// growth/shrink, and the final break publication — the way Linux's
+    /// `mmap_write_lock` does in `SYSCALL_DEFINE1(brk)`.  Without it two
+    /// concurrent brk calls could classify against the same stale break.
+    brk_lock: Mutex<()>,
     /// `signal_struct::timer_create_restore_ids`, the CRIU timer-restore mode.
     timer_restore_ids: AtomicBool,
     /// `signal_struct::autoreap`, set only by `clone3(CLONE_AUTOREAP)`.
@@ -3768,9 +3773,11 @@ pub struct ProcessData {
     ptrace_tracees: SpinNoIrq<PtraceReverseLinks>,
     /// Multi-thread exec coordination state.
     exec_ctl: SpinNoIrq<ExecControlState>,
-    /// Count of threads that have entered `do_exit()`; the counterpart of
-    /// Linux `signal->quick_threads`.
-    exit_started_threads: AtomicUsize,
+    /// Count of live threads that have not entered `do_exit()`; the
+    /// counterpart of Linux `signal->quick_threads`.  Thread admission raises
+    /// it and `do_exit()` entry lowers it, so `all_threads_exiting()` is
+    /// exactly the count reaching zero.
+    quick_threads: AtomicUsize,
     /// Serializes setpgid with successful exec publication; fork starts false.
     pub(crate) exec_committed: Mutex<bool>,
     /// CLONE_VFORK coordination state.
@@ -4067,6 +4074,7 @@ impl ProcessThreadAdmission {
             pending,
         } = self;
         let outcome = membership.commit_infallible();
+        pending.proc_data.note_thread_admitted();
         PendingThreadPublication {
             pending,
             group_exited_at_core: outcome
@@ -4110,6 +4118,7 @@ impl InitialProcessThreadAdmission {
                 .commit()
                 .expect("scoped init publication lost its reserved reaper scope"),
         };
+        pending.proc_data.note_thread_admitted();
         (
             process,
             PendingThreadPublication {
@@ -4196,6 +4205,7 @@ impl ProcessData {
             scope: RwLock::new(scope),
             exit_fd_table,
             mm_layout: RwLock::new(ProcessMmLayout::initial()),
+            brk_lock: Mutex::new(()),
             // `copy_signal()` allocates a zeroed `signal_struct` and copies
             // neither bit, so every process starts with both off; only
             // `clone3(CLONE_AUTOREAP)` and the timer prctl turn them on.
@@ -4250,7 +4260,7 @@ impl ProcessData {
             ptrace_signal: Mutex::new(None),
             ptrace_tracees: SpinNoIrq::new(PtraceReverseLinks::default()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
-            exit_started_threads: AtomicUsize::new(0),
+            quick_threads: AtomicUsize::new(0),
             exec_committed: Mutex::new(false),
             vfork_ctl: SpinNoIrq::new(VforkControlState::default()),
             stop_event,
@@ -4283,8 +4293,7 @@ impl ProcessData {
     /// very first act of `do_exit()`.  A thread created afterwards raises the
     /// live count again, just as a new `copy_process()` raises `quick_threads`.
     pub(crate) fn all_threads_exiting(&self) -> bool {
-        let exiting = self.exit_started_threads.load(Ordering::Acquire);
-        exiting != 0 && exiting >= self.proc.thread_count()
+        self.quick_threads.load(Ordering::Acquire) == 0
     }
 
     /// Returns whether Linux `mm/oom_kill.c:__task_will_free_mem()` would
@@ -4300,19 +4309,33 @@ impl ProcessData {
     pub(crate) fn oom_reap_eligible(&self) -> bool {
         tk_linux_mm::task_dying(tk_linux_mm::FreeMemFacts {
             group_exit: self.group_exit_in_progress() || self.all_threads_exiting(),
-            thread_group_empty: self.proc.thread_count() <= 1,
+            thread_group_empty: self.target_thread_group_empty(),
             pf_exiting: self.all_threads_exiting(),
             ..Default::default()
         })
     }
 
-    /// Records that one thread of this process has entered `do_exit()`.
-    ///
-    /// The counter is monotone, exactly like Linux's `quick_threads`
-    /// decrement: it is never undone, and thread creation is accounted for by
-    /// comparing against the live thread count instead.
+    /// Linux `thread_group_empty(task)` for the task a process pidfd
+    /// addresses: the group leader.  The leader's `thread_group` list is
+    /// empty exactly when no sibling thread is still live — a live leader at
+    /// a live count of one, or an already detached (zombie) leader once the
+    /// live count reaches zero.
+    fn target_thread_group_empty(&self) -> bool {
+        self.proc.has_only_thread(self.proc.pid()) || self.proc.thread_count() == 0
+    }
+
+    /// Records the admission of one live thread, the local counterpart of
+    /// `copy_process()` raising `quick_threads`.
+    pub(crate) fn note_thread_admitted(&self) {
+        self.quick_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records that one thread of this process has entered `do_exit()`,
+    /// lowering the not-yet-exiting live count exactly like Linux's
+    /// `quick_threads` decrement in `synchronize_group_exit()`.
     pub(crate) fn note_thread_exit_started(&self) {
-        self.exit_started_threads.fetch_add(1, Ordering::AcqRel);
+        let previous = self.quick_threads.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "quick_threads underflow");
     }
 
     pub(crate) fn allocate_pkey(&self) -> AxResult<u8> {
@@ -4700,6 +4723,11 @@ impl ProcessData {
     /// Get the top address of the user heap.
     pub fn get_heap_top(&self) -> usize {
         self.mm_layout.read().brk
+    }
+
+    /// Serializes one `brk` transaction against all others on this mm.
+    pub(crate) fn brk_lock(&self) -> &Mutex<()> {
+        &self.brk_lock
     }
 
     pub fn heap_base(&self) -> usize {

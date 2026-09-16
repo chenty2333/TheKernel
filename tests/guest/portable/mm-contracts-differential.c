@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1174,6 +1176,28 @@ static void msync_extra_case(void) {
 /* ------------------------------------------ process_madvise(440) and
                                                 process_mrelease(448) ---- */
 
+static void *plain_exit_thread(void *arg) {
+    int ready = *(int *)arg;
+    /* exit(2) retires only this thread; the leader stays alive. */
+    if (write(ready, "x", 1) != 1) _exit(1);
+    syscall(SYS_exit, 0);
+    return NULL;
+}
+
+static int thread_task_count(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/task", pid);
+    DIR *dir = opendir(path);
+    if (!dir) return -1;
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (entry->d_name[0] != '.') ++count;
+    }
+    closedir(dir);
+    return count;
+}
+
 static void remote_extra_case(void) {
     begin("process-mrelease.raw-differential");
     unsigned char *p = pages(1);
@@ -1219,6 +1243,47 @@ static void remote_extra_case(void) {
     check(write(sync[1], "x", 1) == 1, "process-release-signal");
     check(close(sync[1]) == 0, "process-release-close");
     reap(pid, 0);
+
+    /* One thread of a multi-threaded process calling exit(2) (not
+       exit_group(2)) leaves the group alive: the leader is neither
+       thread_group_empty() nor is the group exiting, so mrelease must
+       answer EINVAL rather than reap the still-live mm. */
+    int ready[2], release[2];
+    check(pipe(ready) == 0 && pipe(release) == 0, "thread-exit-pipes");
+    fflush(NULL);
+    pid = fork();
+    check(pid >= 0, "fork-thread-exit-child");
+    if (!pid) {
+        close(ready[0]); close(release[1]);
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, plain_exit_thread, &ready[1]) != 0)
+            _exit(1);
+        char byte;
+        if (read(release[0], &byte, 1) != 1) _exit(1);
+        _exit(0);
+    }
+    close(ready[1]); close(release[0]);
+    char byte;
+    check(read(ready[0], &byte, 1) == 1, "thread-exit-ready");
+    check(close(ready[0]) == 0, "thread-exit-ready-close");
+    /* Wait until the exited thread has fully left the thread group so the
+       eligibility snapshot is exact on any kernel. */
+    int tasks = 0;
+    for (int i = 0; i < 10000 && tasks != 1; ++i) {
+        usleep(1000);
+        tasks = thread_task_count(pid);
+    }
+    check(tasks == 1, "thread-exit-detached");
+    pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
+    if (pidfd >= 0) {
+        ERROR(syscall(NR_PROCESS_MRELEASE, pidfd, 0), EINVAL,
+              "process-mrelease-one-thread-exited");
+        check(close(pidfd) == 0, "thread-exit-pidfd-close");
+    }
+    check(write(release[1], "x", 1) == 1, "thread-exit-release");
+    check(close(release[1]) == 0, "thread-exit-release-close");
+    reap(pid, 0);
+    mark("PARTIAL_THREAD_EXIT_EINVAL");
     done();
 }
 
