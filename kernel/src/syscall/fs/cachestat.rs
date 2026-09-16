@@ -16,7 +16,7 @@ use crate::{
         FileLike, get_file_like,
         permission::{
             VfsSecurityContext, check_inode_permissions_with_security_and_idmap,
-            inode_owner_and_fowner_with_idmap,
+            check_pseudo_inode_permissions_with_security, inode_owner_and_fowner_with_idmap,
         },
     },
     mm::map_usercopy_error,
@@ -44,7 +44,16 @@ fn can_do_cachestat(
 ) -> AxResult<(bool, bool, bool, bool)> {
     let write_open = cachestat_write_open(status_flags);
     let Some(location) = file.cachestat_location() else {
-        return Ok((write_open, false, false, false));
+        // Objects outside every vfsmount (anonymous pipes and sockets) still
+        // own a pseudo inode, and Linux authorizes them through exactly the
+        // same `can_do_cachestat()` on `file_inode(file)`
+        // (mm/filemap.c:4700-4730) instead of denying the query.  Such an
+        // inode is never reached through a mount, so no mount idmap applies.
+        let metadata = super::ctl::pseudo_metadata(&file.stat()?);
+        let (owns_inode, fowner_capable) = cachestat_owner_and_fowner(&metadata, security, None);
+        let may_write = !(write_open || owns_inode || fowner_capable)
+            && check_pseudo_inode_permissions_with_security(&metadata, W_OK, security).is_ok();
+        return Ok((write_open, owns_inode, fowner_capable, may_write));
     };
     let metadata = location.metadata()?;
     let (owns_inode, fowner_capable) = cachestat_owner_and_fowner(&metadata, security, idmap);
@@ -84,8 +93,15 @@ pub(crate) fn sys_cachestat<M: UserMemory + ?Sized>(
     output: *mut Cachestat,
     flags: u32,
 ) -> AxResult<isize> {
-    // EBADF must win over an invalid range pointer.
+    // EBADF must win over an invalid range pointer. Linux takes the
+    // description with CLASS(fd, f), i.e. `fdget()`, which refuses an O_PATH
+    // description (fs/file.c:1196 `__fget_light` returns EMPTY_FD when
+    // `FMODE_PATH` is set) before `struct cachestat_range` is copied in
+    // (mm/filemap.c:4759-4766).
     let file = get_file_like(fd)?;
+    if file.is_path_only() {
+        return Err(AxError::BadFileDescriptor);
+    }
     let range = VmPtr::vm_read(range, memory).map_err(map_usercopy_error)?;
 
     // Linux classifies hugetlbfs immediately after range copyin. Do not run

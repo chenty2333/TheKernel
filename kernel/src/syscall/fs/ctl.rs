@@ -2027,7 +2027,7 @@ fn update_times<M: UserMemory + ?Sized>(
     }
 }
 
-fn pseudo_metadata(stat: &crate::file::Kstat) -> axfs_ng_vfs::Metadata {
+pub(crate) fn pseudo_metadata(stat: &crate::file::Kstat) -> axfs_ng_vfs::Metadata {
     axfs_ng_vfs::Metadata {
         device: stat.dev,
         inode: stat.ino,
