@@ -21,8 +21,8 @@ use linux_raw_sys::{
 };
 use tk_linux_cred::{InodeSetattrProposal, InodeTimestampIntent, InodeTimestampValue};
 use tk_linux_usercopy::{
-    UserCopyError, UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul,
-    vm_load_until_nul_bounded, vm_write_slice,
+    UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul, vm_load_until_nul_bounded,
+    vm_load_until_nul_trunc, vm_write_slice,
 };
 
 use super::admit_chown;
@@ -636,12 +636,10 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
     // (fs/ioctl.c:492-581).
     //
     // `sys_ioctl()` runs `do_vfs_ioctl()` before it ever calls
-    // `->unlocked_ioctl`, and `do_dentry_open()` installs an empty
-    // `file_operations` table for every `O_PATH` description
-    // (fs/open.c:888-901).  These commands are therefore available on an
-    // `O_PATH` descriptor: only a command that falls through to the provider
-    // is refused by that empty table.  They are reproduced here at the same
-    // point of the generic layer, ahead of `check_io_access()`.
+    // `->unlocked_ioctl`.  They are reproduced here at the same point of the
+    // generic layer, after `check_io_access()`: unlike Linux's `fdget()` the
+    // lookup above does not special-case `O_PATH`, so every command --
+    // generic or provider -- is `-EBADF` on an `O_PATH` descriptor.
     // ------------------------------------------------------------------
     let inode_type = ioctl_inode_type(&f);
     if cmd == FIOCLEX || cmd == FIONCLEX {
@@ -844,6 +842,10 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
             if !current().as_thread().has_effective_capability(CAP_SYS_RAWIO) {
                 return Err(AxError::OperationNotPermitted);
             }
+            // No provider here implements a `->bmap` block mapping, and
+            // `ioctl_fibmap()` answers `-EINVAL` when
+            // `inode->i_mapping->a_ops->bmap` is missing.
+            return Err(AxError::InvalidInput);
         } else if let Some(mode) = preallocate_mode(cmd) {
             // fs/ioctl.c `ioctl_preallocate()` (fs/ioctl.c:268-289) copies a
             // `struct space_resv`, resolves its offset against
@@ -2676,11 +2678,8 @@ pub fn sys_reboot<M: UserMemory + ?Sized>(
     // bytes and still restarts (strncpy_from_user reports the truncation as a
     // byte count, not an error).
     let restart_command = if cmd as u32 == LINUX_REBOOT_CMD_RESTART2 {
-        match vm_load_until_nul_bounded(memory, arg.cast::<u8>(), REBOOT_RESTART2_SCAN) {
-            Ok(command) => command,
-            Err(UserCopyError::TooLong) => Vec::new(),
-            Err(error) => return Err(map_usercopy_error(error)),
-        }
+        vm_load_until_nul_trunc(memory, arg.cast::<u8>(), REBOOT_RESTART2_SCAN)
+            .map_err(map_usercopy_error)?
     } else {
         Vec::new()
     };

@@ -22,15 +22,15 @@ use axhal::{
 };
 use axpoll::IoEvents;
 use axtask::future;
-use linux_raw_sys::general::{AT_FDCWD, RESOLVE_IN_ROOT};
+use linux_raw_sys::general::{AT_FDCWD, CAP_SYS_ADMIN, RESOLVE_IN_ROOT};
 use memory_addr::PAGE_SIZE_4K;
 use spin::Mutex;
 use tk_linux_io_uring::{
     BufferSlot, EnterFlags, EnterRequest, FeatureFlags, FileTarget, IO_URING_PARAMS_BYTES,
     IoUringError, IoUringGeteventsArg, IoUringParams, LegacySignalMask, ParsedSubmission,
-    PreparedRequest, ReadWriteRequest, RegistrationOperation, RegistrationRequest, SetupRequest,
-    RegistrationDispatch, SubmissionOperation, TerminalCause, UnsupportedOutcome,
-    UnsupportedRegistration, encode_probe, probe_output_bytes,
+    PreparedRequest, ReadWriteRequest, RegistrationDispatch, RegistrationHeader,
+    RegistrationOperation, RegistrationRequest, SetupRequest, SubmissionOperation, TerminalCause,
+    UnsupportedOutcome, UnsupportedRegistration, encode_probe, probe_output_bytes,
 };
 use tk_linux_signal::SignalSet;
 
@@ -125,6 +125,11 @@ static REGISTERED_RINGS: Mutex<BTreeMap<u64, RegisteredRingTable>> = Mutex::new(
 /// own TID-keyed object so an empty index table cannot change unregister's
 /// usercopy ordering.
 static IO_URING_TASK_CONTEXTS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+
+/// Per-task restriction publications of `io_register_restrictions_task()`
+/// (`io_uring/register.c:201-240`).  Linux allows a task to register its
+/// restriction exactly once; a second attempt is -EPERM.
+static IO_URING_TASK_RESTRICTIONS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 
 fn current_task_context_id() -> u64 {
     axtask::current().as_thread().kernel_tid() as u64
@@ -592,6 +597,7 @@ fn unregister_ring_fds(
 /// during teardown.
 pub(crate) fn release_registered_ring_fds(task: u64) {
     IO_URING_TASK_CONTEXTS.lock().remove(&task);
+    IO_URING_TASK_RESTRICTIONS.lock().remove(&task);
     REGISTERED_RINGS.lock().remove(&task);
 }
 
@@ -774,6 +780,14 @@ pub fn sys_io_uring_register(
         RegistrationDispatch::Ring
     };
     if dispatch == RegistrationDispatch::Blind {
+        // `io_register_restrictions_task()` admits the caller before it looks
+        // at the record: an already-restricted task is -EPERM, and a caller
+        // without `no_new_privs` or CAP_SYS_ADMIN is -EACCES
+        // (`io_uring/register.c:206-209`), both ahead of the `nr_args` and
+        // copy_from_user() checks that `decode` reproduces.
+        if request.blind_task_restriction() {
+            admit_task_restriction_registration()?;
+        }
         let operation = request.decode(dispatch).map_err(map_policy_error)?;
         return blind_registration(&capability, operation);
     }
@@ -849,10 +863,38 @@ pub fn sys_io_uring_register(
         // (`io_uring/query.c:125-131`), with or without a ring.
         RegistrationOperation::QueryEmpty => return Ok(0),
         RegistrationOperation::Unsupported(unsupported) => {
+            // `io_eventfd_register()` answers -EBUSY from the published
+            // eventfd before it reads the caller's descriptor
+            // (`io_uring/eventfd.c:127-134`); the async variant shares that
+            // body (`io_uring/register.c:807-811`), so the state check
+            // outranks the record copy below as well.
+            if unsupported.header() == RegistrationHeader::EventFdDescriptor
+                && ring.completion_eventfd_registered()
+            {
+                return Err(AxError::ResourceBusy);
+            }
             return Err(unsupported_registration(&capability, unsupported));
         }
     }
     Ok(0)
+}
+
+/// Applies the task admission of `io_register_restrictions_task()`, which
+/// precedes that entry's `nr_args` and copy_from_user() checks
+/// (`io_uring/register.c:206-209`).
+fn admit_task_restriction_registration() -> AxResult<()> {
+    let current = axtask::current();
+    let thread = current.as_thread();
+    if IO_URING_TASK_RESTRICTIONS
+        .lock()
+        .contains(&(thread.kernel_tid() as u64))
+    {
+        return Err(AxError::from(LinuxError::EPERM));
+    }
+    if !thread.no_new_privs() && !thread.has_effective_capability(CAP_SYS_ADMIN) {
+        return Err(AxError::from(LinuxError::EACCES));
+    }
+    Ok(())
 }
 
 /// Answers one registration record dispatched without a ring.

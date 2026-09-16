@@ -66,13 +66,35 @@ impl<M: UserMemory + ?Sized> UserMemoryContext<'_, M> {
         ptr: *const T,
         scan_elements: usize,
     ) -> VmResult<Vec<T>> {
+        // SAFETY: forwarded from this function's caller.
+        unsafe { self.load_any_until_nul_inner(ptr, scan_elements, false) }
+    }
+
+    /// Shared scan loop behind the bounded NUL-terminated loads.  When
+    /// `truncate` is set an exhausted budget reports the elements scanned so
+    /// far (`strncpy_from_user()` semantics) instead of `TooLong`.
+    ///
+    /// # Safety
+    ///
+    /// Same representation and sentinel requirements as
+    /// `load_any_until_nul_bounded()`.
+    unsafe fn load_any_until_nul_inner<T>(
+        &mut self,
+        ptr: *const T,
+        scan_elements: usize,
+        truncate: bool,
+    ) -> VmResult<Vec<T>> {
         let size = core::mem::size_of::<T>();
         if size == 0 {
             return Err(UserCopyError::BadAddress);
         }
         let max_elements = scan_elements.min(MAX_NUL_SEARCH_BYTES / size);
         if max_elements == 0 {
-            return Err(UserCopyError::TooLong);
+            return if truncate {
+                Ok(Vec::new())
+            } else {
+                Err(UserCopyError::TooLong)
+            };
         }
 
         let start = ptr as usize;
@@ -99,7 +121,7 @@ impl<M: UserMemory + ?Sized> UserMemoryContext<'_, M> {
             // is guaranteed by the caller.
             unsafe { result.set_len(old_len + len) };
         }
-        Err(UserCopyError::TooLong)
+        if truncate { Ok(result) } else { Err(UserCopyError::TooLong) }
     }
 
     /// Loads `Pod` values until a zero value appears or the bound is hit.
@@ -123,6 +145,20 @@ impl<M: UserMemory + ?Sized> UserMemoryContext<'_, M> {
         // SAFETY: `Pod` guarantees that every representation is valid and that
         // the all-zero representation is valid.
         unsafe { self.load_any_until_nul_bounded(ptr, scan_elements) }
+    }
+
+    /// Loads `Pod` values until an all-zero value appears, truncating to the
+    /// scan budget the way `strncpy_from_user()` does instead of failing with
+    /// `UserCopyError::TooLong`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // Pointer is an opaque user address, never dereferenced.
+    pub fn load_until_nul_trunc<T: Pod>(
+        &mut self,
+        ptr: *const T,
+        scan_elements: usize,
+    ) -> VmResult<Vec<T>> {
+        // SAFETY: `Pod` guarantees that every representation is valid and that
+        // the all-zero representation is valid.
+        unsafe { self.load_any_until_nul_inner(ptr, scan_elements, true) }
     }
 }
 
@@ -198,6 +234,16 @@ pub fn vm_load_until_nul_bounded<M: UserMemory + ?Sized, T: Pod>(
     scan_elements: usize,
 ) -> VmResult<Vec<T>> {
     memory.load_until_nul_bounded(ptr, scan_elements)
+}
+
+/// Loads a NUL-terminated vector through an explicit context, truncating to
+/// the element-count scan budget instead of failing with `TooLong`.
+pub fn vm_load_until_nul_trunc<M: UserMemory + ?Sized, T: Pod>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const T,
+    scan_elements: usize,
+) -> VmResult<Vec<T>> {
+    memory.load_until_nul_trunc(ptr, scan_elements)
 }
 
 fn is_zero_uninit<T>(value: &core::mem::MaybeUninit<T>) -> bool {

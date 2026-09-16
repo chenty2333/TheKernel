@@ -581,6 +581,31 @@ fn normalize_legacy_open_flags(flags: i32) -> AxResult<i32> {
     Ok(flags as i32)
 }
 
+fn openat2_dirfd_base(
+    files: &Arc<crate::file::FdTable>,
+    dirfd: c_int,
+    retained_dirfd: Option<&Arc<FileDescription>>,
+    path: &FsPath,
+) -> AxResult<Location> {
+    let description = retained_dirfd
+        .cloned()
+        .unwrap_or(files.get_description(dirfd)?);
+    // An empty name is only admissible with O_EMPTYPATH (checked during
+    // copied-input validation), where LOOKUP_EMPTY targets the descriptor
+    // itself via `fdget_raw()` (fs/namei.c:2771-2780); it need not name a
+    // directory.
+    if path.as_bytes().is_empty() {
+        if let Some(location) = description.inner.vfs_location() {
+            return Ok(location.clone());
+        }
+    }
+    Ok(description
+        .file_handle()
+        .downcast::<Directory>()?
+        .inner()
+        .clone())
+}
+
 fn openat2_context(
     files: &Arc<crate::file::FdTable>,
     fs_context: &FsContext,
@@ -596,13 +621,7 @@ fn openat2_context(
         let base = if dirfd == AT_FDCWD {
             current_dir
         } else {
-            retained_dirfd
-                .cloned()
-                .unwrap_or(files.get_description(dirfd)?)
-                .file_handle()
-                .downcast::<Directory>()?
-                .inner()
-                .clone()
+            openat2_dirfd_base(files, dirfd, retained_dirfd, path)?
         };
         return Ok(FsContext::new(base));
     }
@@ -613,13 +632,7 @@ fn openat2_context(
         let base = if dirfd == AT_FDCWD {
             current_dir
         } else {
-            retained_dirfd
-                .cloned()
-                .unwrap_or(files.get_description(dirfd)?)
-                .file_handle()
-                .downcast::<Directory>()?
-                .inner()
-                .clone()
+            openat2_dirfd_base(files, dirfd, retained_dirfd, path)?
         };
         FsContext::new(root).with_current_dir(base)
     }
@@ -2648,7 +2661,19 @@ pub fn sys_fcntl(
                 tk_linux_fd::SetFlError::NotPermitted => AxError::OperationNotPermitted,
                 tk_linux_fd::SetFlError::InvalidInput => AxError::InvalidInput,
             })?;
-            let requested = plan.mutable | ((arg as u32) & FASYNC);
+            let fasync = (arg as u32) & FASYNC;
+            if current_flags & FASYNC != fasync {
+                // FASYNC only changes through a `->fasync` provider; reuse
+                // `ioctl_fioasync`'s admission so objects without one report
+                // the same error instead of silently adopting the bit.
+                if description.is_path_only()
+                    || (description.inner.downcast_ref::<Pipe>().is_none()
+                        && description.inner.downcast_ref::<NamedPipe>().is_none())
+                {
+                    return Err(AxError::NotATty);
+                }
+            }
+            let requested = plan.mutable | fasync;
             description.transition_status_flags(
                 |old| (old.raw() & !FCNTL_SETFL_MUTABLE_FLAGS) | requested,
                 |old, new| {

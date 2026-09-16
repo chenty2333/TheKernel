@@ -347,6 +347,7 @@ mod owned;
 pub use owned::{
     MAX_NUL_SEARCH_BYTES, vm_load, vm_load_any, vm_load_any_until_nul,
     vm_load_any_until_nul_bounded, vm_load_until_nul, vm_load_until_nul_bounded,
+    vm_load_until_nul_trunc,
 };
 
 #[cfg(test)]

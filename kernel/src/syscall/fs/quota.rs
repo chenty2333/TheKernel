@@ -1083,7 +1083,7 @@ fn write_struct<M: UserMemory + ?Sized, T: bytemuck::NoUninit>(
 /// `quota_btobb()` (fs/quota/quota.c:534-537): bytes to 512-byte basic
 /// blocks, rounding up.
 const fn xfs_blocks_from_bytes(bytes: u64) -> u64 {
-    (bytes + (1 << XFS_BB_SHIFT) - 1) >> XFS_BB_SHIFT
+    bytes.saturating_add((1 << XFS_BB_SHIFT) - 1) >> XFS_BB_SHIFT
 }
 /// `quota_bbtob()` (fs/quota/quota.c:529-532): basic blocks back to bytes.
 const fn xfs_bytes_from_blocks(blocks: u64) -> u64 {

@@ -1289,13 +1289,13 @@ fn escape_mount_field(field: &[u8], escaped: &mut Vec<u8>) -> VfsResult<()> {
     Ok(())
 }
 
-fn render_mounts() -> VfsResult<Vec<u8>> {
+fn render_mounts(records: &[mounts::MountRecord], root: &Location) -> VfsResult<Vec<u8>> {
     let mut out = Vec::new();
-    for record in mounts::snapshot()? {
+    for record in records {
         // `seq_path_root()` drops records that are not reachable from the
         // reader's filesystem root, which is what keeps the immutable nullfs
         // namespace root out of this file.
-        if !mounts::visible_from_filesystem_root(&record) {
+        if !mounts::visible_from_filesystem_root(record, root) {
             continue;
         }
         let options = record_mount_options(&record);
@@ -1307,10 +1307,10 @@ fn render_mounts() -> VfsResult<Vec<u8>> {
     Ok(out)
 }
 
-fn render_mountinfo() -> VfsResult<Vec<u8>> {
+fn render_mountinfo(records: &[mounts::MountRecord], root: &Location) -> VfsResult<Vec<u8>> {
     let mut out = Vec::new();
-    for record in mounts::snapshot()? {
-        if !mounts::visible_from_filesystem_root(&record) {
+    for record in records {
+        if !mounts::visible_from_filesystem_root(record, root) {
             continue;
         }
         let dev = DeviceId(record.dev);
@@ -3356,8 +3356,24 @@ impl SimpleDirOps for ThreadDir {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
                 ProcPagemapFile::new(fs, aspace).into()
             }
-            b"mounts" => SimpleFile::new_regular(fs, render_mounts).into(),
-            b"mountinfo" => SimpleFile::new_regular(fs, render_mountinfo).into(),
+            b"mounts" => {
+                // `mounts_open_common()` snapshots the target task's mount
+                // namespace and `fs->root` at open (`fs/proc_namespace.c`:
+                // 269-276); the records themselves are read from that
+                // namespace on every render.
+                let topology = task.as_thread().mount_ns().topology();
+                let root = task.as_thread().fs_context().lock().root_dir().clone();
+                SimpleFile::new_regular(fs, move || render_mounts(&topology.try_records()?, &root))
+                    .into()
+            }
+            b"mountinfo" => {
+                let topology = task.as_thread().mount_ns().topology();
+                let root = task.as_thread().fs_context().lock().root_dir().clone();
+                SimpleFile::new_regular(fs, move || {
+                    render_mountinfo(&topology.try_records()?, &root)
+                })
+                .into()
+            }
             b"cmdline" => SimpleFile::new_regular(fs, move || {
                 let cmdline = task.as_thread().proc_data.cmdline.read();
                 let mut buf = Vec::new();
@@ -3722,11 +3738,20 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
         let pid_ns = pid_ns.clone();
         SimpleFile::new_regular(fs.clone(), move || Ok(crate::task::proc_loadavg(&pid_ns)?))
     });
-    root.add("mounts", SimpleFile::new_regular(fs.clone(), render_mounts));
-    root.add(
-        "mountinfo",
-        SimpleFile::new_regular(fs.clone(), render_mountinfo),
-    );
+    root.add("mounts", {
+        let fs = fs.clone();
+        SimpleFile::new_regular(fs, move || {
+            let root = current().as_thread().fs_context().lock().root_dir().clone();
+            render_mounts(&mounts::snapshot()?, &root)
+        })
+    });
+    root.add("mountinfo", {
+        let fs = fs.clone();
+        SimpleFile::new_regular(fs, move || {
+            let root = current().as_thread().fs_context().lock().root_dir().clone();
+            render_mountinfo(&mounts::snapshot()?, &root)
+        })
+    });
     root.add("sysvipc", {
         let mut sysvipc = DirMapping::new();
         sysvipc.add(

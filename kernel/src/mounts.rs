@@ -1725,25 +1725,18 @@ pub fn is_in_current_namespace(mountpoint: &Arc<Mountpoint>) -> AxResult<bool> {
 /// `show_vfsmnt()`/`show_mountinfo()` call
 /// `seq_path_root(m, &mnt_path, &p->root, ...)` and drop the whole record when
 /// `__d_path()` returns `NULL` (`fs/proc_namespace.c`:118,151 and
-/// `fs/seq_file.c`:508-530), where `p->root` is the reading task's filesystem
-/// root (`fs/proc_namespace.c`:276).  That is what hides the immutable nullfs
-/// mount: it is the *parent* of `current->fs->root`, and `__d_path()` cannot
-/// walk above the root it was given.
-pub fn visible_from_filesystem_root(record: &MountRecord) -> bool {
+/// `fs/seq_file.c`:508-530), where `p->root` is the filesystem root
+/// `mounts_open_common()` snapshots from the *target* task at open
+/// (`fs/proc_namespace.c`:269-276).  That is what hides the immutable nullfs
+/// mount: it is the *parent* of the task's `fs->root`, and `__d_path()`
+/// cannot walk above the root it was given.
+pub fn visible_from_filesystem_root(record: &MountRecord, root: &Location) -> bool {
     let Some(mountpoint) = record.mountpoint.upgrade() else {
         return false;
     };
-    let Some(task) = axtask::current_may_uninit() else {
-        // Before the first task exists nothing can read these files.
-        return true;
-    };
-    let Some(thread) = task.try_as_thread() else {
-        return true;
-    };
-    let root = thread.fs_context().lock().root_dir().clone();
     mountpoint
         .root_location()
-        .path_relative_to(&root)
+        .path_relative_to(root)
         .is_ok_and(|(_, reachable)| reachable)
 }
 
@@ -2104,11 +2097,19 @@ pub fn initialize_mount_tree(
         .try_reserve_exact(chain.len())
         .map_err(|_| AxError::NoMemory)?;
     let mut pending_metadata = Some(metadata);
+    // Build and validate every record before any mount is initialized, so a
+    // mid-chain failure leaves no initialized mount that the ledger never
+    // recorded.
     for (index, mountpoint) in chain.iter().enumerate() {
         if records
             .iter()
             .any(|record| record.mount_id == mountpoint.mount_id())
         {
+            return Err(AxError::AlreadyExists);
+        }
+        // `initialize_extensions()` installs through a `Once` and can only
+        // fail on an already-initialized mount; reject those here.
+        if mount_state(mountpoint).is_ok() {
             return Err(AxError::AlreadyExists);
         }
         // The absolute root is a kernel-internal mount that userspace can
@@ -2135,29 +2136,32 @@ pub fn initialize_mount_tree(
         let dev = linux_device_id(mountpoint.device()).0;
         let mount_id_old = next_mountinfo_id()?;
         let extensions = mount_extensions(mount_flags, mount_metadata, mount_id_old)?;
-        mountpoint.initialize_extensions(extensions)?;
-        prepared.push(MountRecord {
-            mount_id: mountpoint.mount_id(),
-            mount_id_old,
-            parent_id: 0,
-            root: record_metadata.root,
-            source: record_metadata.source,
-            target: target.clone(),
-            fs_type: record_metadata.fs_type,
-            data: record_metadata.data,
-            dev,
-            flags: mount_flags,
-            expire_epoch: None,
-            mountpoint: Arc::downgrade(mountpoint),
-        });
+        prepared.push((
+            extensions,
+            MountRecord {
+                mount_id: mountpoint.mount_id(),
+                mount_id_old,
+                parent_id: 0,
+                root: record_metadata.root,
+                source: record_metadata.source,
+                target: target.clone(),
+                fs_type: record_metadata.fs_type,
+                data: record_metadata.data,
+                dev,
+                flags: mount_flags,
+                expire_epoch: None,
+                mountpoint: Arc::downgrade(mountpoint),
+            },
+        ));
     }
-    for index in 0..prepared.len() {
-        if index != 0 {
-            prepared[index].parent_id = prepared[index - 1].mount_id;
-        }
-        let record = &prepared[index];
-        register_live_superblock_mount(&record.mountpoint.upgrade().ok_or(AxError::Io)?)?;
-        records.push(record.try_clone()?);
+    for index in 1..prepared.len() {
+        prepared[index].1.parent_id = prepared[index - 1].1.mount_id;
+    }
+    for (extensions, record) in prepared {
+        let mountpoint = record.mountpoint.upgrade().ok_or(AxError::Io)?;
+        mountpoint.initialize_extensions(extensions)?;
+        register_live_superblock_mount(&mountpoint)?;
+        records.push(record);
     }
     publish_current_records(&records)?;
     Ok(())
@@ -3630,6 +3634,9 @@ pub fn pivot_root_and_records(
     // 4691-4693): `old_mnt` is the mount that contains `put_old`, which is the
     // mount `put_old` resolves in.
     let old_mount = put_old.mountpoint();
+    // Linux lets `put_old` sit anywhere inside the new root's subtree,
+    // including on mounts stacked below it; requiring it to resolve on
+    // `new_root`'s own mount is a known narrowing.
     if !old_root.is_root_of_mount()
         || !new_root.is_root_of_mount()
         || !put_old.is_dir()
@@ -3683,6 +3690,23 @@ pub fn pivot_root_and_records(
     // immutable nullfs); the nullfs namespace root itself does not, so
     // pivoting onto the absolute root stays -EINVAL.
     if !mount_has_parent(root_mount) || !mount_has_parent(new_mount) {
+        return Err(AxError::InvalidInput);
+    }
+    //     if (!is_path_reachable(old_mnt, old->dentry, &root) ||
+    //         !is_path_reachable(new_mnt, new->dentry, &root))
+    //             return -EINVAL;
+    // (`fs/namespace.c`:4727-4728), where `root` is `current->fs->root`,
+    // which `old_root` names.  Without this a chrooted caller could pivot
+    // mounts the ledger rewrites from paths its own root cannot express.
+    let put_old_reachable = put_old
+        .path_relative_to(old_root)
+        .map_err(|_| AxError::Io)?
+        .1;
+    let new_root_reachable = new_root
+        .path_relative_to(old_root)
+        .map_err(|_| AxError::Io)?
+        .1;
+    if !put_old_reachable || !new_root_reachable {
         return Err(AxError::InvalidInput);
     }
     let new_root_path = new_root.absolute_path().map_err(|_| AxError::Io)?;
