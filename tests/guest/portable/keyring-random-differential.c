@@ -40,7 +40,19 @@
  *                   else is wrong; a missing keyring is -ENOKEY and outranks
  *                   the unknown-type -ENODEV
  *                 - a "user" payload must be 1..=32767 bytes, a rule the copy
- *                   comes first for
+ *                   comes first for, and the 32767-byte boundary is accepted
+ *                 - a "keyring" takes no payload at all: any nonzero plen is
+ *                   -EINVAL even though the same call with plen == 0 creates
+ *                   the keyring
+ *                 - the description is read with the 4096-byte
+ *                   `strndup_user()` budget, so 4095 characters are accepted
+ *                   and 4096 are -EINVAL
+ *                 - no built-in key type invents a missing description, so a
+ *                   NULL or empty description is -EINVAL, and the key type is
+ *                   looked up before that check, so an unknown type is still
+ *                   -ENODEV
+ *                 - the "logon" type vets its description, requiring a ':'
+ *                   that is not the first character
  *   request_key(2) security/keys/keyctl.c
  *                 - a NULL callout_info with no cached key is -ENOKEY and
  *                   never starts an upcall
@@ -84,6 +96,8 @@
 #define GRND_INSECURE 0x0004
 
 #define PAYLOAD_BYTES (1 << 20)
+/* `KEY_MAX_DESC_SIZE` plus the terminating NUL. */
+#define DESCRIPTION_STORAGE 4097
 
 static unsigned char payload[PAYLOAD_BYTES];
 
@@ -293,6 +307,106 @@ static int test_add_key_validation(void) {
     if (do_add_key("keyring", "kr-ring", payload, 0,
                    KEY_SPEC_PROCESS_KEYRING) <= 0)
         return fail("add-key-keyring");
+    return 0;
+}
+
+/* The rules `__key_create_or_update()` applies through the key type's
+ * `preparse()` and through `key_alloc()`, all of them after the destination
+ * keyring has been resolved and the type has been looked up
+ * (security/keys/key.c:828-868, security/keys/keyctl.c:90-118):
+ *
+ *   keyring  `keyring_preparse()` rejects any payload at all
+ *            (security/keys/keyring.c:124-127: `return prep->datalen != 0 ?
+ *            -EINVAL : 0;`)
+ *   user     `user_preparse()` rejects `datalen == 0` and `datalen > 32767`
+ *            (security/keys/user_defined.c:64), so 32767 is the largest
+ *            accepted payload
+ *   all      the description is read with the `KEY_MAX_DESC_SIZE` budget of
+ *            4096 bytes (security/keys/keyctl.c:27 and :96), which makes 4095
+ *            characters the longest acceptable description, and an empty
+ *            description is normalized to NULL before the type is consulted
+ *            (security/keys/keyctl.c:100-103).  `key_alloc()` then answers
+ *            -EINVAL for a missing description and runs the type's
+ *            `vet_description()` (security/keys/key.c:235-245).
+ */
+static int test_add_key_description_rules(void) {
+    static char description[DESCRIPTION_STORAGE];
+
+    /* The type is looked up before `key_alloc()` sees the missing
+     * description, so the registry's -ENODEV is the answer. */
+    errno = 0;
+    if (expect_errno("add-key-null-description-unknown-type",
+                     do_add_key("kr-bogus-type", NULL, payload, 8,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     ENODEV))
+        return 1;
+    errno = 0;
+    if (expect_errno("add-key-null-description",
+                     do_add_key("user", NULL, payload, 8,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EINVAL))
+        return 1;
+    errno = 0;
+    if (expect_errno("add-key-empty-description",
+                     do_add_key("user", "", payload, 8,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EINVAL))
+        return 1;
+
+    /* 32767 bytes is the accepted ceiling of `user_preparse()`.  It is only
+     * observable for the root key owner, whose 25000000-byte quota admits it
+     * (security/keys/key.c:27): an unprivileged owner has the 20000-byte
+     * general quota (:29) and would see -EDQUOT from `key_alloc()` first. */
+    if (geteuid() == 0 &&
+        do_add_key("user", "kr-max-user", payload, 32767,
+                   KEY_SPEC_PROCESS_KEYRING) <= 0)
+        return fail("add-key-max-user-payload");
+
+    /* A keyring holds no payload of its own. */
+    errno = 0;
+    if (expect_errno("add-key-keyring-payload",
+                     do_add_key("keyring", "kr-payload-ring", payload, 1,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EINVAL))
+        return 1;
+    /* The same call with no payload does create the keyring, so the errno
+     * above is the payload rule and not a rejected description. */
+    if (do_add_key("keyring", "kr-payload-ring", NULL, 0,
+                   KEY_SPEC_PROCESS_KEYRING) <= 0)
+        return fail("add-key-keyring-no-payload");
+
+    /* `strndup_user()`'s budget includes the terminator. */
+    memset(description, 'd', sizeof(description));
+    description[4095] = '\0';
+    if (do_add_key("user", description, payload, 8,
+                   KEY_SPEC_PROCESS_KEYRING) <= 0)
+        return fail("add-key-max-description");
+    description[4095] = 'd';
+    description[4096] = '\0';
+    errno = 0;
+    if (expect_errno("add-key-over-long-description",
+                     do_add_key("user", description, payload, 8,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EINVAL))
+        return 1;
+
+    /* `logon_vet_description()` needs a ':' that is not the first
+     * character (security/keys/user_defined.c:200-207). */
+    errno = 0;
+    if (expect_errno("add-key-logon-unqualified",
+                     do_add_key("logon", "kr-unqualified", payload, 8,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EINVAL))
+        return 1;
+    errno = 0;
+    if (expect_errno("add-key-logon-leading-colon",
+                     do_add_key("logon", ":kr-qualified", payload, 8,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EINVAL))
+        return 1;
+    if (do_add_key("logon", "kr:logon", payload, 8,
+                   KEY_SPEC_PROCESS_KEYRING) <= 0)
+        return fail("add-key-logon-qualified");
     return 0;
 }
 
@@ -524,6 +638,8 @@ int main(void) {
     puts("THEKERNEL_ABI_ASSERT keyring-random.portable-differential "
          "GETRANDOM_INSECURE_DELIVERY pass");
     if (test_add_key_validation())
+        return 1;
+    if (test_add_key_description_rules())
         return 1;
     puts("THEKERNEL_ABI_ASSERT keyring-random.portable-differential "
          "ADD_KEY_VALIDATION pass");
