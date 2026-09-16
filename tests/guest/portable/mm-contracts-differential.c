@@ -102,6 +102,9 @@ struct uffdio_register { struct uffdio_range range; uint64_t mode, ioctls; };
 #ifndef F_SEAL_EXEC
 #define F_SEAL_EXEC 0x0020
 #endif
+#ifndef __NR_mbind
+#define __NR_mbind 237
+#endif
 #define PAGE 4096UL
 #define BAD ((void *)(uintptr_t)1)
 static const char *active;
@@ -1219,6 +1222,104 @@ static void remote_extra_case(void) {
     done();
 }
 
+/* ------------------------------------------------------------------ *
+ * migrate_pages / set_mempolicy_home_node
+ * ------------------------------------------------------------------ */
+
+#ifndef __NR_migrate_pages
+#define __NR_migrate_pages 256
+#endif
+#ifndef __NR_set_mempolicy_home_node
+#define __NR_set_mempolicy_home_node 450
+#endif
+#ifndef MPOL_DEFAULT
+#define MPOL_DEFAULT 0
+#endif
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+
+/* kernel_migrate_pages() builds BOTH node masks through get_nodes() before it
+ * looks the target up (mm/mempolicy.c), and get_nodes() returns 0 outright
+ * once `--maxnode` reaches zero, so an empty mask is accepted for a pid that
+ * does not exist.  This kernel resolved the target first and answered ESRCH. */
+static void migrate_pages_case(void) {
+    unsigned long mask = 1UL;
+    pid_t self = getpid();
+
+    begin("migrate-pages.raw-differential");
+
+    /* An empty new-nodes mask is EINVAL: get_nodes() accepts it, but
+     * kernel_migrate_pages() then rejects `nodes_empty(*new)` after the
+     * target has been resolved (mm/mempolicy.c). */
+    ERROR(syscall(__NR_migrate_pages, self, 1, NULL, NULL), EINVAL, "empty-new-mask-self");
+    ERROR(syscall(__NR_migrate_pages, 0, 1, &mask, &mask), EINVAL, "empty-new-mask-zero-pid");
+    mark("EMPTY_NEW_MASK_EINVAL");
+
+    /* maxnode is pre-decremented, so 0 underflows and exceeds the 32 KiB
+     * PAGE_SIZE*BITS_PER_BYTE ceiling of get_nodes(). */
+    ERROR(syscall(__NR_migrate_pages, 0, 0, &mask, &mask), EINVAL, "maxnode-zero-einval");
+    mark("MAXNODE_BOUND");
+
+    /* An empty mask does NOT short-circuit the call: get_nodes() returns 0
+     * and the target is still resolved, so a pid with no vpid is ESRCH. */
+    ERROR(syscall(__NR_migrate_pages, 0x7ffffff0, 1, NULL, NULL), ESRCH,
+          "unknown-pid-empty-mask-esrch");
+    mark("EMPTY_MASK_DOES_NOT_SKIP_TARGET_LOOKUP");
+
+    /* A bad maxnode, however, is decided by get_nodes() before the target is
+     * ever looked up, so it is EINVAL and never ESRCH - including for a pid
+     * that does not exist and for a negative one. */
+    ERROR(syscall(__NR_migrate_pages, 0x7ffffff0, 0, &mask, &mask), EINVAL,
+          "unknown-pid-bad-maxnode-einval");
+    ERROR(syscall(__NR_migrate_pages, -1, 0, &mask, &mask), EINVAL, "negative-pid-bad-maxnode");
+    mark("MASK_VALIDATION_PRECEDES_TARGET_LOOKUP");
+
+    /* The migration itself is a no-op on this single-node configuration. */
+    check(syscall(__NR_migrate_pages, self, 2, &mask, &mask) == 0, "single-node-migration");
+    mark("SINGLE_NODE_MIGRATION_SUCCEEDS");
+
+    done();
+}
+
+/* set_mempolicy_home_node() checks the start alignment, then the flag word,
+ * then that home_node is online, and only then computes the range
+ * (mm/mempolicy.c). */
+static void home_node_case(void) {
+    unsigned char *area = pages(1);
+    pid_t child;
+    begin("set-mempolicy-home-node.raw-differential");
+
+    ERROR(syscall(__NR_set_mempolicy_home_node, 1UL, PAGE, 0UL, 0UL), EINVAL, "unaligned-start");
+    ERROR(syscall(__NR_set_mempolicy_home_node, 0UL, PAGE, 0UL, 1UL), EINVAL, "flags-nonzero");
+    mark("ALIGNMENT_AND_FLAGS_FIRST");
+
+    /* home_node must be below MAX_NUMNODES and online; this configuration has
+     * a single online node. */
+    ERROR(syscall(__NR_set_mempolicy_home_node, 0UL, PAGE, 1UL, 0UL), EINVAL, "offline-node");
+    mark("OFFLINE_NODE_EINVAL");
+
+    /* PAGE_ALIGN(0) makes end == start, which returns success before any VMA
+     * is examined. */
+    check(syscall(__NR_set_mempolicy_home_node, (unsigned long)area, 0UL, 0UL, 0UL) == 0,
+          "empty-range-succeeds");
+    mark("EMPTY_RANGE_SUCCEEDS_EARLY");
+
+    /* err starts at -ENOENT and is only cleared for a VMA carrying a
+     * MPOL_BIND or MPOL_PREFERRED_MANY policy, so an anonymous mapping with
+     * no policy reports ENOENT whether or not it is mapped. */
+    ERROR(syscall(__NR_set_mempolicy_home_node, (unsigned long)area, PAGE, 0UL, 0UL), ENOENT,
+          "mapped-without-policy");
+    mark("UNPOLICED_RANGE_ENOENT");
+
+    child = fork();
+    if (child == 0) {
+        _exit(0);
+    }
+    reap(child, 0);
+    done();
+}
+
 int main(void) {
     active = "mm.setup";
     check(sysconf(_SC_PAGESIZE) == PAGE, "native-page-size");
@@ -1230,6 +1331,7 @@ int main(void) {
     noreserve_case(); memfd_case();
     brk_case(); mmap_extra_case(); madvise_extra_case(); msync_extra_case();
     remote_extra_case();
+    migrate_pages_case(); home_node_case();
     puts("THEKERNEL_MM_CONTRACTS_OK");
     return 0;
 }

@@ -295,6 +295,11 @@ CONTRACTS.update({
     "mount-descriptors": ("raw-differential", "pass", "FSOPEN_CLOEXEC_DESCRIPTOR FSOPEN_FLAGS_BEFORE_NAME FSOPEN_NAME_ADMISSION FSOPEN_UNPRIVILEGED_EPERM MOVE_MOUNT_FLAGS_BEFORE_PATHS MOVE_MOUNT_TARGET_BEFORE_SOURCE MOVE_MOUNT_EMPTY_PATH_DESCRIPTOR MOVE_MOUNT_PLACEMENT_TYPE MOVE_MOUNT_UNPRIVILEGED_EPERM MOVE_MOUNT_ATTACH_DETACHED MOVE_MOUNT_DETACH_RESTORES MOUNT_SETATTR_SHAPE_BEFORE_COPY MOUNT_SETATTR_ATTR_COPY MOUNT_SETATTR_NOOP_SKIPS_PATH MOUNT_SETATTR_ATTRIBUTE_RULES MOUNT_SETATTR_TRAILING_BYTES MOUNT_SETATTR_MOUNT_ROOT_ONLY MOUNT_SETATTR_UNPRIVILEGED_EPERM MOUNT_SETATTR_PATH_ADMISSION MOUNT_SETATTR_DETACHED_RDONLY MOUNT_SETATTR_DETACHED_CLEAR LISTMOUNT_FLAGS_AND_COUNT LISTMOUNT_REQUEST_COPY LISTMOUNT_REQUEST_IDENTITY LISTMOUNT_ROOT_FORWARD_REVERSE LISTMOUNT_STATMOUNT_IDENTITY LISTMOUNT_CURSOR LISTMOUNT_ATTACH_OBSERVED"),
 })
 
+CONTRACTS.update({
+    "migrate-pages": ("raw-differential", "pass", "EMPTY_NEW_MASK_EINVAL MAXNODE_BOUND EMPTY_MASK_DOES_NOT_SKIP_TARGET_LOOKUP MASK_VALIDATION_PRECEDES_TARGET_LOOKUP SINGLE_NODE_MIGRATION_SUCCEEDS"),
+    "set-mempolicy-home-node": ("raw-differential", "pass", "ALIGNMENT_AND_FLAGS_FIRST OFFLINE_NODE_EINVAL EMPTY_RANGE_SUCCEEDS_EARLY UNPOLICED_RANGE_ENOENT"),
+})
+
 PROGRAM_CASES = {
     "tty-job-control": ("tty-job-control",),
     "tty-termios": ("tty-termios",),
@@ -304,7 +309,7 @@ PROGRAM_CASES = {
     "eventfd": ("eventfd",), "creat": ("creat",), "time": ("time",),
     "umask": ("umask",), "native-ni": ("native-ni",),
     "fsattrs": ("setxattrat", "getxattrat", "listxattrat", "removexattrat", "file-getattr", "file-setattr", "open-tree-attr", "xattr-classic"),
-    "mm-contracts": ("mprotect", "munmap", "mincore", "process-vm-readv", "process-vm-writev", "mseal", "mlock", "mlock2", "munlock", "process-madvise", "mlockall", "brk", "mmap", "madvise", "msync", "process-mrelease"),
+    "mm-contracts": ("mprotect", "munmap", "mincore", "process-vm-readv", "process-vm-writev", "mseal", "mlock", "mlock2", "munlock", "process-madvise", "mlockall", "brk", "mmap", "madvise", "msync", "process-mrelease", "migrate-pages", "set-mempolicy-home-node"),
     "network-basic": ("network_bind", "network_connect", "network_getpeername", "network_sendto"),
     "signal-boundary": ("rt_sigaction", "sigaltstack", "rt_tgsigqueueinfo", "restart_syscall", "rt_sigprocmask", "rt_sigreturn", "pause", "kill", "rt_sigpending", "rt_sigtimedwait", "rt_sigqueueinfo", "rt_sigsuspend", "tkill", "tgkill"),
     "stat-access": ("access", "faccessat", "faccessat2", "newfstatat", "statx"),
@@ -424,6 +429,7 @@ SYSCALL_CASES = {
     85: ("creat", "creat"), 95: ("umask", "umask"), 201: ("time", "time"),
     63: ("fs-abi", "uname"), 99: ("fs-abi", "sysinfo"),
     111: ("identity", "identity-pgid"),
+    256: ("mm-contracts", "migrate-pages"), 450: ("mm-contracts", "set-mempolicy-home-node"),
     429: ("mount-api", "mount-descriptors"),
     430: ("mount-api", "mount-descriptors"),
     442: ("mount-api", "mount-descriptors"),

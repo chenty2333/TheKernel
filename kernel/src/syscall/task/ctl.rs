@@ -2265,13 +2265,27 @@ pub fn sys_migrate_pages<M: UserMemory + ?Sized>(
     old_nodes: *const usize,
     new_nodes: *const usize,
 ) -> AxResult<isize> {
+    // `kernel_migrate_pages()` builds both node masks through `get_nodes()`
+    // before it looks the target up (mm/mempolicy.c:1698-1712), and
+    // `get_nodes()` returns 0 outright once `--maxnode` reaches zero.  An
+    // empty mask is therefore accepted for a pid that does not exist, and a
+    // bad `maxnode` is EINVAL rather than ESRCH.
+    let old_nodes = read_nodemask(memory, old_nodes, maxnode)?;
+    let new_nodes = read_nodemask(memory, new_nodes, maxnode)?;
+
     let target = numa_target_process(pid)?;
     check_numa_target_permission(&target)?;
 
-    let old_nodes = read_nodemask(memory, old_nodes, maxnode)?;
-    let new_nodes = read_nodemask(memory, new_nodes, maxnode)?;
     validate_migration_nodes(old_nodes)?;
     validate_migration_nodes(new_nodes)?;
+    // `kernel_migrate_pages()` intersects the new mask with
+    // `cpuset_mems_allowed(current)` and then with `node_states[N_MEMORY]`,
+    // and answers EINVAL for either empty result (mm/mempolicy.c:1723-1731).
+    // An empty *old* mask is fine - it means "every page" - so only the new
+    // mask carries this rule.
+    if new_nodes == 0 {
+        return Err(AxError::InvalidInput);
+    }
     target.migrate_mempolicy_ranges(old_nodes, new_nodes);
     Ok(0)
 }

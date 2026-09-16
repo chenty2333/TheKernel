@@ -7882,8 +7882,8 @@ status = "implemented"
 contract = "linux-migrate_pages"
 handler = "kernel/src/syscall/task/ctl.rs:sys_migrate_pages"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full migrate_pages raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7928,8 +7928,8 @@ status = "implemented"
 contract = "linux-set_mempolicy_home_node"
 handler = "kernel/src/syscall/task/ctl.rs:sys_set_mempolicy_home_node"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full set_mempolicy_home_node raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
