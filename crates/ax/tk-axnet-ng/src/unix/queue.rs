@@ -235,6 +235,12 @@ impl<T> Receiver<T> {
         }
     }
 
+    /// Receives an item and wakes writers immediately.
+    ///
+    /// Production callers use [`Self::try_recv_deferred_wake`], which defers
+    /// the wake until the caller has finished with the received item; this
+    /// eager form exists only for the queue's own tests.
+    #[cfg(test)]
     pub(super) fn try_recv(&self) -> Result<T, TryRecvError> {
         let result = self.try_recv_inner();
         if result.is_ok() {

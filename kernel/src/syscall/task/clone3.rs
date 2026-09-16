@@ -9,7 +9,7 @@ use tk_linux_process::{
 use tk_linux_signal::Signo;
 use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
-use super::clone::{CloneApi, CloneArgs, CloneCallerState, CloneFlags};
+use super::clone::{CloneApi, CloneArgs, CloneFlags};
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     mm::{UserMemoryCapability, map_usercopy_error},
@@ -210,6 +210,7 @@ mod tests {
         copy_clone3_wire_args, validate_clone3_wire_args,
     };
     use crate::config::{USER_SPACE_BASE, USER_SPACE_SIZE};
+    use crate::syscall::task::CloneCallerState;
 
     struct CopyProbe {
         bytes: Vec<u8>,
@@ -372,7 +373,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.validate_for(CloneApi::Clone, super::CloneCallerState::default()),
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
             Err(AxError::InvalidInput)
         );
     }
@@ -384,7 +385,7 @@ mod tests {
             pidfd: 0x1000,
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone, super::CloneCallerState::default()), Ok(()));
+        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
     }
 
     #[test]
@@ -394,7 +395,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.validate_for(CloneApi::Clone3, super::CloneCallerState::default()),
+            args.validate_for(CloneApi::Clone3, CloneCallerState::default()),
             Err(AxError::InvalidInput)
         );
     }

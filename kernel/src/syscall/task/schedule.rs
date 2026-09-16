@@ -13,7 +13,7 @@ use axtask::{
     TaskSchedulingUpdate, current,
     future::{BlockOnError, Interrupted, block_on, interruptible},
     sched_state, set_sched_state_versioned_with_uclamp_constraints, set_task_affinity,
-    set_task_nice as update_task_nice, task_reset_on_spawn, task_scheduling_snapshot,
+    set_task_nice as update_task_nice, task_scheduling_snapshot,
     update_task_scheduling,
 };
 use linux_raw_sys::general::{

@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use core::{
     mem::{self, MaybeUninit},
     sync::atomic::{AtomicU64, Ordering},

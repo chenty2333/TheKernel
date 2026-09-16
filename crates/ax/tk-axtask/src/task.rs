@@ -1099,15 +1099,16 @@ impl TaskInner {
     ///
     /// Constructing the replacement before taking the task-name lock keeps
     /// allocator work out of the spin-locked section. Returning the previous
-    /// image likewise lets callers defer its destructor until after the lock
-    /// has been released.
+    /// image lets a caller read what it displaced without taking the lock a
+    /// second time, which is what [`Self::replace_name`] does. `TaskName` is a
+    /// plain `Copy` array, so there is no destructor to defer.
     pub fn replace_comm(&self, name: TaskName) -> TaskName {
         core::mem::replace(&mut *self.name.lock(), name)
     }
 
     /// Replaces the name with an already-built image, discarding the old one.
     pub fn set_comm(&self, name: TaskName) {
-        drop(self.replace_comm(name));
+        let _ = self.replace_comm(name);
     }
 
     /// Copies a bounded task-name prefix without allocating. Scheduler trace
