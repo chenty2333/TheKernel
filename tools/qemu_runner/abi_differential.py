@@ -93,6 +93,15 @@ CONTRACTS.update({
 })
 
 CONTRACTS.update({
+    "close-range": ("raw-differential", "pass", "FLAGS_MASK_EINVAL RANGE_ORDER_EINVAL GAP_TOLERATED INCLUSIVE_ENDPOINTS BEYOND_TABLE_OK CLOEXEC_MARKS_WITHOUT_CLOSING CLOEXEC_OUTSIDE_UNTOUCHED CLOEXEC_STALE_BIT_CLEARED_ON_ALLOC UNSHARE_CLOEXEC_KEEPS_FDS SHARED_TABLE_CLOSE_VISIBLE UNSHARE_ISOLATES CLOEXEC_APPLIED_ACROSS_EXEC FULL_RANGE_CLOSES_OPEN_FDS"),
+    "openat2": ("raw-differential", "pass", "SIZE_GATE_BEFORE_COPY PADDING_ZERO_ACCEPTED PADDING_NONZERO_E2BIG TAIL_ZERO_CHECK_BEFORE_HEAD_COPY HOW_FAULT_EFAULT FLAGS_MASK_EINVAL RESOLVE_MASK_EINVAL BENEATH_IN_ROOT_EINVAL MODE_VALIDATION_EINVAL DIRECTORY_CREATE_EINVAL TMPFILE_ADMISSION_EINVAL PATH_FLAG_MASK_EINVAL CACHED_MUTATION_EAGAIN_BEFORE_PATH SUCCESS_FLAG_SHAPE CREATE_MODE_EFFECT EMPTYPATH_FLAG_ACCEPTED EMPTYPATH_EMPTY_PATH_OPENS_DIRFD NO_SYMLINKS_ELOOP NO_MAGICLINKS_ELOOP BENEATH_ABSOLUTE_EXDEV IN_ROOT_ABSOLUTE_SCOPED"),
+    "name-to-handle-at": ("raw-differential", "pass", "FLAG_MASK_EINVAL PATH_BEFORE_HANDLE_EFAULT NAME_FAULT_EFAULT NULL_HANDLE_EFAULT OVER_MAX_EINVAL MAX_SIZE_ACCEPTED PROBE_EOVERFLOW_HEADER MNT_ID_WRITE_WIDTH EMPTY_PATH_FLAG DANGLING_SYMLINK_RULES UNSUPPORTED_FS_EOPNOTSUPP FID_HANDLE_ON_UNEXPORTABLE_FS"),
+    "open-by-handle-at": ("raw-differential", "pass", "HEADER_BEFORE_FD_EFAULT ZERO_BYTES_EINVAL OVER_MAX_EINVAL NEGATIVE_TYPE_EINVAL UNKNOWN_TYPE_FLAGS_EINVAL BAD_FD_EBADF O_PATH_MOUNT_FD_EBADF BODY_FAULT_EFAULT EPERM_WITHOUT_DAC_SEARCH ROUND_TRIP_IDENTITY CLOEXEC_RESULT_FLAG TYPE_DIR_ONLY_REJECTS_FILE TYPE_USER_FLAGS_MASKED SYMLINK_HANDLE_ELOOP ESTALE_AFTER_UNLINK UNEXPORTABLE_MOUNT_FD_ESTALE"),
+    "pidfd-open": ("raw-differential", "pass", "FLAGS_BEFORE_LOOKUP NONPOSITIVE_EINVAL UNKNOWN_PID_ESRCH CLOEXEC_AND_RDWR_FLAGS READ_WRITE_EINVAL NONBLOCK_F_GETFL THREAD_F_GETFL NONLEADER_PIDFD_ENOENT NONLEADER_THREAD_PIDFD_OK ZOMBIE_PIDFD_POLL_READY REAPED_PIDFD_ESRCH"),
+    "pidfd-getfd": ("raw-differential", "pass", "FLAGS_BEFORE_FD_LOOKUP NON_PIDFD_EBADF SELF_PIDFD_TRANSFER RESULT_CLOEXEC SHARED_FILE_DESCRIPTION TARGET_FD_CLOSED_EBADF CHILD_TRANSFER FOREIGN_UID_EPERM ZOMBIE_TARGET_ESRCH"),
+})
+
+CONTRACTS.update({
     "inotify_add_watch": ("raw-differential", "pass", "FD_BEFORE_MASK_CONFLICT MASK_BITS_BEFORE_FD MASK_CONFLICT_BEFORE_PATH"),
     "signalfd4": ("raw-differential", "pass", "COPY_BEFORE_FLAGS_FD SIZE_BEFORE_COPY FLAGS_BEFORE_FD VALID_MASK_FLAGS_BAD_FD"),
     "timerfd_settime": ("raw-differential", "pass", "COPY_BEFORE_FLAGS_FD FLAGS_BEFORE_FD VALUE_BEFORE_FD VALID_VALUE_FLAGS_BAD_FD"),
@@ -357,6 +366,7 @@ PROGRAM_CASES = {
     "clock-abi": ("clock-abi",),
     "aio": ("aio", "io_pgetevents"),
     "rseq": ("rseq",),
+    "fd-lifecycle": ("close-range", "openat2", "name-to-handle-at", "open-by-handle-at", "pidfd-open", "pidfd-getfd"),
     "memfd-create": ("memfd-create",),
     "io-uring-register": ("io-uring-register",),
     "io-uring-register-opcodes": ("io-uring-register-opcodes",),
@@ -420,6 +430,7 @@ PROGRAM_SUCCESS = {
     "clock-abi": "THEKERNEL_CLOCK_ABI_DIFFERENTIAL_OK",
     "aio": "THEKERNEL_AIO_OK",
     "rseq": "THEKERNEL_RSEQ_DIFFERENTIAL_OK",
+    "fd-lifecycle": "THEKERNEL_FD_LIFECYCLE_OK",
     "memfd-create": "THEKERNEL_MEMFD_CREATE_OK",
     "io-uring-register": "THEKERNEL_IO_URING_REGISTER_OK",
     "io-uring-register-opcodes": "THEKERNEL_IO_URING_REGISTER_OPCODES_OK",
@@ -446,6 +457,9 @@ SYSCALL_CASES = {
     277: ("fs-boundary", "sync_file_range"), 451: ("fs-boundary", "cachestat"),
     162: ("fs-boundary", "sync"),
     333: ("aio", "io_pgetevents"), 334: ("rseq", "rseq"),
+    436: ("fd-lifecycle", "close-range"), 437: ("fd-lifecycle", "openat2"),
+    303: ("fd-lifecycle", "name-to-handle-at"), 304: ("fd-lifecycle", "open-by-handle-at"),
+    434: ("fd-lifecycle", "pidfd-open"), 438: ("fd-lifecycle", "pidfd-getfd"),
     286: ("fs-boundary", "timerfd_settime"), 149: ("mm-contracts", "mlock"),
     325: ("mm-contracts", "mlock2"), 150: ("mm-contracts", "munlock"),
     440: ("mm-contracts", "process-madvise"), 151: ("mm-contracts", "mlockall"),

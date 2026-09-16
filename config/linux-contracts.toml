@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 323
-implemented = 304
+resolved = 320
+implemented = 301
 explicit_enosys = 19
 fallback = 0
-partial = 62
+partial = 65
 unknown = 0
 
 [[contract]]
@@ -4658,13 +4658,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 437
 name = "openat2"
-status = "implemented"
+status = "partial"
 contract = "linux-openat2"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_openat2"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias"]
-validation_gaps = ["Existing source/helper coverage does not establish the full openat2 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["explicit-none"]
+tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias", "tests/guest/portable/fd-lifecycle-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["openat2's reserved upper-32 flag word (OPENAT2_REGULAR) and the internal __O_REGULAR/EFTYPE admission are unrepresentable here: axerrno has no EFTYPE and the carrier bit is not user-visible, so no guest rule is asserted for them"]
 
 [[contract]]
 id = "linux-name_to_handle_at"
@@ -4681,13 +4681,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 303
 name = "name_to_handle_at"
-status = "implemented"
+status = "partial"
 contract = "linux-name_to_handle_at"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_name_to_handle_at"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/fd_ops.rs:export_handle_decode_uses_complete_dwords_only"]
-validation_gaps = ["Existing source/helper coverage does not establish the full name_to_handle_at raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["explicit-none"]
+tests = ["kernel/src/syscall/fs/fd_ops.rs:export_handle_decode_uses_complete_dwords_only", "tests/guest/portable/fd-lifecycle-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["AT_HANDLE_CONNECTABLE is not exercised: TheKernel's export encoders never emit a connectable handle, so only the flag-combination EINVAL matrix and the decode-side FILEID user-flag rules are asserted"]
 
 [[contract]]
 id = "linux-open_by_handle_at"
@@ -4704,13 +4704,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 304
 name = "open_by_handle_at"
-status = "implemented"
+status = "partial"
 contract = "linux-open_by_handle_at"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_open_by_handle_at"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/fd_ops.rs:export_handle_decode_uses_complete_dwords_only"]
-validation_gaps = ["Existing source/helper coverage does not establish the full open_by_handle_at raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["explicit-none"]
+tests = ["kernel/src/syscall/fs/fd_ops.rs:export_handle_decode_uses_complete_dwords_only", "tests/guest/portable/fd-lifecycle-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["AT_HANDLE_CONNECTABLE is not exercised: TheKernel's export encoders never emit a connectable handle, so only the flag-combination EINVAL matrix and the decode-side FILEID user-flag rules are asserted"]
 
 [[contract]]
 id = "linux-close"
@@ -4754,8 +4754,8 @@ status = "implemented"
 contract = "linux-close_range"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_close_range"
 conditional = "explicit-none"
-tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork"]
-validation_gaps = ["Existing source/helper coverage does not establish the full close_range raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/file/fd_table.rs:last_descriptor_close_is_counted_across_dup_and_fork", "tests/guest/portable/fd-lifecycle-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6410,8 +6410,8 @@ status = "implemented"
 contract = "linux-pidfd_open"
 handler = "kernel/src/syscall/fs/pidfd.rs:sys_pidfd_open"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/pidfd.rs:process_pidfd_identity_rejects_reap_and_pid_reuse"]
-validation_gaps = ["Existing source/helper coverage does not establish the full pidfd_open raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/pidfd.rs:process_pidfd_identity_rejects_reap_and_pid_reuse", "tests/guest/portable/fd-lifecycle-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6433,8 +6433,8 @@ status = "implemented"
 contract = "linux-pidfd_getfd"
 handler = "kernel/src/syscall/fs/pidfd.rs:sys_pidfd_getfd"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/pidfd.rs:process_pidfd_identity_rejects_reap_and_pid_reuse"]
-validation_gaps = ["Existing source/helper coverage does not establish the full pidfd_getfd raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/pidfd.rs:process_pidfd_identity_rejects_reap_and_pid_reuse", "tests/guest/portable/fd-lifecycle-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
