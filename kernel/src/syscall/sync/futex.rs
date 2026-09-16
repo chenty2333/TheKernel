@@ -1079,6 +1079,9 @@ fn do_futex_lock_pi(
 
         let mut decided: Option<AxResult<isize>> = None;
         let mut retry = false;
+        let contended_word = core::cell::Cell::new(0u32);
+        let mut takeover_owner_died = false;
+        let mut owner_exiting = false;
         let result = futex.wq.wait_pi(
             futex.waiter_owner(),
             u32::MAX,
@@ -1139,6 +1142,7 @@ fn do_futex_lock_pi(
                             return Ok(None);
                         }
                         pi_state.attach(PiWord::decode(current_word).tid);
+                        contended_word.set(current_word);
                         Ok(Some(PiWaiter::new(tid, axtask::sched_state(&current()))))
                     }
                 }
@@ -1146,13 +1150,23 @@ fn do_futex_lock_pi(
             |waiter| {
                 // `attach_to_pi_owner()`: the owner named by the user word must
                 // name a live, non-exiting task. A TID that names nothing is
-                // `-ESRCH`; a task that is already leaving is `-EAGAIN`, which
-                // is the errno Linux surfaces when the exit-time fixup has not
-                // published `FUTEX_OWNER_DIED` yet.
+                // `-ESRCH`, unless the word already carries
+                // `FUTEX_OWNER_DIED`, in which case the caller takes the dead
+                // owner's lock over directly. A task that is already leaving
+                // is `-EAGAIN`, which `futex_lock_pi()` consumes internally
+                // while it waits for the exit-time fixup to publish
+                // `FUTEX_OWNER_DIED`; neither errno reaches userspace here.
                 let owner_tid = futex_word_task_tid(self_task.as_thread(), pi_state.owner_tid())?;
                 match crate::task::get_visible_task_including_exiting(owner_tid) {
-                    Err(_) => return Err(AxError::NoSuchProcess),
+                    Err(_) => {
+                        if PiWord::decode(contended_word.get()).owner_died {
+                            takeover_owner_died = true;
+                            return Err(AxError::WouldBlock);
+                        }
+                        return Err(AxError::NoSuchProcess);
+                    }
                     Ok(task) if task.as_thread().pending_exit() => {
+                        owner_exiting = true;
                         return Err(AxError::WouldBlock);
                     }
                     Ok(_) => {}
@@ -1210,7 +1224,53 @@ fn do_futex_lock_pi(
                 fault_in_user_writeable(caller, address)?;
                 continue;
             }
-            Err(WaitConditionError::Fault(error)) => return Err(error),
+            Err(WaitConditionError::Fault(error)) => {
+                if takeover_owner_died {
+                    // `attach_to_pi_owner()` with `FUTEX_OWNER_DIED` set and
+                    // no task behind the TID: take the lock over with
+                    // `FUTEX_WAITERS | FUTEX_OWNER_DIED | vpid`. A cmpxchg
+                    // that loses a race retries through the loop.
+                    let dead_tid = PiWord::decode(contended_word.get()).tid;
+                    let observed = fault_read_u32(caller, address)?;
+                    let word = PiWord::decode(observed);
+                    if word.owner_died && word.tid == dead_tid && word.tid != tid {
+                        let new_value = PiWord {
+                            tid,
+                            waiters: true,
+                            owner_died: true,
+                        }
+                        .encode();
+                        match futex_cas_at(
+                            address,
+                            namespace,
+                            expected_key.as_ref(),
+                            observed,
+                            new_value,
+                            &caller_aspace,
+                        ) {
+                            Ok(true) => {
+                                pi_state.attach(tid);
+                                return Ok(0);
+                            }
+                            Ok(false) => continue,
+                            Err(WaitConditionError::Retry) => {
+                                fault_in_user_writeable(caller, address)?;
+                                continue;
+                            }
+                            Err(WaitConditionError::Fault(error)) => return Err(error),
+                        }
+                    }
+                    continue;
+                }
+                if owner_exiting && error == AxError::WouldBlock {
+                    // `futex_lock_pi()`'s `-EAGAIN` arm puts the exiting owner
+                    // reference, schedules, and retries; the exit-time fixup
+                    // publishes `FUTEX_OWNER_DIED` for the next pass.
+                    axtask::yield_now();
+                    continue;
+                }
+                return Err(error);
+            }
         }
     }
 }
@@ -1805,9 +1865,8 @@ pub fn sys_futex(
             validate_futex_key_access(uaddr, legacy_flags, &caller)?;
             if op.robust_unlock {
                 // `futex_robust_unlock()` zeroes the futex word before the
-                // wakeup, then clears the pending list op.
+                // wakeup.
                 futex_robust_unlock_store(&caller, uaddr)?;
-                futex_robust_list_clear_pending(&caller, uaddr2, op.robust_list32)?;
             }
             let count = wake_futex(
                 uaddr.addr(),
@@ -1817,6 +1876,11 @@ pub fn sys_futex(
                 &caller_aspace,
                 &caller,
             )?;
+            if op.robust_unlock {
+                // The pending list op is cleared only after the wake itself
+                // succeeded.
+                futex_robust_list_clear_pending(&caller, uaddr2, op.robust_list32)?;
+            }
             Ok(count as _)
         }
         FutexCommand::WakeOp => {
@@ -1868,8 +1932,12 @@ pub fn sys_futex(
                         expected2.as_ref(),
                         |old| operation.updated(old),
                     )
-                    .map(|_| true)
                     .map_err(convert)
+                    .and_then(|old| {
+                        operation
+                            .compare(old)
+                            .map_err(|_| WaitConditionError::Fault(LinuxError::ENOSYS.into()))
+                    })
                 });
                 match result {
                     Ok(count) => return Ok(count as _),
@@ -2031,6 +2099,11 @@ pub fn sys_futex(
             result
         }
         FutexCommand::WaitRequeuePi => {
+            // `futex_wait_requeue_pi()` rejects a same-address requeue with
+            // `-EINVAL` before it touches any user memory.
+            if uaddr.addr() == uaddr2.addr() {
+                return Err(AxError::InvalidInput);
+            }
             validate_futex_word_read(uaddr, size_of::<u32>(), &caller)?;
             do_futex_wait_requeue_pi(
                 caller_aspace,
@@ -2043,6 +2116,11 @@ pub fn sys_futex(
             )
         }
         FutexCommand::CmpRequeuePi => {
+            // `futex_requeue()` answers both `-EINVAL` checks before it reads
+            // the words.
+            if uaddr.addr() == uaddr2.addr() || value != 1 {
+                return Err(AxError::InvalidInput);
+            }
             validate_futex_word_read(uaddr, size_of::<u32>(), &caller)?;
             do_futex_cmp_requeue_pi(
                 caller_aspace,

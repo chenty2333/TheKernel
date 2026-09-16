@@ -1794,28 +1794,23 @@ impl WaitQueue {
         let woke = {
             let _gate = self.gate.lock();
             let mut queue = self.queue.lock();
-            if reject_pi && Self::pi_top_locked(&queue).is_some() {
-                return Err(());
-            }
-            // The scan-level rejection below is deliberately disabled here:
-            // the wake path tests the whole queue above, which is the stricter
-            // of the two and keeps `FUTEX_WAKE` from waking anyone before it
-            // reports `-EINVAL`.
+            // The scan rejects only when the next waiter it would wake carries
+            // PI state: the waiters already woken stay woken, like the
+            // `break` in `futex_wake()`'s `hb_waiters_pending` walk which
+            // still runs `wake_up_q(&wake_q)` on the way to `-EINVAL`.
             Self::wake_and_requeue_locked(
                 &mut queue,
                 count,
                 mask,
                 None,
-                false,
+                reject_pi,
                 &mut pending_wakers,
                 &mut retired,
             )
-            .expect("a wake-only scan cannot reject PI waiters")
-            .0
         };
         pending_wakers.finish();
         retired.finish();
-        Ok(woke)
+        woke.map(|(woke, _)| woke)
     }
 
     /// Runs a nofault atomic operation under both queue gates, always waking
@@ -3385,6 +3380,24 @@ mod pi_tests {
         );
         assert!(dst.wq.is_empty());
         assert_eq!(src.wq.wake_inner(usize::MAX, u32::MAX, true), Err(()));
+        drop((first, pi));
+    }
+
+    #[test]
+    fn wake_keeps_the_wakeups_that_precede_a_pi_rejection() {
+        // `FUTEX_WAKE` scans the same way: the PI waiter stops the scan with
+        // `-EINVAL`, but a plain waiter ahead of it stays woken.
+        ensure_scheduler();
+        let src = Arc::new(FutexEntry::new());
+        let first = add_plain_waiter(&src);
+        let pi = add_pi_waiter(&src, 0x55, fifo(1));
+        assert_eq!(src.wq.queue.lock().len, 2);
+        assert_eq!(src.wq.wake_inner(usize::MAX, u32::MAX, true), Err(()));
+        assert_eq!(
+            src.wq.queue.lock().len,
+            1,
+            "the leading non-PI waiter must have been woken"
+        );
         drop((first, pi));
     }
 
