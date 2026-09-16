@@ -1,12 +1,14 @@
 /*
  * Linux v7.2.3 mount/quota/fanotify UAPI surface, asserted through raw
- * syscalls only.  Covers open_tree(428), fsconfig(431), fsmount(432),
- * fspick(433), statmount(457), quotactl(179), quotactl_fd(443),
- * pivot_root(155), fanotify_init(300) and fanotify_mark(301).
+ * syscalls only.  Covers open_tree(428), move_mount(429), fsopen(430),
+ * fsconfig(431), fsmount(432), fspick(433), mount_setattr(442), statmount(457),
+ * listmount(458), quotactl(179), quotactl_fd(443), pivot_root(155),
+ * fanotify_init(300) and fanotify_mark(301).
  *
  * open_tree_attr(467) is owned by fsattrs-differential.c (case
- * open-tree-attr.raw-differential); mount(165) and umount2(166) are out of
- * scope for this program.  Every assertion below is a property of the
+ * open-tree-attr.raw-differential).  mount(165) is out of scope for this
+ * program, and umount2(166) appears only as teardown of the placement the
+ * mount-descriptors case creates.  Every assertion below is a property of the
  * reference fs/namespace.c, fs/fsopen.c, fs/quota/quota.c and
  * fs/notify/fanotify/fanotify_user.c in 7.2.3, in the order those files apply
  * it, so the same binary must pass on both guests.
@@ -26,23 +28,29 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 /* Native x86_64 UAPI, independent of the build host's libc headers. */
 enum {
     NR_PIVOT_ROOT = 155,
+    NR_UMOUNT2 = 166,
     NR_QUOTACTL = 179,
     NR_FANOTIFY_INIT = 300,
     NR_FANOTIFY_MARK = 301,
     NR_OPEN_TREE = 428,
+    NR_MOVE_MOUNT = 429,
     NR_FSOPEN = 430,
     NR_FSCONFIG = 431,
     NR_FSMOUNT = 432,
     NR_FSPICK = 433,
+    NR_MOUNT_SETATTR = 442,
     NR_QUOTACTL_FD = 443,
     NR_STATMOUNT = 457,
+    NR_LISTMOUNT = 458,
 };
 #define OPEN_TREE_CLONE 0x1U
 #define OPEN_TREE_NAMESPACE 0x2U
@@ -62,6 +70,21 @@ enum {
 #define FSCONFIG_CMD_RECONFIGURE 7U
 #define FSCONFIG_CMD_CREATE_EXCL 8U
 #define STATMOUNT_BY_FD 0x1U
+/* include/uapi/linux/mount.h:71-79, 118-141, 169, 212 and 238. */
+#define MOVE_MOUNT_F_EMPTY_PATH 0x04U
+#define MOVE_MOUNT_T_EMPTY_PATH 0x40U
+#define MOVE_MOUNT_SET_GROUP 0x100U
+#define MOVE_MOUNT_BENEATH 0x200U
+#define MOUNT_ATTR_RDONLY 0x1ULL
+#define MOUNT_ATTR_NOATIME 0x10ULL
+#define MS_PRIVATE (1U << 18)
+#define MS_SHARED (1U << 20)
+#define MNT_DETACH 2
+#define LISTMOUNT_REVERSE 1U
+#define LSMT_ROOT (~0ULL)
+/* include/uapi/linux/magic.h:6,25: the fixture's own filesystem and tmpfs. */
+#define TMPFS_MAGIC 0x01021994U
+#define EXT4_SUPER_MAGIC 0xEF53U
 struct mnt_id_req {
     uint32_t size;
     uint32_t mnt_fd; /* union with mnt_ns_fd */
@@ -70,6 +93,12 @@ struct mnt_id_req {
     uint64_t mnt_ns_id;
 };
 _Static_assert(sizeof(struct mnt_id_req) == 32, "mnt_id_req is MNT_ID_REQ_SIZE_VER1");
+/* struct mount_attr (include/uapi/linux/mount.h:143-153) is
+ * MOUNT_ATTR_SIZE_VER0 bytes with no trailing version-1 extension. */
+struct mount_attr {
+    uint64_t attr_set, attr_clr, propagation, userns_fd;
+};
+_Static_assert(sizeof(struct mount_attr) == 32, "mount_attr is MOUNT_ATTR_SIZE_VER0");
 struct statmount {
     uint32_t size, mnt_opts;
     uint64_t mask;
@@ -227,11 +256,27 @@ _Static_assert(FAN_MARK_ONLYDIR == 0x8 && FAN_MARK_FLUSH == 0x80 && FAN_OPEN_PER
 static const char *active;
 static char dir[] = "/root/thekernel-mount-api-XXXXXX";
 static char file_path[sizeof(dir) + 8];
+static char target_path[sizeof(dir) + 8];
 static int dfd = -1, file_fd = -1, pipe_fd[2] = { -1, -1 };
 /* Big enough for the largest XFS quota reply (fs_quota_statv, 160 bytes) and
  * addressable from the unprivileged child bodies. */
 static uint8_t format_buffer[256];
 static int fanotify_absent, quota_absent, quota_active;
+/* The mount-descriptor case keeps every object it hands to the kernel at file
+ * scope, because the unprivileged probes run in a forked child. */
+static uint64_t mount_ids[32], reverse_mount_ids[32];
+static uint8_t statmount_buffer[1024];
+static char oversized_fs_name[4097];
+static struct mount_attr noop_mount_attr;
+static struct mount_attr rdonly_mount_attr = { .attr_set = MOUNT_ATTR_RDONLY };
+static struct mount_attr clear_rdonly_mount_attr = { .attr_clr = MOUNT_ATTR_RDONLY };
+static struct mount_attr unknown_mount_attr = { .attr_set = 1ULL << 63 };
+static struct mount_attr double_propagation_mount_attr = { .propagation = MS_SHARED | MS_PRIVATE };
+static struct mount_attr atime_only_mount_attr = { .attr_set = MOUNT_ATTR_NOATIME };
+static struct {
+    struct mount_attr attr;
+    uint64_t tail;
+} extended_mount_attr = { .tail = 1 }, extended_mount_attr_zeroed;
 
 static void cleanup(void) {
     if (file_fd >= 0) (void)close(file_fd);
@@ -342,6 +387,21 @@ static void body_quota_xgetqstat(void) {
     child_probe_rc =
         (int)syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XGETQSTAT, USRQUOTA), 0, &format_buffer);
 }
+/* The mount-descriptor admissions that Linux decides before it copies
+ * anything: fsopen(2) checks may_mount() and the flag word first, move_mount(2)
+ * its flag word, and mount_setattr(2) its no-op short circuit. */
+static void body_fsopen(void) {
+    child_probe_rc = (int)syscall(NR_FSOPEN, "tmpfs", 0);
+}
+static void body_fsopen_bad_flags(void) {
+    child_probe_rc = (int)syscall(NR_FSOPEN, BAD, BAD_FLAGS);
+}
+static void body_move_mount(void) {
+    child_probe_rc = (int)syscall(NR_MOVE_MOUNT, -1, BAD, -1, BAD, BAD_FLAGS);
+}
+static void body_mount_setattr_noop(void) {
+    child_probe_rc = (int)syscall(NR_MOUNT_SETATTR, AT_FDCWD, "/", 0, &noop_mount_attr, 32);
+}
 /* The errno a call that must fail in the unprivileged child left, or 0. */
 static int unprivileged_errno(void (*body)(void)) {
     int reported = unprivileged_child(body);
@@ -386,6 +446,7 @@ int main(void) {
     dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     check(dfd >= 0, "directory-open");
     check(snprintf(file_path, sizeof(file_path), "%s/file", dir) > 0, "path-format");
+    check(snprintf(target_path, sizeof(target_path), "%s/target", dir) > 0, "target-format");
     file_fd = openat(dfd, "file", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
     check(file_fd >= 0, "file-open");
     check(mkdirat(dfd, "target", 0700) == 0, "target-mkdir");
@@ -890,6 +951,199 @@ int main(void) {
               syscall(NR_FANOTIFY_MARK, group, FAN_MARK_FLUSH, 0, -1, BAD) == 0,
           "flush-ignores-path");
     mark("FLUSH_IGNORES_PATH");
+    done();
+
+    /* 430/429/442/458: the descriptor half of the new mount API, which the
+     * per-syscall cases above only use as setup.  fsopen(2) admits the caller
+     * and the flag word before it copies the filesystem name, and its
+     * strndup_user() answers EINVAL once the name does not terminate inside the
+     * first page (fs/fsopen.c:121-146).  move_mount(2) validates the flag word
+     * before either pathname, looks the target up before the source, and
+     * rejects a placement whose directory-ness differs (fs/namespace.c:4577-4647
+     * and 3642-3643).  mount_setattr(2) settles the attribute shape before the
+     * copy-in, skips the target entirely for a no-op, and reaches the pathname
+     * only through getname_flags(), so a NULL pointer is EFAULT even with
+     * AT_EMPTY_PATH (fs/namespace.c:5145-5184).  listmount(2) validates the
+     * flag word, the count and the request before the copy-in, and orders the
+     * reply by unique mount id (fs/namespace.c:6123-6170, 5891-5922, 6026-6087).
+     * umount2(166) appears only as fixture teardown for the placement this case
+     * creates; its own contract belongs to another cell. */
+    begin("mount-descriptors.raw-differential");
+    int fs_ctx_cloexec = (int)syscall(NR_FSOPEN, "tmpfs", FSOPEN_CLOEXEC);
+    int fs_ctx_plain = (int)syscall(NR_FSOPEN, "tmpfs", 0);
+    check(fs_ctx_cloexec >= 0 && fs_ctx_plain >= 0 && fs_ctx_cloexec != fs_ctx_plain, "fsopen-fds");
+    check(fcntl(fs_ctx_cloexec, F_GETFD) == FD_CLOEXEC && fcntl(fs_ctx_plain, F_GETFD) == 0,
+          "fsopen-cloexec");
+    mark("FSOPEN_CLOEXEC_DESCRIPTOR");
+    ERROR(syscall(NR_FSOPEN, "tmpfs", 0x2), EINVAL, "unknown-flag");
+    ERROR(syscall(NR_FSOPEN, BAD, BAD_FLAGS), EINVAL, "flags-before-name");
+    mark("FSOPEN_FLAGS_BEFORE_NAME");
+    ERROR(syscall(NR_FSOPEN, BAD, 0), EFAULT, "name-copy");
+    ERROR(syscall(NR_FSOPEN, "", 0), ENODEV, "empty-name");
+    ERROR(syscall(NR_FSOPEN, "thekernel-no-such-fs", 0), ENODEV, "unknown-name");
+    memset(oversized_fs_name, 'a', sizeof(oversized_fs_name));
+    oversized_fs_name[sizeof(oversized_fs_name) - 1] = 0;
+    ERROR(syscall(NR_FSOPEN, oversized_fs_name, 0), EINVAL, "oversized-name");
+    mark("FSOPEN_NAME_ADMISSION");
+    check(unprivileged_errno(body_fsopen) == EPERM, "unprivileged-fsopen");
+    check(unprivileged_errno(body_fsopen_bad_flags) == EPERM, "unprivileged-fsopen-flags");
+    mark("FSOPEN_UNPRIVILEGED_EPERM");
+    check(close(fs_ctx_cloexec) == 0 && close(fs_ctx_plain) == 0, "fsopen-close");
+
+    ERROR(syscall(NR_MOVE_MOUNT, -1, BAD, -1, BAD, BAD_FLAGS), EINVAL, "unknown-flag");
+    ERROR(syscall(NR_MOVE_MOUNT, -1, BAD, -1, BAD, MOVE_MOUNT_BENEATH | MOVE_MOUNT_SET_GROUP),
+          EINVAL, "beneath-with-set-group");
+    mark("MOVE_MOUNT_FLAGS_BEFORE_PATHS");
+    ERROR(syscall(NR_MOVE_MOUNT, -1, BAD, AT_FDCWD, "/nonexistent-mount-api", 0), ENOENT,
+          "target-before-source");
+    ERROR(syscall(NR_MOVE_MOUNT, -1, BAD, AT_FDCWD, "/", 0), EFAULT, "source-copy");
+    mark("MOVE_MOUNT_TARGET_BEFORE_SOURCE");
+    ERROR(syscall(NR_MOVE_MOUNT, 1 << 30, NULL, AT_FDCWD, "/", MOVE_MOUNT_F_EMPTY_PATH), EBADF,
+          "source-empty-path-fd");
+    ERROR(syscall(NR_MOVE_MOUNT, AT_FDCWD, "/", 1 << 30, "", MOVE_MOUNT_T_EMPTY_PATH), EBADF,
+          "target-empty-path-fd");
+    ERROR(syscall(NR_MOVE_MOUNT, -1, NULL, AT_FDCWD, "/", MOVE_MOUNT_F_EMPTY_PATH), EBADF,
+          "at-fdcwd-is-not-a-mount");
+    mark("MOVE_MOUNT_EMPTY_PATH_DESCRIPTOR");
+    ERROR(syscall(NR_MOVE_MOUNT, AT_FDCWD, dir, AT_FDCWD, "/", 0), EINVAL, "source-not-mount-root");
+    ERROR(syscall(NR_MOVE_MOUNT, AT_FDCWD, "/", AT_FDCWD, file_path, 0), EINVAL, "file-target");
+    mark("MOVE_MOUNT_PLACEMENT_TYPE");
+    check(unprivileged_errno(body_move_mount) == EPERM, "unprivileged-move-mount");
+    mark("MOVE_MOUNT_UNPRIVILEGED_EPERM");
+    int attach_ctx = (int)syscall(NR_FSOPEN, "tmpfs", 0);
+    check(attach_ctx >= 0, "attach-fsopen");
+    check(syscall(NR_FSCONFIG, attach_ctx, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0, "attach-create");
+    int attach_mnt = (int)syscall(NR_FSMOUNT, attach_ctx, 0, 0);
+    check(attach_mnt >= 0, "attach-fsmount");
+    check(close(attach_ctx) == 0, "attach-context-close");
+    ERROR(syscall(NR_MOVE_MOUNT, attach_mnt, "", AT_FDCWD, file_path, MOVE_MOUNT_F_EMPTY_PATH),
+          EINVAL, "detached-file-target");
+    struct statfs source_fs, target_fs;
+    check(statfs(dir, &source_fs) == 0 && statfs(target_path, &target_fs) == 0, "statfs-before");
+    check((unsigned)source_fs.f_type == EXT4_SUPER_MAGIC &&
+              (unsigned)target_fs.f_type == EXT4_SUPER_MAGIC,
+          "fixture-is-ext4");
+    check(syscall(NR_MOVE_MOUNT, attach_mnt, "", AT_FDCWD, target_path, MOVE_MOUNT_F_EMPTY_PATH) == 0,
+          "attach");
+    check(statfs(target_path, &target_fs) == 0 && (unsigned)target_fs.f_type == TMPFS_MAGIC,
+          "target-is-tmpfs");
+    check(statfs(dir, &source_fs) == 0 && (unsigned)source_fs.f_type == EXT4_SUPER_MAGIC,
+          "source-unchanged");
+    mark("MOVE_MOUNT_ATTACH_DETACHED");
+    check(close(attach_mnt) == 0, "attach-mount-close");
+    check(syscall(NR_UMOUNT2, target_path, MNT_DETACH) == 0, "detach");
+    check(statfs(target_path, &target_fs) == 0 && (unsigned)target_fs.f_type == EXT4_SUPER_MAGIC,
+          "target-restored");
+    mark("MOVE_MOUNT_DETACH_RESTORES");
+
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, BAD, BAD_FLAGS, BAD, 32), EINVAL, "unknown-flag");
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, BAD, 31), EINVAL, "short-attribute");
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, BAD, 0), EINVAL, "empty-attribute");
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, BAD, 4097), E2BIG, "oversized-attribute");
+    mark("MOUNT_SETATTR_SHAPE_BEFORE_COPY");
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, BAD, 32), EFAULT, "attribute-copy");
+    mark("MOUNT_SETATTR_ATTR_COPY");
+    check(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, &noop_mount_attr, 32) == 0, "noop");
+    mark("MOUNT_SETATTR_NOOP_SKIPS_PATH");
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, &unknown_mount_attr, 32), EINVAL, "unknown-attr");
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, &double_propagation_mount_attr, 32), EINVAL,
+          "two-propagation-bits");
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, &atime_only_mount_attr, 32), EINVAL,
+          "atime-set-without-clear");
+    mark("MOUNT_SETATTR_ATTRIBUTE_RULES");
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, &extended_mount_attr, 40), E2BIG, "tail-bytes");
+    check(syscall(NR_MOUNT_SETATTR, dfd, BAD, 0, &extended_mount_attr_zeroed, 40) == 0, "zero-tail");
+    mark("MOUNT_SETATTR_TRAILING_BYTES");
+    ERROR(syscall(NR_MOUNT_SETATTR, dfd, target_path, 0, &rdonly_mount_attr, 32), EINVAL,
+          "not-a-mount-root");
+    mark("MOUNT_SETATTR_MOUNT_ROOT_ONLY");
+    check(unprivileged_errno(body_mount_setattr_noop) == EPERM, "unprivileged-noop");
+    mark("MOUNT_SETATTR_UNPRIVILEGED_EPERM");
+    int attr_ctx = (int)syscall(NR_FSOPEN, "tmpfs", 0);
+    check(attr_ctx >= 0, "attr-fsopen");
+    check(syscall(NR_FSCONFIG, attr_ctx, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0, "attr-create");
+    int attr_mnt = (int)syscall(NR_FSMOUNT, attr_ctx, 0, 0);
+    check(attr_mnt >= 0, "attr-fsmount");
+    check(close(attr_ctx) == 0, "attr-context-close");
+    ERROR(syscall(NR_MOUNT_SETATTR, attr_mnt, NULL, AT_EMPTY_PATH, &rdonly_mount_attr, 32), EFAULT,
+          "null-pathname");
+    mark("MOUNT_SETATTR_PATH_ADMISSION");
+    check(syscall(NR_MOUNT_SETATTR, attr_mnt, "", AT_EMPTY_PATH, &rdonly_mount_attr, 32) == 0,
+          "set-readonly");
+    struct statvfs detached_fs;
+    check(fstatvfs(attr_mnt, &detached_fs) == 0 && (detached_fs.f_flag & ST_RDONLY) != 0,
+          "detached-readonly");
+    mark("MOUNT_SETATTR_DETACHED_RDONLY");
+    check(syscall(NR_MOUNT_SETATTR, attr_mnt, "", AT_EMPTY_PATH, &clear_rdonly_mount_attr, 32) == 0,
+          "clear-readonly");
+    check(fstatvfs(attr_mnt, &detached_fs) == 0 && (detached_fs.f_flag & ST_RDONLY) == 0,
+          "detached-writable");
+    mark("MOUNT_SETATTR_DETACHED_CLEAR");
+    check(close(attr_mnt) == 0, "attr-mount-close");
+
+    struct mnt_id_req list_req, single, cursor;
+    memset(&list_req, 0, sizeof(list_req));
+    list_req.size = sizeof(list_req);
+    ERROR(syscall(NR_LISTMOUNT, BAD, BAD, 1, 0x2), EINVAL, "unknown-flags");
+    ERROR(syscall(NR_LISTMOUNT, BAD, BAD, 1000001, 0), EOVERFLOW, "count-limit");
+    mark("LISTMOUNT_FLAGS_AND_COUNT");
+    ERROR(syscall(NR_LISTMOUNT, BAD, mount_ids, 1, 0), EFAULT, "request-copy");
+    mark("LISTMOUNT_REQUEST_COPY");
+    ERROR(syscall(NR_LISTMOUNT, &list_req, mount_ids, 4, 0), EINVAL, "zero-mount-id");
+    list_req.mnt_id = 1ULL << 31;
+    ERROR(syscall(NR_LISTMOUNT, &list_req, mount_ids, 4, 0), EINVAL, "unique-id-floor");
+    list_req.mnt_id = LSMT_ROOT;
+    list_req.mnt_fd = 3;
+    list_req.mnt_ns_id = 1;
+    ERROR(syscall(NR_LISTMOUNT, &list_req, mount_ids, 4, 0), EINVAL, "namespace-fd-and-id");
+    list_req.mnt_fd = 0;
+    list_req.mnt_ns_id = 0;
+    mark("LISTMOUNT_REQUEST_IDENTITY");
+    long listed = syscall(NR_LISTMOUNT, &list_req, mount_ids, 32, 0);
+    check(listed >= 2 && listed <= 32, "list-count");
+    check(mount_ids[0] > (1ULL << 31), "unique-id-range");
+    int ascending = 1;
+    for (long index = 1; index < listed; index++) {
+        if (mount_ids[index] <= mount_ids[index - 1]) {
+            ascending = 0;
+        }
+    }
+    check(ascending, "ascending-ids");
+    long reversed = syscall(NR_LISTMOUNT, &list_req, reverse_mount_ids, 32, LISTMOUNT_REVERSE);
+    check(reversed == listed, "reverse-count");
+    int mirrored = 1;
+    for (long index = 0; index < listed; index++) {
+        if (reverse_mount_ids[index] != mount_ids[listed - 1 - index]) {
+            mirrored = 0;
+        }
+    }
+    check(mirrored, "reverse-order");
+    mark("LISTMOUNT_ROOT_FORWARD_REVERSE");
+    single = list_req;
+    single.mnt_id = mount_ids[0];
+    single.param = STATMOUNT_MNT_BASIC;
+    check(syscall(NR_STATMOUNT, &single, statmount_buffer, sizeof(statmount_buffer), 0) == 0,
+          "identity-statmount");
+    struct statmount identity_prefix;
+    memcpy(&identity_prefix, statmount_buffer, sizeof(identity_prefix));
+    check(identity_prefix.mnt_id == mount_ids[0], "identity-match");
+    mark("LISTMOUNT_STATMOUNT_IDENTITY");
+    cursor = list_req;
+    cursor.param = mount_ids[0];
+    check(syscall(NR_LISTMOUNT, &cursor, reverse_mount_ids, 32, 0) == listed - 1, "cursor");
+    mark("LISTMOUNT_CURSOR");
+    int seen_ctx = (int)syscall(NR_FSOPEN, "tmpfs", 0);
+    check(seen_ctx >= 0, "seen-fsopen");
+    check(syscall(NR_FSCONFIG, seen_ctx, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0, "seen-create");
+    int seen_mnt = (int)syscall(NR_FSMOUNT, seen_ctx, 0, 0);
+    check(seen_mnt >= 0, "seen-fsmount");
+    check(close(seen_ctx) == 0, "seen-context-close");
+    check(syscall(NR_MOVE_MOUNT, seen_mnt, "", AT_FDCWD, target_path, MOVE_MOUNT_F_EMPTY_PATH) == 0,
+          "seen-attach");
+    check(syscall(NR_LISTMOUNT, &list_req, reverse_mount_ids, 32, 0) == listed + 1, "seen-count");
+    check(close(seen_mnt) == 0, "seen-mount-close");
+    check(syscall(NR_UMOUNT2, target_path, MNT_DETACH) == 0, "seen-detach");
+    mark("LISTMOUNT_ATTACH_OBSERVED");
     done();
 
     check(close(file_fd) == 0, "close"); file_fd = -1;
