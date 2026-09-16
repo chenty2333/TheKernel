@@ -5576,6 +5576,35 @@ impl AddrSpace {
             })
     }
 
+    /// Returns the `mm->data_vm` bytes already present in an exact virtual
+    /// range, filtered the way [`AddrSpace::current_data_mapping_bytes`] does.
+    /// A MAP_FIXED replacement's old data mappings are detached before Linux's
+    /// `may_expand_vm()` runs, so the `RLIMIT_DATA` arm charges only the net
+    /// data growth `length - covered_data_bytes`.
+    pub fn data_bytes_in_range(&self, start: VirtAddr, size: usize) -> AxResult<usize> {
+        if size == 0 {
+            return Ok(0);
+        }
+        let range = VirtAddrRange::try_from_start_size(start, size).ok_or(AxError::NoMemory)?;
+        self.areas
+            .iter_overlapping(range)
+            .filter(|area| {
+                is_data_mapping_area(
+                    area.flags(),
+                    area.backend(),
+                    area.start(),
+                    &self.growdown_starts,
+                )
+            })
+            .try_fold(0usize, |total, area| {
+                let overlap_start = area.start().max(range.start);
+                let overlap_end = area.end().min(range.end);
+                total
+                    .checked_add(overlap_end.sub_addr(overlap_start))
+                    .ok_or(AxError::NoMemory)
+            })
+    }
+
     pub fn resident_user_bytes(&self) -> usize {
         self.areas
             .iter()

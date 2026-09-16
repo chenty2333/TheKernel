@@ -29,6 +29,10 @@ const USER_ADDRESS_SPACE_END: usize = USER_SPACE_BASE + USER_SPACE_SIZE;
 pub(crate) fn sys_brk_transaction(addr: usize, publish_layout: bool) -> AxResult<isize> {
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
+    // Linux holds `mmap_write_lock` across the whole `SYSCALL_DEFINE1(brk)`;
+    // reading the break outside any lock let a concurrent brk classify and
+    // publish against a stale `mm->brk`.
+    let _brk_guard = proc_data.brk_lock().lock();
     let current_top = proc_data.get_heap_top() as usize;
     let heap_base = proc_data.heap_base();
     let initial_heap_end = proc_data.heap_initial_end();

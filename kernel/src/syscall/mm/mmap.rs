@@ -897,6 +897,25 @@ pub fn sys_mmap(
     // bits, so `PROT_GROWSDOWN` on `mmap` is inert — unlike `mprotect`, where
     // it extends the range downwards.  An undefined bit such as 0x80000000
     // therefore maps PROT_NONE instead of failing with EINVAL.
+    // `arch/x86/kernel/sys_x86_64.c:SYSCALL_DEFINE6(mmap, ...)`:
+    //
+    // ```c
+    // 	if (off & ~PAGE_MASK)
+    // 		return -EINVAL;
+    //
+    // 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+    // ```
+    //
+    // The byte offset must be page-aligned for every mapping, and the wrapper
+    // rejects an unaligned one before `ksys_mmap_pgoff()` even reaches
+    // `fget()`.  The page offset itself is ignored for an anonymous mapping:
+    // `do_mmap()`'s `case MAP_PRIVATE:` sets `pgoff = addr >> PAGE_SHIFT` and
+    // the `case MAP_SHARED:` arm says `/* Ignore pgoff. */ pgoff = 0;`, so
+    // only the file branch ever reads the value.
+    let offset: usize = offset.try_into().map_err(|_| AxError::InvalidInput)?;
+    if !PageSize::Size4K.is_aligned(offset) {
+        return Err(AxError::InvalidInput);
+    }
     let permission_flags = MmapProt::from_bits_truncate(prot);
     let is_anonymous_mapping = flags & MmapFlags::ANONYMOUS.bits() != 0;
     let map_flags = match MmapFlags::from_bits(flags) {
@@ -941,10 +960,9 @@ pub fn sys_mmap(
         // `VM_DROPPABLE` is `INIT_VM_FLAG(DROPPABLE)` for `CONFIG_64BIT`, so on
         // x86-64 the `-EOPNOTSUPP` arm is dead.  The rest of the behaviour is
         // carried by the mapping below: private anonymous storage that is never
-        // reserved, is wiped on fork and never dumped.
-        if !is_anonymous_mapping {
-            return Err(AxError::InvalidInput);
-        }
+        // reserved, is wiped on fork and never dumped.  The `if (file)`
+        // branch's `-EINVAL` for `MAP_DROPPABLE` is raised after `fget()`
+        // below, matching `ksys_mmap_pgoff()`'s order.
         if map_flags.intersects(MmapFlags::LOCKED | MmapFlags::HUGE)
             || map_flags.contains(MmapFlags::GROWDOWN)
         {
@@ -977,6 +995,9 @@ pub fn sys_mmap(
     } else {
         None
     };
+    if map_type == MmapFlags::DROPPABLE && !is_anonymous_mapping {
+        return Err(AxError::InvalidInput);
+    }
     if length == 0 {
         return Err(AxError::InvalidInput);
     }
@@ -1002,24 +1023,6 @@ pub fn sys_mmap(
                 .map_err(|_| AxError::InvalidInput)?
                 .into());
         }
-    }
-    // `arch/x86/kernel/sys_x86_64.c:SYSCALL_DEFINE6(mmap, ...)`:
-    //
-    // ```c
-    // 	if (off & ~PAGE_MASK)
-    // 		return -EINVAL;
-    //
-    // 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
-    // ```
-    //
-    // The byte offset must be page-aligned for every mapping, but the page
-    // offset itself is ignored for an anonymous one: `do_mmap()`'s
-    // `case MAP_PRIVATE:` sets `pgoff = addr >> PAGE_SHIFT` and the
-    // `case MAP_SHARED:` arm says `/* Ignore pgoff. */ pgoff = 0;`, so only the
-    // file branch ever reads the value.
-    let offset: usize = offset.try_into().map_err(|_| AxError::InvalidInput)?;
-    if !PageSize::Size4K.is_aligned(offset) {
-        return Err(AxError::InvalidInput);
     }
 
     debug!(
@@ -1502,7 +1505,19 @@ pub fn sys_mmap(
             // admission edge: after the memlock checks, after every flag and
             // file validation, and before any topology change.  The `RLIMIT_AS`
             // half of that predicate has no mmap-path caller in this kernel
-            // yet; the `RLIMIT_DATA` half is enforced here.
+            // yet; the `RLIMIT_DATA` half is enforced here.  A fixed
+            // replacement's covered mappings are torn down before
+            // `may_expand_vm()` runs in Linux, so only the net data growth is
+            // charged — the same net accounting the `RLIMIT_AS` branch above
+            // applies to the whole range.
+            let data_growth = if map_flags.contains(MmapFlags::FIXED)
+                && !map_flags.contains(MmapFlags::FIXED_NOREPLACE)
+            {
+                let covered_data = aspace.data_bytes_in_range(start, length)?;
+                length.saturating_sub(covered_data)
+            } else {
+                length
+            };
             check_rlimit_data_growth(
                 proc_data,
                 &aspace,
@@ -1511,7 +1526,7 @@ pub fn sys_mmap(
                     !matches!(map_type, MmapFlags::PRIVATE | MmapFlags::DROPPABLE),
                     growdown_private_anon,
                 ),
-                length,
+                data_growth,
             )?;
 
             let populate = (map_flags.contains(MmapFlags::POPULATE)
@@ -3746,8 +3761,16 @@ fn msync_address_space(
     let (backends, saw_unmapped, busy) = {
         let aspace = aspace_handle.lock();
         if length == 0 {
-            (Vec::new(), false, false)
-        } else {
+            // `mm/msync.c` runs its `find_vma()` probe even for a zero length:
+            // an address with no VMA after it is `-ENOMEM`, while a VMA that
+            // contains `addr` makes the `start >= end` exit succeed.
+            let start = VirtAddr::from(addr);
+            let mapped = aspace
+                .find_area(start)
+                .is_some_and(|area| area.start() <= start);
+            return if mapped { Ok(0) } else { Err(AxError::NoMemory) };
+        }
+        {
             let start = VirtAddr::from(addr);
             let end = start + length;
             // `mm/msync.c` walks the VMAs in ascending address order with
