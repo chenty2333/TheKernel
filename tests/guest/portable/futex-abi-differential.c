@@ -1244,6 +1244,376 @@ static void *requeue_pi_waiter_main(void *opaque) {
     return NULL;
 }
 
+/* Bounded spin until a worker publishes a flag (used for the "I hold the
+ * futex" handshake, which is not a sleep state and so cannot use
+ * wait_until_blocked()). */
+static int wait_for_flag(_Atomic int *flag, const char *stage) {
+    int64_t start = monotonic_ns();
+    if (start < 0) {
+        return fail(stage, errno != 0 ? errno : EPROTO);
+    }
+    for (;;) {
+        if (atomic_load_explicit(flag, memory_order_acquire) != 0) {
+            return 0;
+        }
+        int64_t now = monotonic_ns();
+        if (now < 0 || now - start >= BLOCK_BOUND_NS) {
+            return fail(stage, ETIMEDOUT);
+        }
+        sched_yield();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* G. FUTEX_CMP_REQUEUE_PI onto an owned (contended) target            */
+/* ------------------------------------------------------------------ */
+
+/* futex_requeue() does not fail when the PI target already has an owner: it
+ * publishes FUTEX_WAITERS over that owner and queues the top waiter on the
+ * target's rt_mutex, returning the number of waiters it placed
+ * (kernel/futex/requeue.c:494-588, 621-684, kernel/futex/pi.c:660-674).  The
+ * owner's unlock then hands the futex to the queued waiter, whose
+ * FUTEX_WAIT_REQUEUE_PI returns 0. */
+
+struct requeue_pi_owner {
+    struct blocked_thread blocked;
+    uint32_t *target;
+    uint32_t *control;
+    _Atomic int locked;
+    long lock_result;
+    int lock_errno;
+    long park_result;
+    int park_errno;
+    long unlock_result;
+    int unlock_errno;
+};
+
+static void *requeue_pi_owner_main(void *opaque) {
+    struct requeue_pi_owner *owner = opaque;
+    struct timespec bound = relative_bound(WAIT_BOUND_NS);
+
+    atomic_store_explicit(&owner->blocked.tid, (int)syscall(SYS_gettid),
+                          memory_order_release);
+    atomic_store_explicit(&owner->blocked.entered, 1, memory_order_release);
+    errno = 0;
+    owner->lock_result = sys_futex(owner->target, FUTEX_LOCK_PI | PRIVATE, 0,
+                                   NULL, NULL, 0);
+    owner->lock_errno = owner->lock_result == -1 ? errno : 0;
+    atomic_store_explicit(&owner->locked, 1, memory_order_release);
+    if (owner->lock_result == 0) {
+        errno = 0;
+        owner->park_result = sys_futex(owner->control, FUTEX_WAIT | PRIVATE, 0,
+                                       &bound, NULL, 0);
+        owner->park_errno = owner->park_result == -1 ? errno : 0;
+        errno = 0;
+        owner->unlock_result = sys_futex(owner->target,
+                                         FUTEX_UNLOCK_PI | PRIVATE, 0, NULL,
+                                         NULL, 0);
+        owner->unlock_errno = owner->unlock_result == -1 ? errno : 0;
+    }
+    atomic_store_explicit(&owner->blocked.done, 1, memory_order_release);
+    return NULL;
+}
+
+struct requeue_pi_owned_case {
+    struct blocked_thread blocked;
+    uint32_t *source;
+    uint32_t *target;
+    /* Separate park words: the owner is released first, and the requeued
+     * waiter must stay parked until the main thread has sampled the word the
+     * handoff published. */
+    uint32_t control;
+    uint32_t owner_control;
+    long wait_result;
+    int wait_errno;
+    long control_result;
+    int control_errno;
+    long unlock_result;
+    int unlock_errno;
+};
+
+static void *requeue_pi_owned_waiter_main(void *opaque) {
+    struct requeue_pi_owned_case *test = opaque;
+    struct timespec bound = relative_bound(WAIT_BOUND_NS);
+
+    atomic_store_explicit(&test->blocked.tid, (int)syscall(SYS_gettid),
+                          memory_order_release);
+    atomic_store_explicit(&test->blocked.entered, 1, memory_order_release);
+    errno = 0;
+    test->wait_result = sys_futex(test->source,
+                                  FUTEX_WAIT_REQUEUE_PI | PRIVATE, 0, &bound,
+                                  test->target, FUTEX_BITSET_MATCH_ANY);
+    test->wait_errno = test->wait_result == -1 ? errno : 0;
+    if (test->wait_result == 0) {
+        /* The requeue transferred ownership of *target to this thread.  Park
+         * until the main thread has sampled the word. */
+        errno = 0;
+        test->control_result = sys_futex(&test->control, FUTEX_WAIT | PRIVATE,
+                                         0, &bound, NULL, 0);
+        test->control_errno = test->control_result == -1 ? errno : 0;
+        errno = 0;
+        test->unlock_result = sys_futex(test->target,
+                                        FUTEX_UNLOCK_PI | PRIVATE, 0, NULL,
+                                        NULL, 0);
+        test->unlock_errno = test->unlock_result == -1 ? errno : 0;
+    }
+    atomic_store_explicit(&test->blocked.done, 1, memory_order_release);
+    return NULL;
+}
+
+/* One owner thread holds the PI futex; the main thread (which does *not* own
+ * it) requeues a waiter onto it.  This is the shape the recorded defect
+ * names: the kernel answered EWOULDBLOCK where Linux queues. */
+static int test_requeue_pi_owned(void) {
+    uint32_t source = 0;
+    uint32_t target = 0;
+    struct requeue_pi_owner owner;
+    struct requeue_pi_owned_case test;
+
+    memset(&owner, 0, sizeof(owner));
+    memset(&test, 0, sizeof(test));
+    owner.target = &target;
+    owner.control = &test.owner_control;
+    test.source = &source;
+    test.target = &target;
+
+    if (start_blocked(&owner.blocked, requeue_pi_owner_main, &owner,
+                      "requeue-pi-owned-owner-create") != 0) {
+        return 1;
+    }
+    if (wait_for_flag(&owner.locked, "requeue-pi-owned-owner-lock") != 0) {
+        return 1;
+    }
+    const uint32_t owner_tid =
+        (uint32_t)atomic_load_explicit(&owner.blocked.tid, memory_order_acquire);
+    if (owner.lock_result != 0 || target != owner_tid) {
+        return fail("requeue-pi-owned-owner-word",
+                    owner.lock_result == -1 ? owner.lock_errno : EPROTO);
+    }
+
+    if (start_blocked(&test.blocked, requeue_pi_owned_waiter_main, &test,
+                      "requeue-pi-owned-create") != 0) {
+        return 1;
+    }
+    if (wait_until_blocked(&test.blocked, "requeue-pi-owned-block") != 0) {
+        return 1;
+    }
+    if (source != 0) {
+        return fail("requeue-pi-owned-precondition", EPROTO);
+    }
+
+    errno = 0;
+    long requeued = sys_futex(&source, FUTEX_CMP_REQUEUE_PI | PRIVATE, 1,
+                              (const struct timespec *)(uintptr_t)1, &target,
+                              0);
+    int saved = errno;
+    printf("THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_OWNED_RAW requeued=%ld "
+           "errno=%d target=%#x owner=%u\n",
+           requeued, saved, target, owner_tid);
+    fflush(stdout);
+    if (requeued != 1) {
+        return fail("requeue-pi-owned-rc", requeued == -1 ? saved : EPROTO);
+    }
+    /* The requeued waiter is blocked on the target, so the target keeps its
+     * owner and gains FUTEX_WAITERS. */
+    if (target != (FUTEX_WAITERS | owner_tid)) {
+        return fail("requeue-pi-owned-held-word", EPROTO);
+    }
+    if (atomic_load_explicit(&test.blocked.done, memory_order_acquire) != 0) {
+        return fail("requeue-pi-owned-waiter-early", EPROTO);
+    }
+
+    /* The owner's unlock hands the futex to the requeued waiter, which
+     * observes itself as the owner when FUTEX_WAIT_REQUEUE_PI returns. */
+    if (release_parked_thread(&test.owner_control,
+                              "requeue-pi-owned-release") != 0) {
+        return 1;
+    }
+    if (await_blocked(&owner.blocked, "requeue-pi-owned-owner-join") != 0) {
+        return 1;
+    }
+    if (owner.unlock_result != 0 ||
+        !parked_wait_succeeded(owner.park_result, owner.park_errno)) {
+        return fail("requeue-pi-owned-owner-result",
+                    owner.unlock_errno != 0  ? owner.unlock_errno
+                    : owner.park_errno != 0  ? owner.park_errno
+                                             : EPROTO);
+    }
+    const uint32_t waiter_tid =
+        (uint32_t)atomic_load_explicit(&test.blocked.tid, memory_order_acquire);
+    if ((target & FUTEX_TID_MASK) != waiter_tid) {
+        return fail("requeue-pi-owned-handoff", EPROTO);
+    }
+
+    if (release_parked_thread(&test.control, "requeue-pi-owned-wake") != 0) {
+        return 1;
+    }
+    if (await_blocked(&test.blocked, "requeue-pi-owned-join") != 0) {
+        return 1;
+    }
+    if (test.wait_result != 0 || test.unlock_result != 0 ||
+        !parked_wait_succeeded(test.control_result, test.control_errno)) {
+        return fail("requeue-pi-owned-waiter-result",
+                    test.wait_errno != 0      ? test.wait_errno
+                    : test.unlock_errno != 0  ? test.unlock_errno
+                    : test.control_errno != 0 ? test.control_errno
+                                              : EPROTO);
+    }
+    if (target != 0) {
+        return fail("requeue-pi-owned-final", EPROTO);
+    }
+
+    record("futex-abi-requeue-pi-owned",
+           "OWNED_RC OWNED_WORD WAITER_BLOCKED HANDOFF_WORD WAITER_RC UNLOCKED",
+           "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_OWNED_OK requeued=1 "
+           "owned_word=1 waiter_blocked=1 handoff=1 waiter_rc=0 unlocked=1");
+    return 0;
+}
+
+/* The caller itself owns the PI futex.  futex_lock_pi_atomic() only reports
+ * -EDEADLK when the *waiter* already owns the target (kernel/futex/pi.c:605,
+ * with @task = top_waiter->task), so a signaling thread that holds the futex
+ * -- the pthread_cond_signal() shape -- requeues normally. */
+static int test_requeue_pi_held(void) {
+    uint32_t source = 0;
+    uint32_t target = 0;
+    struct requeue_pi_owned_case test;
+
+    memset(&test, 0, sizeof(test));
+    test.source = &source;
+    test.target = &target;
+
+    if (expect_futex_zero("requeue-pi-held-lock", &target,
+                          FUTEX_LOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return 1;
+    }
+    const uint32_t owner_tid = (uint32_t)syscall(SYS_gettid);
+    if (target != owner_tid) {
+        return fail("requeue-pi-held-lock-word", EPROTO);
+    }
+
+    if (start_blocked(&test.blocked, requeue_pi_owned_waiter_main, &test,
+                      "requeue-pi-held-create") != 0) {
+        return 1;
+    }
+    if (wait_until_blocked(&test.blocked, "requeue-pi-held-block") != 0) {
+        return 1;
+    }
+
+    errno = 0;
+    long requeued = sys_futex(&source, FUTEX_CMP_REQUEUE_PI | PRIVATE, 1,
+                              (const struct timespec *)(uintptr_t)1, &target,
+                              0);
+    int saved = errno;
+    printf("THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_HELD_RAW requeued=%ld "
+           "errno=%d target=%#x\n",
+           requeued, saved, target);
+    fflush(stdout);
+    if (requeued != 1) {
+        return fail("requeue-pi-held-rc", requeued == -1 ? saved : EPROTO);
+    }
+    if (target != (FUTEX_WAITERS | owner_tid)) {
+        return fail("requeue-pi-held-word", EPROTO);
+    }
+    if (atomic_load_explicit(&test.blocked.done, memory_order_acquire) != 0) {
+        return fail("requeue-pi-held-waiter-early", EPROTO);
+    }
+
+    if (expect_futex_zero("requeue-pi-held-unlock", &target,
+                          FUTEX_UNLOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return 1;
+    }
+    const uint32_t waiter_tid =
+        (uint32_t)atomic_load_explicit(&test.blocked.tid, memory_order_acquire);
+    if ((target & FUTEX_TID_MASK) != waiter_tid) {
+        return fail("requeue-pi-held-handoff", EPROTO);
+    }
+
+    if (release_parked_thread(&test.control, "requeue-pi-held-wake") != 0) {
+        return 1;
+    }
+    if (await_blocked(&test.blocked, "requeue-pi-held-join") != 0) {
+        return 1;
+    }
+    if (test.wait_result != 0 || test.unlock_result != 0 ||
+        !parked_wait_succeeded(test.control_result, test.control_errno)) {
+        return fail("requeue-pi-held-waiter-result",
+                    test.wait_errno != 0      ? test.wait_errno
+                    : test.unlock_errno != 0  ? test.unlock_errno
+                    : test.control_errno != 0 ? test.control_errno
+                                              : EPROTO);
+    }
+    if (target != 0) {
+        return fail("requeue-pi-held-final", EPROTO);
+    }
+
+    record("futex-abi-requeue-pi-held",
+           "HELD_RC HELD_WORD WAITER_BLOCKED HANDOFF_WORD WAITER_RC UNLOCKED",
+           "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_HELD_OK requeued=1 "
+           "held_word=1 waiter_blocked=1 handoff=1 waiter_rc=0 unlocked=1");
+    return 0;
+}
+
+/* A source queue holding a waiter that is *not* a FUTEX_WAIT_REQUEUE_PI
+ * waiter is refused with -EINVAL before the target is touched:
+ * futex_proxy_trylock_atomic() tests `!top_waiter->rt_waiter`
+ * (kernel/futex/requeue.c:314-315) and the chain walk repeats it
+ * (kernel/futex/requeue.c:605-610). */
+static int test_requeue_pi_plain(void) {
+    uint32_t source = 0;
+    uint32_t target = 0;
+    struct futex_waiter plain;
+    struct timespec timeout = relative_bound(WAIT_BOUND_NS);
+
+    if (start_futex_waiter(&plain, &source, FUTEX_WAIT | PRIVATE, 0, &timeout,
+                           NULL, 0, "requeue-pi-plain-create") != 0) {
+        return 1;
+    }
+    if (wait_until_blocked(&plain.blocked, "requeue-pi-plain-block") != 0) {
+        return 1;
+    }
+
+    errno = 0;
+    long refused = sys_futex(&source, FUTEX_CMP_REQUEUE_PI | PRIVATE, 1,
+                             (const struct timespec *)(uintptr_t)1, &target, 0);
+    int saved = errno;
+    printf("THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_PLAIN_RAW rc=%ld "
+           "errno=%d target=%#x source=%#x\n",
+           refused, saved, target, source);
+    fflush(stdout);
+    if (refused != -1 || saved != EINVAL) {
+        /* Leave nothing blocked behind before reporting: the plain waiter is
+         * woken either way by the plain wake below. */
+        (void)sys_futex(&source, FUTEX_WAKE | PRIVATE, 1, NULL, NULL, 0);
+        return fail("requeue-pi-plain-refusal",
+                    refused == -1 ? (saved != EINVAL ? saved : EPROTO) : EPROTO);
+    }
+    if (target != 0) {
+        return fail("requeue-pi-plain-target", EPROTO);
+    }
+
+    errno = 0;
+    long woken = sys_futex(&source, FUTEX_WAKE | PRIVATE, 1, NULL, NULL, 0);
+    int wake_errno = errno;
+    if (woken != 1) {
+        return fail("requeue-pi-plain-wake",
+                    woken == -1 ? wake_errno : EPROTO);
+    }
+    if (await_blocked(&plain.blocked, "requeue-pi-plain-join") != 0) {
+        return 1;
+    }
+    if (plain.result != 0) {
+        return fail("requeue-pi-plain-waiter",
+                    plain.result == -1 ? plain.result_errno : EPROTO);
+    }
+
+    record("futex-abi-requeue-pi-plain",
+           "PLAIN_SOURCE_EINVAL TARGET_UNTOUCHED WAKE_RC WAITER_RC",
+           "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_PLAIN_OK refused=1 "
+           "target_untouched=1 wake_rc=1 waiter_rc=0");
+    return 0;
+}
+
 static int test_requeue_pi(void) {
     uint32_t source = 0;
     uint32_t target = 0;
@@ -2342,6 +2712,20 @@ int main(int argc, char **argv) {
         return result;
     }
     result = want_case("requeue-pi") ? test_requeue_pi() : 0;
+    if (result != 0) {
+        return result;
+    }
+    /* The contended-target requeue cases come after the pre-existing
+     * uncontended one so that neither can mask the other. */
+    result = want_case("requeue-pi-owned") ? test_requeue_pi_owned() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("requeue-pi-held") ? test_requeue_pi_held() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("requeue-pi-plain") ? test_requeue_pi_plain() : 0;
     if (result != 0) {
         return result;
     }

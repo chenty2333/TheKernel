@@ -333,16 +333,23 @@ pub enum PiUnlockOutcome {
 
 /// Result of a queue-gated PI requeue publication.
 ///
-/// `futex_requeue()` (`kernel/futex/requeue.c:544-902`) distinguishes the case
+/// `futex_requeue()` (`kernel/futex/requeue.c:495-903`) distinguishes the case
 /// where the source queue holds no waiter to promote from the case where the
-/// publication raced against userspace: the first ends the syscall with the
-/// waiter count it managed to move, and only the second loops back to `retry`.
+/// publication raced against userspace, and from a source queue whose waiters
+/// are not `FUTEX_WAIT_REQUEUE_PI` waiters: the first ends the syscall with the
+/// waiter count it managed to move, only the second loops back to `retry`, and
+/// the third is `-EINVAL`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PiRequeueOutcome {
     /// The source queue has no live PI waiter, so there is nothing to promote
     /// and nothing to move. `futex_requeue()` skips the chain walk and returns
     /// its `task_count`, which is 0.
     NoWaiters,
+    /// The first live waiter of the source queue is not a
+    /// `FUTEX_WAIT_REQUEUE_PI` waiter, which `futex_requeue()` refuses with
+    /// `-EINVAL` before it touches the target
+    /// (`kernel/futex/requeue.c:314-315`).
+    Invalid,
     /// The publication lost the race against userspace; retry the operation.
     Retry,
     /// The top waiter was woken and `moved` further waiters were requeued.
@@ -352,6 +359,24 @@ pub enum PiRequeueOutcome {
         /// Waiters moved onto the target queue (Linux `task_count`).
         moved: usize,
     },
+}
+
+/// What a successful `pi_requeue()` publication did to the target word.
+///
+/// These are the two non-error returns of `futex_proxy_trylock_atomic()`;
+/// `futex_requeue()` counts the first as an already-satisfied wake and queues
+/// the top waiter on the target's `rt_mutex` for the second
+/// (`kernel/futex/requeue.c:543-588`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PiRequeueTarget {
+    /// The target was free and now names the promoted waiter, which is woken
+    /// immediately: `futex_proxy_trylock_atomic()` returned 1.
+    Promoted,
+    /// The target already had an owner, so the publication only set
+    /// `FUTEX_WAITERS` over it (`futex_lock_pi_atomic()`,
+    /// `kernel/futex/pi.c:660-665`) and the promoted waiter joins the target's
+    /// `rt_mutex` queue instead of being woken.
+    Contended,
 }
 
 /// Outcome of a priority-inheritance wait.
@@ -696,6 +721,36 @@ impl WaiterQueue {
         };
         let waiter = waiter.lock();
         !waiter.cancelled && (waiter.bitset & mask) != 0 && waiter.is_pi()
+    }
+
+    /// Whether the first live waiter of this queue is *not* a
+    /// `FUTEX_WAIT_REQUEUE_PI` waiter.
+    ///
+    /// `futex_proxy_trylock_atomic()` promotes `futex_top_waiter()`, Linux's
+    /// priority-ordered `plist` head, and refuses the whole operation with
+    /// `-EINVAL` when that waiter has no `rt_waiter`
+    /// (`kernel/futex/requeue.c:305-316`). This queue keeps FIFO order and
+    /// records no priority for plain waiters, so its head stands in for the
+    /// plist head; a plain waiter queued behind a PI waiter is caught by the
+    /// scan instead (`kernel/futex/requeue.c:605-610`).
+    fn front_is_plain(&self) -> bool {
+        let mut cursor = self.head;
+        let mut seen = 0;
+        while let Some(ptr) = cursor {
+            if seen >= self.len {
+                break;
+            }
+            seen += 1;
+            // SAFETY: the queue owns a strong reference for every linked
+            // pointer and the queue lock is held for the whole walk.
+            let node = unsafe { ptr.as_ref() };
+            let waiter = node.lock();
+            cursor = waiter.next;
+            if !waiter.cancelled {
+                return !waiter.is_pi();
+            }
+        }
+        false
     }
 }
 
@@ -1543,29 +1598,35 @@ impl WaitQueue {
 
     /// Linux `futex_requeue()`'s `requeue_pi` path.
     ///
-    /// The highest-priority PI waiter of `self` is promoted to owner of
-    /// `target` — `publish` installs `FUTEX_WAITERS | tid` in `target`'s user
-    /// word while both gates are held — and up to `nr_requeue` of the remaining
-    /// PI waiters are moved onto `target`'s queue, where they keep their own
-    /// `rt_mutex_waiter` payload and block until `target`'s unlock hands the
-    /// futex to the strongest of them.
+    /// The top PI waiter of `self` is promoted onto `target` — `publish`
+    /// installs the new target word while both gates are held and reports
+    /// whether the target was free or already owned — and up to `nr_requeue` of
+    /// the remaining PI waiters are moved onto `target`'s queue, where they keep
+    /// their own `rt_mutex_waiter` payload and block until `target`'s unlock
+    /// hands the futex to the strongest of them.
     ///
-    /// The three outcomes mirror the three ways `futex_requeue()` can leave its
-    /// `retry` loop. `NoWaiters` is `futex_proxy_trylock_atomic()` returning 0
-    /// because `futex_top_waiter()` found nothing to promote; `Retry` is the
-    /// loop's own `goto retry` after a lost publication race; `Done` is the
-    /// completed move. Reporting the first two as one value makes a source
-    /// queue that will never have a waiter indistinguishable from a race that
-    /// resolves itself, and the caller then retries forever.
+    /// `nr_wake` and `nr_requeue` are Linux's scan bound
+    /// `task_count - nr_wake >= nr_requeue` (`kernel/futex/requeue.c:590-591`).
+    /// `task_count` starts at 1 when the promotion took the target
+    /// (`requeue.c:546-551`) and at 0 when the waiter was queued on an owner
+    /// instead, so a contended target moves `nr_wake + nr_requeue` waiters and a
+    /// free one moves the remaining `nr_wake + nr_requeue - 1`.
+    ///
+    /// The outcomes mirror the ways `futex_requeue()` can leave its `retry`
+    /// loop: `NoWaiters` when `futex_proxy_trylock_atomic()` found nothing to
+    /// promote, `Invalid` when the queue's waiters are not
+    /// `FUTEX_WAIT_REQUEUE_PI` waiters, `Retry` after a lost publication race,
+    /// and `Done` for the completed move.
     pub fn pi_requeue<P>(
         &self,
         target: &WaitQueue,
         target_owner: WaiterOwner,
+        nr_wake: usize,
         nr_requeue: usize,
         mut publish: P,
     ) -> PiRequeueOutcome
     where
-        P: FnMut(u32) -> bool,
+        P: FnMut(u32) -> Option<PiRequeueTarget>,
     {
         if core::ptr::eq(self, target) {
             // Unreachable: `futex_requeue()` rejects `key1 == key2` with
@@ -1581,30 +1642,50 @@ impl WaitQueue {
         let result = Self::with_two_gates(self, target, || {
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
+            // `futex_proxy_trylock_atomic()` inspects `futex_top_waiter()`
+            // first and refuses the operation when that waiter is not a
+            // `FUTEX_WAIT_REQUEUE_PI` waiter
+            // (`kernel/futex/requeue.c:305-316`), so a queue whose head is a
+            // plain waiter never reaches the promotion below.
+            if src.front_is_plain() {
+                return PiRequeueOutcome::Invalid;
+            }
             let Some((top, pi)) = Self::pi_top_locked(&src) else {
                 return PiRequeueOutcome::NoWaiters;
             };
-            if !publish(pi.tid) {
+            let Some(mode) = publish(pi.tid) else {
                 return PiRequeueOutcome::Retry;
-            }
-            let initial_len = src.len;
+            };
+            let contended = mode == PiRequeueTarget::Contended;
             let mut woke = 0;
-            for _ in 0..initial_len {
-                let Some(waiter) = src.pop_front() else {
-                    break;
-                };
-                let mut entry = waiter.lock();
-                let is_top = core::ptr::eq(Arc::as_ptr(&waiter), top.as_ptr());
-                if is_top && !entry.cancelled {
-                    entry.awakened = true;
-                    woke = 1;
+            if !contended {
+                // `requeue_pi_wake_futex()`: the promoted waiter took the target
+                // and has to be woken.
+                let initial_len = src.len;
+                for _ in 0..initial_len {
+                    let Some(waiter) = src.pop_front() else {
+                        break;
+                    };
+                    let mut entry = waiter.lock();
+                    let is_top = core::ptr::eq(Arc::as_ptr(&waiter), top.as_ptr());
+                    if is_top && !entry.cancelled {
+                        entry.awakened = true;
+                        woke = 1;
+                        drop(entry);
+                        pending_wakers.push(waiter);
+                        break;
+                    }
                     drop(entry);
-                    pending_wakers.push(waiter);
-                    break;
+                    src.push_back(waiter);
                 }
-                drop(entry);
-                src.push_back(waiter);
             }
+            // `futex_requeue_pi_complete()`/`requeue_futex()`: the waiters that
+            // follow the top one move onto the target's rt_mutex queue.
+            let budget = if contended {
+                nr_wake.saturating_add(nr_requeue)
+            } else {
+                nr_wake.saturating_add(nr_requeue).saturating_sub(1)
+            };
             let mut moved = 0;
             let initial_len = src.len;
             for _ in 0..initial_len {
@@ -1612,25 +1693,84 @@ impl WaitQueue {
                     break;
                 };
                 let mut entry = waiter.lock();
-                if !entry.cancelled && entry.pi.is_some() && moved < nr_requeue {
-                    entry.owner = target_owner.clone();
-                    // Linux `futex_requeue_pi_complete(this, 0)`: the waiter is
-                    // queued on the target's rt_mutex, which
-                    // `futex_wait_requeue_pi()` reports as `Q_REQUEUE_PI_DONE`.
-                    entry.requeued_pi = true;
-                    moved += 1;
-                    drop(entry);
-                    dst.push_back(waiter);
-                } else {
+                if entry.cancelled {
                     drop(entry);
                     src.push_back(waiter);
+                    continue;
                 }
+                if moved >= budget {
+                    // `task_count - nr_wake >= nr_requeue` stops the scan and
+                    // leaves the rest of the queue in place.
+                    drop(entry);
+                    src.push_back(waiter);
+                    break;
+                }
+                if !entry.pi.is_some() {
+                    // `(requeue_pi && !this->rt_waiter) || ... -> -EINVAL`
+                    // (`kernel/futex/requeue.c:605-610`).
+                    drop(entry);
+                    src.push_back(waiter);
+                    return PiRequeueOutcome::Invalid;
+                }
+                entry.owner = target_owner.clone();
+                // Linux `futex_requeue_pi_complete(this, 0)`: the waiter is
+                // queued on the target's rt_mutex, which
+                // `futex_wait_requeue_pi()` reports as `Q_REQUEUE_PI_DONE`.
+                entry.requeued_pi = true;
+                moved += 1;
+                drop(entry);
+                dst.push_back(waiter);
             }
             PiRequeueOutcome::Done { woke, moved }
         });
         pending_wakers.finish();
         retired.finish();
         result
+    }
+
+    /// Boosts `pi_state`'s owner by every PI waiter currently queued on this
+    /// queue, as requeueing a waiter onto an owned target does.
+    ///
+    /// Linux's `rt_mutex_start_proxy_lock()` -> `task_blocks_on_rt_mutex()` ->
+    /// `rt_mutex_adjust_prio_chain()` raises the target owner to the strongest
+    /// waiter when `FUTEX_CMP_REQUEUE_PI` queues it
+    /// (`kernel/locking/rtmutex.c:1236-1270`, called from
+    /// `kernel/futex/requeue.c:658-661`). The boost is applied after the queue
+    /// gates are released because it resolves and reschedules tasks.
+    pub fn pi_boost_queued_waiters(&self, pi_state: &PiState) {
+        let mut queued: Vec<WaiterRef> = Vec::new();
+        {
+            let _gate = self.gate.lock();
+            let queue = self.queue.lock();
+            let mut cursor = queue.head;
+            let mut seen = 0;
+            while let Some(ptr) = cursor {
+                if seen >= queue.len {
+                    break;
+                }
+                seen += 1;
+                // SAFETY: the queue owns a strong reference for every linked
+                // pointer and the queue lock is held for the whole walk.
+                let node = unsafe { ptr.as_ref() };
+                let waiter = node.lock();
+                cursor = waiter.next;
+                let boost = waiter.pi.is_some() && !waiter.cancelled;
+                drop(waiter);
+                if boost {
+                    // SAFETY: one more count cannot outlive the allocation
+                    // while the queue lock is held and the node is linked.
+                    unsafe { Arc::increment_strong_count(ptr.as_ptr()) };
+                    // SAFETY: the count incremented above is owned by this
+                    // reference, which is dropped after the gates are released.
+                    queued.push(unsafe { Arc::from_raw(ptr.as_ptr()) });
+                }
+            }
+        }
+        for waiter in &queued {
+            if let Some(pi) = waiter.lock().pi {
+                pi_boost_owner(pi_state, &pi);
+            }
+        }
     }
 
     /// Wakes up at most `count` tasks whose bitset intersects with the given

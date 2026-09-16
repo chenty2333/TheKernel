@@ -10,8 +10,8 @@ use linux_raw_sys::general::{
 };
 use tk_linux_futex::{
     FUTEX_NO_NODE, FUTEX2_PRIVATE, Futex2Flags, FutexCommand, FutexWaitV, LegacyOp, PiAcquire,
-    PiUnlock, PiWord, WakeOp, parse_futex2_flags, pi_handoff_value, plan_pi_acquire,
-    plan_pi_unlock, plan_requeue, validate_numa_node, validate_requeue_flags, wake_op_count,
+    PiUnlock, PiWord, WakeOp, parse_futex2_flags, plan_pi_acquire, plan_pi_unlock, plan_requeue,
+    validate_numa_node, validate_requeue_flags, wake_op_count,
 };
 
 use crate::{
@@ -21,8 +21,8 @@ use crate::{
     },
     task::{
         AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, PiRequeueOutcome,
-        PiUnlockOutcome, PiWaiter, PtraceAccessMode, RestartBlock, Thread, WaitConditionError,
-        WaitConditionResult,
+        PiRequeueTarget, PiUnlockOutcome, PiWaiter, PtraceAccessMode, RestartBlock, Thread,
+        WaitConditionError, WaitConditionResult,
         check_current_thread_ptrace_image_access, futex_table_for, get_visible_task,
         pi_boost_owner, pi_deboost_owner, wait_on_any_futex_if_atomic,
     },
@@ -1498,12 +1498,14 @@ fn do_futex_wait_requeue_pi(
 /// 		return -EINVAL;
 /// ```
 ///
-/// The source word must still hold `value` (`-EAGAIN` otherwise) and the
-/// target must be uncontended: `futex_proxy_trylock_atomic()` takes it for the
-/// first waiter only when the caller can become its owner, so a target that is
-/// already owned is `-EAGAIN` and the waiters stay on the source queue. A
-/// source word naming the caller is `-EDEADLK`, and a target word naming the
-/// caller is `-EDEADLK` too.
+/// The source word must still hold `value` (`-EAGAIN` otherwise). The target
+/// word decides which of `futex_proxy_trylock_atomic()`'s two successful arms
+/// runs for the waiter it promotes: a free target is taken for that waiter and
+/// the waiter is woken, while an owned target only gets `FUTEX_WAITERS` over its
+/// owner and the waiter is queued on the owner's `rt_mutex` like any other
+/// waiter (`kernel/futex/requeue.c:337-355`). A source word naming the caller
+/// is `-EDEADLK`, and so is a target word naming the *promoted waiter*
+/// (`kernel/futex/pi.c:605-606`); a target word naming this caller is not.
 #[expect(clippy::too_many_arguments)]
 fn do_futex_cmp_requeue_pi(
     caller_aspace: Arc<Mutex<AddrSpace>>,
@@ -1527,22 +1529,18 @@ fn do_futex_cmp_requeue_pi(
         return Err(AxError::InvalidInput);
     }
     let nr_requeue = usize::try_from(nr_requeue).map_err(|_| AxError::InvalidInput)?;
-    let tid = current().as_thread().pid_vnr();
 
     validate_futex_word_read(uaddr2, size_of::<u32>(), caller)?;
     let observed_source = fault_read_u32(caller, source)?;
     if observed_source != value {
         return Err(AxError::WouldBlock);
     }
-    let observed_target = fault_read_u32(caller, target)?;
-    let target_word = PiWord::decode(observed_target);
-    if target_word.tid == tid {
-        return Err(LinuxError::EDEADLK.into());
-    }
-    if target_word.is_owned() {
-        // `futex_proxy_trylock_atomic()` only takes an uncontended target.
-        return Err(AxError::WouldBlock);
-    }
+    // Fault the target in here, as `futex_requeue()`'s `retry:` label does
+    // before `futex_proxy_trylock_atomic()` (`kernel/futex/requeue.c:559-565`).
+    // Whether the target already has an owner is decided under the queue gates
+    // below, because the word can change between this read and the
+    // publication -- and an owned target is not an error.
+    let _ = fault_read_u32(caller, target)?;
 
     loop {
         let (source_key, source_namespace) = futex_key_from(source, private, &caller_aspace);
@@ -1564,11 +1562,13 @@ fn do_futex_cmp_requeue_pi(
             }
         }
         let mut promoted: Option<u32> = None;
+        let mut contended_owner: Option<u32> = None;
         let mut failure: Option<AxError> = None;
 
         let result = source_futex.wq.pi_requeue(
             &target_futex.wq,
             target_futex.waiter_owner(),
+            nr_wake as usize,
             nr_requeue,
             |top_tid| {
                 let observed = match nofault_u32_read(
@@ -1585,41 +1585,74 @@ fn do_futex_cmp_requeue_pi(
                     // returns that errno rather than retrying it away.
                     Err(WaitConditionError::Fault(error)) => {
                         failure = Some(error);
-                        return false;
+                        return None;
                     }
-                    Err(WaitConditionError::Retry) => return false,
+                    Err(WaitConditionError::Retry) => return None,
                 };
-                if PiWord::decode(observed).is_owned() {
-                    failure = Some(AxError::WouldBlock);
-                    return false;
-                }
+                // `futex_lock_pi_atomic()` is called for the promoted waiter,
+                // so its deadlock check names that waiter rather than this
+                // caller (`requeue.c:337-342` passes `top_waiter->task`, and
+                // `pi.c:605-606` compares the word against `task_pid_vnr()` of
+                // that task), and an owned target is the `SetWaiters` case,
+                // which queues the waiter on the owner's rt_mutex instead of
+                // failing.
+                let (new_value, mode) =
+                    match plan_pi_acquire(PiWord::decode(observed), top_tid, nr_requeue != 0) {
+                        PiAcquire::Deadlock => {
+                            failure = Some(LinuxError::EDEADLK.into());
+                            return None;
+                        }
+                        PiAcquire::TakeOver { new_value } => (new_value, PiRequeueTarget::Promoted),
+                        PiAcquire::SetWaiters { new_value } => {
+                            // `attach_to_pi_owner()`: the PI state the queued
+                            // waiters inherit names the task the word holds.
+                            contended_owner = Some(PiWord::decode(observed).tid);
+                            (new_value, PiRequeueTarget::Contended)
+                        }
+                    };
                 match futex_cas_at(
                     target,
                     target_namespace,
                     target_expected.as_ref(),
                     observed,
-                    pi_handoff_value(top_tid),
+                    new_value,
                     &caller_aspace,
                 ) {
                     Ok(true) => {}
-                    Ok(false) => return false,
+                    Ok(false) => return None,
                     Err(WaitConditionError::Fault(error)) => {
                         failure = Some(error);
-                        return false;
+                        return None;
                     }
-                    Err(WaitConditionError::Retry) => return false,
+                    Err(WaitConditionError::Retry) => return None,
                 }
-                promoted = Some(top_tid);
-                true
+                if mode == PiRequeueTarget::Promoted {
+                    promoted = Some(top_tid);
+                }
+                Some(mode)
             },
         );
 
         match result {
             PiRequeueOutcome::Done { woke, moved } => {
-                if let Some(top_tid) = promoted {
+                match promoted {
                     // The promoted waiter is the target's new owner; it is the
                     // one that will boost whoever contends on it next.
-                    target_pi_state.attach(top_tid);
+                    Some(top_tid) => target_pi_state.attach(top_tid),
+                    // The target kept its owner, so the waiters that were
+                    // queued behind it inherit that owner -- the publication
+                    // only set `FUTEX_WAITERS` over the word it already held.
+                    None => {
+                        if let Some(owner_tid) = contended_owner {
+                            target_pi_state.attach(owner_tid);
+                        }
+                    }
+                }
+                if moved > 0 {
+                    // `rt_mutex_start_proxy_lock()` raises the target's owner
+                    // to the waiters it queues on its rt_mutex
+                    // (`kernel/futex/requeue.c:658-661`).
+                    target_futex.wq.pi_boost_queued_waiters(&target_pi_state);
                 }
                 // The promoted waiter left the source queue, so the source
                 // owner may no longer need its boost.
@@ -1651,6 +1684,13 @@ fn do_futex_cmp_requeue_pi(
                     let _ = fault_read_u32(caller, target)?;
                 }
                 return Ok(0);
+            }
+            PiRequeueOutcome::Invalid => {
+                // `futex_requeue()` refuses a source queue whose waiters are
+                // not `FUTEX_WAIT_REQUEUE_PI` waiters before it publishes
+                // anything to the target, so the caller sees `-EINVAL` and no
+                // waiter moves (`kernel/futex/requeue.c:305-316`, `605-610`).
+                return Err(AxError::InvalidInput);
             }
             PiRequeueOutcome::Retry => {
                 if let Some(error) = failure {
