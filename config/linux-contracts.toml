@@ -5444,8 +5444,8 @@ status = "implemented"
 contract = "linux-fchmodat2"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_fchmodat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fchmodat2 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5467,8 +5467,8 @@ status = "implemented"
 contract = "linux-utime"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_utime"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full utime raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5490,8 +5490,8 @@ status = "implemented"
 contract = "linux-utimes"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_utimes"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full utimes raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5513,8 +5513,8 @@ status = "implemented"
 contract = "linux-futimesat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_futimesat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full futimesat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5605,8 +5605,8 @@ status = "implemented"
 contract = "linux-sync"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_sync"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full sync raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6111,8 +6111,8 @@ status = "implemented"
 contract = "linux-sync_file_range"
 handler = "kernel/src/syscall/fs/io.rs:sys_sync_file_range"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full sync_file_range raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6295,8 +6295,8 @@ status = "implemented"
 contract = "linux-io_pgetevents"
 handler = "kernel/src/syscall/fs/aio.rs:sys_io_pgetevents"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero"]
-validation_gaps = ["Existing source/helper coverage does not establish the full io_pgetevents raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero", "tests/guest/portable/aio-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6479,8 +6479,8 @@ status = "implemented"
 contract = "linux-cachestat"
 handler = "kernel/src/syscall/fs/cachestat.rs:sys_cachestat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/cachestat.rs:cachestat_model_preserves_range_type_and_admission_boundaries"]
-validation_gaps = ["Existing source/helper coverage does not establish the full cachestat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/cachestat.rs:cachestat_model_preserves_range_type_and_admission_boundaries", "tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6525,8 +6525,8 @@ status = "implemented"
 contract = "linux-inotify_init"
 handler = "kernel/src/syscall/dispatch.rs:compat_inotify_init"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full inotify_init raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6571,8 +6571,8 @@ status = "implemented"
 contract = "linux-inotify_rm_watch"
 handler = "kernel/src/syscall/fs/inotify.rs:sys_inotify_rm_watch"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full inotify_rm_watch raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6594,8 +6594,8 @@ status = "implemented"
 contract = "linux-inotify_init1"
 handler = "kernel/src/syscall/fs/inotify.rs:sys_inotify_init1"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full inotify_init1 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6617,8 +6617,8 @@ status = "implemented"
 contract = "linux-signalfd"
 handler = "kernel/src/syscall/dispatch.rs:compat_signalfd"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full signalfd raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/fs-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -8618,8 +8618,8 @@ status = "implemented"
 contract = "linux-rseq"
 handler = "kernel/src/syscall/sync/rseq.rs:sys_rseq"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/rseq-smoke.c:test_registration"]
-validation_gaps = ["Existing source/helper coverage does not establish the full rseq raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/tools/rseq-smoke.c:test_registration", "tests/guest/portable/rseq-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
