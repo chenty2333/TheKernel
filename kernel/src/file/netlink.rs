@@ -1709,9 +1709,18 @@ impl NetlinkSocket {
     }
 
     /// `WRITE_ONCE(sk->sk_bound_dev_if, ifindex)` from
-    /// `sock_bindtoindex_locked()` (`net/core/sock.c:650`).
-    pub(crate) fn set_bound_device_index(&self, index: i32) {
-        self.bound_dev_if.store(index, Ordering::Release);
+    /// `sock_bindtoindex_locked()` (`net/core/sock.c:650`).  The
+    /// compare-exchange emulates the socket lock: the caller validates
+    /// against `expected` and must retry when the current index moved
+    /// meanwhile, so a concurrent rebind cannot skip the capability check.
+    pub(crate) fn compare_exchange_bound_device_index(
+        &self,
+        expected: i32,
+        index: i32,
+    ) -> bool {
+        self.bound_dev_if
+            .compare_exchange(expected, index, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
@@ -2798,6 +2807,7 @@ impl NetlinkSocket {
         destination: Option<SockaddrNl>,
         nowait: bool,
     ) -> AxResult<usize> {
+        let explicit_destination = destination.is_some();
         let destination = destination.or_else(|| {
             let state = self.state.lock();
             Some(SockaddrNl {
@@ -2808,6 +2818,21 @@ impl NetlinkSocket {
             })
         });
         if let Some(destination) = destination {
+            // `netlink_sendmsg` rejects an explicit address that names either
+            // a port or a group before any delivery unless the protocol
+            // advertises non-root sends or the sender holds CAP_NET_ADMIN
+            // (`net/netlink/af_netlink.c:1852-1859`).  The connect-time peer
+            // address is exempt: its gate ran in `netlink_connect`.
+            if explicit_destination
+                && (destination.nl_pid != 0 || destination.nl_groups != 0)
+                && !netlink_allowed(
+                    self.protocol,
+                    NL_CFG_F_NONROOT_SEND,
+                    ns_capable(actor, self.net_ns.owner_user_ns(), CAP_NET_ADMIN),
+                )
+            {
+                return Err(LinuxError::EPERM.into());
+            }
             // `netlink_sendmsg` derives *both* destinations from one address
             // (`net/netlink/af_netlink.c:1844-1898`):
             //
@@ -2829,12 +2854,10 @@ impl NetlinkSocket {
                 return self.broadcast_usersock(src, actor, sender_pid, destination, nowait);
             }
             if destination.nl_pid != 0 {
-                if destination.nl_groups != 0 {
-                    // Non-USERSOCK multicast addressing still has no
-                    // subscriber registry here, so the address is refused
-                    // instead of being silently reduced to its unicast half.
-                    return Err(AxError::InvalidInput);
-                }
+                // A `{nl_pid, nl_groups}` address on a non-USERSOCK protocol
+                // is two deliveries upstream whose broadcast half has no
+                // subscriber registry here; the syscall still reports the
+                // `netlink_unicast()` result, which is the half below.
                 return self.write_unicast_with_actor(
                     src,
                     actor,
@@ -4998,7 +5021,16 @@ fn broadcast_netlink_usersock(
         copy.try_reserve_exact(data.len())
             .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
         copy.extend_from_slice(data);
-        socket.enqueue_user_from(copy, source_port_id, credentials, nowait)?;
+        // `do_one_broadcast()` reports one failed delivery without aborting
+        // the round, so a full or contended queue on one subscriber costs it
+        // the datagram (recorded as an overrun) but never starves the rest.
+        if socket
+            .enqueue_user_from(copy, source_port_id, credentials, nowait)
+            .is_err()
+        {
+            socket.note_queue_drop();
+            continue;
+        }
         delivered = true;
     }
     if delivered {
@@ -6057,7 +6089,7 @@ mod tests {
     }
 
     #[test]
-    fn uevent_port_unicast_autobinds_and_allows_unprivileged_peer_delivery() {
+    fn uevent_port_unicast_autobinds_and_gates_unprivileged_peer_delivery() {
         let _context = crate::test_support::scheduler_test_context();
         let owner = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
@@ -6090,6 +6122,9 @@ mod tests {
             .unwrap();
         let unprivileged = Cred::try_with_user_namespace(&root, child).unwrap();
         let mut unprivileged_source = &payload[..];
+        // `netlink_sendmsg()`: an explicit destination on a protocol without
+        // `NL_CFG_F_NONROOT_SEND` (kobject uevent has none) is `-EPERM` for
+        // callers without `CAP_NET_ADMIN`.
         assert_eq!(
             sender.write_to_with_actor(
                 &mut unprivileged_source,
@@ -6103,7 +6138,7 @@ mod tests {
                 }),
                 false,
             ),
-            Ok(payload.len())
+            Err(LinuxError::EPERM.into())
         );
     }
 

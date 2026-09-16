@@ -1039,13 +1039,13 @@ pub fn sys_connect(
         // `alg_proto_ops.connect` (`crypto/af_alg.c:480`) and
         // `xsk_proto_ops.connect` (`net/xdp/xsk.c:2140`) are both
         // `sock_no_connect`, which is `return -EOPNOTSUPP;`
-        // (`net/core/sock.c:3536-3539`).  Linux still imports the address and
-        // runs `security_socket_connect()` first, so the family's own address
-        // decode errors keep their precedence.
-        let addr = SocketAddrEx::read_from_user(&capability, addr, addrlen)?;
-        debug!("sys_connect <= fd: {fd}, addr: {addr:?}");
+        // (`net/core/sock.c:3536-3539`).  Linux's generic connect layer only
+        // copies the bounded address (move_addr_to_kernel) and runs
+        // `security_socket_connect()` first; the family's own address decode
+        // never runs.
+        let address = snapshot_address(&capability, addr, addrlen)?;
         let socket_ref = pinned.security_ref()?;
-        let prepared = PreparedSocketAddress::Network(addr);
+        let prepared = PreparedSocketAddress::Packet(address);
         dispatch_socket(&SocketSecurityContext::connect(
             snapshot.actor(),
             &socket_ref,

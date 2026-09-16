@@ -807,9 +807,18 @@ impl PacketSocket {
     }
 
     /// `WRITE_ONCE(sk->sk_bound_dev_if, ifindex)` from
-    /// `sock_bindtoindex_locked()` (`net/core/sock.c:650`).
-    pub(crate) fn set_bound_device_index(&self, index: i32) {
-        self.bound_dev_if.store(index, Ordering::Release);
+    /// `sock_bindtoindex_locked()` (`net/core/sock.c:650`).  The
+    /// compare-exchange emulates the socket lock: the caller validates
+    /// against `expected` and must retry when the current index moved
+    /// meanwhile, so a concurrent rebind cannot skip the capability check.
+    pub(crate) fn compare_exchange_bound_device_index(
+        &self,
+        expected: i32,
+        index: i32,
+    ) -> bool {
+        self.bound_dev_if
+            .compare_exchange(expected, index, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     pub(crate) fn binding(&self) -> PacketBinding {

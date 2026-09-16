@@ -1974,15 +1974,20 @@ pub fn sys_setsockopt(
                 // `optlen < sizeof(int)` gate (`net/core/sock.c:1209-1214`),
                 // because a device name is not an int-sized value: a
                 // three-byte "lo\0" is a complete request.
-                socket.set_bound_device_index(resolve_bound_device_index(
-                    &capability,
-                    snapshot.actor(),
-                    socket.net_namespace(),
-                    optval,
-                    optlen,
-                    socket.bound_device_index(),
-                )?);
-                return Ok(0);
+                loop {
+                    let current = socket.bound_device_index();
+                    let index = resolve_bound_device_index(
+                        &capability,
+                        snapshot.actor(),
+                        socket.net_namespace(),
+                        optval,
+                        optlen,
+                        current,
+                    )?;
+                    if socket.compare_exchange_bound_device_index(current, index) {
+                        return Ok(0);
+                    }
+                }
             }
             if (optlen as usize) < size_of::<i32>() {
                 return Err(AxError::InvalidInput);
@@ -2038,15 +2043,20 @@ pub fn sys_setsockopt(
             match optname {
                 SO_BINDTODEVICE => {
                     let socket = pinned.packet()?;
-                    socket.set_bound_device_index(resolve_bound_device_index(
-                        &capability,
-                        snapshot.actor(),
-                        socket.net_namespace(),
-                        optval,
-                        optlen,
-                        socket.bound_device_index(),
-                    )?);
-                    return Ok(0);
+                    loop {
+                        let current = socket.bound_device_index();
+                        let index = resolve_bound_device_index(
+                            &capability,
+                            snapshot.actor(),
+                            socket.net_namespace(),
+                            optval,
+                            optlen,
+                            current,
+                        )?;
+                        if socket.compare_exchange_bound_device_index(current, index) {
+                            return Ok(0);
+                        }
+                    }
                 }
                 SO_ATTACH_FILTER => {
                     // Linux first copies the complete sock_fprog envelope.
@@ -2253,15 +2263,20 @@ pub fn sys_setsockopt(
     if level == SOL_SOCKET {
         match optname {
             SO_BINDTODEVICE => {
-                socket.set_bound_device_index(resolve_bound_device_index(
-                    &capability,
-                    snapshot.actor(),
-                    socket.net_namespace(),
-                    optval,
-                    optlen,
-                    socket.bound_device_index(),
-                )?);
-                return Ok(0);
+                loop {
+                    let current = socket.bound_device_index();
+                    let index = resolve_bound_device_index(
+                        &capability,
+                        snapshot.actor(),
+                        socket.net_namespace(),
+                        optval,
+                        optlen,
+                        current,
+                    )?;
+                    if socket.compare_exchange_bound_device_index(current, index) {
+                        return Ok(0);
+                    }
+                }
             }
             SO_SNDBUFFORCE => {
                 if !ns_capable(

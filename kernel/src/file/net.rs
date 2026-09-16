@@ -116,9 +116,18 @@ impl Socket {
 
     /// `WRITE_ONCE(sk->sk_bound_dev_if, ifindex)` performed by
     /// `sock_bindtoindex_locked()` under the socket lock
-    /// (`net/core/sock.c:650`).
-    pub(crate) fn set_bound_device_index(&self, index: i32) {
-        self.bound_dev_if.store(index, Ordering::Release);
+    /// (`net/core/sock.c:650`).  The compare-exchange emulates that lock: the
+    /// caller validates against `expected` and must retry when the current
+    /// index moved meanwhile, so a concurrent rebind cannot skip the
+    /// capability check.
+    pub(crate) fn compare_exchange_bound_device_index(
+        &self,
+        expected: i32,
+        index: i32,
+    ) -> bool {
+        self.bound_dev_if
+            .compare_exchange(expected, index, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Records this inet OFD in the namespace-local SOCK_DIAG registry.  The
