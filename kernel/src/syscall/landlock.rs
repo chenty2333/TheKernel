@@ -499,7 +499,9 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
 /// published by `clone(CLONE_THREAD)`.  Linux reaches the same guarantee with
 /// a `task_work` barrier in `security/landlock/tsync.c`; this kernel pins the
 /// thread group with the process-lifecycle lock instead and retries the few
-/// publications that are still in flight.
+/// publications that are still in flight.  If a member is still unresolved
+/// after these attempts the whole restrict fails instead of committing a
+/// silently partial synchronization.
 const LANDLOCK_TSYNC_DISCOVERY_ATTEMPTS: usize = 8;
 
 /// Applies one prepared domain to every live thread of the calling process.
@@ -561,6 +563,12 @@ fn restrict_sibling_threads(
             attempt += 1;
             axtask::yield_now();
             continue;
+        }
+        if unresolved {
+            // All-or-nothing: committing with a thread that was never
+            // discovered would leave that sibling unrestricted while the
+            // caller believes the whole group is synchronized.
+            return Err(AxError::NoSuchProcess);
         }
         // Fallible phase: one clone per target plus the caller's own value.
         let mut prepared = Vec::new();
@@ -798,7 +806,26 @@ pub fn sys_lsm_get_self_attr<M: UserMemory + ?Sized>(
         if ctx.is_null() {
             return Err(AxError::InvalidInput);
         }
-        let header: LsmCtx = read_value(memory, ctx.cast::<LsmCtx>())?;
+        // `security_getselfattr()` runs `memdup_user(ctx, *size)` before it
+        // looks at the ID, so a fault anywhere in the caller-declared `*size`
+        // bytes is `-EFAULT`, even though only the header is inspected.
+        let left = _supplied as usize;
+        let mut copied = Vec::new();
+        copied
+            .try_reserve_exact(left)
+            .map_err(|_| AxError::NoMemory)?;
+        copied.resize(left, MaybeUninit::uninit());
+        memory
+            .read_bytes(ctx as usize, &mut copied)
+            .map_err(|_| AxError::BadAddress)?;
+        let mut header_bytes = [0u8; size_of::<LsmCtx>()];
+        let inspected = left.min(header_bytes.len());
+        // SAFETY: `read_bytes` initialized the first `left` bytes.
+        let initialized =
+            unsafe { core::slice::from_raw_parts(copied.as_ptr().cast::<u8>(), inspected) };
+        header_bytes[..inspected].copy_from_slice(initialized);
+        let header: LsmCtx =
+            try_pod_read_unaligned(&header_bytes).map_err(|_| AxError::BadAddress)?;
         // "If the LSM ID isn't specified it is an error."
         if header.id == LSM_ID_UNDEF {
             return Err(AxError::InvalidInput);

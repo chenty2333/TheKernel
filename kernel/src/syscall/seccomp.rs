@@ -312,9 +312,10 @@ fn get_action_available<M: UserMemory + ?Sized>(
         .map_err(map_usercopy_error)?;
     // The advertised set is owned by the policy crate so it can never drift
     // from the action table `enforce_syscall_seccomp` below dispatches on:
-    // every advertised action has a classified arm there, `SECCOMP_RET_TRACE`
-    // included, whose arm produces the -ENOSYS verdict Linux gives a tracee
-    // whose tracer did not request `PTRACE_EVENT_SECCOMP`.
+    // every advertised action has a classified arm there.  `SECCOMP_RET_TRACE`
+    // is deliberately not advertised: with no `PTRACE_EVENT_SECCOMP`
+    // delivery its verdict always takes the no-tracer -ENOSYS path, so the
+    // query reports -EOPNOTSUPP instead of promising an unusable action.
     if tk_linux_seccomp::action_is_available(action) {
         Ok(0)
     } else {
@@ -518,9 +519,11 @@ pub(super) fn enforce_syscall_seccomp(uctx: &mut UserContext) -> bool {
             false
         }
         ActionClass::Trace { .. } => {
-            // Linux skips the syscall with ENOSYS when no tracer/listener owns
-            // the request. We do not advertise either action until their
-            // complete external ownership lifecycle exists.
+            // No `PTRACE_EVENT_SECCOMP` delivery exists, so every TRACE
+            // verdict takes Linux's "no tracer attached" path
+            // (kernel/seccomp.c `__seccomp_filter()`): the syscall is skipped
+            // with ENOSYS.  `SECCOMP_GET_ACTION_AVAIL` matchingly does not
+            // advertise the action.
             uctx.set_retval((-LinuxError::ENOSYS.code() as isize) as usize);
             false
         }

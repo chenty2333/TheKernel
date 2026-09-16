@@ -10,7 +10,8 @@ pub const MAX_ERRNO: u16 = 4095;
 /// Actions this kernel can carry out, in the order Linux
 /// `seccomp_get_action_avail()` (`kernel/seccomp.c`) accepts them.
 ///
-/// The list is the complete set of filter return values Linux answers 0 for:
+/// The list matches the switch Linux `seccomp_get_action_avail()`
+/// (`kernel/seccomp.c`) answers 0 for, minus `SECCOMP_RET_TRACE`:
 ///
 /// ```c
 /// 	switch (action) {
@@ -30,21 +31,19 @@ pub const MAX_ERRNO: u16 = 4095;
 /// 	return 0;
 /// ```
 ///
-/// The answer describes the action table, not the state of any tracer:
-/// `SECCOMP_RET_TRACE` is available in Linux even though a verdict with no
-/// tracer waiting takes the "no tracer attached" path and fails the syscall
-/// with -ENOSYS (kernel/seccomp.c `__seccomp_filter()`).  This kernel enforces
-/// that same path for every `TRACE` verdict, so it advertises the action too.
-/// What it does not have is `PTRACE_EVENT_SECCOMP` delivery to a tracer that
-/// asked for the event with `PTRACE_O_TRACESECCOMP`, so such a tracer sees the
-/// -ENOSYS verdict instead of a stop.
-pub const AVAILABLE_ACTIONS: [u32; 8] = [
+/// The answer describes the actions this kernel can actually carry out.
+/// Linux also answers 0 for `SECCOMP_RET_TRACE`, but this kernel has no
+/// `PTRACE_EVENT_SECCOMP` delivery to a tracer that asked for the event with
+/// `PTRACE_O_TRACESECCOMP`: every `TRACE` verdict takes the "no tracer
+/// attached" path and fails the syscall with -ENOSYS (kernel/seccomp.c
+/// `__seccomp_filter()`), so advertising the action would promise behavior
+/// that never happens and `TRACE` is left out of the advertised set.
+pub const AVAILABLE_ACTIONS: [u32; 7] = [
     SECCOMP_RET_KILL_PROCESS,
     SECCOMP_RET_KILL_THREAD,
     SECCOMP_RET_TRAP,
     SECCOMP_RET_ERRNO,
     SECCOMP_RET_USER_NOTIF,
-    SECCOMP_RET_TRACE,
     SECCOMP_RET_LOG,
     SECCOMP_RET_ALLOW,
 ];
@@ -196,7 +195,6 @@ mod tests {
             SECCOMP_RET_TRAP,
             SECCOMP_RET_ERRNO,
             SECCOMP_RET_USER_NOTIF,
-            SECCOMP_RET_TRACE,
             SECCOMP_RET_LOG,
             SECCOMP_RET_ALLOW,
         ] {
@@ -210,10 +208,12 @@ mod tests {
     }
 
     #[test]
-    fn advertised_actions_are_exactly_linux_seccomp_get_action_avail_switch() {
-        // kernel/seccomp.c `seccomp_get_action_avail()` answers 0 for these
-        // eight values and -EOPNOTSUPP for every other one, so the table must
-        // not grow, shrink, or accept a value with data bits set.
+    fn advertised_actions_exclude_trace_without_event_delivery() {
+        // kernel/seccomp.c `seccomp_get_action_avail()` answers 0 for its
+        // eight-value switch; this kernel drops `SECCOMP_RET_TRACE` because
+        // without `PTRACE_EVENT_SECCOMP` delivery every TRACE verdict takes
+        // the no-tracer -ENOSYS path, and answers -EOPNOTSUPP for it and for
+        // every value with data bits set.
         assert_eq!(
             AVAILABLE_ACTIONS,
             [
@@ -222,16 +222,15 @@ mod tests {
                 SECCOMP_RET_TRAP,
                 SECCOMP_RET_ERRNO,
                 SECCOMP_RET_USER_NOTIF,
-                SECCOMP_RET_TRACE,
                 SECCOMP_RET_LOG,
                 SECCOMP_RET_ALLOW,
             ]
         );
         assert_eq!(
             AVAILABLE_ACTIONS.map(|action| action & !SECCOMP_RET_ACTION_FULL),
-            [0; 8]
+            [0; 7]
         );
-        assert!(action_is_available(SECCOMP_RET_TRACE));
+        assert!(!action_is_available(SECCOMP_RET_TRACE));
     }
 
     #[test]
