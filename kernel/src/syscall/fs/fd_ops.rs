@@ -143,19 +143,32 @@ const fn open_has_data_write(flags: u32) -> bool {
     matches!(flags & O_ACCMODE, O_WRONLY | O_RDWR)
 }
 
+/// The open flags a descriptor keeps in `f_flags`.
+///
+/// fs/open.c:1153-1168 masks `open_how::flags` with `VALID_OPEN_FLAGS`
+/// (include/linux/fcntl.h:10-14) and strips `O_CLOEXEC` from `op->open_flag`,
+/// and fs/open.c:963 then strips `O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC |
+/// __O_REGULAR` in `do_dentry_open()`.  Every other requested bit stays
+/// visible in `F_GETFL`, including `O_DIRECTORY`, `O_NOFOLLOW`, `__O_TMPFILE`
+/// and `O_EMPTYPATH`.
 fn open_status_flags(flags: u32) -> u32 {
-    let mut status = flags & O_ACCMODE;
-    status |= flags
-        & (O_APPEND
-            | O_DIRECT
-            | O_DSYNC
-            | O_SYNC
-            | O_NONBLOCK
-            | FASYNC
-            | O_LARGEFILE
-            | O_NOATIME
-            | O_PATH);
-    status
+    const STRIPPED: u32 = O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC;
+    const VISIBLE: u32 = O_ACCMODE
+        | O_APPEND
+        | O_NONBLOCK
+        | O_NDELAY
+        | __O_SYNC
+        | O_DSYNC
+        | FASYNC
+        | O_DIRECT
+        | O_LARGEFILE
+        | O_DIRECTORY
+        | O_NOFOLLOW
+        | O_NOATIME
+        | O_PATH
+        | __O_TMPFILE
+        | O_EMPTYPATH;
+    flags & VISIBLE & !STRIPPED
 }
 
 fn file_open_operation(
@@ -394,6 +407,9 @@ fn enforce_special_open_rules(
 }
 
 const OPENAT2_HOW_SIZE: usize = size_of::<open_how>();
+/// include/uapi/asm-generic/fcntl.h:95-96.  linux-raw-sys does not export it,
+/// and include/linux/fcntl.h:14 lists it in VALID_OPEN_FLAGS.
+const O_EMPTYPATH: u32 = 1 << 26;
 const OPENAT2_ALLOWED_FLAGS: u64 = (O_ACCMODE
     | O_APPEND
     | FASYNC
@@ -411,8 +427,10 @@ const OPENAT2_ALLOWED_FLAGS: u64 = (O_ACCMODE
     | O_PATH
     | O_SYNC
     | O_TMPFILE
-    | O_TRUNC) as u64;
-const OPENAT2_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC;
+    | O_TRUNC
+    | O_EMPTYPATH) as u64;
+// fs/open.c:1134 O_PATH_FLAGS carries O_EMPTYPATH as well.
+const OPENAT2_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC | O_EMPTYPATH;
 const OPENAT2_ALLOWED_RESOLVE: u64 = (RESOLVE_NO_XDEV
     | RESOLVE_NO_MAGICLINKS
     | RESOLVE_NO_SYMLINKS
@@ -431,6 +449,11 @@ const fn open_requires_namespace_operation(flags: u32, resolve: u64) -> bool {
 
 const MAX_FILE_HANDLE_SZ: u32 = 128;
 const FILEID_INVALID: i32 = 255;
+// include/linux/exportfs.h:185-191.
+const FILEID_USER_FLAGS_MASK: i32 = 0xffff_0000u32 as i32;
+const FILEID_IS_CONNECTABLE: i32 = 0x0001_0000;
+const FILEID_IS_DIR: i32 = 0x0002_0000;
+const FILEID_VALID_USER_FLAGS: i32 = FILEID_IS_CONNECTABLE | FILEID_IS_DIR;
 const AT_HANDLE_FID: i32 = 0x200;
 const AT_HANDLE_MNT_ID_UNIQUE: i32 = 0x1;
 const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
@@ -1170,18 +1193,46 @@ pub fn sys_open_by_handle_at(
 ) -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
-    // Resolve and authorize the mount selector before touching the untrusted
-    // handle so EBADF/EPERM retain their ABI priority over EFAULT/EINVAL.
+    // fs/fhandle.c:359-368 copies and validates the fixed handle header before
+    // get_path_anchor() resolves the mount selector at :370-372, so a faulting
+    // or malformed header keeps priority over EBADF and EPERM.
+    let handle_addr = handle as usize;
+    let header = unsafe {
+        capability
+            .read_value_uninit(handle.cast::<LinuxFileHandle>())
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
+    if header.handle_bytes == 0 || header.handle_bytes > MAX_FILE_HANDLE_SZ {
+        return Err(AxError::InvalidInput);
+    }
+    if header.handle_type < 0
+        || header.handle_type & FILEID_USER_FLAGS_MASK & !FILEID_VALID_USER_FLAGS != 0
+    {
+        return Err(AxError::InvalidInput);
+    }
+
+    // fs/fhandle.c:170-197 get_path_anchor(): fdget() masks FMODE_PATH, so an
+    // O_PATH descriptor is EBADF while AT_FDCWD selects the working directory
+    // and every other descriptor is taken as the mount selector.
     let (mount, directory_scope) = if mount_fd == AT_FDCWD {
-        (current_fs_context().lock().current_dir().clone(), true)
+        (Some(current_fs_context().lock().current_dir().clone()), true)
     } else {
-        let selected = get_file_like(mount_fd)?;
+        let description = crate::file::get_file_description(mount_fd)?;
+        if description.is_path_only() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        let selected = description.file_handle();
         if let Some(directory) = selected.downcast_ref::<Directory>() {
-            (directory.inner().clone(), true)
+            (Some(directory.inner().clone()), true)
         } else if let Some(file) = selected.downcast_ref::<File>() {
-            (file.inner().location().clone(), false)
+            (Some(file.inner().location().clone()), false)
         } else {
-            return Err(AxError::InvalidInput);
+            // A descriptor without a filesystem anchor names a filesystem
+            // with no export operations. Linux reaches that verdict from
+            // exportfs_decode_fh() (fs/exportfs/expfs.c:454-455) after the
+            // decode authorities are checked, so it is reported below.
+            (None, false)
         }
     };
     // Keep Linux's global, superblock, and mount-namespace decode authorities
@@ -1206,32 +1257,22 @@ pub fn sys_open_by_handle_at(
             &mount_namespace_user_ns,
             CAP_SYS_ADMIN,
         ),
-        mount.mountpoint().is_attached(),
+        mount
+            .as_ref()
+            .is_some_and(|mount| mount.mountpoint().is_attached()),
         directory_scope,
         flags as u32,
     )
     .ok_or(LinuxError::EPERM)?;
     let decode_mode = authorization.decode_mode(flags as u32);
     let relaxed_directory_scope = match authorization {
-        HandleDecodeAuthorization::MountNamespace => Some(mount.clone()),
+        HandleDecodeAuthorization::MountNamespace => mount.clone(),
         HandleDecodeAuthorization::Global | HandleDecodeAuthorization::Superblock => None,
     };
 
-    let flags = normalize_legacy_open_flags(flags)?;
-    let _mount_namespace =
-        open_requires_namespace_operation(flags as u32, 0).then(crate::mounts::namespace_operation);
-
-    let handle_addr = handle as usize;
-    let header = unsafe {
-        capability
-            .read_value_uninit(handle.cast::<LinuxFileHandle>())
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
-    if header.handle_bytes == 0 || header.handle_bytes > MAX_FILE_HANDLE_SZ {
-        return Err(AxError::InvalidInput);
-    }
-
+    // fs/fhandle.c:387-394 copies the handle body after the decode authorities
+    // have been checked, so EPERM precedes EFAULT for a body outside the
+    // caller's address space.
     let body_addr = handle_addr
         .checked_add(size_of::<LinuxFileHandle>())
         .ok_or(LinuxError::EFAULT)?;
@@ -1247,10 +1288,29 @@ pub fn sys_open_by_handle_at(
     // user copy for fault/bounds behavior, then ignore a 1–3 byte tail.
     let body = &body[..usable_export_handle_bytes(header.handle_bytes)];
 
+    let Some(mount) = mount else {
+        return Err(LinuxError::ESTALE.into());
+    };
+    // fs/fhandle.c:401-408: the user flag bits become decode requirements and
+    // are never shown to the filesystem decoder.
+    let connectable = header.handle_type & FILEID_IS_CONNECTABLE != 0;
+    let directory_only = header.handle_type & FILEID_IS_DIR != 0;
+    let handle_type = header.handle_type & !FILEID_USER_FLAGS_MASK;
     let location = mount
         .mountpoint()
-        .decode_export_handle(header.handle_type, body, decode_mode)
+        .decode_export_handle(handle_type, body, decode_mode)
         .map_err(map_decode_export_handle_error)?;
+    if directory_only && !location.is_dir() {
+        return Err(LinuxError::ESTALE.into());
+    }
+    if connectable
+        && !mount
+            .mountpoint()
+            .export_handle_is_descendant(&mount, &location)
+            .map_err(map_decode_export_handle_error)?
+    {
+        return Err(LinuxError::ESTALE.into());
+    }
     // Anonymous decoded references have no parent chain.  Ask the filesystem
     // to verify the stable namespace ancestry from the encoded inode instead.
     if let Some(directory) = relaxed_directory_scope
@@ -1261,6 +1321,27 @@ pub fn sys_open_by_handle_at(
     {
         return Err(LinuxError::ESTALE.into());
     }
+
+    // fs/namei.c:4908-4909: file_open_root()'s do_file_open_root() rejects a
+    // symlink root whenever the open carries LOOKUP_OPEN, and build_open_flags()
+    // clears that intent only for O_PATH (fs/open.c:1270).  open_by_handle_at()
+    // always opens the decoded object as the root of an empty path, so a
+    // symlink handle is ELOOP even though no pathname was followed.
+    if flags as u32 & O_PATH == 0 && location.metadata()?.node_type == NodeType::Symlink {
+        return Err(AxError::from(LinuxError::ELOOP));
+    }
+
+    // fs/fhandle.c:451-453 adds O_LARGEFILE, and fs/open.c:1136-1148 masks it
+    // away again for an O_PATH description.
+    let flags = normalize_legacy_open_flags(flags)?;
+    let flags = if flags as u32 & O_PATH == 0 {
+        flags | O_LARGEFILE as i32
+    } else {
+        flags
+    };
+    let _mount_namespace =
+        open_requires_namespace_operation(flags as u32, 0).then(crate::mounts::namespace_operation);
+
     let task_snapshot = thread.namespace_credential_fs_snapshot();
     let security =
         OpenPathSecurityContext::new(task_snapshot.credential, task_snapshot.fs_snapshot.umask());
@@ -1851,6 +1932,13 @@ pub fn sys_openat2(
     size: usize,
 ) -> AxResult<isize> {
     let (path, how, flags) = copy_openat2_input(&capability, path, how_ptr, size)?;
+    // fs/open.c:1413-1415: O_LARGEFILE is only added for a non-O_PATH
+    // openat2 and only by the syscall entry, not by do_sys_openat2 itself.
+    let flags = if how.flags & O_PATH as u64 == 0 {
+        flags | O_LARGEFILE as i32
+    } else {
+        flags
+    };
     openat2_copied_current(dirfd, path, how, flags)
 }
 
@@ -1870,15 +1958,40 @@ pub(crate) fn copy_openat2_input(
         return Err(AxError::from(LinuxError::E2BIG));
     }
     let mut raw = [0u8; 4096];
-    let raw_destination =
-        unsafe { slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<MaybeUninit<u8>>(), size) };
-    capability
-        .read_bytes(how_ptr as usize, raw_destination)
-        .map_err(map_usercopy_error)?;
-    let raw = &raw[..size];
-    if size > OPENAT2_HOW_SIZE && raw[OPENAT2_HOW_SIZE..].iter().any(|&byte| byte != 0) {
-        return Err(AxError::from(LinuxError::E2BIG));
+    let how_addr = how_ptr as usize;
+    // include/linux/uaccess.h:392-415 copy_struct_from_user() validates the
+    // zeroed tail through check_zeroed_user() BEFORE copying the
+    // interoperable head, so a non-zero tail reports E2BIG even when the
+    // head is unreadable and a faulting tail reports EFAULT.
+    if size > OPENAT2_HOW_SIZE {
+        let tail_addr = how_addr
+            .checked_add(OPENAT2_HOW_SIZE)
+            .ok_or(LinuxError::EFAULT)?;
+        let tail_destination = unsafe {
+            slice::from_raw_parts_mut(
+                raw.as_mut_ptr()
+                    .add(OPENAT2_HOW_SIZE)
+                    .cast::<MaybeUninit<u8>>(),
+                size - OPENAT2_HOW_SIZE,
+            )
+        };
+        capability
+            .read_bytes(tail_addr, tail_destination)
+            .map_err(map_usercopy_error)?;
+        if raw[OPENAT2_HOW_SIZE..size].iter().any(|&byte| byte != 0) {
+            return Err(AxError::from(LinuxError::E2BIG));
+        }
     }
+    let head_destination = unsafe {
+        slice::from_raw_parts_mut(
+            raw.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+            OPENAT2_HOW_SIZE,
+        )
+    };
+    capability
+        .read_bytes(how_addr, head_destination)
+        .map_err(map_usercopy_error)?;
+    let raw = &raw[..OPENAT2_HOW_SIZE];
     let how = unsafe { ptr::read_unaligned(raw.as_ptr().cast::<open_how>()) };
     let flags = validate_openat2_how(&how)? as i32;
     let resolve_cached = how.resolve & RESOLVE_CACHED as u64 != 0;
@@ -1917,7 +2030,9 @@ pub(crate) fn openat2_copied_current(
 /// openat2 ordering.  io_uring runs this after copying the ABI input but
 /// before retaining a dirfd, so its admission errors match the syscall path.
 pub(crate) fn validate_openat2_copied_path(path: &FsPath, how: &open_how) -> AxResult {
-    if path.as_bytes().is_empty() {
+    // fs/namei.c:202-206: a zero-length name is only admissible when
+    // O_EMPTYPATH raised LOOKUP_EMPTY (fs/open.c:1283-1284).
+    if path.as_bytes().is_empty() && how.flags & O_EMPTYPATH as u64 == 0 {
         return Err(AxError::NotFound);
     }
     if how.resolve & RESOLVE_BENEATH as u64 != 0 && path.is_absolute() {
@@ -2000,6 +2115,18 @@ pub(crate) fn openat2_copied_with_snapshot(
             context.credentials(),
             fd_snapshot,
             &mut policy,
+        )
+    } else if how.flags & O_EMPTYPATH as u64 != 0 && path.as_bytes().is_empty() {
+        // LOOKUP_EMPTY performs no component walk: the descriptor named by
+        // dirfd is itself the target (fs/namei.c:2744,2771-2780).
+        open_resolved_location_with_policy(
+            &path,
+            fs.current_dir().clone(),
+            false,
+            flags,
+            how.mode as __kernel_mode_t,
+            context.credentials(),
+            fd_snapshot,
         )
     } else {
         open_in_fs_with_policy(
