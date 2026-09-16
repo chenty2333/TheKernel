@@ -1442,19 +1442,24 @@ pub fn sys_io_submit<M: UserMemory + ?Sized>(
     )
 }
 
-pub fn sys_io_getevents<M: UserMemory + ?Sized>(
+/// Waits for and copies out one completion batch.
+///
+/// This is Linux's `do_io_getevents()` (`fs/aio.c:2268-2281`): the context
+/// lookup comes first and the `min_nr <= nr && min_nr >= 0` range check
+/// second, both reported as `EINVAL`, after the calling wrapper has already
+/// copied the relative timeout.
+fn io_getevents_waited<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ctx: u64,
     min_nr: isize,
     nr: isize,
     events: *mut IoEvent,
-    timeout: *const KernelTimespec,
+    timeout: Option<Duration>,
 ) -> AxResult<isize> {
+    let context = context_for_current(ctx)?;
     if min_nr < 0 || nr < 0 || min_nr > nr {
         return Err(AxError::InvalidInput);
     }
-    let timeout = read_optional_timespec(memory, timeout)?;
-    let context = context_for_current(ctx)?;
     let min_nr = min_nr as usize;
     let nr = nr as usize;
 
@@ -1514,6 +1519,29 @@ pub fn sys_io_getevents<M: UserMemory + ?Sized>(
     Ok(copied as isize)
 }
 
+/// `io_getevents(2)`.
+///
+/// Linux copies the relative timeout before `do_io_getevents()` runs, so an
+/// unreadable timeout is `EFAULT` even when the range arguments are invalid
+/// (`fs/aio.c:2296-2313`).
+pub fn sys_io_getevents<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ctx: u64,
+    min_nr: isize,
+    nr: isize,
+    events: *mut IoEvent,
+    timeout: *const KernelTimespec,
+) -> AxResult<isize> {
+    let timeout = read_optional_timespec(memory, timeout)?;
+    io_getevents_waited(memory, ctx, min_nr, nr, events, timeout)
+}
+
+/// `io_pgetevents(2)`.
+///
+/// Linux's order is fixed and observable: the timeout, then the 16-byte
+/// `struct __aio_sigset` wrapper, then `set_user_sigmask()`'s own NULL /
+/// size / copy checks, and only then the context lookup and the range check
+/// (`fs/aio.c:2329-2360`, `kernel/signal.c:3282-3300`).
 pub fn sys_io_pgetevents<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ctx: u64,
@@ -1523,9 +1551,10 @@ pub fn sys_io_pgetevents<M: UserMemory + ?Sized>(
     timeout: *const KernelTimespec,
     sigset: *const AioSigset,
 ) -> AxResult<isize> {
+    let timeout = read_optional_timespec(memory, timeout)?;
     let sigset = read_optional_sigset(memory, sigset)?;
     with_blocked_signals(sigset, || {
-        sys_io_getevents(memory, ctx, min_nr, nr, events, timeout)
+        io_getevents_waited(memory, ctx, min_nr, nr, events, timeout)
     })
 }
 
