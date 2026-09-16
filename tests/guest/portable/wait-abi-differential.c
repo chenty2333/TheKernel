@@ -175,6 +175,281 @@ static void collect(pid_t pid)
 }
 
 /* ------------------------------------------------------------------ *
+ * Identity, process-group, session and credential probes.
+ *
+ * A raw wrapper per syscall keeps each case on the kernel entry point under
+ * test instead of the libc wrapper, and every probe that has to change global
+ * state runs in a forked child so the shared process is never disturbed.
+ * ------------------------------------------------------------------ */
+static long getpid_op(void) { return syscall(SYS_getpid); }
+static long getppid_op(void) { return syscall(SYS_getppid); }
+static long gettid_op(void) { return syscall(SYS_gettid); }
+static long set_tid_address_op(void *address) { return syscall(SYS_set_tid_address, address); }
+static long tkill_op(int tid, int signo) { return syscall(SYS_tkill, tid, signo); }
+static long tgkill_op(int tgid, int tid, int signo) { return syscall(SYS_tgkill, tgid, tid, signo); }
+static long getpgrp_op(void) { return syscall(SYS_getpgrp); }
+static long getpgid_op(int pid) { return syscall(SYS_getpgid, pid); }
+static long getsid_op(int pid) { return syscall(SYS_getsid, pid); }
+static long setsid_op(void) { return syscall(SYS_setsid); }
+static long getresuid_op(unsigned *r, unsigned *e, unsigned *s) { return syscall(SYS_getresuid, r, e, s); }
+static long getresgid_op(unsigned *r, unsigned *e, unsigned *s) { return syscall(SYS_getresgid, r, e, s); }
+static long setreuid_op(int r, int e) { return syscall(SYS_setreuid, r, e); }
+static long setregid_op(int r, int e) { return syscall(SYS_setregid, r, e); }
+static long setresuid_op(int r, int e, int s) { return syscall(SYS_setresuid, r, e, s); }
+static long setresgid_op(int r, int e, int s) { return syscall(SYS_setresgid, r, e, s); }
+
+#ifndef FUTEX_WAIT
+#define FUTEX_WAIT 0
+#endif
+#ifndef CLONE_NEWPID
+#define CLONE_NEWPID 0x20000000
+#endif
+
+static volatile long *map_shared(void)
+{
+    void *page = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        fprintf(stderr, "THEKERNEL_WAIT_ABI_FAIL map-shared errno=%d\n", errno);
+        exit(1);
+    }
+    memset(page, 0, PAGE);
+    return page;
+}
+
+/* Bounded wait for a child's published stage marker. */
+static void sleep_millis(long millis)
+{
+    struct timespec ts;
+    ts.tv_sec = millis / 1000;
+    ts.tv_nsec = (millis % 1000) * 1000000L;
+    syscall(SYS_nanosleep, &ts, NULL);
+}
+
+static void await_slot(volatile long *slot, long value)
+{
+    for (int i = 0; i < 5000 && *slot != value; ++i) sleep_millis(1);
+}
+
+/* Shared credential-step report: slot 0 counts finished steps, then five
+ * longs (return value, errno, real, effective, saved) per step. */
+static volatile long *id_shared;
+static int id_shared_group;
+
+static void id_read(int ids[3])
+{
+    unsigned r = 0, e = 0, s = 0;
+    long rc = id_shared_group ? getresgid_op(&r, &e, &s) : getresuid_op(&r, &e, &s);
+    ids[0] = rc == 0 ? (int)r : -1;
+    ids[1] = rc == 0 ? (int)e : -1;
+    ids[2] = rc == 0 ? (int)s : -1;
+}
+
+static void id_note(int step, long rc, int error)
+{
+    int ids[3];
+    volatile long *p = id_shared + 1 + (long)step * 5;
+    id_read(ids);
+    p[0] = rc;
+    p[1] = error;
+    p[2] = ids[0];
+    p[3] = ids[1];
+    p[4] = ids[2];
+    id_shared[0] = step + 1;
+}
+
+static void id_call(int step, long rc)
+{
+    id_note(step, rc, rc == -1 ? errno : 0);
+}
+
+static void id_expect(int step, long rc, long error, long r, long e, long s, const char *name)
+{
+    volatile long *p = id_shared + 1 + (long)step * 5;
+    check(name, id_shared[0] > step && p[0] == rc && p[1] == error
+          && p[2] == r && p[3] == e && p[4] == s);
+}
+
+/* Raw credential transitions, run in a forked child. Identity changes are
+ * irreversible once every id has been dropped, so the sequence first proves
+ * the privileged transitions and only then drops the capability. */
+static void setreuid_sequence(void)
+{
+    id_call(0, 0);
+    errno = 0; id_call(1, setreuid_op(-1, -1));
+    errno = 0; id_call(2, setreuid_op(1, -1));
+    errno = 0; id_call(3, setreuid_op(0, 0));
+    errno = 0; id_call(4, setreuid_op(-1, 1));
+    errno = 0; id_call(5, setreuid_op(0, 0));
+    errno = 0; id_call(6, setreuid_op(1, 1));
+    errno = 0; id_call(7, setreuid_op(0, -1));
+    errno = 0; id_call(8, setreuid_op(-1, 0));
+    errno = 0; id_call(9, setreuid_op(1, -1));
+}
+
+static void setregid_sequence(void)
+{
+    id_call(0, 0);
+    errno = 0; id_call(1, setregid_op(-1, -1));
+    errno = 0; id_call(2, setregid_op(1, -1));
+    errno = 0; id_call(3, setregid_op(0, 0));
+    errno = 0; id_call(4, setregid_op(-1, 1));
+    errno = 0; id_call(5, setregid_op(0, 0));
+    errno = 0; id_call(6, setregid_op(1, 1));
+    /* The gid capability follows the uid, so a gid-only change keeps it. */
+    errno = 0; id_call(7, setregid_op(0, -1));
+    errno = 0; id_call(8, setregid_op(-1, 0));
+    errno = 0; id_call(9, setregid_op(0, 0));
+    /* Dropping the uid drops the capability; the gids are untouched. */
+    errno = 0; id_call(10, setresuid_op(1, 1, 1));
+    errno = 0; id_call(11, setregid_op(1, -1));
+    errno = 0; id_call(12, setregid_op(-1, 1));
+    errno = 0; id_call(13, setregid_op(0, 0));
+}
+
+static void setresuid_sequence(void)
+{
+    id_call(0, 0);
+    errno = 0; id_call(1, setresuid_op(-1, -1, -1));
+    errno = 0; id_call(2, setresuid_op(-1, 1, -1));
+    errno = 0; id_call(3, setresuid_op(0, 0, 0));
+    errno = 0; id_call(4, setresuid_op(1, -1, -1));
+    errno = 0; id_call(5, setresuid_op(0, 0, 0));
+    errno = 0; id_call(6, setresuid_op(1, 1, 1));
+    errno = 0; id_call(7, setresuid_op(-1, 0, -1));
+    errno = 0; id_call(8, setresuid_op(0, -1, 0));
+    errno = 0; id_call(9, setresuid_op(1, 1, -1));
+}
+
+static void setresgid_sequence(void)
+{
+    id_call(0, 0);
+    errno = 0; id_call(1, setresgid_op(-1, -1, -1));
+    errno = 0; id_call(2, setresgid_op(-1, 1, -1));
+    errno = 0; id_call(3, setresgid_op(0, 0, 0));
+    errno = 0; id_call(4, setresgid_op(1, -1, -1));
+    errno = 0; id_call(5, setresgid_op(0, 0, 0));
+    errno = 0; id_call(6, setresgid_op(1, 1, 1));
+    /* The gid capability follows the uid, so a gid-only change keeps it. */
+    errno = 0; id_call(7, setresgid_op(-1, 0, -1));
+    errno = 0; id_call(8, setresgid_op(0, -1, 0));
+    errno = 0; id_call(9, setresgid_op(0, 0, 0));
+    /* Dropping the uid drops the capability; the gids are untouched. */
+    errno = 0; id_call(10, setresuid_op(1, 1, 1));
+    errno = 0; id_call(11, setresgid_op(-1, 1, -1));
+    errno = 0; id_call(12, setresgid_op(1, -1, -1));
+    errno = 0; id_call(13, setresgid_op(0, 0, 0));
+}
+
+/* Run the credential sequence in a child and hand back the report. */
+static void id_run_child(void (*sequence)(void))
+{
+    pid_t child = fork();
+    if (child == 0) {
+        sequence();
+        _exit(0);
+    }
+    if (child < 0) {
+        fprintf(stderr, "THEKERNEL_WAIT_ABI_FAIL id-fork errno=%d\n", errno);
+        exit(1);
+    }
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+}
+
+/* ---------------------------------------------------------------- *
+ * Identity: pid, parent pid, thread id, clear-child-tid.
+ * ---------------------------------------------------------------- */
+static atomic_int identity_stage;
+static pid_t identity_thread_pid;
+static pid_t identity_thread_tid;
+static pid_t identity_thread_ppid;
+
+static void *identity_thread(void *unused)
+{
+    (void)unused;
+    identity_thread_pid = (pid_t)getpid_op();
+    identity_thread_tid = (pid_t)gettid_op();
+    identity_thread_ppid = (pid_t)getppid_op();
+    atomic_store_explicit(&identity_stage, 1, memory_order_release);
+    while (atomic_load_explicit(&identity_stage, memory_order_acquire) != 2) sched_yield();
+    return NULL;
+}
+
+static void identity_start_thread(pthread_t *thread)
+{
+    identity_thread_pid = 0;
+    identity_thread_tid = 0;
+    identity_thread_ppid = 0;
+    atomic_store_explicit(&identity_stage, 0, memory_order_release);
+    if (pthread_create(thread, NULL, identity_thread, NULL) != 0) {
+        fprintf(stderr, "THEKERNEL_WAIT_ABI_FAIL identity-thread errno=%d\n", errno);
+        exit(1);
+    }
+    while (atomic_load_explicit(&identity_stage, memory_order_acquire) != 1) sched_yield();
+}
+
+static void identity_stop_thread(pthread_t thread)
+{
+    atomic_store_explicit(&identity_stage, 2, memory_order_release);
+    pthread_join(thread, NULL);
+}
+
+/*
+ * Clone a fresh pid namespace and report what its first process sees. The
+ * unsharing process stays in the parent namespace, so only its child is
+ * namespace pid 1 and its own parent is invisible there.
+ */
+static void pid_namespace_probe(volatile long *report)
+{
+    pid_t outer;
+    report[0] = 0;
+    report[1] = 0;
+    report[2] = 0;
+    report[3] = 0;
+    outer = fork();
+    if (outer == 0) {
+        if (syscall(SYS_unshare, CLONE_NEWPID) != 0) _exit(41);
+        pid_t inner = fork();
+        if (inner < 0) _exit(42);
+        if (inner == 0) {
+            report[1] = getpid_op();
+            report[2] = gettid_op();
+            report[3] = getppid_op();
+            _exit(0);
+        }
+        int status = 0;
+        while (waitpid(inner, &status, 0) < 0 && errno == EINTR) { }
+        report[0] = 1;
+        _exit(0);
+    }
+    if (outer < 0) {
+        fprintf(stderr, "THEKERNEL_WAIT_ABI_FAIL pidns-fork errno=%d\n", errno);
+        exit(1);
+    }
+    while (waitpid(outer, NULL, 0) < 0 && errno == EINTR) { }
+}
+
+/*
+ * clear_child_tid: a live thread shares its address space, so the exiting
+ * thread zeroes the armed word and wakes a futex waiter on it; a plain
+ * process exit has no other user of the mm, so Linux leaves the word alone.
+ * The thread arm is only ever reached by clone(CLONE_THREAD), so it uses a
+ * raw clone whose entry point never returns.
+ */
+static volatile int clear_tid_word;
+static volatile int clear_tid_go = 0;
+static char clear_tid_stack[65536] __attribute__((aligned(16)));
+
+static int clear_tid_thread(void *unused)
+{
+    (void)unused;
+    set_tid_address_op((void *)&clear_tid_word);
+    while (clear_tid_go == 0) sched_yield();
+    sleep_millis(50);
+    syscall(SYS_exit, 0);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ *
  * wait4(2) __WNOTHREAD: only this exact task's own relation counts.
  *
  * __do_wait() walks `current->children` and `current->ptraced`, and breaks
@@ -1688,6 +1963,447 @@ int main(void)
         for (index = 0; index < 2; index++) {
             if (forked[index] > 0) collect(forked[index]);
         }
+    }
+    done();
+
+    /*
+     * getpid(2): the identifier a caller observes is its thread-group id in
+     * its own pid namespace, so a sibling thread shares it, a forked child
+     * has its own, and the first process of a fresh namespace is 1.
+     */
+    begin("getpid.raw-differential");
+    {
+        volatile long *report = map_shared();
+        pid_t self = (pid_t)getpid_op();
+        pthread_t thread;
+        pid_t child;
+
+        check("getpid-main-tid-equals-pid", self > 0 && getpid_op() == (long)self && gettid_op() == (long)self);
+        identity_start_thread(&thread);
+        check("getpid-thread-shares-tgid", identity_thread_pid == self
+              && identity_thread_tid != 0 && identity_thread_tid != (pid_t)gettid_op());
+        identity_stop_thread(thread);
+
+        child = fork();
+        if (child == 0) {
+            report[1] = getpid_op();
+            report[2] = gettid_op();
+            report[3] = self;
+            report[0] = 1;
+            _exit(0);
+        }
+        check("getpid-child-fork", child > 0);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+        check("getpid-child-own-identity", report[1] == (long)child && report[2] == (long)child);
+        check("getpid-child-distinct-from-parent", report[1] != (long)self);
+
+        pid_namespace_probe(report);
+        check("getpid-pidns-init-is-one", report[0] == 1 && report[1] == 1 && report[2] == 1);
+    }
+    done();
+
+    /*
+     * getppid(2): the parent identity is the caller-visible one, so a thread
+     * shares the process parent, an orphan is reparented, and a parent that
+     * lives outside the caller's pid namespace reads as 0.
+     */
+    begin("getppid.raw-differential");
+    {
+        volatile long *report = map_shared();
+        pid_t self = (pid_t)getpid_op();
+        pid_t child;
+        pthread_t thread;
+
+        child = fork();
+        if (child == 0) {
+            report[1] = getppid_op();
+            report[2] = self;
+            report[0] = 1;
+            _exit(0);
+        }
+        check("getppid-child-fork", child > 0);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+        check("getppid-child-sees-parent", report[1] == (long)self);
+        check("getppid-main-parent-alive", getppid_op() > 0 && getppid_op() != (long)self);
+
+        identity_start_thread(&thread);
+        check("getppid-thread-shares-parent", identity_thread_ppid == (pid_t)getppid_op());
+        identity_stop_thread(thread);
+
+        pid_namespace_probe(report);
+        check("getppid-pidns-invisible-parent-zero", report[0] == 1 && report[3] == 0);
+
+        /* An orphan is reparented to the namespace's init process. */
+        {
+            volatile long *orphan = map_shared();
+            pid_t middle = fork();
+            if (middle == 0) {
+                pid_t grandchild;
+                orphan[3] = getpid_op();
+                grandchild = fork();
+                if (grandchild < 0) { orphan[2] = 3; _exit(43); }
+                if (grandchild == 0) {
+                    for (int i = 0; i < 4000; ++i) {
+                        pid_t now = (pid_t)getppid_op();
+                        if (now != (pid_t)orphan[3]) {
+                            orphan[1] = now;
+                            orphan[2] = 1;
+                            _exit(0);
+                        }
+                        sleep_millis(1);
+                    }
+                    orphan[1] = getppid_op();
+                    orphan[2] = 2;
+                    _exit(0);
+                }
+                _exit(0);
+            }
+            check("getppid-orphan-fork", middle > 0);
+            while (waitpid(middle, NULL, 0) < 0 && errno == EINTR) { }
+            for (int i = 0; i < 6000 && orphan[2] == 0; ++i) sleep_millis(1);
+            check("getppid-orphan-reparented-to-init", orphan[2] == 1 && orphan[1] == 1);
+        }
+    }
+    done();
+
+    /*
+     * gettid(2): the per-thread identifier is unique inside its thread group,
+     * addresses the thread for tkill(2)/tgkill(2), and equals the pid of a
+     * single-threaded process.
+     */
+    begin("gettid.raw-differential");
+    {
+        volatile long *report = map_shared();
+        pid_t self = (pid_t)getpid_op();
+        pthread_t thread;
+        pid_t child;
+        long first;
+
+        check("gettid-main-equals-pid", gettid_op() == (long)self && gettid_op() > 0);
+        first = gettid_op();
+        identity_start_thread(&thread);
+        check("gettid-thread-unique", identity_thread_tid != 0
+              && identity_thread_tid != (pid_t)first);
+        check("gettid-thread-addressable", tkill_op((int)identity_thread_tid, 0) == 0
+              && tgkill_op((int)self, (int)identity_thread_tid, 0) == 0);
+        identity_stop_thread(thread);
+        check("gettid-thread-gone-esrch", tkill_op((int)identity_thread_tid, 0) == -1 && errno == ESRCH);
+
+        child = fork();
+        if (child == 0) {
+            report[1] = gettid_op();
+            report[2] = getpid_op();
+            report[0] = 1;
+            _exit(0);
+        }
+        check("gettid-child-fork", child > 0);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+        check("gettid-child-single-threaded", report[1] == (long)child && report[2] == (long)child);
+    }
+    done();
+
+    /*
+     * set_tid_address(2): the raw address is retained without being probed,
+     * the visible tid is returned, and the address is consumed on thread exit
+     * (zeroed and futex-woken) but not by a plain process exit.
+     */
+    begin("set_tid_address.raw-differential");
+    {
+        void *guard = mmap(NULL, PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        volatile long *word;
+        pid_t child;
+        long tid;
+        long woken;
+
+        check("set_tid_address-returns-visible-tid", set_tid_address_op(NULL) == gettid_op());
+        check("set_tid_address-unprobed-address", guard != MAP_FAILED
+              && set_tid_address_op(guard) == gettid_op());
+
+        clear_tid_word = 0x1234;
+        clear_tid_go = 0;
+        tid = clone(clear_tid_thread, clear_tid_stack + sizeof(clear_tid_stack),
+                    CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM,
+                    NULL);
+        check("set_tid_address-thread-clone", tid > 0);
+        clear_tid_go = 1;
+        {
+            struct timespec timeout = {.tv_sec = 5, .tv_nsec = 0};
+            errno = 0;
+            woken = syscall(SYS_futex, (void *)&clear_tid_word, FUTEX_WAIT, 0x1234, &timeout, NULL, 0);
+        }
+        check("set_tid_address-thread-exit-clears-word", clear_tid_word == 0);
+        check("set_tid_address-thread-exit-wakes-futex", woken == 0 && errno == 0);
+
+        word = map_shared();
+        word[0] = 0x1234;
+        child = fork();
+        if (child == 0) {
+            if (set_tid_address_op((void *)word) != gettid_op()) _exit(44);
+            _exit(0);
+        }
+        check("set_tid_address-process-exit-fork", child > 0);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+        check("set_tid_address-process-exit-keeps-word", word[0] == 0x1234);
+    }
+    done();
+
+    /*
+     * getpgrp(2): the no-argument query agrees with getpgid(0), a child
+     * inherits the caller's group, and setpgid(2) moves it to its own.
+     */
+    begin("getpgrp.raw-differential");
+    {
+        volatile long *report = map_shared();
+        pid_t child;
+
+        check("getpgrp-matches-getpgid-zero", getpgrp_op() == getpgid_op(0));
+
+        child = fork();
+        if (child == 0) {
+            report[1] = getpgrp_op();
+            if (setpgid(0, 0) != 0) _exit(45);
+            report[2] = getpgrp_op();
+            report[3] = getpgid_op(0);
+            report[4] = getpid_op();
+            report[5] = getppid_op();
+            report[0] = 1;
+            for (;;) pause();
+        }
+        check("getpgrp-child-fork", child > 0);
+        await_slot(&report[0], 1);
+        check("getpgrp-child-inherits-group", report[1] == getpgrp_op());
+        check("getpgrp-child-own-group", report[2] == (long)child && report[3] == (long)child
+              && report[4] == (long)child);
+        check("getpgrp-parent-observes-child-group", getpgid_op((int)child) == (int)child);
+        collect(child);
+    }
+    done();
+
+    /*
+     * setsid(2): the caller becomes the leader of a new session and process
+     * group whose id is its pid, and a second call from that leader is EPERM.
+     */
+    begin("setsid.raw-differential");
+    {
+        volatile long *report = map_shared();
+        pid_t child;
+
+        child = fork();
+        if (child == 0) {
+            long rc;
+            report[1] = getpgid_op(0);
+            report[2] = getsid_op(0);
+            errno = 0;
+            rc = setsid_op();
+            report[3] = rc;
+            report[4] = errno;
+            report[5] = getpgid_op(0);
+            report[6] = getsid_op(0);
+            report[7] = getpid_op();
+            errno = 0;
+            rc = setsid_op();
+            report[8] = rc;
+            report[9] = errno;
+            report[0] = 1;
+            for (;;) pause();
+        }
+        check("setsid-child-fork", child > 0);
+        await_slot(&report[0], 1);
+        check("setsid-inherits-parent-session", report[1] == getpgrp_op() && report[2] == getsid_op(0));
+        check("setsid-returns-new-session-id", report[3] == report[7] && report[4] == 0
+              && report[5] == report[7] && report[6] == report[7]);
+        check("setsid-parent-observes-new-session", getsid_op((int)child) == (int)child
+              && getpgid_op((int)child) == (int)child);
+        check("setsid-twice-eperm", report[8] == -1 && report[9] == EPERM);
+        collect(child);
+    }
+    done();
+
+    /*
+     * getpgid(2): the zero argument queries the caller, a named pid queries
+     * that process, an unreaped zombie still answers, and a missing pid is
+     * ESRCH.
+     */
+    begin("getpgid.raw-differential");
+    {
+        volatile long *report = map_shared();
+        pid_t child;
+
+        check("getpgid-zero-is-caller", getpgid_op(0) == getpgrp_op());
+        check("getpgid-self-by-pid", getpgid_op((int)getpid()) == getpgrp_op());
+        EXPECT_ERR("getpgid-missing-esrch", getpgid_op(INT32_MAX), ESRCH);
+
+        child = fork();
+        if (child == 0) {
+            if (setpgid(0, 0) != 0) _exit(46);
+            report[1] = getpgid_op(0);
+            report[2] = getpgrp_op();
+            report[0] = 1;
+            for (;;) pause();
+        }
+        check("getpgid-child-fork", child > 0);
+        await_slot(&report[0], 1);
+        check("getpgid-named-child", getpgid_op((int)child) == (int)child);
+        check("getpgid-child-self-report", report[1] == (long)child && report[2] == (long)child);
+        collect(child);
+
+        /* A zombie leader keeps its group addressable until it is reaped. */
+        child = fork();
+        if (child == 0) _exit(0);
+        check("getpgid-zombie-fork", child > 0);
+        {
+            siginfo_t info;
+            memset(&info, 0, sizeof(info));
+            check("getpgid-zombie-observe",
+                  syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, NULL) == 0);
+            check("getpgid-zombie-reports-group", getpgid_op((int)child) == getpgrp_op());
+        }
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+    }
+    done();
+
+    /*
+     * getsid(2): the zero argument queries the caller, a process that called
+     * setsid(2) is its own session, an unreaped zombie still answers, and a
+     * missing pid is ESRCH.
+     */
+    begin("getsid.raw-differential");
+    {
+        volatile long *report = map_shared();
+        pid_t child;
+
+        check("getsid-zero-is-caller", getsid_op(0) == getsid_op((int)getpid()));
+        EXPECT_ERR("getsid-missing-esrch", getsid_op(INT32_MAX), ESRCH);
+
+        child = fork();
+        if (child == 0) {
+            if (setsid_op() < 0) _exit(47);
+            report[1] = getsid_op(0);
+            report[2] = getpgid_op(0);
+            report[3] = getpid_op();
+            report[0] = 1;
+            for (;;) pause();
+        }
+        check("getsid-child-fork", child > 0);
+        await_slot(&report[0], 1);
+        check("getsid-child-new-session", report[1] == (long)child && report[2] == (long)child
+              && report[3] == (long)child);
+        check("getsid-parent-observes-child-session", getsid_op((int)child) == (int)child);
+        check("getsid-child-session-differs-from-parent", getsid_op((int)child) != getsid_op(0));
+        collect(child);
+
+        /* An unreaped zombie leader still reports its session. */
+        child = fork();
+        if (child == 0) _exit(0);
+        check("getsid-zombie-fork", child > 0);
+        {
+            siginfo_t info;
+            memset(&info, 0, sizeof(info));
+            check("getsid-zombie-observe",
+                  syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, NULL) == 0);
+            check("getsid-zombie-reports-session", getsid_op((int)child) == getsid_op(0));
+        }
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+    }
+    done();
+
+    /*
+     * setreuid(2): the -1 sentinels leave an identity unchanged, a changed
+     * effective id drags the saved id with it, and once every id has been
+     * dropped the process may not climb back.
+     */
+    begin("setreuid.raw-differential");
+    {
+        id_shared = map_shared();
+        id_shared_group = 0;
+        id_run_child(setreuid_sequence);
+        check("setreuid-baseline-root", id_shared[0] > 0
+              && id_shared[3] == 0 && id_shared[4] == 0 && id_shared[5] == 0);
+        id_expect(1, 0, 0, 0, 0, 0, "setreuid-sentinel-pair-noop");
+        id_expect(2, 0, 0, 1, 0, 0, "setreuid-real-change-keeps-effective");
+        id_expect(3, 0, 0, 0, 0, 0, "setreuid-privileged-restore");
+        id_expect(4, 0, 0, 0, 1, 1, "setreuid-effective-change-sets-saved");
+        id_expect(5, 0, 0, 0, 0, 0, "setreuid-restore-after-effective");
+        id_expect(6, 0, 0, 1, 1, 1, "setreuid-drop-all-identities");
+        id_expect(7, -1, EPERM, 1, 1, 1, "setreuid-unprivileged-real-refused");
+        id_expect(8, -1, EPERM, 1, 1, 1, "setreuid-unprivileged-effective-refused");
+        id_expect(9, 0, 0, 1, 1, 1, "setreuid-reachable-ids-allowed");
+    }
+    done();
+
+    /*
+     * setregid(2): the same transition rules for the group identity triple.
+     */
+    begin("setregid.raw-differential");
+    {
+        id_shared = map_shared();
+        id_shared_group = 1;
+        id_run_child(setregid_sequence);
+        check("setregid-baseline-root", id_shared[0] > 0
+              && id_shared[3] == 0 && id_shared[4] == 0 && id_shared[5] == 0);
+        id_expect(1, 0, 0, 0, 0, 0, "setregid-sentinel-pair-noop");
+        id_expect(2, 0, 0, 1, 0, 0, "setregid-real-change-keeps-effective");
+        id_expect(3, 0, 0, 0, 0, 0, "setregid-privileged-restore");
+        id_expect(4, 0, 0, 0, 1, 1, "setregid-effective-change-sets-saved");
+        id_expect(5, 0, 0, 0, 0, 0, "setregid-restore-after-effective");
+        id_expect(6, 0, 0, 1, 1, 1, "setregid-drop-all-identities");
+        id_expect(7, 0, 0, 0, 1, 1, "setregid-group-capability-follows-uid");
+        id_expect(8, 0, 0, 0, 0, 1, "setregid-saved-identity-unchanged");
+        id_expect(9, 0, 0, 0, 0, 0, "setregid-privileged-restore-before-drop");
+        id_expect(10, 0, 0, 0, 0, 0, "setregid-drop-uid-keeps-gids");
+        id_expect(11, -1, EPERM, 0, 0, 0, "setregid-unprivileged-real-refused");
+        id_expect(12, -1, EPERM, 0, 0, 0, "setregid-unprivileged-effective-refused");
+        id_expect(13, 0, 0, 0, 0, 0, "setregid-reachable-ids-allowed");
+    }
+    done();
+
+    /*
+     * setresuid(2): each -1 leaves exactly one member of the identity triple
+     * untouched, and every requested id must already be reachable once the
+     * capability is gone.
+     */
+    begin("setresuid.raw-differential");
+    {
+        id_shared = map_shared();
+        id_shared_group = 0;
+        id_run_child(setresuid_sequence);
+        check("setresuid-baseline-root", id_shared[0] > 0
+              && id_shared[3] == 0 && id_shared[4] == 0 && id_shared[5] == 0);
+        id_expect(1, 0, 0, 0, 0, 0, "setresuid-all-sentinels-noop");
+        id_expect(2, 0, 0, 0, 1, 0, "setresuid-effective-only-change");
+        id_expect(3, 0, 0, 0, 0, 0, "setresuid-privileged-restore");
+        id_expect(4, 0, 0, 1, 0, 0, "setresuid-real-only-change");
+        id_expect(5, 0, 0, 0, 0, 0, "setresuid-restore-after-real");
+        id_expect(6, 0, 0, 1, 1, 1, "setresuid-drop-all-identities");
+        id_expect(7, -1, EPERM, 1, 1, 1, "setresuid-unprivileged-effective-refused");
+        id_expect(8, -1, EPERM, 1, 1, 1, "setresuid-unprivileged-real-refused");
+        id_expect(9, 0, 0, 1, 1, 1, "setresuid-reachable-ids-allowed");
+    }
+    done();
+
+    /*
+     * setresgid(2): the same three-sentinel rules for the group triple.
+     */
+    begin("setresgid.raw-differential");
+    {
+        id_shared = map_shared();
+        id_shared_group = 1;
+        id_run_child(setresgid_sequence);
+        check("setresgid-baseline-root", id_shared[0] > 0
+              && id_shared[3] == 0 && id_shared[4] == 0 && id_shared[5] == 0);
+        id_expect(1, 0, 0, 0, 0, 0, "setresgid-all-sentinels-noop");
+        id_expect(2, 0, 0, 0, 1, 0, "setresgid-effective-only-change");
+        id_expect(3, 0, 0, 0, 0, 0, "setresgid-privileged-restore");
+        id_expect(4, 0, 0, 1, 0, 0, "setresgid-real-only-change");
+        id_expect(5, 0, 0, 0, 0, 0, "setresgid-restore-after-real");
+        id_expect(6, 0, 0, 1, 1, 1, "setresgid-drop-all-identities");
+        id_expect(7, 0, 0, 1, 0, 1, "setresgid-group-capability-follows-uid");
+        id_expect(8, 0, 0, 0, 0, 0, "setresgid-saved-identity-moved-by-request");
+        id_expect(9, 0, 0, 0, 0, 0, "setresgid-privileged-restore-before-drop");
+        id_expect(10, 0, 0, 0, 0, 0, "setresgid-drop-uid-keeps-gids");
+        id_expect(11, -1, EPERM, 0, 0, 0, "setresgid-unprivileged-effective-refused");
+        id_expect(12, -1, EPERM, 0, 0, 0, "setresgid-unprivileged-real-refused");
+        id_expect(13, 0, 0, 0, 0, 0, "setresgid-reachable-ids-allowed");
     }
     done();
 

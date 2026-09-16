@@ -3627,8 +3627,8 @@ status = "implemented"
 contract = "linux-getpid"
 handler = "kernel/src/syscall/task/thread.rs:sys_getpid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3650,8 +3650,8 @@ status = "implemented"
 contract = "linux-getppid"
 handler = "kernel/src/syscall/task/thread.rs:sys_getppid"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/thread.rs:getppid_parent_identity_obeys_pid_namespace_visibility"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["kernel/src/syscall/task/thread.rs:getppid_parent_identity_obeys_pid_namespace_visibility", "tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3673,8 +3673,8 @@ status = "implemented"
 contract = "linux-gettid"
 handler = "kernel/src/syscall/task/thread.rs:sys_gettid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3696,8 +3696,8 @@ status = "implemented"
 contract = "linux-set_tid_address"
 handler = "kernel/src/syscall/task/thread.rs:sys_set_tid_address"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3742,8 +3742,8 @@ status = "implemented"
 contract = "linux-rt_sigprocmask"
 handler = "kernel/src/syscall/signal.rs:sys_rt_sigprocmask"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/signal-mask-alias.c:main"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["tests/guest/portable/signal-mask-alias.c:main", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3765,8 +3765,8 @@ status = "implemented"
 contract = "linux-rt_sigreturn"
 handler = "kernel/src/syscall/signal.rs:sys_rt_sigreturn"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/signal-fp-smoke.c:main"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["tests/guest/tools/signal-fp-smoke.c:main", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3788,8 +3788,8 @@ status = "implemented"
 contract = "linux-pause"
 handler = "kernel/src/syscall/signal.rs:sys_pause"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/pause-smoke.c:main"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["tests/guest/tools/pause-smoke.c:main", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3811,8 +3811,8 @@ status = "implemented"
 contract = "linux-kill"
 handler = "kernel/src/syscall/signal.rs:sys_kill"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/signal.rs:process_group_signal_reducer_keeps_the_first_success_sticky", "kernel/src/syscall/signal.rs:broadcast_signal_reducer_matches_linux_historical_eperm_rule"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["kernel/src/syscall/signal.rs:process_group_signal_reducer_keeps_the_first_success_sticky", "kernel/src/syscall/signal.rs:broadcast_signal_reducer_matches_linux_historical_eperm_rule", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3834,8 +3834,8 @@ status = "implemented"
 contract = "linux-rt_sigpending"
 handler = "kernel/src/syscall/signal.rs:sys_rt_sigpending"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/signal.rs:sigpending_only_reports_blocked_pending_signals"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["kernel/src/syscall/signal.rs:sigpending_only_reports_blocked_pending_signals", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3857,8 +3857,8 @@ status = "implemented"
 contract = "linux-rt_sigtimedwait"
 handler = "kernel/src/syscall/signal.rs:sys_rt_sigtimedwait"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/signal-wait-boundary.c:main"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["tests/guest/tools/signal-wait-boundary.c:main", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3880,8 +3880,8 @@ status = "implemented"
 contract = "linux-rt_sigqueueinfo"
 handler = "kernel/src/syscall/signal.rs:sys_rt_sigqueueinfo"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/signal.rs:realtime_queue_policy_matches_linux_siginfo_classification"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["kernel/src/syscall/signal.rs:realtime_queue_policy_matches_linux_siginfo_classification", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3903,8 +3903,8 @@ status = "implemented"
 contract = "linux-rt_sigsuspend"
 handler = "kernel/src/syscall/signal.rs:sys_rt_sigsuspend"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/signal.rs:signal_set_size_rules_match_each_linux_syscall_contract"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["kernel/src/syscall/signal.rs:signal_set_size_rules_match_each_linux_syscall_contract", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3949,8 +3949,8 @@ status = "implemented"
 contract = "linux-tkill"
 handler = "kernel/src/syscall/signal.rs:sys_tkill"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/signal.rs:signal_numbers_are_range_checked_before_narrowing"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["kernel/src/syscall/signal.rs:signal_numbers_are_range_checked_before_narrowing", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3972,8 +3972,8 @@ status = "implemented"
 contract = "linux-tgkill"
 handler = "kernel/src/syscall/signal.rs:sys_tgkill"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/signal.rs:signal_numbers_are_range_checked_before_narrowing"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, namespace and failure-state matrix remains pending"]
+tests = ["kernel/src/syscall/signal.rs:signal_numbers_are_range_checked_before_narrowing", "tests/guest/portable/signal-boundary-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7583,7 +7583,7 @@ status = "implemented"
 contract = "linux-getpgrp"
 handler = "kernel/src/syscall/dispatch.rs:compat_getpgrp"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/identity-differential.c:main"]
+tests = ["tests/guest/portable/identity-differential.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -7606,7 +7606,7 @@ status = "implemented"
 contract = "linux-setsid"
 handler = "kernel/src/syscall/task/job.rs:sys_setsid"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/identity-differential.c:main"]
+tests = ["tests/guest/portable/identity-differential.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -7629,7 +7629,7 @@ status = "implemented"
 contract = "linux-getpgid"
 handler = "kernel/src/syscall/task/job.rs:sys_getpgid"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/identity-differential.c:main"]
+tests = ["tests/guest/portable/identity-differential.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -7652,7 +7652,7 @@ status = "implemented"
 contract = "linux-getsid"
 handler = "kernel/src/syscall/task/job.rs:sys_getsid"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/identity-differential.c:main"]
+tests = ["tests/guest/portable/identity-differential.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -7675,7 +7675,7 @@ status = "implemented"
 contract = "linux-setreuid"
 handler = "kernel/src/syscall/task/ctl.rs:sys_setreuid"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/identity-differential.c:main"]
+tests = ["tests/guest/portable/identity-differential.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -7698,7 +7698,7 @@ status = "implemented"
 contract = "linux-setregid"
 handler = "kernel/src/syscall/task/ctl.rs:sys_setregid"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/identity-differential.c:main"]
+tests = ["tests/guest/portable/identity-differential.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -7721,7 +7721,7 @@ status = "implemented"
 contract = "linux-setresuid"
 handler = "kernel/src/syscall/task/ctl.rs:sys_setresuid"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/identity-differential.c:main"]
+tests = ["tests/guest/portable/identity-differential.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -7744,7 +7744,7 @@ status = "implemented"
 contract = "linux-setresgid"
 handler = "kernel/src/syscall/task/ctl.rs:sys_setresgid"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/identity-differential.c:main"]
+tests = ["tests/guest/portable/identity-differential.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
