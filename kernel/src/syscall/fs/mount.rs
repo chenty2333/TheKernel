@@ -26,8 +26,8 @@ use hashbrown::{HashMap, HashSet};
 use linux_raw_sys::general::{CAP_SYS_ADMIN, mount_attr};
 use tk_linux_mount::*;
 use tk_linux_usercopy::{
-    CopyStructError, UserMemory, UserMemoryContext, VmPtr, copy_struct_from_user, vm_load,
-    vm_load_until_nul, vm_write_slice,
+    CopyStructError, UserCopyError, UserMemory, UserMemoryContext, VmPtr, copy_struct_from_user,
+    vm_load, vm_load_until_nul, vm_load_until_nul_bounded, vm_write_slice,
 };
 
 use crate::{
@@ -2745,13 +2745,34 @@ pub fn sys_fsopen<M: UserMemory + ?Sized>(
     fs_name: *const c_char,
     flags: u32,
 ) -> AxResult<isize> {
-    let fs_name = load_user_string(memory, fs_name)?;
-    debug!("sys_fsopen <= fs_name: {fs_name:?}, flags: {flags:#x}");
-
-    let cloexec = validate_fsopen_flags(flags).map_err(map_mount_uapi)?;
+    // Linux `SYSCALL_DEFINE2(fsopen, ...)` (fs/fsopen.c:121-146) spends its two
+    // cheap admissions first and only then copies the name:
+    //     if (!may_mount()) return -EPERM;
+    //     if (flags & ~FSOPEN_CLOEXEC) return -EINVAL;
+    //     fs_name = strndup_user(_fs_name, PAGE_SIZE);
+    //     if (IS_ERR(fs_name)) return PTR_ERR(fs_name);
+    //     fs_type = get_fs_type(fs_name);
+    //     if (!fs_type) return -ENODEV;
+    // A caller without mount authority therefore reports EPERM even when the
+    // flag word is invalid, and an invalid flag word is reported before a bad
+    // name pointer.  strndup_user() also fails with EINVAL -- not ENODEV --
+    // when no NUL terminates the name inside the first page, so the bounded
+    // loader keeps that boundary.
     if !current_may_mount() {
         return Err(LinuxError::EPERM.into());
     }
+    let cloexec = validate_fsopen_flags(flags).map_err(map_mount_uapi)?;
+    let fs_name = String::from_utf8(
+        vm_load_until_nul_bounded(memory, fs_name.cast::<u8>(), PAGE_SIZE).map_err(|error| {
+            match error {
+                UserCopyError::TooLong => AxError::InvalidInput,
+                other => map_usercopy_error(other),
+            }
+        })?,
+    )
+    .map_err(|_| AxError::IllegalBytes)?;
+    debug!("sys_fsopen <= fs_name: {fs_name:?}, flags: {flags:#x}");
+
     if filesystem_type(&fs_name).is_none() {
         return Err(AxError::NoSuchDevice);
     }
@@ -4198,11 +4219,13 @@ fn mount_setattr_from_copied<M: UserMemory + ?Sized>(
     // Linux's errno order for an invalid attribute paired with a bad path.
     let topology_request = mount_setattr_request(attr)?;
 
-    let path = if pathname.is_null() && flags & AT_EMPTY_PATH != 0 {
-        FsPathBuf::new()
-    } else {
-        load_user_path(memory, pathname)?
-    };
+    // `mount_setattr()` reaches its target through `CLASS(filename_uflags,
+    // name)(path, flags)` (fs/namespace.c:5176), which is `getname_flags()`: a
+    // NULL pointer faults with EFAULT even under AT_EMPTY_PATH, and only an
+    // empty *string* names the descriptor's own mount.  This is also the path
+    // `open_tree_attr()` takes, whose `vfs_open_tree()` already rejected a NULL
+    // pathname before `do_mount_setattr()` can run.
+    let path = load_user_path(memory, pathname)?;
     debug!("sys_mount_setattr <= dirfd: {dirfd}, path: {path:?}, flags: {flags:#x}");
 
     let _mount_operation = mounts::namespace_operation();
@@ -4707,6 +4730,15 @@ fn move_attached_mount(source: &Location, target: &Location, flags: u32) -> AxRe
     if !source.is_root_of_mount() {
         return Err(AxError::InvalidInput);
     }
+    // `do_move_mount()` (fs/namespace.c:3642-3643) compares the directory-ness
+    // of the placement pair before any namespace admission:
+    //     if (d_is_dir(new_path->dentry) != d_is_dir(old_path->dentry))
+    //             return -EINVAL;
+    // A directory mount placed on a regular file (and the reverse) is EINVAL,
+    // not the EIO an unusable placement path would otherwise report.
+    if source.is_dir() != target.is_dir() {
+        return Err(AxError::InvalidInput);
+    }
     ensure_current_move_mount_location(source)?;
     ensure_current_move_mount_location(target)?;
     if flags & MOVE_MOUNT_SET_GROUP != 0 {
@@ -4787,6 +4819,12 @@ pub fn sys_move_mount<M: UserMemory + ?Sized>(
                     return Ok(0);
                 }
                 if flags & MOVE_MOUNT_SET_GROUP != 0 {
+                    return Err(AxError::InvalidInput);
+                }
+                // A detached tree carries its own root, so `do_move_mount()`'s
+                // directory-ness comparison (fs/namespace.c:3642-3643) applies
+                // to the descriptor rather than to a namespace path.
+                if mount_fd.root.is_dir() != target.is_dir() {
                     return Err(AxError::InvalidInput);
                 }
                 let target = if flags & MOVE_MOUNT_BENEATH != 0 {

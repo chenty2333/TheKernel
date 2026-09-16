@@ -291,6 +291,10 @@ CONTRACTS.update({
     "tgkill": ("raw-differential", "pass", "NONPOSITIVE_IDS_EINVAL LOOKUP_BEFORE_SIGNO TGID_MUST_MATCH_TARGET NULL_SIGNAL_PROBE SI_TKILL_RECORD"),
 })
 
+CONTRACTS.update({
+    "mount-descriptors": ("raw-differential", "pass", "FSOPEN_CLOEXEC_DESCRIPTOR FSOPEN_FLAGS_BEFORE_NAME FSOPEN_NAME_ADMISSION FSOPEN_UNPRIVILEGED_EPERM MOVE_MOUNT_FLAGS_BEFORE_PATHS MOVE_MOUNT_TARGET_BEFORE_SOURCE MOVE_MOUNT_EMPTY_PATH_DESCRIPTOR MOVE_MOUNT_PLACEMENT_TYPE MOVE_MOUNT_UNPRIVILEGED_EPERM MOVE_MOUNT_ATTACH_DETACHED MOVE_MOUNT_DETACH_RESTORES MOUNT_SETATTR_SHAPE_BEFORE_COPY MOUNT_SETATTR_ATTR_COPY MOUNT_SETATTR_NOOP_SKIPS_PATH MOUNT_SETATTR_ATTRIBUTE_RULES MOUNT_SETATTR_TRAILING_BYTES MOUNT_SETATTR_MOUNT_ROOT_ONLY MOUNT_SETATTR_UNPRIVILEGED_EPERM MOUNT_SETATTR_PATH_ADMISSION MOUNT_SETATTR_DETACHED_RDONLY MOUNT_SETATTR_DETACHED_CLEAR LISTMOUNT_FLAGS_AND_COUNT LISTMOUNT_REQUEST_COPY LISTMOUNT_REQUEST_IDENTITY LISTMOUNT_ROOT_FORWARD_REVERSE LISTMOUNT_STATMOUNT_IDENTITY LISTMOUNT_CURSOR LISTMOUNT_ATTACH_OBSERVED"),
+})
+
 PROGRAM_CASES = {
     "tty-job-control": ("tty-job-control",),
     "tty-termios": ("tty-termios",),
@@ -313,7 +317,7 @@ PROGRAM_CASES = {
     "lsm-abi": ("lsm-self-attr",),
     "time-abi": ("time-timer", "gettimeofday", "settimeofday", "settimeofday-unprivileged", "clock_settime", "clock_getres", "clock_nanosleep", "adjtimex", "clock_adjtime", "timer_create", "timer_getoverrun"),
     "wait-abi": ("wait4", "waitid", "sched_rr_get_interval", "sched_attr", "mempolicy", "sched_query", "setpriority", "ioprio", "ptrace_stop", "getpid", "getppid", "getpgrp", "setsid", "setreuid", "setregid", "setresuid", "setresgid", "getpgid", "getsid", "gettid", "set_tid_address"),
-    "mount-api": ("open-tree", "fsconfig", "fsmount", "fspick", "statmount", "quotactl", "quotactl-fd", "pivot-root", "fanotify-init", "fanotify-mark"),
+    "mount-api": ("open-tree", "fsconfig", "fsmount", "fspick", "statmount", "quotactl", "quotactl-fd", "pivot-root", "fanotify-init", "fanotify-mark", "mount-descriptors"),
     "keyring-random": ("keyring-random",),
     "landlock-abi": ("landlock-create", "landlock-add-rule", "landlock-restrict-self", "landlock-unix-resolve", "landlock-net-port"),
     "futex-abi": ("futex-abi-opcode", "futex-abi-wake-zero", "futex-abi-requeue", "futex-abi-pi-word", "futex-abi-pi-timeout", "futex-abi-waitv-numa", "futex-abi-requeue-pi-signal", "futex-abi-pi-signal", "futex-abi-futex2-flags", "futex-abi-requeue-pi", "futex-abi-retry-write-fault", "futex-abi-requeue-pi-owned", "futex-abi-requeue-pi-held", "futex-abi-requeue-pi-plain"),
@@ -420,6 +424,10 @@ SYSCALL_CASES = {
     85: ("creat", "creat"), 95: ("umask", "umask"), 201: ("time", "time"),
     63: ("fs-abi", "uname"), 99: ("fs-abi", "sysinfo"),
     111: ("identity", "identity-pgid"),
+    429: ("mount-api", "mount-descriptors"),
+    430: ("mount-api", "mount-descriptors"),
+    442: ("mount-api", "mount-descriptors"),
+    458: ("mount-api", "mount-descriptors"),
     14: ("signal-boundary", "rt_sigprocmask"),
     15: ("signal-boundary", "rt_sigreturn"),
     34: ("signal-boundary", "pause"),

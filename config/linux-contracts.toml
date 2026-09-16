@@ -6893,8 +6893,8 @@ status = "implemented"
 contract = "linux-move_mount"
 handler = "kernel/src/syscall/fs/mount.rs:sys_move_mount"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full move_mount raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6916,8 +6916,8 @@ status = "implemented"
 contract = "linux-fsopen"
 handler = "kernel/src/syscall/fs/mount.rs:sys_fsopen"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full fsopen raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7031,8 +7031,8 @@ status = "implemented"
 contract = "linux-listmount"
 handler = "kernel/src/syscall/fs/mount.rs:sys_listmount"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full listmount raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7054,8 +7054,8 @@ status = "implemented"
 contract = "linux-mount_setattr"
 handler = "kernel/src/syscall/fs/mount.rs:sys_mount_setattr"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full mount_setattr raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
