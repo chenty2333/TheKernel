@@ -29,6 +29,9 @@
 #define SYS_arch_prctl 158
 #endif
 #ifndef SYS_iopl
+#ifndef SYS_ioperm
+#define SYS_ioperm 173
+#endif
 #define SYS_iopl 172
 #endif
 #ifndef SYS_setpgid
@@ -357,6 +360,29 @@ static void iopl_case(void) {
     check(syscall(SYS_iopl, 3) == raised, "raise-is-stable");
     (void)syscall(SYS_iopl, 0);
     mark("LEVEL_AND_LOWERING");
+    done();
+}
+
+
+/* ksys_ioperm() decides the range before it considers capability
+ * (arch/x86/kernel/ioport.c:73-81).  `from + num <= from` is true both for a
+ * zero length and for a range whose end wraps, and
+ * `from + num > IO_BITMAP_BITS` rejects anything past port 65535, so the
+ * comparisons are on the full unsigned long and not on a truncated port. */
+static void ioperm_case(void) {
+    begin("ioperm.raw-differential");
+    ERROR(syscall(SYS_ioperm, 0, 0, 1), EINVAL, "zero-length");
+    ERROR(syscall(SYS_ioperm, 65536, 1, 1), EINVAL, "beyond-last-port");
+    ERROR(syscall(SYS_ioperm, ~0UL, 1, 1), EINVAL, "range-wrap");
+    mark("RANGE_VALIDATION_IS_UNSIGNED");
+
+    /* Dropping a range that was never granted returns before a bitmap is
+     * allocated; granting and revoking reach the bitmap. */
+    check(syscall(SYS_ioperm, 0, 8, 0) == 0, "drop-without-bitmap");
+    check(syscall(SYS_ioperm, 0, 65536, 1) == 0, "whole-bitmap");
+    check(syscall(SYS_ioperm, 65535, 1, 1) == 0, "last-port");
+    check(syscall(SYS_ioperm, 65535, 1, 0) == 0, "drop-last-port");
+    mark("GRANT_AND_REVOKE");
     done();
 }
 
@@ -852,6 +878,7 @@ int main(int argc, char **argv) {
     prctl_cfi_case();
     arch_prctl_case();
     iopl_case();
+    ioperm_case();
     capset_case();
     move_pages_case();
     modify_ldt_case();

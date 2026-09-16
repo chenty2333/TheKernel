@@ -7514,8 +7514,8 @@ status = "implemented"
 contract = "linux-ioperm"
 handler = "kernel/src/syscall/task/ioport.rs:sys_ioperm"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/ioport.rs:ioperm_range_matches_linux_unsigned_long_checks"]
-validation_gaps = ["Existing source/helper coverage does not establish the full ioperm raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/task/ioport.rs:ioperm_range_matches_linux_unsigned_long_checks", "tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]

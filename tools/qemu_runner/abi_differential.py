@@ -300,6 +300,10 @@ CONTRACTS.update({
     "set-mempolicy-home-node": ("raw-differential", "pass", "ALIGNMENT_AND_FLAGS_FIRST OFFLINE_NODE_EINVAL EMPTY_RANGE_SUCCEEDS_EARLY UNPOLICED_RANGE_ENOENT"),
 })
 
+CONTRACTS.update({
+    "ioperm": ("raw-differential", "pass", "RANGE_VALIDATION_IS_UNSIGNED GRANT_AND_REVOKE"),
+})
+
 PROGRAM_CASES = {
     "tty-job-control": ("tty-job-control",),
     "tty-termios": ("tty-termios",),
@@ -314,7 +318,7 @@ PROGRAM_CASES = {
     "signal-boundary": ("rt_sigaction", "sigaltstack", "rt_tgsigqueueinfo", "restart_syscall", "rt_sigprocmask", "rt_sigreturn", "pause", "kill", "rt_sigpending", "rt_sigtimedwait", "rt_sigqueueinfo", "rt_sigsuspend", "tkill", "tgkill"),
     "stat-access": ("access", "faccessat", "faccessat2", "newfstatat", "statx"),
     "socket-msg": ("socket_msg.send_flags", "socket_msg.sendmmsg_flags", "socket_msg.peek_waitall_tcp", "socket_msg.tcp_more", "socket_msg.compat_flag", "socket_msg.waitall_stream", "socket_msg.waitall_tcp", "socket_msg.waitall_datagram", "socket_msg.recvmmsg_deadline", "socket_msg.recvmmsg_waitforone"),
-    "task-control": ("prctl-name", "prctl-timing", "prctl-auxv", "prctl-timer-restore-ids", "prctl-cfi", "arch_prctl", "iopl", "capset", "move_pages", "modify_ldt", "setpgid", "clone3"),
+    "task-control": ("prctl-name", "prctl-timing", "prctl-auxv", "prctl-timer-restore-ids", "prctl-cfi", "arch_prctl", "iopl", "capset", "move_pages", "modify_ldt", "setpgid", "clone3", "ioperm"),
     "identity": ("identity-ids", "identity-switch", "identity-groups", "identity-fsids", "identity-limits", "identity-usage", "identity-personality", "identity-uts", "identity-pgid", "identity-setres", "identity-capget"),
     "fs-abi": ("fs-basic", "fs-path", "getcwd", "fcntl", "syslog", "reboot", "ioctl", "mount", "umount2", "pipe2", "syncfs", "preadv2", "pwritev2", "fallocate-mode", "tee", "vmsplice", "readahead-types", "pidfd-send-signal", "ustat", "sysinfo", "uname", "splice", "fifo-times"),
     "epoll-membarrier": ("epoll-membarrier",),
@@ -429,6 +433,7 @@ SYSCALL_CASES = {
     85: ("creat", "creat"), 95: ("umask", "umask"), 201: ("time", "time"),
     63: ("fs-abi", "uname"), 99: ("fs-abi", "sysinfo"),
     111: ("identity", "identity-pgid"),
+    173: ("task-control", "ioperm"),
     256: ("mm-contracts", "migrate-pages"), 450: ("mm-contracts", "set-mempolicy-home-node"),
     429: ("mount-api", "mount-descriptors"),
     430: ("mount-api", "mount-descriptors"),
