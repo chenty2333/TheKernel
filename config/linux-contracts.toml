@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 319
-implemented = 300
+resolved = 320
+implemented = 301
 explicit_enosys = 19
 fallback = 0
-partial = 66
+partial = 65
 unknown = 0
 
 [[contract]]
@@ -3190,8 +3190,8 @@ status = "implemented"
 contract = "linux-getitimer"
 handler = "kernel/src/syscall/time.rs:sys_getitimer"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/wait-boundary.c:test_itimer_usercopy_semantics"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
+tests = ["tests/guest/tools/wait-boundary.c:test_itimer_usercopy_semantics", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3213,8 +3213,8 @@ status = "implemented"
 contract = "linux-alarm"
 handler = "kernel/src/syscall/time.rs:sys_alarm"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/time.rs:alarm_remaining_seconds_matches_linux_half_second_rule_and_wraps"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
+tests = ["kernel/src/syscall/time.rs:alarm_remaining_seconds_matches_linux_half_second_rule_and_wraps", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3236,8 +3236,8 @@ status = "implemented"
 contract = "linux-setitimer"
 handler = "kernel/src/syscall/time.rs:sys_setitimer"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/wait-boundary.c:test_itimer_periodic"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
+tests = ["tests/guest/tools/wait-boundary.c:test_itimer_periodic", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3282,8 +3282,8 @@ status = "implemented"
 contract = "linux-times"
 handler = "kernel/src/syscall/time.rs:sys_times"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
+tests = ["tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3374,8 +3374,8 @@ status = "implemented"
 contract = "linux-timer_settime"
 handler = "kernel/src/syscall/time.rs:sys_timer_settime"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/signal-wait-boundary.c:test_unaligned_posix_timer_usercopy"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
+tests = ["tests/guest/tools/signal-wait-boundary.c:test_unaligned_posix_timer_usercopy", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3397,8 +3397,8 @@ status = "implemented"
 contract = "linux-timer_gettime"
 handler = "kernel/src/syscall/time.rs:sys_timer_gettime"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/signal-wait-boundary.c:test_unaligned_posix_timer_usercopy"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
+tests = ["tests/guest/tools/signal-wait-boundary.c:test_unaligned_posix_timer_usercopy", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -3443,8 +3443,8 @@ status = "implemented"
 contract = "linux-timer_delete"
 handler = "kernel/src/syscall/time.rs:sys_timer_delete"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/signal-wait-boundary.c:test_unaligned_posix_timer_usercopy"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
+tests = ["tests/guest/tools/signal-wait-boundary.c:test_unaligned_posix_timer_usercopy", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6663,8 +6663,8 @@ status = "implemented"
 contract = "linux-timerfd_create"
 handler = "kernel/src/syscall/fs/timerfd.rs:sys_timerfd_create"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["timerfd_create has no registered differential case and no host test reaches its alarm-clock admission, which is verified by source agreement only"]
+tests = ["tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6709,8 +6709,8 @@ status = "implemented"
 contract = "linux-timerfd_gettime"
 handler = "kernel/src/syscall/fs/timerfd.rs:sys_timerfd_gettime"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full timerfd_gettime raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7100,8 +7100,8 @@ status = "implemented"
 contract = "linux-nanosleep"
 handler = "kernel/src/syscall/task/schedule.rs:sys_nanosleep"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full nanosleep raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7257,13 +7257,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 145
 name = "sched_getscheduler"
-status = "partial"
+status = "implemented"
 contract = "linux-sched_getscheduler"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_getscheduler"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
-validation_gaps = ["No registered differential case exercises this query; the change is covered by source agreement with Linux v7.2.3 and module tests"]
-limitations = ["a task that has started exiting but is not yet a zombie still reports ESRCH instead of its last policy with SCHED_RESET_ON_FORK: the flag comes from task_scheduling_snapshot(), which returns TaskSchedError::TaskExited once the task is terminalizing or Exited, while Linux reads p->sched_reset_on_fork from the still-addressable task_struct"]
+validation_gaps = ["The registered sched_query assertions cover self, negative, unknown, WNOWAIT-zombie, reaped and exiting-but-unreaped targets; a query racing a concurrent sched_setattr on the same task has no differential case"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-sched_rr_get_interval"
@@ -7469,8 +7469,8 @@ contract = "linux-sched_setattr"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_setattr"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
-validation_gaps = ["The attribute size, flag and write-back rules are exercised by the wait-abi differential; the deadline effects have no test"]
-limitations = ["SCHED_FLAG_RECLAIM and SCHED_FLAG_DL_OVERRUN are stored and reported but inert: the EEVDF deadline core has neither a reclaim callback nor an overrun latch"]
+validation_gaps = ["The attribute size, flag and write-back rules are exercised by the wait-abi differential, which also prints the over-capacity admission count as a diagnostic; the deadline effects (throttling, overrun accounting, deadline-following-runtime) have no test"]
+limitations = ["SCHED_FLAG_RECLAIM and SCHED_FLAG_DL_OVERRUN are stored and reported but inert: the EEVDF core keeps them in DeadlineParameters::flags and no code reads them, so there is no reclaim callback, no overrun latch and no SIGXCPU from the deadline class", "Deadline bandwidth admission is only charged when the parameter change is applied through a run queue that owns the task: a task that is blocked or otherwise unowned when it enters SCHED_DEADLINE skips the shared domain ledger, so an over-capacity reservation is granted where Linux answers EBUSY", "An admission refusal reports EINVAL instead of Linux's EBUSY"]
 
 [[contract]]
 id = "linux-sched_getattr"
@@ -7492,8 +7492,8 @@ contract = "linux-sched_getattr"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_getattr"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
-validation_gaps = ["The attribute size, flag and write-back rules are exercised by the wait-abi differential; the deadline effects have no test"]
-limitations = ["SCHED_FLAG_RECLAIM and SCHED_FLAG_DL_OVERRUN are stored and reported but inert: the EEVDF deadline core has neither a reclaim callback nor an overrun latch"]
+validation_gaps = ["The attribute size, flag and write-back rules are exercised by the wait-abi differential, which also prints the DL_DYNAMIC values as a diagnostic; the remaining-budget and absolute-deadline semantics have no test"]
+limitations = ["SCHED_FLAG_RECLAIM and SCHED_FLAG_DL_OVERRUN are stored and reported but inert: the EEVDF core keeps them in DeadlineParameters::flags and no code reads them, so there is no reclaim callback, no overrun latch and no SIGXCPU from the deadline class", "SCHED_GETATTR_FLAG_DL_DYNAMIC is accepted for a deadline target but reports the configured reservation instead of the remaining budget and the absolute deadline", "sched_getattr on an exiting non-leader thread resolves through the group leader's zombie entry and reports ESRCH"]
 
 [[contract]]
 id = "linux-ioperm"
