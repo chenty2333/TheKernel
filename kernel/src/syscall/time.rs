@@ -1328,9 +1328,6 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
     }
 
     if let Some(tz) = tz {
-        if tz.tz_minuteswest < -15 * 60 || tz.tz_minuteswest > 15 * 60 {
-            return Err(AxError::InvalidInput);
-        }
         // `sys_tz` is stored before the wall clock is touched, so a rejected
         // time still leaves the retained timezone changed
         // (`kernel/time/time.c:205-222`).
@@ -1353,8 +1350,8 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
         // (`do_sys_settimeofday64()`, kernel/time/time.c:185-197). Spending the
         // one-shot only on the `tv == NULL` branch would let a later
         // `settimeofday(NULL, &tz)` warp `CLOCK_REALTIME` by
-        // `tz_minuteswest * 60` -- up to +-15 hours -- after a call that already
-        // set the clock.
+        // `tz_minuteswest * 60` after a call that already set the clock. Linux
+        // does not range-check `tz_minuteswest`, so neither do we.
         if crate::time::warp_first_timezone(tz.tz_minuteswest, requested_nanos.is_none())? {
             // `timekeeping_warp_clock()` reaches `ntp_clear()` through
             // `timekeeping_inject_offset()` (`kernel/time/timekeeping.c:1786-1790`),
@@ -1596,10 +1593,13 @@ pub fn sys_setitimer<M: UserMemory + ?Sized>(
     // calls instead of rejecting the selector before touching userspace.
     let (interval, remained) = if !new_value.is_null() {
         let new_value = read_itimer_value(memory, new_value)?;
+        // Linux validates only `tv_usec` (`timeval_valid()`) and saturates the
+        // ktime conversion, so a `tv_sec` beyond the representable nanosecond
+        // range clamps instead of failing with ERANGE.
         let interval = usize::try_from(new_value.it_interval.try_into_time_value()?.as_nanos())
-            .map_err(|_| AxError::OutOfRange)?;
+            .unwrap_or(usize::MAX);
         let remaining = usize::try_from(new_value.it_value.try_into_time_value()?.as_nanos())
-            .map_err(|_| AxError::OutOfRange)?;
+            .unwrap_or(usize::MAX);
         (interval, remaining)
     } else {
         (0, 0)

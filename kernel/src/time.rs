@@ -220,6 +220,13 @@ pub fn set_wall_time(new_time: TimeValue) -> AxResult<()> {
     if target_nanos >= MAX_WALL_TIME_NANOS {
         return Err(AxError::InvalidInput);
     }
+    // The published offset is a signed nanosecond delta against the platform
+    // wall clock; refuse to saturate it so an unrepresentable target cannot be
+    // mistaken for a successful set. Validate it before claiming the
+    // publication sequence: a rejection after the CAS would leave the sequence
+    // odd and every seqlock reader spinning.
+    let base_nanos = axhal::time::wall_time_nanos() as i128;
+    let offset = i64::try_from(target_nanos - base_nanos).map_err(|_| AxError::OutOfRange)?;
     // A local timer interrupt may read wall time, so the writer must not be
     // interrupted or preempted while the publication sequence is odd.
     let publication_guard = kernel_guard::NoPreemptIrqSave::new();
@@ -244,11 +251,6 @@ pub fn set_wall_time(new_time: TimeValue) -> AxResult<()> {
         }
     };
 
-    let base_nanos = axhal::time::wall_time_nanos() as i128;
-    // The published offset is a signed nanosecond delta against the platform
-    // wall clock; refuse to saturate it so an unrepresentable target cannot be
-    // mistaken for a successful set.
-    let offset = i64::try_from(target_nanos - base_nanos).map_err(|_| AxError::OutOfRange)?;
     // The odd/even sequence prevents readers from combining a new offset with
     // an old cancellation generation. Wake readiness consumers only after the
     // complete publication is visible, and never while holding object locks.

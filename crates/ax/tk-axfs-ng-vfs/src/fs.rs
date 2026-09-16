@@ -99,7 +99,12 @@ pub trait FilesystemOps: Send + Sync {
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(12).map_err(|_| VfsError::NoMemory)?;
         bytes.extend_from_slice(&entry.inode().to_ne_bytes());
-        bytes.extend_from_slice(&(entry.object_key().generation as u32).to_ne_bytes());
+        // FILEID_INO64_GEN carries a u32 generation; a backend identity with
+        // high bits set cannot be represented, so the export fails rather
+        // than silently aliasing another generation.
+        let generation = u32::try_from(entry.object_key().generation)
+            .map_err(|_| VfsError::OperationNotSupported)?;
+        bytes.extend_from_slice(&generation.to_ne_bytes());
         Ok(ExportHandle {
             handle_type: FILEID_INO64_GEN,
             bytes,

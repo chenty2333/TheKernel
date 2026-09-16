@@ -807,20 +807,22 @@ pub fn sys_syslog<M: UserMemory + ?Sized>(
     buf: *mut c_char,
     len: isize,
 ) -> AxResult<isize> {
-    let action = SyslogAction::try_from(kind).map_err(|_| AxError::InvalidInput)?;
+    // `do_syslog()` runs `check_syslog_permissions()` before the `switch`
+    // whose default arm is -EINVAL, so an out-of-range type is -EPERM for a
+    // caller without CAP_SYSLOG and -EINVAL only for a privileged one.
+    let privileged = current_can_read_klog();
+    let action = match SyslogAction::try_from(kind) {
+        Ok(action) => action,
+        Err(_) if !privileged => return Err(AxError::OperationNotPermitted),
+        Err(_) => return Err(AxError::InvalidInput),
+    };
     // Keep the cursor snapshot and its later commit in the same read critical
     // section, so two blocking READs cannot consume the same log range.
     let _read_guard = matches!(action, SyslogAction::Read).then(|| SYSLOG_READ_LOCK.lock());
     let cursors = *SYSLOG_CURSORS.lock();
     // Linux's do_syslog() tests `!buf` for READ/READ_ALL/READ_CLEAR, so a
     // NULL output is EINVAL even when the length is zero.
-    let plan = syslog_plan(
-        action,
-        !buf.is_null(),
-        len,
-        current_can_read_klog(),
-        cursors,
-    )?;
+    let plan = syslog_plan(action, !buf.is_null(), len, privileged, cursors)?;
     match plan {
         SyslogPlan::Noop => Ok(0),
         SyslogPlan::Console { enabled } => {

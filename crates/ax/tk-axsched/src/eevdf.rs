@@ -516,6 +516,7 @@ struct MigrationState {
     deadline_remaining_ns: u64,
     deadline_absolute_ns: u64,
     deadline_replenish_at_ns: u64,
+    deadline_overrun_ns: u64,
     deadline_throttled: bool,
     /// Source detachment retains this shared-domain owner alongside the
     /// reservation.  Keeping an Arc, rather than an address-sized identity,
@@ -560,6 +561,10 @@ pub(crate) struct EevdfOwnedState {
     pub(crate) deadline_remaining_ns: u64,
     pub(crate) deadline_absolute_ns: u64,
     pub(crate) deadline_replenish_at_ns: u64,
+    /// Runtime consumed past the exhausted CBS budget.  Charged against the
+    /// next replenished budget, mirroring `replenish_dl_entity()`
+    /// (`kernel/sched/deadline.c:831-834`).
+    pub(crate) deadline_overrun_ns: u64,
     pub(crate) deadline_throttled: bool,
 }
 
@@ -629,6 +634,7 @@ impl<T> EevdfTaskPayload<T> {
                 deadline_remaining_ns: 0,
                 deadline_absolute_ns: 0,
                 deadline_replenish_at_ns: 0,
+                deadline_overrun_ns: 0,
                 deadline_throttled: false,
             }),
         }
@@ -1823,6 +1829,7 @@ impl<T> EEVDFScheduler<T> {
                 .deadline_now_ns
                 .checked_add(config.period_ns)
                 .ok_or(SchedulerError::ArithmeticExhausted)?;
+            state.deadline_overrun_ns = 0;
             state.deadline_throttled = false;
         }
         Ok(())
@@ -1858,9 +1865,11 @@ impl<T> EEVDFScheduler<T> {
                 .expect("deadline sequence exhausted");
             unsafe {
                 let mut state = task.owned_state_mut();
-                state.deadline_remaining_ns = config.runtime_ns;
+                state.deadline_remaining_ns =
+                    config.runtime_ns.saturating_sub(state.deadline_overrun_ns);
                 state.deadline_absolute_ns = absolute;
                 state.deadline_replenish_at_ns = replenish;
+                state.deadline_overrun_ns = 0;
                 state.deadline_throttled = false;
             }
             Self::stage_key(&task, Self::deadline_key(absolute, sequence), 0);
@@ -2324,6 +2333,7 @@ impl<T> EEVDFScheduler<T> {
                     deadline_remaining_ns: old_state.deadline_remaining_ns,
                     deadline_absolute_ns: old_state.deadline_absolute_ns,
                     deadline_replenish_at_ns: old_state.deadline_replenish_at_ns,
+                    deadline_overrun_ns: old_state.deadline_overrun_ns,
                     deadline_throttled: old_state.deadline_throttled,
                     deadline_domain: self.deadline_domain.clone(),
                     origin: EevdfMigrationOrigin::Ready,
@@ -2398,6 +2408,7 @@ impl<T> EEVDFScheduler<T> {
                     deadline_remaining_ns: old_state.deadline_remaining_ns,
                     deadline_absolute_ns: old_state.deadline_absolute_ns,
                     deadline_replenish_at_ns: old_state.deadline_replenish_at_ns,
+                    deadline_overrun_ns: old_state.deadline_overrun_ns,
                     deadline_throttled: old_state.deadline_throttled,
                     deadline_domain: self.deadline_domain.clone(),
                     origin: EevdfMigrationOrigin::Running,
@@ -2613,6 +2624,7 @@ impl<T> EEVDFScheduler<T> {
             state.deadline_remaining_ns = metadata.deadline_remaining_ns;
             state.deadline_absolute_ns = metadata.deadline_absolute_ns;
             state.deadline_replenish_at_ns = metadata.deadline_replenish_at_ns;
+            state.deadline_overrun_ns = metadata.deadline_overrun_ns;
             state.deadline_throttled = metadata.deadline_throttled;
             state.migration = None;
             state.rt_sleeping = false;
@@ -2804,6 +2816,7 @@ impl<T> EEVDFScheduler<T> {
             state.deadline_remaining_ns = metadata.deadline_remaining_ns;
             state.deadline_absolute_ns = metadata.deadline_absolute_ns;
             state.deadline_replenish_at_ns = metadata.deadline_replenish_at_ns;
+            state.deadline_overrun_ns = metadata.deadline_overrun_ns;
             state.deadline_throttled = metadata.deadline_throttled;
             state.migration = None;
             state.rt_sleeping = false;
@@ -3092,11 +3105,13 @@ impl<T> EEVDFScheduler<T> {
                             .deadline_now_ns
                             .checked_add(config.period_ns)
                             .ok_or(SchedulerError::ArithmeticExhausted)?;
+                        next.deadline_overrun_ns = 0;
                         next.deadline_throttled = false;
                     } else {
                         next.deadline_remaining_ns = 0;
                         next.deadline_absolute_ns = 0;
                         next.deadline_replenish_at_ns = 0;
+                        next.deadline_overrun_ns = 0;
                         next.deadline_throttled = false;
                     }
                     if clear_fraction {
@@ -3295,11 +3310,13 @@ impl<T> EEVDFScheduler<T> {
                             .deadline_now_ns
                             .checked_add(config.period_ns)
                             .expect("deadline clock overflow");
+                        next.deadline_overrun_ns = 0;
                         next.deadline_throttled = false;
                     } else {
                         next.deadline_remaining_ns = 0;
                         next.deadline_absolute_ns = 0;
                         next.deadline_replenish_at_ns = 0;
+                        next.deadline_overrun_ns = 0;
                         next.deadline_throttled = false;
                     }
                     if clear_fraction {
@@ -3409,6 +3426,7 @@ impl<T> EEVDFScheduler<T> {
                         state.deadline_remaining_ns = config.runtime_ns;
                         state.deadline_absolute_ns = absolute;
                         state.deadline_replenish_at_ns = replenish;
+                        state.deadline_overrun_ns = 0;
                         state.deadline_throttled = false;
                     }
                     Self::stage_key(task, Self::deadline_key(absolute, sequence), 0);
@@ -3483,6 +3501,7 @@ impl<T> EEVDFScheduler<T> {
                     state.deadline_remaining_ns = config.runtime_ns;
                     state.deadline_absolute_ns = absolute;
                     state.deadline_replenish_at_ns = replenish;
+                    state.deadline_overrun_ns = 0;
                     state.deadline_throttled = false;
                 }
                 let _ = old_config;
@@ -3853,7 +3872,11 @@ impl<T> EEVDFScheduler<T> {
                                 return Err(SchedulerError::ArithmeticExhausted);
                             }
                         };
-                        Some((config.runtime_ns, absolute, replenish))
+                        Some((
+                            config.runtime_ns.saturating_sub(state.deadline_overrun_ns),
+                            absolute,
+                            replenish,
+                        ))
                     } else {
                         None
                     };
@@ -3912,6 +3935,7 @@ impl<T> EEVDFScheduler<T> {
                 task.owned_state_mut().deadline_remaining_ns = remaining;
                 task.owned_state_mut().deadline_absolute_ns = absolute;
                 task.owned_state_mut().deadline_replenish_at_ns = replenish;
+                task.owned_state_mut().deadline_overrun_ns = 0;
                 task.owned_state_mut().deadline_throttled = false;
             } else if throttle_deadline {
                 task.owned_state_mut().deadline_throttled = true;
@@ -4561,8 +4585,15 @@ impl<T> EEVDFScheduler<T> {
             // negative and `replenish_dl_entity()` charges the overrun to the
             // following period (`kernel/sched/deadline.c:831-834`). Keeping the
             // entity throttled and asking for the reschedule again is the
-            // equivalent boundary here; the overrun itself is not carried into
-            // the next budget.
+            // equivalent boundary here; the overrun is retained and deducted
+            // from the replenished budget.
+            unsafe {
+                let mut next = current.owned_state_mut();
+                next.deadline_overrun_ns = state
+                    .deadline_overrun_ns
+                    .checked_add(elapsed_ns)
+                    .ok_or(SchedulerError::ArithmeticExhausted)?;
+            }
             return Ok(true);
         }
         if state.deadline_remaining_ns == 0 {
@@ -4575,6 +4606,9 @@ impl<T> EEVDFScheduler<T> {
         unsafe {
             let mut next = current.owned_state_mut();
             next.deadline_remaining_ns = state.deadline_remaining_ns.saturating_sub(elapsed_ns);
+            if exhausted {
+                next.deadline_overrun_ns = elapsed_ns - state.deadline_remaining_ns;
+            }
             next.deadline_throttled = exhausted;
         }
         Ok(exhausted
@@ -4796,6 +4830,7 @@ impl<T> BaseScheduler for EEVDFScheduler<T> {
                     task.owned_state_mut().deadline_remaining_ns = 0;
                     task.owned_state_mut().deadline_absolute_ns = 0;
                     task.owned_state_mut().deadline_replenish_at_ns = 0;
+                    task.owned_state_mut().deadline_overrun_ns = 0;
                     task.owned_state_mut().deadline_throttled = false;
                 }
                 self.clock = next_clock;

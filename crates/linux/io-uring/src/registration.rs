@@ -458,6 +458,14 @@ impl RegistrationRequest {
         )
     }
 
+    /// Whether this opcode selects the blind per-task restriction entry
+    /// (`io_uring/register.c:201`).  Its `-EPERM`/`-EACCES` admission is
+    /// task state, not record shape, so the syscall adapter applies it before
+    /// this header is classified at all.
+    pub const fn blind_task_restriction(self) -> bool {
+        self.opcode & !IORING_REGISTER_USE_REGISTERED_RING == IORING_REGISTER_RESTRICTIONS
+    }
+
     /// Performs only syscall-envelope classification.  Linux rejects an
     /// opcode outside the v7.2.3 registration enum before it resolves `fd`,
     /// while every known opcode reaches ring lookup before its operation body
@@ -641,6 +649,12 @@ impl RegistrationRequest {
                     }
                 }
                 RegistrationDispatch::Blind => {
+                    // `io_register_restrictions_task()` runs its
+                    // `-EPERM`/`-EACCES` task admission before the record
+                    // shape checks below (`io_uring/register.c:206-209`);
+                    // that admission is task state and lives in the syscall
+                    // adapter, see [`RegistrationRequest::blind_task_restriction`].
+                    //
                     //     if (nr_args != 1)
                     //             return -EINVAL;
                     //     if (copy_from_user(&tres, arg, sizeof(tres)))
