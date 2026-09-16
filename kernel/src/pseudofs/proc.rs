@@ -4618,7 +4618,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                                 return Ok(None);
                             }
                             let value = write_proc_usize(data)?;
-                            set_msgmni_limit(value);
+                            set_msgmni_limit(value)?;
                             Ok(None)
                         }
                     }),
@@ -4655,7 +4655,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                             }
                             let (semmsl, semmns, semopm, semmni) =
                                 parse_sem_limits(data).ok_or(VfsError::InvalidInput)?;
-                            set_sem_limits(semmsl, semmns, semopm, semmni);
+                            set_sem_limits(semmsl, semmns, semopm, semmni)?;
                             Ok(None)
                         }
                     }),

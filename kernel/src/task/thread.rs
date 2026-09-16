@@ -1937,7 +1937,7 @@ impl Thread {
 
     pub(crate) fn replace_sem_undo(&self, replacement: Arc<super::process::SemUndoState>) {
         let old = self.replace_sem_undo_deferred(replacement);
-        Self::retire_sem_undo(old);
+        Self::retire_sem_undo(old, self.proc_data.proc.pid());
     }
 
     /// Exchanges the attachment while an external publication gate is held.
@@ -1949,12 +1949,15 @@ impl Thread {
         core::mem::replace(&mut *self.sem_undo.lock(), replacement)
     }
 
-    pub(crate) fn retire_sem_undo(old: Arc<super::process::SemUndoState>) {
+    /// `pid` is `task_tgid(current)` of the owner that is detaching, which
+    /// Linux publishes as the semaphore's new `sempid` for every adjustment it
+    /// applies (`ipc/sem.c:2430-2438`).
+    pub(crate) fn retire_sem_undo(old: Arc<super::process::SemUndoState>, pid: Pid) {
         // Leaving an IPC namespace must not silently lose a private SEM_UNDO
         // adjustment. Shared CLONE_SYSVSEM state remains live until its last
         // thread owner exits or changes namespace.
         if Arc::strong_count(&old) == 1 {
-            old.apply_on_final_exit();
+            old.apply_on_final_exit(pid);
         }
         drop(old);
     }
@@ -1974,7 +1977,7 @@ impl Thread {
             (old_proxy, old_sem_undo)
         };
         drop(old_proxy);
-        Self::retire_sem_undo(old);
+        Self::retire_sem_undo(old, self.proc_data.proc.pid());
     }
 
     /// Publishes a prepared pidfd-setns namespace aggregate and every
@@ -1998,14 +2001,14 @@ impl Thread {
         drop(old_proxy);
         drop(old_fs);
         if let Some(old_sem_undo) = old_sem_undo {
-            Self::retire_sem_undo(old_sem_undo);
+            Self::retire_sem_undo(old_sem_undo, self.proc_data.proc.pid());
         }
     }
 
     pub(crate) fn apply_sem_undo_on_exit(&self) {
         let state = self.sem_undo();
         if Arc::strong_count(&state) == 2 {
-            state.apply_on_final_exit();
+            state.apply_on_final_exit(self.proc_data.proc.pid());
         }
     }
 

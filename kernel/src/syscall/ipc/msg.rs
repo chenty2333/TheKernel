@@ -7,7 +7,7 @@ use alloc::{
 use core::{
     fmt::Write as _,
     mem::{align_of, offset_of, size_of},
-    sync::atomic::{AtomicI32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicI32, Ordering},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -138,6 +138,12 @@ fn write_msqid_ds<M: UserMemory + ?Sized>(
     ptr: *mut msqid_ds,
     value: msqid_ds,
 ) -> AxResult<()> {
+    // `msg_lspid`/`msg_lrpid` are stored as kernel-wide task-group identities
+    // and rendered with `pid_vnr()` for the *reader's* PID namespace
+    // (`ipc/msg.c:574-575`).
+    let mut value = value;
+    value.msg_lspid = super::render_task_pid(value.msg_lspid as Pid);
+    value.msg_lrpid = super::render_task_pid(value.msg_lrpid as Pid);
     // SAFETY: `initialized_msqid_ds` zeroes every byte, including the ABI
     // alignment hole, and the layout assertions cover the complete record.
     unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_msqid_ds(value)) }
@@ -549,14 +555,18 @@ impl PreparedMsgSet {
     }
 }
 
-static MSGMNI_LIMIT: AtomicUsize = AtomicUsize::new(MSGMNI);
-
+/// Linux `ns->msg_ctlmni`, the per-IPC-namespace message-queue ceiling.
+///
+/// The sysctl is registered per namespace (`ipc/ipc_sysctl.c:117-124`,
+/// `:262-279`), and `ipc_addid(..., ns->msg_ctlmni)` applies it to every
+/// allocation (`ipc/util.c:287-291`).  Zero is a legal value and refuses every
+/// new queue with ENOSPC; there is no "at least one" floor.
 pub(crate) fn msgmni_limit() -> usize {
-    MSGMNI_LIMIT.load(Ordering::Relaxed)
+    current().as_thread().ipc_ns().msgmni()
 }
 
-pub(crate) fn set_msgmni_limit(value: usize) {
-    MSGMNI_LIMIT.store(value.max(1), Ordering::Relaxed);
+pub(crate) fn set_msgmni_limit(value: usize) -> AxResult<()> {
+    current().as_thread().ipc_ns().set_msgmni(value)
 }
 
 pub(crate) fn msg_next_id() -> i32 {
@@ -603,8 +613,8 @@ pub(crate) fn sysvipc_msg_snapshot() -> String {
             ds.msg_perm.mode & 0o777,
             ds.msg_cbytes,
             ds.msg_qnum,
-            ds.msg_lspid,
-            ds.msg_lrpid,
+            super::render_task_pid(ds.msg_lspid as Pid),
+            super::render_task_pid(ds.msg_lrpid as Pid),
             ds.msg_perm.uid,
             ds.msg_perm.gid,
             ds.msg_perm.cuid,
@@ -757,11 +767,14 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
             return Err(AxError::from(LinuxError::EACCES)); // EACCES
         }
 
-        // Check if marked for removal
-        if msg_queue.mark_removed {
-            return Err(AxError::from(LinuxError::EIDRM)); // EIDRM
-        }
-
+        // Linux `ipc/util.c:ipcget_public()` never consults
+        // `ipc_valid_object()`: a keyed lookup either finds the object and
+        // answers with its identifier (or EACCES/EEXIST) or does not find it
+        // at all.  A queue already marked for removal is therefore *not*
+        // EIDRM here - the only EIDRM exits for `msgget()` would be the
+        // EACCES/EEXIST/ENOENT above (`ipc/util.c:409-431`), and the removal
+        // that clears the key is serialized with this lookup by the table
+        // lock.
         return Ok(msqid as isize);
     }
 
@@ -925,6 +938,17 @@ fn prepare_received_message(
         .len();
     if data_len > msgsz && !flags.contains(MsgRcvFlags::MSG_NOERROR) {
         return Err(AxError::from(LinuxError::E2BIG));
+    }
+    if flags.contains(MsgRcvFlags::MSG_COPY) {
+        // `do_msgrcv()` builds the destination with
+        // `prepare_copy(buf, min_t(size_t, bufsz, ns->msg_ctlmax))`, which sets
+        // `copy->m_ts` to that bounded length, and `copy_msg()` then refuses a
+        // source larger than the destination with EINVAL
+        // (`ipc/msgutil.c:132-133`).  `MSG_NOERROR` only suppresses the E2BIG
+        // above; it does not license a truncated copy.
+        if data_len > msgsz.min(MSGMAX) {
+            return Err(AxError::from(LinuxError::EINVAL));
+        }
     }
 
     // Snapshot the selected message while the queue is locked, then perform
@@ -1191,14 +1215,16 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
 
     // Lock the internal structure of the queue
     let mut msg_queue = msg_queue.lock();
-    // Check if the queue is marked as removed
-    if msg_queue.mark_removed {
-        return Err(AxError::from(LinuxError::EIDRM)); // EIDRM - Queue has been removed
-    }
     if cmd == IPC_STAT {
-        // Check read permissions
+        // Linux `msgctl_stat()` tests `ipcperms(ns, &msq->q_perm, S_IRUGO)`
+        // *before* it takes the object lock and runs `ipc_valid_object()`
+        // (`ipc/msg.c:544-560`), so a queue already marked for removal is
+        // still EACCES for a caller that may not read it.
         if !context.allows(&msg_queue.msqid_ds.msg_perm, IpcAccess::Read) {
             return Err(AxError::from(LinuxError::EACCES)); // EACCES
+        }
+        if msg_queue.mark_removed {
+            return Err(AxError::from(LinuxError::EIDRM)); // EIDRM
         }
 
         // Copy queue status to user space
@@ -1210,6 +1236,9 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
         return Ok(0);
     }
 
+    if msg_queue.mark_removed {
+        return Err(AxError::from(LinuxError::EIDRM)); // EIDRM - Queue has been removed
+    }
     if !context.may_control(&msg_queue.msqid_ds.msg_perm) {
         return Err(AxError::from(LinuxError::EPERM)); // EPERM
     }

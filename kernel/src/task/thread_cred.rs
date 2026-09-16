@@ -402,7 +402,7 @@ impl Thread {
         drop(old_proxy);
         drop(old_fs);
         if let Some(old_sem_undo) = old_sem_undo {
-            Self::retire_sem_undo(old_sem_undo);
+            Self::retire_sem_undo(old_sem_undo, self.proc_data.proc.pid());
         }
         Ok(())
     }

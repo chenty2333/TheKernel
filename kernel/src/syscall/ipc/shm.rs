@@ -44,6 +44,8 @@ use crate::{
 const IPC_MODE_MASK: __kernel_mode_t = 0o777;
 const MAX_SHM_ATTACHMENTS: usize = 65_536;
 const SHMLBA: usize = PAGE_SIZE_4K;
+/// `PAGE_SHIFT` for the 4 KiB base page; `memory_addr` exposes the size only.
+const PAGE_SHIFT_4K: usize = 12;
 
 /// Namespace-global logical identity for one SysV attachment.  A mapping may
 /// be split or relocated, so its base address is never its lifetime identity.
@@ -2629,7 +2631,25 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     if size < SHMMIN || size > shmmax_limit() {
         return Err(AxError::InvalidInput);
     }
-    let page_num = memory_addr::align_up_4k(size) / PAGE_SIZE_4K;
+    // Linux `newseg()` (`ipc/shm.c:712-721`):
+    //
+    // ```c
+    // 	size_t numpages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    // 	if (size < SHMMIN || size > ns->shm_ctlmax)
+    // 		return -EINVAL;
+    // 	if (numpages << PAGE_SHIFT < size)
+    // 		return -ENOSPC;
+    // ```
+    //
+    // The addition is performed in `size_t`, so a size within `PAGE_SIZE - 1`
+    // of `ULONG_MAX` wraps to a small page count; the shift-back comparison is
+    // what reports that as ENOSPC instead of letting the wrapped count reach
+    // the mapping arithmetic.  A large `shmmax` is exactly what makes the
+    // wrapped region reachable, so the guard cannot be skipped.
+    let page_num = size.wrapping_add(PAGE_SIZE_4K - 1) >> PAGE_SHIFT_4K;
+    if (page_num << PAGE_SHIFT_4K) < size {
+        return Err(AxError::from(LinuxError::ENOSPC));
+    }
     if page_num == 0 {
         return Err(AxError::InvalidInput);
     }
@@ -2749,6 +2769,18 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let replace_existing = shm_flg.contains(ShmAtFlags::SHM_REMAP);
 
     let start_addr = if let Some(candidate) = explicit_addr {
+        // Linux `mmap_region()` reports `-ENOMEM` when the requested range ends
+        // past `TASK_SIZE` (`mm/mmap.c:858-859`), and `do_shmat()` reaches that
+        // check through `do_mmap()`.  Only the alignment rule ahead of it is
+        // EINVAL (`ipc/shm.c:1541-1560`), so an aligned address above the user
+        // address space is ENOMEM, not EINVAL.
+        if candidate
+            .as_usize()
+            .checked_add(length)
+            .is_none_or(|end| end > aspace.end().as_usize())
+        {
+            return Err(AxError::NoMemory);
+        }
         if !aspace.contains_range(candidate, length) {
             return Err(AxError::InvalidInput);
         }
