@@ -102,12 +102,6 @@ impl ResolvedPidFdSignalTarget {
         }
     }
 
-    fn synthesized_code(&self) -> i32 {
-        match self {
-            Self::Process { .. } | Self::Zombie { .. } => linux_raw_sys::general::SI_USER as i32,
-            Self::ExitedLeader { .. } | Self::Thread { .. } | Self::SelfThread { .. } => SI_TKILL,
-        }
-    }
 }
 
 fn exact_identity_matches<T>(expected: &Arc<T>, published: Option<&Arc<T>>) -> bool {
@@ -597,10 +591,13 @@ fn process_group_pid_of_pidfd_target(
 /// 		return kill_pgrp_info(sig, &kinfo, pid);
 /// ```
 ///
-/// `kill_pgrp_info()` reports `ESRCH` for a group with no members and only
-/// then enters `check_kill_permission()` per member, which validates the
-/// signal number before the credential rule; the signal record is therefore
-/// built after the group has been resolved.
+/// `do_pidfd_send_signal()` runs `copy_siginfo_from_user()` and
+/// `prepare_kill_siginfo()` (EFAULT/EINVAL/EPERM) before it reaches
+/// `kill_pgrp_info()`, which is the first point that walks the group and can
+/// report `ESRCH` for a group with no members; the signal record is therefore
+/// complete before the group is resolved.  Only the descriptor's own PID
+/// number, which `pidfd_get_pid()` fixes before the siginfo copy, is resolved
+/// ahead of it.
 fn send_pidfd_process_group_signal<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     pidfd: i32,
@@ -609,7 +606,6 @@ fn send_pidfd_process_group_signal<M: UserMemory + ?Sized>(
     target: tk_linux_fd::SignalTarget,
 ) -> AxResult<isize> {
     let pgid = process_group_pid_of_pidfd_target(target, pidfd)?;
-    let targets = process_group_targets(pgid)?;
     let request = if sig.is_null() {
         // `prepare_kill_siginfo(sig, &kinfo, PIDTYPE_PGID)` synthesizes
         // `SI_USER` for every scope except `PIDTYPE_PID`, and signal 0 stays a
@@ -629,6 +625,7 @@ fn send_pidfd_process_group_signal<M: UserMemory + ?Sized>(
         SignalSecuritySource::PidFd { code: request.code },
         SignalDeliveryScope::ThreadGroup,
     )?;
+    let targets = process_group_targets(pgid)?;
     send_user_signal_to_process_group_targets(targets, request.signal, operation)?;
     Ok(0)
 }
@@ -723,13 +720,21 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
         }
     };
 
+    // prepare_kill_siginfo() synthesizes SI_TKILL only for PIDTYPE_PID and
+    // SI_USER otherwise, keyed on the final type after the flag override, not
+    // on the descriptor's implied kind.
+    let synthesized_code = match scope {
+        tk_linux_fd::SignalScope::Thread => SI_TKILL,
+        _ => linux_raw_sys::general::SI_USER as i32,
+    };
     let request = if sig.is_null() {
         if signo == 0 {
-            let code = target.synthesized_code();
-            PidFdSignalRequest { signal: None, code }
+            PidFdSignalRequest {
+                signal: None,
+                code: synthesized_code,
+            }
         } else {
             let signo = parse_signo(signo)?;
-            let code = target.synthesized_code();
             let curr = current();
             let thread = curr.as_thread();
             let credential = thread.current_cred();
@@ -739,11 +744,11 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
             PidFdSignalRequest {
                 signal: Some(SignalInfo::new_user(
                     signo,
-                    code,
+                    synthesized_code,
                     thread.proc_data.proc.pid(),
                     sender_uid,
                 )),
-                code,
+                code: synthesized_code,
             }
         }
     } else {
@@ -755,17 +760,18 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
             scope.is_process_group(),
         )?
     };
+    let delivery_scope = match scope {
+        tk_linux_fd::SignalScope::Thread => SignalDeliveryScope::Thread,
+        tk_linux_fd::SignalScope::ThreadGroup => SignalDeliveryScope::ThreadGroup,
+        // The process-group scope is resolved as its own target set by
+        // `send_pidfd_process_group_signal()` before this point; every
+        // member delivery it performs is a thread-group publication.
+        tk_linux_fd::SignalScope::ProcessGroup => return Err(LinuxError::EOPNOTSUPP.into()),
+    };
     let operation = signal_operation(
         request.signal.as_ref().and_then(SignalInfo::try_signo),
         SignalSecuritySource::PidFd { code: request.code },
-        match scope {
-            tk_linux_fd::SignalScope::Thread => SignalDeliveryScope::Thread,
-            tk_linux_fd::SignalScope::ThreadGroup => SignalDeliveryScope::ThreadGroup,
-            // The process-group scope is resolved as its own target set by
-            // `send_pidfd_process_group_signal()` before this point; every
-            // member delivery it performs is a thread-group publication.
-            tk_linux_fd::SignalScope::ProcessGroup => return Err(LinuxError::EOPNOTSUPP.into()),
-        },
+        delivery_scope,
     )?;
     let sig = request.signal;
     let queue_required = queued_signal_required(&sig);
@@ -810,7 +816,18 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
                     process_retries += 1;
                     continue;
                 }
-                let result = if queue_required {
+                let result = if delivery_scope == SignalDeliveryScope::Thread {
+                    // `PIDFD_SIGNAL_THREAD` overrides the scope to
+                    // PIDTYPE_PID, which names only the group leader: publish
+                    // to the leader's private queue instead of the shared one.
+                    generate_signal_for_exited_leader(
+                        &process,
+                        &leader_signal,
+                        &credential,
+                        sig.clone(),
+                        queue_required,
+                    )
+                } else if queue_required {
                     send_queued_signal_to_process_data_with_credential(
                         &process,
                         &credential,
@@ -879,13 +896,33 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
                         }
                         return Err(AxError::NoSuchProcess);
                     }
-                    let result = generate_signal_for_exited_leader(
-                        &runtime,
-                        &leader_signal,
-                        &credential,
-                        sig.clone(),
-                        queue_required,
-                    );
+                    let result = if delivery_scope == SignalDeliveryScope::ThreadGroup {
+                        // `PIDFD_SIGNAL_THREAD_GROUP` overrides the scope to
+                        // PIDTYPE_TGID, which addresses the whole thread group
+                        // of the descriptor's thread.
+                        if queue_required {
+                            send_queued_signal_to_process_data_with_credential(
+                                &runtime,
+                                &credential,
+                                sig.clone(),
+                            )
+                            .map(|_| ())
+                        } else {
+                            send_signal_to_process_data_with_credential(
+                                &runtime,
+                                &credential,
+                                sig.clone(),
+                            )
+                        }
+                    } else {
+                        generate_signal_for_exited_leader(
+                            &runtime,
+                            &leader_signal,
+                            &credential,
+                            sig.clone(),
+                            queue_required,
+                        )
+                    };
                     drop(lifecycle);
                     result?;
                 }
@@ -905,13 +942,34 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
                     SignalTargetKind::PidFdThread,
                     operation,
                 )?;
-                send_signal_to_authorized_thread(
-                    &task,
-                    &credential,
-                    visible_tid,
-                    sig.clone(),
-                    queue_required,
-                )?;
+                if delivery_scope == SignalDeliveryScope::ThreadGroup {
+                    // `PIDFD_SELF_THREAD` + `PIDFD_SIGNAL_THREAD_GROUP` is
+                    // PIDTYPE_TGID on the calling thread: the whole calling
+                    // thread group receives the signal.
+                    let result = if queue_required {
+                        send_queued_signal_to_process_data_with_credential(
+                            &thread.proc_data,
+                            &credential,
+                            sig.clone(),
+                        )
+                        .map(|_| ())
+                    } else {
+                        send_signal_to_process_data_with_credential(
+                            &thread.proc_data,
+                            &credential,
+                            sig.clone(),
+                        )
+                    };
+                    result?;
+                } else {
+                    send_signal_to_authorized_thread(
+                        &task,
+                        &credential,
+                        visible_tid,
+                        sig.clone(),
+                        queue_required,
+                    )?;
+                }
                 break;
             }
             ResolvedPidFdSignalTarget::Thread {
@@ -930,13 +988,33 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
                     operation,
                 )?;
                 let stable_identity_is_leader = visible_tid == thread.proc_data.proc.pid();
-                let result = send_signal_to_authorized_thread(
-                    &task,
-                    &credential,
-                    visible_tid,
-                    sig.clone(),
-                    queue_required,
-                );
+                let result = if delivery_scope == SignalDeliveryScope::ThreadGroup {
+                    // `PIDFD_SIGNAL_THREAD_GROUP` overrides the scope to
+                    // PIDTYPE_TGID, which addresses the whole thread group of
+                    // the descriptor's thread.
+                    if queue_required {
+                        send_queued_signal_to_process_data_with_credential(
+                            &thread.proc_data,
+                            &credential,
+                            sig.clone(),
+                        )
+                        .map(|_| ())
+                    } else {
+                        send_signal_to_process_data_with_credential(
+                            &thread.proc_data,
+                            &credential,
+                            sig.clone(),
+                        )
+                    }
+                } else {
+                    send_signal_to_authorized_thread(
+                        &task,
+                        &credential,
+                        visible_tid,
+                        sig.clone(),
+                        queue_required,
+                    )
+                };
                 if should_retry_pidfd_thread_delivery(
                     &result,
                     stable_identity_is_leader,

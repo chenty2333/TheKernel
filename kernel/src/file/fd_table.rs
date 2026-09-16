@@ -735,6 +735,12 @@ impl Drop for FdTable {
         let entries = self.entries.get_mut();
         for fd in 0..AX_FILE_LIMIT {
             if let Ok(entry) = entries.close(FdNumber::new(fd as u32)) {
+                // `get_mut()` above proves the table lock is unheld (Drop owns
+                // the only reference), so `flush_on_close()` may take its own
+                // subsystem locks — the mqueue hook locks the queue — without
+                // deadlock, exactly like `finish_close()` does for a published
+                // table.
+                entry.description().flush_on_close();
                 entry.description().descriptor_closed();
                 drop(entry);
             }
