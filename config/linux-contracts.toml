@@ -960,8 +960,8 @@ contract = "linux-futex"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/futex-smoke.c:main", "tests/guest/portable/futex-abi-differential.c:main"]
-validation_gaps = ["the restart classification, the visible owner tid and the requeued-waiter EWOULDBLOCK are covered by futex-abi-opcode, futex-abi-pi-word, futex-abi-pi-signal and futex-abi-requeue-pi-signal"]
-limitations = ["priority inheritance covers the directly blocked owner only: there is no rt_mutex-style waiter chain walk, no SCHED_DEADLINE inheritance and no exit_pi_state_list equivalent, and a contended CMP_REQUEUE_PI onto an owned target returns EWOULDBLOCK where Linux queues the promoted waiter"]
+validation_gaps = ["Existing source/helper coverage does not establish the full futex raw syscall contract in current paired execution; the contended-target requeue arms are covered by futex-abi-requeue-pi-owned and futex-abi-requeue-pi-held"]
+limitations = ["priority inheritance covers the directly blocked owner only: there is no rt_mutex-style waiter chain walk, no SCHED_DEADLINE inheritance and no exit_pi_state_list equivalent"]
 
 [[contract]]
 id = "linux-futex_waitv"
@@ -1051,9 +1051,9 @@ status = "partial"
 contract = "linux-futex_requeue"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex_requeue"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words"]
-validation_gaps = ["the rejection is covered by four host tests that fail on the previous tree; no registered differential case reaches it, so the guest evidence is absent"]
-limitations = ["priority inheritance is only refused where the wake and requeue scans meet a published PI waiter; pi_requeue itself still has no non-PI-waiter rejection because the PI-state handover primitive is absent, and FUTEX_WAKE's pi_top_locked whole-queue rejection remains stricter than Linux"]
+tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words", "tests/guest/portable/futex-abi-differential.c:main"]
+validation_gaps = ["the plain requeue and wake_op rejections are covered by requeue_rejects_a_pi_waiter_before_any_effect, requeue_keeps_the_wakeups_that_precede_a_pi_rejection, wake_op_rejects_a_pi_waiter_on_either_queue and requeue_without_a_comparison_rejects_a_pi_waiter; the mirror rejection of a plain source waiter by FUTEX_CMP_REQUEUE_PI has no host test, its evidence is the futex-abi-requeue-pi-plain differential case"]
+limitations = ["FUTEX_WAKE still refuses the whole queue as soon as a published PI waiter is present, where Linux stops with -EINVAL only once its scan reaches that waiter, and a FUTEX_WAIT_REQUEUE_PI waiter does not record the target it named, so a requeue onto a different target moves it where Linux reports -EINVAL (requeue.c:310-312, 614-617)"]
 
 [[contract]]
 id = "linux-membarrier"

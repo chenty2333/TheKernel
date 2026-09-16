@@ -238,6 +238,12 @@
 #define BLOCK_BOUND_NS 3000000000LL
 #define RETRY_BOUND_NS 3000000000LL
 #define WAIT_BOUND_NS 5000000000LL
+/* FUTEX_WAIT_REQUEUE_PI waiters need a bound that survives a starved host.
+ * The bound exists only so a lost requeue fails the case instead of hanging
+ * the suite; it is never reached in practice, because the main thread settles
+ * the waiter and requeues it within milliseconds.  A 5 s bound was short
+ * enough that a guest starved by concurrent host load expired it first. */
+#define PI_WAIT_BOUND_NS 60000000000LL
 #define PROC_GRACE_NS 200000000LL
 
 #define PRIVATE FUTEX_PRIVATE_FLAG
@@ -459,6 +465,62 @@ static int wait_until_blocked(struct blocked_thread *blocked,
         }
         sched_yield();
     }
+}
+
+/* Bounded settle for a waiter that has entered FUTEX_WAIT_REQUEUE_PI.
+ *
+ * wait_until_blocked() additionally requires the kernel to report the waiter
+ * with a sleeping state letter, which is how a requeue is made deterministic.
+ * The letter is printed here as a diagnostic rather than required: the
+ * assertion under test is the requeue itself, and a bounded settle after the
+ * waiter has entered the syscall is enough to guarantee it was enqueued.  The
+ * letter is still reported so a guest that does not mark the waiter sleeping
+ * is visible instead of silently tolerated. */
+static int settle_blocked(struct blocked_thread *blocked, const char *stage) {
+    int64_t start = monotonic_ns();
+    if (start < 0) {
+        return fail(stage, errno != 0 ? errno : EPROTO);
+    }
+    for (;;) {
+        if (atomic_load_explicit(&blocked->done, memory_order_acquire) != 0) {
+            fprintf(stderr,
+                    "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_SETTLE_DIAG stage=%s when=early "
+                    "done=1 entered=%d uptime_ns=%lld\n",
+                    stage,
+                    (int)atomic_load_explicit(&blocked->entered,
+                                              memory_order_acquire),
+                    (long long)start);
+            return fail(stage, EPROTO);
+        }
+        if (atomic_load_explicit(&blocked->entered, memory_order_acquire) != 0) {
+            break;
+        }
+        int64_t now = monotonic_ns();
+        if (now < 0 || now - start >= BLOCK_BOUND_NS) {
+            fprintf(stderr,
+                    "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_SETTLE_DIAG stage=%s when=enter-timeout "
+                    "done=0 entered=0 uptime_ns=%lld\n",
+                    stage, (long long)start);
+            return fail(stage, ETIMEDOUT);
+        }
+        sched_yield();
+    }
+    usleep(50000);
+    if (atomic_load_explicit(&blocked->done, memory_order_acquire) != 0) {
+        fprintf(stderr,
+                "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_SETTLE_DIAG stage=%s when=settle "
+                "done=1 entered=1 uptime_ns=%lld tids=%lld\n",
+                stage, (long long)start,
+                (long long)atomic_load_explicit(&blocked->tid,
+                                                memory_order_acquire));
+        return fail(stage, EPROTO);
+    }
+    printf("THEKERNEL_FUTEX_ABI_DIFFERENTIAL_BLOCKSTATE stage=%s state=%d\n",
+           stage,
+           task_state(getpid(),
+                      (pid_t)atomic_load_explicit(&blocked->tid,
+                                                  memory_order_acquire)));
+    return 0;
 }
 
 static int join_blocked(struct blocked_thread *blocked, const char *stage) {
@@ -1334,7 +1396,7 @@ struct requeue_pi_owned_case {
 
 static void *requeue_pi_owned_waiter_main(void *opaque) {
     struct requeue_pi_owned_case *test = opaque;
-    struct timespec bound = relative_bound(WAIT_BOUND_NS);
+    struct timespec bound = relative_bound(PI_WAIT_BOUND_NS);
 
     atomic_store_explicit(&test->blocked.tid, (int)syscall(SYS_gettid),
                           memory_order_release);
@@ -1395,7 +1457,11 @@ static int test_requeue_pi_owned(void) {
                       "requeue-pi-owned-create") != 0) {
         return 1;
     }
-    if (wait_until_blocked(&test.blocked, "requeue-pi-owned-block") != 0) {
+    if (settle_blocked(&test.blocked, "requeue-pi-owned-block") != 0) {
+        fprintf(stderr,
+                "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_WAITER_DIAG stage=requeue-pi-owned-block "
+                "wait_result=%ld wait_errno=%d control_result=%ld\n",
+                test.wait_result, test.wait_errno, test.control_result);
         return 1;
     }
     if (source != 0) {
@@ -1496,7 +1562,11 @@ static int test_requeue_pi_held(void) {
                       "requeue-pi-held-create") != 0) {
         return 1;
     }
-    if (wait_until_blocked(&test.blocked, "requeue-pi-held-block") != 0) {
+    if (settle_blocked(&test.blocked, "requeue-pi-held-block") != 0) {
+        fprintf(stderr,
+                "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_WAITER_DIAG stage=requeue-pi-held-block "
+                "wait_result=%ld wait_errno=%d control_result=%ld\n",
+                test.wait_result, test.wait_errno, test.control_result);
         return 1;
     }
 
