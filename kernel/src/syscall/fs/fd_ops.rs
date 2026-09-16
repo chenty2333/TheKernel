@@ -143,19 +143,32 @@ const fn open_has_data_write(flags: u32) -> bool {
     matches!(flags & O_ACCMODE, O_WRONLY | O_RDWR)
 }
 
+/// The open flags a descriptor keeps in `f_flags`.
+///
+/// fs/open.c:1153-1168 masks `open_how::flags` with `VALID_OPEN_FLAGS`
+/// (include/linux/fcntl.h:10-14) and strips `O_CLOEXEC` from `op->open_flag`,
+/// and fs/open.c:963 then strips `O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC |
+/// __O_REGULAR` in `do_dentry_open()`.  Every other requested bit stays
+/// visible in `F_GETFL`, including `O_DIRECTORY`, `O_NOFOLLOW`, `__O_TMPFILE`
+/// and `O_EMPTYPATH`.
 fn open_status_flags(flags: u32) -> u32 {
-    let mut status = flags & O_ACCMODE;
-    status |= flags
-        & (O_APPEND
-            | O_DIRECT
-            | O_DSYNC
-            | O_SYNC
-            | O_NONBLOCK
-            | FASYNC
-            | O_LARGEFILE
-            | O_NOATIME
-            | O_PATH);
-    status
+    const STRIPPED: u32 = O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC;
+    const VISIBLE: u32 = O_ACCMODE
+        | O_APPEND
+        | O_NONBLOCK
+        | O_NDELAY
+        | __O_SYNC
+        | O_DSYNC
+        | FASYNC
+        | O_DIRECT
+        | O_LARGEFILE
+        | O_DIRECTORY
+        | O_NOFOLLOW
+        | O_NOATIME
+        | O_PATH
+        | __O_TMPFILE
+        | O_EMPTYPATH;
+    flags & VISIBLE & !STRIPPED
 }
 
 fn file_open_operation(
@@ -394,6 +407,9 @@ fn enforce_special_open_rules(
 }
 
 const OPENAT2_HOW_SIZE: usize = size_of::<open_how>();
+/// include/uapi/asm-generic/fcntl.h:95-96.  linux-raw-sys does not export it,
+/// and include/linux/fcntl.h:14 lists it in VALID_OPEN_FLAGS.
+const O_EMPTYPATH: u32 = 1 << 26;
 const OPENAT2_ALLOWED_FLAGS: u64 = (O_ACCMODE
     | O_APPEND
     | FASYNC
@@ -411,8 +427,10 @@ const OPENAT2_ALLOWED_FLAGS: u64 = (O_ACCMODE
     | O_PATH
     | O_SYNC
     | O_TMPFILE
-    | O_TRUNC) as u64;
-const OPENAT2_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC;
+    | O_TRUNC
+    | O_EMPTYPATH) as u64;
+// fs/open.c:1134 O_PATH_FLAGS carries O_EMPTYPATH as well.
+const OPENAT2_PATH_FLAGS: u32 = O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC | O_EMPTYPATH;
 const OPENAT2_ALLOWED_RESOLVE: u64 = (RESOLVE_NO_XDEV
     | RESOLVE_NO_MAGICLINKS
     | RESOLVE_NO_SYMLINKS
@@ -1851,6 +1869,13 @@ pub fn sys_openat2(
     size: usize,
 ) -> AxResult<isize> {
     let (path, how, flags) = copy_openat2_input(&capability, path, how_ptr, size)?;
+    // fs/open.c:1413-1415: O_LARGEFILE is only added for a non-O_PATH
+    // openat2 and only by the syscall entry, not by do_sys_openat2 itself.
+    let flags = if how.flags & O_PATH as u64 == 0 {
+        flags | O_LARGEFILE as i32
+    } else {
+        flags
+    };
     openat2_copied_current(dirfd, path, how, flags)
 }
 
@@ -1870,15 +1895,40 @@ pub(crate) fn copy_openat2_input(
         return Err(AxError::from(LinuxError::E2BIG));
     }
     let mut raw = [0u8; 4096];
-    let raw_destination =
-        unsafe { slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<MaybeUninit<u8>>(), size) };
-    capability
-        .read_bytes(how_ptr as usize, raw_destination)
-        .map_err(map_usercopy_error)?;
-    let raw = &raw[..size];
-    if size > OPENAT2_HOW_SIZE && raw[OPENAT2_HOW_SIZE..].iter().any(|&byte| byte != 0) {
-        return Err(AxError::from(LinuxError::E2BIG));
+    let how_addr = how_ptr as usize;
+    // include/linux/uaccess.h:392-415 copy_struct_from_user() validates the
+    // zeroed tail through check_zeroed_user() BEFORE copying the
+    // interoperable head, so a non-zero tail reports E2BIG even when the
+    // head is unreadable and a faulting tail reports EFAULT.
+    if size > OPENAT2_HOW_SIZE {
+        let tail_addr = how_addr
+            .checked_add(OPENAT2_HOW_SIZE)
+            .ok_or(LinuxError::EFAULT)?;
+        let tail_destination = unsafe {
+            slice::from_raw_parts_mut(
+                raw.as_mut_ptr()
+                    .add(OPENAT2_HOW_SIZE)
+                    .cast::<MaybeUninit<u8>>(),
+                size - OPENAT2_HOW_SIZE,
+            )
+        };
+        capability
+            .read_bytes(tail_addr, tail_destination)
+            .map_err(map_usercopy_error)?;
+        if raw[OPENAT2_HOW_SIZE..size].iter().any(|&byte| byte != 0) {
+            return Err(AxError::from(LinuxError::E2BIG));
+        }
     }
+    let head_destination = unsafe {
+        slice::from_raw_parts_mut(
+            raw.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+            OPENAT2_HOW_SIZE,
+        )
+    };
+    capability
+        .read_bytes(how_addr, head_destination)
+        .map_err(map_usercopy_error)?;
+    let raw = &raw[..OPENAT2_HOW_SIZE];
     let how = unsafe { ptr::read_unaligned(raw.as_ptr().cast::<open_how>()) };
     let flags = validate_openat2_how(&how)? as i32;
     let resolve_cached = how.resolve & RESOLVE_CACHED as u64 != 0;
@@ -1917,7 +1967,9 @@ pub(crate) fn openat2_copied_current(
 /// openat2 ordering.  io_uring runs this after copying the ABI input but
 /// before retaining a dirfd, so its admission errors match the syscall path.
 pub(crate) fn validate_openat2_copied_path(path: &FsPath, how: &open_how) -> AxResult {
-    if path.as_bytes().is_empty() {
+    // fs/namei.c:202-206: a zero-length name is only admissible when
+    // O_EMPTYPATH raised LOOKUP_EMPTY (fs/open.c:1283-1284).
+    if path.as_bytes().is_empty() && how.flags & O_EMPTYPATH as u64 == 0 {
         return Err(AxError::NotFound);
     }
     if how.resolve & RESOLVE_BENEATH as u64 != 0 && path.is_absolute() {
@@ -2000,6 +2052,18 @@ pub(crate) fn openat2_copied_with_snapshot(
             context.credentials(),
             fd_snapshot,
             &mut policy,
+        )
+    } else if how.flags & O_EMPTYPATH as u64 != 0 && path.as_bytes().is_empty() {
+        // LOOKUP_EMPTY performs no component walk: the descriptor named by
+        // dirfd is itself the target (fs/namei.c:2744,2771-2780).
+        open_resolved_location_with_policy(
+            &path,
+            fs.current_dir().clone(),
+            false,
+            flags,
+            how.mode as __kernel_mode_t,
+            context.credentials(),
+            fd_snapshot,
         )
     } else {
         open_in_fs_with_policy(
