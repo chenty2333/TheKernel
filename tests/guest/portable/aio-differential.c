@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <linux/aio_abi.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -83,8 +84,26 @@ static long do_io_destroy(aio_context_t ctx) {
     return syscall(SYS_io_destroy, ctx);
 }
 
+/* `struct __aio_sigset` verbatim (fs/aio.c:2324-2327). */
+struct aio_sigset_abi {
+    const void *sigmask;
+    size_t sigsetsize;
+};
+
+static long do_io_pgetevents(aio_context_t ctx, long min, long max,
+                             struct io_event *events, struct timespec *timeout,
+                             const struct aio_sigset_abi *usig) {
+    return syscall(SYS_io_pgetevents, ctx, min, max, events, timeout, usig);
+}
+
 /* A context id that no `io_setup` in this process can have produced. */
 #define MISSING_CONTEXT 0x1234UL
+/* A pointer no kernel may dereference successfully. */
+#define BAD_PTR ((void *)(uintptr_t)1)
+/* x86_64 kernel `sigset_t` selects a signal with bit (signo-1). */
+#define SIGBIT(signo) (1ULL << ((signo) - 1))
+
+static void sigusr2_noop(int signo) { (void)signo; }
 
 static struct iocb *make_iocb(struct iocb *iocb, uint16_t opcode, int fd) {
     memset(iocb, 0, sizeof(*iocb));
@@ -257,6 +276,186 @@ static int test_io_destroy_validation(aio_context_t live) {
     return 0;
 }
 
+/*
+ * io_pgetevents(2) is the AIO wait that carries a sixth
+ * `const struct __aio_sigset __user *` argument.  `SYSCALL_DEFINE6`
+ * (fs/aio.c:2329-2360) orders its work as:
+ *
+ *   1. `get_timespec64(&ts, timeout)`                -> -EFAULT
+ *   2. `copy_from_user(&ksig, usig, sizeof(ksig))`   -> -EFAULT
+ *   3. `set_user_sigmask(ksig.sigmask, ksig.sigsetsize)`
+ *      (kernel/signal.c:3282-3298): a NULL mask returns 0 *before* the size
+ *      check, a wrong size is -EINVAL, an unreadable mask is -EFAULT; the
+ *      caller's blocked set is saved and the supplied set installed.
+ *   4. `do_io_getevents()`: `lookup_ioctx()` then the
+ *      `min_nr <= nr && min_nr >= 0` range check (fs/aio.c:2268-2281).
+ *   5. `restore_saved_sigmask_unless(interrupted)` puts the caller's set back
+ *      (fs/aio.c:2353-2355).
+ */
+static int test_io_pgetevents_validation(int pipe_fds[2]) {
+    aio_context_t ctx = 0;
+    struct aio_sigset_abi usig;
+    struct timespec zero = {0, 0};
+    struct iocb iocb;
+    struct iocb *list[1];
+    struct io_event event;
+    struct timespec timeout = {5, 0};
+    /* The caller's blocked set, and the different set that
+     * `set_user_sigmask()` installs for the duration of the call. */
+    uint64_t temporary = SIGBIT(SIGUSR2);
+    uint64_t installed = SIGBIT(SIGUSR1) | SIGBIT(SIGUSR2);
+    uint64_t empty_mask = 0;
+    uint64_t after = 0;
+    long result;
+
+    if (do_io_setup(4, &ctx) != 0)
+        return fail("io-pgetevents-setup");
+
+    /* Step 1 precedes step 3: an unreadable timeout is -EFAULT even though
+     * the sigset descriptor carries a size `set_user_sigmask()` rejects. */
+    usig.sigmask = &usig;
+    usig.sigsetsize = 4;
+    errno = 0;
+    if (expect_errno("io-pgetevents-timeout-first",
+                     do_io_pgetevents(MISSING_CONTEXT, 0, 0, NULL, BAD_PTR,
+                                      &usig),
+                     EFAULT))
+        return 1;
+    errno = 0;
+    if (expect_errno("io-pgetevents-sigset-size",
+                     do_io_pgetevents(MISSING_CONTEXT, 0, 0, NULL, &zero,
+                                      &usig),
+                     EINVAL))
+        return 1;
+    puts("THEKERNEL_ABI_ASSERT io_pgetevents.raw-differential "
+         "TIMEOUT_COPY_BEFORE_SIGSET pass");
+
+    /* Step 2 then step 3: the 16-byte descriptor copy, then the size check,
+     * then the mask copy it points at. */
+    errno = 0;
+    if (expect_errno("io-pgetevents-descriptor-copy",
+                     do_io_pgetevents(MISSING_CONTEXT, 0, 0, NULL, NULL,
+                                      (const struct aio_sigset_abi *)BAD_PTR),
+                     EFAULT))
+        return 1;
+    usig.sigmask = BAD_PTR;
+    usig.sigsetsize = 4;
+    errno = 0;
+    if (expect_errno("io-pgetevents-size-before-mask",
+                     do_io_pgetevents(MISSING_CONTEXT, 0, 0, NULL, NULL,
+                                      &usig),
+                     EINVAL))
+        return 1;
+    usig.sigsetsize = 8;
+    errno = 0;
+    if (expect_errno("io-pgetevents-mask-copy",
+                     do_io_pgetevents(MISSING_CONTEXT, 0, 0, NULL, NULL,
+                                      &usig),
+                     EFAULT))
+        return 1;
+    puts("THEKERNEL_ABI_ASSERT io_pgetevents.raw-differential "
+         "SIGSET_COPY_ORDER pass");
+
+    /* A NULL mask short-circuits the size check (kernel/signal.c:3286-3289),
+     * so any sigsetsize is accepted and no mask is installed. */
+    usig.sigmask = NULL;
+    usig.sigsetsize = 0;
+    result = do_io_pgetevents(ctx, 0, 0, NULL, NULL, &usig);
+    if (result != 0)
+        return fail_value("io-pgetevents-null-mask-zero-size", result, 0);
+    usig.sigsetsize = 4;
+    result = do_io_pgetevents(ctx, 0, 0, NULL, NULL, &usig);
+    if (result != 0)
+        return fail_value("io-pgetevents-null-mask-bad-size", result, 0);
+    usig.sigsetsize = 8;
+    result = do_io_pgetevents(ctx, 0, 0, BAD_PTR, NULL, &usig);
+    if (result != 0)
+        return fail_value("io-pgetevents-null-mask-no-event", result, 0);
+    puts("THEKERNEL_ABI_ASSERT io_pgetevents.raw-differential "
+         "NULL_SIGMASK_ANY_SIZE pass");
+
+    /* Step 4: the range check and the context lookup. */
+    errno = 0;
+    if (expect_errno("io-pgetevents-negative-min",
+                     do_io_pgetevents(ctx, -1, 0, NULL, NULL, NULL), EINVAL))
+        return 1;
+    errno = 0;
+    if (expect_errno("io-pgetevents-negative-nr",
+                     do_io_pgetevents(ctx, 0, -1, NULL, NULL, NULL), EINVAL))
+        return 1;
+    errno = 0;
+    if (expect_errno("io-pgetevents-min-above-nr",
+                     do_io_pgetevents(ctx, 2, 1, NULL, NULL, NULL), EINVAL))
+        return 1;
+    errno = 0;
+    if (expect_errno("io-pgetevents-missing-context",
+                     do_io_pgetevents(MISSING_CONTEXT, 0, 1, NULL, NULL, NULL),
+                     EINVAL))
+        return 1;
+    puts("THEKERNEL_ABI_ASSERT io_pgetevents.raw-differential "
+         "NR_AND_CONTEXT_EINVAL pass");
+
+    /* Step 5: `set_user_sigmask()` installs the supplied mask for the duration
+     * of the call and `restore_saved_sigmask_unless()` puts the caller's set
+     * back (`fs/aio.c:2337-2352`, `kernel/signal.c:3282-3300`).  The
+     * temporary set is deliberately different from the caller's set, so a
+     * missing restore is visible.  A signal that is both pending and blocked
+     * does not set `TIF_SIGPENDING` in a single-threaded process
+     * (`kernel/signal.c` `complete_signal()`), so it must not change the
+     * restore either. */
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = sigusr2_noop;
+    if (sigaction(SIGUSR2, &action, NULL) != 0)
+        return fail("io-pgetevents-sigaction");
+    if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &temporary, NULL, 8) != 0)
+        return fail("io-pgetevents-setmask");
+    if (syscall(SYS_tgkill, getpid(), (pid_t)syscall(SYS_gettid), SIGUSR2) !=
+        0)
+        return fail("io-pgetevents-tgkill");
+    usig.sigmask = &installed;
+    usig.sigsetsize = 8;
+    result = do_io_pgetevents(ctx, 0, 0, NULL, NULL, &usig);
+    if (result != 0)
+        return fail_value("io-pgetevents-masked-wait", result, 0);
+    if (syscall(SYS_rt_sigprocmask, SIG_BLOCK, NULL, &after, 8) != 0)
+        return fail("io-pgetevents-read-mask");
+    if (after != temporary) {
+        fprintf(stderr,
+                "THEKERNEL_AIO_FAIL io-pgetevents-mask-restored after=%llx "
+                "before=%llx\n",
+                (unsigned long long)after, (unsigned long long)temporary);
+        return 1;
+    }
+    if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &empty_mask, NULL, 8) != 0)
+        return fail("io-pgetevents-unblock");
+    puts("THEKERNEL_ABI_ASSERT io_pgetevents.raw-differential MASK_RESTORED "
+         "pass");
+
+    /* A wait that really completes still delivers through this entry point
+     * with a sigset installed. */
+    if (write(pipe_fds[1], "x", 1) != 1)
+        return fail("io-pgetevents-pipe-write");
+    list[0] = make_iocb(&iocb, IOCB_CMD_POLL, pipe_fds[0]);
+    iocb.aio_buf = POLLIN;
+    if (do_io_submit(ctx, 1, list) != 1)
+        return fail("io-pgetevents-submit");
+    usig.sigmask = &installed;
+    usig.sigsetsize = 8;
+    result = do_io_pgetevents(ctx, 1, 1, &event, &timeout, &usig);
+    if (result != 1)
+        return fail_value("io-pgetevents-delivery", result, 1);
+    if (event.obj != (uint64_t)(uintptr_t)&iocb)
+        return fail_value("io-pgetevents-event-obj", (long)event.obj,
+                          (long)(uintptr_t)&iocb);
+    puts("THEKERNEL_ABI_ASSERT io_pgetevents.raw-differential "
+         "EVENT_DELIVERED_WITH_SIGSET pass");
+
+    if (do_io_destroy(ctx) != 0)
+        return fail("io-pgetevents-destroy");
+    return 0;
+}
+
 int main(void) {
     aio_context_t ready = 0;
     aio_context_t live = 0;
@@ -310,8 +509,15 @@ int main(void) {
         return fail("aio-second-setup");
     if (do_io_destroy(live) != 0)
         return fail("aio-second-destroy");
+    puts("THEKERNEL_ABI_RESULT aio.portable-differential pass");
+
+    /* Cases are reported strictly one after another: the ABI parser rejects a
+     * case banner that appears while another case is still open. */
+    puts("THEKERNEL_ABI_CASE io_pgetevents.raw-differential");
+    if (test_io_pgetevents_validation(pipe_fds))
+        return 1;
+    puts("THEKERNEL_ABI_RESULT io_pgetevents.raw-differential pass");
 
     puts("THEKERNEL_AIO_OK");
-    puts("THEKERNEL_ABI_RESULT aio.portable-differential pass");
     return 0;
 }
