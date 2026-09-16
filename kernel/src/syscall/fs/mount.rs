@@ -4219,11 +4219,13 @@ fn mount_setattr_from_copied<M: UserMemory + ?Sized>(
     // Linux's errno order for an invalid attribute paired with a bad path.
     let topology_request = mount_setattr_request(attr)?;
 
-    let path = if pathname.is_null() && flags & AT_EMPTY_PATH != 0 {
-        FsPathBuf::new()
-    } else {
-        load_user_path(memory, pathname)?
-    };
+    // `mount_setattr()` reaches its target through `CLASS(filename_uflags,
+    // name)(path, flags)` (fs/namespace.c:5176), which is `getname_flags()`: a
+    // NULL pointer faults with EFAULT even under AT_EMPTY_PATH, and only an
+    // empty *string* names the descriptor's own mount.  This is also the path
+    // `open_tree_attr()` takes, whose `vfs_open_tree()` already rejected a NULL
+    // pathname before `do_mount_setattr()` can run.
+    let path = load_user_path(memory, pathname)?;
     debug!("sys_mount_setattr <= dirfd: {dirfd}, path: {path:?}, flags: {flags:#x}");
 
     let _mount_operation = mounts::namespace_operation();
