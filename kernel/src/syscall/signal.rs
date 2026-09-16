@@ -997,19 +997,38 @@ fn complete_specific_thread_signal(result: AxResult<()>) -> AxResult<()> {
     }
 }
 
+/// Build the generated record and the security operation for one kill-family
+/// request.
+///
+/// Linux validates the signal number inside `check_kill_permission()`, which
+/// only runs once the target has been resolved through the pid number, so
+/// every caller must find its target before calling this.
+fn prepare_kill_signal(
+    signo: u32,
+    code: i32,
+    source: SignalSecuritySource,
+    scope: SignalDeliveryScope,
+) -> AxResult<(Option<SignalInfo>, SignalSecurityOperation)> {
+    let sig = make_siginfo(signo, code)?;
+    let operation = signal_operation(signal_signo(&sig), source, scope)?;
+    Ok((sig, operation))
+}
+
 pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
     debug!("sys_kill: pid = {pid}, signo = {signo}");
-    let sig = make_siginfo(signo, SI_USER as _)?;
-    let permission_signal = signal_signo(&sig);
-    let operation = signal_operation(
-        permission_signal,
-        SignalSecuritySource::Kill,
-        SignalDeliveryScope::ThreadGroup,
-    )?;
-
+    // `kill_pid_info()` and `kill_pgrp_info()` reach their target through the
+    // pid number and report ESRCH for a missing one before
+    // `check_kill_permission()` validates the signal number, so an
+    // out-of-range signal must not turn a missing target into EINVAL.
     match pid {
         1.. => {
             let pid = resolve_signal_pid(pid as Pid)?;
+            let (sig, operation) = prepare_kill_signal(
+                signo,
+                SI_USER as _,
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            )?;
             match authorize_process_signal_target(pid, operation) {
                 Ok(target) => {
                     complete_initial_process_signal(target, sig, operation, false)?;
@@ -1024,6 +1043,12 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
             let targets = group
                 .try_processes(process_domain()?.registry())
                 .map_err(process_error)?;
+            let (sig, operation) = prepare_kill_signal(
+                signo,
+                SI_USER as _,
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            )?;
             send_user_signal_to_targets(
                 targets,
                 sig,
@@ -1039,6 +1064,12 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
                 .map_err(process_error)?
                 .into_iter()
                 .filter(|process| !process.is_init() && !Arc::ptr_eq(process, &current_process));
+            let (sig, operation) = prepare_kill_signal(
+                signo,
+                SI_USER as _,
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            )?;
             send_user_signal_to_targets(
                 targets,
                 sig,
@@ -1059,6 +1090,12 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
             // the PID number, so an unreaped zombie leader still keeps the
             // group addressable until `release_task()` detaches it.
             let targets = process_group_targets(pgid)?;
+            let (sig, operation) = prepare_kill_signal(
+                signo,
+                SI_USER as _,
+                SignalSecuritySource::Kill,
+                SignalDeliveryScope::ThreadGroup,
+            )?;
             send_user_signal_to_process_group_targets(targets, sig, operation)?;
         }
     }
@@ -1069,13 +1106,15 @@ pub fn sys_tkill(tid: i32, signo: u32) -> AxResult<isize> {
     if tid <= 0 {
         return Err(AxError::InvalidInput);
     }
-    let sig = make_siginfo(signo, SI_TKILL)?;
-    let operation = signal_operation(
-        signal_signo(&sig),
+    // do_send_specific() finds the task through the pid number before
+    // check_kill_permission() validates the signal number.
+    let tid = resolve_signal_pid(tid as Pid)?;
+    let (sig, operation) = prepare_kill_signal(
+        signo,
+        SI_TKILL,
         SignalSecuritySource::Thread,
         SignalDeliveryScope::Thread,
     )?;
-    let tid = resolve_signal_pid(tid as Pid)?;
     let target = authorize_numeric_thread_signal_target(None, tid, operation)?;
     send_signal_to_authorized_numeric_thread(target, sig, true)?;
     Ok(0)
@@ -1085,21 +1124,26 @@ pub fn sys_tgkill(tgid: i32, tid: i32, signo: u32) -> AxResult<isize> {
     if tgid <= 0 || tid <= 0 {
         return Err(AxError::InvalidInput);
     }
-    let sig = make_siginfo(signo, SI_TKILL)?;
-    let operation = signal_operation(
-        signal_signo(&sig),
+    // A tgid mismatch and a missing thread are both resolved before the signal
+    // number is validated.
+    let tgid = resolve_signal_pid(tgid as Pid)?;
+    let tid = resolve_signal_pid(tid as Pid)?;
+    let (sig, operation) = prepare_kill_signal(
+        signo,
+        SI_TKILL,
         SignalSecuritySource::Thread,
         SignalDeliveryScope::Thread,
     )?;
-    let tgid = resolve_signal_pid(tgid as Pid)?;
-    let tid = resolve_signal_pid(tid as Pid)?;
     let target = authorize_numeric_thread_signal_target(Some(tgid), tid, operation)?;
     send_signal_to_authorized_numeric_thread(target, sig, true)?;
     Ok(0)
 }
 
 struct QueuedSignalRequest {
-    signal: Option<SignalInfo>,
+    /// Signal number as passed by the caller; `0` is the existence probe.
+    signo: u32,
+    /// The record copied from userspace, without its signal number applied.
+    sig: SignalInfo,
     code: i32,
 }
 
@@ -1120,21 +1164,33 @@ fn make_queue_signal_info<M: UserMemory + ?Sized>(
 fn prepare_queue_signal_info(
     target_tid: Pid,
     signo: u32,
-    mut sig: SignalInfo,
+    sig: SignalInfo,
 ) -> AxResult<QueuedSignalRequest> {
-    let signo = (signo != 0).then(|| parse_signo(signo)).transpose()?;
+    // Linux's do_rt_sigqueueinfo()/do_rt_tgsigqueueinfo() guard against
+    // impersonation before the pid is translated and before the signal number
+    // is validated, and they compare the raw caller-visible tid.
     if (sig.code() >= 0 || sig.code() == SI_TKILL) && current_visible_tid() != target_tid {
         return Err(AxError::OperationNotPermitted);
     }
     let code = sig.code();
-    if let Some(signo) = signo {
-        sig.set_signo(signo);
-        Ok(QueuedSignalRequest {
-            signal: Some(sig),
-            code,
-        })
-    } else {
-        Ok(QueuedSignalRequest { signal: None, code })
+    Ok(QueuedSignalRequest { signo, sig, code })
+}
+
+impl QueuedSignalRequest {
+    /// Apply the caller's signal number to the copied record.
+    ///
+    /// Linux validates the number in `check_kill_permission()`, i.e. only
+    /// after the target has been found, so this runs last.
+    fn into_signal(self) -> AxResult<Option<SignalInfo>> {
+        let signo = (self.signo != 0).then(|| parse_signo(self.signo)).transpose()?;
+        match signo {
+            Some(signo) => {
+                let mut sig = self.sig;
+                sig.set_signo(signo);
+                Ok(Some(sig))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -1145,15 +1201,17 @@ pub fn sys_rt_sigqueueinfo<M: UserMemory + ?Sized>(
     sig: *const SignalInfo,
 ) -> AxResult<isize> {
     let request = make_queue_signal_info(memory, pid, signo, sig)?;
-    let permission_signal = signal_signo(&request.signal);
+    let code = request.code;
+    // kill_proc_info() resolves the target before check_kill_permission()
+    // validates the signal number.
+    let pid = resolve_signal_pid(pid)?;
+    let sig = request.into_signal()?;
     let operation = signal_operation(
-        permission_signal,
-        SignalSecuritySource::Queued { code: request.code },
+        signal_signo(&sig),
+        SignalSecuritySource::Queued { code },
         SignalDeliveryScope::ThreadGroup,
     )?;
-    let sig = request.signal;
     let queue_required = queued_signal_required(&sig);
-    let pid = resolve_signal_pid(pid)?;
     match authorize_process_signal_target(pid, operation) {
         Ok(target) => {
             complete_initial_process_signal(target, sig, operation, queue_required)?;
@@ -1182,15 +1240,18 @@ pub fn sys_rt_tgsigqueueinfo<M: UserMemory + ?Sized>(
     }
 
     let request = prepare_queue_signal_info(tid as Pid, signo, sig)?;
-    let operation = signal_operation(
-        signal_signo(&request.signal),
-        SignalSecuritySource::Queued { code: request.code },
-        SignalDeliveryScope::Thread,
-    )?;
-    let sig = request.signal;
-    let queue_required = queued_signal_required(&sig);
+    let code = request.code;
+    // do_send_specific() rejects a missing thread and a tgid mismatch before
+    // check_kill_permission() validates the signal number.
     let tgid = resolve_signal_pid(tgid as Pid)?;
     let tid = resolve_signal_pid(tid as Pid)?;
+    let sig = request.into_signal()?;
+    let operation = signal_operation(
+        signal_signo(&sig),
+        SignalSecuritySource::Queued { code },
+        SignalDeliveryScope::Thread,
+    )?;
+    let queue_required = queued_signal_required(&sig);
     let target = authorize_numeric_thread_signal_target(Some(tgid), tid, operation)?;
     send_signal_to_authorized_numeric_thread(target, sig, queue_required)?;
     Ok(0)
