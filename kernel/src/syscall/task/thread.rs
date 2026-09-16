@@ -209,25 +209,25 @@ fn user_xcomp_mask() -> u64 {
 ///
 /// Mirrors `fpu_xstate_prctl()` in arch/x86/kernel/fpu/xstate.c: the two query
 /// commands only copy the mask, and the two request commands validate the
-/// component index before consulting the facility table. `permitted` starts as
-/// `max_features` without the dynamic (opt-in) facilities, and this kernel
-/// never grants one, so both permission masks equal the supported mask minus
-/// the AMX tile-data bit.
+/// component index before consulting the facility table. This kernel never
+/// grants the dynamic AMX tile-data facility, so its bit is removed from the
+/// mask reported to userspace: `ARCH_REQ_XCOMP_PERM` for it is then
+/// -EOPNOTSUPP rather than a silent no-op success that `ARCH_GET_XCOMP_PERM`
+/// would contradict.
 #[cfg(target_arch = "x86_64")]
 fn arch_prctl_xcomp(
     memory: &UserMemoryCapability,
     code: ArchPrctlCode,
     arg2: usize,
 ) -> AxResult<isize> {
-    let supported = user_xcomp_mask();
-    let permitted = supported & !XFEATURE_MASK_XTILE_DATA;
+    let supported = user_xcomp_mask() & !XFEATURE_MASK_XTILE_DATA;
     match code {
         ArchPrctlCode::GetXcompSupp => memory
             .write_value(arg2 as *mut u64, supported)
             .map_err(map_usercopy_error)
             .map(|()| 0),
         ArchPrctlCode::GetXcompPerm | ArchPrctlCode::GetXcompGuestPerm => memory
-            .write_value(arg2 as *mut u64, permitted)
+            .write_value(arg2 as *mut u64, supported)
             .map_err(map_usercopy_error)
             .map(|()| 0),
         ArchPrctlCode::ReqXcompPerm | ArchPrctlCode::ReqXcompGuestPerm => {

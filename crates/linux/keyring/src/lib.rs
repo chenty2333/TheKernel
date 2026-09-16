@@ -88,6 +88,10 @@ pub mod uapi {
             key: i32,
             output: UserBuffer,
         },
+        GetSecurity {
+            key: i32,
+            output: UserBuffer,
+        },
         Clear {
             keyring: i32,
         },
@@ -249,10 +253,16 @@ pub mod uapi {
             }),
             16 => Ok(KeyctlPlan::AssumeAuthority { key: a2 as i32 }),
             // `KEYCTL_GET_SECURITY` answers with the key's LSM security
-            // context.  There is no LSM-independent behaviour to implement:
-            // the reference kernel's SELinux returns a context string, and a
-            // kernel with no `key_getsecurity` hook returns an empty one.
-            17 => Err(KeyctlUapiError::Unsupported),
+            // context.  No LSM registers a `key_getsecurity` hook here, so the
+            // reference kernel's no-hook path applies: the context is empty
+            // and the call reports one byte.
+            17 => Ok(KeyctlPlan::GetSecurity {
+                key: a2 as i32,
+                output: UserBuffer {
+                    address: a3,
+                    len: a4,
+                },
+            }),
             19 => Ok(KeyctlPlan::Reject {
                 key: a2 as i32,
                 timeout: a3 as u64,
@@ -1339,11 +1349,12 @@ mod tests {
     }
 
     #[test]
-    fn get_security_stays_unsupported_and_pkey_query_checks_arg3_first() {
-        use uapi::{KeyctlPlan, KeyctlUapiError, RawKeyctlArgs, decode_keyctl};
+    fn get_security_plans_empty_context_and_pkey_query_checks_arg3_first() {
+        use uapi::{KeyctlPlan, KeyctlUapiError, RawKeyctlArgs, UserBuffer, decode_keyctl};
 
-        // The LSM supplies the answer, so there is no LSM-free behaviour to
-        // implement; the command stays a declared gap.
+        // No LSM registers a `key_getsecurity` hook here, so the reference
+        // kernel's no-hook path applies: the plan decodes and the executor
+        // reports the one-byte empty context.
         assert_eq!(
             decode_keyctl(RawKeyctlArgs {
                 option: 17,
@@ -1352,7 +1363,13 @@ mod tests {
                 arg4: 8,
                 arg5: 0,
             }),
-            Err(KeyctlUapiError::Unsupported)
+            Ok(KeyctlPlan::GetSecurity {
+                key: 7,
+                output: UserBuffer {
+                    address: 0x2000,
+                    len: 8
+                }
+            })
         );
         // `keyctl.c`: `case KEYCTL_PKEY_QUERY: if (arg3 != 0) return -EINVAL;`
         assert_eq!(

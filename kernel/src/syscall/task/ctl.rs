@@ -1802,11 +1802,11 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> AxResult<isize> {
 
 /// Linux 7.2.3 `get_mempolicy(2)` — `SYSCALL_DEFINE5(get_mempolicy, ...)`.
 ///
-/// Validation order is Linux's and is the ABI: unknown flag bits first
-/// (`do_get_mempolicy()`), then the `MPOL_F_MEMS_ALLOWED` early return — which
-/// deliberately skips the `maxnode` and address checks — then the
-/// `maxnode < nr_node_ids` check when a `nodemask` was supplied
-/// (`kernel_get_mempolicy()`), then `addr` requiring `MPOL_F_ADDR`.
+/// Validation order is Linux's and is the ABI: the `maxnode < nr_node_ids`
+/// check first when a `nodemask` was supplied (`kernel_get_mempolicy()`),
+/// then unknown flag bits (`do_get_mempolicy()`), then the
+/// `MPOL_F_MEMS_ALLOWED` early return — which deliberately skips the address
+/// checks — then `addr` requiring `MPOL_F_ADDR`.
 /// `MPOL_F_NODE` without `MPOL_F_ADDR` needs the task's own interleave policy
 /// and is `EINVAL` for any other mode.
 ///

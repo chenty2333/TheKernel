@@ -526,24 +526,28 @@ fn ptrace_shstk_regset(
         return Err(LinuxError::EOPNOTSUPP.into());
     }
     let required = core::mem::size_of::<X86ShstkRegset>();
-    // `ptrace_regset()` rejects a length that is not a whole number of records
-    // (-EINVAL) and `regset_get()` rejects `count + pos > n * size` (-EINVAL);
-    // the length is afterwards clamped to the record size for the write-back.
-    if iov.iov_len < required as i64 || iov.iov_len as usize % required != 0 {
+    // `ptrace_regset()` rejects a length that is not a whole number of
+    // records (-EINVAL); `__regset_get()` then clamps the count to the
+    // record extent, so a zero length copies nothing and writes 0 back.
+    if iov.iov_len < 0 || iov.iov_len as usize % required != 0 {
         return Err(AxError::InvalidInput);
     }
-    iov.iov_len = required as i64;
+    iov.iov_len = (iov.iov_len as usize).min(required) as i64;
     match request {
         PTRACE_GETREGSET => {
-            let state = snapshot_inactive_task_user_cet_state(target_task)
-                .map_err(|_| AxError::NoSuchProcess)?;
-            tracer_memory
-                .write_value(
-                    iov.iov_base as *mut X86ShstkRegset,
-                    X86ShstkRegset { ssp: state.pl3_ssp },
-                )
-                .map_err(map_usercopy_error)?;
-            iov.iov_len = required as i64;
+            // With a zero count Linux never calls the regset's `get`
+            // callback, so the empty request answers without consulting the
+            // tracee's state.
+            if iov.iov_len != 0 {
+                let state = snapshot_inactive_task_user_cet_state(target_task)
+                    .map_err(|_| AxError::NoSuchProcess)?;
+                tracer_memory
+                    .write_value(
+                        iov.iov_base as *mut X86ShstkRegset,
+                        X86ShstkRegset { ssp: state.pl3_ssp },
+                    )
+                    .map_err(map_usercopy_error)?;
+            }
             tracer_memory
                 .write_value(iov_address as *mut IoVec, iov)
                 .map_err(map_usercopy_error)?;

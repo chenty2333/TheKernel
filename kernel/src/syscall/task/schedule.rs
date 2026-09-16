@@ -164,6 +164,14 @@ fn zombie_scheduler_target(tid: Pid) -> AxResult<Option<SchedTarget>> {
 }
 
 /// Resolves `pid` for the scheduler queries Linux restricts to a live task.
+///
+/// Deliberate gap: Linux reaches an unreaped zombie through
+/// `find_task_by_vpid()` here as well, so `sched_getaffinity`,
+/// `sched_setaffinity`, `sched_setparam` and `sched_setscheduler` answer for
+/// one from the still-allocated `task_struct`. TheKernel keeps no scheduler
+/// object for a zombie to mutate through the setter transactions, and the
+/// retained `ZombieSchedulerSnapshot` carries no cpumask, so these calls
+/// report ESRCH for a zombie instead.
 fn live_sched_target(pid: i32) -> AxResult<AxTaskRef> {
     if pid < 0 {
         return Err(AxError::InvalidInput);
@@ -799,16 +807,16 @@ fn flatten_clock_sleep_result(
     }
 }
 
-fn sleep_relative(dur: TimeValue) -> AxResult<(TimeValue, TimeValue)> {
+fn sleep_relative(clock: AlarmClock, dur: TimeValue) -> AxResult<(TimeValue, TimeValue)> {
     debug!("sleep_impl <= {dur:?}");
 
     if dur.is_zero() {
-        return Ok((dur, AlarmClock::Monotonic.now()));
+        return Ok((dur, clock.now()));
     }
-    let start = AlarmClock::Monotonic.now();
+    let start = clock.now();
     let deadline = start.checked_add(dur).unwrap_or(Duration::MAX);
     loop {
-        let mut sleeper = prepare_clock_sleep(AlarmClock::Monotonic, deadline)?;
+        let mut sleeper = prepare_clock_sleep(clock, deadline)?;
 
         // We detect EINTR manually if the slept time is not enough.  The
         // task interrupt is only a wake hint; retry while no visible signal,
@@ -831,7 +839,7 @@ fn sleep_relative(dur: TimeValue) -> AxResult<(TimeValue, TimeValue)> {
     // exactly what Linux copies into `restart->nanosleep.expires` from
     // `hrtimer_get_expires()` so a restarted sleep resumes at the original
     // deadline instead of sleeping the whole interval again.
-    Ok((AlarmClock::Monotonic.now() - start, deadline))
+    Ok((clock.now() - start, deadline))
 }
 
 fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> AxResult<ClockSleepOutcome> {
@@ -1131,7 +1139,7 @@ pub fn sys_nanosleep<M: UserMemory + ?Sized>(
     .try_into_time_value()?;
     debug!("sys_nanosleep <= req: {req:?}");
 
-    let (actual, deadline) = sleep_relative(req)?;
+    let (actual, deadline) = sleep_relative(AlarmClock::Monotonic, req)?;
 
     if let Some(diff) = remaining_relative_sleep(req, actual) {
         debug!("sys_nanosleep => rem: {diff:?}");
@@ -1329,7 +1337,7 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
         let outcome = sleep_absolute(clock, deadline)?;
         finish_absolute_clock_sleep(outcome, clock.now(), deadline)
     } else {
-        let (actual, deadline) = sleep_relative(req)?;
+        let (actual, deadline) = sleep_relative(clock, req)?;
 
         if let Some(diff) = remaining_relative_sleep(req, actual) {
             debug!("sys_clock_nanosleep => rem: {diff:?}");
@@ -1341,9 +1349,9 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
             }
             // A relative `clock_nanosleep()` is `-ERESTART_RESTARTBLOCK` with
             // the timer's absolute expiry recorded, exactly like `nanosleep()`.
-            // `sleep_relative()` always arms the monotonic clock, which is the
+            // `sleep_relative()` armed the resolved clock, which is the
             // equivalent of Linux reading back `t.timer.base->clockid`.
-            install_nanosleep_restart(deadline, SleepClock::Wall(AlarmClock::Monotonic), rem);
+            install_nanosleep_restart(deadline, SleepClock::Wall(clock), rem);
             Err(AxError::Interrupted)
         } else {
             Ok(0)
@@ -1806,6 +1814,17 @@ impl SchedGetAttrTarget {
         }
     }
 
+    /// `task_has_dl_policy()` reads only `p->policy`; it is not part of the
+    /// `get_params()` transaction, so the flags admission in
+    /// `sys_sched_getattr` reads the class this way instead of taking a full
+    /// snapshot that could ESRCH on a task the lookup already resolved.
+    fn policy_class(&self) -> AxResult<SchedClass> {
+        match self {
+            Self::Live(task) => Ok(sched_state(task).class),
+            Self::Zombie(process) => zombie_scheduler_state(process).map(|snapshot| snapshot.class),
+        }
+    }
+
     /// `get_params()`'s deadline branch, read from the same scheduler
     /// transaction as `snapshot()`.
     ///
@@ -1908,7 +1927,7 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
     // deadline target therefore rejects any flag other than the one Linux
     // defines, rather than accepting the unknown bits.
     if flags != 0
-        && (!matches!(target.snapshot()?.0.class, SchedClass::Deadline)
+        && (!matches!(target.policy_class()?, SchedClass::Deadline)
             || flags != linux_sched::SCHED_GETATTR_FLAG_DL_DYNAMIC)
     {
         return Err(AxError::InvalidInput);

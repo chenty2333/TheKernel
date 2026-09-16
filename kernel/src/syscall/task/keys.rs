@@ -123,8 +123,8 @@ fn validate_key_type_encoding(type_name: &str) -> AxResult<()> {
 
 /// `key_type_lookup()` as every other entry point sees it.
 ///
-/// `request_key(2)`, `KEYCTL_SEARCH` and `KEYCTL_RESTRICT_KEYRING` propagate
-/// its `-ENOKEY` for an unregistered type unchanged.
+/// `request_key(2)` and `KEYCTL_SEARCH` propagate its `-ENOKEY` for an
+/// unregistered type unchanged.
 fn registered_key_type(type_name: &str) -> AxResult<KeyTypeKind> {
     KeyTypeKind::from_name(type_name).ok_or(AxError::from(LinuxError::ENOKEY))
 }
@@ -353,6 +353,7 @@ pub fn sys_keyctl<M: UserMemory + ?Sized>(
                 .ok_or(AxError::InvalidInput)?,
         },
         KeyctlPlan::Describe { key, .. } => KeyctlCommand::Describe { key },
+        KeyctlPlan::GetSecurity { key, .. } => KeyctlCommand::GetSecurity { key },
         KeyctlPlan::Clear { keyring } => KeyctlCommand::Clear { keyring },
         KeyctlPlan::Link { key, keyring } => KeyctlCommand::Link { key, keyring },
         KeyctlPlan::Unlink { serial, keyring } => KeyctlCommand::Unlink { serial, keyring },
@@ -427,25 +428,20 @@ pub fn sys_keyctl<M: UserMemory + ?Sized>(
             type_name,
             restriction,
         } => {
-            let kind = match (type_name, restriction) {
+            let type_name = match (type_name, restriction) {
                 // `keyring_restrict(key_ref, NULL, NULL)` installs
                 // `restrict_link_reject`, which refuses every later link.
                 (None, None) => None,
-                // A typed restriction can only come from a key type that
-                // exports `lookup_restriction`.  No type this kernel
-                // implements does, and `keyring_restrict()` reports a missing
-                // backend as -ENOENT rather than -EOPNOTSUPP.
                 (Some(type_name), Some(restriction)) => {
                     let type_name = load_planned_string(memory, type_name)?;
                     let _restriction = load_planned_string(memory, restriction)?;
-                    // The key type is resolved first, and only a registered
-                    // type can reach the missing-backend -ENOENT.
-                    registered_key_type(&type_name)?;
-                    return Err(AxError::NotFound);
+                    // The type is resolved inside the service, after the
+                    // keyring lookup, as `keyctl_restrict_keyring()` does.
+                    Some(type_name)
                 }
                 _ => return Err(AxError::InvalidInput),
             };
-            KeyctlCommand::Restrict { keyring, kind }
+            KeyctlCommand::Restrict { keyring, type_name }
         }
         KeyctlPlan::Move {
             key,
@@ -461,7 +457,19 @@ pub fn sys_keyctl<M: UserMemory + ?Sized>(
     };
 
     match keyring::keyctl(&current_key_actor(), command)? {
-        KeyctlOutput::Value(value) => Ok(value),
+        KeyctlOutput::Value(value) => {
+            // `keyctl_get_security()` with no `key_getsecurity` hook reports
+            // the empty context: it copies the one-byte "" when the caller
+            // supplied a nonempty buffer and returns 1 either way.
+            if let KeyctlPlan::GetSecurity { output, .. } = plan
+                && output.address != 0
+                && output.len != 0
+            {
+                vm_write_slice(memory, output.address as *mut u8, &[0])
+                    .map_err(map_usercopy_error)?;
+            }
+            Ok(value)
+        }
         KeyctlOutput::CountedBytes(bytes) => {
             let KeyctlPlan::Describe { output, .. } = plan else {
                 unreachable!()

@@ -3,7 +3,6 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use axerrno::{AxError, AxResult};
 use tk_linux_cred::KeyPermissionMask;
 
-use super::KeyTypeKind;
 use crate::task::{Credentials, DacCredentialView, Kgid, Kuid, UserGid, UserNamespace, UserUid};
 
 const KEY_REQKEY_DEFL_DEFAULT: i32 = 0;
@@ -196,6 +195,9 @@ pub(crate) enum KeyctlCommand {
     Describe {
         key: i32,
     },
+    GetSecurity {
+        key: i32,
+    },
     Clear {
         keyring: i32,
     },
@@ -252,7 +254,7 @@ pub(crate) enum KeyctlCommand {
     },
     Restrict {
         keyring: i32,
-        kind: Option<KeyTypeKind>,
+        type_name: Option<String>,
     },
     Move {
         key: i32,

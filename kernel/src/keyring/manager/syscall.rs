@@ -732,6 +732,16 @@ impl KeyManager {
                 .into_bytes();
                 return Ok(KeyctlOutput::CountedBytes(description));
             }
+            KeyctlCommand::GetSecurity { key } => {
+                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
+                if !manager.key_has_perm(serial, actor, KeyPermission::VIEW)? {
+                    return Err(LinuxError::EACCES.into());
+                }
+                // No LSM registers a `key_getsecurity` hook, so
+                // `key_getsecurity()` returns 0 and `keyctl_get_security()`
+                // reports the empty context as a one-byte length.
+                1
+            }
             KeyctlCommand::Clear { keyring } => {
                 let keyring =
                     manager.resolve_keyring_in_namespace(keyring, actor, namespace, false)?;
@@ -903,12 +913,28 @@ impl KeyManager {
                 manager.link_persistent_keyring(dest, persistent, actor)?;
                 persistent.serial as isize
             }
-            KeyctlCommand::Restrict { keyring, kind } => {
+            KeyctlCommand::Restrict { keyring, type_name } => {
                 let serial =
                     manager.resolve_keyring_in_namespace(keyring, actor, namespace, false)?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::SETATTR)? {
                     return Err(LinuxError::EACCES.into());
                 }
+                let kind = match type_name {
+                    None => None,
+                    // `keyctl_restrict_keyring()` resolves the keyring with
+                    // `lookup_user_key()` before `keyring_restrict()` looks
+                    // the type up, so the type checks run only here.  A typed
+                    // restriction needs a key type exporting
+                    // `lookup_restriction`; no registered type does, and
+                    // `keyring_restrict()` reports the missing backend as
+                    // -ENOENT rather than -EOPNOTSUPP.
+                    Some(type_name) => {
+                        if KeyTypeKind::from_name(&type_name).is_none() {
+                            return Err(LinuxError::ENOKEY.into());
+                        }
+                        return Err(AxError::NotFound);
+                    }
+                };
                 let key = manager
                     .keys
                     .get_mut(&serial.serial)

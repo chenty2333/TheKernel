@@ -678,16 +678,19 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
     flags: u64,
 ) -> AxResult<isize> {
     let actor = boot_capable()?;
-    let crash = valid_flags(flags)?;
+    // `SYSCALL_DEFINE4(kexec_load)` runs the `security_kernel_load_data()`
+    // LSM hook before `kexec_load_check()` inspects the flags; the kind only
+    // depends on the KEXEC_ON_CRASH bit, which needs no validation.
     authorize_kernel_load_data(
         &actor,
-        if crash {
+        if flags & KEXEC_ON_CRASH != 0 {
             KernelLoadKind::KexecCrashImage
         } else {
             KernelLoadKind::KexecImage
         },
         false,
     )?;
+    let crash = valid_flags(flags)?;
     // `kexec_load_check()` caps the segment count after the flag and LSM
     // admission:
     //

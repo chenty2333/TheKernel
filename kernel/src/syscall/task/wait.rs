@@ -19,7 +19,8 @@ use crate::{
     task::{
         AsThread, PidNamespace, Process, ProcessData, PtraceSession, StopFilter, StopReport,
         TaskParentNode, TaskUsage, Thread, ZombieSnapshot, get_process_data,
-        has_pending_syscall_signal, is_exact_child_of_thread, process_domain, reap_process,
+        get_process_including_zombie, has_pending_syscall_signal, is_exact_child_of_thread,
+        process_domain, reap_process,
     },
 };
 
@@ -576,11 +577,8 @@ fn write_waitpid_event(
     exit_code: *mut i32,
     rusage_ptr: *mut rusage,
 ) -> AxResult<()> {
-    if !exit_code.is_null() {
-        memory
-            .write_value(exit_code, event.waitpid_status())
-            .map_err(map_usercopy_error)?;
-    }
+    // `wait_consider_task()` copies the rusage out before it returns, so the
+    // `put_user(wo_stat, stat_addr)` in `kernel_wait4()` is the later write.
     if !rusage_ptr.is_null() {
         let usage = event.usage();
         // TaskUsage's conversion starts from a zeroed rusage and fills
@@ -591,6 +589,11 @@ fn write_waitpid_event(
                 .write_value_unchecked(rusage_ptr, usage.into())
                 .map_err(map_usercopy_error)?;
         }
+    }
+    if !exit_code.is_null() {
+        memory
+            .write_value(exit_code, event.waitpid_status())
+            .map_err(map_usercopy_error)?;
     }
     Ok(())
 }
@@ -947,6 +950,18 @@ fn waitid_claim(idtype: u32, id: u32, options: u32) -> AxResult<WaitIdClaim> {
 
     let curr = current();
     let viewer_pid_ns = curr.as_thread().pid_ns();
+    // `kernel_waitid_prepare()` runs `find_get_pid()` after validating the
+    // `which`/`upid` pair: a P_PID or nonzero P_PGID id that names no live or
+    // unreaped-zombie process is ESRCH, distinct from the ECHILD the wait
+    // itself reports for an existing process that is not a waitable child.
+    if idtype == P_PID || (idtype == P_PGID && id != 0) {
+        let exists = viewer_pid_ns
+            .resolve_visible_pid(id as Pid)
+            .is_some_and(|tid| get_process_including_zombie(tid).is_ok());
+        if !exists {
+            return Err(AxError::NoSuchProcess);
+        }
+    }
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;
     let nowait = options.contains(WaitOptions::WNOWAIT);
