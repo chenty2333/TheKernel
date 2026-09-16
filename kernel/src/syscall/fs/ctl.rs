@@ -34,7 +34,7 @@ use crate::file::permission::{
 use crate::{
     file::{
         Directory, File, FileDescription, FileLike, IoctlContext, executable,
-        filesystem_type_catalog, get_file_description, inode_flags,
+        filesystem_type_catalog, get_file_description, get_file_like, inode_flags,
         inotify::location_for_fd,
         namespace_mutation,
         permission::{
@@ -1967,6 +1967,15 @@ fn update_times<M: UserMemory + ?Sized>(
         .transpose()?;
     if atime_intent == TimeUpdate::Omit && mtime_intent == TimeUpdate::Omit {
         return Ok(());
+    }
+    // A NULL pathname with a descriptor names the object that descriptor
+    // refers to.  Linux reaches that case through `do_utimes_fd()`, which
+    // resolves the description with `CLASS(fd, f)` (fs/utimes.c:108-117);
+    // `fdget()` refuses an O_PATH description (fs/file.c:1196
+    // `__fget_light` returns EMPTY_FD when `FMODE_PATH` is set), so the
+    // request fails with EBADF before any timestamp is validated or applied.
+    if path.is_none() && dirfd != AT_FDCWD && get_file_like(dirfd)?.is_path_only() {
+        return Err(AxError::BadFileDescriptor);
     }
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
