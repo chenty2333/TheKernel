@@ -94,6 +94,33 @@
 #ifndef SYS_sethostname
 #define SYS_sethostname 170
 #endif
+#ifndef SYS_getpgrp
+#define SYS_getpgrp 111
+#endif
+#ifndef SYS_setsid
+#define SYS_setsid 112
+#endif
+#ifndef SYS_setreuid
+#define SYS_setreuid 113
+#endif
+#ifndef SYS_setregid
+#define SYS_setregid 114
+#endif
+#ifndef SYS_setresuid
+#define SYS_setresuid 117
+#endif
+#ifndef SYS_setresgid
+#define SYS_setresgid 119
+#endif
+#ifndef SYS_getpgid
+#define SYS_getpgid 121
+#endif
+#ifndef SYS_getsid
+#define SYS_getsid 124
+#endif
+#ifndef SYS_capget
+#define SYS_capget 125
+#endif
 #ifndef SYS_setdomainname
 #define SYS_setdomainname 171
 #endif
@@ -1106,6 +1133,276 @@ static void uts_case(void) {
     done();
 }
 
+/* ------------------------------------------------------------------ *
+ * identity-pgid: getpgrp, getpgid, setsid, getsid
+ * ------------------------------------------------------------------ */
+
+/* A forked child is neither a session nor a group leader, so setsid() can
+ * succeed once and must then refuse a second call: ksys_setsid() fails with
+ * EPERM if `signal->leader` is already set (kernel/sys.c:1276-1285). */
+static void setsid_child(void) {
+    pid_t pid = getpid();
+
+    /* Only what the child creates itself is asserted.  A process started
+     * outside the guest's pid namespace reports 0 from getpgrp()/getsid()
+     * for the session and group it inherited, because pid_vnr() of a pid
+     * that is not visible in the current namespace is 0; the ids the child
+     * allocates itself are visible and stable. */
+    check((pid_t)syscall(SYS_setsid) == pid, "setsid-returns-the-new-session");
+    check((pid_t)syscall(SYS_getsid, 0) == pid, "getsid-reports-the-new-session");
+    check((pid_t)syscall(SYS_getpgrp) == pid, "getpgrp-reports-the-new-group");
+    check((pid_t)syscall(SYS_getpgid, 0) == pid, "getpgid-reports-the-new-group");
+
+    errno = 0;
+    check(syscall(SYS_setsid) == -1 && errno == EPERM, "setsid-again-is-eperm");
+}
+
+static void pgid_case(void) {
+    pid_t pid = getpid();
+    pid_t self_pgrp;
+    pid_t self_sid;
+
+    begin("identity-pgid.raw-differential");
+
+    /* getpgrp() is literally do_getpgid(0) (kernel/sys.c:1222-1224), so every
+     * spelling of "the caller's group" must agree. */
+    self_pgrp = (pid_t)syscall(SYS_getpgrp);
+    self_sid = (pid_t)syscall(SYS_getsid, 0);
+    check((pid_t)syscall(SYS_getpgid, 0) == self_pgrp, "getpgid-zero-is-getpgrp");
+    check((pid_t)syscall(SYS_getpgid, pid) == self_pgrp, "getpgid-self-is-getpgrp");
+    mark("GETPGRP_AND_GETPGID_AGREE");
+
+    /* do_getpgid() resolves every nonzero pid through find_task_by_vpid(), so
+     * an unknown pid and a negative pid are both ESRCH, not EINVAL. */
+    errno = 0;
+    check(syscall(SYS_getpgid, 0x7ffffff0) == -1 && errno == ESRCH, "getpgid-unknown-pid");
+    errno = 0;
+    check(syscall(SYS_getpgid, -1) == -1 && errno == ESRCH, "getpgid-negative-pid");
+    mark("GETPGID_ERRORS");
+
+    /* getsid() resolves its argument the same way (kernel/sys.c:1229-1242). */
+    check((pid_t)syscall(SYS_getsid, pid) == self_sid, "getsid-self");
+    errno = 0;
+    check(syscall(SYS_getsid, 0x7ffffff0) == -1 && errno == ESRCH, "getsid-unknown-pid");
+    errno = 0;
+    check(syscall(SYS_getsid, -1) == -1 && errno == ESRCH, "getsid-negative-pid");
+    mark("GETSID_SELF_AND_ERRORS");
+
+    in_child("setsid-child", setsid_child);
+    mark("SETSID_MAKES_A_NEW_SESSION_AND_REFUSES_TWICE");
+
+    check(getpid() == pid && (pid_t)syscall(SYS_getpgrp) == self_pgrp,
+          "session-change-stayed-in-child");
+    done();
+}
+
+/* ------------------------------------------------------------------ *
+ * identity-setres: setreuid, setregid, setresuid, setresgid
+ * ------------------------------------------------------------------ */
+
+/* setresuid() is a no-op when every field already holds its argument, sets all
+ * three ids at once, and assigns fsuid = euid unconditionally
+ * (kernel/sys.c:708-765).  Once the effective id leaves the privileged set the
+ * remaining calls observe the capability branch. */
+static void setresuid_child(void) {
+    uint32_t real = 0, effective = 0, saved = 0;
+
+    check(syscall(SYS_setresuid, -1, -1, -1) == 0, "setresuid-all-unchanged");
+    check(syscall(SYS_getresuid, &real, &effective, &saved) == 0
+              && real == 0 && effective == 0 && saved == 0,
+          "setresuid-unchanged-readback");
+
+    /* Move fsuid away from euid first: the no-op arm requires euid == fsuid as
+     * well, so this call must fall through and reset fsuid to euid. */
+    check(syscall(SYS_setfsuid, 1400) == 0, "setresuid-fsuid-moved");
+    check(syscall(SYS_setresuid, -1, 0, -1) == 0, "setresuid-fsuid-follows-call");
+    check(syscall(SYS_setfsuid, 0) == 0, "setresuid-fsuid-followed-euid");
+
+    check(syscall(SYS_setresuid, 1200, 1201, 1202) == 0, "setresuid-triple");
+    check(syscall(SYS_getresuid, &real, &effective, &saved) == 0
+              && real == 1200 && effective == 1201 && saved == 1202,
+          "setresuid-triple-readback");
+
+    /* No longer privileged: an id outside {ruid, euid, suid} is EPERM, but the
+     * saved id is always an admissible target. */
+    errno = 0;
+    check(syscall(SYS_setresuid, 1300, -1, -1) == -1 && errno == EPERM,
+          "setresuid-other-is-eperm");
+    check(syscall(SYS_setresuid, -1, 1202, -1) == 0, "setresuid-euid-to-saved");
+    check(syscall(SYS_getresuid, &real, &effective, &saved) == 0
+              && real == 1200 && effective == 1202 && saved == 1202,
+          "setresuid-euid-to-saved-readback");
+}
+
+static void setresgid_child(void) {
+    uint32_t real = 0, effective = 0, saved = 0;
+
+    check(syscall(SYS_setresgid, -1, -1, -1) == 0, "setresgid-all-unchanged");
+    check(syscall(SYS_setresgid, 2200, 2201, 2202) == 0, "setresgid-triple");
+    check(syscall(SYS_getresgid, &real, &effective, &saved) == 0
+              && real == 2200 && effective == 2201 && saved == 2202,
+          "setresgid-triple-readback");
+    /* Capabilities follow the *effective user* id, not the group ids, and no
+     * user id has moved, so CAP_SETGID is still effective and a further group
+     * change is still admitted.  The equivalent uid change below is refused,
+     * which is the asymmetry this probe records. */
+    check(syscall(SYS_setresgid, 2300, -1, -1) == 0, "setresgid-other-still-permitted");
+    check(syscall(SYS_setresgid, -1, 2202, -1) == 0, "setresgid-egid-to-saved");
+}
+
+/* The two-argument form cannot leave the saved id alone: setting either id
+ * makes the saved id follow the new effective id (kernel/sys.c:946-951), and
+ * the effective id's admissible set is the old {ruid, euid, suid}. */
+static void setreuid_child(void) {
+    uint32_t real = 0, effective = 0, saved = 0;
+
+    check(syscall(SYS_setreuid, 1500, 1501) == 0, "setreuid-pair");
+    check(syscall(SYS_getresuid, &real, &effective, &saved) == 0
+              && real == 1500 && effective == 1501 && saved == 1501,
+          "setreuid-saved-follows-effective");
+
+    errno = 0;
+    check(syscall(SYS_setreuid, 1600, -1) == -1 && errno == EPERM, "setreuid-other-is-eperm");
+
+    /* 1500 is still the real id, so the effective id may return to it, and
+     * because it is unchanged from the old real id the saved id keeps 1501. */
+    check(syscall(SYS_setreuid, -1, 1500) == 0, "setreuid-euid-to-real");
+    check(syscall(SYS_getresuid, &real, &effective, &saved) == 0
+              && real == 1500 && effective == 1500 && saved == 1501,
+          "setreuid-saved-unchanged-when-euid-was-real");
+}
+
+static void setregid_child(void) {
+    uint32_t real = 0, effective = 0, saved = 0;
+
+    check(syscall(SYS_setregid, 2500, 2501) == 0, "setregid-pair");
+    check(syscall(SYS_getresgid, &real, &effective, &saved) == 0
+              && real == 2500 && effective == 2501 && saved == 2501,
+          "setregid-saved-follows-effective");
+    check(syscall(SYS_setregid, 2600, -1) == 0, "setregid-other-still-permitted");
+}
+
+static void setres_case(void) {
+    uint32_t real = 0, effective = 0, saved = 0;
+
+    begin("identity-setres.raw-differential");
+    check(syscall(SYS_getresuid, &real, &effective, &saved) == 0
+              && real == 0 && effective == 0 && saved == 0,
+          "setres-before-privileged");
+    check(syscall(SYS_getresgid, &real, &effective, &saved) == 0
+              && real == 0 && effective == 0 && saved == 0,
+          "setres-before-privileged-gid");
+
+    in_child("setresuid-child", setresuid_child);
+    mark("SETRESUID_NOOP_AND_FSUID_FOLLOWS_EUID_APPLIED");
+    mark("SETRESUID_FULL_TRIPLE_AND_CAPABILITY_BRANCH");
+
+    in_child("setresgid-child", setresgid_child);
+    mark("SETRESGID_FULL_TRIPLE_AND_CAPABILITY_BRANCH");
+
+    in_child("setreuid-child", setreuid_child);
+    mark("SETREUID_SAVED_ID_FOLLOWS_EFFECTIVE");
+
+    in_child("setregid-child", setregid_child);
+    mark("SETREGID_SAVED_ID_FOLLOWS_EFFECTIVE");
+
+    check(syscall(SYS_getresuid, &real, &effective, &saved) == 0
+              && real == 0 && effective == 0 && saved == 0,
+          "setres-uid-changes-stayed-in-child");
+    check(syscall(SYS_getresgid, &real, &effective, &saved) == 0
+              && real == 0 && effective == 0 && saved == 0,
+          "setres-gid-changes-stayed-in-child");
+    done();
+}
+
+/* ------------------------------------------------------------------ *
+ * identity-capget: capget
+ * ------------------------------------------------------------------ */
+
+struct cap_user_header {
+    uint32_t version;
+    int32_t pid;
+};
+
+struct cap_user_data {
+    uint32_t effective;
+    uint32_t permitted;
+    uint32_t inheritable;
+};
+
+#define CAP_VERSION_1 0x19980330U
+#define CAP_VERSION_3 0x20080522U
+#define CAP_VERSION_PREFERRED 0x20080522U
+
+/* cap_validate_magic() writes the preferred version back before reporting
+ * EINVAL, and SYSCALL_DEFINE2(capget) answers 0 when the version is invalid
+ * *and* the data pointer is NULL (kernel/capability.c:71-93,137-147). */
+static void capget_case(void) {
+    struct cap_user_header header;
+    struct cap_user_data data[2];
+    int32_t self = (int32_t)getpid();
+
+    begin("identity-capget.raw-differential");
+
+    memset(&header, 0, sizeof(header));
+    memset(data, 0, sizeof(data));
+    header.version = CAP_VERSION_3;
+    header.pid = 0;
+    check(syscall(SYS_capget, &header, data) == 0, "capget-v3-self");
+    check(header.pid == 0, "capget-does-not-rewrite-pid");
+    check(data[0].effective == 0xffffffffU && data[0].permitted == 0xffffffffU,
+          "capget-root-effective-and-permitted");
+    /* The v2/v3 split must reproduce the same 64-bit sets in both words; the
+     * upper word is only empty when the configuration grants no capability
+     * above 31, which this one does (CAP_CHECKPOINT_RESTORE and friends). */
+    check(data[1].effective == data[1].permitted && data[0].permitted == data[0].effective,
+          "capget-words-preserve-the-split");
+    mark("EFFECTIVE_SET_MATCHES_GETPID_CAPS");
+
+    /* An unsupported version is EINVAL whenever a data pointer is supplied,
+     * and the header is rewritten to the preferred version on the way out. */
+    memset(&header, 0, sizeof(header));
+    header.version = 0;
+    header.pid = 0;
+    errno = 0;
+    check(syscall(SYS_capget, &header, data) == -1 && errno == EINVAL,
+          "capget-unknown-version");
+    check(header.version == CAP_VERSION_PREFERRED, "capget-version-rewritten");
+
+    /* With no data pointer the same call reports success: the legacy "probe
+     * for the supported version" shape. */
+    memset(&header, 0, sizeof(header));
+    header.version = 0;
+    header.pid = 0;
+    errno = 0;
+    check(syscall(SYS_capget, &header, NULL) == 0, "capget-null-data-unknown-version");
+    check(header.version == CAP_VERSION_PREFERRED, "capget-null-data-version-rewritten");
+    mark("VERSION_VALIDATION_WRITES_PREFERRED_VERSION");
+
+    /* A valid version with no data pointer also succeeds and writes nothing. */
+    memset(&header, 0, sizeof(header));
+    header.version = CAP_VERSION_1;
+    header.pid = 0;
+    check(syscall(SYS_capget, &header, NULL) == 0, "capget-v1-null-data");
+    check(header.version == CAP_VERSION_1, "capget-v1-header-unchanged");
+
+    /* The pid selector: 0 and self are the caller, a negative pid is EINVAL,
+     * and an unpublished pid is ESRCH (kernel/capability.c:110-125,149-156). */
+    memset(&header, 0, sizeof(header));
+    header.version = CAP_VERSION_3;
+    header.pid = self;
+    check(syscall(SYS_capget, &header, data) == 0, "capget-explicit-self");
+    errno = 0;
+    header.pid = -1;
+    check(syscall(SYS_capget, &header, data) == -1 && errno == EINVAL, "capget-negative-pid");
+    errno = 0;
+    header.pid = 0x7ffffff0;
+    check(syscall(SYS_capget, &header, data) == -1 && errno == ESRCH, "capget-unknown-pid");
+    mark("PID_SELECTOR_AND_ERRORS");
+
+    done();
+}
+
 int main(void) {
     ids_case();
     switch_case();
@@ -1115,6 +1412,9 @@ int main(void) {
     usage_case();
     personality_case();
     uts_case();
+    pgid_case();
+    setres_case();
+    capget_case();
 
     fflush(stdout);
     if (failures != 0) {

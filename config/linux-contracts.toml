@@ -7583,8 +7583,8 @@ status = "implemented"
 contract = "linux-getpgrp"
 handler = "kernel/src/syscall/dispatch.rs:compat_getpgrp"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full getpgrp raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7606,8 +7606,8 @@ status = "implemented"
 contract = "linux-setsid"
 handler = "kernel/src/syscall/task/job.rs:sys_setsid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full setsid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7629,8 +7629,8 @@ status = "implemented"
 contract = "linux-getpgid"
 handler = "kernel/src/syscall/task/job.rs:sys_getpgid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full getpgid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7652,8 +7652,8 @@ status = "implemented"
 contract = "linux-getsid"
 handler = "kernel/src/syscall/task/job.rs:sys_getsid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full getsid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7675,8 +7675,8 @@ status = "implemented"
 contract = "linux-setreuid"
 handler = "kernel/src/syscall/task/ctl.rs:sys_setreuid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full setreuid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7698,8 +7698,8 @@ status = "implemented"
 contract = "linux-setregid"
 handler = "kernel/src/syscall/task/ctl.rs:sys_setregid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full setregid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7721,8 +7721,8 @@ status = "implemented"
 contract = "linux-setresuid"
 handler = "kernel/src/syscall/task/ctl.rs:sys_setresuid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full setresuid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7744,8 +7744,8 @@ status = "implemented"
 contract = "linux-setresgid"
 handler = "kernel/src/syscall/task/ctl.rs:sys_setresgid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full setresgid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7767,8 +7767,8 @@ status = "implemented"
 contract = "linux-capget"
 handler = "kernel/src/syscall/task/ctl.rs:sys_capget"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full capget raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
