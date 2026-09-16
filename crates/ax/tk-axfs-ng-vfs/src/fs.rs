@@ -26,6 +26,10 @@ pub struct ExportHandle {
     pub bytes: Vec<u8>,
 }
 
+/// `FILEID_INO64_GEN`, the generic non-decodeable file id
+/// (include/linux/exportfs.h:104).
+pub const FILEID_INO64_GEN: i32 = 0x81;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportHandleMode {
     Openable,
@@ -74,14 +78,32 @@ pub trait FilesystemOps: Send + Sync {
     fn enumerate_inodes(&self, _visitor: &mut InodeVisitor<'_>) -> VfsResult<()> {
         Err(VfsError::OperationNotSupported)
     }
-    /// Exports a backend-validated inode generation.  The VFS deliberately
-    /// does not synthesize a handle from a pathname or a bare inode number.
+    /// Exports a backend-validated inode generation.
+    ///
+    /// A filesystem without export operations still has to satisfy
+    /// `AT_HANDLE_FID`: fs/exportfs/expfs.c:389-390 falls back to
+    /// `exportfs_encode_ino64_fid()` whenever the filesystem has no
+    /// `->encode_fh`, and include/linux/exportfs.h:322-325 admits exactly that
+    /// case (`!nop || nop->encode_fh`).  The generic record is the
+    /// non-decodeable `FILEID_INO64_GEN` pair `{u64 ino, u32 gen}`
+    /// (fs/exportfs/expfs.c:347-368, :344).  Decodeable handles are never
+    /// synthesized from a pathname or a bare inode number.
     fn encode_export_handle(
         &self,
-        _entry: &DirEntry,
-        _mode: ExportHandleMode,
+        entry: &DirEntry,
+        mode: ExportHandleMode,
     ) -> VfsResult<ExportHandle> {
-        Err(crate::VfsError::OperationNotSupported)
+        if mode != ExportHandleMode::Fid {
+            return Err(crate::VfsError::OperationNotSupported);
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(12).map_err(|_| VfsError::NoMemory)?;
+        bytes.extend_from_slice(&entry.inode().to_ne_bytes());
+        bytes.extend_from_slice(&(entry.object_key().generation as u32).to_ne_bytes());
+        Ok(ExportHandle {
+            handle_type: FILEID_INO64_GEN,
+            bytes,
+        })
     }
 
     /// Resolves a previously exported live inode generation.  `NotFound`
