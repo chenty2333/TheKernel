@@ -304,6 +304,10 @@ CONTRACTS.update({
     "ioperm": ("raw-differential", "pass", "RANGE_VALIDATION_IS_UNSIGNED GRANT_AND_REVOKE"),
 })
 
+CONTRACTS.update({
+    "vector-io": ("raw-differential", "pass", "POSITION_TRAVELS_IN_POS_L POS_H_IS_IGNORED OFFSET_HALVES_ARE_COMBINED IOVCNT_UIO_MAXIOV_BOUND ZERO_IOVCNT_SUCCEEDS OFFSET_BEFORE_DESCRIPTOR COPY_FILE_RANGE_FLAG_MASK COPY_FILE_RANGE_ZERO_LENGTH_SUCCEEDS COPY_FILE_RANGE_OVERLAP_EINVAL"),
+})
+
 PROGRAM_CASES = {
     "tty-job-control": ("tty-job-control",),
     "tty-termios": ("tty-termios",),
@@ -320,7 +324,7 @@ PROGRAM_CASES = {
     "socket-msg": ("socket_msg.send_flags", "socket_msg.sendmmsg_flags", "socket_msg.peek_waitall_tcp", "socket_msg.tcp_more", "socket_msg.compat_flag", "socket_msg.waitall_stream", "socket_msg.waitall_tcp", "socket_msg.waitall_datagram", "socket_msg.recvmmsg_deadline", "socket_msg.recvmmsg_waitforone"),
     "task-control": ("prctl-name", "prctl-timing", "prctl-auxv", "prctl-timer-restore-ids", "prctl-cfi", "arch_prctl", "iopl", "capset", "move_pages", "modify_ldt", "setpgid", "clone3", "ioperm"),
     "identity": ("identity-ids", "identity-switch", "identity-groups", "identity-fsids", "identity-limits", "identity-usage", "identity-personality", "identity-uts", "identity-pgid", "identity-setres", "identity-capget"),
-    "fs-abi": ("fs-basic", "fs-path", "getcwd", "fcntl", "syslog", "reboot", "ioctl", "mount", "umount2", "pipe2", "syncfs", "preadv2", "pwritev2", "fallocate-mode", "tee", "vmsplice", "readahead-types", "pidfd-send-signal", "ustat", "sysinfo", "uname", "splice", "fifo-times"),
+    "fs-abi": ("fs-basic", "fs-path", "getcwd", "fcntl", "syslog", "reboot", "ioctl", "mount", "umount2", "pipe2", "syncfs", "preadv2", "pwritev2", "fallocate-mode", "tee", "vmsplice", "readahead-types", "pidfd-send-signal", "ustat", "sysinfo", "uname", "splice", "fifo-times", "vector-io"),
     "epoll-membarrier": ("epoll-membarrier",),
     "socket-provider": ("socket_creation_order", "socket_unix_creation", "socket_netlink_creation", "socket_netlink_policy", "socket_address_lengths", "socket_name_record", "socket_sol_socket_table", "socket_netlink_option_table", "socket_null_operations"),
     "lsm-abi": ("lsm-self-attr",),
@@ -433,6 +437,7 @@ SYSCALL_CASES = {
     85: ("creat", "creat"), 95: ("umask", "umask"), 201: ("time", "time"),
     63: ("fs-abi", "uname"), 99: ("fs-abi", "sysinfo"),
     111: ("identity", "identity-pgid"),
+    295: ("fs-abi", "vector-io"), 296: ("fs-abi", "vector-io"), 326: ("fs-abi", "vector-io"),
     173: ("task-control", "ioperm"),
     256: ("mm-contracts", "migrate-pages"), 450: ("mm-contracts", "set-mempolicy-home-node"),
     429: ("mount-api", "mount-descriptors"),

@@ -29,6 +29,9 @@
 
 /* Native x86_64 UAPI, independent of the build host's libc headers. */
 #define NR_PIDFD_SEND_SIGNAL 424
+#define NR_PREADV 295
+#define NR_PWRITEV 296
+#define NR_COPY_FILE_RANGE 326
 #define NR_PREADV2 327
 #define NR_PWRITEV2 328
 #define NR_SYNC 162
@@ -2182,6 +2185,102 @@ int main(void) {
         check(unlinkat(pdir, "pren2", 0) == 0, "unlink-pren2");
         check(unlinkat(pdir, "pfile", 0) == 0, "unlink-pfile");
         check(close(pdir) == 0, "pdir-close");
+    }
+    done();
+
+    /* ------------------------------------------------------------------ *
+     * preadv(2) / pwritev(2) / copy_file_range(2)
+     *
+     * On x86_64 preadv and pwritev take the 64-bit file position as two
+     * 32-bit halves, and their only validation of the vector is the
+     * UIO_MAXIOV bound (fs/read_write.c).  copy_file_range() rejects every
+     * flag bit except COPY_FILE_SPLICE, refuses an overlapping copy inside
+     * one inode, and reports success for a zero length only after the file
+     * checks have run (fs/read_write.c:1553-1650, generic_copy_file_checks).
+     * ------------------------------------------------------------------ */
+    begin("vector-io.raw-differential");
+    {
+        struct iovec iov[2];
+        char lo[8], hi[8];
+        int vfd = openat(dirfd, "vector-io", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        check(vfd >= 0, "vector-file-open");
+        memset(lo, 'l', sizeof(lo));
+        memset(hi, 'h', sizeof(hi));
+        iov[0].iov_base = lo; iov[0].iov_len = sizeof(lo);
+        iov[1].iov_base = hi; iov[1].iov_len = sizeof(hi);
+
+        /* The halves are combined into one loff_t, so this writes and reads
+         * the same 16 bytes the plain writev/readv pair would. */
+        check(syscall(NR_PWRITEV, vfd, iov, 2, 0, 0) == 16, "pwritev-halves");
+        check(syscall(NR_PREADV, vfd, iov, 2, 0, 0) == 16, "preadv-halves");
+        mark("OFFSET_HALVES_ARE_COMBINED");
+
+        /* iovcnt is bounded before the descriptor is touched. */
+        ERROR(syscall(NR_PREADV, vfd, iov, 1025, 0, 0), EINVAL, "preadv-iovcnt");
+        ERROR(syscall(NR_PWRITEV, vfd, iov, 1025, 0, 0), EINVAL, "pwritev-iovcnt");
+        mark("IOVCNT_UIO_MAXIOV_BOUND");
+
+        check(syscall(NR_PREADV, vfd, iov, 0, 0, 0) == 0, "preadv-zero-iovcnt");
+        check(syscall(NR_PWRITEV, vfd, iov, 0, 0, 0) == 0, "pwritev-zero-iovcnt");
+        mark("ZERO_IOVCNT_SUCCEEDS");
+
+        /* A negative 64-bit offset is EINVAL and a bad descriptor is EBADF;
+         * the offset is checked first. */
+        /* The offset halves are `unsigned long`, so a caller passing an `int`
+         * leaves the upper register bits unspecified and the verdict is not
+         * part of the contract.  These use full-width literals. */
+        ERROR(syscall(NR_PREADV, vfd, iov, 1, -1L, -1L), EINVAL, "preadv-negative-offset");
+        ERROR(syscall(NR_PWRITEV, vfd, iov, 1, -1L, -1L), EINVAL, "pwritev-negative-offset");
+        ERROR(syscall(NR_PREADV, -1, iov, 1, 0, 0), EBADF, "preadv-bad-descriptor");
+        mark("OFFSET_BEFORE_DESCRIPTOR");
+
+        /* copy_file_range(2). */
+        ERROR(syscall(NR_COPY_FILE_RANGE, vfd, NULL, vfd, NULL, 8, 1), EINVAL,
+              "copy-flags-nonzero");
+        mark("COPY_FILE_RANGE_FLAG_MASK");
+
+        check(syscall(NR_COPY_FILE_RANGE, vfd, NULL, vfd, NULL, 0, 0) == 0,
+              "copy-zero-length");
+        mark("COPY_FILE_RANGE_ZERO_LENGTH_SUCCEEDS");
+
+        /* The same inode may not be copied onto itself with overlapping
+         * source and destination ranges. */
+        {
+            loff_t src = 0, dst = 4;
+            ERROR(syscall(NR_COPY_FILE_RANGE, vfd, &src, vfd, &dst, 8, 0), EINVAL,
+                  "copy-overlap");
+            mark("COPY_FILE_RANGE_OVERLAP_EINVAL");
+        }
+
+        /* Where the file position lives on x86_64.
+         *
+         * Linux's pos_from_hilo() is
+         *     ((loff_t)high << HALF_LONG_BITS) << HALF_LONG_BITS | low
+         * with HALF_LONG_BITS = BITS_PER_LONG / 2 = 32, so on a 64-bit long
+         * the double shift discards the high word entirely and the result is
+         * just `low`.  pos_h therefore contributes nothing and the whole
+         * 64-bit position travels in pos_l - which is what glibc relies on
+         * when it passes an `off_t` to preadv/pwritev.  A raw caller that
+         * splits the halves is read at pos_l, both on Linux 7.2.3 and here. */
+        {
+            int hfd = openat(dirfd, "vector-io-hi", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+            struct stat st;
+            check(hfd >= 0, "vector-io-hi-open");
+            check(syscall(NR_PWRITEV, hfd, iov, 1, 0, 1) == 8, "pos-h-write");
+            check(fstat(hfd, &st) == 0 && st.st_size == 8, "pos-h-ignored-for-size");
+            check(syscall(NR_PREADV, hfd, iov, 1, 0, 1) == 8, "pos-h-ignored-for-read");
+            mark("POS_H_IS_IGNORED");
+
+            /* The full 64-bit position really does survive in pos_l. */
+            check(syscall(NR_PWRITEV, hfd, iov, 1, 0x100000000LL, 0) == 8, "pos-l-write");
+            check(fstat(hfd, &st) == 0 && st.st_size == 0x100000008LL, "pos-l-carries-64-bits");
+            mark("POSITION_TRAVELS_IN_POS_L");
+            close(hfd);
+            unlinkat(dirfd, "vector-io-hi", 0);
+        }
+
+        close(vfd);
+        unlinkat(dirfd, "vector-io", 0);
     }
     done();
 

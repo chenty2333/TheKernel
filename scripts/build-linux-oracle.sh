@@ -10,6 +10,10 @@ TARBALL_NAME="linux-${LINUX_VERSION}.tar.xz"
 TARBALL_URL="https://cdn.kernel.org/pub/linux/kernel/v7.x/${TARBALL_NAME}"
 CONFIG="$REPO_ROOT/config/linux/${LINUX_VERSION}-q35-graphics.config"
 
+usage_config_hint() {
+    printf '  --config PATH        Kconfig fragment appended over defconfig\n' >&2
+}
+
 usage() {
     cat >&2 <<EOF
 usage: scripts/build-linux-oracle.sh [options]
@@ -34,8 +38,9 @@ while (($#)); do
         --cache) cache=${2:?}; shift 2 ;;
         --tarball) tarball=${2:?}; shift 2 ;;
         --output) output=${2:?}; shift 2 ;;
+        --config) CONFIG=${2:?}; shift 2 ;;
         --jobs) jobs=${2:?}; shift 2 ;;
-        -h|--help) usage ;;
+        -h|--help) usage_config_hint; usage ;;
         *) printf 'unknown option: %s\n' "$1" >&2; usage ;;
     esac
 done
