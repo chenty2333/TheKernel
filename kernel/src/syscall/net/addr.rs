@@ -8,8 +8,6 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-#[cfg(feature = "vsock")]
-use axnet::vsock::VsockAddr;
 use axnet::{SocketAddrEx, unix::UnixSocketAddr};
 use linux_raw_sys::net::*;
 use tk_linux_net::{UnixName as AbiUnixName, UnixSockAddr as AbiUnixSockAddr};
@@ -374,69 +372,6 @@ impl SocketAddrExt for UnixSocketAddr {
     }
 }
 
-// This type should be provided by linux_raw_sys but it's missing.
-// See https://github.com/sunfishcode/linux-raw-sys/issues/169
-#[cfg(feature = "vsock")]
-#[allow(non_camel_case_types)]
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct sockaddr_vm {
-    pub svm_family: __kernel_sa_family_t,
-    pub svm_reserved1: u16,
-    pub svm_port: u32,
-    pub svm_cid: u32,
-    pub svm_zero: [u8; 4],
-}
-
-#[cfg(feature = "vsock")]
-impl SocketAddrExt for VsockAddr {
-    fn read_from_user(
-        capability: &UserMemoryCapability,
-        addr: UserConstPtr<sockaddr>,
-        addrlen: socklen_t,
-    ) -> AxResult<Self> {
-        if addrlen != size_of::<sockaddr_vm>() as socklen_t {
-            return Err(AxError::InvalidInput);
-        }
-
-        let addr_vsock = unsafe {
-            capability
-                .read_value_uninit(addr.address().as_usize() as *const sockaddr_vm)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
-        if addr_vsock.svm_family as u32 != AF_VSOCK {
-            return Err(AxError::from(LinuxError::EAFNOSUPPORT));
-        }
-        Ok(VsockAddr {
-            cid: addr_vsock.svm_cid as _,
-            port: addr_vsock.svm_port,
-        })
-    }
-
-    fn write_to_user(
-        &self,
-        capability: &UserMemoryCapability,
-        addr: UserPtr<sockaddr>,
-        addrlen: &mut socklen_t,
-    ) -> AxResult<()> {
-        let sockvm_addr = sockaddr_vm {
-            svm_family: AF_VSOCK as _,
-            svm_reserved1: 0,
-            svm_port: self.port,
-            svm_cid: self.cid as _,
-            svm_zero: [0_u8; 4],
-        };
-        fill_addr(capability, addr, addrlen, unsafe {
-            cast_to_slice(&sockvm_addr)
-        })
-    }
-
-    fn family(&self) -> u16 {
-        AF_VSOCK as u16
-    }
-}
-
 impl SocketAddrExt for SocketAddrEx {
     fn read_from_user(
         capability: &UserMemoryCapability,
@@ -448,8 +383,6 @@ impl SocketAddrExt for SocketAddrEx {
                 SocketAddr::read_from_user(capability, addr, addrlen).map(Self::Ip)
             }
             AF_UNIX => UnixSocketAddr::read_from_user(capability, addr, addrlen).map(Self::Unix),
-            #[cfg(feature = "vsock")]
-            AF_VSOCK => VsockAddr::read_from_user(capability, addr, addrlen).map(Self::Vsock),
             _ => Err(AxError::from(LinuxError::EAFNOSUPPORT)),
         }
     }
@@ -463,8 +396,6 @@ impl SocketAddrExt for SocketAddrEx {
         match self {
             SocketAddrEx::Ip(ip_addr) => ip_addr.write_to_user(capability, addr, addrlen),
             SocketAddrEx::Unix(unix_addr) => unix_addr.write_to_user(capability, addr, addrlen),
-            #[cfg(feature = "vsock")]
-            SocketAddrEx::Vsock(vsock_addr) => vsock_addr.write_to_user(capability, addr, addrlen),
         }
     }
 

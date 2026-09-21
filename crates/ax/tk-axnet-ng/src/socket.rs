@@ -152,12 +152,14 @@ bitflags! {
         const DONT_WAIT = 0x04;
         // `MSG_OOB` has no bit here on purpose.  Linux gives the flag no
         // transport-neutral meaning: `tcp_recv_urg()` answers `-EINVAL` when no
-        // urgent byte is queued (`net/ipv4/tcp.c:1480-1483`), `udp_recvmsg()`
-        // never reads the bit (`:1917-1936`), and RAW, netlink and AF_UNIX
-        // datagram refuse it with `-EOPNOTSUPP`.  The socket layer therefore
-        // resolves the flag from the concrete transport before a receive
-        // reaches this interface, so a transport can never be asked to invent
-        // an answer of its own.
+        // urgent byte is queued (`net/ipv4/tcp.c:1483-1485`), `udp_recvmsg()`
+        // never reads it at all — the only `MSG_OOB` test in `net/ipv4/udp.c` is
+        // on the send side (`:1260-1261`) — and RAW, netlink and AF_UNIX
+        // datagram refuse it with `-EOPNOTSUPP` (`net/ipv4/raw.c:758-759`,
+        // `net/netlink/af_netlink.c:1917-1918`, `net/unix/af_unix.c:2573-2575`).
+        // The socket layer therefore resolves the flag from the concrete
+        // transport before a receive reaches this interface, so a transport can
+        // never be asked to invent an answer of its own.
     }
 }
 

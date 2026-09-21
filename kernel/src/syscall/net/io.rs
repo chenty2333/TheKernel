@@ -575,11 +575,13 @@ impl ValidatedRecvFlags {
 ///
 /// Linux has no socket-layer receive allow-list: `__sys_recvfrom()`
 /// (`net/socket.c:2293-2302`) and `____sys_recvmsg()` (`:2895-2904`) hand
-/// `flags` to the protocol unchanged, and each protocol ignores the bits it does
-/// not consume — `udp_recvmsg()` looks only at `MSG_ERRQUEUE`, `MSG_PEEK` and
-/// `MSG_DONTWAIT` (`net/ipv4/udp.c:1917-1936`), and `tcp_recvmsg_locked()` only
-/// at `MSG_OOB`, `MSG_PEEK`, `MSG_WAITALL`, `MSG_TRUNC`, `MSG_ERRQUEUE` and
-/// `MSG_DONTWAIT` (`net/ipv4/tcp.c:2680-2704`).  Bits that no layer knows are
+/// `flags` to the protocol unchanged, and each protocol reads only the bits it
+/// consumes: `udp_recvmsg()` tests `MSG_PEEK`, `MSG_ERRQUEUE` and `MSG_TRUNC`
+/// (`net/ipv4/udp.c:2031-2131`) and leaves `MSG_DONTWAIT` to
+/// `__skb_recv_udp()` (`:1933`), while `tcp_recvmsg_locked()` tests
+/// `MSG_DONTWAIT`, `MSG_OOB`, `MSG_PEEK` and `MSG_WAITALL`
+/// (`net/ipv4/tcp.c:2678-2706`), `MSG_TRUNC` in the copy path (`:2834`) and
+/// `MSG_SOCK_DEVMEM` in the devmem path (`:2849`).  Bits that no layer knows are
 /// therefore accepted and ignored; the one bit whose *meaning* is per-transport,
 /// `MSG_OOB`, is answered by [`check_msg_oob`] once the transport is known.
 ///
@@ -614,7 +616,7 @@ fn msg_oob_transport(socket: &AxSocket) -> tk_linux_net::MsgOobTransport {
         AxSocket::Udp(_) => tk_linux_net::MsgOobTransport::Udp,
         AxSocket::Raw(_) => tk_linux_net::MsgOobTransport::Raw,
         // `unix_seqpacket_sendmsg()`/`unix_seqpacket_recvmsg()` are thin
-        // wrappers over the datagram pair (`net/unix/af_unix.c:2541-2551`), so
+        // wrappers over the datagram pair (`net/unix/af_unix.c:2522-2550`), so
         // both record-oriented AF_UNIX types share its `MSG_OOB` answer.
         AxSocket::Unix(unix) if unix.is_datagram() || unix.is_seqpacket() => {
             tk_linux_net::MsgOobTransport::UnixDatagram
@@ -625,8 +627,6 @@ fn msg_oob_transport(socket: &AxSocket) -> tk_linux_net::MsgOobTransport {
         // are absent from the tree, so there is no reference answer to copy.
         // This transport keeps the pre-existing `EOPNOTSUPP`.
         AxSocket::Dccp(_) => tk_linux_net::MsgOobTransport::UnixDatagram,
-        #[cfg(feature = "vsock")]
-        AxSocket::Vsock(_) => tk_linux_net::MsgOobTransport::Vsock,
     }
 }
 
@@ -1305,9 +1305,7 @@ fn send_impl(
     // address admission and before the transport sees the payload.
     super::socket::check_landlock_sendmsg(&socket.inner, network_addr.as_ref())?;
     if matches!(&socket.inner, AxSocket::Udp(_)) && src.remaining() > axnet::udp::MAX_UDP_SEND_LEN {
-        return Err(socket_failure(
-            tk_linux_net::SocketFailure::MessageTooLarge,
-        ));
+        return Err(socket_failure(tk_linux_net::SocketFailure::MessageTooLarge));
     }
     // The per-protocol `MSG_OOB` answer.  `udp_sendmsg()` tests the bit only
     // after its `len > 0xFFFF` bound (`net/ipv4/udp.c:1254-1261`), and every
@@ -1345,10 +1343,10 @@ fn send_impl(
                 Some(SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
                     let security = VfsSecurityContext::new(snapshot.actor().clone());
                     let target = crate::file::unix_socket::resolve_peer(
-                path.clone(),
-                &security,
-                crate::file::unix_socket::UnixPeerKind::of(unix),
-            )?;
+                        path.clone(),
+                        &security,
+                        crate::file::unix_socket::UnixPeerKind::of(unix),
+                    )?;
                     unix.prepare_send_to_resolved(options, target)
                         .map_err(|error| map_socket_send_error(&socket.inner, error))?
                 }
@@ -1616,7 +1614,10 @@ enum ReceivedSocketAddress {
     /// are ignored on connected socket." (`net/ipv4/tcp.c:2910-2912`).
     Unspecified,
     Network(SocketAddrEx),
-    Netlink { pid: u32, groups: u32 },
+    Netlink {
+        pid: u32,
+        groups: u32,
+    },
     Packet(tk_linux_packet::SockAddrLl),
 }
 
@@ -1792,7 +1793,7 @@ fn recv_impl(
     // before it locks the socket — `if (unlikely(flags & MSG_ERRQUEUE)) return
     // inet_recv_error(sk, msg, len);` (`net/ipv4/tcp.c:2930-2936`) — so TCP
     // answers the error queue first; `udp_recvmsg()` is the same
-    // (`net/ipv4/udp.c:1984-1986`) but never reads `MSG_OOB` at all.  Every other
+    // (`net/ipv4/udp.c:2041-2042`) but never reads `MSG_OOB` at all.  Every other
     // protocol that refuses `MSG_OOB` has no error queue to divert to and tests
     // the bit first (`net/ipv4/raw.c:758-761`, `net/unix/af_unix.c:2574`,
     // `:2930`, `net/netlink/af_netlink.c:1917`), so its refusal must not be
@@ -1854,7 +1855,7 @@ fn recv_impl(
         }
         return Ok(ReceiveOutcome {
             returned_len: recv.len as isize,
-            message_truncated: false,
+            message_truncated: recv.truncated,
             message_eor: false,
             control_truncated,
             address: want_address.then_some(ReceivedSocketAddress::Netlink {
@@ -1908,13 +1909,13 @@ fn recv_impl(
     // `__sys_recvfrom()` starts from a zeroed `struct msghdr` — the only field
     // it sets is `.msg_name`, so `msg_namelen` is 0 before the protocol runs
     // (`net/socket.c:2277-2286`) — and `____sys_recvmsg()` spells that out with
-    // `msg_sys->msg_namelen = 0;` (`net/socket.c:2886-2893`).  The protocols
+    // `msg_sys->msg_namelen = 0;` (`net/socket.c:2891-2896`).  The protocols
     // that store the sender all key on that pointer rather than on the length:
     // udp_recvmsg(), raw_recvmsg(), sctp_recvmsg(), netlink_recvmsg(),
     // packet_recvmsg() and unix_dgram_recvmsg() (`net/ipv4/udp.c:2094-2101`,
     // `net/ipv4/raw.c:784-790`, `net/sctp/socket.c:2153-2155`,
     // `net/netlink/af_netlink.c:1958-1966`,
-    // `net/packet/af_packet.c:3521-3544`, `net/unix/af_unix.c:2550-2557`).
+    // `net/packet/af_packet.c:3521-3544`, `net/unix/af_unix.c:2552-2560`).
     // `tcp_recvmsg_locked()` documents the opposite — "According to UNIX98,
     // msg_name/msg_namelen are ignored on connected socket."
     // (`net/ipv4/tcp.c:2910-2912`) — and `unix_stream_read_generic()` never
@@ -2070,7 +2071,10 @@ fn recv_impl(
     // assigns it unconditionally, so an untouched slot means "no name"
     // (`net/socket.c:2277-2302`).
     let address = want_address.then(|| {
-        remote_addr.map_or(ReceivedSocketAddress::Unspecified, ReceivedSocketAddress::Network)
+        remote_addr.map_or(
+            ReceivedSocketAddress::Unspecified,
+            ReceivedSocketAddress::Network,
+        )
     });
     Ok(ReceiveOutcome {
         returned_len: recv as isize,
@@ -3145,8 +3149,9 @@ mod tests {
 
     #[test]
     fn msg_oob_is_a_transport_answer_the_socket_layer_never_owns() {
-        use tk_linux_net::{MessageDirection, MsgOobTransport, NO_URGENT_DATA_ERRNO,
-            OOB_NOT_SUPPORTED_ERRNO};
+        use tk_linux_net::{
+            MessageDirection, MsgOobTransport, NO_URGENT_DATA_ERRNO, OOB_NOT_SUPPORTED_ERRNO,
+        };
 
         // `____sys_sendmsg()` substitutes the call flags for the per-message
         // word and has no `MSG_OOB` rule (`net/socket.c:2666-2684`), so the bit

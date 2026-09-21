@@ -74,6 +74,7 @@ pub const MSG_INTERNAL_SENDMSG_FLAGS: u32 =
 /// bits it does not use, but AF_PACKET alone tests an allow-list before doing
 /// anything else:
 ///
+/// Excerpt: Linux v7.2.3 `net/packet/af_packet.c:3452-3454` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 /// 	err = -EINVAL;
 /// 	if (flags & ~(MSG_PEEK|MSG_DONTWAIT|MSG_TRUNC|MSG_CMSG_COMPAT|MSG_ERRQUEUE))
@@ -134,7 +135,7 @@ pub enum MessageDirection {
     Receive,
 }
 
-/// `tcp_recv_urg()`'s "no URG data to read" answer, `net/ipv4/tcp.c:1480-1483`.
+/// `tcp_recv_urg()`'s "no URG data to read" answer, `net/ipv4/tcp.c:1483-1485`.
 pub const NO_URGENT_DATA_ERRNO: i32 = 22;
 /// `udp_sendmsg()`'s "Mirror BSD error message compatibility" answer,
 /// `net/ipv4/udp.c:1259-1261`.
@@ -150,22 +151,24 @@ pub const OOB_NOT_SUPPORTED_ERRNO: i32 = 95;
 ///   (`net/ipv4/tcp.c:715-718`), so the octets are sent.  On receive the bit is
 ///   diverted before the copy loop,
 ///
+///   Excerpt: Linux v7.2.3 `net/ipv4/tcp.c:2680-2682` — GPL-2.0-only, (C) The Linux Kernel Authors
 ///   ```c
 ///   	/* Urgent data needs to be handled specially. */
 ///   	if (flags & MSG_OOB)
 ///   		goto recv_urg;
 ///   ```
 ///
-///   (`net/ipv4/tcp.c:2679-2681`), and `tcp_recv_urg()` answers `-EINVAL`
+///   (`net/ipv4/tcp.c:2680-2682`), and `tcp_recv_urg()` answers `-EINVAL`
 ///   whenever no urgent byte is pending:
 ///
+///   Excerpt: Linux v7.2.3 `net/ipv4/tcp.c:1483-1485` — GPL-2.0-only, (C) The Linux Kernel Authors
 ///   ```c
 ///   	if (sock_flag(sk, SOCK_URGINLINE) || !tp->urg_data ||
 ///   	    tp->urg_data == TCP_URG_READ)
 ///   		return -EINVAL;	/* Yes this is right ! */
 ///   ```
 ///
-///   (`net/ipv4/tcp.c:1480-1483`).
+///   (`net/ipv4/tcp.c:1483-1485`).
 /// * UDP rejects it on send (`net/ipv4/udp.c:1259-1261`) and never tests it on
 ///   receive, so `udp_recvmsg()` delivers the datagram normally.
 /// * RAW rejects it in both directions (`net/ipv4/raw.c:517`, `:758`).
@@ -352,9 +355,10 @@ pub const fn waitall_continues(step: ReceiveStep, copied: usize, requested: usiz
     }
 }
 
-/// `sock_rcvlowat()` (`include/net/sock.h:735-741`): the number of octets a
+/// `sock_rcvlowat()` (`include/net/sock.h:2749-2754`): the number of octets a
 /// stream receive must have copied before it may stop waiting.
 ///
+/// Excerpt: Linux v7.2.3 `include/net/sock.h:2751-2753` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 /// 	int v = waitall ? len : min_t(int, READ_ONCE(sk->sk_rcvlowat), len);
 /// 	return v ?: 1;
@@ -584,7 +588,7 @@ mod tests {
 
         // TCP consumes MSG_OOB on send (`net/ipv4/tcp.c:715-718`) and answers
         // `tcp_recv_urg()`'s -EINVAL when no urgent byte is pending
-        // (`net/ipv4/tcp.c:1480-1483`).
+        // (`net/ipv4/tcp.c:1483-1485`).
         assert_eq!(msg_oob_errno(Tcp, Send, false), None);
         assert_eq!(msg_oob_errno(Tcp, Receive, false), Some(22));
 

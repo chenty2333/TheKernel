@@ -3,8 +3,6 @@ use core::mem::size_of;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::NodePermission;
-#[cfg(feature = "vsock")]
-use axnet::vsock::{VsockSocket, VsockStreamTransport};
 use axnet::{
     MAX_LISTEN_BACKLOG, Shutdown, Socket as SocketInner, SocketAddrEx, SocketOps,
     dccp::DccpSocket,
@@ -43,9 +41,9 @@ use crate::{
         NetworkNamespace, ns_capable,
         security::{
             LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_BIND_UDP,
-            LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP, LANDLOCK_ACCESS_NET_CONNECT_TCP, SocketCreateSpec,
-            SocketListenBacklog, SocketSecurityContext, check_current_landlock_net_port,
-            dispatch_socket,
+            LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP, LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            SocketCreateSpec, SocketListenBacklog, SocketSecurityContext,
+            check_current_landlock_net_port, dispatch_socket,
         },
     },
 };
@@ -203,8 +201,6 @@ pub(super) fn validate_network_address(socket: &SocketInner, address: &SocketAdd
             udp.family().accepts_socket_addr(*address)
         }
         (SocketInner::Unix(_), SocketAddrEx::Unix(_)) => true,
-        #[cfg(feature = "vsock")]
-        (SocketInner::Vsock(_), SocketAddrEx::Vsock(_)) => true,
         _ => false,
     };
     supported
@@ -721,10 +717,6 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             SeqPacketTransport::new()?,
             net_stack.unix_namespace(),
         )),
-        #[cfg(feature = "vsock")]
-        (AF_VSOCK, SOCK_STREAM) => {
-            SocketInner::Vsock(VsockSocket::new(VsockStreamTransport::new()))
-        }
         (AF_INET, _) | (AF_INET6, _) | (AF_UNIX, _) | (AF_VSOCK, _) => {
             warn!("Unsupported socket type: domain: {domain}, ty: {ty}");
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
@@ -1263,8 +1255,7 @@ fn unix_autobind(unix: &UnixSocket, owner: &Arc<FileDescription>) -> AxResult<()
     if unix.is_bound() {
         return Ok(());
     }
-    let mut ordernum =
-        unix_autobind_seed() & tk_linux_net::UNIX_AUTOBIND_ORDERNUM_MASK;
+    let mut ordernum = unix_autobind_seed() & tk_linux_net::UNIX_AUTOBIND_ORDERNUM_MASK;
     let lastnum = ordernum;
     loop {
         ordernum = (ordernum + 1) & tk_linux_net::UNIX_AUTOBIND_ORDERNUM_MASK;
@@ -1289,6 +1280,15 @@ fn unix_autobind(unix: &UnixSocket, owner: &Arc<FileDescription>) -> AxResult<()
                     // Every name in the 20-bit space is taken.
                     return Err(LinuxError::ENOSPC.into());
                 }
+            }
+            Err(error @ AxError::InvalidInput) => {
+                // A concurrent bind won the race between the is_bound() check
+                // and the reservation; Linux's `if (u->addr) goto out;` makes
+                // the loser report success too.
+                if unix.is_bound() {
+                    return Ok(());
+                }
+                return Err(error);
             }
             Err(error) => return Err(error),
         }
@@ -1386,10 +1386,8 @@ pub fn sys_accept4(
         // `newsock` first.  Preserve that policy ordering without
         // allocating/subscribing an endpoint which can never be published.
         // AF_ALG is absent here because `alg_proto_ops.accept` is real.
-        let bare_ref = BareAcceptedSocketSecurityRef::new(
-            pinned.backend()?,
-            listening_ref.net_namespace(),
-        );
+        let bare_ref =
+            BareAcceptedSocketSecurityRef::new(pinned.backend()?, listening_ref.net_namespace());
         let accepted_ref = AcceptedSocketSecurityRef::Bare(bare_ref);
         dispatch_socket(&SocketSecurityContext::accept(
             actor,
@@ -1804,7 +1802,12 @@ mod tests {
         );
         // Zero, `tk_linux_net::SOCK_RDM` and `SOCK_PACKET` are all in range; only a family's
         // own `create` hook may refuse them.
-        for admitted in [0, tk_linux_net::SOCK_RDM, SOCK_SEQPACKET, tk_linux_net::SOCK_PACKET] {
+        for admitted in [
+            0,
+            tk_linux_net::SOCK_RDM,
+            SOCK_SEQPACKET,
+            tk_linux_net::SOCK_PACKET,
+        ] {
             assert!(validate_socket_type_range(admitted).is_ok());
         }
     }

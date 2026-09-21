@@ -666,16 +666,17 @@ impl SocketOps for TcpSocket {
         if self.tx_closed.load(Ordering::Acquire) {
             return Err(AxError::BrokenPipe);
         }
-        // Linux `tcp_sendmsg_locked()` pushes the write queue on entry to the
-        // send with `flags & ~MSG_MORE`, which is what releases a cork left by
-        // an earlier `MSG_MORE` send.  `tcp_push()` then marks the tail segment
-        // for transmission, so the merged buffer leaves as one transmission
-        // instead of the previous partial one being flushed first.
-        let uncork = self
-            .send_corked
-            .swap(options.flags.contains(SendFlags::MORE), Ordering::AcqRel);
+        // Linux `tcp_sendmsg_locked()` pushes the write queue on the copy path
+        // with `flags & ~MSG_MORE`, which is what releases a cork left by an
+        // earlier `MSG_MORE` send; a send that fails before copying any bytes
+        // (EAGAIN, pending error) keeps the cork in place.  `tcp_push()` then
+        // marks the tail segment for transmission, so the merged buffer leaves
+        // as one transmission instead of the previous partial one being
+        // flushed first.
+        let more = options.flags.contains(SendFlags::MORE);
         self.general
             .send_poller_with_effective_nonblocking(self, effective_nonblocking, || {
+                let uncork = self.send_corked.load(Ordering::Acquire);
                 if !uncork {
                     self.stack.poll_interfaces();
                 }
@@ -700,8 +701,11 @@ impl SocketOps for TcpSocket {
                         Ok(len)
                     }
                 });
-                if uncork {
-                    self.stack.poll_interfaces();
+                if matches!(sent, Ok(len) if len > 0) {
+                    self.send_corked.store(more, Ordering::Release);
+                    if uncork {
+                        self.stack.poll_interfaces();
+                    }
                 }
                 sent
             })

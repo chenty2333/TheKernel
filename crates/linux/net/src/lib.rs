@@ -323,13 +323,14 @@ pub const SOCKADDR_STORAGE_LEN: usize = 128;
 /// `net/socket.c:move_addr_to_kernel()` bounds every socket address argument
 /// before the protocol is reached:
 ///
+/// Excerpt: Linux v7.2.3 `net/socket.c:251-252` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 /// 	if (ulen < 0 || ulen > sizeof(struct sockaddr_storage))
 /// 		return -EINVAL;
 /// ```
 ///
 /// `__sys_bind` calls it at `net/socket.c:1947` after the descriptor lookup,
-/// `__sys_connect` at `:2003` and `__sys_sendto` at `:2242`; the upper bound is
+/// `__sys_connect` at `:2150` and `__sys_sendto` at `:2242`; the upper bound is
 /// therefore generic socket-layer state and not a family rule. `addrlen` is a
 /// signed `int` on those paths, so `(socklen_t)-1` is the negative length that
 /// this rejects rather than a 4 GiB buffer.
@@ -361,6 +362,7 @@ pub const fn option_length_admitted(optlen: u32) -> bool {
 /// The interface-name import of `sock_setbindtodevice()`
 /// (`net/core/sock.c:689-701`):
 ///
+/// Excerpt: Linux v7.2.3 `net/core/sock.c:686-701` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 /// 	ret = -EINVAL;
 /// 	if (optlen < 0)
@@ -409,6 +411,7 @@ pub const fn bound_device_get_length_admitted(len: i32) -> bool {
 
 /// `sock_bindtoindex_locked()`'s capability rule (`net/core/sock.c:641-643`):
 ///
+/// Excerpt: Linux v7.2.3 `net/core/sock.c:641-643` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 /// 	ret = -EPERM;
 /// 	if (sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW))
@@ -484,6 +487,7 @@ pub fn unix_autobind_name(ordernum: u32) -> [u8; UNIX_AUTOBIND_PATH_LEN] {
 /// Whether `addrlen` is the family-only AF_UNIX address that `unix_bind()`
 /// turns into an autobind request:
 ///
+/// Excerpt: Linux v7.2.3 `net/unix/af_unix.c:1468-1470` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 /// 	if (addr_len == offsetof(struct sockaddr_un, sun_path) &&
 /// 	    sunaddr->sun_family == AF_UNIX)
@@ -628,6 +632,7 @@ pub const RTNLGRP_IPV6_MROUTE_R: u32 = 31;
 /// requested group from `NETLINK_ADD_MEMBERSHIP`.  `rtnetlink_bind` is the only
 /// hook that gates a group of an endpoint TheKernel models:
 ///
+/// Excerpt: Linux v7.2.3 `net/core/rtnetlink.c:7109-7112` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 ///     case RTNLGRP_IPV4_MROUTE_R:
 ///     case RTNLGRP_IPV6_MROUTE_R:
@@ -953,6 +958,7 @@ pub enum SocketTimeoutError {
 /// jiffies `sk_rcvtimeo`/`sk_sndtimeo` store
 /// (`net/core/sock.c:426-457`):
 ///
+/// Excerpt: Linux v7.2.3 `net/core/sock.c:436-453` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 /// 	if (tv.tv_usec < 0 || tv.tv_usec >= USEC_PER_SEC)
 /// 		return -EDOM;
@@ -1044,6 +1050,7 @@ pub enum NetlinkWriteAdmission {
 ///
 /// Linux v7.2.3 `net/netlink/af_netlink.c:1868-1873`:
 ///
+/// Excerpt: Linux v7.2.3 `net/netlink/af_netlink.c:1872-1873` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 /// 	if (len > sk->sk_sndbuf - 32)
 /// 		goto out;
@@ -1097,8 +1104,10 @@ pub enum NetlinkQueueAdmission {
 /// Linux v7.2.3 `net/netlink/af_netlink.c:1210-1232` (unicast,
 /// `netlink_attachskb`) and `:1389-1407` (multicast,
 /// `netlink_broadcast_deliver`) both admit against the *receiving* socket's
-/// `sk_rcvbuf`:
+/// `sk_rcvbuf`.  The hunk below is the unicast form; the multicast body is the
+/// same test with `sk_rcvbuf` cached in a local:
 ///
+/// Excerpt: Linux v7.2.3 `net/netlink/af_netlink.c:1218-1224` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```c
 /// 	rmem = atomic_add_return(skb->truesize, &sk->sk_rmem_alloc);
 ///

@@ -850,8 +850,9 @@ impl SocketOps for UdpSocket {
         let flags = options.flags;
         let mut sender_output = options.from;
         // `MSG_OOB` is ignored by `udp_recvmsg()`: the flag reaches the
-        // `MSG_ERRQUEUE`/`MSG_PEEK`/`MSG_DONTWAIT` tests and nothing else
-        // (`net/ipv4/udp.c:1917-1936`), so the datagram is delivered normally.
+        // `MSG_ERRQUEUE`/`MSG_PEEK`/`MSG_TRUNC` tests, `__skb_recv_udp()`'s
+        // `MSG_DONTWAIT`, and nothing else (`net/ipv4/udp.c:2031-2131`), so the
+        // datagram is delivered normally.
 
         self.general
             .recv_poller_with_effective_nonblocking(self, effective_nonblocking, || {
@@ -973,7 +974,7 @@ impl Drop for UdpSocket {
     fn drop(&mut self) {
         // `udp_destroy_sock()` runs `udp_flush_pending_frames()`: a datagram
         // still corked by `MSG_MORE` is discarded rather than sent short
-        // (`net/ipv4/udp.c:1756-1757`).
+        // (`net/ipv4/udp.c:2829-2837`, `:1009-1018`).
         drop(self.cork.lock().take());
         self.with_smol_socket(|socket| socket.close());
         self.stack.socket_set.remove(self.handle);

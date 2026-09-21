@@ -214,12 +214,24 @@ pub(crate) fn acquire_iptables_output_permit(
     Ok(IptablesOutputPermit { _private: () })
 }
 
+/// NOWAIT-route counterpart of [`acquire_iptables_output_permit`].
+///
+/// This deliberately takes the same blocking `IPTABLES.lock()` as the
+/// ordinary route.  Linux traverses the OUTPUT hook chain entirely on the
+/// RCU read side -- `nf_hook_slow()` documents "Caller must hold
+/// rcu_read_lock" (`net/netfilter/core.c:611-612`) and `ipt_do_table()`
+/// serializes with nothing heavier than `local_bh_disable()`
+/// (`net/ipv4/netfilter/ip_tables.c:223,258`) -- so hook traversal has no
+/// EAGAIN outcome at all, not even for MSG_DONTWAIT.  Reporting policy-table
+/// contention as `WouldBlock` invented an errno Linux never produces here,
+/// and on a real multi-core machine concurrent senders hit it routinely.
+/// `IPTABLES` is a `spin::Mutex`, so `lock()` spins and never sleeps; the
+/// verdict is computed and the guard released before this function returns,
+/// so no NOWAIT caller can sleep behind it either.
 pub(crate) fn try_acquire_iptables_output_permit(
     namespace: &Arc<crate::task::NetworkNamespace>,
 ) -> AxResult<IptablesOutputPermit> {
-    let mut tables = IPTABLES.try_lock().ok_or(AxError::WouldBlock)?;
-    verify_iptables_hook(&mut tables, namespace, 3)?;
-    Ok(IptablesOutputPermit { _private: () })
+    acquire_iptables_output_permit(namespace)
 }
 
 fn socket_option_errno(error: SocketOptionErrno) -> AxError {
@@ -937,11 +949,16 @@ pub(crate) fn iptables_output_verdict(
     iptables_hook_verdict(namespace, 3)
 }
 
+/// NOWAIT-route OUTPUT verdict.
+///
+/// Takes the blocking `IPTABLES.lock()` for the same reason as
+/// [`try_acquire_iptables_output_permit`]: netfilter hook traversal is an
+/// RCU read-side walk in Linux and has no EAGAIN outcome, so table-lock
+/// contention must not surface to userspace as one.
 pub(crate) fn iptables_output_verdict_nowait(
     namespace: &Arc<crate::task::NetworkNamespace>,
 ) -> AxResult<()> {
-    let mut tables = IPTABLES.try_lock().ok_or(AxError::WouldBlock)?;
-    verify_iptables_hook(&mut tables, namespace, 3)
+    iptables_output_verdict(namespace)
 }
 
 /// Execute one installed legacy iptables hook.  `hook_entry` and `underflow`
@@ -2416,6 +2433,31 @@ mod tests {
             packet_sol_socket_value(PacketSocketType::Raw, SO_RCVBUF).map_err(errno),
             Err(LinuxError::ENOPROTOOPT)
         );
+    }
+
+    /// The NOWAIT OUTPUT routes must never invent EAGAIN.
+    ///
+    /// Linux walks the netfilter OUTPUT chain on the RCU read side
+    /// (`net/netfilter/core.c:611-612`, `net/ipv4/netfilter/ip_tables.c:258`),
+    /// so hook traversal has no EAGAIN outcome for any caller, MSG_DONTWAIT
+    /// included.  These entry points previously reported `WouldBlock` when the
+    /// global policy mutex happened to be held, which surfaced to userspace as
+    /// a spurious EAGAIN from `sendto()` on a multi-core machine.  They must
+    /// now agree with their blocking siblings exactly.
+    #[test]
+    fn nowait_output_admission_never_reports_would_block() {
+        let owner = crate::task::UserNamespace::try_new_root().unwrap();
+        let namespace = crate::task::NetworkNamespace::try_new_loopback_only(owner).unwrap();
+
+        let blocking_permit = acquire_iptables_output_permit(&namespace).map(|_| ());
+        let nowait_permit = try_acquire_iptables_output_permit(&namespace).map(|_| ());
+        assert_ne!(nowait_permit, Err(AxError::WouldBlock));
+        assert_eq!(nowait_permit, blocking_permit);
+
+        let blocking_verdict = iptables_output_verdict(&namespace);
+        let nowait_verdict = iptables_output_verdict_nowait(&namespace);
+        assert_ne!(nowait_verdict, Err(AxError::WouldBlock));
+        assert_eq!(nowait_verdict, blocking_verdict);
     }
 
     #[test]
