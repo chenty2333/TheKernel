@@ -1424,10 +1424,7 @@ pub fn sys_clock_settime<M: UserMemory + ?Sized>(
     // `clockid_to_kclock()` sends every negative id to `clock_posix_cpu` unless
     // bits 2..0 are all set, which selects `clock_posix_dynamic`
     // (`kernel/time/posix-timers.c:1541-1554`).  Both carry a `.clock_set`, so
-    // neither is refused before the copy-in; a dynamic clock that names no open
-    // descriptor is EINVAL afterwards, which `decode_cpu_clock_id` already
-    // reports for a CLOCKFD encoding
-    // (`posix_clock_ioctl()`, `kernel/time/posix-clock.c:230-250`).
+    // neither is refused before the copy-in.
     let cpu_clock = decode_cpu_clock_id(clock_id);
     if clock_id < 0 && (clock_id & CLOCKFD_MASK) != CLOCKFD && cpu_clock.is_none() {
         return Err(AxError::InvalidInput);
@@ -1438,6 +1435,13 @@ pub fn sys_clock_settime<M: UserMemory + ?Sized>(
             .assume_init()
     }
     .try_into_time_value()?;
+    // `pc_clock_settime()` checks the timespec strictly, then fails in
+    // `get_clock_desc()` with EINVAL because TheKernel has no posix-clock
+    // devices (`kernel/time/posix-clock.c:197-215,286-297`).  That path never
+    // tests CAP_SYS_TIME and never reaches CLOCK_REALTIME.
+    if clock_id < 0 && (clock_id & CLOCKFD_MASK) == CLOCKFD {
+        return Err(AxError::InvalidInput);
+    }
     if cpu_clock.is_some() {
         // `posix_cpu_clock_set()` runs the permission lookup and then refuses
         // with EPERM; it never reads the timespec, because `clock_settime(2)`
