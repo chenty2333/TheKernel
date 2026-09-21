@@ -119,11 +119,10 @@ pub enum IoUringError {
     /// A copied io_uring registration header or argument is malformed.
     InvalidRegistration,
     /// A copied registration record's `offset + nr_args` overflowed, which
-    /// Linux reports as `-EOVERFLOW` (`io_uring/rsrc.c:426-428`).
+    /// Linux reports as `-EOVERFLOW` (`io_uring/rsrc.c:428-429`).
     RegistrationRangeOverflow,
-    /// A copied registration record held a field Linux rejects with
-    /// `-EFAULT`, such as a non-zero reserved word
-    /// (`io_uring/zcrx.c:1434-1435`).
+    /// A copied registration record held a field Linux rejects with `-EFAULT`,
+    /// such as a non-zero reserved word (`io_uring/zcrx.c:1438-1439`).
     RegistrationFault,
     /// A registration opcode is known but not implemented by this profile.
     UnsupportedRegistration,

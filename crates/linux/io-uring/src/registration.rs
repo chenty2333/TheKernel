@@ -134,7 +134,7 @@ pub enum RegistrationOperation {
     EnableRings,
     /// An empty `REGISTER_QUERY` chain: `io_query()` walks a NULL head and
     /// returns zero without touching either argument
-    /// (`io_uring/query.c:125-131`).
+    /// (`io_uring/query.c:136-151`).
     QueryEmpty,
     /// A Linux-valid registration opcode whose body this profile cannot
     /// service.  The adapter applies `UnsupportedRegistration`'s pre-body
@@ -194,7 +194,7 @@ impl UnsupportedRegistration {
         match self.header {
             // `io_zcrx_ctrl()` looks the validated record's `zcrx_id` up in
             // the ring's zcrx context array and reports -ENXIO when the id is
-            // absent (`io_uring/zcrx.c:1437-1439`).  Only
+            // absent (`io_uring/zcrx.c:1441-1443`).  Only
             // `IORING_REGISTER_ZCRX_IFQ` can populate that array
             // (`io_uring/zcrx.c:884-895`), and this profile refuses it, so
             // every validated control request names an unknown id.
@@ -229,13 +229,13 @@ pub enum RegistrationHeader {
     /// (`io_uring/rsrc.c:439-453`).
     RsrcUpdate,
     /// `struct io_uring_rsrc_register`, copied by `io_register_rsrc()` after
-    /// its `nr_args` size check (`io_uring/rsrc.c:395-418`).
+    /// its `nr_args` size check (`io_uring/rsrc.c:469-484`).
     RsrcRegister,
     /// `struct io_uring_rsrc_update2`, copied by `io_register_rsrc_update()`
-    /// after its `nr_args` size check (`io_uring/rsrc.c:420-437`).
+    /// after its `nr_args` size check (`io_uring/rsrc.c:455-467`).
     RsrcUpdate2,
     /// `struct zcrx_ctrl`, copied by `io_zcrx_ctrl()`
-    /// (`io_uring/zcrx.c:1430-1435`).
+    /// (`io_uring/zcrx.c:1428-1436`).
     ZcrxControl,
     /// `struct io_uring_bpf`, copied by `io_bpf_filter_import()`
     /// (`io_uring/bpf_filter.c:319-335`).
@@ -269,7 +269,7 @@ impl RegistrationHeader {
                 //     if (up.resv || up.resv2)
                 //             return -EINVAL;
                 //
-                // (`io_uring/rsrc.c:445-447`).  Only `offset`, `resv` and
+                // (`io_uring/rsrc.c:450-451`).  Only `offset`, `resv` and
                 // `data` are copied from `struct io_uring_rsrc_update`; the
                 // trailing fields of the wider update2 record are zeroed.
                 if read_u32(bytes, 4) != 0 {
@@ -278,7 +278,7 @@ impl RegistrationHeader {
                 //     if (check_add_overflow(up->offset, nr_args, &tmp))
                 //             return -EOVERFLOW;
                 //
-                // (`io_uring/rsrc.c:426-428`).
+                // (`io_uring/rsrc.c:428-429`).
                 if read_u32(bytes, 0).checked_add(count).is_none() {
                     return Err(IoUringError::RegistrationRangeOverflow);
                 }
@@ -290,7 +290,7 @@ impl RegistrationHeader {
                 //     if (rr.flags & ~IORING_RSRC_REGISTER_SPARSE)
                 //             return -EINVAL;
                 //
-                // (`io_uring/rsrc.c:405-408`), `IORING_RSRC_REGISTER_SPARSE`
+                // (`io_uring/rsrc.c:481-484`), `IORING_RSRC_REGISTER_SPARSE`
                 // being bit zero.
                 if read_u32(bytes, 0) == 0 || read_u64(bytes, 8) != 0 || read_u32(bytes, 4) & !1 != 0
                 {
@@ -306,7 +306,7 @@ impl RegistrationHeader {
                 //     if (!mem_is_zero(&ctrl.__resv, sizeof(ctrl.__resv)))
                 //             return -EFAULT;
                 //
-                // (`io_uring/zcrx.c:1430-1435`): a non-zero reserved word is
+                // (`io_uring/zcrx.c:1434-1439`): a non-zero reserved word is
                 // reported as a fault, not as a malformed record.
                 if read_u64(bytes, 8) != 0 || read_u64(bytes, 16) != 0 {
                     return Err(IoUringError::RegistrationFault);
@@ -365,7 +365,7 @@ impl RegistrationHeader {
                 //     if (!up.nr || up.resv || up.resv2)
                 //             return -EINVAL;
                 //
-                // (`io_uring/rsrc.c:462-464`).
+                // (`io_uring/rsrc.c:464-465`).
                 let nr = read_u32(bytes, 24);
                 if nr == 0 || read_u32(bytes, 4) != 0 || read_u32(bytes, 28) != 0 {
                     return Err(IoUringError::InvalidRegistration);
@@ -373,7 +373,7 @@ impl RegistrationHeader {
                 //     if (check_add_overflow(up->offset, nr_args, &tmp))
                 //             return -EOVERFLOW;
                 //
-                // (`io_uring/rsrc.c:426-428`) with the record's own `nr`.
+                // (`io_uring/rsrc.c:428-429`) with the record's own `nr`.
                 if read_u32(bytes, 0).checked_add(nr).is_none() {
                     return Err(IoUringError::RegistrationRangeOverflow);
                 }
@@ -394,7 +394,7 @@ pub enum RegistrationDispatch {
     /// Dispatched through `__io_uring_register()` with a resolved ring.
     Ring,
     /// Dispatched through `io_uring_register_blind()` with `fd == -1`
-    /// (`io_uring/register.c:1029-1030`).
+    /// (`io_uring/register.c:1031-1032`).
     Blind,
 }
 
@@ -443,7 +443,7 @@ impl RegistrationRequest {
     ///         return io_uring_register_blind(opcode, arg, nr_args);
     /// ```
     ///
-    /// (`io_uring/register.c:1029-1030`), where the blind entry handles
+    /// (`io_uring/register.c:1031-1032`), where the blind entry handles
     /// `IORING_REGISTER_SEND_MSG_RING`, `IORING_REGISTER_QUERY`,
     /// `IORING_REGISTER_RESTRICTIONS` and `IORING_REGISTER_BPF_FILTER` and
     /// answers every other opcode with `-EINVAL`
@@ -651,7 +651,7 @@ impl RegistrationRequest {
                 RegistrationDispatch::Blind => {
                     // `io_register_restrictions_task()` runs its
                     // `-EPERM`/`-EACCES` task admission before the record
-                    // shape checks below (`io_uring/register.c:206-209`);
+                    // shape checks below (`io_uring/register.c:208-217`);
                     // that admission is task state and lives in the syscall
                     // adapter, see [`RegistrationRequest::blind_task_restriction`].
                     //
@@ -691,7 +691,7 @@ impl RegistrationRequest {
                 //     if (size != sizeof(rr))
                 //             return -EINVAL;
                 //
-                // (`io_uring/rsrc.c:398-400`), before the copy and the
+                // (`io_uring/rsrc.c:475-476`), before the copy and the
                 // record's own `nr`/`resv2`/`flags` checks.
                 if self.count != IO_URING_RSRC_REGISTER_BYTES as u32 {
                     Err(IoUringError::InvalidRegistration)
@@ -703,7 +703,7 @@ impl RegistrationRequest {
                 //     if (size != sizeof(up))
                 //             return -EINVAL;
                 //
-                // (`io_uring/rsrc.c:455-457`), before the copy and the
+                // (`io_uring/rsrc.c:460-461`), before the copy and the
                 // record's own `nr`/`resv`/`resv2` checks.
                 if self.count != IO_URING_RSRC_REGISTER_BYTES as u32 {
                     Err(IoUringError::InvalidRegistration)
@@ -882,7 +882,7 @@ impl RegistrationRequest {
                 //     if (!arg || nr_args != 1)
                 //             return -EINVAL;
                 //
-                // (`io_uring/register.c:979-980`): the blind `MSG_RING` entry
+                // (`io_uring/register.c:984-985`): the blind `MSG_RING` entry
                 // rejects a nil record itself, so `-EINVAL` outranks the
                 // `-EFAULT` a copy would raise.
                 if self.argument == 0 || self.count != 1 {
@@ -922,7 +922,7 @@ impl RegistrationRequest {
                 //             return 0;
                 //     }
                 //
-                // (`io_uring/query.c:125-131`): a zero count with a NULL chain
+                // (`io_uring/query.c:125-152`): a zero count with a NULL chain
                 // head is a successful no-op, while a non-empty chain needs the
                 // query registry this profile does not implement.
                 if self.count != 0 {
@@ -939,7 +939,7 @@ impl RegistrationRequest {
                 //     if (copy_from_user(&ctrl, arg, sizeof(ctrl)))
                 //             return -EFAULT;
                 //
-                // (`io_uring/zcrx.c:1430-1432`): the dispatcher adds no header
+                // (`io_uring/zcrx.c:1434-1437`): the dispatcher adds no header
                 // of its own (`io_uring/register.c:959-961`), and the record
                 // is read and field-checked before the zcrx lookup.
                 if self.count != 0 {
@@ -1221,8 +1221,10 @@ mod tests {
             RegistrationRequest::new(IORING_UNREGISTER_PERSONALITY, 1, 0).decode(RegistrationDispatch::Ring),
             Err(IoUringError::InvalidRegistration)
         );
-        // `io_uring/register.c:884-912`: the pbuf, sync-cancel and napi
-        // entries require one argument and, where applicable, one count.
+        // `io_uring/register.c:884-925`: these entries gate on `arg` and
+        // `nr_args` before any body work, and the gates differ — the pbuf,
+        // sync-cancel and napi entries want exactly one count, while
+        // `IORING_REGISTER_FILE_ALLOC_RANGE` wants none.
         assert_eq!(
             RegistrationRequest::new(IORING_REGISTER_PBUF_RING, 0x1000, 0).decode(RegistrationDispatch::Ring),
             Err(IoUringError::InvalidRegistration)
@@ -1244,8 +1246,9 @@ mod tests {
             RegistrationRequest::new(IORING_UNREGISTER_NAPI, 0, 0).decode(RegistrationDispatch::Ring),
             Err(IoUringError::InvalidRegistration)
         );
-        // `io_uring/rsrc.c:398-400` and `:455-457` pass `nr_args` as the
-        // record size, so only the exact struct size reaches the copy.
+        // `io_uring/register.c:846-858` hands `nr_args` to the record helpers
+        // as their size, so only the exact struct size reaches the copy
+        // (`io_uring/rsrc.c:475-476`, `:460-461`).
         assert_eq!(
             RegistrationRequest::new(IORING_REGISTER_FILES2, 0x1000, 16).decode(RegistrationDispatch::Ring),
             Err(IoUringError::InvalidRegistration)
@@ -1268,7 +1271,7 @@ mod tests {
                 header: RegistrationHeader::RsrcUpdate2,
             }))
         );
-        // `io_uring/rsrc.c:439-443`: a zero count outranks the nil record.
+        // `io_uring/rsrc.c:445-446`: a zero count outranks the nil record.
         assert_eq!(
             RegistrationRequest::new(IORING_REGISTER_FILES_UPDATE, 0, 0).decode(RegistrationDispatch::Ring),
             Err(IoUringError::InvalidRegistration)
@@ -1353,7 +1356,7 @@ mod tests {
 
     #[test]
     fn auxiliary_control_records_reuse_linux_field_rules() {
-        // `io_uring/zcrx.c:1430-1435`: the reserved words answer -EFAULT, and
+        // `io_uring/zcrx.c:1438-1443`: the reserved words answer -EFAULT, and
         // every validated record resolves to the absent zcrx id.
         let zcrx = UnsupportedRegistration {
             opcode: IORING_REGISTER_ZCRX_CTRL,
@@ -1444,7 +1447,7 @@ mod tests {
         ] {
             assert!(!RegistrationRequest::new(opcode, 0, 0).blind());
         }
-        // `io_uring/query.c:125-131`: an empty chain is a successful no-op.
+        // `io_uring/query.c:136-151`: an empty chain is a successful no-op.
         assert_eq!(
             RegistrationRequest::new(IORING_REGISTER_QUERY, 0, 0).decode(RegistrationDispatch::Ring),
             Ok(RegistrationOperation::QueryEmpty)
@@ -1462,7 +1465,7 @@ mod tests {
             RegistrationRequest::new(IORING_REGISTER_QUERY, 0x1000, 1).decode(RegistrationDispatch::Ring),
             Err(IoUringError::InvalidRegistration)
         );
-        // `io_uring/register.c:979-980`: the blind MSG_RING record rejects a
+        // `io_uring/register.c:984-985`: the blind MSG_RING record rejects a
         // nil argument with -EINVAL rather than faulting.
         assert_eq!(
             RegistrationRequest::new(IORING_REGISTER_SEND_MSG_RING, 0, 1).decode(RegistrationDispatch::Ring),

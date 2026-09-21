@@ -1,10 +1,6 @@
 //! Device completion, reset, and route-custody regressions.
 
 use super::*;
-#[cfg(feature = "test-io-control")]
-use crate::file::io_uring::diagnostics::{
-    IO_URING_DMA_DIRECT_STATS_ENABLED, IO_URING_PHYSICAL_QUARANTINE,
-};
 
 #[test]
 fn physical_worker_reservation_is_fixed_capacity_and_reversible() {
@@ -765,14 +761,6 @@ fn stale_route_cleanup_cannot_clear_reused_worker_slot_generation() {
 fn reserved_completion_replays_after_route_commit() {
     let _router = PHYSICAL_COMPLETION_TEST_LOCK.lock();
     let _context = crate::test_support::scheduler_test_context();
-    #[cfg(feature = "test-io-control")]
-    let (stats_were_enabled, quarantine_before) = {
-        let enabled = IO_URING_DMA_DIRECT_STATS_ENABLED.swap(true, Ordering::AcqRel);
-        (
-            enabled,
-            IO_URING_PHYSICAL_QUARANTINE.load(Ordering::Acquire),
-        )
-    };
     let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
         .resolve(FeatureFlags::EMPTY)
         .unwrap();
@@ -801,14 +789,6 @@ fn reserved_completion_replays_after_route_commit() {
     assert_eq!(take_replayable_physical_completions(&mut replay), 1);
     assert_eq!(replay[0], completion);
     assert_eq!(PHYSICAL_COMPLETION_ROUTER.lock().quarantine_len, 0);
-    #[cfg(feature = "test-io-control")]
-    {
-        assert_eq!(
-            IO_URING_PHYSICAL_QUARANTINE.load(Ordering::Acquire),
-            quarantine_before
-        );
-        IO_URING_DMA_DIRECT_STATS_ENABLED.store(stats_were_enabled, Ordering::Release);
-    }
     assert!(release_physical_completion_routes(
         &ring,
         request,
@@ -820,14 +800,6 @@ fn reserved_completion_replays_after_route_commit() {
 fn replay_cookie_mismatch_quarantines_reused_handle() {
     let _router = PHYSICAL_COMPLETION_TEST_LOCK.lock();
     let _context = crate::test_support::scheduler_test_context();
-    #[cfg(feature = "test-io-control")]
-    let (stats_were_enabled, quarantine_before) = {
-        let enabled = IO_URING_DMA_DIRECT_STATS_ENABLED.swap(true, Ordering::AcqRel);
-        (
-            enabled,
-            IO_URING_PHYSICAL_QUARANTINE.load(Ordering::Acquire),
-        )
-    };
     let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
         .resolve(FeatureFlags::EMPTY)
         .unwrap();
@@ -860,14 +832,6 @@ fn replay_cookie_mismatch_quarantines_reused_handle() {
             .next()
             .is_some_and(|record| record.replayable)
     );
-    #[cfg(feature = "test-io-control")]
-    {
-        assert_eq!(
-            IO_URING_PHYSICAL_QUARANTINE.load(Ordering::Acquire),
-            quarantine_before + 1
-        );
-        IO_URING_DMA_DIRECT_STATS_ENABLED.store(stats_were_enabled, Ordering::Release);
-    }
     assert!(release_physical_completion_routes(
         &ring,
         request,

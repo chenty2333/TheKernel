@@ -1030,11 +1030,6 @@ pub(super) fn physical_completion_generation_store_for_device(
     }
 }
 
-#[cfg(feature = "test-io-control")]
-pub(crate) fn io_uring_physical_quarantine_len() -> usize {
-    PHYSICAL_COMPLETION_ROUTER.lock().quarantine_len
-}
-
 pub(super) fn physical_completion_work_count() -> usize {
     let router = PHYSICAL_COMPLETION_ROUTER.lock();
     router.work_count.saturating_add(router.pending_count)

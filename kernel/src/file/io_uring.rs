@@ -1648,9 +1648,3 @@ fn initialize_ring_header(pages: &SharedPages, layout: RingLayout) -> AxResult<(
 
 #[cfg(test)]
 mod adapter_state_tests;
-
-#[cfg(feature = "test-io-control")]
-pub(crate) use diagnostics::{
-    io_uring_dma_direct_stats_snapshot, reset_io_uring_dma_direct_stats,
-    set_io_uring_dma_direct_stats_enabled,
-};

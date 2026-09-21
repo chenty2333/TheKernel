@@ -110,6 +110,7 @@ pub const ECANCELED: i64 = 125;
 ///   `aio_poll_complete_work()` (`fs/aio.c:1823-1837`).  That work skips
 ///   `vfs_poll()` for a cancelled request --
 ///
+///   Excerpt: Linux v7.2.3 `fs/aio.c:1783-1786` — GPL-2.0-only, (C) The Linux Kernel Authors
 ///   ```text
 ///   __poll_t mask = 0;
 ///   if (!READ_ONCE(req->cancelled))

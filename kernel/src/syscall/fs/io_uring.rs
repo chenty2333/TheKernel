@@ -199,12 +199,12 @@ fn map_policy_error(error: IoUringError) -> AxError {
         | CurrentPositionUnsupported
         | UnsupportedRegistration => AxError::OperationNotSupported,
         Overflow | GenerationExhausted => AxError::OutOfRange,
-        // `check_add_overflow(offset, nr_args)` in `io_register_files_update()`
-        // and `io_register_rsrc_update()` is Linux's -EOVERFLOW, which is not
-        // this profile's own range error.
+        // `check_add_overflow(offset, nr_args)` in
+        // `__io_register_rsrc_update()` (`io_uring/rsrc.c:428-429`) is Linux's
+        // -EOVERFLOW, which is not this profile's own range error.
         RegistrationRangeOverflow => AxError::from(LinuxError::EOVERFLOW),
         // A reserved registration field Linux rejects as a fault, such as
-        // `zcrx_ctrl.__resv` (`io_uring/zcrx.c:1434-1435`).
+        // `zcrx_ctrl.__resv` (`io_uring/zcrx.c:1438-1439`).
         RegistrationFault => AxError::BadAddress,
         _ => AxError::InvalidInput,
     }
@@ -770,7 +770,7 @@ pub fn sys_io_uring_register(
     //     if (fd == -1)
     //             return io_uring_register_blind(opcode, arg, nr_args);
     //
-    // (`io_uring/register.c:1029-1030`, `:998-1013`).
+    // (`io_uring/register.c:1031-1032`, `:998-1013`).
     let dispatch = if fd == -1 {
         if !request.blind() {
             return Err(AxError::from(LinuxError::EINVAL));
@@ -783,7 +783,7 @@ pub fn sys_io_uring_register(
         // `io_register_restrictions_task()` admits the caller before it looks
         // at the record: an already-restricted task is -EPERM, and a caller
         // without `no_new_privs` or CAP_SYS_ADMIN is -EACCES
-        // (`io_uring/register.c:206-209`), both ahead of the `nr_args` and
+        // (`io_uring/register.c:208-217`), both ahead of the `nr_args` and
         // copy_from_user() checks that `decode` reproduces.
         if request.blind_task_restriction() {
             admit_task_restriction_registration()?;
@@ -860,7 +860,7 @@ pub fn sys_io_uring_register(
             }
         }
         // `io_query()` walks a NULL chain head and returns zero
-        // (`io_uring/query.c:125-131`), with or without a ring.
+        // (`io_uring/query.c:136-151`), with or without a ring.
         RegistrationOperation::QueryEmpty => return Ok(0),
         RegistrationOperation::Unsupported(unsupported) => {
             // `io_eventfd_register()` answers -EBUSY from the published
@@ -881,7 +881,7 @@ pub fn sys_io_uring_register(
 
 /// Applies the task admission of `io_register_restrictions_task()`, which
 /// precedes that entry's `nr_args` and copy_from_user() checks
-/// (`io_uring/register.c:206-209`).
+/// (`io_uring/register.c:208-217`).
 fn admit_task_restriction_registration() -> AxResult<()> {
     let current = axtask::current();
     let thread = current.as_thread();
@@ -904,8 +904,8 @@ fn admit_task_restriction_registration() -> AxResult<()> {
 /// `IORING_REGISTER_BPF_FILTER` and answers every other opcode with -EINVAL
 /// (`io_uring/register.c:998-1013`).  None of those four bodies exists in this
 /// profile, but each still applies its own record shape first: `io_query()`
-/// requires a zero `nr_args` (`io_uring/query.c:129-130`), the blind MSG_RING
-/// entry requires `arg && nr_args == 1` (`io_uring/register.c:979-980`), and
+/// requires a zero `nr_args` (`io_uring/query.c:133-134`), the blind MSG_RING
+/// entry requires `arg && nr_args == 1` (`io_uring/register.c:984-985`), and
 /// the task restriction and BPF filter paths reject a malformed record before
 /// they allocate anything.
 fn blind_registration(
@@ -926,8 +926,9 @@ fn blind_registration(
 ///
 /// Linux reads its fixed-size request record before it judges the record's
 /// fields, so an unreadable or nil record is -EFAULT while only a readable
-/// record can be -EINVAL/EOVERFLOW (`io_uring/rsrc.c:395-418`, `:439-453`,
-/// `:455-464`).  Returning -EOPNOTSUPP here without that copy would let a
+/// record can be -EINVAL/EOVERFLOW (`io_uring/rsrc.c:469-484`, `:439-453`,
+/// `:455-464`, whose shared range gate `__io_register_rsrc_update()` is at
+/// `:420-437`).  Returning -EOPNOTSUPP here without that copy would let a
 /// malformed call observe a different errno than Linux.
 fn unsupported_registration(
     capability: &UserMemoryCapability,
