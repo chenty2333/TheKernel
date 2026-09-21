@@ -216,8 +216,28 @@ def environment(tier: str, env: dict[str, str]) -> None:
         raise ProductError("verify: environment: UNAVAILABLE /dev/kvm is not readable and writable")
 
 
+#: `github.event.before` for a push that *creates* a branch, which names no
+#: previous state rather than an unavailable one.
+NULL_COMMIT = "0" * 40
+
+
 def whitespace(env: dict[str, str]) -> None:
     base = env.get("CI_DIFF_BASE", "")
+    # A branch-creating push reports the null commit as its "before". There is
+    # no previous state to diff against, so the range that carries meaning is
+    # the one this branch adds to the default branch; that is also what a pull
+    # request would have compared. Falling back keeps the first push to a new
+    # branch covered instead of failing it for an environment reason, and keeps
+    # a genuinely unavailable commit an error.
+    if base.strip("0") == "" and base:
+        base = ""
+        merge_base = subprocess.run(("git", "merge-base", "origin/main", "HEAD"),
+                                    cwd=REPO_ROOT, capture_output=True, text=True)
+        if merge_base.returncode == 0:
+            base = merge_base.stdout.strip()
+        else:
+            print("verify: whitespace: no diff base; a branch-creating push has no "
+                  "previous state and origin/main is not fetched here", flush=True)
     if base:
         valid = subprocess.run(("git", "cat-file", "-e", f"{base}^{{commit}}"), cwd=REPO_ROOT, capture_output=True).returncode == 0
         if not valid:

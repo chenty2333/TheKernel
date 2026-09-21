@@ -156,6 +156,24 @@ class VerificationTests(unittest.TestCase):
             with self.assertRaisesRegex(ProductError, "CI_DIFF_BASE"):
                 verify.whitespace({"CI_DIFF_BASE": "unavailable"})
 
+    def test_branch_creating_push_diffs_against_the_default_branch(self):
+        # `github.event.before` is the null commit when a push creates the
+        # branch. That names no previous state, not an unavailable one, so the
+        # range that carries meaning is what the branch adds to origin/main.
+        merge_base = Mock(returncode=0, stdout="abc123\n")
+        with patch.object(verify.subprocess, "run", return_value=merge_base) as run, \
+                patch.object(verify, "execute") as execute:
+            verify.whitespace({"CI_DIFF_BASE": verify.NULL_COMMIT})
+        self.assertEqual(run.call_args_list[0].args[0][:2], ("git", "merge-base"))
+        self.assertIn("abc123", execute.call_args_list[0].args[0].command)
+
+    def test_branch_creating_push_without_a_default_branch_still_checks_the_tree(self):
+        with patch.object(verify.subprocess, "run", return_value=Mock(returncode=1, stdout="")), \
+                patch.object(verify, "execute") as execute:
+            verify.whitespace({"CI_DIFF_BASE": verify.NULL_COMMIT})
+        names = [call.args[0].name for call in execute.call_args_list]
+        self.assertEqual(names, ["whitespace-working", "whitespace-staged"])
+
     def test_nonzero_stage_preserves_failure_category(self):
         with patch.object(verify.subprocess, "Popen", return_value=Mock(wait=Mock(return_value=2))):
             with self.assertRaisesRegex(ProductError, "type=build exit=2"):

@@ -307,4 +307,3 @@ pub const fn process_madvise_remote_valid(advice: u32) -> bool {
 pub const fn advice_refused_on_droppable(advice: u32) -> bool {
     matches!(advice, MADV_KEEPONFORK | MADV_DODUMP)
 }
-

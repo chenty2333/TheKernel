@@ -1008,17 +1008,17 @@ static void madvise_extra_case(void) {
        instead of silently undoing the mapping's contract:
 
        ```c
-       	case MADV_KEEPONFORK:
-       		if (new_flags & VM_DROPPABLE)
-       			return -EINVAL;
+        case MADV_KEEPONFORK:
+                if (new_flags & VM_DROPPABLE)
+                        return -EINVAL;
        ```
        (`mm/madvise.c:1395-1397`), and
 
        ```c
-       	case MADV_DODUMP:
-       		if ((!is_vm_hugetlb_page(vma) && (new_flags & VM_SPECIAL)) ||
-       		    (new_flags & VM_DROPPABLE))
-       			return -EINVAL;
+        case MADV_DODUMP:
+                if ((!is_vm_hugetlb_page(vma) && (new_flags & VM_SPECIAL)) ||
+                    (new_flags & VM_DROPPABLE))
+                        return -EINVAL;
        ```
        (`mm/madvise.c:1402-1406`). */
     unsigned char *drop = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
@@ -1044,7 +1044,7 @@ static void madvise_extra_case(void) {
        restore in `try_to_unmap_one()` explicitly exempts it:
 
        ```c
-       			if (folio_test_dirty(folio) && !(vma->vm_flags & VM_DROPPABLE)) {
+                        if (folio_test_dirty(folio) && !(vma->vm_flags & VM_DROPPABLE)) {
        ```
        (`mm/rmap.c:2258`).  MADV_PAGEOUT is the only guest-visible route into
        that decision, and the dropped page reads back as a fresh zero page
@@ -1068,8 +1068,8 @@ static void madvise_extra_case(void) {
        `CAP_SYS_PTRACE` or a permissive `vm.unprivileged_userfaultfd`:
 
        ```c
-       	if (flags & UFFD_USER_MODE_ONLY)
-       		return true;
+        if (flags & UFFD_USER_MODE_ONLY)
+                return true;
        ```
 
        (`mm/userfaultfd.c:4481-4494`), which lets this assertion reach the
