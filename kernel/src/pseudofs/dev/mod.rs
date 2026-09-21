@@ -12,8 +12,6 @@ mod fb;
 pub(crate) use fb::restore_console_after_master_close;
 pub(crate) mod fuse;
 pub(crate) mod r#loop;
-#[cfg(feature = "memtrack")]
-mod memtrack;
 pub(crate) mod rtc;
 pub(crate) mod scanout;
 mod sound;
@@ -735,16 +733,6 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
     root.add(
         "pts",
         SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())),
-    );
-    #[cfg(feature = "memtrack")]
-    root.add(
-        "memtrack",
-        Device::new(
-            fs.clone(),
-            NodeType::CharacterDevice,
-            DeviceId::new(114, 514),
-            Arc::new(memtrack::MemTrack),
-        ),
     );
 
     // This is mounted to a tmpfs in `new_procfs`

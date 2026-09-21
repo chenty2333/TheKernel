@@ -9,8 +9,6 @@ mod file;
 mod fs;
 mod graphics_metrics;
 pub(crate) mod hugetlb;
-#[cfg(feature = "test-io-control")]
-mod io_test_control;
 pub(crate) mod mqueue;
 pub(crate) mod proc;
 pub(crate) mod rpc_pipefs;

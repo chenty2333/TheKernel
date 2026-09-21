@@ -12,15 +12,6 @@
 #![allow(missing_docs)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-#[cfg(any(
-    all(feature = "eevdf-balanced", feature = "eevdf-latency"),
-    all(feature = "eevdf-balanced", feature = "eevdf-throughput"),
-    all(feature = "eevdf-latency", feature = "eevdf-throughput"),
-))]
-compile_error!(
-    "select at most one EEVDF profile: eevdf-balanced, eevdf-latency, or eevdf-throughput"
-);
-
 extern crate alloc;
 extern crate axruntime;
 
@@ -49,8 +40,6 @@ mod packet_cbpf;
 mod perf_records;
 mod perf_security;
 mod perf_sources;
-#[cfg(feature = "pmu-diagnostics")]
-mod pmu;
 mod pmu_registry;
 mod pseudofs;
 mod random;

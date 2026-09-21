@@ -33,12 +33,6 @@ use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 
 #[cfg(feature = "bpf")]
 use crate::bpf_security::{set_unprivileged_bpf_disabled, unprivileged_bpf_disabled};
-#[cfg(feature = "test-io-control")]
-use crate::file::io_uring::io_uring_dma_direct_stats_snapshot;
-#[cfg(feature = "asid-switch-diagnostics")]
-use crate::mm::asid_switch_diagnostics_snapshot;
-#[cfg(feature = "mm-lock-diagnostics")]
-use crate::mm::{MmLockStage, mm_lock_diagnostics_snapshot};
 use crate::{
     file::{
         Directory, File, FileDescription, PidFd, current_file_operation_security_credential,
@@ -180,130 +174,6 @@ fn try_pid_name(pid: u32) -> VfsResult<String> {
 
 fn render_proc_io_stats() -> Vec<u8> {
     let mut out = render_io_stats_counters();
-    #[cfg(feature = "test-io-control")]
-    {
-        let io_uring_dma = io_uring_dma_direct_stats_snapshot();
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_read_hits {}",
-            io_uring_dma.read_hits
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_read_bytes {}",
-            io_uring_dma.read_bytes
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_read_fallbacks {}",
-            io_uring_dma.read_fallbacks
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_read_fallback_geometry {}",
-            io_uring_dma.read_fallback_geometry
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_read_fallback_provenance {}",
-            io_uring_dma.read_fallback_provenance
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_read_fallback_sg_cap {}",
-            io_uring_dma.read_fallback_sg_cap
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_read_fallback_extent {}",
-            io_uring_dma.read_fallback_extent
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_read_fallback_device_admission {}",
-            io_uring_dma.read_fallback_device_admission
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_write_hits {}",
-            io_uring_dma.write_hits
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_write_bytes {}",
-            io_uring_dma.write_bytes
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_write_fallbacks {}",
-            io_uring_dma.write_fallbacks
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_write_fallback_geometry {}",
-            io_uring_dma.write_fallback_geometry
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_write_fallback_provenance {}",
-            io_uring_dma.write_fallback_provenance
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_write_fallback_sg_cap {}",
-            io_uring_dma.write_fallback_sg_cap
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_write_fallback_extent {}",
-            io_uring_dma.write_fallback_extent
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.dma_direct_write_fallback_device_admission {}",
-            io_uring_dma.write_fallback_device_admission
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.physical_submitted {}",
-            io_uring_dma.physical_submitted
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.physical_child_submitted {}",
-            io_uring_dma.physical_child_submitted
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.physical_completed {}",
-            io_uring_dma.physical_completed
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.physical_child_completed {}",
-            io_uring_dma.physical_child_completed
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.physical_direct_bytes {}",
-            io_uring_dma.physical_direct_bytes
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.physical_qd_highwater {}",
-            io_uring_dma.physical_qd_highwater
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.physical_extent_highwater {}",
-            io_uring_dma.physical_extent_highwater
-        );
-        let _ = writeln!(
-            out,
-            "io_uring.physical_quarantine {}",
-            io_uring_dma.physical_quarantine
-        );
-    }
     let pin = user_io_pin_counters_snapshot();
     let _ = writeln!(out, "user_pin.to_user_attempts {}", pin.to_user_attempts);
     let _ = writeln!(out, "user_pin.to_user_hits {}", pin.to_user_hits);
@@ -998,91 +868,6 @@ impl Pollable for ProcBpfStatsFile {
     }
 }
 
-#[cfg(feature = "test-io-control")]
-fn render_proc_bpf_executor_control() -> Vec<u8> {
-    let (seccomp, packet) = crate::seccomp_jit::executor_policies();
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "BPF_EXECUTOR_CONTROL schema=thekernel-bpf-executor-control-v1"
-    );
-    let _ = writeln!(out, "seccomp={}", seccomp.as_str());
-    let _ = writeln!(out, "packet={}", packet.as_str());
-    out.into_bytes()
-}
-
-#[cfg(feature = "test-io-control")]
-fn parse_bpf_executor_policy(value: &str) -> Option<crate::seccomp_jit::ExecutorPolicy> {
-    match value {
-        "auto" => Some(crate::seccomp_jit::ExecutorPolicy::Auto),
-        "interpreter" => Some(crate::seccomp_jit::ExecutorPolicy::Interpreter),
-        "jit" => Some(crate::seccomp_jit::ExecutorPolicy::Jit),
-        _ => None,
-    }
-}
-
-#[cfg(feature = "test-io-control")]
-fn parse_bpf_executor_control(
-    data: &[u8],
-) -> VfsResult<(
-    Option<crate::seccomp_jit::ExecutorPolicy>,
-    Option<crate::seccomp_jit::ExecutorPolicy>,
-)> {
-    const MAX_CONTROL_BYTES: usize = 128;
-    if data.is_empty() || data.len() > MAX_CONTROL_BYTES {
-        return Err(VfsError::InvalidInput);
-    }
-    let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-    let mut seccomp = None;
-    let mut packet = None;
-    let mut lines = text.split('\n').peekable();
-    while let Some(line) = lines.next() {
-        // A single final newline is the only accepted empty line. Every
-        // nonempty line is parsed before either policy is changed.
-        if line.is_empty() {
-            if lines.peek().is_none() && text.ends_with('\n') {
-                break;
-            }
-            return Err(VfsError::InvalidInput);
-        }
-        if line.ends_with('\r') {
-            return Err(VfsError::InvalidInput);
-        }
-        let (key, value) = line.split_once('=').ok_or(VfsError::InvalidInput)?;
-        if key.is_empty() || value.is_empty() || key.trim() != key || value.trim() != value {
-            return Err(VfsError::InvalidInput);
-        }
-        let policy = parse_bpf_executor_policy(value).ok_or(VfsError::InvalidInput)?;
-        match key {
-            "seccomp" if seccomp.is_none() => seccomp = Some(policy),
-            "packet" if packet.is_none() => packet = Some(policy),
-            _ => return Err(VfsError::InvalidInput),
-        }
-    }
-    if seccomp.is_none() && packet.is_none() {
-        return Err(VfsError::InvalidInput);
-    }
-    Ok((seccomp, packet))
-}
-
-#[cfg(feature = "test-io-control")]
-fn bpf_executor_control_operation(request: SimpleFileOperation<'_>) -> VfsResult<Option<Vec<u8>>> {
-    match request {
-        SimpleFileOperation::Read => Ok(Some(render_proc_bpf_executor_control())),
-        SimpleFileOperation::Write(data) => {
-            // This is deliberately initial-root-only rather than a generic
-            // capability gate: the node is a non-Linux test/perf control and
-            // must not become a namespace-relative production interface.
-            if !current().as_thread().current_cred().is_initial_root_euid() {
-                return Err(VfsError::PermissionDenied);
-            }
-            let (seccomp, packet) = parse_bpf_executor_control(data)?;
-            crate::seccomp_jit::set_executor_policies_for_control(seccomp, packet);
-            Ok(None)
-        }
-    }
-}
-
 /// Render immutable scheduler-build configuration for low-perturbation
 /// diagnosis.  This is a read-only snapshot of compile-time values; it does
 /// not sample or mutate the EEVDF ready path.  Idle stealing is listed in a
@@ -1113,114 +898,6 @@ fn render_proc_sched_profile() -> Vec<u8> {
         idle_steal.hot_residency_ns,
         idle_steal.severe_imbalance_ready_tasks,
     );
-    out.into_bytes()
-}
-
-#[cfg(feature = "mm-lock-diagnostics")]
-fn render_proc_mm_lock_stats() -> Vec<u8> {
-    let mut out = String::new();
-    let first = mm_lock_diagnostics_snapshot(MmLockStage::ALL[0]);
-    let _ = writeln!(
-        out,
-        "MM_LOCK_DIAGNOSTICS schema=thekernel-mm-lock-diagnostics-v1 enabled={} resetting={} \
-         active_samples={} epoch={} sequence={} sequence_exhausted={} histogram=log2_ns_v1",
-        u8::from(first.enabled),
-        u8::from(first.resetting),
-        first.active_samples,
-        first.epoch,
-        first.sequence,
-        u8::from(first.sequence_exhausted)
-    );
-
-    for (index, stage) in MmLockStage::ALL.iter().copied().enumerate() {
-        let snapshot = if index == 0 {
-            first
-        } else {
-            mm_lock_diagnostics_snapshot(stage)
-        };
-        let stage = snapshot.stage;
-        let _ = write!(
-            out,
-            "MM_LOCK_STAGE stage={} epoch={} samples={} wait_sum_ns={} wait_max_ns={} \
-             hold_sum_ns={} hold_max_ns={} saturated={} wait_buckets=",
-            stage.stage.as_str(),
-            snapshot.epoch,
-            stage.samples,
-            stage.wait_ns,
-            stage.max_wait_ns,
-            stage.hold_ns,
-            stage.max_hold_ns,
-            u8::from(stage.saturated),
-        );
-        for (bucket, count) in stage.wait_buckets.iter().enumerate() {
-            if bucket != 0 {
-                out.push(',');
-            }
-            let _ = write!(out, "{count}");
-        }
-        out.push_str(" hold_buckets=");
-        for (bucket, count) in stage.hold_buckets.iter().enumerate() {
-            if bucket != 0 {
-                out.push(',');
-            }
-            let _ = write!(out, "{count}");
-        }
-        out.push('\n');
-    }
-    let final_snapshot = mm_lock_diagnostics_snapshot(MmLockStage::ALL[0]);
-    let _ = writeln!(
-        out,
-        "MM_LOCK_DIAGNOSTICS_END enabled={} resetting={} active_samples={} epoch={} sequence={} \
-         sequence_exhausted={}",
-        u8::from(final_snapshot.enabled),
-        u8::from(final_snapshot.resetting),
-        final_snapshot.active_samples,
-        final_snapshot.epoch,
-        final_snapshot.sequence,
-        u8::from(final_snapshot.sequence_exhausted)
-    );
-    out.into_bytes()
-}
-
-#[cfg(feature = "asid-switch-diagnostics")]
-fn render_proc_asid_switch_stats() -> Vec<u8> {
-    let snapshot = asid_switch_diagnostics_snapshot();
-    format!(
-        "ASID_SWITCH_DIAGNOSTICS schema=thekernel-asid-switch-diagnostics-v1 enabled={} \
-         fast_path_avoided={} fallback_asid_zero={} fallback_invalid_width={} \
-         fallback_exhausted={} fallback_generation_mismatch={} fallback_same_id_different_root={} \
-         saturated={}\n",
-        u8::from(snapshot.enabled()),
-        snapshot.fast_path_avoided(),
-        snapshot.fallback_asid_zero(),
-        snapshot.fallback_invalid_width(),
-        snapshot.fallback_exhausted(),
-        snapshot.fallback_generation_mismatch(),
-        snapshot.fallback_same_id_different_root(),
-        u8::from(snapshot.saturated()),
-    )
-    .into_bytes()
-}
-
-#[cfg(feature = "pmu-diagnostics")]
-fn render_proc_pmu_capabilities() -> Vec<u8> {
-    let snapshot = crate::pmu::capability_snapshot();
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "PMU_CAPABILITIES schema=thekernel-pmu-capabilities-v1 source={} counter_count={} \
-         consistent_snapshot={} samples_collected=0",
-        snapshot.source(),
-        snapshot.counter_count(),
-        u8::from(snapshot.has_consistent_snapshot()),
-    );
-    for (event, requestable) in snapshot.events() {
-        let _ = writeln!(
-            out,
-            "PMU_EVENT event={event} requestable={} sampled=0",
-            u8::from(requestable),
-        );
-    }
     out.into_bytes()
 }
 
@@ -3807,47 +3484,6 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
             || -> VfsResult<Vec<u8>> { Ok(render_proc_sched_profile()) },
         ),
     );
-    #[cfg(feature = "mm-lock-diagnostics")]
-    root.add(
-        "mm_lock_stats",
-        SimpleFile::new_regular_with_permission(
-            fs.clone(),
-            NodePermission::from_bits_truncate(0o444),
-            || -> VfsResult<Vec<u8>> { Ok(render_proc_mm_lock_stats()) },
-        ),
-    );
-    #[cfg(feature = "asid-switch-diagnostics")]
-    root.add(
-        "asid_switch_stats",
-        SimpleFile::new_regular_with_permission(
-            fs.clone(),
-            NodePermission::from_bits_truncate(0o444),
-            || -> VfsResult<Vec<u8>> { Ok(render_proc_asid_switch_stats()) },
-        ),
-    );
-    #[cfg(feature = "pmu-diagnostics")]
-    root.add(
-        "pmu_capabilities",
-        SimpleFile::new_regular_with_permission(
-            fs.clone(),
-            NodePermission::from_bits_truncate(0o444),
-            || -> VfsResult<Vec<u8>> { Ok(render_proc_pmu_capabilities()) },
-        ),
-    );
-    #[cfg(feature = "test-io-control")]
-    root.add(
-        "io_test_control",
-        super::io_test_control::new_file(fs.clone()),
-    );
-    #[cfg(feature = "test-io-control")]
-    root.add(
-        "bpf_executor_control",
-        SimpleFile::new_regular_with_permission(
-            fs.clone(),
-            NodePermission::from_bits_truncate(0o600),
-            RwFile::new(bpf_executor_control_operation),
-        ),
-    );
     root.add(
         "cpuinfo",
         SimpleFile::new_regular(fs.clone(), || {
@@ -4026,7 +3662,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                                     return Ok(None);
                                 }
                                 let value = write_proc_usize(data)?;
-                                set_mq_msg_max(value);
+                                set_mq_msg_max(value)?;
                                 Ok(None)
                             }
                         }),
@@ -4045,7 +3681,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                                     return Ok(None);
                                 }
                                 let value = write_proc_usize(data)?;
-                                set_mq_msgsize_max(value);
+                                set_mq_msgsize_max(value)?;
                                 Ok(None)
                             }
                         }),
@@ -5085,58 +4721,5 @@ mod tests {
         writer.join().unwrap();
 
         assert_eq!(actual, expected);
-    }
-
-    #[cfg(feature = "test-io-control")]
-    #[test]
-    fn bpf_executor_control_parses_all_lines_before_publishing() {
-        let old = crate::seccomp_jit::executor_policies();
-        crate::seccomp_jit::set_executor_policies_for_control(
-            Some(crate::seccomp_jit::ExecutorPolicy::Auto),
-            Some(crate::seccomp_jit::ExecutorPolicy::Auto),
-        );
-
-        assert_eq!(
-            parse_bpf_executor_control(b"seccomp=interpreter\npacket=jit\n"),
-            Ok((
-                Some(crate::seccomp_jit::ExecutorPolicy::Interpreter),
-                Some(crate::seccomp_jit::ExecutorPolicy::Jit),
-            ))
-        );
-        assert_eq!(
-            parse_bpf_executor_control(b"seccomp=interpreter\npacket=bad\n"),
-            Err(VfsError::InvalidInput)
-        );
-        assert_eq!(
-            crate::seccomp_jit::executor_policies(),
-            (
-                crate::seccomp_jit::ExecutorPolicy::Auto,
-                crate::seccomp_jit::ExecutorPolicy::Auto,
-            )
-        );
-
-        crate::seccomp_jit::set_executor_policies_for_control(Some(old.0), Some(old.1));
-    }
-
-    #[cfg(feature = "test-io-control")]
-    #[test]
-    fn bpf_executor_control_readback_has_independent_domains() {
-        let old = crate::seccomp_jit::executor_policies();
-        crate::seccomp_jit::set_executor_policies_for_control(
-            Some(crate::seccomp_jit::ExecutorPolicy::Interpreter),
-            Some(crate::seccomp_jit::ExecutorPolicy::Jit),
-        );
-        assert_eq!(
-            crate::seccomp_jit::executor_policy(),
-            crate::seccomp_jit::ExecutorPolicy::Interpreter
-        );
-        assert_eq!(
-            crate::seccomp_jit::packet_executor_policy(),
-            crate::seccomp_jit::ExecutorPolicy::Jit
-        );
-        let output = String::from_utf8(render_proc_bpf_executor_control()).unwrap();
-        assert!(output.contains("seccomp=interpreter\n"));
-        assert!(output.contains("packet=jit\n"));
-        crate::seccomp_jit::set_executor_policies_for_control(Some(old.0), Some(old.1));
     }
 }

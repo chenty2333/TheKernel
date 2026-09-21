@@ -5,11 +5,16 @@ QEMU runs capture COM1 in `console.log` and COM2 in `kernel.log`, both under the
 run directory. Interactive input, program output, and test completion markers
 belong to COM1. A marker in `kernel.log` cannot make a guest test pass.
 
-CPU boot capability reports and early clock diagnostics go to COM2. The CPU
-suite reads them from `kernel.log`; its userspace KTAP results remain in
-`console.log`. Panic output uses a bounded emergency COM2 writer that does not
-acquire the normal logger's locks. A machine without COM2 still retains normal
-kernel logs in memory; emergency output is best effort.
+CPU boot capability reports and early clock diagnostics go to the diagnostic
+port. The kernel selects that port at boot by probing the UARTs beyond COM1 in
+turn -- COM2, COM3, COM4 -- and taking the first that answers, which is COM2
+under QEMU; the CPU suite therefore reads its reports from `kernel.log`, while
+its userspace KTAP results remain in `console.log`. A machine with none of
+those three ports drains the log ring over COM1 instead, sharing the console's
+bounded lock. Panic output uses a bounded emergency writer on whichever port was
+selected, and it does not acquire the normal logger's locks. A machine with no
+serial port at all still retains kernel logs in memory; emergency output is then
+best effort.
 
 ## Kernel logs
 
