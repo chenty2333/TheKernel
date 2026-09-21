@@ -13,6 +13,7 @@ import io
 import struct
 import tarfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from tests.support import load_script_module, test_tmpdir
@@ -252,6 +253,52 @@ class BundleTests(unittest.TestCase):
         with self.reader.Bundle.open(self.tarball()) as bundle:
             facts = self.reader.collect(bundle)
         self.assertEqual(facts["ecam"]["mcfg"]["ecam_base"], "0xe0000000")
+
+    def repack(self, archive: Path, mutate) -> None:
+        """Rewrite `archive` with `mutate(members)` applied to its entries."""
+
+        with tarfile.open(archive, "r:gz") as source:
+            members = [(m, source.extractfile(m).read() if m.isfile() else None)
+                       for m in source.getmembers()]
+        extra = mutate([member for member, _ in members]) or []
+        with tarfile.open(archive, "w:gz") as target:
+            for member, data in members:
+                target.addfile(member, io.BytesIO(data) if data is not None else None)
+            for member in extra:
+                target.addfile(member)
+
+    def test_a_tarball_reads_the_same_way_without_extraction_filters(self) -> None:
+        # The CI image's Debian bookworm ships Python 3.11.2, which predates
+        # the tarfile extraction filters.  The bundle must still open there,
+        # and must still not unpack a special mode bit onto the host.
+        self.populate()
+        archive = self.tarball()
+
+        def setuid(members):
+            next(m for m in members if m.isfile()).mode = 0o4777
+
+        self.repack(archive, setuid)
+        no_filters = unittest.mock.Mock(wraps=tarfile)
+        del no_filters.data_filter
+        with unittest.mock.patch.object(self.reader, "tarfile", no_filters):
+            with self.reader.Bundle.open(archive) as bundle:
+                facts = self.reader.collect(bundle)
+                modes = sorted(path.stat().st_mode & 0o7777 for path in bundle.files.values())
+        self.assertEqual(facts["ecam"]["mcfg"]["ecam_base"], "0xe0000000")
+        self.assertFalse([mode for mode in modes if mode & 0o7022], [oct(mode) for mode in modes])
+
+    def test_a_tarball_with_a_special_member_is_refused(self) -> None:
+        self.populate()
+        archive = self.tarball()
+
+        def fifo(members):
+            pipe = tarfile.TarInfo(name=f"{self.root.name}/pipe")
+            pipe.type = tarfile.FIFOTYPE
+            return [pipe]
+
+        self.repack(archive, fifo)
+        with self.assertRaisesRegex(self.reader.BundleError, "special tar member"):
+            self.reader.Bundle.open(archive)
 
     def test_a_tarball_leaves_no_unpacked_copy_behind(self) -> None:
         # A capture tarball is hundreds of megabytes, so unpacking it and

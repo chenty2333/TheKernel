@@ -237,12 +237,27 @@ class Bundle:
             extract_dir = Path(tempfile.mkdtemp(prefix="hw-facts-", dir=path.parent))
             try:
                 with tarfile.open(path) as archive:
-                    for member in archive.getmembers():
+                    members = archive.getmembers()
+                    for member in members:
                         if member.name.startswith("/") or ".." in Path(member.name).parts:
                             raise BundleError(f"refusing unsafe tar member: {member.name}")
                         if member.islnk() or member.issym():
                             raise BundleError(f"refusing linked tar member: {member.name}")
-                    archive.extractall(extract_dir, filter="data")
+                        if not (member.isfile() or member.isdir()):
+                            raise BundleError(f"refusing special tar member: {member.name}")
+                    if hasattr(tarfile, "data_filter"):
+                        archive.extractall(extract_dir, filter="data")
+                    else:
+                        # Extraction filters arrived in Python 3.12 and were
+                        # backported only as far as 3.11.4; the CI image's
+                        # Debian bookworm ships 3.11.2.  Everything the `data`
+                        # filter adds beyond the checks above is the mode
+                        # normalisation, so apply that by hand: no setuid,
+                        # setgid or sticky bit, no group/other write, and the
+                        # owner can always read and write what it unpacked.
+                        for member in members:
+                            member.mode = (member.mode & 0o755) | (0o700 if member.isdir() else 0o600)
+                        archive.extractall(extract_dir, members=members)
                 roots = [entry for entry in extract_dir.iterdir() if entry.is_dir()]
                 root = roots[0] if len(roots) == 1 else extract_dir
                 files = {

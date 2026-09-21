@@ -248,26 +248,38 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         functions = script[script.index("running() {"):script.index('case "${1:-}" in')]
         for stuck in (False, True):
             with self.subTest(stuck=stuck):
+                # `start-stop-daemon` cannot be stubbed as a shell function:
+                # a hyphen is not valid in a POSIX function name, and dash
+                # (Debian's /bin/sh, so the CI image's) rejects it with a
+                # syntax error that bash silently accepts.  The stub is an
+                # executable on PATH instead, and the countdown it shares with
+                # the script under test lives in a file.
+                stubs = pathlib.Path(self.enterContext(test_tmpdir()))
+                (stubs / "remaining").write_text("2\n")
+                stub = stubs / "start-stop-daemon"
+                stub.write_text('''#!/bin/sh
+case " $* " in
+    *" -t "*)
+        remaining=$(cat "$STUBS/remaining")
+        [ "$remaining" -gt 0 ] || exit 1
+        [ "$stuck" = yes ] || echo $((remaining - 1)) > "$STUBS/remaining"
+        exit 0 ;;
+    *) echo audio-stop ;;
+esac
+''')
+                stub.chmod(0o755)
                 harness = '''
 set -eu
 WESTON_HOME_MOUNT=/persistent-home
 USER=weston
 PIDFILE=/unused
-remaining=2
-start-stop-daemon() {
-    case " $* " in
-        *" -t "*)
-            [ "$remaining" -gt 0 ] || return 1
-            [ "$stuck" = yes ] || remaining=$((remaining - 1))
-            return 0 ;;
-        *) echo audio-stop ;;
-    esac
-}
 sleep() { echo wait; }
 '''
-                harness += f"stuck={'yes' if stuck else 'no'}\n" + functions
+                harness += functions
                 harness += "\npid_from_file() { return 1; }\nrm() { :; }\nstop\n"
-                result = subprocess.run(["sh"], input=harness, text=True, capture_output=True)
+                env = {**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}",
+                       "STUBS": str(stubs), "stuck": "yes" if stuck else "no"}
+                result = subprocess.run(["sh"], input=harness, text=True, capture_output=True, env=env)
                 self.assertEqual(result.returncode, 1 if stuck else 0)
                 self.assertEqual(result.stdout.splitlines().count("wait"), 10 if stuck else 2)
                 self.assertIn("audio-stop", result.stdout)
