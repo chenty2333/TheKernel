@@ -71,18 +71,53 @@ RAW_RE = re.compile(
     r"(?<![A-Za-z0-9_:.])(" + "|".join(RAW_PRINTS) + r")!\("
 )
 
-#: `#[cfg(test)]` (in any `all(test, …)` form) and a bare `mod tests {`
-#: declaration. Both introduce host test code, which may print freely.
-CFG_TEST = re.compile(r"#\[[^\]]*\btest\b[^\]]*\]|\bmod\s+tests?\s*\{")
+#: `#[test]`, `#[cfg(test)]` (in any `all(test, …)` form) and a bare
+#: `mod tests {` declaration. Each introduces host test code, which may print
+#: freely. `cfg_attr(test, …)` is not one of them: it changes an attribute and
+#: leaves the item in the kernel build.
+CFG_TEST = re.compile(r"#\[(?:test|cfg\([^\]]*\btest\b[^\]]*\))\]|\bmod\s+tests?\s*\{")
+
+#: `cfg(not(test))` names `test` and means the opposite: the item it guards is
+#: exactly the kernel half of a host/kernel split.
+CFG_NOT_TEST = re.compile(r"\bnot\s*\(\s*test\b")
+
+
+def item_end(masked: str, start: int) -> int:
+    """The last offset of the item that begins at `start`.
+
+    An item ends at its first `;` or at the `}` that closes its first body,
+    whichever comes first outside `()`/`[]`: `#[cfg(test)] use x;` guards one
+    line, and the `;` in `fn f() -> [u8; 4] {` is not the end of anything.
+    """
+    nesting = 0
+    for offset in range(start, len(masked)):
+        char = masked[offset]
+        if char in "([":
+            nesting += 1
+        elif char in ")]":
+            nesting -= 1
+        elif nesting == 0 and char == ";":
+            return offset
+        elif nesting == 0 and char == "{":
+            depth = 0
+            for close in range(offset, len(masked)):
+                if masked[close] == "{":
+                    depth += 1
+                elif masked[close] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return close
+            break
+    return len(masked) - 1
 
 
 def mask_host_code(masked: str) -> str:
-    """Blank the bodies of `#[cfg(test)]` items and of `mod tests` blocks.
+    """Blank the `#[cfg(test)]` items and `mod tests` blocks.
 
     A test module is host code even when it sits in the middle of a file that is
-    otherwise the kernel, so the scan is brace-matched from the attribute to the
-    end of the block it introduces rather than to the end of the file: code that
-    follows a test module is still policed.
+    otherwise the kernel, so the scan runs from the attribute to the end of the
+    one item it guards rather than to the end of the file: code that follows a
+    test module is still policed.
 
     The input is already masked, so braces inside strings and comments cannot
     mislead the count.
@@ -93,19 +128,10 @@ def mask_host_code(masked: str) -> str:
         found = CFG_TEST.search(masked, position)
         if found is None:
             break
-        start = masked.find("{", found.start())
-        if start < 0:
-            break
-        depth = 0
-        end = start
-        for offset in range(start, len(masked)):
-            if masked[offset] == "{":
-                depth += 1
-            elif masked[offset] == "}":
-                depth -= 1
-                if depth == 0:
-                    end = offset
-                    break
+        if CFG_NOT_TEST.search(found.group(0)):
+            position = found.end()
+            continue
+        end = item_end(masked, found.start())
         for offset in range(found.start(), end + 1):
             if out[offset] != "\n":
                 out[offset] = " "

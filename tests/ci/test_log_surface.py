@@ -51,6 +51,23 @@ class LogSurfaceCountingTests(unittest.TestCase):
         self.assertEqual(counted(
             'mod tests { fn t() { println!("noise"); } }\n'), 0)
 
+    def test_kernel_code_behind_a_test_named_attribute_is_counted(self) -> None:
+        """`not(test)` and `cfg_attr(test, …)` guard kernel code, not host code."""
+        self.assertEqual(counted(
+            '#[cfg(not(test))]\nfn real() { println!("counts"); }\n'), 1)
+        self.assertEqual(counted(
+            '#[cfg_attr(test, allow(dead_code))]\nfn real() { println!("counts"); }\n'), 1)
+
+    def test_a_test_guard_on_a_one_line_item_ends_at_its_semicolon(self) -> None:
+        """`#[cfg(test)] use …;` must not swallow the kernel function after it."""
+        self.assertEqual(counted(
+            '#[cfg(test)]\nuse std::println;\n'
+            'fn real() { println!("counts"); }\n'), 1)
+        # A `;` inside a signature's brackets is not the end of the item.
+        self.assertEqual(counted(
+            '#[cfg(test)]\nfn t() -> [u8; 4] { println!("noise"); [0; 4] }\n'
+            'fn real() { println!("counts"); }\n'), 1)
+
     def test_the_recursion_guard_on_a_nested_block_still_ends_the_block(self) -> None:
         source = ('#[cfg(test)]\nmod tests {\n'
                   '    fn t() { if true { println!("x"); } }\n}\n'
