@@ -56,7 +56,10 @@ impl EpollGraphLimits {
         self.max_parents_per_node
     }
 
-    /// Maximum epoll-to-leaf path length.
+    /// Maximum epoll-to-epoll links along one path.
+    ///
+    /// Ordinary fd leaves do not consume a level, matching Linux's
+    /// `EP_MAX_NESTS` accounting in `ep_loop_check()`.
     pub const fn max_nesting(self) -> usize {
         self.max_nesting
     }
@@ -321,12 +324,13 @@ impl EpollGraph {
             if edge.parent != current {
                 continue;
             }
-            let below = match edge.child {
-                Some(child) => {
-                    self.max_descendant_depth(child, budget, path_len.saturating_add(1))?
-                }
-                None => 0,
+            // Linux's `ep_loop_check_proc()` skips non-epoll children when it
+            // measures the epoll subtree, so an ordinary fd leaf adds no
+            // nesting level. Only an epoll-to-epoll interest extends the chain.
+            let Some(child) = edge.child else {
+                continue;
             };
+            let below = self.max_descendant_depth(child, budget, path_len.saturating_add(1))?;
             maximum = maximum.max(below.checked_add(1).ok_or(GraphError::Nesting)?);
         }
         Ok(maximum)
@@ -415,12 +419,15 @@ impl EpollGraph {
             }
         }
         let parent_depth = self.max_parent_depth(parent, &mut budget, 0)?;
-        let child_depth = match child {
-            Some(child) => self.max_descendant_depth(child, &mut budget, 0)?,
-            None => 0,
+        // The new interest itself counts one level only when it links two
+        // epoll instances; a non-epoll leaf is not part of the nesting chain
+        // and Linux never runs `ep_loop_check()` for such an insertion.
+        let (child_depth, new_link) = match child {
+            Some(child) => (self.max_descendant_depth(child, &mut budget, 0)?, 1usize),
+            None => (0usize, 0usize),
         };
         let combined = parent_depth
-            .checked_add(1)
+            .checked_add(new_link)
             .and_then(|depth| depth.checked_add(child_depth))
             .ok_or(GraphError::Nesting)?;
         if combined > self.limits.max_nesting {
@@ -502,8 +509,12 @@ mod tests {
         assert_eq!(graph.edge_count(), 2);
 
         graph.add_interest(c, Some(d)).unwrap();
-        assert_eq!(graph.add_interest(d, None), Err(GraphError::Nesting));
-        assert_eq!(graph.edge_count(), 3);
+        // At the three-link limit a non-epoll leaf is still allowed: Linux
+        // does not count ordinary fd interests as nesting levels.
+        graph.add_interest(d, None).unwrap();
+        let e = graph.register(epoll_id(5)).unwrap();
+        assert_eq!(graph.add_interest(d, Some(e)), Err(GraphError::Nesting));
+        assert_eq!(graph.edge_count(), 4);
     }
 
     #[test]
@@ -512,16 +523,72 @@ mod tests {
         let root = graph.register(epoll_id(1)).unwrap();
         let middle = graph.register(epoll_id(2)).unwrap();
         let leaf_owner = graph.register(epoll_id(3)).unwrap();
+        let deep = graph.register(epoll_id(4)).unwrap();
 
         graph.add_interest(middle, Some(leaf_owner)).unwrap();
-        graph.add_interest(leaf_owner, None).unwrap();
+        graph.add_interest(leaf_owner, Some(deep)).unwrap();
+        graph.add_interest(deep, None).unwrap();
         graph.add_interest(root, Some(middle)).unwrap();
 
-        let outer = graph.register(epoll_id(4)).unwrap();
+        let outer = graph.register(epoll_id(5)).unwrap();
         assert_eq!(
             graph.add_interest(outer, Some(root)),
             Err(GraphError::Nesting)
         );
+    }
+
+    #[test]
+    fn fifth_epoll_edge_is_rejected_in_both_insertion_directions() {
+        let mut graph = EpollGraph::try_new(graph_id(1), limits(7, 12, 8, 4)).unwrap();
+        let e0 = graph.register(epoll_id(1)).unwrap();
+        let e1 = graph.register(epoll_id(2)).unwrap();
+        let e2 = graph.register(epoll_id(3)).unwrap();
+        let e3 = graph.register(epoll_id(4)).unwrap();
+        let e4 = graph.register(epoll_id(5)).unwrap();
+        let e5 = graph.register(epoll_id(6)).unwrap();
+
+        // Four epoll-to-epoll links are Linux's `EP_MAX_NESTS`.
+        graph.add_interest(e0, Some(e1)).unwrap();
+        graph.add_interest(e1, Some(e2)).unwrap();
+        graph.add_interest(e2, Some(e3)).unwrap();
+        graph.add_interest(e3, Some(e4)).unwrap();
+
+        // A fifth link below the deepest epoll is rejected even though the
+        // proposed child `e5` is an empty epoll with no descendants.
+        assert_eq!(graph.add_interest(e4, Some(e5)), Err(GraphError::Nesting));
+        // Prepending a parent above the outermost epoll is the same fifth link.
+        assert_eq!(graph.add_interest(e5, Some(e0)), Err(GraphError::Nesting));
+        assert_eq!(graph.edge_count(), 4);
+    }
+
+    #[test]
+    fn ordinary_leaf_interests_do_not_consume_nesting_depth() {
+        let mut graph = EpollGraph::try_new(graph_id(1), limits(7, 12, 8, 4)).unwrap();
+        let e0 = graph.register(epoll_id(1)).unwrap();
+        let e1 = graph.register(epoll_id(2)).unwrap();
+        let e2 = graph.register(epoll_id(3)).unwrap();
+        let e3 = graph.register(epoll_id(4)).unwrap();
+        let e4 = graph.register(epoll_id(5)).unwrap();
+        let e5 = graph.register(epoll_id(6)).unwrap();
+
+        // Reach four links by growing downward and then upward.
+        graph.add_interest(e0, Some(e1)).unwrap();
+        graph.add_interest(e1, Some(e2)).unwrap();
+        graph.add_interest(e2, Some(e3)).unwrap();
+        // The descendant walk must ignore an already-published plain leaf
+        // when a fourth epoll link is prepended above the existing chain.
+        graph.add_interest(e3, None).unwrap();
+        graph.add_interest(e4, Some(e0)).unwrap();
+
+        // Plain fd leaves are accepted at the maximum epoll depth too.
+        graph.add_interest(e3, None).unwrap();
+        graph.add_interest(e2, None).unwrap();
+        graph.add_interest(e4, None).unwrap();
+
+        // The leaves consumed no level: a fifth epoll link still fails now.
+        assert_eq!(graph.add_interest(e3, Some(e5)), Err(GraphError::Nesting));
+        assert_eq!(graph.add_interest(e5, Some(e4)), Err(GraphError::Nesting));
+        assert_eq!(graph.edge_count(), 8);
     }
 
     #[test]

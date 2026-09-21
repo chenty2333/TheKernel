@@ -32,7 +32,9 @@ use super::{
 };
 use crate::task::AX_FILE_LIMIT;
 
-const EPOLL_MAX_NESTS: usize = 5;
+// Linux `EP_MAX_NESTS`: at most four epoll-to-epoll links per chain. Ordinary
+// fd leaves are not counted (`ep_loop_check_proc()` skips non-epoll children).
+const EPOLL_MAX_NESTS: usize = 4;
 const EPOLL_CORE_CAPACITY: usize = AX_FILE_LIMIT;
 const EPOLL_GLOBAL_CORE_SLOTS: usize = 65_536;
 const EPOLL_GRAPH_NODES: usize = 4096;
@@ -1070,7 +1072,7 @@ impl Epoll {
         Ok((key, file))
     }
 
-    fn validate_target(file: &FileDescription) -> AxResult<()> {
+    pub(crate) fn validate_target(file: &FileDescription) -> AxResult<()> {
         match FileLikeKind::from_file_like(file) {
             FileLikeKind::Regular | FileLikeKind::Directory => Err(LinuxError::EPERM.into()),
             FileLikeKind::Fifo | FileLikeKind::Socket | FileLikeKind::Other => Ok(()),

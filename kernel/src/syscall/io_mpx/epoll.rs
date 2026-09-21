@@ -99,7 +99,7 @@ fn parse_epoll_ctl_event<M: UserMemory + ?Sized>(
     let raw = read_epoll_event(memory, event)?;
     let raw_events = strip_epollwakeup(raw.events);
     let flag_bits = raw_events & (EPOLLET | EPOLLONESHOT);
-    let events = linux_epoll_events(raw_events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE))?;
+    let events = linux_epoll_events(raw_events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE));
     let flags = EpollFlags::from_bits(flag_bits).ok_or(AxError::InvalidInput)?;
     Ok(EpollCtlRequest {
         event: EpollEvent {
@@ -162,7 +162,20 @@ pub fn sys_epoll_ctl<M: UserMemory + ?Sized>(
     };
 
     let epoll_description = get_file_description(epfd)?;
+    // `do_epoll_ctl()` resolves the eventpoll descriptor with `CLASS(fd)`,
+    // whose `fdget()` rejects `FMODE_PATH`, so an O_PATH epfd is EBADF before
+    // anything else is examined.
+    check_epoll_target(epoll_description.is_path_only())?;
     let target = get_file_description(fd)?;
+    // The target lookup also precedes every `do_epoll_ctl_file()` test, and
+    // its `fdget()` likewise rejects FMODE_PATH: an O_PATH target is EBADF,
+    // *not* the EPERM a missing `->poll()` would produce.
+    check_epoll_target(target.is_path_only())?;
+    debug!("sys_epoll_ctl <= epfd: {epfd}, op: {op}, fd: {fd}");
+    // `do_epoll_ctl_file()` tests pollability before the self/epoll-type test:
+    // any file whose `->poll()` is absent (regular files and directories)
+    // answers -EPERM, for ADD, MOD, DEL, and even an unknown op alike.
+    Epoll::validate_target(&target)?;
     if Arc::ptr_eq(&epoll_description, &target) {
         return Err(AxError::InvalidInput);
     }
@@ -171,10 +184,6 @@ pub fn sys_epoll_ctl<M: UserMemory + ?Sized>(
         .clone()
         .downcast_arc::<Epoll>()
         .map_err(|_| AxError::InvalidInput)?;
-    debug!("sys_epoll_ctl <= epfd: {epfd}, op: {op}, fd: {fd}");
-    // Linux rejects O_PATH as a non-pollable target before interpreting the
-    // control operation; ADD, MOD, DEL, and even an unknown op report EBADF.
-    check_epoll_target(target.is_path_only())?;
 
     // `do_epoll_ctl_file()` then applies `ep_take_care_of_epollwakeup()` and
     // the EPOLLEXCLUSIVE admission rule *before* the operation switch and any
@@ -268,11 +277,31 @@ fn do_epoll_wait<M: UserMemory + ?Sized>(
     };
     debug!("sys_epoll_wait <= epfd: {epfd}, maxevents: {maxevents}, timeout: {timeout:?}");
 
-    let epoll = Epoll::from_fd(epfd)?;
+    // Linux `do_epoll_wait()` resolves the descriptor with `CLASS(fd)`
+    // (`fdget()` rejects `FMODE_PATH`, so a bad or O_PATH epfd is EBADF), and
+    // only then runs `ep_check_params()`: maxevents EINVAL, `access_ok`
+    // EFAULT, and finally the `is_file_epoll` EINVAL.
+    let epoll_description = get_file_description(epfd)?;
+    check_epoll_target(epoll_description.is_path_only())?;
 
-    if maxevents <= 0 {
+    // access_ok() checks the address extent, not whether pages are mapped or
+    // writable. An empty wait may return zero with an unmapped user pointer;
+    // actual write permissions are checked only when copying ready events.
+    const EP_MAX_EVENTS: i32 = i32::MAX / size_of::<epoll_event>() as i32;
+    if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
         return Err(AxError::InvalidInput);
     }
+    let end = (events as usize)
+        .checked_add(maxevents as usize * size_of::<epoll_event>())
+        .ok_or(AxError::BadAddress)?;
+    if end > crate::config::TASK_SIZE_MAX {
+        return Err(AxError::BadAddress);
+    }
+    let epoll = epoll_description
+        .inner
+        .clone()
+        .downcast_arc::<Epoll>()
+        .map_err(|_| AxError::InvalidInput)?;
     let deadline = timeout.map(|dur| axhal::time::wall_time().saturating_add(dur));
     let mut wait_once = || {
         crate::readiness::block_on_poll_io_until(
@@ -491,12 +520,20 @@ mod tests {
         assert_eq!(request.event.events, IoEvents::READABLE);
         assert!(request.flags.contains(EpollFlags::EDGE_TRIGGER));
         assert!(request.flags.contains(EpollFlags::ONESHOT));
-        assert_eq!(request.raw_events, EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLIN);
+        assert_eq!(
+            request.raw_events,
+            EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLIN
+        );
     }
 
     #[test]
-    fn unknown_event_bits_remain_rejected() {
-        assert!(matches!(parse(0x0000_1000), Err(AxError::InvalidInput)));
+    fn unknown_event_bits_are_stored_verbatim_like_linux() {
+        // Linux never validates the caller's mask: `epoll_ctl(ADD, EPOLLIN |
+        // 0x1000)` succeeds, keeps the unknown bit in `epi->event.events`,
+        // and the bit simply never fires because no `->poll()` raises it.
+        let request = parse(EPOLLIN | 0x0000_1000).unwrap();
+        assert_eq!(request.event.events, IoEvents::READABLE);
+        assert_eq!(request.raw_events, EPOLLIN | 0x0000_1000);
     }
 
     #[test]

@@ -2,29 +2,13 @@ use alloc::vec::Vec;
 
 use crate::{EpollId, FdNumber, InterestMask, InterestMode, OfdId, ReadyMask};
 
-/// Linux `EPOLL_CTL_ADD`.
-pub const EPOLL_CTL_ADD: u32 = 1;
-/// Linux `EPOLL_CTL_DEL`.
-pub const EPOLL_CTL_DEL: u32 = 2;
-/// Linux `EPOLL_CTL_MOD`.
-pub const EPOLL_CTL_MOD: u32 = 3;
-
-/// Linux `EPOLLIN`.
-pub const EPOLLIN: u32 = 0x0000_0001;
-/// Linux `EPOLLOUT`.
-pub const EPOLLOUT: u32 = 0x0000_0004;
-/// Linux `EPOLLERR`.
-pub const EPOLLERR: u32 = 0x0000_0008;
-/// Linux `EPOLLHUP`.
-pub const EPOLLHUP: u32 = 0x0000_0010;
-/// Linux `EPOLLEXCLUSIVE`.
-pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
-/// Linux `EPOLLWAKEUP`.
-pub const EPOLLWAKEUP: u32 = 1 << 29;
-/// Linux `EPOLLONESHOT`.
-pub const EPOLLONESHOT: u32 = 1 << 30;
-/// Linux `EPOLLET`.
-pub const EPOLLET: u32 = 1 << 31;
+// The epoll UAPI constants come from the shared x86_64 UAPI table rather
+// than hand-written copies, so one source of truth feeds both this policy
+// crate and the kernel's `linux_raw_sys` call sites.
+pub use linux_raw_sys::general::{
+    EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLERR, EPOLLET, EPOLLHUP, EPOLLIN,
+    EPOLLEXCLUSIVE, EPOLLONESHOT, EPOLLWAKEUP, EPOLLOUT,
+};
 
 /// Linux `EPOLLEXCLUSIVE_OK_BITS` (`fs/eventpoll.c`).
 ///

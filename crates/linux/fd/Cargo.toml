@@ -13,6 +13,9 @@ readme = "README.md"
 keywords = ["kernel", "linux", "no-std", "epoll"]
 categories = ["no-std", "os"]
 
+[dependencies]
+linux-raw-sys = { version = "0.12", default-features = false, features = ["general", "no_std"] }
+
 [features]
 default = ["alloc"]
 alloc = []

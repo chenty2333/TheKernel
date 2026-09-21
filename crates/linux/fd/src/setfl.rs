@@ -27,18 +27,10 @@
 //! is preserved. `O_NDELAY == O_NONBLOCK` on x86_64/asm-generic, so the SunOS
 //! emulation block is behaviourally dead there and is not modelled.
 
-/// `_IOC`-independent open-status bits from `include/uapi/asm-generic/fcntl.h`
-/// that `F_SETFL` is allowed to change.
-pub const O_APPEND: u32 = 0o2000;
-/// `O_NONBLOCK`; numerically identical to `O_NDELAY` on x86_64.
-pub const O_NONBLOCK: u32 = 0o4000;
-/// `O_NDELAY` from `include/uapi/asm-generic/fcntl.h`. On x86_64 this is the
-/// same bit as [`O_NONBLOCK`], which the static assertion below relies on.
-pub const O_NDELAY: u32 = O_NONBLOCK;
-/// `O_DIRECT` — on a FIFO this selects Linux's packetized pipe mode.
-pub const O_DIRECT: u32 = 0o40000;
-/// `O_NOATIME`.
-pub const O_NOATIME: u32 = 0o1000000;
+// The `F_SETFL` open-status bits come from the shared x86_64 UAPI table
+// rather than hand-written copies, so one source of truth feeds both this
+// policy crate and the kernel's `linux_raw_sys` call sites.
+pub use linux_raw_sys::general::{O_APPEND, O_DIRECT, O_NDELAY, O_NOATIME, O_NONBLOCK};
 
 /// Linux's `SETFL_MASK` (defined in `fs/fcntl.c`, not in a public header).
 ///

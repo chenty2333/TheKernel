@@ -244,9 +244,8 @@ impl PipeRing {
     fn push_source(&mut self, src: &mut IoSrc, max_len: usize) -> AxResult<usize> {
         let (left, right) = self.bytes.vacant_slices_mut();
         // The ring buffer exposes valid writable byte slices here.
-        let left = unsafe {
-            core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
-        };
+        let left =
+            unsafe { core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len()) };
         let right = unsafe {
             core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
         };
@@ -400,7 +399,9 @@ fn write_pipe_buffer(
     atomic_len: Option<usize>,
 ) -> AxResult<PipeTransfer> {
     let mut ring = buffer.lock();
-    let room = ring.vacant_len().min(stream_write_room(&ring, src.remaining()));
+    let room = ring
+        .vacant_len()
+        .min(stream_write_room(&ring, src.remaining()));
     if atomic_len.is_some_and(|len| room < len) {
         return Ok(PipeTransfer::none());
     }
@@ -493,13 +494,22 @@ fn write_pipe_packets(buffer: &Mutex<PipeRing>, src: &mut IoSrc) -> AxResult<Pip
     })
 }
 
-/// Copies exactly the leading `len` bytes of the ring into `dst`.
+/// Copies up to the leading `len` bytes of the ring into `dst`.
+///
+/// Linux `pipe_read()` breaks out of the copy loop on a destination fault and
+/// returns the bytes already copied, reporting `-EFAULT` only when nothing was
+/// copied at all (`fs/pipe.c:446-450`).  A fault on the second ring slice
+/// therefore keeps the first slice's count instead of discarding it.
 fn copy_ring_prefix(ring: &PipeRing, len: usize, dst: &mut IoDst) -> AxResult<usize> {
     let (left, right) = ring.bytes.as_slices();
     let left_len = left.len().min(len);
     let mut count = dst.write(&left[..left_len])?;
     if count == left_len && len > left_len {
-        count += dst.write(&right[..len - left_len])?;
+        match dst.write(&right[..len - left_len]) {
+            Ok(written) => count += written,
+            Err(err) if count == 0 => return Err(err),
+            Err(_) => {}
+        }
     }
     Ok(count)
 }
@@ -544,7 +554,23 @@ fn read_pipe_buffer(buffer: &Mutex<PipeRing>, dst: &mut IoDst) -> AxResult<PipeT
             }
         } else {
             let chars = len.min(total_len);
-            let written = copy_ring_prefix(&ring, chars, dst)?;
+            let written = match copy_ring_prefix(&ring, chars, dst) {
+                Ok(written) => written,
+                Err(err) => {
+                    // `if (written < chars) { if (!ret) ret = -EFAULT; break; }`
+                    // (`fs/pipe.c:446-450`): a copy fault after the stream
+                    // prefix already transferred bytes returns that count, so
+                    // data userspace received is not reported as lost.
+                    if read == 0 {
+                        return Err(err);
+                    }
+                    return Ok(PipeTransfer {
+                        len: read,
+                        wake_readers: false,
+                        became_writable: !was_writable && pipe_poll_writable(&ring),
+                    });
+                }
+            };
             read += written;
             if written < chars {
                 // `if (written < chars) { if (!ret) ret = -EFAULT; break; }`
@@ -595,7 +621,40 @@ fn head_run(ring: &PipeRing) -> PipeRun {
     }
 }
 
+/// The buffer covering absolute stream position `pos` as one run of bytes.
+///
+/// `tee_pipe_buf_ops` walks the source buffers at increasing offsets without
+/// consuming them, so a tee that spans several buffers needs the run at the
+/// running offset, not the one at the read index.  `pos` must lie inside the
+/// occupied region.
+fn run_at(ring: &PipeRing, pos: u64) -> PipeRun {
+    let (first, second) = ring.marks.as_slices();
+    for mark in first.iter().chain(second) {
+        let end = mark.start + mark.len as u64;
+        if pos < mark.start {
+            return PipeRun {
+                len: (mark.start - pos) as usize,
+                flags: None,
+            };
+        }
+        if pos < end {
+            return PipeRun {
+                len: (end - pos) as usize,
+                flags: Some(mark.flags),
+            };
+        }
+    }
+    PipeRun {
+        len: (ring.write_pos - pos) as usize,
+        flags: None,
+    }
+}
+
 /// Copies `run` into `dst`, preserving its buffer flags.
+///
+/// `src_offset` is the run's distance from the source read index; `splice`
+/// passes zero because it consumes each run as it goes, while `tee` leaves the
+/// source untouched and walks the offset forward instead.
 ///
 /// `link_pipe()` (tee) and `splice_pipe_to_pipe()` both carry `buf->flags`
 /// across, clearing only `PIPE_BUF_FLAG_GIFT` and `PIPE_BUF_FLAG_CAN_MERGE`
@@ -606,6 +665,7 @@ fn copy_pipe_run(
     dst: &mut PipeRing,
     run: PipeRun,
     max_len: usize,
+    src_offset: usize,
 ) -> usize {
     if run.len == 0 {
         return 0;
@@ -623,7 +683,13 @@ fn copy_pipe_run(
     }
     let written = {
         let (left, right) = src.bytes.as_slices();
-        copy_slices_to_ring(&mut dst.bytes, &[left, right], take)
+        let left_skip = src_offset.min(left.len());
+        let right_skip = src_offset - left_skip;
+        copy_slices_to_ring(
+            &mut dst.bytes,
+            &[&left[left_skip..], &right[right_skip..]],
+            take,
+        )
     };
     if written == 0 {
         return 0;
@@ -639,7 +705,7 @@ fn move_pipe_buffer(src: &mut PipeRing, dst: &mut PipeRing, max_len: usize) -> P
     let mut total = 0usize;
     while total < max_len {
         let run = head_run(src);
-        let written = copy_pipe_run(src, dst, run, max_len - total);
+        let written = copy_pipe_run(src, dst, run, max_len - total, 0);
         if written == 0 {
             break;
         }
@@ -653,11 +719,15 @@ fn move_pipe_buffer(src: &mut PipeRing, dst: &mut PipeRing, max_len: usize) -> P
     }
 }
 
+/// `link_pipe()` (`fs/splice.c:1807-1827`): duplicates the source buffers into
+/// `dst` without consuming them, walking a running offset across the source
+/// marks and stream regions so no byte or packet mark is copied twice.
 fn copy_pipe_buffer(src: &PipeRing, dst: &mut PipeRing, max_len: usize) -> PipeTransfer {
     let mut total = 0usize;
-    while total < max_len {
-        let run = head_run(src);
-        let written = copy_pipe_run(src, dst, run, max_len - total);
+    let available = max_len.min(src.occupied_len());
+    while total < available {
+        let run = run_at(src, src.read_pos + total as u64);
+        let written = copy_pipe_run(src, dst, run, available - total, total);
         if written == 0 {
             break;
         }
@@ -2296,8 +2366,14 @@ mod tests {
         let mut ring = PipeRing::new(PIPE_BUF_SIZE * 4);
         assert_eq!(ring.bytes.push_slice(&[b's'; 100]), 100);
         ring.commit_stream(100);
-        assert_eq!(stream_write_room(&ring, PIPE_BUF_SIZE + 7), 7 + 3 * PIPE_BUF_SIZE);
-        assert_eq!(stream_write_room(&ring, PIPE_BUF_SIZE * 8), 3 * PIPE_BUF_SIZE);
+        assert_eq!(
+            stream_write_room(&ring, PIPE_BUF_SIZE + 7),
+            7 + 3 * PIPE_BUF_SIZE
+        );
+        assert_eq!(
+            stream_write_room(&ring, PIPE_BUF_SIZE * 8),
+            3 * PIPE_BUF_SIZE
+        );
     }
 
     #[test]

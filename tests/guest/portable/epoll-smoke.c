@@ -461,6 +461,54 @@ static int test_nested(void) {
     return 0;
 }
 
+/* Linux `EP_MAX_NESTS` allows at most four epoll-to-epoll links in one chain,
+ * while a plain fd leaf consumes no nesting level because
+ * `ep_loop_check_proc()` skips non-epoll children. */
+static int test_nesting_limit(void) {
+    int chain[6];
+    int result = 0;
+    for (size_t index = 0; index < 6; ++index) {
+        chain[index] = epoll_create1(EPOLL_CLOEXEC);
+        if (chain[index] < 0) {
+            return fail("nesting-limit-create");
+        }
+    }
+    int pipe_fds[2];
+    if (pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC) != 0) {
+        return fail("nesting-limit-pipe");
+    }
+    for (size_t index = 0; index < 4 && !result; ++index) {
+        result = ctl_add(chain[index], chain[index + 1], EPOLLIN,
+                         0x30 + index, "nesting-limit-link");
+    }
+    /* The deepest epoll still accepts an ordinary fd leaf at this depth. */
+    if (!result) {
+        result = ctl_add(chain[4], pipe_fds[0], EPOLLIN, 0x34,
+                         "nesting-limit-leaf");
+    }
+    /* A fifth epoll-to-epoll link is ELOOP in either direction, even though
+     * the target epoll is empty. */
+    if (!result) {
+        struct epoll_event event = {.events = EPOLLIN, .data.u64 = 0x35};
+        result = ctl_expect_errno(chain[4], EPOLL_CTL_ADD, chain[5], &event,
+                                  ELOOP, "nesting-limit-fifth-link");
+    }
+    if (!result) {
+        struct epoll_event event = {.events = EPOLLIN, .data.u64 = 0x36};
+        result = ctl_expect_errno(chain[5], EPOLL_CTL_ADD, chain[0], &event,
+                                  ELOOP, "nesting-limit-fifth-upward");
+    }
+    for (size_t index = 0; index < 6; ++index) {
+        close(chain[index]);
+    }
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    if (!result) {
+        marker("THEKERNEL_EPOLL_NESTING_LIMIT_OK");
+    }
+    return result;
+}
+
 struct exclusive_waiter {
     int epoll_fd;
     _Atomic pid_t tid;
@@ -741,6 +789,43 @@ static int test_exclusive(void) {
     return 0;
 }
 
+/* access_ok checks address bounds, not PTE presence. Copy faults matter only
+ * when epoll actually has an event to return. Use raw syscalls so libc's
+ * buffer-size annotations do not preempt these deliberately invalid ranges. */
+static int test_wait_pointer_admission(void) {
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    int ev = eventfd(0, EFD_CLOEXEC);
+    if (ep < 0 || ev < 0) return fail("wait-admission-create");
+    struct { int fd; uintptr_t ptr; int count; long result; int error; } cases[] = {
+        {-1, UINTPTR_MAX, 0, -1, EBADF},
+        {ep, UINTPTR_MAX, 0, -1, EINVAL},
+        {ev, UINTPTR_MAX, 1, -1, EFAULT},
+        {ev, 1, 1, -1, EINVAL},
+        {ep, 1, 1, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        errno = 0;
+        long rc = syscall(SYS_epoll_wait, cases[i].fd, cases[i].ptr,
+                          cases[i].count, 0);
+        if (rc != cases[i].result || errno != cases[i].error)
+            return fail_value("wait-pointer-admission", rc, cases[i].result);
+    }
+    struct epoll_event interest = {.events = EPOLLIN, .data.u64 = 7};
+    uint64_t one = 1;
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, ev, &interest) ||
+        write(ev, &one, sizeof(one)) != sizeof(one))
+        return fail("wait-admission-ready");
+    errno = 0;
+    if (syscall(SYS_epoll_wait, ep, (uintptr_t)1, 1, 0) != -1 || errno != EFAULT)
+        return fail("wait-ready-copy-fault");
+    struct epoll_event ready;
+    if (epoll_wait(ep, &ready, 1, 0) != 1 || ready.data.u64 != 7)
+        return fail("wait-fault-preserves-ready-event");
+    close(ev);
+    close(ep);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int thekernel_mode = 0;
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -759,8 +844,8 @@ int main(int argc, char **argv) {
     self_path = argv[0];
 
     if (test_level_vs_edge() || test_et_partial_read() || test_oneshot() ||
-        test_ctl_errors() || test_hup() || test_timeouts() ||
-        test_ofd_close_and_fd_reuse() || test_nested() ||
+        test_ctl_errors() || test_wait_pointer_admission() || test_hup() || test_timeouts() ||
+        test_ofd_close_and_fd_reuse() || test_nested() || test_nesting_limit() ||
         (thekernel_mode ? test_exclusive_admission() : test_exclusive())) {
         return 1;
     }

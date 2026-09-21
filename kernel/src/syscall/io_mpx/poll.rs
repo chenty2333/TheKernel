@@ -225,21 +225,24 @@ pub fn sys_poll(
     // Linux `SYSCALL_DEFINE3(poll)` converts `-ERESTARTNOHAND` into
     // `set_restart_fn(restart_block, do_restart_poll)`, i.e.
     // `-ERESTART_RESTARTBLOCK` with the *absolute* expiry and the original
-    // descriptor array recorded. `ppoll` deliberately does not do this: it
-    // returns `-ERESTARTNOHAND` and relies on the remaining-time write-back to
-    // its `tsp`, so a replay resumes with the shortened timeout.
+    // descriptor array recorded: the transparent restart re-enters
+    // `restart_syscall` and resumes in `do_restart_poll()`, so a signal
+    // interruption never recomputes the relative timeout from zero. `ppoll`
+    // deliberately does not do this: it returns `-ERESTARTNOHAND` and relies
+    // on the remaining-time write-back to its `tsp`, so a replay resumes with
+    // the shortened timeout.
     let deadline = timeout.map(|dur| wall_time().saturating_add(dur));
     let result = do_poll(None, &mut poll_fds, timeout, None, &caller, fds);
     if matches!(result, Err(AxError::Interrupted)) {
-        // `set_restart_fn()` returns `-ERESTARTNOHAND`, so the block is *armed*
-        // for an explicit `restart_syscall()` while the interrupted call itself
-        // still replays: `arch_do_signal_or_restart()` reloads `orig_ax` and
-        // rewinds the instruction pointer for that code, which re-enters
-        // `sys_poll` with the recorded timeout. `do_restart_poll()` -- and with
-        // it the absolute `end_time` -- is only reachable from userspace.
+        // `install_restart_block()` rewrites the pending restart action to
+        // `restart_syscall`, mirroring `-ERESTART_RESTARTBLOCK`: both the
+        // no-handler transparent restart and the return from a handler resume
+        // in `restart_poll()` with the recorded absolute `deadline`, which
+        // also keeps the block reachable for a handler's explicit
+        // `restart_syscall()`.
         current()
             .as_thread()
-            .arm_restart_block(RestartBlock::Poll(PollRestart {
+            .install_restart_block(RestartBlock::Poll(PollRestart {
                 fds: fds.address().as_usize(),
                 nfds: nfds as u32,
                 deadline,
@@ -269,7 +272,9 @@ pub(crate) fn restart_poll(
     if matches!(result, Err(AxError::Interrupted)) {
         // Linux re-arms the same block from `do_restart_poll()` whenever
         // `do_sys_poll()` reports `-ERESTARTNOHAND` again.
-        current().as_thread().arm_restart_block(RestartBlock::Poll(block));
+        current()
+            .as_thread()
+            .install_restart_block(RestartBlock::Poll(block));
     }
     result
 }

@@ -72,10 +72,10 @@ pub(crate) struct NanosleepRestart {
 ///
 /// `SYSCALL_DEFINE3(poll)` records the caller's descriptor array and the
 /// absolute `end_time` through `set_restart_fn(restart_block, do_restart_poll)`.
-/// That helper returns `-ERESTARTNOHAND`, so this block is *not* what the
-/// no-handler path uses -- that path replays the syscall -- and
-/// `do_restart_poll()` runs only when userspace calls `restart_syscall()`
-/// itself, as a signal handler can.
+/// That helper returns `-ERESTART_RESTARTBLOCK`, so the interrupted call's
+/// transparent restart -- with or without a handler -- re-enters
+/// `restart_syscall`, and `do_restart_poll()` resumes the wait at the
+/// absolute expiry instead of recomputing the relative timeout.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct PollRestart {
     /// User `struct pollfd` array, re-read on every restart exactly like
@@ -309,31 +309,16 @@ impl RestartTracker {
         restart.action.kind = RestartActionKind::RestartBlock(block);
     }
 
-    /// Arms `restart_syscall` without changing how the interrupted syscall
-    /// itself resumes.
-    ///
-    /// Linux keeps those decisions apart: `set_restart_fn()` records the
-    /// function an explicit `restart_syscall()` will call, while the syscall's
-    /// *return code* decides what happens when no handler runs --
-    /// `-ERESTART_RESTARTBLOCK` re-enters `restart_syscall` on its own,
-    /// `-ERESTARTNOHAND` replays the original syscall. `poll` returns the
-    /// latter (see `sys_poll`), so its block must stay reachable for a
-    /// handler's `restart_syscall()` while the no-handler path still replays.
-    fn arm_restart_block(&mut self, block: RestartBlock) {
-        self.armed_restart_block = Some(block);
-    }
-
     fn begin_restart_syscall(&mut self, uctx: &UserContext) -> Option<RestartBlock> {
         let block = self.armed_restart_block.take()?;
         self.current_restart = Some(PendingRestart {
             // The syscall being restarted here is the caller's
             // `restart_syscall`, and every block in this ledger resumes work
-            // whose Linux return code is either `-ERESTART_RESTARTBLOCK`
-            // (`nanosleep`, futex) or `-ERESTARTNOHAND` (`poll`).
-            // `handle_signal()` on x86_64 maps both to `-EINTR`
-            // (`arch/x86/kernel/signal.c`), even when the handler asked for
-            // `SA_RESTART`, so a second interrupt of a restarted wait is never
-            // replayed behind the handler's back.
+            // whose Linux return code is `-ERESTART_RESTARTBLOCK`
+            // (`nanosleep`, futex, `poll`). `handle_signal()` on x86_64 maps
+            // it to `-EINTR` (`arch/x86/kernel/signal.c`), even when the
+            // handler asked for `SA_RESTART`, so a second interrupt of a
+            // restarted wait is never replayed behind the handler's back.
             class: RestartClass::NoHand,
             action: RestartAction {
                 syscall: SavedSyscall::capture(uctx),
@@ -456,12 +441,6 @@ impl Thread {
 
     pub(crate) fn install_restart_block(&self, block: RestartBlock) {
         self.restart.lock().install_restart_block(block);
-    }
-
-    /// Arms [`RestartBlock`] for an explicit `restart_syscall()` only; see
-    /// [`RestartTracker::arm_restart_block`].
-    pub(crate) fn arm_restart_block(&self, block: RestartBlock) {
-        self.restart.lock().arm_restart_block(block);
     }
 
     pub(crate) fn begin_restart_syscall(&self, uctx: &UserContext) -> Option<RestartBlock> {

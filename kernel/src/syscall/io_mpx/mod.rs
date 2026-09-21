@@ -190,8 +190,10 @@ fn io_to_linux_poll(events: IoEvents) -> u32 {
     linux
 }
 
-fn linux_epoll_events(events: u32) -> AxResult<IoEvents> {
-    let mut remaining = events;
+fn linux_epoll_events(events: u32) -> IoEvents {
+    // Linux stores the caller's event mask verbatim in `epi->event.events`
+    // and only ever intersects it with what `->poll()` reported, so bits with
+    // no readiness translation are accepted and simply never fire.
     let mut generic = IoEvents::empty();
     for (linux, event) in [
         (EPOLLIN, IoEvents::READABLE),
@@ -206,16 +208,11 @@ fn linux_epoll_events(events: u32) -> AxResult<IoEvents> {
         (EPOLLMSG, IoEvents::MESSAGE),
         (EPOLLRDHUP, IoEvents::READ_HANGUP),
     ] {
-        if remaining & linux != 0 {
+        if events & linux != 0 {
             generic |= event;
-            remaining &= !linux;
         }
     }
-    if remaining == 0 {
-        Ok(generic)
-    } else {
-        Err(AxError::InvalidInput)
-    }
+    generic
 }
 
 fn io_to_linux_epoll(events: IoEvents) -> u32 {
