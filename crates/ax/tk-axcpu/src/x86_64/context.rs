@@ -628,8 +628,6 @@ impl TaskContext {
                         crate::asm::write_user_page_table(next_ctx.cr3);
                     }
                 }
-                #[cfg(feature = "asid-switch-diagnostics")]
-                crate::record_asid_switch_decision(decision);
             }
         }
         unsafe { context_switch(&mut self.rsp, &next_ctx.rsp) }

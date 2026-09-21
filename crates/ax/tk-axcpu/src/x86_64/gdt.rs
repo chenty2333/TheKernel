@@ -10,14 +10,39 @@ use x86_64::{
 
 /// The x86 TSS IST slot dedicated to non-maskable interrupts.
 pub(super) const NMI_IST_INDEX: u16 = 0;
-const NMI_STACK_BYTES: usize = 16 * 1024;
+/// The TSS IST slot dedicated to a double fault.
+pub(super) const DOUBLE_FAULT_IST_INDEX: u16 = 1;
+/// The TSS IST slot dedicated to a machine check.
+pub(super) const MACHINE_CHECK_IST_INDEX: u16 = 2;
+
+/// One stack per IST slot above, in that order.
+///
+/// Linux gives DF, NMI, DB and MCE a stack of their own each
+/// (`tss->x86_tss.ist[IST_INDEX_*]`, arch/x86/kernel/cpu/common.c:2375-2378) and
+/// sizes them at two pages (`EXCEPTION_STKSZ`,
+/// arch/x86/include/asm/page_64_types.h:18-30).  These are roomier because the
+/// handler that runs on one formats a panic report and walks a backtrace, both
+/// of which would otherwise overflow the stack they were meant to escape.
+const IST_STACK_BYTES: usize = 16 * 1024;
+const IST_STACK_SLOTS: usize = 3;
+
+// `init` fills the TSS array positionally, so the slot constants and the array
+// length have to agree or a vector silently lands on another vector's stack.
+const _: () = {
+    assert!(
+        NMI_IST_INDEX == 0
+            && DOUBLE_FAULT_IST_INDEX == 1
+            && MACHINE_CHECK_IST_INDEX == 2
+            && MACHINE_CHECK_IST_INDEX < IST_STACK_SLOTS as u16
+    );
+};
 
 #[repr(C, align(16))]
-struct NmiStack([u8; NMI_STACK_BYTES]);
+struct IstStacks([[u8; IST_STACK_BYTES]; IST_STACK_SLOTS]);
 
-impl NmiStack {
+impl IstStacks {
     const fn new() -> Self {
-        Self([0; NMI_STACK_BYTES])
+        Self([[0; IST_STACK_BYTES]; IST_STACK_SLOTS])
     }
 }
 
@@ -55,13 +80,13 @@ impl TssWithIoBitmap {
 #[unsafe(no_mangle)]
 static TSS: TssWithIoBitmap = TssWithIoBitmap::new();
 
-// An IST belongs to a CPU, exactly like the TSS.  It is deliberately separate
-// from task kernel stacks, so an overflow PMI/NMI cannot consume an arbitrary
-// interrupted task's stack. Intel NMI blocking prevents another architectural
-// NMI from re-entering this stack before IRET; #MC has its own architectural
-// vector and is not installed on this IST.
+// An IST belongs to a CPU, exactly like the TSS.  They are deliberately
+// separate from task kernel stacks, so an overflow, PMI or NMI cannot consume
+// an arbitrary interrupted task's stack.  Each vector that needs one gets its
+// own slot: Intel NMI blocking keeps a second NMI out, but a machine check is
+// not masked by it and must not borrow the NMI stack.
 #[percpu::def_percpu]
-static NMI_STACK: NmiStack = NmiStack::new();
+static IST_STACKS: IstStacks = IstStacks::new();
 
 #[repr(C, align(16))]
 struct CpuGdt {
@@ -183,15 +208,18 @@ pub(super) fn install_user_io_bitmap(
 /// Initializes the per-CPU TSS and GDT structures and loads them into the
 /// current CPU.
 pub(super) fn init() {
-    let nmi_stack = unsafe { NMI_STACK.current_ref_raw() };
+    let ist_stacks = unsafe { IST_STACKS.current_ref_raw() };
     let gdt = unsafe { GDT.current_ref_mut_raw() };
     gdt.entries[1] = 0x00af9b000000ffff;
     gdt.entries[2] = 0x00cf93000000ffff;
     gdt.entries[3] = 0x00cff3000000ffff;
     gdt.entries[4] = 0x00affb000000ffff;
     let tss_storage = unsafe { TSS.current_ref_mut_raw() };
-    let nmi_top = unsafe { nmi_stack.0.as_ptr().add(NMI_STACK_BYTES) } as u64;
-    tss_storage.tss.interrupt_stack_table[NMI_IST_INDEX as usize] = VirtAddr::new(nmi_top);
+    for (slot, stack) in ist_stacks.0.iter().enumerate() {
+        // IST stacks grow downward, so the table names each one's top.
+        let top = unsafe { stack.as_ptr().add(IST_STACK_BYTES) } as u64;
+        tss_storage.tss.interrupt_stack_table[slot] = VirtAddr::new(top);
+    }
     let base = tss_storage as *const _ as u64;
     let limit =
         (core::mem::size_of::<TaskStateSegment>() + IO_BITMAP_BYTES + IO_BITMAP_TERMINATOR_BYTES

@@ -1,11 +1,12 @@
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 use alloc::collections::{BTreeMap, BTreeSet};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axdriver_pci::{
     BarInfo, Cam, Command, DeviceFunction, DeviceFunctionInfo, HeaderType, MemoryBarType,
     PciRangeAllocator, PciRoot,
 };
-use axhal::mem::{PAGE_SIZE_4K, PhysAddr, phys_to_virt};
+use axhal::mem::{PAGE_SIZE_4K, PhysAddr, VirtAddr};
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 use axsync::Mutex;
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
@@ -17,6 +18,11 @@ use crate::{AllDevices, drivers::BusProbeResult, prelude::*};
 use crate::AxInputDevice;
 
 const PCI_BAR_NUM: u8 = 6;
+/// ECAM address per PCI bus: one 1 MiB region of 32 devices x 8 functions x
+/// 4 KiB, so a bus number becomes a byte offset by shifting left by this much.
+/// Linux spells the same fact `PCI_MMCFG_BUS_OFFSET`
+/// (arch/x86/include/asm/pci_x86.h:193).
+const PCI_ECAM_BUS_SHIFT: u32 = 20;
 /// The Q35 topology is shallow, but discovery must bound hostile or malformed
 /// bridge graphs independently from the ECAM's 256 possible bus numbers.
 const MAX_REACHABLE_PCI_BUSES: usize = 64;
@@ -31,6 +37,7 @@ fn walk_reachable_pci_functions(
     root: &mut PciRoot,
     mut visit: impl FnMut(&mut PciRoot, DeviceFunction, &DeviceFunctionInfo),
 ) {
+    let bus_end = pci_scan_bus_end();
     let mut visited = [false; u8::MAX as usize + 1];
     let mut pending = [0_u8; MAX_REACHABLE_PCI_BUSES];
     let mut pending_len = 1;
@@ -55,7 +62,7 @@ fn walk_reachable_pci_functions(
                 numbers.primary,
                 numbers.secondary,
                 numbers.subordinate,
-                axconfig::devices::PCI_BUS_END as u8,
+                bus_end,
             ) else {
                 continue;
             };
@@ -221,14 +228,98 @@ fn input_registry() -> &'static Mutex<BusDeviceRegistry> {
         .expect("PCI device registry not initialized")
 }
 
-fn pci_root() -> PciRoot {
+/// Highest bus number the ECAM walk may reach.
+///
+/// Two independent bounds apply: `[devices] pci-bus-end` says how far this
+/// kernel is willing to look, and the ECAM region says how far configuration
+/// space is actually decoded.  Linux honors the second one literally --
+/// `pci_mmconfig_lookup` (arch/x86/pci/mmconfig-shared.c:119-129) answers
+/// `NULL` for a bus outside the region's `[start_bus, end_bus]`, so a read
+/// there reports an absent device instead of forming an address past the
+/// window.  Walking beyond it would read memory that is not configuration
+/// space at all.
+const fn ecam_scan_bus_end(configured: u8, ecam_end: u8) -> u8 {
+    if ecam_end < configured {
+        ecam_end
+    } else {
+        configured
+    }
+}
+
+/// The walk bound for the ECAM region the platform published.
+fn pci_scan_bus_end() -> u8 {
+    ecam_scan_bus_end(
+        axconfig::devices::PCI_BUS_END as u8,
+        axhal::pci::ecam_bus_range().1,
+    )
+}
+
+/// Virtual base of the mapped ECAM window; zero until [`ecam_window`] runs.
+///
+/// [`axhal::mem::phys_to_virt`] is arithmetic on the direct-map offset: it
+/// names where a physical address *would* appear, not whether the kernel page
+/// table maps it, and that table is built once from the compile-time
+/// `[devices] mmio-ranges` list.  So an ECAM base that firmware reports outside
+/// that list has no mapping, and the first configuration read faults before any
+/// driver exists to explain itself -- which on real hardware looks exactly like
+/// a dead console.  Linux maps the MCFG-declared span rather than assuming it
+/// is reachable (`mcfg_ioremap`, arch/x86/pci/mmconfig_64.c:99-112), and when
+/// that fails it leaves `raw_pci_ext_ops` unset (`pci_mmcfg_arch_init`,
+/// :133-146) so nothing touches the window.  This kernel has ECAM only, with no
+/// port-I/O fallback to retreat to, so a failure here ends the PCI scan.
+static ECAM_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+/// Establish the ECAM mapping once, then report it.
+fn ecam_window() -> Option<VirtAddr> {
+    let mapped = ECAM_WINDOW.load(Ordering::Acquire);
+    if mapped != 0 {
+        return Some(VirtAddr::from(mapped));
+    }
+
+    // The platform accepts only an MCFG region that starts at bus 0
+    // (`select_pci_ecam`), and the configured fallback starts there too, so the
+    // region base is also bus 0's base and `PciRoot` can index it directly.
+    let (bus_begin, bus_end) = axhal::pci::ecam_bus_range();
+    let base = axhal::pci::ecam_base();
+    let size = (bus_end.saturating_sub(bus_begin) as usize + 1) << PCI_ECAM_BUS_SHIFT;
+    let Some(window_end) = base.checked_add(size) else {
+        error!(
+            "pci-ecam: region at {base:#x} for {size:#x} bytes overflows the address space; \
+             PCI configuration space is unreachable"
+        );
+        return None;
+    };
+
+    match axklib::mem::iomap(PhysAddr::from_usize(base), size) {
+        Ok(virt) => {
+            info!(
+                "pci-ecam: mapped [{base:#x}, {window_end:#x}) at {virt:#x} for buses \
+                 {bus_begin}..={bus_end}"
+            );
+            ECAM_WINDOW.store(virt.as_usize(), Ordering::Release);
+            Some(virt)
+        }
+        Err(error) => {
+            error!(
+                "pci-ecam: cannot map [{base:#x}, {window_end:#x}) for buses {bus_begin}..=\
+                 {bus_end}: {error:?}; PCI configuration space is unreachable, so no bus scan \
+                 runs"
+            );
+            None
+        }
+    }
+}
+
+fn pci_root() -> Option<PciRoot> {
     // The ECAM base is a machine fact: the platform discovers it from the
     // firmware's MCFG table during early initialization and falls back to
     // `[devices] pci-ecam-base` only when firmware supplies nothing usable.
     // Asking the platform is what makes this kernel bootable on hardware whose
     // ECAM base differs from the configured value.
-    let base_vaddr = phys_to_virt(axhal::pci::ecam_base().into());
-    unsafe { PciRoot::new(base_vaddr.as_mut_ptr(), Cam::Ecam) }
+    let base = ecam_window()?;
+    // SAFETY: `ecam_window` mapped this exact virtual range as device memory,
+    // covering every bus `pci_scan_bus_end` admits.
+    Some(unsafe { PciRoot::new(base.as_mut_ptr(), Cam::Ecam) })
 }
 
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
@@ -392,15 +483,20 @@ fn config_pci_device(
 
 impl AllDevices {
     pub(crate) fn probe_bus_devices(&mut self) {
-        let mut root = pci_root();
+        #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
+        PCI_DEVICE_REGISTRY.init_once(Mutex::new(BusDeviceRegistry::new()));
+
+        let Some(mut root) = pci_root() else {
+            // `ecam_window` has said why configuration space is unreachable.
+            // The registry above still exists, because the input paths that use
+            // it must not panic over a machine with no reachable PCI.
+            return;
+        };
 
         // PCI 32-bit MMIO space
         let mut allocator = axconfig::devices::PCI_RANGES
             .get(1)
             .map(|range| PciRangeAllocator::new(range.0 as u64, range.1 as u64));
-
-        #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
-        PCI_DEVICE_REGISTRY.init_once(Mutex::new(BusDeviceRegistry::new()));
 
         #[cfg(feature = "usb-xhci")]
         let mut usb_devices = alloc::vec::Vec::new();
@@ -417,7 +513,8 @@ impl AllDevices {
                         && dev_info.prog_if == 0x30
                     {
                         if let Ok(BarInfo::Memory { address, .. }) = root.bar_info(bdf, 0) {
-                            let mmio = phys_to_virt((address as usize).into()).as_mut_ptr();
+                            let mmio =
+                                axhal::mem::phys_to_virt((address as usize).into()).as_mut_ptr();
                             if let Some(mmio) = core::ptr::NonNull::new(mmio) {
                                 match crate::usb::probe(mmio) {
                                     Ok(devices) => {
@@ -489,7 +586,7 @@ impl AllDevices {
         // The igc driver's negative case, printed once so that a machine
         // without the assumed part says so in one greppable line.
         #[cfg(net_dev = "igc")]
-        crate::igc::finish_probe(axconfig::devices::PCI_BUS_END as u8);
+        crate::igc::finish_probe(pci_scan_bus_end());
     }
 }
 
@@ -508,7 +605,12 @@ pub(crate) fn reconcile_input_devices<Register, Unregister>(
     Register: FnMut(AxInputDevice, crate::InputBusIdentity) -> u64,
     Unregister: FnMut(u64),
 {
-    let mut root = pci_root();
+    let Some(mut root) = pci_root() else {
+        // The mapping is established once and never torn down, so reaching here
+        // without it means boot never enumerated a PCI function either, and
+        // there is no registered device to remove.
+        return;
+    };
     let snapshot = pci_snapshot(&mut root);
 
     let (pending, removals) = {
@@ -695,7 +797,7 @@ pub(crate) fn activate_boot_input_devices<Register, Unregister>(
 
 #[cfg(test)]
 mod tests {
-    use super::{memory_bar_mapping_range, valid_bridge_secondary_bus};
+    use super::{ecam_scan_bus_end, memory_bar_mapping_range, valid_bridge_secondary_bus};
     use axdriver_pci::BridgeBusNumbers;
 
     #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
@@ -734,6 +836,18 @@ mod tests {
         assert!(memory_bar_mapping_range(0x1000, 0).is_none());
         assert!(memory_bar_mapping_range(u64::MAX - 0x7ff, 0x1000).is_none());
         assert!(memory_bar_mapping_range(u64::MAX - 0xfff, 0xfff).is_none());
+    }
+
+    #[test]
+    fn scan_bus_end_takes_the_tighter_of_two_bounds() {
+        // The configured fallback always describes buses 0-255, so a profile
+        // that scans to 0xff is unchanged by it.
+        assert_eq!(ecam_scan_bus_end(0xff, 0xff), 0xff);
+        // A narrow MCFG window ends the walk where firmware stopped decoding,
+        // even though `pci-bus-end` would allow more.
+        assert_eq!(ecam_scan_bus_end(0xff, 0x7f), 0x7f);
+        // A profile may still ask for less than the window covers.
+        assert_eq!(ecam_scan_bus_end(0x1f, 0xff), 0x1f);
     }
 
     fn reachable_buses<const MAX: usize>(

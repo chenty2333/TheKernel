@@ -205,6 +205,16 @@ profile answers yes:
   (`/bin/busybox poweroff -f`) after it sees the marker. On a machine with no
   input channel, nothing sends that.
 
+Expect the power button either way, because this kernel cannot power off real
+hardware at all. `poweroff` reaches `system_off()`
+(`crates/ax/tk-axplat-x86-pc/src/power.rs`), which writes `SLP_EN` to I/O port
+`0x604` -- the address QEMU's PIIX4 and ICH9 decode as PM1a_CNT when firmware
+relocates nothing. On the N305, firmware *does* relocate it (the FADT says where)
+and the S5 sleep type comes from the DSDT's `_S5` object, which this kernel never
+evaluates. So the write is dropped, the kernel prints a `power-off:` line naming
+what it tried, and halts with the machine still powered. That terminal state is
+the observation, not a failure: the log above it is what §2 is for.
+
 So §2 establishes boot, log and reachability — not test results. The tests are
 §3's job, and that is the honest split.
 

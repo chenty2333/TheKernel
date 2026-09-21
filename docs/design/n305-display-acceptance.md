@@ -561,9 +561,10 @@ Two commands are easy to mistake for target verification, and neither is it:
   layers, host tests, a product build, Clippy, a TCG guest suite, and the firmware-framebuffer
   console suite — on the development host (`tools/verification.py` `plan`). It proves the tree is
   consistent; it does not touch the N305.
-* `python3 tools/thekernel.py verify --tier hardware` is the **host's** KVM CPU suite
-  (`test --suite cpu --smp 4 --accel kvm`), gated on the development host having `/dev/kvm`. It is
-  not a hardware-in-the-loop tier and it says nothing about the display.
+* `python3 tools/thekernel.py verify --tier hardware` runs the **host's** KVM CPU suite
+  (`test --suite cpu --smp 4 --accel kvm`) and the complete Linux ABI differential
+  (`test --suite abi --smp 4 --accel kvm`), gated on the development host having `/dev/kvm`.
+  It is not a hardware-in-the-loop tier and it says nothing about the display.
 
 The "verified today" column can be reproduced with `python3 tools/thekernel.py test --suite host`,
 which runs the kernel crate's host tests including every Intel module's, and `python3

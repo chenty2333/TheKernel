@@ -11,6 +11,7 @@ impl InitIf for InitIfImpl {
     /// early console, clocking).
     fn init_early(_cpu_id: usize, _mbi: usize) {
         axcpu::init::init_trap();
+        enable_machine_checks();
         crate::console::init();
         crate::time::init_early();
         // The platform entry runs before axruntime clears `.bss`; finalize the
@@ -34,6 +35,7 @@ impl InitIf for InitIfImpl {
     #[cfg(feature = "smp")]
     fn init_early_secondary(_cpu_id: usize) {
         axcpu::init::init_trap();
+        enable_machine_checks();
     }
 
     /// Initializes the platform at the later stage for the primary core.
@@ -75,6 +77,37 @@ impl InitIf for InitIfImpl {
         #[cfg(feature = "pmu")]
         init_pmu_fleet_member();
         report_cpu_state(cpu_id);
+    }
+}
+
+/// Enables machine-check reporting on this CPU.
+///
+/// Linux leaves `CR4.MCE` alone on a CPU that does not advertise MCE (`if
+/// (!mce_available(c)) return;`, arch/x86/kernel/cpu/mce/core.c:2255-2257) and
+/// sets it as the last step of bringing the capability up
+/// (arch/x86/kernel/cpu/mce/core.c:2273).  The bit matters because a machine
+/// check without it is not an exception: the CPU asserts the shutdown state, so
+/// an uncorrectable memory or bus error on real hardware looks like an
+/// unexplained reset.  With it set, vector 18 lands on the interrupt stack that
+/// `init_trap` installed and reaches a report.
+///
+/// This makes the check visible, not recoverable: MCi_* bank decoding, CMCI and
+/// error recovery are not implemented, so the report is the generic unhandled
+/// exception path and the machine still stops.
+fn enable_machine_checks() {
+    use core::arch::x86_64::__cpuid;
+
+    let supported = __cpuid(1).edx & (1 << 18) != 0;
+    if !supported {
+        return;
+    }
+    // SAFETY: Called from ring zero during per-CPU initialization.  CR4 is
+    // modified read-modify-write so no other platform bit is dropped, and
+    // control registers are private to this CPU.
+    unsafe {
+        let mut value = x86::controlregs::cr4();
+        value |= x86::controlregs::Cr4::CR4_ENABLE_MACHINE_CHECK;
+        x86::controlregs::cr4_write(value);
     }
 }
 
@@ -165,7 +198,7 @@ fn report_cpu_state(cpu_id: usize) {
     };
     diagnostic_println!(
         "THEKERNEL_CPU_VISIBLE cpu={} hypervisor={} apic={} pcid={} invpcid={} xsave={} pku={} \
-         cet_ss={}",
+         cet_ss={} mce={}",
         cpu_id,
         one.ecx >> 31,
         (one.edx >> 9) & 1,
@@ -174,10 +207,11 @@ fn report_cpu_state(cpu_id: usize) {
         (one.ecx >> 26) & 1,
         (seven.ecx >> 3) & 1,
         (seven.ecx >> 7) & 1,
+        (one.edx >> 18) & 1,
     );
     diagnostic_println!(
         "THEKERNEL_CPU_ENABLED cpu={} apic={} apic_software={} x2apic={} pcid={} osxsave={} \
-         xcr0={:#x} pke={} cet_cr4={} syscall={}",
+         xcr0={:#x} pke={} cet_cr4={} syscall={} mce_cr4={}",
         cpu_id,
         u8::from(apic_enabled),
         (svr >> 8) & 1,
@@ -188,5 +222,6 @@ fn report_cpu_state(cpu_id: usize) {
         (cr4 >> 22) & 1,
         (cr4 >> 23) & 1,
         efer & 1,
+        (cr4 >> 6) & 1,
     );
 }

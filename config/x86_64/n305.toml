@@ -39,9 +39,11 @@ package = "tk-axplat-x86-pc"
 # are numbered; this is only the compile-time admission limit, and it must be
 # at least eight or the kernel can never bring up the whole machine.
 #
-# `tools/thekernel.py` currently overrides this value with `PRODUCT_MAX_CPUS`
-# (4), so building today's product image from this profile still yields an
-# eight-core kernel capped at four CPUs.  See `docs/design/n305-platform.md`.
+# `tools/thekernel.py` overrides this key from the selected machine profile
+# (`MachineProfile.max_cpus` in `tools/product_state.py`), which for `n305` is
+# also eight.  The build therefore reads the Python profile, not this file, so
+# the value here is a description of the machine; `tests/test_machine_profiles.py`
+# pins it so the description cannot go stale silently.
 max-cpu-num = 8
 phys-memory-base = 0
 # Inert: see the header.  Kept at the q35 value so the generated configuration
@@ -69,7 +71,7 @@ boot-stack-size = 0x0004_0000
 # machine's firmware reserves, not what the kernel would like it to reserve.
 mmio-ranges = [
     [0x8000_0000, 0x6000_0000],       # 32-bit PCIe BAR window, 2.0-3.5 GiB
-    [0xe000_0000, 0x1000_0000],       # ECAM fallback (buses 0-255); MCFG wins
+    [0xe000_0000, 0x1000_0000],       # ECAM fallback (buses 0-255); an MCFG base is mapped on demand
     [0xfec0_0000, 0x0000_1000],       # I/O APIC
     [0xfed0_0000, 0x0000_1000],       # HPET
     [0xfee0_0000, 0x0000_1000],       # Local APIC
@@ -88,10 +90,14 @@ virtio-mmio-ranges = [] # [(uint, uint)]
 # the ACPI MCFG table during early boot; this value is used only when firmware
 # supplies no usable MCFG.  It is the documented Alder Lake PCIEXBAR default
 # (256 MiB window covering buses 0-255), not a measurement of this machine.
+# A base that MCFG reports somewhere else needs no entry here: the PCI driver
+# maps the discovered window itself and stops at the bus range MCFG declares.
 pci-ecam-base = 0xe000_0000
 # Highest PCI bus number the kernel will scan.  Alder Lake-N exposes a handful
 # of root ports, so scanning all 256 buses is wasted work, but this is the
 # conservative bound: a value below the true top bus silently hides devices.
+# An MCFG window that decodes fewer buses narrows the scan further, because
+# configuration space beyond it is not there to read.
 pci-bus-end = 0xff
 # BAR allocation windows.  The leading [0, 0] excludes bus 0, whose devices are
 # already assigned by firmware and must not be reallocated.  The above-4-GiB

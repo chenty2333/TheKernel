@@ -144,7 +144,8 @@ fallback and the `mmio-ranges` in `n305.toml` are still the guesses listed in §
 | `pci-bus-end = 0xff` | `n305.toml [devices]` | A too-low bound silently hides devices |
 | `max-cpu-num = 8` | `n305.toml [plat]` | Fewer than eight CPUs come online |
 | Timer and IPI vectors | `n305.toml [devices]` | Not machine facts; kernel convention |
-| Primary console = COM1 at `0x3f8`, diagnostics = COM2 at `0x2f8` | `crates/ax/tk-axplat-x86-pc/src/console.rs` | No console output at all on this machine |
+| Primary console = COM1 at `0x3f8` | `crates/ax/tk-axplat-x86-pc/src/console.rs` | No console output at all on this machine |
+| Which UART carries the log | *not* an assumption any more: `console.rs::select_sink` probes COM2, COM3 and COM4 and falls back to sharing COM1 | Log drain lands on a port nobody is watching; the fallback keeps it on the console wire |
 
 `plat.phys-memory-size` is **not** on that list because it is inert: no Rust source in
 `crates/` or `kernel/` mentions `PHYS_MEMORY` `[V]`, and installed RAM comes from the
@@ -163,8 +164,15 @@ The N305 has no legacy COM port. What that breaks, and what it does not:
   output terminal at all, so a failure *inside GRUB* is invisible on the only display the
   machine has. `[R]` `grub.cfg` is owned by another workstream and needs a QEMU
   re-verification of the framebuffer tag; this is recorded, not changed.
-* **The kernel's diagnostic channel: already safe.** `console.rs::init_diagnostic()`
-  probes COM2's scratch register and gates every write on `DIAGNOSTIC_PRESENT`. `[R]`
+* **The kernel's diagnostic channel: discovered, not assumed.**
+  `console.rs::init_diagnostic()` probes the UARTs beyond COM1 in turn and keeps
+  the first that answers its scratch-register test, so a board whose second port
+  is COM3 or COM4 gets its log there; a board with none of the three shares
+  COM1's lock, and a board with no port at all stays memory-only. Every write
+  is gated on that selection. `[R]` The selection itself is host-tested
+  (`console::diagnostic_tests`), which is what "discovered" buys: no boot is
+  needed to know the branch logic works, only to know which branch this machine
+  takes. `[V]`
 * **The kernel's primary console: silently useless, but harmless.** `putchar` writes to a
   hardcoded `SerialPort::new(0x3f8)`. `[R]` An absent port reads back `0xff`, which sets the
   transmitter-ready bit, so the write path does not spin or fault — the bytes simply go
@@ -242,8 +250,10 @@ Each item names what would confirm it, so one boot with `AX_LOG=info` settles al
 4. **`[U]` `max-cpu-num = 8` is enough and not too much.** MADT decides what exists, so a
    machine reporting fewer cores still boots; the risk is the reverse, and eight is the
    part's core count.
-5. **`[U]` The kernel's own boot path completes with no serial port.** Nothing here has
-   run on a machine whose COM1 and COM2 are absent.
+5. **`[U]` The kernel's own boot path completes with no serial port.** The sink
+   selection has host tests for every branch, but nothing here has run on a
+   machine that takes the "no UART at all" branch, where the log ring stays in
+   memory and only the screen can report anything.
 6. **`[U]` The firmware framebuffer survives to a console.** The `boot framebuffer:` line
    says whether the tag was accepted or declined and why; a decline now reaches the kernel
    log, and therefore the screen, instead of only COM2.

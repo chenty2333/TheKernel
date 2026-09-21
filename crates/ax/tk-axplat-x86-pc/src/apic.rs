@@ -13,7 +13,8 @@ use x2apic::{
     lapic::{LocalApic, LocalApicBuilder, xapic_base},
 };
 #[cfg(feature = "pmu-sampling")]
-use x86::msr::{rdmsr, wrmsr};
+use x86::msr::rdmsr;
+use x86::msr::wrmsr;
 use x86_64::instructions::port::Port;
 
 use self::vectors::*;
@@ -33,6 +34,15 @@ const IO_APIC_VECTOR_BASE: usize = 0x20;
 const XAPIC_LVT_PERF_OFFSET: usize = 0x340;
 #[cfg(feature = "pmu-sampling")]
 const X2APIC_LVT_PERF_MSR: u32 = 0x834;
+
+/// The two LVT local-interrupt-pin entries, in both register layouts.
+const XAPIC_LVT_LINT0_OFFSET: usize = 0x350;
+const XAPIC_LVT_LINT1_OFFSET: usize = 0x360;
+const X2APIC_LVT_LINT0_MSR: u32 = 0x835;
+const X2APIC_LVT_LINT1_MSR: u32 = 0x836;
+
+/// Bit 16 of an LVT entry: the pin delivers nothing.
+const LVT_MASKED: u32 = 1 << 16;
 
 static mut LOCAL_APIC: MaybeUninit<LocalApic> = MaybeUninit::uninit();
 static IS_X2APIC: AtomicBool = AtomicBool::new(false);
@@ -150,6 +160,26 @@ pub fn local_apic<'a>() -> &'a mut LocalApic {
     unsafe { LOCAL_APIC.assume_init_mut() }
 }
 
+/// This CPU's local-APIC MMIO base.
+///
+/// Linux takes the base from the MADT rather than from `IA32_APIC_BASE`
+/// (`mp_lapic_addr`, arch/x86/kernel/mpparse.c), because a chipset may decode
+/// the local APIC somewhere other than the `0xFEE0_0000` convention: the MSR
+/// records what the firmware left behind, while the table records what the
+/// controller is supposed to answer to.  With no MADT records -- a Multiboot 1
+/// handoff that carried no ACPI tag -- the MSR is all there is, and so is a
+/// header whose declared base is not a page-aligned physical address.
+fn lapic_mmio_base() -> PhysAddr {
+    let declared = super::cpu::apic_facts()
+        .and_then(|facts| facts.lapic_address)
+        .filter(|address| *address != 0 && address & 0xfff == 0)
+        .and_then(|address| usize::try_from(address).ok());
+    declared.map_or_else(
+        || pa!(unsafe { xapic_base() } as usize),
+        |address| pa!(address),
+    )
+}
+
 /// Reads this CPU's complete LVT Performance Counter register.
 ///
 /// `x2apic` deliberately does not expose this LVT entry through `LocalApic`.
@@ -160,7 +190,7 @@ pub unsafe fn read_lvt_perf() -> u32 {
     if IS_X2APIC.load(Ordering::Acquire) {
         unsafe { rdmsr(X2APIC_LVT_PERF_MSR) as u32 }
     } else {
-        let base = phys_to_virt(pa!(unsafe { xapic_base() } as usize));
+        let base = phys_to_virt(lapic_mmio_base());
         unsafe { core::ptr::read_volatile((base.as_usize() + XAPIC_LVT_PERF_OFFSET) as *const u32) }
     }
 }
@@ -173,11 +203,121 @@ pub unsafe fn write_lvt_perf(value: u32) {
             wrmsr(X2APIC_LVT_PERF_MSR, value as u64);
         }
     } else {
-        let base = phys_to_virt(pa!(unsafe { xapic_base() } as usize));
+        let base = phys_to_virt(lapic_mmio_base());
         unsafe {
             core::ptr::write_volatile((base.as_usize() + XAPIC_LVT_PERF_OFFSET) as *mut u32, value);
         }
     }
+}
+
+/// Leaves both LVT local-interrupt pins unable to deliver anything.
+///
+/// `x2apic`'s `enable()` names this step "disable_local_interrupt_pins" and
+/// implements it by writing zero to both entries (`lapic/mod.rs:327-330` in the
+/// vendored crate).  Zero is not a disabled LVT entry: bit 16 is the mask, so a
+/// cleared bit delivers, delivery mode 0 is Fixed, and vector 0 is `#DE`.  The
+/// library's write therefore *unmasks* both pins and aims them at a divide-error
+/// fault.  Linux masks the same two registers (`APIC_LVT_MASKED`,
+/// arch/x86/kernel/apic/apic.c:1136-1137) and names the delivery mode explicitly
+/// whenever it does route a pin (apic.c:2267-2289).
+///
+/// Neither pin is wanted here: the 8259s are masked, every IOAPIC line starts
+/// masked, and the local timer uses LVT timer rather than LINT0/LINT1, so both
+/// entries are masked instead of aimed at a vector.
+fn mask_local_interrupt_pins() {
+    if IS_X2APIC.load(Ordering::Acquire) {
+        unsafe {
+            wrmsr(X2APIC_LVT_LINT0_MSR, u64::from(LVT_MASKED));
+            wrmsr(X2APIC_LVT_LINT1_MSR, u64::from(LVT_MASKED));
+        }
+    } else {
+        let base = phys_to_virt(lapic_mmio_base());
+        for offset in [XAPIC_LVT_LINT0_OFFSET, XAPIC_LVT_LINT1_OFFSET] {
+            unsafe {
+                core::ptr::write_volatile((base.as_usize() + offset) as *mut u32, LVT_MASKED);
+            }
+        }
+    }
+}
+
+/// The ESR in both layouts, plus the half of the ICR that carries the status.
+const XAPIC_ICR_LOW_OFFSET: usize = 0x300;
+const XAPIC_ESR_OFFSET: usize = 0x280;
+const X2APIC_ESR_MSR: u32 = 0x828;
+
+/// ICR bit 12: the controller is still working on the previous write.
+const ICR_SEND_PENDING: u32 = 1 << 12;
+
+/// The `ESR` bits that record a real problem.  Linux masks the same way
+/// (`accept_status = apic_read(APIC_ESR) & 0xEF`, arch/x86/kernel/smpboot.c:936)
+/// because the register's third bit is reserved rather than an error.
+const ESR_ERROR_FLAGS: u32 = 0xef;
+
+/// Whether the local APIC is still processing the last ICR write.
+///
+/// Only an MMIO-mapped xAPIC has anything to poll: its ICR keeps `ICR[12]` set
+/// until the message is sent, and Linux polls it while bringing an AP up
+/// (`apic_flat_64.c:62-63` installs `wait_icr_idle` and
+/// `safe_wait_icr_idle`).  The x2APIC drivers install neither
+/// (`x2apic_phys.c:126-156`), because an x2APIC ICR write is one 64-bit MSR
+/// write that the controller consumes before the next instruction, so
+/// `safe_apic_wait_icr_idle()` returns no status for them
+/// (arch/x86/include/asm/apic.h:463-466).
+#[cfg(feature = "smp")]
+pub fn ipi_pending() -> bool {
+    if IS_X2APIC.load(Ordering::Acquire) {
+        return false;
+    }
+    let base = phys_to_virt(lapic_mmio_base());
+    // SAFETY: The initialized local-APIC register window is mapped by platform
+    // setup, and reading ICR changes no controller state.
+    unsafe {
+        core::ptr::read_volatile((base.as_usize() + XAPIC_ICR_LOW_OFFSET) as *const u32)
+            & ICR_SEND_PENDING
+            != 0
+    }
+}
+
+/// This CPU's APIC error status, masked to the bits that mean something.
+#[cfg(feature = "smp")]
+pub fn error_status() -> u32 {
+    let raw = if IS_X2APIC.load(Ordering::Acquire) {
+        // SAFETY: IA32_X2APIC_ESR is readable while the xAPIC is enabled.
+        unsafe { x86::msr::rdmsr(X2APIC_ESR_MSR) as u32 }
+    } else {
+        let base = phys_to_virt(lapic_mmio_base());
+        // SAFETY: The initialized local-APIC register window is mapped by
+        // platform setup, and reading ESR changes no controller state.
+        unsafe { core::ptr::read_volatile((base.as_usize() + XAPIC_ESR_OFFSET) as *const u32) }
+    };
+    raw & ESR_ERROR_FLAGS
+}
+
+/// Clears this CPU's APIC error status so a later read reports only what the
+/// next message did.
+///
+/// Linux does exactly this before waking an AP ("Be paranoid about clearing
+/// APIC errors", arch/x86/kernel/smpboot.c:1053-1057).  Its guard for the
+/// write is `maxlvt > 3`, which works around the Pentium erratum 3AP; every
+/// LVT-bearing APIC modern enough to be a boot target for this kernel
+/// including the N305 satisfies it.
+#[cfg(feature = "smp")]
+pub fn clear_error_status() {
+    if IS_X2APIC.load(Ordering::Acquire) {
+        // SAFETY: IA32_X2APIC_ESR is writable while the xAPIC is enabled.
+        unsafe { wrmsr(X2APIC_ESR_MSR, 0) };
+    } else {
+        let base = phys_to_virt(lapic_mmio_base());
+        // SAFETY: The initialized local-APIC register window is mapped by
+        // platform setup.
+        unsafe {
+            core::ptr::write_volatile((base.as_usize() + XAPIC_ESR_OFFSET) as *mut u32, 0);
+        }
+    }
+    // Write-then-read is Linux's own sequence here
+    // (arch/x86/kernel/smpboot.c:1053-1057); this read's value is not a status
+    // we act on.
+    let _ = error_status();
 }
 
 #[cfg(any(feature = "smp", feature = "irq"))]
@@ -209,13 +349,14 @@ pub fn init_primary(logical_cpu_id: usize) {
         IS_X2APIC.store(true, Ordering::Release);
     } else {
         info!("Using xAPIC.");
-        let base_vaddr = phys_to_virt(pa!(unsafe { xapic_base() } as usize));
+        let base_vaddr = phys_to_virt(lapic_mmio_base());
         builder.set_xapic_base(base_vaddr.as_usize() as u64);
     }
 
     let mut lapic = builder.build().unwrap();
     unsafe {
         lapic.enable();
+        mask_local_interrupt_pins();
         let bsp_apic_id = normalize_lapic_id(lapic.id());
         super::cpu::assert_current_apic_id(bsp_apic_id);
         assert_eq!(
@@ -230,9 +371,63 @@ pub fn init_primary(logical_cpu_id: usize) {
     }
 
     info!("Initialize IO APIC...");
-    let io_apic = unsafe { IoApic::new(phys_to_virt(IO_APIC_BASE).as_usize() as u64) };
+    report_firmware_apic_records();
+    let io_apic = unsafe { IoApic::new(phys_to_virt(io_apic_base()).as_usize() as u64) };
     IO_APIC.init_once(SpinNoIrq::new(io_apic));
     init_io_apic(super::cpu::hardware_apic_id());
+}
+
+/// The MMIO base to drive: what the MADT's I/O APIC record declared, or the
+/// PCI-chipset convention the historical QEMU guests expect.
+fn io_apic_base() -> PhysAddr {
+    let declared = super::cpu::apic_facts().and_then(|facts| facts.io_apic_address);
+    if declared.is_none() {
+        warn!(
+            "MADT declared no IOAPIC address; using the conventional {IO_APIC_BASE:#x?}, which \
+             this machine may not decode"
+        );
+    }
+    declared.map_or(IO_APIC_BASE, |address| pa!(address as usize))
+}
+
+/// Prints what the firmware declared about the interrupt controllers.
+///
+/// The IOAPIC driver below programs one controller, indexes its redirection
+/// table by pin, and treats that pin number as the global interrupt number and
+/// as `0x20 + pin` in the vector space.  Each of those is a convention, so the
+/// records that contradict one are reported rather than quietly accepted.
+fn report_firmware_apic_records() {
+    let Some(facts) = super::cpu::apic_facts() else {
+        warn!("no MADT was reachable at boot; interrupt routing is unverified");
+        return;
+    };
+
+    if facts.io_apic_count > 1 {
+        warn!(
+            "MADT declares {} IOAPICs but only the first is programmed; interrupts routed above \
+             its redirection table cannot be enabled",
+            facts.io_apic_count
+        );
+    }
+    if facts.io_apic_gsi_base != 0 {
+        warn!(
+            "IOAPIC pin 0 serves GSI {}, but the vector mapping assumes pin == GSI",
+            facts.io_apic_gsi_base
+        );
+    }
+    for record in facts.overrides() {
+        info!(
+            "ACPI interrupt source override: bus {} irq {} -> GSI {} (flags {:#x})",
+            record.bus, record.source, record.gsi, record.flags
+        );
+    }
+    if facts.override_total > facts.overrides().len() {
+        warn!(
+            "only {} of {} ACPI interrupt source overrides are shown",
+            facts.overrides().len(),
+            facts.override_total
+        );
+    }
 }
 
 /// Install a safe, deterministic redirection table before any device IRQ is
@@ -391,6 +586,7 @@ mod tests {
 pub fn init_secondary(logical_cpu_id: usize) {
     unsafe {
         local_apic().enable();
+        mask_local_interrupt_pins();
         let apic_id = normalize_lapic_id(local_apic().id());
         super::cpu::assert_current_apic_id(apic_id);
         assert_eq!(

@@ -11,6 +11,7 @@ use core::{
 };
 
 use axplat::mem::{PhysAddr, phys_to_virt};
+use lazyinit::LazyInit;
 use raw_cpuid::{CpuId, TopologyType};
 
 const APIC_ID_UNASSIGNED: u32 = u32::MAX;
@@ -337,6 +338,7 @@ fn install_map(current_apic_id: u32) {
 /// firmware tables after the temporary mapping is gone.
 pub(crate) fn init_topology() {
     ensure_map(hardware_apic_id());
+    init_apic_facts();
 }
 
 fn ensure_map(current_apic_id: u32) {
@@ -595,41 +597,61 @@ fn find_madt() -> Option<&'static [u8]> {
     find_madt_from_rsdp(rsdp)
 }
 
-fn discover_madt_apic_ids<const N: usize>(out: &mut [u32; N]) -> usize {
-    let Some(madt) = find_madt() else {
-        return 0;
+/// Walks a MADT's entry records, handing each record's type and bytes to
+/// `visit`.
+///
+/// The `entry_length` fields belong to firmware, so this is the only place that
+/// trusts them: a record is never handed out unless it lies wholly inside the
+/// table's own declared length, and a record too short to hold its own header
+/// ends the walk.  Every consumer therefore sees a bounded slice at least two
+/// bytes long.  The table arrives as a slice the caller already holds, which
+/// keeps the walk testable without reaching for firmware memory.
+fn for_each_apic_entry(madt: &[u8], mut visit: impl FnMut(u8, &[u8])) {
+    // The APIC structure header is 44 bytes; the entries follow it.
+    let Some(records) = madt.get(44..) else {
+        return;
     };
-    if madt.len() < 44 {
-        return 0;
-    }
 
-    let mut count = 0;
-    let mut offset: usize = 44;
-    while let Some(end) = offset.checked_add(2) {
-        if end > madt.len() {
+    let mut offset: usize = 0;
+    while let Some(header_end) = offset.checked_add(2) {
+        if header_end > records.len() {
             break;
         }
-        let entry_type = madt[offset];
-        let entry_length = madt[offset + 1] as usize;
+        let entry_length = records[offset + 1] as usize;
         if entry_length < 2 {
             break;
         }
         let Some(entry_end) = offset.checked_add(entry_length) else {
             break;
         };
-        if entry_end > madt.len() {
+        if entry_end > records.len() {
             break;
         }
+        visit(records[offset], &records[offset..entry_end]);
+        offset = entry_end;
+    }
+}
 
+fn discover_madt_apic_ids<const N: usize>(out: &mut [u32; N]) -> usize {
+    let Some(madt) = find_madt() else {
+        return 0;
+    };
+    collect_apic_ids(madt, out)
+}
+
+/// [`discover_madt_apic_ids`] over a table the caller already holds.
+fn collect_apic_ids<const N: usize>(madt: &[u8], out: &mut [u32; N]) -> usize {
+    let mut count = 0;
+    for_each_apic_entry(madt, |entry_type, entry| {
         let (apic_id, flags) = match entry_type {
             // Processor Local APIC: ACPI processor ID, APIC ID, flags.
-            0 if entry_length >= 8 => (madt[offset + 3] as u32, read_u32(madt, offset + 4)),
+            0 if entry.len() >= 8 => (entry[3] as u32, read_u32(entry, 4)),
             // Processor Local x2APIC: reserved, x2APIC ID, flags, UID.
-            9 if entry_length >= 16 => (
-                read_u32(madt, offset + 4).unwrap_or(0),
-                read_u32(madt, offset + 8),
+            9 if entry.len() >= 16 => (
+                read_u32(entry, 4).unwrap_or(0),
+                read_u32(entry, 8),
             ),
-            _ => (0, None),
+            _ => return,
         };
         if let Some(flags) = flags
             && flags & 1 != 0
@@ -639,16 +661,152 @@ fn discover_madt_apic_ids<const N: usize>(out: &mut [u32; N]) -> usize {
             out[count] = apic_id;
             count += 1;
         }
-        offset = entry_end;
-    }
+    });
     count
+}
+
+/// The MADT's interrupt-controller records, copied out of firmware memory.
+///
+/// These describe the programmable interrupt controllers rather than the CPUs,
+/// and the platform needs them after [`init_topology`]'s deadline: the MADT can
+/// live in ACPI-reclaimable memory, which the runtime page table does not map.
+/// So the records are read once while the boot mapping is still live and every
+/// later consumer reads this copy.  A table that names no I/O APIC leaves
+/// `io_apic_address` unset rather than inventing the historical address, which
+/// is what lets the APIC driver report the discrepancy instead of hiding it.
+#[derive(Debug, Default)]
+pub(crate) struct ApicFacts {
+    /// MMIO base of the first "I/O APIC" record (MADT entry type 1).
+    pub(crate) io_apic_address: Option<u32>,
+    /// Global system interrupt served by that I/O APIC's pin 0.
+    pub(crate) io_apic_gsi_base: u32,
+    /// How many I/O APICs the table declares.
+    pub(crate) io_apic_count: usize,
+    /// Local-APIC MMIO base: the MADT header field, replaced by a type 5
+    /// record when the firmware declares one.
+    pub(crate) lapic_address: Option<u64>,
+    /// The first [`MAX_SOURCE_OVERRIDES`] "Interrupt Source Override" records.
+    overrides: [SourceOverride; MAX_SOURCE_OVERRIDES],
+    override_count: usize,
+    /// Override records seen, which may exceed the cap above.
+    pub(crate) override_total: usize,
+}
+
+impl ApicFacts {
+    /// The source overrides the snapshot kept, in table order.
+    pub(crate) fn overrides(&self) -> &[SourceOverride] {
+        &self.overrides[..self.override_count]
+    }
+}
+
+/// A MADT "Interrupt Source Override" (entry type 2) record.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SourceOverride {
+    /// Bus the legacy source lives on: 0 is ISA, 1 is EISA.
+    pub(crate) bus: u32,
+    /// Legacy interrupt number on that bus.
+    pub(crate) source: u16,
+    /// Polarity/trigger flags as the firmware wrote them.
+    pub(crate) flags: u32,
+    /// Global system interrupt that actually delivers the source.
+    pub(crate) gsi: u32,
+}
+
+/// How many source overrides the snapshot keeps.
+///
+/// A firmware table with more is reported as truncated rather than silently
+/// dropping the rest; the cap exists so the snapshot stays a plain `static`.
+const MAX_SOURCE_OVERRIDES: usize = 16;
+
+/// Decodes a MADT "I/O APIC" record (type 1) into its MMIO base and GSI base.
+///
+/// The ACPI description is 12 bytes long, so the two `u32` reads also enforce
+/// the record length.
+fn io_apic_record(entry: &[u8]) -> Option<(u32, u32)> {
+    Some((read_u32(entry, 4)?, read_u32(entry, 8)?))
+}
+
+/// Decodes a MADT "Interrupt Source Override" record (type 2), 16 bytes long.
+fn source_override_record(entry: &[u8]) -> Option<SourceOverride> {
+    Some(SourceOverride {
+        bus: read_u32(entry, 2)?,
+        source: read_u16(entry, 6)?,
+        flags: read_u32(entry, 8)?,
+        gsi: read_u32(entry, 12)?,
+    })
+}
+
+/// Collects the interrupt-controller records from one MADT.
+///
+/// The 44-byte APIC structure header holds the local-APIC MMIO base that the
+/// entry records do not repeat.
+fn scan_apic_facts(madt: &[u8]) -> ApicFacts {
+    let mut facts = ApicFacts::default();
+    // A table that does not even hold the APIC structure header declares no
+    // local-APIC base; the walk over its entries is already bounded the same
+    // way.
+    if let Some(header) = madt.get(..44) {
+        facts.lapic_address = read_u32(header, 36).map(u64::from);
+    }
+
+    for_each_apic_entry(madt, |entry_type, entry| match entry_type {
+        1 => {
+            facts.io_apic_count += 1;
+            if let Some((address, gsi_base)) = io_apic_record(entry)
+                && facts.io_apic_address.is_none()
+            {
+                facts.io_apic_address = Some(address);
+                facts.io_apic_gsi_base = gsi_base;
+            }
+        }
+        2 => {
+            facts.override_total += 1;
+            if let Some(record) = source_override_record(entry)
+                && facts.override_count < MAX_SOURCE_OVERRIDES
+            {
+                facts.overrides[facts.override_count] = record;
+                facts.override_count += 1;
+            }
+        }
+        // "Local APIC Address Override" (type 5): reserved, then a 64-bit base.
+        5 => {
+            if let Some(address) = read_u64(entry, 4) {
+                facts.lapic_address = Some(address);
+            }
+        }
+        _ => {}
+    });
+
+    facts
+}
+
+/// The published snapshot, or uninitialized when no MADT was reachable.
+static APIC_FACTS: LazyInit<ApicFacts> = LazyInit::new();
+
+/// Copies the MADT's interrupt-controller records into an owned snapshot.
+///
+/// Runs with [`init_topology`] because the records live in the same firmware
+/// memory as the CPU entries and expire with the boot page table.
+fn init_apic_facts() {
+    if let Some(madt) = find_madt()
+        && !APIC_FACTS.is_inited()
+    {
+        APIC_FACTS.init_once(scan_apic_facts(madt));
+    }
+}
+
+/// Returns the published interrupt-controller records, or `None` when no MADT
+/// was reachable at [`init_topology`] time.
+pub(crate) fn apic_facts() -> Option<&'static ApicFacts> {
+    APIC_FACTS.get()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CpuApicMap, CpuidTopologyLevel, IntelCoreType, TopologyLayout, build_apic_map,
-        parse_topology_layout, select_topology_layout,
+        CpuApicMap, CpuidTopologyLevel, IntelCoreType, SourceOverride, TopologyLayout,
+        build_apic_map, collect_apic_ids, parse_topology_layout, scan_apic_facts,
+        select_topology_layout,
     };
 
     const fn level(shift: u8, logical_processors: u16, level_type: u8) -> CpuidTopologyLevel {
@@ -752,5 +910,132 @@ mod tests {
         assert_eq!(IntelCoreType::from_raw(0x20), IntelCoreType::Atom);
         assert_eq!(IntelCoreType::from_raw(0x80), IntelCoreType::Unknown(0x80));
         assert_eq!(IntelCoreType::from_raw(0), IntelCoreType::Unknown(0));
+    }
+
+    /// A MADT image: `header_lapic_address` in the 44-byte APIC structure
+    /// header, followed by the given entry records.
+    fn madt_image(header_lapic_address: u32, entries: &[&[u8]]) -> std::vec::Vec<u8> {
+        let mut image = std::vec![0u8; 44];
+        image[36..40].copy_from_slice(&header_lapic_address.to_le_bytes());
+        for entry in entries {
+            image.extend_from_slice(entry);
+        }
+        image
+    }
+
+    fn io_apic_entry(address: u32, gsi_base: u32) -> [u8; 12] {
+        let mut entry = [1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        entry[4..8].copy_from_slice(&address.to_le_bytes());
+        entry[8..12].copy_from_slice(&gsi_base.to_le_bytes());
+        entry
+    }
+
+    fn local_apic_entry(apic_id: u8, flags: u32) -> [u8; 8] {
+        let mut entry = [0, 8, 0, 0, 0, 0, 0, 0];
+        entry[2] = apic_id;
+        entry[3] = apic_id;
+        entry[4..8].copy_from_slice(&flags.to_le_bytes());
+        entry
+    }
+
+    #[test]
+    fn cpu_entries_are_read_from_the_table_that_names_them() {
+        let image = madt_image(
+            0xfec0_0000,
+            &[
+                &local_apic_entry(0, 1),
+                &io_apic_entry(0xfec0_0000, 0),
+                &local_apic_entry(2, 0),
+                &local_apic_entry(4, 1),
+            ],
+        );
+        let mut ids = [0u32; 4];
+        assert_eq!(collect_apic_ids(&image, &mut ids), 2);
+        assert_eq!(ids, [0, 4, 0, 0]);
+    }
+
+    #[test]
+    fn a_record_that_outruns_the_table_ends_the_walk() {
+        // The third record claims to be 40 bytes long in a table with 12 bytes
+        // left after it, so neither it nor the well-formed record behind it may
+        // be read.
+        let mut oversized = io_apic_entry(0xfea0_0000, 24).to_vec();
+        oversized[1] = 40;
+        let image = madt_image(
+            0xfec0_0000,
+            &[
+                &local_apic_entry(0, 1),
+                &io_apic_entry(0xfec0_0000, 0),
+                oversized.as_slice(),
+                &local_apic_entry(4, 1),
+            ],
+        );
+        let mut ids = [0u32; 4];
+        assert_eq!(collect_apic_ids(&image, &mut ids), 1);
+
+        let facts = scan_apic_facts(&image);
+        assert_eq!(facts.io_apic_address, Some(0xfec0_0000));
+        assert_eq!(facts.io_apic_count, 1);
+    }
+
+    #[test]
+    fn the_first_io_apic_record_wins_and_every_one_is_counted() {
+        let image = madt_image(
+            0,
+            &[
+                &io_apic_entry(0xfec0_0000, 0),
+                &io_apic_entry(0xfea0_0000, 24),
+            ],
+        );
+        let facts = scan_apic_facts(&image);
+        assert_eq!(facts.io_apic_address, Some(0xfec0_0000));
+        assert_eq!(facts.io_apic_gsi_base, 0);
+        assert_eq!(facts.io_apic_count, 2);
+    }
+
+    #[test]
+    fn a_source_override_keeps_the_firmware_routing_and_flags() {
+        // ACPI's "Interrupt Source Override": bus, legacy IRQ, flags, GSI.
+        let mut entry = [2u8, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        entry[6..8].copy_from_slice(&0u16.to_le_bytes());
+        entry[8..12].copy_from_slice(&3u32.to_le_bytes());
+        entry[12..16].copy_from_slice(&2u32.to_le_bytes());
+
+        let facts = scan_apic_facts(&madt_image(0xfee0_0000, &[&entry]));
+        assert_eq!(
+            facts.overrides(),
+            &[SourceOverride {
+                bus: 0,
+                source: 0,
+                flags: 3,
+                gsi: 2,
+            }]
+        );
+        assert_eq!(facts.override_total, 1);
+
+        // A record that declares fewer than the 16 bytes its own format needs
+        // is counted but names no GSI.  (A record whose *claimed* length runs
+        // past the table ends the walk instead; see
+        // `a_record_that_outruns_the_table_ends_the_walk`.)
+        let mut short = entry[..12].to_vec();
+        short[1] = 12;
+        let truncated = scan_apic_facts(&madt_image(0, &[short.as_slice()]));
+        assert!(truncated.overrides().is_empty());
+        assert_eq!(truncated.override_total, 1);
+    }
+
+    #[test]
+    fn a_lapic_address_override_replaces_the_header() {
+        let mut entry = [5u8, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        entry[4..12].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
+
+        let header_only = scan_apic_facts(&madt_image(0xfee0_0000, &[]));
+        assert_eq!(header_only.lapic_address, Some(0xfee0_0000));
+
+        let overridden = scan_apic_facts(&madt_image(0xfee0_0000, &[&entry]));
+        assert_eq!(overridden.lapic_address, Some(0x1_0000_0000));
+
+        // A table too short to hold its own header declares nothing.
+        assert_eq!(scan_apic_facts(&[0u8; 43]).lapic_address, None);
     }
 }

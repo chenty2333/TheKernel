@@ -12,6 +12,14 @@ core::arch::global_asm!(
     SYSCALL_VECTOR = const LEGACY_SYSCALL_VECTOR,
 );
 
+// `trap.S` moves a whole frame between an interrupt stack and the task's
+// `TrapFrame`, and it assumes the general registers are the low part of that
+// frame because `PUSH_GENERAL_REGS` has already filled them when it copies.
+const _: () = {
+    assert!(core::mem::size_of::<TrapFrame>() == 22 * 8);
+    assert!(core::mem::offset_of!(TrapFrame, vector) == 15 * 8);
+};
+
 pub(super) const LEGACY_SYSCALL_VECTOR: u8 = 0x80;
 /// x86 Control Protection exception (#CP).  User-mode #CP is returned through
 /// `UserContext` and becomes the kernel signal ABI; only a ring-0 #CP reaches

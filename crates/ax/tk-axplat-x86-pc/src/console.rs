@@ -29,8 +29,9 @@
 //! module is gated on the answer, so a machine without a UART writes to no
 //! port, reads from no port, and registers no interrupt for one.
 //!
-//! The probe is the same test the diagnostic port at 0x2f8 has always used.
-//! It now has one implementation and two callers instead of two copies.
+//! The probe is the same test every serial endpoint in this module uses -- the
+//! console at 0x3f8 and whichever port carries the log stream -- so it has one
+//! implementation and as many callers as the machine has UARTs.
 
 use axplat::console::ConsoleIf;
 use kspin::SpinNoIrq;
@@ -111,9 +112,18 @@ pub fn getchar() -> Option<u8> {
     COM1.lock().try_receive().ok()
 }
 
+/// Brings up both serial endpoints: the interactive console and the log sink.
 pub fn init() {
     if probe_uart(COM1_BASE) {
-        COM1.lock().init();
+        // The probe already left the port at 115200 8-N-1 with its FIFOs
+        // cleared, `IER` zero and `MCR`.OUT2 low.  Calling
+        // [`uart_16550::SerialPort::init`] on top of that rewrites the divisor
+        // to 38400, sets `IER` to "data ready" and raises `MCR`.OUT2, so the
+        // line the operator is watching at 115200 turns to garbage *and* the
+        // port starts asserting its interrupt line before `init_interrupt` has
+        // installed the vector 0x24 handler -- one typed key during early boot
+        // is then an interrupt with nobody serving it.  The probe's answer is
+        // the configuration, so nothing reprograms the port here.
         #[cfg(target_os = "none")]
         COM1_PRESENT.store(true, core::sync::atomic::Ordering::Release);
     }
@@ -244,24 +254,102 @@ impl ConsoleIf for ConsoleIfImpl {
     }
 }
 
-// COM2 belongs exclusively to diagnostics. No receive interrupt or console
-// interface is installed for it. Keep the lock independent of COM1 and logs.
+// The log sink is a *discovered* port, not a constant.  No receive interrupt or
+// console interface is installed for it.  When the sink is not COM1 the lock is
+// independent of the console; when it is COM1, the console's own port lock is
+// taken so the two streams cannot interleave on one wire.
 #[cfg(target_os = "none")]
 static DIAGNOSTIC: SpinNoIrq<()> = SpinNoIrq::new(());
 #[cfg(target_os = "none")]
-static DIAGNOSTIC_PRESENT: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-#[cfg(target_os = "none")]
-const DIAGNOSTIC_BASE: u16 = 0x2f8;
-#[cfg(target_os = "none")]
 const DIAGNOSTIC_POLL_BUDGET: usize = 1_000_000;
+
+/// Where the log stream goes, as decided once by [`init_diagnostic`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(target_os = "none", test))]
+enum Sink {
+    /// Nothing on this machine answered as a 16550.
+    Absent,
+    /// A UART at this base that no other console path touches.
+    Exclusive(u16),
+    /// COM1, shared with the interactive console through the console's lock.
+    Console,
+}
+
+#[cfg(target_os = "none")]
+static DIAGNOSTIC_KIND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(target_os = "none")]
+static DIAGNOSTIC_PORT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+#[cfg(target_os = "none")]
+fn sink() -> Sink {
+    use core::sync::atomic::Ordering::Relaxed;
+    match DIAGNOSTIC_KIND.load(Relaxed) {
+        1 => Sink::Exclusive(DIAGNOSTIC_PORT.load(Relaxed)),
+        2 => Sink::Console,
+        _ => Sink::Absent,
+    }
+}
+
+#[cfg(target_os = "none")]
+fn store_sink(selected: Sink) {
+    let (kind, base) = match selected {
+        Sink::Absent => (0, 0),
+        Sink::Exclusive(base) => (1, base),
+        Sink::Console => (2, COM1_BASE),
+    };
+    DIAGNOSTIC_PORT.store(base, core::sync::atomic::Ordering::Relaxed);
+    DIAGNOSTIC_KIND.store(kind, core::sync::atomic::Ordering::Release);
+}
+
+/// The UART bases tried for the log stream, in order.
+///
+/// COM2 first because it is the port this kernel has always used for
+/// diagnostics, so an operator with both ports wired keeps the separation
+/// between a login shell and the log stream.  COM3 and COM4 follow because they
+/// are the only other bases ISA decodes, and a board that populated a UART
+/// there rather than at COM1 or COM2 is a board whose log would otherwise be
+/// lost for the address of a register block.
+///
+/// COM1 is deliberately *not* in this list: it is claimed last, in
+/// [`select_sink`], and only as the shared [`Sink::Console`], because a console
+/// the log stream fights with for the same wire is worse than no log stream.
+#[cfg(any(target_os = "none", test))]
+const DIAGNOSTIC_CANDIDATES: [u16; 3] = [0x2f8, 0x3e8, 0x2e8];
+
+/// Decides the log sink from what the machine answered.
+///
+/// `probe` is injected because which port wins when several exist is a policy
+/// decision rather than a hardware fact, and a host with no I/O ports is the
+/// only place that decision can be tested.
+#[cfg(any(target_os = "none", test))]
+fn select_sink(com1_present: bool, mut probe: impl FnMut(u16) -> bool) -> Sink {
+    for &base in &DIAGNOSTIC_CANDIDATES {
+        if probe(base) {
+            return Sink::Exclusive(base);
+        }
+    }
+    // A machine with one UART means its operator reads the log there.  This is
+    // the common case: COM2 has not been on a mainstream PC motherboard for
+    // two decades, so a kernel that only ever drains its log ring to 0x2f8
+    // keeps the boot story to itself on almost every machine it runs on.
+    if com1_present {
+        return Sink::Console;
+    }
+    Sink::Absent
+}
 
 fn init_diagnostic() {
     #[cfg(target_os = "none")]
-    if let Some(_guard) = DIAGNOSTIC.try_lock()
-        && probe_uart_with(&mut HardwarePorts, DIAGNOSTIC_BASE)
     {
-        DIAGNOSTIC_PRESENT.store(true, core::sync::atomic::Ordering::Release);
+        if let Some(_guard) = DIAGNOSTIC.try_lock() {
+            // COM1's presence is not re-probed: `init` above already answered
+            // for it, and a second scratch-register write to the console port
+            // would be a second chance to disturb whatever the firmware left
+            // there.
+            store_sink(select_sink(available(), |base| {
+                probe_uart_with(&mut HardwarePorts, base)
+            }));
+        }
     }
 }
 
@@ -299,36 +387,55 @@ fn write_bounded(
 /// power-off. TEMT includes the shift register; THRE alone is insufficient.
 pub(crate) fn flush_diagnostic() {
     #[cfg(target_os = "none")]
-    if let Some(_guard) = DIAGNOSTIC.try_lock()
-        && diagnostic_available()
-    {
+    with_sink(|base| {
         let mut budget = DIAGNOSTIC_POLL_BUDGET;
-        let _ = wait_bounded(&mut budget, || unsafe {
-            let status = x86::io::inb(DIAGNOSTIC_BASE + 5);
+        let _ = wait_bounded(&mut budget, || {
+            let status = unsafe { x86::io::inb(base + 5) };
             status != 0xff && status & 0x40 != 0
         });
-    }
+    });
 }
 
+/// Polls `base`'s transmitter-holding-empty flag and emits one byte.
 #[cfg(target_os = "none")]
-fn write_diagnostic(bytes: &[u8], budget: &mut usize) -> usize {
+fn write_diagnostic(base: u16, bytes: &[u8], budget: &mut usize) -> usize {
     write_bounded(
         bytes,
         budget,
-        || unsafe {
-            let status = x86::io::inb(DIAGNOSTIC_BASE + 5);
+        || {
+            let status = unsafe { x86::io::inb(base + 5) };
             status != 0xff && status & 0x20 != 0
         },
-        |byte| unsafe { x86::io::outb(DIAGNOSTIC_BASE, byte) },
+        |byte| unsafe { x86::io::outb(base, byte) },
     )
 }
 
-/// Whether early initialization detected a diagnostic UART. This read-only
-/// snapshot never touches hardware or waits for the transmit lock.
+/// Runs `body` with the log sink's port held for the duration, if it can be
+/// taken without waiting, and reports whether it ran.
+///
+/// The lock chosen depends on which sink [`init_diagnostic`] settled on: the
+/// diagnostics-only one for an exclusive port, and COM1's own port lock when the
+/// log shares the console.  Nothing here ever blocks -- a sink that is busy is
+/// skipped, because the log ring keeps the record for the next attempt, and a
+/// panic that arrived while some other path already owned the port must not
+/// spin on it forever.
+#[cfg(target_os = "none")]
+fn with_sink<T>(body: impl FnOnce(u16) -> T) -> Option<T> {
+    match sink() {
+        Sink::Absent => None,
+        Sink::Exclusive(base) => DIAGNOSTIC.try_lock().map(|_guard| body(base)),
+        // The guard is dropped rather than used: raw register access keeps the
+        // polling bounded below, which `uart_16550`'s send path does not.
+        Sink::Console => COM1.try_lock().map(|_guard| body(COM1_BASE)),
+    }
+}
+
+/// Whether early initialization found a UART for the log stream. This
+/// read-only snapshot never touches hardware or waits for the transmit lock.
 pub fn diagnostic_available() -> bool {
     #[cfg(target_os = "none")]
     {
-        DIAGNOSTIC_PRESENT.load(core::sync::atomic::Ordering::Acquire)
+        !matches!(sink(), Sink::Absent)
     }
     #[cfg(not(target_os = "none"))]
     {
@@ -340,16 +447,16 @@ pub fn diagnostic_available() -> bool {
 /// Returns the consumed prefix length; callers retain the remaining bytes.
 pub fn try_write_diagnostic_bytes(bytes: &[u8]) -> usize {
     #[cfg(target_os = "none")]
-    if let Some(_guard) = DIAGNOSTIC.try_lock()
-        && diagnostic_available()
-    {
+    if let Some(written) = with_sink(|base| {
         let mut written = 0;
         for byte in bytes {
-            if write_diagnostic(core::slice::from_ref(byte), &mut 1) == 0 {
+            if write_diagnostic(base, core::slice::from_ref(byte), &mut 1) == 0 {
                 break;
             }
             written += 1;
         }
+        written
+    }) {
         return written;
     }
     let _ = bytes;
@@ -361,13 +468,14 @@ pub fn try_write_diagnostic_bytes(bytes: &[u8]) -> usize {
 /// Host builds deliberately do not access I/O ports or format arguments.
 pub fn emergency_diagnostic_print(args: core::fmt::Arguments<'_>) {
     #[cfg(target_os = "none")]
-    if let Some(_guard) = DIAGNOSTIC.try_lock()
-        && diagnostic_available()
     {
-        struct Writer(usize);
-        impl core::fmt::Write for Writer {
+        struct Writer<'a> {
+            base: u16,
+            budget: &'a mut usize,
+        }
+        impl core::fmt::Write for Writer<'_> {
             fn write_str(&mut self, text: &str) -> core::fmt::Result {
-                if write_diagnostic(text.as_bytes(), &mut self.0) == text.len() {
+                if write_diagnostic(self.base, text.as_bytes(), self.budget) == text.len() {
                     Ok(())
                 } else {
                     Err(core::fmt::Error)
@@ -375,7 +483,10 @@ pub fn emergency_diagnostic_print(args: core::fmt::Arguments<'_>) {
             }
         }
         use core::fmt::Write;
-        let _ = Writer(DIAGNOSTIC_POLL_BUDGET).write_fmt(args);
+        let _ = with_sink(|base| {
+            let mut budget = DIAGNOSTIC_POLL_BUDGET;
+            let _ = Writer { base, budget: &mut budget }.write_fmt(args);
+        });
     }
     let _ = args;
 }
@@ -383,6 +494,53 @@ pub fn emergency_diagnostic_print(args: core::fmt::Arguments<'_>) {
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    /// A machine that answers on COM2 keeps the log off the console wire.
+    #[test]
+    fn an_exclusive_diagnostic_uart_wins_over_the_console() {
+        let sink = select_sink(true, |base| base == 0x2f8);
+        assert_eq!(sink, Sink::Exclusive(0x2f8));
+    }
+
+    /// Every candidate gets its turn, so a board whose only spare UART sits at
+    /// the COM3 or COM4 address still has a log sink.
+    #[test]
+    fn the_other_decoded_uart_bases_are_tried() {
+        for base in DIAGNOSTIC_CANDIDATES {
+            assert_eq!(
+                select_sink(true, |candidate| candidate == base),
+                Sink::Exclusive(base)
+            );
+        }
+    }
+
+    /// A single-UART machine is the ordinary modern PC, and it is the case that
+    /// used to lose the whole log stream: the ring drained to a port number no
+    /// one had wired.
+    #[test]
+    fn a_machine_with_only_a_console_uart_still_has_a_log() {
+        assert_eq!(select_sink(true, |_| false), Sink::Console);
+    }
+
+    #[test]
+    fn no_uart_anywhere_leaves_the_sink_absent() {
+        assert_eq!(select_sink(false, |_| false), Sink::Absent);
+    }
+
+    /// COM1 is never selected as an *exclusive* port, whatever the candidate
+    /// list says, because that would let the log stream drive the console port
+    /// while holding a lock the console writes do not take.
+    #[test]
+    fn the_console_port_is_never_claimed_exclusively() {
+        assert_eq!(
+            select_sink(false, |base| base == COM1_BASE),
+            Sink::Absent
+        );
+        assert_eq!(
+            select_sink(true, |base| base == COM1_BASE),
+            Sink::Console
+        );
+    }
 
     #[test]
     fn terminal_flush_stops_when_transmitter_becomes_empty() {

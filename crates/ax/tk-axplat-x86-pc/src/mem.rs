@@ -51,6 +51,14 @@ pub fn init() {
             }
         }
     }
+    // A firmware map that names no usable RAM is a machine fact worth one line
+    // of its own.  Without it this boot dies later inside the heap allocator,
+    // where the message no longer says that the memory map was empty.
+    assert!(
+        !regions.is_empty(),
+        "{:?} boot: firmware reported no usable memory region",
+        boot_info.protocol()
+    );
     RAM_REGIONS.init_once(regions);
 
     let mut reserved = Vec::new();

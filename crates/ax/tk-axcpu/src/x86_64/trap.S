@@ -4,16 +4,25 @@
 .code64
 .equ NUM_INT, 256
 
+# Vectors whose IDT entry names a TSS interrupt stack (`idt::IST_VECTORS`).
+# They enter through `.Ltrap_ist` instead of `.Ltrap_common` because an IST
+# delivery does not leave its frame inside the task's `TrapFrame`.
+.equ IST_VECTOR_NMI, 2
+.equ IST_VECTOR_DF, 8
+.equ IST_VECTOR_MC, 18
+
 .altmacro
 .macro DEF_HANDLER, i
 .Ltrap_handler_\i:
 .if \i == 8 || (\i >= 10 && \i <= 14) || \i == 17 || \i == 21 || \i == 29 || \i == 30
     # error code pushed by CPU
-    push    \i          # interrupt vector
-    jmp     .Ltrap_common
 .else
     push    0           # fill in error code in TrapFrame
+.endif
     push    \i          # interrupt vector
+.if \i == IST_VECTOR_NMI || \i == IST_VECTOR_DF || \i == IST_VECTOR_MC
+    jmp     .Ltrap_ist
+.else
     jmp     .Ltrap_common
 .endif
 .endm
@@ -93,6 +102,30 @@ trap_handler_table:
     add     rsp, 16                     # pop vector, error_code
     iretq
 
+# Same dispatch as `.Ltrap_common`, except that the CPU switched RSP to a TSS
+# interrupt stack.  A ring-0 trap is then already fine -- `iretq` restores the
+# interrupted stack -- but a ring-3 trap has to be put back the way
+# `.Lexit_user` expects: inside the task's `TrapFrame`.
+.Ltrap_ist:
+    cld
+    test    byte ptr [rsp + 3 * 8], 3
+    jz      .Ltrap_kernel
+
+    # The general registers go first because the copy below needs RDI, RSI and
+    # RCX, and the frame has to end up holding the *user* values.
+    swapgs
+    PUSH_GENERAL_REGS
+    mov     rsi, rsp                                    # source: the IST frame
+    mov     rdi, gs:[offset __PERCPU_TSS + 4]           # TSS.RSP0 names the end of the target
+    sub     rdi, {trapframe_size}
+    mov     rcx, {trapframe_size} / 8
+    rep     movsq
+    lea     rsp, [rdi - {trapframe_size}]
+    # Known gap: an NMI that lands between `swapgs` and the RSP switch in
+    # `syscall_entry` reads the user GS here, which the non-IST user path
+    # already did.  Closing it needs an entry-in-progress marker.
+    jmp     .Lexit_user_regs
+
 .global syscall_entry
 syscall_entry:
     swapgs                              # swap in kernel gs
@@ -111,6 +144,7 @@ syscall_entry:
 .Lexit_user:
     PUSH_GENERAL_REGS
 
+.Lexit_user_regs:
     # restore kernel context
     mov     rsp, [rsp + {trapframe_size}]
     pop     r15
