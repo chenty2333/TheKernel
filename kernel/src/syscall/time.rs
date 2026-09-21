@@ -361,10 +361,9 @@ fn resolve_cpu_clock_usage(
             // Linux's process lookup requires `pid_has_task(pid, PIDTYPE_TGID)`
             // and only falls back to the caller's own task id for
             // `clock_gettime(2)` (`kernel/time/posix-cpu-timers.c:87-101`).
-            if target.tid() != caller.tid() && !target.is_thread_group_leader() {
-                return Err(AxError::InvalidInput);
-            }
-            if !gettime && target.tid() != caller.tid() {
+            // Any other process's leader is a valid target for all three
+            // calls; `gettime` decides nothing else.
+            if !target.is_thread_group_leader() && !(gettime && target.tid() == caller.tid()) {
                 return Err(AxError::InvalidInput);
             }
             Ok(target.proc_data.self_usage())
