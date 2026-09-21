@@ -13,6 +13,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axhal::time::Duration;
 use axio::prelude::*;
 use axnet::{
     InterfaceInfo, InterfaceKind, IpAddress, IpCidr, Ipv4Address, Ipv6Address, RecvFlags,
@@ -20,7 +21,6 @@ use axnet::{
 };
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::current;
-use axhal::time::Duration;
 use linux_raw_sys::{
     general::{CAP_AUDIT_READ, CAP_NET_ADMIN, CAP_SYS_ADMIN},
     net::{
@@ -32,22 +32,21 @@ use spin::{Lazy, Mutex, MutexGuard};
 #[cfg(test)]
 use tk_linux_net::NETLINK_MAX_MESSAGE_BYTES;
 use tk_linux_net::{
-    NL_CFG_F_NONROOT_RECV, NL_CFG_F_NONROOT_SEND,
-    NetlinkQueueAdmission, NetlinkWriteAdmission, SYSCTL_RMEM_DEFAULT, SYSCTL_RMEM_MAX,
-    SYSCTL_WMEM_DEFAULT, SYSCTL_WMEM_MAX, admit_kernel_netlink_message, admit_netlink_queue,
-    admit_netlink_write, netlink_allowed, netlink_group_bind_permitted,
-    netlink_protocol_group_capacity,
+    NL_CFG_F_NONROOT_RECV, NL_CFG_F_NONROOT_SEND, NetlinkQueueAdmission, NetlinkWriteAdmission,
+    SYSCTL_RMEM_DEFAULT, SYSCTL_RMEM_MAX, SYSCTL_WMEM_DEFAULT, SYSCTL_WMEM_MAX,
+    admit_kernel_netlink_message, admit_netlink_queue, admit_netlink_write, netlink_allowed,
+    netlink_group_bind_permitted, netlink_protocol_group_capacity,
 };
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, PseudoInode, try_pseudo_inode_path},
     mm::{UserMemoryCapability, UserPtr, map_usercopy_error},
     readiness::{block_on_poll_io, block_on_poll_io_until},
-    time::wall_time,
     task::{
         AsThread, Cred, NetworkNamespace, ns_capable,
         security::{AuditLandlockDenied, AuditSeccompDecision},
     },
+    time::wall_time,
 };
 
 const NETLINK_MAX_PROTOCOL: u32 = 31;
@@ -204,7 +203,7 @@ pub(crate) struct SockaddrNl {
 impl SockaddrNl {
     /// The exact bytes `netlink_getname()` leaves in the kernel's
     /// `sockaddr_storage`, ready for `move_addr_to_user()` to copy out.
-    pub(crate) fn into_bytes(self) -> [u8; size_of::<Self>()] {
+pub(crate) fn into_bytes(self) -> [u8; size_of::<Self>()] {
         // SAFETY: `SockaddrNl` is `repr(C)` and has no padding other than the
         // explicit `nl_pad`, so every byte of the value is initialized.
         unsafe { core::mem::transmute(self) }
@@ -425,10 +424,10 @@ impl Default for NetlinkSockOptions {
 /// membership and `NETLINK_LISTEN_ALL_NSID` gates.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct NetlinkOptionAuthority {
-    pub(crate) init_net_admin: bool,
-    pub(crate) net_admin: bool,
-    pub(crate) net_raw: bool,
-    pub(crate) net_broadcast: bool,
+pub(crate)     init_net_admin: bool,
+pub(crate)     net_admin: bool,
+pub(crate)     net_raw: bool,
+pub(crate)     net_broadcast: bool,
 }
 
 impl NetlinkOptionAuthority {
@@ -471,10 +470,16 @@ pub(crate) enum NetlinkOptionValue {
     /// `NETLINK_LIST_MEMBERSHIPS`: the group bitmap as 32-bit chunks together
     /// with the `ALIGN(BITS_TO_BYTES(ngroups), 4)` length Linux reports in
     /// `*optlen` regardless of how much of it fit in the caller's buffer.
-    Memberships { words: [u32; 2], reported: usize },
+    Memberships {
+        words: [u32; 2],
+        reported: usize,
+    },
     /// `SO_RCVTIMEO`/`SO_SNDTIMEO`: the `struct timeval` `sock_get_timeout()`
     /// encodes from the stored jiffies.
-    Timeout { seconds: i64, microseconds: i64 },
+    Timeout {
+        seconds: i64,
+        microseconds: i64,
+    },
 }
 
 pub struct NetlinkSocket {
@@ -645,10 +650,13 @@ impl<'a> NetlinkWritePermit<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct NetlinkReceived {
-    pub(crate) len: usize,
-    pub(crate) source_port_id: u32,
-    pub(crate) source_groups: u32,
-    pub(crate) credentials: Option<NetlinkCredentials>,
+pub(crate)     len: usize,
+pub(crate)     source_port_id: u32,
+pub(crate)     source_groups: u32,
+pub(crate)     credentials: Option<NetlinkCredentials>,
+    /// `netlink_recvmsg` raises `MSG_TRUNC` when the datagram did not fit the
+    /// destination (`net/netlink/af_netlink.c:1945-1948`).
+pub(crate)     truncated: bool,
 }
 
 /// Sender identity captured when a kobject uevent is queued.  This is kept
@@ -657,9 +665,9 @@ pub(crate) struct NetlinkReceived {
 /// Linux kernel identity (pid 0, root).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NetlinkCredentials {
-    pub(crate) pid: u32,
-    pub(crate) uid: u32,
-    pub(crate) gid: u32,
+pub(crate)     pid: u32,
+pub(crate)     uid: u32,
+pub(crate)     gid: u32,
 }
 
 const KERNEL_UEVENT_CREDENTIALS: NetlinkCredentials = NetlinkCredentials {
@@ -691,57 +699,15 @@ static SOCK_DIAG_REGISTRATIONS: Lazy<Mutex<Vec<Weak<SocketDiagRegistration>>>> =
 static KOBJECT_UEVENT_SEQNUM: AtomicU64 = AtomicU64::new(0);
 static KOBJECT_UEVENT_SEND_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static NETLINK_NEXT_PORT_ID: AtomicU32 = AtomicU32::new(1);
-static SOCK_DIAG_NEXT_COOKIE: AtomicU64 = AtomicU64::new(1);
+mod audit;
+mod diag;
+mod nft;
+mod wiremsg;
 
-/// Lifetime-owned registry entry for an inet socket.  The registration is
-/// retained by the socket OFD, so close/fork/exec naturally share and retire
-/// the same diagnostic identity without a process-global socket table.
-pub(crate) struct SocketDiagRegistration {
-    net_ns: Weak<NetworkNamespace>,
-    family: u16,
-    socket_type: u8,
-    protocol: u8,
-    cookie: u64,
-}
-
-impl SocketDiagRegistration {
-    fn diag_state(&self) -> u8 {
-        // TCP and DCCP inet_diag use the normal close state for an OFD which
-        // has no transport-state snapshot yet. Datagram diagnostics carry no
-        // state bit rather than pretending to be a TCP endpoint.
-        if self.socket_type == SOCK_STREAM as u8
-            || self.socket_type == SOCK_SEQPACKET as u8
-            || self.protocol == 33
-        {
-            7
-        } else {
-            0
-        }
-    }
-}
-
-pub(crate) fn register_socket_diag(
-    net_ns: &Arc<NetworkNamespace>,
-    family: u16,
-    socket_type: u8,
-    protocol: u8,
-) -> AxResult<Arc<SocketDiagRegistration>> {
-    let registration = Arc::try_new(SocketDiagRegistration {
-        net_ns: Arc::downgrade(net_ns),
-        family,
-        socket_type,
-        protocol,
-        cookie: SOCK_DIAG_NEXT_COOKIE.fetch_add(1, Ordering::Relaxed),
-    })
-    .map_err(|_| AxError::NoMemory)?;
-    let mut registrations = SOCK_DIAG_REGISTRATIONS.lock();
-    registrations.retain(|entry| entry.strong_count() != 0);
-    registrations
-        .try_reserve(1)
-        .map_err(|_| AxError::NoMemory)?;
-    registrations.push(Arc::downgrade(&registration));
-    Ok(registration)
-}
+pub(crate) use audit::*;
+pub(crate) use diag::*;
+pub(crate) use nft::*;
+pub(crate) use wiremsg::*;
 
 struct NetlinkPortBinding {
     net_ns: Weak<NetworkNamespace>,
@@ -749,951 +715,12 @@ struct NetlinkPortBinding {
     port_id: u32,
     socket_inode: u64,
 }
-
-#[derive(Clone)]
-struct NftChain {
-    table: String,
-    name: String,
-    hook: Option<NftHook>,
-    policy: NftVerdict,
-}
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum NftVerdict {
-    Continue,
-    Accept,
-    Drop,
-    Reject,
-    Return,
-    Jump,
-    Goto,
-}
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum NftHook {
-    Prerouting,
-    Input,
-    Forward,
-    Output,
-    Postrouting,
-}
-#[derive(Clone)]
-enum NftExpr {
-    Ct {
-        key: u32,
-        dreg: u32,
-    },
-    Payload {
-        base: u32,
-        offset: u32,
-        len: u32,
-        dreg: u32,
-    },
-    Cmp {
-        sreg: u32,
-        op: u32,
-        data: Vec<u8>,
-    },
-    Nat {
-        kind: u32,
-        family: u32,
-        addr_reg: Option<u32>,
-        proto_reg: Option<u32>,
-        masquerade: bool,
-    },
-}
-#[derive(Clone)]
-struct NftRule {
-    table: String,
-    chain: String,
-    handle: u64,
-    verdict: NftVerdict,
-    target_chain: Option<String>,
-    lookup: Option<(String, Vec<u8>)>,
-    expressions: Vec<NftExpr>,
-    counter: u64,
-}
-#[derive(Clone)]
-struct NftSet {
-    table: String,
-    name: String,
-    id: u32,
-    flags: u32,
-    key_type: u32,
-    data_type: u32,
-}
-#[derive(Clone)]
-struct NftSetElement {
-    table: String,
-    set: String,
-    key: Vec<u8>,
-}
-#[derive(Clone)]
-struct NftNamespaceTables {
-    namespace: Weak<NetworkNamespace>,
-    tables: Vec<String>,
-    chains: Vec<NftChain>,
-    rules: Vec<NftRule>,
-    sets: Vec<NftSet>,
-    elements: Vec<NftSetElement>,
-    next_rule: u64,
-    generation: u32,
-}
-static NFT_TABLES: Lazy<Mutex<Vec<NftNamespaceTables>>> = Lazy::new(|| Mutex::new(Vec::new()));
-// Serializes an nfnetlink write with packet traversal.  The state is copied
-// before a datagram and published only when every message validates, so even
-// a multi-message batch has no externally observable intermediate graph.
-static NFT_TRANSACTION: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct ConntrackTuple {
-    family: u8,
-    protocol: u8,
-    source: [u8; 16],
-    destination: [u8; 16],
-    source_port: u16,
-    destination_port: u16,
-}
-struct ConntrackEntry {
-    namespace: Weak<NetworkNamespace>,
-    original: ConntrackTuple,
-    translated: ConntrackTuple,
-    reply: ConntrackTuple,
-    packets: u64,
-    expires_at: u64,
-}
-static CONNTRACK: Lazy<Mutex<Vec<ConntrackEntry>>> = Lazy::new(|| Mutex::new(Vec::new()));
-const CONNTRACK_MAX_ENTRIES: usize = 4096;
-const CONNTRACK_MAX_NAMESPACE_ENTRIES: usize = 1024;
-const CONNTRACK_TIMEOUT_MILLIS: u64 = 60_000;
-
-/// Executes the namespace's nft OUTPUT verdict chain at the packet emission
-/// boundary.  Rule order is insertion order, matching the retained nft
-/// chain order; a terminal drop/reject is never converted to a fake success.
-pub(crate) fn nft_output_verdict(namespace: &Arc<NetworkNamespace>) -> AxResult {
-    // Socket send admission occurs before axnet constructs its IP header.
-    // The authoritative OUTPUT traversal is the router hook, once the full
-    // packet exists; treating this headerless preflight as a packet would
-    // make legitimate payload/ct/nat expressions fail spuriously.
-    let _ = namespace;
-    Ok(())
-}
-
-/// Namespace-local packet traversal entry used by packet, TUN/TAP and inet
-/// boundary code.  The packet is mutable because NAT expressions alter the
-/// in-flight headers before the lower router observes them.
-pub(crate) fn nft_packet_hook(
-    namespace: &Arc<NetworkNamespace>,
-    hook: NftHook,
-    packet: &mut [u8],
-) -> AxResult {
-    #[cfg(feature = "bpf")]
-    crate::bpf::run_network_packet_links(
-        namespace,
-        match hook {
-            NftHook::Prerouting => crate::file::bpf::BpfNetworkHook::Prerouting,
-            NftHook::Input => crate::file::bpf::BpfNetworkHook::Input,
-            NftHook::Forward => crate::file::bpf::BpfNetworkHook::Forward,
-            NftHook::Output => crate::file::bpf::BpfNetworkHook::Output,
-            NftHook::Postrouting => crate::file::bpf::BpfNetworkHook::Postrouting,
-        },
-        packet,
-    )?;
-    let _transaction = NFT_TRANSACTION.lock();
-    conntrack_reverse_translate(namespace, packet)?;
-    if let Some(tuple) = conntrack_tuple(packet) {
-        conntrack_observe(namespace, tuple)?;
-    }
-    let mut namespaces = NFT_TABLES.lock();
-    namespaces.retain(|state| state.namespace.strong_count() != 0);
-    let needle = Arc::downgrade(namespace);
-    for state in namespaces
-        .iter_mut()
-        .filter(|state| Weak::ptr_eq(&state.namespace, &needle))
-    {
-        let mut stack = Vec::new();
-        for index in 0..state.chains.len() {
-            let selected = &state.chains[index];
-            if selected.hook != Some(hook) {
-                continue;
-            }
-            let table = nft_owned_name(&selected.table)?;
-            let chain = nft_owned_name(&selected.name)?;
-            nft_evaluate_chain(namespace, state, &table, &chain, packet, &mut stack)?;
-        }
-    }
-    Ok(())
-}
-
-fn conntrack_tuple(packet: &[u8]) -> Option<ConntrackTuple> {
-    let version = *packet.first()? >> 4;
-    let (family, protocol, source_offset, destination_offset, l4) = match version {
-        4 => {
-            let ihl = usize::from(*packet.first()? & 0x0f).checked_mul(4)?;
-            if ihl < 20 || packet.len() < ihl {
-                return None;
-            }
-            (4, *packet.get(9)?, 12, 16, ihl)
-        }
-        6 => {
-            if packet.len() < 40 {
-                return None;
-            }
-            (6, *packet.get(6)?, 8, 24, 40)
-        }
-        _ => return None,
-    };
-    let mut source = [0; 16];
-    let mut destination = [0; 16];
-    let width = if family == 4 { 4 } else { 16 };
-    source[..width].copy_from_slice(packet.get(source_offset..source_offset + width)?);
-    destination[..width]
-        .copy_from_slice(packet.get(destination_offset..destination_offset + width)?);
-    let (source_port, destination_port) = match protocol {
-        6 | 17 | 132 | 33 => (
-            u16::from_be_bytes(packet.get(l4..l4 + 2)?.try_into().ok()?),
-            u16::from_be_bytes(packet.get(l4 + 2..l4 + 4)?.try_into().ok()?),
-        ),
-        _ => (0, 0),
-    };
-    Some(ConntrackTuple {
-        family,
-        protocol,
-        source,
-        destination,
-        source_port,
-        destination_port,
-    })
-}
-
-fn conntrack_reverse(tuple: ConntrackTuple) -> ConntrackTuple {
-    ConntrackTuple {
-        family: tuple.family,
-        protocol: tuple.protocol,
-        source: tuple.destination,
-        destination: tuple.source,
-        source_port: tuple.destination_port,
-        destination_port: tuple.source_port,
-    }
-}
-
-fn conntrack_observe(namespace: &Arc<NetworkNamespace>, tuple: ConntrackTuple) -> AxResult {
-    let mut state = CONNTRACK.lock();
-    // Sample under the lock so concurrent observations cannot move an entry's
-    // deadline backwards. Idle entries expire even when no packets arrive.
-    let now = axhal::time::monotonic_time_nanos() / 1_000_000;
-    conntrack_observe_at(&mut state, namespace, tuple, now)
-}
-
-fn conntrack_observe_at(
-    state: &mut Vec<ConntrackEntry>,
-    namespace: &Arc<NetworkNamespace>,
-    tuple: ConntrackTuple,
-    now: u64,
-) -> AxResult {
-    state.retain(|entry| entry.namespace.strong_count() != 0 && entry.expires_at > now);
-    let needle = Arc::downgrade(namespace);
-    if let Some(entry) = state.iter_mut().find(|entry| {
-        Weak::ptr_eq(&entry.namespace, &needle)
-            && (entry.original == tuple || entry.translated == tuple || entry.reply == tuple)
-    }) {
-        entry.packets = entry.packets.saturating_add(1);
-        entry.expires_at = now.saturating_add(CONNTRACK_TIMEOUT_MILLIS);
-        return Ok(());
-    }
-    if state.len() >= CONNTRACK_MAX_ENTRIES
-        || state
-            .iter()
-            .filter(|entry| Weak::ptr_eq(&entry.namespace, &needle))
-            .count()
-            >= CONNTRACK_MAX_NAMESPACE_ENTRIES
-    {
-        return Err(LinuxError::ENOBUFS.into());
-    }
-    state.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-    state.push(ConntrackEntry {
-        namespace: needle,
-        original: tuple,
-        translated: tuple,
-        reply: conntrack_reverse(tuple),
-        packets: 1,
-        expires_at: now.saturating_add(CONNTRACK_TIMEOUT_MILLIS),
-    });
-    Ok(())
-}
-
-fn nft_owned_name(name: &str) -> AxResult<String> {
-    let mut owned = String::new();
-    owned
-        .try_reserve_exact(name.len())
-        .map_err(|_| AxError::NoMemory)?;
-    owned.push_str(name);
-    Ok(owned)
-}
-
-fn nft_evaluate_chain(
-    namespace: &Arc<NetworkNamespace>,
-    state: &mut NftNamespaceTables,
-    table: &str,
-    chain: &str,
-    packet: &mut [u8],
-    stack: &mut Vec<String>,
-) -> AxResult<NftVerdict> {
-    // A jump cycle is rejected when installed; retaining this guard makes a
-    // corrupted userspace graph fail closed instead of recursing in kernel
-    // context.
-    if stack.len() >= 64 || stack.iter().any(|item| item == chain) {
-        return Err(LinuxError::ELOOP.into());
-    }
-    stack.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-    stack.push(nft_owned_name(chain)?);
-    let policy = state
-        .chains
-        .iter()
-        .find(|item| item.table == table && item.name == chain)
-        .map(|item| item.policy)
-        .ok_or(AxError::NotFound)?;
-    for index in 0..state.rules.len() {
-        let rule = &mut state.rules[index];
-        if rule.table != table || rule.chain != chain {
-            continue;
-        }
-        rule.counter = rule.counter.saturating_add(1);
-        if !nft_evaluate_expressions(namespace, packet, &rule.expressions)? {
-            continue;
-        }
-        if let Some((set, key)) = &rule.lookup {
-            if !state.elements.iter().any(|item| {
-                item.table == table && item.set == *set && (key.is_empty() || item.key == *key)
-            }) {
-                continue;
-            }
-        }
-        let verdict = rule.verdict;
-        let target = rule
-            .target_chain
-            .as_deref()
-            .map(nft_owned_name)
-            .transpose()?;
-        match verdict {
-            NftVerdict::Continue => {}
-            NftVerdict::Accept => {
-                stack.pop();
-                return Ok(NftVerdict::Accept);
-            }
-            NftVerdict::Drop => {
-                stack.pop();
-                return Err(LinuxError::EPERM.into());
-            }
-            NftVerdict::Reject => {
-                stack.pop();
-                return Err(LinuxError::ECONNREFUSED.into());
-            }
-            NftVerdict::Return => break,
-            NftVerdict::Jump | NftVerdict::Goto => {
-                let target = target.ok_or(AxError::InvalidInput)?;
-                match nft_evaluate_chain(namespace, state, table, &target, packet, stack)? {
-                    NftVerdict::Accept => {
-                        stack.pop();
-                        return Ok(NftVerdict::Accept);
-                    }
-                    _ if verdict == NftVerdict::Goto => break,
-                    _ => {}
-                }
-            }
-        }
-    }
-    stack.pop();
-    match policy {
-        NftVerdict::Drop => Err(LinuxError::EPERM.into()),
-        NftVerdict::Reject => Err(LinuxError::ECONNREFUSED.into()),
-        _ => Ok(NftVerdict::Continue),
-    }
-}
-
-fn nft_evaluate_expressions(
-    namespace: &Arc<NetworkNamespace>,
-    packet: &mut [u8],
-    expressions: &[NftExpr],
-) -> AxResult<bool> {
-    let mut registers: [Option<Vec<u8>>; 16] = core::array::from_fn(|_| None);
-    for expression in expressions {
-        match expression {
-            NftExpr::Ct { key, dreg } => {
-                let index = usize::try_from(*dreg).map_err(|_| AxError::InvalidInput)?;
-                let value = match *key {
-                    // NFT_CT_STATE: NEW for an initial tuple, ESTABLISHED for
-                    // either direction of a retained conntrack entry.
-                    0 => (if conntrack_is_established(namespace, packet) {
-                        2u32
-                    } else {
-                        1u32
-                    })
-                    .to_ne_bytes()
-                    .to_vec(),
-                    7 => conntrack_tuple(packet)
-                        .map(|tuple| tuple.protocol as u32)
-                        .unwrap_or(0)
-                        .to_ne_bytes()
-                        .to_vec(),
-                    _ => return Err(AxError::OperationNotSupported),
-                };
-                let slot = registers.get_mut(index).ok_or(AxError::InvalidInput)?;
-                *slot = Some(value);
-            }
-            NftExpr::Payload {
-                base,
-                offset,
-                len,
-                dreg,
-            } => {
-                let index = usize::try_from(*dreg).map_err(|_| AxError::InvalidInput)?;
-                let start = payload_offset(packet, *base, *offset)?;
-                let end = start
-                    .checked_add(*len as usize)
-                    .ok_or(AxError::InvalidInput)?;
-                let bytes = packet.get(start..end).ok_or(AxError::InvalidInput)?;
-                let mut value = Vec::new();
-                value
-                    .try_reserve_exact(bytes.len())
-                    .map_err(|_| AxError::NoMemory)?;
-                value.extend_from_slice(bytes);
-                *registers.get_mut(index).ok_or(AxError::InvalidInput)? = Some(value);
-            }
-            NftExpr::Cmp { sreg, op, data } => {
-                let value = registers
-                    .get(*sreg as usize)
-                    .and_then(Option::as_ref)
-                    .ok_or(AxError::InvalidInput)?;
-                let equal = value.as_slice() == data.as_slice();
-                // NFT_CMP_EQ/NEQ; relational packet comparisons are defined
-                // only for equal-width big-endian scalar registers here.
-                let matched = match *op {
-                    0 => equal,
-                    1 => !equal,
-                    2 => value.as_slice() < data.as_slice(),
-                    3 => value.as_slice() <= data.as_slice(),
-                    4 => value.as_slice() > data.as_slice(),
-                    5 => value.as_slice() >= data.as_slice(),
-                    _ => return Err(AxError::InvalidInput),
-                };
-                if !matched {
-                    return Ok(false);
-                }
-            }
-            NftExpr::Nat {
-                kind,
-                family,
-                addr_reg,
-                proto_reg,
-                masquerade,
-            } => {
-                let address = addr_reg
-                    .and_then(|reg| registers.get(reg as usize))
-                    .and_then(Option::as_ref)
-                    .map(Vec::as_slice);
-                let port = proto_reg
-                    .and_then(|reg| registers.get(reg as usize))
-                    .and_then(Option::as_ref)
-                    .and_then(|value| value.get(..2))
-                    .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()));
-                nft_apply_nat(
-                    namespace,
-                    packet,
-                    *kind,
-                    *family,
-                    address,
-                    port,
-                    *masquerade,
-                )?;
-            }
-        }
-    }
-    Ok(true)
-}
-
-fn payload_offset(packet: &[u8], base: u32, offset: u32) -> AxResult<usize> {
-    let ip = match base {
-        1 => 0usize,
-        2 => match packet.first().map(|byte| byte >> 4) {
-            Some(4) => usize::from(packet[0] & 0x0f) * 4,
-            Some(6) => 40,
-            _ => return Err(AxError::InvalidInput),
-        },
-        _ => return Err(AxError::OperationNotSupported),
-    };
-    ip.checked_add(offset as usize).ok_or(AxError::InvalidInput)
-}
-
-fn conntrack_is_established(namespace: &Arc<NetworkNamespace>, packet: &[u8]) -> bool {
-    let Some(tuple) = conntrack_tuple(packet) else {
-        return false;
-    };
-    let needle = Arc::downgrade(namespace);
-    CONNTRACK.lock().iter().any(|entry| {
-        Weak::ptr_eq(&entry.namespace, &needle)
-            && (entry.original == tuple || entry.translated == tuple || entry.reply == tuple)
-    })
-}
-
-fn conntrack_reverse_translate(namespace: &Arc<NetworkNamespace>, packet: &mut [u8]) -> AxResult {
-    let Some(tuple) = conntrack_tuple(packet) else {
-        return Ok(());
-    };
-    let needle = Arc::downgrade(namespace);
-    let replacement = CONNTRACK
-        .lock()
-        .iter()
-        .find(|entry| Weak::ptr_eq(&entry.namespace, &needle) && entry.reply == tuple)
-        .map(|entry| conntrack_reverse(entry.original));
-    if let Some(replacement) = replacement {
-        rewrite_tuple(packet, replacement)?;
-    }
-    Ok(())
-}
-
-fn nft_apply_nat(
-    namespace: &Arc<NetworkNamespace>,
-    packet: &mut [u8],
-    kind: u32,
-    family: u32,
-    address: Option<&[u8]>,
-    port: Option<u16>,
-    masquerade: bool,
-) -> AxResult {
-    let before = conntrack_tuple(packet).ok_or(AxError::InvalidInput)?;
-    if family != 0 && family != before.family as u32 {
-        return Err(AxError::InvalidInput);
-    };
-    let mut after = before;
-    let width = if before.family == 4 { 4 } else { 16 };
-    // nft NAT type: 0 DNAT, 1 SNAT.  Masquerade is SNAT using the route's
-    // source address, which is already present in this compact router model.
-    match kind {
-        0 => {
-            if let Some(address) = address {
-                if address.len() != width {
-                    return Err(AxError::InvalidInput);
-                };
-                after.destination[..width].copy_from_slice(address)
-            }
-            if let Some(port) = port {
-                after.destination_port = port
-            }
-        }
-        1 => {
-            if !masquerade {
-                if let Some(address) = address {
-                    if address.len() != width {
-                        return Err(AxError::InvalidInput);
-                    };
-                    after.source[..width].copy_from_slice(address)
-                }
-            }
-            if let Some(port) = port {
-                after.source_port = port
-            }
-        }
-        _ => return Err(AxError::InvalidInput),
-    }
-    rewrite_tuple(packet, after)?;
-    let needle = Arc::downgrade(namespace);
-    let mut entries = CONNTRACK.lock();
-    if let Some(entry) = entries.iter_mut().find(|entry| {
-        Weak::ptr_eq(&entry.namespace, &needle)
-            && (entry.original == before || entry.translated == before)
-    }) {
-        entry.translated = after;
-        entry.reply = conntrack_reverse(after);
-    }
-    Ok(())
-}
-
-fn rewrite_tuple(packet: &mut [u8], tuple: ConntrackTuple) -> AxResult {
-    let version = packet
-        .first()
-        .map(|byte| byte >> 4)
-        .ok_or(AxError::InvalidInput)?;
-    let (width, src, dst, l4, protocol) = match version {
-        4 => {
-            let l4 = usize::from(packet[0] & 0xf) * 4;
-            if l4 < 20 || packet.len() < l4 {
-                return Err(AxError::InvalidInput);
-            };
-            (4, 12, 16, l4, packet[9])
-        }
-        6 => {
-            if packet.len() < 40 {
-                return Err(AxError::InvalidInput);
-            };
-            (16, 8, 24, 40, packet[6])
-        }
-        _ => return Err(AxError::InvalidInput),
-    };
-    packet[src..src + width].copy_from_slice(&tuple.source[..width]);
-    packet[dst..dst + width].copy_from_slice(&tuple.destination[..width]);
-    if matches!(protocol, 6 | 17 | 33 | 132) && packet.len() >= l4 + 4 {
-        packet[l4..l4 + 2].copy_from_slice(&tuple.source_port.to_be_bytes());
-        packet[l4 + 2..l4 + 4].copy_from_slice(&tuple.destination_port.to_be_bytes());
-    }
-    recompute_checksums(packet)?;
-    Ok(())
-}
-
-fn checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    let mut chunks = bytes.chunks_exact(2);
-    for pair in &mut chunks {
-        sum += u16::from_be_bytes([pair[0], pair[1]]) as u32
-    }
-    if let Some(&last) = chunks.remainder().first() {
-        sum += (last as u32) << 8
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16)
-    }
-    !(sum as u16)
-}
-fn recompute_checksums(packet: &mut [u8]) -> AxResult {
-    let version = packet
-        .first()
-        .map(|byte| byte >> 4)
-        .ok_or(AxError::InvalidInput)?;
-    let (l4, protocol, length, pseudo) = match version {
-        4 => {
-            let l4 = usize::from(packet[0] & 0xf) * 4;
-            if l4 < 20 || packet.len() < l4 {
-                return Err(AxError::InvalidInput);
-            };
-            packet[10] = 0;
-            packet[11] = 0;
-            let c = checksum(&packet[..l4]);
-            packet[10..12].copy_from_slice(&c.to_be_bytes());
-            let len = u16::from_be_bytes(packet[2..4].try_into().unwrap()) as usize;
-            (l4, packet[9], len.saturating_sub(l4), {
-                let mut p = Vec::new();
-                p.extend_from_slice(&packet[12..20]);
-                p.extend_from_slice(&[0, packet[9]]);
-                p.extend_from_slice(&(len.saturating_sub(l4) as u16).to_be_bytes());
-                p
-            })
-        }
-        6 => {
-            if packet.len() < 40 {
-                return Err(AxError::InvalidInput);
-            };
-            let len = u16::from_be_bytes(packet[4..6].try_into().unwrap()) as usize;
-            (40, packet[6], len, {
-                let mut p = Vec::new();
-                p.extend_from_slice(&packet[8..40]);
-                p.extend_from_slice(&(len as u32).to_be_bytes());
-                p.extend_from_slice(&[0, 0, 0, packet[6]]);
-                p
-            })
-        }
-        _ => return Err(AxError::InvalidInput),
-    };
-    if matches!(protocol, 6 | 17) && packet.len() >= l4 + length {
-        let check = if protocol == 6 { l4 + 16 } else { l4 + 6 };
-        if packet.len() >= check + 2 {
-            packet[check] = 0;
-            packet[check + 1] = 0;
-            let mut data = pseudo;
-            data.extend_from_slice(&packet[l4..l4 + length]);
-            let value = checksum(&data);
-            if protocol == 6 || value != 0 {
-                packet[check..check + 2].copy_from_slice(&value.to_be_bytes())
-            }
-        }
-    };
-    Ok(())
-}
-
-fn nft_chain_hook(bytes: &[u8]) -> AxResult<NftHook> {
-    // NFTA_CHAIN_HOOK is a nested `nft_hook_attributes`: hook number is the
-    // first u32 attribute.  Priority is retained by nf_tables for ordering;
-    // this compact engine has one ordered chain list per hook, so install
-    // order is its stable tie breaker.
-    let mut number = None;
-    for_each_rtattr(bytes, |kind, value| {
-        match kind {
-            1 if value.len() == size_of::<u32>() => {
-                number = Some(u32::from_ne_bytes(value.try_into().unwrap()));
-                Ok(())
-            }
-            // priority and optional device are installation metadata.  Chain
-            // order remains deterministic in this engine; device-specific
-            // hooks are rejected by the caller when no matching device exists.
-            2 if value.len() == size_of::<i32>() => Ok(()),
-            3 => Ok(()),
-            _ => Err(AxError::InvalidInput),
-        }
-    })?;
-    match number.ok_or(AxError::InvalidInput)? {
-        0 => Ok(NftHook::Prerouting),
-        1 => Ok(NftHook::Input),
-        2 => Ok(NftHook::Forward),
-        3 => Ok(NftHook::Output),
-        4 => Ok(NftHook::Postrouting),
-        _ => Err(AxError::InvalidInput),
-    }
-}
-
-fn nft_expression_verdict(
-    bytes: &[u8],
-) -> AxResult<(NftVerdict, Option<String>, Option<String>, Vec<NftExpr>)> {
-    // Expressions are nested again (list element -> name/data).  Every
-    // standard terminal verdict has an ASCII expression name.  Inspecting
-    // only complete NUL-terminated names avoids accepting arbitrary payload
-    // substrings as a policy instruction.
-    let mut result = NftVerdict::Continue;
-    let mut target = None;
-    let mut lookup = None;
-    let mut operations = Vec::new();
-    fn named(bytes: &[u8], needle: &[u8]) -> bool {
-        bytes.windows(needle.len()).any(|part| part == needle)
-    }
-    for_each_rtattr(bytes, |_kind, expression| {
-        if named(expression, b"drop\0") {
-            result = NftVerdict::Drop;
-        } else if named(expression, b"reject\0") {
-            result = NftVerdict::Reject;
-        } else if named(expression, b"accept\0") {
-            result = NftVerdict::Accept;
-        } else if named(expression, b"return\0") {
-            result = NftVerdict::Return;
-        }
-        // jump/goto carry a chain name in their data payload; the parser
-        // records their control-flow kind and rejects the absent target at
-        // evaluation instead of silently accepting a malformed rule.
-        else if named(expression, b"jump\0") || named(expression, b"goto\0") {
-            result = if named(expression, b"jump\0") {
-                NftVerdict::Jump
-            } else {
-                NftVerdict::Goto
-            };
-            for_each_rtattr(expression, |expr_kind, expr_body| {
-                if expr_kind != 2 {
-                    return Ok(());
-                }
-                for_each_rtattr(expr_body, |kind, data| {
-                    if kind == 2 && target.is_none() {
-                        target = Some(decode_nft_name(data)?);
-                    }
-                    Ok(())
-                })
-            })?;
-        } else if named(expression, b"lookup\0") {
-            for_each_rtattr(expression, |expr_kind, expr_body| {
-                if expr_kind != 2 {
-                    return Ok(());
-                }
-                for_each_rtattr(expr_body, |kind, data| {
-                    if kind == 1 && lookup.is_none() {
-                        lookup = Some(decode_nft_name(data)?);
-                    }
-                    Ok(())
-                })
-            })?;
-        } else {
-            let mut name = None;
-            let mut data = None;
-            for_each_rtattr(expression, |kind, value| match kind {
-                1 if name.is_none() => {
-                    name = Some(decode_nft_name(value)?);
-                    Ok(())
-                }
-                2 if data.is_none() => {
-                    data = Some(value);
-                    Ok(())
-                }
-                _ => Ok(()),
-            })?;
-            match name.as_deref() {
-                Some("ct") => {
-                    let Some(data) = data else {
-                        return Err(AxError::InvalidInput);
-                    };
-                    let (mut key, mut dreg) = (None, None);
-                    for_each_rtattr(data, |kind, value| match kind {
-                        1 if value.len() == 4 => {
-                            key = Some(u32::from_ne_bytes(value.try_into().unwrap()));
-                            Ok(())
-                        }
-                        2 if value.len() == 4 => {
-                            dreg = Some(u32::from_ne_bytes(value.try_into().unwrap()));
-                            Ok(())
-                        }
-                        _ => Err(AxError::InvalidInput),
-                    })?;
-                    operations.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                    operations.push(NftExpr::Ct {
-                        key: key.ok_or(AxError::InvalidInput)?,
-                        dreg: dreg.ok_or(AxError::InvalidInput)?,
-                    });
-                }
-                Some("payload") => {
-                    let Some(data) = data else {
-                        return Err(AxError::InvalidInput);
-                    };
-                    let (mut base, mut offset, mut len, mut dreg) = (None, None, None, None);
-                    for_each_rtattr(data, |kind, value| {
-                        if value.len() != 4 {
-                            return Err(AxError::InvalidInput);
-                        }
-                        let value = u32::from_ne_bytes(value.try_into().unwrap());
-                        match kind {
-                            1 => base = Some(value),
-                            2 => offset = Some(value),
-                            3 => len = Some(value),
-                            4 => dreg = Some(value),
-                            _ => return Err(AxError::InvalidInput),
-                        };
-                        Ok(())
-                    })?;
-                    operations.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                    operations.push(NftExpr::Payload {
-                        base: base.ok_or(AxError::InvalidInput)?,
-                        offset: offset.ok_or(AxError::InvalidInput)?,
-                        len: len.ok_or(AxError::InvalidInput)?,
-                        dreg: dreg.ok_or(AxError::InvalidInput)?,
-                    });
-                }
-                Some("cmp") => {
-                    let Some(data) = data else {
-                        return Err(AxError::InvalidInput);
-                    };
-                    let (mut sreg, mut op, mut rhs) = (None, None, None);
-                    for_each_rtattr(data, |kind, value| match kind {
-                        1 if value.len() == 4 => {
-                            sreg = Some(u32::from_ne_bytes(value.try_into().unwrap()));
-                            Ok(())
-                        }
-                        2 if value.len() == 4 => {
-                            op = Some(u32::from_ne_bytes(value.try_into().unwrap()));
-                            Ok(())
-                        }
-                        3 => for_each_rtattr(value, |inner, bytes| {
-                            if inner == 1 && rhs.is_none() {
-                                let mut copy = Vec::new();
-                                copy.try_reserve_exact(bytes.len())
-                                    .map_err(|_| AxError::NoMemory)?;
-                                copy.extend_from_slice(bytes);
-                                rhs = Some(copy)
-                            };
-                            Ok(())
-                        }),
-                        _ => Err(AxError::InvalidInput),
-                    })?;
-                    operations.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                    operations.push(NftExpr::Cmp {
-                        sreg: sreg.ok_or(AxError::InvalidInput)?,
-                        op: op.ok_or(AxError::InvalidInput)?,
-                        data: rhs.ok_or(AxError::InvalidInput)?,
-                    });
-                }
-                Some("nat") | Some("masq") => {
-                    let data = data.unwrap_or(&[]);
-                    let (mut kind, mut family, mut addr, mut proto) = (
-                        if name.as_deref() == Some("masq") {
-                            Some(1)
-                        } else {
-                            None
-                        },
-                        None,
-                        None,
-                        None,
-                    );
-                    for_each_rtattr(data, |kind_id, value| {
-                        if value.len() != 4 {
-                            return Err(AxError::InvalidInput);
-                        }
-                        let value = u32::from_ne_bytes(value.try_into().unwrap());
-                        match kind_id {
-                            1 => kind = Some(value),
-                            2 => family = Some(value),
-                            3 => addr = Some(value),
-                            5 => proto = Some(value),
-                            _ => {}
-                        }
-                        Ok(())
-                    })?;
-                    operations.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                    operations.push(NftExpr::Nat {
-                        kind: kind.ok_or(AxError::InvalidInput)?,
-                        family: family.unwrap_or(0),
-                        addr_reg: addr,
-                        proto_reg: proto,
-                        masquerade: name.as_deref() == Some("masq"),
-                    });
-                }
-                Some("immediate") => {
-                    let Some(data) = data else {
-                        return Err(AxError::InvalidInput);
-                    };
-                    let mut code = None;
-                    for_each_rtattr(data, |kind, value| {
-                        if kind == 2 {
-                            for_each_rtattr(value, |inner, bytes| {
-                                if inner == 1 && bytes.len() == 4 && code.is_none() {
-                                    code = Some(i32::from_ne_bytes(bytes.try_into().unwrap()))
-                                };
-                                Ok(())
-                            })
-                        } else {
-                            Ok(())
-                        }
-                    })?;
-                    result = match code.ok_or(AxError::InvalidInput)? {
-                        0 => NftVerdict::Drop,
-                        1 => NftVerdict::Accept,
-                        _ => return Err(AxError::OperationNotSupported),
-                    };
-                }
-                Some("counter") | Some("meta") => {}
-                Some(_) => return Err(AxError::OperationNotSupported),
-                None => return Err(AxError::InvalidInput),
-            }
-        }
-        Ok(())
-    })?;
-    if matches!(result, NftVerdict::Jump | NftVerdict::Goto) && target.is_none() {
-        return Err(AxError::InvalidInput);
-    }
-    Ok((result, target, lookup, operations))
-}
-
-fn nft_set_element_key(bytes: &[u8]) -> AxResult<Vec<u8>> {
-    // NFTA_SET_ELEM_LIST_ELEMENTS is a list of NFTA_LIST_ELEM containers;
-    // each carries NFTA_SET_ELEM_KEY, itself a NFTA_DATA_VALUE container.
-    // This implementation admits a single element per message, exactly what
-    // the retained SetElement model represents.
-    let mut key = None;
-    for_each_rtattr(bytes, |_list_kind, element| {
-        for_each_rtattr(element, |kind, data| {
-            if kind != 1 || key.is_some() {
-                return Ok(());
-            }
-            for_each_rtattr(data, |data_kind, value| {
-                if data_kind == 1 && key.is_none() {
-                    let mut copied = Vec::new();
-                    copied
-                        .try_reserve_exact(value.len())
-                        .map_err(|_| AxError::NoMemory)?;
-                    copied.extend_from_slice(value);
-                    key = Some(copied);
-                }
-                Ok(())
-            })
-        })
-    })?;
-    key.ok_or(AxError::InvalidInput)
-}
-
 impl NetlinkSocket {
     /// Audit control and read-log access are global Linux authorities.  A
     /// capability granted by a nested user namespace must never authorize
     /// creating an audit endpoint, even if it was obtained through an fd
     /// transferred from another task.
-    pub(crate) fn audit_socket_creation_authorized(actor: &Cred) -> bool {
+pub(crate) fn audit_socket_creation_authorized(actor: &Cred) -> bool {
         actor.user_ns().is_initial() && actor.has_effective_capability(CAP_AUDIT_READ)
     }
 
@@ -1704,7 +731,7 @@ impl NetlinkSocket {
             && is_initial_network_namespace(&self.net_ns)
     }
     /// The `sk_bound_dev_if` this endpoint currently carries.
-    pub(crate) fn bound_device_index(&self) -> i32 {
+pub(crate) fn bound_device_index(&self) -> i32 {
         self.bound_dev_if.load(Ordering::Acquire)
     }
 
@@ -1713,17 +740,13 @@ impl NetlinkSocket {
     /// compare-exchange emulates the socket lock: the caller validates
     /// against `expected` and must retry when the current index moved
     /// meanwhile, so a concurrent rebind cannot skip the capability check.
-    pub(crate) fn compare_exchange_bound_device_index(
-        &self,
-        expected: i32,
-        index: i32,
-    ) -> bool {
+pub(crate) fn compare_exchange_bound_device_index(&self, expected: i32, index: i32) -> bool {
         self.bound_dev_if
             .compare_exchange(expected, index, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
-    pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
+pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
         &self.net_ns
     }
 
@@ -1748,7 +771,7 @@ impl NetlinkSocket {
         Ok(())
     }
 
-    pub(crate) fn try_new(
+pub(crate) fn try_new(
         protocol: u32,
         socket_type: u32,
         net_ns: Arc<NetworkNamespace>,
@@ -1792,12 +815,7 @@ impl NetlinkSocket {
         Ok(socket)
     }
 
-    pub fn bind(
-        &self,
-        port_id: u32,
-        groups: u32,
-        authority: NetlinkOptionAuthority,
-    ) -> AxResult {
+    pub fn bind(&self, port_id: u32, groups: u32, authority: NetlinkOptionAuthority) -> AxResult {
         self.bind_port_id(port_id, groups, port_id == 0, authority)
     }
 
@@ -1881,9 +899,12 @@ impl NetlinkSocket {
             }
         }
         let mut state = self.state.lock();
-        if state.bound && state.port_id != preferred_port_id {
+        if state.bound && (automatic || state.port_id != preferred_port_id) {
             // `if (nladdr->nl_pid != nlk->portid) return -EINVAL;` runs before
-            // the per-group hooks, so a mismatched port ID outranks them.
+            // the per-group hooks, so a mismatched port ID outranks them.  An
+            // automatic request spells `nl_pid == 0`, which never equals a
+            // bound port ID, so it is EINVAL on every already-bound socket;
+            // only an explicit rebind to the same port ID updates the groups.
             return Err(LinuxError::EINVAL.into());
         }
         if self.protocol == NETLINK_AUDIT && !self.audit_listener_authorized() {
@@ -1934,11 +955,7 @@ impl NetlinkSocket {
                 // `netlink_allowed(sock, NL_CFG_F_NONROOT_RECV)` runs before any
                 // group validation, so an unprivileged caller of a
                 // kernel-service family sees EPERM even for a bogus group.
-                if !netlink_allowed(
-                    self.protocol,
-                    NL_CFG_F_NONROOT_RECV,
-                    authority.net_admin,
-                ) {
+                if !netlink_allowed(self.protocol, NL_CFG_F_NONROOT_RECV, authority.net_admin) {
                     return Err(LinuxError::EPERM.into());
                 }
                 // `netlink_realloc_groups` sizes `nlk->ngroups` from the
@@ -2032,8 +1049,7 @@ impl NetlinkSocket {
                 let reported = ngroups.div_ceil(u32::BITS as usize) * size_of::<u32>();
                 let mut words = [0_u32; 2];
                 for (index, word) in words.iter_mut().enumerate() {
-                    if index * u32::BITS as usize >= ngroups
-                        || len < (index + 1) * size_of::<u32>()
+                    if index * u32::BITS as usize >= ngroups || len < (index + 1) * size_of::<u32>()
                     {
                         break;
                     }
@@ -2228,10 +1244,9 @@ impl NetlinkSocket {
             Option::NoCheck => NetlinkOptionValue::Int(i32::from(state.sock.no_check)),
             Option::Priority => NetlinkOptionValue::Int(state.sock.priority),
             Option::Mark => NetlinkOptionValue::Int(state.sock.mark),
-            Option::Linger => NetlinkOptionValue::Linger([
-                i32::from(sock.linger_on),
-                sock.linger_seconds,
-            ]),
+            Option::Linger => {
+                NetlinkOptionValue::Linger([i32::from(sock.linger_on), sock.linger_seconds])
+            }
             Option::ReusePort => NetlinkOptionValue::Int(state.sock.reuseport),
             // `sk_may_scm_recv` is true for AF_NETLINK, so SO_PASSCRED is a
             // real per-description flag rather than an EOPNOTSUPP case.
@@ -2266,11 +1281,11 @@ impl NetlinkSocket {
     /// NETLINK sockets expose SO_PASSCRED per open file description.  Sender
     /// credentials are retained in queued uevents, so this receive-side flag
     /// may be changed after enqueue without losing the original identity.
-    pub(crate) fn set_passcred(&self, enabled: bool) {
+pub(crate) fn set_passcred(&self, enabled: bool) {
         self.state.lock().passcred = enabled;
     }
 
-    pub(crate) fn passcred(&self) -> bool {
+pub(crate) fn passcred(&self) -> bool {
         self.state.lock().passcred
     }
 
@@ -2475,6 +1490,11 @@ impl NetlinkSocket {
             rcvbuf,
         ) == NetlinkQueueAdmission::Drop
         {
+            // Linux's `netlink_attachskb()` waits for queue space up to the
+            // sender's `sk_sndtimeo` before giving up
+            // (`net/netlink/af_netlink.c:1223-1268`); this kernel reports
+            // EAGAIN immediately instead, so `SO_SNDTIMEO` is stored but has
+            // no effect on the send side.
             return Err(AxError::WouldBlock);
         }
         queue.bytes += data.len();
@@ -2504,7 +1524,7 @@ impl NetlinkSocket {
             .map(|received| received.len)
     }
 
-    pub(crate) fn recv_with_nonblocking(
+pub(crate) fn recv_with_nonblocking(
         &self,
         dst: &mut IoDst,
         flags: RecvFlags,
@@ -2513,7 +1533,7 @@ impl NetlinkSocket {
         self.recv_with_operation_nonblocking(dst, flags, nonblocking, false)
     }
 
-    pub(crate) fn recv_with_operation_nonblocking(
+pub(crate) fn recv_with_operation_nonblocking(
         &self,
         dst: &mut IoDst,
         flags: RecvFlags,
@@ -2567,7 +1587,7 @@ impl NetlinkSocket {
     /// `SO_RCVTIMEO`/`SO_SNDTIMEO` in both spellings.  `sock_set_timeout()`
     /// validates the microseconds field, treats a negative second as the zero
     /// timeout, and stores jiffies (`net/core/sock.c:426-457`).
-    pub(crate) fn set_socket_timeout(
+pub(crate) fn set_socket_timeout(
         &self,
         optname: i32,
         seconds: i64,
@@ -2650,6 +1670,7 @@ impl NetlinkSocket {
             source_port_id,
             source_groups,
             credentials,
+            truncated: packet_len > copy_len,
         })
     }
 
@@ -2752,7 +1773,7 @@ impl NetlinkSocket {
     /// Linux's uevent_net_rcv_skb equivalent.  The netlink framing is only a
     /// userspace submission envelope: listeners receive its payload plus the
     /// kernel-assigned SEQNUM field, as a group-1 kernel multicast datagram.
-    pub(crate) fn send_uevent_from_user(
+pub(crate) fn send_uevent_from_user(
         &self,
         data: &[u8],
         actor: &Cred,
@@ -2786,7 +1807,7 @@ impl NetlinkSocket {
         )
     }
 
-    pub(crate) fn write_with_actor(
+pub(crate) fn write_with_actor(
         &self,
         src: &mut IoSrc,
         actor: &Cred,
@@ -2799,7 +1820,7 @@ impl NetlinkSocket {
     /// unicast peer in this socket's network namespace and protocol family;
     /// `NETLINK_USERSOCK` additionally accepts a group destination, while the
     /// privileged synthetic uevent path keeps its single protocol group.
-    pub(crate) fn write_to_with_actor(
+pub(crate) fn write_to_with_actor(
         &self,
         src: &mut IoSrc,
         actor: &Cred,
@@ -2807,6 +1828,13 @@ impl NetlinkSocket {
         destination: Option<SockaddrNl>,
         nowait: bool,
     ) -> AxResult<usize> {
+        // `netlink_sendmsg` refuses an empty datagram right after the MSG_OOB
+        // check (which the syscall layer already ran) and before the address
+        // validation, the NONROOT_SEND gate, and the size admission below:
+        // `if (len == 0) return -ENODATA;` (`net/netlink/af_netlink.c:1817-1820`).
+        if src.remaining() == 0 {
+            return Err(LinuxError::ENODATA.into());
+        }
         let explicit_destination = destination.is_some();
         let destination = destination.or_else(|| {
             let state = self.state.lock();
@@ -2834,7 +1862,7 @@ impl NetlinkSocket {
                 return Err(LinuxError::EPERM.into());
             }
             // `netlink_sendmsg` derives *both* destinations from one address
-            // (`net/netlink/af_netlink.c:1844-1898`):
+            // (`net/netlink/af_netlink.c:1844-1900`):
             //
             // ```c
             // 	dst_portid = addr->nl_pid;
@@ -2885,6 +1913,10 @@ impl NetlinkSocket {
         destination: SockaddrNl,
         nowait: bool,
     ) -> AxResult<usize> {
+        let len = src.remaining();
+        if len == 0 {
+            return Err(LinuxError::ENODATA.into());
+        }
         if !netlink_allowed(
             self.protocol,
             NL_CFG_F_NONROOT_SEND,
@@ -2892,18 +1924,16 @@ impl NetlinkSocket {
         ) {
             return Err(LinuxError::EPERM.into());
         }
-        let len = src.remaining();
-        if len == 0 {
-            return Err(LinuxError::ENODATA.into());
-        }
+        // `netlink_sendmsg` autobinds before it publishes the datagram, so a
+        // peer never observes sender port ID zero.  The bind runs before the
+        // size admission (`net/netlink/af_netlink.c:1862`), so an oversized
+        // first send still leaves the socket bound.
+        let source_port_id = self.ensure_bound_for_send(sender_pid, nowait)?;
         if admit_netlink_write(len, self.send_buffer_limit())
             == NetlinkWriteAdmission::MessageTooLarge
         {
             return Err(LinuxError::EMSGSIZE.into());
         }
-        // `netlink_sendmsg` autobinds before it publishes the datagram, so a
-        // peer never observes sender port ID zero.
-        let source_port_id = self.ensure_bound_for_send(sender_pid, nowait)?;
         let group = 1_u32 << destination.nl_groups.trailing_zeros();
         let mut data = Vec::new();
         data.try_reserve_exact(len)
@@ -2940,7 +1970,13 @@ impl NetlinkSocket {
         if destination.nl_pid == 0 {
             return Err(LinuxError::ECONNREFUSED.into());
         }
-        self.deliver_unicast(data, source_port_id, destination.nl_pid, credentials, nowait)?;
+        self.deliver_unicast(
+            data,
+            source_port_id,
+            destination.nl_pid,
+            credentials,
+            nowait,
+        )?;
         Ok(len)
     }
 
@@ -2959,15 +1995,18 @@ impl NetlinkSocket {
         if len == 0 {
             return Err(LinuxError::ENODATA.into());
         }
+        // sendto(2) autobinds an unbound netlink socket before it publishes a
+        // datagram, and before the size admission
+        // (`net/netlink/af_netlink.c:1862`), so an oversized first send still
+        // leaves the socket bound.  Besides matching the ABI, this prevents
+        // peers from observing the otherwise-invalid port ID zero in
+        // sockaddr_nl.
+        let source_port_id = self.ensure_bound_for_send(sender_pid, nowait)?;
         if admit_netlink_write(len, self.send_buffer_limit())
             == NetlinkWriteAdmission::MessageTooLarge
         {
             return Err(LinuxError::EMSGSIZE.into());
         }
-        // sendto(2) autobinds an unbound netlink socket before it publishes a
-        // datagram.  Besides matching the ABI, this prevents peers from
-        // observing the otherwise-invalid port ID zero in sockaddr_nl.
-        let source_port_id = self.ensure_bound_for_send(sender_pid, nowait)?;
         // A nonzero destination port is ordinary netlink unicast.  Linux
         // applies the uevent CAP_SYS_ADMIN gate only to the port-0 synthetic
         // receive path, not udevd's main-process-to-worker handoff.
@@ -3055,6 +2094,16 @@ impl NetlinkSocket {
         nowait: bool,
     ) -> AxResult<usize> {
         let len = src.remaining();
+        if len == 0 {
+            return Err(LinuxError::ENODATA.into());
+        }
+        // `netlink_sendmsg` autobinds before the size admission
+        // (`net/netlink/af_netlink.c:1862`), so a kernel-bound first write
+        // leaves the socket named even when the datagram is rejected, and the
+        // kernel's replies (such as ACKs) address a real port ID instead of
+        // zero.  The autobind must precede `acquire_write_permit`, which locks
+        // the same state.
+        self.ensure_bound_for_send(sender_pid, nowait)?;
         if admit_netlink_write(len, self.send_buffer_limit())
             == NetlinkWriteAdmission::MessageTooLarge
         {
@@ -3074,7 +2123,7 @@ impl NetlinkSocket {
     /// Netlink writes have no readiness wait. Retain the operation-local
     /// nonblocking argument so RWF_NOWAIT is explicit and does not mutate the
     /// shared OFD status.
-    pub(crate) fn write_with_nonblocking(
+pub(crate) fn write_with_nonblocking(
         &self,
         src: &mut IoSrc,
         nonblocking: bool,
@@ -3082,7 +2131,7 @@ impl NetlinkSocket {
         self.write_with_operation_nonblocking(src, nonblocking, false)
     }
 
-    pub(crate) fn write_with_operation_nonblocking(
+pub(crate) fn write_with_operation_nonblocking(
         &self,
         src: &mut IoSrc,
         _nonblocking: bool,
@@ -3092,6 +2141,14 @@ impl NetlinkSocket {
         let thread = current.as_thread();
         let actor = thread.current_cred();
         let len = src.remaining();
+        if len == 0 {
+            return Err(LinuxError::ENODATA.into());
+        }
+        // `netlink_sendmsg` autobinds an unbound socket before the size
+        // admission (`net/netlink/af_netlink.c:1862`), so even a rejected
+        // first write leaves the socket named.  This must run before
+        // `acquire_write_permit`, which locks the same state.
+        self.ensure_bound_for_send(thread.proc_data.proc.pid() as u32, nowait)?;
         if admit_netlink_write(len, self.send_buffer_limit())
             == NetlinkWriteAdmission::MessageTooLarge
         {
@@ -3184,6 +2241,29 @@ impl NetlinkSocket {
         Ok(())
     }
 
+    /// Acquire the whole write-side lock bundle for one netlink send.
+    ///
+    /// Audit note (deliberately unconverted).  Every `nowait` arm below turns
+    /// contention on a `spin::Mutex` into EAGAIN, and Linux does not do that
+    /// here: `__netlink_sendskb()` reaches `skb_queue_tail()`, which takes
+    /// `sk_receive_queue.lock` unconditionally, and `netlink_attachskb()`
+    /// returns `-EAGAIN` only for an *rcvbuf overflow* on a zero timeout,
+    /// never for lock contention (`net/netlink/af_netlink.c:1210-1254`).  The
+    /// receive side matches: `__skb_try_recv_datagram()` takes
+    /// `spin_lock_irqsave(&queue->lock)` unconditionally and reserves
+    /// `-EAGAIN` for "no data" (`net/core/datagram.c:264,279`).  So these are
+    /// wrong-errno sites by Linux semantics.
+    ///
+    /// They are NOT mechanically convertible to `lock()`.  This function takes
+    /// several locks at once and hands the guards to the caller, and the
+    /// delivery path re-enters a *peer* socket's `state`/`queue` while this
+    /// bundle is still held (see `enqueue_kernel_permitted`, which exists
+    /// precisely to bypass the sender's own already-held locks for multicast
+    /// loopback).  A blind conversion turns a self-addressed or
+    /// mutually-addressed send into a hard spin-deadlock instead of a spurious
+    /// EAGAIN.  Fixing this properly means restructuring delivery so the
+    /// sender's guards are dropped before a peer's are taken; until then the
+    /// `try_lock` is load-bearing and stays.
     fn acquire_write_permit(&self, nowait: bool) -> AxResult<NetlinkWritePermit<'_>> {
         let gate = if nowait {
             self.write_gate.try_lock().ok_or(AxError::WouldBlock)?
@@ -4304,73 +3384,6 @@ impl NetlinkSocket {
     }
 }
 
-#[derive(Clone, Copy)]
-struct InetDiagRequest {
-    family: u8,
-    protocol: u8,
-    extensions: u8,
-    states: u32,
-    sport: u16,
-    dport: u16,
-    src: [u8; 16],
-    dst: [u8; 16],
-    ifindex: u32,
-    cookie: [u32; 2],
-}
-
-impl InetDiagRequest {
-    fn parse(payload: &[u8]) -> AxResult<Self> {
-        debug_assert_eq!(payload.len(), INET_DIAG_REQ_V2_LEN);
-        let states = u32::from_ne_bytes(payload[4..8].try_into().unwrap());
-        let sport = u16::from_be_bytes(payload[8..10].try_into().unwrap());
-        let dport = u16::from_be_bytes(payload[10..12].try_into().unwrap());
-        let mut src = [0_u8; 16];
-        let mut dst = [0_u8; 16];
-        src.copy_from_slice(&payload[12..28]);
-        dst.copy_from_slice(&payload[28..44]);
-        Ok(Self {
-            family: payload[0],
-            protocol: payload[1],
-            extensions: payload[2],
-            states,
-            sport,
-            dport,
-            src,
-            dst,
-            ifindex: u32::from_ne_bytes(payload[44..48].try_into().unwrap()),
-            cookie: [
-                u32::from_ne_bytes(payload[48..52].try_into().unwrap()),
-                u32::from_ne_bytes(payload[52..56].try_into().unwrap()),
-            ],
-        })
-    }
-
-    fn matches(&self, entry: &SocketDiagRegistration) -> bool {
-        if (self.family != AF_UNSPEC as u8 && self.family as u16 != entry.family)
-            || (self.protocol != 0 && self.protocol != entry.protocol)
-        {
-            return false;
-        }
-        let state = entry.diag_state();
-        if self.states != 0 && (state == 0 || self.states & (1_u32 << (state - 1)) == 0) {
-            return false;
-        }
-        // Registered transport endpoints currently retain the canonical
-        // unbound sockid. Therefore any nonzero address/port/interface filter
-        // cannot match; cookie still identifies the exact live OFD.
-        if self.sport != 0
-            || self.dport != 0
-            || self.src.iter().any(|&v| v != 0)
-            || self.dst.iter().any(|&v| v != 0)
-            || self.ifindex != 0
-        {
-            return false;
-        }
-        self.cookie == [INET_DIAG_NOCOOKIE; 2]
-            || self.cookie == [entry.cookie as u32, (entry.cookie >> 32) as u32]
-    }
-}
-
 fn reserve_netlink_port(
     socket: &NetlinkSocket,
     preferred_port_id: u32,
@@ -4472,574 +3485,6 @@ impl Drop for NetlinkSocket {
     }
 }
 
-/// Deliver one policy decision through the generic NETLINK_AUDIT transport.
-/// The record is a normal netlink frame with Linux's
-/// `AUDIT_LANDLOCK_ACCESS` type, so
-/// listeners receive an ordered kernel-originated datagram instead of a
-/// private side channel.
-pub(crate) fn emit_landlock_audit(sequence: u64, event: AuditLandlockDenied) {
-    let mut text = alloc::format!(
-        "audit({sequence}): landlock_blocker={} landlock_access=0x{:x} landlock_domain={} \
-         exec={}\0",
-        event.blocker,
-        event.access,
-        event.domain_id,
-        u8::from(event.on_exec),
-    )
-    .into_bytes();
-    let mut message = vec![0; size_of::<NlMsgHdr>()];
-    message.append(&mut text);
-    let header = NlMsgHdr {
-        nlmsg_len: message.len() as u32,
-        nlmsg_type: AUDIT_LANDLOCK_ACCESS,
-        nlmsg_flags: 0,
-        nlmsg_seq: sequence as u32,
-        nlmsg_pid: 0,
-    };
-    write_struct(&mut message[..size_of::<NlMsgHdr>()], &header);
-    let mut sockets = AUDIT_SOCKETS.lock();
-    sockets.retain(|weak| {
-        let Some(socket) = weak.upgrade() else {
-            return false;
-        };
-        if socket.subscribed_to(AUDIT_GROUP) {
-            let mut copy = Vec::new();
-            if copy.try_reserve_exact(message.len()).is_ok() {
-                copy.extend_from_slice(&message);
-                socket.enqueue_kernel_from(copy, AUDIT_GROUP, Some(KERNEL_UEVENT_CREDENTIALS));
-            } else {
-                socket.note_queue_drop();
-            }
-        }
-        true
-    });
-}
-
-/// Deliver one seccomp event using Linux's `AUDIT_SECCOMP` message type.
-/// Credentials are captured as kernel credentials with the queued datagram,
-/// not sampled later from a potentially unrelated receiver.
-pub(crate) fn emit_seccomp_audit(sequence: u64, event: AuditSeccompDecision) {
-    let mut text = alloc::format!(
-        "audit({sequence}): arch={:#x} syscall={} ip={:#x} code={:#x} pid={}\0",
-        event.architecture,
-        event.syscall,
-        event.instruction_pointer,
-        event.action,
-        event.pid,
-    )
-    .into_bytes();
-    let mut message = vec![0; size_of::<NlMsgHdr>()];
-    message.append(&mut text);
-    let header = NlMsgHdr {
-        nlmsg_len: message.len() as u32,
-        nlmsg_type: AUDIT_SECCOMP,
-        nlmsg_flags: 0,
-        nlmsg_seq: sequence as u32,
-        nlmsg_pid: 0,
-    };
-    write_struct(&mut message[..size_of::<NlMsgHdr>()], &header);
-    let mut sockets = AUDIT_SOCKETS.lock();
-    sockets.retain(|weak| {
-        let Some(socket) = weak.upgrade() else {
-            return false;
-        };
-        if socket.subscribed_to(AUDIT_GROUP) {
-            let mut copy = Vec::new();
-            if copy.try_reserve_exact(message.len()).is_ok() {
-                copy.extend_from_slice(&message);
-                socket.enqueue_kernel_from(copy, AUDIT_GROUP, Some(KERNEL_UEVENT_CREDENTIALS));
-            } else {
-                socket.note_queue_drop();
-            }
-        }
-        true
-    });
-}
-
-/// Establish the network namespace to which all kernel kobject uevents are
-/// broadcast.  Boot registers init-net before publishing devices; repeating
-/// that registration is harmless, while replacing it is rejected.
-pub(crate) fn register_init_network_namespace(net_ns: &Arc<NetworkNamespace>) -> AxResult {
-    let mut init_net_ns = INIT_NETWORK_NAMESPACE.lock();
-    match init_net_ns.as_ref() {
-        Some(existing) if Arc::ptr_eq(existing, net_ns) => Ok(()),
-        Some(_) => Err(AxError::AlreadyExists),
-        None => {
-            *init_net_ns = Some(net_ns.clone());
-            Ok(())
-        }
-    }
-}
-
-/// Audit endpoints remain global even though ordinary netlink families are
-/// network-namespace scoped.  Compare object identity rather than the owner
-/// user namespace: an unshared network namespace can be owned by init-user
-/// and is still not permitted to host an audit listener.
-fn is_initial_network_namespace(net_ns: &Arc<NetworkNamespace>) -> bool {
-    INIT_NETWORK_NAMESPACE
-        .lock()
-        .as_ref()
-        .is_some_and(|initial| Arc::ptr_eq(initial, net_ns))
-}
-
-/// Publish a kobject uevent exclusively to the boot-established init network
-/// namespace.  Before boot has registered init-net, there can be no
-/// publishable device listener, so retain the historical best-effort behavior
-/// and drop the notification.
-pub(crate) fn emit_init_net_kobject_uevent(
-    action: &str,
-    devpath: &str,
-    subsystem: &str,
-    extra_environment: &[(&str, &str)],
-) -> AxResult<Option<u64>> {
-    let init_net_ns = INIT_NETWORK_NAMESPACE.lock().clone();
-    let Some(init_net_ns) = init_net_ns else {
-        return Ok(None);
-    };
-    emit_kobject_uevent(&init_net_ns, action, devpath, subsystem, extra_environment).map(Some)
-}
-
-/// Publish a kernel kobject uevent to NETLINK_KOBJECT_UEVENT group 1.
-///
-/// The payload follows the Linux wire format: an action/path header followed
-/// by NUL-separated environment strings, with a globally monotonic SEQNUM.
-/// This is intentionally independent from the route netlink request parser.
-pub(crate) fn emit_kobject_uevent(
-    net_ns: &NetworkNamespace,
-    action: &str,
-    devpath: &str,
-    subsystem: &str,
-    extra_environment: &[(&str, &str)],
-) -> AxResult<u64> {
-    if action.is_empty()
-        || devpath.is_empty()
-        || subsystem.is_empty()
-        || action.contains('\0')
-        || devpath.contains('\0')
-        || subsystem.contains('\0')
-        || extra_environment
-            .iter()
-            .any(|(key, value)| key.is_empty() || key.contains('\0') || value.contains('\0'))
-    {
-        return Err(AxError::InvalidInput);
-    }
-
-    // A single sender domain keeps sequence allocation and delivery ordered:
-    // listeners can never receive SEQNUM n + 1 before n.
-    let _send_guard = KOBJECT_UEVENT_SEND_LOCK.lock();
-    let sequence = KOBJECT_UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed) + 1;
-    let sequence_text = sequence.to_string();
-    let mut payload_len = action
-        .len()
-        .checked_add(1)
-        .and_then(|len| len.checked_add(devpath.len()))
-        .and_then(|len| len.checked_add(1))
-        .ok_or(AxError::NoMemory)?;
-    for (key, value) in [
-        ("ACTION", action),
-        ("DEVPATH", devpath),
-        ("SUBSYSTEM", subsystem),
-        ("SEQNUM", sequence_text.as_str()),
-    ]
-    .into_iter()
-    .chain(extra_environment.iter().copied())
-    {
-        payload_len = payload_len
-            .checked_add(key.len())
-            .and_then(|len| len.checked_add(1))
-            .and_then(|len| len.checked_add(value.len()))
-            .and_then(|len| len.checked_add(1))
-            .ok_or(AxError::NoMemory)?;
-    }
-    if admit_kernel_netlink_message(payload_len) == NetlinkWriteAdmission::MessageTooLarge {
-        return Err(LinuxError::EMSGSIZE.into());
-    }
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(payload_len)
-        .map_err(|_| AxError::NoMemory)?;
-    append_uevent_field(&mut payload, action)?;
-    payload.push(b'@');
-    append_uevent_field(&mut payload, devpath)?;
-    payload.push(0);
-    append_uevent_assignment(&mut payload, "ACTION", action)?;
-    append_uevent_assignment(&mut payload, "DEVPATH", devpath)?;
-    append_uevent_assignment(&mut payload, "SUBSYSTEM", subsystem)?;
-    append_uevent_assignment(&mut payload, "SEQNUM", &sequence_text)?;
-    for &(key, value) in extra_environment {
-        append_uevent_assignment(&mut payload, key, value)?;
-    }
-    debug_assert_eq!(payload.len(), payload_len);
-
-    broadcast_uevent_to_namespace(net_ns, &payload, KERNEL_UEVENT_CREDENTIALS, None);
-    Ok(sequence)
-}
-
-fn broadcast_user_uevent(
-    net_ns: &NetworkNamespace,
-    payload: &[u8],
-    credentials: NetlinkCredentials,
-) -> AxResult {
-    // Keep synthetic and kernel-originated uevents in one sequence/delivery
-    // domain, matching uevent_sock_mutex plus the global Linux sequence.
-    let _send_guard = KOBJECT_UEVENT_SEND_LOCK.lock();
-    broadcast_user_uevent_locked(net_ns, payload, credentials, None)
-}
-
-/// Caller already owns `KOBJECT_UEVENT_SEND_LOCK` through a typed Uevent
-/// write permit or through the ordinary wrapper above.
-fn broadcast_user_uevent_locked(
-    net_ns: &NetworkNamespace,
-    payload: &[u8],
-    credentials: NetlinkCredentials,
-    skip: Option<*const NetlinkSocket>,
-) -> AxResult {
-    let sequence = KOBJECT_UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed) + 1;
-    let sequence_text = sequence.to_string();
-    let suffix_len = "SEQNUM="
-        .len()
-        .checked_add(sequence_text.len())
-        .and_then(|len| len.checked_add(1))
-        .ok_or(AxError::NoMemory)?;
-    let message_len = payload
-        .len()
-        .checked_add(suffix_len)
-        .ok_or(AxError::NoMemory)?;
-    if admit_kernel_netlink_message(message_len) == NetlinkWriteAdmission::MessageTooLarge {
-        return Err(LinuxError::EMSGSIZE.into());
-    }
-    let mut message = Vec::new();
-    message
-        .try_reserve_exact(message_len)
-        .map_err(|_| AxError::NoMemory)?;
-    message.extend_from_slice(payload);
-    append_uevent_assignment(&mut message, "SEQNUM", &sequence_text)?;
-    debug_assert_eq!(message.len(), message_len);
-    broadcast_uevent_to_namespace(net_ns, &message, credentials, skip);
-    Ok(())
-}
-
-/// NOWAIT uevent delivery while the caller owns the global sender domain.
-/// Peer state/queues are probed only; contended listeners observe a normal
-/// multicast drop rather than making this source-consuming operation sleep.
-/// The caller's own delivery is returned for its retained queue to enqueue.
-fn broadcast_user_uevent_nowait_locked(
-    net_ns: &NetworkNamespace,
-    payload: &[u8],
-    credentials: NetlinkCredentials,
-    sender: *const NetlinkSocket,
-    sockets: &mut Vec<Weak<NetlinkSocket>>,
-) -> AxResult<Vec<u8>> {
-    let sequence = KOBJECT_UEVENT_SEQNUM.fetch_add(1, Ordering::Relaxed) + 1;
-    let sequence_text = sequence.to_string();
-    let suffix_len = "SEQNUM="
-        .len()
-        .checked_add(sequence_text.len())
-        .and_then(|len| len.checked_add(1))
-        .ok_or(AxError::NoMemory)?;
-    let message_len = payload
-        .len()
-        .checked_add(suffix_len)
-        .ok_or(AxError::NoMemory)?;
-    if admit_kernel_netlink_message(message_len) == NetlinkWriteAdmission::MessageTooLarge {
-        return Err(LinuxError::EMSGSIZE.into());
-    }
-    let mut message = Vec::new();
-    message
-        .try_reserve_exact(message_len)
-        .map_err(|_| AxError::NoMemory)?;
-    message.extend_from_slice(payload);
-    append_uevent_assignment(&mut message, "SEQNUM", &sequence_text)?;
-    sockets.retain(|entry| {
-        let Some(socket) = entry.upgrade() else {
-            return false;
-        };
-        if core::ptr::eq(Arc::as_ptr(&socket), sender)
-            || !core::ptr::eq(socket.net_ns.as_ref(), net_ns)
-        {
-            return true;
-        }
-        let Some(state) = socket.state.try_lock() else {
-            // The NO_ENOBUFS bit itself is protected by this contended lock;
-            // report the loss conservatively so userspace can rescan.
-            socket.overrun.store(true, Ordering::Release);
-            socket.poll_rx.wake();
-            return true;
-        };
-        let subscribed = state.groups & u64::from(KOBJECT_UEVENT_GROUP) != 0;
-        let suppress_enobufs = state.option_flags & (1 << NETLINK_NO_ENOBUFS) != 0;
-        let rcvbuf = usize::try_from(state.sock.rcvbuf).unwrap_or(0);
-        drop(state);
-        if !subscribed {
-            return true;
-        }
-        let Some(mut queue) = socket.queue.try_lock() else {
-            if !suppress_enobufs {
-                socket.overrun.store(true, Ordering::Release);
-            }
-            socket.poll_rx.wake();
-            return true;
-        };
-        if admit_netlink_queue(
-            queue.datagrams.len(),
-            queue.bytes,
-            message.len(),
-            NETLINK_QUEUE_LIMIT,
-            rcvbuf,
-        ) == NetlinkQueueAdmission::Drop
-        {
-            if !suppress_enobufs {
-                socket.overrun.store(true, Ordering::Release);
-            }
-            socket.poll_rx.wake();
-            return true;
-        }
-        let mut copy = Vec::new();
-        if copy.try_reserve_exact(message.len()).is_err() {
-            if !suppress_enobufs {
-                socket.overrun.store(true, Ordering::Release);
-            }
-            socket.poll_rx.wake();
-            return true;
-        }
-        copy.extend_from_slice(&message);
-        queue.bytes += copy.len();
-        queue.datagrams.push_back(NetlinkDatagram {
-            data: copy,
-            source_port_id: 0,
-            source_groups: KOBJECT_UEVENT_GROUP,
-            credentials: Some(credentials),
-        });
-        drop(queue);
-        socket.poll_rx.wake();
-        true
-    });
-    Ok(message)
-}
-
-fn broadcast_uevent_to_namespace(
-    net_ns: &NetworkNamespace,
-    payload: &[u8],
-    credentials: NetlinkCredentials,
-    skip: Option<*const NetlinkSocket>,
-) {
-    // Never retain the global listener registry while taking a socket-local
-    // state or queue lock.  A userspace sender holds its own state/queue
-    // before it takes the sender-domain lock, so registry -> peer lock here
-    // would otherwise form a cross-sender cycle.
-    let mut sockets = KOBJECT_UEVENT_SOCKETS.lock();
-    let listeners = match collect_live_listeners(&mut sockets) {
-        Ok(listeners) => listeners,
-        Err(error) => {
-            // Kernel-originated uevents are best effort.  OOM while taking a
-            // snapshot must not hold the sender domain or make device
-            // publication fail; retain only live registrations and drop this
-            // multicast with a diagnostic.
-            sockets.retain(|socket| socket.strong_count() != 0);
-            warn!("dropping kobject uevent: cannot snapshot listeners: {error}");
-            return;
-        }
-    };
-    drop(sockets);
-
-    for socket in listeners {
-        if skip.is_some_and(|skip| core::ptr::eq(Arc::as_ptr(&socket), skip)) {
-            continue;
-        }
-        if !core::ptr::eq(socket.net_ns.as_ref(), net_ns) {
-            continue;
-        }
-        // This path runs with KOBJECT_UEVENT_SEND_LOCK held.  A synthetic
-        // sender owns its own state before waiting for that lock, so listener
-        // state and queue must be probed, never waited on.
-        let Some(state) = socket.state.try_lock() else {
-            // We cannot inspect NETLINK_NO_ENOBUFS without this lock.  Report
-            // the loss conservatively so eudevd receives an ENOBUFS rescan
-            // signal instead of silently missing device lifecycle events.
-            socket.overrun.store(true, Ordering::Release);
-            socket.poll_rx.wake();
-            continue;
-        };
-        let subscribed = state.groups & u64::from(KOBJECT_UEVENT_GROUP) != 0;
-        let suppress_enobufs = state.option_flags & (1 << NETLINK_NO_ENOBUFS) != 0;
-        let rcvbuf = usize::try_from(state.sock.rcvbuf).unwrap_or(0);
-        drop(state);
-        if !subscribed {
-            continue;
-        }
-        let Some(mut queue) = socket.queue.try_lock() else {
-            if !suppress_enobufs {
-                socket.overrun.store(true, Ordering::Release);
-            }
-            socket.poll_rx.wake();
-            continue;
-        };
-        if admit_netlink_queue(
-            queue.datagrams.len(),
-            queue.bytes,
-            payload.len(),
-            NETLINK_QUEUE_LIMIT,
-            rcvbuf,
-        ) == NetlinkQueueAdmission::Drop
-        {
-            if !suppress_enobufs {
-                socket.overrun.store(true, Ordering::Release);
-            }
-            drop(queue);
-            socket.poll_rx.wake();
-            continue;
-        }
-        // Keep per-socket buffers isolated: an allocation failure for one
-        // listener never makes another listener observe its datagram.
-        let mut message = Vec::new();
-        if message.try_reserve_exact(payload.len()).is_err() {
-            if !suppress_enobufs {
-                socket.overrun.store(true, Ordering::Release);
-            }
-            drop(queue);
-            socket.poll_rx.wake();
-            continue;
-        }
-        message.extend_from_slice(payload);
-        queue.bytes += message.len();
-        queue.datagrams.push_back(NetlinkDatagram {
-            data: message,
-            source_port_id: 0,
-            source_groups: KOBJECT_UEVENT_GROUP,
-            credentials: Some(credentials),
-        });
-        drop(queue);
-        socket.poll_rx.wake();
-    }
-}
-
-/// Snapshot live listeners while holding only the registry lock.  Callers
-/// must release that lock before touching socket-local state or queues.
-fn collect_live_listeners(
-    sockets: &mut Vec<Weak<NetlinkSocket>>,
-) -> AxResult<Vec<Arc<NetlinkSocket>>> {
-    let mut listeners = Vec::new();
-    listeners
-        .try_reserve(sockets.len())
-        .map_err(|_| AxError::NoMemory)?;
-    sockets.retain(|entry| {
-        let Some(socket) = entry.upgrade() else {
-            return false;
-        };
-        listeners.push(socket);
-        true
-    });
-    Ok(listeners)
-}
-
-fn find_netlink_peer(
-    protocol: u32,
-    net_ns: &NetworkNamespace,
-    port_id: u32,
-    nowait: bool,
-) -> AxResult<Option<Arc<NetlinkSocket>>> {
-    // KOBJECT_UEVENT and USERSOCK are the netlink families in this kernel that
-    // accept user-to-user datagrams (`netlink_unicast` resolving a port ID in
-    // `nl_table[protocol].hash`).  Their weak listener registries provide a
-    // lifetime pin without changing the deliberately metadata-only port
-    // reservation table used by the kernel-service families.
-    let registry = match protocol {
-        NETLINK_KOBJECT_UEVENT => &*KOBJECT_UEVENT_SOCKETS,
-        NETLINK_USERSOCK => &*USERSOCK_SOCKETS,
-        _ => return Ok(None),
-    };
-    // Binding takes socket state and then the port registry.  Do not invert
-    // that order by holding the transport registry while inspecting a peer's
-    // state: clone live candidates first, then drop the registry lock.
-    let mut sockets = if nowait {
-        registry.try_lock().ok_or(AxError::WouldBlock)?
-    } else {
-        registry.lock()
-    };
-    let candidates = collect_live_listeners(&mut sockets)?;
-    drop(sockets);
-
-    for socket in candidates {
-        let state = if nowait {
-            socket.state.try_lock().ok_or(AxError::WouldBlock)?
-        } else {
-            socket.state.lock()
-        };
-        let matches = state.bound
-            && state.port_id == port_id
-            && core::ptr::eq(socket.net_ns.as_ref(), net_ns);
-        drop(state);
-        if matches {
-            return Ok(Some(socket));
-        }
-    }
-    Ok(None)
-}
-
-/// Deliver one `NETLINK_USERSOCK` datagram to every subscriber of `group` in
-/// this network namespace.  Linux's `netlink_broadcast` walks the same
-/// protocol hash table and filters on `nlk->groups & group` after translating
-/// the reported sender identity and, for `nl_pid != 0`, excluding the sender.
-fn broadcast_netlink_usersock(
-    sender: &NetlinkSocket,
-    data: &[u8],
-    source_port_id: u32,
-    destination_port_id: u32,
-    group: u32,
-    credentials: NetlinkCredentials,
-    nowait: bool,
-) -> AxResult {
-    let mut sockets = if nowait {
-        USERSOCK_SOCKETS.try_lock().ok_or(AxError::WouldBlock)?
-    } else {
-        USERSOCK_SOCKETS.lock()
-    };
-    let candidates = collect_live_listeners(&mut sockets)?;
-    drop(sockets);
-
-    let mut delivered = false;
-    for socket in candidates {
-        // `do_one_broadcast()` skips the sender (`p->exclude_sk`) and the
-        // socket the address names (`nlk->portid == p->portid`) before it
-        // tests group membership (`net/netlink/af_netlink.c:1429-1431`).  The
-        // named socket is skipped because `netlink_sendmsg` hands it the
-        // `netlink_unicast()` copy instead, which is what makes a
-        // `{nl_pid, nl_groups}` address deliver exactly one datagram to it.
-        if core::ptr::eq(socket.as_ref(), sender) {
-            continue;
-        }
-        if destination_port_id != 0 && socket.bound_port_id() == Some(destination_port_id) {
-            continue;
-        }
-        if !Arc::ptr_eq(&socket.net_ns, &sender.net_ns) {
-            continue;
-        }
-        if !socket.subscribed_to(group) {
-            continue;
-        }
-        let mut copy = Vec::new();
-        copy.try_reserve_exact(data.len())
-            .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
-        copy.extend_from_slice(data);
-        // `do_one_broadcast()` reports one failed delivery without aborting
-        // the round, so a full or contended queue on one subscriber costs it
-        // the datagram (recorded as an overrun) but never starves the rest.
-        if socket
-            .enqueue_user_from(copy, source_port_id, credentials, nowait)
-            .is_err()
-        {
-            socket.note_queue_drop();
-            continue;
-        }
-        delivered = true;
-    }
-    if delivered {
-        Ok(())
-    } else {
-        Err(LinuxError::ESRCH.into())
-    }
-}
-
 #[cfg(test)]
 fn kobject_uevent_socket_is_registered(socket: *const NetlinkSocket) -> bool {
     KOBJECT_UEVENT_SOCKETS
@@ -5102,455 +3547,6 @@ impl FileLike for NetlinkSocket {
     fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
         try_pseudo_inode_path("socket", self.inode.inode())
     }
-}
-
-fn netlink_ack(request: &NlMsgHdr, port_id: u32, error: i32) -> Vec<u8> {
-    let header_len = size_of::<NlMsgHdr>();
-    let err_len = size_of::<NlMsgErr>();
-    let mut out = vec![0; header_len + err_len];
-    let hdr = NlMsgHdr {
-        nlmsg_len: out.len() as u32,
-        nlmsg_type: NLMSG_ERROR,
-        nlmsg_flags: 0,
-        nlmsg_seq: request.nlmsg_seq,
-        nlmsg_pid: port_id,
-    };
-    write_struct(&mut out[..header_len], &hdr);
-    let err = NlMsgErr {
-        error,
-        msg: *request,
-    };
-    write_struct(&mut out[header_len..], &err);
-    out
-}
-
-fn done_message(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
-    let mut out = vec![0; size_of::<NlMsgHdr>()];
-    let hdr = NlMsgHdr {
-        nlmsg_len: out.len() as u32,
-        nlmsg_type: NLMSG_DONE,
-        nlmsg_flags: NLM_F_MULTI,
-        nlmsg_seq: request.nlmsg_seq,
-        nlmsg_pid: port_id,
-    };
-    write_struct(&mut out, &hdr);
-    out
-}
-
-fn netlink_message(
-    request: &NlMsgHdr,
-    port_id: u32,
-    msg_type: u16,
-    mut payload: Vec<u8>,
-) -> Vec<u8> {
-    let header_len = size_of::<NlMsgHdr>();
-    let mut out = vec![0; header_len];
-    out.append(&mut payload);
-    let hdr = NlMsgHdr {
-        nlmsg_len: out.len() as u32,
-        nlmsg_type: msg_type,
-        nlmsg_flags: NLM_F_MULTI,
-        nlmsg_seq: request.nlmsg_seq,
-        nlmsg_pid: port_id,
-    };
-    write_struct(&mut out[..header_len], &hdr);
-    out
-}
-
-fn sock_diag_message(
-    request: &NlMsgHdr,
-    port_id: u32,
-    entry: &SocketDiagRegistration,
-    extensions: u8,
-) -> Vec<u8> {
-    // `inet_diag_msg`: family/state/timer/retrans, inet_diag_sockid, then
-    // expires/rqueue/wqueue/uid/inode.  Addresses and queues are zero until
-    // the transport exposes its bind/connect snapshot; identity, protocol
-    // selection and lifecycle are nevertheless the actual live OFD record.
-    let mut payload = vec![0_u8; 72];
-    payload[0] = entry.family as u8;
-    payload[1] = entry.diag_state();
-    payload[44..48].copy_from_slice(&(entry.cookie as u32).to_ne_bytes());
-    payload[48..52].copy_from_slice(&((entry.cookie >> 32) as u32).to_ne_bytes());
-    // No provider extension is invented yet; retaining the parsed extension
-    // mask makes the request path complete without changing base selection.
-    let _ = extensions;
-    netlink_message(request, port_id, SOCK_DIAG_BY_FAMILY, payload)
-}
-
-fn generic_family_message(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
-    let mut payload = payload_with(&GenlMsgHdr {
-        cmd: CTRL_CMD_NEWFAMILY,
-        version: 2,
-        reserved: 0,
-    });
-    push_attr(
-        &mut payload,
-        CTRL_ATTR_FAMILY_ID,
-        &THEKERNEL_GENL_FAMILY_ID.to_ne_bytes(),
-    );
-    push_attr_string(
-        &mut payload,
-        CTRL_ATTR_FAMILY_NAME,
-        THEKERNEL_GENL_FAMILY_NAME,
-    );
-    push_attr(&mut payload, CTRL_ATTR_VERSION, &[1, 0, 0, 0]);
-    push_attr(&mut payload, CTRL_ATTR_HDRSIZE, &[0, 0, 0, 0]);
-    push_attr(&mut payload, CTRL_ATTR_MAXATTR, &[0, 0, 0, 0]);
-    netlink_message(request, port_id, GENL_ID_CTRL, payload)
-}
-
-fn nft_payload() -> Vec<u8> {
-    vec![0, 0, 0, 0]
-} // struct nfgenmsg
-fn nft_message(request: &NlMsgHdr, port_id: u32, command: u16, payload: Vec<u8>) -> Vec<u8> {
-    netlink_message(
-        request,
-        port_id,
-        (NFNL_SUBSYS_NFTABLES << 8) | command,
-        payload,
-    )
-}
-fn nft_table_message(request: &NlMsgHdr, port_id: u32, table: &str) -> Vec<u8> {
-    let mut payload = nft_payload();
-    push_attr_string(&mut payload, NFTA_TABLE_NAME, table);
-    nft_message(request, port_id, NFT_MSG_NEWTABLE, payload)
-}
-fn nft_chain_message(request: &NlMsgHdr, port_id: u32, chain: &NftChain) -> Vec<u8> {
-    let mut payload = nft_payload();
-    push_attr_string(&mut payload, NFTA_CHAIN_TABLE, &chain.table);
-    push_attr_string(&mut payload, NFTA_CHAIN_NAME, &chain.name);
-    nft_message(request, port_id, NFT_MSG_NEWCHAIN, payload)
-}
-fn nft_rule_message(request: &NlMsgHdr, port_id: u32, rule: &NftRule) -> Vec<u8> {
-    let mut payload = nft_payload();
-    push_attr_string(&mut payload, NFTA_RULE_TABLE, &rule.table);
-    push_attr_string(&mut payload, NFTA_RULE_CHAIN, &rule.chain);
-    push_attr(&mut payload, NFTA_RULE_HANDLE, &rule.handle.to_ne_bytes());
-    nft_message(request, port_id, NFT_MSG_NEWRULE, payload)
-}
-fn nft_set_message(request: &NlMsgHdr, port_id: u32, set: &NftSet) -> Vec<u8> {
-    let mut payload = nft_payload();
-    push_attr_string(&mut payload, NFTA_SET_TABLE, &set.table);
-    push_attr_string(&mut payload, NFTA_SET_NAME, &set.name);
-    push_attr_u32(&mut payload, NFTA_SET_ID, set.id);
-    push_attr_u32(&mut payload, NFTA_SET_FLAGS, set.flags);
-    push_attr_u32(&mut payload, NFTA_SET_KEY_TYPE, set.key_type);
-    push_attr_u32(&mut payload, NFTA_SET_DATA_TYPE, set.data_type);
-    nft_message(request, port_id, NFT_MSG_NEWSET, payload)
-}
-fn nft_element_message(request: &NlMsgHdr, port_id: u32, element: &NftSetElement) -> Vec<u8> {
-    let mut payload = nft_payload();
-    push_attr_string(&mut payload, NFTA_SET_ELEM_LIST_TABLE, &element.table);
-    push_attr_string(&mut payload, NFTA_SET_ELEM_LIST_SET, &element.set);
-    push_attr(&mut payload, NFTA_SET_ELEM_LIST_ELEMENTS, &element.key);
-    nft_message(request, port_id, NFT_MSG_NEWSETELEM, payload)
-}
-
-fn payload_with<T: Copy>(value: &T) -> Vec<u8> {
-    let mut out = vec![0; size_of::<T>()];
-    write_struct(&mut out, value);
-    out
-}
-
-fn push_attr(out: &mut Vec<u8>, attr_type: u16, value: &[u8]) {
-    let len = size_of::<RtAttr>() + value.len();
-    let aligned = align4(len);
-    let start = out.len();
-    out.resize(start + aligned, 0);
-    write_struct(
-        &mut out[start..start + size_of::<RtAttr>()],
-        &RtAttr {
-            rta_len: len as u16,
-            rta_type: attr_type,
-        },
-    );
-    out[start + size_of::<RtAttr>()..start + len].copy_from_slice(value);
-}
-
-fn push_attr_u32(out: &mut Vec<u8>, attr_type: u16, value: u32) {
-    push_attr(out, attr_type, &value.to_ne_bytes());
-}
-
-fn push_attr_string(out: &mut Vec<u8>, attr_type: u16, value: &str) {
-    let mut bytes = value.as_bytes().to_vec();
-    bytes.push(0);
-    push_attr(out, attr_type, &bytes);
-}
-
-fn address_message(request: &NlMsgHdr, port_id: u32, entry: &AddressEntry) -> Vec<u8> {
-    let mut payload = payload_with(&IfAddrMsg {
-        ifa_family: entry.family,
-        ifa_prefixlen: entry.prefix_len,
-        ifa_flags: entry.flags,
-        ifa_scope: entry.scope,
-        ifa_index: entry.index,
-    });
-    if !entry.address.is_empty() {
-        push_attr(&mut payload, IFA_ADDRESS, &entry.address);
-    }
-    if !entry.local.is_empty() {
-        push_attr(&mut payload, IFA_LOCAL, &entry.local);
-    }
-    if !entry.label.is_empty() {
-        push_attr_string(&mut payload, IFA_LABEL, &entry.label);
-    }
-    netlink_message(request, port_id, RTM_NEWADDR, payload)
-}
-
-fn route_message(request: &NlMsgHdr, port_id: u32, entry: &RouteEntry) -> Vec<u8> {
-    let mut payload = payload_with(&RtMsg {
-        rtm_family: entry.family,
-        rtm_dst_len: entry.dst_len,
-        rtm_src_len: 0,
-        rtm_tos: 0,
-        rtm_table: entry.table,
-        rtm_protocol: 0,
-        rtm_scope: entry.scope,
-        rtm_type: entry.route_type,
-        rtm_flags: 0,
-    });
-    if !entry.dst.is_empty() {
-        push_attr(&mut payload, RTA_DST, &entry.dst);
-    }
-    if !entry.gateway.is_empty() {
-        push_attr(&mut payload, RTA_GATEWAY, &entry.gateway);
-    }
-    if let Some(oif) = entry.oif {
-        push_attr_u32(&mut payload, RTA_OIF, oif);
-    }
-    netlink_message(request, port_id, RTM_NEWROUTE, payload)
-}
-
-fn link_message(request: &NlMsgHdr, port_id: u32, entry: &LinkEntry) -> Vec<u8> {
-    let mut payload = payload_with(&IfInfoMsg {
-        ifi_family: AF_UNSPEC as u8,
-        ifi_pad: 0,
-        ifi_type: entry.arphrd,
-        ifi_index: entry.index as i32,
-        ifi_flags: entry.flags,
-        ifi_change: 0,
-    });
-    push_attr_string(&mut payload, IFLA_IFNAME, &entry.name);
-    push_attr_u32(&mut payload, IFLA_MTU, entry.mtu);
-    if !entry.hwaddr.is_empty() {
-        push_attr(&mut payload, IFLA_ADDRESS, &entry.hwaddr);
-    }
-    netlink_message(request, port_id, RTM_NEWLINK, payload)
-}
-
-fn parse_ifinfo(payload: &[u8]) -> AxResult<IfInfoMsg> {
-    if payload.len() < size_of::<IfInfoMsg>() {
-        return Err(AxError::InvalidInput);
-    }
-    read_unaligned::<IfInfoMsg>(payload)
-}
-
-/// Iterate a fully copied NLA stream.  Netlink attribute alignment is part of
-/// the ABI: accepting an unterminated padding fragment would otherwise make a
-/// later message in the same write appear to be an attribute of this one.
-fn for_each_rtattr<'a>(
-    mut bytes: &'a [u8],
-    mut visit: impl FnMut(u16, &'a [u8]) -> AxResult,
-) -> AxResult {
-    while !bytes.is_empty() {
-        if bytes.len() < size_of::<RtAttr>() {
-            return Err(AxError::InvalidInput);
-        }
-        let attr = read_unaligned::<RtAttr>(bytes)?;
-        let length = attr.rta_len as usize;
-        if length < size_of::<RtAttr>() || length > bytes.len() {
-            return Err(AxError::InvalidInput);
-        }
-        visit(attr.rta_type & !0x8000, &bytes[size_of::<RtAttr>()..length])?;
-        let aligned = align4(length);
-        if aligned > bytes.len() {
-            // The final netlink attribute does not require explicit padding.
-            if length == bytes.len() {
-                return Ok(());
-            }
-            return Err(AxError::InvalidInput);
-        }
-        bytes = &bytes[aligned..];
-    }
-    Ok(())
-}
-
-fn decode_nft_name(bytes: &[u8]) -> AxResult<String> {
-    let name = bytes.strip_suffix(&[0]).ok_or(AxError::InvalidInput)?;
-    if name.is_empty() || name.len() >= 256 || name.contains(&0) {
-        return Err(AxError::InvalidInput);
-    }
-    nft_owned_name(core::str::from_utf8(name).map_err(|_| AxError::InvalidInput)?)
-}
-
-fn decode_link_name(bytes: &[u8]) -> AxResult<String> {
-    let name = bytes.strip_suffix(&[0]).ok_or(AxError::InvalidInput)?;
-    if name.is_empty() || name.len() > 15 || name.contains(&0) {
-        return Err(AxError::InvalidInput);
-    }
-    core::str::from_utf8(name)
-        .map(String::from)
-        .map_err(|_| AxError::InvalidInput)
-}
-
-fn parse_link_attributes(bytes: &[u8]) -> AxResult<(Option<String>, Option<usize>)> {
-    let mut name = None;
-    let mut mtu = None;
-    for_each_rtattr(bytes, |kind, value| match kind {
-        IFLA_IFNAME if name.is_none() => {
-            name = Some(decode_link_name(value)?);
-            Ok(())
-        }
-        IFLA_MTU if mtu.is_none() && value.len() == size_of::<u32>() => {
-            mtu = Some(u32::from_ne_bytes(value.try_into().unwrap()) as usize);
-            Ok(())
-        }
-        IFLA_MTU => Err(AxError::InvalidInput),
-        _ => Err(AxError::OperationNotSupported),
-    })?;
-    Ok((name, mtu))
-}
-
-fn ip_address_bytes(address: IpAddress) -> Vec<u8> {
-    match address {
-        IpAddress::Ipv4(address) => address.octets().to_vec(),
-        IpAddress::Ipv6(address) => address.octets().to_vec(),
-    }
-}
-
-fn decode_ip(family: u8, bytes: &[u8]) -> AxResult<IpAddress> {
-    match family as u32 {
-        value if value == AF_INET as u32 && bytes.len() == 4 => Ok(IpAddress::Ipv4(
-            Ipv4Address::from_octets(bytes.try_into().map_err(|_| AxError::InvalidInput)?),
-        )),
-        value if value == AF_INET6 as u32 && bytes.len() == 16 => Ok(IpAddress::Ipv6(
-            Ipv6Address::from_octets(bytes.try_into().map_err(|_| AxError::InvalidInput)?),
-        )),
-        _ => Err(AxError::InvalidInput),
-    }
-}
-
-fn unspecified_ip(family: u8) -> AxResult<IpAddress> {
-    match family as u32 {
-        value if value == AF_INET as u32 => Ok(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)),
-        value if value == AF_INET6 as u32 => Ok(IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)),
-        _ => Err(AxError::InvalidInput),
-    }
-}
-
-fn same_ip_family(left: IpAddress, right: IpAddress) -> bool {
-    matches!(
-        (left, right),
-        (IpAddress::Ipv4(_), IpAddress::Ipv4(_)) | (IpAddress::Ipv6(_), IpAddress::Ipv6(_))
-    )
-}
-
-fn address_entries(interface: &InterfaceInfo) -> Vec<AddressEntry> {
-    interface
-        .addresses
-        .iter()
-        .map(|cidr| {
-            let address = cidr.address();
-            let family = match address {
-                IpAddress::Ipv4(_) => AF_INET as u8,
-                IpAddress::Ipv6(_) => AF_INET6 as u8,
-            };
-            let bytes = ip_address_bytes(address);
-            AddressEntry {
-                family,
-                prefix_len: cidr.prefix_len(),
-                flags: IFA_F_PERMANENT,
-                scope: if interface.kind == InterfaceKind::Loopback {
-                    RT_SCOPE_HOST
-                } else {
-                    RT_SCOPE_UNIVERSE
-                },
-                index: interface.index,
-                local: bytes.clone(),
-                address: bytes,
-                label: interface.name.clone(),
-            }
-        })
-        .collect()
-}
-
-fn link_entry(interface: InterfaceInfo) -> LinkEntry {
-    let is_loopback = interface.kind == InterfaceKind::Loopback;
-    let base = if is_loopback {
-        IFF_LOOPBACK | IFF_RUNNING
-    } else {
-        IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST
-    };
-    let flags = base
-        | if interface.administrative_up {
-            IFF_UP
-        } else {
-            0
-        };
-    LinkEntry {
-        index: interface.index,
-        name: interface.name,
-        flags,
-        mtu: interface.mtu.min(u32::MAX as usize) as u32,
-        hwaddr: interface
-            .hardware_address
-            .map(|address| address.to_vec())
-            .unwrap_or_default(),
-        arphrd: if is_loopback {
-            ARPHRD_LOOPBACK
-        } else {
-            ARPHRD_ETHER
-        },
-    }
-}
-
-fn route_entry(route: &RouteInfo) -> RouteEntry {
-    let destination = route.destination.address();
-    let is_loopback = match destination {
-        IpAddress::Ipv4(address) => address.is_loopback(),
-        IpAddress::Ipv6(address) => address.is_loopback(),
-    };
-    RouteEntry {
-        family: match destination {
-            IpAddress::Ipv4(_) => AF_INET as u8,
-            IpAddress::Ipv6(_) => AF_INET6 as u8,
-        },
-        dst_len: route.destination.prefix_len(),
-        table: RT_TABLE_MAIN,
-        scope: if is_loopback {
-            RT_SCOPE_HOST
-        } else if route.gateway.is_some() {
-            RT_SCOPE_UNIVERSE
-        } else {
-            RT_SCOPE_LINK
-        },
-        route_type: RTN_UNICAST,
-        oif: Some(route.interface_index),
-        dst: if route.destination.prefix_len() == 0 {
-            Vec::new()
-        } else {
-            ip_address_bytes(destination)
-        },
-        gateway: route.gateway.map(ip_address_bytes).unwrap_or_default(),
-    }
-}
-
-fn read_unaligned<T: Copy>(data: &[u8]) -> AxResult<T> {
-    if data.len() < size_of::<T>() {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(unsafe { core::ptr::read_unaligned(data.as_ptr().cast::<T>()) })
-}
-
-fn write_struct<T: Copy>(dst: &mut [u8], value: &T) {
-    let bytes =
-        unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
-    dst[..bytes.len()].copy_from_slice(bytes);
-}
-
-fn align4(value: usize) -> usize {
-    (value + 3) & !3
 }
 
 impl Pollable for NetlinkSocket {
@@ -5709,7 +3705,9 @@ mod tests {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
         let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
-        socket.bind(42, groups, NetlinkOptionAuthority::testing()).unwrap();
+        socket
+            .bind(42, groups, NetlinkOptionAuthority::testing())
+            .unwrap();
         socket
     }
 
@@ -5764,7 +3762,9 @@ mod tests {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
         let socket = NetlinkSocket::try_new(0, SOCK_RAW, net_ns).unwrap();
-        socket.bind(41, 7, NetlinkOptionAuthority::testing()).unwrap();
+        socket
+            .bind(41, 7, NetlinkOptionAuthority::testing())
+            .unwrap();
         let capability = mapped_capability();
 
         let mut length = 4;
@@ -5846,7 +3846,9 @@ mod tests {
         let namespace = NetworkNamespace::try_new_network_namespace(owner.clone()).unwrap();
         let other = NetworkNamespace::try_new_network_namespace(owner).unwrap();
         let socket = NetlinkSocket::try_new(0, SOCK_RAW, namespace.clone()).unwrap();
-        socket.bind(123, 0, NetlinkOptionAuthority::testing()).unwrap();
+        socket
+            .bind(123, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
         let actor = socket_owner_credential(&socket);
         let initial = namespace.stack().interfaces();
         assert_eq!(initial.len(), 1);
@@ -5983,8 +3985,12 @@ mod tests {
         let sender =
             NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
         let receiver = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
-        sender.bind(100, 0, NetlinkOptionAuthority::testing()).unwrap();
-        receiver.bind(101, 0, NetlinkOptionAuthority::testing()).unwrap();
+        sender
+            .bind(100, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
+        receiver
+            .bind(101, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
         let actor = socket_owner_credential(&sender);
         let payload = b"libudev\0ACTION=add\0DEVNAME=input/event0\0";
         let mut source = &payload[..];
@@ -6031,7 +4037,9 @@ mod tests {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
         let sender = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
-        sender.bind(100, 0, NetlinkOptionAuthority::testing()).unwrap();
+        sender
+            .bind(100, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
         let actor = socket_owner_credential(&sender);
         let mut source = &b"libudev\0ACTION=add\0"[..];
 
@@ -6060,8 +4068,12 @@ mod tests {
         let sender =
             NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
         let receiver = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
-        sender.bind(100, 0, NetlinkOptionAuthority::testing()).unwrap();
-        receiver.bind(101, 0, NetlinkOptionAuthority::testing()).unwrap();
+        sender
+            .bind(100, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
+        receiver
+            .bind(101, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
         let actor = socket_owner_credential(&sender);
         let mut source = &b""[..];
 
@@ -6096,7 +4108,9 @@ mod tests {
         let sender =
             NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
         let receiver = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
-        receiver.bind(101, 0, NetlinkOptionAuthority::testing()).unwrap();
+        receiver
+            .bind(101, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
         let root = Cred::try_root(owner.clone()).unwrap();
         let payload = b"libudev\0ACTION=add\0";
         let mut source = &payload[..];
@@ -6287,8 +4301,12 @@ mod tests {
             NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, first_ns.clone()).unwrap();
         let listener = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, first_ns).unwrap();
         let isolated = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, second_ns).unwrap();
-        listener.bind(101, 1, NetlinkOptionAuthority::testing()).unwrap();
-        isolated.bind(101, 1, NetlinkOptionAuthority::testing()).unwrap();
+        listener
+            .bind(101, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
+        isolated
+            .bind(101, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
         let actor = Cred::try_root(owner).unwrap();
         let payload = b"change@/devices/test0\0ACTION=change\0";
 
@@ -6361,7 +4379,9 @@ mod tests {
         let second =
             NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
 
-        first.bind(42, 1, NetlinkOptionAuthority::testing()).unwrap();
+        first
+            .bind(42, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
         assert_eq!(
             second.bind(42, 1, NetlinkOptionAuthority::testing()),
             Err(LinuxError::EADDRINUSE.into())
@@ -6371,12 +4391,16 @@ mod tests {
             Err(LinuxError::EINVAL.into())
         );
 
-        second.bind_auto(42, 1, NetlinkOptionAuthority::testing()).unwrap();
+        second
+            .bind_auto(42, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
         assert_ne!(second.state.lock().port_id, 42);
         drop(first);
 
         let replacement = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
-        replacement.bind(42, 1, NetlinkOptionAuthority::testing()).unwrap();
+        replacement
+            .bind(42, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
     }
 
     #[test]
@@ -6388,8 +4412,12 @@ mod tests {
         let first =
             NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, first_ns.clone()).unwrap();
         let second = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, second_ns).unwrap();
-        first.bind(42, 1, NetlinkOptionAuthority::testing()).unwrap();
-        second.bind(42, 1, NetlinkOptionAuthority::testing()).unwrap();
+        first
+            .bind(42, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
+        second
+            .bind(42, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
 
         emit_kobject_uevent(&first_ns, "change", "/devices/test0", "test", &[]).unwrap();
         let mut first_bytes = [0_u8; 128];
@@ -6426,8 +4454,12 @@ mod tests {
             NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, init_net_ns).unwrap();
         let other_listener =
             NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, other_net_ns).unwrap();
-        init_listener.bind(101, 1, NetlinkOptionAuthority::testing()).unwrap();
-        other_listener.bind(101, 1, NetlinkOptionAuthority::testing()).unwrap();
+        init_listener
+            .bind(101, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
+        other_listener
+            .bind(101, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
 
         assert!(
             emit_init_net_kobject_uevent("change", "/devices/test0", "test", &[])
@@ -6460,23 +4492,31 @@ mod tests {
         let uevent =
             NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
 
-        route.bind(77, 0, NetlinkOptionAuthority::testing()).unwrap();
+        route
+            .bind(77, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
         assert_eq!(
             route_collision.bind(77, 0, NetlinkOptionAuthority::testing()),
             Err(LinuxError::EADDRINUSE.into())
         );
         // The protocol is part of a netlink port identity.
-        uevent.bind(77, 1, NetlinkOptionAuthority::testing()).unwrap();
+        uevent
+            .bind(77, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
         assert_eq!(
             route.bind(78, 0, NetlinkOptionAuthority::testing()),
             Err(LinuxError::EINVAL.into())
         );
-        route_collision.bind_auto(77, 0, NetlinkOptionAuthority::testing()).unwrap();
+        route_collision
+            .bind_auto(77, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
         assert_ne!(route_collision.state.lock().port_id, 77);
 
         drop(route);
         let replacement = NetlinkSocket::try_new(NETLINK_ROUTE, SOCK_RAW, net_ns).unwrap();
-        replacement.bind(77, 0, NetlinkOptionAuthority::testing()).unwrap();
+        replacement
+            .bind(77, 0, NetlinkOptionAuthority::testing())
+            .unwrap();
     }
 
     #[test]
@@ -6547,41 +4587,58 @@ mod tests {
         let _context = crate::test_support::scheduler_test_context();
         let socket = NetlinkSocket::try_new(0, SOCK_DGRAM, route_socket().net_ns.clone()).unwrap();
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_TYPE as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_TYPE as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(SOCK_DGRAM as i32)
         );
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_DOMAIN as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_DOMAIN as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(AF_NETLINK as i32)
         );
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_PROTOCOL as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_PROTOCOL as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(NETLINK_ROUTE as i32)
         );
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_SNDBUF as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_SNDBUF as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(tk_linux_net::SYSCTL_WMEM_DEFAULT)
         );
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_RCVBUF as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_RCVBUF as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(tk_linux_net::SYSCTL_RMEM_DEFAULT)
         );
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(1)
         );
         // `case SO_SNDLOWAT: v.val = 1;` — hardcoded, never stored.
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_SNDLOWAT as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_SNDLOWAT as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(1)
         );
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_ACCEPTCONN as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_ACCEPTCONN as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(0)
         );
         // A read-only name with no setter is ENOPROTOOPT on the set path.
         assert_eq!(
-            socket.set_sol_socket_option(tk_linux_net::SO_TYPE as u32,
+            socket.set_sol_socket_option(
+                tk_linux_net::SO_TYPE as u32,
                 1,
                 NetlinkOptionAuthority::testing()
             ),
@@ -6606,7 +4663,9 @@ mod tests {
             .set_sol_socket_option(tk_linux_net::SO_REUSEADDR as u32, 1, authority)
             .unwrap();
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_REUSEADDR as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_REUSEADDR as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(1)
         );
         socket
@@ -6620,7 +4679,9 @@ mod tests {
             .set_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32, 7, authority)
             .unwrap();
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(7)
         );
         // `case SO_RCVLOWAT: sk->sk_rcvlowat = val ? : 1;`
@@ -6628,7 +4689,9 @@ mod tests {
             .set_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32, 0, authority)
             .unwrap();
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(1)
         );
         // The receive buffer decodes through Linux's shared arithmetic.
@@ -6636,31 +4699,40 @@ mod tests {
             .set_sol_socket_option(tk_linux_net::SO_RCVBUF as u32, 4096, authority)
             .unwrap();
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_RCVBUF as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_RCVBUF as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(tk_linux_net::decode_receive_buffer(4096))
         );
         // `SO_LINGER` stores the flag and seconds as one unit.
         socket.set_linger_option(1, 3);
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_LINGER as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_LINGER as u32)
+                .unwrap(),
             NetlinkOptionValue::Linger([1, 3])
         );
         // `if (!ling.l_onoff) sock_reset_flag(sk, SOCK_LINGER);` clears only
         // the flag, so the previous seconds survive.
         socket.set_linger_option(0, 9);
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_LINGER as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_LINGER as u32)
+                .unwrap(),
             NetlinkOptionValue::Linger([0, 3])
         );
         socket.set_linger_option(1, 0);
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_LINGER as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_LINGER as u32)
+                .unwrap(),
             NetlinkOptionValue::Linger([1, 0])
         );
         // SO_DEBUG needs initial-user-namespace CAP_NET_ADMIN and reports
         // EACCES, not EPERM, when it is missing.
         assert_eq!(
-            socket.set_sol_socket_option(tk_linux_net::SO_DEBUG as u32,
+            socket.set_sol_socket_option(
+                tk_linux_net::SO_DEBUG as u32,
                 1,
                 NetlinkOptionAuthority {
                     net_admin: true,
@@ -6671,7 +4743,8 @@ mod tests {
         );
         // SO_PRIORITY outside [0, 6] needs CAP_NET_RAW or CAP_NET_ADMIN.
         assert_eq!(
-            socket.set_sol_socket_option(tk_linux_net::SO_PRIORITY as u32,
+            socket.set_sol_socket_option(
+                tk_linux_net::SO_PRIORITY as u32,
                 7,
                 NetlinkOptionAuthority::default()
             ),
@@ -6685,7 +4758,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            socket.get_sol_socket_option(tk_linux_net::SO_PRIORITY as u32).unwrap(),
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_PRIORITY as u32)
+                .unwrap(),
             NetlinkOptionValue::Int(6)
         );
     }
@@ -6733,7 +4808,10 @@ mod tests {
             Err(AxError::InvalidInput)
         );
         assert_eq!(socket.set_option(1, 39, authority), Ok(()));
-        assert_eq!(socket.set_option(1, 0, authority), Err(AxError::InvalidInput));
+        assert_eq!(
+            socket.set_option(1, 0, authority),
+            Err(AxError::InvalidInput)
+        );
     }
 
     /// `netlink_bind` refuses a nonzero group mask without
@@ -6749,8 +4827,7 @@ mod tests {
         let unprivileged = NetlinkOptionAuthority::default();
         // nfnetlink_net_init registers no flags at all, so an unprivileged
         // group bind is EPERM even before the port ID is checked.
-        let netfilter =
-            NetlinkSocket::try_new(NETLINK_NETFILTER, SOCK_RAW, namespace()).unwrap();
+        let netfilter = NetlinkSocket::try_new(NETLINK_NETFILTER, SOCK_RAW, namespace()).unwrap();
         assert_eq!(
             netfilter.bind(5, 1, unprivileged),
             Err(LinuxError::EPERM.into())
@@ -6776,14 +4853,27 @@ mod tests {
         // neighbouring group stays open, and the same hook answers
         // NETLINK_ADD_MEMBERSHIP.
         let route = route_socket();
-        route.bind(7, 1 << (tk_linux_net::RTNLGRP_IPV4_MROUTE_R - 2), unprivileged)
+        route
+            .bind(
+                7,
+                1 << (tk_linux_net::RTNLGRP_IPV4_MROUTE_R - 2),
+                unprivileged,
+            )
             .unwrap();
         assert_eq!(
-            route.bind(7, 1 << (tk_linux_net::RTNLGRP_IPV4_MROUTE_R - 1), unprivileged),
+            route.bind(
+                7,
+                1 << (tk_linux_net::RTNLGRP_IPV4_MROUTE_R - 1),
+                unprivileged
+            ),
             Err(LinuxError::EPERM.into())
         );
         assert_eq!(
-            route.bind(7, 1 << (tk_linux_net::RTNLGRP_IPV6_MROUTE_R - 1), unprivileged),
+            route.bind(
+                7,
+                1 << (tk_linux_net::RTNLGRP_IPV6_MROUTE_R - 1),
+                unprivileged
+            ),
             Err(LinuxError::EPERM.into())
         );
         assert_eq!(
@@ -6904,10 +4994,7 @@ mod tests {
         // `sock_init_data_uid` seeds both timeouts with `MAX_SCHEDULE_TIMEOUT`
         // (`net/core/sock.c:3784-3785`), and `sock_get_timeout()` reports that
         // sentinel as `{0, 0}`: a fresh socket reports zero, not "infinite".
-        assert_eq!(
-            socket.receive_timeout(),
-            tk_linux_net::MAX_SCHEDULE_TIMEOUT
-        );
+        assert_eq!(socket.receive_timeout(), tk_linux_net::MAX_SCHEDULE_TIMEOUT);
         assert_eq!(socket.send_timeout(), tk_linux_net::MAX_SCHEDULE_TIMEOUT);
         assert_eq!(
             socket
@@ -6993,7 +5080,11 @@ mod tests {
         assert_eq!(socket.send_buffer_limit(), (SYSCTL_WMEM_MAX + 1) * 2);
         // The clamped spelling of the same request stops at the ceiling.
         socket
-            .set_sol_socket_option(tk_linux_net::SO_SNDBUF as u32, SYSCTL_WMEM_MAX + 1, authority)
+            .set_sol_socket_option(
+                tk_linux_net::SO_SNDBUF as u32,
+                SYSCTL_WMEM_MAX + 1,
+                authority,
+            )
             .unwrap();
         assert_eq!(socket.send_buffer_limit(), SYSCTL_WMEM_MAX * 2);
         // `__sock_set_rcvbuf(sk, max(val, 0))` floors a negative request at
@@ -7012,11 +5103,7 @@ mod tests {
         assert_eq!(
             LinuxError::from(
                 socket
-                    .set_sol_socket_option(
-                        tk_linux_net::SO_SNDBUFFORCE as u32,
-                        4096,
-                        unprivileged
-                    )
+                    .set_sol_socket_option(tk_linux_net::SO_SNDBUFFORCE as u32, 4096, unprivileged)
                     .unwrap_err()
             ),
             LinuxError::EPERM
