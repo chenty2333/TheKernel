@@ -52,6 +52,7 @@ CONTRACTS.update({
     "mseal": ("raw-differential", "pass", "VALIDATION_AND_MAPPING_SEAL DISCARD_RESPECTS_WRITE_PERMISSION"),
 })
 CONTRACTS.update({
+    "network_tcp_close": ("kernel-lifecycle", "pass", "TCP_LIFECYCLE_LO_IS_DOWN TCP_LIFECYCLE_LO_IS_UP LAST_FD_TIMER_RECLAIM ZERO_WINDOW_TIMEOUT_RECLAIM"),
     "network_bind": ("raw-differential", "pass", "IPV4_OVERLONG_EINVAL IPV4_STORAGE_BOUNDARY IPV6_OVERLONG_EINVAL"),
     "network_connect": ("raw-differential", "pass", "IPV6_OVERLONG_EINVAL IPV4_OVERLONG_EINVAL NETLINK_SOCKET NETLINK_KERNEL_CONNECT NETLINK_AUTOBIND NETLINK_DISCONNECT NETLINK_DISCONNECTED_PEER NETLINK_BAD_FAMILY TCP_CLOSE_QUEUED"),
     "network_getpeername": ("raw-differential", "pass", "NETLINK_UNCONNECTED_ZERO NETLINK_CONNECTED_ZERO NETLINK_PEER_POLICY NETLINK_PEER_STATE NETLINK_PEER_RESET NETLINK_TRUNCATED_LENGTH"),
@@ -112,8 +113,8 @@ CONTRACTS.update({
     "mlockall": ("raw-differential", "pass", "POPULATE_FAILURE_IGNORED"),
 })
 CONTRACTS.update({
-    "sched_getaffinity": ("raw-differential", "pass", "get-affinity get-unaligned-length get-low32-zero get-low32-length"),
-    "sched_setaffinity": ("raw-differential", "pass", "set-low32-length set-low32-zero set-short-mask"),
+    "sched_getaffinity": ("raw-differential", "pass", "get-affinity get-negative-pid get-unaligned-length get-low32-zero get-low32-length"),
+    "sched_setaffinity": ("raw-differential", "pass", "set-negative-pid set-low32-length set-low32-zero set-short-mask"),
     "getcpu": ("raw-differential", "pass", "getcpu-first-copy-fault getcpu-node-written-after-cpu-fault"),
     "sched_setparam": ("raw-differential", "pass", "setparam-negative-pid-before-copy setparam-null setparam-bad-pointer"),
     "sched_setscheduler": ("raw-differential", "pass", "setscheduler-negative-pid-before-copy setscheduler-negative-policy-before-copy setscheduler-positive-invalid-policy-after-copy setscheduler-null"),
@@ -148,11 +149,11 @@ CONTRACTS.update({
     "reboot": ("raw-differential", "pass", "MAGIC1_EINVAL MAGIC2_EINVAL RESTART2_NULL_EFAULT RESTART2_BAD_PTR_EFAULT UNKNOWN_CMD_EINVAL CAPABILITY_BEFORE_MAGIC_EPERM"),
     "ioctl": ("raw-differential", "pass", "FIGETBSZ_PSEUDO_EINVAL FIGETBSZ_FILESYSTEM_BLOCK_SIZE PSEUDO_UNSUPPORTED_REFUSALS FSUUID_AND_SYSSFSPATH_ENOTTY FREEZE_AND_THAW_EPERM_UNPRIVILEGED"),
     "mount": ("raw-differential", "pass", "MS_NOUSER_EINVAL SUPERBLOCK_FLAGS_ACCEPTED MAGIC_MASK_STRIPPED"),
-    "umount2": ("raw-differential", "pass", "FLAGS_BEFORE_PATH_EINVAL NOFOLLOW_IS_VALID EXPIRE_ROOT_EINVAL EXPIRE_COMBINATION_EINVAL DETACH_NAMESPACE_ROOT_SUCCEEDS VALID_FLAGS_PATH_VERDICT"),
+    "umount2": ("raw-differential", "pass", "FLAGS_BEFORE_PATH_EINVAL NOFOLLOW_IS_VALID EXPIRE_ROOT_EINVAL EXPIRE_COMBINATION_EINVAL DETACH_NAMESPACE_ROOT_SKIPPED DETACH_NAMESPACE_ROOT_SUCCEEDS VALID_FLAGS_PATH_VERDICT"),
     "pipe2": ("raw-differential", "pass", "UNKNOWN_FLAG_EINVAL NOTIFICATION_ENOPKG FLAG_SPLIT_AND_CLOEXEC PACKET_MODE_ON_WRITE_END_ONLY PACKET_ONE_PAGE_MAX PACKET_SLOT_ACCOUNTING PACKET_WRITE_BOUNDARY SHORT_READ_DISCARDS_PACKET"),
     "syncfs": ("raw-differential", "pass", "PSEUDO_NOOP BAD_FD_EBADF FILESYSTEM_SYNC"),
-    "preadv2": ("raw-differential", "pass", "UNKNOWN_FLAG_EOPNOTSUPP APPEND_NOAPPEND_EINVAL HIPRI_ACCEPTED DSYNC_ACCEPTED IOVEC_COPY_BEFORE_FLAGS"),
-    "pwritev2": ("raw-differential", "pass", "UNKNOWN_FLAG_EOPNOTSUPP APPEND_NOAPPEND_EINVAL HIPRI_ACCEPTED DSYNC_ACCEPTED IOVEC_COPY_BEFORE_FLAGS"),
+    "preadv2": ("raw-differential", "pass", "UNKNOWN_FLAG_EOPNOTSUPP APPEND_NOAPPEND_EINVAL HIPRI_ACCEPTED DSYNC_ACCEPTED IOVEC_COPY_BEFORE_FLAGS POS_H_IS_IGNORED POSITION_TRAVELS_IN_POS_L CURRENT_POSITION_FROM_MINUS_ONE"),
+    "pwritev2": ("raw-differential", "pass", "UNKNOWN_FLAG_EOPNOTSUPP APPEND_NOAPPEND_EINVAL HIPRI_ACCEPTED DSYNC_ACCEPTED IOVEC_COPY_BEFORE_FLAGS POS_H_IS_IGNORED POSITION_TRAVELS_IN_POS_L CURRENT_POSITION_FROM_MINUS_ONE"),
     "fallocate-mode": ("raw-differential", "pass", "GEOMETRY_BEFORE_MODE_EINVAL UNKNOWN_MODE_EOPNOTSUPP MODE_BEFORE_ACCESS_EOPNOTSUPP PUNCH_REQUIRES_KEEP_SIZE COLLAPSE_REJECTS_KEEP_SIZE UNSHARE_RANGE_EOPNOTSUPP ZERO_RANGE_ACCEPTED"),
     "splice": ("raw-differential", "pass", "FILE_SOURCE_NOT_PACKETIZED PACKET_FLAGS_PRESERVED"),
 
@@ -222,9 +223,9 @@ CONTRACTS.update({
     "futex-abi-opcode": ("portable-differential", "pass", "WAKE_REALTIME LOCK_PI_REALTIME WAIT_BITSET_REALTIME LOCK_PI2_REALTIME WAKE_HIGH_BIT WAKE_BIT11 WAIT_ROBUST_UNLOCK LOCK_PI_ROBUST_UNLOCK FD MISALIGNED WAKE_BITSET_ZERO WAKE_ZERO_NO_WAITERS"),
     "futex-abi-wake-zero": ("portable-differential", "pass", "WAKE_ZERO_LIMIT"),
     "futex-abi-requeue": ("portable-differential", "pass", "WOKEN REQUEUED DRAINED EAGAIN"),
-    "futex-abi-pi-word": ("portable-differential", "pass", "LOCKED UNLOCK_RC_ZERO UNLOCK_WORD_ZERO EPERM TRYLOCK"),
+    "futex-abi-pi-word": ("portable-differential", "pass", "LOCKED UNLOCK_RC_ZERO UNLOCK_WORD_ZERO EPERM TRYLOCK ESRCH_BAD_OWNER WAITERS_BAD_OWNER"),
     "futex-abi-pi-timeout": ("portable-differential", "pass", "ETIMEDOUT LOCKPI2 NEGATIVE_TS_EINVAL"),
-    "futex-abi-requeue-pi": ("portable-differential", "pass", "REQUEUED WAITER_RC TARGET_WORD UNLOCKED EINVAL_SELF EINVAL_WAKE2"),
+    "futex-abi-requeue-pi": ("portable-differential", "pass", "REQUEUED WAITER_RC TARGET_WORD UNLOCKED EINVAL_SELF EINVAL_WAKE2 VAL3_ZERO_EAGAIN EINVAL_ALIAS EAGAIN_ALIAS EINVAL_CMP_ALIAS"),
     "futex-abi-futex2-flags": ("portable-differential", "pass", "NUMA_OK NUMA_EINVAL MPOL_OK RESERVED_EINVAL SIZE_EINVAL ALIGN_EINVAL MASK0_EINVAL"),
 })
 CONTRACTS.update({
@@ -286,10 +287,10 @@ CONTRACTS.update({
     "uname": ("raw-differential", "pass", "PERSONALITY_ACCEPTS_ANY_PATTERN NATIVE_RESULT PER_LINUX32_MACHINE_OVERRIDE UNAME26_RELEASE_OVERRIDE ADDR_NO_RANDOMIZE_LEAVES_UNAME UNAME_NULL_BUF_EFAULT"),
     "clock-abi": ("portable-differential", "pass", "MONOTONIC_EPOCH TIMESPEC_NORMALIZED BOOTTIME_NOT_BELOW_MONOTONIC REALTIME_WALL_CLOCK UPTIME_IS_BOOTTIME MONOTONIC_ADVANCES RAW_TRACKS_MONOTONIC SLEEP_ADVANCES_MONOTONIC"),
     "brk": ("raw-differential", "pass", "BREAK_ALIGNMENT SHRINK_KEEPS_BREAK GROW_INTO_HOLE GUARD_GAP_BOUNDARY"),
-    "mmap": ("raw-differential", "pass", "ANON_OFFSET_IGNORED PROT_GROWSDOWN_UP DROPPABLE_MATRIX LOCKED_LIMIT_ERRNOS SHARED_VALIDATE_FLAG_MASK RLIMIT_DATA_GROWTH"),
+    "mmap": ("raw-differential", "pass", "ANON_OFFSET_IGNORED PROT_GROWSDOWN_UP DROPPABLE_MATRIX LOCKED_LIMIT_ERRNOS MLOCK_RLIMIT_ENOMEM SHARED_VALIDATE_FLAG_MASK RLIMIT_DATA_GROWTH"),
     "madvise": ("raw-differential", "pass", "DONTNEED_LOCKED REMOVE_BY_MAPPING_TYPE FREE_LOCKED_EINVAL UNAVAILABLE_ADVICES GUARD_AND_DONTDUMP WIPEONFORK_HOLE DROPPABLE_KEEPONFORK_EINVAL DROPPABLE_DODUMP_EINVAL DROPPABLE_PAGEOUT_DROPS PLAIN_PAGEOUT_KEEPS DROPPABLE_UFFDIO_REGISTER_REFUSED"),
     "msync": ("raw-differential", "pass", "PARTIAL_LOCK_EBUSY PREFIX_FLUSHED_BEFORE_EBUSY"),
-    "process-mrelease": ("raw-differential", "pass", "SELF_IDENTIFIERS_EINVAL NON_PIDFD_EBADF"),
+    "process-mrelease": ("raw-differential", "pass", "SELF_IDENTIFIERS_EINVAL NON_PIDFD_EBADF PARTIAL_THREAD_EXIT_EINVAL"),
 })
 CONTRACTS.update({
     "rt_sigprocmask": ("raw-differential", "pass", "SIZE_BEFORE_POINTER COPY_BEFORE_HOW QUERY_IGNORES_HOW KILL_STOP_DROPPED_AND_COMPOSED ALIASING_ENTRY_SNAPSHOT OLD_FAULT_AFTER_COMMIT"),
@@ -343,7 +344,7 @@ PROGRAM_CASES = {
     "umask": ("umask",), "native-ni": ("native-ni",),
     "fsattrs": ("setxattrat", "getxattrat", "listxattrat", "removexattrat", "file-getattr", "file-setattr", "open-tree-attr", "xattr-classic"),
     "mm-contracts": ("mprotect", "munmap", "mincore", "process-vm-readv", "process-vm-writev", "mseal", "mlock", "mlock2", "munlock", "process-madvise", "mlockall", "brk", "mmap", "madvise", "msync", "process-mrelease", "migrate-pages", "set-mempolicy-home-node"),
-    "network-basic": ("network_bind", "network_connect", "network_getpeername", "network_sendto"),
+    "network-basic": ("network_tcp_close", "network_bind", "network_connect", "network_getpeername", "network_sendto"),
     "signal-boundary": ("rt_sigaction", "sigaltstack", "rt_tgsigqueueinfo", "restart_syscall", "rt_sigprocmask", "rt_sigreturn", "pause", "kill", "rt_sigpending", "rt_sigtimedwait", "rt_sigqueueinfo", "rt_sigsuspend", "tkill", "tgkill"),
     "stat-access": ("access", "faccessat", "faccessat2", "newfstatat", "statx"),
     "socket-msg": ("socket_msg.send_flags", "socket_msg.sendmmsg_flags", "socket_msg.peek_waitall_tcp", "socket_msg.tcp_more", "socket_msg.compat_flag", "socket_msg.waitall_stream", "socket_msg.waitall_tcp", "socket_msg.waitall_datagram", "socket_msg.recvmmsg_deadline", "socket_msg.recvmmsg_waitforone"),

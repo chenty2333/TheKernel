@@ -536,12 +536,137 @@ class GateTests(unittest.TestCase):
             self.assertTrue(all(cell["handler"].endswith(":sys_ni_syscall") for cell in cells.values() if cell["status"] == "explicit-enosys"))
             self.assertEqual(cells[321]["conditional"], "bpf")
 
-    def test_final_acceptance_rejects_unknown_and_unvalidated_cells(self) -> None:
+    def test_final_acceptance_uses_the_committed_shrink_only_allowlist(self) -> None:
         with test_tmpdir() as temporary:
             root = Path(temporary); source, entries = self.source(root / "linux")
             dispatch = root / "dispatch.rs"; self.contract_dispatch(dispatch, entries)
-            with self.assertRaisesRegex(gate.GateError, "final ABI static prerequisites incomplete"):
-                gate.schema(self.manifest(), self.contracts(root), source, dispatch, final=True)
+            # The committed ledger satisfies final strength within its own
+            # allowlist: the ratchet is what keeps CI green, not a lax rule.
+            gate.schema(self.manifest(), self.contracts(root), source, dispatch, final=True)
+            # Trimming the allowlist must fail rather than silently un-claim a
+            # cell whose gap is still declared.
+            committed = self.contracts(root).read_text(encoding="utf-8")
+            trimmed = committed.replace('    "444:landlock_create_ruleset",\n', "", 1)
+            self.assertEqual(len(trimmed) + len('    "444:landlock_create_ruleset",\n'), len(committed))
+            path = root / "pruned.toml"; path.write_text(trimmed, encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "outside the final allowlist"):
+                gate.schema(self.manifest(), path, source, dispatch, final=True)
+
+    def test_final_acceptance_rejects_unreviewed_syscalls(self) -> None:
+        with test_tmpdir() as temporary:
+            root = Path(temporary); _, entries = self.source(root / "linux")
+            with self.assertRaisesRegex(gate.GateError, "unknown=385"):
+                gate.final_static(self.contracts(root), {}, entries)
+
+    def probe_contract(self, identifier: str, citation: str, ordering: str) -> str:
+        return (
+            "\n[[contract]]\n"
+            f'id = "{identifier}"\n'
+            f'flags = ["flag:LANDLOCK_CREATE_RULESET_VERSION bit0 {citation}"]\n'
+            'structs = ["explicit-none"]\n'
+            'multiplexer_commands = ["explicit-none"]\n'
+            'provider_ioctls = ["explicit-none"]\n'
+            f'errno_order = ["{ordering}"]\n'
+            'usercopy = ["explicit-none"]\n'
+            'state = ["explicit-none"]\n'
+            'concurrency = ["explicit-none"]\n'
+            'teardown = ["explicit-none"]\n'
+        )
+
+    def test_a_new_contract_must_cite_the_pinned_linux_release(self) -> None:
+        with test_tmpdir() as temporary:
+            root = Path(temporary); _, entries = self.source(root / "linux")
+            probe = self.probe_contract("linux-probe-cited", "(Linux security/landlock/syscalls.c:172)",
+                                        "errno:VERSION reports landlock_abi_version before any copy")
+            path = root / "probe.toml"
+            path.write_text(self.contracts(root).read_text(encoding="utf-8") + probe, encoding="utf-8")
+            gate.contract_cells(path, entries)
+            path.write_text(path.read_text(encoding="utf-8").replace("Linux security/landlock/syscalls.c:172", "the pinned release"), encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "citation and are not baselined"):
+                gate.contract_cells(path, entries)
+
+    def test_a_cited_contract_may_not_keep_the_unreviewed_errno_order(self) -> None:
+        with test_tmpdir() as temporary:
+            root = Path(temporary); _, entries = self.source(root / "linux")
+            path = root / "unreviewed.toml"
+            # Cited, so it leaves the citation backlog - and therefore may not
+            # keep the sentence that says nobody compared the ordering.
+            path.write_text(self.contracts(root).read_text(encoding="utf-8") + self.probe_contract(
+                "linux-probe-cited-placeholder",
+                "(Linux security/landlock/syscalls.c:172)",
+                gate.UNREVIEWED_ERRNO_ORDER), encoding="utf-8")
+            with self.assertRaisesRegex(gate.GateError, "unreviewed errno_order"):
+                gate.contract_cells(path, entries)
+            # The same placeholder is tolerated while its contract is still
+            # baselined, which is why the committed ledger passes.
+            self.assertIn("linux-open", gate.load_ratchet(
+                gate.load_toml(self.contracts(root), "contracts"))["unreviewed_errno_order"])
+
+    def test_the_unreviewed_placeholder_may_not_enter_the_ledger(self) -> None:
+        placeholder = gate.UNREVIEWED_ERRNO_ORDER
+        cited = {"id": "linux-probe", "errno_order": [placeholder],
+                 "flags": ["flag:x (Linux ipc/mqueue.c:1625)"]}
+        uncited = {"id": "linux-probe", "errno_order": [placeholder], "flags": ["flag:x"]}
+        empty = {name: set() for name in gate.RATCHET_FIELDS}
+        # A newcomer that already cites Linux is rejected on the placeholder
+        # rule; one that cites nothing is rejected on the citation rule first.
+        with self.assertRaisesRegex(gate.GateError, "placeholder and are not baselined"):
+            gate.record_ratchet({"linux-probe": cited}, empty)
+        with self.assertRaisesRegex(gate.GateError, "citation and are not baselined"):
+            gate.record_ratchet({"linux-probe": uncited}, empty)
+        # Baselined as both, the same record is tolerated: that is the backlog.
+        gate.record_ratchet({"linux-probe": uncited}, {
+            **empty, "uncited_contracts": {"linux-probe"}, "unreviewed_errno_order": {"linux-probe"}})
+        # Dropping a record from a list it still needs fails, so a list can only
+        # shrink by the record actually being cleaned up.
+        with self.assertRaisesRegex(gate.GateError, "citation and are not baselined"):
+            gate.record_ratchet({"linux-probe": uncited}, {
+                **empty, "unreviewed_errno_order": {"linux-probe"}})
+
+    def test_an_implemented_cell_on_an_unreviewed_record_is_not_final(self) -> None:
+        with test_tmpdir() as temporary:
+            root = Path(temporary); source, entries = self.source(root / "linux")
+            dispatch = root / "dispatch.rs"; self.contract_dispatch(dispatch, entries)
+            gate.schema(self.manifest(), self.contracts(root), source, dispatch, final=True)
+            # `2:open` is `implemented`, binds its differential case and
+            # declares no validation gap.  Only the placeholder ordering of its
+            # contract record keeps it out of final strength, so dropping that
+            # one allowlist entry must fail the check.
+            path = self.contracts(root, ('    "2:open",\n', ""))
+            with self.assertRaisesRegex(gate.GateError, "outside the final allowlist"):
+                gate.schema(self.manifest(), path, source, dispatch, final=True)
+
+    def test_the_landlock_records_cite_the_abi10_uapi(self) -> None:
+        text = (ROOT / "config/linux-contracts.toml").read_text(encoding="utf-8")
+        self.assertNotIn("flag:ABI7 FS mask0xffff", text)
+        self.assertIn("filesystem 0x1ffff", text)
+        for identifier in ("linux-landlock_create_ruleset", "linux-landlock_add_rule", "linux-landlock_restrict_self"):
+            block = text.split(f'id = "{identifier}"', 1)[1].split("[[", 1)[0]
+            self.assertIn("ABI10", block, identifier)
+            self.assertIn("Linux include/uapi/linux/landlock.h:", block, identifier)
+        self.assertIn("Linux security/landlock/syscalls.c:172", text)
+        self.assertIn("Linux include/uapi/linux/landlock.h:418", text)
+
+    def test_validate_citations_rejects_nonexistent_file_or_out_of_bounds_line(self) -> None:
+        with test_tmpdir() as temporary:
+            root = Path(temporary)
+            linux_tree = root / "linux_mock"
+            uapi = linux_tree / "include/uapi"
+            uapi.mkdir(parents=True)
+            test_file = linux_tree / "fs/test.c"
+            test_file.parent.mkdir(parents=True)
+            test_file.write_text("line 1\nline 2\nline 3\n", encoding="utf-8")
+
+            bad_file = {"id": "linux-probe", "flags": ["Linux nonexistent/file.c:1"]}
+            with self.assertRaisesRegex(gate.GateError, "cites nonexistent Linux file"):
+                gate.validate_citations({"linux-probe": bad_file}, linux_tree)
+
+            bad_line = {"id": "linux-probe", "flags": ["Linux fs/test.c:10-20"]}
+            with self.assertRaisesRegex(gate.GateError, "cites invalid line range"):
+                gate.validate_citations({"linux-probe": bad_line}, linux_tree)
+
+            good = {"id": "linux-probe", "flags": ["Linux fs/test.c:1-2"]}
+            self.assertEqual(gate.validate_citations({"linux-probe": good}, linux_tree), 1)
 
     def test_missing_test_symbol_and_hidden_validation_gap_are_rejected(self) -> None:
         with test_tmpdir() as temporary:

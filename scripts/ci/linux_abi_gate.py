@@ -8,6 +8,7 @@ handler ENOSYS behavior belongs to contract and differential gates.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -273,398 +274,38 @@ CONTRACT_FIELDS = {
     "errno_order", "usercopy", "state", "concurrency", "teardown",
 }
 CELL_FIELDS = {"number", "name", "status", "contract", "handler", "conditional", "tests", "validation_gaps", "limitations"}
-DISPATCH_CALLS = {
-    "kernel/src/syscall/task/wait.rs:sys_waitpid": "sys_waitpid",
-    "kernel/src/syscall/task/wait.rs:sys_waitid": "sys_waitid",
-    "kernel/src/syscall/task/thread.rs:sys_modify_ldt": "sys_modify_ldt",
-    "kernel/src/syscall/task/ctl.rs:sys_prctl": "sys_prctl",
-    "kernel/src/syscall/task/thread.rs:sys_arch_prctl": "sys_arch_prctl",
-    "kernel/src/syscall/sync/rseq.rs:sys_rseq": "sys_rseq",
-    "kernel/src/syscall/task/clone3.rs:sys_clone3": "sys_clone3",
-    "kernel/src/syscall/mm/process_vm.rs:sys_process_mrelease": "sys_process_mrelease",
+# Citation convention (docs/design/abi-contract-system.md): a contract record
+# cites the pinned Linux release as `Linux <path>:<line>`, with the path
+# relative to the release root and an optional `-<line>` end.  A record that
+# does not carry one is not unverifiable: it is listed in
+# `ratchet.uncited_contracts`, which may only shrink.
+LINUX_CITATION = re.compile(r"Linux [A-Za-z0-9_./*-]+:[0-9]+(?:-[0-9]+)?")
+# The ordering sentence a record carries until somebody compares that syscall's
+# real errno order against the pinned release and writes down what they found.
+# It used to be the same boilerplate as every other record's, which let 177 of
+# 368 contracts read like reviewed ordering claims; now it names itself, so the
+# ledger says out loud which half of it is still a template.  Records carrying
+# it are listed in `ratchet.unreviewed_errno_order`, which may only shrink.
+UNREVIEWED_ERRNO_ORDER = "errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"
+# `unbound_programs` is validated for shape here because the ledger's [ratchet]
+# table must stay closed against silently dropping a baseline, but its content is
+# enforced by scripts/ci/check_abi_contracts.py, which owns the runner registry.
+RATCHET_FIELDS = {"uncited_contracts", "unreviewed_errno_order", "final_static_allowlist", "unbound_programs"}
+def expected_dispatch_call(handler: str) -> str:
+    """Derive the expected dispatch call pattern for a handler.
 
-    "kernel/src/syscall/fs/mount.rs:sys_umount2": "sys_umount2",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_flock": "sys_flock",
-    "kernel/src/syscall/fs/ctl.rs:sys_utimensat": "sys_utimensat",
-    "kernel/src/syscall/fs/io.rs:sys_fallocate": "sys_fallocate",
-    "kernel/src/syscall/fs/io.rs:sys_readahead": "sys_readahead",
+    Handlers in submodules (e.g. kernel/src/syscall/fs/...) may be called directly
+    or through their submodule path (super::fs::...) in dispatch.rs.
+    """
+    path_str, _, symbol = handler.rpartition(":")
+    parts = Path(path_str).parts
+    if "syscall" in parts:
+        idx = parts.index("syscall")
+        if len(parts) > idx + 2:
+            submod = parts[idx + 1]
+            return f"(?:super::{submod}::|(?<![A-Za-z0-9_:])){re.escape(symbol)}"
+    return rf"(?<![A-Za-z0-9_:]){re.escape(symbol)}"
 
-    "kernel/src/syscall/task/acct.rs:sys_acct": "sys_acct",
-    "kernel/src/syscall/mm/swap.rs:sys_swapon": "sys_swapon",
-    "kernel/src/syscall/mm/swap.rs:sys_swapoff": "sys_swapoff",
-    "kernel/src/syscall/task/module.rs:sys_init_module": "sys_init_module",
-    "kernel/src/syscall/task/module.rs:sys_finit_module": "sys_finit_module",
-    "kernel/src/syscall/task/module.rs:sys_delete_module": "sys_delete_module",
-    "kernel/src/syscall/task/kexec.rs:sys_kexec_load": "sys_kexec_load",
-    "kernel/src/syscall/task/kexec.rs:sys_kexec_file_load": "sys_kexec_file_load",
-    "kernel/src/syscall/task/keys.rs:sys_add_key": "sys_add_key",
-    "kernel/src/syscall/task/keys.rs:sys_request_key": "sys_request_key",
-    "kernel/src/syscall/task/keys.rs:sys_keyctl": "sys_keyctl",
-    "kernel/src/syscall/task/perf.rs:sys_perf_event_open": "sys_perf_event_open",
-
-    "kernel/src/syscall/task/ptrace.rs:sys_ptrace": "sys_ptrace",
-
-    "kernel/src/syscall/task/job.rs:sys_setpgid": "sys_setpgid",
-    "kernel/src/syscall/dispatch.rs:compat_getpgrp": "compat_getpgrp",
-    "kernel/src/syscall/task/job.rs:sys_setsid": "sys_setsid",
-    "kernel/src/syscall/task/job.rs:sys_getpgid": "sys_getpgid",
-    "kernel/src/syscall/task/job.rs:sys_getsid": "sys_getsid",
-    "kernel/src/syscall/task/ctl.rs:sys_setreuid": "sys_setreuid",
-    "kernel/src/syscall/task/ctl.rs:sys_setregid": "sys_setregid",
-    "kernel/src/syscall/task/ctl.rs:sys_setresuid": "sys_setresuid",
-    "kernel/src/syscall/task/ctl.rs:sys_setresgid": "sys_setresgid",
-    "kernel/src/syscall/task/ctl.rs:sys_capget": "sys_capget",
-    "kernel/src/syscall/task/ctl.rs:sys_capset": "sys_capset",
-    "kernel/src/syscall/task/ctl.rs:sys_mbind": "sys_mbind",
-    "kernel/src/syscall/task/ctl.rs:sys_set_mempolicy": "sys_set_mempolicy",
-    "kernel/src/syscall/task/ctl.rs:sys_get_mempolicy": "sys_get_mempolicy",
-    "kernel/src/syscall/task/ctl.rs:sys_migrate_pages": "sys_migrate_pages",
-    "kernel/src/syscall/task/ctl.rs:sys_move_pages": "sys_move_pages",
-    "kernel/src/syscall/task/ctl.rs:sys_set_mempolicy_home_node": "sys_set_mempolicy_home_node",
-    "kernel/src/syscall/task/ctl.rs:sys_unshare": "sys_unshare",
-    "kernel/src/syscall/task/ctl.rs:sys_setns": "sys_setns",
-    "kernel/src/syscall/task/ctl.rs:sys_kcmp": "sys_kcmp",
-    "kernel/src/syscall/landlock.rs:sys_lsm_get_self_attr": "sys_lsm_get_self_attr",
-    "kernel/src/syscall/landlock.rs:sys_lsm_set_self_attr": "sys_lsm_set_self_attr",
-    "kernel/src/syscall/landlock.rs:sys_lsm_list_modules": "sys_lsm_list_modules",
-
-    "kernel/src/syscall/task/schedule.rs:sys_sched_yield": "sys_sched_yield",
-    "kernel/src/syscall/task/schedule.rs:sys_nanosleep": "sys_nanosleep",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_setaffinity": "sys_sched_setaffinity",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_getaffinity": "sys_sched_getaffinity",
-    "kernel/src/syscall/task/schedule.rs:sys_getcpu": "sys_getcpu",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_setparam": "sys_sched_setparam",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_setscheduler": "sys_sched_setscheduler",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_getparam": "sys_sched_getparam",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_getscheduler": "sys_sched_getscheduler",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_rr_get_interval": "sys_sched_rr_get_interval",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_get_priority_max": "sys_sched_get_priority_max",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_get_priority_min": "sys_sched_get_priority_min",
-    "kernel/src/syscall/task/schedule.rs:sys_getpriority": "sys_getpriority",
-    "kernel/src/syscall/task/schedule.rs:sys_setpriority": "sys_setpriority",
-    "kernel/src/syscall/task/schedule.rs:sys_clock_nanosleep": "sys_clock_nanosleep",
-    "kernel/src/syscall/task/schedule.rs:sys_ioprio_set": "sys_ioprio_set",
-    "kernel/src/syscall/task/schedule.rs:sys_ioprio_get": "sys_ioprio_get",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_setattr": "sys_sched_setattr",
-    "kernel/src/syscall/task/schedule.rs:sys_sched_getattr": "sys_sched_getattr",
-    "kernel/src/syscall/task/ioport.rs:sys_ioperm": "sys_ioperm",
-    "kernel/src/syscall/task/ioport.rs:sys_iopl": "sys_iopl",
-
-    "kernel/src/syscall/dispatch.rs:compat_mknod": "compat_mknod",
-    "kernel/src/syscall/dispatch.rs:compat_inotify_init": "compat_inotify_init",
-    "kernel/src/syscall/fs/inotify.rs:sys_inotify_add_watch": "sys_inotify_add_watch",
-    "kernel/src/syscall/fs/inotify.rs:sys_inotify_rm_watch": "sys_inotify_rm_watch",
-    "kernel/src/syscall/fs/inotify.rs:sys_inotify_init1": "sys_inotify_init1",
-    "kernel/src/syscall/dispatch.rs:compat_signalfd": "compat_signalfd",
-    "kernel/src/syscall/fs/signalfd.rs:sys_signalfd4": "sys_signalfd4",
-    "kernel/src/syscall/fs/timerfd.rs:sys_timerfd_create": "sys_timerfd_create",
-    "kernel/src/syscall/fs/timerfd.rs:sys_timerfd_settime": "sys_timerfd_settime",
-    "kernel/src/syscall/fs/timerfd.rs:sys_timerfd_gettime": "sys_timerfd_gettime",
-    "kernel/src/syscall/fs/fanotify.rs:sys_fanotify_init": "sys_fanotify_init",
-    "kernel/src/syscall/fs/fanotify.rs:sys_fanotify_mark": "sys_fanotify_mark",
-    "kernel/src/syscall/fs/quota.rs:sys_quotactl": "sys_quotactl",
-    "kernel/src/syscall/fs/quota.rs:sys_quotactl_fd": "sys_quotactl_fd",
-    "kernel/src/syscall/fs/mount.rs:sys_mount": "sys_mount",
-    "kernel/src/syscall/fs/mount.rs:sys_pivot_root": "sys_pivot_root",
-    "kernel/src/syscall/fs/mount.rs:sys_open_tree": "sys_open_tree",
-    "kernel/src/syscall/fs/mount.rs:sys_move_mount": "sys_move_mount",
-    "kernel/src/syscall/fs/mount.rs:sys_fsopen": "sys_fsopen",
-    "kernel/src/syscall/fs/mount.rs:sys_fsconfig": "sys_fsconfig",
-    "kernel/src/syscall/fs/mount.rs:sys_fsmount": "sys_fsmount",
-    "kernel/src/syscall/fs/mount.rs:sys_fspick": "sys_fspick",
-    "kernel/src/syscall/fs/mount.rs:sys_statmount": "sys_statmount",
-    "kernel/src/syscall/fs/mount.rs:sys_listmount": "sys_listmount",
-    "kernel/src/syscall/fs/mount.rs:sys_mount_setattr": "sys_mount_setattr",
-
-    "kernel/src/syscall/fs/fd_ops.rs:sys_open": "sys_open",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_openat": "sys_openat",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_openat2": "sys_openat2",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_name_to_handle_at": "sys_name_to_handle_at",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_open_by_handle_at": "sys_open_by_handle_at",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_close": "sys_close",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_close_range": "sys_close_range",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_dup": "sys_dup",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_dup2": "sys_dup2",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_dup3": "sys_dup3",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_fcntl": "sys_fcntl",
-    "kernel/src/syscall/fs/ctl.rs:sys_sysfs": "sys_sysfs",
-    "kernel/src/syscall/fs/ctl.rs:sys_chdir": "sys_chdir",
-    "kernel/src/syscall/fs/ctl.rs:sys_fchdir": "sys_fchdir",
-    "kernel/src/syscall/fs/ctl.rs:sys_chroot": "sys_chroot",
-    "kernel/src/syscall/fs/ctl.rs:sys_mkdir": "sys_mkdir",
-    "kernel/src/syscall/fs/ctl.rs:sys_mkdirat": "sys_mkdirat",
-    "kernel/src/syscall/fs/ctl.rs:sys_mknodat": "sys_mknodat",
-    "kernel/src/syscall/fs/ctl.rs:sys_getdents": "sys_getdents",
-    "kernel/src/syscall/fs/ctl.rs:sys_getdents64": "sys_getdents64",
-    "kernel/src/syscall/fs/ctl.rs:sys_link": "sys_link",
-    "kernel/src/syscall/fs/ctl.rs:sys_linkat": "sys_linkat",
-    "kernel/src/syscall/fs/ctl.rs:sys_unlink": "sys_unlink",
-    "kernel/src/syscall/fs/ctl.rs:sys_unlinkat": "sys_unlinkat",
-    "kernel/src/syscall/fs/ctl.rs:sys_rmdir": "sys_rmdir",
-    "kernel/src/syscall/fs/ctl.rs:sys_symlink": "sys_symlink",
-    "kernel/src/syscall/fs/ctl.rs:sys_symlinkat": "sys_symlinkat",
-    "kernel/src/syscall/fs/ctl.rs:sys_readlink": "sys_readlink",
-    "kernel/src/syscall/fs/ctl.rs:sys_readlinkat": "sys_readlinkat",
-    "kernel/src/syscall/fs/ctl.rs:sys_chown": "sys_chown",
-    "kernel/src/syscall/fs/ctl.rs:sys_lchown": "sys_lchown",
-    "kernel/src/syscall/fs/ctl.rs:sys_fchown": "sys_fchown",
-    "kernel/src/syscall/fs/ctl.rs:sys_fchownat": "sys_fchownat",
-    "kernel/src/syscall/fs/ctl.rs:sys_chmod": "sys_chmod",
-    "kernel/src/syscall/fs/ctl.rs:sys_fchmod": "sys_fchmod",
-    "kernel/src/syscall/fs/ctl.rs:sys_fchmodat": "sys_fchmodat",
-    "kernel/src/syscall/fs/ctl.rs:sys_utime": "sys_utime",
-    "kernel/src/syscall/fs/ctl.rs:sys_utimes": "sys_utimes",
-    "kernel/src/syscall/fs/ctl.rs:sys_futimesat": "sys_futimesat",
-    "kernel/src/syscall/fs/ctl.rs:sys_rename": "sys_rename",
-    "kernel/src/syscall/fs/ctl.rs:sys_renameat": "sys_renameat",
-    "kernel/src/syscall/fs/ctl.rs:sys_renameat2": "sys_renameat2",
-    "kernel/src/syscall/fs/ctl.rs:sys_sync": "sys_sync",
-    "kernel/src/syscall/fs/ctl.rs:sys_vhangup": "sys_vhangup",
-    "kernel/src/syscall/fs/ctl.rs:sys_syncfs": "sys_syncfs",
-    "kernel/src/syscall/fs/ctl.rs:sys_getcwd": "sys_getcwd",
-    "kernel/src/syscall/fs/ctl.rs:sys_reboot": "sys_reboot",
-    "kernel/src/syscall/fs/io.rs:sys_read": "sys_read",
-    "kernel/src/syscall/fs/io.rs:sys_write": "sys_write",
-    "kernel/src/syscall/fs/io.rs:sys_readv": "sys_readv",
-    "kernel/src/syscall/fs/io.rs:sys_writev": "sys_writev",
-    "kernel/src/syscall/fs/io.rs:sys_lseek": "sys_lseek",
-    "kernel/src/syscall/fs/io.rs:sys_pread64": "sys_pread64",
-    "kernel/src/syscall/fs/io.rs:sys_pwrite64": "sys_pwrite64",
-    "kernel/src/syscall/fs/io.rs:sys_preadv": "sys_preadv",
-    "kernel/src/syscall/fs/io.rs:sys_pwritev": "sys_pwritev",
-    "kernel/src/syscall/fs/io.rs:sys_sendfile": "sys_sendfile",
-    "kernel/src/syscall/fs/io.rs:sys_splice": "sys_splice",
-    "kernel/src/syscall/fs/io.rs:sys_copy_file_range": "sys_copy_file_range",
-    "kernel/src/syscall/fs/io.rs:sys_fsync": "sys_fsync",
-    "kernel/src/syscall/fs/io.rs:sys_fdatasync": "sys_fdatasync",
-    "kernel/src/syscall/fs/io.rs:sys_truncate": "sys_truncate",
-    "kernel/src/syscall/fs/io.rs:sys_ftruncate": "sys_ftruncate",
-    "kernel/src/syscall/fs/io.rs:sys_fadvise64": "sys_fadvise64",
-    "kernel/src/syscall/fs/io.rs:sys_sync_file_range": "sys_sync_file_range",
-    "kernel/src/syscall/fs/io.rs:sys_preadv2": "sys_preadv2",
-    "kernel/src/syscall/fs/io.rs:sys_pwritev2": "sys_pwritev2",
-    "kernel/src/syscall/fs/io.rs:sys_tee": "sys_tee",
-    "kernel/src/syscall/fs/io.rs:sys_vmsplice": "sys_vmsplice",
-    "kernel/src/syscall/fs/aio.rs:sys_io_setup": "sys_io_setup",
-    "kernel/src/syscall/fs/aio.rs:sys_io_submit": "sys_io_submit",
-    "kernel/src/syscall/fs/aio.rs:sys_io_getevents": "sys_io_getevents",
-    "kernel/src/syscall/fs/aio.rs:sys_io_pgetevents": "sys_io_pgetevents",
-    "kernel/src/syscall/fs/aio.rs:sys_io_destroy": "sys_io_destroy",
-    "kernel/src/syscall/fs/aio.rs:sys_io_cancel": "sys_io_cancel",
-    "kernel/src/syscall/fs/pipe.rs:sys_pipe2": "sys_pipe2",
-    "kernel/src/syscall/fs/pidfd.rs:sys_pidfd_open": "sys_pidfd_open",
-    "kernel/src/syscall/fs/pidfd.rs:sys_pidfd_getfd": "sys_pidfd_getfd",
-    "kernel/src/syscall/fs/pidfd.rs:sys_pidfd_send_signal": "sys_pidfd_send_signal",
-    "kernel/src/syscall/fs/cachestat.rs:sys_cachestat": "sys_cachestat",
-
-    "kernel/src/syscall/task/clone.rs:sys_clone": "sys_clone",
-    "kernel/src/syscall/task/clone.rs:sys_fork": "sys_fork",
-    "kernel/src/syscall/task/clone.rs:sys_vfork": "sys_vfork",
-    "kernel/src/syscall/task/execve.rs:sys_execve": "sys_execve",
-    "kernel/src/syscall/task/execve.rs:sys_execveat": "sys_execveat",
-
-    "kernel/src/syscall/mm/mmap.rs:sys_mremap": "sys_mremap",
-    "kernel/src/syscall/mm/mmap.rs:sys_msync": "sys_msync",
-    "kernel/src/syscall/mm/mmap.rs:sys_mlock": "sys_mlock",
-    "kernel/src/syscall/mm/mmap.rs:sys_mlock2": "sys_mlock2",
-    "kernel/src/syscall/mm/mmap.rs:sys_munlock": "sys_munlock",
-    "kernel/src/syscall/mm/mmap.rs:sys_mlockall": "sys_mlockall",
-    "kernel/src/syscall/mm/mmap.rs:sys_munlockall": "sys_munlockall",
-    "kernel/src/syscall/mm/mmap.rs:sys_remap_file_pages": "sys_remap_file_pages",
-    "kernel/src/syscall/sync/futex.rs:sys_set_robust_list": "sys_set_robust_list",
-    "kernel/src/syscall/sync/futex.rs:sys_get_robust_list": "sys_get_robust_list",
-    "kernel/src/syscall/io_mpx/poll.rs:sys_poll": "sys_poll",
-    "kernel/src/syscall/io_mpx/poll.rs:sys_ppoll": "sys_ppoll",
-    "kernel/src/syscall/mm/mmap.rs:sys_pkey_mprotect": "sys_pkey_mprotect",
-    "kernel/src/syscall/mm/mmap.rs:sys_pkey_free": "sys_pkey_free",
-    "kernel/src/syscall/mm/process_vm.rs:sys_process_madvise": "sys_process_madvise",
-    "kernel/src/syscall/mm/mmap.rs:sys_map_shadow_stack": "sys_map_shadow_stack",
-    "kernel/src/syscall/dispatch.rs:compat_epoll_create": "compat_epoll_create",
-    "kernel/src/syscall/io_mpx/epoll.rs:sys_epoll_create1": "sys_epoll_create1",
-    "kernel/src/syscall/io_mpx/epoll.rs:sys_epoll_wait": "sys_epoll_wait",
-    "kernel/src/syscall/io_mpx/epoll.rs:sys_epoll_pwait": "sys_epoll_pwait",
-    "kernel/src/syscall/io_mpx/epoll.rs:sys_epoll_pwait2": "sys_epoll_pwait2",
-
-    "kernel/src/syscall/task/thread.rs:sys_getpid": "sys_getpid",
-    "kernel/src/syscall/task/thread.rs:sys_getppid": "sys_getppid",
-    "kernel/src/syscall/task/thread.rs:sys_gettid": "sys_gettid",
-    "kernel/src/syscall/task/thread.rs:sys_set_tid_address": "sys_set_tid_address",
-    "kernel/src/syscall/signal.rs:sys_rt_sigaction": "sys_rt_sigaction",
-    "kernel/src/syscall/signal.rs:sys_rt_sigprocmask": "sys_rt_sigprocmask",
-    "kernel/src/syscall/signal.rs:sys_rt_sigreturn": "sys_rt_sigreturn",
-    "kernel/src/syscall/signal.rs:sys_pause": "sys_pause",
-    "kernel/src/syscall/signal.rs:sys_kill": "sys_kill",
-    "kernel/src/syscall/signal.rs:sys_rt_sigpending": "sys_rt_sigpending",
-    "kernel/src/syscall/signal.rs:sys_rt_sigtimedwait": "sys_rt_sigtimedwait",
-    "kernel/src/syscall/signal.rs:sys_rt_sigqueueinfo": "sys_rt_sigqueueinfo",
-    "kernel/src/syscall/signal.rs:sys_rt_sigsuspend": "sys_rt_sigsuspend",
-    "kernel/src/syscall/signal.rs:sys_sigaltstack": "sys_sigaltstack",
-    "kernel/src/syscall/signal.rs:sys_tkill": "sys_tkill",
-    "kernel/src/syscall/signal.rs:sys_tgkill": "sys_tgkill",
-    "kernel/src/syscall/signal.rs:sys_rt_tgsigqueueinfo": "sys_rt_tgsigqueueinfo",
-
-    "kernel/src/syscall/time.rs:sys_getitimer": "sys_getitimer",
-    "kernel/src/syscall/time.rs:sys_alarm": "sys_alarm",
-    "kernel/src/syscall/time.rs:sys_setitimer": "sys_setitimer",
-    "kernel/src/syscall/time.rs:sys_gettimeofday": "sys_gettimeofday",
-    "kernel/src/syscall/time.rs:sys_times": "sys_times",
-    "kernel/src/syscall/time.rs:sys_adjtimex": "sys_adjtimex",
-    "kernel/src/syscall/time.rs:sys_settimeofday": "sys_settimeofday",
-    "kernel/src/syscall/time.rs:sys_timer_create": "sys_timer_create",
-    "kernel/src/syscall/time.rs:sys_timer_settime": "sys_timer_settime",
-    "kernel/src/syscall/time.rs:sys_timer_gettime": "sys_timer_gettime",
-    "kernel/src/syscall/time.rs:sys_timer_getoverrun": "sys_timer_getoverrun",
-    "kernel/src/syscall/time.rs:sys_timer_delete": "sys_timer_delete",
-    "kernel/src/syscall/time.rs:sys_clock_settime": "sys_clock_settime",
-    "kernel/src/syscall/time.rs:sys_clock_gettime": "sys_clock_gettime",
-    "kernel/src/syscall/time.rs:sys_clock_getres": "sys_clock_getres",
-    "kernel/src/syscall/time.rs:sys_clock_adjtime": "sys_clock_adjtime",
-    "kernel/src/syscall/sys.rs:sys_syslog": "sys_syslog",
-    "kernel/src/syscall/sys.rs:sys_restart_syscall": "sys_restart_syscall",
-    "kernel/src/syscall/sys.rs:sys_getrandom": "sys_getrandom",
-
-    "kernel/src/syscall/ipc/mqueue.rs:sys_mq_open": "sys_mq_open",
-    "kernel/src/syscall/ipc/mqueue.rs:sys_mq_unlink": "sys_mq_unlink",
-    "kernel/src/syscall/ipc/mqueue.rs:sys_mq_timedsend": "sys_mq_timedsend",
-    "kernel/src/syscall/ipc/mqueue.rs:sys_mq_timedreceive": "sys_mq_timedreceive",
-    "kernel/src/syscall/ipc/mqueue.rs:sys_mq_notify": "sys_mq_notify",
-    "kernel/src/syscall/ipc/mqueue.rs:sys_mq_getsetattr": "sys_mq_getsetattr",
-
-    "kernel/src/syscall/ipc/msg.rs:sys_msgget": "sys_msgget",
-    "kernel/src/syscall/ipc/msg.rs:sys_msgsnd": "sys_msgsnd",
-    "kernel/src/syscall/ipc/msg.rs:sys_msgrcv": "sys_msgrcv",
-    "kernel/src/syscall/ipc/msg.rs:sys_msgctl": "sys_msgctl",
-    "kernel/src/syscall/ipc/sem.rs:sys_semget": "sys_semget",
-    "kernel/src/syscall/ipc/sem.rs:sys_semop": "sys_semop",
-    "kernel/src/syscall/ipc/sem.rs:sys_semctl": "sys_semctl",
-    "kernel/src/syscall/ipc/sem.rs:sys_semtimedop": "sys_semtimedop",
-    "kernel/src/syscall/ipc/shm.rs:sys_shmget": "sys_shmget",
-    "kernel/src/syscall/ipc/shm.rs:sys_shmat": "sys_shmat",
-    "kernel/src/syscall/ipc/shm.rs:sys_shmctl": "sys_shmctl",
-    "kernel/src/syscall/ipc/shm.rs:sys_shmdt": "sys_shmdt",
-
-    "kernel/src/syscall/sys.rs:sys_getuid": "sys_getuid",
-    "kernel/src/syscall/sys.rs:sys_geteuid": "sys_geteuid",
-    "kernel/src/syscall/sys.rs:sys_getresuid": "sys_getresuid",
-    "kernel/src/syscall/sys.rs:sys_getgid": "sys_getgid",
-    "kernel/src/syscall/sys.rs:sys_getegid": "sys_getegid",
-    "kernel/src/syscall/sys.rs:sys_getresgid": "sys_getresgid",
-    "kernel/src/syscall/sys.rs:sys_setuid": "sys_setuid",
-    "kernel/src/syscall/sys.rs:sys_setgid": "sys_setgid",
-    "kernel/src/syscall/sys.rs:sys_setfsuid": "sys_setfsuid",
-    "kernel/src/syscall/sys.rs:sys_setfsgid": "sys_setfsgid",
-    "kernel/src/syscall/sys.rs:sys_getgroups": "sys_getgroups",
-    "kernel/src/syscall/sys.rs:sys_setgroups": "sys_setgroups",
-    "kernel/src/syscall/sys.rs:sys_uname": "sys_uname",
-    "kernel/src/syscall/sys.rs:sys_sethostname": "sys_sethostname",
-    "kernel/src/syscall/sys.rs:sys_setdomainname": "sys_setdomainname",
-    "kernel/src/syscall/sys.rs:sys_personality": "sys_personality",
-    "kernel/src/syscall/sys.rs:sys_sysinfo": "sys_sysinfo",
-    "kernel/src/syscall/resources.rs:sys_prlimit64": "sys_prlimit64",
-    "kernel/src/syscall/resources.rs:sys_setrlimit": "sys_setrlimit",
-    "kernel/src/syscall/resources.rs:sys_getrlimit": "sys_getrlimit",
-    "kernel/src/syscall/resources.rs:sys_getrusage": "sys_getrusage",
-
-    "kernel/src/syscall/net/socket.rs:sys_socket": "sys_socket",
-    "kernel/src/syscall/net/socket.rs:sys_socketpair": "sys_socketpair",
-    "kernel/src/syscall/net/socket.rs:sys_bind": "sys_bind",
-    "kernel/src/syscall/net/socket.rs:sys_connect": "sys_connect",
-    "kernel/src/syscall/net/name.rs:sys_getsockname": "sys_getsockname",
-    "kernel/src/syscall/net/name.rs:sys_getpeername": "sys_getpeername",
-    "kernel/src/syscall/net/socket.rs:sys_listen": "sys_listen",
-    "kernel/src/syscall/net/socket.rs:sys_accept": "sys_accept",
-    "kernel/src/syscall/net/socket.rs:sys_accept4": "sys_accept4",
-    "kernel/src/syscall/net/socket.rs:sys_shutdown": "sys_shutdown",
-    "kernel/src/syscall/net/io.rs:sys_sendto": "sys_sendto",
-    "kernel/src/syscall/net/io.rs:sys_sendmsg": "sys_sendmsg",
-    "kernel/src/syscall/net/io.rs:sys_sendmmsg": "sys_sendmmsg",
-    "kernel/src/syscall/net/io.rs:sys_recvfrom": "sys_recvfrom",
-    "kernel/src/syscall/net/io.rs:sys_recvmsg": "sys_recvmsg",
-    "kernel/src/syscall/net/io.rs:sys_recvmmsg": "sys_recvmmsg",
-    "kernel/src/syscall/net/opt.rs:sys_getsockopt": "sys_getsockopt",
-    "kernel/src/syscall/net/opt.rs:sys_setsockopt": "sys_setsockopt",
-
-    "kernel/src/syscall/task/exit.rs:sys_exit": "sys_exit",
-    "kernel/src/syscall/task/exit.rs:sys_exit_group": "sys_exit_group",
-
-    "kernel/src/syscall/fs/stat.rs:sys_stat": "sys_stat",
-    "kernel/src/syscall/fs/stat.rs:sys_fstat": "sys_fstat",
-    "kernel/src/syscall/fs/stat.rs:sys_lstat": "sys_lstat",
-    "kernel/src/syscall/fs/stat.rs:sys_fstatat": "sys_fstatat",
-    "kernel/src/syscall/fs/stat.rs:sys_access": "sys_access",
-    "kernel/src/syscall/fs/stat.rs:sys_faccessat": "sys_faccessat",
-    "kernel/src/syscall/fs/stat.rs:sys_faccessat2": "sys_faccessat2",
-    "kernel/src/syscall/fs/stat.rs:sys_ustat": "sys_ustat",
-    "kernel/src/syscall/fs/stat.rs:sys_statfs": "sys_statfs",
-    "kernel/src/syscall/fs/stat.rs:sys_fstatfs": "sys_fstatfs",
-    "kernel/src/syscall/fs/stat.rs:sys_statx": "sys_statx",
-
-    "kernel/src/syscall/fs/xattr.rs:sys_setxattr": "sys_setxattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_lsetxattr": "sys_lsetxattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_fsetxattr": "sys_fsetxattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_getxattr": "sys_getxattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_lgetxattr": "sys_lgetxattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_fgetxattr": "sys_fgetxattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_listxattr": "sys_listxattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_llistxattr": "sys_llistxattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_flistxattr": "sys_flistxattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_removexattr": "sys_removexattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_lremovexattr": "sys_lremovexattr",
-    "kernel/src/syscall/fs/xattr.rs:sys_fremovexattr": "sys_fremovexattr",
-
-    "kernel/src/syscall/mm/mmap.rs:sys_pkey_alloc": "sys_pkey_alloc",
-    "kernel/src/syscall/mm/mmap.rs:sys_mprotect": "sys_mprotect",
-    "kernel/src/syscall/mm/mmap.rs:sys_munmap": "sys_munmap",
-    "kernel/src/syscall/mm/mincore.rs:sys_mincore": "sys_mincore",
-    "kernel/src/syscall/mm/process_vm.rs:sys_process_vm_readv": "sys_process_vm_readv",
-    "kernel/src/syscall/mm/process_vm.rs:sys_process_vm_writev": "sys_process_vm_writev",
-    "kernel/src/syscall/mm/mmap.rs:sys_mseal": "sys_mseal",
-
-    "kernel/src/syscall/mm/brk.rs:sys_brk": "sys_brk",
-    "kernel/src/syscall/io_mpx/epoll.rs:sys_epoll_ctl": "sys_epoll_ctl",
-    "kernel/src/syscall/sync/futex.rs:sys_futex": "sys_futex",
-    "kernel/src/syscall/sync/futex.rs:sys_futex_waitv": "sys_futex_waitv",
-    "kernel/src/syscall/sync/futex.rs:sys_futex_wake": "sys_futex_wake",
-    "kernel/src/syscall/sync/futex.rs:sys_futex_wait": "sys_futex_wait",
-    "kernel/src/syscall/sync/futex.rs:sys_futex_requeue": "sys_futex_requeue",
-    "kernel/src/syscall/sync/membarrier.rs:sys_membarrier": "sys_membarrier",
-
-    "kernel/src/syscall/fs/io_uring.rs:sys_io_uring_setup": "sys_io_uring_setup",
-    "kernel/src/syscall/fs/io_uring.rs:sys_io_uring_enter": "sys_io_uring_enter",
-    "kernel/src/syscall/fs/io_uring.rs:sys_io_uring_register": "sys_io_uring_register",
-
-    "kernel/src/syscall/mm/mmap.rs:sys_mmap": "sys_mmap",
-    "kernel/src/syscall/mm/mmap.rs:sys_madvise": "sys_madvise",
-    "kernel/src/syscall/io_mpx/select.rs:sys_select": "sys_select",
-    "kernel/src/syscall/io_mpx/select.rs:sys_pselect6": "sys_pselect6",
-
-    "kernel/src/syscall/seccomp.rs:sys_seccomp": "sys_seccomp",
-    "kernel/src/syscall/fs/memfd.rs:sys_memfd_create": "sys_memfd_create",
-    "kernel/src/syscall/fs/userfaultfd.rs:sys_userfaultfd": "sys_userfaultfd",
-    "kernel/src/syscall/fs/secretmem.rs:sys_memfd_secret": "sys_memfd_secret",
-
-    "kernel/src/syscall/landlock.rs:sys_landlock_create_ruleset": "sys_landlock_create_ruleset",
-    "kernel/src/syscall/landlock.rs:sys_landlock_add_rule": "sys_landlock_add_rule",
-    "kernel/src/syscall/landlock.rs:sys_landlock_restrict_self": "sys_landlock_restrict_self",
-
-    "kernel/src/syscall/fs/ctl.rs:sys_ioctl": "sys_ioctl",
-    "kernel/src/syscall/dispatch.rs:compat_eventfd": "compat_eventfd",
-    "kernel/src/syscall/fs/event.rs:sys_eventfd2": "sys_eventfd2",
-    "kernel/src/syscall/fs/fd_ops.rs:sys_creat": "sys_creat",
-    "kernel/src/syscall/time.rs:sys_time": "sys_time",
-    "kernel/src/syscall/task/ctl.rs:sys_umask": "sys_umask",
-    "kernel/src/syscall/dispatch.rs:sys_ni_syscall": "sys_ni_syscall",
-    "kernel/src/syscall/bpf/mod.rs:sys_bpf": "super::bpf::sys_bpf",
-    "kernel/src/syscall/task/uprobe.rs:sys_uretprobe": "super::task::sys_uretprobe",
-    "kernel/src/syscall/task/uprobe.rs:sys_uprobe": "super::task::sys_uprobe",
-    "kernel/src/syscall/fs/xattr.rs:sys_setxattrat": "super::fs::sys_setxattrat",
-    "kernel/src/syscall/fs/xattr.rs:sys_getxattrat": "super::fs::sys_getxattrat",
-    "kernel/src/syscall/fs/xattr.rs:sys_listxattrat": "super::fs::sys_listxattrat",
-    "kernel/src/syscall/fs/xattr.rs:sys_removexattrat": "super::fs::sys_removexattrat",
-    "kernel/src/syscall/fs/mount.rs:sys_open_tree_attr": "super::fs::sys_open_tree_attr",
-    "kernel/src/syscall/fs/fileattr.rs:sys_file_getattr": "super::fs::sys_file_getattr",
-    "kernel/src/syscall/fs/fileattr.rs:sys_file_setattr": "super::fs::sys_file_setattr",
-}
 
 
 def load_toml(path: Path, label: str) -> dict:
@@ -759,12 +400,155 @@ def graph_field(value: object, contract: str, field: str) -> list[str]:
     return value
 
 
-def contract_cells(contracts_path: Path, entries: dict[int, str], dispatch: Path | None = None) -> dict[int, dict]:
+def load_ratchet(data: dict) -> dict[str, set[str]]:
+    """Read the four shrink-only baselines that keep the ledger honest.
+
+    `uncited_contracts` lists contract ids that carry no `Linux <path>:<line>`
+    citation yet, `unreviewed_errno_order` lists the contracts whose ordering
+    sentence is still the placeholder, and `final_static_allowlist` lists the
+    `number:name` cells the final-strength check still tolerates for a declared
+    gap, a missing test binding, or a fully implemented syscall whose contract
+    record has not been compared with Linux.  `unbound_programs` lists the
+    differential programs no cell binds; this gate only pins its shape, and
+    scripts/ci/check_abi_contracts.py compares it with the runner registry.  No
+    list may grow: the caller compares each against reality.
+    """
+    table = data.get("ratchet")
+    if not isinstance(table, dict) or set(table) != RATCHET_FIELDS:
+        raise GateError(f"ratchet must declare exactly {sorted(RATCHET_FIELDS)}")
+    result: dict[str, set[str]] = {}
+    for field in sorted(RATCHET_FIELDS):
+        value = table[field]
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value) or len(value) != len(set(value)):
+            raise GateError(f"ratchet.{field} must be a duplicate-free array of strings")
+        result[field] = set(value)
+    return result
+
+
+def cell_identity(cell: dict) -> str:
+    return f"{cell['number']}:{cell['name']}"
+
+
+def record_ratchet(definitions: dict[str, dict], baseline: dict[str, set[str]]) -> None:
+    """Fail on a new uncited or unreviewed contract; report a shrinking backlog.
+
+    Two independent lists, because they measure different things:
+    `uncited_contracts` says whether a reader can check a record against the
+    pinned release at all, `unreviewed_errno_order` says whether anybody
+    compared its ordering sentence with Linux.  They overlap almost completely
+    today, and both have to empty out before the ledger means what it looks
+    like.
+    """
+    uncited = {
+        ident for ident, definition in definitions.items()
+        if not any(LINUX_CITATION.search(item) for field, value in definition.items() if field != "id" for item in value)
+    }
+    unreviewed = {
+        ident for ident, definition in definitions.items()
+        if definition["errno_order"] == [UNREVIEWED_ERRNO_ORDER]
+    }
+    fresh = sorted(uncited - baseline["uncited_contracts"])
+    if fresh:
+        raise GateError(f"contracts carry no Linux <path>:<line> citation and are not baselined: {fresh}")
+    fresh = sorted(unreviewed - baseline["unreviewed_errno_order"])
+    if fresh:
+        raise GateError(f"contracts carry the unreviewed errno_order placeholder and are not baselined: {fresh}")
+    for name, current, allowed in (
+        ("citation", uncited, baseline["uncited_contracts"]),
+        ("errno-order", unreviewed, baseline["unreviewed_errno_order"]),
+    ):
+        retired = sorted(allowed - current)
+        if retired:
+            print(f"linux-abi {name} ratchet: {len(current)} of {len(definitions)} contracts remain (baseline {len(allowed)}, may not grow); {len(retired)} are now clean and may leave the list: {retired}")
+        else:
+            print(f"linux-abi {name} ratchet: {len(current)} of {len(definitions)} contracts remain (baseline {len(allowed)}, may not grow)")
+    # Adding a citation to a contract is only honest once its ordering sentence
+    # says what was actually compared, so a cited record may not keep the
+    # placeholder that describes an ordering nobody checked.
+    escaping = sorted(unreviewed - uncited)
+    if escaping:
+        raise GateError(f"cited contracts still carry the unreviewed errno_order: {escaping}")
+
+
+def final_static(contracts_path: Path, cells: dict[int, dict], entries: dict[int, str]) -> None:
+    """Require the final-strength static shape within a shrink-only allowlist."""
+    baseline = load_ratchet(load_toml(contracts_path, "contracts"))["final_static_allowlist"]
+    gapped = {cell_identity(cell) for cell in cells.values()
+              if cell["status"] == "implemented" and (not cell["tests"] or cell["validation_gaps"] != ["explicit-none"])}
+    untested = {cell_identity(cell) for cell in cells.values() if not cell["tests"]}
+    # An `implemented` cell is a claim that the syscall matches Linux, so it
+    # cannot be final while its contract still carries the placeholder that
+    # says nobody compared the errno ordering.
+    unrecorded = {cell_identity(cell) for cell in cells.values()
+                  if cell["status"] == "implemented" and cell["errno_order"] == [UNREVIEWED_ERRNO_ORDER]}
+    claims = gapped | untested | unrecorded
+    offenders = sorted(claims - baseline)
+    if len(cells) != len(entries) or offenders:
+        raise GateError(
+            "final ABI static prerequisites incomplete: "
+            f"unknown={len(entries) - len(cells)}, "
+            f"outside the final allowlist={offenders}"
+        )
+    retired = sorted(baseline - claims)
+    if retired:
+        print(f"linux-abi final ratchet: {len(claims)} cells still need runtime or review evidence; {len(retired)} allowlisted cells are clean and may leave the list: {retired}")
+    else:
+        print(f"linux-abi final ratchet: {len(claims)} allowlisted cells still need runtime or review evidence (baseline {len(baseline)}, may not grow)")
+
+
+def validate_citations(definitions: dict[str, dict], linux_tree: Path | None = None) -> int:
+    """If a full Linux source tree is available, verify that cited files and lines exist."""
+    if linux_tree is None or not (linux_tree / "include/uapi").is_dir():
+        return 0
+
+    citation_pattern = re.compile(r"Linux ([A-Za-z0-9_./*-]+):([0-9]+)(?:-([0-9]+))?")
+    checked = 0
+    for ident, definition in definitions.items():
+        for field, value in definition.items():
+            if field == "id" or not isinstance(value, list):
+                continue
+            for item in value:
+                for match in citation_pattern.finditer(item):
+                    rel_path, start_s, end_s = match.groups()
+                    target = linux_tree / rel_path
+                    if not target.is_file():
+                        raise GateError(
+                            f"contract {ident} cites nonexistent Linux file '{rel_path}' in {linux_tree}"
+                        )
+                    line_count = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+                    start = int(start_s)
+                    end = int(end_s) if end_s else start
+                    if start <= 0 or start > line_count or end < start or end > line_count:
+                        raise GateError(
+                            f"contract {ident} cites invalid line range {start}-{end} in {rel_path} (file has {line_count} lines)"
+                        )
+                    checked += 1
+    return checked
+
+
+def find_linux_tree(explicit: Path | None = None, fallback: Path | None = None) -> Path | None:
+    candidates = [
+        explicit,
+        os.environ.get("THEKERNEL_LINUX_SOURCE"),
+        os.environ.get("LINUX_TREE"),
+        fallback,
+        Path.home() / "Desktop/linux-7.2.3",
+    ]
+    for c in candidates:
+        if c:
+            p = Path(c)
+            if (p / "include/uapi").is_dir():
+                return p
+    return None
+
+
+def contract_cells(contracts_path: Path, entries: dict[int, str], dispatch: Path | None = None, linux_tree: Path | None = None) -> dict[int, dict]:
     data = load_toml(contracts_path, "contracts")
-    if set(data) != {"schema", "linux_manifest", "progress", "contract", "cell"} or data["schema"] != 3:
+    if set(data) != {"schema", "linux_manifest", "progress", "ratchet", "contract", "cell"} or data["schema"] != 3:
         raise GateError("contracts schema is invalid")
     if data["linux_manifest"] != "linux-abi.toml":
         raise GateError("contracts must reference the pinned Linux manifest")
+    ratchet = load_ratchet(data)
     definitions: dict[str, dict] = {}
     for item in data["contract"]:
         if not isinstance(item, dict) or set(item) != CONTRACT_FIELDS or not isinstance(item.get("id"), str) or item["id"] in definitions:
@@ -772,6 +556,11 @@ def contract_cells(contracts_path: Path, entries: dict[int, str], dispatch: Path
         for field in CONTRACT_FIELDS - {"id"}:
             graph_field(item[field], item["id"], field)
         definitions[item["id"]] = item
+    record_ratchet(definitions, ratchet)
+    if linux_tree is not None:
+        count = validate_citations(definitions, linux_tree)
+        if count:
+            print(f"linux-abi citations: {count} citations verified against {linux_tree}")
     cells: dict[int, dict] = {}
     used_implemented: set[str] = set()
     for item in data["cell"]:
@@ -850,9 +639,6 @@ def contract_cells(contracts_path: Path, entries: dict[int, str], dispatch: Path
             for name in SYSNO.findall(masked_pattern):
                 bindings[name] = (mask_rust_noncode(expression), attrs)
         for cell in cells.values():
-            expected_call = DISPATCH_CALLS.get(cell["handler"])
-            if expected_call is None:
-                raise GateError(f"contract handler has no approved dispatch call binding: {cell['handler']}")
             if cell["status"] == "explicit-enosys":
                 if (cell["handler"] != "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
                         or cell["name"] not in ni
@@ -860,7 +646,8 @@ def contract_cells(contracts_path: Path, entries: dict[int, str], dispatch: Path
                     raise GateError(f"explicit ENOSYS cell is not bound to its actual NI arm: {cell['number']}:{cell['name']}")
                 continue
             binding = bindings.get(cell["name"])
-            call = re.compile(rf"(?<![A-Za-z0-9_:]){re.escape(expected_call)}\s*\(")
+            pat_str = expected_dispatch_call(cell["handler"])
+            call = re.compile(rf"{pat_str}\s*\(")
             if binding is None or call.search(binding[0]) is None:
                 raise GateError(f"non-NI cell is not bound to its actual dispatch handler: {cell['number']}:{cell['name']}")
             expected_cfg = [] if cell["conditional"] == "explicit-none" else [f'cfg(feature = "{cell["conditional"]}")']
@@ -871,10 +658,11 @@ def contract_cells(contracts_path: Path, entries: dict[int, str], dispatch: Path
     return cells
 
 
-def schema(manifest_path: Path, contracts_path: Path, source: Path, dispatch: Path = DISPATCH, *, final: bool = False) -> None:
+def schema(manifest_path: Path, contracts_path: Path, source: Path, dispatch: Path = DISPATCH, *, final: bool = False, linux_tree: Path | None = None) -> None:
     manifest = load_manifest(manifest_path)
     entries = parse_table(source / manifest["linux"]["table"])
-    cells = contract_cells(contracts_path, entries, dispatch)
+    tree = find_linux_tree(linux_tree, source)
+    cells = contract_cells(contracts_path, entries, dispatch, linux_tree=tree)
     routing = states(manifest, entries)
     ni_mismatch = sorted(number for number, cell in cells.items()
                          if (cell["status"] == "explicit-enosys") != (routing[number] == "explicit-enosys"))
@@ -885,10 +673,9 @@ def schema(manifest_path: Path, contracts_path: Path, source: Path, dispatch: Pa
     unvalidated = [cell["name"] for cell in cells.values()
                    if cell["status"] == "implemented" and (not cell["tests"] or cell["validation_gaps"] != ["explicit-none"])]
     print(f"linux-abi static declarations: implemented-with-gaps={len(unvalidated)}; runtime execution is not established by this gate")
-    if final and (len(cells) != len(entries) or unvalidated):
-        raise GateError(f"final ABI static prerequisites incomplete: unknown={len(entries) - len(cells)}, implemented-with-gaps={unvalidated}")
     if final:
-        print("linux-abi final static prerequisites satisfied; current-run guest results are still required")
+        final_static(contracts_path, cells, entries)
+        print("linux-abi final static prerequisites satisfied within the committed allowlist; current-run guest results are still required")
 
 
 def run_git(directory: Path, *args: str) -> str:
@@ -915,14 +702,15 @@ def materialize(manifest_path: Path, destination: Path) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("command", choices=("materialize", "inventory", "schema", "all")); parser.add_argument("--manifest", type=Path, default=MANIFEST); parser.add_argument("--contracts", type=Path, default=CONTRACTS); parser.add_argument("--linux-src", type=Path, default=SOURCE); parser.add_argument("--dispatch", type=Path, default=DISPATCH)
-    parser.add_argument("--final", action="store_true", help="require final static prerequisites; does not establish guest runtime acceptance")
+    parser.add_argument("--linux-tree", type=Path, default=None, help="path to full Linux source tree for citation verification")
+    parser.add_argument("--final", action="store_true", help="require final static prerequisites within ratchet.final_static_allowlist; does not establish guest runtime acceptance")
     args = parser.parse_args(arguments)
     if args.final and args.command not in {"schema", "all"}:
         parser.error("--final requires schema or all")
     try:
         if args.command in {"materialize", "all"}: materialize(args.manifest, args.linux_src)
         if args.command in {"inventory", "all"}: inventory(args.manifest, args.linux_src, args.dispatch)
-        if args.command in {"schema", "all"}: schema(args.manifest, args.contracts, args.linux_src, args.dispatch, final=args.final)
+        if args.command in {"schema", "all"}: schema(args.manifest, args.contracts, args.linux_src, args.dispatch, final=args.final, linux_tree=args.linux_tree)
     except (GateError, OSError, subprocess.CalledProcessError) as error:
         print(f"linux-abi: {error}", file=sys.stderr); return 1
     return 0
