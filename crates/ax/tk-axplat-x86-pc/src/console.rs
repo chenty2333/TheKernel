@@ -123,11 +123,33 @@ pub fn init() {
         // port starts asserting its interrupt line before `init_interrupt` has
         // installed the vector 0x24 handler -- one typed key during early boot
         // is then an interrupt with nobody serving it.  The probe's answer is
-        // the configuration, so nothing reprograms the port here.
+        // the configuration, so nothing reprograms the port here; the receive
+        // interrupt is turned on later by [`enable_receive_interrupt`].
         #[cfg(target_os = "none")]
         COM1_PRESENT.store(true, core::sync::atomic::Ordering::Release);
     }
     init_diagnostic();
+}
+
+/// Lets COM1 raise its receive interrupt.
+///
+/// The probe leaves `IER` zero and `MCR`.OUT2 low, so without this the UART
+/// never interrupts and a console reader waiting on [`ConsoleIf::irq_num`]
+/// sleeps forever: typed input is never echoed or delivered.  It runs once
+/// the IOAPIC has masked every pin, and pin 4 stays masked until the console
+/// registers its handler, so an early keystroke still reaches no vector
+/// before one exists.
+#[cfg(all(target_os = "none", feature = "irq"))]
+pub(crate) fn enable_receive_interrupt() {
+    if !available() {
+        return;
+    }
+    // Held so the register writes cannot interleave with a transmit.
+    let _port = COM1.lock();
+    unsafe {
+        x86::io::outb(COM1_BASE + 1, 0x01); // IER: received data available.
+        x86::io::outb(COM1_BASE + 4, 0x0b); // MCR: DTR | RTS | OUT2.
+    }
 }
 
 /// The byte-level port access [`probe_uart_with`] needs.

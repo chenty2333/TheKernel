@@ -45,6 +45,9 @@ impl InitIf for InitIfImpl {
     /// platform configuration and initialization.
     fn init_later(cpu_id: usize, _arg: usize) {
         crate::apic::init_primary(cpu_id);
+        // Only now, with every IOAPIC pin masked, may COM1 assert its line.
+        #[cfg(all(target_os = "none", feature = "irq"))]
+        crate::console::enable_receive_interrupt();
         assert!(
             crate::cpu::record_current_cpu_topology(cpu_id),
             "BSP topology record does not match logical CPU {cpu_id}"
