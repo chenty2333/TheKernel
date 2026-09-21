@@ -593,6 +593,21 @@ static int case_clock_settime(void) {
     if (raw_clock_settime((clockid_t)ABI_CLOCKFD_ID(987), &ts) != -1 || errno != EINVAL) {
         return fail("clock_settime-clockfd");
     }
+    /* Zero seconds would also fail the realtime setter's monotonic floor,
+     * hiding an accidental CLOCKFD fallthrough. Use a valid future wall time. */
+    struct timespec future;
+    if (raw_clock_gettime(CLOCK_REALTIME, &future) != 0) {
+        return fail("clock_settime-clockfd-read");
+    }
+    future.tv_sec += 60;
+    errno = 0;
+    if (raw_clock_settime((clockid_t)ABI_CLOCKFD_ID(987), &future) != -1 || errno != EINVAL) {
+        return fail("clock_settime-clockfd-valid-time");
+    }
+    errno = 0;
+    if (raw_clock_settime((clockid_t)ABI_CLOCKFD_ID(987), (void *)1) != -1 || errno != EFAULT) {
+        return fail("clock_settime-clockfd-copy-first");
+    }
     /* An unknown positive id is not a clock at all. */
     errno = 0;
     if (raw_clock_settime((clockid_t)7899, &ts) != -1 || errno != EINVAL) {
@@ -1100,6 +1115,35 @@ static int case_clock_getres(void) {
             return fail("clock_getres-stale-pid");
         }
     }
+    /* A different live process leader is a valid CPU-clock target too.
+     * Keep it alive with a pipe rather than racing a sleep against lookup. */
+    int gate[2];
+    if (pipe(gate) != 0) return fail("clock_getres-child-pipe");
+    pid_t child = fork();
+    if (child < 0) {
+        close(gate[0]);
+        close(gate[1]);
+        return fail("clock_getres-child-fork");
+    }
+    if (child == 0) {
+        char byte;
+        close(gate[1]);
+        while (read(gate[0], &byte, 1) < 0 && errno == EINTR) {}
+        _exit(0);
+    }
+    close(gate[0]);
+    clockid_t child_clock = (clockid_t)ABI_CPUCLOCK_PROCESS(child, ABI_CPUCLOCK_SCHED);
+    int child_ok = raw_clock_getres(child_clock, &ts) == 0 && ts.tv_sec == 0 && ts.tv_nsec == 1;
+    struct timespec zero = {0};
+    errno = 0;
+    child_ok = (raw_clock_settime(child_clock, &zero) == -1 && errno == EPERM) && child_ok;
+    close(gate[1]);
+    int status;
+    pid_t waited;
+    do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    if (!child_ok || waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return fail("clock_getres-other-process");
+    }
     ASSERT("clock_getres", "PID_RESOLUTION_BEFORE_RESOLUTION_VALUE");
 
     RESULT("clock_getres");
@@ -1121,6 +1165,7 @@ static int case_clock_nanosleep(void) {
         CLOCK_REALTIME_COARSE,
         CLOCK_MONOTONIC_COARSE,
         CLOCK_THREAD_CPUTIME_ID,
+        (clockid_t)ABI_CLOCKFD_ID(987),
     };
     for (unsigned i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
         errno = 0;

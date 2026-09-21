@@ -1328,6 +1328,9 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
     }
 
     if let Some(tz) = tz {
+        if !(-900..=900).contains(&tz.tz_minuteswest) {
+            return Err(AxError::InvalidInput);
+        }
         // `sys_tz` is stored before the wall clock is touched, so a rejected
         // time still leaves the retained timezone changed
         // (`kernel/time/time.c:205-222`).
@@ -1351,7 +1354,7 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
         // one-shot only on the `tv == NULL` branch would let a later
         // `settimeofday(NULL, &tz)` warp `CLOCK_REALTIME` by
         // `tz_minuteswest * 60` after a call that already set the clock. Linux
-        // does not range-check `tz_minuteswest`, so neither do we.
+        // bounds `tz_minuteswest` to +-15 hours (-900..=900).
         if crate::time::warp_first_timezone(tz.tz_minuteswest, requested_nanos.is_none())? {
             // `timekeeping_warp_clock()` reaches `ntp_clear()` through
             // `timekeeping_inject_offset()` (`kernel/time/timekeeping.c:1786-1790`),

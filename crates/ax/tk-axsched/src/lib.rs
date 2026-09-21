@@ -1,15 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![doc = include_str!("../README.md")]
 
-#[cfg(any(
-    all(feature = "eevdf-balanced", feature = "eevdf-latency"),
-    all(feature = "eevdf-balanced", feature = "eevdf-throughput"),
-    all(feature = "eevdf-latency", feature = "eevdf-throughput"),
-))]
-compile_error!(
-    "select at most one EEVDF profile: eevdf-balanced, eevdf-latency, or eevdf-throughput"
-);
-
 mod cfs;
 mod eevdf;
 mod eevdf_model;

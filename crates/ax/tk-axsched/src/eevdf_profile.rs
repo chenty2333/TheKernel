@@ -1,9 +1,7 @@
-//! Compile-time EEVDF tuning profiles.
+//! The EEVDF tuning profile.
 //!
-//! A profile is selected when the scheduler crate is built.  There is no
-//! mutable or task-local policy state: the selected value is a plain constant
-//! consumed by the model.  The default (no profile feature) deliberately
-//! preserves the original EEVDF constants.
+//! There is no mutable or task-local policy state: the profile is a plain
+//! constant consumed by the model, and it holds the original EEVDF constants.
 
 /// The small, auditable set of EEVDF constraint parameters selected for one
 /// build.
@@ -43,30 +41,8 @@ const fn is_power_of_two(value: u128) -> bool {
     value != 0 && value & value.wrapping_sub(1) == 0
 }
 
-// The balanced profile is the historical EEVDF configuration.  Keeping it
-// as the no-feature branch makes a default build reproducible and keeps the
-// scheduler's ordinary hot path independent of profile selection.
-#[cfg(all(feature = "eevdf-latency", not(feature = "eevdf-throughput")))]
-pub const EEVDF_PROFILE: EevdfProfile = EevdfProfile {
-    name: "latency",
-    normal_target_ticks: 4,
-    batch_target_ticks: 16,
-    idle_target_ticks: 4,
-    sleeper_grace_ticks: 4,
-    sleeper_decay_ticks: 32,
-};
-
-#[cfg(all(feature = "eevdf-throughput", not(feature = "eevdf-latency")))]
-pub const EEVDF_PROFILE: EevdfProfile = EevdfProfile {
-    name: "throughput",
-    normal_target_ticks: 16,
-    batch_target_ticks: 64,
-    idle_target_ticks: 16,
-    sleeper_grace_ticks: 16,
-    sleeper_decay_ticks: 128,
-};
-
-#[cfg(all(not(feature = "eevdf-latency"), not(feature = "eevdf-throughput")))]
+// The balanced profile is the historical EEVDF configuration, so the scheduler's
+// ordinary hot path is independent of any profile selection.
 pub const EEVDF_PROFILE: EevdfProfile = EevdfProfile {
     name: "balanced",
     normal_target_ticks: 8,
@@ -76,20 +52,7 @@ pub const EEVDF_PROFILE: EevdfProfile = EevdfProfile {
     sleeper_decay_ticks: 64,
 };
 
-// Keep the module name-resolvable while rustc reports the intentional
-// compile-time contract below when both non-default profiles are requested.
-// The value is never a valid build configuration.
-#[cfg(all(feature = "eevdf-latency", feature = "eevdf-throughput"))]
-pub const EEVDF_PROFILE: EevdfProfile = EevdfProfile {
-    name: "invalid-profile-selection",
-    normal_target_ticks: 0,
-    batch_target_ticks: 0,
-    idle_target_ticks: 0,
-    sleeper_grace_ticks: 0,
-    sleeper_decay_ticks: 0,
-};
-
-/// Return the selected immutable profile for API and diagnostic consumers.
+/// Return the immutable profile for API and diagnostic consumers.
 pub const fn eevdf_profile() -> EevdfProfile {
     EEVDF_PROFILE
 }
@@ -109,7 +72,6 @@ mod tests {
         assert!(profile_constraints_hold(EEVDF_PROFILE));
     }
 
-    #[cfg(all(not(feature = "eevdf-latency"), not(feature = "eevdf-throughput")))]
     #[test]
     fn balanced_profile_keeps_the_original_constants() {
         assert_eq!(EEVDF_PROFILE.name, "balanced");
@@ -118,27 +80,5 @@ mod tests {
         assert_eq!(EEVDF_PROFILE.idle_target_ticks, 8);
         assert_eq!(EEVDF_PROFILE.sleeper_grace_ticks, 8);
         assert_eq!(EEVDF_PROFILE.sleeper_decay_ticks, 64);
-    }
-
-    #[cfg(feature = "eevdf-latency")]
-    #[test]
-    fn latency_profile_is_the_bounded_short_request_variant() {
-        assert_eq!(EEVDF_PROFILE.name, "latency");
-        assert_eq!(EEVDF_PROFILE.normal_target_ticks, 4);
-        assert_eq!(EEVDF_PROFILE.batch_target_ticks, 16);
-        assert_eq!(EEVDF_PROFILE.idle_target_ticks, 4);
-        assert_eq!(EEVDF_PROFILE.sleeper_grace_ticks, 4);
-        assert_eq!(EEVDF_PROFILE.sleeper_decay_ticks, 32);
-    }
-
-    #[cfg(feature = "eevdf-throughput")]
-    #[test]
-    fn throughput_profile_is_the_bounded_long_request_variant() {
-        assert_eq!(EEVDF_PROFILE.name, "throughput");
-        assert_eq!(EEVDF_PROFILE.normal_target_ticks, 16);
-        assert_eq!(EEVDF_PROFILE.batch_target_ticks, 64);
-        assert_eq!(EEVDF_PROFILE.idle_target_ticks, 16);
-        assert_eq!(EEVDF_PROFILE.sleeper_grace_ticks, 16);
-        assert_eq!(EEVDF_PROFILE.sleeper_decay_ticks, 128);
     }
 }

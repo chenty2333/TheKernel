@@ -353,11 +353,12 @@ pub enum AffinityLengthReject {
 /// exactly these tests, in this order, before it resolves `pid`:
 ///
 /// ```text
-/// 	if ((len * BITS_PER_BYTE) < nr_cpu_ids)
-/// 		return -EINVAL;
-/// 	if (len & (sizeof(unsigned long)-1))
-/// 		return -EINVAL;
+/// reject unless len * 8 reaches every present CPU id   -> -EINVAL
+/// reject unless len is a whole number of words         -> -EINVAL
 /// ```
+///
+/// Those are the two tests at `kernel/sched/syscalls.c:1313-1316`, restated
+/// here rather than copied.
 ///
 /// On success it copies `min(len, cpumask_size())` bytes and returns that
 /// count, so an over-long request neither writes past the kernel mask nor

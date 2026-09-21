@@ -1835,6 +1835,32 @@ impl<T> EEVDFScheduler<T> {
         Ok(())
     }
 
+    /// Renew a CBS budget the way Linux's replenish loop does: for every whole
+    /// runtime the entity overran, add one more full runtime and move the
+    /// deadline one further period (`replenish_dl_entity()`,
+    /// `kernel/sched/deadline.c:825-834`).  Returns the renewed, always
+    /// positive budget and the number of whole extra periods the overrun
+    /// consumed.
+    ///
+    /// A single `runtime - overrun` subtraction is not enough: an overrun of
+    /// one runtime or more would leave a zero budget, and
+    /// [`Self::account_deadline_runtime`] treats a zero budget with the
+    /// throttle bit clear as an impossible state.
+    fn replenished_budget(
+        config: DeadlineParameters,
+        overrun_ns: u64,
+    ) -> Result<(u64, u64), SchedulerError> {
+        if !config.is_valid() {
+            return Err(SchedulerError::InvalidParameters);
+        }
+        // `is_valid` proves the runtime is non-zero, so both divisions are
+        // total.  An exact multiple still grants one full budget, matching
+        // Linux's `while (dl_se->runtime <= 0)`.
+        let extra_periods = overrun_ns / config.runtime_ns;
+        let remaining = config.runtime_ns - (overrun_ns % config.runtime_ns);
+        Ok((remaining, extra_periods))
+    }
+
     /// Move every expired CBS server back to the runnable EDF tree.  The
     /// separate intrusive tree makes throttling structural: pick_next cannot
     /// accidentally run a server before its replenishment instant.
@@ -1852,21 +1878,35 @@ impl<T> EEVDFScheduler<T> {
                 config.is_valid(),
                 "configured deadline server became invalid"
             );
+            let overrun_ns = unsafe { task.owned_state().deadline_overrun_ns };
+            let (remaining, extra_periods) = Self::replenished_budget(config, overrun_ns)
+                .expect("configured deadline server became invalid");
+            let extra_periods_ns = config
+                .period_ns
+                .checked_mul(extra_periods)
+                .expect("deadline overrun overflowed the replenishment clock");
+            // Re-anchored at `now` rather than advanced on the old deadline's
+            // period grid as Linux's `while (dl_se->runtime <= 0)` loop does
+            // (`kernel/sched/deadline.c:831-834`), which only jumps to
+            // `now + dl_deadline` once that grid has fallen behind (`:845-848`):
+            // a late replenishment slips this server's absolute deadline, while
+            // the budget `replenished_budget()` renews is the same either way.
             let absolute = self
                 .deadline_now_ns
                 .checked_add(config.deadline_ns)
+                .and_then(|value| value.checked_add(extra_periods_ns))
                 .expect("deadline clock overflow during replenishment");
             let replenish = self
                 .deadline_now_ns
                 .checked_add(config.period_ns)
+                .and_then(|value| value.checked_add(extra_periods_ns))
                 .expect("deadline clock overflow during replenishment");
             let sequence = self
                 .next_rt_sequence(false)
                 .expect("deadline sequence exhausted");
             unsafe {
                 let mut state = task.owned_state_mut();
-                state.deadline_remaining_ns =
-                    config.runtime_ns.saturating_sub(state.deadline_overrun_ns);
+                state.deadline_remaining_ns = remaining;
                 state.deadline_absolute_ns = absolute;
                 state.deadline_replenish_at_ns = replenish;
                 state.deadline_overrun_ns = 0;
@@ -3858,25 +3898,50 @@ impl<T> EEVDFScheduler<T> {
                         && state.deadline_replenish_at_ns <= self.deadline_now_ns)
                         || (!exhausted && state.deadline_absolute_ns <= self.deadline_now_ns)
                     {
-                        let absolute = match self.deadline_now_ns.checked_add(config.deadline_ns) {
+                        // Renew exactly like `replenish_deadlines()`: the overrun
+                        // is charged whole periods at a time
+                        // (`kernel/sched/deadline.c:825-834`), so a server that
+                        // overran one runtime or more while throttled is never
+                        // published with a zero budget and the throttle bit
+                        // clear.
+                        let (remaining, extra_periods) =
+                            match Self::replenished_budget(config, state.deadline_overrun_ns) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    self.release_claim(&task);
+                                    return Err(error);
+                                }
+                            };
+                        let extra_periods_ns = match config.period_ns.checked_mul(extra_periods) {
                             Some(value) => value,
                             None => {
                                 self.release_claim(&task);
                                 return Err(SchedulerError::ArithmeticExhausted);
                             }
                         };
-                        let replenish = match self.deadline_now_ns.checked_add(config.period_ns) {
+                        let absolute = match self
+                            .deadline_now_ns
+                            .checked_add(config.deadline_ns)
+                            .and_then(|value| value.checked_add(extra_periods_ns))
+                        {
                             Some(value) => value,
                             None => {
                                 self.release_claim(&task);
                                 return Err(SchedulerError::ArithmeticExhausted);
                             }
                         };
-                        Some((
-                            config.runtime_ns.saturating_sub(state.deadline_overrun_ns),
-                            absolute,
-                            replenish,
-                        ))
+                        let replenish = match self
+                            .deadline_now_ns
+                            .checked_add(config.period_ns)
+                            .and_then(|value| value.checked_add(extra_periods_ns))
+                        {
+                            Some(value) => value,
+                            None => {
+                                self.release_claim(&task);
+                                return Err(SchedulerError::ArithmeticExhausted);
+                            }
+                        };
+                        Some((remaining, absolute, replenish))
                     } else {
                         None
                     };
@@ -7210,6 +7275,120 @@ mod tests {
         };
         assert!(throttled);
         assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn replenished_budget_handles_exact_and_multiple_runtime_debts() {
+        let config = DeadlineParameters {
+            runtime_ns: 25,
+            deadline_ns: 100,
+            period_ns: 120,
+            flags: 0,
+        };
+        for (debt, remaining, periods) in [
+            (0, 25, 0),
+            (24, 1, 0),
+            (25, 25, 1),
+            (30, 20, 1),
+            (50, 25, 2),
+            (76, 24, 3),
+        ] {
+            assert_eq!(
+                EEVDFScheduler::<u8>::replenished_budget(config, debt),
+                Ok((remaining, periods)),
+            );
+        }
+    }
+
+    #[test]
+    fn replenishment_grants_a_full_budget_for_a_whole_runtime_overrun() {
+        // An overrun of one runtime or more must renew the way Linux's
+        // replenish loop does (`kernel/sched/deadline.c:825-834`): one extra
+        // full runtime and one extra period per exhausted budget. A single
+        // saturating subtraction would publish remaining == 0 with the
+        // throttle bit clear, which account_deadline_runtime rejects.
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(1));
+        let config = DeadlineParameters {
+            runtime_ns: 25,
+            deadline_ns: 100,
+            period_ns: 120,
+            flags: 0,
+        };
+        scheduler.stage_task_deadline_config(&task, config).unwrap();
+        let _ = scheduler
+            .set_task_params(&task, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        scheduler.add_task(Arc::clone(&task)).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(25, 1)));
+        // The switch-out sample overruns a whole budget while throttled.
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(30, 1)));
+        assert_eq!(unsafe { task.owned_state().deadline_overrun_ns }, 30);
+        scheduler.deactivate_task(&current, DeactivateReason::Sleep);
+        scheduler
+            .enqueue_task(Arc::clone(&task), EnqueueReason::Wakeup)
+            .unwrap();
+        assert!(unsafe { task.owned_state().deadline_throttled });
+
+        scheduler.advance_deadline_clock(120);
+        let current = scheduler.pick_next_task().unwrap();
+        let (remaining, absolute, replenish, throttled) = unsafe {
+            let state = task.owned_state();
+            (
+                state.deadline_remaining_ns,
+                state.deadline_absolute_ns,
+                state.deadline_replenish_at_ns,
+                state.deadline_throttled,
+            )
+        };
+        // floor(30 / 25) + 1 == 2 budgets, so 50 - 30 == 20 remain, and the
+        // deadline moved two periods past the base instant.
+        assert_eq!(remaining, 20);
+        assert!(!throttled);
+        assert_eq!(absolute, 120 + 100 + 120);
+        assert_eq!(replenish, 120 + 120 + 120);
+        // The renewed budget must be accountable rather than reported as
+        // corruption.
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(20, 1)));
+    }
+
+    #[test]
+    fn waking_after_replenishment_grants_a_full_budget_for_a_runtime_overrun() {
+        // The wake renewal path must charge a whole-runtime overrun the same
+        // way `replenish_deadlines()` does; otherwise a sleeping server wakes
+        // with a zero budget and a clear throttle bit.
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(1));
+        let config = DeadlineParameters {
+            runtime_ns: 25,
+            deadline_ns: 100,
+            period_ns: 120,
+            flags: 0,
+        };
+        scheduler.stage_task_deadline_config(&task, config).unwrap();
+        let _ = scheduler
+            .set_task_params(&task, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        scheduler.add_task(Arc::clone(&task)).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(25, 1)));
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(30, 1)));
+        scheduler.deactivate_task(&current, DeactivateReason::Sleep);
+
+        // The replenishment instant passes while the server sleeps, so the
+        // wake processes the renewal directly.
+        scheduler.advance_deadline_clock(120);
+        scheduler
+            .enqueue_task(Arc::clone(&task), EnqueueReason::Wakeup)
+            .unwrap();
+        let state = unsafe { task.owned_state() };
+        assert_eq!(state.deadline_remaining_ns, 20);
+        assert_eq!(state.deadline_absolute_ns, 120 + 100 + 120);
+        assert_eq!(state.deadline_replenish_at_ns, 120 + 120 + 120);
+        assert!(!state.deadline_throttled);
+        let current = scheduler.pick_next_task().unwrap();
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(20, 1)));
     }
 
     #[test]

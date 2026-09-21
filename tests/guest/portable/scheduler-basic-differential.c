@@ -37,12 +37,14 @@ int main(void)
     long bytes = syscall(SYS_sched_getaffinity, 0, sizeof(mask), mask);
     check("get-affinity", bytes > 0 && bytes <= (long)sizeof(mask));
     if (failed) return 1;
+    EXPECT_ERR("get-negative-pid", syscall(SYS_sched_getaffinity, -1, sizeof(mask), copy), ESRCH);
     EXPECT_ERR("get-unaligned-length", syscall(SYS_sched_getaffinity, 0, sizeof(mask) - 1, copy), EINVAL);
     EXPECT_ERR("get-low32-zero", syscall(SYS_sched_getaffinity, 0, 1UL << 32, copy), EINVAL);
     long high_bytes = syscall(SYS_sched_getaffinity, 0, (1UL << 32) | sizeof(mask), copy);
     check("get-low32-length", high_bytes == bytes && memcmp(mask, copy, (size_t)bytes) == 0);
     done();
     begin("sched_setaffinity.raw-differential");
+    EXPECT_ERR("set-negative-pid", syscall(SYS_sched_setaffinity, -1, sizeof(mask), mask), ESRCH);
     check("set-low32-length", syscall(SYS_sched_setaffinity, 0, (1UL << 32) | (unsigned long)bytes, mask) == 0);
     EXPECT_ERR("set-low32-zero", syscall(SYS_sched_setaffinity, 0, 1UL << 32, mask), EINVAL);
     /* A short set mask is zero-extended, unlike getaffinity's aligned size. */

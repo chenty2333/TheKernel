@@ -13,8 +13,7 @@ use axtask::{
     TaskSchedulingUpdate, current,
     future::{BlockOnError, Interrupted, block_on, interruptible},
     sched_state, set_sched_state_versioned_with_uclamp_constraints, set_task_affinity,
-    set_task_nice as update_task_nice, task_scheduling_snapshot,
-    update_task_scheduling,
+    set_task_nice as update_task_nice, task_scheduling_snapshot, update_task_scheduling,
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM,
@@ -34,10 +33,9 @@ use crate::{
     readiness::block_on_poll_set_interruptible_if,
     task::{
         AlarmClock, AsThread, Cred, NanosleepRestart, PidNamespace, ProcStateHint, Process,
-        PtraceAccessMode, RestartBlock, SleepClock, TaskUsage, Thread,
-        check_current_process_ptrace_access,
-        check_current_thread_ptrace_image_access, cpu_clock_sleep_waiters,
-        get_process_including_zombie, get_task, get_visible_task,
+        PtraceAccessMode, RestartBlock, SleepClock, TaskUsage, Thread, ZombieSchedulerSnapshot,
+        check_current_process_ptrace_access, check_current_thread_ptrace_image_access,
+        cpu_clock_sleep_waiters, get_process_including_zombie, get_task, get_visible_task,
         get_visible_task_including_exiting, has_pending_syscall_signal, ns_capable,
         prepare_clock_sleep, process_domain,
         security::{
@@ -45,7 +43,7 @@ use crate::{
             dispatch_scheduler, dispatch_task_getscheduler,
         },
         set_zombie_nice, try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns,
-        zombie_scheduler_state, ZombieSchedulerSnapshot,
+        zombie_scheduler_state,
     },
     time::TimeValueLike,
 };
@@ -165,6 +163,14 @@ fn zombie_scheduler_target(tid: Pid) -> AxResult<Option<SchedTarget>> {
 
 /// Resolves `pid` for the scheduler queries Linux restricts to a live task.
 ///
+/// A negative `pid` is ESRCH: `sched_getaffinity()`/`sched_setaffinity()` hand
+/// it to `find_process_by_pid()` -> `find_task_by_vpid()`, which matches
+/// nothing and fails without any `pid < 0` test
+/// (`kernel/sched/syscalls.c:215-218,1197-1204,1278-1286`).  `sched_setparam`
+/// and `sched_setscheduler` never reach this helper with a negative pid,
+/// because their entry points already report EINVAL
+/// (`do_sched_setscheduler()`, `kernel/sched/syscalls.c:852-859`).
+///
 /// Deliberate gap: Linux reaches an unreaped zombie through
 /// `find_task_by_vpid()` here as well, so `sched_getaffinity`,
 /// `sched_setaffinity`, `sched_setparam` and `sched_setscheduler` answer for
@@ -174,7 +180,7 @@ fn zombie_scheduler_target(tid: Pid) -> AxResult<Option<SchedTarget>> {
 /// report ESRCH for a zombie instead.
 fn live_sched_target(pid: i32) -> AxResult<AxTaskRef> {
     if pid < 0 {
-        return Err(AxError::InvalidInput);
+        return Err(AxError::NoSuchProcess);
     }
     if pid == 0 {
         return Ok(current().clone());
@@ -1250,6 +1256,16 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
             return Err(AxError::OperationNotSupported);
         }
         _ => {
+            // A CLOCKFD-encoded id names a dynamic POSIX clock
+            // (`clockid_to_kclock()` -> `clock_posix_dynamic`,
+            // `kernel/time/posix-timers.c:1543-1550`), whose `k_clock` carries
+            // no `nsleep` (`kernel/time/posix-clock.c:313-318`).  Linux then
+            // reports EOPNOTSUPP before copying the timespec
+            // (`SYSCALL_DEFINE4(clock_nanosleep)`,
+            // `kernel/time/posix-timers.c:1383-1392`).
+            if clock_id < 0 && (clock_id & CLOCKFD_MASK) == CLOCKFD {
+                return Err(AxError::OperationNotSupported);
+            }
             // Negative non-CLOCKFD values may be Linux's encoded CPU clocks.
             // Resolve them below after user input is copied, so all CPU-clock
             // variants share target lifetime and permission semantics.
@@ -1461,10 +1477,7 @@ pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
     authorize_scheduler_query(&target)?;
     // `linux_policy_from_class` ORs in SCHED_RESET_ON_FORK exactly where Linux
     // does (`if (p->sched_reset_on_fork) retval |= SCHED_RESET_ON_FORK`).
-    Ok(linux_policy_from_class(
-        target.state().class,
-        target.reset_on_fork()?,
-    ) as isize)
+    Ok(linux_policy_from_class(target.state().class, target.reset_on_fork()?) as isize)
 }
 
 /// `security_task_getscheduler(task)` for a query that already resolved its
@@ -2290,11 +2303,18 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
             // `who ? find_task_by_vpid(who) : current`: the lookup has no state
             // filter, so an unreaped zombie is a valid target.
             if who == 0 {
-                setpriority_one(&mut result, &actor_task, &actor_cred, actor_task.clone(), new_nice);
+                setpriority_one(
+                    &mut result,
+                    &actor_task,
+                    &actor_cred,
+                    actor_task.clone(),
+                    new_nice,
+                );
             } else if who > 0 {
                 if let Some(task) = visible_live_task_for_getpriority(who as Pid, &caller_pid_ns) {
                     setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
-                } else if let Some(process) = zombie_target_for_setpriority(who as Pid, &caller_pid_ns)
+                } else if let Some(process) =
+                    zombie_target_for_setpriority(who as Pid, &caller_pid_ns)
                 {
                     setpriority_one_zombie(&mut result, &actor_cred, &process, new_nice);
                 } else {
@@ -2362,8 +2382,7 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                 // `task_pid_vnr(p)` guard below only skips a task with no ID
                 // in the caller's namespace -- a zombie leader clears it.
                 if process.is_zombie() {
-                    if zombie_pid_ns(&process)
-                        .is_some_and(|pid_ns| caller_pid_ns.contains(&pid_ns))
+                    if zombie_pid_ns(&process).is_some_and(|pid_ns| caller_pid_ns.contains(&pid_ns))
                         && process
                             .zombie_payload()
                             .is_some_and(|snapshot| snapshot.credential.ids().ruid == uid)

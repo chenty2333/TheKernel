@@ -52,15 +52,6 @@ mod tests;
 ))]
 compile_error!("select at most one of sched-fifo, sched-rr, or sched-eevdf");
 
-#[cfg(any(
-    all(feature = "eevdf-balanced", feature = "eevdf-latency"),
-    all(feature = "eevdf-balanced", feature = "eevdf-throughput"),
-    all(feature = "eevdf-latency", feature = "eevdf-throughput"),
-))]
-compile_error!(
-    "select at most one EEVDF profile: eevdf-balanced, eevdf-latency, or eevdf-throughput"
-);
-
 cfg_if::cfg_if! {
     if #[cfg(feature = "multitask")] {
         #[macro_use]
