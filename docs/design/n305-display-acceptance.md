@@ -198,11 +198,11 @@ can show.
 ## 3. Per-phase acceptance
 
 Every log record is one line shaped
-`<6>[<secs>.<micros> cpu=<n> tid=<n> INFO target=<module path> module=<module path>] <message>`
+`<6>[<secs>.<micros> cpu=<n> tid=<n> INFO target=<module path>] <message>`
 (`crates/ax/tk-axruntime/src/klog.rs`), so a display line on the panel looks like:
 
 ```text
-<6>[0.910000 cpu=Some(0) tid=Some(1) INFO target=tk_kernel::drm::intel::probe module=tk_kernel::drm::intel::probe] intel-gpu: Intel display probe
+<6>[0.910000 cpu=0 tid=1 INFO target=tk_kernel::drm::intel::probe] intel-gpu: Intel display probe
 ```
 
 The strings quoted below are the message text, which is what to look for on the panel: everything is

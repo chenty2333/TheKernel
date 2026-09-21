@@ -655,6 +655,21 @@ pub mod power {
     pub use axplat::power::cpu_boot;
     pub use axplat::power::system_off;
 
+    /// The last thing this machine says, from a layer that cannot reach the
+    /// kernel log ring.
+    ///
+    /// The ring lives in the runtime, above this crate, so a scheduler or
+    /// interrupt-controller invariant break has no producer path to hand its
+    /// failure to: it goes straight to the diagnostic console, on the same
+    /// bounded emergency writer the panic handler uses, and then the machine
+    /// stops. `axruntime::klog::fatal` is the version for callers that can also
+    /// retain the record, and both spell the same leading words so a reader of a
+    /// run transcript has one thing to search for.
+    pub fn fatal(args: core::fmt::Arguments<'_>) -> ! {
+        crate::console::emergency_diagnostic_print(format_args!("TheKernel fatal: {args}\n"));
+        system_off()
+    }
+
     /// Restart the supported x86 default platform.
     pub fn system_reset() -> ! {
         #[cfg(all(target_os = "none", feature = "defplat"))]

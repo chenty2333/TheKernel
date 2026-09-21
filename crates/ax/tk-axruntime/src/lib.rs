@@ -431,7 +431,14 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     // rebuilding and re-transferring the whole kernel image to change one
     // filter, and the setting most often needed is the one that makes the
     // console readable enough to diagnose the boot in the first place.
+    //
+    // `loglevel=` carries two grammars, told apart by type.  An integer is the
+    // console level Linux's parameter of that name sets, and `klog::init`
+    // applies it; anything else is this kernel's capture filter, which is what
+    // `AX_LOG` also spells.  A filter's default level is never a number, so no
+    // reading is ambiguous.
     let log_level = axhal::boot::command_line_value("loglevel")
+        .filter(|value| value.parse::<u8>().is_err())
         .or(option_env!("AX_LOG"))
         .unwrap_or("info");
     let show_banner = build_flag_enabled(option_env!("AX_START_BANNER"));
@@ -455,7 +462,8 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
                 platform = {}
                 target = {}
                 build_mode = {}
-                log_level = {}
+                capture_level = {}
+                console_loglevel = {}
                 backtrace = {}
                 smp = {}
             "},
@@ -464,6 +472,10 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
             option_env!("AX_TARGET").unwrap_or(""),
             option_env!("AX_MODE").unwrap_or(""),
             log_level,
+            // Both axes, because both can be set from the command line and a
+            // reader diagnosing a silent boot needs to know which one they are
+            // looking at.
+            klog::console_loglevel(),
             enable_backtrace,
             axhal::cpu_num()
         ));
@@ -513,7 +525,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         (None, None) if axhal::boot::framebuffer_offered() => {
             warn!("boot framebuffer: declined for an unrecorded reason")
         }
-        (None, None) => info!("boot framebuffer: none offered by the bootloader"),
+        (None, None) => debug!("boot framebuffer: none offered by the bootloader"),
     }
 
     #[cfg(feature = "alloc")]
@@ -544,7 +556,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
     let (kernel_space_start, kernel_space_size) = axhal::mem::kernel_aspace();
 
-    info!(
+    debug!(
         "kernel aspace: [{:#x?}, {:#x?})",
         kernel_space_start,
         kernel_space_start + kernel_space_size,
@@ -570,8 +582,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     early_screen_milestone("scheduler");
     #[cfg(feature = "multitask")]
     if let Err(error) = axtask::init_scheduler() {
-        error!("Primary task scheduler initialization failed: {error:?}");
-        axhal::power::system_off();
+        klog::fatal(format_args!("Primary task scheduler initialization failed: {error:?}"));
     }
 
     #[cfg(feature = "axdriver")]
@@ -588,8 +599,9 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         #[cfg(feature = "net-ng")]
         {
             if let Err(error) = axnet_ng::init_network(all_devices.net) {
-                error!("Network subsystem initialization failed: {error:?}");
-                axhal::power::system_off();
+                klog::fatal(format_args!(
+                    "Network subsystem initialization failed: {error:?}"
+                ));
             }
 
             #[cfg(feature = "vsock")]
@@ -612,13 +624,13 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     early_screen_milestone("interrupt init");
     #[cfg(feature = "irq")]
     {
-        info!("Initialize interrupt handlers...");
+        debug!("Initialize interrupt handlers...");
         init_interrupt();
     }
 
     #[cfg(all(feature = "tls", not(feature = "multitask")))]
     {
-        info!("Initialize thread local storage...");
+        debug!("Initialize thread local storage...");
         init_tls();
     }
 
@@ -696,7 +708,7 @@ fn start_pci_input_reconcile_worker() {
 fn init_allocator() {
     use axhal::mem::{MemRegionFlags, memory_regions, phys_to_virt};
 
-    info!("Initialize global memory allocator...");
+    debug!("Initialize global memory allocator...");
     info!("  use {} allocator.", axalloc::global_allocator().name());
 
     let mut max_region_size = 0;

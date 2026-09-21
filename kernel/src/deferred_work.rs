@@ -6,6 +6,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
+use axruntime::klog::{self, ConsoleId};
 
 use crate::readiness::block_on_poll_set_uninterruptible;
 
@@ -180,7 +181,9 @@ pub(crate) fn kick_perf_retire_worker() {
     {
         // Registration and topology are immutable before user tasks start.
         // Continuing here could strand the only final-drop owner forever.
-        axhal::power::system_off();
+        axruntime::klog::fatal(format_args!(
+            "final-drop owner worker could not be registered before user tasks started"
+        ));
     }
 }
 
@@ -234,38 +237,51 @@ fn next_uclamp_retry_delay_ms(current: u64) -> u64 {
     current.saturating_mul(2).min(UCLAMP_RETRY_MAX_MS)
 }
 
+/// Whether the serial console has a record to show.  Named because the waits
+/// below take a function path, and a console's work is now a per-console
+/// question: records the serial port would not print do not wake this worker.
+fn serial_work_pending() -> bool {
+    klog::console_work_pending(ConsoleId::Serial)
+}
+
+/// Whether the screen has a record to show, which is the same question asked of
+/// the other console so the two never wake each other.
+fn screen_work_pending() -> bool {
+    klog::console_work_pending(ConsoleId::Screen)
+}
+
 // Producers publish only an atomic pending flag. The dispatcher wakes this
 // dedicated consumer outside runqueue/IRQ locks; UART backpressure cannot
 // delay policy work or cause recursively logging producer-side wakeups.
 fn diagnostic_worker() {
-    let mut drain = axruntime::klog::DiagnosticDrain::new();
+    let mut drain = klog::ConsoleDrain::new(ConsoleId::Serial);
     let mut retry_ms = 1;
     loop {
         if wait_with_bounded_retry(
-            || wait_for_worker(&LOG_WORKER_WAKE, axruntime::klog::diagnostic_work_pending),
+            || wait_for_worker(&LOG_WORKER_WAKE, serial_work_pending),
             axtask::yield_now,
         )
         .is_err()
         {
-            axruntime::klog::retire_diagnostic_sink();
+            klog::retire_console(ConsoleId::Serial);
             axhal::console::emergency_diagnostic_print(format_args!(
                 "kernel diagnostic worker wait failed\n"
             ));
             return;
         }
-        while axruntime::klog::diagnostic_work_pending() {
-            let written = drain.drain_once();
+        while serial_work_pending() {
+            let written = drain.drain_serial_once();
             retry_ms = if written != 0 { 1 } else { (retry_ms * 2).min(100) };
             // Back off while a present UART makes no progress. Idle and absent
             // sinks do not keep a periodic worker running.
-            if axruntime::klog::diagnostic_work_pending() {
+            if serial_work_pending() {
                 if wait_with_bounded_retry(
                     || axtask::sleep(Duration::from_millis(retry_ms)),
                     axtask::yield_now,
                 )
                 .is_err()
                 {
-                    axruntime::klog::retire_diagnostic_sink();
+                    klog::retire_console(ConsoleId::Serial);
                     axhal::console::emergency_diagnostic_print(format_args!(
                         "kernel diagnostic worker timer failed\n"
                     ));
@@ -338,7 +354,10 @@ fn policy_worker() {
                     // failure would leave a successfully committed policy
                     // permanently stale, so fail closed rather than retrying
                     // it forever.
-                    axhal::power::system_off();
+                    axruntime::klog::fatal(format_args!(
+                        "cpu.uclamp reconciliation met a scheduler it does not support; a \
+                         committed policy would have stayed stale"
+                    ));
                 }
                 // Timer registration can fail (for example when its bounded
                 // queue is full).  The retry ticket was republished before
@@ -614,15 +633,18 @@ pub(crate) fn init() {
 }
 
 fn dispatch() {
-    if axruntime::klog::take_reader_notification() {
+    if klog::take_reader_notification() {
         crate::syscall::notify_syslog_readers();
-        // The framebuffer console reads the same ring through its own cursor,
-        // so the same edge that tells `/dev/kmsg` readers there is more log
-        // tells the screen too.
-        crate::pseudofs::dev::tty::fbcon::notify_log_mirror();
     }
-    if axruntime::klog::diagnostic_work_pending() {
+    // Each console is woken by the records it would itself print, so a machine
+    // with no serial port does not have its screen worker chasing work the
+    // screen will never show, and a console the operator has muted is not kept
+    // busy by a log it is not printing.
+    if serial_work_pending() {
         LOG_WORKER_WAKE.wake();
+    }
+    if screen_work_pending() {
+        crate::pseudofs::dev::tty::fbcon::notify_log_mirror();
     }
     // This generic scheduler hook is constant-time and allocation-free. Linux
     // inotify/fanotify/dnotify policy, VFS reclamation, and filesystem shutdown

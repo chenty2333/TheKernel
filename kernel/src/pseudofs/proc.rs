@@ -3337,12 +3337,35 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
             .ok_or(VfsError::InvalidInput)
     }
 
+    fn write_proc_u64(data: &[u8]) -> VfsResult<u64> {
+        str::from_utf8(data)
+            .ok()
+            .map(str::trim)
+            .and_then(|it| it.parse::<u64>().ok())
+            .ok_or(VfsError::InvalidInput)
+    }
+
     fn write_proc_usize(data: &[u8]) -> VfsResult<usize> {
         str::from_utf8(data)
             .ok()
             .map(str::trim)
             .and_then(|it| it.parse::<usize>().ok())
             .ok_or(VfsError::InvalidInput)
+    }
+
+    /// Authorize a write to one of the kernel log's global controls.
+    ///
+    /// These are global -- one write changes what every task's records do -- so
+    /// the authority has to be the live caller's, checked on every write rather
+    /// than once at open: a descriptor can have been opened by a privileged
+    /// process and handed to one that is not.
+    fn proc_write_needs_cap_syslog() -> VfsResult<()> {
+        let actor = current().as_thread().current_cred();
+        if actor.has_effective_capability(linux_raw_sys::general::CAP_SYSLOG) {
+            Ok(())
+        } else {
+            Err(VfsError::PermissionDenied)
+        }
     }
 
     fn write_proc_i32(data: &[u8]) -> VfsResult<i32> {
@@ -3867,12 +3890,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                             Ok(Some(out.into_bytes()))
                         }
                         SimpleFileOperation::Write(data) => {
-                            // This is a global control, authorized by the live
-                            // caller on every write, including inherited fds.
-                            let actor = current().as_thread().current_cred();
-                            if !actor.has_effective_capability(linux_raw_sys::general::CAP_SYSLOG) {
-                                return Err(VfsError::PermissionDenied);
-                            }
+                            proc_write_needs_cap_syslog()?;
                             if is_proc_truncate_write(data) {
                                 return Ok(None);
                             }
@@ -3885,13 +3903,111 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                 ),
             );
             kernel.add(
+                "printk",
+                SimpleFile::new_regular_with_permission(
+                    fs.clone(),
+                    NodePermission::from_bits_truncate(0o644),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            let mut out = String::new();
+                            out.try_reserve_exact(64).map_err(|_| VfsError::NoMemory)?;
+                            axruntime::klog::write_printk(&mut out).map_err(|_| VfsError::Io)?;
+                            Ok(Some(out.into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            proc_write_needs_cap_syslog()?;
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
+                            let mut fields = text.split_ascii_whitespace();
+                            // `proc_dointvec` over four ints: every field has to
+                            // be an integer, and Linux writes them into
+                            // `console_loglevel`, `default_message_loglevel`,
+                            // `minimum_console_loglevel` and
+                            // `default_console_loglevel`. Only the first is a
+                            // live thing here -- the other three are constants
+                            // of this kernel's log ABI, because a `log` record
+                            // always names its own level -- so they are
+                            // validated and then set aside rather than accepted
+                            // as changes they cannot cause.
+                            let loglevel = fields
+                                .next()
+                                .ok_or(VfsError::InvalidInput)?
+                                .parse::<u8>()
+                                .map_err(|_| VfsError::InvalidInput)?;
+                            if fields.any(|field| field.parse::<u8>().is_err()) {
+                                return Err(VfsError::InvalidInput);
+                            }
+                            // The range is 0..=255 rather than Linux's 1..=8
+                            // because `loglevel=0` and the `debug` parameter are
+                            // both real statements this kernel honors: 0 is a
+                            // console that shows nothing, and anything above the
+                            // highest priority shows everything.
+                            axruntime::klog::set_console_loglevel(loglevel);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
+                "printk_ratelimit_ms",
+                SimpleFile::new_regular_with_permission(
+                    fs.clone(),
+                    NodePermission::from_bits_truncate(0o644),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(format!(
+                            "{}\n",
+                            axruntime::klog::ratelimit_interval_ms()
+                        )
+                        .into_bytes())),
+                        SimpleFileOperation::Write(data) => {
+                            proc_write_needs_cap_syslog()?;
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            // Linux's `printk_ratelimit` counts in jiffies; this
+                            // kernel's clock says milliseconds and the file says
+                            // so in its name rather than making a reader guess
+                            // what `HZ` a hobby kernel has.
+                            let value = write_proc_u64(data)?;
+                            axruntime::klog::set_ratelimit_interval_ms(value);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
+                "printk_ratelimit_burst",
+                SimpleFile::new_regular_with_permission(
+                    fs.clone(),
+                    NodePermission::from_bits_truncate(0o644),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(format!(
+                            "{}\n",
+                            axruntime::klog::ratelimit_burst()
+                        )
+                        .into_bytes())),
+                        SimpleFileOperation::Write(data) => {
+                            proc_write_needs_cap_syslog()?;
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)?;
+                            axruntime::klog::set_ratelimit_burst(value);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
                 "log_stats",
                 SimpleFile::new_regular_with_permission(
                     fs.clone(),
                     NodePermission::from_bits_truncate(0o444),
                     || {
                         let mut out = String::new();
-                        out.try_reserve_exact(320).map_err(|_| VfsError::NoMemory)?;
+                        out.try_reserve_exact(512).map_err(|_| VfsError::NoMemory)?;
                         axruntime::klog::write_stats(&mut out).map_err(|_| VfsError::Io)?;
                         Ok(out.into_bytes())
                     },

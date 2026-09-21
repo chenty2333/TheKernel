@@ -2,6 +2,7 @@ use alloc::{format, string::String, vec, vec::Vec};
 use core::{
     ffi::c_char,
     mem::{align_of, offset_of, size_of},
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 use axerrno::{AxError, AxResult};
@@ -708,6 +709,13 @@ use tk_linux_syslog::{
 
 static SYSLOG_READ_LOCK: Mutex<()> = Mutex::new(());
 static SYSLOG_CURSORS: Mutex<SyslogCursors> = Mutex::new(SyslogCursors { read: 0, clear: 0 });
+/// `saved_console_loglevel`: the level `SYSLOG_ACTION_CONSOLE_OFF` replaced, or
+/// [`linux_syslog::Console::NONE`] when no OFF is in effect.
+///
+/// This belongs to the syscall and not to the log: the live level is consulted
+/// per record by the consoles and so lives with the ring, but the value OFF
+/// stashes away is only ever read back by ON, which is a `syslog(2)` fact.
+static SYSLOG_CONSOLE_SAVED: AtomicU8 = AtomicU8::new(linux_syslog::Console::NONE);
 
 static SYSLOG_READERS: event_listener::Event = event_listener::Event::new();
 
@@ -795,9 +803,15 @@ fn syslog_plan(
     privileged: bool,
     cursors: SyslogCursors,
 ) -> AxResult<SyslogPlan> {
-    linux_syslog::plan(action, buf_present, len, privileged, cursors).map_err(|error| match error {
-        SyslogPlanError::InvalidArgument => AxError::InvalidInput,
-        SyslogPlanError::PermissionDenied => AxError::OperationNotPermitted,
+    let console = linux_syslog::Console {
+        loglevel: axruntime::klog::console_loglevel(),
+        saved: SYSLOG_CONSOLE_SAVED.load(Ordering::Acquire),
+    };
+    linux_syslog::plan(action, buf_present, len, privileged, cursors, console).map_err(|error| {
+        match error {
+            SyslogPlanError::InvalidArgument => AxError::InvalidInput,
+            SyslogPlanError::PermissionDenied => AxError::OperationNotPermitted,
+        }
     })
 }
 
@@ -825,12 +839,12 @@ pub fn sys_syslog<M: UserMemory + ?Sized>(
     let plan = syslog_plan(action, !buf.is_null(), len, privileged, cursors)?;
     match plan {
         SyslogPlan::Noop => Ok(0),
-        SyslogPlan::Console { enabled } => {
-            axruntime::klog::set_console_enabled(enabled);
-            Ok(0)
-        }
-        SyslogPlan::ConsoleLevel(level) => {
-            axruntime::klog::set_console_threshold(level);
+        // The plan returns the whole next console state, including the value
+        // OFF saved or ON cleared, so the commit here needs no knowledge of
+        // which of the three actions produced it.
+        SyslogPlan::Console(next) => {
+            axruntime::klog::set_console_loglevel(next.loglevel);
+            SYSLOG_CONSOLE_SAVED.store(next.saved, Ordering::Release);
             Ok(0)
         }
         SyslogPlan::Clear => {

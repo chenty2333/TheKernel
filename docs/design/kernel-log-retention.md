@@ -1,7 +1,7 @@
 # Kernel Log Retention — What Is Kept, What Can Be Lost, and Why
 
 **Branch:** `fix/klog-loss` · **Base:** `feat/intel-stage2` (`72330088`)
-**Problem:** a boot burst reached `/dev/kmsg` and the screen but only part of it
+**Problem:** a boot burst reached the ring readers -- `dmesg` and the screen -- but only part of it
 reached the serial log, so the same boot looked like two different boots
 depending on where you read it.  `intel-klog-check.py` showed it directly: the
 guest's own `cat /sys/kernel/debug/dri/0/intel_gpu` printed all nine report
@@ -20,14 +20,22 @@ One producer path and four readers, all in `crates/ax/tk-axruntime/src/klog.rs`:
 
 | Piece | What it is |
 |---|---|
-| `STORE` ring | `CAPACITY` = 64 KiB of record text, byte-addressed, wrapping. `oldest`/`end` are byte cursors; `retention_bytes_overwritten` in `/proc/sys/kernel/log_stats` reports `oldest`, i.e. how much text the ring has dropped off its front. |
+| `STORE` ring | `CAPACITY` = 256 KiB of record text, byte-addressed, wrapping, and a mark byte beside every text byte (§3), so the structure is twice `CAPACITY` and lives in `.data`. `oldest`/`end` are byte cursors; `retention_bytes_overwritten` in `/proc/sys/kernel/log_stats` reports `oldest`, i.e. how much text the ring has dropped off its front. A measured boot writes about 25 KiB of that, so ten boots fit before the front is overwritten. |
 | `Text` | One formatted record, at most `RECORD_BYTES` = 1024 bytes, always newline-terminated. The terminating newline is not the record delimiter, and the text inside one may contain newlines of its own (§6). A longer record is cut and marked ` [truncated]`, counted as `records_truncated`. |
-| producers | `Logger::log`, `diagnostic()` and `record()` (the `ax_print` path). A per-CPU bit (`PRODUCING`) keeps a CPU from re-entering the path. |
-| readers | `snapshot_into` / `available_from` for `syslog(2)`+`/dev/kmsg`, the framebuffer console mirror, the early boot screen (`try_snapshot_into`, which refuses rather than waits so a panic cannot hang), and the diagnostic console (`DiagnosticDrain`, the serial port the boot probe selected -- COM2 under QEMU). |
+| consoles | Two, each a `Console`: the serial port the boot probe selected, and the framebuffer screen once it installs. What is per-console is existence (`supported`), a reader that has retired, and the `secured`/`lost` pair -- so the ring counts a lost record per console. What is not is the level: `console_loglevel` is one number every console compares against, exactly as in Linux, and `quiet`/`debug`/`loglevel=N`/`dmesg -n`/`/proc/sys/kernel/printk` all move that one. A record's `<N>` leader and its mark carry the same 3-bit priority; the consoles compare against the priority, never against the text. |
+| producers | `Logger::log`, `diagnostic()`/`diagnostic_at()` and `record()` (the `ax_print` path). A per-CPU bit (`PRODUCING`) keeps a CPU from re-entering the path. `Logger::log` is the only producer that consults the capture filter and the rate limits; a boot diagnostic is never suppressed. |
+| readers | `snapshot_into` / `available_from` for `syslog(2)`, the early boot screen (`try_snapshot_into`, which refuses rather than waits so a panic cannot hang), and the two consoles through `ConsoleDrain::{new, drain_with}` -- `drain_serial_once` for the UART. The byte-stream readers show the ring as kept; only a `ConsoleDrain` applies a level, because skipping a record needs the mark, not the text. |
 
-The ring is the log.  `kernel.log` on the host is the **diagnostic console**
-output, not a copy of the ring: it is whatever `DiagnosticDrain` wrote to the
-UART.  That distinction is what the original symptom was hiding in.
+The ring is the log.  `kernel.log` on the host is the **serial console**
+output, not a copy of the ring: it is whatever `ConsoleDrain(Serial)` wrote to
+the UART.  That distinction is what the original symptom was hiding in.
+
+Two decisions, deliberately different in strength: **retention** is
+unconditional for `error`/`warn`/`info` and capped per target only in the
+`debug` band (and capped per call site and globally there, by the rate limits);
+**printing** is each console's level, decided from the record's priority when
+the console reads it.  A console that is quiet, muted, or behind loses nothing
+unless the ring itself wraps over what it had not secured.
 
 ## 2. The loss, measured, one path at a time
 
@@ -56,7 +64,7 @@ dropped record to the line of code that dropped it:
 
 | Path | Drops per boot | What it cost |
 |---|---|---|
-| `Store::append` refusing a record because the **console's 64-record queue** was full | 6, 7, 7 | the reported symptom.  The record stayed in the ring, so `/dev/kmsg` and the screen had it and the serial log did not. |
+| `Store::append` refusing a record because the **console's 64-record queue** was full | 6, 7, 7 | the reported symptom.  The record stayed in the ring, so `dmesg` and the screen had it and the serial log did not. |
 | `allowed()` — `FILTER.try_lock()` failing | 52, 81, 129 | one record above the capture level in one boot; the rest were `trace` records the filter rejects anyway (98% of all `log()` calls are below the capture level). |
 | `producer_guard()` — a nested producer on a CPU already inside the path | 0–4 | in the one boot whose drop carried its real level, a `trace` record. |
 | `append()` — `STORE.try_lock()` failing | 0 in every boot | never fired here: only accepted records take the ring lock.  Nothing bounds it, so it was fixed as well. |
@@ -64,8 +72,8 @@ dropped record to the line of code that dropped it:
 Two of the candidates in the original brief were checked and are not the cause:
 `records_truncated` was 0 in every boot (no 1024-byte truncation), and
 `retention_bytes_overwritten` was 0 (the ring never wrapped; the whole log is
-about 25 KiB of the 64 KiB).  `log::set_max_level(Trace)` is set in `init`, and
-the debugfs file — which is built from the retained `ProbeReport`, not the log —
+about 25 KiB of the 64 KiB the ring then held).  `log::set_max_level(Trace)` was set in `init`
+then, and the debugfs file — which is built from the retained `ProbeReport`, not the log —
 was complete in every boot, which is the control that proves the code ran.
 
 The console queue was the interesting one because it was *not* a ring problem at
@@ -80,7 +88,7 @@ true, and beside the point: it cost console bytes, permanently.
 ## 3. The fix
 
 **The console is now a reader of the ring, not a second copy of it.**  It keeps
-a byte cursor (`DiagnosticDrain::cursor`) and copies a record out only when it
+a byte cursor (`ConsoleDrain::cursor`) and copies a record out only when it
 is about to print it, so a console that is behind costs nothing: the text is
 still in the ring.  The record's priority — needed by the console level filter,
 and not present in arbitrary `diagnostic()` text — is kept in a
@@ -88,6 +96,8 @@ and not present in arbitrary `diagnostic()` text — is kept in a
 marking a record's first byte.  The copy queue and `LOST_DIAGNOSTICS` are gone:
 64 KiB of marks replaces the 64 x 1048-byte queue of copies, and the hand-over
 slots add 4 x 1048 bytes, so the log's static footprint grows by 2656 bytes.
+(A mark per text byte, so the marks array is `CAPACITY` bytes and grew with the
+ring's later move from 64 KiB to 256 KiB.)
 
 Two consequences worth stating:
 
@@ -138,7 +148,7 @@ refuse.
 
 ## 5. What can still be lost
 
-* **Ring wrap.**  More than 64 KiB of unread records and the front is
+* **Ring wrap.**  More than `CAPACITY` of unread records and the front is
   overwritten.  `retention_bytes_overwritten` reports it, and
   `diagnostic_records_dropped` counts the records the console in particular
   never printed.
@@ -148,6 +158,14 @@ refuse.
 * **A second nested record in one window.**  One slot per CPU; the second is
   refused and counted.  This needs two records produced on one CPU while a
   third is inside the producer path.
+* **A rate-limited record.**  Only the `debug` band is limited, and what a
+  closed window refused is announced by the record that reopens it and counted
+  in `messages_suppressed`, so a suppression is distinguishable from a kernel
+  that stayed quiet.  Not a loss of the `error`/`warn`/`info` band: nothing
+  of priority 0, 1 or 2 is ever refused.
+* **A record a console's level mutes.**  Not a loss and not counted as one: the
+  console secures the record as read, so the ring keeps nothing it is owed, and
+  `dmesg` still has it.
 * **Records the capture filter rejects.**  Not a loss: the level is a decision,
   and it is recorded in `/proc/sys/kernel/log_filter`.
 
@@ -224,7 +242,7 @@ the ring, silently, on the one reader that feeds `kernel.log`.
 What is not covered here: the measurement above is a host test suite plus one
 `--net-igc` boot.  No measured boot has produced a record of exactly
 `RECORD_BYTES` (`records_truncated` is 0 in every boot), so the maximal-record
-case is a host test only, and neither the `syslog(2)`/`/dev/kmsg` reader nor the
+case is a host test only, and neither the `syslog(2)` reader nor the
 framebuffer mirror was measured against a multi-line record on a boot.
 
 ## 7. Checking it by hand
@@ -238,7 +256,7 @@ cat /proc/sys/kernel/log_stats
 
 `records_dropped` should be 0.  `diagnostic_records_dropped` should be 0 unless
 the console fell more than a ring behind.  `retention_bytes_overwritten` should
-be 0 unless the boot logged more than 64 KiB.
+be 0 unless the boot logged more than `CAPACITY`.
 
 The measurement used here is
 `/home/ava/.cache/thekernel-targets/klog-loss/klog-measure.py <worktree> <state> <tag>`,
@@ -252,7 +270,7 @@ with the ones that reached the host-side `kernel.log`.
   the diagnostic console is absent and `diagnostic_supported` is 0 — the ring
   and the framebuffer mirror are the whole story there.  The console path this
   document measures is the QEMU one.
-* The `syslog(2)`/`/dev/kmsg` and framebuffer readers were not part of the
+* The `syslog(2)` and framebuffer readers were not part of the
   measurement beyond `dmesg`; they were already cursor readers and are
   unchanged.
 * Contention on the two locks is exercised by host tests with a helper thread

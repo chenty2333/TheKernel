@@ -946,7 +946,16 @@ def fbcon_readable_lines() -> tuple[QmpConsoleLine, ...]:
         QmpConsoleLine("guest userspace: KTAP banner", font.cells("KTAP version 1")),
         QmpConsoleLine("guest userspace: the gated marker line",
                        font.cells("# THEKERNEL_TEST_BEGIN 1 mounts")),
-        QmpConsoleLine("kernel log mirror: task entry", font.cells("Enter user space: ip=0x")),
+        # A record the mirror brought to the screen, which is the half of the
+        # proof the two lines above cannot give.  Two things narrow the choice
+        # to nearly one line: the gate fires at the first test marker, and the
+        # panel holds 50 rows, so the record has to be one of the last the boot
+        # says -- `Initialize alarm...` is, and the very first retained record
+        # (`Logging is enabled.`) scrolled off long before the gate.  And it has
+        # to be a record the default capture level keeps, which rules out every
+        # per-operation line: those are `debug` by design, and a suite that
+        # waited on one would never settle.
+        QmpConsoleLine("kernel log mirror: boot alarm init", font.cells("Initialize alarm")),
     )
 
 

@@ -98,6 +98,10 @@ class KernelCrashLineRuleTests(unittest.TestCase):
             "[    0.006120] Unhandled #PF @ 0x0000000000425678, code=0x00000002",
             "[    0.006120] #GP @ 0x00000000004261a8, code=0x00000000",
             "[    0.006120] Unhandled interrupt 0x20 at 0x00000000004261a8",
+            # `axruntime::klog::fatal`, which writes the console line itself
+            # because the caller stops the CPU without returning.
+            "TheKernel fatal: fatal process-exit invariant failure at "
+            "kernel/src/task/ops.rs:2313: No such process",
         ):
             with self.subTest(line=line):
                 self.assertIsNotNone(_crash_line(line))
@@ -120,6 +124,9 @@ class KernelCrashLineRuleTests(unittest.TestCase):
             # side of the comparison is data about Linux, not this guest dying;
             # the prefix disqualifies it here.
             "THEKERNEL_abi_INNER: Kernel panic - not syncing: Attempted to kill init!",
+            # The rule is anchored: a guest that names the death notice in a test
+            # title is reporting about the kernel, not the kernel reporting.
+            "ok 6 - TheKernel fatal: appears in a case name",
         ):
             with self.subTest(line=line):
                 self.assertIsNone(_crash_line(line))

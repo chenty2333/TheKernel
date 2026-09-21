@@ -514,16 +514,12 @@ pub(crate) fn install() {
 /// Bytes of kernel log copied into the cell grid per pass.
 ///
 /// The ring retains up to 64 KiB, so the first pass after installation is a
-/// replay of the whole retained boot log.  Reading it in bounded chunks keeps
+/// replay of the whole retained boot log.  Reading it in bounded passes keeps
 /// one pass from holding the console lock while it walks the entire ring.
-const LOG_MIRROR_CHUNK: usize = 512;
-
-/// Chunks one pass copies before returning to the worker loop.
-///
 /// Eight KiB is more than a screen can show but far less than the ring, so a
-/// caught-up mirror still finishes the pass promptly and an overrun cannot
-/// monopolise the worker.
-const LOG_MIRROR_CHUNKS_PER_PASS: usize = 16;
+/// caught-up mirror still finishes promptly and an overrun cannot monopolise
+/// the worker.
+const LOG_MIRROR_PASS_BYTES: usize = 8 * 1024;
 
 /// How long a pass which exhausted its budget waits before reading again.
 const LOG_MIRROR_SATURATED_INTERVAL: Duration = Duration::from_millis(33);
@@ -549,30 +545,34 @@ pub(crate) fn notify_log_mirror() {
 
 /// Mirrors the kernel log into the active virtual console.
 ///
-/// The ring is read through a cursor rather than through the diagnostic
-/// record queue, which makes the screen independent of the serial sink in
-/// both directions: a machine with no serial port still shows the log, and a
-/// serial port which has stopped accepting bytes cannot hold the screen back.
-/// Starting the cursor at zero replays every retained byte, so the messages
-/// printed before this console existed -- everything a serial-less machine
-/// sent to a UART that is not there -- appear on the screen rather than being
-/// lost.  Only bytes the ring has already overwritten are missed.
+/// The screen is a console of its own: it announces itself to the log layer,
+/// which is what gives it a place in the ring's accounting -- the records it was
+/// shown, and the ones the ring overwrote before it could show them.  That is
+/// what lets an operator quiet the serial port without quieting the screen, and
+/// the other way round.
 ///
-/// The cost of that independence is that the screen shows every retained
-/// byte, not only the records the console threshold would have admitted.  The
-/// ring stores no per-record level, so a filtered mirror is not possible from
-/// here; and on a machine whose only console is the screen, filtering it is
-/// what makes a failed boot undiagnosable.  Console level control therefore
-/// keeps its existing meaning for the serial sink alone.
+/// Starting the reader at offset zero replays every retained record, so the
+/// messages produced before this console existed appear on the screen rather
+/// than being lost.  Only records the ring has already overwritten are missed,
+/// and `log_stats` counts them per console.
 pub(crate) fn install_log_mirror() {
     if LOG_MIRROR_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
+    // Until a reader exists the screen shows nothing, so the log layer owes it
+    // nothing either; announcing it is what starts both.
+    axruntime::klog::set_console_supported(axruntime::klog::ConsoleId::Screen, true);
     if axtask::try_spawn_with_name(log_mirror_worker, "fbcon-log".into()).is_err() {
         // The screen still works for whatever userspace writes to it; only the
-        // kernel's own log would be missing, so report and carry on.
+        // kernel's own log would be missing, so report and carry on.  Withdraw
+        // the console rather than leave the ring counting a debt to a reader
+        // that will never arrive; a later `install` can announce it again.
         LOG_MIRROR_STARTED.store(false, Ordering::Release);
-        warn!("Failed to start the kernel-log console mirror");
+        axruntime::klog::set_console_supported(axruntime::klog::ConsoleId::Screen, false);
+        // Priority 2, not 4: this is the last thing the screen will ever say
+        // about not saying things. It has to beat `quiet`, because a serial-less
+        // box whose only console has just died has no other way to report it.
+        warn!("\x012Failed to start the kernel-log console mirror");
     }
 }
 
@@ -584,35 +584,41 @@ pub(crate) fn install_log_mirror() {
 /// repaints from these cells.  Dropping the bytes instead would leave a hole
 /// in the log that returning to text could not fill.
 fn log_mirror_worker() {
-    let mut cursor = 0u64;
+    let mut drain = axruntime::klog::ConsoleDrain::new(axruntime::klog::ConsoleId::Screen);
     loop {
-        if mirror_new_log_bytes(&mut cursor) {
-            // The ring grew at least as fast as this pass could read it, so
-            // the wake below -- which is level-triggered on a non-empty ring
-            // -- would return at once and the worker would spin.  Nothing
-            // legitimate produces log faster than a console can show it, so
-            // pace the pass instead of waiting on an edge that is already
-            // set; a console which is somehow logging climbs at a reading
-            // pace rather than pinning a CPU.
+        if mirror_new_log_bytes(&mut drain) {
+            // The ring grew at least as fast as this pass could read it, so the
+            // wake below -- which is level-triggered on a ring the console has
+            // not reached -- would return at once and the worker would spin.
+            // Nothing legitimate produces log faster than a console can show it,
+            // so pace the pass instead of waiting on an edge that is already
+            // set; a console which is somehow logging climbs at a reading pace
+            // rather than pinning a CPU.
             let _ = axtask::sleep(LOG_MIRROR_SATURATED_INTERVAL);
             continue;
         }
         // Re-check after registering, so a record appended between the drain
         // above and this wait cannot leave the mirror asleep with work to do.
+        // The cursor this asks about is the drain's own, so a record the
+        // console's level mutes counts as reached -- which is right: the screen
+        // has seen it, it was just not told to show it.
         if let Err(error) = block_on_poll_set_uninterruptible(&LOG_MIRROR_WAKE, || {
-            if axruntime::klog::available_from(cursor) != 0 {
+            if axruntime::klog::available_from(drain.cursor()) != 0 {
                 Ok(())
             } else {
                 Err(AxError::WouldBlock)
             }
         }) {
-            warn!("Kernel-log console mirror stopped: {error}");
+            // As above: the screen's only reader stopping is machine health, and a
+            // warning level would be silenced by the very quietness it explains.
+            warn!("\x012Kernel-log console mirror stopped: {error}");
             return;
         }
     }
 }
 
-/// Copies everything the ring has retained since `cursor` into the console.
+/// Copies one pass's budget of records into the console, and reports whether the
+/// pass spent that budget.
 ///
 /// **Nothing on this path may log.**  The mirror is a reader of the ring it
 /// writes the console from, so a record produced here would be read back and
@@ -621,33 +627,39 @@ fn log_mirror_worker() {
 /// faster than it can be read.  `the_console_write_path_does_not_log` in this
 /// module's tests is what holds that down; the guard below only keeps a second
 /// caller from racing this one over the same cursor.
-fn mirror_new_log_bytes(cursor: &mut u64) -> bool {
+fn mirror_new_log_bytes(drain: &mut axruntime::klog::ConsoleDrain) -> bool {
     if LOG_MIRROR_WRITING.swap(true, Ordering::AcqRel) {
         return false;
     }
-    let mut bytes = [0u8; LOG_MIRROR_CHUNK];
-    let mut chunks = 0;
-    while chunks < LOG_MIRROR_CHUNKS_PER_PASS {
-        let (count, next) = axruntime::klog::snapshot_into(*cursor, &mut bytes, false);
-        if count == 0 {
-            break;
+    let mut copied = 0;
+    while copied < LOG_MIRROR_PASS_BYTES {
+        match drain.drain_with(write_log_bytes) {
+            0 => break,
+            written => copied += written,
         }
-        *cursor = next;
-        // Kernel logs bypass termios, so apply their CRLF presentation here,
-        // not in the VT parser used by raw-mode applications.
-        let mut start = 0;
-        for (index, byte) in bytes[..count].iter().enumerate() {
-            if *byte == b'\n' {
-                write_active(&bytes[start..index]);
-                write_active(b"\r\n");
-                start = index + 1;
-            }
-        }
-        write_active(&bytes[start..count]);
-        chunks += 1;
     }
     LOG_MIRROR_WRITING.store(false, Ordering::Release);
-    chunks == LOG_MIRROR_CHUNKS_PER_PASS
+    copied >= LOG_MIRROR_PASS_BYTES
+}
+
+/// Put one record's bytes into the active virtual console.
+///
+/// Kernel logs bypass termios, so their CRLF presentation is applied here, not
+/// in the VT parser used by raw-mode applications.  Taking a whole record and
+/// reporting all of it written is what makes the mirror a *console* rather than
+/// a queue: a record the screen cannot keep up with stays in the ring, and one
+/// its level mutes never reaches these cells at all.
+fn write_log_bytes(bytes: &[u8]) -> usize {
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            write_active(&bytes[start..index]);
+            write_active(b"\r\n");
+            start = index + 1;
+        }
+    }
+    write_active(&bytes[start..]);
+    bytes.len()
 }
 
 fn console_window_size(width: usize, height: usize) -> super::terminal::WindowSize {
@@ -855,25 +867,39 @@ mod tests {
         // empty would never return.  Bounding the pass is what turns that into
         // a paced worker instead of a spin, and the saturated flag is what
         // tells the worker to pace itself.
-        let mut cursor = ring_end();
+        //
+        // A screen console exists only once its reader has announced it; this
+        // test drives the reader directly, so it announces it here.
+        axruntime::klog::set_console_supported(axruntime::klog::ConsoleId::Screen, true);
         // More than one pass can carry, so the pass must stop at its budget.
-        for line in 0..(LOG_MIRROR_CHUNK * (LOG_MIRROR_CHUNKS_PER_PASS + 4) / 24) {
+        for line in 0..(LOG_MIRROR_PASS_BYTES * 2 / 24) {
             axruntime::klog::record(alloc::format!("saturate the ring {line:08}\n").as_bytes());
         }
         assert!(
-            axruntime::klog::available_from(cursor) > LOG_MIRROR_CHUNK * LOG_MIRROR_CHUNKS_PER_PASS,
+            axruntime::klog::available_from(0) > LOG_MIRROR_PASS_BYTES,
             "the ring did not hold more than one pass"
         );
 
+        // A reader starts where the console starts: at the beginning of what the
+        // ring still holds, which is what replays a boot the screen missed.
+        let mut drain = axruntime::klog::ConsoleDrain::new(axruntime::klog::ConsoleId::Screen);
         assert!(
-            mirror_new_log_bytes(&mut cursor),
+            mirror_new_log_bytes(&mut drain),
             "a full pass must report that it was saturated"
         );
 
         // Once drained the flag clears, so the worker goes back to sleeping on
-        // the wake edge rather than polling.
-        let mut drained = ring_end();
-        assert!(!mirror_new_log_bytes(&mut drained));
+        // the wake edge rather than polling.  The retry loop is bounded so a
+        // pass that never reports saturation fails the test rather than hanging
+        // the suite.
+        let mut saturated = true;
+        for _ in 0..32 {
+            saturated = mirror_new_log_bytes(&mut drain);
+            if !saturated {
+                break;
+            }
+        }
+        assert!(!saturated, "the mirror never caught up with the ring");
     }
 
     #[test]

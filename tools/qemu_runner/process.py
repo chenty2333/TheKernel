@@ -81,6 +81,11 @@ _KERNEL_CRASH_RE = re.compile(
     # -- and its payload for a CPU fault is one of the strings below, from
     # `crates/ax/tk-axcpu/src/x86_64/trap.rs:26,36,64,69,78,90`.
     r"|panicked at "
+    # `axruntime::klog::fatal`: the machine's own death notice, written to the
+    # diagnostic console by a call site that is about to power the CPU off. It is
+    # not a panic and says so, but a run that ends in it has ended in the kernel
+    # refusing to continue, which is the verdict this rule exists to report.
+    r"|TheKernel fatal: "
     r"|Unhandled (?:kernel )?#[A-Z]{2} @"        # trap.rs:26, :36, :64, :78
     r"|#GP @ "                                   # trap.rs:69
     r"|Unhandled (?:[Ee]xception|[Ii]nterrupt) " # trap.rs:90; x86 trap stubs

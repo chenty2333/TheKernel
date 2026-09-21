@@ -1052,14 +1052,17 @@ static void io_suite(unsigned iterations, const char *path)
 /* Opt-in guest regression: real proc controls and syscall-generated records. */
 #define DIAGNOSTICS_FILTER "/proc/sys/kernel/log_filter"
 #define DIAGNOSTICS_STATS "/proc/sys/kernel/log_stats"
-#define DIAGNOSTICS_BYTES (64U * 1024U)
+#define DIAGNOSTICS_BURST "/proc/sys/kernel/printk_ratelimit_burst"
+#define DIAGNOSTICS_BYTES (256U * 1024U)
 static char diagnostics_saved_filter[2048];
 static int diagnostics_restore_filter;
 static int diagnostics_console_disabled;
+static char diagnostics_saved_burst[32];
+static int diagnostics_restore_burst;
 
-static int diagnostics_write_filter(const char *text)
+static int diagnostics_write_control(const char *path, const char *text)
 {
-    int fd = open(DIAGNOSTICS_FILTER, O_WRONLY | O_CLOEXEC);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     size_t len = strlen(text);
     ssize_t n = write(fd, text, len);
@@ -1069,11 +1072,19 @@ static int diagnostics_write_filter(const char *text)
     return closed;
 }
 
+static int diagnostics_write_filter(const char *text)
+{
+    return diagnostics_write_control(DIAGNOSTICS_FILTER, text);
+}
+
 static void diagnostics_cleanup(void)
 {
     if (diagnostics_restore_filter &&
         diagnostics_write_filter(diagnostics_saved_filter))
         perror("diagnostics restore log_filter");
+    if (diagnostics_restore_burst &&
+        diagnostics_write_control(DIAGNOSTICS_BURST, diagnostics_saved_burst))
+        perror("diagnostics restore printk_ratelimit_burst");
     /* The interface has no console-state query; re-enable it best effort. */
     if (diagnostics_console_disabled && syscall(SYS_syslog, 7, NULL, 0) < 0)
         perror("diagnostics restore console");
@@ -1189,7 +1200,18 @@ static void diagnostics(void)
                         "diagnostics bounded syslog capacity");
     if (syscall(SYS_syslog, 6, NULL, 0) < 0) fail("diagnostics console off");
     diagnostics_console_disabled = 1;
+    /* The debug band has a per-call-site budget, and the filter experiment above
+     * has already run syscalls through the narrow filter, so this call site's
+     * burst can be spent before the capture starts: a window is seconds long and
+     * the whole case fits inside one.  Raise the ceiling for the capture instead
+     * of asserting against a mechanism this case does not test. */
+    diagnostics_read_file(DIAGNOSTICS_BURST, diagnostics_saved_burst,
+                          sizeof(diagnostics_saved_burst));
+    diagnostics_restore_burst = 1;
+    if (diagnostics_write_control(DIAGNOSTICS_BURST, "65536\n"))
+        fail("diagnostics raise ratelimit burst");
     char *record = NULL;
+    long captured = 0;
     /* Capture waits for the ring and the filter rather than refusing a record
      * when another CPU holds either, so no record should be lost here; the
      * retry loop stays because a console control can land between the filter
@@ -1203,14 +1225,29 @@ static void diagnostics(void)
         long n = syscall(SYS_syslog, 3, retained, DIAGNOSTICS_BYTES);
         if (n < 0) fail("diagnostics read retained log");
         diagnostics_require(n <= DIAGNOSTICS_BYTES, "diagnostics syslog bound");
+        captured = n;
         retained[n] = '\0';
         char expected[256];
         snprintf(expected, sizeof(expected),
-                 " DEBUG target=tk_kernel::syscall module=tk_kernel::syscall] "
+                 " DEBUG target=tk_kernel::syscall] "
                  "Syscall getpid return Ok(%ld)", pid);
         record = strstr(retained, expected);
         if (record) break;
         if (sched_yield()) fail("diagnostics yield after dropped record");
+    }
+    if (!record) {
+        /* A missing record has at least four causes with different fixes -- the
+         * filter never admitted it, a budget refused it, the ring overwrote it,
+         * or its text or leader changed shape -- and the ring dump alone cannot
+         * tell them apart. Report what each one is measured by, then fail.
+         * Substring tests are on the *body*, which survives every priority and
+         * format change, so "body present, exact match absent" means formatting
+         * and "neither" means the record was never captured. */
+        char *loose = strstr(retained, "Syscall getpid return Ok(");
+        diagnostics_read_file(DIAGNOSTICS_STATS, stats, sizeof(stats));
+        fprintf(stderr,
+                "diagnostics capture: bytes=%ld body=%s stats: %s\n",
+                captured, loose ? "present" : "absent", stats);
     }
     diagnostics_require(record != NULL, "diagnostics retained structured syscall record");
     char *start = record;
@@ -1220,6 +1257,9 @@ static void diagnostics(void)
     char *tid = strstr(start, " tid=");
     diagnostics_require(cpu && cpu < record && tid && tid < record,
                         "diagnostics retained execution metadata");
+    if (diagnostics_write_control(DIAGNOSTICS_BURST, diagnostics_saved_burst))
+        fail("diagnostics restore ratelimit burst");
+    diagnostics_restore_burst = 0;
     if (diagnostics_write_filter(diagnostics_saved_filter))
         fail("diagnostics restore filter");
     diagnostics_restore_filter = 0;
