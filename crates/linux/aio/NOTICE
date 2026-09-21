@@ -1,0 +1,27 @@
+This package is a new extraction of Linux-visible native AIO admission and
+lifecycle policy designed for TheKernel and distributed under Apache-2.0. It
+is not a port of any upstream file: no Linux source file was translated,
+adapted, or restructured here.
+
+Linux sources were consulted to understand observable `io_setup`,
+`io_submit`, `io_getevents` and `io_cancel` argument acceptance, ring
+lifecycle, and the completion-publishing ordering a caller can detect. No
+other upstream was consulted for this package.
+
+Copied text: one short excerpt. Measured against the Linux 7.2.3 tree
+(whitespace-normalised lines of >= 40 characters inside fenced code blocks,
+matched line for line): 1 line in 1 block, in `src/lib.rs`; the same block
+holds 2 such lines at the inclusive >= 25-character threshold. It quotes three
+lines verbatim from Linux 7.2.3 `fs/aio.c:1783-1786` (the `mask` initialiser
+and the `vfs_poll()` guard inside `aio_poll_complete_work()`, with the blank
+line between them included in the range), which its surrounding prose already
+cites; the marker line above it now reads "Excerpt: Linux v7.2.3
+`fs/aio.c:1783-1786` - GPL-2.0-only, (C) The Linux Kernel Authors". Other
+`fs/aio.c` ranges named in this package (`:1777-1817`, `:1823-1837`,
+`:2248-2254`) are prose citations only, not copies.
+
+That fragment is GPL-2.0-only, (C) The Linux Kernel Authors. It is comment
+text, not code: no Linux code is linked, assembled, or compiled into this
+package, and the Apache-2.0 grant above does not extend to the quoted text.
+Nothing else in this package reproduces upstream source text. See
+`docs/upstream-provenance.md` for the full per-file index.

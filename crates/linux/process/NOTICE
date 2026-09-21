@@ -3,3 +3,38 @@ authored by 朝倉水希 and originally declared as MIT OR Apache-2.0.
 
 The included Apache-2.0 text was recovered from an immediate upstream
 follow-up commit.
+
+Linux is consulted for observable semantics, and this package quotes it.
+Measured against the Linux 7.2.3 tree with `scripts/ci/scan_linux_excerpts.py`,
+6 lines of at least 40 characters (13 lines at a 25-character threshold) in
+3 fenced blocks (5 at the lower threshold) reproduce Linux C verbatim, including
+comments: all 3 counted blocks are in `src/linux_abi.rs`, and the fourth and
+fifth appear at 25 characters — the other block in `src/linux_abi.rs` and the
+`kernel/exit.c` block at `src/wait.rs:51-55`, whose single quoted line is 38
+characters whitespace-free. Each block sits in prose that names the Linux file it
+came from, and
+where the cite gives a line range it is only the `kernel/fork.c`:2703-2711 and
+`:2011-2012` ranges in `src/linux_abi.rs`. The `fs/proc/array.c`,
+`include/uapi/linux/ptrace.h`, and `kernel/ptrace.c` blocks, and the
+`kernel/exit.c` block at `src/wait.rs:51-55`, are cited by file and function
+name with no line range — that block reproduces `kernel/exit.c:1371-1375`, with
+Linux's two-line comment re-flowed onto one line, and no cite in the file names
+that range. No block here carries the inline
+`Excerpt: Linux v7.2.3 <file>:<lines>` marker used by `net`, `mount`, `aio`, and
+`random`.
+
+Four further verbatim lines (eight at the 25-character threshold) sit outside
+fenced blocks, in `//` comments of `src/linux_abi.rs`: 464, 465, 466 are the
+comment at `kernel/fork.c:2704-2706`, quoted by the block at `:463-471`, whose
+prose cites `kernel/fork.c`:2703-2711, and 790 is
+`include/uapi/linux/ptrace.h:186`, quoted by the block at `:786-790`
+and cited by file name only. At the 25-character threshold the same two hunks
+contribute 468, 469 (`kernel/fork.c:2708-2709`) and 787, 788
+(`include/uapi/linux/ptrace.h:182-183`). Adding the missing markers and ranges is
+a source-side follow-up owned by this package.
+
+Those C fragments are GPL-2.0-only, (C) The Linux Kernel Authors. They are
+documentation excerpts kept for provenance; no Linux code is linked, assembled,
+or compiled into this package, and neither the Apache-2.0 grant above nor the
+original MIT OR Apache-2.0 election extends to them. See
+`docs/upstream-provenance.md`.

@@ -1,6 +1,35 @@
 This package is a new extraction of Linux-visible memory-management policy
-contracts designed for TheKernel and distributed under Apache-2.0.
+contracts designed for TheKernel and distributed under Apache-2.0. The Rust
+implementation is original; it was written against Linux behaviour, not against
+Linux source.
 
 Linux, Zircon, and Asterinas sources were consulted to understand observable
-pin, invalidation, fault, and teardown contracts. No source text from those
-projects is copied into this package.
+pin, invalidation, fault, and teardown contracts.
+
+Copied text: this package does quote Linux. Measured against the Linux 7.2.3
+tree with `scripts/ci/scan_linux_excerpts.py`, 59 lines of at least 40 characters
+(111 lines at a 25-character threshold) in 21 fenced code blocks across 9 source
+files (`brk.rs`, `charge.rs`, `madvise.rs`, `memfd.rs`, `mempolicy.rs`, `mmap.rs`,
+`msync.rs`, `release.rs`, `userfaultfd.rs`) reproduce Linux C verbatim, including
+comments;
+`src/release.rs:132-158` is `mm/oom_kill.c:1205-1231` line for line. Each block
+is introduced by prose that names the Linux file it came from and either the
+enclosing function (`mm/mmap.c:check_brk_limits()`,
+`include/linux/mm.h:check_data_rlimit()`, `mm/vma.c:accountable_mapping()`) or a
+line range; only the range cites pin exact positions, and no block in this
+package carries the inline `Excerpt: Linux v7.2.3 <file>:<lines>` marker that
+`net`, `mount`, `aio`, and `random` use.
+One further verbatim line sits outside a fenced block:
+`src/tests.rs:231` (`next = vma_find(&vmi, newbrk + PAGE_SIZE + stack_guard_gap);`)
+is `mm/mmap.c:189`, quoted in a `//` comment at `src/tests.rs:229-232` that cites
+`mm/mmap.c:184-191`. At the 25-character threshold the scan adds three matches
+that are not excerpts at all — `src/mempolicy.rs:732`, `:838`, `:856` are the Rust
+identifier `MPOL_WEIGHTED_INTERLEAVE,` in a `for mode in [..]` test loop, which is
+byte-identical to a line of the same-named Linux enum but is compiled code here.
+No block in this package is marked, so `MPOL_WEIGHTED_INTERLEAVE` and the other
+uapi names this crate declares are ABI facts, not quoted text.
+
+Those C fragments are GPL-2.0-only, (C) The Linux Kernel Authors. They are
+documentation excerpts kept for provenance and review; no Linux code is
+linked, assembled, or compiled into this package, and the Apache-2.0 grant
+above does not extend to them. See `docs/upstream-provenance.md`.

@@ -3,4 +3,47 @@ lifecycle contracts designed for TheKernel and distributed under Apache-2.0.
 
 Linux, liburing, and Asterinas sources were consulted to understand observable
 ABI, memory-ordering, request, resource, completion, cancellation, and teardown
-contracts. No source text from those projects is copied into this package.
+contracts. No liburing or Asterinas source text is in this package; liburing was
+read for caller-side semantics only, and no liburing reference tree is recorded
+in this repository, so that statement is asserted rather than scanned.
+
+Copied text: this package does quote Linux. Measured against the Linux 7.2.3
+tree with `scripts/ci/scan_linux_excerpts.py` (whitespace-normalised lines of at
+least 40 characters, byte-identical to a Linux `*.c` line): 18 lines of verbatim
+Linux text in 2 files — 1 inside a fenced doc block and 17 in unfenced `//`
+comment blocks — and 25 such lines at the inclusive 25-character threshold, all
+24 of the additional ones outside fences.
+
+* `src/registration.rs:442-443` — the fenced block at `:441-444` quotes the
+  `io_uring_register()` blind-dispatch test as two Linux lines, of which only
+  `:443` is long enough to count; the pair is `io_uring/register.c:1031-1032`
+  in the 7.2.3 tree, and the prose cites say so (`:397`, `:446`) — earlier they
+  read `:1029-1030`, which is a different statement.
+* `src/registration.rs` — 16 more verbatim lines at the 40-character threshold,
+  all outside fenced blocks, in the `//` comment blocks above the per-opcode
+  checks: 278, 290, 304, 306, 345, 347, 373, 528, 625, 639, 660, 664, 667, 916,
+  939, 955. The 25-character threshold adds 7 in the same kind of block: 365,
+  524, 552, 556, 612, 751, 768. Each sits in a block whose prose cites the Linux
+  hunk it reproduces —
+  `io_uring/rsrc.c:428-429`, `:450-451`, `:464-465`, `:481-484`,
+  `io_uring/register.c:116-118`, `:201-235`, `:208-217`, `:224-235`, `:786-790`,
+  `:801-805`, `:825-829`, `:831-835`, `:872-876`, `:884-888`, `:890-894`,
+  `:959-961`, `:962-970`,
+  `io_uring/tctx.c:325-326`, `:384-385`, `io_uring/zcrx.c:1434-1437`,
+  `:1434-1439`, `io_uring/query.c:125-152`.
+  Those ranges were each read against the 7.2.3 tree this pass. The subset that
+  sits next to its own quotation is re-checked automatically by
+  `scripts/ci/audit_linux_range_cites.py`, which reports no miss in this package,
+  and pinned by `tests/ci/test_linux_excerpt_baseline.py`.
+* `src/sqe.rs:848` — one verbatim line inside the `io_init_req()` flag/def gate
+  list at `src/sqe.rs:842-849`, cited to `io_uring/io_uring.c:1749-1808`; the
+  line itself is `io_uring/io_uring.c:1807`.
+
+None of these carries the inline `Excerpt: Linux v7.2.3 <file>:<lines>` marker
+that `net`, `mount`, `aio`, and `random` use; adding it is a source-side
+follow-up owned by this package, not by the licence documents.
+
+Those fragments are GPL-2.0-only, (C) The Linux Kernel Authors. They are comment
+text, not code, and no Linux or liburing code is linked or compiled into this
+package, so the Apache-2.0 grant above does not extend to them. See
+`docs/upstream-provenance.md` for the whole-tree index.

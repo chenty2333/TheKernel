@@ -1,0 +1,40 @@
+This package is a new extraction of Linux-visible socket-address, ancillary
+data, and netlink ABI policy designed for TheKernel and distributed under
+Apache-2.0. It is not a port of any upstream file: no Linux source file was
+translated, adapted, or restructured here.
+
+Linux sources were consulted to understand observable sockaddr bounds
+checking, socket option and backlog semantics, UNIX and packet socket
+admission, rtnetlink and netlink multicast group contracts, and the
+sendmsg/recvmsg data-length rules. No other upstream (FreeBSD, NetBSD,
+Asterinas, musl) was consulted for this package.
+
+Copied text: Linux C is quoted verbatim in Rust doc comments as the
+observable-semantics authority. Measured against the Linux 7.2.3 tree with
+`scripts/ci/scan_linux_excerpts.py` (whitespace-normalised lines of >= 40
+characters inside fenced code blocks, matched line for line): 15 lines across
+11 blocks in 2 files - 7 blocks holding 11 lines in `src/lib.rs`, 4 blocks
+holding 4 lines in `src/msg.rs`. At the inclusive >= 25-character threshold the
+same 11 blocks hold 24 lines (18 in `src/lib.rs`, 6 in `src/msg.rs`); no block is
+new at that threshold, so the 9 extra lines are short ones - `case` labels and
+two-line guards - inside hunks the 40-character scan already counted.
+
+The cited hunks are `net/socket.c:251-252`, `net/core/sock.c:686-701`,
+`:641-643`, `:436-453`, `net/unix/af_unix.c:1468-1470`,
+`net/core/rtnetlink.c:7109-7112`, `net/netlink/af_netlink.c:1872-1873`,
+`:1218-1224` and, in the prose above that block, `:1389-1407` in `src/lib.rs`, and
+`net/packet/af_packet.c:3452-3454`, `net/ipv4/tcp.c:2680-2682`, `:1483-1485`
+and `include/net/sock.h:2751-2753` in `src/msg.rs` (the prose above that block
+cites the enclosing `sock_rcvlowat()` at `:2749-2754`). Every block carries an
+inline marker line, "Excerpt: Linux v7.2.3 <file>:<lines> - GPL-2.0-only,
+(C) The Linux Kernel Authors", in addition to the file-and-line citation its
+surrounding prose already gave: 12 marker lines over the 11 counted blocks, the
+extra one at `src/lib.rs:1053`, whose `af_netlink.c:1872-1873` hunk is made of
+lines under 25 characters and is therefore disclosed by its marker rather than
+by a scan count.
+
+Those fragments are GPL-2.0-only, (C) The Linux Kernel Authors. They are
+comment text, not code: no Linux code is linked, assembled, or compiled into
+this package, and the Apache-2.0 grant above does not extend to the quoted
+text. Nothing else in this package reproduces upstream source text. See
+`docs/upstream-provenance.md` for the full per-file index.

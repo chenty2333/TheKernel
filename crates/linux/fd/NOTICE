@@ -2,4 +2,24 @@ This package is derived from TheKernel FD, readiness, and epoll lifecycle work
 distributed under Apache-2.0.
 
 Linux and FreeBSD sources were consulted to understand observable behavior and
-architecture. No Linux or FreeBSD source text is copied into this package.
+architecture.
+
+Copied text: this package does quote Linux. Measured against the Linux 7.2.3
+tree with `scripts/ci/scan_linux_excerpts.py`, 13 lines of at least 40 characters
+(26 lines at a 25-character threshold) in 3 fenced blocks across 3 source files
+(`src/epoll.rs`, `src/pidfd.rs`, `src/setfl.rs`) reproduce Linux C, including
+comments, verbatim; at the 25-character threshold `src/pidfd.rs` splits into 2
+blocks, so that scan reports 4 blocks over the same 3 files. Every such block
+sits in prose that names the Linux file it came from,
+and where Linux gives a name it names that too
+(`kernel/signal.c:SYSCALL_DEFINE4(pidfd_send_signal, ...)`,
+`kernel/pid.c:pidfd_get_task()`, `fs/fcntl.c`, `fs/eventpoll.c`). None of these
+three cites gives a line range, and no block in this package carries the inline
+`Excerpt: Linux v7.2.3 <file>:<lines>` marker that `net`, `mount`, `aio`, and
+`random` use; adding the ranges and markers is a source-side follow-up owned by
+this package.
+
+Those C fragments are GPL-2.0-only, (C) The Linux Kernel Authors. They are
+documentation excerpts kept for provenance; no Linux code is linked, assembled,
+or compiled into this package, and the Apache-2.0 grant above does not extend
+to them. See `docs/upstream-provenance.md`.

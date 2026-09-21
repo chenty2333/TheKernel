@@ -1,0 +1,46 @@
+This package is a new extraction of Linux-visible fanotify and inotify admission
+policy designed for TheKernel and distributed under Apache-2.0. It is not a port
+of any upstream file: no Linux source file was translated, adapted, or
+restructured here.
+
+Linux sources were consulted to understand observable `fanotify_init()` flag
+grammar, `fanotify_mark()` mask and scope admission, the capability domain a
+mark is checked in, watch-descriptor queue limits, and the errno each rejection
+returns.
+
+Copied text: Linux C is quoted verbatim in Rust comments as the
+observable-semantics authority. Measured against the Linux 7.2.3 tree with
+`scripts/ci/scan_linux_excerpts.py` (whitespace-normalised lines of at least 40
+characters, matched line for line,
+inside `crates/linux/fsnotify/**`): 3 lines, 5 at the inclusive
+25-character threshold, all in `src/lib.rs`. None of them sits inside a fenced
+code block, so a fence-restricted scan reports this package as clean; the lines
+are:
+
+* `src/lib.rs:471` — `fanotify_user.c:1996`, inside the unfenced
+  `///` decision list at `:463-474` introduced by prose naming
+  `do_fanotify_mark()` with no file or line cite.
+* `src/lib.rs:501` (`:500` at the 25-character threshold) —
+  `fanotify_user.c:1961-1962`, inside the `//` block at
+  `:497-502`, which does cite `fs/notify/fanotify/fanotify_user.c:1958-1963`.
+* `src/lib.rs:548` — `fanotify_user.c:1803`, inside the `//` block at
+  `:545-551` introduced by prose naming `fanotify_events_supported()` with no
+  file or line cite.
+* `src/lib.rs:599` — `fanotify_user.c:1655`, 37 characters whitespace-free so a
+  40-character scan cannot see it, inside the unfenced `///` grammar
+  list at `:592-601`, whose prose cites `fs/notify/fanotify/fanotify_user.c` by
+  file only.
+
+No block in this package carries the inline
+`Excerpt: Linux v7.2.3 <file>:<lines> - GPL-2.0-only,
+(C) The Linux Kernel Authors` marker that `net`, `mount`, `aio`, and `random`
+use, and only one of the four sites states a line range. Moving these quotes
+into fenced blocks with the marker and the ranges above is a source-side
+follow-up owned by this package.
+
+Those fragments are GPL-2.0-only, (C) The Linux Kernel Authors. They are
+comment text, not code: no Linux code is linked, assembled, or compiled into
+this package, and the Apache-2.0 grant above does not extend to the quoted
+text. Nothing else in this package reproduces upstream source text; a scan down
+to 20-character lines finds no further Linux line anywhere in this crate. See
+`docs/upstream-provenance.md` for the full per-file index.

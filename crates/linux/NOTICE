@@ -2,8 +2,56 @@ TheKernel Linux ABI
 Copyright 2026 TheKernel contributors
 
 The usercopy crate is derived from the StarryOS `starry-vm` crate authored by
-朝倉水希 and Mivik.
+朝倉水希 and Mivik; `crates/linux/usercopy/NOTICE` states the version it names
+and that the upstream revision is not recorded.
 
-The MM crate is a new Apache-2.0 policy extraction. Linux, Zircon, and
-Asterinas snapshots were consulted for observable contracts; no source text
-from those projects is copied into this workspace.
+The MM crate is a new Apache-2.0 policy extraction, written against Linux
+behaviour; its own `crates/linux/mm/NOTICE` records that the package still
+quotes 59 verbatim Linux lines in 21 fenced blocks, and which other projects
+were consulted for observable contracts. No reference tree for Zircon,
+Asterinas, FreeBSD, gVisor, liburing, or libpcap is recorded in this repository,
+so none of those consultations can be scanned here — see the last paragraph.
+
+Excerpt policy for this directory, stated exactly
+-------------------------------------------------
+
+This workspace does reproduce Linux source text. Excerpts of Linux v7.2.3 C and
+comments — GPL-2.0-only, (C) The Linux Kernel Authors — are quoted verbatim in
+Rust comments as the observable-semantics authority. They are documentation
+only: no Linux code is linked, assembled, or compiled here, and the Apache-2.0
+grant in the root `NOTICE` does not extend to the quoted text.
+
+The policy these excerpts are held to:
+
+* Every excerpt is attributed to the Linux file it came from, at or above the
+  block, and either by line range or by the enclosing Linux function
+  (`mm/mmap.c:check_brk_limits()`).
+* The inline marker line
+  `Excerpt: Linux v7.2.3 <file>:<lines> — GPL-2.0-only, (C) The Linux Kernel
+  Authors` is the required form for new excerpts. It is on every matched block in
+  `net`, `mount`, `aio`, and `random` — 18 of the 49 blocks this directory counts
+  at ≥ 40, and 20 of 59 at ≥ 25, from 21 marker lines (12 in `net`, 5 in `mount`,
+  3 in `random`, 1 in `aio`; three of those markers open no counted block because
+  their hunks are made of short lines). Of the 31 unmarked blocks, 1 is cited by
+  surrounding prose with a correct Linux line range and 30 name only the file and
+  the enclosing function. Every block, marked or not, is listed with its gap
+  flagged in `docs/upstream-provenance.md`.
+* Every package under `crates/linux/` that holds Linux source text carries a
+  `NOTICE` inventorying its hunks with measured line counts.
+
+Measured against the Linux 7.2.3 tree with the scan documented in
+`docs/upstream-provenance.md` (whitespace-normalised lines of at least 40
+characters, byte-identical to a Linux `*.c` or `*.h` line): 110 lines in 49
+fenced blocks across 20 files inside `crates/linux/**`, 211 lines in 59 blocks
+across 22 files at the inclusive ≥ 25-character threshold, plus 25 further
+verbatim lines in 5 files that sit outside fenced doc blocks — in unfenced
+`///` prose lists and in `//` comments (`io-uring` 17, `process` 4, `fsnotify` 3,
+`mm` 1; 41 such lines at ≥ 25, 3 of which are Rust `code` rather than text).
+Those outside-fence lines carry the same file-and-range citations but not the
+`Excerpt:` marker, and are a code-side follow-up for their owners.
+
+The scan was run against Linux only. No reference tree for Zircon, Asterinas,
+FreeBSD, gVisor, liburing, or libpcap is recorded anywhere in this repository,
+so the absence of text from those projects is unverified rather than measured;
+the packages that name them as consulted sources state them as consulted for
+semantics, not as sources of copied text.

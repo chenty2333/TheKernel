@@ -178,7 +178,10 @@ full, and manual runs choose a tier. Stages print their name, result and failure
 category. A timed-out stage terminates its process group; Linux child-subreaper
 supervision also reaps descendants that created independent sessions.
 
-`hardware` currently runs the existing CPU KVM correctness suite. Manual CI
+`hardware` runs the CPU KVM correctness suite and the complete two-guest Linux
+ABI differential. It ignores `THEKERNEL_ABI_PROGRAMS` so a reproduction filter
+cannot silently narrow this gate; direct `test --suite abi` still accepts that
+filter and labels its summary `PARTIAL`. Manual CI
 first checks for an online idle runner labelled `self-hosted`, `linux`, `x64`,
 and `thekernel-kvm`. Missing runners or inaccessible inventory fail explicitly
 as **NOT RUN**, and no hardware job is queued. Runner inventory may require the
@@ -188,8 +191,9 @@ check, not host capability attestation: the hardware job checks its tools and
 KVM access after scheduling. A runner going offline afterward can still leave
 the job queued; GitHub does not offer an atomic reserve-and-dispatch operation.
 
-Performance comparisons, Linux ABI differential tests and accelerated graphics
-remain explicit specialized suite commands, outside these default gates. Build
+Performance comparisons and accelerated graphics remain explicit specialized
+suite commands, outside these default gates. Linux ABI differential tests are
+also available directly, but now run in the KVM hardware tier as well. Build
 artifacts stay in the persistent container home under `.cache/thekernel-targets`.
 The development shell rejects host `THEKERNEL_STATE_DIR` overrides because host
 absolute paths are not automatically mounted there; unset the override before
@@ -241,10 +245,20 @@ Repository metadata points here; upstream licenses and attribution remain intact
 Keep integration in `kernel/` and adapters, rather than making lower layers
 aware of Linux objects or product runtime policy. Large integration test modules
 live in sibling test files; splitting source files alone does not justify a new
-crate. Use the dependency-layer CI gate when changing these boundaries.
+crate. Use the dependency-layer CI gate when changing edges between packages,
+and `scripts/ci/check_kernel_module_edges.py` (baseline
+`config/kernel-module-edges.toml`) when changing `use crate::…` edges between
+modules inside the kernel crate; `docs/design/kernel-module-coupling.md`
+explains what each measures.
 
 ## License
 
-TheKernel source is distributed under Apache-2.0; see [LICENSE](LICENSE) and
-[NOTICE](NOTICE). Third-party and vendored directories retain their upstream
-license terms and authorship notices.
+TheKernel's own Rust sources are distributed under Apache-2.0; see
+[LICENSE](LICENSE) and [NOTICE](NOTICE). Third-party and vendored directories
+retain their upstream license terms and authorship notices. That is not the
+whole answer for a distributed binary: the default feature set links vendored
+GPL-2.0-or-later C, and the excerpts of Linux comments in `crates/linux` are
+GPL-2.0-only citation. [docs/licensing.md](docs/licensing.md) states what a
+redistributor must ship, and
+[docs/upstream-provenance.md](docs/upstream-provenance.md) indexes every
+upstream claim this repository makes and how it was measured.

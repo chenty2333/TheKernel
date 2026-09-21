@@ -21,3 +21,100 @@ Modifications and additional work:
 Copyright (C) 2025 Azure-stars <Azure_stars@126.com>
 Copyright (C) 2025 Yuekai Jia <equation618@gmail.com>
 Copyright (C) 2025 KylinSoft Co., Ltd. <https://www.kylinos.cn>
+
+
+Third-party materials, stated exactly
+-------------------------------------
+
+Linux — https://kernel.org — GPL-2.0-only — (C) The Linux Kernel Authors
+
+  Rust comments in crates/linux quote Linux C verbatim as the
+  observable-semantics authority. Measured against the Linux 7.2.3 tree with
+  scripts/ci/scan_linux_excerpts.py (whitespace-normalised lines of >= 40
+  characters inside fenced code blocks, matched line for line; files counts
+  source files holding such a block): mm 59 lines / 21 blocks / 9 files, net
+  15 / 11 / 2, fd 13 / 3 / 3, mount 7 / 3 / 1, process 6 / 3 / 1, ipc 4 / 3 / 1,
+  random 4 / 3 / 1, io-uring 1 / 1 / 1, aio 1 / 1 / 1; seccomp holds one further
+  block whose lines are all shorter than 40 characters. 110 lines in total
+  across 49 blocks in 20 files. At the inclusive >= 25-character threshold the
+  same scope holds 211 lines in 59 blocks in 22 files. kernel/src carries a
+  further 89 such lines in 43 blocks in 19 files.
+
+  The same scan without the fence restriction adds 25 more verbatim lines in 5
+  crates/linux files (4 crates) that sit in unfenced `///` prose lists and in
+  `//` comments: io-uring 17 (registration.rs 16, sqe.rs 1), process 4
+  (linux_abi.rs), fsnotify 3 (lib.rs), mm 1 (tests.rs); 41 such lines at the
+  >= 25 threshold, 3 of which are Rust code rather than text (the
+  MPOL_WEIGHTED_INTERLEAVE enumerator in mm/src/mempolicy.rs). 28 further
+  >= 40 matches in bpf/src/uapi.rs and futex/src/lib.rs are ASCII separator
+  rules (`-------`) that also occur in Linux headers and are not Linux text, so
+  the scan filters them. crates/ax holds 7 further genuine Linux comment lines
+  at >= 40, in tk-axfs-ng, tk-axfs-ng-vfs, and tk-axnet-ng comments, plus 8
+  matches that are Rust code; of the 100 lines an --include-rules scan of that
+  tree reports, 85 are smoltcp RFC bit-layout diagram rows, not Linux text.
+
+  Attribution is by Linux file, and the precision varies: 18 of the 49 fenced
+  crates/linux blocks carry an inline "Excerpt: Linux v7.2.3 <file>:<lines>"
+  marker (21 marker lines in total: 12 in net, 5 in mount, 3 in random, 1 in
+  aio; the three that open no >= 40 block are named in
+  docs/upstream-provenance.md), 1 more has a matching Linux line-range cite in
+  the surrounding prose, and the other 30 (every block in mm and fd, three in
+  ipc, three in process) name the Linux file and, where Linux gives one, the
+  enclosing function, with no line range. Nowhere else in the workspace does any
+  comment carry that marker. The excerpts are documentation only: no Linux code
+  is linked, assembled, or compiled into TheKernel, and the Apache-2.0 grant
+  above does not extend to the
+  quoted text. Every crates/linux package that holds Linux source text states
+  this per package in its own NOTICE (aio, fd, fsnotify, io-uring, ipc, mm,
+  mount, net, process, random, seccomp), and docs/upstream-provenance.md lists
+  every citation, every gap, and the crates/ax lines, whose packages carry no
+  NOTICE yet.
+
+lwext4 — https://github.com/gkostka/lwext4 — vendored C, GPL-2.0-or-later
+
+  crates/ax/tk-lwext4-rust/c/lwext4 vendors lwext4's C tree: 31 .c files
+  (21,629 lines) plus 32 headers (7,258 lines), 28,887 lines between them
+  (find c/lwext4 -name '*.c' -exec cat {} + | wc -l, and the same for '*.h',
+  run from the crate root), self-declaring version 1.0.0
+  (c/lwext4/Makefile:10-12). Per its own LICENSE and README, most modules are
+  BSD-3-Clause, but src/ext4_xattr.c and src/ext4_extent.c carry
+  "GPL version 2 or (at your option) any later version", which upstream states
+  makes the whole library GPL-2.0-or-later. The crate declares license =
+  "GPL-2.0", which in SPDX means GPL-2.0-only; the vendored files say
+  v2-or-later, and only LICENSE.GPLv2 is shipped (no BSD-3-Clause text).
+
+  This C is compiled and linked into every default kernel build:
+  kernel/Cargo.toml requests the axfeat feature "fs-ng-ext4", which enables
+  tk-axfs-ng's "ext4" feature, which pulls tk-lwext4-rust, whose build.rs runs
+  `make musl-generic` over the vendored tree and links the result. A binary
+  built that way is a combined work of Apache-2.0 and GPL-2.0-or-later code:
+  the Apache-2.0 grant above is not a licence for that binary, and anyone
+  redistributing it must also supply the complete corresponding source of the
+  vendored C under its own terms. docs/licensing.md spells out those
+  obligations. There is no non-default build recipe that omits this C:
+  "fs-ng-ext4" is a literal entry in kernel/Cargo.toml's axfeat feature list,
+  not a named tk-kernel feature, so no `cargo` or `./tools/thekernel.py` flag
+  turns it off; docs/licensing.md section 2 states the one-line manifest change
+  its owner would have to make first.
+
+  crates/ax/tk-lwext4-rust/c/ext_images.7z is a binary test archive with no
+  license statement of its own.
+
+ArceOS, StarryOS, smoltcp, rust-fatfs, virtio-drivers, kernel-elf-parser
+
+  crates/ax/* are forks, extractions, or vendored copies of these projects and
+  keep their own license expressions and license texts in place — except as the
+  lwext4 paragraph above states, and except that crates/ax/tk-axfs-ng-vfs
+  declares "MIT OR Apache-2.0" while shipping only the Apache-2.0 text, as
+  docs/licensing.md section 1 records. Upstream: ArceOS
+  (https://github.com/arceos-org/arceos and the arceos-org split repositories,
+  GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0), StarryOS
+  (https://github.com/StarryOS/Starry, MIT OR Apache-2.0), smoltcp
+  (https://github.com/smoltcp-rs/smoltcp, 0BSD), rust-fatfs
+  (https://github.com/rafalh/rust-fatfs, MIT), virtio-drivers
+  (https://github.com/rcore-os/virtio-drivers, MIT), and kernel-elf-parser
+  (https://github.com/Azure-stars/kernel-elf-parser). docs/upstream-provenance
+  .md records, crate by crate, the upstream project, its license, the local
+  declaration, and the sync status; where this repository records no upstream
+  revision it says "unknown" and names the evidence that would pin it rather
+  than inventing a hash.

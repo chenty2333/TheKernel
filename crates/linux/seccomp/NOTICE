@@ -3,4 +3,12 @@ contracts designed for TheKernel and distributed under Apache-2.0.
 
 Linux and TheKernel sources were consulted to understand observable UAPI,
 verifier-profile, filter-stack, action, inheritance, and thread-synchronization
-contracts. No Linux source text is copied into this package.
+contracts.
+
+Copied text: one excerpt. `src/action.rs` reproduces the action allow-list
+switch at Linux 7.2.3 `kernel/seccomp.c:2069-2081` line for line, cited by the
+prose around it. Its case labels are shorter than 40 characters, so a
+40-character scan reports none, but the block is verbatim. That fragment is
+GPL-2.0-only, (C) The Linux Kernel Authors; it is comment text, and no Linux
+code is linked or compiled into this package. Nothing else in this package
+reproduces upstream source text. See `docs/upstream-provenance.md`.

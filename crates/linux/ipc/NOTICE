@@ -1,0 +1,33 @@
+This package is a new extraction of Linux-visible System V IPC and POSIX
+message-queue policy designed for TheKernel and distributed under Apache-2.0.
+It is not a port of any upstream file: no Linux source file was translated,
+adapted, or restructured here.
+
+Linux sources were consulted to understand observable `msgrcv`/`msqctl`/
+`shmctl` argument admission, `ipcperms()` DAC evaluation order, mqueue name
+validation, and the errno each check produces.
+
+Copied text: Linux C is quoted verbatim in Rust doc comments as the
+observable-semantics authority. Measured against the Linux 7.2.3 tree
+(whitespace-normalised lines of at least 40 characters inside fenced code
+blocks, matched line for line): 4 lines across 3 blocks, all in `src/lib.rs`;
+at the inclusive 25-character threshold 9 lines across the same 3 blocks. The
+hunks are `fs/libfs.c:69-72` (`simple_lookup()`, at `src/lib.rs:124-129`),
+`fs/namei.c:198-206` (`do_getname()`, at `:139-149`), and `fs/namei.c:3094-3101`
+(`lookup_noperm_common()`, at `:156-165`).
+
+The prose around each block names the Linux file and the enclosing Linux
+function but gives no line range, and no block in this package carries the
+inline `Excerpt: Linux v7.2.3 <file>:<lines> - GPL-2.0-only,
+(C) The Linux Kernel Authors` marker that `net`, `mount`, `aio`, and `random`
+use. Adding the ranges above and the markers is a source-side follow-up owned by
+this package; the ranges stated here were derived by matching the quoted lines
+against the 7.2.3 tree. Other Linux ranges cited in this package
+(`ipc/util.c:553`, `kernel/groups.c:92`, `:227`, `security/security.c:3370`) are
+prose citations of code reimplemented in Rust, not copies.
+
+Those fragments are GPL-2.0-only, (C) The Linux Kernel Authors. They are
+comment text, not code: no Linux code is linked, assembled, or compiled into
+this package, and the Apache-2.0 grant above does not extend to the quoted
+text. Nothing else in this package reproduces upstream source text. See
+`docs/upstream-provenance.md` for the full per-file index.

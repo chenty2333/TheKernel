@@ -1,0 +1,28 @@
+This package is a new extraction of Linux getrandom ABI flag, length and
+readiness policy designed for TheKernel and distributed under Apache-2.0. It
+is not a port of any upstream file: no Linux source file was translated,
+adapted, or restructured here.
+
+Linux sources were consulted to understand observable flag acceptance, the
+`GRND_INSECURE`/`GRND_RANDOM` conflict rule, the `crng_ready()` gate and its
+`-EAGAIN`/blocking split, and the `import_ubuf()` length clamp. No other
+upstream was consulted for this package.
+
+Copied text: Linux C is quoted verbatim in Rust doc comments as the
+observable-semantics authority. Measured against the Linux 7.2.3 tree
+(whitespace-normalised lines of >= 40 characters inside fenced code blocks,
+matched line for line): 4 lines across 3 blocks, all in `src/lib.rs`; at the
+inclusive >= 25-character threshold 6 lines across the same 3 blocks. The
+hunks are `drivers/char/random.c:1385-1393`, `:1395-1401` and
+`lib/iov_iter.c:1445-1450`. Two of the three blocks are dominated by short
+lines and are effectively disclosed by the `:1385-1393` and `:1395-1401`
+markers, which sit above them; every block now carries an inline marker line,
+"Excerpt: Linux v7.2.3 <file>:<lines> - GPL-2.0-only,
+(C) The Linux Kernel Authors", in addition to the citation its surrounding
+prose already gave.
+
+Those fragments are GPL-2.0-only, (C) The Linux Kernel Authors. They are
+comment text, not code: no Linux code is linked, assembled, or compiled into
+this package, and the Apache-2.0 grant above does not extend to the quoted
+text. Nothing else in this package reproduces upstream source text. See
+`docs/upstream-provenance.md` for the full per-file index.
