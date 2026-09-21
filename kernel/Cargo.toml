@@ -20,24 +20,13 @@ bpf = ["dep:axbpf", "dep:tk-linux-bpf", "perf-sampling"]
 # `virtio-net` and the two cannot both be the one static NIC type.
 net-igc = ["axfeat/driver-igc"]
 asid-fast-switch = ["axhal/asid-fast-switch"]
-asid-switch-diagnostics = ["asid-fast-switch", "axhal/asid-switch-diagnostics"]
 hwp-uclamp = ["axhal/hwp-uclamp", "axruntime/ipi", "axtask/hwp-uclamp"]
 input = ["dep:axinput", "axfeat/input"]
-memtrack = ["axfeat/dwarf", "axalloc/tracking", "dep:gimli"]
-mm-lock-diagnostics = []
-pmu-diagnostics = ["dep:axpmu"]
 pmu = ["axhal/pmu"]
 perf-sampling = ["pmu", "axhal/pmu-sampling", "axruntime/ipi"]
-test-io-control = ["axfs/test-io-control"]
 rootfs-module = ["axdriver/rootfs-module"]
-vsock = ["axfeat/vsock"]
 smp-tlb-shootdown = ["axruntime/ipi", "axtask/remote-resched"]
 irq-continuation-diagnostics = ["axtask/irq-continuation-diagnostics"]
-# EEVDF profiles are immutable compile-time choices. With no profile feature
-# the scheduler crate selects balanced, preserving its historical constants.
-eevdf-balanced = ["axtask/eevdf-balanced"]
-eevdf-latency = ["axtask/eevdf-latency"]
-eevdf-throughput = ["axtask/eevdf-throughput"]
 # The product's SMP build keeps pull-only idle stealing enabled explicitly;
 # the axtask feature itself supplies the SMP+EEVDF prerequisites.
 idle-steal = ["axtask/idle-steal"]
@@ -85,7 +74,6 @@ axruntime = { workspace = true, features = ["irq-exit"] }
 axsync.workspace = true
 axtask = { workspace = true, features = ["fp-simd", "pkeys", "scheduler-observer"] }
 
-axbacktrace = "0.1"
 axcbpf.workspace = true
 axerrno = "0.2"
 axfs-ng-vfs.workspace = true
@@ -93,7 +81,6 @@ axio.workspace = true
 axpoll.workspace = true
 axfault.workspace = true
 axrcu.workspace = true
-axpmu = { workspace = true, optional = true }
 axbpf = { workspace = true, optional = true }
 axexec.workspace = true
 axgpu.workspace = true
@@ -141,7 +128,6 @@ enum_dispatch = "0.3"
 event-listener = { version = "5.4", default-features = false }
 extern-trait = "0.4"
 flatten_objects = "0.2.4"
-gimli = { version = "0.33", default-features = false, optional = true }
 hashbrown = "0.16"
 indoc = "2"
 inherit-methods-macro = "0.1.0"

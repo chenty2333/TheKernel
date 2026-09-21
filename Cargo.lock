@@ -3194,7 +3194,6 @@ dependencies = [
  "memory_addr",
  "percpu 0.2.3-preview.1",
  "static_assertions",
- "tk-axpmu",
  "tk-page-table-entry",
  "x86",
  "x86_64",
@@ -3612,7 +3611,6 @@ name = "tk-kernel"
 version = "0.1.0"
 dependencies = [
  "aes",
- "axbacktrace",
  "axconfig",
  "axerrno 0.2.2",
  "axlog",
@@ -3628,7 +3626,6 @@ dependencies = [
  "event-listener",
  "extern-trait",
  "flatten_objects",
- "gimli",
  "hashbrown 0.16.1",
  "hmac",
  "iced-x86",
@@ -3672,7 +3669,6 @@ dependencies = [
  "tk-axio",
  "tk-axmm",
  "tk-axnet-ng",
- "tk-axpmu",
  "tk-axrandom",
  "tk-axrcu",
  "tk-axruntime",
@@ -3761,6 +3757,9 @@ version = "0.1.0"
 [[package]]
 name = "tk-linux-fd"
 version = "0.1.0"
+dependencies = [
+ "linux-raw-sys",
+]
 
 [[package]]
 name = "tk-linux-fsnotify"
@@ -3791,6 +3790,7 @@ name = "tk-linux-mm"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "linux-raw-sys",
 ]
 
 [[package]]

@@ -8,19 +8,27 @@ members = [
     "crates/linux/*",
 ]
 
-# Lint policy for TheKernel-owned packages. GitHub Actions runs `cargo clippy`
-# directly and promotes every warning not explicitly allowed here to an error.
-# Reusable components retain their explicit component lint policy.
+# Lint policy for TheKernel-owned packages. Reusable components retain their
+# explicit component lint policy.
+#
+# The enforced gate is `make lint`, i.e. `lint_kernel()` in tools/thekernel.py:
+# one `cargo clippy --locked` run over the packages named by `LINT_PACKAGES`,
+# for the product target and the product feature set, denying the `correctness`
+# and `suspicious` Clippy groups.  It does not promote an ordinary warning to an
+# error; `make lint-strict` is the opt-in escalation that adds the whole
+# workspace on the host target with `-D warnings`.
 #
 # Every allowance must state the mechanism that makes the lint wrong for this
 # codebase, not merely that it is inconvenient.
 [workspace.lints.rust]
 # `dead_code` answers a different question in every build configuration: a
 # symbol unreachable in the qemu profile is frequently live under `smp`,
-# `bpf`, `asid-fast-switch`, diagnostics, or the host test profile. Neither
-# ordinary Clippy configuration spans the complete feature power set, so it
-# cannot classify reachability truthfully. Feature-local cleanup must use a
-# narrow `cfg` or a separately reviewed allowance rather than inferred removal.
+# `bpf`, `asid-fast-switch`, `perf-sampling`, or the host test profile.  The
+# gate sees only the product configuration (and passes `-A dead-code` itself),
+# so it cannot classify reachability truthfully; this allowance is what a direct
+# `cargo clippy` or rust-analyzer run over another configuration inherits.
+# Feature-local cleanup must use a narrow `cfg` or a separately reviewed
+# allowance rather than inferred removal.
 dead_code = "allow"
 
 [workspace.lints.clippy]
@@ -165,13 +173,9 @@ net-igc = ["tk-kernel/net-igc"]
 # logical CPUs) and is also valid when QEMU starts it with one CPU.
 x86-product = ["qemu", "smp", "hwp-uclamp", "pmu", "perf-sampling"]
 asid-fast-switch = ["tk-kernel/asid-fast-switch"]
-asid-switch-diagnostics = ["tk-kernel/asid-switch-diagnostics"]
-mm-lock-diagnostics = ["tk-kernel/mm-lock-diagnostics"]
 hwp-uclamp = ["tk-kernel/hwp-uclamp"]
-pmu-diagnostics = ["tk-kernel/pmu-diagnostics"]
 pmu = ["tk-kernel/pmu"]
 perf-sampling = ["tk-kernel/perf-sampling"]
-test-io-control = ["tk-kernel/test-io-control"]
 qemu = [
     "axfeat/defplat",
     "axfeat/bus-pci",
@@ -191,10 +195,6 @@ smp = [
     "tk-kernel/irq-continuation-diagnostics",
     "tk-kernel/idle-steal",
 ]
-# EEVDF profile selection is compile time; the default is balanced.
-eevdf-balanced = ["tk-kernel/eevdf-balanced"]
-eevdf-latency = ["tk-kernel/eevdf-latency"]
-eevdf-throughput = ["tk-kernel/eevdf-throughput"]
 
 [[bin]]
 name = "thekernel"
