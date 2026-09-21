@@ -56,6 +56,7 @@ impl GetRandomRequest {
     ///
     /// `drivers/char/random.c`:
     ///
+    /// Excerpt: Linux v7.2.3 `drivers/char/random.c:1385-1393` — GPL-2.0-only, (C) The Linux Kernel Authors
     /// ```text
     /// if (flags & ~(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE))
     ///         return -EINVAL;
@@ -101,6 +102,7 @@ impl GetRandomRequest {
 
     /// Which branch of Linux's `crng_ready()` gate this call takes.
     ///
+    /// Excerpt: Linux v7.2.3 `drivers/char/random.c:1395-1401` — GPL-2.0-only, (C) The Linux Kernel Authors
     /// ```text
     /// if (!crng_ready() && !(flags & GRND_INSECURE)) {
     ///         if (flags & GRND_NONBLOCK)
@@ -139,6 +141,7 @@ impl GetRandomRequest {
 /// **whole** clamped range with one `access_ok()` before a single byte is
 /// copied:
 ///
+/// Excerpt: Linux v7.2.3 `lib/iov_iter.c:1445-1450` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```text
 /// int import_ubuf(int rw, void __user *buf, size_t len, struct iov_iter *i)
 /// {

@@ -495,15 +495,6 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
-/// Number of discovery passes allowed while a sibling thread is still being
-/// published by `clone(CLONE_THREAD)`.  Linux reaches the same guarantee with
-/// a `task_work` barrier in `security/landlock/tsync.c`; this kernel pins the
-/// thread group with the process-lifecycle lock instead and retries the few
-/// publications that are still in flight.  If a member is still unresolved
-/// after these attempts the whole restrict fails instead of committing a
-/// silently partial synchronization.
-const LANDLOCK_TSYNC_DISCOVERY_ATTEMPTS: usize = 8;
-
 /// Applies one prepared domain to every live thread of the calling process.
 ///
 /// Linux `landlock_restrict_sibling_threads()` (`security/landlock/tsync.c`)
@@ -523,110 +514,97 @@ fn restrict_sibling_threads(
     use crate::task::{AsThread, get_task};
 
     let leader_tid = caller.proc_data.proc.pid();
-    let mut attempt = 0;
-    loop {
-        // The process-lifecycle lock excludes membership publication and
-        // teardown; `clone(CLONE_THREAD)` holds that same lock across its own
-        // domain snapshot, so a sibling either copies the synchronized domain
-        // to a child or is caught by the discovery below.
-        let _lifecycle = caller.proc_data.lock_process_lifecycle();
-        let mut unresolved = false;
-        let mut targets = Vec::new();
-        targets
-            .try_reserve_exact(caller.proc_data.proc.thread_ids().count())
-            .map_err(|_| AxError::NoMemory)?;
-        for tid in caller.proc_data.proc.thread_ids() {
-            if tid == caller.kernel_tid() {
-                continue;
-            }
-            let Ok(task) = get_task(tid) else {
-                // A reserved membership whose task-table entry is published
-                // after clone released the lifecycle lock.
-                unresolved = true;
-                continue;
-            };
-            let Some(thread) = task.try_as_thread() else {
-                continue;
-            };
-            if !Arc::ptr_eq(&thread.proc_data.proc, &caller.proc_data.proc)
-                || thread.kernel_tid() != tid
-            {
-                continue;
-            }
-            // Linux skips threads that already passed PF_EXITING.
-            if thread.pending_exit() {
-                continue;
-            }
-            targets.push(task);
-        }
-        if unresolved && attempt + 1 < LANDLOCK_TSYNC_DISCOVERY_ATTEMPTS {
-            attempt += 1;
-            axtask::yield_now();
+    // The process-lifecycle lock excludes membership publication and teardown:
+    // `clone(CLONE_THREAD)` holds that same lock across
+    // `TaskTableAdmission::commit_with_publication()`, which links the
+    // task-table entry and marks the sibling's membership live in one critical
+    // section.  A live membership therefore always resolves here, so discovery
+    // needs exactly one pass -- and retrying could not help, because the guard
+    // stays held across a yield and blocks the very publication being waited
+    // for.  A sibling's own domain snapshot either copies the synchronized
+    // domain to a child or is caught by the discovery below.
+    let _lifecycle = caller.proc_data.lock_process_lifecycle();
+    let mut targets = Vec::new();
+    targets
+        .try_reserve_exact(caller.proc_data.proc.thread_ids().count())
+        .map_err(|_| AxError::NoMemory)?;
+    for tid in caller.proc_data.proc.thread_ids() {
+        if tid == caller.kernel_tid() {
             continue;
         }
-        if unresolved {
-            // All-or-nothing: committing with a thread that was never
-            // discovered would leave that sibling unrestricted while the
-            // caller believes the whole group is synchronized.
-            return Err(AxError::NoSuchProcess);
+        let Ok(task) = get_task(tid) else {
+            unreachable!("a live sibling membership is published with its task");
+        };
+        let Some(thread) = task.try_as_thread() else {
+            continue;
+        };
+        if !Arc::ptr_eq(&thread.proc_data.proc, &caller.proc_data.proc)
+            || thread.kernel_tid() != tid
+        {
+            continue;
         }
-        // Fallible phase: one clone per target plus the caller's own value.
-        let mut prepared = Vec::new();
-        prepared
-            .try_reserve_exact(targets.len() + 1)
+        // Linux skips threads that already passed PF_EXITING.
+        if thread.pending_exit() {
+            continue;
+        }
+        targets.push(task);
+    }
+    // Fallible phase: one clone per target plus the caller's own value.
+    let mut prepared = Vec::new();
+    prepared
+        .try_reserve_exact(targets.len() + 1)
+        .map_err(|_| AxError::NoMemory)?;
+    for _ in 0..targets.len() {
+        prepared.push(domain.try_clone()?);
+    }
+    let caller_domain = domain.try_clone()?;
+    // The mandatory `no_new_privs` propagation of the TSYNC path:
+    //
+    // 	if (ctx->set_no_new_privs)
+    // 		task_set_no_new_privs(current);
+    //
+    // with the bit sampled once from the caller by
+    // `shared_ctx.set_no_new_privs = task_no_new_privs(current);`
+    // (security/landlock/tsync.c).  A sibling that lacks the bit would drop
+    // the new domain at its next execve(2), because a domain survives an
+    // exec only under `no_new_privs` (security/landlock/domain.c
+    // `landlock_cred_security` is re-evaluated against
+    // `task_no_new_privs()`), so the caller's bit is copied to every
+    // sibling.  Only siblings: Linux leaves the caller's own bit -- set
+    // already, or unset because the caller used CAP_SYS_ADMIN -- alone.
+    let propagate_no_new_privs = caller.no_new_privs();
+    let mut prepared_no_new_privs = Vec::new();
+    if propagate_no_new_privs {
+        prepared_no_new_privs
+            .try_reserve_exact(targets.len())
             .map_err(|_| AxError::NoMemory)?;
-        for _ in 0..targets.len() {
-            prepared.push(domain.try_clone()?);
-        }
-        let caller_domain = domain.try_clone()?;
-        // The mandatory `no_new_privs` propagation of the TSYNC path:
-        //
-        // 	if (ctx->set_no_new_privs)
-        // 		task_set_no_new_privs(current);
-        //
-        // with the bit sampled once from the caller by
-        // `shared_ctx.set_no_new_privs = task_no_new_privs(current);`
-        // (security/landlock/tsync.c).  A sibling that lacks the bit would drop
-        // the new domain at its next execve(2), because a domain survives an
-        // exec only under `no_new_privs` (security/landlock/domain.c
-        // `landlock_cred_security` is re-evaluated against
-        // `task_no_new_privs()`), so the caller's bit is copied to every
-        // sibling.  Only siblings: Linux leaves the caller's own bit -- set
-        // already, or unset because the caller used CAP_SYS_ADMIN -- alone.
-        let propagate_no_new_privs = caller.no_new_privs();
-        let mut prepared_no_new_privs = Vec::new();
-        if propagate_no_new_privs {
-            prepared_no_new_privs
-                .try_reserve_exact(targets.len())
-                .map_err(|_| AxError::NoMemory)?;
-            for task in &targets {
-                let thread = task
-                    .try_as_thread()
-                    .expect("TSYNC targets were validated as threads");
-                prepared_no_new_privs.push(thread.prepare_no_new_privs()?);
-            }
-        }
-        // Infallible commit: no allocation and no failure path, so the group
-        // is never left with only some threads synchronized.
-        let mut leader_synced = caller.kernel_tid() == leader_tid;
-        caller.replace_landlock_domain(caller_domain);
-        let mut no_new_privs = prepared_no_new_privs.into_iter();
-        for (task, value) in targets.iter().zip(prepared) {
+        for task in &targets {
             let thread = task
                 .try_as_thread()
                 .expect("TSYNC targets were validated as threads");
-            if let Some(transition) = no_new_privs.next().flatten() {
-                // Linux updates the credential before it publishes the new
-                // one, so the bit is visible no later than the domain.
-                thread.commit_no_new_privs(transition);
-            }
-            if thread.kernel_tid() == leader_tid {
-                leader_synced = true;
-            }
-            thread.replace_landlock_domain(value);
+            prepared_no_new_privs.push(thread.prepare_no_new_privs()?);
         }
-        return Ok(leader_synced);
     }
+    // Infallible commit: no allocation and no failure path, so the group
+    // is never left with only some threads synchronized.
+    let mut leader_synced = caller.kernel_tid() == leader_tid;
+    caller.replace_landlock_domain(caller_domain);
+    let mut no_new_privs = prepared_no_new_privs.into_iter();
+    for (task, value) in targets.iter().zip(prepared) {
+        let thread = task
+            .try_as_thread()
+            .expect("TSYNC targets were validated as threads");
+        if let Some(transition) = no_new_privs.next().flatten() {
+            // Linux updates the credential before it publishes the new
+            // one, so the bit is visible no later than the domain.
+            thread.commit_no_new_privs(transition);
+        }
+        if thread.kernel_tid() == leader_tid {
+            leader_synced = true;
+        }
+        thread.replace_landlock_domain(value);
+    }
+    Ok(leader_synced)
 }
 
 /// Domain attachment.  Linux `SYSCALL_DEFINE2(landlock_restrict_self, ...)`
@@ -638,6 +616,9 @@ pub fn sys_landlock_restrict_self(ruleset_fd: i32, flags: u32) -> AxResult<isize
     let current = axtask::current();
     let caller = current.as_thread();
     let credential = caller.current_cred();
+    // Linux `SYSCALL_DEFINE2(landlock_restrict_self)` tests the no_new_privs /
+    // `CAP_SYS_ADMIN` rule (`security/landlock/syscalls.c`) before it masks
+    // the flag word, so EPERM outranks EINVAL.
     if !caller.no_new_privs()
         && !crate::task::ns_capable(&credential, credential.user_ns(), CAP_SYS_ADMIN)
     {
@@ -662,7 +643,9 @@ pub fn sys_landlock_restrict_self(ruleset_fd: i32, flags: u32) -> AxResult<isize
     };
     if tsync {
         if restrict_sibling_threads(caller, &domain)? {
-            caller.proc_data.replace_group_leader_landlock_domain(domain);
+            caller
+                .proc_data
+                .replace_group_leader_landlock_domain(domain);
         }
     } else {
         caller.replace_landlock_domain(domain);
@@ -877,10 +860,11 @@ pub fn sys_lsm_set_self_attr<M: UserMemory + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// `config/linux-contracts.toml` names this symbol, so the entry point
-    /// keeps its historical name while the assertions track the aligned ABI.
+    /// `config/linux-contracts.toml` names this symbol. The name is deliberately
+    /// version-free: these assertions track the release pinned by
+    /// `config/linux-abi.toml`, and a re-pin must not leave a stale number here.
     #[test]
-    fn abi_shapes_are_linux_612() {
+    fn abi_shapes_are_pinned_linux_release() {
         assert_eq!(LANDLOCK_ABI_VERSION, 10);
         assert_eq!(size_of::<RulesetAttr>(), 48);
         assert_eq!(size_of::<PathBeneathAttr>(), 12);
@@ -955,21 +939,31 @@ mod tests {
         const SUBDOMAINS_OFF: u32 = 1 << 2;
         assert_eq!(LANDLOCK_RESTRICT_SELF_MASK, 0b1111);
         assert_eq!(LANDLOCK_RESTRICT_SELF_TSYNC, 0b1000);
-        assert_eq!(LANDLOCK_RESTRICT_SELF_MASK & !LANDLOCK_RESTRICT_SELF_LOG_MASK, 0b1000);
+        assert_eq!(
+            LANDLOCK_RESTRICT_SELF_MASK & !LANDLOCK_RESTRICT_SELF_LOG_MASK,
+            0b1000
+        );
         // Unknown flag bits are EINVAL (`flags | MASK != MASK`).
-        let defined = |flags: u32| flags | LANDLOCK_RESTRICT_SELF_MASK == LANDLOCK_RESTRICT_SELF_MASK;
+        let defined =
+            |flags: u32| flags | LANDLOCK_RESTRICT_SELF_MASK == LANDLOCK_RESTRICT_SELF_MASK;
         assert!(defined(0));
         assert!(defined(SUBDOMAINS_OFF | LANDLOCK_RESTRICT_SELF_TSYNC));
         assert!(!defined(1 << 4));
         // A ruleset-free call needs exactly the subdomain flag, with TSYNC as
         // an optional companion; every other flag word still resolves the
         // descriptor, so `-1` is EBADF there.
-        assert!(tk_linux_landlock::restrict_self_without_ruleset(-1, SUBDOMAINS_OFF));
+        assert!(tk_linux_landlock::restrict_self_without_ruleset(
+            -1,
+            SUBDOMAINS_OFF
+        ));
         assert!(tk_linux_landlock::restrict_self_without_ruleset(
             -1,
             SUBDOMAINS_OFF | LANDLOCK_RESTRICT_SELF_TSYNC
         ));
         assert!(!tk_linux_landlock::restrict_self_without_ruleset(-1, 0));
-        assert!(!tk_linux_landlock::restrict_self_without_ruleset(0, SUBDOMAINS_OFF));
+        assert!(!tk_linux_landlock::restrict_self_without_ruleset(
+            0,
+            SUBDOMAINS_OFF
+        ));
     }
 }

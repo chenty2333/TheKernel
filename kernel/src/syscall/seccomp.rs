@@ -101,14 +101,8 @@ fn map_seccomp_publication_error(error: SeccompPublicationError) -> AxError {
 
 fn map_tsync_failure(error: SeccompTsyncFailure, flags: u32) -> AxResult<isize> {
     if flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 {
-        // Linux's ESRCH mode intentionally hides a transient/reaped sibling
-        // TID.  A real mode/ancestry conflict remains a normal policy error.
-        if matches!(error.error, SeccompPublicationError::Stale) {
-            return Err(LinuxError::ESRCH.into());
-        }
+        return Err(LinuxError::ESRCH.into());
     }
-    // The ordinary TSYNC ABI reports the exact failing thread ID as a
-    // successful positive syscall result, not a synthetic errno.
     if error.tid != 0
         && matches!(
             error.error,
@@ -312,10 +306,10 @@ fn get_action_available<M: UserMemory + ?Sized>(
         .map_err(map_usercopy_error)?;
     // The advertised set is owned by the policy crate so it can never drift
     // from the action table `enforce_syscall_seccomp` below dispatches on:
-    // every advertised action has a classified arm there.  `SECCOMP_RET_TRACE`
-    // is deliberately not advertised: with no `PTRACE_EVENT_SECCOMP`
-    // delivery its verdict always takes the no-tracer -ENOSYS path, so the
-    // query reports -EOPNOTSUPP instead of promising an unusable action.
+    // every advertised action has a classified arm there.  The set is Linux's
+    // switch verbatim (`kernel/seccomp.c:2069-2081`), `SECCOMP_RET_TRACE`
+    // included, because the query asks whether a filter may install an action,
+    // not whether a tracer is waiting to be notified about it.
     if tk_linux_seccomp::action_is_available(action) {
         Ok(0)
     } else {
@@ -450,9 +444,15 @@ pub(super) fn enforce_syscall_seccomp(uctx: &mut UserContext) -> bool {
     // 		return 0;
     //
     // `PT_SUSPEND_SECCOMP` is the tracee-side copy of the tracer's option, and
-    // the relationship's option word is cleared when the relationship ends, so
-    // a detach resumes enforcement without a second bookkeeping step.
-    if thread.proc_data.ptrace_seccomp_suspended() {
+    // Linux stores it in that one tracee's `ptrace` word, so the query must
+    // name the exact traced kernel tid: a sibling which was never attached
+    // keeps enforcing its own filters. The relationship's option word is
+    // cleared when the relationship ends, so a detach resumes enforcement
+    // without a second bookkeeping step.
+    if thread
+        .proc_data
+        .ptrace_seccomp_suspended_for(thread.kernel_tid())
+    {
         return true;
     }
 
@@ -521,9 +521,10 @@ pub(super) fn enforce_syscall_seccomp(uctx: &mut UserContext) -> bool {
         ActionClass::Trace { .. } => {
             // No `PTRACE_EVENT_SECCOMP` delivery exists, so every TRACE
             // verdict takes Linux's "no tracer attached" path
-            // (kernel/seccomp.c `__seccomp_filter()`): the syscall is skipped
-            // with ENOSYS.  `SECCOMP_GET_ACTION_AVAIL` matchingly does not
-            // advertise the action.
+            // (kernel/seccomp.c:1299-1305 `__seccomp_filter()`): the syscall
+            // is skipped with ENOSYS.  `ptrace_event_enabled()` reports false
+            // for an untraced task too, so only a tracer that asked for the
+            // event sees a difference, and that is the recorded limitation.
             uctx.set_retval((-LinuxError::ENOSYS.code() as isize) as usize);
             false
         }

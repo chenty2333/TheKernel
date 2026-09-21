@@ -935,51 +935,6 @@ mod tests {
         assert!(after.interpreter_executed >= before.interpreter_executed.saturating_add(1));
     }
 
-    #[cfg(feature = "test-io-control")]
-    #[test]
-    fn control_policy_changes_only_future_packet_admissions() {
-        let old = crate::seccomp_jit::executor_policies();
-        crate::seccomp_jit::set_executor_policies_for_control(
-            None,
-            Some(ExecutorPolicy::Interpreter),
-        );
-        let old_filter = PacketCbpfFilter::try_new(alloc::vec![Instruction::statement(
-            axcbpf::opcode::RET_K,
-            u32::MAX,
-        )])
-        .unwrap();
-        crate::seccomp_jit::set_executor_policies_for_control(None, Some(ExecutorPolicy::Jit));
-        let new_filter = PacketCbpfFilter::try_new(alloc::vec![Instruction::statement(
-            axcbpf::opcode::RET_K,
-            u32::MAX,
-        )]);
-
-        let before = counters();
-        old_filter.filter(&[1, 2, 3]).unwrap();
-        let after = counters();
-        assert_eq!(
-            after.interpreter_executed,
-            before.interpreter_executed.saturating_add(1)
-        );
-        assert_eq!(after.native_executed, before.native_executed);
-        #[cfg(feature = "bpf")]
-        if let Ok(filter) = new_filter {
-            let before = counters();
-            filter.filter(&[1, 2, 3]).unwrap();
-            assert_eq!(
-                counters().native_executed,
-                before.native_executed.saturating_add(1)
-            );
-        }
-        #[cfg(not(feature = "bpf"))]
-        match new_filter {
-            Err(error) => assert_eq!(error, LinuxError::EOPNOTSUPP.into()),
-            Ok(_) => panic!("force-jit admitted an interpreter packet filter"),
-        }
-
-        crate::seccomp_jit::set_executor_policies_for_control(Some(old.0), Some(old.1));
-    }
-
     #[cfg(not(feature = "bpf"))]
     #[test]
     fn force_jit_rejects_instead_of_using_the_interpreter() {

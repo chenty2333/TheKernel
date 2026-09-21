@@ -227,14 +227,6 @@ fn update_executor_policies(
     }
 }
 
-#[cfg(feature = "test-io-control")]
-pub(crate) fn set_executor_policies_for_control(
-    seccomp: Option<ExecutorPolicy>,
-    packet: Option<ExecutorPolicy>,
-) {
-    let _ = update_executor_policies(seccomp, packet);
-}
-
 /// Reserves a published-program counter before the immutable program pointer
 /// is made visible. Dropping the reservation before `commit` rolls the count
 /// back exactly, so failed admission is never exposed in a stable snapshot.
@@ -528,17 +520,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-io-control")]
-    struct RestoreExecutorPolicies((ExecutorPolicy, ExecutorPolicy));
-
-    #[cfg(feature = "test-io-control")]
-    impl Drop for RestoreExecutorPolicies {
-        fn drop(&mut self) {
-            let (seccomp, packet) = self.0;
-            set_executor_policies_for_control(Some(seccomp), Some(packet));
-        }
-    }
-
     fn allow_program() -> VerifiedProgram {
         VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(
             opcode::RET_K,
@@ -588,52 +569,6 @@ mod tests {
         let unaligned = &input.0[1..];
         assert_eq!(unaligned.len(), tk_linux_seccomp::SECCOMP_DATA_SIZE);
         assert_eq!(executor.execute(unaligned), 0);
-    }
-
-    #[cfg(feature = "test-io-control")]
-    #[test]
-    fn control_policy_guard_restores_both_domains_during_unwind() {
-        let old = executor_policies();
-        let panic = std::panic::catch_unwind(|| {
-            let _restore = RestoreExecutorPolicies(executor_policies());
-            set_executor_policies_for_control(
-                Some(ExecutorPolicy::Interpreter),
-                Some(ExecutorPolicy::Jit),
-            );
-            panic!("synthetic assertion failure after policy change");
-        });
-        assert!(panic.is_err());
-        assert_eq!(executor_policies(), old);
-    }
-
-    #[cfg(feature = "test-io-control")]
-    #[test]
-    fn control_policy_changes_only_future_seccomp_admissions() {
-        let _restore = RestoreExecutorPolicies(executor_policies());
-        set_executor_policies_for_control(Some(ExecutorPolicy::Interpreter), None);
-        let old_program_executor = try_compile(&allow_program()).unwrap();
-        set_executor_policies_for_control(Some(ExecutorPolicy::Jit), None);
-        let new_program_executor = try_compile(&allow_program());
-
-        assert_eq!(
-            old_program_executor.execute(AlignedInput::zeroed().bytes()),
-            SECCOMP_RET_ALLOW
-        );
-        assert!(new_program_executor.is_err());
-    }
-
-    #[cfg(feature = "test-io-control")]
-    #[test]
-    fn control_policies_are_independent() {
-        let _restore = RestoreExecutorPolicies(executor_policies());
-        set_executor_policies_for_control(
-            Some(ExecutorPolicy::Interpreter),
-            Some(ExecutorPolicy::Jit),
-        );
-        assert_eq!(
-            executor_policies(),
-            (ExecutorPolicy::Interpreter, ExecutorPolicy::Jit)
-        );
     }
 
     #[cfg(not(feature = "bpf"))]

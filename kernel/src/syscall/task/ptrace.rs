@@ -4,18 +4,18 @@ use axtask::{
     snapshot_inactive_task_user_cet_state, yield_now,
 };
 use tk_linux_arch_x86_64::{ARCH_SHSTK_UNLOCK, NT_X86_SHSTK, X86ShstkRegset};
-use tk_linux_process_adapter::Pid;
-/// `PTRACE_O_MASK`, the two eventless option bits and the shared
-/// `check_ptrace_options()` ladder live in `tk_linux_process` because both the
-/// `PTRACE_SEIZE` and the `PTRACE_SETOPTIONS` spelling of the request word must
-/// run the *same* admission.
-use tk_linux_process::ptrace_options::{PtraceOptionReject, SuspendSeccompAdmission};
 // Only the request-decoding test spells the two eventless bits out by name; the
 // syscall path takes the whole mask from the same crate.
 #[cfg(test)]
 use tk_linux_process::ptrace_options::{
     EXITKILL as PTRACE_O_EXITKILL, SUSPEND_SECCOMP as PTRACE_O_SUSPEND_SECCOMP,
 };
+/// `PTRACE_O_MASK`, the two eventless option bits and the shared
+/// `check_ptrace_options()` ladder live in `tk_linux_process` because both the
+/// `PTRACE_SEIZE` and the `PTRACE_SETOPTIONS` spelling of the request word must
+/// run the *same* admission.
+use tk_linux_process::ptrace_options::{PtraceOptionReject, SuspendSeccompAdmission};
+use tk_linux_process_adapter::Pid;
 use tk_linux_seccomp::SeccompMode;
 use tk_linux_signal::{SignalInfo, Signo};
 
@@ -527,9 +527,11 @@ fn ptrace_shstk_regset(
     }
     let required = core::mem::size_of::<X86ShstkRegset>();
     // `ptrace_regset()` rejects a length that is not a whole number of
-    // records (-EINVAL); `__regset_get()` then clamps the count to the
-    // record extent, so a zero length copies nothing and writes 0 back.
-    if iov.iov_len < 0 || iov.iov_len as usize % required != 0 {
+    // records (-EINVAL); `kiov.iov_len` is a `size_t`, so the word is read
+    // unsigned and any value whose modulo passes clamps to one record.
+    // `__regset_get()` then clamps the count to the record extent, so a zero
+    // length copies nothing and writes 0 back.
+    if iov.iov_len as usize % required != 0 {
         return Err(AxError::InvalidInput);
     }
     iov.iov_len = (iov.iov_len as usize).min(required) as i64;
@@ -554,6 +556,10 @@ fn ptrace_shstk_regset(
             Ok(0)
         }
         PTRACE_SETREGSET => {
+            // `ptrace_regset()` clamps the iovec length and then always calls
+            // `copy_regset_from_user()`, which invokes `ssp_set()`; that
+            // rejects any count other than one complete record with EINVAL.
+            // An empty iovec is therefore EINVAL, not success.
             if iov.iov_len != required as i64 {
                 return Err(AxError::InvalidInput);
             }
@@ -850,9 +856,9 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
 /// `CONFIG_SECCOMP=y`, so the `-EINVAL` configuration branch is not taken here,
 /// and the suspension itself is implemented: `PTRACE_O_SUSPEND_SECCOMP` is
 /// stored in the relationship's option word, where
-/// `ProcessData::ptrace_seccomp_suspended()` reads it for
+/// `ProcessData::ptrace_seccomp_suspended_for()` reads it for
 /// `__secure_computing()`, and `current->ptrace & PT_SUSPEND_SECCOMP` becomes
-/// the tracer's own process state.
+/// the tracer's own thread state.
 fn check_ptrace_options(data: u32) -> AxResult<()> {
     let tracer = current();
     let tracer = tracer.as_thread();
@@ -865,7 +871,9 @@ fn check_ptrace_options(data: u32) -> AxResult<()> {
         filtered: tracer.seccomp_mode() != SeccompMode::Disabled,
         // `current->ptrace & PT_SUSPEND_SECCOMP`: the tracer is itself a tracee
         // whose tracer suspended its policy.
-        already_suspended: tracer.proc_data.ptrace_seccomp_suspended(),
+        already_suspended: tracer
+            .proc_data
+            .ptrace_seccomp_suspended_for(tracer.kernel_tid()),
     };
     match tk_linux_process::ptrace_options::check(data, admission) {
         Ok(()) => Ok(()),
@@ -1214,9 +1222,7 @@ mod tests {
     fn ptrace_syscall_info_layout_matches_linux() {
         use core::mem::{align_of, offset_of, size_of};
 
-        use super::{
-            PtraceSyscallInfo, PtraceSyscallInfoEntry, PtraceSyscallInfoSeccomp,
-        };
+        use super::{PtraceSyscallInfo, PtraceSyscallInfoEntry, PtraceSyscallInfoSeccomp};
 
         // `struct ptrace_syscall_info` (include/uapi/linux/ptrace.h) is 88 bytes
         // with 8-byte alignment on x86_64: a 24-byte header plus a union whose
@@ -1248,7 +1254,10 @@ mod tests {
         // to `offsetofend(..., exit.is_error)` (33) for EXIT -- note 33, not the
         // 40 bytes of the padded `struct ... exit` member.
         assert_eq!(PtraceSyscallInfo::active_size(PTRACE_SYSCALL_INFO_NONE), 24);
-        assert_eq!(PtraceSyscallInfo::active_size(PTRACE_SYSCALL_INFO_ENTRY), 80);
+        assert_eq!(
+            PtraceSyscallInfo::active_size(PTRACE_SYSCALL_INFO_ENTRY),
+            80
+        );
         assert_eq!(PtraceSyscallInfo::active_size(PTRACE_SYSCALL_INFO_EXIT), 33);
         assert_eq!(
             PtraceSyscallInfo::active_size(PTRACE_SYSCALL_INFO_SECCOMP),

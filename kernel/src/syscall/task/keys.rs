@@ -36,11 +36,12 @@ fn load_user_string<M: UserMemory + ?Sized>(
     max_bytes: usize,
 ) -> AxResult<String> {
     String::from_utf8(
-        vm_load_until_nul_bounded(memory, ptr.cast::<u8>(), max_bytes)
-            .map_err(|error| match error {
+        vm_load_until_nul_bounded(memory, ptr.cast::<u8>(), max_bytes).map_err(
+            |error| match error {
                 UserCopyError::TooLong => AxError::InvalidInput,
                 other => map_usercopy_error(other),
-            })?,
+            },
+        )?,
     )
     .map_err(|_| AxError::IllegalBytes)
 }
@@ -181,12 +182,13 @@ fn write_keyring_ids<M: UserMemory + ?Sized>(
     ids: &[i32],
 ) -> AxResult<isize> {
     let full_size = core::mem::size_of_val(ids);
-    // `keyctl_read_key()` stages the read method's output in a kernel buffer
-    // and only calls `copy_to_user()` when the whole result fits: a short
-    // buffer reports the length and transfers nothing at all.
-    if size >= full_size && !buf.is_null() && full_size != 0 {
-        let mut bytes = Vec::with_capacity(full_size);
-        for id in ids {
+    // `keyring_read()` copies as many whole serials as the caller's buffer
+    // holds and reports the full byte count either way, so a short buffer is
+    // a truncated listing, not an empty one.
+    let count = (size / size_of::<i32>()).min(ids.len());
+    if !buf.is_null() && count != 0 {
+        let mut bytes = Vec::with_capacity(count * size_of::<i32>());
+        for id in &ids[..count] {
             bytes.extend_from_slice(&id.to_ne_bytes());
         }
         vm_write_slice(memory, buf, &bytes).map_err(map_usercopy_error)?;

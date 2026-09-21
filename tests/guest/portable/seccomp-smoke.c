@@ -209,9 +209,12 @@ static int test_api(void) {
         return fail("pr-set-seccomp-high-strict-mode-bits");
     }
 
+    /* Linux `seccomp_get_action_avail()` (kernel/seccomp.c:2069-2081) answers
+     * 0 for exactly these eight values, so all eight must be queryable. */
     const uint32_t actions[] = {
         SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD,
         SECCOMP_RET_TRAP,         SECCOMP_RET_ERRNO,
+        SECCOMP_RET_USER_NOTIF,   SECCOMP_RET_TRACE,
         SECCOMP_RET_LOG,          SECCOMP_RET_ALLOW,
     };
     for (size_t index = 0; index < sizeof(actions) / sizeof(actions[0]);
@@ -599,28 +602,25 @@ static int test_strict_kill(void) {
 }
 
 static int test_unsupported_lifecycles(void) {
-    /* Linux advertises SECCOMP_RET_TRACE via `seccomp_get_action_avail()`;
-     * TheKernel does not, because without PTRACE_EVENT_SECCOMP delivery a
-     * TRACE verdict always takes the documented "no tracer attached" path --
-     * the syscall fails with ENOSYS (kernel/seccomp.c `__seccomp_filter()`).
-     * The availability check therefore lives in the kernel-specific section
-     * below; SECCOMP_RET_USER_NOTIF is advertised identically by both kernels
-     * and stays portable. */
+    /* Both SECCOMP_RET_TRACE and SECCOMP_RET_USER_NOTIF are advertised: the
+     * query reports whether a filter may install an action, not whether this
+     * kernel can deliver a PTRACE_EVENT_SECCOMP notification or has a
+     * listener.  Without a tracer, a TRACE verdict is Linux's own no-tracer
+     * path -- the syscall is skipped with ENOSYS (kernel/seccomp.c:1299-1305)
+     * -- which is checked below. */
     uint32_t action = SECCOMP_RET_USER_NOTIF;
     errno = 0;
     if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0U, &action) != 0) {
         return fail("user-notif-action-available");
     }
+    action = SECCOMP_RET_TRACE;
+    errno = 0;
+    if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0U, &action) != 0) {
+        return fail("trace-action-available");
+    }
     if (!require_exact_path_limit) {
         marker("THEKERNEL_SECCOMP_UNSUPPORTED_PORTABLE_OK");
         return 0;
-    }
-
-    action = SECCOMP_RET_TRACE;
-    errno = 0;
-    if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0U, &action) != -1 ||
-        errno != EOPNOTSUPP) {
-        return fail("trace-action-advertised");
     }
 
     struct seccomp_notif_sizes sizes = {0};

@@ -92,10 +92,7 @@ pub(super) fn validate_created_payload(kind: KeyTypeKind, plen: usize) -> AxResu
 /// error;`), and the `logon` type then vets the description through
 /// `logon_vet_description()` (`key.c:239-245`), which requires a `:` that is
 /// not the first character (`user_defined.c:193-207`).
-pub(super) fn validate_created_description(
-    kind: KeyTypeKind,
-    description: &str,
-) -> AxResult<()> {
+pub(super) fn validate_created_description(kind: KeyTypeKind, description: &str) -> AxResult<()> {
     if description.is_empty() {
         return Err(AxError::InvalidInput);
     }
@@ -777,8 +774,8 @@ impl KeyManager {
                     manager.resolve_keyring_in_namespace(keyring, actor, namespace, false)?;
                 // `keyctl_keyring_search()` propagates `key_type_lookup()`
                 // unchanged, so an unregistered type is -ENOKEY here.
-                let kind = KeyTypeKind::from_name(&type_name)
-                    .ok_or(AxError::from(LinuxError::ENOKEY))?;
+                let kind =
+                    KeyTypeKind::from_name(&type_name).ok_or(AxError::from(LinuxError::ENOKEY))?;
                 let serial = manager
                     .search_keyring(keyring, actor, kind, &description, &mut BTreeSet::new())?
                     .ok_or(AxError::from(LinuxError::ENOKEY))?;
@@ -821,13 +818,12 @@ impl KeyManager {
                     return Err(LinuxError::EOPNOTSUPP.into());
                 }
                 let full_len = key.payload.len();
-                // `keyctl_read_key()` answers a short buffer with the full
-                // length and no data at all: the payload only reaches
-                // userspace when it fits whole.
-                let bytes = if copy_limit.is_some_and(|limit| limit >= full_len) {
-                    key.payload.clone()
-                } else {
-                    Vec::new()
+                // `user_read()` copies the first `buflen` bytes and reports
+                // the full payload length either way, so a short buffer is a
+                // truncated read, not an empty one.
+                let bytes = match copy_limit {
+                    Some(limit) => key.payload[..full_len.min(limit)].to_vec(),
+                    None => Vec::new(),
                 };
                 return Ok(KeyctlOutput::Payload { full_len, bytes });
             }
