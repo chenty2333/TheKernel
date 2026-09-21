@@ -617,6 +617,20 @@ impl SignalInfo {
         }
     }
 
+    pub fn child_payload(&self) -> (i32, i64, i64) {
+        // SAFETY: all bytes in SignalInfo are initialized and `_sigchld`
+        // consists only of scalar fields on the x86_64 Linux ABI.
+        unsafe {
+            let child = self
+                .as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigchld;
+            (child._status, child._utime, child._stime)
+        }
+    }
+
     /// Returns the raw Linux ABI record.
     pub fn as_raw(&self) -> &siginfo_t {
         // SAFETY: the storage has exactly siginfo_t's asserted size and

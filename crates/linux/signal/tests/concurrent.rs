@@ -136,12 +136,13 @@ fn concurrent_blocked() {
 }
 
 #[test]
-fn concurrent_signalfd_observation_respects_blocked_mask() {
+fn concurrent_signalfd_observation_uses_fd_mask_alone() {
     let (_proc, thr) = new_test_env();
     let signo = Signo::SIGTERM;
     let mut fd_mask = SignalSet::default();
     fd_mask.add(signo);
 
+    // A pending signal that is also blocked stays visible to signalfd.
     let mut blocked = SignalSet::default();
     blocked.add(signo);
     thr.set_blocked(blocked);
@@ -154,12 +155,15 @@ fn concurrent_signalfd_observation_respects_blocked_mask() {
     assert!(wait_until(|| thr.pending().has(signo)));
     assert!(thr.has_pending_signal_for_signalfd(&fd_mask));
     assert_eq!(
-        thr.dequeue_signal_for_signalfd(&fd_mask)
+        thr.dequeue_signal(&fd_mask)
             .expect("blocked signal must remain visible to signalfd")
             .signo(),
         signo
     );
 
+    // signalfd dequeue applies the fd mask as-is (fs/signalfd.c:162 and 177,
+    // matching in kernel/signal.c:618-637): a pending signal that is NOT
+    // blocked is dequeued and consumed by the signalfd mask too.
     thr.set_blocked(SignalSet::default());
     let sender = {
         let thr = thr.clone();
@@ -167,17 +171,14 @@ fn concurrent_signalfd_observation_respects_blocked_mask() {
     };
     assert!(sender.join().unwrap());
     assert!(wait_until(|| thr.pending().has(signo)));
-    assert!(!thr.has_pending_signal_for_signalfd(&fd_mask));
-    assert!(thr.dequeue_signal_for_signalfd(&fd_mask).is_none());
-
-    thr.set_blocked(blocked);
     assert!(thr.has_pending_signal_for_signalfd(&fd_mask));
     assert_eq!(
-        thr.dequeue_signal_for_signalfd(&fd_mask)
-            .expect("mask update must make the pending signal visible")
+        thr.dequeue_signal(&fd_mask)
+            .expect("unblocked pending signal must be dequeued by the fd mask alone")
             .signo(),
         signo
     );
+    assert!(thr.dequeue_signal(&fd_mask).is_none());
 }
 
 #[test]

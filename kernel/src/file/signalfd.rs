@@ -14,7 +14,7 @@ use tk_linux_signal::{SignalInfo, SignalSet, SignalfdMask, SignalfdSiginfo};
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
     readiness::block_on_poll_io,
-    task::{AsThread, acknowledge_posix_timer_signal},
+    task::{AsThread, ProcessData, acknowledge_posix_timer_signal},
 };
 
 /// The size of signalfd_siginfo structure (128 bytes as per Linux
@@ -47,8 +47,11 @@ impl Signalfd {
         *self.mask.read()
     }
 
-    /// Check if there are any pending signals matching the fd mask and the
-    /// reader thread's current blocked mask.
+    /// Check if any pending signal matches the fd mask alone.
+    ///
+    /// Like Linux's `signalfd_poll` (fs/signalfd.c:52-68), which runs
+    /// `next_signal` over both pending queues with `ctx->sigmask` only
+    /// (lines 59-61), the reader's blocked mask is not consulted.
     fn has_pending_signals(&self) -> bool {
         let mask = self.mask.read();
         let curr = current();
@@ -56,17 +59,51 @@ impl Signalfd {
         signal.has_pending_signal_for_signalfd(&mask)
     }
 
-    /// Dequeue a signal matching both the fd mask and the reader thread's
-    /// current blocked mask. The signal manager keeps the blocked-mask
-    /// snapshot and queue dequeue in one linearization domain.
+    /// Dequeue a signal matching the fd mask alone.
+    ///
+    /// Like Linux's `signalfd_dequeue()` (fs/signalfd.c:162 and 177), the fd
+    /// mask is passed to `dequeue_signal` (kernel/signal.c:618-637) as-is and
+    /// is NOT intersected with the reader thread's blocked mask: a signalfd
+    /// read may dequeue and consume a pending signal that is not blocked.
     fn dequeue_signal(&self) -> Option<SignalInfo> {
         let mask = self.mask.read();
         let curr = current();
         let signal = &curr.as_thread().signal;
-        signal.dequeue_signal_for_signalfd(&mask)
+        signal.dequeue_signal(&mask)
     }
 
-    /// Reads one signalfd record without changing the OFD's O_NONBLOCK bit.
+    /// Dequeues one signal selected by the fd mask and writes one
+    /// `signalfd_siginfo` record into `dst`, returning the record size.
+    /// Returns [`AxError::WouldBlock`] when no matching signal is pending.
+    fn dequeue_record(&self, proc_data: &ProcessData, dst: &mut IoDst) -> AxResult<usize> {
+        let Some(sig_info) = self.dequeue_signal() else {
+            return Err(AxError::WouldBlock);
+        };
+        acknowledge_posix_timer_signal(proc_data, &sig_info);
+        let sfd_info = SignalfdSiginfo::encode(&sig_info);
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref(&sfd_info).cast::<u8>(),
+                SIGNALFD_SIGINFO_SIZE,
+            )
+        };
+        dst.write(bytes)?;
+        if self.has_pending_signals() {
+            self.poll_rx.wake();
+        }
+        Ok(SIGNALFD_SIGINFO_SIZE)
+    }
+
+    /// Reads signalfd records without changing the OFD's O_NONBLOCK bit.
+    ///
+    /// Mirrors Linux's `signalfd_read` (fs/signalfd.c:205-220): the buffer
+    /// must hold at least one `signalfd_siginfo` record or EINVAL is
+    /// returned; at most `remaining / record size` records are produced per
+    /// call, only the first record honors the caller's blocking mode, every
+    /// later record is dequeued with forced non-blocking (`nonblock = 1`,
+    /// fs/signalfd.c:216) and an empty queue stops the loop; once at least
+    /// one record was produced, later errors are swallowed in favor of the
+    /// accumulated byte count (`return total ? total : ret`).
     pub(crate) fn read_with_nonblocking(
         &self,
         dst: &mut IoDst,
@@ -75,27 +112,22 @@ impl Signalfd {
         if dst.remaining_mut() < SIGNALFD_SIGINFO_SIZE {
             return Err(AxError::InvalidInput);
         }
+        let max_records = dst.remaining_mut() / SIGNALFD_SIGINFO_SIZE;
         let proc_data = current().as_thread().proc_data.clone();
 
-        block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
-            if let Some(sig_info) = self.dequeue_signal() {
-                acknowledge_posix_timer_signal(&proc_data, &sig_info);
-                let sfd_info = SignalfdSiginfo::encode(&sig_info);
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        core::ptr::from_ref(&sfd_info).cast::<u8>(),
-                        SIGNALFD_SIGINFO_SIZE,
-                    )
-                };
-                dst.write(bytes)?;
-                if self.has_pending_signals() {
-                    self.poll_rx.wake();
-                }
-                Ok(SIGNALFD_SIGINFO_SIZE)
-            } else {
-                Err(AxError::WouldBlock)
+        // The first record follows the caller's blocking mode.
+        let mut total = block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
+            self.dequeue_record(&proc_data, dst)
+        })?;
+
+        // From the second record on, dequeue without ever waiting.
+        for _ in 1..max_records {
+            match self.dequeue_record(&proc_data, dst) {
+                Ok(bytes) => total += bytes,
+                Err(_) => break,
             }
-        })
+        }
+        Ok(total)
     }
 }
 

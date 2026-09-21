@@ -732,46 +732,27 @@ impl ThreadSignalManager {
     }
 
     /// Dequeues a signal from the thread's pending signals.
+    ///
+    /// `mask` is applied as-is, without intersecting this thread's blocked
+    /// mask. This is the same primitive Linux's `signalfd_dequeue()` uses with
+    /// the fd mask (fs/signalfd.c:162 and 177, matching in
+    /// kernel/signal.c:618-637), so a signalfd read may dequeue and consume a
+    /// pending signal that is not currently blocked.
     #[must_use]
     pub fn dequeue_signal(&self, mask: &SignalSet) -> Option<SignalInfo> {
         self.dequeue_signal_with_source(mask)
             .map(DequeuedSignal::into_info)
     }
 
-    /// Returns whether a pending signal matches both `mask` and the current
-    /// blocked mask of this thread.
+    /// Returns whether a pending signal matches `mask`.
     ///
-    /// The blocked-mask lock is held while both pending queues are observed.
-    /// This gives readiness users the same blocked-mask linearization domain
-    /// as [`Self::dequeue_signal_for_signalfd`]; the result is still only a
-    /// readiness hint and may change before a later operation.
+    /// Like Linux's `signalfd_poll` (fs/signalfd.c:52-68), which runs
+    /// `next_signal` over both pending queues with `ctx->sigmask` alone, the
+    /// reader's blocked mask is not consulted: this is a readiness hint for
+    /// the signalfd fd mask and may change before a later operation.
     pub fn has_pending_signal_for_signalfd(&self, mask: &SignalSet) -> bool {
-        self.with_signalfd_mask(mask, |effective| {
-            let thread_pending = self.pending.lock().set;
-            !(thread_pending & *effective).is_empty()
-                || !(self.proc.pending() & *effective).is_empty()
-        })
-    }
-
-    /// Dequeues one pending signal selected by `mask` and the thread's
-    /// currently blocked mask.
-    ///
-    /// The blocked-mask lock remains held until selection and dequeue have
-    /// both completed. A concurrent mask update therefore cannot make an
-    /// unblocked signal eligible after this operation has selected it.
-    #[must_use]
-    pub fn dequeue_signal_for_signalfd(&self, mask: &SignalSet) -> Option<SignalInfo> {
-        // Keep queue-owned destruction outside the blocked spin lock. The
-        // selection and removal are still linearized while that lock is held.
-        let selected =
-            self.with_signalfd_mask(mask, |effective| self.dequeue_signal_with_source(effective));
-        selected.map(DequeuedSignal::into_info)
-    }
-
-    fn with_signalfd_mask<R>(&self, mask: &SignalSet, f: impl FnOnce(&SignalSet) -> R) -> R {
-        let blocked = self.blocked.lock();
-        let effective = *mask & *blocked;
-        f(&effective)
+        let thread_pending = self.pending.lock().set;
+        !(thread_pending & *mask).is_empty() || !(self.proc.pending() & *mask).is_empty()
     }
 
     fn dequeue_signal_with_source(&self, mask: &SignalSet) -> Option<DequeuedSignal> {
@@ -2194,7 +2175,7 @@ mod signal_wait_tests {
                     SignalDeliveryResult::Retry | SignalDeliveryResult::Fault
                 ));
                 assert_eq!(count.0.load(Ordering::SeqCst), 1);
-                assert!(thread.dequeue_signal_for_signalfd(&mask).is_some());
+                assert!(thread.dequeue_signal(&mask).is_some());
             }
         }
     }

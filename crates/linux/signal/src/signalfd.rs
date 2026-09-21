@@ -100,6 +100,11 @@ impl SignalfdSiginfo {
             out.call_addr = info.sigsys_call_address() as u64;
             out.syscall = info.sigsys_syscall();
             out.arch = info.sigsys_arch();
+        } else if info.signo() == Signo::SIGCHLD {
+            let (status, utime, stime) = info.child_payload();
+            out.status = status;
+            out.utime = utime as u64;
+            out.stime = stime as u64;
         } else if matches!(
             info.signo(),
             Signo::SIGILL | Signo::SIGFPE | Signo::SIGSEGV | Signo::SIGBUS | Signo::SIGTRAP
@@ -138,5 +143,23 @@ mod tests {
         ));
         assert_eq!(poll.band, 7);
         assert_eq!(poll.fd, 8);
+    }
+    #[test]
+    fn encodes_sigchld_payload() {
+        let mut raw: linux_raw_sys::general::siginfo_t = unsafe { core::mem::zeroed() };
+        raw.__bindgen_anon_1.__bindgen_anon_1.si_signo = Signo::SIGCHLD as i32;
+        raw.__bindgen_anon_1.__bindgen_anon_1.si_code = 1;
+        unsafe {
+            let child = &mut raw.__bindgen_anon_1.__bindgen_anon_1._sifields._sigchld;
+            child._status = 42;
+            child._utime = 1234;
+            child._stime = 5678;
+        }
+        let info = SignalInfo::from_raw(raw);
+        let encoded = SignalfdSiginfo::encode(&info);
+        assert_eq!(encoded.signo, Signo::SIGCHLD as u32);
+        assert_eq!(encoded.status, 42);
+        assert_eq!(encoded.utime, 1234);
+        assert_eq!(encoded.stime, 5678);
     }
 }

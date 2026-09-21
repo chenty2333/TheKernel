@@ -137,6 +137,55 @@ fn realtime_signal_is_fifo_with_lowest_signo_priority() {
 }
 
 #[test]
+fn signalfd_mask_drains_multiple_pending_records_unblocked() {
+    // Linux `signalfd_read` loops `dequeue_signal(&ctx->sigmask)` until the
+    // buffer is full or the queue runs dry (fs/signalfd.c:205-220), and the
+    // mask is not intersected with the reader's blocked mask
+    // (kernel/signal.c:618-637). A signalfd-masked dequeue sequence must
+    // therefore drain every matching pending record in order even when none
+    // of the signals is blocked.
+    let (_proc, thread) = new_test_env();
+    let mut fd_mask = SignalSet::default();
+    fd_mask.add(Signo::SIGRTMIN);
+    fd_mask.add(Signo::SIGUSR1);
+    assert!(thread.blocked().is_empty());
+
+    let (user, global) = accounts(8);
+    for code in 1..=3 {
+        send_accounted(
+            &thread,
+            SignalInfo::new_user(Signo::SIGRTMIN, code, 1, 0),
+            &user,
+            &global,
+            8,
+        );
+    }
+    send_accounted(
+        &thread,
+        SignalInfo::new_user(Signo::SIGUSR1, 4, 1, 0),
+        &user,
+        &global,
+        8,
+    );
+
+    let drained: Vec<_> = (0..4)
+        .map(|_| thread.dequeue_signal(&fd_mask).unwrap())
+        .map(|info| (info.signo(), info.code()))
+        .collect();
+    assert_eq!(
+        drained,
+        [
+            (Signo::SIGUSR1, 4),
+            (Signo::SIGRTMIN, 1),
+            (Signo::SIGRTMIN, 2),
+            (Signo::SIGRTMIN, 3),
+        ]
+    );
+    assert!(thread.dequeue_signal(&fd_mask).is_none());
+    assert!(thread.pending().is_empty());
+}
+
+#[test]
 fn process_and_thread_pending_share_one_account() {
     let (process, thread) = new_test_env();
     let (user, global) = accounts(2);

@@ -667,7 +667,7 @@ fn blocked_signal_readiness_covers_ordinary_and_deferred_publication() {
         "blocked signals do not use delivery interrupts"
     );
     assert_eq!(process_wake.hits.swap(0, Ordering::SeqCst), 1);
-    assert!(thread.dequeue_signal_for_signalfd(&mask).is_some());
+    assert!(thread.dequeue_signal(&mask).is_some());
 
     let sent = thread
         .try_send_signal_with(info(), |info| {
@@ -676,7 +676,7 @@ fn blocked_signal_readiness_covers_ordinary_and_deferred_publication() {
         .unwrap();
     assert!(sent.published && !sent.wake);
     assert_eq!(process_wake.hits.swap(0, Ordering::SeqCst), 1);
-    assert!(thread.dequeue_signal_for_signalfd(&mask).is_some());
+    assert!(thread.dequeue_signal(&mask).is_some());
 
     // Both finishing and dropping deferred owners must notify, but the
     // publication call itself must not run arbitrary readiness callbacks.
@@ -693,7 +693,7 @@ fn blocked_signal_readiness_covers_ordinary_and_deferred_publication() {
             drop(deferred);
         }
         assert_eq!(process_wake.hits.swap(0, Ordering::SeqCst), 1);
-        assert!(thread.dequeue_signal_for_signalfd(&mask).is_some());
+        assert!(thread.dequeue_signal(&mask).is_some());
 
         let deferred = thread
             .try_prepare_signal_send()
@@ -707,7 +707,7 @@ fn blocked_signal_readiness_covers_ordinary_and_deferred_publication() {
             drop(deferred);
         }
         assert_eq!(process_wake.hits.swap(0, Ordering::SeqCst), 1);
-        assert!(thread.dequeue_signal_for_signalfd(&mask).is_some());
+        assert!(thread.dequeue_signal(&mask).is_some());
     }
 
     // The readiness subscription belongs to the process, even if one
@@ -723,8 +723,8 @@ fn blocked_signal_readiness_covers_ordinary_and_deferred_publication() {
         .unwrap();
     assert!(sent.published && !sent.wake);
     assert_eq!(process_wake.hits.swap(0, Ordering::SeqCst), 1);
-    assert!(thread.dequeue_signal_for_signalfd(&mask).is_none());
-    assert!(sibling.dequeue_signal_for_signalfd(&mask).is_some());
+    assert!(thread.dequeue_signal(&mask).is_none());
+    assert!(sibling.dequeue_signal(&mask).is_some());
 
     thread.retire_registration(42, true);
     let sent = thread
@@ -734,5 +734,5 @@ fn blocked_signal_readiness_covers_ordinary_and_deferred_publication() {
         .unwrap();
     assert!(sent.published && !sent.wake);
     assert_eq!(process_wake.hits.swap(0, Ordering::SeqCst), 1);
-    assert!(thread.dequeue_signal_for_signalfd(&mask).is_some());
+    assert!(thread.dequeue_signal(&mask).is_some());
 }
