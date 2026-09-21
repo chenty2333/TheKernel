@@ -111,8 +111,8 @@ impl Connection {
             if written < data.len() {
                 let dropped = data.len() - written;
                 self.dropped_bytes = self.dropped_bytes.saturating_add(dropped);
-                info!(
-                    "Vsock connection {:?} rx buffer full, dropped {} bytes",
+                debug!(
+                    "\x014Vsock connection {:?} rx buffer full, dropped {} bytes",
                     (self.local_addr, self.peer_addr),
                     dropped
                 );
@@ -120,8 +120,8 @@ impl Connection {
             written
         } else {
             self.dropped_bytes = self.dropped_bytes.saturating_add(data.len());
-            info!(
-                "Vsock connection {:?} rx buffer full, dropped {} bytes",
+            debug!(
+                "\x014Vsock connection {:?} rx buffer full, dropped {} bytes",
                 (self.local_addr, self.peer_addr),
                 data.len()
             );
@@ -487,7 +487,7 @@ impl VsockConnectionManager {
 
         // check if connection already exists
         if self.connections.contains_key(&conn_id) {
-            warn!("Connection {conn_id:?} already exists, ignoring request");
+            debug!("\x014Connection {conn_id:?} already exists, ignoring request");
             return Ok(None);
         }
 
@@ -503,8 +503,8 @@ impl VsockConnectionManager {
         let mut queue_guard = queue.lock();
         let backlog = queue_guard.backlog;
         if queue_guard.accept_queue.push(conn_id, backlog).is_err() {
-            info!(
-                "Accept queue full for port {}, dropping connection from {:?}",
+            debug!(
+                "\x014Accept queue full for port {}, dropping connection from {:?}",
                 conn_id.local_port, conn_id.peer_addr
             );
             // full -- remove the connection

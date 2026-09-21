@@ -115,6 +115,7 @@ use self::{
     probe::{BusFacts, ProbeReport, WindowStatus},
     regs::{RegisterWindow, Registers},
 };
+use crate::drm::modes::Narration;
 /// The aperture type and the window length are named only by the bare-metal
 /// half: [`mapped_facts`] answers with the one and [`open_register_window`]
 /// maps the other, and no host-test caller names either.  They are gated here
@@ -395,7 +396,7 @@ fn modeset_at_boot(powered: &[(pci::Bdf, RegisterWindow)]) {
         return;
     };
     if !powered.iter().any(|(bdf, _)| *bdf == connector.bdf) {
-        axlog::warn!(
+        axlog::debug!(
             "intel-modeset: display {} never came up in phase 1, so it is not programmed; the \
              power failure above is the finding, not this line",
             connector.bdf
@@ -487,7 +488,7 @@ fn modeset_at_boot(powered: &[(pci::Bdf, RegisterWindow)]) {
         Err(source) => {
             // Not fatal here: the request below carries no values, and phase
             // 5's own refusal names the table and the reference's gap.
-            axlog::warn!(
+            axlog::debug!(
                 "intel-modeset: {} has no buffer-translation values to replay: {}",
                 connector.ddi,
                 source.describe()
@@ -794,7 +795,10 @@ fn reconcile_once<R: Registers, T: PollTimer>(
     let probe = if changed == 0 {
         None
     } else {
-        Some(sink::probe_one(bdf, regs, timer))
+        // A re-probe programs nothing -- `HotplugWatch::record` keeps the answer
+        // for the debug file -- so the pass prints the transition it re-probed
+        // for and leaves the probe's own narration to that file.
+        Some(sink::probe_one(bdf, regs, timer, Narration::Watch))
     };
     ReconcilePass {
         failure: poll.failure(),
@@ -1100,7 +1104,7 @@ mod tests {
     /// states the sink step reported at boot, in the shape the connector step
     /// keeps them in.
     fn boot_report(controller: &FakeController) -> connect::ConnectReport {
-        let device = sink::probe_one(bdf(), controller, &FakeClock::new());
+        let device = sink::probe_one(bdf(), controller, &FakeClock::new(), Narration::Boot);
         connect::ConnectReport {
             hotplug: vec![(device.bdf, device.hotplug.clone())],
             ..connect::ConnectReport::default()

@@ -62,7 +62,19 @@ pub fn set_enable(vector: usize, enabled: bool) {
         // An x2APIC ID wider than the IOAPIC's physical eight-bit destination
         // field cannot be delivered without interrupt remapping.  Keep every
         // line masked rather than allowing a wrapped destination.
-        warn!("IOAPIC delivery is unavailable; refusing to unmask IRQ {vector}");
+        //
+        // Reported once, because the state does not resolve: every driver that
+        // unmasks a pin asks again, so a per-attempt record is one more
+        // unthrottled writer on the path a busy device takes, and the fact -- no
+        // external interrupt will ever arrive -- is the same fact each time.
+        static IO_APIC_UNMASK_REPORTED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !IO_APIC_UNMASK_REPORTED.swap(true, Ordering::AcqRel) {
+            warn!(
+                "IOAPIC delivery is unavailable; refusing to unmask IRQ {vector}. Later \
+                 refusals are not reported."
+            );
+        }
         return;
     }
 
@@ -670,7 +682,13 @@ mod irq_impl {
             // by the shared pass. All sources must be acknowledged before EOI.
             let direct_handled = IRQ_HANDLER_TABLE.handle(vector);
             if !shared_handled && !direct_handled {
-                warn!("Unhandled IRQ {vector}");
+                // A level-triggered line nobody claims is re-asserted by the
+                // controller as soon as the EOI below lands, so this is a
+                // per-interrupt statement and it must live in the band the filter
+                // caps and the budget bounds. `\x014` keeps it a warning for the
+                // reader who opened that band: an IRQ storm from an unclaimed
+                // device is exactly what they came to look for.
+                debug!("\x014Unhandled IRQ {vector}");
             }
             unsafe { super::local_apic().end_of_interrupt() };
             Some(vector)

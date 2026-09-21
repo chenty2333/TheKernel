@@ -11,7 +11,7 @@ mod uprint {
         let mut s = alloc::string::String::new();
         let bytes_written = unsafe { format(str as _, args, output::fmt_write(&mut s)) };
         // println!("{}", s);
-        info!("{}", s);
+        debug!("{}", s);
 
         bytes_written
     }
@@ -24,7 +24,7 @@ mod uprint {
         let c_str = unsafe { CStr::from_ptr(str) };
         // let arg1 = args.arg::<usize>();
 
-        info!("[lwext4] {:?}", c_str);
+        debug!("[lwext4] {:?}", c_str);
         0
     }
 }
@@ -52,13 +52,11 @@ mod ualloc {
     #[unsafe(no_mangle)]
     pub extern "C" fn ext4_user_realloc(memblock: *mut c_void, size: c_size_t) -> *mut c_void {
         if memblock.is_null() {
-            warn!("realloc a a null mem pointer");
             return ext4_user_malloc(size);
         }
 
         let ptr = memblock.cast::<MemoryControlBlock>();
         let old_size = unsafe { ptr.sub(1).read().size };
-        info!("realloc from {} to {}", old_size, size);
 
         let mem = ext4_user_malloc(size);
 
@@ -97,7 +95,6 @@ mod ualloc {
     #[unsafe(no_mangle)]
     pub extern "C" fn ext4_user_free(ptr: *mut c_void) {
         if ptr.is_null() {
-            warn!("free a null pointer !");
             return;
         }
         // debug!("free pointer {:p}", ptr);

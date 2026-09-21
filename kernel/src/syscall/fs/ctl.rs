@@ -140,7 +140,7 @@ fn load_user_path<M: UserMemory + ?Sized>(
 
 fn warn_notification(context: &str, result: AxResult<()>) {
     if let Err(error) = result {
-        warn!("{context} notification failed: {error}");
+        debug!("{context} notification failed: {error}");
     }
 }
 
@@ -899,7 +899,7 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
             if cmd == TIOCGWINSZ {
                 return;
             }
-            warn!("Unsupported ioctl command: {cmd} for fd: {fd}");
+            debug!("Unsupported ioctl command: {cmd} for fd: {fd}");
         }
     })?;
     if cmd == FIONREAD || cmd == TIOCINQ {
@@ -2688,12 +2688,12 @@ pub fn sys_reboot<M: UserMemory + ?Sized>(
         LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => {
             sys_sync()?;
             if restart_command.is_empty() {
-                ax_println!("System is restarting");
+                axruntime::klog::death_notice(format_args!("Restarting system"));
             } else {
-                ax_println!(
-                    "System is restarting with command: {}",
+                axruntime::klog::death_notice(format_args!(
+                    "Restarting system with command '{}'",
                     core::str::from_utf8(&restart_command).unwrap_or("<invalid utf-8>")
-                );
+                ));
             }
             axhal::power::system_reset();
         }
@@ -2705,12 +2705,12 @@ pub fn sys_reboot<M: UserMemory + ?Sized>(
                 return Err(LinuxError::EOPNOTSUPP.into());
             }
             sys_sync()?;
-            ax_println!("System is halted");
+            axruntime::klog::death_notice(format_args!("System halted"));
             axhal::power::system_halt();
         }
         LINUX_REBOOT_CMD_POWER_OFF => {
             sys_sync()?;
-            ax_println!("System is powering off");
+            axruntime::klog::death_notice(format_args!("Power down"));
             system_off();
         }
         LINUX_REBOOT_CMD_KEXEC => {

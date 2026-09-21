@@ -23,15 +23,17 @@
 //!
 //! The result is a fact the firmware did not give this kernel: what monitor is
 //! attached, on which pin, and what timing the mode layer would program for it.
-//! It goes to the kernel log *and* into the probe's debug file, because the
-//! target machine has no serial port: a boot log scrolls away, and an EDID is
-//! worth reading twice.
+//! The boot reading goes to the kernel log *and* into the probe's debug file,
+//! because the target machine has no serial port: a boot log scrolls away, and
+//! an EDID is worth reading twice.  A re-probe by the after-boot watch goes to
+//! the file alone -- see [`probe_one`]'s `narration`, which is where that rule
+//! and its reason live.
 //!
 //! Nothing here has run on the target hardware.
 
 use alloc::{format, string::String, vec::Vec};
 
-use axlog::warn;
+use axlog::{debug, warn};
 
 use super::{
     gmbus::{self, EdidBytes, Pin, PollTimer, SinkProbe},
@@ -39,7 +41,7 @@ use super::{
     pci::Bdf,
     regs::Registers,
 };
-use crate::drm::modes::{self, Constraints, ModePlan};
+use crate::drm::modes::{self, Constraints, ModePlan, Narration};
 
 /// What phase 2 found on one display device.
 pub(crate) struct DeviceSink {
@@ -110,9 +112,24 @@ impl DeviceSink {
 /// and the machine's clock, and a host test passes a model of the controller
 /// and a clock it owns, so the whole chain -- pins, EDID validation, the mode
 /// layer, hotplug -- runs on a machine that has no display hardware.
-pub(crate) fn probe_one<R: Registers, T: PollTimer>(bdf: Bdf, regs: &R, timer: &T) -> DeviceSink {
+///
+/// `narration` says who asked.  The reading is identical either way; what
+/// changes is who hears it, and the answer is in [`Narration`]: the after-boot
+/// watch keeps a re-probe's facts in the hotplug section of the debug file and
+/// prints the transition it re-probed for, so the probe's own lines -- four
+/// DDI register dumps and the per-pin answers -- are said only by the pass that
+/// programs a mode from them.
+pub(crate) fn probe_one<R: Registers, T: PollTimer>(
+    bdf: Bdf,
+    regs: &R,
+    timer: &T,
+    narration: Narration,
+) -> DeviceSink {
+    let narrate = matches!(narration, Narration::Boot);
     let pins = gmbus::probe_sink_with(regs, timer);
-    pins.log();
+    if narrate {
+        pins.log();
+    }
     let monitor = pins.found();
     let edid = pins.edid();
     // The extension is only asked for when the base block declared one, so a
@@ -121,7 +138,14 @@ pub(crate) fn probe_one<R: Registers, T: PollTimer>(bdf: Bdf, regs: &R, timer: &
         Some(pin) => match gmbus::read_edid_extension_with(regs, timer, pin) {
             Ok(extension) => extension,
             Err(error) => {
-                warn!("intel-sink: {}", error.describe());
+                // Nothing else keeps this one: the report says what the
+                // extension *was*, never that it could not be read.  A re-probe
+                // says it where a repeat is throttled.
+                if narrate {
+                    warn!("intel-sink: {}", error.describe());
+                } else {
+                    debug!("\x014intel-sink: {}", error.describe());
+                }
                 None
             }
         },
@@ -138,18 +162,24 @@ pub(crate) fn probe_one<R: Registers, T: PollTimer>(bdf: Bdf, regs: &R, timer: &
         if let Some(extension) = &extension {
             bytes.extend_from_slice(extension.as_slice());
         }
-        modes::plan_modeset(&bytes, &Constraints::unlimited())
+        modes::plan_modeset_at(&bytes, &Constraints::unlimited(), narration)
     });
     let mut hotplug = Vec::new();
     let mut hotplug_errors = Vec::new();
     for ddi in Ddi::ALL {
         match hpd::enable_and_read(regs, ddi) {
             Ok(status) => {
-                status.log();
+                if narrate {
+                    status.log();
+                }
                 hotplug.push(status);
             }
             Err(error) => {
-                warn!("intel-sink: {}", error.describe());
+                // The error travels in `hotplug_errors` and the report renders
+                // it per DDI, so a re-probe needs no console line of its own.
+                if narrate {
+                    warn!("intel-sink: {}", error.describe());
+                }
                 hotplug_errors.push((ddi, error));
             }
         }

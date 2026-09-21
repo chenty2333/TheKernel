@@ -1105,7 +1105,7 @@ impl Router {
                 // A stale/closed handle must never degrade into ordinary
                 // header-based routing. Handles are monotonic, so this is a
                 // terminal discard rather than an ABA retry.
-                warn!("Dropping raw packet with unknown route-plan handle");
+                debug!("\x014Dropping raw packet with unknown route-plan handle");
                 continue;
             }
             if let (TxRouteMetadata::RawRoute(handle), Some(plan)) = (metadata, raw_plan.as_ref()) {
@@ -1126,14 +1126,14 @@ impl Router {
             }
             let packet = outbound.as_slice();
             let Ok(version) = IpVersion::of_packet(packet) else {
-                warn!("Dropping malformed IP packet from transmit queue");
+                debug!("\x014Dropping malformed IP packet from transmit queue");
                 fail_raw_route(raw_plan.as_ref());
                 continue;
             };
             match version {
                 IpVersion::Ipv4 => {
                     let Ok(packet) = smoltcp::wire::Ipv4Packet::new_checked(packet) else {
-                        warn!("Dropping malformed IPv4 packet from transmit queue");
+                        debug!("\x014Dropping malformed IPv4 packet from transmit queue");
                         fail_raw_route(raw_plan.as_ref());
                         continue;
                     };
@@ -1180,7 +1180,9 @@ impl Router {
                                 )
                             } else {
                                 let Some(rule) = self.table.lookup(&dst_addr) else {
-                                    warn!("No route found for rewritten destination: {dst_addr}");
+                                    debug!(
+                        "\x014No route found for rewritten destination: {dst_addr}"
+                    );
                                     fail_raw_route(raw_plan.as_ref());
                                     continue;
                                 };
@@ -1200,7 +1202,7 @@ impl Router {
                             }
                         } else {
                             let Some(rule) = self.table.lookup(&dst_addr) else {
-                                warn!("No route found for destination: {dst_addr}");
+                                debug!("\x014No route found for destination: {dst_addr}");
                                 continue;
                             };
                             // Ordinary traffic remains protected from a raw
@@ -1224,7 +1226,7 @@ impl Router {
                             continue;
                         };
                         let Some(slot) = self.device_slot(ifindex) else {
-                            warn!("Dropping IPv4 packet for missing route device {ifindex}");
+                            debug!("\x014Dropping IPv4 packet for missing route device {ifindex}");
                             fail_raw_route(raw_plan.as_ref());
                             continue;
                         };
@@ -1264,7 +1266,7 @@ impl Router {
                 }
                 IpVersion::Ipv6 => {
                     let Ok(packet) = smoltcp::wire::Ipv6Packet::new_checked(packet) else {
-                        warn!("Dropping malformed IPv6 packet from transmit queue");
+                        debug!("\x014Dropping malformed IPv6 packet from transmit queue");
                         fail_raw_route(raw_plan.as_ref());
                         continue;
                     };
@@ -1307,7 +1309,9 @@ impl Router {
                                 )
                             } else {
                                 let Some(rule) = self.table.lookup(&dst_addr) else {
-                                    warn!("No route found for rewritten destination: {dst_addr}");
+                                    debug!(
+                        "\x014No route found for rewritten destination: {dst_addr}"
+                    );
                                     fail_raw_route(raw_plan.as_ref());
                                     continue;
                                 };
@@ -1327,7 +1331,7 @@ impl Router {
                             }
                         } else {
                             let Some(rule) = self.table.lookup(&dst_addr) else {
-                                warn!("No route found for destination: {dst_addr}");
+                                debug!("\x014No route found for destination: {dst_addr}");
                                 continue;
                             };
                             if IpAddress::Ipv6(packet.src_addr()) != rule.src {
@@ -1349,7 +1353,7 @@ impl Router {
                             continue;
                         };
                         let Some(slot) = self.device_slot(ifindex) else {
-                            warn!("Dropping IPv6 packet for missing route device {ifindex}");
+                            debug!("\x014Dropping IPv6 packet for missing route device {ifindex}");
                             fail_raw_route(raw_plan.as_ref());
                             continue;
                         };

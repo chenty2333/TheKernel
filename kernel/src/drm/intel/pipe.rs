@@ -1405,7 +1405,7 @@ impl PipeProgram {
     /// Put [`Self::render`] into the kernel log.
     pub(crate) fn log(&self, pipe_misc_before: u32, arb_ctl_before: u32) {
         for line in self.render(pipe_misc_before, arb_ctl_before).lines() {
-            axlog::info!("{line}");
+            axlog::debug!("{line}");
         }
     }
 }
@@ -1638,7 +1638,7 @@ impl PipeState {
     /// Put [`Self::render`] into the kernel log.
     pub(crate) fn log(&self) {
         for line in self.render().lines() {
-            axlog::info!("{line}");
+            axlog::debug!("{line}");
         }
     }
 }
@@ -1672,7 +1672,7 @@ impl ArmState {
     /// Put [`Self::render`] into the kernel log.
     pub(crate) fn log(&self) {
         for line in self.render().lines() {
-            axlog::info!("{line}");
+            axlog::debug!("{line}");
         }
     }
 }

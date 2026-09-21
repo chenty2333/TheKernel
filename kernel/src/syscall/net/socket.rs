@@ -718,7 +718,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             net_stack.unix_namespace(),
         )),
         (AF_INET, _) | (AF_INET6, _) | (AF_UNIX, _) | (AF_VSOCK, _) => {
-            warn!("Unsupported socket type: domain: {domain}, ty: {ty}");
+            debug!("Unsupported socket type: domain: {domain}, ty: {ty}");
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
         _ => {
@@ -1633,7 +1633,7 @@ pub fn sys_socketpair(
         }
         _ => {
             // `unix_create`'s switch has no arm for any other type.
-            warn!("Unsupported socketpair type: {ty}");
+            debug!("Unsupported socketpair type: {ty}");
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
     };

@@ -79,7 +79,12 @@ fn maping_blk_err_to_dev_err(err: BlkError) -> DevError {
         BlkError::NoMemory => DevError::NoMemory,
         BlkError::InvalidBlockIndex(_) => DevError::InvalidParam,
         BlkError::Other(error) => {
-            error!("Block device error: {error}");
+            // The caller receives this as `DevError::Io` on the very request that
+            // failed, so a dying disk reports itself once per request through
+            // here -- unthrottled, and in the band that every console prints by
+            // default. The record stays an error for whoever opens the debug band;
+            // it is no longer the machine's own shout about it.
+            debug!("\x013Block device error: {error}");
             DevError::Io
         }
     }

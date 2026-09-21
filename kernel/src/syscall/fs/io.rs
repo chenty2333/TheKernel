@@ -2055,7 +2055,7 @@ fn try_regular_file_pwritev_user_segments(
 }
 
 pub fn sys_unsupported_fd(sysno: Sysno) -> AxResult<isize> {
-    warn!("Unimplemented fd syscall: {sysno}");
+    debug!("Unimplemented fd syscall: {sysno}");
     Err(AxError::Unsupported)
 }
 
@@ -4200,7 +4200,7 @@ pub fn sys_truncate(
             file.sync(false)?;
         }
         if let Err(error) = touch_modified_metadata(&loc) {
-            warn!("truncate metadata update failed after size mutation: {error}");
+            debug!("truncate metadata update failed after size mutation: {error}");
         }
         Ok(())
     })();
@@ -4282,7 +4282,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         f.inner().sync(false)?;
     }
     if let Err(error) = touch_modified_metadata(f.inner().location()) {
-        warn!("ftruncate metadata update failed after size mutation: {error}");
+        debug!("ftruncate metadata update failed after size mutation: {error}");
     }
     notify_write(fd);
     let _ = notify_exact(f.inner().location(), IN_ATTRIB);
@@ -4449,7 +4449,7 @@ pub(crate) fn fallocate_file_like(
                     file.sync(false)?;
                 }
                 if let Err(error) = touch_modified_metadata(&loc) {
-                    warn!(
+                    debug!(
                         "native fallocate metadata update failed after provider mutation: {error}"
                     );
                 }
@@ -4621,7 +4621,7 @@ pub(crate) fn fallocate_file_like(
     }
 
     if let Err(error) = touch_modified_metadata(&loc) {
-        warn!("fallocate metadata update failed after file mutation: {error}");
+        debug!("fallocate metadata update failed after file mutation: {error}");
     }
     if inode_flags::sync_on_content_write(&loc)? {
         file.sync(false)?;

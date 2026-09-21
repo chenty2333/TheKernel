@@ -58,7 +58,7 @@ fn a_monitor_is_found_and_the_mode_layer_reads_the_bytes_this_kernel_asked_for()
     let _guard = scheduler_test_context();
     let edid = edid_with_1080p60(0);
     let controller = FakeController::with_monitor(Pin::DdiB, &edid);
-    let device = probe_one(bdf(), &controller, &FakeClock::new());
+    let device = probe_one(bdf(), &controller, &FakeClock::new(), Narration::Boot);
 
     assert_eq!(device.monitor, Some(Pin::DdiB));
     assert_eq!(device.edid.map(|bytes| *bytes.bytes()), Some(edid));
@@ -89,7 +89,7 @@ fn nothing_plugged_in_says_so_on_every_pin_and_names_the_power_well() {
     let _guard = scheduler_test_context();
     let controller = FakeController::bare();
     controller.detach();
-    let device = probe_one(bdf(), &controller, &FakeClock::new());
+    let device = probe_one(bdf(), &controller, &FakeClock::new(), Narration::Boot);
 
     assert_eq!(device.monitor, None);
     assert_eq!(device.edid, None);
@@ -112,7 +112,7 @@ fn nothing_plugged_in_says_so_on_every_pin_and_names_the_power_well() {
 fn hotplug_is_enabled_and_read_for_every_ddi_in_the_same_pass() {
     let _guard = scheduler_test_context();
     let controller = FakeController::with_monitor(Pin::DdiA, &edid_with_1080p60(0));
-    let device = probe_one(bdf(), &controller, &FakeClock::new());
+    let device = probe_one(bdf(), &controller, &FakeClock::new(), Narration::Boot);
 
     assert_eq!(device.hotplug.len(), Ddi::ALL.len());
     assert!(device.hotplug_errors.is_empty());
@@ -152,7 +152,7 @@ fn the_extension_block_the_sink_declares_is_read_and_parsed_with_the_base() {
     eeprom[gmbus::EDID_BLOCK_LEN..].copy_from_slice(&extension);
     controller.load_eeprom(&eeprom);
 
-    let device = probe_one(bdf(), &controller, &FakeClock::new());
+    let device = probe_one(bdf(), &controller, &FakeClock::new(), Narration::Boot);
     assert_eq!(
         device.extension.map(|block| *block.bytes()),
         Some(extension)
@@ -170,7 +170,7 @@ fn a_window_that_does_not_reach_the_registers_is_reported_and_not_guessed_at() {
     let _guard = scheduler_test_context();
     let controller = FakeController::with_monitor(Pin::DdiA, &edid_with_1080p60(0));
     controller.set_window_len(0x1000);
-    let device = probe_one(bdf(), &controller, &FakeClock::new());
+    let device = probe_one(bdf(), &controller, &FakeClock::new(), Narration::Boot);
 
     assert_eq!(device.monitor, None);
     assert!(device.plan.is_none());

@@ -348,7 +348,7 @@ impl EthernetDevice {
     {
         if let Err(error) = inner.recycle_tx_buffers() {
             stats.record_tx_error();
-            warn!("recycle_tx_buffers failed: {error:?}");
+            debug!("\x014recycle_tx_buffers failed: {error:?}");
             return Err(Self::map_dev_error(error));
         }
 
@@ -356,7 +356,7 @@ impl EthernetDevice {
             Ok(buffer) => buffer,
             Err(error) => {
                 stats.record_tx_drop();
-                warn!("alloc_tx_buffer failed: {error:?}");
+                debug!("\x014alloc_tx_buffer failed: {error:?}");
                 return Err(Self::map_dev_error(error));
             }
         };
@@ -384,7 +384,7 @@ impl EthernetDevice {
             Err(error) => {
                 stats.record_tx_error();
                 stats.record_tx_drop();
-                warn!("transmit failed: {error:?}");
+                debug!("\x014transmit failed: {error:?}");
                 Err(Self::map_dev_error(error))
             }
         }
@@ -432,7 +432,7 @@ impl EthernetDevice {
         let Ok(parsed) = parse_ingress_frame(frame) else {
             self.stats.record_rx_error();
             self.stats.record_rx_drop();
-            warn!("Dropping malformed Ethernet frame");
+            debug!("\x014Dropping malformed Ethernet frame");
             return RxStep::Consumed;
         };
 
@@ -474,7 +474,7 @@ impl EthernetDevice {
 
     fn request_arp(&mut self, context: &PacketDeviceContext<'_>, target_ip: IpAddress) {
         let IpAddress::Ipv4(target_ipv4) = target_ip else {
-            warn!("IPv6 address ARP is not supported: {target_ip}");
+            debug!("IPv6 address ARP is not supported: {target_ip}");
             return;
         };
         debug!("Requesting ARP for {target_ipv4}");
@@ -753,12 +753,12 @@ impl Device for EthernetDevice {
         }
         if self.pending_packets.is_full() {
             self.stats.record_tx_drop();
-            warn!("Pending packets buffer is full, dropping packet");
+            debug!("\x014Pending packets buffer is full, dropping packet");
             return false;
         }
         let Ok(dst_buffer) = self.pending_packets.enqueue(packet.len(), next_hop) else {
             self.stats.record_tx_drop();
-            warn!("Failed to enqueue packet in pending packets buffer");
+            debug!("\x014Failed to enqueue packet in pending packets buffer");
             return false;
         };
         dst_buffer.copy_from_slice(packet);

@@ -54,7 +54,7 @@ pub fn init(args: &[String], envs: &[String]) {
         // HWP itself remains fleet-safe and the scheduler switch/tick paths
         // remain authoritative.  The IPI is only prompt propagation, so an
         // occupied optional broker lane must not prevent boot.
-        warn!("HWP clamp-refresh IPI unavailable; using switch/tick refresh");
+        debug!("HWP clamp-refresh IPI unavailable; using switch/tick refresh");
     }
     crate::mm::init_hardware_asids();
     crate::rcu::init().expect("Failed to initialize kernel RCU domains");
@@ -63,18 +63,24 @@ pub fn init(args: &[String], envs: &[String]) {
         // Native cBPF and native ET_REL modules share this strictly W^X
         // arena. Their optional admission paths return the captured error;
         // boot must not weaken alias safety when reservation fails.
-        error!("native executable arena unavailable: {error:?}");
+        // Priority 2: the strictly W^X arena that native cBPF and ET_REL
+        // modules share is gone, which is the death of a security property
+        // rather than of the boot, so it must beat a console an operator has
+        // quieted without being reported as a machine that stopped.
+        error!("\x012native executable arena unavailable: {error:?}");
     }
     if let Err(error) = crate::syscall::init_kernel_module_exports() {
         // Module relocation has a single, explicit native ABI.  Do not boot
         // with an empty or partially published export registry, because that
         // would make later module admission depend on boot ordering.
-        error!("failed to publish native module ABI exports: {error}");
-        system_off();
+        axruntime::klog::fatal(format_args!(
+            "failed to publish native module ABI exports: {error}"
+        ));
     }
     if let Err(error) = executable::init() {
-        error!("failed to initialize bounded executable registry: {error}");
-        system_off();
+        axruntime::klog::fatal(format_args!(
+            "failed to initialize bounded executable registry: {error}"
+        ));
     }
 
     {
@@ -109,8 +115,9 @@ pub fn init(args: &[String], envs: &[String]) {
     let security_registry = match crate::task::security::init() {
         Ok(registry) => registry,
         Err(error) => {
-            error!("failed to initialize frozen security registry: {error}");
-            system_off();
+            axruntime::klog::fatal(format_args!(
+                "failed to initialize frozen security registry: {error}"
+            ));
         }
     };
     let user_ns = UserNamespace::try_new_root().expect("Failed to allocate init user namespace");
@@ -318,9 +325,9 @@ pub fn init(args: &[String], envs: &[String]) {
     // TODO: wait for all processes to finish
     let exit_code = task.join().expect("Failed to join init task");
     if exit_code == 0 {
-        info!("Init exited normally; shutting down by boot-shell policy");
+        info!("\x015Init exited normally; shutting down by boot-shell policy");
     } else {
-        error!("Init terminated unexpectedly (status {exit_code}); shutting down");
+        error!("\x011Init terminated unexpectedly (status {exit_code}); shutting down");
     }
 
     let cx = init_fs_context.lock();

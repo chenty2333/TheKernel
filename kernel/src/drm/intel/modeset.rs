@@ -1411,7 +1411,7 @@ impl ModeOutcome {
     /// The same lines, to the kernel log.
     pub(crate) fn log(&self) {
         axlog::info!("intel-modeset: {}", self.choice.describe());
-        axlog::info!("intel-modeset: {}", self.pattern.describe());
+        axlog::debug!("intel-modeset: {}", self.pattern.describe());
         self.pipe_state.log();
         self.output.log();
         self.output_state.log();

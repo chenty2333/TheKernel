@@ -63,7 +63,7 @@ impl VirtIoEntropyDriver {
                 *slot = Some(device);
                 info!("registered VirtIO entropy source");
             }
-            Err(error) => warn!("failed to initialize VirtIO entropy source: {error:?}"),
+            Err(error) => debug!("failed to initialize VirtIO entropy source: {error:?}"),
         }
     }
 }

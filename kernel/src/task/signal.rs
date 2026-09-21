@@ -130,7 +130,7 @@ fn try_ptrace_signal_stop(
         return Err(record);
     }
     proc_data.try_ptrace_signal_stop(record)?;
-    info!(
+    debug!(
         "Stopping traced process {} by signal {}",
         proc_data.proc.pid(),
         signo as u8
@@ -768,7 +768,7 @@ pub fn send_signal_to_thread(tgid: Option<Pid>, tid: Pid, sig: Option<SignalInfo
     }
 
     if let Some(sig) = sig {
-        info!("Send signal {:?} to thread {}", sig.signo(), tid);
+        debug!("Send signal {:?} to thread {}", sig.signo(), tid);
         send_signal_thread_inner(&task, thread, sig);
     }
 
@@ -788,7 +788,7 @@ pub fn send_signal_to_visible_thread(
     }
 
     if let Some(sig) = sig {
-        info!("Send signal {:?} to thread {}", sig.signo(), tid);
+        debug!("Send signal {:?} to thread {}", sig.signo(), tid);
         send_signal_thread_inner(&task, thread, sig);
     }
 
@@ -808,7 +808,7 @@ pub(crate) fn send_queued_signal_to_visible_thread(
     }
 
     if let Some(sig) = sig {
-        info!("Queue signal {:?} to thread {}", sig.signo(), tid);
+        debug!("Queue signal {:?} to thread {}", sig.signo(), tid);
         return send_queued_signal_thread_inner(&task, thread, sig);
     }
     Ok(false)
@@ -898,7 +898,7 @@ pub fn send_signal_to_process_data(
     if let Some(sig) = sig {
         let target_cred = proc_data.group_leader_cred();
         let signo = sig.signo();
-        info!("Send signal {signo:?} to process {}", proc_data.proc.pid());
+        debug!("Send signal {signo:?} to process {}", proc_data.proc.pid());
         send_signal_to_process_data_with_policy(
             proc_data,
             &target_cred,
@@ -1101,7 +1101,7 @@ pub fn send_signal_to_process_group(pgid: Pid, sig: Option<SignalInfo>) -> AxRes
     let pg = get_process_group(pgid)?;
 
     if let Some(sig) = sig {
-        info!("Send signal {:?} to process group {}", sig.signo(), pgid);
+        debug!("Send signal {:?} to process group {}", sig.signo(), pgid);
         for proc in pg
             .try_processes(process_domain()?.registry())
             .map_err(process_error)?
@@ -1219,7 +1219,7 @@ fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
         return;
     }
 
-    info!(
+    debug!(
         "Stopping process {} by signal {}",
         proc_data.proc.pid(),
         signo
@@ -1243,13 +1243,13 @@ fn do_continue(proc_data: &ProcessData) {
     match proc_data.continue_job() {
         ContinueResult::None => {}
         ContinueResult::CanceledStopping => {
-            info!(
+            debug!(
                 "Canceling in-flight stop for process {}",
                 proc_data.proc.pid()
             );
         }
         ContinueResult::ResumedStopped => {
-            info!("Continuing process {}", proc_data.proc.pid());
+            debug!("Continuing process {}", proc_data.proc.pid());
             notify_tracer_or_parent_stop_continue(
                 proc_data,
                 linux_raw_sys::general::CLD_CONTINUED,

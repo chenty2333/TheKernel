@@ -1547,7 +1547,7 @@ fn open_resolved_location_with_policy_inner(
             if let Err(error) =
                 notify_parent_with_name(&parent, Some(&loc), loc.name(), IN_CREATE, loc.is_dir(), 0)
             {
-                warn!("open create notification failed: {error}");
+                debug!("open create notification failed: {error}");
             }
         } else {
             warn!("created open entry has no parent: {:?}", loc.name());
@@ -1698,14 +1698,14 @@ fn open_resolved_location_with_policy_inner(
     // precedes truncate mutation notifications.
     if (flags as u32) & O_PATH == 0 {
         if let Err(error) = notify_parent(&loc, IN_OPEN) {
-            warn!("open parent notification failed: {error}");
+            debug!("open parent notification failed: {error}");
         }
         if let Err(error) = notify_exact(&loc, IN_OPEN) {
-            warn!("open notification failed: {error}");
+            debug!("open notification failed: {error}");
         }
     }
     if truncates_regular && let Err(error) = notify_exact(&loc, IN_MODIFY | IN_ATTRIB) {
-        warn!("open truncate notification failed: {error}");
+        debug!("open truncate notification failed: {error}");
     }
 
     Ok(fd)
@@ -1921,7 +1921,7 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
         security.controlling_terminal(),
     )?;
     if let Err(error) = notify_exact(&loc, IN_OPEN) {
-        warn!("tmpfile open notification failed: {error}");
+        debug!("tmpfile open notification failed: {error}");
     }
     Ok(fd as isize)
 }

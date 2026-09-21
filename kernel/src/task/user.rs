@@ -87,7 +87,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
     TaskInner::try_new_with_id_limit(
         move || {
             let curr = axtask::current();
-            info!("Enter user space: ip={:#x}, sp={:#x}", uctx.ip(), uctx.sp());
+            debug!("Enter user space: ip={:#x}, sp={:#x}", uctx.ip(), uctx.sp());
 
             let thr = curr.as_thread();
             let tid = linux_pid_from_task_id(curr.id().as_u64())
@@ -174,7 +174,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                         let result =
                             handle_user_page_fault(aspace_handle, addr, flags, uctx.sp().into());
                         if result != PageFaultResult::Handled {
-                            info!(
+                            debug!(
                                 "{:?}: user page fault at {:#x} {:?}, pc={:#x}, sp={:#x}",
                                 thr.proc_data.proc,
                                 addr,

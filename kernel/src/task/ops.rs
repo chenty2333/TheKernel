@@ -12,7 +12,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axhal::{mem::phys_to_virt, paging::MappingFlags, power::system_off};
+use axhal::{mem::phys_to_virt, paging::MappingFlags};
 use axsync::Mutex;
 use axtask::{AxTaskRef, TaskInner, WeakAxTaskRef, current};
 use bytemuck::AnyBitPattern;
@@ -1442,9 +1442,9 @@ pub fn exit_robust_list(memory: &UserMemoryCapability, head: *const RobustListHe
 /// Two rings and no control-flow change, exposed to the guest through
 /// `/proc/sys/kernel/exit-status`.  It is the second generation of the probe in
 /// this worktree; the first recorded only pid-targeted wait results, and pushed
-/// them through the kernel log sink, which drops records under exactly the
-/// contention the race needs (`klog::allowed` is a `try_lock`).  It never
-/// captured a failing run.
+/// them through the kernel log sink, which at the time refused a record rather
+/// than waiting for the log lock -- under exactly the contention the race needs,
+/// so it never captured a failing run.
 ///
 /// Recorded events:
 ///
@@ -2206,8 +2206,8 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     crate::perf_sources::retire_kretprobe_task(thr.kernel_tid() as u64);
 
     match curr.id_name() {
-        Ok(name) => info!("{name} exit with code: {exit_code}"),
-        Err(error) => info!(
+        Ok(name) => debug!("{name} exit with code: {exit_code}"),
+        Err(error) => debug!(
             "Task({}) exit with code: {} (name unavailable: {})",
             curr.id().as_u64(),
             exit_code,
@@ -2289,14 +2289,20 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         }
         Ok(ThreadExitTransition::FinalThread(exit)) => Some(exit),
         Err(error) => {
-            error!(
-                "fatal exit transition failure for TID {} in process {} after irreversible setup: \
-                 {}",
-                tid,
+            // No `error!` here: the machine stops on this statement, so a record
+            // left for a console worker that never runs again is a fact nobody
+            // hears -- which is exactly what made this failure unreadable for as
+            // long as it existed.  The words go into the death notice instead,
+            // with the two state facts that tell the cases apart: `exit_thread`
+            // answers `NotLive` both for an init being killed and for a process
+            // that is already a zombie, and both arrive here as ESRCH.
+            axruntime::klog::fatal(format_args!(
+                "fatal exit transition failure for TID {tid} in process {} (init={}, zombie={}) \
+                 after irreversible setup: {error}",
                 process.pid(),
-                error
-            );
-            fail_closed_exit(error);
+                process.is_init(),
+                process.is_zombie(),
+            ))
         }
     };
     // Membership is now retired and lifecycle serialization excludes new
@@ -2619,9 +2625,24 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
 /// reversible. Once timer/rseq/group-exit or membership removal has begun,
 /// the caller cannot safely resume userspace after an internal fault, so this
 /// explicit fail-closed policy prevents a partially exited task from running.
+///
+/// `#[track_caller]` is what makes the notice diagnosable: the sites below all
+/// fail with a bare [`AxError`], and `No such process` from the keyring is a
+/// different bug from `No such process` from the PID namespace drain. The exit
+/// transaction is the one place in this kernel where stopping the machine is the
+/// agreed answer, so the machine has to say which invariant it stopped on.
+#[track_caller]
 pub(crate) fn fail_closed_exit(error: AxError) -> ! {
-    error!("fatal process-exit invariant failure: {error}");
-    system_off()
+    let site = core::panic::Location::caller();
+    // `fatal`, not `error!`: a machine that stops here never schedules the
+    // console worker again, so the notice has to leave through the diagnostic
+    // transport on this CPU, and be retained at `KERN_EMERG` for whatever reader
+    // survives it. `error!` would put it in a queue nobody is left to drain.
+    axruntime::klog::fatal(format_args!(
+        "fatal process-exit invariant failure at {}:{}: {error}",
+        site.file(),
+        site.line()
+    ))
 }
 
 #[cfg(test)]

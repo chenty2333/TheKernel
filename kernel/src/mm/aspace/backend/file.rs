@@ -717,7 +717,7 @@ impl FileBackendInner {
             }
             Err(PagingError::NotMapped) => true,
             Err(err) => {
-                warn!("Failed to unmap page {vaddr:?}: {err:?}");
+                debug!("Failed to unmap page {vaddr:?}: {err:?}");
                 false
             }
         }
@@ -808,7 +808,7 @@ impl Drop for WritableMappingAdmission {
             activation,
         ) {
             error!(
-                "failed to roll back writable-mapping admission: {error}; retaining exclusion \
+                "\x011failed to roll back writable-mapping admission: {error}; retaining exclusion \
                  fail-closed"
             );
         }
@@ -855,7 +855,7 @@ impl Drop for FixedWritableMappingAdmission {
         }
         if let Err(error) = self.inner.release_writable_segment() {
             error!(
-                "failed to release prepared fixed writable segment: {error}; retaining \
+                "\x011failed to release prepared fixed writable segment: {error}; retaining \
                  registration fail-closed"
             );
             // `release_writable_segment` restored the inner count on failure.
@@ -939,7 +939,7 @@ impl Drop for FileBackend {
                     }
                     if let Err(error) = self.0.release_writable_segment() {
                         error!(
-                            "failed to release file writable segment: {error}; retaining its \
+                            "\x011failed to release file writable segment: {error}; retaining its \
                              exclusion fail-closed"
                         );
                         self.1.store(SEGMENT_FAIL_CLOSED, Ordering::Release);

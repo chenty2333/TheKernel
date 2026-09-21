@@ -1500,7 +1500,7 @@ fn start_sqpoll_worker(ring: Arc<IoUring>) -> AxResult<()> {
                     match submit_entries(ring.as_ref(), ring.layout().sq_entries(), &actor) {
                         Ok((submitted, _)) => submitted,
                         Err(error) => {
-                            error!("io_uring SQPOLL worker stopped submission pass: {error:?}");
+                            debug!("io_uring SQPOLL worker stopped submission pass: {error:?}");
                             0
                         }
                     };
@@ -2683,7 +2683,7 @@ fn submit_entries(
                 match preparation {
                     Ok(step) => step,
                     Err(error) if submitted != 0 => {
-                        error!("io_uring stopped after {submitted} accepted SQEs: {error:?}");
+                        debug!("io_uring stopped after {submitted} accepted SQEs: {error:?}");
                         return Ok((submitted, false));
                     }
                     Err(error) => return Err(error),
@@ -2769,7 +2769,7 @@ fn submit_entries(
                                     prepared,
                                     negative_errno(error),
                                 ) {
-                                    error!(
+                                    debug!(
                                         "io_uring failed to publish file-binding error after \
                                          acceptance: {completion_error:?}"
                                     );
@@ -2814,7 +2814,7 @@ fn submit_entries(
                                     prepared,
                                     negative_errno(error),
                                 ) {
-                                    error!(
+                                    debug!(
                                         "io_uring failed to publish buffer-binding error after \
                                          acceptance: {completion_error:?}"
                                     );
@@ -2861,7 +2861,7 @@ fn submit_entries(
                                     prepared,
                                     negative_errno(error),
                                 ) {
-                                    error!(
+                                    debug!(
                                         "io_uring failed to publish provided-buffer error after \
                                          acceptance: {completion_error:?}"
                                     );
@@ -3096,7 +3096,7 @@ fn submit_entries(
                             actor.memory().clone(),
                         ) {
                             if submitted != 0 {
-                                error!("io_uring stopped before POLL admission: {error:?}");
+                                debug!("io_uring stopped before POLL admission: {error:?}");
                                 return Ok((submitted, false));
                             }
                             return Err(error);
@@ -3116,7 +3116,7 @@ fn submit_entries(
                     ) {
                         Ok(work) => work,
                         Err(error) if submitted != 0 => {
-                            error!("io_uring stopped before SQ admission commit: {error:?}");
+                            debug!("io_uring stopped before SQ admission commit: {error:?}");
                             return Ok((submitted, false));
                         }
                         Err(error) => return Err(error),
@@ -3132,7 +3132,7 @@ fn submit_entries(
                     let dispatch = match ring.submit_with_dependencies(work) {
                         Ok(dispatch) => dispatch,
                         Err(error) => {
-                            error!(
+                            debug!(
                                 "io_uring dependency admission failed after acceptance: {error:?}"
                             );
                             return Ok((submitted, false));
@@ -3156,7 +3156,7 @@ fn submit_entries(
             }
             Ok(_) => {}
             Err(error) => {
-                error!("io_uring completion failed after acceptance: {error:?}");
+                debug!("io_uring completion failed after acceptance: {error:?}");
                 return Ok((submitted, false));
             }
         }

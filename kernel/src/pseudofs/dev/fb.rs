@@ -890,7 +890,7 @@ impl DisplayCore {
             return;
         }
         if let Err(error) = self.scanout.present() {
-            warn!("Failed to commit framebuffer scanout: {error:?}");
+            debug!("Failed to commit framebuffer scanout: {error:?}");
             // Retain correctness after a transient device failure.
             self.mark_full();
         }

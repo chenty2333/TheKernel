@@ -522,7 +522,7 @@ fn the_sink_step_still_finds_what_it_found_before_this_module_composed_it() {
     // path that ran before phase 2.1 was composed in front of it, and composing
     // must not have changed what it reads.
     let controller = FakeController::with_monitor(Pin::DdiB, &block);
-    let device = sink::probe_one(bdf(), &controller, &FakeClock::new());
+    let device = sink::probe_one(bdf(), &controller, &FakeClock::new(), Narration::Boot);
 
     assert_eq!(device.monitor, Some(Pin::DdiB));
     assert_eq!(device.edid.map(|edid| *edid.bytes()), Some(block));

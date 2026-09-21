@@ -122,11 +122,39 @@ impl ModePlan {
     }
 }
 
-/// Parses an EDID, enumerates its modes, chooses one and logs the decision.
+/// Who asked for a reading, and so who hears it on the console.
+///
+/// The plan does not depend on this; only the log lines do.  A boot probe is the
+/// machine's first statement about what is plugged in, so everything it found is
+/// news.  The after-boot hotplug watch re-runs the same reading whenever a
+/// connect line changes -- up to four times a second on a connector that flaps
+/// -- programs nothing from the answer, and keeps it in its own debug file, so a
+/// re-probe's console lines are a copy of text a reader can already ask for.  A
+/// watch pass therefore says only what no file keeps, and says it in the band a
+/// repeat can be throttled in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Narration {
+    /// A first reading of this sink: say everything the reading found.
+    Boot,
+    /// A re-probe after boot: say only what nothing else keeps.
+    Watch,
+}
+
+/// Parses an EDID, enumerates its modes, chooses one and logs the decision as
+/// the first reading of that sink.
 ///
 /// This is the function a display driver calls.  It never fails: see
 /// [`ModePlan`] for what happened.
 pub fn plan_modeset(edid_bytes: &[u8], constraints: &Constraints) -> ModePlan {
+    plan_modeset_at(edid_bytes, constraints, Narration::Boot)
+}
+
+/// [`plan_modeset`] with the caller saying who asked, and so who hears it.
+pub fn plan_modeset_at(
+    edid_bytes: &[u8],
+    constraints: &Constraints,
+    narration: Narration,
+) -> ModePlan {
     let mut list = ModeList::new();
     let plan = match Edid::parse(edid_bytes) {
         Ok(edid) => {
@@ -159,7 +187,7 @@ pub fn plan_modeset(edid_bytes: &[u8], constraints: &Constraints) -> ModePlan {
             },
         },
     };
-    log_plan(&plan);
+    log_plan(&plan, narration);
     plan
 }
 
@@ -168,30 +196,48 @@ pub fn plan_modeset(edid_bytes: &[u8], constraints: &Constraints) -> ModePlan {
 /// Exactly one line describes the chosen mode; anything the EDID needed to
 /// skip, and any use of the fallback timing, is a warning.  On a machine whose
 /// only output is its screen, this line is how a modeset is diagnosed.
-pub fn log_plan(plan: &ModePlan) {
+///
+/// `narration` says who asked: see [`Narration`] for what a re-probe leaves out
+/// and why.
+pub fn log_plan(plan: &ModePlan, narration: Narration) {
     if let Some(error) = plan.edid_error {
-        if plan.strict {
-            warn!("drm: EDID rejected: {error}");
-        } else {
-            warn!("drm: EDID parsed leniently after: {error}");
+        match (narration, plan.strict) {
+            (Narration::Boot, true) => warn!("drm: EDID rejected: {error}"),
+            (Narration::Boot, false) => warn!("drm: EDID parsed leniently after: {error}"),
+            // The EDID's defects are the one fact about a reading the probe's
+            // debug file does not render, so a watch pass says them anyway -- in
+            // the `debug` band, where the per-call-site budget throttles a
+            // cable that flaps four times a second instead of letting it
+            // reprint the same complaint forever.  `\x014` keeps the console
+            // priority the warning had, so a quiet-enough console still shows it.
+            (Narration::Watch, true) => debug!("\x014drm: EDID rejected: {error}"),
+            (Narration::Watch, false) => debug!("\x014drm: EDID parsed leniently after: {error}"),
         }
     }
     if !plan.warnings.is_clean() {
-        warn!("drm: EDID warnings: {}", plan.warnings);
+        match narration {
+            Narration::Boot => warn!("drm: EDID warnings: {}", plan.warnings),
+            Narration::Watch => debug!("\x014drm: EDID warnings: {}", plan.warnings),
+        }
+    }
+    if matches!(narration, Narration::Watch) {
+        // What is left is the choice itself, and its reason, which the probe's
+        // debug file renders for every pass including this one.
+        return;
     }
     if plan.report.overflowed {
-        warn!(
+        debug!(
             "drm: more than {MAX_MODES} modes advertised; the list was truncated"
         );
     }
     if plan.report.skipped_without_a_table_row > 0 {
-        info!(
+        debug!(
             "drm: {} advertised timings have no table row and were skipped",
             plan.report.skipped_without_a_table_row
         );
     }
     if plan.report.skipped_unknown_vic > 0 {
-        info!(
+        debug!(
             "drm: {} video identification codes are not defined by CTA-861",
             plan.report.skipped_unknown_vic
         );

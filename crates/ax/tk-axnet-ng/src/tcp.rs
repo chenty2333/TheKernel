@@ -567,7 +567,7 @@ impl SocketOps for TcpSocket {
                         }
                     }
                 }
-                info!("TCP connection from {bound_endpoint} to {remote_endpoint}");
+                debug!("TCP connection from {bound_endpoint} to {remote_endpoint}");
 
                 self.with_service_and_smol_socket(|service, socket| {
                     socket.set_bound_endpoint(bound_endpoint);

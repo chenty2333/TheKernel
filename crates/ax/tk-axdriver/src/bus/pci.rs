@@ -1,6 +1,6 @@
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 use alloc::collections::{BTreeMap, BTreeSet};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axdriver_pci::{
     BarInfo, Cam, Command, DeviceFunction, DeviceFunctionInfo, HeaderType, MemoryBarType,
@@ -70,7 +70,10 @@ fn walk_reachable_pci_functions(
                 continue;
             }
             if pending_len == MAX_REACHABLE_PCI_BUSES {
-                warn!(
+                // A bus whose topology always fills the budget makes this true on
+                // every walk, including the input reconcile's per-second one. It
+                // describes the machine, not an event, so it is `dmesg` material.
+                debug!(
                     "PCI reachable-bus budget ({MAX_REACHABLE_PCI_BUSES}) exhausted at {bdf}; stopping discovery"
                 );
                 return;
@@ -268,6 +271,10 @@ fn pci_scan_bus_end() -> u8 {
 /// :133-146) so nothing touches the window.  This kernel has ECAM only, with no
 /// port-I/O fallback to retreat to, so a failure here ends the PCI scan.
 static ECAM_WINDOW: AtomicUsize = AtomicUsize::new(0);
+/// Whether the machine has already been told that ECAM cannot be mapped. The
+/// mapping is retried (a refusal is not permanent), this is not: see
+/// [`ecam_window`].
+static ECAM_REFUSAL_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Establish the ECAM mapping once, then report it.
 fn ecam_window() -> Option<VirtAddr> {
@@ -283,10 +290,12 @@ fn ecam_window() -> Option<VirtAddr> {
     let base = axhal::pci::ecam_base();
     let size = (bus_end.saturating_sub(bus_begin) as usize + 1) << PCI_ECAM_BUS_SHIFT;
     let Some(window_end) = base.checked_add(size) else {
-        error!(
-            "pci-ecam: region at {base:#x} for {size:#x} bytes overflows the address space; \
-             PCI configuration space is unreachable"
-        );
+        if !ECAM_REFUSAL_REPORTED.swap(true, Ordering::AcqRel) {
+            error!(
+                "pci-ecam: region at {base:#x} for {size:#x} bytes overflows the address space; \
+                 PCI configuration space is unreachable"
+            );
+        }
         return None;
     };
 
@@ -300,11 +309,19 @@ fn ecam_window() -> Option<VirtAddr> {
             Some(virt)
         }
         Err(error) => {
-            error!(
-                "pci-ecam: cannot map [{base:#x}, {window_end:#x}) for buses {bus_begin}..=\
-                 {bus_end}: {error:?}; PCI configuration space is unreachable, so no bus scan \
-                 runs"
-            );
+            // Retried on a timer by the PCI input reconcile worker, so the
+            // refusal is news once and not news once a second: an unthrottled
+            // `error!` on a timer both floods the console and is the fastest way
+            // this kernel has of erasing its own boot ring. The attempt itself
+            // still repeats, because a refused mapping is not a refused mapping
+            // forever -- this latch speaks only about who gets told.
+            if !ECAM_REFUSAL_REPORTED.swap(true, Ordering::AcqRel) {
+                error!(
+                    "pci-ecam: cannot map [{base:#x}, {window_end:#x}) for buses {bus_begin}..=\
+                     {bus_end}: {error:?}; PCI configuration space is unreachable, so no bus \
+                     scan runs. A repeated refusal is not reported again."
+                );
+            }
             None
         }
     }
@@ -680,7 +697,13 @@ pub(crate) fn reconcile_input_devices<Register, Unregister>(
         let mut pending = alloc::vec::Vec::new();
         for (key, bdf, info) in additions {
             if config_pci_device(&mut root, bdf, &mut registry.allocator).is_err() {
-                warn!("failed to configure hotplugged PCI function at {bdf}");
+                // A function that will not configure stays "never owned", so the
+                // next tick retries it and would report it again: once a second,
+                // forever, at a level no filter caps. The debug band is what says
+                // "this is a fault, and it is also routine"; the `\x014` keeps it a
+                // warning for whoever opened that band, and the window budget
+                // bounds it there.
+                debug!("\x014failed to configure hotplugged PCI function at {bdf}");
                 continue;
             }
             if let Some(device) = probe_virtio_input(&mut root, bdf, &info) {

@@ -1124,7 +1124,7 @@ impl OutputProgram {
     /// that true even when a later step fails on a machine with no serial port.
     pub(crate) fn log(&self) {
         for text in self.render().lines() {
-            axlog::info!("{text}");
+            axlog::debug!("{text}");
         }
     }
 }
@@ -1200,7 +1200,7 @@ impl OutputState {
     /// Emit [`Self::render`] to the kernel log, one line at a time.
     pub(crate) fn log(&self) {
         for text in self.render().lines() {
-            axlog::info!("{text}");
+            axlog::debug!("{text}");
         }
     }
 }

@@ -942,7 +942,7 @@ impl DeviceOps for LoopDevice {
             }
             BLKRRPART | BLKRAGET | BLKRASET => return Err(AxError::OperationNotSupported),
             _ => {
-                warn!("unknown ioctl for loop device: {cmd}");
+                debug!("unknown ioctl for loop device: {cmd}");
                 return Err(AxError::NotATty);
             }
         }

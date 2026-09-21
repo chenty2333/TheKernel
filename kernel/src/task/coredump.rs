@@ -187,7 +187,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     let pid = proc_data.proc.pid();
     let core_limit = proc_data.rlim.read()[RLIMIT_CORE].current;
     if core_limit == 0 {
-        info!("Skipping core dump for pid {pid}: RLIMIT_CORE=0");
+        debug!("Skipping core dump for pid {pid}: RLIMIT_CORE=0");
         return Ok(false);
     }
     let core_limit = if core_limit == RLIM_INFINITY as u64 {
@@ -196,7 +196,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         core_limit.try_into().unwrap_or(usize::MAX)
     };
     let Some(aspace_handle) = proc_data.coredump_aspace() else {
-        info!("Skipping core dump for pid {pid}: process image is not dumpable");
+        debug!("Skipping core dump for pid {pid}: process image is not dumpable");
         return Ok(false);
     };
     let path = FsPathBuf::from_vec(format!("/tmp/core.{pid}").into_bytes());

@@ -635,7 +635,7 @@ impl SocketOps for UdpSocket {
         route.device_mask = device_mask;
         drop(route);
         self.poll_state.wake();
-        info!("UDP socket {}: bound on {}", self.handle, endpoint);
+        debug!("UDP socket {}: bound on {}", self.handle, endpoint);
         Ok(())
     }
 
@@ -874,7 +874,11 @@ impl SocketOps for UdpSocket {
 
                             let read = dst.write(src)?;
                             if read < src.len() {
-                                warn!("UDP message truncated: {} -> {} bytes", src.len(), read);
+                                debug!(
+                                    "\x014UDP message truncated: {} -> {} bytes",
+                                    src.len(),
+                                    read
+                                );
                             }
 
                             Ok(if flags.contains(RecvFlags::TRUNCATE) {

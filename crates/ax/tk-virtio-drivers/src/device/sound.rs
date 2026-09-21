@@ -14,7 +14,7 @@ use core::{
 
 use bitflags::bitflags;
 use enumn::N;
-use log::{error, info, warn};
+use log::{info, warn};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use super::common::Feature;
@@ -256,7 +256,9 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
     /// Query information about the available jacks.
     fn jack_info(&mut self, jack_start_id: u32, jack_count: u32) -> Result<Vec<VirtIOSndJackInfo>> {
         if jack_start_id + jack_count > self.jacks {
-            error!("jack_start_id + jack_count > jacks! There are not enough jacks to be queried!");
+            log::debug!(
+                "jack_start_id + jack_count > jacks! There are not enough jacks to be queried!"
+            );
             return Err(Error::IoError);
         }
         let hdr = self.request(VirtIOSndQueryInfo {
@@ -290,7 +292,7 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
         stream_count: u32,
     ) -> Result<Vec<VirtIOSndPcmInfo>> {
         if stream_start_id + stream_count > self.streams {
-            error!(
+            log::debug!(
                 "stream_start_id + stream_count > streams! There are not enough streams to be \
                  queried!"
             );
@@ -328,7 +330,7 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
         chmaps_count: u32,
     ) -> Result<Vec<VirtIOSndChmapInfo>> {
         if chmaps_start_id + chmaps_count > self.chmaps {
-            error!("chmaps_start_id + chmaps_count > self.chmaps");
+            log::debug!("chmaps_start_id + chmaps_count > self.chmaps");
             return Err(Error::IoError);
         }
         let hdr = self.request(VirtIOSndQueryInfo {
@@ -363,11 +365,13 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
             self.set_up = true;
         }
         if self.jacks == 0 {
-            error!("[sound device] There is no available jacks!");
+            log::debug!("[sound device] There is no available jacks!");
             return Err(Error::InvalidParam);
         }
         if jack_id >= self.jacks {
-            error!("jack_id >= self.jacks! Make sure jack_id is in the range of [0, jacks - 1)!");
+            log::debug!(
+                "jack_id >= self.jacks! Make sure jack_id is in the range of [0, jacks - 1)!"
+            );
             return Err(Error::InvalidParam);
         }
 
@@ -380,7 +384,7 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
                 .features,
         );
         if !jack_features.contains(JackFeatures::REMAP) {
-            error!("The jack selected does not support VIRTIO_SND_JACK_F_REMAP!");
+            log::debug!("The jack selected does not support VIRTIO_SND_JACK_F_REMAP!");
             return Err(Error::Unsupported);
         }
         let hdr = self.request(VirtIOSndJackRemap {
@@ -535,7 +539,7 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
             self.set_up = true;
         }
         if !self.pcm_parameters[stream_id as usize].setup {
-            warn!("Please set parameters for a stream before using it!");
+            log::debug!("\x014Please set parameters for a stream before using it!");
             return Err(Error::IoError);
         }
 
@@ -613,7 +617,7 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
             return Err(Error::InvalidParam);
         }
         if !self.pcm_parameters[stream_id as usize].setup {
-            warn!("Please set parameters for a stream before using it!");
+            log::debug!("\x014Please set parameters for a stream before using it!");
             return Err(Error::IoError);
         }
         const U32_SIZE: usize = size_of::<u32>();

@@ -338,7 +338,7 @@ impl PipeChecks {
     /// Put [`Self::render`] into the kernel log.
     pub(crate) fn log(&self) {
         for line in self.render().lines() {
-            axlog::info!("{line}");
+            axlog::debug!("{line}");
         }
     }
 }

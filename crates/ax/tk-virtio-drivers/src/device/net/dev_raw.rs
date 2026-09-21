@@ -1,6 +1,6 @@
 use core::{hint::spin_loop, mem::ManuallyDrop};
 
-use log::{debug, info, warn};
+use log::{debug, info};
 use zerocopy::AsBytes;
 
 use super::{
@@ -237,7 +237,7 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
     /// Whether the length of the receive buffer is valid.
     fn check_rx_buf_len(rx_buf: &[u8]) -> Result<()> {
         if rx_buf.len() < MIN_BUFFER_LEN {
-            warn!("Receive buffer len {} is too small", rx_buf.len());
+            debug!("\x014Receive buffer len {} is too small", rx_buf.len());
             Err(Error::InvalidParam)
         } else {
             Ok(())
@@ -247,7 +247,7 @@ impl<H: Hal, T: Transport, const QUEUE_SIZE: usize> VirtIONetRaw<H, T, QUEUE_SIZ
     /// Whether the length of the transmit buffer is valid.
     fn check_tx_buf_len(tx_buf: &[u8]) -> Result<()> {
         if tx_buf.len() < NET_HDR_SIZE {
-            warn!("Transmit buffer len {} is too small", tx_buf.len());
+            debug!("\x014Transmit buffer len {} is too small", tx_buf.len());
             Err(Error::InvalidParam)
         } else {
             Ok(())

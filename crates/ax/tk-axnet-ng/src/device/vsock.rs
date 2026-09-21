@@ -374,14 +374,14 @@ fn abort_overflowed_connection(
 ) {
     outcome.progress = EventProgress::Progress;
     if let Err(error) = dev.abort(conn_id) {
-        warn!("failed to abort overflowed vsock connection: {error:?}");
+        debug!("\x014failed to abort overflowed vsock connection: {error:?}");
     }
     match manager.on_disconnected(conn_id) {
         Ok((rx_poll, connect_poll)) => {
             outcome.notifications.rx_poll = rx_poll;
             outcome.notifications.connect_poll = connect_poll;
         }
-        Err(error) => warn!("failed to publish overflow disconnect: {error:?}"),
+        Err(error) => debug!("\x014failed to publish overflow disconnect: {error:?}"),
     }
 }
 
@@ -399,14 +399,14 @@ fn handle_vsock_event(
             match manager.on_connection_request(conn_id) {
                 Ok(accept_poll) => outcome.notifications.accept_poll = accept_poll,
                 Err(e) => {
-                    info!("Connection request failed: {conn_id:?}, error={e:?}");
+                    debug!("\x014Connection request failed: {conn_id:?}, error={e:?}");
                     // The VirtIO layer has already sent its acceptance before
                     // publishing ConnectionRequest. Finish the upper-state
                     // rollback, release its lock, and explicitly reject the
                     // lower connection so the two layers cannot diverge.
                     drop(manager);
                     if let Err(error) = dev.abort(conn_id) {
-                        warn!("failed to abort rejected vsock connection: {error:?}");
+                        debug!("\x014failed to abort rejected vsock connection: {error:?}");
                     }
                 }
             }
@@ -417,7 +417,7 @@ fn handle_vsock_event(
             let free_space = if let Some(conn) = manager.get_connection(conn_id) {
                 conn.lock().rx_buffer_free()
             } else {
-                info!("Received data for unknown connection: {conn_id:?}");
+                debug!("\x014Received data for unknown connection: {conn_id:?}");
                 return EventOutcome::progress();
             };
 
@@ -427,7 +427,7 @@ fn handle_vsock_event(
                     .push_back(VsockDriverEvent::Received(conn_id, len))
                     .is_err()
                 {
-                    warn!("bounded vsock deferred-event queue is full; aborting {conn_id:?}");
+                    debug!("\x014bounded vsock deferred-event queue is full; aborting {conn_id:?}");
                     let mut outcome = EventOutcome::progress();
                     abort_overflowed_connection(dev, &mut manager, conn_id, &mut outcome);
                     return outcome;
@@ -442,8 +442,8 @@ fn handle_vsock_event(
                     let mut outcome = EventOutcome::received(read_len, remaining);
                     match manager.on_data_received(conn_id, &buf[..read_len]) {
                         Ok(rx_poll) => outcome.notifications.rx_poll = rx_poll,
-                        Err(e) => info!(
-                            "Failed to handle received data: conn_id={conn_id:?}, error={e:?}",
+                        Err(e) => debug!(
+                            "\x014Failed to handle received data: conn_id={conn_id:?}, error={e:?}",
                         ),
                     }
                     if remaining != 0
@@ -452,8 +452,8 @@ fn handle_vsock_event(
                             .push_back(VsockDriverEvent::Received(conn_id, remaining))
                             .is_err()
                     {
-                        warn!(
-                            "bounded vsock deferred-event queue overflowed a partial receive; \
+                        debug!(
+                            "\x014bounded vsock deferred-event queue overflowed a partial receive; \
                              aborting {conn_id:?}"
                         );
                         abort_overflowed_connection(dev, &mut manager, conn_id, &mut outcome);
@@ -461,7 +461,7 @@ fn handle_vsock_event(
                     outcome
                 }
                 Err(e) => {
-                    info!("Failed to receive vsock data: conn_id={conn_id:?}, error={e:?}",);
+                    debug!("\x014Failed to receive vsock data: conn_id={conn_id:?}, error={e:?}",);
                     EventOutcome::progress()
                 }
             }
@@ -474,7 +474,7 @@ fn handle_vsock_event(
                     outcome.notifications.rx_poll = rx_poll;
                     outcome.notifications.connect_poll = connect_poll;
                 }
-                Err(e) => info!("Failed to handle disconnection: {conn_id:?}, error={e:?}",),
+                Err(e) => debug!("\x014Failed to handle disconnection: {conn_id:?}, error={e:?}",),
             }
             outcome
         }
@@ -484,7 +484,9 @@ fn handle_vsock_event(
             match manager.on_connected(conn_id) {
                 Ok(connect_poll) => outcome.notifications.connect_poll = connect_poll,
                 Err(e) => {
-                    info!("Failed to handle connection established: {conn_id:?}, error={e:?}",)
+                    debug!(
+                "\x014Failed to handle connection established: {conn_id:?}, error={e:?}",
+            )
                 }
             }
             outcome
@@ -494,13 +496,13 @@ fn handle_vsock_event(
             let mut outcome = EventOutcome::progress();
             match manager.on_credit_update(conn_id) {
                 Ok(tx_wait) => outcome.notifications.tx_wait = tx_wait,
-                Err(e) => warn!("Failed to handle credit update: {conn_id:?}, error={e:?}"),
+                Err(e) => debug!("\x014Failed to handle credit update: {conn_id:?}, error={e:?}"),
             }
             outcome
         }
 
         VsockDriverEvent::Unknown => {
-            warn!("Received unknown vsock event");
+            debug!("\x014Received unknown vsock event");
             EventOutcome::progress()
         }
     }

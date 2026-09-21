@@ -2033,7 +2033,7 @@ fn recv_impl(
                         continue;
                     }
                     Err(_) => {
-                        warn!("received unexpected cmsg");
+                        debug!("received unexpected cmsg");
                         control_truncated = true;
                         continue;
                     }

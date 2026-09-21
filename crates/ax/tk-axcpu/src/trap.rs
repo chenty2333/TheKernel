@@ -109,11 +109,18 @@ macro_rules! handle_trap {
         let mut iter = $crate::trap::NMI.iter();
         if let Some(func) = iter.next() {
             if iter.next().is_some() {
-                warn!("Multiple handlers for trap NMI are not currently supported");
+                // A second registration is a bug in whatever asked for it, and it
+                // says the same thing on every interrupt until the machine stops,
+                // so one dispatch site reports it once.
+                static REPORTED: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                    warn!("Multiple handlers for trap NMI are not currently supported");
+                }
             }
             func($frame)
         } else {
-            warn!("No registered handler for trap NMI");
+            debug!("\x014No registered handler for trap NMI");
             false
         }
     }};
@@ -124,11 +131,15 @@ macro_rules! handle_trap {
             let mut iter = $crate::trap::IRQ.iter();
             if let Some(func) = iter.next() {
                 if iter.next().is_some() {
-                    warn!("Multiple handlers for trap IRQ are not currently supported");
+                    static REPORTED: core::sync::atomic::AtomicBool =
+                        core::sync::atomic::AtomicBool::new(false);
+                    if !REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                        warn!("Multiple handlers for trap IRQ are not currently supported");
+                    }
                 }
                 func($vector)
             } else {
-                warn!("No registered handler for trap IRQ");
+                debug!("\x014No registered handler for trap IRQ");
                 false
             }
         };
@@ -140,11 +151,18 @@ macro_rules! handle_trap {
         let mut iter = $crate::trap::$trap.iter();
         if let Some(func) = iter.next() {
             if iter.next().is_some() {
-                warn!("Multiple handlers for trap {} are not currently supported", stringify!($trap));
+                static REPORTED: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                if !REPORTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                    warn!(
+                        "Multiple handlers for trap {} are not currently supported",
+                        stringify!($trap)
+                    );
+                }
             }
             func($($args)*)
         } else {
-            warn!("No registered handler for trap {}", stringify!($trap));
+            debug!("\x014No registered handler for trap {}", stringify!($trap));
             false
         }
     }}

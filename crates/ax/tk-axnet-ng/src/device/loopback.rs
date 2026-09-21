@@ -248,7 +248,7 @@ impl Device for LoopbackDevice {
     ) -> bool {
         let Some(protocol) = Self::ip_protocol(packet) else {
             self.stats.record_tx_drop();
-            warn!("Loopback device received a malformed IP packet for {next_hop}");
+            debug!("\x014Loopback device received a malformed IP packet for {next_hop}");
             return false;
         };
         let header = Self::make_header(protocol, &[0; 6]);
@@ -256,7 +256,7 @@ impl Device for LoopbackDevice {
             Ok(()) => true,
             Err(_) => {
                 self.stats.record_tx_drop();
-                warn!("Loopback device buffer is full, dropping packet to {next_hop}");
+                debug!("\x014Loopback device buffer is full, dropping packet to {next_hop}");
                 false
             }
         }

@@ -100,7 +100,7 @@ impl ListenTable {
             )));
             Ok(())
         } else {
-            warn!("socket already listening on port {port}");
+            debug!("socket already listening on port {port}");
             Err(AxError::AddrInUse)
         }
     }
@@ -133,7 +133,7 @@ impl ListenTable {
                 .iter()
                 .any(|&handle| is_connected(handle, &sockets)))
         } else {
-            warn!("accept before listen");
+            debug!("accept before listen");
             Err(AxError::InvalidInput)
         }
     }
@@ -148,7 +148,7 @@ impl ListenTable {
         let entry = self.listen_entry(port);
         let mut table = entry.lock();
         let Some(entry) = table.deref_mut() else {
-            warn!("accept before listen");
+            debug!("accept before listen");
             return Err(AxError::InvalidInput);
         };
 
@@ -159,7 +159,7 @@ impl ListenTable {
             .find_map(|(idx, &handle)| is_connected(handle, &sockets).then_some(idx))
             .ok_or(AxError::WouldBlock)?; // wait for connection
         if idx > 0 {
-            warn!(
+            debug!(
                 "slow SYN queue enumeration: index = {}, len = {}!",
                 idx,
                 syn_queue.len()
@@ -170,7 +170,7 @@ impl ListenTable {
         // If the connection is reset, return ConnectionReset error
         // Otherwise, return the handle and the address tuple
         if is_closed(handle, &sockets) {
-            warn!("accept failed: connection reset");
+            debug!("\x014accept failed: connection reset");
             entry.accept_reservations -= 1;
             sockets.remove(handle);
             Err(AxError::ConnectionReset)
@@ -220,20 +220,20 @@ impl ListenTable {
             }
             if entry.syn_queue.len() + entry.accept_reservations >= entry.queue_limit {
                 // SYN queue is full, drop the packet
-                warn!("SYN queue overflow!");
+                debug!("\x014SYN queue overflow!");
                 return;
             }
 
             let Ok(mut socket) = new_tcp_socket() else {
-                warn!("Failed to allocate TCP buffers for an incoming connection");
+                debug!("\x014Failed to allocate TCP buffers for an incoming connection");
                 return;
             };
             if let Err(err) = socket.listen(entry.listen_endpoint) {
-                warn!("Failed to listen on {}: {:?}", entry.listen_endpoint, err);
+                debug!("\x014Failed to listen on {}: {:?}", entry.listen_endpoint, err);
                 return;
             }
             if sockets.iter().count() >= MAX_SOCKETS {
-                warn!("network socket storage is full; dropping incoming connection");
+                debug!("\x014network socket storage is full; dropping incoming connection");
                 return;
             }
             let handle = sockets.add(socket);

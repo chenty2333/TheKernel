@@ -235,7 +235,7 @@ fn memory_pressure_worker() {
     let mut pressure_episode_active = false;
     loop {
         if let Err(error) = axtask::sleep(Duration::from_millis(poll_interval_ms)) {
-            error!("memory-pressure worker stopped: {error}");
+            error!("\x011memory-pressure worker stopped: {error}");
             return;
         }
         let mut reclaimed_this_wake = 0usize;

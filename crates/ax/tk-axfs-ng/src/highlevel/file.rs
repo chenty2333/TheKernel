@@ -2226,23 +2226,23 @@ fn flush_and_release_closed_file_cache_candidate(candidate: ClosedFileCacheTrimC
     let file = match candidate.anchor.entry().as_file() {
         Ok(file) => file,
         Err(err) => {
-            warn!("Failed to access retained cached file for trim: {err:?}");
+            debug!("Failed to access retained cached file for trim: {err:?}");
             record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_FLUSH_ERRORS, 1);
             return false;
         }
     };
     if let Err(err) = flush_dirty_cache_shared(&candidate.shared, file) {
-        warn!("Failed to flush retained cached file before trim: {err:?}");
+        debug!("Failed to flush retained cached file before trim: {err:?}");
         record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_FLUSH_ERRORS, 1);
         return false;
     }
     if let Err(err) = candidate.anchor.flush_metadata_time_overlay() {
-        warn!("Failed to flush retained cached file timestamps before trim: {err:?}");
+        debug!("Failed to flush retained cached file timestamps before trim: {err:?}");
         record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_FLUSH_ERRORS, 1);
         return false;
     }
     if let Err(err) = discard_cached_pages(&candidate.shared) {
-        warn!("Failed to invalidate retained cached file before trim: {err:?}");
+        debug!("Failed to invalidate retained cached file before trim: {err:?}");
         record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_FLUSH_ERRORS, 1);
         return false;
     }
@@ -3433,7 +3433,7 @@ impl PageCache {
         let addr = global_allocator()
             .alloc_pages(1, PAGE_SIZE, UsageKind::PageCache)
             .inspect_err(|err| {
-                warn!("Failed to allocate page cache: {:?}", err);
+                debug!("\x014Failed to allocate page cache: {:?}", err);
             })?;
         if shmem {
             IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES.fetch_add(1, Ordering::Release);
@@ -3614,8 +3614,8 @@ impl Drop for CachedFilePagePin {
     fn drop(&mut self) {
         let mut guard = self.cache.shared.page_cache.lock();
         let Some(page) = guard.get_mut(&self.pn) else {
-            warn!(
-                "CachedFilePagePin::drop: missing pinned cached page {}",
+            debug!(
+                "\x014CachedFilePagePin::drop: missing pinned cached page {}",
                 self.pn
             );
             return;
@@ -4102,7 +4102,7 @@ fn finish_sg_dirty_writeback_run(
     let mut guard = shared.page_cache.lock();
     for written in &run.pages {
         let Some(page) = guard.get_mut(&written.pn) else {
-            warn!(
+            debug!(
                 "missing page-cache page {} while ending SG writeback",
                 written.pn
             );
@@ -8767,7 +8767,7 @@ impl Drop for CachedFile {
     fn drop(&mut self) {
         let open_handles = self.shared.open_handles.fetch_sub(1, Ordering::AcqRel);
         if open_handles == 0 {
-            warn!("CachedFile dropped with no open handle reference");
+            warn!("\x012CachedFile dropped with no open handle reference");
             return;
         }
         if open_handles > 1 {
@@ -8787,7 +8787,7 @@ impl Drop for CachedFile {
         let file = match self.inner.entry().as_file() {
             Ok(file) => file,
             Err(err) => {
-                warn!("Failed to access file for cache drop: {err:?}");
+                debug!("Failed to access file for cache drop: {err:?}");
                 return;
             }
         };
@@ -8795,7 +8795,7 @@ impl Drop for CachedFile {
             // `close(2)` is not required to persist data to the device. Keep
             // the explicit flush path on `fsync`/`fdatasync`, and only make
             // dirty cached pages visible to the inode here.
-            warn!("Failed to drain cached file pages on drop: {err:?}");
+            debug!("Failed to drain cached file pages on drop: {err:?}");
         }
     }
 }
@@ -9033,7 +9033,7 @@ impl OwnedFileIoTimeCompletion {
                 // Timestamp persistence is best-effort for ordinary I/O: a
                 // provider metadata error must not rewrite already completed
                 // data I/O. NOWAIT never reaches this blocking branch.
-                warn!("owned file I/O timestamp update failed: {error:?}");
+                debug!("owned file I/O timestamp update failed: {error:?}");
             }
         }
         if completed
@@ -11356,7 +11356,7 @@ impl File {
             update.ctime = Some(now);
         }
         if let Err(err) = self.inner.location().update_supported_metadata(update) {
-            warn!("Failed to update file times: {err:?}");
+            debug!("Failed to update file times: {err:?}");
             self.access_flags.fetch_or(flags, Ordering::AcqRel);
         }
     }

@@ -136,7 +136,7 @@ cfg_if::cfg_if! {
                             return Some(AxDeviceEnum::from_net(ixgbe_nic));
                         }
                         axdriver_pci::BarInfo::IO { .. } => {
-                            error!("ixgbe: BAR0 is of I/O type");
+                            warn!("ixgbe: BAR0 is of I/O type");
                             return None;
                         }
                     }

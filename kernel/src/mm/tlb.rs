@@ -484,9 +484,16 @@ mod imp {
     }
 
     fn service_cpu(cpu: usize) {
-        let reasons = SHOOTDOWN
-            .take_pending_reasons(cpu)
-            .unwrap_or_else(|_| axhal::power::system_off());
+        let reasons = SHOOTDOWN.take_pending_reasons(cpu).unwrap_or_else(|_| {
+            // The reason word is the pending-bitmap of this CPU's shootdown
+            // service; if it cannot be taken, no mapping invalidation this CPU
+            // owes can be trusted, and userspace keeps running on stale
+            // translations. That is not a condition to boot through, and the
+            // reason has to leave the machine before the CPU stops.
+            axruntime::klog::fatal(format_args!(
+                "CPU {cpu} could not take its pending TLB shootdown reasons"
+            ))
+        });
         if reasons == 0 {
             return;
         }
@@ -504,10 +511,18 @@ mod imp {
                     }
                     maintain_local(maintenance);
                 })
-                .unwrap_or_else(|_| axhal::power::system_off());
+                .unwrap_or_else(|_| {
+                    axruntime::klog::fatal(format_args!(
+                        "CPU {cpu} could not service a TLB maintenance request"
+                    ))
+                });
         }
         if reasons & !CPU_MAINTENANCE_REASON.bit() != 0 {
-            axhal::power::system_off();
+            // An unknown bit in the reason word is memory corruption evidence,
+            // and the word itself is the only datum that identifies it.
+            axruntime::klog::fatal(format_args!(
+                "CPU {cpu} found an unknown TLB maintenance reason {reasons:#x}"
+            ))
         }
     }
 
@@ -520,8 +535,9 @@ mod imp {
         let now = axhal::time::monotonic_time_nanos();
         let epoch = request.epoch();
         error!(
-            "TLB shootdown epoch {epoch} timed out: maintenance={:?} issuer_cpu={} current_cpu={} \
-             elapsed_ns={} retry_rounds={}; refusing to reclaim mapping resources",
+            "\x010TLB shootdown epoch {epoch} timed out: maintenance={:?} issuer_cpu={} \"
+             current_cpu={} elapsed_ns={} retry_rounds={}; refusing to reclaim mapping \
+             resources",
             request.maintenance(),
             issuer_cpu,
             axhal::percpu::this_cpu_id(),
@@ -540,7 +556,7 @@ mod imp {
                     let ipi_entries_delta =
                         ipi_entries.saturating_sub(attempts.ipi_entries_before[cpu]);
                     error!(
-                        "shootdown target CPU {cpu}: request_pending={} initial_attempt={} \
+                        "\x010shootdown target CPU {cpu}: request_pending={} initial_attempt={} \
                          retry_attempts={} online={} draining={} admissions={} reasons={:#x} \
                          tlb_requested={} tlb_completed={} icache_requested={} \
                          icache_completed={} ipi_entries_before={} ipi_entries={} \
@@ -568,7 +584,7 @@ mod imp {
                         log_irq_continuation_diagnostics(cpu, attempts.irq_diagnostics_before[cpu]);
                     }
                 }
-                Err(error) => error!("TLB CPU {cpu}: snapshot failed: {error:?}"),
+                Err(error) => error!("\x010TLB CPU {cpu}: snapshot failed: {error:?}"),
             }
         }
         if let Some((cpu, snapshot)) = first_incomplete {
@@ -604,7 +620,10 @@ mod imp {
         before: Option<axtask::IrqContinuationDiagnosticSnapshot>,
     ) {
         let Some(after) = axtask::irq_continuation_diagnostic_snapshot(cpu) else {
-            error!("IRQ continuation diagnostics unavailable for CPU {cpu}");
+            // The headline of a dump that could not be taken: a shootdown is
+            // about to stop the machine, and "the evidence the operator asked
+            // for is not there" has to be seen without opening a band first.
+            error!("\x010IRQ continuation diagnostics unavailable for CPU {cpu}");
             return;
         };
         let before = before.unwrap_or(axtask::IrqContinuationDiagnosticSnapshot {
@@ -622,7 +641,7 @@ mod imp {
             irq_off_yield_returns: 0,
             irq_off_idle_boundaries: 0,
         });
-        error!(
+        debug!(
             "IRQ continuation CPU {cpu}: latest_sequence={} timer_events={} timer_delta={} \
              switches={} switch_delta={} switch_returns={} switch_return_delta={} \
              irq_off_disables={} irq_off_disable_delta={} irq_off_enables={} \
@@ -685,7 +704,7 @@ mod imp {
         let first_sequence = after.latest_sequence.saturating_sub(15).max(1);
         for sequence in first_sequence..=after.latest_sequence {
             if let Some(event) = axtask::irq_continuation_diagnostic_event(cpu, sequence) {
-                error!(
+                debug!(
                     "IRQ continuation CPU {cpu} event: sequence={} kind={} task_id={} \
                      peer_task_id={} flags={:#x} preempt_disable_count={}",
                     event.sequence,

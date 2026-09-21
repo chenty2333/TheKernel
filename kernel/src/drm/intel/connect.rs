@@ -53,7 +53,7 @@ use super::{
     regs::Registers,
     sink,
 };
-use crate::drm::modes::ModePlan;
+use crate::drm::modes::{ModePlan, Narration};
 
 /// The pins §11 phase 2.3 says to try, each with the AUX/DDC power well its DDC
 /// channel sits behind.
@@ -359,8 +359,11 @@ pub(crate) fn resolve_device<R: Registers, T: PollTimer>(
     // Steps 2.2 and 2.3 are one call: hotplug enabled and read once, then the
     // EDID read over GMBUS with its header and checksum checks, then the mode
     // layer's plan over whatever validated.  Nothing about that read is
-    // duplicated here.
-    let device = sink::probe_one(bdf, regs, timer);
+    // duplicated here.  This is the boot reading, so it is the one that
+    // narrates: the after-boot watch's re-probes of the same device are
+    // `Narration::Watch`, which is what keeps a flapping connector from
+    // reprinting four register dumps a second.
+    let device = sink::probe_one(bdf, regs, timer, Narration::Boot);
     let hotplug = device.hotplug.clone();
     let outcome = (move || -> Result<Connector, ConnectError> {
         let (Some(pin), Some(edid), Some(plan)) = (device.monitor, device.edid, device.plan) else {

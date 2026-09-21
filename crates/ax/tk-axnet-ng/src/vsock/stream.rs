@@ -516,7 +516,7 @@ impl Pollable for VsockStreamTransport {
 impl Drop for VsockStreamTransport {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown(Shutdown::Both) {
-            warn!("failed to shut down dropped vsock stream: {error:?}");
+            debug!("\x014failed to shut down dropped vsock stream: {error:?}");
         }
 
         if let Some(conn_id) = *self.conn_id.lock() {

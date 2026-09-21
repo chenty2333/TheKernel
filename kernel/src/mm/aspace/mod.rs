@@ -4898,7 +4898,7 @@ impl AddrSpace {
             return;
         }
         if let Err(error) = self.user_io_pins.cancel_reservation(reservation) {
-            warn!(
+            debug!(
                 "AddrSpace::cancel_user_io_pin: token {}: {error:?}",
                 reservation.token().get()
             );
@@ -4991,7 +4991,7 @@ impl AddrSpace {
 
     pub(crate) fn end_user_io_pin(&mut self, token: PinToken) -> Option<Vec<PhysAddr>> {
         if let Err(error) = self.user_io_pins.release(token) {
-            warn!(
+            debug!(
                 "AddrSpace::end_user_io_pin: token {}: {error:?}",
                 token.get()
             );
@@ -9063,7 +9063,7 @@ impl AddrSpace {
                 return PageFaultResult::Handled;
             }
             let err = error.into_error();
-            warn!(
+            debug!(
                 "Failed to extend MAP_GROWSDOWN mapping from {current_start:?} to {fault_page:?}: \
                  {err}"
             );
@@ -9570,7 +9570,7 @@ impl AddrSpace {
                 match populate_result {
                     Ok(n) => {
                         if n == 0 {
-                            warn!("No pages populated for {vaddr:?} ({flags:?})");
+                            debug!("No pages populated for {vaddr:?} ({flags:?})");
                         }
                     }
                     // ResourceBusy is the file cache's internal retry token:
@@ -9578,7 +9578,7 @@ impl AddrSpace {
                     // is not a population failure worth logging.
                     Err(err) if err.canonicalize() == AxError::ResourceBusy => {}
                     Err(err) => {
-                        warn!("Failed to populate pages for {vaddr:?} ({flags:?}): {err}");
+                        debug!("Failed to populate pages for {vaddr:?} ({flags:?}): {err}");
                     }
                 }
                 return classify_page_population(populate_result);
