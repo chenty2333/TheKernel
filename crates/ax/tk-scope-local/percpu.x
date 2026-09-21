@@ -10,9 +10,10 @@ SECTIONS
     . = ALIGN(4K);
     _percpu_start = .;
     _percpu_end = _percpu_start + SIZEOF(.percpu);
-    /* Host accessors use this image directly. Preserve nonzero static
-     * initializers (notably Weak::new()); NOLOAD silently turns them into
-     * invalid zero values before the first scheduler switch. */
+    /* Host accessors address the areas percpu::init() allocates, not this
+     * image; tk_axhal::percpu::init_primary copies the image into them. Keep
+     * it loaded so nonzero static initializers (notably Weak::new()) survive;
+     * NOLOAD would copy invalid zero values. */
     .percpu : AT(_percpu_start) {
         _percpu_load_start = .;
         *(.percpu .percpu.*)
