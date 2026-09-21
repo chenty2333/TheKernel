@@ -19,14 +19,12 @@ use tk_linux_ipc::{
     plan_sem_op, sem_undo_delta_in_range,
 };
 use tk_linux_process_adapter::Pid;
-use tk_linux_usercopy::{
-    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
-};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use super::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
-    IPC_SET, IPC_STAT, IpcAccess, IpcAccessContext, IpcPerm, SEM_INFO,
-    SEM_STAT, SEM_STAT_ANY, SETALL, SETVAL, allocate_ipc_id,
+    IPC_SET, IPC_STAT, IpcAccess, IpcAccessContext, IpcPerm, SEM_INFO, SEM_STAT, SEM_STAT_ANY,
+    SETALL, SETVAL, allocate_ipc_id,
 };
 use crate::{
     mm::map_usercopy_error,
@@ -107,12 +105,13 @@ impl SemUndo {
     }
 
     fn insert(&mut self, key: (i32, u16), value: SemAdjustment) -> AxResult<()> {
-        match self.entries.binary_search_by_key(&key, |(stored, _)| *stored) {
+        match self
+            .entries
+            .binary_search_by_key(&key, |(stored, _)| *stored)
+        {
             Ok(index) => self.entries[index].1 = value,
             Err(index) => {
-                self.entries
-                    .try_reserve(1)
-                    .map_err(|_| AxError::NoMemory)?;
+                self.entries.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                 self.entries.insert(index, (key, value));
             }
         }
@@ -151,8 +150,7 @@ impl SemUndo {
             let key = (semid, op.sem_num);
             if self.find(&key).is_some()
                 || ops[..index].iter().any(|prior| {
-                    plan_sem_op(abi_sem_buf(prior)).records_undo()
-                        && prior.sem_num == op.sem_num
+                    plan_sem_op(abi_sem_buf(prior)).records_undo() && prior.sem_num == op.sem_num
                 })
             {
                 continue;
@@ -778,23 +776,37 @@ pub(crate) fn sem_limits_string() -> String {
     alloc::format!("{} {} {} {}\n", semmsl, semmns, semopm_limit(), semmni)
 }
 
+/// Parses a `/proc/sys/kernel/sem` write into a complete limits tuple.
+///
+/// The file goes through `proc_dointvec()` (`ipc/ipc_sysctl.c:145-160`),
+/// which consumes one value per table entry and stops at the end of input,
+/// so a short write updates only the leading entries - the rest keep their
+/// current values, which seed the tuple here.
 pub(crate) fn parse_sem_limits(data: &[u8]) -> Option<(usize, usize, usize, usize)> {
-    let mut values = data
+    let (mut semmsl, mut semmns, mut semopm, mut semmni) =
+        current().as_thread().ipc_ns().sem_limits();
+    let mut written = 0;
+    for part in data
         .split(|byte| byte.is_ascii_whitespace())
         .filter(|part| !part.is_empty())
-        .map(|part| {
-            core::str::from_utf8(part)
-                .ok()
-                .and_then(|it| it.parse::<usize>().ok())
-        });
-    let semmsl = values.next().flatten()?;
-    let semmns = values.next().flatten()?;
-    let semopm = values.next().flatten()?;
-    let semmni = values.next().flatten()?;
-    values
-        .next()
-        .is_none()
-        .then_some((semmsl, semmns, semopm, semmni))
+    {
+        // `proc_dointvec()` consumes at most one value per table entry and
+        // never looks at the remainder of the write, so a fifth token (or any
+        // trailing non-numeric text) is ignored rather than rejected.
+        if written > 3 {
+            break;
+        }
+        let value = core::str::from_utf8(part).ok()?.parse::<usize>().ok()?;
+        match written {
+            0 => semmsl = value,
+            1 => semmns = value,
+            2 => semopm = value,
+            3 => semmni = value,
+            _ => break,
+        }
+        written += 1;
+    }
+    (written > 0).then_some((semmsl, semmns, semopm, semmni))
 }
 
 pub(crate) fn sem_next_id() -> i32 {
@@ -807,8 +819,8 @@ pub(crate) fn sem_next_id() -> i32 {
 
 pub(crate) fn set_sem_next_id(value: i32) -> AxResult<()> {
     // Linux `ipc/ipc_sysctl.c`: `proc_dointvec_minmax` over `[0, INT_MAX]`,
-    // writable only for a task that is `checkpoint_restore_ns_capable()` over
-    // the IPC namespace's user namespace.
+    // writable under the `ipc_permissions()` rule that `may_set_next_id()`
+    // implements.
     if value < 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }

@@ -494,7 +494,7 @@ impl IpcIdTable {
             .ok_or(IpcError::NoSpace)?;
         if index <= self.last_index {
             self.sequence += 1;
-            if self.sequence > IPCID_SEQ_MAX {
+            if self.sequence >= IPCID_SEQ_MAX {
                 self.sequence = 0;
             }
         }
@@ -551,16 +551,37 @@ pub const fn sem_undo_delta_in_range(prior: i32, sem_op: i16) -> bool {
     let undo = prior - sem_op as i32;
     undo >= -SEMAEM - 1 && undo <= SEMAEM
 }
+/// Caller credentials for one SysV IPC permission decision.
+///
+/// Mirrors what Linux `ipcperms()` (`ipc/util.c:553`) reads from
+/// `current_cred()`: the effective uid, the effective gid (the kernel tests
+/// `fsgid`, which equals `egid` outside `setfsuid()`), the supplemental
+/// groups consulted by `in_group_p()` (`kernel/groups.c:227`), and whether
+/// the caller holds `CAP_IPC_OWNER` in the owning user namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Credentials {
+pub struct Credentials<'g> {
     pub euid: u32,
     pub egid: u32,
+    /// Supplemental group IDs (`struct cred::group_info`). Must be sorted in
+    /// ascending order, exactly as `groups_sort()` leaves them for
+    /// `groups_search()` (`kernel/groups.c:92`), which binary-searches.
+    pub groups: &'g [u32],
+    /// `ns_capable(ns->user_ns, CAP_IPC_OWNER)`.
     pub privileged: bool,
 }
+/// SysV ownership and mode bits of one IPC object: `struct kern_ipc_perm`
+/// (`include/linux/ipc.h`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IpcPermission {
+    /// `ipcp->uid`, the current owner.
     pub uid: u32,
+    /// `ipcp->gid`, the current owner's group.
     pub gid: u32,
+    /// `ipcp->cuid`, the creator. Linux tests it alongside `uid`.
+    pub cuid: u32,
+    /// `ipcp->cgid`, the creator's group. Linux tests it alongside `gid`.
+    pub cgid: u32,
+    /// The low nine `ipcp->mode` permission bits.
     pub mode: u16,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -569,13 +590,46 @@ pub enum Access {
     Write,
     Alter,
 }
-pub const fn authorize(c: Credentials, p: IpcPermission, a: Access) -> Result<(), IpcError> {
+/// Linux `kernel/groups.c:groups_search()`: binary search over the
+/// ascending-sorted supplemental groups.
+const fn groups_search(groups: &[u32], gid: u32) -> bool {
+    let mut left = 0;
+    let mut right = groups.len();
+    while left < right {
+        let mid = left + (right - left) / 2;
+        let found = groups[mid];
+        if found < gid {
+            left = mid + 1;
+        } else if found > gid {
+            right = mid;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+/// Linux `ipcperms()` (`ipc/util.c:553`) without its LSM hook
+/// (`security_ipc_permission()`, `security/security.c:3370`).
+///
+/// Class selection follows the kernel's if/else chain exactly: the owner
+/// class is `euid == ipcp->cuid || euid == ipcp->uid` (`ipc/util.c:563`-
+/// `564`), otherwise the group class is `in_group_p(ipcp->cgid) ||
+/// in_group_p(ipcp->gid)` (`ipc/util.c:565`), where `in_group_p()`
+/// (`kernel/groups.c:227`) also matches the effective gid itself. The
+/// requested access is tested against the selected class bits (shifts
+/// 6/3/0), and `privileged` (`CAP_IPC_OWNER`) overrides the one failure
+/// mode, a cleared mode bit (`ipc/util.c:567-570`).
+pub const fn authorize(c: &Credentials<'_>, p: &IpcPermission, a: Access) -> Result<(), IpcError> {
     if c.privileged {
         return Ok(());
     }
-    let shift = if c.euid == p.uid {
+    let shift = if c.euid == p.cuid || c.euid == p.uid {
         6
-    } else if c.egid == p.gid {
+    } else if c.egid == p.cgid
+        || c.egid == p.gid
+        || groups_search(c.groups, p.cgid)
+        || groups_search(c.groups, p.gid)
+    {
         3
     } else {
         0
@@ -805,16 +859,22 @@ mod tests {
 
     #[test]
     fn permissions_and_selection() {
+        // The effective gid matches the owning group: the group bits (6/3/0
+        // shift 3) grant the write, like `in_group_p(ipcp->gid)`
+        // (`ipc/util.c:565`).
         assert_eq!(
             authorize(
-                Credentials {
+                &Credentials {
                     euid: 2,
                     egid: 2,
+                    groups: &[],
                     privileged: false
                 },
-                IpcPermission {
+                &IpcPermission {
                     uid: 1,
                     gid: 2,
+                    cuid: 1,
+                    cgid: 2,
                     mode: 0o060
                 },
                 Access::Write
@@ -822,6 +882,165 @@ mod tests {
             Ok(())
         );
         assert_eq!(select_message(i64::MIN), Ok(MessageSelection::LowestType));
+    }
+
+    #[test]
+    fn creator_identity_stays_in_the_owner_class() {
+        // `uid_eq(euid, ipcp->cuid) || uid_eq(euid, ipcp->uid)`
+        // (`ipc/util.c:563-564`): the creator keeps owner access even after
+        // a chown moved `uid` to somebody else.
+        let object = IpcPermission {
+            uid: 1001,
+            gid: 100,
+            cuid: 1000,
+            cgid: 100,
+            mode: 0o400,
+        };
+        let creator = Credentials {
+            euid: 1000,
+            egid: 100,
+            groups: &[100],
+            privileged: false,
+        };
+        assert_eq!(authorize(&creator, &object, Access::Read), Ok(()));
+        // With the owner bits cleared the same call is denied, proving the
+        // owner class was selected rather than the matching group bits.
+        assert_eq!(
+            authorize(
+                &creator,
+                &IpcPermission {
+                    mode: 0o040,
+                    ..object
+                },
+                Access::Read
+            ),
+            Err(IpcError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn supplemental_groups_cover_both_ipc_groups() {
+        // `in_group_p(ipcp->cgid) || in_group_p(ipcp->gid)`
+        // (`ipc/util.c:565`) with `in_group_p()` (`kernel/groups.c:227`)
+        // searching the sorted supplemental groups (`kernel/groups.c:92`).
+        let object = IpcPermission {
+            uid: 0,
+            gid: 300,
+            cuid: 0,
+            cgid: 200,
+            mode: 0o070,
+        };
+        // A member of the creator group only: the owner's `gid` need not
+        // match.
+        let creator_group = Credentials {
+            euid: 1000,
+            egid: 400,
+            groups: &[100, 200],
+            privileged: false,
+        };
+        assert_eq!(authorize(&creator_group, &object, Access::Write), Ok(()));
+        // A member of the current owner group only.
+        let owner_group = Credentials {
+            euid: 1000,
+            egid: 400,
+            groups: &[100, 300],
+            privileged: false,
+        };
+        assert_eq!(authorize(&owner_group, &object, Access::Write), Ok(()));
+        // Neither supplemental group matches, and `egid` matches neither:
+        // the other class sees only the low three bits.
+        let outsider = Credentials {
+            euid: 1000,
+            egid: 400,
+            groups: &[100, 150],
+            privileged: false,
+        };
+        assert_eq!(
+            authorize(&outsider, &object, Access::Write),
+            Err(IpcError::PermissionDenied)
+        );
+        assert_eq!(
+            authorize(
+                &outsider,
+                &IpcPermission {
+                    mode: 0o004,
+                    ..object
+                },
+                Access::Read
+            ),
+            Ok(())
+        );
+        // `in_group_p()` also tests the effective gid itself
+        // (`kernel/groups.c:229-230`), here against `cgid`.
+        let creator_egid = Credentials {
+            egid: 200,
+            groups: &[],
+            ..outsider
+        };
+        assert_eq!(authorize(&creator_egid, &object, Access::Write), Ok(()));
+    }
+
+    #[test]
+    fn cap_ipc_owner_overrides_a_denied_class() {
+        // `ipc/util.c:567-570`: `CAP_IPC_OWNER` waives the failed mode test.
+        let object = IpcPermission {
+            uid: 0,
+            gid: 0,
+            cuid: 0,
+            cgid: 0,
+            mode: 0,
+        };
+        let unprivileged = Credentials {
+            euid: 1000,
+            egid: 1000,
+            groups: &[1000],
+            privileged: false,
+        };
+        assert_eq!(
+            authorize(&unprivileged, &object, Access::Read),
+            Err(IpcError::PermissionDenied)
+        );
+        assert_eq!(
+            authorize(
+                &Credentials {
+                    privileged: true,
+                    ..unprivileged
+                },
+                &object,
+                Access::Read
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn owner_class_is_selected_before_the_group_class() {
+        // `ipc/util.c:563-565` is an if/else chain: when both classes
+        // match, only the owner bits count and the kernel never falls
+        // through to the group bits.
+        let object = IpcPermission {
+            uid: 1000,
+            gid: 100,
+            cuid: 1000,
+            cgid: 100,
+            mode: 0o040,
+        };
+        let both = Credentials {
+            euid: 1000,
+            egid: 100,
+            groups: &[100],
+            privileged: false,
+        };
+        // The group bits (0o4) would grant the read; the owner bits (0) do
+        // not, and that denial stands.
+        assert_eq!(
+            authorize(&both, &object, Access::Read),
+            Err(IpcError::PermissionDenied)
+        );
+        assert_eq!(
+            authorize(&both, &object, Access::Write),
+            Err(IpcError::PermissionDenied)
+        );
     }
 
     #[test]
@@ -923,6 +1142,18 @@ mod tests {
             "`idx <= ids->last_idx` must bump the sequence"
         );
         assert_eq!(wrapped.raw(), IPCMNI);
+    }
+
+    #[test]
+    fn cyclic_sequence_wraps_before_the_reserved_maximum() {
+        let mut table = IpcIdTable::new();
+        table.sequence = IPCID_SEQ_MAX - 1;
+        table.last_index = IPC_MIN_CYCLE - 1;
+        table.next = IPC_MIN_CYCLE;
+        let wrapped = table.allocate(None, |_| false).unwrap();
+        assert_eq!(wrapped.index(), 0);
+        assert_eq!(wrapped.sequence(), 0);
+        assert_eq!(wrapped.raw(), 0);
     }
 
     #[test]

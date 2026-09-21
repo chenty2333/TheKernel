@@ -627,6 +627,20 @@ static int case_mq_timedsend(void) {
         errno != EINVAL) {
         return fail("send-priority-invalid");
     }
+    /* `do_mq_timedsend()` validates the priority before the descriptor, so an
+     * invalid priority outranks a closed fd (EINVAL, not EBADF). */
+    errno = 0;
+    if (raw_mq_timedsend(-1, payload, 1, LINUX_MQ_PRIO_MAX, NULL) != -1 ||
+        errno != EINVAL) {
+        return fail("send-priority-before-descriptor");
+    }
+    /* The `mq_msgsize` bound is tested before `load_msg()`, so an oversized
+     * message outranks an unreadable source pointer (EMSGSIZE, not EFAULT). */
+    errno = 0;
+    if (raw_mq_timedsend(fd, (const char *)1, 33, 0, NULL) != -1 ||
+        errno != EMSGSIZE) {
+        return fail("send-size-before-fault");
+    }
     errno = 0;
     if (raw_mq_timedsend(-1, payload, 1, 0, NULL) != -1 || errno != EBADF) {
         return fail("send-bad-descriptor");

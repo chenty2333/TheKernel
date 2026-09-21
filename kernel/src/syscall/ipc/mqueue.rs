@@ -57,11 +57,6 @@ use crate::{
     time::TimeValueLike,
 };
 
-/// `mq_init_ns()` (`ipc/mqueue.c`) seeds one IPC namespace with these values,
-/// and `/proc/sys/fs/mqueue` only ever publishes what they were set to.
-const DEFAULT_QUEUES_MAX: usize = tk_linux_ipc::MQ_QUEUES_MAX_DEFAULT;
-const DEFAULT_MSG_MAX: usize = tk_linux_ipc::MQ_MSG_MAX_DEFAULT;
-const DEFAULT_MSGSIZE_MAX: usize = tk_linux_ipc::MQ_MSGSIZE_MAX_DEFAULT;
 /// `DFLT_MSG` / `DFLT_MSGSIZE`: the attribute a queue created with a NULL
 /// `mq_attr` inherits, before being clamped by the namespace maxima
 /// (`min(ipc_ns->mq_msg_max, ipc_ns->mq_msg_default)` in `mqueue_get_inode()`).
@@ -85,9 +80,6 @@ pub(crate) const MQUEUE_DIR_MODE: u16 = 0o1777;
 pub(crate) const MQUEUE_DIR_UID: u32 = 0;
 
 static MQ_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
-static MQ_QUEUES_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_QUEUES_MAX);
-static MQ_MSG_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_MSG_MAX);
-static MQ_MSGSIZE_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_MSGSIZE_MAX);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, AnyBitPattern)]
@@ -694,7 +686,11 @@ impl PosixMqueue {
     }
 
     /// One `do_mq_timedreceive()` attempt with the queue lock held.
-    fn attempt_receive(&mut self, waiter: &Arc<MqReceiver>, park: bool) -> Option<(MqMessage, MqPublish)> {
+    fn attempt_receive(
+        &mut self,
+        waiter: &Arc<MqReceiver>,
+        park: bool,
+    ) -> Option<(MqMessage, MqPublish)> {
         if let Some(message) = waiter.take_slot() {
             return Some((message, MqPublish::default()));
         }
@@ -872,7 +868,7 @@ impl FileLike for MqFd {
         self.is_nonblocking()
     }
 
-    /// Linux `mqueue_flush_file()` (`ipc/mqueue.c:658`):
+    /// Linux `mqueue_flush_file()` (`ipc/mqueue.c:658-668`):
     ///
     /// ```c
     /// 	spin_lock(&info->lock);
@@ -949,28 +945,32 @@ impl Pollable for MqFd {
     }
 }
 
+/// The three `/proc/sys/fs/mqueue` ceilings of the *calling task's* IPC
+/// namespace, exactly as Linux's `set_lookup()` resolves
+/// `current->nsproxy->ipc_ns->mq_set` (`ipc/mq_sysctl.c:66-70`).  A write in
+/// one namespace must never change what another namespace reads or enforces.
 pub(crate) fn mq_queues_max() -> usize {
-    MQ_QUEUES_MAX.load(Ordering::Acquire)
+    current().as_thread().ipc_ns().mq_queues_max()
 }
 
 pub(crate) fn set_mq_queues_max(value: usize) {
-    MQ_QUEUES_MAX.store(value.max(1), Ordering::Release);
+    current().as_thread().ipc_ns().set_mq_queues_max(value);
 }
 
 pub(crate) fn mq_msg_max() -> usize {
-    MQ_MSG_MAX.load(Ordering::Acquire)
+    current().as_thread().ipc_ns().mq_msg_max()
 }
 
-pub(crate) fn set_mq_msg_max(value: usize) {
-    MQ_MSG_MAX.store(value.max(1), Ordering::Release);
+pub(crate) fn set_mq_msg_max(value: usize) -> AxResult<()> {
+    current().as_thread().ipc_ns().set_mq_msg_max(value)
 }
 
 pub(crate) fn mq_msgsize_max() -> usize {
-    MQ_MSGSIZE_MAX.load(Ordering::Acquire)
+    current().as_thread().ipc_ns().mq_msgsize_max()
 }
 
-pub(crate) fn set_mq_msgsize_max(value: usize) {
-    MQ_MSGSIZE_MAX.store(value.max(1), Ordering::Release);
+pub(crate) fn set_mq_msgsize_max(value: usize) -> AxResult<()> {
+    current().as_thread().ipc_ns().set_mq_msgsize_max(value)
 }
 
 fn current_ids() -> (u32, u32) {
@@ -1018,11 +1018,15 @@ fn normalize_name<M: UserMemory + ?Sized>(
 /// The attribute `mqueue_get_inode()` gives a queue created without an
 /// `mq_attr`: `min(ipc_ns->mq_msg_max, ipc_ns->mq_msg_default)` and
 /// `min(ipc_ns->mq_msgsize_max, ipc_ns->mq_msgsize_default)`.
-fn default_attr() -> MqAttr {
+fn default_attr(namespace: &IpcNamespace) -> MqAttr {
     MqAttr {
         mq_flags: 0,
-        mq_maxmsg: mq_msg_max().min(DEFAULT_MQ_MAXMSG as usize) as isize,
-        mq_msgsize: mq_msgsize_max().min(DEFAULT_MQ_MSGSIZE as usize) as isize,
+        mq_maxmsg: namespace
+            .mq_msg_max()
+            .min(DEFAULT_MQ_MAXMSG as usize) as isize,
+        mq_msgsize: namespace
+            .mq_msgsize_max()
+            .min(DEFAULT_MQ_MSGSIZE as usize) as isize,
         mq_curmsgs: 0,
         __reserved: [0; 4],
     }
@@ -1051,14 +1055,14 @@ fn read_create_attr<M: UserMemory + ?Sized>(
 }
 
 /// The namespace maxima and the caller's `CAP_SYS_RESOURCE` state.
-fn create_limits() -> (MqLimits, bool) {
+fn create_limits(namespace: &IpcNamespace) -> (MqLimits, bool) {
     let curr = current();
     let thread = curr.as_thread();
     (
         MqLimits {
-            queues: mq_queues_max(),
-            max_messages: mq_msg_max(),
-            max_message_size: mq_msgsize_max(),
+            queues: namespace.mq_queues_max(),
+            max_messages: namespace.mq_msg_max(),
+            max_message_size: namespace.mq_msgsize_max(),
         },
         thread
             .current_cred()
@@ -1073,10 +1077,11 @@ fn create_limits() -> (MqLimits, bool) {
 /// `EOVERFLOW` of the charge computation.
 fn read_created_attributes(
     requested: Option<MqAttr>,
+    namespace: &IpcNamespace,
     limits: MqLimits,
     cap_sys_resource: bool,
 ) -> AxResult<MqAttr> {
-    let attr = requested.unwrap_or_else(default_attr);
+    let attr = requested.unwrap_or_else(|| default_attr(namespace));
     match validate_mq_attributes(
         attr.mq_maxmsg as i64,
         attr.mq_msgsize as i64,
@@ -1175,10 +1180,10 @@ fn validate_notify_event(event: &RawSigevent) -> AxResult {
             // `do_mq_notify()` guards the signal mode with Linux `valid_signal()`,
             // which only checks the upper bound:
             //
-            //	static inline int valid_signal(unsigned long sig)
-            //	{
-            //		return sig <= _NSIG ? 1 : 0;
-            //	}
+            // 	static inline int valid_signal(unsigned long sig)
+            // 	{
+            // 		return sig <= _NSIG ? 1 : 0;
+            // 	}
             //
             // so `sigev_signo == 0` is a *successful* registration even though
             // `__do_notify()` then skips it ("do_mq_notify() accepts
@@ -1323,7 +1328,11 @@ fn mq_sleep<T>(
 }
 
 /// Blocks one `mq_timedsend` until its staged message is accepted.
-fn send_blocking(file: &MqFd, waiter: &Arc<MqSenderWaiter>, deadline: Option<Duration>) -> AxResult<()> {
+fn send_blocking(
+    file: &MqFd,
+    waiter: &Arc<MqSenderWaiter>,
+    deadline: Option<Duration>,
+) -> AxResult<()> {
     let queue_handle = Arc::clone(&file.queue);
     let readiness = Arc::clone(&file.readiness);
     let mut completed = false;
@@ -1474,7 +1483,12 @@ fn mq_sender_pid_in_namespace(sender: &MqSender, target_pid_ns: &Arc<PidNamespac
     let mut sender_pid_ns = Some(sender.pid_ns.clone());
     while let Some(namespace) = sender_pid_ns {
         if Arc::ptr_eq(&namespace, target_pid_ns) {
-            return target_pid_ns.visible_pid(sender.pid) as i32;
+            // The number is a stored identity, so render it the way
+            // `pid_nr_ns()` does: a missing binding is zero, never the
+            // sender's init-namespace number.
+            return namespace
+                .visible_pid_checked(sender.pid)
+                .unwrap_or(0) as i32;
         }
         sender_pid_ns = namespace.parent();
     }
@@ -1602,19 +1616,17 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
             }
             // `mqueue_create_attr()`: `queues_max` is the first admission
             // check, and `CAP_SYS_RESOURCE` skips it entirely.
-            let (limits, cap_sys_resource) = create_limits();
+            let (limits, cap_sys_resource) = create_limits(&ipc_ns);
             if manager.queues.len() >= limits.queues && !cap_sys_resource {
                 return Err(LinuxError::ENOSPC.into());
             }
-            let attr = read_created_attributes(requested_attr, limits, cap_sys_resource)?;
+            let attr = read_created_attributes(requested_attr, &ipc_ns, limits, cap_sys_resource)?;
             // `mqueue_get_inode()` charges the full Linux footprint against the
             // creating task's `RLIMIT_MSGQUEUE`: message area plus one
             // `struct msg_msg` and one priority-tree node per slot.
-            let charge_bytes = tk_linux_ipc::mqueue_charge_bytes(
-                attr.mq_maxmsg as u64,
-                attr.mq_msgsize as u64,
-            )
-            .ok_or(AxError::from(LinuxError::EOVERFLOW))?;
+            let charge_bytes =
+                tk_linux_ipc::mqueue_charge_bytes(attr.mq_maxmsg as u64, attr.mq_msgsize as u64)
+                    .ok_or(AxError::from(LinuxError::EOVERFLOW))?;
             let (uid, gid) = current_ids();
             let curr = current();
             let thread = curr.as_thread();
@@ -1648,7 +1660,7 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
     let status_flags = ((oflag as u32) & O_NONBLOCK) | ((oflag as u32) & O_ACCMODE);
     // `do_mq_open()` installs the descriptor with
     //
-    //	fd = FD_ADD(O_CLOEXEC, mqueue_file_open(name, mnt, oflag, ro, mode, attr));
+    // 	fd = FD_ADD(O_CLOEXEC, mqueue_file_open(name, mnt, oflag, ro, mode, attr));
     //
     // (`ipc/mqueue.c:924`), and `FD_ADD` (`include/linux/file.h:252`) hands that
     // first argument straight to `get_unused_fd_flags()`. The queue descriptor
@@ -1710,23 +1722,23 @@ pub fn sys_mq_timedsend<M: UserMemory + ?Sized>(
     abs_timeout: *const timespec,
 ) -> AxResult<isize> {
     // `SYSCALL_DEFINE5(mq_timedsend)` prepares the absolute timeout before it
-    // enters `do_mq_timedsend()`, so a bad timespec outranks the priority
-    // check even though the priority is the first thing that function tests.
+    // enters `do_mq_timedsend()`, so a bad timespec outranks everything below.
+    // Inside `do_mq_timedsend()` the order is priority (EINVAL), fd access
+    // (EBADF), the `mq_msgsize` bound (EMSGSIZE), and only then `load_msg()`
+    // (EFAULT).
     let deadline = validate_timespec(memory, abs_timeout)?;
     validate_priority(msg_prio).map_err(|_| AxError::InvalidInput)?;
     let file = get_mq_fd(fd)?;
     if !file.access.can_write() {
         return Err(AxError::BadFileDescriptor);
     }
-
-    let data = {
+    {
         let queue = file.queue.lock();
         if msg_len > queue.msgsize {
             return Err(AxError::from(LinuxError::EMSGSIZE));
         }
-        drop(queue);
-        vm_load(memory, msg_ptr, msg_len).map_err(map_usercopy_error)?
-    };
+    }
+    let data = vm_load(memory, msg_ptr, msg_len).map_err(map_usercopy_error)?;
 
     let waiter = MqSenderWaiter::new(MqOutgoing {
         priority: msg_prio,
@@ -1961,9 +1973,7 @@ mod tests {
     use alloc::vec;
     use core::{mem::MaybeUninit, ops::Range};
 
-    use tk_linux_ipc::{
-        MQ_MSG_MAX_DEFAULT, MQ_MSGSIZE_MAX_DEFAULT, MQ_QUEUES_MAX_DEFAULT,
-    };
+    use tk_linux_ipc::{MQ_MSG_MAX_DEFAULT, MQ_MSGSIZE_MAX_DEFAULT, MQ_QUEUES_MAX_DEFAULT};
     use tk_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
@@ -1996,7 +2006,7 @@ mod tests {
                 0o600,
                 0,
                 0,
-                default_attr(),
+                default_attr(&namespace),
                 &namespace,
             )
             .unwrap(),
@@ -2039,7 +2049,7 @@ mod tests {
         let pid_ns = PidNamespace::try_new_root(user_ns.clone()).unwrap();
         let ipc_ns = IpcNamespace::try_new(user_ns).unwrap();
         for priority_fault in [false, true] {
-            let mut attr = default_attr();
+            let mut attr = default_attr(&ipc_ns);
             attr.mq_maxmsg = 1;
             attr.mq_msgsize = 4;
             let queue = Arc::new(Mutex::new(
@@ -2104,11 +2114,15 @@ mod tests {
     fn handoff_queue(
         maxmsg: isize,
         msgsize: isize,
-    ) -> (Arc<Mutex<PosixMqueue>>, Arc<PidNamespace>, Arc<IpcNamespace>) {
+    ) -> (
+        Arc<Mutex<PosixMqueue>>,
+        Arc<PidNamespace>,
+        Arc<IpcNamespace>,
+    ) {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let pid_ns = PidNamespace::try_new_root(user_ns.clone()).unwrap();
         let ipc_ns = IpcNamespace::try_new(user_ns).unwrap();
-        let mut attr = default_attr();
+        let mut attr = default_attr(&ipc_ns);
         attr.mq_maxmsg = maxmsg;
         attr.mq_msgsize = msgsize;
         let queue = Arc::new(Mutex::new(
@@ -2125,7 +2139,11 @@ mod tests {
         (queue, pid_ns, ipc_ns)
     }
 
-    fn handoff_sender(pid_ns: &Arc<PidNamespace>, priority: u32, data: &[u8]) -> Arc<MqSenderWaiter> {
+    fn handoff_sender(
+        pid_ns: &Arc<PidNamespace>,
+        priority: u32,
+        data: &[u8],
+    ) -> Arc<MqSenderWaiter> {
         MqSenderWaiter::new(MqOutgoing {
             priority,
             sender: MqSender {
@@ -2293,16 +2311,20 @@ mod tests {
             queue.drop_receiver(&receiver);
             receiver.take_slot()
         };
-        assert_eq!(claimed.expect("the pipelined message survives").data, b"kept".to_vec());
+        assert_eq!(
+            claimed.expect("the pipelined message survives").data,
+            b"kept".to_vec()
+        );
         assert!(queue.lock().messages.is_empty());
     }
 
     #[test]
     fn create_attribute_admission_uses_namespace_limits_and_capability() {
+        let namespace = IpcNamespace::try_new(UserNamespace::try_new_root().unwrap()).unwrap();
         let limits = MqLimits {
-            queues: MQ_QUEUES_MAX_DEFAULT,
-            max_messages: MQ_MSG_MAX_DEFAULT,
-            max_message_size: MQ_MSGSIZE_MAX_DEFAULT,
+            queues: namespace.mq_queues_max(),
+            max_messages: namespace.mq_msg_max(),
+            max_message_size: namespace.mq_msgsize_max(),
         };
         let attr = |maxmsg: isize, msgsize: isize| MqAttr {
             mq_flags: 0,
@@ -2316,24 +2338,65 @@ mod tests {
         // `CAP_SYS_RESOURCE` replaces the namespace maxima with HARD_MSGMAX /
         // HARD_MSGSIZEMAX.
         assert!(matches!(
-            read_created_attributes(Some(attr(0, 64)), limits, true),
+            read_created_attributes(Some(attr(0, 64)), &namespace, limits, true),
             Err(AxError::InvalidInput)
         ));
         assert!(matches!(
-            read_created_attributes(Some(attr(100, 64)), limits, false),
+            read_created_attributes(Some(attr(100, 64)), &namespace, limits, false),
             Err(AxError::InvalidInput)
         ));
-        assert!(read_created_attributes(Some(attr(100, 64)), limits, true).is_ok());
-        assert!(read_created_attributes(Some(attr(65_537, 1)), limits, true).is_err());
+        assert!(
+            read_created_attributes(Some(attr(100, 64)), &namespace, limits, true).is_ok(),
+            "unprivileged ceilings do not bind a CAP_SYS_RESOURCE caller"
+        );
+        assert!(read_created_attributes(Some(attr(65_537, 1)), &namespace, limits, true).is_err());
         assert!(matches!(
-            read_created_attributes(Some(attr(1, 16 * 1024 * 1024 + 1)), limits, true),
+            read_created_attributes(
+                Some(attr(1, 16 * 1024 * 1024 + 1)),
+                &namespace,
+                limits,
+                true
+            ),
             Err(AxError::InvalidInput)
         ));
         // `ipc/mqueue.c` defaults to `min(mq_msg_max, DFLT_MSGMAX)` rather than
         // to the raw namespace maximum.
-        let default = read_created_attributes(None, limits, false).unwrap();
+        let default = read_created_attributes(None, &namespace, limits, false).unwrap();
         assert_eq!(default.mq_maxmsg, MQ_MSG_MAX_DEFAULT as isize);
         assert_eq!(default.mq_msgsize, MQ_MSGSIZE_MAX_DEFAULT as isize);
+
+        // Both ceilings are attributes of *this* namespace, so lowering them
+        // lowers what an attribute-less create inherits here and nowhere else.
+        namespace.set_mq_msg_max(4).unwrap();
+        namespace.set_mq_msgsize_max(512).unwrap();
+        let shrunk = read_created_attributes(None, &namespace, limits, false).unwrap();
+        assert_eq!(shrunk.mq_maxmsg, 4);
+        assert_eq!(shrunk.mq_msgsize, 512);
+        let sibling = IpcNamespace::try_new(UserNamespace::try_new_root().unwrap()).unwrap();
+        assert_eq!(sibling.mq_msg_max(), MQ_MSG_MAX_DEFAULT);
+        assert_eq!(sibling.mq_msgsize_max(), MQ_MSGSIZE_MAX_DEFAULT);
+
+        // The sysctl window is `[MIN_MSGMAX, HARD_MSGMAX]` /
+        // `[MIN_MSGSIZEMAX, HARD_MSGSIZEMAX]` with `EINVAL` outside, so a write
+        // below the floor cannot silently clamp every new queue.
+        assert!(matches!(
+            namespace.set_mq_msg_max(0),
+            Err(AxError::InvalidInput)
+        ));
+        assert!(matches!(
+            namespace.set_mq_msgsize_max(crate::syscall::ipc::MQ_MSGSIZE_MAX_MIN - 1),
+            Err(AxError::InvalidInput)
+        ));
+        assert!(matches!(
+            namespace.set_mq_msg_max(tk_linux_ipc::MQ_MSG_MAX_HARD as usize + 1),
+            Err(AxError::InvalidInput)
+        ));
+        assert_eq!(namespace.mq_msg_max(), 4);
+        assert_eq!(namespace.mq_msgsize_max(), 512);
+        // `queues_max` has no bound at all, and a write of 0 is accepted.
+        assert_eq!(sibling.mq_queues_max(), MQ_QUEUES_MAX_DEFAULT);
+        sibling.set_mq_queues_max(0);
+        assert_eq!(sibling.mq_queues_max(), 0);
     }
 
     #[test]
@@ -2349,7 +2412,9 @@ mod tests {
 
         // The queue owner passes both `may_delete_dentry()` and
         // `check_sticky()`.
-        let queue_owner = slot.replace_fs_ids_for_test(owner_fsuid, owner_fsgid).unwrap();
+        let queue_owner = slot
+            .replace_fs_ids_for_test(owner_fsuid, owner_fsgid)
+            .unwrap();
         assert_eq!(check_unlink_authority(1000, &queue_owner), Ok(()));
         // A foreign queue in the root-owned sticky 01777 directory is `-EPERM`
         // from `check_sticky()`, not the `-EACCES` of a directory permission
@@ -2429,8 +2494,7 @@ mod tests {
         ] {
             provider.bytes[notify_offset..notify_offset + 4]
                 .copy_from_slice(&(notify as i32).to_ne_bytes());
-            provider.bytes[signo_offset..signo_offset + 4]
-                .copy_from_slice(&signo.to_ne_bytes());
+            provider.bytes[signo_offset..signo_offset + 4].copy_from_slice(&signo.to_ne_bytes());
             let mut memory = UserMemoryContext::new(&mut provider);
             let event = RawSigevent::read_from_user(&mut memory, core::ptr::null()).unwrap();
             assert_eq!(validate_notify_event(&event), expected, "{notify}/{signo}");
@@ -2498,6 +2562,33 @@ mod tests {
         );
     }
 
+    /// Binds `global_pid` in `namespace` the way process creation does and
+    /// returns the namespace-local number it was given.
+    ///
+    /// The tests below used to pass synthetic PIDs that were never admitted
+    /// through the lifecycle.  `visible_pid` renders such an identity as
+    /// itself (see its comment on the unit-test fallback), so the assertions
+    /// held without the namespace mapping ever running.  `si_pid` rendering
+    /// is `pid_nr_ns`-strict now, which is what exposed that: a real sender
+    /// always holds a binding, so the tests have to establish one.
+    fn bind_sender_pid(
+        namespace: &Arc<PidNamespace>,
+        global_pid: tk_linux_process::Pid,
+    ) -> tk_linux_process::Pid {
+        namespace
+            .reserve_process(global_pid)
+            .expect("sender PID reservation")
+            .commit();
+        let local = namespace
+            .visible_pid_checked(global_pid)
+            .expect("reserved sender PID must be bound");
+        assert_ne!(
+            local, global_pid,
+            "the binding must exercise the namespace mapping, not the identity"
+        );
+        local
+    }
+
     #[test]
     fn mq_signal_info_uses_sender_snapshot_and_target_uid_mapping() {
         let root = UserNamespace::try_new_root().unwrap();
@@ -2520,9 +2611,13 @@ mod tests {
             real_uid: Kuid::from_raw(1000).unwrap(),
             pid_ns: target_pid_ns.clone(),
         };
+        let local = bind_sender_pid(&target_pid_ns, 4242);
         let info = mq_signal_info_for_sender(&registration_info, &target, &target_pid_ns, sender);
 
-        assert_eq!(info.rt_payload(), SignalRtPayload::new(4242, 0, 0xfeed));
+        assert_eq!(
+            info.rt_payload(),
+            SignalRtPayload::new(local as i32, 0, 0xfeed)
+        );
     }
 
     #[test]
@@ -2530,6 +2625,8 @@ mod tests {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let root_pid_ns = PidNamespace::try_new_root(user_ns.clone()).unwrap();
         let child_pid_ns = root_pid_ns.try_fork(100, user_ns.clone()).unwrap();
+        let root_local = bind_sender_pid(&root_pid_ns, 4242);
+        let child_local = bind_sender_pid(&child_pid_ns, 4243);
         let registration_info = SignalInfo::new_rt(
             Signo::SIGRTMIN,
             SI_MESGQ,
@@ -2546,7 +2643,7 @@ mod tests {
                 pid_ns: root_pid_ns.clone(),
             },
         );
-        assert_eq!(same_namespace.rt_payload().pid, 4242);
+        assert_eq!(same_namespace.rt_payload().pid, root_local as i32);
 
         let invisible_external_sender = mq_signal_info_for_sender(
             &registration_info,
@@ -2565,12 +2662,12 @@ mod tests {
             &user_ns,
             &child_pid_ns,
             MqSender {
-                pid: 4242,
+                pid: 4243,
                 real_uid: Kuid::INITIAL_ROOT,
                 pid_ns: child_pid_ns.clone(),
             },
         );
-        assert_eq!(visible_nested_sender.rt_payload().pid, 4242);
+        assert_eq!(visible_nested_sender.rt_payload().pid, child_local as i32);
 
         let visible_nested_init = mq_signal_info_for_sender(
             &registration_info,
@@ -2601,7 +2698,7 @@ mod tests {
                 0o600,
                 pid,
                 0,
-                default_attr(),
+                default_attr(&ipc_ns),
                 &ipc_ns,
             )
             .unwrap(),
@@ -2652,7 +2749,7 @@ mod tests {
                 0o600,
                 pid,
                 0,
-                default_attr(),
+                default_attr(&ipc_ns),
                 &ipc_ns,
             )
             .unwrap(),

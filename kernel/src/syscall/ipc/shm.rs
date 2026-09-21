@@ -28,9 +28,8 @@ use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
-    IpcAccessContext, IpcNamespace, IpcPerm, SHM_DEST, SHM_INFO,
-    SHM_LOCK, SHM_LOCKED, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK, SHMMIN, ShmLockCharge,
-    allocate_ipc_id, shmall_limit, shmmax_limit, shmmni_limit,
+    IpcAccessContext, IpcNamespace, IpcPerm, SHM_DEST, SHM_INFO, SHM_LOCK, SHM_LOCKED, SHM_STAT,
+    SHM_STAT_ANY, SHM_UNLOCK, SHMMIN, ShmLockCharge, allocate_ipc_id,
 };
 use crate::{
     mm::{
@@ -881,7 +880,9 @@ impl ShmManager {
     /// manager lock, which is this table's `ipc_ids.rwsem`.
     fn allocate_id(&mut self, next_id: &AtomicI32) -> AxResult<IpcId> {
         let segments = &self.shmid_inner;
-        allocate_ipc_id(next_id, &mut self.ids, |index| segments.contains_key(&index))
+        allocate_ipc_id(next_id, &mut self.ids, |index| {
+            segments.contains_key(&index)
+        })
     }
 
     /// Linux `ipc_obtain_object_idr()`: resolve an index without consulting
@@ -2493,7 +2494,6 @@ pub(crate) fn clear_proc_shm_in_namespace(namespace: &IpcNamespace, pid: Pid) {
     clear_proc_shm_in(namespace.shm_transaction(), namespace.shm_manager(), pid)
 }
 
-
 pub(crate) fn shm_next_id() -> i32 {
     let curr = current();
     curr.as_thread()
@@ -2504,8 +2504,8 @@ pub(crate) fn shm_next_id() -> i32 {
 
 pub(crate) fn set_shm_next_id(value: i32) -> AxResult<()> {
     // Linux `ipc/ipc_sysctl.c`: `proc_dointvec_minmax` over `[0, INT_MAX]`,
-    // writable only for a task that is `checkpoint_restore_ns_capable()` over
-    // the IPC namespace's user namespace.
+    // writable under the `ipc_permissions()` rule that `may_set_next_id()`
+    // implements.
     if value < 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
@@ -2633,10 +2633,10 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
         }
     }
 
-    if size < SHMMIN || size > shmmax_limit() {
+    if size < SHMMIN || size > ipc_ns.shm_ctlmax() {
         return Err(AxError::InvalidInput);
     }
-    // Linux `newseg()` (`ipc/shm.c:712-721`):
+    // Linux `newseg()` (`ipc/shm.c:711-721`):
     //
     // ```c
     // 	size_t numpages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
@@ -2659,22 +2659,24 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     let mut manager = ipc_ns.shm_manager().lock();
-    if manager.active_segment_count() >= shmmni_limit() {
-        return Err(AxError::from(LinuxError::ENOSPC));
-    }
     if manager
         .total_page_count()
         .checked_add(page_num)
-        .is_none_or(|total| total > shmall_limit())
+        .is_none_or(|total| total > ipc_ns.shm_ctlall())
     {
         return Err(AxError::from(LinuxError::ENOSPC));
     }
     if creation.hugetlb && !shm_supports_huge_page_hint(creation.huge_hint) {
         // `newseg()` rejects a huge-page request whose hint resolves to no
-        // configured size class.  Only the create path rejects it: a lookup of
-        // an existing key resolves the segment above and returns it, which is
-        // what Linux does because `newseg()` never runs for an existing key.
+        // configured size class after its `shm_ctlall` accounting and before
+        // `ipc_addid(..., shm_ctlmni)`.  Only the create path rejects it: a
+        // lookup of an existing key resolves the segment above and returns
+        // it, which is what Linux does because `newseg()` never runs for an
+        // existing key.
         return Err(AxError::from(LinuxError::EINVAL));
+    }
+    if manager.active_segment_count() >= ipc_ns.shm_ctlmni() {
+        return Err(AxError::from(LinuxError::ENOSPC));
     }
     manager.try_reserve_segment(key != IPC_PRIVATE)?;
     let id = manager.allocate_id(ipc_ns.next_shm_id())?;
@@ -2980,11 +2982,11 @@ pub fn sys_shmctl<M: UserMemory + ?Sized>(
 
     if cmd == IPC_INFO {
         let info = IpcInfo {
-            shmmax: shmmax_limit() as c_ulong,
+            shmmax: ipc_ns.shm_ctlmax() as c_ulong,
             shmmin: SHMMIN as c_ulong,
-            shmmni: shmmni_limit() as c_ulong,
-            shmseg: shmmni_limit() as c_ulong,
-            shmall: shmall_limit() as c_ulong,
+            shmmni: ipc_ns.shm_ctlmni() as c_ulong,
+            shmseg: ipc_ns.shm_ctlmni() as c_ulong,
+            shmall: ipc_ns.shm_ctlall() as c_ulong,
             reserved1: 0,
             reserved2: 0,
             reserved3: 0,

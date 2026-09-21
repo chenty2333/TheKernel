@@ -3,9 +3,10 @@ use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axsync::Mutex;
-use self::shm::Mutex as ShmMutex;
 use axtask::current;
 use tk_linux_process_adapter::Pid;
+
+use self::shm::Mutex as ShmMutex;
 
 mod mqueue;
 mod msg;
@@ -37,7 +38,15 @@ pub(crate) fn render_task_pid(pid: Pid) -> __kernel_pid_t {
     if pid == 0 {
         return 0;
     }
-    current().as_thread().pid_ns().visible_pid(pid) as __kernel_pid_t
+    // A `struct pid` with no number in the reader's namespace renders as zero
+    // (`pid_nr_ns()` leaves `nr = 0` when `upid->ns != ns`), so a creator that
+    // lives in a sibling or descendant PID namespace must not leak its
+    // init-namespace number into `shm_cpid`/`shm_lpid`/`msg_l*rpid`.
+    current()
+        .as_thread()
+        .pid_ns()
+        .visible_pid_checked(pid)
+        .unwrap_or(0) as __kernel_pid_t
 }
 
 /// All IPC objects visible through one Linux IPC namespace.
@@ -73,6 +82,18 @@ pub(crate) struct IpcNamespace {
     semmns: AtomicUsize,
     semopm: AtomicUsize,
     semmni: AtomicUsize,
+    /// Linux `ns->shm_ctlmax`, `ns->shm_ctlall`, `ns->shm_ctlmni`, seeded by
+    /// `shm_init_ns()` (`ipc/shm.c:112-114`) and reachable through
+    /// `/proc/sys/kernel/shm{max,all,mni}`.
+    shm_ctlmax: AtomicUsize,
+    shm_ctlall: AtomicUsize,
+    shm_ctlmni: AtomicUsize,
+    /// Linux `ns->mq_queues_max`, `ns->mq_msg_max`, `ns->mq_msgsize_max`,
+    /// seeded by `mq_init_ns()` (`ipc/mqueue.c:1624-1629`) and reachable
+    /// through `/proc/sys/fs/mqueue/*`.
+    mq_queues_max: AtomicUsize,
+    mq_msg_max: AtomicUsize,
+    mq_msgsize_max: AtomicUsize,
 }
 
 impl IpcNamespace {
@@ -99,6 +120,12 @@ impl IpcNamespace {
             semmns: AtomicUsize::new(sem::SEMMNS),
             semopm: AtomicUsize::new(sem::SEMOPM),
             semmni: AtomicUsize::new(sem::SEMMNI),
+            shm_ctlmax: AtomicUsize::new(DEFAULT_SHMMAX),
+            shm_ctlall: AtomicUsize::new(DEFAULT_SHMALL),
+            shm_ctlmni: AtomicUsize::new(DEFAULT_SHMMNI),
+            mq_queues_max: AtomicUsize::new(tk_linux_ipc::MQ_QUEUES_MAX_DEFAULT),
+            mq_msg_max: AtomicUsize::new(tk_linux_ipc::MQ_MSG_MAX_DEFAULT),
+            mq_msgsize_max: AtomicUsize::new(tk_linux_ipc::MQ_MSGSIZE_MAX_DEFAULT),
         })
         .map_err(|_| AxError::NoMemory)
     }
@@ -183,13 +210,14 @@ impl IpcNamespace {
         semopm: usize,
         semmni: usize,
     ) -> AxResult<()> {
-        if semmni > tk_linux_ipc::IPCMNI as usize {
-            return Err(AxError::from(LinuxError::ERANGE));
-        }
         self.semmsl.store(semmsl, Ordering::Relaxed);
         self.semmns.store(semmns, Ordering::Relaxed);
         self.semopm.store(semopm, Ordering::Relaxed);
-        self.semmni.store(semmni, Ordering::Relaxed);
+        let previous = self.semmni.swap(semmni, Ordering::Relaxed);
+        if semmni > tk_linux_ipc::IPCMNI as usize {
+            self.semmni.store(previous, Ordering::Relaxed);
+            return Err(AxError::from(LinuxError::ERANGE));
+        }
         Ok(())
     }
 
@@ -199,17 +227,21 @@ impl IpcNamespace {
     /// reachable only under `CONFIG_CHECKPOINT_RESTORE`, with mode 0444 and
     /// upgrades them to writable only for a task that is
     /// `checkpoint_restore_ns_capable()` over the IPC namespace's user
-    /// namespace.  Arming a chosen identifier is exactly the primitive that
-    /// could otherwise defeat `ipc_checkid()`, so the capability is what keeps
-    /// identifier aliasing a privileged operation.
+    /// namespace, i.e. `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` there.
+    /// Owning the user namespace by euid is *not* enough: an ordinary root
+    /// whose both capabilities were dropped still sees mode 0444 and must not
+    /// write `next_id`.  Arming a chosen identifier is exactly the primitive
+    /// that could otherwise defeat `ipc_checkid()`, so the capability is what
+    /// keeps identifier aliasing a privileged operation.
     pub(crate) fn may_set_next_id(&self) -> bool {
         let curr = axtask::current();
         let thread = curr.as_thread();
+        let cred = thread.current_cred();
         ns_capable(
-            &thread.current_cred(),
+            &cred,
             self.owner_user_ns(),
             linux_raw_sys::general::CAP_CHECKPOINT_RESTORE,
-        )
+        ) || ns_capable(&cred, self.owner_user_ns(), CAP_SYS_ADMIN)
     }
 
     /// Charges an SHM_LOCK pin to the caller's real user.  The returned token
@@ -385,40 +417,139 @@ pub(crate) const SHMMIN: usize = 1;
 /// and the header explains the value: as large as possible without letting
 /// userspace overflow a "read the limit, add X, write it back" adjustment.
 const DEFAULT_SHMMAX: usize = usize::MAX - (1 << 24);
+/// `SHMMNI` (`include/uapi/linux/shm.h`), the value `shm_init_ns()` seeds.
 const DEFAULT_SHMMNI: usize = 4096;
 const DEFAULT_SHMALL: usize = usize::MAX - (1 << 24);
-const MAX_SHMMNI: usize = 32_768;
 
-static SHM_MAX_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_SHMMAX);
-static SHM_MNI_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_SHMMNI);
-static SHM_ALL_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_SHMALL);
+impl IpcNamespace {
+    /// Linux `ns->shm_ctlmax`, checked first by `newseg()` (`ipc/shm.c:717`).
+    pub(crate) fn shm_ctlmax(&self) -> usize {
+        self.shm_ctlmax.load(Ordering::Relaxed)
+    }
+
+    /// Store a new `/proc/sys/kernel/shmmax`.
+    ///
+    /// Linux binds the entry to `proc_doulongvec_minmax()` with no `extra1` or
+    /// `extra2` (`ipc/ipc_sysctl.c:79-84`), so every `unsigned long` is
+    /// accepted and the value is stored verbatim.
+    pub(crate) fn set_shm_ctlmax(&self, value: usize) {
+        self.shm_ctlmax.store(value, Ordering::Relaxed);
+    }
+
+    /// Linux `ns->shm_ctlall`, the page ceiling `newseg()` adds the request to
+    /// (`ipc/shm.c:722-726`).
+    pub(crate) fn shm_ctlall(&self) -> usize {
+        self.shm_ctlall.load(Ordering::Relaxed)
+    }
+
+    /// Store a new `/proc/sys/kernel/shmall`, unbounded like `shmmax`
+    /// (`ipc/ipc_sysctl.c:85-90`).
+    pub(crate) fn set_shm_ctlall(&self, value: usize) {
+        self.shm_ctlall.store(value, Ordering::Relaxed);
+    }
+
+    /// Linux `ns->shm_ctlmni`, the `ipc_addid()` ceiling (`ipc/shm.c:782`).
+    pub(crate) fn shm_ctlmni(&self) -> usize {
+        self.shm_ctlmni.load(Ordering::Relaxed)
+    }
+
+    /// Store a new `/proc/sys/kernel/shmmni`.
+    ///
+    /// Linux `ipc/ipc_sysctl.c:91-98` uses `proc_dointvec_minmax()` with
+    /// `extra1 = SYSCTL_ZERO` and `extra2 = &ipc_mni`, so a value outside
+    /// `[0, IPCMNI]` is `EINVAL` and the stored limit is untouched.
+    pub(crate) fn set_shm_ctlmni(&self, value: usize) -> AxResult<()> {
+        if value > tk_linux_ipc::IPCMNI as usize {
+            return Err(AxError::InvalidInput);
+        }
+        self.shm_ctlmni.store(value, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Linux `ns->mq_queues_max`, the first admission check of
+    /// `mqueue_create_attr()`.
+    pub(crate) fn mq_queues_max(&self) -> usize {
+        self.mq_queues_max.load(Ordering::Relaxed)
+    }
+
+    /// Store a new `/proc/sys/fs/mqueue/queues_max`.
+    ///
+    /// Linux `ipc/mq_sysctl.c:24-29` binds it to a plain `proc_dointvec()`, so
+    /// unlike its two siblings it has no range and a write of `0` succeeds - it
+    /// only makes every further unprivileged `mq_open()` `ENOSPC`.
+    pub(crate) fn set_mq_queues_max(&self, value: usize) {
+        self.mq_queues_max.store(value, Ordering::Relaxed);
+    }
+
+    /// Linux `ns->mq_msg_max`, the unprivileged per-queue message ceiling.
+    pub(crate) fn mq_msg_max(&self) -> usize {
+        self.mq_msg_max.load(Ordering::Relaxed)
+    }
+
+    /// Store a new `/proc/sys/fs/mqueue/msg_max`.
+    ///
+    /// Linux `ipc/mq_sysctl.c:30-37` bounds it with `extra1 = &MIN_MSGMAX` and
+    /// `extra2 = &HARD_MSGMAX` (`include/linux/ipc_namespace.h:121,123`), so
+    /// anything outside `[1, 65536]` is `EINVAL`.
+    pub(crate) fn set_mq_msg_max(&self, value: usize) -> AxResult<()> {
+        if value < MQ_MSG_MAX_MIN || value > tk_linux_ipc::MQ_MSG_MAX_HARD as usize {
+            return Err(AxError::InvalidInput);
+        }
+        self.mq_msg_max.store(value, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Linux `ns->mq_msgsize_max`, the unprivileged per-message size ceiling.
+    pub(crate) fn mq_msgsize_max(&self) -> usize {
+        self.mq_msgsize_max.load(Ordering::Relaxed)
+    }
+
+    /// Store a new `/proc/sys/fs/mqueue/msgsize_max`.
+    ///
+    /// Linux `ipc/mq_sysctl.c:38-45` bounds it with
+    /// `extra1 = &MIN_MSGSIZEMAX` and `extra2 = &HARD_MSGSIZEMAX`
+    /// (`include/linux/ipc_namespace.h:124,126`), so the writable window is
+    /// `[128, 16 MiB]` and a smaller value - which would silently clamp every
+    /// new queue - is `EINVAL` instead.
+    pub(crate) fn set_mq_msgsize_max(&self, value: usize) -> AxResult<()> {
+        if value < MQ_MSGSIZE_MAX_MIN
+            || value > tk_linux_ipc::MQ_MSGSIZE_MAX_HARD as usize
+        {
+            return Err(AxError::InvalidInput);
+        }
+        self.mq_msgsize_max.store(value, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// `MIN_MSGMAX` (`include/linux/ipc_namespace.h:121`): the lowest `msg_max` an
+/// administrator may leave the namespace with.
+const MQ_MSG_MAX_MIN: usize = 1;
+/// `MIN_MSGSIZEMAX` (`include/linux/ipc_namespace.h:124`).
+const MQ_MSGSIZE_MAX_MIN: usize = 128;
 
 pub(crate) fn shmmax_limit() -> usize {
-    SHM_MAX_LIMIT.load(Ordering::Relaxed)
+    current().as_thread().ipc_ns().shm_ctlmax()
 }
 
 pub(crate) fn set_shmmax_limit(value: usize) {
-    SHM_MAX_LIMIT.store(value, Ordering::Relaxed);
+    current().as_thread().ipc_ns().set_shm_ctlmax(value);
 }
 
 pub(crate) fn shmmni_limit() -> usize {
-    SHM_MNI_LIMIT.load(Ordering::Relaxed)
+    current().as_thread().ipc_ns().shm_ctlmni()
 }
 
 pub(crate) fn set_shmmni_limit(value: usize) -> AxResult<()> {
-    if value > MAX_SHMMNI {
-        return Err(AxError::InvalidInput);
-    }
-    SHM_MNI_LIMIT.store(value, Ordering::Relaxed);
-    Ok(())
+    current().as_thread().ipc_ns().set_shm_ctlmni(value)
 }
 
 pub(crate) fn shmall_limit() -> usize {
-    SHM_ALL_LIMIT.load(Ordering::Relaxed)
+    current().as_thread().ipc_ns().shm_ctlall()
 }
 
 pub(crate) fn set_shmall_limit(value: usize) {
-    SHM_ALL_LIMIT.store(value, Ordering::Relaxed);
+    current().as_thread().ipc_ns().set_shm_ctlall(value);
 }
 
 /// Data structure used to pass permission information to IPC operations.
@@ -953,10 +1084,8 @@ mod credential_caller_tests {
         let mut table = IpcIdTable::new();
         let mut live: BTreeSet<i32> = BTreeSet::new();
         for expected in 0..8 {
-            let id = allocate_ipc_id(&next_id, &mut table, |candidate| {
-                live.contains(&candidate)
-            })
-            .unwrap();
+            let id = allocate_ipc_id(&next_id, &mut table, |candidate| live.contains(&candidate))
+                .unwrap();
             assert_eq!(id.index(), expected);
             assert_eq!(id.sequence(), 0);
             // The published identifier is the index while the sequence is 0.
@@ -977,15 +1106,15 @@ mod credential_caller_tests {
         let next_id = AtomicI32::new(-1);
         let mut table = IpcIdTable::new();
         let mut live: BTreeSet<i32> = BTreeSet::new();
-        let first = allocate_ipc_id(&next_id, &mut table, |candidate| live.contains(&candidate))
-            .unwrap();
+        let first =
+            allocate_ipc_id(&next_id, &mut table, |candidate| live.contains(&candidate)).unwrap();
         let second =
             allocate_ipc_id(&next_id, &mut table, |candidate| live.contains(&candidate)).unwrap();
         assert_eq!((first.index(), second.index()), (0, 1));
         live.remove(&first.index());
         table.release(first.index(), |candidate| live.contains(&candidate));
-        let third = allocate_ipc_id(&next_id, &mut table, |candidate| live.contains(&candidate))
-            .unwrap();
+        let third =
+            allocate_ipc_id(&next_id, &mut table, |candidate| live.contains(&candidate)).unwrap();
         assert_eq!(third.index(), 2, "index 0 must stay retired");
         assert_ne!(third.raw(), first.raw());
         assert_eq!(ipcid_to_seqx(first.raw()), 0);

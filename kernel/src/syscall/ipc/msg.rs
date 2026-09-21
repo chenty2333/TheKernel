@@ -23,14 +23,12 @@ use tk_linux_ipc::{
     select_message,
 };
 use tk_linux_process_adapter::Pid;
-use tk_linux_usercopy::{
-    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
-};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
-    IpcAccessContext, IpcPerm, MSG_INFO, MSG_STAT, MSG_STAT_ANY,
-    PreparedIpcPermissionUpdate, allocate_ipc_id,
+    IpcAccessContext, IpcPerm, MSG_INFO, MSG_STAT, MSG_STAT_ANY, PreparedIpcPermissionUpdate,
+    allocate_ipc_id,
 };
 use crate::{
     mm::map_usercopy_error,
@@ -580,7 +578,8 @@ pub(crate) fn msg_next_id() -> i32 {
 pub(crate) fn set_msg_next_id(value: i32) -> AxResult<()> {
     // Linux `ipc/ipc_sysctl.c`: the entry is `proc_dointvec_minmax` over
     // `[0, INT_MAX]`, so -1 (the "unset" encoding) is not writable, and the
-    // write needs CAP_CHECKPOINT_RESTORE over the IPC namespace.
+    // write follows the `ipc_permissions()` rule that `may_set_next_id()`
+    // implements.
     if value < 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
@@ -1251,12 +1250,8 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
             mode: user_buf.msg_perm.mode,
             qbytes: user_buf.msg_qbytes as i32,
         };
-        let prepared = PreparedMsgSet::prepare(
-            &context,
-            &msg_queue.msqid_ds,
-            request,
-            ipc_time_secs(),
-        )?;
+        let prepared =
+            PreparedMsgSet::prepare(&context, &msg_queue.msqid_ds, request, ipc_time_secs())?;
         prepared.commit(&mut msg_queue);
         msg_queue.waiters.notify_all(false);
 
