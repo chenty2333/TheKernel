@@ -648,6 +648,13 @@ static int test_wait_boundary(void) {
         "wait-boundary-child");
 }
 
+static int test_resource_limits(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-resource-limits-smoke",
+        NULL,
+        "resource-limits-child");
+}
+
 static int test_rseq(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -1007,6 +1014,7 @@ int main(int argc, char **argv) {
         { "pause", test_pause, 60 },
         { "alarm", test_alarm, 60 },
         { "wait-boundary", test_wait_boundary, 60 },
+        { "resource-limits", test_resource_limits, 60 },
         { "rseq", test_rseq, 60 },
         { "futex", test_futex_differential, 60 },
         { "futex2-waitv-signal", test_futex2_waitv_signal_differential, 60 },
