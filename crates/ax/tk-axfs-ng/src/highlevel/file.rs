@@ -2232,17 +2232,17 @@ fn flush_and_release_closed_file_cache_candidate(candidate: ClosedFileCacheTrimC
         }
     };
     if let Err(err) = flush_dirty_cache_shared(&candidate.shared, file) {
-        debug!("Failed to flush retained cached file before trim: {err:?}");
+        ratelimit::warn_ratelimited!("Failed to flush retained cached file before trim: {err:?}");
         record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_FLUSH_ERRORS, 1);
         return false;
     }
     if let Err(err) = candidate.anchor.flush_metadata_time_overlay() {
-        debug!("Failed to flush retained cached file timestamps before trim: {err:?}");
+        ratelimit::warn_ratelimited!("Failed to flush retained cached file timestamps before trim: {err:?}");
         record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_FLUSH_ERRORS, 1);
         return false;
     }
     if let Err(err) = discard_cached_pages(&candidate.shared) {
-        debug!("Failed to invalidate retained cached file before trim: {err:?}");
+        ratelimit::warn_ratelimited!("Failed to invalidate retained cached file before trim: {err:?}");
         record_cached_file_counter(&CLOSED_FILE_CACHE_TRIM_FLUSH_ERRORS, 1);
         return false;
     }
@@ -3433,7 +3433,7 @@ impl PageCache {
         let addr = global_allocator()
             .alloc_pages(1, PAGE_SIZE, UsageKind::PageCache)
             .inspect_err(|err| {
-                debug!("\x014Failed to allocate page cache: {:?}", err);
+                ratelimit::warn_ratelimited!("Failed to allocate page cache: {:?}", err);
             })?;
         if shmem {
             IN_MEMORY_PAGE_CACHE_RESIDENT_PAGES.fetch_add(1, Ordering::Release);
@@ -3614,8 +3614,8 @@ impl Drop for CachedFilePagePin {
     fn drop(&mut self) {
         let mut guard = self.cache.shared.page_cache.lock();
         let Some(page) = guard.get_mut(&self.pn) else {
-            debug!(
-                "\x014CachedFilePagePin::drop: missing pinned cached page {}",
+            ratelimit::warn_ratelimited!(
+                "CachedFilePagePin::drop: missing pinned cached page {}",
                 self.pn
             );
             return;
@@ -8795,7 +8795,7 @@ impl Drop for CachedFile {
             // `close(2)` is not required to persist data to the device. Keep
             // the explicit flush path on `fsync`/`fdatasync`, and only make
             // dirty cached pages visible to the inode here.
-            debug!("Failed to drain cached file pages on drop: {err:?}");
+            ratelimit::warn_ratelimited!("Failed to drain cached file pages on drop: {err:?}");
         }
     }
 }

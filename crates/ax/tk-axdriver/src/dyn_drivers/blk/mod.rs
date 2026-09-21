@@ -84,7 +84,7 @@ fn maping_blk_err_to_dev_err(err: BlkError) -> DevError {
             // here -- unthrottled, and in the band that every console prints by
             // default. The record stays an error for whoever opens the debug band;
             // it is no longer the machine's own shout about it.
-            debug!("\x013Block device error: {error}");
+            ratelimit::error_ratelimited!("Block device error: {error}");
             DevError::Io
         }
     }

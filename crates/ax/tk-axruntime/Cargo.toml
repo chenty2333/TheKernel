@@ -188,6 +188,10 @@ layer = "platform"
 [package.metadata.thekernel.host-test]
 selected = true
 
+[dependencies.ratelimit]
+package = "tk-ratelimit"
+path = "../tk-ratelimit"
+
 [dependencies.log]
 version = "0.4"
 default-features = false

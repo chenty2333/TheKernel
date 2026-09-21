@@ -348,7 +348,7 @@ impl EthernetDevice {
     {
         if let Err(error) = inner.recycle_tx_buffers() {
             stats.record_tx_error();
-            debug!("\x014recycle_tx_buffers failed: {error:?}");
+            ratelimit::warn_ratelimited!("recycle_tx_buffers failed: {error:?}");
             return Err(Self::map_dev_error(error));
         }
 
@@ -356,7 +356,7 @@ impl EthernetDevice {
             Ok(buffer) => buffer,
             Err(error) => {
                 stats.record_tx_drop();
-                debug!("\x014alloc_tx_buffer failed: {error:?}");
+                ratelimit::warn_ratelimited!("alloc_tx_buffer failed: {error:?}");
                 return Err(Self::map_dev_error(error));
             }
         };
@@ -384,7 +384,7 @@ impl EthernetDevice {
             Err(error) => {
                 stats.record_tx_error();
                 stats.record_tx_drop();
-                debug!("\x014transmit failed: {error:?}");
+                ratelimit::warn_ratelimited!("transmit failed: {error:?}");
                 Err(Self::map_dev_error(error))
             }
         }
@@ -432,7 +432,7 @@ impl EthernetDevice {
         let Ok(parsed) = parse_ingress_frame(frame) else {
             self.stats.record_rx_error();
             self.stats.record_rx_drop();
-            debug!("\x014Dropping malformed Ethernet frame");
+            debug!("Dropping malformed Ethernet frame");
             return RxStep::Consumed;
         };
 
@@ -753,12 +753,12 @@ impl Device for EthernetDevice {
         }
         if self.pending_packets.is_full() {
             self.stats.record_tx_drop();
-            debug!("\x014Pending packets buffer is full, dropping packet");
+            debug!("Pending packets buffer is full, dropping packet");
             return false;
         }
         let Ok(dst_buffer) = self.pending_packets.enqueue(packet.len(), next_hop) else {
             self.stats.record_tx_drop();
-            debug!("\x014Failed to enqueue packet in pending packets buffer");
+            debug!("Failed to enqueue packet in pending packets buffer");
             return false;
         };
         dst_buffer.copy_from_slice(packet);

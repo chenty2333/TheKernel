@@ -95,7 +95,7 @@ impl Ext4Disk {
         // Once per failed completion, and the caller already receives the
         // `Ext4Error`: the debug band is what bounds it, and the priority keeps
         // it a warning for the reader who opened that band.
-        debug!("\x014physical queue reset requested: {fallback_context}");
+        ratelimit::warn_ratelimited!("physical queue reset requested: {fallback_context}");
         let (context, quarantined) = match self.reset_device() {
             Ok(BlockResetOutcome::Quiesced) => (fallback_context, false),
             Ok(BlockResetOutcome::Retired) => (

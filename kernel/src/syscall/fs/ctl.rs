@@ -2593,7 +2593,7 @@ pub fn sys_sync() -> AxResult<isize> {
     let mount = current_fs_context().lock().root_dir().mountpoint().clone();
     if let Err(error) = mount.flush_all_filesystems() {
         // Any unprivileged loop can call sync(2), so this is the debug band.
-        debug!("\x014sync: flushing filesystems failed: {error:?}");
+        ratelimit::warn_ratelimited!("sync: flushing filesystems failed: {error:?}");
     }
     Ok(0)
 }

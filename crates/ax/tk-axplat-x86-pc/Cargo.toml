@@ -97,6 +97,10 @@ version = "0.1"
 [dependencies.lazyinit]
 version = "0.2"
 
+[dependencies.ratelimit]
+package = "tk-ratelimit"
+path = "../tk-ratelimit"
+
 [dependencies.log]
 version = "0.4"
 

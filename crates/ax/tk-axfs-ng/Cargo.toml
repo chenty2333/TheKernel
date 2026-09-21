@@ -129,6 +129,10 @@ default-features = false
 [dependencies.kspin]
 version = "0.1"
 
+[dependencies.ratelimit]
+package = "tk-ratelimit"
+path = "../tk-ratelimit"
+
 [dependencies.log]
 version = "0.4"
 

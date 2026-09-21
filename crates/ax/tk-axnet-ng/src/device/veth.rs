@@ -130,7 +130,7 @@ impl Device for VethEnd {
             Err(_) => {
                 self.stats.record_tx_drop();
                 debug!(
-                    "\x014veth {}: peer buffer full, dropping packet to {}",
+                    "veth {}: peer buffer full, dropping packet to {}",
                     self.name, next_hop
                 );
                 false

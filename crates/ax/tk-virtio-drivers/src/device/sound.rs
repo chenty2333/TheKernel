@@ -539,7 +539,7 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
             self.set_up = true;
         }
         if !self.pcm_parameters[stream_id as usize].setup {
-            log::debug!("\x014Please set parameters for a stream before using it!");
+            log::debug!("Please set parameters for a stream before using it!");
             return Err(Error::IoError);
         }
 
@@ -617,7 +617,7 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
             return Err(Error::InvalidParam);
         }
         if !self.pcm_parameters[stream_id as usize].setup {
-            log::debug!("\x014Please set parameters for a stream before using it!");
+            log::debug!("Please set parameters for a stream before using it!");
             return Err(Error::IoError);
         }
         const U32_SIZE: usize = size_of::<u32>();

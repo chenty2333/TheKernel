@@ -210,14 +210,14 @@ pub fn log_plan(plan: &ModePlan, narration: Narration) {
             // cable that flaps four times a second instead of letting it
             // reprint the same complaint forever.  `\x014` keeps the console
             // priority the warning had, so a quiet-enough console still shows it.
-            (Narration::Watch, true) => debug!("\x014drm: EDID rejected: {error}"),
-            (Narration::Watch, false) => debug!("\x014drm: EDID parsed leniently after: {error}"),
+            (Narration::Watch, true) => debug!("drm: EDID rejected: {error}"),
+            (Narration::Watch, false) => debug!("drm: EDID parsed leniently after: {error}"),
         }
     }
     if !plan.warnings.is_clean() {
         match narration {
             Narration::Boot => warn!("drm: EDID warnings: {}", plan.warnings),
-            Narration::Watch => debug!("\x014drm: EDID warnings: {}", plan.warnings),
+            Narration::Watch => debug!("drm: EDID warnings: {}", plan.warnings),
         }
     }
     if matches!(narration, Narration::Watch) {

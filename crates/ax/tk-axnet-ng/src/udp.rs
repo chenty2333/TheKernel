@@ -875,7 +875,7 @@ impl SocketOps for UdpSocket {
                             let read = dst.write(src)?;
                             if read < src.len() {
                                 debug!(
-                                    "\x014UDP message truncated: {} -> {} bytes",
+                                    "UDP message truncated: {} -> {} bytes",
                                     src.len(),
                                     read
                                 );

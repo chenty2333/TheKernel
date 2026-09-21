@@ -4200,7 +4200,7 @@ pub fn sys_truncate(
             file.sync(false)?;
         }
         if let Err(error) = touch_modified_metadata(&loc) {
-            debug!("truncate metadata update failed after size mutation: {error}");
+            ratelimit::warn_ratelimited!("truncate metadata update failed after size mutation: {error}");
         }
         Ok(())
     })();
@@ -4282,7 +4282,7 @@ pub fn sys_ftruncate(fd: c_int, length: __kernel_off_t) -> AxResult<isize> {
         f.inner().sync(false)?;
     }
     if let Err(error) = touch_modified_metadata(f.inner().location()) {
-        debug!("ftruncate metadata update failed after size mutation: {error}");
+        ratelimit::warn_ratelimited!("ftruncate metadata update failed after size mutation: {error}");
     }
     notify_write(fd);
     let _ = notify_exact(f.inner().location(), IN_ATTRIB);
@@ -4449,7 +4449,7 @@ pub(crate) fn fallocate_file_like(
                     file.sync(false)?;
                 }
                 if let Err(error) = touch_modified_metadata(&loc) {
-                    debug!(
+                    ratelimit::warn_ratelimited!(
                         "native fallocate metadata update failed after provider mutation: {error}"
                     );
                 }
@@ -4621,7 +4621,7 @@ pub(crate) fn fallocate_file_like(
     }
 
     if let Err(error) = touch_modified_metadata(&loc) {
-        debug!("fallocate metadata update failed after file mutation: {error}");
+        ratelimit::warn_ratelimited!("fallocate metadata update failed after file mutation: {error}");
     }
     if inode_flags::sync_on_content_write(&loc)? {
         file.sync(false)?;

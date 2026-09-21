@@ -144,7 +144,7 @@ pub(crate) fn probe_one<R: Registers, T: PollTimer>(
                 if narrate {
                     warn!("intel-sink: {}", error.describe());
                 } else {
-                    debug!("\x014intel-sink: {}", error.describe());
+                    debug!("intel-sink: {}", error.describe());
                 }
                 None
             }

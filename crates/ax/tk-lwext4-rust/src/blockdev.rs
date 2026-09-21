@@ -559,7 +559,7 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
         let buf_len = (bdif.ph_bsize * blk_cnt) as usize;
         let buffer = unsafe { slice::from_raw_parts_mut(buf as *mut u8, buf_len) };
         if let Err(err) = dev.read_blocks(blk_id, buffer) {
-            debug!("read_blocks failed: {err:?}");
+            ratelimit::error_ratelimited!("read_blocks failed: {err:?}");
             return EIO as _;
         }
 
@@ -580,7 +580,7 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
         let buf_len = (bdif.ph_bsize * blk_cnt) as usize;
         let buffer = unsafe { slice::from_raw_parts(buf as *const u8, buf_len) };
         if let Err(err) = dev.write_blocks(blk_id, buffer) {
-            debug!("write_blocks failed: {err:?}");
+            ratelimit::error_ratelimited!("write_blocks failed: {err:?}");
             return EIO as _;
         }
 
@@ -597,7 +597,7 @@ impl<Dev: BlockDevice> Ext4BlockDevice<Dev> {
     unsafe extern "C" fn dev_flush(bdev: *mut ext4_blockdev) -> c_int {
         let (_bdev, _bdif, dev) = unsafe { Self::dev_read_fields(bdev) };
         if let Err(err) = dev.flush() {
-            debug!("flush failed: {err:?}");
+            ratelimit::error_ratelimited!("flush failed: {err:?}");
             return EIO as _;
         }
         EOK as _

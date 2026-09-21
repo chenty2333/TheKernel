@@ -688,7 +688,7 @@ mod irq_impl {
                 // caps and the budget bounds. `\x014` keeps it a warning for the
                 // reader who opened that band: an IRQ storm from an unclaimed
                 // device is exactly what they came to look for.
-                debug!("\x014Unhandled IRQ {vector}");
+                ratelimit::warn_ratelimited!("Unhandled IRQ {vector}");
             }
             unsafe { super::local_apic().end_of_interrupt() };
             Some(vector)

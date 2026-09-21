@@ -90,6 +90,7 @@ kernel-elf-parser = { package = "tk-kernel-elf-parser", path = "crates/ax/tk-ker
 memory_set = { package = "tk-memory-set", path = "crates/ax/tk-memory-set", version = "0.1.0" }
 page_table_multiarch = { package = "tk-page-table-multiarch", path = "crates/ax/tk-page-table-multiarch", version = "0.1.0" }
 scope-local = { package = "tk-scope-local", path = "crates/ax/tk-scope-local", version = "0.1.0" }
+ratelimit = { package = "tk-ratelimit", path = "crates/ax/tk-ratelimit" }
 axpoll = { package = "tk-readiness-adapter", version = "0.1.0", path = "crates/readiness-adapter" }
 axcbpf = { package = "tk-axcbpf", path = "crates/ax/tk-axcbpf", version = "0.1.0" }
 axfault = { package = "tk-axfault", path = "crates/ax/tk-axfault", version = "0.1.0" }

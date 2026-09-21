@@ -1200,7 +1200,7 @@ impl TransportOps for DgramTransport {
                 let count = dst.write(&data)?;
                 if count < data.len() {
                     debug!(
-                        "\x014Unix datagram message truncated: {} -> {} bytes",
+                        "Unix datagram message truncated: {} -> {} bytes",
                         data.len(),
                         count
                     );

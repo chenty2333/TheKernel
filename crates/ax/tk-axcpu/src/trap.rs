@@ -120,7 +120,7 @@ macro_rules! handle_trap {
             }
             func($frame)
         } else {
-            debug!("\x014No registered handler for trap NMI");
+            ratelimit::warn_ratelimited!("No registered handler for trap NMI");
             false
         }
     }};
@@ -139,7 +139,7 @@ macro_rules! handle_trap {
                 }
                 func($vector)
             } else {
-                debug!("\x014No registered handler for trap IRQ");
+                ratelimit::warn_ratelimited!("No registered handler for trap IRQ");
                 false
             }
         };
@@ -162,7 +162,7 @@ macro_rules! handle_trap {
             }
             func($($args)*)
         } else {
-            debug!("\x014No registered handler for trap {}", stringify!($trap));
+            ratelimit::warn_ratelimited!("No registered handler for trap {}", stringify!($trap));
             false
         }
     }}

@@ -78,6 +78,10 @@ version = "1.0"
 [dependencies.linkme]
 version = "0.3"
 
+[dependencies.ratelimit]
+package = "tk-ratelimit"
+path = "../tk-ratelimit"
+
 [dependencies.log]
 version = "0.4"
 

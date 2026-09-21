@@ -1,0 +1,20 @@
+[package]
+name = "tk-ratelimit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Per-call-site log rate limiting with Linux's printk_ratelimited semantics"
+license.workspace = true
+repository.workspace = true
+publish = []
+
+[lib]
+name = "ratelimit"
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4"
+
+[package.metadata.thekernel]
+layer = "mechanism"

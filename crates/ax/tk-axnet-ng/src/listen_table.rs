@@ -170,7 +170,7 @@ impl ListenTable {
         // If the connection is reset, return ConnectionReset error
         // Otherwise, return the handle and the address tuple
         if is_closed(handle, &sockets) {
-            debug!("\x014accept failed: connection reset");
+            debug!("accept failed: connection reset");
             entry.accept_reservations -= 1;
             sockets.remove(handle);
             Err(AxError::ConnectionReset)
@@ -220,20 +220,20 @@ impl ListenTable {
             }
             if entry.syn_queue.len() + entry.accept_reservations >= entry.queue_limit {
                 // SYN queue is full, drop the packet
-                debug!("\x014SYN queue overflow!");
+                ratelimit::info_ratelimited!("SYN queue overflow!");
                 return;
             }
 
             let Ok(mut socket) = new_tcp_socket() else {
-                debug!("\x014Failed to allocate TCP buffers for an incoming connection");
+                ratelimit::warn_ratelimited!("Failed to allocate TCP buffers for an incoming connection");
                 return;
             };
             if let Err(err) = socket.listen(entry.listen_endpoint) {
-                debug!("\x014Failed to listen on {}: {:?}", entry.listen_endpoint, err);
+                ratelimit::warn_ratelimited!("Failed to listen on {}: {:?}", entry.listen_endpoint, err);
                 return;
             }
             if sockets.iter().count() >= MAX_SOCKETS {
-                debug!("\x014network socket storage is full; dropping incoming connection");
+                ratelimit::warn_ratelimited!("network socket storage is full; dropping incoming connection");
                 return;
             }
             let handle = sockets.add(socket);

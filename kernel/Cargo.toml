@@ -68,6 +68,7 @@ axfs = { workspace = true, features = ["task-io-accounting", "nfs41"] }
 axhal = { workspace = true, features = ["fp-simd", "pkeys"] }
 axinput = { workspace = true, optional = true }
 axlog.workspace = true
+ratelimit.workspace = true
 axmm.workspace = true
 axnet.workspace = true
 axruntime = { workspace = true, features = ["irq-exit"] }

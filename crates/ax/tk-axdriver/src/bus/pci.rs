@@ -703,7 +703,7 @@ pub(crate) fn reconcile_input_devices<Register, Unregister>(
                 // "this is a fault, and it is also routine"; the `\x014` keeps it a
                 // warning for whoever opened that band, and the window budget
                 // bounds it there.
-                debug!("\x014failed to configure hotplugged PCI function at {bdf}");
+                ratelimit::warn_ratelimited!("failed to configure hotplugged PCI function at {bdf}");
                 continue;
             }
             if let Some(device) = probe_virtio_input(&mut root, bdf, &info) {

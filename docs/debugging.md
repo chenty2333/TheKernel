@@ -61,14 +61,27 @@ and `info` are the band a machine shows without being asked, so a call site in
 that band is a promise that the message is not reached twice: once per boot, once
 per device, once per operator action. A site on a path a remote peer, an
 unprivileged loop, a per-packet poll or a per-page reclaim can drive belongs in
-the debug band instead, whatever its name says about it. Where the record is still
-a genuine fault -- `SYN queue overflow!`, an unclaimed interrupt level, a block
-request that failed -- write it as `debug!("\x014…")`: the band makes it filterable
-and bounded, the priority keeps it a warning to whoever opened that band and to a
-later `dmesg`. Where the repetition is a machine property rather than an event --
-a bus budget that is always exhausted, an IOAPIC that cannot deliver -- the record
-is `debug!` with no prefix, or one `warn!` with a latch that says later refusals
-are not reported.
+the debug band or behind a rate limit, whatever its name says about it. The
+choice is Linux's:
+
+* A fault that Linux would report -- a block request that failed, an interrupt
+  nobody claimed, a driver that could not allocate a transmit buffer -- keeps its
+  real level and goes through `ratelimit::error_ratelimited!`,
+  `warn_ratelimited!` or `info_ratelimited!` (`crates/ax/tk-ratelimit`). Each is
+  `printk_ratelimited()`: a `static` state per call site, ten records per five
+  seconds, and a `<site>: N callbacks suppressed` warning when the window
+  reopens. It is retained and printed like any other record at that level.
+* An event a peer or a user drives that Linux does not report at all -- a
+  malformed frame, a packet with no route, a truncated datagram -- is plain
+  `debug!`, Linux's `pr_debug`.
+* Where the repetition is a machine property rather than an event -- a bus
+  budget that is always exhausted, an IOAPIC that cannot deliver -- the record
+  is `debug!`, or one `warn!` with a latch that says later refusals are not
+  reported.
+
+A `\x01N` prefix still raises a record above what its macro names (`error!` has
+no `KERN_CRIT`), but it is not a way to hide a fault in the debug band: a
+`debug!` record is not retained unless its target's debug band is open.
 
 A machine that stops itself says so through `klog::fatal`, which retains the
 notice at `KERN_EMERG` if the ring answers at once and writes it to the selected

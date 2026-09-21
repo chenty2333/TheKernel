@@ -1106,6 +1106,8 @@ impl Log for Logger {
     fn flush(&self) {} // Never access the UART in an arbitrary caller's context.
 }
 pub(crate) fn init(level: &str) {
+    // `*_ratelimited!` call sites measure their windows on the kernel clock.
+    ratelimit::set_clock(|| axhal::time::monotonic_time().as_millis() as u64);
     set_console_supported(ConsoleId::Serial, axhal::console::diagnostic_available());
     // `level` can now come from the bootloader's `loglevel=`, so a typo is a
     // thing a human does rather than a build-time constant that was reviewed.
