@@ -5583,21 +5583,22 @@ pub fn sys_pwritev(
     do_pwritev(&capability, fd, iov, iovcnt, offset, 0, false)
 }
 
+// Linux hands `preadv2`/`pwritev2` a split position, but on x86_64 each half
+// arrives in a full 64-bit register and `pos_from_hilo()`
+// (fs/read_write.c:1115-1118) shifts `pos_h` by 64 bits, which discards it:
+// the whole position is `pos_l` and `pos_h` must be ignored rather than
+// folded back in.
 pub fn sys_preadv2(
     capability: UserMemoryCapability,
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
-    offset_low: i32,
-    offset_high: i32,
-    _flags: u32,
+    offset: __kernel_off_t,
+    _pos_high: u32,
+    flags: u32,
 ) -> AxResult<isize> {
-    let offset = ((offset_high as i64) << 32) | (offset_low as u32 as i64);
-    debug!(
-        "sys_preadv2 <= fd: {fd}, iovcnt: {iovcnt}, offset_low: {offset_low}, offset_high: \
-         {offset_high}, flags: {_flags}"
-    );
-    do_preadv(&capability, fd, iov, iovcnt, offset, _flags, true)
+    debug!("sys_preadv2 <= fd: {fd}, iovcnt: {iovcnt}, offset: {offset}, flags: {flags}");
+    do_preadv(&capability, fd, iov, iovcnt, offset, flags, true)
 }
 
 pub fn sys_pwritev2(
@@ -5605,16 +5606,12 @@ pub fn sys_pwritev2(
     fd: c_int,
     iov: *const IoVec,
     iovcnt: usize,
-    offset_low: i32,
-    offset_high: i32,
-    _flags: u32,
+    offset: __kernel_off_t,
+    _pos_high: u32,
+    flags: u32,
 ) -> AxResult<isize> {
-    let offset = ((offset_high as i64) << 32) | (offset_low as u32 as i64);
-    debug!(
-        "sys_pwritev2 <= fd: {fd}, iovcnt: {iovcnt}, offset_low: {offset_low}, offset_high: \
-         {offset_high}, flags: {_flags}"
-    );
-    do_pwritev(&capability, fd, iov, iovcnt, offset, _flags, true)
+    debug!("sys_pwritev2 <= fd: {fd}, iovcnt: {iovcnt}, offset: {offset}, flags: {flags}");
+    do_pwritev(&capability, fd, iov, iovcnt, offset, flags, true)
 }
 
 enum SendFile {

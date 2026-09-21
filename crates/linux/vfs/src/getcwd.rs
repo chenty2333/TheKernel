@@ -8,16 +8,15 @@
 //! rendered length and the user-supplied size:
 //!
 //! ```text
-//! 	len = PATH_MAX - b.len;
-//! 	if (unlikely(len > PATH_MAX))
-//! 		error = -ENAMETOOLONG;
-//! 	else if (unlikely(len > size))
-//! 		error = -ERANGE;
-//! 	else if (copy_to_user(buf, b.buf, len))
-//! 		error = -EFAULT;
-//! 	else
-//! 		error = len;
+//! len = PATH_MAX - <bytes rendered>
+//! len > PATH_MAX          -> -ENAMETOOLONG
+//! otherwise len > size    -> -ERANGE
+//! otherwise copy fails    -> -EFAULT
+//! otherwise               -> len (success)
 //! ```
+//!
+//! That is `fs/d_path.c:437-444` restated as a decision list rather than
+//! copied.
 //!
 //! `len` counts the trailing NUL, so a successful `getcwd` reports
 //! `strlen(path) + 1`. The two length verdicts are scalar rules with no

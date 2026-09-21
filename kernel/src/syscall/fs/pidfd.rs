@@ -515,6 +515,17 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize
     })?;
     let proc_data = pidfd.process_data()?;
     let authorized_image = check_pidfd_getfd_permission(&pidfd, &proc_data)?.into_aspace();
+    // `__pidfd_fget()` (kernel/pid.c:881-895) takes the target's
+    // `exec_update_lock`, re-runs `ptrace_may_access()` under it, and only then
+    // reaches `fget_task()`, so an exec racing this syscall is settled *before*
+    // the sibling descriptor is looked up.  This kernel cannot block on an
+    // in-flight exec, so the image re-check stands in for that lock and keeps
+    // the same position: an image that changed after the authorization above
+    // reports EPERM rather than the EBADF that a descriptor the new image no
+    // longer carries would produce.
+    if proc_data.exec_in_progress() || !proc_data.image_matches(&authorized_image) {
+        return Err(AxError::OperationNotPermitted);
+    }
     let target = match pidfd.signal_thread_task()? {
         Some(task) => task,
         None => crate::task::get_visible_task(proc_data.proc.pid())?,
@@ -524,9 +535,6 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize
         .try_fd_table()
         .ok_or(AxError::NoSuchProcess)?
         .get_description(target_fd)?;
-    if proc_data.exec_in_progress() || !proc_data.image_matches(&authorized_image) {
-        return Err(AxError::OperationNotPermitted);
-    }
     add_file_description(description, true).map(|fd| fd as isize)
 }
 
@@ -535,8 +543,21 @@ struct PidFdSignalRequest {
     code: i32,
 }
 
+/// The process group a `PIDFD_SIGNAL_PROCESS_GROUP` request addresses, before
+/// its number is turned into a delivery target.
+enum ProcessGroupTarget {
+    /// The number is known and the descriptor's identity is still published.
+    Ready(Pid),
+    /// The descriptor's target is gone.  `__do_pidfd_send_signal()` resolves no
+    /// task for a scope above `PIDTYPE_PID` (kernel/pid.c), so `ESRCH` for a
+    /// dead target first becomes observable at `kill_pgrp_info()` -- after the
+    /// caller's siginfo record has been copied and validated.  Carrying the
+    /// failure here keeps that order.
+    Gone,
+}
+
 /// Resolves the PID number a `PIDFD_SIGNAL_PROCESS_GROUP` request addresses as
-/// a process-group ID.
+/// a process-group ID, or records that the descriptor's target is gone.
 ///
 /// Linux keeps the descriptor's `struct pid` and passes it to
 /// `kill_pgrp_info()` as `pgrp`, so the group addressed is the one whose
@@ -549,32 +570,47 @@ struct PidFdSignalRequest {
 /// descriptor table to `get_task_pid(current, PIDTYPE_PID)` and
 /// `get_task_pid(current, PIDTYPE_TGID)`, so their numbers are the calling
 /// thread's TID and the calling process's PID.
-fn process_group_pid_of_pidfd_target(
+fn process_group_target_of_pidfd_target(
     target: tk_linux_fd::SignalTarget,
     pidfd: i32,
-) -> AxResult<Pid> {
+) -> AxResult<ProcessGroupTarget> {
+    let ready =
+        |pid| -> AxResult<ProcessGroupTarget> { Ok(ProcessGroupTarget::Ready(pid)) };
     match target {
-        tk_linux_fd::SignalTarget::SelfThread => Ok(current().as_thread().kernel_tid()),
-        tk_linux_fd::SignalTarget::SelfThreadGroup => Ok(current().as_thread().proc_data.proc.pid()),
+        tk_linux_fd::SignalTarget::SelfThread => ready(current().as_thread().kernel_tid()),
+        tk_linux_fd::SignalTarget::SelfThreadGroup => {
+            ready(current().as_thread().proc_data.proc.pid())
+        }
         tk_linux_fd::SignalTarget::Descriptor => match PidFd::from_fd(pidfd) {
             Ok(pidfd) => {
                 if pidfd.signal_thread_tid().is_some() {
                     // A `PIDFD_THREAD` descriptor names the thread's own PID
                     // object, so the group it can address is the one whose
                     // PGID equals that kernel-global TID.
-                    let task = pidfd.signal_thread_task()?.ok_or(AxError::NoSuchProcess)?;
-                    return Ok(task.as_thread().kernel_tid());
+                    return match pidfd.signal_thread_task() {
+                        Ok(Some(task)) => ready(task.as_thread().kernel_tid()),
+                        Ok(None) | Err(AxError::NoSuchProcess) => Ok(ProcessGroupTarget::Gone),
+                        Err(error) => Err(error),
+                    };
                 }
-                let identity = pidfd.process()?;
+                let identity = match pidfd.process() {
+                    Ok(identity) => identity,
+                    Err(AxError::NoSuchProcess) => return Ok(ProcessGroupTarget::Gone),
+                    Err(error) => return Err(error),
+                };
                 // The descriptor does not pin the PID number the way Linux's
                 // retained `struct pid` does, so a reaped target must not let
                 // a recycled number resolve an unrelated group.
                 if !exact_process_is_published(&identity)? {
-                    return Err(AxError::NoSuchProcess);
+                    return Ok(ProcessGroupTarget::Gone);
                 }
-                Ok(identity.pid())
+                ready(identity.pid())
             }
-            Err(AxError::InvalidInput) => Ok(process_data_from_proc_dir_fd(pidfd)?.proc.pid()),
+            Err(AxError::InvalidInput) => match process_data_from_proc_dir_fd(pidfd) {
+                Ok(proc_data) => ready(proc_data.proc.pid()),
+                Err(AxError::NoSuchProcess) => Ok(ProcessGroupTarget::Gone),
+                Err(error) => Err(error),
+            },
             Err(err) => Err(err),
         },
     }
@@ -597,7 +633,8 @@ fn process_group_pid_of_pidfd_target(
 /// report `ESRCH` for a group with no members; the signal record is therefore
 /// complete before the group is resolved.  Only the descriptor's own PID
 /// number, which `pidfd_get_pid()` fixes before the siginfo copy, is resolved
-/// ahead of it.
+/// ahead of it -- a target that is already gone is carried as
+/// [`ProcessGroupTarget::Gone`] and judged after the record.
 fn send_pidfd_process_group_signal<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     pidfd: i32,
@@ -605,7 +642,7 @@ fn send_pidfd_process_group_signal<M: UserMemory + ?Sized>(
     sig: *mut SignalInfo,
     target: tk_linux_fd::SignalTarget,
 ) -> AxResult<isize> {
-    let pgid = process_group_pid_of_pidfd_target(target, pidfd)?;
+    let group = process_group_target_of_pidfd_target(target, pidfd)?;
     let request = if sig.is_null() {
         // `prepare_kill_siginfo(sig, &kinfo, PIDTYPE_PGID)` synthesizes
         // `SI_USER` for every scope except `PIDTYPE_PID`, and signal 0 stays a
@@ -625,6 +662,10 @@ fn send_pidfd_process_group_signal<M: UserMemory + ?Sized>(
         SignalSecuritySource::PidFd { code: request.code },
         SignalDeliveryScope::ThreadGroup,
     )?;
+    let pgid = match group {
+        ProcessGroupTarget::Ready(pgid) => pgid,
+        ProcessGroupTarget::Gone => return Err(AxError::NoSuchProcess),
+    };
     let targets = process_group_targets(pgid)?;
     send_user_signal_to_process_group_targets(targets, request.signal, operation)?;
     Ok(0)

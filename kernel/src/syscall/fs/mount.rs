@@ -74,7 +74,9 @@ fn may_mount(security: &VfsSecurityContext) -> bool {
 /// `capable(CAP_SYS_ADMIN)` -- the test in the *initial* user namespace, which
 /// is stricter than the `may_mount()` gate fsopen(2) already applied.
 fn mount_capable() -> bool {
-    current().as_thread().has_effective_capability(CAP_SYS_ADMIN)
+    current()
+        .as_thread()
+        .has_effective_capability(CAP_SYS_ADMIN)
 }
 
 fn current_may_mount() -> bool {
@@ -4730,6 +4732,18 @@ fn move_attached_mount(source: &Location, target: &Location, flags: u32) -> AxRe
     if !source.is_root_of_mount() {
         return Err(AxError::InvalidInput);
     }
+    ensure_current_move_mount_location(source)?;
+    ensure_current_move_mount_location(target)?;
+    // A `MOVE_MOUNT_SET_GROUP` request never reaches `do_move_mount()`:
+    // `vfs_move_mount()` (fs/namespace.c:4562-4566) returns `do_set_group()`'s
+    // answer directly, and `do_set_group()` (fs/namespace.c:3433-3485) compares
+    // superblocks, mount roots and propagation state -- never dentry types.  A
+    // shared directory mount may therefore join a propagation group whose
+    // target mount has a regular file as its root, so the group join must be
+    // dispatched before the placement comparison below.
+    if flags & MOVE_MOUNT_SET_GROUP != 0 {
+        return set_move_mount_group(source, target);
+    }
     // `do_move_mount()` (fs/namespace.c:3642-3643) compares the directory-ness
     // of the placement pair before any namespace admission:
     //     if (d_is_dir(new_path->dentry) != d_is_dir(old_path->dentry))
@@ -4738,11 +4752,6 @@ fn move_attached_mount(source: &Location, target: &Location, flags: u32) -> AxRe
     // not the EIO an unusable placement path would otherwise report.
     if source.is_dir() != target.is_dir() {
         return Err(AxError::InvalidInput);
-    }
-    ensure_current_move_mount_location(source)?;
-    ensure_current_move_mount_location(target)?;
-    if flags & MOVE_MOUNT_SET_GROUP != 0 {
-        return set_move_mount_group(source, target);
     }
     if source.mountpoint().is_placement_locked() {
         return Err(AxError::InvalidInput);
@@ -5259,6 +5268,9 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
     target: *const c_char,
     flags: i32,
 ) -> AxResult<isize> {
+    // `ksys_umount()` does "basic validity checks done first": it rejects an
+    // unknown flag bit before `user_path_at()`, so EINVAL outranks the
+    // EFAULT an unreadable path would produce.
     validate_umount_flags(flags).map_err(map_mount_uapi)?;
     let target = load_user_path(memory, target)?;
     debug!("sys_umount2 <= target: {target:?}, flags: {flags:#x}");
@@ -5287,7 +5299,7 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
     //     if (!path_mounted(path))                          -> -EINVAL
     //     if (!check_mnt(mnt))                              -> -EINVAL
     //     if (mnt->mnt.mnt_flags & MNT_LOCKED)              -> -EINVAL
-    //     if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN)) -> -EPERM
+    //     if (flags & MNT_FORCE && !ns_capable(sb->s_user_ns, CAP_SYS_ADMIN)) -> -EPERM
     // The two mount-tree tests therefore decide *every* flag combination
     // before `do_umount()` looks at `flags`.  That is observable when the
     // namespace was copied across a user namespace: `copy_mnt_ns()` runs
@@ -5303,6 +5315,15 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
     if target.mountpoint().is_placement_locked() {
         return Err(AxError::InvalidInput);
     }
+    if flags & MNT_FORCE != 0
+        && !ns_capable(
+            security.actor(),
+            security.filesystem_owner_user_ns(),
+            CAP_SYS_ADMIN,
+        )
+    {
+        return Err(AxError::from(LinuxError::EPERM));
+    }
     // `do_umount()` compares against the *filesystem* root, not the namespace
     // root: `current->fs->root.mnt` is the mutable rootfs that
     // `init_mount_tree()` layered on top of the immutable nullfs
@@ -5316,8 +5337,7 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
     // (`fs/namespace.c`:1885-1888).  This runs before the parent test, so an
     // expire request aimed at the filesystem root, or combined with
     // FORCE/DETACH, is -EINVAL rather than -EBUSY or a real unmount.
-    if flags & MNT_EXPIRE != 0
-        && (targets_filesystem_root || flags & (MNT_FORCE | MNT_DETACH) != 0)
+    if flags & MNT_EXPIRE != 0 && (targets_filesystem_root || flags & (MNT_FORCE | MNT_DETACH) != 0)
     {
         return Err(AxError::InvalidInput);
     }

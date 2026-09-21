@@ -384,6 +384,7 @@ pub const fn validate_fsmount_flags(flags: u32) -> Result<bool, UapiError> {
 /// The attribute-word half of `fsmount(2)`, which Linux applies *after* the
 /// namespace capability decision (`fs/namespace.c`:4458-4471):
 ///
+/// Excerpt: Linux v7.2.3 `fs/namespace.c:4456-4469` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```text
 ///     if (attr_flags & ~FSMOUNT_VALID_FLAGS)
 ///         return -EINVAL;
@@ -414,6 +415,7 @@ pub const fn validate_fsmount_attrs(attrs: u32) -> Result<(), UapiError> {
 /// entirely before the syscall looks at the fs_context descriptor
 /// (`fs/namespace.c` v7.2.3:4435-4471):
 ///
+/// Excerpt: Linux v7.2.3 `fs/namespace.c:4446-4461` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```text
 ///     if (flags & ~(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE))
 ///         return -EINVAL;
@@ -476,6 +478,7 @@ pub const fn validate_open_tree(flags: u32) -> Result<bool, UapiError> {
 /// flag-word rules and before the pathname copy (`fs/namespace.c`
 /// v7.2.3:3220-3233):
 ///
+/// Excerpt: Linux v7.2.3 `fs/namespace.c:3220-3229` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```text
 ///     /*
 ///      * If we create a new mount namespace with the cloned mount tree we
@@ -542,6 +545,7 @@ pub const fn validate_mount_setattr_flags(flags: u32, size: usize) -> Result<(),
 /// `ksys_umount()` (fs/namespace.c) performs the whole flag-validity check
 /// before it even loads the pathname:
 ///
+/// Excerpt: Linux v7.2.3 `fs/namespace.c:2061-2063` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```text
 ///     // basic validity checks done first
 ///     if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
@@ -560,6 +564,7 @@ pub const fn validate_umount_flags(flags: i32) -> Result<(), UapiError> {
 /// `path_mount()` (fs/namespace.c) validates the legacy flag word with exactly
 /// one test:
 ///
+/// Excerpt: Linux v7.2.3 `fs/namespace.c:4096-4101` — GPL-2.0-only, (C) The Linux Kernel Authors
 /// ```text
 ///     /* Basic sanity checks */
 ///     if (data_page)

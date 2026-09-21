@@ -1173,6 +1173,52 @@ int main(void) {
         check(syscall(NR_PREADV2, file, BAD, 1, 0LL, 0LL, RWF_HIPRI) == -1 &&
               errno == EFAULT, "bad-iov");
         mark("IOVEC_COPY_BEFORE_FLAGS");
+
+        /* Where the position lives.  pos_from_hilo() (fs/read_write.c:1115-1118)
+         * shifts pos_h by 64 bits on x86_64, so the entire 64-bit position
+         * travels in pos_l and pos_h contributes nothing -- which is what
+         * glibc relies on when it passes an `off_t` and a literal 0. */
+        {
+            int hfd = openat(dirfd, "preadv2-pos",
+                             O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+            struct stat st;
+            check(hfd >= 0, "pos-file-open");
+            check(syscall(NR_PREADV2, hfd, &iov, 1, 0LL, 1LL, 0) == 0,
+                  "pos-h-ignored-for-read");
+            check(fstat(hfd, &st) == 0 && st.st_size == 0, "pos-h-ignored-for-size");
+            mark("POS_H_IS_IGNORED");
+            check(syscall(NR_PWRITEV2, hfd, &iov, 1, 0x100000000LL, 0LL, 0) ==
+                      (long)sizeof(buf), "pos-l-write-64-bit");
+            check(fstat(hfd, &st) == 0 && st.st_size == 0x100000000LL + sizeof(buf),
+                  "pos-l-carries-64-bits");
+            check(syscall(NR_PREADV2, hfd, &iov, 1, 0x100000000LL, 0LL, 0) ==
+                      (long)sizeof(buf), "pos-l-read-64-bit");
+            mark("POSITION_TRAVELS_IN_POS_L");
+            close(hfd);
+            unlinkat(dirfd, "preadv2-pos", 0);
+        }
+
+        /* pos_l == -1 with pos_h == 0 is preadv2's current-position form
+         * (fs/read_write.c:1188-1190: `if (pos == -1) return do_readv(...)`). */
+        {
+            int cfd = openat(dirfd, "preadv2-cur",
+                             O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+            char fill[16];
+            memset(fill, 'c', sizeof(fill));
+            check(cfd >= 0, "cur-file-open");
+            check(pwrite(cfd, fill, sizeof(fill), 0) == (long)sizeof(fill),
+                  "cur-file-fill");
+            check(lseek(cfd, 8, SEEK_SET) == 8, "cur-file-seek");
+            memset(buf, 0, sizeof(buf));
+            check(syscall(NR_PREADV2, cfd, &iov, 1, -1LL, 0LL, 0) == 8,
+                  "minus-one-read-length");
+            check(buf[0] == 'c' && buf[7] == 'c' && buf[8] == 0,
+                  "minus-one-content");
+            check(lseek(cfd, 0, SEEK_CUR) == 16, "minus-one-advances-position");
+            mark("CURRENT_POSITION_FROM_MINUS_ONE");
+            close(cfd);
+            unlinkat(dirfd, "preadv2-cur", 0);
+        }
     }
     done();
 
@@ -1202,6 +1248,56 @@ int main(void) {
         check(syscall(NR_PWRITEV2, file, BAD, 1, 0LL, 0LL, RWF_HIPRI) == -1 &&
               errno == EFAULT, "bad-iov");
         mark("IOVEC_COPY_BEFORE_FLAGS");
+
+        /* The same position rule on the write side: pos_h is shifted out, so a
+         * caller that passes a 64-bit position in pos_l and a literal 0 in
+         * pos_h lands exactly at pos_l. */
+        {
+            int hfd = openat(dirfd, "pwritev2-pos",
+                             O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+            struct stat st;
+            check(hfd >= 0, "pos-file-open");
+            check(syscall(NR_PWRITEV2, hfd, &iov, 1, 0LL, 1LL, 0) ==
+                      (long)sizeof(buf), "pos-h-ignored-for-write");
+            check(fstat(hfd, &st) == 0 && st.st_size == (off_t)sizeof(buf),
+                  "pos-h-ignored-for-size");
+            check(syscall(NR_PREADV2, hfd, &iov, 1, 0LL, 1LL, 0) ==
+                      (long)sizeof(buf), "pos-h-ignored-for-read");
+            mark("POS_H_IS_IGNORED");
+            check(syscall(NR_PWRITEV2, hfd, &iov, 1, 0x100000000LL, 0LL, 0) ==
+                      (long)sizeof(buf), "pos-l-write-64-bit");
+            check(fstat(hfd, &st) == 0 && st.st_size == 0x100000000LL + sizeof(buf),
+                  "pos-l-carries-64-bits");
+            mark("POSITION_TRAVELS_IN_POS_L");
+            close(hfd);
+            unlinkat(dirfd, "pwritev2-pos", 0);
+        }
+
+        /* pos_l == -1 with pos_h == 0 is pwritev2's current-position form
+         * (fs/read_write.c:1203-1211: `if (pos == -1) return do_writev(...)`),
+         * so the write lands at the open-file description's cursor and moves it. */
+        {
+            int cfd = openat(dirfd, "pwritev2-cur",
+                             O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+            struct iovec cur;
+            char fill[16];
+            char probe[16];
+            memset(fill, 'a', sizeof(fill));
+            cur.iov_base = buf;
+            cur.iov_len = 4;
+            check(cfd >= 0, "cur-file-open");
+            check(pwrite(cfd, fill, sizeof(fill), 0) == (long)sizeof(fill),
+                  "cur-file-fill");
+            check(lseek(cfd, 8, SEEK_SET) == 8, "cur-file-seek");
+            check(syscall(NR_PWRITEV2, cfd, &cur, 1, -1LL, 0LL, 0) == 4,
+                  "minus-one-write-length");
+            check(lseek(cfd, 0, SEEK_CUR) == 12, "minus-one-advances-position");
+            check(pread(cfd, probe, sizeof(probe), 0) == (long)sizeof(probe) &&
+                  probe[7] == 'a' && probe[8] == 'y' && probe[11] == 'y' &&
+                  probe[12] == 'a', "minus-one-content");
+            close(cfd);
+            unlinkat(dirfd, "pwritev2-cur", 0);
+        }
     }
     done();
 

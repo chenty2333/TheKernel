@@ -454,7 +454,11 @@ fn encode_v1(data: &QuotaData, ty: usize) -> AxResult<Vec<u8>> {
         // `v1_mem2diskdqblk()` stores the byte limits as whole QUOTABLOCK
         // counts and the usage as a QUOTABLOCK count of `dqb_curspace`
         // (fs/quota/quota_v1.c:44-57).
-        put32(&mut bytes, o, stoqb(r.bhardlimit).min(u32::MAX as u64) as u32);
+        put32(
+            &mut bytes,
+            o,
+            stoqb(r.bhardlimit).min(u32::MAX as u64) as u32,
+        );
         put32(
             &mut bytes,
             o + 4,
@@ -651,14 +655,17 @@ fn admin() -> AxResult<()> {
         .ok_or_else(|| LinuxError::EPERM.into())
 }
 fn may_read(ty: usize, id: u32) -> bool {
+    // Linux `check_quotactl_permission()` (fs/quota/quota.c:122-135) compares
+    // the caller's *effective* IDs, not the fsuid/fsgid.
     let task = current();
     let thread = task.as_thread();
+    let cred = thread.current_cred();
+    let ids = cred.ids();
     thread.has_effective_capability(CAP_SYS_ADMIN)
-        || (ty == 0 && current().as_thread().fsuid().into_raw() == id)
+        || (ty == 0 && ids.euid.into_raw() == id)
         || (ty == 1
-            && (thread.fsgid().into_raw() == id
-                || Kgid::from_raw(id)
-                    .is_some_and(|gid| thread.current_cred().groups().contains(gid))))
+            && (ids.egid.into_raw() == id
+                || Kgid::from_raw(id).is_some_and(|gid| cred.groups().contains(gid))))
 }
 fn merge_record(old: &mut IfDqblk, new: IfDqblk) {
     let valid = new.valid;
@@ -1350,11 +1357,7 @@ fn xfs_quota_stat(data: &QuotaData, ty: usize) -> XfsQuotaStat {
     // `quota_getstate()` (fs/quota/quota.c:377-425): project-quota storage is
     // reported in the group slot only while group accounting is disabled,
     // because `fs_quota_stat` has no third slot.
-    let gquota = if data.enabled[1] {
-        file(1)
-    } else {
-        file(2)
-    };
+    let gquota = if data.enabled[1] { file(1) } else { file(2) };
     XfsQuotaStat {
         qs_version: FS_QSTAT_VERSION,
         _pad0: 0,
@@ -1494,12 +1497,12 @@ fn quotactl<M: UserMemory + ?Sized>(
                 bytes.resize(len, 0);
                 let read = quota_file.entry().as_file()?.read_at(&mut bytes, 0)?;
                 bytes.truncate(read);
-                next.formats[ty] = if bytes.len() >= 8 && get32(&bytes, 0).ok() == Some(V2_MAGICS[ty])
-                {
-                    QuotaFormat::V2
-                } else {
-                    QuotaFormat::OldV1
-                };
+                next.formats[ty] =
+                    if bytes.len() >= 8 && get32(&bytes, 0).ok() == Some(V2_MAGICS[ty]) {
+                        QuotaFormat::V2
+                    } else {
+                        QuotaFormat::OldV1
+                    };
                 if next.formats[ty] == QuotaFormat::V2 {
                     decode_state(&bytes, &mut next, ty)?;
                 } else {
@@ -1755,8 +1758,7 @@ fn quotactl<M: UserMemory + ?Sized>(
                     q.info[ty].igrace = u64::from(new.d_itimer as u32);
                 }
                 q.dirty = true;
-                new.d_fieldmask &=
-                    !((FS_DQ_WARNS_MASK | FS_DQ_TIMER_MASK) as u16);
+                new.d_fieldmask &= !((FS_DQ_WARNS_MASK | FS_DQ_TIMER_MASK) as u16);
             }
             // dquot_set_dqblk() resolves the dquot first: an inactive type is
             // ESRCH before do_set_dqblk() sees the request at all.
@@ -1845,9 +1847,16 @@ pub fn sys_quotactl_fd<M: UserMemory + ?Sized>(
     let root = root_for_location(&loc);
     let op = quota_command(cmd);
     quota_type(cmd)?;
-    let read_only =
-        linux_vfs::quota_command_is_write(op) && crate::mounts::is_readonly(&root)?;
-    quotactl(memory, root, cmd, id, addr, Err(AxError::InvalidInput), read_only)
+    let read_only = linux_vfs::quota_command_is_write(op) && crate::mounts::is_readonly(&root)?;
+    quotactl(
+        memory,
+        root,
+        cmd,
+        id,
+        addr,
+        Err(AxError::InvalidInput),
+        read_only,
+    )
 }
 
 #[cfg(test)]
@@ -1929,8 +1938,12 @@ mod tests {
         }
         // `FS_DQ_BIGTIME` is a timer-width flag, not a selector.
         assert!(
-            check_set_dqblk(qc_mask_from_xfs(FS_DQ_BIGTIME as u16), &empty, QuotaFormat::V2)
-                .is_ok()
+            check_set_dqblk(
+                qc_mask_from_xfs(FS_DQ_BIGTIME as u16),
+                &empty,
+                QuotaFormat::V2
+            )
+            .is_ok()
         );
         // 2^63 is one past the current format's inode maximum...
         let over = IfDqblk {
@@ -1952,9 +1965,7 @@ mod tests {
             check_set_dqblk(qc_mask_from_if(legacy.valid), &legacy, QuotaFormat::OldV1),
             Err(LinuxError::ERANGE.into())
         );
-        assert!(
-            check_set_dqblk(qc_mask_from_if(legacy.valid), &legacy, QuotaFormat::V2).is_ok()
-        );
+        assert!(check_set_dqblk(qc_mask_from_if(legacy.valid), &legacy, QuotaFormat::V2).is_ok());
         // An unselected field is never range checked: only the selector the
         // request asked for bounds the value.
         let unselected = IfDqblk {
@@ -2014,7 +2025,10 @@ mod tests {
         // search past, and exhaustion is ENOENT.
         let mut data = QuotaData::default();
         data.records.insert((0, 1000), IfDqblk::default());
-        assert_eq!(next_quota_record(&data, 0, 1000).map(|(id, _)| id), Ok(1000));
+        assert_eq!(
+            next_quota_record(&data, 0, 1000).map(|(id, _)| id),
+            Ok(1000)
+        );
         assert_eq!(next_quota_record(&data, 0, 999).map(|(id, _)| id), Ok(1000));
         assert_eq!(
             next_quota_record(&data, 0, 1001).map(|(id, _)| id),

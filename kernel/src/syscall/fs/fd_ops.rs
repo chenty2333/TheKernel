@@ -36,9 +36,9 @@ static FILE_RW_HINTS: spin::Lazy<Mutex<BTreeMap<(u64, u64), u64>>> =
 use super::admit_resize;
 use crate::{
     file::{
-        AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, File, FileDescription,
-        FileLike, IoctlContext, Pipe, ReservedFd, close_file_like, current_fd_table, dnotify,
-        executable,
+        AfAlgSocket, AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, File,
+        FileDescription, FileLike, IoctlContext, NetlinkSocket, PacketSocket, Pipe, ReservedFd,
+        Socket, close_file_like, current_fd_table, dnotify, executable,
         flock::{self, RecordLockOwner},
         get_file_description, get_file_like, get_typed_file, inode_flags,
         inotify::{
@@ -268,6 +268,23 @@ fn sync_async_io_to_file_flags(description: &FileDescription, fd: c_int, flags: 
     }
 }
 
+/// Whether this description's provider accepts an fasync registration.  Linux
+/// consults `filp->f_op->fasync`; pipes/FIFOs and every socket family
+/// (`sock_ioctl()` routes `FIOASYNC` to `sock_fasync()`,
+/// net/socket.c:1254-1258) carry one here.  The registration itself lives on
+/// the open file description's `FASYNC` bit; only pipes additionally forward
+/// it to a signal-delivery provider, and socket SIGIO delivery is outside the
+/// scope of this implementation.
+fn description_supports_fasync(description: &FileDescription) -> bool {
+    !description.is_path_only()
+        && (description.inner.downcast_ref::<Pipe>().is_some()
+            || description.inner.downcast_ref::<NamedPipe>().is_some()
+            || description.inner.downcast_ref::<Socket>().is_some()
+            || description.inner.downcast_ref::<PacketSocket>().is_some()
+            || description.inner.downcast_ref::<NetlinkSocket>().is_some()
+            || description.inner.downcast_ref::<AfAlgSocket>().is_some())
+}
+
 /// Applies `FIOASYNC` through the open file description's `FASYNC` status bit.
 ///
 /// fs/ioctl.c `ioctl_fioasync()`:
@@ -282,11 +299,13 @@ fn sync_async_io_to_file_flags(description: &FileDescription, fd: c_int, flags: 
 ///     return error < 0 ? error : 0;
 ///
 /// The provider test is deliberately not "the status bit is writable": only the
-/// objects whose signal delivery this kernel implements may publish `FASYNC`,
+/// objects whose fasync registration this kernel accepts may publish `FASYNC`,
 /// because a registration no provider honours would silently change the
-/// descriptor's asynchronous-I/O behaviour.  Regular files, directories and the
-/// remaining objects therefore answer `-ENOTTY`, exactly as Linux's ext4 and
-/// `empty_fops` providers do.
+/// descriptor's asynchronous-I/O behaviour.  Pipes/FIFOs and every socket
+/// family accept it (Linux routes socket `FIOASYNC` to `sock_fasync()`, which
+/// succeeds for any socket); regular files, directories and the remaining
+/// objects answer `-ENOTTY`, exactly as Linux's ext4 and `empty_fops` providers
+/// do.  Socket registrations are accepted but no SIGIO delivery is wired up.
 pub(crate) fn ioctl_fioasync(context: &IoctlContext, fd: c_int, on: bool) -> AxResult<()> {
     let description = context.files().get_description(fd)?;
     let current = description.io_status_snapshot();
@@ -294,14 +313,7 @@ pub(crate) fn ioctl_fioasync(context: &IoctlContext, fd: c_int, on: bool) -> AxR
         // Linux consults `->fasync` only when the request changes the bit.
         return Ok(());
     }
-    if description.is_path_only() {
-        // `O_PATH` installs `empty_fops` (fs/open.c:886-892), which carries no
-        // `->fasync`.
-        return Err(AxError::NotATty);
-    }
-    if description.inner.downcast_ref::<Pipe>().is_none()
-        && description.inner.downcast_ref::<NamedPipe>().is_none()
-    {
+    if !description_supports_fasync(&description) {
         return Err(AxError::NotATty);
     }
     description.transition_status_flags(
@@ -601,7 +613,8 @@ fn openat2_dirfd_base(
     }
     Ok(description
         .file_handle()
-        .downcast::<Directory>()?
+        .downcast::<Directory>()
+        .map_err(|_| AxError::NotADirectory)?
         .inner()
         .clone())
 }
@@ -1229,7 +1242,10 @@ pub fn sys_open_by_handle_at(
     // O_PATH descriptor is EBADF while AT_FDCWD selects the working directory
     // and every other descriptor is taken as the mount selector.
     let (mount, directory_scope) = if mount_fd == AT_FDCWD {
-        (Some(current_fs_context().lock().current_dir().clone()), true)
+        (
+            Some(current_fs_context().lock().current_dir().clone()),
+            true,
+        )
     } else {
         let description = crate::file::get_file_description(mount_fd)?;
         if description.is_path_only() {
@@ -1996,10 +2012,7 @@ pub(crate) fn copy_openat2_input(
         }
     }
     let head_destination = unsafe {
-        slice::from_raw_parts_mut(
-            raw.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-            OPENAT2_HOW_SIZE,
-        )
+        slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<MaybeUninit<u8>>(), OPENAT2_HOW_SIZE)
     };
     capability
         .read_bytes(how_addr, head_destination)
@@ -2662,25 +2675,28 @@ pub fn sys_fcntl(
                 tk_linux_fd::SetFlError::InvalidInput => AxError::InvalidInput,
             })?;
             let fasync = (arg as u32) & FASYNC;
-            if current_flags & FASYNC != fasync {
-                // FASYNC only changes through a `->fasync` provider; reuse
-                // `ioctl_fioasync`'s admission so objects without one report
-                // the same error instead of silently adopting the bit.
-                if description.is_path_only()
-                    || (description.inner.downcast_ref::<Pipe>().is_none()
-                        && description.inner.downcast_ref::<NamedPipe>().is_none())
-                {
-                    return Err(AxError::NotATty);
+            let requested = if current_flags & FASYNC != fasync {
+                if description_supports_fasync(&description) {
+                    plan.mutable | fasync
+                } else {
+                    // Linux `setfl()` (fs/fcntl.c) skips `->fasync` silently
+                    // when the provider has none and still returns 0, leaving
+                    // the bit unchanged; mirror that instead of failing the
+                    // whole request.
+                    plan.mutable | (current_flags & FASYNC)
                 }
-            }
-            let requested = plan.mutable | fasync;
+            } else {
+                plan.mutable | fasync
+            };
             description.transition_status_flags(
                 |old| (old.raw() & !FCNTL_SETFL_MUTABLE_FLAGS) | requested,
                 |old, new| {
                     if old.nonblocking() != new.nonblocking() {
                         description.inner.set_nonblocking(new.nonblocking())?;
                     }
-                    sync_async_io_to_file_flags(&description, fd, new.raw());
+                    if description_supports_fasync(&description) {
+                        sync_async_io_to_file_flags(&description, fd, new.raw());
+                    }
                     Ok(())
                 },
             )?;
