@@ -127,7 +127,7 @@ impl DeferredWaiters {
         self.tail = Some(ptr);
     }
 
-    fn finish(mut self) {
+    fn drain(&mut self) {
         while let Some(ptr) = self.head.take() {
             // SAFETY: each pointer came from `Arc::into_raw` in `push`, and
             // this list has exclusive ownership of that strong reference.
@@ -149,6 +149,16 @@ impl DeferredWaiters {
             owner.cleanup_if_idle();
         }
     }
+
+    fn finish(mut self) {
+        self.drain();
+    }
+}
+
+impl Drop for DeferredWaiters {
+    fn drop(&mut self) {
+        self.drain();
+    }
 }
 
 /// Waiters whose wakers must be invoked after queue gates are released.
@@ -162,16 +172,19 @@ impl WakeBatch {
         self.waiters.push(waiter);
     }
 
-    fn finish(self) {
-        let mut waiters = self.waiters;
-        while let Some(ptr) = waiters.head.take() {
+    fn finish(mut self) {
+        self.drain();
+    }
+
+    fn drain(&mut self) {
+        while let Some(ptr) = self.waiters.head.take() {
             // SAFETY: `ptr` is an owned strong reference detached from a
             // queue and cannot be concurrently reclaimed before this drain.
             let waiter = unsafe { Arc::from_raw(ptr.as_ptr()) };
             let next = waiter.lock().next.take();
-            waiters.head = next;
-            if waiters.head.is_none() {
-                waiters.tail = None;
+            self.waiters.head = next;
+            if self.waiters.head.is_none() {
+                self.waiters.tail = None;
             }
             let (task, owner) = {
                 let waiter = waiter.lock();
@@ -185,6 +198,12 @@ impl WakeBatch {
             drop(waiter);
             owner.cleanup_if_idle();
         }
+    }
+}
+
+impl Drop for WakeBatch {
+    fn drop(&mut self) {
+        self.drain();
     }
 }
 
@@ -907,9 +926,7 @@ fn clear_waiter_proc_state(task: &WeakAxTaskRef) {
     }
 }
 
-fn resolve_waiter_terminal(
-    waiter: Arc<SpinNoIrq<WaiterEntry>>,
-) -> (WaitTerminalOwnership, bool) {
+fn resolve_waiter_terminal(waiter: Arc<SpinNoIrq<WaiterEntry>>) -> (WaitTerminalOwnership, bool) {
     // Mark the waiter as cancelled first so a concurrent wake either already
     // owns completion or observes cancellation and does not count this waiter.
     // Requeue tests `cancelled` while holding the same waiter lock, so the
@@ -1087,9 +1104,7 @@ impl WaitQueue {
             // Its loop stops at the same point this budget does:
             //     if (task_count - nr_wake >= nr_requeue)
             //             break;
-            if reject_pi
-                && woke + moved < wake_count + requeue_limit
-                && src.front_rejects_pi(mask)
+            if reject_pi && woke + moved < wake_count + requeue_limit && src.front_rejects_pi(mask)
             {
                 return Err(());
             }
@@ -1164,7 +1179,8 @@ impl WaitQueue {
             // See `wake_and_requeue_locked`: the PI rejection of
             // `futex_requeue()` (kernel/futex/requeue.c:606-609) applies while
             // the scan still has wake or requeue budget left.
-            if reject_pi && woke + moved < wake_count + requeue_count && src.front_rejects_pi(mask) {
+            if reject_pi && woke + moved < wake_count + requeue_count && src.front_rejects_pi(mask)
+            {
                 return Err(());
             }
             let Some(waiter) = src.pop_front() else {
@@ -1397,19 +1413,13 @@ impl WaitQueue {
             match condition() {
                 Err(error) => Err(error),
                 Ok(None) => Ok(None),
-                Ok(Some(_))
-                    if timeout.is_some_and(|(clock, deadline)| clock.now() >= deadline) =>
-                {
+                Ok(Some(_)) if timeout.is_some_and(|(clock, deadline)| clock.now() >= deadline) => {
                     Err(WaitConditionError::Fault(AxError::TimedOut))
                 }
                 Ok(Some(pi)) => {
                     // The payload must be visible to `pi_top_locked()` before
                     // the entry can be found in the queue.
-                    waiter
-                        .as_ref()
-                        .expect("unpublished futex waiter")
-                        .lock()
-                        .pi = Some(pi);
+                    waiter.as_ref().expect("unpublished futex waiter").lock().pi = Some(pi);
                     self.queue
                         .lock()
                         .push_back(waiter.take().expect("unpublished futex waiter"));
@@ -1551,10 +1561,13 @@ impl WaitQueue {
     /// `FUTEX_LOCK_PI` can slip a waiter in between. It is called with
     /// `Some(tid)` when a waiter must be promoted and `None` when the futex
     /// becomes unowned; returning `false` means the word changed under us
-    /// (`wake_futex_pi()`'s retry) and nothing is claimed.
-    pub fn pi_unlock<P>(&self, publish: P) -> PiUnlockOutcome
+    /// (`wake_futex_pi()`'s retry) and nothing is claimed. The candidate
+    /// waiter's entry lock is held across the call, so a concurrent
+    /// cancellation — which marks `cancelled` under that same lock — cannot
+    /// make the publication name a waiter that has already left.
+    pub fn pi_unlock<P>(&self, mut publish: P) -> PiUnlockOutcome
     where
-        P: FnOnce(Option<u32>) -> bool,
+        P: FnMut(Option<u32>) -> bool,
     {
         let mut pending_wakers = WakeBatch::default();
         // No node is retired on this path: the promoted waiter is woken and the
@@ -1564,29 +1577,43 @@ impl WaitQueue {
         {
             let _gate = self.gate.lock();
             let mut queue = self.queue.lock();
-            match Self::pi_top_locked(&queue) {
-                None => {
-                    if publish(None) {
-                        outcome = PiUnlockOutcome::Cleared;
+            loop {
+                match Self::pi_top_locked(&queue) {
+                    None => {
+                        if publish(None) {
+                            outcome = PiUnlockOutcome::Cleared;
+                        }
+                        break;
                     }
-                }
-                Some((target, pi)) => {
-                    if publish(Some(pi.tid)) {
+                    Some((target, pi)) => {
+                        // SAFETY: `target` is linked in `queue`, whose lock is
+                        // held, so the queue-owned strong reference is live.
+                        let mut entry = unsafe { target.as_ref() }.lock();
+                        if entry.cancelled {
+                            // The top waiter was cancelled after the selection
+                            // walk observed it; pick the next candidate instead
+                            // of publishing a word that names a dead waiter.
+                            drop(entry);
+                            continue;
+                        }
+                        if !publish(Some(pi.tid)) {
+                            break;
+                        }
+                        entry.awakened = true;
+                        drop(entry);
                         let initial_len = queue.len;
                         for _ in 0..initial_len {
                             let Some(waiter) = queue.pop_front() else {
                                 break;
                             };
-                            if core::ptr::eq(Arc::as_ptr(&waiter), target.as_ptr())
-                                && !waiter.lock().cancelled
-                            {
-                                waiter.lock().awakened = true;
+                            if core::ptr::eq(Arc::as_ptr(&waiter), target.as_ptr()) {
                                 pending_wakers.push(waiter);
                                 outcome = PiUnlockOutcome::HandedOff(pi.tid);
                                 break;
                             }
                             queue.push_back(waiter);
                         }
+                        break;
                     }
                 }
             }
@@ -1650,34 +1677,62 @@ impl WaitQueue {
             if src.front_is_plain() {
                 return PiRequeueOutcome::Invalid;
             }
-            let Some((top, pi)) = Self::pi_top_locked(&src) else {
-                return PiRequeueOutcome::NoWaiters;
-            };
-            let Some(mode) = publish(pi.tid) else {
-                return PiRequeueOutcome::Retry;
+            // Claim the top waiter under its entry lock so a cancellation —
+            // which marks `cancelled` under that same lock — cannot interleave
+            // between the selection and the publication; a cancelled candidate
+            // is skipped and the next-strongest waiter is selected instead.
+            let (top, mode) = loop {
+                let Some((top, pi)) = Self::pi_top_locked(&src) else {
+                    return PiRequeueOutcome::NoWaiters;
+                };
+                // SAFETY: `top` is linked in `src`, whose lock is held, so the
+                // queue-owned strong reference is live.
+                let mut entry = unsafe { top.as_ref() }.lock();
+                if entry.cancelled {
+                    drop(entry);
+                    continue;
+                }
+                let Some(mode) = publish(pi.tid) else {
+                    return PiRequeueOutcome::Retry;
+                };
+                if mode == PiRequeueTarget::Promoted {
+                    // `requeue_pi_wake_futex()`: the promoted waiter took the
+                    // target and has to be woken.
+                    entry.awakened = true;
+                } else {
+                    // `rt_mutex_start_proxy_lock()`: the promoted waiter joins
+                    // the target's rt_mutex queue immediately
+                    // (`kernel/futex/requeue.c:543-588`), so the strongest
+                    // waiter is never stranded in the source queue when the
+                    // requeue budget runs out.
+                    entry.owner = target_owner.clone();
+                    entry.requeued_pi = true;
+                }
+                drop(entry);
+                break (top, mode);
             };
             let contended = mode == PiRequeueTarget::Contended;
             let mut woke = 0;
-            if !contended {
-                // `requeue_pi_wake_futex()`: the promoted waiter took the target
-                // and has to be woken.
-                let initial_len = src.len;
-                for _ in 0..initial_len {
-                    let Some(waiter) = src.pop_front() else {
-                        break;
-                    };
-                    let mut entry = waiter.lock();
-                    let is_top = core::ptr::eq(Arc::as_ptr(&waiter), top.as_ptr());
-                    if is_top && !entry.cancelled {
-                        entry.awakened = true;
+            let mut moved = 0;
+            // Move the claimed top waiter out of the source queue, into the
+            // wake batch when it took the target and onto the target queue
+            // when it queued on the target's owner.
+            let initial_len = src.len;
+            for _ in 0..initial_len {
+                let Some(waiter) = src.pop_front() else {
+                    break;
+                };
+                if core::ptr::eq(Arc::as_ptr(&waiter), top.as_ptr()) {
+                    if contended {
+                        moved += 1;
+                        dst.push_back(waiter);
+                    } else {
                         woke = 1;
-                        drop(entry);
                         pending_wakers.push(waiter);
-                        break;
                     }
-                    drop(entry);
-                    src.push_back(waiter);
+                    break;
                 }
+                src.push_back(waiter);
             }
             // `futex_requeue_pi_complete()`/`requeue_futex()`: the waiters that
             // follow the top one move onto the target's rt_mutex queue.
@@ -1686,7 +1741,6 @@ impl WaitQueue {
             } else {
                 nr_wake.saturating_add(nr_requeue).saturating_sub(1)
             };
-            let mut moved = 0;
             let initial_len = src.len;
             for _ in 0..initial_len {
                 let Some(waiter) = src.pop_front() else {
@@ -2398,14 +2452,26 @@ impl FutexEntry {
     /// Drops the PI state once the futex has no owner and no PI waiter left,
     /// releasing the boost the owner may still be carrying.
     pub fn release_pi_state_if_idle(&self) {
-        let idle = {
-            let slot = self.pi.lock();
+        // The idle check and the slot take are one linearization point under
+        // the wait-queue gate: `FUTEX_LOCK_PI` publishes its waiter under the
+        // same gate, so a lock that queues a waiter either is observed here
+        // (the futex is not idle) or finds the slot empty afterwards and
+        // creates a fresh PI state to boost through. The deboost itself
+        // resolves the owner task, which takes locks a run-queue or registry
+        // owner may hold, so it runs after the gate is released.
+        let state = {
+            let _gate = self.wq.gate.lock();
+            let queue = self.wq.queue.lock();
+            let mut slot = self.pi.lock();
             let Some(state) = slot.as_ref() else {
                 return;
             };
-            state.owner_tid() == 0 && self.wq.pi_top_tid().is_none()
+            if state.owner_tid() != 0 || WaitQueue::pi_top_locked(&queue).is_some() {
+                return;
+            }
+            slot.take()
         };
-        if idle && let Some(state) = self.pi.lock().take() {
+        if let Some(state) = state {
             pi_deboost_owner(&state);
             state.detach();
         }
@@ -3333,14 +3399,8 @@ mod pi_tests {
         let pi = add_pi_waiter(&src, 0x51, fifo(1));
         assert_eq!(src.wq.queue.lock().len, 1);
         assert_eq!(
-            src.wq.wake_and_requeue_if(
-                1,
-                1,
-                &dst.wq,
-                target_owner(&dst),
-                u32::MAX,
-                || Ok(true),
-            ),
+            src.wq
+                .wake_and_requeue_if(1, 1, &dst.wq, target_owner(&dst), u32::MAX, || Ok(true),),
             Err(WaitConditionError::Fault(AxError::InvalidInput))
         );
         assert_eq!(src.wq.queue.lock().len, 1, "the PI waiter must stay queued");
@@ -3363,14 +3423,8 @@ mod pi_tests {
         let pi = add_pi_waiter(&src, 0x52, fifo(1));
         assert_eq!(src.wq.queue.lock().len, 2);
         assert_eq!(
-            src.wq.wake_and_requeue_if(
-                1,
-                1,
-                &dst.wq,
-                target_owner(&dst),
-                u32::MAX,
-                || Ok(true),
-            ),
+            src.wq
+                .wake_and_requeue_if(1, 1, &dst.wq, target_owner(&dst), u32::MAX, || Ok(true),),
             Err(WaitConditionError::Fault(AxError::InvalidInput))
         );
         assert_eq!(
@@ -3419,7 +3473,11 @@ mod pi_tests {
             src.wq.wake_op(1, &dst.wq, 1, || Ok(true)),
             Err(WaitConditionError::Fault(AxError::InvalidInput))
         );
-        assert_eq!(src.wq.queue.lock().len, 0, "the first chain woke its waiter");
+        assert_eq!(
+            src.wq.queue.lock().len,
+            0,
+            "the first chain woke its waiter"
+        );
         assert_eq!(dst.wq.queue.lock().len, 1, "the PI waiter must stay queued");
         drop((first, pi));
     }

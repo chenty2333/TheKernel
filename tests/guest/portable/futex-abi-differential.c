@@ -231,6 +231,21 @@
 #endif
 #endif
 
+/* memfd_create(2) is x86_64 syscall 319; older headers may lack both it and
+ * the flag.  A memfd page is the portable way to obtain one shared futex word
+ * at two virtual addresses inside a single process. */
+#ifndef SYS_memfd_create
+#ifdef __NR_memfd_create
+#define SYS_memfd_create __NR_memfd_create
+#else
+#define SYS_memfd_create 319
+#endif
+#endif
+
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Bounds.  All values are pure safety nets; correct runs never wait. */
 /* ------------------------------------------------------------------ */
@@ -1088,6 +1103,24 @@ static int test_pi_word_states(void) {
     }
     pi = 0;
 
+    /* 8. TRYLOCK_PI validates the owner before it decides the trylock.
+     * `futex_lock_pi_atomic()`'s first-waiter path publishes FUTEX_WAITERS
+     * over the TID and `attach_to_pi_owner()` then reports ESRCH when no task
+     * carries it (kernel/futex/pi.c:661-674), so the failing word keeps the
+     * waiters bit instead of staying untouched and the errno is ESRCH, not
+     * the EWOULDBLOCK the trylock itself would produce for a live owner.
+     * 0x00abcdef exceeds the largest allocatable pid on both kernels. */
+    pi = 0x00abcdefu;
+    if (expect_futex_errno("pi-trylock-invalid-owner", &pi,
+                           FUTEX_TRYLOCK_PI | PRIVATE, 0, NULL, NULL, 0,
+                           ESRCH) != 0) {
+        return 1;
+    }
+    if (pi != (0x00abcdefu | FUTEX_WAITERS)) {
+        return fail("pi-trylock-invalid-owner-word", EPROTO);
+    }
+    pi = 0;
+
     /* 9. A timespec with tv_nsec == 1000000000 is rejected before the word
      * is touched. */
     bad.tv_sec = 0;
@@ -1101,9 +1134,11 @@ static int test_pi_word_states(void) {
     }
 
     record("futex-abi-pi-word",
-           "LOCKED UNLOCK_RC_ZERO UNLOCK_WORD_ZERO EPERM TRYLOCK",
+           "LOCKED UNLOCK_RC_ZERO UNLOCK_WORD_ZERO EPERM TRYLOCK "
+           "ESRCH_BAD_OWNER WAITERS_BAD_OWNER",
            "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_PI_WORD_OK locked=1 unlock_rc=0 "
-           "unlock_word=0 eperm=1 trylock=1");
+           "unlock_word=0 eperm=1 trylock=1 esrch_bad_owner=1 "
+           "waiters_bad_owner=1");
     return 0;
 }
 
@@ -1261,6 +1296,41 @@ static int test_pi_timeout(void) {
 /* ------------------------------------------------------------------ */
 /* F. FUTEX_WAIT_REQUEUE_PI / FUTEX_CMP_REQUEUE_PI                    */
 /* ------------------------------------------------------------------ */
+
+/* Maps one shared memfd page twice, so `*source` and `*target` are two
+ * virtual addresses naming the same futex word.  Linux compares the resolved
+ * keys, not the addresses: futex_requeue() rejects such a pair with EINVAL
+ * (kernel/futex/requeue.c:453-457) and futex_wait_setup() does the same after
+ * its source-value check (kernel/futex/waitwake.c:681-685). */
+static int map_shared_alias_pair(uint32_t **source, uint32_t **target,
+                                 const char *stage) {
+    int fd = (int)syscall(SYS_memfd_create, "futex-abi-alias", MFD_CLOEXEC);
+    if (fd < 0) {
+        return fail(stage, errno);
+    }
+    if (ftruncate(fd, 4096) != 0) {
+        int saved = errno;
+        close(fd);
+        return fail(stage, saved);
+    }
+    void *first = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (first == MAP_FAILED) {
+        int saved = errno;
+        close(fd);
+        return fail(stage, saved);
+    }
+    void *second = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (second == MAP_FAILED) {
+        int saved = errno;
+        munmap(first, 4096);
+        close(fd);
+        return fail(stage, saved);
+    }
+    close(fd);
+    *source = first;
+    *target = second;
+    return 0;
+}
 
 struct requeue_pi_case {
     struct blocked_thread blocked;
@@ -1766,6 +1836,19 @@ static int test_requeue_pi(void) {
                            FUTEX_BITSET_MATCH_ANY, EINVAL) != 0) {
         return 1;
     }
+    /* `do_futex()` forces `val3 = FUTEX_BITSET_MATCH_ANY` for
+     * FUTEX_WAIT_REQUEUE_PI, so a zero val3 is ignored: a source word that
+     * does not match still answers EAGAIN from futex_wait_setup() instead of
+     * the EINVAL an interpreted empty bitset would produce. */
+    uint32_t val3_zero_source = 1;
+    if (expect_futex_errno("requeue-pi-val3-zero-mismatch", &val3_zero_source,
+                           FUTEX_WAIT_REQUEUE_PI | PRIVATE, 2, NULL, &target, 0,
+                           EAGAIN) != 0) {
+        return 1;
+    }
+    if (val3_zero_source != 1) {
+        return fail("requeue-pi-val3-zero-word", EPROTO);
+    }
 
     /* A source queue with no waiter to promote is not an error and not a
      * retry: futex_requeue() skips the chain walk and returns task_count,
@@ -1786,11 +1869,59 @@ static int test_requeue_pi(void) {
         return fail("requeue-pi-no-waiters-word", EPROTO);
     }
 
+    /* One shared futex word mapped at two virtual addresses is *one* futex.
+     * FUTEX_WAIT_REQUEUE_PI must reject that pair with EINVAL instead of
+     * queueing a waiter that no FUTEX_CMP_REQUEUE_PI could ever promote, and
+     * the rejection follows the source-value check, so a mismatched source
+     * still answers EWOULDBLOCK.  The absolute bound only keeps a kernel that
+     * queues anyway from hanging this case. */
+    uint32_t *alias_source = NULL;
+    uint32_t *alias_target = NULL;
+    if (map_shared_alias_pair(&alias_source, &alias_target,
+                              "requeue-pi-alias-map") != 0) {
+        return 1;
+    }
+    *alias_source = 0;
+    *alias_target = 0;
+    struct timespec alias_bound;
+    if (absolute_bound(&alias_bound, WAIT_BOUND_NS) != 0) {
+        return fail("requeue-pi-alias-bound", errno);
+    }
+    if (expect_futex_errno("requeue-pi-alias-einval", alias_source,
+                           FUTEX_WAIT_REQUEUE_PI, 0, &alias_bound,
+                           alias_target, FUTEX_BITSET_MATCH_ANY,
+                           EINVAL) != 0) {
+        return 1;
+    }
+    if (*alias_source != 0 || *alias_target != 0) {
+        return fail("requeue-pi-alias-word", EPROTO);
+    }
+    if (expect_futex_errno("requeue-pi-alias-eagain", alias_source,
+                           FUTEX_WAIT_REQUEUE_PI, 1, &alias_bound,
+                           alias_target, FUTEX_BITSET_MATCH_ANY,
+                           EAGAIN) != 0) {
+        return 1;
+    }
+    if (*alias_source != 0 || *alias_target != 0) {
+        return fail("requeue-pi-alias-eagain-word", EPROTO);
+    }
+    /* futex_requeue() resolves the keys before the cmpval comparison, so the
+     * same aliased pair is EINVAL even when the value also differs. */
+    if (expect_futex_errno("requeue-pi-alias-cmp-einval", alias_source,
+                           FUTEX_CMP_REQUEUE_PI, 1,
+                           (const struct timespec *)(uintptr_t)1,
+                           alias_target, 7, EINVAL) != 0) {
+        return 1;
+    }
+    munmap(alias_source, 4096);
+    munmap(alias_target, 4096);
+
     record("futex-abi-requeue-pi",
-           "REQUEUED WAITER_RC TARGET_WORD UNLOCKED EINVAL_SELF EINVAL_WAKE2",
+           "REQUEUED WAITER_RC TARGET_WORD UNLOCKED EINVAL_SELF EINVAL_WAKE2 "
+           "VAL3_ZERO_EAGAIN EINVAL_ALIAS EAGAIN_ALIAS EINVAL_CMP_ALIAS",
            "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_OK requeued=1 "
            "waiter_rc=0 target_word=1 unlocked=1 einval_self=1 "
-           "einval_wake2=1");
+           "einval_wake2=1 einval_alias=1 eagain_alias=1 einval_cmp_alias=1");
     printf("THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_NOWAITERS_RAW rc=%ld "
            "errno=%d\n",
            no_waiters, no_waiters_errno);

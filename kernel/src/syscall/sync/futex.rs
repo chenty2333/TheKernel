@@ -22,9 +22,9 @@ use crate::{
     task::{
         AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, PiRequeueOutcome,
         PiRequeueTarget, PiUnlockOutcome, PiWaiter, PtraceAccessMode, RestartBlock, Thread,
-        WaitConditionError, WaitConditionResult,
-        check_current_thread_ptrace_image_access, futex_table_for, get_visible_task,
-        pi_boost_owner, pi_deboost_owner, wait_on_any_futex_if_atomic,
+        WaitConditionError, WaitConditionResult, check_current_thread_ptrace_image_access,
+        futex_table_for, get_visible_task, pi_boost_owner, pi_deboost_owner,
+        wait_on_any_futex_if_atomic,
     },
     time::TimeValueLike,
 };
@@ -83,6 +83,21 @@ fn futex_key_from(
         let aspace = aspace.lock();
         let namespace = crate::mm::futex_mapping_namespace_at(&aspace, address);
         (FutexKey::new(&aspace, address), Some(namespace))
+    }
+}
+
+/// `futex_match(&key1, &key2)` for a requeue-PI source/target pair.
+///
+/// Two distinct virtual addresses into one shared mapping resolve to the same
+/// backing at the same word offset, so `uaddr != uaddr2` does not make the
+/// futexes distinct. Linux rejects such a pair with `-EINVAL`
+/// (`kernel/futex/requeue.c:453-457`) and `FUTEX_WAIT_REQUEUE_PI` rejects it in
+/// `futex_wait_setup()` (`kernel/futex/waitwake.c:681-685`). Private keys are
+/// already separated by their addresses, which both callers compare first.
+fn pi_requeue_keys_match(lhs: &FutexKey, rhs: &FutexKey) -> bool {
+    match (lhs.shared_key(), rhs.shared_key()) {
+        (Some(lhs), Some(rhs)) => lhs.backing() == rhs.backing() && lhs.offset() == rhs.offset(),
+        _ => false,
     }
 }
 
@@ -1014,6 +1029,40 @@ fn futex_word_task_tid(thread: &Thread, word_tid: u32) -> AxResult<u32> {
         .ok_or(AxError::NoSuchProcess)
 }
 
+/// `attach_to_pi_owner()`'s verdict on the task named by the futex word.
+enum PiOwnerStatus {
+    /// The owner exists and has not begun exiting.
+    Alive,
+    /// No task carries the TID, but the word also carries `FUTEX_OWNER_DIED`,
+    /// so the caller takes the dead owner's futex over.
+    OwnerDied,
+    /// The owner is leaving; the caller waits for the exit-time fixup.
+    Exiting,
+}
+
+/// Runs `attach_to_pi_owner()`'s owner validation (`kernel/futex/pi.c:470-475`
+/// and `handle_exit_race()` at `pi.c:373-418`) without attaching a `pi_state`.
+///
+/// This consults the task table and the scheduler, neither of which may be
+/// touched under a futex queue gate (`PiState::attach` defers its lookup for
+/// the same reason), so both call sites run it after the gate is released: the
+/// queued path's `wait_pi` `on_queued` callback and `FUTEX_TRYLOCK_PI`'s
+/// deferred check.
+fn classify_pi_owner(self_thread: &Thread, owner_tid: u32, word: u32) -> AxResult<PiOwnerStatus> {
+    let owner_tid = futex_word_task_tid(self_thread, owner_tid)?;
+    match crate::task::get_visible_task_including_exiting(owner_tid) {
+        Err(_) => {
+            if PiWord::decode(word).owner_died {
+                Ok(PiOwnerStatus::OwnerDied)
+            } else {
+                Err(AxError::NoSuchProcess)
+            }
+        }
+        Ok(task) if task.as_thread().pending_exit() => Ok(PiOwnerStatus::Exiting),
+        Ok(_) => Ok(PiOwnerStatus::Alive),
+    }
+}
+
 /// `FUTEX_LOCK_PI`, `FUTEX_LOCK_PI2` and `FUTEX_TRYLOCK_PI`.
 ///
 /// Linux v7.2.3, `kernel/futex/pi.c`:
@@ -1031,8 +1080,11 @@ fn futex_word_task_tid(thread: &Thread, word_tid: u32) -> AxResult<u32> {
 /// readable), `-EDEADLK` (the word already names the caller), `-ESRCH`
 /// (`attach_to_pi_owner()`'s `find_get_task_by_vpid()` found no owner) and
 /// `-EAGAIN` (the owner is `PF_EXITING`). `trylock` maps to
-/// `FUTEX_TRYLOCK_PI`, which returns `-EAGAIN` on contention instead of
-/// queueing, and `deadline` is `None` for an infinite wait.
+/// `FUTEX_TRYLOCK_PI`, which still runs the first-waiter half of
+/// `futex_lock_pi_atomic()` -- publishing `FUTEX_WAITERS` and resolving the
+/// owner -- before it fails the trylock itself with `-EWOULDBLOCK`; a word that
+/// names no task is `-ESRCH` either way. `deadline` is `None` for an infinite
+/// wait.
 fn do_futex_lock_pi(
     caller_aspace: Arc<Mutex<AddrSpace>>,
     caller: &UserMemoryCapability,
@@ -1082,7 +1134,8 @@ fn do_futex_lock_pi(
         let contended_word = core::cell::Cell::new(0u32);
         let mut takeover_owner_died = false;
         let mut owner_exiting = false;
-        let result = futex.wq.wait_pi(
+        let mut validate_trylock_owner = false;
+        let mut result = futex.wq.wait_pi(
             futex.waiter_owner(),
             u32::MAX,
             deadline.map(|deadline| (deadline.clock, deadline.deadline)),
@@ -1122,14 +1175,15 @@ fn do_futex_lock_pi(
                         }
                     }
                     PiAcquire::SetWaiters { new_value } => {
-                        if trylock {
-                            // `rt_mutex_futex_trylock()` failed: the futex is
-                            // owned by a live task. Linux reports the trylock
-                            // result, not -EAGAIN, as -EWOULDBLOCK, which is
-                            // the same errno.
-                            decided = Some(Err(AxError::WouldBlock));
-                            return Ok(None);
-                        }
+                        // `futex_lock_pi_atomic()`'s first-waiter path
+                        // publishes `uval | FUTEX_WAITERS` and attaches to the
+                        // owner *before* anything else -- including for
+                        // `FUTEX_TRYLOCK_PI`, whose `rt_mutex_futex_trylock()`
+                        // only runs after `attach_to_pi_owner()` returned 0
+                        // (`kernel/futex/pi.c:661-674`, `pi.c:1062-1065`). A
+                        // word naming no task is therefore `-ESRCH` and keeps
+                        // the published WAITERS bit rather than being answered
+                        // `-EWOULDBLOCK` from an untouched word.
                         if !futex_cas_at(
                             address,
                             namespace,
@@ -1143,6 +1197,17 @@ fn do_futex_lock_pi(
                         }
                         pi_state.attach(PiWord::decode(current_word).tid);
                         contended_word.set(current_word);
+                        if trylock {
+                            // The owner lookup takes the task-table and
+                            // scheduler locks, which `wait_pi()`'s contract
+                            // keeps out of the queue gate, so the check is
+                            // deferred: the condition declines the wait and
+                            // the caller classifies the owner once the gate
+                            // has been released, exactly as `on_queued` does
+                            // for a queued waiter.
+                            validate_trylock_owner = true;
+                            return Ok(None);
+                        }
                         Ok(Some(PiWaiter::new(tid, axtask::sched_state(&current()))))
                     }
                 }
@@ -1156,25 +1221,58 @@ fn do_futex_lock_pi(
                 // is `-EAGAIN`, which `futex_lock_pi()` consumes internally
                 // while it waits for the exit-time fixup to publish
                 // `FUTEX_OWNER_DIED`; neither errno reaches userspace here.
-                let owner_tid = futex_word_task_tid(self_task.as_thread(), pi_state.owner_tid())?;
-                match crate::task::get_visible_task_including_exiting(owner_tid) {
-                    Err(_) => {
-                        if PiWord::decode(contended_word.get()).owner_died {
-                            takeover_owner_died = true;
-                            return Err(AxError::WouldBlock);
-                        }
-                        return Err(AxError::NoSuchProcess);
+                match classify_pi_owner(
+                    self_task.as_thread(),
+                    pi_state.owner_tid(),
+                    contended_word.get(),
+                )? {
+                    PiOwnerStatus::OwnerDied => {
+                        takeover_owner_died = true;
+                        return Err(AxError::WouldBlock);
                     }
-                    Ok(task) if task.as_thread().pending_exit() => {
+                    PiOwnerStatus::Exiting => {
                         owner_exiting = true;
                         return Err(AxError::WouldBlock);
                     }
-                    Ok(_) => {}
+                    PiOwnerStatus::Alive => {}
                 }
                 pi_boost_owner(&pi_state, waiter);
                 Ok(())
             },
         );
+
+        // `FUTEX_TRYLOCK_PI`'s deferred `attach_to_pi_owner()` step. The
+        // condition above published FUTEX_WAITERS and attached the pi_state,
+        // then declined the wait so the queue gate would be released before
+        // the task and scheduler locks are taken. `Ok(false)` is the only
+        // outcome then, and synthesizing the owner's errno here routes the
+        // answer through the same `-ESRCH`/`FUTEX_OWNER_DIED`/exiting-owner
+        // handling the queued path uses below.
+        if validate_trylock_owner && matches!(result.result, Ok(false)) {
+            // The TID comes from the word this task published, not from the
+            // shared `pi_state`: a concurrent `FUTEX_UNLOCK_PI` may have
+            // detached the state already, and classifying TID 0 would report
+            // `-ESRCH` where the trylock must fail with `-EWOULDBLOCK`.
+            let error = match classify_pi_owner(
+                self_task.as_thread(),
+                PiWord::decode(contended_word.get()).tid,
+                contended_word.get(),
+            ) {
+                // A live owner means `rt_mutex_futex_trylock()` would have
+                // failed, which `futex_lock_pi()` reports as `-EWOULDBLOCK`.
+                Ok(PiOwnerStatus::Alive) => AxError::WouldBlock,
+                Ok(PiOwnerStatus::OwnerDied) => {
+                    takeover_owner_died = true;
+                    AxError::WouldBlock
+                }
+                Ok(PiOwnerStatus::Exiting) => {
+                    owner_exiting = true;
+                    AxError::WouldBlock
+                }
+                Err(error) => error,
+            };
+            result.result = Err(WaitConditionError::Fault(error));
+        }
 
         match result.result {
             Ok(false) => {
@@ -1325,10 +1423,7 @@ fn do_futex_unlock_pi(
         // silent "the word did not match" retry. A word the caller *may* write
         // but whose leaf is read-only is the `-EFAULT` those two operations
         // raise, so it is repaired by `fault_in_user_writeable()` below.
-        fn published(
-            failure: &mut Option<AxError>,
-            result: WaitConditionResult<bool>,
-        ) -> bool {
+        fn published(failure: &mut Option<AxError>, result: WaitConditionResult<bool>) -> bool {
             match result {
                 Ok(applied) => applied,
                 Err(WaitConditionError::Fault(error)) => {
@@ -1436,6 +1531,7 @@ fn do_futex_wait_requeue_pi(
     uaddr: *const u32,
     uaddr2: *const u32,
     value: u32,
+    bitset: u32,
     private: bool,
     deadline: Option<FutexWaitDeadline>,
 ) -> AxResult<isize> {
@@ -1447,9 +1543,11 @@ fn do_futex_wait_requeue_pi(
     let tid = current().as_thread().pid_vnr();
 
     // `futex_wait_requeue_pi()` resolves and validates `uaddr2` for writing
-    // before it validates `*uaddr`, so an inaccessible target is EFAULT even
-    // when the source comparison would already have failed.
-    validate_futex_word_read(uaddr2, size_of::<u32>(), caller)?;
+    // (`get_futex_key(uaddr2, ..., FUTEX_WRITE)`) before it validates `*uaddr`,
+    // so an inaccessible target is EFAULT even when the source comparison
+    // would already have failed.
+    validate_futex_address(uaddr2, size_of::<u32>())?;
+    check_user_writable_with(caller, uaddr2.addr(), size_of::<u32>())?;
     let observed_target = fault_read_u32(caller, target)?;
     let target_word = PiWord::decode(observed_target);
     if target_word.tid == tid {
@@ -1471,12 +1569,23 @@ fn do_futex_wait_requeue_pi(
         let target_expected = target_key.shared_key().cloned();
         let target_table = futex_table_for(&target_key);
         let target_futex = target_table.get_or_insert_owned(&target_key);
+        // `futex_wait_setup()`'s `futex_match(&q->key, key2)` rejection
+        // (`kernel/futex/waitwake.c:681-685`): raw addresses are not enough for
+        // shared futexes, because one page can be mapped at two addresses, and
+        // the only call that could promote the waiter -- `FUTEX_CMP_REQUEUE_PI`
+        // -- rejects the same pair with `-EINVAL`, so the waiter would sleep
+        // forever. The source-value comparison above keeps its
+        // `-EWOULDBLOCK` precedence, exactly as the C runs the `uval != val`
+        // test before the key comparison.
+        if pi_requeue_keys_match(&source_key, &target_key) {
+            return Err(AxError::InvalidInput);
+        }
         let target_pi_state = target_futex.pi_state();
         target_pi_state.attach(target_word.tid);
 
         let outcome = source_futex.wq.wait_pi(
             source_futex.waiter_owner(),
-            u32::MAX,
+            bitset,
             deadline.map(|deadline| (deadline.clock, deadline.deadline)),
             || {
                 let observed = nofault_u32_read(
@@ -1591,6 +1700,15 @@ fn do_futex_cmp_requeue_pi(
     let nr_requeue = usize::try_from(nr_requeue).map_err(|_| AxError::InvalidInput)?;
 
     validate_futex_word_read(uaddr2, size_of::<u32>(), caller)?;
+    // `futex_requeue()` resolves both keys and rejects a `futex_match(&key1,
+    // &key2)` *before* it compares the source word against `cmpval`
+    // (`kernel/futex/requeue.c:443-457` precede `requeue.c:483-497`), so an
+    // aliased shared pair is `-EINVAL` even when the value differs too.
+    let (source_key, _) = futex_key_from(source, private, &caller_aspace);
+    let (target_key, _) = futex_key_from(target, private, &caller_aspace);
+    if pi_requeue_keys_match(&source_key, &target_key) {
+        return Err(AxError::InvalidInput);
+    }
     let observed_source = fault_read_u32(caller, source)?;
     if observed_source != value {
         return Err(AxError::WouldBlock);
@@ -1612,17 +1730,11 @@ fn do_futex_cmp_requeue_pi(
         let target_table = futex_table_for(&target_key);
         let target_futex = target_table.get_or_insert_owned(&target_key);
         let target_pi_state = target_futex.pi_state();
-        // `futex_match(&key1, &key2)`: comparing the user addresses is not
-        // enough for shared futexes, because one page can be mapped at two
-        // addresses. Requeueing PI onto the same word that way would make the
-        // caller the owner of the futex it is waiting on.
-        if let (Some(lhs), Some(rhs)) = (source_key.shared_key(), target_key.shared_key()) {
-            if lhs.backing() == rhs.backing() && lhs.offset() == rhs.offset() {
-                return Err(AxError::InvalidInput);
-            }
+        // The pair is re-resolved on every `retry:` pass, and a mapping change
+        // could in principle make it aliased, so the match is tested here too.
+        if pi_requeue_keys_match(&source_key, &target_key) {
+            return Err(AxError::InvalidInput);
         }
-        let mut promoted: Option<u32> = None;
-        let mut contended_owner: Option<u32> = None;
         let mut failure: Option<AxError> = None;
 
         let result = source_futex.wq.pi_requeue(
@@ -1664,9 +1776,6 @@ fn do_futex_cmp_requeue_pi(
                         }
                         PiAcquire::TakeOver { new_value } => (new_value, PiRequeueTarget::Promoted),
                         PiAcquire::SetWaiters { new_value } => {
-                            // `attach_to_pi_owner()`: the PI state the queued
-                            // waiters inherit names the task the word holds.
-                            contended_owner = Some(PiWord::decode(observed).tid);
                             (new_value, PiRequeueTarget::Contended)
                         }
                     };
@@ -1686,8 +1795,17 @@ fn do_futex_cmp_requeue_pi(
                     }
                     Err(WaitConditionError::Retry) => return None,
                 }
-                if mode == PiRequeueTarget::Promoted {
-                    promoted = Some(top_tid);
+                // `attach_to_pi_state()`: record the owner the publication
+                // just installed while both queue gates are still held, so a
+                // concurrent `FUTEX_UNLOCK_PI` cannot observe the new word
+                // with a PI state that still names the previous owner. A
+                // promoted waiter becomes the owner; a contended target keeps
+                // the owner the word already named.
+                match mode {
+                    PiRequeueTarget::Promoted => target_pi_state.attach(top_tid),
+                    PiRequeueTarget::Contended => {
+                        target_pi_state.attach(PiWord::decode(observed).tid)
+                    }
                 }
                 Some(mode)
             },
@@ -1695,19 +1813,6 @@ fn do_futex_cmp_requeue_pi(
 
         match result {
             PiRequeueOutcome::Done { woke, moved } => {
-                match promoted {
-                    // The promoted waiter is the target's new owner; it is the
-                    // one that will boost whoever contends on it next.
-                    Some(top_tid) => target_pi_state.attach(top_tid),
-                    // The target kept its owner, so the waiters that were
-                    // queued behind it inherit that owner -- the publication
-                    // only set `FUTEX_WAITERS` over the word it already held.
-                    None => {
-                        if let Some(owner_tid) = contended_owner {
-                            target_pi_state.attach(owner_tid);
-                        }
-                    }
-                }
                 if moved > 0 {
                     // `rt_mutex_start_proxy_lock()` raises the target's owner
                     // to the waiters it queues on its rt_mutex
@@ -2111,6 +2216,10 @@ pub fn sys_futex(
                 uaddr,
                 uaddr2.cast_const(),
                 value,
+                // `do_futex()` forces `val3 = FUTEX_BITSET_MATCH_ANY` for
+                // `FUTEX_WAIT_REQUEUE_PI` (`kernel/futex/syscalls.c`), so the
+                // user-supplied word is ignored and `!bitset` is unreachable.
+                u32::MAX,
                 private,
                 wait_deadline,
             )
