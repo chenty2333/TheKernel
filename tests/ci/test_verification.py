@@ -48,6 +48,11 @@ class VerificationTests(unittest.TestCase):
         # that has to boot anything.
         self.assertEqual(stages["kernel-module-edges"].failure, "static")
         self.assertIn("check_kernel_module_edges.py", " ".join(stages["kernel-module-edges"].command))
+        # The raw-print ratchet is the same kind of question -- a committed
+        # baseline over sources, answerable without building anything -- so it
+        # runs in the same place and can never be deferred to a tier that boots.
+        self.assertEqual(stages["log-surface"].failure, "static")
+        self.assertIn("check_log_surface.py", " ".join(stages["log-surface"].command))
         # The hardware tier supplies the runtime half by booting both guests;
         # it does not re-run the static ratchets, which the daily tier owns.
         self.assertFalse(any("--final" in stage.command for stage in verify.plan("hardware", Path("/home/build"))))

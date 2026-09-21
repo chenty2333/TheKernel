@@ -1,0 +1,18 @@
+# Baseline for `scripts/ci/check_log_surface.py`.
+#
+# `vendored` names imported upstream trees this gate does not police. Their print
+# macros are upstream's own debug aids, usually behind a feature the kernel does
+# not enable, and restyling them on every re-vendor would cost more than it buys.
+# Anything outside this list is TheKernel's code and is held to the rule.
+vendored = [
+  "crates/ax/tk-starry-smoltcp/",
+  "crates/ax/tk-starry-fatfs/",
+  "crates/ax/tk-lwext4-rust/",
+]
+
+# Per-file counts of raw prints that remain, and why they are tolerated. A file
+# over its number fails the run; a file under it is reported so this shrinks.
+[allow]
+# "Fake VirtIO sound device for tests": a mock device whose thread says what the
+# fake driver side did. It is not a diagnostic about the running kernel.
+"crates/ax/tk-virtio-drivers/src/device/sound/fake.rs" = 2

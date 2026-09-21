@@ -53,6 +53,12 @@ def plan(tier: str, state: Path) -> list[Stage]:
         # one is reported, and the widening that would make `kernel/src/drm`
         # unliftable again cannot happen unnoticed.
         Stage("kernel-module-edges", "static", (sys.executable, "scripts/ci/check_kernel_module_edges.py"), 120),
+        # The other half of the same promise: `docs/debugging.md` says a kernel
+        # diagnostic is a record with a severity and a target, and a destination
+        # nobody at the call site chooses. A bare `println!` opts out of all
+        # three, so this ratchets the raw prints that remain in code the kernel
+        # builds, per file, against `config/log-surface.toml`.
+        Stage("log-surface", "static", (sys.executable, "scripts/ci/check_log_surface.py"), 120),
         # The contract and dispatch tables are a source of truth only while
         # something enforces them.  `test --suite abi` is run by hand, so until
         # this stage existed no verification tier noticed a cell whose status,
