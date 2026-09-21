@@ -673,6 +673,35 @@ static int child_locked_errno(unsigned long len, rlim_t soft, int fixed,
     return errno;
 }
 
+/* Forked child: drop CAP_IPC_LOCK, set a small RLIMIT_MEMLOCK and call
+   mlock()/mlock2() over it.  `do_mlock()` initializes `error = -ENOMEM` and
+   returns exactly that for the rlimit failure (mm/mlock.c), unlike
+   MAP_LOCKED's -EAGAIN from mlock_future_ok() in do_mmap(). */
+static int child_mlock_errno(unsigned long len, rlim_t soft, int use_mlock2) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) != 0) return 100;
+    rl.rlim_cur = soft;
+    if (setrlimit(RLIMIT_MEMLOCK, &rl) != 0) return 101;
+    struct cap_header header = {CAP_VERSION_3, 0};
+    struct cap_data data[2] = {{0, 0, 0}, {0, 0, 0}};
+    if (syscall(NR_CAPGET, &header, data) != 0) return 102;
+    data[0].effective &= ~(1u << CAP_IPC_LOCK);
+    data[0].permitted &= ~(1u << CAP_IPC_LOCK);
+    if (syscall(NR_CAPSET, &header, data) != 0) return 103;
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return 104;
+    errno = 0;
+    long result = use_mlock2 ? syscall(325, p, len, 0) : syscall(149, p, len);
+    int saved = errno;
+    if (result == 0) {
+        munmap(p, len);
+        return 0;
+    }
+    munmap(p, len);
+    return saved;
+}
+
 static void mmap_extra_case(void) {
     begin("mmap.raw-differential");
     /* arch/x86/kernel/sys_x86_64.c:SYSCALL_DEFINE6(mmap) only rejects an
@@ -773,6 +802,20 @@ static void mmap_extra_case(void) {
     }
     expect_child_errno(pid, 0, "mmap-locked-privileged-zero-limit");
     mark("LOCKED_LIMIT_ERRNOS");
+
+    /* mlock()/mlock2() over RLIMIT_MEMLOCK is -ENOMEM, which must stay
+       distinct from the -EAGAIN MAP_LOCKED reports for the same limit. */
+    fflush(NULL);
+    pid = fork();
+    check(pid >= 0, "fork-mlock2-limit");
+    if (!pid) _exit(child_mlock_errno(4 * PAGE, PAGE, 1));
+    expect_child_errno(pid, ENOMEM, "mlock2-rlimit-enomem");
+    fflush(NULL);
+    pid = fork();
+    check(pid >= 0, "fork-mlock-limit");
+    if (!pid) _exit(child_mlock_errno(4 * PAGE, PAGE, 0));
+    expect_child_errno(pid, ENOMEM, "mlock-rlimit-enomem");
+    mark("MLOCK_RLIMIT_ENOMEM");
 
     /* `mm/mmap.c:do_mmap()` dispatches on `flags & MAP_TYPE` once per branch,
        and the branch depends on whether a file is behind the mapping.  With no

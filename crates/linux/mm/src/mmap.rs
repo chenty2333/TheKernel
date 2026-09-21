@@ -76,8 +76,10 @@ const MAP_HUGE_2MB: u32 = 21 << 26;
 const MAP_HUGE_1GB: u32 = 30 << 26;
 
 /// `include/uapi/linux/mman.h:MAP_SYNC`, accepted by `MAP_SHARED_VALIDATE`
-/// only for a file whose `file_operations` advertise `FOP_MMAP_SYNC`.
-pub const MAP_SYNC: u32 = 0x8_0000;
+/// only for a file whose `file_operations` advertise `FOP_MMAP_SYNC`.  Taken
+/// from the shared x86_64 UAPI table so the kernel's `linux_raw_sys` call
+/// sites and this policy crate share one source of truth.
+pub use linux_raw_sys::general::MAP_SYNC;
 
 const EINVAL: i32 = 22;
 const EOPNOTSUPP: i32 = 95;

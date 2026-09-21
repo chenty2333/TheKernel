@@ -302,7 +302,7 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
     if !axhal::asm::user_shadow_stack_enabled() {
         return Err(AxError::OperationNotSupported);
     }
-    if flags & !SHADOW_STACK_SET_TOKEN != 0 || size == 0 {
+    if flags & !SHADOW_STACK_SET_TOKEN != 0 {
         return Err(AxError::InvalidInput);
     }
     if flags & SHADOW_STACK_SET_TOKEN != 0 && size < core::mem::size_of::<u64>() {
@@ -315,6 +315,9 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
     let size = checked_align_up_4k(size).ok_or(LinuxError::EOVERFLOW)?;
     if addr != 0 && addr < SHADOW_STACK_MIN_ADDR {
         return Err(LinuxError::ERANGE.into());
+    }
+    if size == 0 {
+        return Err(AxError::InvalidInput);
     }
     if addr != 0 && !addr.is_multiple_of(PAGE_SIZE_4K) {
         return Err(AxError::InvalidInput);
@@ -928,10 +931,7 @@ pub fn sys_mmap(
     let map_type = map_flags & MmapFlags::TYPE;
     if !matches!(
         map_type,
-        MmapFlags::PRIVATE
-            | MmapFlags::SHARED
-            | MmapFlags::SHARED_VALIDATE
-            | MmapFlags::DROPPABLE
+        MmapFlags::PRIVATE | MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE | MmapFlags::DROPPABLE
     ) {
         return Err(AxError::InvalidInput);
     }
@@ -1749,6 +1749,23 @@ pub fn sys_remap_file_pages(
     pgoff: usize,
     flags: usize,
 ) -> AxResult<isize> {
+    // An eviction retry revalidates the complete snapshot/LSM sequence, so it
+    // loops rather than recursing: sustained concurrent eviction must not grow
+    // the kernel stack.
+    loop {
+        if sys_remap_file_pages_once(start, size, prot, pgoff, flags)?.is_some() {
+            return Ok(0);
+        }
+    }
+}
+
+fn sys_remap_file_pages_once(
+    start: usize,
+    size: usize,
+    prot: usize,
+    pgoff: usize,
+    flags: usize,
+) -> AxResult<Option<()>> {
     if prot != 0 {
         return Err(AxError::InvalidInput);
     }
@@ -1810,7 +1827,7 @@ pub fn sys_remap_file_pages(
         retry.wait()?;
         // The source VMA snapshot, MAP_LOCKED observation and LSM decision
         // must all be revalidated after a cache eviction terminal edge.
-        return sys_remap_file_pages(start, size, prot, pgoff, flags);
+        return Ok(None);
     }
     let (current_flags, current_lease) = aspace.remap_shared_span_snapshot(start_addr, size)?;
     if current_flags != snapshot_flags || current_lease.ofd_key() != lease.ofd_key() {
@@ -1857,7 +1874,7 @@ pub fn sys_remap_file_pages(
             },
         );
     }
-    Ok(0)
+    Ok(Some(()))
 }
 
 pub fn sys_mprotect(addr: usize, length: usize, prot: usize) -> AxResult<isize> {
@@ -2520,7 +2537,10 @@ fn process_madvise_walk(
         // cursor rather than reporting the hole.
         let area = match aspace.find_area(cursor) {
             Some(area) => area,
-            None => match aspace.areas_overlapping(VirtAddrRange::new(cursor, end)).next() {
+            None => match aspace
+                .areas_overlapping(VirtAddrRange::new(cursor, end))
+                .next()
+            {
                 Some(area) => area,
                 None => return Err(AxError::NoMemory),
             },
@@ -3412,8 +3432,9 @@ fn next_madvise_run(
     if start >= run_end {
         return None;
     }
-    if let Some(&(segment_start, segment_len)) =
-        aspace.locked_segments_in_range(start, run_end.sub_addr(start)).first()
+    if let Some(&(segment_start, segment_len)) = aspace
+        .locked_segments_in_range(start, run_end.sub_addr(start))
+        .first()
     {
         let segment_end = segment_start + segment_len;
         if segment_start > start {
@@ -3768,7 +3789,11 @@ fn msync_address_space(
             let mapped = aspace
                 .find_area(start)
                 .is_some_and(|area| area.start() <= start);
-            return if mapped { Ok(0) } else { Err(AxError::NoMemory) };
+            return if mapped {
+                Ok(0)
+            } else {
+                Err(AxError::NoMemory)
+            };
         }
         {
             let start = VirtAddr::from(addr);
@@ -3827,9 +3852,7 @@ fn msync_address_space(
                         .iter()
                         .find(|(segment_start, _)| *segment_start >= step)
                     {
-                        Some(&(segment_start, _)) if segment_start > step => {
-                            (segment_start, false)
-                        }
+                        Some(&(segment_start, _)) if segment_start > step => (segment_start, false),
                         Some(&(segment_start, segment_len)) => {
                             ((segment_start + segment_len).min(overlap_end), true)
                         }
@@ -3889,17 +3912,6 @@ fn msync_address_space(
             backend.sync_range(offset, sync_length, true)?;
         }
     }
-
-    // MS_INVALIDATE's only msync-visible effect is the VM_LOCKED rejection.
-    // Recheck after the lock-external filesystem operation so a concurrent
-    // mlock cannot race a successful snapshot into an incorrectly successful
-    // invalidate request.
-    let busy = busy
-        || (flags & MS_INVALIDATE != 0
-            && length > 0
-            && aspace_handle
-                .lock()
-                .range_is_locked(VirtAddr::from(addr), length));
 
     match msync_result(busy, saw_unmapped) {
         MsyncResult::Busy => Err(LinuxError::EBUSY.into()),
@@ -3961,6 +3973,8 @@ fn check_mlock_range_limit(
     length: usize,
 ) -> AxResult {
     let locked_bytes = locked_bytes_after_range(aspace, start, length, AxError::NoMemory)?;
+    // Linux `do_mlock()` keeps `error = -ENOMEM` for the rlimit failure
+    // (`mm/mlock.c`); `-EAGAIN` is only the `__mm_populate()` result.
     check_memlock_total(proc_data, has_ipc_lock, locked_bytes, AxError::NoMemory)
 }
 

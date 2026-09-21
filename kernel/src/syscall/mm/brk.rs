@@ -199,7 +199,7 @@ pub(crate) fn sys_brk_transaction(addr: usize, publish_layout: bool) -> AxResult
         let shrink_size = current_top_aligned.saturating_sub(shrink_start.as_usize());
         let aspace_handle = proc_data.aspace();
 
-        // Linux `mm/mmap.c:162-179` lets a shrink proceed only when some VMA
+        // Linux `mm/mmap.c:161-179` lets a shrink proceed only when some VMA
         // intersects the range being given back:
         //
         // ```c

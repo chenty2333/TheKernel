@@ -727,13 +727,6 @@ fn script_interpreter_args(
     Ok(new_args)
 }
 
-/// Clear the ELF cache.
-///
-/// Useful for removing noises during memory leak detect.
-pub fn clear_elf_cache() {
-    ELF_LOADER.lock().0.clear();
-}
-
 fn install_loaded_user_app(
     uspace: &mut AddrSpace,
     path: &FsPath,

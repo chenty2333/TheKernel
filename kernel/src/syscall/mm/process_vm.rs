@@ -146,7 +146,7 @@ fn validate_process_madvise_behavior(behavior: u32) -> AxResult<()> {
 /// final exit removes every such thread before the zombie payload survives.
 fn process_mrelease_has_live_mm_thread(target: &crate::task::ProcessData) -> bool {
     target.proc.thread_ids().any(|tid| {
-        get_visible_task(tid)
+        crate::task::get_visible_task_including_exiting(tid)
             .ok()
             .is_some_and(|task| core::ptr::eq(&*task.as_thread().proc_data, target))
     })

@@ -1,6 +1,4 @@
 use alloc::{sync::Arc, vec::Vec};
-#[cfg(feature = "test-io-control")]
-use core::time::Duration;
 use core::{
     hint::unlikely,
     marker::PhantomData,
@@ -17,8 +15,6 @@ use axhal::{
 };
 use axio::prelude::*;
 use axsync::Mutex;
-#[cfg(feature = "test-io-control")]
-use axtask::sleep;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr};
 use tk_linux_mm::{PinAccess, PinDuration, PinRequest, PinToken, PinUse, UserRange};
 use tk_linux_usercopy::{UserCopyError, VmResult};
@@ -92,14 +88,10 @@ static USER_IO_PIN_VM_RANGE_PIN_BYTES: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_VM_RANGE_PIN_REJECTS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_VM_RANGE_PIN_UNPINS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_UNPINS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "test-io-control")]
-static USER_IO_PIN_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Bounds one address-space critical section while collecting mapping
 /// expectations or acquiring exact lower-level owners for resident user pages.
 const USER_IO_PIN_SCAN_CHUNK_PAGES: usize = 64;
-#[cfg(feature = "test-io-control")]
-pub const USER_IO_PIN_TEST_DELAY_MS_MAX: u64 = 1_000;
 
 fn user_io_pin_scan_chunk_end(cursor: VirtAddr, end: VirtAddr) -> VirtAddr {
     debug_assert!(cursor < end);
@@ -236,20 +228,6 @@ pub fn reset_user_io_pin_counters() {
     ] {
         counter.store(0, Ordering::Relaxed);
     }
-}
-
-#[cfg(feature = "test-io-control")]
-pub fn set_user_io_pin_test_delay_ms(delay_ms: u64) -> AxResult {
-    if delay_ms > USER_IO_PIN_TEST_DELAY_MS_MAX {
-        return Err(AxError::InvalidInput);
-    }
-    USER_IO_PIN_TEST_DELAY_MS.store(delay_ms, Ordering::Relaxed);
-    Ok(())
-}
-
-#[cfg(feature = "test-io-control")]
-fn user_io_pin_test_delay_ms() -> u64 {
-    USER_IO_PIN_TEST_DELAY_MS.load(Ordering::Relaxed)
 }
 
 pub fn user_io_pin_counters_snapshot() -> UserIoPinCounters {
@@ -720,7 +698,7 @@ struct UserIoRangePin {
 impl Drop for UserIoRangePin {
     fn drop(&mut self) {
         let cow_frames = {
-            let mut aspace = super::lock_mm_diagnosed!(self.aspace, UserPinRelease);
+            let mut aspace = self.aspace.lock();
             aspace.end_user_io_pin(self.token)
         };
         // The owner vector can be large; reclaim it only after releasing the
@@ -855,7 +833,7 @@ impl Drop for UnpublishedUserIoPin {
         self.frame_pins.clear();
         self.page_cache_pins.clear();
         if let Some(reservation) = self.reservation.take() {
-            let mut aspace = super::lock_mm_diagnosed!(self.aspace, UserPinRelease);
+            let mut aspace = self.aspace.lock();
             aspace.cancel_user_io_pin(reservation);
         }
         drop(self.system_charge.take());
@@ -984,7 +962,7 @@ fn prepare_user_io_pin_with_duration_and_failure(
         return None;
     }
     let admission = {
-        let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinAdmission);
+        let mut aspace = aspace_handle.lock();
         record_user_io_pin_counter(&USER_IO_PIN_VM_RANGE_PIN_ATTEMPTS, 1);
         // Secret frames have no durable direct alias and therefore cannot be
         // exported as GUP/DMA segments, including long-term registered pins.
@@ -1052,7 +1030,7 @@ fn prepare_user_io_pin_with_duration_and_failure(
         while expectation_cursor < page_end {
             let chunk_end = user_io_pin_scan_chunk_end(expectation_cursor, page_end);
             let expectation_result = {
-                let aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinExpectation);
+                let aspace = aspace_handle.lock();
                 aspace.append_user_io_mapping_expectations(
                     expectation_cursor,
                     chunk_end - expectation_cursor,
@@ -1130,7 +1108,7 @@ fn prepare_user_io_pin_with_duration_and_failure(
         };
 
         let chunk_pin = {
-            let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinCollectOwners);
+            let mut aspace = aspace_handle.lock();
             (|| {
                 if populate_windows {
                     if let Err(error) =
@@ -1311,7 +1289,7 @@ fn prepare_user_io_pin_with_duration_and_failure(
         // protect, remap, and discard publication between windows, so releasing
         // AddrSpace here cannot make an earlier validated prefix stale.
         let validation = {
-            let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinRevalidate);
+            let mut aspace = aspace_handle.lock();
             aspace.revalidate_user_io_pin_window(
                 preparation.reservation(),
                 &preparation.expectations()[validated_expectations..],
@@ -1377,7 +1355,7 @@ fn prepare_user_io_pin_with_duration_and_failure(
     // transition. Keep the guard in an explicit scope so an error cannot drop
     // unpublished owners and recursively cancel while AddrSpace is still held.
     let publication = {
-        let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinCommit);
+        let mut aspace = aspace_handle.lock();
         aspace.commit_user_io_pin(preparation.reservation(), &mut preparation.cow_frames)
     };
     let token = match publication {
@@ -1405,18 +1383,6 @@ fn prepare_user_io_pin_with_duration_and_failure(
             page_cache_pin_pages as u64,
         );
         record_user_io_pin_counter(&USER_IO_PIN_PAGE_CACHE_PIN_BYTES, page_len as u64);
-    }
-
-    #[cfg(feature = "test-io-control")]
-    {
-        let delay_ms = user_io_pin_test_delay_ms();
-        if delay_ms != 0
-            && user_io_pin_counters_enabled()
-            && sleep(Duration::from_millis(delay_ms)).is_err()
-        {
-            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-            return None;
-        }
     }
 
     Some(prepared)

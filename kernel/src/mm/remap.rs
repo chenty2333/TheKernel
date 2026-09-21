@@ -1708,7 +1708,7 @@ fn try_optimistic_mremap(
         request.old_size
     };
     {
-        let aspace = super::lock_mm_diagnosed!(aspace_handle, MremapSerialized);
+        let aspace = aspace_handle.lock();
         aspace.reject_special_mapping_mutation(request.addr, source_size)?;
         if request.fixed {
             aspace.reject_special_mapping_overlap(request.new_addr, request.new_size)?;
@@ -1725,7 +1725,7 @@ fn try_optimistic_mremap(
         // across every alias before entering that path.
         ensure_4k_granularity_across_aliases(&aspace_handle, request.new_addr, request.new_size)?;
     }
-    let mut aspace = super::lock_mm_diagnosed!(aspace_handle, MremapOptimisticPlan);
+    let mut aspace = aspace_handle.lock();
     if !proc_data.image_matches(&aspace_handle) {
         return Ok(OptimisticRemapOutcome::Retry);
     }
@@ -1777,7 +1777,7 @@ fn try_optimistic_mremap(
     drop(aspace);
 
     let prepared = prepare_remap_plan(plan, request, &aspace_handle, proc_data)?;
-    let mut aspace = super::lock_mm_diagnosed!(aspace_handle, MremapOptimisticCommit);
+    let mut aspace = aspace_handle.lock();
     if !proc_data.image_matches(&aspace_handle) || !prepared.revalidate(&aspace, request) {
         return Ok(OptimisticRemapOutcome::Retry);
     }
@@ -1872,7 +1872,7 @@ fn run_locked_mremap(
             request.old_size
         };
         {
-            let aspace = super::lock_mm_diagnosed!(aspace_handle, MremapSerialized);
+            let aspace = aspace_handle.lock();
             aspace.reject_special_mapping_mutation(request.addr, source_size)?;
             if request.fixed {
                 aspace.reject_special_mapping_overlap(request.new_addr, request.new_size)?;
@@ -1894,7 +1894,7 @@ fn run_locked_mremap(
                 request.new_size,
             )?;
         }
-        let mut aspace = super::lock_mm_diagnosed!(aspace_handle, MremapSerialized);
+        let mut aspace = aspace_handle.lock();
         if !proc_data.image_matches(&aspace_handle) {
             continue;
         }
@@ -1963,7 +1963,7 @@ fn run_locked_mremap(
             let sources = sysv_sources.clone();
             drop(aspace);
             let admissions = prepare_sysv_duplicate_admissions_for_sources(proc_data, &sources)?;
-            aspace = super::lock_mm_diagnosed!(aspace_handle, MremapSysvDuplicateCommit);
+            aspace = aspace_handle.lock();
             if !proc_data.image_matches(&aspace_handle)
                 || !remap_segments_match(&aspace, request.addr, source_size, source_segments)
                 || !sysv_duplicate_sources_match(&aspace, &sources)

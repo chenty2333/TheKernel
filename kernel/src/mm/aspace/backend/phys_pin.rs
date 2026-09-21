@@ -331,8 +331,7 @@ fn install_prepared_pin_shard(
     shard_index: usize,
     prepared: PinnedFrameTable,
 ) -> Option<PinnedFrameTable> {
-    let mut shard =
-        crate::mm::lock_mm_diagnosed!(PINNED_FRAME_SHARDS[shard_index], PhysPinRegistryShard);
+    let mut shard = PINNED_FRAME_SHARDS[shard_index].lock();
     if shard.is_none() {
         *shard = Some(prepared);
         None
@@ -349,9 +348,7 @@ fn prepare_physical_pin_registry_with(
     // identifiable. Iterating the shard array directly would lose that.
     #[allow(clippy::needless_range_loop)]
     for shard_index in 0..PIN_TABLE_SHARDS {
-        if crate::mm::lock_mm_diagnosed!(PINNED_FRAME_SHARDS[shard_index], PhysPinRegistryShard)
-            .is_some()
-        {
+        if PINNED_FRAME_SHARDS[shard_index].lock().is_some() {
             continue;
         }
 
@@ -566,10 +563,7 @@ fn unpin_frame_chunks(
 
         for chunk in paddrs[shard_start..shard_end].rchunks(PIN_TABLE_LOCK_CHUNK_PAGES) {
             let chunk_report = {
-                let mut table = crate::mm::lock_mm_diagnosed!(
-                    PINNED_FRAME_SHARDS[shard_index],
-                    PhysPinReleaseShard
-                );
+                let mut table = PINNED_FRAME_SHARDS[shard_index].lock();
                 let table = table.as_mut()?;
                 table.unpin_batch(chunk, deferred_frees)
             };
@@ -589,8 +583,7 @@ fn pin_shard_chunk(shard_index: usize, paddrs: &[PhysAddr]) -> AxResult<()> {
             .all(|&paddr| pin_shard_index(paddr) == shard_index)
     );
 
-    let mut table =
-        crate::mm::lock_mm_diagnosed!(PINNED_FRAME_SHARDS[shard_index], PhysPinPublishShard);
+    let mut table = PINNED_FRAME_SHARDS[shard_index].lock();
     table.as_mut().ok_or(AxError::BadState)?.pin_batch(paddrs)
 }
 
@@ -613,12 +606,10 @@ fn pin_frames_admitted(paddrs: Vec<PhysAddr>) -> AxResult<PhysicalFramePins> {
 }
 
 pub(crate) fn defer_frame_dealloc_if_pinned(paddr: PhysAddr, page_size: PageSize) -> bool {
-    crate::mm::lock_mm_diagnosed!(
-        PINNED_FRAME_SHARDS[pin_shard_index(paddr)],
-        PhysPinDeallocProbeShard
-    )
-    .as_mut()
-    .is_some_and(|table| table.defer_deallocation(paddr, page_size))
+    PINNED_FRAME_SHARDS[pin_shard_index(paddr)]
+        .lock()
+        .as_mut()
+        .is_some_and(|table| table.defer_deallocation(paddr, page_size))
 }
 
 /// Returns whether any exact frame has an active physical pin. Collapse
@@ -626,12 +617,10 @@ pub(crate) fn defer_frame_dealloc_if_pinned(paddr: PhysAddr, page_size: PageSize
 /// DMA—must block it rather than merely delaying allocator reuse.
 pub(crate) fn any_frame_pinned(paddrs: impl IntoIterator<Item = PhysAddr>) -> bool {
     paddrs.into_iter().any(|paddr| {
-        crate::mm::lock_mm_diagnosed!(
-            PINNED_FRAME_SHARDS[pin_shard_index(paddr)],
-            PhysPinDeallocProbeShard
-        )
-        .as_ref()
-        .is_some_and(|table| table.is_pinned(paddr))
+        PINNED_FRAME_SHARDS[pin_shard_index(paddr)]
+            .lock()
+            .as_ref()
+            .is_some_and(|table| table.is_pinned(paddr))
     })
 }
 
