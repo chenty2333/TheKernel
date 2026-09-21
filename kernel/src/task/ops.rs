@@ -2296,6 +2296,17 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             // with the two state facts that tell the cases apart: `exit_thread`
             // answers `NotLive` both for an init being killed and for a process
             // that is already a zombie, and both arrive here as ESRCH.
+            //
+            // Only the root reaper's init is refused, so a live init here is
+            // Linux's `is_global_init()` case, and Linux words it as its panic
+            // does (`kernel/exit.c`, `do_exit()`): an init that returns instead
+            // of powering the machine off is a userspace bug, not this one.
+            if process.is_init() && !process.is_zombie() {
+                axruntime::klog::fatal(format_args!(
+                    "Attempted to kill init! exitcode={:#010x}",
+                    exit_code as u32
+                ));
+            }
             axruntime::klog::fatal(format_args!(
                 "fatal exit transition failure for TID {tid} in process {} (init={}, zombie={}) \
                  after irreversible setup: {error}",

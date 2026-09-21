@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/reboot.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -975,7 +976,7 @@ static int run_suite_case(const struct suite_case *test) {
     return exit_status == 0 || exit_status == 4 ? exit_status : 1;
 }
 
-int main(int argc, char **argv) {
+static int run_init(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
 
@@ -1100,4 +1101,18 @@ int main(int argc, char **argv) {
     sync();
     puts("# THEKERNEL_SYSTEM_TEST_COMPLETE");
     return 0;
+}
+
+/*
+ * PID 1 never returns.  Linux answers an init that exits with
+ * panic("Attempted to kill init!"), so this init stops the machine itself, as
+ * any init does, whatever the suite reported: the KTAP lines are the verdict.
+ */
+int main(int argc, char **argv) {
+    int status = run_init(argc, argv);
+    fflush(NULL);
+    sync();
+    reboot(RB_POWER_OFF);
+    perror("reboot(RB_POWER_OFF)");
+    return status;
 }
