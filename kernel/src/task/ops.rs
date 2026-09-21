@@ -348,27 +348,6 @@ fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
     parent_data.child_exit_event.wake();
 }
 
-#[allow(dead_code)] // reached through the feature-gated memtrack cleanup hook
-fn cleanup_registry<W: RegistryWeak>(registry: &RegistryMutex<WeakRegistry<W>>) {
-    loop {
-        let stale = {
-            let mut registry = registry.lock();
-            let stale = registry.take_one_stale();
-            if stale.is_none() {
-                registry.operations = 0;
-                registry.cleanup_due = false;
-            }
-            stale
-        };
-        let Some(stale) = stale else {
-            break;
-        };
-        // A final weak control block may deallocate. Keep that destructor out
-        // of the registry lock and bound each locked scan to one detach.
-        drop(stale);
-    }
-}
-
 fn cleanup_registry_if_due<W: RegistryWeak>(registry: &RegistryMutex<WeakRegistry<W>>) {
     let stale = {
         let mut registry = registry.lock();
@@ -474,16 +453,6 @@ fn install_current_user_address_space(curr_ptr: *mut TaskInner, token: AddressSp
         #[cfg(not(all(feature = "asid-fast-switch", target_arch = "x86_64")))]
         axhal::asm::write_user_page_table(token.root());
     }
-}
-
-/// Cleanup expired entries in the task tables.
-///
-/// This function is intended to be used during memory leak analysis to remove
-/// possible noise caused by expired entries in the weak registries.
-pub fn cleanup_task_tables() {
-    cleanup_registry(&TASK_TABLE);
-    cleanup_registry(&TASK_ALIAS_TABLE);
-    cleanup_registry(&PROCESS_TABLE);
 }
 
 /// Fallible capacity and identity admission for all task lookup registries.
@@ -2277,9 +2246,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // `exit_signals()`, which makes the task "will free memory" observable
     // from the very start of exit — not only once it is a zombie.  Recorded
     // here so `process_mrelease(2)` sees the same window.
-    thr.proc_data.note_thread_exit_started();
-    let started_group_exit = group_exit && begin_group_exit(&thr.proc_data, exit_code);
-    if started_group_exit {
+    let last_thread = thr.proc_data.note_thread_exit_started();
+    let started_group_exit =
+        (group_exit || last_thread) && begin_group_exit(&thr.proc_data, exit_code);
+    if started_group_exit && group_exit {
         let sig = SignalInfo::new_kernel(Signo::SIGKILL);
         for peer_tid in process.thread_ids() {
             if is_group_exit_peer(tid, peer_tid) {

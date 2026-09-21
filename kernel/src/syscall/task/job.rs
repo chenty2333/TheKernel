@@ -25,6 +25,9 @@ fn process_error(error: ProcessError) -> AxError {
         ProcessError::NotPublished | ProcessError::NotLive | ProcessError::NotInitialized => {
             AxError::NoSuchProcess
         }
+        // `setsid()`/`setpgid()` privilege refusals: Linux `-EPERM`
+        // (`kernel/sys.c:1157-1159`, `kernel/sys.c:1277-1284`).
+        ProcessError::OperationNotPermitted => AxError::OperationNotPermitted,
         ProcessError::WrongDomain => AxError::BadState,
         _ => AxError::BadState,
     }

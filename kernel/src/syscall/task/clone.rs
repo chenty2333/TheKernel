@@ -735,7 +735,7 @@ impl CloneArgs {
         // parent event. Thread clones share ProcessData and therefore do not
         // need a second relationship, but still report TRACECLONE.
         let parent_ptrace = (!flags.contains(CloneFlags::UNTRACED))
-            .then(|| old_proc_data.ptrace_clone_snapshot())
+            .then(|| old_proc_data.ptrace_clone_snapshot(calling_thread.kernel_tid()))
             .flatten();
         let credential_publication_kind = clone_credential_publication_kind(flags);
         // Every branch derives from one immutable calling-task snapshot.
@@ -1089,10 +1089,8 @@ impl CloneArgs {
             // `wait4(2)`'s `__WNOTHREAD` ownership answer available after this
             // process's runtime data is retired, the way `p->real_parent`
             // survives on the `task_struct` until `release_task()`.
-            let real_parent = real_parent_node_for_choice(&clone_task_parent_choice(
-                flags,
-                calling_thread,
-            ));
+            let real_parent =
+                real_parent_node_for_choice(&clone_task_parent_choice(flags, calling_thread));
             let pid_namespace_init = flags.contains(CloneFlags::NEWPID) || pid_ns.has_no_init();
             if pid_namespace_init && set_tid_size != 0 && set_tid[0] != 1 {
                 return Err(AxError::InvalidInput);
@@ -1876,9 +1874,8 @@ mod tests {
     };
     use super::{
         CloneApi, CloneArgs, CloneCallerState, CloneCredentialPublicationKind, CloneFlags,
-        IOPRIO_CLASS_SHIFT,
-        clone_credential_publication_kind, clone_io_context_snapshot, clone_namespace_owner,
-        clone_process_access_state, clone_signal_altstack, inherited_ioprio,
+        IOPRIO_CLASS_SHIFT, clone_credential_publication_kind, clone_io_context_snapshot,
+        clone_namespace_owner, clone_process_access_state, clone_signal_altstack, inherited_ioprio,
         release_clone_lifecycle_then, should_yield_after_clone,
     };
     use crate::task::{Cred, Dumpability, Kgid, Kuid, ProcessAccessState, UserNamespace};
@@ -2053,7 +2050,10 @@ mod tests {
             flags: CloneFlags::from_bits_retain(CLONE_DETACHED as u64),
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
+        assert_eq!(
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2086,7 +2086,10 @@ mod tests {
             flags: CloneFlags::THREAD | CloneFlags::VM | CloneFlags::SIGHAND,
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
+        assert_eq!(
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2100,7 +2103,10 @@ mod tests {
                 | CloneFlags::SYSVSEM,
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
+        assert_eq!(
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2109,7 +2115,10 @@ mod tests {
             flags: CloneFlags::IO,
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
+        assert_eq!(
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2165,7 +2174,10 @@ mod tests {
             flags: CloneFlags::SYSVSEM,
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
+        assert_eq!(
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
+            Ok(())
+        );
     }
 
     #[test]

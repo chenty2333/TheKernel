@@ -19,8 +19,7 @@ use crate::{
     task::{
         AsThread, PidNamespace, Process, ProcessData, PtraceSession, StopFilter, StopReport,
         TaskParentNode, TaskUsage, Thread, ZombieSnapshot, get_process_data,
-        get_process_including_zombie, has_pending_syscall_signal, is_exact_child_of_thread,
-        process_domain, reap_process,
+        has_pending_syscall_signal, is_exact_child_of_thread, process_domain, reap_process,
     },
 };
 
@@ -539,10 +538,7 @@ fn select_wait_event(
 }
 
 /// Maps the kernel's option bits onto the crate's event selection.
-fn selection_for(
-    options: &WaitOptions,
-    wait_exited: bool,
-) -> tk_linux_process::WaitEventSelection {
+fn selection_for(options: &WaitOptions, wait_exited: bool) -> tk_linux_process::WaitEventSelection {
     tk_linux_process::WaitEventSelection {
         exited: wait_exited || options.contains(WaitOptions::WEXITED),
         // `wait4(2)` spells `WSTOPPED` as `WUNTRACED`; they are the same bit,
@@ -558,16 +554,21 @@ fn selection_for(
 /// for, so only that exact session's stops are its to see. A candidate that
 /// carries none is an ordinary child, and `wait_consider_task()` still forces
 /// `ptrace = 1` for it when the tracee is traced from the waiter's own thread
-/// group: `if (!ptrace_reparented(p)) ptrace = 1;` (`kernel/exit.c:1522-1523`).
+/// group: `if (!ptrace_reparented(p)) ptrace = 1;` (`kernel/exit.c:1527-1528`).
 /// That is the `PTRACE_TRACEME` case, where the tracer *is* the real parent, so
 /// its `wait4(2)` must report the stop even though the request named no
 /// session. A stop owned by any other thread group stays hidden, which is what
 /// keeps a separate ptracer's stop from being reported to the real parent as
 /// well, once as a job-control stop and once as a ptrace stop.
-fn stop_filter_for(expected_ptrace_session: Option<PtraceSession>, waiter_group: Pid) -> StopFilter {
+fn stop_filter_for(
+    expected_ptrace_session: Option<PtraceSession>,
+    waiter_group: Pid,
+) -> StopFilter {
     match expected_ptrace_session {
         Some(session) => StopFilter::Session(session),
-        None => StopFilter::Natural { group: waiter_group },
+        None => StopFilter::Natural {
+            group: waiter_group,
+        },
     }
 }
 
@@ -689,31 +690,52 @@ pub fn sys_waitpid(
     };
     let check_children = || {
         let _wait_guard = proc_data.wait_lock.lock();
-        let candidates =
-            match matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &options, curr.as_thread())
-            {
+        loop {
+            let candidates = match matching_wait_candidates(
+                proc_data,
+                &viewer_pid_ns,
+                pid,
+                &options,
+                curr.as_thread(),
+            ) {
                 Ok(candidates) => candidates,
-            Err(err) => {
-                // Error codes are recorded symbolically: `errno()` is not
-                // reachable from here, and the only distinction the report
-                // needs is which `wait4` failure the caller saw.
-                let code = if err == AxError::from(LinuxError::ECHILD) {
-                    1
-                } else if err == AxError::from(LinuxError::ESRCH) {
-                    2
-                } else {
-                    3
-                };
-                trace_wait(pid, -1, 0, &options, 5, code, 0);
-                return Err(err);
-            }
-        };
+                Err(err) => {
+                    // Error codes are recorded symbolically: `errno()` is not
+                    // reachable from here, and the only distinction the report
+                    // needs is which `wait4` failure the caller saw.
+                    let code = if err == AxError::from(LinuxError::ECHILD) {
+                        1
+                    } else if err == AxError::from(LinuxError::ESRCH) {
+                        2
+                    } else {
+                        3
+                    };
+                    trace_wait(pid, -1, 0, &options, 5, code, 0);
+                    return Err(err);
+                }
+            };
 
-        if let Some(event) = select_wait_event(&candidates, &options, true, proc.pid()) {
-            // Diagnostic: record what this pid-targeted wait is about to
-            // return, before the event is consumed. `event.pid()` is the
-            // candidate's namespace-visible pid, which may differ from the
-            // requested pid when the wait matched something else.
+            let Some(event) = select_wait_event(&candidates, &options, true, proc.pid()) else {
+                trace_wait(pid, -1, 0, &options, 4, 0, 0);
+                return if options.contains(WaitOptions::WNOHANG) {
+                    Ok(Some(0))
+                } else {
+                    Ok(None)
+                };
+            };
+
+            if !claim_wait_event(&event, proc_data, false)? {
+                // A concurrent waiter consumed the event first. Linux's
+                // do_wait rescans its child list in this case, so rebuild the
+                // candidate set rather than blocking until the next child
+                // event while a sibling may already have one pending.
+                continue;
+            }
+
+            // Diagnostic: record what this pid-targeted wait is returning.
+            // `event.pid()` is the candidate's namespace-visible pid, which may
+            // differ from the requested pid when the wait matched something
+            // else.
             let (event_kind, status) = match &event {
                 WaitEvent::Exited { snapshot, .. } => (1u32, snapshot.wait_status),
                 WaitEvent::Stopped { stop, .. } => (2, i32::from(stop.signal)),
@@ -728,22 +750,12 @@ pub fn sys_waitpid(
                 0,
                 0,
             );
-            if !claim_wait_event(&event, proc_data, false)? {
-                return Ok(None);
-            }
             // The immutable snapshot and consumed-event claim now suffice;
             // a userfaultfd stall must not hold the parent's wait mutex.
             drop(_wait_guard);
             write_waitpid_event(&memory, &event, exit_code, rusage_ptr)?;
 
             return Ok(Some(event.pid() as isize));
-        }
-
-        trace_wait(pid, -1, 0, &options, 4, 0, 0);
-        if options.contains(WaitOptions::WNOHANG) {
-            Ok(Some(0))
-        } else {
-            Ok(None)
         }
     };
 
@@ -950,18 +962,19 @@ fn waitid_claim(idtype: u32, id: u32, options: u32) -> AxResult<WaitIdClaim> {
 
     let curr = current();
     let viewer_pid_ns = curr.as_thread().pid_ns();
-    // `kernel_waitid_prepare()` runs `find_get_pid()` after validating the
-    // `which`/`upid` pair: a P_PID or nonzero P_PGID id that names no live or
-    // unreaped-zombie process is ESRCH, distinct from the ECHILD the wait
-    // itself reports for an existing process that is not a waitable child.
-    if idtype == P_PID || (idtype == P_PGID && id != 0) {
-        let exists = viewer_pid_ns
-            .resolve_visible_pid(id as Pid)
-            .is_some_and(|tid| get_process_including_zombie(tid).is_ok());
-        if !exists {
-            return Err(AxError::NoSuchProcess);
-        }
-    }
+    // `kernel_waitid_prepare()` only resolves the `which`/`upid` pair into a
+    // `struct pid`; it never errors when the number names no task.  The
+    // ECHILD-vs-block decision happens in `__do_wait()`
+    // (`kernel/exit.c:1706-1710`): `notask_error` starts at `-ECHILD` and is
+    // only cleared by a matching child, so a pid that names nothing, or names
+    // a task that is not a waitable child (including any live thread's tid,
+    // which `pid_has_task(wo->pid, PIDTYPE_PID)` admits), reports ECHILD
+    // without blocking, and only a real child parks the waiter.  ESRCH never
+    // leaves waitid in this kernel -- the lone wait-path ESRCH is
+    // `kernel_wait4(INT_MIN)` (`kernel/exit.c:1894`).  The candidate scan
+    // below reproduces exactly that split: an empty candidate set is ECHILD
+    // immediately, a non-child never matches the filter, and a live child
+    // without a pending event blocks.
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;
     let nowait = options.contains(WaitOptions::WNOWAIT);
@@ -1001,31 +1014,42 @@ fn waitid_claim(idtype: u32, id: u32, options: u32) -> AxResult<WaitIdClaim> {
 
     let check_children = || -> AxResult<Option<WaitIdClaim>> {
         let _wait_guard = proc_data.wait_lock.lock();
-        let candidates = if let Some(pid) = pid {
-            matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &wait_options, curr.as_thread())?
-        } else {
-            vec![pidfd_candidate.clone().ok_or(AxError::InvalidInput)?]
-        };
+        loop {
+            let candidates = if let Some(pid) = pid {
+                matching_wait_candidates(
+                    proc_data,
+                    &viewer_pid_ns,
+                    pid,
+                    &wait_options,
+                    curr.as_thread(),
+                )?
+            } else {
+                vec![pidfd_candidate.clone().ok_or(AxError::InvalidInput)?]
+            };
 
-        if let Some(event) = select_wait_event(
-            &candidates,
-            &wait_options,
-            wait_options.contains(WaitOptions::WEXITED),
-            proc.pid(),
-        ) {
-            if !claim_wait_event(&event, proc_data, nowait)? {
+            let Some(event) = select_wait_event(
+                &candidates,
+                &wait_options,
+                wait_options.contains(WaitOptions::WEXITED),
+                proc.pid(),
+            ) else {
+                if wait_options.contains(WaitOptions::WNOHANG) {
+                    if pidfd_nonblocking && !explicit_nohang {
+                        return Err(AxError::from(LinuxError::EAGAIN));
+                    }
+                    return Ok(Some(WaitIdClaim::Empty));
+                }
                 return Ok(None);
+            };
+
+            if !claim_wait_event(&event, proc_data, nowait)? {
+                // A concurrent waiter consumed the event first; rescan the
+                // candidate set like Linux's do_wait loop instead of blocking
+                // until the next child event.
+                continue;
             }
             return Ok(Some(WaitIdClaim::Event(event)));
         }
-
-        if wait_options.contains(WaitOptions::WNOHANG) {
-            if pidfd_nonblocking && !explicit_nohang {
-                return Err(AxError::from(LinuxError::EAGAIN));
-            }
-            return Ok(Some(WaitIdClaim::Empty));
-        }
-        Ok(None)
     };
 
     let result = block_on_poll_set_interruptible_if(

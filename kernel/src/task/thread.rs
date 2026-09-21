@@ -731,7 +731,19 @@ fn reparent_task_parent_children_matching(
 ) {
     let first = {
         let topology = TASK_PARENT_TOPOLOGY.lock();
-        let first = departing.state.lock().first_child.clone();
+        let mut state = departing.state.lock();
+        // Install the reaper hop in the same transaction that takes the
+        // children, as Linux's forget_original_parent() does under
+        // tasklist_lock: a child's retained `real_parent` identity must
+        // resolve to the replacement reaper from the moment it leaves this
+        // node's child list, never to this dead node while it is still marked
+        // live.
+        if state.live {
+            state.live = false;
+            state.exit_reaper = Some(replacement.clone());
+        }
+        let first = state.first_child.clone();
+        drop(state);
         drop(topology);
         first
     };
@@ -772,21 +784,26 @@ fn finish_task_parent_exit(
     let (replaced, retired) = {
         let topology = TASK_PARENT_TOPOLOGY.lock();
         let mut state = node.state.lock();
-        if !state.live || state.first_child.is_some() {
+        if state.first_child.is_some() {
             drop(state);
             drop(topology);
             return false;
         }
-        state.live = false;
         // A child born under this task retains it as its `real_parent`, and
         // Linux keeps that name until the child is reaped: `forget_original_parent()`
         // reparents every child to the selected live reaper before
-        // `release_task()` (`kernel/exit.c:684-728`). Keep the same hop on the
-        // dead node so a retained child identity still resolves to that reaper
-        // instead of to nothing.
-        let replaced = match reaper {
-            Some(reaper) => state.exit_reaper.replace(reaper),
-            None => state.exit_reaper.take(),
+        // `release_task()` (`kernel/exit.c:684-728`). The reparent batch has
+        // normally already retired this node and installed that hop in the
+        // same transaction that moved the children; only an exit without a
+        // batch still publishes the hop here.
+        let replaced = if state.live {
+            state.live = false;
+            match reaper {
+                Some(reaper) => state.exit_reaper.replace(reaper),
+                None => state.exit_reaper.take(),
+            }
+        } else {
+            None
         };
         // `unlink_task_parent_locked` takes this same node's state lock, so the
         // guard must be released first: a `SpinNoIrq` is not recursive.
