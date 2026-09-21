@@ -197,6 +197,45 @@ pub mod boot {
     pub fn framebuffer_rejection() -> Option<&'static str> {
         None
     }
+
+    /// The kernel command line the bootloader supplied, if any.
+    #[cfg(all(target_os = "none", feature = "defplat"))]
+    pub fn command_line() -> Option<&'static str> {
+        axplat_x86_pc::boot_command_line()
+    }
+
+    /// Host tests have no bootloader.
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn command_line() -> Option<&'static str> {
+        None
+    }
+
+    /// Looks up one `key=value` boot parameter.
+    ///
+    /// Parameters are whitespace separated.  A bare `key` with no `=` is a
+    /// flag, not a value, and is not returned here; ask for it with
+    /// [`command_line_flag`].  The *last* occurrence wins, so a parameter
+    /// appended to an existing command line overrides the earlier one, which
+    /// is what a `grub.cfg` edit and a PXE per-host override both rely on.
+    pub fn command_line_value(key: &str) -> Option<&'static str> {
+        value_in(command_line()?, key)
+    }
+
+    /// Whether a bare `key` flag appears in the command line.
+    pub fn command_line_flag(key: &str) -> bool {
+        command_line().is_some_and(|text| text.split_ascii_whitespace().any(|item| item == key))
+    }
+
+    /// The pure half of [`command_line_value`], so the parse is testable on
+    /// the host where no bootloader exists.
+    pub fn value_in<'a>(command_line: &'a str, key: &str) -> Option<&'a str> {
+        command_line
+            .split_ascii_whitespace()
+            .filter_map(|item| item.split_once('='))
+            .filter(|(name, _)| *name == key)
+            .next_back()
+            .map(|(_, value)| value)
+    }
 }
 
 /// Fleet-owned CET terminal-handoff support.
@@ -715,11 +754,6 @@ pub mod context {
     #[cfg(feature = "pkeys")]
     pub use axcpu::PKRU_DEFAULT;
     pub use axcpu::{AddressSpaceFallbackReason, TaskContext, TrapFrame};
-    #[cfg(feature = "asid-switch-diagnostics")]
-    pub use axcpu::{
-        AsidSwitchDiagnosticsSnapshot, asid_switch_diagnostics_snapshot,
-        reset_asid_switch_diagnostics, set_asid_switch_diagnostics_enabled,
-    };
     #[cfg(feature = "fp-simd")]
     pub use axcpu::{XsaveLayout, XsaveUnavailable, xsave_image_mxcsr_valid};
 }
@@ -824,3 +858,51 @@ macro_rules! addr_of_sym {
     };
 }
 pub(crate) use addr_of_sym;
+
+#[cfg(test)]
+mod boot_command_line_tests {
+    use super::boot::value_in;
+
+    #[test]
+    fn a_value_is_read_from_a_whitespace_separated_parameter_list() {
+        assert_eq!(value_in("quiet loglevel=warn root=/dev/sda", "loglevel"), Some("warn"));
+    }
+
+    #[test]
+    fn an_absent_key_reads_as_absent() {
+        assert_eq!(value_in("quiet root=/dev/sda", "loglevel"), None);
+    }
+
+    #[test]
+    fn a_bare_flag_is_not_a_value() {
+        assert_eq!(value_in("quiet loglevel", "loglevel"), None);
+        assert_eq!(value_in("", "loglevel"), None);
+    }
+
+    #[test]
+    fn the_last_occurrence_wins_so_an_appended_override_takes_effect() {
+        assert_eq!(value_in("loglevel=info loglevel=trace", "loglevel"), Some("trace"));
+    }
+
+    #[test]
+    fn a_key_is_matched_whole_never_as_a_prefix_or_suffix() {
+        assert_eq!(value_in("xloglevel=warn", "loglevel"), None);
+        assert_eq!(value_in("loglevelx=warn", "loglevel"), None);
+    }
+
+    #[test]
+    fn an_empty_value_is_a_value_and_not_an_absent_key() {
+        assert_eq!(value_in("loglevel=", "loglevel"), Some(""));
+    }
+
+    #[test]
+    fn a_value_containing_equals_keeps_everything_after_the_first_one() {
+        assert_eq!(value_in("loglevel=warn,tk_kernel::task=error", "loglevel"),
+                   Some("warn,tk_kernel::task=error"));
+    }
+
+    #[test]
+    fn tabs_and_runs_of_spaces_separate_parameters_like_a_shell_does() {
+        assert_eq!(value_in("quiet\t\tloglevel=warn   root=x", "loglevel"), Some("warn"));
+    }
+}

@@ -507,7 +507,17 @@ pub(crate) fn init(level: &str) {
         store.supported = axhal::console::diagnostic_available();
         store.set_enabled(true);
     }
-    let _ = set_filter(level);
+    // `level` can now come from the bootloader's `loglevel=`, so a typo is a
+    // thing a human does rather than a build-time constant that was reviewed.
+    // Say so on the diagnostic channel: silently keeping the default would
+    // present exactly as "the boot parameter had no effect", with nothing to
+    // distinguish a rejected filter from one that was never read.
+    if set_filter(level).is_err() {
+        diagnostic(format_args!(
+            "klog: rejected log filter {level:?}; keeping {}",
+            level_name(FILTER.lock().default)
+        ));
+    }
     log::set_logger(&Logger).expect("kernel logger already installed");
     log::set_max_level(LevelFilter::Trace);
 }

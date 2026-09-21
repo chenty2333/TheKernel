@@ -426,7 +426,14 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     unsafe { axhal::mem::clear_bss() };
     axhal::percpu::init_primary(cpu_id);
     axhal::init_early(cpu_id, arg);
-    let log_level = option_env!("AX_LOG").unwrap_or("info");
+    // The bootloader's `loglevel=` wins over the compile-time default.  On a
+    // netbooted, serial-less machine the alternative to a boot parameter is
+    // rebuilding and re-transferring the whole kernel image to change one
+    // filter, and the setting most often needed is the one that makes the
+    // console readable enough to diagnose the boot in the first place.
+    let log_level = axhal::boot::command_line_value("loglevel")
+        .or(option_env!("AX_LOG"))
+        .unwrap_or("info");
     let show_banner = build_flag_enabled(option_env!("AX_START_BANNER"));
     let enable_backtrace = build_flag_enabled(option_env!("AX_BACKTRACE"));
 

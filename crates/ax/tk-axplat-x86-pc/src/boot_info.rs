@@ -31,7 +31,16 @@ const MAX_RSDP_LENGTH: usize = 4096;
 const MAX_MODULE_CMDLINE: usize = 256;
 const PAGE_SIZE: usize = 4096;
 
+/// Longest kernel command line retained from the bootloader.
+///
+/// A longer one is discarded whole rather than truncated: half of
+/// `loglevel=warn` is a different, silently wrong setting, and a boot
+/// parameter that quietly means something else is worse than one that was
+/// visibly ignored.  [`BootInfo::command_line_truncated`] says it happened.
+const MAX_BOOT_CMDLINE: usize = 256;
+
 const MB2_TAG_END: u32 = 0;
+const MB2_TAG_CMDLINE: u32 = 1;
 const MB2_TAG_MMAP: u32 = 6;
 const MB2_TAG_MODULE: u32 = 3;
 const MB2_TAG_ACPI_OLD: u32 = 14;
@@ -323,6 +332,11 @@ pub(crate) struct BootInfo {
     tags_truncated: bool,
     framebuffer: Option<FramebufferInfo>,
     framebuffer_rejection: Option<FramebufferRejection>,
+    command_line: [u8; MAX_BOOT_CMDLINE],
+    command_line_len: usize,
+    /// Whether a command line was supplied but exceeded [`MAX_BOOT_CMDLINE`]
+    /// and was therefore dropped instead of applied in part.
+    command_line_truncated: bool,
 }
 
 impl BootInfo {
@@ -345,6 +359,9 @@ impl BootInfo {
             tags_truncated: false,
             framebuffer: None,
             framebuffer_rejection: None,
+            command_line: [0; MAX_BOOT_CMDLINE],
+            command_line_len: 0,
+            command_line_truncated: false,
         }
     }
 
@@ -397,6 +414,19 @@ impl BootInfo {
     pub fn framebuffer_rejection(&self) -> Option<FramebufferRejection> {
         self.framebuffer_rejection
     }
+
+    /// The kernel command line the bootloader supplied, without its
+    /// terminator.  Empty when none was supplied or when one was discarded
+    /// for length; [`Self::command_line_truncated`] separates those.
+    pub(crate) fn command_line(&self) -> &[u8] {
+        &self.command_line[..self.command_line_len]
+    }
+
+    /// Whether a supplied command line was discarded for exceeding
+    /// [`MAX_BOOT_CMDLINE`].
+    pub(crate) fn command_line_truncated(&self) -> bool {
+        self.command_line_truncated
+    }
 }
 
 static BOOT_INFO: LazyInit<BootInfo> = LazyInit::new();
@@ -433,10 +463,11 @@ pub(crate) fn finish_handoff() {
 /// Report the bootloader-supplied tag inventory on the diagnostic channel.
 ///
 /// This runs before the immutable owner is published so the evidence survives
-/// a later handoff failure.  It writes to COM2 diagnostics rather than the
-/// COM1 console: the console is the guest-visible TTY path, while this is
-/// platform bring-up evidence, and on a machine without a working console the
-/// diagnostic channel is the only one that can still be read.
+/// a later handoff failure.  It writes to the diagnostic sink rather than the
+/// console's `print` path: the console is the guest-visible TTY, while this is
+/// platform bring-up evidence.  On a machine with a second serial port the two
+/// are different wires, and on one without them they are the same port but
+/// still separate, bounded writers.
 fn report_tag_inventory(info: &BootInfo) {
     diagnostic_println!(
         "MB2 tag inventory: protocol={:?} count={} truncated={}",
@@ -455,6 +486,14 @@ fn report_tag_inventory(info: &BootInfo) {
         MAX_REGIONS,
         (info.memory_map_entries() - info.memory_regions().len()) as u32,
         info.memory_map_truncated() as u8
+    );
+    // The command line decides log verbosity, so it has to be reported by a
+    // channel that does not itself depend on the log level it is about.
+    diagnostic_println!(
+        "MB2 command line: len={} discarded_for_length={} text={:?}",
+        info.command_line().len(),
+        info.command_line_truncated() as u8,
+        core::str::from_utf8(info.command_line()).unwrap_or("<non-utf8>")
     );
     for record in info.tags() {
         diagnostic_println!("MB2 tag type={} size={}", record.tag_type, record.size);
@@ -534,6 +573,7 @@ enum ParseError {
     ModuleRangeOutsideMemory,
     ModuleCapacity,
     ModuleCommandLine,
+    BootCommandLineUnterminated,
     AcpiTagTruncated,
     AcpiTagMalformed,
     AcpiSignature,
@@ -750,6 +790,25 @@ fn parse_module(tag: &[u8]) -> Result<ModuleInfo, ParseError> {
     })
 }
 
+/// Parses a Multiboot2 boot command line tag (type 1).
+///
+/// The payload is one NUL-terminated string.  Returns `Ok(None)` when the
+/// string is well formed but longer than [`MAX_BOOT_CMDLINE`]: an over-long
+/// command line is dropped, never applied in part, because a prefix of a
+/// boot parameter is a different parameter.  A payload with no terminator is
+/// not a string at all, and that is a parse failure.
+fn parse_boot_command_line(tag: &[u8]) -> Result<Option<&[u8]>, ParseError> {
+    let payload = tag.get(8..).ok_or(ParseError::BootCommandLineUnterminated)?;
+    let end = payload
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or(ParseError::BootCommandLineUnterminated)?;
+    if end > MAX_BOOT_CMDLINE {
+        return Ok(None);
+    }
+    Ok(Some(&payload[..end]))
+}
+
 fn module_is_available(module: ModuleInfo, regions: &[RawRange]) -> bool {
     regions.iter().any(|&(start, length)| {
         start
@@ -952,6 +1011,20 @@ fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, Pa
                 }
                 saw_end = true;
                 break;
+            }
+            // First tag wins, as for the framebuffer.  A second command line
+            // is a bootloader bug, and picking the one that was declared
+            // first is both deterministic and the one GRUB actually built the
+            // entry from.  The inventory above still records that a duplicate
+            // arrived.
+            MB2_TAG_CMDLINE if owner.command_line_len == 0 && !owner.command_line_truncated => {
+                match parse_boot_command_line(tag)? {
+                    Some(text) => {
+                        owner.command_line[..text.len()].copy_from_slice(text);
+                        owner.command_line_len = text.len();
+                    }
+                    None => owner.command_line_truncated = true,
+                }
             }
             MB2_TAG_MMAP => {
                 if saw_mmap {

@@ -93,6 +93,21 @@ pub fn boot_framebuffer_rejection() -> Option<&'static str> {
         .map(FramebufferRejection::as_str)
 }
 
+/// The kernel command line the bootloader supplied, or `None`.
+///
+/// `None` covers three cases the caller cannot act on differently: no command
+/// line tag, an over-long one that was discarded rather than applied in part,
+/// and one that is not UTF-8.  All three are reported on the platform's
+/// diagnostic channel at handoff, which is where the distinction belongs; a
+/// caller reading boot parameters only needs to know it has none.
+pub fn boot_command_line() -> Option<&'static str> {
+    let text = boot_info::get().command_line();
+    if text.is_empty() {
+        return None;
+    }
+    core::str::from_utf8(text).ok()
+}
+
 #[cfg(feature = "pmu")]
 pub mod pmu;
 

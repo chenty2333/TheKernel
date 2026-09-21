@@ -23,7 +23,7 @@ One producer path and four readers, all in `crates/ax/tk-axruntime/src/klog.rs`:
 | `STORE` ring | `CAPACITY` = 64 KiB of record text, byte-addressed, wrapping. `oldest`/`end` are byte cursors; `retention_bytes_overwritten` in `/proc/sys/kernel/log_stats` reports `oldest`, i.e. how much text the ring has dropped off its front. |
 | `Text` | One formatted record, at most `RECORD_BYTES` = 1024 bytes, always newline-terminated. The terminating newline is not the record delimiter, and the text inside one may contain newlines of its own (§6). A longer record is cut and marked ` [truncated]`, counted as `records_truncated`. |
 | producers | `Logger::log`, `diagnostic()` and `record()` (the `ax_print` path). A per-CPU bit (`PRODUCING`) keeps a CPU from re-entering the path. |
-| readers | `snapshot_into` / `available_from` for `syslog(2)`+`/dev/kmsg`, the framebuffer console mirror, the early boot screen (`try_snapshot_into`, which refuses rather than waits so a panic cannot hang), and the diagnostic console (`DiagnosticDrain`, the serial port at `0x2f8`). |
+| readers | `snapshot_into` / `available_from` for `syslog(2)`+`/dev/kmsg`, the framebuffer console mirror, the early boot screen (`try_snapshot_into`, which refuses rather than waits so a panic cannot hang), and the diagnostic console (`DiagnosticDrain`, the serial port the boot probe selected -- COM2 under QEMU). |
 
 The ring is the log.  `kernel.log` on the host is the **diagnostic console**
 output, not a copy of the ring: it is whatever `DiagnosticDrain` wrote to the
