@@ -535,7 +535,7 @@ mod imp {
         let now = axhal::time::monotonic_time_nanos();
         let epoch = request.epoch();
         error!(
-            "\x010TLB shootdown epoch {epoch} timed out: maintenance={:?} issuer_cpu={} \"
+            "\x010TLB shootdown epoch {epoch} timed out: maintenance={:?} issuer_cpu={} \
              current_cpu={} elapsed_ns={} retry_rounds={}; refusing to reclaim mapping \
              resources",
             request.maintenance(),
@@ -641,7 +641,7 @@ mod imp {
             irq_off_yield_returns: 0,
             irq_off_idle_boundaries: 0,
         });
-        debug!(
+        error!(
             "IRQ continuation CPU {cpu}: latest_sequence={} timer_events={} timer_delta={} \
              switches={} switch_delta={} switch_returns={} switch_return_delta={} \
              irq_off_disables={} irq_off_disable_delta={} irq_off_enables={} \
@@ -704,7 +704,7 @@ mod imp {
         let first_sequence = after.latest_sequence.saturating_sub(15).max(1);
         for sequence in first_sequence..=after.latest_sequence {
             if let Some(event) = axtask::irq_continuation_diagnostic_event(cpu, sequence) {
-                debug!(
+                error!(
                     "IRQ continuation CPU {cpu} event: sequence={} kind={} task_id={} \
                      peer_task_id={} flags={:#x} preempt_disable_count={}",
                     event.sequence,

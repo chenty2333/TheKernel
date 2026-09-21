@@ -89,7 +89,7 @@ fn mount_at(fs: &FsContext, path: &FsPath, mount_fs: Filesystem) -> LinuxResult<
         )?,
     )?;
     mounts::attach_tree_and_record(&mountpoint, &target)?;
-    info!("Mounted {} at {:?}", mount_fs.name(), path);
+    info!("Mounted {} at {}", mount_fs.name(), path.as_bytes().escape_ascii());
     Ok(())
 }
 

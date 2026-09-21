@@ -356,7 +356,13 @@ impl<const N: usize> Store<N> {
             // always, and counts every record the ring wraps over as lost even
             // when the console printed it long ago.
             let overwritten = self.end.saturating_sub(N as u64);
-            let destroys_a_head = self.marks[slot] & RECORD_START != 0;
+            // A record the level mutes is not owed to any console: the console
+            // worker is woken only by records it would print, so a muted run can
+            // sit unsecured until the ring wraps over it, and counting that as a
+            // loss would report records nobody was going to show.  The level
+            // asked is the one in force now, when the record is destroyed.
+            let destroys_a_head = self.marks[slot] & RECORD_START != 0
+                && self.marks[slot] & PRIORITY_MASK < self.console_loglevel;
             for console in &mut self.consoles {
                 // Equality counts.  `secured` only advances past a record once
                 // the console has copied it out, so a console equal to this
@@ -1250,8 +1256,9 @@ pub fn set_console_supported(id: ConsoleId, supported: bool) {
 ///
 /// Stored verbatim, as `console_loglevel` is there, where `proc_dointvec` does
 /// not clamp either. `1..=8` is the meaningful band -- 1 shows only
-/// `KERN_EMERG`, 8 shows the debug band -- and 0 is not rejected: it is what
-/// `SYSLOG_ACTION_CONSOLE_OFF` asks for, a console that prints nothing. That
+/// `KERN_EMERG`, 8 shows the debug band -- and 0 is not rejected: it is a
+/// console that prints nothing, which `/proc/sys/kernel/printk` and
+/// `loglevel=0` can ask for (`SYSLOG_ACTION_CONSOLE_OFF` installs 1). That
 /// costs nothing a panic needs, because the panic screen reads the retained ring
 /// (`try_snapshot_into`) rather than a console.
 pub fn set_console_loglevel(level: u8) {
@@ -1920,6 +1927,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A run of records the level mutes never wakes the console, so its cursor
+    /// can still be behind when the ring wraps over them.  Those records were
+    /// never going to be shown, so the wrap costs the console nothing; one it
+    /// would have printed, overwritten the same way, is still a loss.
+    #[test]
+    fn a_muted_record_the_ring_overwrites_is_not_a_console_loss() {
+        let mut store = LocalStore::new();
+        let mut text = Text::new();
+        text.write_str("twenty-four bytes long..\n").unwrap();
+        text.finish();
+        let records_to_wrap = LOCAL_CAPACITY / text.len;
+        store.append(&text, INFO);
+        for _ in 0..records_to_wrap + 3 {
+            store.append(&text, DEBUG);
+        }
+        assert!(!store.prints(ConsoleId::Serial, DEBUG));
+        assert_eq!(
+            store.console(ConsoleId::Serial).lost,
+            1,
+            "only the INFO record the console would have printed is lost"
+        );
     }
 
     /// A record is only lost to the console when the ring overwrites it before

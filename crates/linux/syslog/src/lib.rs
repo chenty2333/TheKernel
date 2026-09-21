@@ -55,8 +55,9 @@ pub struct Console {
     pub saved: u8,
 }
 impl Console {
-    /// `LOGLEVEL_DEFAULT`: no `CONSOLE_OFF` is in effect. One past
-    /// `CONSOLE_LOGLEVEL_DEBUG`, which is the loudest level anything accepts.
+    /// `LOGLEVEL_DEFAULT`: no `CONSOLE_OFF` is in effect. `u8::MAX`, above
+    /// `CONSOLE_LOGLEVEL_DEBUG` (10) and above any level `CONSOLE_OFF` could
+    /// save; only a raw `/proc/sys/kernel/printk` write of 255 collides with it.
     pub const NONE: u8 = u8::MAX;
     /// `CONSOLE_LOGLEVEL_DEFAULT`, the level a fresh boot prints at.
     pub const DEFAULT: Self = Self {
