@@ -21,6 +21,8 @@ from typing import BinaryIO, Iterator, Mapping
 
 from .model import (
     INTENTIONAL_STOP_RETURN_CODE,
+    KERNEL_CRASH_RETURN_CODE,
+    KERNEL_CRASH_TERMINATION_REASON,
     Interaction,
     QmpColorBlock,
     QmpCheckpoint,
@@ -46,6 +48,54 @@ MAX_PENDING_INPUT_BYTES = 64 * 1024
 # userspace console output; markers must still match when a stray escape
 # sequence lands on the marker's line.
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# A kernel that has given up, as one anchored alternation over the *whole* line
+# family.  Every alternative below is a string a kernel actually prints, with
+# the producer named next to it; nothing here is a guess at what a crash looks
+# like, because a marker that never fires is worse than no marker -- it makes the
+# timeout verdict look audited.
+#
+# Matching is anchored at the start of a line (after an optional printk
+# `[ 1234.567890]` timestamp and an optional leftover log-level digit) rather
+# than searched, so a guest that *quotes* a crash keeps its own verdict.  The
+# nested-Linux case is exactly that case, and its transcript is prefixed
+# (`THEKERNEL_<category>_INNER: ...` in tests/guest/tools/nested-linux-boot.c:669),
+# so it cannot reach this rule.
+_KERNEL_CRASH_RE = re.compile(
+    r"^(?:\[\s*\d+\.\d+\]\s*)?[0-9]?\s*(?:"
+    # Linux.  Reference tree: /home/ava/Desktop/linux-7.2.3, the ABI
+    # differential's second target, booted with `console=ttyS0`
+    # (config/x86_64/grub-linux-shell.cfg:10), so these reach the console.
+    r"Kernel panic - not syncing:"               # kernel/panic.c:640
+    r"|Attempted to kill (?:the idle task|init)!"  # kernel/exit.c:1073, :963
+    r"|Oops[: ]"                                 # arch/x86/mm/fault.c:718 (__die("Oops"))
+    r"|general protection fault"                 # arch/x86/kernel/traps.c:801 (GPFSTR)
+    r"|double fault"                             # arch/x86/kernel/traps.c:599
+    r"|kernel BUG at "                           # lib/bug.c:260
+    r"|BUG: "                                    # arch/x86/mm/fault.c:542, :545;
+    #                                             arch/x86/kernel/traps.c:553;
+    #                                             kernel/watchdog.c:884 (soft lockup)
+    # TheKernel.  `crates/ax/tk-axruntime/src/lang_items.rs:31` writes Rust's
+    # `PanicInfo` display -- "panicked at <file>:<line>:<col>:" (the same literal
+    # the early screen asserts at kernel/src/pseudofs/dev/early_screen/tests.rs:331)
+    # -- and its payload for a CPU fault is one of the strings below, from
+    # `crates/ax/tk-axcpu/src/x86_64/trap.rs:26,36,64,69,78,90`.
+    r"|panicked at "
+    r"|Unhandled (?:kernel )?#[A-Z]{2} @"        # trap.rs:26, :36, :64, :78
+    r"|#GP @ "                                   # trap.rs:69
+    r"|Unhandled (?:[Ee]xception|[Ii]nterrupt) " # trap.rs:90; x86 trap stubs
+    r")"
+)
+
+# How far the runner reads into the diagnostic UART's file per poll.  The file
+# is QEMU's own `chardev file` sink, so the runner never owns its write side.
+_DIAGNOSTIC_READ_BYTES = 1 << 20
+
+
+def _crash_line(line: str) -> re.Match[str] | None:
+    """The crash pattern at the start of one already-normalized console line."""
+
+    return _KERNEL_CRASH_RE.match(line)
 
 
 def _validate_qmp_marker(name: str, marker: str | None) -> None:
@@ -1092,6 +1142,8 @@ def _wait_for_process(
     forward_input: bool,
     termination_signals: list[int],
     qmp_controller: _QmpController | None = None,
+    diagnostic_log_path: Path | None = None,
+    initial_diagnostic_offset: int | None = None,
 ) -> tuple[int, str | None, bool, str | None]:
     started_at = time.monotonic()
     input_ready = interaction.input_after_marker is None
@@ -1104,7 +1156,70 @@ def _wait_for_process(
     stop_pending = False
     active_case: tuple[str, float] | None = None
     last_case: str | None = None
+    crash_watch = interaction.detect_kernel_crash
+    # The kernel's own crash text never reaches the console: `lang_items.rs`
+    # writes it to the diagnostic UART, which QEMU appends straight to
+    # `kernel.log`.  Reading what that file has gained since this run started is
+    # therefore the only way to see a TheKernel panic before the watchdog does,
+    # and starting at the current end of file keeps a reused path's stale bytes
+    # from condemning a healthy guest.
+    diagnostic_pending = bytearray()
+    diagnostic_offset = 0
+    if crash_watch and diagnostic_log_path is not None:
+        if initial_diagnostic_offset is not None:
+            diagnostic_offset = initial_diagnostic_offset
+        else:
+            try:
+                diagnostic_offset = diagnostic_log_path.stat().st_size
+            except OSError:
+                diagnostic_offset = 0
     assert process.stdout is not None
+
+    def crash_verdict(line: str, stream: str) -> tuple[int, str, bool, str]:
+        case = active_case[0] if active_case is not None else (last_case or "none")
+        # A guest that took the crash with it is already reaped; signalling a
+        # recycled process group here would report a verdict about the wrong
+        # machine.
+        if process.poll() is None:
+            _terminate_with_grace(process)
+        return (
+            KERNEL_CRASH_RETURN_CODE,
+            f"kernel crash while running test {case} ({stream} stream): {line}",
+            False,
+            KERNEL_CRASH_TERMINATION_REASON,
+        )
+
+    def scan_diagnostic_stream() -> tuple[int, str, bool, str] | None:
+        """Feed this run's appended diagnostic-UART bytes to the crash rule.
+
+        Only complete lines are classified: the panic header and its payload are
+        separate writes, and a half line must not be matched twice.
+        """
+
+        nonlocal diagnostic_offset
+        assert diagnostic_log_path is not None
+        try:
+            with diagnostic_log_path.open("rb") as handle:
+                handle.seek(diagnostic_offset)
+                chunk = handle.read(_DIAGNOSTIC_READ_BYTES)
+        except OSError:
+            return None  # Not created yet, or removed: nothing to classify.
+        if not chunk:
+            return None
+        diagnostic_offset += len(chunk)
+        diagnostic_pending.extend(chunk)
+        while True:
+            newline = diagnostic_pending.find(b"\n")
+            if newline < 0:
+                break
+            raw_line = bytes(diagnostic_pending[:newline])
+            del diagnostic_pending[: newline + 1]
+            line = _ANSI_ESCAPE_RE.sub(
+                "", raw_line.rstrip(b"\r").decode("utf-8", errors="replace")
+            )
+            if _crash_line(line) is not None:
+                return crash_verdict(line, "diagnostic")
+        return None
 
     def consume_lines(
         data: bytes, *, final: bool = False
@@ -1125,6 +1240,11 @@ def _wait_for_process(
             if any(marker_line == prefix or marker_line.startswith(prefix + " ")
                    for prefix in interaction.failure_prefixes):
                 raise ProcessError(f"guest reported failure: {marker_line}")
+            # Before the case bookkeeping: a crash line inside a case belongs to
+            # that case, and reporting it as the `case-timeout` it would
+            # otherwise become loses the only diagnosis the run produced.
+            if crash_watch and _crash_line(marker_line) is not None:
+                return crash_verdict(marker_line, "console")
             begin = re.fullmatch(r"# THEKERNEL_TEST_BEGIN (\d+) (\S+) timeout_seconds=(\d+)", marker_line)
             end = re.fullmatch(r"# THEKERNEL_TEST_END (\d+) (\S+) result=(-?\d+)", marker_line)
             if begin:
@@ -1215,6 +1335,11 @@ def _wait_for_process(
                 if interaction.interactive:
                     _write_stream(console_stream, console_filter.feed(b"", final=True))
 
+        if crash_watch and diagnostic_log_path is not None:
+            crashed = scan_diagnostic_stream()
+            if crashed is not None:
+                return crashed
+
         if input_ready and input_open and input_stream in ready:
             data = os.read(
                 input_stream.fileno(),
@@ -1254,6 +1379,7 @@ def _wait_for_process(
 
         returncode = process.poll()
         if returncode is not None:
+            drained_crash: tuple[int, str, bool, str] | None = None
             if stdout_open:
                 while True:
                     remainder = os.read(process.stdout.fileno(), 65_536)
@@ -1262,15 +1388,29 @@ def _wait_for_process(
                     log_file.write(remainder)
                     if interaction.interactive:
                         _write_stream(console_stream, console_filter.feed(remainder))
-                    consume_lines(remainder)
+                    stopped = consume_lines(remainder)
+                    if stopped is not None and drained_crash is None:
+                        drained_crash = stopped
                 log_file.flush()
+            # A guest that panics on its way out writes the crash line and exits
+            # inside one poll interval, so the scan has to run once more with the
+            # diagnostic file closed by QEMU; otherwise the panic that killed the
+            # run is still reported as `incomplete-case`.
+            if crash_watch and diagnostic_log_path is not None:
+                final_crash = scan_diagnostic_stream()
+                if final_crash is not None and drained_crash is None:
+                    drained_crash = final_crash
             if interaction.interactive:
                 _write_stream(console_stream, console_filter.feed(b"", final=True))
             consume_lines(b"", final=True)
             if qmp_controller is not None:
                 qmp_controller.settle()
+            if drained_crash is not None:
+                return drained_crash
+            if qmp_controller is not None:
                 if qmp_controller.error is not None:
                     raise qmp_controller.error
+            if qmp_controller is not None:
                 if not qmp_controller.complete:
                     raise ProcessError(
                         f"QEMU exited before QMP graphics controls completed (returncode={returncode})"
@@ -1374,6 +1514,12 @@ def run_process(
                 process_stdin = input_stream
             else:
                 process_stdin = subprocess.DEVNULL
+            initial_diagnostic_offset: int | None = None
+            if interaction.detect_kernel_crash and diagnostic_log_path is not None:
+                try:
+                    initial_diagnostic_offset = diagnostic_log_path.stat().st_size
+                except OSError:
+                    initial_diagnostic_offset = 0
             with log_path.open("wb") as log_file:
                 process = subprocess.Popen(
                     command,
@@ -1421,6 +1567,8 @@ def run_process(
                     forward_input=proxy_input,
                     termination_signals=termination_signals,
                     qmp_controller=qmp_controller,
+                    diagnostic_log_path=diagnostic_log_path,
+                    initial_diagnostic_offset=initial_diagnostic_offset,
                 )
                 if qmp_controller is not None:
                     for index, latency_ns in qmp_controller.latency_metrics:

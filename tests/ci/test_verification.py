@@ -28,6 +28,31 @@ class VerificationTests(unittest.TestCase):
         self.assertLessEqual(guest.timeout, 360)
         self.assertFalse(any("bench" in command or "abi" in command or "--fetch-buildroot" in command for command in commands))
 
+    def test_daily_runs_the_static_contract_gates_at_final_strength(self):
+        """A ledger claim is only as good as the strictest check that sees it.
+
+        `--final` turns on three shrink-only ratchets committed in
+        config/linux-contracts.toml: the citation baseline over `[[contract]]`
+        records, the errno-ordering baseline over the same records, and the
+        allowlist over `implemented` cells that still declare a validation gap
+        or bind no test.  All three lists may shrink and never grow, so the
+        daily tier is where overclaiming has to be re-earned.
+        """
+        stages = {stage.name: stage for stage in verify.plan("daily", Path("/home/build"))}
+        self.assertEqual(stages["linux-abi"].command[-2:], ("all", "--final"))
+        self.assertEqual(stages["abi-contracts"].failure, "static")
+        for name in ("linux-abi", "abi-contracts"):
+            self.assertIn("scripts/ci", " ".join(stages[name].command))
+        # Coupling inside the kernel crate is a static question with a committed
+        # baseline, so it belongs beside the package-layer gate, not in a tier
+        # that has to boot anything.
+        self.assertEqual(stages["kernel-module-edges"].failure, "static")
+        self.assertIn("check_kernel_module_edges.py", " ".join(stages["kernel-module-edges"].command))
+        # The hardware tier supplies the runtime half by booting both guests;
+        # it does not re-run the static ratchets, which the daily tier owns.
+        self.assertFalse(any("--final" in stage.command for stage in verify.plan("hardware", Path("/home/build"))))
+
+
     def test_full_extends_daily_with_existing_seatd_pixel_test(self):
         state = Path("/home/build")
         daily = verify.plan("daily", state)
@@ -38,11 +63,32 @@ class VerificationTests(unittest.TestCase):
         self.assertIn("q35-graphics-seatd", full[-1].command)
         self.assertIn("--screenshot", full[-1].command)
 
-    def test_hardware_is_explicit_cpu_correctness(self):
+    def test_hardware_is_explicit_cpu_and_full_abi_correctness(self):
         stages = verify.plan("hardware", Path("/home/build"))
-        self.assertEqual(len(stages), 1)
-        self.assertIn("cpu", stages[0].command)
-        self.assertIn("kvm", stages[0].command)
+        self.assertEqual([stage.name for stage in stages], ["cpu-kvm", "abi-kvm"])
+        cpu, abi = stages
+        self.assertIn("cpu", cpu.command)
+        self.assertIn("kvm", cpu.command)
+        self.assertIn("abi", abi.command)
+        self.assertIn("kvm", abi.command)
+        self.assertIn("--smp", abi.command)
+
+    def test_hardware_tier_drops_the_abi_program_filter(self):
+        with test_tmpdir() as directory, patch.object(verify, "state_root", return_value=Path(directory)), \
+                patch.object(verify, "environment"), patch.object(verify, "execute") as execute, \
+                patch.dict(os.environ, {"THEKERNEL_ABI_PROGRAMS": "wait-abi"}):
+            self.assertEqual(verify.verify_cmd(argparse.Namespace(tier="hardware")), 0)
+        self.assertTrue(execute.call_count)
+        self.assertTrue(all("THEKERNEL_ABI_PROGRAMS" not in call.args[1] for call in execute.call_args_list))
+
+    def test_other_tiers_keep_the_abi_program_filter(self):
+        with test_tmpdir() as directory, patch.object(verify, "state_root", return_value=Path(directory)), \
+                patch.object(verify, "environment"), patch.object(verify, "whitespace"), \
+                patch.object(verify, "execute") as execute, \
+                patch.dict(os.environ, {"THEKERNEL_ABI_PROGRAMS": "wait-abi"}):
+            self.assertEqual(verify.verify_cmd(argparse.Namespace(tier="daily")), 0)
+        self.assertTrue(execute.call_count)
+        self.assertTrue(all(call.args[1].get("THEKERNEL_ABI_PROGRAMS") == "wait-abi" for call in execute.call_args_list))
 
     def test_failed_environment_prevents_all_stages(self):
         with test_tmpdir() as directory, patch.object(verify, "state_root", return_value=Path(directory)), \
@@ -135,6 +181,20 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(module.main(), 1)
             self.assertEqual(output.read_text(), "available=false\n")
             self.assertIn("NOT RUN", summary.read_text())
+
+    def test_scheduled_run_skips_instead_of_failing_on_an_unusable_runner_pool(self):
+        module = load_script_module("hardware_runner", "scripts/ci/check_hardware_runner.py")
+        with test_tmpdir() as directory:
+            output = Path(directory) / "output"
+            summary = Path(directory) / "summary"
+            with patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_OUTPUT": str(output),
+                                         "GITHUB_STEP_SUMMARY": str(summary), module.OPTIONAL_ENVIRONMENT: "1"}), \
+                    patch.object(module.subprocess, "run", return_value=Mock(returncode=1, stdout="")):
+                self.assertEqual(module.main(), 0)
+            self.assertEqual(output.read_text(), "available=false\n")
+            written = summary.read_text()
+            self.assertIn("skipped", written)
+            self.assertNotIn("NOT RUN", written)
 
 
 class BuildrootProvisioningTests(unittest.TestCase):

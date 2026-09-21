@@ -21,6 +21,7 @@ VISIBLE = {
     "xsave": "1",
     "pku": "1",
     "cet_ss": "1",
+    "mce": "1",
 }
 ENABLED = {
     "apic": "1",
@@ -32,6 +33,7 @@ ENABLED = {
     "pke": "0",
     "cet_cr4": "0",
     "syscall": "1",
+    "mce_cr4": "1",
 }
 
 
@@ -95,6 +97,7 @@ class CpuCapabilityReportTests(unittest.TestCase):
             ({**ENABLED, "pke": "1", "osxsave": "1", "xcr0": "0x3"},
              VISIBLE, "PKRU"),
             ({**ENABLED, "cet_cr4": "1"}, {**VISIBLE, "cet_ss": "0"}, "cet_ss"),
+            ({**ENABLED, "mce_cr4": "1"}, {**VISIBLE, "mce": "0"}, "mce"),
             ({**ENABLED, "apic": "0"}, VISIBLE, "apic"),
         )
         for enabled, visible, expected in cases:

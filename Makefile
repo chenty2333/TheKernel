@@ -24,7 +24,7 @@ SCOPE_MEMORY ?= 8G
 RESOURCE_SCOPE = systemd-run --user --scope --quiet --collect \
 	-p MemoryMax=$(SCOPE_MEMORY) -p MemorySwapMax=0 -p OOMPolicy=stop
 
-.PHONY: run run-gui run-existing build lint test bench clean docker-clean
+.PHONY: run run-gui run-existing build lint lint-strict test bench clean docker-clean
 
 # The default image carries no tool payload, so the guest shell has no
 # compiler; boot the distribution-compiler image with
@@ -61,6 +61,15 @@ lint:
 	$(RESOURCE_SCOPE) env CARGO_BUILD_JOBS=$(CARGO_JOBS) \
 	THEKERNEL_STATE_DIR="$(STATE_DIR)" \
 	./tools/thekernel.py lint --smp $(SMP) --memory $(MEMORY)
+
+# The escalation path, developer-only.  `lint` above is what CI enforces: four
+# packages, two denied Clippy groups, no `-D warnings`.  This runs every member
+# on the host target and promotes every warning the in-code allowances do not
+# cover, which the tree does not pass today -- run it to size that work, not to
+# gate it.  No resource scope: it is a check, not a boot.
+lint-strict:
+	env CARGO_BUILD_JOBS=$(CARGO_JOBS) THEKERNEL_STATE_DIR="$(STATE_DIR)" \
+	./tools/thekernel.py lint --workspace --deny-warnings
 
 test:
 	$(RESOURCE_SCOPE) env CARGO_BUILD_JOBS=$(CARGO_JOBS) THEKERNEL_STATE_DIR="$(STATE_DIR)" \

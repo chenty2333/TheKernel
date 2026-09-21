@@ -57,7 +57,13 @@ from tools.qemu_runner.graphics_benchmark import (
 )
 from tools.qemu_runner.graphics_metrics import GraphicsMetricError, enforce_graphics_metrics, parse_graphics_metrics
 from tools.qemu_runner.kernel_benchmark import BenchmarkConfig, BenchmarkTarget, run_benchmark_experiment
-from tools.qemu_runner.abi_differential import AbiConfig, CONTRACTS as ABI_CONTRACTS, run_abi_differential
+from tools.qemu_runner.abi_differential import (
+    AbiConfig,
+    CONTRACTS as ABI_CONTRACTS,
+    PROGRAM_CASES as ABI_PROGRAM_CASES,
+    run_abi_differential,
+    selected_programs as abi_selected_programs,
+)
 from tools.qemu_runner.profiles import BENCHMARK_FAULTS, BENCHMARK_PROFILES, GRAPHICS_PROFILES
 
 
@@ -153,8 +159,10 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
         "AX_ARCH": "x86_64",
         "AX_PLATFORM": PLATFORM,
         "AX_MODE": "release",
-        # Retain useful diagnostics by default. Kernel logs use COM2 and
-        # never enter the interactive COM1 terminal.
+        # Retain useful diagnostics by default.  The kernel drains its log ring
+        # to the first serial port it discovers beyond COM1 -- COM2 under QEMU,
+        # where the harness captures it as `kernel.log` -- so logs stay off the
+        # interactive COM1 terminal on any machine with a second port.
         "AX_LOG": os.environ.get("AX_LOG") or "info",
         "AX_BACKTRACE": os.environ.get("AX_BACKTRACE") or "n",
         # QEMU user networking's fixed product subnet.  axnet-ng consumes
@@ -440,41 +448,72 @@ def build_rootfs(artifacts: Artifacts) -> None:
     stamp.write_text(f"{rebuilt}\n", encoding="utf-8")
 
 
+# The enforced lint policy, as data, so the comment in the root `Cargo.toml` and
+# the gate cannot drift apart again.  This is *not* a workspace-wide Clippy run:
+# it covers the four packages below (the product crate, the kernel crate, and
+# the two adapters whose lint policy the workspace owns) for the product target,
+# denies two Clippy groups, and never promotes an ordinary warning to an error.
+LINT_PACKAGES = (
+    "thekernel",
+    "tk-kernel",
+    "tk-linux-process-adapter",
+    "tk-readiness-adapter",
+)
+LINT_DENIED = ("clippy::correctness", "clippy::suspicious")
+LINT_ALLOWED = ("dead-code", "clippy::drop-non-drop", "clippy::too-many-arguments")
+
+
+def _lint_env(artifacts: Artifacts, *, workspace: bool) -> dict[str, str]:
+    """The environment one Clippy invocation sees.
+
+    A workspace run is a host build: the product's linker script and target
+    `RUSTFLAGS` are per-target and would break every mechanism crate that is
+    only ever compiled for the host, so the escalation path clears them exactly
+    as `host_test_cmd` does and keeps the caches apart.
+    """
+
+    if not workspace:
+        return command_env(artifacts)
+    env = {
+        **os.environ,
+        "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS") or "2",
+        "CARGO_TARGET_DIR": str(state_root() / "target" / "thekernel" / "host"),
+    }
+    for variable in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET",
+                     "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"):
+        env.pop(variable, None)
+    return env
+
+
 @serialized_build
-def lint_kernel(artifacts: Artifacts) -> None:
-    generate_config(artifacts)
-    run_checked(
-        [
-            "cargo",
-            "clippy",
-            "--locked",
-            "--package",
-            "thekernel",
-            "--package",
-            "tk-kernel",
-            "--package",
-            "tk-linux-process-adapter",
-            "--package",
-            "tk-readiness-adapter",
-            "--target",
-            TARGET,
-            "--release",
-            "--features",
-            kernel_features(artifacts),
-            "--",
-            "-D",
-            "clippy::correctness",
-            "-D",
-            "clippy::suspicious",
-            "-A",
-            "dead-code",
-            "-A",
-            "clippy::drop-non-drop",
-            "-A",
-            "clippy::too-many-arguments",
-        ],
-        env=command_env(artifacts),
-    )
+def lint_kernel(artifacts: Artifacts, *, workspace: bool = False,
+                deny_warnings: bool = False) -> None:
+    """Run Clippy: the CI gate by default, the opt-in escalation on request.
+
+    `--workspace` adds every member crate on the host target and
+    `--deny-warnings` promotes every warning that survives the in-code
+    allowances.  Both are developer-only: the tree does not pass the escalated
+    form today, and the gate stays the narrow one until someone pays for the
+    difference.
+    """
+
+    command = ["cargo", "clippy", "--locked"]
+    if workspace:
+        command += ["--workspace", "--all-targets", "--release"]
+    else:
+        generate_config(artifacts)
+        for package in LINT_PACKAGES:
+            command += ["--package", package]
+        command += ["--target", TARGET, "--release", "--features",
+                    kernel_features(artifacts)]
+    command.append("--")
+    if deny_warnings:
+        command += ["-D", "warnings"]
+    for lint in LINT_DENIED:
+        command += ["-D", lint]
+    for lint in LINT_ALLOWED:
+        command += ["-A", lint]
+    run_checked(command, env=_lint_env(artifacts, workspace=workspace))
 
 
 @dataclass(frozen=True)
@@ -495,6 +534,11 @@ class RunSpec:
     qemu_debug: str | None = None
     gdb: bool = False
     failure_prefixes: tuple[str, ...] = ()
+    # Attribute a kernel crash seen on either captured stream to the case that
+    # was running and end the run as a crash, never as the watchdog expiry a
+    # dead guest would otherwise produce.  See
+    # `tools/qemu_runner/process.py:_KERNEL_CRASH_RE` for what counts.
+    detect_kernel_crash: bool = True
     shutdown_after_marker: bool = False
     completion_after_shutdown: str | None = None
     reject_ktap_skips: bool = False
@@ -588,6 +632,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
                     if spec.commands is not None and artifacts.profile == "shell" else None),
                 stop_after_marker=spec.stop_after_marker,
                 failure_prefixes=spec.failure_prefixes,
+                detect_kernel_crash=spec.detect_kernel_crash,
             ),
             memory=artifacts.variant.memory,
             cpus=spec.run_cpus,
@@ -657,7 +702,8 @@ def build_cmd(args: argparse.Namespace) -> int:
 
 
 def lint_cmd(args: argparse.Namespace) -> int:
-    lint_kernel(artifacts_for(args))
+    lint_kernel(artifacts_for(args), workspace=args.workspace,
+                deny_warnings=args.deny_warnings)
     return 0
 
 
@@ -823,6 +869,10 @@ def system_test_cmd(args: argparse.Namespace) -> int:
             commands=None,
             extra_block=None,
             shutdown_after_marker=True,
+            # The gating lane: a panic in the middle of a case used to spend the
+            # case budget and land as `case-timeout`, which sends the next reader
+            # hunting a slow test instead of a dead kernel.
+            detect_kernel_crash=True,
             reject_ktap_skips=not args.allow_skip,
             rootfs_transport="module",
             run_cpus=run_cpus,
@@ -1000,6 +1050,10 @@ def _run_fbcon_boot(args: argparse.Namespace, artifacts: Artifacts, directory: P
             extra_block=None,
             rootfs_transport="module",
             run_cpus=run_cpus,
+            # This suite stops at the first KTAP line and then reads pixels.  A
+            # kernel that died before painting would otherwise surface as a
+            # screenshot that never matched, when the honest verdict is a crash.
+            detect_kernel_crash=True,
             qmp_screenshot=screenshot,
             qmp_screenshot_after_marker=FBCON_MARKER,
             qmp_screenshot_text_cells=fbcon_text_cells(),
@@ -1603,6 +1657,40 @@ def component_host_test_command(package: dict) -> list[str]:
     return command
 
 
+def host_test_selection(packages: list[dict]) -> list[dict]:
+    """Return the components the host suite runs, in a fail-closed way.
+
+    `mechanism` and `linux_abi` components are host-tested by construction.
+    `platform` components are not, because some of them only build for the
+    bare-metal target, so membership there is declared per component.  A
+    declaration that may be *omitted* is silent: a platform component can
+    accumulate `#[test]` functions that no suite ever runs, and nothing says
+    so.  tk-axfs-ng reached 175 unexecuted tests that way, and five more
+    components had the same hole.  Every `platform` component therefore has
+    to state its decision, and one that states none fails the suite instead
+    of disappearing from it.
+    """
+
+    selected = []
+    undeclared = []
+    for package in packages:
+        settings = package.get("metadata", {}).get("thekernel", {})
+        host_test = settings.get("host-test", {})
+        selection = host_test.get("selected")
+        if settings.get("layer") == "platform" and not isinstance(selection, bool):
+            undeclared.append(package["name"])
+        if (settings.get("layer") in {"mechanism", "linux_abi"}
+                or selection is True
+                or package["name"] in {"tk-readiness-adapter", "tk-linux-process-adapter"}):
+            selected.append(package)
+    if undeclared:
+        raise ProductError(
+            "platform components must declare whether the host suite runs them; add "
+            "[package.metadata.thekernel.host-test] with selected = true or false to: "
+            + ", ".join(sorted(undeclared)))
+    return selected
+
+
 def host_test_cmd() -> int:
     test_tmp = state_root() / "test-tmp"
     test_tmp.mkdir(parents=True, exist_ok=True)
@@ -1623,20 +1711,20 @@ def host_test_cmd() -> int:
                               cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
     if metadata.returncode:
         raise ProductError(metadata.stderr.strip() or "cannot discover component host tests")
-    packages = json.loads(metadata.stdout)["packages"]
-    selected = []
-    for package in packages:
-        settings = package.get("metadata", {}).get("thekernel", {})
-        if (settings.get("layer") in {"mechanism", "linux_abi"}
-                or settings.get("host-test", {}).get("selected", False)
-                or package["name"] in {"tk-readiness-adapter", "tk-linux-process-adapter"}):
-            selected.append(package)
+    selected = host_test_selection(json.loads(metadata.stdout)["packages"])
     # Separate invocations preserve declared component test features; a
-    # workspace-wide union changes scheduler and platform semantics.
+    # workspace-wide union changes scheduler and platform semantics.  A
+    # component whose test binary references the per-CPU accessors needs the
+    # same host linker image as the kernel tests; opting in keeps that flag
+    # from changing every other component's link.
+    percpu_rustflags = f"-C link-arg=-T{REPO_ROOT / 'crates/ax/tk-scope-local/percpu.x'}"
     for package in sorted(selected, key=lambda item: item["name"]):
-        run_checked(component_host_test_command(package), env=env)
-    env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"] = (
-        f"-C link-arg=-T{REPO_ROOT / 'crates/ax/tk-scope-local/percpu.x'}")
+        settings = package.get("metadata", {}).get("thekernel", {}).get("host-test", {})
+        command_env = env
+        if settings.get("percpu-linker", False):
+            command_env = {**env, "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": percpu_rustflags}
+        run_checked(component_host_test_command(package), env=command_env)
+    env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"] = percpu_rustflags
     run_checked(["cargo", "test", "--locked", "--manifest-path", "kernel/Cargo.toml",
                  "--tests", "--features", "bpf,perf-sampling,axtask/test", "--target",
                  "x86_64-unknown-linux-gnu", "--", "--test-threads=1"], env=env)
@@ -1678,7 +1766,7 @@ def test_cmd(args: argparse.Namespace) -> int:
             if result:
                 return result
         elif suite == "abi":
-            run_checked([sys.executable, "scripts/ci/linux_abi_gate.py", "all"])
+            run_checked([sys.executable, "scripts/ci/linux_abi_gate.py", "all", "--final"])
             result = abi_test_cmd(args)
             if result:
                 return result
@@ -1722,10 +1810,21 @@ def guest_tool_run(args: argparse.Namespace, command: str, marker: str, cpus: in
 
 
 _CPU_VISIBLE_FIELDS = frozenset(
-    ("hypervisor", "apic", "pcid", "invpcid", "xsave", "pku", "cet_ss")
+    ("hypervisor", "apic", "pcid", "invpcid", "xsave", "pku", "cet_ss", "mce")
 )
 _CPU_ENABLED_FIELDS = frozenset(
-    ("apic", "apic_software", "x2apic", "pcid", "osxsave", "xcr0", "pke", "cet_cr4", "syscall")
+    (
+        "apic",
+        "apic_software",
+        "x2apic",
+        "pcid",
+        "osxsave",
+        "xcr0",
+        "pke",
+        "cet_cr4",
+        "syscall",
+        "mce_cr4",
+    )
 )
 
 
@@ -1793,6 +1892,7 @@ def _validate_cpu_capability_reports(text: str, cpus: int, log: Path | None = No
             ("pcid", "pcid"),
             ("osxsave", "xsave"),
             ("cet_cr4", "cet_ss"),
+            ("mce_cr4", "mce"),
         )
         for enabled_field, visible_field in implications:
             if e[enabled_field] == "1" and v[visible_field] != "1":
@@ -1841,9 +1941,30 @@ def cpu_test_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def abi_selection() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The ABI programs and contract cases the current environment selects.
+
+    ``selected_programs`` is the runner's single filter authority, so the
+    summary below reports the set the guests really ran instead of the size of
+    the whole registry.
+    """
+    programs = abi_selected_programs()
+    return programs, tuple(case for name in programs for case in ABI_PROGRAM_CASES[name])
+
+
+def abi_summary(programs: tuple[str, ...], cases: tuple[str, ...], directory: Path) -> str:
+    label = "PARTIAL " if len(cases) < len(ABI_CONTRACTS) else ""
+    return (f"ABI portable differential: {label}{len(cases)}/{len(ABI_CONTRACTS)} contracts "
+            f"passed on both guests; programs={','.join(programs)}; logs={directory}")
+
+
 def abi_test_cmd(args: argparse.Namespace) -> int:
     if args.accel != "kvm":
         raise ProductError("ABI differential requires --accel kvm")
+    # Resolve THEKERNEL_ABI_PROGRAMS before any build: an invalid filter must
+    # fail without paying for artifacts, and the summary must name exactly the
+    # programs the differential runs.
+    programs, cases = abi_selection()
     artifacts = artifacts_for(args, "shell")
     # --rootfs belongs to the graphics suite. ABI always uses the product
     # shell rootfs, including when test --suite all also exercises graphics.
@@ -1856,8 +1977,9 @@ def abi_test_cmd(args: argparse.Namespace) -> int:
         if args.no_build:
             raise ProductError("--no-build ABI differential requires --linux-kernel")
         completed = subprocess.run(
-            ["bash", str(REPO_ROOT / "scripts/build-linux-oracle.sh"), "--jobs",
-             os.environ.get("CARGO_BUILD_JOBS", "2")],
+            ["bash", str(REPO_ROOT / "scripts/build-linux-oracle.sh"),
+             "--config", str(REPO_ROOT / "config/linux/7.2.3-q35-abi.config"),
+             "--jobs", os.environ.get("CARGO_BUILD_JOBS", "2")],
             cwd=REPO_ROOT, stdout=subprocess.PIPE, text=True, check=False,
         )
         if completed.returncode:
@@ -1886,7 +2008,7 @@ def abi_test_cmd(args: argparse.Namespace) -> int:
             rootfs=rootfs, workdir=output,
             cpus=resolve_run_cpus(args.smp, args.run_cpus), memory=args.memory, timeout=args.timeout,
         ))
-    print(f"ABI portable differential: {len(ABI_CONTRACTS)} contracts passed on both guests; logs={directory}")
+    print(abi_summary(programs, cases, directory))
     return 0
 
 
@@ -1919,8 +2041,9 @@ def bench_cmd(args: argparse.Namespace) -> int:
         if args.no_build:
             raise ProductError("--no-build comparison requires --linux-kernel")
         completed = subprocess.run(
-            ["bash", str(REPO_ROOT / "scripts/build-linux-oracle.sh"), "--jobs",
-             os.environ.get("CARGO_BUILD_JOBS", "2")],
+            ["bash", str(REPO_ROOT / "scripts/build-linux-oracle.sh"),
+             "--config", str(REPO_ROOT / "config/linux/7.2.3-q35-abi.config"),
+             "--jobs", os.environ.get("CARGO_BUILD_JOBS", "2")],
             cwd=REPO_ROOT, capture_output=False, stdout=subprocess.PIPE, text=True,
             check=False,
         )
@@ -1986,6 +2109,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     lint = sub.add_parser("lint", help="run Clippy for the product kernel configuration")
     add_variant_arguments(lint)
+    lint.add_argument("--workspace", action="store_true",
+                      help="escalation, not the gate: lint every workspace member on the host "
+                           "target instead of the four packages the CI gate covers")
+    lint.add_argument("--deny-warnings", action="store_true",
+                      help="escalation, not the gate: promote every warning that survives the "
+                           "in-code allowances to an error.  The tree does not pass this today; "
+                           "no verification tier runs it")
     lint.set_defaults(func=lint_cmd)
 
     clean = sub.add_parser("clean", help="remove generated run, output, and cache directories")

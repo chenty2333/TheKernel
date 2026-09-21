@@ -33,16 +33,52 @@ class Stage:
 def plan(tier: str, state: Path) -> list[Stage]:
     cli = (sys.executable, str(REPO_ROOT / "tools/thekernel.py"))
     if tier == "hardware":
-        return [Stage("cpu-kvm", "test", (*cli, "test", "--suite", "cpu", "--smp", "4", "--accel", "kvm"), 1800)]
+        # KVM is required here and nowhere else, so the full portable ABI
+        # differential (also KVM-only) belongs in this tier rather than daily.
+        # `test --suite abi` runs the static linux-abi gate first and then the
+        # two-guest comparison; its timeout covers a cold Linux oracle build
+        # plus both boots.  verify_cmd strips THEKERNEL_ABI_PROGRAMS for this
+        # tier: a tier run is the whole contract set, while running
+        # `test --suite abi` by hand still honors the reproduction filter.
+        return [
+            Stage("cpu-kvm", "test", (*cli, "test", "--suite", "cpu", "--smp", "4", "--accel", "kvm"), 1800),
+            Stage("abi-kvm", "test", (*cli, "test", "--suite", "abi", "--smp", "4", "--accel", "kvm"), 3600),
+        ]
     stages = [
         Stage("dependency-layers", "static", (sys.executable, "scripts/ci/check_cargo_dependency_layers.py"), 120),
+        # The layer gate can only see edges between cargo packages, so inside
+        # the one `thekernel` crate a subsystem may reach another without a
+        # manifest line changing.  This pins the module-level `use crate::…`
+        # edges to config/kernel-module-edges.toml: a new edge fails, a retired
+        # one is reported, and the widening that would make `kernel/src/drm`
+        # unliftable again cannot happen unnoticed.
+        Stage("kernel-module-edges", "static", (sys.executable, "scripts/ci/check_kernel_module_edges.py"), 120),
         # The contract and dispatch tables are a source of truth only while
         # something enforces them.  `test --suite abi` is run by hand, so until
         # this stage existed no verification tier noticed a cell whose status,
         # handler, test binding or explicit-ENOSYS routing had drifted from the
         # kernel.  `all` also materializes the pinned Linux release, which is
         # the network dependency and the reason for the generous timeout.
-        Stage("linux-abi", "static", (sys.executable, "scripts/ci/linux_abi_gate.py", "all"), 900),
+        # `--final` adds three of the four shrink-only ratchets held in the
+        # registry's [ratchet] table (the fourth is the abi-contracts stage's
+        # `unbound_programs`): every [[contract]] must carry a
+        # `Linux <path>:<line>` citation unless it is in `uncited_contracts`
+        # and must have had its errno ordering compared with Linux unless it is
+        # in `unreviewed_errno_order`, and an `implemented` cell that declares a
+        # validation gap, binds no test, or rests on an unreviewed record must
+        # be in `final_static_allowlist`.  No list may grow, so the ledger
+        # cannot re-declare a claim gap-free without a citation and a registered
+        # differential case behind it.
+        Stage("linux-abi", "static", (sys.executable, "scripts/ci/linux_abi_gate.py", "all", "--final"), 900),
+        # The ABI registry and its guest C sources describe the same
+        # assertion set from two sides; only the KVM tier would otherwise
+        # observe a drift, after a full oracle build and two guest boots.  This
+        # is the runtime half of the split: it proves a ledger `tests` binding
+        # names a program `--suite abi` really boots, which the static gate
+        # checks only for cells that claim verified runtime behavior, and that a
+        # registered program no cell binds is named by the shrink-only
+        # `ratchet.unbound_programs` baseline instead of running unattributed.
+        Stage("abi-contracts", "static", (sys.executable, "scripts/ci/check_abi_contracts.py"), 120),
         Stage("graphics-config-seatd", "static", ("scripts/build-graphics-rootfs.sh", "--flavor", "q35-graphics-seatd", "--check"), 120),
         Stage("graphics-config-desktop", "static", ("scripts/build-graphics-rootfs.sh", "--flavor", "q35-software-desktop", "--check"), 120),
         Stage("host", "test", (*cli, "test", "--suite", "host"), 1800),
@@ -197,6 +233,11 @@ def verify_cmd(args) -> int:
     temporary.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "TMPDIR": str(temporary), "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS") or "2",
            "BR2_JLEVEL": "2"}
+    # The hardware tier runs the full ABI differential.  A caller's
+    # THEKERNEL_ABI_PROGRAMS reproduction filter must not silently narrow a
+    # tier run; running `test --suite abi` directly still honors it.
+    if args.tier == "hardware":
+        env.pop("THEKERNEL_ABI_PROGRAMS", None)
     environment(args.tier, env)
     if args.tier != "hardware":
         whitespace(env)

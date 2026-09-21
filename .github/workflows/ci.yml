@@ -3,7 +3,10 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # `dev` is the integration branch, so it is gated by the same pipeline as
+    # `main`; a branch that only CI runs on pull requests stops being tested
+    # the moment it is merged forward without a PR.
+    branches: [main, dev]
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
@@ -55,10 +58,67 @@ jobs:
       - uses: ./.github/actions/setup-thekernel
       - name: Run repository verification
         run: scripts/dev-shell.sh -- ./tools/thekernel.py verify --tier "$VERIFY_TIER"
+      # Everything a failing guest leaves behind -- `console.log`, `kernel.log`,
+      # `qemu-debug.log`, the fbcon and graphics screenshots -- is written under
+      # the state root (`tools/product_state.py:state_root`), and this job runs
+      # inside the compose container whose state root is the `thekernel-home`
+      # named volume, not the workspace.  `upload-artifact` only sees the
+      # workspace, so the evidence has to be copied out of the volume first.
+      # Only on failure: a green run has nothing here worth keeping.
+      - name: Collect failed run evidence from the container cache
+        if: failure()
+        run: |
+          volume=$(docker volume ls \
+            --filter 'label=com.docker.compose.project=thekernel-dev' \
+            --filter 'label=com.docker.compose.volume=thekernel-home' \
+            --format '{{.Name}}' | head -n1)
+          if [ -z "$volume" ]; then
+            echo 'evidence: no container cache volume; the run failed before booting'
+            exit 0
+          fi
+          mkdir -p ci-evidence
+          docker run --rm \
+            -v "$volume:/state:ro" \
+            -v "$PWD/ci-evidence:/evidence:z" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            --user root --entrypoint bash \
+            "${THEKERNEL_DEV_IMAGE:-thekernel-dev:local}" \
+            -c 'set -eu
+              # The volume is the container HOME (`dev-env/compose.yaml` mounts
+              # `thekernel-home` at /home/thekernel, `dev-env/Dockerfile:146`
+              # sets it), and the state root below HOME is where every run
+              # directory lives.
+              state=/state/.cache/thekernel-targets
+              dirs=()
+              for name in runs verify-fbcon verify-graphics; do
+                if [ -d "$state/$name" ]; then
+                  dirs+=("$name")
+                fi
+              done
+              if [ "${#dirs[@]}" -eq 0 ]; then
+                echo "evidence: cache volume holds no run directories"
+                exit 0
+              fi
+              # OVMF variable stores and QMP sockets are not evidence, and a
+              # socket cannot be archived.
+              tar -C "$state" --exclude=firmware --exclude="*.sock" -cf - "${dirs[@]}" | tar -xf - -C /evidence
+              chown -R "$HOST_UID:$HOST_GID" /evidence'
+      - name: Upload failed run evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verify-evidence-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ci-evidence
+          if-no-files-found: ignore
+          retention-days: 14
 
   hardware-availability:
     name: Hardware runner availability
-    if: github.event_name == 'workflow_dispatch' && inputs.tier == 'hardware'
+    # The nightly schedule is what puts the portable Linux ABI differential
+    # (`test --suite abi`, KVM-only) in front of anyone without a laptop open:
+    # the `verify` job's `full` tier has no guest-ABI stage, so without this
+    # second trigger the ABI guests only ever ran when somebody dispatched them.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'hardware')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -73,14 +133,19 @@ jobs:
           # Runner inventory requires repository Administration:read. The
           # standard workflow token may not have it; fail visibly in that case.
           GH_TOKEN: ${{ secrets.THEKERNEL_RUNNER_READ_TOKEN || github.token }}
+          # On the schedule the runner is opportunistic -- a missing or
+          # unreadable KVM pool at 03:17 must skip the lane, not redden the
+          # night.  An explicit `tier=hardware` dispatch asked for that
+          # evidence, so its absence stays an error.
+          THEKERNEL_HARDWARE_OPTIONAL: ${{ github.event_name == 'schedule' && '1' || '0' }}
         run: python3 scripts/ci/check_hardware_runner.py
 
   hardware:
-    name: Explicit CPU KVM verification
+    name: Explicit CPU and Linux ABI KVM verification
     needs: hardware-availability
     if: needs.hardware-availability.outputs.available == 'true'
     runs-on: [self-hosted, linux, x64, thekernel-kvm]
-    timeout-minutes: 45
+    timeout-minutes: 105
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -91,3 +156,40 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           ./tools/thekernel.py verify --tier hardware
+      # This job boots guests, so it is the one whose failure an operator has to
+      # read.  The state root stays where it is -- redirecting it would throw
+      # away the warm toolchain/Linux-oracle cache that keeps the KVM stages
+      # inside their budget -- so the run directories are copied into the
+      # workspace, which is the only place `upload-artifact` can read from.
+      - name: Collect failed run evidence
+        if: failure()
+        run: |
+          state="${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}"
+          rm -rf ci-evidence
+          mkdir -p ci-evidence
+          found=0
+          for name in runs verify-fbcon verify-graphics; do
+            if [ -d "$state/$name" ]; then
+              cp -a "$state/$name" "ci-evidence/$name"
+              found=1
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "evidence: $state holds no run directories"
+            exit 0
+          fi
+          find ci-evidence -name '*.sock' -delete
+          du -sh ci-evidence
+      - name: Upload failed run evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hardware-evidence-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ci-evidence
+          if-no-files-found: ignore
+          retention-days: 14
+      # The runner's workspace survives the job, so an untracked directory left
+      # here would be part of the next run's checkout.
+      - name: Discard the local evidence copy
+        if: always()
+        run: rm -rf ci-evidence

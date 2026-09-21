@@ -17,6 +17,16 @@ GraphicsProfile = str
 
 INTENTIONAL_STOP_RETURN_CODE = 75
 
+# A guest that crashed is reported with its own exit code so a crash can never
+# be read as the timeout it would otherwise have become.  124 is the watchdog's;
+# 70 is `EX_SOFTWARE` and names the class the operator has to look at: the
+# kernel under test died, and the tail of the log explains where.
+KERNEL_CRASH_RETURN_CODE = 70
+
+# `runner_termination_reason` for the same verdict.  A caller that already
+# distinguishes "case-timeout" from "total-timeout" can distinguish this.
+KERNEL_CRASH_TERMINATION_REASON = "kernel-crash"
+
 
 @dataclass(frozen=True)
 class Drive:
@@ -40,10 +50,23 @@ class Interaction:
     interactive: bool = False
     input_after_marker: str | None = None
     stop_after_marker: str | None = None
-    # Configured protocol names; match a complete prefix token boundary.
+    # Configured protocol names; match a complete prefix token boundary.  These
+    # stay literal by choice: the alternative the review asked for -- per-suite
+    # regexes -- is a second, unanchored way to decide that a guest died, and
+    # anchoring is the delicate part (`_KERNEL_CRASH_RE` matches at line start
+    # so a guest that only *quotes* a crash keeps its own verdict).  Nothing
+    # here compiles a caller-supplied pattern.
     failure_prefixes: tuple[str, ...] = ()
     # Command-file input: one newline-terminated command per exact prompt.
     input_line_after_marker: str | None = None
+    # Report a kernel crash as a crash instead of as a stall.  On by default:
+    # every pattern the runner matches (`_KERNEL_CRASH_RE`) is a string a kernel
+    # prints only when it has already given up, so no healthy guest produces it,
+    # and the lanes that boot a guest -- the system-test suite, the ABI
+    # differential's Linux target, the firmware-fbcon acceptance -- all want the
+    # early verdict.  It is an opt-out rather than an opt-in because a lane that
+    # has to remember to state it is a lane that can forget to.
+    detect_kernel_crash: bool = True
 
 
 @dataclass(frozen=True)
