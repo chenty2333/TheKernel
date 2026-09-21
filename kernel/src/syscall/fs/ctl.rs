@@ -2584,9 +2584,17 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
+/// `SYSCALL_DEFINE0(sync)` is `ksys_sync(); return 0;` (`fs/sync.c`): sync(2)
+/// cannot fail, and writeback errors are reported to `fsync`/`syncfs` callers
+/// through their errseq cursors instead.  `reboot(2)` relies on that -- it
+/// syncs before powering off, and a sync error must not turn `poweroff -f` into
+/// a failed syscall and an init that exits into the fail-closed exit path.
 pub fn sys_sync() -> AxResult<isize> {
     let mount = current_fs_context().lock().root_dir().mountpoint().clone();
-    mount.flush_all_filesystems()?;
+    if let Err(error) = mount.flush_all_filesystems() {
+        // Any unprivileged loop can call sync(2), so this is the debug band.
+        debug!("\x014sync: flushing filesystems failed: {error:?}");
+    }
     Ok(0)
 }
 
