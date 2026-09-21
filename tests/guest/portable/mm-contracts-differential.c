@@ -63,6 +63,9 @@ struct cap_data { uint32_t effective, permitted, inheritable; };
 #ifndef MADV_GUARD_INSTALL
 #define MADV_GUARD_INSTALL 102
 #endif
+#ifndef MADV_GUARD_REMOVE
+#define MADV_GUARD_REMOVE 103
+#endif
 #ifndef MADV_DODUMP
 #define MADV_DODUMP 17
 #endif
