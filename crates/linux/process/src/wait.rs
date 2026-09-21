@@ -45,7 +45,7 @@ pub struct WaitEventState {
     /// `wait_consider_task()`'s per-child `ptrace` argument for `stopped`: this
     /// caller is the child's ptracer, or is treated as one because the tracee
     /// is traced from its own thread group (`if (!ptrace_reparented(p))
-    /// ptrace = 1;`, `kernel/exit.c:1522-1523`). `wait_task_stopped()` reports
+    /// ptrace = 1;`, `kernel/exit.c:1527-1528`). `wait_task_stopped()` reports
     /// such a stop regardless of `WUNTRACED`:
     ///
     /// ```c

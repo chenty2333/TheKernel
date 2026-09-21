@@ -91,6 +91,11 @@ pub enum ProcessError {
     Busy,
     /// The domain does not yet have an init process.
     NotInitialized,
+    /// Linux `-EPERM` from the job-control syscalls: `setsid()` refused a
+    /// session leader or a process-group leader (`kernel/sys.c:1277-1284`,
+    /// `ksys_setsid()`), or `setpgid()` refused a session leader
+    /// (`kernel/sys.c:1157-1159`).
+    OperationNotPermitted,
 }
 
 impl fmt::Display for ProcessError {
@@ -104,6 +109,7 @@ impl fmt::Display for ProcessError {
             Self::NotLive => f.write_str("process is no longer live"),
             Self::Busy => f.write_str("process lifecycle transition is busy"),
             Self::NotInitialized => f.write_str("process domain has no init process"),
+            Self::OperationNotPermitted => f.write_str("operation is not permitted"),
         }
     }
 }
@@ -1203,6 +1209,14 @@ impl<Z> ProcessDomain<Z> {
     }
 
     /// Creates a new session/group identity and moves `process` into it.
+    ///
+    /// This is the core of Linux `setsid()`. As in `ksys_setsid()`
+    /// (`kernel/sys.c:1268`), the call is refused with
+    /// [`ProcessError::OperationNotPermitted`] when `process` is already a
+    /// session leader (`kernel/sys.c:1277-1279`) and when a process-group
+    /// identity equal to the proposed session id exists, i.e. `process`
+    /// leads its own group (`kernel/sys.c:1281-1284`). Both conditions
+    /// answer `-EPERM` in Linux, so neither is a `None` no-op.
     pub fn try_create_session(
         &self,
         process: &Arc<Process<Z>>,
@@ -1212,8 +1226,14 @@ impl<Z> ProcessDomain<Z> {
             return Err(ProcessError::NotLive);
         }
         let old_group = process.group();
+        // kernel/sys.c:1277-1279: "Fail if I am already a session leader".
         if old_group.session.sid() == process.pid {
-            return Ok(None);
+            return Err(ProcessError::OperationNotPermitted);
+        }
+        // kernel/sys.c:1281-1284: fail when a process group whose pgid
+        // equals the proposed session id (the caller's pid) exists.
+        if old_group.pgid() == process.pid {
+            return Err(ProcessError::OperationNotPermitted);
         }
         let session = Session::try_new(process.pid, &self.registry)?;
         let group = ProcessGroup::try_new(process.pid, &session)?;
@@ -1228,11 +1248,14 @@ impl<Z> ProcessDomain<Z> {
             drop(admission);
             return Err(ProcessError::NotLive);
         }
+        // A racing winner on the same process leaves it a session leader,
+        // which `ksys_setsid()` answers with `-EPERM` just like the
+        // leader check above (kernel/sys.c:1277-1279).
         if process.group().session.sid() == process.pid {
             drop(topology);
             self.registry.release_group_member(&group);
             drop(admission);
-            return Ok(None);
+            return Err(ProcessError::OperationNotPermitted);
         }
         let previous = process.replace_group(group.clone());
         admission.commit();
@@ -1241,7 +1264,15 @@ impl<Z> ProcessDomain<Z> {
         Ok(Some((session, group)))
     }
 
-    /// Creates a unique group in the current session and moves `process` into it.
+    /// Creates a unique group in the current session and moves `process`
+    /// into it.
+    ///
+    /// This is the core of Linux `setpgid()` with `pgid == pid`. As in
+    /// `SYSCALL_DEFINE2(setpgid)` (`kernel/sys.c:1157-1159`), a session
+    /// leader is refused with [`ProcessError::OperationNotPermitted`].
+    /// Re-entering the group `process` already leads is the successful
+    /// no-op of `task_pgrp(p) == pgrp` (`kernel/sys.c:1175`), reported as
+    /// `Ok(None)`.
     pub fn try_create_group(
         &self,
         process: &Arc<Process<Z>>,
@@ -1251,6 +1282,10 @@ impl<Z> ProcessDomain<Z> {
             return Err(ProcessError::NotLive);
         }
         let old_group = process.group();
+        // kernel/sys.c:1157-1159: `err = -EPERM; if (p->signal->leader)`.
+        if old_group.session.sid() == process.pid {
+            return Err(ProcessError::OperationNotPermitted);
+        }
         if old_group.pgid() == process.pid {
             return Ok(None);
         }
@@ -2946,5 +2981,85 @@ mod tests {
         assert!(Arc::ptr_eq(&scoped_child.parent().unwrap(), &scoped_init));
         assert!(Arc::ptr_eq(&scoped_init.parent().unwrap(), &root));
         assert!(Arc::ptr_eq(&root_child.parent().unwrap(), &root));
+    }
+
+    fn fork_live_child(domain: &ProcessDomain<()>, pid: Pid) -> Arc<Process<()>> {
+        // Each caller owns a fresh domain, so pid 1 is not initialized yet.
+        let init = domain.try_new_init(1, None).unwrap();
+        domain
+            .prepare_fork(&init, pid, None)
+            .unwrap()
+            .prepare_initial_thread(pid)
+            .unwrap()
+            .commit()
+    }
+
+    /// `setsid()` answers `-EPERM` to a session leader
+    /// (`kernel/sys.c:1277-1279`, `ksys_setsid()`).
+    #[test]
+    fn setsid_rejects_a_session_leader() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let init = domain.try_new_init(1, None).unwrap();
+        domain.prepare_thread(&init, 1).unwrap().commit().unwrap();
+        assert_eq!(init.group().session.sid(), init.pid());
+        assert_eq!(
+            domain.try_create_session(&init).err(),
+            Some(ProcessError::OperationNotPermitted)
+        );
+    }
+
+    /// `setsid()` answers `-EPERM` when a process group with the proposed
+    /// session id exists, i.e. the caller leads its own group
+    /// (`kernel/sys.c:1281-1284`, `ksys_setsid()`).
+    #[test]
+    fn setsid_rejects_a_process_group_leader() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let child = fork_live_child(&domain, 2);
+        assert_ne!(child.group().pgid(), child.pid());
+        domain.try_create_group(&child).unwrap().unwrap();
+        assert_eq!(child.group().pgid(), child.pid());
+        assert_eq!(
+            domain.try_create_session(&child).err(),
+            Some(ProcessError::OperationNotPermitted)
+        );
+    }
+
+    /// `setpgid()` answers `-EPERM` to a session leader
+    /// (`kernel/sys.c:1157-1159`).
+    #[test]
+    fn setpgid_rejects_a_session_leader() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let init = domain.try_new_init(1, None).unwrap();
+        domain.prepare_thread(&init, 1).unwrap().commit().unwrap();
+        assert_eq!(
+            domain.try_create_group(&init).err(),
+            Some(ProcessError::OperationNotPermitted)
+        );
+    }
+
+    /// Re-requesting the group the process already leads is the successful
+    /// no-op of `task_pgrp(p) == pgrp` (`kernel/sys.c:1175`).
+    #[test]
+    fn setpgid_is_a_noop_for_an_existing_group_leader() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let child = fork_live_child(&domain, 2);
+        let group = domain.try_create_group(&child).unwrap().unwrap();
+        assert!(domain.try_create_group(&child).unwrap().is_none());
+        assert!(Arc::ptr_eq(&child.group(), &group));
+    }
+
+    /// An ordinary process (neither session leader nor group leader)
+    /// creates a session named after its pid, like `ksys_setsid()`
+    /// (`kernel/sys.c:1287-1288`).
+    #[test]
+    fn setsid_creates_a_session_for_an_ordinary_process() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let child = fork_live_child(&domain, 2);
+        let (session, group) = domain.try_create_session(&child).unwrap().unwrap();
+        assert_eq!(session.sid(), 2);
+        assert_eq!(group.pgid(), 2);
+        assert!(Arc::ptr_eq(&group.session(), &session));
+        assert!(Arc::ptr_eq(&child.group(), &group));
+        assert!(session.is_live() && group.is_live());
     }
 }
