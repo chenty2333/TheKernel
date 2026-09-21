@@ -19,3 +19,6 @@ virtio-drivers = { package = "tk-virtio-drivers", path = "../tk-virtio-drivers",
 
 [package.metadata.thekernel]
 layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true

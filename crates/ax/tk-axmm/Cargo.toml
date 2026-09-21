@@ -30,3 +30,6 @@ page_table_multiarch = { package = "tk-page-table-multiarch", path = "../tk-page
 
 [package.metadata.thekernel]
 layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true

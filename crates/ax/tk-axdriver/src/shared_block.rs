@@ -4375,7 +4375,15 @@ mod tests {
         let contents = (0..bytes)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        let device = SharedBlockDevice::new(RamDisk::from(contents.as_slice()));
+        // `SharedBlockDevice::new` takes the unified `AxBlockDevice` enum, not
+        // a bare driver.  Under `block_dev = "ramdisk"` the registered static
+        // driver *is* `RamDisk`, so it wraps straight into `Existing`.  This
+        // module had drifted out of compilation, so the change that introduced
+        // the enum never had to update it.
+        let device =
+            SharedBlockDevice::new(crate::structs::StaticBlockDevice::Existing(RamDisk::from(
+                contents.as_slice(),
+            )));
         (device, contents)
     }
 

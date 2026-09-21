@@ -62,3 +62,10 @@ version = "2.3"
 
 [package.metadata.thekernel]
 layer = "platform"
+
+# All 10 unit tests live in `src/mutex.rs`, which is behind `multitask`;
+# with the default (empty) feature set `Mutex` is a `kspin` alias and the
+# module is not compiled, so none of them ran.
+[package.metadata.thekernel.host-test]
+selected = true
+features = ["multitask"]

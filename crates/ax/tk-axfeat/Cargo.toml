@@ -163,3 +163,6 @@ kspin = { version = "0.1", optional = true }
 
 [package.metadata.thekernel]
 layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true

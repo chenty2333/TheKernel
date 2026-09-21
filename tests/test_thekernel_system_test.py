@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 from tests.support import test_tmpdir
+from tools.qemu_runner.abi_differential import CONTRACTS
 import tomllib
 import unittest
 from unittest.mock import patch
@@ -320,6 +321,25 @@ class SystemTestGateTests(unittest.TestCase):
         self.assertNotIn(b"ld-linux-x86-64.so.2\x00", loader.read_bytes()[:4096],
                          "the staged loader looks like it has its own PT_INTERP")
 
+    def test_staged_gcc_payload_satisfies_its_interface(self) -> None:
+        """The gcc payload must stage the compiler driver and lib64 runtime."""
+        root = Path(os.environ.get(
+            "THEKERNEL_STATE_DIR",
+            Path.home() / ".cache" / "thekernel-targets",
+        ))
+        tools = root / "guest-tools" / "gcc"
+        driver = tools / "opt/thekernel-tools/bin/gcc"
+        smoke = tools / "opt/thekernel-tools/bin/gcc-smoke"
+        loader = tools / "lib64" / "ld-linux-x86-64.so.2"
+        if not driver.is_file():
+            self.skipTest(f"no staged gcc payload at {tools}")
+
+        self.assertTrue(smoke.is_file(), "gcc-smoke binary missing")
+        self.assertTrue(loader.is_file(), "dynamic loader missing in gcc payload")
+        header = driver.read_bytes()[:64]
+        self.assertEqual(header[:4], b"\x7fELF")
+        self.assertEqual(header[4], 2, "the gcc driver must be ELF64")
+
     def test_image_reuse_follows_the_payload_it_embeds(self) -> None:
         """A rebuilt payload must invalidate the image built from it.
 
@@ -574,7 +594,8 @@ class SystemTestGateTests(unittest.TestCase):
         metadata = {"packages": [
             {"name": "mechanism-example", "metadata": {"thekernel": {"layer": "mechanism"}}},
             {"name": "linux-example", "metadata": {"thekernel": {"layer": "linux_abi"}}},
-            {"name": "platform-example", "metadata": {"thekernel": {"layer": "platform"}}},
+            {"name": "platform-example", "metadata": {"thekernel": {"layer": "platform",
+                "host-test": {"selected": False}}}},
             {"name": "tk-axtask", "metadata": {"thekernel": {"layer": "platform",
                 "host-test": {"selected": True, "features": ["test", "sched-eevdf"], "all-targets": True}}}},
         ]}
@@ -617,6 +638,75 @@ class SystemTestGateTests(unittest.TestCase):
         self.assertEqual(product.component_host_test_command(package), [
             "cargo", "test", "--locked", "-p", "allocator", "--features", "full",
             "--no-default-features", "--target", "x86_64-unknown-linux-gnu"])
+
+    def test_component_host_test_percpu_linker_is_opt_in(self) -> None:
+        product = load_product()
+        from types import SimpleNamespace
+        metadata = {"packages": [
+            {"name": "plain-example", "metadata": {"thekernel": {"host-test": {"selected": True}}}},
+            {"name": "percpu-example", "metadata": {"thekernel": {"host-test": {
+                "selected": True, "percpu-linker": True}}}},
+        ]}
+        # Snapshot each invocation's flags at call time: the kernel test that
+        # follows reuses and mutates the shared component environment.
+        seen = {}
+        def record(command, env):
+            if command[:3] == ["cargo", "test", "--locked"]:
+                seen[command[4]] = env.get("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS")
+        with test_tmpdir() as directory, patch.dict(os.environ, {"THEKERNEL_STATE_DIR": directory}), \
+                patch.object(product.subprocess, "run", return_value=SimpleNamespace(
+                    returncode=0, stdout=product.json.dumps(metadata))), \
+                patch.object(product, "run_checked", side_effect=record):
+            self.assertEqual(product.host_test_cmd(), 0)
+        self.assertIsNone(seen["plain-example"])
+        self.assertIn("percpu.x", seen["percpu-example"])
+
+    def test_abi_summary_labels_a_narrowed_program_selection(self) -> None:
+        product = load_product()
+        with patch.dict(os.environ, {"THEKERNEL_ABI_PROGRAMS": "wait-abi"}):
+            programs, cases = product.abi_selection()
+            summary = product.abi_summary(programs, cases, Path("/logs/abi-run"))
+        self.assertEqual(programs, ("wait-abi",))
+        self.assertEqual(len(cases), 21)
+        self.assertIn(f"PARTIAL 21/{len(CONTRACTS)}", summary)
+        self.assertIn("programs=wait-abi", summary)
+
+    def test_abi_summary_keeps_the_full_registry_unlabelled(self) -> None:
+        product = load_product()
+        with patch.dict(os.environ, {}, clear=True):
+            programs, cases = product.abi_selection()
+        self.assertEqual(len(cases), len(product.ABI_CONTRACTS))
+        self.assertNotIn("PARTIAL", product.abi_summary(programs, cases, Path("/logs/abi-run")))
+
+    def test_abi_test_cmd_reports_only_the_filtered_programs(self) -> None:
+        product = load_product()
+        from contextlib import nullcontext, redirect_stdout
+        from io import StringIO
+        from types import SimpleNamespace
+        with test_tmpdir() as directory, \
+                patch.dict(os.environ, {"THEKERNEL_ABI_PROGRAMS": "wait-abi"}), \
+                patch.object(product, "state_root", return_value=Path(directory)), \
+                patch.object(product, "artifacts_for", return_value=SimpleNamespace(
+                    rootfs=Path(directory) / "rootfs.ext2",
+                    kernel=Path(directory) / "kernel",
+                    drive_esp=Path(directory) / "boot.esp")), \
+                patch.object(product, "validate_artifact_config"), \
+                patch.object(product, "state_lock", return_value=nullcontext()), \
+                patch.object(product, "run_abi_differential", return_value=Path(directory) / "abi-run") as differential:
+            kernel = Path(directory) / "bzImage"
+            kernel.write_bytes(b"oracle")
+            linux_esp = Path(directory) / "out/linux-7.2.3/abi.esp"
+            linux_esp.parent.mkdir(parents=True)
+            linux_esp.write_bytes(b"esp")
+            args = product.build_parser().parse_args(
+                ["test", "--suite", "abi", "--accel", "kvm", "--no-build",
+                 "--linux-kernel", str(kernel), "--workdir", str(Path(directory) / "runs"), "--smp", "4"])
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(product.abi_test_cmd(args), 0)
+        self.assertEqual(differential.call_count, 1)
+        self.assertIn(f"PARTIAL 21/{len(CONTRACTS)}", stdout.getvalue())
+        self.assertIn("programs=wait-abi", stdout.getvalue())
 
     def test_product_state_defaults_to_the_host_cache(self) -> None:
         product = load_product()

@@ -819,7 +819,23 @@ mod tests {
             .fold(0, |mask, reason| mask | reason.bit());
         super::visit_pending_reasons(all, |reason| visited.push(reason)).unwrap();
         assert_eq!(visited, super::IpiReason::ALL);
-        assert_eq!(super::visit_pending_reasons(1 << 7, |_| {}), Err(1 << 7));
+
+        // The rejection probe must be derived from the live reason set, not
+        // hard-coded.  `IpiReason` grew to eight lanes and now saturates the
+        // `u8` pending mask, at which point a fixed `1 << 7` probe silently
+        // became `PerfReconcile` -- a *known* bit -- and asserted the wrong
+        // thing.  Pick the lowest genuinely unassigned bit instead, and when
+        // the mask is saturated assert that saturation explicitly so this
+        // test resumes probing the moment a lane is retired.
+        match (0..u8::BITS).map(|bit| 1u8 << bit).find(|bit| all & bit == 0) {
+            Some(unknown) => {
+                assert_eq!(super::visit_pending_reasons(unknown, |_| {}), Err(unknown));
+            }
+            None => {
+                assert_eq!(all, u8::MAX);
+                assert_eq!(super::IpiReason::ALL.len(), u8::BITS as usize);
+            }
+        }
     }
 
     #[cfg(feature = "ipi")]

@@ -134,3 +134,11 @@ default-features = false
 
 [package.metadata.thekernel]
 layer = "platform"
+
+# `pci_irq.rs`, `net.rs` and `blk.rs` are each behind their transport
+# feature, so only the 2 ungated `lib.rs` tests were compiled.  All three
+# modules test pure descriptor/queue logic over in-memory state; nothing here
+# touches real virtio MMIO.
+[package.metadata.thekernel.host-test]
+selected = true
+features = ["block", "irq", "net"]

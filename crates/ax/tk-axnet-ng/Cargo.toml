@@ -147,3 +147,10 @@ features = ["smp"]
 
 [package.metadata.thekernel]
 layer = "platform"
+
+# tcp.rs unit tests reference the per-CPU accessors through axtask, so the host
+# test binary needs the same percpu linker image the kernel host tests use;
+# without it the link fails on undefined `_percpu_start`.
+[package.metadata.thekernel.host-test]
+selected = true
+percpu-linker = true

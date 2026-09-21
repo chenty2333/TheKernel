@@ -7549,7 +7549,13 @@ mod tests {
         assert_eq!(&xdr.0[40..44], &2u32.to_be_bytes());
         assert_eq!(&xdr.0[44..52], &[0x5a; 8]);
         assert_eq!(&xdr.0[52..56], &0u32.to_be_bytes());
-        assert_eq!(xdr.0.len(), 60);
+        // The trailing component name is an XDR variable-length opaque, so it
+        // costs 4 (length) + 3 ("new") + 1 (pad to a 4-byte boundary, RFC 4506
+        // 4.10) = 8 bytes, not 7.  The old expectation of 60 dropped the pad
+        // byte; this module had drifted out of compilation so it never failed.
+        assert_eq!(xdr.0.len(), 64);
+        assert_eq!(&xdr.0[56..60], &3u32.to_be_bytes());
+        assert_eq!(&xdr.0[60..64], b"new\0");
     }
 
     #[test]

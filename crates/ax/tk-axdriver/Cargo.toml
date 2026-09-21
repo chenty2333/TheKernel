@@ -296,3 +296,15 @@ optional = true
 [dependencies.kernel_guard]
 version = "0.1"
 optional = true
+
+# `usb-xhci` compiles the USB sync/storage/HID tests, and `ramdisk` +
+# `shared-block` compiles `shared_block.rs` -- its 26 tests are gated on
+# `block_dev = "ramdisk"`, a cfg `build.rs` only emits when a block-device
+# feature is selected.  The shared-block test binary reaches the per-CPU
+# accessors through axtask, so it needs the percpu linker image.
+[package.metadata.thekernel.host-test]
+selected = true
+percpu-linker = true
+# `virtio-input` is only here to make `build.rs` emit
+# `input_dev = "virtio-input"`, which one `bus/pci.rs` test is gated on.
+features = ["usb-xhci", "ramdisk", "shared-block", "virtio-input"]

@@ -72,11 +72,6 @@ sched-eevdf = ["multitask", "preempt"]
 idle-steal = ["smp", "sched-eevdf"]
 # Experimental wake placement; disabled unless the M5 variant requests it.
 sched-wake-locality = ["idle-steal"]
-# EEVDF profiles are compile-time selections. `sched-eevdf` without one of
-# these features is the balanced profile for a reproducible default build.
-eevdf-balanced = ["sched-eevdf", "axsched/eevdf-balanced"]
-eevdf-latency = ["sched-eevdf", "axsched/eevdf-latency"]
-eevdf-throughput = ["sched-eevdf", "axsched/eevdf-throughput"]
 test = ["percpu?/sp-naive"]
 
 [dependencies]

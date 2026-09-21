@@ -35,7 +35,6 @@ nfs41 = []
 overlay = []
 xfs = []
 std = ["lwext4_rust?/std"]
-test-io-control = []
 test-ramdisk = ["axdriver/ramdisk"]
 task-io-accounting = ["dep:crate_interface"]
 times = []
@@ -186,3 +185,15 @@ features = ["test"]
 
 [package.metadata.thekernel]
 layer = "platform"
+
+# Every filesystem backend is behind its own feature, so `fs/*` compiled no
+# tests at all by default (and four `ext4`-gated tests inside
+# `highlevel/file.rs` were skipped too).  `std` is what lets `lwext4_rust`
+# build against the host C library.
+#
+# `fat` is deliberately absent: the `fat` backend does not currently compile
+# at all (`FatFilesystem::new` no longer exists), which is a library break
+# rather than a test gate, so its 2 tests stay excluded until that is fixed.
+[package.metadata.thekernel.host-test]
+selected = true
+features = ["btrfs", "ext4", "nfs41", "overlay", "std", "test-ramdisk", "xfs"]

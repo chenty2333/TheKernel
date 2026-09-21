@@ -16,3 +16,6 @@ log = "0.4"
 
 [package.metadata.thekernel]
 layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true

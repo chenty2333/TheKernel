@@ -2384,7 +2384,10 @@ mod tests {
             PhysicalIoSegment::new(0x30_000, 64 * 1024),
             PhysicalIoSegment::new(0x40_000, 64 * 1024),
             PhysicalIoSegment::new(0x50_000, 64 * 1024 - 512),
-            PhysicalIoSegment::new(0x5f_c00, 512),
+            // 0x50_000 + (64 KiB - 512) == 0x5f_e00.  The old 0x5f_c00 made
+            // this segment overlap its predecessor instead of abutting it, so
+            // the run was not coalescable and the helper returned `None`.
+            PhysicalIoSegment::new(0x5f_e00, 512),
         ];
         let (_, count, total) = to_lwext4_physical_segments(&segments).unwrap();
         assert_eq!(count, 1);

@@ -20,11 +20,6 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# EEVDF tuning is selected at compile time.  With no profile feature the
-# balanced profile is selected, preserving the historical constants.
-eevdf-balanced = []
-eevdf-latency = []
-eevdf-throughput = []
 # Test-only synchronization for callers that exercise the process-global RR
 # quantum. Kept opt-in so production users do not acquire a test API.
 test-utils = []
