@@ -3337,14 +3337,6 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
             .ok_or(VfsError::InvalidInput)
     }
 
-    fn write_proc_u64(data: &[u8]) -> VfsResult<u64> {
-        str::from_utf8(data)
-            .ok()
-            .map(str::trim)
-            .and_then(|it| it.parse::<u64>().ok())
-            .ok_or(VfsError::InvalidInput)
-    }
-
     fn write_proc_usize(data: &[u8]) -> VfsResult<usize> {
         str::from_utf8(data)
             .ok()
@@ -3945,56 +3937,6 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                             // console that shows nothing, and anything above the
                             // highest priority shows everything.
                             axruntime::klog::set_console_loglevel(loglevel);
-                            Ok(None)
-                        }
-                    }),
-                ),
-            );
-            kernel.add(
-                "printk_ratelimit_ms",
-                SimpleFile::new_regular_with_permission(
-                    fs.clone(),
-                    NodePermission::from_bits_truncate(0o644),
-                    RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => Ok(Some(format!(
-                            "{}\n",
-                            axruntime::klog::ratelimit_interval_ms()
-                        )
-                        .into_bytes())),
-                        SimpleFileOperation::Write(data) => {
-                            proc_write_needs_cap_syslog()?;
-                            if is_proc_truncate_write(data) {
-                                return Ok(None);
-                            }
-                            // Linux's `printk_ratelimit` counts in jiffies; this
-                            // kernel's clock says milliseconds and the file says
-                            // so in its name rather than making a reader guess
-                            // what `HZ` a hobby kernel has.
-                            let value = write_proc_u64(data)?;
-                            axruntime::klog::set_ratelimit_interval_ms(value);
-                            Ok(None)
-                        }
-                    }),
-                ),
-            );
-            kernel.add(
-                "printk_ratelimit_burst",
-                SimpleFile::new_regular_with_permission(
-                    fs.clone(),
-                    NodePermission::from_bits_truncate(0o644),
-                    RwFile::new(move |req| match req {
-                        SimpleFileOperation::Read => Ok(Some(format!(
-                            "{}\n",
-                            axruntime::klog::ratelimit_burst()
-                        )
-                        .into_bytes())),
-                        SimpleFileOperation::Write(data) => {
-                            proc_write_needs_cap_syslog()?;
-                            if is_proc_truncate_write(data) {
-                                return Ok(None);
-                            }
-                            let value = write_proc_u32(data)?;
-                            axruntime::klog::set_ratelimit_burst(value);
                             Ok(None)
                         }
                     }),

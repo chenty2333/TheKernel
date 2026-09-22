@@ -23,7 +23,7 @@ One producer path and four readers, all in `crates/ax/tk-axruntime/src/klog.rs`:
 | `STORE` ring | `CAPACITY` = 256 KiB of record text, byte-addressed, wrapping, and a mark byte beside every text byte (§3), so the structure is twice `CAPACITY` and lives in `.data`. `oldest`/`end` are byte cursors; `retention_bytes_overwritten` in `/proc/sys/kernel/log_stats` reports `oldest`, i.e. how much text the ring has dropped off its front. A measured boot writes about 25 KiB of that, so ten boots fit before the front is overwritten. |
 | `Text` | One formatted record, at most `RECORD_BYTES` = 1024 bytes, always newline-terminated. The terminating newline is not the record delimiter, and the text inside one may contain newlines of its own (§6). A longer record is cut and marked ` [truncated]`, counted as `records_truncated`. |
 | consoles | Two, each a `Console`: the serial port the boot probe selected, and the framebuffer screen once it installs. What is per-console is existence (`supported`), a reader that has retired, and the `secured`/`lost` pair -- so the ring counts a lost record per console. What is not is the level: `console_loglevel` is one number every console compares against, exactly as in Linux, and `quiet`/`debug`/`loglevel=N`/`dmesg -n`/`/proc/sys/kernel/printk` all move that one. A record's `<N>` leader and its mark carry the same 3-bit priority; the consoles compare against the priority, never against the text. |
-| producers | `Logger::log`, `diagnostic()`/`diagnostic_at()` and `record()` (the `ax_print` path). A per-CPU bit (`PRODUCING`) keeps a CPU from re-entering the path. `Logger::log` is the only producer that consults the capture filter and the rate limits; a boot diagnostic is never suppressed. |
+| producers | `Logger::log`, `diagnostic()`/`diagnostic_at()` and `record()` (the `ax_print` path). A per-CPU bit (`PRODUCING`) keeps a CPU from re-entering the path. `Logger::log` is the only producer that consults the capture filter; a boot diagnostic is never suppressed. |
 | readers | `snapshot_into` / `available_from` for `syslog(2)`, the early boot screen (`try_snapshot_into`, which refuses rather than waits so a panic cannot hang), and the two consoles through `ConsoleDrain::{new, drain_with}` -- `drain_serial_once` for the UART. The byte-stream readers show the ring as kept; only a `ConsoleDrain` applies a level, because skipping a record needs the mark, not the text. |
 
 The ring is the log.  `kernel.log` on the host is the **serial console**
@@ -32,7 +32,7 @@ the UART.  That distinction is what the original symptom was hiding in.
 
 Two decisions, deliberately different in strength: **retention** is
 unconditional for `error`/`warn`/`info` and capped per target only in the
-`debug` band (and capped per call site and globally there, by the rate limits);
+`debug` band;
 **printing** is each console's level, decided from the record's priority when
 the console reads it.  A console that is quiet, muted, or behind loses nothing
 unless the ring itself wraps over what it had not secured.
@@ -158,11 +158,9 @@ refuse.
 * **A second nested record in one window.**  One slot per CPU; the second is
   refused and counted.  This needs two records produced on one CPU while a
   third is inside the producer path.
-* **A rate-limited record.**  Only the `debug` band is limited, and what a
-  closed window refused is announced by the record that reopens it and counted
-  in `messages_suppressed`, so a suppression is distinguishable from a kernel
-  that stayed quiet.  Not a loss of the `error`/`warn`/`info` band: nothing
-  of priority 0, 1 or 2 is ever refused.
+* **A rate-limited record.**  Not the log's decision: a call site that uses
+  `ratelimit::*_ratelimited!` drops its own records past the burst and says how
+  many in a `callbacks suppressed` warning when its window reopens.
 * **A record a console's level mutes.**  Not a loss and not counted as one: the
   console secures the record as read, so the ring keeps nothing it is owed, and
   `dmesg` still has it.

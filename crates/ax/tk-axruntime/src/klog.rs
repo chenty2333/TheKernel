@@ -21,16 +21,10 @@
 //! and a console that is quiet loses nothing -- the console is a reader of the
 //! retained ring, holding a cursor rather than a copy of each record.
 //!
-//! Retention being unconditional has a price, and the rate limits pay it. A
-//! record the debug band has asked for is bounded twice over: once per call
-//! site, so one chatty place cannot spend the ring, and once globally, so a
-//! thousand places each staying inside their own budget cannot either. What a
-//! window refuses is counted, and the record that reopens the window says how
-//! many were refused -- a suppression that leaves no trace is indistinguishable
-//! from a kernel that never said it. The limits speak only to the debug band,
-//! because that is the band whose volume follows how busy the kernel is: an
-//! `error`, `warn` or `info` record never waits on a budget, and neither does
-//! the machine's own death report, which is what priorities 0..2 are for.
+//! Rate limiting is not the log's decision. As in Linux, the debug band is
+//! bounded by being closed unless a filter opens it, and a call site that a
+//! peer or a loop can repeat says so itself through `ratelimit::*_ratelimited!`
+//! (`printk_ratelimited()`), which keeps its record at its real level.
 //!
 //! The ring is the log; every reader -- `syslog(2)`, the framebuffer console,
 //! the boot screen, and the serial diagnostic console -- reads it through its
@@ -60,14 +54,12 @@
 //! mute routine output without muting the machine's own death report, and the
 //! way to express that is a priority below any level a human would set.
 //!
-//! A prefix says how severe a message is, not how often it may be produced.
-//! `debug!("\x010…")` is stored at priority 0 and rate limited as `debug`, which
-//! is the intended reading: a call site that can be reached once per packet must
-//! not be able to buy an unlimited run of the ring by claiming to be the panic it
-//! is describing.
+//! A prefix says how severe a message is, not which band it belongs to:
+//! `debug!("\x010…")` is stored at priority 0, but only when its target's debug
+//! band is open, because the capture filter decides by the `log` level.
 use core::{
     fmt::{self, Write},
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use kspin::SpinNoIrq;
@@ -104,8 +96,8 @@ const LEADER_BYTES: usize = 3;
 /// is the more severe one, and a console prints a record whose priority is
 /// *below* its level. `log` has no name below `error`, so 0 (`KERN_EMERG`) and 1
 /// (`KERN_ALERT`) are reachable only through [`diagnostic_at`], [`fatal`] or a
-/// `\x01N` prefix, and nothing compares against them: the budget speaks to the
-/// debug band, and a console's level is a range rather than a per-priority rule.
+/// `\x01N` prefix, and nothing compares against them: a console's level is a
+/// range rather than a per-priority rule.
 const EMERG: u8 = 0;
 const ERROR: u8 = 3;
 const WARNING: u8 = 4;
@@ -140,18 +132,6 @@ const CONSOLE_LOGLEVEL_DEBUG: u8 = 10;
 /// `MESSAGE_LOGLEVEL_DEFAULT`, reported by `/proc/sys/kernel/printk`. `log`
 /// always names a level, so nothing here applies it at store time.
 const MESSAGE_LOGLEVEL_DEFAULT: u8 = 4;
-
-/// `DEFAULT_RATELIMIT_INTERVAL`: the window a suppression counts over.
-const DEFAULT_RATELIMIT_INTERVAL_MS: u64 = 5 * 1000;
-/// `DEFAULT_RATELIMIT_BURST`: passes allowed per window before suppressing.
-const DEFAULT_RATELIMIT_BURST: u32 = 10;
-/// One slot per callsite is how Linux does this, through a
-/// `DEFINE_RATELIMIT_STATE` in the calling function. Rust has no way to give an
-/// arbitrary call site static storage, so callsites hash into this many slots;
-/// two hot callsites that collide share a budget, which is the failure mode
-/// worth naming rather than a per-callsite table costing one entry per `log`
-/// call in the kernel.
-const RATELIMIT_SLOTS: usize = 64;
 
 #[derive(Clone, Copy)]
 struct Text {
@@ -658,22 +638,20 @@ pub fn write_printk(out: &mut impl Write) -> fmt::Result {
     )
 }
 pub fn write_stats(out: &mut impl Write) -> fmt::Result {
-    let (overwritten, serial, screen, loglevel, rate_dropped) = {
+    let (overwritten, serial, screen, loglevel) = {
         let store = STORE.lock();
         (
             store.oldest,
             *store.console(ConsoleId::Serial),
             *store.console(ConsoleId::Screen),
             store.console_loglevel,
-            RATE_DROPPED.load(Ordering::Relaxed),
         )
     };
     writeln!(
         out,
         "records_dropped {}\ndiagnostic_records_dropped {}\nrecords_truncated \
          {}\nretention_bytes_overwritten {}\ndiagnostic_supported {}\ndiagnostic_retired \
-         {}\nscreen_records_dropped {}\nconsole_loglevel {}\nmessages_suppressed \
-         {}\nratelimit_interval_ms {}\nratelimit_burst {}",
+         {}\nscreen_records_dropped {}\nconsole_loglevel {}",
         LOST_RECORDS.load(Ordering::Relaxed),
         serial.lost,
         TRUNCATED.load(Ordering::Relaxed),
@@ -682,9 +660,6 @@ pub fn write_stats(out: &mut impl Write) -> fmt::Result {
         serial.retired as u8,
         screen.lost,
         loglevel,
-        rate_dropped,
-        ratelimit_interval_ms(),
-        ratelimit_burst(),
     )
 }
 /// Does this record get made at all?
@@ -741,154 +716,6 @@ fn parsed_priority(body: &[u8]) -> (Option<u8>, usize) {
         skip += 2;
     }
     (selected, skip)
-}
-/// One window of one rate-limited callsite, or of the global storm guard.
-#[derive(Clone, Copy)]
-struct RateWindow {
-    /// The millisecond the current window opened.  `0` is the boot: a window is
-    /// opened by the first record that needs one, and `passed: 0` says nothing
-    /// has been spent from it yet.
-    since_ms: u64,
-    passed: u32,
-    /// Records this window refused, waiting to be reported when it reopens.
-    missed: u32,
-}
-impl RateWindow {
-    const IDLE: Self = Self {
-        since_ms: 0,
-        passed: 0,
-        missed: 0,
-    };
-}
-/// Per-callsite windows, hashed by callsite. A hot line that fires once per
-/// packet gets its own budget, so one noisy driver cannot spend the allowance of
-/// the rest of the kernel.
-static RATE_WINDOWS: SpinNoIrq<[RateWindow; RATELIMIT_SLOTS]> =
-    SpinNoIrq::new([RateWindow::IDLE; RATELIMIT_SLOTS]);
-/// The storm guard: a budget over every callsite at once. Per-callsite windows
-/// cannot bound total volume -- a thousand places each printing ten lines per
-/// window is ten thousand lines -- and once retention is unconditional the ring is
-/// the only thing standing between a storm and a boot that erased its own
-/// evidence.
-///
-/// The number has to sit above an ordinary boot or it throttles the boot instead
-/// of the storm: a whole boot is about 114 records
-/// (`docs/design/kernel-log-retention.md` §4), so the guard opens at a bit over
-/// two boots per window.  What it buys is a bound on the erasure rate: two
-/// windows' worth of records is the worst a storm can erase before the guard
-/// itself goes quiet, and at the ring's average record size that is a second of
-/// full tilt rather than an unlimited scroll.
-const STORM_BURST: u32 = 256;
-static STORM: SpinNoIrq<RateWindow> = SpinNoIrq::new(RateWindow::IDLE);
-static RATELIMIT_INTERVAL_MS: AtomicU64 = AtomicU64::new(DEFAULT_RATELIMIT_INTERVAL_MS);
-static RATELIMIT_BURST: AtomicU32 = AtomicU32::new(DEFAULT_RATELIMIT_BURST);
-/// Records refused by either guard, since boot.
-static RATE_DROPPED: AtomicU64 = AtomicU64::new(0);
-
-/// The rate-limit window, in milliseconds -- `printk_ratelimit` in Linux, which
-/// counts in jiffies.  Named for what it is here because a reader of
-/// `/proc/sys/kernel/printk_ratelimit_ms` should not have to convert.
-pub fn ratelimit_interval_ms() -> u64 {
-    RATELIMIT_INTERVAL_MS.load(Ordering::Relaxed)
-}
-/// Passes allowed per window per call site: `printk_ratelimit_burst`.
-pub fn ratelimit_burst() -> u32 {
-    RATELIMIT_BURST.load(Ordering::Relaxed)
-}
-/// `printk_ratelimit`, in jiffies on Linux and in milliseconds here.
-pub fn set_ratelimit_interval_ms(value: u64) {
-    RATELIMIT_INTERVAL_MS.store(value, Ordering::Relaxed);
-}
-pub fn set_ratelimit_burst(value: u32) {
-    RATELIMIT_BURST.store(value, Ordering::Relaxed);
-}
-
-/// What one guard decided about a record at `now_ms`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Admit {
-    /// Store it.
-    Yes,
-    /// Store it, and report what the closed window refused.
-    YesWithNotice(u32),
-    /// Do not store it; it has been counted.
-    No,
-}
-impl RateWindow {
-    /// The `___ratelimit()` decision: refill on a new window, pass until the
-    /// burst is spent, count the refusals, and let the record that reopens the
-    /// window carry the count of the one before it.
-    fn decide(&mut self, now_ms: u64, window_ms: u64, allowance: u32) -> Admit {
-        if now_ms.saturating_sub(self.since_ms) >= window_ms {
-            let missed = self.missed;
-            *self = RateWindow {
-                since_ms: now_ms,
-                passed: 1,
-                missed: 0,
-            };
-            return if missed > 0 {
-                Admit::YesWithNotice(missed)
-            } else {
-                Admit::Yes
-            };
-        }
-        if self.passed < allowance {
-            self.passed += 1;
-            Admit::Yes
-        } else {
-            self.missed = self.missed.saturating_add(1);
-            RATE_DROPPED.fetch_add(1, Ordering::Relaxed);
-            Admit::No
-        }
-    }
-}
-/// The callsite's window slot. A `&'static str` file identity is the same
-/// pointer for every call from the same place, so the hash is stable without
-/// giving a call site static storage of its own.
-fn rate_slot(file: Option<&str>, line: Option<u32>) -> usize {
-    let file = file.map_or(0, |name| name.as_ptr() as usize);
-    file.wrapping_mul(0x0100_0193) ^ line.unwrap_or(0) as usize
-}
-/// The rate-limit state is global, so a test that counts what a window refused
-/// has to start from a known one.  Nothing in the kernel calls this: a window
-/// that has never been opened is already `IDLE`, and the boot that opens one is
-/// the boot whose records are being counted.
-#[cfg(test)]
-fn reset_rate_state() {
-    *STORM.lock() = RateWindow::IDLE;
-    *RATE_WINDOWS.lock() = [RateWindow::IDLE; RATELIMIT_SLOTS];
-    RATE_DROPPED.store(0, Ordering::Relaxed);
-}
-/// Both guards, in order: the callsite first so one place's budget is its own,
-/// then the storm guard so no set of places can exceed the ring's patience.
-fn admits(file: Option<&str>, line: Option<u32>, now_ms: u64) -> Admit {
-    let window = ratelimit_interval_ms();
-    let per_callsite = {
-        let mut windows = RATE_WINDOWS.lock();
-        let slot = rate_slot(file, line) % RATELIMIT_SLOTS;
-        windows[slot].decide(now_ms, window, ratelimit_burst())
-    };
-    if per_callsite == Admit::No {
-        return per_callsite;
-    }
-    let storm = STORM.lock().decide(now_ms, window, STORM_BURST);
-    match (per_callsite, storm) {
-        // A callsite that just reopened reports its own losses; the storm
-        // guard's count rides along with it rather than competing for the slot.
-        (Admit::YesWithNotice(callsite), Admit::YesWithNotice(storm)) => {
-            Admit::YesWithNotice(callsite.saturating_add(storm))
-        }
-        (Admit::YesWithNotice(callsite), Admit::Yes) => Admit::YesWithNotice(callsite),
-        (Admit::Yes, Admit::YesWithNotice(storm)) => Admit::YesWithNotice(storm),
-        (Admit::Yes, Admit::Yes) => Admit::Yes,
-        // A record the callsite allowed and the storm guard refused is lost for a
-        // reason the callsite's own counter never sees, which is why
-        // `messages_suppressed` counts both guards rather than one.
-        (_, Admit::No) => Admit::No,
-        // The callsite's own refusal returned above, so the guard that would
-        // have had to disagree with it never ran.  Naming the case keeps the
-        // match total without inventing a decision this function cannot make.
-        (Admit::No, _) => Admit::No,
-    }
 }
 struct ProducerGuard {
     cpu: usize,
@@ -973,21 +800,6 @@ fn append(text: &Text, priority: u8) {
         }
     }
 }
-/// Publish the record that reopens a rate-limit window, carrying the count of
-/// what the closed window refused. Linux reports the same thing as its own line
-/// (`net_ratelimit: N callbacks suppressed`), because a suppressed record that
-/// leaves no trace is indistinguishable from a kernel that did not say it.
-fn publish_suppressed(missed: u32, priority: u8) {
-    let mut text = Text::with_reserved_leader();
-    let _ = write!(
-        text,
-        "** {missed} kernel log message{} suppressed **",
-        if missed == 1 { "" } else { "s" }
-    );
-    text.attach_leader(priority);
-    text.finish();
-    publish(&text, priority);
-}
 /// One numeric header field: the number, or `-` when the record has none yet.
 ///
 /// Formatting an `Option` with `{:?}` spent eight bytes saying `Some(0)` on every
@@ -1062,45 +874,12 @@ impl Log for Logger {
         }
         use axlog::LogIf;
         let time = <crate::LogIfImpl as LogIf>::current_time();
-        // Then the budget, before the buffer: a record this path refuses should
-        // not have cost a kilobyte of formatting and a trip through the ring.
-        //
-        // Only the debug band meets a budget, and it is the `log` level's band
-        // that decides, not the effective priority. A prefix can still take a
-        // record to priority 0 from the debug band -- `debug!("\x010…")` is
-        // stored at 0 and reaches every console -- but it cannot take it out of
-        // the band's budget, which is the intended reading: what a prefix states
-        // is how severe one message is, and a call site that can be reached once
-        // per packet must not buy an unlimited run of the ring by claiming to be
-        // the panic it is describing.
-        //
-        // `error`, `warn` and `info` are outside the budget by the same rule
-        // that puts them outside the capture cap. Putting them inside it costs
-        // two IRQ-off global locks to a record produced once per reclaimed page,
-        // which is a slowdown of the allocator by the log, and the log does not
-        // get to do that.
-        let band = priority(record.level());
-        let mut reopened = None;
-        if band > INFO {
-            match admits(
-                record.file(),
-                record.line(),
-                time.as_millis().min(u64::MAX as u128) as u64,
-            ) {
-                Admit::No => return,
-                Admit::YesWithNotice(missed) => reopened = Some(missed),
-                Admit::Yes => {}
-            }
-        }
         let (text, priority) = render(
             record,
             time,
             <crate::LogIfImpl as LogIf>::current_cpu_id(),
             <crate::LogIfImpl as LogIf>::current_task_id(),
         );
-        if let Some(missed) = reopened {
-            publish_suppressed(missed, band);
-        }
         publish(&text, priority);
     }
     fn flush(&self) {} // Never access the UART in an arbitrary caller's context.
@@ -1702,62 +1481,6 @@ mod tests {
         for priority in 0..=DEBUG {
             assert!(!retired.prints(serial, priority));
         }
-    }
-    /// The rate limits are the price of unconditional retention: a call site
-    /// that can be reached once per packet gets a window, not a free pass.
-    #[test]
-    fn a_chatty_callsite_gets_a_window_not_a_free_run_of_the_ring() {
-        let _shared = global();
-        reset_rate_state();
-        set_ratelimit_interval_ms(5_000);
-        set_ratelimit_burst(3);
-        for expected in [Admit::Yes, Admit::Yes, Admit::Yes, Admit::No] {
-            assert_eq!(admits(Some("f.rs"), Some(11), 1_000), expected);
-        }
-        // The record that reopens the window carries the count of the ones the
-        // closed window refused: a suppression that leaves no trace is
-        // indistinguishable from a kernel that never said it.
-        assert_eq!(
-            admits(Some("f.rs"), Some(11), 6_000),
-            Admit::YesWithNotice(1)
-        );
-        // A different call site is not made to pay for this one's noise.
-        assert_eq!(admits(Some("f.rs"), Some(12), 6_000), Admit::Yes);
-        assert_eq!(admits(Some("g.rs"), Some(11), 6_000), Admit::Yes);
-        set_ratelimit_interval_ms(DEFAULT_RATELIMIT_INTERVAL_MS);
-        set_ratelimit_burst(DEFAULT_RATELIMIT_BURST);
-    }
-    /// Per-callsite windows cannot bound total volume, and with retention
-    /// unconditional the ring is then the only thing between a storm and a boot
-    /// that erased its own evidence.
-    #[test]
-    fn a_storm_of_distinct_callsites_cannot_outrun_the_ring() {
-        let _shared = global();
-        reset_rate_state();
-        set_ratelimit_interval_ms(5_000);
-        set_ratelimit_burst(10);
-        // More distinct call sites than there are slots, each one far below its
-        // own burst: only a guard over all of them together can stop this.
-        let mut admitted = 0;
-        for line in 0..(STORM_BURST + 44) {
-            if admits(Some("f.rs"), Some(line), 1_000) == Admit::Yes {
-                admitted += 1;
-            }
-        }
-        assert_eq!(admitted, STORM_BURST, "the storm guard let volume through");
-        assert_eq!(
-            RATE_DROPPED.load(Ordering::Relaxed),
-            44,
-            "`log_stats` would report a different suppression than happened"
-        );
-        // The guard announces itself when it reopens, riding along with the
-        // first record it lets through.
-        assert_eq!(
-            admits(Some("f.rs"), Some(0), 6_000),
-            Admit::YesWithNotice(44)
-        );
-        set_ratelimit_interval_ms(DEFAULT_RATELIMIT_INTERVAL_MS);
-        set_ratelimit_burst(DEFAULT_RATELIMIT_BURST);
     }
     /// The command line reaches the log through two grammars that share one
     /// parameter name, and through three statements that share one number.

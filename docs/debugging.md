@@ -48,13 +48,10 @@ than stopping the OS, and the other console is unaffected.
 
 Retention is unconditional for `error`, `warn` and `info`: those records enter
 the ring whether or not anything prints them. Only the `debug` band is capped,
-per target, and it is bounded twice by rate limits -- per call site, and
-globally, so a thousand chatty places cannot exceed the second budget either.
-What a closed window refused is announced by the record that reopens it
-(`** N kernel log messages suppressed **`) and counted in `messages_suppressed`.
-The budgets speak only to the debug band: an `error`, `warn` or `info` record
-never waits on one, because a record the kernel produces once per reclaimed page
-is not something the log gets to slow the allocator down for.
+per target, by the capture filter. The log itself rate-limits nothing, as in
+Linux: whether a call site can repeat is something only the call site knows,
+and a record the kernel produces once per reclaimed page is not something the
+log gets to slow the allocator down for.
 
 That last sentence is the authoring rule, not a performance note. `error`, `warn`
 and `info` are the band a machine shows without being asked, so a call site in
@@ -133,14 +130,12 @@ overrides can enable debug records at runtime without rebuilding.
 
 What reaches a *screen* is the other axis, and it is one number:
 `console_loglevel`, which every console compares a record's priority against
-when it reads the record. Four statements move it.
+when it reads the record. These statements move it.
 
 ```sh
 cat /proc/sys/kernel/printk           # console_loglevel and the three constants
 echo 4 > /proc/sys/kernel/printk      # warn and below stop printing; errors do not
 dmesg -n 1                            # only KERN_EMERG reaches the consoles
-echo 5000 > /proc/sys/kernel/printk_ratelimit_ms
-echo 10 > /proc/sys/kernel/printk_ratelimit_burst
 ```
 
 `quiet` sets it to 4 and `debug` to a value above every priority;
@@ -157,11 +152,6 @@ saved value, so an ON after an explicit level is a no-op rather than a
 resurrection of the quietness just replaced. A silent console does not cost a
 panic anything, because the panic screen reads the retained ring.
 
-The rate-limit files are this kernel's spelling of Linux's `printk_ratelimit`,
-which counts in jiffies; the window here is in milliseconds and the name says so.
-The burst is passes per call site per window; the global storm guard over all
-call sites at once is a constant of the ring's size and has no knob.
-
 Neither axis alters the user terminal, and neither erases a retained record: a
 console that is quiet, muted, or behind loses nothing unless the ring itself
 overwrites what it had not secured.
@@ -175,8 +165,7 @@ itself overwrites text the console had not reached. `log_stats` reports:
 `records_dropped` (records refused by the recursion guard, which should be 0),
 `diagnostic_records_dropped` and `screen_records_dropped` (records the ring
 overwrote before each console had secured them), `records_truncated`,
-`retention_bytes_overwritten`, sink availability, both consoles' levels,
-`messages_suppressed` (what the rate limits refused), and the rate-limit window.
+`retention_bytes_overwritten`, sink availability, and the console level.
 Missing output is not evidence that an event did not happen when the relevant
 loss counter increased. See `docs/design/kernel-log-retention.md` for the paths
 that can still lose a record and how each was measured.
