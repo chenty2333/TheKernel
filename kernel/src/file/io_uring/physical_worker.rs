@@ -1530,6 +1530,9 @@ pub(super) fn retry_pending_physical_publications_for_device(
             complete_pending_physical_prepublication_error(work, LinuxError::EIO)?;
             continue;
         }
+        // SAFETY: `with_physical_publish` holds the worker-slot reservation taken immediately
+        // before this call, and a Published/Terminal outcome is completed below without fallback,
+        // as `publish` requires.
         let outcome = reservation.with_physical_publish(|| unsafe {
             work.admission_mut().ok_or(AxError::BadState)?.publish()
         });

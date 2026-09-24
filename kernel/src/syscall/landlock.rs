@@ -696,14 +696,8 @@ fn copy_lsm_context<M: UserMemory + ?Sized>(
             .checked_add(offset)
             .ok_or(AxError::BadAddress)?;
         let mut chunk = [0u8; size_of::<LsmCtx>()];
-        // SAFETY: the usercopy provider initializes the requested range.
         memory
-            .read_bytes(address, unsafe {
-                core::slice::from_raw_parts_mut(
-                    chunk.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                    chunk_len,
-                )
-            })
+            .read_into(address, &mut chunk[..chunk_len])
             .map_err(|_| AxError::BadAddress)?;
         if offset < header.len() {
             let head_len = (header.len() - offset).min(chunk_len);

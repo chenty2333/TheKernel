@@ -157,12 +157,7 @@ impl CloseWork {
             })
             .transpose()?;
         let is_dir = location.is_dir();
-        let raw = unsafe { alloc(Layout::new::<Self>()) }.cast::<Self>();
-        if raw.is_null() {
-            return Err(AxError::NoMemory);
-        }
-        unsafe {
-            raw.write(Self {
+        Box::try_new(Self {
                 next: AtomicPtr::new(ptr::null_mut()),
                 location,
                 key,
@@ -171,9 +166,8 @@ impl CloseWork {
                 mask,
                 actor: FanotifyEventActor::default(),
                 account: None,
-            });
-            Ok(Box::from_raw(raw))
-        }
+            })
+        .map_err(|_| AxError::NoMemory)
     }
 
     fn run(&self) {
@@ -233,7 +227,13 @@ fn refill_pending_close_work() {
     let mut current = CLOSE_WORK_INCOMING.swap(ptr::null_mut(), Ordering::AcqRel);
     let mut reversed = ptr::null_mut();
     while !current.is_null() {
+        // SAFETY: only the drainer holding `CloseWorkDrainGuard` reaches this; it took the whole
+        // list with the swap above, so every node is a live `Box<CloseWork>` no producer still
+        // references.
         let next = unsafe { (*current).next.load(Ordering::Relaxed) };
+        // SAFETY: only the drainer holding `CloseWorkDrainGuard` reaches this; it took the whole
+        // list with the swap above, so every node is a live `Box<CloseWork>` no producer still
+        // references.
         unsafe { (*current).next.store(reversed, Ordering::Relaxed) };
         reversed = current;
         current = next;
@@ -249,9 +249,14 @@ fn pop_pending_close_work() -> Option<Box<CloseWork>> {
     if head.is_null() {
         return None;
     }
+    // SAFETY: only the drainer holding `CloseWorkDrainGuard` pops, and `head` is a non-null node
+    // of the private pending list, i.e. a live `Box<CloseWork>`.
     let next = unsafe { (*head).next.load(Ordering::Relaxed) };
     CLOSE_WORK_PENDING.store(next, Ordering::Relaxed);
+    // SAFETY: as above; `head` has been unlinked and is still owned by the pending list.
     unsafe { (*head).next.store(ptr::null_mut(), Ordering::Relaxed) };
+    // SAFETY: `head` came from `Box::into_raw` and is now unlinked from both lists, so ownership
+    // returns to exactly one Box.
     Some(unsafe { Box::from_raw(head) })
 }
 
@@ -295,6 +300,8 @@ pub(crate) fn defer_description_close(mut work: Box<CloseWork>) {
     let work = Box::into_raw(work);
     let mut head = CLOSE_WORK_INCOMING.load(Ordering::Relaxed);
     loop {
+        // SAFETY: `work` came from `Box::into_raw` and is not yet published, so this thread still
+        // has exclusive access to it.
         unsafe { (*work).next.store(head, Ordering::Relaxed) };
         match CLOSE_WORK_INCOMING.compare_exchange_weak(
             head,
@@ -723,6 +730,9 @@ impl InotifyFile {
                 name: linux_raw_sys::general::__IncompleteArrayField::new(),
             };
             let mut encoded = [0_u8; MAX_INOTIFY_EVENT_SIZE];
+            // SAFETY: `inotify_event` is `repr(C)` with four `u32`-sized fields and a zero-length
+            // name, so its 16 bytes have no padding and are initialized; the slice borrows
+            // `header` for its lifetime.
             let header_bytes = unsafe {
                 core::slice::from_raw_parts(
                     (&header as *const inotify_event).cast::<u8>(),

@@ -681,11 +681,8 @@ fn make_pidfd_signal_info<M: UserMemory + ?Sized>(
     // `SignalInfo` is the signal crate's fixed-size, layout-checked mirror of
     // Linux siginfo_t (including its union storage).  Read the complete record
     // through the explicit address-space context before interpreting fields.
-    let sig = unsafe {
-        VmPtr::vm_read_uninit(sig, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let sig = VmPtr::vm_read(sig, memory)
+            .map_err(map_usercopy_error)?;
     let parsed_signo = (signo != 0).then(|| parse_signo(signo)).transpose()?;
     let raw_signo = sig.try_signo().ok_or(AxError::InvalidInput)? as i32;
     if i32::try_from(signo).ok() != Some(raw_signo) {

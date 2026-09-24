@@ -215,6 +215,8 @@ impl UffdResolverData {
 
 fn read_user_pod<T: Pod>(context: &IoctlContext, address: usize) -> AxResult<T> {
     let mut value = MaybeUninit::<T>::uninit();
+    // SAFETY: `MaybeUninit<u8>` has byte alignment and the slice covers exactly the storage of
+    // `value`, which outlives it.
     let bytes = unsafe {
         slice::from_raw_parts_mut(
             value.as_mut_ptr().cast::<MaybeUninit<u8>>(),

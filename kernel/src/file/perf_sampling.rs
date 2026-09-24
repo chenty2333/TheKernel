@@ -345,9 +345,10 @@ struct SamplingState {
 }
 
 fn write_metadata(view: &SharedFixedView, offset: usize, bytes: &[u8]) -> AxResult {
-    // The metadata prefix is not part of the producer/consumer data ring.
-    // Writers serialize it with the perf mmap seqlock below, exactly as ABI
-    // readers retry around an odd `lock` value.
+    // SAFETY: the metadata prefix is not part of the producer/consumer data
+    // ring. Writers serialize it with the perf mmap seqlock below, exactly as
+    // ABI readers retry around an odd `lock` value, so no other producer or
+    // consumer owns these bytes concurrently.
     unsafe { view.write_wrapped(0, PAGE, offset, bytes) }
 }
 
@@ -420,13 +421,14 @@ pub(crate) struct PerfSampleBackend {
     owner: SpinNoIrq<alloc::sync::Weak<super::perf::PerfEventFile>>,
 }
 
-// `CUSTODY` keeps `Arc<PerfSampleBackend>` values in per-CPU spin-locked
-// slots.  The weak descriptor edge makes the automatic Send/Sync solver
-// recursive (`PerfEventFile` owns a backend which weakly names its owner).
-// Every mutable backend field is protected by `SpinNoIrq` or an atomic, and
-// the only raw-pointer paths transfer an owned Arc explicitly, so breaking
-// that type-level cycle is sound.
+// SAFETY: `CUSTODY` keeps `Arc<PerfSampleBackend>` values in per-CPU
+// spin-locked slots.  The weak descriptor edge makes the automatic Send/Sync
+// solver recursive (`PerfEventFile` owns a backend which weakly names its
+// owner).  Every mutable backend field is protected by `SpinNoIrq` or an
+// atomic, and the only raw-pointer paths transfer an owned Arc explicitly, so
+// breaking that type-level cycle is sound.
 unsafe impl Send for PerfSampleBackend {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for PerfSampleBackend {}
 
 struct SamplingRetireQueue {
@@ -565,6 +567,9 @@ fn defer_custody_retire(event: Arc<PerfSampleBackend>) {
         // Release the duplicate while the queue owner is still protected by
         // `retire_queued`.  This decrement therefore cannot run the final
         // destructor in the scheduler's IRQ-disabled leave path.
+        // SAFETY: a true queued bit guarantees the queue already owns a distinct strong reference,
+        // so this releases only the one transferred in by `event` and cannot run the final
+        // destructor.
         unsafe { Arc::decrement_strong_count(node) };
         drop(queued);
         return;
@@ -591,6 +596,7 @@ fn reverse_retire_list(mut head: *mut PerfSampleBackend) -> *mut PerfSampleBacke
     while !head.is_null() {
         // SAFETY: nodes are detached from incoming by the sole consumer.
         let next = unsafe { (*head).retire_next.load(Ordering::Relaxed) };
+        // SAFETY: nodes are detached from incoming by the sole consumer.
         unsafe { (*head).retire_next.store(reversed, Ordering::Relaxed) };
         reversed = head;
         head = next;
@@ -626,11 +632,14 @@ pub(crate) fn drain_deferred_custody_retire_work() {
         let node = list;
         // SAFETY: `node` is exclusively held by this consumer list.
         list = unsafe { (*node).retire_next.load(Ordering::Relaxed) };
+        // SAFETY: `node` is exclusively held by this consumer list.
         unsafe {
             (*node)
                 .retire_next
                 .store(ptr::null_mut(), Ordering::Relaxed)
         };
+        // SAFETY: `node` carries the queue-owned strong reference transferred by `Arc::into_raw`
+        // when it was queued; unlinking it above hands that reference to this Arc.
         let event = unsafe { Arc::from_raw(node) };
         {
             let mut queued = event.retire_queued.lock();
@@ -1475,6 +1484,8 @@ impl PerfSampleBackend {
     /// queue because an IPI may not run the final mapping destructor.
     #[cfg(target_os = "none")]
     pub(crate) unsafe fn reconcile_ipi_stop(event: *const Self) {
+        // SAFETY: the publisher transferred one strong count with `event`, so it is live for this
+        // call (the caller's contract).
         let event_ref = unsafe { &*event };
         event_ref.reconcile_local_stop();
         // SAFETY: exactly the raw strong count transferred by the publisher.

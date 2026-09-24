@@ -56,11 +56,7 @@ pub fn sys_signalfd4<M: UserMemory + ?Sized>(
     check_signalfd_sigset_size(sigsetsize)?;
 
     // Read the signal mask from user space before handling the request mode.
-    let mask = unsafe {
-        VmPtr::vm_read_uninit(mask, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let mask = VmPtr::vm_read(mask, memory).map_err(map_usercopy_error)?;
 
     let flags = SignalfdFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
 

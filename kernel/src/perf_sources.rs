@@ -225,8 +225,13 @@ fn rollback_kretprobe_instance(frame: &axcpu::TrapFrame, slot: Option<usize>) {
         && stack.checked_add(8) == Some(instance.return_stack)
     {
         let trampoline = kretprobe_trampoline as *const () as u64;
+        // SAFETY: `stack` is the interrupted kernel RSP of this same-CPL trap, which points at the
+        // return slot this kretprobe planted (`stack + 8 == return_stack`); it is live stack
+        // memory of the trapped context.
         let live = unsafe { core::ptr::read_unaligned(stack as *const u64) };
         if live == trampoline {
+            // SAFETY: as above; the slot still holds the trampoline address this instance planted,
+            // so restoring the original return address only undoes that patch.
             unsafe { core::ptr::write_unaligned(stack as *mut u64, instance.original_return) };
         }
     }
@@ -784,9 +789,8 @@ pub(crate) fn resolve_uprobe_inode(
             .checked_add(offset)
             .ok_or(AxError::BadAddress)?;
         let byte = memory
-            .read_value_uninit(address as *const u8)
-            .map_err(map_usercopy_error)
-            .map(|value| unsafe { value.assume_init() })?;
+            .read_abi_value(address as *const u8)
+            .map_err(map_usercopy_error)?;
         if byte == 0 {
             if offset == 0 {
                 return Err(AxError::InvalidInput);

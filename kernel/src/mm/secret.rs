@@ -44,6 +44,8 @@ impl SecretFrame {
             .map_err(|_| AxError::NoMemory)?;
         // A frame is cleared before its alias is revoked.  No stale allocator
         // contents can escape through a subsequently installed user mapping.
+        // SAFETY: `direct` is the page the allocator just returned, so its 4 KiB are exclusively
+        // ours.
         unsafe { ptr::write_bytes(direct.as_mut_ptr(), 0, PAGE_SIZE_4K) };
         let physical = virt_to_phys(direct);
         #[cfg(test)]
@@ -83,6 +85,8 @@ impl SecretFrame {
         #[cfg(not(test))]
         {
             let window = SecretWindow::map(self.physical)?;
+            // SAFETY: `window` maps this frame's 4 KiB and `offset + source.len() <= PAGE_SIZE_4K`
+            // (checked above); `source` is kernel memory outside the secret frame.
             unsafe {
                 ptr::copy_nonoverlapping(
                     source.as_ptr(),
@@ -112,6 +116,9 @@ impl SecretFrame {
         #[cfg(not(test))]
         {
             let window = SecretWindow::map(self.physical)?;
+            // SAFETY: `window` maps this frame's 4 KiB and `offset + destination.len() <=
+            // PAGE_SIZE_4K` (checked above); `destination` is kernel memory outside the secret
+            // frame.
             unsafe {
                 ptr::copy_nonoverlapping(
                     window.address().as_ptr().add(offset),
@@ -140,6 +147,8 @@ impl Drop for SecretFrame {
             let Ok(window) = SecretWindow::map(self.physical) else {
                 return;
             };
+            // SAFETY: `window` is the sole mapping of this 4 KiB secret frame, which this drop
+            // still owns.
             unsafe { ptr::write_bytes(window.address().as_mut_ptr(), 0, PAGE_SIZE_4K) };
             drop(window);
             let direct = phys_to_virt(self.physical);

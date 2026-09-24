@@ -354,6 +354,8 @@ impl PreparedPhysicalIoAdmission {
     /// kernel-destination route so the device-global broker can drain this
     /// effect without stealing synchronous exact-route waiters.
     pub(crate) unsafe fn publish(&mut self) -> AxResult<PhysicalIoPublishOutcome> {
+        // SAFETY: forwarded: the caller upholds `publish`'s contract, which this function's doc
+        // states.
         unsafe { self.effect_mut().publish_kernel() }
     }
 

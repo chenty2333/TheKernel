@@ -571,12 +571,7 @@ fn write_prog_info<M: UserMemory + ?Sized>(
 
     // Compute a simple tag (hash of instructions) for identification
     let mut tag = [0u8; 8];
-    let insn_bytes = unsafe {
-        core::slice::from_raw_parts(
-            prog.mechanism.instructions().as_ptr() as *const u8,
-            core::mem::size_of_val(prog.mechanism.instructions()),
-        )
-    };
+    let insn_bytes: &[u8] = bytemuck::cast_slice(prog.mechanism.instructions());
     // Simple FNV-1a hash truncated to 8 bytes
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in insn_bytes {

@@ -170,6 +170,9 @@ impl SwapoffPage {
     pub(crate) fn prepare(self) -> AxResult<PreparedSwapoffPage> {
         let mut prepared = PreparedCowPage::try_new()?;
         prepared.reserve_max_table_frames()?;
+        // SAFETY: the fill reads through the checked VM usercopy primitive, whose `Ok(())` means
+        // every byte of the 4 KiB slice was initialized, as `prepare_uninitialized` requires;
+        // `bytes` is exactly `PAGE_SIZE_4K` long.
         unsafe {
             prepared.prepare_uninitialized(|bytes| {
                 let page = core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast(), PAGE_SIZE_4K);
@@ -1278,6 +1281,9 @@ impl TlbState {
         let (base, len) = ldt.as_ref().map_or((core::ptr::null(), 0), |table| {
             (table.bytes().as_ptr(), table.bytes().len())
         });
+        // SAFETY: callers keep IRQs and preemption disabled, the table is held by this address
+        // space's `Arc<Ldt>` under the lock, and a replaced table is dropped only after the TLB
+        // grace completes, so it describes a valid LDT for as long as any CPU may use it.
         unsafe { axhal::asm::load_user_ldt(base, len) };
     }
 
@@ -8436,6 +8442,9 @@ impl AddrSpace {
     /// * `start` - The start virtual address to read.
     /// * `buf` - The buffer to store the data.
     pub fn read(&self, start: VirtAddr, buf: &mut [u8]) -> AxResult {
+        // SAFETY: `process_area_data` passes a direct-map pointer to `read_size` mapped bytes of
+        // the current page, and `offset + read_size <= buf.len()`; kernel `buf` cannot alias user
+        // frames.
         self.process_area_data(start, buf.len(), |src, offset, read_size| unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), buf.as_mut_ptr().add(offset), read_size);
         })
@@ -8455,6 +8464,9 @@ impl AddrSpace {
                     && area.flags().contains(MappingFlags::EXECUTE)
             })
         });
+        // SAFETY: `process_area_data` passes a direct-map pointer to `write_size` mapped bytes of
+        // the current page, and `offset + write_size <= buf.len()`; kernel `buf` cannot alias user
+        // frames.
         let result = self.process_area_data(start, buf.len(), |dst, offset, write_size| unsafe {
             core::ptr::copy_nonoverlapping(buf.as_ptr().add(offset), dst.as_mut_ptr(), write_size);
         });
@@ -8504,6 +8516,8 @@ impl AddrSpace {
             return Err(AxError::BadState);
         }
         let mut previous = 0u8;
+        // SAFETY: `process_area_data` passes a direct-map pointer to the one mapped byte at
+        // `address`; volatile access keeps the patch a single byte store.
         self.process_area_data(address, 1, |dst, _, _| unsafe {
             previous = core::ptr::read_volatile(dst.as_ptr());
             core::ptr::write_volatile(dst.as_mut_ptr(), byte);
@@ -8547,6 +8561,8 @@ impl AddrSpace {
         }
         let offset = address.as_usize() - page.as_usize();
         let target = axhal::mem::phys_to_virt(PhysAddr::from(paddr.as_usize() + offset));
+        // SAFETY: `paddr` is the 4 KiB executable leaf translated above under the address-space
+        // lock and `offset < 4096`, so `target` is a valid direct-map byte of that frame.
         let previous = unsafe {
             let pointer = target.as_mut_ptr();
             let previous = core::ptr::read_volatile(pointer);
@@ -9214,6 +9230,8 @@ impl AddrSpace {
             drop(grace);
             return Ok(AnonymousReclaim::Dropped);
         }
+        // SAFETY: the leaf was unmapped and the TLB synchronized above, so no user mapping can
+        // write `paddr` while this 4 KiB frame is read for pageout.
         let bytes =
             unsafe { core::slice::from_raw_parts(phys_to_virt(paddr).as_ptr(), PAGE_SIZE_4K) };
         let entry = match crate::mm::pageout(bytes) {

@@ -66,7 +66,7 @@ static CLASSIC_AIO_ENGINE: Mutex<ClassicAioEngine> = Mutex::new(ClassicAioEngine
 static CLASSIC_AIO_ENGINE_WAKE: PollSet = PollSet::new();
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, AnyBitPattern)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct IoEvent {
     data: u64,
     obj: u64,
@@ -140,9 +140,7 @@ fn write_io_event<M: UserMemory + ?Sized>(
     ptr: *mut IoEvent,
     value: IoEvent,
 ) -> AxResult<()> {
-    // SAFETY: `IoEvent` is four initialized 64-bit words with no padding on
-    // x86_64; the complete layout is asserted above.
-    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, value) }.map_err(map_usercopy_error)
+    VmMutPtr::vm_write(ptr, memory, value).map_err(map_usercopy_error)
 }
 
 struct AioContext {
@@ -644,11 +642,7 @@ fn read_iocb_ptr<M: UserMemory + ?Sized>(
     iocbpp: *const *const Iocb,
     index: usize,
 ) -> AxResult<*const Iocb> {
-    let ptr = unsafe {
-        VmPtr::vm_read_uninit(iocbpp.wrapping_add(index), memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let ptr = VmPtr::vm_read(iocbpp.wrapping_add(index), memory).map_err(map_usercopy_error)?;
     Ok(ptr)
 }
 
@@ -656,7 +650,12 @@ fn write_iocb_key<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     iocb: *const Iocb,
 ) -> AxResult {
-    let key = unsafe { core::ptr::addr_of_mut!((*iocb.cast_mut()).aio_key) };
+    // `iocb` is a user address, so form the field address with wrapping
+    // arithmetic rather than an in-bounds place projection.
+    let key = iocb
+        .cast_mut()
+        .wrapping_byte_add(offset_of!(Iocb, aio_key))
+        .cast::<u32>();
     VmMutPtr::vm_write(key, memory, KIOCB_KEY).map_err(map_usercopy_error)?;
     Ok(())
 }
@@ -694,11 +693,8 @@ fn read_optional_sigset<M: UserMemory + ?Sized>(
     if sigset.sigsetsize != size_of::<SignalSet>() {
         return Err(AxError::InvalidInput);
     }
-    let signal_set = unsafe {
-        VmPtr::vm_read_uninit(sigset.sigmask.cast::<SignalSet>(), memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let signal_set =
+        VmPtr::vm_read(sigset.sigmask.cast::<SignalSet>(), memory).map_err(map_usercopy_error)?;
     Ok(Some(signal_set))
 }
 

@@ -127,9 +127,23 @@ impl Signo {
 }
 
 /// Signal set. Compatible with `struct sigset_t` in libc.
-#[derive(Default, Clone, Copy, Not, BitOr, BitOrAssign, BitAnd, BitAndAssign)]
+#[derive(
+    Default,
+    Clone,
+    Copy,
+    Not,
+    BitOr,
+    BitOrAssign,
+    BitAnd,
+    BitAndAssign,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
+)]
 #[repr(transparent)]
 pub struct SignalSet(u64);
+
+// SAFETY: a signal set is one transparent `u64`; every bit pattern is a set.
+unsafe impl tk_linux_usercopy::UserAbiValue for SignalSet {}
 
 impl SignalSet {
     /// Returns the native x86_64 bit representation of this signal set.
@@ -267,7 +281,7 @@ impl SignalPollPayload {
 }
 
 /// Signal information. Compatible with `struct siginfo` in libc.
-#[derive(Clone)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C, align(8))]
 pub struct SignalInfo([u8; 128]);
 
@@ -668,7 +682,7 @@ impl fmt::Debug for SignalInfo {
 
 /// Signal stack. Compatible with `struct sigaltstack` in libc.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SignalStack {
     pub sp: usize,
     pub flags: u32,

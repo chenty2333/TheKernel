@@ -253,6 +253,9 @@ pub(crate) fn copy_instructions(
         .try_reserve_exact(length)
         .map_err(|_| AxError::NoMemory)?;
     instructions.resize(length, Instruction::default());
+    // SAFETY: the view covers the `length` initialized instructions of `instructions` (layout-
+    // identical to `MaybeUninit<Instruction>`), and the usercopy only stores initialized values
+    // through it.
     let destination = unsafe {
         core::slice::from_raw_parts_mut(
             instructions

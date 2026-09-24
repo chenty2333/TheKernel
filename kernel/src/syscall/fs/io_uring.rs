@@ -257,11 +257,9 @@ pub fn sys_io_uring_setup(
     params: *mut u8,
 ) -> AxResult<isize> {
     let input_bytes = capability
-        .read_value_uninit(params as *const [u8; IO_URING_PARAMS_BYTES])
+        .read_abi_value(params as *const [u8; IO_URING_PARAMS_BYTES])
         .map_err(map_usercopy_error)?;
-    // SAFETY: `read_value_uninit` returned success only after initializing the
-    // complete fixed-size byte array. Every bit pattern is valid for bytes.
-    let input = IoUringParams::decode(unsafe { input_bytes.assume_init() });
+    let input = IoUringParams::decode(input_bytes);
     let layout = SetupRequest::from_raw(
         entries,
         input.cq_entries(),
@@ -426,10 +424,8 @@ fn register_probe(
 
 fn copied_ring_update(capability: &UserMemoryCapability, address: usize) -> AxResult<(u32, u64)> {
     let raw = capability
-        .read_value_uninit(address as *const [u8; 16])
+        .read_abi_value(address as *const [u8; 16])
         .map_err(map_usercopy_error)?;
-    // SAFETY: the full fixed update record was copied.
-    let raw = unsafe { raw.assume_init() };
     if raw[4..8].iter().any(|byte| *byte != 0) {
         return Err(AxError::InvalidInput);
     }
@@ -614,20 +610,16 @@ fn register_wait_region(
         || {
             let address = usize::try_from(argument).map_err(|_| AxError::BadAddress)?;
             let header = capability
-                .read_value_uninit(address as *const [u8; 32])
+                .read_abi_value(address as *const [u8; 32])
                 .map_err(map_usercopy_error)?;
-            // SAFETY: the complete fixed header was copied above.
-            let header = unsafe { header.assume_init() };
             let desc_ptr = u64::from_ne_bytes(header[0..8].try_into().unwrap());
             let flags = u64::from_ne_bytes(header[8..16].try_into().unwrap());
             // Linux copies the descriptor after the outer registration record
             // but before validating either record's reserved fields/flags.
             let desc_address = usize::try_from(desc_ptr).map_err(|_| AxError::BadAddress)?;
             let desc = capability
-                .read_value_uninit(desc_address as *const [u8; 64])
+                .read_abi_value(desc_address as *const [u8; 64])
                 .map_err(map_usercopy_error)?;
-            // SAFETY: the explicit complete descriptor copy succeeded.
-            let desc = unsafe { desc.assume_init() };
             if desc_ptr == 0 || flags & !1 != 0 || header[16..32].iter().any(|byte| *byte != 0) {
                 return Err(AxError::InvalidInput);
             }
@@ -1399,10 +1391,8 @@ fn io_result(result: AxResult<isize>) -> i32 {
 fn copy_timeout_duration(capability: &UserMemoryCapability, address: u64) -> AxResult<Duration> {
     let address = usize::try_from(address).map_err(|_| AxError::BadAddress)?;
     let bytes = capability
-        .read_value_uninit(address as *const [u8; 16])
+        .read_abi_value(address as *const [u8; 16])
         .map_err(map_usercopy_error)?;
-    // SAFETY: the capability initialized all sixteen bytes before success.
-    let bytes = unsafe { bytes.assume_init() };
     let seconds = i64::from_ne_bytes(bytes[..8].try_into().unwrap());
     let nanos = i64::from_ne_bytes(bytes[8..].try_into().unwrap());
     if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
@@ -1626,6 +1616,9 @@ fn publish_physical_admission(
             return Ok(PhysicalPublishDecision::Completed);
         }
     }
+    // SAFETY: `with_physical_publish` holds the worker-slot reservation taken immediately before
+    // this call, and a Published/Terminal outcome is completed below without fallback, as
+    // `publish` requires.
     let outcome = match reservation.with_physical_publish(|| unsafe { admission.publish() }) {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(error)) => {
@@ -3173,11 +3166,9 @@ fn copied_signal_mask(
         LegacySignalMask::Address(address) => {
             let address = usize::try_from(address).map_err(|_| AxError::BadAddress)?;
             let value = capability
-                .read_value_uninit::<SignalSet>(address as *const SignalSet)
+                .read_abi_value::<SignalSet>(address as *const SignalSet)
                 .map_err(map_usercopy_error)?;
-            // SAFETY: the explicit capability read initialized the complete
-            // signal-set object before returning success.
-            Ok(Some(unsafe { value.assume_init() }))
+            Ok(Some(value))
         }
     }
 }
@@ -3202,13 +3193,9 @@ fn copied_extended_enter_argument(
         return Err(AxError::InvalidInput);
     }
     let bytes = capability
-        .read_value_uninit(address as *const [u8; IoUringGeteventsArg::BYTES])
+        .read_abi_value(address as *const [u8; IoUringGeteventsArg::BYTES])
         .map_err(map_usercopy_error)?;
-    // SAFETY: the explicit capability read initialized the complete UAPI
-    // record before returning success.
-    Ok(IoUringGeteventsArg::from_ne_bytes(unsafe {
-        bytes.assume_init()
-    }))
+    Ok(IoUringGeteventsArg::from_ne_bytes(bytes))
 }
 
 fn deferred_extended_enter_wait(
@@ -3246,9 +3233,9 @@ fn prepare_extended_enter_wait(
         check_sigset_size(size as usize)?;
         let address = usize::try_from(address).map_err(|_| AxError::BadAddress)?;
         let value = capability
-            .read_value_uninit::<SignalSet>(address as *const SignalSet)
+            .read_abi_value::<SignalSet>(address as *const SignalSet)
             .map_err(map_usercopy_error)?;
-        extended.signal_mask = Some(unsafe { value.assume_init() });
+        extended.signal_mask = Some(value);
     }
     Ok(())
 }

@@ -32,6 +32,10 @@ members = [
 dead_code = "allow"
 
 [workspace.lints.clippy]
+# Every `unsafe` block and `unsafe impl` states the invariant it relies on in a
+# `// SAFETY:` comment, as the Linux ABI crates already require of themselves.
+undocumented_unsafe_blocks = "deny"
+
 # `mm::synchronize_tlb`/`synchronize_icache` return `GlobalGrace`, which only
 # carries drop glue when `smp-tlb-shootdown` is enabled. Dropping the returned
 # grace is the release point of a remote shootdown, so the explicit `drop(...)`

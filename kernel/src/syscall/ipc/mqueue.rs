@@ -82,7 +82,7 @@ pub(crate) const MQUEUE_DIR_UID: u32 = 0;
 static MQ_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, AnyBitPattern)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MqAttr {
     mq_flags: isize,
     mq_maxmsg: isize,
@@ -1160,13 +1160,8 @@ fn validate_timespec<M: UserMemory + ?Sized>(
     if timeout.is_null() {
         return Ok(None);
     }
-    // SAFETY: `VmPtr::vm_read_uninit` initializes the complete repr(C)
-    // `timespec` object before it is converted into a kernel value.
-    let timeout = unsafe {
-        VmPtr::vm_read_uninit(timeout, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let timeout = VmPtr::vm_read_abi(timeout, memory)
+            .map_err(map_usercopy_error)?;
     let tv = timeout.try_into_time_value()?;
     Ok(Some(Duration::from_nanos(
         tv.as_nanos().min(u64::MAX as u128) as u64,
@@ -1909,8 +1904,7 @@ fn write_queue_attr<M: UserMemory + ?Sized>(
     destination: *mut MqAttr,
 ) -> AxResult<()> {
     let snapshot = queue.lock().attr(flags);
-    // SAFETY: attr initializes every repr(C) field, including reserved words.
-    unsafe { VmMutPtr::vm_write_unchecked(destination, memory, snapshot) }
+    VmMutPtr::vm_write(destination, memory, snapshot)
         .map_err(map_usercopy_error)
 }
 

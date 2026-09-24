@@ -45,12 +45,13 @@ pub(crate) struct OwnedPinnedFileIoBuffer {
     direction: PinnedFileIoDirection,
 }
 
-// `PinnedUserSegments` retains a raw user address solely for accounting and
+// SAFETY: `PinnedUserSegments` retains a raw user address solely for accounting and
 // eventual MM-pin release; this adapter never dereferences it.  All later I/O
 // goes through the captured physical descriptors while their owners remain
 // alive.  Destination copying requires `&mut self`, so its mutable pins cannot
 // be written through concurrently via this buffer.
 unsafe impl Send for OwnedPinnedFileIoBuffer {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for OwnedPinnedFileIoBuffer {}
 
 impl OwnedPinnedFileIoBuffer {

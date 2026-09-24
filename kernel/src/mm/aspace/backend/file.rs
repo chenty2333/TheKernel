@@ -356,6 +356,8 @@ impl Drop for FileBackendInner {
         );
         let handle = self.handle.load(Ordering::Acquire);
         if handle != 0 && handle != REGISTERING_LISTENER {
+            // SAFETY: a handle other than 0 and `REGISTERING_LISTENER` came from
+            // `add_evict_listener` on this cache, and this drop is its only removal.
             unsafe {
                 self.cache.remove_evict_listener(handle);
             }

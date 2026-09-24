@@ -63,7 +63,7 @@ bitflags! {
 /// a valid Rust value. This all-integer mirror can be initialized from any bit
 /// pattern and is converted only after the complete record has been copied.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RawSignalAction {
     /// `SIG_DFL` (0), `SIG_IGN` (1), or a userspace handler address.
     pub handler: usize,
@@ -94,11 +94,7 @@ impl RawSignalAction {
         memory: &mut UserMemoryContext<'_, M>,
         ptr: *const Self,
     ) -> VmResult<Self> {
-        let value = ptr.vm_read_uninit(memory)?;
-        // SAFETY: UserMemory initialized every byte before returning `Ok` and this
-        // repr(C) record contains only integer scalars plus SignalSet, which is
-        // repr(transparent) over u64. Therefore every bit pattern is valid.
-        Ok(unsafe { value.assume_init() })
+        ptr.vm_read(memory)
     }
 
     /// Copies this raw action to userspace.
@@ -108,10 +104,7 @@ impl RawSignalAction {
         memory: &mut UserMemoryContext<'_, M>,
         ptr: *mut Self,
     ) -> VmResult {
-        // SAFETY: the size/offset assertions above prove this record has no
-        // implicit gaps or tail padding on the supported 64-bit ABIs. Every
-        // field is initialized by safe construction or a complete user read.
-        unsafe { ptr.vm_write_unchecked(memory, self) }
+        ptr.vm_write(memory, self)
     }
 }
 

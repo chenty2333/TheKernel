@@ -58,7 +58,7 @@ const MQUEUE_MAGIC: i64 = 0x1980_0202;
 /// Native x86_64 `struct ustat`. Although obsolete, Linux still copies the
 /// complete 32-byte object, including its ABI padding and obsolete name fields.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Ustat {
     f_tfree: i32,
     _padding: u32,
@@ -101,10 +101,7 @@ fn write_stat<M: UserMemory + ?Sized>(
     statbuf: *mut stat,
     value: stat,
 ) -> AxResult<()> {
-    // SAFETY: `stat` is an integer-only x86_64 UAPI record.  The layout
-    // assertions above cover its complete initialized object representation,
-    // including ABI padding and tail bytes.
-    unsafe { VmMutPtr::vm_write_unchecked(statbuf, memory, value) }.map_err(map_usercopy_error)
+    VmMutPtr::vm_write_abi(statbuf, memory, value).map_err(map_usercopy_error)
 }
 
 fn write_statx<M: UserMemory + ?Sized>(
@@ -112,9 +109,7 @@ fn write_statx<M: UserMemory + ?Sized>(
     statxbuf: *mut statx,
     value: statx,
 ) -> AxResult<()> {
-    // SAFETY: `statx` is a fully initialized integer-only x86_64 UAPI record;
-    // its complete object extent is checked above before this raw copyout.
-    unsafe { VmMutPtr::vm_write_unchecked(statxbuf, memory, value) }.map_err(map_usercopy_error)
+    VmMutPtr::vm_write_abi(statxbuf, memory, value).map_err(map_usercopy_error)
 }
 
 fn write_statfs<M: UserMemory + ?Sized>(
@@ -122,9 +117,7 @@ fn write_statfs<M: UserMemory + ?Sized>(
     buf: *mut statfs,
     value: statfs,
 ) -> AxResult<()> {
-    // SAFETY: `statfs` is integer-only on the supported x86_64 ABI and its
-    // complete object size/alignment are asserted above.
-    unsafe { VmMutPtr::vm_write_unchecked(buf, memory, value) }.map_err(map_usercopy_error)
+    VmMutPtr::vm_write_abi(buf, memory, value).map_err(map_usercopy_error)
 }
 
 fn write_ustat<M: UserMemory + ?Sized>(
@@ -132,9 +125,7 @@ fn write_ustat<M: UserMemory + ?Sized>(
     buf: *mut Ustat,
     value: Ustat,
 ) -> AxResult<()> {
-    // SAFETY: `Ustat` is integer-only and initialized from a zeroed complete
-    // object representation before its counters are filled in.
-    unsafe { VmMutPtr::vm_write_unchecked(buf, memory, value) }.map_err(|_| AxError::BadAddress)
+    VmMutPtr::vm_write(buf, memory, value).map_err(|_| AxError::BadAddress)
 }
 
 #[inline]
@@ -483,8 +474,7 @@ pub fn sys_faccessat2<M: UserMemory + ?Sized>(
 
 fn statfs(loc: &Location) -> AxResult<statfs> {
     let stat = loc.filesystem().stat()?;
-    // FIXME: Zeroable
-    let mut result: statfs = unsafe { core::mem::zeroed() };
+    let mut result = <statfs as tk_linux_usercopy::UserAbiValue>::abi_zeroed();
     result.f_type = stat.fs_type as _;
     result.f_bsize = stat.block_size as _;
     result.f_blocks = stat.blocks as _;
@@ -549,7 +539,7 @@ fn special_fd_filesystem(fd: &dyn FileLike) -> Option<SpecialFdFilesystem> {
 }
 
 fn special_fd_statfs(fd: &dyn FileLike) -> Option<AxResult<statfs>> {
-    let mut result: statfs = unsafe { core::mem::zeroed() };
+    let mut result = <statfs as tk_linux_usercopy::UserAbiValue>::abi_zeroed();
     let kind = special_fd_filesystem(fd)?;
     result.f_type = match kind {
         SpecialFdFilesystem::Pipe => PIPEFS_MAGIC,

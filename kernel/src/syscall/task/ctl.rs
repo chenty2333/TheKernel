@@ -332,9 +332,11 @@ fn write_nodemask<M: UserMemory + ?Sized>(
     // The reported mask is `nr_node_ids` bits wide, so only the first word is
     // ever written; `copy` never exceeds it here.
     let _ = maxnode;
-    vm_write_slice(memory, nodemask.cast::<u8>(), unsafe {
-        core::slice::from_raw_parts((&value as *const usize).cast::<u8>(), copy.min(node_bytes))
-    })
+    vm_write_slice(
+        memory,
+        nodemask.cast::<u8>(),
+        &value.to_ne_bytes()[..copy.min(node_bytes)],
+    )
     .map_err(map_usercopy_error)
 }
 
@@ -1608,21 +1610,15 @@ fn validate_cap_version<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     header_ptr: *mut __user_cap_header_struct,
 ) -> AxResult<__user_cap_header_struct> {
-    // FIXME: AnyBitPattern
-    let mut header = unsafe {
-        header_ptr
-            .vm_read_uninit(memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let mut header = header_ptr
+            .vm_read_abi(memory)
+            .map_err(map_usercopy_error)?;
     if !matches!(
         header.version,
         _LINUX_CAPABILITY_VERSION_1 | _LINUX_CAPABILITY_VERSION_2 | _LINUX_CAPABILITY_VERSION_3
     ) {
         header.version = _LINUX_CAPABILITY_VERSION_3;
-        unsafe {
-            VmMutPtr::vm_write_unchecked(header_ptr, memory, header).map_err(map_usercopy_error)?;
-        }
+        VmMutPtr::vm_write_abi(header_ptr, memory, header).map_err(map_usercopy_error)?;
         return Err(AxError::InvalidInput);
     }
     Ok(header)
@@ -1654,8 +1650,7 @@ fn write_cap_data<M: UserMemory + ?Sized>(
     let permitted = state.permitted();
     let inheritable = state.inheritable();
     for index in 0..cap_data_words(version) {
-        unsafe {
-            VmMutPtr::vm_write_unchecked(
+        VmMutPtr::vm_write_abi(
                 data.wrapping_add(index),
                 memory,
                 __user_cap_data_struct {
@@ -1665,7 +1660,6 @@ fn write_cap_data<M: UserMemory + ?Sized>(
                 },
             )
             .map_err(map_usercopy_error)?;
-        }
     }
     Ok(())
 }
@@ -1680,12 +1674,9 @@ fn read_cap_data<M: UserMemory + ?Sized>(
     let mut inheritable = [0; CAPABILITY_WORDS];
 
     for index in 0..cap_data_words(version) {
-        let entry: __user_cap_data_struct = unsafe {
-            data.wrapping_add(index)
-                .vm_read_uninit(memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let entry: __user_cap_data_struct = data.wrapping_add(index)
+            .vm_read_abi(memory)
+            .map_err(map_usercopy_error)?;
         let valid = CAPABILITY_VALID_MASK[index];
         effective[index] = entry.effective & valid;
         permitted[index] = entry.permitted & valid;
@@ -2224,6 +2215,8 @@ pub fn sys_move_pages<M: UserMemory + ?Sized>(
 
         for chunk_index in 0..chunk_len {
             let index = offset + chunk_index;
+            // SAFETY: `snapshot_move_pages_array` initialized the first `chunk_len` entries and
+            // `chunk_index < chunk_len`.
             let page = unsafe { page_values[chunk_index].assume_init() };
             let status_value = if nodes.is_null() {
                 // `do_pages_stat()` reports the node of each page; a null
@@ -2232,6 +2225,9 @@ pub fn sys_move_pages<M: UserMemory + ?Sized>(
             } else {
                 match numa_page_node(&target, page) {
                     Ok(_) => {
+                        // SAFETY: `nodes` is non-null on this path, so `snapshot_move_pages_array`
+                        // initialized the first `chunk_len` node entries and `chunk_index <
+                        // chunk_len`.
                         let node = unsafe { node_values[chunk_index].assume_init() };
                         validate_movable_node(node)?;
                         if flags & MPOL_MF_MOVE_ALL as usize == 0
@@ -2410,11 +2406,8 @@ fn copy_prctl_mm_auxv<M: UserMemory + ?Sized>(
     let mut auxv = Vec::new();
     auxv.try_reserve_exact(len).map_err(|_| AxError::NoMemory)?;
     auxv.resize(len, 0);
-    let destination = unsafe {
-        core::slice::from_raw_parts_mut(auxv.as_mut_ptr().cast::<MaybeUninit<u8>>(), len)
-    };
     memory
-        .read_bytes(address, destination)
+        .read_into(address, &mut auxv)
         .map_err(map_usercopy_error)?;
     Ok(auxv)
 }

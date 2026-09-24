@@ -55,11 +55,14 @@ pub const DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE: u64 = 7;
 pub const DRM_CLIENT_CAP_OBJECT_COLOROP: u64 = 8;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVersion {
     pub version_major: i32,
     pub version_minor: i32,
     pub version_patchlevel: i32,
+    /// Linux's `struct drm_version` has an alignment hole here; naming it
+    /// keeps every byte copied back to userspace initialized.
+    pub pad: u32,
     pub name_len: u64,
     pub name: u64,
     pub date_len: u64,
@@ -68,37 +71,37 @@ pub struct DrmVersion {
     pub desc: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmAuth {
     pub magic: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmGetCap {
     pub capability: u64,
     pub value: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSetClientCap {
     pub capability: u64,
     pub value: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmGemClose {
     pub handle: u32,
     pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmPrimeHandle {
     pub handle: u32,
     pub flags: u32,
     pub fd: i32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSetVersion {
     pub drm_di_major: i32,
     pub drm_di_minor: i32,
@@ -138,7 +141,7 @@ pub const DRM_MODE_PROP_SIGNED_RANGE: u32 = 2 << 6;
 pub const DRM_MODE_PROP_ATOMIC: u32 = 0x8000_0000;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeModeInfo {
     pub clock: u32,
     pub hdisplay: u16,
@@ -157,7 +160,7 @@ pub struct DrmModeModeInfo {
     pub name: [u8; DRM_DISPLAY_MODE_LEN],
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeCardRes {
     pub fb_id_ptr: u64,
     pub crtc_id_ptr: u64,
@@ -173,7 +176,7 @@ pub struct DrmModeCardRes {
     pub max_height: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeCrtc {
     pub set_connectors_ptr: u64,
     pub count_connectors: u32,
@@ -186,7 +189,7 @@ pub struct DrmModeCrtc {
     pub mode: DrmModeModeInfo,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeCrtcLut {
     pub crtc_id: u32,
     pub gamma_size: u32,
@@ -195,7 +198,7 @@ pub struct DrmModeCrtcLut {
     pub blue: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeGetEncoder {
     pub encoder_id: u32,
     pub encoder_type: u32,
@@ -204,7 +207,7 @@ pub struct DrmModeGetEncoder {
     pub possible_clones: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeGetConnector {
     pub encoders_ptr: u64,
     pub modes_ptr: u64,
@@ -224,7 +227,7 @@ pub struct DrmModeGetConnector {
     pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeSetPlane {
     pub plane_id: u32,
     pub crtc_id: u32,
@@ -240,7 +243,7 @@ pub struct DrmModeSetPlane {
     pub src_w: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeGetPlane {
     pub plane_id: u32,
     pub crtc_id: u32,
@@ -251,19 +254,21 @@ pub struct DrmModeGetPlane {
     pub format_type_ptr: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeGetPlaneRes {
     pub plane_id_ptr: u64,
     pub count_planes: u32,
+    /// Trailing alignment hole of Linux's layout, made an explicit field.
+    pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModePropertyEnum {
     pub value: u64,
     pub name: [u8; DRM_PROP_NAME_LEN],
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeGetProperty {
     pub values_ptr: u64,
     pub enum_blob_ptr: u64,
@@ -274,50 +279,54 @@ pub struct DrmModeGetProperty {
     pub count_enum_blobs: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeConnectorSetProperty {
     pub value: u64,
     pub prop_id: u32,
     pub connector_id: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeObjGetProperties {
     pub props_ptr: u64,
     pub prop_values_ptr: u64,
     pub count_props: u32,
     pub obj_id: u32,
     pub obj_type: u32,
+    /// Trailing alignment hole of Linux's layout, made an explicit field.
+    pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeObjSetProperty {
     pub value: u64,
     pub prop_id: u32,
     pub obj_id: u32,
     pub obj_type: u32,
+    /// Trailing alignment hole of Linux's layout, made an explicit field.
+    pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeGetBlob {
     pub blob_id: u32,
     pub length: u32,
     pub data: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeCreateBlob {
     pub data: u64,
     pub length: u32,
     pub blob_id: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeDestroyBlob {
     pub blob_id: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeFbCmd {
     pub fb_id: u32,
     pub width: u32,
@@ -328,7 +337,7 @@ pub struct DrmModeFbCmd {
     pub handle: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeFbCmd2 {
     pub fb_id: u32,
     pub width: u32,
@@ -338,10 +347,13 @@ pub struct DrmModeFbCmd2 {
     pub handles: [u32; 4],
     pub pitches: [u32; 4],
     pub offsets: [u32; 4],
+    /// Linux's `struct drm_mode_fb_cmd2` has an alignment hole here; naming
+    /// it keeps every byte copied back to userspace initialized.
+    pub pad: u32,
     pub modifier: [u64; 4],
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeFbDirtyCmd {
     pub fb_id: u32,
     pub flags: u32,
@@ -353,7 +365,7 @@ pub const DRM_MODE_CURSOR_BO: u32 = 0x01;
 pub const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
 pub const DRM_MODE_CURSOR_FLAGS: u32 = 0x03;
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeCursor {
     pub flags: u32,
     pub crtc_id: u32,
@@ -364,7 +376,7 @@ pub struct DrmModeCursor {
     pub handle: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeCursor2 {
     pub flags: u32,
     pub crtc_id: u32,
@@ -377,7 +389,7 @@ pub struct DrmModeCursor2 {
     pub hot_y: i32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeCrtcPageFlip {
     pub crtc_id: u32,
     pub fb_id: u32,
@@ -386,7 +398,7 @@ pub struct DrmModeCrtcPageFlip {
     pub user_data: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeCreateDumb {
     pub height: u32,
     pub width: u32,
@@ -397,19 +409,19 @@ pub struct DrmModeCreateDumb {
     pub size: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeMapDumb {
     pub handle: u32,
     pub pad: u32,
     pub offset: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeDestroyDumb {
     pub handle: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmModeAtomic {
     pub flags: u32,
     pub count_objs: u32,
@@ -452,22 +464,25 @@ pub const DRM_VBLANK_FLIP: u32 = 0x0800_0000;
 pub const DRM_VBLANK_NEXTONMISS: u32 = 0x1000_0000;
 pub const DRM_VBLANK_SECONDARY: u32 = 0x2000_0000;
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmWaitVblankRequest {
     pub type_: u32,
     pub sequence: u32,
     pub signal: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmWaitVblankReply {
     pub type_: u32,
     pub sequence: u32,
     pub tval_sec: i64,
     pub tval_usec: i64,
 }
+/// Read from userspace as a whole; deliberately not `NoUninit`, because a
+/// value built from the 16-byte `request` leaves 8 bytes undefined. Replies
+/// are written back as a `DrmWaitVblankReply`, which spans the union.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::AnyBitPattern)]
 pub union DrmWaitVblank {
     pub request: DrmWaitVblankRequest,
     pub reply: DrmWaitVblankReply,
@@ -484,7 +499,7 @@ pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: u32 = 4;
 pub const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE: u32 = 8;
 pub const DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED: u32 = 1;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSyncobjCreate {
     pub handle: u32,
     pub flags: u32,
@@ -500,7 +515,7 @@ impl DrmSyncobjCreate {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSyncobjDestroy {
     pub handle: u32,
     pub pad: u32,
@@ -516,7 +531,7 @@ impl DrmSyncobjDestroy {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSyncobjHandle {
     pub handle: u32,
     pub flags: u32,
@@ -525,7 +540,7 @@ pub struct DrmSyncobjHandle {
     pub point: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSyncobjTransfer {
     pub src_handle: u32,
     pub dst_handle: u32,
@@ -535,7 +550,7 @@ pub struct DrmSyncobjTransfer {
     pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSyncobjWait {
     pub handles: u64,
     pub timeout_nsec: i64,
@@ -546,7 +561,7 @@ pub struct DrmSyncobjWait {
     pub deadline_nsec: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSyncobjTimelineWait {
     pub handles: u64,
     pub points: u64,
@@ -558,7 +573,7 @@ pub struct DrmSyncobjTimelineWait {
     pub deadline_nsec: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSyncobjEventfd {
     pub handle: u32,
     pub flags: u32,
@@ -567,14 +582,14 @@ pub struct DrmSyncobjEventfd {
     pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSyncobjArray {
     pub handles: u64,
     pub count_handles: u32,
     pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmSyncobjTimelineArray {
     pub handles: u64,
     pub points: u64,
@@ -627,21 +642,21 @@ pub const VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK: u64 = 0x0003;
 pub const VIRTGPU_CONTEXT_PARAM_DEBUG_NAME: u64 = 0x0004;
 pub const VIRTGPU_EVENT_FENCE_SIGNALED: u32 = 0x9000_0000;
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuMap {
     pub offset: u64,
     pub handle: u32,
     pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuExecbufferSyncobj {
     pub handle: u32,
     pub flags: u32,
     pub point: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuExecbuffer {
     pub flags: u32,
     pub size: u32,
@@ -657,13 +672,13 @@ pub struct DrmVirtgpuExecbuffer {
     pub out_syncobjs: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuGetparam {
     pub param: u64,
     pub value: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuResourceCreate {
     pub target: u32,
     pub format: u32,
@@ -681,7 +696,7 @@ pub struct DrmVirtgpuResourceCreate {
     pub stride: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuResourceInfo {
     pub bo_handle: u32,
     pub res_handle: u32,
@@ -689,7 +704,7 @@ pub struct DrmVirtgpuResourceInfo {
     pub blob_mem: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpu3dBox {
     pub x: u32,
     pub y: u32,
@@ -699,7 +714,7 @@ pub struct DrmVirtgpu3dBox {
     pub d: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpu3dTransfer {
     pub bo_handle: u32,
     pub box_: DrmVirtgpu3dBox,
@@ -709,13 +724,13 @@ pub struct DrmVirtgpu3dTransfer {
     pub layer_stride: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpu3dWait {
     pub handle: u32,
     pub flags: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuGetCaps {
     pub cap_set_id: u32,
     pub cap_set_ver: u32,
@@ -724,7 +739,7 @@ pub struct DrmVirtgpuGetCaps {
     pub pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuResourceCreateBlob {
     pub blob_mem: u32,
     pub blob_flags: u32,
@@ -737,13 +752,13 @@ pub struct DrmVirtgpuResourceCreateBlob {
     pub blob_id: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuContextSetParam {
     pub param: u64,
     pub value: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrmVirtgpuContextInit {
     pub num_params: u32,
     pub pad: u32,

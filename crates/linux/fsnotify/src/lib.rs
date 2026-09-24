@@ -277,6 +277,21 @@ pub struct FanotifyEventMetadata {
     pub pid: i32,
 }
 
+impl FanotifyEventMetadata {
+    /// The record's native-endian wire image, as `read(2)` delivers it.
+    pub fn to_ne_bytes(&self) -> [u8; core::mem::size_of::<Self>()] {
+        let mut out = [0; core::mem::size_of::<Self>()];
+        out[0..4].copy_from_slice(&self.event_len.to_ne_bytes());
+        out[4] = self.vers;
+        out[5] = self.reserved;
+        out[6..8].copy_from_slice(&self.metadata_len.to_ne_bytes());
+        out[8..16].copy_from_slice(&self.mask.to_ne_bytes());
+        out[16..20].copy_from_slice(&self.fd.to_ne_bytes());
+        out[20..24].copy_from_slice(&self.pid.to_ne_bytes());
+        out
+    }
+}
+
 /// A fanotify pidfd event-info record.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,6 +305,25 @@ pub struct FanotifyEventInfoPidfd {
     /// Event pidfd or [`FAN_NOPIDFD`].
     pub pidfd: i32,
 }
+
+impl FanotifyEventInfoPidfd {
+    /// The record's native-endian wire image, as `read(2)` delivers it.
+    pub fn to_ne_bytes(&self) -> [u8; core::mem::size_of::<Self>()] {
+        let mut out = [0; core::mem::size_of::<Self>()];
+        out[0] = self.info_type;
+        out[1] = self.pad;
+        out[2..4].copy_from_slice(&self.len.to_ne_bytes());
+        out[4..8].copy_from_slice(&self.pidfd.to_ne_bytes());
+        out
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<FanotifyEventMetadata>() == 24);
+    assert!(core::mem::offset_of!(FanotifyEventMetadata, mask) == 8);
+    assert!(core::mem::offset_of!(FanotifyEventMetadata, pid) == 20);
+    assert!(core::mem::size_of::<FanotifyEventInfoPidfd>() == 8);
+};
 
 /// A fanotify userspace permission response record.
 #[repr(C)]

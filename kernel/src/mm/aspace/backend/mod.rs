@@ -199,6 +199,8 @@ fn alloc_frame(zeroed: bool, size: PageSize) -> AxResult<PhysAddr> {
         // to ~43us. page_size is always a multiple of 8 (4K/2M).
         let p = vaddr.as_mut_ptr() as *mut u64;
         for i in 0..(page_size / 8) {
+            // SAFETY: `vaddr` is the `page_size`-byte block the allocator just returned; it is
+            // 8-byte aligned and `i < page_size / 8`.
             unsafe { *p.add(i) = 0 };
         }
     }

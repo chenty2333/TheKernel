@@ -783,17 +783,9 @@ pub fn sys_bind(
             if (addrlen as usize) < size_of::<crate::file::netlink::SockaddrNl>() {
                 return Err(AxError::InvalidInput);
             }
-            let addr = unsafe {
-                // Every byte is copied into the MaybeUninit storage before
-                // success, and SockaddrNl contains only integer fields for which
-                // every bit pattern is valid.
-                capability
-                    .read_value_uninit(
-                        addr.address().as_usize() as *const crate::file::netlink::SockaddrNl
-                    )
-                    .map_err(map_usercopy_error)?
-                    .assume_init()
-            };
+            let addr = capability
+                .read_value(addr.address().as_usize() as *const crate::file::netlink::SockaddrNl)
+                .map_err(map_usercopy_error)?;
             // `if (nladdr->nl_family != AF_NETLINK) return -EINVAL;` — the
             // netlink family check reports EINVAL, not EAFNOSUPPORT.
             if addr.nl_family as u32 != AF_NETLINK {
@@ -981,14 +973,9 @@ pub fn sys_connect(
             {
                 return Err(AxError::InvalidInput);
             }
-            Some(unsafe {
-                capability
-                    .read_value_uninit(
-                        addr.address().as_usize() as *const crate::file::netlink::SockaddrNl
-                    )
-                    .map_err(map_usercopy_error)?
-                    .assume_init()
-            })
+            Some(capability
+            .read_value(addr.address().as_usize() as *const crate::file::netlink::SockaddrNl)
+            .map_err(map_usercopy_error)?)
         };
         let prepared = address.map_or(
             PreparedSocketAddress::Unspecified,

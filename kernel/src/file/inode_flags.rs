@@ -489,12 +489,11 @@ fn write_u32(context: &IoctlContext, arg: usize, value: u32) -> AxResult<()> {
 }
 
 fn read_fsxattr(context: &IoctlContext, arg: usize) -> AxResult<[u32; 5]> {
-    let mut bytes = [core::mem::MaybeUninit::uninit(); 20];
+    let mut bytes = [0u8; 20];
     context
         .user_memory()
-        .read_bytes(arg, &mut bytes)
+        .read_into(arg as *const u8, &mut bytes)
         .map_err(map_usercopy_error)?;
-    let bytes: [u8; 20] = unsafe { core::mem::transmute(bytes) };
     Ok(core::array::from_fn(|index| {
         u32::from_ne_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
     }))

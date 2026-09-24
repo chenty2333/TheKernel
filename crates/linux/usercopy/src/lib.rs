@@ -149,6 +149,17 @@ impl<'a, M: UserMemory + ?Sized> UserMemoryContext<'a, M> {
         self.memory.read(start, dst)
     }
 
+    /// Reads a byte range into an already-initialized buffer, such as a
+    /// zeroed snapshot array.
+    pub fn read_into(&mut self, start: usize, dst: &mut [u8]) -> VmResult {
+        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and a provider
+        // only ever stores initialized bytes through the view, so `dst` stays
+        // initialized whether the copy succeeds or faults.
+        let view =
+            unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<MaybeUninit<u8>>(), dst.len()) };
+        self.read_bytes(start, view)
+    }
+
     /// Writes a byte range after checked address arithmetic.
     pub fn write_bytes(&mut self, start: usize, src: &[u8]) -> VmResult {
         if src.is_empty() {
@@ -333,6 +344,11 @@ pub unsafe fn vm_write_slice_unchecked<M: UserMemory + ?Sized, T>(
     // SAFETY: forwarded from this function's caller.
     unsafe { memory.write_slice_unchecked(ptr, src) }
 }
+
+mod abi_value;
+#[doc(hidden)]
+pub use abi_value::field_size;
+pub use abi_value::{UserAbiPod, UserAbiValue, abi_bytes, abi_bytes_mut, abi_read_unaligned};
 
 mod thin;
 pub use thin::{VmMutPtr, VmPtr};

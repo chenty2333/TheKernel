@@ -1642,11 +1642,15 @@ fn notify_foreign_cpu_timer_owners(target: &ProcessData) {
             Arc::increment_strong_count(owner);
         }
         if node.generation.load(Ordering::Acquire) != before {
+            // SAFETY: the generation changed, so the count retained above may belong to a retiring
+            // node; release exactly the temporary count this reader added.
             unsafe {
                 drop(Arc::from_raw(owner));
             }
             continue;
         }
+        // SAFETY: the generation was stable across the increment, so this reader holds its own
+        // strong count on `owner`, which this Arc now owns.
         let owner = unsafe { Arc::from_raw(owner) };
         if let Some(cpu) = request_process_cpu_evaluation(&owner) {
             crate::deferred_work::wake_process_timer_worker(cpu);
@@ -1794,6 +1798,8 @@ pub(crate) fn retire_foreign_cpu_timer_owner(target: &ProcessData, slot: usize) 
     // this release point prevents new readers from observing this raw owner.
     node.generation.store(0, Ordering::Release);
     if !owner.is_null() {
+        // SAFETY: the node held one raw strong count in `owner`; the generation flip and swap
+        // removed it from every IRQ reader, so it is released exactly once here.
         unsafe {
             drop(Arc::from_raw(owner));
         }
@@ -1844,7 +1850,7 @@ struct ProcessITimerConsumerSlot {
     cursor: UnsafeCell<MaybeUninit<ProcessITimerWorkConsumer>>,
 }
 
-// The owner token is the synchronization boundary. Exactly one task context
+// SAFETY: the owner token is the synchronization boundary. Exactly one task context
 // may dereference a slot cursor at a time; the fixed storage itself never
 // moves, so a worker can release it after an error and a fallback (possibly
 // running on another CPU) can acquire the same cursor without rebuilding the
@@ -3392,6 +3398,9 @@ fn publish_process_itimer_work(proc_data: &Arc<ProcessData>) -> Option<usize> {
     // Release is the publication point. The caller wakes the worker only after
     // this store, so CPU `cpu`'s consumer may return NotReady on the transient
     // tail gap without losing progress.
+    // SAFETY: the tail is never null: it starts at this CPU's static stub and otherwise holds a
+    // published node, which stays queue-owned (its Arc retained) until the consumer advances past
+    // it.
     unsafe { &*previous }.next.store(node, Ordering::Release);
     PROCESS_ITIMER_WORK_PUBLISHED.fetch_add(1, Ordering::Relaxed);
     Some(cpu)
@@ -3424,6 +3433,8 @@ impl ProcessITimerWorkConsumer {
         let stub = ptr::from_ref(&PROCESS_ITIMER_WORK_STUBS[self.cpu]).cast_mut();
         self.head == stub
             && PROCESS_ITIMER_WORK_TAILS[self.cpu].load(Ordering::Acquire) == stub
+            // SAFETY: `head` is either the permanent stub or a process node whose queue-owned Arc
+            // stays retained until pop advances past it; only this consumer moves `head`.
             && unsafe { &*self.head }
                 .next
                 .load(Ordering::Acquire)
@@ -3479,6 +3490,8 @@ impl ProcessITimerWorkConsumer {
             }
             self.head = next;
             head = next;
+            // SAFETY: see `has_pending`: `head` is the stub or a queue-owned node, and the single
+            // consumer owns `head` updates.
             next = unsafe { &*head }.next.load(Ordering::Acquire);
         }
 
@@ -3501,6 +3514,7 @@ impl ProcessITimerWorkConsumer {
             } else {
                 PROCESS_ITIMER_WORK_PRODUCER_LINK_GAPS.fetch_add(1, Ordering::Relaxed);
             }
+            // SAFETY: as above; `head` is still queue-owned until this pop advances past it.
             next = unsafe { &*head }.next.load(Ordering::Acquire);
             if next.is_null() {
                 return None;
@@ -3508,6 +3522,8 @@ impl ProcessITimerWorkConsumer {
         }
 
         self.head = next;
+        // SAFETY: `head` is queue-owned until this pop completes; the swap below takes its
+        // transferred raw Arc exactly once.
         let owner = unsafe { &*head }
             .owner
             .swap(ptr::null_mut(), Ordering::AcqRel);

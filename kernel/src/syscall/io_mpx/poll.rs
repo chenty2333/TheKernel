@@ -51,14 +51,14 @@ fn write_poll_result(revents: &mut i16, mut result: IoEvents, interested: IoEven
     *revents != 0
 }
 
-fn read_user_value<T>(caller: &UserMemoryCapability, address: usize) -> AxResult<T> {
+fn read_user_value<T: tk_linux_usercopy::UserAbiValue>(
+    caller: &UserMemoryCapability,
+    address: usize,
+) -> AxResult<T> {
     let value = caller
-        .read_value_uninit(address as *const T)
+        .read_abi_value(address as *const T)
         .map_err(map_usercopy_error)?;
-    // SAFETY: the explicit usercopy initialized the complete value before it
-    // is exposed to the kernel. The syscall mirror types used here contain
-    // only integer fields, so every byte representation is valid.
-    Ok(unsafe { value.assume_init() })
+    Ok(value)
 }
 
 fn snapshot_pollfds(

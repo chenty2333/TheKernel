@@ -192,7 +192,7 @@ fn validate_netlink_frames(data: &[u8]) -> AxResult {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct SockaddrNl {
     pub nl_family: u16,
     pub nl_pad: u16,
@@ -204,14 +204,12 @@ impl SockaddrNl {
     /// The exact bytes `netlink_getname()` leaves in the kernel's
     /// `sockaddr_storage`, ready for `move_addr_to_user()` to copy out.
 pub(crate) fn into_bytes(self) -> [u8; size_of::<Self>()] {
-        // SAFETY: `SockaddrNl` is `repr(C)` and has no padding other than the
-        // explicit `nl_pad`, so every byte of the value is initialized.
-        unsafe { core::mem::transmute(self) }
+        bytemuck::cast(self)
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct NlMsgHdr {
     nlmsg_len: u32,
     nlmsg_type: u16,
@@ -221,14 +219,14 @@ struct NlMsgHdr {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct NlMsgErr {
     error: i32,
     msg: NlMsgHdr,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GenlMsgHdr {
     cmd: u8,
     version: u8,
@@ -236,14 +234,14 @@ struct GenlMsgHdr {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RtAttr {
     rta_len: u16,
     rta_type: u16,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RtMsg {
     rtm_family: u8,
     rtm_dst_len: u8,
@@ -257,7 +255,7 @@ struct RtMsg {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct IfAddrMsg {
     ifa_family: u8,
     ifa_prefixlen: u8,
@@ -267,7 +265,7 @@ struct IfAddrMsg {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct IfInfoMsg {
     ifi_family: u8,
     ifi_pad: u8,

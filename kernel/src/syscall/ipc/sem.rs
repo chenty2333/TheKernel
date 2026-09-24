@@ -274,7 +274,7 @@ fn monotonic_duration() -> Duration {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, AnyBitPattern)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SemidDs {
     pub sem_perm: IpcPerm,
     pub sem_otime: __kernel_time_t,
@@ -315,33 +315,6 @@ const _: () = {
     assert!(offset_of!(SemidDs, unused4) == 96);
 };
 
-fn initialized_semid_ds(value: SemidDs) -> SemidDs {
-    // SAFETY: all fields are integer scalars; zero is valid and initializes
-    // both the embedded IpcPerm alignment hole and the complete record.
-    let mut result: SemidDs = unsafe { core::mem::zeroed() };
-    let mut perm: IpcPerm = unsafe { core::mem::zeroed() };
-    perm.key = value.sem_perm.key;
-    perm.uid = value.sem_perm.uid;
-    perm.gid = value.sem_perm.gid;
-    perm.cuid = value.sem_perm.cuid;
-    perm.cgid = value.sem_perm.cgid;
-    perm.mode = value.sem_perm.mode;
-    perm.pad1 = value.sem_perm.pad1;
-    perm.seq = value.sem_perm.seq;
-    perm.pad2 = value.sem_perm.pad2;
-    perm.unused0 = value.sem_perm.unused0;
-    perm.unused1 = value.sem_perm.unused1;
-    result.sem_perm = perm;
-    result.sem_otime = value.sem_otime;
-    result.unused1 = value.unused1;
-    result.sem_ctime = value.sem_ctime;
-    result.unused2 = value.unused2;
-    result.sem_nsems = value.sem_nsems;
-    result.unused3 = value.unused3;
-    result.unused4 = value.unused4;
-    result
-}
-
 const _: () = {
     assert!(align_of::<SemInfo>() == 4);
     assert!(size_of::<SemInfo>() == 40);
@@ -357,10 +330,7 @@ fn write_semid_ds<M: UserMemory + ?Sized>(
     ptr: *mut SemidDs,
     value: SemidDs,
 ) -> AxResult<()> {
-    // SAFETY: `initialized_semid_ds` zeroes all padding and the assertions
-    // above cover the full Linux object extent.
-    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_semid_ds(value)) }
-        .map_err(map_usercopy_error)
+    VmMutPtr::vm_write(ptr, memory, value).map_err(map_usercopy_error)
 }
 
 fn write_sem_info<M: UserMemory + ?Sized>(
@@ -368,9 +338,7 @@ fn write_sem_info<M: UserMemory + ?Sized>(
     ptr: *mut SemInfo,
     value: SemInfo,
 ) -> AxResult<()> {
-    // SAFETY: `SemInfo` consists solely of ten initialized i32 words and has
-    // no padding on x86_64, as checked above.
-    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, value) }.map_err(map_usercopy_error)
+    VmMutPtr::vm_write(ptr, memory, value).map_err(map_usercopy_error)
 }
 
 impl SemidDs {
@@ -386,6 +354,7 @@ impl SemidDs {
                 pad1: 0,
                 seq: 0,
                 pad2: 0,
+                pad3: 0,
                 unused0: 0,
                 unused1: 0,
             },
@@ -401,7 +370,7 @@ impl SemidDs {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, AnyBitPattern)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SemInfo {
     semmap: c_int,
     semmni: c_int,
@@ -1413,11 +1382,7 @@ fn read_timeout<M: UserMemory + ?Sized>(
     if timeout.is_null() {
         return Ok(None);
     }
-    let timeout = unsafe {
-        VmPtr::vm_read_uninit(timeout, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let timeout = VmPtr::vm_read_abi(timeout, memory).map_err(map_usercopy_error)?;
     Ok(Some(timeout))
 }
 

@@ -806,11 +806,12 @@ pub(crate) struct IoUring {
     _request_charge: RequestSlotCharge,
 }
 
-// `self_weak` is initialized before the ring is published and is immutable
+// SAFETY: `self_weak` is initialized before the ring is published and is immutable
 // afterwards.  It is a self-referential ownership aid, so `spin::Once` cannot
 // derive these auto traits without a circular proof through `Weak<IoUring>`.
 // Every mutable ring field is independently atomic or behind a lock.
 unsafe impl Send for IoUring {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for IoUring {}
 
 impl IoUring {

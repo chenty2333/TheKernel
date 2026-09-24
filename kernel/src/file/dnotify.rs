@@ -446,6 +446,7 @@ fn refill_pending_table_cleanup() {
         // SAFETY: the swap gave this single drainer exclusive ownership of the
         // detached batch.
         let next = unsafe { (*current).next.load(Ordering::Relaxed) };
+        // SAFETY: the swap gave this single drainer exclusive ownership of the detached batch.
         unsafe { (*current).next.store(reversed, Ordering::Relaxed) };
         reversed = current;
         current = next;
@@ -465,7 +466,10 @@ fn pop_table_cleanup() -> Option<Box<TableCleanupWork>> {
     // access the private PENDING list.
     let next = unsafe { (*head).next.load(Ordering::Relaxed) };
     TABLE_CLEANUP_PENDING.store(next, Ordering::Relaxed);
+    // SAFETY: as above; `head` is still owned by the private PENDING list.
     unsafe { (*head).next.store(ptr::null_mut(), Ordering::Relaxed) };
+    // SAFETY: `head` came from `Box::into_raw` and is now unlinked, so ownership returns to
+    // exactly one Box.
     Some(unsafe { Box::from_raw(head) })
 }
 

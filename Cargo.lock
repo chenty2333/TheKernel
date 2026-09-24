@@ -3760,6 +3760,9 @@ dependencies = [
 [[package]]
 name = "tk-linux-drm"
 version = "0.1.0"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "tk-linux-fd"
@@ -3857,6 +3860,7 @@ name = "tk-linux-signal"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
+ "bytemuck",
  "derive_more",
  "kspin",
  "linux-raw-sys",

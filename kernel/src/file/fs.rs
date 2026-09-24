@@ -94,13 +94,11 @@ fn clone_range_ioctl(
         let source_fd = i32::try_from(argument).map_err(|_| AxError::BadFileDescriptor)?;
         (source_fd, 0, 0, 0)
     } else if command == FICLONERANGE {
-        let mut raw = [core::mem::MaybeUninit::uninit(); FILE_CLONE_RANGE_BYTES];
+        let mut raw = [0u8; FILE_CLONE_RANGE_BYTES];
         context
             .user_memory()
-            .read_bytes(argument, &mut raw)
+            .read_into(argument as *const u8, &mut raw)
             .map_err(crate::mm::map_usercopy_error)?;
-        // `read_bytes` initializes all elements on success.
-        let raw: [u8; FILE_CLONE_RANGE_BYTES] = unsafe { core::mem::transmute(raw) };
         let source_fd = i64::from_ne_bytes(raw[..8].try_into().map_err(|_| AxError::InvalidInput)?);
         let source_fd = i32::try_from(source_fd).map_err(|_| AxError::BadFileDescriptor)?;
         let source_offset =
@@ -174,13 +172,11 @@ fn dedupe_range_ioctl(
     context: &IoctlContext,
     argument: usize,
 ) -> AxResult<usize> {
-    let mut header = [core::mem::MaybeUninit::uninit(); FILE_DEDUPE_RANGE_HEADER_BYTES];
+    let mut header = [0u8; FILE_DEDUPE_RANGE_HEADER_BYTES];
     context
         .user_memory()
-        .read_bytes(argument, &mut header)
+        .read_into(argument as *const u8, &mut header)
         .map_err(crate::mm::map_usercopy_error)?;
-    // `read_bytes` initializes all elements on success.
-    let header: [u8; FILE_DEDUPE_RANGE_HEADER_BYTES] = unsafe { core::mem::transmute(header) };
     let source_offset =
         u64::from_ne_bytes(header[..8].try_into().map_err(|_| AxError::InvalidInput)?);
     let length = u64::from_ne_bytes(
@@ -214,13 +210,11 @@ fn dedupe_range_ioctl(
             .checked_add(FILE_DEDUPE_RANGE_HEADER_BYTES)
             .and_then(|base| base.checked_add(index.checked_mul(FILE_DEDUPE_RANGE_INFO_BYTES)?))
             .ok_or(AxError::BadAddress)?;
-        let mut info = [core::mem::MaybeUninit::uninit(); FILE_DEDUPE_RANGE_INFO_BYTES];
+        let mut info = [0u8; FILE_DEDUPE_RANGE_INFO_BYTES];
         context
             .user_memory()
-            .read_bytes(address, &mut info)
+            .read_into(address as *const u8, &mut info)
             .map_err(crate::mm::map_usercopy_error)?;
-        // `read_bytes` initializes all elements on success.
-        let mut info: [u8; FILE_DEDUPE_RANGE_INFO_BYTES] = unsafe { core::mem::transmute(info) };
         if info[28..].iter().any(|byte| *byte != 0) {
             return Err(AxError::InvalidInput);
         }

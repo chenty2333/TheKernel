@@ -119,11 +119,7 @@ fn read_epoll_event<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     event: *const epoll_event,
 ) -> AxResult<epoll_event> {
-    let value = unsafe {
-        VmPtr::vm_read_uninit(event, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let value = VmPtr::vm_read_abi(event, memory).map_err(map_usercopy_error)?;
     // SAFETY: the explicit provider initialized every byte, and epoll_event
     // contains only integer fields in the checked packed x86_64 ABI.
     Ok(value)
@@ -266,11 +262,7 @@ fn do_epoll_wait<M: UserMemory + ?Sized>(
         // present mask, reject a bad size before touching the user pointer so
         // EINVAL wins over a possible EFAULT from the copyin.
         check_sigset_size(sigsetsize)?;
-        let value = unsafe {
-            VmPtr::vm_read_uninit(sigmask, memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let value = VmPtr::vm_read(sigmask, memory).map_err(map_usercopy_error)?;
         // SAFETY: the explicit provider initialized the complete signal-set
         // representation; SignalSet is an integer-backed mask.
         Some(value)
@@ -329,10 +321,7 @@ fn do_epoll_wait<M: UserMemory + ?Sized>(
                     };
                     let copy_result =
                         checked_epoll_event_ptr(events_base, copied).and_then(|destination| {
-                            // SAFETY: epoll_event has no padding in the
-                            // checked packed x86_64 ABI, and all fields are
-                            // initialized before this copyout.
-                            unsafe { VmMutPtr::vm_write_unchecked(destination, memory, event) }
+                            VmMutPtr::vm_write_abi(destination, memory, event)
                                 .map_err(map_usercopy_error)
                         });
                     if let Err(error) = copy_result {
@@ -411,11 +400,7 @@ pub fn sys_epoll_pwait2<M: UserMemory + ?Sized>(
     let timeout = if timeout.is_null() {
         None
     } else {
-        let value = unsafe {
-            VmPtr::vm_read_uninit(timeout, memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let value = VmPtr::vm_read_abi(timeout, memory).map_err(map_usercopy_error)?;
         // SAFETY: the explicit provider initialized the complete timespec;
         // its two integer fields are valid for all copied bit patterns.
         Some(value.try_into_time_value()?)

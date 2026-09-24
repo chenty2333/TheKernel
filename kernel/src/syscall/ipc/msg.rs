@@ -42,7 +42,7 @@ fn ipc_time_secs() -> __kernel_time_t {
 
 /// Data structure describing a message queue.
 #[repr(C)]
-#[derive(Clone, Copy, AnyBitPattern)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[allow(non_camel_case_types)]
 pub struct msqid_ds {
     /// operation permission struct
@@ -67,10 +67,10 @@ pub struct msqid_ds {
     unused5: c_ulong,
 }
 
-// These IPC records contain explicit Linux ABI padding (and `IpcPerm` has an
-// alignment hole before its two native-word fields).  Keep the x86_64 layout
-// checked and materialize a zeroed copy before the audited unchecked copyout
-// so no Rust padding bytes escape to userspace.
+// These IPC records carry Linux's ABI padding as explicit fields (including
+// `IpcPerm::pad3`, the alignment hole before its two native-word fields), so
+// they derive `Pod` and no Rust padding byte can escape to userspace.  Keep
+// the x86_64 layout checked.
 //
 // `msqid64_ds` ends with two native-word placeholders - the comment above it in
 // `include/uapi/asm-generic/msgbuf.h` reads "Pad space is left for: - 2
@@ -99,38 +99,6 @@ const _: () = {
     assert!(offset_of!(msqid_ds, unused5) == 112);
 };
 
-fn initialized_msqid_ds(value: msqid_ds) -> msqid_ds {
-    // SAFETY: all fields are integer scalars; zero is a valid representation,
-    // and starting from zero also initializes the alignment padding.
-    let mut result: msqid_ds = unsafe { core::mem::zeroed() };
-    // SAFETY: `IpcPerm` is integer-only; zeroing first prevents its implicit
-    // four-byte alignment hole from containing uninitialized data.
-    let mut perm: IpcPerm = unsafe { core::mem::zeroed() };
-    perm.key = value.msg_perm.key;
-    perm.uid = value.msg_perm.uid;
-    perm.gid = value.msg_perm.gid;
-    perm.cuid = value.msg_perm.cuid;
-    perm.cgid = value.msg_perm.cgid;
-    perm.mode = value.msg_perm.mode;
-    perm.pad1 = value.msg_perm.pad1;
-    perm.seq = value.msg_perm.seq;
-    perm.pad2 = value.msg_perm.pad2;
-    perm.unused0 = value.msg_perm.unused0;
-    perm.unused1 = value.msg_perm.unused1;
-    result.msg_perm = perm;
-    result.msg_stime = value.msg_stime;
-    result.msg_rtime = value.msg_rtime;
-    result.msg_ctime = value.msg_ctime;
-    result.msg_cbytes = value.msg_cbytes;
-    result.msg_qnum = value.msg_qnum;
-    result.msg_qbytes = value.msg_qbytes;
-    result.msg_lspid = value.msg_lspid;
-    result.msg_lrpid = value.msg_lrpid;
-    result.unused4 = value.unused4;
-    result.unused5 = value.unused5;
-    result
-}
-
 fn write_msqid_ds<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *mut msqid_ds,
@@ -142,10 +110,7 @@ fn write_msqid_ds<M: UserMemory + ?Sized>(
     let mut value = value;
     value.msg_lspid = super::render_task_pid(value.msg_lspid as Pid);
     value.msg_lrpid = super::render_task_pid(value.msg_lrpid as Pid);
-    // SAFETY: `initialized_msqid_ds` zeroes every byte, including the ABI
-    // alignment hole, and the layout assertions cover the complete record.
-    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_msqid_ds(value)) }
-        .map_err(map_usercopy_error)
+    VmMutPtr::vm_write(ptr, memory, value).map_err(map_usercopy_error)
 }
 
 impl msqid_ds {
@@ -162,6 +127,7 @@ impl msqid_ds {
                 pad1: 0,
                 seq: 0,
                 pad2: 0,
+                pad3: 0,
                 unused0: 0,
                 unused1: 0,
             },
@@ -627,6 +593,7 @@ pub(crate) fn sysvipc_msg_snapshot() -> String {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MsgInfo {
     msgpool: i32,
     msgmap: i32,
@@ -813,7 +780,11 @@ pub fn sys_msgsnd<M: UserMemory + ?Sized>(
     // is reported before any size or identifier validation.  `do_msgsnd()`
     // then checks the size and the identifier, rejects a non-positive type and
     // only afterwards copies the text and resolves the queue.
-    let mtype_ptr = unsafe { core::ptr::addr_of!((*msgp).mtype) };
+    // Field addresses are formed with wrapping arithmetic: `msgp` is a user
+    // address, not a Rust allocation, so no in-bounds projection is implied.
+    let mtype_ptr = msgp
+        .wrapping_byte_add(offset_of!(UserMsgbuf, mtype))
+        .cast::<i64>();
     let mtype: i64 = VmPtr::vm_read(mtype_ptr, memory).map_err(map_usercopy_error)?;
 
     // MSGMAX = 8192
@@ -832,7 +803,9 @@ pub fn sys_msgsnd<M: UserMemory + ?Sized>(
     let flags = MsgSndFlags::from_bits_truncate(msgflg);
 
     // read data part
-    let mtext_ptr = unsafe { core::ptr::addr_of!((*msgp).mtext) };
+    let mtext_ptr = msgp
+        .wrapping_byte_add(offset_of!(UserMsgbuf, mtext))
+        .cast::<u8>();
     let data_vec = vm_load(memory, mtext_ptr.cast::<u8>(), msgsz).map_err(map_usercopy_error)?;
 
     let msg_queue = {
@@ -984,10 +957,14 @@ fn copy_received_message<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     // Keep mtype-before-payload order so a payload fault has the same
     // partial-copy behavior as the old path.
-    let mtype_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtype) };
+    let mtype_ptr = msgp
+        .wrapping_byte_add(offset_of!(UserMsgbuf, mtype))
+        .cast::<i64>();
     VmMutPtr::vm_write(mtype_ptr, memory, received.message.mtype).map_err(map_usercopy_error)?;
 
-    let data_ptr = unsafe { core::ptr::addr_of_mut!((*msgp).mtext) };
+    let data_ptr = msgp
+        .wrapping_byte_add(offset_of!(UserMsgbuf, mtext))
+        .cast::<u8>();
     vm_write_slice(
         memory,
         data_ptr.cast::<u8>(),
@@ -1147,9 +1124,7 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
             };
             (info, manager.max_active_index())
         };
-        // SAFETY: MsgInfo includes initialized explicit ABI tail padding.
-        unsafe { VmMutPtr::vm_write_unchecked(buf as *mut MsgInfo, memory, info) }
-            .map_err(map_usercopy_error)?;
+        VmMutPtr::vm_write(buf as *mut MsgInfo, memory, info).map_err(map_usercopy_error)?;
         return Ok(index);
     }
     if cmd == MSG_STAT || cmd == MSG_STAT_ANY {

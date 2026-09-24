@@ -443,7 +443,7 @@ fn checked_user_array_address<T>(
     Ok(base_addr)
 }
 
-fn read_checked_array_entry<T>(
+fn read_checked_array_entry<T: tk_linux_usercopy::UserAbiValue>(
     base_addr: usize,
     index: usize,
     caller: &UserMemoryCapability,
@@ -456,11 +456,8 @@ fn read_checked_array_entry<T>(
     // address was formed, so this pointer never performs unchecked OOB
     // arithmetic.
     let pointer = address as *const T;
-    let value = caller
-        .read_value_uninit(pointer)
-        .map_err(map_usercopy_error)?;
-    // SAFETY: the complete element range was checked and copied in above.
-    Ok(unsafe { value.assume_init() })
+    let value = caller.read_abi_value(pointer).map_err(map_usercopy_error)?;
+    Ok(value)
 }
 
 fn futex_clock(clock: tk_linux_futex::Clock) -> AlarmClock {
@@ -484,9 +481,8 @@ fn futex_wait_deadline(
     caller: &UserMemoryCapability,
 ) -> AxResult<FutexWaitDeadline> {
     let ts = timeout;
-    let ts = caller.read_value_uninit(ts).map_err(map_usercopy_error)?;
-    // SAFETY: the explicit usercopy initialized the complete timespec.
-    let ts = unsafe { ts.assume_init() }.try_into_time_value()?;
+    let ts = caller.read_abi_value(ts).map_err(map_usercopy_error)?;
+    let ts = ts.try_into_time_value()?;
     let clock = futex_clock(op.timeout_clock());
     let deadline = if op.timeout_is_relative() {
         clock.now().checked_add(ts).unwrap_or(Duration::MAX)
@@ -560,11 +556,8 @@ fn validate_waitv_timeout(
         CLOCK_MONOTONIC => AlarmClock::Monotonic,
         _ => return Err(AxError::InvalidInput),
     };
-    let ts = caller
-        .read_value_uninit(timeout)
-        .map_err(map_usercopy_error)?;
-    // SAFETY: the explicit usercopy initialized the complete timespec.
-    let ts = unsafe { ts.assume_init() }.try_into_time_value()?;
+    let ts = caller.read_abi_value(timeout).map_err(map_usercopy_error)?;
+    let ts = ts.try_into_time_value()?;
     Ok(Some(FutexWaitDeadline {
         clock,
         deadline: ts,

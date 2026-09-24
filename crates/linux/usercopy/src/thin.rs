@@ -2,7 +2,7 @@ use core::{mem::MaybeUninit, ptr::NonNull, slice};
 
 use bytemuck::{AnyBitPattern, NoUninit};
 
-use crate::{UserMemory, UserMemoryContext, VmResult};
+use crate::{UserAbiPod, UserAbiValue, UserMemory, UserMemoryContext, VmResult};
 
 /// Extension methods for typed userspace pointers.
 pub trait VmPtr: Copy {
@@ -44,6 +44,20 @@ pub trait VmPtr: Copy {
         // makes every resulting representation valid.
         Ok(unsafe { value.assume_init() })
     }
+
+    /// Reads a foreign Linux ABI value audited as [`UserAbiValue`].
+    fn vm_read_abi<M: UserMemory + ?Sized>(
+        self,
+        memory: &mut UserMemoryContext<'_, M>,
+    ) -> VmResult<Self::Target>
+    where
+        Self::Target: UserAbiValue,
+    {
+        let value = self.vm_read_uninit(memory)?;
+        // SAFETY: the provider initialized every byte and `UserAbiValue`
+        // makes every resulting representation valid.
+        Ok(unsafe { value.assume_init() })
+    }
 }
 
 impl<T> VmPtr for *const T {
@@ -82,6 +96,20 @@ pub trait VmMutPtr: VmPtr {
         Self::Target: NoUninit,
     {
         memory.write_slice(self.as_ptr().cast_mut(), slice::from_ref(&value))
+    }
+
+    /// Writes a foreign Linux ABI value audited as [`UserAbiPod`].
+    fn vm_write_abi<M: UserMemory + ?Sized>(
+        self,
+        memory: &mut UserMemoryContext<'_, M>,
+        value: Self::Target,
+    ) -> VmResult
+    where
+        Self::Target: UserAbiPod,
+    {
+        // SAFETY: `UserAbiPod` guarantees the value has no padding, so every
+        // byte of its object representation is initialized.
+        unsafe { self.vm_write_unchecked(memory, value) }
     }
 
     /// Writes a value whose complete object representation is initialized.

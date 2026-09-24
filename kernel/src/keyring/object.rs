@@ -215,6 +215,7 @@ pub(super) struct Key {
 pub(super) fn wipe_key_bytes(bytes: &mut [u8]) {
     for byte in bytes {
         // Volatile stores keep secret retirement observable to the compiler.
+        // SAFETY: `byte` is a valid, exclusive `&mut u8`.
         unsafe { core::ptr::write_volatile(byte, 0) };
     }
     core::sync::atomic::compiler_fence(Ordering::SeqCst);

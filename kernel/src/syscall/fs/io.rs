@@ -1488,9 +1488,9 @@ fn read_at_pinned_user_segments(
     segments: &[PinnedPhysicalSegment],
     offset: u64,
 ) -> AxResult<usize> {
+    // SAFETY: The MM pin owners outlive this call and axfs validates mutable
+    // segment disjointness before materializing any destination slice.
     unsafe {
-        // The MM pin owners outlive this call and axfs validates mutable
-        // segment disjointness before materializing any destination slice.
         file.inner()
             .read_at_pinned_segments(segments, offset, false)
     }
@@ -1504,9 +1504,9 @@ fn write_at_pinned_user_segments(
     if !segments.is_empty() {
         admit_positioned_inode_write(file, offset)?;
     }
+    // SAFETY: Pinned source ownership is held by the caller; cache alias policy
+    // remains entirely inside axfs-ng.
     unsafe {
-        // Pinned source ownership is held by the caller; cache alias policy
-        // remains entirely inside axfs-ng.
         file.inner()
             .write_at_pinned_segments(segments, offset, false)
     }
@@ -3408,7 +3408,7 @@ pub(crate) enum ClassicAioOwnedPreparation {
     Unsupported,
 }
 
-// The operation never dereferences its stored userspace addresses directly:
+// SAFETY: the operation never dereferences its stored userspace addresses directly:
 // all access goes through the captured address-space capability.  Imported
 // iovec addresses therefore travel with that capability into the worker.
 unsafe impl Send for ClassicAioOperation {}

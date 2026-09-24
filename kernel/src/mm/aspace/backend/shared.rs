@@ -604,6 +604,9 @@ impl SharedPages {
             let phys = self.materialize_page_locked(&mut pages, page_index)?;
             let src = axhal::mem::phys_to_virt(phys).as_usize() + page_offset;
             let chunk_len = (page_bytes - page_offset).min(buf.len());
+            // SAFETY: `phys` is a materialized frame of this backing held under the `pages` lock,
+            // `page_offset + chunk_len <= page_bytes`, and `buf` is kernel memory that cannot
+            // alias the direct-map frame.
             unsafe {
                 core::ptr::copy_nonoverlapping(src as *const u8, buf.as_mut_ptr(), chunk_len);
             }
@@ -675,6 +678,9 @@ impl SharedPages {
             let phys = self.materialize_page_locked(&mut pages, page_index)?;
             let dst = axhal::mem::phys_to_virt(phys).as_usize() + page_offset;
             let chunk_len = (page_bytes - page_offset).min(buf.len());
+            // SAFETY: `phys` is a materialized frame of this backing held under the `pages` lock,
+            // `page_offset + chunk_len <= page_bytes`, and `buf` is kernel memory that cannot
+            // alias the direct-map frame.
             unsafe {
                 core::ptr::copy_nonoverlapping(buf.as_ptr(), dst as *mut u8, chunk_len);
             }
@@ -824,6 +830,8 @@ impl SharedPages {
             };
             let zero_start = covered_start - page_start;
             let zero_end = covered_end - page_start;
+            // SAFETY: `frame` is a live frame of this backing held under the storage lock, and the
+            // covered range is clamped to this page, so `zero_start <= zero_end <= page_size`.
             unsafe {
                 core::ptr::write_bytes(
                     axhal::mem::phys_to_virt(frame).as_mut_ptr().add(zero_start),
@@ -1005,6 +1013,9 @@ impl SharedPages {
             let destination = axhal::mem::phys_to_virt(PhysAddr::from(
                 folio.as_usize() + offset * PageSize::Size4K as usize,
             ));
+            // SAFETY: `folio` is a fresh 2 MiB folio and `offset < FOLIO_4K_PAGES` (asserted
+            // above), so each destination is a 4 KiB slot inside it; every `source` is a distinct
+            // live 4 KiB frame outside the folio.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     axhal::mem::phys_to_virt(source).as_ptr(),
@@ -1074,6 +1085,8 @@ impl SharedPages {
             return Err(AxError::BadState);
         }
         for (offset, &destination) in folio.old_pages.iter().enumerate() {
+            // SAFETY: the folio spans `FOLIO_4K_PAGES` 4 KiB pages (checked above) and each
+            // `destination` is a distinct live 4 KiB frame outside it.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     axhal::mem::phys_to_virt(PhysAddr::from(
@@ -1170,7 +1183,12 @@ impl Drop for FixedSharedViewInner {
     }
 }
 
+// SAFETY: the raw page bases point at direct-map frames that
+// `direct_view_pins` keeps allocated for the view's lifetime, and they are only
+// dereferenced through bounds-checked atomic accessors, so the handle may move
+// and be shared across CPUs.
 unsafe impl Send for SharedFixedView {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for SharedFixedView {}
 
 impl SharedFixedView {
@@ -1294,9 +1312,11 @@ pub struct SharedAtomicU32 {
     view: SharedFixedView,
 }
 
-// The target is naturally aligned, points into immutable backing storage, and
-// is accessed exclusively through AtomicU32 operations.
+// SAFETY: the target is naturally aligned, points into backing storage that
+// `view` pins for this handle's lifetime, and is accessed exclusively through
+// AtomicU32 operations, so the handle may move and be shared across CPUs.
 unsafe impl Send for SharedAtomicU32 {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for SharedAtomicU32 {}
 
 impl Clone for SharedAtomicU32 {
@@ -1327,7 +1347,10 @@ pub struct SharedAtomicU64 {
     view: SharedFixedView,
 }
 
+// SAFETY: as for `SharedAtomicU32`: an aligned target pinned by `view` and
+// accessed only through AtomicU64 operations.
 unsafe impl Send for SharedAtomicU64 {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for SharedAtomicU64 {}
 
 impl Clone for SharedAtomicU64 {
@@ -1341,10 +1364,13 @@ impl Clone for SharedAtomicU64 {
 
 impl SharedAtomicU64 {
     pub fn load_acquire(&self) -> u64 {
+        // SAFETY: construction validated alignment and bounds, and `view` pins the frame for this
+        // handle's lifetime.
         unsafe { self.address.as_ref() }.load(Ordering::Acquire)
     }
 
     pub fn store_release(&self, value: u64) {
+        // SAFETY: as for `load_acquire`; `AtomicU64` supplies the shared-mutation rules.
         unsafe { self.address.as_ref() }.store(value, Ordering::Release);
     }
 }
@@ -1390,7 +1416,6 @@ impl Drop for SharedPages {
     }
 }
 
-// FIXME: This implementation does not allow map or unmap partial ranges.
 #[derive(Clone)]
 pub struct SharedBackend {
     start: VirtAddr,

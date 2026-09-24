@@ -149,7 +149,7 @@ pub(crate) fn nft_element_message(
     nft_message(request, port_id, NFT_MSG_NEWSETELEM, payload)
 }
 
-pub(crate) fn payload_with<T: Copy>(value: &T) -> Vec<u8> {
+pub(crate) fn payload_with<T: bytemuck::NoUninit>(value: &T) -> Vec<u8> {
     let mut out = vec![0; size_of::<T>()];
     write_struct(&mut out, value);
     out
@@ -438,16 +438,15 @@ pub(crate) fn route_entry(route: &RouteInfo) -> RouteEntry {
     }
 }
 
-pub(crate) fn read_unaligned<T: Copy>(data: &[u8]) -> AxResult<T> {
+pub(crate) fn read_unaligned<T: bytemuck::AnyBitPattern>(data: &[u8]) -> AxResult<T> {
     if data.len() < size_of::<T>() {
         return Err(AxError::InvalidInput);
     }
-    Ok(unsafe { core::ptr::read_unaligned(data.as_ptr().cast::<T>()) })
+    Ok(bytemuck::pod_read_unaligned(&data[..size_of::<T>()]))
 }
 
-pub(crate) fn write_struct<T: Copy>(dst: &mut [u8], value: &T) {
-    let bytes =
-        unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+pub(crate) fn write_struct<T: bytemuck::NoUninit>(dst: &mut [u8], value: &T) {
+    let bytes = bytemuck::bytes_of(value);
     dst[..bytes.len()].copy_from_slice(bytes);
 }
 

@@ -25,7 +25,7 @@ impl SignalfdMask {
 
 /// Linux x86_64 `struct signalfd_siginfo`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SignalfdSiginfo {
     pub signo: u32,
     pub errno: i32,

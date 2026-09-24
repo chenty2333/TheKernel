@@ -71,9 +71,10 @@ pub(crate) struct DeferredMappingFinalizer {
     inner: ptr::NonNull<DeferredMappingFinalizerInner>,
 }
 
-// The node is immutable after construction apart from its publication link
+// SAFETY: the node is immutable after construction apart from its publication link
 // and reference count; the finalizer itself is only touched by its sole owner.
 unsafe impl Send for DeferredMappingFinalizer {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for DeferredMappingFinalizer {}
 
 impl DeferredMappingFinalizer {

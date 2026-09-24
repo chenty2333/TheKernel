@@ -93,12 +93,7 @@ fn read_xdp_umem(
     }
     let mut bytes = [0u8; 32];
     capability
-        .read_slice(value.address().as_usize() as *const u8, unsafe {
-            core::slice::from_raw_parts_mut(
-                bytes.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
-                bytes.len(),
-            )
-        })
+        .read_into(value.address().as_usize() as *const u8, &mut bytes)
         .map_err(map_usercopy_error)?;
     Ok(af_xdp::XdpUmemLayout {
         address: u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
@@ -413,15 +408,7 @@ fn resolve_bound_device_index(
     let mut devname = [0_u8; tk_linux_net::IFNAMSIZ];
     let copied = tk_linux_net::bound_device_name_length(optlen as usize);
     capability
-        .read_slice(
-            optval.address().as_usize() as *const u8,
-            unsafe {
-                core::slice::from_raw_parts_mut(
-                    devname.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
-                    copied,
-                )
-            },
-        )
+        .read_into(optval.address().as_usize() as *const u8, &mut devname[..copied])
         .map_err(map_usercopy_error)?;
     let index = match tk_linux_net::bound_device_name(&devname[..copied]) {
         None => 0,
@@ -529,6 +516,9 @@ struct IptReplaceHeader {
     num_counters: u32,
     counters: usize,
 }
+
+// SAFETY: every field is an integer or an integer array.
+unsafe impl tk_linux_usercopy::UserAbiValue for IptReplaceHeader {}
 
 #[repr(C)]
 #[derive(Clone, Copy, AnyBitPattern)]
@@ -971,7 +961,7 @@ pub(crate) fn iptables_hook_verdict(
     verify_iptables_hook(&mut IPTABLES.lock(), namespace, hook)
 }
 
-fn read_option<T: Copy>(
+fn read_option<T: tk_linux_usercopy::UserAbiValue>(
     capability: &UserMemoryCapability,
     val: UserConstPtr<u8>,
     len: socklen_t,
@@ -980,9 +970,8 @@ fn read_option<T: Copy>(
         return Err(AxError::InvalidInput);
     }
     capability
-        .read_value_uninit(val.address().as_usize() as *const T)
+        .read_abi_value(val.address().as_usize() as *const T)
         .map_err(map_usercopy_error)
-        .map(|value| unsafe { value.assume_init() })
 }
 
 fn read_option_prefix_i32(
@@ -1150,7 +1139,7 @@ fn sctp_connectx3(
     Ok(0)
 }
 
-fn write_option<T: Copy>(
+fn write_option<T: tk_linux_usercopy::UserAbiPod>(
     capability: &UserMemoryCapability,
     val: UserPtr<u8>,
     len: &mut socklen_t,
@@ -1159,9 +1148,10 @@ fn write_option<T: Copy>(
     let copied = option_copy_len(*len, size_of::<T>());
     if copied != 0 {
         capability
-            .write_bytes(val.address().as_usize(), unsafe {
-                core::slice::from_raw_parts((&value as *const T).cast::<u8>(), copied)
-            })
+            .write_bytes(
+                val.address().as_usize(),
+                &tk_linux_usercopy::abi_bytes(&value)[..copied],
+            )
             .map_err(map_usercopy_error)?;
     }
     *len = copied as socklen_t;
@@ -1194,12 +1184,7 @@ fn handle_ipt_set_replace(
         .map_err(|_| AxError::NoMemory)?;
     replace.resize(total_len, 0);
     capability
-        .read_slice(optval.address().as_usize() as *const u8, unsafe {
-            core::slice::from_raw_parts_mut(
-                replace.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
-                total_len,
-            )
-        })
+        .read_into(optval.address().as_usize() as *const u8, &mut replace[..total_len])
         .map_err(map_usercopy_error)?;
     validate_ipt_replace_table(&replace[header_len..], header.num_entries)?;
     let verdicts = ipt_table_verdicts(&replace[header_len..])?;
@@ -1248,12 +1233,7 @@ fn handle_ipt_get_entries(
     }
     let mut request = [0_u8; REQUEST];
     capability
-        .read_slice(optval.address().as_usize() as *const u8, unsafe {
-            core::slice::from_raw_parts_mut(
-                request.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
-                REQUEST,
-            )
-        })
+        .read_into(optval.address().as_usize() as *const u8, &mut request[..REQUEST])
         .map_err(map_usercopy_error)?;
     let mut name = [0_u8; 32];
     name.copy_from_slice(&request[..32]);
@@ -1301,12 +1281,7 @@ fn handle_ipt_get_info(
     }
     let mut name = [0u8; 32];
     capability
-        .read_slice(optval.address().as_usize() as *const u8, unsafe {
-            core::slice::from_raw_parts_mut(
-                name.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
-                name.len(),
-            )
-        })
+        .read_into(optval.address().as_usize() as *const u8, &mut name)
         .map_err(map_usercopy_error)?;
     let mut tables = IPTABLES.lock();
     tables.retain(|table| table.namespace.strong_count() != 0);
@@ -1817,12 +1792,7 @@ pub fn sys_setsockopt(
             .map_err(|_| AxError::NoMemory)?;
         key.resize(optlen as usize, 0);
         capability
-            .read_slice(optval.address().as_usize() as *const u8, unsafe {
-                core::slice::from_raw_parts_mut(
-                    key.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
-                    key.len(),
-                )
-            })
+            .read_into(optval.address().as_usize() as *const u8, &mut key)
             .map_err(map_usercopy_error)?;
         pinned.af_alg()?.set_alg_key(&key)?;
         return Ok(0);

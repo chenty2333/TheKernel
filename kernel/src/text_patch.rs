@@ -65,6 +65,7 @@ impl TextPatchTransaction {
         // SAFETY: begin changed exactly this leaf to writable and removed X;
         // address is constrained to that same leaf until commit/Drop.
         let previous = unsafe { core::ptr::read_volatile(address as *const u8) };
+        // SAFETY: as above.
         unsafe { core::ptr::write_volatile(address as *mut u8, value) };
         Ok(previous)
     }

@@ -921,15 +921,11 @@ fn preflight_instruction_plan(
     original_byte: u8,
 ) -> AxResult<InstructionPlan> {
     let memory = UserMemoryCapability::new(aspace.clone());
-    let mut raw = [MaybeUninit::<u8>::uninit(); 15];
     let readable = (PAGE_SIZE_4K - (address as usize & (PAGE_SIZE_4K - 1))).min(15);
-    memory
-        .read_bytes(address as usize, &mut raw[..readable])
-        .map_err(map_usercopy_error)?;
     let mut bytes = [0u8; 15];
-    for (dst, src) in bytes.iter_mut().zip(raw[..readable].iter()) {
-        *dst = unsafe { src.assume_init() };
-    }
+    memory
+        .read_into(address as usize as *const u8, &mut bytes[..readable])
+        .map_err(map_usercopy_error)?;
     plan_from_bytes(address, original_byte, bytes, readable)
 }
 

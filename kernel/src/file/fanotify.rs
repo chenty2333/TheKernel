@@ -255,7 +255,10 @@ fn publish_cleanup(work: Box<FanotifyCleanupWork>) {
 unsafe fn reverse_cleanup_batch(mut current: *mut FanotifyCleanupWork) -> *mut FanotifyCleanupWork {
     let mut reversed = ptr::null_mut();
     while !current.is_null() {
+        // SAFETY: the caller guarantees `current` heads a valid, acyclic list it exclusively owns
+        // (this function's contract).
         let next = unsafe { (*current).next.load(Ordering::Relaxed) };
+        // SAFETY: as above.
         unsafe { (*current).next.store(reversed, Ordering::Relaxed) };
         reversed = current;
         current = next;
@@ -292,7 +295,11 @@ fn pop_cleanup_from(
     // the separate INCOMING stack.
     let next = unsafe { (*head).next.load(Ordering::Relaxed) };
     pending.store(next, Ordering::Relaxed);
+    // SAFETY: as above; `head` is still owned by the pending list, which only this drainer
+    // touches.
     unsafe { (*head).next.store(ptr::null_mut(), Ordering::Relaxed) };
+    // SAFETY: `head` came from `Box::into_raw` and is now unlinked from both lists, so ownership
+    // returns to exactly one Box.
     Some(unsafe { Box::from_raw(head) })
 }
 
@@ -764,13 +771,7 @@ impl FanotifyFile {
             };
             let mut encoded =
                 [0_u8; size_of::<FanotifyEventMetadata>() + size_of::<FanotifyEventInfoPidfd>()];
-            let metadata_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&metadata as *const FanotifyEventMetadata).cast::<u8>(),
-                    metadata_len,
-                )
-            };
-            encoded[..metadata_len].copy_from_slice(metadata_bytes);
+            encoded[..metadata_len].copy_from_slice(&metadata.to_ne_bytes()[..metadata_len]);
             if let Some(pidfd) = pidfd.as_ref() {
                 let info = FanotifyEventInfoPidfd {
                     info_type: FAN_EVENT_INFO_TYPE_PIDFD,
@@ -778,13 +779,8 @@ impl FanotifyFile {
                     len: pidfd_info_len as u16,
                     pidfd: pidfd.value(),
                 };
-                let info_bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        (&info as *const FanotifyEventInfoPidfd).cast::<u8>(),
-                        pidfd_info_len,
-                    )
-                };
-                encoded[metadata_len..event_len].copy_from_slice(info_bytes);
+                encoded[metadata_len..event_len]
+                    .copy_from_slice(&info.to_ne_bytes()[..pidfd_info_len]);
             }
             let copy_error = match dst.write(&encoded[..event_len]) {
                 Ok(copied) if copied == event_len => None,
