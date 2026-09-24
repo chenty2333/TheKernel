@@ -9,6 +9,7 @@
 /.cargo/*
 /.crates*
 /.state
+/.gt-env.sh
 /.tmp
 /kernel-x86_64
 /.direnv

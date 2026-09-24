@@ -817,8 +817,8 @@ qemu-system-x86_64 --version
 qemu-system-x86_64 -accel help
 
 # Keep generated state on persistent storage and isolate this worktree's outputs.
-source .gt-env.sh          # THEKERNEL_STATE_DIR + CARGO_BUILD_JOBS
-./tools/thekernel.py test --suite guest --accel tcg \
+THEKERNEL_STATE_DIR="$HOME/.cache/thekernel-targets/guest-toolchain" \
+  CARGO_BUILD_JOBS=8 ./tools/thekernel.py test --suite guest --accel tcg \
   --smp 4 --memory 512M --timeout 300
 ```
 
