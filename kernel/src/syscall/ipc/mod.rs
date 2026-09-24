@@ -891,6 +891,7 @@ mod credential_caller_tests {
             pad2: 0,
             unused0: 0,
             unused1: 0,
+            pad3: 0,
         }
     }
 

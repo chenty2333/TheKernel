@@ -35,7 +35,7 @@ pub const ALG_OP_DECRYPT: u32 = 0;
 pub const ALG_OP_ENCRYPT: u32 = 1;
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::AnyBitPattern)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SockAddrAlgRaw {
     salg_family: u16,
     salg_type: [u8; 14],
@@ -354,7 +354,7 @@ mod tests {
     fn sockaddr_alg_reads_from_the_explicit_capability() {
         let capability = mapped_capability();
         capability
-            .write_abi_value(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_ALG as _))
+            .write_value(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_ALG as _))
             .unwrap();
 
         let address = SockAddrAlg::read_from_user(
@@ -371,7 +371,7 @@ mod tests {
     fn sockaddr_alg_keeps_length_and_family_errors() {
         let capability = mapped_capability();
         capability
-            .write_abi_value(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_INET as _))
+            .write_value(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_INET as _))
             .unwrap();
 
         let short = SockAddrAlg::read_from_user(

@@ -355,7 +355,7 @@ mod tests {
         // The descriptor page is mapped, and the payload page is mapped. The
         // constructor must import both through the selected address space.
         capability
-            .write_abi_value(0x1000 as *mut IoVec, descriptor)
+            .write_value(0x1000 as *mut IoVec, descriptor)
             .unwrap();
         let imported = IoVectorBuf::new(capability.clone(), 0x1000 as *const IoVec, 1).unwrap();
         assert_eq!(imported.entry(0).unwrap().iov_len, PAGE_SIZE_4K as i64);
@@ -375,7 +375,7 @@ mod tests {
             iov_len: PAGE_SIZE_4K as i64 + 1,
         };
         capability
-            .write_abi_value(0x1000 as *mut IoVec, crossing)
+            .write_value(0x1000 as *mut IoVec, crossing)
             .unwrap();
         let imported = IoVectorBuf::new(capability, 0x1000 as *const IoVec, 1).unwrap();
         assert!(matches!(

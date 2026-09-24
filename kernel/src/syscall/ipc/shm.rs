@@ -3290,6 +3290,7 @@ mod tests {
             shm_swp: 4,
             swap_attempts: 5,
             swap_successes: 6,
+            pad: 0,
         };
         // SAFETY: `usage` is a live, fully initialized value for this test
         // and the byte slice covers exactly its object representation.

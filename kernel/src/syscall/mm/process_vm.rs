@@ -739,7 +739,7 @@ mod tests {
             iov_len: 37,
         };
         capability
-                .write_abi_value(0x1000 as *mut IoVec, descriptor)
+                .write_value(0x1000 as *mut IoVec, descriptor)
                 .unwrap();
 
         let (iovecs, total) = read_iovecs(&capability, 0x1000 as *const IoVec, 1).unwrap();

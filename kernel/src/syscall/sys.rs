@@ -1190,7 +1190,7 @@ mod tests {
         assert_eq!(core::mem::offset_of!(sysinfo, sharedram), 48);
         assert_eq!(core::mem::offset_of!(sysinfo, mem_unit), 104);
 
-        let mut info: sysinfo = unsafe { core::mem::zeroed() };
+        let mut info = <Sysinfo as bytemuck::Zeroable>::zeroed();
         set_sysinfo_memory_fields(
             &mut info,
             9 * memory_addr::PAGE_SIZE_4K,
@@ -1221,7 +1221,7 @@ mod tests {
                 write_error: Some(error),
             };
             let mut memory = UserMemoryContext::new(&mut provider);
-            let info: sysinfo = unsafe { core::mem::zeroed() };
+            let info = <Sysinfo as bytemuck::Zeroable>::zeroed();
 
             assert_eq!(
                 write_sysinfo(&mut memory, core::ptr::null_mut(), info),

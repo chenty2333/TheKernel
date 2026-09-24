@@ -2767,7 +2767,7 @@ mod tests {
             iov_len: 32,
         };
         capability
-            .write_abi_value(0x1000 as *mut IoVec, descriptor)
+            .write_value(0x1000 as *mut IoVec, descriptor)
             .unwrap();
         let iov = IoVectorBuf::new(capability.clone(), 0x1000 as *const IoVec, 1).unwrap();
         let mut source = PageProgressIo::new(iov).unwrap();
