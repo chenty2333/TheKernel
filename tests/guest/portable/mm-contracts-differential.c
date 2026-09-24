@@ -211,7 +211,29 @@ static void unmap_case(void) {
     ERROR(syscall(NR_UNMAP, p, 0), EINVAL, "zero-length");
     check(p[0] == 31 && p[2 * PAGE] == 32, "errors-preserve");
     check(syscall(NR_UNMAP, p, 3 * PAGE) == 0, "cleanup");
-    mark("VALIDATION_PRESERVES_NEIGHBORS"); done();
+    mark("VALIDATION_PRESERVES_NEIGHBORS");
+    /* A MAP_SHARED anonymous mapping splits like a private one: carving a
+       hole leaves both survivors mapped over the one shmem object, each
+       keeping its own protection, and a forked child still shares them. */
+    unsigned char *s = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check(s != MAP_FAILED, "shared-map");
+    s[0] = 41; s[PAGE] = 42; s[2 * PAGE] = 43;
+    check(syscall(NR_UNMAP, s + PAGE, PAGE) == 0, "shared-remove-middle");
+    ERROR(syscall(NR_MINCORE, s + PAGE, PAGE, &vec), ENOMEM, "shared-hole-observed");
+    check(s[0] == 41 && s[2 * PAGE] == 43, "shared-neighbors");
+    check(syscall(NR_PROTECT, s + 2 * PAGE, PAGE, PROT_READ) == 0, "shared-protect-tail");
+    fflush(NULL);
+    pid_t child = fork(); check(child >= 0, "shared-fork");
+    if (!child) {
+        s[0] = 44;
+        _exit(s[2 * PAGE] == 43 ? 0 : 16);
+    }
+    reap(child, 0);
+    check(s[0] == 44, "shared-head-still-shared");
+    expect_write_fault(s + 2 * PAGE);
+    check(syscall(NR_UNMAP, s, 3 * PAGE) == 0, "shared-cleanup");
+    mark("SHARED_ANON_PARTIAL_UNMAP"); done();
 }
 static void mincore_case(void) {
     begin("mincore.raw-differential");
