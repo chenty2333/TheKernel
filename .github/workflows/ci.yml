@@ -89,9 +89,12 @@ jobs:
               # sets it), and the state root below HOME is where every run
               # directory lives.
               state=/state/.cache/thekernel-targets
+              # `verify-graphics` is also the Buildroot source, download and
+              # output tree (gigabytes); only its guest run and screenshot are
+              # evidence, and a build failure is already in the job log.
               dirs=()
-              for name in runs verify-fbcon verify-graphics; do
-                if [ -d "$state/$name" ]; then
+              for name in runs verify-fbcon verify-graphics/run verify-graphics/seatd.ppm; do
+                if [ -e "$state/$name" ]; then
                   dirs+=("$name")
                 fi
               done
@@ -168,8 +171,10 @@ jobs:
           rm -rf ci-evidence
           mkdir -p ci-evidence
           found=0
-          for name in runs verify-fbcon verify-graphics; do
-            if [ -d "$state/$name" ]; then
+          # As in the `verify` job, the graphics Buildroot tree is not evidence.
+          for name in runs verify-fbcon verify-graphics/run verify-graphics/seatd.ppm; do
+            if [ -e "$state/$name" ]; then
+              mkdir -p "ci-evidence/$(dirname "$name")"
               cp -a "$state/$name" "ci-evidence/$name"
               found=1
             fi
