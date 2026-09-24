@@ -427,6 +427,9 @@ fn install_current_user_address_space(curr_ptr: *mut TaskInner, token: AddressSp
         (target_is_legal, decision)
     };
 
+    // SAFETY: `curr_ptr` is the running task (see the callers), IRQs and preemption are disabled,
+    // so nothing else touches its saved context; `token` names this process's live page table,
+    // which is safe to load into CR3.
     unsafe {
         set_task_user_address_space((*curr_ptr).ctx_mut(), token);
         #[cfg(all(feature = "asid-fast-switch", target_arch = "x86_64"))]
@@ -1312,6 +1315,9 @@ fn try_mark_robust_owner_died(
     let page_offset = address - page_start.as_usize();
     debug_assert!(page_offset <= memory_addr::PAGE_SIZE_4K - core::mem::size_of::<u32>());
     let physical = paddr + page_offset;
+    // SAFETY: the address-space lock is held, the word is 4-byte aligned (checked on entry) and
+    // lies in the writable 4 KiB leaf just translated, so the direct-map `AtomicU32` stays valid
+    // for this access.
     let word = unsafe { &*phys_to_virt(physical).as_mut_ptr().cast::<AtomicU32>() };
     match atomic_robust_owner_died(word, tid) {
         RobustOwnerDiedResult::Updated => Ok(Some(FutexKey::new(&aspace, address))),

@@ -133,10 +133,8 @@ pub fn sys_prlimit64<M: UserMemory + ?Sized>(
     // resource validation. Keep that observable precedence for combinations
     // of bad pointers, dead PIDs, and out-of-range resource numbers.
     let new_limit = if let Some(new_limit) = VmPtr::nullable(new_limit) {
-        let value = VmPtr::vm_read_uninit(new_limit, memory).map_err(map_rlimit_usercopy_error)?;
-        // SAFETY: the explicit provider initialized the complete value and
-        // rlimit64 contains only integer fields on the x86_64 Linux ABI.
-        Some(unsafe { value.assume_init() })
+        let value = VmPtr::vm_read_abi(new_limit, memory).map_err(map_rlimit_usercopy_error)?;
+        Some(value)
     } else {
         None
     };
@@ -165,10 +163,7 @@ pub fn sys_prlimit64<M: UserMemory + ?Sized>(
     // prlimit64(old,new) cannot report a value from a different generation.
     let old = update_resource_limit(&proc_data, resource, new_limit)?;
     if let Some(old_limit) = VmPtr::nullable(old_limit) {
-        // SAFETY: rlimit64 has no padding on the checked x86_64 ABI, and all
-        // fields in `old` are initialized before this copyout.
-        unsafe { VmMutPtr::vm_write_unchecked(old_limit, memory, old) }
-            .map_err(map_rlimit_usercopy_error)?;
+        VmMutPtr::vm_write_abi(old_limit, memory, old).map_err(map_rlimit_usercopy_error)?;
     }
 
     Ok(0)
@@ -181,13 +176,7 @@ pub fn sys_setrlimit<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     // Linux copies the replacement before dispatching resource policy, so a
     // bad userspace pointer wins over an out-of-range resource number.
-    // SAFETY: the explicit provider initializes every byte and rlimit contains
-    // only integer fields on the checked x86_64 Linux ABI.
-    let new_limit = unsafe {
-        VmPtr::vm_read_uninit(new_limit, memory)
-            .map_err(map_rlimit_usercopy_error)?
-            .assume_init()
-    };
+    let new_limit = VmPtr::vm_read_abi(new_limit, memory).map_err(map_rlimit_usercopy_error)?;
     if resource >= RLIM_NLIMITS {
         return Err(AxError::InvalidInput);
     }
@@ -220,10 +209,7 @@ pub fn sys_getrlimit<M: UserMemory + ?Sized>(
         let limit = &limits[resource];
         native_rlimit(limit.current, limit.max)
     };
-    // SAFETY: rlimit has no padding on the checked x86_64 ABI, and both
-    // fields in `old` are initialized before this copyout.
-    unsafe { VmMutPtr::vm_write_unchecked(old_limit, memory, old) }
-        .map_err(map_rlimit_usercopy_error)?;
+    VmMutPtr::vm_write_abi(old_limit, memory, old).map_err(map_rlimit_usercopy_error)?;
 
     Ok(0)
 }
@@ -251,10 +237,7 @@ pub fn sys_getrusage<M: UserMemory + ?Sized>(
         }
     };
     let result: rusage = result.into();
-    // SAFETY: TaskUsage conversion starts from a zeroed rusage and fills the
-    // integer fields, so the full object representation is initialized.
-    unsafe { VmMutPtr::vm_write_unchecked(usage, memory, result) }
-        .map_err(|_| AxError::BadAddress)?;
+    VmMutPtr::vm_write_abi(usage, memory, result).map_err(|_| AxError::BadAddress)?;
 
     Ok(0)
 }

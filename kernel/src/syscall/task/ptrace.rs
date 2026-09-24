@@ -497,12 +497,9 @@ fn ptrace_shstk_regset(
     //
     // so the iovec is faulted in *before* the regset selector is interpreted:
     // a bad iovec pointer is -EFAULT even for an unknown record type.
-    let mut iov = unsafe {
-        tracer_memory
-            .read_value_uninit(iov_address as *const IoVec)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let mut iov = tracer_memory
+        .read_value(iov_address as *const IoVec)
+        .map_err(map_usercopy_error)?;
     if note != NT_X86_SHSTK {
         // kernel/ptrace.c `ptrace_regset()`:
         //
@@ -1051,21 +1048,16 @@ fn sys_ptrace_for_target(
             let info = target
                 .ptrace_signal_info(session)
                 .ok_or_else(ptrace_io_error)?;
-            unsafe {
-                tracer_memory
-                    .write_value_unchecked(data as *mut SignalInfo, info)
-                    .map_err(map_usercopy_error)?;
-            }
+            tracer_memory
+                .write_value(data as *mut SignalInfo, info)
+                .map_err(map_usercopy_error)?;
             Ok(0)
         }
         PTRACE_SETSIGINFO => {
             let session = check_inactive_tracee(&target)?;
-            let info = unsafe {
-                tracer_memory
-                    .read_value_uninit(data as *const SignalInfo)
-                    .map_err(map_usercopy_error)?
-                    .assume_init()
-            };
+            let info = tracer_memory
+                .read_value(data as *const SignalInfo)
+                .map_err(map_usercopy_error)?;
             target.replace_ptrace_signal_info(session, info)?;
             Ok(0)
         }

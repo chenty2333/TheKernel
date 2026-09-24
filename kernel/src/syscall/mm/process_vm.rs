@@ -255,11 +255,8 @@ fn copy_to_remote(
             .min(page_copy_len(local_addr, len - copied))
             .min(page_copy_len(remote_addr, len - copied));
         debug_assert!(chunk != 0);
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<MaybeUninit<u8>>(), chunk)
-        };
         caller
-            .read_bytes(local_addr, buf)
+            .read_into(local_addr as *const u8, &mut scratch[..chunk])
             .map_err(map_usercopy_error)?;
         {
             let mut aspace = aspace_handle.lock();
@@ -741,13 +738,9 @@ mod tests {
             iov_base: 0x1000,
             iov_len: 37,
         };
-        // SAFETY: IoVec is a complete initialized descriptor and the selected
-        // capability owns the mapped destination range.
-        unsafe {
-            capability
-                .write_value_unchecked(0x1000 as *mut IoVec, descriptor)
+        capability
+                .write_value(0x1000 as *mut IoVec, descriptor)
                 .unwrap();
-        }
 
         let (iovecs, total) = read_iovecs(&capability, 0x1000 as *const IoVec, 1).unwrap();
         assert_eq!(total, 37);

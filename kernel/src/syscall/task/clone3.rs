@@ -86,17 +86,14 @@ fn copy_clone3_wire_args<M: UserMemory + ?Sized>(
     let mut offset = known_size;
     while offset < size {
         let count = (size - offset).min(32);
-        let mut bytes = [MaybeUninit::<u8>::uninit(); 32];
+        let mut bytes = [0u8; 32];
         let address = (args as usize)
             .checked_add(offset)
             .ok_or(AxError::BadAddress)?;
         memory
-            .read_bytes(address, &mut bytes[..count])
+            .read_into(address, &mut bytes[..count])
             .map_err(map_usercopy_error)?;
-        if bytes[..count]
-            .iter()
-            .any(|byte| unsafe { byte.assume_init() } != 0)
-        {
+        if bytes[..count].iter().any(|byte| *byte != 0) {
             return Err(AxError::ArgumentListTooLong);
         }
         offset += count;

@@ -117,13 +117,11 @@ impl TunFile {
         if attachment.is_some() {
             return Err(AxError::ResourceBusy);
         }
-        let mut raw_ifreq = [MaybeUninit::<u8>::uninit(); IFREQ_BYTES];
+        let mut ifreq = [0u8; IFREQ_BYTES];
         context
             .user_memory()
-            .read_bytes(arg, &mut raw_ifreq)
+            .read_into(arg as *const u8, &mut ifreq)
             .map_err(crate::mm::map_usercopy_error)?;
-        // `read_bytes` completed the exact fixed-width ABI object above.
-        let mut ifreq = raw_ifreq.map(|byte| unsafe { byte.assume_init() });
         let flags = u16::from_ne_bytes([ifreq[IFNAMSIZ], ifreq[IFNAMSIZ + 1]]) as u32;
         if flags & (IFF_TUN | IFF_TAP) == 0
             || flags & (IFF_TUN | IFF_TAP) == (IFF_TUN | IFF_TAP)
@@ -480,7 +478,7 @@ impl Pollable for TunFile {
         let attachment = attachment
             .as_ref()
             .ok_or(PollRegistrationError::InvalidState)?;
-        // A successful TUNSETIFF is immutable for this OFD: subsequent
+        // SAFETY: a successful TUNSETIFF is immutable for this OFD: subsequent
         // TUNSETIFF calls fail while `attachment` is populated, and dropping
         // this file requires exclusive ownership.  The Pollable borrow of
         // `self` therefore keeps the selected handle live for `'a` after the

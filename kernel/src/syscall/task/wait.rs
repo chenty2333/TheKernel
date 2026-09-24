@@ -582,14 +582,9 @@ fn write_waitpid_event(
     // `put_user(wo_stat, stat_addr)` in `kernel_wait4()` is the later write.
     if !rusage_ptr.is_null() {
         let usage = event.usage();
-        // TaskUsage's conversion starts from a zeroed rusage and fills
-        // every exposed field, so the complete ABI representation is
-        // initialized for this unchecked copyout.
-        unsafe {
-            memory
-                .write_value_unchecked(rusage_ptr, usage.into())
-                .map_err(map_usercopy_error)?;
-        }
+        memory
+            .write_abi_value(rusage_ptr, usage.into())
+            .map_err(map_usercopy_error)?;
     }
     if !exit_code.is_null() {
         memory
@@ -612,13 +607,9 @@ fn write_waitid_rusage(
         return Ok(());
     }
     let usage = event.usage();
-    // TaskUsage's conversion starts from a zeroed rusage and fills every
-    // exposed field, so the complete ABI representation is initialized.
-    unsafe {
-        memory
-            .write_value_unchecked(rusage_ptr, usage.into())
-            .map_err(map_usercopy_error)?;
-    }
+    memory
+        .write_abi_value(rusage_ptr, usage.into())
+        .map_err(map_usercopy_error)?;
     Ok(())
 }
 

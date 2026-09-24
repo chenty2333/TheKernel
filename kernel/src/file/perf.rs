@@ -274,8 +274,12 @@ pub(crate) fn reconcile_sampling_last(event: &Arc<crate::file::PerfSampleBackend
         event.fail_closed();
         return;
     };
+    // SAFETY: `event` is a live Arc; this adds the strong count that publication transfers to the
+    // IPI consumer.
     unsafe { Arc::increment_strong_count(Arc::as_ptr(event)) };
     if !mailbox.try_publish_sampling(Arc::as_ptr(event), generation) {
+        // SAFETY: publication failed, so the count added above was never transferred; this
+        // releases exactly that count.
         unsafe { drop(Arc::from_raw(Arc::as_ptr(event))) };
         event.fail_closed();
         return;
@@ -302,6 +306,8 @@ pub(crate) fn reconcile_sampling_last(event: &Arc<crate::file::PerfSampleBackend
         )
         .is_ok()
     {
+        // SAFETY: the compare-exchange took the published pointer back before any IPI consumed it,
+        // so the transferred strong count is ours to release.
         unsafe { drop(Arc::from_raw(Arc::as_ptr(event))) };
     }
     event.fail_closed();
@@ -346,6 +352,8 @@ fn perf_reconcile_ipi_handler() {
         // The publisher transfers one explicit Arc count.  The NMI/IPI path
         // stops exactly this event and moves that count to the existing
         // task-context retire queue; it never drops user mappings here.
+        // SAFETY: `address` is the sampling event published into this mailbox with one transferred
+        // strong count, which `reconcile_ipi_stop` takes over.
         unsafe {
             crate::file::PerfSampleBackend::reconcile_ipi_stop(address as *const _);
         }
@@ -388,6 +396,8 @@ fn perf_reconcile_ipi_handler() {
                 )
             }
         };
+        // SAFETY: `group` carries the strong reference transferred by publication, so it is live
+        // for this call.
         unsafe { (&*group).defer_reconcile_custody() };
         let _ = mailbox.acknowledge_result_if_current(
             generation,
@@ -913,12 +923,13 @@ pub(crate) struct PerfGroup {
     retire_next: AtomicUsize,
 }
 
-// CPU-context registration stores groups in a static spin-locked table while
+// SAFETY: cPU-context registration stores groups in a static spin-locked table while
 // files weakly name their group and may strongly own a sampling backend. That
 // is a valid ownership graph but it is cyclic for auto-trait evaluation.
 // Group mutation is exclusively through `state` or atomics, so the static
 // registry may safely share groups across CPUs.
 unsafe impl Send for PerfGroup {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for PerfGroup {}
 
 /// CPU/system-wide contexts are scheduled at every task switch on their
@@ -1132,6 +1143,8 @@ impl PerfGroup {
         // Every prefix entry was initialized exactly once by the collector;
         // the trailing capacity is never observed or dropped.
         {
+            // SAFETY: the collector initialized exactly the first `count <= storage.len()`
+            // entries, and nothing moves or drops them while this slice is borrowed.
             let groups =
                 unsafe { core::slice::from_raw_parts(storage.as_ptr().cast::<Arc<Self>>(), count) };
             if tick {
@@ -2174,6 +2187,9 @@ impl PerfGroup {
         };
         // The handler moves this explicit raw Arc into deferred task-context
         // retirement; it never drops it from the IPI/NMI path.
+        // SAFETY: every `PerfGroup` is allocated by `Arc::try_new` in `new_for_context`, so `self`
+        // lives in an Arc; this adds the strong count that publication transfers to the IPI
+        // consumer.
         unsafe { Arc::increment_strong_count(self as *const Self) };
         if !mailbox.try_publish_control(
             self as *const Self,
@@ -2182,6 +2198,8 @@ impl PerfGroup {
             group_control,
             control,
         ) {
+            // SAFETY: publication failed, so the count added above was never transferred; this
+            // releases exactly that count.
             unsafe { drop(Arc::from_raw(self as *const Self)) };
             self.fail_closed_reconcile();
             return Err(AxError::Io);
@@ -2214,6 +2232,8 @@ impl PerfGroup {
             )
             .is_ok()
         {
+            // SAFETY: the compare-exchange took the published pointer back before any IPI consumed
+            // it, so the transferred strong count is ours to release.
             unsafe { drop(Arc::from_raw(self as *const Self)) };
         }
         // If an IPI raced the timeout, make its late owner-side execution a
@@ -2841,6 +2861,9 @@ impl PerfGroup {
             // Keep this group alive even if the initiating last descriptor
             // is dropped after the bounded wait expires. The handler defers
             // this exact raw strong reference to a task-context retire list.
+            // SAFETY: every `PerfGroup` is allocated by `Arc::try_new` in `new_for_context`, so
+            // `self` lives in an Arc; this adds the strong count that publication transfers to the
+            // IPI consumer.
             unsafe { Arc::increment_strong_count(self as *const Self) };
             if !mailbox.try_publish(self as *const Self, generation) {
                 // SAFETY: publication did not transfer the incremented

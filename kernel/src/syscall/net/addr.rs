@@ -58,6 +58,8 @@ pub(super) fn read_family(
         return Err(AxError::InvalidInput);
     }
     let mut family = [0u8; size_of::<__kernel_sa_family_t>()];
+    // SAFETY: the view covers bytes of a local, already-initialized array, and the usercopy only
+    // ever stores initialized bytes through it, so the array stays initialized.
     let destination = unsafe {
         core::slice::from_raw_parts_mut(
             family.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
@@ -96,9 +98,6 @@ fn parse_unix_socket_addr(snapshot: &[u8]) -> AxResult<UnixSocketAddr> {
         AbiUnixName::Abstract(name) => try_arc_bytes(name).map(UnixSocketAddr::Abstract),
         AbiUnixName::Pathname(path) => try_arc_bytes(path).map(UnixSocketAddr::Path),
     }
-}
-unsafe fn cast_to_slice<T>(value: &T) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
 }
 
 /// The tail of `move_addr_to_user()` (`net/socket.c:281-310`):
@@ -221,12 +220,9 @@ impl SocketAddrExt for SocketAddrV4 {
         if !has_sockaddr_prefix(addrlen, size_of::<sockaddr_in>()) {
             return Err(AxError::InvalidInput);
         }
-        let addr_in = unsafe {
-            capability
-                .read_value_uninit(addr.address().as_usize() as *const sockaddr_in)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let addr_in = capability
+            .read_abi_value(addr.address().as_usize() as *const sockaddr_in)
+            .map_err(map_usercopy_error)?;
         if addr_in.sin_family as u32 != AF_INET {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
@@ -251,9 +247,12 @@ impl SocketAddrExt for SocketAddrV4 {
             },
             __pad: [0_u8; 8],
         };
-        fill_addr(capability, addr, addrlen, unsafe {
-            cast_to_slice(&sockin_addr)
-        })
+        fill_addr(
+            capability,
+            addr,
+            addrlen,
+            tk_linux_usercopy::abi_bytes(&sockin_addr),
+        )
     }
 
     fn family(&self) -> u16 {
@@ -279,6 +278,8 @@ impl SocketAddrExt for SocketAddrV6 {
         }
         let mut raw = [0_u8; size_of::<sockaddr_in6>()];
         let copied = (addrlen as usize).min(raw.len());
+        // SAFETY: the view covers bytes of a local, already-initialized array, and the usercopy
+        // only ever stores initialized bytes through it, so the array stays initialized.
         let destination = unsafe {
             core::slice::from_raw_parts_mut(
                 raw.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
@@ -290,12 +291,17 @@ impl SocketAddrExt for SocketAddrV6 {
             .map_err(map_usercopy_error)?;
         // The zeroed buffer is fully initialized, so the read is defined even
         // though a `[u8; 28]` carries no alignment guarantee.
+        // SAFETY: `raw` is a fully initialized 28-byte buffer and `sockaddr_in6` is a
+        // `UserAbiValue` (every bit pattern valid); `read_unaligned` imposes no alignment
+        // requirement.
         let addr_in6 = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast::<sockaddr_in6>()) };
         if addr_in6.sin6_family as u32 != AF_INET6 {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
 
         Ok(SocketAddrV6::new(
+            // SAFETY: all members of `in6_u` are integer arrays covering the same 16 bytes, so
+            // reading any of them is valid.
             Ipv6Addr::from(unsafe { addr_in6.sin6_addr.in6_u.u6_addr8 }),
             u16::from_be(addr_in6.sin6_port),
             u32::from_be(addr_in6.sin6_flowinfo),
@@ -320,9 +326,12 @@ impl SocketAddrExt for SocketAddrV6 {
             },
             sin6_scope_id: self.scope_id(),
         };
-        fill_addr(capability, addr, addrlen, unsafe {
-            cast_to_slice(&sockin_addr)
-        })
+        fill_addr(
+            capability,
+            addr,
+            addrlen,
+            tk_linux_usercopy::abi_bytes(&sockin_addr),
+        )
     }
 
     fn family(&self) -> u16 {
@@ -345,6 +354,8 @@ impl SocketAddrExt for UnixSocketAddr {
         // bytes. Snapshot that bounded record in one VM operation so parsing
         // never holds a shared reference into concurrently mutable userspace.
         let mut snapshot = [0u8; UNIX_SOCKADDR_CAPACITY];
+        // SAFETY: the view covers bytes of a local, already-initialized array, and the usercopy
+        // only ever stores initialized bytes through it, so the array stays initialized.
         let destination = unsafe {
             core::slice::from_raw_parts_mut(
                 snapshot.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
@@ -584,11 +595,9 @@ mod tests {
             },
             __pad: [0; 8],
         };
-        unsafe {
-            capability
-                .write_value_unchecked(0x1ff0 as *mut sockaddr_in, v4)
-                .unwrap();
-        }
+        capability
+            .write_abi_value(0x1ff0 as *mut sockaddr_in, v4)
+            .unwrap();
         let parsed = SocketAddrV4::read_from_user(
             &capability,
             UserConstPtr::from(0x1ff0),
@@ -609,11 +618,9 @@ mod tests {
             },
             sin6_scope_id: 0,
         };
-        unsafe {
-            capability
-                .write_value_unchecked(0x1fe4 as *mut sockaddr_in6, v6)
-                .unwrap();
-        }
+        capability
+            .write_abi_value(0x1fe4 as *mut sockaddr_in6, v6)
+            .unwrap();
         let parsed = SocketAddrV6::read_from_user(
             &capability,
             UserConstPtr::from(0x1fe4),

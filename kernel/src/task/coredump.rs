@@ -42,7 +42,7 @@ const PN_XNUM: usize = 0xffff;
 // ---- ELF structures ----
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Elf64Ehdr {
     e_ident: [u8; 16],
     e_type: u16,
@@ -61,7 +61,7 @@ struct Elf64Ehdr {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Elf64Phdr {
     p_type: u32,
     p_flags: u32,
@@ -74,7 +74,7 @@ struct Elf64Phdr {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Elf64Nhdr {
     n_namesz: u32,
     n_descsz: u32,
@@ -82,7 +82,7 @@ struct Elf64Nhdr {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Elf64Shdr {
     sh_name: u32,
     sh_type: u32,
@@ -102,7 +102,7 @@ struct Elf64Shdr {
 /// most useful subset: signal info, PID, and general-purpose registers
 /// including the program counter.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ElfPrstatus {
     si_signo: i32,
     si_code: i32,
@@ -124,11 +124,6 @@ struct ElfPrstatus {
 }
 
 // ---- Helpers ----
-
-/// Re-interprets a `#[repr(C)]` value as a byte slice.
-unsafe fn as_bytes<T: Sized>(val: &T) -> &[u8] {
-    unsafe { core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>()) }
-}
 
 /// Aligns `v` up to 4-byte boundary (ELF note alignment).
 const fn align4(v: usize) -> usize {
@@ -302,7 +297,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     let mut offset = 0u64;
 
     // ---- Write ELF header ----
-    write_limited(&file, offset, unsafe { as_bytes(&ehdr) }, core_limit)?;
+    write_limited(&file, offset, bytemuck::bytes_of(&ehdr), core_limit)?;
     offset += EHDR_SIZE as u64;
 
     // ---- Write PT_NOTE program header ----
@@ -316,7 +311,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         p_memsz: note_total as u64,
         p_align: 4,
     };
-    write_limited(&file, offset, unsafe { as_bytes(&note_phdr) }, core_limit)?;
+    write_limited(&file, offset, bytemuck::bytes_of(&note_phdr), core_limit)?;
     offset += PHDR_SIZE as u64;
 
     // ---- Write PT_LOAD program headers ----
@@ -332,7 +327,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
             p_memsz: size as u64,
             p_align: PAGE_SIZE_4K as u64,
         };
-        write_limited(&file, offset, unsafe { as_bytes(&phdr) }, core_limit)?;
+        write_limited(&file, offset, bytemuck::bytes_of(&phdr), core_limit)?;
         offset += PHDR_SIZE as u64;
         cur_load_offset += size;
     }
@@ -345,7 +340,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
             sh_info: actual_phnum,
             ..Elf64Shdr::default()
         };
-        write_limited(&file, offset, unsafe { as_bytes(&shdr) }, core_limit)?;
+        write_limited(&file, offset, bytemuck::bytes_of(&shdr), core_limit)?;
     }
 
     // ---- Write NOTE segment ----
@@ -355,7 +350,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         n_type: NT_PRSTATUS,
     };
     let mut note_off = note_offset as u64;
-    write_limited(&file, note_off, unsafe { as_bytes(&nhdr) }, core_limit)?;
+    write_limited(&file, note_off, bytemuck::bytes_of(&nhdr), core_limit)?;
     note_off += NHDR_SIZE as u64;
 
     // Write name + padding.
@@ -365,7 +360,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     note_off += name_aligned as u64;
 
     // Write prstatus descriptor.
-    write_limited(&file, note_off, unsafe { as_bytes(&prstatus) }, core_limit)?;
+    write_limited(&file, note_off, bytemuck::bytes_of(&prstatus), core_limit)?;
 
     // ---- Write LOAD segment data (memory contents) ----
     let mut file_offset = load_offset as u64;

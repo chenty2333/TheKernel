@@ -290,7 +290,7 @@ impl SignalFrameLayout {
 /// `sigreturn`.  x86_64 enters the handler with the restorer word immediately
 /// below this 16-byte-aligned object.
 #[repr(C, align(16))]
-#[derive(Clone)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SignalFrame {
     ucontext: UContext,
     siginfo: SignalInfo,
@@ -334,29 +334,19 @@ impl SignalFrame {
         memory: &mut UserMemoryContext<'_, M>,
         ptr: *const Self,
     ) -> VmResult<Self> {
-        let frame = ptr.vm_read_uninit(memory)?;
-        // SAFETY: UserMemory returns `Ok` only after initializing every byte of
-        // the destination.  SignalFrame and all nested ABI records contain
-        // only initialized integer/byte storage; every ABI alignment hole is
-        // represented by an explicit zeroed field.  Restoration validates the
-        // machine fields before publication and never interprets siginfo.
-        Ok(unsafe { frame.assume_init() })
+        // Restoration validates the machine fields before publication and
+        // never interprets siginfo.
+        ptr.vm_read(memory)
     }
 
     /// Copies a complete frame to its userspace address.
-    ///
-    /// Construction of this type initializes all bytes, including the
-    /// explicit ABI padding fields, so the unchecked object copy is bounded
-    /// to the frame's exact representation.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn write_to_user<M: UserMemory + ?Sized>(
         &self,
         memory: &mut UserMemoryContext<'_, M>,
         ptr: *mut Self,
     ) -> VmResult {
-        // SAFETY: SignalFrame has no implicit outer padding and its nested
-        // records initialize every ABI padding byte before construction.
-        unsafe { ptr.vm_write_unchecked(memory, self.clone()) }
+        ptr.vm_write(memory, *self)
     }
 }
 

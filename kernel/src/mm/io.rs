@@ -220,20 +220,12 @@ impl Read for IoVectorBufIo {
             if len == 0 {
                 break;
             }
-            let dst = unsafe {
-                core::slice::from_raw_parts_mut(
-                    buf[count..count + len]
-                        .as_mut_ptr()
-                        .cast::<MaybeUninit<u8>>(),
-                    len,
-                )
-            };
             if let Err(error) = self
                 .inner
                 .capability
-                .read_slice(
+                .read_into(
                     (iov.iov_base as usize).wrapping_add(self.offset) as *const u8,
-                    dst,
+                    &mut buf[count..count + len],
                 )
                 .map_err(map_usercopy_error)
             {
@@ -362,11 +354,9 @@ mod tests {
         };
         // The descriptor page is mapped, and the payload page is mapped. The
         // constructor must import both through the selected address space.
-        unsafe {
-            capability
-                .write_value_unchecked(0x1000 as *mut IoVec, descriptor)
-                .unwrap();
-        }
+        capability
+            .write_value(0x1000 as *mut IoVec, descriptor)
+            .unwrap();
         let imported = IoVectorBuf::new(capability.clone(), 0x1000 as *const IoVec, 1).unwrap();
         assert_eq!(imported.entry(0).unwrap().iov_len, PAGE_SIZE_4K as i64);
         imported.check_readable().unwrap();
@@ -384,11 +374,9 @@ mod tests {
             iov_base: 0x3000,
             iov_len: PAGE_SIZE_4K as i64 + 1,
         };
-        unsafe {
-            capability
-                .write_value_unchecked(0x1000 as *mut IoVec, crossing)
-                .unwrap();
-        }
+        capability
+            .write_value(0x1000 as *mut IoVec, crossing)
+            .unwrap();
         let imported = IoVectorBuf::new(capability, 0x1000 as *const IoVec, 1).unwrap();
         assert!(matches!(
             imported.check_readable(),

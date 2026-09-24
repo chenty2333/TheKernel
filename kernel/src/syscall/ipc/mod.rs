@@ -554,7 +554,7 @@ pub(crate) fn set_shmall_limit(value: usize) {
 
 /// Data structure used to pass permission information to IPC operations.
 #[repr(C)]
-#[derive(Clone, Copy, AnyBitPattern)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct IpcPerm {
     /// Key supplied to msgget(2)
     pub key: __kernel_key_t,
@@ -574,6 +574,9 @@ pub struct IpcPerm {
     pub seq: c_ushort,
     /// Padding
     pub pad2: c_ushort,
+    /// The alignment hole before `unused0` in Linux's `ipc64_perm`, named so
+    /// that every byte copied to userspace is initialized.
+    pub pad3: u32,
     /// Unused field
     pub unused0: c_ulong,
     /// Unused field
@@ -888,6 +891,7 @@ mod credential_caller_tests {
             pad2: 0,
             unused0: 0,
             unused1: 0,
+            pad3: 0,
         }
     }
 

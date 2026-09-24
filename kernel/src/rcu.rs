@@ -98,6 +98,9 @@ fn effective_cpu() -> usize {
     axhal::percpu::this_cpu_id()
 }
 
+// SAFETY: `NoPreempt` keeps the reader on one CPU for the whole critical section, `current_cpu`
+// reports that CPU, and `with_local_irqs_disabled` saves and restores the caller's IRQ state, as
+// `EpochPlatform` requires.
 unsafe impl EpochPlatform for KernelEpochPlatform {
     type PinGuard = NoPreempt;
 

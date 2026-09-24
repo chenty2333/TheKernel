@@ -272,20 +272,20 @@ impl Drop for RenderBacking {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Map {
     offset: u64,
     handle: u32,
     pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct GetParam {
     param: u64,
     value: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Create {
     target: u32,
     format: u32,
@@ -303,7 +303,7 @@ struct Create {
     stride: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Info {
     bo_handle: u32,
     res_handle: u32,
@@ -311,7 +311,7 @@ struct Info {
     blob_mem: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Box3 {
     x: u32,
     y: u32,
@@ -321,7 +321,7 @@ struct Box3 {
     d: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Transfer {
     bo_handle: u32,
     box_: Box3,
@@ -331,13 +331,13 @@ struct Transfer {
     layer_stride: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Wait {
     handle: u32,
     flags: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Caps {
     cap_set_id: u32,
     cap_set_ver: u32,
@@ -346,7 +346,7 @@ struct Caps {
     pad: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Exec {
     flags: u32,
     size: u32,
@@ -362,14 +362,14 @@ struct Exec {
     out_syncobjs: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct ExecSyncobj {
     handle: u32,
     flags: u32,
     point: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct CreateBlob {
     blob_mem: u32,
     blob_flags: u32,
@@ -382,31 +382,40 @@ struct CreateBlob {
     blob_id: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct ContextSetParam {
     param: u64,
     value: u64,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct ContextInitIoctl {
     num_params: u32,
     pad: u32,
     ctx_set_params: u64,
 }
 
-fn read<T: Copy>(copy: &impl super::ioctl::UserCopy, addr: usize) -> AxResult<T> {
+fn read<T: bytemuck::AnyBitPattern>(
+    copy: &impl super::ioctl::UserCopy,
+    addr: usize,
+) -> AxResult<T> {
     let mut v = MaybeUninit::<T>::zeroed();
+    // SAFETY: `MaybeUninit<u8>` has byte alignment and the range is exactly
+    // the storage of `v`, which outlives the borrow.
     let b = unsafe {
         slice::from_raw_parts_mut(v.as_mut_ptr().cast::<MaybeUninit<u8>>(), size_of::<T>())
     };
     copy.read(addr, b)?;
+    // SAFETY: `v` started zeroed and the copy overwrote it; `AnyBitPattern`
+    // makes every resulting representation valid.
     Ok(unsafe { v.assume_init() })
 }
-fn write<T>(copy: &impl super::ioctl::UserCopy, addr: usize, value: &T) -> AxResult<()> {
-    copy.write(addr, unsafe {
-        slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>())
-    })
+fn write<T: bytemuck::NoUninit>(
+    copy: &impl super::ioctl::UserCopy,
+    addr: usize,
+    value: &T,
+) -> AxResult<()> {
+    copy.write(addr, bytemuck::bytes_of(value))
 }
 fn bytes(copy: &impl super::ioctl::UserCopy, addr: u64, n: usize, max: usize) -> AxResult<Vec<u8>> {
     if n > max {
@@ -417,6 +426,8 @@ fn bytes(copy: &impl super::ioctl::UserCopy, addr: u64, n: usize, max: usize) ->
     v.resize(n, 0);
     copy.read(
         usize::try_from(addr).map_err(|_| AxError::BadAddress)?,
+        // SAFETY: the view covers the `n` initialized bytes of `v`, and `UserCopy` only stores
+        // initialized bytes through it.
         unsafe { slice::from_raw_parts_mut(v.as_mut_ptr().cast(), n) },
     )?;
     Ok(v)

@@ -1092,12 +1092,11 @@ impl EvdevFile {
                 Ok(0)
             }
             EVIOCSCLOCKID => {
-                let mut bytes = [core::mem::MaybeUninit::uninit(); size_of::<i32>()];
+                let mut bytes = [0u8; size_of::<i32>()];
                 context
                     .user_memory()
-                    .read_bytes(arg, &mut bytes)
+                    .read_into(arg as *const u8, &mut bytes)
                     .map_err(map_usercopy_error)?;
-                let bytes = bytes.map(|byte| unsafe { byte.assume_init() });
                 self.client.set_clock_id(i32::from_ne_bytes(bytes))?;
                 Ok(0)
             }
@@ -1179,12 +1178,11 @@ impl EvdevFile {
     }
 
     fn set_repeat(&self, context: &IoctlContext, arg: usize) -> AxResult<usize> {
-        let mut bytes = [core::mem::MaybeUninit::uninit(); size_of::<[u32; 2]>()];
+        let mut bytes = [0u8; size_of::<[u32; 2]>()];
         context
             .user_memory()
-            .read_bytes(arg, &mut bytes)
+            .read_into(arg as *const u8, &mut bytes)
             .map_err(map_usercopy_error)?;
-        let bytes = bytes.map(|byte| unsafe { byte.assume_init() });
         self.device.set_repeat([
             u32::from_ne_bytes(bytes[..4].try_into().expect("repeat delay")),
             u32::from_ne_bytes(bytes[4..].try_into().expect("repeat period")),
@@ -1212,12 +1210,12 @@ impl EvdevFile {
         if size < size_of::<i32>() || (size - size_of::<i32>()) % size_of::<i32>() != 0 {
             return Err(LinuxError::EINVAL.into());
         }
-        let mut axis = [core::mem::MaybeUninit::uninit(); size_of::<i32>()];
+        let mut axis = [0u8; size_of::<i32>()];
         context
             .user_memory()
-            .read_bytes(arg, &mut axis)
+            .read_into(arg as *const u8, &mut axis)
             .map_err(map_usercopy_error)?;
-        let axis = i32::from_ne_bytes(axis.map(|byte| unsafe { byte.assume_init() }));
+        let axis = i32::from_ne_bytes(axis);
         if !(0..=u8::MAX as i32).contains(&axis) {
             return Err(LinuxError::EINVAL.into());
         }
@@ -1237,12 +1235,11 @@ impl EvdevFile {
     }
 
     fn input_mask(&self, context: &IoctlContext, arg: usize) -> AxResult<InputMask> {
-        let mut bytes = [core::mem::MaybeUninit::uninit(); size_of::<InputMask>()];
+        let mut bytes = [0u8; size_of::<InputMask>()];
         context
             .user_memory()
-            .read_bytes(arg, &mut bytes)
+            .read_into(arg as *const u8, &mut bytes)
             .map_err(map_usercopy_error)?;
-        let bytes = bytes.map(|byte| unsafe { byte.assume_init() });
         InputMask::read_from_bytes(&bytes).map_err(|_| AxError::InvalidInput)
     }
 
@@ -1260,10 +1257,11 @@ impl EvdevFile {
             .user_memory()
             .read_bytes(mask.codes_ptr as usize, &mut uninit)
             .map_err(map_usercopy_error)?;
-        // `read_bytes` succeeded for the complete slice, so every element is
-        // initialized before it crosses into the per-OFD queue state.
         let bitmap = uninit
             .into_iter()
+            // SAFETY: `read_bytes` succeeded for the complete slice, so every
+            // element is initialized before it crosses into the per-OFD queue
+            // state.
             .map(|byte| unsafe { byte.assume_init() })
             .collect();
         self.client.set_mask(event_type, bitmap);

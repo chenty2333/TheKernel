@@ -19,7 +19,7 @@ alloc = []
 
 [dependencies]
 bytemuck = { version = "1.24", default-features = false }
-linux-raw-sys = { version = "0.12", default-features = false, features = ["general", "no_std"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["general", "net", "no_std", "system"] }
 
 [dev-dependencies]
 bytemuck = { version = "1.24", default-features = false, features = ["derive"] }

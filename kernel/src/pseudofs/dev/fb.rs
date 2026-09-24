@@ -292,12 +292,11 @@ const _: () = {
 };
 
 fn color_map_from_user(context: &IoctlContext, arg: usize) -> VfsResult<ColorMap> {
-    let mut raw = [core::mem::MaybeUninit::new(0u8); size_of::<ColorMap>()];
+    let mut bytes = [0u8; size_of::<ColorMap>()];
     context
         .user_memory()
-        .read_bytes(arg, &mut raw)
+        .read_into(arg as *const u8, &mut bytes)
         .map_err(crate::mm::map_usercopy_error)?;
-    let bytes = raw.map(|byte| unsafe { byte.assume_init() });
     Ok(ColorMap {
         start: get_u32::<_, { offset_of!(ColorMap, start) }>(&bytes),
         len: get_u32::<_, { offset_of!(ColorMap, len) }>(&bytes),
@@ -324,16 +323,14 @@ fn read_cmap_channel(context: &IoctlContext, pointer: u64, len: usize) -> VfsRes
     }
     let address = usize::try_from(pointer).map_err(|_| AxError::InvalidInput)?;
     let bytes = len.checked_mul(2).ok_or(AxError::InvalidInput)?;
-    let mut raw = [core::mem::MaybeUninit::new(0u8); 32];
+    let mut raw = [0u8; 32];
     context
         .user_memory()
-        .read_bytes(address, &mut raw[..bytes])
+        .read_into(address as *const u8, &mut raw[..bytes])
         .map_err(crate::mm::map_usercopy_error)?;
     Ok(raw[..bytes]
         .chunks_exact(2)
-        .map(|value| unsafe {
-            u16::from_ne_bytes([value[0].assume_init(), value[1].assume_init()])
-        })
+        .map(|value| u16::from_ne_bytes([value[0], value[1]]))
         .collect())
 }
 

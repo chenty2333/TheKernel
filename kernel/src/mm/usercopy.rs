@@ -77,6 +77,14 @@ impl UserMemoryCapability {
         })
     }
 
+    /// Reads a foreign Linux ABI value audited as `UserAbiValue`.
+    pub fn read_abi_value<T: tk_linux_usercopy::UserAbiValue>(&self, ptr: *const T) -> VmResult<T> {
+        let value = self.read_value_uninit(ptr)?;
+        // SAFETY: the context initialized the complete object and
+        // `UserAbiValue` makes every representation valid.
+        Ok(unsafe { value.assume_init() })
+    }
+
     /// Reads an unaligned typed value without assuming its bit pattern.
     pub fn read_value_uninit<T>(&self, ptr: *const T) -> VmResult<MaybeUninit<T>> {
         self.with_memory(|memory| {
@@ -89,6 +97,17 @@ impl UserMemoryCapability {
     /// Writes a typed value whose complete representation is initialized.
     pub fn write_value<T: NoUninit>(&self, ptr: *mut T, value: T) -> VmResult {
         self.with_memory(|memory| memory.write_slice(ptr, slice::from_ref(&value)))
+    }
+
+    /// Writes a foreign Linux ABI value audited as `UserAbiPod`.
+    pub fn write_abi_value<T: tk_linux_usercopy::UserAbiPod>(
+        &self,
+        ptr: *mut T,
+        value: T,
+    ) -> VmResult {
+        // SAFETY: `UserAbiPod` guarantees the value has no padding, so every
+        // byte of its object representation is initialized.
+        unsafe { self.write_value_unchecked(ptr, value) }
     }
 
     /// Writes a typed value with an audited complete object representation.
@@ -107,6 +126,18 @@ impl UserMemoryCapability {
     /// Reads a typed slice through a fresh user-memory context.
     pub fn read_slice<T>(&self, ptr: *const T, dst: &mut [MaybeUninit<T>]) -> VmResult {
         self.with_memory(|memory| memory.read_slice(ptr, dst))
+    }
+
+    /// Reads bytes into an already-initialized buffer, such as a zeroed
+    /// snapshot array.
+    pub fn read_into(&self, ptr: *const u8, dst: &mut [u8]) -> VmResult {
+        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`, and a usercopy
+        // provider only ever stores initialized bytes through the view, so
+        // `dst` stays initialized whether the copy succeeds or faults.
+        let view = unsafe {
+            slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<MaybeUninit<u8>>(), dst.len())
+        };
+        self.read_slice(ptr, view)
     }
 
     /// Writes a typed slice whose complete representations are initialized.

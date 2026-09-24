@@ -314,6 +314,9 @@ impl PreparedCowDemotionFrames {
             .map_err(|_| AxError::NoMemory)?;
         for offset in (0..PageSize::Size2M as usize).step_by(PAGE_SIZE_4K) {
             let frame = alloc_frame(false, PageSize::Size4K)?;
+            // SAFETY: `source` is a 2 MiB frame and `offset` steps through it in 4 KiB pages;
+            // `frame` is a freshly allocated 4 KiB frame, so the two direct-map ranges are valid
+            // and disjoint.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     phys_to_virt(source).as_ptr().add(offset),
@@ -361,6 +364,8 @@ impl PreparedCowHugeFrame {
                 continue;
             };
             let offset = index * PAGE_SIZE_4K;
+            // SAFETY: `sources` holds exactly 512 frames (validated above), so `offset` stays
+            // inside the freshly allocated 2 MiB `frame`, which no source frame can overlap.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     phys_to_virt(source).as_ptr(),
@@ -477,6 +482,8 @@ impl PreparedCowPage {
         }
         let frame = alloc_frame(false, PageSize::Size4K)?;
         self.frame = PreparedCowFrame::Incomplete(frame);
+        // SAFETY: `frame` was just allocated with 4 KiB and is not yet mapped anywhere, so this is
+        // the only reference to its direct-map bytes.
         let bytes = unsafe {
             slice::from_raw_parts_mut(
                 phys_to_virt(frame).as_mut_ptr().cast::<MaybeUninit<u8>>(),
@@ -595,6 +602,8 @@ trait CowClonePageTableOps {
 
 fn copy_cow_frame(source: PhysAddr, page_size: PageSize) -> AxResult<PhysAddr> {
     let copied = alloc_frame(false, page_size)?;
+    // SAFETY: `copied` was just allocated with `page_size` bytes and cannot overlap the mapped
+    // `source` frame of the same size.
     unsafe {
         core::ptr::copy_nonoverlapping(
             phys_to_virt(source).as_ptr(),
@@ -977,6 +986,8 @@ impl CowBackend {
             let max_read = current_end
                 .map_or(u64::MAX, |end| end.saturating_sub(page_file_start))
                 .min(PAGE_SIZE_4K as u64) as usize;
+            // SAFETY: `index < 512` and `max_read <= PAGE_SIZE_4K`, so the slice lies inside the
+            // unpublished 2 MiB `frame`, which nothing else references yet.
             let destination = unsafe {
                 slice::from_raw_parts_mut(
                     phys_to_virt(frame).as_mut_ptr().add(index * PAGE_SIZE_4K),
@@ -1097,6 +1108,8 @@ impl CowBackend {
             return Err(AxError::InvalidInput);
         }
         let frame = self.alloc_new_frame(false)?;
+        // SAFETY: `frame` was just allocated for this 4 KiB anonymous page and is not yet
+        // mapped, so the slice is the only reference to it.
         let page =
             unsafe { slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), PAGE_SIZE_4K) };
         if let Err(error) = swap::read(entry, page) {
@@ -1194,11 +1207,14 @@ impl CowBackend {
         let frame = self.alloc_new_frame(file_window.is_none())?;
 
         if let Some((file, file_start, start, max_read)) = file_window {
+            // SAFETY: `frame` was just allocated with `self.size` bytes and is not yet mapped, so
+            // the slice is the only reference to it.
             let buf = unsafe {
                 slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), self.size as _)
             };
 
             if start > 0 {
+                // SAFETY: `start < page_size == buf.len()` (checked when the window was built).
                 unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, start) };
             }
             // File-backed COW faults run while the owning mm is locked. Load
@@ -1245,6 +1261,7 @@ impl CowBackend {
             }
             let tail_start = start + max_read;
             if tail_start < buf.len() {
+                // SAFETY: `tail_start < buf.len()`, so the zeroed range stays inside `buf`.
                 unsafe {
                     core::ptr::write_bytes(
                         buf.as_mut_ptr().add(tail_start),
@@ -1287,6 +1304,8 @@ impl CowBackend {
         }
 
         let new_frame = alloc_frame(false, page_size)?;
+        // SAFETY: `paddr` is the mapped frame of `page_size` bytes and `new_frame` was just
+        // allocated with the same size, so both ranges are valid and disjoint.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 phys_to_virt(paddr).as_ptr(),

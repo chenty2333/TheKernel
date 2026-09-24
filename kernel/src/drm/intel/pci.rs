@@ -718,6 +718,8 @@ impl ConfigSpace for Ecam {
         let pointer = axhal::mem::phys_to_virt(axhal::mem::PhysAddr::from_usize(address))
             .as_ptr()
             .cast::<u32>();
+        // SAFETY: `pointer` is the configuration-space address checked against declared device
+        // memory above.
         Some(unsafe { core::ptr::read_volatile(pointer) })
     }
 }

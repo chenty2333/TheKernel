@@ -274,14 +274,12 @@ impl Drop for DspFile {
 }
 
 fn read_int(context: &IoctlContext, arg: usize) -> AxResult<i32> {
-    let mut bytes = [MaybeUninit::uninit(); 4];
+    let mut bytes = [0u8; 4];
     context
         .user_memory()
-        .read_bytes(arg, &mut bytes)
+        .read_into(arg as *const u8, &mut bytes)
         .map_err(crate::mm::map_usercopy_error)?;
-    Ok(i32::from_ne_bytes(
-        bytes.map(|b| unsafe { b.assume_init() }),
-    ))
+    Ok(i32::from_ne_bytes(bytes))
 }
 fn write_int(context: &IoctlContext, arg: usize, value: i32) -> AxResult<usize> {
     context

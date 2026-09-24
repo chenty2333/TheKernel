@@ -568,6 +568,8 @@ impl LoopState {
         if !self.is_bound() {
             return Err(AxError::from(LinuxError::ENXIO));
         }
+        // SAFETY: `loop_info` is a `linux_raw_sys` record of integers and integer arrays, for
+        // which all-zero is a valid value.
         let mut res: loop_info = unsafe { core::mem::zeroed() };
         res.lo_number = number as _;
         res.lo_rdevice = dev_id.0 as _;
@@ -586,6 +588,8 @@ impl LoopState {
         if !self.is_bound() {
             return Err(AxError::from(LinuxError::ENXIO));
         }
+        // SAFETY: `loop_info64` is a `linux_raw_sys` record of integers and integer arrays, for
+        // which all-zero is a valid value.
         let mut res: loop_info64 = unsafe { core::mem::zeroed() };
         res.lo_number = number;
         res.lo_rdevice = dev_id.0;

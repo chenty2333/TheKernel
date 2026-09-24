@@ -372,6 +372,9 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
                 return Err(AxError::BadState);
             }
             let offset = token & (PAGE_SIZE_4K - 1);
+            // SAFETY: the address-space lock is held and `frame` is the populated shadow-stack
+            // leaf for `token`, which is 8-byte aligned inside that 4 KiB page, so the direct-map
+            // store stays in the frame.
             unsafe {
                 (axhal::mem::phys_to_virt(frame).as_mut_ptr().add(offset) as *mut u64)
                     .write((token + 8) as u64 | 1)

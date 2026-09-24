@@ -515,6 +515,38 @@ pub struct PerfEventAttrV0 {
     pub bp_type: u32,
     pub config1: u64,
 }
+impl PerfEventAttrV0 {
+    /// Decodes the fixed ABI-version-0 prefix from native-endian bytes, the
+    /// form a usercopy of `perf_event_attr` delivers.
+    pub fn from_ne_bytes(bytes: [u8; PERF_ATTR_SIZE_VER0 as usize]) -> Self {
+        let u32_at = |offset: usize| {
+            u32::from_ne_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ])
+        };
+        let u64_at = |offset: usize| {
+            let mut word = [0; 8];
+            word.copy_from_slice(&bytes[offset..offset + 8]);
+            u64::from_ne_bytes(word)
+        };
+        Self {
+            event_type: u32_at(core::mem::offset_of!(Self, event_type)),
+            size: u32_at(core::mem::offset_of!(Self, size)),
+            config: u64_at(core::mem::offset_of!(Self, config)),
+            sample_period: u64_at(core::mem::offset_of!(Self, sample_period)),
+            sample_type: u64_at(core::mem::offset_of!(Self, sample_type)),
+            read_format: u64_at(core::mem::offset_of!(Self, read_format)),
+            flags: u64_at(core::mem::offset_of!(Self, flags)),
+            wakeup_events: u32_at(core::mem::offset_of!(Self, wakeup_events)),
+            bp_type: u32_at(core::mem::offset_of!(Self, bp_type)),
+            config1: u64_at(core::mem::offset_of!(Self, config1)),
+        }
+    }
+}
+
 pub const PERF_ATTR_SIZE_OFFSET: usize = core::mem::offset_of!(PerfEventAttrV0, size);
 const _: () = assert!(core::mem::size_of::<PerfEventAttrV0>() == PERF_ATTR_SIZE_VER0 as usize);
 

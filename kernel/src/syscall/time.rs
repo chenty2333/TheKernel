@@ -174,11 +174,15 @@ fn clock_resolution(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
 #[derive(Clone, Copy, Debug)]
 pub struct KernelOldTimex {
     modes: u32,
+    // Linux's `struct __kernel_timex` spells its alignment holes as `int :32;`
+    // members; they are named here so every copied-out byte is initialized.
+    _pad0: i32,
     offset: i64,
     freq: i64,
     maxerror: i64,
     esterror: i64,
     status: i32,
+    _pad1: i32,
     constant: i64,
     precision: i64,
     tolerance: i64,
@@ -187,6 +191,7 @@ pub struct KernelOldTimex {
     ppsfreq: i64,
     jitter: i64,
     shift: i32,
+    _pad2: i32,
     stabil: i64,
     jitcnt: i64,
     calcnt: i64,
@@ -195,6 +200,45 @@ pub struct KernelOldTimex {
     tai: i32,
     _padding: [i32; 11],
 }
+
+// SAFETY: every field is an integer, an integer array, or a `linux_raw_sys`
+// `timeval` (itself two integers).
+unsafe impl tk_linux_usercopy::UserAbiValue for KernelOldTimex {}
+// SAFETY: every Linux alignment hole is a named field, and the assertion below
+// proves the fields cover the whole 208-byte object.
+unsafe impl tk_linux_usercopy::UserAbiPod for KernelOldTimex {}
+const _: () = {
+    use tk_linux_usercopy::field_size;
+    type T = KernelOldTimex;
+    assert!(size_of::<T>() == 208);
+    assert!(
+        size_of::<T>()
+            == field_size(|t: &T| &t.modes)
+                + field_size(|t: &T| &t._pad0)
+                + field_size(|t: &T| &t.offset)
+                + field_size(|t: &T| &t.freq)
+                + field_size(|t: &T| &t.maxerror)
+                + field_size(|t: &T| &t.esterror)
+                + field_size(|t: &T| &t.status)
+                + field_size(|t: &T| &t._pad1)
+                + field_size(|t: &T| &t.constant)
+                + field_size(|t: &T| &t.precision)
+                + field_size(|t: &T| &t.tolerance)
+                + field_size(|t: &T| &t.time)
+                + field_size(|t: &T| &t.tick)
+                + field_size(|t: &T| &t.ppsfreq)
+                + field_size(|t: &T| &t.jitter)
+                + field_size(|t: &T| &t.shift)
+                + field_size(|t: &T| &t._pad2)
+                + field_size(|t: &T| &t.stabil)
+                + field_size(|t: &T| &t.jitcnt)
+                + field_size(|t: &T| &t.calcnt)
+                + field_size(|t: &T| &t.errcnt)
+                + field_size(|t: &T| &t.stbcnt)
+                + field_size(|t: &T| &t.tai)
+                + field_size(|t: &T| &t._padding)
+    );
+};
 
 /// The published Linux timex state plus the generation that absolute
 /// CLOCK_TAI timers snapshot, so an `ADJ_TAI` rebase can reproject them.
@@ -839,7 +883,7 @@ fn write_time_result<M: UserMemory + ?Sized>(
     // provider failures are Linux EFAULT, including access and population
     // failures, so do not expose provider-specific errors here.
     if let Some(ptr) = VmPtr::nullable(ptr) {
-        unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, seconds) }
+        VmMutPtr::vm_write_abi(ptr, memory, seconds)
             .map_err(map_time_usercopy_error)?;
     }
     Ok(())
@@ -861,10 +905,8 @@ fn read_timer_spec<M: UserMemory + ?Sized>(
     ptr: *const itimerspec,
 ) -> AxResult<itimerspec> {
     let value =
-        tk_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory).map_err(map_timer_usercopy_error)?;
-    // SAFETY: the explicit provider initialized every byte of the value, and
-    // `itimerspec` contains only integer fields on the supported x86_64 ABI.
-    Ok(unsafe { value.assume_init() })
+        tk_linux_usercopy::VmPtr::vm_read_abi(ptr, memory).map_err(map_timer_usercopy_error)?;
+    Ok(value)
 }
 
 fn write_timer_id<M: UserMemory + ?Sized>(
@@ -883,7 +925,7 @@ fn write_timer_spec<M: UserMemory + ?Sized>(
     // `linux_raw_sys` does not expose bytemuck's `NoUninit` marker for its
     // repr(C) ABI structs.  The x86_64 `itimerspec` is four integer words with
     // no padding, so its complete object representation is initialized here.
-    unsafe { tk_linux_usercopy::VmMutPtr::vm_write_unchecked(ptr, memory, value) }
+    tk_linux_usercopy::VmMutPtr::vm_write_abi(ptr, memory, value)
         .map_err(map_timer_usercopy_error)
 }
 
@@ -892,10 +934,8 @@ fn read_itimer_value<M: UserMemory + ?Sized>(
     ptr: *const itimerval,
 ) -> AxResult<itimerval> {
     let value =
-        tk_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory).map_err(map_timer_usercopy_error)?;
-    // SAFETY: the explicit provider initialized every byte of the value, and
-    // `itimerval` contains only integer fields on the supported x86_64 ABI.
-    Ok(unsafe { value.assume_init() })
+        tk_linux_usercopy::VmPtr::vm_read_abi(ptr, memory).map_err(map_timer_usercopy_error)?;
+    Ok(value)
 }
 
 fn write_itimer_value<M: UserMemory + ?Sized>(
@@ -905,7 +945,7 @@ fn write_itimer_value<M: UserMemory + ?Sized>(
 ) -> AxResult<()> {
     // `itimerval` has no padding on the x86_64 Linux ABI, so its complete
     // object representation is initialized and safe to copy out.
-    unsafe { tk_linux_usercopy::VmMutPtr::vm_write_unchecked(ptr, memory, value) }
+    tk_linux_usercopy::VmMutPtr::vm_write_abi(ptr, memory, value)
         .map_err(map_timer_usercopy_error)
 }
 
@@ -1225,9 +1265,7 @@ pub fn sys_clock_gettime<M: UserMemory + ?Sized>(
     // kernel/time/alarmtimer.c:600-620); reading needs no capability.
     wake_alarm_admission(clock_id, linux_time::WakeAlarmUse::Read)?;
     let now = clock_now(clock_id)?;
-    // SAFETY: `timespec` is two initialized integer words on the x86_64 Linux
-    // ABI; the layout assertions above cover the complete object extent.
-    unsafe { VmMutPtr::vm_write_unchecked(ts, memory, timespec::from_time_value(now)) }
+    VmMutPtr::vm_write_abi(ts, memory, timespec::from_time_value(now))
         .map_err(map_usercopy_error)?;
     Ok(0)
 }
@@ -1249,9 +1287,7 @@ pub fn sys_gettimeofday<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     let now = wall_time();
     if let Some(ts) = VmPtr::nullable(ts) {
-        // SAFETY: `timeval` is two initialized integer words on the x86_64
-        // Linux ABI; the layout assertions above cover the object extent.
-        unsafe { VmMutPtr::vm_write_unchecked(ts, memory, timeval::from_time_value(now)) }
+        VmMutPtr::vm_write_abi(ts, memory, timeval::from_time_value(now))
             .map_err(map_usercopy_error)?;
     }
     if let Some(tz) = VmPtr::nullable(tz) {
@@ -1259,10 +1295,7 @@ pub fn sys_gettimeofday<M: UserMemory + ?Sized>(
         // settimeofday(2) in `sys_tz` (`kernel/time/time.c:140-155`); it stays
         // zero until userspace sets one, and no clock reads it.
         let retained = system_timezone();
-        // SAFETY: `timezone` contains only its two initialized i32 fields;
-        // generated linux_raw_sys layout is asserted by the compiler below.
-        unsafe {
-            VmMutPtr::vm_write_unchecked(
+        VmMutPtr::vm_write_abi(
                 tz,
                 memory,
                 timezone {
@@ -1270,7 +1303,6 @@ pub fn sys_gettimeofday<M: UserMemory + ?Sized>(
                     tz_dsttime: retained.dst_time,
                 },
             )
-        }
         .map_err(map_usercopy_error)?;
     }
     Ok(0)
@@ -1287,11 +1319,8 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
     // `timespec64_valid_settod()` inside `do_sys_settimeofday64()`
     // (`kernel/time/time.c:199-222`).
     let ts = if let Some(ts) = VmPtr::nullable(ts) {
-        let ts = unsafe {
-            VmPtr::vm_read_uninit(ts, memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let ts = VmPtr::vm_read_abi(ts, memory)
+            .map_err(map_usercopy_error)?;
         if !(0..1_000_000).contains(&ts.tv_usec) {
             return Err(AxError::InvalidInput);
         }
@@ -1301,11 +1330,8 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
     };
 
     let tz = if let Some(tz) = VmPtr::nullable(tz) {
-        Some(unsafe {
-            VmPtr::vm_read_uninit(tz, memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        })
+        Some(VmPtr::vm_read_abi(tz, memory)
+            .map_err(map_usercopy_error)?)
     } else {
         None
     };
@@ -1391,8 +1417,7 @@ pub fn sys_clock_getres<M: UserMemory + ?Sized>(
     }
     let resolution = clock_resolution(clock_id)?;
     if let Some(res) = VmPtr::nullable(res) {
-        // SAFETY: `timespec` is a fully initialized two-word ABI value.
-        unsafe { VmMutPtr::vm_write_unchecked(res, memory, timespec::from_time_value(resolution)) }
+        VmMutPtr::vm_write_abi(res, memory, timespec::from_time_value(resolution))
             .map_err(map_usercopy_error)?;
     }
     Ok(0)
@@ -1428,11 +1453,8 @@ pub fn sys_clock_settime<M: UserMemory + ?Sized>(
     if clock_id < 0 && (clock_id & CLOCKFD_MASK) != CLOCKFD && cpu_clock.is_none() {
         return Err(AxError::InvalidInput);
     }
-    let requested = unsafe {
-        VmPtr::vm_read_uninit(ts, memory)
+    let requested = VmPtr::vm_read_abi(ts, memory)
             .map_err(map_usercopy_error)?
-            .assume_init()
-    }
     .try_into_time_value()?;
     // `pc_clock_settime()` checks the timespec strictly, then fails in
     // `get_clock_desc()` with EINVAL because TheKernel has no posix-clock
@@ -1475,15 +1497,10 @@ pub fn sys_clock_adjtime<M: UserMemory + ?Sized>(
     // `clock_adjtime(2)` copies the timex in first and, unlike `adjtimex(2)`,
     // copies it back only when the operation succeeded
     // (`kernel/time/posix-timers.c:1172-1187`).
-    let mut timex = unsafe {
-        VmPtr::vm_read_uninit(timex_ptr, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let mut timex = VmPtr::vm_read_abi(timex_ptr, memory)
+            .map_err(map_usercopy_error)?;
     let result = clock_adjtime_core(clock_id, &mut timex)?;
-    // SAFETY: `timex` was initialized by the copy-in above and every field
-    // update preserves its fully initialized object representation.
-    unsafe { VmMutPtr::vm_write_unchecked(timex_ptr, memory, timex) }
+    VmMutPtr::vm_write_abi(timex_ptr, memory, timex)
         .map_err(map_usercopy_error)?;
     Ok(result)
 }
@@ -1495,19 +1512,16 @@ pub fn sys_adjtimex<M: UserMemory + ?Sized>(
     // `adjtimex(2)` always copies the timex back, even when the operation
     // failed, and replaces that failure with EFAULT if the copy fails
     // (`kernel/time/time.c:269-282`).
-    let mut timex = unsafe {
-        VmPtr::vm_read_uninit(timex_ptr, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let mut timex = VmPtr::vm_read_abi(timex_ptr, memory)
+            .map_err(map_usercopy_error)?;
     let result = clock_adjtime_core(CLOCK_REALTIME as _, &mut timex);
-    // SAFETY: as above; a failed operation leaves every field initialized.
-    unsafe { VmMutPtr::vm_write_unchecked(timex_ptr, memory, timex) }
+    VmMutPtr::vm_write_abi(timex_ptr, memory, timex)
         .map_err(map_usercopy_error)?;
     result
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Tms {
     /// user time
     tms_utime: i64,
@@ -1531,10 +1545,7 @@ pub fn sys_times<M: UserMemory + ?Sized>(
         let proc_data = &curr.as_thread().proc_data;
         let self_usage = proc_data.self_usage();
         let child_usage = proc_data.children_usage();
-        // SAFETY: `Tms` is repr(C) over four initialized native clock_t words and has
-        // no implicit padding on the supported x86_64 ABI.
-        unsafe {
-            VmMutPtr::vm_write_unchecked(
+        VmMutPtr::vm_write(
                 tms,
                 memory,
                 Tms {
@@ -1544,7 +1555,6 @@ pub fn sys_times<M: UserMemory + ?Sized>(
                     tms_cstime: child_usage.stime_ticks() as i64,
                 },
             )
-        }
         .map_err(map_usercopy_error)?;
     }
     Ok(times_clock_ticks(monotonic_time_nanos()) as isize)

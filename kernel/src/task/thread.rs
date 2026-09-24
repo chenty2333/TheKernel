@@ -923,6 +923,9 @@ fn exit_task_parent_relation(
 #[repr(transparent)]
 pub struct AssumeSync<T>(pub T);
 
+// SAFETY: `AssumeSync` only wraps `Thread::time`, which is borrowed exclusively by the owning task
+// (every caller passes `current()`) with IRQs and preemption disabled, so no two CPUs ever access
+// it concurrently.
 unsafe impl<T> Sync for AssumeSync<T> {}
 
 impl<T> Deref for AssumeSync<T> {

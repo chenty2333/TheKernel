@@ -134,9 +134,20 @@ impl PipeRing {
         (capacity / PIPE_BUF_SIZE).max(1)
     }
 
+    /// `HeapRb` allocates its storage uninitialized, and the write paths hand
+    /// the vacant region to byte copiers as `&mut [u8]`.  Zeroing it once here
+    /// keeps every byte initialized from then on: the ring never
+    /// de-initializes a slot it has handed out.
+    fn zeroed_bytes(mut bytes: HeapRb<u8>) -> HeapRb<u8> {
+        let (left, right) = bytes.vacant_slices_mut();
+        left.fill(core::mem::MaybeUninit::new(0));
+        right.fill(core::mem::MaybeUninit::new(0));
+        bytes
+    }
+
     fn new(capacity: usize) -> Self {
         Self {
-            bytes: HeapRb::new(capacity),
+            bytes: Self::zeroed_bytes(HeapRb::new(capacity)),
             marks: HeapRb::new(Self::max_usage(capacity)),
             write_pos: 0,
             read_pos: 0,
@@ -145,7 +156,7 @@ impl PipeRing {
 
     fn try_new(capacity: usize) -> Result<Self, alloc::collections::TryReserveError> {
         Ok(Self {
-            bytes: HeapRb::try_new(capacity)?,
+            bytes: Self::zeroed_bytes(HeapRb::try_new(capacity)?),
             marks: HeapRb::try_new(Self::max_usage(capacity))?,
             write_pos: 0,
             read_pos: 0,
@@ -222,6 +233,8 @@ impl PipeRing {
     /// packet buffer can be trimmed; `read(2)` never leaves one behind because
     /// it zeroes `buf->len` unconditionally.
     fn advance_read(&mut self, count: usize) {
+        // SAFETY: every caller passes at most the occupied length it just copied out (or the whole
+        // head packet), `u8` needs no drop, and `&mut self` excludes concurrent consumers.
         unsafe { self.bytes.advance_read_index(count) };
         self.read_pos += count as u64;
         while self
@@ -243,9 +256,14 @@ impl PipeRing {
     /// advances the byte write index.
     fn push_source(&mut self, src: &mut IoSrc, max_len: usize) -> AxResult<usize> {
         let (left, right) = self.bytes.vacant_slices_mut();
-        // The ring buffer exposes valid writable byte slices here.
+        // SAFETY: the vacant region is ring storage that `zeroed_bytes` initialized at
+        // construction and the ring never de-initializes, so viewing it as `&mut [u8]` is
+        // valid for the borrow of the ring.
         let left =
             unsafe { core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len()) };
+        // SAFETY: the vacant region is ring storage that `zeroed_bytes` initialized at
+        // construction and the ring never de-initializes, so viewing it as `&mut [u8]` is valid
+        // for the borrow of the ring.
         let right = unsafe {
             core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
         };
@@ -255,6 +273,8 @@ impl PipeRing {
             let right_len = right.len().min(max_len - count);
             count += src.read(&mut right[..right_len])?;
         }
+        // SAFETY: exactly `count` bytes of the vacant region were just written, `u8` needs no
+        // other initialization, and `&mut self` excludes concurrent producers.
         unsafe { self.bytes.advance_write_index(count) };
         Ok(count)
     }
@@ -328,9 +348,14 @@ fn notify_pipe_writable(poll_tx: &PollSet, transfer: PipeTransfer) {
 
 fn copy_slices_to_ring(dst: &mut HeapRb<u8>, src: &[&[u8]], max_len: usize) -> usize {
     let (left, right) = dst.vacant_slices_mut();
-    // The ring buffer exposes valid writable byte slices here.
     let mut dst_slices = [
+        // SAFETY: the vacant region is ring storage that `zeroed_bytes` initialized at
+        // construction and the ring never de-initializes, so viewing it as `&mut [u8]` is valid
+        // for the borrow of the ring.
         unsafe { core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len()) },
+        // SAFETY: the vacant region is ring storage that `zeroed_bytes` initialized at
+        // construction and the ring never de-initializes, so viewing it as `&mut [u8]` is valid
+        // for the borrow of the ring.
         unsafe { core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len()) },
     ];
     let mut copied = 0;
@@ -344,6 +369,8 @@ fn copy_slices_to_ring(dst: &mut HeapRb<u8>, src: &[&[u8]], max_len: usize) -> u
                 src_offset = 0;
             }
             if src_index == src.len() {
+                // SAFETY: exactly `copied` bytes of the vacant region were just written, `u8`
+                // needs no other initialization, and `&mut self` excludes concurrent producers.
                 unsafe { dst.advance_write_index(copied) };
                 return copied;
             }
@@ -357,6 +384,8 @@ fn copy_slices_to_ring(dst: &mut HeapRb<u8>, src: &[&[u8]], max_len: usize) -> u
             copied += count;
         }
     }
+    // SAFETY: exactly `copied` bytes of the vacant region were just written, `u8` needs no other
+    // initialization, and `&mut self` excludes concurrent producers.
     unsafe { dst.advance_write_index(copied) };
     copied
 }

@@ -35,7 +35,7 @@ pub const ALG_OP_DECRYPT: u32 = 0;
 pub const ALG_OP_ENCRYPT: u32 = 1;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SockAddrAlgRaw {
     salg_family: u16,
     salg_type: [u8; 14],
@@ -60,12 +60,9 @@ impl SockAddrAlg {
             return Err(AxError::InvalidInput);
         }
 
-        let raw = unsafe {
-            capability
-                .read_value_uninit(addr.address().as_usize() as *const SockAddrAlgRaw)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let raw = capability
+            .read_value(addr.address().as_usize() as *const SockAddrAlgRaw)
+            .map_err(map_usercopy_error)?;
         if raw.salg_family as u32 != AF_ALG {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
@@ -217,13 +214,7 @@ fn validate_send_params(control: &[u8]) -> AxResult<usize> {
     let mut ancillary_items = 0usize;
     let mut offset = 0usize;
     while control.len().saturating_sub(offset) >= size_of::<cmsghdr>() {
-        let hdr = unsafe {
-            control
-                .as_ptr()
-                .add(offset)
-                .cast::<cmsghdr>()
-                .read_unaligned()
-        };
+        let hdr: cmsghdr = tk_linux_usercopy::abi_read_unaligned(&control[offset..]);
         if hdr.cmsg_len < size_of::<cmsghdr>() {
             return Err(AxError::InvalidInput);
         }
@@ -362,11 +353,9 @@ mod tests {
     #[test]
     fn sockaddr_alg_reads_from_the_explicit_capability() {
         let capability = mapped_capability();
-        unsafe {
-            capability
-                .write_value_unchecked(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_ALG as _))
-                .unwrap();
-        }
+        capability
+            .write_value(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_ALG as _))
+            .unwrap();
 
         let address = SockAddrAlg::read_from_user(
             &capability,
@@ -381,11 +370,9 @@ mod tests {
     #[test]
     fn sockaddr_alg_keeps_length_and_family_errors() {
         let capability = mapped_capability();
-        unsafe {
-            capability
-                .write_value_unchecked(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_INET as _))
-                .unwrap();
-        }
+        capability
+            .write_value(0x1000 as *mut SockAddrAlgRaw, raw_sockaddr(AF_INET as _))
+            .unwrap();
 
         let short = SockAddrAlg::read_from_user(
             &capability,

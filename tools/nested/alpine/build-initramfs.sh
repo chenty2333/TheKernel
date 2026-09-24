@@ -11,7 +11,7 @@
 # NOTE: "no disk" is not "no firmware".  QEMU still loads and executes SeaBIOS
 # and still needs its firmware *data files* on disk at run time -- the inner
 # QEMU dies with "could not load PC BIOS 'bios-256k.bin'" otherwise.  Ship
-# stage/qemu-firmware/ into the image and pass `-L <dir>`.  See REPORT.md s4.
+# stage/qemu-firmware/ into the image and pass `-L <dir>`.
 #
 # Network-free: the only input is the pinned Alpine minirootfs tarball.
 #

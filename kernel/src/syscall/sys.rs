@@ -55,6 +55,37 @@ const _: () = {
     assert!(offset_of!(sysinfo, mem_unit) == 104);
 };
 
+/// Linux's x86_64 `struct sysinfo` with its two alignment holes (after `pad`
+/// and after `mem_unit`) named, so the record derives `Pod` and no
+/// uninitialized byte reaches userspace; Linux zeroes both before copyout.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Sysinfo {
+    uptime: i64,
+    loads: [u64; 3],
+    totalram: u64,
+    freeram: u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap: u64,
+    procs: u16,
+    pad: u16,
+    pad2: u32,
+    totalhigh: u64,
+    freehigh: u64,
+    mem_unit: u32,
+    tail_pad: u32,
+}
+
+const _: () = {
+    assert!(size_of::<Sysinfo>() == size_of::<sysinfo>());
+    assert!(align_of::<Sysinfo>() == align_of::<sysinfo>());
+    assert!(offset_of!(Sysinfo, procs) == offset_of!(sysinfo, procs));
+    assert!(offset_of!(Sysinfo, totalhigh) == offset_of!(sysinfo, totalhigh));
+    assert!(offset_of!(Sysinfo, mem_unit) == offset_of!(sysinfo, mem_unit));
+};
+
 const SYSINFO_MEM_UNIT: u32 = 1;
 
 /// Linux reports only `NR_SHMEM` in `sharedram`; ordinary file cache does not
@@ -64,7 +95,7 @@ fn sysinfo_sharedram_bytes(shmem_pages: usize) -> usize {
 }
 
 fn set_sysinfo_memory_fields(
-    kinfo: &mut sysinfo,
+    kinfo: &mut Sysinfo,
     total_bytes: usize,
     free_bytes: usize,
     shmem_pages: usize,
@@ -80,11 +111,9 @@ fn set_sysinfo_memory_fields(
 fn write_sysinfo<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     info: *mut sysinfo,
-    kinfo: sysinfo,
+    kinfo: Sysinfo,
 ) -> AxResult {
-    // SAFETY: `kinfo` starts zeroed and every exported field is initialized;
-    // the checked x86_64 layout includes the ABI padding and tail exactly.
-    unsafe { VmMutPtr::vm_write_unchecked(info, memory, kinfo) }.map_err(|_| AxError::BadAddress)
+    VmMutPtr::vm_write(info.cast::<Sysinfo>(), memory, kinfo).map_err(|_| AxError::BadAddress)
 }
 
 fn setfsid_abi<Id>(
@@ -382,10 +411,13 @@ pub fn sys_setgroups<M: UserMemory + ?Sized>(
 
 const fn pad_str(info: &str) -> [c_char; 65] {
     let mut data: [c_char; 65] = [0; 65];
-    // this needs #![feature(const_copy_from_slice)]
-    // data[..info.len()].copy_from_slice(info.as_bytes());
-    unsafe {
-        core::ptr::copy_nonoverlapping(info.as_ptr().cast(), data.as_mut_ptr(), info.len());
+    let bytes = info.as_bytes();
+    // Indexing bounds the copy: a string longer than the 65-byte field is a
+    // compile-time panic in these const initializers, not an overflow.
+    let mut index = 0;
+    while index < bytes.len() {
+        data[index] = bytes[index] as c_char;
+        index += 1;
     }
     data
 }
@@ -616,9 +648,7 @@ fn write_utsname<M: UserMemory + ?Sized>(
     uname26: bool,
     machine_override: &[u8],
 ) -> AxResult<()> {
-    // SAFETY: all fields in `uts` are initialized, including the zero-filled
-    // tail bytes, and the checked x86_64 layout has no padding.
-    unsafe { VmMutPtr::vm_write_unchecked(name, memory, uts) }.map_err(|_| AxError::BadAddress)?;
+    VmMutPtr::vm_write_abi(name, memory, uts).map_err(|_| AxError::BadAddress)?;
     if uname26 {
         let release = uname26_release();
         // `release` begins 130 bytes into the packed native x86_64 layout.
@@ -664,8 +694,7 @@ pub fn sys_sysinfo<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     info: *mut sysinfo,
 ) -> AxResult<isize> {
-    // FIXME: Zeroable
-    let mut kinfo: sysinfo = unsafe { core::mem::zeroed() };
+    let mut kinfo = <Sysinfo as bytemuck::Zeroable>::zeroed();
     let stats = system_memory_stats();
     let uptime = current()
         .as_thread()
@@ -1161,7 +1190,7 @@ mod tests {
         assert_eq!(core::mem::offset_of!(sysinfo, sharedram), 48);
         assert_eq!(core::mem::offset_of!(sysinfo, mem_unit), 104);
 
-        let mut info: sysinfo = unsafe { core::mem::zeroed() };
+        let mut info = <Sysinfo as bytemuck::Zeroable>::zeroed();
         set_sysinfo_memory_fields(
             &mut info,
             9 * memory_addr::PAGE_SIZE_4K,
@@ -1192,7 +1221,7 @@ mod tests {
                 write_error: Some(error),
             };
             let mut memory = UserMemoryContext::new(&mut provider);
-            let info: sysinfo = unsafe { core::mem::zeroed() };
+            let info = <Sysinfo as bytemuck::Zeroable>::zeroed();
 
             assert_eq!(
                 write_sysinfo(&mut memory, core::ptr::null_mut(), info),

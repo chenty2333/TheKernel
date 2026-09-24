@@ -318,7 +318,7 @@ thekernel_linux_signal_trampoline:
 );
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MContext {
     r8: usize,
     r9: usize,
@@ -493,7 +493,7 @@ impl MContext {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct UContext {
     pub flags: usize,
     pub link: usize,

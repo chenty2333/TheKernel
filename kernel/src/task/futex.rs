@@ -93,12 +93,13 @@ struct WaiterQueue {
     len: usize,
 }
 
-// Raw links are dereferenced only while the containing `SpinNoIrq` is held,
+// SAFETY: raw links are dereferenced only while the containing `SpinNoIrq` is held,
 // except during `Drop`, when exclusive ownership of the queue provides the
 // same guarantee. Each linked node retains an owning Arc strong reference.
 // The explicit auto-trait impls make that synchronization contract visible to
 // the global futex tables without exposing the raw pointers to callers.
 unsafe impl Send for WaiterQueue {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for WaiterQueue {}
 
 /// Arc references detached while an IRQ-safe queue gate is held.

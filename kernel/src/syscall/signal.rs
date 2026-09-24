@@ -103,11 +103,8 @@ pub fn sys_rt_sigprocmask<M: UserMemory + ?Sized>(
     // permits `set` and `oldset` to alias; BusyBox relies on that contract in
     // its wait path when it atomically blocks signals and saves the old mask.
     let new = if let Some(set) = VmPtr::nullable(set) {
-        let set = unsafe {
-            VmPtr::vm_read_uninit(set, memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let set = VmPtr::vm_read(set, memory)
+            .map_err(map_usercopy_error)?;
         Some(match how as u32 {
             SIG_BLOCK => old | set,
             SIG_UNBLOCK => old & !set,
@@ -124,9 +121,7 @@ pub fn sys_rt_sigprocmask<M: UserMemory + ?Sized>(
     }
 
     if let Some(oldset) = VmPtr::nullable(oldset) {
-        // SAFETY: SignalSet is repr(transparent) over a u64, so every byte
-        // of the value is initialized and safe to copy to userspace.
-        unsafe { VmMutPtr::vm_write_unchecked(oldset, memory, old).map_err(map_usercopy_error)? }
+        VmMutPtr::vm_write(oldset, memory, old).map_err(map_usercopy_error)?
     }
 
     Ok(0)
@@ -1153,11 +1148,8 @@ fn make_queue_signal_info<M: UserMemory + ?Sized>(
     signo: u32,
     sig: *const SignalInfo,
 ) -> AxResult<QueuedSignalRequest> {
-    let sig = unsafe {
-        VmPtr::vm_read_uninit(sig, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let sig = VmPtr::vm_read(sig, memory)
+            .map_err(map_usercopy_error)?;
     prepare_queue_signal_info(target_tid, signo, sig)
 }
 
@@ -1230,11 +1222,8 @@ pub fn sys_rt_tgsigqueueinfo<M: UserMemory + ?Sized>(
     signo: u32,
     sig: *const SignalInfo,
 ) -> AxResult<isize> {
-    let sig = unsafe {
-        VmPtr::vm_read_uninit(sig, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let sig = VmPtr::vm_read(sig, memory)
+            .map_err(map_usercopy_error)?;
     if tgid <= 0 || tid <= 0 {
         return Err(AxError::InvalidInput);
     }
@@ -1729,18 +1718,12 @@ pub fn sys_rt_sigtimedwait<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let set = sanitize_synchronous_wait_set(unsafe {
-        VmPtr::vm_read_uninit(set, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    });
+    let set = sanitize_synchronous_wait_set(VmPtr::vm_read(set, memory)
+            .map_err(map_usercopy_error)?);
 
     let timeout = if let Some(ts) = VmPtr::nullable(timeout) {
-        let ts = unsafe {
-            VmPtr::vm_read_uninit(ts, memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let ts = VmPtr::vm_read_abi(ts, memory)
+            .map_err(map_usercopy_error)?;
         Some(ts.try_into_time_value()?)
     } else {
         None
@@ -1940,12 +1923,8 @@ pub fn sys_rt_sigtimedwait<M: UserMemory + ?Sized>(
         // SignalInfo owns a fully initialized Linux siginfo record. Copy its
         // bytes through the explicit user-memory context rather than exposing
         // the canonical crate's private storage.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                (sig.as_raw() as *const siginfo).cast::<u8>(),
-                size_of::<siginfo>(),
-            )
-        };
+        // SignalInfo is the complete 128-byte Linux siginfo record.
+        let bytes = bytemuck::bytes_of(&sig);
         memory
             .write_bytes(info as usize, bytes)
             .map_err(map_usercopy_error)?;
@@ -1965,11 +1944,8 @@ pub fn sys_rt_sigsuspend<M: UserMemory + ?Sized>(
     let curr = current();
     let thr = curr.as_thread();
 
-    let set = unsafe {
-        VmPtr::vm_read_uninit(set, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let set = VmPtr::vm_read(set, memory)
+            .map_err(map_usercopy_error)?;
     let mut suspended_mask = SigsuspendMask::install(&thr.signal, set);
 
     // sigsuspend always returns -EINTR when a signal is caught
@@ -2047,11 +2023,8 @@ pub fn sys_sigaltstack<M: UserMemory + ?Sized>(
     // Linux ordering: the input value is captured before the old state is
     // copied back to the same userspace address.
     let prepared = if let Some(ss) = VmPtr::nullable(ss) {
-        let candidate = unsafe {
-            VmPtr::vm_read_uninit(ss, memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let candidate = VmPtr::vm_read(ss, memory)
+            .map_err(map_usercopy_error)?;
         Some(prepare_sigaltstack_update(
             &current_stack,
             uctx.sp(),
@@ -2077,13 +2050,8 @@ pub fn sys_sigaltstack<M: UserMemory + ?Sized>(
         } else {
             current_stack.flags_at(uctx.sp())
         };
-        // SAFETY: SignalStack::new/default construction initializes its
-        // explicit ABI padding, and the manager returns a fully initialized
-        // value before this copyout.
-        unsafe {
-            VmMutPtr::vm_write_unchecked(old_ss, memory, visible_stack)
+        VmMutPtr::vm_write(old_ss, memory, visible_stack)
                 .map_err(map_usercopy_error)?
-        }
     }
 
     Ok(0)

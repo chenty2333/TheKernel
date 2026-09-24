@@ -363,14 +363,7 @@ fn credentials_cmsg(pid: u32, uid: u32, gid: u32) -> Option<(cmsghdr, ucred)> {
 }
 
 fn try_box<T>(value: T) -> AxResult<Box<T>> {
-    let raw = unsafe { alloc(Layout::new::<T>()) }.cast::<T>();
-    if raw.is_null() {
-        return Err(AxError::NoMemory);
-    }
-    unsafe {
-        raw.write(value);
-        Ok(Box::from_raw(raw))
-    }
+    Box::try_new(value).map_err(|_| AxError::NoMemory)
 }
 
 pub enum CMsg {
@@ -480,12 +473,10 @@ impl CMsg {
             // syscall runs; take one bounded owned snapshot, then parse only
             // kernel memory.
             capability
-                .read_slice(data_addr as *const u8, unsafe {
-                    core::slice::from_raw_parts_mut(
-                        raw_fds.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                        data_bytes,
-                    )
-                })
+                .read_into(
+                    data_addr as *const u8,
+                    &mut bytemuck::cast_slice_mut::<i32, u8>(&mut raw_fds)[..data_bytes],
+                )
                 .map_err(map_usercopy_error)?;
         }
         for fd in raw_fds {
@@ -699,11 +690,10 @@ impl<'a> CMsgBuilder<'a> {
         };
         // `cmsghdr` has no Rust padding on the supported ABI; the source is
         // fully initialized above, so use the audited byte-copy entry point.
-        if unsafe {
-            self.capability
-                .write_value_unchecked(base as *mut cmsghdr, hdr)
-        }
-        .is_err()
+        if self
+            .capability
+            .write_abi_value(base as *mut cmsghdr, hdr)
+            .is_err()
         {
             // Linux has already installed the fd prefix at this point. Keep it
             // even though the control header itself could not be published;
@@ -762,16 +752,14 @@ impl<'a> CMsgBuilder<'a> {
         // Copy the payload before the header.  A fault leaves msg_controllen
         // at its previous value and therefore cannot advertise an incomplete
         // ancillary message.
-        if unsafe {
-            self.capability
-                .write_value_unchecked(data_addr as *mut ucred, credentials)
-        }
-        .is_err()
-            || unsafe {
-                self.capability
-                    .write_value_unchecked(base as *mut cmsghdr, header)
-            }
+        if self
+            .capability
+            .write_abi_value(data_addr as *mut ucred, credentials)
             .is_err()
+            || self
+                .capability
+                .write_abi_value(base as *mut cmsghdr, header)
+                .is_err()
         {
             return false;
         }
@@ -810,8 +798,9 @@ impl<'a> CMsgBuilder<'a> {
             return false;
         };
         if self.capability.write_bytes(data_addr, payload).is_err()
-            || unsafe {
-                self.capability.write_value_unchecked(
+            || self
+                .capability
+                .write_abi_value(
                     base as *mut cmsghdr,
                     cmsghdr {
                         cmsg_len: message_len,
@@ -819,8 +808,7 @@ impl<'a> CMsgBuilder<'a> {
                         cmsg_type: kind as _,
                     },
                 )
-            }
-            .is_err()
+                .is_err()
         {
             return false;
         }

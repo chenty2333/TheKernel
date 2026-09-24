@@ -3034,11 +3034,8 @@ impl Read for VmBytes {
     /// Reads bytes from the VM's memory into the provided buffer.
     fn read(&mut self, buf: &mut [u8]) -> axio::Result<usize> {
         let len = self.len.min(buf.len());
-        let destination = unsafe {
-            slice::from_raw_parts_mut(buf[..len].as_mut_ptr().cast::<MaybeUninit<u8>>(), len)
-        };
         self.capability
-            .read_slice(self.ptr, destination)
+            .read_into(self.ptr, &mut buf[..len])
             .map_err(map_usercopy_error)?;
         self.ptr = self.ptr.wrapping_add(len);
         self.len -= len;

@@ -2069,6 +2069,7 @@ const fn timestamp_value(update: TimeUpdate) -> InodeTimestampValue {
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
+#[derive(Clone, Copy, bytemuck::AnyBitPattern)]
 pub struct utimbuf {
     actime: linux_raw_sys::general::__kernel_old_time_t,
     modtime: linux_raw_sys::general::__kernel_old_time_t,
@@ -2080,13 +2081,9 @@ pub fn sys_utime<M: UserMemory + ?Sized>(
     times: *const utimbuf,
 ) -> AxResult<isize> {
     let (atime, mtime) = if let Some(times) = times.nullable() {
-        // FIXME: AnyBitPattern
-        let times = unsafe {
-            times
-                .vm_read_uninit(memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let times = times
+            .vm_read(memory)
+            .map_err(map_usercopy_error)?;
         (
             timestamp_from_seconds(times.actime),
             timestamp_from_seconds(times.modtime),
@@ -2119,13 +2116,9 @@ pub fn sys_utimes<M: UserMemory + ?Sized>(
     times: *const [linux_raw_sys::general::timeval; 2],
 ) -> AxResult<isize> {
     let (atime, mtime) = if let Some(times) = times.nullable() {
-        // FIXME: AnyBitPattern
-        let [atime, mtime] = unsafe {
-            times
-                .vm_read_uninit(memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let [atime, mtime] = times
+            .vm_read_abi(memory)
+            .map_err(map_usercopy_error)?;
         (
             timestamp_from_timeval(atime.tv_sec, atime.tv_usec)?,
             timestamp_from_timeval(mtime.tv_sec, mtime.tv_usec)?,
@@ -2176,14 +2169,9 @@ pub fn sys_futimesat<M: UserMemory + ?Sized>(
     times: *const [linux_raw_sys::general::__kernel_old_timeval; 2],
 ) -> AxResult<isize> {
     let (atime, mtime, intent) = if let Some(times) = times.nullable() {
-        // SAFETY: the x86_64 legacy ABI has two initialized integer words per
-        // timeval; usercopy establishes the complete pair before conversion.
-        let times = unsafe {
-            times
-                .vm_read_uninit(memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let times = times
+            .vm_read_abi(memory)
+            .map_err(map_usercopy_error)?;
         let (atime, mtime) = legacy_futimesat_pair(times)?;
         (Some(atime), Some(mtime), TimeUpdate::Explicit)
     } else {
@@ -2233,13 +2221,9 @@ pub fn sys_utimensat<M: UserMemory + ?Sized>(
     }
 
     let (atime, mtime, atime_intent, mtime_intent) = if let Some(times) = times.nullable() {
-        // FIXME: AnyBitPattern
-        let [atime, mtime] = unsafe {
-            times
-                .vm_read_uninit(memory)
-                .map_err(map_usercopy_error)?
-                .assume_init()
-        };
+        let [atime, mtime] = times
+            .vm_read_abi(memory)
+            .map_err(map_usercopy_error)?;
         if atime.tv_nsec == UTIME_OMIT as _ && mtime.tv_nsec == UTIME_OMIT as _ {
             return Ok(0);
         }

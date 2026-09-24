@@ -1156,10 +1156,9 @@ pub(crate) fn read_attr(
         return Err(AxError::BadAddress);
     }
     let v0 = memory
-        .read_value_uninit(attr.cast::<PerfEventAttrV0>())
-        .map_err(map_usercopy_error)
-        .map(|value| unsafe { value.assume_init() })?;
-    let mut out = PerfEventAttr::from(v0);
+        .read_abi_value(attr.cast::<[u8; linux_perf::PERF_ATTR_SIZE_VER0 as usize]>())
+        .map_err(map_usercopy_error)?;
+    let mut out = PerfEventAttr::from(PerfEventAttrV0::from_ne_bytes(v0));
     macro_rules! extension {
         ($field:ident, $offset:expr, $ty:ty) => {
             if size >= $offset + core::mem::size_of::<$ty>() {
@@ -1167,9 +1166,8 @@ pub(crate) fn read_attr(
                     .checked_add($offset)
                     .ok_or(AxError::BadAddress)?;
                 out.$field = memory
-                    .read_value_uninit(address as *const $ty)
-                    .map_err(map_usercopy_error)
-                    .map(|value| unsafe { value.assume_init() })?;
+                    .read_abi_value(address as *const $ty)
+                    .map_err(map_usercopy_error)?;
             }
         };
     }
@@ -1215,9 +1213,8 @@ pub(crate) fn read_attr_size(
 ) -> AxResult<u32> {
     let address = attr_size_address(attr)?;
     memory
-        .read_value_uninit(address as *const u32)
+        .read_abi_value(address as *const u32)
         .map_err(map_usercopy_error)
-        .map(|value| unsafe { value.assume_init() })
 }
 
 fn attr_size_address(attr: *const PerfEventAttr) -> AxResult<usize> {
@@ -1285,16 +1282,7 @@ pub(crate) fn read_attr_tail(
             .checked_add(offset)
             .ok_or(AxError::BadAddress)?;
         memory
-            .read_bytes(
-                address,
-                // This local is initialized by usercopy before inspection.
-                unsafe {
-                    core::slice::from_raw_parts_mut(
-                        extension.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
-                        chunk_len,
-                    )
-                },
-            )
+            .read_into(address as *const u8, &mut extension[..chunk_len])
             .map_err(map_usercopy_error)?;
         if let Err(error) = validate_extension_bytes(&extension[..chunk_len]) {
             report_supported_attr_size(memory, attr);

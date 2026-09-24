@@ -88,7 +88,7 @@ const LOADED_HIGH: u8 = 1;
 const XLF_KERNEL_64: u16 = 1;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::AnyBitPattern)]
 pub(crate) struct KexecSegment {
     buf: *const c_void,
     bufsz: usize,
@@ -238,12 +238,16 @@ impl TransitionImage {
         tables.try_reserve(1).map_err(|_| AxError::NoMemory)?;
         let page = Self::reserve_page_avoiding(exclusions, quarantine)?;
         let paddr = page.paddr;
+        // SAFETY: `page` was just reserved for this table, so its PAGE_SIZE bytes in the direct
+        // map belong to nobody else.
         unsafe { core::ptr::write_bytes(phys_to_virt(paddr.into()).as_mut_ptr(), 0, PAGE_SIZE) };
         tables.push(page);
         Ok(paddr)
     }
 
     fn table_entry(table: usize, index: usize) -> *mut u64 {
+        // SAFETY: `table` is the root or a table page this builder reserved, and every caller
+        // masks `index` to 0..=511, so the entry lies inside that page's direct-map image.
         unsafe {
             phys_to_virt(table.into())
                 .as_mut_ptr()
@@ -262,15 +266,20 @@ impl TransitionImage {
         let mut table = self.cr3;
         for shift in [39usize, 30, 21] {
             let slot = Self::table_entry(table, (va >> shift) & 511);
+            // SAFETY: `slot` points into a transition table page this builder owns (see
+            // `table_entry`).
             let entry = unsafe { slot.read_volatile() };
             if entry & 1 == 0 {
                 let next = Self::reserve_table(&mut self.tables, exclusions, quarantine)?;
+                // SAFETY: as above; `next` is a freshly reserved, zeroed table page.
                 unsafe { slot.write_volatile((next as u64) | PTE_PRESENT_RW) };
                 table = next;
             } else {
                 table = entry as usize & !0xfff;
             }
         }
+        // SAFETY: the final-level entry lies in a table page this builder owns (see
+        // `table_entry`).
         unsafe {
             Self::table_entry(table, (va >> 12) & 511).write_volatile((pa as u64) | PTE_PRESENT_RW)
         };
@@ -373,6 +382,8 @@ impl TransitionImage {
                 let current = page.paddr;
                 let length = (total - offset).min(COPY_PAGE_PAYLOAD);
                 let address = phys_to_virt(current.into()).as_mut_ptr();
+                // SAFETY: `page` was just reserved, so its direct-map page is exclusively ours,
+                // and the header words at offsets 8 and 16 lie inside it.
                 unsafe {
                     core::ptr::write_bytes(address, 0, PAGE_SIZE);
                     address
@@ -383,6 +394,9 @@ impl TransitionImage {
                 }
                 if offset < segment.bytes.len() {
                     let initialized = length.min(segment.bytes.len() - offset);
+                    // SAFETY: `initialized <= segment.bytes.len() - offset`, and `COPY_PAGE_HEADER
+                    // + length <= PAGE_SIZE` because `length <= COPY_PAGE_PAYLOAD`; the source Vec
+                    // and the reserved page cannot overlap.
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             segment.bytes.as_ptr().add(offset),
@@ -395,6 +409,8 @@ impl TransitionImage {
                     first = current;
                 }
                 if previous != 0 {
+                    // SAFETY: `previous` is the page reserved on the prior iteration, still owned
+                    // by this chain; its first word is the next-page link.
                     unsafe {
                         phys_to_virt(previous.into())
                             .as_mut_ptr()
@@ -412,6 +428,8 @@ impl TransitionImage {
         if copy_blob.is_empty() || copy_blob.len() > PAGE_SIZE {
             return Err(AxError::BadState);
         }
+        // SAFETY: the copier and control pages were reserved for this transition; the blob fits in
+        // one page (checked above) and the 56-byte `CopyControl` fits in the control page.
         unsafe {
             let destination = phys_to_virt(copier.paddr.into()).as_mut_ptr();
             core::ptr::write_bytes(destination, 0, PAGE_SIZE);
@@ -520,6 +538,8 @@ fn publish_crash_image(image: Option<CrashKexecImage>) -> AxResult<()> {
     };
     let old = CRASH.swap(new, Ordering::AcqRel);
     if !old.is_null() {
+        // SAFETY: every non-null `CRASH` pointer comes from `Box::into_raw`, and the swap
+        // transferred sole ownership of `old` to this call.
         unsafe { drop(Box::from_raw(old)) };
     }
     Ok(())
@@ -717,11 +737,8 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
                     .ok_or(AxError::BadAddress)?,
             )
             .ok_or(AxError::BadAddress)?;
-        raw.push(unsafe {
-            VmPtr::vm_read_uninit(address as *const KexecSegment, memory)
-                .map_err(|_| AxError::BadAddress)?
-                .assume_init()
-        });
+        raw.push(VmPtr::vm_read(address as *const KexecSegment, memory)
+            .map_err(|_| AxError::BadAddress)?);
     }
     // `do_kexec_load()` opens with the serialization `kexec_load_permitted()`
     // does not cover:
@@ -792,6 +809,8 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
             }
             return Err(AxError::BadAddress);
         }
+        // SAFETY: either `bufsz` is zero or `read_bytes` succeeded and initialized every element;
+        // `MaybeUninit<u8>` and `u8` have the same layout, so the allocation is unchanged.
         let bytes = unsafe { core::mem::transmute::<Vec<MaybeUninit<u8>>, Vec<u8>>(uninit) };
         image.push(ReservedSegment {
             paddr: segment.mem,
@@ -1113,6 +1132,8 @@ fn reserve_transition_low_page(exclusions: &[(usize, usize)]) -> AxResult<Reserv
                 paddr < excluded_end && excluded_start < paddr + PAGE_SIZE
             });
             if !overlaps && let Ok(page) = reserve_payload(paddr, PAGE_SIZE, &[]) {
+                // SAFETY: `page` was just reserved at `paddr`, so its direct-map page is
+                // exclusively ours.
                 unsafe {
                     core::ptr::write_bytes(
                         phys_to_virt(page.paddr.into()).as_mut_ptr(),
@@ -1732,6 +1753,8 @@ pub fn sys_kexec_file_load<M: UserMemory + ?Sized>(
             .read_bytes(cmdline as usize, &mut command_uninit[..cmdline_len])
             .map_err(|_| AxError::BadAddress)?;
     }
+    // SAFETY: `command_len == cmdline_len`, so the buffer is either empty or was completely
+    // initialized by `read_bytes`; `MaybeUninit<u8>` and `u8` have the same layout.
     let command = unsafe { core::mem::transmute::<Vec<MaybeUninit<u8>>, Vec<u8>>(command_uninit) };
     if !command.is_empty() && command.last() != Some(&0) {
         return Err(AxError::InvalidInput);
@@ -1760,6 +1783,8 @@ fn prepare_transition_trampoline(image: &KexecImage, transition: &TransitionImag
     if stub.is_empty() || stub.len() > PAGE_SIZE {
         return Err(AxError::BadState);
     }
+    // SAFETY: the stub fits in one page (checked above), the trampoline page was reserved for this
+    // transition, and a static blob cannot overlap it.
     unsafe {
         core::ptr::copy_nonoverlapping(
             stub.as_ptr(),
@@ -1813,6 +1838,9 @@ fn terminal_handoff<G>(
     // Retain the publication lock across the non-returning jump so no loader
     // can reserve or rewrite destination pages during the terminal copies.
     core::mem::forget(loaded);
+    // SAFETY: `transition` built the page tables, stack, copy stub and control block, and they
+    // were leaked above so they stay valid; interrupts are off, other CPUs are stopped and PCI bus
+    // mastering is fenced, as `copy_transition` requires.
     unsafe { axhal::kexec::copy_transition(cr3, stack_top, copier, control) }
 }
 
@@ -1863,6 +1891,8 @@ pub(crate) fn execute_crash_loaded() -> AxResult<isize> {
         // Move the prebuilt value without touching the allocator.  The tiny
         // Box allocation is intentionally leaked because this path never
         // returns and the failed kernel's heap may be corrupt.
+        // SAFETY: `raw` came from `Box::into_raw` and the swap made it exclusively ours; it is
+        // read once and the allocation is deliberately leaked.
         let prepared = unsafe { raw.read() };
         terminal_handoff(prepared.image, prepared.transition, raw, true)
     }

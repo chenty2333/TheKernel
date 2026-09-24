@@ -75,7 +75,7 @@ fn align_up_to(value: usize, align: usize) -> Option<usize> {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct IpcInfo {
     shmmax: c_ulong,
     shmmin: c_ulong,
@@ -89,9 +89,12 @@ struct IpcInfo {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ShmUsageInfo {
     used_ids: i32,
+    /// The alignment hole in Linux's `shm_info`, named so that every byte
+    /// copied to userspace is initialized.
+    pad: u32,
     shm_tot: c_ulong,
     shm_rss: c_ulong,
     shm_swp: c_ulong,
@@ -127,7 +130,7 @@ bitflags::bitflags! {
 
 /// Data structure describing a shared memory segment.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShmidDs {
     /// operation permission struct
     shm_perm: IpcPerm,
@@ -149,10 +152,9 @@ pub struct ShmidDs {
     unused5: c_ulong,
 }
 
-// These records contain Linux ABI padding through their embedded `IpcPerm`
-// and the native-word fields following the two PID values.  Keep the layout
-// explicit and materialize a zeroed mirror before copyout so no Rust padding
-// bytes are ever sent to userspace.
+// These records carry Linux's ABI padding as explicit fields (the embedded
+// `IpcPerm::pad3` and `ShmUsageInfo::pad`), so they derive `Pod` and no Rust
+// padding byte can reach userspace.  Keep the layout checked.
 const _: () = {
     assert!(align_of::<IpcPerm>() == 8);
     assert!(size_of::<IpcPerm>() == 48);
@@ -187,72 +189,6 @@ const _: () = {
     assert!(offset_of!(ShmUsageInfo, swap_successes) == 40);
 };
 
-fn initialized_ipc_perm(value: &IpcPerm) -> IpcPerm {
-    // SAFETY: every field is an integer scalar and zero is a valid
-    // representation.  Starting from zero also initializes the implicit
-    // four-byte alignment hole before the native-word fields.
-    let mut result: IpcPerm = unsafe { core::mem::zeroed() };
-    result.key = value.key;
-    result.uid = value.uid;
-    result.gid = value.gid;
-    result.cuid = value.cuid;
-    result.cgid = value.cgid;
-    result.mode = value.mode;
-    result.pad1 = value.pad1;
-    result.seq = value.seq;
-    result.pad2 = value.pad2;
-    result.unused0 = value.unused0;
-    result.unused1 = value.unused1;
-    result
-}
-
-fn initialized_shmid_ds(value: &ShmidDs) -> ShmidDs {
-    // SAFETY: every field is an integer scalar and zero is a valid
-    // representation.  The zeroed value initializes the ABI alignment bytes
-    // that Rust does not expose as fields.
-    let mut result: ShmidDs = unsafe { core::mem::zeroed() };
-    result.shm_perm = initialized_ipc_perm(&value.shm_perm);
-    result.shm_segsz = value.shm_segsz;
-    result.shm_atime = value.shm_atime;
-    result.shm_dtime = value.shm_dtime;
-    result.shm_ctime = value.shm_ctime;
-    result.shm_cpid = value.shm_cpid;
-    result.shm_lpid = value.shm_lpid;
-    result.shm_nattch = value.shm_nattch;
-    result.unused4 = value.unused4;
-    result.unused5 = value.unused5;
-    result
-}
-
-fn initialized_ipc_info(value: &IpcInfo) -> IpcInfo {
-    // SAFETY: all fields are native-word integer scalars; zero initializes the
-    // complete object even on a target that inserts alignment bytes.
-    let mut result: IpcInfo = unsafe { core::mem::zeroed() };
-    result.shmmax = value.shmmax;
-    result.shmmin = value.shmmin;
-    result.shmmni = value.shmmni;
-    result.shmseg = value.shmseg;
-    result.shmall = value.shmall;
-    result.reserved1 = value.reserved1;
-    result.reserved2 = value.reserved2;
-    result.reserved3 = value.reserved3;
-    result.reserved4 = value.reserved4;
-    result
-}
-
-fn initialized_shm_usage_info(value: &ShmUsageInfo) -> ShmUsageInfo {
-    // SAFETY: zeroing initializes the four-byte alignment hole after
-    // `used_ids`; every other field is an integer scalar.
-    let mut result: ShmUsageInfo = unsafe { core::mem::zeroed() };
-    result.used_ids = value.used_ids;
-    result.shm_tot = value.shm_tot;
-    result.shm_rss = value.shm_rss;
-    result.shm_swp = value.shm_swp;
-    result.swap_attempts = value.swap_attempts;
-    result.swap_successes = value.swap_successes;
-    result
-}
-
 fn write_shmid_ds<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *mut ShmidDs,
@@ -261,12 +197,10 @@ fn write_shmid_ds<M: UserMemory + ?Sized>(
     // `shm_cpid`/`shm_lpid` are stored as kernel-wide task-group identities
     // and rendered with `pid_vnr()` for the *reader's* PID namespace
     // (`ipc/shm.c` shmctl IPC_STAT).
-    let mut value = initialized_shmid_ds(value);
+    let mut value = *value;
     value.shm_cpid = super::render_task_pid(value.shm_cpid as Pid);
     value.shm_lpid = super::render_task_pid(value.shm_lpid as Pid);
-    // SAFETY: `initialized_shmid_ds` zeroes every padding byte and the layout
-    // assertions above cover the complete Linux object extent.
-    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, value) }.map_err(map_usercopy_error)
+    VmMutPtr::vm_write(ptr, memory, value).map_err(map_usercopy_error)
 }
 
 fn write_ipc_info<M: UserMemory + ?Sized>(
@@ -274,9 +208,7 @@ fn write_ipc_info<M: UserMemory + ?Sized>(
     ptr: *mut IpcInfo,
     value: &IpcInfo,
 ) -> AxResult<()> {
-    // SAFETY: the mirror is fully initialized, including any target padding.
-    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_ipc_info(value)) }
-        .map_err(map_usercopy_error)
+    VmMutPtr::vm_write(ptr, memory, *value).map_err(map_usercopy_error)
 }
 
 fn write_shm_usage_info<M: UserMemory + ?Sized>(
@@ -284,19 +216,14 @@ fn write_shm_usage_info<M: UserMemory + ?Sized>(
     ptr: *mut ShmUsageInfo,
     value: &ShmUsageInfo,
 ) -> AxResult<()> {
-    // SAFETY: `initialized_shm_usage_info` zeroes the ABI alignment hole and
-    // the layout assertions above cover the complete record.
-    unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_shm_usage_info(value)) }
-        .map_err(map_usercopy_error)
+    VmMutPtr::vm_write(ptr, memory, *value).map_err(map_usercopy_error)
 }
 
 fn read_shmid_ds<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const ShmidDs,
 ) -> AxResult<ShmidDs> {
-    let value = VmPtr::vm_read_uninit(ptr, memory).map_err(map_usercopy_error)?;
-    // SAFETY: `vm_read_uninit` initialized every byte of the complete object.
-    Ok(unsafe { value.assume_init() })
+    VmPtr::vm_read(ptr, memory).map_err(map_usercopy_error)
 }
 
 impl ShmidDs {
@@ -319,6 +246,7 @@ impl ShmidDs {
                 pad1: 0,
                 seq: 0,
                 pad2: 0,
+                pad3: 0,
                 unused0: 0,
                 unused1: 0,
             },
@@ -544,7 +472,7 @@ impl ShmInner {
     /// derived from published buckets so an in-flight fork reservation can
     /// never leak through IPC_STAT or /proc/sysvipc/shm.
     fn visible_snapshot(&self) -> ShmidDs {
-        let mut snapshot = initialized_shmid_ds(&self.shmid_ds);
+        let mut snapshot = self.shmid_ds;
         snapshot.shm_nattch = self.attach_count() as c_ulong;
         snapshot
     }
@@ -768,10 +696,10 @@ fn reserve_first_shmat_pages(
     Ok((pages, Some(reservation)))
 }
 
-/// A bidirectional map, allowing lookup by key or value.
-/// TODO: I don't know where to put this, so I put it here.
+/// A bidirectional hash map, allowing lookup by key or value; SysV shm uses
+/// it to translate between IPC keys and shmids.
 #[derive(Debug, Clone)]
-pub struct BiBTreeMap<K, V>
+pub struct BiHashMap<K, V>
 where
     K: Eq + Hash + Clone,
     V: Eq + Hash + Clone,
@@ -780,14 +708,14 @@ where
     reverse: HashMap<V, K>,
 }
 
-impl<K, V> BiBTreeMap<K, V>
+impl<K, V> BiHashMap<K, V>
 where
     K: Eq + Hash + Clone,
     V: Eq + Hash + Clone,
 {
-    /// Creates a new empty [`BiBTreeMap`].
+    /// Creates a new empty [`BiHashMap`].
     pub fn new() -> Self {
-        BiBTreeMap {
+        BiHashMap {
             forward: HashMap::new(),
             reverse: HashMap::new(),
         }
@@ -830,7 +758,7 @@ where
     }
 }
 
-impl<K, V> Default for BiBTreeMap<K, V>
+impl<K, V> Default for BiHashMap<K, V>
 where
     K: Eq + Hash + Clone,
     V: Eq + Hash + Clone,
@@ -845,7 +773,7 @@ where
 /// manage the mapping.
 pub struct ShmManager {
     /// key <-> published shmid
-    key_shmid: BiBTreeMap<i32, i32>,
+    key_shmid: BiHashMap<i32, i32>,
     /// index -> shm_inner, exactly `shm_ids(ns).ipcs_idr`
     shmid_inner: HashMap<i32, Arc<Mutex<ShmInner>>>,
     /// Total pages reserved by live segments, including segments awaiting
@@ -862,7 +790,7 @@ pub struct ShmManager {
 impl ShmManager {
     pub(crate) fn new() -> Self {
         ShmManager {
-            key_shmid: BiBTreeMap::new(),
+            key_shmid: BiHashMap::new(),
             shmid_inner: HashMap::new(),
             total_pages: 0,
             pid_vaddr_shmid: HashMap::new(),
@@ -3006,6 +2934,7 @@ pub fn sys_shmctl<M: UserMemory + ?Sized>(
             (
                 ShmUsageInfo {
                     used_ids: manager.active_segment_count() as i32,
+                    pad: 0,
                     // `shm_tot` is what the segments reserved; `shm_rss` is
                     // what is actually resident.
                     shm_tot: manager.total_page_count() as c_ulong,
@@ -3320,6 +3249,7 @@ mod tests {
                     pad1: 0,
                     seq: 0,
                     pad2: 0,
+                    pad3: 0,
                     unused0: 0,
                     unused1: 0,
                 },
@@ -3346,7 +3276,6 @@ mod tests {
         ds.shm_perm.pad2 = 0x3333;
         ds.shm_perm.unused0 = 0x4444;
         ds.shm_perm.unused1 = 0x5555;
-        let ds = initialized_shmid_ds(&ds);
         // SAFETY: `ds` is a live, fully initialized value for this test and
         // the byte slice covers exactly its object representation.
         let ds_bytes = unsafe {
@@ -3361,8 +3290,8 @@ mod tests {
             shm_swp: 4,
             swap_attempts: 5,
             swap_successes: 6,
+            pad: 0,
         };
-        let usage = initialized_shm_usage_info(&usage);
         // SAFETY: `usage` is a live, fully initialized value for this test
         // and the byte slice covers exactly its object representation.
         let usage_bytes = unsafe {

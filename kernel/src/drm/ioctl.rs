@@ -39,7 +39,7 @@ impl UserCopy for crate::file::IoctlContext {
     }
 }
 
-fn read_pod<T: Copy>(copy: &impl UserCopy, address: usize) -> AxResult<T> {
+fn read_pod<T: bytemuck::AnyBitPattern>(copy: &impl UserCopy, address: usize) -> AxResult<T> {
     // `MaybeUninit<T>` avoids a generic-length stack array (not available on
     // stable Rust) while still reserving exactly the ABI record's bytes.
     // Zero first, then let UserCopy overwrite every byte before `assume_init`.
@@ -50,16 +50,17 @@ fn read_pod<T: Copy>(copy: &impl UserCopy, address: usize) -> AxResult<T> {
         slice::from_raw_parts_mut(value.as_mut_ptr().cast::<MaybeUninit<u8>>(), size_of::<T>())
     };
     copy.read(address, bytes)?;
-    // SAFETY: all DRM UAPI records passed here are repr(C) integer records;
-    // UserCopy completed an exact-width copy into the zero-initialized value.
+    // SAFETY: UserCopy completed an exact-width copy into the zero-initialized
+    // value, and `AnyBitPattern` makes every resulting representation valid.
     Ok(unsafe { value.assume_init() })
 }
 
-fn write_pod<T>(copy: &impl UserCopy, address: usize, value: &T) -> AxResult<()> {
-    // SAFETY: DRM UAPI types are repr(C) scalar records and this only exposes
-    // their exact ABI-sized representation to the requesting process.
-    let bytes = unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
-    copy.write(address, bytes)
+fn write_pod<T: bytemuck::NoUninit>(
+    copy: &impl UserCopy,
+    address: usize,
+    value: &T,
+) -> AxResult<()> {
+    copy.write(address, bytemuck::bytes_of(value))
 }
 
 fn write_u32(copy: &impl UserCopy, address: u64, value: u32) -> AxResult<()> {
@@ -86,7 +87,7 @@ fn array_at(base: u64, index: usize, element_size: u64) -> AxResult<u64> {
     )
     .ok_or(AxError::BadAddress)
 }
-fn read_array<T: Copy>(
+fn read_array<T: bytemuck::AnyBitPattern>(
     copy: &impl UserCopy,
     address: u64,
     count: usize,
@@ -1670,9 +1671,8 @@ fn wait_vblank(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()>
         tval_sec: (now / 1_000_000_000) as i64,
         tval_usec: ((now / 1_000) % 1_000_000) as i64,
     };
-    // SAFETY: writing the reply union member initializes the complete 24-byte union.
-    let response = uapi::DrmWaitVblank { reply };
-    write_pod(copy, arg, &response)
+    // The reply member spans the whole 24-byte union, so it is the record.
+    write_pod(copy, arg, &reply)
 }
 
 /// Linux exposes a 32-bit vblank sequence; resolve it into the closest epoch

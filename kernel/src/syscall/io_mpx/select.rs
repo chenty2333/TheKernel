@@ -1,15 +1,13 @@
 use alloc::vec::Vec;
-use core::{fmt, mem::MaybeUninit, slice, time::Duration};
+use core::{fmt, time::Duration};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
 use axpoll::IoEvents;
 use bitmaps::Bitmap;
-use linux_raw_sys::{
-    general::*,
-    select_macros::{FD_ISSET, FD_SET, FD_ZERO},
-};
+use linux_raw_sys::general::*;
 use tk_linux_signal::SignalSet;
+use tk_linux_usercopy::{UserAbiValue, abi_bytes, abi_bytes_mut};
 
 use super::{FdPollSet, wait_io_result, wait_signal_only};
 use crate::{
@@ -28,7 +26,7 @@ impl FdSet {
         let mut bitmap = Bitmap::new();
         if let Some(fds) = fds {
             for i in 0..nfds {
-                if unsafe { FD_ISSET(i as _, fds) } {
+                if fd_is_set(fds, i) {
                     bitmap.set(i, true);
                 }
             }
@@ -43,14 +41,14 @@ impl fmt::Debug for FdSet {
     }
 }
 
-fn read_user_value<T>(caller: &UserMemoryCapability, address: usize) -> AxResult<T> {
+fn read_user_value<T: tk_linux_usercopy::UserAbiValue>(
+    caller: &UserMemoryCapability,
+    address: usize,
+) -> AxResult<T> {
     let value = caller
-        .read_value_uninit(address as *const T)
+        .read_abi_value(address as *const T)
         .map_err(map_usercopy_error)?;
-    // SAFETY: the explicit usercopy initialized the complete value before it
-    // is exposed to the kernel. The syscall mirror types used here contain
-    // only integer fields or opaque user pointers.
-    Ok(unsafe { value.assume_init() })
+    Ok(value)
 }
 
 fn snapshot_fd_set(
@@ -61,19 +59,26 @@ fn snapshot_fd_set(
     if nfds == 0 || fds.is_null() {
         return Ok(None);
     }
-    let mut set = MaybeUninit::<__kernel_fd_set>::zeroed();
+    let mut set = <__kernel_fd_set as UserAbiValue>::abi_zeroed();
     // select copies only the native-long words covered by nfds, even when
     // libc's fd_set is larger or crosses an inaccessible page boundary.
-    let bytes = unsafe {
-        slice::from_raw_parts_mut(
-            set.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-            fd_set_bytes(nfds),
-        )
-    };
     caller
-        .read_bytes(fds.address().as_usize(), bytes)
+        .read_into(
+            fds.address().as_usize() as *const u8,
+            &mut abi_bytes_mut(&mut set)[..fd_set_bytes(nfds)],
+        )
         .map_err(map_usercopy_error)?;
-    Ok(Some(unsafe { set.assume_init() }))
+    Ok(Some(set))
+}
+
+// `nfds` is clamped to `AX_FILE_LIMIT <= __FD_SETSIZE` and the bitmap is
+// `__FD_SETSIZE` wide, so every descriptor indexes inside `fds_bits`.  Word
+// `fd / BITS`, bit `fd % BITS` is the bit the byte-wise `FD_SET` macro
+// addresses on little-endian x86_64.
+const FD_BITS: usize = core::ffi::c_ulong::BITS as usize;
+
+fn fd_is_set(set: &__kernel_fd_set, fd: usize) -> bool {
+    set.fds_bits[fd / FD_BITS] & (1 << (fd % FD_BITS)) != 0
 }
 
 fn fd_set_bytes(nfds: u32) -> usize {
@@ -90,22 +95,17 @@ fn copy_fd_set(
         return Ok(());
     }
 
-    // Build a fully initialized kernel-owned mirror, then copy its bytes. No
-    // user pointer is ever converted to a Rust reference and fd_set padding
-    // is deterministically zeroed rather than copied from uninitialized data.
-    let mut set = unsafe { MaybeUninit::<__kernel_fd_set>::zeroed().assume_init() };
-    unsafe { FD_ZERO(&mut set) };
+    // Build a zeroed kernel-owned mirror, then copy its bytes. No user pointer
+    // is ever converted to a Rust reference.
+    let mut set = <__kernel_fd_set as UserAbiValue>::abi_zeroed();
     for fd in &bitmap {
-        unsafe { FD_SET(fd as _, &mut set) };
+        set.fds_bits[fd / FD_BITS] |= 1 << (fd % FD_BITS);
     }
-    let bytes = unsafe {
-        slice::from_raw_parts(
-            (&set as *const __kernel_fd_set).cast::<u8>(),
-            fd_set_bytes(nfds),
-        )
-    };
     caller
-        .write_bytes(destination.address().as_usize(), bytes)
+        .write_bytes(
+            destination.address().as_usize(),
+            &abi_bytes(&set)[..fd_set_bytes(nfds)],
+        )
         .map_err(map_usercopy_error)
 }
 
@@ -323,6 +323,10 @@ pub struct SignalSetWithSize {
     set: UserConstPtr<SignalSet>,
     sigsetsize: usize,
 }
+
+// SAFETY: `UserConstPtr` is a transparent raw user pointer, which asserts
+// nothing about its target, and `sigsetsize` is an integer.
+unsafe impl tk_linux_usercopy::UserAbiValue for SignalSetWithSize {}
 
 pub fn sys_pselect6(
     caller: UserMemoryCapability,

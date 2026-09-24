@@ -54,7 +54,7 @@ const SCHED_RR_TIMESLICE_MS_DEFAULT: u32 = {
 };
 static SCHED_RR_TIMESLICE_MS: AtomicU32 = AtomicU32::new(SCHED_RR_TIMESLICE_MS_DEFAULT);
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct SchedParam {
     sched_priority: i32,
 }
@@ -394,10 +394,7 @@ fn read_sched_attr<M: UserMemory + ?Sized>(
     let mut out = SchedAttr::default();
     let copy_size = attr_size.min(size_of::<SchedAttr>());
     let src = vm_load(memory, attr.cast::<u8>(), copy_size).map_err(map_usercopy_error)?;
-    let dst = unsafe {
-        core::slice::from_raw_parts_mut((&mut out as *mut SchedAttr).cast::<u8>(), copy_size)
-    };
-    dst.copy_from_slice(&src);
+    bytemuck::bytes_of_mut(&mut out)[..copy_size].copy_from_slice(&src);
 
     let mut tail_nonzero = false;
     if attr_size > size_of::<SchedAttr>() {
@@ -1136,13 +1133,10 @@ pub fn sys_nanosleep<M: UserMemory + ?Sized>(
     req: *const timespec,
     rem: *mut timespec,
 ) -> AxResult<isize> {
-    // FIXME: AnyBitPattern
-    let req = unsafe {
-        req.vm_read_uninit(memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    }
-    .try_into_time_value()?;
+    let req = req
+        .vm_read_abi(memory)
+        .map_err(map_usercopy_error)?
+        .try_into_time_value()?;
     debug!("sys_nanosleep <= req: {req:?}");
 
     let (actual, deadline) = sleep_relative(AlarmClock::Monotonic, req)?;
@@ -1150,10 +1144,8 @@ pub fn sys_nanosleep<M: UserMemory + ?Sized>(
     if let Some(diff) = remaining_relative_sleep(req, actual) {
         debug!("sys_nanosleep => rem: {diff:?}");
         if !rem.is_null() {
-            unsafe {
-                VmMutPtr::vm_write_unchecked(rem, memory, timespec::from_time_value(diff))
-                    .map_err(map_usercopy_error)?;
-            }
+            VmMutPtr::vm_write_abi(rem, memory, timespec::from_time_value(diff))
+                .map_err(map_usercopy_error)?;
         }
         // Linux `do_nanosleep()` reports `-ERESTART_RESTARTBLOCK` after
         // `hrtimer_nanosleep()` armed `restart->nanosleep` with the timer's
@@ -1215,17 +1207,12 @@ pub(crate) fn restart_nanosleep<M: UserMemory + ?Sized>(
         ClockSleepOutcome::Interrupted => {
             if block.rem != 0 {
                 let remaining = deadline - now;
-                // SAFETY: the address was captured from the interrupted
-                // syscall's `rmtp` argument and is revalidated by this explicit
-                // usercopy against the caller's live address space.
-                unsafe {
-                    VmMutPtr::vm_write_unchecked(
-                        block.rem as *mut timespec,
-                        memory,
-                        timespec::from_time_value(remaining),
-                    )
-                    .map_err(map_usercopy_error)?;
-                }
+                VmMutPtr::vm_write_abi(
+                    block.rem as *mut timespec,
+                    memory,
+                    timespec::from_time_value(remaining),
+                )
+                .map_err(map_usercopy_error)?;
             }
             Err(AxError::Interrupted)
         }
@@ -1280,12 +1267,10 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
     // The interval is copied in and validated before `flags` is examined, so a
     // faulting pointer reports EFAULT rather than EINVAL
     // (`kernel/time/posix-timers.c:1394-1399`).
-    let req = unsafe {
-        req.vm_read_uninit(memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    }
-    .try_into_time_value()?;
+    let req = req
+        .vm_read_abi(memory)
+        .map_err(map_usercopy_error)?
+        .try_into_time_value()?;
     // Unique flag bits never make this EINVAL: Linux masks flags with
     // `TIMER_ABSTIME` on every non-alarm path
     // (`common_nsleep()`, `kernel/time/posix-timers.c:1355-1363`).
@@ -1316,10 +1301,8 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
                 if let Some(diff) = remaining_relative_sleep(req, actual)
                     && !rem.is_null()
                 {
-                    unsafe {
-                        VmMutPtr::vm_write_unchecked(rem, memory, timespec::from_time_value(diff))
-                            .map_err(map_usercopy_error)?;
-                    }
+                    VmMutPtr::vm_write_abi(rem, memory, timespec::from_time_value(diff))
+                        .map_err(map_usercopy_error)?;
                 }
                 // `do_cpu_nanosleep()` records the timer's remaining CPU time in
                 // `restart->nanosleep.expires` and reports
@@ -1358,10 +1341,8 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
         if let Some(diff) = remaining_relative_sleep(req, actual) {
             debug!("sys_clock_nanosleep => rem: {diff:?}");
             if !rem.is_null() {
-                unsafe {
-                    VmMutPtr::vm_write_unchecked(rem, memory, timespec::from_time_value(diff))
-                        .map_err(map_usercopy_error)?;
-                }
+                VmMutPtr::vm_write_abi(rem, memory, timespec::from_time_value(diff))
+                    .map_err(map_usercopy_error)?;
             }
             // A relative `clock_nanosleep()` is `-ERESTART_RESTARTBLOCK` with
             // the timer's absolute expiry recorded, exactly like `nanosleep()`.
@@ -1505,13 +1486,10 @@ pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
     if pid < 0 || param.is_null() {
         return Err(AxError::InvalidInput);
     }
-    let priority = unsafe {
-        param
-            .vm_read_uninit(memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    }
-    .sched_priority;
+    let priority = param
+        .vm_read(memory)
+        .map_err(map_usercopy_error)?
+        .sched_priority;
     let task = live_sched_target(pid)?;
     update_sched_param(&task, priority)
 }
@@ -1525,13 +1503,10 @@ pub fn sys_sched_setscheduler<M: UserMemory + ?Sized>(
     if pid < 0 || policy < 0 || param.is_null() {
         return Err(AxError::InvalidInput);
     }
-    let priority = unsafe {
-        param
-            .vm_read_uninit(memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    }
-    .sched_priority;
+    let priority = param
+        .vm_read(memory)
+        .map_err(map_usercopy_error)?
+        .sched_priority;
     let task = live_sched_target(pid)?;
     update_sched_policy(&task, policy, priority)
 }
@@ -1554,19 +1529,14 @@ pub fn sys_sched_getparam<M: UserMemory + ?Sized>(
     // `retval = security_task_getscheduler(p); if (retval) return retval;`
     // runs before the priority is sampled, so a denial wins over the copyout.
     authorize_scheduler_query(&target)?;
-    // `SchedParam` is a complete `repr(C)` value containing only its i32
-    // priority field, so its initialized representation is safe to copy out
-    // through the explicitly bound user-memory context.
-    unsafe {
-        VmMutPtr::vm_write_unchecked(
-            param,
-            memory,
-            SchedParam {
-                sched_priority: state_static_priority(target.state()),
-            },
-        )
-        .map_err(map_usercopy_error)?;
-    }
+    VmMutPtr::vm_write(
+        param,
+        memory,
+        SchedParam {
+            sched_priority: state_static_priority(target.state()),
+        },
+    )
+    .map_err(map_usercopy_error)?;
     Ok(0)
 }
 
@@ -1596,14 +1566,12 @@ pub fn sys_sched_rr_get_interval<M: UserMemory + ?Sized>(
     // it reads `p->sched_class`, and the interval is copied out only after a
     // successful read, so a denial also suppresses the `EFAULT`.
     authorize_scheduler_query(&target)?;
-    unsafe {
-        VmMutPtr::vm_write_unchecked(
-            interval,
-            memory,
-            timespec::from_time_value(rr_interval_for_state(target.state())),
-        )
-        .map_err(map_usercopy_error)?;
-    }
+    VmMutPtr::vm_write_abi(
+        interval,
+        memory,
+        timespec::from_time_value(rr_interval_for_state(target.state())),
+    )
+    .map_err(map_usercopy_error)?;
     Ok(0)
 }
 

@@ -213,11 +213,12 @@ pub(super) struct RegisteredBuffer {
     pub(super) _pin_owner: PinBeforeCharge<PinnedUserSegmentsMut, RegisteredBufferPinCharge>,
 }
 
-// The owner retains the explicit address-space capability alongside the
+// SAFETY: the owner retains the explicit address-space capability alongside the
 // kernel-side pin/fence state and opaque userspace address. It never relies on
 // current-task state; the address-space pin registry serializes mapping
 // changes for the selected capability.
 unsafe impl Send for RegisteredBuffer {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for RegisteredBuffer {}
 
 pub(super) struct RegisteredBuffers {
@@ -1147,9 +1148,9 @@ impl IoUring {
             } => {
                 let address = address.checked_add(offset).ok_or(AxError::BadAddress)?;
                 let value = capability
-                    .read_value_uninit(address as *const [u8; 64])
+                    .read_abi_value(address as *const [u8; 64])
                     .map_err(crate::mm::map_usercopy_error)?;
-                bytes = unsafe { value.assume_init() };
+                bytes = value;
             }
         }
         Ok(bytes)
@@ -1164,10 +1165,9 @@ impl IoUring {
         // UAPI user pointer semantics.  Copy it against this enter caller's
         // current capability after the record has been copied by value.
         let value = capability
-            .read_value_uninit(address as *const SignalSet)
+            .read_abi_value(address as *const SignalSet)
             .map_err(crate::mm::map_usercopy_error)?;
-        // SAFETY: the complete fixed signal set was copied before returning.
-        Ok(unsafe { value.assume_init() })
+        Ok(value)
     }
 
     pub(super) fn drain_registered_files_after_retire(&self) -> AxResult<()> {

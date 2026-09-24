@@ -139,7 +139,7 @@ impl TaskUsage {
 
 impl From<TaskUsage> for rusage {
     fn from(value: TaskUsage) -> Self {
-        let mut usage: rusage = unsafe { core::mem::zeroed() };
+        let mut usage = <rusage as tk_linux_usercopy::UserAbiValue>::abi_zeroed();
         usage.ru_utime = __kernel_old_timeval::from_time_value(value.utime());
         usage.ru_stime = __kernel_old_timeval::from_time_value(value.stime());
         usage.ru_maxrss = value.maxrss_kb as _;

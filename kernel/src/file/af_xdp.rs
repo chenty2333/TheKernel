@@ -632,6 +632,9 @@ impl XdpEndpoint {
                     let capacity = frame.capacity();
                     let ptr = frame.as_mut_ptr().cast::<u8>();
                     core::mem::forget(frame);
+                    // SAFETY: `ptr`, `length` and `capacity` come from the forgotten
+                    // `Vec<MaybeUninit<u8>>`, whose first `length` bytes the usercopy initialized;
+                    // `u8` has the same layout, so the allocation is reused unchanged.
                     let frame = unsafe { Vec::from_raw_parts(ptr, length, capacity) };
                     Ok((frame, state.ifindex.ok_or(AxError::BadState)?))
                 })();

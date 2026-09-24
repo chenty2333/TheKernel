@@ -102,11 +102,7 @@ pub fn sys_timerfd_settime<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     debug!("sys_timerfd_settime <= fd: {fd}, flags: {flags}");
 
-    let new_value = unsafe {
-        VmPtr::vm_read_uninit(new_value, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let new_value = VmPtr::vm_read_abi(new_value, memory).map_err(map_usercopy_error)?;
     let flags = flags as u32;
     if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 {
         return Err(AxError::InvalidInput);
@@ -120,18 +116,14 @@ pub fn sys_timerfd_settime<M: UserMemory + ?Sized>(
     let (old_interval, old_value_dur) = tfd.settime(absolute, cancel_on_set, interval, value)?;
 
     if let Some(old_value) = old_value.nullable() {
-        // SAFETY: `itimerspec` contains four initialized integer words on the
-        // x86_64 Linux ABI; the complete layout is asserted above.
-        unsafe {
-            VmMutPtr::vm_write_unchecked(
-                old_value,
-                memory,
-                itimerspec {
-                    it_interval: duration_to_timespec(old_interval),
-                    it_value: duration_to_timespec(old_value_dur),
-                },
-            )
-        }
+        VmMutPtr::vm_write_abi(
+            old_value,
+            memory,
+            itimerspec {
+                it_interval: duration_to_timespec(old_interval),
+                it_value: duration_to_timespec(old_value_dur),
+            },
+        )
         .map_err(map_usercopy_error)?;
     }
 
@@ -148,18 +140,14 @@ pub fn sys_timerfd_gettime<M: UserMemory + ?Sized>(
     let tfd = TimerFd::from_fd(fd)?;
     let (interval, value) = tfd.gettime();
 
-    // SAFETY: `itimerspec` contains four initialized integer words on the
-    // x86_64 Linux ABI; the complete layout is asserted above.
-    unsafe {
-        VmMutPtr::vm_write_unchecked(
-            curr_value,
-            memory,
-            itimerspec {
-                it_interval: duration_to_timespec(interval),
-                it_value: duration_to_timespec(value),
-            },
-        )
-    }
+    VmMutPtr::vm_write_abi(
+        curr_value,
+        memory,
+        itimerspec {
+            it_interval: duration_to_timespec(interval),
+            it_value: duration_to_timespec(value),
+        },
+    )
     .map_err(map_usercopy_error)?;
 
     Ok(0)

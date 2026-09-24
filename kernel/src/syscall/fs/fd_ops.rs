@@ -232,12 +232,9 @@ fn validate_async_signal(sig: c_int) -> AxResult<u8> {
 }
 
 fn read_rw_hint(capability: &UserMemoryCapability, arg: usize) -> AxResult<u64> {
-    unsafe {
-        capability
-            .read_value_uninit(arg as *const u64)
-            .map_err(map_usercopy_error)
-            .map(|value| value.assume_init())
-    }
+    capability
+        .read_abi_value(arg as *const u64)
+        .map_err(map_usercopy_error)
 }
 
 fn write_rw_hint(capability: &UserMemoryCapability, arg: usize, hint: u64) -> AxResult<()> {
@@ -472,7 +469,7 @@ const NAME_TO_HANDLE_ALLOWED_FLAGS: i32 =
     (AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) as i32 | AT_HANDLE_FID | AT_HANDLE_MNT_ID_UNIQUE;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct LinuxFileHandle {
     handle_bytes: u32,
     handle_type: i32,
@@ -1149,12 +1146,9 @@ pub fn sys_name_to_handle_at(
             axfs_ng_vfs::ExportHandleMode::Openable
         },
     )?;
-    let header = unsafe {
-        capability
-            .read_value_uninit(handle.cast::<LinuxFileHandle>())
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let header = capability
+        .read_value(handle.cast::<LinuxFileHandle>())
+        .map_err(map_usercopy_error)?;
     if header.handle_bytes > MAX_FILE_HANDLE_SZ {
         return Err(AxError::InvalidInput);
     }
@@ -1180,12 +1174,7 @@ pub fn sys_name_to_handle_at(
         // Linux stores exportfs_encode_fh()'s FILEID_INVALID result in the
         // fixed header while reporting the required variable payload size.
         let required_header = short_handle_probe_header(required_bytes);
-        let required_header = unsafe {
-            slice::from_raw_parts(
-                (&required_header as *const LinuxFileHandle).cast::<u8>(),
-                size_of::<LinuxFileHandle>(),
-            )
-        };
+        let required_header = bytemuck::bytes_of(&required_header);
         capability
             .write_bytes(handle as usize, required_header)
             .map_err(map_usercopy_error)?;
@@ -1223,12 +1212,9 @@ pub fn sys_open_by_handle_at(
     // get_path_anchor() resolves the mount selector at :370-372, so a faulting
     // or malformed header keeps priority over EBADF and EPERM.
     let handle_addr = handle as usize;
-    let header = unsafe {
-        capability
-            .read_value_uninit(handle.cast::<LinuxFileHandle>())
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let header = capability
+        .read_value(handle.cast::<LinuxFileHandle>())
+        .map_err(map_usercopy_error)?;
     if header.handle_bytes == 0 || header.handle_bytes > MAX_FILE_HANDLE_SZ {
         return Err(AxError::InvalidInput);
     }
@@ -1312,6 +1298,8 @@ pub fn sys_open_by_handle_at(
     capability
         .read_bytes(body_addr, &mut body)
         .map_err(map_usercopy_error)?;
+    // SAFETY: `read_bytes` succeeded, so every element of `body` is initialized, and
+    // `MaybeUninit<u8>` has the layout of `u8`; the slice borrows `body`.
     let body = unsafe { slice::from_raw_parts(body.as_ptr().cast::<u8>(), body.len()) };
     // exportfs consumes handle words, not arbitrary bytes. Retain the full
     // user copy for fault/bounds behavior, then ignore a 1–3 byte tail.
@@ -1996,29 +1984,17 @@ pub(crate) fn copy_openat2_input(
         let tail_addr = how_addr
             .checked_add(OPENAT2_HOW_SIZE)
             .ok_or(LinuxError::EFAULT)?;
-        let tail_destination = unsafe {
-            slice::from_raw_parts_mut(
-                raw.as_mut_ptr()
-                    .add(OPENAT2_HOW_SIZE)
-                    .cast::<MaybeUninit<u8>>(),
-                size - OPENAT2_HOW_SIZE,
-            )
-        };
         capability
-            .read_bytes(tail_addr, tail_destination)
+            .read_into(tail_addr as *const u8, &mut raw[OPENAT2_HOW_SIZE..size])
             .map_err(map_usercopy_error)?;
         if raw[OPENAT2_HOW_SIZE..size].iter().any(|&byte| byte != 0) {
             return Err(AxError::from(LinuxError::E2BIG));
         }
     }
-    let head_destination = unsafe {
-        slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<MaybeUninit<u8>>(), OPENAT2_HOW_SIZE)
-    };
     capability
-        .read_bytes(how_addr, head_destination)
+        .read_into(how_addr as *const u8, &mut raw[..OPENAT2_HOW_SIZE])
         .map_err(map_usercopy_error)?;
-    let raw = &raw[..OPENAT2_HOW_SIZE];
-    let how = unsafe { ptr::read_unaligned(raw.as_ptr().cast::<open_how>()) };
+    let how: open_how = tk_linux_usercopy::abi_read_unaligned(&raw[..OPENAT2_HOW_SIZE]);
     let flags = validate_openat2_how(&how)? as i32;
     let resolve_cached = how.resolve & RESOLVE_CACHED as u64 != 0;
     if resolve_cached && flags as u32 & (O_TRUNC | O_CREAT | __O_TMPFILE) != 0 {
@@ -2259,14 +2235,10 @@ fn read_user_flock64(
     address: usize,
 ) -> AxResult<(flock64, [u8; size_of::<flock64>()])> {
     let mut raw = [0u8; size_of::<flock64>()];
-    let destination =
-        unsafe { slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<MaybeUninit<u8>>(), raw.len()) };
     capability
-        .read_bytes(address, destination)
+        .read_into(address as *const u8, &mut raw)
         .map_err(map_usercopy_error)?;
-    // SAFETY: `read_bytes` initialized the complete object representation;
-    // `read_unaligned` handles the byte-aligned local buffer.
-    let lock = unsafe { ptr::read_unaligned(raw.as_ptr().cast::<flock64>()) };
+    let lock: flock64 = tk_linux_usercopy::abi_read_unaligned(&raw);
     Ok((lock, raw))
 }
 
@@ -2519,12 +2491,9 @@ pub fn sys_fcntl(
         }
         F_SETOWN_EX => {
             let description = get_file_description(fd)?;
-            let owner = unsafe {
-                capability
-                    .read_value_uninit(arg as *const f_owner_ex)
-                    .map_err(map_usercopy_error)?
-                    .assume_init()
-            };
+            let owner = capability
+                .read_abi_value(arg as *const f_owner_ex)
+                .map_err(map_usercopy_error)?;
             if owner.pid < 0 {
                 return Err(AxError::NoSuchProcess);
             }

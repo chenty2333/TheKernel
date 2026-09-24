@@ -81,12 +81,7 @@ impl Signalfd {
         };
         acknowledge_posix_timer_signal(proc_data, &sig_info);
         let sfd_info = SignalfdSiginfo::encode(&sig_info);
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                core::ptr::from_ref(&sfd_info).cast::<u8>(),
-                SIGNALFD_SIGINFO_SIZE,
-            )
-        };
+        let bytes = &bytemuck::bytes_of(&sfd_info)[..SIGNALFD_SIGINFO_SIZE];
         dst.write(bytes)?;
         if self.has_pending_signals() {
             self.poll_rx.wake();

@@ -161,7 +161,7 @@ const FUSE_IOCTL_RETRY: u32 = 1 << 2;
 const FUSE_IOCTL_DIR: u32 = 1 << 4;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct InHeader {
     len: u32,
     opcode: u32,
@@ -175,7 +175,7 @@ struct InHeader {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct OutHeader {
     len: u32,
     error: i32,
@@ -183,7 +183,7 @@ struct OutHeader {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct InitIn {
     major: u32,
     minor: u32,
@@ -194,7 +194,7 @@ struct InitIn {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct InitOut {
     major: u32,
     minor: u32,
@@ -466,10 +466,8 @@ impl FuseConnection {
         self.waiters.wake();
     }
 
-    fn append_pod<T: Copy>(bytes: &mut Vec<u8>, value: &T) -> AxResult<()> {
-        let raw = unsafe {
-            core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>())
-        };
+    fn append_pod<T: bytemuck::NoUninit>(bytes: &mut Vec<u8>, value: &T) -> AxResult<()> {
+        let raw = bytemuck::bytes_of(value);
         bytes
             .try_reserve(raw.len())
             .map_err(|_| AxError::NoMemory)?;
@@ -477,11 +475,8 @@ impl FuseConnection {
         Ok(())
     }
 
-    fn write_pod<T: Copy>(dst: &mut IoDst, value: &T) -> AxResult<()> {
-        let raw = unsafe {
-            core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>())
-        };
-        dst.write(raw).map(|_| ())
+    fn write_pod<T: bytemuck::NoUninit>(dst: &mut IoDst, value: &T) -> AxResult<()> {
+        dst.write(bytemuck::bytes_of(value)).map(|_| ())
     }
 
     fn build_request(
@@ -806,22 +801,14 @@ impl FuseConnection {
             flags2: ((FUSE_ALLOW_IDMAP >> 32) & u64::from(u32::MAX)) as u32,
             unused: [0; 11],
         };
-        let body = unsafe {
-            core::slice::from_raw_parts((&input as *const InitIn).cast::<u8>(), size_of::<InitIn>())
-        };
+        let body = bytemuck::bytes_of(&input);
         let reply = Self::reply_data(self.request(FUSE_INIT, FUSE_ROOT_ID, body)?)?;
         if reply.len() < 8 {
             return Err(LinuxError::EPROTO.into());
         }
         let mut output = InitOut::default();
         let n = reply.len().min(size_of::<InitOut>());
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                reply.as_ptr(),
-                (&mut output as *mut InitOut).cast::<u8>(),
-                n,
-            );
-        }
+        bytemuck::bytes_of_mut(&mut output)[..n].copy_from_slice(&reply[..n]);
         if output.major != FUSE_KERNEL_MAJOR || output.minor == 0 {
             return Err(LinuxError::EPROTO.into());
         }
@@ -1249,8 +1236,7 @@ impl FuseConnection {
         }
         let mut header_bytes = [0; size_of::<OutHeader>()];
         src.read(&mut header_bytes)?;
-        let header =
-            unsafe { core::ptr::read_unaligned(header_bytes.as_ptr().cast::<OutHeader>()) };
+        let header: OutHeader = bytemuck::pod_read_unaligned(&header_bytes);
         if (header.len as usize) < size_of::<OutHeader>()
             || (header.len as usize) > MAX_REQUEST_BYTES
             || (header.len as usize) - size_of::<OutHeader>() != src.remaining()
@@ -5017,15 +5003,10 @@ impl FuseOpenFile {
                 return Some(Err(AxError::NoMemory));
             }
             initialized.resize(input_len, 0);
-            let dst = unsafe {
-                core::slice::from_raw_parts_mut(
-                    initialized
-                        .as_mut_ptr()
-                        .cast::<core::mem::MaybeUninit<u8>>(),
-                    input_len,
-                )
-            };
-            if let Err(error) = context.user_memory().read_bytes(arg, dst) {
+            if let Err(error) = context
+                .user_memory()
+                .read_into(arg as *const u8, &mut initialized)
+            {
                 return Some(Err(crate::mm::map_usercopy_error(error)));
             }
         }
@@ -5144,17 +5125,9 @@ impl FuseOpenFile {
                         .try_reserve_exact(len)
                         .map_err(|_| AxError::NoMemory)?;
                     input.resize(start + len, 0);
-                    let dst = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            input[start..]
-                                .as_mut_ptr()
-                                .cast::<core::mem::MaybeUninit<u8>>(),
-                            len,
-                        )
-                    };
                     context
                         .user_memory()
-                        .read_bytes(base, dst)
+                        .read_into(base as *const u8, &mut input[start..])
                         .map_err(crate::mm::map_usercopy_error)?;
                 } else {
                     output

@@ -100,9 +100,11 @@ pub(crate) struct DeferredFileLease {
     inner: ptr::NonNull<DeferredFileLeaseInner>,
 }
 
-// The allocation is immutable after construction except for its atomic
-// reference count and publication link. The retained values are Send + Sync.
+// SAFETY: the allocation is immutable after construction except for its
+// atomic reference count and publication link, and the retained values are
+// Send + Sync, so the handle may move and be shared across CPUs.
 unsafe impl Send for DeferredFileLease {}
+// SAFETY: as for `Send`.
 unsafe impl Sync for DeferredFileLease {}
 
 impl DeferredFileLease {
@@ -355,6 +357,8 @@ fn reverse_description_cleanup_list(
         // SAFETY: the drain guard gives this consumer exclusive access to the
         // detached snapshot. Producers can only mutate the incoming head.
         let next = unsafe { (*current).next.load(Ordering::Relaxed) };
+        // SAFETY: the drain guard gives this consumer exclusive access to the detached snapshot.
+        // Producers can only mutate the incoming head.
         unsafe { (*current).next.store(reversed, Ordering::Relaxed) };
         reversed = current;
         current = next;
@@ -380,6 +384,8 @@ fn pop_description_cleanup_from(
     // SAFETY: only the drain-guard owner accesses the pending FIFO.
     let next = unsafe { (*head).next.load(Ordering::Relaxed) };
     pending.store(next, Ordering::Relaxed);
+    // SAFETY: as above; `head` is still owned by the pending FIFO, which only the drain-guard
+    // owner touches.
     unsafe { (*head).next.store(ptr::null_mut(), Ordering::Relaxed) };
     // SAFETY: removing the head transfers its unique ownership to this caller.
     Some(unsafe { Box::from_raw(head) })

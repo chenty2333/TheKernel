@@ -115,11 +115,13 @@ const fn recvmmsg_consumes_pending_error(flags: u32) -> bool {
     ) && flags & MSG_ERRQUEUE == 0
 }
 
-fn read_user_copy<T: Copy>(capability: &UserMemoryCapability, ptr: UserConstPtr<T>) -> AxResult<T> {
+fn read_user_copy<T: tk_linux_usercopy::UserAbiValue>(
+    capability: &UserMemoryCapability,
+    ptr: UserConstPtr<T>,
+) -> AxResult<T> {
     capability
-        .read_value_uninit(ptr.address().as_usize() as *const T)
+        .read_abi_value(ptr.address().as_usize() as *const T)
         .map_err(map_usercopy_error)
-        .map(|value| unsafe { value.assume_init() })
 }
 
 fn snapshot_user_bytes(
@@ -144,12 +146,7 @@ fn snapshot_user_bytes(
         .map_err(|_| AxError::NoMemory)?;
     snapshot.resize(len, 0);
     capability
-        .read_slice(ptr, unsafe {
-            core::slice::from_raw_parts_mut(
-                snapshot.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                snapshot.len(),
-            )
-        })
+        .read_into(ptr, &mut snapshot)
         .map_err(map_usercopy_error)?;
     Ok(snapshot)
 }
@@ -168,19 +165,20 @@ fn snapshot_iov_payload(iov: IoVectorBuf) -> AxResult<Vec<u8>> {
     Ok(payload)
 }
 
-fn write_user_copy<T: Copy>(
+fn write_user_copy<T: tk_linux_usercopy::UserAbiPod>(
     capability: &UserMemoryCapability,
     ptr: UserPtr<T>,
     value: T,
 ) -> AxResult {
     capability
-        .write_bytes(ptr.address().as_usize(), unsafe {
-            core::slice::from_raw_parts((&value as *const T).cast::<u8>(), size_of::<T>())
-        })
+        .write_bytes(
+            ptr.address().as_usize(),
+            tk_linux_usercopy::abi_bytes(&value),
+        )
         .map_err(map_usercopy_error)
 }
 
-fn write_user_field<T: Copy>(
+fn write_user_field<T: tk_linux_usercopy::UserAbiPod>(
     capability: &UserMemoryCapability,
     base: usize,
     offset: usize,
@@ -233,17 +231,9 @@ impl Read for ProgressiveVmBytes {
             };
             let page_offset = address & (PAGE_SIZE_4K - 1);
             let chunk = (target - copied).min(PAGE_SIZE_4K - page_offset);
-            let destination = unsafe {
-                core::slice::from_raw_parts_mut(
-                    output[copied..copied + chunk]
-                        .as_mut_ptr()
-                        .cast::<MaybeUninit<u8>>(),
-                    chunk,
-                )
-            };
             if let Err(error) = self
                 .capability
-                .read_slice(address as *const u8, destination)
+                .read_into(address as *const u8, &mut output[copied..copied + chunk])
                 .map_err(map_usercopy_error)
             {
                 self.advance(copied);
@@ -1413,12 +1403,9 @@ fn read_netlink_send_address(
     {
         return Err(AxError::InvalidInput);
     }
-    let address = unsafe {
-        capability
-            .read_value_uninit(addr.address().as_usize() as *const SockaddrNl)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    let address = capability
+        .read_value(addr.address().as_usize() as *const SockaddrNl)
+        .map_err(map_usercopy_error)?;
     if address.nl_family as u32 != AF_NETLINK {
         return Err(LinuxError::EINVAL.into());
     }
@@ -1638,12 +1625,7 @@ impl ReceivedSocketAddress {
                     nl_pid: pid,
                     nl_groups: groups,
                 };
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        (&addr_value as *const SockaddrNl).cast::<u8>(),
-                        size_of::<SockaddrNl>(),
-                    )
-                };
+                let bytes = addr_value.into_bytes();
                 let copy_len = (*addrlen as usize).min(bytes.len());
                 if copy_len != 0 {
                     capability
@@ -2784,11 +2766,9 @@ mod tests {
             iov_base: 0x1ff0,
             iov_len: 32,
         };
-        unsafe {
-            capability
-                .write_value_unchecked(0x1000 as *mut IoVec, descriptor)
-                .unwrap();
-        }
+        capability
+            .write_value(0x1000 as *mut IoVec, descriptor)
+            .unwrap();
         let iov = IoVectorBuf::new(capability.clone(), 0x1000 as *const IoVec, 1).unwrap();
         let mut source = PageProgressIo::new(iov).unwrap();
         let mut output = [0_u8; 32];

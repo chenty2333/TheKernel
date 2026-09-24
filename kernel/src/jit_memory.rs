@@ -155,6 +155,8 @@ impl ExecutableArena {
             .map_err(|_| AxError::NoMemory)?;
         // A stale allocator page must never become observable through the
         // hierarchy anchor.
+        // SAFETY: `direct` is the page the allocator just returned for this anchor, so its 4 KiB
+        // are exclusively ours.
         unsafe { ptr::write_bytes(direct.as_mut_ptr(), 0, PAGE_SIZE_4K) };
         let sentinel = base + SENTINEL_PAGE * PAGE_SIZE_4K;
         // Keep the anchor page if the mapping backend reports failure:
@@ -252,6 +254,8 @@ impl ExecBackend for Backend {
                 return Err(AxError::NoMemory);
             }
         };
+        // SAFETY: `direct` is the `pages`-page block the allocator just returned for this
+        // allocation, so it is exclusively ours.
         unsafe { ptr::write_bytes(direct.as_mut_ptr(), 0, pages * PAGE_SIZE_4K) };
         Ok(Allocation {
             first,
@@ -301,6 +305,12 @@ impl ExecBackend for Backend {
         if mapping.final_alias {
             return Err(AxError::BadState);
         }
+        if len > mapping.pages * PAGE_SIZE_4K {
+            return Err(AxError::InvalidInput);
+        }
+        // SAFETY: a direct (non-final) alias maps `mapping.pages` pages
+        // read/write at `mapping.address` for as long as `mapping` is borrowed,
+        // and `len` is within them.
         Ok(unsafe { core::slice::from_raw_parts_mut(mapping.address.as_mut_ptr(), len) })
     }
 
@@ -313,6 +323,8 @@ impl ExecBackend for Backend {
     }
 
     fn deallocate(&self, allocation: Allocation) {
+        // SAFETY: `allocation` owns its `pages` direct-map pages until the dealloc below, and
+        // every alias has already been unmapped.
         unsafe {
             ptr::write_bytes(
                 allocation.direct.as_mut_ptr(),
@@ -461,6 +473,9 @@ impl ExecutableCode {
         let RawPublished::Executable(_) = self.raw else {
             return None;
         };
+        // SAFETY: `self.code` is published executable JIT text of `self.len` bytes and the entry
+        // lies inside it (checked above); the module loader emitted this entry with the `extern
+        // "C" fn() -> i32` ABI.
         let function: extern "C" fn() -> i32 =
             unsafe { core::mem::transmute(self.code.as_usize() + entry_offset) };
         Some(function())
@@ -472,6 +487,8 @@ impl ExecutableCode {
         let Ok(length) = u32::try_from(data.len()) else {
             return 0;
         };
+        // SAFETY: `self.code` is published executable JIT text and `entry_offset < self.len`; the
+        // JIT emitted this entry with the `extern "C" fn(*const u8, u32) -> u32` ABI.
         let function: extern "C" fn(*const u8, u32) -> u32 =
             unsafe { core::mem::transmute(self.code.as_usize() + self.entry_offset) };
         function(data.as_ptr(), length)
