@@ -32,9 +32,39 @@ env:
   DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
+  schedule-changes:
+    name: Check for new commits since the previous schedule
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.commit.outputs.run }}
+    steps:
+      - name: Compare with the previous scheduled run
+        id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          previous=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=schedule&per_page=10" \
+            --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)] | max_by(.run_number) | .head_sha // \"\"") || {
+              echo 'schedule: cannot read history; run verification rather than skip it'
+              previous=
+            }
+          if [[ -n "$previous" && "$previous" == "$GITHUB_SHA" ]]; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'schedule: no new commit; skipping the full and hardware tiers'
+          else
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+            echo 'schedule: new commit or no history; running the full and hardware tiers'
+          fi
+
   verify:
     name: Repository verification
-    if: github.event_name != 'workflow_dispatch' || inputs.tier != 'hardware'
+    needs: schedule-changes
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.tier != 'hardware') && (github.event_name != 'schedule' || needs.schedule-changes.outputs.run == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.tier == 'full') && 360 || 150 }}
     env:
@@ -45,9 +75,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build checked-in development environment
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: dev-env
           load: true
@@ -117,11 +147,12 @@ jobs:
 
   hardware-availability:
     name: Hardware runner availability
-    # The nightly schedule is what puts the portable Linux ABI differential
+    # When main advances, the nightly schedule puts the Linux ABI differential
     # (`test --suite abi`, KVM-only) in front of anyone without a laptop open:
     # the `verify` job's `full` tier has no guest-ABI stage, so without this
     # second trigger the ABI guests only ever ran when somebody dispatched them.
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'hardware')
+    needs: schedule-changes
+    if: ${{ !cancelled() && ((github.event_name == 'schedule' && needs.schedule-changes.outputs.run == 'true') || (github.event_name == 'workflow_dispatch' && inputs.tier == 'hardware')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
