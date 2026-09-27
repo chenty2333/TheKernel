@@ -3782,22 +3782,14 @@ fn msync_address_space(
     const PAGE_SIZE: usize = PageSize::Size4K as usize;
     let length = checked_align_up(length, PAGE_SIZE).ok_or(AxError::NoMemory)?;
     addr.checked_add(length).ok_or(AxError::NoMemory)?;
+    if length == 0 {
+        // `mm/msync.c` sets `error = 0` and takes the `end == start` exit
+        // *before* `mmap_read_lock()` and the `find_vma()` walk, so an empty
+        // range succeeds without the kernel looking at the address at all.
+        return Ok(0);
+    }
     let (backends, saw_unmapped, busy) = {
         let aspace = aspace_handle.lock();
-        if length == 0 {
-            // `mm/msync.c` runs its `find_vma()` probe even for a zero length:
-            // an address with no VMA after it is `-ENOMEM`, while a VMA that
-            // contains `addr` makes the `start >= end` exit succeed.
-            let start = VirtAddr::from(addr);
-            let mapped = aspace
-                .find_area(start)
-                .is_some_and(|area| area.start() <= start);
-            return if mapped {
-                Ok(0)
-            } else {
-                Err(AxError::NoMemory)
-            };
-        }
         {
             let start = VirtAddr::from(addr);
             let end = start + length;
@@ -4699,6 +4691,18 @@ mod tests {
         assert_eq!(byte, [42]);
         node.read_at(&mut byte, (PAGE_SIZE_4K * 3) as u64).unwrap();
         assert_eq!(byte, [4], "out-of-range suffix must stay dirty");
+        // An empty range is never an error, mapped or not: `mm/msync.c` takes
+        // its `end == start` exit before it looks at any VMA.
+        assert_eq!(
+            msync_address_space(&aspace, leading_hole, 0, MS_SYNC),
+            Ok(0),
+            "msync(len 0) in a hole must succeed"
+        );
+        assert_eq!(
+            msync_address_space(&aspace, (base + PAGE_SIZE_4K * 64).as_usize(), 0, MS_SYNC),
+            Ok(0),
+            "msync(len 0) with nothing mapped must succeed"
+        );
     }
 
     #[test]
