@@ -272,8 +272,12 @@ fn sync_async_io_to_file_flags(description: &FileDescription, fd: c_int, flags: 
 /// the open file description's `FASYNC` bit; only pipes additionally forward
 /// it to a signal-delivery provider, and socket SIGIO delivery is outside the
 /// scope of this implementation.
-fn description_supports_fasync(description: &FileDescription) -> bool {
-    !description.is_path_only()
+///
+/// `path_only` comes from a status snapshot the caller already holds.  `F_SETFL`
+/// asks this while the description's status-transition lock is held, and
+/// sampling the status again there re-enters that lock.
+fn description_supports_fasync(description: &FileDescription, path_only: bool) -> bool {
+    !path_only
         && (description.inner.downcast_ref::<Pipe>().is_some()
             || description.inner.downcast_ref::<NamedPipe>().is_some()
             || description.inner.downcast_ref::<Socket>().is_some()
@@ -310,7 +314,7 @@ pub(crate) fn ioctl_fioasync(context: &IoctlContext, fd: c_int, on: bool) -> AxR
         // Linux consults `->fasync` only when the request changes the bit.
         return Ok(());
     }
-    if !description_supports_fasync(&description) {
+    if !description_supports_fasync(&description, current.path_only()) {
         return Err(AxError::NotATty);
     }
     description.transition_status_flags(
@@ -2599,7 +2603,8 @@ pub fn sys_fcntl(
         }
         F_SETFL => {
             let description = get_file_description(fd)?;
-            let current_flags = description.status_flags();
+            let status = description.io_status_snapshot();
+            let current_flags = status.raw();
             // `S_ISFIFO(inode->i_mode)` in fs/fcntl.c:setfl() covers both
             // anonymous pipes and named FIFOs, because Linux builds both on a
             // `S_IFIFO` inode.
@@ -2645,7 +2650,7 @@ pub fn sys_fcntl(
             })?;
             let fasync = (arg as u32) & FASYNC;
             let requested = if current_flags & FASYNC != fasync {
-                if description_supports_fasync(&description) {
+                if description_supports_fasync(&description, status.path_only()) {
                     plan.mutable | fasync
                 } else {
                     // Linux `setfl()` (fs/fcntl.c) skips `->fasync` silently
@@ -2663,7 +2668,7 @@ pub fn sys_fcntl(
                     if old.nonblocking() != new.nonblocking() {
                         description.inner.set_nonblocking(new.nonblocking())?;
                     }
-                    if description_supports_fasync(&description) {
+                    if description_supports_fasync(&description, new.path_only()) {
                         sync_async_io_to_file_flags(&description, fd, new.raw());
                     }
                     Ok(())
