@@ -160,13 +160,11 @@ fn do_poll(
         } else {
             wait_signal_only(uctx, timeout, sigmask)
         };
-        return match result {
-            Ok(result) => {
-                copy_poll_results(caller, user_fds, poll_fds)?;
-                Ok(result)
-            }
-            Err(error) => Err(error),
-        };
+        // Linux's `do_sys_poll()` runs its `revents` write-back loop before it
+        // returns the scan's verdict, so a caller woken by a signal reads this
+        // scan's zeroes rather than the values it passed in.
+        copy_poll_results(caller, user_fds, poll_fds)?;
+        return result;
     }
     let deadline = timeout.map(|dur| wall_time().saturating_add(dur));
     let mut poll_once = || {
@@ -199,13 +197,12 @@ fn do_poll(
         )
     };
 
-    match wait_io_result(uctx, sigmask, &mut wait_once) {
-        Ok(result) => {
-            copy_poll_results(caller, user_fds, poll_fds)?;
-            Ok(result)
-        }
-        Err(error) => Err(error),
-    }
+    let result = wait_io_result(uctx, sigmask, &mut wait_once);
+    // `-ERESTARTNOHAND` is not an early exit for Linux: `do_sys_poll()` still
+    // writes every entry's `revents`, so an interrupted `poll` reports the
+    // events it did find and zeroes the rest.
+    copy_poll_results(caller, user_fds, poll_fds)?;
+    result
 }
 
 #[cfg(target_arch = "x86_64")]
