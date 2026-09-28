@@ -164,7 +164,7 @@ the *neighbouring* cite. `mm/src/userfaultfd.rs:35`
 (`mm/userfaultfd.c:3659-3661`) and `net/src/lib.rs:332` (`net/socket.c:1947`)
 were both re-read against the reference tree and are right — `-EINVAL` before
 `vma_can_userfault()`, and `move_addr_to_kernel()` inside `__sys_bind()`. The
-third, `kernel/src/syscall/fs/io_uring.rs:773`, is the callee-body case named
+third, `kernel/src/syscall/fs/io_uring.rs:765`, is the callee-body case named
 above. The walk is not tightened to hide them: refusing to cross into a region
 that already carries its own attribution would also have hidden `msg.rs:171` and
 `:591`, where the marker above the block was right and the prose cite below it
@@ -459,21 +459,26 @@ what it was forked from.
 
 `kernel/src/**` is not covered by any `NOTICE`, and this pass did not triage it
 site by site. Measured, so the owner starts from numbers rather than an
-estimate: **89 verbatim Linux lines in 43 fenced blocks across 19 files at
-≥ 40**, **166 lines / 53 blocks / 25 files at ≥ 25**. By subtree, where `files`
+estimate: **89 verbatim Linux lines in 43 fenced blocks across 20 files at
+≥ 40**, **166 lines / 53 blocks / 26 files at ≥ 25**. The 2026-09-28 re-scan
+accounts for the split of `mm/aspace/mod.rs` quotations between `map.rs` and
+`query.rs`: file counts increase by one at both thresholds, while line and
+block counts stay unchanged. The `io_uring.rs` allowlisted citation above also
+moved from line 773 to 765 after the typed-usercopy cleanup; its text and Linux
+ranges are unchanged. By subtree, where `files`
 counts any category and so includes comment-only files:
 
 | Subtree | ≥ 40 fenced lines / blocks / files | ≥ 25 fenced lines / blocks / files | ≥ 40 outside fences: doc / `//` / `code` |
 | --- | --- | --- | --- |
 | `syscall/` | 65 / 31 / 29 | 116 / 37 / 34 | 7 / 108 / 8 |
 | `task/` | 9 / 5 / 4 | 16 / 5 / 5 | 0 / 1 / 0 |
-| `mm/` | 9 / 3 / 2 | 14 / 4 / 3 | 0 / 0 / 0 |
+| `mm/` | 9 / 3 / 3 | 14 / 4 / 4 | 0 / 0 / 0 |
 | `mounts.rs` | 5 / 3 / 1 | 13 / 3 / 1 | 0 / 3 / 0 |
 | `file/` | 0 / 0 / 2 | 3 / 1 / 4 | 0 / 5 / 0 |
 | `drm/` | 1 / 1 / 1 | 2 / 2 / 2 | 0 / 0 / 0 |
 | `time.rs` | 0 / 0 / 0 | 2 / 1 / 1 | 0 / 0 / 0 |
 | `bpf/` | 0 / 0 / 0 | 0 / 0 / 1 | 0 / 0 / 2 |
-| **`kernel/src` total** | **89 / 43 / 19** | **166 / 53 / 25** | 132 lines, of which 8 `code` |
+| **`kernel/src` total** | **89 / 43 / 20** | **166 / 53 / 26** | 132 lines, of which 8 `code` |
 
 Three things about that table need stating plainly. **Not one** of the 43 blocks
 (53 at ≥ 25) carries an `Excerpt:` marker, while `crates/linux` puts 18 of 49 in
