@@ -96,9 +96,7 @@ struct Elf64Shdr {
     sh_entsize: u64,
 }
 
-/// Minimal `prstatus` for core dump (architecture-independent layout).
-/// `struct elf_prstatus` as x86_64 Linux writes it, so a note reader finds
-/// every field where `include/linux/elfcore.h` puts it.
+/// Linux x86_64 `struct elf_prstatus` layout for the NT_PRSTATUS note.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ElfPrstatus {
@@ -174,14 +172,33 @@ fn fill_gregs(uctx: &UserContext, regs: &mut [u64; NUM_GREGS]) {
     // leaves in that slot for a frame that did not come from a system call.
     let frame = uctx.linux_pt_regs(!0);
     let gregs = [
-        frame.r15, frame.r14, frame.r13, frame.r12, frame.bp, frame.bx, frame.r11, frame.r10,
-        frame.r9, frame.r8, frame.ax, frame.cx, frame.dx, frame.si, frame.di, frame.orig_ax,
-        frame.ip, frame.cs, frame.flags, frame.sp, frame.ss,
+        frame.r15,
+        frame.r14,
+        frame.r13,
+        frame.r12,
+        frame.bp,
+        frame.bx,
+        frame.r11,
+        frame.r10,
+        frame.r9,
+        frame.r8,
+        frame.ax,
+        frame.cx,
+        frame.dx,
+        frame.si,
+        frame.di,
+        frame.orig_ax,
+        frame.ip,
+        frame.cs,
+        frame.flags,
+        frame.sp,
+        frame.ss,
     ];
     regs[..gregs.len()].copy_from_slice(&gregs);
     regs[21] = uctx.fs_base;
     regs[22] = uctx.gs_base;
-    // `ds`, `es`, `fs` and `gs` name no value for a 64-bit frame.
+    // The saved context has no legacy segment selectors; keep those slots zero.
+    regs[23..].fill(0);
 }
 
 // ---- Public API ----
@@ -256,8 +273,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         _pad0: 0,
         pr_sigpend: 0,
         pr_sighold: 0,
-        // `fill_prstatus` reports the thread that took the signal, not the
-        // thread group, which is what a reader matches PT_LOAD notes against.
+        // Linux identifies the dumping thread, not its thread group leader.
         pr_pid: thr.tid() as i32,
         pr_ppid: ppid,
         pr_pgrp: pgid,
@@ -435,8 +451,10 @@ mod tests {
         assert_eq!(core::mem::offset_of!(ElfPrstatus, pr_reg), 112);
         assert_eq!(core::mem::offset_of!(ElfPrstatus, pr_fpvalid), 328);
 
-        let uctx = UserContext::new(0x1234, VirtAddr::from_usize(0x7fff_f000), 0xabcd);
-        let mut regs = [0u64; NUM_GREGS];
+        let mut uctx = UserContext::new(0x1234, VirtAddr::from_usize(0x7fff_f000), 0xabcd);
+        uctx.fs_base = 0x1234_5000;
+        uctx.gs_base = 0x5678_9000;
+        let mut regs = [!0u64; NUM_GREGS];
         fill_gregs(&uctx, &mut regs);
 
         assert_eq!(regs[16], 0x1234, "rip");
@@ -446,5 +464,8 @@ mod tests {
         assert_ne!(regs[17], 0, "cs");
         assert_ne!(regs[18], 0, "rflags");
         assert_eq!(regs[0..4], [0u64; 4], "r15..r12 are untouched here");
+        assert_eq!(regs[21], uctx.fs_base, "fs_base");
+        assert_eq!(regs[22], uctx.gs_base, "gs_base");
+        assert_eq!(regs[23..], [0u64; 4], "legacy segment selectors");
     }
 }

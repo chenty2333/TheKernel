@@ -39,10 +39,8 @@ static int empty_read(int fd) {
     return 0;
 }
 
-/* `F_SETFL` is the only way to move `O_NONBLOCK` after creation, so it writes
- * the same open file description status that `check_flags` reads back.  Only
- * the status flags are asserted: reading through a cleared `O_NONBLOCK` would
- * block instead of proving anything. */
+/* Round-trip mutable status through F_SETFL/F_GETFL without changing CLOEXEC.
+ * Do not read while O_NONBLOCK is cleared: an empty descriptor would block. */
 static int toggle_nonblock(int fd) {
     if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0 || check_flags(fd, 1, 1))
         return 1;

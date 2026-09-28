@@ -30,24 +30,26 @@ static int poll_reports_the_interrupted_scan(void)
     int monitors[2][2];
     /* No SA_RESTART, so the request comes back as EINTR. */
     struct sigaction handler = { .sa_handler = discard };
+    struct sigaction previous_handler;
     struct pollfd watched[2];
 
     sigemptyset(&handler.sa_mask);
-    if (sigaction(SIGALRM, &handler, NULL))
+    if (sigaction(SIGALRM, &handler, &previous_handler))
         return fail("poll-handler");
     if (pipe(monitors[0]) || pipe(monitors[1]))
         return fail("poll-pipe");
     watched[0] = (struct pollfd){ .fd = monitors[0][0], .events = POLLIN, .revents = 0x7f };
     watched[1] = (struct pollfd){ .fd = monitors[1][0], .events = POLLIN, .revents = 0x7f };
-    if (alarm(1) == (unsigned)-1)
-        return fail("poll-alarm");
+    alarm(1);
     if (syscall(SYS_poll, watched, 2, 30000) != -1 || errno != EINTR)
         return fail("poll-interrupted");
     if (watched[0].revents != 0 || watched[1].revents != 0)
         return fail("poll-revents-on-eintr");
-    /* The signal above consumed the suite's own watchdog. */
-    if (alarm(10) == (unsigned)-1)
-        return fail("poll-rearm-alarm");
+    /* Restore the watchdog's terminating disposition, not just its timer. */
+    alarm(0);
+    if (sigaction(SIGALRM, &previous_handler, NULL))
+        return fail("poll-restore-handler");
+    alarm(10);
     return close(monitors[0][0]) || close(monitors[0][1]) ||
            close(monitors[1][0]) || close(monitors[1][1]);
 }
