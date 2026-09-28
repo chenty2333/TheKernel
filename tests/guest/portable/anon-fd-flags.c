@@ -39,6 +39,16 @@ static int empty_read(int fd) {
     return 0;
 }
 
+/* Round-trip mutable status through F_SETFL/F_GETFL without changing CLOEXEC.
+ * Do not read while O_NONBLOCK is cleared: an empty descriptor would block. */
+static int toggle_nonblock(int fd) {
+    if (fcntl(fd, F_SETFL, O_NONBLOCK) != 0 || check_flags(fd, 1, 1))
+        return 1;
+    if (fcntl(fd, F_SETFL, 0) != 0 || check_flags(fd, 0, 1))
+        return 1;
+    return fcntl(fd, F_SETFL, O_NONBLOCK) != 0 || check_flags(fd, 1, 1);
+}
+
 static int receive_signal(int fd, int mode, int signo) {
     if (mode == 0) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
@@ -156,7 +166,8 @@ int main(void) {
     int notify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     int fds[] = {signal_fd, timer_fd, notify_fd};
     for (unsigned int i = 0; i < sizeof(fds) / sizeof(fds[0]); ++i) {
-        if (fds[i] < 0 || check_flags(fds[i], 1, 1) || empty_read(fds[i]))
+        if (fds[i] < 0 || check_flags(fds[i], 1, 1) || empty_read(fds[i]) ||
+            toggle_nonblock(fds[i]))
             return 1;
     }
     /* Updating a signalfd mask never changes existing creation flags. */

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,6 +14,44 @@ static int fail(const char *stage)
 {
     fprintf(stderr, "THEKERNEL_SELECT_FAIL stage=%s errno=%d\n", stage, errno);
     return 1;
+}
+
+static void discard(int signo)
+{
+    (void)signo;
+}
+
+/* An interrupted `poll` still reports this scan's `revents`: Linux writes every
+ * entry back before returning `-ERESTARTNOHAND`, so a caller that passes dirty
+ * `revents` finds zeroes here, not its own input.  A timer signal is what
+ * breaks the wait, because `poll` takes no mask argument. */
+static int poll_reports_the_interrupted_scan(void)
+{
+    int monitors[2][2];
+    /* No SA_RESTART, so the request comes back as EINTR. */
+    struct sigaction handler = { .sa_handler = discard };
+    struct sigaction previous_handler;
+    struct pollfd watched[2];
+
+    sigemptyset(&handler.sa_mask);
+    if (sigaction(SIGALRM, &handler, &previous_handler))
+        return fail("poll-handler");
+    if (pipe(monitors[0]) || pipe(monitors[1]))
+        return fail("poll-pipe");
+    watched[0] = (struct pollfd){ .fd = monitors[0][0], .events = POLLIN, .revents = 0x7f };
+    watched[1] = (struct pollfd){ .fd = monitors[1][0], .events = POLLIN, .revents = 0x7f };
+    alarm(1);
+    if (syscall(SYS_poll, watched, 2, 30000) != -1 || errno != EINTR)
+        return fail("poll-interrupted");
+    if (watched[0].revents != 0 || watched[1].revents != 0)
+        return fail("poll-revents-on-eintr");
+    /* Restore the watchdog's terminating disposition, not just its timer. */
+    alarm(0);
+    if (sigaction(SIGALRM, &previous_handler, NULL))
+        return fail("poll-restore-handler");
+    alarm(10);
+    return close(monitors[0][0]) || close(monitors[0][1]) ||
+           close(monitors[1][0]) || close(monitors[1][1]);
 }
 
 int main(void)
@@ -33,6 +72,8 @@ int main(void)
     if (syscall(SYS_pselect6, 0, NULL, NULL, NULL, &ts, &invalid_mask) != -1 ||
         errno != EINVAL || ts.tv_sec != 1 || ts.tv_nsec != 0)
         return fail("pselect-mask-error-preserves-timeout");
+    if (poll_reports_the_interrupted_scan())
+        return 1;
 
     int pipefd[2];
     if (pipe(pipefd) || close(pipefd[0]))

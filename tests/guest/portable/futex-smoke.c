@@ -1053,6 +1053,23 @@ static int test_alignment_and_fault(void) {
         (void)munmap(page, (size_t)page_size);
         return fail_value("fault-shared-wake", result, -1);
     }
+    /* `futex_requeue()` rejects a negative count before it resolves either
+     * futex key, so an unusable address must not turn that `-EINVAL` into an
+     * `-EFAULT`. */
+    errno = 0;
+    result = sys_futex(NULL, FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG, -1,
+                       NULL, NULL, 0);
+    if (result != -1 || errno != EINVAL) {
+        (void)munmap(page, (size_t)page_size);
+        return fail_value("requeue-negative-wake-count", result, -1);
+    }
+    errno = 0;
+    result = sys_futex(NULL, FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG, 0,
+                       (const struct timespec *)(uintptr_t)-1, NULL, 0);
+    if (result != -1 || errno != EINVAL) {
+        (void)munmap(page, (size_t)page_size);
+        return fail_value("requeue-negative-requeue-count", result, -1);
+    }
     if (munmap(page, (size_t)page_size) != 0) {
         return fail("fault-munmap");
     }

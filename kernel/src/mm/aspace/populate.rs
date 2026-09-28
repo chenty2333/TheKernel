@@ -246,7 +246,6 @@ impl AddrSpace {
         let grace = self.synchronize_tlb_after_mutation();
         drop(retired);
         drop(grace);
-        self.publish_resident_highwater();
         result
     }
 

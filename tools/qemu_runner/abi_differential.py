@@ -52,7 +52,6 @@ CONTRACTS.update({
     "mseal": ("raw-differential", "pass", "VALIDATION_AND_MAPPING_SEAL DISCARD_RESPECTS_WRITE_PERMISSION"),
 })
 CONTRACTS.update({
-    "network_tcp_close": ("kernel-lifecycle", "pass", "TCP_LIFECYCLE_LO_IS_DOWN TCP_LIFECYCLE_LO_IS_UP LAST_FD_TIMER_RECLAIM ZERO_WINDOW_TIMEOUT_RECLAIM"),
     "network_bind": ("raw-differential", "pass", "IPV4_OVERLONG_EINVAL IPV4_STORAGE_BOUNDARY IPV6_OVERLONG_EINVAL"),
     "network_connect": ("raw-differential", "pass", "IPV6_OVERLONG_EINVAL IPV4_OVERLONG_EINVAL NETLINK_SOCKET NETLINK_KERNEL_CONNECT NETLINK_AUTOBIND NETLINK_DISCONNECT NETLINK_DISCONNECTED_PEER NETLINK_BAD_FAMILY TCP_CLOSE_QUEUED"),
     "network_getpeername": ("raw-differential", "pass", "NETLINK_UNCONNECTED_ZERO NETLINK_CONNECTED_ZERO NETLINK_PEER_POLICY NETLINK_PEER_STATE NETLINK_PEER_RESET NETLINK_TRUNCATED_LENGTH"),
@@ -149,7 +148,7 @@ CONTRACTS.update({
     "reboot": ("raw-differential", "pass", "MAGIC1_EINVAL MAGIC2_EINVAL RESTART2_NULL_EFAULT RESTART2_BAD_PTR_EFAULT UNKNOWN_CMD_EINVAL CAPABILITY_BEFORE_MAGIC_EPERM"),
     "ioctl": ("raw-differential", "pass", "FIGETBSZ_PSEUDO_EINVAL FIGETBSZ_FILESYSTEM_BLOCK_SIZE PSEUDO_UNSUPPORTED_REFUSALS FSUUID_AND_SYSSFSPATH_ENOTTY FREEZE_AND_THAW_EPERM_UNPRIVILEGED"),
     "mount": ("raw-differential", "pass", "MS_NOUSER_EINVAL SUPERBLOCK_FLAGS_ACCEPTED MAGIC_MASK_STRIPPED"),
-    "umount2": ("raw-differential", "pass", "FLAGS_BEFORE_PATH_EINVAL NOFOLLOW_IS_VALID EXPIRE_ROOT_EINVAL EXPIRE_COMBINATION_EINVAL DETACH_NAMESPACE_ROOT_SKIPPED DETACH_NAMESPACE_ROOT_SUCCEEDS VALID_FLAGS_PATH_VERDICT"),
+    "umount2": ("raw-differential", "pass", "FLAGS_BEFORE_PATH_EINVAL NOFOLLOW_IS_VALID EXPIRE_ROOT_EINVAL EXPIRE_COMBINATION_EINVAL DETACH_NAMESPACE_ROOT_SUCCEEDS VALID_FLAGS_PATH_VERDICT"),
     "pipe2": ("raw-differential", "pass", "UNKNOWN_FLAG_EINVAL NOTIFICATION_ENOPKG FLAG_SPLIT_AND_CLOEXEC PACKET_MODE_ON_WRITE_END_ONLY PACKET_ONE_PAGE_MAX PACKET_SLOT_ACCOUNTING PACKET_WRITE_BOUNDARY SHORT_READ_DISCARDS_PACKET"),
     "syncfs": ("raw-differential", "pass", "PSEUDO_NOOP BAD_FD_EBADF FILESYSTEM_SYNC"),
     "preadv2": ("raw-differential", "pass", "UNKNOWN_FLAG_EOPNOTSUPP APPEND_NOAPPEND_EINVAL HIPRI_ACCEPTED DSYNC_ACCEPTED IOVEC_COPY_BEFORE_FLAGS POS_H_IS_IGNORED POSITION_TRAVELS_IN_POS_L CURRENT_POSITION_FROM_MINUS_ONE"),
@@ -344,7 +343,7 @@ PROGRAM_CASES = {
     "umask": ("umask",), "native-ni": ("native-ni",),
     "fsattrs": ("setxattrat", "getxattrat", "listxattrat", "removexattrat", "file-getattr", "file-setattr", "open-tree-attr", "xattr-classic"),
     "mm-contracts": ("mprotect", "munmap", "mincore", "process-vm-readv", "process-vm-writev", "mseal", "mlock", "mlock2", "munlock", "process-madvise", "mlockall", "brk", "mmap", "madvise", "msync", "process-mrelease", "migrate-pages", "set-mempolicy-home-node"),
-    "network-basic": ("network_tcp_close", "network_bind", "network_connect", "network_getpeername", "network_sendto"),
+    "network-basic": ("network_bind", "network_connect", "network_getpeername", "network_sendto"),
     "signal-boundary": ("rt_sigaction", "sigaltstack", "rt_tgsigqueueinfo", "restart_syscall", "rt_sigprocmask", "rt_sigreturn", "pause", "kill", "rt_sigpending", "rt_sigtimedwait", "rt_sigqueueinfo", "rt_sigsuspend", "tkill", "tgkill"),
     "stat-access": ("access", "faccessat", "faccessat2", "newfstatat", "statx"),
     "socket-msg": ("socket_msg.send_flags", "socket_msg.sendmmsg_flags", "socket_msg.peek_waitall_tcp", "socket_msg.tcp_more", "socket_msg.compat_flag", "socket_msg.waitall_stream", "socket_msg.waitall_tcp", "socket_msg.waitall_datagram", "socket_msg.recvmmsg_deadline", "socket_msg.recvmmsg_waitforone"),

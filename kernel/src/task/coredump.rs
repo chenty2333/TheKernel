@@ -96,11 +96,7 @@ struct Elf64Shdr {
     sh_entsize: u64,
 }
 
-/// Minimal `prstatus` for core dump (architecture-independent layout).
-///
-/// On Linux the exact layout depends on the architecture. We store the
-/// most useful subset: signal info, PID, and general-purpose registers
-/// including the program counter.
+/// Linux x86_64 `struct elf_prstatus` layout for the NT_PRSTATUS note.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ElfPrstatus {
@@ -119,8 +115,14 @@ struct ElfPrstatus {
     pr_stime: [u64; 2],
     pr_cutime: [u64; 2],
     pr_cstime: [u64; 2],
-    /// General registers followed by the program counter.
-    pr_reg: [u64; NUM_GREGS + 1],
+    /// `pr_reg` is the general regset, which `regset_get` copies as
+    /// `struct user_regs_struct`: `struct pt_regs` in its own order, then the
+    /// segment bases and selectors.
+    pr_reg: [u64; NUM_GREGS],
+    pr_fpvalid: i32,
+    /// The four bytes Linux aligns away after `pr_fpvalid`, explicit here so
+    /// `bytemuck` can treat the note as plain data.
+    _pad1: i32,
 }
 
 // ---- Helpers ----
@@ -164,11 +166,39 @@ fn mapping_flags_to_elf(flags: MappingFlags) -> u32 {
 
 // ---- Core dump generation (x86_64 register extraction) ----
 
-fn fill_gregs(uctx: &UserContext, regs: &mut [u64; NUM_GREGS + 1]) {
-    // Keep the compact register view stable: the first slots carry the
-    // instruction and stack pointers, while the remaining slots are zero.
-    regs[0] = uctx.ip() as u64;
-    regs[1] = uctx.sp() as u64;
+fn fill_gregs(uctx: &UserContext, regs: &mut [u64; NUM_GREGS]) {
+    // The saved frame keeps no `orig_ax`: rax holds the syscall return value by
+    // the time a fatal signal is delivered. -1 is what the x86_64 entry code
+    // leaves in that slot for a frame that did not come from a system call.
+    let frame = uctx.linux_pt_regs(!0);
+    let gregs = [
+        frame.r15,
+        frame.r14,
+        frame.r13,
+        frame.r12,
+        frame.bp,
+        frame.bx,
+        frame.r11,
+        frame.r10,
+        frame.r9,
+        frame.r8,
+        frame.ax,
+        frame.cx,
+        frame.dx,
+        frame.si,
+        frame.di,
+        frame.orig_ax,
+        frame.ip,
+        frame.cs,
+        frame.flags,
+        frame.sp,
+        frame.ss,
+    ];
+    regs[..gregs.len()].copy_from_slice(&gregs);
+    regs[21] = uctx.fs_base;
+    regs[22] = uctx.gs_base;
+    // The saved context has no legacy segment selectors; keep those slots zero.
+    regs[23..].fill(0);
 }
 
 // ---- Public API ----
@@ -243,7 +273,8 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         _pad0: 0,
         pr_sigpend: 0,
         pr_sighold: 0,
-        pr_pid: pid as i32,
+        // Linux identifies the dumping thread, not its thread group leader.
+        pr_pid: thr.tid() as i32,
         pr_ppid: ppid,
         pr_pgrp: pgid,
         pr_sid: 0,
@@ -251,7 +282,9 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         pr_stime: [0; 2],
         pr_cutime: [0; 2],
         pr_cstime: [0; 2],
-        pr_reg: [0u64; NUM_GREGS + 1],
+        pr_reg: [0u64; NUM_GREGS],
+        pr_fpvalid: 0,
+        _pad1: 0,
     };
     fill_gregs(uctx, &mut prstatus.pr_reg);
 
@@ -400,4 +433,39 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         );
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use axhal::uspace::UserContext;
+    use memory_addr::VirtAddr;
+
+    use super::*;
+
+    /// A note reader takes `pr_reg` for `struct user_regs_struct`, so every
+    /// register has to sit at the index that header gives it -- the program
+    /// counter at 16 and the stack pointer at 19, not in the first two slots.
+    #[test]
+    fn prstatus_note_keeps_the_x86_64_gregset_offsets() {
+        assert_eq!(core::mem::size_of::<ElfPrstatus>(), 336);
+        assert_eq!(core::mem::offset_of!(ElfPrstatus, pr_reg), 112);
+        assert_eq!(core::mem::offset_of!(ElfPrstatus, pr_fpvalid), 328);
+
+        let mut uctx = UserContext::new(0x1234, VirtAddr::from_usize(0x7fff_f000), 0xabcd);
+        uctx.fs_base = 0x1234_5000;
+        uctx.gs_base = 0x5678_9000;
+        let mut regs = [!0u64; NUM_GREGS];
+        fill_gregs(&uctx, &mut regs);
+
+        assert_eq!(regs[16], 0x1234, "rip");
+        assert_eq!(regs[19], 0x7fff_f000, "rsp");
+        assert_eq!(regs[14], 0xabcd, "rdi");
+        assert_eq!(regs[15], !0u64, "orig_ax of a frame with no syscall");
+        assert_ne!(regs[17], 0, "cs");
+        assert_ne!(regs[18], 0, "rflags");
+        assert_eq!(regs[0..4], [0u64; 4], "r15..r12 are untouched here");
+        assert_eq!(regs[21], uctx.fs_base, "fs_base");
+        assert_eq!(regs[22], uctx.gs_base, "gs_base");
+        assert_eq!(regs[23..], [0u64; 4], "legacy segment selectors");
+    }
 }

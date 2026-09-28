@@ -386,7 +386,6 @@ impl AddrSpace {
         let grace = self.synchronize_tlb_after_mutation();
         retirement.release();
         drop(grace);
-        self.publish_resident_highwater();
 
         self.refresh_growdown_starts();
         for range in ranges {

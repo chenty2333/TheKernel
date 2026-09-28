@@ -1535,12 +1535,13 @@ fn do_futex_wait_requeue_pi(
     }
     let tid = current().as_thread().pid_vnr();
 
-    // `futex_wait_requeue_pi()` resolves and validates `uaddr2` for writing
-    // (`get_futex_key(uaddr2, ..., FUTEX_WRITE)`) before it validates `*uaddr`,
-    // so an inaccessible target is EFAULT even when the source comparison
-    // would already have failed.
+    // `get_futex_key(..., FUTEX_WRITE)` needs a writable mapping only for a
+    // shared key. A private target may remain read-only while this task waits
+    // on the source; promotion in CMP_REQUEUE_PI performs the actual write.
     validate_futex_address(uaddr2, size_of::<u32>())?;
-    check_user_writable_with(caller, uaddr2.addr(), size_of::<u32>())?;
+    if !private {
+        check_user_writable_with(caller, uaddr2.addr(), size_of::<u32>())?;
+    }
     let observed_target = fault_read_u32(caller, target)?;
     let target_word = PiWord::decode(observed_target);
     if target_word.tid == tid {
@@ -2059,9 +2060,13 @@ pub fn sys_futex(
             }
         }
         FutexCommand::Requeue | FutexCommand::CmpRequeue => {
-            // `futex_requeue()` takes `val` as `nr_wake`, the raw `uaddr2`
-            // *register* as `nr_requeue`, and for `FUTEX_CMP_REQUEUE` also a
-            // deferred `val3` comparison value.
+            // `futex_requeue()` takes `val` as `nr_wake`, the raw fourth
+            // argument (`timeout`) as `nr_requeue`, and for `FUTEX_CMP_REQUEUE` a
+            // deferred `val3` comparison value. It rejects a negative count
+            // with `-EINVAL` before resolving either futex key, so a bad count
+            // wins over a bad address.
+            assert_unsigned(value)?;
+            let value2 = assert_unsigned(timeout.addr() as u32)? as usize;
             let requeue_expected = if command == FutexCommand::CmpRequeue {
                 Some(value3)
             } else {
@@ -2073,8 +2078,6 @@ pub fn sys_futex(
                 validate_futex_key_access(uaddr, legacy_flags, &caller)?;
             }
             validate_futex_requeue_target(uaddr2.cast_const(), legacy_flags, &caller)?;
-            assert_unsigned(value)?;
-            let value2 = assert_unsigned(timeout.addr() as u32)? as usize;
 
             if requeue_expected.is_some() {
                 let _ = fault_read_u32(&caller, uaddr.addr())?;

@@ -818,12 +818,12 @@ impl KeyManager {
                     return Err(LinuxError::EOPNOTSUPP.into());
                 }
                 let full_len = key.payload.len();
-                // `user_read()` copies the first `buflen` bytes and reports
-                // the full payload length either way, so a short buffer is a
-                // truncated read, not an empty one.
+                // `keyctl_read_key()` stages the provider's output and only
+                // copies it to userspace when the entire payload fits. A
+                // short buffer is a size query, not a truncated read.
                 let bytes = match copy_limit {
-                    Some(limit) => key.payload[..full_len.min(limit)].to_vec(),
-                    None => Vec::new(),
+                    Some(limit) if limit >= full_len => key.payload.clone(),
+                    _ => Vec::new(),
                 };
                 return Ok(KeyctlOutput::Payload { full_len, bytes });
             }
