@@ -1,264 +1,135 @@
 # TheKernel
 
-TheKernel is a personal Rust operating-system project providing a
-Linux-compatible userspace ABI on ArceOS components. x86_64 is the only
-supported product architecture; the reference machine is QEMU `q35` with
-UEFI/OVMF.
+TheKernel is a personal Rust operating system that runs unmodified Linux
+userspace. It implements the Linux syscall ABI on top of components derived
+from ArceOS, and targets x86_64 only.
 
-## Checkout and development environment
+The reference machine is QEMU `q35` with UEFI/OVMF. Bring-up on real hardware
+(an Intel Core i3-N305 mini PC, `--platform n305`) is in progress; see
+[docs/design/n305-platform.md](docs/design/n305-platform.md).
 
-Clone the single repository; its root Cargo workspace includes the kernel,
-mechanism crates (`crates/ax/`), and Linux ABI crates (`crates/linux/`).
+What currently runs on it:
+
+- an interactive shell image, optionally with a native C toolchain
+  (`tcc`, glibc, or a distribution `gcc`) and a nested QEMU that boots Linux;
+- a Weston desktop with a terminal, file manager, editor, image viewer,
+  Python and the WebKitGTK MiniBrowser, using Virgl OpenGL and VirtIO sound;
+- VirtIO block/net/input/GPU/sound devices, plus xHCI USB keyboards, mice
+  and mass storage.
+
+It is not a claim of complete Linux ABI coverage, distribution or container
+compatibility, or general performance parity with Linux.
+
+## Quick start
+
+Everything builds inside the checked-in development container
+(`dev-env/Dockerfile`), which CI uses as well:
 
 ```bash
 git clone https://github.com/chenty2333/TheKernel.git
 cd TheKernel
+./scripts/dev-shell.sh -- scripts/setup-toolchain.sh   # first time only
+./scripts/dev-shell.sh -- bash                         # enter the shell
 ```
 
-CI builds the checked-in `dev-env/Dockerfile` with a reusable BuildKit cache,
-then runs the same `scripts/dev-shell.sh` commands used locally. No repository
-image variable or registry publication is required. Locally the image is built
-on first use; pass `--build` to rebuild after changing the Dockerfile:
+The image is built on first use; pass `--build` to rebuild it after changing
+the Dockerfile. With rootless Podman behind `DOCKER_HOST`, also set
+`THEKERNEL_ROOTLESS_PODMAN=1`. The Rust toolchain is pinned by
+`rust-toolchain.toml`.
+
+Then boot something:
 
 ```bash
-export THEKERNEL_DEV_IMAGE=thekernel-dev:local
-./scripts/dev-shell.sh -- bash
+make run                          # interactive shell (KVM, 4 CPUs, 1 GiB)
+make run RUN_ARGS="--toolchain gcc"   # shell image with a C compiler
+make run-gui RUN_ARGS=--build     # build and open the Weston desktop
+make run-gui                      # reopen the desktop without rebuilding
 ```
 
-When Docker Compose connects to a rootless Podman API socket, set
-`THEKERNEL_ROOTLESS_PODMAN=1` alongside `DOCKER_HOST`. This opt-in maps the host
-caller to container root so mounted checkout writes retain host ownership. The
-existing entrypoint adjusts ownership of its dedicated persistent home volume;
-it does not recursively change checkout ownership. Leave this option unset for
-Docker.
+The first desktop build compiles Buildroot and WebKit and takes a while.
+Shut the desktop down from the panel button; killing QEMU can lose pending
+writes. The desktop home directory lives on a persistent disk under
+`${XDG_DATA_HOME:-~/.local/share}/thekernel/desktop/` and survives rebuilds
+and `make clean`. See [docs/graphics-rootfs.md](docs/graphics-rootfs.md) for
+desktop build dependencies and options.
 
-Boot the interactive TheKernel guest shell directly from the host with
-`./scripts/dev-shell.sh --guest-shell`.
+## Commands
 
-Provision the pinned Rust toolchain and `axconfig-gen` explicitly inside the
-image, using the same script as CI:
+`tools/thekernel.py` is the single build, boot and test entry point; the
+Makefile wraps it with resource limits for everyday use.
 
-```bash
-./scripts/dev-shell.sh -- scripts/setup-toolchain.sh
-```
+| Command | Purpose |
+|---|---|
+| `thekernel.py build` | Build the kernel and UEFI ESP |
+| `thekernel.py run` | Build and boot (`--profile shell --interactive` for a shell) |
+| `thekernel.py run-gui` | Boot the Weston desktop (`--build` to update images) |
+| `thekernel.py test --suite …` | `host`, `guest`, `abi`, `graphics`, `cpu`, `fbcon`, `all` |
+| `thekernel.py bench --suite …` | `scheduler`, `io`, `graphics`, `all` |
+| `thekernel.py lint` | Clippy for the product kernel configuration |
+| `thekernel.py verify --tier …` | `daily`, `full`, `hardware` (see below) |
+| `thekernel.py clean` | Remove generated run, output and cache directories |
 
-The root `rust-toolchain.toml` selects Rust and its required components.
-Verification checks the environment before work starts and never installs tools.
+Useful `run` options: `--gdb` exposes a GDB socket and pauses on
+shutdown/panic; `--input-backend usb` and `--usb-disk IMAGE` switch input to
+xHCI and attach a disk image; `--graphics-profile interactive` uses software
+rendering. Kernel output goes to `kernel.log`, separate from the guest
+terminal; see [docs/debugging.md](docs/debugging.md).
 
-## Product entry point
-
-`./tools/thekernel.py` is the only product build and boot entry point:
-
-```bash
-./tools/thekernel.py build
-./tools/thekernel.py run --profile shell --interactive
-./tools/thekernel.py test --suite guest --smp 4 --accel tcg
-./tools/thekernel.py lint --smp 4
-```
-
-For the ordinary interactive shell workflow, the root Makefile supplies a
-small, resource-bounded wrapper around that same entry point:
-
-```bash
-make run
-make run-gui       # open the already-built Weston desktop
-make run-gui RUN_ARGS=--build  # update images, then open the desktop
-make run-existing  # reuse already-built kernel, ESP, and rootfs artifacts
-make build         # build without booting
-make lint          # run Clippy for the product kernel configuration
-make test          # run the host verification suite
-make clean         # remove generated run, output, and cache directories
-make docker-clean  # remove the dev container volume and local image
-```
-
-`make run-gui` starts the existing kernel and desktop images without building.
-Use `make run-gui RUN_ARGS=--build` on the first run or after changing code;
-it updates the images before starting. The first Buildroot build and package
-downloads can take a while; subsequent updates use incremental builds. It opens
-a Weston desktop with launchers for a terminal, file manager, text editor,
-image viewer, Python, and the sandboxed WebKitGTK MiniBrowser. The default
-desktop uses KVM, a 1920×1080 display, 2 GiB of guest memory, and Virgl OpenGL
-acceleration through the host GPU. Browser audio plays through PulseAudio and
-VirtIO sound; `curl`, `ssh`, `scp`, and `sftp` are included. Select
-`RUN_ARGS="--graphics-profile interactive"` for software rendering. Save your
-work and use the panel's
-Shut Down button to flush files and exit. Closing QEMU directly or pressing
-Ctrl+C forcibly stops the guest and can lose pending writes.
-See [graphics rootfs](docs/graphics-rootfs.md) for build dependencies
-and cache options.
-The desktop home at `/var/lib/weston`, including Documents, Pictures, and
-Downloads, lives on a persistent disk at
-`${XDG_DATA_HOME:-~/.local/share}/thekernel/desktop/home.ext4`. Rebuilding the
-system or running `make clean` preserves this default user disk. The rest of
-the root filesystem uses a temporary snapshot; changes there are discarded.
-
-The xHCI USB driver supports boot-protocol keyboards and mice and BOT/SCSI
-mass-storage devices attached at boot. Use
-`make run-gui RUN_ARGS="--input-backend usb --usb-disk /home/ava/usb.img"`
-to replace VirtIO input with USB input and attach an existing writable disk
-image. The USB disk follows the VirtIO system and home disks in `/dev/vd*`.
-This attaches an image, not a physical host USB device. Runtime hotplug, UAS,
-and non-boot HID report protocols are not supported yet.
-
-Kernel output is captured separately from the user terminal in `kernel.log`.
-See [kernel diagnostics and request tracing](docs/debugging.md) for runtime log
-filters, loss counters, and focused io_uring lifecycle capture.
-
-Its commands write below `${THEKERNEL_STATE_DIR:-~/.cache/thekernel-targets}`.
-With defaults, the system kernel and ESP are under
-`~/.cache/thekernel-targets/out/x86_64/q35-uefi/system/mem1g/`, and the
-root filesystem is `~/.cache/thekernel-targets/out/rootfs/x86/rootfs-x86.img`. On non-Debian x86_64 hosts the rootfs
-build falls back to the native gcc and needs the static C library (Fedora:
-`glibc-static`, Debian: `libc6-dev`).
-
-## Verification
-
-The same suite entry points serve local development and CI:
-
-```bash
-./tools/thekernel.py test --suite host
-./tools/thekernel.py test --suite guest --smp 4 --accel tcg
-./tools/thekernel.py test --suite abi --accel kvm --smp 4
-./tools/thekernel.py test --suite graphics \
-  --rootfs "$HOME/.cache/thekernel-targets/graphics/rootfs.ext2" \
-  --screenshot "$HOME/.cache/thekernel-targets/graphics/screen.ppm"
-./tools/thekernel.py test --suite cpu --accel kvm --smp 4
-./tools/thekernel.py test --suite all --accel kvm --smp 4 \
-  --rootfs "$HOME/.cache/thekernel-targets/graphics/rootfs.ext2" \
-  --screenshot "$HOME/.cache/thekernel-targets/graphics/screen.ppm"
-./tools/thekernel.py bench --suite scheduler
-./tools/thekernel.py bench --suite io
-```
-
-The guest gate requires complete KTAP output with no failures or skips and
-normal guest shutdown. CPU and accelerated graphics validation require KVM;
-native Intel graphics and bare-metal certification are deferred.
-
-`python3 -m unittest discover -s tests -t .` runs the host Python framework
-checks; its temporary files use the existing disk cache without requiring
-`TMPDIR`. These checks exercise rejection paths and do not establish guest ABI
-or performance results. The ABI declaration gate is likewise a static check;
-the ABI suite runs its registered contracts on both TheKernel and Linux 7.2.3.
-
-`--no-build` requires current guest test inputs and matching configuration,
-rootfs, kernel and ESP. It can deliberately reuse a previously built kernel
-after Rust source edits for baseline comparisons. A configuration or guest
-test change requires a rebuild. The comparison runners verify the actual
-kernel embedded in each ESP before boot; filesystem-sensitive differential
-fixtures also verify their filesystem provider inside the guest.
-
-For a focused guest failure, `tools/thekernel.py run --gdb` prints a Unix GDB
-socket and keeps guest shutdown/reboot/panic paused for inspection. Attach GDB
-with the matching unstripped Cargo binary. `run --rootfs-transport drive`
-uses the same drive boot topology as the graphics and ABI runners.
-
-The current bounded product claim is `q35-preview-v0`; it is not a claim of
-complete Linux ABI coverage, distribution/container compatibility, bare-metal
-support, or general performance superiority.
+Build artifacts are written below
+`${THEKERNEL_STATE_DIR:-~/.cache/thekernel-targets}`. On non-Debian hosts,
+building the rootfs outside the container needs a static C library (Fedora:
+`glibc-static`).
 
 ## Verification
 
 ```bash
 ./scripts/dev-shell.sh -- ./tools/thekernel.py verify --tier daily
 ./scripts/dev-shell.sh -- ./tools/thekernel.py verify --tier full
-# On a provisioned KVM host:
-./tools/thekernel.py verify --tier hardware
+./tools/thekernel.py verify --tier hardware    # on a KVM host
 ```
 
-`daily` checks the environment, changed-line whitespace, dependency boundaries,
-graphics configuration, host tests, the product build and Clippy, then runs the
-existing system guest suite under TCG with a five-minute guest limit. The
-build, lint and system guest share a 512 MiB configuration to keep the real
-memory-pressure/reclaim workload within the TCG time budget. It does
-not build a desktop rootfs. Clippy rejects correctness and suspicious findings;
-style and performance suggestions remain visible advisories, while compiler
-errors always fail. `full` adds the pinned Buildroot seatd image and
-Pixman pixel smoke. Pull requests and main pushes run daily; scheduled runs use
-full, and manual runs choose a tier. Stages print their name, result and failure
-category. A timed-out stage terminates its process group; Linux child-subreaper
-supervision also reaps descendants that created independent sessions.
+| Tier | Contents | Runs on |
+|---|---|---|
+| `daily` | Static gates (dependency layers, module edges, ABI declarations and contracts, log surface), host tests, build, Clippy, the guest suite under TCG, framebuffer console | Pull requests and pushes to `main` |
+| `full` | `daily` plus the pinned Buildroot graphics image and a Pixman rendering check | Nightly, when `main` has new commits |
+| `hardware` | CPU correctness suite and the complete Linux ABI differential under KVM | Nightly and on demand, on a self-hosted KVM runner |
 
-`hardware` runs the CPU KVM correctness suite and the complete two-guest Linux
-ABI differential. It ignores `THEKERNEL_ABI_PROGRAMS` so a reproduction filter
-cannot silently narrow this gate; direct `test --suite abi` still accepts that
-filter and labels its summary `PARTIAL`. Manual CI
-first checks for an online idle runner labelled `self-hosted`, `linux`, `x64`,
-and `thekernel-kvm`. Missing runners or inaccessible inventory fail explicitly
-as **NOT RUN**, and no hardware job is queued. Runner inventory may require the
-optional `THEKERNEL_RUNNER_READ_TOKEN` secret with repository Administration:read;
-ordinary hosted verification does not need it. Availability is a point-in-time
-check, not host capability attestation: the hardware job checks its tools and
-KVM access after scheduling. A runner going offline afterward can still leave
-the job queued; GitHub does not offer an atomic reserve-and-dispatch operation.
-
-Performance comparisons and accelerated graphics remain explicit specialized
-suite commands, outside these default gates. Linux ABI differential tests are
-also available directly, but now run in the KVM hardware tier as well. Build
-artifacts stay in the persistent container home under `.cache/thekernel-targets`.
-The development shell rejects host `THEKERNEL_STATE_DIR` overrides because host
-absolute paths are not automatically mounted there; unset the override before
-using it. Direct host commands still accept that variable. Development containers
-have an 8 GiB memory limit with no additional swap allowance.
+The guest suite must produce complete KTAP output with no failures or skips
+and shut down cleanly. The ABI suite runs every registered contract on both
+TheKernel and Linux 7.2.3 and compares the results; setting
+`THEKERNEL_ABI_PROGRAMS` narrows a direct run, which is then reported as
+`PARTIAL`. Benchmarks are described in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Repository layout
 
-- `kernel/`: Linux-compatible kernel and syscall integration.
-- `crates/ax/`: mechanism and platform crates.
-- `crates/linux/`: reusable Linux ABI crates.
-- Other `crates/` directories: maintained adapters and reusable components.
-- `config/`: x86_64 product configuration and GRUB configuration.
-- `tools/thekernel.py`: product build, boot, system-test, and lint entry point.
-- `tools/qemu_runner/`: x86_64 QEMU runner implementation.
-- `tests/guest/`: system suite and semantic smoke command streams.
+| Path | Contents |
+|---|---|
+| `kernel/` | Linux-compatible kernel and syscall integration |
+| `crates/ax/` | Mechanism and platform crates (scheduler, memory, drivers, HAL, …) |
+| `crates/linux/` | Reusable Linux ABI crates (signals, futex, io_uring, VFS, BPF, …) |
+| `crates/*-adapter/` | Adapters between the layers |
+| `config/` | Platform profiles, kernel configuration, ABI declarations |
+| `tools/` | `thekernel.py`, the QEMU runner and helper tools |
+| `scripts/` | Container, toolchain, rootfs and CI scripts |
+| `tests/` | Host tests and the guest system suite |
+| `docs/` | Debugging, licensing, provenance and design records |
 
-Each workspace package declares `package.metadata.thekernel.layer`. CI checks
-all declared local dependency edges, including optional and test dependencies:
-`mechanism` uses mechanisms; `platform` uses platform and mechanism crates;
-`linux_abi` uses Linux ABI and mechanism crates; `integration` may use all layers.
-Standalone algorithms, ABI types, and driver interfaces remain mechanisms;
-hardware access and the AX runtime belong to the platform layer.
+Every workspace package declares its layer in
+`package.metadata.thekernel.layer`, and CI enforces the allowed edges:
+`mechanism` crates use only mechanisms, `platform` adds platform crates,
+`linux_abi` adds Linux ABI crates, and `integration` (the kernel) may use all
+of them. Keep Linux objects and product policy out of lower layers.
+`scripts/ci/check_kernel_module_edges.py` tracks coupling between modules
+inside the kernel crate; see
+[docs/design/kernel-module-coupling.md](docs/design/kernel-module-coupling.md).
 
-## Workspace compiler and packages
-
-All components inherit the root `rust-toolchain.toml`: `nightly-2026-08-23`,
-which provides `rustc 1.100.0-nightly (c54751567 2026-08-22)`.
-The inherited `rust-version = "1.100"` is Cargo's numeric compiler floor,
-not a claim that these nightly-dependent components support stable Rust.
-Do not add component-local toolchain overrides or separate MSRV matrices.
-
-Component package names use `tk-` (for example `tk-axcbpf` and
-`tk-linux-vfs`); the top-level product remains `thekernel`. Existing short
-library names such as `axcbpf` are intentional, not legacy package aliases.
-The `tk-*` series starts at `0.1.0`, independently of upstream version numbers;
-future component versions follow their own API changes. The top-level product
-keeps its separate version. Internal packages inherit `publish = false`: a
-crate boundary does not imply a separately released public product.
-Release-ready components explicitly permit only crates.io after package and
-independent-consumer validation. Other packages retain the private default;
-publication follows dependency order rather than the workspace directory order.
-The `thekernel` image and `tk-kernel` integration remain internal: their boot,
-linking and integration-test setup is supplied by this repository, not by a
-standalone library consumer. Platform libraries target x86_64 bare metal and
-require the final image to supply their documented platform interfaces.
-Repository metadata points here; upstream licenses and attribution remain intact.
-
-Keep integration in `kernel/` and adapters, rather than making lower layers
-aware of Linux objects or product runtime policy. Large integration test modules
-live in sibling test files; splitting source files alone does not justify a new
-crate. Use the dependency-layer CI gate when changing edges between packages,
-and `scripts/ci/check_kernel_module_edges.py` (baseline
-`config/kernel-module-edges.toml`) when changing `use crate::…` edges between
-modules inside the kernel crate; `docs/design/kernel-module-coupling.md`
-explains what each measures.
+Component crates are named `tk-*` and are not published.
 
 ## License
 
-TheKernel's own Rust sources are distributed under Apache-2.0; see
-[LICENSE](LICENSE) and [NOTICE](NOTICE). Third-party and vendored directories
-retain their upstream license terms and authorship notices. That is not the
-whole answer for a distributed binary: the default feature set links vendored
-GPL-2.0-or-later C, and the excerpts of Linux comments in `crates/linux` are
-GPL-2.0-only citation. [docs/licensing.md](docs/licensing.md) states what a
-redistributor must ship, and
-[docs/upstream-provenance.md](docs/upstream-provenance.md) indexes every
-upstream claim this repository makes and how it was measured.
+TheKernel's own sources are Apache-2.0 ([LICENSE](LICENSE), [NOTICE](NOTICE)).
+Vendored and third-party code keeps its upstream license. A distributed
+binary built with the default features also links GPL-2.0-or-later C code;
+[docs/licensing.md](docs/licensing.md) explains what a redistributor must
+ship, and [docs/upstream-provenance.md](docs/upstream-provenance.md) indexes
+the upstream sources this repository draws on.
