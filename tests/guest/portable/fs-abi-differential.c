@@ -1008,7 +1008,7 @@ int main(void) {
              * probe, and a skip here once hid a real regression in namespace
              * creation behind an assertion that never ran.  `check()` exits, so
              * the case never reaches its THEKERNEL_ABI_RESULT line either. */
-            mark("DETACH_NAMESPACE_ROOT_SKIPPED");
+            fprintf(stderr, "DETACH_NAMESPACE_ROOT_SKIPPED: mount namespace unavailable\n");
             check(0, "detach-namespace-isolated");
         } else {
             check(detach_answer == 0, "detach-root");
@@ -1295,6 +1295,7 @@ int main(void) {
             check(pread(cfd, probe, sizeof(probe), 0) == (long)sizeof(probe) &&
                   probe[7] == 'a' && probe[8] == 'y' && probe[11] == 'y' &&
                   probe[12] == 'a', "minus-one-content");
+            mark("CURRENT_POSITION_FROM_MINUS_ONE");
             close(cfd);
             unlinkat(dirfd, "pwritev2-cur", 0);
         }

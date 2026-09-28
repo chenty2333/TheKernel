@@ -207,7 +207,7 @@ static void lifecycle_enable_loopback(void) {
     struct ifreq ifr = {0};
     strcpy(ifr.ifr_name, "lo");
     check("TCP_LIFECYCLE_LO_QUERY_DOWN", ioctl(query, SIOCGIFFLAGS, &ifr) == 0);
-    mark("TCP_LIFECYCLE_LO_IS_DOWN", !(ifr.ifr_flags & IFF_UP));
+    check("TCP_LIFECYCLE_LO_IS_DOWN", !(ifr.ifr_flags & IFF_UP));
     check("TCP_LIFECYCLE_LO_INDEX", ioctl(query, SIOCGIFINDEX, &ifr) == 0);
     int index = ifr.ifr_ifindex;
     int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
@@ -230,14 +230,16 @@ static void lifecycle_enable_loopback(void) {
           && ((struct nlmsgerr *)NLMSG_DATA(header))->error == 0);
     close(fd);
     check("TCP_LIFECYCLE_LO_QUERY_UP", ioctl(query, SIOCGIFFLAGS, &ifr) == 0);
-    mark("TCP_LIFECYCLE_LO_IS_UP", (ifr.ifr_flags & IFF_UP) != 0);
+    check("TCP_LIFECYCLE_LO_IS_UP", (ifr.ifr_flags & IFF_UP) != 0);
     close(query);
 }
 
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--close-lifecycle")) {
         alarm(100);
-        begin("network_tcp_close.kernel-lifecycle");
+        /* These bounds exercise TheKernel's service timers, not Linux's TCP
+         * timeout policy. Keep this explicit mode outside the ABI protocol. */
+        active = "network_tcp_close.kernel-lifecycle";
         check("TCP_LIFECYCLE_NETNS", unshare(CLONE_NEWNET) == 0);
         // Let the namespace worker observe administratively down lo. Bringing
         // it up must resume service rather than inherit a terminal RX state.
@@ -245,10 +247,10 @@ int main(int argc, char **argv) {
         check("TCP_LIFECYCLE_LO_ADDRESS", system("/sbin/ip address add 127.0.0.1/8 dev lo") == 0);
         lifecycle_enable_loopback();
         tcp_close_queued(AF_INET, 1);
-        mark("LAST_FD_TIMER_RECLAIM", 1);
+        puts("THEKERNEL_TCP_CLOSE_LAST_FD_TIMER_RECLAIM_OK");
         tcp_close_queued(AF_INET, 2);
-        mark("ZERO_WINDOW_TIMEOUT_RECLAIM", 1);
-        done();
+        puts("THEKERNEL_TCP_CLOSE_ZERO_WINDOW_TIMEOUT_RECLAIM_OK");
+        puts("THEKERNEL_TCP_CLOSE_LIFECYCLE_OK");
         return 0;
     }
     alarm(30);
