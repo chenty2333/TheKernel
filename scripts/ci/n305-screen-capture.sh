@@ -11,9 +11,11 @@
 #       person now, a checker later) needs frames from before the completion
 #       banner to after it.
 #
-#   n305-screen-capture.sh preview [--device DEVICE]
+#   n305-screen-capture.sh preview [--device DEVICE] [--snapshot FILE]
 #       Open a live ffplay window for the capture dongle.  This is useful while
-#       a person is waiting to press the DUT's power button.
+#       a person is waiting to press the DUT's power button.  The dongle can be
+#       opened only once, so --snapshot also rewrites FILE as a JPEG once a
+#       second from the same stream, for an agent watching alongside.
 #
 #   n305-screen-capture.sh verdict --dir DIR --completion-frame N --checker NAME
 #       Write the verdict.txt the DUT gate requires, from the frames actually
@@ -65,7 +67,7 @@ die() {
 }
 
 usage() {
-	sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 	exit "${1:-0}"
 }
 
@@ -116,10 +118,15 @@ capture)
 	;;
 preview)
 	device=$(default_device) || device=/dev/video0
+	snapshot=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--device)
 			device="$2"
+			shift 2
+			;;
+		--snapshot)
+			snapshot="$2"
 			shift 2
 			;;
 		*) die "unknown argument: $1" ;;
@@ -131,8 +138,20 @@ preview)
 	while IFS= read -r arg; do
 		input_args+=("$arg")
 	done < <(capture_device_args "$device")
-	exec ffplay -hide_banner -loglevel warning "${input_args[@]}" \
-		-window_title 'N305 HDMI capture' "$device"
+	if [ -z "$snapshot" ]; then
+		exec ffplay -hide_banner -loglevel warning "${input_args[@]}" \
+			-window_title 'N305 HDMI capture' "$device"
+	fi
+	command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required for --snapshot"
+	mkdir -p "$(dirname "$snapshot")"
+	# One reader fans out: the raw MJPEG stream goes to the window and a
+	# 1 fps re-encode replaces the snapshot atomically, so a reader never sees
+	# a half-written file.
+	ffmpeg -hide_banner -loglevel error "${input_args[@]}" -i "$device" \
+		-map 0:v -c copy -f mjpeg pipe:1 \
+		-map 0:v -vf fps=1 -q:v 3 -update 1 -atomic_writing 1 -y "$snapshot" |
+		ffplay -hide_banner -loglevel error -fflags nobuffer -f mjpeg \
+			-window_title 'N305 HDMI capture' -i pipe:0
 	;;
 verdict)
 	dir=""
