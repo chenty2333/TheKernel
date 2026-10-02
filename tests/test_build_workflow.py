@@ -55,6 +55,13 @@ class BuildWorkflowTests(unittest.TestCase):
         self.assertNotRegex(cleanup, r"docker\s+(stop|rm)\s+\$\(")
         self.assertNotRegex(cleanup, r"systemctl\s+.*\s+stop\s+\*")
 
+    def test_n305_capture_prefers_the_hdmi_dongle_and_has_preview(self) -> None:
+        capture = (ROOT / "scripts/ci/n305-screen-capture.sh").read_text(encoding="utf-8")
+        self.assertIn("/dev/v4l/by-id/*eEver*video-index0", capture)
+        self.assertIn("preview)", capture)
+        self.assertIn("-input_format", capture)
+        self.assertIn("mjpeg", capture)
+
 
 if __name__ == "__main__":
     unittest.main()
