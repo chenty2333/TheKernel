@@ -290,46 +290,35 @@ pub fn ipi_pending() -> bool {
     }
 }
 
-/// This CPU's APIC error status, masked to the bits that mean something.
-#[cfg(feature = "smp")]
-pub fn error_status() -> u32 {
-    let raw = if IS_X2APIC.load(Ordering::Acquire) {
-        // SAFETY: IA32_X2APIC_ESR is readable while the xAPIC is enabled.
-        unsafe { x86::msr::rdmsr(X2APIC_ESR_MSR) as u32 }
-    } else {
-        let base = phys_to_virt(lapic_mmio_base());
-        // SAFETY: The initialized local-APIC register window is mapped by
-        // platform setup, and reading ESR changes no controller state.
-        unsafe { core::ptr::read_volatile((base.as_usize() + XAPIC_ESR_OFFSET) as *const u32) }
-    };
-    raw & ESR_ERROR_FLAGS
-}
-
-/// Clears this CPU's APIC error status so a later read reports only what the
-/// next message did.
+/// Returns the APIC errors this CPU logged since the previous call, masked to
+/// the bits that mean something, and starts a fresh interval.
 ///
-/// Linux does exactly this before waking an AP ("Be paranoid about clearing
-/// APIC errors", arch/x86/kernel/smpboot.c:1053-1057).  Its guard for the
-/// write is `maxlvt > 3`, which works around the Pentium erratum 3AP; every
-/// LVT-bearing APIC modern enough to be a boot target for this kernel
-/// including the N305 satisfies it.
+/// The readable ESR is a snapshot, not a live view: a write to it is what moves
+/// the errors logged since the last write into the readable register and
+/// clears the internal log (Intel SDM Vol. 3A, 11.5.3 "Error Handling").  A
+/// read without the write therefore reports whatever the *previous* write
+/// latched.  Linux writes before every read for that reason, both before an
+/// AP is woken and after it (arch/x86/kernel/smpboot.c:1053-1057 and
+/// :933-936); in x2APIC mode zero is the only value that may be written.
 #[cfg(feature = "smp")]
-pub fn clear_error_status() {
-    if IS_X2APIC.load(Ordering::Acquire) {
-        // SAFETY: IA32_X2APIC_ESR is writable while the xAPIC is enabled.
-        unsafe { wrmsr(X2APIC_ESR_MSR, 0) };
+pub fn take_error_status() -> u32 {
+    let raw = if IS_X2APIC.load(Ordering::Acquire) {
+        // SAFETY: IA32_X2APIC_ESR is writable and readable while the x2APIC is
+        // enabled, and zero is the architecturally required write value.
+        unsafe {
+            wrmsr(X2APIC_ESR_MSR, 0);
+            x86::msr::rdmsr(X2APIC_ESR_MSR) as u32
+        }
     } else {
-        let base = phys_to_virt(lapic_mmio_base());
+        let esr = (phys_to_virt(lapic_mmio_base()).as_usize() + XAPIC_ESR_OFFSET) as *mut u32;
         // SAFETY: The initialized local-APIC register window is mapped by
         // platform setup.
         unsafe {
-            core::ptr::write_volatile((base.as_usize() + XAPIC_ESR_OFFSET) as *mut u32, 0);
+            core::ptr::write_volatile(esr, 0);
+            core::ptr::read_volatile(esr)
         }
-    }
-    // Write-then-read is Linux's own sequence here
-    // (arch/x86/kernel/smpboot.c:1053-1057); this read's value is not a status
-    // we act on.
-    let _ = error_status();
+    };
+    raw & ESR_ERROR_FLAGS
 }
 
 #[cfg(any(feature = "smp", feature = "irq"))]

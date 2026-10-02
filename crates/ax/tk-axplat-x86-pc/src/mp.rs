@@ -75,7 +75,11 @@ pub fn start_secondary_cpu(logical_cpu_id: usize, stack_top: PhysAddr) {
 
     // INIT-SIPI-SIPI Sequence
     // Ref: Intel SDM Vol 3C, Section 8.4.4, MP Initialization Example
-    super::apic::clear_error_status();
+    // Errors logged before this point -- by firmware, or by anything else
+    // that reached this CPU's APIC since it was enabled -- are not this AP's,
+    // so discard them; the read below then reports only what INIT-SIPI-SIPI
+    // itself caused.
+    let _ = super::apic::take_error_status();
     unsafe { lapic.send_init_ipi(apic_destination) };
     wait_for_icr_consumed("INIT", logical_cpu_id, apic_id);
     busy_wait(Duration::from_millis(10)); // 10ms
@@ -85,7 +89,7 @@ pub fn start_secondary_cpu(logical_cpu_id: usize, stack_top: PhysAddr) {
     unsafe { lapic.send_sipi(START_PAGE_IDX, apic_destination) };
     wait_for_icr_consumed("second STARTUP", logical_cpu_id, apic_id);
 
-    let status = super::apic::error_status();
+    let status = super::apic::take_error_status();
     if status != 0 {
         error!("CPU {logical_cpu_id} (APIC {apic_id:#x}): local APIC error status {status:#x} on startup");
     }
