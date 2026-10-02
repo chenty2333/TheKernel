@@ -12,8 +12,96 @@ struct KernelEntropySource;
 impl EntropySource for KernelEntropySource {
     type Error = ();
 
+    /// A VirtIO entropy device is preferred when present; otherwise the CPU's
+    /// own generator seeds the pool.  Bare metal has no VirtIO device, and
+    /// without the CPU fallback the secure pool never seeds, so every
+    /// consumer -- execve's AT_RANDOM first among them -- fails with EAGAIN.
     fn fill_entropy(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
-        axdriver::fill_entropy(destination).map_err(|_| ())
+        if axdriver::entropy_source_ready() {
+            return axdriver::fill_entropy(destination).map_err(|_| ());
+        }
+        cpu_entropy::fill(destination)
+    }
+}
+
+/// RDSEED/RDRAND as a seed source, which is what Linux does by default
+/// (`random.trust_cpu=on`) on CPUs that implement them.
+mod cpu_entropy {
+    use core::{
+        arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdseed64_step},
+        sync::atomic::{AtomicU8, Ordering},
+    };
+
+    const UNPROBED: u8 = 0xff;
+    const RDRAND: u8 = 1 << 0;
+    const RDSEED: u8 = 1 << 1;
+    /// Intel's DRNG guide bounds RDRAND retries at 10; RDSEED can transiently
+    /// underflow under load, so it gets more attempts before RDRAND takes over.
+    const RDRAND_RETRIES: usize = 10;
+    const RDSEED_RETRIES: usize = 100;
+
+    static FEATURES: AtomicU8 = AtomicU8::new(UNPROBED);
+
+    fn features() -> u8 {
+        let cached = FEATURES.load(Ordering::Relaxed);
+        if cached != UNPROBED {
+            return cached;
+        }
+        let mut found = 0;
+        if __cpuid(1).ecx & (1 << 30) != 0 {
+            found |= RDRAND;
+        }
+        if __cpuid(0).eax >= 7 && __cpuid_count(7, 0).ebx & (1 << 18) != 0 {
+            found |= RDSEED;
+        }
+        FEATURES.store(found, Ordering::Relaxed);
+        found
+    }
+
+    pub(super) fn available() -> bool {
+        features() != 0
+    }
+
+    pub(super) fn fill(destination: &mut [u8]) -> Result<(), ()> {
+        let features = features();
+        for chunk in destination.chunks_mut(8) {
+            let word = next_word(features).ok_or(())?;
+            chunk.copy_from_slice(&word.to_ne_bytes()[..chunk.len()]);
+        }
+        Ok(())
+    }
+
+    fn next_word(features: u8) -> Option<u64> {
+        if features & RDSEED != 0 {
+            for _ in 0..RDSEED_RETRIES {
+                let mut word = 0;
+                // SAFETY: CPUID reported RDSEED.
+                if unsafe { rdseed(&mut word) } == 1 {
+                    return Some(word);
+                }
+                core::hint::spin_loop();
+            }
+        }
+        if features & RDRAND != 0 {
+            for _ in 0..RDRAND_RETRIES {
+                let mut word = 0;
+                // SAFETY: CPUID reported RDRAND.
+                if unsafe { rdrand(&mut word) } == 1 {
+                    return Some(word);
+                }
+            }
+        }
+        None
+    }
+
+    #[target_feature(enable = "rdseed")]
+    fn rdseed(word: &mut u64) -> i32 {
+        _rdseed64_step(word)
+    }
+
+    #[target_feature(enable = "rdrand")]
+    fn rdrand(word: &mut u64) -> i32 {
+        _rdrand64_step(word)
     }
 }
 
@@ -37,7 +125,9 @@ pub fn fill_secure(buf: &mut [u8]) -> AxResult<()> {
 /// `ReseedingDrbg::fill_bytes` neither reseeds nor reports failure, so it must
 /// never be used as the probe.
 pub fn is_ready() -> bool {
-    axdriver::entropy_source_ready() || SECURE_RANDOM.lock().is_seeded()
+    axdriver::entropy_source_ready()
+        || cpu_entropy::available()
+        || SECURE_RANDOM.lock().is_seeded()
 }
 
 /// Linux's `wait_for_random_bytes()`: block until the secure pool is ready.
