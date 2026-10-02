@@ -22,28 +22,30 @@ compatibility, or general performance parity with Linux.
 
 ## Quick start
 
-Everything builds inside the checked-in development container
-(`dev-env/Dockerfile`), which CI uses as well:
+All local build, test, and QEMU commands use the checked-in development
+container (`dev-env/Dockerfile`), the same image that CI uses. The container is
+started for one command with `--rm`; it is not a background service, does not
+use host networking, and never owns a physical host NIC.
 
 ```bash
 git clone https://github.com/chenty2333/TheKernel.git
 cd TheKernel
-./scripts/dev-shell.sh -- scripts/setup-toolchain.sh   # first time only
-./scripts/dev-shell.sh -- bash                         # enter the shell
+make bootstrap                 # first time only: install the pinned helper
+make run                       # interactive shell (KVM when /dev/kvm is available)
 ```
 
-The image is built on first use; pass `--build` to rebuild it after changing
-the Dockerfile. With rootless Podman behind `DOCKER_HOST`, also set
-`THEKERNEL_ROOTLESS_PODMAN=1`. The Rust toolchain is pinned by
-`rust-toolchain.toml`.
+The image is built on first use. Pass `./scripts/dev-shell.sh --build -- bash`
+to rebuild it after changing the Dockerfile. With rootless Podman behind
+`DOCKER_HOST`, set `THEKERNEL_ROOTLESS_PODMAN=1`. The Rust toolchain is pinned
+by `rust-toolchain.toml` and is kept in the named `thekernel-home` volume.
 
-Then boot something:
+Other common commands:
 
 ```bash
-make run                          # interactive shell (KVM, 4 CPUs, 1 GiB)
-make run RUN_ARGS="--toolchain gcc"   # shell image with a C compiler
-make run-gui RUN_ARGS=--build     # build and open the Weston desktop
-make run-gui                      # reopen the desktop without rebuilding
+make run RUN_ARGS="--toolchain gcc" # shell image with a C compiler
+make run-gui RUN_ARGS=--build        # build and open the Weston desktop
+make run-gui                         # reopen the desktop without rebuilding
+./scripts/dev-shell.sh -- bash       # optional interactive container shell
 ```
 
 The first desktop build compiles Buildroot and WebKit and takes a while.
@@ -56,7 +58,10 @@ desktop build dependencies and options.
 ## Commands
 
 `tools/thekernel.py` is the single build, boot and test entry point; the
-Makefile wraps it with resource limits for everyday use.
+Makefile wraps it with the development container and resource limits for
+everyday use. The lower-level `scripts/build-*.sh` files are deterministic
+artifact builders called by `tools/thekernel.py`; they are not alternate user
+entry points.
 
 | Command | Purpose |
 |---|---|
@@ -68,6 +73,13 @@ Makefile wraps it with resource limits for everyday use.
 | `thekernel.py lint` | Clippy for the product kernel configuration |
 | `thekernel.py verify --tier …` | `daily`, `full`, `hardware` (see below) |
 | `thekernel.py clean` | Remove generated run, output and cache directories |
+
+For the usual workflow prefer the equivalent `make` targets (`build`, `lint`,
+`test`, `bench`, `verify`, `run`, `run-gui`, and `clean`). `make docker-clean` removes
+the development image and its toolchain volume; it does not touch other Docker
+projects. `make host-cleanup` only audits/removes the historical exact names
+`thekernel-boot`/`thekernel-netboot` and their matching systemd units, if an old
+installation left them behind.
 
 Useful `run` options: `--gdb` exposes a GDB socket and pauses on
 shutdown/panic; `--input-backend usb` and `--usb-disk IMAGE` switch input to
@@ -110,9 +122,12 @@ TheKernel and Linux 7.2.3 and compares the results; setting
 | `crates/*-adapter/` | Adapters between the layers |
 | `config/` | Platform profiles, kernel configuration, ABI declarations |
 | `tools/` | `thekernel.py`, the QEMU runner and helper tools |
-| `scripts/` | Container, toolchain, rootfs and CI scripts |
+| `scripts/` | Container entry points, deterministic artifact builders and CI scripts |
 | `tests/` | Host tests and the guest system suite |
 | `docs/` | Debugging, licensing, provenance and design records |
+
+The build/container contract is summarized in
+[docs/build-workflow.md](docs/build-workflow.md).
 
 Every workspace package declares its layer in
 `package.metadata.thekernel.layer`, and CI enforces the allowed edges:

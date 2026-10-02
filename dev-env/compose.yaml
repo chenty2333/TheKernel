@@ -1,6 +1,9 @@
 name: thekernel-dev
 
 x-common-env: &common-env
+  # Compose is only a short-lived execution boundary.  It must never become
+  # a boot or network daemon on the host.
+  THEKERNEL_DEV_CONTAINER: "1"
   HOME: /home/thekernel
   PYTHONDONTWRITEBYTECODE: "1"
   CARGO_BUILD_JOBS: "${CARGO_BUILD_JOBS:-2}"
@@ -30,32 +33,15 @@ services:
         DEBIAN_MIRROR: "${THEKERNEL_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
         DEBIAN_SECURITY_MIRROR: "${THEKERNEL_DEBIAN_SECURITY_MIRROR:-http://deb.debian.org/debian-security}"
     userns_mode: "${THEKERNEL_USERNS_MODE:-}"
-    mem_limit: 8g
-    memswap_limit: 8g
+    mem_limit: "${THEKERNEL_DEV_MEMORY:-8g}"
+    memswap_limit: "${THEKERNEL_DEV_MEMORY:-8g}"
     working_dir: /workspace
     stdin_open: true
     tty: true
     init: true
-    environment: *common-env
-    volumes: *common-volumes
-
-  builder:
-    image: ${THEKERNEL_DEV_IMAGE:-thekernel-dev:local}
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        DEBIAN_MIRROR: "${THEKERNEL_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
-        DEBIAN_SECURITY_MIRROR: "${THEKERNEL_DEBIAN_SECURITY_MIRROR:-http://deb.debian.org/debian-security}"
-    userns_mode: "${THEKERNEL_USERNS_MODE:-}"
-    mem_limit: 8g
-    memswap_limit: 8g
-    working_dir: /workspace
-    privileged: true
-    stdin_open: true
-    tty: true
-    init: true
-    profiles: ["builder"]
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
     environment: *common-env
     volumes: *common-volumes
 
