@@ -81,6 +81,7 @@ pub(crate) mod debugfs;
 pub(crate) mod fb;
 mod firmware_snapshot;
 mod gmbus;
+mod gt_probe;
 pub(crate) mod gtt;
 mod hpd;
 mod id;
@@ -209,6 +210,7 @@ static HOTPLUG: Mutex<Option<HotplugWatch>> = Mutex::new(None);
 /// boot log scrolls away.  A run that did not happen, and a run that failed,
 /// both leave their reason here rather than leaving the file silent about it.
 static MODESET: Mutex<Option<String>> = Mutex::new(None);
+static GT_REPORT: Mutex<Vec<(pci::Bdf, String)>> = Mutex::new(Vec::new());
 static FIRMWARE_STATE: Mutex<Vec<(pci::Bdf, firmware_snapshot::Snapshot)>> = Mutex::new(Vec::new());
 
 /// What the graphics address space turned out to be, as text.
@@ -252,6 +254,15 @@ pub(crate) fn probe_at_boot() {
     let report = platform_probe();
     report.log();
     *REPORT.lock() = Some(report);
+    let observations: Vec<_> = mapped_windows()
+        .into_iter()
+        .map(|(bdf, window)| {
+            let text = gt_probe::report(window);
+            axlog::info!("{bdf}: {text}");
+            (bdf, text)
+        })
+        .collect();
+    *GT_REPORT.lock() = observations;
 }
 
 /// Run the rest of the bring-up order against the device the probe found.
@@ -988,6 +999,9 @@ pub(crate) fn report_text() -> String {
         ),
     };
     // The locks are taken one at a time: nothing holds two at once.
+    for (bdf, report) in GT_REPORT.lock().iter() {
+        text.push_str(&alloc::format!("{bdf}: {report}"));
+    }
     for (bdf, state) in FIRMWARE_STATE.lock().iter() {
         text.push_str(&alloc::format!("intel-firmware: {bdf}\n"));
         text.push_str(&state.render());
