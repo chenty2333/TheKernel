@@ -46,7 +46,8 @@ impl From<Arc<SpinNoIrq<FrameRefCnt>>> for CowFrameOwner {
 impl CowFrameOwner {
     fn retain(self, paddr: PhysAddr, size: PageSize) -> AxResult<Self> {
         // Serialize with migration of the original exact-frame reference.
-        let _registry = FRAME_TABLE.lock();
+        let mut registry_guard = FRAME_TABLE.lock();
+        let _ = registry_guard.get_or_insert_with(FrameTableRefCount::new);
         if let Some(backing) = demoted_huge_backing(paddr) {
             if !backing.contains_extent(paddr, size) {
                 return Err(AxError::BadState);
@@ -65,7 +66,8 @@ impl CowFrameOwner {
     }
 
     fn retire(&self, paddr: PhysAddr, size: PageSize) {
-        let mut registry = FRAME_TABLE.lock();
+        let mut registry_guard = FRAME_TABLE.lock();
+        let registry = registry_guard.get_or_insert_with(FrameTableRefCount::new);
         // An ordinary journal can predate migration by another mm. Ownership
         // follows the allocation's current registry, never its old geometry.
         let backing = match self {
@@ -75,7 +77,7 @@ impl CowFrameOwner {
         if let Some(backing) = backing {
             assert!(backing.contains_extent(paddr, size));
             let allocation = backing.retire(size);
-            drop(registry);
+            drop(registry_guard);
             if let Some((base, size)) = allocation {
                 dealloc_frame(base, size);
             }
@@ -90,14 +92,15 @@ impl CowFrameOwner {
         if count.references == 0 {
             registry.remove_frame(paddr, size);
             drop(count);
-            drop(registry);
+            drop(registry_guard);
             dealloc_frame(paddr, size);
         }
     }
 }
 
 fn retire_cow_frame(paddr: PhysAddr, size: PageSize) {
-    let mut registry = FRAME_TABLE.lock();
+    let mut registry_guard = FRAME_TABLE.lock();
+    let registry = registry_guard.get_or_insert_with(FrameTableRefCount::new);
     let allocation = if let Some(backing) = demoted_huge_backing(paddr) {
         assert!(backing.contains_extent(paddr, size));
         backing.retire(size)
@@ -114,7 +117,7 @@ fn retire_cow_frame(paddr: PhysAddr, size: PageSize) {
     } else {
         Some((paddr, size))
     };
-    drop(registry);
+    drop(registry_guard);
     if let Some((base, size)) = allocation {
         dealloc_frame(base, size);
     }
@@ -127,7 +130,7 @@ struct FrameTableRefCount {
 impl FrameTableRefCount {
     const INITIAL_CNT: u32 = 1;
 
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             table: HashMap::new(),
         }
@@ -170,12 +173,14 @@ impl FrameTableRefCount {
                 .contains_key(&(paddr.as_usize(), page_size as usize)),
             "removing unreferenced frame"
         );
-        self.table
-            .remove(&(paddr.as_usize(), page_size as usize));
+        self.table.remove(&(paddr.as_usize(), page_size as usize));
     }
 }
 
-static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRefCount::new());
+// HashMap's empty value is not const-initializable on every supported build
+// target. Keep first construction under the no-IRQ lock so it cannot recurse
+// from an interrupt and does not require a process-wide Once side lock.
+static FRAME_TABLE: SpinNoIrq<Option<FrameTableRefCount>> = SpinNoIrq::new(None);
 
 /// One original huge allocation which may simultaneously have unsplit huge
 /// PTEs (fork siblings) and demoted P1 children.  Both domains retain the
@@ -249,7 +254,8 @@ pub(crate) fn register_demoted_huge_backing(base: PhysAddr, size: PageSize) -> A
     if !matches!(size, PageSize::Size2M | PageSize::Size1G) {
         return Err(AxError::InvalidInput);
     }
-    let mut registry = FRAME_TABLE.lock();
+    let mut registry_guard = FRAME_TABLE.lock();
+    let registry = registry_guard.get_or_insert_with(FrameTableRefCount::new);
     if let Some(backing) = demoted_huge_backing(base) {
         return if base
             .sub_addr(backing.base)
@@ -276,7 +282,7 @@ pub(crate) fn register_demoted_huge_backing(base: PhysAddr, size: PageSize) -> A
     .map_err(|_| AxError::NoMemory)?;
     // Publication and migration share the same lock as fork retain/retire.
     DEMOTED_HUGE_BACKINGS.lock().insert(base, backing);
-    registry.table.remove(&(base, size as usize));
+    registry.table.remove(&(base.as_usize(), size as usize));
     Ok(())
 }
 
@@ -939,7 +945,8 @@ impl CowBackend {
         paddr: PhysAddr,
         page_size: PageSize,
     ) -> AxResult<CowFrameOwner> {
-        let mut registry = FRAME_TABLE.lock();
+        let mut registry_guard = FRAME_TABLE.lock();
+        let registry = registry_guard.get_or_insert_with(FrameTableRefCount::new);
         if let Some(backing) = demoted_huge_backing(paddr) {
             Ok(CowFrameOwner::Demoted(backing))
         } else {
@@ -1103,7 +1110,8 @@ impl CowBackend {
         if !self.is_4k_anonymous() {
             return false;
         }
-        let mut registry = FRAME_TABLE.lock();
+        let mut registry_guard = FRAME_TABLE.lock();
+        let registry = registry_guard.get_or_insert_with(FrameTableRefCount::new);
         if demoted_huge_backing(paddr).is_some() {
             return false;
         }
@@ -1305,7 +1313,8 @@ impl CowBackend {
         pt: &mut PageTableCursor,
     ) -> AxResult {
         let exclusive = {
-            let mut registry = FRAME_TABLE.lock();
+            let mut registry_guard = FRAME_TABLE.lock();
+            let registry = registry_guard.get_or_insert_with(FrameTableRefCount::new);
             // Exact-frame counts cannot prove exclusivity across geometries.
             demoted_huge_backing(paddr).is_none()
                 && registry
@@ -1856,12 +1865,8 @@ mod tests {
     fn frame_reference_table_reuses_the_fallibly_inserted_owner() {
         let mut table = FrameTableRefCount::new();
         let frame = PhysAddr::from(0x3000_0000);
-        let first = table
-            .get_or_init_frame(frame, PageSize::Size4K)
-            .unwrap();
-        let second = table
-            .get_or_init_frame(frame, PageSize::Size4K)
-            .unwrap();
+        let first = table.get_or_init_frame(frame, PageSize::Size4K).unwrap();
+        let second = table.get_or_init_frame(frame, PageSize::Size4K).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(table.table.len(), 1);
         assert_eq!(first.lock().references, FrameTableRefCount::INITIAL_CNT);
@@ -1887,12 +1892,15 @@ mod tests {
         register_demoted_huge_backing(base, PageSize::Size2M).unwrap();
         let backing = demoted_huge_backing(base).unwrap();
         assert_eq!(backing.mapped_units.load(Ordering::Acquire), 3 * 512);
+        let mut registry = FRAME_TABLE.lock();
         assert!(
-            FRAME_TABLE
-                .lock()
+            registry
+                .as_mut()
+                .unwrap()
                 .get_frame_ref(base, PageSize::Size2M)
                 .is_none()
         );
+        drop(registry);
         // These journals were acquired before migration; rollback/release
         // must follow the current allocation registry, not their stale Arc.
         first.retire(base, PageSize::Size2M);
