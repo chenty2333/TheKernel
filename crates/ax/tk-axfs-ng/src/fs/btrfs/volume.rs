@@ -419,7 +419,7 @@ impl BtrfsVolume {
     /// names the device: evacuation must first COW-relocate every block group
     /// and publish that new chunk tree.  Existing I/O retains the old
     /// `BlockVolume` map until the caller publishes this stage.
-    pub fn stage_member_change(
+    pub(super) fn stage_member_change(
         &self,
         change: BtrfsDeviceTopologyChange,
     ) -> AxResult<BtrfsTopologyStage> {
@@ -495,7 +495,7 @@ impl BtrfsVolume {
     /// committed the chunk tree and every affected superblock mirror.  This
     /// is intentionally `&mut self`, preventing a mount from exposing a new
     /// map while retaining an old in-memory chunk/devid relation.
-    pub fn publish_staged_topology(&mut self, stage: BtrfsTopologyStage) {
+    pub(super) fn publish_staged_topology(&mut self, stage: BtrfsTopologyStage) {
         self.volume.publish_member_map(stage.routing);
         self.chunks = stage.chunks;
         self.members = stage.members;
@@ -503,20 +503,23 @@ impl BtrfsVolume {
 
     // Device-topology API kept for the in-progress device add/remove path.
     #[allow(dead_code)]
-    pub fn stage_member_index(stage: &BtrfsTopologyStage, devid: u64) -> Option<usize> {
+    pub(super) fn stage_member_index(stage: &BtrfsTopologyStage, devid: u64) -> Option<usize> {
         stage.members.get(&devid).copied()
     }
 
     /// Final checked chunk map carried by an unpublished topology stage.
     /// Tree writers use it to build per-block-group free-space accounting
     /// before this routing/chunk map becomes visible.
-    pub fn staged_chunks(stage: &BtrfsTopologyStage) -> &[Chunk] {
+    pub(super) fn staged_chunks(stage: &BtrfsTopologyStage) -> &[Chunk] {
         &stage.chunks
     }
 
     // Device-topology API kept for the in-progress device add/remove path.
     #[allow(dead_code)]
-    pub fn staged_member_has_stripes(stage: &BtrfsTopologyStage, devid: u64) -> AxResult<bool> {
+    pub(super) fn staged_member_has_stripes(
+        stage: &BtrfsTopologyStage,
+        devid: u64,
+    ) -> AxResult<bool> {
         let index = Self::stage_member_index(stage, devid).ok_or(AxError::NoSuchDevice)?;
         Ok(stage
             .chunks
@@ -527,7 +530,10 @@ impl BtrfsVolume {
     /// Replaces the candidate logical chunk map after the caller rebuilt the
     /// CHUNK tree image.  This validates all stripe indices against the
     /// staged, not currently published, routing table.
-    pub fn stage_chunks(stage: &mut BtrfsTopologyStage, mut chunks: Vec<Chunk>) -> AxResult<()> {
+    pub(super) fn stage_chunks(
+        stage: &mut BtrfsTopologyStage,
+        mut chunks: Vec<Chunk>,
+    ) -> AxResult<()> {
         chunks.sort_by_key(|chunk| chunk.logical);
         let devices = BlockVolume::staged_devices(&stage.routing);
         let mut previous_end = 0;
@@ -548,7 +554,10 @@ impl BtrfsVolume {
     /// Verifies the bootstrap array against the *final* candidate chunk map.
     /// A topology commit must never publish an old system stripe which refers
     /// to a removed member merely because the normal chunk tree is correct.
-    pub fn validate_staged_system_chunks(stage: &BtrfsTopologyStage, bytes: &[u8]) -> AxResult<()> {
+    pub(super) fn validate_staged_system_chunks(
+        stage: &BtrfsTopologyStage,
+        bytes: &[u8],
+    ) -> AxResult<()> {
         if bytes.len() > super::BtrfsSuperblock::system_chunk_array_capacity() {
             return Err(AxError::InvalidInput);
         }
@@ -605,7 +614,7 @@ impl BtrfsVolume {
     /// unpublished candidate map.  Every member gets its own validated
     /// device-item image; a newly added blank member is initialized from the
     /// current superblock only after the replacement trees are durable.
-    pub fn publish_staged_topology_superblocks(
+    pub(super) fn publish_staged_topology_superblocks(
         &self,
         stage: &BtrfsTopologyStage,
         superblock: &BtrfsSuperblock,

@@ -5359,7 +5359,7 @@ impl BtrfsMount {
     /// publication failure returns every stripe to the physical allocator.
     // Balance/relocation writer API in progress.
     #[allow(dead_code)]
-    pub fn allocate_chunk(
+    pub(super) fn allocate_chunk(
         &mut self,
         physical: &super::BtrfsAllocator,
         logical: u64,
@@ -6200,7 +6200,7 @@ impl BtrfsMount {
     /// swapped only after that final durability point.
     // Balance/relocation writer API in progress.
     #[allow(dead_code)]
-    pub fn change_device(
+    pub(super) fn change_device(
         &mut self,
         change: BtrfsMountDeviceChange,
         system_chunk_array: &[u8],
@@ -6215,7 +6215,7 @@ impl BtrfsMount {
     /// tree generation that is checked against the staged routing map.
     // Balance/relocation writer API in progress.
     #[allow(dead_code)]
-    pub fn change_device_with_chunk_tree(
+    pub(super) fn change_device_with_chunk_tree(
         &mut self,
         change: BtrfsMountDeviceChange,
         mut items: Vec<RawTreeItem>,
@@ -8567,7 +8567,7 @@ impl BtrfsMount {
     /// generation; an interrupted operation leaves the prior topology root.
     // Balance/relocation writer API in progress.
     #[allow(dead_code)]
-    pub fn commit_topology_transaction(
+    pub(super) fn commit_topology_transaction(
         &mut self,
         transaction: super::BtrfsTransaction,
         allocator: &BtrfsLogicalAllocator,
