@@ -717,6 +717,15 @@ fn preflight_mprotect_geometry(
     Ok(Some((length, end)))
 }
 
+fn validate_shared_validate_flags(is_anonymous: bool, flags: usize) -> AxResult<()> {
+    if let Some(errno) = tk_linux_mm::map_shared_validate_errno(is_anonymous, flags, false) {
+        return Err(LinuxError::try_from(errno)
+            .map_err(|_| AxError::InvalidInput)?
+            .into());
+    }
+    Ok(())
+}
+
 fn validate_file_mmap_access(
     file: &axfs::File,
     backend: &FileBackend,
@@ -1018,14 +1027,7 @@ pub fn sys_mmap(
     // not model yet must still accept under `MAP_SHARED_VALIDATE`.  No file in
     // this kernel advertises `FOP_MMAP_SYNC`, so `MAP_SYNC` stays a stray bit.
     if (flags & MmapFlags::TYPE.bits()) == MmapFlags::SHARED_VALIDATE.bits() {
-        if let Some(errno) =
-            tk_linux_mm::map_shared_validate_errno(is_anonymous_mapping, flags as u32, false)
-        {
-            debug!("mmap MAP_SHARED_VALIDATE rejected: flags {flags:#x} -> errno {errno}");
-            return Err(LinuxError::try_from(errno)
-                .map_err(|_| AxError::InvalidInput)?
-                .into());
-        }
+        validate_shared_validate_flags(is_anonymous_mapping, flags)?;
     }
 
     debug!(
@@ -4665,6 +4667,13 @@ mod tests {
         let protection = MmapProt::from_bits(PROT_SEM as usize).unwrap();
         assert_eq!(MappingFlags::from(protection), MappingFlags::USER);
         assert!(preflight_mprotect_geometry(0x4000, 1, PROT_SEM as usize).is_ok());
+    }
+
+    #[test]
+    fn map_shared_validate_rejects_unknown_high_word_bits() {
+        let flags = MmapFlags::SHARED_VALIDATE.bits() | (1usize << 32);
+        assert!(validate_shared_validate_flags(false, flags).is_err());
+        assert!(validate_shared_validate_flags(false, MmapFlags::SHARED_VALIDATE.bits()).is_ok());
     }
 
     fn mmap_description(name: &str) -> Arc<FileDescription> {

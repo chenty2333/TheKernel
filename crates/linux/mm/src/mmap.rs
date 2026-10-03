@@ -37,7 +37,7 @@ pub const PAGE_SIZE: u64 = 4096;
 /// `MAP_ABOVE4G` is only nonzero on x86 (`arch/x86/include/uapi/asm/mman.h:6`
 /// defines it as `0x80`).  `MAP_EXECUTABLE` and `MAP_DENYWRITE` are named there
 /// even though the kernel ignores both.
-pub const LEGACY_MAP_MASK: u32 = MAP_SHARED
+pub const LEGACY_MAP_MASK: usize = MAP_SHARED
     | MAP_PRIVATE
     | MAP_FIXED
     | MAP_ANONYMOUS
@@ -56,24 +56,24 @@ pub const LEGACY_MAP_MASK: u32 = MAP_SHARED
     | MAP_HUGE_2MB
     | MAP_HUGE_1GB;
 
-const MAP_SHARED: u32 = 0x01;
-const MAP_PRIVATE: u32 = 0x02;
-const MAP_FIXED: u32 = 0x10;
-const MAP_ANONYMOUS: u32 = 0x20;
-const MAP_32BIT: u32 = 0x40;
-const MAP_ABOVE4G: u32 = 0x80;
-const MAP_GROWSDOWN: u32 = 0x0100;
-const MAP_DENYWRITE: u32 = 0x0800;
-const MAP_EXECUTABLE: u32 = 0x1000;
-const MAP_LOCKED: u32 = 0x2000;
-const MAP_NORESERVE: u32 = 0x4000;
-const MAP_POPULATE: u32 = 0x8000;
-const MAP_NONBLOCK: u32 = 0x1_0000;
-const MAP_STACK: u32 = 0x2_0000;
-const MAP_HUGETLB: u32 = 0x4_0000;
-const MAP_UNINITIALIZED: u32 = 0x400_0000;
-const MAP_HUGE_2MB: u32 = 21 << 26;
-const MAP_HUGE_1GB: u32 = 30 << 26;
+const MAP_SHARED: usize = 0x01;
+const MAP_PRIVATE: usize = 0x02;
+const MAP_FIXED: usize = 0x10;
+const MAP_ANONYMOUS: usize = 0x20;
+const MAP_32BIT: usize = 0x40;
+const MAP_ABOVE4G: usize = 0x80;
+const MAP_GROWSDOWN: usize = 0x0100;
+const MAP_DENYWRITE: usize = 0x0800;
+const MAP_EXECUTABLE: usize = 0x1000;
+const MAP_LOCKED: usize = 0x2000;
+const MAP_NORESERVE: usize = 0x4000;
+const MAP_POPULATE: usize = 0x8000;
+const MAP_NONBLOCK: usize = 0x1_0000;
+const MAP_STACK: usize = 0x2_0000;
+const MAP_HUGETLB: usize = 0x4_0000;
+const MAP_UNINITIALIZED: usize = 0x400_0000;
+const MAP_HUGE_2MB: usize = 21 << 26;
+const MAP_HUGE_1GB: usize = 30 << 26;
 
 /// `include/uapi/linux/mman.h:MAP_SYNC`, accepted by `MAP_SHARED_VALIDATE`
 /// only for a file whose `file_operations` advertise `FOP_MMAP_SYNC`.  Taken
@@ -129,14 +129,14 @@ const EOPNOTSUPP: i32 = 95;
 /// `is_anonymous` is that dispatch's input, not a hint.
 pub const fn map_shared_validate_errno(
     is_anonymous: bool,
-    flags: u32,
+    flags: usize,
     file_accepts_map_sync: bool,
 ) -> Option<i32> {
     if is_anonymous {
         return Some(EINVAL);
     }
     let mask = if file_accepts_map_sync {
-        LEGACY_MAP_MASK | MAP_SYNC
+        LEGACY_MAP_MASK | MAP_SYNC as usize
     } else {
         LEGACY_MAP_MASK
     };
@@ -221,7 +221,7 @@ mod tests {
         // `include/uapi/asm-generic/mman-common.h` and
         // `arch/x86/include/uapi/asm/mman.h` give them.
         for bit in [
-            0x01_u32,        // MAP_SHARED
+            0x01_usize,      // MAP_SHARED
             0x02,            // MAP_PRIVATE
             0x10,            // MAP_FIXED
             0x20,            // MAP_ANONYMOUS
@@ -243,7 +243,11 @@ mod tests {
             assert_eq!(LEGACY_MAP_MASK & bit, bit, "{bit:#x}");
         }
         // The three extended bits that are deliberately *not* legacy.
-        for bit in [0x8_0000_u32 /* MAP_SYNC */, 0x10_0000 /* MAP_FIXED_NOREPLACE */, 0x08 /* MAP_DROPPABLE */] {
+        for bit in [
+            0x8_0000_usize, // MAP_SYNC
+            0x10_0000,      // MAP_FIXED_NOREPLACE
+            0x08,           // MAP_DROPPABLE
+        ] {
             assert_eq!(LEGACY_MAP_MASK & bit, 0, "{bit:#x}");
         }
     }
@@ -282,16 +286,20 @@ mod tests {
         assert_eq!(map_shared_validate_errno(false, 0x03 | 0x08, false), Some(95));
         // `MAP_SYNC` needs `FOP_MMAP_SYNC` on the file behind the mapping.
         assert_eq!(
-            map_shared_validate_errno(false, 0x03 | MAP_SYNC, false),
+            map_shared_validate_errno(false, 0x03 | MAP_SYNC as usize, false),
             Some(95)
         );
         assert_eq!(
-            map_shared_validate_errno(false, 0x03 | MAP_SYNC, true),
+            map_shared_validate_errno(false, 0x03 | MAP_SYNC as usize, true),
             None
         );
         // A `MAP_SHARED_VALIDATE` word's `MAP_TYPE` field is part of the word,
         // so the request itself must not be reported as a stray bit.
         assert_eq!(map_shared_validate_errno(false, 0x03, false), None);
+        assert_eq!(
+            map_shared_validate_errno(false, 0x03 | (1usize << 32), false),
+            Some(95)
+        );
     }
 
     #[test]
