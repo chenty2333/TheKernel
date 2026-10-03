@@ -80,6 +80,56 @@ fn read_iovecs(
     Ok((result, total))
 }
 
+/// Imports process_vm's local iovec array with Linux `import_iovec()` order.
+/// The complete local ranges are checked arithmetically before the remote
+/// descriptor array, PID lookup, or ptrace authorization is consulted. This
+/// intentionally does not probe local page tables; access_ok is geometry-only.
+fn read_process_vm_local_iovecs(
+    caller: &UserMemoryCapability,
+    iovs: *const IoVec,
+    iovcnt: usize,
+) -> AxResult<(Vec<UserIoVec>, usize)> {
+    if iovcnt > PROCESS_VM_MAX_IOV {
+        return Err(AxError::InvalidInput);
+    }
+    if iovcnt == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    if iovs.is_null() {
+        return Err(AxError::BadAddress);
+    }
+
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(iovcnt)
+        .map_err(|_| AxError::NoMemory)?;
+    let mut total = 0usize;
+    for index in 0..iovcnt {
+        let offset = index
+            .checked_mul(core::mem::size_of::<IoVec>())
+            .ok_or(AxError::BadAddress)?;
+        let address = (iovs as usize)
+            .checked_add(offset)
+            .ok_or(AxError::BadAddress)?;
+        let iov = caller
+            .read_value(address as *const IoVec)
+            .map_err(map_usercopy_error)?;
+        if iov.iov_len < 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let len = iov.iov_len as usize;
+        let base = iov.iov_base as usize;
+        let end = base.checked_add(len).ok_or(AxError::BadAddress)?;
+        if end > crate::config::TASK_SIZE_MAX {
+            return Err(AxError::BadAddress);
+        }
+
+        total = total.checked_add(len).ok_or(AxError::InvalidInput)?;
+        result.push(UserIoVec { base, len });
+    }
+    Ok((result, total))
+}
+
 /// Imports a remote iovec array under process_madvise's aggregate byte cap.
 ///
 /// Do the arithmetic checks while copyin is still the only operation: a bad
@@ -395,7 +445,7 @@ fn sys_process_vm_rw(
     }
 
     let caller = UserMemoryCapability::new(caller_aspace);
-    let (local, local_len) = read_iovecs(&caller, local_iov, local_iovcnt)?;
+    let (local, local_len) = read_process_vm_local_iovecs(&caller, local_iov, local_iovcnt)?;
     if local_len == 0 {
         return Ok(0);
     }
@@ -500,12 +550,12 @@ pub fn sys_process_madvise(
     let pidfd = match tk_linux_fd::pidfd_task_target(pidfd) {
         tk_linux_fd::PidfdTaskTarget::SelfThread
         | tk_linux_fd::PidfdTaskTarget::SelfThreadGroup => None,
-        tk_linux_fd::PidfdTaskTarget::Descriptor => Some(
-            PidFd::from_fd(pidfd).map_err(|error| match error {
+        tk_linux_fd::PidfdTaskTarget::Descriptor => {
+            Some(PidFd::from_fd(pidfd).map_err(|error| match error {
                 AxError::InvalidInput => AxError::BadFileDescriptor,
                 error => error,
-            })?,
-        ),
+            })?)
+        }
     };
     let (target, target_image) = match &pidfd {
         Some(pidfd) => (pidfd.process_data()?, pidfd.image_access_snapshot()?),
@@ -541,46 +591,50 @@ pub fn sys_process_madvise(
     for iov in remote.into_iter().filter(|iov| iov.len != 0) {
         let result = if !remote_mm {
             super::mmap::sys_madvise(iov.base, iov.len, behavior).map(|_| ())
-        } else { match behavior {
-            // COLLAPSE may transact every shared alias.  It owns its lock
-            // acquisition so it can order every participating mm by ID.
-            MADV_COLLAPSE => crate::syscall::mm::mmap::process_madvise_collapse(
-                &target_aspace,
-                iov.base,
-                iov.len,
-            ),
-            MADV_COLD | MADV_PAGEOUT => {
-                crate::syscall::mm::mmap::ensure_4k_granularity_across_aliases(
+        } else {
+            match behavior {
+                // COLLAPSE may transact every shared alias.  It owns its lock
+                // acquisition so it can order every participating mm by ID.
+                MADV_COLLAPSE => crate::syscall::mm::mmap::process_madvise_collapse(
                     &target_aspace,
-                    VirtAddr::from(iov.base),
+                    iov.base,
                     iov.len,
-                )
-                .and_then(|_| {
-                    let mut aspace = target_aspace.lock();
-                    match behavior {
-                        MADV_WILLNEED => unreachable!("WILLNEED owns its lock-external retry"),
-                        MADV_COLD => crate::syscall::mm::mmap::process_madvise_cold(
-                            &mut aspace,
-                            iov.base,
-                            iov.len,
-                        ),
-                        MADV_PAGEOUT => crate::syscall::mm::mmap::process_madvise_collect_pageout(
-                            &mut aspace,
-                            iov.base,
-                            iov.len,
-                            &mut pageout_work,
-                        ),
-                        _ => unreachable!("behavior was validated before ptrace access"),
-                    }
-                })
+                ),
+                MADV_COLD | MADV_PAGEOUT => {
+                    crate::syscall::mm::mmap::ensure_4k_granularity_across_aliases(
+                        &target_aspace,
+                        VirtAddr::from(iov.base),
+                        iov.len,
+                    )
+                    .and_then(|_| {
+                        let mut aspace = target_aspace.lock();
+                        match behavior {
+                            MADV_WILLNEED => unreachable!("WILLNEED owns its lock-external retry"),
+                            MADV_COLD => crate::syscall::mm::mmap::process_madvise_cold(
+                                &mut aspace,
+                                iov.base,
+                                iov.len,
+                            ),
+                            MADV_PAGEOUT => {
+                                crate::syscall::mm::mmap::process_madvise_collect_pageout(
+                                    &mut aspace,
+                                    iov.base,
+                                    iov.len,
+                                    &mut pageout_work,
+                                )
+                            }
+                            _ => unreachable!("behavior was validated before ptrace access"),
+                        }
+                    })
+                }
+                MADV_WILLNEED => crate::syscall::mm::mmap::process_madvise_willneed(
+                    &target_aspace,
+                    iov.base,
+                    iov.len,
+                ),
+                _ => unreachable!("remote behavior was validated"),
             }
-            MADV_WILLNEED => crate::syscall::mm::mmap::process_madvise_willneed(
-                &target_aspace,
-                iov.base,
-                iov.len,
-            ),
-            _ => unreachable!("remote behavior was validated"),
-        }};
+        };
         match result {
             Ok(()) => {
                 completed = completed
@@ -706,7 +760,8 @@ mod tests {
 
     use super::{
         IoVec, ProcessVmOp, UserIoVec, UserMemoryCapability, page_copy_len,
-        process_madvise_is_remote, process_vm_copy, read_iovecs, validate_process_madvise_behavior,
+        process_madvise_is_remote, process_vm_copy, read_iovecs, read_process_vm_local_iovecs,
+        validate_process_madvise_behavior,
     };
     use crate::mm::{AddrSpace, Backend};
 
@@ -739,8 +794,8 @@ mod tests {
             iov_len: 37,
         };
         capability
-                .write_value(0x1000 as *mut IoVec, descriptor)
-                .unwrap();
+            .write_value(0x1000 as *mut IoVec, descriptor)
+            .unwrap();
 
         let (iovecs, total) = read_iovecs(&capability, 0x1000 as *const IoVec, 1).unwrap();
         assert_eq!(total, 37);
@@ -753,6 +808,35 @@ mod tests {
         let capability = mapped_capability();
         assert!(matches!(
             read_iovecs(&capability, 0x1ff8 as *const IoVec, 1),
+            Err(AxError::BadAddress)
+        ));
+    }
+
+    #[test]
+    fn process_vm_local_iovecs_check_every_range_before_remote_resolution() {
+        let capability = mapped_capability();
+        let descriptors = [
+            IoVec {
+                iov_base: 0x1000,
+                iov_len: 1,
+            },
+            IoVec {
+                iov_base: crate::config::TASK_SIZE_MAX as u64,
+                iov_len: 1,
+            },
+        ];
+        capability
+            .write_value(0x1000 as *mut IoVec, descriptors[0])
+            .unwrap();
+        capability
+            .write_value(
+                (0x1000 + core::mem::size_of::<IoVec>()) as *mut IoVec,
+                descriptors[1],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            read_process_vm_local_iovecs(&capability, 0x1000 as *const IoVec, descriptors.len()),
             Err(AxError::BadAddress)
         ));
     }
