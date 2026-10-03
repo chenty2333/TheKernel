@@ -68,3 +68,26 @@ PXE 时通过 `n305-netboot.py prepare` 的既有参数配置 GRUB；run 的追�
 再比 loglevel=7。屏幕再次停在 alarm 时，检查主机是否仍有 guest DHCP/UDP
 日志或 shell 网络活动；记录停顿位置和 elapsed 时间。网络未起来不能倒推
 整机死锁；硬件停顿原因未明前保留 quiet 退路，不盲改屏幕锁。
+
+## 4. 提示符前 NUL 的来源：先诊断再修复
+
+准备 dev PXE 时明确追加诊断参数（准备不需要 sudo）：
+
+```sh
+scripts/n305-netboot.sh prepare --mode kernel \
+  --out /home/ava/.cache/thekernel-targets/wt-dev/n305-next-a \
+  --interface enp0s31f6 --address 192.168.10.1 \
+  --kernel /home/ava/.cache/thekernel-targets/wt-dev/out/x86_64/n305/shell/mem1g/kernel-x86_64 \
+  --rootfs /home/ava/.cache/thekernel-targets/wt-dev/out/rootfs/x86/rootfs-x86.img \
+  --kernel-cmdline tty.input_trace=1
+```
+
+本次 shell 产物需按第 1 步构建，并使用对应 rootfs；不要把别人/以前构建的
+ELF 和 rootfs 拼在一起。用户随后按既有今晚流程用 sudo 启动生成的前台
+start.sh，本次代理不执行 sudo 或启动服务。
+
+guest 中 `dmesg | grep vt-input` 应显示 `seq=... source=... vt=... byte=0x..`。
+查 `byte=0x00` 是 Serial、UsbKeyboard、VirtualKeyboard 还是 OtherEvdev。
+**真实来源仍未知，未修复。** 无记录时先确认 `/proc/cmdline` 的诊断参数，
+再确认是否确有接收字节；不能用无日志证明没有 NUL。仅记录首 64 字节，
+不要输入密码；收集结果后移除参数。不得先把所有 NUL 过滤掉掩盖来源。

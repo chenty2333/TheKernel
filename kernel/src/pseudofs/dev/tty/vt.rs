@@ -351,6 +351,10 @@ impl VtManager {
         stamp: ConsoleInputStamp,
         bytes: &[u8],
     ) -> AxResult<()> {
+        self.route_input_from(stamp, bytes, super::input_trace::InputSource::Serial)
+    }
+
+    fn route_input_from(&self, stamp: ConsoleInputStamp, bytes: &[u8], source: super::input_trace::InputSource) -> AxResult<()> {
         let _route = self.route.lock();
         let state = self.state.lock();
         if state.active != stamp.vt || state.input_generation != stamp.route_generation {
@@ -364,6 +368,9 @@ impl VtManager {
         tty.ldisc
             .lock()
             .inject_input_at(bytes, stamp.flush_generation)?;
+        let reservation = super::input_trace::reserve(bytes.len());
+        drop(_route);
+        super::input_trace::accepted(reservation, source, stamp.vt, bytes);
         poll.wake();
         self.poll.wake();
         Ok(())
@@ -415,6 +422,7 @@ impl VtManager {
         match action {
             KeyAction::Bytes(bytes, len) => {
                 return Some(super::keyboard::KeyboardInput {
+                    source: super::input_trace::InputSource::OtherEvdev,
                     stamp: target.stamp,
                     bytes,
                     len,
@@ -442,7 +450,7 @@ impl VtManager {
         &self,
         input: &super::keyboard::KeyboardInput,
     ) -> AxResult<()> {
-        self.route_console_input(input.stamp, &input.bytes[..input.len])
+        self.route_input_from(input.stamp, &input.bytes[..input.len], input.source)
     }
 
     /// Observes the selected VT after dropping the state spin lock.

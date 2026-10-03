@@ -1,5 +1,6 @@
 pub(crate) mod fbcon;
 pub(crate) mod keyboard;
+pub(crate) mod input_trace;
 mod ntty;
 mod ptm;
 mod pts;

@@ -28,6 +28,32 @@ class NetbootTests(unittest.TestCase):
         self.assertIn("apkovl=http://192.168.10.1:8080/", capture)
         self.assertIn("alpine_repo=http://192.168.10.1:8080/apks/main", capture)
 
+    def test_prepare_appends_diagnostic_tokens_without_starting_host_services(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools.n305_netboot import prepare
+        from tools.product_state import state_root
+        scratch = state_root() / "test-tmp"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            kernel, rootfs = root / "kernel", root / "rootfs"
+            kernel.write_bytes(b"fake ELF")
+            rootfs.write_bytes(b"fake disk")
+            args = SimpleNamespace(interface="eth1", address="192.168.10.1", port=8080,
+                gfxmode="auto", out=root / "session", mode="kernel", kernel=kernel,
+                rootfs=rootfs, loglevel="info", kernel_cmdline="tty.input_trace=1")
+            def fake_grub(command, **kwargs):
+                Path(command[command.index("-o") + 1]).write_bytes(b"fake GRUB")
+            with patch("tools.n305_netboot.shutil.which", return_value="/tool/grub"), \
+                 patch("tools.n305_netboot.subprocess.run", side_effect=fake_grub) as command:
+                prepare(args)
+                self.assertEqual(command.call_count, 1)
+            text = (args.out / "grub.cfg").read_text()
+            self.assertIn("quiet loglevel=info n305.net=dhcp", text)
+            self.assertIn("tty.input_trace=1", text)
+            self.assertNotIn("loglevel=info tty.input_trace=1 n305.net", text)
+
     def test_dnsmasq_follows_address_changes_across_link_bounces(self):
         # bind-interfaces answered every DISCOVER with "has no address" after
         # the N305 bounced the link on 2026-10-04.
