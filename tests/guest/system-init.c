@@ -663,6 +663,13 @@ static int test_resource_limits(void) {
         "resource-limits-child");
 }
 
+static int test_cpu_accounting(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-cpu-accounting-smoke",
+        NULL,
+        "cpu-accounting-child");
+}
+
 static int test_rseq(void) {
     pid_t child = fork();
     if (child < 0) {
@@ -1024,6 +1031,7 @@ static int run_init(int argc, char **argv) {
         { "alarm", test_alarm, 60 },
         { "wait-boundary", test_wait_boundary, 60 },
         { "resource-limits", test_resource_limits, 60 },
+        { "cpu-accounting", test_cpu_accounting, 60 },
         { "rseq", test_rseq, 60 },
         { "futex", test_futex_differential, 60 },
         { "futex2-waitv-signal", test_futex2_waitv_signal_differential, 60 },

@@ -1137,14 +1137,18 @@ pub fn poll_timer(task: &TaskInner) {
     let Some(thr) = task.try_as_thread() else {
         return;
     };
+    // Keep generation and publication in one IRQ/preemption-excluded
+    // transaction. Releasing this guard before the store lets a timer tick
+    // or switch publish newer totals which this old snapshot then overwrites.
+    let guard = NoPreemptIrqSave::new();
     let usage = {
-        let _guard = NoPreemptIrqSave::new();
         let mut time = thr.time.borrow_mut();
         time.poll(&thr.proc_data);
         let (utime, stime) = time.output();
         TaskUsage::from_time_values(utime, stime)
     };
     thr.store_usage_snapshot(usage);
+    drop(guard);
     if let Some(cpu) = request_process_cpu_evaluation(&thr.proc_data) {
         crate::deferred_work::wake_process_timer_worker(cpu);
     }
@@ -1155,8 +1159,10 @@ pub fn set_timer_state(task: &TaskInner, state: TimerState) -> bool {
     let Some(thr) = task.try_as_thread() else {
         return false;
     };
+    // As in poll_timer, do not admit another accounting producer until the
+    // snapshot from this state transition has been published.
+    let guard = NoPreemptIrqSave::new();
     let usage = {
-        let _guard = NoPreemptIrqSave::new();
         let mut time = thr.time.borrow_mut();
         time.poll(&thr.proc_data);
         time.set_state(state);
@@ -1164,6 +1170,7 @@ pub fn set_timer_state(task: &TaskInner, state: TimerState) -> bool {
         TaskUsage::from_time_values(utime, stime)
     };
     thr.store_usage_snapshot(usage);
+    drop(guard);
     let timer_work_published = request_process_cpu_evaluation(&thr.proc_data);
     if let Some(cpu) = timer_work_published {
         crate::deferred_work::wake_process_timer_worker(cpu);

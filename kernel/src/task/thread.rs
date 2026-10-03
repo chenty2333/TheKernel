@@ -2712,6 +2712,9 @@ impl Thread {
     }
 
     /// Publishes a CPU usage snapshot for lock-free readers such as procfs.
+    /// Accounting producers must retain IRQ/preemption exclusion from the
+    /// TimeManager sample through this store; the atomic multi-field store
+    /// alone cannot prevent a precomputed older snapshot from arriving last.
     pub fn store_usage_snapshot(&self, usage: TaskUsage) {
         self.live_usage.store(usage);
         // Publish after the atomic accounting snapshot so CPU-clock sleepers

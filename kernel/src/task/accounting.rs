@@ -199,8 +199,10 @@ pub struct AtomicTaskUsage {
     nivcsw: AtomicU64,
     /// Serializes the multi-field publication.  This is IRQ-safe because
     /// [`SpinNoIrq`] masks local interrupts while a writer owns the
-    /// transaction; the timer path and task-context poller therefore cannot
-    /// interleave stores or publish an older snapshot over a newer one.
+    /// transaction, so add/store cannot interleave their individual fields.
+    /// This lock alone cannot order snapshots computed before it was taken:
+    /// task-local producers must exclude IRQs/preemption from TimeManager
+    /// sampling through publication to avoid overwriting newer totals.
     writer: SpinNoIrq<()>,
     /// Readers retry instead of combining fields from the middle of a
     /// serialized add/store transaction.
