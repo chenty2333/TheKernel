@@ -1,6 +1,7 @@
 //! PCI xHCI host integration. Class drivers use the existing block/evdev APIs.
 mod dma;
 mod hid;
+mod hid_report;
 mod storage;
 mod sync;
 
@@ -139,7 +140,7 @@ impl Drop for ProbeGuard<'_> {
 }
 
 struct DeviceOwner {
-    _device: Device,
+    _device: Arc<Mutex<Device>>,
     _session: InterfaceSession,
 }
 
@@ -165,6 +166,12 @@ fn class_control(
 }
 
 /// Called only after the existing PCI enumerator has mapped/enabled BAR0.
+fn supported_interface(interface: &InterfaceDescriptor) -> bool {
+    interface.alternate_setting == 0
+        && (interface.class == 3
+            || (interface.class == 8 && interface.subclass == 6 && interface.protocol == 0x50))
+}
+
 pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
     let mut controller = Box::new(
         USBHost::new_xhci(mmio, DmaCoherency::Coherent, &dma::KERNEL).map_err(|_| DevError::Io)?,
@@ -188,61 +195,87 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
         let Some(info) = probed.into_device_info() else {
             continue;
         };
-        let selected = info.configurations().iter().find_map(|config| {
+        let selected = info.configurations().iter().find(|config| {
             config
                 .interfaces
                 .iter()
                 .flat_map(|group| &group.alt_settings)
-                .find(|interface| {
-                    interface.alternate_setting == 0
-                        && matches!(
-                            (interface.class, interface.subclass, interface.protocol),
-                            (3, 1, 1 | 2) | (8, 6, 0x50)
-                        )
-                })
-                .map(|interface| (config.configuration_value, interface.clone()))
+                .any(supported_interface)
         });
-        let Some((configuration, interface)) = selected else {
+        let Some(config) = selected else {
             continue;
         };
-        let result: DevResult<crate::AxDeviceEnum> = (|| {
+        let opened: DevResult<Arc<Mutex<Device>>> = (|| {
             let mut device = host
                 .wait(controller.open_device(&info))?
                 .map_err(|_| DevError::Io)?;
-            host.wait(device.set_configuration(configuration))?
+            host.wait(device.set_configuration(config.configuration_value))?
                 .map_err(|_| DevError::Io)?;
-            let session = host
-                .wait(device.claim_interface(interface.interface_number, 0))?
-                .map_err(|_| DevError::Io)?;
-            if interface.class == 3 {
-                class_control(&host, &mut device, interface.interface_number, 0x0b, 0)?; // SET_PROTOCOL(boot)
-                let input = UsbInput::new(host.clone(), device, session, &interface)?;
-                #[cfg(not(feature = "dyn"))]
-                return Ok(crate::AxDeviceEnum::Input(crate::AxInputDevice::Usb(input)));
-                #[cfg(feature = "dyn")]
-                return Ok(crate::AxDeviceEnum::Input(Box::new(input)));
-            }
-            let block = UsbBlock::new(host.clone(), device, session, &interface)?;
-            #[cfg(not(feature = "dyn"))]
-            return Ok(crate::AxDeviceEnum::Block(crate::AxBlockDevice::Usb(block)));
-            #[cfg(feature = "dyn")]
-            return Ok(crate::AxDeviceEnum::Block(Box::new(block)));
+            Arc::try_new(Mutex::new(device)).map_err(|_| DevError::NoMemory)
         })();
-        match result {
-            Ok(device) => {
-                info!("USB registered {}", device.device_name());
-                devices.push(device);
+        let device = match opened {
+            Ok(device) => device,
+            Err(error) => {
+                warn!(
+                    "USB {:04x}:{:04x} configuration failed: {error:?}",
+                    info.vendor_id(),
+                    info.product_id()
+                );
+                continue;
             }
-            Err(error) => warn!(
-                "USB {:04x}:{:04x} interface {} failed: {:?}",
-                info.vendor_id(),
-                info.product_id(),
-                interface.interface_number,
-                error
-            ),
+        };
+        for interface in config
+            .interfaces
+            .iter()
+            .flat_map(|group| &group.alt_settings)
+            .filter(|i| supported_interface(i))
+        {
+            let result: DevResult<crate::AxDeviceEnum> = (|| {
+                let mut guard = device.lock();
+                let session = host
+                    .wait(guard.claim_interface(interface.interface_number, 0))?
+                    .map_err(|_| DevError::Io)?;
+                if interface.class == 3 && interface.subclass == 1 {
+                    class_control(
+                        &host,
+                        &mut guard,
+                        interface.interface_number,
+                        0x0b,
+                        u16::from(interface.protocol != 1),
+                    )?;
+                }
+                drop(guard);
+                if interface.class == 3 {
+                    let input = UsbInput::new(host.clone(), device.clone(), session, interface)?;
+                    #[cfg(not(feature = "dyn"))]
+                    return Ok(crate::AxDeviceEnum::Input(crate::AxInputDevice::Usb(input)));
+                    #[cfg(feature = "dyn")]
+                    return Ok(crate::AxDeviceEnum::Input(Box::new(input)));
+                }
+                let block = UsbBlock::new(host.clone(), device.clone(), session, interface)?;
+                #[cfg(not(feature = "dyn"))]
+                return Ok(crate::AxDeviceEnum::Block(crate::AxBlockDevice::Usb(block)));
+                #[cfg(feature = "dyn")]
+                return Ok(crate::AxDeviceEnum::Block(Box::new(block)));
+            })();
+            match result {
+                Ok(device) => {
+                    info!(
+                        "USB registered {} interface {}",
+                        device.device_name(),
+                        interface.interface_number
+                    );
+                    devices.push(device);
+                }
+                Err(error) => warn!(
+                    "USB {:04x}:{:04x} interface {} failed: {error:?}",
+                    info.vendor_id(),
+                    info.product_id(),
+                    interface.interface_number
+                ),
+            }
         }
     }
-    // The controller owns DMA rings for the lifetime of these boot devices.
     guard.armed = false;
     Box::leak(controller);
     Ok(devices)

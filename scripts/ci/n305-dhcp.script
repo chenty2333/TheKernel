@@ -1,0 +1,18 @@
+#!/bin/sh
+# udhcpc's lease hook; guest-side only, never run on the development host.
+set -eu
+case "${1:-}" in
+bound|renew)
+    ip -4 addr flush dev "$interface"
+    ip -4 addr add "$ip/${subnet:-255.255.255.0}" dev "$interface"
+    ip link set "$interface" up
+    ip -4 route replace "$ip/${subnet:-255.255.255.0}" dev "$interface" src "$ip"
+    ip -4 route del default 2>/dev/null || true
+    if [ -n "${router:-}" ]; then
+        set -- $router
+        ip -4 route replace default via "$1" dev "$interface" src "$ip"
+    fi
+    printf 'N305_DHCP_BOUND interface=%s ip=%s subnet=%s router=%s\n' "$interface" "$ip" "${subnet:-}" "${router:-none}"
+    ;;
+deconfig) : ;; # Keep the previous address until a valid lease is accepted.
+esac

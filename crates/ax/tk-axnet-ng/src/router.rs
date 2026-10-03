@@ -548,11 +548,16 @@ impl Router {
     }
 
     pub fn try_add_device(&mut self, device: Box<dyn Device>) -> AxResult<u32> {
-        // A real receive ring has no safe task-context polling fallback in
-        // this stack. Reject a no-IRQ device before it becomes visible in the
-        // router, while software devices (loopback/veth) retain their bridge
-        // based admission path.
-        if device.rx_wake_required() && !device.rx_wake_capable() {
+        // A physical receive ring needs either an IRQ or an explicit bounded
+        // task-context polling contract before publication. Software devices
+        // (loopback/veth) retain their bridge-based admission path.
+        if device.rx_wake_required()
+            && !device.rx_wake_capable()
+            && device
+                .rx_poll_interval_micros()
+                .filter(|us| (1000..=1_000_000).contains(us))
+                .is_none()
+        {
             return Err(AxError::Unsupported);
         }
         if self.devices.len() >= MAX_DEVICES {
@@ -780,8 +785,10 @@ impl Router {
     /// This is distinct from a source whose registration has failed terminally.
     pub(crate) fn has_dormant_rx_source(&self) -> bool {
         self.devices.iter().enumerate().any(|(index, device)| {
-            !self.links[index].up && !device.is_quarantined()
-                && !self.rx_wake_quarantined(index) && !self.rx_wake_unavailable(index)
+            !self.links[index].up
+                && !device.is_quarantined()
+                && !self.rx_wake_quarantined(index)
+                && !self.rx_wake_unavailable(index)
         })
     }
 
@@ -920,6 +927,26 @@ impl Router {
     /// Apply a complete link-admin proposal after callers have copied and
     /// validated every netlink attribute.  The replacement is all-or-nothing:
     /// duplicate names and invalid MTUs are rejected before publication.
+    pub(crate) fn set_primary_ipv4(&mut self, ifindex: u32, address: smoltcp::wire::Ipv4Cidr) {
+        if let Some(slot) = self.device_slot(ifindex) {
+            self.devices[slot].set_primary_ipv4(address);
+        }
+    }
+
+    pub(crate) fn rx_poll_interval_micros(&self) -> Option<u64> {
+        self.devices
+            .iter()
+            .enumerate()
+            .filter(|(i, d)| {
+                self.links[*i].up && !d.is_quarantined() && !self.rx_wake_quarantined(*i)
+            })
+            .filter_map(|(_, d)| {
+                d.rx_poll_interval_micros()
+                    .filter(|us| (1000..=1_000_000).contains(us))
+            })
+            .min()
+    }
+
     pub(crate) fn configure_link(
         &mut self,
         ifindex: u32,
@@ -1133,7 +1160,9 @@ impl Router {
             match version {
                 IpVersion::Ipv4 => {
                     let Ok(packet) = smoltcp::wire::Ipv4Packet::new_checked(packet) else {
-                        ratelimit::warn_ratelimited!("Dropping malformed IPv4 packet from transmit queue");
+                        ratelimit::warn_ratelimited!(
+                            "Dropping malformed IPv4 packet from transmit queue"
+                        );
                         fail_raw_route(raw_plan.as_ref());
                         continue;
                     };
@@ -1180,9 +1209,7 @@ impl Router {
                                 )
                             } else {
                                 let Some(rule) = self.table.lookup(&dst_addr) else {
-                                    debug!(
-                        "No route found for rewritten destination: {dst_addr}"
-                    );
+                                    debug!("No route found for rewritten destination: {dst_addr}");
                                     fail_raw_route(raw_plan.as_ref());
                                     continue;
                                 };
@@ -1266,7 +1293,9 @@ impl Router {
                 }
                 IpVersion::Ipv6 => {
                     let Ok(packet) = smoltcp::wire::Ipv6Packet::new_checked(packet) else {
-                        ratelimit::warn_ratelimited!("Dropping malformed IPv6 packet from transmit queue");
+                        ratelimit::warn_ratelimited!(
+                            "Dropping malformed IPv6 packet from transmit queue"
+                        );
                         fail_raw_route(raw_plan.as_ref());
                         continue;
                     };
@@ -1309,9 +1338,7 @@ impl Router {
                                 )
                             } else {
                                 let Some(rule) = self.table.lookup(&dst_addr) else {
-                                    debug!(
-                        "No route found for rewritten destination: {dst_addr}"
-                    );
+                                    debug!("No route found for rewritten destination: {dst_addr}");
                                     fail_raw_route(raw_plan.as_ref());
                                     continue;
                                 };
@@ -2064,6 +2091,62 @@ mod tests {
             router.try_add_device(device).unwrap();
         }
         router
+    }
+
+    struct PolledDevice;
+    impl Device for PolledDevice {
+        fn name(&self) -> &str {
+            "polled"
+        }
+        fn stats(&self) -> DeviceStats {
+            DeviceStats::default()
+        }
+        fn interface_kind(&self) -> crate::device::InterfaceKind {
+            crate::device::InterfaceKind::Ethernet
+        }
+        fn mtu(&self) -> usize {
+            LOOPBACK_MTU
+        }
+        fn rx_wake_required(&self) -> bool {
+            true
+        }
+        fn rx_poll_interval_micros(&self) -> Option<u64> {
+            Some(10_000)
+        }
+        fn register_waker(&self, _: &Waker) -> Result<(), axpoll::PollRegistrationError> {
+            Ok(())
+        }
+        fn recv(
+            &mut self,
+            _: PacketDeviceContext<'_>,
+            _: &mut IngressPacketBuffer,
+            _: Instant,
+        ) -> RxStep {
+            RxStep::Idle
+        }
+        fn send(&mut self, _: PacketDeviceContext<'_>, _: IpAddress, _: &[u8], _: Instant) -> bool {
+            false
+        }
+        fn register_rx_waker(
+            &self,
+            _: &Waker,
+        ) -> Result<RxWakeSource, axpoll::PollRegistrationError> {
+            Ok(RxWakeSource::Unavailable)
+        }
+    }
+    #[test]
+    fn no_irq_device_is_admitted_only_with_a_bounded_polling_contract() {
+        let mut router =
+            Router::try_new_loopback_only(Arc::new(ListenTable::try_new().unwrap())).unwrap();
+        let index = router.try_add_device(Box::new(PolledDevice)).unwrap();
+        assert_eq!(router.rx_poll_interval_micros(), Some(10_000));
+        let result = router.register_rx_waker(Waker::noop());
+        assert_eq!(result.unavailable, 1);
+        assert!(!router.has_quarantined_device());
+        router
+            .configure_link(index, None, None, Some(false))
+            .unwrap();
+        assert_eq!(router.rx_poll_interval_micros(), None);
     }
 
     #[test]

@@ -8,7 +8,13 @@ The commit counts and test results below describe the original workstream
 runs, not the status of every later revision. Integration into `main` does not
 remove the hardware-validation limits recorded here.
 
-## 1. What stage 2 was, and what it now does
+**2026-10-03 safety update:** with a valid firmware framebuffer, boot now stops
+at the read-only phase-0 probe before power/modeset writes. The historical
+sequence below has no complete hardware rollback; keeping the aperture was
+not enough to promise preservation of a live console. Runtime MCFG and fixed-
+mode firmware KMS are used instead. Native Intel 1080p remains 未在硬件上验证.
+
+## 1. What stage 2 was, and what it originally did
 
 The goal was the Intel display engine of the target machine -- an Acer
 蜂鸟mini with an i3-N305 (Alder Lake-N, Gen12 Xe-LP, device `8086:46d0`) whose

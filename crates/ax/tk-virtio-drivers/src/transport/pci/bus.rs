@@ -253,6 +253,21 @@ impl PciRoot {
         (status, command)
     }
 
+    /// Reads firmware-assigned BAR words without the sizing writes in bar_info.
+    /// Upper halves of 64-bit BARs remain raw words, not separate resources.
+    pub fn raw_bars(&self, bdf: DeviceFunction, header: HeaderType) -> [u32; 6] {
+        let count = match header {
+            HeaderType::Standard => 6,
+            HeaderType::PciPciBridge => 2,
+            _ => 0,
+        };
+        let mut words = [0; 6];
+        for (slot, word) in words.iter_mut().enumerate().take(count) {
+            *word = self.config_read_word(bdf, 0x10 + slot as u8 * 4);
+        }
+        words
+    }
+
     /// Reads the subsystem vendor and device IDs of a type-0 PCI endpoint.
     /// The caller must first establish that this is an endpoint function,
     /// because bridge headers assign a different meaning to offset 0x2c.
@@ -722,6 +737,27 @@ impl From<u8> for HeaderType {
 #[cfg(test)]
 mod tests {
     use super::{BridgeBusNumbers, decode_bridge_bus_numbers, decode_interrupt_line_and_pin};
+
+    #[test]
+    fn raw_bar_inventory_never_sizes_or_modifies_the_device() {
+        use super::{Cam, DeviceFunction, HeaderType, PciRoot};
+        let mut memory = alloc::vec![0u32; Cam::MmioCam.size() as usize / 4];
+        let original = [0xf0000004, 0x40, 0x1235, 0, 0, 0];
+        memory[4..10].copy_from_slice(&original);
+        // SAFETY: owned aligned allocation spans the entire MMIO CAM.
+        let root = unsafe { PciRoot::new(memory.as_mut_ptr().cast(), Cam::MmioCam) };
+        let bdf = DeviceFunction {
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        assert_eq!(root.raw_bars(bdf, HeaderType::Standard), original);
+        assert_eq!(
+            root.raw_bars(bdf, HeaderType::PciPciBridge),
+            [original[0], original[1], 0, 0, 0, 0]
+        );
+        assert_eq!(&memory[4..10], &original);
+    }
 
     #[test]
     fn interrupt_line_and_pin_accepts_firmware_route() {

@@ -13,7 +13,6 @@ impl InitIf for InitIfImpl {
         axcpu::init::init_trap();
         enable_machine_checks();
         crate::console::init();
-        crate::time::init_early();
         // The platform entry runs before axruntime clears `.bss`; finalize the
         // initialized-data handoff after the early diagnostics are available,
         // then copy/use the memory map.  CPU topology discovery is intentionally
@@ -29,6 +28,9 @@ impl InitIf for InitIfImpl {
         // what makes the PCI bus driver's later read of `crate::pci` a plain
         // load instead of a second ACPI walk.
         crate::acpi::init_early();
+        crate::mem::init_runtime_mmio();
+        // Clock selection can consume HPET only after its ACPI address is retained.
+        crate::time::init_early();
     }
 
     /// Initializes the platform at the early stage for secondary cores.

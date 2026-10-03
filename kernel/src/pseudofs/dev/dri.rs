@@ -111,6 +111,16 @@ fn pci_registrations(
     Ok([pci, transport])
 }
 
+fn platform_registration(name: &str) -> VfsResult<Arc<DeviceRegistration>> {
+    DeviceRegistration::try_bus_device(
+        DeviceIdentity::without_dev("platform".into(), "platform".into(), name.into())?,
+        "platform_device".into(),
+        Vec::new(),
+        "platform".into(),
+        false,
+    )
+}
+
 fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_DEVICES>>> {
     let mut parents = Vec::new();
     let transport = if let Some(identity) = device.adapter.pci_identity() {
@@ -123,6 +133,11 @@ fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_
             DeviceReservation::publish_pair(pci_reservation, pci, virtio_reservation, virtio)?;
         parents.extend([pci, virtio]);
         Some((path, name))
+    } else if let Some(name) = device.adapter.platform_name() {
+        let platform = platform_registration(name)?;
+        let reservation = global_device_registry().reserve(platform.identity().clone())?;
+        parents.push(reservation.publish(platform)?);
+        Some(("platform".into(), name.into()))
     } else {
         None
     };
@@ -456,6 +471,21 @@ mod tests {
         fn present(&self, _: Scanout) -> DrmResult<Arc<crate::drm::fence::Fence>> {
             Ok(crate::drm::fence::Fence::new(true))
         }
+    }
+
+    #[test]
+    fn firmware_device_has_a_real_platform_identity_for_libdrm() {
+        let registration = platform_registration("simple-framebuffer.0").unwrap();
+        assert!(
+            registration
+                .uevent_payload()
+                .contains("SUBSYSTEM=platform\n")
+        );
+        assert!(
+            registration
+                .uevent_payload()
+                .contains("MODALIAS=platform:simple-framebuffer.0\n")
+        );
     }
 
     #[test]

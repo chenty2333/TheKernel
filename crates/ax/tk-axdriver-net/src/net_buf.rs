@@ -29,6 +29,11 @@ impl NetBufPtr {
         self.raw_ptr.as_ptr() as *mut T
     }
 
+    /// Buffer identity without constructing a slice before ownership validation.
+    pub fn packet_ptr(&self) -> NonNull<u8> {
+        self.buf_ptr
+    }
+
     /// Return [`NetBufPtr`] buffer len.
     pub fn packet_len(&self) -> usize {
         self.len

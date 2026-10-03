@@ -97,7 +97,7 @@ fn validate_csw(csw: &[u8; 13], tag: u32, requested: usize, actual: usize) -> De
 impl UsbBlock {
     pub(super) fn new(
         host: Arc<Host>,
-        device: Device,
+        device: Arc<Mutex<Device>>,
         session: InterfaceSession,
         interface: &InterfaceDescriptor,
     ) -> DevResult<Self> {

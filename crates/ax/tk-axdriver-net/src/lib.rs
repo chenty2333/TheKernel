@@ -15,6 +15,8 @@ extern crate std;
 #[cfg(feature = "fxmac")]
 /// fxmac driver for PhytiumPi
 pub mod fxmac;
+#[cfg(feature = "rtl8125")]
+pub mod rtl8125;
 #[cfg(feature = "igc")]
 /// Intel i225/i226 (2.5 GbE) NIC device driver.
 pub mod igc;

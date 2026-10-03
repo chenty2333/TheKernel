@@ -139,9 +139,9 @@ pub fn init(args: &[String], envs: &[String]) {
     // Device publication below (including DRM's initial registration) may
     // emit uevents, so init-net must be established first.
     match crate::drm::init_virtio_gpu() {
-        Ok(true) => info!("registered VirtIO GPU as DRM primary device"),
-        Ok(false) => info!("no DRM-capable VirtIO GPU found"),
-        Err(error) => error!("failed to initialize DRM VirtIO GPU: {error}"),
+        Ok(true) => info!("registered primary DRM device"),
+        Ok(false) => info!("no usable primary DRM device found"),
+        Err(error) => error!("failed to initialize primary DRM device: {error}"),
     }
     {
         let fs = FS_CONTEXT.lock();

@@ -180,7 +180,7 @@ fn propose_with_mode(
         {
             return Err(DrmError::Invalid);
         }
-        let cursor = c.object == r.cursor_plane_id;
+        let cursor = r.cursor_plane_id != 0 && c.object == r.cursor_plane_id;
         match c.property {
             property::CONNECTOR_CRTC_ID => next.connector_crtc = c.value as u32,
             property::CONNECTOR_EDID => return Err(DrmError::PermissionDenied),
@@ -311,6 +311,9 @@ fn propose_with_mode(
             return Err(DrmError::NotFound);
         }
         let mode = next.mode.ok_or(DrmError::Invalid)?;
+        if file.fixed_mode().is_some_and(|fixed| mode != fixed) {
+            return Err(DrmError::Invalid);
+        }
         let fb = device
             .framebuffers
             .get(&next.fb)
@@ -446,7 +449,7 @@ fn matches_object(r: &super::kms::KmsResources, object: u32, prop: u32) -> bool 
         | property::CRTC_MODE_ID
         | property::CRTC_GAMMA_LUT
         | property::CRTC_OUT_FENCE_PTR => object == r.crtc.id,
-        _ => object == r.primary_plane_id || object == r.cursor_plane_id,
+        _ => object == r.primary_plane_id || (r.cursor_plane_id != 0 && object == r.cursor_plane_id),
     }
 }
 

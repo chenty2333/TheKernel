@@ -112,6 +112,18 @@ impl fmt::Display for DrmError {
 /// lock held. Presentation returns a fence which becomes terminal only after
 /// the host has consumed the scanout command.
 pub trait DisplayAdapter: Send + Sync {
+    fn driver_name(&self) -> &'static str {
+        "virtio_gpu"
+    }
+    fn platform_name(&self) -> Option<&'static str> {
+        None
+    }
+    fn fixed_mode(&self) -> Option<Mode> {
+        None
+    }
+    fn supports_cursor(&self) -> bool {
+        true
+    }
     fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
         None
     }
@@ -228,6 +240,7 @@ pub struct CursorUpdate {
 
 pub struct DrmDevice {
     pub(crate) adapter: Arc<dyn DisplayAdapter>,
+    pub(crate) fixed_mode: Option<Mode>,
     pub(crate) render: Option<Arc<dyn super::render::RenderAdapter>>,
     pub(crate) state: Mutex<DeviceState>,
     vblank_waiters: WaitQueue,
@@ -339,9 +352,16 @@ impl DrmDevice {
         primary_plane_id: u32,
     ) -> Arc<Self> {
         let preferred_mode = adapter.preferred_mode();
+        let fixed_mode = adapter.fixed_mode();
+        let cursor_plane_id = if adapter.supports_cursor() {
+            primary_plane_id.checked_add(1).unwrap_or(primary_plane_id)
+        } else {
+            0
+        };
         let edid = default_edid(preferred_mode);
         Arc::new(Self {
             adapter,
+            fixed_mode,
             render,
             state: Mutex::new(DeviceState {
                 next_open: 1,
@@ -362,7 +382,7 @@ impl DrmDevice {
                         framebuffer: None,
                     },
                     primary_plane_id,
-                    cursor_plane_id: primary_plane_id.checked_add(1).unwrap_or(primary_plane_id),
+                    cursor_plane_id,
                     preferred_mode,
                     modes: alloc::vec![preferred_mode],
                 },
@@ -400,7 +420,7 @@ impl DrmDevice {
                         framebuffer: None,
                     },
                     primary_plane_id,
-                    cursor_plane_id: primary_plane_id.checked_add(1).unwrap_or(primary_plane_id),
+                    cursor_plane_id,
                     preferred_mode,
                     modes: alloc::vec![preferred_mode],
                 }),
@@ -418,7 +438,7 @@ impl DrmDevice {
                         framebuffer: None,
                     },
                     primary_plane_id,
-                    cursor_plane_id: primary_plane_id.checked_add(1).unwrap_or(primary_plane_id),
+                    cursor_plane_id,
                     preferred_mode,
                     modes: alloc::vec![preferred_mode],
                 }),

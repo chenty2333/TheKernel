@@ -3542,9 +3542,11 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
     );
     root.add(
         "cmdline",
-        // The supported boot paths do not currently preserve firmware/QEMU
-        // command-line bytes. An empty line is honest when no source exists.
-        SimpleFile::new_regular(fs.clone(), || Ok("\n")),
+        // PXE lease/logging options are bootloader input, not kernel build
+        // settings. The platform owns a bounded immutable handoff copy.
+        SimpleFile::new_regular(fs.clone(), || {
+            Ok(format!("{}\n", axhal::boot::command_line().unwrap_or("")))
+        }),
     );
     root.add("net", {
         let mut net = DirMapping::new();

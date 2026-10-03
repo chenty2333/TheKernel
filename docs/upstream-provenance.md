@@ -161,7 +161,7 @@ could not gate anything.
 Three rows survive the pass, and none of them is a finding. Two are one class: a
 prose cite whose walk ran past a fence and collected the quotation belonging to
 the *neighbouring* cite. `mm/src/userfaultfd.rs:35`
-(`mm/userfaultfd.c:3659-3661`) and `net/src/lib.rs:332` (`net/socket.c:1947`)
+(`mm/userfaultfd.c:3659-3661`) and `net/src/lib.rs:347` (`net/socket.c:1947`)
 were both re-read against the reference tree and are right — `-EINVAL` before
 `vma_can_userfault()`, and `move_addr_to_kernel()` inside `__sys_bind()`. The
 third, `kernel/src/syscall/fs/io_uring.rs:765`, is the callee-body case named

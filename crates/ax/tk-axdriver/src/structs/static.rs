@@ -433,9 +433,21 @@ pub use crate::drivers::AxVsockDevice;
 
 impl super::AxDeviceEnum {
     /// Constructs a network device.
-    #[cfg(feature = "net")]
+    #[cfg(all(feature = "net", not(net_dev = "n305-net")))]
     pub const fn from_net(dev: AxNetDevice) -> Self {
         Self::Net(dev)
+    }
+
+    #[cfg(all(feature = "net", net_dev = "n305-net"))]
+    pub(crate) fn try_from_net(dev: impl axdriver_net::NetDriverOps + 'static) -> DevResult<Self> {
+        alloc::boxed::Box::try_new(dev)
+            .map(|device| Self::Net(device))
+            .map_err(|_| DevError::NoMemory)
+    }
+
+    #[cfg(all(feature = "net", net_dev = "n305-net"))]
+    pub fn from_net(dev: impl axdriver_net::NetDriverOps + 'static) -> Self {
+        Self::Net(alloc::boxed::Box::new(dev))
     }
 
     /// Constructs a block device.

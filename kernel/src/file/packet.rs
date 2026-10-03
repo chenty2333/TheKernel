@@ -156,6 +156,25 @@ pub fn socket_ifreq_ioctl(
                     .min(i32::MAX as usize) as i32,
             ),
         ),
+        IfreqRequest::GetHardwareAddress => {
+            let interface = interface_by_name(&interfaces, ifr.name()).ok_or(LinuxError::ENODEV)?;
+            (
+                ifr,
+                IfreqOutput::HardwareAddress {
+                    kind: if interface.kind == InterfaceKind::Loopback {
+                        772
+                    } else {
+                        1
+                    },
+                    address: interface.hardware_address.unwrap_or([0; 6]),
+                },
+            )
+        }
+        IfreqRequest::GetTxQueueLength => {
+            interface_by_name(&interfaces, ifr.name()).ok_or(LinuxError::ENODEV)?;
+            // No qdisc/software backlog is configured; this is not the DMA ring size.
+            (ifr, IfreqOutput::Integer(0))
+        }
         IfreqRequest::GetConfiguration | IfreqRequest::SetFlags | IfreqRequest::SetMtu => {
             unreachable!()
         }

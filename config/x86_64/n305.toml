@@ -1,14 +1,10 @@
 # Acer mini PC, Intel Core i3-N305 (Alder Lake-N, Gracemont E-cores only).
 #
-# ============================================================================
-# THIS PROFILE HAS NEVER BEEN BOOTED ON THE MACHINE IT DESCRIBES.
-# ============================================================================
-# Every address below is either derived from the kernel's own fallback policy
-# or read out of public Intel documentation.  None of it has been confirmed
-# against this machine's firmware.  Boot this image on the target with
-# `loglevel=info` (or higher) and read the `pci-ecam:` and `Memory regions`
-# lines before trusting anything here.  The full list of assumptions is in
-# `docs/design/n305-platform.md`.
+# On 2026-10-03 the user reported a PXE boot reaching the shell, with MCFG
+# ECAM at 0xc0000000 and an 800x600 GOP framebuffer at 0x4000000000.
+# This is a boot observation, not validation of Intel modesetting or NIC I/O.
+# Those drivers remain 未在硬件上验证. Addresses below are fallbacks; runtime
+# ACPI/Multiboot facts take precedence and their source is logged.
 #
 # What must be confirmed on the machine itself:
 #   * the ECAM base and its bus range from the ACPI MCFG table.  The kernel
@@ -19,9 +15,9 @@
 #   * the physical address ranges firmware reserves for PCIe MMIO/BARs, below
 #     and above 4 GiB.  `mmio-ranges` is a compile-time declaration: the kernel
 #     maps these as uncached device memory and will not allocate RAM inside
-#     them, so a wrong range is a real fault, not a cosmetic error.
-#   * whether the machine has a legacy 16550 UART at all.  It does not: the
-#     kernel's primary console is hardcoded to 0x3f8 (see below).
+#     them; RAM overlap is clipped and runtime device spans are added/mapped.
+#   * whether an internal legacy 16550 UART really answers; the
+#     board exposes no external serial port; an internal COM1 may still answer.
 #
 # `plat.phys-memory-size` is inert.  No Rust code reads it; installed RAM comes
 # from the Multiboot2 memory map at boot.  Do not use it to describe this

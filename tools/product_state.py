@@ -103,6 +103,7 @@ class Variant:
     # be built, booted on a machine that has no such part, and seen to reject
     # it -- the only automated run this workstream has.
     net_igc: bool = False
+    net_rtl8125: bool = False
 
     @property
     def memory_bytes(self) -> int:
@@ -123,6 +124,8 @@ class Variant:
             suffix += "-io-notify-fastpath"
         if self.net_igc:
             suffix += "-net-igc"
+        if self.net_rtl8125:
+            suffix += "-net-rtl8125"
         return f"mem{self.memory.lower()}{suffix}"
 
 
@@ -296,6 +299,7 @@ def validate_artifact_config(artifacts: Artifacts, rootfs: Path | None, transpor
 # staging tree would otherwise leave a stamped image in place.
 ROOTFS_INPUT_FILES = (
     "scripts/build-rootfs.sh",
+    "scripts/ci/n305-dhcp.script",
     "scripts/build-guest-tools.sh",
     "scripts/build-nested-payload.sh",
     "scripts/build-glibc-payload.sh",

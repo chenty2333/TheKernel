@@ -566,6 +566,13 @@ impl DrmFile {
         Ok(())
     }
 
+    pub(crate) fn driver_name(&self) -> &'static str {
+        self.device.adapter.driver_name()
+    }
+    pub(crate) fn fixed_mode(&self) -> Option<Mode> {
+        self.device.fixed_mode
+    }
+
     pub fn resources(&self) -> KmsResources {
         self.device.state.lock().resources.clone()
     }
@@ -1407,6 +1414,57 @@ mod tests {
     fn device() -> Arc<DrmDevice> {
         DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4)
     }
+    #[test]
+    fn fixed_mode_is_rejected_in_proposal_without_advertising_a_cursor() {
+        struct Fixed;
+        impl super::super::DisplayAdapter for Fixed {
+            fn supports_cursor(&self) -> bool {
+                false
+            }
+            fn fixed_mode(&self) -> Option<Mode> {
+                Some(self.preferred_mode())
+            }
+            fn create_dumb(
+                &self,
+                _: DumbRequest,
+                _: u32,
+                _: u64,
+                _: Arc<dyn Send + Sync>,
+            ) -> DrmResult<Arc<dyn super::super::GemBacking>> {
+                Ok(Arc::new(Backing))
+            }
+            fn present(&self, _: Scanout) -> DrmResult<Arc<super::super::fence::Fence>> {
+                panic!("invalid TEST_ONLY must not present")
+            }
+        }
+        let device = DrmDevice::new(Arc::new(Fixed), 1, 2, 3, 4);
+        let file = device.open_primary();
+        file.become_master().unwrap();
+        assert_eq!(file.resources().cursor_plane_id, 0);
+        let wrong = Mode {
+            width: 640,
+            height: 480,
+            refresh_millihz: 60_000,
+        };
+        let changes = [
+            super::super::atomic::Change {
+                object: 3,
+                property: super::super::property::CRTC_ACTIVE,
+                value: 1,
+            },
+            super::super::atomic::Change {
+                object: 3,
+                property: super::super::property::CRTC_MODE_ID,
+                value: 2,
+            },
+        ];
+        assert!(matches!(
+            super::super::atomic::propose(&file, &changes, Some((2, wrong))),
+            Err(DrmError::Invalid)
+        ));
+        assert!(!device.state.lock().atomic.active);
+    }
+
     #[test]
     fn handles_are_per_open_and_drop_releases_master() {
         let dev = device();
