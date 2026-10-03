@@ -71,10 +71,12 @@ fn read_iovecs(
             return Err(AxError::InvalidInput);
         }
         let len = iov.iov_len as usize;
-        total = total.checked_add(len).ok_or(AxError::InvalidInput)?;
+        // Linux import_iovec() caps the iterator while copying every entry.
+        let accepted = len.min(MAX_RW_COUNT - total);
+        total += accepted;
         result.push(UserIoVec {
             base: iov.iov_base as usize,
-            len,
+            len: accepted,
         });
     }
     Ok((result, total))
@@ -124,8 +126,15 @@ fn read_process_vm_local_iovecs(
             return Err(AxError::BadAddress);
         }
 
-        total = total.checked_add(len).ok_or(AxError::InvalidInput)?;
-        result.push(UserIoVec { base, len });
+        // Match import_iovec(): check the complete local range above, then
+        // truncate the iterator at MAX_RW_COUNT. Keep importing later entries
+        // so an invalid range after the cap is still reported.
+        let accepted = len.min(MAX_RW_COUNT - total);
+        total += accepted;
+        result.push(UserIoVec {
+            base,
+            len: accepted,
+        });
     }
     Ok((result, total))
 }
@@ -759,7 +768,7 @@ mod tests {
     use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 
     use super::{
-        IoVec, ProcessVmOp, UserIoVec, UserMemoryCapability, page_copy_len,
+        IoVec, MAX_RW_COUNT, ProcessVmOp, UserIoVec, UserMemoryCapability, page_copy_len,
         process_madvise_is_remote, process_vm_copy, read_iovecs, read_process_vm_local_iovecs,
         validate_process_madvise_behavior,
     };
@@ -839,6 +848,112 @@ mod tests {
             read_process_vm_local_iovecs(&capability, 0x1000 as *const IoVec, descriptors.len()),
             Err(AxError::BadAddress)
         ));
+    }
+
+    #[test]
+    fn process_vm_iovecs_cap_total_at_max_rw_count_after_full_local_checks() {
+        let capability = mapped_capability();
+        let descriptors = [
+            IoVec {
+                iov_base: 0x2000,
+                iov_len: (MAX_RW_COUNT - 7) as i64,
+            },
+            IoVec {
+                iov_base: 0x4000,
+                iov_len: PAGE_SIZE_4K as i64,
+            },
+        ];
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            capability
+                .write_value(
+                    (0x1000 + index * core::mem::size_of::<IoVec>()) as *mut IoVec,
+                    *descriptor,
+                )
+                .unwrap();
+        }
+
+        let (iovecs, total) =
+            read_process_vm_local_iovecs(&capability, 0x1000 as *const IoVec, descriptors.len())
+                .unwrap();
+        assert_eq!(total, MAX_RW_COUNT);
+        assert_eq!(iovecs[0].len, MAX_RW_COUNT - 7);
+        assert_eq!(iovecs[1].len, 7);
+
+        // A single element larger than the cap is truncated too, but the
+        // full range of every later element is still checked.
+        let oversized = [
+            IoVec {
+                iov_base: 0x2000,
+                iov_len: (MAX_RW_COUNT + PAGE_SIZE_4K) as i64,
+            },
+            IoVec {
+                iov_base: 0x4000,
+                iov_len: 1,
+            },
+        ];
+        for (index, descriptor) in oversized.iter().enumerate() {
+            capability
+                .write_value(
+                    (0x1000 + index * core::mem::size_of::<IoVec>()) as *mut IoVec,
+                    *descriptor,
+                )
+                .unwrap();
+        }
+        let (iovecs, total) =
+            read_process_vm_local_iovecs(&capability, 0x1000 as *const IoVec, oversized.len())
+                .unwrap();
+        assert_eq!(total, MAX_RW_COUNT);
+        assert_eq!(iovecs[0].len, MAX_RW_COUNT);
+        assert_eq!(iovecs[1].len, 0);
+
+        let invalid_tail = [
+            oversized[0],
+            IoVec {
+                iov_base: crate::config::TASK_SIZE_MAX as u64,
+                iov_len: 1,
+            },
+        ];
+        for (index, descriptor) in invalid_tail.iter().enumerate() {
+            capability
+                .write_value(
+                    (0x1000 + index * core::mem::size_of::<IoVec>()) as *mut IoVec,
+                    *descriptor,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            read_process_vm_local_iovecs(&capability, 0x1000 as *const IoVec, invalid_tail.len(),),
+            Err(AxError::BadAddress)
+        ));
+    }
+
+    #[test]
+    fn process_vm_remote_iovec_total_is_capped_at_max_rw_count() {
+        let capability = mapped_capability();
+        let descriptors = [
+            IoVec {
+                iov_base: 0x2000,
+                iov_len: (MAX_RW_COUNT - 7) as i64,
+            },
+            IoVec {
+                iov_base: 0x4000,
+                iov_len: PAGE_SIZE_4K as i64,
+            },
+        ];
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            capability
+                .write_value(
+                    (0x1000 + index * core::mem::size_of::<IoVec>()) as *mut IoVec,
+                    *descriptor,
+                )
+                .unwrap();
+        }
+
+        let (iovecs, total) =
+            read_iovecs(&capability, 0x1000 as *const IoVec, descriptors.len()).unwrap();
+        assert_eq!(total, MAX_RW_COUNT);
+        assert_eq!(iovecs[0].len, MAX_RW_COUNT - 7);
+        assert_eq!(iovecs[1].len, 7);
     }
 
     #[test]
