@@ -95,6 +95,8 @@ pub enum RcuError {
 /// and the retire reservation is released.
 #[derive(Debug)]
 pub enum PublishError<T> {
+    /// The retire capacity was reserved in a different epoch domain.
+    WrongDomain(Arc<T>),
     /// Another writer installed a different pointer first.
     Stale(Arc<T>),
     /// The monotonically increasing epoch domain is exhausted.
@@ -104,6 +106,8 @@ pub enum PublishError<T> {
 /// Failure while clearing an atomic RCU slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClearError {
+    /// The retire capacity was reserved in a different epoch domain.
+    WrongDomain,
     /// Another writer changed the expected pointer first.
     Stale,
     /// The monotonic epoch domain is exhausted.
@@ -512,6 +516,13 @@ impl<P: EpochPlatform, const MAX_CPUS: usize, const CAPACITY: usize>
         expected: *const T,
         mut reservation: RetireReservation<'_, P, MAX_CPUS, CAPACITY>,
     ) -> Result<Arc<T>, PublishError<T>> {
+        // Capacity belongs to a domain, not merely to a reservation's Rust
+        // type. Reject a foreign token before changing the epoch, pointer or
+        // Arc ownership; its Drop refunds only the domain that reserved it.
+        if !core::ptr::eq(self, reservation.domain) {
+            drop(reservation);
+            return Err(PublishError::WrongDomain(replacement));
+        }
         let _writer = self.writer.lock();
         if slot.load(Ordering::Acquire).cast_const() != expected {
             drop(reservation);
@@ -583,6 +594,10 @@ impl<P: EpochPlatform, const MAX_CPUS: usize, const CAPACITY: usize>
         expected: *const T,
         mut reservation: RetireReservation<'_, P, MAX_CPUS, CAPACITY>,
     ) -> Result<Arc<T>, ClearError> {
+        if !core::ptr::eq(self, reservation.domain) {
+            drop(reservation);
+            return Err(ClearError::WrongDomain);
+        }
         let _writer = self.writer.lock();
         if slot.load(Ordering::Acquire).cast_const() != expected {
             drop(reservation);
@@ -839,6 +854,8 @@ impl<'d, T, P: EpochPlatform, const MAX_CPUS: usize, const CAPACITY: usize>
 
     /// Atomically clears a published object and queues its old owner for the
     /// supplied pre-reserved grace-period retirement.
+    /// The reservation must belong to this slot's domain; a foreign one is
+    /// refunded without changing the pointer or epoch.
     pub fn clear(
         &self,
         expected: &Arc<T>,
@@ -979,6 +996,8 @@ impl<'d, T, P: EpochPlatform, const MAX_CPUS: usize, const CAPACITY: usize>
     /// A failed check leaves both the slot and reservation unchanged except
     /// for releasing the reservation capacity; no visible partial update is
     /// possible.
+    /// Reservations from other slots in the same domain are valid, but a
+    /// reservation from another domain is rejected before publication.
     pub fn publish(
         &self,
         replacement: Arc<T>,
@@ -1106,6 +1125,70 @@ mod tests {
     }
 
     type TestDomain = EpochDomain<TestPlatform, 1, 2>;
+
+    #[test]
+    fn foreign_retire_reservation_cannot_publish_into_another_domain() {
+        let target = TestDomain::new();
+        let foreign = TestDomain::new();
+        target.register_cpu(0).unwrap();
+        let initial = Arc::new(1usize);
+        let slot = RcuSlot::new(&target, initial.clone());
+        let replacement = Arc::new(2usize);
+        let result = slot.publish(
+            replacement.clone(),
+            &initial,
+            foreign.reserve_retire().unwrap(),
+        );
+        match result {
+            Err(PublishError::WrongDomain(returned)) => {
+                assert!(Arc::ptr_eq(&returned, &replacement));
+            }
+            _ => panic!("foreign reservation was not rejected"),
+        }
+        assert!(Arc::ptr_eq(&slot.load(), &initial));
+        assert_eq!(target.epoch.load(Ordering::Acquire), 0);
+        assert!(!target.has_pending());
+        assert!(!foreign.has_pending());
+        assert_eq!(target.retire.lock().reserved, 0);
+        assert_eq!(foreign.retire.lock().reserved, 0);
+        assert_eq!(Arc::strong_count(&replacement), 1);
+    }
+
+    #[test]
+    fn foreign_retire_reservation_cannot_clear_another_domain() {
+        let target = TestDomain::new();
+        let foreign = TestDomain::new();
+        target.register_cpu(0).unwrap();
+        let initial = Arc::new(1usize);
+        let slot = RcuSlot::new(&target, initial.clone());
+        let result = slot.clear(&initial, foreign.reserve_retire().unwrap());
+        assert!(matches!(result, Err(ClearError::WrongDomain)));
+        assert!(Arc::ptr_eq(&slot.load(), &initial));
+        assert_eq!(target.epoch.load(Ordering::Acquire), 0);
+        assert!(!target.has_pending());
+        assert!(!foreign.has_pending());
+        assert_eq!(target.retire.lock().reserved, 0);
+        assert_eq!(foreign.retire.lock().reserved, 0);
+    }
+
+    #[test]
+    fn retire_reservations_are_shared_between_slots_in_the_same_domain() {
+        let domain = TestDomain::new();
+        domain.register_cpu(0).unwrap();
+        let source = RcuSlot::new(&domain, Arc::new(1usize));
+        let target = RcuSlot::new(&domain, Arc::new(2usize));
+        let expected = target.load();
+        let retired = target
+            .publish(Arc::new(3usize), &expected, source.reserve_retire().unwrap())
+            .unwrap();
+        assert!(Arc::ptr_eq(&retired, &expected));
+        assert_eq!(*source.load(), 1);
+        assert_eq!(*target.load(), 3);
+        assert_eq!(domain.drain(2).unwrap().dropped, 1);
+        target.clear(&target.load(), source.reserve_retire().unwrap()).unwrap();
+        assert!(target.is_empty());
+        assert_eq!(domain.drain(2).unwrap().dropped, 1);
+    }
 
     #[test]
     fn empty_pending_probes_do_not_take_the_retire_lock() {

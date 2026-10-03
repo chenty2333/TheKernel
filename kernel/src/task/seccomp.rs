@@ -205,7 +205,9 @@ impl Thread {
             .seccomp
             .clear(&retirement.expected, retirement.reservation)
             .map_err(|error| match error {
-                ClearError::Stale | ClearError::EpochExhausted => AxError::BadState,
+                ClearError::WrongDomain | ClearError::Stale | ClearError::EpochExhausted => {
+                    AxError::BadState
+                }
                 ClearError::NotTaskContext | ClearError::BadContext => AxError::BadState,
             });
         if result.is_ok() {
@@ -384,6 +386,7 @@ impl Thread {
             .map_err(|error| match error {
                 PublishError::Stale(_) => SeccompPublicationError::Stale,
                 PublishError::EpochExhausted(_) => SeccompPublicationError::EpochExhausted,
+                PublishError::WrongDomain(_) => SeccompPublicationError::BadState,
             })?;
         crate::rcu::wake_seccomp_retire_worker();
         Ok(())
@@ -433,6 +436,7 @@ impl Thread {
             .map_err(|error| match error {
                 PublishError::Stale(_) => SeccompPublicationError::Stale,
                 PublishError::EpochExhausted(_) => SeccompPublicationError::EpochExhausted,
+                PublishError::WrongDomain(_) => SeccompPublicationError::BadState,
             });
         if result.is_ok() {
             crate::rcu::wake_seccomp_retire_worker();

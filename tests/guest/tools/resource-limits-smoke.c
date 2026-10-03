@@ -3,14 +3,18 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int fail(const char *stage) {
@@ -190,11 +194,54 @@ static int test_mmap_boundary_faults(void) {
     return 0;
 }
 
+/* Normal callers must keep the two independent policy-retirement domains
+ * usable while credentials and seccomp states are replaced and torn down.
+ * The foreign-reservation misuse itself is a Rust mechanism regression:
+ * userspace cannot manufacture that internal token. */
+static int test_policy_retire_domains(void) {
+    for (int round = 0; round < 8; ++round) {
+        pid_t child = fork();
+        if (child < 0) return fail("policy-domains-fork");
+        if (child == 0) {
+            uid_t uid = geteuid();
+            gid_t gid = getegid();
+            struct sock_filter filter[] = {
+                BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+            };
+            struct sock_fprog program = {
+                .len = sizeof(filter) / sizeof(filter[0]),
+                .filter = filter,
+            };
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) _exit(1);
+            for (int i = 0; i < 16; ++i) {
+                if (setresuid((uid_t)-1, uid, (uid_t)-1) ||
+                    setresgid((gid_t)-1, gid, (gid_t)-1) ||
+                    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) ||
+                    geteuid() != uid || getegid() != gid ||
+                    prctl(PR_GET_SECCOMP) != SECCOMP_MODE_FILTER) {
+                    _exit(1);
+                }
+            }
+            _exit(0);
+        }
+        int status;
+        pid_t waited;
+        do { waited = waitpid(child, &status, 0); }
+        while (waited < 0 && errno == EINTR);
+        if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status)) {
+            return fail("policy-domains-child");
+        }
+    }
+    puts("THEKERNEL_POLICY_RETIRE_DOMAINS_OK");
+    return 0;
+}
+
 int main(void) {
     if (test_rlimit_nofile_exhaustion() != 0) return 1;
     if (test_pipe_capacity_saturation() != 0) return 1;
     if (test_path_length_limits() != 0) return 1;
     if (test_mmap_boundary_faults() != 0) return 1;
+    if (test_policy_retire_domains() != 0) return 1;
 
     puts("THEKERNEL_RESOURCE_LIMITS_OK");
     return 0;
