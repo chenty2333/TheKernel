@@ -2719,7 +2719,19 @@ impl DirNodeOps for OverlayDir {
             .work
             .as_ref()
             .ok_or_else(OverlayFilesystem::read_only_error)?;
-        let location = backend.create(work, &upper, name, options)?;
+        let location = match backend.create(work, &upper, name, options) {
+            Ok(location) => location,
+            Err(VfsError::AlreadyExists) if disposition == CreateDisposition::OpenOrCreate => {
+                // Another OpenOrCreate may have published after our initial
+                // lookup. Resolve and open that winner instead of turning the
+                // non-exclusive operation into EEXIST.
+                return Ok(axfs_ng_vfs::CreateOutcome {
+                    entry: self.lookup(name)?,
+                    created: false,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         self.fs.namespace_epoch.fetch_add(1, Ordering::AcqRel);
         let layers = OverlayLayers {
             upper: Some(location),
