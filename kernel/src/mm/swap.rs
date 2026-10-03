@@ -276,7 +276,7 @@ pub(crate) fn unregister_address_space(aspace: &Arc<Mutex<AddrSpace>>) {
 /// system-wide uprobes.  Callers only retain strong references returned by the
 /// snapshot; the registry itself remains weak and therefore cannot extend an
 /// mm's lifetime.
-fn try_live_address_spaces() -> AxResult<Vec<Arc<Mutex<AddrSpace>>>> {
+pub(crate) fn try_live_address_spaces() -> AxResult<Vec<Arc<Mutex<AddrSpace>>>> {
     let mut live = LIVE_ADDRESS_SPACES.lock();
     let count = live.entries.len();
     let mut spaces = Vec::new();
@@ -320,7 +320,11 @@ fn for_each_live_address_space(mut visit: impl FnMut(Arc<Mutex<AddrSpace>>)) {
             visit(aspace);
         } else {
             let mut live = LIVE_ADDRESS_SPACES.lock();
-            if live.entries.get(&id).is_some_and(|(current, ..)| current.upgrade().is_none()) {
+            if live
+                .entries
+                .get(&id)
+                .is_some_and(|(current, ..)| current.upgrade().is_none())
+            {
                 live.entries.remove(&id);
             }
         }
@@ -696,10 +700,7 @@ mod tests {
         assert_eq!(effective_priority(SWAP_FLAG_DISCARD as u32), -1);
         // Every SWAP_FLAGS_VALID bit except PREFER leaves the default alone,
         // which is what makes the priority independent of insertion history.
-        assert_eq!(
-            effective_priority(SWAP_FLAGS_VALID & !SWAP_FLAG_PREFER),
-            -1
-        );
+        assert_eq!(effective_priority(SWAP_FLAGS_VALID & !SWAP_FLAG_PREFER), -1);
         // With PREFER, the priority is the low 15 bits and the PREFER bit itself
         // is masked away.
         assert_eq!(effective_priority(SWAP_FLAG_PREFER), 0);

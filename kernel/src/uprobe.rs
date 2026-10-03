@@ -3423,7 +3423,7 @@ pub(crate) fn register(
     // process-image live-mm registry, otherwise the first system-wide probe
     // silently misses ordinary processes whose executable mapping predates
     // registration.
-    let mut address_spaces = crate::mm::live_address_spaces();
+    let mut address_spaces = crate::mm::try_live_address_spaces()?;
     // A CPU/cgroup uprobe has no single target mm. Publication therefore
     // installs the object+offset probe into every already-known mm; later
     // mmap/fork/exec reconciliation observes the same global consumer. Keep

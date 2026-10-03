@@ -26,7 +26,13 @@ static KHUGEPAGED_CURSOR: SpinNoIrq<KhugepagedCursor> = SpinNoIrq::new(Khugepage
 });
 
 fn scan_once() {
-    let spaces = crate::mm::live_address_spaces();
+    let spaces = match crate::mm::try_live_address_spaces() {
+        Ok(spaces) => spaces,
+        Err(error) => {
+            warn!("khugepaged live-mm snapshot failed: {error:?}");
+            return;
+        }
+    };
     if spaces.is_empty() {
         *KHUGEPAGED_CURSOR.lock() = KhugepagedCursor {
             mm_index: 0,
