@@ -71,3 +71,11 @@ reset 2673–2679; RX/TX configuration 2594–2617 and 2790–2815; old descript
 selection and single queue 3866–3886; coalescing 4043–4061; enabling 4131–4136;
 TX doorbell 4554; RX validation/FCS 4790–4823. The omitted PHY initialization
 is in `r8169_phy_config.c`; firmware format/loading is in `r8169_firmware.c`.
+
+## 2026-10-04 family extraction
+
+The measured N305 part is **10ec:8168**, not RTL8125. The descriptor, DMA,
+identity and register-bus core now lives in `tk-axdriver-net/src/r8169/`;
+`rtl8125` is the existing feature entry point into that single implementation.
+See `nic-rtl8168.md` for the H-specific path. The B warm-PHY sequence is
+retained, not silently replaced with an H PHY upload.

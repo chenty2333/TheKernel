@@ -9,8 +9,9 @@ use super::regs::{
 };
 use crate::{DevError, DevResult};
 
-pub fn reset(bus: &mut impl Bus) -> DevResult {
-    bus.write(r::IRQ_MASK, Dword, 0);
+pub fn reset(bus: &mut impl Bus, chip: super::ids::Chip) -> DevResult {
+    let (mask, _, width) = chip.irq();
+    bus.write(mask, width, 0);
     bus.write(r::COMMAND, Byte, r::RESET);
     for _ in 0..1000 {
         if bus.read(r::COMMAND, Byte) & r::RESET == 0 {
@@ -28,7 +29,7 @@ fn legacy_descriptors(bus: &mut impl Bus) {
     let value = bus.read(r::OCP_DATA, Dword) & 0xffff;
     bus.write(r::OCP_DATA, Dword, (1 << 31) | command | (value & !1));
 }
-pub fn program(bus: &mut impl Bus, tx: u64, rx: u64) {
+fn program_8125(bus: &mut impl Bus, tx: u64, rx: u64) {
     bus.write(r::CFG_LOCK, Byte, 0xc0);
     bus.write(r::INT_CFG, Byte, 0);
     bus.write(r::INT_CFG1, Word, 0);
@@ -57,4 +58,17 @@ pub fn program(bus: &mut impl Bus, tx: u64, rx: u64) {
     bus.write(r::IRQ_STATUS, Dword, u32::MAX);
     // Posted-write flush; no interrupt source is ever unmasked.
     let _ = bus.read(r::COMMAND, Byte);
+}
+
+/// Family dispatch occurs before any chip-specific indirect register access.
+pub fn program(bus: &mut impl Bus, chip: super::ids::Chip, tx: u64, rx: u64) -> DevResult {
+    match chip {
+        super::ids::Chip::Rtl8125B => program_8125(bus, tx, rx),
+        super::ids::Chip::Rtl8168H => super::h8168::program(bus, tx, rx)?,
+    }
+    if bus.interrupts_available() {
+        let (mask, _, width) = chip.irq();
+        bus.write(mask, width, 0x002f); // RX/TX success/error and link change
+    }
+    Ok(())
 }

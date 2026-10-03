@@ -20,6 +20,7 @@ bpf = ["dep:axbpf", "dep:tk-linux-bpf", "perf-sampling"]
 # `virtio-net` and the two cannot both be the one static NIC type.
 net-n305 = ["axfeat/driver-n305-net"]
 net-rtl8125 = ["axfeat/driver-rtl8125"]
+net-rtl8168 = ["axfeat/driver-rtl8168"]
 net-igc = ["axfeat/driver-igc"]
 asid-fast-switch = ["axhal/asid-fast-switch"]
 hwp-uclamp = ["axhal/hwp-uclamp", "axruntime/ipi", "axtask/hwp-uclamp"]

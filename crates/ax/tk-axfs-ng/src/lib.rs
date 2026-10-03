@@ -952,3 +952,6 @@ fn init_filesystems_with_root_mode(
         .expect("Failed to allocate root filesystem scope context");
     ROOT_FS_SCOPE_CONTEXT.call_once(|| shared);
 }
+
+/// Byte-oriented path accepted by the filesystem open API.
+pub use axfs_ng_vfs::FsPath;

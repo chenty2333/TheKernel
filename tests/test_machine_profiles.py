@@ -65,6 +65,15 @@ class MachineProfileTests(unittest.TestCase):
         self.assertTrue(rtl.net_rtl8125)
         self.assertIn("-net-rtl8125", rtl.name)
 
+    def test_rtl8168_feature_has_its_own_variant_and_is_in_n305(self):
+        args = product.build_parser().parse_args(["build", "--net-rtl8168"])
+        artifacts = product.artifacts_for(args)
+        self.assertTrue(artifacts.variant.net_rtl8168)
+        self.assertIn("-net-rtl8168", artifacts.variant.name)
+        self.assertIn("net-rtl8168", product.kernel_features(artifacts).split())
+        args = product.build_parser().parse_args(["build", "--platform", "n305"])
+        self.assertIn("net-rtl8168", product.kernel_features(product.artifacts_for(args)).split())
+
     def test_every_selectable_profile_exists_and_generates_a_config(self) -> None:
         self.assertEqual(set(MACHINE_PROFILES), {"q35-uefi", "n305"})
         for name, profile in MACHINE_PROFILES.items():

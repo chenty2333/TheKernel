@@ -1,5 +1,5 @@
 //! Register facts: Linux r8169_main.c:257-315, 411-455, 473-501.
-//! The 8125 interrupt registers are 32-bit; old 8169 offsets are not used.
+//! IRQ layout is selected by ids::Chip; 8168 uses word, 8125 dword registers.
 pub const WINDOW: usize = 0x10000;
 pub const MAC: usize = 0x00;
 pub const TX_LOW: usize = 0x20;
@@ -37,4 +37,10 @@ pub trait Bus: Send + Sync {
     fn read(&mut self, offset: usize, width: Width) -> u32;
     fn write(&mut self, offset: usize, width: Width, value: u32);
     fn delay_us(&mut self, micros: u32);
+    fn irq_num(&self) -> Option<usize> {
+        None
+    }
+    fn interrupts_available(&self) -> bool {
+        false
+    }
 }

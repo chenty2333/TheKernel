@@ -590,11 +590,28 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         early_screen_milestone("driver init");
         #[allow(unused_variables)]
         let all_devices = axdriver::init_drivers();
+        #[allow(unused_mut)]
+        let mut all_devices = all_devices;
 
         #[cfg(feature = "fs-ng")]
         early_screen_milestone("filesystems");
         #[cfg(feature = "fs-ng")]
         axfs_ng::init_filesystems(all_devices.block);
+        #[cfg(all(feature = "fs-ng", feature = "net-ng"))]
+        for device in all_devices.net.iter_mut() {
+            #[allow(unused_imports)]
+            use axdriver::prelude::NetDriverOps;
+            if let Some(path) = device.firmware_path() {
+                match read_network_firmware(path) {
+                    Some(bytes) => match device.load_firmware(&bytes) {
+                        Ok(()) => info!("NIC firmware {path}: applied; hardware-unverified"),
+                        Err(error) => warn!("NIC firmware {path}: failed {error:?}; MAC may be stopped"),
+                    },
+                    None => warn!("NIC firmware {path}: unavailable; degraded warm-PXE PHY only"),
+                }
+            }
+        }
+
 
         #[cfg(feature = "net-ng")]
         {
@@ -861,3 +878,22 @@ fn init_tls() {
     unsafe { axhal::asm::write_thread_pointer(main_tls.tls_ptr() as usize) };
     core::mem::forget(main_tls);
 }
+
+/// Rootfs-only runtime firmware loader. Small fixed cap; no arbitrary DMA image.
+#[cfg(all(feature = "fs-ng", feature = "net-ng"))]
+fn read_network_firmware(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    let context = axfs_ng::ROOT_FS_CONTEXT.get()?;
+    let file = axfs_ng::OpenOptions::new().read(true).open(context, axfs_ng::FsPath::new(path.as_bytes())).ok()?.into_file().ok()?;
+    let mut bytes = alloc::vec::Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let length = file.read_slice(&mut chunk).ok()?;
+        if length == 0 { return Some(bytes); }
+        if bytes.len().checked_add(length)? > 64 * 1024 { return None; }
+        bytes.try_reserve(length).ok()?;
+        bytes.extend_from_slice(&chunk[..length]);
+    }
+}
+
+#[cfg(all(feature = "fs-ng", feature = "net-ng"))]
+extern crate alloc;

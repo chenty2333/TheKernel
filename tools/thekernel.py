@@ -95,7 +95,8 @@ def parse_variant(args: argparse.Namespace) -> Variant:
                       io_submit_batch=getattr(args, "io_submit_batch", False),
                       io_notify_fastpath=getattr(args, "io_notify_fastpath", False),
                       net_igc=getattr(args, "net_igc", False),
-                      net_rtl8125=getattr(args, "net_rtl8125", False))
+                      net_rtl8125=getattr(args, "net_rtl8125", False),
+                      net_rtl8168=getattr(args, "net_rtl8168", False))
     if variant.memory_bytes <= KERNEL_LOAD_PADDR:
         raise ProductError("--memory must extend beyond the 2 MiB kernel load address")
     if variant.memory_bytes > X86_64_MAX_MEMORY_BYTES:
@@ -280,6 +281,8 @@ def kernel_features(artifacts: Artifacts) -> str:
         features.append("net-igc")
     if variant.net_rtl8125:
         features.append("net-rtl8125")
+    if variant.net_rtl8168 or artifacts.machine.name == "n305":
+        features.append("net-rtl8168")
     if artifacts.machine.name == "n305" or (variant.net_igc and variant.net_rtl8125):
         features.append("net-n305")
     return " ".join(features)
@@ -1480,6 +1483,7 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
     parser.add_argument("--io-notify-fastpath", action="store_true",
                         help="enable the experimental no-mark fanotify permission fast path in separate artifact paths")
     parser.add_argument("--net-rtl8125", action="store_true", help="build the unverified RTL8125B/BG polling driver")
+    parser.add_argument("--net-rtl8168", action="store_true", help="build the unverified RTL8168H family driver")
     parser.add_argument("--net-igc", action="store_true",
                         help="build the Intel i225/i226 (igc) NIC probe into the product kernel; "
                              "no QEMU machine has this device, so a boot exercises the "

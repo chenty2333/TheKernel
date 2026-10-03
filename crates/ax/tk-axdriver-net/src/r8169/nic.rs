@@ -5,6 +5,7 @@ use core::{marker::PhantomData, mem::ManuallyDrop, ptr::NonNull};
 use super::{
     Hal, bringup,
     desc::{self as d, Descriptor},
+    ids::Chip,
     probe,
     regs::{
         self as r, Bus,
@@ -74,6 +75,7 @@ impl<H: Hal> Drop for Allocation<H> {
 pub struct RtlNic<H: Hal, B: Bus, const N: usize> {
     bus: B,
     mac: [u8; 6],
+    chip: Chip,
     tx_desc: ManuallyDrop<Allocation<H>>,
     rx_desc: ManuallyDrop<Allocation<H>>,
     tx_data: ManuallyDrop<Allocation<H>>,
@@ -95,7 +97,7 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
         if N < 2 || N > 256 || !N.is_power_of_two() {
             return Err(DevError::InvalidParam);
         }
-        let mac = probe::identify(&mut bus)?;
+        let (chip, mac) = probe::identify(&mut bus)?;
         // No published addresses until all four allocations have succeeded.
         let tx_desc = Allocation::new(N * size_of::<Descriptor>())?;
         let rx_desc = Allocation::new(N * size_of::<Descriptor>())?;
@@ -104,6 +106,7 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
         let mut nic = Self {
             bus,
             mac,
+            chip,
             tx_desc: ManuallyDrop::new(tx_desc),
             rx_desc: ManuallyDrop::new(rx_desc),
             tx_data: ManuallyDrop::new(tx_data),
@@ -117,11 +120,11 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
             tx_used: 0,
             rx_head: 0,
         };
-        bringup::reset(&mut nic.bus)?;
+        bringup::reset(&mut nic.bus, chip)?;
         for index in 0..N {
             nic.arm_rx(index);
         }
-        bringup::program(&mut nic.bus, nic.tx_desc.address, nic.rx_desc.address);
+        bringup::program(&mut nic.bus, chip, nic.tx_desc.address, nic.rx_desc.address)?;
         Ok(nic)
     }
     pub fn link_up(&mut self) -> bool {
@@ -145,13 +148,11 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
 }
 impl<H: Hal, B: Bus, const N: usize> Drop for RtlNic<H, B, N> {
     fn drop(&mut self) {
-        if bringup::reset(&mut self.bus).is_err()
+        if bringup::reset(&mut self.bus, self.chip).is_err()
             || self.rx_loan.contains(&true)
             || self.tx_loan.contains(&CALLER)
         {
-            log::warn!(
-                "rtl8125: DMA stop or packet-loan release unconfirmed; retaining DMA memory"
-            );
+            log::warn!("r8169: DMA stop or packet-loan release unconfirmed; retaining DMA memory");
             return;
         }
         // SAFETY: reset completed, so no DMA can access these allocations;
@@ -165,14 +166,46 @@ impl<H: Hal, B: Bus, const N: usize> Drop for RtlNic<H, B, N> {
     }
 }
 impl<H: Hal, B: Bus, const N: usize> BaseDriverOps for RtlNic<H, B, N> {
+    fn irq_num(&self) -> Option<usize> {
+        self.bus.irq_num()
+    }
     fn device_name(&self) -> &str {
-        "rtl8125"
+        self.chip.name()
     }
     fn device_type(&self) -> DeviceType {
         DeviceType::Net
     }
 }
 impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
+    fn rx_poll_interval_micros(&self) -> Option<u64> {
+        Some(10_000)
+    }
+    fn firmware_path(&self) -> Option<&'static str> {
+        (self.chip == Chip::Rtl8168H).then_some("/lib/firmware/rtl_nic/rtl8168h-2.fw")
+    }
+    fn load_firmware(&mut self, bytes: &[u8]) -> DevResult {
+        if self.chip != Chip::Rtl8168H {
+            return Err(DevError::Unsupported);
+        }
+        let firmware = super::firmware::Firmware::parse(bytes)?;
+        if self.tx_used != 0 || self.rx_loan.contains(&true) || self.tx_loan.contains(&CALLER) {
+            return Err(DevError::ResourceBusy);
+        }
+        bringup::reset(&mut self.bus, self.chip)?;
+        // A PHY failure leaves the MAC disabled; no fake warm-PHY success.
+        firmware.execute(&mut self.bus)?;
+        super::h8168::configure_phy(&mut self.bus)?;
+        for index in 0..N {
+            self.arm_rx(index);
+        }
+        self.rx_head = 0;
+        bringup::program(
+            &mut self.bus,
+            self.chip,
+            self.tx_desc.address,
+            self.rx_desc.address,
+        )
+    }
     fn mac_address(&self) -> EthernetAddress {
         EthernetAddress(self.mac)
     }
@@ -235,7 +268,10 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
         }
         self.tx_tail = (slot + 1) % N;
         self.tx_used += 1;
-        self.bus.write(r::TX_POLL, Word, 1);
+        match self.chip {
+            Chip::Rtl8125B => self.bus.write(r::TX_POLL, Word, 1),
+            Chip::Rtl8168H => self.bus.write(0x38, Byte, 1 << 6),
+        }
         Ok(())
     }
     fn recycle_tx_buffers(&mut self) -> DevResult {
@@ -343,6 +379,39 @@ mod tests {
             unsafe { (*nic.descriptor(true, index)).options } & d::OWN,
             0
         );
+    }
+    #[test]
+    fn h8168_packets_use_the_shared_ring_and_byte_doorbell() {
+        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+        assert_eq!(nic.device_name(), "rtl8168");
+        for _ in 0..12 {
+            let packet = nic.alloc_tx_buffer(42).unwrap();
+            unsafe {
+                packet.packet_ptr().as_ptr().write_bytes(0xa5, 42);
+            }
+            let slot = nic.tx_tail;
+            nic.transmit(packet).unwrap();
+            assert_eq!(nic.bus.writes.last(), Some(&(0x38, Byte, 0x40)));
+            unsafe {
+                let data = (*nic.descriptor(false, slot)).address as *const u8;
+                assert_eq!(core::slice::from_raw_parts(data, 42), &[0xa5; 42]);
+                assert_eq!(core::slice::from_raw_parts(data.add(42), 18), &[0; 18]);
+                (*nic.descriptor(false, slot)).options &= !d::OWN;
+            }
+            nic.recycle_tx_buffers().unwrap();
+            let rx = nic.rx_head;
+            unsafe {
+                nic.rx_data.slot(rx).as_ptr().write_bytes(0x5a, 60);
+                (*nic.descriptor(true, rx)).options = d::FIRST | d::LAST | 64;
+            }
+            let packet = nic.receive().unwrap();
+            assert_eq!(packet.packet_len(), 60);
+            assert_eq!(
+                unsafe { core::slice::from_raw_parts(packet.packet_ptr().as_ptr(), 60) },
+                &[0x5a; 60]
+            );
+            nic.recycle_rx_buffer(packet).unwrap();
+        }
     }
     #[test]
     fn malformed_receive_is_rearmed_and_ring_full_is_bounded() {
