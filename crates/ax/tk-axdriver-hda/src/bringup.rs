@@ -315,6 +315,9 @@ impl<H: Hal, B: Bus> Controller<H, B> {
 }
 impl<H: Hal, B: Bus> Verbs for Controller<H, B> {
     fn verb(&mut self, codec: u8, node: u8, operation: u16, payload: u16) -> DevResult<u32> {
+        if codec >= 15 || node >= 128 || operation > 0xfff {
+            return Err(DevError::InvalidParam);
+        }
         if !self.live {
             return Err(DevError::BadState);
         }

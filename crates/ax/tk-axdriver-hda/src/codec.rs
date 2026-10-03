@@ -32,7 +32,7 @@ fn children(v: &mut impl Verbs, c: u8, n: u8) -> DevResult<core::ops::Range<u16>
     let value = parameter(v, c, n, 4)?;
     let start = ((value >> 16) & 255) as u16;
     let count = (value & 255) as u16;
-    if start + count > 256 {
+    if start + count > 128 {
         return Err(DevError::InvalidParam);
     }
     Ok(start..start + count)
@@ -50,7 +50,7 @@ fn connections(v: &mut impl Verbs, c: u8, n: u8) -> DevResult<Vec<u8>> {
             let raw = (value >> (index * bits)) & if long { 65535 } else { 255 };
             let range = raw & if long { 32768 } else { 128 } != 0;
             let target = raw & if long { 32767 } else { 127 };
-            if target == 0 || target > 255 {
+            if target == 0 || target > 127 {
                 return Err(DevError::InvalidParam);
             }
             if range {
@@ -230,4 +230,25 @@ pub fn configure(v: &mut impl Verbs, route: &Route) -> DevResult {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct InvalidNodes;
+    impl Verbs for InvalidNodes {
+        fn verb(&mut self, _: u8, _: u8, operation: u16, payload: u16) -> DevResult<u32> {
+            Ok(match (operation, payload) {
+                (0xf00, 4) => 0x7f0002,
+                (0xf00, 0x0e) => 0x81,
+                (0xf02, _) => 128,
+                _ => 0,
+            })
+        }
+    }
+    #[test]
+    fn indirect_node_bit_is_never_used_as_an_eighth_node_bit() {
+        assert!(children(&mut InvalidNodes, 0, 0).is_err());
+        assert!(connections(&mut InvalidNodes, 0, 2).is_err());
+    }
 }

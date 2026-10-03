@@ -80,3 +80,8 @@ Measured QEMU 10.2.2/KVM: `check_hda_waveform.py` passed all 8192 frames /
 run lost the final backend-buffered samples even though DMA drained; release
 now runs a silent tail for max(FIFOS + 1, two periods) before STOP. This is why
 submission/initialization markers are not used as waveform acceptance.
+
+Node IDs are bounded to the specification's seven bits; malformed child ranges
+and long connection entries must not set the reserved indirect-address bit.
+The regression test and final 8192-frame QEMU WAV comparison pass with that
+validation (seven HDA host tests total).
