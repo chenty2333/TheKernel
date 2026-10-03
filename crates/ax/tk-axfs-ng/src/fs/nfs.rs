@@ -6523,8 +6523,29 @@ impl DirNodeOps for NfsNode {
         )
     }
     fn read_dir(&self, offset: u64, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+        let mut count = 0;
+        let self_inode = self.attr.lock().fileid;
+        if offset == 0 {
+            if !sink.accept(FsName::new(b"."), self_inode, NodeType::Directory, 1) {
+                return Ok(count);
+            }
+            count += 1;
+        }
+        if offset <= 1 {
+            let current = self.parent_entry()?;
+            let parent_inode = current
+                .parent()
+                .map(|parent| parent.inode())
+                .unwrap_or_else(|| current.inode());
+            if !sink.accept(FsName::new(b".."), parent_inode, NodeType::Directory, 2) {
+                return Ok(count);
+            }
+            count += 1;
+        }
+
+        let server_cookie = if offset <= 2 { 0 } else { offset };
         let epoch = self.fs.mount.coherency_epoch();
-        let verifier = if offset == 0 {
+        let verifier = if server_cookie == 0 {
             [0; 8]
         } else {
             match *self.dir_verifier.lock() {
@@ -6543,14 +6564,13 @@ impl DirNodeOps for NfsNode {
         let reply = nfs_vfs(
             self.fs
                 .mount
-                .read_dir(&self.fh, offset, verifier, 64 * 1024),
+                .read_dir(&self.fh, server_cookie, verifier, 64 * 1024),
         )?;
-        if offset == 0 {
+        if server_cookie == 0 {
             *self.dir_verifier.lock() = Some((epoch, reply.verifier));
         } else if reply.verifier != verifier {
             return Err(VfsError::Io);
         }
-        let mut count = 0;
         for entry in reply.entries {
             if !sink.accept(
                 &entry.name,
@@ -7793,8 +7813,8 @@ mod tests {
         let sessionid = [0x61; 16];
         let verifier = [0x8c; 8];
         let transport = Arc::new(ScriptTransport::new(vec![
-            Ok(read_dir_success(sessionid, 1, verifier, 1, b"first", false)),
-            Ok(read_dir_success(sessionid, 2, verifier, 2, b"second", true)),
+            Ok(read_dir_success(sessionid, 1, verifier, 3, b"first", false)),
+            Ok(read_dir_success(sessionid, 2, verifier, 4, b"second", true)),
         ]));
         let mount = mounted_session(transport.clone(), sessionid);
         let fs = Arc::new(NfsFilesystem {
@@ -7804,39 +7824,50 @@ mod tests {
             nodes: Mutex::new(Vec::new()),
             node_data: Mutex::new(Vec::new()),
         });
-        let node = NfsNode {
+        let node = Arc::new(NfsNode {
             fs,
             fh: FileHandle::new(b"directory".to_vec()).unwrap(),
-            attr: Mutex::new(NfsAttr::default()),
+            attr: Mutex::new(NfsAttr {
+                fileid: 77,
+                ..NfsAttr::default()
+            }),
             entry: Mutex::new(None),
             parent: None,
             name: None,
             dir_verifier: Mutex::new(None),
             epoch: AtomicU64::new(1),
             user_data: Arc::new(NodeUserData::default()),
-        };
+        });
+        let root_node = node.clone();
+        let _root = DirEntry::new_dir(
+            |weak| {
+                *root_node.entry.lock() = Some(weak);
+                DirNode::new(root_node)
+            },
+            Reference::root(),
+        );
 
         let mut first_cookies = Vec::new();
         let mut first_sink = |_: &FsName, _: u64, _: NodeType, cookie| {
             first_cookies.push(cookie);
             true
         };
-        assert_eq!(node.read_dir(0, &mut first_sink), Ok(1));
+        assert_eq!(node.read_dir(0, &mut first_sink), Ok(3));
         drop(first_sink);
-        assert_eq!(first_cookies, [1]);
+        assert_eq!(first_cookies, [1, 2, 3]);
 
         let mut second_cookies = Vec::new();
         let mut second_sink = |_: &FsName, _: u64, _: NodeType, cookie| {
             second_cookies.push(cookie);
             true
         };
-        assert_eq!(node.read_dir(1, &mut second_sink), Ok(1));
-        assert_eq!(second_cookies, [2]);
+        assert_eq!(node.read_dir(3, &mut second_sink), Ok(1));
+        assert_eq!(second_cookies, [4]);
 
         let calls = transport.calls.lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(request_readdir_cookie_verifier(&calls[0]), (0, [0; 8]));
-        assert_eq!(request_readdir_cookie_verifier(&calls[1]), (1, verifier));
+        assert_eq!(request_readdir_cookie_verifier(&calls[1]), (3, verifier));
     }
 
     #[test]
