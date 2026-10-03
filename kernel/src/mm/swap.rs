@@ -14,7 +14,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs::OpenOptions;
+use axfs::{File, OpenOptions};
 use axfs_ng_vfs::{Location, NodeType};
 use axsync::Mutex;
 use spin::Lazy;
@@ -38,6 +38,7 @@ pub(crate) const DEF_SWAP_PRIO: i16 = -1;
 struct SwapArea {
     id: u16,
     location: Location,
+    file: Arc<File>,
     priority: i16,
     // One reference per software PTE naming the slot.  This is MM ownership,
     // not a transient I/O pin.
@@ -410,11 +411,15 @@ pub fn activate(location: Location, flags: i32) -> AxResult<()> {
     if length < PAGE * 2 || !length.is_multiple_of(PAGE) {
         return Err(AxError::InvalidInput);
     }
+    let file = Arc::try_new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open_loc(location.clone())?
+            .into_file()?,
+    )
+    .map_err(|_| AxError::NoMemory)?;
     let mut header = [0u8; PAGE];
-    let file = OpenOptions::new()
-        .read(true)
-        .open_loc(location.clone())?
-        .into_file()?;
     if file.read_at(&mut header[..], 0)? != PAGE
         || &header[PAGE - SWAP_SIGNATURE.len()..] != SWAP_SIGNATURE
     {
@@ -459,6 +464,7 @@ pub fn activate(location: Location, flags: i32) -> AxResult<()> {
         SwapArea {
             id,
             location,
+            file,
             priority,
             refs,
             draining: false,
@@ -633,16 +639,12 @@ pub fn pageout(page: &[u8]) -> AxResult<SwapPte> {
         return Err(AxError::InvalidInput);
     }
     let (key, slot) = allocate_slot()?;
-    let (location, id) = {
+    let (file, id) = {
         let swaps = SWAPS.lock();
         let area = swaps.areas.get(&key).ok_or(AxError::Io)?;
-        (area.location.clone(), area.id)
+        (area.file.clone(), area.id)
     };
     let result = (|| {
-        let file = OpenOptions::new()
-            .write(true)
-            .open_loc(location)?
-            .into_file()?;
         (file.write_at(page, ((slot + 1) * PAGE) as u64)? == PAGE)
             .then_some(())
             .ok_or(AxError::Io)
@@ -659,7 +661,7 @@ pub(crate) fn read(entry: SwapPte, page: &mut [u8]) -> AxResult<()> {
     if page.len() != PAGE {
         return Err(AxError::InvalidInput);
     }
-    let (_key, location) = {
+    let (_key, file) = {
         let swaps = SWAPS.lock();
         let (key, area) = swaps
             .areas
@@ -669,12 +671,8 @@ pub(crate) fn read(entry: SwapPte, page: &mut [u8]) -> AxResult<()> {
         if area.refs.get(entry.slot()).copied().unwrap_or(0) == 0 {
             return Err(AxError::InvalidInput);
         }
-        (key.clone(), area.location.clone())
+        (key.clone(), area.file.clone())
     };
-    let file = OpenOptions::new()
-        .read(true)
-        .open_loc(location)?
-        .into_file()?;
     if file.read_at(page, ((entry.slot() + 1) * PAGE) as u64)? != PAGE {
         return Err(AxError::Io);
     }
@@ -690,7 +688,37 @@ pub fn pagein(entry: SwapPte, page: &mut [u8]) -> AxResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use axfs::FileFlags;
+    use axfs_ng_vfs::{FileAttr, FsName, Mountpoint, NodePermission};
+
     use super::*;
+    use crate::pseudofs::tmp::MemoryFs;
+
+    fn make_swap_file() -> Location {
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount
+            .root_location()
+            .create(
+                FsName::new(b"swap-open-mode"),
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open_loc(location.clone())
+            .unwrap()
+            .into_file()
+            .unwrap();
+        file.set_len((PAGE * 2) as u64).unwrap();
+        let mut header = [0u8; PAGE];
+        header[PAGE - SWAP_SIGNATURE.len()..].copy_from_slice(SWAP_SIGNATURE);
+        assert_eq!(file.write_at(&header[..], 0).unwrap(), PAGE);
+        drop(file);
+        location
+    }
 
     #[test]
     fn swap_priority_follows_linux_flag_rule() {
@@ -746,6 +774,49 @@ mod tests {
         );
         drop(activation);
         assert!(admit_mutation_state(state).is_ok());
+    }
+
+    #[test]
+    fn swap_activation_uses_and_retains_a_read_write_open() {
+        let _context = crate::test_support::scheduler_test_context();
+        let location = make_swap_file();
+
+        // A read-only open would pass; activation must execute the real
+        // write-open path so immutable files fail before publication.
+        location
+            .entry()
+            .set_file_attr(FileAttr {
+                xflags: 0x8,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(activate(location.clone(), 0).is_err());
+        assert!(!active_area(&location).unwrap());
+
+        location.entry().set_file_attr(FileAttr::default()).unwrap();
+        activate(location.clone(), 0).unwrap();
+        {
+            let swaps = SWAPS.lock();
+            let area = swaps
+                .areas
+                .values()
+                .find(|area| area.location.same_node(&location))
+                .unwrap();
+            assert!(
+                area.file
+                    .flags()
+                    .contains(FileFlags::READ | FileFlags::WRITE)
+            );
+        }
+
+        let contents = [0x5a; PAGE];
+        let entry = pageout(&contents).unwrap();
+        let mut observed = [0; PAGE];
+        read(entry, &mut observed).unwrap();
+        assert_eq!(observed, contents);
+        release(entry).unwrap();
+        deactivate(&location).unwrap();
+        assert!(!active_area(&location).unwrap());
     }
 
     #[test]
