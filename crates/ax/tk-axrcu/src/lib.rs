@@ -721,6 +721,9 @@ impl<P: EpochPlatform, const MAX_CPUS: usize, const CAPACITY: usize>
     /// Returns whether a task-context drain has work pending. This is only a
     /// hint; a concurrent reader may keep the FIFO temporarily unreclaimable.
     pub fn has_pending(&self) -> bool {
+        if !self.retire_pending.load(Ordering::Acquire) {
+            return false;
+        }
         !self.retire.lock().is_empty()
     }
 
@@ -728,6 +731,15 @@ impl<P: EpochPlatform, const MAX_CPUS: usize, const CAPACITY: usize>
     /// readiness predicate used to arm the deferred-work worker; blocked
     /// entries are awakened by [`EpochPlatform::reader_quiescent`].
     pub fn has_reclaimable_pending(&self) -> bool {
+        // Queue commit publishes true before unlocking; only an empty drain
+        // publishes false, under that same lock. An empty hint can race an
+        // in-flight publisher, just as the old locked probe could precede it.
+        // Publication's task-context wake and reader-quiescence wake remain
+        // unchanged. A positive hint still takes the lock and performs the
+        // original front/grace check, never bypassing reclamation admission.
+        if !self.retire_pending.load(Ordering::Acquire) {
+            return false;
+        }
         let queue = self.retire.lock();
         queue
             .front()
@@ -1094,6 +1106,45 @@ mod tests {
     }
 
     type TestDomain = EpochDomain<TestPlatform, 1, 2>;
+
+    #[test]
+    fn empty_pending_probes_do_not_take_the_retire_lock() {
+        let domain = TestDomain::new();
+        // A reservation has no retired owner yet and must not make either
+        // readiness hint positive. Holding the FIFO proves the empty probe
+        // does not need IRQ/preemption guard transitions or the queue lock.
+        let slot = RcuSlot::new(&domain, Arc::new(1usize));
+        let reservation = slot.reserve_retire().unwrap();
+        let queue = domain.retire.lock();
+        assert!(!domain.has_pending());
+        assert!(!domain.has_reclaimable_pending());
+        drop(queue);
+        drop(reservation);
+    }
+
+    #[test]
+    fn pending_hint_keeps_publication_grace_and_empty_drain_behavior() {
+        let domain = TestDomain::new();
+        domain.register_cpu(0).unwrap();
+        let slot = RcuSlot::new(&domain, Arc::new(1usize));
+        let reader = domain.read_enter().unwrap();
+        let old = slot.load();
+        let retired = slot
+            .publish(Arc::new(2usize), &old, slot.reserve_retire().unwrap())
+            .unwrap();
+        assert!(domain.has_pending());
+        assert!(!domain.has_reclaimable_pending());
+        assert_eq!(domain.drain(0).unwrap().dropped, 0);
+        assert!(domain.has_pending());
+        drop(reader);
+        assert!(domain.has_reclaimable_pending());
+        assert_eq!(domain.drain(1).unwrap().dropped, 1);
+        assert!(!domain.has_pending());
+        assert!(!domain.has_reclaimable_pending());
+        assert_eq!(*slot.load(), 2);
+        assert_eq!(*old, 1);
+        assert_eq!(*retired, 1);
+    }
 
     struct ConcurrentTestPlatform;
 
