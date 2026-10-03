@@ -3323,12 +3323,16 @@ impl NfsMount {
         mode: XattrSetMode,
     ) -> NfsResult<()> {
         let dir = self.openattr(file, true)?;
-        let existing = self.lookup(Some(&dir), name);
+        let existing = match self.lookup(Some(&dir), name) {
+            Ok(handle) => Some(handle),
+            Err(NfsError::Status(2)) => None,
+            Err(error) => return Err(error),
+        };
         let state = match (existing, mode) {
-            (Ok(_), XattrSetMode::Create) => return Err(NfsError::Status(17)),
-            (Err(_), XattrSetMode::Replace) => return Err(NfsError::Status(61)),
-            (Ok(_), _) => self.open(&dir, name, 3, 0)?,
-            (Err(_), _) => self.create_file(&dir, name, 0o600, 3)?,
+            (Some(_), XattrSetMode::Create) => return Err(NfsError::Status(17)),
+            (None, XattrSetMode::Replace) => return Err(NfsError::Status(61)),
+            (Some(_), _) => self.open(&dir, name, 3, 0)?,
+            (None, _) => self.create_file(&dir, name, 0o600, 3)?,
         };
         let result = (|| {
             self.setattr(&state.handle, state.stateid, None, Some(value.len() as u64))?;
@@ -7651,6 +7655,49 @@ mod tests {
         body.0
     }
 
+    fn openattr_success(sessionid: [u8; 16], sequence: u32, handle: &[u8]) -> Vec<u8> {
+        let mut body = Xdr::default();
+        body.u32(NFS_OK);
+        body.opaque(b"");
+        body.u32(4);
+        body.u32(OP_SEQUENCE);
+        body.u32(NFS_OK);
+        body.fixed(&sessionid);
+        body.u32(sequence);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(OP_PUTFH);
+        body.u32(NFS_OK);
+        body.u32(OP_OPENATTR);
+        body.u32(NFS_OK);
+        body.u32(OP_GETFH);
+        body.u32(NFS_OK);
+        body.opaque(handle);
+        body.0
+    }
+
+    fn lookup_error(sessionid: [u8; 16], sequence: u32, status: u32) -> Vec<u8> {
+        let mut body = Xdr::default();
+        body.u32(status);
+        body.opaque(b"");
+        body.u32(3);
+        body.u32(OP_SEQUENCE);
+        body.u32(NFS_OK);
+        body.fixed(&sessionid);
+        body.u32(sequence);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(OP_PUTFH);
+        body.u32(NFS_OK);
+        body.u32(OP_LOOKUP);
+        body.u32(status);
+        body.0
+    }
+
     fn rpc_reply(request: &[u8], body: Vec<u8>) -> Vec<u8> {
         let mut rpc = Xdr::default();
         rpc.u32(request_xid(request));
@@ -7873,6 +7920,23 @@ mod tests {
         let (first, second) = request_setattr_bitmap(&calls[0]);
         assert_eq!(first, 0);
         assert_eq!(second, (1 << 1) | (1 << 4) | (1 << 5));
+    }
+
+    #[test]
+    fn named_attribute_lookup_io_error_is_not_treated_as_missing() {
+        let sessionid = [0x39; 16];
+        let transport = Arc::new(ScriptTransport::new(vec![
+            Ok(openattr_success(sessionid, 1, b"attrs")),
+            Ok(lookup_error(sessionid, 2, 5)),
+        ]));
+        let mount = mounted_session(transport.clone(), sessionid);
+        let file = FileHandle::new(b"file".to_vec()).unwrap();
+        let name = FsNameBuf::from_vec(b"user.example".to_vec()).unwrap();
+        assert_eq!(
+            mount.set_named_attr(&file, &name, b"value", XattrSetMode::Upsert),
+            Err(NfsError::Status(5))
+        );
+        assert_eq!(transport.calls.lock().len(), 2);
     }
 
     #[test]
