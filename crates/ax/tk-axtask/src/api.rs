@@ -1616,7 +1616,9 @@ pub fn run_idle() -> ! {
             crate::run_queue::IdleStealOutcome::NoWork => {}
         }
         trace!("idle task: waiting for IRQs...");
-        #[cfg(feature = "irq")]
+        #[cfg(all(feature = "irq", feature = "smp"))]
+        crate::run_queue::idle_wait();
+        #[cfg(all(feature = "irq", not(feature = "smp")))]
         axhal::asm::wait_for_irqs();
     }
 }

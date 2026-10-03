@@ -1627,6 +1627,23 @@ pub fn wait_for_irqs() {
     }
 }
 
+/// Enables interrupts and waits for one, with no window between the two.
+///
+/// Call with interrupts disabled after checking for work.  STI holds off
+/// interrupts until the following instruction has begun, so an interrupt
+/// that arrives after the check -- a wake IPI in particular -- ends this HLT
+/// rather than being serviced before it and leaving the CPU asleep until some
+/// later interrupt.
+#[inline]
+pub fn enable_irqs_and_wait() {
+    if cfg!(target_os = "none") {
+        unsafe { asm!("sti; hlt", options(nomem, nostack)) }
+    } else {
+        enable_irqs();
+        core::hint::spin_loop()
+    }
+}
+
 /// Halt the current CPU.
 #[inline]
 pub fn halt() {

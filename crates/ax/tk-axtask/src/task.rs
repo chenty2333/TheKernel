@@ -1868,7 +1868,7 @@ impl TaskInner {
     }
 
     #[inline]
-    #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+    #[cfg(feature = "preempt")]
     pub(crate) fn preempt_pending(&self) -> bool {
         self.need_resched.load(Ordering::Acquire)
     }

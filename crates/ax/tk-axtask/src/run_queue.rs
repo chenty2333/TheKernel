@@ -2400,6 +2400,30 @@ fn request_reschedule_cpu(cpu_id: usize, task: &AxTaskRef) {
     }
 }
 
+/// Waits on this CPU's idle task until it may have work.
+///
+/// The final check runs with interrupts disabled and the halt is `sti; hlt`,
+/// so a wake IPI arriving after the check ends the halt.  Checking with
+/// interrupts enabled and then halting let such an IPI be serviced just
+/// before HLT, leaving the queued task waiting for the next timer tick.
+#[cfg(all(feature = "irq", feature = "smp"))]
+pub(crate) fn idle_wait() {
+    let Some(run_queue) = get_run_queue(this_cpu_id()) else {
+        axhal::asm::wait_for_irqs();
+        return;
+    };
+    axhal::asm::disable_irqs();
+    #[cfg(feature = "preempt")]
+    let preempt_pending = crate::current().preempt_pending();
+    #[cfg(not(feature = "preempt"))]
+    let preempt_pending = false;
+    if preempt_pending || run_queue.load.snapshot().ready_tasks != 0 {
+        axhal::asm::enable_irqs();
+    } else {
+        axhal::asm::enable_irqs_and_wait();
+    }
+}
+
 #[cfg(not(feature = "smp"))]
 fn request_reschedule_cpu(_cpu_id: usize, _task: &AxTaskRef) {
     #[cfg(feature = "preempt")]
