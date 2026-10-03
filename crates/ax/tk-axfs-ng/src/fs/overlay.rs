@@ -2697,11 +2697,15 @@ impl DirNodeOps for OverlayDir {
     ) -> VfsResult<axfs_ng_vfs::CreateOutcome<DirEntry>> {
         let upper = self.upper_location()?;
         if disposition == CreateDisposition::OpenOrCreate {
-            if let Ok(existing) = self.lookup(name) {
-                return Ok(axfs_ng_vfs::CreateOutcome {
-                    entry: existing,
-                    created: false,
-                });
+            match self.lookup(name) {
+                Ok(existing) => {
+                    return Ok(axfs_ng_vfs::CreateOutcome {
+                        entry: existing,
+                        created: false,
+                    });
+                }
+                Err(VfsError::NotFound) => {}
+                Err(error) => return Err(error),
             }
         }
         let backend = self
