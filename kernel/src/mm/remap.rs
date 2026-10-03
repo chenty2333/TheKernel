@@ -6,7 +6,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::{MappingFlags, PageSize};
 use linux_raw_sys::general::RLIMIT_MEMLOCK;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
-use memory_set::MappingLineage;
+use memory_set::{DeferredUnmapBackend, MappingLineage};
 use tk_linux_mm::{MemlockLimit, MemlockPlan, PageRange as LinuxPageRange, RemapGeometry};
 
 use crate::{
@@ -647,6 +647,96 @@ fn map_locked_relocated_segments(
     Ok(())
 }
 
+fn prepare_dontunmap_source_pte_retirements(
+    aspace: &AddrSpace,
+    source_segments: &[RemapSegment],
+) -> AxResult<Vec<Option<crate::mm::BackendRetirement>>> {
+    let mut retirements = Vec::new();
+    retirements
+        .try_reserve_exact(source_segments.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for segment in source_segments {
+        let range = VirtAddrRange::try_from_start_size(segment.start, segment.size)
+            .ok_or(AxError::InvalidInput)?;
+        segment
+            .backend
+            .preflight_unmap(range, aspace.page_table())?;
+        let retirement = segment
+            .backend
+            .prepare_deferred_unmap(segment.start, segment.size, aspace.page_table())
+            .ok_or(AxError::NoMemory)?;
+        retirements.push(Some(retirement));
+    }
+    Ok(retirements)
+}
+
+/// Leaves the retained DONTUNMAP VMA present but withdraws its current PTEs.
+/// The exact page-table snapshots are prepared before destination publication,
+/// so this commit step neither allocates nor changes backend ownership until a
+/// TLB grace period has completed.
+fn withdraw_dontunmap_source_ptes(
+    aspace: &mut AddrSpace,
+    source_segments: &[RemapSegment],
+    retirements: &mut [Option<crate::mm::BackendRetirement>],
+) -> AxResult {
+    if source_segments.len() != retirements.len() {
+        return Err(AxError::BadState);
+    }
+    let mut withdrawn = 0usize;
+    for (index, segment) in source_segments.iter().enumerate() {
+        let retirement = retirements[index]
+            .as_mut()
+            .expect("prepared DONTUNMAP source retirement");
+        if !segment.backend.unmap_deferred_prepared(
+            retirement,
+            segment.start,
+            segment.size,
+            aspace.page_table_mut(),
+        ) {
+            // Stable MM serialization plus the prepared snapshot make this an
+            // internal consistency failure. Restore any already-withdrawn
+            // prefix before reporting it; every restore is allocation-free.
+            for restore_index in (0..withdrawn).rev() {
+                let previous = &source_segments[restore_index];
+                let retirement = retirements[restore_index]
+                    .take()
+                    .expect("withdrawn DONTUNMAP retirement");
+                assert!(
+                    previous.backend.restore_deferred(
+                        retirement,
+                        previous.start,
+                        previous.size,
+                        aspace.page_table_mut(),
+                    ),
+                    "failed to restore prepared DONTUNMAP source PTEs"
+                );
+            }
+            drop(aspace.synchronize_tlb_after_mutation());
+            return Err(AxError::BadState);
+        }
+        withdrawn += 1;
+    }
+
+    drop(aspace.synchronize_tlb_after_mutation());
+    // COW retirement drops decrement the old source's owner only after the
+    // source translations are gone from every CPU. File/shared snapshots only
+    // retain their PTE tuples, so dropping them is harmless as well.
+    retirements
+        .iter_mut()
+        .for_each(|retirement| drop(retirement.take()));
+    Ok(())
+}
+
+fn rollback_dontunmap_destination(
+    aspace: &mut AddrSpace,
+    destination: VirtAddr,
+    size: usize,
+    wake: &mut DeferredUffdWake,
+) -> AxResult {
+    wake.merge(aspace.unmap(destination, size)?);
+    Ok(())
+}
+
 fn check_mremap_locked_growth_limit(
     proc_data: &ProcessData,
     has_ipc_lock: bool,
@@ -1243,7 +1333,7 @@ fn commit_prepared_remap(
         )?;
         match prepared {
             PreparedRemapPlan::Duplicate {
-                source_segments: _,
+                source_segments,
                 destination_segments,
                 destination,
                 mut sysv_admissions,
@@ -1259,6 +1349,14 @@ fn commit_prepared_remap(
                         duplicated_locked,
                     )?;
                 }
+                let mut source_pte_retirements = if request.dont_unmap {
+                    Some(prepare_dontunmap_source_pte_retirements(
+                        aspace,
+                        &source_segments,
+                    )?)
+                } else {
+                    None
+                };
                 let staged_fragments = destination_segments.len();
                 let duplicate = aspace.duplicate_mapping_into_empty_transaction(
                     request.addr,
@@ -1277,6 +1375,18 @@ fn commit_prepared_remap(
                 let (duplicate, transaction_wake) = duplicate.into_parts();
                 wake.merge(transaction_wake);
                 duplicate?;
+                if let Some(retirements) = source_pte_retirements.as_mut()
+                    && let Err(error) =
+                        withdraw_dontunmap_source_ptes(aspace, &source_segments, retirements)
+                {
+                    rollback_dontunmap_destination(
+                        aspace,
+                        destination,
+                        request.new_size,
+                        &mut wake,
+                    )?;
+                    return Err(error);
+                }
                 commit_sysv_duplicate_admissions(&mut sysv_admissions);
                 if request.dont_unmap {
                     // Linux transfers VM_LOCKED/VM_LOCKONFAULT ownership to
@@ -1449,6 +1559,14 @@ fn commit_locked_remap(
                         duplicated_locked,
                     )?;
                 }
+                let mut source_pte_retirements = if request.dont_unmap {
+                    Some(prepare_dontunmap_source_pte_retirements(
+                        aspace,
+                        &source_segments,
+                    )?)
+                } else {
+                    None
+                };
                 let staged_fragments = source_segments.len();
                 let duplicate = if request.fixed && !request.dont_unmap {
                     aspace
@@ -1508,6 +1626,18 @@ fn commit_locked_remap(
                 let (duplicate, transaction_wake) = duplicate.into_parts();
                 wake.merge(transaction_wake);
                 duplicate?;
+                if let Some(retirements) = source_pte_retirements.as_mut()
+                    && let Err(error) =
+                        withdraw_dontunmap_source_ptes(aspace, &source_segments, retirements)
+                {
+                    rollback_dontunmap_destination(
+                        aspace,
+                        destination,
+                        request.new_size,
+                        &mut wake,
+                    )?;
+                    return Err(error);
+                }
                 commit_sysv_duplicate_admissions(sysv_admissions);
                 if request.dont_unmap {
                     aspace.clear_locked_range(request.addr, request.new_size);
@@ -2150,6 +2280,91 @@ mod tests {
             memory_addr::PhysAddr::from(0x1000),
             PAGE_SIZE_4K
         )));
+    }
+
+    #[test]
+    fn dontunmap_withdraws_private_source_ptes_and_refaults_independently() {
+        let page = PAGE_SIZE_4K;
+        let source = VirtAddr::from(0x4000);
+        let destination = VirtAddr::from(0x10_000);
+        let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        let mut aspace = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x20_000).unwrap();
+        aspace
+            .map(
+                source,
+                page,
+                flags,
+                true,
+                Backend::new_alloc(source, PageSize::Size4K),
+            )
+            .unwrap();
+        aspace.populate_area(source, page, flags).unwrap();
+        let source_frame = aspace.page_table().query(source).unwrap().0;
+        let area = aspace.find_area(source).unwrap();
+        let source_segment = RemapSegment {
+            start: source,
+            size: page,
+            flags: area.flags(),
+            backend: area.backend().clone(),
+            lineage: area.lineage(),
+        };
+        let source_segments = [source_segment.clone()];
+        let mut retirements =
+            prepare_dontunmap_source_pte_retirements(&aspace, &source_segments).unwrap();
+        let Backend::Cow(source_cow) = &source_segment.backend else {
+            panic!("test requires a private COW mapping");
+        };
+        let destination_backend =
+            Backend::Cow(source_cow.duplicate_mapping(source, destination).unwrap());
+        let source_backend = source_segment.backend.clone();
+        aspace
+            .duplicate_mapping_into_empty_transaction(
+                source,
+                page,
+                destination,
+                page,
+                1,
+                move |aspace, lineage| {
+                    aspace.stage_mapping_fragment(
+                        destination,
+                        page,
+                        flags,
+                        false,
+                        destination_backend,
+                        false,
+                        lineage,
+                    )?;
+                    source_backend.migrate_present_pages(
+                        source,
+                        destination,
+                        page,
+                        &mut aspace.page_table_mut().cursor(),
+                    )
+                },
+            )
+            .finish()
+            .unwrap();
+
+        assert_eq!(
+            aspace.page_table().query(destination).unwrap().0,
+            source_frame
+        );
+        withdraw_dontunmap_source_ptes(&mut aspace, &source_segments, &mut retirements).unwrap();
+        assert!(aspace.page_table().query(source).is_err());
+        assert_eq!(
+            aspace.page_table().query(destination).unwrap().0,
+            source_frame
+        );
+
+        // The retained private VMA faults from its original backing policy,
+        // not from the frame now owned by the destination mapping.
+        aspace.populate_area(source, page, flags).unwrap();
+        let refaulted_source_frame = aspace.page_table().query(source).unwrap().0;
+        assert_ne!(refaulted_source_frame, source_frame);
+        assert_eq!(
+            aspace.page_table().query(destination).unwrap().0,
+            source_frame
+        );
     }
 
     #[test]
