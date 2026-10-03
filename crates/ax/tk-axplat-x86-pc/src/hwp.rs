@@ -221,6 +221,11 @@ pub fn apply_current_clamp(min: u16, max: u16) -> Result<(), Error> {
     if !valid_clamp(min, max) {
         return Err(Error::InvalidClamp);
     }
+    // Every context switch calls this.  Without HWP (no fleet) there is no
+    // per-CPU state worth locating, so answer before `local` does.
+    if !fleet_active() {
+        return Err(Error::Unsupported);
+    }
     local(|state| {
         if !fleet_active() || !state.prepared {
             return Err(Error::Unsupported);
@@ -246,7 +251,10 @@ pub fn restore_current_request() -> Result<(), Error> {
 
 fn local<T>(f: impl FnOnce(&mut State) -> Result<T, Error>) -> Result<T, Error> {
     let _guard = kernel_guard::NoPreemptIrqSave::new();
-    let cpu = crate::cpu::current_logical_cpu_id();
+    // The per-CPU id is the logical id `current_logical_cpu_id` derived at
+    // bring-up, and reading it costs one GS-relative load; the derivation
+    // executes CPUID, which a hypervisor always intercepts.
+    let cpu = axplat::percpu::this_cpu_id();
     f(&mut STATES[cpu].lock())
 }
 

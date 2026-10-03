@@ -385,7 +385,12 @@ pub(crate) fn logical_cpu_id_for_apic(apic_id: u32) -> Option<usize> {
 }
 
 pub(crate) fn apic_id_for_logical(logical_cpu_id: usize) -> Option<u32> {
-    ensure_map(hardware_apic_id());
+    // Every cross-CPU IPI resolves its target here.  The current APIC ID only
+    // seeds the map's first publication, and reading it executes CPUID --
+    // an unconditional VM exit under a hypervisor -- so skip it once ready.
+    if APIC_ID_MAP_STATE.load(Ordering::Acquire) != MAP_READY {
+        ensure_map(hardware_apic_id());
+    }
     let len = APIC_ID_MAP_LEN.load(Ordering::Acquire);
     if logical_cpu_id >= len {
         return None;
