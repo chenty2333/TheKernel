@@ -79,6 +79,7 @@ mod clk;
 mod connect;
 pub(crate) mod debugfs;
 pub(crate) mod fb;
+mod firmware_snapshot;
 mod gmbus;
 pub(crate) mod gtt;
 mod hpd;
@@ -208,6 +209,7 @@ static HOTPLUG: Mutex<Option<HotplugWatch>> = Mutex::new(None);
 /// boot log scrolls away.  A run that did not happen, and a run that failed,
 /// both leave their reason here rather than leaving the file silent about it.
 static MODESET: Mutex<Option<String>> = Mutex::new(None);
+static FIRMWARE_STATE: Mutex<Vec<(pci::Bdf, firmware_snapshot::Snapshot)>> = Mutex::new(Vec::new());
 
 /// What the graphics address space turned out to be, as text.
 ///
@@ -277,19 +279,31 @@ pub(crate) fn bring_up_at_boot() {
         return;
     }
 
-    if axhal::boot::framebuffer().is_some() {
-        // The current modeset has no complete restoration of the firmware's
-        // PLL/PHY/pipe state on failure. The live GOP surface is the only
-        // diagnostic channel: do not claim that merely retaining its address
-        // makes destructive register programming fail-safe.
+    if axhal::boot::command_line_value("intel.modeset") != Some("1") {
         axlog::warn!(
-            "intel-gpu: phase 0 complete; stopping before power/modeset writes: live firmware \
-             console has no verified hardware rollback. Use firmware KMS; hardware-unverified \
-             (未在硬件上验证)"
+            "intel-gpu: native display writes disabled by default; firmware console unchanged; \
+             intel.modeset=1 only requests rollback preflight"
         );
         *MODESET.lock() = Some(String::from(
-            "not attempted: preserve the live firmware console; hardware rollback is not \
-             implemented",
+            "not attempted: intel.modeset=1 absent; no display register writes\n",
+        ));
+        return;
+    }
+    let captured: Vec<_> = windows
+        .iter()
+        .map(|(bdf, window)| (*bdf, firmware_snapshot::Snapshot::capture(window)))
+        .collect();
+    let rollback_complete =
+        !captured.is_empty() && captured.iter().all(|(_, state)| state.permits_modeset());
+    *FIRMWARE_STATE.lock() = captured;
+    if !rollback_complete {
+        axlog::warn!(
+            "intel-gpu: intel.modeset=1 REFUSED: candidate state is not a complete PLL/PHY/GGTT \
+             rollback and restored scanout is unverified; no display writes; 未在硬件上验证"
+        );
+        *MODESET.lock() = Some(String::from(
+            "not attempted: incomplete firmware restoration; explicit parameter cannot bypass \
+             safety preflight\n",
         ));
         return;
     }
@@ -974,6 +988,10 @@ pub(crate) fn report_text() -> String {
         ),
     };
     // The locks are taken one at a time: nothing holds two at once.
+    for (bdf, state) in FIRMWARE_STATE.lock().iter() {
+        text.push_str(&alloc::format!("intel-firmware: {bdf}\n"));
+        text.push_str(&state.render());
+    }
     if let Some(failure) = &*POWER_FAILURE.lock() {
         text.push_str(failure);
         text.push('\n');
