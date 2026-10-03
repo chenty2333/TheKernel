@@ -230,7 +230,9 @@ impl XfsVolume {
         transaction: &mut XfsMetadataTransaction,
     ) -> XfsResult<()> {
         let (inode, raw) = self.inode_and_bytes(number)?;
-        if inode.mode & 0o170000 != 0o100000
+        let mode = inode.mode & 0o170000;
+        let empty_symlink_reclaim = mode == 0o120000 && size == 0 && extents.is_empty();
+        if (mode != 0o100000 && !empty_symlink_reclaim)
             || !matches!(
                 inode.data_format,
                 XfsForkFormat::Extents | XfsForkFormat::Local | XfsForkFormat::Btree
@@ -1093,8 +1095,38 @@ impl XfsVolume {
         number: u64,
         size: u64,
     ) -> XfsResult<XfsMetadataTransaction> {
+        self.prepare_data_fork_truncate(number, size, false)
+    }
+
+    /// Reclaims an unlinked symlink's data fork. Inline symlinks have no
+    /// physical data to return; remote symlinks use the same extent-accounting
+    /// planner as regular files. External attribute-fork blocks remain
+    /// unsupported rather than being leaked when the inode bit is freed.
+    pub(super) fn prepare_symlink_reclaim(&self, number: u64) -> XfsResult<XfsMetadataTransaction> {
         let (inode, _) = self.inode_and_bytes(number)?;
-        if inode.mode & 0o170000 != 0o100000
+        if inode.mode & 0o170000 != 0o120000
+            || self.attribute_fork_owned_blocks(number, &inode)? != 0
+        {
+            return Err(XfsError::UnsupportedFeature);
+        }
+        match inode.data_format {
+            XfsForkFormat::Local if inode.blocks == 0 => Ok(XfsMetadataTransaction::default()),
+            XfsForkFormat::Extents | XfsForkFormat::Btree => {
+                self.prepare_data_fork_truncate(number, 0, true)
+            }
+            _ => Err(XfsError::UnsupportedFeature),
+        }
+    }
+
+    fn prepare_data_fork_truncate(
+        &self,
+        number: u64,
+        size: u64,
+        allow_symlink: bool,
+    ) -> XfsResult<XfsMetadataTransaction> {
+        let (inode, _) = self.inode_and_bytes(number)?;
+        let mode = inode.mode & 0o170000;
+        if (mode != 0o100000 && !(allow_symlink && mode == 0o120000))
             || !matches!(
                 inode.data_format,
                 XfsForkFormat::Extents | XfsForkFormat::Btree

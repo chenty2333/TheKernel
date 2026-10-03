@@ -538,9 +538,9 @@ impl XfsMount {
         self.commit_locked(&mut live, &metadata)
     }
 
-    /// Removes one non-directory name.  A final regular-file link also
-    /// truncates and returns its data extents and inode bit in this exact log
-    /// transaction; special inode reclamation is not guessed here.
+    /// Removes one non-directory name. A final regular-file or symlink link
+    /// also returns its data extents and inode bit in this exact log
+    /// transaction; blockless special inodes need only their inode bit freed.
     pub fn unlink_named(
         &self,
         directory: u64,
@@ -876,10 +876,12 @@ impl XfsMount {
                 .volume
                 .stage_inode_link_count(inode_number, links, metadata);
         }
-        if inode.mode & 0o170000 != 0o100000 {
-            return Err(XfsError::UnsupportedFeature);
-        }
-        let reclaim = self.volume.prepare_regular_truncate(inode_number, 0)?;
+        let reclaim = match inode.mode & 0o170000 {
+            0o100000 => self.volume.prepare_regular_truncate(inode_number, 0)?,
+            0o120000 => self.volume.prepare_symlink_reclaim(inode_number)?,
+            _ if inode.blocks == 0 => XfsMetadataTransaction::default(),
+            _ => return Err(XfsError::UnsupportedFeature),
+        };
         metadata.buffers.extend(reclaim.buffers);
         self.volume
             .stage_inode_link_count(inode_number, 0, metadata)?;
