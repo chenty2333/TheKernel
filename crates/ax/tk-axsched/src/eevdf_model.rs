@@ -106,11 +106,19 @@ pub const fn checked_ceil_div(numerator: u128, denominator: u128) -> Result<u128
 
 /// Divide a 129-bit unsigned integer (`high * 2^128 + low`) by a non-zero
 /// u128 denominator.  The quotient must fit in u128; a set quotient bit at
-/// position 128 is reported as arithmetic exhaustion.  The loop is over the
-/// fixed width of the representation, never over an input value.
+/// position 128 is reported as arithmetic exhaustion. Without the high bit,
+/// native division suffices; the carry fallback loops over the fixed width
+/// of the representation, never over an input value.
 fn checked_div_129(high: bool, low: u128, denominator: u128) -> Result<(u128, u128), ModelError> {
     if denominator == 0 {
         return Err(ModelError::InvalidWeight);
+    }
+    // Virtual-clock settlement adds two residues below total_weight. Normal
+    // weights leave that sum inside u128: it needs no 129-bit long division.
+    // The quotient of a u128 numerator by a nonzero denominator always fits;
+    // both its quotient and remainder are identical to the fallback below.
+    if !high {
+        return Ok((low / denominator, low % denominator));
     }
     let half = denominator >> 1;
     let odd = denominator & 1 != 0;
@@ -1871,6 +1879,60 @@ pub fn min_eligible_at(entities: &[Entity]) -> Result<Option<i128>, ModelError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn division_without_carry_preserves_quotient_remainder_and_zero_error() {
+        let values = [
+            0,
+            1,
+            2,
+            3,
+            1023,
+            1024,
+            1025,
+            u64::MAX as u128,
+            1 << 64,
+            1 << 127,
+            u128::MAX - 1,
+            u128::MAX,
+        ];
+        for numerator in values {
+            assert_eq!(
+                checked_div_129(false, numerator, 0),
+                Err(ModelError::InvalidWeight)
+            );
+            for denominator in values.into_iter().filter(|value| *value != 0) {
+                assert_eq!(
+                    checked_div_129(false, numerator, denominator),
+                    Ok((numerator / denominator, numerator % denominator))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn division_with_carry_keeps_the_129_bit_fallback_and_overflow_check() {
+        for low in [0, 1, 2, 1 << 127, u128::MAX - 1, u128::MAX] {
+            assert_eq!(
+                checked_div_129(true, low, 0),
+                Err(ModelError::InvalidWeight)
+            );
+            assert_eq!(
+                checked_div_129(true, low, 1),
+                Err(ModelError::ArithmeticExhausted)
+            );
+            assert_eq!(
+                checked_div_129(true, low, 2),
+                Ok(((1 << 127) + (low >> 1), low & 1))
+            );
+            assert_eq!(
+                checked_div_129(true, low, 1 << 127),
+                Ok((2 + (low >> 127), low & ((1 << 127) - 1)))
+            );
+        }
+        assert_eq!(checked_div_129(true, 0, u128::MAX), Ok((1, 1)));
+        assert_eq!(checked_div_129(true, u128::MAX, u128::MAX), Ok((2, 1)));
+    }
 
     #[test]
     fn profile_constants_drive_request_and_sleeper_model() {
