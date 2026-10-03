@@ -135,8 +135,11 @@ sh /etc/n305-capture.sh > /dev/console 2>&1
     start, end = network.network_address + 10, network.network_address + 30
     if start <= ipaddress.IPv4Address(address) <= end:
         raise ValueError("server address overlaps DHCP pool (.10 through .30)")
+    # bind-dynamic, not bind-interfaces: powering the N305 on bounces the
+    # link, NetworkManager re-applies the address, and a bind-interfaces
+    # dnsmasq then answers every DISCOVER with "has no address".
     write(out / "dnsmasq.conf", f'''interface={args.interface}
-bind-interfaces
+bind-dynamic
 except-interface=lo
 port=0
 no-resolv
@@ -160,8 +163,11 @@ pid-file={out / 'dnsmasq.pid'}
 
 def generate_session_scripts(out: Path, interface: str, address: str) -> None:
     qout, qiface, qaddress = map(shlex.quote, (str(out), interface, address))
-    # No pre-existing profile is modified. Only a new, non-autoconnect profile
-    # owns the trusted zone; reactivating the old UUID restores its properties.
+    # No pre-existing profile is modified. A new profile owns the trusted zone;
+    # reactivating the old UUID restores its properties. It must autoconnect at
+    # the highest priority: the DUT's OS resets its NIC, the link bounces, and
+    # NetworkManager otherwise re-activates the old DHCP profile, leaving the
+    # interface without the server address. Cleanup deletes it on every exit.
     write(out / "start.sh", f'''#!/bin/bash
 set -euo pipefail
 [[ $(id -u) == 0 ]] || {{ echo "Run with sudo" >&2; exit 1; }}
@@ -177,7 +183,7 @@ if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; t
     OLD_ZONE=$(firewall-cmd --get-zone-of-interface="$IFACE" 2>/dev/null || true)
 fi
 cleanup() {{
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM HUP
     [[ -z "$DNS" ]] || {{ kill "$DNS" 2>/dev/null || true; wait "$DNS" 2>/dev/null || true; }}
     [[ -z "$HTTP" ]] || {{ kill "$HTTP" 2>/dev/null || true; wait "$HTTP" 2>/dev/null || true; }}
     if [[ "$CREATED" == 1 ]]; then
@@ -202,7 +208,8 @@ cleanup() {{
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-nmcli connection add type ethernet ifname "$IFACE" con-name "$PROFILE" connection.autoconnect no ipv4.method manual ipv4.addresses "$ADDRESS/24" ipv4.never-default yes ipv6.method disabled connection.zone trusted >/dev/null
+trap 'exit 129' HUP
+nmcli connection add type ethernet ifname "$IFACE" con-name "$PROFILE" connection.autoconnect yes connection.autoconnect-priority 999 ipv4.method manual ipv4.addresses "$ADDRESS/24" ipv4.never-default yes ipv6.method disabled connection.zone trusted >/dev/null
 CREATED=1
 NEW=$(nmcli -g connection.uuid connection show "$PROFILE")
 nmcli connection up uuid "$NEW" >/dev/null

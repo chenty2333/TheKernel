@@ -12,6 +12,7 @@ import unittest
 
 from tools.n305_netboot import CaptureHandler, generate_session_scripts, grub_config
 
+ROOT = Path(__file__).resolve().parents[1]
 
 class NetbootTests(unittest.TestCase):
     def test_lease_hook_is_a_rootfs_cache_input(self):
@@ -27,13 +28,24 @@ class NetbootTests(unittest.TestCase):
         self.assertIn("apkovl=http://192.168.10.1:8080/", capture)
         self.assertIn("alpine_repo=http://192.168.10.1:8080/apks/main", capture)
 
+    def test_dnsmasq_follows_address_changes_across_link_bounces(self):
+        # bind-interfaces answered every DISCOVER with "has no address" after
+        # the N305 bounced the link on 2026-10-04.
+        source = (ROOT / "tools/n305_netboot.py").read_text(encoding="utf-8")
+        self.assertIn("\nbind-dynamic\n", source)
+        self.assertNotIn("\nbind-interfaces\n", source)
+
     def test_generated_session_has_rollback_for_success_and_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             generate_session_scripts(root, "eth1", "192.168.10.1")
             text = (root / "start.sh").read_text()
             self.assertIn("trap cleanup EXIT", text)
-            self.assertIn("connection.autoconnect no", text)
+            self.assertIn("trap 'exit 129' HUP", text)
+            # The DUT's OS resets its NIC; after the link bounce the session
+            # profile, not the user's DHCP profile, must come back.
+            self.assertIn("connection.autoconnect yes connection.autoconnect-priority 999", text)
+            self.assertIn('nmcli connection delete "$PROFILE"', text)
             self.assertIn('connection up uuid "$OLD"', text)
             self.assertNotIn("systemctl", text)
             self.assertNotIn("connection modify", text)
