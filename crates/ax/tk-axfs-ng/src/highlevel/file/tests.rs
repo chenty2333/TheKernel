@@ -821,7 +821,9 @@ fn reclaim_contention_preserves_pages_and_retries_after_reader_releases() {
             Ok(())
         })
         .unwrap();
-    let reader = cached.begin_cache_user().unwrap();
+    let reader = cached
+        .begin_cache_user_range(0..u64::MAX, RangeCacheLeaseKind::CachedRead)
+        .unwrap();
     assert_eq!(cached.reclaim_one(), Err(VfsError::ResourceBusy));
     cached.with_page(0, |page| assert_eq!(page.unwrap().data()[0], 0x5a));
     drop(reader);
@@ -852,6 +854,58 @@ fn ordinary_cache_still_requires_reclaim_at_its_bounded_capacity() {
     );
     assert_eq!(cached.shared.page_cache.lock().len(), capacity);
     assert!(cached.shared.page_cache.lock().contains(&0));
+    mark_cached_file_unlinked(&location);
+    drop(cached);
+}
+
+#[test]
+fn buffered_cache_reclaim_calls_listeners_without_the_page_cache_lock() {
+    let capacity = super::per_file_page_cache_capacity().get();
+    let (cached, location, _) = cached_append_test_file((capacity as u64 + 1) * PAGE_SIZE as u64);
+    for pn in 0..capacity as u32 {
+        cached
+            .with_page_or_insert_without_reclaim(pn, |_| Ok(()))
+            .unwrap();
+    }
+
+    let listener_saw_unlocked_cache = Arc::new(AtomicBool::new(false));
+    let observed = listener_saw_unlocked_cache.clone();
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let notified = notifications.clone();
+    let shared = Arc::downgrade(&cached.shared);
+    let handle = cached
+        .add_evict_listener(CachedFileEvictionOwner::new(78).unwrap(), move |_| {
+            notified.fetch_add(1, Ordering::AcqRel);
+            let shared = shared.upgrade().ok_or(VfsError::BadState)?;
+            let Some(cache) = shared.page_cache.try_lock() else {
+                observed.store(false, Ordering::Release);
+                return Err(VfsError::ResourceBusy);
+            };
+            drop(cache);
+            observed.store(true, Ordering::Release);
+            prepared_listener()
+        })
+        .unwrap();
+
+    let offset = capacity as u64 * PAGE_SIZE as u64;
+    assert_eq!(cached.write_at_slice(&[0x5a], offset), Ok(1));
+    assert!(listener_saw_unlocked_cache.load(Ordering::Acquire));
+    assert!(cached.is_page_cached(capacity as u32));
+    assert_eq!(cached.shared.page_cache.lock().len(), capacity);
+
+    // The sync read helper is used by mm-locked COW collapse. It must report
+    // pressure rather than taking direct-I/O/cache-reclaim locks under the mm.
+    let missing = (0..capacity as u32)
+        .find(|pn| !cached.is_page_cached(*pn))
+        .unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        cached.read_at_sync(&mut &mut byte[..], u64::from(missing) * PAGE_SIZE as u64),
+        Err(VfsError::ResourceBusy)
+    );
+    assert_eq!(notifications.load(Ordering::Acquire), 1);
+
+    unsafe { cached.remove_evict_listener(handle) };
     mark_cached_file_unlinked(&location);
     drop(cached);
 }

@@ -12,9 +12,8 @@ impl CachedFile {
         wait_writeback: bool,
         allow_async_page_fill: bool,
         readahead: bool,
+        native_gate: Option<HeldNativeWritebackGate<'_>>,
     ) -> VfsResult<T> {
-        let _cache_user =
-            self.begin_cache_user_range(range.clone(), RangeCacheLeaseKind::CachedWrite)?;
         let file = self.inner.entry().as_file()?;
         let mut initial = page_initial(file)?;
         let start_page =
@@ -24,28 +23,27 @@ impl CachedFile {
         let mut page_offset = (range.start % PAGE_SIZE as u64) as usize;
         for pn in start_page..end_page {
             let page_start = pn as u64 * PAGE_SIZE as u64;
-            loop {
-                let mut guard = self.shared.page_cache.lock();
-                let page_range =
-                    page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize;
-                let load_from_file = load_page(page_start, &page_range);
-                self.ensure_page_cached_with(
-                    file,
-                    &mut guard,
-                    pn,
-                    load_from_file,
-                    allow_async_page_fill,
-                    readahead,
-                )?;
-                if wait_writeback && guard.get(&pn).is_some_and(PageCache::is_writeback) {
-                    drop(guard);
-                    wait_for_page_writeback_clear(&self.shared, pn);
-                    continue;
-                }
-                let page = guard.get_mut(&pn).unwrap();
-                initial = page_each(initial, page, page_start, page_range)?;
-                break;
-            }
+            let page_range = page_offset..(range.end - page_start).min(PAGE_SIZE as u64) as usize;
+            let load_from_file = load_page(page_start, &page_range);
+            let mut next_initial = Some(initial);
+            initial = self.with_page_or_insert_with_reclaim(
+                pn,
+                load_from_file,
+                allow_async_page_fill,
+                if readahead { READAHEAD_PAGES } else { 1 },
+                wait_writeback,
+                native_gate,
+                |page| {
+                    page_each(
+                        next_initial
+                            .take()
+                            .expect("page callback must run at most once"),
+                        page,
+                        page_start,
+                        page_range,
+                    )
+                },
+            )?;
             page_offset = 0;
         }
 
@@ -54,46 +52,34 @@ impl CachedFile {
 
     pub(super) fn prepare_write_page(
         &self,
-        file: &FileNode,
         pn: u32,
         load_from_file: bool,
         allow_async_page_fill: bool,
+        native_gate: Option<HeldNativeWritebackGate<'_>>,
     ) -> VfsResult<CachedFilePagePin> {
-        let _cache_user = self.begin_cache_user()?;
-        loop {
-            let mut guard = self.shared.page_cache.lock();
-            let evicted = self.ensure_page_cached_with(
-                file,
-                &mut guard,
-                pn,
-                load_from_file,
-                allow_async_page_fill,
-                true,
-            )?;
-            if guard.get(&pn).is_some_and(PageCache::is_writeback) {
-                drop(evicted);
-                drop(guard);
-                wait_for_page_writeback_clear(&self.shared, pn);
-                continue;
-            }
-            let range_lease = Some(CachedFileShared::try_range_cache_lease(
-                &self.shared,
-                page_range(u64::from(pn), 1),
-                RangeCacheLeaseKind::CachedWrite,
-            )?);
-            guard
-                .get_mut(&pn)
-                .expect("prepared cache page disappeared while locked")
-                .pin()?;
-            drop(guard);
-            drop(evicted);
-            return Ok(CachedFilePagePin {
-                cache: self.clone(),
-                pn,
-                dirty_on_release: false,
-                _range_lease: range_lease,
-            });
-        }
+        let range_lease = self.with_page_or_insert_with_reclaim(
+            pn,
+            load_from_file,
+            allow_async_page_fill,
+            READAHEAD_PAGES,
+            true,
+            native_gate,
+            |page| {
+                let range_lease = CachedFileShared::try_range_cache_lease(
+                    &self.shared,
+                    page_range(u64::from(pn), 1),
+                    RangeCacheLeaseKind::CachedWrite,
+                )?;
+                page.pin()?;
+                Ok(range_lease)
+            },
+        )?;
+        Ok(CachedFilePagePin {
+            cache: self.clone(),
+            pn,
+            dirty_on_release: false,
+            _range_lease: Some(range_lease),
+        })
     }
 
     pub(super) fn commit_prepared_write(&self, pn: u32, range: Range<usize>, src: &[u8]) {
@@ -120,6 +106,7 @@ impl CachedFile {
         allow_async: bool,
         readahead: bool,
         bounce: &mut [u8],
+        allow_reclaim: bool,
     ) -> VfsResult<usize> {
         if bounce.len() < PAGE_SIZE {
             return Err(VfsError::InvalidInput);
@@ -141,7 +128,13 @@ impl CachedFile {
                 return Ok(read);
             }
         }
-        let _direct_guard = self.shared.direct_io_lock.lock();
+        let native_mutation = if allow_reclaim {
+            begin_source_location_writeback_mutation(&self.inner)?
+        } else {
+            None
+        };
+        let native_gate = allow_reclaim.then(|| held_native_writeback_gate(&native_mutation));
+        let _direct_guard = allow_reclaim.then(|| self.shared.direct_io_lock.lock());
         let mut total = 0usize;
         let mut current = offset;
         while current < end {
@@ -164,6 +157,7 @@ impl CachedFile {
                 false,
                 allow_async,
                 readahead,
+                native_gate,
             ) {
                 Ok(copied) => copied,
                 Err(_) if total != 0 => break,
@@ -200,7 +194,14 @@ impl CachedFile {
             .try_reserve_exact(PAGE_SIZE)
             .map_err(|_| VfsError::NoMemory)?;
         bounce.resize(PAGE_SIZE, 0);
-        self.read_at_with_async_policy_with_bounce(dst, offset, allow_async, readahead, &mut bounce)
+        self.read_at_with_async_policy_with_bounce(
+            dst,
+            offset,
+            allow_async,
+            readahead,
+            &mut bounce,
+            true,
+        )
     }
 
     /// Reads data from the file at `offset` into `dst`.
@@ -225,10 +226,18 @@ impl CachedFile {
     ///
     /// This is intended for callers that already own a larger transaction and
     /// therefore cannot release its transaction and suspend after publishing a
-    /// request. Ordinary reads should use [`read_at`](Self::read_at), which may
-    /// use the explicit split-submit/wait path when the filesystem supports it.
+    /// request. It never takes the direct-I/O lock or reclaims cache pages, so
+    /// mm-locked callers cannot invert the cache-to-address-space lock order;
+    /// a full cache is reported as `ResourceBusy`. Ordinary reads should use
+    /// [`read_at`](Self::read_at), which may use the explicit split-submit/wait
+    /// path when the filesystem supports it.
     pub fn read_at_sync(&self, dst: impl Write + IoBufMut, offset: u64) -> VfsResult<usize> {
-        self.read_at_with_async_policy(dst, offset, false, true)
+        let mut bounce = Vec::new();
+        bounce
+            .try_reserve_exact(PAGE_SIZE)
+            .map_err(|_| VfsError::NoMemory)?;
+        bounce.resize(PAGE_SIZE, 0);
+        self.read_at_with_async_policy_with_bounce(dst, offset, false, true, &mut bounce, false)
     }
 
     /// Cache-managed synchronous read using caller-reserved bounce storage.
@@ -240,7 +249,7 @@ impl CachedFile {
         offset: u64,
         bounce: &mut [u8],
     ) -> VfsResult<usize> {
-        self.read_at_with_async_policy_with_bounce(dst, offset, false, true, bounce)
+        self.read_at_with_async_policy_with_bounce(dst, offset, false, true, bounce, true)
     }
 
     /// Reads into caller-pinned physical memory without exposing an aliasing
@@ -273,6 +282,8 @@ impl CachedFile {
             return Ok(read);
         }
 
+        let native_mutation = begin_source_location_writeback_mutation(&self.inner)?;
+        let native_gate = Some(held_native_writeback_gate(&native_mutation));
         let _direct_guard = self.shared.direct_io_lock.lock();
         let mut cursor = PinnedPhysicalCursor::new(dst);
         let mut bounce = try_zeroed_pinned_io_bounce(PAGE_SIZE)?;
@@ -298,6 +309,7 @@ impl CachedFile {
                 false,
                 try_async,
                 true,
+                native_gate,
             ) {
                 Ok(copied) => copied,
                 Err(_) if total != 0 => break,
@@ -356,13 +368,14 @@ impl CachedFile {
         &self,
         mut buf: impl Read + IoBuf,
         offset: u64,
+        native_gate: Option<HeldNativeWritebackGate<'_>>,
     ) -> VfsResult<usize> {
         let mut bounce = Vec::new();
         bounce
             .try_reserve_exact(PAGE_SIZE)
             .map_err(|_| VfsError::NoMemory)?;
         bounce.resize(PAGE_SIZE, 0);
-        self.write_at_locked_with_bounce(&mut buf, offset, &mut bounce)
+        self.write_at_locked_with_bounce(&mut buf, offset, &mut bounce, native_gate)
     }
 
     /// Cache-owned write under the caller's direct/append locks, using a
@@ -373,6 +386,7 @@ impl CachedFile {
         mut buf: impl Read + IoBuf,
         offset: u64,
         bounce: &mut [u8],
+        native_gate: Option<HeldNativeWritebackGate<'_>>,
     ) -> VfsResult<usize> {
         if bounce.len() < PAGE_SIZE {
             return Err(VfsError::InvalidInput);
@@ -415,7 +429,7 @@ impl CachedFile {
             let range = page_offset..page_offset + read;
             let load_from_file = !(range.start == 0 && range.end == PAGE_SIZE)
                 && u64::from(pn) * (PAGE_SIZE as u64) < committed_len;
-            let page_pin = match self.prepare_write_page(file, pn, load_from_file, true) {
+            let page_pin = match self.prepare_write_page(pn, load_from_file, true, native_gate) {
                 Ok(page_pin) => page_pin,
                 Err(_) if written != 0 => break,
                 Err(error) => return Err(error),
@@ -520,11 +534,12 @@ impl CachedFile {
             let range = page_offset..page_offset + chunk;
             let load_from_file = !(range.start == 0 && range.end == PAGE_SIZE)
                 && u64::from(pn) * (PAGE_SIZE as u64) < committed_len;
-            let page_pin = match self.prepare_write_page(file, pn, load_from_file, try_async) {
-                Ok(page_pin) => page_pin,
-                Err(_) if written != 0 => break,
-                Err(error) => return Err(error),
-            };
+            let page_pin =
+                match self.prepare_write_page(pn, load_from_file, try_async, Some(native_gate)) {
+                    Ok(page_pin) => page_pin,
+                    Err(_) if written != 0 => break,
+                    Err(error) => return Err(error),
+                };
             if next > committed_len {
                 match file.set_len(next) {
                     Ok(()) => {
@@ -552,9 +567,11 @@ impl CachedFile {
         if let Some(written) = self.try_write_aligned_bypass(&mut buf, offset, len)? {
             return Ok(written);
         }
+        let native_mutation = begin_source_location_writeback_mutation(&self.inner)?;
+        let native_gate = Some(held_native_writeback_gate(&native_mutation));
         let _direct_guard = self.shared.direct_io_lock.lock();
         let _guard = self.shared.append_lock.read();
-        self.write_at_locked(buf, offset)
+        self.write_at_locked(buf, offset, native_gate)
     }
 
     pub(super) fn write_at_with_held_native_mutation(
@@ -574,7 +591,7 @@ impl CachedFile {
         }
         let _direct_guard = self.shared.direct_io_lock.lock();
         let _guard = self.shared.append_lock.read();
-        self.write_at_locked(buf, offset)
+        self.write_at_locked(buf, offset, Some(native_gate))
     }
 
     pub fn write_at_slice(&self, src: &[u8], offset: u64) -> VfsResult<usize> {
@@ -616,8 +633,22 @@ impl CachedFile {
     /// but cannot extend it beyond the caller's remaining input.
     pub fn append_with_admission(
         &self,
+        buf: impl Read + IoBuf,
+        admit: impl FnOnce(u64, usize) -> VfsResult<usize>,
+    ) -> VfsResult<(usize, u64)> {
+        let native_mutation = begin_source_location_writeback_mutation(&self.inner)?;
+        self.append_with_admission_with_reclaim_gate(
+            buf,
+            admit,
+            Some(held_native_writeback_gate(&native_mutation)),
+        )
+    }
+
+    fn append_with_admission_with_reclaim_gate(
+        &self,
         mut buf: impl Read + IoBuf,
         admit: impl FnOnce(u64, usize) -> VfsResult<usize>,
+        native_gate: Option<HeldNativeWritebackGate<'_>>,
     ) -> VfsResult<(usize, u64)> {
         let _direct_guard = self.shared.direct_io_lock.lock();
         let _guard = self.shared.append_lock.write();
@@ -629,7 +660,7 @@ impl CachedFile {
             return Err(VfsError::InvalidInput);
         }
         let mut admitted = (&mut buf).take(allowed as u64);
-        let written = self.write_at_locked(&mut admitted, len)?;
+        let written = self.write_at_locked(&mut admitted, len, native_gate)?;
         let new_end = len
             .checked_add(written as u64)
             .ok_or(VfsError::InvalidInput)?;
@@ -640,9 +671,9 @@ impl CachedFile {
         &self,
         src: impl Read + IoBuf,
         admit: impl FnOnce(u64, usize) -> VfsResult<usize>,
-        _native_gate: HeldNativeWritebackGate<'_>,
+        native_gate: HeldNativeWritebackGate<'_>,
     ) -> VfsResult<(usize, u64)> {
-        self.append_with_admission(src, admit)
+        self.append_with_admission_with_reclaim_gate(src, admit, Some(native_gate))
     }
 
     /// Nonblocking append transaction for RWF_NOWAIT. Both inode gates are
@@ -667,7 +698,7 @@ impl CachedFile {
             return Err(VfsError::InvalidInput);
         }
         let mut admitted = (&mut buf).take(allowed as u64);
-        let written = self.write_at_locked(&mut admitted, len)?;
+        let written = self.write_at_locked(&mut admitted, len, None)?;
         let new_end = len
             .checked_add(written as u64)
             .ok_or(VfsError::InvalidInput)?;
@@ -686,6 +717,18 @@ impl CachedFile {
     /// appends, but no other cached or direct writer can enter between two
     /// nonempty elements.
     pub fn append_vectored(&self, src: &[&[u8]]) -> VfsResult<(usize, u64)> {
+        let native_mutation = begin_source_location_writeback_mutation(&self.inner)?;
+        self.append_vectored_with_reclaim_gate(
+            src,
+            Some(held_native_writeback_gate(&native_mutation)),
+        )
+    }
+
+    fn append_vectored_with_reclaim_gate(
+        &self,
+        src: &[&[u8]],
+        native_gate: Option<HeldNativeWritebackGate<'_>>,
+    ) -> VfsResult<(usize, u64)> {
         let _direct_guard = self.shared.direct_io_lock.lock();
         let _append_guard = self.shared.append_lock.write();
         let file = self.inner.entry().as_file()?;
@@ -697,7 +740,7 @@ impl CachedFile {
                 continue;
             }
             let requested = buf.len();
-            let written = match self.write_at_locked(buf, end) {
+            let written = match self.write_at_locked(buf, end, native_gate) {
                 Ok(written) => written,
                 Err(_) if total != 0 => break,
                 Err(error) => return Err(error),
@@ -714,9 +757,9 @@ impl CachedFile {
     pub(super) fn append_vectored_with_held_native_mutation(
         &self,
         src: &[&[u8]],
-        _native_gate: HeldNativeWritebackGate<'_>,
+        native_gate: HeldNativeWritebackGate<'_>,
     ) -> VfsResult<(usize, u64)> {
-        self.append_vectored(src)
+        self.append_vectored_with_reclaim_gate(src, Some(native_gate))
     }
 
     /// Truncates or extends the file to `len` bytes.

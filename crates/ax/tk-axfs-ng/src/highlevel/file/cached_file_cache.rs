@@ -380,10 +380,6 @@ impl CachedFile {
         Self::begin_shared_cache_invalidating_mutation(&self.shared)
     }
 
-    pub(super) fn begin_cache_user(&self) -> VfsResult<CachedFileCacheUserGuard> {
-        self.begin_cache_user_range(0..u64::MAX, RangeCacheLeaseKind::CachedRead)
-    }
-
     pub(super) fn begin_cache_user_range(
         &self,
         range: Range<u64>,
@@ -933,6 +929,21 @@ impl CachedFile {
         }
         let native_mutation = begin_source_location_writeback_mutation(&self.inner)?;
         let _direct_guard = self.shared.direct_io_lock.lock();
+        self.reclaim_one_with_held_direct_io_lock(held_native_writeback_gate(&native_mutation))
+    }
+
+    /// Reclaims one page when the caller already holds both the source
+    /// writeback admission and `direct_io_lock`. This is used by buffered I/O
+    /// that must release the page-cache lock before invoking eviction
+    /// listeners, while preserving the normal native-gate-before-direct-lock
+    /// order.
+    pub(super) fn reclaim_one_with_held_direct_io_lock(
+        &self,
+        native_gate: HeldNativeWritebackGate<'_>,
+    ) -> VfsResult<bool> {
+        if self.in_memory {
+            return Ok(false);
+        }
         let (candidate, writeback_pending) = {
             let cache = self.shared.page_cache.lock();
             (
@@ -964,11 +975,7 @@ impl CachedFile {
             return Ok(false);
         }
         invalidation.prepare_evictions()?;
-        invalidation.writeback_with_held_native_gate(
-            file,
-            true,
-            held_native_writeback_gate(&native_mutation),
-        )?;
+        invalidation.writeback_with_held_native_gate(file, true, native_gate)?;
         invalidation.commit_discard();
         release_cached_file_writeback_anchor_if_clean(&self.shared);
         Ok(true)

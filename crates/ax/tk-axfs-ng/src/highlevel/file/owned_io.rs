@@ -821,15 +821,17 @@ pub(super) fn cached_owned_file_io_execute(
             FileIoOpcode::Write => match request.placement() {
                 FileIoWritePlacement::Positioned => {
                     native_mutation = begin_native_location_mutation(&cache.inner, false)?;
+                    let native_gate = Some(held_native_writeback_gate(&native_mutation));
                     let _direct_guard = cache.shared.direct_io_lock.lock();
                     let _append_guard = cache.shared.append_lock.read();
                     let offset = request.offset();
-                    cached_owned_write_execute(cache, request, offset, bounces)
+                    cached_owned_write_execute(cache, request, offset, bounces, native_gate)
                 }
                 FileIoWritePlacement::Append => {
                     // EOF is selected only after the append domain is held, and
                     // remains fixed for every chunk of this operation.
                     native_mutation = begin_native_location_mutation(&cache.inner, true)?;
+                    let native_gate = Some(held_native_writeback_gate(&native_mutation));
                     let _direct_guard = cache.shared.direct_io_lock.lock();
                     let _append_guard = cache.shared.append_lock.write();
                     let offset = cache.inner.entry().as_file()?.len()?;
@@ -839,7 +841,7 @@ pub(super) fn cached_owned_file_io_execute(
                     {
                         return Err(VfsError::InvalidInput);
                     }
-                    cached_owned_write_execute(cache, request, offset, bounces)
+                    cached_owned_write_execute(cache, request, offset, bounces, native_gate)
                 }
             },
         }
@@ -897,6 +899,7 @@ pub(super) fn cached_owned_write_execute(
     request: &mut dyn FileIoRequestAccess,
     offset: u64,
     bounces: &mut CachedOwnedIoBounces,
+    native_gate: Option<HeldNativeWritebackGate<'_>>,
 ) -> VfsResult<usize> {
     let mut done = 0usize;
     while done < request.len() {
@@ -915,6 +918,7 @@ pub(super) fn cached_owned_write_execute(
             &bounces.transfer[..copied],
             current,
             &mut bounces.cache_page,
+            native_gate,
         ) {
             Ok(written) => written,
             Err(error) => return owned_file_io_prefix_or_error(done, error),

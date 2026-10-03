@@ -901,6 +901,69 @@ impl CachedFile {
         }
     }
 
+    /// Inserts or accesses a page without invoking an eviction listener while
+    /// holding the cache mutex. When `native_gate` is `Some`, the caller must
+    /// already hold this inode's `direct_io_lock` after acquiring the source
+    /// writeback gate; cache pressure is then reclaimed through the staged
+    /// eviction protocol. With no native gate this never reclaims, so it is
+    /// safe under an mm lock and returns `ResourceBusy` at capacity.
+    pub(super) fn with_page_or_insert_with_reclaim<R>(
+        &self,
+        pn: u32,
+        load_from_file: bool,
+        allow_async_page_fill: bool,
+        readahead_pages: usize,
+        wait_writeback: bool,
+        native_gate: Option<HeldNativeWritebackGate<'_>>,
+        f: impl FnOnce(&mut PageCache) -> VfsResult<R>,
+    ) -> VfsResult<R> {
+        let mut f = Some(f);
+        let mut reclaimed = 0usize;
+        loop {
+            let attempt = self.with_page_or_insert_without_reclaim_with_options(
+                pn,
+                load_from_file,
+                allow_async_page_fill,
+                readahead_pages,
+                wait_writeback,
+                |page| f.take().expect("page insertion callback was consumed")(page),
+            );
+            match attempt {
+                Ok(value) => return Ok(value),
+                Err(VfsError::ResourceBusy) if f.is_some() => {
+                    let (cache_full, writeback) = {
+                        let cache = self.shared.page_cache.lock();
+                        (
+                            !cache.contains(&pn) && cache.len() == cache.cap().get(),
+                            cache.peek(&pn).is_some_and(PageCache::is_writeback),
+                        )
+                    };
+                    if wait_writeback && writeback {
+                        wait_for_page_writeback_clear(&self.shared, pn);
+                        continue;
+                    }
+                    if !cache_full {
+                        return Err(VfsError::ResourceBusy);
+                    }
+                    let Some(native_gate) = native_gate else {
+                        return Err(VfsError::ResourceBusy);
+                    };
+                    if reclaimed == LOCK_EXTERNAL_INSERT_RECLAIM_RETRY_LIMIT {
+                        return Err(VfsError::ResourceBusy);
+                    }
+                    // The direct-I/O lock is held by our caller, but all
+                    // cache-user, range-lease and page-cache guards from the
+                    // failed insertion attempt have been dropped.
+                    if !self.reclaim_one_with_held_direct_io_lock(native_gate)? {
+                        return Err(VfsError::ResourceBusy);
+                    }
+                    reclaimed += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Loads one mmap fault page and an optional forward page-cache window
     /// without replacing any existing cache page.
     ///
@@ -912,6 +975,25 @@ impl CachedFile {
         &self,
         pn: u32,
         readahead_pages: usize,
+        f: impl FnOnce(&mut PageCache) -> VfsResult<R>,
+    ) -> VfsResult<R> {
+        self.with_page_or_insert_without_reclaim_with_options(
+            pn,
+            true,
+            false,
+            readahead_pages,
+            true,
+            f,
+        )
+    }
+
+    fn with_page_or_insert_without_reclaim_with_options<R>(
+        &self,
+        pn: u32,
+        load_from_file: bool,
+        allow_async_page_fill: bool,
+        readahead_pages: usize,
+        reject_writeback: bool,
         f: impl FnOnce(&mut PageCache) -> VfsResult<R>,
     ) -> VfsResult<R> {
         let _cache_user = self.begin_cache_user_range(
@@ -926,15 +1008,15 @@ impl CachedFile {
             self.inner.entry().as_file()?,
             &mut guard,
             pn,
-            true,
-            false,
+            load_from_file,
+            allow_async_page_fill,
             readahead_pages.max(1),
         )?;
         debug_assert!(
             _evicted.is_none(),
-            "no-reclaim cache insertion must not evict while an address space is locked"
+            "no-reclaim cache insertion must not evict while holding the cache lock"
         );
-        if guard.get(&pn).is_some_and(PageCache::is_writeback) {
+        if reject_writeback && guard.get(&pn).is_some_and(PageCache::is_writeback) {
             return Err(VfsError::ResourceBusy);
         }
         let result = f(guard.get_mut(&pn).unwrap());
