@@ -142,16 +142,36 @@ fn frequency_from_counts(
     u64::try_from(hz).ok()
 }
 
-/// Convert a hardware tick count to nanoseconds with a saturating u128
-/// intermediate.  This helper is intentionally pure so large-counter cases
-/// can be tested without booting a platform.
+/// Convert ticks with the exact floor of `ticks * 1e9 / frequency_hz`,
+/// saturating only the u64 result. This helper remains pure and testable
+/// without booting a platform.
 fn ticks_to_nanos_checked(ticks: u64, frequency_hz: u64) -> u64 {
     if frequency_hz == 0 {
         return 0;
     }
-    let nanos =
-        u128::from(ticks).saturating_mul(u128::from(NANOS_PER_SEC)) / u128::from(frequency_hz);
-    nanos.min(u128::from(u64::MAX)) as u64
+    // The full product is below 2^94 over the entire u64 tick domain, so this
+    // multiplication is exact. For divisor d > 0, high >= d is equivalent
+    // to product >= d * 2^64: the mathematical quotient does not fit u64.
+    // Return the original saturation value rather than letting DIV trap.
+    let product = u128::from(ticks) * u128::from(NANOS_PER_SEC);
+    let high = (product >> 64) as u64;
+    if high >= frequency_hz {
+        return u64::MAX;
+    }
+    let nanos: u64;
+    // SAFETY: the divisor is nonzero and high < divisor proves that the
+    // unsigned RDX:RAX / divisor quotient fits u64. DIV therefore cannot
+    // raise #DE, and computes precisely the old u128 division's floor.
+    unsafe {
+        core::arch::asm!(
+            "div {divisor}",
+            divisor = in(reg) frequency_hz,
+            inlateout("rax") product as u64 => nanos,
+            inlateout("rdx") high => _,
+            options(pure, nomem, nostack),
+        );
+    }
+    nanos
 }
 
 /// Convert nanoseconds to hardware ticks with a saturating u128
@@ -800,6 +820,90 @@ mod tests {
         assert_eq!(nanos_to_ticks_checked(u64::MAX, u64::MAX), u64::MAX);
         assert_eq!(ticks_to_nanos_checked(10, 0), 0);
         assert_eq!(nanos_to_ticks_checked(10, 0), 0);
+    }
+
+    #[test]
+    fn tick_conversion_preserves_exact_floor_monotonicity_and_saturation() {
+        fn check(ticks: u64, frequency: u64) -> u64 {
+            // Keep the original expression as an independent oracle.
+            let expected = if frequency == 0 {
+                0
+            } else {
+                (u128::from(ticks).saturating_mul(1_000_000_000)
+                    / u128::from(frequency))
+                    .min(u128::from(u64::MAX)) as u64
+            };
+            let actual = ticks_to_nanos_checked(ticks, frequency);
+            assert_eq!(actual, expected, "ticks={ticks} frequency={frequency}");
+            actual
+        }
+
+        fn check_frequency(frequency: u64) {
+            for ticks in [0, 1, 2, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+                check(ticks, frequency);
+            }
+            for bit in 0..64 {
+                let ticks = 1_u64 << bit;
+                let before = check(ticks - 1, frequency);
+                let at = check(ticks, frequency);
+                let after = check(ticks + 1, frequency);
+                assert!(before <= at && at <= after);
+            }
+            if frequency != 0 {
+                // ceil(2^64 * frequency / 1e9) is the first tick whose
+                // quotient overflows u64. This product fits u128 even for
+                // frequency == u64::MAX.
+                let first_overflow = ((u128::from(u64::MAX) + 1)
+                    * u128::from(frequency))
+                    .div_ceil(1_000_000_000);
+                if first_overflow <= u128::from(u64::MAX) {
+                    let ticks = first_overflow as u64;
+                    let before = check(ticks - 1, frequency);
+                    let at = check(ticks, frequency);
+                    let after = check(ticks.saturating_add(1), frequency);
+                    assert!(before <= at && at == u64::MAX && at == after);
+                }
+            }
+        }
+
+        for frequency in [
+            0,
+            1,
+            2,
+            3,
+            1_000_000,
+            999_999_999,
+            1_000_000_000,
+            1_000_000_001,
+            2_400_000_000,
+            3_600_000_000,
+            100_000_000_000,
+            u64::MAX,
+        ] {
+            check_frequency(frequency);
+        }
+        for bit in 0..64 {
+            let frequency = 1_u64 << bit;
+            check_frequency(frequency - 1);
+            check_frequency(frequency);
+            check_frequency(frequency + 1);
+        }
+
+        let mut random = 0x4d59_5df4_d0f3_3173_u64;
+        for iteration in 0..65_536 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let ticks = random;
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let frequency = match iteration & 3 {
+                0 => 0,
+                1 => random % 1_000_000_000 + 1,
+                2 => random % 100_000_000_000 + 1,
+                _ => random,
+            };
+            let at = check(ticks, frequency);
+            let after = check(ticks.saturating_add(1), frequency);
+            assert!(at <= after);
+        }
     }
 
     #[test]
