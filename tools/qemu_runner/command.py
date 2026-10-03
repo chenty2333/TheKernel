@@ -14,7 +14,11 @@ class CommandError(ValueError):
 
 VALID_DRIVE_MODES = frozenset({"snapshot", "readonly", "rw"})
 Q35_MACHINE = "q35,max-ram-below-4g=2G"
-_ACCEL_CPU_MODELS = {"kvm": "host", "tcg": "max"}
+# QEMU masks invariant TSC from `-cpu host` because it blocks live migration,
+# which these guests never use.  Without it TheKernel falls back to HPET, an
+# exiting MMIO read on every clock query, so a VM would measure a clock the
+# target hardware does not have.  Both kernels in a comparison get the same.
+_ACCEL_CPU_MODELS = {"kvm": "host,+invtsc", "tcg": "max"}
 _RUNNER_OWNED_OPTIONS = frozenset({"-accel", "-cpu", "-serial", "-chardev", "-nographic"})
 
 

@@ -131,7 +131,7 @@ class CommandTests(unittest.TestCase):
             rootfs=Drive(Path("root.img"), "snapshot"),
             direct_kernel=True,
         )
-        for accel, cpu_model in (("kvm", "host"), ("tcg", "max")):
+        for accel, cpu_model in (("kvm", "host,+invtsc"), ("tcg", "max")):
             with self.subTest(accel=accel):
                 command = build_qemu_command(**base, accel=accel)
                 self.assertEqual(command.count("-accel"), 1)
