@@ -115,7 +115,6 @@ use self::{
     probe::{BusFacts, ProbeReport, WindowStatus},
     regs::{RegisterWindow, Registers},
 };
-use crate::drm::modes::Narration;
 /// The aperture type and the window length are named only by the bare-metal
 /// half: [`mapped_facts`] answers with the one and [`open_register_window`]
 /// maps the other, and no host-test caller names either.  They are gated here
@@ -123,6 +122,7 @@ use crate::drm::modes::Narration;
 /// builds have in common.
 #[cfg(target_os = "none")]
 use self::{id::Aperture, regs::PROBE_WINDOW};
+use crate::drm::modes::Narration;
 
 /// The report of the one probe this kernel runs, kept for the debug file.
 ///
@@ -274,6 +274,23 @@ pub(crate) fn bring_up_at_boot() {
             "intel-gpu: no device with a mapped register window, so the power and connector steps \
              of the bring-up order did not run"
         );
+        return;
+    }
+
+    if axhal::boot::framebuffer().is_some() {
+        // The current modeset has no complete restoration of the firmware's
+        // PLL/PHY/pipe state on failure. The live GOP surface is the only
+        // diagnostic channel: do not claim that merely retaining its address
+        // makes destructive register programming fail-safe.
+        axlog::warn!(
+            "intel-gpu: phase 0 complete; stopping before power/modeset writes: live firmware \
+             console has no verified hardware rollback. Use firmware KMS; hardware-unverified \
+             (未在硬件上验证)"
+        );
+        *MODESET.lock() = Some(String::from(
+            "not attempted: preserve the live firmware console; hardware rollback is not \
+             implemented",
+        ));
         return;
     }
 

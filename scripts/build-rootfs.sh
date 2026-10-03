@@ -298,6 +298,7 @@ install -m 0644 "$REPO_ROOT/NOTICE" \
     "$STAGE/usr/share/licenses/thekernel/NOTICE"
 install -m 0755 "$REPO_ROOT/tests/guest/shell-init.sh" \
     "$STAGE/etc/thekernel/shell-init.sh"
+install -m 0755 "$REPO_ROOT/scripts/ci/n305-dhcp.script" "$STAGE/etc/thekernel/n305-dhcp.script"
 rm -f "$STAGE/sbin/init"
 # The payload selection also selects which cases the suite contains: the
 # native-compilation case is only meaningful when the compiler is installed,

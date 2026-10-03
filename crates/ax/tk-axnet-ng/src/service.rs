@@ -55,6 +55,7 @@ pub struct Service {
     pub(crate) router: Router,
     pub(crate) socket_set: Arc<SocketSetWrapper<'static>>,
     timeout: Option<ServiceTimeout>,
+    rx_poll_deadline: Option<Instant>,
 }
 
 /// Result of one bounded task-context network pass.
@@ -71,6 +72,13 @@ pub enum ServicePoll {
     /// after this bounded pass; callers must yield and poll it again while
     /// keeping the quarantine visible.
     Quarantined { continuation: bool },
+}
+
+fn earliest_deadline(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 struct ServiceTimeout {
@@ -91,6 +99,7 @@ impl Service {
             router,
             socket_set,
             timeout: None,
+            rx_poll_deadline: None,
         })
     }
 
@@ -104,6 +113,10 @@ impl Service {
         let timestamp = now();
 
         let rx = self.router.poll(timestamp);
+        self.rx_poll_deadline = self
+            .router
+            .rx_poll_interval_micros()
+            .map(|us| timestamp + smoltcp::time::Duration::from_micros(us));
         let mut ingress = 0;
         while ingress < RX_PASS_BUDGET {
             match self
@@ -273,6 +286,15 @@ impl Service {
             (protocol, close) => protocol.or(close),
         };
 
+        let polling = self.router.rx_poll_interval_micros();
+        if polling.is_none() {
+            self.rx_poll_deadline = None;
+        } else if self.rx_poll_deadline.is_none() {
+            self.rx_poll_deadline =
+                polling.map(|us| now() + smoltcp::time::Duration::from_micros(us));
+        }
+        let next = earliest_deadline(next, self.rx_poll_deadline);
+
         if let Some(t) = next {
             let next = TimeValue::from_micros(t.total_micros() as _);
 
@@ -424,6 +446,20 @@ mod tests {
             Ipv4Address::new(10, 0, 2, 15).into(),
         ));
         Service::try_new(router, socket_set).unwrap()
+    }
+
+    #[test]
+    fn polling_deadline_is_not_lost_behind_a_protocol_deadline() {
+        let poll = Some(Instant::from_micros(10_000));
+        assert_eq!(earliest_deadline(None, poll), poll);
+        assert_eq!(
+            earliest_deadline(Some(Instant::from_micros(50_000)), poll),
+            poll
+        );
+        assert_eq!(
+            earliest_deadline(Some(Instant::from_micros(100)), poll),
+            Some(Instant::from_micros(100))
+        );
     }
 
     #[test]

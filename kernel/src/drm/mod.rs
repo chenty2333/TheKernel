@@ -14,6 +14,7 @@ mod gem;
 pub(crate) mod intel;
 mod ioctl;
 mod kms;
+pub(crate) mod linear;
 pub mod modes;
 mod property;
 mod render;
@@ -29,8 +30,8 @@ pub use device::{
     AdapterMetrics, DisplayAdapter, DrmDevice, DrmError, DrmMetrics, DrmResult, Scanout,
     primary_device, register_primary_device,
 };
-pub(crate) use fbdev::drm_scanout;
 pub use fbdev::DrmFbdev;
+pub(crate) use fbdev::drm_scanout;
 pub(crate) use fence::metrics as fence_metrics;
 pub use file::{DrmEvent, DrmFile, OpenId};
 pub use gem::{DumbBuffer, DumbRequest, GemBacking, GemHandle, MmapOffset};
@@ -51,7 +52,21 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
     // a log a person can act on and one that only says "no display".
     intel::probe_at_boot();
     intel::bring_up_at_boot();
-    virtio::init()
+    if primary_device().is_some() {
+        return Ok(true);
+    }
+    if virtio::init()? {
+        return Ok(true);
+    }
+    match linear::init_firmware() {
+        Ok(ready) => Ok(ready),
+        Err(error) => {
+            axlog::warn!(
+                "drm: firmware KMS registration failed: {error}; direct firmware console retained"
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// Seat/session hooks used by the VT and logind control path.  They operate

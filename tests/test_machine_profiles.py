@@ -58,6 +58,13 @@ def contains(outer: tuple[int, int], inner: tuple[int, int]) -> bool:
 
 
 class MachineProfileTests(unittest.TestCase):
+    def test_n305_compiles_both_candidate_nics_and_rtl_flag_is_not_ignored(self):
+        args = product.build_parser().parse_args(["build", "--platform", "n305"])
+        self.assertIn("net-n305", product.kernel_features(product.artifacts_for(args)).split())
+        rtl = product.parse_variant(product.build_parser().parse_args(["build", "--net-rtl8125"]))
+        self.assertTrue(rtl.net_rtl8125)
+        self.assertIn("-net-rtl8125", rtl.name)
+
     def test_every_selectable_profile_exists_and_generates_a_config(self) -> None:
         self.assertEqual(set(MACHINE_PROFILES), {"q35-uefi", "n305"})
         for name, profile in MACHINE_PROFILES.items():
@@ -97,7 +104,8 @@ class MachineProfileTests(unittest.TestCase):
         self.assertEqual(profile["platform"], "x86-pc")
         # The header must say the profile is unverified on hardware.
         text = (REPO_ROOT / machine_profile("n305").config).read_text(encoding="utf-8")
-        self.assertIn("NEVER BEEN BOOTED", text)
+        self.assertIn("boot observation, not validation of Intel modesetting or NIC I/O", text)
+        self.assertIn("未在硬件上验证", text)
 
     def test_secret_window_tiles_the_top_of_the_kernel_address_space(self) -> None:
         for name in MACHINE_PROFILES:

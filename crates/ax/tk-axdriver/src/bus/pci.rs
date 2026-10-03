@@ -12,10 +12,9 @@ use axsync::Mutex;
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 use lazyinit::LazyInit;
 
-use crate::{AllDevices, drivers::BusProbeResult, prelude::*};
-
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 use crate::AxInputDevice;
+use crate::{AllDevices, drivers::BusProbeResult, prelude::*};
 
 const PCI_BAR_NUM: u8 = 6;
 /// ECAM address per PCI bus: one 1 MiB region of 32 devices x 8 functions x
@@ -74,7 +73,8 @@ fn walk_reachable_pci_functions(
                 // every walk, including the input reconcile's per-second one. It
                 // describes the machine, not an event, so it is `dmesg` material.
                 debug!(
-                    "PCI reachable-bus budget ({MAX_REACHABLE_PCI_BUSES}) exhausted at {bdf}; stopping discovery"
+                    "PCI reachable-bus budget ({MAX_REACHABLE_PCI_BUSES}) exhausted at {bdf}; \
+                     stopping discovery"
                 );
                 return;
             }
@@ -231,30 +231,9 @@ fn input_registry() -> &'static Mutex<BusDeviceRegistry> {
         .expect("PCI device registry not initialized")
 }
 
-/// Highest bus number the ECAM walk may reach.
-///
-/// Two independent bounds apply: `[devices] pci-bus-end` says how far this
-/// kernel is willing to look, and the ECAM region says how far configuration
-/// space is actually decoded.  Linux honors the second one literally --
-/// `pci_mmconfig_lookup` (arch/x86/pci/mmconfig-shared.c:119-129) answers
-/// `NULL` for a bus outside the region's `[start_bus, end_bus]`, so a read
-/// there reports an absent device instead of forming an address past the
-/// window.  Walking beyond it would read memory that is not configuration
-/// space at all.
-const fn ecam_scan_bus_end(configured: u8, ecam_end: u8) -> u8 {
-    if ecam_end < configured {
-        ecam_end
-    } else {
-        configured
-    }
-}
-
 /// The walk bound for the ECAM region the platform published.
 fn pci_scan_bus_end() -> u8 {
-    ecam_scan_bus_end(
-        axconfig::devices::PCI_BUS_END as u8,
-        axhal::pci::ecam_bus_range().1,
-    )
+    axhal::pci::ecam_bus_range().1
 }
 
 /// Virtual base of the mapped ECAM window; zero until [`ecam_window`] runs.
@@ -317,9 +296,9 @@ fn ecam_window() -> Option<VirtAddr> {
             // forever -- this latch speaks only about who gets told.
             if !ECAM_REFUSAL_REPORTED.swap(true, Ordering::AcqRel) {
                 error!(
-                    "pci-ecam: cannot map [{base:#x}, {window_end:#x}) for buses {bus_begin}..=\
-                     {bus_end}: {error:?}; PCI configuration space is unreachable, so no bus \
-                     scan runs. A repeated refusal is not reported again."
+                    "pci-ecam: cannot map [{base:#x}, {window_end:#x}) for buses \
+                     {bus_begin}..={bus_end}: {error:?}; PCI configuration space is unreachable, \
+                     so no bus scan runs. A repeated refusal is not reported again."
                 );
             }
             None
@@ -358,8 +337,10 @@ fn probe_virtio_input(
     bdf: DeviceFunction,
     dev_info: &axdriver_pci::DeviceFunctionInfo,
 ) -> Option<AxInputDevice> {
-    use crate::drivers::DriverProbe;
-    use crate::virtio::{VirtIoDevMeta, VirtIoInput};
+    use crate::{
+        drivers::DriverProbe,
+        virtio::{VirtIoDevMeta, VirtIoInput},
+    };
 
     match <VirtIoInput as VirtIoDevMeta>::Driver::probe_pci(root, bdf, dev_info) {
         BusProbeResult::Device(crate::AxDeviceEnum::Input(device)) => Some(device),
@@ -422,7 +403,9 @@ fn config_pci_device(
 ) -> DevResult {
     let mut bar = 0;
     while bar < PCI_BAR_NUM {
-        let info = root.bar_info(bdf, bar).unwrap();
+        let info = root
+            .bar_info(bdf, bar)
+            .map_err(|_| DevError::InvalidParam)?;
         if let BarInfo::Memory {
             address_type,
             address,
@@ -434,7 +417,7 @@ fn config_pci_device(
             if size > 0 && address == 0 {
                 let new_addr = allocator
                     .as_mut()
-                    .expect("No memory ranges available for PCI BARs!")
+                    .ok_or(DevError::NoMemory)?
                     .alloc(size as _)
                     .ok_or(DevError::NoMemory)?;
                 if address_type == MemoryBarType::Width32 {
@@ -446,7 +429,9 @@ fn config_pci_device(
         }
 
         // read the BAR info again after assignment.
-        let info = root.bar_info(bdf, bar).unwrap();
+        let info = root
+            .bar_info(bdf, bar)
+            .map_err(|_| DevError::InvalidParam)?;
         match info {
             BarInfo::IO { address, size } => {
                 if address > 0 && size > 0 {
@@ -492,7 +477,9 @@ fn config_pci_device(
     let (_status, cmd) = root.get_status_command(bdf);
     root.set_command(
         bdf,
-        cmd | Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER
+        cmd | Command::IO_SPACE
+            | Command::MEMORY_SPACE
+            | Command::BUS_MASTER
             | Command::INTERRUPT_DISABLE,
     );
     Ok(())
@@ -510,6 +497,21 @@ impl AllDevices {
             return;
         };
 
+        // Inventory precedes any BAR-sizing writes or driver reset. Raw words
+        // keep a 64-bit BAR pair visible without disturbing the boot GPU.
+        let mut count = 0usize;
+        for bus in 0..=pci_scan_bus_end() {
+            for (bdf, info) in root.enumerate_bus(bus) {
+                let bars = root.raw_bars(bdf, info.header_type);
+                info!(
+                    "pci-inventory: {bdf} {:04x}:{:04x} class={:02x}:{:02x}:{:02x} BAR={bars:08x?}",
+                    info.vendor_id, info.device_id, info.class, info.subclass, info.prog_if
+                );
+                count += 1;
+            }
+        }
+        info!("pci-inventory: {count} functions; raw BAR words, before driver initialization");
+
         // PCI 32-bit MMIO space
         let mut allocator = axconfig::devices::PCI_RANGES
             .get(1)
@@ -519,7 +521,9 @@ impl AllDevices {
         let mut usb_devices = alloc::vec::Vec::new();
         walk_reachable_pci_functions(&mut root, |root, bdf, dev_info| {
             debug!("PCI {bdf}: {dev_info}");
-            if dev_info.header_type != HeaderType::Standard {
+            if dev_info.header_type != HeaderType::Standard
+                || (dev_info.class == 0x03 && dev_info.vendor_id != 0x1af4)
+            {
                 return;
             }
             match config_pci_device(root, bdf, &mut allocator) {
@@ -598,12 +602,16 @@ impl AllDevices {
         // USB is auxiliary storage; preserve the existing root disk ordering
         // even when the xHCI function precedes VirtIO block on the PCI bus.
         #[cfg(feature = "usb-xhci")]
-        for device in usb_devices { self.add_device(device); }
+        for device in usb_devices {
+            self.add_device(device);
+        }
 
         // The igc driver's negative case, printed once so that a machine
         // without the assumed part says so in one greppable line.
-        #[cfg(net_dev = "igc")]
+        #[cfg(any(net_dev = "igc", net_dev = "n305-net"))]
         crate::igc::finish_probe(pci_scan_bus_end());
+        #[cfg(any(net_dev = "rtl8125", net_dev = "n305-net"))]
+        crate::rtl8125::finish_probe();
     }
 }
 
@@ -703,7 +711,9 @@ pub(crate) fn reconcile_input_devices<Register, Unregister>(
                 // "this is a fault, and it is also routine"; the `\x014` keeps it a
                 // warning for whoever opened that band, and the window budget
                 // bounds it there.
-                ratelimit::warn_ratelimited!("failed to configure hotplugged PCI function at {bdf}");
+                ratelimit::warn_ratelimited!(
+                    "failed to configure hotplugged PCI function at {bdf}"
+                );
                 continue;
             }
             if let Some(device) = probe_virtio_input(&mut root, bdf, &info) {
@@ -820,11 +830,11 @@ pub(crate) fn activate_boot_input_devices<Register, Unregister>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ecam_scan_bus_end, memory_bar_mapping_range, valid_bridge_secondary_bus};
     use axdriver_pci::BridgeBusNumbers;
 
     #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
     use super::{BootRegistrationAction, boot_registration_action};
+    use super::{memory_bar_mapping_range, valid_bridge_secondary_bus};
 
     #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
     #[test]
@@ -859,18 +869,6 @@ mod tests {
         assert!(memory_bar_mapping_range(0x1000, 0).is_none());
         assert!(memory_bar_mapping_range(u64::MAX - 0x7ff, 0x1000).is_none());
         assert!(memory_bar_mapping_range(u64::MAX - 0xfff, 0xfff).is_none());
-    }
-
-    #[test]
-    fn scan_bus_end_takes_the_tighter_of_two_bounds() {
-        // The configured fallback always describes buses 0-255, so a profile
-        // that scans to 0xff is unchanged by it.
-        assert_eq!(ecam_scan_bus_end(0xff, 0xff), 0xff);
-        // A narrow MCFG window ends the walk where firmware stopped decoding,
-        // even though `pci-bus-end` would allow more.
-        assert_eq!(ecam_scan_bus_end(0xff, 0x7f), 0x7f);
-        // A profile may still ask for less than the window covers.
-        assert_eq!(ecam_scan_bus_end(0x1f, 0xff), 0x1f);
     }
 
     fn reachable_buses<const MAX: usize>(

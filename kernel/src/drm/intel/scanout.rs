@@ -177,6 +177,13 @@ pub(crate) fn register(surface: Arc<Surface>, verdict: Verdict) {
              (reference section 11 phase 6)"
         );
     }
+    if refused.is_none() {
+        // Only a proven scanning surface may publish Intel KMS. Userspace
+        // presents through a RAM copy, without reprogramming the pipe.
+        if let Err(error) = crate::drm::linear::register("thekernel-intel", surface.clone()) {
+            warn!("intel-drm: registration failed: {error}; direct console retained");
+        }
+    }
     if offer(Offered { surface, refused }) {
         warn!(
             "scanout: a second Intel framebuffer surface replaced the first; the registered \

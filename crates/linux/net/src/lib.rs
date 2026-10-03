@@ -11,12 +11,12 @@ mod msg;
 pub use msg::{
     BatchDeadline, MSG_BATCH, MSG_CMSG_CLOEXEC, MSG_CMSG_COMPAT, MSG_CONFIRM, MSG_CTRUNC,
     MSG_DONTROUTE, MSG_DONTWAIT, MSG_EOR, MSG_ERRQUEUE, MSG_FASTOPEN, MSG_INTERNAL_SENDMSG_FLAGS,
-    MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_PROBE, MSG_SPLICE_PAGES, MSG_TRUNC,
-    MSG_WAITALL, MSG_WAITFORONE, MSG_ZEROCOPY, MessageDirection, MsgOobTransport,
-    NO_URGENT_DATA_ERRNO, NSEC_PER_SEC, OOB_NOT_SUPPORTED_ERRNO, ReceiveStep, Timespec64,
-    absolute_deadline, batch_deadline, compat_flag_errno, msg_oob_errno,
-    packet_recvmsg_flag_errno, receive_wait_target, remaining_timeout, sock_rcvlowat,
-    strip_internal_sendmsg_flags, waitall_continues,
+    MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_PROBE, MSG_SPLICE_PAGES, MSG_TRUNC, MSG_WAITALL,
+    MSG_WAITFORONE, MSG_ZEROCOPY, MessageDirection, MsgOobTransport, NO_URGENT_DATA_ERRNO,
+    NSEC_PER_SEC, OOB_NOT_SUPPORTED_ERRNO, ReceiveStep, Timespec64, absolute_deadline,
+    batch_deadline, compat_flag_errno, msg_oob_errno, packet_recvmsg_flag_errno,
+    receive_wait_target, remaining_timeout, sock_rcvlowat, strip_internal_sendmsg_flags,
+    waitall_continues,
 };
 
 pub const AF_UNSPEC: u16 = 0;
@@ -103,6 +103,10 @@ pub enum IfreqRequest {
     GetFlags,
     /// Return interface MTU.
     GetMtu,
+    /// Return the link-layer type and address.
+    GetHardwareAddress,
+    /// Return the configured software TX queue length.
+    GetTxQueueLength,
     /// Set interface flags.
     SetFlags,
     /// Set interface MTU.
@@ -119,7 +123,9 @@ impl IfreqRequest {
             0x8914 => Some(Self::SetFlags),
             0x8921 => Some(Self::GetMtu),
             0x8922 => Some(Self::SetMtu),
+            0x8927 => Some(Self::GetHardwareAddress),
             0x8933 => Some(Self::GetIndex),
+            0x8942 => Some(Self::GetTxQueueLength),
             _ => None,
         }
     }
@@ -170,6 +176,13 @@ impl IfreqWire {
                 self.0[IFREQ_UNION_OFFSET..IFREQ_UNION_OFFSET + 4]
                     .copy_from_slice(&value.to_ne_bytes());
             }
+            IfreqOutput::HardwareAddress { kind, address } => {
+                // Linux net/core/dev.c:10014-10035 replaces family and the
+                // device's address bytes, not the unused sockaddr/union tail.
+                self.0[IFREQ_UNION_OFFSET..IFREQ_UNION_OFFSET + 2]
+                    .copy_from_slice(&kind.to_ne_bytes());
+                self.0[IFREQ_UNION_OFFSET + 2..IFREQ_UNION_OFFSET + 8].copy_from_slice(&address);
+            }
             IfreqOutput::Flags(value) => {
                 self.0[IFREQ_UNION_OFFSET..IFREQ_UNION_OFFSET + 2]
                     .copy_from_slice(&value.to_ne_bytes());
@@ -184,6 +197,8 @@ impl IfreqWire {
 pub enum IfreqOutput {
     /// Integer union member.
     Integer(i32),
+    /// Ethernet-width address and ARPHRD family in sockaddr.
+    HardwareAddress { kind: u16, address: [u8; 6] },
     /// Short flags union member.
     Flags(i16),
     /// MTU union member.
@@ -721,7 +736,10 @@ pub const fn netlink_protocol_flags(protocol: u32) -> u32 {
         // rtnetlink_net_init, genl_net_init, diag_net_init, audit_net_init and
         // uevent_net_init all register `.flags = NL_CFG_F_NONROOT_RECV`;
         // nfnetlink_net_init registers no flags at all.
-        NETLINK_ROUTE | NETLINK_GENERIC | NETLINK_SOCK_DIAG | NETLINK_AUDIT
+        NETLINK_ROUTE
+        | NETLINK_GENERIC
+        | NETLINK_SOCK_DIAG
+        | NETLINK_AUDIT
         | NETLINK_KOBJECT_UEVENT => NL_CFG_F_NONROOT_RECV,
         // netlink_add_usersock_entry: `.flags = NL_CFG_F_NONROOT_SEND`.
         NETLINK_USERSOCK => NL_CFG_F_NONROOT_SEND,
@@ -1622,6 +1640,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hardware_address_query_preserves_unused_ifreq_bytes() {
+        assert_eq!(
+            IfreqRequest::decode(0x8927),
+            Some(IfreqRequest::GetHardwareAddress)
+        );
+        assert_eq!(
+            IfreqRequest::decode(0x8942),
+            Some(IfreqRequest::GetTxQueueLength)
+        );
+        let bytes = IfreqWire::decode(&[0xa5; IFREQ_SIZE])
+            .unwrap()
+            .with_output(IfreqOutput::HardwareAddress {
+                kind: 1,
+                address: [2, 3, 4, 5, 6, 7],
+            })
+            .bytes();
+        assert_eq!(&bytes[..16], &[0xa5; 16]);
+        assert_eq!(&bytes[16..18], &1u16.to_ne_bytes());
+        assert_eq!(&bytes[18..24], &[2, 3, 4, 5, 6, 7]);
+        assert_eq!(&bytes[24..], &[0xa5; 16]);
+    }
+
+    #[test]
     fn bound_device_rules_mirror_sock_setbindtodevice() {
         // `if (optlen > IFNAMSIZ - 1) optlen = IFNAMSIZ - 1;`
         assert_eq!(bound_device_name_length(0), 0);
@@ -1850,11 +1891,7 @@ mod tests {
             NL_CFG_F_NONROOT_SEND,
             false
         ));
-        assert!(netlink_allowed(
-            NETLINK_ROUTE,
-            NL_CFG_F_NONROOT_SEND,
-            true
-        ));
+        assert!(netlink_allowed(NETLINK_ROUTE, NL_CFG_F_NONROOT_SEND, true));
         // `uevent_net_init` sets `.flags = NL_CFG_F_NONROOT_RECV` (its
         // `.groups = 1` still becomes 32, because `__netlink_kernel_create`
         // raises every request below 32), so an unprivileged process may
@@ -2127,7 +2164,10 @@ mod tests {
         // (`net/netlink/af_netlink.c:1869`), so the minimum send buffer admits
         // 4576 bytes and refuses 4577.
         assert_eq!(
-            admit_netlink_write(SOCK_MIN_SNDBUF as usize - NETLINK_SEND_BUFFER_OVERHEAD, SOCK_MIN_SNDBUF),
+            admit_netlink_write(
+                SOCK_MIN_SNDBUF as usize - NETLINK_SEND_BUFFER_OVERHEAD,
+                SOCK_MIN_SNDBUF
+            ),
             NetlinkWriteAdmission::Admit
         );
         assert_eq!(

@@ -14,13 +14,9 @@
 //! [`ConfigSpace`] simply has no write method.  A driver that owns the device
 //! can add one later as a deliberate, named act.
 //!
-//! Configuration space itself is reached through the platform's ECAM aperture,
-//! the mechanism `axdriver`'s bus probe and the platform's uncore performance
-//! monitor already use: the platform maps `axconfig::devices::PCI_ECAM_BASE`
-//! as device memory while building the kernel address space, and a function's
-//! header is a calculated offset into that window.  This module deliberately
-//! computes that offset the same way rather than inventing a second route to
-//! configuration space.
+//! Configuration space uses the same runtime MCFG decision as the generic PCI
+//! bus. Its discovered span is mapped as device memory; the configured MMIO
+//! list is not an allowlist for firmware-discovered addresses.
 
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
@@ -650,77 +646,64 @@ impl BusScan {
     }
 }
 
-/// Configuration space reached through the platform's ECAM aperture.
-///
-/// The platform maps every range it lists in `mmio-ranges` as device memory
-/// while building the kernel address space, so the aperture is reached through
-/// the direct map at its physical address -- the same route `axdriver`'s bus
-/// probe takes.  The range check before each access is not redundant with
-/// that: it is what keeps a mistyped bus number from reading address space the
-/// platform never declared.
+/// A read-only view of the runtime segment-zero ECAM mapping.
 #[cfg(target_os = "none")]
 pub(crate) struct Ecam {
-    base: usize,
+    physical: usize,
+    mapped: usize,
     bus_end: u8,
 }
 
 #[cfg(target_os = "none")]
 impl Ecam {
-    /// The platform's ECAM window, or `None` when the configuration does not
-    /// describe one.
     pub(crate) fn platform() -> Option<Self> {
-        let base = axconfig::devices::PCI_ECAM_BASE;
-        let bus_end = u8::try_from(axconfig::devices::PCI_BUS_END).ok()?;
-        if base == 0 {
+        let physical = axhal::pci::ecam_base();
+        let (bus_begin, bus_end) = axhal::pci::ecam_bus_range();
+        let size = ecam_span(physical, bus_begin, bus_end)?;
+        if axhal::pci::ecam_segment() != 0 {
             return None;
         }
-        Some(Self { base, bus_end })
+        match axmm::iomap(axhal::mem::PhysAddr::from_usize(physical), size) {
+            Ok(mapped) => Some(Self {
+                physical,
+                mapped: mapped.as_usize(),
+                bus_end,
+            }),
+            Err(error) => {
+                axlog::warn!(
+                    "intel-gpu: ECAM mapping failed at {physical:#x}: {error:?}; firmware console \
+                     retained"
+                );
+                None
+            }
+        }
     }
 
-    /// The physical base of the aperture, for a log line.
     pub(crate) const fn base(&self) -> u64 {
-        self.base as u64
+        self.physical as u64
     }
-
-    /// The highest bus the platform declares.
     pub(crate) const fn bus_end(&self) -> u8 {
         self.bus_end
     }
 }
 
-/// Whether `address .. address + width` lies inside a range the platform
-/// declared as device memory.
-#[cfg(target_os = "none")]
-fn declared_mmio(address: usize, width: usize) -> bool {
-    let Some(end) = address.checked_add(width) else {
-        return false;
-    };
-    axhal::mem::mmio_ranges().iter().any(|&(start, size)| {
-        start
-            .checked_add(size)
-            .is_some_and(|range_end| address >= start && end <= range_end)
-    })
+/// Only segment-zero windows beginning at bus zero are currently supported.
+fn ecam_span(base: usize, bus_begin: u8, bus_end: u8) -> Option<usize> {
+    if base == 0 || base & 0xfffff != 0 || bus_begin != 0 {
+        return None;
+    }
+    let size = (usize::from(bus_end) + 1) << 20;
+    base.checked_add(size)?;
+    Some(size)
 }
 
 #[cfg(target_os = "none")]
 impl ConfigSpace for Ecam {
     fn read_u32(&self, bdf: Bdf, offset: u16) -> Option<u32> {
-        let address = config_address(self.base, self.bus_end, bdf, offset, 4)?;
-        if !declared_mmio(address, 4) {
-            return None;
-        }
-        // SAFETY: `address` was just checked to lie inside a range the
-        // platform declared as device memory, and the platform maps every such
-        // range into the kernel address space before any driver runs.  A
-        // configuration-space read has no side effects and needs no device
-        // state, which is why it is the one access this probe makes before it
-        // knows what it is talking to.
-        let pointer = axhal::mem::phys_to_virt(axhal::mem::PhysAddr::from_usize(address))
-            .as_ptr()
-            .cast::<u32>();
-        // SAFETY: `pointer` is the configuration-space address checked against declared device
-        // memory above.
-        Some(unsafe { core::ptr::read_volatile(pointer) })
+        let address = config_address(self.mapped, self.bus_end, bdf, offset, 4)?;
+        // SAFETY: platform() mapped this exact runtime window; config_address
+        // admits only aligned dwords inside its buses and function windows.
+        Some(unsafe { core::ptr::read_volatile(address as *const u32) })
     }
 }
 
@@ -730,6 +713,16 @@ mod tests {
 
     use super::*;
     use crate::drm::intel::testbus::{FakeBus, Header};
+
+    #[test]
+    fn runtime_ecam_does_not_require_the_old_configured_mmio_range() {
+        assert_eq!(ecam_span(0xc000_0000, 0, 255), Some(256 << 20));
+        assert_eq!(ecam_span(0xc000_0000, 0, 63), Some(64 << 20));
+        assert_eq!(ecam_span(0, 0, 255), None);
+        assert_eq!(ecam_span(0xc000_0001, 0, 255), None);
+        assert_eq!(ecam_span(0xc000_0000, 1, 255), None);
+        assert_eq!(ecam_span(usize::MAX & !0xfffff, 0, 255), None);
+    }
 
     #[test]
     fn config_address_places_a_function_in_its_ecam_window() {

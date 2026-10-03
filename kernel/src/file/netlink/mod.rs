@@ -96,9 +96,13 @@ const VETH_INFO_PEER: u16 = 1;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
+const IFA_BROADCAST: u16 = 4;
+const IFA_CACHEINFO: u16 = 6;
+const IFA_FLAGS: u16 = 8;
 const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
 const RTA_GATEWAY: u16 = 5;
+const RTA_PREFSRC: u16 = 7;
 const IFF_UP: u32 = 0x1;
 const IFF_BROADCAST: u32 = 0x2;
 const IFF_LOOPBACK: u32 = 0x8;
@@ -203,7 +207,7 @@ pub(crate) struct SockaddrNl {
 impl SockaddrNl {
     /// The exact bytes `netlink_getname()` leaves in the kernel's
     /// `sockaddr_storage`, ready for `move_addr_to_user()` to copy out.
-pub(crate) fn into_bytes(self) -> [u8; size_of::<Self>()] {
+    pub(crate) fn into_bytes(self) -> [u8; size_of::<Self>()] {
         bytemuck::cast(self)
     }
 }
@@ -422,10 +426,10 @@ impl Default for NetlinkSockOptions {
 /// membership and `NETLINK_LISTEN_ALL_NSID` gates.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct NetlinkOptionAuthority {
-pub(crate)     init_net_admin: bool,
-pub(crate)     net_admin: bool,
-pub(crate)     net_raw: bool,
-pub(crate)     net_broadcast: bool,
+    pub(crate) init_net_admin: bool,
+    pub(crate) net_admin: bool,
+    pub(crate) net_raw: bool,
+    pub(crate) net_broadcast: bool,
 }
 
 impl NetlinkOptionAuthority {
@@ -648,13 +652,13 @@ impl<'a> NetlinkWritePermit<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct NetlinkReceived {
-pub(crate)     len: usize,
-pub(crate)     source_port_id: u32,
-pub(crate)     source_groups: u32,
-pub(crate)     credentials: Option<NetlinkCredentials>,
+    pub(crate) len: usize,
+    pub(crate) source_port_id: u32,
+    pub(crate) source_groups: u32,
+    pub(crate) credentials: Option<NetlinkCredentials>,
     /// `netlink_recvmsg` raises `MSG_TRUNC` when the datagram did not fit the
     /// destination (`net/netlink/af_netlink.c:1945-1948`).
-pub(crate)     truncated: bool,
+    pub(crate) truncated: bool,
 }
 
 /// Sender identity captured when a kobject uevent is queued.  This is kept
@@ -663,9 +667,9 @@ pub(crate)     truncated: bool,
 /// Linux kernel identity (pid 0, root).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NetlinkCredentials {
-pub(crate)     pid: u32,
-pub(crate)     uid: u32,
-pub(crate)     gid: u32,
+    pub(crate) pid: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 const KERNEL_UEVENT_CREDENTIALS: NetlinkCredentials = NetlinkCredentials {
@@ -718,7 +722,7 @@ impl NetlinkSocket {
     /// capability granted by a nested user namespace must never authorize
     /// creating an audit endpoint, even if it was obtained through an fd
     /// transferred from another task.
-pub(crate) fn audit_socket_creation_authorized(actor: &Cred) -> bool {
+    pub(crate) fn audit_socket_creation_authorized(actor: &Cred) -> bool {
         actor.user_ns().is_initial() && actor.has_effective_capability(CAP_AUDIT_READ)
     }
 
@@ -729,7 +733,7 @@ pub(crate) fn audit_socket_creation_authorized(actor: &Cred) -> bool {
             && is_initial_network_namespace(&self.net_ns)
     }
     /// The `sk_bound_dev_if` this endpoint currently carries.
-pub(crate) fn bound_device_index(&self) -> i32 {
+    pub(crate) fn bound_device_index(&self) -> i32 {
         self.bound_dev_if.load(Ordering::Acquire)
     }
 
@@ -738,13 +742,13 @@ pub(crate) fn bound_device_index(&self) -> i32 {
     /// compare-exchange emulates the socket lock: the caller validates
     /// against `expected` and must retry when the current index moved
     /// meanwhile, so a concurrent rebind cannot skip the capability check.
-pub(crate) fn compare_exchange_bound_device_index(&self, expected: i32, index: i32) -> bool {
+    pub(crate) fn compare_exchange_bound_device_index(&self, expected: i32, index: i32) -> bool {
         self.bound_dev_if
             .compare_exchange(expected, index, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
-pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
+    pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
         &self.net_ns
     }
 
@@ -769,7 +773,7 @@ pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
         Ok(())
     }
 
-pub(crate) fn try_new(
+    pub(crate) fn try_new(
         protocol: u32,
         socket_type: u32,
         net_ns: Arc<NetworkNamespace>,
@@ -1279,11 +1283,11 @@ pub(crate) fn try_new(
     /// NETLINK sockets expose SO_PASSCRED per open file description.  Sender
     /// credentials are retained in queued uevents, so this receive-side flag
     /// may be changed after enqueue without losing the original identity.
-pub(crate) fn set_passcred(&self, enabled: bool) {
+    pub(crate) fn set_passcred(&self, enabled: bool) {
         self.state.lock().passcred = enabled;
     }
 
-pub(crate) fn passcred(&self) -> bool {
+    pub(crate) fn passcred(&self) -> bool {
         self.state.lock().passcred
     }
 
@@ -1522,7 +1526,7 @@ pub(crate) fn passcred(&self) -> bool {
             .map(|received| received.len)
     }
 
-pub(crate) fn recv_with_nonblocking(
+    pub(crate) fn recv_with_nonblocking(
         &self,
         dst: &mut IoDst,
         flags: RecvFlags,
@@ -1531,7 +1535,7 @@ pub(crate) fn recv_with_nonblocking(
         self.recv_with_operation_nonblocking(dst, flags, nonblocking, false)
     }
 
-pub(crate) fn recv_with_operation_nonblocking(
+    pub(crate) fn recv_with_operation_nonblocking(
         &self,
         dst: &mut IoDst,
         flags: RecvFlags,
@@ -1585,7 +1589,7 @@ pub(crate) fn recv_with_operation_nonblocking(
     /// `SO_RCVTIMEO`/`SO_SNDTIMEO` in both spellings.  `sock_set_timeout()`
     /// validates the microseconds field, treats a negative second as the zero
     /// timeout, and stores jiffies (`net/core/sock.c:426-457`).
-pub(crate) fn set_socket_timeout(
+    pub(crate) fn set_socket_timeout(
         &self,
         optname: i32,
         seconds: i64,
@@ -1771,7 +1775,7 @@ pub(crate) fn set_socket_timeout(
     /// Linux's uevent_net_rcv_skb equivalent.  The netlink framing is only a
     /// userspace submission envelope: listeners receive its payload plus the
     /// kernel-assigned SEQNUM field, as a group-1 kernel multicast datagram.
-pub(crate) fn send_uevent_from_user(
+    pub(crate) fn send_uevent_from_user(
         &self,
         data: &[u8],
         actor: &Cred,
@@ -1805,7 +1809,7 @@ pub(crate) fn send_uevent_from_user(
         )
     }
 
-pub(crate) fn write_with_actor(
+    pub(crate) fn write_with_actor(
         &self,
         src: &mut IoSrc,
         actor: &Cred,
@@ -1818,7 +1822,7 @@ pub(crate) fn write_with_actor(
     /// unicast peer in this socket's network namespace and protocol family;
     /// `NETLINK_USERSOCK` additionally accepts a group destination, while the
     /// privileged synthetic uevent path keeps its single protocol group.
-pub(crate) fn write_to_with_actor(
+    pub(crate) fn write_to_with_actor(
         &self,
         src: &mut IoSrc,
         actor: &Cred,
@@ -2121,7 +2125,7 @@ pub(crate) fn write_to_with_actor(
     /// Netlink writes have no readiness wait. Retain the operation-local
     /// nonblocking argument so RWF_NOWAIT is explicit and does not mutate the
     /// shared OFD status.
-pub(crate) fn write_with_nonblocking(
+    pub(crate) fn write_with_nonblocking(
         &self,
         src: &mut IoSrc,
         nonblocking: bool,
@@ -2129,7 +2133,7 @@ pub(crate) fn write_with_nonblocking(
         self.write_with_operation_nonblocking(src, nonblocking, false)
     }
 
-pub(crate) fn write_with_operation_nonblocking(
+    pub(crate) fn write_with_operation_nonblocking(
         &self,
         src: &mut IoSrc,
         _nonblocking: bool,
@@ -3154,6 +3158,16 @@ pub(crate) fn write_with_operation_nonblocking(
                         return Err(AxError::InvalidInput);
                     }
                 }
+                IFA_LABEL if value.last() == Some(&0) && value.len() <= 16 => {}
+                IFA_BROADCAST if message.ifa_family as u32 == AF_INET && value.len() == 4 => {}
+                IFA_FLAGS
+                    if value.len() == 4
+                        && u32::from_ne_bytes(value.try_into().unwrap())
+                            & !u32::from(IFA_F_PERMANENT)
+                            == 0 => {}
+                // Infinite lifetimes are echoed by ip addr flush/add; finite
+                // lifetime management remains deliberately unsupported.
+                IFA_CACHEINFO if value.len() == 16 && value[..8] == [0xff; 8] => {}
                 _ => return Err(AxError::OperationNotSupported),
             }
             offset = offset
@@ -3184,8 +3198,10 @@ pub(crate) fn write_with_operation_nonblocking(
         if !matches!(message.rtm_family as u32, family if family == AF_INET as u32 || family == AF_INET6 as u32)
             || message.rtm_src_len != 0
             || message.rtm_tos != 0
-            || message.rtm_scope != 0
-            || message.rtm_protocol != 0
+            || !matches!(message.rtm_scope, RT_SCOPE_UNIVERSE | RT_SCOPE_LINK)
+            // iproute2/BusyBox label ordinary routes boot/static. These
+            // origins carry no policy; multipath/metrics remain unsupported.
+            || !matches!(message.rtm_protocol, 0 | 3 | 4)
             || message.rtm_flags != 0
         {
             return Err(AxError::InvalidInput);
@@ -3206,6 +3222,7 @@ pub(crate) fn write_with_operation_nonblocking(
         let mut destination = None;
         let mut gateway = None;
         let mut output_ifindex = None;
+        let mut preferred_source = None;
         let mut offset = size_of::<RtMsg>();
         while offset < payload.len() {
             if payload.len() - offset < size_of::<RtAttr>() {
@@ -3228,6 +3245,14 @@ pub(crate) fn write_with_operation_nonblocking(
                 }
                 RTA_GATEWAY => {
                     if gateway
+                        .replace(decode_ip(message.rtm_family, value)?)
+                        .is_some()
+                    {
+                        return Err(AxError::InvalidInput);
+                    }
+                }
+                RTA_PREFSRC => {
+                    if preferred_source
                         .replace(decode_ip(message.rtm_family, value)?)
                         .is_some()
                     {
@@ -3264,11 +3289,17 @@ pub(crate) fn write_with_operation_nonblocking(
             .into_iter()
             .find(|interface| interface.index == ifindex)
             .ok_or(AxError::NoSuchDevice)?;
+        if message.rtm_scope == RT_SCOPE_LINK && gateway.is_some() {
+            return Err(AxError::InvalidInput);
+        }
         let source = interface
             .addresses
             .iter()
             .map(|cidr| cidr.address())
-            .find(|address| same_ip_family(*address, destination))
+            .find(|address| {
+                same_ip_family(*address, destination)
+                    && preferred_source.is_none_or(|preferred| preferred == *address)
+            })
             .ok_or(AxError::NoSuchDevice)?;
         Ok(Rule::new(
             IpCidr::new(destination, message.rtm_dst_len),
@@ -3920,6 +3951,29 @@ mod tests {
             configured[0].addresses[0],
             IpCidr::new(Ipv4Address::new(127, 0, 0, 1).into(), 8)
         );
+        assert_eq!(namespace.stack().routes().len(), 1);
+        // A DHCP lease hook uses ordinary boot-origin, link-scope routes
+        // with an explicit source. Never accept a source not owned by OIF.
+        let mut route = payload_with(&RtMsg {
+            rtm_family: AF_INET as u8,
+            rtm_dst_len: 8,
+            rtm_src_len: 0,
+            rtm_tos: 0,
+            rtm_table: RT_TABLE_MAIN,
+            rtm_protocol: 3,
+            rtm_scope: RT_SCOPE_LINK,
+            rtm_type: RTN_UNICAST,
+            rtm_flags: 0,
+        });
+        push_attr(&mut route, RTA_DST, &[127, 0, 0, 1]);
+        push_attr(&mut route, RTA_OIF, &index.to_ne_bytes());
+        push_attr(&mut route, RTA_PREFSRC, &[127, 0, 0, 2]);
+        assert_eq!(
+            send(RTM_NEWROUTE, NLM_F_REPLACE, route.clone()),
+            -(LinuxError::ENODEV as i32)
+        );
+        *route.last_mut().unwrap() = 1;
+        assert_eq!(send(RTM_NEWROUTE, NLM_F_REPLACE, route), 0);
         assert_eq!(namespace.stack().routes().len(), 1);
         let permit = namespace.stack().acquire_packet_service();
         assert_eq!(permit.interfaces().unwrap(), configured);

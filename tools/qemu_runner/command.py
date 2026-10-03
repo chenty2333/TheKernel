@@ -201,6 +201,7 @@ def build_qemu_command(
             command.extend([
                 "-device", "usb-kbd,id=input-kbd,bus=xhci.0",
                 "-device", "usb-mouse,id=input-mouse,bus=xhci.0",
+                "-device", "usb-tablet,id=input-tablet,bus=xhci.0",
             ])
         if usb_disk is not None:
             command.extend([

@@ -224,6 +224,16 @@ pub trait Device: Send + Sync {
         None
     }
 
+    /// Optional bounded receive polling when the NIC supplies no IRQ owner.
+    /// Zero or sub-millisecond intervals are not an admitted fallback.
+    fn rx_poll_interval_micros(&self) -> Option<u64> {
+        None
+    }
+
+    /// Keep a link-layer ARP source synchronized with the namespace's primary
+    /// IPv4 address. IP-only transports have no address-dependent link state.
+    fn set_primary_ipv4(&mut self, _address: smoltcp::wire::Ipv4Cidr) {}
+
     fn addresses(&self) -> Vec<IpCidr> {
         Vec::new()
     }

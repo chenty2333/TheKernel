@@ -41,9 +41,7 @@ default_device() {
 	# enumeration cannot silently select /dev/video0.
 	for candidate in \
 		/dev/v4l/by-id/*eEver*video-index0 \
-		/dev/v4l/by-id/*HDMI*video-index0 \
-		/dev/video4 \
-		/dev/video0; do
+		/dev/v4l/by-id/*HDMI*video-index0; do
 		[ -e "$candidate" ] || continue
 		printf '%s' "$candidate"
 		return 0
@@ -77,7 +75,7 @@ shift
 
 case "$command" in
 capture)
-	device=$(default_device) || device=/dev/video0
+	device=$(default_device) || device=""
 	out=""
 	seconds=0
 	while [ $# -gt 0 ]; do
@@ -99,7 +97,7 @@ capture)
 	done
 	[ -n "$out" ] || die "--out is required"
 	command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required to read the capture dongle"
-	[ -e "$device" ] || die "no capture device at $device (is the HDMI dongle plugged in?)"
+	[ -e "$device" ] || die "no capture device at $device (attach the HDMI dongle or pass its explicit --device path; no webcam is selected automatically)"
 	mkdir -p "$out"
 	# One frame per second is enough to cover a boot and cheap to check, and
 	# -start_number 0 is what makes the frame indices start where the gate
@@ -117,7 +115,7 @@ capture)
 	exec ffmpeg -hide_banner -loglevel warning -y "$@"
 	;;
 preview)
-	device=$(default_device) || device=/dev/video0
+	device=$(default_device) || device=""
 	snapshot=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -133,7 +131,7 @@ preview)
 		esac
 	done
 	command -v ffplay >/dev/null 2>&1 || die "ffplay is required for the live preview"
-	[ -e "$device" ] || die "no capture device at $device (is the HDMI dongle plugged in?)"
+	[ -e "$device" ] || die "no capture device at $device (attach the HDMI dongle or pass its explicit --device path; no webcam is selected automatically)"
 	input_args=(-f v4l2)
 	while IFS= read -r arg; do
 		input_args+=("$arg")

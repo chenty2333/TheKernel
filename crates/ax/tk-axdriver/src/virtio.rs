@@ -112,7 +112,7 @@ pub trait VirtIoDevMeta {
 }
 
 cfg_if! {
-    if #[cfg(net_dev = "virtio-net")] {
+    if #[cfg(any(net_dev = "virtio-net", net_dev = "n305-net"))] {
         pub struct VirtIoNet;
 
         impl VirtIoDevMeta for VirtIoNet {

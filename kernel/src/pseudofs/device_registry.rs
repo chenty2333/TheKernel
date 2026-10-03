@@ -275,12 +275,9 @@ impl DeviceRegistration {
             _ => return Err(VfsError::InvalidInput),
         }
         if attributes.len() > MAX_DEVICE_ATTRIBUTES
-            || attributes.iter().any(|attr| {
-                matches!(
-                    attr.name.as_str(),
-                    "dev" | "uevent" | "subsystem"
-                )
-            })
+            || attributes
+                .iter()
+                .any(|attr| matches!(attr.name.as_str(), "dev" | "uevent" | "subsystem"))
             || (device_link && attributes.iter().any(|attr| attr.name == "device"))
         {
             return Err(VfsError::InvalidInput);
@@ -519,6 +516,14 @@ impl DeviceRegistration {
         );
         if self.subsystem_kind == SysfsSubsystemKind::Bus && self.subsystem == "pci" {
             payload.push_str(&alloc::format!("PCI_SLOT_NAME={}\n", self.identity.name));
+        }
+        if self.subsystem_kind == SysfsSubsystemKind::Bus && self.subsystem == "platform" {
+            // A non-OF platform device has no PCI IDs. libdrm uses MODALIAS
+            // as its bus name and compatible identity (xf86drm.c's OF fallback).
+            payload.push_str(&alloc::format!(
+                "MODALIAS=platform:{}\n",
+                self.identity.name
+            ));
         }
         if let Some(device_id) = self.identity.device_id {
             payload = alloc::format!(
@@ -1003,7 +1008,10 @@ impl SimpleDirOps for RegistryDir {
                         && device.subsystem.as_bytes() == name.as_bytes()
                 })
                 .pop()
-                .map(|device| self.maker(RegistryDirKind::Bus(device.subsystem.clone())).into())
+                .map(|device| {
+                    self.maker(RegistryDirKind::Bus(device.subsystem.clone()))
+                        .into()
+                })
                 .ok_or(VfsError::NotFound),
             RegistryDirKind::Bus(_) if name.as_bytes() == b"devices" => Ok(self
                 .maker(RegistryDirKind::BusDevices(match &self.kind {
@@ -1014,14 +1022,17 @@ impl SimpleDirOps for RegistryDir {
             RegistryDirKind::BusDevices(bus) => {
                 let device = global_device_registry()
                     .visible_matching(|device| {
-                        device.subsystem == *bus && device.identity.name.as_bytes() == name.as_bytes()
+                        device.subsystem == *bus
+                            && device.identity.name.as_bytes() == name.as_bytes()
                     })
                     .pop()
                     .ok_or(VfsError::NotFound)?;
-                Ok(SimpleFile::new(self.fs.clone(), axfs_ng_vfs::NodeType::Symlink, move || {
-                    Ok(alloc::format!("../../..{}", device.canonical_path()).into_bytes())
-                })
-                .into())
+                Ok(
+                    SimpleFile::new(self.fs.clone(), axfs_ng_vfs::NodeType::Symlink, move || {
+                        Ok(alloc::format!("../../..{}", device.canonical_path()).into_bytes())
+                    })
+                    .into(),
+                )
             }
             RegistryDirKind::Bus(_) => Err(VfsError::NotFound),
             RegistryDirKind::DevCharRoot => {
@@ -1157,12 +1168,12 @@ impl RegistryDir {
             // one level below inputN. Top-level DRM/fb devices still point to
             // their bus object.
             let target = device_link_target(&device);
-            return Ok(
-                SimpleFile::new(self.fs.clone(), axfs_ng_vfs::NodeType::Symlink, move || {
-                    Ok(target.clone().into_bytes())
-                })
-                .into(),
-            );
+            return Ok(SimpleFile::new(
+                self.fs.clone(),
+                axfs_ng_vfs::NodeType::Symlink,
+                move || Ok(target.clone().into_bytes()),
+            )
+            .into());
         }
         let attribute = device
             .attributes
@@ -1271,8 +1282,9 @@ impl SimpleFileOps for DeviceAttributeFile {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloc::{format, vec};
+
+    use super::*;
 
     fn resolve_from(link: &str, target: &str) -> String {
         let mut components = Vec::new();
@@ -1583,22 +1595,24 @@ mod tests {
     #[test]
     fn bus_devices_have_bus_subsystems_without_class_membership() {
         let pci = DeviceRegistration::try_bus_device(
-            DeviceIdentity::without_dev(
-                "pci0000:00".into(),
-                "pci".into(),
-                "0000:00:03.0".into(),
-            )
-            .unwrap(),
+            DeviceIdentity::without_dev("pci0000:00".into(), "pci".into(), "0000:00:03.0".into())
+                .unwrap(),
             "pci_device".into(),
-            vec![DeviceAttribute::try_new("device".into(), || Ok(String::from("0x1052\n"))).unwrap()],
+            vec![
+                DeviceAttribute::try_new("device".into(), || Ok(String::from("0x1052\n"))).unwrap(),
+            ],
             "pci".into(),
             false,
         )
         .unwrap();
-        assert!(pci
-            .uevent_payload()
-            .contains("DEVPATH=/devices/pci0000:00/0000:00:03.0\nSUBSYSTEM=pci\n"));
-        assert!(pci.uevent_payload().contains("PCI_SLOT_NAME=0000:00:03.0\n"));
+        assert!(
+            pci.uevent_payload()
+                .contains("DEVPATH=/devices/pci0000:00/0000:00:03.0\nSUBSYSTEM=pci\n")
+        );
+        assert!(
+            pci.uevent_payload()
+                .contains("PCI_SLOT_NAME=0000:00:03.0\n")
+        );
         assert!(!pci.class_member);
         assert_eq!(
             resolve_from(
@@ -1612,16 +1626,39 @@ mod tests {
     #[test]
     fn drm_minor_skips_subsystem_directory_to_find_its_physical_parent() {
         let minor = DeviceRegistration::try_new(
-            DeviceIdentity::new("virtio0".into(), "drm".into(), "renderD128".into(), DeviceId::new(226, 128))
-                .unwrap().child_of_path("pci0000:00/0000:00:01.0/virtio8".into(), "drm".into()).unwrap(),
-            "drm_minor".into(), Vec::new(), None,
-        ).unwrap();
+            DeviceIdentity::new(
+                "virtio0".into(),
+                "drm".into(),
+                "renderD128".into(),
+                DeviceId::new(226, 128),
+            )
+            .unwrap()
+            .child_of_path("pci0000:00/0000:00:01.0/virtio8".into(), "drm".into())
+            .unwrap(),
+            "drm_minor".into(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
         let canonical = alloc::format!("/sys{}", minor.canonical_path());
-        assert_eq!(canonical, "/sys/devices/pci0000:00/0000:00:01.0/virtio8/drm/renderD128");
-        assert_eq!(resolve_from(&alloc::format!("{canonical}/device"), &device_link_target(&minor)),
-            "/sys/devices/pci0000:00/0000:00:01.0/virtio8");
-        assert_eq!(resolve_from(&alloc::format!("{canonical}/subsystem"), &subsystem_link_target(&minor)),
-            "/sys/class/drm");
+        assert_eq!(
+            canonical,
+            "/sys/devices/pci0000:00/0000:00:01.0/virtio8/drm/renderD128"
+        );
+        assert_eq!(
+            resolve_from(
+                &alloc::format!("{canonical}/device"),
+                &device_link_target(&minor)
+            ),
+            "/sys/devices/pci0000:00/0000:00:01.0/virtio8"
+        );
+        assert_eq!(
+            resolve_from(
+                &alloc::format!("{canonical}/subsystem"),
+                &subsystem_link_target(&minor)
+            ),
+            "/sys/class/drm"
+        );
     }
 
     #[test]

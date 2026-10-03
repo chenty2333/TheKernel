@@ -249,9 +249,8 @@ impl ProbeReport {
         }
         out.push_str(&format!("intel-gpu: verdict: {}\n", self.verdict()));
         out.push_str(
-            "intel-gpu: this proves the device was enumerated and its registers read back; it \
-             does not prove the display engine works, because no mode has been set and no pixel \
-             has been scanned out by this kernel\n",
+            "intel-gpu: this read-only probe does not prove the display engine works: no mode has \
+             been set and no pixel has been scanned out by this kernel\n",
         );
         out
     }
@@ -897,6 +896,7 @@ mod tests {
         assert!(text.contains("device 0x2922"), "{text}");
         assert!(text.contains("device 0x2918"), "{text}");
         assert!(text.contains("not a display controller"), "{text}");
+        assert!(!text.contains("this proves the device"), "{text}");
     }
 
     #[test]

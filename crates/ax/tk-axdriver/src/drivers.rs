@@ -67,6 +67,24 @@ register_vsock_driver!(
     <virtio::VirtIoSocket as VirtIoDevMeta>::Device
 );
 
+#[cfg(net_dev = "n305-net")]
+register_net_driver!(IgcDriver, alloc::boxed::Box<dyn axdriver_net::NetDriverOps>);
+#[cfg(net_dev = "rtl8125")]
+register_net_driver!(Rtl8125Driver, axdriver_net::rtl8125::nic::RtlNic<crate::rtl8125::PlatformHal, crate::rtl8125::Window, 256>);
+#[cfg(any(net_dev = "rtl8125", net_dev = "n305-net"))]
+pub struct Rtl8125Driver;
+#[cfg(any(net_dev = "rtl8125", net_dev = "n305-net"))]
+impl DriverProbe for Rtl8125Driver {
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut PciRoot,
+        bdf: DeviceFunction,
+        info: &DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        crate::rtl8125::probe(root, bdf, info)
+    }
+}
+
 cfg_if::cfg_if! {
     if #[cfg(block_dev = "ramdisk")] {
         pub struct RamDiskDriver;
@@ -84,8 +102,9 @@ cfg_if::cfg_if! {
 }
 
 cfg_if::cfg_if! {
-    if #[cfg(net_dev = "igc")] {
+    if #[cfg(any(net_dev = "igc", net_dev = "n305-net"))] {
         pub struct IgcDriver;
+        #[cfg(net_dev = "igc")]
         register_net_driver!(
             IgcDriver,
             axdriver_net::igc::IgcNic<crate::igc::IgcHalImpl, { crate::igc::QUEUE_SIZE }>

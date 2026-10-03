@@ -60,7 +60,7 @@ macro_rules! for_each_drivers {
             type $drv_type = crate::sound::VirtIoSoundDriver;
             $code
         }
-        #[cfg(net_dev = "virtio-net")]
+        #[cfg(any(net_dev = "virtio-net", net_dev = "n305-net"))]
         {
             type $drv_type = <virtio::VirtIoNet as VirtIoDevMeta>::Driver;
             $code
@@ -90,9 +90,14 @@ macro_rules! for_each_drivers {
             type $drv_type = crate::drivers::RamDiskDriver;
             $code
         }
-        #[cfg(net_dev = "igc")]
+        #[cfg(any(net_dev = "igc", net_dev = "n305-net"))]
         {
             type $drv_type = crate::drivers::IgcDriver;
+            $code
+        }
+        #[cfg(any(net_dev = "rtl8125", net_dev = "n305-net"))]
+        {
+            type $drv_type = crate::drivers::Rtl8125Driver;
             $code
         }
         #[cfg(net_dev = "ixgbe")]

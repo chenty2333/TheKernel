@@ -652,10 +652,7 @@ fn collect_apic_ids<const N: usize>(madt: &[u8], out: &mut [u32; N]) -> usize {
             // Processor Local APIC: ACPI processor ID, APIC ID, flags.
             0 if entry.len() >= 8 => (entry[3] as u32, read_u32(entry, 4)),
             // Processor Local x2APIC: reserved, x2APIC ID, flags, UID.
-            9 if entry.len() >= 16 => (
-                read_u32(entry, 4).unwrap_or(0),
-                read_u32(entry, 8),
-            ),
+            9 if entry.len() >= 16 => (read_u32(entry, 4).unwrap_or(0), read_u32(entry, 8)),
             _ => return,
         };
         if let Some(flags) = flags
@@ -731,13 +728,14 @@ fn io_apic_record(entry: &[u8]) -> Option<(u32, u32)> {
     Some((read_u32(entry, 4)?, read_u32(entry, 8)?))
 }
 
-/// Decodes a MADT "Interrupt Source Override" record (type 2), 16 bytes long.
+/// Decodes a MADT "Interrupt Source Override" record (type 2), 10 bytes long.
+/// Layout: Linux include/acpi/actbl2.h:1336-1342.
 fn source_override_record(entry: &[u8]) -> Option<SourceOverride> {
     Some(SourceOverride {
-        bus: read_u32(entry, 2)?,
-        source: read_u16(entry, 6)?,
-        flags: read_u32(entry, 8)?,
-        gsi: read_u32(entry, 12)?,
+        bus: u32::from(*entry.get(2)?),
+        source: u16::from(*entry.get(3)?),
+        flags: u32::from(read_u16(entry, 8)?),
+        gsi: read_u32(entry, 4)?,
     })
 }
 
@@ -1001,10 +999,9 @@ mod tests {
     #[test]
     fn a_source_override_keeps_the_firmware_routing_and_flags() {
         // ACPI's "Interrupt Source Override": bus, legacy IRQ, flags, GSI.
-        let mut entry = [2u8, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        entry[6..8].copy_from_slice(&0u16.to_le_bytes());
-        entry[8..12].copy_from_slice(&3u32.to_le_bytes());
-        entry[12..16].copy_from_slice(&2u32.to_le_bytes());
+        let mut entry = [2u8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
+        entry[4..8].copy_from_slice(&2u32.to_le_bytes());
+        entry[8..10].copy_from_slice(&3u16.to_le_bytes());
 
         let facts = scan_apic_facts(&madt_image(0xfee0_0000, &[&entry]));
         assert_eq!(
@@ -1018,12 +1015,12 @@ mod tests {
         );
         assert_eq!(facts.override_total, 1);
 
-        // A record that declares fewer than the 16 bytes its own format needs
+        // A record that declares fewer than the 10 bytes its own format needs
         // is counted but names no GSI.  (A record whose *claimed* length runs
         // past the table ends the walk instead; see
         // `a_record_that_outruns_the_table_ends_the_walk`.)
-        let mut short = entry[..12].to_vec();
-        short[1] = 12;
+        let mut short = entry[..9].to_vec();
+        short[1] = 9;
         let truncated = scan_apic_facts(&madt_image(0, &[short.as_slice()]));
         assert!(truncated.overrides().is_empty());
         assert_eq!(truncated.override_total, 1);

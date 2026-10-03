@@ -170,6 +170,8 @@ io-notify-fastpath = ["tk-kernel/io-notify-fastpath"]
 # product kernel so a boot on a machine that has no such part produces the
 # "no supported device present" verdict.  There is no QEMU model for this
 # device, so that verdict is the only end-to-end run the driver has.
+net-n305 = ["tk-kernel/net-n305"]
+net-rtl8125 = ["tk-kernel/net-rtl8125"]
 net-igc = ["tk-kernel/net-igc"]
 # The shipped x86_64 product keeps its hardware-backed Linux ABI paths in one
 # explicit opt-in.  CET and cachestat have no feature gate: both are always

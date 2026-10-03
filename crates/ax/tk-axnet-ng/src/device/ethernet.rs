@@ -653,6 +653,17 @@ impl Device for EthernetDevice {
         Some(self.hardware_address().0)
     }
 
+    fn rx_poll_interval_micros(&self) -> Option<u64> {
+        (self.irq.is_none() && !self.quarantined).then_some(10_000)
+    }
+
+    fn set_primary_ipv4(&mut self, address: Ipv4Cidr) {
+        if self.ip != address {
+            self.ip = address;
+            self.neighbors.clear();
+        }
+    }
+
     fn addresses(&self) -> alloc::vec::Vec<smoltcp::wire::IpCidr> {
         vec![self.ip.into()]
     }

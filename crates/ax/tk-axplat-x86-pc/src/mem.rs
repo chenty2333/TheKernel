@@ -13,6 +13,8 @@ use crate::{
 const MAX_REGIONS: usize = boot_info::MAX_REGIONS;
 const MAX_RESERVED_RANGES: usize = 1 + boot_info::MAX_MODULES;
 
+static RUNTIME_MMIO: LazyInit<Vec<RawRange, 32>> = LazyInit::new();
+
 static RAM_REGIONS: LazyInit<Vec<RawRange, MAX_REGIONS>> = LazyInit::new();
 static RESERVED_RAM_REGIONS: LazyInit<Vec<RawRange, MAX_RESERVED_RANGES>> = LazyInit::new();
 
@@ -77,6 +79,48 @@ pub fn init() {
     RESERVED_RAM_REGIONS.init_once(reserved);
 }
 
+/// Firmware-discovered windows must survive replacement of the boot page table.
+/// This is a mapping list, not a claim that configured BAR allocation windows
+/// describe the target. Already assigned PCI BARs are mapped by their drivers.
+pub(crate) fn init_runtime_mmio() {
+    let mut ranges: Vec<RawRange, 32> = Vec::new();
+    for &range in MMIO_RANGES {
+        ranges.push(range).expect("MMIO range capacity");
+    }
+    let mut add_page = |address: Option<usize>| {
+        if let Some(address) = address.filter(|a| *a != 0 && a & 0xfff == 0) {
+            ranges
+                .push((address, 4096))
+                .expect("runtime MMIO range capacity");
+        }
+    };
+    if let Some(facts) = crate::cpu::apic_facts() {
+        add_page(facts.lapic_address.and_then(|a| usize::try_from(a).ok()));
+        add_page(facts.io_apic_address.map(|a| a as usize));
+    }
+    add_page(crate::acpi::hpet_base());
+    // Uncore discovery can read ECAM before the bus driver maps it on demand.
+    // Keep its runtime span in the early map as well, not the stale fallback.
+    let (begin, end) = crate::pci::ecam_bus_range();
+    let base = crate::pci::ecam_base();
+    let span = (usize::from(end.saturating_sub(begin)) + 1) << 20;
+    if base != 0 && base.checked_add(span).is_some() {
+        ranges.push((base, span)).expect("runtime ECAM range capacity");
+    }
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut merged: Vec<RawRange, 32> = Vec::new();
+    for (start, size) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.0 + last.1
+        {
+            last.1 = (start + size).max(last.0 + last.1) - last.0;
+        } else {
+            merged.push((start, size)).expect("merged MMIO capacity");
+        }
+    }
+    RUNTIME_MMIO.init_once(merged);
+}
+
 struct MemIfImpl;
 
 impl MemoryManagement for MemIfImpl {
@@ -110,7 +154,9 @@ impl MemIf for MemIfImpl {
 
     /// Returns all device memory (MMIO) ranges on the platform.
     fn mmio_ranges() -> &'static [RawRange] {
-        &MMIO_RANGES
+        RUNTIME_MMIO
+            .get()
+            .map_or(MMIO_RANGES, |ranges| ranges.as_slice())
     }
 
     /// Translates a physical address to a virtual address.

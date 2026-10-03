@@ -65,8 +65,9 @@ impl IgcHal for IgcHalImpl {
         // direct map's answer.  Coherent because x86_64 with no IOMMU in the
         // way is coherent, which is what this kernel's DMA users already
         // assume.
-        let virtual_address =
-            global_allocator().alloc_pages(pages, DMA_PAGE_BYTES, UsageKind::Dma).ok()?;
+        let virtual_address = global_allocator()
+            .alloc_pages(pages, DMA_PAGE_BYTES, UsageKind::Dma)
+            .ok()?;
         if virtual_address == 0 {
             return None;
         }
@@ -121,6 +122,15 @@ pub(crate) fn probe_and_init(
 ) -> crate::drivers::BusProbeResult {
     match probe(root, bdf, dev_info) {
         Some(Some(nic)) => {
+            #[cfg(all(net_dev = "n305-net", not(feature = "dyn")))]
+            match crate::AxDeviceEnum::try_from_net(nic) {
+                Ok(device) => crate::drivers::BusProbeResult::Device(device),
+                Err(error) => {
+                    warn!("igc: could not publish NIC: {error:?}");
+                    crate::drivers::BusProbeResult::Claimed
+                }
+            }
+            #[cfg(not(all(net_dev = "n305-net", not(feature = "dyn"))))]
             crate::drivers::BusProbeResult::Device(crate::AxDeviceEnum::from_net(nic))
         }
         Some(None) => crate::drivers::BusProbeResult::Claimed,

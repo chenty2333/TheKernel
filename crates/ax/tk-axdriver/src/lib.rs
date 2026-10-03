@@ -72,9 +72,9 @@ mod macros;
 mod bus;
 mod drivers;
 mod dummy;
-mod structs;
 #[cfg(feature = "virtio-sound")]
 pub mod sound;
+mod structs;
 
 #[cfg(feature = "shared-block")]
 mod block_volume;
@@ -87,8 +87,10 @@ mod virtio;
 #[cfg(feature = "usb-xhci")]
 mod usb;
 
-#[cfg(net_dev = "igc")]
+#[cfg(any(net_dev = "igc", net_dev = "n305-net"))]
 mod igc;
+#[cfg(any(net_dev = "rtl8125", net_dev = "n305-net"))]
+mod rtl8125;
 
 #[cfg(feature = "ixgbe")]
 mod ixgbe;
@@ -354,9 +356,9 @@ pub struct VirtioIoCounters {
 #[repr(u64)]
 pub enum AsyncBlockWaitPolicy {
     /// Drain, spin briefly, then yield/sleep through the shared completion path.
-    Hybrid = 0,
+    Hybrid         = 0,
     /// Force submit-one/wait-one fallback through the owned-request path.
-    Sync = 1,
+    Sync           = 1,
     /// Prefer IRQ wakeups and use the hybrid fallback unless IRQ wait is armed.
     InterruptFirst = 2,
 }

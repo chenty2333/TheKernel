@@ -11,12 +11,15 @@ pub struct UsbInput {
     state: Mutex<InputState>,
     id: InputDeviceId,
     keyboard: bool,
+    pointer: Option<super::hid_report::PointerReport>,
 }
 struct InputState {
     host: Arc<Host>,
     _owner: DeviceOwner,
     endpoint: crab_usb::EndpointHandle,
-    report: Box<[u8; 8]>,
+    report: Box<[u8; 64]>,
+    buttons: u8,
+    report_len: usize,
     pending: Option<RequestId>,
     previous: [u8; 8],
     events: VecDeque<Event>,
@@ -38,7 +41,7 @@ fn key(usage: u8) -> u16 {
     }
 }
 const MODIFIERS: [u16; 8] = [29, 42, 56, 125, 97, 54, 100, 126];
-fn push(events: &mut VecDeque<Event>, ty: u16, code: u16, value: i32) {
+pub(super) fn push(events: &mut VecDeque<Event>, ty: u16, code: u16, value: i32) {
     events.push_back(Event {
         event_type: ty,
         code,
@@ -96,11 +99,11 @@ fn decode(keyboard: bool, old: &[u8; 8], report: &[u8], events: &mut VecDeque<Ev
 impl UsbInput {
     pub(super) fn new(
         host: Arc<Host>,
-        device: Device,
+        device: Arc<Mutex<Device>>,
         session: InterfaceSession,
         interface: &InterfaceDescriptor,
     ) -> DevResult<Self> {
-        let keyboard = interface.protocol == 1;
+        let keyboard = interface.subclass == 1 && interface.protocol == 1;
         let descriptor = interface
             .endpoints
             .iter()
@@ -112,19 +115,47 @@ impl UsbInput {
         let endpoint = session
             .endpoint(descriptor.address)
             .map_err(|_| DevError::Io)?;
+        let mut device_guard = device.lock();
+        let pointer = if keyboard {
+            None
+        } else {
+            let mut descriptor = [0u8; 1024];
+            let length = host
+                .wait(device_guard.control_in(
+                    ControlSetup {
+                        request_type: RequestType::Standard,
+                        recipient: Recipient::Interface,
+                        request: Request::Other(6),
+                        value: 0x2200,
+                        index: u16::from(interface.interface_number),
+                    },
+                    &mut descriptor,
+                ))?
+                .map_err(|_| DevError::Io)?;
+            Some(super::hid_report::PointerReport::parse(
+                &descriptor[..length.min(descriptor.len())],
+            )?)
+        };
         let id = InputDeviceId {
             bus_type: 3,
-            vendor: device.vendor_id(),
-            product: device.product_id(),
-            version: device.descriptor().device_version,
+            vendor: device_guard.vendor_id(),
+            product: device_guard.product_id(),
+            version: device_guard.descriptor().device_version,
         };
-        let mut report = Box::new([0; 8]);
+        drop(device_guard);
+        let report_len = if keyboard {
+            8
+        } else {
+            usize::from(descriptor.max_packet_size).min(64)
+        };
+        let mut report = Box::new([0; 64]);
         let pending = Some(host.submit(
             &endpoint,
-            TransferRequest::interrupt_in(&mut report[..if keyboard { 8 } else { 3 }]),
+            TransferRequest::interrupt_in(&mut report[..report_len]),
         )?);
         Ok(Self {
             keyboard,
+            pointer,
             id,
             state: Mutex::new(InputState {
                 host,
@@ -134,6 +165,8 @@ impl UsbInput {
                 },
                 endpoint,
                 report,
+                buttons: 0,
+                report_len,
                 pending,
                 previous: [0; 8],
                 events: VecDeque::new(),
@@ -197,13 +230,56 @@ impl InputDriverOps for UsbInput {
                     set(code);
                 }
             }
+            EventType::Absolute if !self.keyboard => {
+                let Some(pointer) = &self.pointer else {
+                    return Ok(false);
+                };
+                for axis in 0..=1 {
+                    if pointer.absolute_range(axis).is_some() {
+                        set(u16::from(axis));
+                    }
+                }
+            }
             EventType::Relative if !self.keyboard => {
-                set(0);
-                set(1);
+                let Some(pointer) = &self.pointer else {
+                    return Ok(false);
+                };
+                for axis in [0, 1, 8] {
+                    if pointer.relative_axis(axis) {
+                        set(axis);
+                    }
+                }
             }
             _ => return Ok(false),
         }
         Ok(true)
+    }
+    fn get_property_bits(&mut self, out: &mut [u8]) -> DevResult<bool> {
+        out.fill(0);
+        if self
+            .pointer
+            .as_ref()
+            .is_some_and(|p| p.absolute_range(0).is_some())
+        {
+            if let Some(byte) = out.first_mut() {
+                *byte = 1;
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    fn get_abs_info(&mut self, axis: u8) -> DevResult<Option<axdriver_input::AbsInfo>> {
+        Ok(self
+            .pointer
+            .as_ref()
+            .and_then(|p| p.absolute_range(axis))
+            .map(|(min, max)| axdriver_input::AbsInfo {
+                min: min as u32,
+                max: max as u32,
+                fuzz: 0,
+                flat: 0,
+                res: 0,
+            }))
     }
     fn read_event(&mut self) -> DevResult<Event> {
         let state = self.state.get_mut();
@@ -211,34 +287,40 @@ impl InputDriverOps for UsbInput {
             return Ok(event);
         }
         state.host.pump()?;
-        if let Some(id) = state.pending {
-            if let Some(completion) = state.host.reclaim(&state.endpoint, id)? {
-                state.pending = None;
-                if completion.status != TransferStatus::Completed {
-                    return Err(DevError::Io);
-                }
-                let length = completion.actual_length.min(state.report.len());
-                if decode(
-                    self.keyboard,
+        if let Some(id) = state.pending
+            && let Some(completion) = state.host.reclaim(&state.endpoint, id)?
+        {
+            state.pending = None;
+            if completion.status != TransferStatus::Completed {
+                return Err(DevError::Io);
+            }
+            let length = completion.actual_length.min(state.report.len());
+            let decoded = if let Some(pointer) = &self.pointer {
+                pointer.decode(
+                    &state.report[..length],
+                    &mut state.buttons,
+                    &mut state.events,
+                )
+            } else {
+                decode(
+                    true,
                     &state.previous,
                     &state.report[..length],
                     &mut state.events,
-                ) {
-                    state.previous.fill(0);
-                    state.previous[..length].copy_from_slice(&state.report[..length]);
-                }
-                state.pending = Some(
-                    state
-                        .host
-                        .submit(
-                            &state.endpoint,
-                            TransferRequest::interrupt_in(
-                                &mut state.report[..if self.keyboard { 8 } else { 3 }],
-                            ),
-                        )
-                        .map_err(|_| DevError::Io)?,
-                );
+                )
+            };
+            if decoded && self.keyboard {
+                state.previous.copy_from_slice(&state.report[..8]);
             }
+            state.pending = Some(
+                state
+                    .host
+                    .submit(
+                        &state.endpoint,
+                        TransferRequest::interrupt_in(&mut state.report[..state.report_len]),
+                    )
+                    .map_err(|_| DevError::Io)?,
+            );
         }
         state.events.pop_front().ok_or(DevError::Again)
     }

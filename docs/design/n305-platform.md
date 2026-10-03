@@ -2,8 +2,8 @@
 
 **Target machine:** Acer mini PC, Intel Core i3-N305 (Alder Lake-N, eight Gracemont
 E-cores, no SMT).
-**Target worktree:** `/home/ava/Worktrees/TheKernel/n305-platform`
-**Branch:** `feat/n305-platform`
+**Current preparation worktree:** `/home/ava/Worktrees/TheKernel/dev`
+**Current branch:** `dev`
 **Companion profile:** `config/x86_64/n305.toml`
 
 **Evidence rules.** Every factual claim below is tagged:
@@ -15,9 +15,11 @@ E-cores, no SMT).
 | `[I]` | Inference from verified code or output. Labelled as an inference, not a fact. |
 | `[U]` | **Unverified.** Only a boot on the target machine can settle it. |
 
-This document deliberately contains a large `[U]` section. The profile it describes has
-never run on the machine it describes, and presenting a plausible memory map as a
-measurement would be the most expensive kind of error here.
+The original platform audit below predates the user-reported 2026-10-03 PXE
+shell boot (MCFG ECAM 0xc0000000, firmware framebuffer 800x600 at 0x4000000000).
+That observation is not a native GPU/NIC validation. The dated runtime update
+at the end and n305-tonight.md supersede old readiness statements; configured
+fallbacks still must not be presented as hardware measurements.
 
 ---
 
@@ -140,11 +142,11 @@ fallback and the `mmio-ranges` in `n305.toml` are still the guesses listed in §
 |---|---|---|
 | Kernel load address `0x200000` | `n305.toml [plat] kernel-base-paddr` | GRUB cannot load the image |
 | Kernel virtual base and direct-map offset | `n305.toml [plat]` | Immediate fault at entry |
-| `mmio-ranges` (BAR windows, ECAM, APIC, HPET) | `n305.toml [devices]` | RAM marked as device memory, or a device access to unmapped memory |
-| `pci-bus-end = 0xff` | `n305.toml [devices]` | A too-low bound silently hides devices |
+| Configured `mmio-ranges` fallback | `n305.toml [devices]` plus discovered ranges | MADT/HPET/MCFG addresses are added at runtime; remaining configured windows are assumptions |
+| `pci-bus-end = 0xff` fallback | `n305.toml [devices]` | Only used without usable MCFG; runtime end bus wins |
 | `max-cpu-num = 8` | `n305.toml [plat]` | Fewer than eight CPUs come online |
 | Timer and IPI vectors | `n305.toml [devices]` | Not machine facts; kernel convention |
-| Primary console = COM1 at `0x3f8` | `crates/ax/tk-axplat-x86-pc/src/console.rs` | No console output at all on this machine |
+| UART console = COM1 at `0x3f8` | `crates/ax/tk-axplat-x86-pc/src/console.rs` | It may answer without an exposed port; the firmware screen remains the human console |
 | Which UART carries the log | *not* an assumption any more: `console.rs::select_sink` probes COM2, COM3 and COM4 and falls back to sharing COM1 | Log drain lands on a port nobody is watching; the fallback keeps it on the console wire |
 
 `plat.phys-memory-size` is **not** on that list because it is inert: no Rust source in
@@ -234,12 +236,12 @@ machine.
 
 Each item names what would confirm it, so one boot with `AX_LOG=info` settles all of them.
 
-1. **`[U]` The ECAM base and bus range from MCFG.** Confirm with the `pci-ecam:` line:
+1. **The original ECAM expectation (superseded).** Confirm new boots with the `pci-ecam:` line:
    `source=mcfg` means discovery worked; `source=configured` means the configured value was
    used instead. Discovery itself is already exercised on QEMU (§1.5), so what is unverified
-   here is only whether *this machine's* firmware declares what the profile guesses. Expected
-   on Alder Lake: base `0xe0000000`, segment 0, buses `0x00-0xff`; the profile's fallback and
-   its `mmio-ranges` are that guess, not a measurement.
+   here was whether this machine matched the old guess. The user now reports
+   `0xc0000000`, segment 0, buses `0x00-0xff`; `0xe0000000` remains a configured
+   fallback, not the target's observed ECAM base.
 2. **`[U]` `pci-bus-end`.** The profile uses `0xff` (every bus) because a bound below the
    true top bus hides devices silently. If `source=mcfg` and the MCFG region's end bus is
    lower, that lower number is the real one.
@@ -302,3 +304,43 @@ Each item names what would confirm it, so one boot with `AX_LOG=info` settles al
   on QEMU (§1.5), but every address in `n305.toml` is still a documented expectation rather
   than a measurement, and the first boot on the N305 is the first time they meet that
   firmware. §5 is the list of what that boot must settle.
+
+## 2026-10-03 runtime-address corrections
+
+The user observed a real boot with MCFG ECAM `0xc0000000`, while the Intel
+probe still read the configured `0xe0000000`. This observation supersedes the
+older statement that no target boot had occurred; it does not validate the
+Intel modeset or either candidate NIC.
+
+* Intel configuration reads now use `axhal::pci` (the same retained MCFG
+  decision as the generic PCI bus), map the exact runtime span, and bound
+  every read to that mapping. `mmio-ranges` is no longer an allowlist for
+  those reads. Mapping failure leaves the firmware screen untouched.
+* The MCFG bus limit is authoritative; `pci-bus-end` is only the no-MCFG
+  fallback. Boot inventory reports every answering BDF, vendor/device,
+  three-byte class and all raw BAR words **before** a driver resets a device.
+  Upper words of 64-bit BARs are shown verbatim, not sized as separate BARs.
+* LAPIC and the first IOAPIC already used MADT addresses. Their discovered
+  pages now join the initial MMIO mapping, so a relocated controller does
+  not disappear when the temporary boot page table is replaced.
+* HPET previously assumed `0xfed00000`; it now uses a validated system-memory
+  GAS in the ACPI HPET table. Absent/malformed HPET means no HPET MMIO reads,
+  and the existing CPUID/PIT clock-selection paths remain available.
+* The MADT interrupt-source-override decoder incorrectly expected 16 bytes.
+  The actual record is 10 bytes. Its bus/IRQ/GSI/flags now decode correctly;
+  this explains the observed "only 0 of 2 ... shown" without assuming the
+  firmware records were malformed. This change reports overrides; it does
+  **not** implement general ACPI interrupt routing.
+* Installed RAM and framebuffer address/pitch/channel layout already come
+  from the Multiboot handoff; the N305 framebuffer at `0x4000000000` is mapped
+  from its actual tag, not a configured low-memory aperture. CPU topology,
+  invariant-TSC availability and clock ratios already come from MADT/CPUID.
+* `pci-ranges` remains a fallback allocator for **unassigned** PCI BARs, not
+  runtime host-bridge `_CRS` discovery. The boot GPU is never sized/reassigned
+  by the generic bus. Missing allocation space or malformed BARs now returns
+  a probe error rather than panicking. General `_CRS`, multiple segments and
+  multiple IOAPIC routing remain outside this preparation.
+
+These changes are **未在硬件上验证**. Host tests cover ECAM geometry, HPET GAS,
+raw BAR reads and the real ten-byte MADT layout. QEMU acceptance is recorded
+in `n305-tonight.md`; no QEMU result proves a target register works.

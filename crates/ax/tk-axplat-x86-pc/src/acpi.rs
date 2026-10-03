@@ -20,13 +20,17 @@
 //! there is no way to report a fault this early: discovery degrades to the
 //! configured fallback and the boot log records which path was taken.
 
+mod hpet;
 pub mod mcfg;
-
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use crate::config::devices::{PCI_BUS_END, PCI_ECAM_BASE};
-use crate::cpu::{physical_bytes, read_u32, read_u64, table_length_and_bytes};
+pub(crate) use hpet::hpet_base;
 use mcfg::ConfigRegion;
+
+use crate::{
+    config::devices::{PCI_BUS_END, PCI_ECAM_BASE},
+    cpu::{physical_bytes, read_u32, read_u64, table_length_and_bytes},
+};
 
 /// Which ACPI root table an MCFG lookup walked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,6 +289,7 @@ pub(crate) fn root_tables(rsdp: &[u8]) -> RootTables {
 /// temporary boot page table maps firmware memory.  Never panics: an absent or
 /// malformed table leaves the configured fallback in place.
 pub(crate) fn init_early() {
+    hpet::init_early();
     let (discovery, chosen) = match find_mcfg() {
         McfgLookup::Found { bytes, root } => match mcfg::parse_regions(bytes) {
             Ok(regions) => {
@@ -417,8 +422,7 @@ pub(crate) fn report() {
     let (bus_begin, bus_end) = pci_ecam_bus_range();
 
     info!(
-        "pci-ecam: base={:#x} segment={} bus={:#04x}-{:#04x} source={} \
-         mcfg={} root={} regions={}",
+        "pci-ecam: base={:#x} segment={} bus={:#04x}-{:#04x} source={} mcfg={} root={} regions={}",
         pci_ecam_base(),
         pci_ecam_segment(),
         bus_begin,
@@ -436,8 +440,8 @@ pub(crate) fn report() {
     }
     if ecam_source() == EcamSource::Configured {
         info!(
-            "pci-ecam: {:#x} is the configured [devices] pci-ecam-base fallback, not a \
-             firmware discovery",
+            "pci-ecam: {:#x} is the configured [devices] pci-ecam-base fallback, not a firmware \
+             discovery",
             pci_ecam_base()
         );
     }
@@ -513,7 +517,7 @@ fn check_root(
     root: RootTable,
     saw_readable_root: &mut bool,
 ) -> Option<McfgLookup> {
-    match find_in_root(root_address, entry_width) {
+    match find_in_root(root_address, entry_width, b"MCFG") {
         RootWalk::Found(address) => Some(match table_length_and_bytes(address) {
             Some((_, table)) => McfgLookup::Found { bytes: table, root },
             // The MCFG's own checksum or length is bad.  Say "present but
@@ -542,7 +546,7 @@ enum RootWalk {
 }
 
 /// Search one root table for the MCFG signature.
-fn find_in_root(root_address: u64, entry_width: usize) -> RootWalk {
+fn find_in_root(root_address: u64, entry_width: usize, signature: &[u8; 4]) -> RootWalk {
     if entry_width != 4 && entry_width != 8 {
         return RootWalk::Unreadable;
     }
@@ -563,7 +567,7 @@ fn find_in_root(root_address: u64, entry_width: usize) -> RootWalk {
         // table is still a usable index and a later entry may be the MCFG.
         if let Some(table_address) = table_address
             && let Some((_, table)) = table_length_and_bytes(table_address)
-            && &table[..4] == b"MCFG"
+            && &table[..4] == signature
         {
             return RootWalk::Found(table_address);
         }
@@ -574,8 +578,7 @@ fn find_in_root(root_address: u64, entry_width: usize) -> RootWalk {
 
 #[cfg(test)]
 mod tests {
-    use super::mcfg::ConfigRegion;
-    use super::{EcamSource, McfgStatus, PciEcam, RootTable, select_pci_ecam};
+    use super::{EcamSource, McfgStatus, PciEcam, RootTable, mcfg::ConfigRegion, select_pci_ecam};
 
     fn region(base: u64, segment: u16, start: u8, end: u8) -> ConfigRegion {
         ConfigRegion {
@@ -624,7 +627,10 @@ mod tests {
 
     #[test]
     fn a_table_with_only_other_segments_yields_no_discovery() {
-        let regions = [region(0x8000_0000, 1, 0, 0xff), region(0x9000_0000, 3, 0, 0x3f)];
+        let regions = [
+            region(0x8000_0000, 1, 0, 0xff),
+            region(0x9000_0000, 3, 0, 0x3f),
+        ];
         assert_eq!(select_pci_ecam(&regions), None);
     }
 
@@ -639,10 +645,7 @@ mod tests {
         // `crate::config` module, not through an `axconfig` dependency.
         let fallback = PciEcam::configured();
         assert_eq!(fallback.base, crate::config::devices::PCI_ECAM_BASE as u64);
-        assert_eq!(
-            fallback.bus_end,
-            crate::config::devices::PCI_BUS_END as u8
-        );
+        assert_eq!(fallback.bus_end, crate::config::devices::PCI_BUS_END as u8);
         assert_eq!(fallback.source, EcamSource::Configured);
         // The published accessors must agree with the parsed fallback before
         // early initialization has run.

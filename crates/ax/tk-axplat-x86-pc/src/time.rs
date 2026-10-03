@@ -10,7 +10,7 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use axplat::{
-    mem::{PhysAddr, pa, phys_to_virt},
+    mem::{PhysAddr, phys_to_virt},
     time::TimeIf,
 };
 use kspin::SpinNoIrq;
@@ -31,7 +31,6 @@ const MAX_CLOCK_FREQUENCY_HZ: u64 = 100_000_000_000;
 #[cfg(feature = "irq")]
 const MAX_LAPIC_FREQUENCY_HZ: u64 = 20_000_000_000;
 
-const HPET_BASE: PhysAddr = pa!(0xfed0_0000);
 const HPET_GENERAL_CAPABILITIES: usize = 0x00;
 const HPET_GENERAL_CONFIGURATION: usize = 0x10;
 const HPET_MAIN_COUNTER: usize = 0xf0;
@@ -241,7 +240,7 @@ struct Hpet {
 
 impl Hpet {
     fn new() -> Option<Self> {
-        let base = phys_to_virt(HPET_BASE).as_mut_ptr();
+        let base = phys_to_virt(PhysAddr::from_usize(crate::acpi::hpet_base()?)).as_mut_ptr();
         let capabilities =
             unsafe { core::ptr::read_volatile(base.add(HPET_GENERAL_CAPABILITIES) as *const u64) };
         let period_fs = capabilities >> 32;
@@ -295,7 +294,8 @@ impl Hpet {
 /// verified that the counter is 64-bit and left the block enabled.
 #[inline]
 fn read_hpet_clock_counter() -> u64 {
-    let base = phys_to_virt(HPET_BASE).as_mut_ptr();
+    let address = crate::acpi::hpet_base().expect("selected HPET has a retained ACPI address");
+    let base = phys_to_virt(PhysAddr::from_usize(address)).as_mut_ptr();
     unsafe { core::ptr::read_volatile(base.add(HPET_MAIN_COUNTER) as *const u64) }
 }
 

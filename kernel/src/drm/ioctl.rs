@@ -146,7 +146,7 @@ pub(super) fn dispatch(
         return Err(AxError::InvalidInput);
     }
     match command {
-        uapi::DRM_IOCTL_VERSION => version(copy, arg)?,
+        uapi::DRM_IOCTL_VERSION => version(copy, arg, file.driver_name().as_bytes())?,
         uapi::DRM_IOCTL_GET_MAGIC => get_magic(file, copy, arg)?,
         uapi::DRM_IOCTL_AUTH_MAGIC => auth_magic(file, copy, arg)?,
         uapi::DRM_IOCTL_SET_MASTER => file.become_master().map_err(AxError::from)?,
@@ -158,16 +158,7 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_MODE_DESTROY_DUMB => destroy_dumb(file, copy, arg)?,
         uapi::DRM_IOCTL_GET_CAP => {
             let mut request: uapi::DrmGetCap = read_pod(copy, arg)?;
-            request.value = match request.capability {
-                uapi::DRM_CAP_DUMB_BUFFER
-                | uapi::DRM_CAP_TIMESTAMP_MONOTONIC
-                | uapi::DRM_CAP_SYNCOBJ
-                | uapi::DRM_CAP_SYNCOBJ_TIMELINE => 1,
-                uapi::DRM_CAP_PRIME => uapi::DRM_PRIME_CAP_IMPORT | uapi::DRM_PRIME_CAP_EXPORT,
-                uapi::DRM_CAP_DUMB_PREFERRED_DEPTH => 24,
-                uapi::DRM_CAP_DUMB_PREFER_SHADOW => 0,
-                _ => return Err(AxError::InvalidInput),
-            };
+            request.value = capability_value(request.capability)?;
             write_pod(copy, arg, &request)?;
         }
         uapi::DRM_IOCTL_PRIME_HANDLE_TO_FD => prime_handle_to_fd(file, context, arg)?,
@@ -412,18 +403,33 @@ fn write_truncated(
     Ok(())
 }
 
-fn version(copy: &impl UserCopy, arg: usize) -> AxResult<()> {
+fn capability_value(capability: u64) -> AxResult<u64> {
+    Ok(match capability {
+        uapi::DRM_CAP_DUMB_BUFFER
+        | uapi::DRM_CAP_TIMESTAMP_MONOTONIC
+        | uapi::DRM_CAP_SYNCOBJ
+        | uapi::DRM_CAP_SYNCOBJ_TIMELINE => 1,
+        uapi::DRM_CAP_PRIME => uapi::DRM_PRIME_CAP_IMPORT | uapi::DRM_PRIME_CAP_EXPORT,
+        // Known but unsupported capability: SDL KMSDRM requires a
+        // successful query with zero, not EINVAL.
+        uapi::DRM_CAP_ASYNC_PAGE_FLIP => 0,
+        uapi::DRM_CAP_DUMB_PREFERRED_DEPTH => 24,
+        uapi::DRM_CAP_DUMB_PREFER_SHADOW => 0,
+        _ => return Err(AxError::InvalidInput),
+    })
+}
+
+fn version(copy: &impl UserCopy, arg: usize, name: &[u8]) -> AxResult<()> {
     let mut r: uapi::DrmVersion = read_pod(copy, arg)?;
-    const NAME: &[u8] = b"virtio_gpu";
     const DATE: &[u8] = b"20260830";
-    const DESC: &[u8] = b"TheKernel virtio GPU";
-    write_truncated(copy, r.name, r.name_len, NAME)?;
+    const DESC: &[u8] = b"TheKernel DRM device";
+    write_truncated(copy, r.name, r.name_len, name)?;
     write_truncated(copy, r.date, r.date_len, DATE)?;
     write_truncated(copy, r.desc, r.desc_len, DESC)?;
     r.version_major = 0;
     r.version_minor = 1;
     r.version_patchlevel = 0;
-    r.name_len = NAME.len() as u64;
+    r.name_len = name.len() as u64;
     r.date_len = DATE.len() as u64;
     r.desc_len = DESC.len() as u64;
     write_pod(copy, arg, &r)
@@ -748,10 +754,14 @@ fn syncobj_timeline_signal(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> 
 fn plane_resources(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut r: uapi::DrmModeGetPlaneRes = read_pod(copy, arg)?;
     let capacity = r.count_planes;
-    r.count_planes = 2;
+    r.count_planes = if file.resources().cursor_plane_id == 0 {
+        1
+    } else {
+        2
+    };
     if r.plane_id_ptr != 0 && capacity != 0 {
         write_u32(copy, r.plane_id_ptr, file.resources().primary_plane_id)?;
-        if capacity > 1 {
+        if capacity > 1 && r.count_planes > 1 {
             write_u32(
                 copy,
                 r.plane_id_ptr.checked_add(4).ok_or(AxError::BadAddress)?,
@@ -764,7 +774,7 @@ fn plane_resources(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult
 fn get_plane(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     let mut r: uapi::DrmModeGetPlane = read_pod(copy, arg)?;
     let x = file.resources();
-    if r.plane_id != x.primary_plane_id && r.plane_id != x.cursor_plane_id {
+    if r.plane_id == 0 || (r.plane_id != x.primary_plane_id && r.plane_id != x.cursor_plane_id) {
         return Err(AxError::InvalidInput);
     }
     let s = file.device_state();
@@ -1697,6 +1707,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sdl_async_page_flip_query_reports_known_but_unsupported() {
+        assert_eq!(capability_value(uapi::DRM_CAP_ASYNC_PAGE_FLIP), Ok(0));
+        assert_eq!(capability_value(uapi::DRM_CAP_DUMB_BUFFER), Ok(1));
+        assert_eq!(capability_value(u64::MAX), Err(AxError::InvalidInput));
+    }
+
+    #[test]
     fn prime_fd_flags_accept_linux_cloexec_and_reject_the_old_bit() {
         assert_eq!(fd_flags(0), Ok(false));
         assert_eq!(fd_flags(2), Ok(false));
@@ -1763,7 +1780,7 @@ mod tests {
             ..Default::default()
         };
         write_pod(&copy, 0, &request).unwrap();
-        version(&copy, 0).unwrap();
+        version(&copy, 0, b"virtio_gpu").unwrap();
         let response: uapi::DrmVersion = read_pod(&copy, 0).unwrap();
         assert_eq!(response.name_len, 10);
         assert_eq!(response.desc_len, 20);

@@ -24,8 +24,8 @@ use spin::Once;
 
 use crate::{
     device::{
-        Device, DeviceStats, InterfaceInfo, InterfaceKind, LoopbackDevice, PacketSendProgress, RxWakeSource,
-        TapDevice, TapHandle, TunDevice, TunHandle, VethEnd,
+        Device, DeviceStats, InterfaceInfo, InterfaceKind, LoopbackDevice, PacketSendProgress,
+        RxWakeSource, TapDevice, TapHandle, TunDevice, TunHandle, VethEnd,
     },
     listen_table::ListenTable,
     packet::{
@@ -211,6 +211,9 @@ impl NetStackServicePermit<'_> {
             cidr: addr,
         });
         *registry = next;
+        if let IpCidr::Ipv4(address) = addr {
+            self.service.router.set_primary_ipv4(ifindex, address);
+        }
         self.publish_route_generation();
         Ok(())
     }
@@ -248,6 +251,19 @@ impl NetStackServicePermit<'_> {
             }
         });
         registry.remove(position);
+        if matches!(addr, IpCidr::Ipv4(_)) {
+            let replacement = registry
+                .iter()
+                .rev()
+                .find_map(|entry| match entry.cidr {
+                    IpCidr::Ipv4(address) if entry.ifindex == ifindex => Some(address),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    smoltcp::wire::Ipv4Cidr::new(smoltcp::wire::Ipv4Address::UNSPECIFIED, 0)
+                });
+            self.service.router.set_primary_ipv4(ifindex, replacement);
+        }
         self.publish_route_generation();
         Ok(())
     }
@@ -990,14 +1006,21 @@ impl NetStack {
     /// device capacity.
     pub fn try_add_device(&self, device: Box<dyn Device>) -> AxResult<u32> {
         // Perform the RX-ring admission check before taking any wake-source
-        // ownership. A real Ethernet device without an IRQ cannot be
-        // serviced by this stack, and must never become a published but
-        // unwakeable interface. Software devices keep the ordinary bridge
-        // path because they do not require an IRQ-backed owner.
-        if device.rx_wake_required() && !device.rx_wake_capable() {
+        // ownership. A physical ring without an IRQ must opt into bounded
+        // worker polling, rather than become a published but unwakeable
+        // interface. Software devices keep the ordinary bridge path.
+        if device.rx_wake_required()
+            && !device.rx_wake_capable()
+            && device
+                .rx_poll_interval_micros()
+                .filter(|us| (1000..=1_000_000).contains(us))
+                .is_none()
+        {
             return Err(AxError::Unsupported);
         }
-        if self.rx_worker.is_none() && device.rx_wake_capable() {
+        if self.rx_worker.is_none()
+            && (device.rx_wake_capable() || device.rx_poll_interval_micros().is_some())
+        {
             return Err(AxError::Unsupported);
         }
         let mut service = self.service.lock();
@@ -1028,6 +1051,7 @@ impl NetStack {
         if let Some(worker) = worker {
             match device.register_rx_waker(&worker.irq_waker) {
                 Ok(RxWakeSource::Armed) => {}
+                Ok(RxWakeSource::Unavailable) if device.rx_poll_interval_micros().is_some() => {}
                 Ok(RxWakeSource::Unavailable) => {
                     device.stop_rx_waker();
                     return Err(AxError::Unsupported);
@@ -1725,8 +1749,10 @@ impl NetStack {
         service.register_protocol_timer(waker)?;
         let registration = service.register_rx_waker(waker);
         let quarantine_edge = service.router.take_quarantine_edge();
-        if registration.has_owner() || service.has_rx_backlog()
+        if registration.has_owner()
+            || service.has_rx_backlog()
             || service.router.has_dormant_rx_source()
+            || service.router.rx_poll_interval_micros().is_some()
             || self.socket_set.closing_tcp_deadline().is_some()
         {
             // A source error is already represented in the router's

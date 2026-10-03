@@ -10,8 +10,7 @@
 # showing an error on the screen.
 #
 # What it is for: replacing TheKernel's assumptions about this machine with
-# facts.  The headline fact is the PCI ECAM base, which the kernel currently
-# takes from configuration; the bundle carries the raw ACPI MCFG table, an
+# facts. The headline fact is the firmware PCI ECAM base; the bundle carries the raw ACPI MCFG table, an
 # independent decode of the same bytes done here with od/awk, and the kernel's
 # own ECAM line from dmesg, so the value can be corroborated three ways.
 #
@@ -33,7 +32,7 @@ export PATH
 PAYLOAD_VERSION="1"
 MARKER_NAME="N305-CAPTURE-MARKER.txt"
 MARKER_TEXT="thekernel-n305-capture-v1"
-PROBE_TIMEOUT=300
+PROBE_TIMEOUT=${N305_PROBE_TIMEOUT:-300}
 BUNDLE_MIB_LIMIT=64
 
 # ---------------------------------------------------------------------------
@@ -107,6 +106,10 @@ locate_payload() {
 	return 0
 }
 
+if [ -n "${N305_CAPTURE_ROOT:-}" ]; then
+    MNT="$N305_CAPTURE_ROOT"
+    mkdir -p "$MNT/dump" || exit 1
+else
 MNT=$(locate_payload) || {
 	fatal "no partition carrying $MARKER_NAME (the USB payload partition)"
 	exit 1
@@ -119,6 +122,8 @@ if ! touch "$MNT/.n305-write-test" 2>/dev/null; then
 	exit 1
 fi
 rm -f "$MNT/.n305-write-test"
+
+fi
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUT="$MNT/dump/n305-$STAMP"
@@ -282,7 +287,10 @@ record_file() { # record_file <relative-path> <status> <detail>
 
 say "stage 0/9: installing the offline tool set"
 mkdir -p "$OUT/meta"
-if [ ! -d "$MNT/apks" ]; then
+if [ -n "${N305_CAPTURE_ROOT:-}" ]; then
+    cap_file meta/tool-install.txt /var/log/n305-tool-install.log
+    record "${N305_TOOL_INSTALL_STATUS:-UNAVAILABLE}" meta/network-tool-install "local signed APK repository bootstrap"
+elif [ ! -d "$MNT/apks" ]; then
 	record_file meta/tool-install.txt UNAVAILABLE \
 		"the payload partition has no apks/ directory, so no tools were installed"
 elif [ -z "$(ls "$MNT"/apks/*.apk 2>/dev/null)" ]; then
@@ -461,7 +469,7 @@ cap_sh sysfs/memory-blocks.txt "cat /sys/devices/system/memory/block_size_bytes;
 # ---------------------------------------------------------------------------
 
 say "stage 5/9: PCI"
-cap pci/lspci-nnvvv.txt lspci -nnvvv
+cap pci/lspci-nnvvv.txt lspci -nnvvv -xxxx
 cap pci/lspci-nn.txt lspci -nn
 cap pci/lspci-tree.txt lspci -t
 cap pci/lspci-drivers.txt lspci -nnk
@@ -501,6 +509,15 @@ record OK pci/config "$(find "$OUT/pci/config" -type f | wc -l | tr -d ' ') devi
 # CPU topology.
 # ---------------------------------------------------------------------------
 
+# Capture CH9329's real descriptor layout rather than trusting a guessed one.
+cap usb/lsusb.txt lsusb -v
+for hid in /sys/bus/hid/devices/*; do
+    [ -d "$hid" ] || continue
+    name=$(basename "$hid")
+    cap_file "usb/hid/$name.report_descriptor" "$hid/report_descriptor"
+    cap_file "usb/hid/$name.uevent" "$hid/uevent"
+done
+
 say "stage 6/9: CPU topology"
 cap cpu/lscpu.txt lscpu
 cap cpu/lscpu-parsable.txt lscpu -p
@@ -529,15 +546,22 @@ for connector in /sys/class/drm/card*-*; do
 			fi
 		done
 	} >> "$OUT/display/connectors.txt"
-	if [ -s "$connector/edid" ]; then
-		cp "$connector/edid" "$OUT/display/edid/$name.edid" 2>/dev/null
-		record OK "display/edid/$name.edid" "$(wc -c < "$connector/edid" | tr -d ' ') bytes"
-		if command -v edid-decode >/dev/null 2>&1; then
-			edid-decode "$connector/edid" > "$OUT/display/edid/$name.txt" 2>&1
-			record OK "display/edid/$name.txt" "edid-decode"
-		fi
+    # sysfs binary attributes commonly report st_size=0 even with real bytes.
+    # Test the copied file, not -s on the sysfs path.
+    edid="$OUT/display/edid/$name.edid"
+    cat "$connector/edid" > "$edid" 2>/dev/null
+    if [ -s "$edid" ]; then
+        record OK "display/edid/$name.edid" "$(wc -c < "$edid" | tr -d ' ') bytes"
+        if command -v edid-decode >/dev/null 2>&1; then
+            if edid-decode "$edid" > "$OUT/display/edid/$name.txt" 2>&1; then
+                record OK "display/edid/$name.txt" "edid-decode"
+            else
+                record FAIL "display/edid/$name.txt" "edid-decode rejected the EDID"
+            fi
+        fi
 	else
-		record UNAVAILABLE "display/edid/$name.edid" "no EDID: nothing connected or no DDC"
+        rm -f "$edid"
+        record UNAVAILABLE "display/edid/$name.edid" "no EDID: nothing connected or no DDC"
 	fi
 done
 if ! command -v edid-decode >/dev/null 2>&1; then
@@ -600,6 +624,14 @@ cap storage/lsblk.txt lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL
 cap_sh storage/block-devices.txt "for dev in /sys/block/*; do [ -d \"\$dev\" ] || continue; printf '===== %s =====\n' \"\$(basename \$dev)\"; for f in size removable rotational model state; do printf '%-14s %s\n' \"\$f\" \"\$(cat \$dev/\$f 2>/dev/null)\"; done; done"
 cap_sh storage/nvme.txt "for nvme in /sys/class/nvme/nvme*; do [ -d \"\$nvme\" ] || continue; printf '===== %s =====\n' \"\$nvme\"; for f in model serial firmware_revision state; do printf '%-22s %s\n' \"\$f\" \"\$(cat \$nvme/\$f 2>/dev/null)\"; done; done"
 cap_sh network/interfaces.txt "for netif in /sys/class/net/*; do [ -d \"\$netif\" ] || continue; printf '===== %s =====\n' \"\$(basename \$netif)\"; for f in address operstate carrier mtu type speed; do printf '%-14s %s\n' \"\$f\" \"\$(cat \$netif/\$f 2>/dev/null)\"; done; done"
+cap network/ip-link.txt ip -details link
+for netif in /sys/class/net/*; do
+    [ -d "$netif" ] || continue
+    name=$(basename "$netif")
+    [ "$name" = lo ] && continue
+    cap "network/ethtool-$name.txt" ethtool -i "$name"
+done
+cap_sh network/dmesg-nic.txt "dmesg | grep -iE 'r8169|rtl8125|igc|ethernet|link.*(up|down)'"
 cap_sh network/pci-net.txt "lspci -nn | grep -iE 'ethernet|network'"
 cap_sh network/firmware.txt "dmesg | grep -iE 'iwlwifi|firmware|Direct firmware load'"
 if [ -r /proc/config.gz ]; then
@@ -740,6 +772,21 @@ say "CAPTURE COMPLETE: $ok probes ok, $unavailable unavailable, $failures failed
 say "bundle: $OUT"
 if [ "$failures" != "0" ]; then
 	say "some probes failed; see capture-status.txt in the bundle"
+fi
+if [ -n "${N305_UPLOAD_URL:-}" ]; then
+    say "hardware summary (before upload):"
+    lspci -nn | grep -iE 'VGA|Display|Ethernet' | while IFS= read -r line; do say "$line"; done
+    ip -brief link | while IFS= read -r line; do say "$line"; done
+    say "uploading capture to host"
+    if curl --fail --silent --show-error --connect-timeout 10 --max-time 180 \
+        -H 'Content-Type: application/gzip' --data-binary "@$MNT/dump/n305-$STAMP.tar.gz" "$N305_UPLOAD_URL"; then
+        say "CAPTURE UPLOADED: $ok ok, $unavailable unavailable, $failures failed; host has results"
+        say "leaving this summary visible; power-cycle when ready for TheKernel"
+        exit 0
+    fi
+    fatal "UPLOAD FAILED; data remains at $OUT in RAM, do not power off before retrying"
+    say "retry: curl --fail --data-binary @$MNT/dump/n305-$STAMP.tar.gz $N305_UPLOAD_URL"
+    exit 1
 fi
 say "powering off in 10 seconds - a machine that stays on has failed"
 
