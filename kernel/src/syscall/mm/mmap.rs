@@ -704,10 +704,10 @@ fn preflight_mprotect_geometry(
     if !addr.is_multiple_of(PageSize::Size4K as usize) {
         return Err(AxError::InvalidInput);
     }
-    MmapProt::from_bits(prot).ok_or(AxError::InvalidInput)?;
     if length == 0 {
         return Ok(None);
     }
+    MmapProt::from_bits(prot).ok_or(AxError::InvalidInput)?;
     let length = checked_align_up_4k(length).ok_or(AxError::NoMemory)?;
     let start = VirtAddr::from(addr);
     let end = start.checked_add(length).ok_or(AxError::NoMemory)?;
@@ -4653,8 +4653,9 @@ mod tests {
             preflight_mprotect_geometry(0x4001, 0, 0),
             Err(AxError::InvalidInput)
         );
+        assert_eq!(preflight_mprotect_geometry(0x4000, 0, 1usize << 63), Ok(None));
         assert_eq!(
-            preflight_mprotect_geometry(0x4000, 0, usize::MAX),
+            preflight_mprotect_geometry(0x4000, PAGE_SIZE_4K, 1usize << 63),
             Err(AxError::InvalidInput)
         );
     }
