@@ -101,6 +101,7 @@ def prepare(args: argparse.Namespace) -> None:
         write(overlay / "etc/apk/world", "alpine-base\nopenssl\nlinux-firmware-i915\nlinux-firmware-realtek\n")
         write(overlay / "etc/apk/repositories", f"http://{address}:{args.port}/apks/main\nhttp://{address}:{args.port}/apks/community\n")
         shutil.copyfile(REPO / "scripts/ci/n305-capture-payload.sh", overlay / "etc/n305-capture.sh")
+        shutil.copyfile(REPO / "scripts/ci/n305-capture-acpi.sh", overlay / "etc/n305-capture-acpi.sh")
         upload = f"http://{address}:{args.port}/upload/{token}"
         write(overlay / "etc/local.d/n305-capture.start", f'''#!/bin/sh
 export N305_CAPTURE_ROOT=/var/lib/n305-capture

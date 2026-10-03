@@ -91,3 +91,24 @@ guest 中 `dmesg | grep vt-input` 应显示 `seq=... source=... vt=... byte=0x..
 **真实来源仍未知，未修复。** 无记录时先确认 `/proc/cmdline` 的诊断参数，
 再确认是否确有接收字节；不能用无日志证明没有 NUL。仅记录首 64 字节，
 不要输入密码；收集结果后移除参数。不得先把所有 NUL 过滤掉掩盖来源。
+
+## 5. 更新后的 Alpine 采集（给 HD Audio 和电源键工作提供数据）
+
+按 `docs/design/n305-tonight.md` 的 capture 准备参数重新运行
+`scripts/n305-netboot.sh prepare --mode capture ...`，**重建 overlay，不能复用
+昨天的 payload**。生成脚本仍由用户 sudo 前台启动；已有接口恢复流程不变。
+用户确认上传到主机后查看：
+
+- `acpi/mcfg-decoded.txt` 应为 `0xc0000000`，seg 0，bus 00–ff。
+- `acpi/checksums.txt` 的 FACS 应为 `n/a`；其他 SDT 的 BAD 不会被隐藏。
+- `acpi/kernel-ecam.txt` 应明确来源：retained log 或 kernel /proc/iomem。
+  两者皆无时应是 UNAVAILABLE，不是假的成功或 grep FAIL。
+- `acpi/power-button-fadt.txt`：昨晚字节显示固定 PM1 电源键、SCI 9、
+  PM1a_EVT 0x1800、PM1a_CNT 0x1804；同时读 PNP0C0C 枚举文件，不用字符串
+  搜索 AML 来声称某设备不存在。
+- `audio/card*-codec#*.txt`：把含 `Codec:`、Vendor Id、Node/Pin 的报告交给 B。
+  逐个核对 capture-status.txt；发现节点或成功加载模块不等于取得 codec 数据。
+
+新 collector 未上真机。缺 codec 文件时先看 `audio/load-hda.txt` 和其 stderr，
+不要依据控制器 PCI ID 猜 codec。此轮 A5–A9 尚未实现，不打开看门狗，不写 U 盘，
+不声称 SCI/S5、通用 HID 或 DbC 已可用。

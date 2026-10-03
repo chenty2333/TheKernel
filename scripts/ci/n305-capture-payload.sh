@@ -386,65 +386,40 @@ for table in "$OUT"/acpi/tables/DSDT "$OUT"/acpi/tables/SSDT*; do
 	cap_sh "acpi/iasl/$name.dsl" "iasl -d -p '$OUT/acpi/iasl/$name' '$table' >/dev/null 2>&1; cat '$OUT/acpi/iasl/$name.dsl' 2>/dev/null"
 done
 
-# ACPI checksum audit: every table's bytes must sum to 0 mod 256.  A table
-# that fails this is evidence of a firmware bug and must not be trusted.
-if [ -d "$OUT/acpi/tables" ]; then
-	: > "$OUT/acpi/checksums.txt"
-	for table in "$OUT"/acpi/tables/*; do
-		[ -f "$table" ] || continue
-		sum=$(od -An -tu1 -v "$table" 2>/dev/null |
-			awk '{ for (i = 1; i <= NF; i++) total += $i } END { printf "%d", total % 256 }')
-		bytes=$(wc -c < "$table" | tr -d ' ')
-		if [ "$sum" = "0" ]; then
-			printf 'ok    %-10s %8s bytes\n' "$(basename "$table")" "$bytes" >> "$OUT/acpi/checksums.txt"
-		else
-			printf 'BAD   %-10s %8s bytes  (sum mod 256 = %s)\n' "$(basename "$table")" "$bytes" "$sum" >> "$OUT/acpi/checksums.txt"
-		fi
-	done
-	record OK acpi/checksums.txt ""
-fi
-
-# Independent MCFG decode.  struct acpi_table_mcfg is a 36-byte header plus 8
-# reserved bytes, so the allocation list starts at offset 44 and each entry is
-# 16 bytes: base address (u64 LE), PCI segment group (u16 LE), start bus (u8),
-# end bus (u8).  This is decoded with od and awk only, deliberately not with
-# the same code that writes the rest of the bundle.
+# The helper is deployed alongside this payload by both image builders.
+ACPI_DECODER="$(dirname -- "$0")/n305-capture-acpi.sh"
+cap acpi/checksums.txt sh "$ACPI_DECODER" audit "$OUT/acpi/tables"
 if [ -f "$OUT/acpi/tables/MCFG" ]; then
-	{
-		printf 'MCFG decoded from %s\n' "$OUT/acpi/tables/MCFG"
-		printf 'signature: %s\n' "$(od -An -tc -j0 -N4 "$OUT/acpi/tables/MCFG" | tr -d ' ')"
-		printf 'length:    %s bytes\n' "$(od -An -tu4 -j4 -N4 "$OUT/acpi/tables/MCFG" | tr -d ' ')"
-		printf 'revision:  %s\n' "$(od -An -tu1 -j8 -N1 "$OUT/acpi/tables/MCFG" | tr -d ' ')"
-		printf '\n'
-		printf 'allocation list (offset 44, 16 bytes per entry):\n'
-		od -An -tu1 -v -j44 "$OUT/acpi/tables/MCFG" |
-			awk '{
-				for (i = 1; i <= NF; i++) b[++n] = $i
-			} END {
-				entries = int(n / 16)
-				if (entries == 0) printf "  none\n"
-				for (e = 0; e < entries; e++) {
-					o = e * 16 + 1
-					base = 0
-					for (k = 7; k >= 0; k--) base = base * 256 + b[o + k]
-					segment = b[o + 8] + b[o + 9] * 256
-					printf "  entry %d: ecam_base=0x%x segment=%d bus=%02x-%02x\n", \
-						e, base, segment, b[o + 10], b[o + 11]
-				}
-			}'
-		printf '\n'
-		printf 'first allocation bytes (offset 44..59):\n'
-		od -An -tx1 -v -j44 -N16 "$OUT/acpi/tables/MCFG"
-	} > "$OUT/acpi/mcfg-decoded.txt"
-	record OK acpi/mcfg-decoded.txt ""
+    cap acpi/mcfg-decoded.txt sh "$ACPI_DECODER" mcfg "$OUT/acpi/tables/MCFG"
 else
-	record_file acpi/mcfg-decoded.txt UNAVAILABLE \
-		"no MCFG table: this machine does not advertise ECAM via ACPI"
+    record_file acpi/mcfg-decoded.txt UNAVAILABLE "no MCFG table advertised"
+fi
+if [ -f "$OUT/acpi/tables/FACP" ]; then
+    cap acpi/power-button-fadt.txt sh "$ACPI_DECODER" fadt "$OUT/acpi/tables/FACP"
+else
+    record_file acpi/power-button-fadt.txt UNAVAILABLE "no FADT table advertised"
+fi
+# Enumerated ACPI devices, not just an ASCII search in AML (EISA IDs can be encoded).
+if [ -d /sys/bus/acpi/devices ]; then
+    cap acpi/power-button-devices.txt sh "$ACPI_DECODER" power-devices /sys/bus/acpi/devices
+else
+    record_file acpi/power-button-devices.txt UNAVAILABLE "ACPI device enumeration absent"
 fi
 
 # The kernel's own interpretation, and the memory windows it derived from it.
-cap_sh acpi/kernel-ecam.txt "dmesg | grep -iE 'ECAM|MCFG|PCI:.*bus|pci_bus'"
-cap_sh proc/pci-windows.txt "grep -iE 'PCI Bus|PCI ECAM|PCIe' /proc/iomem"
+cap acpi/kernel-ecam-source.txt dmesg
+if sh "$ACPI_DECODER" kernel-ecam "$OUT/acpi/kernel-ecam-source.txt" /proc/iomem > "$OUT/acpi/kernel-ecam.txt" 2> "$OUT/acpi/kernel-ecam.txt.stderr"; then
+    record OK acpi/kernel-ecam.txt "kernel ECAM log or explicitly labelled iomem window"
+else
+    decoder_rc=$?
+    if [ "$decoder_rc" -eq 3 ]; then
+        record UNAVAILABLE acpi/kernel-ecam.txt "kernel does not retain an ECAM log/window"
+    else
+        record FAIL acpi/kernel-ecam.txt "decoder/read failed: $decoder_rc"
+    fi
+fi
+[ -s "$OUT/acpi/kernel-ecam.txt.stderr" ] || rm -f "$OUT/acpi/kernel-ecam.txt.stderr"
+cap_sh proc/pci-windows.txt "grep -iE 'PCI Bus|PCI ECAM|MMCONFIG|PCIe' /proc/iomem"
 
 # ---------------------------------------------------------------------------
 # Memory and I/O maps.
@@ -648,6 +623,33 @@ else
 			"neither /proc/config.gz nor a boot-media config file is available"
 	fi
 fi
+# HD Audio capture for the independent driver workstream. No codec is inferred
+# from the controller PCI ID. Loading the live Linux module is read-only w.r.t. disks.
+cap audio/load-hda.txt modprobe snd_hda_intel
+cap_file audio/cards.txt /proc/asound/cards
+cap_file audio/pcm.txt /proc/asound/pcm
+codec_count=0
+if sh "$ACPI_DECODER" codec-paths /proc/asound > "$OUT/audio/codec-paths.txt" 2> "$OUT/audio/codec-paths.txt.stderr"; then
+    record OK audio/codec-paths.txt "discovered codec nodes; per-file copies follow"
+    while IFS= read -r codec; do
+        codec_count=$((codec_count+1))
+        card=$(basename "$(dirname "$codec")")
+        cap_file "audio/$card-$(basename "$codec").txt" "$codec"
+    done < "$OUT/audio/codec-paths.txt"
+    printf 'Discovered %s codec nodes; see each audio/card*-codec#*.txt capture status\n' "$codec_count" > "$OUT/audio/codecs.txt"
+    record OK audio/codecs.txt "$codec_count codec nodes; per-file status is authoritative"
+else
+    decoder_rc=$?
+    if [ "$decoder_rc" -eq 3 ]; then
+        record_file audio/codecs.txt UNAVAILABLE "no /proc/asound/card*/codec#* after HDA probe; codec model unknown"
+        record UNAVAILABLE audio/codec-paths.txt "no codec nodes"
+    else
+        record_file audio/codecs.txt FAIL "codec enumeration/read failed: $decoder_rc"
+        record FAIL audio/codec-paths.txt "decoder failed: $decoder_rc"
+    fi
+fi
+[ -s "$OUT/audio/codec-paths.txt.stderr" ] || rm -f "$OUT/audio/codec-paths.txt.stderr"
+
 cap logs/dmesg.txt dmesg
 cap_file logs/dmesg-file.txt /var/log/dmesg
 cap_file logs/messages.txt /var/log/messages
@@ -667,12 +669,15 @@ cap_sh logs/kernel-warnings.txt "dmesg | grep -iE 'error|fail|warn|denied|unsupp
 	printf 'Payload:   version %s, sha256 %s\n\n' "$PAYLOAD_VERSION" "$(sha256sum "$0" 2>/dev/null | cut -d' ' -f1)"
 	printf 'This directory was written by a throwaway Alpine Linux live environment\n'
 	printf 'booted from the USB stick it lives on.  Nothing on the machine was\n'
-	printf 'modified: every probe reads the kernel, /sys, /proc or ACPI.\n\n'
+	printf 'persistently modified: probes read kernel/sysfs/proc/ACPI information;\n'
+	printf 'live Linux driver modules may be loaded for discovery.\n\n'
 	printf 'Start here:\n'
 	printf '  SUMMARY.txt          the headline facts, including the PCI ECAM base\n'
 	printf '  capture-status.txt   OK / FAIL / UNAVAILABLE for every single probe\n'
 	printf '  acpi/mcfg-decoded.txt  MCFG bytes decoded independently of any parser\n'
-	printf '  acpi/checksums.txt   ACPI table checksum audit\n'
+	printf '  acpi/checksums.txt   ACPI checksum audit (FACS is n/a)\n'
+	printf '  acpi/power-button-*.txt FADT button flags and PNP0C0C enumeration\n'
+	printf '  audio/card*-codec#*.txt  Linux HDA codec reports\n'
 	printf '  MANIFEST.sha256      hashes of every file in this bundle\n\n'
 	printf 'Reading it on the development host:\n'
 	printf '  copy the whole n305-<timestamp> directory (or the .tar.gz beside it)\n'
@@ -732,6 +737,10 @@ record OK README.txt ""
 	printf '\n== ACPI table integrity ==\n'
 	grep -c '^ok' "$OUT/acpi/checksums.txt" 2>/dev/null | sed 's/^/tables with a valid checksum: /'
 	grep '^BAD' "$OUT/acpi/checksums.txt" 2>/dev/null
+	printf '\n== ACPI power button ==\n'
+	cat "$OUT/acpi/power-button-fadt.txt" "$OUT/acpi/power-button-devices.txt" 2>/dev/null
+	printf '\n== HDA codecs ==\n'
+	cat "$OUT/audio/codecs.txt" 2>/dev/null
 	printf '\n== Probe status counts ==\n'
 	cut -f1 "$STATUS" | sort | uniq -c | sort -rn
 	printf '\n== Probes that failed or were unavailable ==\n'

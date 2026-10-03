@@ -383,6 +383,7 @@ mkdir -p "$WORK/apkovl/etc/local.d" "$WORK/apkovl/etc/runlevels/default"
 # because an apkovl was supplied.
 : > "$WORK/apkovl/etc/.default_boot_services"
 install -m 0755 "$PAYLOAD" "$WORK/apkovl/etc/local.d/n305-capture.start"
+install -m 0755 "$SCRIPT_DIR/n305-capture-acpi.sh" "$WORK/apkovl/etc/local.d/n305-capture-acpi.sh"
 ln -sf /etc/init.d/local "$WORK/apkovl/etc/runlevels/default/local"
 (
 	cd "$WORK/apkovl"
@@ -424,6 +425,7 @@ mcopy -i "$WORK/payload.fat" "$WORK/alpine.apkovl.tar.gz" ::/alpine.apkovl.tar.g
 mcopy -i "$WORK/payload.fat" "$WORK/apks/MANIFEST.sha256" ::/apks/MANIFEST.sha256
 mcopy -i "$WORK/payload.fat" "$WORK/apks/"*.apk ::/apks/
 mcopy -i "$WORK/payload.fat" "$PAYLOAD" ::/payload/n305-capture-payload.sh
+mcopy -i "$WORK/payload.fat" "$SCRIPT_DIR/n305-capture-acpi.sh" ::/payload/n305-capture-acpi.sh
 printf '%s\n' "$MARKER_TEXT" > "$WORK/$MARKER_NAME"
 mcopy -i "$WORK/payload.fat" "$WORK/$MARKER_NAME" ::/"$MARKER_NAME"
 
