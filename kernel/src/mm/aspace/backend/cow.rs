@@ -17,6 +17,7 @@ use axhal::{
     },
 };
 use axsync::Mutex;
+use hashbrown::HashMap;
 use kspin::SpinNoIrq;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
@@ -120,7 +121,7 @@ fn retire_cow_frame(paddr: PhysAddr, size: PageSize) {
 }
 
 struct FrameTableRefCount {
-    table: BTreeMap<(PhysAddr, usize), Arc<SpinNoIrq<FrameRefCnt>>>,
+    table: HashMap<(usize, usize), Arc<SpinNoIrq<FrameRefCnt>>>,
 }
 
 impl FrameTableRefCount {
@@ -128,7 +129,7 @@ impl FrameTableRefCount {
 
     const fn new() -> Self {
         Self {
-            table: BTreeMap::new(),
+            table: HashMap::new(),
         }
     }
 
@@ -137,30 +138,40 @@ impl FrameTableRefCount {
         paddr: PhysAddr,
         page_size: PageSize,
     ) -> Option<Arc<SpinNoIrq<FrameRefCnt>>> {
-        self.table.get(&(paddr, page_size as usize)).cloned()
+        self.table
+            .get(&(paddr.as_usize(), page_size as usize))
+            .cloned()
     }
 
     fn get_or_init_frame(
         &mut self,
         paddr: PhysAddr,
         page_size: PageSize,
-    ) -> Arc<SpinNoIrq<FrameRefCnt>> {
-        self.table
-            .entry((paddr, page_size as usize))
-            .or_insert_with(|| {
-                Arc::new(SpinNoIrq::new(FrameRefCnt {
-                    references: Self::INITIAL_CNT,
-                }))
-            })
-            .clone()
+    ) -> AxResult<Arc<SpinNoIrq<FrameRefCnt>>> {
+        let key = (paddr.as_usize(), page_size as usize);
+        if let Some(frame) = self.table.get(&key) {
+            return Ok(frame.clone());
+        }
+        // Both allocations happen before the caller publishes or protects a
+        // PTE.  In particular, a fork can roll back its earlier journal entries
+        // if capacity or Arc storage is unavailable for this frame.
+        self.table.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        let frame = Arc::try_new(SpinNoIrq::new(FrameRefCnt {
+            references: Self::INITIAL_CNT,
+        }))
+        .map_err(|_| AxError::NoMemory)?;
+        self.table.insert(key, frame.clone());
+        Ok(frame)
     }
 
     fn remove_frame(&mut self, paddr: PhysAddr, page_size: PageSize) {
         assert!(
-            self.table.contains_key(&(paddr, page_size as usize)),
+            self.table
+                .contains_key(&(paddr.as_usize(), page_size as usize)),
             "removing unreferenced frame"
         );
-        self.table.remove(&(paddr, page_size as usize));
+        self.table
+            .remove(&(paddr.as_usize(), page_size as usize));
     }
 }
 
@@ -866,14 +877,14 @@ fn clone_pages_transactionally<Ops, Pages, FrameRef>(
 where
     Ops: CowClonePageTableOps,
     Pages: ExactSizeIterator<Item = CowClonePage>,
-    FrameRef: FnMut(PhysAddr, PageSize) -> CowFrameOwner,
+    FrameRef: FnMut(PhysAddr, PageSize) -> AxResult<CowFrameOwner>,
 {
     let mut transaction = CowCloneTransaction::try_new(ops, pages.len())?;
     for page in pages {
         if page.eager_copy {
             transaction.copy_page(page)?;
         } else {
-            transaction.share_page(page, frame_ref(page.paddr, page.page_size))?;
+            transaction.share_page(page, frame_ref(page.paddr, page.page_size)?)?;
         }
     }
     transaction.commit();
@@ -923,12 +934,18 @@ impl CowBackend {
         self.materialized.store(true, Ordering::Relaxed);
     }
 
-    fn get_or_track_frame_ref(&self, paddr: PhysAddr, page_size: PageSize) -> CowFrameOwner {
+    fn get_or_track_frame_ref(
+        &self,
+        paddr: PhysAddr,
+        page_size: PageSize,
+    ) -> AxResult<CowFrameOwner> {
         let mut registry = FRAME_TABLE.lock();
         if let Some(backing) = demoted_huge_backing(paddr) {
-            CowFrameOwner::Demoted(backing)
+            Ok(CowFrameOwner::Demoted(backing))
         } else {
-            CowFrameOwner::Ordinary(registry.get_or_init_frame(paddr, page_size))
+            registry
+                .get_or_init_frame(paddr, page_size)
+                .map(CowFrameOwner::Ordinary)
         }
     }
 
@@ -1836,6 +1853,21 @@ mod tests {
     use crate::pseudofs::tmp::MemoryFs;
 
     #[test]
+    fn frame_reference_table_reuses_the_fallibly_inserted_owner() {
+        let mut table = FrameTableRefCount::new();
+        let frame = PhysAddr::from(0x3000_0000);
+        let first = table
+            .get_or_init_frame(frame, PageSize::Size4K)
+            .unwrap();
+        let second = table
+            .get_or_init_frame(frame, PageSize::Size4K)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(table.table.len(), 1);
+        assert_eq!(first.lock().references, FrameTableRefCount::INITIAL_CNT);
+    }
+
+    #[test]
     fn demoted_backing_migrates_three_fork_owners_and_releases_real_2m() {
         let base = alloc_frame(false, PageSize::Size2M).unwrap();
         let Backend::Cow(backend) = Backend::new_alloc(VirtAddr::from(0x4000), PageSize::Size2M)
@@ -1844,10 +1876,12 @@ mod tests {
         };
         let first = backend
             .get_or_track_frame_ref(base, PageSize::Size2M)
+            .unwrap()
             .retain(base, PageSize::Size2M)
             .unwrap();
         let second = backend
             .get_or_track_frame_ref(base, PageSize::Size2M)
+            .unwrap()
             .retain(base, PageSize::Size2M)
             .unwrap();
         register_demoted_huge_backing(base, PageSize::Size2M).unwrap();
@@ -1866,6 +1900,7 @@ mod tests {
         assert_eq!(backing.mapped_units.load(Ordering::Acquire), 512);
         let child = backend
             .get_or_track_frame_ref(base, PageSize::Size4K)
+            .unwrap()
             .retain(base, PageSize::Size4K)
             .unwrap();
         assert!(matches!(child, CowFrameOwner::Demoted(_)));
@@ -2304,7 +2339,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, 3);
         assert_eq!(
             clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-                frame_refs.get(&paddr).unwrap().clone().into()
+                Ok(frame_refs.get(&paddr).unwrap().clone().into())
             }),
             Err(AxError::NoMemory)
         );
@@ -2362,7 +2397,7 @@ mod tests {
 
         assert_eq!(
             clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-                frame_refs.get(&paddr).unwrap().clone().into()
+                Ok(frame_refs.get(&paddr).unwrap().clone().into())
             }),
             Err(AxError::NoMemory)
         );
@@ -2395,7 +2430,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, usize::MAX);
 
         clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-            frame_refs.get(&paddr).unwrap().clone().into()
+            Ok(frame_refs.get(&paddr).unwrap().clone().into())
         })
         .unwrap();
 
@@ -2426,7 +2461,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, usize::MAX);
 
         clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-            frame_refs.get(&paddr).unwrap().clone().into()
+            Ok(frame_refs.get(&paddr).unwrap().clone().into())
         })
         .unwrap();
 
@@ -2458,7 +2493,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, usize::MAX);
 
         clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-            frame_refs.get(&paddr).unwrap().clone().into()
+            Ok(frame_refs.get(&paddr).unwrap().clone().into())
         })
         .unwrap();
 
@@ -2488,7 +2523,7 @@ mod tests {
 
         assert_eq!(
             clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-                frame_refs.get(&paddr).unwrap().clone().into()
+                Ok(frame_refs.get(&paddr).unwrap().clone().into())
             }),
             Err(AxError::NoMemory)
         );
@@ -2521,7 +2556,7 @@ mod tests {
 
         assert_eq!(
             clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-                frame_refs.get(&paddr).unwrap().clone().into()
+                Ok(frame_refs.get(&paddr).unwrap().clone().into())
             }),
             Err(AxError::BadAddress)
         );
