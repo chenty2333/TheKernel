@@ -97,7 +97,8 @@ impl BtrfsSuperblock {
     }
     /// Decodes a complete 4 KiB superblock after checking its checksum,
     /// magic, address, geometry, and selected checksum type.  Invalid media
-    /// is `EIO`; an unsupported future checksum is `EOPNOTSUPP`.
+    /// is `EIO`; an unsupported checksum type is `EINVAL`, matching Linux's
+    /// validation order before checksum verification.
     pub fn decode(bytes: &[u8], expected_bytenr: u64) -> AxResult<Self> {
         if bytes.len() != BTRFS_SUPERBLOCK_SIZE {
             return Err(AxError::Io);
@@ -105,6 +106,10 @@ impl BtrfsSuperblock {
         if &bytes[MAGIC_OFFSET..MAGIC_OFFSET + MAGIC.len()] != MAGIC {
             return Err(AxError::Io);
         }
+        let csum_type = match le16(bytes, 0xc4)? {
+            0 => ChecksumType::Crc32c,
+            _ => return Err(AxError::InvalidInput),
+        };
         let on_disk_checksum = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         if on_disk_checksum != crc32c(&bytes[CHECKSUM_BYTES..]) {
             return Err(AxError::Io);
@@ -113,10 +118,6 @@ impl BtrfsSuperblock {
         if bytenr != expected_bytenr {
             return Err(AxError::Io);
         }
-        let csum_type = match le16(bytes, 0xc4)? {
-            0 => ChecksumType::Crc32c,
-            _ => return Err(AxError::Unsupported),
-        };
         let sectorsize = le32(bytes, 0x90)?;
         let nodesize = le32(bytes, 0x94)?;
         let leafsize = le32(bytes, 0x98)?;
@@ -423,6 +424,16 @@ mod tests {
         assert_eq!(
             BtrfsSuperblock::decode(&superblock_with_log_level(BTRFS_MAX_LEVEL), 0x1_0000).err(),
             Some(AxError::Io)
+        );
+    }
+
+    #[test]
+    fn unsupported_superblock_checksum_is_reported_before_crc_validation() {
+        let mut image = superblock_with_log_level(0);
+        image[0xc4..0xc6].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            BtrfsSuperblock::decode(&image, 0x1_0000).err(),
+            Some(AxError::InvalidInput)
         );
     }
 }
