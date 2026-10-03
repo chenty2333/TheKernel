@@ -296,3 +296,14 @@ class CommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class NvmeTopologyTests(unittest.TestCase):
+    def test_nvme_coexists_with_existing_disks(self):
+        command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"), direct_kernel=True,
+            extra_block=Drive(Path("extra.img"), "rw"), usb_disk=Drive(Path("usb.img"), "rw"),
+            nvme_disk=Drive(Path("nvme,a.img"), "readonly"))
+        self.assertIn("nvme,drive=nvme-disk,serial=TK-NVME-TEST,max_ioqpairs=4", command)
+        self.assertTrue(any("nvme,,a.img" in value and "readonly=on" in value for value in command))
+        self.assertTrue(any("virtio-blk-pci" in value for value in command))
+        self.assertTrue(any("usb-storage" in value for value in command))

@@ -906,14 +906,18 @@ fn init_filesystems_with_root_mode(
             dev.device_name(),
             extra_device_name(index)
         );
+        let read_only = axdriver::block_device_is_read_only(&dev);
+        let name = if dev.device_name().starts_with("nvme") {
+            String::from(dev.device_name())
+        } else { extra_device_name(index) };
         let device = SharedBlockDevice::new(dev);
         extras.push(RegisteredBlockDevice {
-            name: extra_device_name(index),
+            name,
             info: BlockDeviceInfo {
                 num_blocks: device.num_blocks(),
                 block_size: device.block_size(),
             },
-            read_only: AtomicBool::new(false),
+            read_only: AtomicBool::new(read_only),
             mounted: Arc::new(AtomicBool::new(false)),
             device,
         });

@@ -3,6 +3,8 @@
 // is first so that a build which asks for it by name gets it, while a build
 // that only asks for `virtio-net` (the product default) never sees it.
 const NET_DEV_FEATURES: &[&str] = &["n305-net", "rtl8125", "igc", "ixgbe", "virtio-net"];
+// NVMe, like USB, is an independent StaticBlockDevice variant, not an
+// alternative to Existing; enabling it preserves the selected virtio-blk.
 const BLOCK_DEV_FEATURES: &[&str] = &["ramdisk", "virtio-blk"];
 const DISPLAY_DEV_FEATURES: &[&str] = &["virtio-gpu"];
 const INPUT_DEV_FEATURES: &[&str] = &["virtio-input"];

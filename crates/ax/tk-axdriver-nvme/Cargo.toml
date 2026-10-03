@@ -1,0 +1,16 @@
+[package]
+name = "tk-axdriver-nvme"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+axdriver_block = { package = "tk-axdriver-block", path = "../tk-axdriver-block" }
+
+[package.metadata.thekernel]
+layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true

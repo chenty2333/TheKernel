@@ -266,6 +266,7 @@ def kernel_features(artifacts: Artifacts) -> str:
     # runtime no-op, so a single product ELF still boots on non-Intel and
     # virtualized machines.
     features = [PRODUCT_FEATURE]
+    features.append("nvme")
     if artifacts.profile == "shell":
         features.append("boot-shell")
     if variant.asid_fast_switch:
@@ -534,6 +535,8 @@ class RunSpec:
     commands: Path | None
     extra_block: Path | None
     run_cpus: int
+    nvme_disk: Path | None = None
+    kernel_args: str = ""
     usb_disk: Path | None = None
     input_backend: str = "virtio"
     qemu_debug: str | None = None
@@ -585,6 +588,23 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
         run_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise ProductError(f"cannot create run directory: {error}") from error
+    if spec.kernel_args:
+        if not re.fullmatch(r"[A-Za-z0-9_.=,:/+ -]+", spec.kernel_args):
+            raise ProductError("kernel arguments must be plain GRUB tokens")
+        copied_esp = run_dir / "kernel-args-esp.img"
+        grub_source = REPO_ROOT / "config/x86_64" / ("grub.cfg" if spec.rootfs_transport == "module" else "grub-drive.cfg")
+        grub = grub_source.read_text().replace("multiboot2 /TheKernel.elf", "multiboot2 /TheKernel.elf " + spec.kernel_args)
+        grub_path = run_dir / "grub-args.cfg"
+        grub_path.write_text(grub)
+        command = ["bash", str(REPO_ROOT / "scripts/build-x86-uefi-esp.sh"),
+                   "--kernel", str(artifacts.kernel), "--output", str(copied_esp),
+                   "--grub-config", str(grub_path)]
+        if spec.rootfs_transport == "module":
+            command.extend(["--rootfs", str(selected_rootfs)])
+        else:
+            command.extend(["--mode", "multiboot-drive"])
+        run_checked(command)
+        selected_esp = copied_esp
     if spec.gdb:
         print(f"GDB socket: {run_dir / 'gdb.sock'}", file=sys.stderr, flush=True)
     interactive = spec.interactive
@@ -624,6 +644,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             rootfs_transport=spec.rootfs_transport,
             esp=selected_esp,
             extra_block=spec.extra_block.expanduser().resolve() if spec.extra_block else None,
+            nvme_disk=spec.nvme_disk.expanduser().resolve() if spec.nvme_disk else None,
             usb_disk=spec.usb_disk.expanduser().resolve() if spec.usb_disk else None,
             input_backend=spec.input_backend,
             input_path=command_path,
@@ -845,6 +866,8 @@ def run_cmd(args: argparse.Namespace) -> int:
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
             extra_block=Path(args.extra_block) if args.extra_block else None,
+            nvme_disk=Path(args.nvme_disk) if args.nvme_disk else None,
+            kernel_args=args.kernel_args,
             usb_disk=Path(args.usb_disk) if args.usb_disk else None,
             input_backend=args.input_backend,
             rootfs=rootfs,
@@ -1554,6 +1577,8 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--input-after-marker")
     parser.add_argument("--stop-after-marker")
     parser.add_argument("--extra-block")
+    parser.add_argument("--nvme-disk", help="attach a disposable image as NVMe; guest writes remain disabled by default")
+    parser.add_argument("--kernel-args", default="", help="explicit additional boot parameters in a run-local ESP copy")
     parser.add_argument("--usb-disk", help="attach an existing writable image as USB mass storage")
     parser.add_argument("--input-backend", choices=("virtio", "usb"), default="virtio",
                         help="select VirtIO input or xHCI USB keyboard and mouse")

@@ -3240,6 +3240,7 @@ dependencies = [
  "tk-axdriver-display",
  "tk-axdriver-input",
  "tk-axdriver-net",
+ "tk-axdriver-nvme",
  "tk-axdriver-pci",
  "tk-axdriver-virtio",
  "tk-axdriver-vsock",
@@ -3287,6 +3288,13 @@ dependencies = [
  "log",
  "spin 0.9.9",
  "tk-axdriver-base",
+]
+
+[[package]]
+name = "tk-axdriver-nvme"
+version = "0.1.0"
+dependencies = [
+ "tk-axdriver-block",
 ]
 
 [[package]]

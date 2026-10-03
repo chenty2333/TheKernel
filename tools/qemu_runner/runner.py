@@ -195,6 +195,8 @@ class RunConfig:
     rootfs_transport: RootfsTransport = "drive"
     extra_block: Path | None = None
     extra_block_mode: DriveMode = "rw"
+    nvme_disk: Path | None = None
+    nvme_disk_mode: DriveMode = "rw"
     usb_disk: Path | None = None
     usb_disk_mode: DriveMode = "rw"
     input_backend: str = "virtio"
@@ -391,6 +393,7 @@ def run(
     workdir = config.workdir.expanduser().resolve()
     rootfs_mode = _validate_mode("rootfs", config.rootfs_mode)
     extra_mode = _validate_mode("extra-block", config.extra_block_mode)
+    nvme_mode = _validate_mode("NVMe disk", config.nvme_disk_mode)
     usb_mode = _validate_mode("usb-disk", config.usb_disk_mode)
     initrd = _initrd_from_extra_args(config.extra_args)
     input_path = None
@@ -454,6 +457,8 @@ def run(
         else None
     )
 
+    nvme_disk = (_plan_drive(config.nvme_disk, mode=nvme_mode, label="NVMe disk")
+                 if config.nvme_disk is not None else None)
     usb_disk = (
         _plan_drive(config.usb_disk, mode=usb_mode, label="USB disk")
         if config.usb_disk is not None else None
@@ -506,6 +511,8 @@ def run(
         run_input_paths.append(ovmf_vars_source)
     if extra_block is not None:
         run_input_paths.append(extra_block.path)
+    if nvme_disk is not None:
+        run_input_paths.append(nvme_disk.path)
     if usb_disk is not None:
         run_input_paths.append(usb_disk.path)
     if qemu_executable is not None:
@@ -575,6 +582,11 @@ def run(
             )
             opened_fds.append(extra_fd)
             qemu_extra_block = Drive(path=qemu_extra_path, mode=extra_block.mode)
+        qemu_nvme_disk = None
+        if nvme_disk is not None:
+            nvme_fd, nvme_path = _open_qemu_input(nvme_disk.path, label="NVMe disk", writable=nvme_disk.mode == "rw")
+            opened_fds.append(nvme_fd)
+            qemu_nvme_disk = Drive(path=nvme_path, mode=nvme_disk.mode)
         qemu_usb_disk = None
         if usb_disk is not None:
             usb_fd, qemu_usb_path = _open_qemu_input(
@@ -612,6 +624,7 @@ def run(
             rootfs=qemu_rootfs,
             extra_block=qemu_extra_block,
             usb_disk=qemu_usb_disk,
+            nvme_disk=qemu_nvme_disk,
             input_backend=config.input_backend,
             esp=qemu_esp,
             ovmf_code=qemu_ovmf_code,

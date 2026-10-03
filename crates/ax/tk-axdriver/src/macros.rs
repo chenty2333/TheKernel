@@ -50,6 +50,11 @@ macro_rules! for_each_drivers {
         #[allow(unused_imports)]
         use crate::virtio::{self, VirtIoDevMeta};
 
+        #[cfg(feature = "nvme")]
+        {
+            type $drv_type = crate::nvme::NvmeDriver;
+            $code
+        }
         #[cfg(feature = "virtio-rng")]
         {
             type $drv_type = virtio::VirtIoEntropyDriver;

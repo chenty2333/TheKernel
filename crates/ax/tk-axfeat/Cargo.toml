@@ -11,6 +11,7 @@ homepage = "https://github.com/arceos-org/arceos"
 repository.workspace = true
 
 [features]
+driver-nvme = ["axdriver?/nvme"]
 default = []
 
 alloc = ["axalloc", "axruntime/alloc"]

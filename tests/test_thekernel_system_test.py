@@ -43,8 +43,8 @@ class SystemTestGateTests(unittest.TestCase):
             artifacts.append(product.Artifacts(Path("/unused"), product.parse_variant(args), args.profile))
         self.assertEqual(len({item.output_dir for item in artifacts}), 4)
         self.assertEqual(len({item.cargo_target_dir for item in artifacts}), 4)
-        self.assertEqual(product.kernel_features(artifacts[0]), "x86-product boot-shell")
-        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product boot-shell io-submit-batch")
+        self.assertEqual(product.kernel_features(artifacts[0]), "x86-product nvme boot-shell")
+        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product nvme boot-shell io-submit-batch")
         self.assertEqual(product.kernel_features(artifacts[2]), product.kernel_features(artifacts[3]))
         self.assertEqual(product.kernel_features(artifacts[3]).split().count("io-submit-batch"), 1)
 
@@ -57,9 +57,9 @@ class SystemTestGateTests(unittest.TestCase):
             artifacts.append(product.Artifacts(Path("/unused"), product.parse_variant(args), args.profile))
         self.assertEqual(len({item.output_dir for item in artifacts}), 4)
         self.assertEqual(len({item.cargo_target_dir for item in artifacts}), 4)
-        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product boot-shell io-notify-fastpath")
+        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product nvme boot-shell io-notify-fastpath")
         self.assertEqual(product.kernel_features(artifacts[3]),
-                         "x86-product boot-shell io-submit-batch io-notify-fastpath")
+                         "x86-product nvme boot-shell io-submit-batch io-notify-fastpath")
 
     def test_candidate_flags_cannot_replace_io_or_graphics_benchmark_baseline(self) -> None:
         product = load_product()
@@ -730,7 +730,7 @@ class SystemTestGateTests(unittest.TestCase):
         args = product.build_parser().parse_args(["build"])
         self.assertEqual(
             product.kernel_features(product.Artifacts(Path("state"), product.parse_variant(args))),
-            "x86-product",
+            "x86-product nvme",
         )
 
     def test_product_feature_combines_variant_features_without_repeating_baseline(self) -> None:
@@ -741,7 +741,7 @@ class SystemTestGateTests(unittest.TestCase):
 
         self.assertEqual(
             product.kernel_features(product.Artifacts(Path("state"), product.parse_variant(args), args.profile)),
-            "x86-product boot-shell asid-fast-switch",
+            "x86-product nvme boot-shell asid-fast-switch",
         )
 
     def test_product_defaults_and_compile_time_network_match_q35_gate(self) -> None:

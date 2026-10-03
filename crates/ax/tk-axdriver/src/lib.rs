@@ -193,6 +193,8 @@ pub fn activate_boot_pci_input_devices<Register, Unregister>(
 /// Returns whether a block device is immutable boot media.
 #[cfg(all(feature = "block", not(feature = "dyn")))]
 pub fn block_device_is_read_only(device: &AxBlockDevice) -> bool {
+    #[cfg(feature = "nvme")]
+    if let StaticBlockDevice::Nvme(nvme) = device { return nvme.read_only(); }
     matches!(device, StaticBlockDevice::BootModule(_))
 }
 
@@ -615,3 +617,6 @@ pub fn init_drivers() -> AllDevices {
 
     all_devs
 }
+
+#[cfg(feature = "nvme")]
+mod nvme;
