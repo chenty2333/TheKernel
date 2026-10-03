@@ -477,6 +477,15 @@ pub fn activate(location: Location, flags: i32) -> AxResult<()> {
 /// Removes an inactive-only area.  A non-empty area is never torn down: that
 /// is the rollback boundary until anonymous-page migration is complete.
 pub fn deactivate(location: &Location) -> AxResult<()> {
+    // Linux opens the active backing with O_RDWR before changing swap state.
+    // Keep every filesystem/provider write-open check before the draining
+    // admission so a failed open leaves all PTEs and slots untouched.
+    let _swapoff_open = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open_loc(location.clone())?
+        .into_file()?;
+
     let (key, id) = {
         let mut swaps = SWAPS.lock();
         let key = swaps
@@ -815,6 +824,31 @@ mod tests {
         read(entry, &mut observed).unwrap();
         assert_eq!(observed, contents);
         release(entry).unwrap();
+        deactivate(&location).unwrap();
+        assert!(!active_area(&location).unwrap());
+    }
+
+    #[test]
+    fn swapoff_write_open_failure_leaves_the_area_untouched() {
+        let _context = crate::test_support::scheduler_test_context();
+        let location = make_swap_file();
+        activate(location.clone(), 0).unwrap();
+
+        // Simulate an active swap file whose write-open check now fails.
+        // Failed swapoff must not leave the area draining or release slots.
+        location
+            .entry()
+            .set_file_attr(FileAttr {
+                xflags: 0x8,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(deactivate(&location).is_err());
+        assert!(active_area(&location).unwrap());
+        let (key, slot) = allocate_slot().unwrap();
+        release_slot(&key, slot).unwrap();
+
+        location.entry().set_file_attr(FileAttr::default()).unwrap();
         deactivate(&location).unwrap();
         assert!(!active_area(&location).unwrap());
     }

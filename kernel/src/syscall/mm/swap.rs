@@ -78,6 +78,15 @@ pub fn sys_swapoff<M: UserMemory + ?Sized>(
     specialfile: *const c_char,
 ) -> AxResult<isize> {
     admin()?;
-    deactivate(&resolve(memory, specialfile)?)?;
+    let location = resolve(memory, specialfile)?;
+    let security = VfsSecurityContext::new(current().as_thread().current_cred());
+    check_open_permissions_with_security(
+        &location,
+        O_RDWR,
+        security.actor(),
+        security.credentials(),
+        security.filesystem_owner_user_ns(),
+    )?;
+    deactivate(&location)?;
     Ok(0)
 }
