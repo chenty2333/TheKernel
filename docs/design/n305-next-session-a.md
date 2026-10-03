@@ -52,3 +52,19 @@ udhcpc -i eth0 -n -q
 A2 详细日志卡住、A3 VT 的 NUL 来源、A4 采集脚本，以及 A5–A9 的看门狗、
 ACPI 电源、USB 启动、通用 HID、DbC 尚未在此检查单中列为已实现/已通过。
 后续实现会在同一文件追加各自的可执行验证步骤。
+
+## 3. 详细日志问题：仍须真机定位
+
+QEMU 的 4/8 核 loglevel=7 和 8 核 quiet 均进 shell，TCG 的实际 framebuffer
+文字检查通过；没有复现真机停顿，**没有根因修复**。本地复现命令：
+
+```sh
+python3 tools/thekernel.py run --platform n305 --profile shell --smp 8 \
+  --accel kvm --graphics-profile firmware-fb --kernel-cmdline loglevel=7
+```
+
+PXE 时通过 `n305-netboot.py prepare` 的既有参数配置 GRUB；run 的追加选项
+只影响本地单次 QEMU ESP，不会自动改 PXE 目录。先跑 quiet 建立可用网络，
+再比 loglevel=7。屏幕再次停在 alarm 时，检查主机是否仍有 guest DHCP/UDP
+日志或 shell 网络活动；记录停顿位置和 elapsed 时间。网络未起来不能倒推
+整机死锁；硬件停顿原因未明前保留 quiet 退路，不盲改屏幕锁。

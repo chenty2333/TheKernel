@@ -563,6 +563,7 @@ class RunSpec:
     graphics_width: int = 800
     graphics_height: int = 600
     audio_backend: str | None = None
+    kernel_cmdline: str | None = None
 
 
 @isolated_run
@@ -619,6 +620,25 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             checkpoints=spec.qmp_checkpoints,
             timeout_secs=spec.qmp_timeout_secs,
         )
+    if spec.kernel_cmdline is not None:
+        from tools.kernel_cmdline import append_kernel_cmdline
+        template_name = "grub.cfg" if spec.rootfs_transport == "module" else "grub-drive.cfg"
+        try:
+            grub_text = append_kernel_cmdline(
+                (REPO_ROOT / "config" / "x86_64" / template_name).read_text(), spec.kernel_cmdline)
+        except ValueError as error:
+            raise ProductError(str(error)) from error
+        grub_config = run_dir / "grub-cmdline.cfg"
+        grub_config.write_text(grub_text)
+        selected_esp = run_dir / "kernel-cmdline.esp"
+        esp_command = ["bash", str(REPO_ROOT / "scripts" / "build-x86-uefi-esp.sh"),
+                       "--kernel", str(artifacts.kernel), "--output", str(selected_esp),
+                       "--grub-config", str(grub_config)]
+        if spec.rootfs_transport == "module":
+            esp_command.extend(("--rootfs", str(selected_rootfs)))
+        else:
+            esp_command.extend(("--mode", "multiboot-drive"))
+        run_checked(esp_command, env=command_env(artifacts))
     result = run(
         RunConfig(
             arch="x86_64",
@@ -844,6 +864,7 @@ def run_cmd(args: argparse.Namespace) -> int:
             graphics_width=width,
             graphics_height=height,
             audio_backend=getattr(args, "audio_backend", None),
+            kernel_cmdline=getattr(args, "kernel_cmdline", None),
             input_after_marker=input_after_marker,
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
@@ -1053,6 +1074,7 @@ def _run_fbcon_boot(args: argparse.Namespace, artifacts: Artifacts, directory: P
         artifacts,
         RunSpec(
             accel=args.accel,
+            kernel_cmdline=getattr(args, "kernel_cmdline", None),
             timeout=args.timeout,
             qemu_debug=getattr(args, "qemu_debug", None),
             workdir=directory,
@@ -1543,6 +1565,7 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--gdb", action="store_true",
                         help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")
     parser.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
+    parser.add_argument("--kernel-cmdline", help="append literal kernel arguments to a per-run GRUB config")
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--width", type=int, default=800, help="guest display width in pixels")
     parser.add_argument("--height", type=int, default=600, help="guest display height in pixels")
@@ -1767,6 +1790,8 @@ def suite_default_timeout(suite: str) -> float:
 
 
 def test_cmd(args: argparse.Namespace) -> int:
+    if getattr(args, "kernel_cmdline", None) is not None and args.suite != "fbcon":
+        raise ProductError("test --kernel-cmdline is currently supported only for --suite fbcon")
     # `fbcon` is deliberately not part of `all`: it asserts on a firmware
     # framebuffer and therefore fixes the graphics profile and the screenshot
     # path, which the other suites select independently.  Run it as
@@ -2160,6 +2185,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="suite to run; fbcon requires --accel tcg (use graphics for KVM)",
     )
     test.add_argument("--run-cpus", type=int)
+    test.add_argument("--kernel-cmdline", help="fbcon only: append literal boot arguments")
     test.add_argument("--allow-skip", action="store_true")
     test.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
     test.add_argument("--gdb", action="store_true",
