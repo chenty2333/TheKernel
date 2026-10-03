@@ -1,4 +1,5 @@
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use axerrno::{AxError, AxResult};
 use axsync::Mutex;
@@ -6,6 +7,7 @@ use axsync::Mutex;
 /// Native `BTRFS_TREE_LOG_OBJECTID` (`-6LL`) represented in unsigned tree
 /// keys and tree-block headers.
 pub const TREE_LOG_OBJECTID: u64 = (-6_i64) as u64;
+static NEXT_BTRFS_CORE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Btrfs tree identity.  The numeric representation follows the on-media
 /// object ID domain but is deliberately typed so a caller cannot accidentally
@@ -105,11 +107,13 @@ struct StagedLog {
 /// generation publication, delayed-ref validation, qgroup admission, and a
 /// replayable tree-log boundary before any VFS namespace entry is exposed.
 pub struct BtrfsCore {
+    identity: u64,
     state: Mutex<State>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalLease {
+    core_identity: u64,
     id: u64,
     generation: u64,
 }
@@ -134,7 +138,11 @@ impl BtrfsCore {
         if generation == 0 {
             return Err(AxError::InvalidInput);
         }
+        let identity = NEXT_BTRFS_CORE_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| AxError::NoMemory)?;
         Ok(Arc::try_new(Self {
+            identity,
             state: Mutex::new(State {
                 generation,
                 trees: BTreeMap::new(),
@@ -167,10 +175,17 @@ impl BtrfsCore {
         state.next_logical_lease = id.checked_add(1).ok_or(AxError::NoMemory)?;
         let generation = state.generation;
         state.logical_leases.insert(id, (generation, Vec::new()));
-        Ok(LogicalLease { id, generation })
+        Ok(LogicalLease {
+            core_identity: self.identity,
+            id,
+            generation,
+        })
     }
 
     pub fn claim_logical_range(&self, lease: LogicalLease, logical: u64, len: u64) -> AxResult<()> {
+        if lease.core_identity != self.identity {
+            return Err(AxError::BadState);
+        }
         let end = logical.checked_add(len).ok_or(AxError::InvalidInput)?;
         let mut state = self.state.lock();
         if state.generation != lease.generation {
@@ -210,6 +225,9 @@ impl BtrfsCore {
         logical: u64,
         len: u64,
     ) -> AxResult<()> {
+        if lease.core_identity != self.identity {
+            return Err(AxError::BadState);
+        }
         let mut state = self.state.lock();
         let (_, ranges) = state
             .logical_leases
@@ -224,6 +242,9 @@ impl BtrfsCore {
     }
 
     pub fn end_logical_lease(&self, lease: LogicalLease) -> AxResult<()> {
+        if lease.core_identity != self.identity {
+            return Err(AxError::BadState);
+        }
         let mut state = self.state.lock();
         let (_, ranges) = state
             .logical_leases
@@ -830,6 +851,38 @@ mod tests {
         assert_eq!(transaction.commit_after_persist(), Err(AxError::NoMemory));
         assert_eq!(core.generation(), u64::MAX);
         assert_eq!(core.item(TreeId::Fs, key), None);
+    }
+
+    #[test]
+    fn logical_lease_rejects_cross_core_operations_with_colliding_local_ids() {
+        let left = BtrfsCore::new(1).unwrap();
+        let right = BtrfsCore::new(1).unwrap();
+        let left_lease = left.begin_logical_lease().unwrap();
+        let right_lease = right.begin_logical_lease().unwrap();
+        assert_eq!(left_lease.id, right_lease.id);
+        assert_eq!(left_lease.generation, right_lease.generation);
+        left.claim_logical_range(left_lease, 0x1000, 0x1000)
+            .unwrap();
+        right
+            .claim_logical_range(right_lease, 0x2000, 0x1000)
+            .unwrap();
+
+        assert_eq!(
+            left.claim_logical_range(right_lease, 0x3000, 0x1000),
+            Err(AxError::BadState)
+        );
+        assert_eq!(
+            left.release_logical_range(right_lease, 0x1000, 0x1000),
+            Err(AxError::BadState)
+        );
+        assert_eq!(left.end_logical_lease(right_lease), Err(AxError::BadState));
+        assert_eq!(
+            left.claim_logical_range(left_lease, 0x1800, 0x100),
+            Err(AxError::InvalidInput)
+        );
+        left.release_logical_range(left_lease, 0x1000, 0x1000)
+            .unwrap();
+        left.end_logical_lease(left_lease).unwrap();
     }
 }
 
