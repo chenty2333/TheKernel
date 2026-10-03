@@ -3238,6 +3238,7 @@ dependencies = [
  "tk-axdriver-base",
  "tk-axdriver-block",
  "tk-axdriver-display",
+ "tk-axdriver-hda",
  "tk-axdriver-input",
  "tk-axdriver-net",
  "tk-axdriver-nvme",
@@ -3269,6 +3270,13 @@ version = "0.1.0"
 dependencies = [
  "tk-axdriver-base",
  "tk-axgpu",
+]
+
+[[package]]
+name = "tk-axdriver-hda"
+version = "0.1.0"
+dependencies = [
+ "tk-axdriver-base",
 ]
 
 [[package]]

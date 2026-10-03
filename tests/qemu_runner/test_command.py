@@ -307,3 +307,13 @@ class NvmeTopologyTests(unittest.TestCase):
         self.assertTrue(any("nvme,,a.img" in value and "readonly=on" in value for value in command))
         self.assertTrue(any("virtio-blk-pci" in value for value in command))
         self.assertTrue(any("usb-storage" in value for value in command))
+
+class HdaTopologyTests(unittest.TestCase):
+    def test_hda_wav_is_distinct_from_virtio_sound(self):
+        command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),
+            rootfs=None, direct_kernel=True, audio_device="hda",
+            audio_backend="wav", audio_path=Path("audio.wav"))
+        self.assertIn("ich9-intel-hda", command)
+        self.assertIn("hda-duplex,audiodev=hda-audio", command)
+        self.assertFalse(any("virtio-sound" in value for value in command))
+        self.assertTrue(any("out.frequency=48000,out.channels=2,out.format=s16" in value for value in command))

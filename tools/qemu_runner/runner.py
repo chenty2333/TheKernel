@@ -209,6 +209,7 @@ class RunConfig:
     graphics_profile: GraphicsProfile = "headless"
     graphics_width: int = 800
     graphics_height: int = 600
+    audio_device: str = "virtio"
     audio_backend: str | None = None
     qmp: QmpControls = QmpControls()
     extra_args: tuple[str, ...] = ()
@@ -638,6 +639,7 @@ def run(
             graphics_width=config.graphics_width,
             graphics_height=config.graphics_height,
             audio_backend=config.audio_backend,
+            audio_device=config.audio_device,
             audio_path=audio_path,
             qmp_socket=qmp_socket,
             diagnostic_log_path=diagnostic_log_path,

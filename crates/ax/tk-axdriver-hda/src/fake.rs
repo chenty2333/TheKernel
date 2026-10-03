@@ -1,0 +1,203 @@
+use alloc::vec;
+
+use crate::{
+    codec::{Widget, find_route},
+    desc::{BufferDescriptor, verb},
+};
+fn widget(node: u8, kind: u32, connections: alloc::vec::Vec<u8>) -> Widget {
+    Widget {
+        node,
+        caps: (kind << 20) | 1,
+        pin_caps: 16,
+        config: 0,
+        connections,
+    }
+}
+#[test]
+fn graph_selects_converter_without_codec_id() {
+    let nodes = vec![
+        widget(2, 0, vec![]),
+        widget(3, 3, vec![2]),
+        widget(4, 4, vec![3]),
+    ];
+    let path = find_route(&nodes).unwrap();
+    assert_eq!(
+        path.iter().map(|w| w.node).collect::<alloc::vec::Vec<_>>(),
+        vec![4, 3, 2]
+    );
+}
+#[test]
+fn cycle_and_digital_path_are_rejected() {
+    let mut nodes = vec![widget(2, 3, vec![4]), widget(4, 4, vec![2])];
+    assert!(find_route(&nodes).is_none());
+    nodes[0] = widget(2, 0, vec![]);
+    nodes[0].caps |= 1 << 9;
+    assert!(find_route(&nodes).is_none());
+}
+#[test]
+fn prefers_headphone_and_skips_disconnected_pin() {
+    let mut nodes = vec![
+        widget(2, 0, vec![]),
+        widget(3, 4, vec![2]),
+        widget(4, 4, vec![2]),
+    ];
+    nodes[2].config = 2 << 20;
+    assert_eq!(find_route(&nodes).unwrap()[0].node, 4);
+    nodes[2].config |= 1 << 30;
+    assert_eq!(find_route(&nodes).unwrap()[0].node, 3);
+}
+#[test]
+fn wire_layout() {
+    assert_eq!(core::mem::size_of::<BufferDescriptor>(), 16);
+    assert_eq!(verb(2, 5, 0x200, 0x11), 0x20520011);
+}
+
+extern crate std;
+use core::ptr::NonNull;
+use std::{
+    alloc::{Layout, alloc_zeroed, dealloc},
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
+
+use crate::{
+    Controller, Hal,
+    desc::PERIOD,
+    regs::{self, Bus},
+};
+struct Host;
+// SAFETY: aligned host allocation serves as fake physical address.
+unsafe impl Hal for Host {
+    fn allocate(pages: usize) -> Option<(u64, NonNull<u8>)> {
+        // SAFETY: valid nonzero layout; freed with same layout after fake DMA stops.
+        let p = NonNull::new(unsafe {
+            alloc_zeroed(Layout::from_size_align(pages * 4096, 4096).unwrap())
+        })?;
+        Some((p.as_ptr() as u64, p))
+    }
+    unsafe fn release(_: u64, p: NonNull<u8>, pages: usize) {
+        // SAFETY: caller has retired fake DMA and retains allocation ownership.
+        unsafe {
+            dealloc(
+                p.as_ptr(),
+                Layout::from_size_align(pages * 4096, 4096).unwrap(),
+            );
+        }
+    }
+}
+#[derive(Default)]
+struct State {
+    regs: BTreeMap<usize, u32>,
+    now: u64,
+}
+struct Fake(Arc<Mutex<State>>);
+impl Fake {
+    fn address(s: &State, o: usize) -> u64 {
+        u64::from(s.regs[&o]) | (u64::from(s.regs[&(o + 4)]) << 32)
+    }
+}
+impl Bus for Fake {
+    fn read(&mut self, o: usize, _: usize) -> u32 {
+        let s = self.0.lock().unwrap();
+        match o {
+            0 => 0x1101,
+            0xe => 1,
+            0x4e | 0x5e => 0x40,
+            _ => *s.regs.get(&o).unwrap_or(&0),
+        }
+    }
+    fn write(&mut self, o: usize, _: usize, value: u32) {
+        let mut s = self.0.lock().unwrap();
+        s.regs.insert(o, value);
+        if o == 0xa3 {
+            s.regs.insert(o, 0);
+        }
+        if o == regs::CORBRP || o == regs::RIRBWP {
+            s.regs.insert(o, 0);
+        }
+        if o == regs::CORBWP && value != 0 {
+            let corb = Self::address(&s, regs::CORB);
+            let rirb = Self::address(&s, regs::RIRB);
+            // SAFETY: controller published a valid owned CORB allocation.
+            let command = unsafe { (corb as *const u32).add(value as usize).read() };
+            let node = (command >> 20) & 255;
+            let operation = (command >> 8) & 4095;
+            let payload = command & 255;
+            let response = match (node, operation, payload) {
+                (0, 0xf00, 0) => 0x10ec0999,
+                (0, 0xf00, 4) => 0x10001,
+                (1, 0xf00, 5) => 1,
+                (1, 0xf00, 4) => 0x20003,
+                (2, 0xf00, 9) => 17,
+                (3, 0xf00, 9) => 0x300100,
+                (4, 0xf00, 9) => 0x400100,
+                (2, 0xf00, 0xa) => (1 << 6) | (1 << 17),
+                (2, 0xf00, 0xb) => 1,
+                (4, 0xf00, 0xc) => 16,
+                (3 | 4, 0xf00, 0xe) => 1,
+                (3, 0xf02, _) => 2,
+                (4, 0xf02, _) => 3,
+                _ => 0,
+            };
+            let wp = (*s.regs.get(&regs::RIRBWP).unwrap_or(&0) + 1) & 255;
+            s.regs.insert(regs::RIRBWP, wp);
+            // SAFETY: owned RIRB allocation is large enough for this published entry.
+            unsafe {
+                (rirb as *mut u64).add(wp as usize).write(response);
+            }
+        }
+        if o == 0xa0 && value & 1 != 0 {
+            s.regs.insert(0xa4, 0);
+        }
+    }
+    fn delay_us(&mut self, m: u32) {
+        self.0.lock().unwrap().now += u64::from(m) * 1000;
+    }
+    fn now_ns(&self) -> u64 {
+        self.0.lock().unwrap().now
+    }
+}
+#[test]
+fn controller_route_bdl_and_period_completion() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut c = Controller::<Host, _>::new(Fake(state.clone())).unwrap();
+    assert_eq!(c.route().vendor, 0x10ec0999);
+    assert_eq!(c.route().path.last().unwrap().node, 2);
+    assert_eq!(state.lock().unwrap().regs[&regs::RIRBCTL], 3);
+    assert_eq!(state.lock().unwrap().regs[&0x20], 0);
+    c.prepare(4096, 4).unwrap();
+    let token = c.submit(&[0x55; PERIOD]).unwrap();
+    let second = c.submit(&[0x66; PERIOD]).unwrap();
+    assert_ne!(token, second);
+    {
+        let mut s = state.lock().unwrap();
+        let bdl = Fake::address(&s, 0xb8);
+        // SAFETY: stopped fake hardware only inspects the driver's owned BDL and audio memory.
+        unsafe {
+            let first = (bdl as *const BufferDescriptor).read();
+            assert_eq!(first.length, 4096);
+            assert_eq!(*(first.address as *const u8), 0x55);
+        }
+        s.regs.insert(0xa4, 4096);
+        s.now += 22_000_000;
+    }
+    assert_eq!(c.complete().unwrap(), Some(token));
+    {
+        let mut s = state.lock().unwrap();
+        s.regs.insert(0xa4, 8192);
+        s.now += 22_000_000;
+    }
+    assert_eq!(c.complete().unwrap(), Some(second));
+    let before = state.lock().unwrap().now;
+    c.release().unwrap();
+    assert!(state.lock().unwrap().now - before >= 42_666_000);
+}
+#[test]
+fn missed_full_lap_is_not_fabricated_completion() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut c = Controller::<Host, _>::new(Fake(state.clone())).unwrap();
+    c.prepare(4096, 4).unwrap();
+    c.submit(&[0; PERIOD]).unwrap();
+    state.lock().unwrap().now += 100_000_000;
+    assert!(c.complete().is_err());
+}

@@ -1,0 +1,139 @@
+//! Intel HDA platform seam; generic analog codec graph, no DSP/HDMI writes.
+use core::ptr::NonNull;
+
+use axalloc::{UsageKind, global_allocator};
+use axdriver_base::{DevError, DevResult};
+use axdriver_hda::{Controller, Hal, regs::Bus};
+use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
+use spin::Mutex;
+
+use crate::drivers::{BusProbeResult, DriverProbe};
+pub struct PlatformHal;
+// SAFETY: x86 coherent identity DMA; owned page-aligned contiguous allocations.
+unsafe impl Hal for PlatformHal {
+    fn allocate(pages: usize) -> Option<(u64, NonNull<u8>)> {
+        let address = global_allocator()
+            .alloc_pages(pages, 4096, UsageKind::Dma)
+            .ok()?;
+        Some((
+            axhal::mem::virt_to_phys(address.into()).as_usize() as u64,
+            NonNull::new(address as *mut u8)?,
+        ))
+    }
+    unsafe fn release(_address: u64, pointer: NonNull<u8>, pages: usize) {
+        global_allocator().dealloc_pages(pointer.as_ptr() as usize, pages, UsageKind::Dma);
+    }
+}
+pub struct Window {
+    base: usize,
+    size: usize,
+}
+impl Bus for Window {
+    fn read(&mut self, offset: usize, width: usize) -> u32 {
+        if ![1, 2, 4].contains(&width)
+            || !offset.is_multiple_of(width)
+            || offset.checked_add(width).is_none_or(|end| end > self.size)
+        {
+            return u32::MAX;
+        }
+        // SAFETY: probe mapped the BAR; access is width-aligned and bounded.
+        unsafe {
+            match width {
+                1 => ((self.base + offset) as *const u8).read_volatile() as u32,
+                2 => ((self.base + offset) as *const u16).read_volatile() as u32,
+                _ => ((self.base + offset) as *const u32).read_volatile(),
+            }
+        }
+    }
+    fn write(&mut self, offset: usize, width: usize, value: u32) {
+        if ![1, 2, 4].contains(&width)
+            || !offset.is_multiple_of(width)
+            || offset.checked_add(width).is_none_or(|end| end > self.size)
+        {
+            return;
+        }
+        // SAFETY: same bounded width-correct device window as read.
+        unsafe {
+            match width {
+                1 => ((self.base + offset) as *mut u8).write_volatile(value as u8),
+                2 => ((self.base + offset) as *mut u16).write_volatile(value as u16),
+                _ => ((self.base + offset) as *mut u32).write_volatile(value),
+            }
+        }
+    }
+    fn delay_us(&mut self, micros: u32) {
+        axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(micros)));
+    }
+    fn now_ns(&self) -> u64 {
+        axhal::time::monotonic_time_nanos()
+    }
+}
+type Sound = Controller<PlatformHal, Window>;
+static DEVICE: Mutex<Option<Sound>> = Mutex::new(None);
+pub struct HdaDriver;
+impl DriverProbe for HdaDriver {
+    fn probe_pci(
+        root: &mut PciRoot,
+        bdf: DeviceFunction,
+        info: &DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        if !axdriver_hda::ids::matches(info.vendor_id, info.class, info.subclass, info.prog_if) {
+            return BusProbeResult::NotMatched;
+        }
+        let mut slot = DEVICE.lock();
+        if slot.is_some() {
+            return BusProbeResult::Claimed;
+        }
+        let Ok(BarInfo::Memory { address, size, .. }) = root.bar_info(bdf, 0) else {
+            return BusProbeResult::Claimed;
+        };
+        if address == 0 || size < 0x400 {
+            return BusProbeResult::Claimed;
+        }
+        let Ok(base) = axklib::mem::iomap((address as usize).into(), size as usize) else {
+            return BusProbeResult::Claimed;
+        };
+        match Sound::new(Window {
+            base: base.as_usize(),
+            size: size as usize,
+        }) {
+            Ok(device) => {
+                let route = device.route();
+                log::info!(
+                    "hda: {bdf} codec={:08x} address={} analog route {:?}; S16LE stereo 48000 Hz; \
+                     未在硬件上验证",
+                    route.vendor,
+                    route.codec,
+                    route
+                        .path
+                        .iter()
+                        .map(|w| w.node)
+                        .collect::<alloc::vec::Vec<_>>()
+                );
+                *slot = Some(device);
+            }
+            Err(error) => log::warn!(
+                "hda: {bdf} initialization stopped: {error:?}; no sound endpoint registered"
+            ),
+        }
+        BusProbeResult::Claimed
+    }
+}
+pub fn available() -> bool {
+    DEVICE.lock().is_some()
+}
+fn with_device<T>(f: impl FnOnce(&mut Sound) -> DevResult<T>) -> DevResult<T> {
+    f(DEVICE.lock().as_mut().ok_or(DevError::Unsupported)?)
+}
+pub fn prepare(period: u32, periods: u32) -> DevResult {
+    with_device(|d| d.prepare(period, periods))
+}
+pub fn submit(bytes: &[u8]) -> DevResult<u16> {
+    with_device(|d| d.submit(bytes))
+}
+pub fn complete() -> DevResult<Option<u16>> {
+    with_device(|d| d.complete())
+}
+pub fn release() -> DevResult {
+    with_device(|d| d.release())
+}

@@ -620,3 +620,6 @@ pub fn init_drivers() -> AllDevices {
 
 #[cfg(feature = "nvme")]
 mod nvme;
+
+#[cfg(feature = "intel-hda")]
+mod hda;

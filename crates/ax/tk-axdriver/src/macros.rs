@@ -60,6 +60,11 @@ macro_rules! for_each_drivers {
             type $drv_type = virtio::VirtIoEntropyDriver;
             $code
         }
+        #[cfg(feature = "intel-hda")]
+        {
+            type $drv_type = crate::hda::HdaDriver;
+            $code
+        }
         #[cfg(feature = "virtio-sound")]
         {
             type $drv_type = crate::sound::VirtIoSoundDriver;

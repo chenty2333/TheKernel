@@ -1,0 +1,13 @@
+[package]
+name = "tk-axdriver-hda"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "Apache-2.0"
+publish = false
+[dependencies]
+axdriver_base = { package = "tk-axdriver-base", path = "../tk-axdriver-base" }
+[package.metadata.thekernel]
+layer = "platform"
+[package.metadata.thekernel.host-test]
+selected = true

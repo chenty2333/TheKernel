@@ -64,6 +64,10 @@ impl DriverProbe for VirtIoSoundDriver {
 }
 
 pub fn available() -> bool {
+    #[cfg(feature = "intel-hda")]
+    if crate::hda::available() {
+        return true;
+    }
     STREAM.lock().is_some()
 }
 
@@ -85,6 +89,10 @@ fn with_device<T>(
 }
 
 pub fn prepare(period: u32, periods: u32) -> DevResult {
+    #[cfg(feature = "intel-hda")]
+    if crate::hda::available() {
+        return crate::hda::prepare(period, periods);
+    }
     with_device(|d, id| {
         d.pcm_set_params(
             id,
@@ -101,11 +109,19 @@ pub fn prepare(period: u32, periods: u32) -> DevResult {
 }
 
 pub fn submit(bytes: &[u8]) -> DevResult<u16> {
+    #[cfg(feature = "intel-hda")]
+    if crate::hda::available() {
+        return crate::hda::submit(bytes);
+    }
     with_device(|d, id| d.pcm_xfer_nb(id, bytes))
 }
 
 /// Retires a completed DMA period and checks the device's completion status.
 pub fn complete() -> DevResult<Option<u16>> {
+    #[cfg(feature = "intel-hda")]
+    if crate::hda::available() {
+        return crate::hda::complete();
+    }
     with_device(|d, _| match d.pcm_completed() {
         Some(token) => {
             d.pcm_xfer_ok(token)?;
@@ -117,6 +133,10 @@ pub fn complete() -> DevResult<Option<u16>> {
 
 /// Call only after every submitted period has been retired.
 pub fn release() -> DevResult {
+    #[cfg(feature = "intel-hda")]
+    if crate::hda::available() {
+        return crate::hda::release();
+    }
     with_device(|d, id| {
         d.pcm_stop(id)?;
         d.pcm_release(id)

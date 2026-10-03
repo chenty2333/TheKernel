@@ -31,6 +31,7 @@ license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
 repository.workspace = true
 
 [features]
+intel-hda = ["bus-pci", "dep:axdriver_hda", "dep:axalloc", "dep:axhal", "dep:spin"]
 nvme = ["block", "bus-pci", "dep:axdriver_nvme", "dep:axalloc", "dep:axhal"]
 ahci = [
     "block",
@@ -314,9 +315,14 @@ selected = true
 percpu-linker = true
 # `virtio-input` is only here to make `build.rs` emit
 # `input_dev = "virtio-input"`, which one `bus/pci.rs` test is gated on.
-features = ["usb-xhci", "ramdisk", "shared-block", "virtio-input", "nvme"]
+features = ["usb-xhci", "ramdisk", "shared-block", "virtio-input", "nvme", "intel-hda"]
 
 [dependencies.axdriver_nvme]
 package = "tk-axdriver-nvme"
 path = "../tk-axdriver-nvme"
+optional = true
+
+[dependencies.axdriver_hda]
+package = "tk-axdriver-hda"
+path = "../tk-axdriver-hda"
 optional = true

@@ -267,6 +267,7 @@ def kernel_features(artifacts: Artifacts) -> str:
     # virtualized machines.
     features = [PRODUCT_FEATURE]
     features.append("nvme")
+    features.append("intel-hda")
     if artifacts.profile == "shell":
         features.append("boot-shell")
     if variant.asid_fast_switch:
@@ -562,6 +563,7 @@ class RunSpec:
     qmp_timeout_secs: float = 5.0
     graphics_width: int = 800
     graphics_height: int = 600
+    audio_device: str = "virtio"
     audio_backend: str | None = None
 
 
@@ -667,6 +669,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             graphics_width=spec.graphics_width,
             graphics_height=spec.graphics_height,
             audio_backend=spec.audio_backend,
+            audio_device=spec.audio_device,
             extra_args=(("-d", spec.qemu_debug, "-D", str(run_dir / "qemu-debug.log"))
                         if spec.qemu_debug else ()) + (
                 ("-gdb", f"unix:{run_dir / 'gdb.sock'},server=on,wait=off",
@@ -862,6 +865,7 @@ def run_cmd(args: argparse.Namespace) -> int:
             graphics_width=width,
             graphics_height=height,
             audio_backend=getattr(args, "audio_backend", None),
+            audio_device=getattr(args, "audio_device", "virtio"),
             input_after_marker=input_after_marker,
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
@@ -1565,6 +1569,7 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--width", type=int, default=800, help="guest display width in pixels")
     parser.add_argument("--height", type=int, default=600, help="guest display height in pixels")
+    parser.add_argument("--audio-device", choices=("virtio", "hda"), default="virtio", help="select the appended playback controller")
     parser.add_argument("--audio-backend", choices=("pa", "wav"),
                         help="attach VirtIO playback through host PulseAudio or workdir/audio.wav")
     parser.add_argument(
