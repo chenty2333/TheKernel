@@ -2,6 +2,52 @@
 
 use super::*;
 
+const MIN_DATA_BMBT_ROOT_RECORDS: u64 = 3;
+const MIN_ATTR_BMBT_ROOT_RECORDS: u64 = 2;
+
+fn max_bmbt_root_level(
+    block_size: u32,
+    crc_enabled: bool,
+    max_extents: u64,
+    min_root_records: u64,
+) -> XfsResult<u16> {
+    // XFS computes the worst-case BMBT height from half-full nodes and the
+    // minimum key/pointer capacity of the inode root. Use the on-disk header
+    // size and maximum extent count for this fork format.
+    const RECORD_BYTES: usize = 16;
+    let header_bytes = if crc_enabled { 72 } else { 24 };
+    let block_bytes = usize::try_from(block_size).map_err(|_| XfsError::CorruptMetadata)?;
+    let records_per_node = block_bytes
+        .checked_sub(header_bytes)
+        .ok_or(XfsError::CorruptMetadata)?
+        / RECORD_BYTES;
+    let minimum_records =
+        u64::try_from(records_per_node / 2).map_err(|_| XfsError::CorruptMetadata)?;
+    if minimum_records == 0 {
+        return Err(XfsError::CorruptMetadata);
+    }
+
+    let mut blocks = max_extents.div_ceil(minimum_records);
+    let mut level = 1u16;
+    while blocks > 1 {
+        if blocks <= min_root_records {
+            blocks = 1;
+        } else {
+            blocks = blocks.div_ceil(minimum_records);
+        }
+        level = level.checked_add(1).ok_or(XfsError::CorruptMetadata)?;
+    }
+    Ok(level)
+}
+
+fn validate_bmbt_root_level(level: u16, maximum: u16) -> XfsResult<()> {
+    if level > maximum {
+        Err(XfsError::CorruptMetadata)
+    } else {
+        Ok(())
+    }
+}
+
 impl XfsVolume {
     /// Decodes an inode by its stable 64-bit XFS number.  The AG and inode
     /// block calculation is checked before every multiplication/addition.
@@ -85,17 +131,37 @@ impl XfsVolume {
                 inode.attr_fork(&raw)?,
                 usize::try_from(inode.attr_extents).map_err(|_| XfsError::CorruptMetadata)?,
             ),
-            XfsForkFormat::Btree => self.attr_bmbt_extents(number, inode.attr_fork(&raw)?),
+            XfsForkFormat::Btree => self.attr_bmbt_extents(number, &inode, inode.attr_fork(&raw)?),
             _ => Err(XfsError::UnsupportedFeature),
         }
     }
 
-    pub(super) fn attr_bmbt_extents(&self, number: u64, fork: &[u8]) -> XfsResult<Vec<XfsExtent>> {
+    pub(super) fn attr_bmbt_extents(
+        &self,
+        number: u64,
+        inode: &XfsInode,
+        fork: &[u8],
+    ) -> XfsResult<Vec<XfsExtent>> {
         if fork.len() < 4 {
             return Err(XfsError::CorruptMetadata);
         }
         let level = be16(fork, 0)?;
         let records = be16(fork, 2)? as usize;
+        let large_extents = inode.flags2 & XfsInode::DIFLAG2_NREXT64 != 0;
+        let max_extents = if large_extents {
+            (1u64 << 32) - 1
+        } else {
+            (1u64 << 15) - 1
+        };
+        validate_bmbt_root_level(
+            level,
+            max_bmbt_root_level(
+                self.superblock.block_size,
+                self.superblock.is_v5(),
+                max_extents,
+                MIN_ATTR_BMBT_ROOT_RECORDS,
+            )?,
+        )?;
         if records == 0 {
             return Err(XfsError::CorruptMetadata);
         }
@@ -174,6 +240,21 @@ impl XfsVolume {
         }
         let level = be16(fork, 0)?;
         let records = be16(fork, 2)? as usize;
+        let large_extents = inode.flags2 & XfsInode::DIFLAG2_NREXT64 != 0;
+        let max_extents = if large_extents {
+            (1u64 << 32) - 1
+        } else {
+            (1u64 << 15) - 1
+        };
+        validate_bmbt_root_level(
+            level,
+            max_bmbt_root_level(
+                self.superblock.block_size,
+                self.superblock.is_v5(),
+                max_extents,
+                MIN_ATTR_BMBT_ROOT_RECORDS,
+            )?,
+        )?;
         if level == 0 || records == 0 {
             return Ok(Vec::new());
         }
@@ -227,6 +308,21 @@ impl XfsVolume {
         }
         let level = be16(fork, 0)?;
         let records = be16(fork, 2)?;
+        let large_extents = inode.flags2 & XfsInode::DIFLAG2_NREXT64 != 0;
+        let max_extents = if large_extents {
+            (1u64 << 48) - 1
+        } else {
+            (1u64 << 31) - 1
+        };
+        validate_bmbt_root_level(
+            level,
+            max_bmbt_root_level(
+                self.superblock.block_size,
+                self.superblock.is_v5(),
+                max_extents,
+                MIN_DATA_BMBT_ROOT_RECORDS,
+            )?,
+        )?;
         if records == 0 {
             return Err(XfsError::CorruptMetadata);
         }
@@ -1058,5 +1154,34 @@ impl XfsVolume {
             plan.ingest(record.clone())?;
         }
         Ok((scan, plan))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bmbt_root_levels_follow_xfs_geometry_and_extent_count() {
+        assert_eq!(
+            max_bmbt_root_level(512, true, 1, MIN_DATA_BMBT_ROOT_RECORDS),
+            Ok(1)
+        );
+        let small =
+            max_bmbt_root_level(512, true, (1u64 << 31) - 1, MIN_DATA_BMBT_ROOT_RECORDS).unwrap();
+        let large =
+            max_bmbt_root_level(512, true, (1u64 << 48) - 1, MIN_DATA_BMBT_ROOT_RECORDS).unwrap();
+        assert!(large > small);
+        let attribute =
+            max_bmbt_root_level(512, true, (1u64 << 32) - 1, MIN_ATTR_BMBT_ROOT_RECORDS).unwrap();
+        assert!(attribute >= small);
+        assert!(
+            max_bmbt_root_level(512, false, (1u64 << 48) - 1, MIN_DATA_BMBT_ROOT_RECORDS).is_ok()
+        );
+        assert_eq!(validate_bmbt_root_level(small, small), Ok(()));
+        assert_eq!(
+            validate_bmbt_root_level(small + 1, small),
+            Err(XfsError::CorruptMetadata)
+        );
     }
 }
