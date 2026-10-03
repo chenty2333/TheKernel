@@ -2617,7 +2617,18 @@ impl<Z> Iterator for ThreadIds<Z> {
     type Item = Pid;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while !self.finished && self.remaining != 0 {
+        while !self.finished {
+            if self.remaining == 0 {
+                // The initial membership count is only a bounded hint. A
+                // concurrent CLONE_THREAD|set_tid can insert a lower TID
+                // ahead of the cursor and consume one of those visits, so
+                // budget exhaustion alone does not prove that the tree ended.
+                let live = self.process.tg.lock().memberships;
+                if live == 0 {
+                    break;
+                }
+                self.remaining = live;
+            }
             let tg = self.process.tg.lock();
             let next = if let Some(last) = self.last.as_ref().filter(|last| last.link.is_linked()) {
                 // SAFETY: `last` is linked in this process's thread tree and
@@ -2712,6 +2723,21 @@ mod tests {
             finished: false,
         };
         assert_eq!(partial.count(), 6);
+    }
+
+    #[test]
+    fn thread_walk_rearms_after_a_lower_tid_is_inserted() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let process = domain.try_new_init(1, None).unwrap();
+        domain.prepare_thread(&process, 10).unwrap().commit().unwrap();
+        domain.prepare_thread(&process, 30).unwrap().commit().unwrap();
+
+        // The iterator snapshots two memberships. A thread with a lower
+        // set_tid value is then linked before the first read; visiting it must
+        // not consume the only slot for the original highest TID.
+        let thread_ids = process.thread_ids();
+        domain.prepare_thread(&process, 2).unwrap().commit().unwrap();
+        assert_eq!(thread_ids.collect::<Vec<_>>(), [2, 10, 30]);
     }
 
     #[test]
