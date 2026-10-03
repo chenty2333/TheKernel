@@ -2907,9 +2907,22 @@ impl NfsMount {
         mode: Option<u32>,
         size: Option<u64>,
     ) -> NfsResult<()> {
-        if mode.is_none() && size.is_none() {
+        self.setattr_attrs(handle, stateid, mode, size, None, None)
+    }
+    pub fn setattr_attrs(
+        &self,
+        handle: &FileHandle,
+        stateid: [u8; 16],
+        mode: Option<u32>,
+        size: Option<u64>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> NfsResult<()> {
+        if mode.is_none() && size.is_none() && uid.is_none() && gid.is_none() {
             return Err(NfsError::Length);
         }
+        let owner = uid.map(|uid| self.uid_to_owner(uid)).transpose()?;
+        let group = gid.map(|gid| self.gid_to_group(gid)).transpose()?;
         // A successful truncate supersedes all dirty bytes at and beyond EOF.
         // Keep the ledger gate over the RPC and the retirement so recovery can
         // never restore data after a later visible SETATTR(size).
@@ -2920,8 +2933,8 @@ impl NfsMount {
                 stateid,
                 mode,
                 size,
-                owner: None,
-                group: None,
+                owner: owner.as_deref(),
+                group: group.as_deref(),
                 acl: None,
             },
         ])?;
@@ -2938,20 +2951,7 @@ impl NfsMount {
         uid: u32,
         gid: u32,
     ) -> NfsResult<()> {
-        let owner = self.uid_to_owner(uid)?;
-        let group = self.gid_to_group(gid)?;
-        self.compound(&[
-            Operation::PutFh(handle),
-            Operation::SetAttr {
-                stateid,
-                mode: None,
-                size: None,
-                owner: Some(&owner),
-                group: Some(&group),
-                acl: None,
-            },
-        ])
-        .map(|_| self.invalidate())
+        self.setattr_attrs(handle, stateid, None, None, Some(uid), Some(gid))
     }
     pub fn read(
         &self,
@@ -6425,15 +6425,14 @@ impl NodeOps for NfsNode {
         nfs_metadata(&self.fs.mount, self.refresh()?)
     }
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()> {
-        nfs_vfs(self.fs.mount.setattr(
+        nfs_vfs(self.fs.mount.setattr_attrs(
             &self.fh,
             [0; 16],
             update.mode.map(|m| m.bits() as u32),
             None,
+            update.owner.map(|(uid, _)| uid),
+            update.owner.map(|(_, gid)| gid),
         ))?;
-        if let Some((uid, gid)) = update.owner {
-            nfs_vfs(self.fs.mount.setattr_owner(&self.fh, [0; 16], uid, gid))?;
-        }
         self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -7515,6 +7514,32 @@ mod tests {
         (cookie, verifier)
     }
 
+    fn request_setattr_bitmap(record: &[u8]) -> (u32, u32) {
+        let call = decode_record(record).unwrap();
+        let mut xdr = XdrIn::new(&call);
+        for _ in 0..6 {
+            xdr.u32().unwrap();
+        }
+        xdr.u32().unwrap();
+        xdr.opaque().unwrap();
+        xdr.u32().unwrap();
+        xdr.opaque().unwrap();
+        xdr.opaque().unwrap();
+        xdr.u32().unwrap();
+        assert_eq!(xdr.u32().unwrap(), 3);
+        assert_eq!(xdr.u32().unwrap(), OP_SEQUENCE);
+        xdr.take(16).unwrap();
+        for _ in 0..4 {
+            xdr.u32().unwrap();
+        }
+        assert_eq!(xdr.u32().unwrap(), OP_PUTFH);
+        xdr.opaque().unwrap();
+        assert_eq!(xdr.u32().unwrap(), OP_SETATTR);
+        xdr.take(16).unwrap();
+        assert_eq!(xdr.u32().unwrap(), 2);
+        (xdr.u32().unwrap(), xdr.u32().unwrap())
+    }
+
     fn getattr_size_success(sessionid: [u8; 16], sequence: u32, size: u64) -> Vec<u8> {
         let mut body = Xdr::default();
         body.u32(NFS_OK);
@@ -7600,6 +7625,29 @@ mod tests {
         body.opaque(&attr.0);
         body.u32(0);
         body.u32(eof as u32);
+        body.0
+    }
+
+    fn setattr_success(sessionid: [u8; 16], sequence: u32) -> Vec<u8> {
+        let mut body = Xdr::default();
+        body.u32(NFS_OK);
+        body.opaque(b"");
+        body.u32(3);
+        body.u32(OP_SEQUENCE);
+        body.u32(NFS_OK);
+        body.fixed(&sessionid);
+        body.u32(sequence);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(OP_PUTFH);
+        body.u32(NFS_OK);
+        body.u32(OP_SETATTR);
+        body.u32(NFS_OK);
+        body.u32(2);
+        body.u32(0);
+        body.u32(0);
         body.0
     }
 
@@ -7806,6 +7854,25 @@ mod tests {
             close_after_open_operation(Ok(7), || Err(NfsError::Transport)),
             Err(NfsError::Transport)
         );
+    }
+
+    #[test]
+    fn metadata_mode_and_owner_are_one_setattr_compound() {
+        let sessionid = [0x38; 16];
+        let transport = Arc::new(ScriptTransport::new(vec![Ok(setattr_success(
+            sessionid, 1,
+        ))]));
+        let mount = mounted_session(transport.clone(), sessionid);
+        let handle = FileHandle::new(b"file".to_vec()).unwrap();
+        mount
+            .setattr_attrs(&handle, [0; 16], Some(0o640), None, Some(12), Some(34))
+            .unwrap();
+
+        let calls = transport.calls.lock();
+        assert_eq!(calls.len(), 1);
+        let (first, second) = request_setattr_bitmap(&calls[0]);
+        assert_eq!(first, 0);
+        assert_eq!(second, (1 << 1) | (1 << 4) | (1 << 5));
     }
 
     #[test]
