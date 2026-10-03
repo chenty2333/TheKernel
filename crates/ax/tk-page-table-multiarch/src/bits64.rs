@@ -304,6 +304,45 @@ impl<PTE: GenericPTE, H: PagingHandler> Drop for ReplacedPteRun<PTE, H> {
 }
 
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H> {
+    /// Reconstructs the canonical virtual address represented by page-table
+    /// indices. The tree contains only `VA_MAX_BITS` bits; high-half
+    /// sign-extension bits are not stored in its indices.
+    fn canonicalize_vaddr(vaddr: usize) -> usize {
+        debug_assert!(M::VA_MAX_BITS > 0 && M::VA_MAX_BITS <= usize::BITS as usize);
+        let address_mask = usize::MAX >> (usize::BITS as usize - M::VA_MAX_BITS);
+        let sign_bit = 1usize << (M::VA_MAX_BITS - 1);
+        let address = vaddr & address_mask;
+        if address & sign_bit == 0 {
+            address
+        } else {
+            address | !address_mask
+        }
+    }
+
+    /// Validates a complete canonical range and converts it to the unsigned
+    /// address interval represented by page-table indices.
+    fn canonical_tree_range(start: usize, size: usize) -> PagingResult<(usize, usize)> {
+        let end = start.checked_add(size).ok_or(PagingError::NotAligned)?;
+        if !PageSize::Size4K.is_aligned(start) || !PageSize::Size4K.is_aligned(size) {
+            return Err(PagingError::NotAligned);
+        }
+        if !M::vaddr_is_valid(start) || (size != 0 && !M::vaddr_is_valid(end - 1)) {
+            return Err(PagingError::NotAligned);
+        }
+
+        let tree_bits = 12 + M::LEVELS * 9;
+        if tree_bits != M::VA_MAX_BITS || tree_bits >= usize::BITS as usize {
+            return Err(PagingError::NotAligned);
+        }
+        let tree_size = 1usize << tree_bits;
+        let begin = start & (tree_size - 1);
+        let normalized_end = begin
+            .checked_add(size)
+            .filter(|end| *end <= tree_size)
+            .ok_or(PagingError::NotAligned)?;
+        Ok((begin, normalized_end))
+    }
+
     /// Creates a new page table instance or returns the error.
     ///
     /// It will allocate a new page for the root page table.
@@ -384,23 +423,10 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
     /// Absent subtrees are skipped and huge leaves are clipped to the range.
     /// The range must be 4K aligned, canonical, and must not overflow the virtual address.
     pub fn mapped_bytes(&self, start: M::VirtAddr, size: usize) -> PagingResult<usize> {
-        let start: usize = start.into();
-        let range_end = start.checked_add(size).ok_or(PagingError::NotAligned)?;
-        if !PageSize::Size4K.is_aligned(start) || !PageSize::Size4K.is_aligned(size) {
-            return Err(PagingError::NotAligned);
-        }
-        if !M::vaddr_is_valid(start) || (size != 0 && !M::vaddr_is_valid(range_end - 1)) {
-            return Err(PagingError::NotAligned);
-        }
+        let (begin, end) = Self::canonical_tree_range(start.into(), size)?;
         if size == 0 {
             return Ok(0);
         }
-        // Page-table indices exclude canonical sign-extension bits, just as
-        // get_entry does. Normalize the range to the tree's address space.
-        let tree_size = 1usize << (12 + M::LEVELS * 9);
-        let begin = start & (tree_size - 1);
-        let end = begin.checked_add(size).filter(|end| *end <= tree_size)
-            .ok_or(PagingError::NotAligned)?;
         self.mapped_bytes_recursive(self.table_of(self.root_paddr()), 0, 0, begin, end)
     }
 
@@ -451,20 +477,14 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         start: M::VirtAddr,
         size: usize,
     ) -> PagingResult<Vec<MappedLeaf<M::VirtAddr>>> {
-        let start_usize: usize = start.into();
-        let end_usize = start_usize
-            .checked_add(size)
-            .ok_or(PagingError::NotAligned)?;
-        if !PageSize::Size4K.is_aligned(start_usize) || !PageSize::Size4K.is_aligned(size) {
-            return Err(PagingError::NotAligned);
-        }
+        let (range_start, range_end) = Self::canonical_tree_range(start.into(), size)?;
 
         let leaf_count = self.validate_and_count_mapped_leaves_recursive(
             self.table_of(self.root_paddr()),
             0,
             0,
-            start_usize,
-            end_usize,
+            range_start,
+            range_end,
         )?;
         let mut leaves = Vec::new();
         leaves
@@ -474,8 +494,8 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
             self.table_of(self.root_paddr()),
             0,
             0,
-            start_usize,
-            end_usize,
+            range_start,
+            range_end,
             &mut leaves,
         )?;
         debug_assert_eq!(leaves.len(), leaf_count);
@@ -491,10 +511,8 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         size: usize,
     ) -> PagingResult<Vec<MappedLeaf<M::VirtAddr>>> {
         let begin: usize = start.into();
+        let _ = Self::canonical_tree_range(begin, size)?;
         let end = begin.checked_add(size).ok_or(PagingError::NotAligned)?;
-        if !PageSize::Size4K.is_aligned(begin) || !PageSize::Size4K.is_aligned(size) {
-            return Err(PagingError::NotAligned);
-        }
         if size == 0 {
             return Ok(Vec::new());
         }
@@ -980,7 +998,9 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         let start_vaddr_usize: usize = start_vaddr.into();
         let mut n = 0;
         for (i, entry) in table.iter().enumerate() {
-            let vaddr_usize = start_vaddr_usize + (i << (12 + (M::LEVELS - 1 - level) * 9));
+            let vaddr_usize = Self::canonicalize_vaddr(
+                start_vaddr_usize + (i << (12 + (M::LEVELS - 1 - level) * 9)),
+            );
             let vaddr = vaddr_usize.into();
             let is_leaf = level == M::LEVELS - 1 || entry.is_huge();
 
@@ -1057,7 +1077,12 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
                 out.len() < out.capacity(),
                 "preallocated mapped-leaf buffer exhausted"
             );
-            out.push((entry_start.into(), entry.paddr(), entry.flags(), page_size));
+            out.push((
+                Self::canonicalize_vaddr(entry_start).into(),
+                entry.paddr(),
+                entry.flags(),
+                page_size,
+            ));
         }
 
         Ok(())
@@ -1275,8 +1300,9 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
                 DrainStep::Skip => {}
                 DrainStep::Preserve => {}
                 DrainStep::Leaf(paddr, flags, page_size) => {
-                    out.push((entry_start.into(), paddr, flags, page_size));
-                    self.push(entry_start.into());
+                    let vaddr = PageTable64::<M, PTE, H>::canonicalize_vaddr(entry_start).into();
+                    out.push((vaddr, paddr, flags, page_size));
+                    self.push(vaddr);
                 }
                 DrainStep::Child(child_paddr) => {
                     self.drain_mapped_leaves_recursive(
@@ -1749,12 +1775,8 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
         size: usize,
     ) -> PagingResult<Vec<MappedLeaf<M::VirtAddr>>> {
         let start_usize: usize = start.into();
-        let end_usize = start_usize
-            .checked_add(size)
-            .ok_or(PagingError::NotAligned)?;
-        if !PageSize::Size4K.is_aligned(start_usize) || !PageSize::Size4K.is_aligned(size) {
-            return Err(PagingError::NotAligned);
-        }
+        let (range_start, range_end) =
+            PageTable64::<M, PTE, H>::canonical_tree_range(start_usize, size)?;
 
         let leaf_count = {
             let root = self.inner.table_of(self.inner.root_paddr());
@@ -1762,8 +1784,8 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
                 root,
                 0,
                 0,
-                start_usize,
-                end_usize,
+                range_start,
+                range_end,
             )?
         };
         let mut leaves = Vec::new();
@@ -1788,12 +1810,8 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
         leaves: &mut Vec<(M::VirtAddr, PhysAddr, MappingFlags, PageSize)>,
     ) -> PagingResult {
         let start_usize: usize = start.into();
-        let end_usize = start_usize
-            .checked_add(size)
-            .ok_or(PagingError::NotAligned)?;
-        if !PageSize::Size4K.is_aligned(start_usize) || !PageSize::Size4K.is_aligned(size) {
-            return Err(PagingError::NotAligned);
-        }
+        let (range_start, range_end) =
+            PageTable64::<M, PTE, H>::canonical_tree_range(start_usize, size)?;
 
         let leaf_count = {
             let root = self.inner.table_of(self.inner.root_paddr());
@@ -1801,8 +1819,8 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
                 root,
                 0,
                 0,
-                start_usize,
-                end_usize,
+                range_start,
+                range_end,
             )?
         };
         leaves.clear();
@@ -1813,8 +1831,8 @@ impl<'a, M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64Cursor
             self.inner.root_paddr(),
             0,
             0,
-            start_usize,
-            end_usize,
+            range_start,
+            range_end,
             leaves,
         ) {
             panic!("validated mapped-leaf drain failed: {error:?}");

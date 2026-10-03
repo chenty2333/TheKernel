@@ -790,6 +790,95 @@ fn test_mapped_bytes_sparse_protnone_and_huge_x86() -> PagingResult<()> {
 }
 
 #[test]
+fn test_high_half_page_table_enumeration_preserves_canonical_addresses() -> PagingResult<()> {
+    type Meta = page_table_multiarch::x86_64::X64PagingMetaData;
+    type Pte = page_table_entry::x86_64::X64PTE;
+
+    ALLOCATED.with_borrow_mut(|it| it.clear());
+    let mut table = PageTable64::<Meta, Pte, TrackPagingHandler<Meta>>::try_new()?;
+    let high_page = VirtAddr::from_usize(0xffff_8000_0000_1000);
+    let high_huge = VirtAddr::from_usize(0xffff_8000_0020_0000);
+    table.cursor_no_flush().map(
+        high_page,
+        PhysAddr::from_usize(0x1000),
+        PageSize::Size4K,
+        MappingFlags::READ,
+    )?;
+    table.cursor_no_flush().map(
+        high_huge,
+        PhysAddr::from_usize(0x20_0000),
+        PageSize::Size2M,
+        MappingFlags::READ | MappingFlags::WRITE,
+    )?;
+
+    assert_eq!(
+        table.mapped_bytes(VirtAddr::from_usize(high_page.as_usize() - 0x1000), 0x3000)?,
+        0x1000
+    );
+    assert_eq!(
+        table.collect_mapped_leaves(high_page, 0x1000)?,
+        vec![(
+            high_page,
+            PhysAddr::from_usize(0x1000),
+            MappingFlags::READ,
+            PageSize::Size4K,
+        )]
+    );
+    assert_eq!(
+        table.collect_overlapping_mapped_leaves(high_huge + 0x1000, 0x1000)?,
+        vec![(
+            high_huge,
+            PhysAddr::from_usize(0x20_0000),
+            MappingFlags::READ | MappingFlags::WRITE,
+            PageSize::Size2M,
+        )]
+    );
+
+    let walked = RefCell::new(Vec::new());
+    let record = |_: usize, _: usize, vaddr: VirtAddr, _: &Pte| {
+        walked.borrow_mut().push(vaddr);
+    };
+    table.walk(usize::MAX, Some(&record), None);
+    assert!(walked.borrow().contains(&high_page));
+    assert!(walked.borrow().contains(&high_huge));
+
+    assert_eq!(
+        table.collect_mapped_leaves(VirtAddr::from_usize(0x0000_7fff_ffff_f000), 0x2000),
+        Err(PagingError::NotAligned)
+    );
+    assert_eq!(
+        table.cursor_no_flush().drain_mapped_leaves(
+            VirtAddr::from_usize(0x0000_7fff_ffff_f000),
+            0x2000,
+        ),
+        Err(PagingError::NotAligned)
+    );
+    assert!(table.query_mapped(high_page).is_ok());
+
+    assert_eq!(
+        table.cursor_no_flush().drain_mapped_leaves(high_page, 0x1000)?,
+        vec![(
+            high_page,
+            PhysAddr::from_usize(0x1000),
+            MappingFlags::READ,
+            PageSize::Size4K,
+        )]
+    );
+    assert_eq!(
+        table.cursor_no_flush().drain_mapped_leaves(high_huge, 0x20_0000)?,
+        vec![(
+            high_huge,
+            PhysAddr::from_usize(0x20_0000),
+            MappingFlags::READ | MappingFlags::WRITE,
+            PageSize::Size2M,
+        )]
+    );
+    drop(table);
+    assert_eq!(ALLOCATED.with_borrow(|it| it.len()), 0);
+    Ok(())
+}
+
+#[test]
 fn test_collect_mapped_leaves_x86() -> PagingResult<()> {
     type Meta = page_table_multiarch::x86_64::X64PagingMetaData;
     type Pte = page_table_entry::x86_64::X64PTE;
