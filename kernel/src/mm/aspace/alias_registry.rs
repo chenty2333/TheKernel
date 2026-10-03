@@ -58,7 +58,29 @@ enum AliasState {
 #[derive(Default)]
 struct AliasRegistry {
     entries: BTreeMap<SharedBackingKey, Vec<AliasEntry>>,
-    mutations: HashMap<SharedBackingKey, u64>,
+    // HashMap is fallibly allocated and not const-initializable on all build
+    // targets. Construct it lazily under the same registry mutex before the
+    // first mutation reservation.
+    mutations: Option<HashMap<SharedBackingKey, u64>>,
+}
+
+impl AliasRegistry {
+    fn is_mutating(&self, key: &SharedBackingKey) -> bool {
+        self.mutations
+            .as_ref()
+            .is_some_and(|mutations| mutations.contains_key(key))
+    }
+
+    fn remove_mutation(&mut self, key: &SharedBackingKey) -> Option<u64> {
+        self.mutations.as_mut()?.remove(key)
+    }
+
+    fn try_insert_mutation(&mut self, key: SharedBackingKey, generation: u64) -> AxResult {
+        let mutations = self.mutations.get_or_insert_with(HashMap::new);
+        mutations.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        mutations.insert(key, generation);
+        Ok(())
+    }
 }
 
 #[cfg(not(test))]
@@ -68,7 +90,7 @@ type AliasRegistryMutex<T> = spin::Mutex<T>;
 
 static ALIASES: AliasRegistryMutex<AliasRegistry> = AliasRegistryMutex::new(AliasRegistry {
     entries: BTreeMap::new(),
-    mutations: HashMap::new(),
+    mutations: None,
 });
 
 fn allocate_lease_id() -> AxResult<u64> {
@@ -135,7 +157,7 @@ impl PendingAliasLease {
         let lease_id = allocate_lease_id()?;
         let weak = Arc::downgrade(address_space);
         let mut registry = ALIASES.lock();
-        if registry.mutations.contains_key(&key) {
+        if registry.is_mutating(&key) {
             return Err(AxError::WouldBlock);
         }
         let aliases = registry.entries.entry(key).or_default();
@@ -190,7 +212,7 @@ impl PendingAliasLease {
 pub(crate) fn wait_for_alias_publication(key: SharedBackingKey) {
     loop {
         let registry = ALIASES.lock();
-        let blocked = registry.mutations.contains_key(&key)
+        let blocked = registry.is_mutating(&key)
             || registry.entries.get(&key).is_some_and(|aliases| {
                 aliases
                     .iter()
@@ -207,7 +229,7 @@ pub(crate) fn wait_for_alias_publication(key: SharedBackingKey) {
 impl Drop for AliasMutationReservation {
     fn drop(&mut self) {
         let mut registry = ALIASES.lock();
-        if registry.mutations.remove(&self.key) != Some(self.generation) {
+        if registry.remove_mutation(&self.key) != Some(self.generation) {
             panic!("alias mutation reservation generation changed");
         }
     }
@@ -321,7 +343,7 @@ pub(crate) fn reserve_alias_mutation(
 ) -> AxResult<(AliasMutationReservation, Vec<AliasSnapshot>)> {
     loop {
         let mut registry = ALIASES.lock();
-        if registry.mutations.contains_key(&key)
+        if registry.is_mutating(&key)
             || registry.entries.get(&key).is_some_and(|aliases| {
                 aliases
                     .iter()
@@ -366,11 +388,7 @@ pub(crate) fn reserve_alias_mutation(
         // The freeze is published only after all fallible snapshot allocation
         // has succeeded.  Reserving the map slot first makes insertion itself
         // allocation-free, so every error leaves alias admission open.
-        registry
-            .mutations
-            .try_reserve(1)
-            .map_err(|_| AxError::NoMemory)?;
-        registry.mutations.insert(key, generation);
+        registry.try_insert_mutation(key, generation)?;
         return Ok((AliasMutationReservation { key, generation }, snapshot));
     }
 }
@@ -413,8 +431,8 @@ mod tests {
 
         let (mutation, aliases) = reserve_alias_mutation(key).unwrap();
         assert_eq!(aliases.len(), 1);
-        assert!(ALIASES.lock().mutations.contains_key(&key));
+        assert!(ALIASES.lock().is_mutating(&key));
         drop(mutation);
-        assert!(!ALIASES.lock().mutations.contains_key(&key));
+        assert!(!ALIASES.lock().is_mutating(&key));
     }
 }
