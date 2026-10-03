@@ -3491,6 +3491,11 @@ impl PerfEventFile {
             };
             crate::uprobe::register(key, offset, retprobe, reference_counter_offset)?;
         }
+        if let PerfEvent::Tracepoint(id) = event {
+            // Released with the probes below: on construction failure here,
+            // otherwise by `release_dynamic_source`.
+            crate::perf_sources::subscribe_tracepoint(id);
+        }
         let now = monotonic_time_nanos();
         let file = Arc::try_new(Self {
             id,
@@ -3547,6 +3552,9 @@ impl PerfEventFile {
             Err(error) => {
                 if let PerfEvent::Kprobe { addr, retprobe, .. } = event {
                     crate::perf_sources::unregister_kprobe(addr, retprobe);
+                }
+                if let PerfEvent::Tracepoint(id) = event {
+                    crate::perf_sources::unsubscribe_tracepoint(id);
                 }
                 if let PerfEvent::Uprobe {
                     mount_id,
@@ -4014,6 +4022,7 @@ impl PerfEventFile {
             PerfEvent::Kprobe { addr, retprobe, .. } => {
                 crate::perf_sources::unregister_kprobe(addr, retprobe)
             }
+            PerfEvent::Tracepoint(id) => crate::perf_sources::unsubscribe_tracepoint(id),
             PerfEvent::Uprobe {
                 mount_id,
                 device,

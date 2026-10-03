@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use core::{
     arch::naked_asm,
     mem::offset_of,
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 
 use axcpu::trap::{BREAKPOINT, DEBUG, register_trap_handler};
@@ -33,6 +33,54 @@ pub(crate) const SCHED_SWITCH_TRACEPOINT_ID: u64 = 1;
 pub(crate) const RAW_SYSCALLS_ENTER_TRACEPOINT_ID: u64 = 2;
 pub(crate) const RAW_SYSCALLS_EXIT_TRACEPOINT_ID: u64 = 3;
 pub(crate) const SCHED_WAKEUP_TRACEPOINT_ID: u64 = 4;
+
+/// Live perf event files subscribed to `raw_syscalls:sys_enter` or
+/// `sys_exit`.  Those two tracepoints fire on every system call, so their
+/// producers check this before building a record, snapshotting registers or
+/// reading the clock -- Linux's static-key gate, as a counter.  A file joins
+/// in [`subscribe_tracepoint`] when it is created and leaves exactly once
+/// through the descriptor's idempotent dynamic-source release.
+static RAW_SYSCALL_TRACEPOINT_SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
+
+fn is_raw_syscall_tracepoint(id: u64) -> bool {
+    matches!(id, RAW_SYSCALLS_ENTER_TRACEPOINT_ID | RAW_SYSCALLS_EXIT_TRACEPOINT_ID)
+}
+
+pub(crate) fn subscribe_tracepoint(id: u64) {
+    if is_raw_syscall_tracepoint(id) {
+        RAW_SYSCALL_TRACEPOINT_SUBSCRIBERS.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn unsubscribe_tracepoint(id: u64) {
+    if is_raw_syscall_tracepoint(id) {
+        RAW_SYSCALL_TRACEPOINT_SUBSCRIBERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Which consumers a raw syscall tracepoint has right now.  An event opened
+/// concurrently with a system call may miss that one call, as with Linux's
+/// static keys; nothing that was subscribed before the call can.
+struct RawSyscallConsumers {
+    perf: bool,
+    #[cfg(feature = "bpf")]
+    bpf: bool,
+}
+
+impl RawSyscallConsumers {
+    fn current() -> Option<Self> {
+        let consumers = Self {
+            perf: RAW_SYSCALL_TRACEPOINT_SUBSCRIBERS.load(Ordering::Acquire) != 0,
+            #[cfg(feature = "bpf")]
+            bpf: crate::bpf::raw_tracepoint_links_active(),
+        };
+        #[cfg(feature = "bpf")]
+        let any = consumers.perf || consumers.bpf;
+        #[cfg(not(feature = "bpf"))]
+        let any = consumers.perf;
+        any.then_some(consumers)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TracepointInfo {
@@ -954,6 +1002,9 @@ pub(crate) fn emit_raw_syscall_enter(
     args: [u64; 6],
     regs: &axcpu::uspace::LinuxPtRegs,
 ) {
+    let Some(consumers) = RawSyscallConsumers::current() else {
+        return;
+    };
     // raw_syscalls:sys_enter: common header + long id + unsigned long args[6]
     let mut payload = [0u8; 64];
     trace_common(&mut payload, RAW_SYSCALLS_ENTER_TRACEPOINT_ID as u16);
@@ -963,7 +1014,7 @@ pub(crate) fn emit_raw_syscall_enter(
         payload[offset..offset + 8].copy_from_slice(&arg.to_ne_bytes());
     }
     #[cfg(feature = "bpf")]
-    {
+    if consumers.bpf {
         // The raw prototype is exactly `(struct pt_regs *regs, long id)`.
         // `regs` is an invocation-local, read-only x86_64-style register
         // snapshot. The interpreter dereferences it only through the bounded
@@ -981,19 +1032,24 @@ pub(crate) fn emit_raw_syscall_enter(
             Some(&regs_bytes),
         );
     }
-    if let Some(thread) = axtask::current().try_as_thread() {
+    if consumers.perf
+        && let Some(thread) = axtask::current().try_as_thread()
+    {
         thread.perf_emit_tracepoint_raw(RAW_SYSCALLS_ENTER_TRACEPOINT_ID, &payload, axhal::time::monotonic_time_nanos());
     }
 }
 
 pub(crate) fn emit_raw_syscall_exit(number: u64, result: i64, regs: &axcpu::uspace::LinuxPtRegs) {
+    let Some(consumers) = RawSyscallConsumers::current() else {
+        return;
+    };
     // raw_syscalls:sys_exit: common header + long id + long ret
     let mut payload = [0u8; 24];
     trace_common(&mut payload, RAW_SYSCALLS_EXIT_TRACEPOINT_ID as u16);
     payload[8..16].copy_from_slice(&number.to_ne_bytes());
     payload[16..24].copy_from_slice(&result.to_ne_bytes());
     #[cfg(feature = "bpf")]
-    {
+    if consumers.bpf {
         // Prototype: `(struct pt_regs *regs, long ret)`.
         let mut regs_bytes = [0u8; axcpu::uspace::LinuxPtRegs::BYTE_LEN];
         regs.write_native_bytes(&mut regs_bytes);
@@ -1007,7 +1063,9 @@ pub(crate) fn emit_raw_syscall_exit(number: u64, result: i64, regs: &axcpu::uspa
             Some(&regs_bytes),
         );
     }
-    if let Some(thread) = axtask::current().try_as_thread() {
+    if consumers.perf
+        && let Some(thread) = axtask::current().try_as_thread()
+    {
         thread.perf_emit_tracepoint_raw(RAW_SYSCALLS_EXIT_TRACEPOINT_ID, &payload, axhal::time::monotonic_time_nanos());
     }
 }

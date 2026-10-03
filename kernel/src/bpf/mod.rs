@@ -267,6 +267,16 @@ pub(crate) fn unregister_raw_tracepoint_link(link: &crate::file::bpf::BpfRawTrac
 const MAX_ACTIVE_RAW_TRACEPOINT_LINKS: usize = 64;
 static ACTIVE_RAW_TRACEPOINT_LINKS: SpinNoIrq<Vec<Weak<crate::file::bpf::BpfRawTracepointLink>>> =
     SpinNoIrq::new(Vec::new());
+/// Length of [`ACTIVE_RAW_TRACEPOINT_LINKS`], republished under its lock
+/// after every change, so producers that fire on every system call can skip
+/// the registry lock and the snapshot array while nothing is attached.  A
+/// dead entry keeps it non-zero until the next prune, which only costs that
+/// producer the slow path.
+static ACTIVE_RAW_TRACEPOINT_LINK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn raw_tracepoint_links_active() -> bool {
+    ACTIVE_RAW_TRACEPOINT_LINK_COUNT.load(Ordering::Acquire) != 0
+}
 
 pub(crate) fn activate_raw_tracepoint_link(
     link: &Arc<crate::file::bpf::BpfRawTracepointLink>,
@@ -284,6 +294,7 @@ pub(crate) fn activate_raw_tracepoint_link(
     }
     active.try_reserve(1).map_err(|_| AxError::NoMemory)?;
     active.push(Arc::downgrade(link));
+    ACTIVE_RAW_TRACEPOINT_LINK_COUNT.store(active.len(), Ordering::Release);
     Ok(())
 }
 pub(crate) fn deactivate_raw_tracepoint_link(link: &crate::file::bpf::BpfRawTracepointLink) {
@@ -293,6 +304,7 @@ pub(crate) fn deactivate_raw_tracepoint_link(link: &crate::file::bpf::BpfRawTrac
             .upgrade()
             .is_some_and(|entry| !entry.detached() && !core::ptr::eq(Arc::as_ptr(&entry), link))
     });
+    ACTIVE_RAW_TRACEPOINT_LINK_COUNT.store(active.len(), Ordering::Release);
 }
 
 /// Runs raw-tracepoint programs without allocating in syscall/scheduler
@@ -308,11 +320,15 @@ pub(crate) fn run_raw_tracepoint_links_with_regs(
     context: &mut [u8],
     regs: Option<&[u8]>,
 ) {
+    if !raw_tracepoint_links_active() {
+        return;
+    }
     let mut snapshot: [Option<Arc<crate::file::bpf::BpfRawTracepointLink>>;
         MAX_ACTIVE_RAW_TRACEPOINT_LINKS] = [const { None }; MAX_ACTIVE_RAW_TRACEPOINT_LINKS];
     let count = {
         let mut active = ACTIVE_RAW_TRACEPOINT_LINKS.lock();
         active.retain(|candidate| candidate.upgrade().is_some_and(|link| !link.detached()));
+        ACTIVE_RAW_TRACEPOINT_LINK_COUNT.store(active.len(), Ordering::Release);
         let mut count = 0;
         for link in active.iter().filter_map(Weak::upgrade) {
             if count == snapshot.len() {

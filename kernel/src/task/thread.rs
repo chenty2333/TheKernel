@@ -174,9 +174,15 @@ impl IoPortState {
         Option<&[u8; IO_BITMAP_BYTES]>,
         Option<&[u8; IO_BITMAP_BYTES]>,
     ) {
-        let bitmap = self.bitmap.as_deref();
+        // Revocations only narrow a shared grant bitmap; without one the TSS
+        // gets no bitmap at all and `revoked` is never read.  This runs on
+        // every return to user mode, so skip the 8 KiB scan in the common
+        // case of a task that never called ioperm.
+        let Some(bitmap) = self.bitmap.as_deref() else {
+            return (None, None);
+        };
         let revoked = (!self.revoked.iter().all(|&byte| byte == 0)).then_some(&self.revoked);
-        (bitmap, revoked)
+        (Some(bitmap), revoked)
     }
 }
 

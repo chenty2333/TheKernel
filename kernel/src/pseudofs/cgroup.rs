@@ -694,6 +694,14 @@ pub(crate) fn reconcile_current_uclamp_if_stale() {
     let Some(thread) = task.try_as_thread() else {
         return;
     };
+    // Every return to user mode passes here.  The published generation is
+    // even and a policy write is in progress only while the global one is odd,
+    // so equality means no committed write since this task's last publication
+    // -- exactly the case the lookup below would discard.  Skip the pid-to-
+    // cgroup lookup for it.
+    if thread.uclamp_policy_generation() == UCLAMP_POLICY_GENERATION.load(Ordering::Acquire) {
+        return;
+    }
     let pid = thread.proc_data.proc.pid();
     let (constraints, generation) = uclamp_constraints_for_pid_with_generation(pid);
     if thread.uclamp_policy_generation() == generation {
