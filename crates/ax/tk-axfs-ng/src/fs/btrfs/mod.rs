@@ -19,6 +19,9 @@ mod tree;
 mod vfs;
 mod volume;
 
+/// Btrfs uses levels 0 through 7 for tree blocks; 8 is the exclusive limit.
+pub(crate) const BTRFS_MAX_LEVEL: u8 = 8;
+
 pub use allocator::{BtrfsAllocator, BtrfsLogicalAllocator, LogicalReservation};
 pub use compression::Compression;
 pub use format::{

@@ -1,5 +1,7 @@
 use axerrno::{AxError, AxResult};
 
+use super::BTRFS_MAX_LEVEL;
+
 /// Bytes in every Btrfs superblock copy.
 pub const BTRFS_SUPERBLOCK_SIZE: usize = 4096;
 const CHECKSUM_BYTES: usize = 32;
@@ -129,7 +131,7 @@ impl BtrfsSuperblock {
         let log_root_transid = le64(bytes, 0x68)?;
         let log_root_level = bytes[0xc8];
         if (log_root == 0 && (log_root_transid != 0 || log_root_level != 0))
-            || (log_root != 0 && log_root_transid == 0)
+            || (log_root != 0 && (log_root_transid == 0 || log_root_level >= BTRFS_MAX_LEVEL))
         {
             return Err(AxError::Io);
         }
@@ -393,6 +395,36 @@ fn le64(bytes: &[u8], offset: usize) -> AxResult<u64> {
         .and_then(|v| v.try_into().ok())
         .map(u64::from_le_bytes)
         .ok_or(AxError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn superblock_with_log_level(level: u8) -> [u8; BTRFS_SUPERBLOCK_SIZE] {
+        let mut image = [0; BTRFS_SUPERBLOCK_SIZE];
+        image[MAGIC_OFFSET..MAGIC_OFFSET + MAGIC.len()].copy_from_slice(MAGIC);
+        image[0x30..0x38].copy_from_slice(&0x1_0000u64.to_le_bytes());
+        image[0x60..0x68].copy_from_slice(&0x2_0000u64.to_le_bytes());
+        image[0x68..0x70].copy_from_slice(&1u64.to_le_bytes());
+        image[0x70..0x78].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        for offset in [0x90, 0x94, 0x98, 0x9c] {
+            image[offset..offset + 4].copy_from_slice(&4096u32.to_le_bytes());
+        }
+        image[0xc8] = level;
+        let checksum = crc32c(&image[CHECKSUM_BYTES..]);
+        image[..4].copy_from_slice(&checksum.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn superblock_log_root_level_stays_within_the_format_limit() {
+        assert!(BtrfsSuperblock::decode(&superblock_with_log_level(7), 0x1_0000).is_ok());
+        assert_eq!(
+            BtrfsSuperblock::decode(&superblock_with_log_level(BTRFS_MAX_LEVEL), 0x1_0000).err(),
+            Some(AxError::Io)
+        );
+    }
 }
 
 /// CRC-32C (Castagnoli) with the Btrfs wire initial/final complement.

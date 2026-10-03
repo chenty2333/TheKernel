@@ -1,6 +1,6 @@
 use axerrno::{AxError, AxResult};
 
-use super::{Checksum, TreeItemKey, crc32c};
+use super::{BTRFS_MAX_LEVEL, Checksum, TreeItemKey, crc32c};
 
 const HEADER_SIZE: usize = 0x65;
 const LEAF_ITEM_SIZE: usize = 25;
@@ -124,6 +124,7 @@ impl<'a> BtrfsTreeBlock<'a> {
             || generation == 0
             || owner == 0
             || level == 0
+            || level >= BTRFS_MAX_LEVEL
             || children.is_empty()
         {
             return Err(AxError::InvalidInput);
@@ -185,6 +186,9 @@ impl<'a> BtrfsTreeBlock<'a> {
         let owner = le64(bytes, 88)?;
         let item_count = le32(bytes, 96)?;
         let level = *bytes.get(100).ok_or(AxError::Io)?;
+        if level >= BTRFS_MAX_LEVEL {
+            return Err(AxError::Io);
+        }
         let item_size = if level == 0 {
             LEAF_ITEM_SIZE
         } else {
@@ -350,6 +354,61 @@ impl<'a> BtrfsTreeBlock<'a> {
             return Err(AxError::Io);
         }
         Ok((key, bytenr, generation))
+    }
+}
+
+pub(super) fn valid_child_level(parent: u8, child: u8) -> bool {
+    child.checked_add(1) == Some(parent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::btrfs::ChecksumType;
+
+    #[test]
+    fn tree_block_levels_are_limited_to_the_format_maximum() {
+        let fsid = [0x5a; 16];
+        let mut image = BtrfsTreeBlock::encode_leaf(4096, &fsid, 4096, 1, 1, &[]).unwrap();
+        image[100] = BTRFS_MAX_LEVEL;
+        let raw_checksum = crc32c(&image[32..]);
+        image[..4].copy_from_slice(&raw_checksum.to_le_bytes());
+        let checksum = Checksum::from_disk(ChecksumType::Crc32c, &image[..32]).unwrap();
+        assert_eq!(
+            BtrfsTreeBlock::decode(&image, &fsid, checksum, 4096).err(),
+            Some(AxError::Io)
+        );
+
+        assert_eq!(
+            BtrfsTreeBlock::encode_internal(
+                4096,
+                &fsid,
+                8192,
+                1,
+                1,
+                BTRFS_MAX_LEVEL,
+                &[TreeChild {
+                    key: TreeItemKey {
+                        objectid: 1,
+                        item_type: 1,
+                        offset: 0,
+                    },
+                    bytenr: 4096,
+                    generation: 1,
+                }],
+            )
+            .err(),
+            Some(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn tree_child_level_must_decrease_by_exactly_one() {
+        assert!(valid_child_level(1, 0));
+        assert!(valid_child_level(7, 6));
+        assert!(!valid_child_level(0, 0));
+        assert!(!valid_child_level(1, 1));
+        assert!(!valid_child_level(3, 1));
     }
 }
 

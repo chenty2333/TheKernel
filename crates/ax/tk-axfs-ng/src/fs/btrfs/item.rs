@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{DeviceId, Metadata, NodePermission, NodeType, Timestamp};
 
-use super::crc32c_seed;
+use super::{BTRFS_MAX_LEVEL, crc32c_seed};
 
 /// Item-type values in the Btrfs key space used by the mounted namespace.
 pub const INODE_ITEM: u8 = 1;
@@ -357,6 +357,24 @@ pub struct BtrfsRootItem {
     pub level: u8,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_item_level_stays_within_the_format_limit() {
+        let mut bytes = alloc::vec![0; ROOT_ITEM_LEVEL + 1];
+        bytes[ROOT_ITEM_GENERATION..ROOT_ITEM_GENERATION + 8].copy_from_slice(&1u64.to_le_bytes());
+        bytes[ROOT_ITEM_ROOT_DIRID..ROOT_ITEM_ROOT_DIRID + 8].copy_from_slice(&1u64.to_le_bytes());
+        bytes[ROOT_ITEM_BYTENR..ROOT_ITEM_BYTENR + 8].copy_from_slice(&4096u64.to_le_bytes());
+        bytes[ROOT_ITEM_LEVEL] = BTRFS_MAX_LEVEL;
+        assert_eq!(BtrfsRootItem::decode(&bytes).err(), Some(AxError::Io));
+
+        bytes[ROOT_ITEM_LEVEL] = BTRFS_MAX_LEVEL - 1;
+        assert!(BtrfsRootItem::decode(&bytes).is_ok());
+    }
+}
+
 impl BtrfsRootItem {
     pub fn decode(bytes: &[u8]) -> AxResult<Self> {
         if bytes.len() <= ROOT_ITEM_LEVEL {
@@ -366,7 +384,7 @@ impl BtrfsRootItem {
         let root_dirid = le64(bytes, ROOT_ITEM_ROOT_DIRID)?;
         let bytenr = le64(bytes, ROOT_ITEM_BYTENR)?;
         let level = bytes[ROOT_ITEM_LEVEL];
-        if generation == 0 || root_dirid == 0 || bytenr == 0 {
+        if generation == 0 || root_dirid == 0 || bytenr == 0 || level >= BTRFS_MAX_LEVEL {
             return Err(AxError::Io);
         }
         Ok(Self {

@@ -6046,14 +6046,14 @@ impl BtrfsMount {
                 &self.superblock.fsid,
                 self.superblock.csum_type,
             )?;
-            let owner = BtrfsTreeBlock::decode(
+            let block = BtrfsTreeBlock::decode(
                 &image,
                 &self.superblock.fsid,
                 Checksum::from_disk(self.superblock.csum_type, &image[..32])?,
                 root.bytenr,
-            )?
-            .owner();
-            if owner == 0 {
+            )?;
+            let owner = block.owner();
+            if owner == 0 || block.level() != root.level {
                 return Err(AxError::Io);
             }
             roots.try_reserve(1).map_err(|_| AxError::NoMemory)?;
@@ -6061,7 +6061,7 @@ impl BtrfsMount {
         }
         for (logical, owner) in roots {
             let mut nodes = BTreeSet::new();
-            self.collect_tree_nodes(logical, owner, None, &mut nodes)?;
+            self.collect_tree_nodes(logical, owner, None, None, &mut nodes)?;
             for node in nodes {
                 if self.volume.logical_range_uses_member(
                     node,
@@ -7268,6 +7268,7 @@ impl BtrfsMount {
         logical: u64,
         owner: u64,
         expected_generation: Option<u64>,
+        expected_parent_level: Option<u8>,
         seen: &mut BTreeSet<u64>,
     ) -> AxResult<()> {
         if !seen.insert(logical) {
@@ -7288,6 +7289,8 @@ impl BtrfsMount {
         if block.owner() != owner
             || block.generation() > self.superblock.generation
             || expected_generation.is_some_and(|generation| block.generation() != generation)
+            || expected_parent_level
+                .is_some_and(|parent| !super::tree::valid_child_level(parent, block.level()))
         {
             return Err(AxError::Io);
         }
@@ -7296,7 +7299,13 @@ impl BtrfsMount {
         }
         for index in 0..block.item_count() {
             let child = block.child(index)?;
-            self.collect_tree_nodes(child.bytenr, owner, Some(child.generation), seen)?;
+            self.collect_tree_nodes(
+                child.bytenr,
+                owner,
+                Some(child.generation),
+                Some(block.level()),
+                seen,
+            )?;
         }
         Ok(())
     }
@@ -7307,6 +7316,7 @@ impl BtrfsMount {
         header_owner: u64,
         relation_root: u64,
         expected_generation: Option<u64>,
+        expected_parent_level: Option<u8>,
         seen: &mut BTreeSet<(u64, u64)>,
         output: &mut Vec<TreeBlockRecord>,
     ) -> AxResult<()> {
@@ -7330,6 +7340,8 @@ impl BtrfsMount {
         if block.owner() != header_owner
             || block.generation() > self.superblock.generation
             || expected_generation.is_some_and(|generation| block.generation() != generation)
+            || expected_parent_level
+                .is_some_and(|parent| !super::tree::valid_child_level(parent, block.level()))
         {
             return Err(AxError::Io);
         }
@@ -7348,6 +7360,7 @@ impl BtrfsMount {
                     header_owner,
                     relation_root,
                     Some(child.generation),
+                    Some(block.level()),
                     seen,
                     output,
                 )?;
@@ -7470,14 +7483,14 @@ impl BtrfsMount {
                 &self.superblock.fsid,
                 self.superblock.csum_type,
             )?;
-            let header_owner = BtrfsTreeBlock::decode(
+            let root_block = BtrfsTreeBlock::decode(
                 &image,
                 &self.superblock.fsid,
                 Checksum::from_disk(self.superblock.csum_type, &image[..32])?,
                 root.bytenr,
-            )?
-            .owner();
-            if header_owner == 0 {
+            )?;
+            let header_owner = root_block.owner();
+            if header_owner == 0 || root_block.level() != root.level {
                 return Err(AxError::Io);
             }
             // `_source_relation_root` selects the existing ROOT_ITEM relation;
@@ -7487,6 +7500,7 @@ impl BtrfsMount {
                 root.bytenr,
                 header_owner,
                 destination,
+                None,
                 None,
                 &mut seen,
                 &mut records,
@@ -7703,6 +7717,7 @@ impl BtrfsMount {
             TreeId::Chunk as u64,
             TreeId::Chunk as u64,
             None,
+            None,
             &mut obsolete_seen,
             &mut obsolete_records,
         )?;
@@ -7710,6 +7725,7 @@ impl BtrfsMount {
             self.superblock.root,
             TreeId::Root as u64,
             TreeId::Root as u64,
+            None,
             None,
             &mut obsolete_seen,
             &mut obsolete_records,
@@ -7720,6 +7736,7 @@ impl BtrfsMount {
             TreeId::FreeSpace as u64,
             TreeId::FreeSpace as u64,
             None,
+            None,
             &mut obsolete_seen,
             &mut obsolete_records,
         )?;
@@ -7728,6 +7745,7 @@ impl BtrfsMount {
             old_extent_root,
             TreeId::Extent as u64,
             TreeId::Extent as u64,
+            None,
             None,
             &mut obsolete_seen,
             &mut obsolete_records,
@@ -7746,6 +7764,7 @@ impl BtrfsMount {
                 TreeId::Log as u64,
                 TreeId::Log as u64,
                 None,
+                None,
                 &mut obsolete_seen,
                 &mut obsolete_records,
             )?;
@@ -7755,6 +7774,7 @@ impl BtrfsMount {
                     root.subvolume,
                     root.subvolume,
                     Some(root.generation),
+                    None,
                     &mut obsolete_seen,
                     &mut obsolete_records,
                 )?;
@@ -7768,6 +7788,7 @@ impl BtrfsMount {
                         TreeId::Log as u64,
                         TreeId::Log as u64,
                         None,
+                        None,
                         &mut obsolete_seen,
                         &mut obsolete_records,
                     )?;
@@ -7777,6 +7798,7 @@ impl BtrfsMount {
                     self.subvolume_root(rewrite.root_objectid)?,
                     rewrite.old_tree_owner,
                     rewrite.root_objectid,
+                    None,
                     None,
                     &mut obsolete_seen,
                     &mut obsolete_records,
@@ -8645,7 +8667,7 @@ impl BtrfsMount {
             if decoded.owner() != owner
                 || decoded.generation() != child.generation
                 || decoded.generation() > block.generation()
-                || decoded.level().checked_add(1) != Some(block.level())
+                || !super::tree::valid_child_level(block.level(), decoded.level())
             {
                 return Err(AxError::Io);
             }
@@ -8726,7 +8748,10 @@ impl BtrfsMount {
                 Checksum::from_disk(superblock.csum_type, &image[..32])?,
                 child.bytenr,
             )?;
-            if decoded.owner() != owner || decoded.generation() != child.generation {
+            if decoded.owner() != owner
+                || decoded.generation() != child.generation
+                || !super::tree::valid_child_level(block.level(), decoded.level())
+            {
                 return Err(AxError::Io);
             }
             Self::collect_tree_items_from(
