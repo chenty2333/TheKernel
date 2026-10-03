@@ -976,10 +976,11 @@ pub fn sys_getrandom<M: UserMemory + ?Sized>(
     Ok(total as isize)
 }
 
-/// `USER_PTR_MAX` from `arch/x86/include/asm/uaccess_64.h`: `TASK_SIZE_MAX`
-/// minus one page.  `access_ok()` accepts any address up to and including it.
+/// `USER_PTR_MAX` from `arch/x86/include/asm/uaccess_64.h`. `access_ok()` uses
+/// the exclusive address-space end as an inclusive pointer-start bound; the
+/// later VMA/usercopy checks still reject the unmapped top guard page.
 const fn user_ptr_max() -> usize {
-    crate::config::USER_SPACE_BASE + crate::config::USER_SPACE_SIZE - 4096
+    crate::config::TASK_SIZE_MAX
 }
 
 pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
@@ -1003,10 +1004,21 @@ pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
 mod tests {
     use core::{cell::Cell, mem::MaybeUninit};
 
+    use memory_addr::PAGE_SIZE_4K;
     use tk_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
     use crate::task::{IdMapInputExtent, Kuid, UserNamespace};
+
+    #[test]
+    fn user_pointer_limit_matches_the_linux_task_size_boundary() {
+        assert_eq!(user_ptr_max(), crate::config::TASK_SIZE_MAX);
+        assert_eq!(
+            crate::config::USER_SPACE_BASE + crate::config::USER_SPACE_SIZE,
+            crate::config::TASK_SIZE_MAX
+        );
+        assert_eq!(crate::config::TASK_SIZE_MAX, (1usize << 47) - PAGE_SIZE_4K);
+    }
 
     struct GroupMemory {
         bytes: Vec<u8>,

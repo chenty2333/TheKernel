@@ -16,7 +16,7 @@ use tk_linux_mm::{MincorePlan, MmError};
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, vm_write_slice};
 
 use crate::{
-    config::{USER_SPACE_BASE, USER_SPACE_SIZE},
+    config::{TASK_SIZE_MAX, USER_SPACE_BASE, USER_SPACE_SIZE},
     mm::{AddrSpace, map_usercopy_error},
 };
 
@@ -34,7 +34,7 @@ fn map_mincore_plan_error(error: MmError) -> AxError {
 /// pointer above the user limit is not. Mapping and permissions remain the
 /// responsibility of the later VMA walk or usercopy operation.
 fn mincore_access_ok(start: usize, len: usize) -> bool {
-    const USER_POINTER_LIMIT: usize = USER_SPACE_BASE + USER_SPACE_SIZE - 1;
+    const USER_POINTER_LIMIT: usize = TASK_SIZE_MAX;
 
     start
         .checked_add(len)
@@ -131,7 +131,7 @@ pub fn sys_mincore<M: UserMemory + ?Sized>(
     length: usize,
     vec: *mut u8,
 ) -> AxResult<isize> {
-    const USER_POINTER_LIMIT: usize = USER_SPACE_BASE + USER_SPACE_SIZE - 1;
+    const USER_POINTER_LIMIT: usize = TASK_SIZE_MAX;
     let plan = MincorePlan::new(addr, length, PAGE_SIZE_4K, USER_POINTER_LIMIT)
         .map_err(map_mincore_plan_error)?;
 
@@ -276,5 +276,19 @@ mod tests {
         );
         drop(memory);
         assert_eq!((provider.reads, provider.writes), (0, 0));
+    }
+
+    #[test]
+    fn mincore_ranges_end_at_task_size_without_admitting_the_guard_page() {
+        let last_page = TASK_SIZE_MAX - PAGE_SIZE_4K;
+        assert!(mincore_access_ok(last_page, PAGE_SIZE_4K));
+        assert!(!mincore_access_ok(TASK_SIZE_MAX, PAGE_SIZE_4K));
+
+        let plan = MincorePlan::new(last_page, PAGE_SIZE_4K, PAGE_SIZE_4K, TASK_SIZE_MAX).unwrap();
+        assert_eq!(plan.rounded_len(), PAGE_SIZE_4K);
+        assert_eq!(
+            MincorePlan::new(TASK_SIZE_MAX, PAGE_SIZE_4K, PAGE_SIZE_4K, TASK_SIZE_MAX),
+            Err(tk_linux_mm::MmError::AddressOutOfRange)
+        );
     }
 }
