@@ -615,6 +615,13 @@ static int test_signal_wait_boundary(void) {
         "signal-wait-child");
 }
 
+static int test_fatal_fault(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-fatal-fault-smoke",
+        NULL,
+        "fatal-fault-child");
+}
+
 /* Does a process start a child the way glibc's posix_spawn does?
  *
  * Not payload-gated: it needs no payload, and it is the mechanism a
@@ -1011,6 +1018,7 @@ static int run_init(int argc, char **argv) {
         { "vfork", test_vfork, 60 },
         { "signal-mask-alias", test_signal_mask_alias, 60 },
         { "signal-wait", test_signal_wait_boundary, 60 },
+        { "fatal-fault", test_fatal_fault, 60 },
         { "posix-spawn", test_posix_spawn_smoke, 60 },
         { "pause", test_pause, 60 },
         { "alarm", test_alarm, 60 },
