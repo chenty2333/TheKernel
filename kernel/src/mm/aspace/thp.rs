@@ -354,59 +354,6 @@ impl AddrSpace {
         Ok(true)
     }
 
-    /// Finds every PMD-aligned mapping of one shared backing folio in this
-    /// address space.  A non-PMD alias of the same 2 MiB backing must make the
-    /// whole promotion ineligible: otherwise its old PTEs would keep pointing
-    /// at the pre-folio frames after the shared backing is switched.
-    pub(crate) fn shared_folio_alias_starts(
-        &self,
-        pages: &Arc<SharedPages>,
-        start_index: usize,
-    ) -> AxResult<Vec<VirtAddr>> {
-        let backing_start = start_index
-            .checked_mul(PAGE_SIZE_4K)
-            .ok_or(AxError::InvalidInput)?;
-        let backing_end = backing_start
-            .checked_add(COLLAPSE_2M_SIZE)
-            .ok_or(AxError::InvalidInput)?;
-        let mut starts = Vec::new();
-        starts
-            .try_reserve_exact(self.areas.len())
-            .map_err(|_| AxError::NoMemory)?;
-        for area in self.areas.iter() {
-            let Some(shared) = area.backend().shared_pages() else {
-                continue;
-            };
-            if !Arc::ptr_eq(shared, pages) {
-                continue;
-            }
-            let backend_start = match area.backend() {
-                Backend::Shared(shared) => shared
-                    .backing_offset(area.start().as_usize())
-                    .ok_or(AxError::BadState)?,
-                _ => unreachable!("shared pages originate only from SharedBackend"),
-            };
-            let backend_end = backend_start
-                .checked_add(area.size())
-                .ok_or(AxError::BadState)?;
-            if backing_start >= backend_end || backing_end <= backend_start {
-                continue;
-            }
-            // A partial overlap is still an alias of pages we are about to
-            // replace, but cannot be made into a PMD without changing its VMA
-            // geometry. Reject before any folio or PTE publication.
-            if backing_start < backend_start || backing_end > backend_end {
-                return Err(AxError::InvalidInput);
-            }
-            let start = area.start() + (backing_start - backend_start);
-            if !PageSize::Size2M.is_aligned(start.as_usize()) {
-                return Err(AxError::InvalidInput);
-            }
-            starts.push(start);
-        }
-        Ok(starts)
-    }
-
     /// Validates an alias P1 run against the shared backing before its folio
     /// is promoted.  It performs every fallible VMA/UFFD/pin/PTE check while
     /// the old mapping remains live; publication below is then one PMD store.
@@ -634,6 +581,25 @@ impl AddrSpace {
         )
     }
 
+    pub(crate) fn publish_shared_folio_pmd_demotion(
+        &mut self,
+        plan: &mut PreparedSharedFolioPmdRedirect,
+        frames: &[PhysAddr],
+    ) -> AxResult<SharedFolioDemotionReplacement> {
+        if frames.len() != COLLAPSE_2M_SIZE / PAGE_SIZE_4K {
+            return Err(AxError::BadState);
+        }
+        debug_assert!(plan.frames.capacity() >= frames.len());
+        plan.frames.clear();
+        plan.frames.extend_from_slice(frames);
+        self.publish_shared_folio_demotion_2m(
+            plan.start,
+            &plan.frames,
+            plan.flags,
+            &mut plan.tables,
+        )
+    }
+
     pub(crate) fn write_protect_shared_folio_redirects(
         &mut self,
         redirects: &[SharedFolioPteRedirect],
@@ -676,6 +642,49 @@ impl AddrSpace {
             let paddr = folio + (offset % COLLAPSE_2M_SIZE);
             let flags = redirect.flags - MappingFlags::WRITE;
             if cursor.remap(redirect.vaddr, paddr, flags).is_err() {
+                for rollback in &redirects[..=index] {
+                    cursor
+                        .remap(
+                            rollback.vaddr,
+                            rollback.old_paddr,
+                            rollback.flags - MappingFlags::WRITE,
+                        )
+                        .map_err(|_| AxError::BadState)?;
+                }
+                cursor.flush();
+                return Err(AxError::BadState);
+            }
+        }
+        cursor.flush();
+        Ok(())
+    }
+
+    /// Redirects resident P1 aliases from a promoted folio to its retained
+    /// base pages.  The caller has copied the folio contents and revoked
+    /// writable access from every alias before publishing these leaves.
+    pub(crate) fn publish_shared_folio_p1_demotion(
+        &mut self,
+        redirects: &[SharedFolioPteRedirect],
+        start_index: usize,
+        frames: &[PhysAddr],
+    ) -> AxResult {
+        if redirects.iter().any(|redirect| {
+            redirect
+                .backing_index
+                .checked_sub(start_index)
+                .and_then(|index| frames.get(index))
+                .is_none()
+        }) {
+            return Err(AxError::BadState);
+        }
+        let mut cursor = self.pt.cursor();
+        for (index, redirect) in redirects.iter().enumerate() {
+            let backing_index = redirect.backing_index - start_index;
+            let frame = frames[backing_index];
+            if cursor
+                .remap(redirect.vaddr, frame, redirect.flags - MappingFlags::WRITE)
+                .is_err()
+            {
                 for rollback in &redirects[..=index] {
                     cursor
                         .remap(
@@ -1055,44 +1064,6 @@ impl AddrSpace {
         debug_assert_eq!(published, source);
         drop(self.synchronize_tlb_after_mutation());
         Ok(())
-    }
-
-    pub(crate) fn preflight_shared_folio_demotion_2m(
-        &self,
-        start: VirtAddr,
-        pages: &Arc<SharedPages>,
-        start_index: usize,
-    ) -> AxResult<MappingFlags> {
-        let end = start + COLLAPSE_2M_SIZE;
-        let area = self
-            .find_area(start)
-            .filter(|area| area.start() <= start && area.end() >= end)
-            .ok_or(AxError::NoMemory)?;
-        if !Arc::ptr_eq(
-            area.backend().shared_pages().ok_or(AxError::InvalidInput)?,
-            pages,
-        ) {
-            return Err(AxError::BadState);
-        }
-        self.check_no_user_io_pin_overlap(start, COLLAPSE_2M_SIZE, InvalidationReason::Remap)?;
-        let range = PageRange::new(start.as_usize(), COLLAPSE_2M_SIZE, PAGE_SIZE_4K)
-            .map_err(|_| AxError::InvalidInput)?;
-        if self.uffd.as_ref().is_some_and(|state| {
-            state
-                .registrations
-                .intersecting(self.address_space_id, range)
-                .any(|registration| registration.mode().bits() & UffdRegisterMode::WP.bits() != 0)
-        }) {
-            return Err(AxError::InvalidInput);
-        }
-        let (folio, flags, size) = self.pt.query_mapped(start).map_err(|error| match error {
-            PagingError::NotMapped => AxError::NoMemory,
-            _ => AxError::BadAddress,
-        })?;
-        if size != PageSize::Size2M || folio != pages.paddr_at(start_index)? {
-            return Err(AxError::BadState);
-        }
-        Ok(flags)
     }
 
     pub(crate) fn write_protect_shared_folio_demotion_2m(

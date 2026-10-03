@@ -880,6 +880,101 @@ impl SharedPages {
         Ok(frames)
     }
 
+    /// Copies promoted-folio contents into its retained 4 KiB backing frames
+    /// without changing ownership or freeing the folio.  Alias transactions
+    /// use this phase after write-protecting every mapping and before
+    /// publishing PTEs that point at the retained frames.
+    pub(crate) fn copy_folio_to_retained_4k_pages(
+        &self,
+        start_index: usize,
+        frames: &[PhysAddr],
+    ) -> AxResult {
+        if self.is_external() {
+            return Err(AxError::OperationNotSupported);
+        }
+        if self.size != PageSize::Size4K
+            || !start_index.is_multiple_of(FOLIO_4K_PAGES)
+            || frames.len() != FOLIO_4K_PAGES
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let storage = self.phys_pages.lock();
+        if self.direct_view_pins.load(Ordering::Acquire) != 0 {
+            return Err(AxError::ResourceBusy);
+        }
+        let folio = storage
+            .folios
+            .iter()
+            .find(|folio| folio.start_index == start_index)
+            .ok_or(AxError::InvalidInput)?;
+        if folio.old_pages.as_slice() != frames {
+            return Err(AxError::BadState);
+        }
+        for (offset, &destination) in frames.iter().enumerate() {
+            // SAFETY: the promoted folio and each retained 4 KiB destination
+            // are live backing-owned frames under `storage`; their ranges do
+            // not overlap, and the copy remains within one 2 MiB folio.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    axhal::mem::phys_to_virt(PhysAddr::from(
+                        folio.paddr.as_usize() + offset * PageSize::Size4K as usize,
+                    ))
+                    .as_ptr(),
+                    axhal::mem::phys_to_virt(destination).as_mut_ptr(),
+                    PageSize::Size4K as usize,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Commits a demotion after [`Self::copy_folio_to_retained_4k_pages`]
+    /// completed and every alias PTE was redirected and invalidated.  The
+    /// caller keeps alias admission frozen across both phases.
+    pub(crate) fn commit_copied_4k_folio_demotion(
+        &self,
+        start_index: usize,
+        frames: &[PhysAddr],
+    ) -> AxResult {
+        if self.is_external() {
+            return Err(AxError::OperationNotSupported);
+        }
+        if self.size != PageSize::Size4K
+            || !start_index.is_multiple_of(FOLIO_4K_PAGES)
+            || frames.len() != FOLIO_4K_PAGES
+        {
+            return Err(AxError::InvalidInput);
+        }
+        let end = start_index
+            .checked_add(FOLIO_4K_PAGES)
+            .ok_or(AxError::InvalidInput)?;
+        let mut storage = self.phys_pages.lock();
+        if self.direct_view_pins.load(Ordering::Acquire) != 0 {
+            return Err(AxError::ResourceBusy);
+        }
+        if end > storage.pages.len() {
+            return Err(AxError::BadState);
+        }
+        let folio_index = storage
+            .folios
+            .iter()
+            .position(|folio| folio.start_index == start_index)
+            .ok_or(AxError::InvalidInput)?;
+        let folio = &storage.folios[folio_index];
+        if folio.old_pages.as_slice() != frames {
+            return Err(AxError::BadState);
+        }
+        let folio = storage.folios.remove(folio_index);
+        for (slot, frame) in storage.pages[start_index..end]
+            .iter_mut()
+            .zip(folio.old_pages.iter().copied())
+        {
+            *slot = Some(frame);
+        }
+        dealloc_frame(folio.paddr, PageSize::Size2M);
+        Ok(())
+    }
+
     pub fn has_4k_folio(&self, start_index: usize) -> bool {
         self.size == PageSize::Size4K
             && self

@@ -26,10 +26,10 @@ use crate::{
     mm::{
         AddrSpace, Backend, DeferredUffdWake, FileMappingLease, FileMappingSharing,
         MadviseReadahead, MadviseThp, PreparedFixedSharedMapping, PreparedProtect,
-        SharedFolioDemotionReplacement, SharedFolioPteRedirect, SharedFolioPteReplacement,
-        SharedPages, WritableMappingAdmission, check_memory_overcommit, check_rlimit_as_growth,
-        check_rlimit_data_growth, checked_align_up, checked_align_up_4k, overcommit_memory_policy,
-        remap_user_mapping,
+        PreparedSharedFolioPmdRedirect, SharedFolioDemotionReplacement, SharedFolioPteRedirect,
+        SharedFolioPteReplacement, SharedPages, WritableMappingAdmission, check_memory_overcommit,
+        check_rlimit_as_growth, check_rlimit_data_growth, checked_align_up, checked_align_up_4k,
+        overcommit_memory_policy, remap_user_mapping,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -2712,86 +2712,212 @@ fn demote_shared_folio_locked(
     start_index: usize,
     guards: &mut [axsync::MutexGuard<'_, AddrSpace>],
 ) -> AxResult<()> {
-    // Snapshot every fallible backing resource before touching any PTE.  The
+    // Snapshot every fallible backing resource before touching any PTE. The
     // old 4 KiB frames remain folio-owned until the final commit.
     let frames = pages.demote_4k_folio_frames(start_index)?;
-    let mut plans = Vec::new();
-    for (guard_index, guard) in guards.iter().enumerate() {
-        for alias_start in guard.shared_folio_alias_starts(&pages, start_index)? {
-            let flags =
-                guard.preflight_shared_folio_demotion_2m(alias_start, &pages, start_index)?;
-            plans.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-            plans.push((guard_index, alias_start, flags));
-        }
-    }
-    if plans.is_empty() {
-        return Err(AxError::BadState);
-    }
-    let mut tables = Vec::new();
-    tables
-        .try_reserve_exact(plans.len())
+    let mut pmd_plans = Vec::new();
+    pmd_plans
+        .try_reserve_exact(guards.len())
         .map_err(|_| AxError::NoMemory)?;
-    for _ in &plans {
-        tables.push(PreparedPageTableFrames::try_new(1).map_err(|_| AxError::NoMemory)?);
+    let mut p1_redirects = Vec::new();
+    p1_redirects
+        .try_reserve_exact(guards.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for guard in guards.iter() {
+        let pmds = guard.prepare_shared_folio_pmd_redirects_except(pages, start_index, None)?;
+        let p1 = guard.preflight_shared_folio_redirects_2m(pages, start_index, None)?;
+        pmd_plans.push(pmds);
+        p1_redirects.push(p1);
+    }
+    let pmd_count = pmd_plans.iter().try_fold(0usize, |count, plans| {
+        count.checked_add(plans.len()).ok_or(AxError::NoMemory)
+    })?;
+    if pmd_count == 0 && p1_redirects.iter().all(Vec::is_empty) {
+        // An already-promoted backing can outlive all resident mappings.
+        // There are then no translations to redirect, only an ownership
+        // transition to commit.
+        return pages.demote_4k_folio(start_index);
     }
 
-    for (protected, &(guard_index, alias_start, flags)) in plans.iter().enumerate() {
-        if let Err(error) =
-            guards[guard_index].write_protect_shared_folio_demotion_2m(alias_start, flags)
-        {
-            for &(rollback_guard, rollback_start, rollback_flags) in plans[..protected].iter().rev()
+    // Pre-reserve publication journals before write-protecting any alias.
+    let mut published_pmd = Vec::new();
+    published_pmd
+        .try_reserve_exact(pmd_count)
+        .map_err(|_| AxError::NoMemory)?;
+    let mut p1_published = Vec::new();
+    p1_published
+        .try_reserve_exact(guards.len())
+        .map_err(|_| AxError::NoMemory)?;
+    p1_published.resize(guards.len(), false);
+
+    // Revoke write access in both PMD and P1 aliases before taking the folio
+    // snapshot.  A P1 DONTUNMAP alias may be unaligned even though the target
+    // alias is a huge PMD; it must participate in the same data transaction.
+    for (guard_index, plans) in pmd_plans.iter().enumerate() {
+        for plan in plans {
+            if let Err(error) =
+                guards[guard_index].write_protect_shared_folio_demotion_2m(plan.start, plan.flags)
             {
-                guards[rollback_guard].restore_shared_folio_demotion_pmd_permissions(
-                    rollback_start,
-                    rollback_flags,
-                )?;
-            }
-            return Err(error);
-        }
-    }
-
-    let mut published = Vec::new();
-    published
-        .try_reserve_exact(plans.len())
-        .map_err(|_| AxError::NoMemory)?;
-    for (index, &(guard_index, alias_start, flags)) in plans.iter().enumerate() {
-        match guards[guard_index].publish_shared_folio_demotion_2m(
-            alias_start,
-            &frames,
-            flags,
-            &mut tables[index],
-        ) {
-            Ok(replacement) => published.push((guard_index, replacement)),
-            Err(error) => {
-                for (rollback_guard, replacement) in published.drain(..).rev() {
-                    guards[rollback_guard].rollback_shared_folio_demotion_2m(replacement)?;
-                }
-                for &(rollback_guard, rollback_start, rollback_flags) in plans.iter().rev() {
-                    guards[rollback_guard].restore_shared_folio_demotion_pmd_permissions(
-                        rollback_start,
-                        rollback_flags,
-                    )?;
-                }
-                return Err(error);
+                let restore = restore_shared_folio_demotion_source_permissions(
+                    guards,
+                    &pmd_plans,
+                    &p1_redirects,
+                );
+                return restore.and(Err(error));
             }
         }
     }
+    for (guard_index, redirects) in p1_redirects.iter().enumerate() {
+        if let Err(error) = guards[guard_index].write_protect_shared_folio_redirects(redirects) {
+            let restore =
+                restore_shared_folio_demotion_source_permissions(guards, &pmd_plans, &p1_redirects);
+            return restore.and(Err(error));
+        }
+    }
 
-    // No stale PMD may retain writable access while the folio is copied back.
+    // Read-only aliases still observe the live folio while its latest bytes
+    // are copied into retained 4 KiB frames.  Only after this snapshot is
+    // complete may P1 aliases be redirected to those frames.
+    if let Err(error) = pages.copy_folio_to_retained_4k_pages(start_index, &frames) {
+        let restore =
+            restore_shared_folio_demotion_source_permissions(guards, &pmd_plans, &p1_redirects);
+        return restore.and(Err(error));
+    }
+
+    for guard_index in 0..pmd_plans.len() {
+        for plan_index in 0..pmd_plans[guard_index].len() {
+            let published = {
+                let plan = &mut pmd_plans[guard_index][plan_index];
+                guards[guard_index].publish_shared_folio_pmd_demotion(plan, &frames)
+            };
+            match published {
+                Ok(replacement) => published_pmd.push((guard_index, replacement)),
+                Err(error) => {
+                    let rollback = rollback_shared_folio_demotion_publication(
+                        guards,
+                        &pmd_plans,
+                        &p1_redirects,
+                        &mut published_pmd,
+                        &p1_published,
+                    );
+                    return rollback.and(Err(error));
+                }
+            }
+        }
+    }
+    for (guard_index, redirects) in p1_redirects.iter().enumerate() {
+        if redirects.is_empty() {
+            continue;
+        }
+        if let Err(error) =
+            guards[guard_index].publish_shared_folio_p1_demotion(redirects, start_index, &frames)
+        {
+            let rollback = rollback_shared_folio_demotion_publication(
+                guards,
+                &pmd_plans,
+                &p1_redirects,
+                &mut published_pmd,
+                &p1_published,
+            );
+            return rollback.and(Err(error));
+        }
+        p1_published[guard_index] = true;
+    }
+
+    // No stale PMD or P1 translation may retain access to the folio while the
+    // backing ownership changes.
     for guard in guards.iter_mut() {
         drop(guard.synchronize_tlb_after_mutation());
     }
-    if let Err(error) = pages.demote_4k_folio(start_index) {
-        for (rollback_guard, replacement) in published.drain(..).rev() {
-            guards[rollback_guard].rollback_shared_folio_demotion_2m(replacement)?;
+    if let Err(error) = pages.commit_copied_4k_folio_demotion(start_index, &frames) {
+        let rollback = rollback_shared_folio_demotion_publication(
+            guards,
+            &pmd_plans,
+            &p1_redirects,
+            &mut published_pmd,
+            &p1_published,
+        );
+        return rollback.and(Err(error));
+    }
+
+    // The backing now names the retained base frames, so it is safe to make
+    // all alias permissions writable again.
+    let mut first_error = None;
+    for (guard_index, plans) in pmd_plans.iter().enumerate() {
+        for plan in plans {
+            if let Err(error) =
+                guards[guard_index].restore_shared_folio_permissions_2m(plan.start, plan.flags)
+            {
+                first_error.get_or_insert(error);
+            }
         }
+    }
+    for (guard_index, redirects) in p1_redirects.iter().enumerate() {
+        if let Err(error) = guards[guard_index].restore_shared_folio_redirect_permissions(redirects)
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn restore_shared_folio_demotion_source_permissions(
+    guards: &mut [axsync::MutexGuard<'_, AddrSpace>],
+    pmd_plans: &[Vec<PreparedSharedFolioPmdRedirect>],
+    p1_redirects: &[Vec<SharedFolioPteRedirect>],
+) -> AxResult {
+    let mut first_error = None;
+    for (guard_index, plans) in pmd_plans.iter().enumerate() {
+        for plan in plans {
+            if let Err(error) = guards[guard_index]
+                .restore_shared_folio_demotion_pmd_permissions(plan.start, plan.flags)
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    for (guard_index, redirects) in p1_redirects.iter().enumerate() {
+        if let Err(error) = guards[guard_index].restore_shared_folio_redirect_permissions(redirects)
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn rollback_shared_folio_demotion_publication(
+    guards: &mut [axsync::MutexGuard<'_, AddrSpace>],
+    pmd_plans: &[Vec<PreparedSharedFolioPmdRedirect>],
+    p1_redirects: &[Vec<SharedFolioPteRedirect>],
+    published_pmd: &mut Vec<(usize, SharedFolioDemotionReplacement)>,
+    p1_published: &[bool],
+) -> AxResult {
+    let mut first_error = None;
+    for guard_index in (0..p1_published.len()).rev() {
+        if p1_published[guard_index]
+            && let Err(error) =
+                guards[guard_index].rollback_shared_folio_redirects(&p1_redirects[guard_index])
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    for (guard_index, replacement) in published_pmd.drain(..).rev() {
+        if let Err(error) =
+            guards[guard_index].rollback_shared_folio_demotion_2m_protected(replacement)
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    for guard in guards.iter_mut() {
+        drop(guard.synchronize_tlb_after_mutation());
+    }
+    if let Some(error) = first_error {
+        // A failed remap rollback may leave some aliases on retained frames
+        // while the folio remains authoritative. Keep every alias read-only
+        // rather than exposing a writable split-brain backing.
         return Err(error);
     }
-    for (guard_index, replacement) in published {
-        guards[guard_index]
-            .restore_shared_folio_permissions_2m(replacement.start, replacement.flags)?;
-    }
-    Ok(())
+    restore_shared_folio_demotion_source_permissions(guards, pmd_plans, p1_redirects)
 }
 
 /// Creates a sparse anonymous-shmem hole across every address space alias.
@@ -4218,6 +4344,78 @@ mod tests {
         .unwrap();
         let device = Backend::new_shared(base, Arc::new(pages));
         assert!(classify_madvise_backend(&device).has_physical_mapping);
+    }
+
+    #[test]
+    fn madv_remove_demotes_shared_folio_with_a_p1_alias() {
+        let _context = crate::test_support::scheduler_test_context();
+        let size = PageSize::Size2M as usize;
+        let base = VirtAddr::from(0x1000);
+        let source = VirtAddr::from(size);
+        let p1_alias = VirtAddr::from(2 * size + PAGE_SIZE_4K);
+        let pages = Arc::new(SharedPages::new_shmem(size, PageSize::Size4K).unwrap());
+        let pattern = [0x5a_u8; 32];
+        pages.write_bytes(0, &pattern).unwrap();
+        let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        let mut aspace = AddrSpace::new_empty(base, 8 * size).unwrap();
+        aspace
+            .map(
+                source,
+                size,
+                flags,
+                true,
+                Backend::new_shared(source, pages.clone()),
+            )
+            .unwrap();
+        aspace
+            .map(
+                p1_alias,
+                size,
+                flags,
+                true,
+                Backend::new_shared(p1_alias, pages.clone()),
+            )
+            .unwrap();
+        let aspace = Arc::new(Mutex::new(aspace));
+
+        // This is the post-collapse topology also created by a page-granular
+        // DONTUNMAP duplicate: one aligned huge alias and one unaligned P1
+        // alias both name the same promoted SharedPages folio.
+        process_madvise_collapse(&aspace, source.as_usize(), size).unwrap();
+        {
+            let aspace = aspace.lock();
+            assert!(matches!(
+                aspace.page_table().query(source),
+                Ok((_, _, PageSize::Size2M))
+            ));
+            assert!(matches!(
+                aspace.page_table().query(p1_alias),
+                Ok((_, _, PageSize::Size4K))
+            ));
+        }
+
+        // Exercise the same alias demotion through a 4 KiB-granularity user
+        // of the mapping, and verify the promoted contents survive the
+        // redirect of its unaligned P1 alias.
+        ensure_4k_granularity_across_aliases(&aspace, source, PAGE_SIZE_4K).unwrap();
+        assert!(!pages.has_4k_folio(0));
+        let mut observed = [0; 32];
+        pages.read_bytes(0, &mut observed).unwrap();
+        assert_eq!(observed, pattern);
+
+        process_madvise_collapse(&aspace, source.as_usize(), size).unwrap();
+
+        remove_anonymous_shared_across_aliases(&aspace, pages.clone(), 0, size).unwrap();
+        assert!(!pages.has_4k_folio(0));
+        let aspace = aspace.lock();
+        assert!(matches!(
+            aspace.page_table().query(source),
+            Err(axhal::paging::PagingError::NotMapped)
+        ));
+        assert!(matches!(
+            aspace.page_table().query(p1_alias),
+            Err(axhal::paging::PagingError::NotMapped)
+        ));
     }
 
     #[test]
