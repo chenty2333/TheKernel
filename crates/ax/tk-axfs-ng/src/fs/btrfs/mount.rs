@@ -5411,7 +5411,11 @@ impl BtrfsMount {
             };
             let mut items = self.chunk_tree_items()?;
             let mut device_items = self.device_items_from_chunk_tree(&items)?;
-            let encoded = chunk.encode_item(|index| self.volume.member_devid(index))?;
+            let encoded = chunk.encode_item(|index| {
+                let devid = self.volume.member_devid(index)?;
+                let device = device_items.get(&devid)?;
+                Some((devid, device.uuid))
+            })?;
             Self::set_raw_item(
                 &mut items,
                 RawTreeItem {

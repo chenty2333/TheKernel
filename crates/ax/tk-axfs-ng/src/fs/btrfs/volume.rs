@@ -105,13 +105,13 @@ impl Chunk {
         })
     }
 
-    /// Serializes the typed CHUNK_ITEM payload.  Device identity is supplied
-    /// by the transaction's checked member map; positional stripe indices are
-    /// never emitted as a synthetic devid.
+    /// Serializes the typed CHUNK_ITEM payload.  Device ID and UUID are
+    /// supplied by the transaction's checked member map; positional stripe
+    /// indices are never emitted as a synthetic identity.
     #[allow(dead_code)]
     pub fn encode_item(
         &self,
-        mut device_id: impl FnMut(usize) -> Option<u64>,
+        mut device_identity: impl FnMut(usize) -> Option<(u64, [u8; 16])>,
     ) -> AxResult<Vec<u8>> {
         if self.stripes.is_empty() || self.stripes.len() > u16::MAX as usize {
             return Err(AxError::InvalidInput);
@@ -147,10 +147,10 @@ impl Chunk {
         );
         output.extend_from_slice(&self.sub_stripes.to_le_bytes());
         for stripe in &self.stripes {
-            let devid = device_id(stripe.device).ok_or(AxError::NoSuchDevice)?;
+            let (devid, uuid) = device_identity(stripe.device).ok_or(AxError::NoSuchDevice)?;
             output.extend_from_slice(&devid.to_le_bytes());
             output.extend_from_slice(&stripe.physical.to_le_bytes());
-            output.extend_from_slice(&[0; 16]); // dev UUID belongs to checked device item; preserve no invented identity
+            output.extend_from_slice(&uuid);
         }
         Ok(output)
     }
@@ -1865,6 +1865,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chunk_item_encodes_checked_member_uuid_for_each_stripe() {
+        let uuid = [0xa5; 16];
+        let chunk = Chunk {
+            logical: 0x10_000,
+            length: 0x10_000,
+            stripe_len: 0x10_000,
+            profile: ChunkProfile::Single,
+            sub_stripes: 0,
+            block_group_flags: BLOCK_GROUP_DATA,
+            stripes: vec![Stripe {
+                device: 0,
+                physical: 0x20_000,
+            }],
+        };
+        let encoded = chunk
+            .encode_item(|device| (device == 0).then_some((17, uuid)))
+            .unwrap();
+        assert_eq!(
+            &encoded[CHUNK_HEADER_BYTES + 16..CHUNK_HEADER_BYTES + STRIPE_BYTES],
+            &uuid
+        );
+    }
+
+    #[test]
     fn raid10_geometry_uses_the_fixed_two_stripe_mirror_group() {
         assert!(validate_raid10_geometry(2, 2).is_ok());
         assert!(validate_raid10_geometry(4, 2).is_ok());
@@ -1890,7 +1914,7 @@ mod tests {
                 .collect(),
         };
         assert_eq!(
-            malformed.encode_item(|device| Some(device as u64 + 1)),
+            malformed.encode_item(|device| Some((device as u64 + 1, [0; 16]))),
             Err(AxError::InvalidInput)
         );
     }
