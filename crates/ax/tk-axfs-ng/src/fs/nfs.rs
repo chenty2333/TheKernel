@@ -3330,13 +3330,17 @@ impl NfsMount {
             (Ok(_), _) => self.open(&dir, name, 3, 0)?,
             (Err(_), _) => self.create_file(&dir, name, 0o600, 3)?,
         };
-        self.setattr(&state.handle, state.stateid, None, Some(value.len() as u64))?;
-        let written = self.write(&state.handle, state.stateid, 0, StableHow::FileSync, value)?;
-        if written.count as usize != value.len() {
-            return Err(NfsError::Transport);
-        };
-        self.commit(&state.handle, 0, 0)?;
-        self.close(&state)
+        let result = (|| {
+            self.setattr(&state.handle, state.stateid, None, Some(value.len() as u64))?;
+            let written =
+                self.write(&state.handle, state.stateid, 0, StableHow::FileSync, value)?;
+            if written.count as usize != value.len() {
+                return Err(NfsError::Transport);
+            }
+            self.commit(&state.handle, 0, 0)?;
+            Ok(())
+        })();
+        close_after_open_operation(result, || self.close(&state))
     }
     pub fn remove_named_attr(&self, file: &FileHandle, name: &FsName) -> NfsResult<()> {
         let dir = self.openattr(file, false)?;
@@ -7097,6 +7101,24 @@ fn checked_server_transfer(returned: usize, requested: usize) -> VfsResult<usize
         Err(VfsError::Io)
     }
 }
+
+fn close_after_open_operation<T>(
+    result: NfsResult<T>,
+    close: impl FnOnce() -> NfsResult<()>,
+) -> NfsResult<T> {
+    match result {
+        Ok(value) => {
+            close()?;
+            Ok(value)
+        }
+        Err(error) => {
+            // A failed CLOSE remains represented in `state_records` for the
+            // session recovery path; do not hide the operation's primary error.
+            let _ = close();
+            Err(error)
+        }
+    }
+}
 impl NodeOps for NfsOpenFile {
     fn inode(&self) -> u64 {
         self.attr.lock().fileid
@@ -7656,6 +7678,21 @@ mod tests {
     fn server_transfer_cannot_exceed_requested_buffer() {
         assert_eq!(checked_server_transfer(4, 4), Ok(4));
         assert_eq!(checked_server_transfer(5, 4), Err(VfsError::Io));
+    }
+
+    #[test]
+    fn named_attribute_operation_error_still_attempts_close() {
+        let mut closed = false;
+        let result = close_after_open_operation::<()>(Err(NfsError::Malformed), || {
+            closed = true;
+            Ok(())
+        });
+        assert_eq!(result, Err(NfsError::Malformed));
+        assert!(closed);
+        assert_eq!(
+            close_after_open_operation(Ok(7), || Err(NfsError::Transport)),
+            Err(NfsError::Transport)
+        );
     }
 
     #[test]
