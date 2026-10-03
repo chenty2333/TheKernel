@@ -16,7 +16,7 @@ use tk_linux_mm::{MincorePlan, MmError};
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, vm_write_slice};
 
 use crate::{
-    config::{TASK_SIZE_MAX, USER_SPACE_BASE, USER_SPACE_SIZE},
+    config::TASK_SIZE_MAX,
     mm::{AddrSpace, map_usercopy_error},
 };
 
@@ -178,6 +178,8 @@ mod tests {
 
     use tk_linux_usercopy::{UserCopyError, VmResult};
 
+    use crate::config::USER_SPACE_BASE;
+
     use super::*;
 
     struct AccessProbe {
@@ -258,7 +260,7 @@ mod tests {
             sys_mincore(
                 &mut memory,
                 empty_aspace(),
-                USER_SPACE_BASE + USER_SPACE_SIZE,
+                TASK_SIZE_MAX + PAGE_SIZE_4K,
                 0,
                 ptr::null_mut(),
             ),
@@ -270,7 +272,7 @@ mod tests {
                 empty_aspace(),
                 USER_SPACE_BASE,
                 0,
-                (USER_SPACE_BASE + USER_SPACE_SIZE) as *mut u8,
+                (TASK_SIZE_MAX + PAGE_SIZE_4K) as *mut u8,
             ),
             Err(AxError::BadAddress)
         );
@@ -282,10 +284,12 @@ mod tests {
     fn mincore_ranges_end_at_task_size_without_admitting_the_guard_page() {
         let last_page = TASK_SIZE_MAX - PAGE_SIZE_4K;
         assert!(mincore_access_ok(last_page, PAGE_SIZE_4K));
+        assert!(mincore_access_ok(TASK_SIZE_MAX, 0));
         assert!(!mincore_access_ok(TASK_SIZE_MAX, PAGE_SIZE_4K));
 
         let plan = MincorePlan::new(last_page, PAGE_SIZE_4K, PAGE_SIZE_4K, TASK_SIZE_MAX).unwrap();
         assert_eq!(plan.rounded_len(), PAGE_SIZE_4K);
+        assert!(MincorePlan::new(TASK_SIZE_MAX, 0, PAGE_SIZE_4K, TASK_SIZE_MAX).is_ok());
         assert_eq!(
             MincorePlan::new(TASK_SIZE_MAX, PAGE_SIZE_4K, PAGE_SIZE_4K, TASK_SIZE_MAX),
             Err(tk_linux_mm::MmError::AddressOutOfRange)
