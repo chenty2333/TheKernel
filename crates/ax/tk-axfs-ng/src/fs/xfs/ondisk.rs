@@ -304,8 +304,12 @@ pub struct XfsAgf {
     pub longest_free_extent: u32,
     pub bno_root: u32,
     pub cnt_root: u32,
+    pub bno_level: u32,
+    pub cnt_level: u32,
     pub rmap_root: Option<u32>,
+    pub rmap_level: Option<u32>,
     pub refcount_root: Option<u32>,
+    pub refcount_level: Option<u32>,
     pub freelist_first: u32,
     pub freelist_last: u32,
     pub freelist_count: u32,
@@ -314,7 +318,8 @@ pub struct XfsAgf {
 
 impl XfsAgf {
     pub(super) fn parse(bytes: &[u8], features: XfsFeatures, crc_enabled: bool) -> XfsResult<Self> {
-        if bytes.len() < 92 || be32(bytes, 0)? != XFS_AGF_MAGIC {
+        let minimum_size = if features.has_reflink() { 96 } else { 92 };
+        if bytes.len() < minimum_size || be32(bytes, 0)? != XFS_AGF_MAGIC {
             return Err(XfsError::CorruptMetadata);
         }
         if crc_enabled {
@@ -332,23 +337,52 @@ impl XfsAgf {
         };
         let mut uuid = [0; 16];
         uuid.copy_from_slice(slice(bytes, 64, 16)?);
+        let bno_level = be32(bytes, 28)?;
+        let cnt_level = be32(bytes, 32)?;
+        let rmap_level = features.has_rmapbt().then(|| be32(bytes, 36)).transpose()?;
+        let refcount_level = features
+            .has_reflink()
+            .then(|| be32(bytes, 92))
+            .transpose()?;
+        if bno_level == 0
+            || cnt_level == 0
+            || rmap_level.is_some_and(|level| level == 0)
+            || refcount_level.is_some_and(|level| level == 0)
+        {
+            return Err(XfsError::CorruptMetadata);
+        }
         Ok(Self {
             sequence: be32(bytes, 8)?,
             length: be32(bytes, 12)?,
             bno_root: be32(bytes, 16)?,
             cnt_root: be32(bytes, 20)?,
+            bno_level,
+            cnt_level,
             free_blocks: be32(bytes, 52)?,
             longest_free_extent: be32(bytes, 56)?,
             freelist_first: be32(bytes, 40)?,
             freelist_last: be32(bytes, 44)?,
             freelist_count: be32(bytes, 48)?,
             rmap_root,
+            rmap_level,
             refcount_root,
+            refcount_level,
             uuid: XfsUuid(uuid),
         })
     }
 
     pub(super) fn serialize(self, sb: XfsSuperblock, lsn: u64) -> XfsResult<Vec<u8>> {
+        if self.bno_level == 0
+            || self.cnt_level == 0
+            || self.rmap_root.is_some() != self.rmap_level.is_some()
+            || self.refcount_root.is_some() != self.refcount_level.is_some()
+            || self.rmap_root.is_some() != sb.features.has_rmapbt()
+            || self.refcount_root.is_some() != sb.features.has_reflink()
+            || self.rmap_level.is_some_and(|level| level == 0)
+            || self.refcount_level.is_some_and(|level| level == 0)
+        {
+            return Err(XfsError::CorruptMetadata);
+        }
         let mut bytes = vec![0; sb.sector_size as usize];
         if bytes.len() < if sb.is_v5() { 224 } else { 92 } {
             return Err(XfsError::CorruptMetadata);
@@ -358,8 +392,13 @@ impl XfsAgf {
         put_be32(&mut bytes, 12, self.length)?;
         put_be32(&mut bytes, 16, self.bno_root)?;
         put_be32(&mut bytes, 20, self.cnt_root)?;
+        put_be32(&mut bytes, 28, self.bno_level)?;
+        put_be32(&mut bytes, 32, self.cnt_level)?;
         if let Some(root) = self.rmap_root {
             put_be32(&mut bytes, 24, root)?;
+        }
+        if let Some(level) = self.rmap_level {
+            put_be32(&mut bytes, 36, level)?;
         }
         put_be32(&mut bytes, 40, self.freelist_first)?;
         put_be32(&mut bytes, 44, self.freelist_last)?;
@@ -369,6 +408,9 @@ impl XfsAgf {
         bytes[64..80].copy_from_slice(&self.uuid.0);
         if let Some(root) = self.refcount_root {
             put_be32(&mut bytes, 88, root)?;
+        }
+        if let Some(level) = self.refcount_level {
+            put_be32(&mut bytes, 92, level)?;
         }
         if sb.is_v5() {
             put_be64(&mut bytes, 208, lsn)?;
@@ -1243,5 +1285,114 @@ impl XfsAgfl {
             rewrite_crc32c(&mut bytes, 32)?;
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod agf_tests {
+    use super::*;
+
+    fn test_superblock() -> XfsSuperblock {
+        XfsSuperblock {
+            block_size: 512,
+            data_blocks: 2,
+            realtime_blocks: 0,
+            realtime_extents: 0,
+            realtime_extent_size: 0,
+            log_start: 0,
+            root_inode: 1,
+            realtime_bitmap_inode: 0,
+            realtime_summary_inode: 0,
+            realtime_bitmap_blocks: 0,
+            ag_blocks: 2,
+            ag_count: 1,
+            log_blocks: 2,
+            quota_flags: 0,
+            user_quota_inode: 0,
+            group_quota_inode: 0,
+            project_quota_inode: 0,
+            version: XfsSuperblock::VERSION_5,
+            version_features: 0,
+            sector_size: 512,
+            inode_size: 256,
+            inodes_per_block: 2,
+            block_log: 9,
+            sector_log: 9,
+            inode_log: 8,
+            inodes_per_block_log: 1,
+            ag_block_log: 1,
+            directory_block_log: 0,
+            uuid: XfsUuid([0x11; 16]),
+            meta_uuid: XfsUuid([0x22; 16]),
+            features: XfsFeatures {
+                compat: 0,
+                ro_compat: XfsFeatures::RO_COMPAT_RMAPBT | XfsFeatures::RO_COMPAT_REFLINK,
+                incompat: 0,
+                log_incompat: 0,
+            },
+            metadir_inode: 0,
+            rtgroup_count: 0,
+            rtgroup_extents: 0,
+            rtgroup_block_log: 0,
+            realtime_start: 0,
+            realtime_reserved: 0,
+        }
+    }
+
+    fn test_agf(uuid: XfsUuid) -> XfsAgf {
+        XfsAgf {
+            sequence: 0,
+            length: 2,
+            free_blocks: 1,
+            longest_free_extent: 1,
+            bno_root: 1,
+            cnt_root: 1,
+            bno_level: 3,
+            cnt_level: 4,
+            rmap_root: Some(1),
+            rmap_level: Some(5),
+            refcount_root: Some(1),
+            refcount_level: Some(6),
+            freelist_first: 0,
+            freelist_last: 0,
+            freelist_count: 0,
+            uuid,
+        }
+    }
+
+    #[test]
+    fn agf_tree_levels_survive_parse_and_mutation_serialization() {
+        let sb = test_superblock();
+        let agf = test_agf(sb.uuid);
+        let bytes = agf.serialize(sb, 7).unwrap();
+        let parsed = XfsAgf::parse(&bytes, sb.features, true).unwrap();
+        assert_eq!(parsed, agf);
+
+        let mut changed = parsed;
+        changed.free_blocks = 0;
+        let persisted = changed.serialize(sb, 8).unwrap();
+        let reparsed = XfsAgf::parse(&persisted, sb.features, true).unwrap();
+        assert_eq!(
+            (
+                reparsed.bno_level,
+                reparsed.cnt_level,
+                reparsed.rmap_level,
+                reparsed.refcount_level,
+            ),
+            (3, 4, Some(5), Some(6))
+        );
+    }
+
+    #[test]
+    fn agf_rejects_zero_btree_levels() {
+        let sb = test_superblock();
+        let agf = test_agf(sb.uuid);
+        let mut bytes = agf.serialize(sb, 0).unwrap();
+        put_be32(&mut bytes, 28, 0).unwrap();
+        rewrite_crc32c(&mut bytes, 216).unwrap();
+        assert_eq!(
+            XfsAgf::parse(&bytes, sb.features, true),
+            Err(XfsError::CorruptMetadata)
+        );
     }
 }
