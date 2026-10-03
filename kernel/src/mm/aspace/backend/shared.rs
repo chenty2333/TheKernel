@@ -299,30 +299,31 @@ impl SharedPages {
         // allocation or resident charge to unwind.
         let backing_key = SharedBackingKey::allocate()?;
         let num_pages = size / page_size as usize;
-        let mut phys_pages = Vec::new();
+        let mut phys_pages = Vec::<Option<PhysAddr>>::new();
         phys_pages
             .try_reserve_exact(num_pages)
             .map_err(|_| AxError::NoMemory)?;
         for _ in 0..num_pages {
             match alloc_frame(true, page_size) {
-                Ok(frame) => phys_pages.push(frame),
+                Ok(frame) => phys_pages.push(Some(frame)),
                 Err(err) => {
-                    for frame in phys_pages {
+                    for frame in phys_pages.into_iter().flatten() {
                         dealloc_frame(frame, page_size);
                     }
                     return Err(err);
                 }
             }
         }
+        let storage = SharedPageStorage {
+            pages: phys_pages,
+            folios: Vec::new(),
+        };
         if let Some(charge) = resident_charge {
             charge_shmem_pages(charge, num_pages, page_size);
         }
         Ok(Self {
             backing_key,
-            phys_pages: Mutex::new(SharedPageStorage {
-                pages: phys_pages.into_iter().map(Some).collect(),
-                folios: Vec::new(),
-            }),
+            phys_pages: Mutex::new(storage),
             secret_frames: None,
             secret_size: None,
             secret_growth: None,
