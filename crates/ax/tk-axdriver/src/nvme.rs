@@ -75,6 +75,10 @@ impl DriverProbe for NvmeDriver {
         };
         let allow_write = axhal::boot::command_line_value("nvme.allow_write") == Some("1");
         if allow_write {
+            const WARNING: &[u8] =
+                b"\n!!! NVMe WRITES ENABLED: nvme.allow_write=1; WINDOWS DATA AT RISK !!!\n";
+            axhal::console::write_tty_bytes(WARNING);
+            let _ = axhal::console::try_write_diagnostic_bytes(WARNING);
             log::warn!(
                 "!!! NVMe WRITES ENABLED by nvme.allow_write=1: ALL DATA INCLUDING WINDOWS IS AT \
                  RISK !!!"
