@@ -4840,7 +4840,11 @@ impl BtrfsMount {
         target_chunk: Option<(u64, u64)>,
     ) -> AxResult<()> {
         if image.is_empty() {
-            return Err(AxError::InvalidInput);
+            // An empty segment list is a real truncate-to-zero transaction:
+            // it removes old extent/data-ref/checksum state and updates the
+            // inode and free-space/quota trees without allocating a new data
+            // extent.
+            return self.replace_file_with_regular_segments(fs_root, tree_owner, inode, 0, &[]);
         }
         let old_extents = self.file_extents(fs_root, tree_owner, inode)?;
         let sector = u64::from(self.superblock.sectorsize);
