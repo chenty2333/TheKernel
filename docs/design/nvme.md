@@ -83,3 +83,10 @@ write/read, and host fake repeats 70 pairs across both CQ phase wraps.
 Write-enable warning is also sent directly to the foreground and diagnostic
 console transports, so the boot log filter cannot hide it. QEMU with the
 ordinary default log filter printed the warning before `NVME_RAW_OK`.
+
+Final combined KVM boot with NVMe, virtio-blk and USB storage enumerated all
+three disks alongside the boot module and passed the NVMe read-only helper.
+Run-local boot-argument ESP/GRUB outputs are checked against all input paths
+before writing: matching paths and hardlinks to an input NVMe image are
+rejected without invoking the ESP builder. A normal explicit RO-parameter
+boot still passed the content/admission helper.

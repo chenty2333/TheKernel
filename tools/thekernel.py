@@ -594,9 +594,20 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
         if not re.fullmatch(r"[A-Za-z0-9_.=,:/+ -]+", spec.kernel_args):
             raise ProductError("kernel arguments must be plain GRUB tokens")
         copied_esp = run_dir / "kernel-args-esp.img"
+        grub_path = run_dir / "grub-args.cfg"
+        protected = (artifacts.kernel, selected_esp, selected_rootfs, *(
+            path for path in (spec.nvme_disk, spec.usb_disk, spec.extra_block, spec.commands)
+            if path is not None
+        ))
+        try:
+            _validate_output_destinations(
+                (("kernel-args ESP", copied_esp), ("kernel-args GRUB config", grub_path)),
+                protected_paths=protected,
+            )
+        except RunnerError as error:
+            raise ProductError(str(error)) from error
         grub_source = REPO_ROOT / "config/x86_64" / ("grub.cfg" if spec.rootfs_transport == "module" else "grub-drive.cfg")
         grub = grub_source.read_text().replace("multiboot2 /TheKernel.elf", "multiboot2 /TheKernel.elf " + spec.kernel_args)
-        grub_path = run_dir / "grub-args.cfg"
         grub_path.write_text(grub)
         command = ["bash", str(REPO_ROOT / "scripts/build-x86-uefi-esp.sh"),
                    "--kernel", str(artifacts.kernel), "--output", str(copied_esp),
