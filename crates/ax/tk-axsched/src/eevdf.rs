@@ -4562,7 +4562,10 @@ impl<T> EEVDFScheduler<T> {
         if period_ns == 0 {
             return Err(SchedulerError::InconsistentState);
         }
-        let state = unsafe { current.owned_state().clone() };
+        // The queue owner excludes state writers. All reads and derived
+        // scalar values below finish before rr/fair_service_transaction
+        // mutates this slot, so no owned rollback snapshot is needed here.
+        let state = unsafe { current.owned_state() };
         if state.runtime_remainder_ns >= period_ns
             || (state.runtime_remainder_ns != 0
                 && state.runtime_fraction_period_ns != 0
@@ -4573,7 +4576,7 @@ impl<T> EEVDFScheduler<T> {
         {
             return Err(SchedulerError::InconsistentState);
         }
-        Self::validate_runtime_fraction_owner(current, &state)?;
+        Self::validate_runtime_fraction_owner(current, state)?;
         if state.runtime_fraction_remainder_ns != 0 && state.runtime_fraction_period_ns != period_ns
         {
             // A conversion residue is still runtime in the old tuple.  Do not
@@ -4700,7 +4703,9 @@ impl<T> EEVDFScheduler<T> {
         if is_deadline_class(current.sched_params().class) {
             return self.account_deadline_runtime(current, delta.elapsed_ns());
         }
-        let state = unsafe { current.owned_state().clone() };
+        // This read-only borrow ends before the model transaction and token
+        // publication; both remain under the same queue-owner exclusion.
+        let state = unsafe { current.owned_state() };
         if state.runtime_remainder_ns >= period
             || (state.runtime_remainder_ns != 0
                 && state.runtime_fraction_period_ns != 0
@@ -4713,7 +4718,7 @@ impl<T> EEVDFScheduler<T> {
         {
             return Err(SchedulerError::InconsistentState);
         }
-        Self::validate_runtime_fraction_owner(current, &state)?;
+        Self::validate_runtime_fraction_owner(current, state)?;
         let params = current.sched_params();
         let fraction_weight = Self::runtime_fraction_weight(params)?;
         let total = u128::from(state.runtime_remainder_ns)
@@ -4771,7 +4776,8 @@ impl<T> EEVDFScheduler<T> {
     }
 
     fn settle_before_lifecycle(&mut self, task: &Arc<EEVDFTask<T>>) -> Result<(), SchedulerError> {
-        let state = unsafe { task.owned_state().clone() };
+        // Copy the period before settlement can write the state slot.
+        let state = unsafe { task.owned_state() };
         if state.runtime_remainder_ns != 0 || state.runtime_fraction_remainder_ns != 0 {
             let period = state.runtime_fraction_period_ns;
             self.settle_runtime_remainder(task, period)?;
