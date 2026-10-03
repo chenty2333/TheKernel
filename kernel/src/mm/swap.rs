@@ -8,7 +8,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::{
+    ops::Bound,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::OpenOptions;
@@ -42,6 +45,20 @@ struct SwapArea {
     draining: bool,
     _activation: SwapActivation,
 }
+
+struct SwapoffDrainGuard {
+    id: u16,
+}
+
+impl Drop for SwapoffDrainGuard {
+    fn drop(&mut self) {
+        let mut swaps = SWAPS.lock();
+        if let Some(area) = swaps.areas.values_mut().find(|area| area.id == self.id) {
+            area.draining = false;
+        }
+    }
+}
+
 struct SwapRegistry {
     areas: BTreeMap<Vec<u8>, SwapArea>,
     next_id: u16,
@@ -259,23 +276,55 @@ pub(crate) fn unregister_address_space(aspace: &Arc<Mutex<AddrSpace>>) {
 /// system-wide uprobes.  Callers only retain strong references returned by the
 /// snapshot; the registry itself remains weak and therefore cannot extend an
 /// mm's lifetime.
-pub(crate) fn live_address_spaces() -> Vec<Arc<Mutex<AddrSpace>>> {
+fn try_live_address_spaces() -> AxResult<Vec<Arc<Mutex<AddrSpace>>>> {
     let mut live = LIVE_ADDRESS_SPACES.lock();
+    let count = live.entries.len();
     let mut spaces = Vec::new();
-    let stale: Vec<_> = live
-        .entries
-        .iter()
-        .filter_map(|(id, (weak, ..))| {
-            weak.upgrade().map_or(Some(*id), |aspace| {
-                spaces.push(aspace);
-                None
-            })
-        })
-        .collect();
+    spaces
+        .try_reserve_exact(count)
+        .map_err(|_| AxError::NoMemory)?;
+    let mut stale = Vec::new();
+    stale
+        .try_reserve_exact(count)
+        .map_err(|_| AxError::NoMemory)?;
+    for (id, (weak, ..)) in &live.entries {
+        if let Some(aspace) = weak.upgrade() {
+            spaces.push(aspace);
+        } else {
+            stale.push(*id);
+        }
+    }
     for id in stale {
         live.entries.remove(&id);
     }
-    spaces
+    Ok(spaces)
+}
+
+fn for_each_live_address_space(mut visit: impl FnMut(Arc<Mutex<AddrSpace>>)) {
+    // Address-space IDs are monotonic and never reused. Walking one weak entry
+    // at a time avoids allocating a global snapshot for revocation callers.
+    let mut after = 0;
+    loop {
+        let next = {
+            let live = LIVE_ADDRESS_SPACES.lock();
+            live.entries
+                .range((Bound::Excluded(after), Bound::Unbounded))
+                .next()
+                .map(|(&id, (weak, ..))| (id, weak.clone()))
+        };
+        let Some((id, weak)) = next else {
+            break;
+        };
+        after = id;
+        if let Some(aspace) = weak.upgrade() {
+            visit(aspace);
+        } else {
+            let mut live = LIVE_ADDRESS_SPACES.lock();
+            if live.entries.get(&id).is_some_and(|(current, ..)| current.upgrade().is_none()) {
+                live.entries.remove(&id);
+            }
+        }
+    }
 }
 
 /// Revokes resident PTEs for exactly one externally owned backing.  The live
@@ -285,9 +334,9 @@ pub(crate) fn live_address_spaces() -> Vec<Arc<Mutex<AddrSpace>>> {
 /// it.  Locks are acquired one address space at a time, never while holding a
 /// device/lease registry lock.
 pub(crate) fn revoke_shared_pages(pages: &Arc<SharedPages>) {
-    for aspace in live_address_spaces() {
+    for_each_live_address_space(|aspace| {
         aspace.lock().revoke_external_shared_pages(pages);
-    }
+    });
 }
 
 pub(crate) fn revoke_external_shared_pages(pages: &Arc<SharedPages>) {
@@ -432,38 +481,43 @@ pub fn deactivate(location: &Location) -> AxResult<()> {
         area.draining = true;
         (key, area.id)
     };
+    let _drain = SwapoffDrainGuard { id };
     let epoch = LIVE_ADDRESS_SPACE_EPOCH.load(Ordering::Acquire);
-    let mut spaces = live_address_spaces();
-    spaces.sort_by_key(|aspace| aspace.lock().address_space_id().get());
+    let mut spaces = try_live_address_spaces()?;
+    // The stable sort may allocate a temporary merge buffer.  Keep this
+    // post-draining preparation phase fallible/allocation-free.
+    spaces.sort_unstable_by_key(|aspace| aspace.lock().address_space_id().get());
     // Snapshot under each mm lock, then release every lock before the
     // allocation and I/O preflight. Each snapshot owns an additional slot
     // reference, preventing an intervening fault from invalidating its read.
-    let prepared: AxResult<Vec<Vec<crate::mm::PreparedSwapoffPage>>> = spaces
-        .iter()
-        .map(|aspace| {
-            let pages = aspace.lock().snapshot_swapoff_area(id)?;
-            pages.into_iter().map(|page| page.prepare()).collect()
-        })
-        .collect();
-    let mut prepared = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            if let Some(area) = SWAPS.lock().areas.get_mut(&key) {
-                area.draining = false;
-            }
-            return Err(error);
+    let mut prepared = Vec::new();
+    prepared
+        .try_reserve_exact(spaces.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for aspace in &spaces {
+        let pages = aspace.lock().snapshot_swapoff_area(id)?;
+        let mut prepared_pages = Vec::new();
+        prepared_pages
+            .try_reserve_exact(pages.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for page in pages {
+            prepared_pages.push(page.prepare()?);
         }
-    };
+        prepared.push(prepared_pages);
+    }
     // Acquire every live mm in stable address-space-ID order. Validation is
     // global and side-effect-free; once it passes this commit phase contains
     // only preallocated page-table publication and reference transfers.
-    let mut guards: Vec<_> = spaces.iter().map(|aspace| aspace.lock()).collect();
+    let mut guards = Vec::new();
+    guards
+        .try_reserve_exact(spaces.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for aspace in &spaces {
+        guards.push(aspace.lock());
+    }
     if LIVE_ADDRESS_SPACE_EPOCH.load(Ordering::Acquire) != epoch {
         drop(guards);
         drop(prepared);
-        if let Some(area) = SWAPS.lock().areas.get_mut(&key) {
-            area.draining = false;
-        }
         return Err(LinuxError::EBUSY.into());
     }
     if let Some(error) = guards
@@ -473,9 +527,6 @@ pub fn deactivate(location: &Location) -> AxResult<()> {
     {
         drop(guards);
         drop(prepared);
-        if let Some(area) = SWAPS.lock().areas.get_mut(&key) {
-            area.draining = false;
-        }
         return Err(error);
     }
     for (aspace, pages) in guards.iter_mut().zip(prepared.iter_mut()) {
@@ -486,10 +537,6 @@ pub fn deactivate(location: &Location) -> AxResult<()> {
     let mut swaps = SWAPS.lock();
     let area = swaps.areas.get(&key).ok_or(AxError::InvalidInput)?;
     if area.refs.iter().any(|refs| *refs != 0) {
-        drop(swaps);
-        if let Some(area) = SWAPS.lock().areas.get_mut(&key) {
-            area.draining = false;
-        }
         return Err(LinuxError::EBUSY.into());
     }
     swaps.areas.remove(&key);
