@@ -121,6 +121,38 @@ fn one_system_budget_bounds_independent_address_space_registries() {
 }
 
 #[test]
+fn pin_tokens_are_bound_to_their_registry_even_when_sequences_overlap() {
+    let quota = PinQuota::new(2, (2 * PAGE) as u64, 2);
+    let mut first_registry = registry::<1, 2>(quota, 1);
+    let mut second_registry = registry::<1, 2>(quota, 1);
+    let first = first_registry
+        .reserve(
+            request(0x1000, PAGE, PinAccess::Read, PinDuration::AsyncIo, 7),
+            AddressSpaceId::new(1).unwrap(),
+        )
+        .unwrap();
+    let second = second_registry
+        .reserve(
+            request(0x8000, PAGE, PinAccess::Read, PinDuration::AsyncIo, 7),
+            AddressSpaceId::new(2).unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(first.token().get(), second.token().get());
+    assert_eq!(
+        second_registry.view(first.token()),
+        Err(MmError::UnknownToken)
+    );
+    assert_eq!(
+        second_registry.cancel_reservation(first),
+        Err(MmError::UnknownToken)
+    );
+    assert_eq!(second_registry.reserved_count(), 1);
+    second_registry.cancel_reservation(second).unwrap();
+    first_registry.cancel_reservation(first).unwrap();
+}
+
+#[test]
 fn system_budget_rejects_foreign_and_released_charges_without_mutation() {
     let quota = PinQuota::new(1, PAGE as u64, 1);
     let mut first = PinBudget::<1>::new(PAGE, quota, 7).unwrap();

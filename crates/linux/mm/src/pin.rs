@@ -62,6 +62,19 @@ fn try_atomic_update(
     }
 }
 
+static NEXT_PIN_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_pin_registry_identity() -> Result<NonZeroU64, MmError> {
+    let identity = try_atomic_update(
+        &NEXT_PIN_REGISTRY_ID,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |current| current.checked_add(1),
+    )
+    .map_err(|_| MmError::IdExhausted)?;
+    NonZeroU64::new(identity).ok_or(MmError::InvalidIdentity)
+}
+
 /// Fully typed pin intent. Fields remain private so intent cannot be partial.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PinRequest {
@@ -408,14 +421,19 @@ impl<const CHARGE_CAPACITY: usize> PinBudget<CHARGE_CAPACITY> {
     }
 }
 
-/// ABA-safe, nonzero pin token. Registry sequences never wrap or reuse it.
+/// ABA-safe pin token bound to one originating registry. The local sequence
+/// never wraps or reuses a token within that registry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct PinToken(NonZeroU64);
+pub struct PinToken {
+    registry: NonZeroU64,
+    sequence: NonZeroU64,
+}
 
 impl PinToken {
-    /// Integer representation useful for opaque consumer maps and diagnostics.
+    /// Registry-local sequence useful for diagnostics. This value alone is
+    /// not a cross-registry identity; retain the complete opaque token.
     pub const fn get(self) -> u64 {
-        self.0.get()
+        self.sequence.get()
     }
 }
 
@@ -607,6 +625,7 @@ impl MutationBlocker {
 /// invokes no callbacks. A consumer must explicitly cancel every abandoned
 /// reservation; forced teardown cancels all such reservations automatically.
 pub struct PinRegistry<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize> {
+    identity: NonZeroU64,
     page_size: PageSize,
     global_quota: PinQuota,
     global_usage: PinAccounting,
@@ -625,13 +644,17 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
         global_quota: PinQuota,
         first_token: u64,
     ) -> Result<Self, MmError> {
+        let page_size = PageSize::new(page_size)?;
+        let next_token = Some(NonZeroU64::new(first_token).ok_or(MmError::InvalidIdentity)?);
+        let identity = allocate_pin_registry_identity()?;
         Ok(Self {
-            page_size: PageSize::new(page_size)?,
+            identity,
+            page_size,
             global_quota,
             global_usage: PinAccounting::default(),
             owners: [None; OWNER_CAPACITY],
             records: [None; TOKEN_CAPACITY],
-            next_token: Some(NonZeroU64::new(first_token).ok_or(MmError::InvalidIdentity)?),
+            next_token,
             state: PinRegistryState::Open,
         })
     }
@@ -993,7 +1016,10 @@ impl<const OWNER_CAPACITY: usize, const TOKEN_CAPACITY: usize>
 
     fn allocate_token(&mut self) -> Result<PinToken, MmError> {
         let raw = self.next_token.ok_or(MmError::IdExhausted)?;
-        let token = PinToken(raw);
+        let token = PinToken {
+            registry: self.identity,
+            sequence: raw,
+        };
         self.next_token = raw.get().checked_add(1).and_then(NonZeroU64::new);
         Ok(token)
     }
