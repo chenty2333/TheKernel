@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use axerrno::{AxError, AxResult};
 use axsync::Mutex;
+use hashbrown::HashMap;
 use tk_linux_mm::AddressSpaceId;
 
 use super::AddrSpace;
@@ -57,7 +58,7 @@ enum AliasState {
 #[derive(Default)]
 struct AliasRegistry {
     entries: BTreeMap<SharedBackingKey, Vec<AliasEntry>>,
-    mutations: BTreeMap<SharedBackingKey, u64>,
+    mutations: HashMap<SharedBackingKey, u64>,
 }
 
 #[cfg(not(test))]
@@ -67,7 +68,7 @@ type AliasRegistryMutex<T> = spin::Mutex<T>;
 
 static ALIASES: AliasRegistryMutex<AliasRegistry> = AliasRegistryMutex::new(AliasRegistry {
     entries: BTreeMap::new(),
-    mutations: BTreeMap::new(),
+    mutations: HashMap::new(),
 });
 
 fn allocate_lease_id() -> AxResult<u64> {
@@ -317,7 +318,7 @@ pub(crate) fn snapshot_aliases(key: SharedBackingKey) -> Vec<AliasSnapshot> {
 /// otherwise unavoidable snapshot-to-commit re-promotion window.
 pub(crate) fn reserve_alias_mutation(
     key: SharedBackingKey,
-) -> (AliasMutationReservation, Vec<AliasSnapshot>) {
+) -> AxResult<(AliasMutationReservation, Vec<AliasSnapshot>)> {
     loop {
         let mut registry = ALIASES.lock();
         if registry.mutations.contains_key(&key)
@@ -332,26 +333,45 @@ pub(crate) fn reserve_alias_mutation(
             continue;
         }
         let generation = NEXT_ALIAS_LEASE_ID.load(Ordering::Acquire);
-        registry.mutations.insert(key, generation);
-        let mut snapshot = registry.entries.get(&key).map_or_else(Vec::new, |aliases| {
+        let aliases = registry.entries.get(&key);
+        let snapshot_len = aliases.map_or(0, |aliases| {
             aliases
                 .iter()
                 .filter(|entry| matches!(entry.state, AliasState::Committed { .. }))
                 .filter(|entry| entry.address_space.strong_count() != 0)
-                .map(|entry| AliasSnapshot {
+                .count()
+        });
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(snapshot_len)
+            .map_err(|_| AxError::NoMemory)?;
+        if let Some(aliases) = aliases {
+            for entry in aliases.iter().filter(|entry| {
+                matches!(entry.state, AliasState::Committed { .. })
+                    && entry.address_space.strong_count() != 0
+            }) {
+                snapshot.push(AliasSnapshot {
                     key,
                     lease_id: entry.lease_id,
                     address_space_id: entry.address_space_id,
                     address_space: entry.address_space.clone(),
-                })
-                .collect()
-        });
+                });
+            }
+        }
         snapshot.sort_unstable_by(|lhs, rhs| {
             lhs.address_space_id
                 .cmp(&rhs.address_space_id)
                 .then_with(|| lhs.lease_id.cmp(&rhs.lease_id))
         });
-        return (AliasMutationReservation { key, generation }, snapshot);
+        // The freeze is published only after all fallible snapshot allocation
+        // has succeeded.  Reserving the map slot first makes insertion itself
+        // allocation-free, so every error leaves alias admission open.
+        registry
+            .mutations
+            .try_reserve(1)
+            .map_err(|_| AxError::NoMemory)?;
+        registry.mutations.insert(key, generation);
+        return Ok((AliasMutationReservation { key, generation }, snapshot));
     }
 }
 
@@ -380,5 +400,21 @@ mod tests {
 
         drop(first);
         assert!(snapshot_aliases(key).is_empty());
+    }
+
+    #[test]
+    fn mutation_reservation_publishes_a_complete_alias_snapshot() {
+        let address_space = Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(0x1000), 0x20_000).unwrap(),
+        ));
+        let address_space_id = address_space.lock().address_space_id();
+        let key = SharedBackingKey::allocate().unwrap();
+        let _lease = AliasLease::try_new(key, &address_space, address_space_id).unwrap();
+
+        let (mutation, aliases) = reserve_alias_mutation(key).unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert!(ALIASES.lock().mutations.contains_key(&key));
+        drop(mutation);
+        assert!(!ALIASES.lock().mutations.contains_key(&key));
     }
 }

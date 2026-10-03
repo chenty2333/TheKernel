@@ -2673,15 +2673,17 @@ fn demote_shared_folio_across_aliases(
     pages: Arc<SharedPages>,
     start_index: usize,
 ) -> AxResult {
-    let (_mutation, aliases) = crate::mm::reserve_alias_mutation(pages.backing_key());
-    let mut participants = aliases
-        .into_iter()
-        .filter_map(|alias| {
-            alias
-                .revalidate()
-                .map(|aspace| (alias.address_space_id(), aspace))
-        })
-        .collect::<Vec<_>>();
+    let (_mutation, aliases) = crate::mm::reserve_alias_mutation(pages.backing_key())?;
+    let participant_capacity = aliases.len().checked_add(1).ok_or(AxError::NoMemory)?;
+    let mut participants = Vec::new();
+    participants
+        .try_reserve_exact(participant_capacity)
+        .map_err(|_| AxError::NoMemory)?;
+    for alias in aliases {
+        if let Some(aspace) = alias.revalidate() {
+            participants.push((alias.address_space_id(), aspace));
+        }
+    }
     let target_id = target.lock().address_space_id();
     if !participants
         .iter()
@@ -2805,15 +2807,17 @@ fn remove_anonymous_shared_across_aliases(
     length: usize,
 ) -> AxResult<()> {
     let end = offset.checked_add(length).ok_or(AxError::InvalidInput)?;
-    let (_mutation, aliases) = crate::mm::reserve_alias_mutation(pages.backing_key());
-    let mut participants = aliases
-        .into_iter()
-        .filter_map(|alias| {
-            alias
-                .revalidate()
-                .map(|aspace| (alias.address_space_id(), aspace))
-        })
-        .collect::<Vec<_>>();
+    let (_mutation, aliases) = crate::mm::reserve_alias_mutation(pages.backing_key())?;
+    let participant_capacity = aliases.len().checked_add(1).ok_or(AxError::NoMemory)?;
+    let mut participants = Vec::new();
+    participants
+        .try_reserve_exact(participant_capacity)
+        .map_err(|_| AxError::NoMemory)?;
+    for alias in aliases {
+        if let Some(aspace) = alias.revalidate() {
+            participants.push((alias.address_space_id(), aspace));
+        }
+    }
     let target_id = target.lock().address_space_id();
     if !participants
         .iter()
@@ -2949,15 +2953,17 @@ pub(crate) fn process_madvise_collapse(
         // Upgrade and de-duplicate first, then acquire every live mm in the
         // sole global order (AddressSpaceId).  No VMA mutation happens before
         // all participants are locked.
-        let (_mutation, aliases) = crate::mm::reserve_alias_mutation(key);
-        let mut participants = aliases
-            .into_iter()
-            .filter_map(|alias| {
-                alias
-                    .revalidate()
-                    .map(|aspace| (alias.address_space_id(), aspace))
-            })
-            .collect::<Vec<_>>();
+        let (_mutation, aliases) = crate::mm::reserve_alias_mutation(key)?;
+        let participant_capacity = aliases.len().checked_add(1).ok_or(AxError::NoMemory)?;
+        let mut participants = Vec::new();
+        participants
+            .try_reserve_exact(participant_capacity)
+            .map_err(|_| AxError::NoMemory)?;
+        for alias in aliases {
+            if let Some(aspace) = alias.revalidate() {
+                participants.push((alias.address_space_id(), aspace));
+            }
+        }
         let target_id = aspace_handle.lock().address_space_id();
         if !participants
             .iter()
