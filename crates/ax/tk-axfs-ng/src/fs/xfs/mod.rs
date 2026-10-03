@@ -353,6 +353,88 @@ mod tests {
     }
 
     #[cfg(feature = "test-ramdisk")]
+    fn apply_truncate_test_transaction(
+        volume: &XfsVolume,
+        transaction: &XfsMetadataTransaction,
+        lsn: u64,
+    ) -> XfsResult<()> {
+        for write in &transaction.data_writes {
+            volume.write_data_fs_block(write.fs_block, &write.after)?;
+        }
+        for buffer in &transaction.buffers {
+            let item = buffer.to_log_item()?;
+            let home = item.materialize_home_image(
+                &buffer.before,
+                lsn,
+                volume.superblock.inode_size as usize,
+            )?;
+            volume.write_data_fs_block(buffer.basic_block, &home)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-ramdisk")]
+    #[test]
+    fn regular_truncate_zeroes_the_retained_partial_block_before_regrowth() -> XfsResult<()> {
+        let volume = recovery_test_volume();
+        let number = 1;
+        let mut inode_block = vec![0; 512];
+        let mut raw_inode = vec![0; 256];
+        put_be16(&mut raw_inode, 0, XFS_DINODE_MAGIC)?;
+        put_be16(&mut raw_inode, 2, 0o100644)?;
+        raw_inode[4] = 3;
+        raw_inode[5] = XfsForkFormat::Extents as u8;
+        put_be32(&mut raw_inode, 16, 1)?;
+        put_be64(&mut raw_inode, 56, 1000)?;
+        put_be64(&mut raw_inode, 64, 1)?;
+        put_be32(&mut raw_inode, 76, 1)?;
+        raw_inode[83] = XfsForkFormat::Local as u8;
+        put_be32(&mut raw_inode, 92, 1)?;
+        put_be64(&mut raw_inode, 152, number)?;
+        raw_inode[160..176].copy_from_slice(&volume.superblock.uuid.0);
+        raw_inode[176..192].copy_from_slice(&encode_xfs_extent(XfsExtent {
+            unwritten: false,
+            file_block: 0,
+            start_block: 1,
+            block_count: 1,
+        })?);
+        rewrite_crc32c(&mut raw_inode, 100)?;
+        inode_block[256..].copy_from_slice(&raw_inode);
+        volume.write_data_fs_block(0, &inode_block)?;
+        volume.write_data_fs_block(1, &[0xa5; 512])?;
+        assert_eq!(
+            volume
+                .inode(number)
+                .unwrap_or_else(|error| panic!("test inode parse failed: {error:?}"))
+                .size,
+            1000
+        );
+
+        let shrink = volume
+            .prepare_regular_truncate(number, 500)
+            .unwrap_or_else(|error| panic!("truncate preparation failed: {error:?}"));
+        assert_eq!(shrink.data_writes.len(), 1);
+        let tail = &shrink.data_writes[0];
+        assert_eq!(tail.fs_block, 1);
+        assert_eq!(&tail.before[..], &[0xa5; 512]);
+        assert_eq!(&tail.after[..500], &[0xa5; 500]);
+        assert_eq!(&tail.after[500..], &[0; 12]);
+
+        // Use the same data-before-metadata order as the transaction commit
+        // path, then extend within the retained block and re-read its tail.
+        apply_truncate_test_transaction(&volume, &shrink, 1)?;
+        assert_eq!(volume.inode(number)?.size, 500);
+
+        let grow = volume.prepare_regular_truncate(number, 1000)?;
+        assert!(grow.data_writes.is_empty());
+        apply_truncate_test_transaction(&volume, &grow, 2)?;
+        let mut regrown_tail = [0xff; 500];
+        assert_eq!(volume.read_inode_at(number, 500, &mut regrown_tail)?, 500);
+        assert_eq!(regrown_tail, [0; 500]);
+        Ok(())
+    }
+
+    #[cfg(feature = "test-ramdisk")]
     fn agf_recovery_write(basic_block: u64, lsn: u64) -> XfsHomeWriteDescriptor {
         let mut bytes = vec![0; 512];
         bytes[0..4].copy_from_slice(&XFS_AGF_MAGIC.to_be_bytes());

@@ -1083,9 +1083,11 @@ impl XfsVolume {
         })
     }
 
-    /// Stages a shrinking truncate.  Whole tail extents are returned through
+    /// Stages a shrinking truncate. Whole tail extents are returned through
     /// the same AG allocator and the final partial extent is split before its
-    /// physical tail is freed.  Growing a sparse file only changes inode EOF.
+    /// physical tail is freed. A written partial EOF block is zeroed before
+    /// publishing the smaller size so later regrowth cannot reveal stale data.
+    /// Growing a sparse file only changes inode EOF.
     pub fn prepare_regular_truncate(
         &self,
         number: u64,
@@ -1133,6 +1135,35 @@ impl XfsVolume {
             }
         }
         extents.retain(|extent| extent.block_count != 0);
+        let eof_tail_write = if size < inode.size && !size.is_multiple_of(block_size) {
+            let file_block = size / block_size;
+            if let Some(extent) = extents.iter().find(|extent| {
+                !extent.unwritten
+                    && file_block >= extent.file_block
+                    && file_block < extent.file_block + extent.block_count as u64
+            }) {
+                let physical = extent
+                    .start_block
+                    .checked_add(file_block - extent.file_block)
+                    .ok_or(XfsError::AddressOutOfRange)?;
+                let before = self.read_data_fs_block(physical)?;
+                let mut after = Vec::new();
+                after
+                    .try_reserve_exact(before.len())
+                    .map_err(|_| XfsError::NoMemory)?;
+                after.extend_from_slice(&before);
+                after[(size % block_size) as usize..].fill(0);
+                Some(XfsStagedDataWrite {
+                    fs_block: physical,
+                    before,
+                    after,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let fork_bytes = self.superblock.inode_size as usize - inode.core_bytes as usize;
         let needed = bmap_external_blocks(self.superblock, fork_bytes, extents.len())?;
         let reused = if needed == 0 {
@@ -1198,6 +1229,13 @@ impl XfsVolume {
             }
         }
         let mut transaction = XfsMetadataTransaction::default();
+        if let Some(write) = eof_tail_write {
+            transaction
+                .data_writes
+                .try_reserve_exact(1)
+                .map_err(|_| XfsError::NoMemory)?;
+            transaction.data_writes.push(write);
+        }
         for (ag, allocations, releases) in groups {
             let staged = self.stage_extent_delta(ag, &allocations, &releases)?;
             transaction.buffers.extend(staged.buffers);
