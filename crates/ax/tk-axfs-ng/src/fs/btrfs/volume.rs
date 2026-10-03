@@ -12,6 +12,7 @@ const STRIPE_BYTES: usize = 32;
 const DISK_KEY_BYTES: usize = 17;
 const CHUNK_ITEM_KEY: u8 = 228;
 const PROFILE_MASK: u64 = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
+const RAID10_SUB_STRIPES: usize = 2;
 const BLOCK_GROUP_DATA: u64 = 1;
 const BLOCK_GROUP_SYSTEM: u64 = 2;
 const BLOCK_GROUP_METADATA: u64 = 4;
@@ -114,6 +115,9 @@ impl Chunk {
     ) -> AxResult<Vec<u8>> {
         if self.stripes.is_empty() || self.stripes.len() > u16::MAX as usize {
             return Err(AxError::InvalidInput);
+        }
+        if self.profile == ChunkProfile::Raid10 {
+            validate_raid10_geometry(self.stripes.len(), self.sub_stripes)?;
         }
         let mut output = Vec::new();
         let length = CHUNK_HEADER_BYTES
@@ -1120,9 +1124,10 @@ impl BtrfsVolume {
                 }
             }
             ChunkProfile::Raid10 => {
-                let group_width = usize::from(chunk.sub_stripes);
                 let group = raid10_group(chunk, relative)?;
-                for stripe in &chunk.stripes[group * group_width..(group + 1) * group_width] {
+                for stripe in
+                    &chunk.stripes[group * RAID10_SUB_STRIPES..(group + 1) * RAID10_SUB_STRIPES]
+                {
                     output.push(StripeWrite {
                         device: stripe.device,
                         physical: stripe
@@ -1449,10 +1454,11 @@ impl BtrfsVolume {
                 }
             }
             ChunkProfile::Raid10 => {
-                let width = usize::from(chunk.sub_stripes);
                 let group = raid10_group(chunk, relative)?;
                 let offset = raid10_offset(chunk, relative)?;
-                for stripe in &chunk.stripes[group * width..(group + 1) * width] {
+                for stripe in
+                    &chunk.stripes[group * RAID10_SUB_STRIPES..(group + 1) * RAID10_SUB_STRIPES]
+                {
                     reads.push(StripeRead {
                         device: stripe.device,
                         physical: stripe
@@ -1747,6 +1753,16 @@ impl BtrfsVolume {
     }
 }
 
+fn validate_raid10_geometry(stripe_count: usize, sub_stripes: u16) -> AxResult<()> {
+    if stripe_count < RAID10_SUB_STRIPES
+        || stripe_count % RAID10_SUB_STRIPES != 0
+        || usize::from(sub_stripes) != RAID10_SUB_STRIPES
+    {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
 fn validate_chunk(chunk: &Chunk, devices: &[BlockVolumeDevice]) -> AxResult<()> {
     if chunk.length == 0
         || chunk.stripe_len == 0
@@ -1755,10 +1771,8 @@ fn validate_chunk(chunk: &Chunk, devices: &[BlockVolumeDevice]) -> AxResult<()> 
     {
         return Err(AxError::InvalidInput);
     }
-    if matches!(chunk.profile, ChunkProfile::Raid10)
-        && (chunk.sub_stripes < 2 || chunk.stripes.len() % usize::from(chunk.sub_stripes) != 0)
-    {
-        return Err(AxError::InvalidInput);
+    if chunk.profile == ChunkProfile::Raid10 {
+        validate_raid10_geometry(chunk.stripes.len(), chunk.sub_stripes)?;
     }
     if matches!(
         chunk.profile,
@@ -1846,6 +1860,42 @@ fn le64(bytes: &[u8], offset: usize) -> AxResult<u64> {
         .ok_or(AxError::Io)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raid10_geometry_uses_the_fixed_two_stripe_mirror_group() {
+        assert!(validate_raid10_geometry(2, 2).is_ok());
+        assert!(validate_raid10_geometry(4, 2).is_ok());
+        for (stripe_count, sub_stripes) in [(4, 0), (4, 1), (4, 3), (4, 4), (3, 2)] {
+            assert_eq!(
+                validate_raid10_geometry(stripe_count, sub_stripes),
+                Err(AxError::InvalidInput)
+            );
+        }
+
+        let malformed = Chunk {
+            logical: 0,
+            length: 0x10_000,
+            stripe_len: 0x1000,
+            profile: ChunkProfile::Raid10,
+            sub_stripes: 4,
+            block_group_flags: BLOCK_GROUP_DATA,
+            stripes: (0..4)
+                .map(|device| Stripe {
+                    device,
+                    physical: 0,
+                })
+                .collect(),
+        };
+        assert_eq!(
+            malformed.encode_item(|device| Some(device as u64 + 1)),
+            Err(AxError::InvalidInput)
+        );
+    }
+}
+
 fn map_primary(chunk: &Chunk, relative: u64, len: u64) -> AxResult<StripeRead> {
     if len == 0
         || relative
@@ -1867,10 +1917,7 @@ fn map_primary(chunk: &Chunk, relative: u64, len: u64) -> AxResult<StripeRead> {
         }
         ChunkProfile::Raid10 => {
             let group = raid10_group(chunk, relative)?;
-            (
-                group * usize::from(chunk.sub_stripes),
-                raid10_offset(chunk, relative)?,
-            )
+            (group * RAID10_SUB_STRIPES, raid10_offset(chunk, relative)?)
         }
         ChunkProfile::Raid5 | ChunkProfile::Raid6 => {
             let parity_count = if chunk.profile == ChunkProfile::Raid5 {
@@ -2006,14 +2053,14 @@ fn gf_div(value: u8, divisor: u8) -> AxResult<u8> {
     Ok(gf_mul(value, inverse))
 }
 fn raid10_group(chunk: &Chunk, relative: u64) -> AxResult<usize> {
-    let groups = chunk.stripes.len() / usize::from(chunk.sub_stripes);
+    let groups = chunk.stripes.len() / RAID10_SUB_STRIPES;
     if groups == 0 {
         return Err(AxError::InvalidInput);
     }
     Ok(((relative / chunk.stripe_len) % groups as u64) as usize)
 }
 fn raid10_offset(chunk: &Chunk, relative: u64) -> AxResult<u64> {
-    let groups = (chunk.stripes.len() / usize::from(chunk.sub_stripes)) as u64;
+    let groups = (chunk.stripes.len() / RAID10_SUB_STRIPES) as u64;
     (relative / chunk.stripe_len)
         .checked_div(groups)
         .and_then(|stripe| stripe.checked_mul(chunk.stripe_len))
