@@ -61,6 +61,14 @@ const DIR_ITEM_HEADER_BYTES: usize = 30;
 const FILE_EXTENT_HEADER_BYTES: usize = 21;
 const DEV_ITEM_BYTES: usize = 98;
 
+pub(super) const fn max_inline_data_size(nodesize: u32) -> u64 {
+    (nodesize as u64).saturating_sub(
+        super::tree::HEADER_SIZE as u64
+            + super::tree::LEAF_ITEM_SIZE as u64
+            + FILE_EXTENT_HEADER_BYTES as u64,
+    )
+}
+
 /// Native tree-log directory-index deletion range.  The key identifies the
 /// parent and inclusive first index; the payload is exactly the inclusive
 /// last index.  Keeping the range typed prevents an empty/short log item
@@ -360,6 +368,12 @@ pub struct BtrfsRootItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_symlink_capacity_uses_leaf_item_geometry() {
+        assert_eq!(max_inline_data_size(4096), 3949);
+        assert_eq!(max_inline_data_size(512), 365);
+    }
 
     #[test]
     fn root_item_level_stays_within_the_format_limit() {

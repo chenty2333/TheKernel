@@ -793,12 +793,13 @@ impl BtrfsFilesystem {
             }
             let target_len =
                 u64::try_from(target.as_bytes().len()).map_err(|_| VfsError::StorageFull)?;
-            let inline_limit = u64::from(mount.superblock().nodesize).saturating_sub(512);
-            // Linux Btrfs accepts long symlinks; the regular extent path is
-            // used when the native leaf cannot contain the target.  The
-            // target still becomes reachable only with its DIR_ITEM.
+            let superblock = mount.superblock();
+            let inline_limit = super::item::max_inline_data_size(superblock.nodesize)
+                .min(u64::from(superblock.sectorsize.saturating_sub(1)));
+            // Symlink targets use uncompressed inline data. Bound them by the
+            // actual leaf item capacity and Linux's strict sectorsize limit.
             if target_len > inline_limit {
-                return Err(VfsError::StorageFull);
+                return Err(VfsError::NameTooLong);
             }
             item.size = target_len;
             item.nbytes = target_len;

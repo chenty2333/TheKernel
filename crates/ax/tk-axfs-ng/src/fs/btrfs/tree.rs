@@ -2,8 +2,8 @@ use axerrno::{AxError, AxResult};
 
 use super::{BTRFS_MAX_LEVEL, Checksum, TreeItemKey, crc32c};
 
-const HEADER_SIZE: usize = 0x65;
-const LEAF_ITEM_SIZE: usize = 25;
+pub(super) const HEADER_SIZE: usize = 0x65;
+pub(super) const LEAF_ITEM_SIZE: usize = 25;
 const INTERNAL_ITEM_SIZE: usize = 33;
 
 /// A checked Btrfs tree block.  The block borrows its verified backing bytes;
