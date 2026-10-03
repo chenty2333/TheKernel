@@ -1902,18 +1902,29 @@ impl TaskInner {
     #[inline]
     #[cfg(feature = "preempt")]
     pub(crate) fn enable_preempt(&self, resched: bool) {
+        if self.release_preempt() && resched {
+            // If current task is pending to be preempted, do rescheduling.
+            Self::current_check_preempt_pending();
+        }
+    }
+
+    /// Drops one preemption-disable level without rescheduling, and reports
+    /// whether that was the outermost level with a reschedule pending.  The
+    /// caller then honours it through [`Self::current_check_preempt_pending`],
+    /// which needs no borrow of this task across the switch.
+    #[inline]
+    #[cfg(feature = "preempt")]
+    pub(crate) fn release_preempt(&self) -> bool {
         match self
             .preempt_disable_count
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             }) {
-            Ok(1) if resched && self.need_resched.load(Ordering::Acquire) => {
-                // If current task is pending to be preempted, do rescheduling.
-                Self::current_check_preempt_pending();
-            }
-            Ok(_) => {}
+            Ok(1) => self.need_resched.load(Ordering::Acquire),
+            Ok(_) => false,
             Err(_) => {
                 self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                false
             }
         }
     }

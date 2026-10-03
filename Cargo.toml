@@ -197,9 +197,12 @@ qemu = [
 smp = [
     "axfeat/smp",
     "tk-kernel/smp-tlb-shootdown",
-    "tk-kernel/irq-continuation-diagnostics",
     "tk-kernel/idle-steal",
 ]
+# Records every preemption change made with IRQs masked, for the TLB-shootdown
+# stall report.  It reads RFLAGS on both sides of every lock guard, which cost
+# about a quarter of a null system call, so it is opt-in for chasing a stall.
+irq-continuation-diagnostics = ["tk-kernel/irq-continuation-diagnostics"]
 
 [[bin]]
 name = "thekernel"

@@ -173,75 +173,85 @@ cfg_if::cfg_if! {
 #[cfg(feature = "preempt")]
 struct KernelGuardIfImpl;
 
+/// Runs `f` on the task executing on this CPU without touching its reference
+/// count, or returns [`None`] before the first task is installed.
+///
+/// Every spinlock guard passes through here twice, so the owned
+/// [`CurrentTask`] handle -- an atomic increment and decrement of the task's
+/// `Arc` per call -- was a measurable share of each system call.  The borrow
+/// is sound without it: the per-CPU slot owns a strong reference for as long
+/// as the task runs on this CPU, and the borrow ends when `f` returns, before
+/// any reschedule could switch the task away.
+#[cfg(feature = "preempt")]
+#[inline]
+fn with_current_task<R>(f: impl FnOnce(&AxTask) -> R) -> Option<R> {
+    let ptr: *const AxTask = axhal::percpu::current_task_ptr();
+    // SAFETY: see above; a non-null slot names the live task running here.
+    (!ptr.is_null()).then(|| f(unsafe { &*ptr }))
+}
+
+#[cfg(all(feature = "preempt", feature = "irq-continuation-diagnostics", target_os = "none"))]
+fn record_preempt_event(kind: u64, curr: &AxTask) {
+    let mut flags = 0;
+    if curr.is_idle() {
+        flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+    }
+    if curr.preempt_pending() {
+        flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+    }
+    crate::irq_continuation_diagnostics::record_event(
+        kind,
+        curr.id().as_u64(),
+        0,
+        flags,
+        curr.preempt_disable_count(),
+    );
+}
+
 #[cfg(feature = "preempt")]
 #[crate_interface::impl_interface]
 impl kernel_guard::KernelGuardIf for KernelGuardIfImpl {
     fn disable_preempt() {
-        if let Some(curr) = current_may_uninit() {
+        with_current_task(|curr| {
             #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
             if !axhal::asm::irqs_enabled() {
-                let mut flags = 0;
-                if curr.is_idle() {
-                    flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
-                }
-                if curr.preempt_pending() {
-                    flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
-                }
-                crate::irq_continuation_diagnostics::record_event(
+                record_preempt_event(
                     crate::irq_continuation_diagnostics::EVENT_PREEMPT_DISABLE_IRQ_OFF,
-                    curr.id().as_u64(),
-                    0,
-                    flags,
-                    curr.preempt_disable_count(),
+                    curr,
                 );
             }
             curr.disable_preempt();
-        }
+        });
     }
 
     fn enable_preempt() {
-        if let Some(curr) = current_may_uninit() {
-            #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
-            let irq_off = !axhal::asm::irqs_enabled();
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        let irq_off = !axhal::asm::irqs_enabled();
+        let resched = with_current_task(|curr| {
             #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
             if irq_off {
-                let mut flags = 0;
-                if curr.is_idle() {
-                    flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
-                }
-                if curr.preempt_pending() {
-                    flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
-                }
-                crate::irq_continuation_diagnostics::record_event(
+                record_preempt_event(
                     crate::irq_continuation_diagnostics::EVENT_PREEMPT_ENABLE_IRQ_OFF,
-                    curr.id().as_u64(),
-                    0,
-                    flags,
-                    curr.preempt_disable_count(),
+                    curr,
                 );
             }
             // The task-local counter is the first, allocation-free filter.
             // Only its final release with a pending request enters the context
             // checker, which distinguishes an ordinary task safe point from
             // the one explicit outermost IRQ-exit safe point.
-            curr.enable_preempt(true);
-            #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
-            if irq_off && !axhal::asm::irqs_enabled() {
-                let mut flags = 0;
-                if curr.is_idle() {
-                    flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
-                }
-                if curr.preempt_pending() {
-                    flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
-                }
-                crate::irq_continuation_diagnostics::record_event(
+            curr.release_preempt()
+        });
+        if resched == Some(true) {
+            TaskInner::current_check_preempt_pending();
+        }
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        if irq_off && !axhal::asm::irqs_enabled() {
+            with_current_task(|curr| {
+                record_preempt_event(
                     crate::irq_continuation_diagnostics::EVENT_PREEMPT_ENABLE_RETURN_IRQ_OFF,
-                    curr.id().as_u64(),
-                    0,
-                    flags,
-                    curr.preempt_disable_count(),
+                    curr,
                 );
-            }
+            });
         }
     }
 }
