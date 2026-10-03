@@ -344,3 +344,48 @@ Intel modeset or either candidate NIC.
 These changes are **未在硬件上验证**. Host tests cover ECAM geometry, HPET GAS,
 raw BAR reads and the real ten-byte MADT layout. QEMU acceptance is recorded
 in `n305-tonight.md`; no QEMU result proves a target register works.
+
+## 2026-10-04 measured on the machine
+
+Two boots on the target (Acer SQM2270, board N305MI25-AJ, BIOS 1.01
+05/26/2023): the PXE Alpine capture, whose bundle is
+`~/.cache/thekernel-targets/hw-prep-2026-10-03/capture/received/n305-20261003T235530Z`,
+and TheKernel `e7108b2a` with `loglevel=7`, recorded from the HDMI capture.
+
+Settled by the hardware:
+
+* **Ethernet is a Realtek RTL8111/8168, `10ec:8168` rev 0x15, 1 GbE**, behind
+  root port 00:1d.0 at 01:00.0 (I/O BAR plus 64-bit memory BARs at
+  0x80504000 and 0x80500000). It is neither the RTL8125 nor an i225/i226: the
+  "2.5G" in retail listings is wrong, and both prepared drivers correctly
+  reported no matching device and touched nothing. Linux binds `r8169`.
+* **ECAM is 0xc0000000, segment 0, buses 0-255** from MCFG (raw bytes
+  `00 00 00 c0 00 00 00 00` at offset 44). TheKernel logs `source=mcfg` with
+  that base; Linux's `/proc/iomem` agrees. The capture bundle's own MCFG
+  decoder printed 0x80000000: that is a decoder bug in the capture tool.
+* **The Intel display is `8086:46d0` at 00:02.0** and TheKernel's read-only
+  probe now finds it (GSMBASE 0x7c000001, GGC VAMEN=0), then stops before
+  power/modeset writes as designed. Linux's i915 binds with DMC.
+* **MADT interrupt source overrides parse**: IRQ0 → GSI 2 (flags 0x0) and
+  IRQ9 → GSI 9 (flags 0xd), replacing the earlier "0 of 2".
+* The PCI inventory lists 18 functions and matches `lspci`, including
+  `1cc4:6a13` NVMe, `8086:54c8` HDA, `8086:54f0` CNVi WiFi and an eMMC host.
+* The firmware framebuffer stayed 800x600 even with GRUB `gfxpayload` asking
+  for 1920x1080; firmware KMS registered `/dev/dri/card0` at that size.
+* The HDMI EDID that Linux read belongs to the eEver capture dongle (1080p and
+  2160p modes), not to a monitor.
+
+Cautions:
+
+* **The NVMe carries a BitLocker-encrypted Windows.** Never write to it; boot
+  media for TheKernel must be USB.
+* The ACPI FACS "bad checksum" line in the capture summary is a false alarm:
+  FACS has no checksum field.
+
+Open after these boots:
+
+* With `loglevel=7` the screen stopped at `Initialize alarm...` and init's
+  output never appeared for over a minute, while the `quiet` boot reached the
+  shell within seconds. Cause unknown: a verbose-console stall is the first
+  suspect.
+* The stray `^@` before the shell prompt persists without a keyboard attached.
