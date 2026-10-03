@@ -3146,6 +3146,22 @@ impl NfsMount {
         let _ledger = self.unstable_ops.lock();
         self.write_locked(handle, stateid, offset, stability, data)
     }
+    fn append_write(
+        &self,
+        handle: &FileHandle,
+        stateid: [u8; 16],
+        data: &[u8],
+    ) -> NfsResult<(u64, WriteResult)> {
+        self.wait_recalled_delegation(handle)?;
+        // Serialize the EOF revalidation with every local WRITE and size
+        // change.  Reading EOF before this gate would let two open states
+        // append at the same stale offset.
+        let _ledger = self.unstable_ops.lock();
+        let offset = self.attrs(handle)?.size;
+        let result = self.write_locked(handle, stateid, offset, StableHow::Unstable, data)?;
+        self.invalidate();
+        Ok((offset, result))
+    }
     fn commit_locked(&self, handle: &FileHandle, offset: u64, count: u32) -> NfsResult<[u8; 8]> {
         // NFS COMMIT count==0 is the open-ended interval [offset, EOF), so it
         // intentionally performs no offset addition.  A finite range must be
@@ -7177,10 +7193,14 @@ impl FileNodeOps for NfsOpenFile {
         if !self.write {
             return Err(VfsError::BadFileDescriptor);
         }
-        let offset = self.attr.lock().size;
-        let count = self.write_at(buf, offset)?;
-        self.attr.lock().size = offset.saturating_add(count as u64);
-        Ok((count, offset.saturating_add(count as u64)))
+        let stateid = nfs_vfs(self.fs.mount.current_open_stateid(&self.state))?;
+        let (offset, result) =
+            nfs_vfs(self.fs.mount.append_write(&self.state.handle, stateid, buf))?;
+        let count = checked_server_transfer(result.count as usize, buf.len())?;
+        let size = offset.checked_add(count as u64).ok_or(VfsError::Io)?;
+        let mut attr = self.attr.lock();
+        attr.size = attr.size.max(size);
+        Ok((count, size))
     }
     fn set_len(&self, len: u64) -> VfsResult<()> {
         if !self.write {
@@ -7374,6 +7394,80 @@ mod tests {
         xdr.u32().unwrap()
     }
 
+    fn request_write_offset(record: &[u8]) -> u64 {
+        let call = decode_record(record).unwrap();
+        let mut xdr = XdrIn::new(&call);
+        for _ in 0..6 {
+            xdr.u32().unwrap();
+        }
+        xdr.u32().unwrap();
+        xdr.opaque().unwrap();
+        xdr.u32().unwrap();
+        xdr.opaque().unwrap();
+        xdr.opaque().unwrap();
+        xdr.u32().unwrap();
+        assert_eq!(xdr.u32().unwrap(), 3);
+        assert_eq!(xdr.u32().unwrap(), OP_SEQUENCE);
+        xdr.take(16).unwrap();
+        for _ in 0..4 {
+            xdr.u32().unwrap();
+        }
+        assert_eq!(xdr.u32().unwrap(), OP_PUTFH);
+        xdr.opaque().unwrap();
+        assert_eq!(xdr.u32().unwrap(), OP_WRITE);
+        xdr.take(16).unwrap();
+        xdr.u64().unwrap()
+    }
+
+    fn getattr_size_success(sessionid: [u8; 16], sequence: u32, size: u64) -> Vec<u8> {
+        let mut body = Xdr::default();
+        body.u32(NFS_OK);
+        body.opaque(b"");
+        body.u32(3);
+        body.u32(OP_SEQUENCE);
+        body.u32(NFS_OK);
+        body.fixed(&sessionid);
+        body.u32(sequence);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(OP_PUTFH);
+        body.u32(NFS_OK);
+        body.u32(OP_GETATTR);
+        body.u32(NFS_OK);
+        body.u32(2);
+        body.u32(1 << 4);
+        body.u32(0);
+        let mut attr = Xdr::default();
+        attr.u64(size);
+        body.opaque(&attr.0);
+        body.0
+    }
+
+    fn write_success(sessionid: [u8; 16], sequence: u32, count: u32, verifier: [u8; 8]) -> Vec<u8> {
+        let mut body = Xdr::default();
+        body.u32(NFS_OK);
+        body.opaque(b"");
+        body.u32(3);
+        body.u32(OP_SEQUENCE);
+        body.u32(NFS_OK);
+        body.fixed(&sessionid);
+        body.u32(sequence);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.u32(OP_PUTFH);
+        body.u32(NFS_OK);
+        body.u32(OP_WRITE);
+        body.u32(NFS_OK);
+        body.u32(count);
+        body.u32(StableHow::Unstable as u32);
+        body.fixed(&verifier);
+        body.0
+    }
+
     fn rpc_reply(request: &[u8], body: Vec<u8>) -> Vec<u8> {
         let mut rpc = Xdr::default();
         rpc.u32(request_xid(request));
@@ -7562,6 +7656,71 @@ mod tests {
     fn server_transfer_cannot_exceed_requested_buffer() {
         assert_eq!(checked_server_transfer(4, 4), Ok(4));
         assert_eq!(checked_server_transfer(5, 4), Err(VfsError::Io));
+    }
+
+    #[test]
+    fn nfs_append_revalidates_eof_across_distinct_open_caches() {
+        let sessionid = [0x72; 16];
+        let transport = Arc::new(ScriptTransport::new(vec![
+            Ok(getattr_size_success(sessionid, 1, 10)),
+            Ok(write_success(sessionid, 2, 2, [0x33; 8])),
+            Ok(getattr_size_success(sessionid, 3, 12)),
+            Ok(write_success(sessionid, 4, 2, [0x33; 8])),
+        ]));
+        let mount = mounted_session(transport.clone(), sessionid);
+        let handle = FileHandle::new(vec![1, 2, 3]).unwrap();
+        let stateid = [0x55; 16];
+        let owner = 9;
+        mount.register_reserved_state(
+            owner,
+            handle.clone(),
+            stateid,
+            false,
+            StateReplay::Open {
+                parent: handle.clone(),
+                name: FsNameBuf::from_vec(b"file".to_vec()).unwrap(),
+                share_access: 3,
+                share_deny: 0,
+                create: false,
+                mode: 0,
+                create_verifier: [0; 8],
+                delegation_preference: false,
+            },
+        );
+        let fs = Arc::new(NfsFilesystem {
+            mount,
+            root: Mutex::new(None),
+            self_ref: Mutex::new(None),
+            nodes: Mutex::new(Vec::new()),
+            node_data: Mutex::new(Vec::new()),
+        });
+        let state = OpenState {
+            stateid,
+            handle,
+            owner,
+            sequence: 1,
+        };
+        let open = || NfsOpenFile {
+            fs: fs.clone(),
+            state: state.clone(),
+            attr: Mutex::new(NfsAttr {
+                size: 10,
+                ..NfsAttr::default()
+            }),
+            read: false,
+            write: true,
+            locks: Mutex::new(Vec::new()),
+        };
+        let first = open();
+        let second = open();
+
+        assert_eq!(first.append(b"ab"), Ok((2, 12)));
+        assert_eq!(second.append(b"cd"), Ok((2, 14)));
+
+        let calls = transport.calls.lock();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(request_write_offset(&calls[1]), 10);
+        assert_eq!(request_write_offset(&calls[3]), 12);
     }
 
     #[test]
