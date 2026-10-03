@@ -23,6 +23,12 @@ use super::{AddrSpace, SharedPages};
 
 const PAGE: usize = 4096;
 const SWAP_SIGNATURE: &[u8] = b"SWAPSPACE2";
+const SWAP_HEADER_VERSION_OFFSET: usize = 1024;
+const SWAP_HEADER_LAST_PAGE_OFFSET: usize = 1028;
+const SWAP_HEADER_BADPAGE_COUNT_OFFSET: usize = 1032;
+const SWAP_HEADER_BADPAGES_OFFSET: usize = 1536;
+const SWAP_MAX_BADPAGES: usize =
+    (PAGE - SWAP_SIGNATURE.len() - SWAP_HEADER_BADPAGES_OFFSET) / core::mem::size_of::<u32>();
 /// include/uapi/linux/swap.h: `SWAP_FLAG_PREFER 0x8000`,
 /// `SWAP_FLAG_PRIO_MASK 0x7fff`, `SWAP_FLAG_DISCARD 0x10000`,
 /// `SWAP_FLAG_DISCARD_ONCE 0x20000`, `SWAP_FLAG_DISCARD_PAGES 0x40000`.
@@ -379,6 +385,44 @@ fn path_key(location: &Location) -> AxResult<Vec<u8>> {
     Ok(key)
 }
 
+fn swap_header_u32(header: &[u8; PAGE], offset: usize, big_endian: bool) -> u32 {
+    let bytes = [
+        header[offset],
+        header[offset + 1],
+        header[offset + 2],
+        header[offset + 3],
+    ];
+    if big_endian {
+        u32::from_be_bytes(bytes)
+    } else {
+        u32::from_le_bytes(bytes)
+    }
+}
+
+/// Parses the Linux SWAPSPACE2 v1 page count for a regular swap file.
+/// Regular files cannot carry bad-page entries; Linux rejects those files
+/// rather than allowing the invalid slots to participate in allocation.
+fn swap_slots_from_header(header: &[u8; PAGE], file_pages: usize) -> AxResult<usize> {
+    let version = swap_header_u32(header, SWAP_HEADER_VERSION_OFFSET, false);
+    let big_endian = if version == 1 {
+        false
+    } else if swap_header_u32(header, SWAP_HEADER_VERSION_OFFSET, true) == 1 {
+        true
+    } else {
+        return Err(AxError::InvalidInput);
+    };
+    let last_page = swap_header_u32(header, SWAP_HEADER_LAST_PAGE_OFFSET, big_endian);
+    let badpage_count = swap_header_u32(header, SWAP_HEADER_BADPAGE_COUNT_OFFSET, big_endian);
+    if last_page == 0 || badpage_count as usize > SWAP_MAX_BADPAGES || badpage_count != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let page_count = last_page as usize + 1;
+    if page_count > file_pages {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(page_count - 1)
+}
+
 /// mm/swapfile.c:
 ///
 /// ```c
@@ -425,8 +469,8 @@ pub fn activate(location: Location, flags: i32) -> AxResult<()> {
     {
         return Err(AxError::InvalidInput);
     }
+    let slots = swap_slots_from_header(&header, length / PAGE)?;
     let key = path_key(&location)?;
-    let slots = length / PAGE - 1;
     let mut swaps = SWAPS.lock();
     if swaps
         .areas
@@ -703,6 +747,24 @@ mod tests {
     use super::*;
     use crate::pseudofs::tmp::MemoryFs;
 
+    fn set_swap_header_u32(header: &mut [u8; PAGE], offset: usize, value: u32, big_endian: bool) {
+        let bytes = if big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        header[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    }
+
+    fn valid_swap_header() -> [u8; PAGE] {
+        let mut header = [0u8; PAGE];
+        set_swap_header_u32(&mut header, SWAP_HEADER_VERSION_OFFSET, 1, false);
+        set_swap_header_u32(&mut header, SWAP_HEADER_LAST_PAGE_OFFSET, 1, false);
+        set_swap_header_u32(&mut header, SWAP_HEADER_BADPAGE_COUNT_OFFSET, 0, false);
+        header[PAGE - SWAP_SIGNATURE.len()..].copy_from_slice(SWAP_SIGNATURE);
+        header
+    }
+
     fn make_swap_file() -> Location {
         let fs = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
@@ -722,8 +784,7 @@ mod tests {
             .into_file()
             .unwrap();
         file.set_len((PAGE * 2) as u64).unwrap();
-        let mut header = [0u8; PAGE];
-        header[PAGE - SWAP_SIGNATURE.len()..].copy_from_slice(SWAP_SIGNATURE);
+        let header = valid_swap_header();
         assert_eq!(file.write_at(&header[..], 0).unwrap(), PAGE);
         drop(file);
         location
@@ -763,6 +824,62 @@ mod tests {
             SWAP_FLAGS_VALID,
             SWAP_FLAG_PRIO_MASK | SWAP_FLAG_PREFER | 0x10000 | 0x20000 | 0x40000
         );
+    }
+
+    #[test]
+    fn swap_v1_header_bounds_follow_linux_last_page_and_badpage_rules() {
+        let valid = valid_swap_header();
+        assert_eq!(swap_slots_from_header(&valid, 2), Ok(1));
+        assert_eq!(
+            swap_slots_from_header(&valid, 1),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut header = valid;
+        set_swap_header_u32(&mut header, SWAP_HEADER_VERSION_OFFSET, 2, false);
+        assert_eq!(
+            swap_slots_from_header(&header, 2),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut header = valid;
+        set_swap_header_u32(&mut header, SWAP_HEADER_LAST_PAGE_OFFSET, 0, false);
+        assert_eq!(
+            swap_slots_from_header(&header, 2),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut header = valid;
+        set_swap_header_u32(&mut header, SWAP_HEADER_LAST_PAGE_OFFSET, 2, false);
+        assert_eq!(
+            swap_slots_from_header(&header, 2),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut header = valid;
+        set_swap_header_u32(&mut header, SWAP_HEADER_BADPAGE_COUNT_OFFSET, 1, false);
+        assert_eq!(
+            swap_slots_from_header(&header, 2),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut header = valid;
+        set_swap_header_u32(
+            &mut header,
+            SWAP_HEADER_BADPAGE_COUNT_OFFSET,
+            (SWAP_MAX_BADPAGES + 1) as u32,
+            false,
+        );
+        assert_eq!(
+            swap_slots_from_header(&header, 2),
+            Err(AxError::InvalidInput)
+        );
+
+        let mut big_endian = valid_swap_header();
+        set_swap_header_u32(&mut big_endian, SWAP_HEADER_VERSION_OFFSET, 1, true);
+        set_swap_header_u32(&mut big_endian, SWAP_HEADER_LAST_PAGE_OFFSET, 1, true);
+        set_swap_header_u32(&mut big_endian, SWAP_HEADER_BADPAGE_COUNT_OFFSET, 0, true);
+        assert_eq!(swap_slots_from_header(&big_endian, 2), Ok(1));
     }
 
     #[test]
