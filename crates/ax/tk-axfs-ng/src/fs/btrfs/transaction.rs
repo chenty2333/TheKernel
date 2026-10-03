@@ -774,6 +774,22 @@ impl BtrfsTransaction {
         }
         validate_refs(&state.refs, &self.delayed_refs)?;
         validate_qgroups(&state.qgroups, &self.qgroup_deltas)?;
+        if self
+            .new_subvolumes
+            .iter()
+            .any(|(destination, _)| state.subvolumes.contains_key(destination))
+        {
+            return Err(AxError::AlreadyExists);
+        }
+        let next_generation = state.generation.checked_add(1).ok_or(AxError::NoMemory)?;
+        let next_subvolume = state
+            .next_subvolume
+            .checked_add(u64::try_from(self.new_subvolumes.len()).map_err(|_| AxError::NoMemory)?)
+            .ok_or(AxError::NoMemory)?;
+
+        // Every fallible scalar/admission check is complete before the first
+        // mutation. `commit_after_persist` cannot leave these core tables
+        // partially published if the generation space is exhausted.
         state.committed_log = self.log.clone();
         for (key, change) in &self.changes {
             match change {
@@ -790,12 +806,30 @@ impl BtrfsTransaction {
         for (destination, source) in &self.new_subvolumes {
             state.subvolumes.insert(*destination, *source);
         }
-        state.next_subvolume = state
-            .next_subvolume
-            .checked_add(self.new_subvolumes.len() as u64)
-            .ok_or(AxError::NoMemory)?;
-        state.generation = state.generation.checked_add(1).ok_or(AxError::NoMemory)?;
+        state.next_subvolume = next_subvolume;
+        state.generation = next_generation;
         Ok(state.generation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_commit_generation_overflow_does_not_partially_publish() {
+        let core = BtrfsCore::new(u64::MAX).unwrap();
+        let key = TreeItemKey {
+            objectid: 5,
+            item_type: 1,
+            offset: 0,
+        };
+        let mut transaction = core.begin();
+        transaction.set_item(TreeId::Fs, key, b"staged").unwrap();
+
+        assert_eq!(transaction.commit_after_persist(), Err(AxError::NoMemory));
+        assert_eq!(core.generation(), u64::MAX);
+        assert_eq!(core.item(TreeId::Fs, key), None);
     }
 }
 
