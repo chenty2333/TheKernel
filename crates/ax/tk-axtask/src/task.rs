@@ -1614,9 +1614,14 @@ impl TaskInner {
     }
 
     /// Clears the interrupt state of the task.
+    ///
+    /// A caller which will wait or return to userspace must recheck its
+    /// durable wake predicate afterwards. The acquire RMW consumes a
+    /// publisher's Release wake together with its preceding predicate
+    /// publication; an unsynchronized false store could miss both.
     #[inline]
     pub fn clear_interrupt(&self) {
-        self.interrupted.store(false, Ordering::Release);
+        let _ = self.interrupted.swap(false, Ordering::AcqRel);
     }
 
     /// Returns whether the task has a pending interrupt wakeup.

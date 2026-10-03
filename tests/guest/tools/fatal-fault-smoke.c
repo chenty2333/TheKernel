@@ -79,8 +79,15 @@ int main(void)
 {
     setbuf(stdout, NULL);
     alarm(20);
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode < 2; mode++) {
         if (run_case(mode) != 0)
+            return 1;
+    }
+    /* A non-leader's SIGKILL wake can race the leader's ready-byte return
+     * and its next blocking read. Repeat that crossing, not merely the
+     * already-blocked-peer case. The watchdog still covers the whole run. */
+    for (int round = 0; round < 32; round++) {
+        if (run_case(2) != 0)
             return 1;
     }
     alarm(0);

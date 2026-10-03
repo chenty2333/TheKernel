@@ -2017,6 +2017,17 @@ impl ThreadSignalManager {
         *self.stack.lock() = stack;
     }
 
+    /// Returns the delivery fast-path hint for private or shared signals.
+    ///
+    /// A positive result includes blocked/ignored signals and must be
+    /// followed by the caller's authoritative eligibility check. A concurrent
+    /// publication can race a negative result, so waiters must also preserve
+    /// the publisher's wake edge rather than treating this as wait admission.
+    pub fn may_have_pending_signals(&self) -> bool {
+        self.possibly_has_signal.load(Ordering::Acquire)
+            || self.proc.possibly_has_signal.load(Ordering::Acquire)
+    }
+
     /// Gets current pending signals.
     pub fn pending(&self) -> SignalSet {
         self.pending.lock().set | self.proc.pending()

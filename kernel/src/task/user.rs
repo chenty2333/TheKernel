@@ -10,7 +10,7 @@ use tk_linux_signal::{SignalInfo, Signo};
 use super::{
     AsThread, TimerState, check_signals, do_exit, fail_closed_exit,
     force_rseq_fault_signal_current_thread, force_signal_current_thread, has_pending_fatal_signal,
-    set_timer_state, terminate_rseq_fault_current_thread, wait_if_stopped,
+    has_pending_syscall_signal, set_timer_state, terminate_rseq_fault_current_thread, wait_if_stopped,
 };
 use crate::{
     mm::{
@@ -80,6 +80,17 @@ fn deliver_fatal_user_signal_info(info: SignalInfo) {
 
 fn deliver_fatal_user_signal(signo: Signo) {
     deliver_fatal_user_signal_info(SignalInfo::new_kernel(signo));
+}
+
+fn acknowledge_user_return_interrupt(task: &TaskInner, pending: impl FnOnce() -> bool) {
+    // The acquire acknowledgement synchronizes with a wake published before
+    // it. Re-arm if the signal is still eligible, instead of erasing its only
+    // route out of the next blocking syscall. A publication after the empty
+    // recheck leaves a new interrupt set; nothing below clears it again.
+    task.clear_interrupt();
+    if pending() {
+        task.interrupt();
+    }
 }
 
 /// Fallibly creates an unpublished user task.
@@ -275,13 +286,18 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     axtask::resched_if_needed();
                 }
 
-                // `interrupt` is also the wake edge for a sibling exec gate.
-                // Clear it before the final gate read: a gate published
-                // before this store is observed below, while a publication
-                // after the read leaves the interrupt set for the next trap
-                // or blocking point.
-                curr.clear_interrupt();
+                // A signal may arrive after check_signals but before this
+                // tail. Acknowledge handled wakes, then preserve any still
+                // eligible signal's next blocking-point wake. The cheap
+                // hint is only a filter for the authoritative mask/action
+                // predicate; it never decides delivery by itself.
+                acknowledge_user_return_interrupt(&curr, || {
+                    thr.signal.may_have_pending_signals() && has_pending_syscall_signal(thr)
+                });
 
+                // The same channel carries sibling exec wakes. A gate
+                // published before acknowledgement is seen by this final
+                // read; one published afterwards leaves its wake set.
                 if thr.proc_data.should_exit_for_exec(tid) {
                     if has_pending_fatal_signal(thr) {
                         while check_signals(thr, &mut uctx, None) {}
@@ -321,6 +337,35 @@ use axerrno::{AxError, AxResult};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_return_keeps_an_unhandled_signal_published_before_acknowledgement() {
+        let task = TaskInner::try_new(|| {}, "user-return-pending".into(), 64 * 1024).unwrap();
+        task.interrupt();
+        acknowledge_user_return_interrupt(&task, || true);
+        assert!(task.is_interrupted());
+    }
+
+    #[test]
+    fn user_return_keeps_a_signal_published_after_the_predicate_read() {
+        let task = TaskInner::try_new(|| {}, "user-return-racing".into(), 64 * 1024).unwrap();
+        acknowledge_user_return_interrupt(&task, || {
+            assert!(!task.is_interrupted());
+            // The empty predicate was read first; a producer publishes its
+            // new wake before that old empty result reaches the caller.
+            task.interrupt();
+            false
+        });
+        assert!(task.is_interrupted());
+    }
+
+    #[test]
+    fn user_return_clears_wakes_for_already_handled_or_ineligible_signals() {
+        let task = TaskInner::try_new(|| {}, "user-return-handled".into(), 64 * 1024).unwrap();
+        task.interrupt();
+        acknowledge_user_return_interrupt(&task, || false);
+        assert!(!task.is_interrupted());
+    }
 
     #[test]
     fn linux_task_identity_exhaustion_maps_to_eagain_without_truncation() {
