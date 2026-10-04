@@ -8089,7 +8089,7 @@ status = "partial"
 contract = "linux-ptrace"
 handler = "kernel/src/syscall/task/ptrace.rs:sys_ptrace"
 conditional = "explicit-none"
-tests = ["kernel/src/task/access.rs:process_access_ptrace_enforces_dumpability_image_owner_and_commoncap", "kernel/src/task/registers.rs:general_register_layout_roundtrip_and_privilege_filter", "tests/guest/portable/ptrace-registers.c:main", "tests/guest/portable/ptrace-registers-differential.c:main", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+tests = ["kernel/src/task/access.rs:process_access_ptrace_enforces_dumpability_image_owner_and_commoncap", "kernel/src/task/registers.rs:general_register_layout_roundtrip_and_privilege_filter", "kernel/src/task/restart.rs:ptrace_restart_uses_changed_arguments_even_when_orig_rax_is_unchanged", "kernel/src/task/restart.rs:ptrace_negative_orig_rax_cancels_only_the_current_restart_frame", "tests/guest/portable/ptrace-registers.c:main", "tests/guest/portable/ptrace-registers-differential.c:main", "tests/guest/portable/sysadmin-abi-differential.c:main"]
 validation_gaps = ["the paired sysadmin case covers request admission but not complete register transfer; the guest register regression covers GPR transfer and mutation, and floating-state mutation, but not real gdb/strace workflows"]
 limitations = ["PTRACE_GETREGS/SETREGS and NT_PRSTATUS transfer a stopped user-context snapshot; alternate and legacy segment selectors are not supported; debug-register POKEUSER and PTRACE_LISTEN return EIO; GETFPREGS/SETFPREGS, NT_PRFPREG and CPU-sized standard NT_X86_XSTATE are supported; PEEKSIGINFO and GETSIGMASK/SETSIGMASK are missing; syscall tracing and single-step resume effects are not implemented; relationships and stops are process-wide rather than per-thread"]
 

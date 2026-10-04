@@ -17,7 +17,10 @@ EFLAGS writes preserve privileged bits. FS/GS bases must be in the lower
 canonical user range. CS/SS must match the kernel's ring-3 descriptors; nonzero
 legacy selectors are currently rejected (no user LDT/selector restore). This
 is a documented limitation, not full Linux selector compatibility. Changes to
-`orig_rax` update or cancel the interrupted-syscall restart candidate.
+`orig_rax` update or cancel only the interrupted-syscall restart candidate
+belonging to the stopped frame. Argument writes also replace replay arguments,
+even if `orig_rax` did not change; an ancestor signal handler's saved restart
+is not discarded.
 
 ## Validation and remaining work
 

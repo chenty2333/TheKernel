@@ -410,21 +410,63 @@ impl RestartTracker {
         core::mem::take(&mut self.resume_restored_context)
     }
 
+    /// A debugger edits the live syscall frame, not an ancestor handler's
+    /// saved restart. Keep the private replay ledger coherent with that frame.
+    fn ptrace_update_registers(
+        &mut self,
+        original_ip: usize,
+        regs: &super::registers::GeneralRegisters,
+    ) {
+        let cancel = (regs[15] as i64) < 0;
+        let update = |saved: &mut SavedSyscall| {
+            saved.sysno = regs[15] as usize;
+            saved.args = [
+                regs[14] as usize,
+                regs[13] as usize,
+                regs[12] as usize,
+                regs[7] as usize,
+                regs[9] as usize,
+                regs[8] as usize,
+            ];
+            saved.return_ip = regs[16] as usize;
+            saved.restart_ip = saved.return_ip.saturating_sub(SYSCALL_INSN_LEN);
+        };
+        if let Some(current) = self.current_restart.as_mut()
+            && current.action.syscall.return_ip == original_ip
+        {
+            if cancel {
+                self.current_restart = None;
+                self.armed_restart_block = None;
+            } else {
+                update(&mut current.action.syscall);
+            }
+        }
+        if let Some(state) = self.restart_states.last_mut()
+            && state.action.syscall.return_ip == original_ip
+        {
+            if cancel {
+                self.restart_states.pop();
+                self.armed_restart_block = None;
+            } else {
+                update(&mut state.action.syscall);
+            }
+        }
+    }
+
     fn clear_saved_syscall(&mut self) {
         self.current_restart = None;
     }
 }
 
 impl Thread {
-    pub(crate) fn ptrace_update_restart_sysno(&self, orig_rax: u64) {
-        let mut tracker = self.restart.lock();
-        if (orig_rax as i64) < 0 {
-            tracker.current_restart = None;
-            tracker.armed_restart_block = None;
-            tracker.restart_states.clear();
-        } else if let Some(state) = tracker.restart_states.last_mut() {
-            state.action.syscall.sysno = orig_rax as usize;
-        }
+    pub(crate) fn ptrace_update_restart_registers(
+        &self,
+        original_ip: usize,
+        regs: &super::registers::GeneralRegisters,
+    ) {
+        self.restart
+            .lock()
+            .ptrace_update_registers(original_ip, regs);
     }
 
     pub(crate) fn enter_syscall(
@@ -502,6 +544,43 @@ mod tests {
         uctx.set_arg4(0x55);
         uctx.set_arg5(0x66);
         uctx
+    }
+
+    #[test]
+    fn ptrace_restart_uses_changed_arguments_even_when_orig_rax_is_unchanged() {
+        let mut tracker = RestartTracker::try_new().unwrap();
+        let mut context = make_uctx(0x11, 0x77, 0x1000);
+        tracker.enter_syscall(&context, false, Some(RestartClass::Sys));
+        assert!(tracker.request_syscall_restart());
+        tracker.finish_signal_delivery(SignalOSAction::Continue, false);
+        let mut regs = [0; super::super::registers::NUM_GREGS];
+        super::super::registers::fill_gregs(&context, 0x77, &mut regs);
+        regs[14] = 0x99;
+        regs[13] = 0x88;
+        tracker.ptrace_update_registers(context.ip(), &regs);
+        tracker.finish_signal_resume(&mut context);
+        assert_eq!(context.arg0(), 0x99);
+        assert_eq!(context.arg1(), 0x88);
+        assert_eq!(context.sysno(), 0x77);
+        assert_eq!(context.ip(), 0x1000 - SYSCALL_INSN_LEN);
+    }
+
+    #[test]
+    fn ptrace_negative_orig_rax_cancels_only_the_current_restart_frame() {
+        let mut tracker = RestartTracker::try_new().unwrap();
+        let outer = make_uctx(0x11, 0x77, 0x1000);
+        tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
+        assert!(tracker.request_syscall_restart());
+        tracker.finish_signal_delivery(SignalOSAction::Handler, true);
+        let inner = make_uctx(0x22, 0x88, 0x4000);
+        tracker.enter_syscall(&inner, true, Some(RestartClass::Sys));
+        assert!(tracker.request_syscall_restart());
+        let mut regs = [0; super::super::registers::NUM_GREGS];
+        super::super::registers::fill_gregs(&inner, u64::MAX, &mut regs);
+        tracker.ptrace_update_registers(inner.ip(), &regs);
+        assert!(tracker.current_restart.is_none());
+        assert_eq!(tracker.restart_states.len(), 1);
+        assert_eq!(tracker.restart_states[0].action.syscall.sysno, 0x77);
     }
 
     #[test]

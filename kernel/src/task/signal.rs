@@ -1314,14 +1314,12 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
     if publish_registers {
         let regs = thr.ptrace_registers.lock().take();
         if let Some(regs) = regs {
-            // Every debugger writer validates before committing this image.
+            // Apply only to a restart frame belonging to this original user
+            // context; an outer interrupted handler keeps its own ledger.
+            thr.ptrace_update_restart_registers(uctx.ip(), &regs);
             super::registers::apply_gregs(uctx, &regs).expect("validated ptrace registers");
-            let old_orig = thr
-                .ptrace_orig_rax
-                .swap(regs[15], core::sync::atomic::Ordering::AcqRel);
-            if old_orig != regs[15] {
-                thr.ptrace_update_restart_sysno(regs[15]);
-            }
+            thr.ptrace_orig_rax
+                .store(regs[15], core::sync::atomic::Ordering::Release);
         }
     }
     if publish_registers {
