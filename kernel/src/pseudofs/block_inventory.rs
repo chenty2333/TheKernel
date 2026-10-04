@@ -33,6 +33,12 @@ pub(super) fn path(name: &str) -> String {
         .unwrap_or_else(|| name.into())
 }
 
+fn removable_text(removable: Option<bool>) -> axfs_ng_vfs::VfsResult<String> {
+    removable
+        .map(|value| format!("{}\n", u8::from(value)))
+        .ok_or(axfs_ng_vfs::VfsError::OperationNotSupported)
+}
+
 fn dev_text(id: DeviceId) -> String {
     format!("{}:{}\n", id.major(), id.minor())
 }
@@ -58,9 +64,10 @@ pub(super) fn augment_device(dir: &mut DirMapping, fs: &Arc<SimpleFs>, name: &st
         "dev",
         SimpleFile::new_regular(fs.clone(), move || Ok(dev_text(id))),
     );
+    let removable = axfs::block_device_info(name).and_then(|info| info.removable);
     dir.add(
         "removable",
-        SimpleFile::new_regular(fs.clone(), || Ok("0\n")),
+        SimpleFile::new_regular(fs.clone(), move || removable_text(removable)),
     );
     let owned = String::from(name);
     dir.add(
@@ -201,6 +208,15 @@ pub(super) fn register_proc(root: &mut DirMapping, fs: &Arc<SimpleFs>) {
 mod tests {
     use super::*;
     #[test]
+    fn unknown_removability_is_not_a_fixed_disk_claim() {
+        assert_eq!(removable_text(Some(false)).unwrap(), "0\n");
+        assert_eq!(removable_text(Some(true)).unwrap(), "1\n");
+        assert_eq!(
+            removable_text(None),
+            Err(axfs_ng_vfs::VfsError::OperationNotSupported)
+        );
+    }
+    #[test]
     fn partition_row_uses_kib_and_omits_zero_capacity() {
         let mut out = String::new();
         partition_row(&mut out, DeviceId::new(259, 3), 2048, "nvme0n1p1");
@@ -213,6 +229,7 @@ mod tests {
         let entry = axfs::BlockInventoryEntry {
             name: "nvme0n1p7".into(),
             info: axfs::BlockDeviceInfo {
+                removable: Some(false),
                 num_blocks: 10,
                 block_size: 4096,
             },

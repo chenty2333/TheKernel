@@ -548,6 +548,8 @@ impl Drop for MountedBlockDevice {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockDeviceInfo {
+    /// None means the driver has not observed a media-removability fact.
+    pub removable: Option<bool>,
     pub num_blocks: u64,
     pub block_size: usize,
 }
@@ -893,11 +895,13 @@ fn init_filesystems_with_root_mode(
         dev.num_blocks()
     );
 
+    let root_removable = axdriver::block_device_removable(&dev);
     let root_device = SharedBlockDevice::new(dev);
     ROOT_BLOCK_DEVICE.call_once(|| RegisteredBlockDevice {
         partition: None,
         name: ROOT_BLOCK_DEVICE_NAME.into(),
         info: BlockDeviceInfo {
+            removable: root_removable,
             num_blocks: root_device.num_blocks(),
             block_size: root_device.block_size(),
         },
@@ -919,6 +923,7 @@ fn init_filesystems_with_root_mode(
         let name = if dev.device_name().starts_with("nvme") {
             String::from(dev.device_name())
         } else { extra_device_name(index) };
+        let removable = axdriver::block_device_removable(&dev);
         let device = SharedBlockDevice::new(dev);
         let partitions = if name.starts_with("nvme") {
             match axdriver::discover_gpt_partitions(&device, &name, read_only) {
@@ -930,6 +935,7 @@ fn init_filesystems_with_root_mode(
             partition: None,
             name,
             info: BlockDeviceInfo {
+                removable,
                 num_blocks: device.num_blocks(),
                 block_size: device.block_size(),
             },
@@ -944,7 +950,7 @@ fn init_filesystems_with_root_mode(
             info!("registered GPT partition /dev/{name} blocks={} read_only={read_only}", device.num_blocks());
             extras.push(RegisteredBlockDevice {
                 partition: metadata,
-                name, info:BlockDeviceInfo {num_blocks:device.num_blocks(),block_size:device.block_size()},
+                name, info:BlockDeviceInfo {removable,num_blocks:device.num_blocks(),block_size:device.block_size()},
                 read_only:AtomicBool::new(read_only),mounted:Arc::new(AtomicBool::new(false)),device,
             });
         }

@@ -200,6 +200,19 @@ pub fn block_device_is_read_only(device: &AxBlockDevice) -> bool {
     matches!(device, StaticBlockDevice::BootModule(_))
 }
 
+/// Fixed-media facts known by these drivers. USB's SCSI RMB bit is not yet
+/// retained, and dynamic drivers have no media-removability contract.
+#[cfg(all(feature = "block", not(feature = "dyn")))]
+pub fn block_device_removable(device: &AxBlockDevice) -> Option<bool> {
+    #[cfg(feature = "usb-xhci")]
+    if matches!(device, StaticBlockDevice::Usb(_)) { return None; }
+    #[cfg(not(feature = "usb-xhci"))]
+    let _ = device;
+    Some(false)
+}
+#[cfg(all(feature = "block", feature = "dyn"))]
+pub fn block_device_removable(_device: &AxBlockDevice) -> Option<bool> { None }
+
 /// Dynamic block drivers do not currently expose immutable boot modules.
 #[cfg(all(feature = "block", feature = "dyn"))]
 pub fn block_device_is_read_only(_device: &AxBlockDevice) -> bool {

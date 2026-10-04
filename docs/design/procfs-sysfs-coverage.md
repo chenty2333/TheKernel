@@ -305,3 +305,15 @@ Fifteenth-commit cycle: full host Python655 (3 environmental skips) and Rust6006
 q35/n305 lint (784 existing kernel warnings), latest-source default KVM guest61/61
 (system-mjc03spd) passed; no guest skips and normal shutdown. Inspect-payload
 build-input regression also passed (5 focused Python tests).
+
+Removability correction: the USB BOT driver has not retained SCSI INQUIRY RMB,
+so it cannot truthfully report fixed media. Block geometry now retains an
+optional driver fact: fixed loop/boot-module/VirtIO/NVMe media report 0, while
+USB/dynamic-driver unknown media return EOPNOTSUPP rather than a fabricated 0.
+No additional USB commands or hardware configuration writes were introduced.
+USB media-removability acceptance remains pending.
+
+Correction validation: driver49/axfs230/kernel2591 host tests, lint, and full
+KVM guest61/61 passed (system-n0ghiks9), with no guest skips and normal shutdown.
+Host formatter tests distinguish true/false/unknown; the guest still verifies
+actual fixed boot-media geometry/read-only state. USB RMB is unverified.
