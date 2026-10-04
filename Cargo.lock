@@ -3243,6 +3243,7 @@ dependencies = [
  "tk-axdriver-pci",
  "tk-axdriver-virtio",
  "tk-axdriver-vsock",
+ "tk-axdriver-watchdog",
  "tk-axhal",
  "tk-axsync",
  "tk-axtask",
@@ -3320,6 +3321,10 @@ dependencies = [
  "log",
  "tk-axdriver-base",
 ]
+
+[[package]]
+name = "tk-axdriver-watchdog"
+version = "0.1.0"
 
 [[package]]
 name = "tk-axexec"

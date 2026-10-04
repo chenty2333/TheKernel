@@ -521,6 +521,8 @@ impl AllDevices {
         let mut usb_devices = alloc::vec::Vec::new();
         walk_reachable_pci_functions(&mut root, |root, bdf, dev_info| {
             debug!("PCI {bdf}: {dev_info}");
+            #[cfg(feature = "itco")]
+            crate::itco::probe(root, bdf, dev_info);
             if dev_info.header_type != HeaderType::Standard
                 || (dev_info.class == 0x03 && dev_info.vendor_id != 0x1af4)
             {

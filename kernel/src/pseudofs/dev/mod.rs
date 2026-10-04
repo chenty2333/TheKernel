@@ -569,6 +569,15 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 
 fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
     let mut root = DevRoot::new(fs.clone());
+    #[cfg(feature = "watchdog-itco")]
+    if axdriver::itco::available() {
+        let device = Arc::try_new(watchdog::Watchdog).ok().and_then(|ops|
+            Device::try_new_with_permissions(fs.clone(), NodeType::CharacterDevice,
+                DeviceId::new(10,130), NodePermission::from_bits_truncate(0o600), ops).ok());
+        if let Some(device) = device { root.add("watchdog", device); }
+        else { let _ = axdriver::itco::set_enabled(false); warn!("itco: device publication failed; stopped watchdog"); }
+    }
+
     root.add(
         "null",
         Device::new(
@@ -966,3 +975,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(feature = "watchdog-itco")]
+mod watchdog;

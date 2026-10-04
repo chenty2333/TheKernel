@@ -267,6 +267,7 @@ def kernel_features(artifacts: Artifacts) -> str:
     # runtime no-op, so a single product ELF still boots on non-Intel and
     # virtualized machines.
     features = [PRODUCT_FEATURE]
+    features.append("watchdog-itco")
     if artifacts.profile == "shell":
         features.append("boot-shell")
     if variant.asid_fast_switch:
@@ -564,6 +565,7 @@ class RunSpec:
     graphics_height: int = 600
     audio_backend: str | None = None
     kernel_cmdline: str | None = None
+    qemu_extra_args: tuple[str, ...] = ()
 
 
 @isolated_run
@@ -672,7 +674,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             extra_args=(("-d", spec.qemu_debug, "-D", str(run_dir / "qemu-debug.log"))
                         if spec.qemu_debug else ()) + (
                 ("-gdb", f"unix:{run_dir / 'gdb.sock'},server=on,wait=off",
-                 "-action", "reboot=shutdown,shutdown=pause,panic=pause") if spec.gdb else ()),
+                 "-action", "reboot=shutdown,shutdown=pause,panic=pause") if spec.gdb else ()) + spec.qemu_extra_args,
             qmp=qmp,
         ),
     )
@@ -865,6 +867,7 @@ def run_cmd(args: argparse.Namespace) -> int:
             graphics_height=height,
             audio_backend=getattr(args, "audio_backend", None),
             kernel_cmdline=getattr(args, "kernel_cmdline", None),
+            qemu_extra_args=(("-action", "reboot=reset", "-watchdog-action", "reset") if getattr(args,"allow_reboot",False) else ()),
             input_after_marker=input_after_marker,
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
@@ -1566,6 +1569,7 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
                         help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")
     parser.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
     parser.add_argument("--kernel-cmdline", help="append literal kernel arguments to a per-run GRUB config")
+    parser.add_argument("--allow-reboot", action="store_true", help="allow real VM reboots for watchdog/reset tests")
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--width", type=int, default=800, help="guest display width in pixels")
     parser.add_argument("--height", type=int, default=600, help="guest display height in pixels")
