@@ -26,7 +26,14 @@ checks GET/SETREGS, short/empty/alignment-sensitive NT_PRSTATUS, PEEKUSER,
 POKEUSER, raw memory PEEK/POKE, and that a changed RAX affects child execution.
 Actual test results are recorded in the task progress file after execution.
 
-Floating state, signal-mask/pending requests, syscall entry/exit stops,
+Floating state uses an owner-published, heap-aligned XSAVE image. Getters normalize
+init x87/SSE components and emit the standard regset software-reserved xfeature
+mask, without the signal-frame magic/trailer. Setters validate MXCSR and the
+uncompacted XSAVE header before commit. FP writes activate x87/SSE and preserve
+other components; XSTATE writes require a complete CPU-sized image. Restore is
+performed by the stopped owner after wake, never through a remote context pointer.
+
+Signal-mask/pending requests, syscall entry/exit stops,
 single-step, LISTEN, hardware watchpoints and real gdb/strace acceptance remain
 pending. Existing relationship and stop storage is process-wide; multithreaded
 debugging requires task-exact stop/relationship semantics, not just registers.

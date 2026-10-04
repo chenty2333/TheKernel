@@ -92,3 +92,109 @@ pub(super) fn ptrace_user_word(
     *thread.ptrace_registers.lock() = Some(regs);
     Ok(0)
 }
+
+/// Produce the Linux standard user XSAVE view, not the signal-frame trailer.
+/// Init components have architectural values even when XSAVE omitted them.
+fn normalize_fp_image(image: &mut [u8], features: u64, xstate: bool) {
+    if features != 0 {
+        let present = u64::from_le_bytes(image[512..520].try_into().unwrap());
+        if present & 1 == 0 {
+            image[..24].fill(0);
+            image[..2].copy_from_slice(&0x037fu16.to_le_bytes());
+            image[32..160].fill(0);
+        }
+        if present & 6 == 0 {
+            image[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        }
+        if present & 2 == 0 {
+            image[160..416].fill(0);
+        }
+    }
+    image[416..512].fill(0);
+    if xstate {
+        image[464..472].copy_from_slice(&features.to_le_bytes());
+    }
+}
+
+pub(super) fn floating_register_transfer(
+    memory: &UserMemoryCapability,
+    thread: &Thread,
+    write: bool,
+    xstate: bool,
+    address: usize,
+    len: usize,
+) -> AxResult<isize> {
+    let layout = axhal::asm::xsave_layout().map_err(|_| ptrace_io_error())?;
+    let required = if xstate { layout.xstate_size } else { 512 };
+    if write && len != required {
+        return Err(if xstate {
+            AxError::BadAddress
+        } else {
+            AxError::InvalidInput
+        });
+    }
+    if !write && len == 0 {
+        return Ok(0);
+    }
+    let mut image = axtask::XsaveImage::new(layout).map_err(|_| AxError::NoMemory)?;
+    {
+        let snapshot = thread.ptrace_xsave.lock();
+        let snapshot = snapshot.as_ref().ok_or(AxError::NoSuchProcess)?;
+        image.as_mut_bytes().copy_from_slice(snapshot.as_bytes());
+    }
+    normalize_fp_image(image.as_mut_bytes(), layout.xfeatures, xstate);
+    if !write {
+        memory
+            .write_bytes(address, &image.as_bytes()[..len])
+            .map_err(map_usercopy_error)?;
+        return Ok(0);
+    }
+    // SAFETY: the owned aligned image has at least `len` initialized bytes;
+    // successful read initializes every transferred byte before inspection.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            image
+                .as_mut_bytes()
+                .as_mut_ptr()
+                .cast::<core::mem::MaybeUninit<u8>>(),
+            len,
+        )
+    };
+    memory
+        .read_bytes(address, bytes)
+        .map_err(map_usercopy_error)?;
+    if !xstate && layout.xfeatures != 0 {
+        let mut present = u64::from_le_bytes(image.as_bytes()[512..520].try_into().unwrap());
+        present |= 3;
+        image.as_mut_bytes()[512..520].copy_from_slice(&present.to_le_bytes());
+    }
+    if !axhal::asm::xsave_image_header_valid(layout, image.as_bytes())
+        || !axhal::asm::xsave_image_mxcsr_valid(image.as_bytes())
+    {
+        return Err(AxError::InvalidInput);
+    }
+    // Software-reserved bytes are output metadata, not restore controls.
+    image.as_mut_bytes()[416..512].fill(0);
+    let retired = thread.ptrace_xsave.lock().replace(image);
+    drop(retired);
+    Ok(0)
+}
+
+#[cfg(test)]
+mod fp_tests {
+    use super::normalize_fp_image;
+    #[test]
+    fn fp_init_and_user_xstate_metadata_are_not_signal_trailers() {
+        let mut bytes = [0xa5u8; 832];
+        bytes[512..576].fill(0);
+        normalize_fp_image(&mut bytes, 7, true);
+        assert_eq!(&bytes[..2], &0x37fu16.to_le_bytes());
+        assert_eq!(&bytes[24..28], &0x1f80u32.to_le_bytes());
+        assert!(bytes[32..416].iter().all(|&byte| byte == 0));
+        assert_eq!(&bytes[464..472], &7u64.to_le_bytes());
+        assert!(bytes[416..464].iter().all(|&byte| byte == 0));
+        assert!(bytes[472..512].iter().all(|&byte| byte == 0));
+        normalize_fp_image(&mut bytes, 7, false);
+        assert!(bytes[416..512].iter().all(|&byte| byte == 0));
+    }
+}

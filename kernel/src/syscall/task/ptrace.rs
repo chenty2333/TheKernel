@@ -4,7 +4,7 @@ use axtask::{
     TaskState, current, replace_inactive_task_user_cet_state,
     snapshot_inactive_task_user_cet_state, yield_now,
 };
-use regs::{general_register_transfer, ptrace_user_word};
+use regs::{floating_register_transfer, general_register_transfer, ptrace_user_word};
 use tk_linux_arch_x86_64::{ARCH_SHSTK_UNLOCK, NT_X86_SHSTK, X86ShstkRegset};
 // Only the request-decoding test spells the two eventless bits out by name; the
 // syscall path takes the whole mask from the same crate.
@@ -45,6 +45,8 @@ const PTRACE_KILL: u32 = 8;
 const PTRACE_SINGLESTEP: u32 = 9;
 const PTRACE_GETREGS: u32 = 12;
 const PTRACE_SETREGS: u32 = 13;
+const PTRACE_GETFPREGS: u32 = 14;
+const PTRACE_SETFPREGS: u32 = 15;
 const PTRACE_ATTACH: u32 = 16;
 const PTRACE_DETACH: u32 = 17;
 const PTRACE_SYSCALL: u32 = 24;
@@ -505,7 +507,7 @@ fn ptrace_shstk_regset(
         .read_value(iov_address as *const IoVec)
         .map_err(map_usercopy_error)?;
     if note == NT_PRSTATUS {
-        if iov.iov_len as usize % 8 != 0 {
+        if !(iov.iov_len as usize).is_multiple_of(8) {
             return Err(AxError::InvalidInput);
         }
         iov.iov_len = (iov.iov_len as usize).min(216) as i64;
@@ -513,6 +515,33 @@ fn ptrace_shstk_regset(
             tracer_memory,
             target_task.as_thread(),
             request == PTRACE_SETREGSET,
+            iov.iov_base as usize,
+            iov.iov_len as usize,
+        )?;
+        tracer_memory
+            .write_value(iov_address as *mut IoVec, iov)
+            .map_err(map_usercopy_error)?;
+        return Ok(0);
+    }
+    if note == NT_PRFPREG || note == NT_X86_XSTATE {
+        let layout = axhal::asm::xsave_layout().map_err(|_| ptrace_io_error())?;
+        if note == NT_X86_XSTATE && layout.xfeatures == 0 {
+            return Err(LinuxError::ENODEV.into());
+        }
+        if !(iov.iov_len as usize).is_multiple_of(8) {
+            return Err(AxError::InvalidInput);
+        }
+        let size = if note == NT_PRFPREG {
+            512
+        } else {
+            layout.xstate_size
+        };
+        iov.iov_len = (iov.iov_len as usize).min(size) as i64;
+        floating_register_transfer(
+            tracer_memory,
+            target_task.as_thread(),
+            request == PTRACE_SETREGSET,
+            note == NT_X86_XSTATE,
             iov.iov_base as usize,
             iov.iov_len as usize,
         )?;
@@ -1010,6 +1039,17 @@ fn sys_ptrace_for_target(
         PTRACE_POKETEXT | PTRACE_POKEDATA => {
             let session = check_inactive_tracee(&target)?;
             poke_word(&target, session, addr, data)
+        }
+        PTRACE_GETFPREGS | PTRACE_SETFPREGS => {
+            check_inactive_tracee(&target)?;
+            floating_register_transfer(
+                tracer_memory,
+                target_thread,
+                request == PTRACE_SETFPREGS,
+                false,
+                data,
+                512,
+            )
         }
         PTRACE_GETREGS | PTRACE_SETREGS => {
             check_inactive_tracee(&target)?;

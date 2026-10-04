@@ -31,8 +31,11 @@ int main(void) {
         if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0)) _exit(1);
         long result;
         pid_t self = getpid();
+        uint64_t vector[2] = { 12, 34 };
+        __asm__ volatile ("movdqu %0, %%xmm15" : : "m"(vector) : "xmm15");
         __asm__ volatile ("syscall" : "=a"(result) : "a"((long)SYS_kill), "D"((long)self), "S"((long)SIGSTOP) : "rcx", "r11", "memory");
-        _exit(result == 77 && word == 22 ? 0 : 2);
+        __asm__ volatile ("movdqu %%xmm15, %0" : "=m"(vector));
+        _exit(result == 77 && word == 22 && vector[0] == 33 && vector[1] == 34 ? 0 : 2);
     }
     CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
     struct user_regs_struct regs, original;
@@ -52,6 +55,33 @@ int main(void) {
     regs.fs_base = 1UL << 47; errno = 0;
     CHECK(request(PTRACE_SETREGS, 0, &regs) == -1 && errno == EIO);
     CHECK(request(PTRACE_GETREGS, 0, &regs) == 0 && memcmp(&original, &regs, sizeof(regs)) == 0);
+    struct user_fpregs_struct fp;
+    CHECK(request(PTRACE_GETFPREGS, 0, &fp) == 0);
+    uint64_t vector[2];
+    memcpy(vector, &fp.xmm_space[60], sizeof(vector));
+    CHECK(vector[0] == 12 && vector[1] == 34);
+    unsigned int mxcsr = fp.mxcsr;
+    fp.mxcsr = ~0U; errno = 0;
+    CHECK(request(PTRACE_SETFPREGS, 0, &fp) == -1 && errno == EINVAL);
+    fp.mxcsr = mxcsr; vector[0] = 33;
+    memcpy(&fp.xmm_space[60], vector, sizeof(vector));
+    CHECK(request(PTRACE_SETFPREGS, 0, &fp) == 0);
+    iov.iov_base = &fp; iov.iov_len = sizeof(fp);
+    CHECK(request(PTRACE_GETREGSET, 2, &iov) == 0 && iov.iov_len == sizeof(fp));
+    memcpy(vector, &fp.xmm_space[60], sizeof(vector));
+    CHECK(vector[0] == 33 && vector[1] == 34);
+    unsigned char xstate[32768];
+    iov.iov_base = xstate; iov.iov_len = sizeof(xstate);
+    long xs = request(PTRACE_GETREGSET, 0x202, &iov);
+    if (xs == 0) {
+        CHECK(iov.iov_len >= 576 && iov.iov_len <= sizeof(xstate));
+        CHECK(request(PTRACE_SETREGSET, 0x202, &iov) == 0);
+        uint64_t invalid = UINT64_MAX;
+        memcpy(xstate + 512, &invalid, sizeof(invalid)); errno = 0;
+        CHECK(request(PTRACE_SETREGSET, 0x202, &iov) == -1 && errno == EINVAL);
+        iov.iov_len = 8; errno = 0;
+        CHECK(request(PTRACE_SETREGSET, 0x202, &iov) == -1 && errno == EFAULT);
+    } else { CHECK(errno == ENODEV); }
     regs.rax = 66;
     CHECK(request(PTRACE_SETREGS, 0, &regs) == 0);
     CHECK(request(PTRACE_POKEUSER, offsetof(struct user_regs_struct, rax), (void *)77) == 0);

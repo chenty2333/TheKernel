@@ -1277,6 +1277,13 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
             &mut regs,
         );
         *thr.ptrace_registers.lock() = Some(regs);
+        if proc_data.ptrace_active_session().is_some() {
+            // Allocate and save in the owner task, never by dereferencing a
+            // remote scheduler context. Resume installs this exact image.
+            let image = axtask::snapshot_current_task_xsave().ok();
+            let retired = core::mem::replace(&mut *thr.ptrace_xsave.lock(), image);
+            drop(retired);
+        }
     }
     while !thr.pending_exit()
         && !proc_data.should_exit_for_exec(tid)
@@ -1315,6 +1322,14 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
             if old_orig != regs[15] {
                 thr.ptrace_update_restart_sysno(regs[15]);
             }
+        }
+    }
+    if publish_registers {
+        let image = thr.ptrace_xsave.lock().take();
+        if let Some(image) = image {
+            axtask::prepare_current_task_xsave_commit(&image)
+                .expect("validated stopped XSAVE image")
+                .commit();
         }
     }
     // Thaw or terminal exit releases exactly the membership counted above.

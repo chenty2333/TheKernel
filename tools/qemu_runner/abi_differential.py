@@ -333,7 +333,10 @@ CONTRACTS.update({
     "vector-io": ("raw-differential", "pass", "POSITION_TRAVELS_IN_POS_L POS_H_IS_IGNORED OFFSET_HALVES_ARE_COMBINED IOVCNT_UIO_MAXIOV_BOUND ZERO_IOVCNT_SUCCEEDS OFFSET_BEFORE_DESCRIPTOR COPY_FILE_RANGE_FLAG_MASK COPY_FILE_RANGE_ZERO_LENGTH_SUCCEEDS COPY_FILE_RANGE_OVERLAP_EINVAL"),
 })
 
+CONTRACTS.update({"ptrace-registers": ("raw-differential", "pass", "REGISTER_AND_FP_MUTATION")})
+
 PROGRAM_CASES = {
+    "ptrace-registers": ("ptrace-registers",),
     "tty-job-control": ("tty-job-control",),
     "tty-termios": ("tty-termios",),
     "unix-write-credentials": ("unix-write-credentials",),
@@ -399,6 +402,7 @@ def selected_programs() -> tuple[str, ...]:
         )
     return selected
 PROGRAM_SUCCESS = {
+    "ptrace-registers": "THEKERNEL_PTRACE_REGISTERS_DIFFERENTIAL_OK",
     "tty-job-control": "THEKERNEL_TTY_JOB_CONTROL_OK",
     "tty-termios": "THEKERNEL_TTY_TERMIOS_OK",
     "unix-write-credentials": "THEKERNEL_UNIX_WRITE_CREDENTIALS_OK",
