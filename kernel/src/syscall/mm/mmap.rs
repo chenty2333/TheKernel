@@ -2776,6 +2776,12 @@ fn demote_shared_folio_locked(
             return restore.and(Err(error));
         }
     }
+    // P1 write protection only invalidates the local TLB.  Every participating
+    // mm needs a grace before the snapshot, or a remote CPU holding a stale
+    // writable translation could store into the folio after it was copied.
+    for guard in guards.iter_mut() {
+        drop(guard.synchronize_tlb_after_mutation());
+    }
 
     // Read-only aliases still observe the live folio while its latest bytes
     // are copied into retained 4 KiB frames.  Only after this snapshot is
