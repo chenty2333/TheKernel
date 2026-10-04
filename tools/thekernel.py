@@ -566,6 +566,7 @@ class RunSpec:
     audio_backend: str | None = None
     kernel_cmdline: str | None = None
     qemu_extra_args: tuple[str, ...] = ()
+    powerdown_after_marker: str | None = None
 
 
 @isolated_run
@@ -611,15 +612,15 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
         if not command_path.is_file():
             raise ProductError(f"commands file does not exist: {command_path}")
     qmp = QmpControls()
-    if spec.qmp_screenshot is not None or spec.qmp_checkpoints:
+    if spec.qmp_screenshot is not None or spec.qmp_checkpoints or spec.powerdown_after_marker:
         qmp = QmpControls(
             socket=run_dir / "graphics-smoke.qmp",
-            screenshot=(None if spec.qmp_checkpoints else spec.qmp_screenshot.expanduser().resolve()),
+            screenshot=(spec.qmp_screenshot.expanduser().resolve() if spec.qmp_screenshot else None),
             screenshot_after_marker=(None if spec.qmp_checkpoints else spec.qmp_screenshot_after_marker),
             screenshot_size=(None if spec.qmp_checkpoints else spec.qmp_screenshot_size),
             screenshot_color_blocks=( () if spec.qmp_checkpoints else spec.qmp_screenshot_color_blocks),
             screenshot_text_cells=(None if spec.qmp_checkpoints else spec.qmp_screenshot_text_cells),
-            checkpoints=spec.qmp_checkpoints,
+            checkpoints=spec.qmp_checkpoints + ((QmpCheckpoint(input_after_marker=spec.powerdown_after_marker, powerdown=True),) if spec.powerdown_after_marker else ()),
             timeout_secs=spec.qmp_timeout_secs,
         )
     if spec.kernel_cmdline is not None:
@@ -867,6 +868,8 @@ def run_cmd(args: argparse.Namespace) -> int:
             graphics_height=height,
             audio_backend=getattr(args, "audio_backend", None),
             kernel_cmdline=getattr(args, "kernel_cmdline", None),
+            powerdown_after_marker=getattr(args,"powerdown_after_marker",None),
+            qmp_timeout_secs=args.timeout,
             qemu_extra_args=(("-action", "reboot=reset", "-watchdog-action", "reset") if getattr(args,"allow_reboot",False) else ()),
             input_after_marker=input_after_marker,
             stop_after_marker=args.stop_after_marker,
@@ -1569,6 +1572,7 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
                         help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")
     parser.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
     parser.add_argument("--kernel-cmdline", help="append literal kernel arguments to a per-run GRUB config")
+    parser.add_argument("--powerdown-after-marker", help="inject the ACPI power button with QMP after a guest marker")
     parser.add_argument("--allow-reboot", action="store_true", help="allow real VM reboots for watchdog/reset tests")
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--width", type=int, default=800, help="guest display width in pixels")

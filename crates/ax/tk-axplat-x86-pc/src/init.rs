@@ -28,6 +28,7 @@ impl InitIf for InitIfImpl {
         // what makes the PCI bus driver's later read of `crate::pci` a plain
         // load instead of a second ACPI walk.
         crate::acpi::init_early();
+        crate::power::init_early();
         crate::mem::init_runtime_mmio();
         // Clock selection can consume HPET only after its ACPI address is retained.
         crate::time::init_early();
@@ -64,6 +65,7 @@ impl InitIf for InitIfImpl {
         // does not exist yet at that point, and this is the last moment before
         // the PCI bus driver starts using the published base.
         crate::acpi::report();
+        crate::power::init_later();
         report_cpu_state(cpu_id);
     }
 

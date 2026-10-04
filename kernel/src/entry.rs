@@ -321,6 +321,10 @@ pub fn init(args: &[String], envs: &[String]) {
     // Keep the init process user-visible as PID 1. Kernel-only alarm workers can
     // consume later scheduler task IDs without changing that ABI.
     spawn_alarm_task().expect("Failed to start alarm workers");
+    if axhal::power::power_button_available()
+        && let Err(error) = spawn_power_button_task()
+    { warn!("acpi-power: deferred shutdown worker unavailable: {error}"); }
+
 
     // TODO: wait for all processes to finish
     let exit_code = task.join().expect("Failed to join init task");
@@ -340,4 +344,26 @@ pub fn init(args: &[String], envs: &[String]) {
         .expect("Failed to flush rootfs");
 
     system_off();
+}
+
+/// IRQ handler only latches the event; sleeping, PID-1 notification and filesystem
+/// flush happen here, with neither an input lock nor a platform spinlock held.
+fn spawn_power_button_task() -> axerrno::AxResult<axtask::AxTaskRef> {
+    axtask::spawn_raw(|| {
+        loop {
+            if axhal::power::take_power_button_event() {
+                info!("acpi-power: power button; notifying init with SIGPWR");
+                let _ = crate::task::send_signal_to_process(1, Some(
+                    tk_linux_signal::SignalInfo::new_kernel(tk_linux_signal::Signo::SIGPWR)));
+                let _ = axtask::sleep(core::time::Duration::from_secs(1));
+                let mount = FS_CONTEXT.lock().root_dir().mountpoint().clone();
+                match mount.flush_all_filesystems() {
+                    Ok(()) => axruntime::klog::death_notice(format_args!("acpi-power: filesystems flushed; entering S5")),
+                    Err(error) => axruntime::klog::death_notice(format_args!("acpi-power: shutdown flush failed: {error}")),
+                }
+                system_off();
+            }
+            let _ = axtask::sleep(core::time::Duration::from_millis(50));
+        }
+    }, "acpi_power_button".into(), axconfig::TASK_STACK_SIZE)
 }

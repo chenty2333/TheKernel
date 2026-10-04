@@ -763,12 +763,15 @@ class _QmpController:
                 self._request(client, buffer, "cont", None, sequence, deadline, device_deleted_events)
                 sequence += 1
             for checkpoint in self.checkpoints:
-                if checkpoint.input_events or checkpoint.pci_hotplug:
+                if checkpoint.input_events or checkpoint.pci_hotplug or checkpoint.powerdown:
                     self._wait_marker(
                         checkpoint.input_after_marker,
                         f"checkpoint marker: {checkpoint.input_after_marker}",
                         deadline,
                     )
+                if checkpoint.powerdown:
+                    self._request(client, buffer, "system_powerdown", None, sequence, deadline, device_deleted_events)
+                    sequence += 1
                 for action in checkpoint.pci_hotplug:
                     if action.action == "add":
                         self._request(

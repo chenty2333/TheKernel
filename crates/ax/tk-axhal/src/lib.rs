@@ -670,6 +670,21 @@ pub mod power {
         system_off()
     }
 
+    /// Fixed-function SCI availability; hosted tests own no power hardware.
+    pub fn power_button_available() -> bool {
+        #[cfg(all(target_os = "none", feature = "defplat"))]
+        { axplat_x86_pc::power_button_available() }
+        #[cfg(not(all(target_os = "none", feature = "defplat")))]
+        { false }
+    }
+    /// Consume a coalesced fixed-function button event outside IRQ context.
+    pub fn take_power_button_event() -> bool {
+        #[cfg(all(target_os = "none", feature = "defplat"))]
+        { axplat_x86_pc::take_power_button_event() }
+        #[cfg(not(all(target_os = "none", feature = "defplat")))]
+        { false }
+    }
+
     /// Restart the supported x86 default platform.
     pub fn system_reset() -> ! {
         #[cfg(all(target_os = "none", feature = "defplat"))]

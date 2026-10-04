@@ -678,3 +678,26 @@ mod tests {
         assert_eq!(RootTable::Xsdt, RootTable::Xsdt);
     }
 }
+
+pub(crate) mod sleep;
+
+/// Visit checksum-validated tables in the preferred root, during early boot.
+pub(crate) fn visit_tables(mut visit: impl FnMut(&'static [u8])) {
+    let rsdp = crate::boot_info::get().rsdp().map(|r| r.bytes().as_slice()).or_else(|| {
+        let address = crate::cpu::find_rsdp()?;
+        // SAFETY: the temporary boot mapping is still active.
+        unsafe { physical_bytes(address, 36) }
+    });
+    let Some(rsdp) = rsdp else { return; };
+    let roots = root_tables(rsdp);
+    for (address, width) in [(if roots.revision >= 2 { roots.xsdt } else { 0 }, 8), (roots.rsdt, 4)] {
+        let Some((length, root)) = table_length_and_bytes(address) else { continue; };
+        if root.get(..4) != Some(if width == 8 { b"XSDT" } else { b"RSDT" })
+            || length < 36 || (length - 36) % width != 0 { continue; }
+        for offset in (36..length).step_by(width) {
+            let address = if width == 8 { read_u64(root,offset) } else { read_u32(root,offset).map(u64::from) };
+            if let Some((_, table)) = address.and_then(table_length_and_bytes) { visit(table); }
+        }
+        return;
+    }
+}

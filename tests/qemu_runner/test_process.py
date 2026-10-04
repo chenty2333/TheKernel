@@ -762,6 +762,20 @@ for index in range(2):
             self.assertEqual([command["execute"] for command in commands], ["qmp_capabilities", "input-send-event", "screendump"])
             self.assertFalse(qmp_socket.exists())
 
+    def test_qmp_powerdown_is_marker_gated_button_not_quit(self) -> None:
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            qmp_socket = root / "qmp.sock"
+            commands = self.start_qmp_server(qmp_socket)
+            result = run_process(
+                command=(sys.executable, "-c", "import time; print('READY', flush=True); time.sleep(.3)"),
+                workdir=root, log_path=root / "console.log", limits=RunLimits(total_timeout_secs=2),
+                interaction=Interaction(), qmp_socket=qmp_socket,
+                qmp_checkpoints=(QmpCheckpoint(input_after_marker="READY", powerdown=True),),
+            )
+            self.assertTrue(result.guest_clean_shutdown, result.error_message)
+            self.assertEqual([c["execute"] for c in commands], ["qmp_capabilities", "system_powerdown"])
+
     def test_qmp_device_del_waits_for_async_matching_device_deleted_before_readd(self) -> None:
         with test_tmpdir() as directory:
             root = Path(directory)
