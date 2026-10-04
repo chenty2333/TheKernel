@@ -1538,7 +1538,7 @@ struct SigsuspendMask<'a> {
 
 impl<'a> SigsuspendMask<'a> {
     fn install(signal: &'a ThreadSignalManager, temporary: SignalSet) -> Self {
-        let old_blocked = signal.set_blocked(temporary);
+        let old_blocked = signal.begin_temporary_mask(temporary);
         Self {
             signal,
             old_blocked,
@@ -1551,12 +1551,13 @@ impl<'a> SigsuspendMask<'a> {
     }
 
     fn hand_off_to_handler(&mut self) {
+        self.signal.end_temporary_mask(false);
         self.restore_on_drop = false;
     }
 
     fn restore(&mut self) {
         if self.restore_on_drop {
-            self.signal.set_blocked(self.old_blocked);
+            self.signal.end_temporary_mask(true);
             self.restore_on_drop = false;
         }
     }

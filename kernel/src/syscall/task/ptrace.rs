@@ -73,6 +73,9 @@ const PTRACE_SETREGSET: u32 = 0x4205;
 const PTRACE_SEIZE: u32 = 0x4206;
 const PTRACE_INTERRUPT: u32 = 0x4207;
 const PTRACE_LISTEN: u32 = 0x4208;
+const PTRACE_PEEKSIGINFO: u32 = 0x4209;
+const PTRACE_GETSIGMASK: u32 = 0x420a;
+const PTRACE_SETSIGMASK: u32 = 0x420b;
 const PTRACE_GET_SYSCALL_INFO: u32 = 0x420e;
 
 // kernel/ptrace.c: `#define PTRACE_O_MASK (0x000000ff | PTRACE_O_EXITKILL |
@@ -1117,6 +1120,32 @@ fn sys_ptrace_for_target(
             // group-stop in a distinct listening state until an event or
             // INTERRUPT re-traps it. Do not fake that state with CONT.
             Err(ptrace_io_error())
+        }
+        PTRACE_GETSIGMASK | PTRACE_SETSIGMASK => {
+            check_inactive_tracee(&target)?;
+            if addr != 8 {
+                return Err(AxError::InvalidInput);
+            }
+            if request == PTRACE_GETSIGMASK {
+                tracer_memory
+                    .write_value(
+                        data as *mut u64,
+                        target_thread.signal.ptrace_sigmask().bits(),
+                    )
+                    .map_err(map_usercopy_error)?;
+            } else {
+                let bits = tracer_memory
+                    .read_value(data as *const u64)
+                    .map_err(map_usercopy_error)?;
+                target_thread
+                    .signal
+                    .ptrace_set_sigmask(tk_linux_signal::SignalSet::from_bits(bits));
+            }
+            Ok(0)
+        }
+        PTRACE_PEEKSIGINFO => {
+            check_inactive_tracee(&target)?;
+            regs::peek_siginfo(tracer_memory, target_thread, addr, data)
         }
         PTRACE_GETSIGINFO => {
             let session = check_inactive_tracee(&target)?;

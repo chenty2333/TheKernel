@@ -36,7 +36,15 @@ uncompacted XSAVE header before commit. FP writes activate x87/SSE and preserve
 other components; XSTATE writes require a complete CPU-sized image. Restore is
 performed by the stopped owner after wake, never through a remote context pointer.
 
-Signal-mask/pending requests, syscall entry/exit stops,
+GET/SETSIGMASK use the native eight-byte signal set and exclude SIGKILL/SIGSTOP.
+Temporary suspend/poll masks retain their eventual restore value in the signal
+manager; a debugger replacement updates it so a local wait guard cannot restore
+stale data. PEEKSIGINFO reads private/shared queues without consuming records.
+The original signal queues keep per-signal delivery priority; independent arrival
+tokens order the siginfo view across signal numbers. Allocation, sorting and
+faulting usercopy are outside pending spin locks.
+
+LISTEN, syscall entry/exit stops,
 single-step, LISTEN, hardware watchpoints and real gdb/strace acceptance remain
 pending. Existing relationship and stop storage is process-wide; multithreaded
 debugging requires task-exact stop/relationship semantics, not just registers.

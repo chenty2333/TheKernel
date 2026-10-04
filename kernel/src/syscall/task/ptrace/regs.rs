@@ -198,3 +198,51 @@ mod fp_tests {
         assert!(bytes[416..512].iter().all(|&byte| byte == 0));
     }
 }
+
+pub(super) fn peek_siginfo(
+    memory: &UserMemoryCapability,
+    thread: &Thread,
+    addr: usize,
+    data: usize,
+) -> AxResult<isize> {
+    // The three fields form the 16-byte native ptrace_peeksiginfo_args ABI.
+    let args = memory
+        .read_value(addr as *const [u64; 2])
+        .map_err(map_usercopy_error)?;
+    let offset = args[0];
+    let flags = args[1] as u32;
+    let count = (args[1] >> 32) as u32 as i32;
+    if flags & !1 != 0 || count < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let snapshot = if flags == 1 {
+        thread.signal.process().pending_snapshot()
+    } else {
+        thread.signal.pending_snapshot()
+    }
+    .map_err(|_| AxError::NoMemory)?;
+    let mut copied = 0;
+    while copied < count as usize {
+        let Some(index) = offset.checked_add(copied as u64) else {
+            break;
+        };
+        let Some(info) = snapshot.get(index) else {
+            break;
+        };
+        let destination = data
+            .checked_add(copied * core::mem::size_of::<SignalInfo>())
+            .ok_or(AxError::BadAddress)?;
+        if let Err(error) = memory.write_value(destination as *mut SignalInfo, info) {
+            return if copied == 0 {
+                Err(map_usercopy_error(error))
+            } else {
+                Ok(copied as isize)
+            };
+        }
+        copied += 1;
+    }
+    Ok(copied as isize)
+}

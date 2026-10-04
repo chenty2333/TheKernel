@@ -1,4 +1,4 @@
-use alloc::{alloc::AllocError, boxed::Box, sync::Arc};
+use alloc::{alloc::AllocError, boxed::Box, sync::Arc, vec::Vec};
 use core::{
     array,
     ptr::NonNull,
@@ -133,11 +133,13 @@ pub enum SignalQueueError {
 }
 
 struct StandardSignal {
+    order: u128,
     info: SignalInfo,
     generation: Option<SignalRecordGeneration>,
 }
 
 struct RealtimeSignalNode {
+    order: u128,
     info: SignalInfo,
     generation: Option<SignalRecordGeneration>,
     _charge: SignalQueueCharge,
@@ -283,6 +285,7 @@ impl PreparedSignal {
         if !info.signo().is_realtime() {
             return Ok(Self {
                 kind: PreparedSignalKind::Standard(StandardSignal {
+                    order: 0,
                     info,
                     generation: None,
                 }),
@@ -292,6 +295,7 @@ impl PreparedSignal {
 
         let charge = SignalQueueCharge::try_new(per_user, rlimit, global)?;
         let node = allocate(RealtimeSignalNode {
+            order: 0,
             info,
             generation: None,
             _charge: charge,
@@ -314,6 +318,7 @@ impl PreparedSignal {
             PreparedSignalKind::RealtimeFallback(info)
         } else {
             PreparedSignalKind::Standard(StandardSignal {
+                order: 0,
                 info,
                 generation: None,
             })
@@ -491,6 +496,7 @@ impl PublishOutcome {
 
 /// Structure to record pending signals.
 pub struct PendingSignals {
+    next_order: u128,
     /// Signals with at least one deliverable instance.
     pub set: SignalSet,
     standard: [Option<StandardSignal>; STANDARD_SIGNAL_SLOTS],
@@ -518,6 +524,7 @@ impl DetachedSignal {
 impl Default for PendingSignals {
     fn default() -> Self {
         Self {
+            next_order: 0,
             set: SignalSet::default(),
             standard: array::from_fn(|_| None),
             realtime: array::from_fn(|_| RealtimeSignalQueue::default()),
@@ -542,6 +549,17 @@ impl PendingSignals {
                         }),
                     };
                 }
+                let Some(order) = self.next_order.checked_add(1) else {
+                    return PublishOutcome {
+                        added: false,
+                        unused: Some(PreparedSignal {
+                            kind: PreparedSignalKind::Standard(signal),
+                            generation,
+                        }),
+                    };
+                };
+                self.next_order = order;
+                signal.order = order;
                 self.set.add(signo);
                 let slot = &mut self.standard[signo as usize];
                 debug_assert!(slot.is_none());
@@ -553,6 +571,17 @@ impl PendingSignals {
             }
             PreparedSignalKind::Realtime(mut node) => {
                 node.generation = generation;
+                let Some(order) = self.next_order.checked_add(1) else {
+                    return PublishOutcome {
+                        added: false,
+                        unused: Some(PreparedSignal {
+                            kind: PreparedSignalKind::Realtime(node),
+                            generation,
+                        }),
+                    };
+                };
+                self.next_order = order;
+                node.order = order;
                 let index = signo as usize - Signo::SIGRTMIN as usize;
                 self.realtime_publish_epoch[index] =
                     self.realtime_publish_epoch[index].wrapping_add(1);
@@ -626,8 +655,82 @@ impl PendingSignals {
     }
 
     pub(crate) fn take_all(&mut self) -> Self {
-        core::mem::take(self)
+        let detached = core::mem::take(self);
+        // Detached delivery records can still be requeued; never recycle an
+        // arrival token even when a flush emptied the visible queue.
+        self.next_order = detached.next_order;
+        detached
     }
+}
+
+/// Immutable queued siginfo values in arrival order. Fallback-only pending
+/// bits have no retained info record and are intentionally absent.
+pub struct PendingSignalSnapshot {
+    records: Vec<(u128, SignalInfo)>,
+}
+
+impl PendingSignalSnapshot {
+    pub fn get(&self, offset: u64) -> Option<SignalInfo> {
+        usize::try_from(offset)
+            .ok()
+            .and_then(|off| self.records.get(off))
+            .map(|entry| entry.1)
+    }
+}
+
+pub(crate) fn snapshot_pending_queue(
+    queue: &kspin::SpinNoIrq<PendingSignals>,
+) -> Result<PendingSignalSnapshot, AllocError> {
+    let mut records = Vec::new();
+    for _ in 0..16 {
+        let count = {
+            let pending = queue.lock();
+            pending
+                .standard
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count()
+                + pending
+                    .realtime
+                    .iter()
+                    .map(|entry| entry.len)
+                    .sum::<usize>()
+        };
+        records.try_reserve_exact(count).map_err(|_| AllocError)?;
+        {
+            let pending = queue.lock();
+            let current_count = pending
+                .standard
+                .iter()
+                .filter(|entry| entry.is_some())
+                .count()
+                + pending
+                    .realtime
+                    .iter()
+                    .map(|entry| entry.len)
+                    .sum::<usize>();
+            if current_count > records.capacity() {
+                continue;
+            }
+            for signal in pending.standard.iter().flatten() {
+                records.push((signal.order, signal.info));
+            }
+            for queue in &pending.realtime {
+                let mut cursor = queue.head;
+                while let Some(node) = cursor {
+                    // SAFETY: the pending lock retains the entire queue and
+                    // serializes every link and node lifetime during this copy.
+                    let node = unsafe { node.as_ref() };
+                    records.push((node.order, node.info));
+                    cursor = node.next;
+                }
+            }
+        }
+        // Allocation and O(n log n) sorting are outside the IRQ-disabled lock.
+        records.sort_unstable_by_key(|entry| entry.0);
+        return Ok(PendingSignalSnapshot { records });
+    }
+    Err(AllocError)
 }
 
 #[cfg(test)]
@@ -648,6 +751,48 @@ mod tests {
 
     fn all_signals() -> SignalSet {
         !SignalSet::default()
+    }
+
+    #[test]
+    fn pending_snapshot_keeps_cross_signal_arrival_order_and_does_not_dequeue() {
+        let (user, global) = accounts(8, 8);
+        let queue = kspin::SpinNoIrq::new(PendingSignals::default());
+        for signo in [
+            Signo::SIGUSR2,
+            Signo::SIGRT32,
+            Signo::SIGUSR1,
+            Signo::SIGRTMIN,
+        ] {
+            let prepared =
+                PreparedSignal::try_accounted(SignalInfo::new_kernel(signo), &user, 8, &global)
+                    .unwrap();
+            assert!(queue.lock().publish(prepared).finish());
+        }
+        let before = user.queued();
+        let snapshot = snapshot_pending_queue(&queue).unwrap();
+        for (index, signo) in [
+            Signo::SIGUSR2,
+            Signo::SIGRT32,
+            Signo::SIGUSR1,
+            Signo::SIGRTMIN,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(snapshot.get(index as u64).unwrap().signo(), signo);
+        }
+        assert!(snapshot.get(4).is_none());
+        assert!(snapshot.get(u64::MAX).is_none());
+        assert_eq!(user.queued(), before);
+        assert!(queue.lock().set.has(Signo::SIGUSR1));
+        assert_eq!(
+            snapshot_pending_queue(&queue)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .signo(),
+            Signo::SIGUSR2
+        );
     }
 
     #[test]

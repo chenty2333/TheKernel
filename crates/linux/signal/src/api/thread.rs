@@ -405,6 +405,7 @@ pub struct ThreadSignalManager {
     pending: SpinNoIrq<PendingSignals>,
     /// The set of signals currently blocked from delivery.
     blocked: SpinNoIrq<SignalSet>,
+    temporary_restore_mask: SpinNoIrq<Option<SignalSet>>,
     /// Temporarily preserved mask while a synchronous wait unblocks signals.
     real_blocked: SpinNoIrq<Option<SignalSet>>,
     /// The stack used by signal handlers
@@ -532,6 +533,7 @@ impl ThreadSignalManager {
 
             pending: SpinNoIrq::new(PendingSignals::default()),
             blocked: SpinNoIrq::new(SignalSet::default()),
+            temporary_restore_mask: SpinNoIrq::new(None),
             real_blocked: SpinNoIrq::new(None),
             stack: SpinNoIrq::new(SignalStack::default()),
 
@@ -1114,7 +1116,8 @@ impl ThreadSignalManager {
     {
         let blocked = self.blocked.lock();
         let mask = !*blocked & !excluded;
-        let restore_blocked = restore_blocked.unwrap_or_else(|| *blocked);
+        let restore_blocked =
+            self.resolve_temporary_restore_mask(restore_blocked.unwrap_or_else(|| *blocked));
         drop(blocked);
 
         loop {
@@ -1217,7 +1220,8 @@ impl ThreadSignalManager {
     ) -> SignalDeliveryResult {
         let blocked = self.blocked.lock();
         let mask = !*blocked & !excluded;
-        let restore_blocked = restore_blocked.unwrap_or_else(|| *blocked);
+        let restore_blocked =
+            self.resolve_temporary_restore_mask(restore_blocked.unwrap_or_else(|| *blocked));
         drop(blocked);
 
         loop {
@@ -1974,6 +1978,55 @@ impl ThreadSignalManager {
         }
     }
 
+    pub fn pending_snapshot(&self) -> Result<crate::PendingSignalSnapshot, AllocError> {
+        crate::snapshot_pending_queue(&self.pending)
+    }
+
+    /// Begin an owner-task temporary mask, retaining the eventual restore
+    /// mask where a stopped-task debugger can inspect or replace it.
+    pub fn begin_temporary_mask(&self, set: SignalSet) -> SignalSet {
+        let old = self.set_blocked(set);
+        *self.temporary_restore_mask.lock() = Some(old);
+        old
+    }
+
+    pub fn end_temporary_mask(&self, restore: bool) {
+        let saved = self.temporary_restore_mask.lock().take();
+        if restore && let Some(saved) = saved {
+            self.set_blocked(saved);
+        }
+    }
+
+    pub fn resolve_temporary_restore_mask(&self, fallback: SignalSet) -> SignalSet {
+        self.temporary_restore_mask.lock().unwrap_or(fallback)
+    }
+
+    pub fn ptrace_sigmask(&self) -> SignalSet {
+        let blocked = self.blocked.lock();
+        self.temporary_restore_mask.lock().unwrap_or(*blocked)
+    }
+
+    pub fn ptrace_set_sigmask(&self, mut set: SignalSet) {
+        set.remove(Signo::SIGKILL);
+        set.remove(Signo::SIGSTOP);
+        let old = {
+            // Both reads and writes take blocked -> saved, so no reader can
+            // splice a new visible mask with an older restore mask.
+            let mut blocked = self.blocked.lock();
+            let mut saved = self.temporary_restore_mask.lock();
+            let old = *blocked;
+            *blocked = set;
+            if saved.is_some() {
+                *saved = Some(set);
+            }
+            old
+        };
+        self.possibly_has_signal.store(true, Ordering::Release);
+        if old.bits() != set.bits() {
+            self.notify_pending();
+        }
+    }
+
     /// Gets the blocked signals.
     pub fn blocked(&self) -> SignalSet {
         *self.blocked.lock()
@@ -2112,6 +2165,31 @@ mod signal_wait_tests {
         let thread = ThreadSignalManager::try_new(process).unwrap();
         thread.try_register(1).unwrap().commit().unwrap();
         thread
+    }
+
+    #[test]
+    fn ptrace_replaces_temporary_restore_mask_and_filters_unblockable_signals() {
+        let thread = registered_thread();
+        let original = SignalSet::from_bits(1 << (Signo::SIGUSR1 as u8 - 1));
+        thread.set_blocked(original);
+        thread.begin_temporary_mask(SignalSet::default());
+        assert_eq!(thread.ptrace_sigmask().bits(), original.bits());
+        let all = SignalSet::from_bits(u64::MAX);
+        thread.ptrace_set_sigmask(all);
+        let mut expected = all;
+        expected.remove(Signo::SIGKILL);
+        expected.remove(Signo::SIGSTOP);
+        assert_eq!(thread.ptrace_sigmask().bits(), expected.bits());
+        assert_eq!(
+            thread.resolve_temporary_restore_mask(original).bits(),
+            expected.bits()
+        );
+        thread.end_temporary_mask(true);
+        assert_eq!(thread.blocked().bits(), expected.bits());
+        assert!(thread.temporary_restore_mask.lock().is_none());
+        thread.begin_temporary_mask(SignalSet::default());
+        thread.end_temporary_mask(false);
+        assert!(thread.blocked().is_empty());
     }
 
     #[test]

@@ -35,7 +35,10 @@ int main(void) {
         __asm__ volatile ("movdqu %0, %%xmm15" : : "m"(vector) : "xmm15");
         __asm__ volatile ("syscall" : "=a"(result) : "a"((long)SYS_kill), "D"((long)self), "S"((long)SIGSTOP) : "rcx", "r11", "memory");
         __asm__ volatile ("movdqu %%xmm15, %0" : "=m"(vector));
-        _exit(result == 77 && word == 22 && vector[0] == 33 && vector[1] == 34 ? 0 : 2);
+        sigset_t mask;
+        if (sigprocmask(SIG_BLOCK, NULL, &mask) != 0) _exit(3);
+        _exit(result == 77 && word == 22 && vector[0] == 33 && vector[1] == 34 &&
+              sigismember(&mask, SIGUSR1) && !sigismember(&mask, SIGKILL) && !sigismember(&mask, SIGSTOP) ? 0 : 2);
     }
     CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
     struct user_regs_struct regs, original;
@@ -82,6 +85,35 @@ int main(void) {
         iov.iov_len = 8; errno = 0;
         CHECK(request(PTRACE_SETREGSET, 0x202, &iov) == -1 && errno == EFAULT);
     } else { CHECK(errno == ENODEV); }
+    uint64_t mask = UINT64_MAX;
+    CHECK(request(0x420b, 8, &mask) == 0);
+    mask = 0;
+    CHECK(request(0x420a, 8, &mask) == 0);
+    CHECK(mask == (UINT64_MAX & ~(1ULL << (SIGKILL - 1)) & ~(1ULL << (SIGSTOP - 1))));
+    errno = 0;
+    CHECK(request(0x420a, 7, NULL) == -1 && errno == EINVAL);
+    CHECK(kill(child, SIGUSR1) == 0);
+    union sigval value = { .sival_int = 55 };
+    CHECK(sigqueue(child, SIGRTMIN + 1, value) == 0);
+    value.sival_int = 66;
+    CHECK(sigqueue(child, SIGRTMIN, value) == 0);
+    CHECK(syscall(SYS_tgkill, child, child, SIGUSR2) == 0);
+    struct { uint64_t off; uint32_t flags; int32_t nr; } peek = { 0, 1, 8 };
+    siginfo_t infos[8];
+    CHECK(request(0x4209, (unsigned long)&peek, infos) == 3);
+    CHECK(infos[0].si_signo == SIGUSR1 && infos[1].si_signo == SIGRTMIN + 1 && infos[2].si_signo == SIGRTMIN);
+    CHECK(infos[1].si_value.sival_int == 55 && infos[2].si_value.sival_int == 66);
+    peek.off = 1; peek.nr = 1;
+    CHECK(request(0x4209, (unsigned long)&peek, infos) == 1 && infos[0].si_signo == SIGRTMIN + 1);
+    peek.off = 0; peek.flags = 0; peek.nr = 8;
+    CHECK(request(0x4209, (unsigned long)&peek, infos) == 1 && infos[0].si_signo == SIGUSR2);
+    CHECK(request(0x4209, (unsigned long)&peek, infos) == 1 && infos[0].si_signo == SIGUSR2);
+    peek.flags = 2; errno = 0;
+    CHECK(request(0x4209, (unsigned long)&peek, infos) == -1 && errno == EINVAL);
+    peek.flags = 0; peek.nr = -1; errno = 0;
+    CHECK(request(0x4209, (unsigned long)&peek, infos) == -1 && errno == EINVAL);
+    peek.off = UINT64_MAX; peek.nr = 1;
+    CHECK(request(0x4209, (unsigned long)&peek, infos) == 0);
     regs.rax = 66;
     CHECK(request(PTRACE_SETREGS, 0, &regs) == 0);
     CHECK(request(PTRACE_POKEUSER, offsetof(struct user_regs_struct, rax), (void *)77) == 0);
