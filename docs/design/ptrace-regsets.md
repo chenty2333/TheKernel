@@ -131,3 +131,16 @@ initial child stop, then follows an actual child write entry/exit and detaches i
 before exit. Full traced-child exit handoff/reaping, thread-exact relationships,
 exec option events and actual gdb/strace still need acceptance; this case does not
 claim those workflows are complete.
+
+## Exec reports
+
+TRACEEXEC produces event 4 and an event message containing the former visible
+thread ID, captured before identity/alias handoff. Non-seized legacy tracing
+without that option produces a plain SIGTRAP with SI_USER siginfo; seized tracing
+without TRACEEXEC produces no extra trap. Publication uses the exact admitted
+relationship, not a new attach which happens after the image commits.
+
+The paired regression execs the real ELF test program in all four option/seize
+combinations, inspects the new image's entry registers and siginfo, then confirms
+an actual pipe write and normal exit. Non-leader exec event IDs and thread-exact
+wait/exit handoff still require multithreaded debugger acceptance.

@@ -745,6 +745,10 @@ static int test_epoll_membarrier_differential(void) {
         "--thekernel", "epoll-membarrier-differential-child");
 }
 
+static int test_ptrace_exec(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-exec-differential", NULL, "ptrace-exec-child");
+}
+
 static int test_ptrace_fork(void) {
     return run_guest_program("/opt/thekernel-tests/portable/ptrace-fork-differential", NULL, "ptrace-fork-child");
 }
@@ -1068,6 +1072,7 @@ static int run_init(int argc, char **argv) {
         { "ptrace-step", test_ptrace_step, 30 },
         { "ptrace-stop-ready", test_ptrace_stop_ready, 30 },
         { "ptrace-fork", test_ptrace_fork, 45 },
+        { "ptrace-exec", test_ptrace_exec, 30 },
         { "anon-fd-flags", test_anon_fd_flags, 20 },
         { "select", test_select, 20 },
         { "exit-status", test_exit_status, 20 },

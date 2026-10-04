@@ -2,6 +2,16 @@
 use super::*;
 use crate::task::AsThread;
 
+fn exec_stop_kind(options: u32, seized: bool) -> Option<u8> {
+    if options & (1 << 4) != 0 {
+        Some(4)
+    } else if !seized {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 fn all_images_published(images: impl IntoIterator<Item = bool>) -> bool {
     let mut saw_thread = false;
     for ready in images {
@@ -36,6 +46,32 @@ impl ProcessData {
         }
         job.stop_notified = true;
         true
+    }
+
+    /// Event-enabled exec is an event stop; legacy TRACEME/ATTACH emits a
+    /// plain delivery trap. Seized tracees without TRACEEXEC get no trap.
+    pub(crate) fn ptrace_exec_stop(&self, session: PtraceSession, old_pid: usize) -> Option<u8> {
+        let mut control = self.ptrace_ctl.lock();
+        if control.active_session() != Some(session) {
+            return None;
+        }
+        let event = exec_stop_kind(control.options, control.seized)?;
+        let mut job = self.job_ctl.lock();
+        if job.state != StopState::Running {
+            return None;
+        }
+        if event != 0 {
+            control.event_message = old_pid;
+        }
+        job.state = StopState::Stopped;
+        job.stop_kind = StopKind::Ptrace;
+        job.stop_signal = Signo::SIGTRAP as u8;
+        job.ptrace_event = event;
+        job.ptrace_session = Some(session);
+        job.stop_reported = false;
+        job.stop_notified = false;
+        job.continued = false;
+        Some(event)
     }
 
     /// Publish syscall provenance and the wait status in one generation.
@@ -131,6 +167,14 @@ impl ProcessData {
 mod tests {
     use super::*;
     use crate::task::AsThread;
+    #[test]
+    fn exec_event_legacy_and_seized_admission_are_distinct() {
+        assert_eq!(exec_stop_kind(0, false), Some(0));
+        assert_eq!(exec_stop_kind(0, true), None);
+        assert_eq!(exec_stop_kind(1 << 4, false), Some(4));
+        assert_eq!(exec_stop_kind(1 << 4, true), Some(4));
+    }
+
     #[test]
     fn a_requested_stop_is_not_reportable_until_all_owner_images_exist() {
         assert!(!all_images_published([]));

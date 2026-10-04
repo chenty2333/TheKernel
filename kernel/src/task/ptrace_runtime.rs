@@ -9,6 +9,7 @@ use super::{Thread, notify_ptrace_attach_stop, wait_if_stopped};
 pub(crate) const TRAP_FLAG: u64 = 1 << 8;
 pub(crate) const STEP_INSTRUCTION: u8 = 4;
 pub(crate) const INHERITED_SIGNAL_STOP: u8 = 3;
+const LEGACY_EXEC_STOP: u8 = 4;
 
 pub(crate) const TRACE_SYSCALL: u8 = 1;
 pub(crate) const EMULATE_SYSCALL: u8 = 2;
@@ -105,6 +106,19 @@ fn syscall_stop(thr: &Thread, uctx: &mut UserContext, op: u8) {
     thr.ptrace_stop_provenance.store(0, Ordering::Release);
 }
 
+pub(crate) fn report_exec(thr: &Thread, session: super::PtraceSession, old_pid: usize) {
+    thr.ptrace_stop_provenance
+        .store(LEGACY_EXEC_STOP, Ordering::Release);
+    match thr.proc_data.ptrace_exec_stop(session, old_pid) {
+        Some(0) => notify_ptrace_attach_stop(&thr.proc_data),
+        Some(_) => {
+            thr.ptrace_stop_provenance.store(0, Ordering::Release);
+            notify_ptrace_attach_stop(&thr.proc_data);
+        }
+        None => thr.ptrace_stop_provenance.store(0, Ordering::Release),
+    }
+}
+
 pub(crate) fn synthetic_stop_signal_info(thr: &Thread) -> Option<SignalInfo> {
     let provenance = thr.ptrace_stop_provenance.load(Ordering::Acquire);
     let stop = thr.proc_data.current_stop_report()?;
@@ -114,6 +128,16 @@ pub(crate) fn synthetic_stop_signal_info(thr: &Thread) -> Option<SignalInfo> {
     if provenance == INHERITED_SIGNAL_STOP && stop.signal == Signo::SIGSTOP as u8 {
         // Linux adds a bare pending SIGSTOP to a non-seized inherited child.
         return Some(SignalInfo::new_user(Signo::SIGSTOP, 0, 0, 0));
+    }
+    if provenance == LEGACY_EXEC_STOP && stop.signal == Signo::SIGTRAP as u8 {
+        return Some(SignalInfo::new_user(
+            Signo::SIGTRAP,
+            0,
+            thr.proc_data.pid_ns().visible_pid(thr.tid()),
+            thr.proc_data
+                .user_ns()
+                .from_kuid_munged(thr.current_cred().ids().ruid),
+        ));
     }
     if !matches!(provenance & 0x7f, 1 | 2)
         || stop.signal != (Signo::SIGTRAP as u8 | (provenance & 0x80))
