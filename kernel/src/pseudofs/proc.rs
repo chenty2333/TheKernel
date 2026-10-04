@@ -2897,6 +2897,7 @@ impl SimpleDirOps for ThreadDir {
                 Some(b"fd".as_slice()),
                 Some(b"fdinfo".as_slice()),
                 Some(b"ns".as_slice()),
+                Some(b"net".as_slice()),
             ]
             .into_iter()
             .flatten()
@@ -3201,6 +3202,7 @@ impl SimpleDirOps for ThreadDir {
                 })
             })
             .into(),
+            b"net" => super::proc_net::task_dir(fs, &task).into(),
             b"ns" => SimpleDir::new_maker(fs.clone(), {
                 drop(proc_image_access(&task, process_view)?);
                 Arc::new(ThreadNamespaceDir {
@@ -3391,32 +3393,6 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
         data.iter().all(|byte| byte.is_ascii_whitespace())
     }
 
-    fn proc_net_dev_snapshot() -> String {
-        let mut output = concat!(
-            "Inter-|   Receive                                                |  Transmit\n",
-            " face |bytes    packets errs drop fifo frame compressed multicast|",
-            "bytes    packets errs drop fifo colls carrier compressed\n",
-        )
-        .to_string();
-        let net_ns = current().as_thread().net_ns();
-        for (name, stats) in net_ns.stack().device_stats() {
-            let _ = writeln!(
-                output,
-                "{name:>6}: {rx_bytes:>7} {rx_packets:>7} {rx_errors:>4} {rx_dropped:>4} 0 0 0 0 \
-                 {tx_bytes:>8} {tx_packets:>7} {tx_errors:>4} {tx_dropped:>4} 0 0 0 0",
-                rx_bytes = stats.rx_bytes,
-                rx_packets = stats.rx_packets,
-                rx_errors = stats.rx_errors,
-                rx_dropped = stats.rx_dropped,
-                tx_bytes = stats.tx_bytes,
-                tx_packets = stats.tx_packets,
-                tx_errors = stats.tx_errors,
-                tx_dropped = stats.tx_dropped,
-            );
-        }
-        output
-    }
-
     fn proc_uts_write_value(data: &[u8]) -> Option<&[u8]> {
         if is_proc_truncate_write(data) {
             return None;
@@ -3560,14 +3536,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
             Ok(format!("{}\n", axhal::boot::command_line().unwrap_or("")))
         }),
     );
-    root.add("net", {
-        let mut net = DirMapping::new();
-        net.add(
-            "dev",
-            SimpleFile::new_regular(fs.clone(), || Ok(proc_net_dev_snapshot())),
-        );
-        SimpleDir::new_maker(fs.clone(), Arc::new(net))
-    });
+    root.add("net", super::proc_net::root_link(fs.clone()));
 
     root.add("sys", {
         let mut sys = DirMapping::new();

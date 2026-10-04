@@ -16,6 +16,7 @@ pub(crate) mod proc;
 mod proc_inventory;
 mod proc_interrupts;
 mod proc_memory;
+mod proc_net;
 mod proc_task_memory;
 pub(crate) mod rpc_pipefs;
 pub(crate) mod sys;

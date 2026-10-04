@@ -378,3 +378,36 @@ derived from those addresses or MSI-X table offsets. Linux reads BAR masks by
 writing config registers; adding that to a sysfs read, or guessing a size, is
 not permitted. Capture existing probe results first; unknown firmware geometry
 must remain explicitly unresolved unless a safe admitted acquisition path exists.
+
+### Network namespace-scoped dev and IPv4 routes
+
+`/proc/net` now has Linux's `self/net` symlink shape; `/proc/<pid>/net` and
+`/proc/<pid>/task/<tid>/net` select the target task's current network namespace
+when looking up a child file. Open files retain that namespace after unshare or
+setns; an already opened process-net directory follows its target on a new child
+lookup. The previous dev callback incorrectly used the reader's current
+namespace each time. Its sole formatter now lives in the new proc_net module.
+
+`route` uses the actual RouteInfo/InterfaceInfo snapshots: normalized IPv4
+prefix/mask in x86 native-word hex, gateway, and UP/GATEWAY/HOST flags. TheKernel
+has one routing table and no per-route priority/advmss/window/rtt metrics; these
+and Linux's legacy RefCnt/Use fields are 0. IPv6 routes are excluded; an IPv6
+next hop has no IPv4 gateway number, as in Linux. A concurrently removed
+interface's route is omitted, not relabelled via a reused storage position.
+
+Host kernel2596 tests, lint, latest KVM guest63/63 (system-ljmsqmen), and full
+ABI257/257 (abi-kmni5ouv) passed; no guest skips and normal shutdown. Guest
+checks route grammar plus namespace unshare/setns, old-file pinning, directory
+follow behavior, and reading the parent's namespace from a child in another
+namespace. Contract state descriptions for unshare/setns were updated; progress
+counts are unchanged. ABI coverage remains the existing suite, not a paired
+Linux execution of the new proc-net smoke test.
+
+Actual Alpine netstat -rn now displays the real loopback/default routes
+(shell-pzl8yk85). `ip -4 route` independently fails to send its dump request;
+that netlink failure is not masked by this procfs node. Host strace of the exact
+signed Alpine ip binary shows a 156-byte send buffer containing a 36-byte
+RTM_GETROUTE request followed by a zeroed tail; examine Linux NLMSG_OK termination
+rather than weakening tool validation. Socket tables/SNMP and active ss/netstat
+acceptance remain pending; current SOCK_DIAG retains identity but hardcodes
+unbound addresses/closed stream state, so an empty successful ss is not proof.
