@@ -178,3 +178,17 @@ ABI 验证结果：最初 Linux oracle 的 CONFIG_HZ=100，使既有 socket-prov
 验证 1500us 请求向上整倍数量化；未改两个内核的时钟或 socket 实现，也没
 改成接受任意正数。独立重跑完整差分 **257/257 contracts 在两个 guest
 通过**（abi-2wdn18zu）。该测试修复与内核锁修复分开提交。
+
+### B1：真实 btime
+
+`/proc/stat` 新增整数秒 btime，来自平台 RTC epoch 与已有 realtime offset
+的同一发布协议，而不是固定日期或两次前进时钟相减。按照 Linux 7.2.3
+对读者 time namespace 的 boottime offset 反向平移。主机格式回归通过；
+完整 kernel 2582 测试、product lint、完整 KVM guest 56/56 均通过，无 skip
+正常关机（system-1tq88tjv）；新 guest 回归检查 btime+uptime 重构实际 realtime。
+Linux 主机同一回归也通过。**time namespace 偏移在本项只核对源码规则，
+未额外 guest 验收；不把它写成已测通过。**
+
+真实 Alpine ps 的 STARTED 不再是 1970，显示此次 guest 的实际启动日期
+（shell-6riw98rp）。top 仍失败，不能称跑通；htop 已越过缺 btime 的错误，
+现在明确报无法初始化终端类型 vt100，需核对 payload 的 terminfo 数据路径。

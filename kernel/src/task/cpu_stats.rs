@@ -12,6 +12,8 @@ use core::{
 
 use axconfig::plat::MAX_CPU_NUM;
 
+use super::AsThread;
+
 #[repr(align(64))]
 struct CpuTicks([AtomicU64; 4]);
 
@@ -96,7 +98,19 @@ pub(crate) fn proc_stat() -> String {
         }
     }
     append_interrupt_totals(&mut output, &interrupts);
+    let epoch = crate::time::boot_epoch();
+    let epoch = axtask::current_may_uninit()
+        .and_then(|task| {
+            task.try_as_thread()
+                .map(|thread| thread.time_ns().shift_boot_epoch(epoch))
+        })
+        .unwrap_or(epoch);
+    append_boot_epoch(&mut output, epoch);
     output
+}
+
+fn append_boot_epoch(output: &mut String, epoch: core::time::Duration) {
+    let _ = writeln!(output, "btime {}", epoch.as_secs());
 }
 
 fn append_interrupt_totals(output: &mut String, interrupts: &[u64]) {
@@ -142,5 +156,13 @@ mod tests {
         let mut output = String::new();
         append_interrupt_totals(&mut output, &[2, 0, 7]);
         assert_eq!(output, "intr 9 2 0 7\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n");
+    }
+
+    #[test]
+    fn boot_epoch_uses_integer_seconds_and_a_single_linux_record() {
+        use core::time::Duration;
+        let mut output = String::new();
+        append_boot_epoch(&mut output, Duration::from_millis(1_000_950));
+        assert_eq!(output, "btime 1000\n");
     }
 }

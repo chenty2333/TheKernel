@@ -1309,6 +1309,12 @@ pub(crate) fn apply_boottime_offset(&self, value: Duration) -> Duration {
         apply_time_offset(value, self.offset_ns(true))
     }
 
+    /// /proc/stat reports the wall-clock boot epoch shifted opposite to the
+    /// namespace's elapsed boottime offset, as Linux timens_sub_boottime does.
+    pub(crate) fn shift_boot_epoch(&self, value: Duration) -> Duration {
+        apply_time_offset(value, self.offset_ns(true).saturating_neg())
+    }
+
 pub(crate) fn host_monotonic_deadline(&self, value: Duration) -> Duration {
         apply_time_offset(value, self.offset_ns(false).saturating_neg())
     }

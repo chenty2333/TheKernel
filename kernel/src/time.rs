@@ -197,6 +197,18 @@ pub fn wall_time() -> TimeValue {
     TimeValue::from_nanos(wall_time_nanos_with_generation().0)
 }
 
+/// Wall-clock epoch of the monotonic origin, with the same clock-set
+/// publication protocol as realtime reads. Avoid subtracting two separately
+/// sampled advancing clocks just to recover the immutable platform origin.
+pub(crate) fn boot_epoch() -> TimeValue {
+    TimeValue::from_nanos(read_wall_time_publication(&WALL_TIME_PUBLICATION_SEQUENCE, || {
+        apply_wall_time_offset(
+            axhal::time::epochoffset_nanos(),
+            WALL_TIME_OFFSET_NANOS.load(Ordering::Relaxed),
+        )
+    }).0)
+}
+
 /// Atomically snapshots wall time and its discontinuity generation.
 pub(crate) fn wall_time_with_discontinuity_generation() -> (TimeValue, u64) {
     let (nanos, generation) = wall_time_nanos_with_generation();
