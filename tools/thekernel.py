@@ -548,7 +548,6 @@ class RunSpec:
     extra_block: Path | None
     run_cpus: int
     nvme_disk: Path | None = None
-    kernel_args: str = ""
     usb_disk: Path | None = None
     usb_boot: bool = False
     input_backend: str = "virtio"
@@ -607,24 +606,26 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
         run_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise ProductError(f"cannot create run directory: {error}") from error
-    if spec.kernel_args:
-        if not re.fullmatch(r"[A-Za-z0-9_.=,:/+ -]+", spec.kernel_args):
-            raise ProductError("kernel arguments must be plain GRUB tokens")
-        copied_esp = run_dir / "kernel-args-esp.img"
-        grub_path = run_dir / "grub-args.cfg"
+    if spec.kernel_cmdline is not None:
+        from tools.kernel_cmdline import append_kernel_cmdline
+        copied_esp = run_dir / "kernel-cmdline.esp"
+        grub_path = run_dir / "grub-cmdline.cfg"
         protected = (artifacts.kernel, selected_esp, selected_rootfs, *(
             path for path in (spec.nvme_disk, spec.usb_disk, spec.extra_block, spec.commands)
             if path is not None
         ))
         try:
             _validate_output_destinations(
-                (("kernel-args ESP", copied_esp), ("kernel-args GRUB config", grub_path)),
+                (("kernel-cmdline ESP", copied_esp), ("kernel-cmdline GRUB config", grub_path)),
                 protected_paths=protected,
             )
         except RunnerError as error:
             raise ProductError(str(error)) from error
         grub_source = REPO_ROOT / "config/x86_64" / ("grub.cfg" if spec.rootfs_transport == "module" else "grub-drive.cfg")
-        grub = grub_source.read_text().replace("multiboot2 /TheKernel.elf", "multiboot2 /TheKernel.elf " + spec.kernel_args)
+        try:
+            grub = append_kernel_cmdline(grub_source.read_text(), spec.kernel_cmdline)
+        except ValueError as error:
+            raise ProductError(str(error)) from error
         grub_path.write_text(grub)
         command = ["bash", str(REPO_ROOT / "scripts/build-x86-uefi-esp.sh"),
                    "--kernel", str(artifacts.kernel), "--output", str(copied_esp),
@@ -633,7 +634,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             command.extend(["--rootfs", str(selected_rootfs)])
         else:
             command.extend(["--mode", "multiboot-drive"])
-        run_checked(command)
+        run_checked(command, env=command_env(artifacts))
         selected_esp = copied_esp
     if spec.gdb:
         print(f"GDB socket: {run_dir / 'gdb.sock'}", file=sys.stderr, flush=True)
@@ -666,25 +667,6 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             checkpoints=spec.qmp_checkpoints + ((QmpCheckpoint(input_after_marker=spec.powerdown_after_marker, powerdown=True),) if spec.powerdown_after_marker else ()),
             timeout_secs=spec.qmp_timeout_secs,
         )
-    if spec.kernel_cmdline is not None:
-        from tools.kernel_cmdline import append_kernel_cmdline
-        template_name = "grub.cfg" if spec.rootfs_transport == "module" else "grub-drive.cfg"
-        try:
-            grub_text = append_kernel_cmdline(
-                (REPO_ROOT / "config" / "x86_64" / template_name).read_text(), spec.kernel_cmdline)
-        except ValueError as error:
-            raise ProductError(str(error)) from error
-        grub_config = run_dir / "grub-cmdline.cfg"
-        grub_config.write_text(grub_text)
-        selected_esp = run_dir / "kernel-cmdline.esp"
-        esp_command = ["bash", str(REPO_ROOT / "scripts" / "build-x86-uefi-esp.sh"),
-                       "--kernel", str(artifacts.kernel), "--output", str(selected_esp),
-                       "--grub-config", str(grub_config)]
-        if spec.rootfs_transport == "module":
-            esp_command.extend(("--rootfs", str(selected_rootfs)))
-        else:
-            esp_command.extend(("--mode", "multiboot-drive"))
-        run_checked(esp_command, env=command_env(artifacts))
     result = run(
         RunConfig(
             arch="x86_64",
@@ -924,7 +906,6 @@ def run_cmd(args: argparse.Namespace) -> int:
             commands=Path(args.commands) if args.commands else None,
             extra_block=Path(args.extra_block) if args.extra_block else None,
             nvme_disk=Path(args.nvme_disk) if args.nvme_disk else None,
-            kernel_args=args.kernel_args,
             usb_disk=Path(args.usb_disk) if args.usb_disk else None,
             usb_boot=getattr(args,"usb_boot",False),
             input_backend=args.input_backend,
@@ -1644,7 +1625,6 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--stop-after-marker")
     parser.add_argument("--extra-block")
     parser.add_argument("--nvme-disk", help="attach a disposable image as NVMe; guest writes remain disabled by default")
-    parser.add_argument("--kernel-args", default="", help="explicit additional boot parameters in a run-local ESP copy")
     parser.add_argument("--usb-boot", action="store_true", help="boot solely from --usb-disk (ESP and rootfs on USB); no SATA or VirtIO root")
     parser.add_argument("--usb-disk", help="attach an existing writable image as USB mass storage")
     parser.add_argument("--input-backend", choices=("virtio", "usb"), default="virtio",

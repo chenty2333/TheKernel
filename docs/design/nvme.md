@@ -62,7 +62,7 @@ No Windows filesystem mount or BitLocker decryption is attempted.
 Host fake emulates Identify, queue creation, DMA payload copies, CQ phases,
 70 read/write pairs through queue wrap, PRP offsets, range rejection, RO
 admission and timeout poison. QEMU `--nvme-disk IMAGE` appends a standard NVMe
-controller to the existing topology. `--kernel-args` builds a run-local ESP
+controller to the existing topology. `--kernel-cmdline` builds a run-local ESP
 with explicit parameters; the canonical ESP/config is not edited.
 
 `tests/guest/nvme-smoke.c` is destructive only in raw/fs modes. Compile static

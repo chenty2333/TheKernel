@@ -1208,8 +1208,8 @@ if __name__ == "__main__":
 class KernelArgumentInputProtectionTests(unittest.TestCase):
     def test_nvme_image_and_hardlink_cannot_alias_boot_argument_outputs(self):
         product = load_product()
-        for output, hardlink in (("kernel-args-esp.img", False),
-                                 ("grub-args.cfg", False), ("grub-args.cfg", True)):
+        for output, hardlink in (("kernel-cmdline.esp", False),
+                                 ("grub-cmdline.cfg", False), ("grub-cmdline.cfg", True)):
             with self.subTest(output=output, hardlink=hardlink), test_tmpdir() as directory:
                 root = Path(directory)
                 args = product.build_parser().parse_args(["build", "--profile", "shell"])
@@ -1227,7 +1227,7 @@ class KernelArgumentInputProtectionTests(unittest.TestCase):
                 spec = product.RunSpec(accel="kvm", timeout=1, workdir=run_dir,
                     interactive=False, input_after_marker=None, stop_after_marker=None,
                     commands=None, extra_block=None, run_cpus=1, nvme_disk=image,
-                    kernel_args="nvme.allow_write=1")
+                    kernel_cmdline="nvme.allow_write=1")
                 with patch.object(product, "run_checked") as builder:
                     with self.assertRaises(product.ProductError):
                         product.run_product.__wrapped__(artifacts, spec)
