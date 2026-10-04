@@ -306,6 +306,72 @@ fn ecam_window() -> Option<VirtAddr> {
     }
 }
 
+/// Read one aligned dword only inside the platform's existing ECAM mapping.
+pub(crate) fn observe_config_word(address: crate::pci::Address, offset: usize) -> Option<u32> {
+    observe_config_value(address, offset, 4)
+}
+
+pub(crate) fn observe_config_value(
+    address: crate::pci::Address,
+    offset: usize,
+    width: usize,
+) -> Option<u32> {
+    if !matches!(width, 1 | 2 | 4) || !offset.is_multiple_of(width) || offset > 4096 - width {
+        return None;
+    }
+    let base = ECAM_WINDOW.load(Ordering::Acquire);
+    if base == 0 {
+        return None;
+    }
+    let relative = address.ecam_offset(
+        axhal::pci::ecam_segment(),
+        axhal::pci::ecam_bus_range(),
+        offset,
+    )?;
+    let pointer = base.checked_add(relative)? as *const u8;
+    // SAFETY: ecam_offset/width validate segment, mapped bus, function,
+    // alignment and complete access bounds; the mapping is never reclaimed.
+    Some(unsafe {
+        match width {
+            1 => u32::from(pointer.read_volatile()),
+            2 => u32::from(pointer.cast::<u16>().read_volatile()),
+            4 => pointer.cast::<u32>().read_volatile(),
+            _ => unreachable!(),
+        }
+    })
+}
+
+pub(crate) fn observe_inventory() -> DevResult<alloc::vec::Vec<crate::pci::Address>> {
+    let mut entries = alloc::vec::Vec::new();
+    if ECAM_WINDOW.load(Ordering::Acquire) == 0 {
+        return Ok(entries);
+    }
+    let Some(mut root) = pci_root() else {
+        return Ok(entries);
+    };
+    let mut allocation_failed = false;
+    walk_reachable_pci_functions(&mut root, |_root, bdf, _info| {
+        if allocation_failed {
+            return;
+        }
+        if entries.try_reserve(1).is_err() {
+            allocation_failed = true;
+            return;
+        }
+        entries.push(crate::pci::Address {
+            segment: axhal::pci::ecam_segment(),
+            bus: bdf.bus,
+            device: bdf.device,
+            function: bdf.function,
+        });
+    });
+    if allocation_failed {
+        Err(DevError::NoMemory)
+    } else {
+        Ok(entries)
+    }
+}
+
 fn pci_root() -> Option<PciRoot> {
     // The ECAM base is a machine fact: the platform discovers it from the
     // firmware's MCFG table during early initialization and falls back to

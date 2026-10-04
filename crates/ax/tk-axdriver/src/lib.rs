@@ -69,6 +69,8 @@ extern crate alloc;
 mod macros;
 
 #[cfg(not(feature = "dyn"))]
+#[path = "pci_observation.rs"]
+pub mod pci;
 mod bus;
 mod drivers;
 mod dummy;

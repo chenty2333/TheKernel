@@ -317,3 +317,42 @@ Correction validation: driver49/axfs230/kernel2591 host tests, lint, and full
 KVM guest61/61 passed (system-n0ghiks9), with no guest skips and normal shutdown.
 Host formatter tests distinguish true/false/unknown; the guest still verifies
 actual fixed boot-media geometry/read-only state. USB RMB is unverified.
+
+### PCI identity and read-only binary configuration
+
+PCI boot inventory follows the existing bounded reachable-bus walk and uses the
+already mapped firmware-selected ECAM segment/range. Unowned functions, including
+bridges, are added to the same device registry as the existing DRM/input parents;
+those parents receive the same live vendor/device/class/subsystem/revision fields.
+No competing `/sys/bus/pci` tree shadows display/input descendants. NUMA affinity
+has not been discovered, so `numa_node` reports Linux's unknown value -1.
+
+`config` is a real read-only binary node, not a generated full-buffer text file:
+reads touch only the admitted interval, using aligned byte/halfword/dword loads.
+Its observed length is 256 or 4096 bytes after capability/reachability/alias
+checks. Metadata length is independent of read permissions. The immutable opener
+credential must have CAP_SYS_ADMIN in the initial user namespace for full reads;
+otherwise access ends at byte64 (CardBus byte128). Writes/append/truncation never
+modify configuration space. No new BAR probes, command changes, or driver resets
+are introduced by these observations.
+
+Generic publication is boot-only: later sysfs mounts cannot claim a newly
+arrived input function ahead of the established input reconcile owner. Existing
+input removal/publication remains owned by that subsystem. General PCI hotplug,
+canonical bridge-parent paths, and registry exhaustion beyond its existing
+64-object capacity are not accepted here. IRQ/resource/driver/enable attributes
+remain pending, so this is not full `lspci -vvv/-k` acceptance yet.
+
+PCI identity/config validation: driver52 and kernel2594 host tests, lint, and
+latest KVM guest62/62 passed (system-dfoke4e8), with no guest skips and normal
+shutdown. The guest observed 13 functions/3 bridges, compared config bytes with
+identity/class files, checked full fstat length, rejected a config write, and
+verified inherited privileged descriptors versus newly opened unprivileged
+64-byte descriptors. Host tests prove requested interval/width bounds, malformed
+capability-cycle termination, fixed metadata length, and formatter widths.
+
+Actual Alpine lspci now identifies host/SATA/network/display/input functions and
+renders all three downstream buses (shell-ay4nlznj). Config/class failures and
+bogus ffff class output are gone. `-vvv` still reports missing IRQ/resource files;
+`-k` has no real driver binding links yet. Those are the next PCI sub-item, not
+accepted via the programs' exit statuses. Physical PCI/ECAM behavior is untested.

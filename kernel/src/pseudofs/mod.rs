@@ -11,6 +11,7 @@ mod fs;
 mod graphics_metrics;
 pub(crate) mod hugetlb;
 pub(crate) mod mqueue;
+mod pci_sysfs;
 pub(crate) mod proc;
 mod proc_inventory;
 mod proc_interrupts;

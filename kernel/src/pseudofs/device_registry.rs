@@ -152,9 +152,13 @@ pub struct DeviceAttribute {
     kind: DeviceAttributeKind,
 }
 
+type AttributeNodeMaker =
+    dyn Fn(Arc<SimpleFs>) -> VfsResult<Arc<dyn axfs_ng_vfs::FileNodeOps>> + Send + Sync;
+
 #[derive(Clone)]
 enum DeviceAttributeKind {
     File(Arc<dyn SimpleFileOps>),
+    Node(Arc<AttributeNodeMaker>),
     Directory(Arc<Vec<DeviceAttribute>>),
 }
 
@@ -165,6 +169,20 @@ impl DeviceAttribute {
         Ok(Self {
             name,
             kind: DeviceAttributeKind::File(ops),
+        })
+    }
+
+    /// Binary attributes provide bounded node operations instead of a
+    /// whole-value read; the immutable registration retains the constructor.
+    pub fn try_node(
+        name: String,
+        maker: impl Fn(Arc<SimpleFs>) -> VfsResult<Arc<dyn axfs_ng_vfs::FileNodeOps>> + Send + Sync + 'static,
+    ) -> VfsResult<Self> {
+        validate_component(&name)?;
+        let maker = Arc::try_new(maker).map_err(|_| VfsError::NoMemory)?;
+        Ok(Self {
+            name,
+            kind: DeviceAttributeKind::Node(maker),
         })
     }
 
@@ -181,7 +199,6 @@ impl DeviceAttribute {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
@@ -189,7 +206,7 @@ impl DeviceAttribute {
     #[cfg(test)]
     pub(crate) fn directory_child_names(&self) -> Option<Vec<&str>> {
         match &self.kind {
-            DeviceAttributeKind::File(_) => None,
+            DeviceAttributeKind::File(_) | DeviceAttributeKind::Node(_) => None,
             DeviceAttributeKind::Directory(children) => Some(
                 children
                     .iter()
@@ -245,6 +262,11 @@ impl DeviceRegistration {
         subsystem: String,
         device_link: bool,
     ) -> VfsResult<Arc<Self>> {
+        let attributes = if subsystem == "pci" {
+            super::pci_sysfs::enrich(&identity.name, attributes)?
+        } else {
+            attributes
+        };
         Self::try_new_with_sysfs(
             identity,
             devtype,
@@ -1227,6 +1249,7 @@ fn attribute_node(fs: Arc<SimpleFs>, attribute: &DeviceAttribute) -> VfsResult<N
         DeviceAttributeKind::File(ops) => {
             Ok(SimpleFile::new_regular(fs, DeviceAttributeFile { ops: ops.clone() }).into())
         }
+        DeviceAttributeKind::Node(maker) => Ok(NodeOpsMux::File(maker(fs)?)),
         DeviceAttributeKind::Directory(attributes) => Ok(SimpleDir::new_maker(
             fs.clone(),
             Arc::new(DeviceAttributeDir {
