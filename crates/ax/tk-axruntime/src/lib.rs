@@ -605,9 +605,9 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
                 match read_network_firmware(path) {
                     Some(bytes) => match device.load_firmware(&bytes) {
                         Ok(()) => info!("NIC firmware {path}: applied; hardware-unverified"),
-                        Err(error) => warn!("NIC firmware {path}: failed {error:?}; MAC may be stopped"),
+                        Err(error) => warn!("\x013NIC firmware {path}: failed {error:?}; MAC may be stopped"),
                     },
-                    None => warn!("NIC firmware {path}: unavailable; degraded warm-PXE PHY only"),
+                    None => warn!("\x013NIC firmware {path}: unavailable; degraded warm-PXE PHY only"),
                 }
             }
         }

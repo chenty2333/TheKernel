@@ -69,6 +69,9 @@ impl FakeBus {
             indirect: BTreeMap::new(),
         }
     }
+    pub fn set_register(&mut self, offset: usize, value: u32) {
+        self.registers.insert(offset, value);
+    }
     pub fn h8168() -> Self {
         let mut bus = Self::new();
         bus.registers.insert(r::TX_CONFIG, 0x54100000);

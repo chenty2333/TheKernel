@@ -67,50 +67,62 @@ impl<'a> Firmware<'a> {
         while pc < self.len() {
             steps += 1;
             if steps > 100_000 {
+                log::warn!("\x013R8169_FW_BUDGET_FAILED pc={pc} steps={steps}");
                 return Err(DevError::Io);
             }
             let (op, reg, data) = self.instruction(pc);
             let mut next = pc + 1;
-            match op {
-                0 => {
-                    previous = access(bus, mac, &mut base, reg, None)?;
-                    reads += 1;
-                }
-                1 => previous |= data,
-                2 => previous &= data,
-                3 => next = pc - reg,
-                4 => mac = data != 0,
-                7 => reads = 0,
-                8 => {
-                    access(bus, mac, &mut base, reg, Some(data))?;
-                }
-                9 => {
-                    if reads == u32::from(data) {
-                        next += 1;
+            let operation = (|| -> DevResult {
+                match op {
+                    0 => {
+                        previous = access(bus, mac, &mut base, reg, None)?;
+                        reads += 1;
                     }
-                }
-                10 => {
-                    if previous == data {
-                        next += reg;
+                    1 => previous |= data,
+                    2 => previous &= data,
+                    3 => next = pc - reg,
+                    4 => mac = data != 0,
+                    7 => reads = 0,
+                    8 => {
+                        access(bus, mac, &mut base, reg, Some(data))?;
                     }
-                }
-                11 => {
-                    if previous != data {
-                        next += reg;
+                    9 => {
+                        if reads == u32::from(data) {
+                            next += 1;
+                        }
                     }
-                }
-                12 => {
-                    access(bus, mac, &mut base, reg, Some(previous))?;
-                }
-                13 => next += reg,
-                14 => {
-                    delays += u32::from(data);
-                    if delays > 5000 {
-                        return Err(DevError::Io);
+                    10 => {
+                        if previous == data {
+                            next += reg;
+                        }
                     }
-                    bus.delay_us(u32::from(data) * 1000);
+                    11 => {
+                        if previous != data {
+                            next += reg;
+                        }
+                    }
+                    12 => {
+                        access(bus, mac, &mut base, reg, Some(previous))?;
+                    }
+                    13 => next += reg,
+                    14 => {
+                        delays += u32::from(data);
+                        if delays > 5000 {
+                            return Err(DevError::Io);
+                        }
+                        bus.delay_us(u32::from(data) * 1000);
+                    }
+                    _ => return Err(DevError::Unsupported),
                 }
-                _ => return Err(DevError::Unsupported),
+                Ok(())
+            })();
+            if let Err(error) = operation {
+                log::warn!(
+                    "\x013R8169_FW_INSTRUCTION_FAILED pc={pc} opcode={op:#x} reg={reg:#x} \
+                     data={data:#06x} base={base:#06x} mac={mac} steps={steps} delay_ms={delays} \
+                     error={error:?}"
+                );
+                return Err(error);
             }
             pc = next;
         }

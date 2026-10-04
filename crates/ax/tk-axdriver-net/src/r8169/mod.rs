@@ -5,6 +5,7 @@ pub mod desc;
 mod fake;
 pub mod firmware;
 pub mod h8168;
+pub mod health;
 pub mod ids;
 pub mod indirect;
 pub mod nic;

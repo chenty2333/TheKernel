@@ -10,13 +10,19 @@ pub fn wait(
     us: u32,
     attempts: usize,
 ) -> DevResult<u32> {
+    let mut last = 0;
     for _ in 0..attempts {
         let value = bus.read(port, Dword);
+        last = value;
         if (value & READY != 0) == high {
             return Ok(value);
         }
         bus.delay_us(us);
     }
+    log::warn!(
+        "\x013R8169_INDIRECT_TIMEOUT port={port:#x} want_high={high} last={last:#010x} \
+         attempts={attempts} delay_us={us}"
+    );
     Err(DevError::Io)
 }
 pub fn mac_read(bus: &mut impl Bus, address: u16) -> DevResult<u16> {
@@ -46,7 +52,11 @@ pub fn phy_read(bus: &mut impl Bus, address: u16) -> DevResult<u16> {
         return Err(DevError::InvalidParam);
     }
     bus.write(0xb8, Dword, u32::from(address) << 15);
-    Ok(wait(bus, 0xb8, true, 25, 10)? as u16)
+    let value = wait(bus, 0xb8, true, 25, 10).map_err(|error| {
+        log::warn!("\x013RTL8168_PHY_READ_FAILED address={address:#06x} error={error:?}");
+        error
+    })?;
+    Ok(value as u16)
 }
 pub fn phy_write(bus: &mut impl Bus, address: u16, data: u16) -> DevResult {
     if address & 1 != 0 {
@@ -57,7 +67,12 @@ pub fn phy_write(bus: &mut impl Bus, address: u16, data: u16) -> DevResult {
         Dword,
         READY | (u32::from(address) << 15) | u32::from(data),
     );
-    wait(bus, 0xb8, false, 25, 10)?;
+    wait(bus, 0xb8, false, 25, 10).map_err(|error| {
+        log::warn!(
+            "\x013RTL8168_PHY_WRITE_FAILED address={address:#06x} value={data:#06x} error={error:?}"
+        );
+        error
+    })?;
     Ok(())
 }
 pub fn eri_read(bus: &mut impl Bus, address: u16) -> DevResult<u32> {

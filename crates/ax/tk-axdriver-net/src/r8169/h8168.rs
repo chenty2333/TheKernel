@@ -102,26 +102,30 @@ pub fn configure_phy(bus: &mut impl Bus) -> DevResult {
         i::phy_write(bus, 0xa436, key)?;
         modify(bus, 0xa438, clear, set)
     }
-    parameter(bus, 0x808a, 0x003f, 0x000a)?;
-    parameter(bus, 0x0811, 0, 0x0800)?;
-    modify(bus, 0xa42c, 0, 2)?;
-    modify(bus, 0xa442, 0, 1 << 11)?;
-    i::mac_write(bus, 0xdd02, 0x807d)?;
-    let adc_high = i::mac_read(bus, 0xdd02)?;
-    let adc = i::mac_read(bus, 0xdd00)?;
+    super::health::stage("parameter-808a", parameter(bus, 0x808a, 0x003f, 0x000a))?;
+    super::health::stage("parameter-0811", parameter(bus, 0x0811, 0, 0x0800))?;
+    super::health::stage("PHY-a42c", modify(bus, 0xa42c, 0, 2))?;
+    super::health::stage("PHY-a442-set", modify(bus, 0xa442, 0, 1 << 11))?;
+    super::health::stage("MAC-dd02", i::mac_write(bus, 0xdd02, 0x807d))?;
+    let adc_high = super::health::stage("ADC-dd02", i::mac_read(bus, 0xdd02))?;
+    let adc = super::health::stage("ADC-dd00", i::mac_read(bus, 0xdd00))?;
     let bias = ((adc >> 1) & 0x7ff8) | (adc & 7) | ((adc_high & 0x80) << 8);
     if bias != 0xffff {
-        i::phy_write(bus, 0xbcfc, bias)?;
+        super::health::stage("ADC-bcfc", i::phy_write(bus, 0xbcfc, bias))?;
     }
-    let length = (i::phy_read(bus, 0xbcdc)? & 15).saturating_sub(3);
-    i::phy_write(bus, 0xbcde, length * 0x1111)?;
-    modify(bus, 0xa442, 1 << 7, 0)?;
-    modify(bus, 0xa430, (1 << 0) | (1 << 2), 0)?;
-    modify(bus, 0xa432, 0, 1 << 4)?;
+    let length =
+        (super::health::stage("length-bcdc", i::phy_read(bus, 0xbcdc))? & 15).saturating_sub(3);
+    super::health::stage("length-bcde", i::phy_write(bus, 0xbcde, length * 0x1111))?;
+    super::health::stage("PHY-a442-clear", modify(bus, 0xa442, 1 << 7, 0))?;
+    super::health::stage("PHY-a430", modify(bus, 0xa430, (1 << 0) | (1 << 2), 0))?;
+    super::health::stage("PHY-a432", modify(bus, 0xa432, 0, 1 << 4))?;
     // Advertise 10/100/1000 full/half duplex and restart auto-negotiation.
-    i::phy_write(bus, 0xa408, 0x0de1)?;
-    i::phy_write(bus, 0xa412, 0x0300)?;
-    let bmcr = i::phy_read(bus, 0xa400)?;
-    i::phy_write(bus, 0xa400, (bmcr & !0x0c00) | 0x1200)?;
+    super::health::stage("advertise-10-100", i::phy_write(bus, 0xa408, 0x0de1))?;
+    super::health::stage("advertise-1000", i::phy_write(bus, 0xa412, 0x0300))?;
+    let bmcr = super::health::stage("BMCR-read", i::phy_read(bus, 0xa400))?;
+    super::health::stage(
+        "autoneg-restart",
+        i::phy_write(bus, 0xa400, (bmcr & !0x0c00) | 0x1200),
+    )?;
     Ok(())
 }

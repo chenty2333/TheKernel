@@ -88,6 +88,9 @@ pub struct RtlNic<H: Hal, B: Bus, const N: usize> {
     tx_tail: usize,
     tx_used: usize,
     rx_head: usize,
+    counters: super::health::Counters,
+    monitor: super::health::Monitor,
+    firmware_stage: &'static str,
 }
 // DMA pointers denote exclusive allocations; &mut self serializes CPU access.
 unsafe impl<H: Hal, B: Bus, const N: usize> Send for RtlNic<H, B, N> {}
@@ -119,6 +122,9 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
             tx_tail: 0,
             tx_used: 0,
             rx_head: 0,
+            counters: super::health::Counters::default(),
+            monitor: super::health::Monitor::default(),
+            firmware_stage: "warm-PXE-no-firmware-attempt",
         };
         bringup::reset(&mut nic.bus, chip)?;
         for index in 0..N {
@@ -126,6 +132,78 @@ impl<H: Hal, B: Bus, const N: usize> RtlNic<H, B, N> {
         }
         bringup::program(&mut nic.bus, chip, nic.tx_desc.address, nic.rx_desc.address)?;
         Ok(nic)
+    }
+    /// Read-only status snapshot; PHY OCP reads do not write PHY values and
+    /// IntrStatus is not acknowledged/cleared here. No recovery/reset is done.
+    pub fn snapshot(&mut self) -> super::health::Snapshot {
+        let (mask, status, width) = self.chip.irq();
+        let command = self.bus.read(r::COMMAND, Byte);
+        let intr_status = self.bus.read(status, width);
+        let intr_mask = self.bus.read(mask, width);
+        let phy_status = self.bus.read(r::PHY_STATUS, Byte);
+        let (bmcr, bmsr) = if self.chip == Chip::Rtl8168H {
+            let bmcr = super::indirect::phy_read(&mut self.bus, 0xa400).ok();
+            let _ = super::indirect::phy_read(&mut self.bus, 0xa402); // latched-low link observation
+            (bmcr, super::indirect::phy_read(&mut self.bus, 0xa402).ok())
+        } else {
+            (None, None)
+        };
+        super::health::Snapshot {
+            command,
+            intr_status,
+            intr_mask,
+            phy_status,
+            bmcr,
+            bmsr,
+            tx_head: self.tx_head,
+            tx_tail: self.tx_tail,
+            tx_used: self.tx_used,
+            rx_head: self.rx_head,
+            tx_head_status: unsafe { d::status(self.descriptor(false, self.tx_head)) },
+            rx_head_status: unsafe { d::status(self.descriptor(true, self.rx_head)) },
+            rx_loans: self.rx_loan.iter().filter(|v| **v).count(),
+            counters: self.counters,
+            firmware_stage: self.firmware_stage,
+        }
+    }
+    fn diagnostic_tick(&mut self) {
+        if self.chip != Chip::Rtl8168H {
+            return;
+        }
+        let Some(now) = self.bus.now_millis() else {
+            return;
+        };
+        let owned = self.tx_used != 0
+            && unsafe { d::status(self.descriptor(false, self.tx_head)) } & d::OWN != 0;
+        if let Some(reason) = self.monitor.observe(now, self.counters, owned) {
+            let state = self.snapshot();
+            log::warn!(
+                "\x013RTL8168_HEALTH reason={} ms={} ChipCmd={:#04x} IntrStatus={:#06x} \
+                 IntrMask={:#06x} PHYstatus={:#04x} BMCR={:?} BMSR={:?} tx_head={} tx_tail={} \
+                 tx_used={} tx_desc={:#010x} rx_head={} rx_desc={:#010x} rx_loans={} tx={} \
+                 tx_reaped={} rx={} rx_bad={} fw_stage={} (observation, no reset)",
+                reason.as_str(),
+                now,
+                state.command,
+                state.intr_status,
+                state.intr_mask,
+                state.phy_status,
+                state.bmcr,
+                state.bmsr,
+                state.tx_head,
+                state.tx_tail,
+                state.tx_used,
+                state.tx_head_status,
+                state.rx_head,
+                state.rx_head_status,
+                state.rx_loans,
+                state.counters.tx,
+                state.counters.tx_reaped,
+                state.counters.rx,
+                state.counters.rx_bad,
+                state.firmware_stage
+            );
+        }
     }
     pub fn link_up(&mut self) -> bool {
         self.bus.read(r::PHY_STATUS, Byte) & r::LINK != 0
@@ -152,7 +230,9 @@ impl<H: Hal, B: Bus, const N: usize> Drop for RtlNic<H, B, N> {
             || self.rx_loan.contains(&true)
             || self.tx_loan.contains(&CALLER)
         {
-            log::warn!("r8169: DMA stop or packet-loan release unconfirmed; retaining DMA memory");
+            log::warn!(
+                "r8169: DMA stop or packet-loan release unconfirmed; retaining DMA memory"
+            );
             return;
         }
         // SAFETY: reset completed, so no DMA can access these allocations;
@@ -187,25 +267,59 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
         if self.chip != Chip::Rtl8168H {
             return Err(DevError::Unsupported);
         }
-        let firmware = super::firmware::Firmware::parse(bytes)?;
-        if self.tx_used != 0 || self.rx_loan.contains(&true) || self.tx_loan.contains(&CALLER) {
-            return Err(DevError::ResourceBusy);
+        self.firmware_stage = "firmware-parse";
+        let result = (|| {
+            let firmware =
+                super::health::stage(self.firmware_stage, super::firmware::Firmware::parse(bytes))?;
+            self.firmware_stage = "firmware-quiescence";
+            if self.tx_used != 0 || self.rx_loan.contains(&true) || self.tx_loan.contains(&CALLER) {
+                return super::health::stage(self.firmware_stage, Err(DevError::ResourceBusy));
+            }
+            self.firmware_stage = "firmware-MAC-reset";
+            super::health::stage(
+                self.firmware_stage,
+                bringup::reset(&mut self.bus, self.chip),
+            )?;
+            self.firmware_stage = "firmware-execute";
+            super::health::stage(self.firmware_stage, firmware.execute(&mut self.bus))?;
+            self.firmware_stage = "PHY-calibration-autoneg";
+            super::health::stage(
+                self.firmware_stage,
+                super::h8168::configure_phy(&mut self.bus),
+            )?;
+            self.firmware_stage = "firmware-ring-rearm";
+            for index in 0..N {
+                self.arm_rx(index);
+            }
+            self.rx_head = 0;
+            self.firmware_stage = "firmware-MAC-program";
+            super::health::stage(
+                self.firmware_stage,
+                bringup::program(
+                    &mut self.bus,
+                    self.chip,
+                    self.tx_desc.address,
+                    self.rx_desc.address,
+                ),
+            )?;
+            self.firmware_stage = "ready-after-firmware";
+            Ok(())
+        })();
+        let snapshot = self.snapshot();
+        if result.is_err() {
+            log::warn!(
+                "\x013RTL8168_FIRMWARE_FAILED stage={} state={snapshot:?}; MAC may be stopped; no \
+                 automatic recovery",
+                self.firmware_stage
+            );
+        } else {
+            log::info!(
+                "RTL8168_FIRMWARE_READY state={snapshot:?}; verify link/DHCP, not just this log"
+            );
         }
-        bringup::reset(&mut self.bus, self.chip)?;
-        // A PHY failure leaves the MAC disabled; no fake warm-PHY success.
-        firmware.execute(&mut self.bus)?;
-        super::h8168::configure_phy(&mut self.bus)?;
-        for index in 0..N {
-            self.arm_rx(index);
-        }
-        self.rx_head = 0;
-        bringup::program(
-            &mut self.bus,
-            self.chip,
-            self.tx_desc.address,
-            self.rx_desc.address,
-        )
+        result
     }
+
     fn mac_address(&self) -> EthernetAddress {
         EthernetAddress(self.mac)
     }
@@ -268,6 +382,7 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
         }
         self.tx_tail = (slot + 1) % N;
         self.tx_used += 1;
+        self.counters.tx = self.counters.tx.saturating_add(1);
         match self.chip {
             Chip::Rtl8125B => self.bus.write(r::TX_POLL, Word, 1),
             Chip::Rtl8168H => self.bus.write(0x38, Byte, 1 << 6),
@@ -282,10 +397,12 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
             self.tx_loan[self.tx_slots[self.tx_head]] = FREE;
             self.tx_head = (self.tx_head + 1) % N;
             self.tx_used -= 1;
+            self.counters.tx_reaped = self.counters.tx_reaped.saturating_add(1);
         }
         Ok(())
     }
     fn receive(&mut self) -> DevResult<NetBufPtr> {
+        self.diagnostic_tick();
         for _ in 0..N {
             let index = self.rx_head;
             if self.rx_loan[index] {
@@ -297,10 +414,12 @@ impl<H: Hal, B: Bus, const N: usize> NetDriverOps for RtlNic<H, B, N> {
             }
             self.rx_head = (index + 1) % N;
             let Some(length) = d::receive_length(status) else {
+                self.counters.rx_bad = self.counters.rx_bad.saturating_add(1);
                 self.arm_rx(index);
                 continue;
             };
             self.rx_loan[index] = true;
+            self.counters.rx = self.counters.rx.saturating_add(1);
             let pointer = self.rx_data.slot(index);
             return Ok(NetBufPtr::new(pointer, pointer, length));
         }
@@ -323,6 +442,29 @@ mod tests {
         super::fake::{FakeBus, FakeHal},
         *,
     };
+    #[test]
+    fn health_snapshot_preserves_irq_status_mac_and_descriptor_ownership() {
+        let mut nic = RtlNic::<FakeHal, _, 4>::new(FakeBus::h8168()).unwrap();
+        nic.bus.set_register(0x3e, 0x0027);
+        nic.bus.set_register(0x6c, 0xc3);
+        let prior = nic.bus.writes.len();
+        let state = nic.snapshot();
+        assert_eq!(state.intr_status, 0x0027);
+        assert_eq!(state.command, r::RX_TX_ENABLE);
+        assert_eq!(state.phy_status, 0xc3);
+        assert_eq!(state.rx_head, 0);
+        assert_ne!(state.rx_head_status & d::OWN, 0);
+        assert_eq!(state.tx_used, 0);
+        assert!(
+            nic.bus.writes[prior..]
+                .iter()
+                .all(|&(port, _, value)| port == 0xb8 && value & (1 << 31) == 0)
+        );
+        assert_eq!(nic.snapshot().intr_status, 0x0027);
+        assert!(nic.load_firmware(&[1]).is_err());
+        assert_eq!(nic.firmware_stage, "firmware-parse");
+        assert_eq!(nic.snapshot().command, r::RX_TX_ENABLE); // bad header did not pretend to reset/recover
+    }
     #[test]
     fn failed_allocations_release_unpublished_prefix_but_failed_reset_retains_dma() {
         let (a, f) = FakeHal::counts();

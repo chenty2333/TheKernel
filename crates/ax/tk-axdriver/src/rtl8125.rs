@@ -35,6 +35,9 @@ pub struct Window {
     msi: Option<msi::Owner>,
 }
 impl Bus for Window {
+    fn now_millis(&self) -> Option<u64> {
+        Some(axhal::time::monotonic_time().as_millis().min(u128::from(u64::MAX)) as u64)
+    }
     fn irq_num(&self) -> Option<usize> {
         #[cfg(all(feature = "rtl8168", target_os = "none"))]
         {

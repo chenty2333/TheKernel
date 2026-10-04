@@ -1,6 +1,7 @@
 # RTL8168H / shared r8169-family core
 
-**未在硬件上验证.** N305 capture measured PCI `10ec:8168` rev 0x15, BAR2
+**新增停流诊断未在硬件上验证；基础网络路径已有用户报告的 2026-10-04 真机成功，偶发停流仍未定位。**
+N305 capture measured PCI `10ec:8168` rev 0x15, BAR2
 `0x80504000`, 4 KiB. Revision 0x15 is not treated as the MAC identity. Probe
 prints raw TxConfig and XID, admits `(XID & 0x7cf) == 0x541` only for PCI
 8168, and rejects other XIDs before reset. RTL8125B still requires PCI 8125
@@ -95,3 +96,51 @@ excerpt scan finds zero matching lines. N305-profile QEMU shell boot rejected
 the absent Realtek device, read the staged 976-byte firmware and notice, and
 exited cleanly with `poweroff -f`. No result here establishes native DHCP,
 PHY calibration or MSI on N305 silicon.
+
+## 2026-10-04 reported hardware results and intermittent-stop diagnostics
+
+The user-provided `HWTEST-2026-10-04.md` reports raw TxConfig 0x57100f80/XID
+0x571, which masks to the admitted H=0x541 identity; MSI, PHY firmware, DHCP
+192.168.10.15, host ping and netconsole worked in two of the first three boots.
+One boot completed DHCP but subsequently emitted no ARP/UDP; unlike successful
+boots, its host-side link did not renegotiate during firmware loading. No kernel
+log exists for that failed boot. This is correlation, **not a diagnosed PHY or
+MAC defect**, and these physical tests were performed by the user, not rerun by
+this code change.
+
+New diagnostics do not reset/recover the device or change its initialization
+register sequence. Each firmware phase and PHY calibration transaction failure
+names its step. Firmware interpreter failures also report instruction PC/opcode,
+register/data, selected base, mode and bounded execution/delay counts. Indirect
+timeouts report port, expected completion, last read, attempts and delay. Failure
+WARN records deliberately use an explicit KERN_ERR (3) prefix: ordinary WARN (4)
+is hidden by Linux-compatible quiet=4, so these records remain visible on a
+quiet screen without weakening the global console filter. Missing firmware or
+load failure in the runtime receives the same failure priority. Success remains
+INFO and is retained for dmesg/netconsole.
+
+An optional monotonic clock in the existing platform bus enables a bounded
+observer during the existing 10ms receive poll. It dumps ChipCmd, IntrStatus,
+IntrMask, PHYstatus, optional BMCR/BMSR, TX head/tail/used/head descriptor, RX
+head/descriptor/loan count, packet/reap/drop counters and last firmware phase:
+
+- TX still hardware-owned with no observed completion progress for 5s;
+- RX quiet for 30s **after actual RX traffic** (explicitly labelled
+  `rx-quiet-not-proof-of-stall`, because idle can be normal).
+
+At most three reports per reason per no-progress episode, at least 30s apart;
+observed traffic/progress re-arms reporting. First pending TX starts its own
+age, even after a long idle period. There is no warning merely because an unused
+interface has no traffic, and clock reversal cannot underflow a duration.
+IntrStatus is read, not W1C-acknowledged. PHY queries use OCP read commands and
+do not write PHY values; the second BMSR read observes current rather than
+latched-low link state. A failed PHY query is `None`, never invented zero.
+
+Host fake tests cover status/ownership preservation, firmware-stage failure,
+rate limiting, idle/new-TX/clock behavior and existing bounded firmware/ring
+paths. QEMU has no RTL8168 model. **The new diagnostic path has not been validated
+on N305 hardware; intermittent stop remains unresolved.** At next reproduction,
+keep the screen visible in quiet, collect `RTL8168_STEP_FAILED`,
+`R8169_FW_*FAILED`, `RTL8168_FIRMWARE_FAILED/READY`, and `RTL8168_HEALTH` records.
+Compare firmware phase, command bits and descriptor ownership between a working
+and failed boot; do not infer that a link renegotiation alone proves recovery.

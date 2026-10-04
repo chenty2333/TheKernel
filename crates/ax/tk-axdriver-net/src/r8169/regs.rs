@@ -34,6 +34,8 @@ pub enum Width {
     Dword,
 }
 pub trait Bus: Send + Sync {
+    /// Optional monotonic clock for bounded diagnostics; never changes hardware policy.
+    fn now_millis(&self) -> Option<u64> { None }
     fn read(&mut self, offset: usize, width: Width) -> u32;
     fn write(&mut self, offset: usize, width: Width, value: u32);
     fn delay_us(&mut self, micros: u32);
