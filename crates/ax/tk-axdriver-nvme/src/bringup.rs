@@ -81,6 +81,8 @@ impl<H: Hal> Queue<H> {
         })
     }
     fn submit<B: Bus>(&mut self, bus: &mut B, stride: usize, mut cmd: Command) -> DevResult<u32> {
+        let mut observed = bus.interrupt_generation();
+        let deadline = bus.now_us().map(|now| now.saturating_add(5_000_000));
         self.cid = self.cid.wrapping_add(1);
         cmd.0[0] |= u32::from(self.cid) << 16;
         // SAFETY: 32 entries of 64 bytes fit the owned SQ; one synchronous command in flight.
@@ -134,7 +136,14 @@ impl<H: Hal> Queue<H> {
             if bus.read32(regs::CSTS) & 2 != 0 {
                 return Err(DevError::BadState);
             }
-            bus.delay_us(10);
+            if deadline
+                .zip(bus.now_us())
+                .is_some_and(|(end, now)| now >= end)
+            {
+                break;
+            }
+            bus.wait_completion(observed);
+            observed = bus.interrupt_generation();
         }
         Err(DevError::BadState)
     }
@@ -236,7 +245,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
             let mut cq = Command::new(5, 0);
             cq.pointer(6, q.cq.address);
             cq.0[10] = u32::from(id) | (u32::from(DEPTH - 1) << 16);
-            cq.0[11] = 1;
+            cq.0[11] = 1 | if this.bus.interrupt_enabled() { 2 } else { 0 };
             this.admin_cmd(cq)?;
             let mut sq = Command::new(1, 0);
             sq.pointer(6, this.queues.last().unwrap().sq.address);

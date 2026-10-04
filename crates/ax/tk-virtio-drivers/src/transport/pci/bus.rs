@@ -231,6 +231,21 @@ impl PciRoot {
         }
     }
 
+    /// Bounded configuration read for native PCI capability consumers.
+    pub fn read_config_dword(&self, bdf: DeviceFunction, offset: u8) -> Option<u32> {
+        if !bdf.valid() || offset & 3 != 0 { return None; }
+        Some(self.config_read_word(bdf, offset))
+    }
+
+    /// Width-correct capability control write, preserving adjacent status.
+    pub fn write_config_u16(&mut self, bdf: DeviceFunction, offset: u8, value: u16) -> bool {
+        if !bdf.valid() || offset & 1 != 0 { return false; }
+        let address = self.cam_offset(bdf, offset & !3) + u32::from(offset & 3);
+        // SAFETY: valid BDF, aligned halfword wholly in the conventional config window.
+        unsafe { self.mmio_base.cast::<u8>().add(address as usize).cast::<u16>().write_volatile(value); }
+        true
+    }
+
     /// Enumerates PCI devices on the given bus.
     pub fn enumerate_bus(&self, bus: u8) -> BusDeviceIterator {
         // Safe because the BusDeviceIterator only reads read-only fields.

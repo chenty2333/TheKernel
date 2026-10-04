@@ -39,6 +39,10 @@ struct Fake {
     disk: alloc::vec::Vec<u8>,
     commands: alloc::vec::Vec<(u16, u8)>,
     timeout: bool,
+    irq: bool,
+    delay_io: bool,
+    pending: Option<u16>,
+    delivered: std::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 impl Fake {
     fn new() -> Self {
@@ -52,6 +56,10 @@ impl Fake {
             disk: vec![0; 1024 * 1024],
             commands: vec![],
             timeout: false,
+            irq: false,
+            delay_io: false,
+            pending: None,
+            delivered: std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0)),
         }
     }
     fn addr(&self, register: usize) -> u64 {
@@ -83,6 +91,8 @@ impl Fake {
                 }
                 9 => result = 0x10001,
                 5 => {
+                    assert_eq!(c[11] & 2 != 0, self.irq);
+                    assert_eq!(c[11] >> 16, 0);
                     self.queues.insert(c[10] as u16, (0, pointer, 0, 0, 1));
                 }
                 1 => {
@@ -122,6 +132,10 @@ impl Fake {
             out.add(2).write(u32::from(id) << 16);
             out.add(3).write((c[0] >> 16) | (u32::from(phase) << 16));
         }
+        if self.irq {
+            self.delivered
+                .fetch_add(1, core::sync::atomic::Ordering::Release);
+        }
         let next = (head + 1) % 32;
         self.queues.insert(
             id,
@@ -149,10 +163,26 @@ impl Bus for Fake {
             }
         }
         if offset >= DBS && (offset - DBS).is_multiple_of(8) && !self.timeout {
-            self.execute(((offset - DBS) / 8) as u16);
+            let id = ((offset - DBS) / 8) as u16;
+            if self.delay_io && id != 0 {
+                self.pending = Some(id);
+            } else {
+                self.execute(id);
+            }
         }
     }
     fn delay_us(&mut self, _: u32) {}
+    fn interrupt_enabled(&self) -> bool {
+        self.irq
+    }
+    fn interrupt_generation(&self) -> u64 {
+        self.delivered.load(core::sync::atomic::Ordering::Acquire)
+    }
+    fn wait_completion(&mut self, _: u64) {
+        if let Some(id) = self.pending.take() {
+            self.execute(id);
+        }
+    }
 }
 #[test]
 fn content_prp_list_two_queues_and_wrap() {
@@ -203,4 +233,25 @@ fn prp_offset_boundaries() {
     );
     assert_eq!(&list[..2], &[0x2000, 0x3000]);
     assert!(prps(0x1000, 9000, 0x9001, &mut list).is_err());
+}
+
+#[test]
+fn interrupts_and_lost_interrupt_polling_keep_one_cq_owner() {
+    for interrupt in [true, false] {
+        let mut bus = Fake::new();
+        bus.irq = interrupt;
+        bus.delay_io = true;
+        let delivered = bus.delivered.clone();
+        let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+        let before = delivered.load(core::sync::atomic::Ordering::Acquire);
+        controller.write_block(8, &[0xa5; 8192]).unwrap();
+        let mut out = [0; 8192];
+        controller.read_block(8, &mut out).unwrap();
+        controller.flush().unwrap();
+        assert_eq!(out, [0xa5; 8192]);
+        assert_eq!(
+            delivered.load(core::sync::atomic::Ordering::Acquire) - before,
+            if interrupt { 3 } else { 0 }
+        );
+    }
 }

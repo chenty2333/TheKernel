@@ -620,6 +620,23 @@ mod irq_impl {
         }
     }
 
+    /// Reserve a message vector outside every implemented IOAPIC pin and
+    /// outside the LAPIC/IPI range. Ownership is permanent for this boot.
+    pub fn allocate_msi(handler: IrqHandler) -> Option<(u64, u32, usize)> {
+        let destination = super::IO_APIC_DEST.load(core::sync::atomic::Ordering::Acquire);
+        if destination == super::IO_APIC_DEST_UNAVAILABLE { return None; }
+        let max_pin = {
+            // SAFETY: a published destination proves init_primary installed IO_APIC.
+            unsafe { super::IO_APIC.lock().max_table_entry() }
+        };
+        for vector in super::msi_vectors(max_pin).rev() {
+            if IRQ_HANDLER_TABLE.register_handler(vector, handler) {
+                return Some((0xfee0_0000 | (u64::from(destination) << 12), vector as u32, vector));
+            }
+        }
+        None
+    }
+
     struct IrqIfImpl;
 
     #[cfg_attr(target_os = "none", impl_plat_interface)]
@@ -714,5 +731,24 @@ mod irq_impl {
                 }
             }
         }
+    }
+}
+
+#[cfg(any(feature = "irq", test))]
+fn msi_vectors(max_pin: u8) -> core::ops::Range<usize> {
+    let first = IO_APIC_VECTOR_BASE + usize::from(max_pin) + 1;
+    let end = vectors::APIC_LOCAL_RESERVED_VECTOR as usize;
+    first.min(end)..end
+}
+#[cfg(feature = "irq")]
+pub use irq_impl::allocate_msi;
+#[cfg(test)]
+mod msi_tests {
+    #[test] fn vectors_never_alias_ioapic_or_lapic() {
+        let vectors: std::vec::Vec<_> = super::msi_vectors(23).collect();
+        assert_eq!(vectors.first(), Some(&0x38));
+        assert_eq!(vectors.last(), Some(&0xee));
+        assert!(super::msi_vectors(0xce).next().is_none());
+        assert!(super::msi_vectors(u8::MAX).next().is_none());
     }
 }

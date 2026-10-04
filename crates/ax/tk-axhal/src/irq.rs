@@ -909,3 +909,13 @@ mod tests {
         );
     }
 }
+
+/// Reserve an MSI vector independently of IOAPIC routing. A driver must mask
+/// its device before configuring the returned message and retain ownership
+/// until reboot so delayed messages cannot target a different device.
+pub fn allocate_msi(handler: axplat::irq::IrqHandler) -> Option<(u64, u32, usize)> {
+    #[cfg(all(target_os = "none", feature = "defplat", not(feature = "myplat")))]
+    { axplat_x86_pc::allocate_msi(handler) }
+    #[cfg(not(all(target_os = "none", feature = "defplat", not(feature = "myplat"))))]
+    { let _ = handler; None }
+}

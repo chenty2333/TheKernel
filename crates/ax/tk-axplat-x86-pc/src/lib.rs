@@ -169,3 +169,9 @@ unsafe extern "C" fn rust_entry_secondary(_magic: usize) {
         axplat::call_secondary_main(current_cpu_id());
     }
 }
+
+/// Allocate a permanent MSI/MSI-X vector, excluding physical IOAPIC pins.
+#[cfg(feature = "irq")]
+pub fn allocate_msi(handler: axplat::irq::IrqHandler) -> Option<(u64, u32, usize)> {
+    apic::allocate_msi(handler)
+}

@@ -23,3 +23,5 @@ pub unsafe trait Hal: Send + Sync {
     unsafe fn release(address: u64, pointer: NonNull<u8>, pages: usize);
 }
 pub use bringup::Controller;
+
+pub mod msix;

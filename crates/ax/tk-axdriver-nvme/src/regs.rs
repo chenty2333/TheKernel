@@ -10,6 +10,19 @@ pub trait Bus: Send + Sync {
     fn read32(&mut self, offset: usize) -> u32;
     fn write32(&mut self, offset: usize, value: u32);
     fn delay_us(&mut self, micros: u32);
+    fn interrupt_enabled(&self) -> bool {
+        false
+    }
+    fn interrupt_generation(&self) -> u64 {
+        0
+    }
+    fn now_us(&self) -> Option<u64> {
+        None
+    }
+    fn wait_completion(&mut self, _observed: u64) {
+        self.delay_us(10);
+    }
+
     fn read64(&mut self, offset: usize) -> u64 {
         u64::from(self.read32(offset)) | (u64::from(self.read32(offset + 4)) << 32)
     }

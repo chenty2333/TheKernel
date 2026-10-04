@@ -32,7 +32,7 @@ repository.workspace = true
 
 [features]
 intel-hda = ["bus-pci", "dep:axdriver_hda", "dep:axalloc", "dep:axhal", "dep:spin"]
-nvme = ["block", "bus-pci", "dep:axdriver_nvme", "dep:axalloc", "dep:axhal"]
+nvme = ["block", "bus-pci", "dep:axdriver_nvme", "dep:axalloc", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq"]
 ahci = [
     "block",
     "axdriver_block/ahci",
