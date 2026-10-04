@@ -2872,6 +2872,7 @@ impl SimpleDirOps for ThreadDir {
             [
                 Some(b"stat".as_slice()),
                 Some(b"status".as_slice()),
+                Some(b"statm".as_slice()),
                 Some(b"uid_map".as_slice()),
                 Some(b"gid_map".as_slice()),
                 Some(b"setgroups".as_slice()),
@@ -2918,6 +2919,12 @@ impl SimpleDirOps for ThreadDir {
                 task_status(&task, process_view, viewer.user_ns(), &pid_ns)
             })?
             .into(),
+            b"statm" => {
+                // Aggregate memory sizes are world-readable on Linux, unlike
+                // maps/smaps. Do not add the ptrace gate used for those files.
+                let process = task.as_thread().proc_data.clone();
+                SimpleFile::new_regular(fs, move || super::proc_task_memory::statm(&process)).into()
+            }
             b"uid_map" => {
                 let subject = proc_subject_cred(&task, process_view);
                 let ids = subject.ids();

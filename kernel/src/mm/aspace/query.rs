@@ -737,6 +737,15 @@ impl AddrSpace {
             .sum()
     }
 
+    /// Size of the VMAs carrying the actual grow-down stack policy, rather
+    /// than an address guessed from mutable PR_SET_MM metadata.
+    pub(crate) fn current_stack_mapping_bytes(&self) -> usize {
+        self.areas.iter()
+            .filter(|area| self.growdown_starts.contains(&area.start()))
+            .map(MemoryArea::size)
+            .sum()
+    }
+
     /// Returns the number of VMA bytes already present in an exact virtual
     /// range.  MAP_FIXED uses this to charge only the net address-space
     /// growth, matching Linux's `pglen - unmapped_pages` accounting.

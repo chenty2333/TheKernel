@@ -221,3 +221,29 @@ Linux 主机同一 probe 通过；nr_anon 是 gauge，Linux 会批量折叠且�
 真实 Alpine vmstat -s、vmstat 1 2、top -b -n 1 均已启动并输出
 （shell-xa3o8qek）。top 不再直接退出，但 VIRT/RES/SHR 都为 0（缺 PID statm），
 vmstat 的 context switches 等未接入字段仍为 0；**不是最终完整工具验收**。
+
+### 主程序 ELF 元数据与 statm
+
+statm 首轮回归抓到原有 exec 元数据问题：主程序 text=392194 页却只有
+size=2318 页（shell-9swbofm9）。原 reset_mm_layout_for_exec 扫描所有 EXEC
+VMA，把解释器/远处 trampoline 纳入跨度。现在从已验证的 **main ELF**
+PT_LOAD 保留 initialized code/data 范围，移除这个全 VMA 近似。
+Linux 7.2.3 binfmt_elf.c 的范围规则只作为格式/事实参考，Rust 为原创。
+execve/execveat 两项 contract 状态描述同步更新，进度计数不变。
+
+新回归从 /proc/self/exe 读取自身 ELF（含 ET_DYN 的 AT_ENTRY bias），直接
+对照 /proc/self/stat 的 start/end code/data；Linux 主机、TheKernel guest
+均通过。完整 kernel2587、lint、最终 KVM guest59/59 无 skip 正常关机
+（system-vrz73etb）、全 ABI257/257（abi-41enjrnd）通过。
+
+statm 七个 4KiB 页字段来自实际 VMA/PTE、main ELF 元数据、现有 data_vm 和
+实际 growdown VMA 策略；legacy lib/dirty 字段按 Linux 固定为 0。私有 COW
+页不是 file/shmem RSS，不因 fork 共享物理页就虚增第三字段。它是公开汇总
+信息，不套用 maps/smaps 的 ptrace 权限；guest 专门验证降 UID 的子进程仍
+可读父进程 statm。实际 top VIRT/RES 不再为 0，ps 显示正常启动时间/内存
+（shell-yq44cxtn）；完整其他工具/设备/连接视图仍未完成。
+
+第十二提交周期：最新 full host Python655（3 环境 skip）+Rust6002、q35/n305
+lint（784 条既有 kernel 警告）、KVM guest59/59、ABI257/257 均通过；正常
+关机，真实 top/ps 输出已核对。设备树/连接表/zone/buddy 和负向 fault 统计
+仍待做，不能据此声称 B1 或容器支持全部完成。
