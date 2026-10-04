@@ -4,8 +4,8 @@
 //!
 //! This machine's primary console is the 16550 that PC firmware has decoded at
 //! 0x3f8 since 1984.  Nothing guarantees that one exists.  The target hardware
-//! for this kernel is a mini PC whose firmware implements no legacy UART at
-//! all, and it is not the only such machine.
+//! for this kernel has no physical serial connector. That does not by itself
+//! prove that its legacy I/O decoder is absent; presence must be tested.
 //!
 //! An absent port cannot simply be written to and ignored, because the two
 //! ways an undecoded I/O port can answer are both fatal to a driver that
@@ -25,7 +25,9 @@
 //! Neither is fixed by checking the status register, because the status
 //! register is the thing that is lying.  The port is therefore *probed* before
 //! it is used, using the 16550's scratch register: a real UART preserves a byte
-//! written to it and an undecoded port cannot.  Every access to 0x3f8 in this
+//! written to it. Scratch alone was insufficient on the reported N305 boot:
+//! LSR/IIR sanity and two distinct modem-loopback signatures are also required.
+//! No probe injects received data or filters NUL. Every access to 0x3f8 in this
 //! module is gated on the answer, so a machine without a UART writes to no
 //! port, reads from no port, and registers no interrupt for one.
 //!
@@ -114,20 +116,21 @@ pub fn getchar() -> Option<u8> {
 
 /// Brings up both serial endpoints: the interactive console and the log sink.
 pub fn init() {
-    if probe_uart(COM1_BASE) {
-        // The probe already left the port at 115200 8-N-1 with its FIFOs
-        // cleared, `IER` zero and `MCR`.OUT2 low.  Calling
-        // [`uart_16550::SerialPort::init`] on top of that rewrites the divisor
-        // to 38400, sets `IER` to "data ready" and raises `MCR`.OUT2, so the
-        // line the operator is watching at 115200 turns to garbage *and* the
-        // port starts asserting its interrupt line before `init_interrupt` has
-        // installed the vector 0x24 handler -- one typed key during early boot
-        // is then an interrupt with nobody serving it.  The probe's answer is
-        // the configuration, so nothing reprograms the port here; the receive
-        // interrupt is turned on later by [`enable_receive_interrupt`].
-        #[cfg(target_os = "none")]
-        COM1_PRESENT.store(true, core::sync::atomic::Ordering::Release);
-    }
+    let present = probe_uart(COM1_BASE);
+    // The probe already left the port at 115200 8-N-1 with its FIFOs
+    // cleared, `IER` zero and `MCR`.OUT2 low.  Calling
+    // [`uart_16550::SerialPort::init`] on top of that rewrites the divisor
+    // to 38400, sets `IER` to "data ready" and raises `MCR`.OUT2, so the
+    // line the operator is watching at 115200 turns to garbage *and* the
+    // port starts asserting its interrupt line before `init_interrupt` has
+    // installed the vector 0x24 handler -- one typed key during early boot
+    // is then an interrupt with nobody serving it.  The probe's answer is
+    // the configuration, so nothing reprograms the port here; the receive
+    // interrupt is turned on later by [`enable_receive_interrupt`].
+    #[cfg(target_os = "none")]
+    COM1_PRESENT.store(present, core::sync::atomic::Ordering::Release);
+    #[cfg(not(target_os = "none"))]
+    let _ = present;
     init_diagnostic();
 }
 
@@ -152,7 +155,7 @@ pub(crate) fn enable_receive_interrupt() {
     }
 }
 
-/// The byte-level port access [`probe_uart_with`] needs.
+/// The byte-level port access [`probe_facts`] needs.
 ///
 /// A trait rather than direct `inb`/`outb` calls so the decision the probe
 /// makes -- present or absent -- can be tested on a host with no I/O ports at
@@ -185,22 +188,73 @@ impl PortIo for HardwarePorts {
     }
 }
 
-/// Probes `base` for a 16550 and leaves it configured for 115200 8-N-1.
-///
-/// Returns whether one was found.  Both checks are needed and each rejects a
-/// different way of being absent: `0xff` in the line status register is the
-/// floating-bus read that would otherwise look like permanent input, and a
-/// scratch register that does not hold what was written to it is a decoded
-/// port with no UART behind it, which would otherwise look like a working one
-/// with a permanently busy transmitter.
+/// Probe facts are scalar and retained for the quiet-visible late boot report.
 #[cfg(any(target_os = "none", test))]
-fn probe_uart_with(io: &mut impl PortIo, base: u16) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbeFacts {
+    reason: u8,
+    lsr: u8,
+    iir: u8,
+    loop_a: u8,
+    loop_b: u8,
+}
+#[cfg(any(target_os = "none", test))]
+impl ProbeFacts {
+    fn present(self) -> bool {
+        self.reason == 1
+    }
+    fn packed(self) -> u64 {
+        u64::from(self.reason)
+            | u64::from(self.lsr) << 8
+            | u64::from(self.iir) << 16
+            | u64::from(self.loop_a) << 24
+            | u64::from(self.loop_b) << 32
+    }
+    fn unpack(value: u64) -> Self {
+        Self {
+            reason: value as u8,
+            lsr: (value >> 8) as u8,
+            iir: (value >> 16) as u8,
+            loop_a: (value >> 24) as u8,
+            loop_b: (value >> 32) as u8,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self.reason {
+            1 => "present",
+            2 => "floating-LSR",
+            3 => "scratch",
+            4 => "invalid-LSR",
+            5 => "invalid-IIR",
+            6 => "loopback-mismatch",
+            _ => "not-probed",
+        }
+    }
+}
+#[cfg(target_os = "none")]
+static COM1_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Original bounded 8250-family autoconfiguration subset. Register/behavior
+/// reference: Linux 7.2.3 8250_port.c autoconfig; not translated source.
+/// Modem loopback is tested without sending a byte into the receiver.
+#[cfg(any(target_os = "none", test))]
+fn probe_facts(io: &mut impl PortIo, base: u16) -> ProbeFacts {
+    let mut facts = ProbeFacts {
+        reason: 0,
+        lsr: 0,
+        iir: 0,
+        loop_a: 0,
+        loop_b: 0,
+    };
+    // SAFETY: caller admits only the standard legacy UART windows; all
+    // transactions are finite, with IRQ output disabled before classification.
     unsafe {
-        // Clear DLAB before disabling interrupts, because IER shares DLM.
         io.write(base + 3, 0x03);
         io.write(base + 1, 0);
-        if io.read(base + 5) == 0xff {
-            return false;
+        facts.lsr = io.read(base + 5);
+        if facts.lsr == 0xff {
+            facts.reason = 2;
+            return facts;
         }
         let scratch = io.read(base + 7);
         io.write(base + 7, 0x5a);
@@ -209,29 +263,94 @@ fn probe_uart_with(io: &mut impl PortIo, base: u16) -> bool {
         let second = io.read(base + 7);
         io.write(base + 7, scratch);
         if first != 0x5a || second != 0xa5 {
-            return false;
+            facts.reason = 3;
+            return facts;
+        }
+        // Clear firmware's FIFO before testing THRE: a genuine UART may still
+        // be sending GRUB's last bytes. There is no unbounded ready loop.
+        io.write(base + 2, 0xc7);
+        facts.lsr = io.read(base + 5);
+        // A zero register after clearing the FIFO is not a permanently busy
+        // UART. Receive/error bits are not a reason to filter genuine NUL.
+        if facts.lsr & 0x20 == 0 {
+            facts.reason = 4;
+            return facts;
+        }
+        facts.iir = io.read(base + 2);
+        if facts.iir & 0x3f != 1 || !matches!(facts.iir & 0xc0, 0 | 0xc0) {
+            facts.reason = 5;
+            return facts;
+        }
+        let modem = io.read(base + 4);
+        io.write(base + 4, 0x1a); // loopback, RTS/OUT2 -> CTS/DCD
+        facts.loop_a = io.read(base + 6) & 0xf0;
+        io.write(base + 4, 0x15); // loopback, DTR/OUT1 -> DSR/RI
+        facts.loop_b = io.read(base + 6) & 0xf0;
+        // No rejected probe leaves loopback or external IRQ output enabled.
+        io.write(base + 4, modem & !0x18);
+        if facts.loop_a != 0x90 || facts.loop_b != 0x60 {
+            facts.reason = 6;
+            return facts;
         }
         io.write(base + 3, 0x80);
-        io.write(base, 1); // 115200 baud, 8-N-1.
+        io.write(base, 1);
         io.write(base + 1, 0);
         io.write(base + 3, 0x03);
         io.write(base + 2, 0xc7);
-        io.write(base + 4, 0x03); // DTR/RTS; no interrupt output.
+        io.write(base + 4, 0x03);
         io.write(base + 1, 0);
-        true
+        facts.reason = 1;
+        facts
     }
 }
-
-/// Probes the real hardware.  Host builds have no ports and report absence.
+#[cfg(test)]
+fn probe_uart_with(io: &mut impl PortIo, base: u16) -> bool {
+    probe_facts(io, base).present()
+}
 fn probe_uart(base: u16) -> bool {
     #[cfg(target_os = "none")]
     {
-        probe_uart_with(&mut HardwarePorts, base)
+        let facts = probe_facts(&mut HardwarePorts, base);
+        if base == COM1_BASE {
+            COM1_PROBE.store(facts.packed(), core::sync::atomic::Ordering::Release);
+        }
+        facts.present()
     }
     #[cfg(not(target_os = "none"))]
     {
         let _ = base;
         false
+    }
+}
+/// Report actual probe evidence before any receive interrupt is enabled.
+pub(crate) fn report_uart() {
+    #[cfg(target_os = "none")]
+    {
+        let facts = ProbeFacts::unpack(COM1_PROBE.load(core::sync::atomic::Ordering::Acquire));
+        if facts.present() {
+            info!(
+                "uart-console: port={:#x} probe={} LSR={:#04x} IIR={:#04x} loop={:#04x}/{:#04x}; \
+                 VT receive admitted",
+                COM1_BASE,
+                facts.name(),
+                facts.lsr,
+                facts.iir,
+                facts.loop_a,
+                facts.loop_b
+            );
+        } else {
+            warn!(
+                "\x013uart-console: port={:#x} probe={} LSR={:#04x} IIR={:#04x} \
+                 loop={:#04x}/{:#04x}; UART/IRQ/VT receive disabled, not filtering NUL (N305 \
+                 detection not hardware-validated)",
+                COM1_BASE,
+                facts.name(),
+                facts.lsr,
+                facts.iir,
+                facts.loop_a,
+                facts.loop_b
+            );
+        }
     }
 }
 
@@ -369,7 +488,7 @@ fn init_diagnostic() {
             // would be a second chance to disturb whatever the firmware left
             // there.
             store_sink(select_sink(available(), |base| {
-                probe_uart_with(&mut HardwarePorts, base)
+                probe_facts(&mut HardwarePorts, base).present()
             }));
         }
     }
@@ -810,7 +929,7 @@ mod diagnostic_tests {
 mod probe_tests {
     use std::vec::Vec;
 
-    use super::{PortIo, probe_uart_with};
+    use super::{PortIo, ProbeFacts, probe_facts, probe_uart_with};
 
     const BASE: u16 = 0x3f8;
 
@@ -832,6 +951,10 @@ mod probe_tests {
         machine: Machine,
         reads: Vec<u16>,
         writes: Vec<(u16, u8)>,
+        mcr: u8,
+        iir: u8,
+        loopback: bool,
+        fifo_clears_thre: bool,
     }
 
     impl FakePorts {
@@ -840,6 +963,10 @@ mod probe_tests {
                 machine,
                 reads: Vec::new(),
                 writes: Vec::new(),
+                mcr: 0,
+                iir: 0xc1,
+                loopback: true,
+                fifo_clears_thre: true,
             }
         }
 
@@ -854,6 +981,18 @@ mod probe_tests {
             let offset = port - BASE;
             match &mut self.machine {
                 Machine::Uart { scratch, status } => match offset {
+                    2 => self.iir,
+                    4 => self.mcr,
+                    6 => {
+                        if self.loopback && self.mcr & 0x10 != 0 {
+                            ((self.mcr & 1) << 5)
+                                | ((self.mcr & 2) << 3)
+                                | ((self.mcr & 4) << 4)
+                                | ((self.mcr & 8) << 4)
+                        } else {
+                            0
+                        }
+                    }
                     5 => *status,
                     7 => *scratch,
                     _ => 0,
@@ -872,6 +1011,17 @@ mod probe_tests {
 
         unsafe fn write(&mut self, port: u16, value: u8) {
             self.writes.push((port, value));
+            if port == BASE + 4 {
+                self.mcr = value;
+            }
+            if port == BASE + 2
+                && value & 4 != 0
+                && self.fifo_clears_thre
+                && let Machine::Uart { status, .. } = &mut self.machine
+            {
+                *status |= 0x20;
+            }
+
             if let Machine::Uart { scratch, .. } = &mut self.machine
                 && port == BASE + 7
             {
@@ -880,6 +1030,72 @@ mod probe_tests {
         }
     }
 
+    #[test]
+    fn scratch_readback_alone_does_not_admit_a_phantom_receiver() {
+        let mut ports = FakePorts::new(Machine::Uart {
+            scratch: 0x33,
+            status: 0x61,
+        });
+        ports.loopback = false;
+        ports.mcr = 0x0b;
+        let facts = probe_facts(&mut ports, BASE);
+        assert_eq!(facts.name(), "loopback-mismatch");
+        assert!(!facts.present());
+        assert_eq!(facts.loop_a, 0);
+        assert_eq!(facts.loop_b, 0);
+        assert_eq!(ports.mcr & 0x18, 0);
+        assert!(!ports.reads.contains(&BASE));
+        assert!(ports.wrote(BASE + 1, 0));
+    }
+    #[test]
+    fn disabled_interrupt_register_must_have_a_legal_iir_signature() {
+        for iir in [0, 0xff, 0x41, 0x81, 0xc3, 0xc5] {
+            let mut p = FakePorts::new(Machine::Uart {
+                scratch: 0,
+                status: 0x60,
+            });
+            p.iir = iir;
+            let f = probe_facts(&mut p, BASE);
+            assert_eq!(f.name(), "invalid-IIR");
+            assert!(
+                !p.writes
+                    .iter()
+                    .any(|&(port, value)| port == BASE + 4 && value & 0x10 != 0)
+            );
+        }
+    }
+    #[test]
+    fn real_uart_signatures_with_data_ready_or_no_fifo_remain_admitted() {
+        for status in [0, 0x20, 0x60, 0x61, 0x7f] {
+            for iir in [1, 0xc1] {
+                let mut p = FakePorts::new(Machine::Uart {
+                    scratch: 0xa7,
+                    status,
+                });
+                p.iir = iir;
+                let f = probe_facts(&mut p, BASE);
+                assert!(f.present());
+                assert_eq!((f.loop_a, f.loop_b), (0x90, 0x60));
+                assert_eq!(ProbeFacts::unpack(f.packed()), f);
+                assert_eq!(p.mcr, 3);
+                assert!(!p.reads.contains(&BASE));
+            }
+        }
+    }
+    #[test]
+    fn fifo_reset_does_not_turn_a_zero_status_decoder_into_a_uart() {
+        let mut p=FakePorts::new(Machine::Uart{scratch:0,status:0});p.fifo_clears_thre=false;
+        let f=probe_facts(&mut p,BASE);assert_eq!(f.name(),"invalid-LSR");
+        assert!(!p.reads.contains(&BASE));
+        assert!(p.reads.len()<16);assert!(p.writes.len()<16);
+    }
+    #[test]
+    fn retained_not_probed_and_floating_facts_are_distinguishable() {
+        assert_eq!(ProbeFacts::unpack(0).name(), "not-probed");
+        let f = probe_facts(&mut FakePorts::new(Machine::Floating), BASE);
+        assert_eq!(f.name(), "floating-LSR");
+        assert_eq!(f.lsr, 0xff);
+    }
     #[test]
     fn a_floating_bus_is_not_mistaken_for_a_uart() {
         let mut ports = FakePorts::new(Machine::Floating);
@@ -948,7 +1164,7 @@ mod probe_tests {
         // Every read the probe performs must be a single, unconditional read:
         // a loop on a lying status register is the hang this design exists to
         // prevent.  Counting reads bounds that: the probe reads the status
-        // once and the scratch register three times, whatever the machine.
+        // at most twice (before and after FIFO clear), never in a retry loop.
         for machine in [
             Machine::Floating,
             Machine::Zeroed,
@@ -961,7 +1177,10 @@ mod probe_tests {
             let mut ports = FakePorts::new(machine);
             probe_uart_with(&mut ports, BASE);
             let status_reads = ports.reads.iter().filter(|port| **port == BASE + 5).count();
-            assert!(status_reads <= 1, "status register polled {status_reads} times");
+            assert!(
+                status_reads <= 2,
+                "status register polled {status_reads} times"
+            );
         }
     }
 }
