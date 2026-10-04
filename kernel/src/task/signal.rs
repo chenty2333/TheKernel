@@ -1349,7 +1349,7 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
     }
 }
 
-fn interrupt_stop_siblings(proc_data: &ProcessData) {
+pub(super) fn interrupt_stop_siblings(proc_data: &ProcessData) {
     let curr_tid = linux_pid_from_task_id(current().id().as_u64())
         .unwrap_or_else(|error| fail_closed_exit(error));
     for tid in proc_data.proc.thread_ids() {

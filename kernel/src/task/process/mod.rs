@@ -2125,12 +2125,13 @@ pub(crate) fn resume_ptrace(
         &self,
         session: PtraceSession,
         detach: bool,
+        commit_resume: impl FnOnce(),
     ) -> Option<(
         ContinueResult,
         Option<PtraceSignalRecord>,
         Option<PtraceRelationshipSnapshot>,
     )> {
-        self.resume_ptrace_inner(session, detach, true)
+        self.resume_ptrace_inner(session, detach, true, commit_resume)
     }
 
     fn resume_ptrace_inner(
@@ -2138,6 +2139,7 @@ pub(crate) fn resume_ptrace(
         session: PtraceSession,
         detach: bool,
         require_inactive: bool,
+        commit_resume: impl FnOnce(),
     ) -> Option<(
         ContinueResult,
         Option<PtraceSignalRecord>,
@@ -2153,6 +2155,11 @@ pub(crate) fn resume_ptrace(
         if require_inactive && !job_ctl.is_ptrace_inactive_for(session) {
             return None;
         }
+        // A stopped owner can be woken by an unrelated interrupt before the
+        // explicit stop-event notification. Commit resume mode while the job
+        // gate still excludes any observation of Running. This callback must
+        // only update task-local state: no allocation, usercopy or sleep.
+        commit_resume();
         let retired_relationship = detach.then(|| {
             let retired = ptrace_ctl
                 .clear_session(session)
@@ -2282,7 +2289,7 @@ pub(crate) fn finish_ptrace_resume(&self, result: ContinueResult) {
 
 pub(crate) fn end_ptrace(&self, session: PtraceSession) -> Option<PtraceRelationshipSnapshot> {
         let (result, record, retired_relationship) =
-            self.resume_ptrace_inner(session, true, false)?;
+            self.resume_ptrace_inner(session, true, false, || {})?;
         if let Some(record) = record {
             super::timer::acknowledge_posix_timer_signal(self, record.info());
             drop(record);

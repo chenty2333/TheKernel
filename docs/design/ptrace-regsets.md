@@ -64,7 +64,18 @@ keeps the owner parked while making ordinary ptrace requests return ESRCH;
 INTERRUPT or SIGCONT re-publishes an event stop. An INTERRUPT arriving during an
 already traced stop is retained until resume instead of being silently lost.
 
-Syscall entry/exit stops,
-single-step, LISTEN, hardware watchpoints and real gdb/strace acceptance remain
-pending. Existing relationship and stop storage is process-wide; multithreaded
+SYSCALL publishes genuine entry/exit stops and syscall event messages. The entry
+image has RAX=-ENOSYS and a separate original syscall number; edits of orig_rax
+and argument registers affect dispatch, while a negative orig_rax skips it.
+SYSEMU samples its skip decision on entry, so resuming that stop with CONT cannot
+execute the suppressed syscall. Exit RAX edits affect the value observed in user
+space. GET_SYSCALL_INFO includes actual IP/SP, six native arguments, return/error
+and short-buffer sizing. Without TRACESYSGOOD it reports NONE, using provenance
+captured at stop publication rather than guessing from later option changes.
+Syscall siginfo is synthetic and not a queued signal to consume. Resume mode is
+bound to the exact ptrace generation and committed before the job gate exposes
+Running, so a reattachment cannot inherit a dead tracer's mode and an unrelated
+wake cannot execute the tracee before its requested mode is installed.
+
+Single-step, hardware watchpoints and real gdb/strace acceptance remain pending. Existing relationship and stop storage is process-wide; multithreaded
 debugging requires task-exact stop/relationship semantics, not just registers.

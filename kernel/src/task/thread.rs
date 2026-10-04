@@ -1062,6 +1062,8 @@ pub struct Thread {
     /// Published only while parked at a user-context stop boundary.
     pub(crate) ptrace_registers: SpinNoIrq<Option<super::registers::GeneralRegisters>>,
     pub(crate) ptrace_orig_rax: AtomicU64,
+    pub(crate) ptrace_syscall_mode: SpinNoIrq<Option<(super::PtraceSession, u8)>>,
+    pub(crate) ptrace_syscall_stop: AtomicU8,
     pub(crate) ptrace_xsave: SpinNoIrq<Option<axtask::XsaveImage>>,
     /// The process data shared by all threads in the process.
     pub proc_data: Arc<ProcessData>,
@@ -1805,6 +1807,8 @@ impl Thread {
         let thread = Box::try_new(Thread {
             ptrace_registers: SpinNoIrq::new(None),
             ptrace_orig_rax: AtomicU64::new(u64::MAX),
+            ptrace_syscall_mode: SpinNoIrq::new(None),
+            ptrace_syscall_stop: AtomicU8::new(0),
             ptrace_xsave: SpinNoIrq::new(None),
             signal,
             proc_data,

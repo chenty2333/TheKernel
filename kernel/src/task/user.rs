@@ -18,7 +18,6 @@ use crate::{
         PageFaultFailure, PageFaultResult, UserMemoryCapability, handle_user_page_fault,
         map_usercopy_error,
     },
-    syscall::handle_syscall,
 };
 
 /// Maps an `ExceptionKind::Other` exception to the correct POSIX signal using
@@ -185,7 +184,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     ReturnReason::Syscall => {
                         thr.ptrace_orig_rax
                             .store(uctx.sysno() as u64, core::sync::atomic::Ordering::Release);
-                        handle_syscall(&mut uctx);
+                        super::ptrace_runtime::handle_traced_syscall(thr, &mut uctx);
                     }
                     ReturnReason::PageFault(addr, flags) => {
                         let aspace_handle = thr.proc_data.aspace();

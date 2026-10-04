@@ -139,8 +139,7 @@ const NT_X86_XSTATE: usize = 0x202;
 /// ```
 ///
 /// The payload is a union, so it is modelled as `[u64; 8]`-sized storage plus
-/// typed accessors; the only field TheKernel can currently populate is `op`,
-/// because it has no syscall-entry/exit stop generation.
+/// typed accessors. The transfer encodes initialized bytes explicitly.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PtraceSyscallInfo {
@@ -406,11 +405,13 @@ fn do_attach(target_thread: &Thread, seized: bool, initial_options: u32) -> AxRe
 }
 
 fn do_continue(
-    target: &ProcessData,
+    thread: &Thread,
     session: PtraceSession,
     data: usize,
     detach: bool,
+    syscall_mode: u8,
 ) -> AxResult<PtraceContinueOutcome> {
+    let target = &thread.proc_data;
     let curr = current();
     let tracer_data = curr.as_thread().proc_data.clone();
     let signal = parse_signal(data)?.map(|info| info.signo());
@@ -418,7 +419,9 @@ fn do_continue(
         .current_stop_report()
         .is_some_and(|stop| stop.ptrace_event != 0);
     let (resume_result, record, retired_relationship) = target
-        .resume_ptrace(session, detach)
+        .resume_ptrace(session, detach, || {
+            *thread.ptrace_syscall_mode.lock() = Some((session, syscall_mode));
+        })
         .ok_or(AxError::NoSuchProcess)?;
     if detach {
         tracer_data.remove_ptrace_tracee(PtraceReverseLink::new(target.proc.pid(), session));
@@ -650,93 +653,41 @@ fn ptrace_shstk_regset(
     }
 }
 
-/// Implement `PTRACE_GET_SYSCALL_INFO` (0x420e, include/uapi/linux/ptrace.h).
-///
-/// kernel/ptrace.c:
-///
-/// ```c
-/// static int ptrace_get_syscall_info(struct task_struct *child, unsigned long user_size,
-/// 				   void __user *datavp)
-/// {
-/// 	struct pt_regs *regs = task_pt_regs(child);
-/// 	struct ptrace_syscall_info info = {
-/// 		.op = PTRACE_SYSCALL_INFO_NONE,
-/// 		.arch = syscall_get_arch(child),
-/// 		.instruction_pointer = instruction_pointer(regs),
-/// 		.stack_pointer = user_stack_pointer(regs),
-/// 	};
-/// 	unsigned long actual_size = offsetof(struct ptrace_syscall_info, entry);
-/// 	unsigned long write_size;
-/// 	...
-/// 	if (info.op == PTRACE_SYSCALL_INFO_ENTRY || info.op == PTRACE_SYSCALL_INFO_SECCOMP) {
-/// 		...
-/// 		actual_size = offsetofend(struct ptrace_syscall_info, entry);
-/// 	} else if (info.op == PTRACE_SYSCALL_INFO_EXIT) {
-/// 		...
-/// 		actual_size = offsetofend(struct ptrace_syscall_info, exit.is_error);
-/// 	}
-/// 	write_size = min(actual_size, user_size);
-/// 	if (copy_to_user(datavp, &info, write_size))
-/// 		return -EFAULT;
-/// 	return actual_size;
-/// }
-/// ```
-///
-/// `user_size` arrives in `addr` and the destination pointer in `data`, because
-/// kernel/ptrace.c routes the request as
-/// `ptrace_get_syscall_info(child, addr, datap)`.
-///
-/// TheKernel never publishes a syscall-entry/exit stop, so no stop can be
-/// classified as ENTRY, EXIT or SECCOMP, and `op` is always
-/// `PTRACE_SYSCALL_INFO_NONE`.  That is the truthful answer a caller uses to
-/// detect the absence of syscall stops; it is also what strace checks first.
-/// `instruction_pointer`/`stack_pointer` would come from the stopped tracee's
-/// saved register file, which TheKernel does not retain per stop, so they are
-/// reported as zero instead of being fabricated.
+/// Copy only the active ABI bytes; avoid exposing Rust union padding.
 #[cfg(target_arch = "x86_64")]
 fn ptrace_get_syscall_info(
     tracer_memory: &UserMemoryCapability,
+    thread: &Thread,
     user_size: usize,
     data: usize,
 ) -> AxResult<isize> {
-    let info = PtraceSyscallInfo {
-        op: PTRACE_SYSCALL_INFO_NONE,
-        reserved: 0,
-        flags: 0,
-        arch: AUDIT_ARCH_X86_64,
-        instruction_pointer: 0,
-        stack_pointer: 0,
-        // Initialise the largest union member so that every byte of the
-        // structure is defined; `ptrace_get_syscall_info()` builds `info` with a
-        // designated initialiser, which zero-fills the same bytes.
-        payload: PtraceSyscallInfoPayload {
-            seccomp: PtraceSyscallInfoSeccomp {
-                nr: 0,
-                args: [0; 6],
-                ret_data: 0,
-                reserved2: 0,
-            },
-        },
-    };
-    let actual_size = PtraceSyscallInfo::active_size(info.op);
+    let regs = thread.ptrace_registers.lock().ok_or(AxError::NoSuchProcess)?;
+    let provenance = thread.ptrace_syscall_stop.load(core::sync::atomic::Ordering::Acquire);
+    let op = thread.proc_data.current_stop_report().map_or(0, |stop| {
+        crate::task::ptrace_runtime::syscall_info_operation(provenance, stop.ptrace_event)
+    });
+    let mut bytes = [0u8; 88];
+    bytes[0] = op;
+    bytes[4..8].copy_from_slice(&AUDIT_ARCH_X86_64.to_ne_bytes());
+    bytes[8..16].copy_from_slice(&regs[16].to_ne_bytes());
+    bytes[16..24].copy_from_slice(&regs[19].to_ne_bytes());
+    match op {
+        PTRACE_SYSCALL_INFO_ENTRY => {
+            for (i, value) in [regs[15], regs[14], regs[13], regs[12], regs[7], regs[9], regs[8]].into_iter().enumerate() {
+                bytes[24 + i * 8..32 + i * 8].copy_from_slice(&value.to_ne_bytes());
+            }
+        }
+        PTRACE_SYSCALL_INFO_EXIT => {
+            bytes[24..32].copy_from_slice(&regs[10].to_ne_bytes());
+            bytes[32] = ((regs[10] as i64) < 0 && (regs[10] as i64) >= -4095) as u8;
+        }
+        _ => {}
+    }
+    let actual_size = PtraceSyscallInfo::active_size(op);
     let write_size = actual_size.min(user_size);
     if write_size != 0 {
-        // SAFETY: `PtraceSyscallInfo` is `#[repr(C)]`, every field (including
-        // the whole union payload) is initialised above, it contains no
-        // padding-invalid bytes, and `write_size <= size_of::<PtraceSyscallInfo>()`.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                (&info as *const PtraceSyscallInfo).cast::<u8>(),
-                write_size,
-            )
-        };
-        tracer_memory
-            .write_bytes(data, bytes)
-            .map_err(map_usercopy_error)?;
+        tracer_memory.write_bytes(data, &bytes[..write_size]).map_err(map_usercopy_error)?;
     }
-    // Linux returns the *actual* size, not the number of bytes copied, so a
-    // short (or even zero-length) user buffer still reports how much the kernel
-    // had to offer.
     Ok(actual_size as isize)
 }
 
@@ -1005,34 +956,23 @@ fn sys_ptrace_for_target(
     // memory or usercopy.
     let ptrace_action = target.lock_ptrace_actions();
     match request {
-        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
+        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP | PTRACE_SYSEMU => {
             let session = check_inactive_tracee(&target)?;
-            do_continue(&target, session, data, false)?.finish()
+            do_continue(target_thread, session, data, false, match request {
+                PTRACE_SYSCALL => crate::task::ptrace_runtime::TRACE_SYSCALL,
+                PTRACE_SYSEMU => crate::task::ptrace_runtime::EMULATE_SYSCALL,
+                _ => 0,
+            })?.finish()
         }
-        // kernel/ptrace.c `ptrace_resume()` also accepts PTRACE_SYSEMU,
-        // PTRACE_SYSEMU_SINGLESTEP and PTRACE_SINGLEBLOCK:
-        //
-        // 	case PTRACE_SYSEMU:
-        // 	case PTRACE_SYSEMU_SINGLESTEP:
-        // 	case PTRACE_SINGLEBLOCK:
-        // 		...
-        // 		ret = ptrace_resume(child, request, data);
-        //
-        // All three need machinery TheKernel does not have -- syscall-entry
-        // emulation (TIF_SYSCALL_EMU, i.e. a syscall stop whose return value is
-        // forced to -ENOSYS with the syscall skipped) and hardware block-step
-        // (arch_has_block_step()).  They are decoded here so that the *stop
-        // generation* check runs first, which is what makes the difference
-        // between -ESRCH (unrelated or running tracee) and -EIO; resuming
-        // without the requested effect would be a silent ABI violation, so the
-        // request still fails closed with -EIO.
-        PTRACE_SYSEMU | PTRACE_SYSEMU_SINGLESTEP | PTRACE_SINGLEBLOCK => {
+        // Instruction/block stepping is implemented independently of syscall
+        // tracing; until then these requests must not silently resume normally.
+        PTRACE_SYSEMU_SINGLESTEP | PTRACE_SINGLEBLOCK => {
             check_inactive_tracee(&target)?;
             Err(ptrace_io_error())
         }
         PTRACE_DETACH => {
             let session = check_inactive_tracee(&target)?;
-            let outcome = do_continue(&target, session, data, true)?;
+            let outcome = do_continue(target_thread, session, data, true, 0)?;
             drop(ptrace_action);
             outcome.finish()
         }
@@ -1162,9 +1102,9 @@ fn sys_ptrace_for_target(
         }
         PTRACE_GETSIGINFO => {
             let session = check_inactive_tracee(&target)?;
-            let info = target
-                .ptrace_signal_info(session)
-                .ok_or_else(ptrace_io_error)?;
+            let info = target.ptrace_signal_info(session).or_else(|| {
+                crate::task::ptrace_runtime::syscall_stop_signal_info(target_thread)
+            }).ok_or_else(ptrace_io_error)?;
             tracer_memory
                 .write_value(data as *mut SignalInfo, info)
                 .map_err(map_usercopy_error)?;
@@ -1213,7 +1153,7 @@ fn sys_ptrace_for_target(
             #[cfg(target_arch = "x86_64")]
             {
                 check_inactive_tracee(&target)?;
-                return ptrace_get_syscall_info(tracer_memory, addr, data);
+                return ptrace_get_syscall_info(tracer_memory, target_thread, addr, data);
             }
             #[cfg(not(target_arch = "x86_64"))]
             {

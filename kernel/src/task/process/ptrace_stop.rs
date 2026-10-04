@@ -2,6 +2,25 @@
 use super::*;
 
 impl ProcessData {
+    /// Publish syscall provenance and the wait status in one generation.
+    pub(crate) fn ptrace_syscall_stop(&self, session: PtraceSession, op: u8) -> Option<bool> {
+        let mut control = self.ptrace_ctl.lock();
+        let mut job = self.job_ctl.lock();
+        if control.active_session() != Some(session) || job.state != StopState::Running {
+            return None;
+        }
+        let good = control.options & tk_linux_process::ptrace_options::TRACESYSGOOD != 0;
+        control.event_message = op as usize;
+        job.state = StopState::Stopped;
+        job.stop_kind = StopKind::Ptrace;
+        job.stop_signal = Signo::SIGTRAP as u8 | if good { 0x80 } else { 0 };
+        job.ptrace_event = 0;
+        job.ptrace_session = Some(session);
+        job.stop_reported = false;
+        job.continued = false;
+        Some(good)
+    }
+
     pub(crate) fn current_stop_report(&self) -> Option<StopReport> {
         self.job_ctl.lock().current_stop_report()
     }

@@ -11,6 +11,7 @@ mod jobctl;
 mod loadavg;
 mod ops;
 mod process;
+pub(crate) mod ptrace_runtime;
 pub(crate) mod registers;
 mod resources;
 mod restart;
