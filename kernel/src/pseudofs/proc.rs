@@ -3422,6 +3422,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
     }
 
     let mut root = DirMapping::new();
+    super::proc_inventory::register(&mut root, &fs);
     root.add("boot-progress",SimpleFile::new_regular(fs.clone(),||Ok(boot_progress_snapshot())));
     root.add(
         "stat",

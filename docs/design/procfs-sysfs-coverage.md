@@ -65,3 +65,22 @@ BusyBox 1.36.1 选项与 Alpine BusyBox 选项不能假定相同。
 
 当前：盘点完成；**B1 节点修补及全工具 guest 验收尚未完成**。
 后续每项在这里记录真实来源、零字段的依据以及已跑/未跑边界。
+
+### B1.2a：filesystems / modules
+
+filesystems 从 legacy mount/fsopen 的同一 provider 注册表枚举：块 provider
+省略 nodev，非块 provider 使用 nodev，字段以 tab 分隔并以 LF 结束。
+modules 为空：静态链接的驱动不是可加载模块。新增两个主机格式/来源测试、
+默认 guest 的 proc-inventory 用例。未改变 mount 的行为或 provider 集合。
+
+后续工具准备：已用 Alpine 3.24.1 自带 apk 和信任密钥（不使用
+allow-untrusted，不执行安装脚本）在本用户缓存目录解包签名软件包。
+在主机只读运行 sysstat 12.7.8：pidstat 读取 stat/status/schedstat、
+stat/uptime、CPU 目录；iostat -x 读取各磁盘 stat、stat/uptime、CPU 目录；
+mpstat -P ALL 读取 interrupts/softirqs/stat/uptime、CPU 目录。三个程序均
+退出 0；guest 尚未运行。PID schedstat 也缺失，应补真实调度时间而非假值。
+
+B1.2a 实测：两个新增主机测试通过，product lint 通过；完整 KVM guest
+53/53 通过，无跳过且正常关机，包含 `PROC_INVENTORY_OK filesystems=19
+loaded_modules=0`。第一次运行因 helper 误放在不被打包的目录而失败，修复
+打包路径并重新构建、完整重跑后才记录通过。这不是所有工具的验收。

@@ -201,6 +201,14 @@ const FILESYSTEM_TYPES: &[FilesystemType] = &[
     },
 ];
 
+/// Export the same provider registry used by mount(2) and fsopen(2).
+/// The boolean has Linux's FS_REQUIRES_DEV meaning, not "has a source".
+pub(crate) fn proc_filesystem_types() -> impl Iterator<Item = (&'static str, bool)> {
+    FILESYSTEM_TYPES
+        .iter()
+        .map(|entry| (entry.name, entry.ops == FsContextOps::Block))
+}
+
 fn filesystem_type(name: &str) -> Option<FilesystemType> {
     let canonical = match name {
         // The FAT driver exposes Linux's traditional spelling aliases while

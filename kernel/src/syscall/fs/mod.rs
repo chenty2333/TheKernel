@@ -10,6 +10,7 @@ mod io;
 pub(crate) mod io_uring;
 mod memfd;
 mod mount;
+pub(crate) use mount::proc_filesystem_types;
 mod pidfd;
 mod pipe;
 mod quota;
