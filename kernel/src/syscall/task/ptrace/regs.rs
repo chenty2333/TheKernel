@@ -34,7 +34,8 @@ pub(super) fn general_register_transfer(
             .lock()
             .ok_or(AxError::NoSuchProcess)?;
         context.rflags = previous[18];
-        crate::task::registers::apply_gregs(&mut context, &previous)?;
+        crate::task::registers::restore_gregs(&mut context, &previous);
+        validate_legacy_selectors(thread, &regs)?;
         crate::task::registers::apply_gregs(&mut context, &regs)?;
         // Keep the unmodifiable flags from the original stopped frame.
         crate::task::registers::fill_gregs(&context, regs[15], &mut regs);
@@ -85,8 +86,9 @@ pub(super) fn ptrace_user_word(
         .ok_or(AxError::NoSuchProcess)?;
     let mut context = axhal::uspace::UserContext::new(0, axhal::mem::VirtAddr::from_usize(0), 0);
     context.rflags = regs[18];
-    crate::task::registers::apply_gregs(&mut context, &regs)?;
+    crate::task::registers::restore_gregs(&mut context, &regs);
     regs[addr / 8] = data as u64;
+    validate_legacy_selectors(thread, &regs)?;
     crate::task::registers::apply_gregs(&mut context, &regs)?;
     crate::task::registers::fill_gregs(&context, regs[15], &mut regs);
     *thread.ptrace_registers.lock() = Some(regs);
@@ -245,4 +247,42 @@ pub(super) fn peek_siginfo(
         copied += 1;
     }
     Ok(copied as isize)
+}
+
+fn validate_legacy_selectors(
+    thread: &Thread,
+    regs: &crate::task::registers::GeneralRegisters,
+) -> AxResult<()> {
+    let table = thread.proc_data.aspace().lock().ldt_snapshot();
+    for &raw in &regs[23..] {
+        let selector = raw as u16;
+        if selector == 0 {
+            continue;
+        }
+        if selector & 3 != 3 {
+            return Err(ptrace_io_error());
+        }
+        if selector & 4 == 0 {
+            if ![0x2b, 0x33].contains(&selector) {
+                return Err(ptrace_io_error());
+            }
+        } else {
+            let table = table.as_ref().ok_or_else(ptrace_io_error)?;
+            let offset = (selector as usize >> 3) * 8;
+            let bytes = table
+                .bytes()
+                .get(offset..offset + 8)
+                .ok_or_else(ptrace_io_error)?;
+            let descriptor = u64::from_le_bytes(bytes.try_into().unwrap());
+            let ty = (descriptor >> 40) & 15;
+            if descriptor & (1 << 47) == 0
+                || descriptor & (1 << 44) == 0
+                || descriptor >> 45 & 3 != 3
+                || (ty & 8 != 0 && ty & 2 == 0)
+            {
+                return Err(ptrace_io_error());
+            }
+        }
+    }
+    Ok(())
 }

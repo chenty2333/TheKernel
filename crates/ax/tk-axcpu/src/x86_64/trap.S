@@ -170,7 +170,26 @@ enter_user:
     add rdi, {trapframe_size}
     mov gs:[offset __PERCPU_TSS + 4], rdi      # store end of TrapFrame -> TSS.sp0
 
+    # Selectors were admitted against this CPU's installed GDT/LDT. Reload
+    # bases after selector loads; a MOV to FS/GS may replace the hidden base.
+    movzx ecx, word ptr [rsp + {user_ds}]
+    mov ds, cx
+    movzx ecx, word ptr [rsp + {user_es}]
+    mov es, cx
+    movzx ecx, word ptr [rsp + {user_fs}]
+    mov fs, cx
+    mov eax, dword ptr [rsp + {user_fs_base}]
+    mov edx, dword ptr [rsp + {user_fs_base} + 4]
+    mov ecx, 0xc0000100
+    wrmsr
+
     swapgs                              # swap in user gs
+    movzx ecx, word ptr [rsp + {user_gs}]
+    mov gs, cx
+    mov eax, dword ptr [rsp + {user_gs_base}]
+    mov edx, dword ptr [rsp + {user_gs_base} + 4]
+    mov ecx, 0xc0000101
+    wrmsr
 
     POP_GENERAL_REGS
     add rsp, 16                         # pop vector, error_code

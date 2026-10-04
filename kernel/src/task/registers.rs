@@ -36,13 +36,17 @@ pub(crate) fn fill_gregs(uctx: &UserContext, orig_rax: u64, regs: &mut [u64; NUM
     regs[..gregs.len()].copy_from_slice(&gregs);
     regs[21] = uctx.fs_base;
     regs[22] = uctx.gs_base;
-    // The saved context has no legacy segment selectors; keep those slots zero.
-    regs[23..].fill(0);
+    regs[23..].copy_from_slice(&[
+        uctx.ds as u64,
+        uctx.es as u64,
+        uctx.fs_selector as u64,
+        uctx.gs_selector as u64,
+    ]);
 }
 
 /// Install a debugger image only after validating every privileged field.
-/// Legacy selectors are not transported by the saved context yet; nonzero
-/// values fail closed instead of issuing an unvalidated kernel segment load.
+/// Descriptor admission is performed by the stopped-task request adapter;
+/// this shared layout helper validates privilege, pointer and flag fields.
 pub(crate) fn apply_gregs(uctx: &mut UserContext, regs: &GeneralRegisters) -> AxResult<()> {
     let mut r = *regs;
     for i in [17, 20, 23, 24, 25, 26] {
@@ -53,7 +57,6 @@ pub(crate) fn apply_gregs(uctx: &mut UserContext, regs: &GeneralRegisters) -> Ax
     }
     if r[17] != uctx.cs
         || r[20] != uctx.ss
-        || r[23..].iter().any(|&selector| selector != 0)
         || r[16] >= 1 << 47
         || r[19] >= 1 << 47
         || r[21] >= 1 << 47
@@ -61,6 +64,13 @@ pub(crate) fn apply_gregs(uctx: &mut UserContext, regs: &GeneralRegisters) -> Ax
     {
         return Err(LinuxError::EIO.into());
     }
+    restore_gregs(uctx, &r);
+    Ok(())
+}
+
+/// Restore an owner-produced or debugger-validated image. Original hardware
+/// selectors can legally have RPL 0; only debugger writes require RPL 3.
+pub(crate) fn restore_gregs(uctx: &mut UserContext, r: &GeneralRegisters) {
     uctx.r15 = r[0];
     uctx.r14 = r[1];
     uctx.r13 = r[2];
@@ -81,7 +91,10 @@ pub(crate) fn apply_gregs(uctx: &mut UserContext, regs: &GeneralRegisters) -> Ax
     uctx.rsp = r[19];
     uctx.fs_base = r[21];
     uctx.gs_base = r[22];
-    Ok(())
+    uctx.ds = r[23] as u16;
+    uctx.es = r[24] as u16;
+    uctx.fs_selector = r[25] as u16;
+    uctx.gs_selector = r[26] as u16;
 }
 
 #[cfg(test)]

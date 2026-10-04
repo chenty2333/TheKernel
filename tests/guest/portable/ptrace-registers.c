@@ -35,12 +35,16 @@ int main(void) {
         __asm__ volatile ("movdqu %0, %%xmm15" : : "m"(vector) : "xmm15");
         __asm__ volatile ("syscall" : "=a"(result) : "a"((long)SYS_kill), "D"((long)self), "S"((long)SIGSTOP) : "rcx", "r11", "memory");
         __asm__ volatile ("movdqu %%xmm15, %0" : "=m"(vector));
-        unsigned short cs, ss;
+        unsigned short cs, ss, ds, es, fs, gs;
         __asm__ volatile ("mov %%cs, %0" : "=r"(cs));
         __asm__ volatile ("mov %%ss, %0" : "=r"(ss));
+        __asm__ volatile ("mov %%ds, %0" : "=r"(ds));
+        __asm__ volatile ("mov %%es, %0" : "=r"(es));
+        __asm__ volatile ("mov %%fs, %0" : "=r"(fs));
+        __asm__ volatile ("mov %%gs, %0" : "=r"(gs));
         sigset_t mask;
         if (sigprocmask(SIG_BLOCK, NULL, &mask) != 0) _exit(3);
-        _exit(cs == 0x33 && ss == 0x2b && result == 77 && word == 22 && vector[0] == 33 && vector[1] == 34 &&
+        _exit(cs == 0x33 && ss == 0x2b && ds == 0x2b && es == 0x2b && fs == 0x2b && gs == 0x2b && result == 77 && word == 22 && vector[0] == 33 && vector[1] == 34 &&
               sigismember(&mask, SIGUSR1) && !sigismember(&mask, SIGKILL) && !sigismember(&mask, SIGSTOP) ? 0 : 2);
     }
     CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
@@ -118,6 +122,7 @@ int main(void) {
     CHECK(request(0x4209, (unsigned long)&peek, infos) == -1 && errno == EINVAL);
     peek.off = UINT64_MAX; peek.nr = 1;
     CHECK(request(0x4209, (unsigned long)&peek, infos) == 0);
+    regs.ds = 0x2b; regs.es = 0x2b; regs.fs = 0x2b; regs.gs = 0x2b;
     regs.rax = 66;
     CHECK(request(PTRACE_SETREGS, 0, &regs) == 0);
     CHECK(request(PTRACE_POKEUSER, offsetof(struct user_regs_struct, rax), (void *)77) == 0);

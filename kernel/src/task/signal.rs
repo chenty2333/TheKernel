@@ -1328,7 +1328,7 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
             // Apply only to a restart frame belonging to this original user
             // context; an outer interrupted handler keeps its own ledger.
             thr.ptrace_update_restart_registers(uctx.ip(), &regs);
-            super::registers::apply_gregs(uctx, &regs).expect("validated ptrace registers");
+            super::registers::restore_gregs(uctx, &regs);
             thr.ptrace_orig_rax
                 .store(regs[15], core::sync::atomic::Ordering::Release);
         }

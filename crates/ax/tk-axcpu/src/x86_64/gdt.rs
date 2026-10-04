@@ -100,6 +100,10 @@ impl CpuGdt {
 
 #[percpu::def_percpu]
 static GDT: CpuGdt = CpuGdt::new();
+#[percpu::def_percpu]
+static LDT_BASE: usize = 0;
+#[percpu::def_percpu]
+static LDT_BYTES: usize = 0;
 
 /// Kernel code segment for 64-bit mode.
 pub const KCODE64: SegmentSelector = SegmentSelector::new(1, PrivilegeLevel::Ring0);
@@ -172,6 +176,28 @@ unsafe fn refresh_ldt_data_segments(base: *const u8, bytes: usize) {
 
     refresh!("ds");
     refresh!("es");
+}
+
+/// Sanitize a saved data selector against the currently installed descriptors.
+/// Caller pins this CPU with IRQs disabled; load_ldt's owner retains the table.
+pub(super) fn sanitize_user_data_selector(selector: u16) -> u16 {
+    if selector == 0 {
+        return 0;
+    }
+    if selector & 4 == 0 {
+        return if [UDATA.index(), UCODE64.index()].contains(&(selector >> 3)) {
+            selector
+        } else {
+            0
+        };
+    }
+    let base = unsafe { *LDT_BASE.current_ref_raw() } as *const u8;
+    let bytes = unsafe { *LDT_BYTES.current_ref_raw() };
+    if ldt_data_selector_is_usable(base, bytes, selector) {
+        selector
+    } else {
+        0
+    }
 }
 
 /// Installs the current task's I/O permissions for the imminent user return.
@@ -248,6 +274,10 @@ pub(super) fn init() {
 pub unsafe fn load_ldt(base: *const u8, bytes: usize) {
     debug_assert!(!crate::asm::irqs_enabled());
     let gdt = unsafe { GDT.current_ref_mut_raw() };
+    unsafe {
+        *LDT_BASE.current_ref_mut_raw() = base as usize;
+        *LDT_BYTES.current_ref_mut_raw() = bytes;
+    }
     if bytes == 0 {
         gdt.entries[9] = 0;
         gdt.entries[10] = 0;

@@ -26,9 +26,12 @@ so accepting a noncanonical return frame could fault after SWAPGS in ring 0.
 Such debugger inputs fail closed with EIO, without changing the image. This
 restriction remains until safe return-fault delivery is implemented.
 FS/GS bases must be in the lower
-canonical user range. CS/SS must match the kernel's ring-3 descriptors; nonzero
-legacy selectors are currently rejected (the saved context does not yet restore those selectors). This
-is a documented limitation, not full Linux selector compatibility. Changes to
+canonical user range. CS/SS must match the kernel's ring-3 long-mode descriptors. Legacy DS/ES/FS/GS
+selectors are transported and restored against present GDT/LDT data/readable-code
+descriptors. Invalidated LDT selectors become null at the final IRQ-disabled
+return edge. FS/GS loads preserve the explicit saved bases, rather than reproducing
+all legacy non-FSGSBASE hidden-base interactions. This and the stronger descriptor
+admission remain documented Linux limitations. Changes to
 `orig_rax` update or cancel only the interrupted-syscall restart candidate
 belonging to the stopped frame. Argument writes also replace replay arguments,
 even if `orig_rax` did not change; an ancestor signal handler's saved restart

@@ -1,12 +1,18 @@
 use x86::{controlregs::cr2, irq::*};
 use x86_64::structures::idt::PageFaultErrorCode;
 
-use super::{gdt, TrapFrame};
+use super::{TrapFrame, gdt};
 use crate::trap::PageFaultFlags;
 
 core::arch::global_asm!(
     include_str!("trap.S"),
     trapframe_size = const core::mem::size_of::<TrapFrame>(),
+    user_fs_base = const core::mem::size_of::<TrapFrame>() + 8,
+    user_gs_base = const core::mem::size_of::<TrapFrame>() + 16,
+    user_ds = const core::mem::size_of::<TrapFrame>() + 24,
+    user_es = const core::mem::size_of::<TrapFrame>() + 26,
+    user_fs = const core::mem::size_of::<TrapFrame>() + 28,
+    user_gs = const core::mem::size_of::<TrapFrame>() + 30,
     UDATA = const gdt::UDATA.0,
     UCODE64 = const gdt::UCODE64.0,
     SYSCALL_VECTOR = const LEGACY_SYSCALL_VECTOR,

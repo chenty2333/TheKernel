@@ -9,20 +9,21 @@ use memory_addr::VirtAddr;
 use x86_64::{
     registers::{
         control::Cr2,
-        model_specific::{Efer, EferFlags, KernelGsBase, LStar, SFMask, Star},
+        model_specific::{Efer, EferFlags, GsBase, KernelGsBase, LStar, SFMask, Star},
         rflags::RFlags,
+        segmentation::{DS, ES, FS, GS, Segment},
     },
     structures::idt::ExceptionVector,
 };
 
 use super::{
+    TrapFrame,
     asm::{read_thread_pointer, write_thread_pointer},
     gdt,
     trap::{
-        err_code_to_flags, CONTROL_PROTECTION_VECTOR, IRQ_VECTOR_END, IRQ_VECTOR_START,
-        LEGACY_SYSCALL_VECTOR,
+        CONTROL_PROTECTION_VECTOR, IRQ_VECTOR_END, IRQ_VECTOR_START, LEGACY_SYSCALL_VECTOR,
+        err_code_to_flags,
     },
-    TrapFrame,
 };
 pub use crate::uspace_common::{ExceptionKind, ReturnReason};
 
@@ -64,10 +65,19 @@ pub type ReturnHookResult = UserReturnHookResult;
 #[repr(C)]
 pub struct UserContext {
     tf: TrapFrame,
+    kernel_rsp: u64,
     /// FS Segment Base
     pub fs_base: u64,
     /// GS Segment Base
     pub gs_base: u64,
+    /// Saved legacy DS selector.
+    pub ds: u16,
+    /// Saved legacy ES selector.
+    pub es: u16,
+    /// Saved FS selector (independent of its explicit base).
+    pub fs_selector: u16,
+    /// Saved GS selector (independent of its explicit base).
+    pub gs_selector: u16,
 }
 
 /// Linux x86_64 `struct pt_regs` ABI layout used by tracing programs.
@@ -200,8 +210,13 @@ impl UserContext {
                 ss: gdt::UDATA.0 as _,
                 ..Default::default()
             },
+            kernel_rsp: 0,
             fs_base: 0,
             gs_base: 0,
+            ds: 0,
+            es: 0,
+            fs_selector: 0,
+            gs_selector: 0,
         }
     }
 
@@ -266,15 +281,37 @@ impl UserContext {
             UserReturnHookAction::EnterUser => {}
         }
 
+        let kernel_segments = (DS::get_reg(), ES::get_reg(), FS::get_reg(), GS::get_reg());
+        let kernel_gs_base = GsBase::read();
+        // A shared LDT may have been replaced while this context was parked.
+        // Admit only present user data/readable-code descriptors before the
+        // assembly performs a privileged segment load.
+        self.ds = gdt::sanitize_user_data_selector(self.ds);
+        self.es = gdt::sanitize_user_data_selector(self.es);
+        self.fs_selector = gdt::sanitize_user_data_selector(self.fs_selector);
+        self.gs_selector = gdt::sanitize_user_data_selector(self.gs_selector);
         let kernel_fs_base = read_thread_pointer();
         unsafe { write_thread_pointer(self.fs_base as _) };
         KernelGsBase::write(x86_64::VirtAddr::new_truncate(self.gs_base));
 
         unsafe { enter_user(self) };
 
+        self.ds = DS::get_reg().0;
+        self.es = ES::get_reg().0;
+        self.fs_selector = FS::get_reg().0;
+        self.gs_selector = GS::get_reg().0;
         self.gs_base = KernelGsBase::read().as_u64();
         self.fs_base = read_thread_pointer() as _;
-        unsafe { write_thread_pointer(kernel_fs_base) };
+        // IRQs remain disabled. Restore GS base immediately after changing
+        // its selector, before anything can use a per-CPU GS-relative load.
+        unsafe { GS::set_reg(kernel_segments.3) };
+        GsBase::write(kernel_gs_base);
+        unsafe {
+            FS::set_reg(kernel_segments.2);
+            write_thread_pointer(kernel_fs_base);
+            DS::set_reg(kernel_segments.0);
+            ES::set_reg(kernel_segments.1);
+        };
 
         let cr2 = Cr2::read().unwrap().as_u64() as usize;
         let vector = self.vector as u8;
@@ -370,5 +407,21 @@ pub(super) fn init_syscall() {
     ); // TF | IF | DF | IOPL | AC | NT (0x47700)
     unsafe {
         Efer::update(|efer| *efer |= EferFlags::SYSTEM_CALL_EXTENSIONS);
+    }
+}
+
+#[cfg(test)]
+mod selector_layout_tests {
+    use super::*;
+    #[test]
+    fn assembly_user_extra_state_offsets_match_the_context() {
+        let size = core::mem::size_of::<TrapFrame>();
+        assert_eq!(core::mem::offset_of!(UserContext, kernel_rsp), size);
+        assert_eq!(core::mem::offset_of!(UserContext, fs_base), size + 8);
+        assert_eq!(core::mem::offset_of!(UserContext, gs_base), size + 16);
+        assert_eq!(core::mem::offset_of!(UserContext, ds), size + 24);
+        assert_eq!(core::mem::offset_of!(UserContext, es), size + 26);
+        assert_eq!(core::mem::offset_of!(UserContext, fs_selector), size + 28);
+        assert_eq!(core::mem::offset_of!(UserContext, gs_selector), size + 30);
     }
 }
