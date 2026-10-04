@@ -44,7 +44,12 @@ The original signal queues keep per-signal delivery priority; independent arriva
 tokens order the siginfo view across signal numbers. Allocation, sorting and
 faulting usercopy are outside pending spin locks.
 
-LISTEN, syscall entry/exit stops,
+Seized INTERRUPT stops carry PTRACE_EVENT_STOP and synthetic siginfo. LISTEN
+keeps the owner parked while making ordinary ptrace requests return ESRCH;
+INTERRUPT or SIGCONT re-publishes an event stop. An INTERRUPT arriving during an
+already traced stop is retained until resume instead of being silently lost.
+
+Syscall entry/exit stops,
 single-step, LISTEN, hardware watchpoints and real gdb/strace acceptance remain
 pending. Existing relationship and stop storage is process-wide; multithreaded
 debugging requires task-exact stop/relationship semantics, not just registers.

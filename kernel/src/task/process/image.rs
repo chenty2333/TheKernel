@@ -284,7 +284,7 @@ pub(crate) fn ptrace_inactive_image_snapshot_if_session<A: Clone>(
     let image = image_binding.read();
     let ptrace_ctl = ptrace_ctl.lock();
     let job_ctl = job_ctl.lock();
-    if ptrace_ctl.active_session() != Some(session) || !job_ctl.is_ptrace_inactive_for(session) {
+    if ptrace_ctl.active_session() != Some(session) || ptrace_ctl.listening || !job_ctl.is_ptrace_inactive_for(session) {
         return None;
     }
     let snapshot = image.aspace.clone();

@@ -335,7 +335,10 @@ CONTRACTS.update({
 
 CONTRACTS.update({"ptrace-registers": ("raw-differential", "pass", "REGISTER_AND_FP_MUTATION")})
 
+CONTRACTS.update({"ptrace-listen": ("raw-differential", "pass", "LISTEN_RETRAP_AND_DEFERRED_INTERRUPT")})
+
 PROGRAM_CASES = {
+    "ptrace-listen": ("ptrace-listen",),
     "ptrace-registers": ("ptrace-registers",),
     "tty-job-control": ("tty-job-control",),
     "tty-termios": ("tty-termios",),
@@ -402,6 +405,7 @@ def selected_programs() -> tuple[str, ...]:
         )
     return selected
 PROGRAM_SUCCESS = {
+    "ptrace-listen": "THEKERNEL_PTRACE_LISTEN_OK",
     "ptrace-registers": "THEKERNEL_PTRACE_REGISTERS_DIFFERENTIAL_OK",
     "tty-job-control": "THEKERNEL_TTY_JOB_CONTROL_OK",
     "tty-termios": "THEKERNEL_TTY_TERMIOS_OK",

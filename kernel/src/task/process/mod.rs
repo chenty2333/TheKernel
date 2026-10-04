@@ -194,6 +194,7 @@ mod image;
 mod mempolicy;
 mod namespaces;
 mod ptrace;
+mod ptrace_stop;
 mod session;
 mod zombie;
 
@@ -1767,7 +1768,7 @@ pub(crate) fn ptrace_inactive_session_if_traced_by(
         let ptrace_ctl = self.ptrace_ctl.lock();
         let session = ptrace_ctl.active_session_if_owned_by(tracer, tracer_kernel_tid)?;
         let job_ctl = self.job_ctl.lock();
-        job_ctl.is_ptrace_inactive_for(session).then_some(session)
+        (!ptrace_ctl.listening && job_ctl.is_ptrace_inactive_for(session)).then_some(session)
     }
 
 pub(crate) fn ptrace_set_options(&self, session: PtraceSession, options: u32) -> bool {
@@ -2082,11 +2083,17 @@ pub(crate) fn ptrace_signal_info(&self, session: PtraceSession) -> Option<Signal
         let pending = self.ptrace_signal.lock();
         let ptrace_ctl = self.ptrace_ctl.lock();
         let job_ctl = self.job_ctl.lock();
-        if ptrace_ctl.active_session() != Some(session) || !job_ctl.is_ptrace_inactive_for(session)
-        {
-            return None;
-        }
-        pending.as_ref().map(|record| record.info().clone())
+        if ptrace_ctl.active_session() != Some(session) || ptrace_ctl.listening || !job_ctl.is_ptrace_inactive_for(session) { return None; }
+        if let Some(record) = pending.as_ref() { return Some(*record.info()); }
+        let signo = Signo::from_repr(job_ctl.stop_signal)?;
+        let event = job_ctl.ptrace_event;
+        if event == 0 { return None; }
+        drop(job_ctl);
+        drop(ptrace_ctl);
+        drop(pending);
+        Some(SignalInfo::new_user(signo, (event as i32) << 8 | signo as i32,
+            self.pid_ns().visible_pid(self.proc.pid()),
+            self.user_ns().from_kuid_munged(self.group_leader_cred().ids().ruid)))
     }
 
 pub(crate) fn replace_ptrace_signal_info(
@@ -2244,23 +2251,19 @@ pub(crate) fn ptrace_event_stop(
     /// Applies `PTRACE_INTERRUPT` to an exact seized relationship. Unlike
     /// ordinary actions this is allowed while the tracee is running.
 pub(crate) fn ptrace_interrupt(&self, session: PtraceSession, signo: u8) -> Option<bool> {
-        let ptrace_ctl = self.ptrace_ctl.lock();
-        if ptrace_ctl.active_session() != Some(session) || !ptrace_ctl.seized {
-            return None;
-        }
+        let mut ptrace_ctl = self.ptrace_ctl.lock();
+        if ptrace_ctl.active_session() != Some(session) || !ptrace_ctl.seized { return None; }
         let mut job_ctl = self.job_ctl.lock();
-        if job_ctl.is_ptrace_inactive_for(session) {
-            // Linux queues a second trap when INTERRUPT races an existing
-            // ptrace stop. Until that pending-trap state is represented, fail
-            // closed instead of reporting a success that CONT would lose.
-            return None;
+        if job_ctl.is_ptrace_inactive_for(session) && !ptrace_ctl.listening {
+            // Retain the promised trap across the current stop and resume.
+            ptrace_ctl.interrupt_pending = true;
+            return Some(false);
         }
-        if job_ctl.stop_kind == StopKind::Ptrace && job_ctl.state != StopState::Running {
-            return None;
-        }
+        ptrace_ctl.listening = false;
+        ptrace_ctl.interrupt_pending = false;
         job_ctl.state = StopState::Stopped;
         job_ctl.stop_signal = signo;
-        job_ctl.ptrace_event = 0;
+        job_ctl.ptrace_event = 128;
         job_ctl.stop_kind = StopKind::Ptrace;
         job_ctl.ptrace_session = Some(session);
         job_ctl.stop_reported = false;
@@ -2437,6 +2440,7 @@ pub(crate) fn cgroup_freeze_complete(&self) -> bool {
 
     /// Begins a job-control stop transition.
     pub fn begin_stop(&self, signo: u8) -> bool {
+        let ptrace_ctl = self.ptrace_ctl.lock();
         let mut job_ctl = self.job_ctl.lock();
         if job_ctl.state != StopState::Running {
             return false;
@@ -2446,6 +2450,11 @@ pub(crate) fn cgroup_freeze_complete(&self) -> bool {
         job_ctl.ptrace_event = 0;
         job_ctl.stop_kind = StopKind::JobControl;
         job_ctl.ptrace_session = None;
+        if ptrace_ctl.seized && let Some(session) = ptrace_ctl.active_session() {
+            job_ctl.stop_kind = StopKind::Ptrace;
+            job_ctl.ptrace_session = Some(session);
+            job_ctl.ptrace_event = 128;
+        }
         true
     }
 
@@ -2456,7 +2465,7 @@ pub(crate) fn cgroup_freeze_complete(&self) -> bool {
             return false;
         }
         job_ctl.state = StopState::Stopped;
-        job_ctl.ptrace_session = None;
+        if job_ctl.stop_kind != StopKind::Ptrace { job_ctl.ptrace_session = None; }
         job_ctl.stop_reported = false;
         job_ctl.continued = false;
         true

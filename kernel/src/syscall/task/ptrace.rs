@@ -414,13 +414,26 @@ fn do_continue(
     let curr = current();
     let tracer_data = curr.as_thread().proc_data.clone();
     let signal = parse_signal(data)?.map(|info| info.signo());
+    let event_stop = target
+        .current_stop_report()
+        .is_some_and(|stop| stop.ptrace_event != 0);
     let (resume_result, record, retired_relationship) = target
         .resume_ptrace(session, detach)
         .ok_or(AxError::NoSuchProcess)?;
     if detach {
         tracer_data.remove_ptrace_tracee(PtraceReverseLink::new(target.proc.pid(), session));
     }
+    // Event stops are notifications, not signal-delivery stops. Linux ignores
+    // the resume signal there; do not fabricate a signal without its record.
+    let signal = if event_stop && record.is_none() {
+        None
+    } else {
+        signal
+    };
     let reinjected = reinject_ptrace_signal(target, record, signal);
+    if target.ptrace_pending_interrupt_stop(session) {
+        notify_ptrace_attach_stop(target);
+    }
     target.finish_ptrace_resume(resume_result);
     Ok(PtraceContinueOutcome {
         result: reinjected.map(|()| 0),
@@ -1115,11 +1128,11 @@ fn sys_ptrace_for_target(
             Ok(0)
         }
         PTRACE_LISTEN => {
-            check_inactive_tracee(&target)?;
-            // LISTEN is not an ordinary resume: Linux retains a seized
-            // group-stop in a distinct listening state until an event or
-            // INTERRUPT re-traps it. Do not fake that state with CONT.
-            Err(ptrace_io_error())
+            let session = check_inactive_tracee(&target)?;
+            if target.ptrace_listen(session)? {
+                notify_ptrace_attach_stop(&target);
+            }
+            Ok(0)
         }
         PTRACE_GETSIGMASK | PTRACE_SETSIGMASK => {
             check_inactive_tracee(&target)?;

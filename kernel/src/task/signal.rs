@@ -1226,11 +1226,18 @@ fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
     );
 
     if proc_data.finish_stop() {
-        notify_tracer_or_parent_stop_continue(
-            proc_data,
-            linux_raw_sys::general::CLD_STOPPED,
-            signo as i32,
-        );
+        if proc_data
+            .current_stop_report()
+            .is_some_and(|stop| stop.traced())
+        {
+            notify_ptrace_attach_stop(proc_data);
+        } else {
+            notify_tracer_or_parent_stop_continue(
+                proc_data,
+                linux_raw_sys::general::CLD_STOPPED,
+                signo as i32,
+            );
+        }
         interrupt_stop_siblings(proc_data);
     }
 
@@ -1240,6 +1247,10 @@ fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
 
 /// Continues a stopped process.
 fn do_continue(proc_data: &ProcessData) {
+    if proc_data.ptrace_sigcont_wake() {
+        notify_ptrace_attach_stop(proc_data);
+        return;
+    }
     match proc_data.continue_job() {
         ContinueResult::None => {}
         ContinueResult::CanceledStopping => {
@@ -1368,11 +1379,13 @@ fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
 }
 
 pub fn notify_ptrace_attach_stop(proc_data: &ProcessData) {
-    notify_tracer_or_parent_stop_continue(
-        proc_data,
-        linux_raw_sys::general::CLD_TRAPPED,
-        Signo::SIGSTOP as i32,
-    );
+    if let Some(stop) = proc_data.current_stop_report() {
+        notify_tracer_or_parent_stop_continue(
+            proc_data,
+            linux_raw_sys::general::CLD_TRAPPED,
+            stop.signal as i32 | ((stop.ptrace_event as i32) << 8),
+        );
+    }
 }
 
 #[cfg(test)]
