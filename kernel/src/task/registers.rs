@@ -41,7 +41,8 @@ pub(crate) fn fill_gregs(uctx: &UserContext, orig_rax: u64, regs: &mut [u64; NUM
 }
 
 /// Install a debugger image only after validating every privileged field.
-/// This kernel has no userspace LDT; nonzero legacy selectors fail closed rather than fault in a kernel restore.
+/// Legacy selectors are not transported by the saved context yet; nonzero
+/// values fail closed instead of issuing an unvalidated kernel segment load.
 pub(crate) fn apply_gregs(uctx: &mut UserContext, regs: &GeneralRegisters) -> AxResult<()> {
     let mut r = *regs;
     for i in [17, 20, 23, 24, 25, 26] {
@@ -53,6 +54,8 @@ pub(crate) fn apply_gregs(uctx: &mut UserContext, regs: &GeneralRegisters) -> Ax
     if r[17] != uctx.cs
         || r[20] != uctx.ss
         || r[23..].iter().any(|&selector| selector != 0)
+        || r[16] >= 1 << 47
+        || r[19] >= 1 << 47
         || r[21] >= 1 << 47
         || r[22] >= 1 << 47
     {
@@ -97,7 +100,15 @@ mod tests {
         apply_gregs(&mut ctx, &regs).unwrap();
         assert_eq!(ctx.rax, 99);
         assert_eq!(ctx.rflags & !FLAG_MASK, flags & !FLAG_MASK);
-        for (index, value) in [(17, 0), (20, 0), (21, 1 << 47), (22, !0), (23, 1)] {
+        for (index, value) in [
+            (17, 0),
+            (20, 0),
+            (16, 1 << 47),
+            (19, !0),
+            (21, 1 << 47),
+            (22, !0),
+            (23, 1),
+        ] {
             let mut bad = regs;
             bad[index] = value;
             assert!(apply_gregs(&mut ctx, &bad).is_err());

@@ -13,9 +13,14 @@ input does not partially commit a register image. GETREGSET uses native-word
 alignment, clamps its iovec length, and supports an empty transfer. Raw PEEK
 requests write the word through `data`, not the syscall return register.
 
-EFLAGS writes preserve privileged bits. FS/GS bases must be in the lower
+EFLAGS writes preserve privileged bits. RIP/RSP writes are restricted to the
+lower canonical user range: unlike Linux, this kernel has no bad-IRET fixup,
+so accepting a noncanonical return frame could fault after SWAPGS in ring 0.
+Such debugger inputs fail closed with EIO, without changing the image. This
+restriction remains until safe return-fault delivery is implemented.
+FS/GS bases must be in the lower
 canonical user range. CS/SS must match the kernel's ring-3 descriptors; nonzero
-legacy selectors are currently rejected (no user LDT/selector restore). This
+legacy selectors are currently rejected (the saved context does not yet restore those selectors). This
 is a documented limitation, not full Linux selector compatibility. Changes to
 `orig_rax` update or cancel only the interrupted-syscall restart candidate
 belonging to the stopped frame. Argument writes also replace replay arguments,
