@@ -480,9 +480,19 @@ fn poke_word(
     data: usize,
 ) -> AxResult<isize> {
     let memory = pinned_tracee_memory(target, session)?;
-    memory
-        .write_value(addr as *mut usize, data)
-        .map_err(|_| ptrace_io_error())?;
+    if memory.write_value(addr as *mut usize, data).is_ok() {
+        return Ok(0);
+    }
+    // Debugger text stores force a private executable COW copy, not a user
+    // writable/executable VMA. Reuse the existing instruction-patch primitive;
+    // shared and secret mappings fail its admission, never reach an inode write.
+    let mut aspace = memory.address_space().lock();
+    for (offset, byte) in data.to_ne_bytes().into_iter().enumerate() {
+        let address = addr.checked_add(offset).ok_or_else(ptrace_io_error)?;
+        aspace.private_executable_cow_patch_byte(axhal::mem::VirtAddr::from_usize(address), byte)
+            .map_err(|_| ptrace_io_error())?;
+    }
+
     Ok(0)
 }
 

@@ -347,7 +347,10 @@ CONTRACTS.update({"ptrace-stop-ready": ("raw-differential", "pass", "REPORT_PREC
 
 CONTRACTS.update({"ptrace-exec": ("raw-differential", "pass", "EVENT_LEGACY_AND_SEIZED_EXEC_PROTOCOL")})
 
+CONTRACTS.update({"ptrace-breakpoint": ("raw-differential", "pass", "PRIVATE_TEXT_PATCH_TRAP_STEP_AND_RESTORE")})
+
 PROGRAM_CASES = {
+    "ptrace-breakpoint": ("ptrace-breakpoint",),
     "ptrace-exec": ("ptrace-exec",),
     "ptrace-stop-ready": ("ptrace-stop-ready",),
     "ptrace-fork": ("ptrace-fork",),
@@ -426,6 +429,7 @@ PROGRAM_SUCCESS = {
     "ptrace-stop-ready": "THEKERNEL_PTRACE_STOP_READY_OK",
     "ptrace-fork": "THEKERNEL_PTRACE_FORK_OK",
     "ptrace-exec": "THEKERNEL_PTRACE_EXEC_OK",
+    "ptrace-breakpoint": "THEKERNEL_PTRACE_BREAKPOINT_OK",
     "ptrace-registers": "THEKERNEL_PTRACE_REGISTERS_DIFFERENTIAL_OK",
     "tty-job-control": "THEKERNEL_TTY_JOB_CONTROL_OK",
     "tty-termios": "THEKERNEL_TTY_TERMIOS_OK",

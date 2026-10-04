@@ -144,3 +144,23 @@ The paired regression execs the real ELF test program in all four option/seize
 combinations, inspects the new image's entry registers and siginfo, then confirms
 an actual pipe write and normal exit. Non-leader exec event IDs and thread-exact
 wait/exit handoff still require multithreaded debugger acceptance.
+
+## Software breakpoint stores
+
+POKETEXT/POKEDATA first use ordinary writable-memory admission. Protected text
+uses the common original private-executable COW patch primitive, shared with uprobes, while
+holding the selected address-space handle and preserving its RX user PTE policy.
+ELF loader backings do not carry syscall-mmap FileMapping metadata, so private
+COW admission includes them as well as private anonymous executable backings.
+Uprobes retain their stronger inode-binding admission before the same copy path.
+No writable/executable mprotect window is created. Shared mappings and secret
+backings cannot pass this admission, so neither inode cache nor another process's
+mapping becomes patched. As with Linux's remote copy, a fault can leave a copied
+prefix; an eight-byte store is not promised to be transactional across mappings.
+
+The paired regression inserts an actual INT3, verifies the trap's IP/siginfo,
+restores the instruction, single-steps it, and continues to normal exit. Parent
+text, a shared RX alias, and pread of the executable inode retain original bytes.
+A protected shared-alias write returns EIO. General FOLL_FORCE mutation of other
+protected private mappings and concurrent debugger/uprobe byte ownership remain
+limitations, not claims established by this executable-text test.
