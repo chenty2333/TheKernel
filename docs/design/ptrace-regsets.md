@@ -107,3 +107,27 @@ The paired readiness case uses 16 real seized tracees. It releases their handsha
 immediately after wait status, with no GETREGS/GETSIGINFO/PEEK inactivity barrier,
 and proves a pipe write stays absent until CONT and appears afterwards. This
 checks execution effects rather than merely observing ptrace return success.
+
+## Fork/vfork/clone stop publication
+
+Selected fork/vfork/clone options create an inherited relationship for a new
+process, not just a parent notification. Non-seized children get a bare SIGSTOP
+with the native inherited-signal siginfo; seized children get EVENT_STOP. The
+owner parks before its first user instruction (after CHILD_SETTID's schedule-tail
+publication). Child syscall resume mode starts empty, rather than inheriting the
+parent's SYSCALL/SYSEMU requests. CLONE_UNTRACED suppresses both inheritance and
+the parent event. Event choice uses the supplied exit signal: vfork has priority,
+then non-SIGCHLD clone, then fork; a disabled vfork event does not fall back to fork.
+
+Parent clone event stops publish the actual owner context after complete child
+publication and before entering the vfork-completion wait. This permits register
+inspection of a vfork parent without waiting for a child the debugger has parked.
+Stop provenance is cleared on leaving the owner wait, so an inherited SIGSTOP's
+synthetic info cannot leak into a later delivery stop.
+
+The paired portable case exercises fork, non-thread clone, vfork, UNTRACED and
+seized fork, checks a shared first-instruction side effect stays absent at the
+initial child stop, then follows an actual child write entry/exit and detaches it
+before exit. Full traced-child exit handoff/reaping, thread-exact relationships,
+exec option events and actual gdb/strace still need acceptance; this case does not
+claim those workflows are complete.

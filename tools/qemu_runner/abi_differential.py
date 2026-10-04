@@ -341,10 +341,13 @@ CONTRACTS.update({"ptrace-syscall": ("raw-differential", "pass", "ENTRY_EXIT_MUT
 
 CONTRACTS.update({"ptrace-step": ("raw-differential", "pass", "INSTRUCTION_SYSCALL_AND_EMULATION_STEPS")})
 
+CONTRACTS.update({"ptrace-fork": ("raw-differential", "pass", "AUTOMATIC_INHERITANCE_AND_INITIAL_CHILD_STOP")})
+
 CONTRACTS.update({"ptrace-stop-ready": ("raw-differential", "pass", "REPORT_PRECEDES_NO_FURTHER_USER_EFFECTS")})
 
 PROGRAM_CASES = {
     "ptrace-stop-ready": ("ptrace-stop-ready",),
+    "ptrace-fork": ("ptrace-fork",),
     "ptrace-step": ("ptrace-step",),
     "ptrace-syscall": ("ptrace-syscall",),
     "ptrace-listen": ("ptrace-listen",),
@@ -418,6 +421,7 @@ PROGRAM_SUCCESS = {
     "ptrace-syscall": "THEKERNEL_PTRACE_SYSCALL_OK",
     "ptrace-step": "THEKERNEL_PTRACE_STEP_OK",
     "ptrace-stop-ready": "THEKERNEL_PTRACE_STOP_READY_OK",
+    "ptrace-fork": "THEKERNEL_PTRACE_FORK_OK",
     "ptrace-registers": "THEKERNEL_PTRACE_REGISTERS_DIFFERENTIAL_OK",
     "tty-job-control": "THEKERNEL_TTY_JOB_CONTROL_OK",
     "tty-termios": "THEKERNEL_TTY_TERMIOS_OK",

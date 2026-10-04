@@ -663,7 +663,7 @@ fn ptrace_get_syscall_info(
     data: usize,
 ) -> AxResult<isize> {
     let regs = thread.ptrace_registers.lock().ok_or(AxError::NoSuchProcess)?;
-    let provenance = thread.ptrace_syscall_stop.load(core::sync::atomic::Ordering::Acquire);
+    let provenance = thread.ptrace_stop_provenance.load(core::sync::atomic::Ordering::Acquire);
     let op = thread.proc_data.current_stop_report().map_or(0, |stop| {
         crate::task::ptrace_runtime::syscall_info_operation(provenance, stop.ptrace_event)
     });
@@ -1110,7 +1110,7 @@ fn sys_ptrace_for_target(
         PTRACE_GETSIGINFO => {
             let session = check_inactive_tracee(&target)?;
             let info = target.ptrace_signal_info(session).or_else(|| {
-                crate::task::ptrace_runtime::syscall_stop_signal_info(target_thread)
+                crate::task::ptrace_runtime::synthetic_stop_signal_info(target_thread)
             }).ok_or_else(ptrace_io_error)?;
             tracer_memory
                 .write_value(data as *mut SignalInfo, info)

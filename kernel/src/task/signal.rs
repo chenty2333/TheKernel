@@ -1336,6 +1336,7 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
         }
     }
     if publish_registers {
+        thr.ptrace_stop_provenance.store(0, core::sync::atomic::Ordering::Release);
         let regs = thr.ptrace_registers.lock().take();
         if let Some(regs) = regs {
             // Apply only to a restart frame belonging to this original user
