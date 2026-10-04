@@ -1,0 +1,14 @@
+pub const DOORBELL: usize = 4;
+pub const ERST_SIZE: usize = 8;
+pub const ERST_BASE: usize = 0x10;
+pub const ERDP: usize = 0x18;
+pub const CONTROL: usize = 0x20;
+pub const PORT: usize = 0x28;
+pub const CONTEXT: usize = 0x30;
+pub const INFO1: usize = 0x38;
+pub const INFO2: usize = 0x3c;
+pub const ENABLE: u32 = 1 << 31;
+pub const RUN: u32 = 1;
+pub const RUN_CHANGE: u32 = 1 << 4;
+pub const HALT: u32 = (1 << 2) | (1 << 3);
+pub const PORT_CHANGES: u32 = (1 << 17) | (1 << 21) | (1 << 22) | (1 << 23);

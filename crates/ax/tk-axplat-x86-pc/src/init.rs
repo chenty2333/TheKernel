@@ -28,6 +28,7 @@ impl InitIf for InitIfImpl {
         // what makes the PCI bus driver's later read of `crate::pci` a plain
         // load instead of a second ACPI walk.
         crate::acpi::init_early();
+        crate::power::init_early();
         crate::mem::init_runtime_mmio();
         // Clock selection can consume HPET only after its ACPI address is retained.
         crate::time::init_early();
@@ -47,6 +48,7 @@ impl InitIf for InitIfImpl {
     /// platform configuration and initialization.
     fn init_later(cpu_id: usize, _arg: usize) {
         crate::apic::init_primary(cpu_id);
+        crate::console::report_uart();
         // Only now, with every IOAPIC pin masked, may COM1 assert its line.
         #[cfg(all(target_os = "none", feature = "irq"))]
         crate::console::enable_receive_interrupt();
@@ -64,6 +66,7 @@ impl InitIf for InitIfImpl {
         // does not exist yet at that point, and this is the last moment before
         // the PCI bus driver starts using the published base.
         crate::acpi::report();
+        crate::power::init_later();
         report_cpu_state(cpu_id);
     }
 

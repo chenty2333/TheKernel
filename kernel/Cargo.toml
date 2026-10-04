@@ -16,12 +16,15 @@ workspace = true
 [features]
 intel-hda = ["axfeat/driver-intel-hda"]
 nvme = ["axfeat/driver-nvme"]
+usb-dbc = ["axfeat/driver-usb-dbc", "axdriver/usb-dbc"]
+watchdog-itco = ["axfeat/driver-itco", "axdriver/itco"]
 bpf = ["dep:axbpf", "dep:tk-linux-bpf", "perf-sampling"]
 # The Intel i225/i226 (igc) work.  Selected by an explicit build flag rather
 # than by the platform profile, because the product's network device is
 # `virtio-net` and the two cannot both be the one static NIC type.
 net-n305 = ["axfeat/driver-n305-net"]
 net-rtl8125 = ["axfeat/driver-rtl8125"]
+net-rtl8168 = ["axfeat/driver-rtl8168"]
 net-igc = ["axfeat/driver-igc"]
 asid-fast-switch = ["axhal/asid-fast-switch"]
 hwp-uclamp = ["axhal/hwp-uclamp", "axruntime/ipi", "axtask/hwp-uclamp"]

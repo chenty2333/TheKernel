@@ -654,7 +654,9 @@ impl Device for EthernetDevice {
     }
 
     fn rx_poll_interval_micros(&self) -> Option<u64> {
-        (self.irq.is_none() && !self.quarantined).then_some(10_000)
+        if self.quarantined { None } else {
+            self.inner.rx_poll_interval_micros().or_else(|| self.irq.is_none().then_some(10_000))
+        }
     }
 
     fn set_primary_ipv4(&mut self, address: Ipv4Cidr) {
@@ -665,7 +667,11 @@ impl Device for EthernetDevice {
     }
 
     fn addresses(&self) -> alloc::vec::Vec<smoltcp::wire::IpCidr> {
-        vec![self.ip.into()]
+        if self.ip.address().is_unspecified() {
+            alloc::vec::Vec::new()
+        } else {
+            vec![self.ip.into()]
+        }
     }
 
     fn packet_capabilities(&self) -> PacketDeviceCapabilities {

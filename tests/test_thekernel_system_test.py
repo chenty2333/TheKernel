@@ -25,6 +25,17 @@ def load_product():
 
 
 class SystemTestGateTests(unittest.TestCase):
+    def test_usb_dbc_is_opt_in_and_has_separate_artifacts(self) -> None:
+        product = load_product()
+        variants = []
+        for flags in ([], ["--usb-dbc"]):
+            args = product.build_parser().parse_args(["build", "--platform", "n305", *flags])
+            variants.append(product.artifacts_for(args))
+        self.assertNotIn("usb-dbc", product.kernel_features(variants[0]).split())
+        self.assertIn("usb-dbc", product.kernel_features(variants[1]).split())
+        self.assertNotEqual(variants[0].output_dir, variants[1].output_dir)
+        self.assertNotEqual(variants[0].cargo_target_dir, variants[1].cargo_target_dir)
+
     def test_guest_tool_paths_match_installed_source_names(self) -> None:
         # Crate/package renames must not rename the independently installed C tools.
         installed = {f"thekernel-{path.stem}"
@@ -43,8 +54,8 @@ class SystemTestGateTests(unittest.TestCase):
             artifacts.append(product.Artifacts(Path("/unused"), product.parse_variant(args), args.profile))
         self.assertEqual(len({item.output_dir for item in artifacts}), 4)
         self.assertEqual(len({item.cargo_target_dir for item in artifacts}), 4)
-        self.assertEqual(product.kernel_features(artifacts[0]), "x86-product nvme intel-hda boot-shell")
-        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product nvme intel-hda boot-shell io-submit-batch")
+        self.assertEqual(product.kernel_features(artifacts[0]), "x86-product nvme intel-hda watchdog-itco boot-shell")
+        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product nvme intel-hda watchdog-itco boot-shell io-submit-batch")
         self.assertEqual(product.kernel_features(artifacts[2]), product.kernel_features(artifacts[3]))
         self.assertEqual(product.kernel_features(artifacts[3]).split().count("io-submit-batch"), 1)
 
@@ -57,9 +68,9 @@ class SystemTestGateTests(unittest.TestCase):
             artifacts.append(product.Artifacts(Path("/unused"), product.parse_variant(args), args.profile))
         self.assertEqual(len({item.output_dir for item in artifacts}), 4)
         self.assertEqual(len({item.cargo_target_dir for item in artifacts}), 4)
-        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product nvme intel-hda boot-shell io-notify-fastpath")
+        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product nvme intel-hda watchdog-itco boot-shell io-notify-fastpath")
         self.assertEqual(product.kernel_features(artifacts[3]),
-                         "x86-product nvme intel-hda boot-shell io-submit-batch io-notify-fastpath")
+                         "x86-product nvme intel-hda watchdog-itco boot-shell io-submit-batch io-notify-fastpath")
 
     def test_candidate_flags_cannot_replace_io_or_graphics_benchmark_baseline(self) -> None:
         product = load_product()
@@ -730,7 +741,7 @@ class SystemTestGateTests(unittest.TestCase):
         args = product.build_parser().parse_args(["build"])
         self.assertEqual(
             product.kernel_features(product.Artifacts(Path("state"), product.parse_variant(args))),
-            "x86-product nvme intel-hda",
+            "x86-product nvme intel-hda watchdog-itco",
         )
 
     def test_product_feature_combines_variant_features_without_repeating_baseline(self) -> None:
@@ -741,7 +752,7 @@ class SystemTestGateTests(unittest.TestCase):
 
         self.assertEqual(
             product.kernel_features(product.Artifacts(Path("state"), product.parse_variant(args), args.profile)),
-            "x86-product nvme intel-hda boot-shell asid-fast-switch",
+            "x86-product nvme intel-hda watchdog-itco boot-shell asid-fast-switch",
         )
 
     def test_product_defaults_and_compile_time_network_match_q35_gate(self) -> None:

@@ -3422,6 +3422,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
     }
 
     let mut root = DirMapping::new();
+    root.add("boot-progress",SimpleFile::new_regular(fs.clone(),||Ok(boot_progress_snapshot())));
     root.add(
         "stat",
         SimpleFile::new_regular(fs.clone(), || Ok(crate::task::cpu_stats::proc_stat())),
@@ -4781,5 +4782,33 @@ mod tests {
         writer.join().unwrap();
 
         assert_eq!(actual, expected);
+    }
+}
+
+/// Diagnostic snapshots are deliberately approximate and lock-free with
+/// respect to VT/fbcon/scheduler state; counters, not task-state proof.
+pub(crate) fn boot_progress_snapshot()->String {
+    use core::fmt::Write as _;
+    let mut out=String::new();
+    let stage=axruntime::boot_progress::stage();
+    let _=writeln!(out,"BOOT_PROGRESS enabled={} stage={}({})",axruntime::boot_progress::enabled(),stage,axruntime::boot_progress::Stage::name(stage));
+    for cpu in 0..axhal::cpu_num() {
+        if let Some(s)=axruntime::boot_progress::cpu(cpu) {
+            let _=writeln!(out,"cpu={} phase={} timer_irqs={} last_timer_ns={} screen_write={}/{} bytes={} present={}/{} log_records={} last_point={}",
+                cpu,s.phase,s.timers,s.last_ns,s.write_start,s.write_done,s.bytes,s.present_start,s.present_done,s.log_records,s.last_point);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod boot_progress_tests {
+    #[test]
+    fn diagnostic_file_has_bounded_cpu_and_scope_vocabulary() {
+        let text=super::boot_progress_snapshot();
+        assert!(text.starts_with("BOOT_PROGRESS enabled="));
+        assert!(text.contains("cpu=0 phase="));assert!(text.contains("timer_irqs="));
+        assert!(text.contains("screen_write="));assert!(text.contains("present="));
+        assert!(text.len()<8192); // x86 platform supports at most the configured CPU fleet.
     }
 }

@@ -199,6 +199,7 @@ class RunConfig:
     nvme_disk_mode: DriveMode = "rw"
     usb_disk: Path | None = None
     usb_disk_mode: DriveMode = "rw"
+    usb_boot: bool = False
     input_backend: str = "virtio"
     limits: RunLimits = RunLimits()
     interaction: Interaction = Interaction()
@@ -626,6 +627,7 @@ def run(
             extra_block=qemu_extra_block,
             usb_disk=qemu_usb_disk,
             nvme_disk=qemu_nvme_disk,
+            usb_boot=config.usb_boot,
             input_backend=config.input_backend,
             esp=qemu_esp,
             ovmf_code=qemu_ovmf_code,

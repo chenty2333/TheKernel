@@ -521,6 +521,8 @@ impl AllDevices {
         let mut usb_devices = alloc::vec::Vec::new();
         walk_reachable_pci_functions(&mut root, |root, bdf, dev_info| {
             debug!("PCI {bdf}: {dev_info}");
+            #[cfg(feature = "itco")]
+            crate::itco::probe(root, bdf, dev_info);
             if dev_info.header_type != HeaderType::Standard
                 || (dev_info.class == 0x03 && dev_info.vendor_id != 0x1af4)
             {
@@ -533,12 +535,17 @@ impl AllDevices {
                         && dev_info.subclass == 0x03
                         && dev_info.prog_if == 0x30
                     {
-                        if let Ok(BarInfo::Memory { address, .. }) = root.bar_info(bdf, 0) {
+                        if let Ok(BarInfo::Memory { address, size, .. }) = root.bar_info(bdf, 0) {
+                            let _ = size;
                             let mmio =
                                 axhal::mem::phys_to_virt((address as usize).into()).as_mut_ptr();
                             if let Some(mmio) = core::ptr::NonNull::new(mmio) {
                                 match crate::usb::probe(mmio) {
                                     Ok(devices) => {
+                                        #[cfg(feature = "usb-dbc")]
+                                        if let Ok(size) = usize::try_from(size) {
+                                            crate::dbc::probe(mmio.as_ptr() as usize, size);
+                                        }
                                         for device in devices {
                                             usb_devices.push(device);
                                         }

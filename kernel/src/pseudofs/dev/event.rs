@@ -478,6 +478,7 @@ impl EvdevDevice {
                 });
             }
         }
+        let input_source = super::tty::input_trace::InputSource::from_bus(state.device.device_id().bus_type);
         let grabbed = state.grab_owner.is_some();
         drop(state);
         // Key handling may switch seats (and pause this very device); never
@@ -485,13 +486,14 @@ impl EvdevDevice {
         if key_count != 0 {
             let mut keyboard = self.keyboard.lock();
             for &(code, value) in &keys[..key_count] {
-                if let Some(input) = super::tty::VT_MANAGER.keyboard_event(
+                if let Some(mut input) = super::tty::VT_MANAGER.keyboard_event(
                     &mut keyboard,
                     code,
                     value,
                     grabbed,
                     keyboard_target,
                 ) {
+                    input.source = input_source;
                     keyboard.queue_input(input);
                 }
             }

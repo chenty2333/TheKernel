@@ -31,6 +31,7 @@ use crate::{
 
 /// Initialize and run initproc.
 pub fn init(args: &[String], envs: &[String]) {
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::KernelInit);
     const INIT_PID: Pid = 1;
 
     crate::syscall::init_crash_kexec_hook();
@@ -320,9 +321,26 @@ pub fn init(args: &[String], envs: &[String]) {
 
     // Keep the init process user-visible as PID 1. Kernel-only alarm workers can
     // consume later scheduler task IDs without changing that ABI.
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::Pid1Published);
+    #[cfg(feature = "usb-dbc")]
+    crate::pseudofs::dev::tty::start_usb_debug_console();
+    if axruntime::boot_progress::enabled()
+        && let Err(error) = axtask::spawn_raw(
+            boot_progress_task, "boot_progress".into(), axconfig::TASK_STACK_SIZE,
+        )
+    {
+        warn!("boot-progress: observer unavailable: {error}");
+    }
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::AlarmStart);
     spawn_alarm_task().expect("Failed to start alarm workers");
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::AlarmDone);
+    if axhal::power::power_button_available()
+        && let Err(error) = spawn_power_button_task()
+    { warn!("acpi-power: deferred shutdown worker unavailable: {error}"); }
+
 
     // TODO: wait for all processes to finish
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::InitJoin);
     let exit_code = task.join().expect("Failed to join init task");
     if exit_code == 0 {
         info!("\x015Init exited normally; shutting down by boot-shell policy");
@@ -340,4 +358,40 @@ pub fn init(args: &[String], envs: &[String]) {
         .expect("Failed to flush rootfs");
 
     system_off();
+}
+
+/// IRQ handler only latches the event; sleeping, PID-1 notification and filesystem
+/// flush happen here, with neither an input lock nor a platform spinlock held.
+fn spawn_power_button_task() -> axerrno::AxResult<axtask::AxTaskRef> {
+    axtask::spawn_raw(|| {
+        loop {
+            if axhal::power::take_power_button_event() {
+                info!("acpi-power: power button; notifying init with SIGPWR");
+                let _ = crate::task::send_signal_to_process(1, Some(
+                    tk_linux_signal::SignalInfo::new_kernel(tk_linux_signal::Signo::SIGPWR)));
+                let _ = axtask::sleep(core::time::Duration::from_secs(1));
+                let mount = FS_CONTEXT.lock().root_dir().mountpoint().clone();
+                match mount.flush_all_filesystems() {
+                    Ok(()) => axruntime::klog::death_notice(format_args!("acpi-power: filesystems flushed; entering S5")),
+                    Err(error) => axruntime::klog::death_notice(format_args!("acpi-power: shutdown flush failed: {error}")),
+                }
+                system_off();
+            }
+            let _ = axtask::sleep(core::time::Duration::from_millis(50));
+        }
+    }, "acpi_power_button".into(), axconfig::TASK_STACK_SIZE)
+}
+
+/// Bounded opt-in observer. It reads only atomic progress; no screen/VT or
+/// scheduler snapshot locks, no recovery attempts and no framebuffer bypass.
+fn boot_progress_task() {
+    for _ in 0..12 {
+        let _=axtask::sleep(core::time::Duration::from_secs(5));
+        let snapshot=crate::pseudofs::proc::boot_progress_snapshot();
+        axhal::console::emergency_diagnostic_print(format_args!("{snapshot}"));
+        // Retained for dmesg/netconsole and a still-working screen mirror. If
+        // that screen itself is stuck this cannot repair it; DbC/serial is the
+        // independent output path, not an unsafe overwrite of active scanout.
+        warn!("\x013{snapshot}");
+    }
 }

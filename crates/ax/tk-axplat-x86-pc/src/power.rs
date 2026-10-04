@@ -1,4 +1,5 @@
 //! Power management.
+//! N305 SCI/S5 transitions are not validated on hardware; Q35 is the emulated test.
 
 use axplat::power::PowerIf;
 use x86_64::instructions::port::PortWriteOnly;
@@ -18,26 +19,7 @@ impl PowerIf for PowerImpl {
         crate::mp::start_secondary_cpu(cpu_id, pa!(stack_top_paddr))
     }
 
-    /// Power off the whole system.
-    ///
-    /// The register written below is an emulator affordance.  QEMU's PIIX4
-    /// (`pc`) and ICH9 (`q35`) southbridges decode PM1a_CNT at I/O port 0x604
-    /// when firmware assigned no other base, and there `SLP_EN` with a sleep
-    /// type of zero means S5 -- the same distinction spelled out in
-    /// `tools/nested/hello/hello.c`.  On a real machine firmware puts PM1a_CNT
-    /// wherever the FADT says, and the S5 encoding comes from the DSDT's `_S5`
-    /// object, which this kernel never evaluates; Linux reads both before it
-    /// even *offers* the method (`acpi_sleep_state_supported`,
-    /// drivers/acpi/sleep.c:87-96, gates the registration of `acpi_power_off`
-    /// at :1117-1126).  So on real hardware the write is ignored and the CPU
-    /// keeps running.
-    ///
-    /// Halting is the right thing to do then, and matches Linux when no
-    /// power-off handler is registered (`do_kernel_power_off`,
-    /// kernel/reboot.c:658-665 -- "Otherwise does nothing" -- falling through
-    /// to `machine_halt`).  What must not happen is silence, so the line after
-    /// the first `halt` says which method was tried and that the machine is
-    /// still powered.
+    /// Enter firmware-described S5, or retain the legacy safe fallback.
     fn system_off() -> ! {
         info!("Shutting down...");
 
@@ -56,7 +38,9 @@ impl PowerIf for PowerImpl {
             crate::console::flush_diagnostic();
             // SAFETY: 0x604 is a 16-bit I/O port.  A machine that does not
             // decode it drops the write, which is the case reported below.
-            unsafe { PortWriteOnly::new(0x604).write(0x2000u16) };
+            if !enter_s5() {
+                unsafe { PortWriteOnly::new(0x604).write(0x2000u16) };
+            }
         }
 
         axcpu::asm::halt();
@@ -64,8 +48,8 @@ impl PowerIf for PowerImpl {
         // kernel's panic exit path, where the logger may be the thing that is
         // already stuck.
         crate::console::emergency_diagnostic_print(format_args!(
-            "power-off: {} did not stop this CPU; this kernel evaluates no ACPI _S5 \
-             sequence, so the machine stays powered -- use its power button\n",
+            "power-off: {} did not stop this CPU; firmware S5 or legacy fallback did not \
+             complete, so the machine stays powered -- use its power button\n",
             if reboot_instead {
                 "the 8042 reset command on port 0x64"
             } else {
@@ -99,4 +83,190 @@ pub fn system_reset() -> ! {
     loop {
         axcpu::asm::halt();
     }
+}
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use kspin::SpinNoIrq;
+use x86_64::instructions::port::Port;
+
+use crate::acpi::sleep::{FixedPower, parse_fadt, sleep_types};
+
+static FIXED: SpinNoIrq<Option<FixedPower>> = SpinNoIrq::new(None);
+static S5: SpinNoIrq<Option<[u8; 2]>> = SpinNoIrq::new(None);
+static BUTTON: AtomicBool = AtomicBool::new(false);
+static BUTTON_READY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn init_early() {
+    let mut fixed = None;
+    crate::acpi::visit_tables(|table| {
+        if table.get(..4) == Some(b"FACP") {
+            fixed = parse_fadt(table);
+        }
+    });
+    let Some(fixed) = fixed else {
+        return;
+    };
+    let mut types = None;
+    if let Some((_, dsdt)) = crate::cpu::table_length_and_bytes(fixed.dsdt)
+        && dsdt.get(..4) == Some(b"DSDT")
+    {
+        types = sleep_types(&dsdt[36..]);
+    }
+    crate::acpi::visit_tables(|table| {
+        if table.get(..4) == Some(b"SSDT") && types.is_none() {
+            types = sleep_types(&table[36..]);
+        }
+    });
+    *S5.lock() = types;
+    *FIXED.lock() = Some(fixed);
+}
+
+/// Status is only latched/acknowledged here; no logging, sync or task signal in IRQ.
+#[cfg(feature = "irq")]
+fn sci_handler() {
+    if let Some(fixed) = *FIXED.lock() {
+        for port in [fixed.event_a, fixed.event_b] {
+            if port == 0 {
+                continue;
+            }
+            // SAFETY: validated FADT system-I/O block, handled as W1C status.
+            unsafe {
+                let status: u16 = Port::new(port).read();
+                let enable: u16 = Port::new(port + fixed.event_half).read();
+                if status & enable & (1 << 8) != 0 {
+                    PortWriteOnly::new(port).write(1u16 << 8);
+                    BUTTON.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn init_later() {
+    let Some(fixed) = *FIXED.lock() else {
+        warn!("acpi-power: no supported fixed FADT; retaining legacy power-off fallback");
+        return;
+    };
+    info!(
+        "acpi-power: SCI={} event={:#x} control={:#x} fixed-button={} S5={:?}",
+        fixed.sci,
+        fixed.event_a,
+        fixed.control_a,
+        fixed.fixed_button,
+        *S5.lock()
+    );
+    #[cfg(feature = "irq")]
+    let mut sci_low = true;
+    #[cfg(feature = "irq")]
+    if let Some(facts) = crate::cpu::apic_facts() {
+        if facts.io_apic_count != 1
+            || facts.io_apic_gsi_base != 0
+            || facts.override_total != facts.overrides().len()
+            || facts.overrides().iter().any(|r| {
+                r.source == fixed.sci
+                    && (r.bus != 0
+                        || r.gsi != u32::from(fixed.sci)
+                        || !matches!(r.flags, 0 | 0x0d | 0x0f))
+            })
+        {
+            warn!("acpi-power: unsupported SCI interrupt-source routing");
+            return;
+        }
+        if let Some(record) = facts.overrides().iter().find(|r| r.source == fixed.sci) {
+            sci_low = record.flags & 3 != 1;
+        }
+    } else {
+        return;
+    }
+    #[cfg(feature = "irq")]
+    if fixed.fixed_button && fixed.sci < 16 && S5.lock().is_some() {
+        // SAFETY: validated system-I/O PM1 control register. A firmware-specified
+        // enable command is used only if SCI_EN is absent; bounded readback.
+        unsafe {
+            let control: u16 = Port::new(fixed.control_a).read();
+            if control & 1 == 0 {
+                if fixed.smi == 0 || fixed.enable == 0 {
+                    return;
+                }
+                PortWriteOnly::new(fixed.smi).write(fixed.enable);
+                let mut enabled = false;
+                for _ in 0..1_000_000 {
+                    let value: u16 = Port::new(fixed.control_a).read();
+                    if value & 1 != 0 {
+                        enabled = true;
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                if !enabled {
+                    warn!("acpi-power: firmware did not enable SCI");
+                    return;
+                }
+            }
+            // This minimal fixed-event owner handles only PWRBTN. Other PM1
+            // sources are disabled instead of leaving an unacknowledged SCI.
+            for port in [fixed.event_a, fixed.event_b] {
+                if port != 0 {
+                    PortWriteOnly::new(port + fixed.event_half).write(0u16);
+                    PortWriteOnly::new(port).write(1u16 << 8);
+                }
+            }
+        }
+        let vector = usize::from(fixed.sci) + 0x20;
+        if !crate::apic::configure_sci(vector, sci_low)
+            || !axplat::irq::register(vector, sci_handler)
+        {
+            warn!("acpi-power: SCI routing/registration unavailable");
+            return;
+        }
+        // SAFETY: validated event enable ports, SCI handler registered first.
+        unsafe {
+            for port in [fixed.event_a, fixed.event_b] {
+                if port != 0 {
+                    PortWriteOnly::new(port + fixed.event_half).write(1u16 << 8);
+                }
+            }
+        }
+        BUTTON_READY.store(true, Ordering::Release);
+    }
+}
+/// Whether the fixed-button SCI path is enabled.
+pub fn power_button_available() -> bool {
+    BUTTON_READY.load(Ordering::Acquire)
+}
+/// Drain the one-bit coalesced power button event from a task, never IRQ context.
+pub fn take_power_button_event() -> bool {
+    BUTTON.swap(false, Ordering::AcqRel)
+}
+
+fn enter_s5() -> bool {
+    let fixed = *FIXED.lock();
+    let types = *S5.lock();
+    let (Some(fixed), Some(types)) = (fixed, types) else {
+        return false;
+    };
+    axcpu::asm::disable_irqs();
+    // SAFETY: early discovery validated both ports and literal sleep types.
+    // Preserve SCI_EN/reserved bits, first stage both sleep types without EN,
+    // then assert SLP_EN in each populated control block (ACPI 16.1.6).
+    unsafe {
+        let a: u16 = Port::new(fixed.control_a).read();
+        let a = (a & !0x3c00) | (u16::from(types[0]) << 10);
+        let b = if fixed.control_b != 0 {
+            let b: u16 = Port::new(fixed.control_b).read();
+            (b & !0x3c00) | (u16::from(types[1]) << 10)
+        } else {
+            0
+        };
+        PortWriteOnly::new(fixed.control_a).write(a);
+        if fixed.control_b != 0 {
+            PortWriteOnly::new(fixed.control_b).write(b);
+        }
+        PortWriteOnly::new(fixed.control_a).write(a | (1 << 13));
+        if fixed.control_b != 0 {
+            PortWriteOnly::new(fixed.control_b).write(b | (1 << 13));
+        }
+    }
+    true
 }

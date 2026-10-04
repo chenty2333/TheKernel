@@ -1,5 +1,6 @@
 pub(crate) mod fbcon;
 pub(crate) mod keyboard;
+pub(crate) mod input_trace;
 mod ntty;
 mod ptm;
 mod pts;
@@ -1607,5 +1608,50 @@ mod tests {
         drop(slave);
         drop(master);
         drain_all_description_cleanup();
+    }
+}
+
+/// Independent, bounded log-reader and ordinary active-VT input admission.
+/// No shared syslog cursor, no console/screen lock held during transport polling.
+#[cfg(feature = "usb-dbc")]
+pub(crate) fn start_usb_debug_console() {
+    if !axdriver::dbc::available() { return; }
+    if let Err(error) = axtask::spawn_raw(usb_debug_task, "usb_debug".into(), axconfig::TASK_STACK_SIZE) {
+        warn!("\x013usb-dbc: console worker unavailable: {error}; normal consoles unchanged");
+        return;
+    }
+    if let Err(error) = axtask::spawn_raw(usb_debug_input_task, "usb_debug_input".into(), axconfig::TASK_STACK_SIZE) {
+        warn!("\x013usb-dbc: input worker unavailable: {error}; debug log output remains available");
+    }
+}
+#[cfg(feature = "usb-dbc")]
+fn usb_debug_task() {
+    let mut cursor = 0u64;
+    let mut log_bytes = [0u8; 1024];
+    let mut reported_gap = false;
+    while axdriver::dbc::poll() {
+        if let Some((len, end)) = axruntime::klog::try_snapshot_into(cursor, &mut log_bytes, false) {
+            let start = end - len as u64;
+            let accepted = axdriver::dbc::try_write(&log_bytes[..len]);
+            if start > cursor && !reported_gap {
+                reported_gap = true;
+                warn!("\x013usb-dbc: log reader lost {} retained bytes; host slow/absent", start-cursor);
+            }
+            cursor = start + accepted as u64;
+        }
+        let _ = axtask::sleep(Duration::from_millis(2));
+    }
+}
+
+/// A blocked VT input route must not hold up the independent log/DMA worker.
+#[cfg(feature = "usb-dbc")]
+fn usb_debug_input_task() {
+    let mut input = [0u8; 128];
+    while axdriver::dbc::available() {
+        if axdriver::dbc::input_ready() {
+            let (len, stamp) = VT_MANAGER.read_console_input(&mut input, axdriver::dbc::read);
+            if len != 0 { let _ = VT_MANAGER.route_dbc_input(stamp, &input[..len]); }
+        }
+        let _ = axtask::sleep(Duration::from_millis(2));
     }
 }

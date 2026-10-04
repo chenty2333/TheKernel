@@ -194,6 +194,8 @@ class QmpCheckpoint:
     screenshot_color_blocks: tuple[QmpColorBlock, ...] = ()
     screenshot_text_cells: "QmpTextCells | None" = None
     pci_hotplug: tuple["QmpPciHotplug", ...] = ()
+    # Fixed-function ACPI button injection, never a host-forced shutdown.
+    powerdown: bool = False
     # When set, measure from immediately before QMP input submission until
     # the guest reports that the input-driven frame became visible.  The
     # controller appends the host-monotonic sample to the captured log.

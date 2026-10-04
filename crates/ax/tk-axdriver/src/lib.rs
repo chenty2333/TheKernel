@@ -630,3 +630,8 @@ mod hda;
 mod partition;
 #[cfg(feature = "shared-block")]
 pub use partition::discover_gpt_partitions;
+#[cfg(feature = "itco")]
+pub mod itco;
+
+#[cfg(feature = "usb-dbc")]
+pub mod dbc;

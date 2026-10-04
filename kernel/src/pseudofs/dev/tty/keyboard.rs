@@ -14,6 +14,7 @@ pub(crate) struct KeyboardTarget {
 /// the modifier/caps/hotkey state machine a second time.
 #[derive(Clone, Copy)]
 pub(crate) struct KeyboardInput {
+    pub(crate) source: super::input_trace::InputSource,
     pub(super) stamp: super::vt::ConsoleInputStamp,
     pub(super) bytes: [u8; 8],
     pub(super) len: usize,
@@ -295,6 +296,7 @@ mod tests {
                 panic!("text expected");
             };
             k.queue_input(KeyboardInput {
+                source: super::super::input_trace::InputSource::OtherEvdev,
                 stamp: Default::default(),
                 bytes,
                 len,
@@ -334,6 +336,7 @@ mod tests {
         k.prepare_batch(2).unwrap();
         for byte in [b'a', b'b'] {
             k.queue_input(KeyboardInput {
+                source: super::super::input_trace::InputSource::OtherEvdev,
                 stamp: Default::default(),
                 bytes: [byte; 8],
                 len: 1,

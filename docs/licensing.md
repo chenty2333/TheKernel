@@ -194,3 +194,11 @@ holds:
   TheKernel manifest and concludes fork; `docs/upstream-provenance.md` records
   the package as original, so the name and the provenance disagree and only one
   of them can be right.
+
+### Original DbC transport (2026-10-04)
+
+`tk-axdriver-dbc` is original Apache-2.0 Rust; the license text is
+`LICENSES/Apache-2.0.txt`. Linux debug VID/PID compatibility constants and Intel
+xHCI §7.6 register/DMA facts are not a copied driver implementation or license
+grant for a USB vendor identity. No Linux code/excerpts were added; no firmware
+blob is needed by DbC. See `docs/design/usb-dbc.md` for scope and references.

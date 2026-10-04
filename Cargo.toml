@@ -160,6 +160,8 @@ workspace = true
 [features]
 intel-hda = ["tk-kernel/intel-hda"]
 nvme = ["tk-kernel/nvme"]
+usb-dbc = ["tk-kernel/usb-dbc"]
+watchdog-itco = ["tk-kernel/watchdog-itco"]
 # `cargo build` is the shipped x86_64 product, not an accidental reduced
 # feature subset. Kernel/library host tests select their own manifests and
 # feature sets explicitly.
@@ -174,6 +176,7 @@ io-notify-fastpath = ["tk-kernel/io-notify-fastpath"]
 # device, so that verdict is the only end-to-end run the driver has.
 net-n305 = ["tk-kernel/net-n305"]
 net-rtl8125 = ["tk-kernel/net-rtl8125"]
+net-rtl8168 = ["tk-kernel/net-rtl8168"]
 net-igc = ["tk-kernel/net-igc"]
 # The shipped x86_64 product keeps its hardware-backed Linux ABI paths in one
 # explicit opt-in.  CET and cachestat have no feature gate: both are always

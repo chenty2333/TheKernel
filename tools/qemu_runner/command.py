@@ -80,6 +80,7 @@ def build_qemu_command(
     extra_block: Drive | None = None,
     nvme_disk: Drive | None = None,
     usb_disk: Drive | None = None,
+    usb_boot: bool = False,
     input_backend: str = "virtio",
     esp: Drive | None = None,
     ovmf_code: Path | None = None,
@@ -122,6 +123,8 @@ def build_qemu_command(
     if input_backend not in {"virtio", "usb"}:
         raise CommandError(f"unsupported input backend: {input_backend}")
     _validate_extra_args(extra_args)
+    if usb_boot and (arch != "x86_64" or usb_disk is None or rootfs is not None or direct_kernel):
+        raise CommandError("USB boot requires x86 UEFI, USB disk, and no other root drive")
     qemu_argv = [qemu_binary or "qemu-system-x86_64"]
     if arch == "x86_64":
         if direct_kernel:
@@ -155,8 +158,7 @@ def build_qemu_command(
                 f"if=pflash,format=raw,readonly=on,aio=threads,file={_escaped_path(ovmf_code)}",
                 "-drive",
                 f"if=pflash,format=raw,aio=threads,file={_escaped_path(ovmf_vars)}",
-                "-drive",
-                f"file={_escaped_path(esp.path)},if=ide,format=raw,snapshot=on,aio=threads",
+                *([] if usb_boot else ["-drive", f"file={_escaped_path(esp.path)},if=ide,format=raw,snapshot=on,aio=threads"]),
                 "-m",
                 memory,
                 "-smp",
@@ -215,7 +217,7 @@ def build_qemu_command(
         if usb_disk is not None:
             command.extend([
                 "-drive", drive_options(usb_disk.path, "usb-disk", mode=usb_disk.mode),
-                "-device", "usb-storage,id=usb-storage,bus=xhci.0,drive=usb-disk",
+                "-device", "usb-storage,id=usb-storage,bus=xhci.0,drive=usb-disk" + (",bootindex=1" if usb_boot else ""),
             ])
         if diagnostic_log_path is not None:
             command.extend([

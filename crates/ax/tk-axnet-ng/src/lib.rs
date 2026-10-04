@@ -22,6 +22,7 @@ extern crate std;
 
 mod buffer;
 mod consts;
+mod boot_ipv4;
 /// Datagram Congestion Control Protocol over raw IP.
 pub mod dccp;
 mod device;
@@ -130,7 +131,8 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> AxResult<Ar
         info!("  use NIC 0: {:?}", dev.device_name());
 
         let eth0_address = EthernetAddress(dev.mac_address().0);
-        let eth0_ip = Ipv4Cidr::new(IP.parse().expect("Invalid IPv4 address"), IP_PREFIX);
+        let config = boot_ipv4::parse(IP, GATEWAY, IP_PREFIX)?;
+        let eth0_ip = config.address.unwrap_or_else(|| Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0));
 
         let eth0_dev = router.try_add_device(Box::new(EthernetDevice::new(
             "eth0".to_owned(),
@@ -138,18 +140,24 @@ pub fn init_network(mut net_devs: AxDeviceContainer<AxNetDevice>) -> AxResult<Ar
             eth0_ip,
         )))?;
 
-        router.add_rule(Rule::new(
-            Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0).into(),
-            Some(GATEWAY.parse().expect("Invalid gateway address")),
-            eth0_dev,
-            eth0_ip.address().into(),
-        ));
+        if let Some(gateway) = config.gateway {
+            router.add_rule(Rule::new(
+                Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0).into(),
+                Some(gateway.into()),
+                eth0_dev,
+                eth0_ip.address().into(),
+            ));
+        }
 
         info!("eth0:");
         info!("  mac:  {eth0_address}");
-        info!("  ip:   {eth0_ip}");
+        if let Some(ip) = config.address {
+            info!("  ip:   {ip}");
+        } else {
+            info!("  IPv4 unconfigured: awaiting DHCP/manual address; no boot default route");
+        }
 
-        Some(eth0_ip)
+        config.address
     } else {
         warn!("  No network device found!");
         None

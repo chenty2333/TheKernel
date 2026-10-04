@@ -351,6 +351,15 @@ impl VtManager {
         stamp: ConsoleInputStamp,
         bytes: &[u8],
     ) -> AxResult<()> {
+        self.route_input_from(stamp, bytes, super::input_trace::InputSource::Serial)
+    }
+
+    #[cfg(feature = "usb-dbc")]
+    pub(super) fn route_dbc_input(&self, stamp: ConsoleInputStamp, bytes: &[u8]) -> AxResult<()> {
+        self.route_input_from(stamp, bytes, super::input_trace::InputSource::UsbDebug)
+    }
+
+    fn route_input_from(&self, stamp: ConsoleInputStamp, bytes: &[u8], source: super::input_trace::InputSource) -> AxResult<()> {
         let _route = self.route.lock();
         let state = self.state.lock();
         if state.active != stamp.vt || state.input_generation != stamp.route_generation {
@@ -364,6 +373,9 @@ impl VtManager {
         tty.ldisc
             .lock()
             .inject_input_at(bytes, stamp.flush_generation)?;
+        let reservation = super::input_trace::reserve(bytes.len());
+        drop(_route);
+        super::input_trace::accepted(reservation, source, stamp.vt, bytes);
         poll.wake();
         self.poll.wake();
         Ok(())
@@ -415,6 +427,7 @@ impl VtManager {
         match action {
             KeyAction::Bytes(bytes, len) => {
                 return Some(super::keyboard::KeyboardInput {
+                    source: super::input_trace::InputSource::OtherEvdev,
                     stamp: target.stamp,
                     bytes,
                     len,
@@ -442,7 +455,7 @@ impl VtManager {
         &self,
         input: &super::keyboard::KeyboardInput,
     ) -> AxResult<()> {
-        self.route_console_input(input.stamp, &input.bytes[..input.len])
+        self.route_input_from(input.stamp, &input.bytes[..input.len], input.source)
     }
 
     /// Observes the selected VT after dropping the state spin lock.
@@ -1157,6 +1170,8 @@ impl DeviceOps for VtDevice {
         // ttyN write belongs to ttyN, not the currently selected VT.
         let _ = offset;
         axhal::console::write_tty_bytes(buf);
+        #[cfg(feature = "usb-dbc")]
+        if number == VT_MANAGER.active() { axdriver::dbc::mirror_tty(buf); }
         super::fbcon::write(
             number,
             buf,
@@ -1563,6 +1578,24 @@ mod tests {
             .unwrap();
         assert_eq!(m.activate(2), Ok(None));
         assert_eq!(m.route_keyboard_input(&input), Err(AxError::Interrupted));
+    }
+
+    #[cfg(feature = "usb-dbc")]
+    #[test]
+    fn dbc_zero_byte_uses_vt_admission_and_stale_flush_is_rejected() {
+        let _context = crate::test_support::scheduler_test_context();
+        let m = VtManager::new();
+        let tty = m.active_tty().0;
+        let mut raw = tty.terminal.termios.lock().to_user_bytes();
+        raw[12..16].copy_from_slice(&0u32.to_ne_bytes());
+        *tty.terminal.termios.lock() = super::super::terminal::termios::Termios2::from_user_bytes(raw);
+        let mut bytes = [0u8; 1];
+        let (_, stale) = m.read_console_input(&mut bytes, |_| 1);
+        tty.ldisc.lock().flush_input().unwrap();
+        assert_eq!(m.route_dbc_input(stale, &bytes), Err(AxError::Interrupted));
+        let (_, fresh) = m.read_console_input(&mut bytes, |_| 1);
+        m.route_dbc_input(fresh, &bytes).unwrap();
+        assert_eq!(tty.ldisc.lock().readable_len(), 1);
     }
 
     #[test]

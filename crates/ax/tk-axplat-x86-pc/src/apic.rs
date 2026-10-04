@@ -96,7 +96,18 @@ pub fn set_enable(vector: usize, enabled: bool) {
 
 /// Configure only an admitted PCI INTx line as level-triggered, active-low.
 #[cfg(feature = "irq")]
-pub fn configure_pci_intx(vector: usize) -> bool {
+pub fn configure_pci_intx(vector: usize) -> bool { configure_level_line(vector, true) }
+
+/// SCI is always level-triggered; MADT can override its default low polarity.
+#[cfg(feature = "irq")]
+pub(crate) fn configure_sci(vector: usize, low_active: bool) -> bool {
+    configure_level_line(vector, low_active)
+}
+
+#[cfg(feature = "irq")]
+fn configure_level_line(vector: usize, low_active: bool) -> bool {
+    let electrical = IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE;
+    let wanted = IrqFlags::LEVEL_TRIGGERED | if low_active { IrqFlags::LOW_ACTIVE } else { IrqFlags::empty() };
     let Some(pin) = io_apic_pin(vector) else {
         return false;
     };
@@ -116,10 +127,7 @@ pub fn configure_pci_intx(vector: usize) -> bool {
         {
             return false;
         }
-        if entry
-            .flags()
-            .contains(IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE)
-        {
+        if entry.flags() & electrical == wanted {
             // Another device may already be using this shared line.
             return true;
         }
@@ -129,7 +137,7 @@ pub fn configure_pci_intx(vector: usize) -> bool {
             io_apic.disable_irq(pin);
         }
         entry.set_flags(entry.flags() | IrqFlags::MASKED);
-        set_pci_intx_flags(&mut entry);
+        set_level_flags(&mut entry, low_active);
         io_apic.set_table_entry(pin, entry);
         if !was_masked {
             io_apic.enable_irq(pin);
@@ -139,8 +147,15 @@ pub fn configure_pci_intx(vector: usize) -> bool {
 }
 
 #[cfg(any(feature = "irq", test))]
+fn set_level_flags(entry: &mut RedirectionTableEntry, low_active: bool) {
+    let mask = IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE;
+    let flags = IrqFlags::LEVEL_TRIGGERED | if low_active { IrqFlags::LOW_ACTIVE } else { IrqFlags::empty() };
+    entry.set_flags((entry.flags() & !mask) | flags);
+}
+
+#[cfg(test)]
 fn set_pci_intx_flags(entry: &mut RedirectionTableEntry) {
-    entry.set_flags(entry.flags() | IrqFlags::LEVEL_TRIGGERED | IrqFlags::LOW_ACTIVE);
+    set_level_flags(entry, true);
 }
 
 #[cfg(feature = "irq")]
@@ -750,5 +765,21 @@ mod msi_tests {
         assert_eq!(vectors.last(), Some(&0xee));
         assert!(super::msi_vectors(0xce).next().is_none());
         assert!(super::msi_vectors(u8::MAX).next().is_none());
+    }
+}
+#[cfg(test)]
+mod sci_tests {
+    use super::*;
+    #[test]
+    fn firmware_active_high_sci_clears_pci_polarity_preserving_mask_and_destination() {
+        let mut entry = RedirectionTableEntry::default();
+        entry.set_vector(0x29); entry.set_mode(IrqMode::Fixed); entry.set_dest(2);
+        entry.set_flags(IrqFlags::MASKED | IrqFlags::LOW_ACTIVE);
+        set_level_flags(&mut entry, false);
+        assert!(!entry.flags().contains(IrqFlags::LOW_ACTIVE));
+        assert!(entry.flags().contains(IrqFlags::MASKED | IrqFlags::LEVEL_TRIGGERED));
+        assert_eq!(entry.vector(), 0x29); assert_eq!(entry.dest(), 2);
+        set_level_flags(&mut entry, true);
+        assert!(entry.flags().contains(IrqFlags::LOW_ACTIVE | IrqFlags::LEVEL_TRIGGERED));
     }
 }

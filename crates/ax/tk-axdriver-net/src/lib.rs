@@ -77,4 +77,16 @@ pub trait NetDriverOps: BaseDriverOps {
     /// Allocate a memory buffer of a specified size for network transmission,
     /// returns [`DevResult`]
     fn alloc_tx_buffer(&mut self, size: usize) -> DevResult<NetBufPtr>;
+
+    /// Native drivers may retain a polling fallback even when IRQs are enabled.
+    fn rx_poll_interval_micros(&self) -> Option<u64> { None }
+
+    /// Optional firmware staged in rootfs, loaded before network publication.
+    fn firmware_path(&self) -> Option<&'static str> { None }
+    /// Apply validated runtime firmware while there are no packet borrowers.
+    fn load_firmware(&mut self, _bytes: &[u8]) -> DevResult { Err(DevError::Unsupported) }
+
 }
+
+#[cfg(feature = "rtl8125")]
+pub mod r8169;

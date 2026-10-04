@@ -101,6 +101,7 @@ def prepare(args: argparse.Namespace) -> None:
         write(overlay / "etc/apk/world", "alpine-base\nopenssl\nlinux-firmware-i915\nlinux-firmware-realtek\n")
         write(overlay / "etc/apk/repositories", f"http://{address}:{args.port}/apks/main\nhttp://{address}:{args.port}/apks/community\n")
         shutil.copyfile(REPO / "scripts/ci/n305-capture-payload.sh", overlay / "etc/n305-capture.sh")
+        shutil.copyfile(REPO / "scripts/ci/n305-capture-acpi.sh", overlay / "etc/n305-capture-acpi.sh")
         upload = f"http://{address}:{args.port}/upload/{token}"
         write(overlay / "etc/local.d/n305-capture.start", f'''#!/bin/sh
 export N305_CAPTURE_ROOT=/var/lib/n305-capture
@@ -123,6 +124,15 @@ sh /etc/n305-capture.sh > /dev/console 2>&1
             archive.add(overlay / "etc", arcname="etc")
         (http / "capture.apkovl.tar.gz").chmod(0o644)
     cfg = grub_config(args.mode, address, args.port, args.loglevel, args.gfxmode)
+    if getattr(args, "kernel_cmdline", None) is not None:
+        if args.mode != "kernel":
+            raise RuntimeError("--kernel-cmdline applies only to the TheKernel kernel mode")
+        import sys
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        from tools.kernel_cmdline import append_kernel_cmdline
+        cfg = append_kernel_cmdline(cfg, args.kernel_cmdline)
+
     write(out / "grub.cfg", cfg)
     maker = shutil.which("grub2-mkstandalone") or shutil.which("grub-mkstandalone")
     if not maker:
@@ -358,6 +368,7 @@ def main() -> None:
     prep.add_argument("--alpine-dir", type=Path, help="Alpine netboot directory with vmlinuz-lts/initramfs-lts/modloop-lts")
     prep.add_argument("--apks", type=Path, help="local signed APK repository, with APKINDEX.tar.gz")
     prep.add_argument("--loglevel", choices=("error", "warn", "info", "debug", "trace"), default="info")
+    prep.add_argument("--kernel-cmdline", help="kernel mode: append literal diagnostic arguments")
     prep.add_argument("--gfxmode", default="1920x1080x32,auto")
     serve = sub.add_parser("serve"); serve.add_argument("--out", type=Path, required=True)
     serve.add_argument("--bind", required=True)

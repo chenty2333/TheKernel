@@ -3237,6 +3237,7 @@ dependencies = [
  "tk-axalloc",
  "tk-axdriver-base",
  "tk-axdriver-block",
+ "tk-axdriver-dbc",
  "tk-axdriver-display",
  "tk-axdriver-hda",
  "tk-axdriver-input",
@@ -3245,6 +3246,7 @@ dependencies = [
  "tk-axdriver-pci",
  "tk-axdriver-virtio",
  "tk-axdriver-vsock",
+ "tk-axdriver-watchdog",
  "tk-axhal",
  "tk-axsync",
  "tk-axtask",
@@ -3263,6 +3265,10 @@ dependencies = [
  "simple-ahci",
  "tk-axdriver-base",
 ]
+
+[[package]]
+name = "tk-axdriver-dbc"
+version = "0.1.0"
 
 [[package]]
 name = "tk-axdriver-display"
@@ -3336,6 +3342,10 @@ dependencies = [
  "log",
  "tk-axdriver-base",
 ]
+
+[[package]]
+name = "tk-axdriver-watchdog"
+version = "0.1.0"
 
 [[package]]
 name = "tk-axexec"

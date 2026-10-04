@@ -374,6 +374,17 @@ if [ -n "$TOOLS_DIR" ]; then
     cp -a "$TOOLS_DIR/." "$STAGE/"
 fi
 
+# Firmware is optional rootfs data, never an ELF build input. Redistributors
+# must carry the Realtek notice next to the bytecode.
+if [ -n "${THEKERNEL_RTL8168_FIRMWARE_DIR:-}" ]; then
+    firmware_dir=$THEKERNEL_RTL8168_FIRMWARE_DIR
+    for name in rtl8168h-2.fw LICENSE.r8169; do
+        [ -f "$firmware_dir/$name" ] || { printf 'missing firmware input: %s/%s\n' "$firmware_dir" "$name" >&2; exit 1; }
+    done
+    install -d "$STAGE/lib/firmware/rtl_nic"
+    install -m 0644 "$firmware_dir/rtl8168h-2.fw" "$firmware_dir/LICENSE.r8169" "$STAGE/lib/firmware/rtl_nic/"
+fi
+
 "$SCRIPT_DIR/create-rootfs-image.sh" \
     --arch "$ARCH" --stage "$STAGE" --output "$IMAGE" --size-mb "$SIZE_MB" \
     --owner-mode "$ROOTFS_OWNER_MODE"

@@ -95,7 +95,9 @@ def parse_variant(args: argparse.Namespace) -> Variant:
                       io_submit_batch=getattr(args, "io_submit_batch", False),
                       io_notify_fastpath=getattr(args, "io_notify_fastpath", False),
                       net_igc=getattr(args, "net_igc", False),
-                      net_rtl8125=getattr(args, "net_rtl8125", False))
+                      net_rtl8125=getattr(args, "net_rtl8125", False),
+                      net_rtl8168=getattr(args, "net_rtl8168", False),
+                      usb_dbc=getattr(args, "usb_dbc", False))
     if variant.memory_bytes <= KERNEL_LOAD_PADDR:
         raise ProductError("--memory must extend beyond the 2 MiB kernel load address")
     if variant.memory_bytes > X86_64_MAX_MEMORY_BYTES:
@@ -166,8 +168,8 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
         # interactive COM1 terminal on any machine with a second port.
         "AX_LOG": os.environ.get("AX_LOG") or "info",
         "AX_BACKTRACE": os.environ.get("AX_BACKTRACE") or "n",
-        # QEMU user networking's fixed product subnet.  axnet-ng consumes
-        # these at compile time and rejects an absent address at boot.
+        # QEMU user networking defaults; the N305 target opts out below.
+        # axnet-ng consumes optional static configuration at compile time.
         "AX_IP": "10.0.2.15",
         "AX_GW": "10.0.2.2",
         "SMOLTCP_IFACE_MAX_ADDR_COUNT": "4",
@@ -180,6 +182,10 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
             part for part in (inherited_rustflags, target_rustflags) if part
         ),
     }
+    if artifacts.machine.name == "n305":
+        # Hardware must not inherit Slirp's address or gateway; DHCP/manual
+        # configuration owns this interface, including a no-router lease.
+        env.update({"AX_IP": "", "AX_GW": ""})
     # Cargo gives this variable precedence over RUSTFLAGS, including the
     # product's required linker script. Accept custom flags via RUSTFLAGS only.
     env.pop("CARGO_ENCODED_RUSTFLAGS", None)
@@ -268,6 +274,9 @@ def kernel_features(artifacts: Artifacts) -> str:
     features = [PRODUCT_FEATURE]
     features.append("nvme")
     features.append("intel-hda")
+    features.append("watchdog-itco")
+    if variant.usb_dbc:
+        features.append("usb-dbc")
     if artifacts.profile == "shell":
         features.append("boot-shell")
     if variant.asid_fast_switch:
@@ -282,6 +291,8 @@ def kernel_features(artifacts: Artifacts) -> str:
         features.append("net-igc")
     if variant.net_rtl8125:
         features.append("net-rtl8125")
+    if variant.net_rtl8168 or artifacts.machine.name == "n305":
+        features.append("net-rtl8168")
     if artifacts.machine.name == "n305" or (variant.net_igc and variant.net_rtl8125):
         features.append("net-n305")
     return " ".join(features)
@@ -539,6 +550,7 @@ class RunSpec:
     nvme_disk: Path | None = None
     kernel_args: str = ""
     usb_disk: Path | None = None
+    usb_boot: bool = False
     input_backend: str = "virtio"
     qemu_debug: str | None = None
     gdb: bool = False
@@ -565,10 +577,15 @@ class RunSpec:
     graphics_height: int = 600
     audio_device: str = "virtio"
     audio_backend: str | None = None
+    kernel_cmdline: str | None = None
+    qemu_extra_args: tuple[str, ...] = ()
+    powerdown_after_marker: str | None = None
 
 
 @isolated_run
 def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
+    if spec.usb_boot and (spec.usb_disk is None or spec.kernel_cmdline is not None):
+        raise ProductError("--usb-boot requires --usb-disk; boot arguments must be embedded in its GRUB config")
     try:
         selected_esp = artifacts.esp_for_rootfs_transport(spec.rootfs_transport)
     except ProductError:
@@ -638,27 +655,48 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
         if not command_path.is_file():
             raise ProductError(f"commands file does not exist: {command_path}")
     qmp = QmpControls()
-    if spec.qmp_screenshot is not None or spec.qmp_checkpoints:
+    if spec.qmp_screenshot is not None or spec.qmp_checkpoints or spec.powerdown_after_marker:
         qmp = QmpControls(
             socket=run_dir / "graphics-smoke.qmp",
-            screenshot=(None if spec.qmp_checkpoints else spec.qmp_screenshot.expanduser().resolve()),
+            screenshot=(spec.qmp_screenshot.expanduser().resolve() if spec.qmp_screenshot else None),
             screenshot_after_marker=(None if spec.qmp_checkpoints else spec.qmp_screenshot_after_marker),
             screenshot_size=(None if spec.qmp_checkpoints else spec.qmp_screenshot_size),
             screenshot_color_blocks=( () if spec.qmp_checkpoints else spec.qmp_screenshot_color_blocks),
             screenshot_text_cells=(None if spec.qmp_checkpoints else spec.qmp_screenshot_text_cells),
-            checkpoints=spec.qmp_checkpoints,
+            checkpoints=spec.qmp_checkpoints + ((QmpCheckpoint(input_after_marker=spec.powerdown_after_marker, powerdown=True),) if spec.powerdown_after_marker else ()),
             timeout_secs=spec.qmp_timeout_secs,
         )
+    if spec.kernel_cmdline is not None:
+        from tools.kernel_cmdline import append_kernel_cmdline
+        template_name = "grub.cfg" if spec.rootfs_transport == "module" else "grub-drive.cfg"
+        try:
+            grub_text = append_kernel_cmdline(
+                (REPO_ROOT / "config" / "x86_64" / template_name).read_text(), spec.kernel_cmdline)
+        except ValueError as error:
+            raise ProductError(str(error)) from error
+        grub_config = run_dir / "grub-cmdline.cfg"
+        grub_config.write_text(grub_text)
+        selected_esp = run_dir / "kernel-cmdline.esp"
+        esp_command = ["bash", str(REPO_ROOT / "scripts" / "build-x86-uefi-esp.sh"),
+                       "--kernel", str(artifacts.kernel), "--output", str(selected_esp),
+                       "--grub-config", str(grub_config)]
+        if spec.rootfs_transport == "module":
+            esp_command.extend(("--rootfs", str(selected_rootfs)))
+        else:
+            esp_command.extend(("--mode", "multiboot-drive"))
+        run_checked(esp_command, env=command_env(artifacts))
     result = run(
         RunConfig(
             arch="x86_64",
             kernel=artifacts.kernel,
-            rootfs=selected_rootfs,
+            rootfs=(None if spec.usb_boot else selected_rootfs),
             rootfs_transport=spec.rootfs_transport,
             esp=selected_esp,
             extra_block=spec.extra_block.expanduser().resolve() if spec.extra_block else None,
             nvme_disk=spec.nvme_disk.expanduser().resolve() if spec.nvme_disk else None,
             usb_disk=spec.usb_disk.expanduser().resolve() if spec.usb_disk else None,
+            usb_boot=spec.usb_boot,
+            usb_disk_mode=("snapshot" if spec.usb_boot else "rw"),
             input_backend=spec.input_backend,
             input_path=command_path,
             workdir=run_dir,
@@ -684,7 +722,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             extra_args=(("-d", spec.qemu_debug, "-D", str(run_dir / "qemu-debug.log"))
                         if spec.qemu_debug else ()) + (
                 ("-gdb", f"unix:{run_dir / 'gdb.sock'},server=on,wait=off",
-                 "-action", "reboot=shutdown,shutdown=pause,panic=pause") if spec.gdb else ()),
+                 "-action", "reboot=shutdown,shutdown=pause,panic=pause") if spec.gdb else ()) + spec.qemu_extra_args,
             qmp=qmp,
         ),
     )
@@ -877,6 +915,10 @@ def run_cmd(args: argparse.Namespace) -> int:
             graphics_height=height,
             audio_backend=getattr(args, "audio_backend", None),
             audio_device=getattr(args, "audio_device", "virtio"),
+            kernel_cmdline=getattr(args, "kernel_cmdline", None),
+            powerdown_after_marker=getattr(args,"powerdown_after_marker",None),
+            qmp_timeout_secs=args.timeout,
+            qemu_extra_args=(("-action", "reboot=reset", "-watchdog-action", "reset") if getattr(args,"allow_reboot",False) else ()),
             input_after_marker=input_after_marker,
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
@@ -884,6 +926,7 @@ def run_cmd(args: argparse.Namespace) -> int:
             nvme_disk=Path(args.nvme_disk) if args.nvme_disk else None,
             kernel_args=args.kernel_args,
             usb_disk=Path(args.usb_disk) if args.usb_disk else None,
+            usb_boot=getattr(args,"usb_boot",False),
             input_backend=args.input_backend,
             rootfs=rootfs,
             rootfs_transport=args.rootfs_transport,
@@ -1088,6 +1131,7 @@ def _run_fbcon_boot(args: argparse.Namespace, artifacts: Artifacts, directory: P
         artifacts,
         RunSpec(
             accel=args.accel,
+            kernel_cmdline=getattr(args, "kernel_cmdline", None),
             timeout=args.timeout,
             qemu_debug=getattr(args, "qemu_debug", None),
             workdir=directory,
@@ -1508,6 +1552,8 @@ def graphics_benchmark_cmd(args: argparse.Namespace) -> int:
 
 
 def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = True) -> None:
+    parser.add_argument("--usb-dbc", action="store_true",
+                        help="opt-in xHCI USB debug console (hardware unverified; QEMU has no DbC)")
     parser.add_argument("--smp", type=int, default=4)
     parser.add_argument("--memory", default="1G")
     parser.add_argument("--asid-fast-switch", action="store_true")
@@ -1518,6 +1564,7 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
     parser.add_argument("--io-notify-fastpath", action="store_true",
                         help="enable the experimental no-mark fanotify permission fast path in separate artifact paths")
     parser.add_argument("--net-rtl8125", action="store_true", help="build the unverified RTL8125B/BG polling driver")
+    parser.add_argument("--net-rtl8168", action="store_true", help="build the unverified RTL8168H family driver")
     parser.add_argument("--net-igc", action="store_true",
                         help="build the Intel i225/i226 (igc) NIC probe into the product kernel; "
                              "no QEMU machine has this device, so a boot exercises the "
@@ -1577,6 +1624,9 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--gdb", action="store_true",
                         help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")
     parser.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
+    parser.add_argument("--kernel-cmdline", help="append literal kernel arguments to a per-run GRUB config")
+    parser.add_argument("--powerdown-after-marker", help="inject the ACPI power button with QMP after a guest marker")
+    parser.add_argument("--allow-reboot", action="store_true", help="allow real VM reboots for watchdog/reset tests")
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--width", type=int, default=800, help="guest display width in pixels")
     parser.add_argument("--height", type=int, default=600, help="guest display height in pixels")
@@ -1595,6 +1645,7 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--extra-block")
     parser.add_argument("--nvme-disk", help="attach a disposable image as NVMe; guest writes remain disabled by default")
     parser.add_argument("--kernel-args", default="", help="explicit additional boot parameters in a run-local ESP copy")
+    parser.add_argument("--usb-boot", action="store_true", help="boot solely from --usb-disk (ESP and rootfs on USB); no SATA or VirtIO root")
     parser.add_argument("--usb-disk", help="attach an existing writable image as USB mass storage")
     parser.add_argument("--input-backend", choices=("virtio", "usb"), default="virtio",
                         help="select VirtIO input or xHCI USB keyboard and mouse")
@@ -1804,6 +1855,8 @@ def suite_default_timeout(suite: str) -> float:
 
 
 def test_cmd(args: argparse.Namespace) -> int:
+    if getattr(args, "kernel_cmdline", None) is not None and args.suite != "fbcon":
+        raise ProductError("test --kernel-cmdline is currently supported only for --suite fbcon")
     # `fbcon` is deliberately not part of `all`: it asserts on a firmware
     # framebuffer and therefore fixes the graphics profile and the screenshot
     # path, which the other suites select independently.  Run it as
@@ -2197,6 +2250,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="suite to run; fbcon requires --accel tcg (use graphics for KVM)",
     )
     test.add_argument("--run-cpus", type=int)
+    test.add_argument("--kernel-cmdline", help="fbcon only: append literal boot arguments")
     test.add_argument("--allow-skip", action="store_true")
     test.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
     test.add_argument("--gdb", action="store_true",

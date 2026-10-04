@@ -32,7 +32,7 @@ pub mod kexec;
 mod mem;
 pub mod pci;
 mod power;
-pub use power::system_reset;
+pub use power::{system_reset, power_button_available, take_power_button_event};
 mod time;
 
 pub use boot_info::{ColorField, FramebufferInfo, FramebufferRejection, ModuleInfo};

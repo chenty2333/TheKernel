@@ -104,6 +104,8 @@ class Variant:
     # it -- the only automated run this workstream has.
     net_igc: bool = False
     net_rtl8125: bool = False
+    net_rtl8168: bool = False
+    usb_dbc: bool = False
 
     @property
     def memory_bytes(self) -> int:
@@ -126,6 +128,10 @@ class Variant:
             suffix += "-net-igc"
         if self.net_rtl8125:
             suffix += "-net-rtl8125"
+        if self.net_rtl8168:
+            suffix += "-net-rtl8168"
+        if self.usb_dbc:
+            suffix += "-usb-dbc"
         return f"mem{self.memory.lower()}{suffix}"
 
 
@@ -463,4 +469,12 @@ def rootfs_fingerprint() -> str:
         digest.update(content)
     for name in ROOTFS_INPUT_ENV:
         digest.update(f"{name}={os.environ.get(name, '')}".encode())
+    firmware_dir = os.environ.get("THEKERNEL_RTL8168_FIRMWARE_DIR", "")
+    digest.update(f"rtl8168-firmware={firmware_dir}".encode())
+    if firmware_dir:
+        for name in ("rtl8168h-2.fw", "LICENSE.r8169"):
+            path = Path(firmware_dir) / name
+            if not path.is_file():
+                raise ProductError(f"missing firmware input: {path}")
+            digest.update(path.read_bytes())
     return digest.hexdigest()
