@@ -106,7 +106,21 @@ pub(crate) fn proc_stat() -> String {
         })
         .unwrap_or(epoch);
     append_boot_epoch(&mut output, epoch);
+    let running = super::proc_runnable_tasks();
+    append_scheduler_counts(
+        &mut output,
+        axtask::statistics::context_switches(),
+        axtask::statistics::task_publications(),
+        running,
+    );
     output
+}
+
+fn append_scheduler_counts(output: &mut String, switches: u64, publications: u64, running: usize) {
+    let _ = write!(
+        output,
+        "ctxt {switches}\nprocesses {publications}\nprocs_running {running}\n"
+    );
 }
 
 fn append_boot_epoch(output: &mut String, epoch: core::time::Duration) {
@@ -164,5 +178,12 @@ mod tests {
         let mut output = String::new();
         append_boot_epoch(&mut output, Duration::from_millis(1_000_950));
         assert_eq!(output, "btime 1000\n");
+    }
+
+    #[test]
+    fn scheduler_rows_have_linux_names_and_distinct_event_and_gauge_values() {
+        let mut output = String::new();
+        append_scheduler_counts(&mut output, 1234, 50, 3);
+        assert_eq!(output, "ctxt 1234\nprocesses 50\nprocs_running 3\n");
     }
 }

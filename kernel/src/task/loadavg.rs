@@ -27,6 +27,13 @@ static LOAD_5: AtomicU64 = AtomicU64::new(0);
 static LOAD_15: AtomicU64 = AtomicU64::new(0);
 static NR_UNINTERRUPTIBLE: AtomicUsize = AtomicUsize::new(0);
 
+/// Live runnable work, including kernel tasks and excluding idle tasks.
+pub(crate) fn proc_runnable_tasks() -> usize {
+    (0..axhal::cpu_num().min(MAX_CPU_NUM))
+        .filter_map(scheduler_load_snapshot)
+        .fold(0usize, |sum, load| sum.saturating_add(load.runnable_tasks()))
+}
+
 /// Records a transition into or out of the real D-state hint.  This counter
 /// is maintained at the state-transition point, not by allocating a task
 /// snapshot in the timer IRQ path.

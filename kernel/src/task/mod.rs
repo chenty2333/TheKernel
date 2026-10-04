@@ -9,6 +9,7 @@ mod exec_cred;
 mod futex;
 mod jobctl;
 mod loadavg;
+pub(crate) use loadavg::proc_runnable_tasks;
 mod ops;
 mod process;
 mod resources;

@@ -63,6 +63,7 @@ cfg_if::cfg_if! {
         #[cfg(feature = "scheduler-observer")]
         mod scheduler_observer;
         mod task;
+        pub mod statistics;
         mod api;
         mod wait_queue;
         pub mod event_listener;

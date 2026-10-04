@@ -247,3 +247,19 @@ statm 七个 4KiB 页字段来自实际 VMA/PTE、main ELF 元数据、现有 da
 lint（784 条既有 kernel 警告）、KVM guest59/59、ABI257/257 均通过；正常
 关机，真实 top/ps 输出已核对。设备树/连接表/zone/buddy 和负向 fault 统计
 仍待做，不能据此声称 B1 或容器支持全部完成。
+
+### Scheduler totals
+
+`/proc/stat` now publishes `ctxt`, `processes`, and `procs_running` from actual
+scheduler transitions, successful runnable-task publication, and lock-free
+ready/running non-idle snapshots. Per-CPU switch counters are cacheline isolated;
+no-op yields, failed reservations, and queue-only migrations are not counted as
+new switches/tasks. Initial unpublished boot/idle tasks are outside the
+publication counter. `procs_blocked` is still absent: Linux counts I/O wait, not
+all uninterruptible tasks; the existing D-state counter cannot substitute for it.
+
+Host tk-axtask139 and kernel2588 tests, lint, and full KVM guest60/60 passed
+(system-o6f3be00), with no guest skip and normal shutdown. The fork/pipe probe
+observed increased publication/switch totals. Real Alpine `vmstat 1 2` now reports
+nonzero context-switch rates and real runnable snapshots (shell-70ia2vsi);
+its missing blocked-I/O accounting remains unaccepted.

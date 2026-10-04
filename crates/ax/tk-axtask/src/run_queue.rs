@@ -1030,6 +1030,7 @@ impl PreparedTaskPublication {
             let result = scheduler.commit_reserved_task(reservation);
             let mut publication_claim_corrupt = false;
             if let Ok(task) = &result {
+                crate::statistics::account_publication();
                 // A reservation is deliberately invisible to the load model:
                 // it can still be cancelled without ever becoming runnable.
                 // Add its clamp only with the successful scheduler commit.
@@ -2215,7 +2216,9 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
         }
         #[cfg(feature = "smp")]
         task.set_cpu_id(run_queue.cpu_id as _);
-        run_queue.enqueue_task(task, EnqueueReason::New)
+        let result = run_queue.enqueue_task(task, EnqueueReason::New);
+        if result.is_ok() { crate::statistics::account_publication(); }
+        result
     }
 
     /// Unblock one task by inserting it into the run queue.
@@ -4076,6 +4079,8 @@ impl AxRunQueue {
             }
             return;
         }
+
+        crate::statistics::account_switch(self.cpu_id);
 
         #[cfg(feature = "sched-wake-locality")]
         if reason != SwitchReason::Block {
