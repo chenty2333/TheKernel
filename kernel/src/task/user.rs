@@ -116,6 +116,11 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     .map_err(map_usercopy_error);
             }
             while !thr.pending_exit() {
+                // Covers initial inherited stops and a new stop arriving while
+                // a prior value image is being retired. No user instruction
+                // follows a reportable image until a real resume opens the gate.
+                wait_if_stopped(thr, &mut uctx);
+                if thr.pending_exit() { break; }
                 // Cgroup/sysctl clamp writes commit their policy before
                 // attempting every live runqueue transaction. A task that
                 // was migrating during that bounded pass remains marked dirty

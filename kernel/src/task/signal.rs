@@ -82,6 +82,12 @@ pub(crate) fn apply_signal_context(context: &mut UserContext, signal: &SignalUse
 }
 
 fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData, code: u32, status: i32) {
+    if matches!(code, linux_raw_sys::general::CLD_TRAPPED | linux_raw_sys::general::CLD_STOPPED)
+        && proc_data.current_stop_report().is_some_and(|stop| stop.ptrace_session.is_some())
+        && (!proc_data.ptrace_stop_ready() || !proc_data.claim_ptrace_stop_notification())
+    {
+        return;
+    }
     let notify_pid = proc_data
         .ptrace_tracer()
         .or_else(|| proc_data.proc.parent().map(|parent| parent.pid()));
@@ -1297,6 +1303,10 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
             let image = axtask::snapshot_current_task_xsave().ok();
             let retired = core::mem::replace(&mut *thr.ptrace_xsave.lock(), image);
             drop(retired);
+            // Wake/report only after the user context is actually parked.
+            // Early request-side notification lets a waiter mutate memory
+            // while the tracee can still execute a syscall before stopping.
+            notify_ptrace_attach_stop(proc_data);
         }
     }
     while !thr.pending_exit()
@@ -1382,7 +1392,9 @@ fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
 }
 
 pub fn notify_ptrace_attach_stop(proc_data: &ProcessData) {
-    if let Some(stop) = proc_data.current_stop_report() {
+    if let Some(stop) = proc_data.current_stop_report()
+        && stop.ptrace_session.is_some()
+    {
         notify_tracer_or_parent_stop_continue(
             proc_data,
             linux_raw_sys::general::CLD_TRAPPED,

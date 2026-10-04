@@ -93,3 +93,17 @@ that no store occurred at that stop before stepping the next instruction.
 Hardware branch stepping (SINGLEBLOCK), hardware watchpoints and real gdb/strace
 acceptance remain pending. Existing relationship and stop storage is process-wide; multithreaded
 debugging requires task-exact stop/relationship semantics, not just registers.
+
+## Stop report readiness
+
+A stop request is not yet a reportable stopped context. Ptrace wait status and
+SIGCHLD notification require all owners' value-image publication. Owners notify
+after snapshotting, with one notification per stop. The top-of-user-loop gate
+also covers a new stop arriving while a prior image retires. Without this barrier,
+a waiter could release a shared-memory handshake after EVENT_STOP and let the
+tracee execute another syscall before its resume mode was installed.
+
+The paired readiness case uses 16 real seized tracees. It releases their handshake
+immediately after wait status, with no GETREGS/GETSIGINFO/PEEK inactivity barrier,
+and proves a pipe write stays absent until CONT and appears afterwards. This
+checks execution effects rather than merely observing ptrace return success.

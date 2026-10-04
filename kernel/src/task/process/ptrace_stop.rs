@@ -1,7 +1,43 @@
 //! Seized stop/listen/interrupt transitions; no user execution while listening.
 use super::*;
+use crate::task::AsThread;
+
+fn all_images_published(images: impl IntoIterator<Item = bool>) -> bool {
+    let mut saw_thread = false;
+    for ready in images {
+        saw_thread = true;
+        if !ready {
+            return false;
+        }
+    }
+    saw_thread
+}
 
 impl ProcessData {
+    /// A requested stop is not yet a waitable stop. Every owner must have
+    /// crossed its user boundary and published its value image first.
+    pub(crate) fn ptrace_stop_ready(&self) -> bool {
+        all_images_published(self.proc.thread_ids().map(|tid| {
+            super::super::get_task(tid).ok().is_some_and(|task| {
+                task.try_as_thread()
+                    .is_some_and(|thread| thread.ptrace_registers.lock().is_some())
+            })
+        }))
+    }
+
+    pub(crate) fn claim_ptrace_stop_notification(&self) -> bool {
+        let mut job = self.job_ctl.lock();
+        if job
+            .current_stop_report()
+            .is_none_or(|stop| stop.ptrace_session.is_none())
+            || job.stop_notified
+        {
+            return false;
+        }
+        job.stop_notified = true;
+        true
+    }
+
     /// Publish syscall provenance and the wait status in one generation.
     pub(crate) fn ptrace_syscall_stop(&self, session: PtraceSession, op: u8) -> Option<bool> {
         let mut control = self.ptrace_ctl.lock();
@@ -17,6 +53,7 @@ impl ProcessData {
         job.ptrace_event = 0;
         job.ptrace_session = Some(session);
         job.stop_reported = false;
+        job.stop_notified = false;
         job.continued = false;
         Some(good)
     }
@@ -38,6 +75,7 @@ impl ProcessData {
         if control.interrupt_pending {
             control.interrupt_pending = false;
             job.stop_reported = false;
+            job.stop_notified = false;
             return Ok(true);
         }
         control.listening = true;
@@ -61,6 +99,7 @@ impl ProcessData {
         job.ptrace_event = 128;
         job.ptrace_session = Some(session);
         job.stop_reported = false;
+        job.stop_notified = false;
         job.continued = false;
         true
     }
@@ -82,7 +121,22 @@ impl ProcessData {
         job.ptrace_event = 128;
         job.ptrace_session = Some(session);
         job.stop_reported = false;
+        job.stop_notified = false;
         job.continued = false;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::AsThread;
+    #[test]
+    fn a_requested_stop_is_not_reportable_until_all_owner_images_exist() {
+        assert!(!all_images_published([]));
+        assert!(!all_images_published([false]));
+        assert!(!all_images_published([true, false]));
+        assert!(all_images_published([true]));
+        assert!(all_images_published([true, true]));
     }
 }

@@ -2074,6 +2074,7 @@ pub(crate) fn try_ptrace_signal_stop(
         job_ctl.stop_kind = StopKind::Ptrace;
         job_ctl.ptrace_session = Some(session);
         job_ctl.stop_reported = false;
+        job_ctl.stop_notified = false;
         job_ctl.continued = false;
         *pending = Some(record);
         Ok(())
@@ -2221,6 +2222,7 @@ pub(crate) fn ptrace_stop(&self, session: PtraceSession, signo: u8) -> bool {
         job_ctl.stop_kind = StopKind::Ptrace;
         job_ctl.ptrace_session = Some(session);
         job_ctl.stop_reported = false;
+        job_ctl.stop_notified = false;
         job_ctl.continued = false;
         true
     }
@@ -2251,6 +2253,7 @@ pub(crate) fn ptrace_event_stop(
         job_ctl.stop_kind = StopKind::Ptrace;
         job_ctl.ptrace_session = Some(session);
         job_ctl.stop_reported = false;
+        job_ctl.stop_notified = false;
         job_ctl.continued = false;
         true
     }
@@ -2274,6 +2277,7 @@ pub(crate) fn ptrace_interrupt(&self, session: PtraceSession, signo: u8) -> Opti
         job_ctl.stop_kind = StopKind::Ptrace;
         job_ctl.ptrace_session = Some(session);
         job_ctl.stop_reported = false;
+        job_ctl.stop_notified = false;
         job_ctl.continued = false;
         Some(true)
     }
@@ -2474,6 +2478,7 @@ pub(crate) fn cgroup_freeze_complete(&self) -> bool {
         job_ctl.state = StopState::Stopped;
         if job_ctl.stop_kind != StopKind::Ptrace { job_ctl.ptrace_session = None; }
         job_ctl.stop_reported = false;
+        job_ctl.stop_notified = false;
         job_ctl.continued = false;
         true
     }
@@ -2523,8 +2528,9 @@ pub(crate) fn continue_job(&self) -> ContinueResult {
     /// `wait_consider_task()` decides stop visibility per waiter rather than
     /// once per task (`StopFilter`).
 pub(crate) fn peek_stop_status(&self, filter: StopFilter) -> Option<StopReport> {
-        let job_ctl = self.job_ctl.lock();
-        job_ctl.stop_report_for(filter)
+        let report = self.job_ctl.lock().stop_report_for(filter)?;
+        if report.ptrace_session.is_some() && !self.ptrace_stop_ready() { return None; }
+        Some(report)
     }
 
     /// Claims one already-selected stop report so a waiter can complete

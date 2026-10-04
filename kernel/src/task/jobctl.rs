@@ -112,6 +112,7 @@ pub(in crate::task) struct JobControlState {
     pub(in crate::task) ptrace_session: Option<PtraceSession>,
     pub(in crate::task) continued: bool,
     pub(in crate::task) stop_reported: bool,
+    pub(in crate::task) stop_notified: bool,
 }
 
 impl JobControlState {
@@ -165,6 +166,7 @@ impl Default for JobControlState {
             ptrace_session: None,
             continued: false,
             stop_reported: false,
+            stop_notified: false,
         }
     }
 }
@@ -417,6 +419,7 @@ mod tests {
             ptrace_session: Some(old),
             continued: false,
             stop_reported: false,
+            stop_notified: false,
         };
         assert!(job.is_ptrace_inactive_for(old));
         let old_report = job.stop_report_for(StopFilter::Session(old)).unwrap();
