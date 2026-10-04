@@ -843,7 +843,11 @@ pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     // or else the runner's rootfs image (vda), precedes any data image (vdb).
     // Do not infer root identity from capacity; a perfectly valid data disk
     // may be larger than the rootfs image.
-    let root_index = 0;
+    let root_index = if axhal::boot::command_line_value("root") == Some("usb") {
+        // Fail closed: never mount the first internal disk if USB-root discovery fails.
+        block_devs.iter().position(|dev| dev.device_name() == "USB rootfs")
+            .expect("root=usb requested but no validated USB GPT root partition was found")
+    } else { 0 };
     let dev = block_devs.remove(root_index);
     if axdriver::block_device_is_read_only(&dev) {
         init_filesystems_with_root_read_only(dev, block_devs);

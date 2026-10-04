@@ -3,6 +3,7 @@ mod dma;
 mod hid;
 mod hid_report;
 mod storage;
+mod root_partition;
 mod sync;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};

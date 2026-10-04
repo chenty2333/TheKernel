@@ -9,6 +9,8 @@ pub struct UsbBlock {
     state: Mutex<Storage>,
     blocks: u64,
     block_size: usize,
+    start: u64,
+    root_partition: bool,
 }
 struct Storage {
     host: Arc<Host>,
@@ -150,11 +152,38 @@ impl UsbBlock {
             last as u64 + 1,
             block_size
         );
-        Ok(Self {
+        let mut block = Self {
             state: Mutex::new(state),
             blocks: last as u64 + 1,
             block_size,
-        })
+            start: 0,
+            root_partition: false,
+        };
+        if axhal::boot::command_line_value("root") == Some("usb") {
+            if block_size != 512 {
+                return Err(DevError::Unsupported);
+            }
+            let mut bytes = [0u8; 512];
+            block.io(1, &mut bytes, true)?;
+            let header = super::root_partition::header(&bytes, block.blocks)?;
+            let mut entries = Vec::new();
+            let length = (header.count * 128).div_ceil(512) * 512;
+            entries
+                .try_reserve_exact(length)
+                .map_err(|_| DevError::NoMemory)?;
+            entries.resize(length, 0);
+            block.io(header.table, &mut entries, true)?;
+            let (start, blocks) =
+                super::root_partition::partition(header, &entries[..header.count * 128])?;
+            block.start = start;
+            block.blocks = blocks;
+            block.root_partition = true;
+            info!(
+                "USB rootfs: GPT start={} blocks={} (all filesystem I/O over USB BOT)",
+                start, blocks
+            );
+        }
+        Ok(block)
     }
     fn validate_range(&self, block: u64, length: usize) -> DevResult {
         if !length.is_multiple_of(self.block_size)
@@ -168,7 +197,12 @@ impl UsbBlock {
     }
     fn io(&mut self, block: u64, data: &mut [u8], input: bool) -> DevResult {
         self.validate_range(block, data.len())?;
-        let mut block = block;
+        let mut block = super::root_partition::physical(
+            self.start,
+            self.blocks,
+            block,
+            (data.len() / self.block_size) as u64,
+        )?;
         // Bounded requests avoid oversized xHCI transfer descriptors.
         for chunk in data.chunks_mut(64 * 1024) {
             let count = (chunk.len() / self.block_size) as u16;
@@ -184,7 +218,11 @@ impl UsbBlock {
 }
 impl BaseDriverOps for UsbBlock {
     fn device_name(&self) -> &str {
-        "USB mass storage"
+        if self.root_partition {
+            "USB rootfs"
+        } else {
+            "USB mass storage"
+        }
     }
     fn device_type(&self) -> DeviceType {
         DeviceType::Block

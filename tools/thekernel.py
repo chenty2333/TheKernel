@@ -539,6 +539,7 @@ class RunSpec:
     extra_block: Path | None
     run_cpus: int
     usb_disk: Path | None = None
+    usb_boot: bool = False
     input_backend: str = "virtio"
     qemu_debug: str | None = None
     gdb: bool = False
@@ -571,6 +572,8 @@ class RunSpec:
 
 @isolated_run
 def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
+    if spec.usb_boot and (spec.usb_disk is None or spec.kernel_cmdline is not None):
+        raise ProductError("--usb-boot requires --usb-disk; boot arguments must be embedded in its GRUB config")
     try:
         selected_esp = artifacts.esp_for_rootfs_transport(spec.rootfs_transport)
     except ProductError:
@@ -646,11 +649,13 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
         RunConfig(
             arch="x86_64",
             kernel=artifacts.kernel,
-            rootfs=selected_rootfs,
+            rootfs=(None if spec.usb_boot else selected_rootfs),
             rootfs_transport=spec.rootfs_transport,
             esp=selected_esp,
             extra_block=spec.extra_block.expanduser().resolve() if spec.extra_block else None,
             usb_disk=spec.usb_disk.expanduser().resolve() if spec.usb_disk else None,
+            usb_boot=spec.usb_boot,
+            usb_disk_mode=("snapshot" if spec.usb_boot else "rw"),
             input_backend=spec.input_backend,
             input_path=command_path,
             workdir=run_dir,
@@ -876,6 +881,7 @@ def run_cmd(args: argparse.Namespace) -> int:
             commands=Path(args.commands) if args.commands else None,
             extra_block=Path(args.extra_block) if args.extra_block else None,
             usb_disk=Path(args.usb_disk) if args.usb_disk else None,
+            usb_boot=getattr(args,"usb_boot",False),
             input_backend=args.input_backend,
             rootfs=rootfs,
             rootfs_transport=args.rootfs_transport,
@@ -1589,6 +1595,7 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--input-after-marker")
     parser.add_argument("--stop-after-marker")
     parser.add_argument("--extra-block")
+    parser.add_argument("--usb-boot", action="store_true", help="boot solely from --usb-disk (ESP and rootfs on USB); no SATA or VirtIO root")
     parser.add_argument("--usb-disk", help="attach an existing writable image as USB mass storage")
     parser.add_argument("--input-backend", choices=("virtio", "usb"), default="virtio",
                         help="select VirtIO input or xHCI USB keyboard and mouse")
