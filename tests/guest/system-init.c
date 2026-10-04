@@ -478,6 +478,12 @@ static int test_exec_mm_bounds(void) {
         NULL, "exec-mm-bounds-child");
 }
 
+static int test_netlink_dump_padding(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-netlink-dump-padding-smoke",
+        NULL, "netlink-dump-padding-child");
+}
+
 static int test_proc_net_route(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-proc-net-route-smoke",
@@ -1097,6 +1103,7 @@ static int run_init(int argc, char **argv) {
         { "block-inventory", test_block_inventory, 30 },
         { "pci-sysfs", test_pci_sysfs, 30 },
         { "proc-net-route", test_proc_net_route, 30 },
+        { "netlink-dump-padding", test_netlink_dump_padding, 30 },
         { "memory-pressure", test_memory_pressure_reclaim, 120 },
         { "process-exec", test_process_pipe_and_exec, 60 },
         { "vfork", test_vfork, 60 },

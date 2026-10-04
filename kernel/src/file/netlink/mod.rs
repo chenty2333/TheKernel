@@ -195,6 +195,17 @@ fn validate_netlink_frames(data: &[u8]) -> AxResult {
     Ok(())
 }
 
+/// Ordinary receiver framing differs from the exact-envelope uevent path
+/// and this implementation's transactional nfnetlink preflight.
+fn validate_protocol_frames(protocol: u32, data: &[u8]) -> AxResult<&[u8]> {
+    if matches!(protocol, NETLINK_ROUTE | NETLINK_SOCK_DIAG | NETLINK_GENERIC) {
+        Ok(&data[..framing::ordinary_prefix_len(data)])
+    } else {
+        validate_netlink_frames(data)?;
+        Ok(data)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct SockaddrNl {
@@ -703,6 +714,7 @@ static KOBJECT_UEVENT_SEND_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static NETLINK_NEXT_PORT_ID: AtomicU32 = AtomicU32::new(1);
 mod audit;
 mod diag;
+mod framing;
 mod nft;
 mod wiremsg;
 
@@ -1692,28 +1704,7 @@ impl NetlinkSocket {
             _ => return Err(AxError::OperationNotSupported),
         }
 
-        // Validate the complete datagram before dispatching its first
-        // mutation.  Otherwise a valid first route followed by a truncated
-        // second frame could change state and still be rejected only after
-        // the damage is done.
-        let mut preflight = 0usize;
-        while preflight < data.len() {
-            if data.len() - preflight < size_of::<NlMsgHdr>() {
-                return Err(AxError::InvalidInput);
-            }
-            let header = read_unaligned::<NlMsgHdr>(&data[preflight..])?;
-            let message_len = header.nlmsg_len as usize;
-            if message_len < size_of::<NlMsgHdr>() || preflight + message_len > data.len() {
-                return Err(AxError::InvalidInput);
-            }
-            let next = preflight
-                .checked_add(align4(message_len))
-                .ok_or(AxError::InvalidInput)?;
-            if next > data.len() && preflight + message_len != data.len() {
-                return Err(AxError::InvalidInput);
-            }
-            preflight = next.min(data.len());
-        }
+        let data = validate_protocol_frames(self.protocol, data)?;
 
         // nfnetlink batches are transactional.  Preserve the old namespace
         // graph before dispatch and restore it if any ACKed member fails; an
@@ -2166,7 +2157,7 @@ impl NetlinkSocket {
                 .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
             data.resize(len, 0);
             src.read_exact(&mut data)?;
-            validate_netlink_frames(&data)?;
+            validate_protocol_frames(self.protocol, &data)?;
             self.send_uevent_with_permit(
                 &mut permit,
                 &data,
@@ -2183,7 +2174,7 @@ impl NetlinkSocket {
             .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
         data.resize(len, 0);
         src.read_exact(&mut data)?;
-        validate_netlink_frames(&data)?;
+        validate_protocol_frames(self.protocol, &data)?;
         let mut permit = self.acquire_write_permit(nowait)?;
         self.send_uevent_with_permit(
             &mut permit,
@@ -3821,6 +3812,16 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_netlink_padding_does_not_weaken_transactional_or_uevent_framing() {
+        let bytes = [0u8; 16];
+        assert_eq!(validate_protocol_frames(NETLINK_ROUTE, &bytes).unwrap(), &[]);
+        assert_eq!(validate_protocol_frames(NETLINK_SOCK_DIAG, &bytes).unwrap(), &[]);
+        assert_eq!(validate_protocol_frames(NETLINK_GENERIC, &bytes).unwrap(), &[]);
+        assert_eq!(validate_protocol_frames(NETLINK_NETFILTER, &bytes), Err(AxError::InvalidInput));
+        assert_eq!(validate_protocol_frames(NETLINK_KOBJECT_UEVENT, &bytes), Err(AxError::InvalidInput));
+    }
+
+    #[test]
     fn write_rejects_usize_max_message_without_reading_source() {
         let _context = crate::test_support::scheduler_test_context();
         let socket = route_socket();
@@ -3858,11 +3859,9 @@ mod tests {
             reads: 0,
         };
 
-        // A zeroed datagram is structurally invalid, but it must clear the
-        // length admission and reach netlink parsing at the exact limit.
-        let error = socket.write_with_actor(&mut source, &actor, 1).unwrap_err();
-
-        assert_eq!(LinuxError::from(error), LinuxError::EINVAL);
+        // Length admission still imports exactly once. Linux's ordinary
+        // receiver then ignores a zero-length first header without dispatch.
+        assert_eq!(socket.write_with_actor(&mut source, &actor, 1).unwrap(), NETLINK_MAX_MESSAGE_BYTES);
         assert_eq!(source.remaining, 0);
         assert_eq!(source.reads, 1);
     }
@@ -5032,10 +5031,7 @@ mod tests {
             remaining: 400_000,
             reads: 0,
         };
-        assert_eq!(
-            LinuxError::from(socket.write_with_actor(&mut source, &actor, 1).unwrap_err()),
-            LinuxError::EINVAL
-        );
+        assert_eq!(socket.write_with_actor(&mut source, &actor, 1).unwrap(), 400_000);
         assert_eq!(source.remaining, 0);
     }
 

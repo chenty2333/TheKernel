@@ -411,3 +411,26 @@ RTM_GETROUTE request followed by a zeroed tail; examine Linux NLMSG_OK terminati
 rather than weakening tool validation. Socket tables/SNMP and active ss/netstat
 acceptance remain pending; current SOCK_DIAG retains identity but hardcodes
 unbound addresses/closed stream state, so an empty successful ss is not proof.
+
+### Netlink dump allocation padding
+
+The exact signed Alpine ip sends 156 bytes for a 36-byte RTM_GETROUTE request,
+followed by a zeroed allocation tail. Ordinary kernel netlink receiver framing
+now follows Linux NLMSG_OK termination: the first incomplete/invalid next header
+ends dispatch, including a short final alignment tail. Successful writes report
+the submitted length, not the trimmed prefix. The special uevent envelope and
+the current transactional nfnetlink preflight remain strict; no version-specific
+iproute2 workaround or new mutation fallback is introduced.
+
+The same padded C request succeeds on host Linux (read-only dump) and guest;
+host kernel2599, lint, KVM guest64/64 (system-ngy3ngg8), and full ABI257/257
+(abi-9xqnyodt) passed, with no guest skips and normal shutdown. Two old length-
+admission tests incorrectly assumed a zero header must later fail EINVAL; their
+EMSGSIZE/import-once assertions remain, while the verified parsing result is now
+an ignored message and successful byte count. Write/writev/sendto/sendmsg state
+notes were updated without changing progress counts.
+
+Real ip -4 route now receives/prints actual rows (shell-jh5z8xjc), but then reports
+`DONE truncated`/`Dump terminated`: the preexisting multipart completion has only
+a header, missing Linux's signed 32-bit completion status. This is a distinct
+next wire-format fix. Do not mark the real ip command fully accepted yet.
