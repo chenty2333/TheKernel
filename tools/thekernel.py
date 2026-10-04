@@ -167,8 +167,8 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
         # interactive COM1 terminal on any machine with a second port.
         "AX_LOG": os.environ.get("AX_LOG") or "info",
         "AX_BACKTRACE": os.environ.get("AX_BACKTRACE") or "n",
-        # QEMU user networking's fixed product subnet.  axnet-ng consumes
-        # these at compile time and rejects an absent address at boot.
+        # QEMU user networking defaults; the N305 target opts out below.
+        # axnet-ng consumes optional static configuration at compile time.
         "AX_IP": "10.0.2.15",
         "AX_GW": "10.0.2.2",
         "SMOLTCP_IFACE_MAX_ADDR_COUNT": "4",
@@ -181,6 +181,10 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
             part for part in (inherited_rustflags, target_rustflags) if part
         ),
     }
+    if artifacts.machine.name == "n305":
+        # Hardware must not inherit Slirp's address or gateway; DHCP/manual
+        # configuration owns this interface, including a no-router lease.
+        env.update({"AX_IP": "", "AX_GW": ""})
     # Cargo gives this variable precedence over RUSTFLAGS, including the
     # product's required linker script. Accept custom flags via RUSTFLAGS only.
     env.pop("CARGO_ENCODED_RUSTFLAGS", None)

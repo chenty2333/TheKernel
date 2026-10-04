@@ -3,11 +3,15 @@
 set -eu
 case "${1:-}" in
 bound|renew)
+    # DHCP owns this interface's addresses and lease routes. Dump-and-delete
+    # retains gateway/OIF and precedes changing the preferred source; a bare
+    # `del default` has neither. Flush old connected routes on lease changes
+    # too, but never routes on unrelated NICs.
+    ip -4 route flush dev "$interface"
     ip -4 addr flush dev "$interface"
     ip -4 addr add "$ip/${subnet:-255.255.255.0}" dev "$interface"
     ip link set "$interface" up
     ip -4 route replace "$ip/${subnet:-255.255.255.0}" dev "$interface" src "$ip"
-    ip -4 route del default 2>/dev/null || true
     if [ -n "${router:-}" ]; then
         set -- $router
         ip -4 route replace default via "$1" dev "$interface" src "$ip"

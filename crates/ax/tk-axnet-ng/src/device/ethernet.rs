@@ -667,7 +667,11 @@ impl Device for EthernetDevice {
     }
 
     fn addresses(&self) -> alloc::vec::Vec<smoltcp::wire::IpCidr> {
-        vec![self.ip.into()]
+        if self.ip.address().is_unspecified() {
+            alloc::vec::Vec::new()
+        } else {
+            vec![self.ip.into()]
+        }
     }
 
     fn packet_capabilities(&self) -> PacketDeviceCapabilities {

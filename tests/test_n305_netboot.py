@@ -15,6 +15,34 @@ from tools.n305_netboot import CaptureHandler, generate_session_scripts, grub_co
 ROOT = Path(__file__).resolve().parents[1]
 
 class NetbootTests(unittest.TestCase):
+    def test_n305_has_no_compile_time_slirp_address_or_default_gateway(self):
+        from tools import thekernel as product
+        parser=product.build_parser()
+        for platform,expected in [("n305",("","")),("q35-uefi",("10.0.2.15","10.0.2.2"))]:
+            artifacts=product.artifacts_for(parser.parse_args(["build","--platform",platform]))
+            env=product.command_env(artifacts)
+            self.assertEqual((env["AX_IP"],env["AX_GW"]),expected)
+
+    def test_lease_hook_flushes_scoped_defaults_before_replacing_source_address(self):
+        from tests.support import test_tmpdir
+        with test_tmpdir() as directory:
+            directory=Path(directory);log=directory/"calls";stub=directory/"ip"
+            stub.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n")
+            stub.chmod(0o755)
+            for router in ["","192.168.10.1 192.168.10.2"]:
+                log.write_text("")
+                result=subprocess.run(["sh",str(ROOT/"scripts/ci/n305-dhcp.script"),"bound"],
+                    env={**os.environ,"PATH":str(directory)+":"+os.environ["PATH"],"CALL_LOG":str(log),
+                         "interface":"eth0","ip":"192.168.10.15","subnet":"255.255.255.0","router":router},
+                    text=True,capture_output=True)
+                self.assertEqual(result.returncode,0,result.stderr)
+                calls=log.read_text().splitlines()
+                self.assertEqual(calls[0],"-4 route flush dev eth0")
+                self.assertTrue(calls[1].startswith("-4 addr flush"))
+                defaults=[c for c in calls if "route replace default" in c]
+                self.assertEqual(len(defaults),int(bool(router)))
+                if router:self.assertIn("via 192.168.10.1 dev eth0 src 192.168.10.15",defaults[0])
+
     def test_lease_hook_is_a_rootfs_cache_input(self):
         from tools.product_state import ROOTFS_INPUT_FILES
         self.assertIn("scripts/ci/n305-dhcp.script", ROOTFS_INPUT_FILES)
