@@ -707,13 +707,14 @@ fn preflight_mprotect_geometry(
     if length == 0 {
         return Ok(None);
     }
-    MmapProt::from_bits(prot).ok_or(AxError::InvalidInput)?;
     let length = checked_align_up_4k(length).ok_or(AxError::NoMemory)?;
     let start = VirtAddr::from(addr);
     let end = start.checked_add(length).ok_or(AxError::NoMemory)?;
     if end <= start {
         return Err(AxError::NoMemory);
     }
+    // Linux reports range overflow before validating prot bits.
+    MmapProt::from_bits(prot).ok_or(AxError::InvalidInput)?;
     Ok(Some((length, end)))
 }
 
@@ -4665,6 +4666,10 @@ mod tests {
         assert_eq!(
             preflight_mprotect_geometry(0x4000, PAGE_SIZE_4K, 1usize << 63),
             Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            preflight_mprotect_geometry(0x4000, usize::MAX - 0x1000, 1usize << 63),
+            Err(AxError::NoMemory)
         );
     }
 
