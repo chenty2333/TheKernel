@@ -14,7 +14,7 @@ class InspectPayloadTests(unittest.TestCase):
         self.assertEqual(selected_tool_payload('inspect'), 'inspect')
         self.assertEqual(rootfs_image_bytes('inspect'), 160 * 1024 * 1024)
         for name in ['scripts/build-inspect-payload.sh', 'config/inspect-apks.lock',
-                     'tests/guest/inspect-tools.sh']:
+                     'tests/guest/inspect-tools.sh', 'tests/guest/block-gpt-tools.sh']:
             self.assertIn(name, ROOTFS_INPUT_FILES)
 
     def test_exact_package_closure_has_required_real_tools(self):

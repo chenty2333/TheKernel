@@ -283,3 +283,25 @@ checks both aliases. Real Alpine `lsblk` now shows the 160MiB read-only boot dis
 mounted at `/`, rather than an empty inventory (shell-3xbtpov0). That guest has
 no NVMe GPT disk: the GPT parent/offset tests cover the host partition view and
 formatters, **not a real guest partition tree or physical NVMe**.
+
+Optional NVMe GPT acceptance now runs non-interactively using
+`tests/guest/block-gpt-tools.sh` in the inspect payload. A disposable 16MiB image
+under the state directory contains an 8192-sector partition at LBA2048. Actual
+Alpine lsblk reports the 16MiB parent and 4MiB child, including PKNAME and nested
+JSON children; sysfs class/dev aliases agree. The probe attempts a write only to
+that disposable QEMU partition, with the default `nvme.allow_write` still off:
+it must fail and the original sector must remain unchanged. Both success markers
+were observed (shell-vkfdw3ma), followed by normal shutdown. This is QEMU NVMe
+and GPT-tree acceptance, not physical NVMe evidence.
+
+The first probe incorrectly expected O_RDWR open itself to fail. Linux 7.2.3
+normal blkdev_open allows it; the stricter RO check in bdev_file_open_by_path is
+for an internal kernel helper, not that userspace path. The probe now checks the
+actual forbidden write. TheKernel's established RO write errno is EROFS, whereas
+Linux blkdev_write_iter returns EPERM; this acceptance tolerates either only to
+prove rejection, **not to claim errno ABI equivalence**.
+
+Fifteenth-commit cycle: full host Python655 (3 environmental skips) and Rust6006,
+q35/n305 lint (784 existing kernel warnings), latest-source default KVM guest61/61
+(system-mjc03spd) passed; no guest skips and normal shutdown. Inspect-payload
+build-input regression also passed (5 focused Python tests).

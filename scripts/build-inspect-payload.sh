@@ -106,6 +106,7 @@ for program in programs:
         shutil.copy2(source, bin_dir/program)
 shutil.copy2(lock, out/'opt/thekernel-tools/MANIFEST')
 shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/inspect-tools.sh', out/'opt/thekernel-tools/inspect-tools.sh')
+shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/block-gpt-tools.sh', out/'opt/thekernel-tools/block-gpt-tools.sh')
 PY
 # OUTPUT is a dedicated regenerable tool staging tree, not a source directory.
 # Refuse dangerous aliases before replacing it.
