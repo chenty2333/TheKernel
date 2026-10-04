@@ -37,6 +37,15 @@ int main(void) {
         if (bytes<256 || (unsigned)(config[0]|config[1]<<8)!=vendor ||
             (unsigned)(config[2]|config[3]<<8)!=device ||
             (unsigned)(config[9]|config[10]<<8|config[11]<<16)!=class_id) return fail("config-identity");
+        snprintf(path,sizeof(path),"/sys/bus/pci/devices/%s/irq",entry->d_name);
+        FILE *irq_file=fopen(path,"r"); unsigned irq;
+        if (!irq_file || fscanf(irq_file,"%u",&irq)!=1 || irq>=0xf0) return fail("irq-vector");
+        fclose(irq_file);
+        // All default Q35 PCI functions use disabled MSI or legacy INTx;
+        // primary MSI message selection is independently covered on the host.
+        unsigned expected_irq=config[0x3d] && config[0x3c]<0xd0 ? 0x20+config[0x3c] : 0;
+        if (irq!=expected_irq) return fail("irq-firmware-route");
+        snprintf(path,sizeof(path),"/sys/bus/pci/devices/%s/config",entry->d_name);
         if ((class_id >> 8)==0x0604) bridges++;
         if (retained_fd<0 && (config[14]&0x7f)==0) {
             snprintf(retained,sizeof(retained),"%s",path);

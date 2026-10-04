@@ -128,6 +128,39 @@ pub fn subsystem(address: Address, header: &[u8; 64]) -> Option<(u16, u16)> {
     };
     Some((value as u16, (value >> 16) as u16))
 }
+fn irq_with(
+    address: Address,
+    header: &[u8; 64],
+    mut read: impl FnMut(Address, usize) -> Option<u32>,
+) -> Option<u32> {
+    // Linux pci-sysfs irq_show uses the primary MSI IRQ when MSI is enabled,
+    // but retains legacy INTx for MSI-X. Read the actual message vector; do
+    // not mistake MSI-X table indices or the firmware line for an MSI IRQ.
+    if let Some(position) = capability_with(address, header, 5, &mut read) {
+        let control = (read(address, position)? >> 16) as u16;
+        if control & 1 != 0 {
+            let data_offset = position + if control & 0x80 != 0 { 12 } else { 8 };
+            if data_offset > 252 {
+                return None;
+            }
+            let vector = read(address, data_offset)? & 0xff;
+            return (0x20..0xf0).contains(&vector).then_some(vector);
+        }
+    }
+    // This is the established x86 platform IRQ namespace used by the PCI
+    // transports: firmware line/GSI plus the 32 architectural exceptions.
+    let line = u32::from(header[0x3c]);
+    if header[0x3d] == 0 || line >= 0xd0 {
+        Some(0)
+    } else {
+        Some(0x20 + line)
+    }
+}
+
+pub fn irq(address: Address) -> Option<u32> {
+    irq_with(address, &header(address)?, word)
+}
+
 fn config_size(address: Address, header: &[u8; 64]) -> usize {
     let host_bridge = header[11] == 6 && header[10] == 0;
     let express = capability(address, header, 0x10).is_some();
@@ -204,6 +237,57 @@ pub fn read_configuration(address: Address, offset: usize, output: &mut [u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn irq_selects_primary_msi_and_retains_intx_for_msix_or_disabled_msi() {
+        let address = Address::parse("0000:00:01.0").unwrap();
+        let mut header = [0; 64];
+        header[0x3c] = 11;
+        header[0x3d] = 1;
+        assert_eq!(
+            irq_with(address, &header, |_, _| panic!("no capabilities")),
+            Some(43)
+        );
+        header[0x3d] = 0;
+        assert_eq!(irq_with(address, &header, |_, _| None), Some(0));
+        header[0x3d] = 1;
+        header[0x3c] = 0xff;
+        assert_eq!(irq_with(address, &header, |_, _| None), Some(0));
+        header[0x3c] = 11;
+        header[6] = 0x10;
+        header[0x34] = 0x50;
+        assert_eq!(
+            irq_with(address, &header, |_, at| Some(match at {
+                0x50 => 0x00810005,
+                0x5c => 100,
+                _ => panic!("unexpected read"),
+            })),
+            Some(100)
+        );
+        assert_eq!(
+            irq_with(address, &header, |_, at| Some(match at {
+                0x50 => 0x00010005,
+                0x58 => 101,
+                _ => panic!("unexpected read"),
+            })),
+            Some(101)
+        );
+        assert_eq!(
+            irq_with(address, &header, |_, _| Some(0x00000005)),
+            Some(43)
+        );
+        assert_eq!(
+            irq_with(address, &header, |_, _| Some(0x80000011)),
+            Some(43)
+        );
+        assert_eq!(
+            irq_with(address, &header, |_, at| Some(if at == 0x50 {
+                0x00010005
+            } else {
+                0xf0
+            })),
+            None
+        );
+    }
     #[test]
     fn binary_reads_never_touch_bytes_outside_the_requested_interval() {
         let mut output = [0; 8];

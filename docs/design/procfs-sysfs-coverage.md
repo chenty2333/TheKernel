@@ -356,3 +356,25 @@ renders all three downstream buses (shell-ay4nlznj). Config/class failures and
 bogus ffff class output are gone. `-vvv` still reports missing IRQ/resource files;
 `-k` has no real driver binding links yet. Those are the next PCI sub-item, not
 accepted via the programs' exit statuses. Physical PCI/ECAM behavior is untested.
+
+PCI `irq` now follows the Linux MSI-versus-MSI-X selection rule: enabled MSI
+reports its actual primary message vector; MSI-X retains legacy INTx. Valid
+INTx firmware lines use the established TheKernel x86 GSI+0x20 vector namespace;
+no valid INTx reports 0. These are local CPU-vector identifiers, not Linux's
+dynamic logical IRQ numbers. Invalid/reserved enabled-MSI vectors are rejected,
+not fabricated. Host cases cover 32/64-bit MSI, disabled MSI, MSI-X and no route.
+
+Eighteenth-commit cycle: full host Python655 (3 environmental skips)+Rust6014,
+q35/n305 lint (784 existing kernel warnings), and KVM guest62/62 passed
+(system-qa8vmi60), with no guest skips and normal shutdown. The guest checks
+13 actual firmware INTx routes. Real lspci -vvv now shows valid IRQ vectors and
+no missing-irq errors (shell-3j95o27s); missing resources remain unaccepted.
+
+Resource acquisition gap: the existing startup code sizes ordinary endpoint
+BARs but does not retain the results; it does not size bridge BARs or expansion
+ROMs, and deliberately preserves the firmware GPU. Root-port BAR0 and the NIC
+ROM have real nonzero addresses in QEMU config. Their exact sizes cannot be
+derived from those addresses or MSI-X table offsets. Linux reads BAR masks by
+writing config registers; adding that to a sysfs read, or guessing a size, is
+not permitted. Capture existing probe results first; unknown firmware geometry
+must remain explicitly unresolved unless a safe admitted acquisition path exists.
