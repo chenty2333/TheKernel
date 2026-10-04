@@ -10,7 +10,8 @@ use tk_linux_signal::{SignalInfo, Signo};
 use super::{
     AsThread, TimerState, check_signals, do_exit, fail_closed_exit,
     force_rseq_fault_signal_current_thread, force_signal_current_thread, has_pending_fatal_signal,
-    has_pending_syscall_signal, set_timer_state, terminate_rseq_fault_current_thread, wait_if_stopped,
+    has_pending_syscall_signal, set_timer_state, terminate_rseq_fault_current_thread,
+    wait_if_stopped,
 };
 use crate::{
     mm::{
@@ -124,6 +125,8 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                 // `run_with_return_hook`; a Retry returns here with IRQs
                 // restored so task-context scheduling/fault handling can run
                 // before the next attempt.
+                thr.ptrace_orig_rax
+                    .store(u64::MAX, core::sync::atomic::Ordering::Release);
                 let reason = loop {
                     let aspace = thr.proc_data.aspace();
                     match uctx.run_with_return_hook(|uctx| {
@@ -179,7 +182,11 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                 set_timer_state(&curr, TimerState::Kernel);
 
                 match reason {
-                    ReturnReason::Syscall => handle_syscall(&mut uctx),
+                    ReturnReason::Syscall => {
+                        thr.ptrace_orig_rax
+                            .store(uctx.sysno() as u64, core::sync::atomic::Ordering::Release);
+                        handle_syscall(&mut uctx);
+                    }
                     ReturnReason::PageFault(addr, flags) => {
                         let aspace_handle = thr.proc_data.aspace();
                         let result =

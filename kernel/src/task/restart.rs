@@ -416,6 +416,17 @@ impl RestartTracker {
 }
 
 impl Thread {
+    pub(crate) fn ptrace_update_restart_sysno(&self, orig_rax: u64) {
+        let mut tracker = self.restart.lock();
+        if (orig_rax as i64) < 0 {
+            tracker.current_restart = None;
+            tracker.armed_restart_block = None;
+            tracker.restart_states.clear();
+        } else if let Some(state) = tracker.restart_states.last_mut() {
+            state.action.syscall.sysno = orig_rax as usize;
+        }
+    }
+
     pub(crate) fn enter_syscall(
         &self,
         uctx: &UserContext,

@@ -1267,6 +1267,17 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
     let proc_data = &thr.proc_data;
     let tid = linux_pid_from_task_id(current().id().as_u64())
         .unwrap_or_else(|error| fail_closed_exit(error));
+    let publish_registers = proc_data.should_wait_for_stop();
+    if publish_registers {
+        let mut regs = [0; super::registers::NUM_GREGS];
+        super::registers::fill_gregs(
+            uctx,
+            thr.ptrace_orig_rax
+                .load(core::sync::atomic::Ordering::Acquire),
+            &mut regs,
+        );
+        *thr.ptrace_registers.lock() = Some(regs);
+    }
     while !thr.pending_exit()
         && !proc_data.should_exit_for_exec(tid)
         && proc_data.should_wait_for_stop()
@@ -1291,6 +1302,19 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
         }) {
             Ok(()) => {}
             Err(_) => handle_stopped_interrupt(thr, uctx),
+        }
+    }
+    if publish_registers {
+        let regs = thr.ptrace_registers.lock().take();
+        if let Some(regs) = regs {
+            // Every debugger writer validates before committing this image.
+            super::registers::apply_gregs(uctx, &regs).expect("validated ptrace registers");
+            let old_orig = thr
+                .ptrace_orig_rax
+                .swap(regs[15], core::sync::atomic::Ordering::AcqRel);
+            if old_orig != regs[15] {
+                thr.ptrace_update_restart_sysno(regs[15]);
+            }
         }
     }
     // Thaw or terminal exit releases exactly the membership counted above.

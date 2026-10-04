@@ -1059,6 +1059,9 @@ impl Drop for TaskResourceAdmission {
 
 /// The inner data of a thread.
 pub struct Thread {
+    /// Published only while parked at a user-context stop boundary.
+    pub(crate) ptrace_registers: SpinNoIrq<Option<super::registers::GeneralRegisters>>,
+    pub(crate) ptrace_orig_rax: AtomicU64,
     /// The process data shared by all threads in the process.
     pub proc_data: Arc<ProcessData>,
 
@@ -1799,6 +1802,8 @@ impl Thread {
         // publication.
         let sem_undo = super::process::SemUndoState::try_new(namespaces.ipc())?;
         let thread = Box::try_new(Thread {
+            ptrace_registers: SpinNoIrq::new(None),
+            ptrace_orig_rax: AtomicU64::new(u64::MAX),
             signal,
             proc_data,
             namespaces: SpinNoIrq::new(namespaces),

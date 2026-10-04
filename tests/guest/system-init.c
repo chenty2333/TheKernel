@@ -745,6 +745,10 @@ static int test_epoll_membarrier_differential(void) {
         "--thekernel", "epoll-membarrier-differential-child");
 }
 
+static int test_ptrace_registers(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-registers", NULL, "ptrace-registers-child");
+}
+
 static int test_eventfd_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/eventfd-differential", NULL,
@@ -1038,6 +1042,7 @@ static int run_init(int argc, char **argv) {
         { "epoll", test_epoll_differential, 60 },
         { "epoll-membarrier", test_epoll_membarrier_differential, 60 },
         { "eventfd", test_eventfd_differential, 60 },
+        { "ptrace-registers", test_ptrace_registers, 60 },
         { "anon-fd-flags", test_anon_fd_flags, 20 },
         { "select", test_select, 20 },
         { "exit-status", test_exit_status, 20 },
