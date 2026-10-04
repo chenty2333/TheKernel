@@ -466,6 +466,12 @@ static int test_jit_mem(void) {
         "jit-mem-child");
 }
 
+static int test_proc_interrupts(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-proc-interrupts-smoke",
+        NULL, "proc-interrupts-child");
+}
+
 static int test_proc_inventory(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-proc-inventory-smoke",
@@ -1027,6 +1033,7 @@ static int run_init(int argc, char **argv) {
         { "sysv-shm", test_sysv_shm, 60 },
         { "procfs", test_procfs, 60 },
         { "proc-inventory", test_proc_inventory, 30 },
+        { "proc-interrupts", test_proc_interrupts, 30 },
         { "memory-pressure", test_memory_pressure_reclaim, 120 },
         { "process-exec", test_process_pipe_and_exec, 60 },
         { "vfork", test_vfork, 60 },

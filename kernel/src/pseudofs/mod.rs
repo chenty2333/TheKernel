@@ -12,6 +12,7 @@ pub(crate) mod hugetlb;
 pub(crate) mod mqueue;
 pub(crate) mod proc;
 mod proc_inventory;
+mod proc_interrupts;
 pub(crate) mod rpc_pipefs;
 pub(crate) mod sys;
 pub(crate) mod tmp;

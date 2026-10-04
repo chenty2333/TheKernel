@@ -1,7 +1,7 @@
 //! Cumulative CPU accounting sampled by the existing local scheduler tick.
 //!
 //! Unlike summing live processes, these counters retain exited-task time and
-//! include kernel-only workers. The four original procfs CPU fields are exposed;
+//! include kernel-only workers. The ten Linux procfs CPU fields are exposed;
 //! IRQ/softirq time is not split from system time, nor I/O wait from idle time.
 
 use alloc::string::String;
@@ -72,7 +72,9 @@ fn render(samples: &[[u64; 4]], hz: u64) -> String {
         for ticks in sample {
             let _ = write!(output, " {}", clock_ticks(*ticks, hz));
         }
-        output.push('\n');
+        // The remaining Linux fields are not separately accounted here:
+        // I/O wait is included in idle and IRQ execution in system time.
+        output.push_str(" 0 0 0 0 0 0\n");
     }
     output
 }
@@ -83,7 +85,29 @@ pub(crate) fn proc_stat() -> String {
     for (sample, cpu) in samples.iter_mut().zip(&CPU_TICKS).take(online) {
         *sample = cpu.snapshot();
     }
-    render(&samples[..online], axconfig::TICKS_PER_SEC as u64)
+    let mut output = render(&samples[..online], axconfig::TICKS_PER_SEC as u64);
+    let mut interrupts = [0u64; axhal::irq::statistics::VECTOR_COUNT];
+    for cpu in 0..online {
+        for (sum, count) in interrupts
+            .iter_mut()
+            .zip(axhal::irq::statistics::snapshot_cpu(cpu))
+        {
+            *sum = sum.saturating_add(count);
+        }
+    }
+    append_interrupt_totals(&mut output, &interrupts);
+    output
+}
+
+fn append_interrupt_totals(output: &mut String, interrupts: &[u64]) {
+    let total = interrupts
+        .iter()
+        .fold(0u64, |sum, count| sum.saturating_add(*count));
+    let _ = write!(output, "intr {total}");
+    for count in interrupts {
+        let _ = write!(output, " {count}");
+    }
+    output.push_str("\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n");
 }
 
 #[cfg(test)]
@@ -107,9 +131,16 @@ mod tests {
     fn proc_cpu_rows_use_user_hz_and_sum_before_rounding() {
         assert_eq!(
             render(&[[15, 5, 20, 30], [5, 5, 10, 20]], 1000),
-            "cpu 2 1 3 5\ncpu0 1 0 2 3\ncpu1 0 0 1 2\n"
+            "cpu 2 1 3 5 0 0 0 0 0 0\ncpu0 1 0 2 3 0 0 0 0 0 0\ncpu1 0 0 1 2 0 0 0 0 0 0\n"
         );
         assert_eq!(clock_ticks(250, 250), 100);
         assert_eq!(clock_ticks(u64::MAX, 100), u64::MAX);
+    }
+
+    #[test]
+    fn proc_stat_interrupt_total_sums_raw_vectors_not_ipi_reasons() {
+        let mut output = String::new();
+        append_interrupt_totals(&mut output, &[2, 0, 7]);
+        assert_eq!(output, "intr 9 2 0 7\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n");
     }
 }

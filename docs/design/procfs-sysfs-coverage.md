@@ -84,3 +84,33 @@ B1.2a 实测：两个新增主机测试通过，product lint 通过；完整 KVM
 53/53 通过，无跳过且正常关机，包含 `PROC_INVENTORY_OK filesystems=19
 loaded_modules=0`。第一次运行因 helper 误放在不被打包的目录而失败，修复
 打包路径并重新构建、完整重跑后才记录通过。这不是所有工具的验收。
+
+### B1.2b：中断观察
+
+在 axhal IRQ dispatcher 进入点记录当前 CPU 的 x86 vector：固定数组，每 CPU
+cacheline 对齐，单次 relaxed atomic 增量，无锁、无分配、无日志。包括外部
+INTx 和 MSI/MSI-X 实际到达的向量，未观察到的普通向量不输出。TheKernel
+的 IRQ 号就是 vector，**不是 Linux 动态分配的逻辑 IRQ 编号**。
+LOC/SPU 来自 LAPIC 向量；ERR 为所有 CPU 的实际 APIC error 总量。没有 NMI
+入口统计，不伪造 NMI 行。没有真实设备/处理器标签的普通行标记 x86-vector。
+
+单个原始 IPI vector 与多原因 broker 不等价：IPI 行是实际硬件到达次数；
+RES/CAL/TLB 是对应原因的实际分发次数，合并的请求不会被计成多次原始 IRQ。
+这些计数不会改动设备启用、路由、CPU 功耗策略或中断确认流程。
+
+softirqs 输出 Linux 的 10 个名称和每 CPU 列。内核**没有 Linux softirq
+执行机制**，已有网络轮询/定时器/延后任务在 hard IRQ 或 task context 执行，
+所以这十类软中断事件为零；不能用这些零推导没有网络活动或没有定时器。
+该节点不是引入 ksoftirqd，也不是已实现 Linux softirq 子系统的声明。
+
+同一向量观察还导出 `/proc/stat` 的 intr 总量/各向量字段；总量只加原始
+IRQ，不再加 IPI 原因，防止重复。CPU 行补为 Linux 的十字段形状：未单独
+跟踪的 iowait/irq/softirq/steal/guest/guest_nice 为 0；现有 idle/system
+仍包含无法细分的等待/中断时间。没有虚拟机 vCPU steal 或 guest time
+会计来源，不能把这些零当成性能证明。softirq 总量和十类事件也为 0。
+
+B1.2b 实测：完整 host 退出 0，650 个 Python 测试（3 个环境 skip）、5995 个
+Rust 测试通过（含 kernel 2580）；q35 和 n305 product lint 通过（各 785 条
+既有 kernel 警告）；最终源码的完整 KVM guest 54/54 通过、无 skip、正常
+关机。proc-interrupts 在 4 CPU guest 检查列数和真实 LOC 增长。MSI/MSI-X
+目前只验证统一向量计数路径的主机注入，**没有真机 MSI 验收**。

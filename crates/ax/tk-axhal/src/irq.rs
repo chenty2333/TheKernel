@@ -1,5 +1,7 @@
 //! Interrupt management.
 
+pub mod statistics;
+
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 #[cfg(feature = "ipi")]
@@ -527,6 +529,7 @@ fn ipi_broker_handler() {
     };
     let pending = mailbox.take();
     if visit_pending_reasons(pending, |reason| {
+        statistics::record_ipi_reason(cpu, reason.index());
         let handler = IPI_REASON_HANDLERS.handler(reason);
         if handler == 0 {
             crate::power::system_off();
@@ -663,6 +666,7 @@ pub fn register_irq_hook(hook: fn(usize)) -> bool {
 #[register_trap_handler(IRQ)]
 pub fn irq_handler(vector: usize) -> bool {
     let guard = kernel_guard::NoPreempt::new();
+    statistics::record_irq(crate::percpu::this_cpu_id(), vector);
 
     if let Some(irq) = handle(vector) {
         let hook = IRQ_HOOK.load(Ordering::SeqCst);
