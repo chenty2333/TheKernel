@@ -2,9 +2,13 @@
 
 Only main workspace `/home/ava/Desktop/TheKernel`. This is a **future user-run
 procedure**, not a record of physical validation. Do not touch A's worktree,
-services or network session. All three physical drivers are **未在硬件上验证**.
+services or network session. Midday physical results in
+`/home/ava/.cache/thekernel-targets/tier1-2026-10-04/HWTEST-2026-10-04.md`
+confirm the older polling NVMe read-only path and ALC269 codec/route enumeration.
+New MSI-X/GPT nodes, native ALSA playback, native modesetting and rollback remain
+**未在硬件上验证**.
 Do not write the internal BitLocker Windows NVMe. Do not enable GT writes.
-Native 1080p modesetting remains incomplete and must not be attempted yet.
+Native modesetting is an explicitly enabled, guarded hardware test; never enable it in the baseline.
 
 ## 1. Prepare, without host network changes
 
@@ -68,8 +72,10 @@ the kernel; the existing boot-module root/screen must remain usable.
 
 ## 3. Analog HDA output
 
-A's next Alpine capture should load the HDA driver and report the actual
-codec IDs/widget graph; subsystem `10ec:12ec` alone does not name the codec.
+The physical driver enumerated codec `10ec0269` (ALC269 family), with headphone
+pin `0x21` -> mixer `0x0c` -> DAC `0x02`. Keep generic widget enumeration; do not
+replace it with a hard-coded model route. Enumeration was verified, playback
+was not.
 In TheKernel:
 
 ```
@@ -100,39 +106,76 @@ If no route/node or drain fails, stop; the codec may require a board-specific
 quirk after actual enumeration. Do not substitute HDMI audio: HDMI depends on
 future native display power/link/ELD ownership.
 
-## 4. Intel snapshot and GT observations — no modeset
+## 4. Intel baseline and GT — read only
 
-Baseline guest:
+Boot without `intel.modeset=1` and inspect:
 
 ```
 cat /sys/kernel/debug/dri/0/intel_gpu
+dmesg | grep -i intel
 ```
 
-Expected: `8086:46d0`, unchanged 800x600 firmware console, read-only GT ACK
-observations. If GT is asleep, gated engine/fuse values are **unavailable**,
-not proof that BCS or media engines are absent. No forcewake is acquired.
+Expected: `8086:46d0`, original 800x600 console, no display writes. Midday GT
+reads found ACK_GT/RENDER/VDBOX0/VEBOX0 = 0 and BCS0_CTL unavailable with no
+forcewake, sample-stable=false. These are gated/unknown observations, **not**
+proof that the engines are absent. Do not write forcewake, GT reset, execlist,
+GuC/HuC or batch registers. BCS/GEM/GT work remains only the design/readonly probe.
 
-Only after the baseline is visible, a subsequent **diagnostic** boot may add
-`intel.modeset=1` to its external GRUB configuration. Current code must print
-**REFUSED**, capture known register candidates and perform **no display
-writes**; debugfs must say NOT a complete rollback. Screen remains the same
-firmware console. This is snapshot collection, **not** a 1080p test. Do not
-change the refusal gate on the machine.
+## 5. First recovery exercise — explicit modeset with an injected failure
 
-If the screen changes/disappears or init never appears, stop that attempt and
-return to the known-good boot configuration. A retained framebuffer pointer
-is not evidence of recovery. The existing HDMI capture workflow can establish
-whether scanout continues; QEMU/fake registers cannot answer that question.
+Use a fresh copied boot image/config, the known working capture/monitor and
+external kernel-log capture. Keep `nvme.allow_write` absent. Append:
 
-## 5. Separate future acceptance, not enabled by this change
+```
+intel.modeset=1 intel.modeset.fail_write=1
+```
 
-Finish full firmware PLL/PHY/DDI/transcoder/pipe/plane/power/CDCLK/GGTT rollback
-first. Obtain live EDID, attempt its advertised 1920x1080@60 mode only with an
-explicit parameter, and inject failure after each phase. Expected: either
-known 1080p pattern plus advancing counters, or restored firmware picture plus
-advancing counters and visible console updates. Compare physical capture,
-not just register equality. Follow `intel-firmware-rollback.md` before unlocking.
+Expected: admission either refuses **before all writes** (unsupported firmware
+pipe/port/calibration/clock/ownership), or the first plane write is deliberately
+refused and real restoration runs. The screen must return/stay at the original
+800x600 firmware console with readable, updating text. Log/debugfs must report
+`ROLLBACK_MMIO_VERIFIED`, original layout/live surface, advancing scanlines and
+restored PTEs. This label alone does not verify the monitor picture: confirm the
+actual console visibly, type commands, and compare the external capture.
 
-For GT, follow `intel-bcs-minimal.md`: owned forcewake/reset, mappings/context,
-no-op breadcrumb, then disposable BO copy/guard comparisons. No submission,
-GT firmware loading or GPU-copy benchmark belongs to the current session.
+If preflight refuses, it is not a modeset/rollback pass. Read the candidate
+before-image and refusal reason; do not bypass admission or substitute guessed
+PLL/PHY/power values. The supported path is one firmware primary on pipe A,
+combo HDMI/DVI A/B, an already reusable active PHY and a valid firmware-selected
+combo PLL/CDCLK. DP/Type-C, other active pipes, overlay/cursor and PHY
+recalibration are deliberately not attempted.
+
+If `ROLLBACK_FAILED`, missing picture, black screen, corrupted pitch or stopped
+console appears, stop physical acceptance. Use the external log to distinguish
+the original failure from recovery failure; do not claim success from register
+equality. Reboot using the **baseline** configuration with no modeset option.
+DMA is retained, no native console is published and no second modeset is tried.
+Do not issue GPU reset or enable GT/SSD writes as a workaround.
+
+## 6. Native 1080p60 and later rollback prefixes
+
+After the first recovery test succeeds visibly, boot the fresh configuration
+with only:
+
+```
+intel.modeset=1
+```
+
+Expected: live EDID advertises 1920x1080@60; selected mode log says
+1920x1080, 148500-kHz CEA timing when that exact descriptor is supplied; native
+color bars/marker followed by the working console at 1920x1080. `fbset -i` and
+the fixed linear DRM mode should reflect the selected geometry. Confirm the
+capture/monitor actually receives 1080p60, rows/pitch/colors are correct and
+console text updates. The saved dongle EDID is not a substitute for the currently
+attached sink. A scanline/SURFLIVE log without the visible pattern is not a pass.
+
+Record the reported forward write count. In separate boots repeat
+`intel.modeset=1 intel.modeset.fail_write=N` at later counts through power,
+PLL/PHY, pipe and the final plane-arm write. Each must restore the same visible
+800x600 console and pass the MMIO/PTE/progression contract. N past the last write
+is not an injected-failure test. Never enable automatic hotplug modesetting or
+GT submission for this session.
+
+Analog audio can be checked separately after either baseline or successful
+native boot. HDMI audio still requires coordinated display-power references,
+link/ELD availability and codec converter setup and is not an acceptance item.

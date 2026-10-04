@@ -3,8 +3,11 @@
 ## Facts, boundaries and references
 
 N305 is `8086:54c8`, class 0403 / interface 00; subsystem `10ec:12ec` is
-not a codec model identification. The driver reads codec vendor IDs and walks
-the widget graph, rather than guessing a Realtek model. **未在硬件上验证**.
+not a codec model identification. Midday physical testing subsequently
+identified `10ec0269` (ALC269 family), headphone route 0x21 -> 0x0c -> 0x02.
+The driver obtained it through generic widget enumeration, not a model guess.
+Codec/controller enumeration is physically verified; PCM/native ALSA playback
+and headphone waveform remain **未在硬件上验证**.
 
 Original Rust; consulted Intel HDA 1.0a §§3–7 (PDF/text under external refs/audio),
 Linux 7.2.3 `sound/hda/{controllers/intel.c,core/controller.c,common/codec.c,

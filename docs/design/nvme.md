@@ -108,3 +108,12 @@ debugfs extraction matches every byte independently. MSI-X completion wake
 was observed; forced polling passes the same RO/offset test. Parser/view host
 tests reject corrupt CRCs, overlaps, out-of-range I/O and RO writes. All target
 N305 behavior remains hardware-unverified.
+
+## Midday physical baseline (user-run, older integration)
+
+`HWTEST-2026-10-04.md` reports UMIS 1cc4:6a13, two polling I/O queues,
+read_only=true, blockdev RO=1 and capacity 512110190592 bytes. Protective MBR and
+GPT header reads passed with no data writes. This verifies the older base
+read-only path, **not** this continuation's MSI-X delivery or GPT partition
+nodes; those still need the next physical session. BitLocker Windows protection
+and the absent-by-default write-enable parameter remain unchanged.

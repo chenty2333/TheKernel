@@ -749,3 +749,17 @@ between a result and a guess.
 * **The register table's `PIPESTAT` access, and whether phase 4 clears the underrun bit**, is still
   a question for the coordinator rather than a decision this workstream can make. Until it is
   answered, §5.5's pre-sample is what the verdict has instead of a clean bit.
+
+## 2026-10-04 boot transaction supersedes the old no-rollback boundary
+
+The earlier raw-sequence failure discussion is historical. The product boot
+caller now uses `intel-firmware-rollback.md`'s guarded transaction when explicitly
+requested with `intel.modeset=1`, and default boot still writes nothing. It
+preserves reusable active PHY calibration/CDCLK, uses the firmware PLL route,
+corrects HDMI encoder-before-transcoder enable order, restores failures and
+checks original GGTT/layout/live scanout progression. General cold/DP/Type-C/
+multi-pipe modesetting remains refused before writes. The new checkpoint undo
+is the only exception to the GTT primitive's old no-unmap policy: changed
+consumers must be quiesced and DMA retained before exact before-image restoration.
+This implementation and its visible native picture/recovery remain unverified
+on physical hardware; model tests do not certify PLL/PHY/cache/monitor behavior.
