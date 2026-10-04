@@ -409,8 +409,24 @@ pub(crate) fn link_entry(interface: InterfaceInfo) -> LinkEntry {
     }
 }
 
+fn route_network_address(cidr: IpCidr) -> IpAddress {
+    match cidr {
+        IpCidr::Ipv4(cidr) => cidr.network().address().into(),
+        IpCidr::Ipv6(cidr) => {
+            let prefix = cidr.prefix_len();
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            Ipv6Address::from((u128::from_be_bytes(cidr.address().octets()) & mask).to_be_bytes())
+                .into()
+        }
+    }
+}
+
 pub(crate) fn route_entry(route: &RouteInfo) -> RouteEntry {
-    let destination = route.destination.address();
+    let destination = route_network_address(route.destination);
     let is_loopback = match destination {
         IpAddress::Ipv4(address) => address.is_loopback(),
         IpAddress::Ipv6(address) => address.is_loopback(),
@@ -460,13 +476,49 @@ pub(crate) fn align4(value: usize) -> usize {
 mod tests {
     use super::*;
     #[test]
+    fn route_dump_publishes_network_prefix_not_configured_host_bits() {
+        let route = RouteInfo {
+            destination: IpCidr::new(Ipv4Address::new(127, 0, 0, 1).into(), 8),
+            gateway: None,
+            interface_index: 1,
+            source: Ipv4Address::new(127, 0, 0, 1).into(),
+        };
+        let entry = route_entry(&route);
+        assert_eq!(entry.dst, [127, 0, 0, 0]);
+        assert_eq!(entry.dst_len, 8);
+        let address = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0xffff, 0xffff, 0xffff, 0xffff);
+        let network = route_network_address(IpCidr::new(address.into(), 65));
+        assert_eq!(
+            network,
+            Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0x8000, 0, 0, 0).into()
+        );
+        assert_eq!(
+            route_network_address(IpCidr::new(address.into(), 0)),
+            Ipv6Address::UNSPECIFIED.into()
+        );
+        assert_eq!(
+            route_network_address(IpCidr::new(address.into(), 128)),
+            address.into()
+        );
+    }
+
+    #[test]
     fn multipart_done_includes_status_and_preserves_request_identity() {
-        let request = NlMsgHdr {nlmsg_len:36,nlmsg_type:RTM_GETROUTE,nlmsg_flags:1|0x300,nlmsg_seq:31,nlmsg_pid:0};
-        let bytes=done_message(&request,77);
-        let header=read_unaligned::<NlMsgHdr>(&bytes).unwrap();
-        assert_eq!(bytes.len(),20);assert_eq!(header.nlmsg_len,20);
-        assert_eq!(header.nlmsg_type,NLMSG_DONE);assert_eq!(header.nlmsg_flags,NLM_F_MULTI);
-        assert_eq!(header.nlmsg_seq,31);assert_eq!(header.nlmsg_pid,77);
-        assert_eq!(i32::from_ne_bytes(bytes[16..20].try_into().unwrap()),0);
+        let request = NlMsgHdr {
+            nlmsg_len: 36,
+            nlmsg_type: RTM_GETROUTE,
+            nlmsg_flags: 1 | 0x300,
+            nlmsg_seq: 31,
+            nlmsg_pid: 0,
+        };
+        let bytes = done_message(&request, 77);
+        let header = read_unaligned::<NlMsgHdr>(&bytes).unwrap();
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(header.nlmsg_len, 20);
+        assert_eq!(header.nlmsg_type, NLMSG_DONE);
+        assert_eq!(header.nlmsg_flags, NLM_F_MULTI);
+        assert_eq!(header.nlmsg_seq, 31);
+        assert_eq!(header.nlmsg_pid, 77);
+        assert_eq!(i32::from_ne_bytes(bytes[16..20].try_into().unwrap()), 0);
     }
 }

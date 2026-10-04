@@ -451,3 +451,12 @@ q35/n305 lint (784 existing kernel warnings), KVM guest64/64 (system-p838_dz4),
 and full ABI257/257 (abi-ej44bbkj) passed, with no guest skips and normal shutdown.
 Read/readv/recvfrom/recvmsg state descriptions now mention the status payload;
 progress counts remain unchanged. No physical acceptance or performance claim.
+
+Route dump destination prefixes now exclude configured host bits for both IP
+families; this only fixes serialization, not routing state or lookup. Host tests
+cover IPv4, non-byte IPv6 prefixes, and /0,/128 boundaries. The guest parses
+actual RTA_DST values and rejects host bits. Kernel2601, lint, guest64/64
+(system-slewxdie), and ABI257/257 (abi-hjsd4mfs) passed with normal shutdown and
+no guest skips. Real ip -4 route and netstat -rn now agree on 127.0.0.0/8 and the
+actual default gateway (shell-rzzrswu8). Socket tables/real ss snapshots remain
+unimplemented; this is route-view acceptance only.

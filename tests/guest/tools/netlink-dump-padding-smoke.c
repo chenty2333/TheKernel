@@ -40,7 +40,24 @@ int main(void) {
                 if (status) return 8;
                 done=1;
             }
-            if (msg->nlmsg_type==RTM_NEWROUTE) rows++;
+            if (msg->nlmsg_type==RTM_NEWROUTE) {
+                if (msg->nlmsg_len<NLMSG_LENGTH(sizeof(struct rtmsg))) return 9;
+                struct rtmsg *entry=NLMSG_DATA(msg);
+                int attrlen=RTM_PAYLOAD(msg);
+                for (struct rtattr *attr=RTM_RTA(entry);RTA_OK(attr,attrlen);attr=RTA_NEXT(attr,attrlen)) {
+                    if (attr->rta_type==RTA_DST && entry->rtm_family==AF_INET && RTA_PAYLOAD(attr)==4) {
+                        const unsigned char *address=RTA_DATA(attr);
+                        unsigned prefix=entry->rtm_dst_len;
+                        for (unsigned byte=0;byte<4;byte++) {
+                            unsigned used=prefix>byte*8 ? prefix-byte*8 : 0;
+                            if (used>8) used=8;
+                            unsigned mask=used ? (0xff << (8-used))&0xff : 0;
+                            if (address[byte]&~mask) return 10;
+                        }
+                    }
+                }
+                rows++;
+            }
         }
     }
     close(fd);
