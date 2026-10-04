@@ -354,7 +354,7 @@ fn the_plan_log_carries_the_reference_the_dividers_and_the_symbol_rate() {
 /// write that commits them (`[I915]` `display/intel_ddi.c:1140-1179` and
 /// `:1218-1229`).
 #[test]
-fn the_write_order_is_the_sequence_the_reference_states() {
+fn the_write_order_enables_hdmi_encoder_before_cpu_transcoder() {
     let regs = ready_mock();
     let plan = target_plan();
     program(&regs, &plan).expect("the mock's status bits all behave");
@@ -395,8 +395,8 @@ fn the_write_order_is_the_sequence_the_reference_states() {
             // 5.4, 5.5, 5.6, 5.7.
             "TRANS_CLK_SEL(A)",
             "TRANS_DDI_FUNC_CTL(A)",
-            "PIPECONF_A",
             "DDI_BUF_CTL(A)",
+            "PIPECONF_A",
         ]
     );
 }
@@ -941,8 +941,8 @@ fn the_phy_b_write_order_is_the_sequence_with_b_registers() {
             // values is B's, and the buffer is B's.
             "TRANS_CLK_SEL(A)",
             "TRANS_DDI_FUNC_CTL(A)",
-            "PIPECONF_A",
             "DDI_BUF_CTL(B)",
+            "PIPECONF_A",
         ]
     );
     assert_eq!(state.ddi, Ddi::B);

@@ -1274,6 +1274,7 @@ pub(crate) const fn ddi_buf_ctl_register(ddi: Ddi) -> Option<Register> {
 /// its own memory could not be run twice against the same buffer, which is what
 /// a repaint needs.
 pub(crate) struct ModeRequest<'a> {
+    pub(crate) pll_id: u8,
     /// The DDI the monitor answered on -- `sink.rs`'s `Pin::ddi()` is the
     /// authority for which physical port that is (§11 phase 2.3).
     pub(crate) ddi: Ddi,
@@ -1314,6 +1315,7 @@ impl<'a> ModeRequest<'a> {
         encoding: PllFieldEncoding,
     ) -> Self {
         Self {
+            pll_id: ddi.index() as u8,
             ddi,
             pipe,
             plan,
@@ -1574,10 +1576,9 @@ pub(crate) fn preflight_mode<R: Registers>(
 /// exactly the misreading this order avoids.
 ///
 /// A failure at any write stops the sequence and is reported in full: a mode
-/// that was half programmed is not a mode.  Nothing is unwound, and the design
-/// document argues why (§4.2 of `docs/design/intel-modeset.md`): the failure's
-/// own signature on the panel is the primary diagnostic on a machine with no
-/// serial port, and there is no saved firmware state to restore.
+/// that was half programmed is not a mode. This primitive returns errors to
+/// its caller rather than owning rollback: the boot transaction restores the
+/// original firmware state before reporting a failure.
 ///
 /// It allocates nothing, enables no interrupt, and writes no register outside
 /// the two programs it computed.
@@ -1619,6 +1620,7 @@ pub(crate) fn set_mode<R: Registers, T: PollTimer>(
     let platform_ref_khz =
         output::read_platform_reference_khz(regs).map_err(ModesetError::Output)?;
     let mut output_request = OutputRequest::hdmi(request.ddi, mode, request.encoding);
+    output_request.pll_id = request.pll_id;
     output_request.link_rate = request.link_rate;
     if let Some(swing) = request.swing {
         output_request = output_request.with_swing(swing);

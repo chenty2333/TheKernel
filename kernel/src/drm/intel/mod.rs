@@ -4,7 +4,7 @@
 //! This is the first Intel-specific code in the kernel.  It exists to answer
 //! one question honestly -- *is this kernel talking to a real Intel GPU?* --
 //! before anything is built on top of the answer.  It does that without
-//! programming the device at all: it reads PCI configuration space, matches
+//! programming the device on the default path: it reads PCI configuration space, matches
 //! what it finds against a table of known parts, maps the register aperture
 //! read-only in effect, and reads the handful of registers that are safe to
 //! read on a part whose display engine the firmware is still driving.
@@ -39,11 +39,17 @@
 //! that a device matching the table is present at a specific bus address, that
 //! its register aperture was mapped, and that the registers answered with
 //! values -- which is a different claim from "the values are correct", and a
-//! much weaker one than "the display engine works".  No mode is set, no plane
+//! much weaker one than "the display engine works". On default boot no mode is set, no plane
 //! is enabled, no pixel is scanned out.  On a machine that has never run this
 //! code against a real Gen12 part, the register *values* in the report have
 //! never been observed: the decoding around them has been tested against
 //! synthetic configuration space, and that is the limit of what the tests say.
+//!
+//! Opt-in boot modesetting is now a separate guarded transaction: it captures
+//! the complete supported firmware footprint/GGTT, preserves calibration and
+//! CDCLK, restores failures in dependency order and verifies original scanout
+//! identity/progression. See `intel-firmware-rollback.md`. This native path and
+//! its hardware recovery remain 未在硬件上验证; unsupported topology is refused.
 //!
 //! ## Where the display driver plugs in
 //!
@@ -79,6 +85,7 @@ mod clk;
 mod connect;
 pub(crate) mod debugfs;
 pub(crate) mod fb;
+mod firmware_scanout;
 mod firmware_snapshot;
 mod gmbus;
 mod gt_probe;
@@ -95,6 +102,7 @@ mod pll;
 mod power;
 mod probe;
 mod regs;
+mod rollback;
 pub(crate) mod scanout;
 mod sink;
 mod swing;
@@ -283,331 +291,217 @@ pub(crate) fn probe_at_boot() {
 pub(crate) fn bring_up_at_boot() {
     let windows = mapped_windows();
     if windows.is_empty() {
-        axlog::info!(
-            "intel-gpu: no device with a mapped register window, so the power and connector steps \
-             of the bring-up order did not run"
-        );
+        axlog::info!("intel-gpu: no mapped display; no writes");
         return;
     }
-
     if axhal::boot::command_line_value("intel.modeset") != Some("1") {
         axlog::warn!(
-            "intel-gpu: native display writes disabled by default; firmware console unchanged; \
-             intel.modeset=1 only requests rollback preflight"
+            "intel-gpu: native display writes disabled by default; firmware console unchanged"
         );
         *MODESET.lock() = Some(String::from(
             "not attempted: intel.modeset=1 absent; no display register writes\n",
         ));
         return;
     }
-    let captured: Vec<_> = windows
-        .iter()
-        .map(|(bdf, window)| (*bdf, firmware_snapshot::Snapshot::capture(window)))
-        .collect();
-    let rollback_complete =
-        !captured.is_empty() && captured.iter().all(|(_, state)| state.permits_modeset());
-    *FIRMWARE_STATE.lock() = captured;
-    if !rollback_complete {
-        axlog::warn!(
-            "intel-gpu: intel.modeset=1 REFUSED: candidate state is not a complete PLL/PHY/GGTT \
-             rollback and restored scanout is unverified; no display writes; 未在硬件上验证"
-        );
-        *MODESET.lock() = Some(String::from(
-            "not attempted: incomplete firmware restoration; explicit parameter cannot bypass \
-             safety preflight\n",
-        ));
-        return;
-    }
-
-    // The devices whose phase-1 power came up, which are the only ones later
-    // steps may touch.
-    let mut powered = Vec::new();
-    for (bdf, window) in &windows {
-        axlog::info!("intel-gpu: powering up {bdf} (reference section 11 phase 1)");
-        match power::bring_up(window) {
-            Ok(state) => {
-                state.log();
-                *POWER.lock() = Some(state);
-                powered.push((*bdf, *window));
+    #[cfg(target_os = "none")]
+    {
+        if windows.len() != 1 {
+            axlog::warn!("intel-gpu: multiple displays unsupported by boot rollback; no writes");
+            return;
+        }
+        let (bdf, window) = windows[0];
+        match bring_up_native(bdf, &window) {
+            Ok(text) => {
+                axlog::info!("{text}");
+                *MODESET.lock() = Some(text);
             }
-            Err(error) => {
-                // One line, once, and the sequence stops here: §11 phase 1 is
-                // the gate everything else is behind, and a later step that
-                // fails because the display is unpowered would be reported as
-                // its own fault rather than this one's.
-                let text = alloc::format!("intel-gpu: power: {} ({error:?})", error.describe());
+            Err(text) => {
                 axlog::warn!("{text}");
-                *POWER_FAILURE.lock() = Some(text);
-                continue;
+                *MODESET.lock() = Some(text);
             }
         }
     }
-
-    // Phase 2 runs for every mapped device whose power came up, because the
-    // connector is per-device and one device's monitor must not be lost to
-    // another device's failure.  `resolve_at_boot` is phases 2.1, 2.2 and 2.3
-    // composed: the AUX/DDC power wells first, then one pass over the bus, then
-    // the connector the modeset takes.
-    let report = { REPORT.lock().clone() };
-    if let Some(report) = report {
-        let connect = connect::resolve_at_boot(&report);
-        *CONNECT.lock() = Some(connect);
-    }
-
-    // The modeset runs before the watch starts, and that order is deliberate:
-    // a watch that was already polling could see a monitor arrive while the
-    // only sequence this kernel has for programming a pipe is halfway through
-    // it, and there is no second modeset to give it.
-    #[cfg(target_os = "none")]
-    modeset_at_boot(&powered);
-
-    // The after-boot watch starts here and nowhere else.  Every step it depends
-    // on has now run: the window is mapped, the display is powered, hotplug
-    // detection is enabled, and the states the boot step read are in [`CONNECT`]
-    // to be the baseline.  A machine that reached none of that never gets here
-    // and never polls.
-    #[cfg(target_os = "none")]
-    start_hotplug_watch(&powered);
 }
 
-/// Ask the display engine to scan a pattern out, and offer the result to the
-/// console.
-///
-/// This is reference §11 phases 3.2 to 6 as one boot-time step, and the only
-/// caller of [`modeset::set_mode`] in the product build.  Everything it needs
-/// has already happened by the time it runs: the probe mapped the register
-/// window, phase 1 powered the display, phase 2 found a monitor and produced
-/// the mode layer's plan.  It takes the first device a monitor answered on
-/// whose power came up -- there is one display engine and one console, so a
-/// second monitor has nowhere to go.
-///
-/// Two of its inputs are worth naming because they are what the machine
-/// supplies and this kernel cannot:
-///
-/// * **The surface's size.**  [`modeset::choose_mode`] runs inside `set_mode`,
-///   so the framebuffer has to be allocated before the mode is known.  It is
-///   allocated for the larger of the mode layer's choice and §11 phase 3.1's
-///   1920x1080@60 preference, which are the only two modes `choose_mode` can
-///   return, so whichever it picks fits.  A larger monitor therefore costs the
-///   larger allocation, and a frame that cannot be allocated is refused by name
-///   with the firmware's console still up.
-/// * **§8.5's voltage-swing values.**  They are the board's, not ours, so they
-///   are read back out of the PHY the firmware programmed ([`swing`]).  When
-///   that read refuses -- a port the firmware never brought up -- the request
-///   carries no values and [`output::OutputProgram::plan`] refuses with
-///   `MissingBufferTranslation` *before the first write*, which is the same
-///   outcome with one error path instead of two.
-///
-/// The console is offered the surface only through [`scanout::register`], which
-/// re-checks the phase-6 verdict against the surface it was handed: on anything
-/// but a proven scanout the firmware framebuffer keeps the screen and the
-/// reason the Intel one did not is what the log carries.  The ordering that
-/// makes the offer count is the entry point's: `drm::init_virtio_gpu` runs
-/// before `pseudofs::mount_all`, and `/dev/fb0` asks for a surface only when
-/// that filesystem is built, so the candidate registered here is in the list
-/// before the console consults it.  Nothing here retries,
-/// nothing unwinds, and nothing panics -- a half-programmed mode is not a mode,
-/// and on a machine whose only output is the screen the failure's own signature
-/// is the diagnostic.
+/// All allocation/capture precedes the first write. No after-boot programming
+/// bypasses this transaction; hotplug modesetting remains a separate follow-up.
 #[cfg(target_os = "none")]
-fn modeset_at_boot(powered: &[(pci::Bdf, RegisterWindow)]) {
-    use alloc::sync::Arc;
-
-    // The report is moved out rather than cloned: `ModePlan` is not `Clone` and
-    // holding the lock across an allocation and a modeset would be worse than
-    // either.  It is put back before this function returns, so the debug file
-    // still shows what phase 2 found.
-    let Some(report) = CONNECT.lock().take() else {
-        return;
-    };
-    let Some(connector) = report.connectors.first() else {
-        axlog::info!(
-            "intel-modeset: no monitor answered on any DDC pin, so no mode is set and the \
-             firmware's framebuffer keeps the console (reference section 11 phase 3.1)"
-        );
-        *CONNECT.lock() = Some(report);
-        return;
-    };
-    let Some((window, aperture, physical)) = mapped_facts(connector.bdf) else {
-        axlog::warn!(
-            "intel-modeset: display {} has a connector but no mapped register window, so nothing \
-             was programmed",
-            connector.bdf
-        );
-        *CONNECT.lock() = Some(report);
-        return;
-    };
-    if !powered.iter().any(|(bdf, _)| *bdf == connector.bdf) {
-        axlog::debug!(
-            "intel-modeset: display {} never came up in phase 1, so it is not programmed; the \
-             power failure above is the finding, not this line",
-            connector.bdf
-        );
-        *CONNECT.lock() = Some(report);
-        return;
+fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, String> {
+    let supported = REPORT.lock().as_ref().is_some_and(|report| {
+        report
+            .displays
+            .iter()
+            .any(|found| found.info.bdf == bdf && found.info.device_id == 0x46d0)
+    });
+    if !supported {
+        return Err(String::from(
+            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0; no writes",
+        ));
     }
-    if aperture.bar != 0 {
-        axlog::warn!(
-            "intel-modeset: the window mapped for {} is {} (BAR {}), not the GTTMMADR aperture \
-             the graphics address space lives in, so nothing was programmed",
-            connector.bdf,
-            aperture.name,
-            aperture.bar
-        );
-        *CONNECT.lock() = Some(report);
-        return;
+    let (_, aperture, physical) = mapped_facts(bdf)
+        .ok_or_else(|| String::from("Intel mapped facts unavailable; no writes"))?;
+    let bar_len = aperture
+        .size
+        .ok_or_else(|| String::from("Intel GGTT aperture unknown; no writes"))?;
+    let ecam = pci::Ecam::platform()
+        .ok_or_else(|| String::from("PCI runtime mapping unavailable; no writes"))?;
+    let size = gtt::ApertureSize::read(&ecam, bdf);
+    if matches!(
+        size,
+        gtt::ApertureSize::NotObserved
+            | gtt::ApertureSize::Unreadable
+            | gtt::ApertureSize::Unmodelled { .. }
+    ) {
+        return Err(String::from("Intel GGTT size not measured; no writes"));
     }
-    // The aperture's size is the model's, not a probe: §11 phase 0.4 says to
-    // read the actual BAR sizes and this probe is read-only, so it cannot use
-    // the write-all-ones trick.  A BAR the firmware shrank would fail the page
-    // table's own read-back check rather than silently addressing past it.
-    let Some(bar0_len) = aperture.size else {
-        axlog::warn!(
-            "intel-modeset: no documented size for {}, so the GTT array is not mapped and no mode \
-             is set",
-            aperture.name
-        );
-        *CONNECT.lock() = Some(report);
-        return;
-    };
-
-    // The aperture the allocator may use is the device's own statement of it:
-    // the BAR split says how much *window* there is, and i915 takes the size
-    // from the `GGMS` field instead (`gt/intel_ggtt.c:1228`, decoded by
-    // `gen8_get_total_gtt_size` at `:1107-1121`).  A machine where the field
-    // cannot be read keeps the window-derived size, with the observation
-    // visibly absent rather than assumed.
-    let aperture_size = match pci::Ecam::platform() {
-        Some(ecam) => gtt::ApertureSize::read(&ecam, connector.bdf),
-        None => gtt::ApertureSize::NotObserved,
-    };
-    let gtt = match gtt::Gtt::map(physical, bar0_len, aperture_size) {
-        Ok(gtt) => gtt,
-        Err(error) => {
-            axlog::warn!("intel-modeset: {}", error.describe());
-            *CONNECT.lock() = Some(report);
-            return;
-        }
-    };
+    let gtt = gtt::Gtt::map(physical, bar_len, size).map_err(|e| e.describe())?;
+    let image = gtt.checkpoint().map_err(|e| e.describe())?;
+    *FIRMWARE_STATE.lock() = alloc::vec![(bdf, firmware_snapshot::Snapshot::capture(window))];
+    let tx = rollback::Transaction::begin(window, &gmbus::MonotonicTimer).map_err(|e| {
+        alloc::format!("intel.modeset=1 REFUSED before writes: {e}; firmware unchanged")
+    })?;
+    *FIRMWARE_STATE.lock() = alloc::vec![(bdf, tx.before.clone())];
     *GTT.lock() = Some(gtt.describe());
-
-    // Select before allocating: a surface large enough for two candidate
-    // modes is not a console with the dimensions of the mode actually scanned.
-    let mut edid = Vec::with_capacity(2 * gmbus::EDID_BLOCK_LEN);
-    edid.extend_from_slice(connector.edid.as_slice());
-    if let Some(extension) = &connector.extension {
-        edid.extend_from_slice(extension.as_slice());
+    if let Some(value) = axhal::boot::command_line_value("intel.modeset.fail_write") {
+        let attempt = value
+            .parse::<usize>()
+            .map_err(|_| String::from("invalid intel.modeset.fail_write; no writes"))?;
+        tx.inject_failure(attempt)?;
     }
-    let mode = match modeset::preflight_mode(&window, &connector.plan, &edid) {
-        Ok((_, mode)) => mode,
-        Err(error) => {
-            let text = alloc::format!("intel-modeset: {}", error.describe());
-            axlog::warn!("{text}");
-            *MODESET.lock() = Some(text);
-            *CONNECT.lock() = Some(report);
-            return;
+    let reusable = tx.reusable_phys.clone();
+    let result = (|| {
+        tx.quiesce(&gmbus::MonotonicTimer)?;
+        let state = power::bring_up_preserving_phys(&tx, reusable).map_err(|e| e.describe())?;
+        *POWER.lock() = Some(state);
+        let resolved = connect::resolve_device(bdf, &tx, &gmbus::MonotonicTimer);
+        let mut report = connect::ConnectReport::default();
+        report.hotplug.push((bdf, resolved.hotplug));
+        let connector = resolved.outcome.map_err(|e| e.describe())?;
+        if connector.ddi != tx.ddi {
+            return Err(String::from(
+                "live EDID route differs from saved firmware combo port",
+            ));
         }
-    };
-    let width = u32::from(mode.hdisplay);
-    let height = u32::from(mode.vdisplay);
-    axlog::info!(
-        "intel-modeset: allocating {width}x{height} XRGB8888 for {} (phase 3.2), then programming \
-         pipe A through DDI {} (phases 3.4 to 5.7)",
-        connector.bdf,
-        connector.ddi
-    );
-    let surface = match fb::Surface::allocate(&gtt, width, height, fb::Format::Xrgb8888) {
-        Ok(surface) => surface,
-        Err(error) => {
-            axlog::warn!("intel-modeset: {}", error.describe());
-            *CONNECT.lock() = Some(report);
-            return;
-        }
-    };
-
-    let swing = match swing::read_firmware_swing(&window, connector.ddi) {
-        Ok(swing) => Some(swing),
-        Err(source) => {
-            // Not fatal here: the request below carries no values, and phase
-            // 5's own refusal names the table and the reference's gap.
-            axlog::debug!(
-                "intel-modeset: {} has no buffer-translation values to replay: {}",
-                connector.ddi,
-                source.describe()
-            );
-            None
-        }
-    };
-
-    let mut request = modeset::ModeRequest::new(
-        connector.ddi,
-        pipe::Pipe::A,
-        &connector.plan,
-        &edid,
-        &surface,
-        // The named field encoding is the one the ADL-N path writes and reads
-        // back (`icl_wrpll_params_populate`); the Skylake codes are the other
-        // convention and not this part's.
-        pll::PllFieldEncoding::Named,
-    );
-    request.frame = 0;
-    request.swing = swing;
-    // §8.6 gives no sourced HDMI encoding for PHY_LINK_RATE; zero is the
-    // honest value until a dump from this machine settles it (reference §13.4).
-    request.link_rate = output::LinkRate::NoSourcedEncoding;
-
-    let outcome = match modeset::set_mode(&window, &gmbus::MonotonicTimer, &request) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let text = alloc::format!(
-                "intel-modeset: the mode was not set: {} ({error:?}).  The firmware's framebuffer \
-                 keeps the console (reference section 11 phase 6)",
-                error.describe()
-            );
-            axlog::warn!("{text}");
-            // The GGTT mapping already exists, and an error from `arm` can
-            // follow writes that exposed it to the display engine. Keep the
-            // pages just as we do after an inconclusive phase-6 verdict;
-            // returning here must not free memory still named by the GGTT.
-            scanout::register(
-                Arc::new(surface),
-                scanout::Verdict::NotScanning {
-                    reason: text.clone(),
-                },
-            );
-            *MODESET.lock() = Some(text);
-            *CONNECT.lock() = Some(report);
-            return;
-        }
-    };
-    outcome.log();
-    *MODESET.lock() = Some(outcome.render());
-
-    let verdict = if outcome.prove.verdict().is_scanning_out() {
-        match outcome.prove.surflive() {
-            Some(surflive) => scanout::Verdict::Scanning { surflive },
-            // A scanning verdict without the reading it was made from is not
-            // evidence, and the console is not moved on anything less.
-            None => scanout::Verdict::NotScanning {
-                reason: String::from(
-                    "phase 6 reports the pipe scanning, but the PLANE_SURFLIVE reading that \
-                     verdict rests on is absent",
+        report.connectors.push(connector);
+        *CONNECT.lock() = Some(report);
+        modeset_at_boot(&tx, &gtt, tx.pll_id)
+    })();
+    match result {
+        Ok(text) => Ok(alloc::format!(
+            "intel-modeset: committed opt-in native mode after {} writes; {text}; 未在硬件上验证",
+            tx.attempts()
+        )),
+        Err(original) => {
+            let recovery = tx.restore(&gmbus::MonotonicTimer, &gtt, &image);
+            let text = match recovery {
+                Ok(proof) => {
+                    alloc::format!(
+                        "intel-modeset: failed: {original}; ROLLBACK_MMIO_VERIFIED: {proof}"
+                    )
+                }
+                Err(error) => alloc::format!(
+                    "intel-modeset: failed: {original}; ROLLBACK_FAILED: {error}; DMA \
+                     quarantined; scanout recovery NOT proven; no further display writes"
                 ),
-            },
+            };
+            if let Some((_, state)) = FIRMWARE_STATE.lock().first_mut() {
+                state.restoration = Some(text.clone());
+            }
+            Err(text)
         }
-    } else {
-        scanout::Verdict::NotScanning {
-            reason: outcome
-                .prove
-                .verdict()
-                .unavailable_reason()
-                .unwrap_or_else(|| {
-                    String::from("phase 6 did not prove the pipe is scanning this surface out")
-                }),
+    }
+}
+
+/// Allocate the exact live EDID mode, program through the boot transaction,
+/// and publish only a proven native scanout. Any error returns to the outer
+/// dependency-aware rollback. Both failed and successful DMA surfaces remain
+/// owned; no old-GOP-console claim is made merely from an allocation/address.
+#[cfg(target_os = "none")]
+fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<String, String> {
+    use alloc::sync::Arc;
+    let report = CONNECT
+        .lock()
+        .take()
+        .ok_or_else(|| String::from("connector report absent"))?;
+    let result = (|| {
+        let connector = report
+            .connectors
+            .first()
+            .ok_or_else(|| String::from("no live EDID connector"))?;
+        let mut edid = Vec::new();
+        edid.try_reserve_exact(256)
+            .map_err(|_| String::from("EDID staging allocation failed"))?;
+        edid.extend_from_slice(connector.edid.as_slice());
+        if let Some(extension) = &connector.extension {
+            edid.extend_from_slice(extension.as_slice());
         }
-    };
-    scanout::register(Arc::new(surface), verdict);
+        let (_, mode) =
+            modeset::preflight_mode(regs, &connector.plan, &edid).map_err(|e| e.describe())?;
+        axlog::info!(
+            "intel-modeset: EDID selected {}x{} clock={} kHz",
+            mode.hdisplay,
+            mode.vdisplay,
+            mode.clock_khz
+        );
+        let surface = fb::Surface::allocate(
+            gtt,
+            u32::from(mode.hdisplay),
+            u32::from(mode.vdisplay),
+            fb::Format::Xrgb8888,
+        )
+        .map_err(|e| e.describe())?;
+        let mut request = modeset::ModeRequest::new(
+            connector.ddi,
+            pipe::Pipe::A,
+            &connector.plan,
+            &edid,
+            &surface,
+            pll::PllFieldEncoding::Named,
+        );
+        request.pll_id = pll_id;
+        request.swing = swing::read_firmware_swing(regs, connector.ddi).ok();
+        request.link_rate = output::LinkRate::NoSourcedEncoding;
+        let outcome = modeset::set_mode(regs, &gmbus::MonotonicTimer, &request);
+        // Both success and failure retain the allocation until the controller
+        // and its PTEs prove retirement; never free a failed native scanout.
+        match outcome {
+            Ok(outcome) => {
+                let text = outcome.render();
+                let verdict = if outcome.prove.verdict().is_scanning_out() {
+                    outcome
+                        .prove
+                        .surflive()
+                        .map(|surflive| scanout::Verdict::Scanning { surflive })
+                } else {
+                    None
+                };
+                let success = verdict.is_some();
+                scanout::register(
+                    Arc::new(surface),
+                    verdict.unwrap_or_else(|| scanout::Verdict::NotScanning {
+                        reason: text.clone(),
+                    }),
+                );
+                if success {
+                    Ok(text)
+                } else {
+                    Err(alloc::format!("native scanout not proven: {text}"))
+                }
+            }
+            Err(error) => {
+                let text = error.describe();
+                scanout::register(
+                    Arc::new(surface),
+                    scanout::Verdict::NotScanning {
+                        reason: text.clone(),
+                    },
+                );
+                Err(text)
+            }
+        }
+    })();
     *CONNECT.lock() = Some(report);
+    result
 }
 
 /// The mapped window, the aperture the probe mapped it from, and the BAR's

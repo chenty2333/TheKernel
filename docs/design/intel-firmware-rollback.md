@@ -1,67 +1,125 @@
-# Firmware display preservation: fail-closed preparation (2026-10-04)
+# ADL-N boot modeset transaction and firmware recovery
 
-**B3 is not complete. Native modesetting is NOT enabled, even with
-`intel.modeset=1`. 未在硬件上验证.** A fake register window cannot establish that
-firmware scanout survives a failed PLL/PHY transition on the N305.
+`intel.modeset=1` now enters the native boot modeset through a guarded hardware
+transaction. Default boot still returns before all display writes. **Native
+modesetting and recovery are 未在硬件上验证.** QEMU has no Intel display engine.
 
-## Implemented boundary
+## Admission, not a blanket permission to replay registers
 
-Default boot stops before *all* display programming, including when there is
-no GOP framebuffer tag. Explicit `intel.modeset=1` requests a read-only
-candidate snapshot of the existing driver's known register inventory: display
-power/clock, combo PHY A/B, DPLL, DDI, transcoder, pipe, plane and watermark
-registers. Offset deduplication preserves one initial value per register;
-missing reads are retained as unavailable, never converted to zero. Debugfs
-reports the candidate and that it does not permit destructive programming.
+Supported device: N305 `8086:46d0`. The initial firmware configuration must have
+one stable primary plane on pipe A, a combo HDMI/DVI link on DDI A or B, no
+active overlay/cursor/eDP transcoder, a usable firmware CDCLK, and a powered,
+enabled, locked combo PLL selected by the actual firmware port-clock route.
+DDI B can use PLL 0: PLL choice is not inferred from the port's number.
+The active PHY must pass the existing calibration verification through a
+**write-denying** register view. A PHY that would need recalibration is refused,
+not reinitialized and later treated as if its hidden analog state were RAM.
+Unused PHYs and the other PLL are not programmed. DP/Type-C, multiple active
+pipes, overlays/cursors and cold display initialization remain unsupported and
+are refused **before the first write**, even with the explicit parameter.
 
-A candidate is **not** a complete firmware image: powered-down banks can read
-zero, and the driver's table is not an inventory of every ADL-P/N firmware
-register. No real restoration API is exposed. The old modeset is still
-refused. Host tests use the existing fake registers for read-only capture,
-missing-bank refusal and a RAM-register undo model. The latter checks every
-failure prefix and exact reverse write/content restoration; it deliberately
-does not pretend to implement hardware PLL/PHY/power sequencing.
+GMBUS must initially be idle with no firmware interrupt owner. Missing
+before-images, an unknown GGTT size, allocation failure, unstable firmware
+plane/link identity or a stalled scanline also refuse admission. A captured
+inventory alone is not permission: `Snapshot::capture` stays fail-closed until
+`rollback::Transaction::begin` validates this supported configuration.
 
-## Why replaying saved dwords is not enough
+## Before-image and ownership
 
-Linux 7.2.3 `drivers/gpu/drm/i915/display/` was used to inspect the dependency
-order (`intel_display_power_map.c`, `intel_cdclk.c`, `intel_combo_phy.c`,
-`intel_dpll_mgr.c`, `intel_ddi.c`, `intel_crtc.c`, `skl_universal_plane.c`,
-`skl_watermark.c`, `intel_modeset_setup.c`). ADL-N is an ADL-P subplatform.
-Firmware state must include all enabled pipes/planes/transcoders, ports,
-clock routing, port PLLs, combo/Type-C PHY state, CDCLK, DBUF/DDB/watermarks,
-power requesters/DC policy and the GGTT entries used by firmware and the
-attempted new scanout. Retain the firmware framebuffer memory and geometry.
+Before any register write, capture the driver's complete relevant register
+inventory: PLL divisors/enables/routes, combo PHY calibration and lane controls,
+DDI, transcoder, pipe timings/misc/arbitration, primary-plane geometry/format/
+surface/color, DDB/watermarks, driver power requests, DBUF, DC policy, CDCLK/raw
+clock and GMBUS/HPD. Supplemental TX_DW5 shadows cover **every lane**, not only
+lane 0: group stores broadcast, so replaying lane 0 would lose firmware lane
+settings. Group reads/readbacks use the readable lane shadows.
 
-A rollback implementation must classify RW versus RO/status/W1C/self-clearing
-and masked-write registers; an enable's readback contains status bits that
-must not be blindly written back. Shared PLLs and power wells may serve an
-unmodified pipe. Type-C ownership/PHY access is not interchangeable with combo
-PHY. GGTT PTEs and new framebuffer DMA owners need an explicit undo/quarantine
-contract, not just register replay. The snapshot must precede the first power,
-clock, hotplug/GMBUS or modeset write, not merely precede `set_mode()`.
+Capture the entire measured GGTT array, including absent PTE bits, and its
+allocation cursor. Register/journal/PTE tracking capacity exists before the
+first mutation. The allocator never overwrites a present firmware PTE. Changes
+are tracked once per register, including an attempted write that can have landed
+before a failure is reported. All newly exposed framebuffer allocations remain
+owned on failure; uncertain DMA retirement never frees or reuses them.
 
-Restoration needs bounded disable/readback steps for the attempted plane,
-pipe/transcoder and DDI, then dependency-aware undo of clock/PLL/PHY changes,
-then firmware route/timing/watermark/PTE/plane reinstatement, and finally power
-requests/DC policy. The order of *operations* must reverse the attempted
-sequence, but hardware prerequisites constrain the order of each operation's
-internal writes. Report both the original failure and any rollback failure.
-Never report "firmware console retained" merely because an address is saved.
+Only the supported footprint can be written. Other pipes/PHYs/PLL, display
+interrupt registers, CDCLK and PHY recalibration registers are denied by the
+transaction. CDCLK and calibrated PHY state are **preserved**, not gratuitously
+reprogrammed. BIOS/KVMR/debug power requesters are read but never changed.
+Read-only, W1C and transient command state are not configuration to replay.
+HPD stores neutralize W1C pulse-latch bits. GMBUS recovery cancels/resets a
+transaction and restores idle selectors/masks/index, never replays an old I2C
+command. Power/PLL/pipe/DDI status bits are excluded from restoration writes.
 
-## Required scanout acceptance before unlocking modeset
+## Forward and reverse dependency order
 
-After rollback, check the firmware pipe/transcoder/plane and live surface,
-restore the exact relevant PTEs, and sample advancing scanline/frame counters
-with a bounded deadline. Register equality alone is insufficient; capture the
-physical output and compare a known framebuffer pattern/console update. A
-counter alone also cannot prove the monitor has the restored picture. Require
-both progression and visible firmware framebuffer output, including the
-original pitch/pixel layout. Failed restoration must not free DMA still being
-scanned or continue to another modeset.
+Forward boot stages:
 
-For the eventual opt-in native path, obtain EDID through the actual port/VBT
-route; choose the advertised mode, then test 1920x1080@60 if present. The saved
-capture-dongle EDID is not a substitute for a live monitor EDID. Test injected
-failure after each phase, not just successful 1080p. Until the above contracts
-exist, the only safe result of the parameter is a diagnostic refusal.
+1. Disable/arm the original primary plane; observe two real scanline wraps
+   (frame boundaries), then disable pipe/transcoder, DDI and its clock route.
+   Wait for pipe-off/DDI-idle/PLL-unlock, with bounded deadlines.
+2. Reuse the verified active PHY and usable CDCLK; bring up display power,
+   raw clock, DBUF and workarounds, then read **live** EDID through GMBUS.
+   The connector must match the saved firmware combo port.
+3. Select the advertised mode (1080p60 when present), allocate exact geometry,
+   paint the native surface, map fresh GGTT entries, program timings and WM.
+4. Program/lock the same combo PLL, route its clock, program PHY signal levels,
+   configure transcoder routing, enable HDMI DDI **before** the CPU transcoder,
+   then arm the primary plane. This corrects the old DDI/transcoder order to
+   Linux ADL-P/N's encoder-enable -> transcoder-enable -> plane-update order.
+5. Publish the native scanout only after the existing phase-6 proof succeeds.
+   There is no after-boot hotplug programming that bypasses the transaction.
+
+On any error, including an inconclusive final scanout proof:
+
+1. Disable/arm the attempted plane and wait for frame boundaries when its pipe
+   is running; stop pipe/link/clock/PLL with status readbacks.
+2. Restore changed PTEs in descending index order; verify the **whole** GGTT
+   array before reinstating the firmware surface.
+3. Undo non-PHY data/timings/WM/PLL divisors in reverse tracked order while
+   the pipe/PLL are off; reset any outstanding GMBUS transaction.
+4. Restore original PLL power, enable and lock, then its original clock route.
+   With the reference clock back, disable PHY training, restore coefficients,
+   then restore every original lane's TX_DW5 (not a lane-0 broadcast substitute).
+5. Restore firmware DDI/transcoder/pipe, then primary control and surface commit.
+   Withdraw only added driver power requests; restore DC policy last.
+6. Verify all touched writable fields, unchanged CDCLK, exact PTEs, original
+   pitch/size/format/offset/route/surface and live SURFLIVE, and multiple fresh
+   scanline advances. Equality alone and a saved framebuffer address are not
+   accepted as successful recovery.
+
+Every poll also has an iteration bound. A persistent hardware restore failure
+reports `ROLLBACK_FAILED`, retains DMA, publishes no native console and makes
+no further display attempt; it is **not** disguised as firmware recovery.
+`ROLLBACK_MMIO_VERIFIED` means the MMIO/PTE/scanout-progress contract passed,
+not that pixels on a physical monitor were compared. Physical verification must
+also see the original 800x600 console scanning normally and updating text.
+
+## Host validation and physical acceptance
+
+Existing register models execute the real power-preserving and native 1080p60
+program, then restore the original 800x600 state. The matrix exercises DDI A and
+DDI B on PLL 0, every write failure prefix, both an unposted refusal and a store
+that landed before failure, derived PLL/pipe/DDI status, distinct per-lane PHY
+shadows, exact PTE retirement and restored layout. Negative tests cover dormant
+PHY preservation, forbidden clock/calibration/foreign-state writes, GMBUS abort,
+unsupported firmware topology, dropped PTE restoration and a stopped scanline
+with otherwise equal registers. These are model/order/content tests, not
+physical PLL, PHY, cache or monitor-output validation.
+
+For a user-run recovery exercise, append both `intel.modeset=1` and
+`intel.modeset.fail_write=N` (1..4096). The selected forward write is deliberately
+refused once; restoration bypasses that failed wrapper. Without `intel.modeset=1`
+this option does nothing. Start with N=1; use the normal successful boot's
+reported forward write count to exercise later prefixes. A value past the last
+write does **not** trigger a fault and is not a recovery test.
+
+See `n305-next-session-b.md` for the exact boot/visible acceptance steps. Do not
+enable NVMe writes or GT submission/forcewake for these tests. The display-only
+GGTT path does not initialize/invalidate an executing GT; its fresh binding and
+visible pattern/console still require physical verification. HDMI audio remains
+separate future display-power/link/ELD work.
+
+Reference behavior/register facts: Linux 7.2.3 `i915/display/intel_display.c`,
+`intel_ddi.c`, `intel_dpll.c`, `intel_dpll_mgr.c`, `intel_combo_phy.c`,
+`intel_combo_phy_regs.h`, `intel_cdclk.c`, `intel_display_power*.c`,
+`skl_universal_plane*.c` and `skl_watermark.c`. Rust implementation is original.

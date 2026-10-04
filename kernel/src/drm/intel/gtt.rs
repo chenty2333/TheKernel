@@ -693,40 +693,65 @@ impl ApertureSize {
 /// taken.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GttError {
+    CheckpointUnavailable,
+    CheckpointMismatch,
     /// BAR 0 is shorter than the register window plus the page table array.
-    BarTooSmall { observed: u64, needed: u64 },
+    BarTooSmall {
+        observed: u64,
+        needed: u64,
+    },
     /// The array window could not be mapped.
-    WindowUnmappable { physical: u64 },
+    WindowUnmappable {
+        physical: u64,
+    },
     /// A page table window smaller than one entry.
-    WindowTooSmall { bytes: usize },
+    WindowTooSmall {
+        bytes: usize,
+    },
     /// A page table entry naming address zero.
     AddressZero,
     /// An address that is not a whole number of pages.
-    AddressNotAligned { address: u64 },
+    AddressNotAligned {
+        address: u64,
+    },
     /// An address with bits outside `GEN12_GGTT_PTE_ADDR_MASK`.
-    AddressTooWide { address: u64 },
+    AddressTooWide {
+        address: u64,
+    },
     /// A graphics address outside the aperture the table covers.
     ///
     /// The bound is [`Gtt::aperture`], which is the aperture **this kernel
     /// observed**, not the length of the mapped window: an address the window
     /// covers but the device's `GGMS` field does not is as far outside the real
     /// table as one past the end of the BAR.
-    AddressOutsideAperture { address: u64, aperture: u64 },
+    AddressOutsideAperture {
+        address: u64,
+        aperture: u64,
+    },
     /// The device reported a GGTT size this kernel has no model for.
     ///
     /// The aperture is unknown rather than zero, and no address is handed out:
     /// the only alternative is guessing a size, and a guessed size writes page
     /// table entries outside the table the hardware walks.
-    ApertureSizeUnmodelled { raw: u16 },
+    ApertureSizeUnmodelled {
+        raw: u16,
+    },
     /// A run of zero bytes.
     EmptyRun,
     /// No free run of that many pages is left in the aperture.
-    ApertureExhausted { pages: u64, aperture: u64 },
+    ApertureExhausted {
+        pages: u64,
+        aperture: u64,
+    },
     /// An entry was written and did not read back as written.
     ///
     /// This is the one failure a real aperture can produce that no arithmetic
     /// predicts, and it is the reason the map path reads its own work back.
-    ReadBackMismatch { index: usize, wrote: u64, read: u64 },
+    ReadBackMismatch {
+        index: usize,
+        wrote: u64,
+        read: u64,
+    },
 }
 
 impl GttError {
@@ -735,6 +760,12 @@ impl GttError {
         use alloc::{format, string::String};
 
         match self {
+            Self::CheckpointUnavailable => {
+                String::from("GGTT checkpoint allocation failed before programming")
+            }
+            Self::CheckpointMismatch => {
+                String::from("GGTT checkpoint belongs to a different aperture")
+            }
             Self::BarTooSmall { observed, needed } => format!(
                 "BAR 0 is {observed:#x} bytes, but the page table array is at \
                  {GGTT_ARRAY_OFFSET:#x} and is {GGTT_ARRAY_BYTES:#x} bytes, so {needed:#x} are \
@@ -815,7 +846,64 @@ pub(crate) struct Gtt {
     next: Mutex<u64>,
 }
 
+/// Exact before-image, including absent PTE bits, not a reconstructed mapping.
+pub(crate) struct Checkpoint {
+    entries: alloc::vec::Vec<u64>,
+    cursor: u64,
+}
+
 impl Gtt {
+    /// Capture before *any* display/GGTT mutation. Does not write the table.
+    pub(crate) fn checkpoint(&self) -> Result<Checkpoint, GttError> {
+        let cursor = self.next.lock();
+        let mut entries = alloc::vec::Vec::new();
+        entries
+            .try_reserve_exact(self.entries)
+            .map_err(|_| GttError::CheckpointUnavailable)?;
+        for index in 0..self.entries {
+            entries.push(self.array.read(index));
+        }
+        Ok(Checkpoint {
+            entries,
+            cursor: *cursor,
+        })
+    }
+
+    /// Verify exact content, not just the present/address bits.
+    pub(crate) fn verify_checkpoint(&self, image: &Checkpoint) -> Result<(), GttError> {
+        if image.entries.len() != self.entries {
+            return Err(GttError::CheckpointMismatch);
+        }
+        for (index, &wrote) in image.entries.iter().enumerate() {
+            let read = self.array.read(index);
+            if read != wrote {
+                return Err(GttError::ReadBackMismatch { index, wrote, read });
+            }
+        }
+        Ok(())
+    }
+
+    /// Undo changes in descending PTE order, then verify the complete aperture.
+    /// Unchanged firmware PTEs are never gratuitously rewritten.
+    /// # Safety
+    /// All display/GT consumers of changed entries must be quiesced and their
+    /// DMA memory retained until this readback succeeds. This is not a GT reset
+    /// or an invalidation of a live engine's translation cache.
+    pub(crate) unsafe fn restore_checkpoint(&self, image: &Checkpoint) -> Result<(), GttError> {
+        if image.entries.len() != self.entries {
+            return Err(GttError::CheckpointMismatch);
+        }
+        let mut cursor = self.next.lock();
+        for (index, &value) in image.entries.iter().enumerate().rev() {
+            if self.array.read(index) != value {
+                self.array.write(index, value);
+            }
+        }
+        self.verify_checkpoint(image)?;
+        *cursor = image.cursor;
+        Ok(())
+    }
+
     /// Take a page table that is already mapped, with no observation of the
     /// device's GGTT size field.
     ///
@@ -1239,3 +1327,38 @@ pub(crate) mod mock {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    #[test]
+    fn checkpoint_is_read_only_and_restores_exact_firmware_and_absent_bits() {
+        let array = mock::MockPageTable::new(65536);
+        array.write(0, 0x12345001);
+        array.write(1, 0x23456003);
+        // An absent entry may contain bits: undo must not synthesise zero.
+        array.write(64000, 0xabcdef00);
+        let gtt = Gtt::over(alloc::boxed::Box::new(array.clone())).unwrap();
+        let image = gtt.checkpoint().unwrap();
+        let address = gtt.map_linear(0x400000, 8192).unwrap();
+        assert!(gtt.verify_checkpoint(&image).is_err());
+        // SAFETY: fake page table has no hardware/DMA consumers.
+        unsafe {
+            gtt.restore_checkpoint(&image).unwrap();
+        }
+        gtt.verify_checkpoint(&image).unwrap();
+        assert_eq!(gtt.map_linear(0x400000, 8192).unwrap(), address);
+    }
+    #[test]
+    fn dropped_restore_is_failure_not_success_and_keeps_cursor_reserved() {
+        let array = mock::MockPageTable::new(65536);
+        let gtt = Gtt::over(alloc::boxed::Box::new(array.clone())).unwrap();
+        let image = gtt.checkpoint().unwrap();
+        gtt.map_linear(0x400000, 4096).unwrap();
+        let cursor = *gtt.next.lock();
+        array.drop_writes();
+        // SAFETY: fake page table has no hardware/DMA consumers.
+        assert!(unsafe { gtt.restore_checkpoint(&image) }.is_err());
+        assert_eq!(*gtt.next.lock(), cursor);
+    }
+}

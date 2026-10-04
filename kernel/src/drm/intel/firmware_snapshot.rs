@@ -1,6 +1,5 @@
-//! Read-only candidate inventory, NOT a complete hardware rollback image.
-//! No restoration API is exposed to a production caller until register side
-//! effects, GGTT ownership and actual firmware scanout recovery are covered.
+//! Register before-image. Admission/restoration belongs to rollback::Transaction;
+//! an inventory by itself never authorizes hardware writes.
 use alloc::{format, string::String, vec::Vec};
 
 use super::regs::{self, Register, Registers, Width};
@@ -12,6 +11,8 @@ pub(crate) struct Entry {
 #[derive(Clone)]
 pub(crate) struct Snapshot {
     pub(crate) entries: Vec<Entry>,
+    pub(crate) admitted: bool,
+    pub(crate) restoration: Option<String>,
 }
 impl Snapshot {
     pub(crate) fn capture(device: &impl Registers) -> Self {
@@ -19,18 +20,24 @@ impl Snapshot {
             .iter()
             .copied()
             .chain(regs::POWER_AND_CLOCK_REGISTERS.iter().copied())
+            .chain(regs::BUS.iter().copied())
             .chain(regs::COMBO_PHYS.iter().flat_map(|phy| phy.all()))
             .chain(regs::table::ALL.iter().copied().flatten().copied())
+            .chain(super::rollback::LANE_DW5.iter().flatten().copied())
             .filter(|register| register.required_quirk().is_none())
             .collect();
         inventory.sort_by_key(|register| register.offset());
         inventory.dedup_by_key(|register| register.offset());
         Self {
+            admitted: false,
+            restoration: None,
             entries: inventory
                 .into_iter()
                 .map(|register| Entry {
                     value: match register.width() {
-                        Width::Bits32 => device.read(register).map(u64::from),
+                        Width::Bits32 => {
+                            super::rollback::snapshot_read32(device, register).map(u64::from)
+                        }
                         Width::Bits64 => device.read64(register),
                     },
                     register,
@@ -39,15 +46,24 @@ impl Snapshot {
         }
     }
     pub(crate) fn permits_modeset(&self) -> bool {
-        // A register read is not proof that a powered-down bank was captured.
-        // Full firmware state and a hardware restoration sequence remain absent.
-        false
+        self.admitted
     }
     pub(crate) fn render(&self) -> String {
-        let mut text = String::from(
-            "intel-firmware: candidate snapshot; NOT a complete rollback; modeset refused; \
-             未在硬件上验证\n",
-        );
+        let mut text = if self.admitted {
+            String::from(
+                "intel-firmware: admitted pipe-A combo-HDMI before-image, with GGTT checkpoint \
+                 and live scanout identity; 未在硬件上验证\n",
+            )
+        } else {
+            String::from(
+                "intel-firmware: candidate snapshot; NOT a complete rollback; modeset refused; \
+                 未在硬件上验证\n",
+            )
+        };
+        if let Some(restoration) = &self.restoration {
+            text.push_str(restoration);
+            text.push('\n');
+        }
         for entry in &self.entries {
             match entry.value {
                 Some(value) => text.push_str(&format!(

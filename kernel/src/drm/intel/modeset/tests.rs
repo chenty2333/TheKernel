@@ -1127,7 +1127,7 @@ fn request<'a>(plan: &'a ModePlan, edid: &'a [u8], surface: &'a fb::Surface) -> 
 }
 
 #[test]
-fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads() {
+fn the_whole_sequence_uses_i915_hdmi_enable_order_and_stops_before_the_reads() {
     let _guard = scheduler_test_context();
     let (edid, plan) = plan_1080p60();
     let surface = test_surface();
@@ -1235,10 +1235,10 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
     assert_eq!(dpclka, 2, "the mapping, then the clock-off clear");
     assert_eq!(
         *output_names.last().expect("the output writes"),
-        DDI_BUF_CTL_A.name(),
-        "DDI_BUF_CTL is the output's last write, after the IS_IDLE poll"
+        "PIPECONF_A",
+        "CPU transcoder follows HDMI encoder enable/idle poll"
     );
-    // And the transcoder is enabled before the DDI buffer that consumes it.
+    // i915 enables the HDMI encoder before the CPU transcoder.
     let transconf = output_names
         .iter()
         .position(|name| *name == "PIPECONF_A")
@@ -1247,7 +1247,7 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
         .iter()
         .position(|name| *name == DDI_BUF_CTL_A.name())
         .expect("DDI_BUF_CTL is written");
-    assert!(transconf < ddi_buf);
+    assert!(ddi_buf < transconf);
 
     // 6. The arm pair is last: `PLANE_CTL` then `PLANE_SURF`, adjacent, and
     //    nothing follows them but the proof's reads.  This is the order the
@@ -1628,5 +1628,324 @@ fn a_larger_surface_cannot_advertise_pixels_outside_the_scanout() {
             mode: (1920, 1080),
         })
     ));
+    assert!(regs.writes().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Real boot transaction integration: a native 1080p program over an 800x600
+// firmware primary, with hardware-status derivation and every failure prefix.
+// ---------------------------------------------------------------------------
+struct FailOneWrite<'a> {
+    registers: &'a MockRegisters,
+    calls: Cell<usize>,
+    fail: Cell<Option<usize>>,
+    posted: bool,
+}
+impl Registers for FailOneWrite<'_> {
+    fn read(&self, r: Register) -> Option<u32> {
+        self.registers.read(r)
+    }
+    fn read64(&self, r: Register) -> Option<u64> {
+        self.registers.read64(r)
+    }
+    fn write(&self, r: Register, value: u32) -> bool {
+        let n = self.calls.get() + 1;
+        self.calls.set(n);
+        if self.fail.get() == Some(n) {
+            self.fail.set(None);
+            if self.posted {
+                let _ = self.registers.write(r, value);
+            }
+            return false;
+        }
+        self.registers.write(r, value)
+    }
+}
+fn boot_firmware_device() -> (MockRegisters, Rc<Cell<u32>>) {
+    let (r, live) = working_device(7);
+    let lines = Cell::new(0u32);
+    r.on_read(PIPEDSL_A, move |_| {
+        lines.set((lines.get() + 7) % 600);
+        lines.get()
+    });
+    r.set(regs::pipe::PIPECONF_A, (1 << 31) | (1 << 30));
+    r.derive(regs::pipe::PIPECONF_A, |v| {
+        if v & (1 << 31) != 0 {
+            v | (1 << 30)
+        } else {
+            v & !(1 << 30)
+        }
+    });
+    r.set(PLANE_CTL_A, (1 << 31) | (4 << 24));
+    r.set(PLANE_SURF_A, 0x400000);
+    live.set(0x400000);
+    r.set(regs::pipe::PLANE_STRIDE_A, 50);
+    r.set(regs::pipe::PLANE_SIZE_A, (599 << 16) | 799);
+    r.set(regs::pipe::PIPESRC_A, (799 << 16) | 599);
+    r.set(regs::ddi::TRANS_DDI_FUNC_CTL_A, (1 << 31) | (1 << 27));
+    r.set(regs::ddi::TRANS_CLK_SEL_A, 1 << 28);
+    r.set(DDI_BUF_CTL_A, 1 << 31);
+    r.set(DDI_BUF_CTL_B, 1 << 7);
+    r.derive(DDI_BUF_CTL_B, |v| {
+        if v & (1 << 31) != 0 {
+            v & !(1 << 7)
+        } else {
+            v | (1 << 7)
+        }
+    });
+    for reg in [regs::dpll::DPLL0_ENABLE, regs::dpll::DPLL1_ENABLE] {
+        r.derive(reg, |v| {
+            let mut value = v & !((1 << 30) | (1 << 26));
+            if v & (1 << 27) != 0 {
+                value |= 1 << 26;
+            }
+            if v & ((1 << 31) | (1 << 27)) == (1 << 31) | (1 << 27) {
+                value |= 1 << 30;
+            }
+            value
+        });
+    }
+    r.set(
+        regs::dpll::DPLL0_ENABLE,
+        (1 << 31) | (1 << 30) | (1 << 27) | (1 << 26),
+    );
+    for phy in regs::COMBO_PHYS {
+        use super::super::phy as facts;
+        let row = facts::procmon_row(facts::process_voltage(0));
+        r.set(phy.comp_dw0, facts::COMP_INIT);
+        r.set(phy.comp_dw1, row.dw1);
+        r.set(phy.comp_dw9, row.dw9);
+        r.set(phy.comp_dw10, row.dw10);
+        r.set(phy.comp_dw8, facts::IREFGEN);
+        r.set(
+            phy.tx_dw8_ln0,
+            facts::ODCC_CLK_SEL | facts::ODCC_CLK_DIV_SEL_DIV2,
+        );
+        r.set(phy.pcs_dw1_ln0, facts::RUN_DCC_ONCE);
+        r.set(phy.cl_dw5, facts::CL_POWER_DOWN_ENABLE);
+    }
+    for (index, lanes) in super::super::rollback::LANE_DW5.iter().enumerate() {
+        let group = if index == 0 {
+            regs::port::PORT_TX_DW5_GRP_A
+        } else {
+            regs::port::PORT_TX_DW5_GRP_B
+        };
+        let values: [Rc<Cell<u32>>; 4] =
+            core::array::from_fn(|lane| Rc::new(Cell::new((1 << 31) | ((lane as u32 + 1) << 18))));
+        for (reg, value) in lanes.iter().zip(&values) {
+            let on_write = value.clone();
+            r.derive(*reg, move |v| {
+                on_write.set(v);
+                v
+            });
+            let on_read = value.clone();
+            r.on_read(*reg, move |_| on_read.get());
+        }
+        let group_write = values.clone();
+        r.derive(group, move |v| {
+            for lane in &group_write {
+                lane.set(v);
+            }
+            v
+        });
+        let group_read = values[0].clone();
+        r.on_read(group, move |_| group_read.get());
+    }
+    r.set(regs::SKL_FUSE_STATUS, u32::MAX);
+    r.set(regs::SFUSE_STRAP, 1 << 8);
+    r.set(regs::DC_STATE_EN, 2);
+    // BIOS keeps the original firmware wells alive. Driver requests can be
+    // withdrawn without faking loss of the firmware's global power references.
+    let well_states = power::well_state(power::PW_1.index) | power::well_state(power::PW_A.index);
+    r.set(regs::HSW_PWR_WELL_CTL1, well_states | (well_states << 1));
+    r.set(regs::HSW_PWR_WELL_CTL2, well_states);
+    r.derive(regs::HSW_PWR_WELL_CTL2, move |v| v | well_states);
+    for reg in [
+        regs::DBUF_CTL_S0,
+        regs::DBUF_CTL_S1,
+        regs::DBUF_CTL_S2,
+        regs::DBUF_CTL_S3,
+    ] {
+        r.derive(reg, |v| {
+            if v & (1 << 31) != 0 {
+                v | (1 << 30)
+            } else {
+                v & !(1 << 30)
+            }
+        });
+    }
+    r.set(regs::DBUF_CTL_S0, (1 << 31) | (1 << 30));
+    r.set(
+        regs::ICL_PWR_WELL_CTL_DDI2,
+        power::well_state(power::DDI_IO_A.index),
+    );
+    (r, live)
+}
+fn transaction_attempt(failure: Option<usize>, posted: bool, ddi: Ddi) -> usize {
+    use super::super::rollback::Transaction;
+    let (regs, _) = boot_firmware_device();
+    if ddi == Ddi::B {
+        regs.set(regs::ddi::TRANS_DDI_FUNC_CTL_A, (1 << 31) | (2 << 27));
+        regs.set(regs::ddi::TRANS_CLK_SEL_A, 2 << 28);
+        regs.set(DDI_BUF_CTL_A, 1 << 7);
+        regs.set(DDI_BUF_CTL_B, 1 << 31);
+        // DDI B on PLL 0: route is independent of the PHY number.
+        regs.set(regs::dpll::ICL_DPCLKA_CFGCR0, 1 << 10);
+    } else {
+        // Unused PHY B must not be calibrated or otherwise changed at boot.
+        regs.set(regs::COMBO_PHYS[1].comp_dw0, 0);
+        regs.set(regs::COMBO_PHYS[1].tx_dw8_ln0, 0);
+    }
+    let io_states =
+        power::well_state(power::DDI_IO_A.index) | power::well_state(power::DDI_IO_B.index);
+    regs.set(regs::ICL_PWR_WELL_CTL_DDI2, io_states);
+    regs.derive(regs::ICL_PWR_WELL_CTL_DDI2, move |v| v | io_states);
+    let backend = FailOneWrite {
+        registers: &regs,
+        calls: Cell::new(0),
+        fail: Cell::new(failure),
+        posted,
+    };
+    let clock = FakeClock::new();
+    let tx = Transaction::begin(&backend, &clock).expect("stable supported firmware");
+    let array = gtt::mock::MockPageTable::new(8192);
+    // A present firmware PTE, alongside arbitrary absent-entry bits.
+    gtt::PageTable::write(&array, 1024, 0x12345001);
+    gtt::PageTable::write(&array, 1025, 0xabcdef00);
+    let table = gtt::Gtt::over(Box::new(array)).unwrap();
+    let image = table.checkpoint().unwrap();
+    let (edid, plan) = plan_1080p60();
+    let mut surface = None;
+    let attempt = (|| -> Result<(), String> {
+        tx.quiesce(&clock)?;
+        power::bring_up_preserving_phys(&tx, tx.reusable_phys.clone()).map_err(|e| e.describe())?;
+        surface = Some(
+            fb::Surface::allocate(&table, 1920, 1080, fb::Format::Xrgb8888)
+                .map_err(|e| e.describe())?,
+        );
+        let mut req = request(&plan, &edid, surface.as_ref().unwrap());
+        req.ddi = ddi;
+        req.pll_id = tx.pll_id;
+        let outcome = set_mode(&tx, &clock, &req).map_err(|e| e.describe())?;
+        if !outcome.prove.verdict().is_scanning_out() {
+            return Err(outcome.render());
+        }
+        Ok(())
+    })();
+    let count = backend.calls.get();
+    if failure.is_none() {
+        assert!(attempt.is_ok(), "{attempt:?}");
+    } else {
+        assert!(attempt.is_err(), "write {failure:?} did not fail");
+    }
+    // Also exercise a requested rollback of a successful native mode. Tests
+    // prove mechanism/order, never claim that a real monitor recovered.
+    let proof = tx
+        .restore(&clock, &table, &image)
+        .expect("firmware rollback");
+    assert!(proof.contains("advances=2"));
+    table.verify_checkpoint(&image).unwrap();
+    for entry in &tx.before.entries {
+        if entry.register.is_writable() && !entry.register.name().starts_with("GMBUS") {
+            // Exact readable state after status derivation, not just native
+            // constants: this includes PLL, PHY, DDI, pipe/plane, WM and power.
+            assert_eq!(
+                regs.read(entry.register).map(u64::from),
+                entry.value,
+                "{} after write failure {failure:?}",
+                entry.register.name()
+            );
+        }
+    }
+    assert_eq!(regs.read(PLANE_SURFLIVE_A), Some(0x400000));
+    assert_eq!(regs.read(regs::pipe::PLANE_SIZE_A), Some((599 << 16) | 799));
+    // Drop backing only after restored plane identity and exact PTE retirement.
+    drop(surface);
+    count
+}
+#[test]
+fn boot_transaction_rolls_back_every_unposted_and_posted_write_failure() {
+    let _guard = scheduler_test_context();
+    for ddi in [Ddi::A, Ddi::B] {
+        let writes = transaction_attempt(None, false, ddi);
+        assert!(writes >= 60, "exercise complete quiesce/power/modeset path");
+        for posted in [false, true] {
+            for n in 1..=writes {
+                transaction_attempt(Some(n), posted, ddi);
+            }
+        }
+    }
+}
+#[test]
+fn unsupported_firmware_and_forbidden_register_writes_are_fail_closed() {
+    use super::super::rollback::Transaction;
+    let (regs, _) = boot_firmware_device();
+    regs.set(regs::pipe::PIPECONF_B, 1 << 31 | 1 << 30);
+    assert!(Transaction::begin(&regs, &FakeClock::new()).is_err());
+    assert!(regs.writes().is_empty());
+    let (regs, _) = boot_firmware_device();
+    let tx = Transaction::begin(&regs, &FakeClock::new()).unwrap();
+    assert!(!tx.write(regs::CDCLK_CTL, 0));
+    assert!(!tx.write(regs::interrupt::DEIIR, u32::MAX));
+    assert!(regs.writes().is_empty());
+}
+#[test]
+fn native_fault_knob_and_gmbus_abort_recover_without_replaying_commands() {
+    use super::super::rollback::Transaction;
+    let (regs, _) = boot_firmware_device();
+    let active = Rc::new(Cell::new(false));
+    let command = active.clone();
+    regs.derive(regs::GMBUS1, move |v| {
+        command.set(v & (1 << 30) != 0);
+        v
+    });
+    regs.on_read(regs::GMBUS2, move |_| if active.get() { 1 << 9 } else { 0 });
+    let clock = FakeClock::new();
+    let tx = Transaction::begin(&regs, &clock).unwrap();
+    let table = test_gtt();
+    let image = table.checkpoint().unwrap();
+    assert!(tx.write(regs::GMBUS0, 4));
+    assert!(tx.write(regs::GMBUS5, 0x80000080));
+    assert!(tx.write(regs::GMBUS1, 1 << 30));
+    assert_ne!(regs.read(regs::GMBUS2).unwrap() & (1 << 9), 0);
+    tx.restore(&clock, &table, &image).unwrap();
+    assert_eq!(regs.read(regs::GMBUS2).unwrap() & (1 << 9), 0);
+    assert_eq!(regs.read(regs::GMBUS0), Some(0));
+    assert_eq!(regs.read(regs::GMBUS5), Some(0));
+    let (regs, _) = boot_firmware_device();
+    let tx = Transaction::begin(&regs, &clock).unwrap();
+    assert!(tx.inject_failure(0).is_err());
+    tx.inject_failure(1).unwrap();
+    assert!(tx.quiesce(&clock).is_err());
+    assert!(regs.writes().is_empty());
+    tx.restore(&clock, &table, &image).unwrap();
+}
+#[test]
+fn rollback_reports_stalled_scanout_and_never_labels_equality_as_recovery() {
+    use super::super::rollback::Transaction;
+    let (regs, _) = boot_firmware_device();
+    let clock = FakeClock::new();
+    let tx = Transaction::begin(&regs, &clock).unwrap();
+    let table = test_gtt();
+    let image = table.checkpoint().unwrap();
+    tx.quiesce(&clock).unwrap();
+    regs.on_read(PIPEDSL_A, |_| 0);
+    assert!(
+        tx.restore(&clock, &table, &image)
+            .unwrap_err()
+            .contains("scanline stalled")
+    );
+    table.verify_checkpoint(&image).unwrap();
+}
+#[test]
+fn firmware_phy_recalibration_and_foreign_state_writes_are_not_admitted() {
+    use super::super::rollback::Transaction;
+    let (regs, _) = boot_firmware_device();
+    regs.set(regs::COMBO_PHYS[0].tx_dw8_ln0, 0);
+    assert!(Transaction::begin(&regs, &FakeClock::new()).is_err());
+    assert!(regs.writes().is_empty());
+    let (regs, _) = boot_firmware_device();
+    let tx = Transaction::begin(&regs, &FakeClock::new()).unwrap();
+    assert!(!tx.write(regs::dpll::DPLL1_ENABLE, 0));
     assert!(regs.writes().is_empty());
 }

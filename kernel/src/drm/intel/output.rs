@@ -564,6 +564,8 @@ pub(crate) struct SwingProgram {
 /// Everything phase 5 needs told.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OutputRequest {
+    /// Existing combo PLL route to use; boot uses the firmware-selected PLL.
+    pub(crate) pll_id: u8,
     /// The DDI the monitor is on: `sink.rs` gets this from the GMBUS pin
     /// (`Pin::ddi()`), and §11 phase 2.3 makes that the authority for which
     /// physical port is in use.
@@ -595,6 +597,7 @@ impl OutputRequest {
     /// and [`PllFieldEncoding::Named`] is the one §6.3's worked example uses.
     pub(crate) const fn hdmi(ddi: Ddi, mode: Mode, encoding: PllFieldEncoding) -> Self {
         Self {
+            pll_id: ddi.index() as u8,
             ddi,
             port_type: PortType::Hdmi,
             mode,
@@ -705,6 +708,19 @@ const fn port_registers(phy: ComboPhy) -> PortRegisters {
             ddi_buf_ctl: ddi::DDI_BUF_CTL_B,
         },
     }
+}
+
+fn selected_port_registers(phy: ComboPhy, index: u8) -> Result<PortRegisters, OutputError> {
+    let mut registers = port_registers(phy);
+    let (enable, cfg0, cfg1) = match index {
+        0 => (dpll::DPLL0_ENABLE, dpll::DPLL0_CFGCR0, dpll::DPLL0_CFGCR1),
+        1 => (dpll::DPLL1_ENABLE, dpll::DPLL1_CFGCR0, dpll::DPLL1_CFGCR1),
+        _ => return Err(OutputError::ComboPllIndex { index }),
+    };
+    registers.pll_enable = enable;
+    registers.pll_cfgcr0 = Some(cfg0);
+    registers.pll_cfgcr1 = Some(cfg1);
+    Ok(registers)
 }
 
 /// The three `PORT_TX_*` dwords §8.5's batch writes once per lane.
@@ -843,6 +859,7 @@ const fn phy_index(phy: ComboPhy) -> u32 {
 /// without going through a register file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OutputProgram {
+    pub(crate) pll_id: u8,
     /// The DDI this plan is for.
     pub(crate) ddi: Ddi,
     /// The combo PHY that DDI is on: A ↔ DPLL0, B ↔ DPLL1 (§6.3's table).
@@ -908,7 +925,7 @@ impl OutputProgram {
         // FIA and no Type-C state machine in this kernel, so a request for one
         // is refused before a single register value is computed.
         let phy = combo_phy_of(request.ddi)?;
-        let registers = port_registers(phy);
+        let registers = selected_port_registers(phy, request.pll_id)?;
 
         // Both combo PHYs have a config pair in the table, so this is a check
         // on the table's completeness rather than on the request: a PHY whose
@@ -1003,6 +1020,7 @@ impl OutputProgram {
             | request.width.four_lane_bit();
 
         Ok(Self {
+            pll_id: request.pll_id,
             ddi: request.ddi,
             phy,
             port_type: request.port_type,
@@ -1016,7 +1034,7 @@ impl OutputProgram {
             ddi_io_well: ddi_io_well(phy),
             swing,
             link_rate: request.link_rate,
-            dpclka_select: phy.ddi_clock_select(),
+            dpclka_select: u32::from(request.pll_id) << (phy_index(phy) * 2),
             dpclka_clock_off: phy.ddi_clock_off_bit(),
             trans_clk_sel,
             trans_ddi_func_ctl,
@@ -1234,7 +1252,7 @@ pub(crate) fn program(
     // The register set is looked up from that same DDI, so a plan whose `phy`
     // field disagreed with its `ddi` field could not redirect a write.
     let phy = combo_phy_of(plan.ddi)?;
-    let registers = port_registers(phy);
+    let registers = selected_port_registers(phy, plan.pll_id)?;
     let pll_cfgcr0 = registers
         .pll_cfgcr0
         .ok_or(OutputError::PllConfigRegisterMissing { phy })?;
@@ -1367,9 +1385,9 @@ pub(crate) fn program(
     // 5.6 -- the transcoder itself.  `regs/pipe.rs` calls this register
     // `PIPECONF_A`; §5.2 records that i915 v6.12 calls the same offset
     // `TRANSCONF` and that they are one register, not two.
-    write(regs, pipe::PIPECONF_A, plan.transconf)?;
+    // The pipe enable follows the HDMI encoder enable below.
 
-    // 5.7 -- the DDI buffer last, then the idle poll.  The write is a
+    // 5.7 -- the DDI buffer, then idle poll, then transcoder enable.  The write is a
     // read-modify-write over the fields the plan composes
     // ([`DDI_BUF_CTL_OWNED`]): the register also carries the board's
     // `PORT_REVERSAL` and i915 keeps it for this exact mode, so a whole-value
@@ -1405,6 +1423,9 @@ pub(crate) fn program(
             });
         }
     }
+    // ADL-P/N i915 enables the HDMI encoder before the CPU transcoder;
+    // plane arm follows both. A stopped firmware pipe is mandatory at boot.
+    write(regs, pipe::PIPECONF_A, plan.transconf)?;
     let ddi_buf_ctl_readback = read(regs, registers.ddi_buf_ctl)?;
 
     Ok(OutputState {
@@ -1433,6 +1454,9 @@ pub(crate) fn program(
 /// `pll::PllError` and `power::PowerError`; `describe()` is the text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum OutputError {
+    ComboPllIndex {
+        index: u8,
+    },
     /// The DDI is not a combo-PHY port, so this sequence does not cover it.
     UnsupportedDdi {
         /// The DDI that was asked for.
@@ -1559,6 +1583,9 @@ impl OutputError {
     /// The error in words a person on the machine can act on.
     pub(crate) fn describe(&self) -> String {
         match self {
+            Self::ComboPllIndex { index } => {
+                format!("unsupported combo PLL {index}: only 0 and 1 are implemented")
+            }
             Self::UnsupportedDdi { ddi } => format!(
                 "DDI {} is not a combo-PHY port.  Reference section 8.1: the ports this sequence \
                  programs are combo PHY A and B; C and D are Type-C/DKL ports, and section 8.8 \

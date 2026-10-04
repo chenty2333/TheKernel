@@ -1290,6 +1290,20 @@ fn unwind(
 /// well as emitted, because none of this can be run on the target yet and a
 /// host test has to be able to read what it would have said.
 pub(crate) fn bring_up(regs: &impl Registers) -> Result<PowerState, PowerError> {
+    bring_up_inner(regs, None)
+}
+/// Boot rollback reuses an already verified active PHY; it must not recalibrate
+/// unused PHYs or modify hidden analog state that a register image cannot undo.
+pub(crate) fn bring_up_preserving_phys(
+    regs: &impl Registers,
+    phys: Vec<phy::PhyState>,
+) -> Result<PowerState, PowerError> {
+    bring_up_inner(regs, Some(phys))
+}
+fn bring_up_inner(
+    regs: &impl Registers,
+    preserved: Option<Vec<phy::PhyState>>,
+) -> Result<PowerState, PowerError> {
     // Phase 0.3: the "am I allowed to do this" reads, before anything is
     // programmed.  On a machine whose display is fused off, every later step
     // fails with no diagnostic at all, so these two refusals exist to be the
@@ -1309,7 +1323,10 @@ pub(crate) fn bring_up(regs: &impl Registers) -> Result<PowerState, PowerError> 
 
     // Phase 1.2: PHY A first, for every combo PHY present.  This runs before
     // PW_1, which is the order `icl_display_core_init` uses.
-    let phys = phy::init_all(regs)?;
+    let phys = match preserved {
+        Some(phys) => phys,
+        None => phy::init_all(regs)?,
+    };
 
     // Phase 1.3.
     let pw1 = enable_well(regs, PW_1)?;
