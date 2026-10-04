@@ -199,3 +199,25 @@ terminfo 打包修复：Alpine ncurses-terminfo-base 把数据装在 `/etc/termi
 （shell-tezgq9hr，PTY_TOOL_OK）；这证明基本交互启动，不代表所有字段/面板
 都已核对。最新完整 host Python655（3 环境 skip）+Rust5997、两个平台 lint、
 KVM default guest56/56 均通过，正常关机（system-pyjsqlum）。top/vmstat 仍待修。
+
+### 基础 vmstat：已测量字段，未测量字段不伪造
+
+新增 allocator 实际 free/VirtMem/PageCache/PageTable 页数、CPU-local 累计
+成功 minor/major fault 事件；已有后台回收 worker 的 scanned/reclaimed 页
+事件映射到 pgscan_kswapd/pgsteal_kswapd。PSWP/CMA 确实没有对应机制，字段
+为 0。没有把累计扫描遇到的 dirty/writeback/pinned 数冒充当前 gauge。
+未跟踪的 LRU/dirty/writeback/分页 I/O 等字段暂未发布；**统计覆盖仍部分**。
+当前 pgfault/pgmajfault 的来源是 TheKernel 的成功 fault 分类边界，Linux
+PGFAULT 也计部分失败的 MM fault、PGMAJFAULT 有失败 I/O 的计数边界；这种
+错误完成路径尚未对齐，不能声称负向事件统计已经完整。
+
+主机两个新计数/格式回归以及完整 kernel 2584 通过，lint 通过；最新完整
+KVM guest57/57 无 skip 正常关机（system-bxuaoq86）。新 probe 在 fork 后
+实际写私有页制造 COW，证明累计 fault 增长，而不假定 mmap 初始写都 lazy。
+Linux 主机同一 probe 通过；nr_anon 是 gauge，Linux 会批量折叠且主机有其它
+进程，不能要求一次全局快照净增恰好 32。第一次探针的这个错误假设已修正
+并完整重跑，不将那次失败记成通过。
+
+真实 Alpine vmstat -s、vmstat 1 2、top -b -n 1 均已启动并输出
+（shell-xa3o8qek）。top 不再直接退出，但 VIRT/RES/SHR 都为 0（缺 PID statm），
+vmstat 的 context switches 等未接入字段仍为 0；**不是最终完整工具验收**。

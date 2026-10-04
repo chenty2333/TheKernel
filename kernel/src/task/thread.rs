@@ -2726,12 +2726,14 @@ impl Thread {
     /// Accounts one successfully handled minor page fault.
     pub(crate) fn account_minor_fault(&self) {
         self.minor_faults.fetch_add(1, Ordering::Relaxed);
+        crate::mm::vm_events::account_fault(false);
         self.perf_on_minor_fault();
     }
 
     /// Accounts one successfully handled major page fault.
     pub(crate) fn account_major_fault(&self) {
         self.major_faults.fetch_add(1, Ordering::Relaxed);
+        crate::mm::vm_events::account_fault(true);
         self.perf_on_major_fault();
     }
 

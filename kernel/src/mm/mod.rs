@@ -12,6 +12,7 @@ mod pressure;
 mod remap;
 pub(crate) mod secret;
 mod stats;
+pub(crate) mod vm_events;
 mod swap;
 mod thp;
 mod tlb;
