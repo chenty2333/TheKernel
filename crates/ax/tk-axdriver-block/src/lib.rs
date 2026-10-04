@@ -773,3 +773,5 @@ mod tests {
         ));
     }
 }
+
+pub mod partition;

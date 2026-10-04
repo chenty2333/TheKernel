@@ -10,6 +10,8 @@ use crate::{drivers::RegisteredStaticBlockDevice, prelude::*};
 pub enum StaticBlockDevice {
     /// A driver discovered through the normal global/MMIO/PCI probes.
     Existing(RegisteredStaticBlockDevice),
+    #[cfg(feature = "shared-block")]
+    Partition(alloc::boxed::Box<crate::partition::PartitionBlock>),
     #[cfg(feature = "nvme")]
     Nvme(alloc::boxed::Box<crate::nvme::NvmeDevice>),
     #[cfg(feature = "usb-xhci")]
@@ -37,6 +39,8 @@ impl BaseDriverOps for StaticBlockDevice {
     fn device_name(&self) -> &str {
         match self {
             Self::Existing(device) => device.device_name(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.device_name(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.device_name(),
             Self::BootModule(device) => device.device_name(),
@@ -48,6 +52,8 @@ impl BaseDriverOps for StaticBlockDevice {
     fn device_type(&self) -> DeviceType {
         match self {
             Self::Existing(device) => device.device_type(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.device_type(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.device_type(),
             Self::BootModule(device) => device.device_type(),
@@ -59,6 +65,8 @@ impl BaseDriverOps for StaticBlockDevice {
     fn irq_num(&self) -> Option<usize> {
         match self {
             Self::Existing(device) => device.irq_num(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.irq_num(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.irq_num(),
             Self::BootModule(device) => device.irq_num(),
@@ -73,6 +81,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn num_blocks(&self) -> u64 {
         match self {
             Self::Existing(device) => device.num_blocks(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.num_blocks(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.num_blocks(),
             Self::BootModule(device) => device.num_blocks(),
@@ -83,6 +93,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn block_size(&self) -> usize {
         match self {
             Self::Existing(device) => device.block_size(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.block_size(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.block_size(),
             Self::BootModule(device) => device.block_size(),
@@ -93,6 +105,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn block_geometry(&self) -> DevResult<axdriver_block::BlockGeometry> {
         match self {
             Self::Existing(device) => device.block_geometry(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.block_geometry(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.block_geometry(),
             Self::BootModule(device) => device.block_geometry(),
@@ -103,6 +117,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn block_capabilities(&self) -> axdriver_block::BlockCapabilities {
         match self {
             Self::Existing(device) => device.block_capabilities(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.block_capabilities(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.block_capabilities(),
             Self::BootModule(device) => device.block_capabilities(),
@@ -113,6 +129,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> DevResult {
         match self {
             Self::Existing(device) => device.read_block(block_id, buf),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.read_block(block_id, buf),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.read_block(block_id, buf),
             Self::BootModule(device) => device.read_block(block_id, buf),
@@ -123,6 +141,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn read_block_vectored(&mut self, block_id: u64, bufs: &mut [&mut [u8]]) -> DevResult {
         match self {
             Self::Existing(device) => device.read_block_vectored(block_id, bufs),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.read_block_vectored(block_id, bufs),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.read_block_vectored(block_id, bufs),
             Self::BootModule(device) => device.read_block_vectored(block_id, bufs),
@@ -133,6 +153,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn write_block(&mut self, block_id: u64, buf: &[u8]) -> DevResult {
         match self {
             Self::Existing(device) => device.write_block(block_id, buf),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.write_block(block_id, buf),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.write_block(block_id, buf),
             Self::BootModule(device) => device.write_block(block_id, buf),
@@ -143,6 +165,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn write_block_vectored(&mut self, block_id: u64, bufs: &[&[u8]]) -> DevResult {
         match self {
             Self::Existing(device) => device.write_block_vectored(block_id, bufs),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.write_block_vectored(block_id, bufs),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.write_block_vectored(block_id, bufs),
             Self::BootModule(device) => device.write_block_vectored(block_id, bufs),
@@ -157,6 +181,8 @@ impl BlockDriverOps for StaticBlockDevice {
     ) -> DevResult<BlockPhysicalSgOutcome> {
         match self {
             Self::Existing(device) => unsafe { device.read_block_physical_sg(block_id, segments) },
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => unsafe { device.read_block_physical_sg(block_id, segments) },
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => unsafe { device.read_block_physical_sg(block_id, segments) },
             Self::BootModule(device) => unsafe {
@@ -173,6 +199,8 @@ impl BlockDriverOps for StaticBlockDevice {
     ) -> DevResult<BlockPhysicalSgOutcome> {
         match self {
             Self::Existing(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
             Self::BootModule(device) => unsafe {
@@ -185,6 +213,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn flush(&mut self) -> DevResult {
         match self {
             Self::Existing(device) => device.flush(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.flush(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.flush(),
             Self::BootModule(device) => device.flush(),
@@ -195,6 +225,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn write_block_fua(&mut self, block_id: u64, buf: &[u8]) -> DevResult {
         match self {
             Self::Existing(device) => device.write_block_fua(block_id, buf),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.write_block_fua(block_id, buf),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.write_block_fua(block_id, buf),
             Self::BootModule(device) => device.write_block_fua(block_id, buf),
@@ -205,6 +237,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn fence(&mut self) -> DevResult {
         match self {
             Self::Existing(device) => device.fence(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.fence(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.fence(),
             Self::BootModule(device) => device.fence(),
@@ -215,6 +249,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn discard_blocks(&mut self, range: BlockRange) -> DevResult {
         match self {
             Self::Existing(device) => device.discard_blocks(range),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.discard_blocks(range),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.discard_blocks(range),
             Self::BootModule(device) => device.discard_blocks(range),
@@ -225,6 +261,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn write_zeroes(&mut self, range: BlockRange) -> DevResult {
         match self {
             Self::Existing(device) => device.write_zeroes(range),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.write_zeroes(range),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.write_zeroes(range),
             Self::BootModule(device) => device.write_zeroes(range),
@@ -235,6 +273,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn async_queue_caps(&self) -> Option<BlockQueueCaps> {
         match self {
             Self::Existing(device) => device.async_queue_caps(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.async_queue_caps(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.async_queue_caps(),
             Self::BootModule(device) => device.async_queue_caps(),
@@ -248,6 +288,8 @@ impl BlockDriverOps for StaticBlockDevice {
     ) -> DevResult<BlockSubmitReport> {
         match self {
             Self::Existing(device) => device.submit_async_batch(requests),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.submit_async_batch(requests),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.submit_async_batch(requests),
             Self::BootModule(device) => device.submit_async_batch(requests),
@@ -261,6 +303,8 @@ impl BlockDriverOps for StaticBlockDevice {
     ) -> DevResult<BlockSubmitReport> {
         match self {
             Self::Existing(device) => device.submit_sync_batch(requests),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.submit_sync_batch(requests),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.submit_sync_batch(requests),
             Self::BootModule(device) => device.submit_sync_batch(requests),
@@ -274,6 +318,8 @@ impl BlockDriverOps for StaticBlockDevice {
     ) -> DevResult<BlockSubmitReport> {
         match self {
             Self::Existing(device) => unsafe { device.submit_physical_batch(requests) },
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => unsafe { device.submit_physical_batch(requests) },
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => unsafe { device.submit_physical_batch(requests) },
             Self::BootModule(device) => unsafe { device.submit_physical_batch(requests) },
@@ -287,6 +333,8 @@ impl BlockDriverOps for StaticBlockDevice {
     ) -> DevResult<BlockCompletionDrain> {
         match self {
             Self::Existing(device) => device.drain_async_completions(output),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.drain_async_completions(output),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.drain_async_completions(output),
             Self::BootModule(device) => device.drain_async_completions(output),
@@ -300,6 +348,8 @@ impl BlockDriverOps for StaticBlockDevice {
     ) -> DevResult<BlockCompletionDrain> {
         match self {
             Self::Existing(device) => device.wait_any_physical_completion(output),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.wait_any_physical_completion(output),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.wait_any_physical_completion(output),
             Self::BootModule(device) => device.wait_any_physical_completion(output),
@@ -314,6 +364,8 @@ impl BlockDriverOps for StaticBlockDevice {
     ) -> DevResult {
         match self {
             Self::Existing(device) => device.install_completion_notifier(notifier, context),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.install_completion_notifier(notifier, context),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.install_completion_notifier(notifier, context),
             Self::BootModule(device) => device.install_completion_notifier(notifier, context),
@@ -324,6 +376,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn reset_device(&mut self) -> DevResult<BlockResetOutcome> {
         match self {
             Self::Existing(device) => device.reset_device(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.reset_device(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.reset_device(),
             Self::BootModule(device) => device.reset_device(),
@@ -334,6 +388,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn poll_async_complete(&mut self, budget: usize) -> DevResult<usize> {
         match self {
             Self::Existing(device) => device.poll_async_complete(budget),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.poll_async_complete(budget),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.poll_async_complete(budget),
             Self::BootModule(device) => device.poll_async_complete(budget),
@@ -344,6 +400,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn wait_async_all(&mut self, handles: &[BlockRequestHandle]) -> DevResult {
         match self {
             Self::Existing(device) => device.wait_async_all(handles),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.wait_async_all(handles),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.wait_async_all(handles),
             Self::BootModule(device) => device.wait_async_all(handles),
@@ -354,6 +412,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn enable_irq(&mut self) -> DevResult {
         match self {
             Self::Existing(device) => device.enable_irq(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.enable_irq(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.enable_irq(),
             Self::BootModule(device) => device.enable_irq(),
@@ -364,6 +424,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn disable_irq(&mut self) -> DevResult {
         match self {
             Self::Existing(device) => device.disable_irq(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.disable_irq(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.disable_irq(),
             Self::BootModule(device) => device.disable_irq(),
@@ -374,6 +436,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn is_irq_enabled(&self) -> bool {
         match self {
             Self::Existing(device) => device.is_irq_enabled(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.is_irq_enabled(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.is_irq_enabled(),
             Self::BootModule(device) => device.is_irq_enabled(),
@@ -384,6 +448,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn handle_irq(&mut self) -> DevResult<usize> {
         match self {
             Self::Existing(device) => device.handle_irq(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.handle_irq(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.handle_irq(),
             Self::BootModule(device) => device.handle_irq(),
@@ -394,6 +460,8 @@ impl BlockDriverOps for StaticBlockDevice {
     fn fence_async(&mut self) -> DevResult {
         match self {
             Self::Existing(device) => device.fence_async(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.fence_async(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.fence_async(),
             Self::BootModule(device) => device.fence_async(),

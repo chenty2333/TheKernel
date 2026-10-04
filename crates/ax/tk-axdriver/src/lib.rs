@@ -195,6 +195,8 @@ pub fn activate_boot_pci_input_devices<Register, Unregister>(
 pub fn block_device_is_read_only(device: &AxBlockDevice) -> bool {
     #[cfg(feature = "nvme")]
     if let StaticBlockDevice::Nvme(nvme) = device { return nvme.read_only(); }
+    #[cfg(feature = "shared-block")]
+    if let StaticBlockDevice::Partition(partition) = device { return partition.read_only(); }
     matches!(device, StaticBlockDevice::BootModule(_))
 }
 
@@ -623,3 +625,8 @@ mod nvme;
 
 #[cfg(feature = "intel-hda")]
 mod hda;
+
+#[cfg(feature = "shared-block")]
+mod partition;
+#[cfg(feature = "shared-block")]
+pub use partition::discover_gpt_partitions;

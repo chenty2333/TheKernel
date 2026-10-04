@@ -33,10 +33,11 @@ commands. Owned DMA survives until reset proves RDY=0; an unresponsive device
 quarantines allocations rather than letting a late DMA corrupt reused memory.
 No retry that could duplicate an uncertain write is performed.
 
-**Polling, not MSI-X, is implemented.** The platform has fixed IRQ handlers but
-no reservable MSI-X vector/DMA-domain lifecycle. Guessing a vector or registering
-an IRQ that overlaps another driver is not an acceptable substitute. MSI-X
-reservation and completion wakeups remain work, so this is not full B1 closure.
+MSI-X is preferred when a validated capability/table and permanently owned
+vector are available; task-context CQ ownership is preserved and bounded
+polling remains armed. Early boot and missing IRQ delivery fall back safely.
+`nvme.poll=1` selects diagnostic polling explicitly. The ownership/table/
+wakeup contract and measured transport tests are in `nvme-msix.md`.
 
 The static block wrapper already had BootModule/Existing/USB variants. NVMe
 adds a peer variant and independent feature-gated probe; it deliberately does
@@ -45,10 +46,16 @@ and USB coexist without forcing every block device into a global dynamic
 model. The bootloader module remains root `/dev/vda`; NVMe is registered as
 `/dev/nvme0n1`, with immutable hardware RO propagated to the registry.
 
-**The inspected tree has no generic MBR/GPT partition device enumeration.**
-No partition nodes or Windows filesystem mounts are claimed in this change.
-Raw read-only inspection is safe; GPT/MBR views remain work rather than a
-vendor driver inventing its own filesystem path.
+GPT views are now discovered by the reusable `tk-axdriver-block::partition`
+parser and published through the existing device registry/devfs. It checks
+protective MBR, primary GPT header/entry-array CRCs, bounded sizes, geometry
+and non-overlap before exposing `nvme0n1pN`. A corrupt table leaves the whole
+disk node available but publishes no questionable partitions. This is GPT,
+not extended MBR support; recovery from a corrupt primary using backup GPT is
+not implemented. Views share the one parent controller queue, enforce relative
+bounds and retain immutable hardware RO even if BLKROSET clears software RO.
+The root boot module is unchanged; a partition can be mounted as ext4 data.
+No Windows filesystem mount or BitLocker decryption is attempted.
 
 ## Validation
 
@@ -90,3 +97,14 @@ Run-local boot-argument ESP/GRUB outputs are checked against all input paths
 before writing: matching paths and hardlinks to an input NVMe image are
 rejected without invoking the ESP builder. A normal explicit RO-parameter
 boot still passed the content/admission helper.
+
+
+Continuation GPT validation: a disposable 128-MiB QEMU GPT image contains a
+119-MiB ext4 partition at 1 MiB. `/dev/nvme0n1p1` reports the exact geometry;
+partition-relative superblock bytes match the parent's offset. Default writes
+fail with EROFS, and clearing software RO cannot bypass the driver lock. With
+explicit write enable, a 128-KiB file write/fsync/read/unmount passes and host
+debugfs extraction matches every byte independently. MSI-X completion wake
+was observed; forced polling passes the same RO/offset test. Parser/view host
+tests reject corrupt CRCs, overlaps, out-of-range I/O and RO writes. All target
+N305 behavior remains hardware-unverified.

@@ -911,6 +911,12 @@ fn init_filesystems_with_root_mode(
             String::from(dev.device_name())
         } else { extra_device_name(index) };
         let device = SharedBlockDevice::new(dev);
+        let partitions = if name.starts_with("nvme") {
+            match axdriver::discover_gpt_partitions(&device, &name, read_only) {
+                Ok(partitions) => partitions,
+                Err(error) => { warn!("GPT discovery on {name} rejected: {error:?}; whole disk retained"); Vec::new() }
+            }
+        } else { Vec::new() };
         extras.push(RegisteredBlockDevice {
             name,
             info: BlockDeviceInfo {
@@ -921,6 +927,15 @@ fn init_filesystems_with_root_mode(
             mounted: Arc::new(AtomicBool::new(false)),
             device,
         });
+        for partition in partitions {
+            let name = String::from(partition.device_name());
+            let device = SharedBlockDevice::new(partition);
+            info!("registered GPT partition /dev/{name} blocks={} read_only={read_only}", device.num_blocks());
+            extras.push(RegisteredBlockDevice {
+                name, info:BlockDeviceInfo {num_blocks:device.num_blocks(),block_size:device.block_size()},
+                read_only:AtomicBool::new(read_only),mounted:Arc::new(AtomicBool::new(false)),device,
+            });
+        }
         index += 1;
     }
     EXTRA_BLOCK_DEVICES.call_once(|| Mutex::new(extras));
