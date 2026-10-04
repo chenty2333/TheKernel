@@ -73,7 +73,7 @@ if actual != expected:
 out.mkdir()
 # Only runtime libraries/data live at distro absolute paths. Never replace the
 # project's init, accounts, shell, BusyBox, or baseline program symlinks.
-for path in ['lib', 'usr/lib', 'usr/share']:
+for path in ['lib', 'usr/lib', 'usr/share', 'etc/terminfo']:
     shutil.copytree(root/path, out/path, symlinks=True)
 for path in ['lib/apk', 'lib/modules-load.d', 'lib/sysctl.d', 'usr/lib/modules-load.d',
              'usr/lib/sysctl.d', 'usr/lib/apk']:

@@ -192,3 +192,10 @@ Linux 主机同一回归也通过。**time namespace 偏移在本项只核对源
 真实 Alpine ps 的 STARTED 不再是 1970，显示此次 guest 的实际启动日期
 （shell-6riw98rp）。top 仍失败，不能称跑通；htop 已越过缺 btime 的错误，
 现在明确报无法初始化终端类型 vt100，需核对 payload 的 terminfo 数据路径。
+
+terminfo 打包修复：Alpine ncurses-terminfo-base 把数据装在 `/etc/terminfo`，
+并非 `/usr/share/terminfo`。独立 payload 增加这个已签名数据目录，不复制
+发行版账户/系统配置。真实 htop 在 guest PTY 内完成渲染并按 q 正常退出
+（shell-tezgq9hr，PTY_TOOL_OK）；这证明基本交互启动，不代表所有字段/面板
+都已核对。最新完整 host Python655（3 环境 skip）+Rust5997、两个平台 lint、
+KVM default guest56/56 均通过，正常关机（system-pyjsqlum）。top/vmstat 仍待修。

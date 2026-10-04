@@ -28,6 +28,11 @@ class InspectPayloadTests(unittest.TestCase):
         self.assertNotIn('podman', dict(pins))
         self.assertTrue(all(version for _, version in pins))
 
+    def test_terminfo_follows_the_alpine_runtime_path(self):
+        source = (ROOT/'scripts/build-inspect-payload.sh').read_text()
+        self.assertIn("'etc/terminfo'", source)
+        self.assertNotIn("for path in ['etc']", source)
+
     def test_busybox_keeps_multicall_dispatch_basename(self):
         source = (ROOT/'scripts/build-inspect-payload.sh').read_text()
         self.assertIn("bin_dir/'busybox'", source)
