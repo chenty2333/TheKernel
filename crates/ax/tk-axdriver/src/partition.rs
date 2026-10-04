@@ -2,7 +2,16 @@
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 
 use crate::{AxBlockDevice, SharedBlockDevice, StaticBlockDevice, prelude::*};
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartitionMetadata {
+    pub parent: String,
+    pub number: usize,
+    /// Starting logical block on the parent, not a 512-byte sector count.
+    pub start: u64,
+}
+
 pub struct PartitionBlock {
+    metadata: PartitionMetadata,
     parent: SharedBlockDevice,
     start: u64,
     blocks: u64,
@@ -19,6 +28,9 @@ impl PartitionBlock {
             return Err(DevError::InvalidParam);
         }
         self.start.checked_add(block).ok_or(DevError::InvalidParam)
+    }
+    pub fn metadata(&self) -> &PartitionMetadata {
+        &self.metadata
     }
     pub fn read_only(&self) -> bool {
         self.read_only
@@ -71,6 +83,11 @@ pub fn discover_gpt_partitions(
         .into_iter()
         .map(|part| {
             StaticBlockDevice::Partition(Box::new(PartitionBlock {
+                metadata: PartitionMetadata {
+                    parent: name.into(),
+                    number: part.number,
+                    start: part.start,
+                },
                 parent: parent.clone(),
                 start: part.start,
                 blocks: part.blocks,
@@ -93,6 +110,11 @@ mod tests {
             axdriver_block::ramdisk::RamDisk::from(data.as_slice()),
         ));
         let mut view = PartitionBlock {
+            metadata: PartitionMetadata {
+                parent: "nvme0n1".into(),
+                number: 1,
+                start: 4,
+            },
             parent: parent.clone(),
             start: 4,
             blocks: 8,
@@ -100,6 +122,9 @@ mod tests {
             name: "nvme0n1p1".into(),
             read_only: true,
         };
+        assert_eq!(view.metadata().start, 4);
+        assert_eq!(view.metadata().number, 1);
+        assert_eq!(view.metadata().parent, "nvme0n1");
         let mut out = [0; 512];
         view.read_block(0, &mut out).unwrap();
         assert_eq!(&out, &data[2048..2560]);

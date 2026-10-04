@@ -3429,6 +3429,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
     }
 
     let mut root = DirMapping::new();
+    super::block_inventory::register_proc(&mut root, &fs);
     super::proc_inventory::register(&mut root, &fs);
     super::proc_interrupts::register(&mut root, &fs);
     super::proc_memory::register(&mut root, &fs);

@@ -1,5 +1,6 @@
 //! Basic virtual filesystem support
 
+mod block_inventory;
 pub mod cgroup;
 pub mod dev;
 mod device;

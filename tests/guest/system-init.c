@@ -478,6 +478,12 @@ static int test_exec_mm_bounds(void) {
         NULL, "exec-mm-bounds-child");
 }
 
+static int test_block_inventory(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-block-inventory-smoke",
+        NULL, "block-inventory-child");
+}
+
 static int test_proc_statm(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-proc-statm-smoke",
@@ -1076,6 +1082,7 @@ static int run_init(int argc, char **argv) {
         { "proc-statm", test_proc_statm, 30 },
         { "exec-mm-bounds", test_exec_mm_bounds, 30 },
         { "proc-scheduler-counts", test_proc_scheduler_counts, 30 },
+        { "block-inventory", test_block_inventory, 30 },
         { "memory-pressure", test_memory_pressure_reclaim, 120 },
         { "process-exec", test_process_pipe_and_exec, 60 },
         { "vfork", test_vfork, 60 },

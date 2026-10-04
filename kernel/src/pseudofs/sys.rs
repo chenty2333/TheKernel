@@ -189,7 +189,10 @@ fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     // Device-registry publication supplies the complete graphics class
     // object.  A static empty fb0 directory would shadow that object and
     // prevent udev from reading its dev/uevent attributes.
-    SimpleDir::new_maker(fs.clone(), Arc::new(device_registry::class_root(fs)))
+    SimpleDir::new_maker(
+        fs.clone(),
+        Arc::new(super::block_inventory::class_root(fs.clone()).chain(device_registry::class_root(fs))),
+    )
 }
 
 fn block_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
@@ -212,6 +215,9 @@ fn block_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     }
 
     for (index, name) in axfs::block_device_names().into_iter().enumerate() {
+        if axfs::block_inventory().iter().any(|entry| entry.name == name && entry.partition.is_some()) {
+            continue;
+        }
         let Some(info) = axfs::block_device_info(&name) else {
             continue;
         };
@@ -271,7 +277,10 @@ fn dev_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
 
 fn block_device_link(fs: Arc<SimpleFs>, dev_name: String) -> Arc<SimpleFile> {
     SimpleFile::new(fs, NodeType::Symlink, move || {
-        Ok(format!("../../block/{dev_name}"))
+        Ok(format!(
+            "../../block/{}",
+            super::block_inventory::path(&dev_name)
+        ))
     })
 }
 
@@ -398,7 +407,7 @@ fn node_meminfo(node: u32) -> String {
     )
 }
 
-fn block_device_dir(
+pub(super) fn block_device_dir(
     fs: Arc<SimpleFs>,
     dev_name: String,
     dev_id: DeviceId,
@@ -421,7 +430,8 @@ fn block_device_dir(
         SimpleFile::new_regular(fs.clone(), || Ok(format!("{BLOCK_DMA_ALIGNMENT}\n"))),
     );
     dir.add("queue", SimpleDir::new_maker(fs.clone(), Arc::new(queue)));
-    dir.add("uevent", uevent_file(fs.clone(), dev_name, dev_id));
+    dir.add("uevent", uevent_file(fs.clone(), dev_name.clone(), dev_id));
+    super::block_inventory::augment_device(&mut dir, &fs, &dev_name, dev_id);
     SimpleDir::new_maker(fs, Arc::new(dir))
 }
 
@@ -490,6 +500,7 @@ fn loop_block_device_dir(
     );
     dir.add("queue", SimpleDir::new_maker(fs.clone(), Arc::new(queue)));
     dir.add("loop", SimpleDir::new_maker(fs.clone(), Arc::new(loop_dir)));
+    super::block_inventory::augment_loop(&mut dir, &fs, dev_id);
     dir.add("uevent", uevent_file(fs.clone(), dev_name, dev_id));
     SimpleDir::new_maker(fs, Arc::new(dir))
 }

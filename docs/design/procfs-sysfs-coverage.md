@@ -263,3 +263,23 @@ Host tk-axtask139 and kernel2588 tests, lint, and full KVM guest60/60 passed
 observed increased publication/switch totals. Real Alpine `vmstat 1 2` now reports
 nonzero context-switch rates and real runnable snapshots (shell-70ia2vsi);
 its missing blocked-I/O accounting remains unaccepted.
+
+### Registered block geometry and GPT topology
+
+The block registry now retains parent/partition-number/start metadata from the
+validated GPT parser. Sysfs exposes `dev`, actual registry `ro`, `removable=0`
+(the registered fixed disks have no removable-media state machine), Linux
+512-byte-sector `size`/partition `start`, partition `partition`/`uevent`, and
+`subsystem`. Whole disks contain their partition directories; `/sys/class/block`
+and `/sys/dev/block` resolve to that same tree, using the established devfs IDs.
+`/proc/partitions` reports actual nonzero capacities in KiB, including attached
+loop devices. Existing queue logical-block-size/DMA-alignment remain unchanged;
+other queue fields and `stat`/`diskstats` are **not yet implemented**.
+
+Driver49, axfs230, kernel2590 host tests, product lint, and full KVM guest61/61
+passed (system-1j2wnemi), with no guest skip and normal shutdown. The guest probe
+compares sysfs and proc capacities/read-only state against real block ioctls and
+checks both aliases. Real Alpine `lsblk` now shows the 160MiB read-only boot disk
+mounted at `/`, rather than an empty inventory (shell-3xbtpov0). That guest has
+no NVMe GPT disk: the GPT parent/offset tests cover the host partition view and
+formatters, **not a real guest partition tree or physical NVMe**.

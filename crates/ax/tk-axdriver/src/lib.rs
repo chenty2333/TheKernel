@@ -629,7 +629,17 @@ mod hda;
 #[cfg(feature = "shared-block")]
 mod partition;
 #[cfg(feature = "shared-block")]
-pub use partition::discover_gpt_partitions;
+pub use partition::{discover_gpt_partitions, PartitionMetadata};
+
+/// Geometry retained by a validated GPT view; never inferred from its name.
+#[cfg(all(feature = "shared-block", not(feature = "dyn")))]
+pub fn block_device_partition(device: &AxBlockDevice) -> Option<PartitionMetadata> {
+    if let StaticBlockDevice::Partition(partition) = device {
+        Some(partition.metadata().clone())
+    } else { None }
+}
+#[cfg(all(feature = "shared-block", feature = "dyn"))]
+pub fn block_device_partition(_device: &AxBlockDevice) -> Option<PartitionMetadata> { None }
 #[cfg(feature = "itco")]
 pub mod itco;
 

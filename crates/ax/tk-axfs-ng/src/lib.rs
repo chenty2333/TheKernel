@@ -63,6 +63,9 @@ pub(crate) fn account_backing_read(_bytes: usize) {}
 #[inline]
 pub(crate) fn account_backing_write(_bytes: usize) {}
 
+mod block_inventory;
+pub use block_inventory::{block_inventory, BlockInventoryEntry};
+
 mod fs;
 #[cfg(feature = "btrfs")]
 pub use fs::BtrfsFilesystem;
@@ -500,6 +503,7 @@ pub fn render_io_stats_counters() -> String {
 }
 
 struct RegisteredBlockDevice {
+    partition: Option<axdriver::PartitionMetadata>,
     name: String,
     device: SharedBlockDevice,
     info: BlockDeviceInfo,
@@ -891,6 +895,7 @@ fn init_filesystems_with_root_mode(
 
     let root_device = SharedBlockDevice::new(dev);
     ROOT_BLOCK_DEVICE.call_once(|| RegisteredBlockDevice {
+        partition: None,
         name: ROOT_BLOCK_DEVICE_NAME.into(),
         info: BlockDeviceInfo {
             num_blocks: root_device.num_blocks(),
@@ -922,6 +927,7 @@ fn init_filesystems_with_root_mode(
             }
         } else { Vec::new() };
         extras.push(RegisteredBlockDevice {
+            partition: None,
             name,
             info: BlockDeviceInfo {
                 num_blocks: device.num_blocks(),
@@ -933,9 +939,11 @@ fn init_filesystems_with_root_mode(
         });
         for partition in partitions {
             let name = String::from(partition.device_name());
+            let metadata = axdriver::block_device_partition(&partition);
             let device = SharedBlockDevice::new(partition);
             info!("registered GPT partition /dev/{name} blocks={} read_only={read_only}", device.num_blocks());
             extras.push(RegisteredBlockDevice {
+                partition: metadata,
                 name, info:BlockDeviceInfo {num_blocks:device.num_blocks(),block_size:device.block_size()},
                 read_only:AtomicBool::new(read_only),mounted:Arc::new(AtomicBool::new(false)),device,
             });
