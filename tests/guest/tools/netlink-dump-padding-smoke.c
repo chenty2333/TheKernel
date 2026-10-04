@@ -33,7 +33,13 @@ int main(void) {
         for (struct nlmsghdr *msg=(struct nlmsghdr *)reply;NLMSG_OK(msg,remaining);msg=NLMSG_NEXT(msg,remaining)) {
             if (msg->nlmsg_seq!=31) continue;
             if (msg->nlmsg_type==NLMSG_ERROR) return 5;
-            if (msg->nlmsg_type==NLMSG_DONE) done=1;
+            if (msg->nlmsg_type==NLMSG_DONE) {
+                int status;
+                if (msg->nlmsg_len<NLMSG_LENGTH(sizeof(status)) || !(msg->nlmsg_flags&NLM_F_MULTI)) return 7;
+                memcpy(&status,NLMSG_DATA(msg),sizeof(status));
+                if (status) return 8;
+                done=1;
+            }
             if (msg->nlmsg_type==RTM_NEWROUTE) rows++;
         }
     }

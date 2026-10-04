@@ -23,7 +23,9 @@ pub(crate) fn netlink_ack(request: &NlMsgHdr, port_id: u32, error: i32) -> Vec<u
 }
 
 pub(crate) fn done_message(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
-    let mut out = vec![0; size_of::<NlMsgHdr>()];
+    // A successful dump carries a signed 32-bit status after the header.
+    // A header-only DONE makes real iproute2 reject the completion as truncated.
+    let mut out = vec![0; size_of::<NlMsgHdr>() + size_of::<i32>()];
     let hdr = NlMsgHdr {
         nlmsg_len: out.len() as u32,
         nlmsg_type: NLMSG_DONE,
@@ -452,4 +454,19 @@ pub(crate) fn write_struct<T: bytemuck::NoUninit>(dst: &mut [u8], value: &T) {
 
 pub(crate) fn align4(value: usize) -> usize {
     (value + 3) & !3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn multipart_done_includes_status_and_preserves_request_identity() {
+        let request = NlMsgHdr {nlmsg_len:36,nlmsg_type:RTM_GETROUTE,nlmsg_flags:1|0x300,nlmsg_seq:31,nlmsg_pid:0};
+        let bytes=done_message(&request,77);
+        let header=read_unaligned::<NlMsgHdr>(&bytes).unwrap();
+        assert_eq!(bytes.len(),20);assert_eq!(header.nlmsg_len,20);
+        assert_eq!(header.nlmsg_type,NLMSG_DONE);assert_eq!(header.nlmsg_flags,NLM_F_MULTI);
+        assert_eq!(header.nlmsg_seq,31);assert_eq!(header.nlmsg_pid,77);
+        assert_eq!(i32::from_ne_bytes(bytes[16..20].try_into().unwrap()),0);
+    }
 }

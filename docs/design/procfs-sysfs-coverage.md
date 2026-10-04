@@ -434,3 +434,20 @@ Real ip -4 route now receives/prints actual rows (shell-jh5z8xjc), but then repo
 `DONE truncated`/`Dump terminated`: the preexisting multipart completion has only
 a header, missing Linux's signed 32-bit completion status. This is a distinct
 next wire-format fix. Do not mark the real ip command fully accepted yet.
+
+### Multipart completion status
+
+NLMSG_DONE now includes the successful signed 32-bit status after its header,
+with the original sequence/port identity and MULTI flag. Host wire test and the
+same C dump probe on Linux/guest require that payload, not merely the message
+type. Real Alpine ip -4 route now completes without `DONE truncated` or
+`Dump terminated` (shell-ar6wexmo); netstat -rn also displays the actual routes.
+The netlink loopback destination still carries host bits (127.0.0.1/8) whereas
+proc route is normalized (127.0.0.0/8); fix that independent existing formatter
+before claiming every route field is correct.
+
+Twenty-first cycle: full host Python655 (3 environmental skips)+Rust6020,
+q35/n305 lint (784 existing kernel warnings), KVM guest64/64 (system-p838_dz4),
+and full ABI257/257 (abi-ej44bbkj) passed, with no guest skips and normal shutdown.
+Read/readv/recvfrom/recvmsg state descriptions now mention the status payload;
+progress counts remain unchanged. No physical acceptance or performance claim.
