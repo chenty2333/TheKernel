@@ -35,15 +35,19 @@ int main(void) {
         __asm__ volatile ("movdqu %0, %%xmm15" : : "m"(vector) : "xmm15");
         __asm__ volatile ("syscall" : "=a"(result) : "a"((long)SYS_kill), "D"((long)self), "S"((long)SIGSTOP) : "rcx", "r11", "memory");
         __asm__ volatile ("movdqu %%xmm15, %0" : "=m"(vector));
+        unsigned short cs, ss;
+        __asm__ volatile ("mov %%cs, %0" : "=r"(cs));
+        __asm__ volatile ("mov %%ss, %0" : "=r"(ss));
         sigset_t mask;
         if (sigprocmask(SIG_BLOCK, NULL, &mask) != 0) _exit(3);
-        _exit(result == 77 && word == 22 && vector[0] == 33 && vector[1] == 34 &&
+        _exit(cs == 0x33 && ss == 0x2b && result == 77 && word == 22 && vector[0] == 33 && vector[1] == 34 &&
               sigismember(&mask, SIGUSR1) && !sigismember(&mask, SIGKILL) && !sigismember(&mask, SIGSTOP) ? 0 : 2);
     }
     CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
     struct user_regs_struct regs, original;
     CHECK(request(PTRACE_GETREGS, 0, &regs) == 0);
     original = regs;
+    CHECK(regs.cs == 0x33 && regs.ss == 0x2b);
     CHECK(regs.orig_rax == SYS_kill && regs.rip && regs.rsp);
     uint64_t first = 0;
     struct iovec iov = { &first, sizeof(first) };

@@ -5,6 +5,13 @@ The x86-64 general-register image is shared with core dumps in
 order, including FS/GS bases and `orig_rax`. Facts were checked against Linux
 7.2.3 `arch/x86/kernel/ptrace.c` and `kernel/ptrace.c`; Rust is original.
 
+The actual user GDT selectors match Linux amd64: CS=0x33, SS=0x2b.
+Kernel selectors remain unchanged, with TSS/LDT moved beyond the user slots.
+This avoids GDB's native CS-based misclassification as i386; it is not a fake
+ptrace-only register translation. The guest regression reads actual CS/SS.
+Upstream behavior reference: [GDB x86 Linux architecture detection](https://gnu.googlesource.com/binutils-gdb/+/d01e823438c7dc264d6885fbbfeace4d8955dcb7/gdb/nat/x86-linux.c).
+No upstream implementation or prose was copied.
+
 A thread publishes a value image immediately before parking at a stop boundary,
 and consumes it on resume. Remote writers hold the existing ptrace action gate,
 wait for scheduler inactivity, and never retain a pointer into another task's
