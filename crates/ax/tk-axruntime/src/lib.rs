@@ -126,6 +126,13 @@ pub(crate) fn invoke_panic_screen_hook(
 /// an interrupt.  On a host build the kernel crate is not linked and there is
 /// no screen to paint, so the call compiles away rather than failing to link.
 fn early_screen_milestone(name: &str) {
+    use boot_progress::Stage;
+    boot_progress::mark(match name {
+        "runtime entry"=>Stage::Runtime,"heap allocator"=>Stage::Heap,"memory management"=>Stage::Paging,
+        "platform devices"=>Stage::Platform,"scheduler"=>Stage::Scheduler,"driver init"=>Stage::Drivers,
+        "filesystems"=>Stage::Filesystems,"secondary CPU bring-up"=>Stage::SecondaryCpus,
+        "interrupt init"=>Stage::Interrupts,"kernel main"=>Stage::KernelMain,_=>Stage::Unknown,
+    });
     #[cfg(all(target_os = "none", not(test)))]
     crate_interface::call_interface!(EarlyScreen::milestone, name);
     #[cfg(not(all(target_os = "none", not(test))))]
@@ -153,6 +160,8 @@ fn early_screen_rebind() {
 }
 
 pub mod klog;
+/// Opt-in, lock-free boot and console progress observations.
+pub mod boot_progress;
 
 #[cfg(all(target_os = "none", not(test)))]
 mod lang_items;
@@ -426,6 +435,8 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     unsafe { axhal::mem::clear_bss() };
     axhal::percpu::init_primary(cpu_id);
     axhal::init_early(cpu_id, arg);
+    boot_progress::init();
+    boot_progress::cpu_phase(cpu_id,1);
     // The bootloader's `loglevel=` wins over the compile-time default.  On a
     // netbooted, serial-less machine the alternative to a boot parameter is
     // rebuilding and re-transferring the whole kernel image to change one
@@ -653,6 +664,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
     ctor_bare::call_ctors();
 
+    boot_progress::cpu_phase(cpu_id,6);
     info!("Primary CPU {cpu_id} init OK.");
     INITED_CPUS.fetch_add(1, Ordering::Release);
 
@@ -670,6 +682,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     // have stopped the machine without a console to say so.  From here the
     // kernel's own device filesystem, and with it the framebuffer console,
     // takes the screen over.
+    boot_progress::cpu_phase(cpu_id,7);
     early_screen_milestone("kernel main");
     unsafe { main() };
 
@@ -854,6 +867,7 @@ fn timer_irq_context(_vector: usize, frame: &axhal::context::TrapFrame) {
 #[cfg(feature = "irq")]
 fn timer_irq_handler() {
     let now_ns = axhal::time::monotonic_time_nanos();
+    if boot_progress::enabled() { boot_progress::timer(axhal::percpu::this_cpu_id(),now_ns); }
     let periodic_due = advance_periodic_deadline(now_ns);
     let early_due = consume_early_deadline(now_ns);
 

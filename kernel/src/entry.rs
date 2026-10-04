@@ -31,6 +31,7 @@ use crate::{
 
 /// Initialize and run initproc.
 pub fn init(args: &[String], envs: &[String]) {
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::KernelInit);
     const INIT_PID: Pid = 1;
 
     crate::syscall::init_crash_kexec_hook();
@@ -320,13 +321,24 @@ pub fn init(args: &[String], envs: &[String]) {
 
     // Keep the init process user-visible as PID 1. Kernel-only alarm workers can
     // consume later scheduler task IDs without changing that ABI.
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::Pid1Published);
+    if axruntime::boot_progress::enabled()
+        && let Err(error) = axtask::spawn_raw(
+            boot_progress_task, "boot_progress".into(), axconfig::TASK_STACK_SIZE,
+        )
+    {
+        warn!("boot-progress: observer unavailable: {error}");
+    }
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::AlarmStart);
     spawn_alarm_task().expect("Failed to start alarm workers");
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::AlarmDone);
     if axhal::power::power_button_available()
         && let Err(error) = spawn_power_button_task()
     { warn!("acpi-power: deferred shutdown worker unavailable: {error}"); }
 
 
     // TODO: wait for all processes to finish
+    axruntime::boot_progress::mark(axruntime::boot_progress::Stage::InitJoin);
     let exit_code = task.join().expect("Failed to join init task");
     if exit_code == 0 {
         info!("\x015Init exited normally; shutting down by boot-shell policy");
@@ -366,4 +378,18 @@ fn spawn_power_button_task() -> axerrno::AxResult<axtask::AxTaskRef> {
             let _ = axtask::sleep(core::time::Duration::from_millis(50));
         }
     }, "acpi_power_button".into(), axconfig::TASK_STACK_SIZE)
+}
+
+/// Bounded opt-in observer. It reads only atomic progress; no screen/VT or
+/// scheduler snapshot locks, no recovery attempts and no framebuffer bypass.
+fn boot_progress_task() {
+    for _ in 0..12 {
+        let _=axtask::sleep(core::time::Duration::from_secs(5));
+        let snapshot=crate::pseudofs::proc::boot_progress_snapshot();
+        axhal::console::emergency_diagnostic_print(format_args!("{snapshot}"));
+        // Retained for dmesg/netconsole and a still-working screen mirror. If
+        // that screen itself is stuck this cannot repair it; DbC/serial is the
+        // independent output path, not an unsafe overwrite of active scanout.
+        warn!("\x013{snapshot}");
+    }
 }

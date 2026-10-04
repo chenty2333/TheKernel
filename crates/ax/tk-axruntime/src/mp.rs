@@ -88,6 +88,7 @@ pub fn start_secondary_cpus(primary_cpu_id: usize) {
 #[axplat::secondary_main]
 pub fn rust_main_secondary(cpu_id: usize) -> ! {
     axhal::percpu::init_secondary(cpu_id);
+    super::boot_progress::cpu_phase(cpu_id,1);
     axhal::init_early_secondary(cpu_id);
 
     ENTERED_CPUS.fetch_add(1, Ordering::Release);
@@ -97,6 +98,7 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
     axmm::init_memory_management_secondary();
 
     axhal::init_later_secondary(cpu_id);
+    super::boot_progress::cpu_phase(cpu_id,4);
 
     #[cfg(feature = "multitask")]
     if let Err(error) = axtask::init_scheduler_secondary() {
@@ -104,6 +106,7 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
         axhal::power::system_off();
     }
 
+    super::boot_progress::cpu_phase(cpu_id,6);
     info!("Secondary CPU {cpu_id:x} init OK.");
     super::INITED_CPUS.fetch_add(1, Ordering::Release);
 
@@ -111,6 +114,7 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
         core::hint::spin_loop();
     }
 
+    super::boot_progress::cpu_phase(cpu_id,7);
     #[cfg(feature = "irq")]
     {
         // Legacy one-shot LAPIC initialization leaves the initial count at

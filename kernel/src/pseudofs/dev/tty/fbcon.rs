@@ -650,6 +650,7 @@ fn mirror_new_log_bytes(drain: &mut axruntime::klog::ConsoleDrain) -> bool {
 /// a queue: a record the screen cannot keep up with stays in the ring, and one
 /// its level mutes never reaches these cells at all.
 fn write_log_bytes(bytes: &[u8]) -> usize {
+    axruntime::boot_progress::log_record();
     let mut start = 0;
     for (index, byte) in bytes.iter().enumerate() {
         if *byte == b'\n' {
@@ -681,11 +682,14 @@ fn dimensions() -> Option<(usize, usize)> {
 /// Writes terminal output to one virtual console.  Output is retained while
 /// inactive so selecting that VT later reconstructs its screen.
 pub(crate) fn write(vt: u16, bytes: &[u8], _active: u16, _graphics: bool) {
+    let progress=axruntime::boot_progress::Scope::write(bytes.len());
     let Some((cols, rows)) = dimensions() else {
         return;
     };
     {
+        progress.point(2); // before cell mutex
         let mut console = FBCON.lock();
+        progress.point(3); // updating cells
         let Some(console) = console.as_mut() else {
             return;
         };
@@ -696,6 +700,7 @@ pub(crate) fn write(vt: u16, bytes: &[u8], _active: u16, _graphics: bool) {
             screen.put(byte, cols, rows);
         }
     }
+    progress.point(4); // queuing trailing repaint
     schedule_write_present(vt);
 }
 
@@ -760,7 +765,10 @@ fn trailing_present() {
 /// its own writes to that console through [`write`] instead, so that output
 /// meant for an inactive `ttyN` is not shown on the active one.
 pub(crate) fn write_active(bytes: &[u8]) {
+    let progress=axruntime::boot_progress::Scope::write(0);
+    progress.point(10); // before VT-state lookup
     let active = VT_MANAGER.active();
+    progress.point(11); // before graphics-mode lookup
     write(active, bytes, active, VT_MANAGER.graphics(active));
 }
 
@@ -771,12 +779,16 @@ pub(crate) fn present_while_text_active(vt: u16) {
     let Some((cols, rows)) = dimensions() else {
         return;
     };
+    let progress=axruntime::boot_progress::Scope::present();
+    progress.point(6); // before display access
     fb::fbcon_draw(|frame| {
+        progress.point(7); // drawing pixels
         frame.clear(0x0000_0000);
         // Snapshot one row at a time so writers are never excluded for the
         // MMIO-bound glyph drawing, only for a bounded cell copy.
         let mut row_cells = [Cell::DEFAULT; MAX_COLS];
         for row in 0..rows {
+            progress.point(8); // snapshotting a cell row
             let cursor_col = {
                 let console = FBCON.lock();
                 let Some(console) = console.as_ref() else {
@@ -789,6 +801,7 @@ pub(crate) fn present_while_text_active(vt: u16) {
                     .copy_from_slice(&screen.cells[row * MAX_COLS..row * MAX_COLS + cols]);
                 (screen.cursor_visible && screen.row == row).then_some(screen.col)
             };
+            progress.point(9); // row glyph writes
             for (col, &cell) in row_cells[..cols].iter().enumerate() {
                 let (fg, bg) = cell.colors();
                 frame.glyph(
@@ -808,6 +821,8 @@ pub(crate) fn present_while_text_active(vt: u16) {
 /// protocol.  The caller-supplied graphics snapshot is deliberately ignored:
 /// it may have become stale before this function runs.
 pub(crate) fn present(vt: u16, _graphics: bool) {
+    let progress=axruntime::boot_progress::Scope::present();
+    progress.point(5); // before VT presentation gate
     crate::pseudofs::dev::tty::VT_MANAGER.with_text_active(vt, || present_while_text_active(vt));
 }
 
