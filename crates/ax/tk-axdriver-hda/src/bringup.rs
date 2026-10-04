@@ -294,6 +294,21 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         self.running = false;
         wait(&mut self.bus, self.stream, 1, 2, 0)
     }
+    /// Cancel playback only after RUN readback proves that DMA stopped.
+    pub fn abort(&mut self) -> DevResult {
+        if let Err(error) = self.stop() {
+            self.live = false;
+            return Err(error);
+        }
+        self.pending.clear();
+        self.retired.clear();
+        // SAFETY: STOP readback proved retirement before reusing owned slots.
+        unsafe {
+            self.audio.pointer.as_ptr().write_bytes(0, PERIOD * PERIODS);
+        }
+        self.prepared = false;
+        Ok(())
+    }
     pub fn release(&mut self) -> DevResult {
         if !self.pending.is_empty() {
             return Err(DevError::ResourceBusy);

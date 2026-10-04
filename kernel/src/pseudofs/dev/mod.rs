@@ -660,6 +660,22 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
             ),
         );
     }
+    if axdriver::sound::available() {
+        let mut snd = DirMapping::new();
+        for (name, minor, pcm) in [("controlC0", 0, false), ("pcmC0D0p", 16, true)] {
+            snd.add(
+                name,
+                Device::new_with_permissions(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    DeviceId::new(116, minor),
+                    NodePermission::from_bits_truncate(0o660),
+                    Arc::new(sound::AlsaDevice { pcm }),
+                ),
+            );
+        }
+        root.add("snd", SimpleDir::new_maker(fs.clone(), Arc::new(snd)));
+    }
     // `/dev/fb0` is published whenever the kernel has a scanout to draw into.
     // DRM owns the virtio-gpu scanout before devfs publication, so fbdev is an
     // emulation client of that primary device rather than a competing raw

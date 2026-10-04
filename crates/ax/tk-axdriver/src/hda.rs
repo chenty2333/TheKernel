@@ -137,3 +137,7 @@ pub fn complete() -> DevResult<Option<u16>> {
 pub fn release() -> DevResult {
     with_device(|d| d.release())
 }
+
+pub fn abort() -> DevResult {
+    with_device(|d| d.abort())
+}

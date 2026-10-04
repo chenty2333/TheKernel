@@ -42,7 +42,7 @@ A resolves the previously observed verbose-console stall.
 In the guest:
 
 ```
-ls -l /dev/nvme0n1
+ls -l /dev/nvme0n1 /dev/nvme0n1p*
 blockdev --getro /dev/nvme0n1
 dmesg | grep -i nvme
 dd if=/dev/nvme0n1 bs=512 count=2 | hexdump -C
@@ -51,8 +51,13 @@ dd if=/dev/nvme0n1 bs=512 count=2 | hexdump -C
 Expected: block node; getro prints **1**; controller identifies UMIS
 `1cc4:6a13`, up to two queues, read_only=true; raw MBR/GPT bytes answer. Do not
 mount the whole Windows disk, run mkfs/fsck, invoke write tests, change BLKROSET,
-or append `nvme.allow_write=1`. Partition enumeration is not implemented yet,
-so no `/dev/nvme0n1p*` node is promised. QEMU destructive tests must stay on
+or append `nvme.allow_write=1`. Valid primary GPT entries should appear as
+`/dev/nvme0n1p1`, etc., preserving GPT entry numbers; each must also report RO=1.
+Do not mount BitLocker partitions. Malformed/unsupported GPT keeps the whole
+namespace available but reports discovery failure instead of guessing offsets.
+The MSI-X log should name the owned vector and later report a completion wake.
+If interrupts do not arrive, bounded polling remains armed. A separate read-only
+boot with `nvme.poll=1` explicitly exercises the fallback. QEMU destructive tests must stay on
 explicit disposable host image files, never physical devices.
 
 If the node is absent or a read fails, stop storage acceptance. Record the
@@ -69,17 +74,28 @@ In TheKernel:
 
 ```
 dmesg | grep -i hda
-ls -l /dev/dsp
+ls -l /dev/dsp /dev/snd/controlC0 /dev/snd/pcmC0D0p
 ```
 
 Expected: actual codec ID, generic analog route, S16LE stereo 48000 Hz and an
-OSS node. There is **no native ALSA PCM endpoint yet**, so direct `aplay -D
-hw:0,0` is not an acceptance step. Install the reviewed `hda-smoke` static
-helper into a copied boot rootfs ahead of time (never onto internal NVMe),
-then run `/hda-smoke` with headphones/analog output at a safe external volume.
-Expected: known waveform and successful drain/close. Capture the analog
-signal externally if available and compare samples/timing; merely hearing a
-noise or seeing a submission marker is not sample correctness proof.
+OSS and native ALSA nodes. Prepare unmodified static `aplay`, the standard
+hardware-plugin configuration `tests/guest/alsa-hw.conf`, and a stereo S16LE
+48000-Hz known waveform in a copied boot rootfs (never on internal NVMe).
+Run at a safe **external** volume:
+
+```
+ALSA_CONFIG_PATH=/alsa-hw.conf aplay -D hw:0,0 /input.wav
+```
+
+Expected: `Playing WAVE ... Signed 16 bit Little Endian, Rate 48000 Hz, Stereo`,
+normal exit, audible analog output, and working screen/guest after drain/close.
+`/hda-smoke` remains an OSS regression check; `/alsa-smoke` (compiled from
+`tests/guest/alsa-smoke.c`) checks the native ABI and START/DROP/reopen lifecycle.
+Do not run OSS and native clients concurrently: the second opener must be busy.
+In QEMU, unmodified aplay's recorded WAV matched all 8192 frames / 32768 bytes;
+this is not a claim about the physical codec. Capture analog output externally
+if available and compare waveform/timing rather than counting a submission
+marker or merely hearing a noise as proof.
 If no route/node or drain fails, stop; the codec may require a board-specific
 quirk after actual enumeration. Do not substitute HDMI audio: HDMI depends on
 future native display power/link/ELD ownership.

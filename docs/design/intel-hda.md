@@ -12,12 +12,33 @@ codecs/generic.c}`. Those are the relocated paths of the older `sound/pci/hda`
 files named in the request. QEMU's CORB/RIRB response-count behavior was checked
 against <https://github.com/qemu/qemu/blob/master/hw/audio/intel-hda.c>.
 
-**The current kernel audio interface is OSS `/dev/dsp`, not ALSA PCM.** This
-change reuses that endpoint and its existing bounded playback worker. Native
-`/dev/snd/pcmC0D0p`, ALSA control/PCM ioctls, mmap status/control and a direct
-`aplay -D hw:0,0` path are not implemented, so B2 is only partially complete.
-An ALSA OSS plugin may use `/dev/dsp`; this is not claimed as direct ALSA
-support. The driver currently offers stereo S16LE at 48000 Hz only.
+## Native ALSA and retained OSS
+
+`/dev/snd/controlC0` and `/dev/snd/pcmC0D0p` now expose the native Linux
+x86_64 ALSA control/PCM UAPI, not an ALSA-to-OSS userspace adapter. The same
+bounded playback owner serves HDA or the boot-selected VirtIO sound backend;
+`/dev/dsp` remains available, and OSS/native opens share exclusive ownership.
+There was no pre-existing native ALSA PCM endpoint in this checkout: the old
+sound file implemented OSS, so the native endpoint is an additive ABI module.
+
+Supported hardware is deliberately narrow: RW_INTERLEAVED, stereo S16_LE,
+48000 Hz, four 1024-frame periods. HW_REFINE intersects masks and intervals;
+unsupported formats/rates and empty/open-ended intersections are rejected.
+No mmap, capture, pause, digital output or mixer controls are advertised.
+ALSA's status/control mmap fallback uses SYNC_PTR; sample buffers use the
+standard WRITEI_FRAMES ioctl, with checked usercopy and short transfer counts.
+Pointers are period-granular (BATCH), software-staged frames stay before START
+or the negotiated start threshold, and SW boundary wrap is reported without
+accepting forged application DMA pointers. The fixed-size ring is never
+resized to a userspace-provided buffer size. DRAIN flushes the last partial
+period and waits DMA plus backend audible tail. DROP stops HDA before discarding
+owned slots; VirtIO STOP/RELEASE must retire every used-ring buffer before reuse.
+Uncertain retirement retains the owner instead of admitting a new opener.
+
+The implementation is a bounded bring-up playback interface, not full ALSA
+feature parity, low latency, or a guarantee against hardware underruns. The
+backend's existing full-ring ambiguity checks still fail closed. HDMI stays
+excluded for the display-power dependencies below.
 
 ## Transport and graph
 
@@ -85,3 +106,37 @@ Node IDs are bounded to the specification's seven bits; malformed child ranges
 and long connection entries must not set the reserved indirect-address bit.
 The regression test and final 8192-frame QEMU WAV comparison pass with that
 validation (seven HDA host tests total).
+
+## Native ALSA validation (continuation)
+
+Build **unmodified** upstream alsa-lib 1.2.15.3 and alsa-utils 1.2.16 `aplay`
+with a static musl toolchain (hardware PCM plugin enabled). Put `aplay`,
+`tests/guest/alsa-hw.conf` and an 8192-frame WAV from
+`tools/check_hda_waveform.py::expected_payload` into a disposable rootfs.
+In the guest run:
+
+```
+ALSA_CONFIG_PATH=/alsa-hw.conf aplay -D hw:0,0 /input.wav
+```
+
+Run QEMU with `--audio-device hda --audio-backend wav`, power off after playback,
+and run `tools/check_hda_waveform.py <workdir>/audio.wav`. The acceptance is all
+8192 frames / 32768 bytes identical, with only surrounding silence permitted.
+`tests/guest/alsa-smoke.c` additionally checks native control enumeration,
+unsupported format rejection, prestart state/pointers, forged pointer rejection,
+explicit START/DROP/PREPARE/HW_FREE, and exclusive OSS/native ownership.
+The configuration file only selects ALSA's standard hardware plugin; it does
+not modify the client, convert samples or route them through OSS.
+
+Sources for the client: <https://www.alsa-project.org/wiki/Download> and
+<https://www.alsa-project.org/files/pub/utils/>. ABI layouts were checked against
+Linux `include/uapi/sound/asound.h`; the Rust byte codec and state machine are
+original implementations.
+
+Measured continuation: native `aplay -D hw:0,0` on QEMU HDA/KVM produced the
+exact 8192-frame / 32768-byte waveform. The native ABI exerciser passed on HDA
+and VirtIO. Four new ALSA host tests, eight HDA host tests, shared adapter
+42 host tests and the full guest 52/52 gate passed. The additional VirtIO WAV
+run used QEMU's existing 44100-Hz backend default (resampling), so its recording
+is **not** claimed as a bit-identical 48000-Hz PCM test. Physical codec/headphone
+output and HDMI remain unverified.

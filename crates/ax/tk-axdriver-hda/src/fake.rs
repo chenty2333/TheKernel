@@ -201,3 +201,16 @@ fn missed_full_lap_is_not_fabricated_completion() {
     state.lock().unwrap().now += 100_000_000;
     assert!(c.complete().is_err());
 }
+#[test]
+fn abort_stops_before_discarding_and_allows_a_fresh_stream() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut c = Controller::<Host, _>::new(Fake(state.clone())).unwrap();
+    c.prepare(4096, 4).unwrap();
+    c.submit(&[0x55; PERIOD]).unwrap();
+    c.abort().unwrap();
+    assert_eq!(state.lock().unwrap().regs[&0xa0] & 2, 0);
+    assert_eq!(c.complete().unwrap(), None);
+    c.prepare(4096, 4).unwrap();
+    c.submit(&[0x77; PERIOD]).unwrap();
+    c.abort().unwrap();
+}

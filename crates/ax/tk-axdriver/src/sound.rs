@@ -142,3 +142,37 @@ pub fn release() -> DevResult {
         d.pcm_release(id)
     })
 }
+
+/// Cancel a substream; submitted DMA buffers stay owned until device retirement.
+pub fn abort(tokens: &[u16]) -> DevResult {
+    #[cfg(feature = "intel-hda")]
+    if crate::hda::available() {
+        return crate::hda::abort();
+    }
+    with_device(|d, id| {
+        d.pcm_stop(id)?;
+        d.pcm_release(id)?;
+        let mut pending = alloc::vec::Vec::from(tokens);
+        let deadline = axhal::time::monotonic_time_nanos().saturating_add(250_000_000);
+        while !pending.is_empty() {
+            if let Some(token) = d.pcm_completed() {
+                let index = pending
+                    .iter()
+                    .position(|t| *t == token)
+                    .ok_or(axdriver_virtio::VirtIoError::WrongToken)?;
+                // Used-ring ownership proves DMA retirement; a cancelled
+                // period's playback status is intentionally not a data verdict.
+                match d.pcm_xfer_ok(token) {
+                    Ok(()) | Err(axdriver_virtio::VirtIoError::IoError) => {}
+                    Err(error) => return Err(error),
+                }
+                pending.remove(index);
+            } else if axhal::time::monotonic_time_nanos() >= deadline {
+                return Err(axdriver_virtio::VirtIoError::IoError);
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+        Ok(())
+    })
+}

@@ -1,6 +1,7 @@
-//! Bounded OSS playback endpoint for the existing VirtIO sound device.
+//! Shared bounded playback owner for native ALSA and OSS endpoints.
 //! PulseAudio owns mixing/conversion; the kernel accepts stereo S16LE at 48 kHz.
 
+mod alsa;
 use alloc::{borrow::Cow, sync::Arc, vec::Vec};
 use core::{
     any::Any,
@@ -10,6 +11,7 @@ use core::{
     time::Duration,
 };
 
+pub(crate) use alsa::AlsaDevice;
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{Location, NodeFlags, VfsError, VfsResult};
 use axio::prelude::*;
@@ -398,9 +400,11 @@ impl FileLike for DspFile {
                 Ok(0)
             }
             RESET => {
-                let result = self.playback.state.lock().reset_with(|| {
-                    axdriver::sound::release().map_err(driver_error)
-                });
+                let result = self
+                    .playback
+                    .state
+                    .lock()
+                    .reset_with(|| axdriver::sound::release().map_err(driver_error));
                 if result.is_err() {
                     self.playback.ready.wake();
                 }
