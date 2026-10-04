@@ -31,6 +31,7 @@ license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
 repository.workspace = true
 
 [features]
+usb-dbc = ["usb-xhci", "dep:axdriver_dbc"]
 itco = ["dep:axdriver_watchdog", "dep:kspin", "dep:axhal", "dep:axklib"]
 ahci = [
     "block",
@@ -320,4 +321,9 @@ features = ["usb-xhci", "ramdisk", "shared-block", "virtio-input"]
 [dependencies.axdriver_watchdog]
 package = "tk-axdriver-watchdog"
 path = "../tk-axdriver-watchdog"
+optional = true
+
+[dependencies.axdriver_dbc]
+package = "tk-axdriver-dbc"
+path = "../tk-axdriver-dbc"
 optional = true

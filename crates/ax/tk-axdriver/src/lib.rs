@@ -618,3 +618,6 @@ pub fn init_drivers() -> AllDevices {
 
 #[cfg(feature = "itco")]
 pub mod itco;
+
+#[cfg(feature = "usb-dbc")]
+pub mod dbc;

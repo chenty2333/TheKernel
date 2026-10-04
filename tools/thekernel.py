@@ -96,7 +96,8 @@ def parse_variant(args: argparse.Namespace) -> Variant:
                       io_notify_fastpath=getattr(args, "io_notify_fastpath", False),
                       net_igc=getattr(args, "net_igc", False),
                       net_rtl8125=getattr(args, "net_rtl8125", False),
-                      net_rtl8168=getattr(args, "net_rtl8168", False))
+                      net_rtl8168=getattr(args, "net_rtl8168", False),
+                      usb_dbc=getattr(args, "usb_dbc", False))
     if variant.memory_bytes <= KERNEL_LOAD_PADDR:
         raise ProductError("--memory must extend beyond the 2 MiB kernel load address")
     if variant.memory_bytes > X86_64_MAX_MEMORY_BYTES:
@@ -272,6 +273,8 @@ def kernel_features(artifacts: Artifacts) -> str:
     # virtualized machines.
     features = [PRODUCT_FEATURE]
     features.append("watchdog-itco")
+    if variant.usb_dbc:
+        features.append("usb-dbc")
     if artifacts.profile == "shell":
         features.append("boot-shell")
     if variant.asid_fast_switch:
@@ -1511,6 +1514,8 @@ def graphics_benchmark_cmd(args: argparse.Namespace) -> int:
 
 
 def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = True) -> None:
+    parser.add_argument("--usb-dbc", action="store_true",
+                        help="opt-in xHCI USB debug console (hardware unverified; QEMU has no DbC)")
     parser.add_argument("--smp", type=int, default=4)
     parser.add_argument("--memory", default="1G")
     parser.add_argument("--asid-fast-switch", action="store_true")

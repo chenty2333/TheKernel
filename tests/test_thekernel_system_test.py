@@ -25,6 +25,17 @@ def load_product():
 
 
 class SystemTestGateTests(unittest.TestCase):
+    def test_usb_dbc_is_opt_in_and_has_separate_artifacts(self) -> None:
+        product = load_product()
+        variants = []
+        for flags in ([], ["--usb-dbc"]):
+            args = product.build_parser().parse_args(["build", "--platform", "n305", *flags])
+            variants.append(product.artifacts_for(args))
+        self.assertNotIn("usb-dbc", product.kernel_features(variants[0]).split())
+        self.assertIn("usb-dbc", product.kernel_features(variants[1]).split())
+        self.assertNotEqual(variants[0].output_dir, variants[1].output_dir)
+        self.assertNotEqual(variants[0].cargo_target_dir, variants[1].cargo_target_dir)
+
     def test_guest_tool_paths_match_installed_source_names(self) -> None:
         # Crate/package renames must not rename the independently installed C tools.
         installed = {f"thekernel-{path.stem}"

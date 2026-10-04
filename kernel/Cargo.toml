@@ -14,6 +14,7 @@ repository.workspace = true
 workspace = true
 
 [features]
+usb-dbc = ["axfeat/driver-usb-dbc", "axdriver/usb-dbc"]
 watchdog-itco = ["axfeat/driver-itco", "axdriver/itco"]
 bpf = ["dep:axbpf", "dep:tk-linux-bpf", "perf-sampling"]
 # The Intel i225/i226 (igc) work.  Selected by an explicit build flag rather

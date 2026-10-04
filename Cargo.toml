@@ -158,6 +158,7 @@ repository.workspace = true
 workspace = true
 
 [features]
+usb-dbc = ["tk-kernel/usb-dbc"]
 watchdog-itco = ["tk-kernel/watchdog-itco"]
 # `cargo build` is the shipped x86_64 product, not an accidental reduced
 # feature subset. Kernel/library host tests select their own manifests and

@@ -11,6 +11,7 @@ homepage = "https://github.com/arceos-org/arceos"
 repository.workspace = true
 
 [features]
+driver-usb-dbc = ["input", "axdriver/usb-dbc"]
 driver-itco = ["axdriver?/itco"]
 default = []
 

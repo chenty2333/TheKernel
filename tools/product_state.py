@@ -105,6 +105,7 @@ class Variant:
     net_igc: bool = False
     net_rtl8125: bool = False
     net_rtl8168: bool = False
+    usb_dbc: bool = False
 
     @property
     def memory_bytes(self) -> int:
@@ -129,6 +130,8 @@ class Variant:
             suffix += "-net-rtl8125"
         if self.net_rtl8168:
             suffix += "-net-rtl8168"
+        if self.usb_dbc:
+            suffix += "-usb-dbc"
         return f"mem{self.memory.lower()}{suffix}"
 
 

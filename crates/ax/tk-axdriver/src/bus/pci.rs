@@ -535,12 +535,17 @@ impl AllDevices {
                         && dev_info.subclass == 0x03
                         && dev_info.prog_if == 0x30
                     {
-                        if let Ok(BarInfo::Memory { address, .. }) = root.bar_info(bdf, 0) {
+                        if let Ok(BarInfo::Memory { address, size, .. }) = root.bar_info(bdf, 0) {
+                            let _ = size;
                             let mmio =
                                 axhal::mem::phys_to_virt((address as usize).into()).as_mut_ptr();
                             if let Some(mmio) = core::ptr::NonNull::new(mmio) {
                                 match crate::usb::probe(mmio) {
                                     Ok(devices) => {
+                                        #[cfg(feature = "usb-dbc")]
+                                        if let Ok(size) = usize::try_from(size) {
+                                            crate::dbc::probe(mmio.as_ptr() as usize, size);
+                                        }
                                         for device in devices {
                                             usb_devices.push(device);
                                         }

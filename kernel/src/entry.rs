@@ -322,6 +322,8 @@ pub fn init(args: &[String], envs: &[String]) {
     // Keep the init process user-visible as PID 1. Kernel-only alarm workers can
     // consume later scheduler task IDs without changing that ABI.
     axruntime::boot_progress::mark(axruntime::boot_progress::Stage::Pid1Published);
+    #[cfg(feature = "usb-dbc")]
+    crate::pseudofs::dev::tty::start_usb_debug_console();
     if axruntime::boot_progress::enabled()
         && let Err(error) = axtask::spawn_raw(
             boot_progress_task, "boot_progress".into(), axconfig::TASK_STACK_SIZE,

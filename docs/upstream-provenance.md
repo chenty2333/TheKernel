@@ -495,3 +495,11 @@ a Rust literal. The first two are ABI enumerator names; the third is the one tha
 is text rather than a name, and its owner should decide whether to keep it
 attributed. Those files are owned elsewhere; the same marker-plus-`NOTICE`
 treatment applied above should be repeated there.
+
+## Original xHCI DbC transport (Codex A, 2026-10-04)
+
+`crates/ax/tk-axdriver-dbc` is TheKernel-original Apache-2.0 Rust, local-only,
+with no copied upstream implementation. Intel xHCI 1.2b §7.6 register/layout
+facts and Linux 7.2.3 `xhci-dbgcap.c`, `xhci-dbgtty.c`, `usb_debug.c` behavior/
+identity facts were consulted. No Linux quotations or translated code were
+introduced. Hardware transport remains unverified; see `docs/design/usb-dbc.md`.

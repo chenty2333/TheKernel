@@ -3237,6 +3237,7 @@ dependencies = [
  "tk-axalloc",
  "tk-axdriver-base",
  "tk-axdriver-block",
+ "tk-axdriver-dbc",
  "tk-axdriver-display",
  "tk-axdriver-input",
  "tk-axdriver-net",
@@ -3262,6 +3263,10 @@ dependencies = [
  "simple-ahci",
  "tk-axdriver-base",
 ]
+
+[[package]]
+name = "tk-axdriver-dbc"
+version = "0.1.0"
 
 [[package]]
 name = "tk-axdriver-display"

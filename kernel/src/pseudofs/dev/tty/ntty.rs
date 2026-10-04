@@ -125,6 +125,8 @@ impl Console {
     fn emit(&self, bytes: &[u8]) {
         axhal::console::write_tty_bytes(bytes);
         let vt = self.vt.unwrap_or_else(|| super::VT_MANAGER.active());
+        #[cfg(feature = "usb-dbc")]
+        if vt == super::VT_MANAGER.active() { axdriver::dbc::mirror_tty(bytes); }
         super::fbcon::write(
             vt,
             bytes,

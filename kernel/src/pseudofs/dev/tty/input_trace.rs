@@ -7,6 +7,8 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InputSource {
     Serial,
+    #[cfg(feature = "usb-dbc")]
+    UsbDebug,
     UsbKeyboard,
     VirtualKeyboard,
     OtherEvdev,
