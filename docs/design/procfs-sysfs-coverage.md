@@ -114,3 +114,28 @@ Rust 测试通过（含 kernel 2580）；q35 和 n305 product lint 通过（各 
 既有 kernel 警告）；最终源码的完整 KVM guest 54/54 通过、无 skip、正常
 关机。proc-interrupts 在 4 CPU guest 检查列数和真实 LOC 增长。MSI/MSI-X
 目前只验证统一向量计数路径的主机注入，**没有真机 MSI 验收**。
+
+### B1.3：独立真实工具 payload 与第一轮发现
+
+`--toolchain inspect` 独立 160 MiB 镜像；76 个精确版本签名 APK，实际工具
+staging 约 17 MiB。保留默认 init、BusyBox、账户；真实程序在
+`/opt/thekernel-tools/bin`，动态库/硬件 ID 数据按发行版路径安装。
+测试脚本 `/opt/thekernel-tools/inspect-tools.sh` 逐个运行上述工具，有失败则
+最终返回非零；htop 经真实 PTY 渲染并发送应用自己的 q 键退出，超时失败。
+该脚本目前用于诊断，**不是已通过的 B1 验收**。
+
+第一轮 QEMU `shell-kmiusllq`：ps/free/uptime/pidstat 退出 0；ps START 显示
+1970（proc/stat 缺 btime），pmap 退出 0 但没有映射明细，lsblk 退出 0 但
+没有磁盘行；这些输出不能称合理。top 返回 1，vmstat 报无法创建 vmstat
+结构；htop 返回 2（PTY smoke 保持失败）。findmnt 触发同任务递归 Mutex
+获取 panic。后续程序尚未运行，不能把它们记成成功/失败。
+
+已定位可疑来源：with_path_fs 持有当前 fs_struct mutex 做 VFS lookup，
+而 /proc/self/mountinfo lookup 要再取目标 task 的 fs->root。须以回归实际
+验证后才能确认修复；该问题不是格式节点注册的许可或硬件问题。
+
+工具 payload 本身验证：签名解包/版本闭包验证和重复 staging 成功；65 个
+相关 Python 测试（3 个既有环境 skip）通过，PTY runner 在主机 htop 实际
+渲染/正常退出，product lint 通过；最终默认 guest 54/54、无 skip、正常关机。
+这只证明打包与基线没有回归；第一轮真实工具审计的 panic/失败仍然存在，
+没有宣称全工具通过。

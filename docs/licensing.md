@@ -202,3 +202,20 @@ holds:
 xHCI §7.6 register/DMA facts are not a copied driver implementation or license
 grant for a USB vendor identity. No Linux code/excerpts were added; no firmware
 blob is needed by DbC. See `docs/design/usb-dbc.md` for scope and references.
+
+### Optional inspect-tool payload (2026-10-05)
+
+`scripts/build-inspect-payload.sh` stages unmodified signed Alpine 3.24 x86_64
+packages, using the existing 3.24.1 minirootfs pin and its trust keys. The exact
+package versions and SPDX expressions are in `config/inspect-apks.lock`, also
+shipped as the payload MANIFEST. No APK scriptlets run on the host. This is an
+optional userspace payload, not Rust linked into the kernel or a host install.
+
+Main licenses: BusyBox GPL-2.0-only; procps/sysstat/htop/pciutils/usbutils and
+iproute2/net-tools GPL family; util-linux programs GPL/BSD/public-domain and
+libraries LGPL (per-package expressions in the lock); musl MIT; ncurses MIT.
+Packaged data/notices in usr/share are retained. Redistributors must also supply
+the applicable license texts and corresponding GPL/LGPL sources, including
+Alpine's packaging changes (Alpine aports v3.24 APKBUILDs and their referenced
+sources). The version/license lock is not a substitute for corresponding source.
+TheKernel's PTY runner and probe script are original Apache-2.0 work.

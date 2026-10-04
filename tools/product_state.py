@@ -310,6 +310,9 @@ ROOTFS_INPUT_FILES = (
     "scripts/build-nested-payload.sh",
     "scripts/build-glibc-payload.sh",
     "scripts/build-gcc-payload.sh",
+    "scripts/build-inspect-payload.sh",
+    "config/inspect-apks.lock",
+    "tests/guest/inspect-tools.sh",
     "scripts/lib/musl-host-compiler.sh",
     "scripts/create-rootfs-image.sh",
     "tools/nested/alpine/build-initramfs.sh",
@@ -341,7 +344,7 @@ ROOTFS_INPUT_ENV = (
 # stages a dynamic loader and shared libc, and `gcc` is `glibc` plus a real
 # distribution C compiler.  Each selection gets its own image, because the
 # kernel embeds it and the two payloads must never be confused for one another.
-TOOL_PAYLOADS = ("none", "tcc", "nested", "glibc", "gcc")
+TOOL_PAYLOADS = ("none", "tcc", "nested", "glibc", "gcc", "inspect")
 
 
 def selected_tool_payload(requested: str | None = None) -> str:
@@ -380,7 +383,7 @@ def rootfs_image_bytes(payload: str) -> int:
     # class; 160 MiB would leave under 30 MiB free, which is not enough room for
     # a compile's intermediate files.
     return {"none": 96, "tcc": 160, "nested": 224, "glibc": 160,
-            "gcc": 224}[payload] * 1024 * 1024
+            "gcc": 224, "inspect": 160}[payload] * 1024 * 1024
 
 
 

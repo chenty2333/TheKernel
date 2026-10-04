@@ -82,6 +82,9 @@ done
 
 case "$PAYLOAD" in
     none|tcc) ;;
+    inspect)
+        exec "$SCRIPT_DIR/build-inspect-payload.sh" --output "$OUTPUT"
+        ;;
     # The nested payload is a superset of `tcc` and is built by its own script,
     # which owns the GLib/QEMU pins.  It is accepted here so that the payload
     # vocabulary has one definition rather than one per builder.
