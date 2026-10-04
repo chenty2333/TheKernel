@@ -2,6 +2,7 @@
 mod dma;
 mod hid;
 mod hid_report;
+mod hid_usage;
 mod storage;
 mod root_partition;
 mod sync;
@@ -242,7 +243,7 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
                         &mut guard,
                         interface.interface_number,
                         0x0b,
-                        u16::from(interface.protocol != 1),
+                        1, // Always report protocol; keyboard arrays share the generic parser.
                     )?;
                 }
                 drop(guard);

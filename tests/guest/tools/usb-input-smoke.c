@@ -33,8 +33,8 @@ int main(void) {
             if(bytes<0) continue;
             for(size_t j=0;j<(size_t)bytes/sizeof events[0];j++) {
                 if(events[j].type==EV_KEY && events[j].code==KEY_A && events[j].value==1) key=1;
-                if(events[j].type==EV_REL && events[j].code==REL_X && events[j].value) rel=1;
-                if(events[j].type==EV_ABS && events[j].code==ABS_X && events[j].value) abs=1;
+                if(events[j].type==EV_REL && events[j].code==REL_X && events[j].value==17) rel=1;
+                if(events[j].type==EV_ABS && events[j].code==ABS_X && events[j].value==16384) abs=1;
             }
         }
     }
