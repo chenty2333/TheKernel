@@ -28,6 +28,12 @@ class InspectPayloadTests(unittest.TestCase):
         self.assertNotIn('podman', dict(pins))
         self.assertTrue(all(version for _, version in pins))
 
+    def test_busybox_keeps_multicall_dispatch_basename(self):
+        source = (ROOT/'scripts/build-inspect-payload.sh').read_text()
+        self.assertIn("bin_dir/'busybox'", source)
+        self.assertIn('/opt/thekernel-tools/bin/busybox {program}', source)
+        self.assertNotIn('alpine-busybox', source)
+
     def test_builder_refuses_to_remove_unrelated_files_before_network(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as directory:
             out = Path(directory)/'precious'

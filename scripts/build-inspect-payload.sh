@@ -80,7 +80,7 @@ for path in ['lib/apk', 'lib/modules-load.d', 'lib/sysctl.d', 'usr/lib/modules-l
     shutil.rmtree(out/path, ignore_errors=True)
 bin_dir = out/'opt/thekernel-tools/bin'
 bin_dir.mkdir(parents=True)
-shutil.copy2(root/'bin/busybox', bin_dir/'alpine-busybox')
+shutil.copy2(root/'bin/busybox', bin_dir/'busybox')
 programs = ['ps', 'top', 'free', 'vmstat', 'uptime', 'pmap', 'pidstat', 'htop',
             'lsblk', 'findmnt', 'mount', 'df', 'lscpu', 'lsns', 'lspci', 'lsusb',
             'iostat', 'mpstat', 'ip', 'ss', 'netstat', 'unshare', 'nsenter']
@@ -100,7 +100,7 @@ for program in programs:
         raise SystemExit(f'tool escaped staging: {program}')
     if source.name == 'busybox':
         dest = bin_dir/program
-        dest.write_text(f'#!/bin/sh\nexec /opt/thekernel-tools/bin/alpine-busybox {program} "$@"\n')
+        dest.write_text(f'#!/bin/sh\nexec /opt/thekernel-tools/bin/busybox {program} "$@"\n')
         dest.chmod(0o755)
     else:
         shutil.copy2(source, bin_dir/program)
