@@ -1085,36 +1085,13 @@ pub(crate) fn reset_mm_layout_for_exec(
         heap_base: usize,
         stack_pointer: usize,
         saved_auxv: Vec<u8>,
+        elf_bounds: crate::mm::ElfBounds,
     ) {
-        let aspace_handle = self.aspace();
-        let aspace = aspace_handle.lock();
-        let mut start_code = usize::MAX;
-        let mut end_code = 0usize;
-        let mut start_data = usize::MAX;
-        let mut end_data = 0usize;
-        for area in aspace
-            .areas()
-            .filter(|area| area.flags().contains(MappingFlags::USER))
-        {
-            if area.flags().contains(MappingFlags::EXECUTE) {
-                start_code = start_code.min(area.start().as_usize());
-                end_code = end_code.max(area.end().as_usize());
-            }
-            if area.flags().contains(MappingFlags::WRITE) && area.start().as_usize() < heap_base {
-                start_data = start_data.min(area.start().as_usize());
-                end_data = end_data.max(area.end().as_usize());
-            }
-        }
-        drop(aspace);
         let mut layout = self.mm_layout.write();
-        layout.start_code = (start_code != usize::MAX)
-            .then_some(start_code)
-            .unwrap_or(0);
-        layout.end_code = end_code;
-        layout.start_data = (start_data != usize::MAX)
-            .then_some(start_data)
-            .unwrap_or(heap_base);
-        layout.end_data = end_data.max(heap_base);
+        layout.start_code = elf_bounds.start_code;
+        layout.end_code = elf_bounds.end_code;
+        layout.start_data = elf_bounds.start_data;
+        layout.end_data = elf_bounds.end_data;
         layout.start_brk = heap_base;
         layout.brk = heap_base + crate::config::USER_HEAP_SIZE;
         layout.start_stack = stack_pointer;

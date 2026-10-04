@@ -271,6 +271,7 @@ impl ExecImageAccess {
 }
 
 pub(crate) struct PreparedUserApp {
+    elf_bounds: super::ElfBounds,
     entry_point: VirtAddr,
     auxv: Vec<AuxEntry>,
     arguments: Vec<Vec<u8>>,
@@ -296,6 +297,7 @@ impl PreparedUserApp {
 }
 
 pub(crate) struct LoadedUserApp {
+    pub(crate) elf_bounds: super::ElfBounds,
     pub(crate) entry_point: VirtAddr,
     pub(crate) stack_pointer: VirtAddr,
     pub(crate) arguments: Vec<Vec<u8>>,
@@ -813,6 +815,7 @@ fn prepare_loaded_user_app(
     };
 
     Ok(PreparedUserApp {
+        elf_bounds: super::ElfBounds::default(),
         entry_point: VirtAddr::from_usize(0),
         auxv: Vec::new(),
         arguments: try_copy_args(args, 0)?,
@@ -1056,6 +1059,17 @@ fn map_prepared_user_app(
         None
     };
     let elf = map_elf(uspace, layout.elf_base, &prepared.executable)?;
+    let mut elf_bounds = super::ElfBounds::default();
+    for ph in elf.headers().ph.iter().filter(|ph| ph.get_type() == Ok(xmas_elf::program::Type::Load)) {
+        let start = usize::try_from(ph.virtual_addr).ok()
+            .and_then(|value| value.checked_add(elf.base()))
+            .ok_or(AxError::InvalidExecutable)?;
+        let end = usize::try_from(ph.file_size).ok()
+            .and_then(|value| start.checked_add(value))
+            .ok_or(AxError::InvalidExecutable)?;
+        elf_bounds.observe_load(start, end, ph.flags.is_execute());
+    }
+    prepared.elf_bounds = elf_bounds;
     let (entry_point, ldso_base) = image_entry_and_aux_base(elf.entry(), dynamic_linker);
     let mut auxv: Vec<AuxEntry> = elf
         .aux_vector(
@@ -1114,6 +1128,7 @@ pub(crate) fn finish_prepared_user_app(
             .map(|entry| (entry.get_type() as usize, entry.value())),
     );
     Ok(LoadedUserApp {
+        elf_bounds: prepared.elf_bounds,
         entry_point,
         stack_pointer,
         arguments: prepared.arguments,

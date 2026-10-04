@@ -801,6 +801,7 @@ fn do_execve(
         layout.heap_base(),
         user_stack_base.as_usize(),
         loaded.saved_auxv,
+        loaded.elf_bounds,
     );
     // A successful exec installs a fresh mm, so no nonzero key allocation or
     // stale mapping key can survive into the new image.

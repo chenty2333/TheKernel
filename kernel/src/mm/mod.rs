@@ -7,6 +7,7 @@ mod fault;
 mod io;
 pub(crate) mod ldt;
 mod loader;
+mod elf_bounds;
 mod mapping_finalizer;
 mod pressure;
 mod remap;
@@ -23,6 +24,7 @@ pub use self::{
     access::*, asid::AddressSpaceToken, aspace::*, io::*, loader::*, pressure::*, stats::*, swap::*,
 };
 pub(crate) use self::{
+    elf_bounds::ElfBounds,
     asid::init as init_hardware_asids,
     fault::handle_user_page_fault,
     mapping_finalizer::{

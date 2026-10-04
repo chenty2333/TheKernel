@@ -466,6 +466,12 @@ static int test_jit_mem(void) {
         "jit-mem-child");
 }
 
+static int test_exec_mm_bounds(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-exec-mm-bounds-smoke",
+        NULL, "exec-mm-bounds-child");
+}
+
 static int test_proc_vmstat(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-proc-vmstat-smoke",
@@ -1055,6 +1061,7 @@ static int run_init(int argc, char **argv) {
         { "proc-path-lookup", test_proc_path_lookup, 30 },
         { "proc-btime", test_proc_btime, 30 },
         { "proc-vmstat", test_proc_vmstat, 30 },
+        { "exec-mm-bounds", test_exec_mm_bounds, 30 },
         { "memory-pressure", test_memory_pressure_reclaim, 120 },
         { "process-exec", test_process_pipe_and_exec, 60 },
         { "vfork", test_vfork, 60 },
