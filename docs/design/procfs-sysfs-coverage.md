@@ -139,3 +139,42 @@ staging 约 17 MiB。保留默认 init、BusyBox、账户；真实程序在
 渲染/正常退出，product lint 通过；最终默认 guest 54/54、无 skip、正常关机。
 这只证明打包与基线没有回归；第一轮真实工具审计的 panic/失败仍然存在，
 没有宣称全工具通过。
+
+路径查找修复候选后实际审计 `shell-2cc4yv3e` 完成遍历，无 panic；findmnt
+和 mount 返回 0，并显示真实的根/伪文件系统挂载树。剩余 14 项失败：
+`top/vmstat/htop/df/lsns/lsusb/netstat`，以及 net 下除 dev 外的七个缺失文件。
+htop 明确报 `No btime in /proc/stat`。df 为本次工具 wrapper 的 basename
+错误（alpine-busybox 没进入 BusyBox 的 multi-call dispatch），不是内核
+缺陷；需独立修复。lspci 三种调用返回 0 但仍报 config/class/irq/resource
+缺失、class ffff；lsblk 没有磁盘行、lscpu 核心/插槽数为 0，这些均未验收。
+`iostat/mpstat/ip/ss/net-dev` 返回 0，仍需检查活跃设备/连接数值而不是仅看
+退出码。B1 未完成；B2 尚未开始，不能把工具打包当成容器支持。
+
+### findmnt 的路径查找重入修复
+
+Linux 7.2.3 fs/namei.c 的 path_init/get_fs_root 使用保留的 fs->root 视图，
+不会持有 fs_struct 锁跨越整个 provider 查找。TheKernel 的 with_path_fs
+原先把 live FsContext mutex 保持到回调返回；proc self mountinfo/mounts
+在 lookup 时保存目标进程 root，从而重新获取同一锁并 panic。
+
+修复为先 clone FsContext（保留 root/cwd/umask 的一致视图），释放 live
+锁后再做路径回调。真正修改进程 fs_struct 的 with_fs 路径仍保持原 writer
+锁，不能借此把 chdir/chroot/umask 改成修改临时副本。26 个直接/间接使用
+这一路径快照的 syscall contract 并发说明同步更新，状态/进度计数不变。
+
+主机新增回归要求 provider 回调中可重取 live fs_struct，绝对路径忽略非法
+目录 fd；完整 kernel 2581 测试通过。proc-path-lookup 在 Linux 主机和
+TheKernel guest 都通过：绝对/dirfd 相对打开 proc self mountinfo/mounts、
+stat，以及 readlink root/cwd。最终完整默认 KVM guest 55/55，无 skip 正常
+关机（system-7179numk）。独立 Alpine findmnt/mount 的真实挂载树已验证；
+全 ABI 差分仍在构建/运行时不记通过。Bison 数据目录问题已实测修正后重跑。
+
+工具 df 的 wrapper basename 修复为独立提交 800182ab；真实 Alpine guest
+已显示 /dev/vda 和三个 tmpfs 的容量，正常关机（shell-k7ewh3x4）。
+
+ABI 验证结果：最初 Linux oracle 的 CONFIG_HZ=100，使既有 socket-provider
+测试硬编码的 2000us 超时回读断言失败；这个失败发生在 Linux 对照程序，
+不是 TheKernel 路径查找修复。测试改为先用 1us 请求观测真实量化单位，再
+验证 1500us 请求向上整倍数量化；未改两个内核的时钟或 socket 实现，也没
+改成接受任意正数。独立重跑完整差分 **257/257 contracts 在两个 guest
+通过**（abi-2wdn18zu）。该测试修复与内核锁修复分开提交。

@@ -466,6 +466,12 @@ static int test_jit_mem(void) {
         "jit-mem-child");
 }
 
+static int test_proc_path_lookup(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-proc-path-lookup-smoke",
+        NULL, "proc-path-lookup-child");
+}
+
 static int test_proc_interrupts(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-proc-interrupts-smoke",
@@ -1034,6 +1040,7 @@ static int run_init(int argc, char **argv) {
         { "procfs", test_procfs, 60 },
         { "proc-inventory", test_proc_inventory, 30 },
         { "proc-interrupts", test_proc_interrupts, 30 },
+        { "proc-path-lookup", test_proc_path_lookup, 30 },
         { "memory-pressure", test_memory_pressure_reclaim, 120 },
         { "process-exec", test_process_pipe_and_exec, 60 },
         { "vfork", test_vfork, 60 },

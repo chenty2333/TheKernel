@@ -375,7 +375,19 @@ pub fn with_path_fs<R>(
     f: impl FnOnce(&mut FsContext) -> AxResult<R>,
 ) -> AxResult<R> {
     let fs_context = current_fs_context();
-    let mut fs = fs_context.lock();
+    with_path_fs_snapshot(&fs_context, dirfd, path, f)
+}
+
+fn with_path_fs_snapshot<R>(
+    fs_context: &Mutex<FsContext>,
+    dirfd: c_int,
+    path: &FsPath,
+    f: impl FnOnce(&mut FsContext) -> AxResult<R>,
+) -> AxResult<R> {
+    // Pin root/cwd/umask, then release fs_struct before calling providers.
+    // Procfs may inspect this very task's root while resolving a pathname.
+    // Actual fs_struct mutation still goes through with_fs, not this view.
+    let mut fs = fs_context.lock().clone();
     if dirfd == AT_FDCWD || path.is_absolute() {
         f(&mut fs)
     } else {
@@ -1771,6 +1783,22 @@ mod tests {
 
     use super::*;
     use crate::{file::FileDescription, pseudofs::tmp};
+
+    #[test]
+    fn path_lookup_releases_fs_struct_before_reentrant_provider_inspection() {
+        let _context = crate::test_support::scheduler_test_context();
+        let filesystem = tmp::MemoryFs::new().unwrap();
+        let root = Mountpoint::new_root(&filesystem);
+        let context = Mutex::new(FsContext::new(root.root_location()));
+        for dirfd in [AT_FDCWD, 123] {
+            with_path_fs_snapshot(&context, dirfd, FsPath::new(b"/"), |view| {
+                let live = context.try_lock().expect("path provider must not own live fs_struct");
+                assert!(live.root_dir().is_root());
+                assert!(view.root_dir().is_root());
+                Ok(())
+            }).unwrap();
+        }
+    }
 
     struct RecordingDirSink {
         called: bool,
