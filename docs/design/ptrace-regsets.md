@@ -77,5 +77,19 @@ bound to the exact ptrace generation and committed before the job gate exposes
 Running, so a reattachment cannot inherit a dead tracer's mode and an unrelated
 wake cannot execute the tracee before its requested mode is installed.
 
-Single-step, hardware watchpoints and real gdb/strace acceptance remain pending. Existing relationship and stop storage is process-wide; multithreaded
+Instruction stepping sets TF at the final user-entry edge, preserving it across
+unrelated IRQ returns. Debugger-forced TF is hidden from register reads and cleared
+by ordinary resume/detach; user-provided TF and POPF/IRET-owned updates are not
+claimed by that cleanup. DR6 is captured and acknowledged before IRQ enable or
+migration and architectural BS stops carry TRAP_TRACE at the actual return IP.
+The synthetic syscall-step stop instead uses Linux x86's TRAP_BRKPT convention.
+SYSEMU_SINGLESTEP combines skipped syscall entries with instruction stepping.
+The paired guest test executes NOP/store instructions, steps across a real
+syscall, verifies skipped SYSEMU_SINGLESTEP side effects, and preserves user-owned
+TF. POPF/IRET opcode detection has host helper coverage, not a claim that arbitrary
+user return-fault recovery is complete. The test admits at most one additional
+same-IP TRAP_TRACE observed on native Linux after the emulation entry, and checks
+that no store occurred at that stop before stepping the next instruction.
+Hardware branch stepping (SINGLEBLOCK), hardware watchpoints and real gdb/strace
+acceptance remain pending. Existing relationship and stop storage is process-wide; multithreaded
 debugging requires task-exact stop/relationship semantics, not just registers.

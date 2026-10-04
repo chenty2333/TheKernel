@@ -410,6 +410,7 @@ fn do_continue(
     data: usize,
     detach: bool,
     syscall_mode: u8,
+    changes_tf: bool,
 ) -> AxResult<PtraceContinueOutcome> {
     let target = &thread.proc_data;
     let curr = current();
@@ -420,7 +421,7 @@ fn do_continue(
         .is_some_and(|stop| stop.ptrace_event != 0);
     let (resume_result, record, retired_relationship) = target
         .resume_ptrace(session, detach, || {
-            *thread.ptrace_syscall_mode.lock() = Some((session, syscall_mode));
+            crate::task::ptrace_runtime::commit_resume_mode(thread, session, syscall_mode, changes_tf);
         })
         .ok_or(AxError::NoSuchProcess)?;
     if detach {
@@ -956,23 +957,29 @@ fn sys_ptrace_for_target(
     // memory or usercopy.
     let ptrace_action = target.lock_ptrace_actions();
     match request {
-        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP | PTRACE_SYSEMU => {
+        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP | PTRACE_SYSEMU | PTRACE_SYSEMU_SINGLESTEP => {
+            use crate::task::ptrace_runtime::{TRACE_SYSCALL, EMULATE_SYSCALL, STEP_INSTRUCTION};
             let session = check_inactive_tracee(&target)?;
-            do_continue(target_thread, session, data, false, match request {
-                PTRACE_SYSCALL => crate::task::ptrace_runtime::TRACE_SYSCALL,
-                PTRACE_SYSEMU => crate::task::ptrace_runtime::EMULATE_SYSCALL,
+            let resume_mode = match request {
+                PTRACE_SYSCALL => TRACE_SYSCALL,
+                PTRACE_SYSEMU => EMULATE_SYSCALL,
+                PTRACE_SINGLESTEP => STEP_INSTRUCTION,
+                PTRACE_SYSEMU_SINGLESTEP => EMULATE_SYSCALL | STEP_INSTRUCTION,
                 _ => 0,
-            })?.finish()
+            };
+            let changes_tf = if resume_mode & STEP_INSTRUCTION != 0 {
+                regs::next_instruction_changes_tf(target_thread, session)?
+            } else { false };
+            do_continue(target_thread, session, data, false, resume_mode, changes_tf)?.finish()
         }
-        // Instruction/block stepping is implemented independently of syscall
-        // tracing; until then these requests must not silently resume normally.
-        PTRACE_SYSEMU_SINGLESTEP | PTRACE_SINGLEBLOCK => {
+        // Hardware branch/block stepping is not yet implemented.
+        PTRACE_SINGLEBLOCK => {
             check_inactive_tracee(&target)?;
             Err(ptrace_io_error())
         }
         PTRACE_DETACH => {
             let session = check_inactive_tracee(&target)?;
-            let outcome = do_continue(target_thread, session, data, true, 0)?;
+            let outcome = do_continue(target_thread, session, data, true, 0, false)?;
             drop(ptrace_action);
             outcome.finish()
         }

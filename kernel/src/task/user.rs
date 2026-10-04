@@ -47,6 +47,9 @@ fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
 /// but #CP does not update it; Linux reports the trapping instruction address
 /// in `si_addr` for that exception.
 fn map_exception_signal_info(exc_info: &ExceptionInfo, instruction_pointer: usize) -> SignalInfo {
+    if exc_info.vector == 1 && exc_info.error_code & (1 << 14) != 0 {
+        return SignalInfo::new_fault(Signo::SIGTRAP, linux_raw_sys::general::TRAP_TRACE as i32, instruction_pointer);
+    }
     if exc_info.vector == 21 {
         return control_protection_signal_info(instruction_pointer);
     }
@@ -135,6 +138,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                             // task-local. Refresh or invalidate it only at
                             // this IRQ-disabled final return edge so a
                             // migration cannot expose a prior task's ports.
+                            super::ptrace_runtime::prepare_user_step(thr, uctx);
                             thr.install_user_io_permissions();
                         }
                         action
@@ -388,6 +392,15 @@ mod tests {
             task_create_error(TaskCreateError::IdentifierExhausted),
             AxError::WouldBlock
         );
+    }
+
+    #[test]
+    fn debug_bs_status_uses_trace_code_and_the_saved_instruction_address() {
+        let exception = ExceptionInfo { vector: 1, error_code: 1 << 14, cr2: 0, address: 0x1234 };
+        let info = map_exception_signal_info(&exception, exception.address);
+        assert_eq!(info.signo(), Signo::SIGTRAP);
+        assert_eq!(info.code(), linux_raw_sys::general::TRAP_TRACE as i32);
+        assert_eq!(info.fault_address(), 0x1234);
     }
 
     #[test]

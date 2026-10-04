@@ -321,6 +321,15 @@ impl UserContext {
         let ret = match (vector, err_code_to_flags(self.error_code)) {
             (PAGE_FAULT_VECTOR, Ok(flags)) => ReturnReason::PageFault(va!(cr2), flags),
             (LEGACY_SYSCALL_VECTOR, _) => ReturnReason::Syscall,
+            (1, _) => {
+                // DR6 is CPU-local. Snapshot/acknowledge before enabling IRQs
+                // or permitting migration; #DB has no CPU-pushed error code.
+                let status = super::asm::read_perf_debug_status();
+                super::asm::acknowledge_perf_debug_status(status & ((1 << 14) | 0x0f));
+                ReturnReason::Exception(ExceptionInfo {
+                    vector, error_code: status, cr2, address: self.ip(),
+                })
+            }
             // #CP is a user exception, not an IDT panic path. Preserve its
             // vector/error-code/IP in ExceptionInfo so the kernel's common
             // user-fault path emits SIGSEGV/SEGV_CPERR with si_addr = RIP.
@@ -366,7 +375,7 @@ impl DerefMut for UserContext {
 pub struct ExceptionInfo {
     /// The exception vector.
     pub vector: u8,
-    /// The error code.
+    /// CPU error code, or the captured DR6 reason for #DB (vector 1).
     pub error_code: u64,
     /// The faulting virtual address (if applicable).
     pub cr2: usize,

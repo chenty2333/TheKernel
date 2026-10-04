@@ -39,6 +39,9 @@ pub(super) fn general_register_transfer(
         crate::task::registers::apply_gregs(&mut context, &regs)?;
         // Keep the unmodifiable flags from the original stopped frame.
         crate::task::registers::fill_gregs(&context, regs[15], &mut regs);
+        if regs[18] & crate::task::ptrace_runtime::TRAP_FLAG != 0 {
+            thread.ptrace_forced_tf.store(false, core::sync::atomic::Ordering::Release);
+        }
         *thread.ptrace_registers.lock() = Some(regs);
     } else {
         // SAFETY: regs is an initialized native word array; len is a clamped prefix.
@@ -91,6 +94,9 @@ pub(super) fn ptrace_user_word(
     validate_legacy_selectors(thread, &regs)?;
     crate::task::registers::apply_gregs(&mut context, &regs)?;
     crate::task::registers::fill_gregs(&context, regs[15], &mut regs);
+    if regs[18] & crate::task::ptrace_runtime::TRAP_FLAG != 0 {
+        thread.ptrace_forced_tf.store(false, core::sync::atomic::Ordering::Release);
+    }
     *thread.ptrace_registers.lock() = Some(regs);
     Ok(0)
 }
@@ -285,4 +291,21 @@ fn validate_legacy_selectors(
         }
     }
     Ok(())
+}
+
+/// Inspect at most one native instruction without holding a spin guard over
+/// usercopy. An unmapped suffix terminates decoding rather than rejecting a
+/// legitimate step at the end of a page.
+pub(super) fn next_instruction_changes_tf(thread: &Thread, session: PtraceSession) -> AxResult<bool> {
+    let address = thread.ptrace_registers.lock().ok_or(AxError::NoSuchProcess)?[16] as usize;
+    let memory = pinned_tracee_memory(&thread.proc_data, session)?;
+    let mut bytes = [0; 15];
+    let mut len = 0;
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        let Some(address) = address.checked_add(offset) else { break; };
+        let Ok(value) = memory.read_value(address as *const u8) else { break; };
+        *byte = value;
+        len += 1;
+    }
+    Ok(crate::task::ptrace_runtime::instruction_changes_tf(&bytes[..len]))
 }

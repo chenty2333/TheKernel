@@ -1287,6 +1287,9 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
                 .load(core::sync::atomic::Ordering::Acquire),
             &mut regs,
         );
+        if thr.ptrace_forced_tf.load(core::sync::atomic::Ordering::Acquire) {
+            regs[18] &= !super::ptrace_runtime::TRAP_FLAG;
+        }
         *thr.ptrace_registers.lock() = Some(regs);
         if proc_data.ptrace_active_session().is_some() {
             // Allocate and save in the owner task, never by dereferencing a
