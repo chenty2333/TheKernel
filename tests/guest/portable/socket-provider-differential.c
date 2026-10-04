@@ -801,6 +801,18 @@ static void sol_socket_table(void) {
         mark("SNDTIMEO_FRESH_ZERO",
              getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, &tvlen) == 0 &&
                  tvlen == sizeof(tv) && tv.tv_sec == 0 && tv.tv_usec == 0);
+        /* USER_HZ is not the kernel's HZ. Observe the timeout quantum using
+         * a 1-us request instead of assuming the oracle also runs at 1000 Hz.
+         * The subsequent 1500-us request must round up to that quantum. */
+        tv.tv_sec = 0; tv.tv_usec = 1;
+        check("RCVTIMEO_SET_NEW",
+              setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO_NEW, &tv, sizeof(tv)) == 0);
+        tvlen = sizeof(tv);
+        int quantum_ok = getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO_OLD, &tv, &tvlen) == 0 &&
+                         tvlen == sizeof(tv) && tv.tv_sec == 0 &&
+                         tv.tv_usec > 0 && tv.tv_usec <= 1000000;
+        long quantum = quantum_ok ? tv.tv_usec : 1;
+        long rounded = ((1500 + quantum - 1) / quantum) * quantum;
         tv.tv_sec = 0; tv.tv_usec = 1500;
         check("RCVTIMEO_SET_NEW",
               setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO_NEW, &tv, sizeof(tv)) == 0);
@@ -809,8 +821,8 @@ static void sol_socket_table(void) {
               setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO_OLD, &tv, sizeof(tv)) == 0);
         tvlen = sizeof(tv);
         mark("RCVTIMEO_JIFFY_ROUND_TRIP",
-             getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO_OLD, &tv, &tvlen) == 0 &&
-                 tvlen == sizeof(tv) && tv.tv_sec == 0 && tv.tv_usec == 2000);
+             quantum_ok && getsockopt(fd, SOL_SOCKET, SO_RCVTIMEO_OLD, &tv, &tvlen) == 0 &&
+                 tvlen == sizeof(tv) && tv.tv_sec == 0 && tv.tv_usec == rounded);
         tvlen = sizeof(tv);
         mark("SNDTIMEO_ROUND_TRIP",
              getsockopt(fd, SOL_SOCKET, SO_SNDTIMEO_NEW, &tv, &tvlen) == 0 &&
