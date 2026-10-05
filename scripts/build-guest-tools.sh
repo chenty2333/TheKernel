@@ -82,6 +82,9 @@ done
 
 case "$PAYLOAD" in
     none|tcc) ;;
+    containers)
+        exec "$SCRIPT_DIR/build-containers-payload.sh" --output "$OUTPUT"
+        ;;
     inspect)
         exec "$SCRIPT_DIR/build-inspect-payload.sh" --output "$OUTPUT"
         ;;

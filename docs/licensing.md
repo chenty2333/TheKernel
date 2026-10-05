@@ -240,3 +240,19 @@ from Quancheng Laboratory Innovation Center (2024). Both the declared metadata
 and the original license/attribution are retained; this discrepancy is recorded,
 not silently relabeled. TheKernel additions are original Apache-2.0 code. No
 Linux C implementation was copied or translated for this interface.
+
+## Optional B2 container payload
+
+`scripts/build-containers-payload.sh` stages exactly the signed Alpine 3.24.1
+x86_64 closure in `config/containers-apks.lock`; each package's SPDX expression
+comes from verified APK metadata. Key programs: bubblewrap (LGPL-2.1-or-later),
+crun (GPL-2.0-or-later AND LGPL-2.1-or-later), podman/conmon (Apache-2.0), fuse-overlayfs
+(GPL-2.0-or-later), shadow-subids helpers (BSD-3-Clause), musl (MIT), and
+BusyBox (GPL-2.0-only). The complete lock records dependencies and mixed grants;
+shipped upstream license/data files are retained in the optional payload.
+These distribution binaries are not linked into the kernel. Installer scripts,
+triggers and host ownership changes are disabled; no host container is started.
+The separate BusyBox OCI root retains its dynamic loader; the offline Alpine
+image is constructed from the already pinned minirootfs release, with only the
+content digests required by the image format, not an extra provenance archive.
+The original Apache-2.0 builder/tests never replace baseline init or accounts.

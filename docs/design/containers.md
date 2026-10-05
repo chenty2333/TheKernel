@@ -221,6 +221,29 @@ the private marker. It emits KTAP and exits0 (`shell-v6lsjj09`). Cleanup release
 the namespace init normally before waiting on its wrapper; the earlier missing
 path timeout is not counted as success. Level 1 is now usable; proceed to bwrap.
 
+### Separate signed container payload
+
+`--toolchain containers` selects a separate384MiB image; the default128MiB
+rootfs and baseline init/accounts remain unchanged. The builder verifies the
+exact131-package Alpine3.24.1 closure, disables installer scripts/triggers and
+host ownership changes, and retains runtime licenses. It stages bwrap0.12.0,
+crun1.30.1, podman5.8.8, conmon, uid/gid-map and FUSE helpers without launching
+any of them as host containers. The repeated signed build stages109MiB.
+
+A minimal dynamic BusyBox OCI root includes its loader and bind destinations.
+An offline `alpine:3.24.1`/`alpine:latest` image comes from the pinned release
+archive; manifest/config/layer digests were validated without registry pulls.
+No cgroup/OCI/podman runtime acceptance is implied by packaging.
+
+Validated: related Python5 and period50 full host663/Rust6069, system70/70
+(`system-0pnpux24`), q35/n305 lint784. Real bwrap --version reports0.12.0.
+The initial readonly fixture target was absent and has been added. Bwrap now
+reaches pivot cleanup and reports `unmount old root: Invalid argument`
+(`shell-etbfzsfw`); level2 remains pending. Linux transfers the old root's
+placement lock to the new root when pivoting; repair this observed lifecycle
+before attempting crun. The noninteractive bwrap script is staged, but its
+success marker has not occurred and is not recorded as passed.
+
 ## Tool acceptance ladder
 
 1. util-linux unshare/nsenter: passed, noninteractive signed-tool guest regression.
