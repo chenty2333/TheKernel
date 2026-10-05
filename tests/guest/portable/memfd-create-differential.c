@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -344,7 +345,47 @@ static int test_file_shape(void) {
     return 0;
 }
 
-int main(void) {
+static int test_anonymous_exec(void) {
+    int src = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    int fd = (int)do_memfd_create("exec:/proc/self/exe", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (src < 0 || fd < 0) return fail("memfd-exec-open");
+    struct stat stat;
+    if (fstat(fd, &stat) || stat.st_nlink != 0) return fail("memfd-anonymous-nlink");
+    char path[64], label[256];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    ssize_t len = readlink(path, label, sizeof(label) - 1);
+    if (len < 0) return fail("memfd-anonymous-label");
+    label[len] = 0;
+    if (strcmp(label, "/memfd:exec:/proc/self/exe (deleted)")) return fail("memfd-anonymous-name");
+    char buffer[4096]; ssize_t n;
+    while ((n = read(src, buffer, sizeof(buffer))) > 0) {
+        ssize_t copied = 0;
+        while (copied < n) {
+            ssize_t w = write(fd, buffer + copied, n - copied);
+            if (w <= 0) return fail("memfd-exec-write");
+            copied += w;
+        }
+    }
+    if (n < 0 || close(src)) return fail("memfd-exec-copy");
+    if (fcntl(fd, F_ADD_SEALS, 0xf)) return fail("memfd-exec-seal");
+    // The initial writable anonymous OFD must not block a sealed ELF exec.
+    pid_t child = fork();
+    if (child < 0) return fail("memfd-exec-fork");
+    if (!child) {
+        char *args[] = {"memfd-exec", "--memfd-exec-child", NULL};
+        char *env[] = {NULL};
+        syscall(SYS_execveat, fd, "", args, env, AT_EMPTY_PATH);
+        perror("memfd-execveat"); _exit(91);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status))
+        return fail("memfd-exec-child-status");
+    if (close(fd)) return fail("memfd-exec-close");
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--memfd-exec-child")) return 0;
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
 
@@ -373,6 +414,9 @@ int main(void) {
         return 1;
     puts("THEKERNEL_ABI_ASSERT memfd-create.portable-differential "
          "MFD_FILE_SHAPE pass");
+
+    if (test_anonymous_exec()) return 1;
+    puts("THEKERNEL_ABI_ASSERT memfd-create.portable-differential MFD_ANONYMOUS_SEALED_EXEC pass");
 
     puts("THEKERNEL_MEMFD_CREATE_OK");
     puts("THEKERNEL_ABI_RESULT memfd-create.portable-differential pass");

@@ -278,3 +278,32 @@ payload, and is not a claim of an absent guest loader.
 
 No pending level is claimed usable. Tools and images will use a separate signed
 Alpine payload, not the default guest filesystem.
+
+### Anonymous executable memfds (level 3 preparation)
+
+The initial crun probe exits1 before its version or OCI command, with its generic
+self-cloning error (`shell-y9lv5eno`). Its upstream1.30.1
+[self-cloning implementation](https://github.com/containers/crun/blob/1.30.1/src/libcrun/cloned_binary.c)
+can use either a readonly bind fd or sealed memfd. An independent sealed-ELF
+probe exposed ETXTBSY through the initial writable memfd OFD, which incorrectly
+owned a pathname writer lease. This is a real fallback defect, not yet proof
+that it was crun's selected branch.
+
+Memfd creation now prepares a zero-link inode on a private kernel shmem mount,
+with the original opaque name, real ownership, initial mode/seals and a reserved
+unpublished descriptor. It never creates a caller-visible /tmp/memfd path or
+consults chroot's directory tree. Like Linux alloc_file_pseudo(), its initial
+writable OFD does not take pathname writer exclusion; ordinary writable reopens
+still do. The existing cached backend preserves shared RW/RX mappings. Only
+this exact private mount receives namespace-neutral flags/idmap treatment;
+unknown ordinary mounts remain errors. ELF preflight reads the same cached
+bytes as image mapping, rather than stale lower-inode data.
+
+Validated: kernel2634 (anonymous inode/name/owner and dirty-header regressions),
+q35 lint784, system70/70 (`system-jdt3qw10`), and the paired memfd-create program
+including actual sealed ELF execveat and zero-link/name checks (`abi-dza2f1bk`). Earlier full
+guests failed two existing futex/JIT tests: the first implementation omitted
+private-mount stat handling, then selected a direct backend without shared-file
+mmap. Those defects were repaired, not counted as passes. An ABI invocation
+without its required KVM selector did not execute the oracle; the corrected
+selected run passed. No crun/OCI/resource-limit acceptance is claimed yet.

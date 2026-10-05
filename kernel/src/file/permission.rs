@@ -1509,10 +1509,14 @@ fn check_inode_permissions_with_metadata(
         task.try_as_thread()
             .map(|thread| thread.mount_ns().topology())
     });
-    let idmap = topology
-        .map(|topology| topology.idmap_for_mount(loc.mountpoint().mount_id()))
-        .transpose()?
-        .flatten();
+    let idmap = if super::memfd_provider::is_internal_mount(loc.mountpoint()) {
+        None
+    } else {
+        topology
+            .map(|topology| topology.idmap_for_mount(loc.mountpoint().mount_id()))
+            .transpose()?
+            .flatten()
+    };
     let projected_metadata = metadata_for_idmap(metadata, actor, idmap.as_deref());
     check_inode_permissions_with_projected_metadata(
         loc,

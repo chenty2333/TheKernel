@@ -694,7 +694,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:creation flags validation before object and descriptor publication"]
 usercopy = ["usercopy:bounded name import before object publication"]
-state = ["state:memory-backed file supports sealing with write-admission serialization"]
+state = ["state:anonymous kernel shmem file supports sealing with write-admission serialization; initial writable OFD has no pathname writer exclusion"]
 concurrency = ["concurrency:descriptor reservation precedes publication and object lifetime is reference counted"]
 teardown = ["teardown:failed creation releases unpublished resources; last OFD reference releases object"]
 flags = ["flag:MFD_CLOEXEC MFD_ALLOW_SEALING"]
@@ -707,8 +707,8 @@ contract = "linux-memfd_create"
 handler = "kernel/src/syscall/fs/memfd.rs:sys_memfd_create"
 conditional = "explicit-none"
 tests = ["kernel/src/file/memfd.rs:writable_registration_is_idempotent_and_blocks_seal_write", "tests/guest/portable/memfd-create-differential.c:main"]
-validation_gaps = ["The registered memfd-create differential covers the flag mask, the 250-byte name scan, descriptor cloexec, the inode mode, seal admission and the file shape; the vm.memfd_noexec scope matrix still has no guest assertion because the differential guest shares one boot and that sysctl is global to it"]
-limitations = ["MFD_HUGETLB always fails with EOPNOTSUPP where the oracle, built with hugetlbfs, creates a default-size hugetlbfs file for MFD_HUGETLB and for MFD_HUGETLB|MFD_HUGE_2MB, answers ENODEV for MFD_HUGE_1GB and for an unregistered size log, and EINVAL for a reserved bit; the missing primitive is a kernel-internal anonymous hugetlbfs inode on the per-hstate MemoryFs instance, because MemoryFs files are only reachable through a path-mounted instance"]
+validation_gaps = ["The registered memfd-create differential covers the flag mask, the 250-byte name scan, descriptor cloexec, the inode mode, seal admission, anonymous zero-link name and actual sealed ELF execveat through the initial writable OFD; the vm.memfd_noexec scope matrix still has no guest assertion because the differential guest shares one boot and that sysctl is global to it"]
+limitations = ["MFD_HUGETLB always fails with EOPNOTSUPP where the oracle, built with hugetlbfs, creates a default-size hugetlbfs file for MFD_HUGETLB and for MFD_HUGETLB|MFD_HUGE_2MB, answers ENODEV for MFD_HUGE_1GB and for an unregistered size log, and EINVAL for a reserved bit; the per-hstate anonymous hugetlbfs allocation and mmap ownership are not wired to memfd_create; the internal anonymous shmem provider does not select a hugetlb hstate"]
 
 [[contract]]
 id = "linux-userfaultfd"
@@ -4562,7 +4562,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate ABI arguments and user memory before committing child publication or replacement image"]
 usercopy = ["usercopy:copy supplied task ABI pointers with checked user-memory access"]
-state = ["state:replace image, reset registers and TLS, close CLOEXEC descriptors and apply exec credential transition", "state:publish main ELF initialized PT_LOAD code/data bounds, excluding dynamic linker and trampoline VMAs"]
+state = ["state:replace image, reset registers and TLS, close CLOEXEC descriptors and apply exec credential transition", "state:publish main ELF initialized PT_LOAD code/data bounds, excluding dynamic linker and trampoline VMAs; preflight reads coherent cached contents including anonymous shmem"]
 concurrency = ["concurrency:task and address-space ownership gates serialize publication and image replacement"]
 teardown = ["teardown:failed preparation releases staged resources; successful exit or exec releases prior ownership"]
 
@@ -4573,7 +4573,7 @@ status = "implemented"
 contract = "linux-execve"
 handler = "kernel/src/syscall/task/execve.rs:sys_execve"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls"]
+tests = ["kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 
@@ -4585,7 +4585,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate ABI arguments and user memory before committing child publication or replacement image"]
 usercopy = ["usercopy:copy supplied task ABI pointers with checked user-memory access"]
-state = ["state:resolve image through dirfd or empty-path descriptor and commit the replacement image", "state:publish main ELF initialized PT_LOAD code/data bounds, excluding dynamic linker and trampoline VMAs"]
+state = ["state:resolve image through dirfd or empty-path descriptor and commit the replacement image", "state:publish main ELF initialized PT_LOAD code/data bounds, excluding dynamic linker and trampoline VMAs; preflight reads coherent cached contents including anonymous shmem"]
 concurrency = ["concurrency:task and address-space ownership gates serialize publication and image replacement"]
 teardown = ["teardown:failed preparation releases staged resources; successful exit or exec releases prior ownership"]
 
@@ -4596,7 +4596,7 @@ status = "implemented"
 contract = "linux-execveat"
 handler = "kernel/src/syscall/task/execve.rs:sys_execveat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls"]
+tests = ["kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 

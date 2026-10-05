@@ -470,6 +470,13 @@ fn load_exec_args_env<M: UserMemory + ?Sized>(
     Ok((args, envs))
 }
 
+fn executable_display_path(loc: &axfs_ng_vfs::Location) -> AxResult<axfs_ng_vfs::FsPathBuf> {
+    if let Some(label) = crate::file::memfd_provider::label(loc) {
+        return label;
+    }
+    try_copy_path(&loc.absolute_path()?)
+}
+
 fn do_execve(
     uctx: &mut UserContext,
     loc: axfs_ng_vfs::Location,
@@ -490,7 +497,7 @@ fn do_execve(
     )?;
     fanotify::permission_check(&loc, &loc, fanotify::FAN_OPEN_PERM, loc.is_dir(), false)?;
 
-    let abs_path = try_copy_path(&loc.absolute_path()?)?;
+    let abs_path = executable_display_path(&loc)?;
     let task_name = task_name_from_fs_name(loc.name());
 
     let thr = curr.as_thread();
@@ -526,8 +533,7 @@ fn do_execve(
     let source_security = prepared_app.take_credential_source_security()?;
     let source_mode = source_security.mode();
     let final_exe_path = {
-        let path = prepared_app.credential_source.absolute_path()?;
-        try_copy_path(&path)?
+        executable_display_path(&prepared_app.credential_source)?
     };
     let file_owner = source_security.owner();
     let nosuid = crate::mounts::is_nosuid(&prepared_app.credential_source)?;

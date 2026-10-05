@@ -515,10 +515,9 @@ enum ExecLoadTarget<'a> {
 
 impl ExecLoadTarget<'_> {
     fn read_at(&self, cache: &CachedFile, buf: &mut [u8], offset: u64) -> AxResult<usize> {
-        match self {
-            Self::Mapped(_) => cache.read_at(buf, offset),
-            Self::Probe => cache.location().entry().as_file()?.read_at(buf, offset),
-        }
+        // Preflight and mapping must inspect the same page-cache contents;
+        // an anonymous shmem file can have newer bytes than its lower inode.
+        cache.read_at(buf, offset)
     }
 }
 
@@ -1287,6 +1286,18 @@ mod tests {
             include_bytes!("../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2"),
         );
         (script, interpreter, dynamic_linker)
+    }
+
+    #[test]
+    fn preflight_reads_dirty_cached_contents_not_stale_lower_inode() {
+        let fs = MemoryFs::new_with_capacity(Some(1024 * 1024)).unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let loc = create_test_file(&mount.root_location(), "cached-header", b"old");
+        let cache = CachedFile::get_or_create(loc);
+        assert_eq!(cache.write_at_slice(b"new", 0).unwrap(), 3);
+        let mut bytes = [0; 3];
+        assert_eq!(ExecLoadTarget::Probe.read_at(&cache, &mut bytes, 0).unwrap(), 3);
+        assert_eq!(&bytes, b"new");
     }
 
     #[test]

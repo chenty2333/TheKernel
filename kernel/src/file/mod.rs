@@ -38,6 +38,7 @@ pub mod inotify;
 pub(crate) mod io_uring;
 pub(crate) mod lease;
 pub(crate) mod memfd;
+pub(crate) mod memfd_provider;
 pub(crate) mod namespace_mutation;
 mod net;
 pub(crate) mod netlink;
