@@ -1056,3 +1056,22 @@ prefix grammar and each measured start against raw config while retaining its
 existing read-only/credential checks. Final lint-only iterator cleanup uses the
 same fixed four-byte chunks, with related host tests/lint rerun; no new runtime
 semantics or syscall contract changes, so no redundant full ABI run.
+
+### B1 close38: active ss Unix acceptance, no additional kernel provider
+
+The existing proc table is sufficient for signed Alpine iproute2 `ss -xanp`'s
+normal fallback: `shell-af7ib2rr` displayed a real Unix LISTEN row and two ESTAB
+rows, with actual pathnames/inodes and parent PID/FD ownership, without any
+netlink diagnostic. The fixture's original socket state, namespace pin/isolation,
+dup/final-close and queued-data non-consumption assertions also passed.
+`--tools` now includes this non-interactive ss acceptance alongside both real
+netstat providers. Host Linux base regression compiled with warnings-as-errors
+and passed; lint passed. No kernel behavior changed, so neither a redundant
+full guest suite nor an unrelated ABI run is needed for this test-only step.
+TCP/UDP real-tool acceptance and the eight shared network counters were already
+verified by the earlier live fixtures; no duplicate implementation is added.
+
+Known difference: Unix SOCK_DIAG remains unsupported; proc fallback has no
+receive/send queue byte columns, so ss displays zeros there even for queued
+payload. This is a documented fallback limitation, not claimed native queue
+measurement, and is not expanded under the B1 closeout scope.

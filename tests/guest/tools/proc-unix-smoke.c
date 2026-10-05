@@ -55,11 +55,12 @@ static void pair(unsigned type) {
     ino_t inode = inode_of(sockets[0]); int duplicate = dup(sockets[0]); need(duplicate >= 0, "pair duplicate");
     close(sockets[0]); check(duplicate, type, 3, 0, ""); close(duplicate); gone(inode); close(sockets[1]);
 }
-static void tools(const char *path, int busybox) {
+static void tools(const char *path, int provider) {
     int output[2]; need(!pipe(output), "tool output pipe"); pid_t child = fork(); need(child >= 0, "tool fork");
     if (!child) {
         close(output[0]); dup2(output[1], STDOUT_FILENO); dup2(output[1], STDERR_FILENO); close(output[1]);
-        if (busybox) execl("/opt/thekernel-tools/bin/busybox", "busybox", "netstat", "-xanp", (char *)NULL);
+        if (provider == 2) execl("/opt/thekernel-tools/bin/ss", "ss", "-xanp", (char *)NULL);
+        else if (provider == 1) execl("/opt/thekernel-tools/bin/busybox", "busybox", "netstat", "-xanp", (char *)NULL);
         else execl("/opt/thekernel-tools/bin/netstat", "netstat", "-xanp", (char *)NULL);
         _exit(127);
     }
@@ -67,11 +68,12 @@ static void tools(const char *path, int busybox) {
     while (used < sizeof(text)-1 && (amount = read(output[0], text+used, sizeof(text)-1-used)) > 0) used += amount;
     need(used < sizeof(text)-1, "tool output bounded"); text[used] = 0; close(output[0]); int status;
     need(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "real netstat exit");
-    printf("UNIX_NETSTAT_PROVIDER=%s\n%s", busybox ? "busybox" : "net-tools", text);
+    printf("UNIX_NETSTAT_PROVIDER=%s\n%s", provider == 2 ? "ss" : provider == 1 ? "busybox" : "net-tools", text);
     char *line = strstr(text, path); need(line != NULL, "real netstat bound pathname");
     char *start = line; while (start > text && start[-1] != '\n') start--;
-    need(strstr(start, "LISTENING") && strstr(start, "STREAM"), "real netstat listener type and state");
-    if (busybox) {
+    if (provider == 2) need(strstr(start, "LISTEN") && strstr(start, "u_str"), "real ss Unix listener type and state");
+    else need(strstr(start, "LISTENING") && strstr(start, "STREAM"), "real netstat listener type and state");
+    if (provider == 1) {
         char owner[32]; snprintf(owner, sizeof(owner), "%ld/", (long)getpid());
         char *end = strchr(start, '\n'), *pid = strstr(start, owner);
         need(pid && (!end || pid < end), "BusyBox real listener PID owner");
@@ -116,7 +118,7 @@ int main(int argc, char **argv) {
     int server = accept4(listener, NULL, NULL, SOCK_CLOEXEC); need(server >= 0, "accept new observed OFD");
     check(server, 1, 3, 0, path); check(client, 1, 3, 0, "");
     need(send(client, "not-consumed", 13, 0) == 13, "stream enqueue"); check(server, 1, 3, 0, path);
-    if (run_tools) { tools(path, 0); tools(path, 1); }
+    if (run_tools) { tools(path, 0); tools(path, 1); tools(path, 2); }
     if (run_namespace) namespace_view(listener);
     char data[13]; need(recv(server, data, sizeof(data), MSG_WAITALL) == sizeof(data) && !memcmp(data, "not-consumed", 13), "diagnostics preserve stream data");
     ino_t server_inode = inode_of(server), client_inode = inode_of(client), listener_inode = inode_of(listener);
