@@ -60,6 +60,7 @@ fn uevent(name: &str, id: DeviceId, partition: Option<usize>) -> String {
 }
 
 pub(super) fn augment_device(dir: &mut DirMapping, fs: &Arc<SimpleFs>, name: &str, id: DeviceId) {
+    super::block_statistics::augment_device(dir, fs, name);
     dir.add(
         "dev",
         SimpleFile::new_regular(fs.clone(), move || Ok(dev_text(id))),

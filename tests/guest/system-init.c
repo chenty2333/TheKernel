@@ -496,6 +496,12 @@ static int test_namespace_relationships(void) {
         "--nested", "namespace-relationships-child");
 }
 
+static int test_block_statistics(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-block-statistics-smoke",
+        NULL, "block-statistics-child");
+}
+
 static int test_proc_unix(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-proc-unix-smoke",
@@ -1131,6 +1137,7 @@ static int run_init(int argc, char **argv) {
         { "exec-mm-bounds", test_exec_mm_bounds, 30 },
         { "proc-scheduler-counts", test_proc_scheduler_counts, 30 },
         { "block-inventory", test_block_inventory, 30 },
+        { "block-statistics", test_block_statistics, 30 },
         { "pci-sysfs", test_pci_sysfs, 30 },
         { "proc-net-route", test_proc_net_route, 30 },
         { "netlink-dump-padding", test_netlink_dump_padding, 30 },

@@ -1075,3 +1075,21 @@ Known difference: Unix SOCK_DIAG remains unsupported; proc fallback has no
 receive/send queue byte columns, so ss displays zeros there even for queued
 payload. This is a documented fallback limitation, not claimed native queue
 measurement, and is not expanded under the B1 closeout scope.
+
+### B1 close39: diskstats/sysfs stat and actual iostat disk output
+
+Registered whole disks/GPT views and native loop nodes now share measured block
+observations between `/proc/diskstats` and sysfs `stat`. Read-only guest I/O
+advances real completion/512-byte sector counts; proc/sysfs fields agree. Signed
+Alpine `iostat -dx` now displays `vda`, not an empty device header. Related driver
+59, filesystem177, kernel2621 host tests and lint passed; guest70/70 passed
+(`system-wtpgl_4e`), tools result0 (`shell-wbzjq40w`). No syscall admission or
+hardware-state change was introduced, so no unrelated ABI comparison was run.
+See `block-statistics.md` for publication/completion/ownership sources.
+
+Known differences: successful native callback/request counts are not a complete
+Linux BIO accountant; failed operations, fixed loop-node lifetime and native
+observation-time boundaries differ. No physical busy/latency benchmark is
+claimed. Unknown/quarantined ownership makes statistics unavailable rather than
+inventing successful zero counts. Queue capability detail and the existing
+aggregate CPU whitespace/field issue remain deferred under CONTINUE-B.

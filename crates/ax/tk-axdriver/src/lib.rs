@@ -84,6 +84,8 @@ mod structs;
 mod block_volume;
 #[cfg(feature = "shared-block")]
 mod shared_block;
+#[cfg(feature = "shared-block")]
+pub mod block_statistics;
 
 #[cfg(feature = "virtio")]
 mod virtio;

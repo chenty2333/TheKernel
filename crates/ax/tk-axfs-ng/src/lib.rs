@@ -653,6 +653,17 @@ pub fn block_device_info(name: &str) -> Option<BlockDeviceInfo> {
         .map(|entry| entry.info)
 }
 
+/// Snapshot the retained shared queue, never keep the registry lock while
+/// observing its counters or device completion state.
+pub fn block_device_statistics(name: &str) -> Option<axdriver::block_statistics::Snapshot> {
+    let device = if name == ROOT_BLOCK_DEVICE_NAME {
+        ROOT_BLOCK_DEVICE.get()?.device.clone()
+    } else {
+        EXTRA_BLOCK_DEVICES.get()?.lock().iter().find(|entry| entry.name == name)?.device.clone()
+    };
+    device.statistics()
+}
+
 pub fn root_block_device_info() -> Option<BlockDeviceInfo> {
     ROOT_BLOCK_DEVICE.get().map(|entry| entry.info)
 }

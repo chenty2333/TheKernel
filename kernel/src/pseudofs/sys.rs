@@ -504,6 +504,7 @@ fn loop_block_device_dir(
     dir.add("queue", SimpleDir::new_maker(fs.clone(), Arc::new(queue)));
     dir.add("loop", SimpleDir::new_maker(fs.clone(), Arc::new(loop_dir)));
     super::block_inventory::augment_loop(&mut dir, &fs, dev_id);
+    super::block_statistics::augment_loop(&mut dir, &fs, number);
     dir.add("uevent", uevent_file(fs.clone(), dev_name, dev_id));
     SimpleDir::new_maker(fs, Arc::new(dir))
 }

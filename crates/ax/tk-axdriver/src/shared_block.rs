@@ -878,6 +878,7 @@ impl CompletionMailbox {
 }
 
 struct SharedBlockDeviceInner {
+    statistics: crate::block_statistics::Statistics,
     device: Mutex<AxBlockDevice>,
     name: String,
     device_type: DeviceType,
@@ -999,7 +1000,7 @@ impl SharedBlockDeviceGuard<'_> {
     pub fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> DevResult {
         if let Some(result) = self
             .device
-            .try_legacy_sync(|device| BlockDriverOps::read_block(device, block_id, buf))
+            .try_legacy_io(crate::block_statistics::Operation::Read, Some(buf.len() as u64), |device| BlockDriverOps::read_block(device, block_id, buf))
         {
             return result;
         }
@@ -1010,7 +1011,7 @@ impl SharedBlockDeviceGuard<'_> {
     pub fn write_block(&mut self, block_id: u64, buf: &[u8]) -> DevResult {
         if let Some(result) = self
             .device
-            .try_legacy_sync(|device| BlockDriverOps::write_block(device, block_id, buf))
+            .try_legacy_io(crate::block_statistics::Operation::Write, Some(buf.len() as u64), |device| BlockDriverOps::write_block(device, block_id, buf))
         {
             return result;
         }
@@ -1021,7 +1022,7 @@ impl SharedBlockDeviceGuard<'_> {
     pub fn read_block_vectored(&mut self, block_id: u64, bufs: &mut [&mut [u8]]) -> DevResult {
         if let Some(result) = self
             .device
-            .try_legacy_sync(|device| BlockDriverOps::read_block_vectored(device, block_id, bufs))
+            .try_legacy_io(crate::block_statistics::Operation::Read, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::read_block_vectored(device, block_id, bufs))
         {
             return result;
         }
@@ -1032,7 +1033,7 @@ impl SharedBlockDeviceGuard<'_> {
     pub fn write_block_vectored(&mut self, block_id: u64, bufs: &[&[u8]]) -> DevResult {
         if let Some(result) = self
             .device
-            .try_legacy_sync(|device| BlockDriverOps::write_block_vectored(device, block_id, bufs))
+            .try_legacy_io(crate::block_statistics::Operation::Write, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::write_block_vectored(device, block_id, bufs))
         {
             return result;
         }
@@ -1041,7 +1042,7 @@ impl SharedBlockDeviceGuard<'_> {
 
     /// Flushes through the idle legacy owner or the typed shared owner.
     pub fn flush(&mut self) -> DevResult {
-        if let Some(result) = self.device.try_legacy_sync(BlockDriverOps::flush) {
+        if let Some(result) = self.device.try_legacy_io(crate::block_statistics::Operation::Flush, Some(0), BlockDriverOps::flush) {
             return result;
         }
         {
@@ -1109,6 +1110,7 @@ impl SharedBlockDevice {
         let device_type = device.device_type();
         let irq = device.irq_num();
         let inner = Arc::new(SharedBlockDeviceInner {
+            statistics: crate::block_statistics::Statistics::new(),
             device: Mutex::new(device),
             name,
             device_type,
@@ -1141,6 +1143,18 @@ impl SharedBlockDevice {
             );
         }
         Self { inner }
+    }
+
+    pub fn statistics(&self) -> Option<crate::block_statistics::Snapshot> {
+        if self.inner.completion_quarantined.load(Ordering::Acquire) {
+            return None;
+        }
+        self.inner.statistics.snapshot()
+    }
+
+    fn try_legacy_io<R>(&self, op: crate::block_statistics::Operation, bytes: Option<u64>,
+        operation: impl FnOnce(&mut AxBlockDevice) -> DevResult<R>) -> Option<DevResult<R>> {
+        self.try_legacy_sync(|device| self.inner.statistics.legacy(op, bytes, || operation(device)))
     }
 
     /// Returns a restricted ordinary-device guard.  Completion and reset
@@ -1694,6 +1708,7 @@ impl SharedBlockDevice {
                 self.notify_progress();
                 return Err(DevError::BadState);
             }
+            self.inner.statistics.completed(records);
             self.notify_progress();
             return Ok((drain, completion_batch_has_physical(records)));
         }
@@ -2767,6 +2782,7 @@ impl SharedBlockDevice {
                     if let Ok(report) = report {
                         if report.submitted <= requests.len() {
                             self.publish_completion_credits(report.submitted);
+                            self.inner.statistics.queue(requests, report);
                         }
                     }
                     Some(report)
@@ -2859,7 +2875,7 @@ impl SharedBlockDevice {
             return Ok(());
         }
         if let Some(result) =
-            self.try_legacy_sync(|device| BlockDriverOps::read_block(device, block_id, buf))
+            self.try_legacy_io(crate::block_statistics::Operation::Read, Some(buf.len() as u64), |device| BlockDriverOps::read_block(device, block_id, buf))
         {
             return result;
         }
@@ -2881,7 +2897,7 @@ impl SharedBlockDevice {
             let handle = request.handle.ok_or(DevError::BadState)?;
             return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_sync(|device| BlockDriverOps::read_block(device, block_id, buf))
+        self.try_legacy_io(crate::block_statistics::Operation::Read, Some(buf.len() as u64), |device| BlockDriverOps::read_block(device, block_id, buf))
             .unwrap_or(Err(DevError::BadState))
     }
 
@@ -2890,7 +2906,7 @@ impl SharedBlockDevice {
             return Ok(());
         }
         if let Some(result) =
-            self.try_legacy_sync(|device| BlockDriverOps::write_block(device, block_id, buf))
+            self.try_legacy_io(crate::block_statistics::Operation::Write, Some(buf.len() as u64), |device| BlockDriverOps::write_block(device, block_id, buf))
         {
             return result;
         }
@@ -2912,7 +2928,7 @@ impl SharedBlockDevice {
             let handle = request.handle.ok_or(DevError::BadState)?;
             return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_sync(|device| BlockDriverOps::write_block(device, block_id, buf))
+        self.try_legacy_io(crate::block_statistics::Operation::Write, Some(buf.len() as u64), |device| BlockDriverOps::write_block(device, block_id, buf))
             .unwrap_or(Err(DevError::BadState))
     }
 
@@ -2931,7 +2947,7 @@ impl SharedBlockDevice {
             return Ok(());
         }
         if let Some(result) = self
-            .try_legacy_sync(|device| BlockDriverOps::read_block_vectored(device, block_id, bufs))
+            .try_legacy_io(crate::block_statistics::Operation::Read, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::read_block_vectored(device, block_id, bufs))
         {
             return result;
         }
@@ -2952,7 +2968,7 @@ impl SharedBlockDevice {
             let handle = request.handle.ok_or(DevError::BadState)?;
             return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_sync(|device| BlockDriverOps::read_block_vectored(device, block_id, bufs))
+        self.try_legacy_io(crate::block_statistics::Operation::Read, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::read_block_vectored(device, block_id, bufs))
             .unwrap_or(Err(DevError::BadState))
     }
 
@@ -2971,7 +2987,7 @@ impl SharedBlockDevice {
             return Ok(());
         }
         if let Some(result) = self
-            .try_legacy_sync(|device| BlockDriverOps::write_block_vectored(device, block_id, bufs))
+            .try_legacy_io(crate::block_statistics::Operation::Write, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::write_block_vectored(device, block_id, bufs))
         {
             return result;
         }
@@ -2992,7 +3008,7 @@ impl SharedBlockDevice {
             let handle = request.handle.ok_or(DevError::BadState)?;
             return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_sync(|device| BlockDriverOps::write_block_vectored(device, block_id, bufs))
+        self.try_legacy_io(crate::block_statistics::Operation::Write, bufs.iter().try_fold(0u64, |sum, buf| sum.checked_add(buf.len() as u64)), |device| BlockDriverOps::write_block_vectored(device, block_id, bufs))
             .unwrap_or(Err(DevError::BadState))
     }
 
@@ -3071,6 +3087,7 @@ impl SharedBlockDevice {
                             .physical_pending
                             .fetch_add(report.submitted, Ordering::AcqRel);
                         self.publish_completion_credits(report.submitted);
+                        self.inner.statistics.physical(requests, report);
                     }
                     Ok(report)
                 }
@@ -3470,7 +3487,7 @@ impl BlockDriverOps for SharedBlockDevice {
     }
 
     fn flush(&mut self) -> DevResult {
-        if let Some(result) = self.try_legacy_sync(BlockDriverOps::flush) {
+        if let Some(result) = self.try_legacy_io(crate::block_statistics::Operation::Flush, Some(0), BlockDriverOps::flush) {
             return result;
         }
         let segments: [BlockSegment; 0] = [];
@@ -3491,12 +3508,12 @@ impl BlockDriverOps for SharedBlockDevice {
             let handle = request.handle.ok_or(DevError::BadState)?;
             return self.wait_async_all_owned(core::slice::from_ref(&handle));
         }
-        self.try_legacy_sync(BlockDriverOps::flush)
+        self.try_legacy_io(crate::block_statistics::Operation::Flush, Some(0), BlockDriverOps::flush)
             .unwrap_or(Err(DevError::BadState))
     }
 
     fn write_block_fua(&mut self, block_id: u64, buf: &[u8]) -> DevResult {
-        self.try_legacy_sync(|device| BlockDriverOps::write_block_fua(device, block_id, buf))
+        self.try_legacy_io(crate::block_statistics::Operation::Write, Some(buf.len() as u64), |device| BlockDriverOps::write_block_fua(device, block_id, buf))
             .unwrap_or(Err(DevError::Unsupported))
     }
 
@@ -3505,13 +3522,19 @@ impl BlockDriverOps for SharedBlockDevice {
     }
 
     fn discard_blocks(&mut self, range: BlockRange) -> DevResult {
-        self.try_legacy_sync(|device| BlockDriverOps::discard_blocks(device, range))
-            .unwrap_or(Err(DevError::Unsupported))
+        self.try_legacy_sync(|device| {
+            let bytes = range.blocks.checked_mul(device.block_size() as u64);
+            self.inner.statistics.legacy(crate::block_statistics::Operation::Discard, bytes,
+                || BlockDriverOps::discard_blocks(device, range))
+        }).unwrap_or(Err(DevError::Unsupported))
     }
 
     fn write_zeroes(&mut self, range: BlockRange) -> DevResult {
-        self.try_legacy_sync(|device| BlockDriverOps::write_zeroes(device, range))
-            .unwrap_or(Err(DevError::Unsupported))
+        self.try_legacy_sync(|device| {
+            let bytes = range.blocks.checked_mul(device.block_size() as u64);
+            self.inner.statistics.legacy(crate::block_statistics::Operation::Write, bytes,
+                || BlockDriverOps::write_zeroes(device, range))
+        }).unwrap_or(Err(DevError::Unsupported))
     }
 
     fn async_queue_caps(&self) -> Option<BlockQueueCaps> {
@@ -3540,6 +3563,7 @@ impl BlockDriverOps for SharedBlockDevice {
             let report = device.submit_async_batch(requests)?;
             if report.submitted <= requests.len() {
                 self.publish_completion_credits(report.submitted);
+                self.inner.statistics.queue(requests, report);
             }
             report
         };
@@ -3662,6 +3686,7 @@ impl BlockDriverOps for SharedBlockDevice {
                     self.inner.completion_waiters.notify_many(usize::MAX, false);
                     return Err(DevError::BadState);
                 }
+                self.inner.statistics.quiesced();
                 self.inner.physical_pending.store(0, Ordering::Release);
                 self.inner.completion_credits.store(0, Ordering::Release);
                 {
@@ -4385,6 +4410,18 @@ mod tests {
                 contents.as_slice(),
             )));
         (device, contents)
+    }
+
+    #[test]
+    fn statistics_never_fetch_geometry_before_quarantined_io_admission() {
+        let (device, _) = patterned_device(4096);
+        device.inner.completion_quarantined.store(true, Ordering::Release);
+        let _lower_held = device.inner.device.lock();
+        let mut caller = device.clone();
+        let range = BlockRange { start: 0, blocks: 1 };
+        assert!(matches!(caller.discard_blocks(range), Err(DevError::BadState)));
+        assert!(matches!(caller.write_zeroes(range), Err(DevError::BadState)));
+        assert!(caller.statistics().is_none());
     }
 
     fn one_physical_request<'a>(

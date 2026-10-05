@@ -29,7 +29,14 @@ use crate::{
     pseudofs::DeviceOps,
 };
 
-const LOOP_COUNT: usize = 16;
+pub(crate) const LOOP_COUNT: usize = 16;
+static IO_STATISTICS: [axdriver::block_statistics::Statistics<0>; LOOP_COUNT] =
+    [const { axdriver::block_statistics::Statistics::new() }; LOOP_COUNT];
+
+pub(crate) fn io_statistics(number: u32) -> Option<axdriver::block_statistics::Snapshot> {
+    IO_STATISTICS.get(number as usize)?.snapshot()
+}
+
 const SECTOR_SIZE: u64 = 512;
 const DEFAULT_BLOCK_SIZE: u32 = 512;
 
@@ -798,9 +805,11 @@ impl DeviceOps for LoopDevice {
             return Ok(0);
         }
         let limit = min(buf.len() as u64, state.size_bytes() - offset) as usize;
-        backing
-            .file
-            .read_at_slice(&mut buf[..limit], state.offset + offset)
+        let statistics = &IO_STATISTICS[self.number as usize];
+        let ticket = statistics.begin_legacy(axdriver::block_statistics::Operation::Read);
+        let result = backing.file.read_at_slice(&mut buf[..limit], state.offset + offset);
+        statistics.finish_legacy(ticket, result.as_ref().ok().map(|bytes| *bytes as u64));
+        result
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
@@ -819,12 +828,12 @@ impl DeviceOps for LoopDevice {
             return Ok(0);
         }
         let limit = min(buf.len() as u64, state.size_bytes() - offset) as usize;
-        backing
-            .file
-            .location()
-            .entry()
-            .as_file()?
-            .write_at(&buf[..limit], state.offset + offset)
+        let file = backing.file.location().entry().as_file()?;
+        let statistics = &IO_STATISTICS[self.number as usize];
+        let ticket = statistics.begin_legacy(axdriver::block_statistics::Operation::Write);
+        let result = file.write_at(&buf[..limit], state.offset + offset);
+        statistics.finish_legacy(ticket, result.as_ref().ok().map(|bytes| *bytes as u64));
+        result
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> VfsResult<usize> {
