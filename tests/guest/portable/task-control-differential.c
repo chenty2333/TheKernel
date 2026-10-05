@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +105,8 @@
 #define CLONE_PARENT 0x00008000UL
 #define CLONE_AUTOREAP (1UL << 34)
 #define CLONE_NNP (1UL << 35)
+#define CLONE_PIDFD_AUTOKILL (1UL << 36)
+#define CLONE_PIDFD 0x00001000UL
 /* include/uapi/linux/sched.h:42.  Above the 32-bit window clone(2) reads its
  * flags from (`lower_32_bits(clone_flags)`, kernel/fork.c:2880), so only
  * clone3(2) can ask for it. */
@@ -814,6 +817,63 @@ static void clone3_case(void) {
               "nnp-does-not-change-parent");
     }
     mark("NNP_CHILD_ONLY_MONOTONIC");
+
+    args.flags = CLONE_PIDFD_AUTOKILL | CLONE_NNP | CLONE_AUTOREAP;
+    args.exit_signal = 0;
+    ERROR(clone3_call(&args, sizeof(args)), EINVAL, "autokill-needs-pidfd");
+    args.flags = CLONE_PIDFD_AUTOKILL | CLONE_NNP | CLONE_PIDFD;
+    ERROR(clone3_call(&args, sizeof(args)), EINVAL, "autokill-needs-autoreap");
+    int ready[2], hold[2];
+    int pipes_ok = pipe(ready) == 0 && pipe(hold) == 0;
+    check(pipes_ok, "autokill-pipes");
+    if (pipes_ok) {
+        int killer = -1;
+        args.flags = CLONE_PIDFD_AUTOKILL | CLONE_PIDFD | CLONE_AUTOREAP | CLONE_NNP;
+        args.pidfd = (uint64_t)(uintptr_t)&killer;
+        fflush(stdout);
+        child = clone3_call(&args, sizeof(args));
+        if (child == 0) {
+            close(ready[0]); close(hold[1]);
+            char byte = 'R';
+            if (write(ready[1], &byte, 1) != 1) _exit(30);
+            /* Parent retains hold[1] until after final-pidfd close. The
+             * child cannot exit voluntarily while this blocking read waits. */
+            (void)read(hold[0], &byte, 1);
+            _exit(31);
+        }
+        close(ready[1]); close(hold[0]);
+        check(child > 0 && killer >= 0, "autokill-published-pidfd");
+        if (child > 0 && killer >= 0) {
+            char byte = 0;
+            check(read(ready[0], &byte, 1) == 1 && byte == 'R', "autokill-child-running");
+            check(fcntl(killer, F_GETFD) == FD_CLOEXEC, "autokill-cloexec");
+            check(fcntl(killer, F_GETFL) == (O_RDWR | O_TRUNC), "autokill-status-flags");
+            int duplicate = dup(killer);
+            int watcher = (int)syscall(434, child, 0); /* independent, non-autokill pidfd */
+            check(duplicate >= 0 && watcher >= 0, "autokill-duplicate-and-watcher");
+            if (duplicate >= 0 && watcher >= 0) {
+                struct pollfd watched = { .fd = watcher, .events = POLLIN };
+                check(close(killer) == 0 && poll(&watched, 1, 0) == 0,
+                      "nonfinal-pidfd-close-does-not-kill");
+                killer = -1;
+                check(close(duplicate) == 0, "final-autokill-close");
+                duplicate = -1;
+                check(poll(&watched, 1, 5000) == 1 && (watched.revents & POLLIN),
+                      "final-pidfd-close-exits-child");
+                errno = 0;
+                check(waitpid((pid_t)child, &status, 0) == -1 && errno == ECHILD,
+                      "autokill-child-autoreaped");
+            }
+            if (duplicate >= 0) close(duplicate);
+            if (killer >= 0) close(killer);
+            if (watcher >= 0) close(watcher);
+        }
+        close(ready[0]); close(hold[1]);
+    }
+    args.pidfd = 1;
+    ERROR(clone3_call(&args, sizeof(args)), EFAULT, "autokill-publication-fault");
+    args.pidfd = 0;
+    mark("PIDFD_AUTOKILL_FINAL_OFD");
 
     /* CLONE_EMPTY_MNTNS: a mount namespace holding a clone of the parent's
      * namespace root and nothing else.  The empty namespace belongs to the

@@ -33,7 +33,7 @@ The differential probe does not establish racing clone/fs-sharing admission.
 ### Other known gaps (next)
 
 - New mount namespaces from `open_tree`/`fsmount`, published through existing nsfs.
-- `clone3` `CLONE_PIDFD_AUTOKILL` final-OFD teardown.
+- Mount-tree namespace construction remains the last original known gap.
 
 ### `clone3(CLONE_NNP)`
 
@@ -49,6 +49,28 @@ inheritance, and NEWUSER+NNP); q35 lint passed with 784 existing warnings;
 KVM system guest 70/70 (`system-k93x8ebc`); paired task-control 14/14 selected
 contracts (`abi-8gos6_qh`). Actual children observe NNP=1, cannot clear it, and
 leave the parent's NNP unchanged, both with and without NEWUSER.
+
+### `clone3(CLONE_PIDFD_AUTOKILL)`
+
+The clone pidfd is armed after complete task/cgroup/IPC publication and before
+its fd becomes visible. Failed preparation/usercopy never arms it. The existing
+final-OFD close hook (not backend `Arc` destruction or per-fd close) atomically
+consumes the action and queues a kernel-originated process SIGKILL through its
+weak `ProcessData` identity. It never looks up a reused numeric PID or rechecks
+the closer's capabilities. Plain `pidfd_open` does not arm this action.
+Existing admission requires PIDFD+AUTOREAP, disallows THREAD, and requires
+CAP_SYS_ADMIN unless the request includes NNP. Clone pidfd status also now
+retains Linux O_RDWR, thread O_EXCL and autokill O_TRUNC.
+
+Validated: kernel host 2625, q35 lint (784 existing warnings), system guest
+70/70 (`system-uyqbyc_e`), paired task-control 14/14 (`abi-9lvoilyu`). A real
+blocked child survives closing one dup, then exits when the final clone-pidfd
+OFD closes despite an independent non-autokill watcher remaining open; it is
+actually autoreaped. CLOEXEC/status, invalid shapes and publication EFAULT
+also pass on both guests. An initially missing host-test import was repaired
+before this final validation. Concurrent SCM_RIGHTS/exec combinations are not
+claimed tested. The original clone3 implementation gaps are resolved; its
+contract is implemented, with these narrower validation gaps retained.
 
 ## Tool acceptance ladder
 

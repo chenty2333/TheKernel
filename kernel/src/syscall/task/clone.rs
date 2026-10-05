@@ -427,6 +427,12 @@ bitflags! {
     }
 }
 
+fn clone_pidfd_status(flags: CloneFlags) -> u32 {
+    O_RDWR
+        | if flags.contains(CloneFlags::THREAD) { O_EXCL } else { 0 }
+        | if flags.contains(CloneFlags::PIDFD_AUTOKILL) { O_TRUNC } else { 0 }
+}
+
 fn check_rlimit_nproc(thread: &Thread) -> AxResult<()> {
     let proc_data = &thread.proc_data;
     let uid = thread.real_uid();
@@ -561,11 +567,6 @@ impl CloneArgs {
             ProcessAbiError::PermissionDenied => AxError::OperationNotPermitted,
             _ => AxError::InvalidInput,
         })?;
-        // Autokill still needs the final-OFD lifetime action. NNP is prepared
-        // in the complete unpublished child credential below.
-        if flags.contains(CloneFlags::PIDFD_AUTOKILL) {
-            return Err(AxError::InvalidInput);
-        }
 
         if flags.contains(CloneFlags::THREAD)
             && !flags.contains(CloneFlags::VM | CloneFlags::SIGHAND)
@@ -1305,12 +1306,9 @@ impl CloneArgs {
                 PidFd::new_process(&new_proc_data)
             };
             let pidfd_obj = Arc::try_new(pidfd_obj).map_err(|_| AxError::NoMemory)?;
-            let thread_pidfd = flags
-                .contains(CloneFlags::THREAD)
-                .then(|| pidfd_obj.clone());
-            let pidfd_file: Arc<dyn crate::file::FileLike> = pidfd_obj;
-            let description = FileDescription::new(pidfd_file)?;
-            Some((reservation.prepare_publication(description)?, thread_pidfd))
+            let pidfd_file: Arc<dyn crate::file::FileLike> = pidfd_obj.clone();
+            let description = FileDescription::new_with_flags(pidfd_file, clone_pidfd_status(flags))?;
+            Some((reservation.prepare_publication(description)?, pidfd_obj))
         } else {
             None
         };
@@ -1530,7 +1528,9 @@ impl CloneArgs {
                 .expect("parent scheduler bounds are valid"),
         );
         set_prepared_task_uclamp_request(&task, child_uclamp);
-        if let Some((_, Some(pidfd))) = pending_pidfd.as_ref() {
+        if flags.contains(CloneFlags::THREAD)
+            && let Some((_, pidfd)) = pending_pidfd.as_ref()
+        {
             pidfd.bind_thread_task(&task)?;
         }
         let task_publication =
@@ -1716,7 +1716,10 @@ impl CloneArgs {
         for admission in shm_admissions {
             admission.commit();
         }
-        if let Some((publication, _)) = pending_pidfd.take() {
+        if let Some((publication, pidfd)) = pending_pidfd.take() {
+            if flags.contains(CloneFlags::PIDFD_AUTOKILL) {
+                pidfd.arm_autokill();
+            }
             publication.commit();
         }
 
@@ -1859,7 +1862,7 @@ mod tests {
     };
 
     use axerrno::AxError;
-    use linux_raw_sys::general::{CLONE_DETACHED, CLONE_PIDFD};
+    use linux_raw_sys::general::{CLONE_DETACHED, CLONE_PIDFD, O_RDWR, O_EXCL, O_TRUNC};
 
     #[cfg(target_arch = "x86_64")]
     use super::{
@@ -1869,7 +1872,7 @@ mod tests {
     };
     use super::{
         CloneApi, CloneArgs, CloneCallerState, CloneCredentialPublicationKind, CloneFlags,
-        IOPRIO_CLASS_SHIFT, clone_credential_publication_kind, clone_io_context_snapshot,
+        IOPRIO_CLASS_SHIFT, clone_credential_publication_kind, clone_io_context_snapshot, clone_pidfd_status,
         clone_namespace_owner, clone_process_access_state, clone_signal_altstack, inherited_ioprio,
         release_clone_lifecycle_then, should_yield_after_clone,
     };
@@ -2061,6 +2064,34 @@ mod tests {
             args.validate_for(CloneApi::Clone, CloneCallerState::default()),
             Err(AxError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn clone_pidfd_status_retains_linux_access_thread_and_autokill_bits() {
+        assert_eq!(clone_pidfd_status(CloneFlags::PIDFD), O_RDWR);
+        assert_eq!(clone_pidfd_status(CloneFlags::PIDFD | CloneFlags::THREAD), O_RDWR | O_EXCL);
+        assert_eq!(clone_pidfd_status(CloneFlags::PIDFD | CloneFlags::PIDFD_AUTOKILL), O_RDWR | O_TRUNC);
+    }
+
+    #[test]
+    fn clone_autokill_admits_only_pidfd_autoreap_and_authorized_lifetime() {
+        let base = CloneFlags::PIDFD | CloneFlags::AUTOREAP | CloneFlags::PIDFD_AUTOKILL;
+        for nnp in [false, true] {
+            for admin in [false, true] {
+                let args = CloneArgs {
+                    flags: base | if nnp { CloneFlags::NNP } else { CloneFlags::empty() },
+                    ..Default::default()
+                };
+                assert_eq!(
+                    args.validate_for(CloneApi::Clone3, CloneCallerState { cap_sys_admin: admin, ..Default::default() }),
+                    if nnp || admin { Ok(()) } else { Err(AxError::OperationNotPermitted) },
+                );
+            }
+        }
+        for missing in [CloneFlags::PIDFD, CloneFlags::AUTOREAP] {
+            let args = CloneArgs { flags: (base | CloneFlags::NNP) & !missing, ..Default::default() };
+            assert_eq!(args.validate_for(CloneApi::Clone3, CloneCallerState::default()), Err(AxError::InvalidInput));
+        }
     }
 
     #[test]

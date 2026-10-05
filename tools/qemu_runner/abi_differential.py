@@ -379,7 +379,7 @@ CONTRACTS.update({
 PROGRAM_CASES["task-control"] += ("setns",)
 
 CONTRACTS["clone3"] = (
-    "raw-differential", "pass", "FLAG_ADMISSION NEWTIME AUTOREAP EMPTY_MNTNS NNP_CHILD_ONLY_MONOTONIC",
+    "raw-differential", "pass", "FLAG_ADMISSION NEWTIME AUTOREAP EMPTY_MNTNS NNP_CHILD_ONLY_MONOTONIC PIDFD_AUTOKILL_FINAL_OFD",
 )
 
 # The registry is static: the gate reads it to decide whether a claimed

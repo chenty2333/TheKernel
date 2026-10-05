@@ -12,11 +12,13 @@ use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::{AxTaskRef, WeakAxTaskRef};
 use spin::Once;
 use tk_linux_process_adapter::Pid;
+use tk_linux_signal::{SignalInfo, Signo};
 
 use crate::{
     file::{FileLike, Kstat, PseudoInode},
     task::{
         AsThread, Cred, CredentialSlot, Process, ProcessData, ProcessImageAccessSnapshot, Thread,
+        send_signal_to_process_data,
     },
 };
 
@@ -31,6 +33,8 @@ pub struct PidFd {
     thread_tid: Option<Pid>,
 
     non_blocking: AtomicBool,
+    // Armed only after complete child runtime publication, before fd visibility.
+    autokill: AtomicBool,
 }
 impl PidFd {
     pub fn new_process(proc_data: &Arc<ProcessData>) -> Self {
@@ -45,7 +49,13 @@ impl PidFd {
             thread_tid: None,
 
             non_blocking: AtomicBool::new(false),
+            autokill: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn arm_autokill(&self) {
+        debug_assert!(self.thread_tid.is_none());
+        self.autokill.store(true, Ordering::Release);
     }
 
     /// Builds a thread pidfd before its scheduler task is published. The clone
@@ -63,6 +73,7 @@ impl PidFd {
             thread_tid: Some(thread.tid()),
 
             non_blocking: AtomicBool::new(false),
+            autokill: AtomicBool::new(false),
         }
     }
 
@@ -231,6 +242,20 @@ impl PidFd {
     }
 }
 impl FileLike for PidFd {
+    fn final_close(&self) {
+        if self.autokill.swap(false, Ordering::AcqRel)
+            && let Some(target) = self.proc_data.upgrade()
+        {
+            // Clone admission established the capability/NNP authority.
+            // Final OFD release is a kernel-originated, nonallocating SIGKILL
+            // to the retained process identity, not a numeric PID lookup.
+            let _ = send_signal_to_process_data(
+                &target,
+                Some(SignalInfo::new_kernel(Signo::SIGKILL)),
+            );
+        }
+    }
+
     fn stat(&self) -> AxResult<Kstat> {
         Ok(self.inode.stat())
     }
