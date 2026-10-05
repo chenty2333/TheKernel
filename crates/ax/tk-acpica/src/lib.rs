@@ -37,3 +37,5 @@ pub mod resources;
 pub mod ec;
 
 pub mod thermal;
+
+pub mod routing;
