@@ -346,6 +346,7 @@ ROOTFS_INPUT_ENV = (
 # distribution C compiler.  Each selection gets its own image, because the
 # kernel embeds it and the two payloads must never be confused for one another.
 TOOL_PAYLOADS = ("none", "tcc", "nested", "glibc", "gcc", "inspect")
+TOOL_PAYLOADS += ("acpica",)
 
 
 def selected_tool_payload(requested: str | None = None) -> str:
@@ -383,6 +384,8 @@ def rootfs_image_bytes(payload: str) -> int:
     # used, so it reuses the nested payload's 224 MiB rather than adding a size
     # class; 160 MiB would leave under 30 MiB free, which is not enough room for
     # a compile's intermediate files.
+    if payload == "acpica":
+        return 128 * 1024 * 1024
     return {"none": 96, "tcc": 160, "nested": 224, "glibc": 160,
             "gcc": 224, "inspect": 160}[payload] * 1024 * 1024
 
