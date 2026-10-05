@@ -17,10 +17,10 @@ pub fn millicelsius(raw: u64, critical: Option<u64>) -> Result<i64, Status> {
     scaled.checked_sub(offset).ok_or(BAD_PARAMETER)
 }
 pub fn critical_reached(current: u64, critical: u64) -> bool {
-    current != 0
-        && current != u64::from(u32::MAX)
+    // Policy and sysfs share validity: an overflow/sentinel is not a real trip.
+    millicelsius(current, Some(critical)).is_ok()
+        && millicelsius(critical, Some(critical)).is_ok()
         && critical > 2732
-        && critical != u64::from(u32::MAX)
         && current >= critical
 }
 #[cfg(test)]
@@ -40,5 +40,7 @@ mod tests {
         assert!(critical_reached(3501, 3500));
         assert!(!critical_reached(3500, 0));
         assert!(!critical_reached(u32::MAX.into(), 3500));
+        assert!(!critical_reached(u64::MAX, 3500));
+        assert!(!critical_reached(u64::MAX, u64::MAX));
     }
 }
