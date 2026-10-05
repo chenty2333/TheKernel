@@ -237,3 +237,10 @@ functions and selected `intel_display_regs.h` register fields, with their
 2006–2007 / 2025 Intel copyrights retained in source and crate NOTICE. The
 kernel adapter remains original Apache-2.0 Rust; linking the MIT crate does
 not change the existing product's GPL obligations described above.
+
+Additional MIT arithmetic translations: selected DKL HDMI/no-SSC functions in
+`intel_dpll_mgr.c`, selected fields from `intel_{mg,dkl}_phy_regs.h`, ADL-P
+B0+/ADL-N D0 table selection and display-13 pixel-rate minimum in `intel_cdclk.c`.
+Each has original attribution and the crate's permission-text reference.
+Tests may compile local MIT source into temporary host oracles; no Linux C
+source or firmware is added to the repository by that testing workflow.

@@ -48,3 +48,13 @@ It needs `THEKERNEL_LINUX_REFERENCE`, `THEKERNEL_STATE_DIR` under `/home`, and
 GCC; run it explicitly with `--test upstream_readout -- --ignored`. Its generated
 C/binary is removed at test completion; no independent-oracle success is inferred
 from the handwritten unit model. This oracle checks timing only, not ownership.
+
+`dpll_mgr.rs` now includes pure DKL HDMI/non-SSC divisor calculation and
+frequency readback. It preserves source divisor search order, integer fractional
+truncation, all selected clock/PLL register words and optional AFC startup bits.
+The `upstream_clock` oracle compares 192 clock/refclk/AFC cases to unmodified
+compiled C, plus 42 ADL-P CDCLK table selections. CDCLK only quantizes a supplied
+**global** minimum; pixel-rate/2 alone is not the complete watermark/DBUF/audio
+minimum. Unsatisfiable requests fail instead of C's warning+max fallback; A0 or
+unknown stepping is not admitted. No TC PLL, CDCLK, DKL HIP selector, PHY/power
+or workaround register programming is implemented by these arithmetic functions.

@@ -35,3 +35,21 @@ src/display.rs:
   Copyright © 2025 Intel Corporation.
   This is partial readout, not hsw_get_pipe_config, get_config for TC PLL/PHY,
   framebuffer reconstruction, or modeset_setup ownership/fastboot equivalence.
+
+src/dpll_mgr.rs:
+  drivers/gpu/drm/i915/display/intel_dpll_mgr.c:
+  icl_mg_pll_find_divisors, icl_calc_mg_pll_state,
+  icl_ddi_mg_pll_get_freq (display-13 DKL HDMI/no-SSC branches only)
+  Copyright © 2006-2016 Intel Corporation.
+  intel_mg_phy_regs.h / intel_dkl_phy_regs.h: selected field encodings
+  Copyright © 2022 Intel Corporation.
+src/cdclk.rs:
+  drivers/gpu/drm/i915/display/intel_cdclk.c:
+  adlp_cdclk_table, _intel_pixel_rate_to_cdclk (display-13 PPC/guardband),
+  bxt_calc_cdclk table selection for ADL-P B0+ / ADL-N D0
+  Copyright © 2006-2017 Intel Corporation.
+  No full intel_crtc_min_cdclk, plane bandwidth/audio policy, PCODE or clock writes.
+
+Optional upstream_clock/upstream_readout tests extract and compile local MIT
+C bodies and headers at runtime. They do not distribute a Linux C copy or
+implement a kernel LinuxKPI layer. Temporary oracle files are removed.

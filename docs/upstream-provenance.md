@@ -530,3 +530,14 @@ interlace correction and SET_CONTEXT_LATENCY override follow source order.
 `kernel/src/drm/intel/i915_port.rs` is original TheKernel glue, limited to an
 already-admitted powered pipe A and denying every write. No GPL helper port
 or full fastboot state-equivalence claim is introduced.
+
+Clock slice: `intel_dpll_mgr.c::{icl_mg_pll_find_divisors,icl_calc_mg_pll_state,
+icl_ddi_mg_pll_get_freq}` → `src/dpll_mgr.rs` (DKL HDMI, no SSC only).
+`intel_cdclk.c::adlp_cdclk_table`, display-13 pixel-rate minimum and
+`bxt_calc_cdclk` table search → `src/cdclk.rs` (ADL-P B0+ / ADL-N D0).
+Selected field definitions come from MIT `intel_{dkl,mg}_phy_regs.h`.
+No PLL/PHY/power/clock writes or workarounds are silently declared complete.
+The optional C oracles load unmodified bodies/headers from the external Linux
+7.2.3 tree, build temporary host programs and remove them. Private captured
+EDID→selected timing→DKL arithmetic→preserved CDCLK is exercised in an explicit
+kernel host test, without bundling BIOS/EDID or asserting full clock policy.

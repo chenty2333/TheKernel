@@ -60,7 +60,7 @@ fn decode(registers: &impl Registers) -> Result<Timings, String> {
     // state as the source for a progressive native rollback/modeset transaction.
     if conf & ((1 << 31) | (1 << 30)) != ((1 << 31) | (1 << 30)) || conf & (3 << 21) != 0 {
         return Err(String::from(
-            "interlaced firmware readout unsupported; no writes",
+            "firmware pipe A stopped, transitioning or interlaced; no writes",
         ));
     }
     let timings =
@@ -73,8 +73,110 @@ fn decode(registers: &impl Registers) -> Result<Timings, String> {
 }
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use crate::drm::intel::regs::mock::MockRegisters;
+    #[test]
+    #[ignore = "requires THEKERNEL_N305_CAPTURE private input; run explicitly"]
+    fn captured_edid_to_tc_pll_and_preserved_cdclk() {
+        use intel_display::{
+            bios::Vbt,
+            cdclk,
+            device::{Port, Step},
+            dpll_mgr,
+        };
+
+        use crate::drm::modes::{Constraints, plan_modeset};
+        let root = std::path::PathBuf::from(
+            std::env::var_os("THEKERNEL_N305_CAPTURE").expect("set THEKERNEL_N305_CAPTURE"),
+        );
+        let edid = std::fs::read(root.join("display/edid/card1-HDMI-A-1.edid")).unwrap();
+        let plan = plan_modeset(&edid, &Constraints::unlimited());
+        // This capture's EDID 1.3 has a range descriptor with a 1.4-only
+        // "bare limits" tag. Preserve the explicit warning/lossy path, not a
+        // false strict-parse success or a relaxation of parser validation.
+        assert!(!plan.strict && plan.used_edid(), "{plan:?}");
+        assert_eq!(
+            plan.edid_error,
+            Some(crate::drm::modes::EdidError::InvalidDisplayDescriptor { index: 2 })
+        );
+        assert_eq!(plan.warnings.invalid_descriptors, 1);
+        assert_eq!(plan.selection.mode.clock_khz, 297000);
+        let choice = super::super::modeset::choose_mode(
+            &plan,
+            &edid,
+            super::super::modeset::EngineLimits::at_cdclk(192000),
+        );
+        let mode = choice.into_mode().unwrap();
+        assert_eq!(
+            (
+                mode.clock_khz,
+                mode.hdisplay,
+                mode.hsync_start,
+                mode.hsync_end,
+                mode.htotal
+            ),
+            (148500, 1920, 2008, 2052, 2200)
+        );
+        assert_eq!(
+            (
+                mode.vdisplay,
+                mode.vsync_start,
+                mode.vsync_end,
+                mode.vtotal,
+                mode.refresh_millihz()
+            ),
+            (1080, 1084, 1089, 1125, 60000)
+        );
+        let debug = root.join("graphics/debugfs-0000:00:02.0");
+        let bytes = std::fs::read(debug.join("i915_vbt")).unwrap();
+        let vbt = Vbt::parse(&bytes).unwrap();
+        let route = vbt
+            .parse_general_definitions()
+            .unwrap()
+            .encoder(Port::Tc1)
+            .unwrap()
+            .unwrap();
+        assert!(route.supports_hdmi() && !route.usb_type_c && !route.lspcon);
+        assert_eq!(route.gmbus_pin(), Some(9));
+        let report = std::fs::read_to_string(debug.join("i915_cdclk_info")).unwrap();
+        let current = report
+            .lines()
+            .find_map(|line| line.strip_prefix("Current CD clock frequency: "))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(current, 192000);
+        let maximum = report
+            .lines()
+            .find_map(|line| line.strip_prefix("Max CD clock frequency: "))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(maximum, 652800);
+        // Capture doesn't establish actual firmware refclk; test all supported
+        // references, not a guessed fixed value. No MMIO or full WM policy here.
+        for reference in [19200, 24000, 38400] {
+            let pll = dpll_mgr::icl_calc_mg_pll_state(mode.clock_khz, reference, None).unwrap();
+            assert_eq!(
+                dpll_mgr::icl_ddi_mg_pll_get_freq(&pll, reference),
+                Ok(mode.clock_khz)
+            );
+            let preserved = cdclk::bxt_calc_cdclk(Step::D0, reference, current, maximum).unwrap();
+            assert_eq!(preserved.cdclk_khz, current);
+        }
+        assert!(cdclk::pixel_rate_min_cdclk(mode.clock_khz) < current);
+        std::println!(
+            "captured EDID: {mode:?}; VBT TC1/GMBUS9; 148500 TMDS DKL calculation; preserve \
+             192000 CDCLK, full WM/power policy still pending"
+        );
+    }
     #[test]
     fn admitted_progressive_timings_are_read_without_writes() {
         let r = MockRegisters::new();

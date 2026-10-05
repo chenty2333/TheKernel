@@ -6,8 +6,10 @@
 #![forbid(unsafe_code)]
 
 pub mod bios;
+pub mod cdclk;
 pub mod device;
 pub mod display;
+pub mod dpll_mgr;
 pub mod opregion;
 
 /// Backend access failure: unavailable/powered-off registers never become zero.
