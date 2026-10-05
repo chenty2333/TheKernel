@@ -270,3 +270,15 @@ plane readout/stride helpers, ADL-P main-plane tile helpers from `intel_fb.c`,
 and selected encodings in `skl_universal_plane_regs.h` / `drm_fourcc.h` into
 `universal_plane.rs`. Original 2020, 2021, 2024 and 2011 Intel copyrights are
 preserved in source, NOTICE and the bundled MIT text. No DRM core is imported.
+
+Color discovery translates individually MIT-licensed `intel_color.c` (2016
+Intel) configuration, CSC, LUT readout and packing helpers plus selected
+`intel_color_regs.h` encodings (2023 Intel) into `src/color.rs`. Source and
+NOTICE retain the exact function inventory and original copyrights; the bundled
+MIT grant covers the translation and temporary local C oracles. No color
+commit/programming code or GPL tracing is imported by this slice.
+
+The color-oracle shim contributes four normalized scanner matches at25 (one
+at40): conventional min/length expressions and MIT color-state declarations.
+These are registered in crate NOTICE/provenance and CI inventory, without a
+scanner exemption or an added GPL implementation.

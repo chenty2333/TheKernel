@@ -123,3 +123,19 @@ Known difference: main-size multiplication uses u64 rather than wrapping u32.
 Measured: compiled upstream C agrees on 1792 states and exact read traces;
 four model tests cover missing/dark domains, unsupported layouts and admission.
 No kernel plane writes or hardware output were enabled by this slice.
+
+### Color discovery
+
+Pipe configuration, optional pipe/output CSC matrices, 129-entry degamma,
+256-entry legacy gamma and 1024-entry precision gamma now follow display13
+upstream readout. Indexed palette selectors are saved/restored/verified under a
+backend lock, even when a write lands before reporting failure. Buffers are
+caller-owned; failed captures cannot publish partially filled arrays. Raw CSC
+and LUT dwords are retained separately from decoded fields.
+Known upstream limitation: multi-segment readout only yields nine super-fine
+entries; fine/coarse entries are unreliable in i915 too. This port explicitly
+marks that state incomplete and must not claim complete LUT equivalence.
+Compiled-i915 C comparison passes 192 states/entry streams/traces. Five host
+regressions cover bypass/dark domains, buffer bounds, unsupported precision,
+all indexed-access failure prefixes, CSC and LUT packing. No runtime color
+programming or hardware validation was introduced.

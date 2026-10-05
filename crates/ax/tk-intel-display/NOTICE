@@ -86,3 +86,25 @@ src/universal_plane.rs:
   Copyright 2011 Intel Corporation.
   ADL-P has five exposed universal planes, no DG2 4-tile interpretation.
   No auxiliary plane/DPT ownership, joiner or allocation is implied by readout.
+
+src/color.rs:
+  drivers/gpu/drm/i915/display/intel_color.c (display13 branches):
+  skl_get_config, hsw_read_gamma_mode, ilk_read_csc_mode, icl_read_csc,
+  ilk_read_pipe_csc, icl_read_output_csc, icl_read_luts,
+  icl_has_{pre,post}_csc_lut, glk_read_degamma_lut, ilk_read_lut_8,
+  bdw_read_lut_10, ivb_lut_10_size, icl_read_lut_multi_segment,
+  intel_color_lut_pack, i9xx_lut_8_pack, ilk_lut_{10,12p4}_pack,
+  glk_degamma_lut_pack
+  Copyright © 2016 Intel Corporation.
+  intel_color_regs.h selected fields: Copyright © 2023 Intel Corporation.
+  Indexed reads preserve/verify firmware selectors under a backend lock.
+  Multi-segment readout retains upstream's nine-super-fine-entry limitation,
+  explicitly incomplete, never a fabricated full 1024-entry LUT.
+
+The current excerpt scanner inventory for this crate is five outside-fence
+code-line matches at25, two at40, no fenced/comment/range-marked matches.
+In addition to ARRAY_SIZE, upstream_color.rs contributes the conventional
+min expression, LEGACY_LUT_LENGTH constant and two MIT color-state member
+layouts at25; only the dual drm_property_blob pointer declaration also meets40.
+These are C compile-shim facts/declarations, not imported driver bodies or prose.
+No scanner exemption is applied. Whole crates/ax totals are registered in CI.

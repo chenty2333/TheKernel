@@ -592,3 +592,27 @@ is not proven by this slice. Optional `upstream_plane` compiles the unchanged
 format, full initial-plane reconstruction and tile/stride bodies with external
 register/format definitions: 1792 format/alpha/order/tiling/rotation/layout
 states and exact seven-read traces. No physical memory or private fixture added.
+
+Color slice: `intel_color.c` display13 `skl_get_config`, `icl_read_csc` and
+`icl_read_luts` paths, CSC matrix helpers and all used LUT read/packing helpers
+→ `src/color.rs` (exact list in NOTICE); fields from MIT `intel_color_regs.h`.
+Caller-owned LUT buffers avoid a large kernel stack object. Decoded CSC offsets
+are u16 like i915; the complete original dwords are also retained for safety.
+All indexed palettes preserve and verify firmware selectors on every error
+prefix, under the same lock as color commits. Extra wrapper operations are the
+only trace exclusions in the compiled-C oracle. Disabled tables are not read.
+The upstream multi-segment FIXME is preserved as an explicit nine-entry-only
+state, not silently zero-filled or accepted as a complete transform. ICL-only
+Wa_1406463849 does not apply to ADL-P; TGL+ CSC reads do not disarm updates.
+Measured: 192 configuration/CSC/LUT states, decoded entries and upstream MMIO
+traces agree with unchanged local C bodies; all indexed fault prefixes tested.
+
+Color-oracle inventory reconciliation: scoped scanner finds four new code-line
+matches in `tests/upstream_color.rs` at25: conventional `min`, LUT length256,
+CSC matrix members and pre/post LUT blob pointers. Only the final declaration
+also matches at40. Alongside ARRAY_SIZE, the Intel crate now has five such
+code matches at25 / two at40, no fenced/comment/marked matches. Current whole
+`crates/ax` totals supersede the pre-oracle figures above: at40, 0 fenced and
+17 outside fences (10 code); at25, 18 fenced /15 blocks /4 files and33 outside
+fences (22 code). Other scopes and citation counts are unchanged; CI baseline
+is reconciled, not suppressed. Temporary imported bodies retain the MIT grant.

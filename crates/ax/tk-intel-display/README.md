@@ -58,3 +58,13 @@ compiled C, plus 42 ADL-P CDCLK table selections. CDCLK only quantizes a supplie
 minimum. Unsatisfiable requests fail instead of C's warning+max fallback; A0 or
 unknown stepping is not admitted. No TC PLL, CDCLK, DKL HIP selector, PHY/power
 or workaround register programming is implemented by these arithmetic functions.
+
+Continuation readout modules now include serialized `dkl_phy` access and TC
+PLL hardware state, `universal_plane` format/modifier/layout reconstruction,
+and `color` pipe/CSC/LUT discovery. They are independent mechanisms, not yet
+full combined firmware equivalence or kernel fastboot/KMS wiring. Readout-only
+indexed access preserves/verifies firmware selectors on all error prefixes;
+failed restoration requires quarantine. Color buffers are caller-owned, and
+multi-segment LUT readout is explicitly limited to upstream's nine trustworthy
+entries. See NOTICE for sources and the compiled-C `upstream_dkl`,
+`upstream_plane` and `upstream_color` oracles; all remain unverified on hardware.
