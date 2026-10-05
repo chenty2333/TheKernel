@@ -840,3 +840,49 @@ bucket identity. Full UDP tail and UNIX/SNMP coverage remain incomplete.
 Final equivalent-cleanup checks: kernel2615 tests, including UDP header/row
 formatter coverage, and q35 lint pass; unused argument removal restores784
 existing warnings. No runtime protocol behavior changed in this cleanup.
+
+### B1 follow-up33: namespace relationship queries blocking lsns (pending)
+
+Fresh actual signed-tool sweep after32 completes (shell-__l_zry9) with four
+nonzero probes: lsns, lsusb, net-unix and net-snmp. The sweep remains diagnostic,
+not whole-B1 acceptance. iostat still has no disk rows; its exit0 is not storage
+statistics acceptance. The aggregate CPU field interpretation differs between
+its output and mpstat and must be checked separately, not dismissed as timing.
+
+Actual LSNS_DEBUG=all reports get_ns_inos rc=-22 on PID1 (shell-_y9g3fok).
+[Upstream util-linux2.42.3 lsns](https://github.com/util-linux/util-linux/blob/v2.42.3/sys-utils/lsns.c)
+accepts EPERM for an inaccessible user parent but aborts on EINVAL. Linux7.2.3
+fs/nsfs.c and kernel/user_namespace.c use the same ancestry rule for user-parent
+and namespace-owner queries. Initial user namespaces have no parent; a caller
+cannot see an owner outside its own user-namespace subtree. No extra SYS_ADMIN
+gate is involved for this owner traversal. The native user-parent ioctl was
+unconditionally EINVAL and the owner ioctl lacked the ancestry check; both are
+now routed through an original, pointer-identity ancestry helper before any
+namespace descriptor is created. Nonhierarchical parent EINVAL remains intact.
+This does not implement new mount namespaces or claim complete nsfs metadata.
+
+The C probe's base relationship/errno cases pass on host Linux without changing
+host namespaces. Guest-only fixture will create a user namespace, verify caller
+scope against inherited old namespace FDs, check an ancestor's returned parent
+identity, and drop SYS_ADMIN in an isolated worker to prove no extra gate.
+Guest/tool/full-period33 validation is still pending.
+
+Initial actual guest fixture succeeds (shell-y4aimmk3, NS_REL_TOOLS_RC=0):
+ancestor/child identity, inherited-FD denial and no-extra-SYS_ADMIN checks pass.
+lsns now returns0 and lists the eight initial namespace types plus the live
+child user namespace, but emits three Unsupported ioctl NS_GET_NSTYPE warnings.
+These are not declared whole-lsns acceptance: the existing namespace files share
+procfs's device ID with ordinary proc files, so the tool misclassifies proc FDs
+as namespace FDs. Device/fs identity remains a separate next correction.
+Linux7.2.3 open_namespace also requires CLOEXEC; the existing related-FD helper
+used false. Corrected to true and added paired C descriptor-flag assertions;
+full-period33/runtime/ABI validation must be run after that change.
+
+Final period33 passes: Python655 (three environmental skips), Rust6043 (one
+existing ignore; kernel2616), q35/n305 lint (784 existing warnings), KVM guest
+68/68 without skips/normal shutdown (system-rq5zr3br), ABI257/257 on both guests
+(abi-3pwcs2ib), and actual relationship/CLOEXEC/child-scope/no-extra-SYS_ADMIN
+fixture (shell-ue926kv_, NS_REL_TOOLS_RC=0). Actual lsns lists correct namespace
+rows but still emits the three procfs-device-misclassification warnings, so
+no-error whole-tool acceptance remains pending. No host namespace or physical
+hardware configuration was changed. Contract progress counters stay unchanged.

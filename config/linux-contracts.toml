@@ -603,7 +603,7 @@ multiplexer_commands = ["mux:FIONBIO FIONREAD TIOCINQ and namespace commands bef
 provider_ioctls = ["ioctl:regular files FIEMAP FICLONE FICLONERANGE FIDEDUPERANGE FS_IOC_GETFLAGS FS_IOC_SETFLAGS FS_IOC_FSGETXATTR FS_IOC_FSSETXATTR; FUSE handles FIBMAP"]
 errno_order = ["errno:fd lookup EBADF then shared command usercopy and object-specific command validation; unhandled provider commands ENOTTY"]
 usercopy = ["usercopy:IoctlContext retains address-space capability for command-specific import and export"]
-state = ["state:FIONBIO updates shared OFD status; mutating provider ioctls commit through object-owned operations"]
+state = ["state:FIONBIO updates shared OFD status; mutating provider ioctls commit through object-owned operations; NS_GET_PARENT on user namespaces and NS_GET_USERNS expose only owners in the caller user-namespace subtree, returning EPERM for an absent or outside-scope owner without an extra SYS_ADMIN capability gate; returned related namespace descriptors are O_RDONLY and FD_CLOEXEC"]
 concurrency = ["concurrency:OFD and provider-specific serialization; FIEMAP snapshots extent state"]
 teardown = ["teardown:request-owned usercopy state and retained OFD released on completion or error"]
 
@@ -614,7 +614,7 @@ status = "implemented"
 contract = "linux-ioctl"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_ioctl"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:fionbio_uses_the_complete_int_and_treats_every_nonzero_as_enabled", "kernel/src/file/fiemap.rs:linux_fiemap_layout_matches_x86_64_uapi", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/ctl.rs:fionbio_uses_the_complete_int_and_treats_every_nonzero_as_enabled", "kernel/src/file/fiemap.rs:linux_fiemap_layout_matches_x86_64_uapi", "kernel/src/syscall/fs/namespace_visibility.rs:namespace_owner_visibility_uses_ancestry_not_a_capability_gate", "tests/guest/tools/namespace-relationships-smoke.c:main", "tests/guest/portable/fs-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 

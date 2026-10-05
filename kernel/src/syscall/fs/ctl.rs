@@ -154,7 +154,7 @@ fn add_proc_namespace_fd(
     let file = axfs::File::new(FileBackend::Direct(loc), FileFlags::READ);
     Ok(context.add_file_like(
         Arc::try_new(File::new(file)).map_err(|_| AxError::NoMemory)?,
-        false,
+        true,
     )? as isize)
 }
 
@@ -192,6 +192,12 @@ fn proc_namespace_ioctl(
 
     let result = match cmd {
         NS_GET_PARENT => match (kind, object) {
+            (ProcNamespaceKind::User, ProcNamespaceObject::User(ns)) => {
+                super::namespace_visibility::visible_owner(context.caller_cred().user_ns(), ns.parent())
+                    .and_then(|parent| add_proc_namespace_fd(
+                        context, loc, ProcNamespaceKind::User, ProcNamespaceObject::User(parent),
+                    ))
+            }
             (ProcNamespaceKind::Pid, ProcNamespaceObject::Pid(ns)) => {
                 visible_pid_namespace_parent(context, &ns)
                     .map(|parent| {
@@ -212,23 +218,21 @@ fn proc_namespace_ioctl(
                 | ProcNamespaceKind::Ipc
                 | ProcNamespaceKind::Mount
                 | ProcNamespaceKind::Net
-                | ProcNamespaceKind::User
                 | ProcNamespaceKind::Uts,
                 _,
             ) => Err(AxError::InvalidInput),
             _ => Err(AxError::InvalidInput),
         },
-        NS_GET_USERNS => object
-            .owner_user_ns()
-            .map(|owner| {
+        NS_GET_USERNS => super::namespace_visibility::visible_owner(
+            context.caller_cred().user_ns(), object.owner_user_ns(),
+        ).and_then(|owner| {
                 add_proc_namespace_fd(
                     context,
                     loc,
                     ProcNamespaceKind::User,
                     ProcNamespaceObject::User(owner),
                 )
-            })
-            .unwrap_or(Err(AxError::OperationNotPermitted)),
+            }),
         NS_GET_OWNER_UID => match object {
             ProcNamespaceObject::User(ns) => {
                 let owner = context
