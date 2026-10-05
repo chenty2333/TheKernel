@@ -70,7 +70,14 @@ actually autoreaped. CLOEXEC/status, invalid shapes and publication EFAULT
 also pass on both guests. An initially missing host-test import was repaired
 before this final validation. Concurrent SCM_RIGHTS/exec combinations are not
 claimed tested. The original clone3 implementation gaps are resolved; its
-contract is implemented, with these narrower validation gaps retained.
+contract is implemented. The registered raw contract assertions have passed;
+this is not an assertion that every concurrency cross-product was executed.
+The final static gate also requires a recorded errno-order review, not merely
+an implemented status: the size/copy/scalar/set_tid/flag and AUTOKILL capability
+ordering was checked against Linux `kernel/fork.c:2893-3052,2062-2094`. An
+incomplete declaration initially blocked the next ABI run before either guest
+ran; it was corrected without widening the shrink-only allowlist. Untested
+SCM_RIGHTS/exec combinations remain explicit above, not claimed passes.
 
 ## Tool acceptance ladder
 

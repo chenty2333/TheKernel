@@ -8631,7 +8631,7 @@ flags = ["flag:clone_args sizes, CLONE_* and set_tid/exit_signal fields"]
 structs = ["struct:native x86_64 clone3 argument/result layout"]
 multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
-errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
+errno_order = ["errno:size bounds and copy_struct faults/nonzero extension precede pointer-count, exit-signal and cgroup shape EINVAL; set_tid copy EFAULT precedes flag/stack EINVAL; copy_process checks AUTOREAP/NNP/AUTOKILL combinations before AUTOKILL CAP_SYS_ADMIN EPERM; pidfd publication EFAULT precedes child visibility (Linux kernel/fork.c:2893-3052, kernel/fork.c:2062-2094)"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
 state = ["state:copy versioned clone_args and publish a child with selected sharing, identity and stack ownership; NNP restricts only the child before publication, AUTOKILL arms the clone pidfd after complete runtime publication"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
@@ -8645,7 +8645,7 @@ contract = "linux-clone3"
 handler = "kernel/src/syscall/task/clone3.rs:sys_clone3"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
-validation_gaps = ["Paired raw tests cover flag admission, NNP with/without NEWUSER, parent invariance, final dup-pidfd AUTOKILL versus an independent watcher, failed pidfd publication, AUTOREAP and EMPTY_MNTNS; concurrent SCM_RIGHTS transfer and exec-escalation combinations remain untested"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
