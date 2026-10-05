@@ -941,7 +941,7 @@ mod boot_command_line_tests {
 #[cfg(any(feature="defplat",feature="pmu",feature="hwp-uclamp"))]
 pub mod cpu_power { pub use axplat_x86_pc::{cpuidle,cpufreq,thermal}; }
 
-/// Scheduler idle entry with IRQs disabled. Preserves HLT unless opted in.
+/// Scheduler idle entry with IRQs disabled. Automatic MWAIT with safe HLT fallback.
 pub fn cpu_idle_wait() {
     #[cfg(all(target_os="none",feature="defplat"))] axplat_x86_pc::cpuidle::wait();
     #[cfg(not(all(target_os="none",feature="defplat")))] asm::enable_irqs_and_wait();

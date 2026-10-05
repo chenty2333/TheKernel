@@ -202,14 +202,21 @@ FADT/PNP0C0C 枚举保留实际状态；声卡 `/proc/asound/card*/codec#*` 交�
 
 ## CPU power management — 未在硬件上验证
 
-- Boot the unchanged default first; record firmware HWP request and idle
-  behavior with read-only diagnostics. Do not enable HWP with MSR writes and
-  do not change NVMe policy. Keep the existing guarded native boot procedure.
-- Repeat with only `cpuidle.mwait=1`. Read every CPU's cpuidle state name/desc,
-  latency/residency/disable and usage/time before/after an idle window. Check
-  that Gracemont C1 is unusable, that missing ARAT blocks C6/C8/C10, and that
-  timers, wakeups and normal guest-like workloads remain reliable. Compare
-  package/core hardware residency counters and wall power, not just entries.
+- 本轮没有真机授权，不启动/改动 N305。以下步骤留给有授权的现场会话。
+- 先以 `cpuidle.mwait=0` 建立 HLT 排障基线，再移除该参数验证默认自动
+  MWAIT。`cpuidle.mwait=1` 等同默认，不强制绕过硬件/深度状态准入；非法
+  值或裸参数退回 HLT，重复参数最后一项生效。保持既有受保护的启动流程，
+  不开启固件 HWP，不改变 NVMe 策略。
+- 在每个 CPU 上核对 family6/modelBE、MONITOR、CPUID.5 扩展/中断唤醒/
+  子状态、实际状态表、稳定单调时钟和已编程的 LAPIC 定时器；不猜测未知
+  硬件。GMT 的 MWAIT C1（0x00）不可用，C1E 可以准入；缺少 ARAT 必须阻断
+  C6/C8/C10，不能通过 `=1` 或 sysfs disable 写入解禁。
+- 比较默认/强制关闭的 name/desc/latency/residency/disable/usage/time；
+  运行 CPU power 回归、各 CPU 定时器唤醒、跨 CPU futex 唤醒和持续负载。
+  关闭/不支持路径必须只有 HLT，默认 MWAIT 不得导致挂起、丢唤醒或校验错误。
+- 分别记录软件 entry/time、稳定性、硬件 core/package residency 和外部墙上
+  功耗/温度；前三者不能替代节能实测。固定工作负载且没有并发编译/VM 时
+  才比较实际功耗。上述真机项目均为“未在硬件上验证”。
 - Read cpufreq_supported, cpuinfo range and sampled current frequency. If HWP
   is not firmware enabled, or the nominal reference/package-control policy
   is unsupported, keep the unsupported result; do not bypass admission.

@@ -1,4 +1,4 @@
-//! Opt-in Intel MONITOR/MWAIT idle, with a timer-bounded residency predictor.
+//! Capability-gated automatic Intel MONITOR/MWAIT idle.
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// An idle state's architectural hint and timing facts, in microseconds.
@@ -123,7 +123,7 @@ impl CpuIdle {
 }
 static CPUS: [CpuIdle; crate::config::plat::MAX_CPU_NUM] =
     [const { CpuIdle::new() }; crate::config::plat::MAX_CPU_NUM];
-static OPTED_IN: AtomicBool = AtomicBool::new(false);
+static MWAIT_ALLOWED: AtomicBool = AtomicBool::new(true);
 #[repr(align(64))]
 struct MonitorLine(AtomicU64);
 static MONITOR: [MonitorLine; crate::config::plat::MAX_CPU_NUM] =
@@ -150,7 +150,7 @@ pub fn state_count(cpu: usize) -> usize {
         .map_or(0, |cpu| 1 + table(cpu.model.load(Ordering::Acquire)).len())
 }
 pub fn enabled() -> bool {
-    OPTED_IN.load(Ordering::Acquire)
+    MWAIT_ALLOWED.load(Ordering::Acquire)
 }
 pub fn supported(cpu: usize) -> bool {
     CPUS.get(cpu)
@@ -222,37 +222,110 @@ fn choose(states: &[IdleState], available: u8, disabled: u8, expected_us: u64) -
     }
     chosen
 }
+/// Absent/1 select automatic admission, 0 disables. Invalid values fail closed.
+/// The last exact key wins; a bare key is invalid rather than an enable flag.
+fn policy_allowed(command_line: Option<&str>) -> bool {
+    let value = command_line
+        .unwrap_or("")
+        .split_ascii_whitespace()
+        .rev()
+        .find_map(|word| {
+            if word == "cpuidle.mwait" {
+                Some("")
+            } else {
+                word.strip_prefix("cpuidle.mwait=")
+            }
+        });
+    matches!(value, None | Some("1"))
+}
+
+#[derive(Clone, Copy)]
+struct Admission {
+    max_leaf: u32,
+    intel: bool,
+    family: u32,
+    model: u8,
+    monitor: bool,
+    extensions: u32,
+    substates: u32,
+    arat: bool,
+    clock_safe: bool,
+}
+impl Admission {
+    fn mask(self) -> u8 {
+        if self.max_leaf < 6
+            || !self.intel
+            || self.family != 6
+            || !self.monitor
+            || self.extensions & 3 != 3
+            || !self.clock_safe
+        {
+            return 1; // Only the mandatory HLT fallback.
+        }
+        eligible(self.model, self.substates, self.arat)
+    }
+}
+
+fn select_entry(cpu: &CpuIdle, allowed: bool, now_ns: u64) -> usize {
+    let deadline = cpu.deadline.load(Ordering::Acquire);
+    // Never substitute a prediction for an absent, expired or unarmed timer.
+    if !allowed || deadline <= now_ns {
+        return 0;
+    }
+    let until_timer = (deadline - now_ns) / 1000;
+    let history = cpu.prediction.load(Ordering::Relaxed);
+    let expected = if history == 0 {
+        until_timer
+    } else {
+        until_timer.min(history)
+    };
+    choose(
+        table(cpu.model.load(Ordering::Acquire)),
+        cpu.eligible.load(Ordering::Acquire),
+        cpu.disabled.load(Ordering::Acquire),
+        expected,
+    )
+}
+
 /// Read-only CPU discovery, before userspace and before this CPU's idle loop.
 pub fn init_current() {
     #[cfg(target_os = "none")]
     {
         use core::arch::x86_64::__cpuid_count;
-        let (vendor, identity, mwait, thermal) = (
-            __cpuid_count(0, 0),
-            __cpuid_count(1, 0),
-            __cpuid_count(5, 0),
-            __cpuid_count(6, 0),
-        );
+        let vendor = __cpuid_count(0, 0);
         let cpu = axplat::percpu::this_cpu_id();
-        let opted = crate::boot_command_line().and_then(|line| {
-            line.split_ascii_whitespace()
-                .filter_map(|p| p.strip_prefix("cpuidle.mwait="))
-                .next_back()
-        }) == Some("1");
-        OPTED_IN.store(opted, Ordering::Release);
+        MWAIT_ALLOWED.store(
+            policy_allowed(crate::boot_command_line()),
+            Ordering::Release,
+        );
+        if vendor.eax < 6 {
+            return;
+        }
+        let identity = __cpuid_count(1, 0);
+        let mwait = __cpuid_count(5, 0);
+        let thermal = __cpuid_count(6, 0);
+        let extended = __cpuid_count(0x8000_0000, 0);
+        let invariant_tsc =
+            extended.eax >= 0x8000_0007 && __cpuid_count(0x8000_0007, 0).edx & (1 << 8) != 0;
         let family = (identity.eax >> 8) & 15;
         let model = (((identity.eax >> 16) & 15) << 4 | ((identity.eax >> 4) & 15)) as u8;
         let intel = [vendor.ebx, vendor.edx, vendor.ecx] == [0x756e6547, 0x49656e69, 0x6c65746e];
-        if vendor.eax < 6
-            || !intel
-            || family != 6
-            || identity.ecx & (1 << 3) == 0
-            || mwait.ecx & 3 != 3
-            || table(model).is_empty()
-        {
+        let mask = Admission {
+            max_leaf: vendor.eax,
+            intel,
+            family,
+            model,
+            monitor: identity.ecx & (1 << 3) != 0,
+            extensions: mwait.ecx,
+            substates: mwait.edx,
+            arat: thermal.eax & (1 << 2) != 0,
+            clock_safe: crate::time::mwait_clock_safe(invariant_tsc),
+        }
+        .mask();
+        // Keep the table for diagnosis only on recognized native identities.
+        if !intel || family != 6 || table(model).is_empty() {
             return;
         }
-        let mask = eligible(model, mwait.edx, thermal.eax & (1 << 2) != 0);
         let mut disable = 0;
         for (index, state) in table(model).iter().enumerate() {
             if state.default_disabled {
@@ -264,17 +337,17 @@ pub fn init_current() {
         CPUS[cpu].model.store(model, Ordering::Release);
     }
 }
-/// Record the next LAPIC deadline without changing how that timer is armed.
+/// Publish a successfully armed local LAPIC deadline, with IRQs disabled.
 pub fn note_timer(deadline_ns: u64) {
     #[cfg(target_os = "none")]
     CPUS[axplat::percpu::this_cpu_id()]
         .deadline
-        .store(deadline_ns, Ordering::Relaxed);
+        .store(deadline_ns, Ordering::Release);
     #[cfg(not(target_os = "none"))]
     let _ = deadline_ns;
 }
 /// Called with IRQs disabled after the scheduler's final ready-queue check.
-/// Returns with IRQs enabled, like the default `sti; hlt` path.
+/// Returns with IRQs enabled; HLT remains the fallback and explicit-off path.
 pub fn wait() {
     #[cfg(target_os = "none")]
     {
@@ -282,23 +355,8 @@ pub fn wait() {
         let cpu_id = axplat::percpu::this_cpu_id();
         let cpu = &CPUS[cpu_id];
         let before = ticks_to_nanos(current_ticks());
-        let until_timer = cpu.deadline.load(Ordering::Relaxed).saturating_sub(before) / 1000;
         let history = cpu.prediction.load(Ordering::Relaxed);
-        let expected = if history == 0 {
-            until_timer
-        } else {
-            until_timer.min(history)
-        };
-        let chosen = if enabled() {
-            choose(
-                table(cpu.model.load(Ordering::Acquire)),
-                cpu.eligible.load(Ordering::Acquire),
-                cpu.disabled.load(Ordering::Acquire),
-                expected,
-            )
-        } else {
-            0
-        };
+        let chosen = select_entry(cpu, enabled(), before);
         if chosen == 0 {
             axcpu::asm::enable_irqs_and_wait();
         } else {
@@ -335,6 +393,123 @@ pub fn wait() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_policy_and_explicit_off_are_not_hardware_overrides() {
+        for line in [
+            None,
+            Some(""),
+            Some("quiet"),
+            Some("cpuidle.mwait=1"),
+            Some("cpuidle.mwait=0 cpuidle.mwait=1"),
+        ] {
+            assert!(policy_allowed(line));
+        }
+        for line in [
+            "cpuidle.mwait=0",
+            "cpuidle.mwait=1 cpuidle.mwait=0",
+            "cpuidle.mwait=",
+            "cpuidle.mwait",
+            "cpuidle.mwait=yes",
+            "cpuidle.mwait=2",
+        ] {
+            assert!(!policy_allowed(Some(line)));
+        }
+        assert!(policy_allowed(Some(
+            "xcpuidle.mwait=0 cpuidle.mwait_extra=0"
+        )));
+    }
+    #[test]
+    fn admission_rejects_missing_features_unknown_models_and_unsafe_clocks() {
+        let good = Admission {
+            max_leaf: 6,
+            intel: true,
+            family: 6,
+            model: 0xbe,
+            monitor: true,
+            extensions: 3,
+            substates: 0x11111120,
+            arat: true,
+            clock_safe: true,
+        };
+        assert_eq!(good.mask(), 61);
+        for bad in [
+            Admission {
+                max_leaf: 5,
+                ..good
+            },
+            Admission {
+                intel: false,
+                ..good
+            },
+            Admission { family: 15, ..good },
+            Admission {
+                model: 0xff,
+                ..good
+            },
+            Admission {
+                monitor: false,
+                ..good
+            },
+            Admission {
+                extensions: 1,
+                ..good
+            },
+            Admission {
+                extensions: 2,
+                ..good
+            },
+            Admission {
+                substates: 0,
+                ..good
+            },
+            Admission {
+                clock_safe: false,
+                ..good
+            },
+        ] {
+            assert_eq!(bad.mask(), 1);
+        }
+        assert_eq!(
+            Admission {
+                arat: false,
+                ..good
+            }
+            .mask(),
+            5
+        );
+        assert_eq!(
+            Admission {
+                model: 0xcc,
+                arat: false,
+                ..good
+            }
+            .mask(),
+            7
+        );
+        assert_eq!(
+            Admission {
+                substates: 0x10,
+                ..good
+            }
+            .mask(),
+            1
+        ); // GMT C1 unusable.
+    }
+    #[test]
+    fn only_a_future_armed_deadline_allows_mwait() {
+        let cpu = CpuIdle::new();
+        cpu.model.store(0xbe, Ordering::Relaxed);
+        cpu.eligible.store(61, Ordering::Relaxed);
+        cpu.prediction.store(10_000, Ordering::Relaxed);
+        assert_eq!(select_entry(&cpu, true, 0), 0);
+        cpu.deadline.store(1_000_000, Ordering::Relaxed);
+        assert_eq!(select_entry(&cpu, true, 1_000_000), 0);
+        assert_eq!(select_entry(&cpu, true, 2_000_000), 0);
+        assert_eq!(select_entry(&cpu, false, 0), 0);
+        assert_eq!(select_entry(&cpu, true, 0), 3);
+        cpu.disabled.store(0xff, Ordering::Relaxed);
+        assert_eq!(select_entry(&cpu, true, 0), 0);
+    }
     #[test]
     fn gracemont_facts_and_arat_gate() {
         assert_eq!(

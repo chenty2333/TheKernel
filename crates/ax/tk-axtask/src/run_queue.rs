@@ -2402,8 +2402,9 @@ fn request_reschedule_cpu(cpu_id: usize, task: &AxTaskRef) {
 
 /// Waits on this CPU's idle task until it may have work.
 ///
-/// The final check runs with interrupts disabled and the halt is `sti; hlt`,
-/// so a wake IPI arriving after the check ends the halt.  Checking with
+/// The final check runs with IRQs disabled. Admitted MWAIT breaks on masked
+/// interrupts; fallback HLT uses `sti; hlt`. Both preserve a wake IPI arriving
+/// after the check. Checking with
 /// interrupts enabled and then halting let such an IPI be serviced just
 /// before HLT, leaving the queued task waiting for the next timer tick.
 #[cfg(all(feature = "irq", feature = "smp"))]

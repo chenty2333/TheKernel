@@ -6,48 +6,83 @@ All Rust is original. Behavioral authority is Linux 7.2.3 `intel_idle.c`,
 `intel_pstate.c`, `coretemp.c`; register facts come from CPUID/MSRs.
 **未在硬件上验证**. No NVMe writes or firmware HWP enablement are involved.
 
-## Idle
+## Idle: automatic admission, explicit troubleshooting disable
 
-Default stays `sti; hlt`. Only `cpuidle.mwait=1` selects MWAIT, and only on
-known Intel family-6 models with CPUID MONITOR, MWAIT extensions and masked-IRQ
-break support. Gracemont model BE uses gmt timing/hint facts: C1 00/1/1
-(unusable, cannot be re-enabled), C1E 01/2/4, C6 20/195/585, C8 40/260/1040,
-C10 60/660/1980 (hint/exit latency/target residency in microseconds).
-Panther Lake model CC uses its own upstream table for development-host testing.
-Unknown models/capabilities fall back to HLT. CPUID.5 substate admission uses
-hint high-nibble + 1; without CPUID.6 ARAT no hint at or below C6 is admitted.
+Default is automatic MWAIT **when the current CPU and platform pass admission**.
+Otherwise the scheduler reliably uses `sti; hlt`. This supersedes the former
+opt-in default; it does not change HWP policy, NVMe policy or thermal registers.
 
-The predictor is the smaller of the next programmed LAPIC deadline and an
-EWMA of recent idle intervals. It selects the deepest enabled state whose
-residency and exit latency fit. This is not Linux menu/teo and has no full
-latency-QoS governor. The scheduler keeps IRQs disabled through its final ready
-check and MONITOR/MWAIT; ECX interrupt-break closes the wake race. Accounting
-finishes before IRQ delivery. A mandatory HLT fallback cannot be disabled.
+`cpuidle.mwait` semantics:
+- absent: automatic admission (the normal default);
+- `0`: force HLT, without hiding the detected hardware/state table;
+- `1`: same automatic admission as absent, **not** a hardware/deep-state override;
+- empty, bare or any other value: fail closed to HLT;
+- when repeated, the last exact key wins.
 
-Sysfs exposes per-CPU state name/desc/latency/residency/usage/time/disable;
-time is accumulated wall microseconds, not a hardware residency MSR.
-HLT accounting includes interrupt-return overhead. Unsupported and ARAT-blocked
-states cannot be re-enabled. A global diagnostic `mwait_enabled` and per-CPU
-`mwait_supported` distinguish opt-in from availability.
+Every CPU must report Intel family6, an explicitly known model (BE Gracemont or
+CC Panther Lake), CPUID basic leaf6, MONITOR, CPUID.5 extension and masked-IRQ
+break support, and advertised substates for the chosen hint. Unknown hardware
+is not guessed from model proximity. Gracemont uses upstream gmt facts:
+C1 00/1/1 (unusable, cannot be enabled), C1E 01/2/4, C6 20/195/585,
+C8 40/260/1040, C10 60/660/1980 (hint/latency/residency in microseconds).
+Panther Lake uses its own upstream table, not spoofed Gracemont facts.
+CPUID.5 substate numbering is hint high-nibble +1; the requested substate must
+exist. C6 and deeper hints (>=20 hex) additionally require per-CPU CPUID.6 ARAT.
+Automatic MWAIT does **not** bypass that gate or state disable controls.
 
-QEMU opt-in: `--accel kvm --cpu-pm`, which adds `-overcommit cpu-pm=on`.
-Guest suite boot opt-in: `--guest-kernel-cmdline cpuidle.mwait=1`.
-This changes both HLT and MWAIT virtualization. Host utilization comparisons
-under concurrent builds/other VMs are not performance evidence.
+The monotonic clock must survive idle: a selected TSC requires invariant TSC
+on this CPU too, while the admitted 64-bit HPET is independent of CPU idle.
+An uninitialized/unsafe clock excludes MWAIT. TSC-deadline or calibrated local
+LAPIC one-shot must have actually been armed with a future deadline. Timer
+programming is preemption/IRQ pinned; idle sees its deadline only after the
+hardware arm succeeds. An absent/expired deadline always selects HLT, even if
+idle-history prediction would otherwise suggest a long sleep.
 
-## Validation
+The predictor uses the smaller of that deadline and an EWMA of recent idle
+intervals; latency/residency must fit. This is a simplified governor, not Linux
+menu/teo or full latency QoS. The scheduler's final ready check stays IRQ-disabled;
+MONITOR/MWAIT uses masked-interrupt break, so an interrupt already pending or
+arriving before entry is not lost. Accounting precedes IRQ delivery. Mandatory
+HLT cannot be disabled. No firmware C-state policy/demotion MSRs are changed.
 
-Unit tests cover Gracemont facts, CPUID hint numbering, ARAT gate, residency
-boundaries, disable and unsupported inputs. KVM MWAIT guest passed 63/63
-(system-k_vuyw7g): all four CPUs reported MWAIT supported/enabled and usage
-increased 234–383 entries during a 300 ms idle observation, with 198–299 ms
-accumulated time. Default KVM guest passed 63/63 (system-3o8tk3d1), with MWAIT
-not exposed/enabled and HLT counters increasing. Full host passed 653 Python
-(3 skips) and kernel 2597; q35/n305 lint passed. These are software-entered idle
-counters, not proof of physical package residency or power reduction.
-A controlled host-utilization reduction has not been established: concurrent
-Codex builds/VMs invalidate that performance comparison per COMMON rule 11.
-Frequency, temperature and real-tool sections follow in independent changes.
+Sysfs state name/desc/latency/residency/usage/time/disable retain their units.
+`mwait_enabled` means policy allows automatic admission, not that every CPU
+can enter it. Per-CPU `mwait_supported` means safe platform admission; disabled
+or too-short intervals can still select HLT. Counters count software entries/
+wall microseconds, not hardware residency; HLT time includes IRQ-return overhead.
+
+QEMU still needs explicit host permission `--accel kvm --cpu-pm`
+(`-overcommit cpu-pm=on`) to expose/pass HLT and MWAIT. No kernel opt-in is
+required. For troubleshooting use `--guest-kernel-cmdline cpuidle.mwait=0` in
+the guest suite, or `--kernel-cmdline cpuidle.mwait=0` in a normal run.
+Without advertised MWAIT, even the default automatically falls back to HLT.
+
+## Current idle validation scope
+
+Host tests cover parameter defaults/repetition/invalid input, known state facts,
+feature/vendor/model admission, invariant clock, ARAT, disable, residency and
+future-armed-deadline requirements. The guest power case checks each CPU's HLT
+and MWAIT deltas separately: forced-off/unsupported paths must have zero MWAIT
+entries. It also checks timer wake on every allowed CPU,100 timer-paced remote
+futex handshakes and a one-second oversubscribed, pinned busy workload with
+verified sums and a sleeping heartbeat. These are scheduling correctness
+probes with bounded waits, **not** latency or energy benchmarks.
+
+Measured with the formal framework, without repeating unrelated ABI/host suites:
+
+| Path | Observation | Scheduling correctness |
+| --- | --- | --- |
+| Default KVM + `--cpu-pm`, no kernel parameter | Complete guest63/63 passed; all4 CPUs admitted MWAIT,326–372 entries/300 ms window | Timer wake on all CPUs,100 remote futex handshakes and8 pinned busy workers with heartbeat/sum checks passed |
+| KVM + `--cpu-pm`, `cpuidle.mwait=0` | Focused shell CPU-power case passed; support remains1, all4 CPUs MWAIT entries/time0 and HLT grows | Same wake/load checks passed |
+| Default KVM without `--cpu-pm`, no kernel parameter | Focused case passed; policy1, admission0, all4 CPUs MWAIT entries/time0 and HLT grows | Same wake/load checks passed |
+
+Affected platform host tests passed143; harness host tests passed62 (3 skips),
+strict C compilation/Linux-host scheduling probe and q35/n305 lint passed. Scope is
+four virtual CPUs,100 handshakes and one-second load, not a long-duration soak.
+No native authorization/run is included. Entry/time growth, virtual scheduling
+stability, physical core/package residency and actual energy savings are
+separate claims; the latter two remain **未在硬件上验证**. Host utilization under
+concurrent builds/VMs is not evidence of savings.
 
 ## Frequency and firmware ownership
 
@@ -107,7 +142,7 @@ Temperature validation: platform139 tests passed (target/offset/validity/delta,
 virtual/unknown admission); kernel read-only attribute test and q35 lint passed.
 KVM guest63/63 (system-migo15ns) opened the empty hwmon class successfully,
 without probing virtual thermal MSRs. Actual core/package readings remain
-unverified on physical hardware; real sensors acceptance follows below.
+unverified on physical hardware.
 
 ## Real power tools
 
@@ -118,7 +153,7 @@ Linux msr module (TheKernel has no loadable modules); no fake successful
 modprobe or MSR transport is installed. Sensors' status1/No sensors found is
 the expected unsupported QEMU result, not a temperature measurement.
 
-Real-tool acceptance passed in the complete opt-in debug KVM guest66/66
+Before the automatic-default change, real-tool acceptance passed in debug KVM guest66/66
 (system-13qkgs9m): cpupower idle-info reported intel_idle, HLT/MWAIT descriptions,
 latency/residency and growing usage/duration; frequency-info honestly reported
 no active driver, and sensors reported No sensors found. Running info commands
@@ -128,7 +163,7 @@ passed654 Python tests (3 skips), kernel2599; affected tool fixtures refreshed
 with63 host tests and strict C compilation. q35/n305 lint passed with existing
 warnings; platform power excerpt scan found zero matches/zero Linux code.
 
-## Final ABI boundary
+## Earlier full ABI boundary (unchanged by idle policy)
 
 Complete50-program ABI run `abi-wx81cz3w`: all50 TheKernel programs passed.
 The Linux oracle completed50 with one unchanged socket-provider failure,

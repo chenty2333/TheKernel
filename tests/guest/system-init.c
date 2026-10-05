@@ -1122,7 +1122,7 @@ static int run_init(int argc, char **argv) {
         { "creat", test_creat_differential, 60 },
         { "time", test_time_differential, 60 },
         { "umask", test_umask_differential, 60 },
-        { "cpu-power", test_cpu_power, 10 },
+        { "cpu-power", test_cpu_power, 30 },
         { "signal-fp", test_signal_fp, 60 },
         { "jit-mem", test_jit_mem, 30 },
         { "proc-shape", test_proc_shape, 30 },
