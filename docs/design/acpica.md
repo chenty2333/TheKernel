@@ -75,6 +75,14 @@ S5. Panic/IRQ paths never block on AML and retain static S5 as a fallback.
 - Q35 thermal policy fixture: real sysfs values and critical -> orderly flush ->
   ACPICA S5 passed; ordinary no-zone guest suite remained **69/69**.
 
+- An authored PNP0C0C `_INI` Notify 0x80 exercised the kernel method-button
+  consumer and orderly ACPICA S5; q35 QMP still produces a fixed button, not
+  a method-button event. A deliberately unsupported authored ECDT forced
+  initialization failure; after repairing static SCI ownership, QMP still caused
+  init notification, filesystem flush and clean static S5. The initial failing
+  fallback test exposed duplicate SCI registration/disabled PM1 events; it was
+  fixed rather than counted as a successful fallback.
+
 ## Reproduce
 
 Use a separate state directory and `CARGO_BUILD_JOBS=6`; host builds and VM
@@ -91,7 +99,7 @@ CARGO_BUILD_JOBS=6 nice -n 10 cargo run -p tk-acpica --features host \
   --example table_probe -- EXTERNAL_TABLE_DIRECTORY
 ```
 
-For the authored thermal shutdown regression, use the same environment with
+For the authored thermal/button/fallback regressions, use the same environment with
 `nice -n 10 python3 scripts/ci/acpica-policy-qemu-smoke.py`. It does not accept
 host termination or shell EOF as a critical-trip result.
 

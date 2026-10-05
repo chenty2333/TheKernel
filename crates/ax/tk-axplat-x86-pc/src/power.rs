@@ -96,6 +96,8 @@ static FIXED: SpinNoIrq<Option<FixedPower>> = SpinNoIrq::new(None);
 static S5: SpinNoIrq<Option<[u8; 2]>> = SpinNoIrq::new(None);
 static BUTTON: AtomicBool = AtomicBool::new(false);
 static BUTTON_READY: AtomicBool = AtomicBool::new(false);
+// Handler ownership is independent of published button/thermal availability.
+static STATIC_SCI: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn init_early() {
     let mut fixed = None;
@@ -228,6 +230,7 @@ pub(crate) fn init_later() {
                 }
             }
         }
+        STATIC_SCI.store(true, Ordering::Release);
         BUTTON_READY.store(true, Ordering::Release);
     }
 }
@@ -293,10 +296,23 @@ pub fn install_acpica_sci(irq:u32,handler:fn())->Option<usize> {
     let low=facts.overrides().iter().find(|r|r.source==fixed.sci).is_none_or(|r|r.flags&3!=1);
     let vector=usize::from(fixed.sci)+0x20;
     if !crate::apic::configure_sci(vector,low){return None;}
-    if BUTTON_READY.swap(false,Ordering::AcqRel){let _=axplat::irq::unregister(vector);}
+    BUTTON_READY.store(false, Ordering::Release);
+    if STATIC_SCI.swap(false,Ordering::AcqRel){let _=axplat::irq::unregister(vector);}
     if !axplat::irq::register(vector,handler){return None;}
     ACPICA_SCI.store(true,Ordering::Release);Some(vector)
 }
 #[cfg(feature="irq")]
 pub fn remove_acpica_sci(vector:usize){if ACPICA_SCI.swap(false,Ordering::AcqRel){let _=axplat::irq::unregister(vector);}}
-pub fn restore_static_acpi(){ACPICA_OFF.store(0,Ordering::Release);init_later();}
+pub fn restore_static_acpi() {
+    ACPICA_OFF.store(0, Ordering::Release);
+    BUTTON_READY.store(false, Ordering::Release);
+    // Termination may disable PM1 even if ACPICA failed before claiming SCI.
+    // Revoke only our old static handler, then re-register and re-enable events.
+    #[cfg(feature = "irq")]
+    if STATIC_SCI.swap(false, Ordering::AcqRel) {
+        if let Some(fixed) = *FIXED.lock() {
+            let _ = axplat::irq::unregister(usize::from(fixed.sci) + 0x20);
+        }
+    }
+    init_later();
+}

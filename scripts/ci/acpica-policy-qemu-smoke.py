@@ -26,43 +26,75 @@ def ordered(text: str, *markers: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--no-build", action="store_true")
-    parser.add_argument("--case", choices=("thermal",), default="thermal")
+    parser.add_argument("--case", choices=("thermal", "method-button", "fixed-button", "fallback", "all"), default="all")
     args = parser.parse_args()
     os.environ["THEKERNEL_TOOLCHAIN"] = "acpica"
     run_args = product.build_parser().parse_args(["run", "--profile", "shell", "--toolchain", "acpica"])
     artifacts = product.artifacts_for(run_args)
     if not args.no_build:
         product.build_cmd(run_args)
-    directory = Path(tempfile.mkdtemp(prefix="acpica-" + args.case + "-", dir=state_root() / "runs"))
+    cases = ("thermal", "method-button", "fixed-button", "fallback") if args.case == "all" else (args.case,)
+    for case in cases:
+        run_case(artifacts, case)
+
+
+def run_case(artifacts, case: str) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="acpica-" + case + "-", dir=state_root() / "runs"))
     commands = directory / "commands"
-    commands.write_text("\n".join([
-        "/bin/busybox cat /sys/class/thermal/thermal_zone0/type",
-        "/bin/busybox cat /sys/class/thermal/thermal_zone0/temp",
-        "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_0_temp",
-        "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_0_type",
-        "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_1_temp",
-        "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_1_type",
-        "/bin/busybox echo THEKERNEL_THERMAL_SYSFS_READ",
-        "/bin/busybox sleep 60", "",
-    ]))
+    extra = ()
+    powerdown = None
+    lines = ["/bin/busybox sleep 60", ""]
+    if case == "thermal":
+        lines = [
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/type",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/temp",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_0_temp",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_0_type",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_1_temp",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_1_type",
+            "/bin/busybox echo THEKERNEL_THERMAL_SYSFS_READ", *lines,
+        ]
+        fixture = "thermal.aml"
+    elif case == "method-button":
+        fixture = "button.aml"
+    elif case == "fallback":
+        fixture = "unsupported-ecdt.bin"
+        powerdown = "THEKERNEL_ACPI_POLICY_READY"
+    else:
+        fixture = None
+        powerdown = "THEKERNEL_ACPI_POLICY_READY"
+    if powerdown:
+        lines = ["/bin/busybox sleep 3", "/bin/busybox echo THEKERNEL_ACPI_POLICY_READY", *lines]
+    if fixture:
+        extra = ("-acpitable", "file=" + str(ROOT / "tests/guest/acpi" / fixture))
+    commands.write_text("\n".join(lines))
     result = product.run_product(artifacts, product.RunSpec(
         accel="kvm", timeout=120, workdir=directory, interactive=False,
         input_after_marker="THEKERNEL_SHELL_READY", stop_after_marker=None,
         commands=commands, extra_block=None, run_cpus=4,
-        kernel_cmdline="acpi=acpica",
-        qemu_extra_args=("-acpitable", "file=" + str(ROOT / "tests/guest/acpi/thermal.aml")),
+        kernel_cmdline="acpi=acpica", qemu_extra_args=extra,
+        powerdown_after_marker=powerdown, qmp_timeout_secs=120,
     ))
     if result:
         raise RuntimeError(f"guest failed ({result}); see {directory}")
     console = (directory / "console.log").read_text()
     kernel = (directory / "kernel.log").read_text()
-    lines = console.splitlines()
-    for value in ("acpitz", "26800", "36800", "critical", "31800", "passive"):
-        if value not in lines:
-            raise RuntimeError(f"missing actual sysfs value {value!r}; see {directory}")
-    ordered(console, "THEKERNEL_THERMAL_SYSFS_READ", "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPICA_S5_PREPARED")
-    ordered(kernel, "thermal critical trip reached", "acpi-power: filesystems flushed; entering S5", "acpica: entering S5 after AML preparation")
-    print("ACPICA_THERMAL_QEMU_PASS", directory, flush=True)
+    if case == "thermal":
+        for value in ("acpitz", "26800", "36800", "critical", "31800", "passive"):
+            if value not in console.splitlines():
+                raise RuntimeError(f"missing actual sysfs value {value!r}; see {directory}")
+        ordered(console, "THEKERNEL_THERMAL_SYSFS_READ", "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPICA_S5_PREPARED")
+        ordered(kernel, "thermal critical trip reached", "acpi-power: filesystems flushed; entering S5", "acpica: entering S5 after AML preparation")
+    elif case == "fallback":
+        ordered(kernel, "static fallback restored", "acpi-power: filesystems flushed; entering S5")
+        if "THEKERNEL_ACPICA_S5_PREPARED" in console or "acpica: ready version" in kernel:
+            raise RuntimeError("failed initialization retained ACPICA ownership")
+        ordered(console, "THEKERNEL_SHELL_READY", "THEKERNEL_ACPI_BUTTON_EVENT")
+    else:
+        expected = "method-buttons=1" if case == "method-button" else "fixed-button=true"
+        ordered(kernel, expected, "acpi-power: filesystems flushed; entering S5", "acpica: entering S5 after AML preparation")
+        ordered(console, "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPICA_S5_PREPARED")
+    print("ACPICA_" + case.upper().replace("-", "_") + "_QEMU_PASS", directory, flush=True)
 
 
 if __name__ == "__main__":
