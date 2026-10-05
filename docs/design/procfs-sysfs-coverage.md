@@ -677,3 +677,25 @@ Swap2044 total/64 used/1980 free (shell-j47n82gu, SWAP_CAPACITY_RC=0). Data and
 16 in/out events survive; no host/device swapon or physical acceptance is
 claimed. This is the existing TheKernel regular-file RAM fixture, not Linux
 acceptance of tmpfs swap.
+
+### Public per-mm VmSwap
+
+PID/status VmSwap was still constant0 after active swap became observable in
+smaps/meminfo. Linux7.2.3 fs/proc/array.c/task_mmu.c status reports mm swap-entry
+occupancy; use the same mm-owned software registry under the existing status
+memory snapshot lock. CLONE_VM shares one mm observation; fork duplicates its
+PTE owners while the global swap area's unique occupied-slot count stays fixed.
+Status aggregate access remains public under the current default procfs view;
+do not add the maps/smaps ptrace gate or change reader credential mapping.
+
+Extend the existing controlled guest fixture to compare VmSwap before/pageout/
+page-in, let an UID1000 child read its root parent's aggregate status, and check
+fork slot references do not multiply global usage. Host Linux base parser checks
+the numeric status grammar but does not activate host swap. Kernel2609, lint
+(784 existing warnings), and KVM guest67/67 without skips/normal shutdown pass
+(system-a8dngfao). The controlled RAM fixture verifies VmSwap's actual64kB
+increase and restoration, UID1000 access to its root parent's64kB aggregate,
+and unchanged unique global slot usage across that fork. Actual signed Alpine
+free remains correct (shell-j_rkmh6n, SWAP_CAPACITY_RC=0). No new errno/admission
+behavior, host/device swap, or broader Dirty/PSS/status completeness claim;
+full period/ABI validation remains the item27 run.

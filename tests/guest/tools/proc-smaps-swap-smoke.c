@@ -72,6 +72,25 @@ static void real_free(void) {
     }
     int status;need(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status),"real free exit");
 }
+static unsigned long long status_swap(const char *path) {
+    FILE *file=fopen(path,"r");need(file!=NULL,"status open");
+    char line[256];unsigned long long value;char unit[8];
+    while(fgets(line,sizeof(line),file)) {
+        if(sscanf(line,"VmSwap: %llu %7s",&value,unit)==2) {
+            need(!strcmp(unit,"kB"),"status swap units");fclose(file);return value;
+        }
+    }
+    fclose(file);need(0,"VmSwap status field");return 0;
+}
+static void unprivileged_parent_swap(unsigned long long expected) {
+    char path[64];snprintf(path,sizeof(path),"/proc/%ld/status",(long)getpid());
+    pid_t child=fork();need(child>=0,"status observer fork");
+    if(!child) {
+        if(!geteuid())need(!setuid(1000),"unprivileged status reader");
+        need(status_swap(path)==expected,"public parent swap aggregate");_exit(0);
+    }
+    int status;need(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status),"unprivileged status read");
+}
 static void swap_probe(volatile unsigned *mapping,int tools) {
     /* Guest-only local file fixture; never activate swap on the host/device. */
     char path[]="/tmp/thekernel-smap-swap.XXXXXX";int fd=mkstemp(path);need(fd>=0,"swap fixture file");
@@ -85,6 +104,7 @@ static void swap_probe(volatile unsigned *mapping,int tools) {
         meminfo_value("CommitLimit")==commit+2044,"swap capacity and commit limit activation");
     swap_row(path,2044,0,1);
     struct observed before=observe((const void *)mapping);
+    unsigned long long task_swap=status_swap("/proc/self/status");
     unsigned long long input=vm_event("pswpin"),output=vm_event("pswpout");
     need(!madvise((void *)mapping,PAGE*PAGES,MADV_PAGEOUT),"pageout");
     struct observed swapped=observe((const void *)mapping);
@@ -93,6 +113,9 @@ static void swap_probe(volatile unsigned *mapping,int tools) {
     need(swapped.swap>=before.swap+PAGE*PAGES/1024 && swapped.rss+PAGE*PAGES/1024<=before.rss,"actual software swap leaves");
     need(meminfo_value("SwapFree")==available+2044-PAGE*PAGES/1024,"unique occupied swap slots");
     swap_row(path,2044,PAGE*PAGES/1024,1);
+    need(status_swap("/proc/self/status")==task_swap+PAGE*PAGES/1024,"VmSwap actual per-mm occupancy");
+    unprivileged_parent_swap(task_swap+PAGE*PAGES/1024);
+    need(meminfo_value("SwapFree")==available+2044-PAGE*PAGES/1024,"fork references do not multiply global occupied slots");
     if(tools)real_free();
     for(unsigned page=0;page<PAGES;page++)need(mapping[page*PAGE/sizeof(unsigned)]==0x12340000+page,"page-in bytes preserved");
     struct observed restored=observe((const void *)mapping);
@@ -102,6 +125,7 @@ static void swap_probe(volatile unsigned *mapping,int tools) {
     need(restored.swap+PAGE*PAGES/1024<=swapped.swap && restored.rss>=swapped.rss+PAGE*PAGES/1024,"swap leaves retire on page-in");
     need(meminfo_value("SwapFree")==available+2044,"swap capacity restored after page-in");
     swap_row(path,2044,0,1);
+    need(status_swap("/proc/self/status")==task_swap,"VmSwap retires restored pages");
     need(!swapoff(path) && !unlink(path),"swap fixture cleanup");
     need(meminfo_value("SwapTotal")==total && meminfo_value("SwapFree")==available &&
         meminfo_value("CommitLimit")==commit,"swap capacity and commit limit cleanup");
@@ -123,6 +147,7 @@ int main(int argc,char **argv) {
     need(mapping!=MAP_FAILED,"anonymous mapping");
     for(unsigned page=0;page<PAGES;page++)mapping[page*PAGE/sizeof(unsigned)]=0x12340000+page;
     struct observed before=observe((const void *)mapping);need(before.rss>=PAGE*PAGES/1024,"touched pages resident");
+    (void)status_swap("/proc/self/status");
     if(argc==2 && (!strcmp(argv[1],"--swap") || !strcmp(argv[1],"--swap-tools")))swap_probe(mapping,!strcmp(argv[1],"--swap-tools"));
     if(argc==2 && !strcmp(argv[1],"--tools"))pmap_probe(before.start);
     need(!munmap((void *)mapping,PAGE*PAGES),"mapping cleanup");

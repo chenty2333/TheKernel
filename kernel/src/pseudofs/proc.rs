@@ -1654,7 +1654,7 @@ fn task_status(
 ) -> VfsResult<String> {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
-    let (vm_size_kb, vm_rss_kb, locked_kb) = {
+    let (vm_size_kb, vm_rss_kb, locked_kb, swapped_kb) = {
         let aspace_handle = proc_data.aspace();
         let aspace = aspace_handle.lock();
         let vm_size = aspace
@@ -1666,6 +1666,7 @@ fn task_status(
             vm_size / 1024,
             aspace.resident_user_bytes() / 1024,
             aspace.locked_bytes() / 1024,
+            aspace.total_swapped_bytes() / 1024,
         )
     };
     let state = task_state(task);
@@ -1726,7 +1727,7 @@ fn task_status(
         VmSize:\t{} kB\n\
         VmRSS:\t{} kB\n\
         VmLck:\t{} kB\n\
-        VmSwap:\t0 kB\n\
+        VmSwap:\t{} kB\n\
         Threads:\t{}\n\
         NoNewPrivs:\t{}\n\
         Seccomp:\t{}\n\
@@ -1759,6 +1760,7 @@ fn task_status(
         vm_size_kb,
         vm_rss_kb,
         locked_kb,
+        swapped_kb,
         threads,
         cred.no_new_privs() as u8,
         seccomp.mode() as u8,

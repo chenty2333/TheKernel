@@ -9,6 +9,12 @@ fn swapped_bytes<T>(entries: &BTreeMap<VirtAddr, T>, start: VirtAddr, size: usiz
 }
 
 impl AddrSpace {
+    /// Per-mm swap occupancy. CLONE_VM shares this registry; fork copies its
+    /// PTE owners without multiplying the swap area's unique occupied slots.
+    pub(crate) fn total_swapped_bytes(&self) -> usize {
+        self.swapped.len() * PAGE_SIZE_4K
+    }
+
     /// VMA ranges are page-aligned. Count owned software swap leaves rather
     /// than interpreting hardware table holes as swapped memory.
     pub(crate) fn swapped_bytes_in_range(&self, start: VirtAddr, size: usize) -> usize {
