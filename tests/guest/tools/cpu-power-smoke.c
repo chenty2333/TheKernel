@@ -51,4 +51,19 @@ static int idle(void) {
     errno=0; int result=write(fd,"2\n",2); close(fd); if(result!=-1||errno!=EINVAL) return 1;
     puts("THEKERNEL_CPU_IDLE_OK");return 0;
 }
-int main(void) { return idle(); }
+static int frequency(void) {
+    char buf[256],path[256];
+    unsigned long long supported=number(ROOT "/cpu0/cpufreq_supported");
+    if(supported==~0ULL) return 1;
+    if(!supported) {
+        errno=0; int fd=open(ROOT "/cpu0/cpufreq/scaling_driver",O_RDONLY);
+        if(fd>=0||errno!=ENOENT) { if(fd>=0) close(fd); return 1; }
+        puts("CPU_FREQUENCY unsupported (no firmware-enabled HWP frequency reference)"); return 0;
+    }
+    if(text(ROOT "/cpu0/cpufreq/scaling_driver",buf,sizeof(buf))||strcmp(buf,"intel_pstate\n")) return 1;
+    const char *fields[]={"cpuinfo_min_freq","scaling_min_freq","scaling_max_freq","cpuinfo_max_freq"};
+    unsigned long long previous=0;
+    for(unsigned i=0;i<4;i++) { snprintf(path,sizeof(path),ROOT "/cpu0/cpufreq/%s",fields[i]); unsigned long long value=number(path); if(value==~0ULL||value<previous) return 1; previous=value; }
+    puts("CPU_FREQUENCY supported"); return 0;
+}
+int main(void) { return idle()||frequency(); }

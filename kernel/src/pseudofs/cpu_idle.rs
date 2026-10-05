@@ -92,6 +92,7 @@ pub fn register(fs: &Arc<SimpleFs>, root: &mut DirMapping) {
         );
         cpu_dir.add("cpuidle", SimpleDir::new_maker(fs.clone(), Arc::new(idle)));
         cpu_dir.add("online", SimpleFile::new_regular(fs.clone(), || Ok("1\n")));
+        super::cpu_frequency::register(cpu, fs, &mut cpu_dir);
         root.add(
             format!("cpu{cpu}"),
             SimpleDir::new_maker(fs.clone(), Arc::new(cpu_dir)),

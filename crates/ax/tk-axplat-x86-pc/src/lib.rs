@@ -178,3 +178,6 @@ pub fn allocate_msi(handler: axplat::irq::IrqHandler) -> Option<(u64, u32, usize
 
 /// Opt-in Intel MWAIT idle state selection and counters.
 pub mod cpuidle;
+
+/// Explicit firmware-enabled HWP frequency policy and effective frequency.
+pub mod cpufreq;

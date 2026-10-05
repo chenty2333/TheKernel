@@ -939,7 +939,7 @@ mod boot_command_line_tests {
 
 /// CPU power-management facts; hosted builds expose unsupported hardware.
 #[cfg(any(feature="defplat",feature="pmu",feature="hwp-uclamp"))]
-pub mod cpu_power { pub use axplat_x86_pc::cpuidle; }
+pub mod cpu_power { pub use axplat_x86_pc::{cpuidle,cpufreq}; }
 
 /// Scheduler idle entry with IRQs disabled. Preserves HLT unless opted in.
 pub fn cpu_idle_wait() {

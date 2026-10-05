@@ -68,6 +68,7 @@ impl InitIf for InitIfImpl {
         crate::acpi::report();
         crate::power::init_later();
         crate::cpuidle::init_current();
+        crate::cpufreq::init_current();
         report_cpu_state(cpu_id);
     }
 
@@ -86,6 +87,7 @@ impl InitIf for InitIfImpl {
         #[cfg(feature = "pmu")]
         init_pmu_fleet_member();
         crate::cpuidle::init_current();
+        crate::cpufreq::init_current();
         report_cpu_state(cpu_id);
     }
 }

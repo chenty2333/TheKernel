@@ -5871,3 +5871,6 @@ mod exited_queue_tests {
         assert_eq!(task.exit_queue_fault(), None);
     }
 }
+
+#[cfg(feature="hwp-uclamp")]
+pub(crate) fn refresh_cpu_power_policy(cpu: usize) { refresh_hwp_clamp_for_cpu(cpu); }

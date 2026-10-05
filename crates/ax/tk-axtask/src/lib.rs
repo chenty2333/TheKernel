@@ -108,3 +108,7 @@ cfg_if::cfg_if! {
         pub use self::api_s::{can_block_current, sleep, sleep_until, yield_now};
     }
 }
+
+/// Publish an explicit sysfs HWP policy on its owner CPU after commit.
+#[cfg(feature="hwp-uclamp")]
+pub fn refresh_cpu_power_policy(cpu: usize) { run_queue::refresh_cpu_power_policy(cpu); }
