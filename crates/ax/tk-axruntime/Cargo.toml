@@ -31,6 +31,7 @@ repository.workspace = true
 alloc = ["dep:axalloc"]
 axdriver = ["dep:axdriver"]
 default = []
+platform-services = []
 display = [
     "axdriver",
     "dep:axdisplay",

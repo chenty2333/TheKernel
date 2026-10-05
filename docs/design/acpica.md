@@ -183,3 +183,24 @@ and native failure/recovery tests. None is implied by S5 or offline AML success.
 [FreeBSD integration](https://github.com/freebsd/freebsd-src/blob/main/sys/dev/acpica/acpi.c),
 [Haiku integration](https://github.com/haiku/haiku/blob/master/src/add-ons/kernel/bus_managers/acpi/BusManager.cpp).
 These OS integrations were consulted for architecture, not copied.
+
+
+## Default-path follow-up: bootstrap phases
+
+The pre-probe service boundary now uses the BSP's initialized heap/mappings,
+scheduler, constructors, IRQ broker and timer. Firmware services finish before
+the initial PCI probe. AP startup retains its original post-device boundary;
+this is not a disabled scheduler, polling substitute, skipped accounting check
+or second runtime. A separate non-inlined device-subsystem phase limits the
+long-lived boot frame. Init no longer starts ACPICA after the user task is built.
+
+Reproduction isolated the invalid ordering: bringing AP scheduling ahead of
+device initialization also crashed the `acpi=static` control, while the BSP-only
+pre-probe phase with the eventual full SMP4 machine passed all 69 guest cases.
+The UP early-AP-order experiment booted and ran but failed its SMP-dependent
+namespace case; it was not accepted as a full pass. GDB observed failed current
+validation in an AP timer and separate invalid instruction-pointer faults; the
+precise corruption origin in that discarded early-AP order is not proven.
+The shipped phase restores the supported AP boundary, leaves all scheduler
+assertions unchanged, and has real SMP4 runtime validation. ACPICA is still
+opt-in until routing/INTx and default-native ABI acceptance finish.

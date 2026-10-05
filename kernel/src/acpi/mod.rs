@@ -132,3 +132,14 @@ fn disable_storming_gpes() {
         warn!("acpica: SCI storm; delivery stays masked (GPE disable unavailable)");
     }
 }
+
+
+struct FirmwareServices;
+#[crate_interface::impl_interface]
+impl axruntime::PlatformServices for FirmwareServices {
+    fn before_pci_probe() {
+        #[cfg(target_os = "none")]
+        axhal::console::write_tty_bytes(b"THEKERNEL_PLATFORM_SERVICES_READY\n");
+        init();
+    }
+}

@@ -307,7 +307,6 @@ pub fn init(args: &[String], envs: &[String]) {
         .expect("Failed to prepare init scheduler state");
     // Firmware ownership and event handlers must be ready before userspace
     // can request powerdown; init task IDs are already reserved at this point.
-    crate::acpi::init();
     let task_publication =
         reserve_prepared_task(task.clone()).expect("Failed to reserve init runqueue publication");
     let task_table_admission =

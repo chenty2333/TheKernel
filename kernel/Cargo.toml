@@ -78,7 +78,7 @@ axlog.workspace = true
 ratelimit.workspace = true
 axmm.workspace = true
 axnet.workspace = true
-axruntime = { workspace = true, features = ["irq-exit"] }
+axruntime = { workspace = true, features = ["irq-exit", "platform-services"] }
 axsync.workspace = true
 axtask = { workspace = true, features = ["fp-simd", "pkeys", "scheduler-observer"] }
 
