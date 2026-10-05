@@ -141,3 +141,13 @@ src/tc.rs:
   Original additional DKL before-image readout uses the upstream HDMI setup
   register layout. It is not an upstream get_config or ownership-acquire port.
   Power/cold must already be pinned; no cold unblock or ownership write.
+
+src/ddi.rs:
+  drivers/gpu/drm/i915/display/intel_ddi.c:
+  intel_ddi_read_func_ctl selected HDMI/DVI control fields,
+  intel_ddi_read_func_ctl_dvi (display13 four lanes),
+  icl_ddi_tc_is_clock_enabled, icl_ddi_tc_get_pll
+  Copyright © 2012 Intel Corporation.
+  intel_display_regs.h selected fields: Copyright © 2025 Intel Corporation.
+  DP software state, audio and infoframe get_config remain separate; unknown
+  selections do not grant a DKL PLL. Combined raw clock evidence is original.

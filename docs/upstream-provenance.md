@@ -651,3 +651,14 @@ fallible MMIO prefixes checked for restoration/quarantine on all four ports.
 48 compiled-C readiness/ownership/FIA states and exact read offsets agree.
 This is not `adlp_tc_phy_get_hw_state` (which acquires power/cold), nor complete
 HPD-derived TC-mode discovery or encoder fastboot admission.
+
+DDI readout slice: selected HDMI/DVI fields in `intel_ddi_read_func_ctl`,
+display13 four-lane `intel_ddi_read_func_ctl_dvi`, `icl_ddi_tc_is_clock_enabled`
+and `icl_ddi_tc_get_pll` → `src/ddi.rs`. TGL port encoding uses `(port+1)<<27`;
+TC1=PORT_D, selector0x4610c. TC gates are bits12/13/14/**21**, not four adjacent
+bits. Unknown clock muxes return no PLL, never a guessed DKL path. Only HDMI
+mode interprets scrambling/high-TMDS flags; DVI lane count is four regardless
+of the DP width field. Combined raw clock evidence is original glue; full
+encoder/DP/audio/infoframe state is not claimed by the control decoder.
+4096 compiled-C HDMI/DVI BPC/sync/scrambling and TC mux/gate states/read traces
+agree; missing/dark domains and unknown encodings are covered.

@@ -8,6 +8,7 @@
 pub mod bios;
 pub mod cdclk;
 pub mod color;
+pub mod ddi;
 pub mod device;
 pub mod display;
 pub mod dkl_phy;

@@ -174,3 +174,13 @@ lane groups plus UC status), restores/verifies HIP and quarantines uncertain
 restoration. 48 compiled-C predicate/FIA state/read-offset cases and all43
 fault prefixes on four ports pass. No TC cold/ownership acquisition was enabled;
 HPD mode selection and complete DDI/encoder admission still follow.
+
+### DDI clock/control discovery
+
+HDMI/DVI control fields and TC clock/PLL route getters now follow display13
+source. TC4 gate is bit21 (TC1–3 are12–14), and TC1's DDI mux is0x4610c.
+Unknown mux/BPC/port encodings retain raw evidence but cannot authorize native
+ownership. DVI ignores HDMI scrambling bits; HDMI/DVI have four lanes regardless
+of the DP width field. Full encoder/audio/infoframe get_config remains outside
+this control-only slice. 4096 compiled-i915 states/read traces and three model
+regressions pass. No runtime DDI/clock writes or hardware validation introduced.

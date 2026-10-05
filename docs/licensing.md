@@ -299,3 +299,8 @@ modular-FIA and legacy pin/lane fields (2019 Intel), with display/DKL/MG registe
 facts (2025/2022 Intel) into `tc.rs`. The 2019 copyright is added to the bundled
 MIT grant and source/NOTICE. Extra DKL before-image collection is original glue,
 not an imported PHY connect/ownership implementation or GPL code.
+
+DDI discovery translates selected HDMI/DVI control fields and TC clock-enabled /
+PLL-selection helpers from MIT `intel_ddi.c` (2012 Intel), with selected MIT
+`intel_display_regs.h` fields (2025 Intel), into `ddi.rs`. Source, NOTICE and the
+bundled grant retain attribution. No DDI programming or DP software core added.
