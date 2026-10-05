@@ -138,6 +138,18 @@ pub trait DisplayAdapter: Send + Sync {
         allocation_owner: Arc<dyn Send + Sync>,
     ) -> DrmResult<Arc<dyn GemBacking>>;
     fn present(&self, scanout: Scanout) -> DrmResult<Arc<Fence>>;
+    /// Hardware adapters reject unsupported state before the core admits a
+    /// commit. A fixed firmware link cannot silently claim DPMS/color changes.
+    fn validate_atomic_state(&self, active: bool, dpms_on: bool, gamma_lut: bool) -> DrmResult<()> {
+        let _ = (active, dpms_on, gamma_lut);
+        Ok(())
+    }
+    /// Native adapters report a hardware frame counter. `None` retains the
+    /// existing virtual/software cadence; a stationary native counter must not
+    /// manufacture vblank events or complete an atomic commit.
+    fn hardware_vblank_counter(&self) -> DrmResult<Option<u32>> {
+        Ok(None)
+    }
     /// A lock-bounded snapshot. Implementations must not drain queues or
     /// advance fences while reporting these values.
     fn metrics(&self) -> AdapterMetrics {
@@ -259,6 +271,7 @@ pub(crate) struct DeviceState {
     pub(crate) framebuffers: BTreeMap<FramebufferId, Framebuffer>,
     pub(crate) next_framebuffer: FramebufferId,
     pub(crate) vblank: u64,
+    hardware_vblank: Option<u32>,
     /// One software gamma LUT for the sole virtual CRTC, stored as RGB
     /// triplets in the legacy DRM 16-bit component representation.
     pub(crate) gamma_lut: Vec<u16>,
@@ -389,6 +402,7 @@ impl DrmDevice {
                 framebuffers: BTreeMap::new(),
                 next_framebuffer: 1,
                 vblank: 0,
+                hardware_vblank: None,
                 gamma_lut: (0..256)
                     .flat_map(|index| {
                         let value = (index * 257) as u16;
@@ -1181,8 +1195,10 @@ fn vblank_worker(device: Arc<DrmDevice>) {
             device.worker_failed();
             return;
         }
-        if device.advance_vblank().is_err() {
-            device.cancel_pending_commits();
+        match device.advance_vblank() {
+            Err(DrmError::DeviceLost) => return,
+            Err(_) => device.cancel_pending_commits(),
+            Ok(()) => {}
         }
     }
 }
@@ -1194,11 +1210,36 @@ impl DrmDevice {
     /// transition separate also lets host unit tests exercise the real commit
     /// completion path without pretending the dummy platform has a clock.
     pub(crate) fn advance_vblank(&self) -> DrmResult<()> {
-        self.refresh_display_config()?;
+        if let Err(error) = self.refresh_display_config() {
+            if error == DrmError::DeviceLost {
+                self.worker_failed();
+            }
+            return Err(error);
+        }
+        let counter = match self.adapter.hardware_vblank_counter() {
+            Ok(counter) => counter,
+            Err(error) => {
+                self.worker_failed();
+                return Err(error);
+            }
+        };
         let (sequence, job, epoch, events) = {
             let mut state = self.state.lock();
-            state.vblank = state.vblank.wrapping_add(1);
-            self.telemetry.vblanks.fetch_add(1, Ordering::Relaxed);
+            let frames = if let Some(counter) = counter {
+                let previous = state.hardware_vblank.replace(counter);
+                let Some(previous) = previous else {
+                    return Ok(());
+                };
+                let delta = counter.wrapping_sub(previous);
+                if delta == 0 {
+                    return Ok(());
+                }
+                u64::from(delta)
+            } else {
+                1
+            };
+            state.vblank = state.vblank.wrapping_add(frames);
+            self.telemetry.vblanks.fetch_add(frames, Ordering::Relaxed);
             let sequence = state.vblank;
             let mut events = Vec::new();
             while state

@@ -1,8 +1,8 @@
 # N305 下次显示/GPU/HDMI 音频验证 — Codex D
 
 2026-10-05。**全部未在硬件上验证；这一轮不启动真机、PXE服务或写USB/NVMe。**
-下面是未来用户执行的步骤，不是已验证结果。当前 TC1 编程/回滚、fastboot
-完整接管和GT/HDMI audio尚未实现，不能照本文件强行启用未实现阶段。
+下面是未来用户执行的步骤，不是已验证结果。受限 TC1/TC2 固件等价 fastboot/KMS
+调用链已接通并做主机模型测试；TC 模式重编程、GT、HDMI audio 仍未实现。
 
 ## 基线和板级资料
 
@@ -19,20 +19,31 @@
 4. TheKernel尚没有新VBT导出节点。添加节点时应返回缓存的原始VBT字节且只读，
    不能在每次read时重触发映射/硬件读取，也不能在共享伪文件系统里大改。
 
-## 只读时序 / fastboot 门槛
+## 固件等价 fastboot / 原生 KMS（未在硬件上验证）
 
-`intel.modeset=1` 仍由旧事务只接受exact D0、single pipe-A combo HDMI。真实TC1配置
-应被拒绝且固件画面保持更新；**REFUSED 是正确安全结果，不是原生显示成功**。
-新的MIT timing adapter仅在旧事务已证明live powered pipe A后读七个timing
-寄存器，打印 `intel-i915-readout`；包括display13 SCL对vblank start的覆盖。
-这条日志只是partialreadout，不能证明fastboot或正确的portclock/plane归属。
+先保持原有只读启动基线。未来由用户单独启用 `intel.modeset=1`，不加
+`intel.gt=1`。仅 exact N305 display D0、single pipe A、VBT-confirmed TC1/TC2
+legacy HDMI、线性 XR24、无颜色/缩放/DSC/VRR 等状态可进入；其他配置应明确
+REFUSED，固件 console 继续可读，不算原生显示成功。驱动读取本次启动的
+ASLS/VBT、PLL/PHY/pipe/plane/WM；不会把旧 Linux capture 当本次固件状态。
 
-完整TC readout实现后，先核对native firmware实际的：pipe/transcoder/DDI TC1、
-电源、TC legacy mode/PLL route和锁定、完整时序/portclock/CDCLK、plane
-format/modifier/stride/offset/SURFLIVE、scaler/color/WM、GGTT physical backing。
-如果全部与目标1080p60和可保活的固件framebuffer一致，fastboot应**零mode
-重编程**，保留图像且文字可更新。只有分辨率相同、扫描线变化或读到寄存器
-数值不构成完整等价/ownership证据。
+1. 看到 `intel-fastboot: native fixed-mode KMS registered`，确认模式与当前
+   firmware/GOP 完全相同（可能4K30，不强制切1080p60）。没有 PLL/link/timing/
+   WM 重编程。日志只说明软件接管判断，仍需用户确认屏幕与文字实际正常。
+2. fbdev/console 使用 DRM dumb GEM。确认 console 的新原生 SURFLIVE 地址和
+   hardware frame counter 持续变化；原始 firmware GGTT PTE 保留。
+3. 启动未修改 Weston 的 DRM + pixman 后端，确认真实图像更新与连续翻页。
+   KMS/atomic fence 要在 SURFLIVE 和后续新硬件帧后完成，不能只看 ioctl=0。
+   关闭 Weston/返回文字 VT，确认既有 fbdev atomic restore/repaint 返回可读
+   console。此步骤不证明 iris/ANV/GPU渲染。
+4. DPMS、gamma、cursor、缩放、不同 pitch/格式/模式请求目前应返回不支持，
+   不能出现成功返回却没有实际效果。HPD IRQ 和真正中断时间戳尚未接通；
+   当前 vblank 是任务轮询硬件帧计数，不制造软件帧。
+5. fastboot 不使用 combo-only 的 `intel.modeset.fail_write` 注入参数，带此
+   参数会在写之前拒绝。当前失败恢复已在主机模型验证：plane store 可能
+   已落地，恢复前一 surface 并看到 fresh frame 后才释放新 GGTT；恢复不确定
+   则保留 DMA owners 并终止后续提交。真机故障注入入口尚未开放，不强行用
+   旧参数测试 TC。观察画面是未来真机回滚验收的必要部分。
 
 ## TC1 原生模式与失败恢复（实现前不执行）
 

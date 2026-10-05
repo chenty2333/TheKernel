@@ -569,6 +569,16 @@ impl DrmFile {
     pub(crate) fn driver_name(&self) -> &'static str {
         self.device.adapter.driver_name()
     }
+    pub(crate) fn validate_adapter_state(
+        &self,
+        active: bool,
+        dpms_on: bool,
+        gamma_lut: bool,
+    ) -> DrmResult<()> {
+        self.device
+            .adapter
+            .validate_atomic_state(active, dpms_on, gamma_lut)
+    }
     pub(crate) fn fixed_mode(&self) -> Option<Mode> {
         self.device.fixed_mode
     }

@@ -83,8 +83,10 @@
 
 mod clk;
 mod connect;
+mod dma;
 pub(crate) mod debugfs;
 pub(crate) mod fb;
+mod fastboot;
 mod firmware_scanout;
 mod firmware_snapshot;
 mod gmbus;
@@ -113,6 +115,8 @@ mod timing;
 mod testbus;
 
 use alloc::{string::String, vec::Vec};
+#[cfg(target_os = "none")]
+use alloc::sync::Arc;
 
 use spin::Mutex;
 
@@ -229,6 +233,8 @@ static FIRMWARE_STATE: Mutex<Vec<(pci::Bdf, firmware_snapshot::Snapshot)>> = Mut
 /// at all -- so it belongs next to the modeset in the file a person reads back,
 /// not only in a boot log that has scrolled away.
 static GTT: Mutex<Option<String>> = Mutex::new(None);
+#[cfg(target_os = "none")]
+static ADDRESS_SPACE: Mutex<Option<(pci::Bdf, Arc<gtt::Gtt>)>> = Mutex::new(None);
 
 /// A value as grouped hexadecimal, the way a register dump is written down.
 ///
@@ -324,22 +330,17 @@ pub(crate) fn bring_up_at_boot() {
     }
 }
 
-/// All allocation/capture precedes the first write. No after-boot programming
-/// bypasses this transaction; hotplug modesetting remains a separate follow-up.
+/// One allocator for display and the separately opted-in GT, never two
+/// independently locked cursors over the same hardware PTE array.
 #[cfg(target_os = "none")]
-fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, String> {
-    let supported = REPORT.lock().as_ref().is_some_and(|report| {
-        report
-            .displays
-            .iter()
-            .any(|found| found.info.bdf == bdf
-                && i915_port::native_device_supported(found.info.vendor_id,
-                    found.info.device_id, found.info.revision))
-    });
-    if !supported {
-        return Err(String::from(
-            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0 exact display D0; no writes",
-        ));
+fn shared_ggtt(bdf: pci::Bdf) -> Result<Arc<gtt::Gtt>, String> {
+    let mut owner = ADDRESS_SPACE.lock();
+    if let Some((owned, gtt)) = &*owner {
+        return if *owned == bdf {
+            Ok(gtt.clone())
+        } else {
+            Err(String::from("different GGTT device; no writes"))
+        };
     }
     let (_, aperture, physical) = mapped_facts(bdf)
         .ok_or_else(|| String::from("Intel mapped facts unavailable; no writes"))?;
@@ -357,7 +358,37 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
     ) {
         return Err(String::from("Intel GGTT size not measured; no writes"));
     }
-    let gtt = gtt::Gtt::map(physical, bar_len, size).map_err(|e| e.describe())?;
+    let gtt = Arc::try_new(gtt::Gtt::map(physical, bar_len, size).map_err(|e| e.describe())?)
+        .map_err(|_| String::from("GGTT owner allocation failed; no writes"))?;
+    *owner = Some((bdf, gtt.clone()));
+    Ok(gtt)
+}
+
+/// All allocation/capture precedes the first write. No after-boot programming
+/// bypasses this transaction; hotplug modesetting remains a separate follow-up.
+#[cfg(target_os = "none")]
+fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, String> {
+    let supported = REPORT.lock().as_ref().is_some_and(|report| {
+        report
+            .displays
+            .iter()
+            .any(|found| found.info.bdf == bdf
+                && i915_port::native_device_supported(found.info.vendor_id,
+                    found.info.device_id, found.info.revision))
+    });
+    if !supported {
+        return Err(String::from(
+            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0 exact display D0; no writes",
+        ));
+    }
+    let gtt = shared_ggtt(bdf)?;
+    // TC fastboot has its own restricted transaction. It never routes TC
+    // through the old combo-PHY modeset/rollback sequence.
+    let function = window.read(regs::ddi::TRANS_DDI_FUNC_CTL_A).unwrap_or(0);
+    if matches!(intel_display::ddi::decode_function_control(function).port,
+        Some(intel_display::device::Port::Tc1 | intel_display::device::Port::Tc2)) {
+        return fastboot::init(bdf, *window, gtt);
+    }
     let image = gtt.checkpoint().map_err(|e| e.describe())?;
     *FIRMWARE_STATE.lock() = alloc::vec![(bdf, firmware_snapshot::Snapshot::capture(window))];
     let tx = rollback::Transaction::begin(window, &gmbus::MonotonicTimer).map_err(|e| {

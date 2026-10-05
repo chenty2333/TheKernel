@@ -16,6 +16,7 @@ pub mod dpll_mgr;
 pub mod hdmi;
 pub mod hdmi_packet;
 pub mod opregion;
+pub mod pipe_config;
 pub mod scaler;
 pub mod tc;
 pub mod universal_plane;

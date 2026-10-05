@@ -150,19 +150,11 @@
 //!
 //! ## What this module deliberately does not do
 //!
-//! * **It does not invalidate any translation cache.**  `[I915]` writes
-//!   `GEN12_GUC_TLB_INV_CR` (`0xcee8`, bit 0) after every PTE update
-//!   (`gt/intel_ggtt.c:237-252`); that register is below `0x40000`, the range
-//!   the reference's §2.1 model assigns to `FORCEWAKE_GT`
-//!   (`intel_uncore.c`, `__gen12_fw_ranges`, `GEN_FW_RANGE(0xb400, 0xcfff,
-//!   FORCEWAKE_GT)`), and this kernel implements no forcewake handshake and
-//!   refuses to address registers outside [`regs::FORCEWAKE_FREE_BANDS`].  A
-//!   freshly written entry for an address the display engine has never walked is
-//!   *expected* to be picked up without one, but no source states that, and the
-//!   vendor driver does not rely on it: it invalidates after the first binding
-//!   of an object as well as after an update (`gen8_ggtt_insert_entries` ends
-//!   in `ggtt->invalidate(ggtt)`, `:497-501`).  See
-//!   `docs/design/intel-scanout.md`.
+//! * **Display-only bindings use uncached GGTT stores.** Local Linux 7.2.3
+//!   `gen8_ggtt_invalidate()` emits a GFX flush only for WC mappings; ADL-N
+//!   uses UC. The GuC invalidate route is selected only for GuC submission.
+//!   No GuC/GT register is written by display-only binding. Runtime GT/GuC
+//!   ownership must coordinate its own invalidation before sharing this table.
 //! * **It does not unmap.**  An aperture range that is released must first be
 //!   cleared out of the display engine's plane register, which belongs to the
 //!   module that programs the plane, and the pages behind it must not go back
@@ -846,6 +838,12 @@ pub(crate) struct Gtt {
     next: Mutex<u64>,
 }
 
+/// A bounded reservation's exact absent PTE before-image, including padding.
+pub(crate) struct Binding {
+    pub(crate) address: u64,
+    before: alloc::vec::Vec<u64>,
+}
+
 /// Exact before-image, including absent PTE bits, not a reconstructed mapping.
 pub(crate) struct Checkpoint {
     entries: alloc::vec::Vec<u64>,
@@ -1171,6 +1169,99 @@ impl Gtt {
             }
         }
         Ok(start)
+    }
+
+    /// Bind fixed, pinned scattered system pages for the native KMS adapter.
+    /// The caller keeps the backing pinned even on an ambiguous PTE failure.
+    /// UC stores and full readback implement ADL-N's non-GuC GGTT route.
+    pub(crate) fn bind_pages(&self, physical: &[u64]) -> Result<Binding, GttError> {
+        if physical.is_empty() {
+            return Err(GttError::EmptyRun);
+        }
+        if let ApertureSize::Unmodelled { raw } = self.size {
+            return Err(GttError::ApertureSizeUnmodelled { raw });
+        }
+        let mut before = alloc::vec::Vec::new();
+        let count = physical
+            .len()
+            .checked_add(SCANOUT_PADDING_ENTRIES as usize)
+            .ok_or(GttError::CheckpointUnavailable)?;
+        before
+            .try_reserve_exact(count)
+            .map_err(|_| GttError::CheckpointUnavailable)?;
+        for &page in physical {
+            Pte::encode(page)?;
+        }
+        let mut next = self.next.lock();
+        let address = self.reserve_run(&mut next, physical.len() as u64)?;
+        let first = self.index_of(address)?;
+        for i in first..first + count {
+            before.push(self.array.read(i));
+        }
+        // Complete before-image exists before the first write. If a readback
+        // fails, this run has never been exposed to a consumer; restore it now.
+        for i in 0..count {
+            let value = if i < physical.len() {
+                Pte::encode(physical[i])?.raw()
+            } else {
+                self.scratch.raw()
+            };
+            self.array.write(first + i, value);
+        }
+        for i in 0..count {
+            let wrote = if i < physical.len() {
+                Pte::encode(physical[i])?.raw()
+            } else {
+                self.scratch.raw()
+            };
+            let read = self.array.read(first + i);
+            if read != wrote {
+                for (j, &value) in before.iter().enumerate().rev() {
+                    self.array.write(first + j, value);
+                }
+                for (j, &wrote) in before.iter().enumerate() {
+                    let read = self.array.read(first + j);
+                    if read != wrote {
+                        return Err(GttError::ReadBackMismatch {
+                            index: first + j,
+                            wrote,
+                            read,
+                        });
+                    }
+                }
+                return Err(GttError::ReadBackMismatch {
+                    index: first + i,
+                    wrote,
+                    read,
+                });
+            }
+        }
+        Ok(Binding { address, before })
+    }
+
+    /// # Safety
+    /// Every hardware consumer has stopped using this binding, proved with a
+    /// fresh latched scanout/frame or an engine idle/reset. Backing stays pinned
+    /// until all PTE readbacks succeed. No GT/GuC consumer may race this update.
+    pub(crate) unsafe fn release_binding(&self, binding: &Binding) -> Result<(), GttError> {
+        let mut next = self.next.lock();
+        let first = self.index_of(binding.address)?;
+        for (i, &value) in binding.before.iter().enumerate().rev() {
+            self.array.write(first + i, value);
+        }
+        for (i, &wrote) in binding.before.iter().enumerate() {
+            let read = self.array.read(first + i);
+            if read != wrote {
+                return Err(GttError::ReadBackMismatch {
+                    index: first + i,
+                    wrote,
+                    read,
+                });
+            }
+        }
+        // Search still checks every present entry, including live bindings.
+        *next = self.aperture.saturating_sub(RESERVED_HIGH_APERTURE);
+        Ok(())
     }
 
     /// Find a block of `pages` entries plus the padding that follows them, all

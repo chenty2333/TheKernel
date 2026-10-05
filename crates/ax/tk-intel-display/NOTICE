@@ -179,3 +179,14 @@ five HDMI packet-size constants, and the HDMI IEEE OUI constant. All are
 32–34 or28 normalized characters; no driver body/prose is copied into Rust.
 Current crate totals are12 code matches at25 /2 at40; no fenced/comment/range
 matches. Whole crates/ax counts are reconciled in CI, without scan exemptions.
+
+src/pipe_config.rs:
+  intel_display.c: bdw_get_pipe_misc_output_format, selected hsw_get_pipe_config
+  scalar fields, Copyright © 2006-2007 Intel Corporation;
+  intel_vrr.c: intel_vrr_get_config display13 branch,
+  Copyright © 2020 Intel Corporation;
+  intel_{display,vrr,vdsc}_regs.h selected fields,
+  Copyright © 2025 / 2024 / 2023 Intel Corporation. LICENSE-MIT applies.
+  DSC controls are discovery/refusal evidence, not a complete PPS decoder.
+  Kernel fastboot adapter now calls this and the existing plane, color, scaler,
+  watermark, TC/PLL/DDI/HDMI readouts for a fixed linear TC HDMI KMS path.

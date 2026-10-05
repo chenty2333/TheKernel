@@ -200,3 +200,46 @@ HDMI-library field/rejection cases pass; dark/missing MMIO, every packet
 truncation, malformed headers/checksums, ECC-hole and bounded SPD tests pass.
 No packet writes, runtime backend, complete firmware equivalence or native KMS
 were enabled by this slice. Remaining pipe/global and GGTT proof still follow.
+
+### Runtime-linked fixed-mode N305 fastboot
+
+The TC1/TC2 branch of `bring_up_native` now uses the existing DRM/KMS/atomic
+framework rather than the combo-only modeset transaction. Its runtime chain is:
+ASLS/OpRegion/VBT legacy HDMI route → already-on PW1/PW2/PWA/DDI/AUX request
+pin → twice-stable pipe/plane/PLL/PHY/DDI/color/scaler/WM/HDMI capture → GOP
+BAR2 aperture correspondence and stolen-memory PTE/allocator exclusion → native
+fixed-mode KMS → pinned scattered dumb-GEM GGTT binding → primary SURF arm →
+SURFLIVE and two fresh hardware frame observations → fence/event publication.
+No clock, link, timing, pitch, color or WM programming is needed for equivalent
+firmware geometry. The measured firmware mode is the only advertised mode;
+it is not silently replaced by the capture's EDID mode. Native hardware frame
+counts gate the existing vblank worker; events have task-observation timestamps,
+not IRQ timestamps. Existing fbdev/master/VT restoration submits its own GEM
+through the same atomic path. DPMS, gamma, cursor, overlays, DPT/CCS/tiled/color,
+scaling, DSC/joiner, VRR, other pipes/ports, high-TMDS scrambling and nonmatching
+geometry/pitch are refused. Firmware PTEs are never replaced.
+
+New GGTT bindings use UC stores/readback, matching `gen8_ggtt_invalidate` on
+this non-GuC ADL-N route; the old unconditional-GuC-invalidate description was
+incorrect. PTE updates are not a grant to access GT MMIO. Bound pages retain a
+fixed-view pin. Plane arm failure restores the previous surface and requires
+fresh scanout progression before releasing the new binding. Uncertain DMA,
+PTE restoration or old-buffer retirement retains backing and terminally closes
+submission. Already-on power pin failure restores only its driver request
+bits, preserving BIOS/debug requestors. No physical picture is established by
+MMIO progression. Native boot/Weston, VT return, fault-injected rollback and GT
+copy remain physical acceptance items; host models are explicitly not hardware.
+
+GT execution does not depend on complete TC modeset, HPD, DMC or HDMI audio.
+Next software milestone is the independently guarded `intel.gt=1` BCS path:
+forcewake/engine reset, PPGTT/LRC/execlists, validated copy and breadcrumb,
+CPU-side exact result/guards; only then GEM/execbuf and RCS/Mesa integration.
+
+DMA admission is part of that runtime chain: read the boot RSDP/root and actual
+DMAR graphics DRHD GSTS. Direct physical RAM bindings require translation-off
+on the dedicated iGPU unit (or its include-all unit); active or unknown remapping
+is refused. Other devices' DMA domains are neither modified nor needlessly
+queried. Table/scope parsing is bounded and checksummed; firmware-pointer reads
+exclude all usable RAM. This does not implement an IOMMU mapping service.
+The single GGTT allocator is shared with future GT work, avoiding two cursors
+racing over the same page table. ADL-N's 39-bit DMA limit is checked per page.

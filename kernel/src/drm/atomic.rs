@@ -306,6 +306,7 @@ fn propose_with_mode(
     {
         return Err(DrmError::Invalid);
     }
+    file.validate_adapter_state(next.active, next.dpms == DPMS_ON, next.gamma_lut_blob != 0)?;
     let fb = if next.active {
         if !r.connector.connected {
             return Err(DrmError::NotFound);
@@ -449,7 +450,9 @@ fn matches_object(r: &super::kms::KmsResources, object: u32, prop: u32) -> bool 
         | property::CRTC_MODE_ID
         | property::CRTC_GAMMA_LUT
         | property::CRTC_OUT_FENCE_PTR => object == r.crtc.id,
-        _ => object == r.primary_plane_id || (r.cursor_plane_id != 0 && object == r.cursor_plane_id),
+        _ => {
+            object == r.primary_plane_id || (r.cursor_plane_id != 0 && object == r.cursor_plane_id)
+        }
     }
 }
 

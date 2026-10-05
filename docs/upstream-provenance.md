@@ -686,3 +686,17 @@ Current Intel crate totals:12 code matches at25 /2 at40, no fenced/comment/marke
 matches. Whole crates/ax at25 is now18 fenced lines /15 blocks /4 files and40
 outside fences (29 code); at40 remains0 fenced and17 outside (10 code).
 Other scopes/citation counts unchanged; the baseline is reconciled, not bypassed.
+
+### Native N305 fastboot wiring
+
+`tk-intel-display/src/pipe_config.rs` translates display13
+`intel_display.c::bdw_get_pipe_misc_output_format`, the scalar readout steps of
+`hsw_get_pipe_config`, and `intel_vrr.c::intel_vrr_get_config`, with selected
+MIT `intel_{display,vrr,vdsc}_regs.h` fields. Original Intel copyrights
+2006–2007/2020/2025/2024/2023 and the full MIT grant are in the crate NOTICE and
+LICENSE-MIT. Active DSC/joining is refused, not described as a decoded PPS.
+`kernel/src/drm/intel/fastboot.rs` is original adapter/ownership/recovery policy
+around these translated getters. Power-map and UC non-GuC GGTT ordering refer
+to local i915; the GMS size decoder independently implements published field
+facts, with no GPL text/translation. No GT reset, GuC, DMC, physical display
+acceptance or Mesa rendering is implied by this native KMS adapter.

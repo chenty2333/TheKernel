@@ -318,3 +318,9 @@ all included functions; no GPL or HDMI/audio programming code is introduced.
 Seven new HDMI-oracle scanner matches at25 are conventional min and HDMI size /
 OUI constants. Registered in NOTICE/provenance and CI; at40 counts are unchanged.
 These do not import a C driver, GPL body or private capture fixture.
+
+The native N305 fastboot call chain uses the MIT pipe/VRR readout translation
+in `crates/ax/tk-intel-display/src/pipe_config.rs`; functions/headers and original
+Intel grants are listed in its NOTICE. The kernel adapter, power-request pin,
+GGTT binding ownership and pageflip recovery policy are original MIT code.
+No GPL early-quirks code is copied for the independently decoded GMS facts.
