@@ -219,3 +219,15 @@ the applicable license texts and corresponding GPL/LGPL sources, including
 Alpine's packaging changes (Alpine aports v3.24 APKBUILDs and their referenced
 sources). The version/license lock is not a substitute for corresponding source.
 TheKernel's PTY runner and probe script are original Apache-2.0 work.
+
+## MIT i915 display translation (Codex D, 2026-10-05)
+
+`crates/ax/tk-intel-display` is MIT Rust translated from the individually checked
+MIT files of Linux 7.2.3 i915, not part of the earlier “original Rust only” rule.
+Its `NOTICE` lists the exact included functions; each translation file names
+its source and retains the upstream copyright. `LICENSE-MIT` ships the full
+permission/warranty text. Currently included: ADL-P/N device/stepping selection,
+VBT/BDB routing and HDMI capabilities, and read-only OpRegion VBT discovery.
+No GPL ACPI/trace implementation, DRM C core, GT or firmware is bundled by this
+crate. Private N305 BIOS/EDID captures are external test inputs, not distributed
+MIT fixtures. Hardware behavior remains unverified.

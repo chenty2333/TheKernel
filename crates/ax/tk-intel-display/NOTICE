@@ -1,0 +1,28 @@
+tk-intel-display is a bounded Rust translation of MIT-licensed Linux 7.2.3
+i915 display components. The original grants are preserved in LICENSE-MIT.
+No GPL i915 ACPI/trace code is included. No firmware or private capture data
+is bundled; external capture tests read user-supplied files without modifying them.
+
+src/device.rs:
+  drivers/gpu/drm/i915/display/intel_display_device.c:
+  adl_p_steppings, adl_p_adl_n_steppings, get_pre_gmdid_step, xe_lpd_display
+  Copyright © 2023 Intel Corporation.
+  include/drm/intel/pciids.h (PCI identity facts): Copyright 2013 Intel Corporation.
+src/bios.rs:
+  drivers/gpu/drm/i915/display/intel_bios.c:
+  intel_bios_is_valid_vbt, _get_blocksize, find_raw_section,
+  child_device_expected_size, parse_general_definitions, dvo_port_to_port,
+  map_ddc_pin, intel_bios_encoder_supports_{dvi,hdmi,dp,edp,typec_usb,tbt},
+  intel_bios_hdmi_max_tmds_clock, sanitize_dedicated_external
+  Copyright © 2006 Intel Corporation.
+  drivers/gpu/drm/i915/display/intel_vbt_defs.h: selected byte-layout fields
+  Copyright © 2006-2016 Intel Corporation.
+src/opregion.rs:
+  drivers/gpu/drm/i915/display/intel_opregion.c:
+  intel_opregion_setup VBT discovery and selected header/ASLE byte-layout fields
+  Copyright 2008 Intel Corporation <hong.liu@intel.com>
+  Copyright 2008 Red Hat <mjg@redhat.com>
+
+Only display 13 ADL-P/N semantic paths are included. Safety divergences are
+explicitly documented in each file and README.md. Original TheKernel adapter
+and tests are MIT (Copyright 2026 TheKernel contributors).

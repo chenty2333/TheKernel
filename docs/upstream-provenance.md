@@ -503,3 +503,22 @@ with no copied upstream implementation. Intel xHCI 1.2b §7.6 register/layout
 facts and Linux 7.2.3 `xhci-dbgcap.c`, `xhci-dbgtty.c`, `usb_debug.c` behavior/
 identity facts were consulted. No Linux quotations or translated code were
 introduced. Hardware transport remains unverified; see `docs/design/usb-dbc.md`.
+
+## MIT i915 ADL-P/N display translation (Codex D, 2026-10-05)
+
+Source authority: local Linux 7.2.3, `drivers/gpu/drm/i915/display/`.
+`crates/ax/tk-intel-display/NOTICE` is the function inventory, with the original
+copyright and `LICENSE-MIT`. Current source-to-Rust mapping:
+
+- `intel_display_device.c` → `src/device.rs`: ADL-P/N default display identity
+  and revision/stepping lookup; PCI ID facts from `include/drm/intel/pciids.h`.
+- `intel_bios.c` / `intel_vbt_defs.h` → `src/bios.rs`: VBT/BDB extent validation,
+  section iteration (including MIPI v3 size), general-definition child parsing,
+  XELPD DVO mapping, ADL-P DDC mapping and HDMI/DP/USB-TC flags/caps.
+- `intel_opregion.c` → `src/opregion.rs`: header/ASLE layout facts, external
+  RVDA address/size and mailbox VBT lookup only. No ASLE/ACPI/SWSCI writes.
+
+Other display platforms and old/future BDB semantic versions are omitted.
+Checked byte access, accessed-section validation and stricter ambiguous-input
+admission are documented divergences, not alleged exact equivalence to unsafe
+C inputs. The rest of the D1 inventory is planned, **not translated**.

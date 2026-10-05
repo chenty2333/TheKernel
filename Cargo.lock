@@ -3639,6 +3639,10 @@ name = "tk-axtlb"
 version = "0.1.0"
 
 [[package]]
+name = "tk-intel-display"
+version = "0.1.0"
+
+[[package]]
 name = "tk-kernel"
 version = "0.1.0"
 dependencies = [
