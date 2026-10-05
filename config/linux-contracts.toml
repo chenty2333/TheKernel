@@ -257,7 +257,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_open_tree_attr"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/fsattrs-differential.c:main", "tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["the shared open-tree rule passes the user-namespace capability check and the pathname copy and then reports EOPNOTSUPP, because there is no mount-namespace creation and nsfs publication provider"]
+limitations = ["the shared open-tree rule passes the user-namespace capability check and the pathname copy and then reports EOPNOTSUPP, because there is no mount-namespace creation from a mount tree; a private nsfs descriptor provider now exists but this operation has not been wired to a constructor"]
 
 [[cell]]
 number = 468
@@ -1594,7 +1594,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate flags and request shape; resolve pathname or fd; provider read then output copy"]
 usercopy = ["usercopy:bounded pathname import and initialized output record copy"]
-state = ["state:read retained inode and mount metadata without mutating target"]
+state = ["state:read retained inode and mount metadata without mutating target; namespace targets now belong to a real private nsfs mount with its own allocated filesystem identity, distinct from proc source symlinks"]
 concurrency = ["concurrency:retain resolved location or OFD during provider access"]
 teardown = ["teardown:release request-owned pathname and target references on completion"]
 
@@ -1755,7 +1755,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate flags and request shape; resolve pathname or fd; provider read then output copy"]
 usercopy = ["usercopy:bounded pathname import and initialized output record copy"]
-state = ["state:read retained inode and mount metadata without mutating target"]
+state = ["state:read retained inode and mount metadata without mutating target; namespace targets now report the actual private nsfs filesystem type and identity"]
 concurrency = ["concurrency:retain resolved location or OFD during provider access", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release request-owned pathname and target references on completion"]
 
@@ -1778,7 +1778,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate flags and request shape; resolve pathname or fd; provider read then output copy"]
 usercopy = ["usercopy:bounded pathname import and initialized output record copy"]
-state = ["state:read retained inode and mount metadata without mutating target"]
+state = ["state:read retained inode and mount metadata without mutating target; namespace targets now report the actual private nsfs filesystem type and identity"]
 concurrency = ["concurrency:retain resolved location or OFD during provider access"]
 teardown = ["teardown:release request-owned pathname and target references on completion"]
 
@@ -4608,7 +4608,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics"]
+state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics; proc namespace opens select a live authorized task namespace through an object-backed magic link and retain its actual nsfs file"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -4631,7 +4631,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics"]
+state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics; proc namespace opens select a live authorized task namespace through an object-backed magic link and retain its actual nsfs file"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -4654,7 +4654,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics"]
+state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics; object-backed proc namespace links jump to retained nsfs locations after magic-link/symlink and cross-mount policy; directory-search admission does not add execute permission to a final regular target"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -5229,7 +5229,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:preserve symlink target bytes and return bounded non-NUL-terminated link contents with fd/path origin rules"]
+state = ["state:preserve symlink target bytes and return bounded non-NUL-terminated link contents with fd/path origin rules; proc namespace source links revalidate READ_FSCREDS image access and observe the target task current namespace atomically; namespace descriptor display uses its pinned object label"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -5252,7 +5252,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:preserve symlink target bytes and return bounded non-NUL-terminated link contents with fd/path origin rules"]
+state = ["state:preserve symlink target bytes and return bounded non-NUL-terminated link contents with fd/path origin rules; proc namespace source links revalidate READ_FSCREDS image access and observe the target task current namespace atomically; namespace descriptor display uses its pinned object label"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -5712,7 +5712,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:admit descriptor capabilities and signed offsets, preserve partial transfer progress, serialize shared cursor and provider mutations, and perform requested provider sync/advice; kernel netlink multipart completion includes its signed 32-bit status payload and route destinations exclude CIDR host bits; RTM_NEWLINK carries real per-ifindex 32/64-bit core device statistics; proc smaps Swap counts only mm-owned software swap leaves in the VMA range; vmstat file-swap events count writes at submission and reads at full successful completion; meminfo swap capacity and proc swaps rows report actual registry slots and backing identity; public PID status VmSwap reflects the current mm software-swap registry without adding a maps ptrace gate; namespace-pinned proc TCP tables expose real mandatory consumer columns with open-credential UID mapping, but trailing lifetime/congestion fields and orphan/SYN child rows remain incomplete; TCP inet_diag emits observed state endpoints queues namespace-mapped UID and socket inode, with Linux state-number masks, bound-inactive selection and dump-cookie nonselection; TCP diagnostic timer/retry/probe fields now observe transport state and existing protocol clock without polling; UDP inet_diag/proc tables now observe bound/connected endpoints, owner identity, occupied native payload-ring bytes and corked payload without taking pending errors; native UDP queue bytes are not Linux skb truesize; other diagnostic transports/extensions and orphaned TCP states remain unsupported"]
+state = ["state:admit descriptor capabilities and signed offsets, preserve partial transfer progress, serialize shared cursor and provider mutations, and perform requested provider sync/advice; kernel netlink multipart completion includes its signed 32-bit status payload and route destinations exclude CIDR host bits; RTM_NEWLINK carries real per-ifindex 32/64-bit core device statistics; proc smaps Swap counts only mm-owned software swap leaves in the VMA range; vmstat file-swap events count writes at submission and reads at full successful completion; meminfo swap capacity and proc swaps rows report actual registry slots and backing identity; public PID status VmSwap reflects the current mm software-swap registry without adding a maps ptrace gate; namespace-pinned proc TCP tables expose real mandatory consumer columns with open-credential UID mapping, but trailing lifetime/congestion fields and orphan/SYN child rows remain incomplete; TCP inet_diag emits observed state endpoints queues namespace-mapped UID and socket inode, with Linux state-number masks, bound-inactive selection and dump-cookie nonselection; TCP diagnostic timer/retry/probe fields now observe transport state and existing protocol clock without polling; UDP inet_diag/proc tables now observe bound/connected endpoints, owner identity, occupied native payload-ring bytes and corked payload without taking pending errors; native UDP queue bytes are not Linux skb truesize; other diagnostic transports/extensions and orphaned TCP states remain unsupported; opaque nsfs namespace files have no byte-stream provider and payload reads return EINVAL"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -6875,7 +6875,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_open_tree"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["OPEN_TREE_NAMESPACE passes the user-namespace capability check and the pathname copy and then reports EOPNOTSUPP, because there is no mount-namespace creation and nsfs publication provider"]
+limitations = ["OPEN_TREE_NAMESPACE passes the user-namespace capability check and the pathname copy and then reports EOPNOTSUPP, because there is no mount-namespace creation from a mount tree; a private nsfs descriptor provider now exists but this operation has not been wired to a constructor"]
 
 [[contract]]
 id = "linux-move_mount"
@@ -6967,7 +6967,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_fsmount"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["FSMOUNT_NAMESPACE reports EOPNOTSUPP after every Linux verdict has been taken, where Linux returns it as the last step of a path this kernel has no mount-namespace constructor for; there is no nsfs descriptor provider"]
+limitations = ["FSMOUNT_NAMESPACE reports EOPNOTSUPP after every Linux verdict has been taken, where Linux returns it as the last step of a path this kernel has no mount-namespace constructor for; a private nsfs descriptor provider now exists, but there is no mount-namespace constructor for this operation"]
 
 [[contract]]
 id = "linux-fspick"

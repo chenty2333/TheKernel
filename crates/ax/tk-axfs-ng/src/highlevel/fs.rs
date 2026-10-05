@@ -349,6 +349,16 @@ impl FsContext {
         }
         policy.follow_symlink(&loc, final_component)?;
         *follow_count += 1;
+        if loc.flags().contains(NodeFlags::MAGIC_LINK)
+            && let Some(target) = loc.entry().as_file()?.magic_link_target()
+        {
+            let target = target?;
+            if !Arc::ptr_eq(loc.mountpoint(), target.mountpoint()) {
+                policy.cross_mount(&loc, &target)?;
+                Self::note_mount_access_with_policy(&target, policy);
+            }
+            return Ok(target);
+        }
         let target = loc.read_link()?;
         if target.is_empty() {
             return Err(VfsError::NotFound);
@@ -787,6 +797,17 @@ impl FsContext {
             }
             policy.follow_symlink(&loc, true)?;
             *follow_count += 1;
+            if loc.flags().contains(NodeFlags::MAGIC_LINK)
+                && let Some(target) = loc.entry().as_file()?.magic_link_target()
+            {
+                let target = target?;
+                if !Arc::ptr_eq(loc.mountpoint(), target.mountpoint()) {
+                    policy.cross_mount(&loc, &target)?;
+                    Self::note_mount_access_with_policy(&target, policy);
+                }
+                if requires_directory { target.check_is_dir()?; }
+                return Ok((target, false));
+            }
             let target = loc.read_link()?;
             if target.is_empty() {
                 return Err(VfsError::NotFound);
@@ -1217,7 +1238,7 @@ mod tests {
         CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileNode,
         FileNodeOps, Filesystem, FilesystemOps, Location, Metadata, MetadataUpdate,
         MetadataUpdateCapabilities, Mountpoint, NamedCreateOptions, NodeOps, NodePermission,
-        NodeType, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
+        NodeFlags, NodeType, OpenOptions as VfsOpenOptions, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
         WeakDirEntry, drain_deferred_dentry_cache_cleanup,
         path::{FinalComponentKind, FsName, FsPath},
     };
@@ -1263,6 +1284,7 @@ mod tests {
         fail_flush: AtomicBool,
         rename_supported: AtomicBool,
         flush_gate: StdMutex<Option<Arc<FlushGate>>>,
+        object_target: StdMutex<Option<Location>>,
     }
 
     #[derive(Default)]
@@ -1304,6 +1326,7 @@ mod tests {
                 fail_flush: AtomicBool::new(false),
                 rename_supported: AtomicBool::new(true),
                 flush_gate: StdMutex::new(None),
+                object_target: StdMutex::new(None),
             });
             let root = DirEntry::new_dir(
                 {
@@ -1425,6 +1448,9 @@ mod tests {
                     fs: self.fs.clone(),
                     ino: self.child_inode(name),
                     contents: contents.to_vec(),
+                    object_target: if name.as_bytes() == b"object-jump" {
+                        self.fs.object_target.lock().unwrap().clone()
+                    } else { None },
                 })),
                 node_type,
                 Reference::new(self.this.upgrade(), name.to_owned()),
@@ -1436,6 +1462,7 @@ mod tests {
         fs: Arc<TestFs>,
         ino: u64,
         contents: Vec<u8>,
+        object_target: Option<Location>,
     }
 
     impl NodeOps for TestFile {
@@ -1478,6 +1505,12 @@ mod tests {
 
         fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
             self
+        }
+        fn flags(&self) -> NodeFlags {
+            if self.object_target.is_some() { NodeFlags::MAGIC_LINK } else { NodeFlags::empty() }
+        }
+        fn magic_link_target(&self) -> Option<VfsResult<Location>> {
+            self.object_target.clone().map(Ok)
         }
     }
 
@@ -1596,6 +1629,7 @@ mod tests {
                 b"child" | b"other" | b"rename-disabled" => Ok(self.child(name)),
                 b"file" => Ok(self.file(name, NodeType::RegularFile, b"")),
                 b"jump" => Ok(self.file(name, NodeType::Symlink, b"/child/child")),
+                b"object-jump" => Ok(self.file(name, NodeType::Symlink, b"label:[123]")),
                 b"jump-create" => Ok(self.file(name, NodeType::Symlink, b"/child/new")),
                 b"bad-jump" => Ok(self.file(name, NodeType::Symlink, b"/file/")),
                 _ => Err(VfsError::NotFound),
@@ -2166,6 +2200,50 @@ mod tests {
         fn escape_root(&mut self, _root: &Location) -> VfsResult<()> {
             Err(VfsError::CrossesDevices)
         }
+    }
+
+    #[test]
+    fn object_magic_links_jump_without_reparsing_and_retain_walk_admission() {
+        let fs = TestFs::new();
+        let context = FsContext::new(Mountpoint::new_root(&Filesystem::new(fs.clone())).root_location());
+        let target_context = TestFs::context();
+        let target = target_context.resolve(FsPath::new(b"/file")).unwrap();
+        *fs.object_target.lock().unwrap() = Some(target.clone());
+        let result = context.resolve(FsPath::new(b"/object-jump")).unwrap();
+        assert!(result.ptr_eq(&target));
+        let (opened, created) = context.resolve_open_with_policy(
+            FsPath::new(b"/object-jump"), &VfsOpenOptions::default(), true,
+            &mut |_| Ok(()), &mut |_, _, _| Ok(()), &mut ObserveWalk::default(),
+        ).unwrap();
+        assert!(opened.ptr_eq(&target));
+        assert!(!created);
+        for open in [false, true] {
+            let result = if open {
+                context.resolve_open_with_policy(
+                    FsPath::new(b"/object-jump"), &VfsOpenOptions::default(), true,
+                    &mut |_| Ok(()), &mut |_, _, _| Ok(()), &mut RejectTopologyEdges,
+                ).map(|(loc, _)| loc)
+            } else {
+                context.resolve_with_policy(FsPath::new(b"/object-jump"), &mut |_| Ok(()), &mut RejectTopologyEdges)
+            };
+            assert_eq!(result.unwrap_err(), VfsError::CrossesDevices);
+        }
+        assert_eq!(context.resolve_with_policy(
+            FsPath::new(b"/object-jump"), &mut |_| Ok(()), &mut RejectSymlink,
+        ).unwrap_err(), VfsError::FilesystemLoop);
+        // The admission callback authorizes directory search, not execute
+        // access to the final regular target. Final operation rights belong
+        // to the caller. Continuing below a directory target is still gated.
+        context.resolve_with_admission(FsPath::new(b"/object-jump"), &mut |loc| {
+            assert!(!loc.ptr_eq(&target)); Ok(())
+        }).unwrap();
+        let directory = target_context.resolve(FsPath::new(b"/child")).unwrap();
+        let directory_fs = TestFs::new();
+        *directory_fs.object_target.lock().unwrap() = Some(directory.clone());
+        let directory_context = FsContext::new(Mountpoint::new_root(&Filesystem::new(directory_fs)).root_location());
+        assert_eq!(directory_context.resolve_with_admission(FsPath::new(b"/object-jump/child"), &mut |loc| {
+            if loc.ptr_eq(&directory) { Err(VfsError::PermissionDenied) } else { Ok(()) }
+        }).unwrap_err(), VfsError::PermissionDenied);
     }
 
     #[test]

@@ -534,7 +534,9 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
 }
 
 pub fn location_to_kstat(loc: &Location) -> AxResult<Kstat> {
-    let idmap = if let Some(task) = axtask::current_may_uninit()
+    let idmap = if crate::pseudofs::nsfs::is_internal_mount(loc.mountpoint()) {
+        None
+    } else if let Some(task) = axtask::current_may_uninit()
         && let Some(thread) = task.try_as_thread()
     {
         thread
@@ -1606,6 +1608,9 @@ impl FileLike for File {
     }
 
     fn path(&self) -> AxResult<Cow<'_, FsPath>> {
+        if let Some(label) = crate::pseudofs::nsfs::descriptor_label(self.inner.location()) {
+            return Ok(Cow::Owned(label?));
+        }
         path_for(self.inner.location())
     }
 

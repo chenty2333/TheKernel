@@ -236,6 +236,19 @@ pub trait NodeOps: Send + Sync + 'static {
         NodeFlags::empty()
     }
 
+    /// An object-backed magic link may jump directly to a retained location.
+    /// Its display label is not reparsed as a pathname. Pathwalk policy must
+    /// admit the source link before invoking this callback.
+    fn magic_link_target(&self) -> Option<VfsResult<crate::Location>> {
+        None
+    }
+
+    /// Dynamic symlinks can capture their complete display label once instead
+    /// of mixing a length observation with a later payload observation.
+    fn read_link_text(&self) -> Option<VfsResult<FsPathBuf>> {
+        None
+    }
+
     /// Admits one open before a high-level file backend is constructed.
     ///
     /// Dynamic filesystems can use this to enforce open-time policy which
@@ -1446,6 +1459,9 @@ impl DirEntry {
             return Err(VfsError::InvalidData);
         }
         let file = self.as_file()?;
+        if let Some(text) = file.read_link_text() {
+            return text;
+        }
         let mut buf = vec![0; file.len()? as usize];
         file.read_at(&mut buf, 0)?;
         Ok(FsPathBuf::from_vec(buf))

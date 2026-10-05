@@ -886,3 +886,29 @@ fixture (shell-ue926kv_, NS_REL_TOOLS_RC=0). Actual lsns lists correct namespace
 rows but still emits the three procfs-device-misclassification warnings, so
 no-error whole-tool acceptance remains pending. No host namespace or physical
 hardware configuration was changed. Contract progress counters stay unchanged.
+
+### B1 follow-up34: actual namespace filesystem identity and clean lsns
+
+See [nsfs design](nsfs.md). Proc namespace source nodes are now actual dynamic
+magic symlinks, while followed/opened targets belong to one real private nsfs
+filesystem with a VFS-allocated device identity. No fake NSTYPE is returned for
+ordinary proc files and no guessed device number is substituted. READ_FSCREDS
+image checks are reused before observing the live target; an opened target pins
+its namespace. Generic pathwalk jumps to an actual Location, preserving magic/
+symlink and cross-mount policy. Namespace readlink observes one complete label.
+
+Actual signed Alpine lsns now lists all eight initial types and a live child
+user namespace **without diagnostics** (shell-lq89w57m, NS_REL_TOOLS_RC=0).
+The same fixture asserts inode/device/statfs/mode/source-label/truncation,
+openat2 no-magic/no-symlink/no-cross-device errors, a retained dynamic O_PATH
+source across unshare, an opened target surviving creator exit, parent/owner
+scope, no extra SYS_ADMIN gate and CLOEXEC. Host Linux base passes without host
+namespace changes. Related axfs177/VFS27/kernel2618 tests, q35 lint, KVM guest
+68/68 (system-1oroyxtd) and ABI257/257 (abi-zshngyku) pass. Initial failed probes
+and their repairs are documented in nsfs.md; no failures were counted as passes.
+
+This is basic lsns/namespace-file acceptance, not complete nsfs ioctl/export/
+inode-attribute behavior or container acceptance. Broader filesystem UID user-
+namespace projection is still incomplete. mount-tree namespace construction
+is still absent; its contracts now acknowledge that the nsfs descriptor provider
+exists rather than repeating the earlier missing-provider statement.

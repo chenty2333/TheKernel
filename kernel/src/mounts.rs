@@ -2223,6 +2223,9 @@ pub fn note_mount_access(loc: &Location) {
 }
 
 pub fn flags_for_location(loc: &Location) -> AxResult<u32> {
+    if crate::pseudofs::nsfs::is_internal_mount(loc.mountpoint()) {
+        return Ok(0);
+    }
     flags_for_mountpoint(loc.mountpoint()).ok_or(AxError::Io)
 }
 

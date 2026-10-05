@@ -11,9 +11,9 @@ use axdriver::virtio_io_counters_snapshot;
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::render_io_stats_counters;
 use axfs_ng_vfs::{
-    DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, FsName, FsNameBuf,
+    DeviceId, FileNodeOps, Filesystem, FilesystemOps, FsName, FsNameBuf,
     FsPath, FsPathBuf, Location, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission,
-    NodeType, NodeUserData, Reference, VfsError, VfsResult,
+    NodeType, NodeUserData, VfsError, VfsResult,
 };
 use axhal::paging::MappingFlags;
 use axpoll::{IoEvents, Pollable};
@@ -1053,7 +1053,7 @@ fn proc_image_access(
     }
 }
 
-fn proc_fd_image_access(task: &AxTaskRef, process_view: bool) -> VfsResult<Arc<Mutex<AddrSpace>>> {
+pub(super) fn proc_fd_image_access(task: &AxTaskRef, process_view: bool) -> VfsResult<Arc<Mutex<AddrSpace>>> {
     let proc_data = &task.as_thread().proc_data;
     if proc_data.exec_in_progress() {
         return Err(VfsError::PermissionDenied);
@@ -1061,7 +1061,7 @@ fn proc_fd_image_access(task: &AxTaskRef, process_view: bool) -> VfsResult<Arc<M
     Ok(proc_image_access(task, process_view)?.into_aspace())
 }
 
-fn validate_proc_fd_image(
+pub(super) fn validate_proc_fd_image(
     task: &AxTaskRef,
     authorized_image: &Arc<Mutex<AddrSpace>>,
 ) -> VfsResult<()> {
@@ -2267,7 +2267,7 @@ impl ProcNamespaceObject {
     }
 }
 
-struct ProcNamespaceFile {
+pub(super) struct ProcNamespaceFile {
     node: SimpleFsNode,
     fs: Arc<SimpleFs>,
     kind: ProcNamespaceKind,
@@ -2275,12 +2275,12 @@ struct ProcNamespaceFile {
 }
 
 impl ProcNamespaceFile {
-    fn new(
+    pub(super) fn new(
         fs: Arc<SimpleFs>,
         kind: ProcNamespaceKind,
         task: &AxTaskRef,
         _process_view: bool,
-    ) -> Arc<Self> {
+    ) -> VfsResult<Arc<Self>> {
         let thread = task.as_thread();
         let object = match kind {
             ProcNamespaceKind::Cgroup => ProcNamespaceObject::Cgroup(thread.cgroup_ns()),
@@ -2298,24 +2298,24 @@ impl ProcNamespaceFile {
         Self::from_object(fs, kind, object)
     }
 
-    fn from_object(
+    pub(super) fn from_object(
         fs: Arc<SimpleFs>,
         kind: ProcNamespaceKind,
         object: ProcNamespaceObject,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            node: SimpleFsNode::new(
+    ) -> VfsResult<Arc<Self>> {
+        Arc::try_new(Self {
+            node: SimpleFsNode::try_new(
                 fs.clone(),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o444),
-            ),
+            )?,
             fs,
             kind,
             object,
-        })
+        }).map_err(|_| VfsError::NoMemory)
     }
 
-    fn namespace_inode(&self) -> Option<u64> {
+    pub(super) fn namespace_inode(&self) -> Option<u64> {
         match &self.object {
             ProcNamespaceObject::Cgroup(ns) => Some(ns.proc_inode()),
             // IPC owns an independent allocator; reserve the low bits for
@@ -2367,13 +2367,13 @@ impl NodeOps for ProcNamespaceFile {
     }
 
     fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE | NodeFlags::MAGIC_LINK
+        NodeFlags::NON_CACHEABLE
     }
 }
 
 impl FileNodeOps for ProcNamespaceFile {
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        Ok(0)
+        Err(VfsError::InvalidInput)
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
@@ -2451,7 +2451,7 @@ impl SimpleDirOps for ThreadNamespaceDir {
             b"uts" => ProcNamespaceKind::Uts,
             _ => return Err(VfsError::NotFound),
         };
-        Ok(ProcNamespaceFile::new(self.fs.clone(), kind, &task, self.process_view).into())
+        super::nsfs::proc_link(self.fs.clone(), kind, &task, self.process_view)
     }
 
     fn is_cacheable(&self) -> bool {
@@ -2615,26 +2615,8 @@ pub(crate) fn proc_namespace_location_from_object(
     kind: ProcNamespaceKind,
     object: ProcNamespaceObject,
 ) -> VfsResult<Location> {
-    let parent = template.entry().parent();
-    let name = match kind {
-        ProcNamespaceKind::Cgroup => "cgroup",
-        ProcNamespaceKind::Ipc => "ipc",
-        ProcNamespaceKind::Mount => "mnt",
-        ProcNamespaceKind::Net => "net",
-        ProcNamespaceKind::Pid => "pid",
-        ProcNamespaceKind::Time => "time",
-        ProcNamespaceKind::TimeForChildren => "time_for_children",
-        ProcNamespaceKind::User => "user",
-        ProcNamespaceKind::Uts => "uts",
-    };
-    let template_file = template.entry().downcast::<ProcNamespaceFile>()?;
-    let file = ProcNamespaceFile::from_object(template_file.fs.clone(), kind, object);
-    let entry = DirEntry::new_file(
-        FileNode::new(file),
-        NodeType::RegularFile,
-        Reference::try_new(parent, FsName::new(name.as_bytes()))?,
-    );
-    Ok(Location::new(template.mountpoint().clone(), entry))
+    template.entry().downcast::<ProcNamespaceFile>()?;
+    super::nsfs::object_location(kind, object)
 }
 
 fn parse_timens_offset_line(line: &str) -> VfsResult<Option<(u32, i64, u32)>> {
