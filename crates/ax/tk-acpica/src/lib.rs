@@ -31,3 +31,5 @@ mod tests {
         assert_eq!(unsafe { super::tk_acpi_abi_width() }, usize::BITS);
     }
 }
+
+pub mod resources;
