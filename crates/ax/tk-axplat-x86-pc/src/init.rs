@@ -67,6 +67,7 @@ impl InitIf for InitIfImpl {
         // the PCI bus driver starts using the published base.
         crate::acpi::report();
         crate::power::init_later();
+        crate::cpuidle::init_current();
         report_cpu_state(cpu_id);
     }
 
@@ -84,6 +85,7 @@ impl InitIf for InitIfImpl {
         init_hwp_fleet_member();
         #[cfg(feature = "pmu")]
         init_pmu_fleet_member();
+        crate::cpuidle::init_current();
         report_cpu_state(cpu_id);
     }
 }

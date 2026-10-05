@@ -312,6 +312,8 @@ fn cpu_root_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         );
     }
 
+    #[cfg(any(feature="pmu",feature="hwp-uclamp"))]
+    super::cpu_idle::register(&fs, &mut cpu_root);
     SimpleDir::new_maker(fs, Arc::new(cpu_root))
 }
 

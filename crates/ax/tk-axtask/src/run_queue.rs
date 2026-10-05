@@ -2420,7 +2420,7 @@ pub(crate) fn idle_wait() {
     if preempt_pending || run_queue.load.snapshot().ready_tasks != 0 {
         axhal::asm::enable_irqs();
     } else {
-        axhal::asm::enable_irqs_and_wait();
+        axhal::cpu_idle_wait();
     }
 }
 

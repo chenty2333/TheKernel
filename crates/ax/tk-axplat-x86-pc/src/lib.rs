@@ -175,3 +175,6 @@ unsafe extern "C" fn rust_entry_secondary(_magic: usize) {
 pub fn allocate_msi(handler: axplat::irq::IrqHandler) -> Option<(u64, u32, usize)> {
     apic::allocate_msi(handler)
 }
+
+/// Opt-in Intel MWAIT idle state selection and counters.
+pub mod cpuidle;
