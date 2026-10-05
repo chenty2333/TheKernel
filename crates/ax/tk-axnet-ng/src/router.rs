@@ -903,9 +903,14 @@ impl Router {
 
     pub(crate) fn device_stats(&self) -> Vec<(String, DeviceStats)> {
         self.devices
-            .iter()
-            .map(|device| (device.name().into(), device.stats()))
+            .iter().enumerate()
+            .map(|(slot, device)| (self.links[slot].name.clone(), device.stats()))
             .collect()
+    }
+
+    pub(crate) fn interface_statistics(&self, index: u32) -> Option<DeviceStats> {
+        let slot = self.device_slot(index)?;
+        self.devices.get(slot).map(|device| device.stats())
     }
 
     pub(crate) fn interfaces(&self) -> Vec<InterfaceInfo> {

@@ -246,6 +246,7 @@ pub(crate) fn link_message(request: &NlMsgHdr, port_id: u32, entry: &LinkEntry) 
     if !entry.hwaddr.is_empty() {
         push_attr(&mut payload, IFLA_ADDRESS, &entry.hwaddr);
     }
+    super::link_stats::append_attributes(&mut payload, entry.stats);
     netlink_message(request, port_id, RTM_NEWLINK, payload)
 }
 
@@ -385,7 +386,7 @@ pub(crate) fn address_entries(interface: &InterfaceInfo) -> Vec<AddressEntry> {
         .collect()
 }
 
-pub(crate) fn link_entry(interface: InterfaceInfo) -> LinkEntry {
+pub(crate) fn link_entry(interface: InterfaceInfo, stats: axnet::DeviceStats) -> LinkEntry {
     let is_loopback = interface.kind == InterfaceKind::Loopback;
     let base = if is_loopback {
         IFF_LOOPBACK | IFF_RUNNING
@@ -399,6 +400,7 @@ pub(crate) fn link_entry(interface: InterfaceInfo) -> LinkEntry {
             0
         };
     LinkEntry {
+        stats,
         index: interface.index,
         name: interface.name,
         flags,

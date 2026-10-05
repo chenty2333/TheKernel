@@ -192,7 +192,9 @@ fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     // prevent udev from reading its dev/uevent attributes.
     SimpleDir::new_maker(
         fs.clone(),
-        Arc::new(super::block_inventory::class_root(fs.clone()).chain(device_registry::class_root(fs))),
+        Arc::new(super::block_inventory::class_root(fs.clone())
+            .chain(super::net_sysfs::class_root(fs.clone()))
+            .chain(device_registry::class_root(fs))),
     )
 }
 

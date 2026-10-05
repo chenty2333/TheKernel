@@ -513,3 +513,53 @@ Actual signed Alpine ss -tanpe displays IPv4/IPv6 LISTEN and ESTAB, the server's
 inode (shell-k0mycr4k, DIAG_TOOLS_RC=0). This is active TCP base-record acceptance,
 not acceptance of missing proc TCP/UDP tables, unsupported diagnostic transports,
 or timers/advanced filters/orphan states. Contract progress counts are unchanged.
+
+### Common network counter source
+
+Linux 7.2.3 net/core/net-sysfs.c, fs/sysfs/mount.c and the if_link UAPI are
+behavior/layout references. New /sys/class/net/<if>/statistics/ core counters
+retain the sysfs mount's network namespace; ordinary readers changing netns
+cannot silently change that filesystem's view. Boot uses the already-registered
+init-net because sysfs is mounted before the init userspace Thread exists.
+Interface names are dynamically enumerated, and opened attributes retain the
+stable ifindex so removal/name reuse cannot relabel another device's counters.
+A newly created legacy sysfs mount captures its caller's network namespace.
+Modern fsopen context-time namespace capture is not newly accepted here.
+
+Eight decimal/newline counters come from the actual DeviceStats under the
+existing service lock (RX/TX bytes, packets, errors, drops); no poll/receive or
+hardware configuration occurs on read. The same stable-ifindex observation
+supplies RTM_NEWLINK's Linux-shaped IFLA_STATS and IFLA_STATS64. Wide counters
+are preserved; narrow counters use the Linux low-word conversion. Detailed
+error/multicast/collision/compression/nohandler/otherhost classifications are
+not maintained by this device provider and their wire fields remain0, as for
+an unimplemented optional driver counter; they are not newly accepted real
+hardware measurements. Only the eight observed counters are exposed in sysfs.
+
+The old /proc/net/dev device-name snapshot used the immutable transport name
+rather than the router's renamed link; it now uses the control-plane name.
+Canonical sysfs device ancestry, device/subsystem symlinks, uevent publication,
+and other netdev configuration attributes remain incomplete; these class
+counter directories are not a claim of complete Linux netdev sysfs topology.
+
+Host Linux C probe passes: active loopback UDP traffic advances actual packet/
+byte counters and sysfs/proc/rtnetlink agree, including narrow/wide conversion.
+Final period24 validation passed: Python655 (three environmental skips),
+Rust6029 (one preexisting ignored test; net214 and kernel2605), q35/n305 lint
+(784 existing kernel warnings), KVM guest66/66 with no skips/normal shutdown
+(system-k5c6vjnm), and full ABI257/257 (abi-cvcea69d). Guest verifies old sysfs
+retains its mount namespace after NEWNET, a newly mounted sysfs sees the new
+namespace, and actual configured-new-loopback traffic advances only the new
+view. Linux correctly creates lo down/unconfigured in NEWNET; an initial test
+omitted that setup and failed EADDRNOTAVAIL, then was repaired with explicit
+in-guest netlink address/UP setup rather than changing kernel defaults.
+
+Signed Alpine iproute2 ip -s link and BusyBox ifconfig both display the actual
+five packets/2700 bytes per direction and agree with sysfs/proc/netlink
+(shell-zi60qhmz, NET_STATS_TOOLS_RC=0). The exact Alpine BusyBox1.37 ip applet
+rejects -s on host Linux too (usage, exit1); it lacks that option, so BusyBox
+ip -s is not accepted or worked around with a wrapper. An initial shell probe
+correctly failed on this tool limitation rather than accepting runner shutdown
+as program success. Host stable-ifindex tests also cover actual traffic,
+control-plane rename and removal/name reuse without counter aliasing. No
+physical network or concurrent-load performance acceptance is claimed.

@@ -320,6 +320,7 @@ struct LinkEntry {
     mtu: u32,
     hwaddr: Vec<u8>,
     arphrd: u16,
+    stats: axnet::DeviceStats,
 }
 
 #[derive(Default)]
@@ -712,6 +713,7 @@ static KOBJECT_UEVENT_SEND_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static NETLINK_NEXT_PORT_ID: AtomicU32 = AtomicU32::new(1);
 mod audit;
 mod diag;
+mod link_stats;
 mod framing;
 mod nft;
 mod wiremsg;
@@ -3364,7 +3366,9 @@ impl NetlinkSocket {
             .ok_or(AxError::BadState)?
             .interfaces()?;
         for interface in interfaces {
-            let link = link_entry(interface);
+            let stats = permit.route_service().ok_or(AxError::BadState)?
+                .interface_statistics(interface.index).ok_or(AxError::NotFound)?;
+            let link = link_entry(interface, stats);
             if let Some(filter) = filter
                 && filter.ifi_index > 0
                 && filter.ifi_index as u32 != link.index

@@ -110,6 +110,11 @@ impl NetStackServicePermit<'_> {
             .packet_device_capabilities(interface_index)
     }
 
+    /// Read an admitted service's device counters by stable interface identity.
+    pub fn interface_statistics(&self, interface_index: u32) -> Option<DeviceStats> {
+        self.service.router.interface_statistics(interface_index)
+    }
+
     pub fn interfaces(&self) -> AxResult<Vec<InterfaceInfo>> {
         let mut interfaces = self.service.router.interfaces();
         let addresses = if self.nowait {
@@ -1645,6 +1650,11 @@ impl NetStack {
         self.service.lock().router.device_stats()
     }
 
+    /// No polling or queue consumption; removal cannot alias a reused name.
+    pub fn interface_statistics(&self, interface_index: u32) -> Option<DeviceStats> {
+        self.service.lock().router.interface_statistics(interface_index)
+    }
+
     /// Snapshot the interfaces currently owned by this network stack.
     pub fn interfaces(&self) -> Vec<InterfaceInfo> {
         self.acquire_packet_service()
@@ -2959,6 +2969,29 @@ mod tests {
         });
         let wake = Arc::new(NetRxIrqWake(state));
         Wake::wake_by_ref(&wake);
+    }
+
+    #[test]
+    fn statistics_follow_stable_ifindex_and_control_plane_rename() {
+        let stack = NetStack::new_loopback_only();
+        let source = packet_endpoint(&stack, PacketProtocol::All, true);
+        stack.send_packet(1, source.as_ref(), PacketSendRequest::Raw {
+            protocol: TEST_PROTOCOL, frame: &TEST_FRAME,
+        }).unwrap();
+        let observed = stack.interface_statistics(1).unwrap();
+        assert_eq!((observed.rx_packets, observed.tx_packets), (1, 1));
+        assert_eq!((observed.rx_bytes, observed.tx_bytes), (6, 6));
+        stack.configure_link(1, Some("renamed".into()), None, None).unwrap();
+        assert_eq!(stack.device_stats()[0].0, "renamed");
+        let service = stack.acquire_packet_service();
+        assert_eq!(service.interface_statistics(1).unwrap().rx_bytes, observed.rx_bytes);
+        drop(service);
+        stack.remove_device(1).unwrap();
+        let replacement = stack.add_device(Box::new(LoopbackDevice::try_new().unwrap()));
+        stack.configure_link(replacement, Some("renamed".into()), None, None).unwrap();
+        assert_ne!(replacement, 1);
+        assert!(stack.interface_statistics(1).is_none());
+        assert_eq!(stack.interface_statistics(replacement).unwrap().rx_bytes, 0);
     }
 
     #[test]

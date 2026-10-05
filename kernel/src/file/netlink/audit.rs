@@ -112,6 +112,11 @@ pub(crate) fn is_initial_network_namespace(net_ns: &Arc<NetworkNamespace>) -> bo
         .is_some_and(|initial| Arc::ptr_eq(initial, net_ns))
 }
 
+/// Boot sysfs is mounted before init has a userspace Thread context.
+pub(crate) fn initial_network_namespace() -> Option<Arc<NetworkNamespace>> {
+    INIT_NETWORK_NAMESPACE.lock().clone()
+}
+
 /// Publish a kobject uevent exclusively to the boot-established init network
 /// namespace.  Before boot has registered init-net, there can be no
 /// publishable device listener, so retain the historical best-effort behavior
