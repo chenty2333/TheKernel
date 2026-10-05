@@ -378,6 +378,10 @@ CONTRACTS.update({
 })
 PROGRAM_CASES["task-control"] += ("setns",)
 
+CONTRACTS["clone3"] = (
+    "raw-differential", "pass", "FLAG_ADMISSION NEWTIME AUTOREAP EMPTY_MNTNS NNP_CHILD_ONLY_MONOTONIC",
+)
+
 # The registry is static: the gate reads it to decide whether a claimed
 # syscall names a program this runner really executes.
 PROGRAMS = tuple(PROGRAM_CASES)

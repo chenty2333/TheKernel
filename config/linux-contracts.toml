@@ -8646,7 +8646,7 @@ handler = "kernel/src/syscall/task/clone3.rs:sys_clone3"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
 validation_gaps = ["EMPTY_MNTNS discriminates the empty mount namespace on both guests"]
-limitations = ["CLONE_NNP and CLONE_PIDFD_AUTOKILL flags and their lifecycle semantics are missing; CLONE_AUTOREAP is implemented end to end, and CLONE_EMPTY_MNTNS installs a root-mount-only mount namespace"]
+limitations = ["CLONE_NNP prepares a restricted child credential before publication, including NEWUSER, without changing the parent. CLONE_PIDFD_AUTOKILL final-OFD kill lifecycle is still missing; CLONE_AUTOREAP is implemented end to end, and CLONE_EMPTY_MNTNS installs a root-mount-only mount namespace"]
 
 [[contract]]
 id = "linux-process_mrelease"

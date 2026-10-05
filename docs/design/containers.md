@@ -33,7 +33,22 @@ The differential probe does not establish racing clone/fs-sharing admission.
 ### Other known gaps (next)
 
 - New mount namespaces from `open_tree`/`fsmount`, published through existing nsfs.
-- `clone3` `CLONE_NNP` and `CLONE_PIDFD_AUTOKILL`.
+- `clone3` `CLONE_PIDFD_AUTOKILL` final-OFD teardown.
+
+### `clone3(CLONE_NNP)`
+
+The complete unpublished child credential now includes `no_new_privs` before
+one fork/user-namespace security admission and publication. Ordinary fork may
+change only this monotonic restriction; every other credential field and
+namespace/group identity must match its source. A new-user-namespace child can
+also request NNP. Parent credentials remain unchanged; thread clones still
+reject NNP with `EINVAL` under the existing Linux flag admission rules.
+
+Validated: kernel host 2623 passed (including typed security publication,
+inheritance, and NEWUSER+NNP); q35 lint passed with 784 existing warnings;
+KVM system guest 70/70 (`system-k93x8ebc`); paired task-control 14/14 selected
+contracts (`abi-8gos6_qh`). Actual children observe NNP=1, cannot clear it, and
+leave the parent's NNP unchanged, both with and without NEWUSER.
 
 ## Tool acceptance ladder
 

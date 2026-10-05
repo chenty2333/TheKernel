@@ -193,7 +193,7 @@ impl<T: CredentialPublicationTargetOwner> PendingCredentialPublication<T> {
         published: &Arc<Cred>,
         target_owner: T,
     ) -> AxResult<Self> {
-        if !source.same_linux_credential(published) {
+        if !published.is_fork_credential_of(source) {
             return Err(AxError::BadState);
         }
         Self::try_new(

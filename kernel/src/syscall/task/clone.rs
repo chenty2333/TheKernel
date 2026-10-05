@@ -561,14 +561,9 @@ impl CloneArgs {
             ProcessAbiError::PermissionDenied => AxError::OperationNotPermitted,
             _ => AxError::InvalidInput,
         })?;
-        // Residual gaps, reported rather than papered over: these flags are
-        // admitted by Linux but have no complete lifecycle here, so a request
-        // that uses one is refused instead of being accepted and then ignored.
-        // CLONE_NNP must publish a child credential that differs from the
-        // parent's, and the fork publication path requires a bit-identical
-        // pending credential; CLONE_PIDFD_AUTOKILL must kill the child when its
-        // pidfd is released.
-        if flags.intersects(CloneFlags::NNP | CloneFlags::PIDFD_AUTOKILL) {
+        // Autokill still needs the final-OFD lifetime action. NNP is prepared
+        // in the complete unpublished child credential below.
+        if flags.contains(CloneFlags::PIDFD_AUTOKILL) {
             return Err(AxError::InvalidInput);
         }
 
@@ -758,11 +753,11 @@ impl CloneArgs {
                 ids.egid,
                 parent_cred.has_effective_capability_in_own_user_ns(CAP_SETFCAP),
             )?;
-            Cred::try_prepare_with_user_namespace(&parent_cred, user_ns)?
+            Cred::try_prepare_clone_child(&parent_cred, Some(user_ns), flags.contains(CloneFlags::NNP))?
         } else if flags.contains(CloneFlags::THREAD) {
             parent_cred.clone()
         } else {
-            Cred::try_prepare_clone_for_fork(&parent_cred)?
+            Cred::try_prepare_clone_child(&parent_cred, None, flags.contains(CloneFlags::NNP))?
         };
         let namespace_owner = clone_namespace_owner(flags, &parent_cred, &child_cred)?;
         if old_proc_data.exec_in_progress() {

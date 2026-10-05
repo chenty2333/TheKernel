@@ -97,22 +97,43 @@ impl Cred {
     }
 
     pub(crate) fn try_prepare_clone_for_fork(old: &Arc<Self>) -> AxResult<Arc<Self>> {
-        let registry = old.security.registry();
-        let security = registry.try_prepare_credential_state(
-            old.core(),
-            &old.security,
-            old.core(),
-            CredentialStateTransition::Fork,
-        )?;
-        Self::try_from_parts(old.core.clone(), security)
+        Self::try_prepare_clone_child(old, None, false)
     }
 
     pub(crate) fn try_prepare_with_user_namespace(
         old: &Arc<Self>,
         user_ns: Arc<UserNamespace>,
     ) -> AxResult<Arc<Self>> {
-        let core = CoreCred::try_with_user_namespace(old.core(), user_ns).map_err(cred_error)?;
-        Self::try_from_core_transition(old, core, CredentialStateTransition::UserNamespace)
+        Self::try_prepare_clone_child(old, Some(user_ns), false)
+    }
+
+    /// Prepare the complete child core before its single security-state fork
+    /// or user-namespace admission. NNP is monotonic and never changes parent.
+    pub(crate) fn try_prepare_clone_child(
+        old: &Arc<Self>,
+        user_ns: Option<Arc<UserNamespace>>,
+        set_nnp: bool,
+    ) -> AxResult<Arc<Self>> {
+        let (mut core, transition) = if let Some(user_ns) = user_ns {
+            (
+                CoreCred::try_with_user_namespace(old.core(), user_ns).map_err(cred_error)?,
+                CredentialStateTransition::UserNamespace,
+            )
+        } else {
+            (old.core.clone(), CredentialStateTransition::Fork)
+        };
+        if set_nnp && !core.no_new_privs() {
+            let prepared = CoreCred::try_prepare_transition(
+                &core,
+                core.ids(),
+                core.groups().clone(),
+                core.capabilities(),
+                true,
+            )
+            .map_err(cred_error)?;
+            core = prepared.try_into_proposed(&core).map_err(cred_error)?;
+        }
+        Self::try_from_core_transition(old, core, transition)
     }
 
     #[cfg(test)]
@@ -228,6 +249,19 @@ impl Cred {
     /// shared core, so outer `Arc` identity is intentionally too strict.
     pub(crate) fn same_linux_credential(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.core, &other.core)
+    }
+
+    /// Ordinary fork shares the immutable core. CLONE_NNP may instead
+    /// publish exactly one additional restriction, with every other Linux
+    /// credential field retaining its inherited value/identity.
+    pub(in crate::task) fn is_fork_credential_of(&self, source: &Self) -> bool {
+        self.same_linux_credential(source)
+            || (!source.no_new_privs()
+                && self.no_new_privs()
+                && self.ids() == source.ids()
+                && self.capabilities() == source.capabilities()
+                && Arc::ptr_eq(self.groups(), source.groups())
+                && Arc::ptr_eq(self.user_ns(), source.user_ns()))
     }
 
     pub(crate) fn is_initial_root_euid(&self) -> bool {

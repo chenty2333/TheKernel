@@ -103,6 +103,7 @@
 #define CLONE_FS 0x00000200UL
 #define CLONE_PARENT 0x00008000UL
 #define CLONE_AUTOREAP (1UL << 34)
+#define CLONE_NNP (1UL << 35)
 /* include/uapi/linux/sched.h:42.  Above the 32-bit window clone(2) reads its
  * flags from (`lower_32_bits(clone_flags)`, kernel/fork.c:2880), so only
  * clone3(2) can ask for it. */
@@ -785,6 +786,34 @@ static void clone3_case(void) {
               "autoreap-child-not-waitable");
     }
     mark("AUTOREAP");
+
+    long parent_nnp = syscall(SYS_prctl, 39, 0UL, 0UL, 0UL, 0UL);
+    check(parent_nnp == 0 || parent_nnp == 1, "parent-nnp-query");
+    args.flags = CLONE_NNP | CLONE_THREAD | CLONE_VM | CLONE_SIGHAND;
+    args.exit_signal = 0;
+    ERROR(clone3_call(&args, sizeof(args)), EINVAL, "nnp-rejects-thread");
+    for (unsigned newuser = 0; newuser < 2; ++newuser) {
+        args.flags = CLONE_NNP | (newuser ? 0x10000000UL : 0);
+        args.exit_signal = SIGCHLD;
+        fflush(stdout);
+        child = clone3_call(&args, sizeof(args));
+        if (child == 0) {
+            if (syscall(SYS_prctl, 39, 0UL, 0UL, 0UL, 0UL) != 1) _exit(20);
+            if (syscall(SYS_prctl, 38, 0UL, 0UL, 0UL, 0UL) != -1 || errno != EINVAL) _exit(21);
+            _exit(0);
+        }
+        if (newuser && child < 0) {
+            check(errno == EPERM, "newuser-nnp-capability");
+        } else {
+            check(child > 0, "clone-nnp-child");
+            if (child > 0) check(waitpid((pid_t)child, &status, 0) == child &&
+                                  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                                  "child-nnp-set-and-monotonic");
+        }
+        check(syscall(SYS_prctl, 39, 0UL, 0UL, 0UL, 0UL) == parent_nnp,
+              "nnp-does-not-change-parent");
+    }
+    mark("NNP_CHILD_ONLY_MONOTONIC");
 
     /* CLONE_EMPTY_MNTNS: a mount namespace holding a clone of the parent's
      * namespace root and nothing else.  The empty namespace belongs to the

@@ -6389,6 +6389,51 @@ fn child_credential_publication_is_ordered_typed_and_success_only() {
 }
 
 #[test]
+fn clone_nnp_credential_is_restricted_before_one_child_publication() {
+    let _probe_guard = reset_credential_state_probes();
+    let registry = probe_registry();
+    let namespace = UserNamespace::try_new_root().unwrap();
+    let source = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+    let child = Cred::try_prepare_clone_child(&source, None, true).unwrap();
+    assert!(!source.no_new_privs());
+    assert!(child.no_new_privs());
+    assert!(!child.same_linux_credential(&source));
+    assert!(child.is_fork_credential_of(&source));
+    assert!(!source.is_fork_credential_of(&child));
+    assert!(child.security().validate_live().is_err());
+    let publication = PendingCredentialPublication::try_fork(
+        &source,
+        &child,
+        TestCredentialPublicationTargetOwner { identity: 0x505 },
+    )
+    .unwrap();
+    publication.activate();
+    publication.notify();
+    assert_eq!(CRED_STATE_PUBLICATION_TRACE.load(Ordering::SeqCst), 23);
+    assert_eq!(CRED_STATE_PUBLICATION_OPERATION.load(Ordering::SeqCst), 1);
+    let inherited = Cred::try_prepare_clone_child(&child, None, false).unwrap();
+    assert!(inherited.no_new_privs());
+    assert!(inherited.same_linux_credential(&child));
+    drop(inherited);
+
+    let ids = source.ids();
+    let user_ns = namespace.try_fork(ids.euid, ids.egid, true).unwrap();
+    let user_child = Cred::try_prepare_clone_child(&source, Some(user_ns.clone()), true).unwrap();
+    assert!(user_child.no_new_privs());
+    assert!(Arc::ptr_eq(user_child.user_ns(), &user_ns));
+    assert!(!user_child.is_fork_credential_of(&source));
+    let publication = PendingCredentialPublication::try_user_namespace(
+        &source,
+        &user_child,
+        TestCredentialPublicationTargetOwner { identity: 0x606 },
+    )
+    .unwrap();
+    publication.activate();
+    publication.notify();
+    assert!(!source.no_new_privs());
+}
+
+#[test]
 fn credential_publication_rejects_mislabeled_or_foreign_children() {
     let _probe_guard = reset_credential_state_probes();
     let registry = probe_registry();
