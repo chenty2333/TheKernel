@@ -200,9 +200,30 @@ real child-PID descriptor next, and make failed script cleanup release its
 namespace init before waiting. Restricted proc/sysfs visibility beyond the
 existing provider behavior has not been separately established here.
 
+### Level 1: real unshare/nsenter accepted
+
+`/proc/<pid>/ns/pid_for_children` now selects that target task's retained
+child PID namespace, independently of its active PID namespace. It is a real
+nsfs object with the standard `pid:[inode]` label, PID type/parent/owner ioctls
+and setns grammar, not a fabricated link to the active PID namespace.
+
+Validated: kernel2632, Python7 related tests, q35 lint784, system70/70
+(`system-x6i3qwxp`), paired task-control15/15 (`abi-55oqv1a4`). The raw probe
+establishes equal active/child identity initially, distinct child identity after
+PID unshare without changing active identity, and the real label/type ioctl.
+
+The optional signed guest regression `container-namespace.sh` runs exact
+`unshare -mpfUr --mount-proc`, verifies PID1 and mapped root IDs, excludes a
+live outside top process from both ps views, mounts/writes private tmpfs, and
+proves the parent's mount graph/file view and original namespace unchanged.
+Real nsenter enters the other task's user/mount/child-PID namespaces and reads
+the private marker. It emits KTAP and exits0 (`shell-v6lsjj09`). Cleanup releases
+the namespace init normally before waiting on its wrapper; the earlier missing
+path timeout is not counted as success. Level 1 is now usable; proceed to bwrap.
+
 ## Tool acceptance ladder
 
-1. util-linux unshare/nsenter: pending.
+1. util-linux unshare/nsenter: passed, noninteractive signed-tool guest regression.
 2. bubblewrap read-only bind/tmpfs isolation: pending; requires level 1.
 3. crun busybox OCI bundle and actual memory/pids enforcement: pending; requires level 2.
 4. offline rootless podman with `--network=none`: pending; requires level 3.

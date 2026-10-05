@@ -20,6 +20,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/statfs.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -1091,6 +1093,36 @@ static void chroot_namespace_case(void) {
     done();
 }
 
+static void pid_children_descriptor_case(void) {
+    fflush(stdout);
+    pid_t probe = fork();
+    check(probe >= 0, "pid-children-probe-fork");
+    if (probe == 0) {
+        int active = open("/proc/self/ns/pid", O_RDONLY | O_CLOEXEC);
+        int children = open("/proc/self/ns/pid_for_children", O_RDONLY | O_CLOEXEC);
+        struct stat a, b, after;
+        if (active < 0 || children < 0 || fstat(active, &a) || fstat(children, &b) || a.st_ino != b.st_ino) _exit(80);
+        close(children);
+        if (syscall(272, 0x20000000UL) != 0) _exit(81);
+        children = open("/proc/self/ns/pid_for_children", O_RDONLY | O_CLOEXEC);
+        int still_active = open("/proc/self/ns/pid", O_RDONLY | O_CLOEXEC);
+        char label[128];
+        ssize_t len = readlink("/proc/self/ns/pid_for_children", label, sizeof(label));
+        if (children < 0 || still_active < 0 || fstat(children, &b) || fstat(still_active, &after)) _exit(82);
+        if (a.st_ino != after.st_ino || a.st_ino == b.st_ino || len < 5 || memcmp(label, "pid:[", 5)) _exit(83);
+        if (ioctl(children, 0xb703U) != 0x20000000) _exit(84);
+        close(active); close(children); close(still_active);
+        _exit(0);
+    }
+    if (probe > 0) {
+        int status = 0;
+        check(waitpid(probe, &status, 0) == probe && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "pid-children-retains-selected-not-active-namespace");
+        if (WIFEXITED(status) && WEXITSTATUS(status)) fprintf(stderr, "PID_CHILDREN_DESCRIPTOR status=%d\n", WEXITSTATUS(status));
+    }
+    mark("PID_FOR_CHILDREN_REAL_IDENTITY");
+}
+
 static void mount_setns_case(void) {
     begin("setns.raw-differential");
     int fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
@@ -1117,6 +1149,7 @@ static void mount_setns_case(void) {
         close(fd);
     }
     nonmount_setns_cases();
+    pid_children_descriptor_case();
     mark("MOUNT_CAPS_BEFORE_SHARED_FS");
     mark("MOUNT_ONLY_SHARED_FS_EINVAL");
     mark("PIDFD_MIXED_SET_PRIVATE_FS");

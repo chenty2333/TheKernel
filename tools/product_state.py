@@ -314,6 +314,7 @@ ROOTFS_INPUT_FILES = (
     "config/inspect-apks.lock",
     "tests/guest/inspect-tools.sh",
     "tests/guest/block-gpt-tools.sh",
+    "tests/guest/container-namespace.sh",
     "scripts/lib/musl-host-compiler.sh",
     "scripts/create-rootfs-image.sh",
     "tools/nested/alpine/build-initramfs.sh",

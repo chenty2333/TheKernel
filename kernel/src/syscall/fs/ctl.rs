@@ -198,7 +198,7 @@ fn proc_namespace_ioctl(
                         context, loc, ProcNamespaceKind::User, ProcNamespaceObject::User(parent),
                     ))
             }
-            (ProcNamespaceKind::Pid, ProcNamespaceObject::Pid(ns)) => {
+            (ProcNamespaceKind::Pid | ProcNamespaceKind::PidForChildren, ProcNamespaceObject::Pid(ns)) => {
                 visible_pid_namespace_parent(context, &ns)
                     .map(|parent| {
                         add_proc_namespace_fd(
@@ -252,7 +252,7 @@ fn proc_namespace_ioctl(
             ProcNamespaceKind::Ipc => CLONE_NEWIPC,
             ProcNamespaceKind::Mount => CLONE_NEWNS,
             ProcNamespaceKind::Net => CLONE_NEWNET,
-            ProcNamespaceKind::Pid => CLONE_NEWPID,
+            ProcNamespaceKind::Pid | ProcNamespaceKind::PidForChildren => CLONE_NEWPID,
             ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => CLONE_NEWTIME,
             ProcNamespaceKind::User => CLONE_NEWUSER,
             ProcNamespaceKind::Uts => CLONE_NEWUTS,

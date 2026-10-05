@@ -2235,6 +2235,7 @@ pub(crate) enum ProcNamespaceKind {
     TimeForChildren,
     User,
     Uts,
+    PidForChildren,
 }
 
 pub(crate) enum ProcNamespaceObject {
@@ -2288,6 +2289,7 @@ impl ProcNamespaceFile {
             ProcNamespaceKind::Mount => ProcNamespaceObject::Mount(thread.mount_ns()),
             ProcNamespaceKind::Net => ProcNamespaceObject::Net(thread.net_ns()),
             ProcNamespaceKind::Pid => ProcNamespaceObject::Pid(thread.pid_ns()),
+            ProcNamespaceKind::PidForChildren => ProcNamespaceObject::Pid(thread.pid_ns_for_children()),
             ProcNamespaceKind::Time => ProcNamespaceObject::Time(thread.time_ns()),
             ProcNamespaceKind::TimeForChildren => {
                 ProcNamespaceObject::Time(thread.time_ns_for_children())
@@ -2430,6 +2432,7 @@ impl SimpleDirOps for ThreadNamespaceDir {
                 b"time_for_children".as_slice(),
                 b"user".as_slice(),
                 b"uts".as_slice(),
+                b"pid_for_children".as_slice(),
             ]
             .into_iter()
             .map(|name| Cow::Borrowed(FsName::new(name))),
@@ -2449,6 +2452,7 @@ impl SimpleDirOps for ThreadNamespaceDir {
             b"time_for_children" => ProcNamespaceKind::TimeForChildren,
             b"user" => ProcNamespaceKind::User,
             b"uts" => ProcNamespaceKind::Uts,
+            b"pid_for_children" => ProcNamespaceKind::PidForChildren,
             _ => return Err(VfsError::NotFound),
         };
         super::nsfs::proc_link(self.fs.clone(), kind, &task, self.process_view)

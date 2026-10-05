@@ -1136,7 +1136,7 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
         ProcNamespaceKind::Ipc => CLONE_NEWIPC,
         ProcNamespaceKind::Mount => CLONE_NEWNS,
         ProcNamespaceKind::Net => CLONE_NEWNET,
-        ProcNamespaceKind::Pid => CLONE_NEWPID,
+        ProcNamespaceKind::Pid | ProcNamespaceKind::PidForChildren => CLONE_NEWPID,
         ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => CLONE_NEWTIME,
         ProcNamespaceKind::User => CLONE_NEWUSER,
         ProcNamespaceKind::Uts => CLONE_NEWUTS,
@@ -1164,7 +1164,7 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
             Replacement::Mount(mount_ns)
         }
         (ProcNamespaceKind::Net, ProcNamespaceObject::Net(net_ns)) => Replacement::Net(net_ns),
-        (ProcNamespaceKind::Pid, ProcNamespaceObject::Pid(pid_ns)) => {
+        (ProcNamespaceKind::Pid | ProcNamespaceKind::PidForChildren, ProcNamespaceObject::Pid(pid_ns)) => {
             Replacement::PidForChildren(pid_ns)
         }
         (ProcNamespaceKind::User, ProcNamespaceObject::User(user_ns)) => Replacement::User(user_ns),

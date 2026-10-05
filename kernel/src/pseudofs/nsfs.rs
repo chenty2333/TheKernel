@@ -59,7 +59,7 @@ fn label(kind: ProcNamespaceKind, inode: u64) -> VfsResult<Vec<u8>> {
         ProcNamespaceKind::Ipc => "ipc",
         ProcNamespaceKind::Mount => "mnt",
         ProcNamespaceKind::Net => "net",
-        ProcNamespaceKind::Pid => "pid",
+        ProcNamespaceKind::Pid | ProcNamespaceKind::PidForChildren => "pid",
         ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => "time",
         ProcNamespaceKind::User => "user",
         ProcNamespaceKind::Uts => "uts",

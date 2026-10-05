@@ -7966,7 +7966,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:authorize namespace descriptor and atomically install namespace membership and dependent FS state; preopened proc net files retain their original network namespace"]
+state = ["state:authorize namespace descriptor and atomically install namespace membership and dependent FS state; preopened proc net files retain their original network namespace; pid_for_children descriptors retain the selected child PID namespace with genuine nsfs identity and PID ioctls"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 

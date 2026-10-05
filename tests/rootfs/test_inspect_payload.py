@@ -17,6 +17,17 @@ class InspectPayloadTests(unittest.TestCase):
                      'tests/guest/inspect-tools.sh', 'tests/guest/block-gpt-tools.sh']:
             self.assertIn(name, ROOTFS_INPUT_FILES)
 
+    def test_namespace_acceptance_is_staged_as_an_optional_guest_script(self):
+        self.assertIn('tests/guest/container-namespace.sh', ROOTFS_INPUT_FILES)
+        builder = (ROOT/'scripts/build-inspect-payload.sh').read_text()
+        self.assertIn("out/'opt/thekernel-tools/container-namespace.sh'", builder)
+        script = ROOT/'tests/guest/container-namespace.sh'
+        subprocess.run(['sh', '-n', str(script)], check=True)
+        text = script.read_text()
+        self.assertIn('unshare" -mpfUr --mount-proc', text)
+        self.assertIn('--pid="/proc/$launcher/ns/pid_for_children"', text)
+        self.assertIn('THEKERNEL_CONTAINER_NAMESPACE_OK', text)
+
     def test_exact_package_closure_has_required_real_tools(self):
         lines = [line.split('#', 1)[0].strip()
                  for line in (ROOT/'config/inspect-apks.lock').read_text().splitlines()]
