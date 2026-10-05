@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <linux/inet_diag.h>
 #include <linux/netlink.h>
 #include <linux/sock_diag.h>
@@ -50,6 +52,57 @@ static int dump(int family, uint32_t states, ino_t inode, struct inet_diag_msg *
     close(fd);require(done,"diag completion");return found;
 }
 
+static int proc_tcp_rows(FILE *file,int family,ino_t inode,struct inet_diag_msg *out) {
+    char line[512];require(fgets(line,sizeof(line),file)!=NULL && strstr(line,"local_address") && strstr(line,"inode"),"proc TCP header");
+    int found=0;
+    while(fgets(line,sizeof(line),file)) {
+        unsigned slot,sport,dport,state,sendq,recvq,timer,remaining,retries,uid,probes;
+        unsigned long long number;char local[65],peer[65];
+        require(sscanf(line,"%u: %64[0-9A-F]:%x %64[0-9A-F]:%x %x %x:%x %x:%x %x %u %u %llu",&slot,local,&sport,peer,&dport,
+            &state,&sendq,&recvq,&timer,&remaining,&retries,&uid,&probes,&number)==14,"proc TCP mandatory grammar");
+        if(number!=(unsigned long long)inode)continue;
+        memset(out,0,sizeof(*out));out->idiag_family=family;out->idiag_state=state;out->idiag_rqueue=recvq;out->idiag_wqueue=sendq;
+        out->idiag_uid=uid;out->idiag_inode=number;out->id.idiag_sport=htons(sport);out->id.idiag_dport=htons(dport);
+        require(strlen(local)==(family==AF_INET?8:32) && strlen(peer)==strlen(local),"proc address word width");
+        for(unsigned word=0;word<(family==AF_INET?1U:4U);word++) {
+            char hex[9]={0};memcpy(hex,local+word*8,8);out->id.idiag_src[word]=strtoul(hex,NULL,16);
+            memcpy(hex,peer+word*8,8);out->id.idiag_dst[word]=strtoul(hex,NULL,16);
+        }
+        found++;
+    }
+    return found;
+}
+static int proc_tcp(int family,ino_t inode,struct inet_diag_msg *out) {
+    FILE *file=fopen(family==AF_INET?"/proc/net/tcp":"/proc/net/tcp6","r");require(file!=NULL,"proc TCP open");
+    int found=proc_tcp_rows(file,family,inode,out);fclose(file);return found;
+}
+static void namespace_views(ino_t inode) {
+    int saved=open("/proc/self/ns/net",O_RDONLY|O_CLOEXEC);require(saved>=0,"saved net namespace");
+    FILE *old=fopen("/proc/net/tcp","r");require(old!=NULL,"old TCP file");
+    require(!unshare(CLONE_NEWNET),"new network namespace");
+    struct inet_diag_msg entry={0};
+    require(proc_tcp_rows(old,AF_INET,inode,&entry)==1,"opened TCP file pins old namespace");
+    require(proc_tcp(AF_INET,inode,&entry)==0,"fresh TCP file selects new namespace");
+    require(!setns(saved,CLONE_NEWNET),"restore network namespace");
+    require(proc_tcp(AF_INET,inode,&entry)==1,"restored namespace exposes original endpoint");
+    fclose(old);close(saved);
+}
+static void compare_proc(int family,ino_t inode,const struct inet_diag_msg *diag) {
+    struct inet_diag_msg entry={0};require(proc_tcp(family,inode,&entry)==1,"proc TCP inode discovery");
+    require(entry.idiag_state==diag->idiag_state && entry.idiag_uid==diag->idiag_uid && entry.idiag_rqueue==diag->idiag_rqueue &&
+        entry.idiag_wqueue==(diag->idiag_state==10?0:diag->idiag_wqueue) &&
+        !memcmp(&entry.id.idiag_src,&diag->id.idiag_src,16) && !memcmp(&entry.id.idiag_dst,&diag->id.idiag_dst,16) &&
+        entry.id.idiag_sport==diag->id.idiag_sport && entry.id.idiag_dport==diag->id.idiag_dport,"proc TCP real endpoint/state/owner/queue agreement");
+}
+static void real_netstat(unsigned port) {
+    int pipefd[2];require(!pipe(pipefd),"netstat output pipe");pid_t child=fork();require(child>=0,"netstat fork");
+    if(!child){close(pipefd[0]);dup2(pipefd[1],STDOUT_FILENO);close(pipefd[1]);execl("/opt/thekernel-tools/bin/netstat","netstat","-tanp",(char *)NULL);_exit(127);}
+    close(pipefd[1]);char text[16384];size_t length=0;ssize_t size;
+    while(length<sizeof(text)-1 && (size=read(pipefd[0],text+length,sizeof(text)-1-length))>0)length+=size;
+    text[length]=0;close(pipefd[0]);int status;require(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status),"real TCP netstat exit");
+    printf("%s",text);char endpoint[32];snprintf(endpoint,sizeof(endpoint),":%u",port);
+    require(strstr(text,"LISTEN") && strstr(text,"ESTABLISHED") && strstr(text,endpoint),"real netstat live TCP rows");
+}
 static ino_t inode_of(int fd) {struct stat st;require(!fstat(fd,&st),"socket inode");return st.st_ino;}
 static void ready(int fd) {struct pollfd p={.fd=fd,.events=POLLIN};require(poll(&p,1,3000)==1 && (p.revents&POLLIN),"receive ready");}
 
@@ -68,6 +121,7 @@ static void real_ss(unsigned port) {
     require(strstr(output,"LISTEN") && strstr(output,"ESTAB") && strstr(output,endpoint),"real ss active endpoints");
 }
 
+static int namespace_mode;
 static void check_family(int family, int tools) {
     int listener=socket(family,SOCK_STREAM|SOCK_CLOEXEC,IPPROTO_TCP);
     require(listener>=0,"listener socket");
@@ -83,10 +137,12 @@ static void check_family(int family, int tools) {
     ino_t listener_inode=inode_of(listener);struct inet_diag_msg entry={0};
     require(dump(family,1U<<13,listener_inode,&entry)==1 && entry.idiag_state==7,"bound inactive pseudo-state mask");
     require(dump(family,1U<<7,listener_inode,&entry)==0,"bound inactive not CLOSE mask");
+    require(proc_tcp(family,listener_inode,&entry)==0,"proc TCP omits bound inactive OFD");
     require(!listen(listener,4),"listen");
     require(dump(family,1U<<10,listener_inode,&entry)==1,"LISTEN mask and inode");
     require(entry.idiag_family==family && entry.idiag_state==10 && ntohs(entry.id.idiag_sport)==port &&
         !entry.id.idiag_dport && entry.idiag_uid==geteuid() && entry.idiag_rqueue==0 && entry.idiag_wqueue==4,"listen fields");
+    compare_proc(family,listener_inode,&entry);
     if(family==AF_INET) require(entry.id.idiag_src[0]==htonl(INADDR_LOOPBACK),"IPv4 address bytes");
     else require(!memcmp(entry.id.idiag_src,&in6addr_loopback,16),"IPv6 address bytes");
     request_cookie=0x5a5a5a5a;
@@ -104,8 +160,9 @@ static void check_family(int family, int tools) {
     require(dump(family,1U<<1,server_inode,&entry)==1,"ESTABLISHED mask and inode");
     require(entry.idiag_state==1 && ntohs(entry.id.idiag_sport)==port && entry.id.idiag_dport &&
         entry.idiag_uid==geteuid() && entry.idiag_rqueue==sizeof(data),"connected fields and real queue");
+    compare_proc(family,server_inode,&entry);
     require(dump(family,1U<<10,server_inode,&entry)==0,"established not listening");
-    if(tools) real_ss(port);
+    if(tools) {real_ss(port);real_netstat(port);}
     char received[sizeof(data)];require(recv(server,received,sizeof(received),MSG_WAITALL)==sizeof(received) &&
         !memcmp(received,data,sizeof(data)),"diagnostics did not consume data");
     require(dump(family,1U<<1,server_inode,&entry)==1 && entry.idiag_rqueue==0,"queue drained");
@@ -116,12 +173,15 @@ static void check_family(int family, int tools) {
     require(dump(family,1U<<1,server_inode,&entry)==1 && entry.idiag_timer==2 && entry.idiag_expires>0 &&
         !entry.idiag_retrans,"actual keepalive timer and expiry");
     if(tools)real_ss(port);
+    if(namespace_mode && family==AF_INET && !geteuid())namespace_views(server_inode);
     close(server);close(client);close(listener);
     require(dump(family,1U<<10,listener_inode,&entry)==0,"closed listener retired");
+    require(proc_tcp(family,listener_inode,&entry)==0,"proc closed listener retired");
 }
 
 int main(int argc,char **argv) {
     alarm(25);int tools=argc==2 && !strcmp(argv[1],"--tools");
+    namespace_mode=argc==2 && !strcmp(argv[1],"--namespace");
     check_family(AF_INET,tools);check_family(AF_INET6,tools);
     if(!geteuid()) {
         pid_t child=fork();require(child>=0,"uid child");

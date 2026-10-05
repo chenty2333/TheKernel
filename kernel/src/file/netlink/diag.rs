@@ -17,7 +17,7 @@ pub(crate) struct SocketDiagRegistration {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SocketDiagRecord {
     pub(crate) family: u16,
-    protocol: u8,
+    pub(crate) protocol: u8,
     pub(crate) state: u8,
     pub(crate) cookie: u64,
     pub(crate) sport: u16,
@@ -28,7 +28,7 @@ pub(crate) struct SocketDiagRecord {
     pub(crate) receive_queue: u32,
     pub(crate) send_queue: u32,
     pub(crate) uid: u32,
-    pub(crate) inode: u32,
+    pub(crate) inode: u64,
     pub(crate) timer: u8,
     pub(crate) expires_ms: u32,
     pub(crate) retransmit_timeouts: u32,
@@ -95,7 +95,7 @@ impl SocketDiagRegistration {
             receive_queue: snapshot.receive_queue as u32,
             send_queue: snapshot.send_queue as u32,
             uid,
-            inode: inode as u32,
+            inode,
             timer: snapshot.timer_kind,
             expires_ms: snapshot.timer_remaining_ms,
             retransmit_timeouts: snapshot.retransmit_timeouts,

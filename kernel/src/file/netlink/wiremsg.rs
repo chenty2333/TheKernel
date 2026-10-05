@@ -84,7 +84,7 @@ pub(crate) fn sock_diag_message(
     payload[56..60].copy_from_slice(&entry.receive_queue.to_ne_bytes());
     payload[60..64].copy_from_slice(&entry.send_queue.to_ne_bytes());
     payload[64..68].copy_from_slice(&entry.uid.to_ne_bytes());
-    payload[68..72].copy_from_slice(&entry.inode.to_ne_bytes());
+    payload[68..72].copy_from_slice(&(entry.inode as u32).to_ne_bytes());
     // No provider extension is invented yet; retaining the parsed extension
     // mask makes the request path complete without changing base selection.
     let _ = extensions;

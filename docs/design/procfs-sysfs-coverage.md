@@ -737,3 +737,43 @@ was incorrectly placed after a subsequent keepalive emission: it now checks
 reset immediately after ACK and count1 after the next emitted probe. Related
 host/lint were rerun after that test-only repair; production behavior remained
 unchanged. No physical network or real packet-loss acceptance is claimed.
+
+### Live proc TCP consumer prefix
+
+Publish tcp/tcp6 in the existing task-selected net directory; an opened file
+pins that target network namespace and its opener's user-namespace credential.
+Reuse the live readonly TCP provider, not a second endpoint registry or an empty
+fallback. Preserve full64-bit socket inode for proc (inet_diag's UAPI remains
+32-bit). Bound inactive TCP_CLOSE is not in proc TCP's listen/established walk.
+Addresses use native32-bit word hex on x86_64, with the correct IPv4/IPv6 headers;
+IPv4 records retain the Linux minimum line width. Listener proc transmit queue
+is0, unlike inet_diag's listener backlog capacity. Proc ignores delayed-ACK
+control timers, while inet_diag exposes Linux7.2.3 kind5; other active deadlines
+are translated to USER_HZ100 units. Retry/probe/UID/inode/queues come from actual
+observations, with no polling or queue consumption.
+
+Linux7.2.3 tcp_ipv4.c/tcp_ipv6.c supply the mandatory consumer-prefix grammar.
+Native sock-reference/pointer/congestion-tail observations are not yet exposed;
+those trailing Linux per-state fields are omitted rather than fabricated0.
+Thus this is not complete Linux7.2.3 row-field coverage. Orphan/TIME-WAIT after
+final OFD close and SYN-queue child rows also remain incomplete. UDP/UDP6/UNIX/
+SNMP are still missing and netstat -tunap is not yet accepted as a whole.
+
+The same C probe on host Linux validates active IPv4/IPv6 endpoints, listener
+and unread queues, addresses/UID/inode against inet_diag, closed retirement and
+inactive omission. Guest-only namespace mode will check old-file namespace
+pinning vs a fresh view and setns restoration; no host namespace is changed.
+Period30 passes: Python655 (three environmental skips), Rust6036 (one existing
+ignored test; kernel2611), KVM guest67/67 without skips/normal shutdown
+(system-h4vj1n9c), full ABI257/257 (abi-jfcfyisi), q35/n305 lint. The new constant-
+chunk style warning was repaired using typed4-byte chunks; related kernel2611
+and both lints were rerun, leaving784 existing warnings with unchanged runtime
+address conversion. Guest verifies old-file namespace pinning, fresh-new-net
+view, setns restoration, inactive omission and live mandatory column values.
+
+Actual signed Alpine netstat -tanp displays IPv4/IPv6 LISTEN/ESTABLISHED and
+actual16-byte receive queues (shell-xjgff18k, DIAG_TOOLS_RC=0). Most PID/program
+labels are shown, but that run's first IPv4 listener shows '-' despite ss finding
+its PID/fd/inode; this separate ownership-label anomaly needs diagnosis and is
+not declared passed. Netstat -tunap/UDP/UNIX/SNMP and complete trailing TCP rows
+remain unaccepted; no physical network acceptance is claimed.

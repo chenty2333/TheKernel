@@ -493,7 +493,7 @@ static int test_net_statistics(void) {
 static int test_socket_diag(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-socket-diag-smoke",
-        NULL, "socket-diag-child");
+        "--namespace", "socket-diag-child");
 }
 
 static int test_netlink_dump_padding(void) {
