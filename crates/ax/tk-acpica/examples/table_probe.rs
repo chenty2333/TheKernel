@@ -34,6 +34,8 @@ fn main() {
     );
     let mut prt_ok = 0;
     let mut prt_err = 0;
+    let mut prw_ok = 0;
+    let mut prw_err = 0;
     let mut buttons = 0;
     let mut ec = 0;
     let mut thermal = 0;
@@ -43,6 +45,17 @@ fn main() {
                 prt_ok += 1
             } else {
                 prt_err += 1
+            }
+        }
+        if n.path.ends_with("._PRW") {
+            if engine
+                .evaluate(&n.path, &[])
+                .and_then(tk_acpica::gpe::parse)
+                .is_ok()
+            {
+                prw_ok += 1;
+            } else {
+                prw_err += 1;
             }
         }
         if n.kind == 13 {
@@ -65,7 +78,11 @@ fn main() {
          AML-errors={}",
         tk_acpica::aml_error_count()
     );
-    if s5.is_err() || prt_ok == 0 || prt_err != 0 {
+    println!(
+        "_PRW decoded={prw_ok} errors={prw_err} AML-errors={}",
+        tk_acpica::aml_error_count()
+    );
+    if s5.is_err() || prt_ok == 0 || prt_err != 0 || prw_err != 0 {
         std::process::exit(1);
     }
 }

@@ -11,6 +11,8 @@ mod ec;
 #[cfg(target_os = "none")]
 mod native;
 pub mod thermal;
+#[cfg(target_os = "none")]
+mod wake;
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 static BUTTONS: SpinNoIrq<Vec<String>> = SpinNoIrq::new(Vec::new());
 
@@ -62,6 +64,8 @@ fn initialize() -> Result<(), Status> {
         .install_fixed_power(axhal::acpi::button_event)
         .is_ok();
     let ec_count = ec::install(&engine, &nodes)?;
+    let wake_sources = wake::configure(&engine, &nodes)?;
+    info!("acpica: registered wake GPE sources={wake_sources}; sleep wake masks remain disabled");
     engine.initialize_objects()?;
     let osc = engine.platform_osc();
     info!("acpica: platform _OSC status={osc:?}; no native PCIe control requested");

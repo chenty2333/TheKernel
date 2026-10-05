@@ -30,8 +30,18 @@ routing and validated MADT overrides. Unsupported routing fails closed and
 restores static power handling. IRQ work admission uses a fixed 128-entry queue;
 AML runs on a task, never inline in SCI. Shutdown masks/synchronizes SCI and
 drains work before namespace teardown. ACPICA handles edge/level GPE dispatch;
-the adapter additionally bounds sustained SCI traffic and disables GPEs from a
-task. Detailed wake-source policy remains limited by the absence of suspend.
+the adapter additionally admits at most 1024 SCI callbacks per second, masks
+sustained traffic and disables GPEs from a task. Exactly one recovery is allowed
+per boot; a repeated storm remains masked until reboot. The rate/recovery budget
+has host regression coverage, not a measured hardware storm claim.
+
+`_PRW` global/block-device GPE references are validated and registered before
+automatic GPE enable. Wake-only sources are not blindly enabled as runtime
+sources; S0-capable sources and control-method power buttons explicitly retain
+runtime delivery. Sleep wake masks and wake power resources are not activated:
+there is no suspend/resume lifecycle in this task. External N305 `_PRW` decoded
+60/60 with zero AML errors in simulation. An authored Q35 button fixture registered
+one wake-capable S0 GPE; this does not establish physical wake.
 
 Fixed events and `PNP0C0C` Notify 0x80 latch the existing ordered shutdown worker:
 SIGPWR to init, one-second grace, filesystem flush, sleep-state preparation and

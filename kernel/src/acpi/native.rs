@@ -1,7 +1,7 @@
 //! Native OSL adapter. Enabled only by acpi=acpica; no native hardware claim.
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -58,8 +58,8 @@ static SCI_INFLIGHT: SpinNoIrq<()> = SpinNoIrq::new(());
 static IRQ_FUNCTION: AtomicUsize = AtomicUsize::new(0);
 static IRQ_CONTEXT: AtomicUsize = AtomicUsize::new(0);
 static IRQ_VECTOR: AtomicUsize = AtomicUsize::new(0);
-static IRQ_WINDOW: AtomicU64 = AtomicU64::new(0);
-static IRQ_COUNT: AtomicU32 = AtomicU32::new(0);
+static SCI_BUDGET: SpinNoIrq<tk_acpica::gpe::StormBudget> =
+    SpinNoIrq::new(tk_acpica::gpe::StormBudget::new());
 static STORM: AtomicBool = AtomicBool::new(false);
 
 pub fn start_worker() -> Result<(), Status> {
@@ -88,7 +88,11 @@ fn worker() {
             if STORM.swap(false, Ordering::AcqRel) {
                 // Fail closed on sustained SCI traffic. Disable GPEs from task
                 // context before re-enabling the fixed-event SCI delivery.
-                super::disable_storming_gpes();
+                if SCI_BUDGET.lock().recover_once() {
+                    super::disable_storming_gpes();
+                } else {
+                    warn!("acpica: repeated SCI storm; delivery remains masked until reboot");
+                }
             }
             let _ = axtask::sleep(Duration::from_millis(1));
         }
@@ -97,10 +101,7 @@ fn worker() {
 fn sci() {
     let _inflight = SCI_INFLIGHT.lock();
     let now = axhal::time::monotonic_time_nanos() / 1_000_000_000;
-    if IRQ_WINDOW.swap(now, Ordering::Relaxed) != now {
-        IRQ_COUNT.store(0, Ordering::Relaxed);
-    }
-    if IRQ_COUNT.fetch_add(1, Ordering::Relaxed) >= 1024 {
+    if SCI_BUDGET.lock().observe(now) {
         axhal::irq::set_enable(IRQ_VECTOR.load(Ordering::Relaxed), false);
         STORM.store(true, Ordering::Release);
         return;
@@ -149,7 +150,7 @@ fn pci_address(id: PciId, reg: u32) -> Option<u64> {
     )
 }
 // SAFETY: native adapter is activated after allocation/scheduler setup and only
-// with explicit ACPI hardware ownership. SCI is BSP-targeted and synchronized
+// with explicit ACPI hardware ownership. SCI removal is synchronized
 // by masking and waiting for the in-flight callback. Mappings persist for the kernel lifetime; queue is bounded
 // and drained before interpreter termination.
 unsafe impl Backend for Native {
@@ -338,7 +339,6 @@ unsafe impl Backend for Native {
     }
 }
 pub fn reenable_sci() {
-    IRQ_COUNT.store(0, Ordering::Relaxed);
     axhal::irq::set_enable(IRQ_VECTOR.load(Ordering::Acquire), true);
 }
 pub(super) fn read_ec_port(port: u16) -> Result<u8, Status> {
@@ -350,7 +350,4 @@ pub(super) fn write_ec_port(port: u16, value: u8) -> Result<(), Status> {
 }
 pub(super) fn stall_ec(micros: u32) {
     NATIVE.stall(micros);
-}
-pub(super) fn pci_read(id: PciId, reg: u32, width: u32) -> Result<u64, Status> {
-    NATIVE.read_pci(id, reg, width)
 }

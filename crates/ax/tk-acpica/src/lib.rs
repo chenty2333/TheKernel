@@ -39,3 +39,5 @@ pub mod ec;
 pub mod thermal;
 
 pub mod routing;
+
+pub mod gpe;

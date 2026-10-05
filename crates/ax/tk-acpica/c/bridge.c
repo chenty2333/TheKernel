@@ -164,3 +164,11 @@ UINT32 tk_acpi_table_count(void) {
     }
     return count;
 }
+ACPI_STATUS tk_acpi_setup_wake(const char *device,const char *block,UINT32 number,UINT8 runtime) {
+    ACPI_HANDLE wake,gpe=NULL;
+    ACPI_STATUS status=AcpiGetHandle(NULL,(char *)device,&wake);
+    if(ACPI_SUCCESS(status) && block)status=AcpiGetHandle(NULL,(char *)block,&gpe);
+    if(ACPI_SUCCESS(status))status=AcpiSetupGpeForWake(wake,gpe,number);
+    if(ACPI_SUCCESS(status) && runtime)status=AcpiEnableGpe(gpe,number);
+    return status;
+}
