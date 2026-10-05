@@ -362,6 +362,9 @@ if [ "$TOOLCHAIN" = debug ]; then
         -o "$STAGE/opt/thekernel-tests/debugger/threads-target"
     cp "$REPO_ROOT/tests/guest/debugger/threads.gdb" "$STAGE/opt/thekernel-tests/debugger/threads.gdb"
     cp "$REPO_ROOT/tests/guest/debugger/threads-target.c" "$STAGE/opt/thekernel-tests/debugger/threads-target.c"
+    "${CROSS_COMPILE}gcc" -O0 -g3 -static -no-pie -std=c11 -Wall -Wextra -Werror \
+        "$REPO_ROOT/tests/guest/debugger/watch-target.c" -o "$STAGE/opt/thekernel-tests/debugger/watch-target"
+    cp "$REPO_ROOT/tests/guest/debugger/watch.gdb" "$STAGE/opt/thekernel-tests/debugger/watch.gdb"
 fi
 
 # The optional guest tool payload: a compiler and its development sysroot,

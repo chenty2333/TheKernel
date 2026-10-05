@@ -7,6 +7,7 @@ pub(crate) mod cpu_stats;
 mod creds;
 mod exec_cred;
 mod futex;
+pub(crate) mod hardware_debug;
 mod jobctl;
 mod loadavg;
 mod ops;

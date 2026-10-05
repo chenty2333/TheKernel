@@ -130,6 +130,28 @@ int main(void) {
     CHECK(request(PTRACE_DETACH, 0, NULL) == 0);
     CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     child = 0;
+    child = fork(); CHECK(child >= 0);
+    if (!child) {
+        if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0)) _exit(1);
+        raise(SIGSTOP); word = 44; word = 55; _exit(word != 55);
+    }
+    CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status));
+    CHECK(request(PTRACE_POKEUSER, offsetof(struct user, u_debugreg[0]), (void *)&word) == 0);
+    CHECK(request(PTRACE_POKEUSER, offsetof(struct user, u_debugreg[7]), (void *)0x90001) == 0);
+    for (unsigned long expected = 44; expected <= 55; expected += 11) {
+        CHECK(request(PTRACE_CONT, 0, NULL) == 0);
+        CHECK(waitpid(child, &status, 0) == child && WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP);
+        siginfo_t info; CHECK(request(PTRACE_GETSIGINFO, 0, &info) == 0);
+        CHECK(info.si_code == TRAP_HWBKPT);
+        struct user_regs_struct trap_regs; CHECK(request(PTRACE_GETREGS, 0, &trap_regs) == 0);
+        CHECK((uintptr_t)info.si_addr == trap_regs.rip);
+        unsigned long actual = 0;
+        CHECK(request(PTRACE_PEEKDATA, (unsigned long)&word, &actual) == 0 && actual == expected);
+        CHECK(request(PTRACE_PEEKUSER, offsetof(struct user, u_debugreg[6]), &actual) == 0 && (actual & 1));
+    }
+    CHECK(request(PTRACE_POKEUSER, offsetof(struct user, u_debugreg[7]), NULL) == 0);
+    CHECK(request(PTRACE_CONT, 0, NULL) == 0);
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status)); child = 0;
     puts("PTRACE_REGISTERS_OK");
     return 0;
 }

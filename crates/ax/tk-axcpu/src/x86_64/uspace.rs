@@ -60,6 +60,8 @@ pub type ReturnHookAction = UserReturnHookAction;
 /// Concise alias for [`UserReturnHookResult`].
 pub type ReturnHookResult = UserReturnHookResult;
 
+pub use super::debug_registers::HardwareDebugRegisters;
+
 /// Context to enter user space.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -78,6 +80,8 @@ pub struct UserContext {
     pub fs_selector: u16,
     /// Saved GS selector (independent of its explicit base).
     pub gs_selector: u16,
+    /// Validated task-owned user comparator overlay.
+    pub debug_registers: HardwareDebugRegisters,
 }
 
 /// Linux x86_64 `struct pt_regs` ABI layout used by tracing programs.
@@ -217,6 +221,7 @@ impl UserContext {
             es: 0,
             fs_selector: 0,
             gs_selector: 0,
+            debug_registers: HardwareDebugRegisters::default(),
         }
     }
 
@@ -294,7 +299,11 @@ impl UserContext {
         unsafe { write_thread_pointer(self.fs_base as _) };
         KernelGsBase::write(x86_64::VirtAddr::new_truncate(self.gs_base));
 
+        let kernel_debug = self.debug_registers.enabled().then(HardwareDebugRegisters::read);
+        if kernel_debug.is_some() { self.debug_registers.install(); }
         unsafe { enter_user(self) };
+        let debug_status = if self.vector == 1 { super::asm::read_perf_debug_status() } else { 0 };
+        if let Some(image) = kernel_debug { image.install(); }
 
         self.ds = DS::get_reg().0;
         self.es = ES::get_reg().0;
@@ -324,7 +333,7 @@ impl UserContext {
             (1, _) => {
                 // DR6 is CPU-local. Snapshot/acknowledge before enabling IRQs
                 // or permitting migration; #DB has no CPU-pushed error code.
-                let status = super::asm::read_perf_debug_status();
+                let status = debug_status;
                 super::asm::acknowledge_perf_debug_status(status & ((1 << 14) | 0x0f));
                 ReturnReason::Exception(ExceptionInfo {
                     vector, error_code: status, cr2, address: self.ip(),

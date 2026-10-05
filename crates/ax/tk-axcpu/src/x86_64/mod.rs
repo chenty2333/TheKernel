@@ -1,4 +1,5 @@
 mod context;
+pub mod debug_registers;
 mod gdt;
 mod idt;
 pub mod ioport;

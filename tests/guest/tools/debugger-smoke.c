@@ -88,6 +88,14 @@ int main(int argc, char **argv) {
         !strstr(output, "= 12") || !strstr(output, "DEBUG_RESULT=24") ||
         !strstr(output, "exited normally")) return 1;
     puts("THEKERNEL_REAL_GDB_BASIC_OK");
+    char *watch[] = {"/usr/bin/gdb", "-q", "-nx", "-batch", "-x",
+        "/opt/thekernel-tests/debugger/watch.gdb", "--args",
+        "/opt/thekernel-tests/debugger/watch-target", NULL};
+    if (run_tool(watch, "gdb-watch") || !strstr(output, "Hardware watchpoint") ||
+        !strstr(output, "WATCH_FIRST_OK") || !strstr(output, "WATCH_SECOND_OK") ||
+        !strstr(output, "Old value = 7") || !strstr(output, "New value = 19") ||
+        !strstr(output, "WATCH_RESULT=19") || !strstr(output, "exited normally")) return 1;
+    puts("THEKERNEL_REAL_GDB_WATCH_OK");
     char *trace[] = {"/usr/bin/strace", "-f", "-qq", "-s", "64", "-e",
         "trace=fork,clone,vfork,execve,openat,write,lseek,read,close,unlink,wait4",
         "/opt/thekernel-tests/debugger/trace-target", follow ? NULL : "--trace-child", NULL};

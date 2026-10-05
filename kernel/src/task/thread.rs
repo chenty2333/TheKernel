@@ -1073,6 +1073,7 @@ pub struct Thread {
     pub(crate) ptrace_syscall_mode: SpinNoIrq<Option<(super::PtraceSession, u8)>>,
     pub(crate) ptrace_stop_provenance: AtomicU8,
     pub(crate) ptrace_forced_tf: AtomicBool,
+    pub(crate) hardware_debug: SpinNoIrq<super::hardware_debug::DebugState>,
     pub(crate) ptrace_xsave: SpinNoIrq<Option<axtask::XsaveImage>>,
     /// The process data shared by all threads in the process.
     pub proc_data: Arc<ProcessData>,
@@ -1830,6 +1831,7 @@ impl Thread {
             ptrace_syscall_mode: SpinNoIrq::new(None),
             ptrace_stop_provenance: AtomicU8::new(0),
             ptrace_forced_tf: AtomicBool::new(false),
+            hardware_debug: SpinNoIrq::new(Default::default()),
             ptrace_xsave: SpinNoIrq::new(None),
             signal,
             proc_data,

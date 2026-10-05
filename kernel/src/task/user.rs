@@ -144,6 +144,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                             // this IRQ-disabled final return edge so a
                             // migration cannot expose a prior task's ports.
                             super::ptrace_runtime::prepare_user_step(thr, uctx);
+                            uctx.debug_registers = thr.hardware_debug.lock().image();
                             thr.install_user_io_permissions();
                         }
                         action
@@ -245,10 +246,13 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     ReturnReason::Interrupt => {}
                     ReturnReason::Exception(exc_info) => {
                         crate::uprobe::abort_xol(&mut uctx);
-                        deliver_fatal_user_signal_info(map_exception_signal_info(
-                            &exc_info,
-                            uctx.ip() as usize,
-                        ));
+                        let watch_address = if exc_info.vector == 1 {
+                            thr.hardware_debug.lock().trap(exc_info.error_code)
+                        } else { None };
+                        let info = watch_address.filter(|_| exc_info.error_code & (1 << 14) == 0).map(|_| SignalInfo::new_fault(
+                            Signo::SIGTRAP, linux_raw_sys::general::TRAP_HWBKPT as i32, uctx.ip(),
+                        )).unwrap_or_else(|| map_exception_signal_info(&exc_info, uctx.ip()));
+                        deliver_fatal_user_signal_info(info);
                     }
                     r => {
                         warn!("Unexpected return reason: {r:?}");

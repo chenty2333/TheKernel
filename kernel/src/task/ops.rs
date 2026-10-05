@@ -2284,6 +2284,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // the registered user area while a task is exiting (the mapping may have
     // already disappeared), so this path must not perform a user write.
     thr.reset_rseq_on_exit();
+    *thr.hardware_debug.lock() = Default::default();
     thr.proc_data.end_exec(tid);
     // Linux `do_exit()` calls `synchronize_group_exit()` before
     // `exit_signals()`, which makes the task "will free memory" observable

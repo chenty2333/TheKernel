@@ -90,7 +90,7 @@ TF. POPF/IRET opcode detection has host helper coverage, not a claim that arbitr
 user return-fault recovery is complete. The test admits at most one additional
 same-IP TRAP_TRACE observed on native Linux after the emulation entry, and checks
 that no store occurred at that stop before stepping the next instruction.
-Hardware branch stepping (SINGLEBLOCK) and hardware watchpoints remain pending.
+Hardware branch stepping (SINGLEBLOCK) remains unsupported.
 Real gdb/strace acceptance and task-exact multithread state are recorded below.
 
 ## Stop report readiness
@@ -284,3 +284,26 @@ raw regression passed native Linux but exposed premature wait4 return in the
 guest before this fix. The raw regression then passed the paired subset; host2596 and complete baseline62/debug64 KVM guest passed, including real strace-f. The tracer
 still sees EINTR rather than Linux's internal ERESTART* sentinel for this
 interruption; exact internal syscall-exit rendering remains a parity gap.
+
+## Hardware comparators
+
+POKEUSER/PEEKUSER admit DR0–DR3, virtual DR6 and raw DR7. Enabled
+comparators support execution, aligned 1/2/4/8-byte write and read/write
+watchpoints; I/O comparators and kernel addresses are rejected. Reserved DR7
+bits are retained for reads but removed from the physical image. Invalid writes
+do not commit. User entry installs a task-owned image with IRQs disabled; every
+return snapshots DR6 and restores the kernel/perf image before IRQ dispatch.
+SIGTRAP reports TRAP_HWBKPT and the trapping RIP (TRAP_TRACE wins if BS is set).
+Exec and logical exit clear the image and release ownership.
+
+Known difference: ptrace hardware comparators and perf breakpoint descriptors
+exclude each other globally with EBUSY, not Linux's shared per-CPU slot admission.
+Disabled DR7 releases the ptrace lease; a perf lease lasts with the descriptor.
+This conservative admission avoids silently masking existing perf breakpoints.
+No hardware registers change by default. Native N305 behavior is unverified.
+
+Validation: real Alpine GDB 16.3 `watch watched` stopped on both writes,
+reported 0→7→19 and exited normally in the 64/64 debug guest suite
+(`system-ohd44s06`). Raw POKEUSER hardware writes, virtual DR6, TRAP_HWBKPT
+and si_addr=RIP passed on both Linux and TheKernel (`abi-h6lylt08`).
+Kernel host tests passed 2596; q35 lint passed with existing warnings.

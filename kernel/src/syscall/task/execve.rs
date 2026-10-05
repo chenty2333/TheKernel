@@ -825,6 +825,7 @@ fn do_execve(
     reset_current_task_extended_state();
     reset_current_user_cet_state();
     crate::task::reset_current_xsave_state();
+    *thr.hardware_debug.lock() = Default::default();
     let _ = rseq_exec.commit();
     if let Some(session) = exec_ptrace_session {
         crate::task::ptrace_runtime::report_exec(thr, session, exec_old_pid);
