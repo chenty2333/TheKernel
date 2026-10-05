@@ -10,6 +10,25 @@
 #include <unistd.h>
 
 static int fail(const char *label) { fprintf(stderr, "PCI sysfs: %s (errno=%d)\n", label, errno); return 1; }
+static int resources(const char *path, const unsigned char *config) {
+    FILE *file=fopen(path,"r"); if (!file) return fail("resource-open");
+    char line[256]; unsigned rows=0;
+    while (fgets(line,sizeof(line),file)) {
+        unsigned long long start,end,flags; char extra;
+        if (rows>=6 || sscanf(line,"0x%16llx 0x%16llx 0x%16llx %c",&start,&end,&flags,&extra)!=3 ||
+            strlen(line)!=57 || line[56]!='\n') return fail("resource-prefix-grammar");
+        if (flags) {
+            unsigned raw; memcpy(&raw, config+0x10+rows*4, sizeof(raw));
+            unsigned long long expected=raw & ((flags&0x100) ? ~3U : ~15U);
+            if (!(flags&0x100) && (raw&6)==4 && rows<5) { unsigned high;memcpy(&high,config+0x14+rows*4,sizeof(high));expected|=(unsigned long long)high<<32; }
+            if (start!=expected || end<start || !(flags&0x300)) return fail("resource-config-range");
+        } else if (start || end) return fail("resource-absent-not-invented");
+        rows++;
+    }
+    if (ferror(file) || fclose(file)) return fail("resource-read");
+    // Empty means not observed by the native boot BAR owner, not no resources.
+    return 0;
+}
 static int read_hex(const char *path, unsigned *value) {
     FILE *file=fopen(path,"r"); if (!file) return -1;
     int result=fscanf(file,"%x",value)==1 ? 0 : -1; fclose(file); return result;
@@ -37,6 +56,8 @@ int main(void) {
         if (bytes<256 || (unsigned)(config[0]|config[1]<<8)!=vendor ||
             (unsigned)(config[2]|config[3]<<8)!=device ||
             (unsigned)(config[9]|config[10]<<8|config[11]<<16)!=class_id) return fail("config-identity");
+        snprintf(path,sizeof(path),"/sys/bus/pci/devices/%s/resource",entry->d_name);
+        if (resources(path, config)) return 1;
         snprintf(path,sizeof(path),"/sys/bus/pci/devices/%s/irq",entry->d_name);
         FILE *irq_file=fopen(path,"r"); unsigned irq;
         if (!irq_file || fscanf(irq_file,"%u",&irq)!=1 || irq>=0xf0) return fail("irq-vector");

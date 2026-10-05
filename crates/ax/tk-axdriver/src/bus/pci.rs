@@ -418,6 +418,9 @@ fn probe_virtio_input(
 
 #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
 fn quiesce_pci_function(root: &mut PciRoot, bdf: DeviceFunction) {
+    crate::pci_resources::invalidate(crate::pci::Address {
+        segment: axhal::pci::ecam_segment(), bus: bdf.bus, device: bdf.device, function: bdf.function,
+    });
     // Stop DMA and mask INTx before transferring the removal to axinput.  The
     // VirtIO input owner then drops its queues and resets the transport while
     // tearing down the event node.
@@ -467,6 +470,8 @@ fn config_pci_device(
     bdf: DeviceFunction,
     allocator: &mut Option<PciRangeAllocator>,
 ) -> DevResult {
+    let mut resources = [crate::pci_resources::Resource::default(); 6];
+    let mut observed_all = true;
     let mut bar = 0;
     while bar < PCI_BAR_NUM {
         let info = root
@@ -498,6 +503,18 @@ fn config_pci_device(
         let info = root
             .bar_info(bdf, bar)
             .map_err(|_| DevError::InvalidParam)?;
+        let raw = observe_config_word(crate::pci::Address {
+            segment: axhal::pci::ecam_segment(), bus: bdf.bus, device: bdf.device, function: bdf.function,
+        }, 0x10 + usize::from(bar) * 4);
+        let (start, size) = match info {
+            BarInfo::IO { address, size } => (u64::from(address), u64::from(size)),
+            BarInfo::Memory { address, size, .. } => (address, u64::from(size)),
+        };
+        if let Some(observed) = raw.and_then(|raw| crate::pci_resources::Resource::observed(start, size, raw)) {
+            resources[usize::from(bar)] = observed;
+        } else {
+            observed_all = false;
+        }
         match info {
             BarInfo::IO { address, size } => {
                 if address > 0 && size > 0 {
@@ -548,6 +565,14 @@ fn config_pci_device(
             | Command::BUS_MASTER
             | Command::INTERRUPT_DISABLE,
     );
+    let address = crate::pci::Address {
+        segment: axhal::pci::ecam_segment(), bus: bdf.bus, device: bdf.device, function: bdf.function,
+    };
+    if observed_all {
+        crate::pci_resources::record(address, resources);
+    } else {
+        crate::pci_resources::invalidate(address);
+    }
     Ok(())
 }
 

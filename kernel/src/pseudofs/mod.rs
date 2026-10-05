@@ -12,6 +12,7 @@ mod graphics_metrics;
 pub(crate) mod hugetlb;
 pub(crate) mod mqueue;
 mod pci_sysfs;
+mod pci_resources;
 mod net_sysfs;
 pub(crate) mod nsfs;
 pub(crate) mod proc;

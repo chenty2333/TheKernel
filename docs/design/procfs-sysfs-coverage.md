@@ -1021,3 +1021,38 @@ lint passed with the same 784 existing kernel warnings. The fresh baseline has
 
 收口优先顺序是 lspci → ss/netstat → net statistics → diskstats/iostat →
 lsusb → lsns；剩余细节不阻止进入 B2，但实际工具失败不能标为通过。
+
+### B1 close37: eliminate lspci's missing-resource diagnostic
+
+The fresh USB-backed QEMU sweep (`shell-v9pe1q4o`) showed that all three lspci
+calls exit 0, but `-vvv` prints `pcilib: Cannot open .../resource` for each
+function. This is a direct tool diagnostic, not a BAR-size cosmetic difference.
+The native PCI configuration owner already sizes standard-function BARs twice;
+it now retains the results of those **existing** probes. No probe/configuration
+write is added, and observation failure/cache exhaustion does not change driver
+admission. Removal invalidates observations; reads check current identity and
+all six raw BAR words before using a cached range.
+
+The read-only `resource` file exports the measured six-BAR prefix with Linux
+three-column hex records. A measured zero-size BAR and a 64-bit BAR's upper slot
+are genuinely absent resources, so their rows are zero. Unmeasured functions
+export no rows; unmeasured ROM/bridge windows are omitted at EOF, not filled with
+invented zero-sized resources. This is **not the full Linux resource array**.
+pciutils' native sysfs reader treats a missing suffix as unknown and falls back
+to read-only config for that class of fields; this preserves actual config
+addresses without new hardware sizing. No cache/file read enables a device.
+
+The first sweep also confirmed clean basic lsns (8 real namespace rows), empty
+ss Unix exit 0 (not yet an active socket acceptance), missing diskstats and
+empty iostat disks, and lsusb exit 1 with three QEMU USB input devices present.
+The next item after lspci is active ss Unix; field-level driver/ROM/bridge
+resource details stay in “已知差异”, not another expansive implementation.
+
+Close37 validation: related driver host tests 55/55 and kernel 2620/2620 passed;
+KVM guest 69/69 passed (`system-we0f6x6y`). Actual signed Alpine lspci -vvv/-k/-t
+all returned 0 without pcilib diagnostics (`shell-4yjhlt52`), and the GPU resource
+prefix contained actual 4 KiB and 16 KiB memory ranges. The guest PCI test checks
+prefix grammar and each measured start against raw config while retaining its
+existing read-only/credential checks. Final lint-only iterator cleanup uses the
+same fixed four-byte chunks, with related host tests/lint rerun; no new runtime
+semantics or syscall contract changes, so no redundant full ABI run.

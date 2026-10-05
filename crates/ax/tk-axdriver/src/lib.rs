@@ -71,6 +71,8 @@ mod macros;
 #[cfg(not(feature = "dyn"))]
 #[path = "pci_observation.rs"]
 pub mod pci;
+#[cfg(not(feature = "dyn"))]
+pub mod pci_resources;
 mod bus;
 mod drivers;
 mod dummy;

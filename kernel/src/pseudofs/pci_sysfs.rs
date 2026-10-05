@@ -169,11 +169,11 @@ pub(super) fn enrich(
         return Ok(attributes);
     };
     attributes
-        .try_reserve(FIELDS.len() + 3)
+        .try_reserve(FIELDS.len() + 4)
         .map_err(|_| VfsError::NoMemory)?;
     attributes.retain(|attribute| {
         !FIELDS.contains(&attribute.name())
-            && !matches!(attribute.name(), "config" | "numa_node" | "irq")
+            && !matches!(attribute.name(), "config" | "numa_node" | "irq" | "resource")
     });
     for field in FIELDS {
         attributes.push(DeviceAttribute::try_new(field.into(), move || {
@@ -192,6 +192,9 @@ pub(super) fn enrich(
         axdriver::pci::irq(address)
             .map(|irq| format!("{irq}\n"))
             .ok_or(VfsError::Io)
+    })?);
+    attributes.push(DeviceAttribute::try_new("resource".into(), move || {
+        super::pci_resources::snapshot(address)
     })?);
     // No PCI-to-NUMA affinity has been discovered. Linux uses -1 for unknown.
     attributes.push(DeviceAttribute::try_new("numa_node".into(), || Ok("-1\n"))?);
