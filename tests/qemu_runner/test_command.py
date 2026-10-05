@@ -317,3 +317,14 @@ class HdaTopologyTests(unittest.TestCase):
         self.assertIn("hda-duplex,audiodev=hda-audio", command)
         self.assertFalse(any("virtio-sound" in value for value in command))
         self.assertTrue(any("out.frequency=48000,out.channels=2,out.format=s16" in value for value in command))
+
+
+class CpuPowerManagementTests(unittest.TestCase):
+    def test_power_passthrough_is_explicit_and_kvm_only(self):
+        options = dict(arch="x86_64", kernel=Path("kernel"), rootfs=None,
+                       direct_kernel=True, accel="kvm")
+        self.assertNotIn("-overcommit", build_qemu_command(**options))
+        enabled = build_qemu_command(**options, cpu_pm=True)
+        self.assertEqual(enabled[enabled.index("-overcommit") + 1], "cpu-pm=on")
+        with self.assertRaises(CommandError):
+            build_qemu_command(**{**options, "accel": "tcg"}, cpu_pm=True)
