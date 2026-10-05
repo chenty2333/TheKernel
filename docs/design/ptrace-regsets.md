@@ -307,3 +307,9 @@ reported 0→7→19 and exited normally in the 64/64 debug guest suite
 (`system-ohd44s06`). Raw POKEUSER hardware writes, virtual DR6, TRAP_HWBKPT
 and si_addr=RIP passed on both Linux and TheKernel (`abi-h6lylt08`).
 Kernel host tests passed 2596; q35 lint passed with existing warnings.
+
+Final continuation acceptance: the full debug KVM suite66/66 passed with real
+GDB basic/threads/hardware watch and strace-f alongside opt-in CPU idle. The
+complete50-program TheKernel ABI guest passed (abi-wx81cz3w); Linux50 had the
+same pre-existing socket timeout-rounding assertion failure. This is not a
+complete paired-ABI pass and does not erase the advanced differences above.

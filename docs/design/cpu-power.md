@@ -127,3 +127,18 @@ The same run passed real GDB basic/watch/threads and strace-f. Final full host
 passed654 Python tests (3 skips), kernel2599; affected tool fixtures refreshed
 with63 host tests and strict C compilation. q35/n305 lint passed with existing
 warnings; platform power excerpt scan found zero matches/zero Linux code.
+
+## Final ABI boundary
+
+Complete50-program ABI run `abi-wx81cz3w`: all50 TheKernel programs passed.
+The Linux oracle completed50 with one unchanged socket-provider failure,
+RCVTIMEO_JIFFY_ROUND_TRIP (its HZ100 timeout-rounding expectation). Thus the
+complete paired gate is **not a pass**. It predates this continuation and is
+outside the A task; no socket/B work was changed. The hardware ptrace subset
+passed on both kernels separately. Power interfaces do not establish native
+N305 behavior, physical residency or a controlled host-utilization decrease.
+
+Known HWP difference: remote policy writes publish/kick asynchronously; sysfs
+reads show requested policy, with hardware applying it on its owner refresh.
+Native reproducibility tests must verify application before timing work and
+configure every CPU used by the workload, not only cpu0.
