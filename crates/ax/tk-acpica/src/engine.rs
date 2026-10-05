@@ -98,6 +98,19 @@ impl Engine {
         registration: &'static BackendRegistration,
         mode: Mode,
     ) -> Result<Self, Status> {
+        // SAFETY: same initialization contract; no early handler is requested.
+        unsafe { Self::initialize_with_tables(registration, mode, |_| Ok(())) }
+    }
+    /// Install table-described handlers before AML table loading. The hook may
+    /// inspect tables and install operation-region handlers, but must not evaluate
+    /// AML or enable events before namespace/hardware initialization completes.
+    /// # Safety
+    /// Same contract as initialize, plus the hook must obey this phase boundary.
+    pub unsafe fn initialize_with_tables(
+        registration: &'static BackendRegistration,
+        mode: Mode,
+        prepare: impl FnOnce(&Self) -> Result<(), Status>,
+    ) -> Result<Self, Status> {
         LIVE.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| crate::ALREADY_EXISTS)?;
         // SAFETY: global lifecycle claim excludes another engine.
@@ -113,6 +126,7 @@ impl Engine {
         unsafe {
             status(AcpiInitializeSubsystem())?;
             status(AcpiInitializeTables(core::ptr::null_mut(), 32, 1))?;
+            prepare(&engine)?;
             status(AcpiLoadTables())?;
             let flags = match mode {
                 Mode::Hardware => 0,

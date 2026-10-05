@@ -8,6 +8,8 @@ use tk_acpica::{Engine, Node};
 use tk_acpica::{Mode, Status};
 #[cfg(target_os = "none")]
 mod native;
+#[cfg(target_os = "none")]
+mod ec;
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 static BUTTONS: SpinNoIrq<Vec<String>> = SpinNoIrq::new(Vec::new());
 
@@ -28,6 +30,7 @@ pub fn init() {
     }
     #[cfg(target_os = "none")]
     if let Err(status) = initialize() {
+        ec::stop();
         native::stop_worker();
         axhal::acpi::restore_static();
         warn!("acpica: initialization failed status={status:#x}; static fallback restored");
@@ -41,7 +44,7 @@ fn initialize() -> Result<(), Status> {
     native::start_worker()?;
     // SAFETY: allocation, scheduler, IRQ/APIC and owned RSDP are ready; only
     // explicit acpi=acpica allows firmware AML to take hardware ownership.
-    let mut engine = unsafe { Engine::initialize(&native::REGISTRATION, Mode::Hardware) }?;
+    let mut engine = unsafe { Engine::initialize_with_tables(&native::REGISTRATION, Mode::Hardware, ec::bootstrap) }?;
     engine.install_notify(notify)?;
     let nodes = engine.namespace()?;
     let mut buttons = Vec::new();
@@ -55,10 +58,13 @@ fn initialize() -> Result<(), Status> {
     let fixed = engine
         .install_fixed_power(axhal::acpi::button_event)
         .is_ok();
+    let ec_count = ec::install(&engine, &nodes)?;
     engine.initialize_objects()?;
     let osc = engine.platform_osc();
     info!("acpica: platform _OSC status={osc:?}; no native PCIe control requested");
     engine.update_gpes()?;
+    ec::activate(&engine)?;
+    info!("acpica: installed EC controllers={ec_count}");
     info!(
         "acpica: ready version=20260930 nodes={} devices={} AML-errors={} fixed-button={} \
          method-buttons={} hardware-unverified",

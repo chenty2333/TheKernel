@@ -86,8 +86,15 @@ reference and its text conversion live outside Git in `refs/acpica/`.
 ## Remaining acceptance and known differences
 
 PCI INTx allocation/probe ordering, inactive-link `_SRS` policy and a real INTx
-RX/TX test remain pending. EC and thermal consumers are being committed
-separately; their mechanism tests alone do not establish native behaviour.
+RX/TX test remain pending. EC SystemIO operation regions are installed before object initialization. ECDT
+bootstrap handlers are installed before table AML loading, then checked against
+PNP0C09 namespace resources. Transactions serialize byte commands, use bounded
+100 ms waits and honor namespace `_GLK`. S0 query handling polls every 25 ms with
+a 64-query budget and masks its global GPE; GPE-block packages and EC wake are
+not supported. Q35 has no EC: protocol/timeout/ECDT validation tests plus a Q35
+no-EC guest run are **not** proof of native EC transactions. The prohibited
+hardware run is the outstanding acceptance blocker. Thermal integration is
+being committed separately.
 Root sysfs currently exports admitted ACPICA table descriptors; `dynamic/` is
 present but separate dynamic-load attribution is not implemented. Namespace
 views do not claim Linux modalias/driver binding or full device-power policy.

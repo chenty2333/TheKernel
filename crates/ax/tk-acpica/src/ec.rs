@@ -132,3 +132,73 @@ mod tests {
         assert_eq!(m.clock, 100_000);
     }
 }
+
+/// ECDT's validated SystemIO bootstrap resources. The ID is an absolute AML
+/// path, never logged; UID is retained for matching/diagnostics by the owner.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BootController {
+    pub command: u16,
+    pub data: u16,
+    pub gpe: u8,
+    pub uid: u32,
+    pub path: alloc::string::String,
+}
+pub fn ecdt(table: &[u8]) -> Result<BootController, Status> {
+    if table.len() < 66
+        || &table[..4] != b"ECDT"
+        || u32::from_le_bytes(table[4..8].try_into().unwrap()) as usize != table.len()
+        || table.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0
+    {
+        return Err(BAD_PARAMETER);
+    }
+    fn port(gas: &[u8]) -> Result<u16, Status> {
+        let address = u64::from_le_bytes(gas[4..12].try_into().unwrap());
+        if gas[0] != 1
+            || gas[1] != 8
+            || gas[2] != 0
+            || gas[3] > 1
+            || address == 0
+            || address > u16::MAX.into()
+        {
+            return Err(crate::SUPPORT);
+        }
+        Ok(address as u16)
+    }
+    let name = &table[65..];
+    let end = name.iter().position(|v| *v == 0).ok_or(BAD_PARAMETER)?;
+    let path = core::str::from_utf8(&name[..end]).map_err(|_| BAD_PARAMETER)?;
+    if !path.starts_with('\\') || path.len() > 4096 {
+        return Err(BAD_PARAMETER);
+    }
+    Ok(BootController {
+        command: port(&table[36..48])?,
+        data: port(&table[48..60])?,
+        uid: u32::from_le_bytes(table[60..64].try_into().unwrap()),
+        gpe: table[64],
+        path: path.into(),
+    })
+}
+#[cfg(test)]
+mod ecdt_tests {
+    use super::*;
+    #[test]
+    fn table_validation() {
+        let mut t = alloc::vec![0u8; 70];
+        t[..4].copy_from_slice(b"ECDT");
+        t[4..8].copy_from_slice(&70u32.to_le_bytes());
+        for (offset, port) in [(36, 0x66u64), (48, 0x62)] {
+            t[offset] = 1;
+            t[offset + 1] = 8;
+            t[offset + 4..offset + 12].copy_from_slice(&port.to_le_bytes());
+        }
+        t[64] = 9;
+        t[65..].copy_from_slice(b"\\EC0\0");
+        t[9] = 0u8.wrapping_sub(t.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
+        let ec = ecdt(&t).unwrap();
+        assert_eq!((ec.command, ec.data, ec.gpe), (0x66, 0x62, 9));
+        assert_eq!(ec.path, "\\EC0");
+        t[9] ^= 1;
+        assert_eq!(ecdt(&t), Err(BAD_PARAMETER));
+        assert_eq!(ecdt(&t[..40]), Err(BAD_PARAMETER));
+    }
+}
