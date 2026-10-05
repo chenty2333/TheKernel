@@ -348,6 +348,10 @@ for source in "$REPO_ROOT"/tests/guest/portable/*.c; do
 done
 
 if [ "$TOOLCHAIN" = debug ]; then
+    POWER_PAYLOAD="${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}/guest-tools/power"
+    bash "$REPO_ROOT/scripts/build-power-payload.sh" --output "$POWER_PAYLOAD"
+    cp -a "$POWER_PAYLOAD/." "$STAGE/"
+    install -m 0755 "$REPO_ROOT/tests/guest/power-tools.sh" "$STAGE/opt/thekernel-tests/power-tools.sh"
     mkdir -p "$STAGE/opt/thekernel-tests/debugger"
     "${CROSS_COMPILE}gcc" -O0 -g3 -fno-omit-frame-pointer -static -no-pie -std=c11 -Wall -Wextra -Werror \
         -pthread "$REPO_ROOT/tests/guest/debugger/debug-target.c" \

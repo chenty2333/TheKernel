@@ -199,3 +199,27 @@ MCFG 为 0xc0000000，FACS checksum 为 n/a，kernel-ecam 明确来源或 UNAVAI
 FADT/PNP0C0C 枚举保留实际状态；声卡 `/proc/asound/card*/codec#*` 交给 B。
 逐个看 capture-status，不用 PCI 控制器 ID 猜 codec。新 collector 未上真机。
 调度器 Reschedule 注册空档、B 的 NVMe/HDA/GT 及主机采集卡故障不在 A 本轮范围。
+
+## CPU power management — 未在硬件上验证
+
+- Boot the unchanged default first; record firmware HWP request and idle
+  behavior with read-only diagnostics. Do not enable HWP with MSR writes and
+  do not change NVMe policy. Keep the existing guarded native boot procedure.
+- Repeat with only `cpuidle.mwait=1`. Read every CPU's cpuidle state name/desc,
+  latency/residency/disable and usage/time before/after an idle window. Check
+  that Gracemont C1 is unusable, that missing ARAT blocks C6/C8/C10, and that
+  timers, wakeups and normal guest-like workloads remain reliable. Compare
+  package/core hardware residency counters and wall power, not just entries.
+- Read cpufreq_supported, cpuinfo range and sampled current frequency. If HWP
+  is not firmware enabled, or the nominal reference/package-control policy
+  is unsupported, keep the unsupported result; do not bypass admission.
+  If supported, save initial settings, explicitly select powersave/EPP and a
+  bounded min/max, verify busy APERF/MPERF behavior and scheduler uclamp clipping
+  within policy bounds. Restore saved settings after the authorized experiment.
+  Verify that default scheduling never changes the firmware request.
+- Read coretemp hwmon labels/input/max/crit/crit_alarm and run `sensors`.
+  Compare core/package temperatures with firmware/reference readings; check
+  invalid DTS status and read-only permissions. Do not clear thermal log bits.
+- Run real cpupower frequency-info/idle-info. Measure power/temperature and
+  latency under fixed independent workloads, with no concurrent builds/VMs.
+  QEMU success and the software idle counters do not establish N305 savings.

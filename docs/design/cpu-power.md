@@ -108,3 +108,22 @@ virtual/unknown admission); kernel read-only attribute test and q35 lint passed.
 KVM guest63/63 (system-migo15ns) opened the empty hwmon class successfully,
 without probing virtual thermal MSRs. Actual core/package readings remain
 unverified on physical hardware; real sensors acceptance follows below.
+
+## Real power tools
+
+Nine pinned, signed Alpine3.24 runtime packages stage unmodified cpupower7.1.5
+and sensors3.6.0 into the debug guest. Info commands run as uid/gid65534: their
+sysfs inputs are public. This avoids cpupower's root-only attempt to load the
+Linux msr module (TheKernel has no loadable modules); no fake successful
+modprobe or MSR transport is installed. Sensors' status1/No sensors found is
+the expected unsupported QEMU result, not a temperature measurement.
+
+Real-tool acceptance passed in the complete opt-in debug KVM guest66/66
+(system-13qkgs9m): cpupower idle-info reported intel_idle, HLT/MWAIT descriptions,
+latency/residency and growing usage/duration; frequency-info honestly reported
+no active driver, and sensors reported No sensors found. Running info commands
+as an unprivileged user removed the initial root-only missing-msr-module warning.
+The same run passed real GDB basic/watch/threads and strace-f. Final full host
+passed654 Python tests (3 skips), kernel2599; affected tool fixtures refreshed
+with63 host tests and strict C compilation. q35/n305 lint passed with existing
+warnings; platform power excerpt scan found zero matches/zero Linux code.

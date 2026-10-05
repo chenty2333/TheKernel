@@ -1,0 +1,11 @@
+# Signed Alpine v3.24 x86_64 power tools runtime closure.
+# filename	sha256	url	license	origin
+cpupower-7.1.5-r0.apk	2838ac49a8e710e935f58a1ba9d7e5ab595d41a97ee29323a2a8a4a7c3afc0bd	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/cpupower-7.1.5-r0.apk	GPL-2.0-only	linux-tools
+libcap2-2.78-r0.apk	42886a7b4bcde26347c712925c8dc7db202b6029ef9b8c7ee81577ab7bdd8fad	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcap2-2.78-r0.apk	BSD-3-Clause OR GPL-2.0-only	libcap
+libintl-1.0-r0.apk	cb03919cba5624b5e8759d04f3b31913b02585355988b914bc31de4746ff5ef6	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libintl-1.0-r0.apk	LGPL-2.1-or-later	gettext
+libnl3-3.11.0-r0.apk	b8c9b0a045b1615027b58618103f3dabeca69aacb80b527ac7b96ba354aba4a4	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libnl3-3.11.0-r0.apk	LGPL-2.1-or-later	libnl3
+lm-sensors-3.6.0-r5.apk	2c7cdc2c048b8966e9669a3dff221cb45ee84b0e39067220b0d99a45fd966ead	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/lm-sensors-3.6.0-r5.apk	LGPL-2.1-or-later AND GPL-2.0-or-later	lm-sensors
+lm-sensors-libs-3.6.0-r5.apk	6d0bf5b4e84232132afd4088ef749a84bf1bbdbca559604107e5695f9fc7c810	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/lm-sensors-libs-3.6.0-r5.apk	LGPL-2.1-or-later AND GPL-2.0-or-later	lm-sensors
+musl-1.2.6-r2.apk	573712e2f49c15bfc20a2699f204acdfc74c772722b15e7353d768057fae0e71	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-1.2.6-r2.apk	MIT	musl
+pciutils-libs-3.15.0-r0.apk	2905bb60e9bc41d208d62c7f6b238140117dde44254b0acc6e42834ede8e815c	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/pciutils-libs-3.15.0-r0.apk	GPL-2.0-or-later	pciutils
+sysfsutils-2.1.1-r3.apk	8339101131547d03b4eda3e3dbb24352e6fe875ec985017607b7fb446a26826f	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/sysfsutils-2.1.1-r3.apk	GPL-2.0-only AND LGPL-2.1-only	sysfsutils

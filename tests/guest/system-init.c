@@ -464,6 +464,10 @@ static int test_signal_fp(void) {
  * findings as required or informational, so a non-zero result here means a
  * required contract failed rather than that a probe was unable to look. */
 #if defined(THEKERNEL_TOOL_PAYLOAD_DEBUG)
+static int test_real_cpu_tools(void) {
+    return run_guest_program("/opt/thekernel-tests/bin/thekernel-cpu-power-smoke", "--tools", "real-cpu-tools-child");
+}
+
 static int test_real_gdb_threads(void) {
     return run_guest_program("/opt/thekernel-tests/bin/thekernel-debugger-smoke", "--threads", "real-gdb-threads-child");
 }
@@ -1126,6 +1130,7 @@ static int run_init(int argc, char **argv) {
 #if defined(THEKERNEL_TOOL_PAYLOAD_DEBUG)
         { "real-debugger", test_real_debugger, 240 },
         { "real-gdb-threads", test_real_gdb_threads, 120 },
+        { "real-cpu-tools", test_real_cpu_tools, 30 },
 #endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
         { "compiler-smoke", test_compiler_smoke, 120 },

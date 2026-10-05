@@ -218,3 +218,18 @@ the pin file copied into the guest. This is optional userspace, not Rust kernel
 source or a change to the kernel license. Redistribution must satisfy each
 package's license and corresponding-source requirements where applicable;
 Alpine package origins identify the build recipes and upstream source projects.
+
+### CPU power diagnostic payload
+
+The debug guest optionally includes unmodified, Alpine-signed `cpupower`
+7.1.5-r0 (GPL-2.0-only, origin linux-tools) and lm-sensors3.6.0-r5
+(GPL-2.0-or-later/LGPL-2.1-or-later), with their musl/libcap/libintl/libnl3/
+pciutils/sysfsutils runtime closure. Exact package/source-origin/license rows
+are in `config/guest-power-apk-pins.tsv`; `scripts/build-power-payload.sh`
+verifies pins and Alpine signatures before extraction, using the same checksum-pinned
+Alpine3.24.1 bootstrap as the debugger payload. No package maintainer scripts,
+host installation, sensors-detect or kernel-linked GPL code are introduced.
+Corresponding sources are the Alpine v3.24 aports linux-tools/lm-sensors and
+listed dependency origins; upstream versions and Alpine package revisions are
+preserved in the manifest. `/opt/thekernel-tools/POWER-PACKAGES.tsv` accompanies
+the binaries. The new kernel Rust only implements architectural facts/behavior.

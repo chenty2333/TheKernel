@@ -66,7 +66,14 @@ static int frequency(void) {
     for(unsigned i=0;i<4;i++) { snprintf(path,sizeof(path),ROOT "/cpu0/cpufreq/%s",fields[i]); unsigned long long value=number(path); if(value==~0ULL||value<previous) return 1; previous=value; }
     puts("CPU_FREQUENCY supported"); return 0;
 }
-int main(void) {
+int main(int argc, char **argv) {
+    if(argc==2 && !strcmp(argv[1],"--tools")) {
+        /* All info nodes are public. Avoid cpupower's root-only attempt to
+           load Linux's msr module; TheKernel does not have loadable modules. */
+        if(setgid(65534)||setuid(65534)) return 1;
+        execl("/bin/sh","sh","/opt/thekernel-tests/power-tools.sh",(char *)NULL);
+        return 1;
+    }
     int fd=open("/sys/class/hwmon",O_RDONLY|O_DIRECTORY); if(fd<0) return 1; close(fd);
     puts("CPU_THERMAL hwmon class accessible"); return idle()||frequency();
 }
