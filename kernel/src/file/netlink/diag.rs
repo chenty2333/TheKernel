@@ -29,6 +29,12 @@ pub(crate) struct SocketDiagRecord {
     pub(crate) send_queue: u32,
     pub(crate) uid: u32,
     pub(crate) inode: u32,
+    pub(crate) timer: u8,
+    pub(crate) expires_ms: u32,
+    pub(crate) retransmit_timeouts: u32,
+    pub(crate) probes_sent: u32,
+    pub(crate) retransmit_delay_ms: u32,
+    pub(crate) ack_delay_ms: u32,
 }
 
 fn diagnostic_address(address: Option<IpAddress>, family: u16) -> [u8; 16] {
@@ -90,6 +96,12 @@ impl SocketDiagRegistration {
             send_queue: snapshot.send_queue as u32,
             uid,
             inode: inode as u32,
+            timer: snapshot.timer_kind,
+            expires_ms: snapshot.timer_remaining_ms,
+            retransmit_timeouts: snapshot.retransmit_timeouts,
+            probes_sent: snapshot.probes_sent,
+            retransmit_delay_ms: snapshot.retransmit_delay_ms,
+            ack_delay_ms: snapshot.ack_delay_ms,
         }))
     }
 }
@@ -229,6 +241,12 @@ mod tests {
             send_queue: 5,
             uid: 1000,
             inode: 42,
+            timer: 2,
+            expires_ms: 1234,
+            retransmit_timeouts: 3,
+            probes_sent: 7,
+            retransmit_delay_ms: 1000,
+            ack_delay_ms: 10,
         }
     }
 
@@ -277,6 +295,8 @@ mod tests {
         let payload = &bytes[size_of::<NlMsgHdr>()..];
         assert_eq!(payload.len(), 72);
         assert_eq!(&payload[..2], &[AF_INET as u8, 10]);
+        assert_eq!(&payload[2..4], &[2, 7]);
+        assert_eq!(&payload[52..56], &1234u32.to_ne_bytes());
         assert_eq!(&payload[4..6], &24680u16.to_be_bytes());
         assert_eq!(&payload[8..12], &[127, 0, 0, 1]);
         for (offset, expected) in [(40, 2u32), (56, 3), (60, 5), (64, 1000), (68, 42)] {

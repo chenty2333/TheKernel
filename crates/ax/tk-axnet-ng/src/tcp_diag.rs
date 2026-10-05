@@ -12,6 +12,12 @@ pub struct TcpDiagnosticSnapshot {
     pub receive_queue: usize,
     /// Bytes for connected sockets; admitted backlog capacity for listeners.
     pub send_queue: usize,
+    pub timer_kind: u8,
+    pub timer_remaining_ms: u32,
+    pub retransmit_timeouts: u32,
+    pub probes_sent: u32,
+    pub retransmit_delay_ms: u32,
+    pub ack_delay_ms: u32,
 }
 
 fn linux_state(state: smol::State) -> u8 {
@@ -49,6 +55,7 @@ impl TcpSocket {
             return Err(AxError::WouldBlock);
         }
         let socket = sockets.get::<smol::Socket>(self.handle);
+        let timer = socket.timer_observation(crate::service::now());
         // Accepted children and wildcard binds have a concrete connection
         // tuple, independent of the wrapper's bind-admission metadata.
         let local = socket.local_endpoint().map_or_else(
@@ -77,6 +84,19 @@ impl TcpSocket {
             peer: socket.remote_endpoint(),
             receive_queue,
             send_queue,
+            timer_kind: match timer.kind {
+                smol::TimerKind::Inactive => 0,
+                smol::TimerKind::Retransmit => 1,
+                smol::TimerKind::KeepAlive => 2,
+                smol::TimerKind::TimeWait => 3,
+                smol::TimerKind::ZeroWindowProbe => 4,
+                smol::TimerKind::DelayedAck => 5,
+            },
+            timer_remaining_ms: timer.remaining.total_millis().min(u32::MAX as u64) as u32,
+            retransmit_timeouts: timer.retransmit_timeouts,
+            probes_sent: timer.probes_sent,
+            retransmit_delay_ms: timer.retransmit_delay.total_millis().min(u32::MAX as u64) as u32,
+            ack_delay_ms: timer.ack_delay.total_millis().min(u32::MAX as u64) as u32,
         })
     }
 }

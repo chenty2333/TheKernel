@@ -67,6 +67,12 @@ pub(crate) fn sock_diag_message(
     let mut payload = vec![0_u8; 72];
     payload[0] = entry.family as u8;
     payload[1] = entry.state;
+    payload[2] = entry.timer;
+    payload[3] = match entry.timer {
+        1 => entry.retransmit_timeouts.min(u8::MAX as u32) as u8,
+        2 | 4 => entry.probes_sent.min(u8::MAX as u32) as u8,
+        _ => 0,
+    };
     payload[4..6].copy_from_slice(&entry.sport.to_be_bytes());
     payload[6..8].copy_from_slice(&entry.dport.to_be_bytes());
     payload[8..24].copy_from_slice(&entry.src);
@@ -74,6 +80,7 @@ pub(crate) fn sock_diag_message(
     payload[40..44].copy_from_slice(&entry.ifindex.to_ne_bytes());
     payload[44..48].copy_from_slice(&(entry.cookie as u32).to_ne_bytes());
     payload[48..52].copy_from_slice(&((entry.cookie >> 32) as u32).to_ne_bytes());
+    payload[52..56].copy_from_slice(&entry.expires_ms.to_ne_bytes());
     payload[56..60].copy_from_slice(&entry.receive_queue.to_ne_bytes());
     payload[60..64].copy_from_slice(&entry.send_queue.to_ne_bytes());
     payload[64..68].copy_from_slice(&entry.uid.to_ne_bytes());

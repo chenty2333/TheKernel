@@ -486,9 +486,9 @@ transport's admitted bound, not a fabricated Linux default.
 
 Partial: this does not cover orphaned/TIME-WAIT endpoints after final OFD close,
 SYN-queue child records, TCP diagnostic bytecode, exact non-dump lookup (both explicitly rejected), timer/
-retransmission base fields or optional extensions. Timer/retransmission fields
-remain zero pending actual provider data, not accepted as Linux-equivalent
-observations. UDP/raw/DCCP/SCTP dumps now reject EOPNOTSUPP rather than publish
+retransmission base fields or optional extensions. At item23 timer/retransmission fields were still zero/unaccepted; the later
+TCP control-timer observation section replaces those placeholders with actual
+provider observations. UDP/raw/DCCP/SCTP dumps now reject EOPNOTSUPP rather than publish
 fake endpoints. /proc socket tables and SNMP remain pending. No physical network
 or performance acceptance is claimed.
 
@@ -699,3 +699,41 @@ and unchanged unique global slot usage across that fork. Actual signed Alpine
 free remains correct (shell-j_rkmh6n, SWAP_CAPACITY_RC=0). No new errno/admission
 behavior, host/device swap, or broader Dirty/PSS/status completeness claim;
 full period/ABI validation remains the item27 run.
+
+### TCP control-timer observations
+
+Before publishing proc TCP tables, replace diagnostic timer/retransmission zeros
+with real transport observations. smoltcp already has active retransmit,
+keepalive, zero-window, TIME-WAIT and delayed-ACK timers. A read-only typed
+observation samples those fields with the same clock the existing service uses;
+it never polls, emits, consumes, acknowledges, or changes deadlines. Numeric
+Linux7.2.3 inet_diag timer kinds0..5 and millisecond expiry are encoded at the
+kernel boundary, not baked into transport behavior.
+
+Add observation-only counters to actual protocol events: RTO expiry increments
+retry timeouts (not fast retransmit), valid acknowledgement progress resets
+them; accepted keepalive/zero-window probe emission increments probes, and valid
+inbound progress clears probes. Reset clears both. This does not change send,
+ACK, timer, congestion, socket-option or admission behavior. Linux's base wire
+record selects retry vs probe counters according to timer kind; its byte field
+is bounded when the native count exceeds255. Proc-oriented full counts and
+RTO/ACK delay are retained for the next table formatter.
+
+Linux7.2.3 net/ipv4/inet_diag.c, tcp_ipv4.c and UAPI inet_diag.h are behavioral
+references. The previous diagnostic base timers are no longer accepted as
+constant0 when active. Orphan/TIME-WAIT after final OFD close, SYN-queue records,
+bytecode and optional extensions remain incomplete. Kernel/transport host tests
+pass: smol631+7 doctests, net214 (one existing ignored test), kernel2609 and
+lint784 existing warnings. Guest67/67 without skips/normal shutdown passes
+(system-0oi5i21n), and full ABI257/257 passes (abi-q0edryik). The same C keepalive
+probe on host Linux and guest requires actual timer2 and positive expiry; it
+does not assume a Linux default interval for this transport.
+
+Signed Alpine ss -tanpeo displays the live retransmit and keepalive deadlines
+for both families (shell-2bq15nfl, DIAG_TOOLS_RC=0). This package labels Linux7.2.3
+DELACK kind5 as unknown, but the numeric kind/expiry are correct; do not remap
+that kernel UAPI to work around a tool-version label. An initial host assertion
+was incorrectly placed after a subsequent keepalive emission: it now checks
+reset immediately after ACK and count1 after the next emitted probe. Related
+host/lint were rerun after that test-only repair; production behavior remained
+unchanged. No physical network or real packet-loss acceptance is claimed.

@@ -58,7 +58,7 @@ static void real_ss(unsigned port) {
     pid_t pid=fork();require(pid>=0,"ss fork");
     if(!pid) {
         close(pipefd[0]);dup2(pipefd[1],STDOUT_FILENO);close(pipefd[1]);
-        execl("/opt/thekernel-tools/bin/ss","ss","-tanpe",(char *)NULL);_exit(127);
+        execl("/opt/thekernel-tools/bin/ss","ss","-tanpeo",(char *)NULL);_exit(127);
     }
     close(pipefd[1]);char output[16384];size_t length=0;ssize_t size;
     while(length<sizeof(output)-1 && (size=read(pipefd[0],output+length,sizeof(output)-1-length))>0) length+=size;
@@ -109,6 +109,13 @@ static void check_family(int family, int tools) {
     char received[sizeof(data)];require(recv(server,received,sizeof(received),MSG_WAITALL)==sizeof(received) &&
         !memcmp(received,data,sizeof(data)),"diagnostics did not consume data");
     require(dump(family,1U<<1,server_inode,&entry)==1 && entry.idiag_rqueue==0,"queue drained");
+    int keepalive=1;
+    require(!setsockopt(server,SOL_SOCKET,SO_KEEPALIVE,&keepalive,sizeof(keepalive)),"keepalive activation");
+    require(send(client,"k",1,0)==1,"keepalive observation traffic");ready(server);
+    char keepalive_byte;require(recv(server,&keepalive_byte,1,0)==1 && keepalive_byte=='k',"keepalive observation received");
+    require(dump(family,1U<<1,server_inode,&entry)==1 && entry.idiag_timer==2 && entry.idiag_expires>0 &&
+        !entry.idiag_retrans,"actual keepalive timer and expiry");
+    if(tools)real_ss(port);
     close(server);close(client);close(listener);
     require(dump(family,1U<<10,listener_inode,&entry)==0,"closed listener retired");
 }

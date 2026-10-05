@@ -19,6 +19,9 @@ use crate::{
 };
 
 mod congestion;
+#[path = "tcp_observation.rs"]
+mod observation;
+pub use observation::{TimerKind, TimerObservation};
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
@@ -467,6 +470,8 @@ pub enum CongestionControl {
 pub struct Socket<'a> {
     state: State,
     timer: Timer,
+    retransmit_timeouts: u32,
+    probes_sent: u32,
     rtte: RttEstimator,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
@@ -584,6 +589,8 @@ impl<'a> Socket<'a> {
         Socket {
             state: State::Closed,
             timer: Timer::new(),
+            retransmit_timeouts: 0,
+            probes_sent: 0,
             rtte: RttEstimator::default(),
             assembler: Assembler::new(),
             tx_buffer,
@@ -930,6 +937,8 @@ impl<'a> Socket<'a> {
         self.state = State::Closed;
         self.failure_reason = None;
         self.timer = Timer::new();
+        self.retransmit_timeouts = 0;
+        self.probes_sent = 0;
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
@@ -2106,6 +2115,10 @@ impl<'a> Socket<'a> {
 
         // Update remote state.
         self.remote_last_ts = Some(cx.now());
+        self.probes_sent = 0;
+        if repr.ack_number.is_some_and(|ack| ack > self.local_seq_no) {
+            self.retransmit_timeouts = 0;
+        }
 
         // RFC 1323: The window field (SEG.WND) in the header of every incoming segment, with the
         // exception of SYN segments, is left-shifted by Snd.Wind.Scale bits before updating SND.WND.
@@ -2486,6 +2499,9 @@ impl<'a> Socket<'a> {
             self.failure_reason = Some(FailureReason::TimedOut);
             self.set_state(State::Closed);
         } else if !self.seq_to_transmit(cx) && self.timer.should_retransmit(cx.now()) {
+            if matches!(self.timer, Timer::Retransmit { .. }) {
+                self.retransmit_timeouts = self.retransmit_timeouts.saturating_add(1);
+            }
             // If a retransmit timer expired, we should resend data starting at the last ACK.
             net_debug!("retransmitting");
 
@@ -2710,6 +2726,9 @@ impl<'a> Socket<'a> {
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
         emit(cx, (ip_repr, repr))?;
+        if is_keep_alive || is_zero_window_probe {
+            self.probes_sent = self.probes_sent.saturating_add(1);
+        }
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -5839,6 +5858,7 @@ mod test {
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
+        assert_eq!(s.socket.timer_observation(Instant::from_millis(1000)).retransmit_timeouts, 0);
         recv_nothing!(s, time 1050);
         recv!(s, time 2000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
@@ -5846,6 +5866,13 @@ mod test {
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
+        assert_eq!(s.socket.timer_observation(Instant::from_millis(2000)).retransmit_timeouts, 1);
+        send!(s, time 2010, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 7),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.socket.timer_observation(Instant::from_millis(2010)).retransmit_timeouts, 0);
     }
 
     #[test]
@@ -7829,6 +7856,7 @@ mod test {
             s.socket.poll_at(&mut s.cx),
             PollAt::Time(Instant::from_millis(100))
         );
+        assert_eq!(s.socket.timer_observation(Instant::from_millis(0)).probes_sent, 1);
         recv_nothing!(s, time 95);
         recv!(s, time 100, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -7849,6 +7877,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
+        assert!(s.socket.timer_observation(Instant::from_millis(200)).probes_sent >= 3);
         send!(s, time 250, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
@@ -7858,6 +7887,7 @@ mod test {
             s.socket.poll_at(&mut s.cx),
             PollAt::Time(Instant::from_millis(350))
         );
+        assert_eq!(s.socket.timer_observation(Instant::from_millis(250)).probes_sent, 0);
         recv_nothing!(s, time 345);
         recv!(s, time 350, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -7865,6 +7895,7 @@ mod test {
             payload:    &b"\x00"[..],
             ..RECV_TEMPL
         }));
+        assert_eq!(s.socket.timer_observation(Instant::from_millis(350)).probes_sent, 1);
     }
 
     // =========================================================================================//
