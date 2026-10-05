@@ -152,8 +152,8 @@ pub fn set_overcommit_ratio(value: u32) {
 
 pub fn commit_limit_bytes() -> usize {
     let stats = system_memory_stats();
-    ((stats.total_bytes as u128 * overcommit_ratio() as u128) / 100).min(usize::MAX as u128)
-        as usize
+    (((stats.total_bytes as u128 * overcommit_ratio() as u128) / 100)
+        + super::swap_usage().total_bytes as u128).min(usize::MAX as u128) as usize
 }
 
 pub fn committed_as_bytes() -> usize {

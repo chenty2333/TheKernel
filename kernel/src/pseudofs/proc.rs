@@ -92,7 +92,6 @@ use crate::{
     },
 };
 
-const PROC_SWAPS_HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
 
 fn validate_oom_score_adj_value(next_value: i32) -> VfsResult<()> {
     if !(-1000..=1000).contains(&next_value) {
@@ -1399,10 +1398,13 @@ fn real_meminfo() -> String {
     let page_tables_kb = stats.page_table_bytes / 1024;
     let commit_limit_kb = commit_limit_bytes() / 1024;
     let committed_kb = committed_as_bytes() / 1024;
+    let swap_usage = crate::mm::swap_usage();
+    let swap_total_kb = swap_usage.total_bytes / 1024;
+    let swap_free_kb = swap_usage.free_bytes / 1024;
     format!(
         "MemTotal:       {total_kb:>8} kB\nMemFree:        {free_kb:>8} kB\nMemAvailable:   \
          {available_kb:>8} kB\nBuffers:               0 kB\nCached:         {cached_kb:>8} \
-         kB\nSwapCached:            0 kB\nSwapTotal:             0 kB\nSwapFree:              0 \
+         kB\nSwapCached:            0 kB\nSwapTotal:      {swap_total_kb:>8} kB\nSwapFree:       {swap_free_kb:>8} \
          kB\nPageTables:     {page_tables_kb:>8} kB\nCommitLimit:    {commit_limit_kb:>8} \
          kB\nCommitted_AS:   {committed_kb:>8} kB\n"
     )
@@ -3464,7 +3466,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
     );
     root.add(
         "swaps",
-        SimpleFile::new_regular(fs.clone(), || Ok(PROC_SWAPS_HEADER)),
+        SimpleFile::new_regular(fs.clone(), super::proc_swap::swaps),
     );
     root.add(
         "meminfo2",

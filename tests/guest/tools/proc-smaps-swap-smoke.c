@@ -46,14 +46,44 @@ static unsigned long long vm_event(const char *name) {
     }
     fclose(file);need(0,"vmstat swap event");return 0;
 }
-static void swap_probe(volatile unsigned *mapping) {
+static unsigned long long meminfo_value(const char *name) {
+    FILE *file=fopen("/proc/meminfo","r");need(file!=NULL,"meminfo open");
+    char line[256],key[64],unit[8];unsigned long long value;
+    while(fgets(line,sizeof(line),file)) {
+        if(sscanf(line,"%63[^:]: %llu %7s",key,&value,unit)==3 && !strcmp(key,name)) {
+            need(!strcmp(unit,"kB"),"meminfo units");fclose(file);return value;
+        }
+    }
+    fclose(file);need(0,"meminfo swap field");return 0;
+}
+static void swap_row(const char *path,unsigned long long total,unsigned long long used,int present) {
+    FILE *file=fopen("/proc/swaps","r");need(file!=NULL,"swaps open");
+    char line[512];need(fgets(line,sizeof(line),file)!=NULL && strstr(line,"Filename") && strstr(line,"Priority"),"swaps header");
+    int found=0;while(fgets(line,sizeof(line),file)) {
+        char filename[256],type[32];unsigned long long size,occupancy;int priority;
+        need(sscanf(line,"%255s %31s %llu %llu %d",filename,type,&size,&occupancy,&priority)==5,"swap row grammar");
+        if(!strcmp(filename,path)){need(!strcmp(type,"file") && size==total && occupancy==used && priority==-1,"swap row values");found++;}
+    }
+    fclose(file);need(found==present,"swap row lifetime");
+}
+static void real_free(void) {
+    pid_t child=fork();need(child>=0,"free fork");if(!child) {
+        execl("/opt/thekernel-tools/bin/free","free","-k",(char *)NULL);_exit(127);
+    }
+    int status;need(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status),"real free exit");
+}
+static void swap_probe(volatile unsigned *mapping,int tools) {
     /* Guest-only local file fixture; never activate swap on the host/device. */
     char path[]="/tmp/thekernel-smap-swap.XXXXXX";int fd=mkstemp(path);need(fd>=0,"swap fixture file");
     need(!ftruncate(fd,2*1024*1024),"swap fixture length");
     unsigned char header[PAGE]={0};uint32_t version=1,last=511;
     memcpy(header+1024,&version,4);memcpy(header+1028,&last,4);memcpy(header+PAGE-10,"SWAPSPACE2",10);
     need(pwrite(fd,header,sizeof(header),0)==sizeof(header) && !fsync(fd),"swap header");close(fd);
+    unsigned long long total=meminfo_value("SwapTotal"),available=meminfo_value("SwapFree"),commit=meminfo_value("CommitLimit");
     need(!swapon(path,0),"guest swap activation");
+    need(meminfo_value("SwapTotal")==total+2044 && meminfo_value("SwapFree")==available+2044 &&
+        meminfo_value("CommitLimit")==commit+2044,"swap capacity and commit limit activation");
+    swap_row(path,2044,0,1);
     struct observed before=observe((const void *)mapping);
     unsigned long long input=vm_event("pswpin"),output=vm_event("pswpout");
     need(!madvise((void *)mapping,PAGE*PAGES,MADV_PAGEOUT),"pageout");
@@ -61,13 +91,21 @@ static void swap_probe(volatile unsigned *mapping) {
     unsigned long long output_after=vm_event("pswpout");
     need(output_after>=output+PAGES && vm_event("pswpin")==input,"submitted swap output events");
     need(swapped.swap>=before.swap+PAGE*PAGES/1024 && swapped.rss+PAGE*PAGES/1024<=before.rss,"actual software swap leaves");
+    need(meminfo_value("SwapFree")==available+2044-PAGE*PAGES/1024,"unique occupied swap slots");
+    swap_row(path,2044,PAGE*PAGES/1024,1);
+    if(tools)real_free();
     for(unsigned page=0;page<PAGES;page++)need(mapping[page*PAGE/sizeof(unsigned)]==0x12340000+page,"page-in bytes preserved");
     struct observed restored=observe((const void *)mapping);
     unsigned long long input_after=vm_event("pswpin");
     need(input_after>=input+PAGES && vm_event("pswpout")==output_after,"completed swap input events");
     printf("VMSTAT_SWAP in_delta=%llu out_delta=%llu pages\n",input_after-input,output_after-output);
     need(restored.swap+PAGE*PAGES/1024<=swapped.swap && restored.rss>=swapped.rss+PAGE*PAGES/1024,"swap leaves retire on page-in");
+    need(meminfo_value("SwapFree")==available+2044,"swap capacity restored after page-in");
+    swap_row(path,2044,0,1);
     need(!swapoff(path) && !unlink(path),"swap fixture cleanup");
+    need(meminfo_value("SwapTotal")==total && meminfo_value("SwapFree")==available &&
+        meminfo_value("CommitLimit")==commit,"swap capacity and commit limit cleanup");
+    swap_row(path,0,0,0);
     printf("SMAPS_SWAP before=%llu pageout=%llu restored=%llu kB\n",before.swap,swapped.swap,restored.swap);
 }
 static void pmap_probe(unsigned long start) {
@@ -85,7 +123,7 @@ int main(int argc,char **argv) {
     need(mapping!=MAP_FAILED,"anonymous mapping");
     for(unsigned page=0;page<PAGES;page++)mapping[page*PAGE/sizeof(unsigned)]=0x12340000+page;
     struct observed before=observe((const void *)mapping);need(before.rss>=PAGE*PAGES/1024,"touched pages resident");
-    if(argc==2 && !strcmp(argv[1],"--swap"))swap_probe(mapping);
+    if(argc==2 && (!strcmp(argv[1],"--swap") || !strcmp(argv[1],"--swap-tools")))swap_probe(mapping,!strcmp(argv[1],"--swap-tools"));
     if(argc==2 && !strcmp(argv[1],"--tools"))pmap_probe(before.start);
     need(!munmap((void *)mapping,PAGE*PAGES),"mapping cleanup");
     puts("THEKERNEL_PROC_SMAPS_SWAP_OK");return 0;

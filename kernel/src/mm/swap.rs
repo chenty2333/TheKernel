@@ -49,6 +49,7 @@ struct SwapArea {
     // One reference per software PTE naming the slot.  This is MM ownership,
     // not a transient I/O pin.
     refs: Vec<u32>,
+    used_slots: usize,
     draining: bool,
     _activation: SwapActivation,
 }
@@ -80,6 +81,10 @@ impl Default for SwapRegistry {
     }
 }
 static SWAPS: Lazy<Mutex<SwapRegistry>> = Lazy::new(|| Mutex::new(SwapRegistry::default()));
+
+#[path = "swap_observations.rs"]
+mod observations;
+pub(crate) use observations::{swap_devices, swap_usage};
 // Bumped before a fork child can copy software swap PTEs. Swapoff samples it
 // before snapshotting and aborts/rolls back if the live-MM population changes.
 static LIVE_ADDRESS_SPACE_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -511,6 +516,7 @@ pub fn activate(location: Location, flags: i32) -> AxResult<()> {
             file,
             priority,
             refs,
+            used_slots: 0,
             draining: false,
             _activation: activation,
         },
@@ -624,6 +630,7 @@ pub fn allocate_slot() -> AxResult<(Vec<u8>, usize)> {
         .position(|refs| *refs == 0)
         .ok_or(LinuxError::ENOSPC)?;
     area.refs[slot] = 1;
+    area.used_slots += 1;
     Ok((key, slot))
 }
 
@@ -635,6 +642,7 @@ fn release_slot(area: &[u8], slot: usize) -> AxResult<()> {
         return Err(AxError::InvalidInput);
     }
     *refs -= 1;
+    if *refs == 0 { area.used_slots -= 1; }
     Ok(())
 }
 
@@ -650,7 +658,9 @@ pub(crate) fn retain(entry: SwapPte) -> AxResult<()> {
         .refs
         .get_mut(entry.slot())
         .ok_or(AxError::InvalidInput)?;
+    let was_free = *refs == 0;
     *refs = refs.checked_add(1).ok_or(AxError::NoMemory)?;
+    if was_free { area.used_slots += 1; }
     Ok(())
 }
 
@@ -942,13 +952,21 @@ mod tests {
         let before = crate::mm::swap_io_events::snapshot();
         assert!(pageout(&contents[..PAGE-1]).is_err());
         assert_eq!(crate::mm::swap_io_events::snapshot(), before);
+        let usage_before = swap_usage();
+        assert_eq!((usage_before.total_bytes, usage_before.free_bytes), (PAGE, PAGE));
         let entry = pageout(&contents).unwrap();
+        assert_eq!((swap_usage().total_bytes, swap_usage().free_bytes), (PAGE, 0));
+        retain(entry).unwrap();
+        assert_eq!(swap_usage().free_bytes, 0);
+        release(entry).unwrap();
+        assert_eq!(swap_usage().free_bytes, 0);
         assert_eq!(crate::mm::swap_io_events::snapshot(), (before.0, before.1+1));
         let mut observed = [0; PAGE];
         read(entry, &mut observed).unwrap();
         assert_eq!(observed, contents);
         assert_eq!(crate::mm::swap_io_events::snapshot(), (before.0+1, before.1+1));
         release(entry).unwrap();
+        assert_eq!(swap_usage().free_bytes, PAGE);
         assert!(read(entry, &mut observed).is_err());
         assert_eq!(crate::mm::swap_io_events::snapshot(), (before.0+1, before.1+1));
         deactivate(&location).unwrap();

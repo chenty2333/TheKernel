@@ -787,9 +787,10 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:mapping geometry/flags/offset then VFS permissions and VM admission before publication"]
 usercopy = ["usercopy:validate user virtual range; population faults backing through VM policy"]
-state = ["state:insert VMA and mapping ownership; fixed replacement commits through address-space mutation"]
+state = ["state:insert VMA and mapping ownership; fixed replacement commits through address-space mutation", "state:strict overcommit uses the existing RAM-ratio estimate plus usable active swap capacity; complete committed_as and HugeTLB reservation modeling remains limited"]
 concurrency = ["concurrency:address-space locking and mapping generation protect replacement"]
 teardown = ["teardown:failed preparation releases unpublished backing and leaves prior VMA state"]
+
 
 [[cell]]
 number = 9
@@ -1109,9 +1110,10 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:invalid or unadmitted heap endpoint returns unchanged break rather than negative errno"]
 usercopy = ["explicit-none"]
-state = ["state:grow or shrink heap VMA and publish break after address-space transaction"]
+state = ["state:grow or shrink heap VMA and publish break after address-space transaction", "state:strict overcommit uses the existing RAM-ratio estimate plus usable active swap capacity; complete committed_as and HugeTLB reservation modeling remains limited"]
 concurrency = ["concurrency:heap transaction serializes VMA changes with layout publication"]
 teardown = ["teardown:shrink releases removed backing and deferred fault wakeups"]
+
 
 [[cell]]
 number = 12
@@ -4007,9 +4009,10 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate entry flags and geometry; retain target and authority; commit owner state or copy readiness output with explicit failure semantics"]
 usercopy = ["usercopy:owned request/output snapshots where required; mapping operations use scalar addresses without importing mapped contents"]
-state = ["state:apply requested memory mapping protection, locking, remapping or advisory operation under address-space ownership"]
+state = ["state:apply requested memory mapping protection, locking, remapping or advisory operation under address-space ownership", "state:strict overcommit uses the existing RAM-ratio estimate plus usable active swap capacity; complete committed_as and HugeTLB reservation modeling remains limited"]
 concurrency = ["concurrency:retain task/address-space/OFD owner through operation; release locks before blocking population or usercopy"]
 teardown = ["teardown:release poll registrations or temporary mapping capabilities; persistent state remains owned by the process"]
+
 
 [[cell]]
 number = 25
@@ -5709,7 +5712,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:admit descriptor capabilities and signed offsets, preserve partial transfer progress, serialize shared cursor and provider mutations, and perform requested provider sync/advice; kernel netlink multipart completion includes its signed 32-bit status payload and route destinations exclude CIDR host bits; RTM_NEWLINK carries real per-ifindex 32/64-bit core device statistics; proc smaps Swap counts only mm-owned software swap leaves in the VMA range; vmstat file-swap events count writes at submission and reads at full successful completion; TCP inet_diag emits observed state endpoints queues namespace-mapped UID and socket inode, with Linux state-number masks, bound-inactive selection and dump-cookie nonselection; other diagnostic transports extensions timers and orphaned TCP states remain unsupported"]
+state = ["state:admit descriptor capabilities and signed offsets, preserve partial transfer progress, serialize shared cursor and provider mutations, and perform requested provider sync/advice; kernel netlink multipart completion includes its signed 32-bit status payload and route destinations exclude CIDR host bits; RTM_NEWLINK carries real per-ifindex 32/64-bit core device statistics; proc smaps Swap counts only mm-owned software swap leaves in the VMA range; vmstat file-swap events count writes at submission and reads at full successful completion; meminfo swap capacity and proc swaps rows report actual registry slots and backing identity; TCP inet_diag emits observed state endpoints queues namespace-mapped UID and socket inode, with Linux state-number masks, bound-inactive selection and dump-cookie nonselection; other diagnostic transports extensions timers and orphaned TCP states remain unsupported"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -5755,7 +5758,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:admit descriptor capabilities and signed offsets, preserve partial transfer progress, serialize shared cursor and provider mutations, and perform requested provider sync/advice; kernel netlink multipart completion includes its signed 32-bit status payload and route destinations exclude CIDR host bits; RTM_NEWLINK carries real per-ifindex 32/64-bit core device statistics; proc smaps Swap counts only mm-owned software swap leaves in the VMA range; vmstat file-swap events count writes at submission and reads at full successful completion; TCP inet_diag emits observed state endpoints queues namespace-mapped UID and socket inode, with Linux state-number masks, bound-inactive selection and dump-cookie nonselection; other diagnostic transports extensions timers and orphaned TCP states remain unsupported"]
+state = ["state:admit descriptor capabilities and signed offsets, preserve partial transfer progress, serialize shared cursor and provider mutations, and perform requested provider sync/advice; kernel netlink multipart completion includes its signed 32-bit status payload and route destinations exclude CIDR host bits; RTM_NEWLINK carries real per-ifindex 32/64-bit core device statistics; proc smaps Swap counts only mm-owned software swap leaves in the VMA range; vmstat file-swap events count writes at submission and reads at full successful completion; meminfo swap capacity and proc swaps rows report actual registry slots and backing identity; TCP inet_diag emits observed state endpoints queues namespace-mapped UID and socket inode, with Linux state-number masks, bound-inactive selection and dump-cookie nonselection; other diagnostic transports extensions timers and orphaned TCP states remain unsupported"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 

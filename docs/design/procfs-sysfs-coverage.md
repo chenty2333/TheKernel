@@ -631,3 +631,49 @@ swapon, physical I/O, or new errno/admission behavior is claimed.
 Also found meminfo SwapTotal/Free and proc/swaps
 still report empty/zero despite active swap; those real registry gauges need a
 separate follow-up rather than silently claiming free/vmstat complete.
+
+
+### Active swap capacity and inventory
+
+Publish active regular-file swap registry rows and actual meminfo SwapTotal/
+SwapFree; the formerly header-only/constant0 views hid usable swap. Maintain
+used_slots at zero/nonzero reference transitions so each shared software slot
+is counted once and proc reads do not scan every slot under the global swap
+mutex. Snapshot locations/size/usage/priority under that lock, then resolve byte
+paths after unlock. Preserve raw non-UTF8 names and escape space/tab/LF/backslash
+as Linux7.2.3 mm/swapfile.c does; large path rows always separate filename/type.
+Linux swap header pages are excluded from usable capacity.
+
+Free/total availability excludes draining areas; table entries retain backing
+files until withdrawal. TheKernel does not newly serialize table reads across
+an entire swapoff using Linux's swapon_mutex, so transient draining observations
+remain a concurrency difference, not a newly accepted exact Linux snapshot.
+No new block-device swap support or hardware I/O is introduced. Slot retain/
+release semantics are otherwise unchanged, including the existing internal
+retain API; used_slots tracks whatever that API actually owns.
+
+CommitLimit adds active usable swap bytes to the existing RAM-ratio estimate;
+this also fixes the corresponding strict-overcommit admission threshold. It
+does not claim complete Linux committed_as/HugeTLB-reservation accounting,
+which remains limited by the existing model. That admission change requires
+full ABI, in addition to period27 host/guest/q35+n305 lint.
+
+Extend the guest RAM fixture to check capacity2044kB (511 usable4KiB slots),
+used64kB after pageout, restored free slots/page-in, inventory priority/type and
+final disappearance on swapoff, plus CommitLimit capacity deltas. Signed Alpine
+free is run while swap is active, not after cleanup. Host range/format/VFS slot-
+refcount tests pass. Period27: Python655 (three environmental skips), Rust6033
+(one existing ignored test; kernel2609), KVM guest67/67 without skips and with
+normal shutdown (system-q2e2dbru), full ABI257/257 (abi-oi6ws1a7), and q35/n305
+lint pass. A new redundant error-type conversion lint warning was removed;
+that identity conversion cleanup does not change runtime behavior. Final q35/
+n305 lint reports784 existing warnings and related kernel2609 tests pass after
+that cleanup.
+
+Guest verifies activation and cleanup add/remove2044kB in SwapTotal/Free and
+CommitLimit, unique occupancy64kB after16-page pageout, inventory file/priority
+and disappearance. Signed Alpine free -k while the fixture is active displays
+Swap2044 total/64 used/1980 free (shell-j47n82gu, SWAP_CAPACITY_RC=0). Data and
+16 in/out events survive; no host/device swapon or physical acceptance is
+claimed. This is the existing TheKernel regular-file RAM fixture, not Linux
+acceptance of tmpfs swap.
