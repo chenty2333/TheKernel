@@ -1,0 +1,20 @@
+MIT Linux 7.2.3 GT translations for the exact N305 Gen12/A0 BCS path.
+Full original uncore grant (including its next-paragraph clause), Intel
+copyrights and TheKernel copyright are preserved in LICENSE-MIT.
+
+src/uncore.rs: intel_uncore.c forcewake reset/get/put/wait/fallback helpers.
+Copyright © 2013 Intel Corporation.
+src/reset.rs: gt/intel_engine_cs.c stop-CS and pending MI-forcewake helpers;
+gt/intel_reset.c prepare/cancel and hardware-domain reset (BCS-only Gen12).
+Copyright © 2016 / 2008-2018 Intel Corporation.
+Only the supported generation/engine is included. No GPL, firmware binary,
+GuC submission, media/SFC reset or display programming is imported.
+Selected intel_{gt,engine}_regs.h fields: Copyright © 2022 Intel Corporation.
+Original safety differences: fallible MMIO/ACK failures return errors instead
+of merely logging and proceeding; reset cancellation is additionally verified.
+Stop/MI-forcewake timeout, Gen11+ BCS reset domain bit2, double GDRST and50us
+settling are preserved. GT/media A0 admission is separate from display D0.
+The temporary C oracle shim's conventional ARRAY_SIZE macro contributes one
+normalized code-line match at both25/40 to the excerpt inventory. It is
+explicitly inventoried, not scanner-exempted; source function bodies remain
+external inputs/temporary grant-preserving builds rather than repo quotations.

@@ -324,3 +324,14 @@ in `crates/ax/tk-intel-display/src/pipe_config.rs`; functions/headers and origin
 Intel grants are listed in its NOTICE. The kernel adapter, power-request pin,
 GGTT binding ownership and pageflip recovery policy are original MIT code.
 No GPL early-quirks code is copied for the independently decoded GMS facts.
+
+`crates/ax/tk-intel-gt` ports the MIT N305 Gen12 forcewake/reset path from
+`intel_uncore.c`, `gt/intel_engine_cs.c`, `gt/intel_reset.c` and selected
+`intel_{gt,engine}_regs.h` fields. Its LICENSE-MIT retains the exact uncore
+permission grant, including the next-paragraph clause, and Intel original
+copyrights; NOTICE lists functions and safety differences. Independent C
+oracles extract immutable local MIT functions into temporary builds under
+`wt-intel`, remove them afterwards, and preserve the full grant. No firmware,
+GPL compatibility layer or foreign capture is bundled.
+Its C shim's single conventional `ARRAY_SIZE` match is separately inventoried
+at25/40 in NOTICE/provenance and the CI baseline, without exemptions.

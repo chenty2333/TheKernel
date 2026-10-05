@@ -700,3 +700,20 @@ around these translated getters. Power-map and UC non-GuC GGTT ordering refer
 to local i915; the GMS size decoder independently implements published field
 facts, with no GPL text/translation. No GT reset, GuC, DMC, physical display
 acceptance or Mesa rendering is implied by this native KMS adapter.
+
+### Independently opted-in N305 GT entry
+
+The native `intel.gt=1` boot hook is independent of display fastboot/HDMI/HPD/
+DMC/audio. `tk-intel-gt` translates only Gen12 GT forcewake ownership/reset,
+source fallback-ACK workaround, BCS CS-stop/prefetch/pending-MI-forcewake and
+prepare/cancel/hardware-domain reset. MIT sources/functions/copyrights and the
+exact original uncore grant are in its NOTICE/LICENSE-MIT. Kernel MMIO adapter
+and terminal-owner policy are original MIT. Source `intel_step.c` maps N305
+revision0 to GT/media A0; display D0 is not reused. The compiled-i915 oracle
+checks BCS domain selection (Gen11 bit2, not old bit3), reset prepare/cancel,
+double GDRST and50us settle. Model tests are not physical reset/copy evidence.
+
+The GT C oracle shim's conventional `ARRAY_SIZE` definition adds one code-line
+match at both excerpt thresholds25/40. The combined Intel display+GT test
+inventory is13 code matches at25 and3 at40, with no fenced/comment/marker
+matches and no scan exemption. The CI totals are reconciled accordingly.

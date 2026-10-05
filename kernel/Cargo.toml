@@ -43,6 +43,7 @@ io-notify-fastpath = []
 
 [dependencies]
 intel_display = { package = "tk-intel-display", path = "../crates/ax/tk-intel-display" }
+intel_gt = { package = "tk-intel-gt", path = "../crates/ax/tk-intel-gt" }
 axfeat = { workspace = true, features = [
     "fp-simd",
     "irq",

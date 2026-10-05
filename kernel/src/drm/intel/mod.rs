@@ -91,6 +91,7 @@ mod firmware_scanout;
 mod firmware_snapshot;
 mod gmbus;
 mod gt_probe;
+mod gt;
 pub(crate) mod gtt;
 mod hpd;
 mod id;
@@ -1276,4 +1277,10 @@ mod tests {
         assert!(text.contains("every 250 ms"), "{text}");
         assert!(text.contains("The poll writes no register"), "{text}");
     }
+}
+
+/// GT bring-up is independent of HDMI modesetting, HPD, DMC and audio.
+pub(crate) fn bring_up_gt_at_boot() {
+    #[cfg(target_os = "none")]
+    gt::init_at_boot();
 }

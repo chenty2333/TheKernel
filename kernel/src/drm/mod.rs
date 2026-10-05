@@ -52,6 +52,7 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
     // a log a person can act on and one that only says "no display".
     intel::probe_at_boot();
     intel::bring_up_at_boot();
+    intel::bring_up_gt_at_boot();
     if primary_device().is_some() {
         return Ok(true);
     }

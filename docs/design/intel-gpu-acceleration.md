@@ -90,3 +90,18 @@ GuC 70 系列最低表项为70.12.1；使用前还须检查当前CSS版本/长�
 或 i915/xe执行 uAPI**。这些是待实现项，不是因QEMU没有GPU就可跳过的源码
 任务；模拟MMIO、页表/命令编码和状态机测试仍然需要继续做。QEMU/host验证
 不能替代真机reset、DMA隔离、copy字节或实际Mesa执行。
+
+## Runtime execution entry (2026-10-05)
+
+`intel.gt=1` now reaches an independent native boot hook after the display hook,
+even when display modesetting is disabled/refused. Exact N305 revision0 selects
+GT/media A0. The kernel adapter admits only curated owned-wake GT registers;
+display registers and global/GuC reset masks are excluded. It executes source
+forcewake clear/get/fallback, corroborates GuC MIA reset (no controller race),
+then BCS stop/prefetch/pending-MI-forcewake, ready-for-reset and two BCS-domain
+GDRSTs with50us settling and verified cancellation. Failed ownership is terminal.
+The resulting owner holds wake and leaves BCS stopped until address-space/LRC/
+ring setup. This is a runtime dependency, NOT a completed BCS copy milestone.
+PPGTT/LRC/execlists, cache-policy setup, exact owned-buffer copy/result and
+completion/retirement are the immediate next work; full HDMI/DMC/audio are not
+prerequisites. No physical GT reset, copy or rendering was run this round.
