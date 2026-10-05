@@ -175,6 +175,31 @@ successful native children now, not the old optional EPERM branch. Both clone
 and unshare reject the actual chroot fixture on both guests. This closes the
 creation gap exposed in step46 and restores clone3's implemented status.
 
+### Modern mount create authority inside user namespaces
+
+The first real isolation test reached a tmpfs mount failure in signed
+util-linux. A bounded comparison confirmed full child CapEff/CapPrm and
+successful BusyBox legacy mount, but libmount's modern create path returned
+permission denied (`shell-nzcl1mr2`). The cause was fsconfig CREATE checking
+initial-user privilege for every filesystem, ignoring Linux FS_USERNS_MOUNT.
+
+Creation now chooses the supported filesystem's Linux authority domain and
+retains fsopen's creator namespace rather than substituting current after a
+namespace change. Non-userns filesystems still require initial-user privilege;
+fspick cannot reach CREATE in its reconfiguration phase, so its creator field
+is not claimed to identify a superblock owner.
+
+Validated: kernel2632, q35 lint784, system70/70 (`system-6cxpi5ya`), paired
+mount-api11/11 (`abi-f_hk3zg9`). Actual private tmpfs creation succeeds; an
+inherited parent-owned context still fails EPERM after user/mount unshare,
+and privileged-only hugetlbfs remains denied. Both real BusyBox and modern
+util-linux mounts now return0 (`shell-1qwhe8h3`). The broader isolation script
+advanced through mounting and parent isolation, then exposed missing
+`/proc/<wrapper>/ns/pid_for_children`; its timeout was not acceptance. Add the
+real child-PID descriptor next, and make failed script cleanup release its
+namespace init before waiting. Restricted proc/sysfs visibility beyond the
+existing provider behavior has not been separately established here.
+
 ## Tool acceptance ladder
 
 1. util-linux unshare/nsenter: pending.

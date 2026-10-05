@@ -440,6 +440,39 @@ static int write_quota_file(const char *path) {
     return first == (ssize_t)sizeof(block) && second == (ssize_t)sizeof(block) ? 0 : -1;
 }
 
+static void fs_context_userns_case(void) {
+    int inherited = (int)syscall(NR_FSOPEN, "tmpfs", FSOPEN_CLOEXEC);
+    check(inherited >= 0, "parent-owned-fs-context");
+    fflush(stdout);
+    pid_t child = fork();
+    check(child >= 0, "userns-create-probe-fork");
+    if (child == 0) {
+        if (syscall(272, 0x10000000UL | 0x00020000UL) != 0) _exit(70); /* USER | MOUNT */
+        errno = 0;
+        if (syscall(NR_FSCONFIG, inherited, FSCONFIG_CMD_CREATE, NULL, NULL, 0) != -1 || errno != EPERM) _exit(71);
+        int own = (int)syscall(NR_FSOPEN, "tmpfs", FSOPEN_CLOEXEC);
+        if (own < 0 || syscall(NR_FSCONFIG, own, FSCONFIG_CMD_CREATE, NULL, NULL, 0) != 0) _exit(72);
+        int mounted = (int)syscall(NR_FSMOUNT, own, FSMOUNT_CLOEXEC, 0);
+        if (mounted < 0) _exit(73);
+        close(mounted); close(own); close(inherited);
+        int privileged = (int)syscall(NR_FSOPEN, "hugetlbfs", 0);
+        if (privileged >= 0) {
+            errno = 0;
+            if (syscall(NR_FSCONFIG, privileged, FSCONFIG_CMD_CREATE, NULL, NULL, 0) != -1 || errno != EPERM) _exit(74);
+            close(privileged);
+        } else if (errno != ENODEV) _exit(75);
+        _exit(0);
+    }
+    if (child > 0) {
+        int status = 0;
+        check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "userns-create-vs-context-creator-domain");
+        if (WIFEXITED(status) && WEXITSTATUS(status))
+            fprintf(stderr, "FSCONTEXT_USERNS_CHILD status=%d\n", WEXITSTATUS(status));
+    }
+    if (inherited >= 0) close(inherited);
+}
+
 static void namespace_descriptor(int fd, int cloexec) {
     struct statfs fs;
     struct stat ns, own;
@@ -576,6 +609,8 @@ int main(void) {
     mark("SHAPE_AND_COPY_ORDER");
     ERROR(syscall(NR_FSCONFIG, ctx, 0x7fffffff, NULL, NULL, 0), EOPNOTSUPP, "unknown-command");
     mark("UNKNOWN_COMMAND_EOPNOTSUPP");
+    fs_context_userns_case();
+    mark("USERNS_CREATE_AND_PINNED_OWNER");
     ERROR(syscall(NR_FSCONFIG, pipe_fd[0], FSCONFIG_SET_STRING, "key", "value", 0), EINVAL,
           "not-a-context");
     ERROR(syscall(NR_FSCONFIG, 1 << 30, FSCONFIG_SET_STRING, "key", "value", 0), EBADF, "bad-fd");

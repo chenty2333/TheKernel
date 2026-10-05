@@ -63,20 +63,25 @@ fn may_mount(security: &VfsSecurityContext) -> bool {
     ns_capable(security.actor(), mount_ns.owner_user_ns(), CAP_SYS_ADMIN)
 }
 
-/// Linux's `mount_capable()` (fs/super.c:695-701), which `vfs_cmd_create()`
-/// runs before it builds a superblock:
-///     if (!(fc->fs_type->fs_flags & FS_USERNS_MOUNT))
-///             return capable(CAP_SYS_ADMIN);
-///     else
-///             return ns_capable(fc->user_ns, CAP_SYS_ADMIN);
-/// TheKernel has no `FS_USERNS_MOUNT` filesystem type and its fs_contexts are
-/// always created in the caller's own user namespace, so both arms reduce to
-/// `capable(CAP_SYS_ADMIN)` -- the test in the *initial* user namespace, which
-/// is stricter than the `may_mount()` gate fsopen(2) already applied.
-fn mount_capable() -> bool {
-    current()
-        .as_thread()
-        .has_effective_capability(CAP_SYS_ADMIN)
+// Linux filesystem flags select the create authority domain. The fsopen
+// creator namespace is retained: changing current's user namespace after
+// opening a context must not replace that authority.
+fn filesystem_allows_userns_mount(name: &str) -> bool {
+    matches!(name, "tmpfs" | "proc" | "sysfs" | "devpts" | "mqueue"
+        | "cgroup" | "cgroup2" | "overlay" | "bpf")
+}
+
+fn fs_context_create_may_admin(name: &str, owner: &Arc<crate::task::UserNamespace>, actor: &crate::task::Cred) -> bool {
+    if filesystem_allows_userns_mount(name) {
+        ns_capable(actor, owner, CAP_SYS_ADMIN)
+    } else {
+        actor.has_effective_capability(CAP_SYS_ADMIN)
+    }
+}
+
+fn mount_capable(state: &FsOpenState) -> bool {
+    let curr = current();
+    fs_context_create_may_admin(&state.fs_type, &state.creator_user_ns, &curr.as_thread().current_cred())
 }
 
 fn current_may_mount() -> bool {
@@ -1188,6 +1193,9 @@ enum FsContextPhase {
 
 struct FsOpenState {
     fs_type: String,
+    // CREATE authority, captured by fsopen. fspick's reconfigure phase cannot
+    // execute CREATE, so its creator field is never a superblock-owner claim.
+    creator_user_ns: Arc<crate::task::UserNamespace>,
     source: Option<FsPathBuf>,
     data: String,
     config_len: usize,
@@ -2848,6 +2856,7 @@ pub fn sys_fsopen<M: UserMemory + ?Sized>(
 
     FsOpenFd(Mutex::new(FsOpenState {
         fs_type: fs_name,
+        creator_user_ns: current().as_thread().current_cred().user_ns().clone(),
         source: None,
         data: String::new(),
         config_len: 0,
@@ -3241,7 +3250,7 @@ pub fn sys_fsconfig<M: UserMemory + ?Sized>(
             if state.phase != FsContextPhase::CreateParams {
                 return Err(AxError::ResourceBusy);
             }
-            if !mount_capable() {
+            if !mount_capable(&state) {
                 return Err(LinuxError::EPERM.into());
             }
             // TheKernel defers superblock construction to fsmount(2), so
@@ -3687,6 +3696,7 @@ pub fn sys_fspick<M: UserMemory + ?Sized>(
     };
     FsOpenFd(Mutex::new(FsOpenState {
         fs_type: try_string(&metadata.fs_type)?,
+        creator_user_ns: current().as_thread().current_cred().user_ns().clone(),
         source: Some(FsPathBuf::from_vec(metadata.source.as_bytes().to_vec())),
         data: try_string(&metadata.data)?,
         config_len: 0,
@@ -5491,11 +5501,29 @@ mod tests {
     use crate::pseudofs::MemoryFs;
 
     #[test]
+    fn fs_context_create_pins_creator_and_selects_linux_userns_types() {
+        let root = crate::task::UserNamespace::try_new_root().unwrap();
+        let parent = crate::task::Cred::try_root(root.clone()).unwrap();
+        let ids = parent.ids();
+        let child = root.try_fork(ids.euid, ids.egid, true).unwrap();
+        let actor = crate::task::Cred::try_with_user_namespace(&parent, child.clone()).unwrap();
+        for name in ["tmpfs", "proc", "sysfs", "devpts", "mqueue", "cgroup", "cgroup2", "overlay", "bpf"] {
+            assert!(fs_context_create_may_admin(name, &child, &actor));
+            assert!(!fs_context_create_may_admin(name, &root, &actor));
+        }
+        for name in ["hugetlbfs", "tracefs", "debugfs", "ext4", "xfs", "btrfs", "nfs4"] {
+            assert!(!fs_context_create_may_admin(name, &child, &actor));
+            assert!(fs_context_create_may_admin(name, &root, &parent));
+        }
+    }
+
+    #[test]
     fn fsmount_consumes_context_before_publication_and_retains_reconfigure_root() {
         let fs = MemoryFs::new().unwrap();
         let root = Mountpoint::new_root(&fs).root_location();
         let mut state = FsOpenState {
-            fs_type: String::from("tmpfs"), source: Some(FsPathBuf::from_vec(b"source".to_vec())),
+            fs_type: String::from("tmpfs"),
+            creator_user_ns: crate::task::UserNamespace::try_new_root().unwrap(), source: Some(FsPathBuf::from_vec(b"source".to_vec())),
             data: String::from("size=4096"), config_len: 12, phase: FsContextPhase::AwaitingMount,
             fuse_connection: None, nfs_transport: None, nfs_options: NfsMountOptions::default(),
             overlay: None, binary: alloc::vec![(String::from("binary"), alloc::vec![1])],

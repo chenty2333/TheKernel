@@ -6931,7 +6931,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve stable mount identity, enforce namespace and capability authority, and query or mutate mounted filesystem ownership"]
+state = ["state:retain fsopen creator user namespace and choose Linux FS_USERNS_MOUNT create authority versus initial-user privilege; resolve stable mount identity and retain ownership"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 

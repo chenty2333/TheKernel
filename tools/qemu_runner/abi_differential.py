@@ -393,6 +393,10 @@ CONTRACTS["userns-root"] = (
 )
 PROGRAM_CASES["task-control"] += ("userns-root",)
 
+# Include the real user-namespace create/creator-retention probe.
+_fsconfig = CONTRACTS["fsconfig"]
+CONTRACTS["fsconfig"] = (_fsconfig[0], _fsconfig[1], _fsconfig[2] + " USERNS_CREATE_AND_PINNED_OWNER")
+
 # The registry is static: the gate reads it to decide whether a claimed
 # syscall names a program this runner really executes.
 PROGRAMS = tuple(PROGRAM_CASES)
