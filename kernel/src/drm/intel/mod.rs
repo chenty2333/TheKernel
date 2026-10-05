@@ -92,6 +92,7 @@ mod firmware_snapshot;
 mod gmbus;
 mod gt_probe;
 mod gt;
+pub(super) mod gem_exec;
 pub(crate) mod gtt;
 mod hpd;
 mod id;
@@ -1284,3 +1285,5 @@ pub(crate) fn bring_up_gt_at_boot() {
     #[cfg(target_os = "none")]
     gt::init_at_boot();
 }
+
+pub(super) fn gt_registered() -> bool { gt::registered() }

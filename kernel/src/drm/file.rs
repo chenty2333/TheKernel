@@ -641,23 +641,8 @@ impl DrmFile {
             .device
             .adapter
             .create_dumb(request, pitch, size, charge)?;
-        let mmap_offset = {
-            let mut device = self.device.state.lock();
-            let offset = device.next_mmap_offset;
-            device.next_mmap_offset = offset
-                .checked_add(
-                    size.checked_add(PAGE_SIZE - 1).ok_or(DrmError::Overflow)? & !(PAGE_SIZE - 1),
-                )
-                .ok_or(DrmError::Overflow)?;
-            offset
-        };
-        let mut file = self.state.lock();
-        let handle = file.next_handle;
-        file.next_handle = handle.checked_add(1).ok_or(DrmError::Overflow)?;
-        file.handles
-            .insert(handle, Arc::new(GemObject::new(backing, size, mmap_offset)));
-        drop(file);
-        self.device.gem_handle_opened(size, false);
+        let handle = self.create_system_gem(backing, size)?;
+        let mmap_offset = self.map_dumb(handle)?;
         Ok(DumbBuffer {
             handle,
             pitch,
@@ -685,6 +670,36 @@ impl DrmFile {
             .get(&handle)
             .cloned()
             .ok_or(DrmError::NotFound)
+    }
+
+    /// Existing per-file GEM namespace for a system-memory driver object.
+    pub(crate) fn create_system_gem(
+        &self,
+        backing: Arc<dyn super::GemBacking>,
+        size: u64,
+    ) -> DrmResult<GemHandle> {
+        let mmap_offset = {
+            let mut device = self.device.state.lock();
+            let offset = device.next_mmap_offset;
+            device.next_mmap_offset = offset
+                .checked_add(
+                    size.checked_add(PAGE_SIZE - 1).ok_or(DrmError::Overflow)? & !(PAGE_SIZE - 1),
+                )
+                .ok_or(DrmError::Overflow)?;
+            offset
+        };
+        let mut state = self.state.lock();
+        let handle = state.next_handle;
+        state.next_handle = handle.checked_add(1).ok_or(DrmError::Overflow)?;
+        state
+            .handles
+            .insert(handle, Arc::new(GemObject::new(backing, size, mmap_offset)));
+        drop(state);
+        self.device.gem_handle_opened(size, false);
+        Ok(handle)
+    }
+    pub(crate) fn has_intel_gt(&self) -> bool {
+        self.device.has_intel_gt()
     }
 
     pub(crate) fn create_render_gem(

@@ -174,3 +174,37 @@ pub fn prepare(io: &impl GtIo) -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// Strict admission for one snapshotted linear fast-copy and END. The user
+/// batch is NEVER executed: the native adapter rebuilds this verified plan.
+/// Only the three bounded private-VM windows currently implemented are exposed.
+pub fn decode_copy(
+    words: &[u32; 11],
+    source_size: u64,
+    destination_size: u64,
+) -> Result<Copy, Error> {
+    let source = u64::from(words[8]) | (u64::from(words[9]) << 32);
+    let destination = u64::from(words[4]) | (u64::from(words[5]) << 32);
+    let source_offset = source.checked_sub(0x10000).ok_or(Error::Refused)?;
+    let destination_offset = destination.checked_sub(0x20000).ok_or(Error::Refused)?;
+    if source_size > 65536 || destination_size > 65536 {
+        return Err(Error::Refused);
+    }
+    let copy = Copy {
+        source,
+        destination,
+        source_bytes: source_size
+            .checked_sub(source_offset)
+            .ok_or(Error::Refused)?,
+        destination_bytes: destination_size
+            .checked_sub(destination_offset)
+            .ok_or(Error::Refused)?,
+        width: words[3] & 0xffff,
+        height: words[3] >> 16,
+        pitch: words[1] & 0xffff,
+    };
+    if &batch(copy)?[3..] != words {
+        return Err(Error::Refused);
+    }
+    Ok(copy)
+}

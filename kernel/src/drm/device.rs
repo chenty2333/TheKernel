@@ -533,7 +533,7 @@ impl DrmDevice {
     /// Factory for an unprivileged render-node OFD.  It exists only when the
     /// transport negotiated the legacy VIRGL capability.
     pub fn open_render(self: &Arc<Self>) -> DrmResult<super::DrmFile> {
-        if self.render.is_none() {
+        if !self.has_render() {
             return Err(DrmError::Unsupported);
         }
         let id = {
@@ -546,8 +546,25 @@ impl DrmDevice {
         Ok(super::DrmFile::new(Arc::clone(self), id, true, false))
     }
 
+    pub(crate) fn has_intel_gt(&self) -> bool {
+        self.render.is_none()
+            && super::intel::gt_registered()
+            && match self.adapter.pci_identity() {
+                Some(p) => {
+                    (
+                        p.vendor_id,
+                        p.device_id,
+                        p.revision,
+                        p.bus,
+                        p.device,
+                        p.function,
+                    ) == (0x8086, 0x46d0, 0, 0, 2, 0)
+                }
+                None => self.adapter.driver_name() == "simpledrm", /* same boot's firmware surface, not another GPU. */
+            }
+    }
     pub fn has_render(&self) -> bool {
-        self.render.is_some()
+        self.render.is_some() || self.has_intel_gt()
     }
 
     pub fn preferred_mode(&self) -> Mode {

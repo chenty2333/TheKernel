@@ -182,3 +182,36 @@ fn copy_shared_policy_steers_only_live_dss_and_restores_selector_on_landed_failu
         assert_eq!(bad.writes.get(), 0);
     }
 }
+
+#[test]
+fn user_copy_plan_refuses_foreign_opcodes_tiling_addresses_and_out_of_object_rows() {
+    let c = bcs::Copy {
+        source: 0x10000,
+        destination: 0x20000,
+        source_bytes: 16384,
+        destination_bytes: 16384,
+        width: 64,
+        height: 64,
+        pitch: 256,
+    };
+    let batch = bcs::batch(c).unwrap();
+    let words: [u32; 11] = batch[3..].try_into().unwrap();
+    assert_eq!(bcs::decode_copy(&words, 16384, 16384), Ok(c));
+    for (i, mask) in [
+        (0, 1 << 12),
+        (1, 1 << 29),
+        (2, 1),
+        (5, 1),
+        (6, 1),
+        (7, 1 << 16),
+        (9, 1),
+        (10, 1),
+    ] {
+        let mut bad = words;
+        bad[i] ^= mask;
+        assert!(bcs::decode_copy(&bad, 16384, 16384).is_err(), "word{i}");
+    }
+    assert!(bcs::decode_copy(&words, 16383, 16384).is_err());
+    assert!(bcs::decode_copy(&words, 16384, 16383).is_err());
+    assert!(bcs::decode_copy(&words, 65537, 16384).is_err());
+}

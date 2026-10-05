@@ -46,6 +46,30 @@ impl Ram {
             physical,
         })
     }
+    fn from_pages(pages: Arc<SharedPages>) -> Result<Self, Error> {
+        if pages.is_external() || pages.page_size() != axhal::paging::PageSize::Size4K {
+            return Err(Error::Refused);
+        }
+        let pin = pages.fixed_view().map_err(|_| Error::Refused)?;
+        let count = pin.len() / PAGE;
+        if count == 0 || count > 16 {
+            return Err(Error::Refused);
+        }
+        let mut physical = Vec::new();
+        physical
+            .try_reserve_exact(count)
+            .map_err(|_| Error::Refused)?;
+        for i in 0..count {
+            let p = pages.paddr_at(i).map_err(|_| Error::Refused)?.as_usize() as u64;
+            ppgtt::physical(p)?;
+            physical.push(p);
+        }
+        Ok(Self {
+            pages,
+            _pin: pin,
+            physical,
+        })
+    }
     fn write(&self, offset: usize, data: &[u8]) -> Result<(), Error> {
         self.pages
             .write_bytes(offset, data)
@@ -100,6 +124,8 @@ pub(super) struct Memory {
     status: Ram,
     bindings: Vec<Binding>,
     descriptor: u64,
+    operation: bcs::Copy,
+    selftest: bool,
 }
 impl Memory {
     fn allocate(gtt: Arc<Gtt>) -> Result<Self, Error> {
@@ -116,7 +142,41 @@ impl Memory {
             status: Ram::allocate(1)?,
             bindings,
             descriptor: 0,
+            operation: bcs::Copy {
+                source: 0x11000,
+                destination: 0x21000,
+                source_bytes: PAYLOAD as u64,
+                destination_bytes: PAYLOAD as u64,
+                width: 64,
+                height: 64,
+                pitch: 256,
+            },
+            selftest: true,
         })
+    }
+    fn from_objects(
+        gtt: Arc<Gtt>,
+        source: Arc<SharedPages>,
+        destination: Arc<SharedPages>,
+        operation: bcs::Copy,
+    ) -> Result<Self, Error> {
+        if Arc::ptr_eq(&source, &destination) {
+            return Err(Error::Refused);
+        }
+        let source = Ram::from_pages(source)?;
+        let destination = Ram::from_pages(destination)?;
+        let batch = bcs::batch(operation)?;
+        bcs::decode_copy(
+            batch[3..].try_into().unwrap(),
+            (source.physical.len() * PAGE) as u64,
+            (destination.physical.len() * PAGE) as u64,
+        )?;
+        let mut memory = Self::allocate(gtt)?;
+        memory.source = source;
+        memory.destination = destination;
+        memory.operation = operation;
+        memory.selftest = false;
+        Ok(memory)
     }
     fn bind_and_build(&mut self) -> Result<(), Error> {
         for r in [&self.context, &self.ring, &self.status] {
@@ -160,29 +220,23 @@ impl Memory {
         self.context.dwords(1, regs)?;
         self.context.dwords(2, indirect)?;
         self.context.dwords(3, per_ctx)?;
-        let batch = bcs::batch(bcs::Copy {
-            source: 0x11000,
-            destination: 0x21000,
-            source_bytes: PAYLOAD as u64,
-            destination_bytes: PAYLOAD as u64,
-            width: 64,
-            height: 64,
-            pitch: 256,
-        })?;
+        let batch = bcs::batch(self.operation)?;
         self.batch.dwords(0, &batch)?;
         let count = bcs::ring(regs, 0x30000, ctx, 1)?;
         self.ring.dwords(0, &regs[..count])?;
-        let mut data = Vec::new();
-        data.try_reserve_exact(6 * PAGE)
-            .map_err(|_| Error::Refused)?;
-        data.resize(6 * PAGE, 0xa5);
-        for (i, b) in data[PAGE..PAGE + PAYLOAD].iter_mut().enumerate() {
-            *b = pattern(i);
+        if self.selftest {
+            let mut data = Vec::new();
+            data.try_reserve_exact(6 * PAGE)
+                .map_err(|_| Error::Refused)?;
+            data.resize(6 * PAGE, 0xa5);
+            for (i, b) in data[PAGE..PAGE + PAYLOAD].iter_mut().enumerate() {
+                *b = pattern(i);
+            }
+            self.source.write(0, &data)?;
+            data.fill(0x5a);
+            data[PAGE..PAGE + PAYLOAD].fill(0);
+            self.destination.write(0, &data)?;
         }
-        self.source.write(0, &data)?;
-        data.fill(0x5a);
-        data[PAGE..PAGE + PAYLOAD].fill(0);
-        self.destination.write(0, &data)?;
         self.status.write(0x10 * 4, &[0xff; 12 * 8])?;
         self.status.write(0x2f * 4, &11u32.to_le_bytes())?;
         for r in [
@@ -300,7 +354,13 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
 fn execute_and_quiesce(io: &impl GtIo, memory: &Memory) -> Result<Result<(), Error>, Error> {
     let executed = submit(io, memory);
     intel_gt::reset::stop_and_reset_bcs(io).map_err(|_| Error::Quarantined)?;
-    Ok(executed.and_then(|()| memory.verify()))
+    Ok(executed.and_then(|()| {
+        if memory.selftest {
+            memory.verify()
+        } else {
+            Ok(())
+        }
+    }))
 }
 
 #[cfg(target_os = "none")]
@@ -331,8 +391,49 @@ pub(super) fn run(owner: &mut super::Owner, bdf: pci::Bdf) -> Result<(), Error> 
     verified
 }
 
+/// Scoped synchronous execution over existing GEM SharedPages. Caller owns all
+/// GEM Arcs/reservation fences through this call; the GT owner additionally
+/// retains the fixed views/page tables on any ambiguous retirement error.
+#[cfg(target_os = "none")]
+pub(super) fn objects(
+    owner: &mut super::Owner,
+    source: Arc<SharedPages>,
+    destination: Arc<SharedPages>,
+    operation: bcs::Copy,
+) -> Result<(), Error> {
+    if owner.lost || owner.memory.is_some() {
+        return Err(Error::Quarantined);
+    }
+    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    operation.validate()?;
+    if Arc::ptr_eq(&source, &destination) {
+        return Err(Error::Refused);
+    }
+    if owner.bus.read(intel_gt::uncore::GT_ACK)? & 1 == 0
+        || owner.bus.read(intel_gt::uncore::RENDER_ACK)? & 1 == 0
+        || owner.bus.read(0xc000)? & 1 == 0
+        || owner.bus.read(0x480c)? != 0
+        || owner.bus.read(0x400c)? != 5
+        || owner.bus.read(0xb024)? >> 16 != 0x10
+    {
+        return Err(Error::Refused);
+    }
+    // Last job and bootstrap must already be quiescent; bounded reset also
+    // establishes a fresh engine state before loading another private context.
+    intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
+    let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+    let memory = Memory::from_objects(gtt, source, destination, operation)?;
+    owner.memory = Some(memory);
+    let memory = owner.memory.as_mut().unwrap();
+    memory.bind_and_build()?;
+    let outcome = execute_and_quiesce(&owner.bus, memory)?;
+    memory.release()?;
+    owner.memory = None;
+    outcome
+}
+
 #[cfg(test)]
-mod tests {
+pub(in crate::drm::intel) mod tests {
     use alloc::{boxed::Box, collections::BTreeMap};
     use core::cell::{Cell, RefCell};
 
@@ -496,6 +597,21 @@ mod tests {
             execute,
             fail_write: Cell::new(None),
         }
+    }
+    pub(in crate::drm::intel) fn objects(
+        source: Arc<SharedPages>,
+        destination: Arc<SharedPages>,
+        operation: bcs::Copy,
+    ) -> Result<(), Error> {
+        let array = super::super::super::gtt::mock::MockPageTable::new(65536);
+        let gtt = Arc::new(Gtt::over(Box::new(array)).unwrap());
+        let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
+        memory.bind_and_build()?;
+        let io = model(&memory, true);
+        let outcome = execute_and_quiesce(&io, &memory)?;
+        drop(io);
+        memory.release()?;
+        outcome
     }
     #[test]
     fn native_copy_submission_model_walks_private_vm_compares_guards_and_retires_after_reset() {

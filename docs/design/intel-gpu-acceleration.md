@@ -115,3 +115,28 @@ images/commands validate software only, not N305 GPU output or RCS rendering.
 No arbitrary batch/execbuf is exposed yet. Next: reuse this memory/submission
 ownership in per-file GEM/validated submission/sync, then RCS and real Mesa;
 no generic multi-generation scheduler or parallel Intel backend is introduced.
+
+## Bounded GEM/submit/sync runtime integration
+
+After successful native BCS bootstrap only, the existing primary/render DRM
+files route the narrow Intel private ioctls to existing GEM handles, mmap/PRIME
+backings, allocation accounting, reservation fences and binary syncobjs.
+System GEM is limited to64KiB per object for the current private VM windows.
+CREATE, WB MMAP_OFFSET, PREAD/PWRITE, BUSY/WAIT and default-context EXECBUFFER2
+are implemented. EXECBUFFER2 accepts only source/destination/batch, fixed softpin
+windows10000/20000/30000, NO_RELOC, one linear32 fast-copy+END and optional binary
+fence arrays. All other flags/commands/contexts are refused, not silently ignored.
+The caller's batch is snapshotted/decoded then rebuilt in kernel-owned memory;
+no arbitrary privileged commands or CPU-copy execution fallback are exposed.
+Explicit producer and atomic predecessor fences are respected before the final
+snapshot; copied source/destination RAM stays fixed/pinned through quiescence.
+Shared completion/error edges reach GEM reservations and output syncobjs only
+following native result/retirement handling. mmap/PRIME views retain allocation
+charge beyond close. Render-node registration is independent of native KMS and
+is gated by successful GT bootstrap, not a fabricated virtio render adapter.
+
+Measured: full affected DRM host regression, model GEM→private VM/copy bytes/
+sync/error/mmap-after-close tests and compiled Linux7.2.3 wire facts. Physical
+BCS/user-program acceptance is still pending; this is not Mesa-compatible i915.
+RCS context/WA/3D command/state and Mesa queries/contexts/submit capabilities
+remain the next functional dependency, not HDMI/DMC/audio.

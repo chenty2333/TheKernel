@@ -7,7 +7,7 @@ use alloc::{format, string::String};
 use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 use intel_gt::{Error, GtIo};
-use spin::Mutex;
+use axsync::Mutex;
 
 #[cfg(target_os = "none")]
 use super::pci;
@@ -88,12 +88,15 @@ impl GtIo for Bus {
     }
 }
 struct Owner {
+    bdf: super::pci::Bdf,
     bus: Bus,
     lost: bool,
     // Published before an ELSQ load; retained through any ambiguous reset/DMA.
     memory: Option<copy::Memory>,
 }
-mod copy;
+pub(super) mod copy;
+static READY: AtomicBool = AtomicBool::new(false);
+pub(super) fn registered() -> bool { READY.load(Ordering::Acquire) }
 static OWNER: Mutex<Option<Owner>> = Mutex::new(None);
 
 /// Independent boot hook; default path never writes forcewake or resets GT.
@@ -142,6 +145,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     };
     if let Err(error) = intel_gt::uncore::acquire_gt(&bus) {
         *owner = Some(Owner {
+            bdf,
             bus,
             lost: true,
             memory: None,
@@ -162,11 +166,13 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     match result {
         Ok(()) => {
             let mut device = Owner {
+                bdf,
                 bus,
                 lost: false,
                 memory: None,
             };
             let copied = copy::run(&mut device, bdf);
+            if copied.is_ok() { READY.store(true, Ordering::Release); }
             if copied.is_err() {
                 device.lost = true;
             }
@@ -191,6 +197,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 bus.awake.store(false, Ordering::Release);
             }
             *owner = Some(Owner {
+                bdf,
                 bus,
                 lost: true,
                 memory: None,
@@ -201,6 +208,20 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             ))
         }
     }
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn submit_copy(source: alloc::sync::Arc<crate::mm::SharedPages>, destination: alloc::sync::Arc<crate::mm::SharedPages>, operation: intel_gt::bcs::Copy) -> Result<(), Error> {
+    if !registered() { return Err(Error::Refused); }
+    let mut state = OWNER.lock();
+    let owner = state.as_mut().ok_or(Error::Refused)?;
+    let result = copy::objects(owner, source, destination, operation);
+    if result.is_err() { owner.lost = true; }
+    result
+}
+#[cfg(not(target_os = "none"))]
+pub(super) fn submit_copy(_source: alloc::sync::Arc<crate::mm::SharedPages>, _destination: alloc::sync::Arc<crate::mm::SharedPages>, _operation: intel_gt::bcs::Copy) -> Result<(), Error> {
+    Err(Error::Refused) // No host/native CPU-copy fallback.
 }
 
 #[cfg(test)]

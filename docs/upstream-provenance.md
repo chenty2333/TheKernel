@@ -735,3 +735,10 @@ BCS is not RCS rendering, and no i915 execbuf/Mesa capability is advertised.
 The BCS/context C shims add two conventional `INVALID_MMIO_REG` definitions
 at25 only; GT totals are3 at25/1 at40, combined Intel15 at25/3 at40. CI
 `crates/ax` at25 changes only outside/code41/30→43/32. No exemption is used.
+
+The original kernel `intel/gem_exec.rs` adapter uses published x86_64 i915 UAPI
+facts, not a GPL execbuf body. Local Linux7.2.3 headers compiled independently
+confirm eight sizes, eight ioctl encodings, WB mapping flag and five offsets.
+Existing GEM/PRIME/mmap/reservation/binary-sync infrastructure is reused; user
+commands are bounded, decoded and rebuilt rather than run privileged. No full
+Mesa/RCS execution or physical BCS acceptance is claimed.
