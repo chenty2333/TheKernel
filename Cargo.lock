@@ -3690,6 +3690,7 @@ dependencies = [
  "spin 0.10.1",
  "strum 0.28.0",
  "syscalls",
+ "tk-acpica",
  "tk-axalloc",
  "tk-axbpf",
  "tk-axcbpf",

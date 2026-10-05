@@ -936,3 +936,42 @@ mod boot_command_line_tests {
         assert_eq!(value_in("quiet\t\tloglevel=warn   root=x", "loglevel"), Some("warn"));
     }
 }
+
+/// ACPI OSL hardware ownership hooks; absent on hosted builds.
+pub mod acpi {
+    pub fn rsdp_pointer()->usize {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::acpi_rsdp_pointer() }
+        #[cfg(not(all(target_os="none",feature="defplat")))] { 0 }
+    }
+    pub fn ecam()->(u64,u16,u8,u8) {
+        #[cfg(all(target_os="none",feature="defplat"))] { let (b,e)=axplat_x86_pc::pci::ecam_bus_range();(axplat_x86_pc::pci::ecam_base() as u64,0,b,e) }
+        #[cfg(not(all(target_os="none",feature="defplat")))] { (0,0,0,0) }
+    }
+    pub fn install_sci(irq:u32,handler:fn())->Option<usize> {
+        #[cfg(all(target_os="none",feature="defplat",feature="irq"))] { axplat_x86_pc::install_acpica_sci(irq,handler) }
+        #[cfg(not(all(target_os="none",feature="defplat",feature="irq")))] { let _=(irq,handler);None }
+    }
+    pub fn remove_sci(vector:usize) {
+        #[cfg(all(target_os="none",feature="defplat",feature="irq"))] { axplat_x86_pc::remove_acpica_sci(vector); }
+        #[cfg(not(all(target_os="none",feature="defplat",feature="irq")))] { let _=vector; }
+    }
+    pub fn register_off(callback:fn()->bool) {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::register_acpica_off(callback); }
+        #[cfg(not(all(target_os="none",feature="defplat")))] { let _=callback; }
+    }
+    pub fn button_event() {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::record_acpica_button(); }
+    }
+    pub fn publish_button(available:bool) {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::publish_acpica_button(available); }
+        #[cfg(not(all(target_os="none",feature="defplat")))] { let _=available; }
+    }
+    pub fn restore_static() {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::restore_static_acpi(); }
+    }
+}
+
+/// Complete diagnostic UART transmission before a firmware power transition.
+pub fn acpi_flush_diagnostics() {
+    #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::acpi_flush_diagnostics(); }
+}

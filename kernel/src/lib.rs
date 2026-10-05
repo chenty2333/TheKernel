@@ -53,3 +53,5 @@ mod test_support;
 mod text_patch;
 mod time;
 mod uprobe;
+
+mod acpi;

@@ -195,3 +195,6 @@ log = { workspace = true }
 
 [package.metadata.thekernel]
 layer = "integration"
+
+[dependencies.tk-acpica]
+path = "../crates/ax/tk-acpica"

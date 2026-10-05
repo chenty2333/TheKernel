@@ -305,6 +305,9 @@ pub fn init(args: &[String], envs: &[String]) {
 
     let task = prepare_task_with_sched_from(task, SchedState::default(), &current())
         .expect("Failed to prepare init scheduler state");
+    // Firmware ownership and event handlers must be ready before userspace
+    // can request powerdown; init task IDs are already reserved at this point.
+    crate::acpi::init();
     let task_publication =
         reserve_prepared_task(task.clone()).expect("Failed to reserve init runqueue publication");
     let task_table_admission =
@@ -364,8 +367,10 @@ pub fn init(args: &[String], envs: &[String]) {
 /// flush happen here, with neither an input lock nor a platform spinlock held.
 fn spawn_power_button_task() -> axerrno::AxResult<axtask::AxTaskRef> {
     axtask::spawn_raw(|| {
+        if crate::acpi::with_engine(|_|()).is_some(){axhal::console::write_tty_bytes(b"THEKERNEL_ACPI_BUTTON_WORKER_READY\n");}
         loop {
             if axhal::power::take_power_button_event() {
+                if crate::acpi::enabled(){axhal::console::write_tty_bytes(b"THEKERNEL_ACPI_BUTTON_EVENT\n");}
                 info!("acpi-power: power button; notifying init with SIGPWR");
                 let _ = crate::task::send_signal_to_process(1, Some(
                     tk_linux_signal::SignalInfo::new_kernel(tk_linux_signal::Signo::SIGPWR)));

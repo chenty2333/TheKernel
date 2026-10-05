@@ -241,6 +241,12 @@ pub fn take_power_button_event() -> bool {
 }
 
 fn enter_s5() -> bool {
+    let callback=ACPICA_OFF.load(Ordering::Acquire);
+    if callback != 0 {
+        // SAFETY: immutable fn() -> bool installed after ACPICA is ready.
+        let off=unsafe { core::mem::transmute::<usize,fn()->bool>(callback) };
+        if off() { return true; }
+    }
     let fixed = *FIXED.lock();
     let types = *S5.lock();
     let (Some(fixed), Some(types)) = (fixed, types) else {
@@ -270,3 +276,27 @@ fn enter_s5() -> bool {
     }
     true
 }
+
+// ACPICA owns SCI only after explicit opt-in and successful OSL registration.
+static ACPICA_OFF: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ACPICA_SCI: AtomicBool = AtomicBool::new(false);
+pub fn register_acpica_off(callback:fn()->bool) { ACPICA_OFF.store(callback as usize,Ordering::Release); }
+pub fn record_acpica_button() { BUTTON.store(true,Ordering::Release); }
+pub fn publish_acpica_button(available:bool) { BUTTON_READY.store(available,Ordering::Release); }
+#[cfg(feature="irq")]
+pub fn install_acpica_sci(irq:u32,handler:fn())->Option<usize> {
+    let fixed=(*FIXED.lock())?;
+    if irq!=u32::from(fixed.sci)||fixed.sci>=16{return None;}
+    let facts=crate::cpu::apic_facts()?;
+    if facts.io_apic_count!=1||facts.io_apic_gsi_base!=0||facts.override_total!=facts.overrides().len()
+        ||facts.overrides().iter().any(|r|r.source==fixed.sci&&(r.bus!=0||r.gsi!=irq||!matches!(r.flags,0|0x0d|0x0f))){return None;}
+    let low=facts.overrides().iter().find(|r|r.source==fixed.sci).is_none_or(|r|r.flags&3!=1);
+    let vector=usize::from(fixed.sci)+0x20;
+    if !crate::apic::configure_sci(vector,low){return None;}
+    if BUTTON_READY.swap(false,Ordering::AcqRel){let _=axplat::irq::unregister(vector);}
+    if !axplat::irq::register(vector,handler){return None;}
+    ACPICA_SCI.store(true,Ordering::Release);Some(vector)
+}
+#[cfg(feature="irq")]
+pub fn remove_acpica_sci(vector:usize){if ACPICA_SCI.swap(false,Ordering::AcqRel){let _=axplat::irq::unregister(vector);}}
+pub fn restore_static_acpi(){ACPICA_OFF.store(0,Ordering::Release);init_later();}

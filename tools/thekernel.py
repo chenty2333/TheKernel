@@ -925,6 +925,7 @@ def system_test_cmd(args: argparse.Namespace) -> int:
     return run_product(
         artifacts,
         RunSpec(
+            kernel_cmdline=os.environ.get("THEKERNEL_TEST_CMDLINE"),
             accel=args.accel,
             timeout=args.timeout,
             qemu_debug=getattr(args, "qemu_debug", None),

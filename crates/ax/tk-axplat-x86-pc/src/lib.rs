@@ -175,3 +175,12 @@ unsafe extern "C" fn rust_entry_secondary(_magic: usize) {
 pub fn allocate_msi(handler: axplat::irq::IrqHandler) -> Option<(u64, u32, usize)> {
     apic::allocate_msi(handler)
 }
+
+/// Stable owned boot RSDP pointer for ACPICA native-RSDP mode.
+pub fn acpi_rsdp_pointer()->usize { boot_info::get().rsdp().map_or(0,|r|r.bytes().as_ptr() as usize) }
+pub use power::{register_acpica_off,record_acpica_button,publish_acpica_button,restore_static_acpi};
+#[cfg(feature="irq")]
+pub use power::{install_acpica_sci,remove_acpica_sci};
+
+/// Finish diagnostic serial transmission before power removal.
+pub fn acpi_flush_diagnostics(){console::flush_diagnostic();}
