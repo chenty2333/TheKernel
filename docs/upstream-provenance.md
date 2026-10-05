@@ -638,3 +638,16 @@ ownership. Global readout retains four irregular DBUF controls plus MBUS_CTL;
 this is not full global bandwidth reconstruction or policy. No WM/PCODE writes.
 64 compiled-C states with all decoded fields and65-register traces agree;
 missing/dark domains, DDB bounds and dedicated SAGV/cursor offsets are tested.
+
+TC readout slice: `intel_tc.c` ADL-P ready/owned predicates, display13 ownership
+condition and modular-FIA mapping/legacy pin/lane fields → `src/tc.rs`. TCSS
+status registers stride4; TC1 DDI is PORT_D (0x64300), DDI stride0x100. ADL-P
+always has two ports per modular FIA, at0x163000/0x16e000. **Display13 pin
+assignment still comes from DFLEXPA1**, not TCSS_DDI_STATUS's display20+ field.
+Core/port/legacy AUX cold-block power must already be pinned; no waking domains,
+no ownership/cold writes. Additional original DKL before-image collection reads
+19 setup-related words under the preserved-selector mechanism, with all43
+fallible MMIO prefixes checked for restoration/quarantine on all four ports.
+48 compiled-C readiness/ownership/FIA states and exact read offsets agree.
+This is not `adlp_tc_phy_get_hw_state` (which acquires power/cold), nor complete
+HPD-derived TC-mode discovery or encoder fastboot admission.

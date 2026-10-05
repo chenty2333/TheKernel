@@ -130,3 +130,14 @@ src/watermark.rs:
   Six latency levels and dedicated SAGV/transitions, five planes plus cursor.
   DDB coordinates are still MBUS-relative; raw DBUF/MBUS state is retained.
   No WM allocation/computation, SAGV/PCODE or hardware writes are imported.
+
+src/tc.rs:
+  drivers/gpu/drm/i915/display/intel_tc.c:
+  adlp_tc_phy_is_ready, adlp_tc_phy_is_owned, tc_phy_owned_by_display,
+  tc_phy_load_fia_params and legacy get_pin_assignment/get_lane_mask fields
+  Copyright © 2019 Intel Corporation.
+  intel_display_regs.h / intel_{mg,dkl}_phy_regs.h selected fields:
+  Copyright © 2025 / 2022 Intel Corporation.
+  Original additional DKL before-image readout uses the upstream HDMI setup
+  register layout. It is not an upstream get_config or ownership-acquire port.
+  Power/cold must already be pinned; no cold unblock or ownership write.

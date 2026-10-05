@@ -163,3 +163,14 @@ watermark change. Computation, global bandwidth/MDCLK policy, SAGV and PCODE
 programming remain for modeset. Compiled-i915 comparison passes64 states and
 all65 reads. Missing/dark registers and layout boundaries are covered. No
 runtime or hardware WM programming was enabled by this slice.
+
+### TC PHY discovery
+
+TC ready/owned and modular-FIA field readout are ported with already-enabled
+core/port/cold-domain contracts. Display13 pin assignment uses DFLEXPA1, not
+the newer TCSS field. All-ones TCSS reads mean not-ready, never permission for
+DKL access. Original before-image discovery captures19 DKL setup words (both
+lane groups plus UC status), restores/verifies HIP and quarantines uncertain
+restoration. 48 compiled-C predicate/FIA state/read-offset cases and all43
+fault prefixes on four ports pass. No TC cold/ownership acquisition was enabled;
+HPD mode selection and complete DDI/encoder admission still follow.

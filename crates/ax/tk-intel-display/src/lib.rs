@@ -14,6 +14,7 @@ pub mod dkl_phy;
 pub mod dpll_mgr;
 pub mod opregion;
 pub mod scaler;
+pub mod tc;
 pub mod universal_plane;
 pub mod watermark;
 

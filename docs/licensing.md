@@ -293,3 +293,9 @@ and getters plus enabled-DBUF-slice readout (2022 Intel) into `watermark.rs`.
 Register fields come from MIT `skl_universal_plane_regs.h`, `intel_cursor_regs.h`
 (2024 Intel), and `skl_watermark_regs.h` (2023 Intel). Source/NOTICE preserve
 original attribution and the shared MIT grant. No WM programming imported yet.
+
+TC discovery translates selected MIT `intel_tc.c` ADL-P readiness/ownership,
+modular-FIA and legacy pin/lane fields (2019 Intel), with display/DKL/MG register
+facts (2025/2022 Intel) into `tc.rs`. The 2019 copyright is added to the bundled
+MIT grant and source/NOTICE. Extra DKL before-image collection is original glue,
+not an imported PHY connect/ownership implementation or GPL code.
