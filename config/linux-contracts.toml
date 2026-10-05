@@ -694,7 +694,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:creation flags validation before object and descriptor publication"]
 usercopy = ["usercopy:bounded name import before object publication"]
-state = ["state:anonymous kernel shmem file supports sealing with write-admission serialization; initial writable OFD has no pathname writer exclusion"]
+state = ["state:anonymous kernel shmem file uses the creating actor fsuid/fsgid and supports sealing with write-admission serialization; initial writable OFD has no pathname writer exclusion"]
 concurrency = ["concurrency:descriptor reservation precedes publication and object lifetime is reference counted"]
 teardown = ["teardown:failed creation releases unpublished resources; last OFD reference releases object"]
 flags = ["flag:MFD_CLOEXEC MFD_ALLOW_SEALING"]
@@ -707,7 +707,7 @@ contract = "linux-memfd_create"
 handler = "kernel/src/syscall/fs/memfd.rs:sys_memfd_create"
 conditional = "explicit-none"
 tests = ["kernel/src/file/memfd.rs:writable_registration_is_idempotent_and_blocks_seal_write", "tests/guest/portable/memfd-create-differential.c:main"]
-validation_gaps = ["The registered memfd-create differential covers the flag mask, the 250-byte name scan, descriptor cloexec, the inode mode, seal admission, anonymous zero-link name and actual sealed ELF execveat through the initial writable OFD and reopening the retained proc exe inode after CLOEXEC; the vm.memfd_noexec scope matrix still has no guest assertion because the differential guest shares one boot and that sysctl is global to it"]
+validation_gaps = ["The registered memfd-create differential covers the flag mask, the 250-byte name scan, descriptor cloexec, the inode mode, seal admission, anonymous zero-link name, actual fsuid/fsgid ownership and actual sealed ELF execveat through the initial writable OFD and reopening the retained proc exe inode after CLOEXEC; the vm.memfd_noexec scope matrix still has no guest assertion because the differential guest shares one boot and that sysctl is global to it"]
 limitations = ["MFD_HUGETLB always fails with EOPNOTSUPP where the oracle, built with hugetlbfs, creates a default-size hugetlbfs file for MFD_HUGETLB and for MFD_HUGETLB|MFD_HUGE_2MB, answers ENODEV for MFD_HUGE_1GB and for an unregistered size log, and EINVAL for a reserved bit; the per-hstate anonymous hugetlbfs allocation and mmap ownership are not wired to memfd_create; the internal anonymous shmem provider does not select a hugetlb hstate"]
 
 [[contract]]

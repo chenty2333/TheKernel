@@ -345,6 +345,28 @@ static int test_file_shape(void) {
     return 0;
 }
 
+static int test_creation_fsids(void) {
+    if (geteuid() != 0 || getegid() != 0) return fail("memfd-fsid-root-fixture");
+    pid_t child = fork();
+    if (child < 0) return fail("memfd-fsid-fork");
+    if (!child) {
+        if (syscall(SYS_setfsgid, 456) != 0 || syscall(SYS_setfsuid, 123) != 0) _exit(71);
+        if (geteuid() != 0 || getegid() != 0 || syscall(SYS_setfsuid, -1) != 123 ||
+            syscall(SYS_setfsgid, -1) != 456) _exit(72);
+        int fd = (int)do_memfd_create("fsid-owner", MFD_CLOEXEC);
+        struct stat stat;
+        if (fd < 0 || fstat(fd, &stat) || stat.st_uid != 123 || stat.st_gid != 456) _exit(73);
+        if (close(fd)) _exit(74);
+        _exit(0);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) {
+        fprintf(stderr, "MEMFD_FSID_STATUS=%#x\n", status);
+        return fail("memfd-fsid-child");
+    }
+    return 0;
+}
+
 static int test_anonymous_exec(void) {
     int src = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
     int fd = (int)do_memfd_create("exec:/proc/self/exe", MFD_CLOEXEC | MFD_ALLOW_SEALING);
@@ -425,6 +447,8 @@ int main(int argc, char **argv) {
     puts("THEKERNEL_ABI_ASSERT memfd-create.portable-differential "
          "MFD_FILE_SHAPE pass");
 
+    if (test_creation_fsids()) return 1;
+    puts("THEKERNEL_ABI_ASSERT memfd-create.portable-differential MFD_CREATOR_FS_IDS pass");
     if (test_anonymous_exec()) return 1;
     puts("THEKERNEL_ABI_ASSERT memfd-create.portable-differential MFD_ANONYMOUS_SEALED_EXEC pass");
 

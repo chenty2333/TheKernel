@@ -64,7 +64,7 @@ pub fn sys_memfd_create(
     let reservation = reserve_fd(plan.flags & MFD_CLOEXEC != 0)?;
     let actor = axtask::current().as_thread().current_cred();
     let ids = actor.ids();
-    let location = memfd_provider::create(&name, plan, ids.euid.into_raw(), ids.egid.into_raw())?;
+    let location = memfd_provider::create(&name, plan, ids.fsuid.into_raw(), ids.fsgid.into_raw())?;
     let file = Arc::try_new(File::new(axfs::File::new(
         axfs::FileBackend::Direct(location).with_direct_io(false),
         axfs::FileFlags::READ | axfs::FileFlags::WRITE,

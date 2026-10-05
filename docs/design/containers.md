@@ -337,3 +337,19 @@ ordinary proc exe display text is the saved exec path, not a full Linux d_path
 rename/root projection. The retained inode, sealing and readonly state were
 tested; detached FUSE/NFS executable-provider retirement was not. No time
 namespace or deferred B1 field work is folded into this repair.
+
+### Creation filesystem IDs and period 55
+
+The new anonymous memfd path initially selected effective UID/GID, whereas
+Linux's shmem inode owner comes from the creating task's filesystem UID/GID.
+It now selects fsuid/fsgid from the same pinned credential. The paired raw
+fixture keeps effective IDs0 while setting filesystem IDs123/456 and requires
+the actual inode to report123/456; it runs in isolated guest children, not by
+changing host identities. Both guests passed (`abi-jibfcrev`).
+
+The complete period55 passed: Python663 with3 existing environment skips,
+Rust6073 with1 existing ignore (kernel2635), q35/n305 lint784, and KVM system70/70
+with no skip/normal shutdown (`system-co_rgp_c`). The existing Linux-excerpt
+inventory checks still pass; no baseline widening or invented provenance
+repair was needed. Next: expose the cgroup mount point and run the actual OCI
+bundle, then enforce/test its real memory and pids limits before podman.
