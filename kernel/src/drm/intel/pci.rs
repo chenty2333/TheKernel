@@ -679,6 +679,26 @@ impl Ecam {
         }
     }
 
+    /// Sole fresh-GT owner only, after DMA/VM admission. PCI COMMAND is a
+    /// 16-bit write: never echo adjacent STATUS write-one-to-clear bits.
+    pub(super) fn enable_n305_bus_master(&self, bdf: Bdf) -> Option<bool> {
+        let info = DeviceInfo::read(self, bdf)?;
+        if (info.vendor_id, info.device_id, info.revision) != (0x8086, 0x46d0, 0)
+            || info.command & 2 == 0
+        {
+            return None;
+        }
+        if info.command & 4 != 0 {
+            return Some(false);
+        }
+        let address = config_address(self.mapped, self.bus_end, bdf, offset::COMMAND, 2)?;
+        // SAFETY: checked exact-N305 COMMAND word in this live ECAM mapping.
+        // Caller holds exclusive opt-in GT ownership; no other PCI bit changes.
+        unsafe { core::ptr::write_volatile(address as *mut u16, info.command | 4) };
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        (self.read_u16(bdf, offset::COMMAND)? == info.command | 4).then_some(true)
+    }
+
     pub(crate) const fn base(&self) -> u64 {
         self.physical as u64
     }

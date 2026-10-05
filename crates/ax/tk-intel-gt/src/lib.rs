@@ -4,6 +4,9 @@
 //! firmware load or userspace command stream. Kernel intel.gt=1 owns invocation.
 #![no_std]
 #![forbid(unsafe_code)]
+pub mod bcs;
+pub mod lrc;
+pub mod ppgtt;
 pub mod reset;
 pub mod uncore;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

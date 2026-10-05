@@ -18,3 +18,46 @@ The temporary C oracle shim's conventional ARRAY_SIZE macro contributes one
 normalized code-line match at both25/40 to the excerpt inventory. It is
 explicitly inventoried, not scanner-exempted; source function bodies remain
 external inputs/temporary grant-preserving builds rather than repo quotations.
+
+Runtime private BCS copy additions (same original grants in LICENSE-MIT):
+src/ppgtt.rs: gt/gen8_ppgtt.c gen8_pde_encode/gen12_pte_encode,
+Copyright © 2020 Intel Corporation. Original private scratch/table builder.
+src/lrc.rs: gt/intel_lrc.c gen12_xcs_offsets/set_offsets, init_common_regs,
+init_ppgtt_regs, lrc_update_regs, __reset_stop_ring, init_wa_bb_regs,
+setup_predicate_disable_wa, gen12_emit_timestamp_wa/gen12_emit_restore_scratch,
+gen12_init_indirectctx_bb/gen12_init_per_ctx_bb. Copyright © 2014 Intel.
+intel_lrc_reg.h/context fields: Copyright © 2014-2018 Intel Corporation.
+src/bcs.rs: gem/selftests/i915_gem_client_blt.c prepare_blit (linear32),
+Copyright © 2019 Intel; gt/gen8_engine_cs.c/.h gen12_emit_flush_xcs,
+preparser_disable, gen12_get_aux_inv_reg/gen12_needs_ccs_aux_inv,
+gen12_emit_aux_table_inv, gen8_emit_bb_start_noarb, __gen8_emit_flush_dw,
+gen8_emit_ggtt_write, emit_xcs_breadcrumb/gen12_emit_fini_breadcrumb_tail,
+gen8_emit_wa_tail, Copyright © 2014 Intel Corporation.
+Selected intel_gpu_commands.h fields: Copyright © 2003-2018 Intel.
+BCS prepare: intel_workarounds.c icl_wa_init_mcr/__set_mcr_steering and
+Gen12 GT DFR/DOP WAs, engine_fake_wa_init/gen12_ctx_gt_mocs_init,
+Copyright © 2014-2018 Intel; intel_sseu.c live Gen12 single-slice/DSS facts,
+Copyright © 2019 Intel; intel_gtt.c tgl_setup_private_ppat (UC index3),
+Copyright © 2020 Intel; intel_mocs.c Gen12 UC entry3/paired L3 policy,
+Copyright © 2015 Intel; intel_gt_mcr.c multicast/steering facts,
+Copyright © 2022 Intel Corporation. No media engine or RCS WA is executed.
+
+Safety scope: one kernel-owned privileged BCS context, no user batch uAPI;
+no semaphores/scheduler/preemption clients. All unused VM branches reach an
+owned read-only scratch page. Render wake and idle are required before shared
+cache policy; MCR selection uses actual fuse bits and restores its before-image
+on every error prefix. Unknown unicast agents are refused. Source firmware-lock
+exception for DOP readback is preserved. Only N305 Gen12.0 applicable branches
+are included; KBL/DG2/fast-color/hold-switchout paths do not apply.
+The source two-word WA tail is MI_ARB_CHECK then MI_NOOP, not two NOOPs.
+RAM/VM/context/GGTT remain pinned until source stop/reset quiescence, including
+possibly-landed ELSQ failures; ambiguous reset terminally retains them.
+Host model copies are explicitly not physical GPU-output evidence.
+
+The two new C shims add two conventional INVALID_MMIO_REG definitions at
+threshold25 (none at40). Current GT inventory:3 code lines at25,1 at40;
+combined display+GT:15 at25,3 at40. No fenced/comment/marker matches or exemptions.
+
+Native ELSQ/HWSP/CSB sequence adapts gt/intel_execlists_submission.c
+enable_execlists/reset_csb_pointers, Copyright © 2014 Intel Corporation,
+under this full MIT grant; memory/admission/retirement policy is original.

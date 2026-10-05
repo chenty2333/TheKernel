@@ -2,7 +2,7 @@
 
 2026-10-05。**全部未在硬件上验证；这一轮不启动真机、PXE服务或写USB/NVMe。**
 下面是未来用户执行的步骤，不是已验证结果。受限 TC1/TC2 固件等价 fastboot/KMS
-调用链已接通并做主机模型测试；TC 模式重编程、GT、HDMI audio 仍未实现。
+调用链已接通并做主机模型测试；TC 模式重编程、RCS/Mesa、HDMI audio 仍未实现；GT BCS 软件链见下。
 
 ## 基线和板级资料
 
@@ -63,11 +63,17 @@ commit/pageflip/fence；当前固定帧缓冲CPU拷贝adapter不计Intel nativea
 
 ## GT 和 HDMI 音频（各自依赖实现门槛）
 
-- GT默认关闭；实现reset/retirement之前不开放 `intel.gt=1` 的写路径。
-  forcewake acquire/release→bounded noop breadcrumb→BCS copy/fill。
-  比较每一个目标字节和redzones，强制timeout/reset后console仍活、BO不提前
-  释放。然后才测试RCS/Mesa；OpenGL iris与Vulkan ANV分别验证，不用BCS成功
-  代替render成功。N305/i915 GuC 应是 tgl 系列，**不是 adlp_guc**。显示 D0 不等于 GT stepping；本地 i915 的 GT/media revision0 映射是 A0，workaround 必须用各自的表。
+- GT默认关闭。未来用户单独以 `intel.gt=1` 启动（不需要 `intel.modeset=1`），
+  应先看到精确 N305 GT/media A0、forcewake 和 BCS-only reset admission。
+  GuC 未处于 MIA reset、RCS 忙、DMA translation/ownership 无法证明时明确拒绝。
+  BCS 链已经实现：private PPGTT/LRC → ELSQ → hardware breadcrumb → BCS reset
+  retirement →16384目标字节/源不变/双方两端4KiB guards逐字节核对。
+  只有实际结果通过才应出现 `BCS_COPY_BYTES_AND_GUARDS_VERIFIED`；这仍不是
+  RCS/Mesa rendering。主机模型成功不能代替该真机验收。失败时有 bounded
+  timeout/reset，无法证明退休则保留全部 DMA owners、禁止再提交；确认 console
+  持续可读。当前没有开放真机故障注入，不使用旧 display fail_write 参数。
+  下一步再测试 GEM/submit/sync、RCS、iris OpenGL 和 ANV Vulkan，分别验收。
+  N305 GuC 应是 tgl 系列，不是 adlp_guc；display D0 不等于 GT/media A0。
 - HDMI audio依赖实际TC link、audio powerwell、ELD和HDAcomponent握手。现在
   尚未接入，不把模拟ELD/analogcodec枚举当HDMI音频通过。将来跟modesetopt-in
   开启，验证显示器audio能力/ELD、HDA HDMI pin/converter、48kHz双声道真实

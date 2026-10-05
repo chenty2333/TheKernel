@@ -19,22 +19,34 @@ use super::{
 struct Bus {
     window: RegisterWindow,
     awake: AtomicBool,
+    render_awake: AtomicBool,
 }
 impl Bus {
     fn allowed(&self, r: u32, write: bool) -> bool {
         if !r.is_multiple_of(4) || r as usize + 4 > self.window.len() {
             return false;
         }
-        if r == intel_gt::uncore::GT_REQUEST {
+        if [
+            intel_gt::uncore::GT_REQUEST,
+            intel_gt::uncore::RENDER_REQUEST,
+        ]
+        .contains(&r)
+        {
             return true;
         }
-        if r == intel_gt::uncore::GT_ACK {
+        if [intel_gt::uncore::GT_ACK, intel_gt::uncore::RENDER_ACK].contains(&r) {
             return !write;
+        }
+        if [0xb024, 0x209c, 0x9550].contains(&r) {
+            return self.render_awake.load(Ordering::Acquire) && (!write || r != 0x209c);
         }
         self.awake.load(Ordering::Acquire)
             && match r {
                 0xc000 | 0x800c | 0xa2a0 | 0x22030 | 0x22034 => !write,
                 0x941c | 0x2209c | 0x2229c | 0x220d0 => true,
+                0xfdc | 0x9424 | 0x480c | 0x400c | 0x22080 | 0x22098 | 0x220a8 | 0x220b0 | 0x220b4 | 0x220c4
+                | 0x223a0 | 0x22510 | 0x22514 | 0x22518 | 0x2251c | 0x22550 => true,
+                0x220b8 | 0x9138 | 0x913c => !write,
                 _ => false,
             }
     }
@@ -78,7 +90,10 @@ impl GtIo for Bus {
 struct Owner {
     bus: Bus,
     lost: bool,
+    // Published before an ELSQ load; retained through any ambiguous reset/DMA.
+    memory: Option<copy::Memory>,
 }
+mod copy;
 static OWNER: Mutex<Option<Owner>> = Mutex::new(None);
 
 /// Independent boot hook; default path never writes forcewake or resets GT.
@@ -123,9 +138,14 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     let bus = Bus {
         window,
         awake: AtomicBool::new(false),
+        render_awake: AtomicBool::new(false),
     };
     if let Err(error) = intel_gt::uncore::acquire_gt(&bus) {
-        *owner = Some(Owner { bus, lost: true });
+        *owner = Some(Owner {
+            bus,
+            lost: true,
+            memory: None,
+        });
         return Err(format!(
             "GT forcewake failed: {error:?}; terminal owner, no submission"
         ));
@@ -141,18 +161,40 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     })();
     match result {
         Ok(()) => {
-            *owner = Some(Owner { bus, lost: false });
-            Ok(String::from(
-                "intel-gt: owned GT wake and BCS-only stop/reset initialized, GT/media A0; BCS \
-                 copy NOT submitted; context/address-space setup follows; 未在硬件上验证",
-            ))
+            let mut device = Owner {
+                bus,
+                lost: false,
+                memory: None,
+            };
+            let copied = copy::run(&mut device, bdf);
+            if copied.is_err() {
+                device.lost = true;
+            }
+            *owner = Some(device);
+            copied
+                .map(|_| {
+                    String::from(
+                        "intel-gt: BCS_COPY_BYTES_AND_GUARDS_VERIFIED after hardware breadcrumb \
+                         and reset retirement; GT/media A0; not RCS/Mesa rendering",
+                    )
+                })
+                .map_err(|e| {
+                    format!(
+                        "intel-gt: BCS selftest failed {e:?}; unsafe-to-retire DMA owners retained, terminal \
+                         submission"
+                    )
+                })
         }
         Err(error) => {
             let released = intel_gt::uncore::release_gt(&bus).is_ok();
             if released {
                 bus.awake.store(false, Ordering::Release);
             }
-            *owner = Some(Owner { bus, lost: true });
+            *owner = Some(Owner {
+                bus,
+                lost: true,
+                memory: None,
+            });
             Err(format!(
                 "intel-gt: initialization failed {error:?}; wake-release-verified={released}; no \
                  BCS submission"
@@ -176,6 +218,7 @@ mod tests {
         let bus = Bus {
             window,
             awake: AtomicBool::new(false),
+            render_awake: AtomicBool::new(false),
         };
         assert_eq!(bus.write(0x2209c, 0x01000100), Err(Error::Refused));
         assert_eq!(bus.read(0x22030), Err(Error::Unavailable(0x22030)));

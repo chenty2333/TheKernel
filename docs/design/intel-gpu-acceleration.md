@@ -2,7 +2,7 @@
 
 2026-10-05；D4 的路线评估，**实现尚未完成、未在硬件上验证**。
 以本地 Linux 7.2.3 和已缓存 Mesa 26.1.2 源码为准；不把版本外的行为
-当作承诺。显示 D2 的 TC1 安全状态/回滚尚未完成，不能现在启用 GT。
+当作承诺。GT 与显示按实际依赖独立推进；完整 HDMI/DMC/audio 不是 BCS 前置条件。
 
 ## 不可混淆的边界
 
@@ -46,9 +46,8 @@ force_probe 更适合当 authority。execlists 首阶段是受限实验路径，
 声称复制了 Linux ADL-P 默认 GuC submission。达到 Mesa 支持前，不能向
 GETPARAM/QUERY 谎报 softpin/context VM/timeline sync/reset 能力。
 
-1. 完成显示 TC1 的只读 inventory、完整 hidden PHY/PLL/power 恢复、稳定
-   console/scanout 验证。GT 默认关闭，设置 `intel.gt=1` 仍只能在实现完
-   相应 admission 后生效；不要先添一个“开启”参数而接到半成品写路径。
+1. GT 独立 admission：精确 GT/media A0、独占 forcewake、GuC reset 排除控制器
+   竞争、直接 DMA 与 owned pinned RAM；不等待 TC 模式设置/HPD/DMC/audio。
 2. 移植 ADL-N forcewake domain 引用和 bounded ACK、GT runtime power、uncore
    保存/恢复与 stepping WA。已读到 ACK 不是拥有 forcewake。无超时退路
    就不准写引擎寄存器；先实现 engine/GT reset、request fault retirement。
@@ -85,11 +84,8 @@ GuC 70 系列最低表项为70.12.1；使用前还须检查当前CSS版本/长�
 
 ## 当前实现状态
 
-只有现有只读 GT probe、已翻译的显示 identity/VBT/OpRegion/timing slice。
-**本轮还没有 forcewake owner、PPGTT、LRC/execlists、GPU reset、BCS/RCS提交
-或 i915/xe执行 uAPI**。这些是待实现项，不是因QEMU没有GPU就可跳过的源码
-任务；模拟MMIO、页表/命令编码和状态机测试仍然需要继续做。QEMU/host验证
-不能替代真机reset、DMA隔离、copy字节或实际Mesa执行。
+固件 fixed-mode fastboot/KMS 已接通；GT 的代码路径和测量边界见下节。
+默认 GT 关闭，只有 `intel.gt=1` 才能进入 exact N305 admission。
 
 ## Runtime execution entry (2026-10-05)
 
@@ -100,8 +96,22 @@ display registers and global/GuC reset masks are excluded. It executes source
 forcewake clear/get/fallback, corroborates GuC MIA reset (no controller race),
 then BCS stop/prefetch/pending-MI-forcewake, ready-for-reset and two BCS-domain
 GDRSTs with50us settling and verified cancellation. Failed ownership is terminal.
-The resulting owner holds wake and leaves BCS stopped until address-space/LRC/
-ring setup. This is a runtime dependency, NOT a completed BCS copy milestone.
-PPGTT/LRC/execlists, cache-policy setup, exact owned-buffer copy/result and
-completion/retirement are the immediate next work; full HDMI/DMC/audio are not
-prerequisites. No physical GT reset, copy or rendering was run this round.
+The owner retains wake and now continues into the complete private BCS chain
+below. This still is software implementation, not measured GPU copy/rendering.
+
+## BCS private execution/result path (software implemented; hardware unverified)
+
+The boot hook now publishes all DMA owners before binding/loading, builds one
+private low-2MiB PPGTT with read-only source/batch/scratch and writable disposable
+destination, creates source Gen12 BCS LRC+WA pages, programs verified UC index3,
+then submits the exact source linear32 batch/ring via ELSQ. Only masked polling
+interrupts are used. Hardware breadcrumb has a500ms bounded wait; the source
+BCS stop/reset must succeed before unbinding even a completed context. Ambiguous
+reset/binding retains the pages, context, VM and GGTT under the terminal owner.
+Every16384 payload byte, unchanged source and both4KiB guards on each object
+must match before the native success marker can be printed. The native code
+never simulates the copy. Host interpreter/result/fault tests and compiled-C
+images/commands validate software only, not N305 GPU output or RCS rendering.
+No arbitrary batch/execbuf is exposed yet. Next: reuse this memory/submission
+ownership in per-file GEM/validated submission/sync, then RCS and real Mesa;
+no generic multi-generation scheduler or parallel Intel backend is introduced.

@@ -715,5 +715,23 @@ double GDRST and50us settle. Model tests are not physical reset/copy evidence.
 
 The GT C oracle shim's conventional `ARRAY_SIZE` definition adds one code-line
 match at both excerpt thresholds25/40. The combined Intel display+GT test
-inventory is13 code matches at25 and3 at40, with no fenced/comment/marker
+inventory is15 code matches at25 and3 at40, with no fenced/comment/marker
 matches and no scan exemption. The CI totals are reconciled accordingly.
+
+### Kernel-owned N305 BCS execution chain
+
+`intel.gt=1` now continues from source forcewake/reset into owned SharedPages,
+39-bit physical checks, direct-DMA admission, shared scoped GGTT bindings,
+private four-level PPGTT, source Gen12 BCS LRC/indirect/predicate image, UC cache
+policy and applicable GT workarounds, execlists load, flush/breadcrumb wait,
+source stop/reset retirement, exact copied bytes/source/guard verification.
+Source/function and copyright inventory is in `tk-intel-gt/NOTICE` and its full
+original MIT grant. Unmodified compiled C compares whole register/WA images,
+PDE/PTE fields and all batch/ring words; it caught predicate WA and WA-tail
+omissions before commit. The native kernel does not have a CPU-copy fallback:
+the interpreter is host-test-only. No physical GPU execution has been observed;
+BCS is not RCS rendering, and no i915 execbuf/Mesa capability is advertised.
+
+The BCS/context C shims add two conventional `INVALID_MMIO_REG` definitions
+at25 only; GT totals are3 at25/1 at40, combined Intel15 at25/3 at40. CI
+`crates/ax` at25 changes only outside/code41/30→43/32. No exemption is used.

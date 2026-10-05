@@ -335,3 +335,12 @@ oracles extract immutable local MIT functions into temporary builds under
 GPL compatibility layer or foreign capture is bundled.
 Its C shim's single conventional `ARRAY_SIZE` match is separately inventoried
 at25/40 in NOTICE/provenance and the CI baseline, without exemptions.
+
+The same `tk-intel-gt` grant now covers selected Gen12 system PPGTT, BCS LRC/
+indirect/predicate WAs, linear fast-copy and flush/breadcrumb/WA-tail routines
+from MIT `gt/{gen8_ppgtt,intel_lrc,gen8_engine_cs}.c/.h`, command/LRC headers,
+`gem/selftests/i915_gem_client_blt.c`, and required shared UC/MCR/GT policy from
+`gt/{intel_gtt,intel_mocs,intel_workarounds,intel_sseu,intel_gt_mcr}.c`.
+NOTICE inventories exact functions and original copyrights (2003-2018,
+2014/2014-2018/2015/2019/2020/2022). Native memory/PCI/DMA/result-retirement
+adapter is original MIT; no arbitrary user batches, GPL or binary firmware.
