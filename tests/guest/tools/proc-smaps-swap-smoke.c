@@ -38,6 +38,14 @@ static struct observed observe(const void *mapping) {
     need(result.size==(result.end-result.start)/1024 && result.rss+result.swap<=result.size,"real VMA sizes");
     return result;
 }
+static unsigned long long vm_event(const char *name) {
+    FILE *file=fopen("/proc/vmstat","r");need(file!=NULL,"vmstat open");
+    char key[64];unsigned long long value;
+    while(fscanf(file,"%63s %llu",key,&value)==2) {
+        if(!strcmp(key,name)){fclose(file);return value;}
+    }
+    fclose(file);need(0,"vmstat swap event");return 0;
+}
 static void swap_probe(volatile unsigned *mapping) {
     /* Guest-only local file fixture; never activate swap on the host/device. */
     char path[]="/tmp/thekernel-smap-swap.XXXXXX";int fd=mkstemp(path);need(fd>=0,"swap fixture file");
@@ -47,11 +55,17 @@ static void swap_probe(volatile unsigned *mapping) {
     need(pwrite(fd,header,sizeof(header),0)==sizeof(header) && !fsync(fd),"swap header");close(fd);
     need(!swapon(path,0),"guest swap activation");
     struct observed before=observe((const void *)mapping);
+    unsigned long long input=vm_event("pswpin"),output=vm_event("pswpout");
     need(!madvise((void *)mapping,PAGE*PAGES,MADV_PAGEOUT),"pageout");
     struct observed swapped=observe((const void *)mapping);
+    unsigned long long output_after=vm_event("pswpout");
+    need(output_after>=output+PAGES && vm_event("pswpin")==input,"submitted swap output events");
     need(swapped.swap>=before.swap+PAGE*PAGES/1024 && swapped.rss+PAGE*PAGES/1024<=before.rss,"actual software swap leaves");
     for(unsigned page=0;page<PAGES;page++)need(mapping[page*PAGE/sizeof(unsigned)]==0x12340000+page,"page-in bytes preserved");
     struct observed restored=observe((const void *)mapping);
+    unsigned long long input_after=vm_event("pswpin");
+    need(input_after>=input+PAGES && vm_event("pswpout")==output_after,"completed swap input events");
+    printf("VMSTAT_SWAP in_delta=%llu out_delta=%llu pages\n",input_after-input,output_after-output);
     need(restored.swap+PAGE*PAGES/1024<=swapped.swap && restored.rss>=swapped.rss+PAGE*PAGES/1024,"swap leaves retire on page-in");
     need(!swapoff(path) && !unlink(path),"swap fixture cleanup");
     printf("SMAPS_SWAP before=%llu pageout=%llu restored=%llu kB\n",before.swap,swapped.swap,restored.swap);

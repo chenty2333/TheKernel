@@ -17,6 +17,8 @@ struct VmSnapshot {
     page_table_pages: usize,
     faults: u64,
     major_faults: u64,
+    swap_reads: u64,
+    swap_writes: u64,
     background_scanned: u64,
     background_reclaimed: u64,
 }
@@ -26,6 +28,7 @@ fn snapshot() -> VmSnapshot {
     let usage = allocator.usages();
     let pressure = crate::mm::memory_pressure_snapshot();
     let (faults, major_faults) = crate::mm::vm_events::snapshot();
+    let (swap_reads, swap_writes) = crate::mm::swap_io_events::snapshot();
     VmSnapshot {
         free_pages: allocator.available_pages(),
         anon_pages: usage.get(UsageKind::VirtMem) / PAGE_SIZE_4K,
@@ -33,6 +36,8 @@ fn snapshot() -> VmSnapshot {
         page_table_pages: usage.get(UsageKind::PageTable) / PAGE_SIZE_4K,
         faults,
         major_faults,
+        swap_reads,
+        swap_writes,
         background_scanned: pressure.scanned_pages,
         background_reclaimed: pressure.reclaimed_pages,
     }
@@ -49,9 +54,9 @@ fn render_vmstat(vm: &VmSnapshot) -> String {
         ("pgmajfault", vm.major_faults),
         ("pgscan_kswapd", vm.background_scanned),
         ("pgsteal_kswapd", vm.background_reclaimed),
-        // No swap device or CMA allocator exists in this image.
-        ("pswpin", 0),
-        ("pswpout", 0),
+        ("pswpin", vm.swap_reads),
+        ("pswpout", vm.swap_writes),
+        // This allocator has no CMA pool.
         ("nr_free_cma", 0),
     ] {
         let _ = writeln!(text, "{name} {value}");
@@ -79,6 +84,8 @@ mod tests {
             page_table_pages: 6,
             faults: 1000,
             major_faults: 7,
+            swap_reads: 11,
+            swap_writes: 13,
             background_scanned: 80,
             background_reclaimed: 70,
         };
@@ -88,6 +95,7 @@ mod tests {
         ));
         assert!(text.contains("pgfault 1000\npgmajfault 7\n"));
         assert!(text.contains("pgscan_kswapd 80\npgsteal_kswapd 70\n"));
+        assert!(text.contains("pswpin 11\npswpout 13\n"));
         assert_eq!(text.lines().count(), 11);
         for line in text.lines() {
             let fields: alloc::vec::Vec<_> = line.split_whitespace().collect();

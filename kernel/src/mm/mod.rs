@@ -15,6 +15,7 @@ pub(crate) mod secret;
 mod stats;
 pub(crate) mod vm_events;
 mod swap;
+pub(crate) mod swap_io_events;
 mod thp;
 mod tlb;
 mod usercopy;

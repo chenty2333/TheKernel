@@ -204,8 +204,8 @@ KVM default guest56/56 均通过，正常关机（system-pyjsqlum）。top/vmsta
 
 新增 allocator 实际 free/VirtMem/PageCache/PageTable 页数、CPU-local 累计
 成功 minor/major fault 事件；已有后台回收 worker 的 scanned/reclaimed 页
-事件映射到 pgscan_kswapd/pgsteal_kswapd。PSWP/CMA 确实没有对应机制，字段
-为 0。没有把累计扫描遇到的 dirty/writeback/pinned 数冒充当前 gauge。
+事件映射到 pgscan_kswapd/pgsteal_kswapd。CMA 无对应池。最初把 PSWP 也假定
+不存在而填0是错误，后续实际软件 swap 回归纠正此判断，见文末 swap I/O events。没有把累计扫描遇到的 dirty/writeback/pinned 数冒充当前 gauge。
 未跟踪的 LRU/dirty/writeback/分页 I/O 等字段暂未发布；**统计覆盖仍部分**。
 当前 pgfault/pgmajfault 的来源是 TheKernel 的成功 fault 分类边界，Linux
 PGFAULT 也计部分失败的 MM fault、PGMAJFAULT 有失败 I/O 的计数边界；这种
@@ -602,3 +602,32 @@ swap. Its pswpin/pswpout constant0 must be replaced by actual successful swap-I/
 counters in a follow-up; absence of an active swap device in the baseline guest
 is not proof that these fields are always0. Do not claim those counters correct
 under active swap until repaired and measured.
+
+
+### File-swap I/O events
+
+Replace vmstat pswpin/pswpout constant0 with actual regular-file swap events.
+Linux7.2.3 mm/page_io.c counts PSWPOUT when file writes are submitted (including
+later I/O failure), but PSWPIN only on full successful file-read completion.
+TheKernel's existing swap engine uses regular files: increment at those matching
+boundaries in swap.rs, after slot/entry admission and never for invalid input,
+missing capacity or dead slot references. Read/short-I/O failure does not add a
+page-in event; slot/VM ownership behavior is unchanged. Events are4KiB page
+counts, not physical disk I/O, cache-miss claims or a new swap implementation.
+
+Local counter/format tests cover full vs short completion and actual nonzero
+wire values. Extend the existing host VFS swap test with admitted/rejected I/O
+counter boundaries; guest RAM fixture must show real16-page output then input
+increments. Final kernel2608 and lint (784 existing warnings) passed, including
+the actual VFS host swap testcase's invalid/admitted/retired-slot boundaries.
+Guest67/67 passes without skips and with normal shutdown (system-cw2cjjjo): the
+RAM fixture reports16 submitted output pages and16 completed input pages, while
+smaps observes0->64->0kB and contents survive. Signed Alpine vmstat -s displays
+16 pages swapped in/out after fixture cleanup (shell-jzjy5qwh, SWAP_EVENTS_RC=0).
+A host-test-only nested-module reference error was repaired and host tests rerun;
+production event behavior was unchanged by that test repair. No host/device
+swapon, physical I/O, or new errno/admission behavior is claimed.
+
+Also found meminfo SwapTotal/Free and proc/swaps
+still report empty/zero despite active swap; those real registry gauges need a
+separate follow-up rather than silently claiming free/vmstat complete.

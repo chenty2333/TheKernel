@@ -698,6 +698,7 @@ pub fn pageout(page: &[u8]) -> AxResult<SwapPte> {
         (area.file.clone(), area.id)
     };
     let result = (|| {
+        super::swap_io_events::write_submitted();
         (file.write_at(page, ((slot + 1) * PAGE) as u64)? == PAGE)
             .then_some(())
             .ok_or(AxError::Io)
@@ -726,7 +727,9 @@ pub(crate) fn read(entry: SwapPte, page: &mut [u8]) -> AxResult<()> {
         }
         (key.clone(), area.file.clone())
     };
-    if file.read_at(page, ((entry.slot() + 1) * PAGE) as u64)? != PAGE {
+    let read_bytes = file.read_at(page, ((entry.slot() + 1) * PAGE) as u64)?;
+    super::swap_io_events::read_completed(read_bytes);
+    if read_bytes != PAGE {
         return Err(AxError::Io);
     }
     Ok(())
@@ -936,11 +939,18 @@ mod tests {
         }
 
         let contents = [0x5a; PAGE];
+        let before = crate::mm::swap_io_events::snapshot();
+        assert!(pageout(&contents[..PAGE-1]).is_err());
+        assert_eq!(crate::mm::swap_io_events::snapshot(), before);
         let entry = pageout(&contents).unwrap();
+        assert_eq!(crate::mm::swap_io_events::snapshot(), (before.0, before.1+1));
         let mut observed = [0; PAGE];
         read(entry, &mut observed).unwrap();
         assert_eq!(observed, contents);
+        assert_eq!(crate::mm::swap_io_events::snapshot(), (before.0+1, before.1+1));
         release(entry).unwrap();
+        assert!(read(entry, &mut observed).is_err());
+        assert_eq!(crate::mm::swap_io_events::snapshot(), (before.0+1, before.1+1));
         deactivate(&location).unwrap();
         assert!(!active_area(&location).unwrap());
     }
