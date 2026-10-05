@@ -23,7 +23,7 @@ class InspectPayloadTests(unittest.TestCase):
         pins = [line.split('=', 1) for line in lines if line]
         self.assertEqual(len(pins), len(dict(pins)))
         for name in ['busybox', 'musl', 'procps-ng', 'sysstat', 'util-linux', 'htop',
-                     'pciutils', 'usbutils', 'iproute2-ss', 'net-tools']:
+                     'pciutils', 'usbutils', 'iproute2-ss', 'net-tools', 'eudev', 'eudev-hwids']:
             self.assertIn(name, dict(pins))
         self.assertNotIn('podman', dict(pins))
         self.assertTrue(all(version for _, version in pins))
@@ -32,6 +32,16 @@ class InspectPayloadTests(unittest.TestCase):
         source = (ROOT/'scripts/build-inspect-payload.sh').read_text()
         self.assertIn("'etc/terminfo'", source)
         self.assertNotIn("for path in ['etc']", source)
+
+    def test_hardware_names_compile_in_staging_without_host_udev_actions(self):
+        source = (ROOT/'scripts/build-inspect-payload.sh').read_text()
+        self.assertIn("'hwdb', '--update', '--root', str(root)", source)
+        self.assertIn("shutil.copy2(hwdb, out/'etc/udev/hwdb.bin')", source)
+        self.assertIn('check=True, env=env', source)
+        self.assertIn('probe usb-hwdb', (ROOT/'tests/guest/inspect-tools.sh').read_text())
+        self.assertNotIn("'trigger'", source)
+        self.assertNotIn("'control'", source)
+        self.assertNotIn("str(root/'sbin/udevd')", source)
 
     def test_busybox_keeps_multicall_dispatch_basename(self):
         source = (ROOT/'scripts/build-inspect-payload.sh').read_text()

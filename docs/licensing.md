@@ -219,3 +219,12 @@ the applicable license texts and corresponding GPL/LGPL sources, including
 Alpine's packaging changes (Alpine aports v3.24 APKBUILDs and their referenced
 sources). The version/license lock is not a substitute for corresponding source.
 TheKernel's PTY runner and probe script are original Apache-2.0 work.
+
+The inspect payload also includes eudev's signed hardware-name data and an
+isolated compiled `etc/udev/hwdb.bin`. APK scripts remain disabled; the pinned
+staging `udevadm hwdb --update --root STAGING` performs only offline database
+compilation. It does not run udevd, control/trigger host devices, or install host
+configuration. eudev/eudev-hwids are GPL-2.0-or-later; kmod-libs LGPL-2.1-or-later;
+xz-libs has the exact mixed SPDX expression in the lock. Hardware database
+source files remain packaged under usr/lib/udev/hwdb.d, and corresponding-source
+obligations include eudev and Alpine's data/packaging changes.

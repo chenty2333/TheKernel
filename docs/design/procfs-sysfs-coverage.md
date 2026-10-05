@@ -912,3 +912,35 @@ inode-attribute behavior or container acceptance. Broader filesystem UID user-
 namespace projection is still incomplete. mount-tree namespace construction
 is still absent; its contracts now acknowledge that the nsfs descriptor provider
 exists rather than repeating the earlier missing-provider statement.
+
+### B1 follow-up35: usbutils hardware-name database payload
+
+The signed usbutils019 lsusb is a standalone ELF, using eudev's compiled hardware
+name database rather than the usb.ids text alone. [Upstream names_init](https://github.com/gregkh/usbutils/blob/v019/names.c) creates
+udev_hwdb; read-only host strace of the same signed executable confirms an open
+of host /etc/udev/hwdb.bin. The guest payload lacked that file, explaining its
+initial hardware-name initialization diagnostic without proving a kernel USB
+enumeration fault.
+
+The exact signed closure now has81 packages, adding eudev/eudev-hwids and their
+three new dependencies (five packages total). APK scripts/ownership changes remain disabled.
+After exact closure validation, the pinned staging udevadm performs only offline
+hwdb compilation with --root STAGING; input directories and output file remain
+under that isolated root. No udev daemon, trigger/control operation or host
+configuration change is involved. Copy only the generated database to
+payload/etc/udev/hwdb.bin. Source data and licensing notices remain in the
+runtime/data trees. The inspector includes a noninteractive binary-header check.
+
+Two fresh signed builds pass closure validation and database generation. Six
+related Python tests and q35 lint pass (784 existing warnings). Actual KVM
+shell-ft284xb7 sees the9.3MiB database; lsusb no longer emits the name database
+initialization diagnostic. **Full USB acceptance still fails**: default lsusb
+returns1 with no devices, and lsusb -t explicitly reports missing
+/sys/bus/usb/devices. These results do not assert real USB inventory or physical
+support. No kernel runtime changed in this packaging item.
+
+Final follow-up35 checks after adding the noninteractive header probe: six
+Python tests and q35 lint pass; actual KVM shell-0wjdb87d reports
+HWDB_HEADER_RC=0 and no name-initialization diagnostic. LSUSB_RC remains1,
+not accepted as USB enumeration. No kernel/runtime source changed; latest
+full guest/ABI runtime checks remain follow-up34.

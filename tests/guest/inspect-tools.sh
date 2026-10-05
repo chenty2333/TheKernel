@@ -29,6 +29,7 @@ probe lsns "$T/lsns"
 probe lspci-vvv "$T/lspci" -vvv
 probe lspci-k "$T/lspci" -k
 probe lspci-tree "$T/lspci" -t
+probe usb-hwdb /bin/busybox sh -c '[ "$(/bin/busybox dd if=/etc/udev/hwdb.bin bs=8 count=1 2>/dev/null)" = KSLPHHRH ]'
 probe lsusb "$T/lsusb"
 probe iostat "$T/iostat" -x
 probe mpstat "$T/mpstat" -P ALL

@@ -57,7 +57,7 @@ env -u LD_PRELOAD -u LD_LIBRARY_PATH "$ROOT/lib/ld-musl-x86_64.so.1" \
     --repositories-file "$ROOT/etc/apk/repositories" \
     --cache-dir "$CACHE/inspect-apks" --no-scripts --no-chown add "${PINS[@]}"
 python3 - "$ROOT" "$WORK/stage" "$REPO_ROOT/config/inspect-apks.lock" <<'PY'
-import os, shutil, sys
+import os, shutil, subprocess, sys
 from pathlib import Path
 root, out, lock = map(Path, sys.argv[1:])
 expected = dict(line.split('#', 1)[0].strip().split('=', 1)
@@ -70,7 +70,21 @@ for block in (root/'lib/apk/db/installed').read_text().split('\n\n'):
         actual[fields['P']] = fields['V']
 if actual != expected:
     raise SystemExit('signed package closure does not match the checked-in version lock')
+# APK scriptlets stay disabled. Compile only the signed hardware name data,
+# with both input directories and output hwdb.bin rooted in this staging tree.
+# This is not udevd/control/trigger, and must never change host devices.
+env = dict(os.environ)
+for name in ['LD_PRELOAD', 'LD_LIBRARY_PATH']:
+    env.pop(name, None)
+subprocess.run([str(root/'lib/ld-musl-x86_64.so.1'), '--library-path',
+                f'{root}/lib:{root}/usr/lib', str(root/'bin/udevadm'),
+                'hwdb', '--update', '--root', str(root)], check=True, env=env)
+hwdb = root/'etc/udev/hwdb.bin'
+if not hwdb.is_file() or hwdb.stat().st_size < 80:
+    raise SystemExit('isolated hardware database compilation produced no usable file')
 out.mkdir()
+(out/'etc/udev').mkdir(parents=True)
+shutil.copy2(hwdb, out/'etc/udev/hwdb.bin')
 # Only runtime libraries/data live at distro absolute paths. Never replace the
 # project's init, accounts, shell, BusyBox, or baseline program symlinks.
 for path in ['lib', 'usr/lib', 'usr/share', 'etc/terminfo']:
