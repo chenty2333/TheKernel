@@ -226,6 +226,10 @@ unsafe impl Backend for OfflineBackend {
 mod tests {
     use super::*;
     use crate::{Engine, Mode, Value};
+    unsafe extern "C" {
+        fn tk_acpi_table_references(index: u32) -> u32;
+        fn tk_acpi_table(index: u32, out: *mut u8, capacity: usize, used: *mut usize) -> Status;
+    }
     static NOTIFIED: AtomicUsize = AtomicUsize::new(0);
     fn notification(path: &str, value: u32) {
         assert_eq!(path, "\\_SB_.PWRB");
@@ -241,6 +245,28 @@ mod tests {
             .register();
         // SAFETY: single instance with only simulated hardware and authored AML.
         let mut e = unsafe { Engine::initialize(backend, Mode::Offline) }.unwrap();
+        // Every owned copy, including output-limit failure, balances the C
+        // descriptor's validation reference rather than pinning it forever.
+        let count = e.table_count().unwrap();
+        assert!(count > 0);
+        for index in 0..count {
+            // SAFETY: live offline engine; test-only observer takes table mutex.
+            let before = unsafe { tk_acpi_table_references(index) };
+            assert_ne!(before, u32::MAX);
+            for _ in 0..8 {
+                assert!(!e.table(index).unwrap().is_empty());
+                let mut byte = 0;
+                let mut used = usize::MAX;
+                // SAFETY: writable one-byte buffer and live engine, bounded C API.
+                assert_eq!(
+                    unsafe { tk_acpi_table(index, &mut byte, 1, &mut used) },
+                    LIMIT
+                );
+                assert_eq!(used, 0);
+                // SAFETY: same synchronized host-only observer.
+                assert_eq!(unsafe { tk_acpi_table_references(index) }, before);
+            }
+        }
         e.install_notify(notification).unwrap();
         e.initialize_objects().unwrap();
         assert_eq!(

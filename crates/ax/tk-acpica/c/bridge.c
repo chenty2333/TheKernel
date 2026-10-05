@@ -2,6 +2,7 @@
 #include "acpi.h"
 #include "accommon.h"
 #include "acresrc.h"
+#include "actables.h"
 extern void tk_acpi_log(const char *, ACPI_SIZE);
 void AcpiOsVprintf(const char *format, va_list args) {
     char buffer[512];
@@ -131,11 +132,35 @@ ACPI_STATUS tk_acpi_install_fixed_power(void) {
     return AcpiInstallFixedEventHandler(ACPI_EVENT_POWER_BUTTON,FixedPower,NULL);
 }
 ACPI_STATUS tk_acpi_table(UINT32 index, UINT8 *out, ACPI_SIZE capacity, ACPI_SIZE *used) {
-    ACPI_TABLE_HEADER *table;ACPI_STATUS status=AcpiGetTableByIndex(index,&table);*used=0;
+    ACPI_TABLE_HEADER *table;ACPI_TABLE_DESC *desc;
+    ACPI_STATUS status=AcpiUtAcquireMutex(ACPI_MTX_TABLES);*used=0;
     if(ACPI_FAILURE(status))return status;
-    if(!table || table->Length<8 || table->Length>capacity)return AE_LIMIT;
-    memcpy(out,table,table->Length);*used=table->Length;return AE_OK;
+    if(index>=AcpiGbl_RootTableList.CurrentTableCount){status=AE_BAD_PARAMETER;goto done;}
+    desc=&AcpiGbl_RootTableList.Tables[index];
+    status=AcpiTbGetTable(desc,&table);
+    if(ACPI_SUCCESS(status)) {
+        if(!table || table->Length<8 || table->Length>capacity)status=AE_LIMIT;
+        else{memcpy(out,table,table->Length);*used=table->Length;}
+        /* Balance the reference on both success and bounded-output failure.
+         * Copy/release under the table mutex also excludes uninstallation. */
+        AcpiTbPutTable(desc);
+    }
+done:
+    AcpiUtReleaseMutex(ACPI_MTX_TABLES);return status;
 }
+#ifdef TK_ACPICA_HOST
+/* Host regression instrumentation; no production firmware export API. */
+UINT32 tk_acpi_table_references(UINT32 index) {
+    UINT32 count=0xffffffff;
+    if(ACPI_SUCCESS(AcpiUtAcquireMutex(ACPI_MTX_TABLES))) {
+        if(index<AcpiGbl_RootTableList.CurrentTableCount)
+            count=AcpiGbl_RootTableList.Tables[index].ValidationCount;
+        AcpiUtReleaseMutex(ACPI_MTX_TABLES);
+    }
+    return count;
+}
+#endif
+
 extern ACPI_STATUS tk_acpi_ec_access(UINT32,UINT64,UINT32,UINT64 *,void *);
 static ACPI_STATUS EcAccess(UINT32 f,ACPI_PHYSICAL_ADDRESS a,UINT32 w,UINT64 *v,void *h,void *r) {
     (void)r;return tk_acpi_ec_access(f,a,w,v,h);

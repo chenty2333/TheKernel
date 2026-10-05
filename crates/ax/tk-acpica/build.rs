@@ -52,6 +52,9 @@ fn main() {
         .flag("-mno-mmx")
         .flag("-std=gnu11")
         .warnings(false);
+    if env::var_os("CARGO_FEATURE_HOST").is_some() {
+        build.define("TK_ACPICA_HOST", None);
+    }
     // cc doesn't have a compiler spec for Rust's bare-metal triple. The host
     // x86_64 C compiler emits the same SysV ABI with all hosted features off.
     if env::var("CARGO_CFG_TARGET_OS").unwrap() == "none" {
