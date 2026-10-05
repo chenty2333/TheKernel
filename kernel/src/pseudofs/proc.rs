@@ -1854,6 +1854,9 @@ fn render_task_maps(
             } else {
                 (0, 0)
             };
+            let swapped_bytes = if include_smaps {
+                aspace.swapped_bytes_in_range(area.start(), area.size())
+            } else { 0 };
             rows.push((
                 area.start().as_usize(),
                 area.end().as_usize(),
@@ -1862,12 +1865,13 @@ fn render_task_maps(
                 file,
                 resident_bytes,
                 locked_bytes,
+                swapped_bytes,
             ));
         }
         rows
     };
     let mut out = String::new();
-    for (start, end, flags, shared, file, resident_bytes, locked_bytes) in rows {
+    for (start, end, flags, shared, file, resident_bytes, locked_bytes, swapped_bytes) in rows {
         let r = if flags.contains(MappingFlags::READ) {
             'r'
         } else {
@@ -1920,9 +1924,7 @@ fn render_task_maps(
         );
 
         if include_smaps {
-            let _ = writeln!(out, "Size:           {:>8} kB", (end - start) / 1024);
-            let _ = writeln!(out, "Rss:            {:>8} kB", resident_bytes / 1024);
-            let _ = writeln!(out, "Locked:         {:>8} kB", locked_bytes / 1024);
+            super::proc_task_memory::smaps_base(&mut out, end-start, resident_bytes, swapped_bytes, locked_bytes);
         }
     }
 

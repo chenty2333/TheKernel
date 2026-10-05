@@ -563,3 +563,42 @@ correctly failed on this tool limitation rather than accepting runner shutdown
 as program success. Host stable-ifindex tests also cover actual traffic,
 control-plane rename and removal/name reuse without counter aliasing. No
 physical network or concurrent-load performance acceptance is claimed.
+
+### Per-VMA swap observations and pmap mapping rows
+
+Actual Alpine pmap -x exits0 but emits only totals (shell-e58g_u3x), despite
+valid mapping headers and real Rss. The procps-ng4.0.6 upstream pmap.c consumer
+prints its mapping row when it sees the numeric Swap field; missing that field
+suppresses every row. Behavioral consumer source:
+[procps-ng4.0.6 pmap source](https://gitlab.com/procps-ng/procps/-/raw/v4.0.6/src/pmap.c). Linux7.2.3
+fs/proc/task_mmu.c supplies the field grammar/order, not implementation code.
+
+Add Swap from the mm-owned software-PTE BTreeMap within each page-aligned VMA,
+not by guessing that every hardware PTE hole is swapped. Empty software maps
+produce real0; demand holes, PROT_NONE and unrelated VMAs cannot inflate it.
+Keep MM snapshot locking separate from pathname/VFS resolution. Size/Rss/Swap/
+Locked formatting is in proc_task_memory, rather than adding a new formatter
+body to the shared proc builder. Dirty/private/shared/PSS accounting remains
+incomplete; displaying mapping rows does not make pmap's Dirty column verified.
+
+The same base C parser passes host Linux on an actually touched anonymous VMA.
+Guest-only --swap creates an explicit temporary RAM-filesystem fixture, activates
+it, exercises MADV_PAGEOUT/page-in with content checks, and removes it; it never
+runs swapon on the host or touches any block device. Such a RAM-backed TheKernel
+fixture is a software-PTE observation test, not Linux tmpfs swapon acceptance or
+physical swap-I/O evidence. Kernel2607, lint (784 existing warnings), and
+KVM guest67/67 with no skips/normal shutdown passed (system-wcabpb9i). The
+RAM-backed guest fixture observes actual Swap0 ->64 ->0kB with corresponding
+resident transitions, preserved page contents and successful swapoff/unlink.
+Actual signed Alpine pmap -x now shows the held anonymous mapping as64kB/RSS64
+and prints all mapping rows, not just totals (shell-dmf5effw, PMAP_TOOLS_RC=0).
+Dirty/private/shared/PSS remain incomplete; only mapping/RSS/swap are accepted.
+No syscall errno/admission behavior changed; the last full ABI257/257 and full
+period host validation are from item24, not claimed as rerun for this item.
+
+While verifying the source, found that the existing kernel does support software
+swap leaves, contradicting the earlier vmstat formatter's assumed absence of
+swap. Its pswpin/pswpout constant0 must be replaced by actual successful swap-I/O
+counters in a follow-up; absence of an active swap device in the baseline guest
+is not proof that these fields are always0. Do not claim those counters correct
+under active swap until repaired and measured.

@@ -478,6 +478,12 @@ static int test_exec_mm_bounds(void) {
         NULL, "exec-mm-bounds-child");
 }
 
+static int test_proc_smaps_swap(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-proc-smaps-swap-smoke",
+        "--swap", "proc-smaps-swap-child");
+}
+
 static int test_net_statistics(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-net-statistics-smoke",
@@ -1118,6 +1124,7 @@ static int run_init(int argc, char **argv) {
         { "netlink-dump-padding", test_netlink_dump_padding, 30 },
         { "socket-diag", test_socket_diag, 30 },
         { "net-statistics", test_net_statistics, 30 },
+        { "proc-smaps-swap", test_proc_smaps_swap, 30 },
         { "memory-pressure", test_memory_pressure_reclaim, 120 },
         { "process-exec", test_process_pipe_and_exec, 60 },
         { "vfork", test_vfork, 60 },

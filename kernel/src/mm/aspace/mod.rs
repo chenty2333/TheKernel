@@ -73,6 +73,7 @@ mod policy;
 mod populate;
 mod protect_types;
 mod query;
+mod observations;
 mod setup;
 mod thp;
 mod tlb;

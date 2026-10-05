@@ -2,6 +2,7 @@
 //! statm's seven-field order and the two legacy fields that are always zero.
 
 use alloc::{format, string::String};
+use core::fmt::Write;
 
 use axfs_ng_vfs::{VfsError, VfsResult};
 use axhal::paging::MappingFlags;
@@ -23,6 +24,26 @@ fn render(value: &Statm) -> String {
         "{} {} {} {} 0 {} 0\n",
         value.size, value.resident, value.shared, value.text, value.data_stack
     )
+}
+
+/// Base per-VMA observations. Swap's numeric row is also a record delimiter
+/// consumed by procps pmap -x; do not fabricate private/shared dirty or PSS.
+pub(super) fn smaps_base(
+    out: &mut String,
+    size: usize,
+    resident: usize,
+    swapped: usize,
+    locked: usize,
+) {
+    for (name, bytes) in [
+        ("Size", size),
+        ("Rss", resident),
+        ("Swap", swapped),
+        ("Locked", locked),
+    ] {
+        let label = format!("{name}:");
+        let _ = writeln!(out, "{label:<16}{:>8} kB", bytes / 1024);
+    }
 }
 
 pub(super) fn statm(process: &ProcessData) -> VfsResult<String> {
@@ -62,6 +83,17 @@ pub(super) fn statm(process: &ProcessData) -> VfsResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smaps_swap_row_precedes_locked_and_preserves_observed_kilobytes() {
+        let mut text = String::new();
+        smaps_base(&mut text, 32768, 8192, 16384, 4096);
+        assert_eq!(
+            text,
+            "Size:                 32 kB\nRss:                   8 kB\nSwap:                 16 \
+             kB\nLocked:                4 kB\n"
+        );
+    }
 
     #[test]
     fn statm_has_seven_page_count_fields_with_linux_legacy_zeroes() {
