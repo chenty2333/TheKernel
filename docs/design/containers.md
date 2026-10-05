@@ -367,3 +367,21 @@ reaches cgroup control-file lookup, but cat and crun fail to open
 OCI acceptance: CgroupFile/CgroupDir do not currently provide persistent inode
 userdata for the OFD errseq interface. Repair that actual file-open boundary
 next, then rerun the bundle. Memory is still not advertised or enforced.
+
+### Cgroup OFD errseq integration
+
+Cgroup file and directory nodes now own persistent inode userdata. The existing
+VFS errseq interface can therefore construct real OFDs instead of rejecting
+open with EOPNOTSUPP. Repeated aliases of one inode share its state; distinct
+inodes do not. Controller contents, authority checks and pids admission are not
+replaced with a userspace shim or synthetic data.
+
+Validated: kernel2636 with the new inode-identity regression; q35 lint784;
+KVM system70/70 (`system-7nh_4t_r`); selected fs-abi24/259 (`abi-38hsmr9g`, generic
+open/read/descriptor regression, not a cgroup-specific oracle assertion).
+The real mount explicitly returns0 and cat prints the genuine `pids` controller
+(`shell-n70c_dx3`). Crun advances but exits1 opening `self/setgroups` relative to
+its detached fsmount proc-root fd: ENOTDIR. Upstream1.30.1's get_procfd prefers
+that new mount API; the kernel's directory-fd helper currently recognizes only
+its Directory wrapper. Fix that observed path capability next. OCI, memory and
+pids-limit acceptance remain pending; rootless podman has not been attempted.

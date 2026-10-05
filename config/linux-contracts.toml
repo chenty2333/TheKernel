@@ -4608,7 +4608,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics; proc namespace opens select a live authorized task namespace through an object-backed magic link and retain its actual nsfs file"]
+state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics; cgroup directory/control inodes retain per-inode errseq for OFD construction; proc namespace opens select a live authorized task namespace through an object-backed magic link and retain its actual nsfs file"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -4619,7 +4619,7 @@ status = "implemented"
 contract = "linux-open"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_open"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/pseudofs/cgroup.rs:cgroup_inode_errseq_is_shared_across_lookups_not_with_other_inodes"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -4631,7 +4631,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics; proc namespace opens select a live authorized task namespace through an object-backed magic link and retain its actual nsfs file"]
+state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics; cgroup directory/control inodes retain per-inode errseq for OFD construction; proc namespace opens select a live authorized task namespace through an object-backed magic link and retain its actual nsfs file"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -4642,7 +4642,7 @@ status = "implemented"
 contract = "linux-openat"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_openat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/pseudofs/cgroup.rs:cgroup_inode_errseq_is_shared_across_lookups_not_with_other_inodes"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -4654,7 +4654,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics; object-backed proc namespace links jump to retained nsfs locations after magic-link/symlink and cross-mount policy; directory-search admission does not add execute permission to a final regular target"]
+state = ["state:resolve pathname/open_how then install an owned open-file description with access, creation, resolution and CLOEXEC semantics; cgroup directory/control inodes retain per-inode errseq for OFD construction; object-backed proc namespace links jump to retained nsfs locations after magic-link/symlink and cross-mount policy; directory-search admission does not add execute permission to a final regular target"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -4665,7 +4665,7 @@ status = "partial"
 contract = "linux-openat2"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_openat2"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias", "tests/guest/portable/fd-lifecycle-differential.c:main"]
+tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias", "tests/guest/portable/fd-lifecycle-differential.c:main", "kernel/src/pseudofs/cgroup.rs:cgroup_inode_errseq_is_shared_across_lookups_not_with_other_inodes"]
 validation_gaps = ["explicit-none"]
 limitations = ["openat2's reserved upper-32 flag word (OPENAT2_REGULAR) and the internal __O_REGULAR/EFTYPE admission are unrepresentable here: axerrno has no EFTYPE and the carrier bit is not user-visible, so no guest rule is asserted for them"]
 

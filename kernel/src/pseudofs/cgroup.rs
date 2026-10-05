@@ -14,7 +14,7 @@ use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{
     CreateDisposition, CreateOutcome, DeviceId, DirEntry, DirEntrySink, DirNode, DirNodeOps,
     FileNode, FileNodeOps, Filesystem, FilesystemOps, FsName, FsNameBuf, FsPath, Metadata,
-    MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, Reference,
+    MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData, Reference,
     RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult, WeakDirEntry, path::MAX_NAME_LEN,
 };
 use axhal::time::wall_time;
@@ -1135,6 +1135,7 @@ impl FilesystemOps for CgroupFs {
 struct CgroupNode {
     fs: Arc<CgroupFs>,
     ino: u64,
+    user_data: NodeUserData,
     metadata: Mutex<Metadata>,
 }
 
@@ -1163,6 +1164,7 @@ impl CgroupNode {
         Ok(Self {
             fs,
             ino,
+            user_data: NodeUserData::new(),
             metadata: Mutex::new(metadata),
         })
     }
@@ -3232,6 +3234,10 @@ pub(crate) fn prepare_fork_charge_into(
 }
 
 impl NodeOps for CgroupDir {
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.node.user_data)
+    }
+
     fn inode(&self) -> u64 {
         self.node.ino
     }
@@ -3728,6 +3734,10 @@ fn is_read_only_control_file(name: &str) -> bool {
 }
 
 impl NodeOps for CgroupFile {
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.node.user_data)
+    }
+
     fn inode(&self) -> u64 {
         self.node.ino
     }
@@ -3837,6 +3847,19 @@ mod tests {
     use axfs_ng_vfs::Timestamp;
 
     use super::*;
+
+    #[test]
+    fn cgroup_inode_errseq_is_shared_across_lookups_not_with_other_inodes() {
+        let fs = new_cgroup_v2().unwrap();
+        let root = fs.root_dir();
+        let first = root.as_dir().unwrap().lookup(FsName::new(b"cgroup.controllers")).unwrap();
+        let second = root.as_dir().unwrap().lookup(FsName::new(b"cgroup.controllers")).unwrap();
+        let root_errors = root.writeback_error_state().unwrap();
+        let first_errors = first.writeback_error_state().unwrap();
+        let second_errors = second.writeback_error_state().unwrap();
+        assert!(Arc::ptr_eq(&first_errors, &second_errors));
+        assert!(!Arc::ptr_eq(&first_errors, &root_errors));
+    }
 
     #[test]
     fn scheduler_clamp_controls_keep_minimum_and_maximum_ordered() {
