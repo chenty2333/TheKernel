@@ -93,3 +93,18 @@ D 不改其文件。原生硬件行为始终标 **未在硬件上验证**。
 运行再跑 KVM guest。每三提交/最后跑全 host、guest、两平台 lint。使用独立
 `THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets/wt-intel`、6 个构建
 任务、nice 10。这些 QEMU/host 结果不能确认 TC PHY、屏幕像素或音频输出。
+
+## Continuation: DKL firmware state readout
+
+DKL access and the display-13 TC PLL readout are implemented in the MIT crate.
+The power-reference/lock backend contracts prevent reads from dark PHYs and
+selector races. Firmware discovery restores the whole shared HIP index and
+verifies it, including failures after potentially landed stores; uncertain
+restoration is a quarantine error, not a successful readout. The upstream raw
+read/mask order is unchanged. No kernel call site enables these accessors yet;
+PLL readout alone is not full firmware equivalence or fastboot takeover.
+
+Measured: local compiled i915 C agrees on 192 primitive-operation traces across
+four ports/16 banks and 12 PLL states/read traces. Five regression tests cover
+layout, unchanged RMW stores, dark/disabled domains, 18 fault prefixes and both
+restoration write/read failures. No physical MMIO or monitor output was tested.

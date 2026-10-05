@@ -564,3 +564,17 @@ At ≥40, `crates/ax` totals are now `(0,0,0,16,9,0,0)`; at ≥25 they are
 and range-citation counts are unchanged. `test_linux_excerpt_baseline.py` is
 reconciled to these measured totals rather than disabling/exempting the scan.
 The earlier inventory tables remain explicitly dated historical measurements.
+
+DKL readout/access extension: MIT `intel_dkl_phy.c` helpers → `src/dkl_phy.rs`,
+`intel_dpll_mgr.c::dkl_pll_get_hw_state` → `src/dpll_mgr.rs`. ADL-P TC PLL enables
+start at **0x46038, stride 8**, not the TGL/ICL MG_PLL_ENABLE registers. Backend
+contracts pin power and serialize all HIP access. Firmware-only readout encloses
+all eight reads in one lock, preserves the full shared selector and verifies its
+restoration on every fallible prefix; failure requires quarantine. This is an
+explicit safety divergence from i915's driver-owned helper (one lock per read).
+`intel_de_rmw` ultimately always writes through `intel_uncore_rmw`, contrary to
+the DKL helper's stale unchanged-value-elision comment. Port follows executable
+upstream behavior. Optional `upstream_dkl` compiles unmodified local C helpers,
+state-readout body and register masks: 192 four-operation traces and 12 masked
+PLL states/read traces. The oracle ignores only the documented preservation
+wrapper's three extra operations, not any upstream register access.

@@ -257,3 +257,10 @@ The conventional host-oracle `ARRAY_SIZE` sizeof expression produces one
 additional scanner code-line match at thresholds25/40, not a copied prose block
 or an imported C driver. The measured inventory and its CI baseline are updated
 in provenance and the crate NOTICE; the scanner remains enabled and unchanged.
+
+The DKL access/readout slice additionally translates MIT `intel_dkl_phy.c`
+(`dkl_phy_set_hip_idx`, `intel_dkl_phy_{read,write,rmw,posting_read}`) and
+`intel_dpll_mgr.c::dkl_pll_get_hw_state` into `dkl_phy.rs` / `dpll_mgr.rs`.
+The 2022 / 2006–2016 Intel copyrights and permission-text references accompany
+source; selected display register fields retain the 2025 attribution in NOTICE.
+The local C oracle uses the same temporary-source grant, not a shipped C driver.

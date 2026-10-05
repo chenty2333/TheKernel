@@ -59,3 +59,16 @@ at both thresholds25/40 in tests/upstream_clock.rs: the conventional sizeof
 ARRAY_SIZE expression used by the original host compile shim. This is not an
 imported C driver or a quoted Linux prose block. Accounted as one outside-fence
 code line in the repository's scanner baseline; no fenced quote or range marker.
+
+src/dkl_phy.rs:
+  drivers/gpu/drm/i915/display/intel_dkl_phy.c:
+  dkl_phy_set_hip_idx, intel_dkl_phy_{read,write,rmw,posting_read}
+  intel_dkl_phy_regs.h: four ADL-P TC apertures/bank/index layout
+  Copyright © 2022 Intel Corporation.
+src/dpll_mgr.rs additionally includes dkl_pll_get_hw_state, ADL-P
+  intel_tc_pll_enable_reg routing and its display_regs.h register fields.
+  Copyright © 2006-2016 / 2025 Intel Corporation.
+  Power and global HIP locking are explicit backend lifetime contracts.
+  Readout restores and verifies firmware's selector under a single lock;
+  i915 driver-owned individual access routines retain their original sequence.
+  dco_khz is derived metadata, excluded from raw state comparisons.

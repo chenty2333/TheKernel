@@ -5,7 +5,8 @@
 // intel_{mg,dkl}_phy_regs.h: selected DKL/clock register fields.
 // Copyright © 2022 Intel Corporation. MIT permission text: ../LICENSE-MIT.
 // ADL-P/N display-13 DKL HDMI, no SSC only. MG PHY, DP/TBT, combo PLL,
-// other platforms and all hardware enable/disable/get_state/WA writes omitted.
+// other platforms and hardware enable/disable/WA writes omitted.
+// dkl_pll_get_hw_state is translated below with a preserved-selector wrapper.
 use crate::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,4 +146,72 @@ mod tests {
         let s = icl_calc_mg_pll_state(148352, 24000, None).unwrap();
         assert_eq!(icl_ddi_mg_pll_get_freq(&s, 24000), Ok(148351));
     }
+}
+
+/// Power reference acquired only if DISPLAY_CORE is already enabled. The
+/// backend releases it after the operation (including errors), never wakes an
+/// otherwise dark display during firmware discovery.
+pub trait PllReadoutIo: crate::dkl_phy::DklIo {
+    fn with_display_core_if_enabled<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<Option<T>, Error>;
+}
+
+/// Display-13 DKL get_hw_state. `None` means dark power domain / disabled PLL,
+/// not a zero-filled state. Raw enable/lock/power evidence is retained separately
+/// from the masked configuration used by i915's PLL state comparisons.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DklPllReadout {
+    pub enable: u32,
+    pub state: DklPllState,
+}
+pub fn dkl_pll_get_hw_state(
+    io: &impl PllReadoutIo,
+    port: crate::dkl_phy::TcPort,
+    refclk_khz: u32,
+    override_afc_startup: bool,
+) -> Result<Option<DklPllReadout>, Error> {
+    use crate::dkl_phy::with_preserved_selector;
+    io.with_display_core_if_enabled(|| {
+        let enable = io.read32(port.pll_enable())?;
+        if enable & (1 << 31) == 0 {
+            return Ok(None);
+        }
+        with_preserved_selector(io, port, |phy| {
+            let refclkin_ctl = phy.read(0x212c)? & (7 << 8);
+            let hsclkctl = phy.read(0x20d4)? & ((1 << 16) | (3 << 14) | (3 << 12) | (15 << 8));
+            let coreclkctl1 = phy.read(0x20d8)? & (255 << 8);
+            let div0 =
+                phy.read(0x2200)? & (0x1fffff | if override_afc_startup { 7 << 25 } else { 0 });
+            let div1 = phy.read(0x2204)? & ((31 << 16) | 255);
+            let ssc = phy.read(0x2210)? & ((7 << 29) | (255 << 16) | (7 << 11) | (1 << 9));
+            let bias = phy.read(0x2214)? & ((1 << 30) | (0x3fffff << 8));
+            let tdc_coldst_bias = phy.read(0x2218)? & 0xffff;
+            let mut state = DklPllState {
+                dco_khz: 0,
+                refclkin_ctl,
+                coreclkctl1,
+                hsclkctl,
+                div0,
+                div1,
+                ssc,
+                bias,
+                tdc_coldst_bias,
+            };
+            // dco_khz is derived metadata, not an MMIO state field in i915.
+            icl_ddi_mg_pll_get_freq(&state, refclk_khz)?;
+            let m1 = (div0 >> 8) & 15;
+            let frac = if bias & (1 << 30) != 0 {
+                (bias >> 8) & 0x3fffff
+            } else {
+                0
+            };
+            let dco = u64::from(m1) * u64::from(div0 & 255) * u64::from(refclk_khz)
+                + ((u64::from(m1) * u64::from(frac) * u64::from(refclk_khz)) >> 22);
+            state.dco_khz = dco.try_into().map_err(|_| Error::Refused)?;
+            Ok(Some(DklPllReadout { enable, state }))
+        })
+    })
+    .map(Option::flatten)
 }

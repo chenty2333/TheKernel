@@ -9,6 +9,7 @@ pub mod bios;
 pub mod cdclk;
 pub mod device;
 pub mod display;
+pub mod dkl_phy;
 pub mod dpll_mgr;
 pub mod opregion;
 
@@ -22,6 +23,8 @@ pub enum Error {
     UnsupportedDevice,
     Unavailable(u32),
     Refused,
+    /// Recovery could not be verified; the caller must quarantine the device.
+    RestoreFailed(u32),
 }
 
 fn bytes(data: &[u8], offset: usize, length: usize) -> Result<&[u8], Error> {
