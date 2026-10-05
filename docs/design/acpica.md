@@ -108,17 +108,59 @@ An unavailable external directory reports an explicit skip (exit 77).
 Only the project-authored synthetic fixture is checked in. The programmer
 reference and its text conversion live outside Git in `refs/acpica/`.
 
+## Final verification and completion status
+
+The final runtime source passed the formal host suite (655 Python tests, three
+existing skips; 2616 kernel tests; ACPICA 19 tests), native opt-in Q35/OVMF guest
+69/69, product lint and N305 build lint (baseline warnings). All four policy
+regressions passed: thermal critical trip, authored control-method Notify, QMP
+fixed button and initialization-failure/static rollback. The complete ABI
+comparison ran 40 real programs and passed 257/257 contracts on both TheKernel
+and Linux 7.2.3. ABI used the default static boot mode; native ACPICA acceptance
+is the separate guest/policy runs, not the ABI result.
+
+Final review also repaired leaked table-validation references (both successful
+copies and bounded-output failures now balance under the table mutex) and a
+false critical trip for an unrepresentable 64-bit sensor sentinel. Their host
+regressions failed/identified the old behaviour and pass after repair. Linux
+excerpt scans found no matching Rust lines in the new crate/kernel ACPI modules
+or pseudofs scope. The dependency-layer check still reports six pre-existing
+manifest-policy differences in DBC/HDA/NVMe/watchdog; those manifests are
+unchanged from the worktree base and were not repaired outside this task.
+
+- E1: completed, including external q35/N305 offline interpretation.
+- E2.1–3 and E2.7–8: completed at the stated QEMU scope (startup/failure rollback,
+  S5, button consumers, thermal policy, tables/devices). QMP is fixed-button
+  production; the method-button consumer uses an authored Notify fixture.
+- E2.4: implementation delivered (upstream edge/level dispatch, `_PRW` policy,
+  bounded queue/SCI recovery). Live GPE-storm and physical wake acceptance remain
+  unverified: no admitted controllable storm producer, and no suspend lifecycle
+  or authorized physical run. Host budget tests are not substituted for that.
+- E2.5: blocked. The safe current kernel initialization phase follows initial
+  PCI driver probing. The earlier insertion faulted; no scheduler changes or
+  unsafe device reprobe were retained. IRQ assignment, inactive-link `_SRS`
+  allocation and an INTx RX/TX acceptance case require a safe pre-probe service
+  phase before this can be called complete.
+- E2.6: S0 SystemIO EC/ECDT implementation delivered. Native EC transactions and
+  wake acceptance are blocked by q35 lacking an EC and this round forbidding
+  physical testing. GPE-block packages are explicitly unsupported.
+- E3: guest/tools/power/docs completed; INTx and native EC acceptance remain
+  blocked as above. This is **not a claim of complete ACPI hardware support**.
+
+`config/linux-contracts.toml` is unchanged, including `[progress]`. No syscall
+semantics were changed. No physical run, push, branch creation or merge occurred.
+
 ## Remaining acceptance and known differences
 
 PCI INTx allocation/probe ordering, inactive-link `_SRS` policy and a real INTx
-RX/TX test remain pending. EC SystemIO operation regions are installed before object initialization. ECDT
+RX/TX test are blocked as described above. EC SystemIO operation regions are installed before object initialization. ECDT
 bootstrap handlers are installed before table AML loading, then checked against
 PNP0C09 namespace resources. Transactions serialize byte commands, use bounded
 100 ms waits and honor namespace `_GLK`. S0 query handling polls every 25 ms with
 a 64-query budget and masks its global GPE; GPE-block packages and EC wake are
 not supported. Q35 has no EC: protocol/timeout/ECDT validation tests plus a Q35
 no-EC guest run are **not** proof of native EC transactions. The prohibited
-hardware run is the outstanding acceptance blocker. Thermal zones expose `acpitz`, `_TMP`, valid `_CRT`/`_PSV` trip values/types in
+hardware run is the outstanding native acceptance blocker. Thermal zones expose `acpitz`, `_TMP`, valid `_CRT`/`_PSV` trip values/types in
 `/sys/class/thermal`. Reads use the Linux integer-decikelvin offset heuristic,
 not fabricated zero on AML failure. A five-second monitor sends the existing
 ordered shutdown request at `_CRT`; it is not a passive cooling governor.
