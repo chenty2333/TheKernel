@@ -7,9 +7,10 @@ use tk_acpica::{Engine, Node};
 #[cfg(target_os = "none")]
 use tk_acpica::{Mode, Status};
 #[cfg(target_os = "none")]
-mod native;
-#[cfg(target_os = "none")]
 mod ec;
+#[cfg(target_os = "none")]
+mod native;
+pub mod thermal;
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 static BUTTONS: SpinNoIrq<Vec<String>> = SpinNoIrq::new(Vec::new());
 
@@ -44,7 +45,9 @@ fn initialize() -> Result<(), Status> {
     native::start_worker()?;
     // SAFETY: allocation, scheduler, IRQ/APIC and owned RSDP are ready; only
     // explicit acpi=acpica allows firmware AML to take hardware ownership.
-    let mut engine = unsafe { Engine::initialize_with_tables(&native::REGISTRATION, Mode::Hardware, ec::bootstrap) }?;
+    let mut engine = unsafe {
+        Engine::initialize_with_tables(&native::REGISTRATION, Mode::Hardware, ec::bootstrap)
+    }?;
     engine.install_notify(notify)?;
     let nodes = engine.namespace()?;
     let mut buttons = Vec::new();
@@ -74,9 +77,10 @@ fn initialize() -> Result<(), Status> {
         fixed,
         BUTTONS.lock().len()
     );
+    let thermal = thermal::init(&nodes)?;
     *ENGINE.lock() = Some(engine);
     axhal::acpi::register_off(power_off);
-    axhal::acpi::publish_button(fixed || !BUTTONS.lock().is_empty());
+    axhal::acpi::publish_button(fixed || !BUTTONS.lock().is_empty() || thermal);
     Ok(())
 }
 fn notify(path: &str, value: u32) {

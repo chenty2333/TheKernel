@@ -62,6 +62,9 @@ S5. Panic/IRQ paths never block on AML and retain static S5 as a fallback.
   semantic change was made. Final acceptance uses the explicit inspection
   payload, without changing the ordinary rootfs size.
 
+- Q35 thermal policy fixture: real sysfs values and critical -> orderly flush ->
+  ACPICA S5 passed; ordinary no-zone guest suite remained **69/69**.
+
 ## Reproduce
 
 Use a separate state directory and `CARGO_BUILD_JOBS=6`; host builds and VM
@@ -78,6 +81,10 @@ CARGO_BUILD_JOBS=6 nice -n 10 cargo run -p tk-acpica --features host \
   --example table_probe -- EXTERNAL_TABLE_DIRECTORY
 ```
 
+For the authored thermal shutdown regression, use the same environment with
+`nice -n 10 python3 scripts/ci/acpica-policy-qemu-smoke.py`. It does not accept
+host termination or shell EOF as a critical-trip result.
+
 The probe reads only DSDT/SSDT and prints counts/status, never OEM AML or MSDM.
 An unavailable external directory reports an explicit skip (exit 77).
 Only the project-authored synthetic fixture is checked in. The programmer
@@ -93,8 +100,14 @@ PNP0C09 namespace resources. Transactions serialize byte commands, use bounded
 a 64-query budget and masks its global GPE; GPE-block packages and EC wake are
 not supported. Q35 has no EC: protocol/timeout/ECDT validation tests plus a Q35
 no-EC guest run are **not** proof of native EC transactions. The prohibited
-hardware run is the outstanding acceptance blocker. Thermal integration is
-being committed separately.
+hardware run is the outstanding acceptance blocker. Thermal zones expose `acpitz`, `_TMP`, valid `_CRT`/`_PSV` trip values/types in
+`/sys/class/thermal`. Reads use the Linux integer-decikelvin offset heuristic,
+not fabricated zero on AML failure. A five-second monitor sends the existing
+ordered shutdown request at `_CRT`; it is not a passive cooling governor.
+An authored injected SSDT was measured at 26800 mC with a 36800 mC critical
+trip and 31800 mC passive trip. Ten seconds later its `_TMP` reached `_CRT`;
+the log showed the critical request, button event, filesystem flush, AML
+preparation and clean QEMU S5. This proves policy, not an N305 sensor.
 Root sysfs currently exports admitted ACPICA table descriptors; `dynamic/` is
 present but separate dynamic-load attribution is not implemented. Namespace
 views do not claim Linux modalias/driver binding or full device-power policy.

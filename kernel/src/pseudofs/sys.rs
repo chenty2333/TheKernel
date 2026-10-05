@@ -196,6 +196,7 @@ fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         fs.clone(),
         Arc::new(super::block_inventory::class_root(fs.clone())
             .chain(super::net_sysfs::class_root(fs.clone()))
+            .chain(super::acpi_thermal::class_root(fs.clone()))
             .chain(device_registry::class_root(fs))),
     )
 }

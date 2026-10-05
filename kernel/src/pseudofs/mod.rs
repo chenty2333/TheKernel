@@ -180,3 +180,5 @@ mod tests {
 }
 
 mod acpi;
+
+mod acpi_thermal;
