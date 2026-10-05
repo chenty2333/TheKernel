@@ -320,6 +320,7 @@ case "$TOOLCHAIN" in
     # `gcc` is a superset of `glibc`: the compiler is dynamic, so the glibc
     # loader case runs too and the image proves its own prerequisite.
     gcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1 -DTHEKERNEL_TOOL_PAYLOAD_GCC=1" ;;
+    debug) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_DEBUG=1" ;;
     *) printf 'unknown THEKERNEL_TOOLCHAIN: %s\n' "$TOOLCHAIN" >&2; exit 2 ;;
 esac
 # shellcheck disable=SC2086 # INIT_DEFINES is a deliberate flag list
@@ -345,6 +346,18 @@ for source in "$REPO_ROOT"/tests/guest/portable/*.c; do
         -pthread "$source" \
         -o "$STAGE/opt/thekernel-tests/portable/$name"
 done
+
+if [ "$TOOLCHAIN" = debug ]; then
+    mkdir -p "$STAGE/opt/thekernel-tests/debugger"
+    "${CROSS_COMPILE}gcc" -O0 -g3 -fno-omit-frame-pointer -static -no-pie -std=c11 -Wall -Wextra -Werror \
+        -pthread "$REPO_ROOT/tests/guest/debugger/debug-target.c" \
+        -o "$STAGE/opt/thekernel-tests/debugger/debug-target"
+    "${CROSS_COMPILE}gcc" -O2 -static -std=c11 -Wall -Wextra -Werror \
+        "$REPO_ROOT/tests/guest/debugger/trace-target.c" \
+        -o "$STAGE/opt/thekernel-tests/debugger/trace-target"
+    cp "$REPO_ROOT/tests/guest/debugger/basic.gdb" "$STAGE/opt/thekernel-tests/debugger/basic.gdb"
+    cp "$REPO_ROOT/tests/guest/debugger/debug-target.c" "$STAGE/opt/thekernel-tests/debugger/debug-target.c"
+fi
 
 # The optional guest tool payload: a compiler and its development sysroot,
 # built on the host by build-guest-tools.sh and copied in as-is.  Nothing here

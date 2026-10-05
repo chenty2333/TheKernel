@@ -164,3 +164,16 @@ text, a shared RX alias, and pread of the executable inode retain original bytes
 A protected shared-alias write returns EIO. General FOLL_FORCE mutation of other
 protected private mappings and concurrent debugger/uprobe byte ownership remain
 limitations, not claims established by this executable-text test.
+
+## Real Alpine tools
+
+The optional debug payload uses signed pinned Alpine GDB16.3 and strace6.19, with
+its complete runtime closure and a debug-info C target. Native and guest GDB
+batch runs establish breakpoint/run/bt/registers/print/variable mutation,
+step/next/finish and normal continuation; changed input yields DEBUG_RESULT=24.
+The ordinary smoke also validates strace file syscall parameters and returns.
+The same driver with --follow-fork exercises fork/exec/file tracing; currently the
+calls and target result are correct, but strace exits with ECHILD at traced-child
+teardown. This remains a failure, not a completed strace-f claim. The traced
+relationship is currently removed before a durable zombie is visible; tracer-first
+exit handoff and independent multithread stops remain required next work.

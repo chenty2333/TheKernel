@@ -202,3 +202,19 @@ holds:
 xHCI §7.6 register/DMA facts are not a copied driver implementation or license
 grant for a USB vendor identity. No Linux code/excerpts were added; no firmware
 blob is needed by DbC. See `docs/design/usb-dbc.md` for scope and references.
+
+## Optional Alpine debug payload (Codex A, 2026-10-05)
+
+The `debug` payload stages unmodified signed Alpine v3.24 x86_64 packages using
+an Alpine 3.24.1 minirootfs bootstrap. `config/guest-debug-apk-pins.tsv` records
+the exact package versions, source URLs, reproducibility checksums, SPDX license
+expressions and origins from Alpine's signed package metadata. Native apk verifies
+signatures before extraction; no package scripts or host installation run.
+
+GDB 16.3-r4 declares GPL-3.0-or-later AND LGPL-3.0-or-later; strace 6.19-r1 declares
+BSD-3-Clause; musl declares MIT and Python PSF-2.0. Dependencies retain their
+original package payloads/notices, with their individual declarations recorded in
+the pin file copied into the guest. This is optional userspace, not Rust kernel
+source or a change to the kernel license. Redistribution must satisfy each
+package's license and corresponding-source requirements where applicable;
+Alpine package origins identify the build recipes and upstream source projects.

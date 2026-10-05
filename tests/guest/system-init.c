@@ -459,6 +459,12 @@ static int test_signal_fp(void) {
  * contract a compiler or an emulator depends on and classifies its own
  * findings as required or informational, so a non-zero result here means a
  * required contract failed rather than that a probe was unable to look. */
+#if defined(THEKERNEL_TOOL_PAYLOAD_DEBUG)
+static int test_real_debugger(void) {
+    return run_guest_program("/opt/thekernel-tests/bin/thekernel-debugger-smoke", NULL, "real-debugger-child");
+}
+#endif
+
 static int test_jit_mem(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-jit-mem-smoke",
@@ -1098,6 +1104,9 @@ static int run_init(int argc, char **argv) {
         { "jit-mem", test_jit_mem, 30 },
         { "proc-shape", test_proc_shape, 30 },
         { "threads-futex", test_threads_futex, 60 },
+#if defined(THEKERNEL_TOOL_PAYLOAD_DEBUG)
+        { "real-debugger", test_real_debugger, 240 },
+#endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
         { "compiler-smoke", test_compiler_smoke, 120 },
 #endif
