@@ -83,3 +83,28 @@ atomic rejection, policy/uclamp priority, wide APERF/MPERF ratios and unsupporte
 hardware. Kernel preference-name test and q35 lint passed. KVM guest63/63
 (system-up8kt0mm) confirmed cpufreq_supported=0 and no phantom driver directory;
 no HWP/APERF hardware effect is claimed. Owner sampling is preemption/IRQ pinned.
+
+## Read-only coretemp
+
+Physical Intel family6 models BE/CC with DTS are admitted; hypervisors and
+unknown models are excluded before any thermal MSR access. TjMax comes from
+MSR_TEMPERATURE_TARGET[23:16], with Linux's target offset[15:8] used for max.
+Input is (TjMax − digital readout) in millidegrees only when status valid[31]
+is set. Crit alarm reports the out-of-spec log bit[5], without clearing it.
+Only IA32_THERM_STATUS, optional package status and target are read.
+
+Owner timer paths sample core/package status every100 ms; sysfs reads those
+value snapshots, never another CPU's MSR. One coretemp hwmon per package
+contains package and deduplicated core labels, input/max/crit/crit_alarm.
+Attributes are read-only. Invalid samples return an error, not a made-up
+temperature. Unsupported QEMU has an empty hwmon class, no pretend sensors.
+The class composes with the existing dynamic device registry (graphics etc.).
+Known scope differences: model admission is deliberately narrow, TjMax is
+captured at boot, and no CPU-hotplug/sysfs sensor-removal lifecycle is added.
+Native MSR admission and actual readings remain **未在硬件上验证**.
+
+Temperature validation: platform139 tests passed (target/offset/validity/delta,
+virtual/unknown admission); kernel read-only attribute test and q35 lint passed.
+KVM guest63/63 (system-migo15ns) opened the empty hwmon class successfully,
+without probing virtual thermal MSRs. Actual core/package readings remain
+unverified on physical hardware; real sensors acceptance follows below.

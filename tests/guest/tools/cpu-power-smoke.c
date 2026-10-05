@@ -66,4 +66,7 @@ static int frequency(void) {
     for(unsigned i=0;i<4;i++) { snprintf(path,sizeof(path),ROOT "/cpu0/cpufreq/%s",fields[i]); unsigned long long value=number(path); if(value==~0ULL||value<previous) return 1; previous=value; }
     puts("CPU_FREQUENCY supported"); return 0;
 }
-int main(void) { return idle()||frequency(); }
+int main(void) {
+    int fd=open("/sys/class/hwmon",O_RDONLY|O_DIRECTORY); if(fd<0) return 1; close(fd);
+    puts("CPU_THERMAL hwmon class accessible"); return idle()||frequency();
+}

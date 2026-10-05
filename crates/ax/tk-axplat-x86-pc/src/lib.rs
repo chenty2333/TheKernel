@@ -181,3 +181,6 @@ pub mod cpuidle;
 
 /// Explicit firmware-enabled HWP frequency policy and effective frequency.
 pub mod cpufreq;
+
+/// Read-only, physical Intel DTS temperatures and target limits.
+pub mod thermal;

@@ -31,6 +31,8 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     fs_dir.add("fuse", SimpleDir::new_maker(fs.clone(), Arc::new(fuse_dir)));
 
     root.add("class", class_dir(fs.clone()));
+    #[cfg(any(feature="pmu",feature="hwp-uclamp"))]
+    root.add("class", super::cpu_thermal::class_dir(fs.clone()));
     root.add("block", block_dir(fs.clone()));
     root.add("dev", dev_dir(fs.clone()));
     root.add("devices", devices_dir(fs.clone()));

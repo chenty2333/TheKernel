@@ -722,6 +722,7 @@ impl TimeIf for TimeIfImpl {
     fn set_oneshot_timer(deadline_ns: u64) {
         crate::cpuidle::note_timer(deadline_ns);
         crate::cpufreq::sample_current(Self::ticks_to_nanos(Self::current_ticks()));
+        crate::thermal::sample_current(Self::ticks_to_nanos(Self::current_ticks()));
         if TSC_DEADLINE_MODE.load(Ordering::Acquire) {
             let now_tsc = read_tsc();
             let now_ns = Self::ticks_to_nanos(Self::current_ticks());

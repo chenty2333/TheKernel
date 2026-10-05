@@ -69,6 +69,7 @@ impl InitIf for InitIfImpl {
         crate::power::init_later();
         crate::cpuidle::init_current();
         crate::cpufreq::init_current();
+        crate::thermal::init_current();
         report_cpu_state(cpu_id);
     }
 
@@ -88,6 +89,7 @@ impl InitIf for InitIfImpl {
         init_pmu_fleet_member();
         crate::cpuidle::init_current();
         crate::cpufreq::init_current();
+        crate::thermal::init_current();
         report_cpu_state(cpu_id);
     }
 }
