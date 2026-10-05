@@ -104,6 +104,8 @@ pub(crate) struct MountNamespace {
     // clone-owned IDs with the namespace lifetime so dropping the final task
     // or nsfd cannot strand a provider registration after namespace teardown.
     provider_registrations: Mutex<Vec<crate::mounts::ClonedProviderMount>>,
+    detached_fuse_mount_ids: Mutex<Vec<u64>>,
+    detached_nfs_mount_ids: Mutex<Vec<u64>>,
 }
 
 /// Namespace IDs in statmount/listmount are references to live namespace
@@ -121,6 +123,8 @@ pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Se
             owner_user_ns,
             topology,
             provider_registrations: Mutex::new(Vec::new()),
+            detached_fuse_mount_ids: Mutex::new(Vec::new()),
+            detached_nfs_mount_ids: Mutex::new(Vec::new()),
         })
         .map_err(|_| AxError::NoMemory)?;
         Self::register(&namespace)?;
@@ -153,6 +157,8 @@ pub(crate) fn try_fork(
             owner_user_ns,
             topology: topology.topology(),
             provider_registrations: Mutex::new(Vec::new()),
+            detached_fuse_mount_ids: Mutex::new(Vec::new()),
+            detached_nfs_mount_ids: Mutex::new(Vec::new()),
         })
         .map_err(|_| AxError::NoMemory)?;
         // Provider registrations are external state.  Do not activate them
@@ -169,6 +175,46 @@ pub(crate) fn try_fork(
         // prepared receipt is dropped.
         *namespace.provider_registrations.lock() = topology.take_active_provider_mounts();
         Ok(namespace)
+    }
+
+    /// Adopt a caller-owned detached clone without ever switching current().
+    /// All structural mutations are private under namespace_operation().
+    pub(crate) fn try_from_detached(
+        &self,
+        owner_user_ns: Arc<UserNamespace>,
+        root: &Arc<axfs_ng_vfs::Mountpoint>,
+        idmaps: &hashbrown::HashMap<u64, Arc<crate::mounts::MountIdmap>>,
+        propagation: &[crate::mounts::DetachedMountPropagation],
+    ) -> AxResult<Arc<Self>> {
+        let id = try_allocate_proc_namespace_id()?;
+        let mut prepared = self.topology.try_prepare_detached_namespace(
+            id, root, idmaps, propagation,
+            !Arc::ptr_eq(&self.owner_user_ns, &owner_user_ns),
+        )?;
+        let result = (|| {
+            let namespace = Arc::try_new(Self {
+                id,
+                owner_user_ns,
+                topology: prepared.topology(),
+                provider_registrations: Mutex::new(Vec::new()),
+                detached_fuse_mount_ids: Mutex::new(Vec::new()),
+                detached_nfs_mount_ids: Mutex::new(Vec::new()),
+            }).map_err(|_| AxError::NoMemory)?;
+            prepared.activate_provider_mounts()?;
+            Self::register(&namespace)?;
+            *namespace.provider_registrations.lock() = prepared.take_active_provider_mounts();
+            namespace.topology.finalize_namespace_placement_locks();
+            Ok(namespace)
+        })();
+        if result.is_err() {
+            let _ = root.root_location().lazy_unmount();
+        }
+        result
+    }
+
+    pub(crate) fn adopt_detached_provider_registrations(&self, fuse: Vec<u64>, nfs: Vec<u64>) {
+        *self.detached_fuse_mount_ids.lock() = fuse;
+        *self.detached_nfs_mount_ids.lock() = nfs;
     }
 
 pub(crate) const fn id(&self) -> u64 {
@@ -234,6 +280,12 @@ pub(crate) fn live() -> AxResult<Vec<Arc<Self>>> {
 impl Drop for MountNamespace {
     fn drop(&mut self) {
         crate::mounts::unregister_cloned_provider_mounts(&mut *self.provider_registrations.lock());
+        for id in self.detached_fuse_mount_ids.lock().drain(..) {
+            crate::pseudofs::dev::fuse::unregister_mount_connection(id);
+        }
+        for id in self.detached_nfs_mount_ids.lock().drain(..) {
+            crate::syscall::fs::unregister_nfs_mount(id);
+        }
     }
 }
 

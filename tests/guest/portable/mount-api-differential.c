@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
@@ -439,6 +440,78 @@ static int write_quota_file(const char *path) {
     return first == (ssize_t)sizeof(block) && second == (ssize_t)sizeof(block) ? 0 : -1;
 }
 
+static void namespace_descriptor(int fd, int cloexec) {
+    struct statfs fs;
+    struct stat ns, own;
+    int current_ns = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+    check(fd >= 0 && current_ns >= 0, "new-ns-and-current-ns");
+    if (fd >= 0 && current_ns >= 0) {
+        check(fstatfs(fd, &fs) == 0 && (unsigned long)fs.f_type == 0x6e736673UL,
+              "new-ns-real-nsfs");
+        check(ioctl(fd, 0xb703U) == 0x00020000, "new-ns-ioctl-type");
+        check(fstat(fd, &ns) == 0 && fstat(current_ns, &own) == 0 && ns.st_ino != own.st_ino,
+              "new-ns-distinct-identity");
+        check(fcntl(fd, F_GETFD) == (cloexec ? FD_CLOEXEC : 0), "new-ns-cloexec-policy");
+    }
+    if (current_ns >= 0) close(current_ns);
+}
+
+static void enter_created_namespace(int fd, int source_file, int nested_file) {
+    fflush(stdout);
+    pid_t child = fork();
+    check(child >= 0, "new-ns-fork");
+    if (child == 0) {
+        char cwd[64];
+        if (syscall(308, fd, 0x00020000U) != 0) _exit(40);
+        if (getcwd(cwd, sizeof(cwd)) == NULL || strcmp(cwd, "/") != 0) _exit(41);
+        errno = 0;
+        if (access("/file", F_OK) == 0 ? !source_file : (source_file || errno != ENOENT)) _exit(42);
+        errno = 0;
+        if (access("/target/inside", F_OK) == 0 ? !nested_file : (nested_file || errno != ENOENT)) _exit(43);
+        errno = 0;
+        if (access("/proc/uptime", F_OK) != -1 || errno != ENOENT) _exit(44);
+        _exit(0);
+    }
+    if (child > 0) {
+        int status = 0;
+        check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "new-ns-real-root-and-isolation");
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+            fprintf(stderr, "NEW_NAMESPACE_CHILD status=%d\n", WEXITSTATUS(status));
+    }
+}
+
+static void open_tree_namespace_case(void) {
+    ERROR(syscall(NR_OPEN_TREE, file_fd, "", OPEN_TREE_NAMESPACE | AT_EMPTY_PATH), ENOTDIR,
+          "new-ns-regular-file");
+    int nsfd = (int)syscall(NR_OPEN_TREE, dfd, "", OPEN_TREE_NAMESPACE | AT_EMPTY_PATH);
+    namespace_descriptor(nsfd, 0);
+    if (nsfd >= 0) { enter_created_namespace(nsfd, 1, 0); close(nsfd); }
+    int ctx = (int)syscall(NR_FSOPEN, "tmpfs", FSOPEN_CLOEXEC);
+    check(ctx >= 0 && syscall(NR_FSCONFIG, ctx, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0,
+          "new-ns-nested-context");
+    int mountfd = (int)syscall(NR_FSMOUNT, ctx, FSMOUNT_CLOEXEC, 0);
+    check(mountfd >= 0 && syscall(NR_MOVE_MOUNT, mountfd, "", dfd, "target", MOVE_MOUNT_F_EMPTY_PATH) == 0,
+          "new-ns-nested-source-mount");
+    if (mountfd >= 0) close(mountfd);
+    if (ctx >= 0) close(ctx);
+    int marker = openat(dfd, "target/inside", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    check(marker >= 0, "new-ns-nested-marker");
+    if (marker >= 0) close(marker);
+    check(syscall(NR_MOUNT, NULL, target_path, NULL, 1U << 17, NULL) == 0,
+          "new-ns-source-unbindable");
+    ERROR(syscall(NR_OPEN_TREE, AT_FDCWD, target_path, OPEN_TREE_NAMESPACE), EINVAL,
+          "new-ns-unbindable-source-einval");
+    check(syscall(NR_MOUNT, NULL, target_path, NULL, MS_PRIVATE, NULL) == 0,
+          "new-ns-source-private-again");
+    nsfd = (int)syscall(NR_OPEN_TREE, dfd, "", OPEN_TREE_NAMESPACE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH | AT_RECURSIVE);
+    namespace_descriptor(nsfd, 1);
+    check(syscall(NR_UMOUNT2, target_path, 0) == 0, "new-ns-source-unmounted");
+    if (nsfd >= 0) { enter_created_namespace(nsfd, 1, 1); close(nsfd); }
+    check(access("/proc/uptime", F_OK) == 0 && fcntl(dfd, F_GETFD) == FD_CLOEXEC,
+          "namespace-construction-does-not-enter-caller");
+}
+
 int main(void) {
     active = "mount-api.setup";
     check(mkdtemp(dir) != NULL, "mkdir");
@@ -476,6 +549,8 @@ int main(void) {
     ERROR(syscall(NR_OPEN_TREE, dfd, "", AT_EMPTY_PATH | AT_RECURSIVE, NULL, 0), EINVAL,
           "recursive-without-clone");
     mark("RECURSIVE_REQUIRES_CLONE");
+    open_tree_namespace_case();
+    mark("NAMESPACE_NSFS_ROOT_RECURSIVE");
     done();
 
     /* 431: SYSCALL_DEFINE5(fsconfig) checks fd < 0, then the per-command shape,
@@ -547,6 +622,17 @@ int main(void) {
     check(fcntl(mounted, F_GETFD) == FD_CLOEXEC, "mount-cloexec");
     check(close(mounted) == 0, "mount-close");
     mark("TMPFS_CLONE_CLOEXEC");
+    ERROR(syscall(NR_FSMOUNT, ctx, FSMOUNT_NAMESPACE, 0), EBUSY,
+          "mounted-context-consumed-before-namespace");
+    check(close(ctx) == 0, "plain-ctx-close");
+    ctx = (int)syscall(NR_FSOPEN, "tmpfs", FSOPEN_CLOEXEC);
+    check(ctx >= 0 && syscall(NR_FSCONFIG, ctx, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0,
+          "namespace-fresh-context");
+    int new_ns = (int)syscall(NR_FSMOUNT, ctx, FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE, 0);
+    namespace_descriptor(new_ns, 1);
+    if (new_ns >= 0) { enter_created_namespace(new_ns, 0, 0); close(new_ns); }
+    ERROR(syscall(NR_FSMOUNT, ctx, 0, 0), EBUSY, "namespace-context-consumed");
+    mark("NAMESPACE_NSFS_EMPTY_TMPFS_ROOT");
     check(close(ctx) == 0, "ctx-close");
     done();
 

@@ -1209,6 +1209,27 @@ struct FsOpenState {
     reconfigure_mount: Option<axfs_ng_vfs::Location>,
 }
 
+impl FsOpenState {
+    fn consume_mount(&mut self, root: Location) {
+        // Linux cleans creation parameters before namespace/fd allocation.
+        // Current providers have no lazy fs_context initializer, so the
+        // retained superblock view starts directly in reconfiguration phase.
+        self.phase = FsContextPhase::ReconfParams;
+        self.reconfigure_mount = Some(root);
+        self.source = None;
+        self.data.clear();
+        self.config_len = 0;
+        self.binary.clear();
+        self.paths.clear();
+        self.fuse_connection = None;
+        self.nfs_transport = None;
+        self.nfs_options = NfsMountOptions::default();
+        if self.overlay.is_some() {
+            self.overlay = Some(OverlayMountOptions::empty());
+        }
+    }
+}
+
 /// One immutable lower mount-view snapshot retained by an overlay superblock.
 /// The mount id is the identity used by every copied-up lower `Location`.
 struct OverlayLowerIdmap {
@@ -1942,6 +1963,41 @@ fn retained_recursive_submounts(
     Ok(mounts)
 }
 
+// Bind-copy admission follows the retained source ledger, including when an
+// OFD refers to another namespace. Nonrecursive copies must not reveal data
+// hidden by a locked child; locked mounts outside the selected subtree do not
+// restrict that copy. The original mount itself may be locked.
+fn admit_bind_tree_copy(ledger: &DetachedTreeLedger, source: &Location, recursive: bool) -> AxResult<()> {
+    let source_id = source.mountpoint().mount_id();
+    if ledger.mount(source_id)?.unbindable {
+        return Err(AxError::InvalidInput);
+    }
+    if recursive {
+        return Ok(());
+    }
+    for mount in &ledger.mounts {
+        if mount.mountpoint.mount_id() == source_id || !mount.mountpoint.is_placement_locked() {
+            continue;
+        }
+        let mut ancestor = mount;
+        for depth in 0..ledger.mounts.len() {
+            let Some(parent) = ancestor.parent else { break };
+            if parent == source_id {
+                let attachment = ancestor.mountpoint.location().ok_or(AxError::Io)?;
+                if source.entry().is_ancestor_of(attachment.entry())? {
+                    return Err(AxError::InvalidInput);
+                }
+                break;
+            }
+            ancestor = ledger.mount(parent)?;
+            if depth + 1 == ledger.mounts.len() {
+                return Err(AxError::Io);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One detached tree may be retained by many `FsMountFd`s produced without
 /// OPEN_TREE_CLONE.  This state is shared by those descriptors: a detached
 /// mount is consumed exactly once by move_mount, and its rollback runs only
@@ -2599,6 +2655,7 @@ fn do_bind_mount(
     let fs = bind_filesystem_for(&source_loc, &metadata.fs_type)?;
     let mount_flags = bind_mount_flags(&source_loc, target, flags)?;
     let mountpoint = mounts::new_detached_with_flags(&fs, mount_flags, metadata)?;
+    mounts::inherit_mount_attribute_locks(source_loc.mountpoint(), &mountpoint)?;
 
     if flags & MS_REC != 0 {
         let detached_context = FsContext::new(mountpoint.root_location());
@@ -2614,7 +2671,8 @@ fn do_bind_mount(
             let child_fs = bind_filesystem_for(&child_source, &child.metadata.fs_type)?;
             let child_flags =
                 bind_mount_flags(&child_source, &child_target, child.flags | MS_BIND | MS_REC)?;
-            mounts::mount_with_flags(&child_target, &child_fs, child_flags, child.metadata)?;
+            let child_mount = mounts::mount_with_flags(&child_target, &child_fs, child_flags, child.metadata)?;
+            mounts::inherit_mount_attribute_locks(child_source.mountpoint(), &child_mount)?;
         }
     }
 
@@ -3277,7 +3335,7 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     let fsopen = file
         .downcast_ref::<FsOpenFd>()
         .ok_or(AxError::InvalidInput)?;
-    let state = fsopen.0.lock();
+    let mut state = fsopen.0.lock();
 
     // `!fc->root` (fs/namespace.c:4493-4495) is the context that never reached
     // `FSCONFIG_CMD_CREATE`: it has no superblock, so `-EINVAL`.  For a context
@@ -3294,18 +3352,6 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     if state.phase != FsContextPhase::AwaitingMount {
         return Err(AxError::ResourceBusy);
     }
-    if flags & FSMOUNT_NAMESPACE != 0 {
-        // Both capability tests above have passed, the descriptor is a
-        // well-formed fs_context, the root exists and the phase is
-        // `FS_CONTEXT_AWAITING_MOUNT`, so Linux would now enter
-        // `create_new_namespace()` and allocate an nsfs descriptor for the new
-        // mount namespace.  TheKernel has no nsfs descriptor provider to
-        // allocate from, so the well-formed request is reported as unsupported
-        // rather than as a malformed one.  This is the residual named by the
-        // `fsmount` cell: the errno is TheKernel's, not Linux's, and every
-        // verdict that precedes namespace creation now matches Linux.
-        return Err(AxError::OperationNotSupported);
-    }
     let source = match state.source.as_deref() {
         Some(source) => FsPathBuf::from_vec(source.as_bytes().to_vec()),
         None => FsPathBuf::from_vec(b"none".to_vec()),
@@ -3317,7 +3363,6 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     let nfs_options = state.nfs_options.clone();
     let overlay_options = state.overlay.clone();
     let configured_paths = state.paths.clone();
-    drop(state);
     // Overlay resolves every constituent and takes its namespace/idmap view
     // under one operation gate.  The detached mount is not allocated until
     // that complete admission transaction has succeeded.
@@ -3326,7 +3371,8 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     // operation so no role can be selected from a topology changed halfway
     // through the fsopen mount.
     let _provider_mount_operation =
-        matches!(fs_type.as_str(), "overlay" | "xfs" | "btrfs").then(mounts::namespace_operation);
+        (flags & FSMOUNT_NAMESPACE != 0 || matches!(fs_type.as_str(), "overlay" | "xfs" | "btrfs"))
+            .then(mounts::namespace_operation);
     let mut linux_device = None;
     let mut block_members = None;
     let fs = if fs_type == "overlay" {
@@ -3561,12 +3607,14 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     let (rollback_fuse_mount_ids, rollback_nfs_mount_ids) = build.into_registrations();
     *tree.rollback_fuse_mount_ids.lock() = rollback_fuse_mount_ids;
     *tree.rollback_nfs_mount_ids.lock() = rollback_nfs_mount_ids;
-    FsMountFd {
-        root: mountpoint.root_location(),
-        tree,
-    }
-    .add_to_fd_table(cloexec)
-    .map(|new_fd| new_fd as isize)
+    state.consume_mount(mountpoint.root_location());
+    drop(state);
+    let mount_fd = FsMountFd { root: mountpoint.root_location(), tree };
+    if flags & FSMOUNT_NAMESPACE != 0 {
+        namespace_file_from_mount_fd(mount_fd)?.add_to_fd_table(cloexec)
+    } else {
+        mount_fd.add_to_fd_table(cloexec)
+    }.map(|fd| fd as isize)
 }
 
 pub fn sys_fspick<M: UserMemory + ?Sized>(
@@ -3657,12 +3705,51 @@ pub fn sys_fspick<M: UserMemory + ?Sized>(
     .map(|fd| fd as isize)
 }
 
+enum PreparedTreeFile {
+    Mount(FsMountFd),
+    Namespace(File),
+}
+
+impl PreparedTreeFile {
+    fn publish(self, cloexec: bool) -> AxResult<isize> {
+        match self {
+            Self::Mount(file) => file.add_to_fd_table(cloexec),
+            Self::Namespace(file) => file.add_to_fd_table(cloexec),
+        }.map(|fd| fd as isize)
+    }
+}
+
+// Caller holds namespace_operation() across private graph construction and
+// provider receipt transfer. No temporary namespace switch is performed.
+fn namespace_file_from_mount_fd(mount_fd: FsMountFd) -> AxResult<File> {
+    let curr = current();
+    let thread = curr.as_thread();
+    let propagation = mount_fd.tree.detached_ledger.lock().as_ref()
+        .ok_or(AxError::InvalidInput)?.propagation()?;
+    let namespace = thread.mount_ns().try_from_detached(
+        thread.current_cred().user_ns().clone(),
+        mount_fd.root.mountpoint(),
+        &mount_fd.tree.idmaps.lock(),
+        &propagation,
+    )?;
+    namespace.adopt_detached_provider_registrations(
+        core::mem::take(&mut *mount_fd.tree.rollback_fuse_mount_ids.lock()),
+        core::mem::take(&mut *mount_fd.tree.rollback_nfs_mount_ids.lock()),
+    );
+    let location = crate::pseudofs::nsfs::object_location(
+        ProcNamespaceKind::Mount, ProcNamespaceObject::Mount(namespace),
+    )?;
+    Ok(File::new(axfs::File::new(
+        axfs::FileBackend::Direct(location), axfs::FileFlags::READ,
+    )))
+}
+
 fn prepare_open_tree<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     dirfd: i32,
     pathname: *const c_char,
     flags: u32,
-) -> AxResult<(FsMountFd, bool)> {
+) -> AxResult<(PreparedTreeFile, bool)> {
     // `vfs_open_tree()` (fs/namespace.c:3194-3243) validates the flag word, then
     // the namespace capability, then the clone mount capability, and only then
     // copies and resolves the pathname:
@@ -3744,15 +3831,8 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
         &security,
     )?;
 
-    // Linux resolves the pathname before it calls `open_new_namespace()`, so a
-    // namespace-requesting open_tree reports a bad pathname as EFAULT/ENOENT
-    // rather than as an unimplemented request.  The namespace itself is the
-    // residual: `open_new_namespace()` returns an nsfs descriptor for a
-    // namespace created by `create_new_namespace()`, and TheKernel has no nsfs
-    // descriptor provider to allocate one from.  This errno is TheKernel's,
-    // not Linux's, and the `open-tree`/`open-tree-attr` cells name it.
-    if namespace_request {
-        return Err(AxError::OperationNotSupported);
+    if namespace_request && loc.node_type() != NodeType::Directory {
+        return Err(AxError::NotADirectory);
     }
 
     // `source_topology` is the sole namespace authority for a relative FD;
@@ -3803,7 +3883,7 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
             .flatten())
     };
 
-    if flags & OPEN_TREE_CLONE == 0 {
+    if flags & (OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE) == 0 {
         // Without OPEN_TREE_CLONE, Linux returns a handle to the existing
         // attached mount tree.  It is intentionally not a move-capable clone.
         let mut idmaps = HashMap::new();
@@ -3816,10 +3896,10 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
             // Non-clone open_tree is another retained reference to this one
             // detached tree, not a separately owning rollback handle.
             return Ok((
-                FsMountFd {
+                PreparedTreeFile::Mount(FsMountFd {
                     root: loc,
                     tree: source.tree.clone(),
-                },
+                }),
                 cloexec,
             ));
         }
@@ -3859,7 +3939,7 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
             idmaps.insert(root_source_mount_id, idmap);
         }
         return Ok((
-            FsMountFd {
+            PreparedTreeFile::Mount(FsMountFd {
                 root: loc,
                 tree: FsMountTreeState::try_new(
                     idmaps,
@@ -3868,7 +3948,7 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
                     Vec::new(),
                     Vec::new(),
                 )?,
-            },
+            }),
             cloexec,
         ));
     }
@@ -3894,6 +3974,7 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
     } else {
         return Err(AxError::InvalidInput);
     };
+    admit_bind_tree_copy(&source_ledger, &loc, flags & AT_RECURSIVE != 0)?;
     let root_source = source_ledger.mount(root_source_mount_id)?;
     let inherited_idmap = retained_idmap_for(root_source_mount_id)?;
     let metadata = mounts::clone_metadata_for_bind(&loc)?;
@@ -3902,6 +3983,7 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
     let root_is_nfs = metadata.fs_type == "nfs4";
     let mountpoint =
         mounts::new_detached_with_flags(&filesystem, mounts::flags_for_location(&loc)?, metadata)?;
+    mounts::inherit_mount_attribute_locks(loc.mountpoint(), &mountpoint)?;
     let mut build = DetachedTreeBuildGuard::new(mountpoint.clone());
     let mut retained_idmaps = HashMap::new();
     if let Some(idmap) = inherited_idmap.as_ref() {
@@ -3972,6 +4054,7 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
                     child.flags,
                     child.metadata,
                 )?;
+                mounts::inherit_mount_attribute_locks(child.source.mountpoint(), &child_mount)?;
                 if let Some(idmap) = child_idmap.as_ref()
                     && retained_idmaps
                         .insert(child_mount.mount_id(), idmap.clone())
@@ -4018,13 +4101,13 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
     let (rollback_fuse_mount_ids, rollback_nfs_mount_ids) = build.into_registrations();
     *tree.rollback_fuse_mount_ids.lock() = rollback_fuse_mount_ids;
     *tree.rollback_nfs_mount_ids.lock() = rollback_nfs_mount_ids;
-    Ok((
-        FsMountFd {
-            root: mountpoint.root_location(),
-            tree,
-        },
-        cloexec,
-    ))
+    let mount_fd = FsMountFd { root: mountpoint.root_location(), tree };
+    let file = if namespace_request {
+        PreparedTreeFile::Namespace(namespace_file_from_mount_fd(mount_fd)?)
+    } else {
+        PreparedTreeFile::Mount(mount_fd)
+    };
+    Ok((file, cloexec))
 }
 
 pub fn sys_open_tree<M: UserMemory + ?Sized>(
@@ -4034,9 +4117,7 @@ pub fn sys_open_tree<M: UserMemory + ?Sized>(
     flags: u32,
 ) -> AxResult<isize> {
     let (mount_fd, cloexec) = prepare_open_tree(memory, dirfd, pathname, flags)?;
-    mount_fd
-        .add_to_fd_table(cloexec)
-        .map(|new_fd| new_fd as isize)
+    mount_fd.publish(cloexec)
 }
 
 fn apply_mount_attr_to_mount_fd(
@@ -4174,18 +4255,22 @@ pub fn sys_open_tree_attr<M: UserMemory + ?Sized>(
         if !mount_setattr_is_noop(copied_attr) {
             let request =
                 mount_setattr_request_with_replace(copied_attr, flags & OPEN_TREE_CLONE != 0)?;
+            // The NAMESPACE form returns a namespace inode on private nsfs,
+            // not a mount root. Linux validates attributes, then returns
+            // EINVAL at path_mounted() rather than mutating the cloned tree.
+            let PreparedTreeFile::Mount(mount_fd) = &mount_fd else {
+                return Err(AxError::InvalidInput);
+            };
             let _mount_operation = mounts::namespace_operation();
             apply_mount_attr_to_mount_fd(
-                &mount_fd,
+                mount_fd,
                 flags & AT_RECURSIVE != 0,
                 copied_attr,
                 request,
             )?;
         }
     }
-    mount_fd
-        .add_to_fd_table(cloexec)
-        .map(|new_fd| new_fd as isize)
+    mount_fd.publish(cloexec)
 }
 
 pub fn sys_mount_setattr<M: UserMemory + ?Sized>(
@@ -5404,6 +5489,53 @@ mod tests {
 
     use super::*;
     use crate::pseudofs::MemoryFs;
+
+    #[test]
+    fn fsmount_consumes_context_before_publication_and_retains_reconfigure_root() {
+        let fs = MemoryFs::new().unwrap();
+        let root = Mountpoint::new_root(&fs).root_location();
+        let mut state = FsOpenState {
+            fs_type: String::from("tmpfs"), source: Some(FsPathBuf::from_vec(b"source".to_vec())),
+            data: String::from("size=4096"), config_len: 12, phase: FsContextPhase::AwaitingMount,
+            fuse_connection: None, nfs_transport: None, nfs_options: NfsMountOptions::default(),
+            overlay: None, binary: alloc::vec![(String::from("binary"), alloc::vec![1])],
+            paths: alloc::vec![(String::from("path"), root.clone())], reconfigure_mount: None,
+        };
+        state.consume_mount(root.clone());
+        assert!(state.phase == FsContextPhase::ReconfParams);
+        assert!(state.source.is_none() && state.data.is_empty());
+        assert_eq!(state.config_len, 0);
+        assert!(state.binary.is_empty() && state.paths.is_empty());
+        assert_eq!(state.reconfigure_mount.unwrap().mountpoint().mount_id(), root.mountpoint().mount_id());
+    }
+
+    #[test]
+    fn bind_copy_rejects_unbindable_root_and_only_selected_locked_children() {
+        let _context = crate::test_support::scheduler_test_context();
+        let fs = MemoryFs::new().unwrap();
+        let root = Mountpoint::new_root(&fs);
+        let inside = root.root_location().create(
+            axfs_ng_vfs::FsName::new(b"inside"), NodeType::Directory,
+            NodePermission::from_bits_truncate(0o755),
+        ).unwrap();
+        let outside = root.root_location().create(
+            axfs_ng_vfs::FsName::new(b"outside"), NodeType::Directory,
+            NodePermission::from_bits_truncate(0o755),
+        ).unwrap();
+        let child_fs = MemoryFs::new().unwrap();
+        let child = inside.mount(&child_fs).unwrap();
+        child.lock_placement();
+        let mut ledger = DetachedTreeLedger::singleton(root.clone(), None, None, false).unwrap();
+        ledger.mounts.push(DetachedTreeMount {
+            mountpoint: child, parent: Some(root.mount_id()), idmap: None,
+            peer_group: None, unbindable: false,
+        });
+        assert_eq!(admit_bind_tree_copy(&ledger, &root.root_location(), false), Err(AxError::InvalidInput));
+        assert_eq!(admit_bind_tree_copy(&ledger, &root.root_location(), true), Ok(()));
+        assert_eq!(admit_bind_tree_copy(&ledger, &outside, false), Ok(()));
+        ledger.mounts[0].unbindable = true;
+        assert_eq!(admit_bind_tree_copy(&ledger, &root.root_location(), true), Err(AxError::InvalidInput));
+    }
 
     #[test]
     fn tmpfs_mount_honors_root_mode_for_unprivileged_shared_memory() {

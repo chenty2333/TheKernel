@@ -93,7 +93,7 @@ fn retain_location(file: Arc<ProcNamespaceFile>, kind: ProcNamespaceKind) -> Vfs
     Ok(Location::new(fs.mount.clone(), entry))
 }
 
-pub(super) fn object_location(
+pub(crate) fn object_location(
     kind: ProcNamespaceKind,
     object: ProcNamespaceObject,
 ) -> VfsResult<Location> {

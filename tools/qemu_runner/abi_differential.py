@@ -382,6 +382,12 @@ CONTRACTS["clone3"] = (
     "raw-differential", "pass", "FLAG_ADMISSION NEWTIME AUTOREAP EMPTY_MNTNS NNP_CHILD_ONLY_MONOTONIC PIDFD_AUTOKILL_FINAL_OFD",
 )
 
+CONTRACTS.update({
+    "open-tree": ("raw-differential", "pass", "CLONE_CLOEXEC_IDENTITY FLAG_BITS_BEFORE_PATH RECURSIVE_REQUIRES_CLONE NAMESPACE_NSFS_ROOT_RECURSIVE"),
+    "fsmount": ("raw-differential", "pass", "SCALARS_BEFORE_DESCRIPTOR UNCREATED_CONTEXT_EINVAL TMPFS_CLONE_CLOEXEC NAMESPACE_NSFS_EMPTY_TMPFS_ROOT"),
+    "open-tree-attr": ("raw-differential", "pass", "CLONE_CLOEXEC_DIRECTORY READONLY_CLONE_SOURCE_UNCHANGED VALIDATION_ORDER NAMESPACE_NOOP_AND_NONMOUNT_ATTR"),
+})
+
 # The registry is static: the gate reads it to decide whether a claimed
 # syscall names a program this runner really executes.
 PROGRAMS = tuple(PROGRAM_CASES)

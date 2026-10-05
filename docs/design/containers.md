@@ -32,8 +32,9 @@ The differential probe does not establish racing clone/fs-sharing admission.
 
 ### Other known gaps (next)
 
-- New mount namespaces from `open_tree`/`fsmount`, published through existing nsfs.
-- Mount-tree namespace construction remains the last original known gap.
+- All originally listed namespace/clone construction gaps are now addressed.
+- Source review found an additional direct non-mount setns installed-user
+  admin check and PID ancestry errno discrepancy; fix next before tool entry.
 
 ### `clone3(CLONE_NNP)`
 
@@ -78,6 +79,56 @@ ordering was checked against Linux `kernel/fork.c:2893-3052,2062-2094`. An
 incomplete declaration initially blocked the next ABI run before either guest
 ran; it was corrected without widening the shrink-only allowlist. Untested
 SCM_RIGHTS/exec combinations remain explicit above, not claimed passes.
+
+### `open_tree` / `fsmount` NAMESPACE and nsfs publication
+
+An owned detached tree is adopted into a new graph above a private clone of
+current's immutable namespace underlay. Construction never switches current's
+namespace or mutates its graph. The existing source-FD-pinned ledger governs
+recursive children and idmaps. Complete records/provider receipts are prepared
+before attachment, with rollback before placement locks; the namespace owns
+FUSE/NFS registration IDs after successful transfer. The existing private nsfs
+provider publishes the real retained object, supporting statfs/type ioctl/setns.
+
+Less-privileged owners receive one-way slave peers and placement locks. Captured
+RO/nosuid/nodev/noexec and atime restrictions cannot be cleared through remount,
+attached or detached mount attributes; bind/namespace/propagation copies retain
+these immutable floors. Unbindable roots and nonrecursive copies hiding locked
+children are rejected before copying. Shared record materialization takes an
+explicit destination rather than selecting a current task namespace.
+
+`open_tree_attr` NAMESPACE no-op attributes return the namespace fd. Non-noop
+attributes are validated then rejected with EINVAL because the namespace inode
+is not a mount root, rather than changing the cloned tree. Successful fsmount
+consumes creation parameters before namespace/fd publication and retains a
+clean reconfiguration view under its existing serialized context lock.
+
+Validated: kernel host 2630; period45 Python657 (3 existing environment skips),
+Rust6067 (1 existing ignore); q35/n305 lint (784 existing kernel warnings);
+KVM system 70/70 (`system-ggdc211s`); paired mount-api/fsattrs 19/19 selected
+contracts (`abi-gx2ysi0v`). Real children enter selected roots, see only the
+selected file/tree, retain a recursive nested tmpfs after source unmount, and
+cannot reach the old proc root. Genuine nsfs identity/type/CLOEXEC, ENOTDIR,
+unbindable rejection, and fsmount context consumption pass on both guests.
+
+The first ABI attempt stopped at the declaration gate (fixed in commit44),
+not at a guest. The next Linux run exposed a test incorrectly reusing a consumed
+fsmount context; both the test and native phase consumption were corrected.
+Initial compile-only import/type/assert formatting errors were repaired before
+this final run. Neither failed attempt is recorded as acceptance.
+
+#### Known differences and validation scope
+
+- Existing read-only construction imposes a provider readonly floor even on
+  some clones backed by writable superblocks. Clearing RO can remain
+  EOPNOTSUPP rather than Linux success. This is not relaxed as a side effect
+  of namespace bring-up, and the corresponding cells remain partial.
+- Existing fsconfig binary/non-overlay path consumption and CREATE_EXCL gaps
+  remain. Consumed detached-context reconfigure still uses current's mount
+  ledger. These are not mistaken for working backend reconfiguration.
+- Cross-owner floors/one-way peers and rollback have host coverage. FUSE/NFS
+  namespace teardown and concurrent fault injection were not exercised in
+  paired guests; no physical hardware acceptance is claimed.
 
 ## Tool acceptance ladder
 

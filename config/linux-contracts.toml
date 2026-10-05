@@ -257,7 +257,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_open_tree_attr"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/fsattrs-differential.c:main", "tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["the shared open-tree rule passes the user-namespace capability check and the pathname copy and then reports EOPNOTSUPP, because there is no mount-namespace creation from a mount tree; a private nsfs descriptor provider now exists but this operation has not been wired to a constructor"]
+limitations = ["Read-only source clones inherit the existing immutable provider readonly floor; clearing RDONLY can return EOPNOTSUPP instead of Linux allowing it on a writable backing superblock"]
 
 [[cell]]
 number = 468
@@ -6875,7 +6875,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_open_tree"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["OPEN_TREE_NAMESPACE passes the user-namespace capability check and the pathname copy and then reports EOPNOTSUPP, because there is no mount-namespace creation from a mount tree; a private nsfs descriptor provider now exists but this operation has not been wired to a constructor"]
+limitations = ["A clone of an already-read-only source keeps the existing immutable provider readonly floor; clearing RDONLY can return EOPNOTSUPP even when Linux would allow a writable backing superblock"]
 
 [[contract]]
 id = "linux-move_mount"
@@ -6944,7 +6944,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_fsconfig"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["The validation order and errno precedence are exercised by the mount-api differential; provider option consumption has no test"]
-limitations = ["SET_BINARY and non-overlay SET_PATH parameters are stored without provider consumption and CREATE_EXCL is treated as CREATE; fsmount inherits this"]
+limitations = ["SET_BINARY and non-overlay SET_PATH parameters are stored without provider consumption and CREATE_EXCL is treated as CREATE; fsmount inherits this; reconfiguration of a consumed detached context still depends on the current namespace mount ledger"]
 
 [[contract]]
 id = "linux-fsmount"
@@ -6967,7 +6967,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_fsmount"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["FSMOUNT_NAMESPACE reports EOPNOTSUPP after every Linux verdict has been taken, where Linux returns it as the last step of a path this kernel has no mount-namespace constructor for; a private nsfs descriptor provider now exists, but there is no mount-namespace constructor for this operation"]
+limitations = ["Filesystem context provider gaps remain inherited from fsconfig: unconsumed binary/non-overlay path options and CREATE_EXCL equivalence; read-only construction retains the existing immutable provider readonly floor"]
 
 [[contract]]
 id = "linux-fspick"
@@ -7979,7 +7979,7 @@ handler = "kernel/src/syscall/task/ctl.rs:sys_setns"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/ctl.rs:mount_namespace_entry_checks_capabilities_before_shared_fs", "tests/guest/portable/task-control-differential.c:mount_setns_case"]
 validation_gaps = ["Existing source/helper coverage does not establish the full setns raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Mount-only setns rejects shared fs_struct; mixed pidfd namespace sets prepare a private fs_struct as Linux does. Concurrent clone/fs-sharing admission remains outside the current differential probe"]
+limitations = ["Direct non-mount namespace entry lacks the additional installed-user CAP_SYS_ADMIN check, and direct PID namespace ancestry rejection returns EPERM rather than Linux EINVAL; mount-entry capability/shared-fs checks are implemented"]
 
 [[contract]]
 id = "linux-kcmp"

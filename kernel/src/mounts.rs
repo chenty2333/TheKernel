@@ -744,6 +744,7 @@ impl MountTopology {
                 root_old,
             )?,
         )?;
+        inherit_mount_attribute_locks(&root_source, &root_clone)?;
         register_live_superblock_mount(&root_clone)?;
         let mut cloned = Vec::new();
         let mut source_identity = HashMap::new();
@@ -833,6 +834,7 @@ impl MountTopology {
                         old,
                     )?,
                 )?;
+                inherit_mount_attribute_locks(&original, &clone)?;
                 register_live_superblock_mount(&clone)?;
                 clone.attach_to(&target)?;
                 // Everything else resolves from the mount a task sees at the
@@ -884,6 +886,9 @@ impl MountTopology {
             } else {
                 mount.locked || lock_mounts
             };
+            if lock_mounts {
+                lock_mount_attributes(mount.mountpoint()?.as_ref(), mount.flags)?;
+            }
             if mount.locked {
                 mount.mountpoint()?.lock_placement();
             }
@@ -917,6 +922,83 @@ impl MountTopology {
             providers,
             providers_active: false,
         })
+    }
+
+    /// Build a private namespace from the immutable underlay and an owned
+    /// detached clone. Caller holds namespace_operation(); current is untouched.
+    pub(crate) fn try_prepare_detached_namespace(
+        &self,
+        namespace_id: u64,
+        root: &Arc<Mountpoint>,
+        idmaps: &HashMap<u64, Arc<MountIdmap>>,
+        propagation: &[DetachedMountPropagation],
+        different_owner: bool,
+    ) -> AxResult<PreparedMountTopologyClone> {
+        if root.root_location().node_type() != axfs_ng_vfs::NodeType::Directory {
+            return Err(AxError::NotADirectory);
+        }
+        let prepared = self.try_prepare_clone_namespace(namespace_id, false, true)?;
+        let topology = prepared.topology();
+        let target = topology.root_location()?;
+        let (added, _) = detached_tree_records(root, &target)?;
+        let mut records = topology.try_records()?;
+        if records.len().checked_add(added.len()).is_none_or(|n| n > MAX_MOUNT_RECORDS) {
+            return Err(AxError::StorageFull);
+        }
+        records.try_reserve(added.len()).map_err(|_| AxError::NoMemory)?;
+        register_live_superblock_tree(&added)?;
+        records.extend(added);
+        let mut publication = topology.prepare_replace_records_with_detached_propagation_and_idmaps(
+            &records, propagation, idmaps,
+        )?;
+        let mut covered = self.root_location()?;
+        let mut inherited_lock = false;
+        while let Some(child) = covered.mounted_child() {
+            inherited_lock |= child.is_placement_locked();
+            covered = child.root_location();
+        }
+        let mut slave_peers = HashMap::new();
+        if different_owner {
+            slave_peers.try_reserve(propagation.len()).map_err(|_| AxError::NoMemory)?;
+        }
+        for mount in &mut publication.next.mounts {
+            if different_owner {
+                lock_mount_attributes(mount.mountpoint()?.as_ref(), mount.flags)?;
+            }
+            if mount.parent.is_none() {
+                continue;
+            }
+            mount.locked = different_owner || (mount.id == root.mount_id() && inherited_lock);
+            // Receive from the old group, never send mutations back into it.
+            if different_owner && let Some(peer) = mount.peer_group {
+                let slave = if let Some(slave) = slave_peers.get(&peer.id) {
+                    *slave
+                } else {
+                    let slave = PeerGroup {
+                        id: next_propagation_peer_id()?, master: Some(peer.id),
+                    };
+                    slave_peers.insert(peer.id, slave);
+                    slave
+                };
+                mount.peer_group = Some(slave);
+            }
+        }
+        root.attach_to(&target)?;
+        if let Err(error) = publication.commit() {
+            let _ = root.root_location().lazy_unmount();
+            return Err(error);
+        }
+        // Install VFS locks only after namespace registry admission, so a
+        // construction failure can still detach the unpublished tree.
+        Ok(prepared)
+    }
+
+    pub(crate) fn finalize_namespace_placement_locks(&self) {
+        for mount in &self.state.lock().mounts {
+            if mount.locked && let Some(mountpoint) = mount.mountpoint.upgrade() {
+                mountpoint.lock_placement();
+            }
+        }
     }
 
     pub(crate) fn try_records(&self) -> AxResult<Vec<MountRecord>> {
@@ -1124,6 +1206,8 @@ impl MountTopology {
                 0,
             )
             .map_err(map_topology_uapi_error)?;
+            let point = mount.mountpoint()?;
+            check_mount_attribute_floor(mount_state(&point)?.attribute_floor.load(Ordering::Acquire), mount.flags)?;
             if let Some(idmap) = &request.idmap {
                 if mount.attached || (mount.idmap.is_some() && !request.idmap_replace) {
                     return Err(AxError::InvalidInput);
@@ -1417,6 +1501,7 @@ struct LinuxMountState {
     mount_id_old: u32,
     legacy_mount_id: i32,
     flags: AtomicU32,
+    attribute_floor: AtomicU32,
     remount_epoch: AtomicU64,
     activity_epoch: AtomicU64,
     readonly_floor: bool,
@@ -2013,6 +2098,7 @@ fn mount_extensions(flags: u32, metadata: MountMetadata, mount_id_old: u32) -> V
         mount_id_old,
         legacy_mount_id,
         flags: AtomicU32::new(flags),
+        attribute_floor: AtomicU32::new(0),
         remount_epoch: AtomicU64::new(0),
         activity_epoch: AtomicU64::new(0),
         readonly_floor: flags & MS_RDONLY != 0,
@@ -2267,6 +2353,36 @@ fn joined_mount_root(base: &FsPath, path_in_mount: &FsPath) -> AxResult<FsPathBu
     Ok(FsPathBuf::from_vec(joined))
 }
 
+// Internal marker, never a user-visible mount flag. The remaining bits
+// retain the native restrictive flags and the captured atime mode.
+const ATTRIBUTE_ATIME_LOCK: u32 = 1 << 31;
+const ATTRIBUTE_RESTRICTIONS: u32 = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC;
+const ATTRIBUTE_ATIME_MODE: u32 = MS_NOATIME | MS_NODIRATIME | MS_STRICTATIME;
+
+fn check_mount_attribute_floor(floor: u32, flags: u32) -> AxResult<()> {
+    if flags & (floor & ATTRIBUTE_RESTRICTIONS) != floor & ATTRIBUTE_RESTRICTIONS
+        || (floor & ATTRIBUTE_ATIME_LOCK != 0
+            && flags & ATTRIBUTE_ATIME_MODE != floor & ATTRIBUTE_ATIME_MODE)
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
+    Ok(())
+}
+
+pub(crate) fn inherit_mount_attribute_locks(source: &Mountpoint, target: &Mountpoint) -> AxResult<()> {
+    let floor = mount_state(source)?.attribute_floor.load(Ordering::Acquire);
+    mount_state(target)?.attribute_floor.store(floor, Ordering::Release);
+    Ok(())
+}
+
+fn lock_mount_attributes(mountpoint: &Mountpoint, flags: u32) -> AxResult<()> {
+    mount_state(mountpoint)?.attribute_floor.fetch_or(
+        (flags & (ATTRIBUTE_RESTRICTIONS | ATTRIBUTE_ATIME_MODE)) | ATTRIBUTE_ATIME_LOCK,
+        Ordering::AcqRel,
+    );
+    Ok(())
+}
+
 pub fn clone_metadata_for_bind(loc: &Location) -> AxResult<MountMetadata> {
     let mut metadata = metadata_for_location(loc)?;
     let path_in_mount = loc.path_in_mount().map_err(|_| AxError::Io)?;
@@ -2296,6 +2412,7 @@ pub fn update_detached_mount_flags(
             .extension_shared::<LinuxMountState>()
             .ok_or(AxError::Io)?;
         let next = update(stable_mount_flags(&state))?;
+        check_mount_attribute_floor(state.attribute_floor.load(Ordering::Acquire), next)?;
         if state.readonly_floor && next & MS_RDONLY == 0 {
             return Err(AxError::OperationNotSupported);
         }
@@ -2715,13 +2832,11 @@ fn propagate_attached_tree(root: &Arc<Mountpoint>, target: &Location) -> VfsResu
     Ok(())
 }
 
-fn attach_tree_and_record_kind(
+// Materialize against an explicit destination, never a task-selected namespace.
+fn detached_tree_records(
     root: &Arc<Mountpoint>,
     target: &Location,
-    kind: AttachKind,
-    idmaps: &HashMap<u64, Arc<MountIdmap>>,
-    propagation: &[DetachedMountPropagation],
-) -> VfsResult<()> {
+) -> AxResult<(Vec<MountRecord>, HashSet<u64>)> {
     if root.is_attached() {
         return Err(AxError::ResourceBusy);
     }
@@ -2772,6 +2887,18 @@ fn attach_tree_and_record_kind(
             mountpoint: Arc::downgrade(&mountpoint),
         });
     }
+
+    Ok((committed, pending_ids))
+}
+
+fn attach_tree_and_record_kind(
+    root: &Arc<Mountpoint>,
+    target: &Location,
+    kind: AttachKind,
+    idmaps: &HashMap<u64, Arc<MountIdmap>>,
+    propagation: &[DetachedMountPropagation],
+) -> VfsResult<()> {
+    let (committed, pending_ids) = detached_tree_records(root, target)?;
 
     let mut records = snapshot()?;
     let record_index = MountRecordIndex::new(&records)?;
@@ -2908,6 +3035,7 @@ fn clone_tree_for_propagation(
             source.root_location().entry().clone(),
             mount_extensions(record.flags, metadata, old)?,
         )?;
+        inherit_mount_attribute_locks(&source, &clone)?;
         retain_file_mount_cache(&clone)?;
         let (parent_id, target) = if source_id == root.mount_id() {
             (destination_parent, try_path(destination_path.as_ref())?)
@@ -3206,6 +3334,7 @@ pub fn remount_with_data(
     {
         return Err(AxError::InvalidInput);
     }
+    check_mount_attribute_floor(state.attribute_floor.load(Ordering::Acquire), flags)?;
     if state.readonly_floor && flags & MS_RDONLY == 0 {
         return Err(AxError::OperationNotSupported);
     }
@@ -3264,6 +3393,7 @@ pub fn try_update_flags_for_mounts(
     };
 
     for (_, state, flags) in &updates {
+        check_mount_attribute_floor(state.attribute_floor.load(Ordering::Acquire), *flags)?;
         if state.readonly_floor && *flags & MS_RDONLY == 0 {
             return Err(AxError::OperationNotSupported);
         }
@@ -4537,6 +4667,87 @@ mod tests {
             old_child.location().unwrap().mountpoint().mount_id(),
             old_root.mount_id()
         );
+    }
+
+    #[test]
+    fn inherited_mount_attribute_floor_locks_only_captured_restrictions() {
+        let floor = MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | ATTRIBUTE_ATIME_LOCK;
+        assert_eq!(check_mount_attribute_floor(floor, MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME), Ok(()));
+        assert_eq!(check_mount_attribute_floor(floor, MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | MS_RDONLY), Ok(()));
+        for missing in [MS_NOSUID, MS_NODEV, MS_NOEXEC, MS_NOATIME] {
+            assert_eq!(check_mount_attribute_floor(floor, (floor & !ATTRIBUTE_ATIME_LOCK) & !missing), Err(AxError::OperationNotPermitted));
+        }
+        assert_eq!(check_mount_attribute_floor(0, 0), Ok(()));
+        assert_eq!(check_mount_attribute_floor(MS_RDONLY | ATTRIBUTE_ATIME_LOCK, 0), Err(AxError::OperationNotPermitted));
+        // Adding and removing RO is still allowed when it was not inherited.
+        assert_eq!(check_mount_attribute_floor(ATTRIBUTE_ATIME_LOCK, MS_RDONLY), Ok(()));
+        assert_eq!(check_mount_attribute_floor(ATTRIBUTE_ATIME_LOCK, 0), Ok(()));
+    }
+
+    #[test]
+    fn detached_namespace_has_private_underlay_real_tree_and_one_way_peers() {
+        let _context = crate::test_support::scheduler_test_context();
+        let _operation = namespace_operation();
+        let (old_root, old_child, records) = mounted_root_with_child();
+        let mounts = records.iter().map(|r| Mount::try_from_record(r, None).unwrap()).collect();
+        let source = MountTopology::try_new(141, mounts).unwrap();
+        let fs = MemoryFs::new().unwrap();
+        let metadata = MountMetadata::try_from_parts(FsPath::new(b"none"), "tmpfs", FsPath::new(b"/"), "").unwrap();
+        let detached = new_detached_with_flags(&fs, 0, metadata).unwrap();
+        let target = detached.root_location().create(
+            axfs_ng_vfs::FsName::new(b"nested"), axfs_ng_vfs::NodeType::Directory,
+            axfs_ng_vfs::NodePermission::from_bits_truncate(0o755),
+        ).unwrap();
+        let nested_fs = MemoryFs::new().unwrap();
+        let nested = mount_with_flags(
+            &target, &nested_fs, 0,
+            MountMetadata::try_from_parts(FsPath::new(b"none"), "tmpfs", FsPath::new(b"/"), "").unwrap(),
+        ).unwrap();
+        let propagation = [detached.mount_id(), nested.mount_id()].map(|mount_id| DetachedMountPropagation {
+            mount_id, peer_group: Some(PeerGroup { id: 900, master: None }), unbindable: false,
+        });
+        let prepared = source.try_prepare_detached_namespace(
+            142, &detached, &HashMap::new(), &propagation, true,
+        ).unwrap();
+        let topology = prepared.topology();
+        assert_eq!(topology.try_records().unwrap().len(), 3);
+        let underlay = topology.root_location().unwrap();
+        assert_ne!(underlay.mountpoint().mount_id(), old_root.mount_id());
+        assert_eq!(topology.visible_root_location().unwrap().mountpoint().mount_id(), detached.mount_id());
+        let lookup = axfs::FsContext::new(topology.visible_root_location().unwrap())
+            .resolve(FsPath::new(b"/nested")).unwrap();
+        assert_eq!(lookup.mountpoint().mount_id(), nested.mount_id());
+        let snapshot = topology.try_snapshot().unwrap();
+        let root = snapshot.mounts.iter().find(|m| m.id == detached.mount_id()).unwrap();
+        let child = snapshot.mounts.iter().find(|m| m.id == nested.mount_id()).unwrap();
+        assert!(root.locked && child.locked);
+        assert_eq!(root.peer_group, child.peer_group);
+        assert_ne!(root.peer_group.unwrap().id, 900);
+        assert_eq!(root.peer_group.unwrap().master, Some(900));
+        assert!(!detached.is_placement_locked());
+        topology.finalize_namespace_placement_locks();
+        assert!(detached.is_placement_locked() && nested.is_placement_locked());
+        assert_eq!(source.try_records().unwrap().len(), 2);
+        assert_eq!(old_child.location().unwrap().mountpoint().mount_id(), old_root.mount_id());
+    }
+
+    #[test]
+    fn detached_namespace_failed_idmap_validation_never_attaches_tree() {
+        let _context = crate::test_support::scheduler_test_context();
+        let _operation = namespace_operation();
+        let (_root, _child, records) = mounted_root_with_child();
+        let source = MountTopology::try_new(143,
+            records.iter().map(|r| Mount::try_from_record(r, None).unwrap()).collect()).unwrap();
+        let fs = MemoryFs::new().unwrap();
+        let detached = new_detached_with_flags(&fs, 0,
+            MountMetadata::try_from_parts(FsPath::new(b"none"), "tmpfs", FsPath::new(b"/"), "").unwrap()).unwrap();
+        let owner = crate::task::UserNamespace::try_new_root().unwrap();
+        let map = MountIdmap::try_new(owner, &[], &[]).unwrap();
+        let mut idmaps = HashMap::new();
+        idmaps.insert(u64::MAX, map);
+        assert!(source.try_prepare_detached_namespace(144, &detached, &idmaps, &[], false).is_err());
+        assert!(!detached.is_attached());
+        assert_eq!(source.try_records().unwrap().len(), 2);
     }
 
     #[test]

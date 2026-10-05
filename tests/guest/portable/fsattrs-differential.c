@@ -285,6 +285,13 @@ int main(void) {
     ERROR(syscall(NR_TREE, dfd, "", TREE_FLAGS | AT_EMPTY_PATH, BAD, 32), EFAULT, "bad-attr");
     ERROR(syscall(NR_TREE, -1, BAD, BAD_FLAGS, BAD, 32), EINVAL, "flags-before-copy");
     ERROR(syscall(NR_TREE, -1, BAD, BAD_FLAGS, NULL, 32), EINVAL, "null-size");
+    struct mattr zero_mount = {0};
+    int nsfd = syscall(NR_TREE, dfd, "", 2U | O_CLOEXEC | AT_EMPTY_PATH, &zero_mount, 32);
+    check(nsfd >= 0 && fcntl(nsfd, F_GETFD) == FD_CLOEXEC, "namespace-noop-attributes");
+    if (nsfd >= 0) close(nsfd);
+    ERROR(syscall(NR_TREE, dfd, "", 2U | AT_EMPTY_PATH, &mount, 32), EINVAL,
+          "namespace-inode-is-not-a-mount-root");
+    mark("NAMESPACE_NOOP_AND_NONMOUNT_ATTR");
     mark("VALIDATION_ORDER"); done();
 
     check(close(fd) == 0, "close"); fd = -1;
