@@ -12,7 +12,7 @@ BUSYBOX_SHA256=b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314
 
 ARCH=""
 OUTPUT=""
-SIZE_MB=${THEKERNEL_ROOTFS_SIZE_MB:-96}
+SIZE_MB=${THEKERNEL_ROOTFS_SIZE_MB:-128}
 TOOLCHAIN=${THEKERNEL_TOOLCHAIN:-none}
 TOOLS_DIR=${THEKERNEL_ROOTFS_TOOLS_DIR:-}
 SOURCE_CACHE=${THEKERNEL_SOURCE_CACHE:-$REPO_ROOT/.state/source-cache}
@@ -43,7 +43,7 @@ Environment overrides:
                                 is compiled into the image, not just recorded;
                                 the payload itself is staged separately
   THEKERNEL_ROOTFS_TOOLS_DIR  tree of guest tools to copy into the image
-  THEKERNEL_ROOTFS_SIZE_MB    image size (default: 96)
+  THEKERNEL_ROOTFS_SIZE_MB    image size (default: 128)
   THEKERNEL_SOURCE_CACHE      Download cache
 EOF
 }

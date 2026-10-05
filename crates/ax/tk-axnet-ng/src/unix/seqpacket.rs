@@ -63,6 +63,10 @@ impl Bind {
     pub(super) fn identity(&self) -> usize {
         Arc::as_ptr(&self.0).cast::<()>() as usize
     }
+    pub(super) fn diagnostic_listening(&self) -> bool {
+        self.0.backlog.load(Ordering::Acquire) != 0
+    }
+
     fn listen(&self, backlog: usize, credentials: SocketCredentials) -> AxResult<()> {
         if self.0.tx.is_closed() {
             return Err(AxError::InvalidInput);

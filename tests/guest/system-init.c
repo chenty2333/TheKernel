@@ -496,6 +496,12 @@ static int test_namespace_relationships(void) {
         "--nested", "namespace-relationships-child");
 }
 
+static int test_proc_unix(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-proc-unix-smoke",
+        "--namespace", "proc-unix-child");
+}
+
 static int test_socket_diag(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-socket-diag-smoke",
@@ -1129,6 +1135,7 @@ static int run_init(int argc, char **argv) {
         { "proc-net-route", test_proc_net_route, 30 },
         { "netlink-dump-padding", test_netlink_dump_padding, 30 },
         { "socket-diag", test_socket_diag, 30 },
+        { "proc-unix", test_proc_unix, 30 },
         { "namespace-relationships", test_namespace_relationships, 35 },
         { "net-statistics", test_net_statistics, 30 },
         { "proc-smaps-swap", test_proc_smaps_swap, 30 },

@@ -166,11 +166,18 @@ impl Socket {
         (self.inode.inode(), self.inode.owner_uid())
     }
 
-    /// Accepted inet sockets retain their listener's immutable ABI identity,
-    /// but are a distinct open file description and therefore need their own
-    /// SOCK_DIAG lifetime token. Keeping the token on the child makes
-    /// close/dup/fork/exec retirement exact.
-    pub(crate) fn inherit_inet_identity_from(&mut self, listener: &Self) -> AxResult<()> {
+    pub(crate) fn register_unix_observation(&mut self) -> AxResult<()> {
+        self.diag_registration = Some(super::netlink::register_socket_diag(&self.net_ns, 1, 0)?);
+        Ok(())
+    }
+
+    /// Accepted sockets are distinct OFDs with their own observation token.
+    /// Inet sockets also retain their listener's immutable ABI identity.
+    /// Keeping the token on the child makes close/dup/fork/exec retirement exact.
+    pub(crate) fn inherit_observation_identity_from(&mut self, listener: &Self) -> AxResult<()> {
+        if matches!(&self.inner, SocketInner::Unix(_)) {
+            return self.register_unix_observation();
+        }
         let Some(identity) = listener.inet_identity else {
             return Ok(());
         };

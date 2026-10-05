@@ -415,7 +415,7 @@ pub(crate) fn accept_pinned(
     ))?;
     let mut accepted = Socket::new(reservation.commit()?, net_ns);
     accepted.inherit_creator_security_from(listener);
-    accepted.inherit_inet_identity_from(listener)?;
+    accepted.inherit_observation_identity_from(listener)?;
     let accepted = prepare_new_socket_like(accepted, nonblocking)?;
     publish_new_socket_like(accepted, cloexec).map(|fd| fd as isize)
 }
@@ -730,6 +730,9 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     };
     let mut socket = Socket::new(socket, net_ns);
     socket.capture_creator_security(Arc::clone(actor), snapshot.landlock_domain().clone());
+    if domain == AF_UNIX {
+        socket.register_unix_observation()?;
+    }
     if matches!(domain, AF_INET | AF_INET6) {
         let effective_protocol = match ty {
             SOCK_STREAM if proto == 0 => IPPROTO_TCP as u32,
@@ -1416,7 +1419,7 @@ pub fn sys_accept4(
     ))?;
     let mut socket = Socket::new(reservation.commit()?, net_ns);
     socket.inherit_creator_security_from(listener);
-    socket.inherit_inet_identity_from(listener)?;
+    socket.inherit_observation_identity_from(listener)?;
 
     let remote_addr = socket.peer_addr()?;
     if !addr.is_null() {
@@ -1627,27 +1630,13 @@ pub fn sys_socketpair(
             return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
     };
-    let sock1 = Socket::new(SocketInner::Unix(sock1), net_ns.clone());
-    let sock2 = Socket::new(SocketInner::Unix(sock2), net_ns);
+    let mut sock1 = Socket::new(SocketInner::Unix(sock1), net_ns.clone());
+    let mut sock2 = Socket::new(SocketInner::Unix(sock2), net_ns);
+    sock1.register_unix_observation()?;
+    sock2.register_unix_observation()?;
 
-    if nonblocking {
-        sock1.set_nonblocking(true)?;
-        sock2.set_nonblocking(true)?;
-    }
-
-    let status_flags = socket_status_flags(nonblocking);
-    let description1 = FileDescription::new_with_flags(
-        Arc::try_new(sock1).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>,
-        status_flags,
-    )?;
-    let description2 = FileDescription::new_with_flags(
-        Arc::try_new(sock2).map_err(|_| AxError::NoMemory)? as Arc<dyn FileLike>,
-        status_flags,
-    )?;
-    let socket1 = PinnedSocketDescription::from_description(description1)?;
-    let socket2 = PinnedSocketDescription::from_description(description2)?;
-    register_socket_endpoint_owner(&socket1)?;
-    register_socket_endpoint_owner(&socket2)?;
+    let socket1 = prepare_new_socket_like(sock1, nonblocking)?;
+    let socket2 = prepare_new_socket_like(sock2, nonblocking)?;
     dispatch_socket_post_create(actor, &socket1, spec)?;
     dispatch_socket_post_create(actor, &socket2, spec)?;
     {

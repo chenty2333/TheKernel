@@ -21,6 +21,7 @@ mod proc_memory;
 mod proc_swap;
 mod proc_net;
 mod proc_inet;
+mod proc_unix;
 mod proc_task_memory;
 pub(crate) mod rpc_pipefs;
 pub(crate) mod sys;

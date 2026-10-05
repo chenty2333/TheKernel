@@ -718,11 +718,13 @@ mod link_stats;
 mod framing;
 mod nft;
 mod wiremsg;
+mod unix_observations;
 
 pub(crate) use audit::*;
 pub(crate) use diag::*;
 pub(crate) use nft::*;
 pub(crate) use wiremsg::*;
+pub(crate) use unix_observations::*;
 
 struct NetlinkPortBinding {
     net_ns: Weak<NetworkNamespace>,

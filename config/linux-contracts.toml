@@ -1868,9 +1868,9 @@ flags = ["flag:socket type CLOEXEC NONBLOCK; operation-specific message or addre
 structs = ["struct:native sockaddr and socklen; message entries use msghdr iovec cmsghdr; option entries use length-delimited values"]
 multiplexer_commands = ["mux:socket family protocol and option level/name select provider behavior"]
 provider_ioctls = ["explicit-none"]
-errno_order = ["errno:pin fd and capture authority; import operation-owned inputs; run provider admission and output-copy validation"]
+errno_order = ["errno:pin fd and capture authority; import operation-owned inputs; run provider admission and output-copy validation", "errno:Unix observation-token allocation may return ENOMEM before endpoint FD publication; existing socketpair descriptor reservation and output-copy order are preserved"]
 usercopy = ["usercopy:bounded sockaddr message and option snapshots; explicit short output and length copyout"]
-state = ["state:retain socket OFD and apply operation to its protocol endpoint"]
+state = ["state:retain socket OFD and apply operation to its protocol endpoint", "state:AF_UNIX creation and accepted OFDs allocate a namespace-local weak observation token before descriptor publication; proc/net/unix reads real OFD state without retaining the socket after final close"]
 concurrency = ["concurrency:poll readiness and endpoint synchronization coordinate blocking calls and peer activity"]
 teardown = ["teardown:release retained endpoint and owned message/control data on completion"]
 
@@ -1881,7 +1881,7 @@ status = "partial"
 contract = "linux-socket"
 handler = "kernel/src/syscall/net/socket.rs:sys_socket"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main", "tests/guest/tools/proc-unix-smoke.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["SOCK_PACKET (10) passes the creation type range but the AF_PACKET branch admits only SOCK_RAW and SOCK_DGRAM, so a SOCK_PACKET socket cannot be created; the missing primitive is the AF_PACKET protocol family that SOCK_PACKET is the obsolete spelling of"]
 
@@ -1891,9 +1891,9 @@ flags = ["flag:socket type CLOEXEC NONBLOCK; operation-specific message or addre
 structs = ["struct:native sockaddr and socklen; message entries use msghdr iovec cmsghdr; option entries use length-delimited values"]
 multiplexer_commands = ["mux:socket family protocol and option level/name select provider behavior"]
 provider_ioctls = ["explicit-none"]
-errno_order = ["errno:pin fd and capture authority; import operation-owned inputs; run provider admission and output-copy validation"]
+errno_order = ["errno:pin fd and capture authority; import operation-owned inputs; run provider admission and output-copy validation", "errno:Unix observation-token allocation may return ENOMEM before endpoint FD publication; existing socketpair descriptor reservation and output-copy order are preserved"]
 usercopy = ["usercopy:bounded sockaddr message and option snapshots; explicit short output and length copyout"]
-state = ["state:retain socket OFD and apply operation to its protocol endpoint"]
+state = ["state:retain socket OFD and apply operation to its protocol endpoint", "state:AF_UNIX creation and accepted OFDs allocate a namespace-local weak observation token before descriptor publication; proc/net/unix reads real OFD state without retaining the socket after final close"]
 concurrency = ["concurrency:poll readiness and endpoint synchronization coordinate blocking calls and peer activity"]
 teardown = ["teardown:release retained endpoint and owned message/control data on completion"]
 
@@ -1904,7 +1904,7 @@ status = "implemented"
 contract = "linux-socketpair"
 handler = "kernel/src/syscall/net/socket.rs:sys_socketpair"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main", "tests/guest/tools/proc-unix-smoke.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -2029,9 +2029,9 @@ flags = ["flag:socket type CLOEXEC NONBLOCK; operation-specific message or addre
 structs = ["struct:native sockaddr and socklen; message entries use msghdr iovec cmsghdr; option entries use length-delimited values"]
 multiplexer_commands = ["mux:socket family protocol and option level/name select provider behavior"]
 provider_ioctls = ["explicit-none"]
-errno_order = ["errno:pin fd and capture authority; import operation-owned inputs; run provider admission and output-copy validation"]
+errno_order = ["errno:pin fd and capture authority; import operation-owned inputs; run provider admission and output-copy validation", "errno:Unix observation-token allocation may return ENOMEM before endpoint FD publication; existing socketpair descriptor reservation and output-copy order are preserved"]
 usercopy = ["usercopy:bounded sockaddr message and option snapshots; explicit short output and length copyout"]
-state = ["state:retain socket OFD and apply operation to its protocol endpoint"]
+state = ["state:retain socket OFD and apply operation to its protocol endpoint", "state:AF_UNIX creation and accepted OFDs allocate a namespace-local weak observation token before descriptor publication; proc/net/unix reads real OFD state without retaining the socket after final close"]
 concurrency = ["concurrency:poll readiness and endpoint synchronization coordinate blocking calls and peer activity"]
 teardown = ["teardown:release retained endpoint and owned message/control data on completion"]
 
@@ -2042,7 +2042,7 @@ status = "implemented"
 contract = "linux-accept"
 handler = "kernel/src/syscall/net/socket.rs:sys_accept"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main", "tests/guest/tools/proc-unix-smoke.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -2052,9 +2052,9 @@ flags = ["flag:socket type CLOEXEC NONBLOCK; operation-specific message or addre
 structs = ["struct:native sockaddr and socklen; message entries use msghdr iovec cmsghdr; option entries use length-delimited values"]
 multiplexer_commands = ["mux:socket family protocol and option level/name select provider behavior"]
 provider_ioctls = ["explicit-none"]
-errno_order = ["errno:pin fd and capture authority; import operation-owned inputs; run provider admission and output-copy validation"]
+errno_order = ["errno:pin fd and capture authority; import operation-owned inputs; run provider admission and output-copy validation", "errno:Unix observation-token allocation may return ENOMEM before endpoint FD publication; existing socketpair descriptor reservation and output-copy order are preserved"]
 usercopy = ["usercopy:bounded sockaddr message and option snapshots; explicit short output and length copyout"]
-state = ["state:retain socket OFD and apply operation to its protocol endpoint"]
+state = ["state:retain socket OFD and apply operation to its protocol endpoint", "state:AF_UNIX creation and accepted OFDs allocate a namespace-local weak observation token before descriptor publication; proc/net/unix reads real OFD state without retaining the socket after final close"]
 concurrency = ["concurrency:poll readiness and endpoint synchronization coordinate blocking calls and peer activity"]
 teardown = ["teardown:release retained endpoint and owned message/control data on completion"]
 
@@ -2065,7 +2065,7 @@ status = "implemented"
 contract = "linux-accept4"
 handler = "kernel/src/syscall/net/socket.rs:sys_accept4"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main", "tests/guest/tools/proc-unix-smoke.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 

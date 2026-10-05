@@ -3,6 +3,9 @@ mod queue;
 pub(crate) mod seqpacket;
 pub(crate) mod stream;
 
+mod observations;
+pub use observations::UnixDiagnosticSnapshot;
+
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{
     any::Any,

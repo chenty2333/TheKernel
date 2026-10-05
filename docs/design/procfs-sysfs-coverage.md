@@ -944,3 +944,80 @@ Python tests and q35 lint pass; actual KVM shell-0wjdb87d reports
 HWDB_HEADER_RC=0 and no name-initialization diagnostic. LSUSB_RC remains1,
 not accepted as USB enumeration. No kernel/runtime source changed; latest
 full guest/ABI runtime checks remain follow-up34.
+
+### B1 follow-up36: namespace-local live Unix OFD table
+
+`/proc/net/unix` is now wired through the existing target-task network namespace
+provider, with the namespace retained at open. Stream/datagram/seqpacket socket
+creation, socketpair and both accept paths register a weak observation token;
+the shared preparation helper attaches the actual file owner. Registry locks
+are released before endpoint observation. Reads do not poll, accept or consume
+queued messages, and the registry does not keep an OFD alive after final close.
+
+The seven-field prefix follows Linux 7.2.3 `net/unix/af_unix.c`'s proc format.
+Type, connected/listening state, real pseudo-inode and raw bound-address bytes
+come from the endpoint. Abstract leading/embedded NULs become `@`; non-UTF-8
+bytes are retained. Protocol is zero (Unix has no IP protocol); the opaque
+pointer column is always zero as a deliberate native pointer-hiding policy.
+RefCount measures actual **native socket-wrapper Arc owners**, excluding the
+observation's own temporary reference. It is not Linux's `sk_refcnt`, and is
+not presented as an equivalent transport reference count. An OFD-backed
+connected socket has state 03, all other OFD-backed sockets state 01; a listening
+stream/seqpacket endpoint sets flag 00010000.
+
+Coverage is explicitly partial: the native registry is OFD-backed, not a Linux
+Unix sock hash-table walk. Unaccepted listener-queue children and orphan
+transports surviving final OFD close are not represented. Unix SOCK_DIAG is
+still unsupported; no empty successful netlink response is substituted.
+SNMP and full TCP/UDP trailing fields remain separate work.
+
+The original regression runs unchanged on host Linux (no host namespace or
+container creation), comparing headers/mandatory grammar, three socket types,
+raw abstract bytes, pathname/listen/accept states, inode/dup/final-close
+lifetime and non-consumption of actual queued data. Guest additionally tests
+namespace pin/isolation and runs both signed Alpine net-tools and BusyBox
+`netstat -xanp` against a live pathname listener. The host base regression and the actual signed Alpine net-tools/BusyBox
+listener/connected/PID rows passed (`shell-mzhcic74`, tools result 0).
+The existing net-tools single-digit inode ownership-parser limitation is not
+worked around by renumbering kernel inodes. BusyBox ownership is asserted.
+
+Required regression-image headroom: adding this static guest regression exposed
+that the default 96 MiB ext4 image had only 307 free 4 KiB blocks (about 1.2 MiB)
+while reserving 1228 blocks. `e2fsck -fn` found a clean image, not corrupt metadata.
+Two complete native suites failed only the direct-I/O fixture's initial fsync;
+the same failure reproduced before running the Unix test in a fresh shell guest.
+The Linux 7.2.3 oracle independently failed several non-root filesystem fixtures
+with ENOSPC. Keeping this exact kernel/content and expanding only a disposable
+copy to 128 MiB made the complete isolated direct-I/O program pass, including
+fragmented physical SG, fixed-buffer lifetimes and queued-close completion.
+The baseline allocation and both standalone builder defaults are therefore
+128 MiB now, with a host test keeping them in sync. This is capacity for the
+existing regression corpus, not a new payload or an alternate validation path.
+The optional inspect payload remains 160 MiB; container tools are still separate.
+Native ext4's insufficient-space fsync errno of EINVAL was observed but is not
+claimed repaired by this capacity change. No filesystem errno was weakened to
+make the test pass. Freshly rebuilt 128 MiB baseline: complete host suite passed (657 Python cases,
+3 environment skips; 6049 Rust cases, 1 existing ignored case; kernel 2619).
+KVM guest passed 69/69 with no skips and normal shutdown (`system-y9iunctn`);
+full Linux/native ABI comparison passed 257/257 (`abi-ufpkqjni`). q35 and n305
+lint passed with the same 784 existing kernel warnings. The fresh baseline has
+4915 free 4 KiB blocks, not the prior 307. No physical hardware acceptance.
+
+## 已知差异（CONTINUE-B 收口范围，2026-10-05）
+
+以下属于字段级/非目标用法差异，按续做要求登记后不再继续扩展：
+- net-tools 的单数字 inode PID 标签解析差异；不为用户态解析缺陷重编号。
+- Unix RefCount 是 native OFD wrapper 引用，未接受的队列子连接及孤儿
+  transport 不在此表；Unix SOCK_DIAG 是否影响 `ss -x` 的实际使用仍待验。
+- TCP/UDP 尾字段、skb truesize、引用/drop 细节与 SNMP 等高级统计未完整。
+- smaps 的 Dirty/PSS/私有共享精确分摊、buddy/zone 高阶表、PSI stall
+  时间、精确 iowait/blocked/per-PID I/O 与部分 fault 边界未完整；不伪造数值。
+- `/proc/stat` aggregate 行少一个空格，sysstat 的固定偏移解析可导致
+  iostat CPU 字段错位（与退出失败不同）；本轮不扩展 CPU 字段级工作。
+- PCI 未观测 BAR/ROM/GPU 资源尺寸、USB native 公共 API 缺真实地址/速度/
+  拓扑/raw config；若影响指定工具基本使用，在收口时间内单独修阻塞。
+- native ext4 在测试镜像空间耗尽时 fsync 曾返回 EINVAL；扩大回归镜像
+  只修容量不足，不声称修复该 errno。未来 ENOSPC 边界另行处理。
+
+收口优先顺序是 lspci → ss/netstat → net statistics → diskstats/iostat →
+lsusb → lsns；剩余细节不阻止进入 B2，但实际工具失败不能标为通过。

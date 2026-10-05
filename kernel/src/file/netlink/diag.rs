@@ -11,7 +11,7 @@ pub(crate) struct SocketDiagRegistration {
     pub(crate) family: u16,
     protocol: u8,
     pub(crate) cookie: u64,
-    owner: Mutex<Option<Weak<dyn FileLike>>>,
+    pub(super) owner: Mutex<Option<Weak<dyn FileLike>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
