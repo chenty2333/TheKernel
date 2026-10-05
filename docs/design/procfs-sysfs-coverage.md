@@ -777,3 +777,22 @@ labels are shown, but that run's first IPv4 listener shows '-' despite ss findin
 its PID/fd/inode; this separate ownership-label anomaly needs diagnosis and is
 not declared passed. Netstat -tunap/UDP/UNIX/SNMP and complete trailing TCP rows
 remain unaccepted; no physical network acceptance is claimed.
+
+### B1 follow-up31: distinguish net-tools and BusyBox ownership labels
+
+The inspect payload's `netstat` is the signed net-tools2.10-r3 standalone
+program, not the BusyBox applet. Read-only diagnosis of fstat, lstat, readlink
+and readdir succeeds for the first listener's legitimate `socket:[3]` link.
+[Upstream net-tools v2.10 parser](https://github.com/ecki/net-tools/blob/v2.10/netstat.c)
+rejects a one-digit inode because its socket-link minimum length assumes at
+least two digits. This is a consumer restriction, not an observed descriptor
+loss; no inode renumbering or patched tool is used to hide it.
+
+The optional C `--tools` mode now runs both signed consumers and explicitly
+requires the BusyBox LISTEN row's own PID/program. Actual KVM shell-t7c9u73i
+passes DIAG_TOOLS_RC=0: BusyBox1.37 correctly labels inode3; net-tools retains
+its '-' for that inode and labels the other endpoints. Both show real IPv4/IPv6
+rows and unread queues. This corrects the earlier provider assumption without
+claiming net-tools' one-digit-inode PID display passes. Host Linux C endpoint
+probe, kernel2611 tests and q35 lint pass (784 existing warnings). This item
+changes acceptance tests/documentation only; runtime behavior stays unchanged.

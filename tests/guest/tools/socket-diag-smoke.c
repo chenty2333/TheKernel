@@ -94,14 +94,22 @@ static void compare_proc(int family,ino_t inode,const struct inet_diag_msg *diag
         !memcmp(&entry.id.idiag_src,&diag->id.idiag_src,16) && !memcmp(&entry.id.idiag_dst,&diag->id.idiag_dst,16) &&
         entry.id.idiag_sport==diag->id.idiag_sport && entry.id.idiag_dport==diag->id.idiag_dport,"proc TCP real endpoint/state/owner/queue agreement");
 }
-static void real_netstat(unsigned port) {
+static void real_netstat(unsigned port, int busybox) {
     int pipefd[2];require(!pipe(pipefd),"netstat output pipe");pid_t child=fork();require(child>=0,"netstat fork");
-    if(!child){close(pipefd[0]);dup2(pipefd[1],STDOUT_FILENO);close(pipefd[1]);execl("/opt/thekernel-tools/bin/netstat","netstat","-tanp",(char *)NULL);_exit(127);}
+    if(!child){close(pipefd[0]);dup2(pipefd[1],STDOUT_FILENO);close(pipefd[1]);if(busybox)execl("/opt/thekernel-tools/bin/busybox","busybox","netstat","-tanp",(char *)NULL);
+        else execl("/opt/thekernel-tools/bin/netstat","netstat","-tanp",(char *)NULL);
+        _exit(127);
+    }
     close(pipefd[1]);char text[16384];size_t length=0;ssize_t size;
     while(length<sizeof(text)-1 && (size=read(pipefd[0],text+length,sizeof(text)-1-length))>0)length+=size;
     text[length]=0;close(pipefd[0]);int status;require(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status),"real TCP netstat exit");
-    printf("%s",text);char endpoint[32];snprintf(endpoint,sizeof(endpoint),":%u",port);
+    printf("NETSTAT_PROVIDER=%s\n%s",busybox?"busybox":"net-tools",text);char endpoint[32];snprintf(endpoint,sizeof(endpoint),":%u",port);
     require(strstr(text,"LISTEN") && strstr(text,"ESTABLISHED") && strstr(text,endpoint),"real netstat live TCP rows");
+    if(busybox) {
+        char owner[32];snprintf(owner,sizeof(owner),"%ld/",(long)getpid());
+        char *line=strstr(text,"LISTEN"),*end=strchr(line,'\n'),*pid=strstr(line,owner);
+        require(pid && (!end || pid<end),"BusyBox netstat listener PID mapping including single-digit inode");
+    }
 }
 static ino_t inode_of(int fd) {struct stat st;require(!fstat(fd,&st),"socket inode");return st.st_ino;}
 static void ready(int fd) {struct pollfd p={.fd=fd,.events=POLLIN};require(poll(&p,1,3000)==1 && (p.revents&POLLIN),"receive ready");}
@@ -162,7 +170,11 @@ static void check_family(int family, int tools) {
         entry.idiag_uid==geteuid() && entry.idiag_rqueue==sizeof(data),"connected fields and real queue");
     compare_proc(family,server_inode,&entry);
     require(dump(family,1U<<10,server_inode,&entry)==0,"established not listening");
-    if(tools) {real_ss(port);real_netstat(port);}
+    if(tools) {
+        real_ss(port);
+        require(inode_of(listener)==listener_inode && inode_of(server)==server_inode,"tools preserve parent descriptors");
+        real_netstat(port,0);real_netstat(port,1);
+    }
     char received[sizeof(data)];require(recv(server,received,sizeof(received),MSG_WAITALL)==sizeof(received) &&
         !memcmp(received,data,sizeof(data)),"diagnostics did not consume data");
     require(dump(family,1U<<1,server_inode,&entry)==1 && entry.idiag_rqueue==0,"queue drained");
