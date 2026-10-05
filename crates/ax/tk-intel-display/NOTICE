@@ -53,3 +53,9 @@ src/cdclk.rs:
 Optional upstream_clock/upstream_readout tests extract and compile local MIT
 C bodies and headers at runtime. They do not distribute a Linux C copy or
 implement a kernel LinuxKPI layer. Temporary oracle files are removed.
+
+The excerpt inventory scanner also finds one normalized textual C-code match
+at both thresholds25/40 in tests/upstream_clock.rs: the conventional sizeof
+ARRAY_SIZE expression used by the original host compile shim. This is not an
+imported C driver or a quoted Linux prose block. Accounted as one outside-fence
+code line in the repository's scanner baseline; no fenced quote or range marker.

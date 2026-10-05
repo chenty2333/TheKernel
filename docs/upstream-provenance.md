@@ -548,3 +548,12 @@ next/future lookup remains unknown in the hardware admission layer. Native
 boot admission additionally requires the characterized `8086:46d0` exact D0,
 not merely a family ID. This changes no default MMIO write policy and does
 not assert the stepping/workaround/TC hardware port is complete.
+
+The 2026-10-05 re-scan finds **one** new normalized code-line match in
+`tk-intel-display/tests/upstream_clock.rs`: the conventional C `ARRAY_SIZE`
+sizeof expression in the original oracle shim. It adds no fenced/prose quote.
+At ≥40, `crates/ax` totals are now `(0,0,0,16,9,0,0)`; at ≥25 they are
+`(18,15,4,29,18,0,0)` in the scanner's seven-category order. Other scope totals
+and range-citation counts are unchanged. `test_linux_excerpt_baseline.py` is
+reconciled to these measured totals rather than disabling/exempting the scan.
+The earlier inventory tables remain explicitly dated historical measurements.

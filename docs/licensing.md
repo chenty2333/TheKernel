@@ -244,3 +244,11 @@ B0+/ADL-N D0 table selection and display-13 pixel-rate minimum in `intel_cdclk.c
 Each has original attribution and the crate's permission-text reference.
 Tests may compile local MIT source into temporary host oracles; no Linux C
 source or firmware is added to the repository by that testing workflow.
+
+Temporary compiled MIT oracle copies also carry the complete crate permission
+text and all source copyrights; they are removed when each test completes.
+
+The conventional host-oracle `ARRAY_SIZE` sizeof expression produces one
+additional scanner code-line match at thresholds25/40, not a copied prose block
+or an imported C driver. The measured inventory and its CI baseline are updated
+in provenance and the crate NOTICE; the scanner remains enabled and unchanged.
