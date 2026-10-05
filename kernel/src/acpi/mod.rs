@@ -10,6 +10,8 @@ use tk_acpica::{Mode, Status};
 mod ec;
 #[cfg(target_os = "none")]
 mod native;
+#[cfg(target_os = "none")]
+mod pci;
 pub mod thermal;
 #[cfg(target_os = "none")]
 mod wake;
@@ -69,9 +71,15 @@ fn initialize() -> Result<(), Status> {
     engine.initialize_objects()?;
     let osc = engine.platform_osc();
     info!("acpica: platform _OSC status={osc:?}; no native PCIe control requested");
+    pci::init(&engine, &nodes)?;
     engine.update_gpes()?;
     ec::activate(&engine)?;
     info!("acpica: installed EC controllers={ec_count}");
+    let thermal = thermal::init(&nodes)?;
+    pci::publish()?;
+    *ENGINE.lock() = Some(engine);
+    axhal::acpi::register_off(power_off);
+    axhal::acpi::publish_button(fixed || !BUTTONS.lock().is_empty() || thermal);
     info!(
         "acpica: ready version=20260930 nodes={} devices={} AML-errors={} fixed-button={} \
          method-buttons={} hardware-unverified",
@@ -81,10 +89,6 @@ fn initialize() -> Result<(), Status> {
         fixed,
         BUTTONS.lock().len()
     );
-    let thermal = thermal::init(&nodes)?;
-    *ENGINE.lock() = Some(engine);
-    axhal::acpi::register_off(power_off);
-    axhal::acpi::publish_button(fixed || !BUTTONS.lock().is_empty() || thermal);
     Ok(())
 }
 fn notify(path: &str, value: u32) {

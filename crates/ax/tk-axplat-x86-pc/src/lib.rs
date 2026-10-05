@@ -184,3 +184,6 @@ pub use power::{install_acpica_sci,remove_acpica_sci};
 
 /// Finish diagnostic serial transmission before power removal.
 pub fn acpi_flush_diagnostics(){console::flush_diagnostic();}
+
+#[cfg(feature = "irq")]
+pub use apic::configure_pci_intx_polarity;

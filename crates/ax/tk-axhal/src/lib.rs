@@ -975,3 +975,28 @@ pub mod acpi {
 pub fn acpi_flush_diagnostics() {
     #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::acpi_flush_diagnostics(); }
 }
+
+
+/// One firmware routing provider, installed before PCI transport admission.
+pub mod pci_firmware_irq {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    pub type Router = fn(u8, u8, u8, u8) -> Option<(u32, bool)>;
+    static ROUTER: AtomicUsize = AtomicUsize::new(0);
+    pub fn install(router: Router) -> bool {
+        ROUTER.compare_exchange(0, router as usize, Ordering::Release, Ordering::Acquire).is_ok()
+    }
+    /// None means no provider (static rescue); Some(None) is an unroutable
+    /// native function, never permission to guess the old config-space line.
+    pub fn resolve(bus: u8, device: u8, function: u8, pin: u8) -> Option<Option<(u32, bool)>> {
+        let ptr = ROUTER.load(Ordering::Acquire);
+        if ptr == 0 { return None }
+        // SAFETY: install accepts only a static fn with this exact signature.
+        Some(unsafe { core::mem::transmute::<usize, Router>(ptr) }(bus, device, function, pin))
+    }
+    pub fn configure(vector: usize, active_low: bool) -> bool {
+        #[cfg(all(target_os="none",feature="defplat",feature="irq"))]
+        { axplat_x86_pc::configure_pci_intx_polarity(vector, active_low) }
+        #[cfg(not(all(target_os="none",feature="defplat",feature="irq")))]
+        { let _=(vector, active_low); false }
+    }
+}

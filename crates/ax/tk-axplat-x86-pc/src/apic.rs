@@ -783,3 +783,10 @@ mod sci_tests {
         assert!(entry.flags().contains(IrqFlags::LOW_ACTIVE | IrqFlags::LEVEL_TRIGGERED));
     }
 }
+
+
+/// Admitted firmware PCI link polarity, still level-triggered.
+#[cfg(feature = "irq")]
+pub fn configure_pci_intx_polarity(vector: usize, active_low: bool) -> bool {
+    configure_level_line(vector, active_low)
+}

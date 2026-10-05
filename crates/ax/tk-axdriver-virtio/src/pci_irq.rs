@@ -74,8 +74,8 @@ fn release(index: usize) {
 
 /// Admit the acknowledgment owner before unmasking a PCI function. Drivers
 /// without interrupt consumers never call this and retain polling-only INTx.
-pub(super) fn admit(transport: &mut PciTransport, vector: usize) -> bool {
-    if !axhal::irq::register_shared_dispatcher(dispatch) || !axhal::irq::configure_pci_intx(vector)
+pub(super) fn admit(transport: &mut PciTransport, vector: usize, active_low: bool) -> bool {
+    if !axhal::irq::register_shared_dispatcher(dispatch) || !axhal::pci_firmware_irq::configure(vector, active_low)
     {
         return false;
     }

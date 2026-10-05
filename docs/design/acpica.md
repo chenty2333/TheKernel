@@ -204,3 +204,29 @@ precise corruption origin in that discarded early-AP order is not proven.
 The shipped phase restores the supported AP boundary, leaves all scheduler
 assertions unchanged, and has real SMP4 runtime validation. ACPICA is still
 opt-in until routing/INTx and default-native ABI acceptance finish.
+
+## Pre-probe INTx routing
+
+Firmware initialization now selects `_PIC(1)`, resolves root/bridge `_PRT` and
+already-programmed PNP0C0F `_CRS` links, and publishes one read-only routing
+provider before initial PCI transport admission. Exact function entries precede
+wildcards; bridges without a `_PRT` swizzle the downstream pin. Missing entries,
+unsupported segments/resources, conflicting electrical polarity and cycles do
+not authorize a guessed config-space line. A failed initialization never
+publishes the native routing provider. There is no inactive-link `_SRS` allocator.
+
+VirtIO block/net/input require an admitted route and acknowledgment owner before
+INTx enable. A native route works with Interrupt Line=0xff; a native lookup
+failure does not fall back to that register or silently admit a polling device.
+Q35 APIC links report **level, active high**, so their actual polarity is passed
+to the IOAPIC rather than the old unconditional PCI active-low assumption.
+
+The Q35/OVMF SMP4 native guest passed 69/69 after this wiring. The separate
+`acpica-intx-qemu-smoke.py` run removes NIC MSI-X with `vectors=0`; the actual
+user program also checks that neither MSI nor MSI-X exists in its PCI capability
+list. BDF 00:06.0 used firmware INTA -> GSI 22/vector 54, active high. It compared
+all 65536 TCP echo bytes through SLirp to a temporary host-loopback peer and
+observed that vector's interrupt count increase from 0 to 155, then completed
+AML-prepared S5. This is QEMU device I/O acceptance, **not N305 acceptance**.
+Affected host tests: ACPICA 22, VirtIO 19, platform 119; lint retains 784 baseline
+warnings. The temporary peer exits with the test; no host service is installed.

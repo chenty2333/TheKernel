@@ -351,3 +351,8 @@ pub(super) fn write_ec_port(port: u16, value: u8) -> Result<(), Status> {
 pub(super) fn stall_ec(micros: u32) {
     NATIVE.stall(micros);
 }
+
+
+pub(super) fn pci_read(bus: u8, device: u8, function: u8, reg: u32) -> Result<u32, Status> {
+    NATIVE.read_pci(PciId {segment: 0, bus: bus.into(), device: device.into(), function: function.into()}, reg, 32).map(|v| v as u32)
+}
