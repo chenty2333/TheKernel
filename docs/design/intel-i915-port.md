@@ -150,3 +150,16 @@ filter programming belong to native modeset. Compiled-C comparison passes48
 configurations/read traces, including pipe-D0x800 stride and direct window
 sizes. Dark/missing domains and reserved bindings are covered. No runtime call
 site or scaler programming was enabled.
+
+### Watermark/DDB discovery
+
+Six display13 latency levels plus transition/SAGV/SAGV-transition are read for
+five exposed planes and the cursor. DDB readout follows the display11+ path
+(no NV12/extra MIN_BUF_CFG read); disabled end0 stays disabled, otherwise end
+becomes exclusive+1. Raw DBUF controls/enabled slice mask and MBUS_CTL are kept
+for the outer stable-state proof. DDB remains MBUS-relative until pipe/slice
+mapping is reconstructed; this slice alone cannot authorize allocation or a
+watermark change. Computation, global bandwidth/MDCLK policy, SAGV and PCODE
+programming remain for modeset. Compiled-i915 comparison passes64 states and
+all65 reads. Missing/dark registers and layout boundaries are covered. No
+runtime or hardware WM programming was enabled by this slice.

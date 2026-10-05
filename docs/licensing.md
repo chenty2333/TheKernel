@@ -287,3 +287,9 @@ Scaler discovery additionally translates MIT `skl_scaler.c` pipe scaler state
 and configuration getters (2020 Intel) with selected `intel_display_regs.h`
 fields (2025 Intel) into `src/scaler.rs`. Permission/copyright references and
 function inventory accompany source/NOTICE; no GPL display trace is imported.
+
+Watermark discovery translates MIT `skl_watermark.c` display13 WM/DDB decoders
+and getters plus enabled-DBUF-slice readout (2022 Intel) into `watermark.rs`.
+Register fields come from MIT `skl_universal_plane_regs.h`, `intel_cursor_regs.h`
+(2024 Intel), and `skl_watermark_regs.h` (2023 Intel). Source/NOTICE preserve
+original attribution and the shared MIT grant. No WM programming imported yet.

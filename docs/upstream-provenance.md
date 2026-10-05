@@ -626,3 +626,15 @@ controls, including active plane/reserved bindings which the pipe-only getter
 skips. Active filter/scaling state is not admitted for plane-only fastboot.
 48 compiled-C configurations and exact read traces agree; dark-domain,
 missing-register and plane/reserved-binding regressions pass.
+
+WM slice: `skl_watermark.c` display13 pipe WM/DDB getters and decoders plus
+`intel_enabled_dbuf_slices_mask` → `src/watermark.rs`. ADL-P has **six** latency
+levels and dedicated SAGV/transition offsets, not eight ordinary levels. Both
+five exposed planes and the cursor are included in upstream read order.
+DDB end0 remains disabled; nonzero inclusive ends become exclusive+1. Raw
+values are retained separately from decoded fields; safety validation is not
+upstream decode and must resolve MBUS-relative offsets/enabled slices before
+ownership. Global readout retains four irregular DBUF controls plus MBUS_CTL;
+this is not full global bandwidth reconstruction or policy. No WM/PCODE writes.
+64 compiled-C states with all decoded fields and65-register traces agree;
+missing/dark domains, DDB bounds and dedicated SAGV/cursor offsets are tested.

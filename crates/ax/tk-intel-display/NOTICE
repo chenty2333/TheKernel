@@ -118,3 +118,15 @@ src/scaler.rs:
   Additional original ownership readout checks BOTH scaler controls, including
   plane/reserved bindings skipped by the upstream pipe-only getter. Power must
   be pinned for PANEL_FITTER independently of the pipe. No filter programming.
+
+src/watermark.rs:
+  drivers/gpu/drm/i915/display/skl_watermark.c:
+  skl_wm_level_from_reg_val, skl_pipe_wm_get_hw_state, skl_ddb_entry_init,
+  skl_ddb_entry_init_from_hw, skl_ddb_get_hw_plane_state,
+  skl_pipe_ddb_get_hw_state, intel_enabled_dbuf_slices_mask (display13)
+  Copyright © 2022 Intel Corporation.
+  skl_universal_plane_regs.h / intel_cursor_regs.h: Copyright © 2024 Intel Corporation.
+  skl_watermark_regs.h: Copyright © 2023 Intel Corporation.
+  Six latency levels and dedicated SAGV/transitions, five planes plus cursor.
+  DDB coordinates are still MBUS-relative; raw DBUF/MBUS state is retained.
+  No WM allocation/computation, SAGV/PCODE or hardware writes are imported.

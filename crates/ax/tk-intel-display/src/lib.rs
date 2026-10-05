@@ -15,6 +15,7 @@ pub mod dpll_mgr;
 pub mod opregion;
 pub mod scaler;
 pub mod universal_plane;
+pub mod watermark;
 
 /// Backend access failure: unavailable/powered-off registers never become zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

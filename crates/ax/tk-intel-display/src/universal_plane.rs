@@ -20,6 +20,10 @@ pub const XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 pub struct Plane(u8);
 impl Plane {
     pub const PRIMARY: Self = Self(0);
+    pub const SECOND: Self = Self(1);
+    pub const THIRD: Self = Self(2);
+    pub const FOURTH: Self = Self(3);
+    pub const FIFTH: Self = Self(4);
     pub fn new(index: u8) -> Result<Self, Error> {
         if index >= 5 {
             return Err(Error::Refused);
