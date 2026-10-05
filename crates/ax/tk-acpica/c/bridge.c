@@ -1,6 +1,7 @@
 /* Original TheKernel FFI/variadic adapter, Apache-2.0. */
 #include "acpi.h"
 #include "accommon.h"
+#include "acresrc.h"
 extern void tk_acpi_log(const char *, ACPI_SIZE);
 void AcpiOsVprintf(const char *format, va_list args) {
     char buffer[512];
@@ -88,11 +89,20 @@ void tk_acpi_remove_notify(void) {
     AcpiRemoveNotifyHandler(ACPI_ROOT_OBJECT,ACPI_ALL_NOTIFY,Notify);
 }
 /* Validate decoded resource lists as well as returning the original AML buffer. */
-ACPI_STATUS tk_acpi_validate_resources(const char *path, UINT8 possible) {
-    ACPI_HANDLE handle; ACPI_BUFFER result={ACPI_ALLOCATE_BUFFER,NULL};
+ACPI_STATUS tk_acpi_resources(const char *path, UINT8 possible,
+    UINT8 *out, ACPI_SIZE capacity, ACPI_SIZE *used) {
+    ACPI_HANDLE handle;
+    ACPI_BUFFER resources={ACPI_ALLOCATE_BUFFER,NULL}, aml={ACPI_ALLOCATE_BUFFER,NULL};
     ACPI_STATUS status=AcpiGetHandle(NULL,(char *)path,&handle);
-    if (ACPI_SUCCESS(status)) status=possible ? AcpiGetPossibleResources(handle,&result) : AcpiGetCurrentResources(handle,&result);
-    if (result.Pointer) AcpiOsFree(result.Pointer);
+    *used=0;
+    if (ACPI_SUCCESS(status)) status=possible ? AcpiGetPossibleResources(handle,&resources) : AcpiGetCurrentResources(handle,&resources);
+    if (ACPI_SUCCESS(status)) status=AcpiRsCreateAmlResources(&resources,&aml);
+    if (ACPI_SUCCESS(status)) {
+        if(aml.Length>capacity)status=AE_LIMIT;
+        else{memcpy(out,aml.Pointer,aml.Length);*used=aml.Length;}
+    }
+    if(resources.Pointer)AcpiOsFree(resources.Pointer);
+    if(aml.Pointer)AcpiOsFree(aml.Pointer);
     return status;
 }
 /* _OSC only offers support already implemented by the OS; no native PCIe
@@ -114,4 +124,35 @@ ACPI_STATUS tk_acpi_platform_osc(void) {
     }
     if(result.Pointer)AcpiOsFree(result.Pointer);
     return status;
+}
+extern void tk_acpi_fixed_power(void);
+static UINT32 FixedPower(void *context) { (void)context;tk_acpi_fixed_power();return ACPI_INTERRUPT_HANDLED; }
+ACPI_STATUS tk_acpi_install_fixed_power(void) {
+    return AcpiInstallFixedEventHandler(ACPI_EVENT_POWER_BUTTON,FixedPower,NULL);
+}
+ACPI_STATUS tk_acpi_table(UINT32 index, UINT8 *out, ACPI_SIZE capacity, ACPI_SIZE *used) {
+    ACPI_TABLE_HEADER *table;ACPI_STATUS status=AcpiGetTableByIndex(index,&table);*used=0;
+    if(ACPI_FAILURE(status))return status;
+    if(!table || table->Length<8 || table->Length>capacity)return AE_LIMIT;
+    memcpy(out,table,table->Length);*used=table->Length;return AE_OK;
+}
+extern ACPI_STATUS tk_acpi_ec_access(UINT32,UINT64,UINT32,UINT64 *,void *);
+static ACPI_STATUS EcAccess(UINT32 f,ACPI_PHYSICAL_ADDRESS a,UINT32 w,UINT64 *v,void *h,void *r) {
+    (void)r;return tk_acpi_ec_access(f,a,w,v,h);
+}
+static ACPI_STATUS EcSetup(ACPI_HANDLE region,UINT32 function,void *context,void **region_context) {
+    (void)region;*region_context=function==ACPI_REGION_ACTIVATE?context:NULL;return AE_OK;
+}
+ACPI_STATUS tk_acpi_install_ec(const char *path,void *context) {
+    ACPI_HANDLE handle;ACPI_STATUS status=AcpiGetHandle(NULL,(char *)path,&handle);
+    if(ACPI_FAILURE(status))return status;
+    return AcpiInstallAddressSpaceHandler(handle,ACPI_ADR_SPACE_EC,EcAccess,EcSetup,context);
+}
+ACPI_STATUS tk_acpi_resolve(const char *parent,const char *source,UINT8 *out,ACPI_SIZE capacity,ACPI_SIZE *used) {
+    ACPI_HANDLE base,handle;ACPI_BUFFER path={ACPI_ALLOCATE_BUFFER,NULL};
+    ACPI_STATUS status=AcpiGetHandle(NULL,(char *)parent,&base);*used=0;
+    if(ACPI_SUCCESS(status))status=AcpiGetHandle(base,(char *)source,&handle);
+    if(ACPI_SUCCESS(status))status=AcpiGetName(handle,ACPI_FULL_PATHNAME,&path);
+    if(ACPI_SUCCESS(status)){ACPI_SIZE length=strlen(path.Pointer);if(length>capacity)status=AE_LIMIT;else{memcpy(out,path.Pointer,length);*used=length;}}
+    if(path.Pointer)AcpiOsFree(path.Pointer);return status;
 }

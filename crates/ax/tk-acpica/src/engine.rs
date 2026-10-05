@@ -11,6 +11,7 @@ use crate::{
     backend::{BackendRegistration, install_backend},
 };
 static LIVE: AtomicBool = AtomicBool::new(false);
+static POWER: AtomicUsize = AtomicUsize::new(0);
 static NOTIFY: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
@@ -60,12 +61,33 @@ unsafe extern "C" {
     ) -> Status;
     fn tk_acpi_install_notify() -> Status;
     fn tk_acpi_remove_notify();
-    fn tk_acpi_validate_resources(path: *const c_char, possible: u8) -> Status;
+    fn tk_acpi_resources(
+        path: *const c_char,
+        possible: u8,
+        out: *mut u8,
+        capacity: usize,
+        used: *mut usize,
+    ) -> Status;
     fn tk_acpi_platform_osc() -> Status;
+    fn tk_acpi_install_fixed_power() -> Status;
+    fn tk_acpi_resolve(
+        parent: *const c_char,
+        source: *const c_char,
+        out: *mut u8,
+        capacity: usize,
+        used: *mut usize,
+    ) -> Status;
+    fn tk_acpi_table(index: u32, out: *mut u8, capacity: usize, used: *mut usize) -> Status;
 }
 pub fn status(status: Status) -> Result<(), Status> {
     if status == OK { Ok(()) } else { Err(status) }
 }
+// SAFETY: ACPICA public operations synchronize their internal shared state.
+// Rust methods borrow the lifecycle owner; Drop cannot overlap a live borrow.
+// The caller's installed Backend is Sync and promises deferred-work draining.
+unsafe impl Send for Engine {}
+// SAFETY: same ACPICA public-interface synchronization and backend contract.
+unsafe impl Sync for Engine {}
 impl Engine {
     /// # Safety
     /// Caller owns ACPI hardware, SCI and mappings and has initialized allocation,
@@ -100,6 +122,48 @@ impl Engine {
         Ok(engine)
     }
     /// Run _REG/_STA/_INI after custom handlers (notably EC) are installed.
+    /// An owned table copy. OEM tables may contain private data (e.g. MSDM);
+    /// callers must apply root-only access policy and must never log the bytes.
+    pub fn table(&self, index: u32) -> Result<Vec<u8>, Status> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(1024 * 1024)
+            .map_err(|_| NO_MEMORY)?;
+        bytes.resize(1024 * 1024, 0);
+        let mut used = 0;
+        // SAFETY: caller holds the live engine; table copy stays within buffer.
+        unsafe {
+            status(tk_acpi_table(
+                index,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut used,
+            ))?;
+        }
+        bytes.truncate(used);
+        Ok(bytes)
+    }
+    pub fn resolve(&self, parent: &str, source: &str) -> Result<String, Status> {
+        let parent = CString::new(parent).map_err(|_| BAD_PARAMETER)?;
+        let source = CString::new(source).map_err(|_| BAD_PARAMETER)?;
+        let mut out = [0u8; 4096];
+        let mut used = 0;
+        // SAFETY: bounded output and live CStrings throughout the C call.
+        unsafe {
+            status(tk_acpi_resolve(
+                parent.as_ptr(),
+                source.as_ptr(),
+                out.as_mut_ptr(),
+                out.len(),
+                &mut used,
+            ))?;
+        }
+        let path = core::str::from_utf8(&out[..used]).map_err(|_| BAD_PARAMETER)?;
+        let mut owned = String::new();
+        owned.try_reserve_exact(path.len()).map_err(|_| NO_MEMORY)?;
+        owned.push_str(path);
+        Ok(owned)
+    }
     pub fn initialize_objects(&self) -> Result<(), Status> {
         // SAFETY: live instance, OSL is ready and hardware mode admits AML.
         unsafe { status(AcpiInitializeObjects(0)) }
@@ -180,16 +244,25 @@ impl Engine {
     /// ACPICA resource pointers). Consumers must use a checked resource parser.
     pub fn resources(&self, path: &str, possible: bool) -> Result<Vec<u8>, Status> {
         let name = CString::new(path).map_err(|_| BAD_PARAMETER)?;
-        // SAFETY: C validator releases its own native resource allocation.
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(65536).map_err(|_| NO_MEMORY)?;
+        bytes.resize(65536, 0);
+        let mut used = 0;
+        // SAFETY: live instance, initialized output slice; C validates and
+        // converts the single method result without re-executing firmware AML.
         unsafe {
-            status(tk_acpi_validate_resources(name.as_ptr(), possible.into()))?;
+            status(tk_acpi_resources(
+                name.as_ptr(),
+                possible.into(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut used,
+            ))?;
         }
-        let method = alloc::format!("{path}.{}", if possible { "_PRS" } else { "_CRS" });
-        match self.evaluate(&method, &[])? {
-            Value::Buffer(v) => Ok(v),
-            _ => Err(0x1003),
-        }
+        bytes.truncate(used);
+        Ok(bytes)
     }
+
     /// Install the one root Notify observer. Callback runs on deferred OSL work,
     /// must not panic, and must not retain its temporary pathname reference.
     pub fn install_notify(&mut self, callback: fn(&str, u32)) -> Result<(), Status> {
@@ -204,6 +277,11 @@ impl Engine {
         }
         self.notify = true;
         Ok(())
+    }
+    pub fn install_fixed_power(&self, callback: fn()) -> Result<(), Status> {
+        POWER.store(callback as usize, Ordering::Release);
+        // SAFETY: the callback is static and only latches a coalesced event.
+        unsafe { status(tk_acpi_install_fixed_power()) }
     }
     pub fn update_gpes(&self) -> Result<(), Status> {
         // SAFETY: invoked after all namespace/custom handlers are initialized.
@@ -230,6 +308,7 @@ impl Engine {
 }
 impl Drop for Engine {
     fn drop(&mut self) {
+        crate::backend::backend().quiesce();
         // SAFETY: exclusive lifecycle owner; terminate drains deferred callbacks
         // and removes the SCI handler before deleting interpreter locks/caches.
         unsafe {
@@ -239,6 +318,7 @@ impl Drop for Engine {
             let _ = AcpiTerminate();
         }
         NOTIFY.store(0, Ordering::Release);
+        POWER.store(0, Ordering::Release);
         LIVE.store(false, Ordering::Release);
     }
 }
@@ -332,5 +412,16 @@ mod tests {
         }
         let mut c = 0;
         assert!(decode(&[99, 0, 0, 0, 0, 0, 0, 0], &mut c, 0).is_err());
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn tk_acpi_fixed_power() {
+    let callback = POWER.load(Ordering::Acquire);
+    if callback != 0 {
+        // SAFETY: install_fixed_power publishes only static fn() callbacks.
+        unsafe {
+            core::mem::transmute::<usize, fn()>(callback)();
+        }
     }
 }

@@ -55,7 +55,7 @@ fn main() {
     // cc doesn't have a compiler spec for Rust's bare-metal triple. The host
     // x86_64 C compiler emits the same SysV ABI with all hosted features off.
     if env::var("CARGO_CFG_TARGET_OS").unwrap() == "none" {
-        build.compiler(env::var("CC").unwrap_or_else(|_| "cc".into()));
+        build.compiler(env::var("CC").unwrap_or_else(|_| "cc".into())).flag("-mcmodel=large").pic(false);
     }
     for component in [
         "dispatcher",

@@ -193,6 +193,9 @@ unsafe impl Backend for OfflineBackend {
     fn remove_irq(&self, _irq: u32, _handler: IrqHandler) -> Status {
         OK
     }
+    fn quiesce(&self) {
+        self.wait_events();
+    }
     fn wait_events(&self) {
         while self.active.load(Ordering::Acquire) != 0 {
             std::thread::sleep(Duration::from_millis(1));

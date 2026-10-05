@@ -52,6 +52,8 @@ pub unsafe trait Backend: Sync {
         SUPPORT
     }
     fn wait_events(&self);
+    /// Mask/synchronize SCI and drain deferred work before namespace teardown.
+    fn quiesce(&self);
     fn read_port(&self, _address: u16, _width: u32) -> Result<u32, Status> {
         Err(SUPPORT)
     }
