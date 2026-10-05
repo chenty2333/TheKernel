@@ -26,3 +26,12 @@ src/opregion.rs:
 Only display 13 ADL-P/N semantic paths are included. Safety divergences are
 explicitly documented in each file and README.md. Original TheKernel adapter
 and tests are MIT (Copyright 2026 TheKernel contributors).
+
+src/display.rs:
+  drivers/gpu/drm/i915/display/intel_display.c:
+  intel_get_transcoder_timings (non-DSI display 13), intel_get_pipe_src_size
+  Copyright © 2006-2007 Intel Corporation.
+  intel_display_regs.h: selected timing/source/register fields
+  Copyright © 2025 Intel Corporation.
+  This is partial readout, not hsw_get_pipe_config, get_config for TC PLL/PHY,
+  framebuffer reconstruction, or modeset_setup ownership/fastboot equivalence.

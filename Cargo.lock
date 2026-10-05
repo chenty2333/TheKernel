@@ -3711,6 +3711,7 @@ dependencies = [
  "tk-axsync",
  "tk-axtask",
  "tk-axtlb",
+ "tk-intel-display",
  "tk-kernel-elf-parser",
  "tk-linux-aio",
  "tk-linux-arch-x86-64",

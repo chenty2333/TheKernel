@@ -522,3 +522,11 @@ Other display platforms and old/future BDB semantic versions are omitted.
 Checked byte access, accessed-section validation and stricter ambiguous-input
 admission are documented divergences, not alleged exact equivalence to unsafe
 C inputs. The rest of the D1 inventory is planned, **not translated**.
+
+Additional slice: `intel_display.c::intel_get_transcoder_timings` (non-DSI,
+version 13) and `intel_get_pipe_src_size` → `tk-intel-display/src/display.rs`;
+register masks/offsets from MIT `intel_display_regs.h`. All seven timing reads,
+interlace correction and SET_CONTEXT_LATENCY override follow source order.
+`kernel/src/drm/intel/i915_port.rs` is original TheKernel glue, limited to an
+already-admitted powered pipe A and denying every write. No GPL helper port
+or full fastboot state-equivalence claim is introduced.

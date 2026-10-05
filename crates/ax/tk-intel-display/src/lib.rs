@@ -7,6 +7,7 @@
 
 pub mod bios;
 pub mod device;
+pub mod display;
 pub mod opregion;
 
 /// Backend access failure: unavailable/powered-off registers never become zero.

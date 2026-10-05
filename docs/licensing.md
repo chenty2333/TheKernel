@@ -231,3 +231,9 @@ VBT/BDB routing and HDMI capabilities, and read-only OpRegion VBT discovery.
 No GPL ACPI/trace implementation, DRM C core, GT or firmware is bundled by this
 crate. Private N305 BIOS/EDID captures are external test inputs, not distributed
 MIT fixtures. Hardware behavior remains unverified.
+
+The readout slice additionally translates MIT `intel_display.c` timing/source
+functions and selected `intel_display_regs.h` register fields, with their
+2006–2007 / 2025 Intel copyrights retained in source and crate NOTICE. The
+kernel adapter remains original Apache-2.0 Rust; linking the MIT crate does
+not change the existing product's GPL obligations described above.

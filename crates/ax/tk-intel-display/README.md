@@ -29,3 +29,22 @@ THEKERNEL_N305_CAPTURE=/path/to/n305-20261003T235530Z \
 Synthetic malformed tables and board-routing regressions run in the normal
 host suite. Actual captured tests are separate and never silently count a
 missing capture as a pass. 未在硬件上验证.
+
+`display.rs` translates the non-DSI display-13 transcoder timing reads in exact
+upstream order, including interlace correction followed by SET_CONTEXT_LATENCY
+vblank-start override, and the distinct high-half PIPESRC width decode. A backend
+must hold a stable already-powered pipe domain; sleeping readout refuses without
+MMIO. The kernel's narrow adapter only reads admitted live pipe A before the
+first modeset write. It cannot write through RegisterIo and does not open the
+existing combo-only transaction to TC. **This is not complete firmware state
+readout or fastboot takeover.** PLL, format/modifier, scaling, watermark/color,
+GGTT ownership and full equivalence remain pending.
+
+The optional `upstream_readout` test extracts unmodified
+`intel_get_transcoder_timings` and register definitions from the local reference,
+compiles them with a minimal read backend, and compares 128 raw states across
+four transcoders/progressive+interlaced, including the exact seven-read order.
+It needs `THEKERNEL_LINUX_REFERENCE`, `THEKERNEL_STATE_DIR` under `/home`, and
+GCC; run it explicitly with `--test upstream_readout -- --ignored`. Its generated
+C/binary is removed at test completion; no independent-oracle success is inferred
+from the handwritten unit model. This oracle checks timing only, not ownership.

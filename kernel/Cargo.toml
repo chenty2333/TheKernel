@@ -42,6 +42,7 @@ io-submit-batch = []
 io-notify-fastpath = []
 
 [dependencies]
+intel_display = { package = "tk-intel-display", path = "../crates/ax/tk-intel-display" }
 axfeat = { workspace = true, features = [
     "fp-simd",
     "irq",

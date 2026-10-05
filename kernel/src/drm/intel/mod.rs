@@ -92,6 +92,7 @@ mod gt_probe;
 pub(crate) mod gtt;
 mod hpd;
 mod id;
+mod i915_port;
 mod modeset;
 mod output;
 mod pattern;
@@ -360,6 +361,9 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
     let tx = rollback::Transaction::begin(window, &gmbus::MonotonicTimer).map_err(|e| {
         alloc::format!("intel.modeset=1 REFUSED before writes: {e}; firmware unchanged")
     })?;
+    // Read the MIT timing slice only after live firmware pipe-A admission.
+    let timings = i915_port::read_admitted_timings(&tx)?;
+    axlog::info!("intel-i915-readout: {timings:?}; timing slice only, not fastboot ownership");
     *FIRMWARE_STATE.lock() = alloc::vec![(bdf, tx.before.clone())];
     *GTT.lock() = Some(gtt.describe());
     if let Some(value) = axhal::boot::command_line_value("intel.modeset.fail_write") {
