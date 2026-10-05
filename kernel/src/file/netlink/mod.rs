@@ -565,6 +565,7 @@ enum NetlinkWritePermit<'a> {
         state: MutexGuard<'a, NetlinkState>,
         queue: MutexGuard<'a, NetlinkQueue>,
         records: Vec<SocketDiagRecord>,
+        nowait: bool,
     },
 }
 
@@ -1706,6 +1707,12 @@ impl NetlinkSocket {
 
         let data = validate_protocol_frames(self.protocol, data)?;
 
+        if let NetlinkWritePermit::SockDiag { records, nowait, .. } = permit {
+            *records = diagnostic_records(
+                &self.net_ns, *nowait, actor, requested_diagnostic_protocols(data),
+            )?;
+        }
+
         // nfnetlink batches are transactional.  Preserve the old namespace
         // graph before dispatch and restore it if any ACKed member fails; an
         // ACK is a delivery mechanism, not permission to retain a prefix of
@@ -1773,7 +1780,7 @@ impl NetlinkSocket {
         sender_pid: u32,
     ) -> AxResult {
         if self.protocol != NETLINK_KOBJECT_UEVENT {
-            let mut permit = self.acquire_write_permit(false, actor)?;
+            let mut permit = self.acquire_write_permit(false)?;
             return self.handle_write(&mut permit, data, actor);
         }
         if !ns_capable(actor, self.net_ns.owner_user_ns(), CAP_SYS_ADMIN) {
@@ -2108,7 +2115,7 @@ impl NetlinkSocket {
             .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
         data.resize(len, 0);
         src.read_exact(&mut data)?;
-        let mut permit = self.acquire_write_permit(nowait, actor)?;
+        let mut permit = self.acquire_write_permit(nowait)?;
         self.send_uevent_with_permit(&mut permit, &data, actor, sender_pid)?;
         Ok(len)
     }
@@ -2151,7 +2158,7 @@ impl NetlinkSocket {
             // Uevent has a global listener registry.  Admit that registry
             // before importing an unreplayable source so it cannot produce a
             // late EAGAIN after usercopy.
-            let mut permit = self.acquire_write_permit(true, &actor)?;
+            let mut permit = self.acquire_write_permit(true)?;
             let mut data = Vec::new();
             data.try_reserve_exact(len)
                 .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
@@ -2175,7 +2182,7 @@ impl NetlinkSocket {
         data.resize(len, 0);
         src.read_exact(&mut data)?;
         validate_protocol_frames(self.protocol, &data)?;
-        let mut permit = self.acquire_write_permit(nowait, &actor)?;
+        let mut permit = self.acquire_write_permit(nowait)?;
         self.send_uevent_with_permit(
             &mut permit,
             &data,
@@ -2257,7 +2264,7 @@ impl NetlinkSocket {
     /// EAGAIN.  Fixing this properly means restructuring delivery so the
     /// sender's guards are dropped before a peer's are taken; until then the
     /// `try_lock` is load-bearing and stays.
-    fn acquire_write_permit(&self, nowait: bool, actor: &Cred) -> AxResult<NetlinkWritePermit<'_>> {
+    fn acquire_write_permit(&self, nowait: bool) -> AxResult<NetlinkWritePermit<'_>> {
         let gate = if nowait {
             self.write_gate.try_lock().ok_or(AxError::WouldBlock)?
         } else {
@@ -2336,9 +2343,8 @@ impl NetlinkSocket {
                 })
             }
             NETLINK_SOCK_DIAG => {
-                let records = diagnostic_records(&self.net_ns, nowait, actor)?;
                 Ok(NetlinkWritePermit::SockDiag {
-                    gate, state, queue, records,
+                    gate, state, queue, records: Vec::new(), nowait,
                 })
             }
             _ => Err(AxError::OperationNotSupported),
@@ -2434,7 +2440,7 @@ impl NetlinkSocket {
         }
         // Linux selects dump when either NLM_F_ROOT or NLM_F_MATCH is set.
         // Exact lookup/bytecode providers have not been implemented here.
-        if payload[1] != 6 || hdr.nlmsg_flags & 0x300 == 0 || payload.len() != INET_DIAG_REQ_V2_LEN {
+        if !matches!(payload[1], 6 | 17) || hdr.nlmsg_flags & 0x300 == 0 || payload.len() != INET_DIAG_REQ_V2_LEN {
             return Err(AxError::OperationNotSupported);
         }
         let request = InetDiagRequest::parse(&payload[..INET_DIAG_REQ_V2_LEN])?;

@@ -34,9 +34,10 @@ fn row(index: usize, entry: &SocketDiagRecord) -> String {
     } else {
         entry.send_queue
     };
+    let width = if entry.protocol == 17 { 5 } else { 4 };
     format!(
-        "{index:4}: {}:{:04X} {}:{:04X} {:02X} {send:08X}:{:08X} {timer:02X}:{when:08X} {:08X} \
-         {:5} {:8} {}\n",
+        "{index:width$}: {}:{:04X} {}:{:04X} {:02X} {send:08X}:{:08X} {timer:02X}:{when:08X} \
+         {:08X} {:5} {:8} {}\n",
         address(&entry.src, entry.family),
         entry.sport,
         address(&entry.dst, entry.family),
@@ -65,7 +66,7 @@ fn header(family: u16) -> String {
 }
 pub(super) fn tcp(namespace: &Arc<NetworkNamespace>, family: u16) -> VfsResult<String> {
     let actor = current_file_operation_security_credential().ok_or(VfsError::Io)?;
-    let records = diagnostic_records(namespace, false, &actor)?;
+    let records = diagnostic_records(namespace, false, &actor, 1 << 6)?;
     let mut out = header(family);
     for (index, entry) in records
         .iter()
@@ -85,6 +86,40 @@ pub(super) fn tcp(namespace: &Arc<NetworkNamespace>, family: u16) -> VfsResult<S
     Ok(out)
 }
 
+fn udp_header(family: u16) -> String {
+    if family == 2 {
+        format!(
+            "{:<127}\n",
+            "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  \
+             timeout inode ref pointer drops"
+        )
+    } else {
+        String::from(
+            "  sl  local_address                         remote_address                        st \
+             tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n",
+        )
+    }
+}
+
+pub(super) fn udp(namespace: &Arc<NetworkNamespace>, family: u16) -> VfsResult<String> {
+    let actor = current_file_operation_security_credential().ok_or(VfsError::Io)?;
+    let records = diagnostic_records(namespace, false, &actor, 1 << 17)?;
+    let mut out = udp_header(family);
+    for (index, entry) in records
+        .iter()
+        .filter(|entry| entry.family == family && entry.protocol == 17)
+        .enumerate()
+    {
+        let row = row(index, entry);
+        if family == 2 {
+            let _ = writeln!(out, "{:<127}", row.trim_end_matches('\n'));
+        } else {
+            out.push_str(&row);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +135,13 @@ mod tests {
         assert!(header(2).contains("rem_address"));
         assert!(header(10).contains("remote_address"));
         // The wire integer order is fixed by x86_64-only project scope.
+    }
+    #[test]
+    fn udp_header_preserves_linux_family_labels_and_ipv4_width() {
+        assert_eq!(udp_header(2).len(), 128);
+        assert!(udp_header(2).contains("rem_address"));
+        assert!(udp_header(10).contains("remote_address"));
+        assert!(udp_header(10).ends_with("inode ref pointer drops\n"));
     }
     #[test]
     fn row_preserves_live_mandatory_columns_listener_queue_and_timer_rules() {
@@ -148,5 +190,18 @@ mod tests {
         let fields: alloc::vec::Vec<_> = text.split_whitespace().collect();
         assert_eq!(fields[4], "00000000:00000009");
         assert_eq!(fields[5], "00:00000000");
+        entry.protocol = 17;
+        entry.state = 7;
+        entry.timer = 0;
+        entry.send_queue = 6;
+        entry.receive_queue = 19;
+        entry.retransmit_timeouts = 0;
+        entry.probes_sent = 0;
+        let text = row(0, &entry);
+        assert!(text.starts_with("    0:"));
+        let fields: alloc::vec::Vec<_> = text.split_whitespace().collect();
+        assert_eq!(fields[3], "07");
+        assert_eq!(fields[4], "00000006:00000013");
+        assert_eq!(&fields[5..7], &["00:00000000", "00000000"]);
     }
 }

@@ -22,7 +22,7 @@ static void require(int good, const char *name) {
 }
 
 static uint32_t request_cookie;
-static int dump(int family, uint32_t states, ino_t inode, struct inet_diag_msg *out) {
+static int dump_protocol(int family, unsigned protocol, uint32_t states, ino_t inode, struct inet_diag_msg *out) {
     int fd=socket(AF_NETLINK,SOCK_RAW|SOCK_CLOEXEC,NETLINK_SOCK_DIAG);
     require(fd>=0,"diag socket");
     struct timeval timeout={3,0};
@@ -30,7 +30,7 @@ static int dump(int family, uint32_t states, ino_t inode, struct inet_diag_msg *
     struct {struct nlmsghdr header; struct inet_diag_req_v2 request;} query={0};
     query.header.nlmsg_len=sizeof(query);query.header.nlmsg_type=SOCK_DIAG_BY_FAMILY;
     query.header.nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP;query.header.nlmsg_seq=57;
-    query.request.sdiag_family=family;query.request.sdiag_protocol=IPPROTO_TCP;
+    query.request.sdiag_family=family;query.request.sdiag_protocol=protocol;
     query.request.idiag_states=states;
     query.request.id.idiag_cookie[0]=query.request.id.idiag_cookie[1]=request_cookie;
     struct sockaddr_nl kernel={.nl_family=AF_NETLINK};
@@ -50,6 +50,10 @@ static int dump(int family, uint32_t states, ino_t inode, struct inet_diag_msg *
         }
     }
     close(fd);require(done,"diag completion");return found;
+}
+
+static int dump(int family, uint32_t states, ino_t inode, struct inet_diag_msg *out) {
+    return dump_protocol(family,IPPROTO_TCP,states,inode,out);
 }
 
 static int proc_tcp_rows(FILE *file,int family,ino_t inode,struct inet_diag_msg *out) {
@@ -191,13 +195,78 @@ static void check_family(int family, int tools) {
     require(proc_tcp(family,listener_inode,&entry)==0,"proc closed listener retired");
 }
 
+static int proc_udp(int family, ino_t inode, struct inet_diag_msg *out) {
+    FILE *file=fopen(family==AF_INET?"/proc/net/udp":"/proc/net/udp6","r");require(file!=NULL,"proc UDP open");
+    int found=proc_tcp_rows(file,family,inode,out);fclose(file);return found;
+}
+static void udp_fields(int family,int fd,unsigned state,struct inet_diag_msg *diag) {
+    ino_t inode=inode_of(fd);require(dump_protocol(family,IPPROTO_UDP,1U<<state,inode,diag)==1,"UDP diag inode/state discovery");
+    struct inet_diag_msg proc={0};require(proc_udp(family,inode,&proc)==1,"proc UDP inode discovery");
+    require(proc.idiag_state==state && proc.idiag_uid==geteuid() && proc.idiag_inode==diag->idiag_inode &&
+        proc.idiag_rqueue==diag->idiag_rqueue && proc.idiag_wqueue==diag->idiag_wqueue &&
+        !memcmp(&proc.id,&diag->id,36),"proc UDP endpoint state queues owner agreement");
+    require(!diag->idiag_timer && !diag->idiag_expires && !diag->idiag_retrans,"UDP has no TCP retransmission timer");
+}
+static void real_udp_tools(unsigned port) {
+    for(int provider=0;provider<3;provider++) {
+        int pipefd[2];require(!pipe(pipefd),"UDP tool pipe");pid_t child=fork();require(child>=0,"UDP tool fork");
+        if(!child) {
+            close(pipefd[0]);dup2(pipefd[1],STDOUT_FILENO);close(pipefd[1]);
+            if(provider==0)execl("/opt/thekernel-tools/bin/ss","ss","-uanpe",(char *)NULL);
+            else if(provider==1)execl("/opt/thekernel-tools/bin/netstat","netstat","-uanp",(char *)NULL);
+            else execl("/opt/thekernel-tools/bin/busybox","busybox","netstat","-uanp",(char *)NULL);
+            _exit(127);
+        }
+        close(pipefd[1]);char text[16384];size_t length=0;ssize_t n;
+        while(length<sizeof(text)-1 && (n=read(pipefd[0],text+length,sizeof(text)-1-length))>0)length+=n;
+        text[length]=0;close(pipefd[0]);int status;
+        require(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status),"real UDP tool exit");
+        printf("UDP_PROVIDER=%d\n%s",provider,text);char endpoint[32];snprintf(endpoint,sizeof(endpoint),":%u",port);
+        require(strstr(text,endpoint) && strstr(text,"ESTAB"),"real UDP tools active endpoints");
+    }
+}
+static void check_udp(int family,int tools) {
+    int server=socket(family,SOCK_DGRAM|SOCK_CLOEXEC,IPPROTO_UDP),client=socket(family,SOCK_DGRAM|SOCK_CLOEXEC,IPPROTO_UDP);
+    require(server>=0 && client>=0,"UDP sockets");struct inet_diag_msg entry={0};
+    require(dump_protocol(family,IPPROTO_UDP,~0U,inode_of(server),&entry)==0,"unbound UDP omitted");
+    struct sockaddr_storage address={0};socklen_t size;
+    if(family==AF_INET){struct sockaddr_in *a=(void *)&address;a->sin_family=family;a->sin_addr.s_addr=htonl(INADDR_LOOPBACK);size=sizeof(*a);}
+    else {struct sockaddr_in6 *a=(void *)&address;a->sin6_family=family;a->sin6_addr=in6addr_loopback;size=sizeof(*a);}
+    require(!bind(server,(void *)&address,size) && !getsockname(server,(void *)&address,&size),"UDP bound address");
+    unsigned port=family==AF_INET?ntohs(((struct sockaddr_in *)&address)->sin_port):ntohs(((struct sockaddr_in6 *)&address)->sin6_port);
+    udp_fields(family,server,7,&entry);require(!entry.idiag_rqueue && !entry.idiag_wqueue,"empty UDP queue");
+    require(dump_protocol(family,IPPROTO_UDP,1U<<13,inode_of(server),&entry)==0,"UDP not TCP bound-inactive pseudo-state");
+    require(!connect(client,(void *)&address,size),"UDP connect");udp_fields(family,client,1,&entry);
+    require(ntohs(entry.id.idiag_dport)==port,"UDP connected peer port");
+    const char data[]="udp-first",second[]="udp-next";
+    require(send(client,data,sizeof(data),0)==sizeof(data) && send(client,second,sizeof(second),0)==sizeof(second),"UDP queued datagrams");ready(server);
+    udp_fields(family,server,7,&entry);require(entry.idiag_rqueue>=sizeof(data)+sizeof(second),"UDP queue includes all unread datagrams");
+    if(tools)real_udp_tools(port);
+    char bytes[32];require(recv(server,bytes,sizeof(bytes),0)==sizeof(data) && !memcmp(bytes,data,sizeof(data)),"UDP diagnostics preserve first datagram");
+    require(recv(server,bytes,sizeof(bytes),0)==sizeof(second) && !memcmp(bytes,second,sizeof(second)),"UDP diagnostics preserve second datagram");
+    udp_fields(family,server,7,&entry);require(!entry.idiag_rqueue,"UDP queue drained");
+    require(send(client,"corked",6,MSG_MORE)==6,"UDP cork");udp_fields(family,client,1,&entry);require(entry.idiag_wqueue>=6,"UDP cork queue observed");
+    require(send(client,"!",1,0)==1,"UDP cork flush");ready(server);
+    require(recv(server,bytes,sizeof(bytes),0)==7 && !memcmp(bytes,"corked!",7),"UDP cork unchanged by diagnostics");
+    if(namespace_mode && family==AF_INET && !geteuid()) {
+        int ns=open("/proc/self/ns/net",O_RDONLY|O_CLOEXEC);require(ns>=0,"saved UDP namespace");
+        FILE *old=fopen("/proc/net/udp","r");require(old!=NULL,"old UDP file");
+        require(!unshare(CLONE_NEWNET),"new UDP namespace");
+        require(proc_tcp_rows(old,family,inode_of(server),&entry)==1 && proc_udp(family,inode_of(server),&entry)==0,"UDP old file pins namespace fresh file selects new");
+        require(!setns(ns,CLONE_NEWNET),"restore UDP namespace");fclose(old);close(ns);
+    }
+    ino_t inode=inode_of(server);close(server);close(client);
+    require(dump_protocol(family,IPPROTO_UDP,~0U,inode,&entry)==0 && proc_udp(family,inode,&entry)==0,"UDP final close retires endpoint");
+}
+
 int main(int argc,char **argv) {
     alarm(25);int tools=argc==2 && !strcmp(argv[1],"--tools");
     namespace_mode=argc==2 && !strcmp(argv[1],"--namespace");
     check_family(AF_INET,tools);check_family(AF_INET6,tools);
+    check_udp(AF_INET,tools);check_udp(AF_INET6,tools);
     if(!geteuid()) {
         pid_t child=fork();require(child>=0,"uid child");
-        if(!child) {require(!setuid(1000),"unprivileged UID");check_family(AF_INET,0);_exit(0);}
+        if(!child) {require(!setuid(1000),"unprivileged UID");check_family(AF_INET,0);check_udp(AF_INET,0);_exit(0);}
         int status;require(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status),"nonroot socket owner");
     }
     puts("THEKERNEL_SOCKET_DIAG_OK");return 0;

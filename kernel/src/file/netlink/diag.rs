@@ -68,40 +68,84 @@ impl SocketDiagRegistration {
         let Some(socket) = owner.downcast_ref::<crate::file::Socket>() else {
             return Ok(None);
         };
-        // No canonical CLOSED/unbound rows for transports without a provider.
-        let axnet::Socket::Tcp(tcp) = &socket.inner else {
-            return Ok(None);
-        };
-        let snapshot = match tcp.diagnostic_snapshot(nowait) {
-            Ok(snapshot) => snapshot,
-            Err(AxError::WouldBlock) if !nowait => return Ok(None),
-            Err(error) => return Err(error),
+        let (
+            local,
+            peer,
+            state,
+            receive_queue,
+            send_queue,
+            timer,
+            expires_ms,
+            retransmit_timeouts,
+            probes_sent,
+            retransmit_delay_ms,
+            ack_delay_ms,
+        ) = match &socket.inner {
+            axnet::Socket::Tcp(tcp) => {
+                let snapshot = match tcp.diagnostic_snapshot(nowait) {
+                    Ok(snapshot) => snapshot,
+                    Err(AxError::WouldBlock) if !nowait => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                (
+                    snapshot.local,
+                    snapshot.peer,
+                    snapshot.state,
+                    snapshot.receive_queue,
+                    snapshot.send_queue,
+                    snapshot.timer_kind,
+                    snapshot.timer_remaining_ms,
+                    snapshot.retransmit_timeouts,
+                    snapshot.probes_sent,
+                    snapshot.retransmit_delay_ms,
+                    snapshot.ack_delay_ms,
+                )
+            }
+            axnet::Socket::Udp(udp) => {
+                let Some(snapshot) = udp.diagnostic_snapshot(nowait)? else {
+                    return Ok(None);
+                };
+                (
+                    snapshot.local.into(),
+                    snapshot.peer,
+                    if snapshot.peer.is_some() { 1 } else { 7 },
+                    snapshot.receive_queue,
+                    snapshot.send_queue,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            }
+            _ => return Ok(None),
         };
         // Linux TCP dumps do not enumerate anonymous, unbound TCP_CLOSE OFDs.
-        if snapshot.local.port == 0 {
+        if local.port == 0 {
             return Ok(None);
         }
         let (inode, uid) = socket.diag_inode_owner();
         Ok(Some(SocketDiagRecord {
             family: self.family,
             protocol: self.protocol,
-            state: snapshot.state,
+            state,
             cookie: self.cookie,
-            sport: snapshot.local.port,
-            dport: snapshot.peer.map_or(0, |peer| peer.port),
-            src: diagnostic_address(snapshot.local.addr, self.family),
-            dst: diagnostic_address(snapshot.peer.map(|peer| peer.addr), self.family),
+            sport: local.port,
+            dport: peer.map_or(0, |peer| peer.port),
+            src: diagnostic_address(local.addr, self.family),
+            dst: diagnostic_address(peer.map(|peer| peer.addr), self.family),
             ifindex: socket.bound_device_index() as u32,
-            receive_queue: snapshot.receive_queue as u32,
-            send_queue: snapshot.send_queue as u32,
+            receive_queue: receive_queue.min(u32::MAX as usize) as u32,
+            send_queue: send_queue.min(u32::MAX as usize) as u32,
             uid,
             inode,
-            timer: snapshot.timer_kind,
-            expires_ms: snapshot.timer_remaining_ms,
-            retransmit_timeouts: snapshot.retransmit_timeouts,
-            probes_sent: snapshot.probes_sent,
-            retransmit_delay_ms: snapshot.retransmit_delay_ms,
-            ack_delay_ms: snapshot.ack_delay_ms,
+            timer,
+            expires_ms,
+            retransmit_timeouts,
+            probes_sent,
+            retransmit_delay_ms,
+            ack_delay_ms,
         }))
     }
 }
@@ -113,6 +157,7 @@ pub(crate) fn diagnostic_records(
     net_ns: &Arc<NetworkNamespace>,
     nowait: bool,
     actor: &Cred,
+    protocol_mask: u32,
 ) -> AxResult<Vec<SocketDiagRecord>> {
     let uid_map = if nowait {
         actor.user_ns().try_uid_map()?
@@ -131,7 +176,10 @@ pub(crate) fn diagnostic_records(
         registry.retain(|entry| entry.strong_count() != 0);
         let mut entries = Vec::new();
         for entry in registry.iter().filter_map(Weak::upgrade) {
-            if Weak::ptr_eq(&entry.net_ns, &namespace) {
+            if Weak::ptr_eq(&entry.net_ns, &namespace)
+                && entry.protocol < 32
+                && protocol_mask & (1 << entry.protocol) != 0
+            {
                 entries.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                 entries.push(entry);
             }
@@ -151,6 +199,34 @@ pub(crate) fn diagnostic_records(
         }
     }
     Ok(records)
+}
+
+/// Select only admitted dump protocols before endpoint locks are observed.
+/// Incomplete trailing envelopes follow the ordinary receiver's prefix rule.
+pub(crate) fn requested_diagnostic_protocols(data: &[u8]) -> u32 {
+    let mut remaining = data;
+    let mut protocols = 0;
+    while remaining.len() >= size_of::<NlMsgHdr>() {
+        let Ok(header) = read_unaligned::<NlMsgHdr>(remaining) else {
+            break;
+        };
+        let length = header.nlmsg_len as usize;
+        if length < size_of::<NlMsgHdr>() || length > remaining.len() {
+            break;
+        }
+        let payload = &remaining[size_of::<NlMsgHdr>()..length];
+        if header.nlmsg_type == SOCK_DIAG_BY_FAMILY
+            && header.nlmsg_flags & 0x300 != 0
+            && payload.len() == INET_DIAG_REQ_V2_LEN
+            && matches!(payload[1], 6 | 17)
+            && matches!(payload[0] as u32, AF_UNSPEC | AF_INET | AF_INET6)
+        {
+            protocols |= 1 << payload[1];
+        }
+        let consumed = (length.saturating_add(3) & !3).min(remaining.len());
+        remaining = &remaining[consumed..];
+    }
+    protocols
 }
 
 pub(crate) fn register_socket_diag(
@@ -209,14 +285,18 @@ impl InetDiagRequest {
         }
         // Bound TCP_CLOSE sockets are selected by TCPF_BOUND_INACTIVE, while
         // their emitted base-record state remains TCP_CLOSE (Linux 7.2.3).
-        let state = if entry.state == 7 { 13 } else { entry.state };
+        let state = if entry.protocol == 6 && entry.state == 7 {
+            13
+        } else {
+            entry.state
+        };
         if self.states & (1_u32 << state) == 0 {
             return false;
         }
         // In dump mode Linux uses only the port selectors here. Address,
         // interface and cookie selection belongs to bytecode/exact lookup;
         // real ss submits a zero cookie, not INET_DIAG_NOCOOKIE.
-        entry.state == 7
+        (entry.protocol == 6 && entry.state == 7)
             || ((self.sport == 0 || self.sport == entry.sport)
                 && (self.dport == 0 || self.dport == entry.dport))
     }
@@ -225,6 +305,56 @@ impl InetDiagRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task::UserNamespace;
+
+    #[test]
+    fn protocol_admission_uses_only_complete_supported_dump_requests() {
+        let mut frame = vec![0; size_of::<NlMsgHdr>() + INET_DIAG_REQ_V2_LEN];
+        let header = NlMsgHdr {
+            nlmsg_len: frame.len() as u32,
+            nlmsg_type: SOCK_DIAG_BY_FAMILY,
+            nlmsg_flags: 0x300,
+            nlmsg_seq: 1,
+            nlmsg_pid: 0,
+        };
+        write_struct(&mut frame, &header);
+        frame[16] = AF_INET as u8;
+        frame[17] = 6;
+        assert_eq!(requested_diagnostic_protocols(&frame), 1 << 6);
+        let mut batch = frame.clone();
+        frame[17] = 17;
+        batch.extend_from_slice(&frame);
+        batch.extend_from_slice(&[0; 20]);
+        assert_eq!(requested_diagnostic_protocols(&batch), (1 << 6) | (1 << 17));
+        frame[17] = 132;
+        assert_eq!(requested_diagnostic_protocols(&frame), 0);
+        assert_eq!(requested_diagnostic_protocols(&frame[..20]), 0);
+        frame[17] = 17;
+        frame[16] = 1;
+        assert_eq!(requested_diagnostic_protocols(&frame), 0);
+        frame[16] = AF_INET as u8;
+        frame[6..8].fill(0);
+        assert_eq!(requested_diagnostic_protocols(&frame), 0);
+    }
+
+    #[test]
+    fn unrequested_udp_owner_lock_cannot_block_a_tcp_observation() {
+        let _context = crate::test_support::scheduler_test_context();
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns.clone()).unwrap();
+        let actor = Cred::try_root(user_ns).unwrap();
+        let udp = register_socket_diag(&net_ns, AF_INET as u16, 17).unwrap();
+        let _held = udp.owner.lock();
+        assert!(
+            diagnostic_records(&net_ns, true, &actor, 1 << 6)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            diagnostic_records(&net_ns, true, &actor, 1 << 17),
+            Err(AxError::WouldBlock)
+        ));
+    }
 
     fn record() -> SocketDiagRecord {
         SocketDiagRecord {
@@ -248,6 +378,27 @@ mod tests {
             retransmit_delay_ms: 1000,
             ack_delay_ms: 10,
         }
+    }
+
+    #[test]
+    fn udp_close_state_is_not_tcp_bound_inactive_and_ports_are_filtered() {
+        let mut bytes = [0; INET_DIAG_REQ_V2_LEN];
+        bytes[0] = AF_INET as u8;
+        bytes[1] = 17;
+        let mut request = InetDiagRequest::parse(&bytes).unwrap();
+        let mut entry = record();
+        entry.protocol = 17;
+        entry.state = 7;
+        request.states = 1 << 13;
+        assert!(!request.matches(&entry));
+        request.states = 1 << 7;
+        assert!(request.matches(&entry));
+        request.sport = entry.sport + 1;
+        assert!(!request.matches(&entry));
+        request.sport = entry.sport;
+        entry.state = 1;
+        request.states = 1 << 1;
+        assert!(request.matches(&entry));
     }
 
     #[test]

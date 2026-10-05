@@ -34,6 +34,10 @@ use crate::{
     wrapper::Transport,
 };
 
+#[path = "udp_diag.rs"]
+mod diag;
+pub use diag::UdpDiagnosticSnapshot;
+
 /// Metadata for an asynchronous network error, independent of Linux wire ABI.
 #[derive(Clone, Copy, Debug)]
 pub struct UdpError {

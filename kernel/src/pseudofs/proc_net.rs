@@ -18,7 +18,7 @@ use super::{
 };
 use crate::task::{AsThread, NetworkNamespace};
 
-const CHILDREN: [&[u8]; 4] = [b"dev", b"route", b"tcp", b"tcp6"];
+const CHILDREN: [&[u8]; 6] = [b"dev", b"route", b"tcp", b"tcp6", b"udp", b"udp6"];
 const ROUTE_HEADER: &str =
     "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT";
 
@@ -134,6 +134,12 @@ impl SimpleDirOps for NetDir {
                 let family = if name.as_bytes() == b"tcp" { 2 } else { 10 };
                 Ok(SimpleFile::try_new_regular_with_open_credential(self.fs.clone(), move || {
                     super::proc_inet::tcp(&namespace, family)
+                })?.into())
+            }
+            b"udp" | b"udp6" => {
+                let family = if name.as_bytes() == b"udp" { 2 } else { 10 };
+                Ok(SimpleFile::try_new_regular_with_open_credential(self.fs.clone(), move || {
+                    super::proc_inet::udp(&namespace, family)
                 })?.into())
             }
             _ => Err(VfsError::NotFound),

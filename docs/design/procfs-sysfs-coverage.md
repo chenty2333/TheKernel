@@ -796,3 +796,47 @@ rows and unread queues. This corrects the earlier provider assumption without
 claiming net-tools' one-digit-inode PID display passes. Host Linux C endpoint
 probe, kernel2611 tests and q35 lint pass (784 existing warnings). This item
 changes acceptance tests/documentation only; runtime behavior stays unchanged.
+
+### B1 follow-up32: live UDP/UDP6 observation
+
+UDP adds read-only diagnostic snapshots using cork → transition → socket-set
+lock order, matching send/autobind. It does not poll, drain datagrams or take
+pending asynchronous errors. Unbound endpoints are omitted; bound/unconnected
+state7 and connected state1 use Linux state masks, not TCP's inactive bit13.
+Namespace/open-credential UID mapping and real socket inode are reused. UDP
+has no TCP timer/retry state, so the corresponding Linux columns are zero.
+`/proc/net/udp{,6}` exposes the mandatory endpoint/queue/owner columns, and
+inet_diag admits UDP dumps; exact lookup and bytecode remain unsupported.
+
+Native UDP queue observation is occupied payload-ring bytes (including actual
+ring wrap padding) plus corked transmit payload length. It is deliberately not
+a guessed Linux skb truesize. Zero-length datagrams can therefore have zero
+native payload queue bytes; no socket-object memory or skb overhead is invented.
+Linux reference/pointer/drop tail fields are not yet supplied, despite preserving
+the Linux header labels; full row coverage is not claimed. UNIX/SNMP remain
+missing and full netstat -tunap remains unaccepted. Paired C probes cover bound/
+connected masks, all unread datagrams, non-consuming repeated reads, real cork,
+retirement and open-file namespace pinning. Validation results will be appended.
+
+Follow-up32 validation: axnet216 tests (one existing ignore), kernel2614 tests,
+KVM guest67/67 without skips/normal shutdown (system-bnr0ao5n), ABI257/257 on
+both guests (abi-35ffdyy8), and actual signed Alpine ss/net-tools/BusyBox UDP
+views (shell-qakyurkw, DIAG_TOOLS_RC=0) pass. IPv4/IPv6 show real19 occupied
+payload bytes for the two queued datagrams and their owning PID. Cork and
+post-observation receive content are asserted, not inferred from exit alone.
+
+Review caught cross-protocol coupling before commit: the initial all-transport
+snapshot could wait for unrelated UDP cork locks during a TCP query. Proc files
+now select their protocol before endpoint observation; netlink preflights the
+supported dump protocols in the whole valid datagram prefix before any reply
+is queued. Host regression holds a UDP owner lock: TCP NOWAIT succeeds while
+UDP NOWAIT correctly returns WouldBlock. Mixed/padded/invalid request selection
+is covered. The runtime/ABI/tool runs above include this fix. A later unused
+argument deletion and UDP-header helper extraction are behavior-equivalent;
+related kernel/formatter tests and lint are rerun after those cleanups. UDP's
+proc slot is the native registry iteration index, not a claim of Linux hash
+bucket identity. Full UDP tail and UNIX/SNMP coverage remain incomplete.
+
+Final equivalent-cleanup checks: kernel2615 tests, including UDP header/row
+formatter coverage, and q35 lint pass; unused argument removal restores784
+existing warnings. No runtime protocol behavior changed in this cleanup.
