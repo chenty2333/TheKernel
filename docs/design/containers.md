@@ -244,10 +244,35 @@ placement lock to the new root when pivoting; repair this observed lifecycle
 before attempting crun. The noninteractive bwrap script is staged, but its
 success marker has not occurred and is not recorded as passed.
 
+### Level 2: pivot placement custody and real bwrap accepted
+
+The observed old-root unmount EINVAL came from retained placement custody:
+Linux pivot transfers MNT_LOCKED to the new visible root and clears it on the
+old root. VFS now performs that sole structural transfer under its tree writer
+at the infallible edge-swap boundary, with no public unlock API. The prepared
+namespace ledger mirrors both mounts' placement state atomically. Attribute
+floors remain with their own mounts; pivot does not remove those restrictions.
+A locked new pivot root remains inadmissible.
+
+Validated: affected VFS and kernel2632 host tests; q35 lint784; system70/70
+(`system-yh57drsd`); paired mount-api11/11 (`abi-d3v_3u5r`). The real mapped-user
+namespace fixture cannot detach the new protected root but can detach/rmdir its
+old root after pivot. The initial Linux fixture omitted uid/gid mappings and
+failed mkdir; it was corrected, not counted as a kernel pass. VFS tests also
+establish old-root detach while retaining the new boundary lock.
+
+Real signed bwrap0.12.0 now runs the minimal BusyBox shell/commands, refuses
+writes to readonly root/fixture, writes private tmpfs, changes hostname, and
+has distinct user/mount/PID/net/UTS/IPC identities. It emits KTAP and exits0
+(`shell-g1g1ef7d`). Level2 is accepted; proceed to crun and real cgroup limits.
+The formal runner's actual staged loader/fixture/offline image were verified;
+an earlier manual staging-tree assertion used a stale tree, not the runner's
+payload, and is not a claim of an absent guest loader.
+
 ## Tool acceptance ladder
 
 1. util-linux unshare/nsenter: passed, noninteractive signed-tool guest regression.
-2. bubblewrap read-only bind/tmpfs isolation: pending; requires level 1.
+2. bubblewrap read-only bind/tmpfs and six-namespace isolation: passed.
 3. crun busybox OCI bundle and actual memory/pids enforcement: pending; requires level 2.
 4. offline rootless podman with `--network=none`: pending; requires level 3.
 

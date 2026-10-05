@@ -3943,7 +3943,20 @@ pub fn pivot_root_and_records(
         record.expire_epoch = None;
     }
     commit_mount_mutation(plan)?;
-    let publication = prepare_current_record_publication(&records)?;
+    let mut publication = prepare_current_record_publication(&records)?;
+    if root_mount.is_placement_locked()
+        && let Some(prepared) = publication.as_mut()
+    {
+        // Mirror the VFS pivot-only transfer in the same prepared ledger.
+        // Attribute floors stay with their mounts; only placement custody
+        // moves from the old visible root to the new visible root.
+        let old = prepared.next.mounts.iter_mut().find(|m| m.id == root_mount.mount_id())
+            .ok_or(AxError::Io)?;
+        old.locked = false;
+        let new = prepared.next.mounts.iter_mut().find(|m| m.id == new_mount.mount_id())
+            .ok_or(AxError::Io)?;
+        new.locked = true;
+    }
     if let Some(publication) = &publication {
         publication.validate_epoch()?;
     }

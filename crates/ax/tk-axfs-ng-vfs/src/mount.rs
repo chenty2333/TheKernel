@@ -1923,6 +1923,9 @@ impl Location {
         }
 
         let _tree = mount_tree_write();
+        if new_root.placement_locked.load(Ordering::Acquire) {
+            return Err(VfsError::InvalidInput);
+        }
         if new_root.unmounting.load(Ordering::Acquire)
             || old_root.unmounting.load(Ordering::Acquire)
         {
@@ -2026,6 +2029,14 @@ impl Location {
             .lock()
             .insert(put_old_key, old_root.clone());
         *old_root.location.lock() = Some(MountLocation::new(put_old));
+        // Pivot keeps the namespace boundary locked at its new visible root,
+        // while the old root becomes detachable. This is the sole structural
+        // transfer, not a user-toggleable unlock operation; all fallible
+        // preparation and both edge swaps have completed under the writer.
+        if old_root.placement_locked.load(Ordering::Acquire) {
+            new_root.placement_locked.store(true, Ordering::Release);
+            old_root.placement_locked.store(false, Ordering::Release);
+        }
         Mountpoint::refresh_subtree_handles_locked(&new_subtree);
         Mountpoint::refresh_subtree_handles_locked(&old_subtree);
         Ok(())
@@ -2569,6 +2580,28 @@ mod tests {
                 .unwrap()
                 .same_mount(&old_root)
         );
+    }
+
+    #[test]
+    fn pivot_root_transfers_inherited_placement_lock_without_unlocking_new_boundary() {
+        let underlay_fs = Filesystem::new(LookupTestFs::new(50));
+        let underlay = Mountpoint::new_root(&underlay_fs);
+        let old_fs = Filesystem::new(LookupTestFs::new(100));
+        let old = Mountpoint::new_detached(&old_fs).unwrap();
+        old.attach_to(&underlay.root_location()).unwrap();
+        let old_root = old.root_location();
+        let target = old_root.lookup_no_follow_in_mount(FsName::new(b"child")).unwrap();
+        let next_fs = Filesystem::new(LookupTestFs::new(200));
+        let next = target.mount(&next_fs).unwrap();
+        let next_root = next.root_location();
+        let put_old = next_root.lookup_no_follow_in_mount(FsName::new(b"child")).unwrap();
+        old.lock_placement();
+        next_root.pivot_root_to(&old, &put_old).unwrap();
+        assert!(!old.is_placement_locked());
+        assert!(next.is_placement_locked());
+        old_root.lazy_unmount().unwrap();
+        assert!(next.is_attached());
+        assert!(next.is_placement_locked());
     }
 
     #[test]

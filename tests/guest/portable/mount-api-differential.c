@@ -440,6 +440,50 @@ static int write_quota_file(const char *path) {
     return first == (ssize_t)sizeof(block) && second == (ssize_t)sizeof(block) ? 0 : -1;
 }
 
+static void pivot_inherited_lock_case(void) {
+    fflush(stdout);
+    pid_t child = fork();
+    check(child >= 0, "pivot-lock-probe-fork");
+    if (child == 0) {
+        uid_t uid = getuid(); gid_t gid = getgid();
+        if (syscall(272, 0x10000000UL | 0x00020000UL) != 0) _exit(90);
+        char map[96];
+        int mapping = open("/proc/self/uid_map", O_WRONLY | O_CLOEXEC);
+        int bytes = snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)uid);
+        if (mapping < 0 || write(mapping, map, (size_t)bytes) != bytes) _exit(98);
+        close(mapping);
+        mapping = open("/proc/self/setgroups", O_WRONLY | O_CLOEXEC);
+        if (mapping < 0 || write(mapping, "deny", 4) != 4) _exit(99);
+        close(mapping);
+        mapping = open("/proc/self/gid_map", O_WRONLY | O_CLOEXEC);
+        bytes = snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)gid);
+        if (mapping < 0 || write(mapping, map, (size_t)bytes) != bytes) _exit(100);
+        close(mapping);
+        if (syscall(NR_MOUNT, "tmpfs", target_path, "tmpfs", 0, "mode=755") != 0) _exit(91);
+        char oldpath[sizeof(target_path) + 8];
+        snprintf(oldpath, sizeof(oldpath), "%s/old", target_path);
+        if (mkdir(oldpath, 0700) != 0) _exit(92);
+        if (syscall(NR_PIVOT_ROOT, target_path, oldpath) != 0) _exit(93);
+        if (chdir("/") != 0) _exit(94);
+        errno = 0;
+        if (syscall(NR_UMOUNT2, "/", MNT_DETACH) != -1 || errno != EINVAL) _exit(95);
+        if (syscall(NR_UMOUNT2, "/old", MNT_DETACH) != 0) _exit(96);
+        if (rmdir("/old") != 0) _exit(97);
+        _exit(0);
+    }
+    if (child > 0) {
+        int status = 0;
+        pid_t waited = waitpid(child, &status, 0);
+        fprintf(stderr, "PIVOT_WAIT child=%d waited=%d raw=%d errno=%d\n", child, waited, status, errno);
+        check(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "pivot-transfers-lock-new-boundary-remains-protected");
+        if (!WIFEXITED(status) || WEXITSTATUS(status))
+            fprintf(stderr, "PIVOT_LOCK_CHILD raw=%d exited=%d code=%d signal=%d\n", status,
+                    WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                    WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    }
+}
+
 static void fs_context_userns_case(void) {
     int inherited = (int)syscall(NR_FSOPEN, "tmpfs", FSOPEN_CLOEXEC);
     check(inherited >= 0, "parent-owned-fs-context");
@@ -1003,6 +1047,8 @@ int main(void) {
     mark("LOOKUP_DIRECTORY_NEW_ROOT");
     ERROR(syscall(NR_PIVOT_ROOT, "/", file_path), ENOTDIR, "file-put-old");
     mark("LOOKUP_DIRECTORY_PUT_OLD");
+    pivot_inherited_lock_case();
+    mark("INHERITED_PLACEMENT_LOCK_TRANSFER");
     done();
 
     /* 300: SYSCALL_DEFINE2(fanotify_init) capability-checks the privileged
