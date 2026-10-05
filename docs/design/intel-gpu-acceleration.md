@@ -1,0 +1,92 @@
+# ADL-N GPU 加速路线评估
+
+2026-10-05；D4 的路线评估，**实现尚未完成、未在硬件上验证**。
+以本地 Linux 7.2.3 和已缓存 Mesa 26.1.2 源码为准；不把版本外的行为
+当作承诺。显示 D2 的 TC1 安全状态/回滚尚未完成，不能现在启用 GT。
+
+## 不可混淆的边界
+
+- `iris` 是 Mesa Gallium/OpenGL 驱动；Vulkan 使用 `ANV`，不是“iris
+  的 Vulkan”。Weston 有 EGL/OpenGL 不代表 Vulkan 或浏览器已加速。
+- 现有 `render.rs` 是 virtio/virgl uAPI，不能冒充 i915/xe。现有
+  `GemBacking::shared_pages`、PRIME、syncobj 和 fence 可复用上层 ownership，
+  但不具备 Intel VM、LR context、引擎调度、reset 或 GPU cache 契约。
+- BCS copy/fill 不等于 alpha blending/shader 渲染，更不证明 Mesa 可运行。
+  首阶段内核自有 bounded copy 的成功不能宣称 execbuf uAPI 完成。
+- i915 显示 ADL-N 是 ADL-P 子平台；**GuC 选择不同**。本地
+  `i915/gt/uc/intel_uc_fw.c::__uc_fw_auto_select` 为 ADL-N 改选 ADL-S，
+  因为 ADL-N 无 HWConfig，不能使用可能读取 HWConfig 的 ADL-P GuC。
+  N305/i915 目标是 `i915/tgl_guc_70.bin`，HuC 是 `i915/tgl_huc.bin`。
+  xe 也有 ALDERLAKE_N→tgl GuC 的明确表项（最低版本选择另行核对）。
+
+- **Display stepping 与 GT stepping 是不同表**。本地
+  `i915/display/intel_display_device.c` 的 ADL-N revision0→display D0，
+  但 `i915/intel_step.c::adlp_n_revids` 对 revision0 使用 graphics/media A0。
+  新显示 crate 的 `Step::D0` 绝不能拿来选择 GT/engine workarounds。
+
+## 路线比较（工作量为评估，不是测得的交付日期）
+
+| 路线 | 工作量/主要依赖 | Mesa/uAPI | 优点和风险 |
+|---|---|---|---|
+| Rust 忠实翻译 i915 gt/gem | 本地 C/H 输入 gt 94274行（226文件）、gem30587行（65文件），实际裁剪后仍是数万行；forcewake、GT电源/uncore、WA、48-bit PPGTT/39-bit DMA、LR context/execlists 或 GuC、GEM/execbuf、hangcheck/reset、cache/coherency、dma-resv/fence | i915 QUERY/GETPARAM、GEM_CREATE/CREATE_EXT、MMAP/MMAP_OFFSET、SET_DOMAIN/SET_CACHING、GEM_CONTEXT_CREATE_EXT/SETPARAM/DESTROY、EXECBUFFER2、WAIT/BUSY/MADVISE、reset stats、PRIME 与 syncobj/timeline | 与当前 Rust 架构和 i915 ADL-N成熟路径最接近；可逐函数核对，但最大风险是裁剪漏 WA 和伪造 ABI 功能支持 |
+| Rust 翻译 xe | 新 VM_BIND/exec queue 模型较清晰，但还要 GuC CT/ADS/context registration/submission/reset、VM residency、async fences、scheduler/TTM/BO管理，工作量仍数万行 | XE_DEVICE_QUERY/GEM_CREATE/GEM_MMAP_OFFSET/VM_CREATE/VM_BIND/VM_DESTROY/EXEC_QUEUE_CREATE/DESTROY/EXEC/WAIT_USER_FENCE、syncobj与GPU用户fence | Mesa26.1.2 iris有xe backend；但Linux7.2.3 `xe_pci.c::adl_n_desc` 明确 `require_force_probe=true`，不是已支持的默认路径；不是“现代所以无需大量内核依赖” |
+| C i915/xe + LinuxKPI | C 驱动本身减少手译，但需完整 kernel API 兼容：锁/RCU/workqueue/timer、PCI/DMA/runtime PM、memory mapping/shmem/TTM、DRM核心、fence/dma-resv、interrupt、ACPI等；当前仓库没有这层 | 原生 C 驱动 uAPI，前提是 ioctl/mmap/PRIME/sync/copy-user 都可正确桥接 | FreeBSD [drm-kmod](https://github.com/freebsd/drm-kmod)确实使用LinuxKPI，证明模式成熟，不证明TheKernel已有足够KPI；许多依赖许可需单独审核。为这一GPU建立另一套内核对象体系代价很高 |
+
+uAPI 清单来自本地 Mesa 26.1.2 `src/gallium/drivers/iris/{i915,xe}/`
+及 `src/intel/{common,dev}/`，不是仅按 Linux header 猜“返回 0 就可用”。
+完整 ABI 仍需按用户程序实际 ioctl 请求的 flags/extensions/query 项逐条核对。
+`execbuf` 不可接受未校验用户指针/对象数组，unsupported flags 要返回错误。
+
+## 推荐及有序实现门槛
+
+选择 **Rust/i915，先最小 BCS execlists，之后扩展 i915 GEM/execbuf + RCS，
+GuC 独立阶段**。不同时做 xe、LinuxKPI 或版本兼容层。理由是已有 i915
+显示基线、Rust ownership 与退役机制，且 Linux 默认 ADL-N 支持比 xe
+force_probe 更适合当 authority。execlists 首阶段是受限实验路径，不是
+声称复制了 Linux ADL-P 默认 GuC submission。达到 Mesa 支持前，不能向
+GETPARAM/QUERY 谎报 softpin/context VM/timeline sync/reset 能力。
+
+1. 完成显示 TC1 的只读 inventory、完整 hidden PHY/PLL/power 恢复、稳定
+   console/scanout 验证。GT 默认关闭，设置 `intel.gt=1` 仍只能在实现完
+   相应 admission 后生效；不要先添一个“开启”参数而接到半成品写路径。
+2. 移植 ADL-N forcewake domain 引用和 bounded ACK、GT runtime power、uncore
+   保存/恢复与 stepping WA。已读到 ACK 不是拥有 forcewake。无超时退路
+   就不准写引擎寄存器；先实现 engine/GT reset、request fault retirement。
+3. 系统 pinned pages + 39-bit DMA 验证，GGTT 分配与固件显示不重叠，48-bit
+   PPGTT 四级页表/scratch/error entries、TLB/cache invalidation。reset 后
+   不确定 DMA retired 时保留 owners，不免费页。
+4. 移植 `intel_engine_cs.c`, `intel_lrc.c`, `intel_context.c`, `intel_ring.c`,
+   `intel_execlists_submission.c` 的 BCS0 必需分支。单 context/request，
+   bounded breadcrumb wait。ring/HWSP/LRC地址与context descriptor全部验界。
+5. 编码匹配 generation 的 copy/fill，校验尺寸/format/pitch/extent/overlap。
+   用 disposable BO+redzones 做精确字节比较，挂死/close/cancel/reset时仍保
+   活依赖。不能先把用户任意 batch 塞进 privileged BCS。
+6. 接入 per-file `IntelGemBacking` + context/VM registry + execbuf object
+   validation、dma-buf reservation fences、CPU/GPU cache ownership。现有
+   GEM handle/PRIME alias 保持同一 backing Arc；mmap token 不泄漏物理地址。
+   fence signal 只在真实 breadcrumb或已确认reset retirement时发生。
+7. RCS 引擎/工作区/WA/context-state，按 Mesa实际调用完成 QUERY/GETPARAM/
+   contexts/EXECBUFFER2 flags、共享 syncobj timeline、poll 和错误/reset stats。
+   真正运行未修改 `eglinfo`、OpenGL三角形/Weston EGL和ANV `vulkaninfo` 后，
+   才分别报告加速成功；QEMU不能验证Intel执行。
+8. GuC 固件解析/验证/authentication、ADS/CT队列、registration/scheduling/
+   reset/hangcheck作为同一路线的后续实现，不要以填几个uAPI结构代替它。
+
+## 固件和许可登记
+
+已从主机 linux-firmware 的同名 `.xz` 解压到用户指定外部 refs 目录：
+`tgl_guc_70.bin`、`tgl_huc.bin`、以及比较用的 `adlp_guc_70.bin`；同时保留
+主机 `/usr/share/licenses/linux-firmware/LICENSE.i915`，登记在 refs/INDEX.md。
+它们是 Intel 的**二进制固件许可，不是 MIT**；不能改固件或给它换成 crate
+许可。没有进 Git、没有打包进内核、没有加载。i915 Linux 7.2.3 首选 tgl
+GuC 70 系列最低表项为70.12.1；使用前还须检查当前CSS版本/长度/签名和认证
+失败路径，外部文件存在并不证明满足要求。HuC 是媒体认证，不是普通BCS复制
+或OpenGL的硬前提。DMC仅显示电源管理，与GT固件分别加载和退役。
+
+## 当前实现状态
+
+只有现有只读 GT probe、已翻译的显示 identity/VBT/OpRegion/timing slice。
+**本轮还没有 forcewake owner、PPGTT、LRC/execlists、GPU reset、BCS/RCS提交
+或 i915/xe执行 uAPI**。这些是待实现项，不是因QEMU没有GPU就可跳过的源码
+任务；模拟MMIO、页表/命令编码和状态机测试仍然需要继续做。QEMU/host验证
+不能替代真机reset、DMA隔离、copy字节或实际Mesa执行。

@@ -549,6 +549,13 @@ boot admission additionally requires the characterized `8086:46d0` exact D0,
 not merely a family ID. This changes no default MMIO write policy and does
 not assert the stepping/workaround/TC hardware port is complete.
 
+GT route assessment consulted local Linux 7.2.3 `i915/intel_step.c` (ADL-N
+revision0 graphics/media A0, distinct from display D0), `gt/uc/intel_uc_fw.c`
+(ADL-N selects tgl GuC via the ADL-S override), xe device/firmware tables, and
+cached Mesa 26.1.2 iris i915/xe backends. No GT/HDA code was translated by that
+assessment. The FreeBSD LinuxKPI route reference is the upstream drm-kmod
+repository linked from `docs/design/intel-gpu-acceleration.md`.
+
 The 2026-10-05 re-scan finds **one** new normalized code-line match in
 `tk-intel-display/tests/upstream_clock.rs`: the conventional C `ARRAY_SIZE`
 sizeof expression in the original oracle shim. It adds no fenced/prose quote.

@@ -245,8 +245,13 @@ Each has original attribution and the crate's permission-text reference.
 Tests may compile local MIT source into temporary host oracles; no Linux C
 source or firmware is added to the repository by that testing workflow.
 
-Temporary compiled MIT oracle copies also carry the complete crate permission
-text and all source copyrights; they are removed when each test completes.
+GT firmware assessment inputs (not part of the repository/product): the external
+refs directory contains host linux-firmware `tgl_guc_70.bin`, `tgl_huc.bin` and
+comparison-only `adlp_guc_70.bin` with `LICENSE.i915`. These are Intel binary
+firmware under that separate grant, not MIT and not loaded. N305's i915 GuC
+selection follows its ADL-N→ADL-S override (tgl, not adlp). Temporary C oracle
+copies carry the complete crate MIT grant/source copyrights and are removed
+when the test completes. No GPL HDA/GT translation is shipped in this work.
 
 The conventional host-oracle `ARRAY_SIZE` sizeof expression produces one
 additional scanner code-line match at thresholds25/40, not a copied prose block
