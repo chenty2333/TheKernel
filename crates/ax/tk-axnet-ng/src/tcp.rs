@@ -28,6 +28,10 @@ use crate::{
     state::*,
 };
 
+#[path = "tcp_diag.rs"]
+mod diag;
+pub use diag::TcpDiagnosticSnapshot;
+
 pub(crate) fn new_tcp_socket() -> AxResult<smol::Socket<'static>> {
     Ok(smol::Socket::new(
         smol::SocketBuffer::new(try_zeroed_socket_buffer(TCP_RX_BUF_LEN)?),
@@ -1042,6 +1046,19 @@ mod tests {
             panic!("TCP expected")
         };
         (stack, client, server)
+    }
+
+    #[test]
+    fn diagnostics_use_accepted_connection_tuple_and_do_not_consume_bytes() {
+        let (stack, client, server) = connected_pair_for_reset();
+        // Incoming children do not populate this optional bind-admission field.
+        assert_eq!(server.with_smol_socket(|socket| socket.get_bound_endpoint().port), 0);
+        assert_eq!(client.send(&b"diag-bytes"[..], SendOptions::default()), Ok(10));
+        for _ in 0..16 { stack.poll_interfaces(); }
+        let snapshot = server.diagnostic_snapshot(false).unwrap();
+        assert_eq!((snapshot.state, snapshot.local.port, snapshot.peer.unwrap().port), (1, 32492, 32493));
+        assert_eq!(snapshot.receive_queue, 10);
+        assert_eq!(server.with_smol_socket(|socket| socket.recv_queue()), 10);
     }
 
     #[test]

@@ -125,6 +125,21 @@ impl ListenTable {
         &self.tcp[port as usize]
     }
 
+    pub(crate) fn diagnostic_backlog(
+        &self,
+        port: u16,
+        sockets: &SocketSet<'_>,
+        nowait: bool,
+    ) -> AxResult<(usize, usize)> {
+        let entry = if nowait {
+            self.listen_entry(port).try_lock().ok_or(AxError::WouldBlock)?
+        } else {
+            self.listen_entry(port).lock()
+        };
+        let entry = entry.as_ref().ok_or(AxError::WouldBlock)?;
+        Ok((entry.syn_queue.iter().filter(|&&handle| is_connected(handle, sockets)).count(), entry.queue_limit))
+    }
+
     pub(crate) fn can_accept(&self, port: u16, socket_set: &SocketSetWrapper) -> AxResult<bool> {
         let sockets = socket_set.inner.lock();
         if let Some(entry) = self.listen_entry(port).lock().as_ref() {

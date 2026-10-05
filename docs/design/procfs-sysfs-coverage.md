@@ -31,7 +31,7 @@
 | `lspci -vvv`, `-k`, `-t` | bus/pci/devices/BDF/{vendor,device,class,revision,subsystem_vendor,subsystem_device,config,resource,irq,driver,numa_node,modalias,msi_irqs}；drivers 和真实父级 | 只有显示/输入路径发布部分 PCI 身份；没有完整 PCI 枚举、只读配置空间、BAR 资源/driver 树 |
 | `lsusb` | bus/usb/devices/*/{busnum,devnum,descriptors,product,speed,subsystem}；usbfs | 通用 USB sysfs 枚举缺失，不能用空目录假装支持 |
 | 主机 iproute2 `ip -s link` | rtnetlink，不直接读取 proc/sys | 主机成功；需核对 guest rtnetlink 计数与 sysfs statistics 共用来源 |
-| `ss -tanp` | SOCK_DIAG netlink，PID fd/链接/cmdline；回退 proc/net/tcp* | SOCK_DIAG 支持情况待验；PID fd 已有；net/tcp* 缺失 |
+| `ss -tanp` | SOCK_DIAG netlink，PID fd/链接/cmdline；回退 proc/net/tcp* | TCP基本SOCK_DIAG真实端点/队列/PID/inode已验；高级extensions未验；net/tcp* 缺失 |
 | `netstat -tunap` | proc/net/{tcp,tcp6,udp,udp6}、PID fd/cmdline | net 仅 dev；协议连接表缺失 |
 
 主机上述命令除特别标注者均退出 0。项目 BusyBox 从已构建 rootfs 中提取后
@@ -460,3 +460,56 @@ actual RTA_DST values and rejects host bits. Kernel2601, lint, guest64/64
 no guest skips. Real ip -4 route and netstat -rn now agree on 127.0.0.0/8 and the
 actual default gateway (shell-rzzrswu8). Socket tables/real ss snapshots remain
 unimplemented; this is route-view acceptance only.
+
+### Live TCP diagnostic base records
+
+The SOCK_DIAG provider now observes actual TCP sockets rather than emitting a
+canonical CLOSED/unbound placeholder for every registered inet OFD. The socket
+retains a lifetime token; the registry and token hold weak references only.
+Registration is attached after Arc publication, including accepted inet sockets.
+The dump copies namespace-local tokens, releases the registry, then observes
+transports under socket-set -> listener-entry ordering. It does not poll,
+acknowledge, or consume queues. NOWAIT uses try-locks for registry, owner,
+UID-map and transport observations before any reply enqueue. A concurrent wrapper
+transition is omitted by a blocking dump, or reports WouldBlock to NOWAIT.
+
+Linux 7.2.3 inet_diag/tcp_diag and tcp_states are the behavioral references:
+state masks use `1 << state` (zero selects nothing). Bound inactive sockets are
+selected by pseudo-state 13 but emit TCP_CLOSE=7; anonymous unbound TCP_CLOSE
+OFDs are not enumerated. IPv4/IPv6 endpoint bytes and network-order ports, actual
+SO_BINDTODEVICE index, TCP state, receive/send queue bytes, listener completed
+accept entries/backlog limit, UID mapped through the requesting user namespace,
+and actual socket pseudo-inode are serialized in the 72-byte base record.
+The lifetime cookie is distinct from the inode; a dump does not use request
+cookie/address/interface fields as exact-lookup filters. Queue capacity is the existing
+transport's admitted bound, not a fabricated Linux default.
+
+Partial: this does not cover orphaned/TIME-WAIT endpoints after final OFD close,
+SYN-queue child records, TCP diagnostic bytecode, exact non-dump lookup (both explicitly rejected), timer/
+retransmission base fields or optional extensions. Timer/retransmission fields
+remain zero pending actual provider data, not accepted as Linux-equivalent
+observations. UDP/raw/DCCP/SCTP dumps now reject EOPNOTSUPP rather than publish
+fake endpoints. /proc socket tables and SNMP remain pending. No physical network
+or performance acceptance is claimed.
+
+The same socket-diag C regression passes on host Linux: IPv4/IPv6 LISTEN and
+ESTABLISHED, bound-inactive selection, adjacent/zero state masks, actual fstat
+inode/owner, pending accept count, unread byte count and nonconsumption, queue
+drain and closed-listener retirement. It also exercises a UID1000 creator when
+running as root. Guest KTAP and signed Alpine ss -tanpe acceptance are pending;
+these are not marked passed merely because host formatting tests passed.
+
+Final TCP base-record validation: net crate213 (one preexisting ignored test),
+kernel2603, lint (784 existing warnings), KVM guest65/65 without skips and normal
+shutdown (system-ss1gvq3z), and full ABI257/257 (abi-szushf_d) passed. The accepted
+connection regression caught and repaired a new snapshot error: use the real
+connection tuple before optional bind-admission metadata, which is empty for
+accepted children. The actual Alpine ss also caught an old dump-cookie filter:
+it submits zero cookies, and Linux does not use them for dump exact selection.
+The C probe now tests zero and arbitrary dump cookies on both Linux and guest.
+
+Actual signed Alpine ss -tanpe displays IPv4/IPv6 LISTEN and ESTAB, the server's
+16 unread bytes, admitted listener backlog4, and the parent's actual PID/fd and
+inode (shell-k0mycr4k, DIAG_TOOLS_RC=0). This is active TCP base-record acceptance,
+not acceptance of missing proc TCP/UDP tables, unsupported diagnostic transports,
+or timers/advanced filters/orphan states. Contract progress counts are unchanged.

@@ -226,6 +226,9 @@ fn prepare_new_socket_arc(
     socket: Arc<dyn FileLike>,
     nonblocking: bool,
 ) -> AxResult<PinnedSocketDescription> {
+    if let Some(network) = socket.downcast_ref::<Socket>() {
+        network.attach_diag_owner(&socket);
+    }
     if nonblocking {
         socket.set_nonblocking(true)?;
     }

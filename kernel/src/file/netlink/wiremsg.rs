@@ -60,18 +60,24 @@ fn netlink_message(
 pub(crate) fn sock_diag_message(
     request: &NlMsgHdr,
     port_id: u32,
-    entry: &SocketDiagRegistration,
+    entry: &SocketDiagRecord,
     extensions: u8,
 ) -> Vec<u8> {
-    // `inet_diag_msg`: family/state/timer/retrans, inet_diag_sockid, then
-    // expires/rqueue/wqueue/uid/inode.  Addresses and queues are zero until
-    // the transport exposes its bind/connect snapshot; identity, protocol
-    // selection and lifecycle are nevertheless the actual live OFD record.
+    // Linux inet_diag_msg base record; ports/address bytes retain wire order.
     let mut payload = vec![0_u8; 72];
     payload[0] = entry.family as u8;
-    payload[1] = entry.diag_state();
+    payload[1] = entry.state;
+    payload[4..6].copy_from_slice(&entry.sport.to_be_bytes());
+    payload[6..8].copy_from_slice(&entry.dport.to_be_bytes());
+    payload[8..24].copy_from_slice(&entry.src);
+    payload[24..40].copy_from_slice(&entry.dst);
+    payload[40..44].copy_from_slice(&entry.ifindex.to_ne_bytes());
     payload[44..48].copy_from_slice(&(entry.cookie as u32).to_ne_bytes());
     payload[48..52].copy_from_slice(&((entry.cookie >> 32) as u32).to_ne_bytes());
+    payload[56..60].copy_from_slice(&entry.receive_queue.to_ne_bytes());
+    payload[60..64].copy_from_slice(&entry.send_queue.to_ne_bytes());
+    payload[64..68].copy_from_slice(&entry.uid.to_ne_bytes());
+    payload[68..72].copy_from_slice(&entry.inode.to_ne_bytes());
     // No provider extension is invented yet; retaining the parsed extension
     // mask makes the request path complete without changing base selection.
     let _ = extensions;

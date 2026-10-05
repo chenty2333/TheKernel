@@ -142,7 +142,6 @@ impl Socket {
         self.diag_registration = Some(super::netlink::register_socket_diag(
             &self.net_ns,
             family,
-            socket_type,
             protocol,
         )?);
         self.inet_identity = Some(InetSocketIdentity {
@@ -155,6 +154,16 @@ impl Socket {
 
     pub(crate) const fn inet_identity(&self) -> Option<InetSocketIdentity> {
         self.inet_identity
+    }
+
+    pub(crate) fn attach_diag_owner(&self, owner: &Arc<dyn FileLike>) {
+        if let Some(entry) = &self.diag_registration {
+            entry.attach_owner(Arc::downgrade(owner));
+        }
+    }
+
+    pub(crate) fn diag_inode_owner(&self) -> (u64, u32) {
+        (self.inode.inode(), self.inode.owner_uid())
     }
 
     /// Accepted inet sockets retain their listener's immutable ABI identity,

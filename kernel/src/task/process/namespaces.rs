@@ -902,6 +902,10 @@ pub(crate) fn uid_map(&self) -> Arc<IdMap> {
         self.map_state.lock().uid_map()
     }
 
+pub(crate) fn try_uid_map(&self) -> AxResult<Arc<IdMap>> {
+        Ok(self.map_state.try_lock().ok_or(AxError::WouldBlock)?.uid_map())
+    }
+
 pub(crate) fn gid_map(&self) -> Arc<IdMap> {
         self.map_state.lock().gid_map()
     }

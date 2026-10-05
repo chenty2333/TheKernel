@@ -76,6 +76,10 @@ impl PseudoInode {
         self.inode
     }
 
+    pub(crate) const fn owner_uid(&self) -> u32 {
+        self.uid
+    }
+
     pub(crate) fn stat(&self) -> Kstat {
         let times = self.times.lock();
         Kstat {

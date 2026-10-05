@@ -24,8 +24,7 @@ use axtask::current;
 use linux_raw_sys::{
     general::{CAP_AUDIT_READ, CAP_NET_ADMIN, CAP_SYS_ADMIN},
     net::{
-        AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET,
-        SOCK_STREAM, sockaddr, socklen_t,
+        AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, SOCK_DGRAM, SOCK_RAW, sockaddr, socklen_t,
     },
 };
 use spin::{Lazy, Mutex, MutexGuard};
@@ -64,7 +63,6 @@ const NETLINK_GENERIC: u32 = 16;
 pub(crate) const NETLINK_AUDIT: u32 = 9;
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
 const INET_DIAG_REQ_V2_LEN: usize = 56;
-const INET_DIAG_NOCOOKIE: u32 = u32::MAX;
 const AUDIT_GROUP: u32 = 1;
 const AUDIT_SECCOMP: u16 = 1326;
 const AUDIT_LANDLOCK_ACCESS: u16 = 1423;
@@ -528,8 +526,8 @@ struct NetlinkQueue {
 /// ownership instead of using a generic write lock: an accepted NOWAIT write
 /// must never discover a deeper blocking lock after it has consumed a user
 /// source.  Route/generic/audit/uevent retain the socket state and ACK queue;
-/// sock-diag additionally owns its registry; nfnetlink owns both its global
-/// transaction and namespace table graph.
+/// sock-diag additionally owns read-only endpoint snapshots; nfnetlink owns
+/// both its global transaction and namespace table graph.
 enum NetlinkWritePermit<'a> {
     Route {
         gate: MutexGuard<'a, ()>,
@@ -565,7 +563,7 @@ enum NetlinkWritePermit<'a> {
         gate: MutexGuard<'a, ()>,
         state: MutexGuard<'a, NetlinkState>,
         queue: MutexGuard<'a, NetlinkQueue>,
-        registry: MutexGuard<'static, Vec<Weak<SocketDiagRegistration>>>,
+        records: Vec<SocketDiagRecord>,
     },
 }
 
@@ -639,9 +637,9 @@ impl<'a> NetlinkWritePermit<'a> {
         }
     }
 
-    fn sock_diag_registry(&mut self) -> Option<&mut Vec<Weak<SocketDiagRegistration>>> {
+    fn sock_diag_records(&self) -> Option<&[SocketDiagRecord]> {
         match self {
-            Self::SockDiag { registry, .. } => Some(registry),
+            Self::SockDiag { records, .. } => Some(records),
             _ => None,
         }
     }
@@ -1773,7 +1771,7 @@ impl NetlinkSocket {
         sender_pid: u32,
     ) -> AxResult {
         if self.protocol != NETLINK_KOBJECT_UEVENT {
-            let mut permit = self.acquire_write_permit(false)?;
+            let mut permit = self.acquire_write_permit(false, actor)?;
             return self.handle_write(&mut permit, data, actor);
         }
         if !ns_capable(actor, self.net_ns.owner_user_ns(), CAP_SYS_ADMIN) {
@@ -2108,7 +2106,7 @@ impl NetlinkSocket {
             .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
         data.resize(len, 0);
         src.read_exact(&mut data)?;
-        let mut permit = self.acquire_write_permit(nowait)?;
+        let mut permit = self.acquire_write_permit(nowait, actor)?;
         self.send_uevent_with_permit(&mut permit, &data, actor, sender_pid)?;
         Ok(len)
     }
@@ -2151,7 +2149,7 @@ impl NetlinkSocket {
             // Uevent has a global listener registry.  Admit that registry
             // before importing an unreplayable source so it cannot produce a
             // late EAGAIN after usercopy.
-            let mut permit = self.acquire_write_permit(true)?;
+            let mut permit = self.acquire_write_permit(true, &actor)?;
             let mut data = Vec::new();
             data.try_reserve_exact(len)
                 .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
@@ -2175,7 +2173,7 @@ impl NetlinkSocket {
         data.resize(len, 0);
         src.read_exact(&mut data)?;
         validate_protocol_frames(self.protocol, &data)?;
-        let mut permit = self.acquire_write_permit(nowait)?;
+        let mut permit = self.acquire_write_permit(nowait, &actor)?;
         self.send_uevent_with_permit(
             &mut permit,
             &data,
@@ -2257,7 +2255,7 @@ impl NetlinkSocket {
     /// EAGAIN.  Fixing this properly means restructuring delivery so the
     /// sender's guards are dropped before a peer's are taken; until then the
     /// `try_lock` is load-bearing and stays.
-    fn acquire_write_permit(&self, nowait: bool) -> AxResult<NetlinkWritePermit<'_>> {
+    fn acquire_write_permit(&self, nowait: bool, actor: &Cred) -> AxResult<NetlinkWritePermit<'_>> {
         let gate = if nowait {
             self.write_gate.try_lock().ok_or(AxError::WouldBlock)?
         } else {
@@ -2336,18 +2334,9 @@ impl NetlinkSocket {
                 })
             }
             NETLINK_SOCK_DIAG => {
-                let registry = if nowait {
-                    SOCK_DIAG_REGISTRATIONS
-                        .try_lock()
-                        .ok_or(AxError::WouldBlock)?
-                } else {
-                    SOCK_DIAG_REGISTRATIONS.lock()
-                };
+                let records = diagnostic_records(&self.net_ns, nowait, actor)?;
                 Ok(NetlinkWritePermit::SockDiag {
-                    gate,
-                    state,
-                    queue,
-                    registry,
+                    gate, state, queue, records,
                 })
             }
             _ => Err(AxError::OperationNotSupported),
@@ -2425,9 +2414,9 @@ impl NetlinkSocket {
     }
 
     /// SOCK_DIAG owns a separate netlink protocol and terminates every dump
-    /// with the normal multipart DONE message. `inet_diag_req_v2` is parsed
-    /// as its complete fixed UAPI form: family/protocol/extensions/states and
-    /// the complete inet_diag_sockid selector all participate in filtering.
+    /// with the normal multipart DONE message. Family/protocol/state and port
+    /// selectors participate; dump cookie/address/interface bytes are not the
+    /// exact-lookup selectors. Other transports and lookup modes fail closed.
     fn handle_sock_diag_message(
         &self,
         permit: &mut NetlinkWritePermit<'_>,
@@ -2441,21 +2430,18 @@ impl NetlinkSocket {
         if family != AF_INET as u32 && family != AF_INET6 as u32 && family != AF_UNSPEC as u32 {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
+        // Linux selects dump when either NLM_F_ROOT or NLM_F_MATCH is set.
+        // Exact lookup/bytecode providers have not been implemented here.
+        if payload[1] != 6 || hdr.nlmsg_flags & 0x300 == 0 || payload.len() != INET_DIAG_REQ_V2_LEN {
+            return Err(AxError::OperationNotSupported);
+        }
         let request = InetDiagRequest::parse(&payload[..INET_DIAG_REQ_V2_LEN])?;
         let port_id = permit.port_id();
-        let namespace = Arc::downgrade(&self.net_ns);
-        let registrations = permit.sock_diag_registry().ok_or(AxError::BadState)?;
+        let records = permit.sock_diag_records().ok_or(AxError::BadState)?;
         let mut replies = Vec::new();
-        registrations.retain(|entry| {
-            let Some(entry) = entry.upgrade() else {
-                return false;
-            };
-            if !Weak::ptr_eq(&entry.net_ns, &namespace) || !request.matches(&entry) {
-                return true;
-            }
-            replies.push(sock_diag_message(hdr, port_id, &entry, request.extensions));
-            true
-        });
+        for entry in records.iter().filter(|entry| request.matches(entry)) {
+            replies.push(sock_diag_message(hdr, port_id, entry, request.extensions));
+        }
         for reply in replies {
             self.enqueue_kernel_permitted(permit, reply);
         }
