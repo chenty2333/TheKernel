@@ -1083,6 +1083,18 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
     Ok(0)
 }
 
+// Linux mount installation checks installed-credential authority before
+// fs_struct ownership. A pidfd bundle copies fs_struct only for mixed flags.
+fn admit_mount_namespace_entry(own_admin: bool, own_chroot: bool, shared_fs: bool) -> AxResult<()> {
+    if !own_admin || !own_chroot {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if shared_fs {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
 pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
     debug!("sys_setns <= fd: {fd}, nstype: {nstype:#x}");
 
@@ -1162,6 +1174,13 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
     if !ns_capable(&actor_cred, owner_user_ns, CAP_SYS_ADMIN) {
         return Err(AxError::OperationNotPermitted);
     }
+    if matches!(&replacement, Replacement::Mount(_)) {
+        admit_mount_namespace_entry(
+            ns_capable(&actor_cred, actor_cred.user_ns(), CAP_SYS_ADMIN),
+            ns_capable(&actor_cred, actor_cred.user_ns(), CAP_SYS_CHROOT),
+            thread.fs_context_is_shared(),
+        )?;
+    }
     // A mount namespace cannot retain an fs_struct rooted in the namespace
     // being left.  Resolve and validate the target root before entering the
     // single-thread publication scope, so no namespace pointer can be
@@ -1176,9 +1195,8 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
     {
         return Err(AxError::OperationNotPermitted);
     }
-    // setns(CLONE_NEWNS) must not retarget a CLONE_FS-shared fs_struct for
-    // sibling tasks which remain in the old namespace.  Clone before the
-    // namespace publication transaction, then reset only this task's root/cwd.
+    // Admission above rejects a shared fs_struct. Prepare the private
+    // root/cwd replacement before publishing the namespace transaction.
     let replacement_fs = mount_root
         .as_ref()
         .map(|root| thread.prepare_fs_context_for_mount_namespace(root.clone()))
@@ -1337,10 +1355,12 @@ fn sys_setns_pidfd(pidfd: &PidFd, flags: u32) -> AxResult<isize> {
             // credential which will be installed by nsset. The NEWUSER case
             // is checked against the prepared credential at commit; without
             // NEWUSER the current credential is already installed.
-            if flags & CLONE_NEWUSER == 0
-                && !ns_capable(&actor_cred, actor_cred.user_ns(), CAP_SYS_CHROOT)
-            {
-                return Err(AxError::OperationNotPermitted);
+            if flags & CLONE_NEWUSER == 0 {
+                admit_mount_namespace_entry(
+                    ns_capable(&actor_cred, actor_cred.user_ns(), CAP_SYS_ADMIN),
+                    ns_capable(&actor_cred, actor_cred.user_ns(), CAP_SYS_CHROOT),
+                    flags == CLONE_NEWNS && thread.fs_context_is_shared(),
+                )?;
             }
         }
         if flags & CLONE_NEWUTS != 0 {
@@ -2974,6 +2994,24 @@ mod tests {
 
     use super::*;
     use crate::task::{Cred, Kgid, Kuid, UserNamespace};
+
+    #[test]
+    fn mount_namespace_entry_checks_capabilities_before_shared_fs() {
+        for admin in [false, true] {
+            for chroot in [false, true] {
+                for shared in [false, true] {
+                    let expected = if !admin || !chroot {
+                        Err(AxError::OperationNotPermitted)
+                    } else if shared {
+                        Err(AxError::InvalidInput)
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(admit_mount_namespace_entry(admin, chroot, shared), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn mempolicy_home_node_selects_bind_and_preferred_many_allocations() {

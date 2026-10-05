@@ -372,6 +372,12 @@ PROGRAM_CASES = {
     "io-uring-register-opcodes": ("io-uring-register-opcodes",),
     "io-uring-setup-batch": ("io-uring-setup-batch",),
 }
+# Mount-only and mixed pidfd setns share the existing task-control program.
+CONTRACTS.update({
+    "setns": ("raw-differential", "pass", "MOUNT_CAPS_BEFORE_SHARED_FS MOUNT_ONLY_SHARED_FS_EINVAL PIDFD_MIXED_SET_PRIVATE_FS"),
+})
+PROGRAM_CASES["task-control"] += ("setns",)
+
 # The registry is static: the gate reads it to decide whether a claimed
 # syscall names a program this runner really executes.
 PROGRAMS = tuple(PROGRAM_CASES)
@@ -689,6 +695,8 @@ SYSCALL_CASES = {
     242: ("posix-mqueue", "mq_timedsend"), 243: ("posix-mqueue", "mq_timedreceive"),
     244: ("posix-mqueue", "mq_notify"),
 }
+SYSCALL_CASES[308] = ("task-control", "setns")
+
 
 
 @dataclass(frozen=True)

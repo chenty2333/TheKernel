@@ -851,6 +851,70 @@ static void clone3_case(void) {
     done();
 }
 
+/* Each child retains its namespace descriptor before losing capability.
+ * A shared fs_struct is forbidden only in the mount-only setns form; Linux
+ * prepares a private temporary fs_struct for a mixed pidfd namespace set. */
+static int mount_setns_child(int nsfd, unsigned mode, unsigned drop_cap) {
+    struct cap_header_wire header = { CAP_VERSION_3, 0 };
+    struct cap_data_wire caps[2];
+    if (syscall(SYS_capget, &header, caps) != 0) return 10;
+    int admin = (caps[0].effective & (1U << 21)) != 0;
+    int chroot = (caps[0].effective & (1U << 18)) != 0;
+    if (drop_cap != 0) {
+        caps[0].effective &= ~(1U << drop_cap);
+        if (syscall(SYS_capset, &header, caps) != 0) return 11;
+    }
+    int fd = nsfd;
+    unsigned flags = 0x00020000U;
+    if (mode == 2 || mode == 3) {
+        fd = (int)syscall(434, getpid(), 0); /* pidfd_open */
+        if (fd < 0) return 12;
+        if (mode == 3) flags |= 0x04000000U; /* CLONE_NEWUTS */
+    }
+    errno = 0;
+    long result = syscall(308, fd, flags); /* setns */
+    int expected = (!admin || !chroot || drop_cap != 0) ? EPERM :
+                   ((mode == 1 || mode == 2) ? EINVAL : 0);
+    if (expected == 0 ? result != 0 : !(result == -1 && errno == expected)) {
+        fprintf(stderr, "SETNS_MOUNT mode=%u drop=%u result=%ld errno=%d expected=%d\n",
+                mode, drop_cap, result, errno, expected);
+        return 13;
+    }
+    if (mode == 2 || mode == 3) close(fd);
+    return 0;
+}
+
+static void mount_setns_case(void) {
+    begin("setns.raw-differential");
+    int fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+    check(fd >= 0, "open-mount-namespace");
+    if (fd >= 0) {
+        for (unsigned mode = 0; mode <= 3; ++mode) {
+            for (unsigned drop = 0; drop <= 2; ++drop) {
+                struct clone_args_wire args;
+                memset(&args, 0, sizeof(args));
+                args.flags = mode == 0 ? 0 : CLONE_FS;
+                args.exit_signal = SIGCHLD;
+                fflush(stdout);
+                long child = clone3_call(&args, sizeof(args));
+                if (child == 0) _exit(mount_setns_child(fd, mode, drop == 1 ? 18 : drop == 2 ? 21 : 0));
+                check(child > 0, "clone-fs-admission-child");
+                if (child > 0) {
+                    int status = 0;
+                    check(waitpid((pid_t)child, &status, 0) == child &&
+                          WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                          "capabilities-and-fs-sharing");
+                }
+            }
+        }
+        close(fd);
+    }
+    mark("MOUNT_CAPS_BEFORE_SHARED_FS");
+    mark("MOUNT_ONLY_SHARED_FS_EINVAL");
+    mark("PIDFD_MIXED_SET_PRIVATE_FS");
+    done();
+}
+
 static int setpgid_stage(int fd) {
     if (fd < 0) return 1;
     ssize_t wrote = write(fd, "x", 1);
@@ -884,6 +948,7 @@ int main(int argc, char **argv) {
     modify_ldt_case();
     setpgid_case();
     clone3_case();
+    mount_setns_case();
 
     if (failures != 0) {
         fprintf(stderr, "THEKERNEL_TASK_CONTROL_FAILURES %d\n", failures);

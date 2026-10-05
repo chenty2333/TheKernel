@@ -7977,9 +7977,9 @@ status = "partial"
 contract = "linux-setns"
 handler = "kernel/src/syscall/task/ctl.rs:sys_setns"
 conditional = "explicit-none"
-tests = []
+tests = ["kernel/src/syscall/task/ctl.rs:mount_namespace_entry_checks_capabilities_before_shared_fs", "tests/guest/portable/task-control-differential.c:mount_setns_case"]
 validation_gaps = ["Existing source/helper coverage does not establish the full setns raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Mount namespace entry lacks CAP_SYS_CHROOT and shared fs-users checks; Linux rejects these cases with EPERM and EINVAL respectively"]
+limitations = ["Mount-only setns rejects shared fs_struct; mixed pidfd namespace sets prepare a private fs_struct as Linux does. Concurrent clone/fs-sharing admission remains outside the current differential probe"]
 
 [[contract]]
 id = "linux-kcmp"
