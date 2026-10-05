@@ -139,8 +139,11 @@ Final formal host: 657 Python tests (three existing skips), 2617 kernel tests,
 ACPICA 23, VirtIO 19, platform 119. The affected kernel host tests were rerun
 after the flush-report change; guest and both product/N305 lints use that final
 runtime source. Both lints passed with 784 baseline kernel warnings. New Rust
-ACPI-module/Linux-excerpt scans found zero matches. Full default-native ABI
-comparison is the remaining final gate; its result is recorded after completion.
+ACPI-module/Linux-excerpt scans found zero matches. The final complete Linux
+7.2.3 ABI differential passed **40 programs, 257/257 contracts** on both guests.
+The TheKernel guest had an empty ACPI command line, ACPICA ready/PCI-before-probe
+markers, routed VirtIO block rootfs (GSI22) and NIC (GSI23), and AML-prepared S5.
+This is fresh default-native acceptance, not the older static-mode result.
 
 
 Historical offline interpretation (simulated hardware, synthetic FADT): external
