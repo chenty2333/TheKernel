@@ -307,3 +307,33 @@ private-mount stat handling, then selected a direct backend without shared-file
 mmap. Those defects were repaired, not counted as passes. An ABI invocation
 without its required KVM selector did not execute the oracle; the corrected
 selected run passed. No crun/OCI/resource-limit acceptance is claimed yet.
+
+### Retained executable identity and readonly mount-root execution
+
+Crun's first successful readonly bind path returns a detached O_PATH mount-root
+fd, not an ordinary File wrapper. Execveat now admits its actual root Location
+and retained root idmap. Preflight consumes the same frozen VFS actor/Landlock
+context, preserving the caller's current tree for interpreter lookup while
+adding the detached root's idmap. It does not make unknown descriptors into
+executable files or treat the fd's display path as a lookup target.
+
+Process runtime retains the terminal executable Location through fork/exec and
+releases it on final exit. Proc exe is a real magic link to that object, under
+the existing ReadFs image-access checks and exec/image revalidation. Readlink
+uses display text plus the actual zero-link deleted suffix; reopening follows
+the inode, not that text. This matters after memfd CLOEXEC and after detached
+file-root execution, when no namespace pathname names the executable.
+
+Validated: kernel2635, q35 lint784 (one new Option-replace style warning was
+removed), KVM system70/70 (`system-xofd3d4a`), paired memfd-create/mount-api12/259
+(`abi-au_sn7nb`). Raw children actually execute a readonly detached file root
+and reopen its readonly regular proc exe inode, and reopen the fully sealed
+zero-link memfd after CLOEXEC. Real signed crun now reports version1.30.1 and
+its feature set (`shell-1lvje7a9`); this is startup acceptance only, not OCI run
+or cgroup limits. The next observed gap is the absent sysfs cgroup mount point.
+
+Known differences: detached file-root display text can collapse to `/`, and
+ordinary proc exe display text is the saved exec path, not a full Linux d_path
+rename/root projection. The retained inode, sealing and readonly state were
+tested; detached FUSE/NFS executable-provider retirement was not. No time
+namespace or deferred B1 field work is folded into this repair.

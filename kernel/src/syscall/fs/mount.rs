@@ -2762,6 +2762,17 @@ fn pseudo_fs_for_mount(source: &str, fs_type: &str, data: &str) -> AxResult<Opti
 }
 
 impl FsMountFd {
+    pub(crate) fn root_idmap(&self) -> AxResult<Option<Arc<crate::mounts::MountIdmap>>> {
+        let _operation = self.tree.operation.lock();
+        let mount_id = self.root.mountpoint().mount_id();
+        let topology = self.tree.topology.lock().clone();
+        if let Some(topology) = topology {
+            topology.idmap_for_mount(mount_id)
+        } else {
+            Ok(self.tree.idmaps.lock().get(&mount_id).cloned())
+        }
+    }
+
     pub(crate) fn location(&self) -> &Location {
         &self.root
     }

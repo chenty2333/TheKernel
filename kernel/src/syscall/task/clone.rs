@@ -1183,6 +1183,7 @@ impl CloneArgs {
                 prepared_zombie_snapshot,
                 child_credential.clone(),
                 child_exe_path,
+                old_proc_data.executable_location().ok_or(AxError::BadState)?,
                 old_proc_data.retain_executable()?,
                 child_cmdline,
                 aspace,

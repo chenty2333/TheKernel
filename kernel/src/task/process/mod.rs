@@ -14,7 +14,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs_ng_vfs::FsPathBuf;
+use axfs_ng_vfs::{FsPathBuf, Location};
 use axhal::{paging::MappingFlags, time::monotonic_time_nanos};
 use axnet::{NetStack, PacketAction, PacketContext, PacketHookPoint};
 use axpoll::PollSet;
@@ -278,6 +278,7 @@ pub(crate)     proc: Arc<Process>,
     group_leader_identity: GroupLeaderIdentityBinding,
     /// The executable path
     pub exe_path: RwLock<FsPathBuf>,
+    exe_location: SpinNoIrq<Option<Location>>,
     /// The inode currently held busy as this process image.
 pub(crate)     executable: SpinNoIrq<Option<ExecutableKey>>,
     /// The command line arguments
@@ -464,6 +465,7 @@ pub(crate) fn try_new(
         prepared_zombie_snapshot: PreparedZombieSnapshot,
         group_leader_credential: Arc<CredentialSlot>,
         exe_path: FsPathBuf,
+        exe_location: Location,
         executable: Option<ExecutableKey>,
         cmdline: Arc<Vec<Vec<u8>>>,
         aspace: Arc<Mutex<AddrSpace>>,
@@ -520,6 +522,7 @@ pub(crate) fn try_new(
             prepared_zombie_snapshot: SpinNoIrq::new(Some(prepared_zombie_snapshot)),
             group_leader_identity,
             exe_path: RwLock::new(exe_path),
+            exe_location: SpinNoIrq::new(Some(exe_location)),
             executable: SpinNoIrq::new(executable),
             cmdline: RwLock::new(cmdline),
             start_realtime_sec,
@@ -1312,6 +1315,15 @@ pub(crate) fn start_monotonic_ns(&self) -> u64 {
         self.start_monotonic_ns
     }
 
+    pub(crate) fn executable_location(&self) -> Option<Location> {
+        self.exe_location.lock().clone()
+    }
+
+pub(crate) fn replace_executable_location(&self, location: Location) {
+        let old = self.exe_location.lock().replace(location);
+        drop(old);
+    }
+
 pub(crate) fn executable(&self) -> Option<ExecutableKey> {
         *self.executable.lock()
     }
@@ -1327,6 +1339,8 @@ pub(crate) fn replace_executable(&self, new_executable: Option<ExecutableKey>) {
 
 pub(crate) fn release_executable(&self) {
         self.replace_executable(None);
+        let old = self.exe_location.lock().take();
+        drop(old);
     }
 
     /// Set the top address of the user heap.

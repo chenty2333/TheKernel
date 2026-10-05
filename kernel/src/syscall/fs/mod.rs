@@ -11,7 +11,7 @@ pub(crate) mod io_uring;
 mod memfd;
 mod mount;
 mod namespace_visibility;
-pub(crate) use mount::proc_filesystem_types;
+pub(crate) use mount::{FsMountFd, proc_filesystem_types};
 mod pidfd;
 mod pipe;
 mod quota;

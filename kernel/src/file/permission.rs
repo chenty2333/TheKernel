@@ -282,6 +282,21 @@ impl VfsSecurityContext {
         })
     }
 
+    /// Keeps the actor/current tree while adding a retained detached fd root.
+    pub(crate) fn with_fd_mount_idmap(
+        mut self,
+        mount_id: u64,
+        idmap: Option<Arc<crate::mounts::MountIdmap>>,
+    ) -> AxResult<Self> {
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
+        if let Some(idmap) = idmap {
+            rows.push((mount_id, idmap));
+        }
+        self.detached_mount_idmaps = Some(Arc::try_new(rows).map_err(|_| AxError::NoMemory)?);
+        Ok(self)
+    }
+
     fn idmap_for(&self, location: &Location) -> AxResult<Option<Arc<crate::mounts::MountIdmap>>> {
         let mount_id = location.mountpoint().mount_id();
         if let Some(topology) = self.mount_topology.as_ref() {

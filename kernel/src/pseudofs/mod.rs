@@ -18,6 +18,7 @@ mod usb_sysfs;
 mod net_sysfs;
 pub(crate) mod nsfs;
 pub(crate) mod proc;
+mod proc_exe;
 mod proc_inventory;
 mod proc_interrupts;
 mod proc_memory;

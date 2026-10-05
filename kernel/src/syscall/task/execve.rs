@@ -485,7 +485,6 @@ fn do_execve(
     security: &VfsSecurityContext,
 ) -> AxResult<isize> {
     let actor = security.actor_arc();
-    let credentials = security.credentials();
     let curr = current();
     let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
     fanotify::permission_check(
@@ -514,9 +513,7 @@ fn do_execve(
         loc.clone(),
         &abs_path,
         &args,
-        credentials,
-        actor,
-        security.filesystem_owner_user_ns(),
+        security,
     )?;
 
     // Linearize against PTRACE_ATTACH/PTRACE_SEIZE and thread publication
@@ -530,6 +527,7 @@ fn do_execve(
     // Only the terminal ELF (the shebang interpreter when the initial object
     // is a script) supplies set-ID and file-capability privilege. PT_INTERP is
     // part of the readability/content chain but is never a credential source.
+    let final_exe_location = prepared_app.credential_source.clone();
     let source_security = prepared_app.take_credential_source_security()?;
     let source_mode = source_security.mode();
     let final_exe_path = {
@@ -786,6 +784,7 @@ fn do_execve(
         .unwrap_or_else(|error| fail_closed_exit(error));
     set_current_user_address_space(new_token);
     proc_data.replace_executable(executable_key);
+    proc_data.replace_executable_location(final_exe_location);
 
     drop(curr.replace_name(task_name));
 
@@ -899,9 +898,17 @@ pub fn sys_execveat<M: UserMemory + ?Sized>(
         resolve_at_with_security(dirfd, Some(&path), flags as u32, &security)?
     };
 
-    let loc = match resolved {
-        ResolveAtResult::File(loc) => loc,
-        ResolveAtResult::Other(_) => return Err(AxError::InvalidInput),
+    let (loc, security) = match resolved {
+        ResolveAtResult::File(loc) => (loc, security),
+        ResolveAtResult::Other(file) => {
+            let mount = file.downcast_ref::<crate::syscall::fs::FsMountFd>()
+                .ok_or(AxError::InvalidInput)?;
+            let location = mount.location().clone();
+            let security = security.with_fd_mount_idmap(
+                location.mountpoint().mount_id(), mount.root_idmap()?,
+            )?;
+            (location, security)
+        }
     };
     if (flags as u32) & AT_SYMLINK_NOFOLLOW != 0 && loc.node_type() == NodeType::Symlink {
         return Err(axerrno::LinuxError::ELOOP.into());

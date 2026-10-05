@@ -385,7 +385,17 @@ static int test_anonymous_exec(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "--memfd-exec-child")) return 0;
+    if (argc == 2 && !strcmp(argv[1], "--memfd-exec-child")) {
+        int exe = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+        if (exe < 0 || fcntl(exe, F_GET_SEALS) != 0xf) return 81;
+        struct stat stat;
+        if (fstat(exe, &stat) || stat.st_nlink != 0) return 82;
+        char label[256]; ssize_t n = readlink("/proc/self/exe", label, sizeof(label) - 1);
+        if (n < 0) return 83;
+        label[n] = 0;
+        if (strcmp(label, "/memfd:exec:/proc/self/exe (deleted)")) return 84;
+        close(exe); return 0;
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
 
@@ -418,6 +428,7 @@ int main(int argc, char **argv) {
     if (test_anonymous_exec()) return 1;
     puts("THEKERNEL_ABI_ASSERT memfd-create.portable-differential MFD_ANONYMOUS_SEALED_EXEC pass");
 
+    puts("THEKERNEL_ABI_ASSERT memfd-create.portable-differential MFD_EXEC_OBJECT_IDENTITY pass");
     puts("THEKERNEL_MEMFD_CREATE_OK");
     puts("THEKERNEL_ABI_RESULT memfd-create.portable-differential pass");
     return 0;

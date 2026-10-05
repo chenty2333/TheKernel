@@ -150,7 +150,7 @@ pub(crate) fn spawn_usermode_helper(spec: UsermodeHelperSpec) -> AxResult<Usermo
     copy_from_kernel(&mut uspace)?;
     let (entry, stack) = load_user_app_helper(
         &mut uspace,
-        loc,
+        loc.clone(),
         &caller_snapshot.fs_snapshot,
         &helper_security,
         &helper_path,
@@ -221,6 +221,7 @@ pub(crate) fn spawn_usermode_helper(spec: UsermodeHelperSpec) -> AxResult<Usermo
         ProcessData::try_prepare_zombie_snapshot()?,
         helper_credential.clone(),
         helper_path,
+        loc,
         executable,
         cmdline,
         aspace,

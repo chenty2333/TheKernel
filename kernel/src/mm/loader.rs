@@ -997,19 +997,17 @@ pub(crate) fn preflight_user_app_at(
     loc: Location,
     path: &FsPath,
     args: &[Vec<u8>],
-    credentials: &DacCredentialView,
-    actor: &Cred,
-    filesystem_owner_user_ns: &alloc::sync::Arc<UserNamespace>,
+    security: &VfsSecurityContext,
 ) -> AxResult<PreparedUserApp> {
     ELF_LOADER.lock().0.clear();
     let all_readable = Cell::new(true);
     let access = ExecAccess::User {
-        credentials,
-        actor,
-        filesystem_owner_user_ns,
+        credentials: security.credentials(),
+        actor: security.actor(),
+        filesystem_owner_user_ns: security.filesystem_owner_user_ns(),
         all_readable: &all_readable,
         fs_context: None,
-        vfs_security: None,
+        vfs_security: Some(security),
         #[cfg(test)]
         test_resolver: None,
         #[cfg(test)]

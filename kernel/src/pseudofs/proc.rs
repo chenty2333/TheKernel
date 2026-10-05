@@ -1037,7 +1037,7 @@ fn proc_subject_cred(task: &AxTaskRef, process_view: bool) -> Arc<Cred> {
     }
 }
 
-fn proc_image_access(
+pub(super) fn proc_image_access(
     task: &AxTaskRef,
     process_view: bool,
 ) -> VfsResult<ProcessImageAccessSnapshot> {
@@ -3160,22 +3160,7 @@ impl SimpleDirOps for ThreadDir {
                 })
                 .into()
             }
-            b"exe" => {
-                drop(proc_image_access(&task, process_view)?);
-                SimpleFile::new_magic_link(fs, move || {
-                    let image = proc_image_access(&task, process_view)?.into_aspace();
-                    let proc_data = &task.as_thread().proc_data;
-                    if proc_data.exec_in_progress() {
-                        return Err(VfsError::PermissionDenied);
-                    }
-                    let path = proc_data.exe_path.read().as_bytes().to_vec();
-                    if proc_data.exec_in_progress() || !proc_data.image_matches(&image) {
-                        return Err(VfsError::PermissionDenied);
-                    }
-                    Ok(path)
-                })
-                .into()
-            }
+            b"exe" => super::proc_exe::link(fs, &task, process_view)?.into(),
             b"fd" => SimpleDir::new_maker(fs.clone(), {
                 drop(proc_fd_image_access(&task, process_view)?);
                 Arc::new(ThreadFdDir {

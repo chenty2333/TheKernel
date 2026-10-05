@@ -589,7 +589,14 @@ static void open_tree_namespace_case(void) {
           "namespace-construction-does-not-enter-caller");
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--mount-exec-child")) {
+        int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+        struct stat st; struct statfs fs;
+        if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode)) return 81;
+        if (fstatfs(fd, &fs) || !(fs.f_flags & 1)) return 82;
+        close(fd); return 0;
+    }
     active = "mount-api.setup";
     check(mkdtemp(dir) != NULL, "mkdir");
     check(atexit(cleanup) == 0, "cleanup-register");
@@ -613,6 +620,25 @@ int main(void) {
           cloned.st_ino == source.st_ino && cloned.st_dev == source.st_dev, "clone-identity");
     check(close(tree) == 0, "clone-close");
     mark("CLONE_CLOEXEC_IDENTITY");
+    int executable_tree = (int)syscall(NR_OPEN_TREE, AT_FDCWD, "/proc/self/exe",
+                                     OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+    check(executable_tree >= 0, "clone-executable-file");
+    check(syscall(NR_MOUNT_SETATTR, executable_tree, "", AT_EMPTY_PATH,
+                  &rdonly_mount_attr, sizeof(rdonly_mount_attr)) == 0, "readonly-executable-file");
+    pid_t exec_child = fork();
+    check(exec_child >= 0, "mount-exec-fork");
+    if (!exec_child) {
+        char *args[] = {"mount-api", "--mount-exec-child", NULL};
+        char *env[] = {NULL};
+        syscall(SYS_execveat, executable_tree, "", args, env, AT_EMPTY_PATH);
+        perror("mount-root-execveat"); _exit(83);
+    }
+    int exec_status;
+    check(waitpid(exec_child, &exec_status, 0) == exec_child && WIFEXITED(exec_status) &&
+          WEXITSTATUS(exec_status) == 0, "mount-exec-child-status");
+    check(close(executable_tree) == 0, "mount-exec-close");
+    mark("READONLY_FILE_ROOT_EXEC_IDENTITY");
+
     ERROR(syscall(NR_OPEN_TREE, -1, BAD, BAD_FLAGS, NULL, 0), EINVAL, "flags-before-path");
     ERROR(syscall(NR_OPEN_TREE, -1, BAD, OPEN_TREE_CLONE | 0x40000000, NULL, 0), EINVAL,
           "unknown-flag-before-path");

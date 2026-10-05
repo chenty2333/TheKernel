@@ -261,6 +261,7 @@ pub fn init(args: &[String], envs: &[String]) {
         prepared_zombie_snapshot,
         credential.clone(),
         exe_path,
+        loc.clone(),
         executable::acquire(&loc).expect("Failed to retain init executable identity"),
         cmdline,
         aspace,

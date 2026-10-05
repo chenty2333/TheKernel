@@ -2,7 +2,7 @@ use alloc::{borrow::Cow, sync::Arc, vec::Vec};
 use core::{any::Any, task::Context};
 
 use axfs_ng_vfs::{
-    FileNodeOps, FilesystemOps, FsPath, Metadata, MetadataUpdate, NodeFlags, NodeOps,
+    FileNodeOps, FilesystemOps, FsPath, Location, Metadata, MetadataUpdate, NodeFlags, NodeOps,
     NodePermission, NodeType, NodeUserData, VfsError, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
@@ -31,6 +31,11 @@ pub trait SimpleFileOps: Send + Sync + 'static {
     /// writable inode; writable pseudo-files are owner-writable by default.
     fn default_permission(&self) -> NodePermission {
         NodePermission::from_bits_truncate(0o444)
+    }
+
+    /// An object-backed link jumps without interpreting its display text.
+    fn magic_link_target(&self) -> Option<VfsResult<Location>> {
+        None
     }
 
     /// Reads all content in the file.
@@ -278,6 +283,10 @@ impl NodeOps for SimpleFile {
 
     fn flags(&self) -> NodeFlags {
         self.flags
+    }
+
+    fn magic_link_target(&self) -> Option<VfsResult<Location>> {
+        self.ops.magic_link_target()
     }
 
     fn persistent_user_data(&self) -> Option<&NodeUserData> {
