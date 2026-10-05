@@ -1083,6 +1083,13 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
     Ok(0)
 }
 
+fn admit_namespace_admin(target_admin: bool, needs_installed_admin: bool, installed_admin: bool) -> AxResult<()> {
+    if !target_admin || (needs_installed_admin && !installed_admin) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    Ok(())
+}
+
 // Linux mount installation checks installed-credential authority before
 // fs_struct ownership. A pidfd bundle copies fs_struct only for mixed flags.
 fn admit_mount_namespace_entry(own_admin: bool, own_chroot: bool, shared_fs: bool) -> AxResult<()> {
@@ -1171,9 +1178,11 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
     let thread = curr.as_thread();
     let task_snapshot = thread.namespace_credential_fs_snapshot();
     let actor_cred = task_snapshot.credential;
-    if !ns_capable(&actor_cred, owner_user_ns, CAP_SYS_ADMIN) {
-        return Err(AxError::OperationNotPermitted);
-    }
+    admit_namespace_admin(
+        ns_capable(&actor_cred, owner_user_ns, CAP_SYS_ADMIN),
+        !matches!(&replacement, Replacement::User(_)),
+        ns_capable(&actor_cred, actor_cred.user_ns(), CAP_SYS_ADMIN),
+    )?;
     if matches!(&replacement, Replacement::Mount(_)) {
         admit_mount_namespace_entry(
             ns_capable(&actor_cred, actor_cred.user_ns(), CAP_SYS_ADMIN),
@@ -1193,7 +1202,7 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
     if let Replacement::PidForChildren(pid_ns) = &replacement
         && !task_snapshot.namespaces.pid().contains(pid_ns)
     {
-        return Err(AxError::OperationNotPermitted);
+        return Err(AxError::InvalidInput);
     }
     // Admission above rejects a shared fs_struct. Prepare the private
     // root/cwd replacement before publishing the namespace transaction.
@@ -1236,9 +1245,9 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
                 Replacement::Net(net_ns) => proxy.replace_net(net_ns),
                 Replacement::PidForChildren(pid_ns) => proxy.replace_pid_for_children(pid_ns),
                 Replacement::Uts(uts_ns) => proxy.replace_uts(uts_ns),
-                // Linux time-namespace setns is deferred: the caller keeps
-                // its current clock domain and only future children inherit
-                // the selected namespace.  This mirrors unshare(NEWTIME).
+                // Current implementation remains child-only for time setns;
+                // Linux installs active and child clocks. This residual is
+                // recorded in linux-setns rather than claimed equivalent.
                 Replacement::Time(time_ns) => proxy.replace_time_for_children(time_ns),
                 Replacement::User(_) => unreachable!("handled above"),
             });
@@ -1337,10 +1346,11 @@ fn sys_setns_pidfd(pidfd: &PidFd, flags: u32) -> AxResult<isize> {
     };
     let result = (|| -> AxResult<()> {
         let require_owner_admin = |owner: Arc<crate::task::UserNamespace>| -> AxResult<()> {
-            if !ns_capable(&actor_cred, &owner, CAP_SYS_ADMIN) {
-                return Err(AxError::OperationNotPermitted);
-            }
-            Ok(())
+            admit_namespace_admin(
+                ns_capable(&actor_cred, &owner, CAP_SYS_ADMIN),
+                flags & CLONE_NEWUSER == 0,
+                ns_capable(&actor_cred, actor_cred.user_ns(), CAP_SYS_ADMIN),
+            )
         };
 
         // Linux's pidfd nsset installation order is explicit.  Keep each
@@ -2994,6 +3004,20 @@ mod tests {
 
     use super::*;
     use crate::task::{Cred, Kgid, Kuid, UserNamespace};
+
+    #[test]
+    fn namespace_admin_keeps_target_and_installed_domains_distinct() {
+        for target in [false, true] {
+            for required in [false, true] {
+                for installed in [false, true] {
+                    assert_eq!(
+                        admit_namespace_admin(target, required, installed),
+                        if target && (!required || installed) { Ok(()) } else { Err(AxError::OperationNotPermitted) },
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn mount_namespace_entry_checks_capabilities_before_shared_fs() {

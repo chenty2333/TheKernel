@@ -33,8 +33,9 @@ The differential probe does not establish racing clone/fs-sharing admission.
 ### Other known gaps (next)
 
 - All originally listed namespace/clone construction gaps are now addressed.
-- Source review found an additional direct non-mount setns installed-user
-  admin check and PID ancestry errno discrepancy; fix next before tool entry.
+- Direct non-mount installed-admin and PID ancestry checks are now fixed.
+- The stronger raw setns setup exposed NEWUSER clone falsely identifying the
+  visible root as a chroot. Fix and strengthen NNP+NEWUSER acceptance next.
 
 ### `clone3(CLONE_NNP)`
 
@@ -48,8 +49,11 @@ reject NNP with `EINVAL` under the existing Linux flag admission rules.
 Validated: kernel host 2623 passed (including typed security publication,
 inheritance, and NEWUSER+NNP); q35 lint passed with 784 existing warnings;
 KVM system guest 70/70 (`system-k93x8ebc`); paired task-control 14/14 selected
-contracts (`abi-8gos6_qh`). Actual children observe NNP=1, cannot clear it, and
-leave the parent's NNP unchanged, both with and without NEWUSER.
+contracts (`abi-8gos6_qh`). Plain native NNP children observe NNP=1, cannot clear it, and leave the
+parent unchanged. The combined NEWUSER raw branch accepted EPERM; it did not
+prove successful native NEWUSER creation. Only the host credential constructor
+established combined NEWUSER+NNP at this stage. The stronger setns fixture
+below exposed the missing native creation admission, to be fixed next.
 
 ### `clone3(CLONE_PIDFD_AUTOKILL)`
 
@@ -129,6 +133,30 @@ this final run. Neither failed attempt is recorded as acceptance.
 - Cross-owner floors/one-way peers and rollback have host coverage. FUSE/NFS
   namespace teardown and concurrent fault injection were not exercised in
   paired guests; no physical hardware acceptance is claimed.
+
+### Non-mount `setns` installed authority and PID ancestry
+
+Target-owner authority is not interchangeable with installed-credential
+CAP_SYS_ADMIN: ownership of a descendant user's UTS namespace can grant the
+former even after the caller drops the latter. Direct non-user descriptors
+now require both; pidfd sets check the installed domain unless NEWUSER prepares
+that credential (the existing post-transition check then applies). A direct
+PID namespace outside the active namespace's descendant tree returns EINVAL.
+No ptrace permission policy was changed.
+
+Validated: kernel2631, q35 lint784, system70/70 (`system-1en50sm7`), paired
+task-control14/14 (`abi-309zpcq6`). A real unshare-created user/UTS target has a
+distinct hostname; direct and pidfd positive controls enter it, while dropping
+only the caller's admin denies entry and leaves its hostname unchanged. A real
+PID-namespace init cannot select its parent's PID namespace. Direct time setns
+still lacks the single-thread EUSERS gate and remains child-clock-only, rather
+than Linux's active+child transition; this separate limitation is retained.
+
+The first stronger fixture used clone3 NEWUSER+NEWUTS and exposed native EPERM
+from the incorrect layered-root chroot guard, before reaching setns. It was
+not counted as passing. Using ordinary fork+unshare isolates the setns fix;
+the clone3 cell is conservatively partial again until the next root-identity
+fix. Earlier combined NEWUSER+NNP acceptance claims are corrected above.
 
 ## Tool acceptance ladder
 

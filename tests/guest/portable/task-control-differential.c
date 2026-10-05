@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/statfs.h>
 #include <sys/wait.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #ifndef SYS_prctl
@@ -973,6 +974,93 @@ static int mount_setns_child(int nsfd, unsigned mode, unsigned drop_cap) {
     return 0;
 }
 
+static void nonmount_setns_cases(void) {
+    int ready[2], hold[2];
+    check(pipe(ready) == 0 && pipe(hold) == 0, "setns-owned-target-pipes");
+    struct clone_args_wire args;
+    memset(&args, 0, sizeof(args));
+    args.flags = 0;
+    args.exit_signal = SIGCHLD;
+    fflush(stdout);
+    long target = clone3_call(&args, sizeof(args));
+    if (target == 0) {
+        close(ready[0]); close(hold[1]);
+        if (syscall(272, 0x10000000UL | 0x04000000UL) != 0) _exit(57); /* unshare */
+        if (syscall(170, "tk-setns-owner", 14) != 0) _exit(50);
+        char byte = 'R';
+        if (write(ready[1], &byte, 1) != 1) _exit(51);
+        (void)read(hold[0], &byte, 1);
+        _exit(0);
+    }
+    close(ready[1]); close(hold[0]);
+    check(target > 0, "setns-descendant-user-owner");
+    if (target > 0) {
+        char byte = 0, path[128];
+        check(read(ready[0], &byte, 1) == 1 && byte == 'R', "setns-target-ready");
+        snprintf(path, sizeof(path), "/proc/%ld/ns/uts", target);
+        int nsfd = open(path, O_RDONLY | O_CLOEXEC);
+        int pidfd = (int)syscall(434, target, 0);
+        check(nsfd >= 0 && pidfd >= 0, "setns-owner-descriptors");
+        for (unsigned form = 0; form < 2; ++form) {
+            for (unsigned drop = 0; drop < 2; ++drop) {
+                fflush(stdout);
+                pid_t probe = fork();
+                check(probe >= 0, "setns-admin-probe-fork");
+                if (probe == 0) {
+                    struct cap_header_wire header = { CAP_VERSION_3, 0 };
+                    struct cap_data_wire caps[2];
+                    struct utsname before, after;
+                    if (uname(&before) != 0 || syscall(SYS_capget, &header, caps) != 0) _exit(52);
+                    if (drop) caps[0].effective &= ~(1U << 21);
+                    int own_admin = (caps[0].effective & (1U << 21)) != 0;
+                    if (syscall(SYS_capset, &header, caps) != 0) _exit(53);
+                    errno = 0;
+                    long joined = syscall(308, form ? pidfd : nsfd, 0x04000000U);
+                    if (own_admin ? joined != 0 : !(joined == -1 && errno == EPERM)) _exit(54);
+                    if (uname(&after) != 0 ||
+                        strcmp(after.nodename, own_admin ? "tk-setns-owner" : before.nodename) != 0) _exit(55);
+                    _exit(0);
+                }
+                if (probe > 0) {
+                    int status = 0;
+                    check(waitpid(probe, &status, 0) == probe && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                          "setns-target-owner-does-not-replace-own-admin");
+                    if (WIFEXITED(status) && WEXITSTATUS(status))
+                        fprintf(stderr, "SETNS_ADMIN_CHILD status=%d form=%u drop=%u\n", WEXITSTATUS(status), form, drop);
+                }
+            }
+        }
+        if (nsfd >= 0) close(nsfd);
+        if (pidfd >= 0) close(pidfd);
+        close(hold[1]); hold[1] = -1;
+        int status = 0;
+        check(waitpid((pid_t)target, &status, 0) == target && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "setns-target-teardown");
+    }
+    close(ready[0]); if (hold[1] >= 0) close(hold[1]);
+    mark("TARGET_AND_INSTALLED_ADMIN_DOMAINS");
+
+    int parent_pidns = open("/proc/self/ns/pid", O_RDONLY | O_CLOEXEC);
+    check(parent_pidns >= 0, "parent-pidns-descriptor");
+    memset(&args, 0, sizeof(args));
+    args.flags = 0x20000000UL; /* NEWPID */
+    args.exit_signal = SIGCHLD;
+    fflush(stdout);
+    long child = clone3_call(&args, sizeof(args));
+    if (child == 0) {
+        errno = 0;
+        _exit(syscall(308, parent_pidns, 0x20000000U) == -1 && errno == EINVAL ? 0 : 56);
+    }
+    if (child < 0) check(errno == EPERM, "pidns-capability");
+    else {
+        int status = 0;
+        check(waitpid((pid_t)child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "pidns-parent-entry-einval");
+    }
+    if (parent_pidns >= 0) close(parent_pidns);
+    mark("PID_ANCESTRY_EINVAL");
+}
+
 static void mount_setns_case(void) {
     begin("setns.raw-differential");
     int fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
@@ -998,6 +1086,7 @@ static void mount_setns_case(void) {
         }
         close(fd);
     }
+    nonmount_setns_cases();
     mark("MOUNT_CAPS_BEFORE_SHARED_FS");
     mark("MOUNT_ONLY_SHARED_FS_EINVAL");
     mark("PIDFD_MIXED_SET_PRIVATE_FS");

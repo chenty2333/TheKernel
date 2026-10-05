@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 319
-implemented = 300
+resolved = 318
+implemented = 299
 explicit_enosys = 19
 fallback = 0
-partial = 66
+partial = 67
 unknown = 0
 
 [[contract]]
@@ -7979,7 +7979,7 @@ handler = "kernel/src/syscall/task/ctl.rs:sys_setns"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/ctl.rs:mount_namespace_entry_checks_capabilities_before_shared_fs", "tests/guest/portable/task-control-differential.c:mount_setns_case"]
 validation_gaps = ["Existing source/helper coverage does not establish the full setns raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Direct non-mount namespace entry lacks the additional installed-user CAP_SYS_ADMIN check, and direct PID namespace ancestry rejection returns EPERM rather than Linux EINVAL; mount-entry capability/shared-fs checks are implemented"]
+limitations = ["Time namespace setns remains child-only rather than installing active and child clocks; direct time entry does not enforce Linux single-thread EUSERS. Mount, target/installed-admin and direct PID ancestry checks are implemented"]
 
 [[contract]]
 id = "linux-kcmp"
@@ -8640,13 +8640,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 435
 name = "clone3"
-status = "implemented"
+status = "partial"
 contract = "linux-clone3"
 handler = "kernel/src/syscall/task/clone3.rs:sys_clone3"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["explicit-none"]
+limitations = ["NEWUSER clone admission compares fs root to the immutable namespace-root marker rather than the visible overmount; ordinary layered-root callers are incorrectly rejected as chrooted with EPERM"]
 
 [[contract]]
 id = "linux-process_mrelease"

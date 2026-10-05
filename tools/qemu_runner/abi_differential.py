@@ -374,7 +374,7 @@ PROGRAM_CASES = {
 }
 # Mount-only and mixed pidfd setns share the existing task-control program.
 CONTRACTS.update({
-    "setns": ("raw-differential", "pass", "MOUNT_CAPS_BEFORE_SHARED_FS MOUNT_ONLY_SHARED_FS_EINVAL PIDFD_MIXED_SET_PRIVATE_FS"),
+    "setns": ("raw-differential", "pass", "MOUNT_CAPS_BEFORE_SHARED_FS MOUNT_ONLY_SHARED_FS_EINVAL PIDFD_MIXED_SET_PRIVATE_FS TARGET_AND_INSTALLED_ADMIN_DOMAINS PID_ANCESTRY_EINVAL"),
 })
 PROGRAM_CASES["task-control"] += ("setns",)
 
