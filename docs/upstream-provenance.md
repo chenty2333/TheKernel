@@ -503,3 +503,17 @@ with no copied upstream implementation. Intel xHCI 1.2b §7.6 register/layout
 facts and Linux 7.2.3 `xhci-dbgcap.c`, `xhci-dbgtty.c`, `usb_debug.c` behavior/
 identity facts were consulted. No Linux quotations or translated code were
 introduced. Hardware transport remains unverified; see `docs/design/usb-dbc.md`.
+
+## ACPICA integration (2026-10-05)
+
+`crates/ax/tk-acpica/vendor/{components,include}` contains unchanged ACPICA
+20260930 from the [official release](https://github.com/acpica/acpica/releases/tag/20260930).
+The repository now redirects to `open-acpica/acpica`. The release archive is
+`acpica-unix-20260930.tar.gz`; its SHA256 was verified against the GitHub
+release-asset digest: `aa18901b92e30749be0edc3081c8d550c61fce4fa37546fc6a65d367a4ae71a5`.
+The elected option is **BSD-3-Clause**, with the original Intel/contributor
+copyright headers, `LICENSE.BSD-3-Clause`, and `NOTICE` retained in the crate.
+The Rust adapter and TheKernel C/platform glue are original Apache-2.0 code.
+Generated include copies insert the TheKernel platform configuration; vendored
+files are not edited. Neither Linux-tree ACPICA nor FreeBSD/Haiku code is copied.
+Firmware tables (including OEM AML and MSDM keys) are never repository inputs.

@@ -1,0 +1,12 @@
+TheKernel adapter and Rust OSL: original Apache-2.0 code.
+ACPICA 20260930: Copyright (c) 1999-2026 Intel Corp. and contributors.
+Vendored components/ and include/ are unchanged from the official release:
+https://github.com/acpica/acpica/releases/tag/20260930
+(The upstream repository redirects to open-acpica/acpica.)
+Source archive: acpica-unix-20260930.tar.gz
+SHA256: aa18901b92e30749be0edc3081c8d550c61fce4fa37546fc6a65d367a4ae71a5
+Checked against the GitHub release asset digest before extraction.
+ACPICA offers BSD-3-Clause OR GPL-2.0-only; this integration elects BSD-3-Clause.
+See LICENSE.BSD-3-Clause. Original copyright and SPDX headers are retained.
+Build-time platform-header insertion affects only generated copies in OUT_DIR.
+No Linux-tree ACPICA, FreeBSD, or Haiku implementation is copied.
