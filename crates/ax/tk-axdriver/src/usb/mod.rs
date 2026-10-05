@@ -5,6 +5,7 @@ mod hid_report;
 mod hid_usage;
 mod storage;
 mod root_partition;
+pub mod observations;
 mod sync;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -192,9 +193,16 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
     let changes = host
         .wait(controller.probe_devices())?
         .map_err(|_| DevError::Io)?;
+    let bus = observations::allocate_bus();
     let mut devices = Vec::new();
     for probed in changes.connected {
+        let mut observation = bus.and_then(|bus| match observations::observe(bus, &probed) {
+            Ok(observation) => observation,
+            Err(error) => { warn!("USB observation unavailable: {error:?}"); None }
+        });
+
         let Some(info) = probed.into_device_info() else {
+            if let Some(observation) = observation.take() { observations::publish(observation); }
             continue;
         };
         let selected = info.configurations().iter().find(|config| {
@@ -205,6 +213,7 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
                 .any(supported_interface)
         });
         let Some(config) = selected else {
+            if let Some(observation) = observation.take() { observations::publish(observation); }
             continue;
         };
         let opened: DevResult<Arc<Mutex<Device>>> = (|| {
@@ -215,6 +224,10 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
                 .map_err(|_| DevError::Io)?;
             Arc::try_new(Mutex::new(device)).map_err(|_| DevError::NoMemory)
         })();
+        if opened.is_ok() {
+            if let Some(observation) = &mut observation { observation.location.configuration = Some(config.configuration_value); }
+        }
+        if let Some(observation) = observation.take() { observations::publish(observation); }
         let device = match opened {
             Ok(device) => device,
             Err(error) => {

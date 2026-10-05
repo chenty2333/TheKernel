@@ -845,8 +845,6 @@ dependencies = [
 [[package]]
 name = "crab-usb"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2f4b14fe6186cbf7cf6fbf96efa3783fff539b8a85688fd19ac4f2c54e49839"
 dependencies = [
  "anyhow",
  "ax-sync",

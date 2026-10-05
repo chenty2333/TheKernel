@@ -228,3 +228,15 @@ configuration. eudev/eudev-hwids are GPL-2.0-or-later; kmod-libs LGPL-2.1-or-lat
 xz-libs has the exact mixed SPDX expression in the lock. Hardware database
 source files remain packaged under usr/lib/udev/hwdb.d, and corresponding-source
 obligations include eudev and Alpine's data/packaging changes.
+
+## CrabUSB cached-observation integration
+
+`crates/vendor/crab-usb` is the existing crates.io CrabUSB 0.11.0 dependency,
+selected through one Cargo patch rather than a parallel implementation. Only
+read-only addressed-device/cache observation methods were added; the controller
+command and class-driver implementations are not replaced. The upstream package
+manifest declares Apache-2.0, while its packaged `LICENSE` contains an MIT grant
+from Quancheng Laboratory Innovation Center (2024). Both the declared metadata
+and the original license/attribution are retained; this discrepancy is recorded,
+not silently relabeled. TheKernel additions are original Apache-2.0 code. No
+Linux C implementation was copied or translated for this interface.

@@ -1093,3 +1093,23 @@ observation-time boundaries differ. No physical busy/latency benchmark is
 claimed. Unknown/quarantined ownership makes statistics unavailable rather than
 inventing successful zero counts. Queue capability detail and the existing
 aggregate CPU whitespace/field issue remain deferred under CONTINUE-B.
+
+### B1 close40: basic lsusb on real QEMU USB devices
+
+Same-version CrabUSB exposes a narrowly added read-only cache observation;
+TheKernel publishes actual addressed devices/configuration bytes through the
+existing registry. No control request or hardware configuration is added;
+opaque core IDs are not interpreted as addresses and no root-hub identity is
+fabricated. Signed lsusb lists all three actual QEMU keyboard/mouse/tablet nodes,
+addresses1/2/3 and physical port paths1-5/1-6/1-7, with no diagnostics. The
+standalone USB KTAP verifies every identity/config blob and real program row
+(`shell-3fzpnccq`, result0). Complete host657/6058, guest70/70 (`system-sm8jr8fn`)
+and q35/n305 lint passed for period40. Source/license notices are recorded; see
+`usb-sysfs.md`. No N305 or live-hotplug acceptance.
+
+B1 tool-level closeout is now accepted within CONTINUE-B's time bound: the three
+lspci modes no longer emit resource diagnostics; real ss/netstat show TCP/UDP/
+Unix sockets; eight shared net counters advance with traffic; diskstats/sysfs
+stat and iostat show actual I/O/disk rows; plain lsusb enumerates actual attached
+USB inputs; basic lsns has clean namespace rows. All field-level differences in
+“已知差异” remain explicit. No further B1 field work is planned; proceed to B2.

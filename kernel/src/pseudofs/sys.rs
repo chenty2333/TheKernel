@@ -25,6 +25,7 @@ pub fn new_sysfs() -> Filesystem {
 
 fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     super::pci_sysfs::publish_inventory();
+    super::usb_sysfs::publish_inventory();
     let mut root = DirMapping::new();
     let mut fs_dir = DirMapping::new();
     let mut fuse_dir = DirMapping::new();

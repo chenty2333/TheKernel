@@ -228,3 +228,7 @@ all-features = true
 
 [package.metadata.thekernel]
 layer = "integration"
+
+# The existing USB backend with a narrow read-only cached observation API.
+[patch.crates-io]
+crab-usb = { path = "crates/vendor/crab-usb" }

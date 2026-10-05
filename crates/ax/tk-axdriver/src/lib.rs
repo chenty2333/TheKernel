@@ -92,6 +92,8 @@ mod virtio;
 
 #[cfg(feature = "usb-xhci")]
 mod usb;
+#[cfg(feature = "usb-xhci")]
+pub use usb::observations as usb_observations;
 
 #[cfg(any(net_dev = "igc", net_dev = "n305-net"))]
 mod igc;

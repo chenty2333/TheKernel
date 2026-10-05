@@ -503,3 +503,15 @@ with no copied upstream implementation. Intel xHCI 1.2b §7.6 register/layout
 facts and Linux 7.2.3 `xhci-dbgcap.c`, `xhci-dbgtty.c`, `usb_debug.c` behavior/
 identity facts were consulted. No Linux quotations or translated code were
 introduced. Hardware transport remains unverified; see `docs/design/usb-dbc.md`.
+
+## 2026-10-05 main: existing CrabUSB dependency observation surface
+
+The existing crates.io CrabUSB 0.11.0 source is kept at `crates/vendor/crab-usb`
+with its original manifest/README/LICENSE attribution. The local change exposes
+an addressed device's actual owned xHCI output-context address, existing
+configuration cache and discovered parent-port route through immutable probe
+metadata. It adds no USB command or descriptor request. Kernel integration
+retains existing raw configuration descriptor bytes and encodes the standard
+device-descriptor fields already decoded by the dependency. This is dependency
+reuse with original Rust observation additions, not a Linux-code translation.
+The package/license-file discrepancy is recorded in `docs/licensing.md`.
