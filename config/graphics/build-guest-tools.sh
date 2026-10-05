@@ -21,7 +21,7 @@ for source in "$source_dir/tests/guest/graphics/"*.c; do
     cflags=
     output=$name
     case "$name" in
-        drm-uapi-oracle)
+        drm-uapi-oracle|intel-bcs-smoke)
             cflags=-I$STAGING_DIR/usr/include/libdrm
             ;;
         device-lease-probe)

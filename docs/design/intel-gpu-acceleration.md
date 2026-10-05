@@ -140,3 +140,10 @@ sync/error/mmap-after-close tests and compiled Linux7.2.3 wire facts. Physical
 BCS/user-program acceptance is still pending; this is not Mesa-compatible i915.
 RCS context/WA/3D command/state and Mesa queries/contexts/submit capabilities
 remain the next functional dependency, not HDMI/DMC/audio.
+
+The graphics-image tool builder now includes the original `intel-bcs-smoke`
+acceptance client. It requires an explicit `--execute` node argument and never
+falls back to a CPU copy or counts ENOTTY/unknown GPU as success. Native exec,
+exact16384-byte readback, binary output-sync wait and shared mmap-after-handle-
+close must all succeed. Only compilation and non-executing argument refusal
+have run here; host DRM nodes were not opened, physical acceptance is pending.

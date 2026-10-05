@@ -344,3 +344,8 @@ from MIT `gt/{gen8_ppgtt,intel_lrc,gen8_engine_cs}.c/.h`, command/LRC headers,
 NOTICE inventories exact functions and original copyrights (2003-2018,
 2014/2014-2018/2015/2019/2020/2022). Native memory/PCI/DMA/result-retirement
 adapter is original MIT; no arbitrary user batches, GPL or binary firmware.
+
+`tests/guest/graphics/intel-bcs-smoke.c` is original MIT user acceptance code
+using public i915/DRM wire facts. It is installed by the existing graphics
+image builder; it does not bundle a driver, binary firmware or a CPU-copy
+replacement. Compilation/usage checks are not native hardware validation.

@@ -73,7 +73,10 @@ commit/pageflip/fence；当前固定帧缓冲CPU拷贝adapter不计Intel nativea
   timeout/reset，无法证明退休则保留全部 DMA owners、禁止再提交；确认 console
   持续可读。当前没有开放真机故障注入，不使用旧 display fail_write 参数。
   GEM/submit/binary-sync 软件链已接通，仅支持受限 linear BCS/no-reloc/default context；
-  真实用户程序尚未验收。之后再测试 RCS、iris OpenGL 和 ANV Vulkan，分别验收。
+  真实用户程序尚未验收。图形镜像现在包含 `intel-bcs-smoke`，未来用户显式运行
+  `intel-bcs-smoke --execute /dev/dri/renderD128`，只有真实 ioctl 提交、16384 字节
+  readback、binary syncobj wait 和 mmap-after-close 全通过才出现用户态成功标记。
+  本轮只编译及测试无参数拒绝入口，未打开主机 DRM。之后分别测试 RCS/iris/ANV。
   N305 GuC 应是 tgl 系列，不是 adlp_guc；display D0 不等于 GT/media A0。
 - HDMI audio依赖实际TC link、audio powerwell、ELD和HDAcomponent握手。现在
   尚未接入，不把模拟ELD/analogcodec枚举当HDMI音频通过。将来跟modesetopt-in
