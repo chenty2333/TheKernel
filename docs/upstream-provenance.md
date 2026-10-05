@@ -470,7 +470,7 @@ counts any category and so includes comment-only files:
 
 | Subtree | ≥ 40 fenced lines / blocks / files | ≥ 25 fenced lines / blocks / files | ≥ 40 outside fences: doc / `//` / `code` |
 | --- | --- | --- | --- |
-| `syscall/` | 65 / 31 / 29 | 116 / 37 / 34 | 7 / 108 / 8 |
+| `syscall/` | 65 / 31 / 29 | 116 / 37 / 34 | 5 / 108 / 8 |
 | `task/` | 9 / 5 / 4 | 16 / 5 / 5 | 0 / 1 / 0 |
 | `mm/` | 9 / 3 / 3 | 14 / 4 / 4 | 0 / 0 / 0 |
 | `mounts.rs` | 5 / 3 / 1 | 13 / 3 / 1 | 0 / 3 / 0 |
@@ -478,12 +478,21 @@ counts any category and so includes comment-only files:
 | `drm/` | 1 / 1 / 1 | 2 / 2 / 2 | 0 / 0 / 0 |
 | `time.rs` | 0 / 0 / 0 | 2 / 1 / 1 | 0 / 0 / 0 |
 | `bpf/` | 0 / 0 / 0 | 0 / 0 / 1 | 0 / 0 / 2 |
-| **`kernel/src` total** | **89 / 43 / 20** | **166 / 53 / 26** | 132 lines, of which 8 `code` |
+| **`kernel/src` total** | **89 / 43 / 20** | **166 / 53 / 26** | 130 lines, of which 8 `code` |
+
+The 2026-10-05 B2 create-authority correction removed the obsolete
+`mount_capable` documentation excerpts asserting no userns-mountable types.
+Re-scanning original Rust changes against the same pinned release leaves
+fenced/block/file/code totals unchanged, while outside-fence matches decrease
+132→130 at ≥40 and 302→299 at ≥25. The declaration is not a claim of new Linux
+implementation translation; removed comments are no longer counted. `kernel/src`
+has no NOTICE file to edit. The unchanged raw ≥40 count includes104 drawing
+matches under the current scope.
 
 Three things about that table need stating plainly. **Not one** of the 43 blocks
 (53 at ≥ 25) carries an `Excerpt:` marker, while `crates/linux` puts 18 of 49 in
 that form: kernel-side citation is uniformly weaker. The ≥ 40 outside-fence count
-is **132 with the ASCII-rule filter and 234 without it**, so 102 of the raw
+is **130 with the ASCII-rule filter and 234 without it**, so 104 of the raw
 matches are `// -----` drawing lines. And unlike `crates/linux`, this scope does
 have verbatim Linux text that compiles: 8 `code` matches at ≥ 40, all of them
 identifiers or format strings rather than borrowed prose —
