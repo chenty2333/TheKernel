@@ -31,6 +31,7 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     let mut fuse_dir = DirMapping::new();
     fuse_dir.add("connections", empty_dir(fs.clone()));
     fs_dir.add("fuse", SimpleDir::new_maker(fs.clone(), Arc::new(fuse_dir)));
+    fs_dir.add("cgroup", empty_dir(fs.clone()));
 
     root.add("class", class_dir(fs.clone()));
     root.add("block", block_dir(fs.clone()));
@@ -544,6 +545,7 @@ mod tests {
 
         for path in [
             b"/fs/fuse/connections".as_slice(),
+            b"/fs/cgroup",
             b"/kernel/tracing",
             b"/kernel/debug/tracing",
             b"/kernel/debug/dri/0",

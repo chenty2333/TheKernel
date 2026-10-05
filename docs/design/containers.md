@@ -353,3 +353,17 @@ with no skip/normal shutdown (`system-co_rgp_c`). The existing Linux-excerpt
 inventory checks still pass; no baseline widening or invented provenance
 repair was needed. Next: expose the cgroup mount point and run the actual OCI
 bundle, then enforce/test its real memory and pids limits before podman.
+
+### Sysfs cgroup mount point
+
+Sysfs now declares `/sys/fs/cgroup`, matching Linux's cgroup mount-point
+registration. It remains an immutable empty mount point until userspace mounts
+the real cgroup filesystem; no fake controller files or boot-mounted hierarchy
+were added. The existing host mount-point test covers it.
+
+Validated: kernel2635, q35 lint784 and KVM system70/70. The real OCI probe now
+reaches cgroup control-file lookup, but cat and crun fail to open
+`cgroup.controllers` with EOPNOTSUPP (`shell-8ptpcdx2`, crun exit1). This is not
+OCI acceptance: CgroupFile/CgroupDir do not currently provide persistent inode
+userdata for the OFD errseq interface. Repair that actual file-open boundary
+next, then rerun the bundle. Memory is still not advertised or enforced.
