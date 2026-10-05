@@ -745,8 +745,14 @@ impl CloneArgs {
             // Match Linux current_chrooted(): creating a user namespace from
             // a restricted filesystem root must not create authority which
             // can be used to escape that root in later namespace slices.
-            if !calling_thread.fs_context().lock().root_dir().is_root() {
-                return Err(AxError::OperationNotPermitted);
+            {
+                let _topology = crate::mounts::namespace_operation();
+                let snapshot = calling_thread.namespace_credential_fs_snapshot();
+                if !crate::mounts::root_matches_visible_namespace(
+                    snapshot.fs_snapshot.root_dir(), snapshot.mount_topology.as_ref(),
+                )? {
+                    return Err(AxError::OperationNotPermitted);
+                }
             }
             let ids = parent_cred.ids();
             let user_ns = parent_cred.user_ns().try_fork(

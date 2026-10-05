@@ -806,14 +806,10 @@ static void clone3_case(void) {
             if (syscall(SYS_prctl, 38, 0UL, 0UL, 0UL, 0UL) != -1 || errno != EINVAL) _exit(21);
             _exit(0);
         }
-        if (newuser && child < 0) {
-            check(errno == EPERM, "newuser-nnp-capability");
-        } else {
-            check(child > 0, "clone-nnp-child");
-            if (child > 0) check(waitpid((pid_t)child, &status, 0) == child &&
-                                  WIFEXITED(status) && WEXITSTATUS(status) == 0,
-                                  "child-nnp-set-and-monotonic");
-        }
+        check(child > 0, "clone-nnp-child-including-newuser");
+        if (child > 0) check(waitpid((pid_t)child, &status, 0) == child &&
+                              WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                              "child-nnp-set-and-monotonic");
         check(syscall(SYS_prctl, 39, 0UL, 0UL, 0UL, 0UL) == parent_nnp,
               "nnp-does-not-change-parent");
     }
@@ -979,13 +975,12 @@ static void nonmount_setns_cases(void) {
     check(pipe(ready) == 0 && pipe(hold) == 0, "setns-owned-target-pipes");
     struct clone_args_wire args;
     memset(&args, 0, sizeof(args));
-    args.flags = 0;
+    args.flags = 0x10000000UL | 0x04000000UL; /* NEWUSER | NEWUTS */
     args.exit_signal = SIGCHLD;
     fflush(stdout);
     long target = clone3_call(&args, sizeof(args));
     if (target == 0) {
         close(ready[0]); close(hold[1]);
-        if (syscall(272, 0x10000000UL | 0x04000000UL) != 0) _exit(57); /* unshare */
         if (syscall(170, "tk-setns-owner", 14) != 0) _exit(50);
         char byte = 'R';
         if (write(ready[1], &byte, 1) != 1) _exit(51);
@@ -1061,6 +1056,41 @@ static void nonmount_setns_cases(void) {
     mark("PID_ANCESTRY_EINVAL");
 }
 
+static void chroot_namespace_case(void) {
+    begin("userns-root.raw-differential");
+    char directory[] = "/var/tmp/thekernel-userns-chroot.XXXXXX";
+    check(mkdtemp(directory) != NULL, "chroot-fixture-directory");
+    for (unsigned api = 0; api < 2; ++api) {
+        fflush(stdout);
+        pid_t probe = fork();
+        check(probe >= 0, "chroot-probe-fork");
+        if (probe == 0) {
+            if (chroot(directory) != 0 || chdir("/") != 0) _exit(60);
+            errno = 0;
+            long result;
+            if (api == 0) result = syscall(272, 0x10000000UL); /* unshare NEWUSER */
+            else {
+                struct clone_args_wire args;
+                memset(&args, 0, sizeof(args));
+                args.flags = 0x10000000UL;
+                args.exit_signal = SIGCHLD;
+                result = clone3_call(&args, sizeof(args));
+                if (result == 0) _exit(61);
+                if (result > 0) { int status = 0; (void)waitpid((pid_t)result, &status, 0); _exit(62); }
+            }
+            _exit(result == -1 && errno == EPERM ? 0 : 63);
+        }
+        if (probe > 0) {
+            int status = 0;
+            check(waitpid(probe, &status, 0) == probe && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                  "restricted-root-cannot-create-user-namespace");
+        }
+    }
+    check(rmdir(directory) == 0, "chroot-fixture-teardown");
+    mark("CLONE_AND_UNSHARE_CHROOT_EPERM");
+    done();
+}
+
 static void mount_setns_case(void) {
     begin("setns.raw-differential");
     int fd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
@@ -1127,6 +1157,7 @@ int main(int argc, char **argv) {
     setpgid_case();
     clone3_case();
     mount_setns_case();
+    chroot_namespace_case();
 
     if (failures != 0) {
         fprintf(stderr, "THEKERNEL_TASK_CONTROL_FAILURES %d\n", failures);

@@ -388,6 +388,11 @@ CONTRACTS.update({
     "open-tree-attr": ("raw-differential", "pass", "CLONE_CLOEXEC_DIRECTORY READONLY_CLONE_SOURCE_UNCHANGED VALIDATION_ORDER NAMESPACE_NOOP_AND_NONMOUNT_ATTR"),
 })
 
+CONTRACTS["userns-root"] = (
+    "raw-differential", "pass", "CLONE_AND_UNSHARE_CHROOT_EPERM",
+)
+PROGRAM_CASES["task-control"] += ("userns-root",)
+
 # The registry is static: the gate reads it to decide whether a claimed
 # syscall names a program this runner really executes.
 PROGRAMS = tuple(PROGRAM_CASES)

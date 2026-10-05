@@ -856,7 +856,18 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
     {
         return Err(AxError::InvalidInput);
     }
-    let task_snapshot = thread.namespace_credential_fs_snapshot();
+    let task_snapshot = {
+        let _topology = (flags & CLONE_NEWUSER != 0).then(crate::mounts::namespace_operation);
+        let snapshot = thread.namespace_credential_fs_snapshot();
+        if flags & CLONE_NEWUSER != 0
+            && !crate::mounts::root_matches_visible_namespace(
+                snapshot.fs_snapshot.root_dir(), snapshot.mount_topology.as_ref(),
+            )?
+        {
+            return Err(AxError::OperationNotPermitted);
+        }
+        snapshot
+    };
     let actor_cred = task_snapshot.credential;
     let namespace_owner = unshare_namespace_owner(flags, &actor_cred)?;
     let user_scope_owner = if flags & CLONE_NEWUSER != 0 {

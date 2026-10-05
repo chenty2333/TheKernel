@@ -1667,6 +1667,14 @@ fn commit_mount_mutation(_plan: tk_linux_mount::MountPlan) -> AxResult<()> {
     Ok(())
 }
 
+/// Compare the fs_struct root with the namespace's visible overmount, not
+/// the immutable underlay's namespace-root marker or just an inode number.
+/// Caller owns namespace_operation() while selecting the topology/root pair.
+pub(crate) fn root_matches_visible_namespace(root: &Location, topology: &MountTopology) -> AxResult<bool> {
+    let visible = topology.visible_root_location()?;
+    Ok(Arc::ptr_eq(root.mountpoint(), visible.mountpoint()) && root.entry().ptr_eq(visible.entry()))
+}
+
 pub const ROOT_BLOCK_SOURCE: &str = "/dev/vda";
 pub const ROOT_BLOCK_DEVICE_ID: DeviceId = DeviceId::new(8, 0);
 
@@ -4712,6 +4720,18 @@ mod tests {
         let topology = prepared.topology();
         assert_eq!(topology.try_records().unwrap().len(), 3);
         let underlay = topology.root_location().unwrap();
+        let visible = topology.visible_root_location().unwrap();
+        assert!(!visible.is_root());
+        assert!(root_matches_visible_namespace(&visible, &topology).unwrap());
+        assert!(!root_matches_visible_namespace(&underlay, &topology).unwrap());
+        let restricted = visible.create(
+            axfs_ng_vfs::FsName::new(b"restricted"), NodeType::Directory,
+            axfs_ng_vfs::NodePermission::from_bits_truncate(0o755),
+        ).unwrap();
+        assert!(!root_matches_visible_namespace(&restricted, &topology).unwrap());
+        let alias = Mountpoint::new_root(&fs).root_location();
+        assert_eq!(alias.inode(), visible.inode());
+        assert!(!root_matches_visible_namespace(&alias, &topology).unwrap());
         assert_ne!(underlay.mountpoint().mount_id(), old_root.mount_id());
         assert_eq!(topology.visible_root_location().unwrap().mountpoint().mount_id(), detached.mount_id());
         let lookup = axfs::FsContext::new(topology.visible_root_location().unwrap())

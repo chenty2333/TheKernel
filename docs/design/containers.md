@@ -34,8 +34,8 @@ The differential probe does not establish racing clone/fs-sharing admission.
 
 - All originally listed namespace/clone construction gaps are now addressed.
 - Direct non-mount installed-admin and PID ancestry checks are now fixed.
-- The stronger raw setns setup exposed NEWUSER clone falsely identifying the
-  visible root as a chroot. Fix and strengthen NNP+NEWUSER acceptance next.
+- The visible-root NEWUSER admission discrepancy is now fixed and the
+  combined raw creation/NNP cases require successful native creation.
 
 ### `clone3(CLONE_NNP)`
 
@@ -157,6 +157,23 @@ from the incorrect layered-root chroot guard, before reaching setns. It was
 not counted as passing. Using ordinary fork+unshare isolates the setns fix;
 the clone3 cell is conservatively partial again until the next root-identity
 fix. Earlier combined NEWUSER+NNP acceptance claims are corrected above.
+
+### NEWUSER admission follows the visible namespace root
+
+An ordinary root filesystem layered on the immutable namespace underlay is
+not a chroot. Both clone and unshare now compare the coherent fs_struct root
+with the namespace's visible root by retained mountpoint and dentry identity,
+under the existing namespace-operation/publication order. Numeric inode
+identity alone and the underlay's `is_root` marker are insufficient. A real
+restricted directory root remains EPERM; unshare now enforces that missing
+restriction rather than silently creating authority inside a chroot.
+
+Validated: kernel2631 (layered root, restricted entry, and same-inode foreign
+mount identity); q35 lint784; system70/70 (`system-4pxqympe`); paired task-control
+and sysadmin20/20 (`abi-7ovmhlp9`). NEWUSER+NNP and NEWUSER+UTS require real
+successful native children now, not the old optional EPERM branch. Both clone
+and unshare reject the actual chroot fixture on both guests. This closes the
+creation gap exposed in step46 and restores clone3's implemented status.
 
 ## Tool acceptance ladder
 
