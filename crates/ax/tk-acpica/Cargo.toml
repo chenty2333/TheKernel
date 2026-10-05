@@ -13,3 +13,13 @@ cc = "1"
 
 [package.metadata.thekernel]
 layer = "mechanism"
+
+[features]
+host = []
+
+[package.metadata.thekernel.host-test]
+features = ["host"]
+
+[[example]]
+name = "table_probe"
+required-features = ["host"]
