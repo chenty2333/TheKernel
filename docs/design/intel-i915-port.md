@@ -184,3 +184,19 @@ ownership. DVI ignores HDMI scrambling bits; HDMI/DVI have four lanes regardless
 of the DP width field. Full encoder/audio/infoframe get_config remains outside
 this control-only slice. 4096 compiled-i915 states/read traces and three model
 regressions pass. No runtime DDI/clock writes or hardware validation introduced.
+
+### HDMI infoframe discovery
+
+Enabled GCP and AVI/SPD/vendor/HDR DIP data now follow display13 get_config
+read order. Raw control/data are retained; malformed enabled packets fail decode
+rather than become zero-filled valid frames. Hardware byte3 is the ECC hole,
+byte4 is the checksum. Decode handles AVI flags/bars, vendor VIC/3D metadata and
+HDR u16 fields, with bounded lengths and checksum checks.
+Known safety difference: SPD fixed-width text scans stop at each field boundary,
+not beyond a borrowed packet. The C comparison uses zero-padded backing buffers
+for the source initializer; it does not exercise unchecked string reads.
+Measured: 256 compiled-i915 enable/GCP/data/read-trace cases and4800 compiled
+HDMI-library field/rejection cases pass; dark/missing MMIO, every packet
+truncation, malformed headers/checksums, ECC-hole and bounded SPD tests pass.
+No packet writes, runtime backend, complete firmware equivalence or native KMS
+were enabled by this slice. Remaining pipe/global and GGTT proof still follow.

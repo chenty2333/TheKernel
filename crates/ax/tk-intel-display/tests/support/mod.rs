@@ -92,7 +92,11 @@ pub fn compile(code: &str, name: &str) -> Oracle {
     };
     let source = oracle.directory.join("oracle.c");
     // Preserve the MIT grant and source copyrights even in temporary copies.
-    let license = include_str!("../../LICENSE-MIT");
+    let license = concat!(
+        include_str!("../../LICENSE-MIT"),
+        "\n",
+        include_str!("../../LICENSE-HDMI-MIT")
+    );
     fs::write(&source, format!("/*\n{license}\n*/\n{code}")).unwrap();
     let result = Command::new("gcc")
         .args(["-std=c11", "-O2", "-Werror"])

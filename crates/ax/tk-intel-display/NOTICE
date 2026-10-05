@@ -151,3 +151,31 @@ src/ddi.rs:
   intel_display_regs.h selected fields: Copyright © 2025 Intel Corporation.
   DP software state, audio and infoframe get_config remain separate; unknown
   selections do not grant a DKL PLL. Combined raw clock evidence is original.
+
+src/hdmi.rs:
+  drivers/gpu/drm/i915/display/intel_hdmi.c:
+  hsw_infoframes_enabled, hsw_infoframe_enable, hsw_dip_data_reg,
+  hsw_read_infoframe, intel_hdmi_infoframes_enabled, intel_read_infoframe,
+  intel_hdmi_read_gcp_infoframe (display13 HDMI packet branches)
+  Copyright 2006 Dave Airlie <airlied@linux.ie>
+  Copyright © 2006-2009 Intel Corporation.
+  intel_display_regs.h: Copyright © 2025 Intel Corporation.
+  GCP and AVI/SPD/vendor/DRM data are read only when enabled. DIP byte3 is
+  the hardware ECC/reserved hole; byte4 is the packet checksum. No packet writes.
+src/hdmi_packet.rs:
+  drivers/video/hdmi.c / include/linux/hdmi.h:
+  hdmi_infoframe_checksum, hdmi_infoframe_unpack (four display packet types),
+  hdmi_{avi,spd,drm}_infoframe_unpack, hdmi_vendor_any_infoframe_unpack,
+  hdmi_drm_infoframe_unpack_only and selected initialization defaults
+  Copyright (C) 2012 Avionic Design GmbH.
+  Exact permission text, including non-infringement disclaimer, is preserved
+  separately in LICENSE-HDMI-MIT and included in temporary C oracle grants.
+  Checked slices and field-bounded SPD text intentionally avoid unchecked
+  packet/string accesses. No audio codec, HDMI sink or mode programming.
+
+HDMI-oracle inventory update: hdmi_packet.rs contributes seven additional
+outside-fence code matches at25 (none at40): the conventional min expression,
+five HDMI packet-size constants, and the HDMI IEEE OUI constant. All are
+32–34 or28 normalized characters; no driver body/prose is copied into Rust.
+Current crate totals are12 code matches at25 /2 at40; no fenced/comment/range
+matches. Whole crates/ax counts are reconciled in CI, without scan exemptions.

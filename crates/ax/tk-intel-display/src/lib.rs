@@ -13,6 +13,8 @@ pub mod device;
 pub mod display;
 pub mod dkl_phy;
 pub mod dpll_mgr;
+pub mod hdmi;
+pub mod hdmi_packet;
 pub mod opregion;
 pub mod scaler;
 pub mod tc;

@@ -304,3 +304,17 @@ DDI discovery translates selected HDMI/DVI control fields and TC clock-enabled /
 PLL-selection helpers from MIT `intel_ddi.c` (2012 Intel), with selected MIT
 `intel_display_regs.h` fields (2025 Intel), into `ddi.rs`. Source, NOTICE and the
 bundled grant retain attribution. No DDI programming or DP software core added.
+
+HDMI discovery translates display13 packet-enable/GCP/DIP reads and the hardware
+ECC-hole layout from MIT `intel_hdmi.c` (Dave Airlie 2006; Intel 2006–2009),
+with selected `intel_display_regs.h` fields (2025 Intel), into `hdmi.rs`.
+`hdmi_packet.rs` translates selected AVI/SPD/vendor/HDR decode/checksum helpers
+from MIT `drivers/video/hdmi.c` and `include/linux/hdmi.h` (Avionic Design 2012).
+Their exact grant has a non-infringement disclaimer and is bundled separately
+as `LICENSE-HDMI-MIT`, not replaced with a different standard-MIT disclaimer.
+The C-oracle helper includes both complete grants. Source/NOTICE inventory names
+all included functions; no GPL or HDMI/audio programming code is introduced.
+
+Seven new HDMI-oracle scanner matches at25 are conventional min and HDMI size /
+OUI constants. Registered in NOTICE/provenance and CI; at40 counts are unchanged.
+These do not import a C driver, GPL body or private capture fixture.

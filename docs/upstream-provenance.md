@@ -662,3 +662,27 @@ of the DP width field. Combined raw clock evidence is original glue; full
 encoder/DP/audio/infoframe state is not claimed by the control decoder.
 4096 compiled-C HDMI/DVI BPC/sync/scrambling and TC mux/gate states/read traces
 agree; missing/dark domains and unknown encodings are covered.
+
+HDMI slice: display13 packet-enable/GCP/DIP read helpers in MIT `intel_hdmi.c`
+→ `src/hdmi.rs`; exact included functions in NOTICE. Enabled GCP only is read,
+then enabled AVI/SPD/vendor/DRM packets in encoder get_config order. DIP has
+an ECC/reserved hole at byte3, not a hole at the byte4 checksum. Raw control
+(including filtered-out PPS/reserved bits) and raw bytes remain available to
+strict admission; reading a packet is not proof it is valid. 256 compiled-C
+hardware-enable/software-index/GCP/data states and exact MMIO traces agree.
+Selected MIT `drivers/video/hdmi.c`/`include/linux/hdmi.h` decode helpers →
+`src/hdmi_packet.rs`: all AVI fields/bars, SPD text/SDI, vendor VIC/3D metadata,
+and HDR u16 fields, checksum/version/length checks. Full Avionic Design grant
+is in LICENSE-HDMI-MIT. Known safety difference: SPD initializer's unchecked
+string scan is replaced with field-bounded prefix/zero-pad behavior; C oracle
+input buffers have explicit trailing zeros, not undefined string accesses.
+4800 packet-field/rejection cases agree with unmodified local C functions.
+No claim of full fastboot ownership, packet programming, audio or hardware output.
+
+HDMI-oracle excerpt inventory: seven new code matches at25 in
+`tests/hdmi_packet.rs`: conventional min, five packet-size constants and HDMI
+IEEE OUI. Their normalized lengths are28–34, so at40 totals are unchanged.
+Current Intel crate totals:12 code matches at25 /2 at40, no fenced/comment/marked
+matches. Whole crates/ax at25 is now18 fenced lines /15 blocks /4 files and40
+outside fences (29 code); at40 remains0 fenced and17 outside (10 code).
+Other scopes/citation counts unchanged; the baseline is reconciled, not bypassed.
