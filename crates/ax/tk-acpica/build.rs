@@ -38,5 +38,5 @@ fn main() {
         sources.sort();
         build.files(sources);
     }
-    build.file("c/abi.c").compile("tk_acpica");
+    build.file("c/abi.c").file("c/bridge.c").compile("tk_acpica");
 }

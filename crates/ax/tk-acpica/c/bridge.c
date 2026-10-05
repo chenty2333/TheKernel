@@ -10,4 +10,3 @@ void AcpiOsVprintf(const char *format, va_list args) {
 void AcpiOsPrintf(const char *format, ...) {
     va_list args; va_start(args, format); AcpiOsVprintf(format, args); va_end(args);
 }
-unsigned int tk_acpi_abi_width(void) { return sizeof(ACPI_SIZE) * 8; }
