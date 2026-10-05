@@ -130,8 +130,20 @@ impl Engine {
                 if self.hardware_id(&path).as_deref() != Ok("PNP0C0F") {
                     return Err(SUPPORT);
                 }
+                let sta = match self.integer(&format!("{path}._STA")) {
+                    Ok(v) => v,
+                    Err(5) => 0xf,
+                    Err(e) => return Err(e),
+                };
+                if sta & 3 != 3 {
+                    return Err(SUPPORT);
+                }
                 let r = crate::resources::parse(&self.resources(&path, false)?)?;
-                if r.irqs.len() != 1 || r.irqs[0].numbers.len() != 1 || !r.irqs[0].level {
+                if r.irqs.len() != 1
+                    || r.irqs[0].numbers.len() != 1
+                    || !r.irqs[0].level
+                    || r.irqs[0].numbers[0] == 0
+                {
                     return Err(SUPPORT);
                 }
                 Ok((r.irqs[0].numbers[0], r.irqs[0].active_low))

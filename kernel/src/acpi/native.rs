@@ -1,4 +1,4 @@
-//! Native OSL adapter. Enabled only by acpi=acpica; no native hardware claim.
+//! Native OSL adapter. Default firmware service backend; no native hardware claim.
 use core::{
     ffi::c_void,
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
@@ -251,7 +251,7 @@ unsafe impl Backend for Native {
         }
     }
     fn read_port(&self, address: u16, width: u32) -> Result<u32, Status> {
-        // SAFETY: OSL validated port width/range; explicit acpi=acpica owns I/O.
+        // SAFETY: OSL validated port width/range; the admitted firmware backend owns I/O.
         unsafe {
             let value: u32;
             match width {
@@ -274,7 +274,7 @@ unsafe impl Backend for Native {
         }
     }
     fn write_port(&self, address: u16, width: u32, value: u32) -> Status {
-        // SAFETY: OSL validated port width/range; explicit acpi=acpica owns I/O.
+        // SAFETY: OSL validated port width/range; the admitted firmware backend owns I/O.
         unsafe {
             match width {
                 8 => {

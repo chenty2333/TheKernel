@@ -1,4 +1,4 @@
-//! Kernel ACPI ownership and policy; native transitions are opt-in.
+//! Kernel ACPI ownership and policy; ACPICA is default; static parsing is a minimal rescue.
 use alloc::{string::String, vec::Vec};
 
 use axsync::Mutex;
@@ -18,8 +18,11 @@ mod wake;
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 static BUTTONS: SpinNoIrq<Vec<String>> = SpinNoIrq::new(Vec::new());
 
+fn select_native(option: Option<&str>) -> Result<bool, ()> {
+    match option { None | Some("acpica") => Ok(true), Some("static") => Ok(false), Some(_) => Err(()) }
+}
 pub fn enabled() -> bool {
-    axhal::boot::command_line_value("acpi") == Some("acpica")
+    select_native(axhal::boot::command_line_value("acpi")) == Ok(true)
 }
 pub fn with_engine<T>(f: impl FnOnce(&Engine) -> T) -> Option<T> {
     let engine = ENGINE.lock();
@@ -30,15 +33,19 @@ pub fn namespace() -> Vec<Node> {
 }
 static INIT_TRIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 pub fn init() {
-    if !enabled() || INIT_TRIED.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        return;
+    if INIT_TRIED.swap(true, core::sync::atomic::Ordering::AcqRel) { return; }
+    match select_native(axhal::boot::command_line_value("acpi")) {
+        Ok(true) => {}
+        Ok(false) => { info!("acpica: explicit static rescue requested; AML disabled"); return; }
+        Err(()) => { warn!("acpica: unknown acpi option; using static rescue, AML disabled"); return; }
     }
     #[cfg(target_os = "none")]
     if let Err(status) = initialize() {
         ec::stop();
         native::stop_worker();
         axhal::acpi::restore_static();
-        warn!("acpica: initialization failed status={status:#x}; static fallback restored");
+        warn!("acpica: initialization failed status={status:#x}; static fallback restored; fixed-button={}", axhal::power::power_button_available());
+        axhal::console::write_tty_bytes(b"THEKERNEL_ACPICA_INIT_FAILED_STATIC_RESCUE\n");
     }
 }
 #[cfg(target_os = "none")]
@@ -47,8 +54,8 @@ fn initialize() -> Result<(), Status> {
         return Err(tk_acpica::SUPPORT);
     }
     native::start_worker()?;
-    // SAFETY: allocation, scheduler, IRQ/APIC and owned RSDP are ready; only
-    // explicit acpi=acpica allows firmware AML to take hardware ownership.
+    // SAFETY: the pre-probe BSP service boundary established allocation,
+    // blocking scheduler, IRQ/timer and owned RSDP before firmware ownership.
     let mut engine = unsafe {
         Engine::initialize_with_tables(&native::REGISTRATION, Mode::Hardware, ec::bootstrap)
     }?;
@@ -62,9 +69,8 @@ fn initialize() -> Result<(), Status> {
         }
     }
     *BUTTONS.lock() = buttons;
-    let fixed = engine
-        .install_fixed_power(axhal::acpi::button_event)
-        .is_ok();
+    let fixed = engine.fixed_power_supported();
+    if fixed { engine.install_fixed_power(axhal::acpi::button_event)?; }
     let ec_count = ec::install(&engine, &nodes)?;
     let wake_sources = wake::configure(&engine, &nodes)?;
     info!("acpica: registered wake GPE sources={wake_sources}; sleep wake masks remain disabled");
@@ -145,5 +151,17 @@ impl axruntime::PlatformServices for FirmwareServices {
         #[cfg(target_os = "none")]
         axhal::console::write_tty_bytes(b"THEKERNEL_PLATFORM_SERVICES_READY\n");
         init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn native_is_default_and_only_named_rescue_bypasses_it() {
+        assert_eq!(super::select_native(None), Ok(true));
+        assert_eq!(super::select_native(Some("acpica")), Ok(true));
+        assert_eq!(super::select_native(Some("static")), Ok(false));
+        assert_eq!(super::select_native(Some("off")), Err(()));
+        assert_eq!(super::select_native(Some("")), Err(()));
     }
 }

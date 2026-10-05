@@ -26,14 +26,14 @@ def ordered(text: str, *markers: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--no-build", action="store_true")
-    parser.add_argument("--case", choices=("thermal", "method-button", "fixed-button", "fallback", "all"), default="all")
+    parser.add_argument("--case", choices=("thermal", "method-button", "fixed-button", "fallback", "routing-failure", "static-rescue", "all"), default="all")
     args = parser.parse_args()
     os.environ["THEKERNEL_TOOLCHAIN"] = "acpica"
     run_args = product.build_parser().parse_args(["run", "--profile", "shell", "--toolchain", "acpica"])
     artifacts = product.artifacts_for(run_args)
     if not args.no_build:
         product.build_cmd(run_args)
-    cases = ("thermal", "method-button", "fixed-button", "fallback") if args.case == "all" else (args.case,)
+    cases = ("thermal", "method-button", "fixed-button", "fallback", "routing-failure", "static-rescue") if args.case == "all" else (args.case,)
     for case in cases:
         run_case(artifacts, case)
 
@@ -57,8 +57,8 @@ def run_case(artifacts, case: str) -> None:
         fixture = "thermal.aml"
     elif case == "method-button":
         fixture = "button.aml"
-    elif case == "fallback":
-        fixture = "unsupported-ecdt.bin"
+    elif case in ("fallback", "routing-failure"):
+        fixture = "unsupported-ecdt.bin" if case == "fallback" else "unsupported-pci.aml"
         powerdown = "THEKERNEL_ACPI_POLICY_READY"
     else:
         fixture = None
@@ -72,7 +72,7 @@ def run_case(artifacts, case: str) -> None:
         accel="kvm", timeout=120, workdir=directory, interactive=False,
         input_after_marker="THEKERNEL_SHELL_READY", stop_after_marker=None,
         commands=commands, extra_block=None, run_cpus=4,
-        kernel_cmdline="acpi=acpica", qemu_extra_args=extra,
+        kernel_cmdline="acpi=static" if case == "static-rescue" else None, qemu_extra_args=extra,
         powerdown_after_marker=powerdown, qmp_timeout_secs=120,
     ))
     if result:
@@ -84,15 +84,22 @@ def run_case(artifacts, case: str) -> None:
             if value not in console.splitlines():
                 raise RuntimeError(f"missing actual sysfs value {value!r}; see {directory}")
         ordered(console, "THEKERNEL_THERMAL_SYSFS_READ", "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPICA_S5_PREPARED")
-        ordered(kernel, "thermal critical trip reached", "acpi-power: filesystems flushed; entering S5", "acpica: entering S5 after AML preparation")
-    elif case == "fallback":
-        ordered(kernel, "static fallback restored", "acpi-power: filesystems flushed; entering S5")
+        ordered(kernel, "thermal critical trip reached")
+        ordered(console, "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPI_FILESYSTEMS_FLUSHED", "THEKERNEL_ACPICA_S5_PREPARED")
+    elif case in ("fallback", "routing-failure", "static-rescue"):
+        start = "explicit static rescue requested" if case == "static-rescue" else "static fallback restored"
+        ordered(kernel, start)
+        ordered(console, "THEKERNEL_SHELL_READY", "THEKERNEL_ACPI_FILESYSTEMS_FLUSHED")
         if "THEKERNEL_ACPICA_S5_PREPARED" in console or "acpica: ready version" in kernel:
             raise RuntimeError("failed initialization retained ACPICA ownership")
-        ordered(console, "THEKERNEL_SHELL_READY", "THEKERNEL_ACPI_BUTTON_EVENT")
+        if case != "static-rescue":
+            ordered(console, "THEKERNEL_ACPICA_INIT_FAILED_STATIC_RESCUE", "THEKERNEL_SHELL_READY", "THEKERNEL_ACPI_BUTTON_EVENT")
+        else:
+            ordered(console, "THEKERNEL_SHELL_READY", "THEKERNEL_ACPI_FILESYSTEMS_FLUSHED")
     else:
         expected = "method-buttons=1" if case == "method-button" else "fixed-button=true"
-        ordered(kernel, expected, "acpi-power: filesystems flushed; entering S5", "acpica: entering S5 after AML preparation")
+        ordered(kernel, expected)
+        ordered(console, "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPI_FILESYSTEMS_FLUSHED", "THEKERNEL_ACPICA_S5_PREPARED")
         ordered(console, "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPICA_S5_PREPARED")
     print("ACPICA_" + case.upper().replace("-", "_") + "_QEMU_PASS", directory, flush=True)
 

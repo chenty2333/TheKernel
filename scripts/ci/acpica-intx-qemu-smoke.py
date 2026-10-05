@@ -56,6 +56,7 @@ def main() -> None:
         worker.start()
         commands = directory / "commands"
         commands.write_text(
+            "/opt/thekernel-tests/bin/thekernel-acpi-smoke require-tools && /bin/busybox echo THEKERNEL_ACPI_INSPECTION_COMPLETE\n"
             "/bin/busybox dmesg | /bin/busybox grep 'acpica:'\n"
             f"/opt/thekernel-tests/bin/thekernel-acpi-intx-smoke {port} 54 && /bin/busybox echo THEKERNEL_INTX_COMPLETE\n"
             "/bin/busybox poweroff -f\n"
@@ -65,14 +66,14 @@ def main() -> None:
                 accel="kvm", timeout=120, workdir=directory, interactive=False,
                 input_after_marker="THEKERNEL_SHELL_READY", stop_after_marker=None,
                 commands=commands, extra_block=None, run_cpus=4,
-                kernel_cmdline="acpi=acpica", qemu_extra_args=("-global", "virtio-net-pci.vectors=0"),
+                kernel_cmdline=None, qemu_extra_args=("-global", "virtio-net-pci.vectors=0"),
             ))
         finally:
             stop.set()
             worker.join(timeout=11)
     console = (directory / "console.log").read_text()
     kernel = (directory / "kernel.log").read_text()
-    markers = ("THEKERNEL_ACPI_NIC_INTX_ONLY", "THEKERNEL_ACPI_INTX_IO_OK", "THEKERNEL_INTX_COMPLETE")
+    markers = ("THEKERNEL_ACPI_USER_TOOLS_OK", "THEKERNEL_ACPI_INSPECTION_COMPLETE", "THEKERNEL_ACPI_NIC_INTX_ONLY", "THEKERNEL_ACPI_INTX_IO_OK", "THEKERNEL_INTX_COMPLETE")
     if result or failures or worker.is_alive() or seen[0] != 65536 or any(m not in console for m in markers):
         raise RuntimeError(f"INTx I/O failed: exit={result} bytes={seen[0]} server={failures}; {directory}")
     if "INTx 00:06.0 pin=1 GSI=22 low=false" not in kernel + console:

@@ -69,6 +69,7 @@ unsafe extern "C" {
         used: *mut usize,
     ) -> Status;
     fn tk_acpi_platform_osc() -> Status;
+    fn tk_acpi_has_fixed_power() -> u8;
     fn tk_acpi_install_fixed_power() -> Status;
     fn tk_acpi_table_count() -> u32;
     fn tk_acpi_resolve(
@@ -301,6 +302,11 @@ impl Engine {
         self.notify = true;
         Ok(())
     }
+    /// FADT method-button/reduced-hardware flags exclude the fixed PM1 button.
+    pub fn fixed_power_supported(&self) -> bool {
+        // SAFETY: FADT globals belong to this live engine.
+        unsafe { tk_acpi_has_fixed_power() != 0 }
+    }
     pub fn install_fixed_power(&self, callback: fn()) -> Result<(), Status> {
         POWER.store(callback as usize, Ordering::Release);
         // SAFETY: the callback is static and only latches a coalesced event.
@@ -445,6 +451,23 @@ extern "C" fn tk_acpi_fixed_power() {
         // SAFETY: install_fixed_power publishes only static fn() callbacks.
         unsafe {
             core::mem::transmute::<usize, fn()>(callback)();
+        }
+    }
+}
+
+#[cfg(test)]
+mod fixed_power_tests {
+    unsafe extern "C" {
+        fn tk_acpi_fixed_power_supported(flags: u32) -> u8;
+    }
+    #[test]
+    fn method_button_and_reduced_hardware_do_not_enable_fixed_pm1() {
+        // SAFETY: pure flags predicate; no hardware or global state access.
+        unsafe {
+            assert_eq!(tk_acpi_fixed_power_supported(0), 1);
+            assert_eq!(tk_acpi_fixed_power_supported(1 << 4), 0);
+            assert_eq!(tk_acpi_fixed_power_supported(1 << 20), 0);
+            assert_eq!(tk_acpi_fixed_power_supported((1 << 4) | (1 << 20)), 0);
         }
     }
 }

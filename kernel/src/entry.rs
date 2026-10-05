@@ -358,8 +358,17 @@ pub fn init(args: &[String], envs: &[String]) {
         .filesystem()
         .flush()
         .expect("Failed to flush rootfs");
+    report_power_flush();
 
     system_off();
+}
+
+/// Both PID-1 completion and the force-after-grace worker reach this only
+/// after a successful flush. Keep acceptance observable even when init reacts
+/// to SIGPWR before the worker's grace expires or diagnostic UART is busy.
+fn report_power_flush() {
+    axruntime::klog::death_notice(format_args!("acpi-power: filesystems flushed; entering S5"));
+    axhal::console::write_tty_bytes(b"THEKERNEL_ACPI_FILESYSTEMS_FLUSHED\n");
 }
 
 /// IRQ handler only latches the event; sleeping, PID-1 notification and filesystem
@@ -376,7 +385,7 @@ fn spawn_power_button_task() -> axerrno::AxResult<axtask::AxTaskRef> {
                 let _ = axtask::sleep(core::time::Duration::from_secs(1));
                 let mount = FS_CONTEXT.lock().root_dir().mountpoint().clone();
                 match mount.flush_all_filesystems() {
-                    Ok(()) => axruntime::klog::death_notice(format_args!("acpi-power: filesystems flushed; entering S5")),
+                    Ok(()) => report_power_flush(),
                     Err(error) => axruntime::klog::death_notice(format_args!("acpi-power: shutdown flush failed: {error}")),
                 }
                 system_off();

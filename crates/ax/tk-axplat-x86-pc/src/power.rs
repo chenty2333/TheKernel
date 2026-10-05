@@ -280,7 +280,7 @@ fn enter_s5() -> bool {
     true
 }
 
-// ACPICA owns SCI only after explicit opt-in and successful OSL registration.
+// ACPICA takes SCI ownership only after successful OSL registration.
 static ACPICA_OFF: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static ACPICA_SCI: AtomicBool = AtomicBool::new(false);
 pub fn register_acpica_off(callback:fn()->bool) { ACPICA_OFF.store(callback as usize,Ordering::Release); }

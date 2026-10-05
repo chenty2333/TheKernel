@@ -128,6 +128,12 @@ ACPI_STATUS tk_acpi_platform_osc(void) {
 }
 extern void tk_acpi_fixed_power(void);
 static UINT32 FixedPower(void *context) { (void)context;tk_acpi_fixed_power();return ACPI_INTERRUPT_HANDLED; }
+UINT8 tk_acpi_fixed_power_supported(UINT32 flags) {
+    return !(flags & (ACPI_FADT_POWER_BUTTON | ACPI_FADT_HW_REDUCED));
+}
+UINT8 tk_acpi_has_fixed_power(void) {
+    return tk_acpi_fixed_power_supported(AcpiGbl_FADT.Flags);
+}
 ACPI_STATUS tk_acpi_install_fixed_power(void) {
     return AcpiInstallFixedEventHandler(ACPI_EVENT_POWER_BUTTON,FixedPower,NULL);
 }
