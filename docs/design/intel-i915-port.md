@@ -139,3 +139,14 @@ Compiled-i915 C comparison passes 192 states/entry streams/traces. Five host
 regressions cover bypass/dark domains, buffer bounds, unsupported precision,
 all indexed-access failure prefixes, CSC and LUT packing. No runtime color
 programming or hardware validation was introduced.
+
+### Scaler discovery
+
+Display13 pipe-scaler getter and window readout now follow i915, with separate
+already-enabled PANEL_FITTER power. An extra ownership helper inspects both
+controls so a plane-bound scaler cannot be missed by the pipe-only getter.
+Any active scaler remains outside plane-only fastboot admission; geometry and
+filter programming belong to native modeset. Compiled-C comparison passes48
+configurations/read traces, including pipe-D0x800 stride and direct window
+sizes. Dark/missing domains and reserved bindings are covered. No runtime call
+site or scaler programming was enabled.

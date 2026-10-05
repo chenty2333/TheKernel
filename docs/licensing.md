@@ -282,3 +282,8 @@ The color-oracle shim contributes four normalized scanner matches at25 (one
 at40): conventional min/length expressions and MIT color-state declarations.
 These are registered in crate NOTICE/provenance and CI inventory, without a
 scanner exemption or an added GPL implementation.
+
+Scaler discovery additionally translates MIT `skl_scaler.c` pipe scaler state
+and configuration getters (2020 Intel) with selected `intel_display_regs.h`
+fields (2025 Intel) into `src/scaler.rs`. Permission/copyright references and
+function inventory accompany source/NOTICE; no GPL display trace is imported.

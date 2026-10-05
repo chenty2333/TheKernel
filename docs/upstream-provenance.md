@@ -616,3 +616,13 @@ code matches at25 / two at40, no fenced/comment/marked matches. Current whole
 17 outside fences (10 code); at25, 18 fenced /15 blocks /4 files and33 outside
 fences (22 code). Other scopes and citation counts are unchanged; CI baseline
 is reconciled, not suppressed. Temporary imported bodies retain the MIT grant.
+
+Scaler slice: MIT `skl_scaler.c::{skl_pipe_scaler_get_hw_state,
+skl_scaler_get_config}` → `src/scaler.rs`, display13/two scalers, no CASF.
+Offsets use **pipe stride0x800**, not transcoder/plane stride0x1000. Window
+sizes are direct pixels, not +1 fields. PANEL_FITTER power is pinned separately
+and never woken for discovery. Original extra ownership readout checks both
+controls, including active plane/reserved bindings which the pipe-only getter
+skips. Active filter/scaling state is not admitted for plane-only fastboot.
+48 compiled-C configurations and exact read traces agree; dark-domain,
+missing-register and plane/reserved-binding regressions pass.

@@ -108,3 +108,13 @@ min expression, LEGACY_LUT_LENGTH constant and two MIT color-state member
 layouts at25; only the dual drm_property_blob pointer declaration also meets40.
 These are C compile-shim facts/declarations, not imported driver bodies or prose.
 No scanner exemption is applied. Whole crates/ax totals are registered in CI.
+
+src/scaler.rs:
+  drivers/gpu/drm/i915/display/skl_scaler.c:
+  skl_pipe_scaler_get_hw_state, skl_scaler_get_config (display13, CASF absent)
+  Copyright © 2020 Intel Corporation.
+  intel_display_regs.h: selected scaler fields
+  Copyright © 2025 Intel Corporation.
+  Additional original ownership readout checks BOTH scaler controls, including
+  plane/reserved bindings skipped by the upstream pipe-only getter. Power must
+  be pinned for PANEL_FITTER independently of the pipe. No filter programming.

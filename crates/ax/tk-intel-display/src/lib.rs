@@ -13,6 +13,7 @@ pub mod display;
 pub mod dkl_phy;
 pub mod dpll_mgr;
 pub mod opregion;
+pub mod scaler;
 pub mod universal_plane;
 
 /// Backend access failure: unavailable/powered-off registers never become zero.
