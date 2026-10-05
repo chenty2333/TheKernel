@@ -156,3 +156,11 @@ ACPI_STATUS tk_acpi_resolve(const char *parent,const char *source,UINT8 *out,ACP
     if(ACPI_SUCCESS(status)){ACPI_SIZE length=strlen(path.Pointer);if(length>capacity)status=AE_LIMIT;else{memcpy(out,path.Pointer,length);*used=length;}}
     if(path.Pointer)AcpiOsFree(path.Pointer);return status;
 }
+UINT32 tk_acpi_table_count(void) {
+    UINT32 count=0;
+    if(ACPI_SUCCESS(AcpiUtAcquireMutex(ACPI_MTX_TABLES))) {
+        count=AcpiGbl_RootTableList.CurrentTableCount;
+        AcpiUtReleaseMutex(ACPI_MTX_TABLES);
+    }
+    return count;
+}

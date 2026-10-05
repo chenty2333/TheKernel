@@ -31,6 +31,7 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     fuse_dir.add("connections", empty_dir(fs.clone()));
     fs_dir.add("fuse", SimpleDir::new_maker(fs.clone(), Arc::new(fuse_dir)));
 
+    root.add("firmware",super::acpi::firmware(fs.clone()));
     root.add("class", class_dir(fs.clone()));
     root.add("block", block_dir(fs.clone()));
     root.add("dev", dev_dir(fs.clone()));
@@ -180,6 +181,7 @@ fn bus_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         "event_source",
         SimpleDir::new_maker(fs.clone(), Arc::new(event_source)),
     );
+    let bus=bus.chain(super::acpi::bus_root(fs.clone()));
     SimpleDir::new_maker(
         fs.clone(),
         Arc::new(bus.chain(device_registry::bus_root(fs))),

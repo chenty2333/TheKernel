@@ -70,6 +70,7 @@ unsafe extern "C" {
     ) -> Status;
     fn tk_acpi_platform_osc() -> Status;
     fn tk_acpi_install_fixed_power() -> Status;
+    fn tk_acpi_table_count() -> u32;
     fn tk_acpi_resolve(
         parent: *const c_char,
         source: *const c_char,
@@ -124,6 +125,14 @@ impl Engine {
     /// Run _REG/_STA/_INI after custom handlers (notably EC) are installed.
     /// An owned table copy. OEM tables may contain private data (e.g. MSDM);
     /// callers must apply root-only access policy and must never log the bytes.
+    pub fn table_count(&self) -> Result<u32, Status> {
+        // SAFETY: live instance, C reads the descriptor count under its mutex.
+        let count = unsafe { tk_acpi_table_count() };
+        if count > 4096 {
+            return Err(LIMIT);
+        }
+        Ok(count)
+    }
     pub fn table(&self, index: u32) -> Result<Vec<u8>, Status> {
         let mut bytes = Vec::new();
         bytes
