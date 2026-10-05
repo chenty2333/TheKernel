@@ -578,3 +578,17 @@ upstream behavior. Optional `upstream_dkl` compiles unmodified local C helpers,
 state-readout body and register masks: 192 four-operation traces and 12 masked
 PLL states/read traces. The oracle ignores only the documented preservation
 wrapper's three extra operations, not any upstream register access.
+
+Plane slice: `skl_universal_plane.c::{skl_format_to_fourcc,
+skl_get_initial_plane_config,skl_plane_stride_mult}` and ADL-P main-plane
+`intel_fb.c::intel_tile_{size,width_bytes,height}` / `intel_fb_align_height` →
+`src/universal_plane.rs`. Source format fallback is preserved for readout, but
+native admission separately requires the exact XRGB8888 raw format, linear,
+opaque/unrotated/unreflected layout, bypassed plane color and complete pitch.
+ADL-P field5 is **Yf**, not DG2 4-tile. Five universal planes are exposed per
+pipe (display13 runtime has four sprites plus primary). Main size is checked
+u64, unlike upstream u32 multiplication. Auxiliary/compression/DPT ownership
+is not proven by this slice. Optional `upstream_plane` compiles the unchanged
+format, full initial-plane reconstruction and tile/stride bodies with external
+register/format definitions: 1792 format/alpha/order/tiling/rotation/layout
+states and exact seven-read traces. No physical memory or private fixture added.

@@ -72,3 +72,17 @@ src/dpll_mgr.rs additionally includes dkl_pll_get_hw_state, ADL-P
   Readout restores and verifies firmware's selector under a single lock;
   i915 driver-owned individual access routines retain their original sequence.
   dco_khz is derived metadata, excluded from raw state comparisons.
+
+src/universal_plane.rs:
+  drivers/gpu/drm/i915/display/skl_universal_plane.c:
+  skl_format_to_fourcc, skl_get_initial_plane_config, skl_plane_stride_mult
+  Copyright © 2020 Intel Corporation.
+  drivers/gpu/drm/i915/display/intel_fb.c:
+  intel_tile_{size,width_bytes,height}, intel_fb_align_height (ADL-P main plane)
+  Copyright © 2021 Intel Corporation.
+  skl_universal_plane_regs.h: selected plane fields
+  Copyright © 2024 Intel Corporation.
+  include/uapi/drm/drm_fourcc.h: selected format/modifier encodings
+  Copyright 2011 Intel Corporation.
+  ADL-P has five exposed universal planes, no DG2 4-tile interpretation.
+  No auxiliary plane/DPT ownership, joiner or allocation is implied by readout.

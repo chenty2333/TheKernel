@@ -108,3 +108,18 @@ Measured: local compiled i915 C agrees on 192 primitive-operation traces across
 four ports/16 banks and 12 PLL states/read traces. Five regression tests cover
 layout, unchanged RMW stores, dark/disabled domains, 18 fault prefixes and both
 restoration write/read failures. No physical MMIO or monitor output was tested.
+
+### Plane reconstruction
+
+Plane format/modifier/rotation/stride/main-size readout now follows the upstream
+initial-plane path, including two CTL reads (get_hw_state then reconstruction).
+Display13 exposes five universal planes per pipe. ADL-P has Yf, not 4-tile.
+Readout preserves unknown-format fallback as i915 does; fastboot admission
+must not accept it as XRGB evidence. The plane-local admission helper rejects
+nonlinear/DPT, auxiliary or multiplane formats, rotation/reflection, encryption,
+async flip, keying and non-bypassed plane color. It is necessary, not sufficient:
+full link/pipe/scaler/color/WM/GGTT/latch stability still belongs to takeover.
+Known difference: main-size multiplication uses u64 rather than wrapping u32.
+Measured: compiled upstream C agrees on 1792 states and exact read traces;
+four model tests cover missing/dark domains, unsupported layouts and admission.
+No kernel plane writes or hardware output were enabled by this slice.

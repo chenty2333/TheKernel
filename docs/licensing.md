@@ -264,3 +264,9 @@ The DKL access/readout slice additionally translates MIT `intel_dkl_phy.c`
 The 2022 / 2006–2016 Intel copyrights and permission-text references accompany
 source; selected display register fields retain the 2025 attribution in NOTICE.
 The local C oracle uses the same temporary-source grant, not a shipped C driver.
+
+Plane reconstruction translates MIT `skl_universal_plane.c` format and initial
+plane readout/stride helpers, ADL-P main-plane tile helpers from `intel_fb.c`,
+and selected encodings in `skl_universal_plane_regs.h` / `drm_fourcc.h` into
+`universal_plane.rs`. Original 2020, 2021, 2024 and 2011 Intel copyrights are
+preserved in source, NOTICE and the bundled MIT text. No DRM core is imported.
