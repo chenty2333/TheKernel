@@ -193,7 +193,7 @@ class SystemTestGateTests(unittest.TestCase):
             "nested": ["compiler-smoke", "nested-tcg-hello", "nested-linux-boot"],
             "glibc": ["glibc-smoke"],
             "gcc": ["glibc-smoke", "gcc-smoke"],
-            "debug": ["real-debugger"],
+            "debug": ["real-debugger", "real-gdb-threads"],
         }
         with test_tmpdir() as directory:
             for payload, flags in defines.items():
@@ -207,7 +207,7 @@ class SystemTestGateTests(unittest.TestCase):
                     text = result.stdout
                     present = [name for name in ("compiler-smoke", "nested-tcg-hello",
                                                  "nested-linux-boot", "glibc-smoke",
-                                                 "gcc-smoke", "real-debugger")
+                                                 "gcc-smoke", "real-debugger", "real-gdb-threads")
                                if f'{{ "{name}",' in text]
                     self.assertEqual(present, expected[payload])
                     # Both payloads are supersets of `none`, so the baseline

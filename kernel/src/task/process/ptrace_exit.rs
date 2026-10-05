@@ -85,15 +85,18 @@ pub(crate) fn retained_ptrace_exit_session(process: &Process) -> Option<PtraceSe
 
 /// Transfer before clearing the live relationship, under its action gate. The
 /// tracer reverse link remains until terminal wait or tracer teardown.
-pub(crate) fn retain_ptrace_exit(data: &ProcessData) {
-    let session = data.ptrace_active_session();
+pub(crate) fn retain_ptrace_exit(thread: &super::super::Thread) {
+    let data = &thread.proc_data;
+    let session = thread.ptrace_active_session();
     let owner = data.group_leader_signal_owner();
     let mut owner = owner.lock();
     let Some(identity) = owner.as_mut() else {
         return;
     };
     identity.exit_autoreap = data.autoreap();
-    if let Some(session) = session {
+    if thread.is_thread_group_leader()
+        && let Some(session) = session
+    {
         identity.ptrace_exit = PtraceExitState::Pending(session);
     }
 }
@@ -166,7 +169,8 @@ pub(crate) fn claim_ptrace_exit(
             return None;
         }
     }
-    waiter.remove_ptrace_tracee(PtraceReverseLink::new(process.pid(), expected));
+    let tracee_tid = snapshot.reap_owner.lock().as_ref()?.registration_tid;
+    waiter.remove_ptrace_tracee(PtraceReverseLink::new(tracee_tid, expected));
     let real_parent = process
         .parent()
         .is_some_and(|parent| parent.pid() == waiter.proc.pid());

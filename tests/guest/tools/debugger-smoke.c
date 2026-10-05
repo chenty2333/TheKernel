@@ -67,6 +67,20 @@ int main(int argc, char **argv) {
     char *strace_version[] = {"/usr/bin/strace", "--version", NULL};
     if (run_tool(gdb_version, "gdb-version") || !strstr(output, "GNU gdb (GDB) 16.3")) return 1;
     if (run_tool(strace_version, "strace-version") || !strstr(output, "strace -- version 6.19")) return 1;
+    if (argc == 2 && strcmp(argv[1], "--threads") == 0) {
+        char *threads[] = {"/usr/bin/gdb", "-q", "-nx", "-batch", "-x",
+            "/opt/thekernel-tests/debugger/threads.gdb", "--args",
+            "/opt/thekernel-tests/debugger/threads-target", NULL};
+        if (run_tool(threads, "gdb-threads")) return 1;
+        if (!strstr(output, "worker_inner (marker=11)") ||
+            !strstr(output, "worker_inner (marker=22)") ||
+            !strstr(output, "snapshot_ready (marker=33)") ||
+            !strstr(output, "Switching to thread 2") ||
+            !strstr(output, "Switching to thread 3") ||
+            !strstr(output, "fs_base") || !strstr(output, "THREADS_RESULT=12,23,34") ||
+            !strstr(output, "exited normally")) return 1;
+        puts("THEKERNEL_REAL_GDB_THREADS_OK"); return 0;
+    }
     char *gdb[] = {"/usr/bin/gdb", "-q", "-nx", "-batch", "-x", SCRIPT, "--args", TARGET, NULL};
     if (run_tool(gdb, "gdb-basic")) return 1;
     if (!strstr(output, "Breakpoint 1") || !strstr(output, "middle (input=4)") ||

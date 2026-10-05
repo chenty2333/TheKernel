@@ -1658,7 +1658,14 @@ fn wait_for_caught_signal(
     with_proc_state_hint(ProcStateHint::Interruptible, || {
         let mut block = SignalWaitBlock::new(None);
         loop {
-            if thr.pending_exit() {
+            if thr.pending_exit() || thr.proc_data.should_exit_for_exec(thr.kernel_tid()) {
+                return Ok(());
+            }
+            // A private ptrace request need not enqueue a signal. Publish the
+            // actual blocked syscall context and remain in pause/sigsuspend
+            // after CONT; only a caught handler completes this signal wait.
+            crate::task::wait_if_stopped(thr, uctx);
+            if thr.pending_exit() || thr.proc_data.should_exit_for_exec(thr.kernel_tid()) {
                 return Ok(());
             }
 

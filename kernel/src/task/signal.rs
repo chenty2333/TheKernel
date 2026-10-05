@@ -82,12 +82,6 @@ pub(crate) fn apply_signal_context(context: &mut UserContext, signal: &SignalUse
 }
 
 fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData, code: u32, status: i32) {
-    if matches!(code, linux_raw_sys::general::CLD_TRAPPED | linux_raw_sys::general::CLD_STOPPED)
-        && proc_data.current_stop_report().is_some_and(|stop| stop.ptrace_session.is_some())
-        && (!proc_data.ptrace_stop_ready() || !proc_data.claim_ptrace_stop_notification())
-    {
-        return;
-    }
     let notify_pid = proc_data
         .ptrace_tracer()
         .or_else(|| proc_data.proc.parent().map(|parent| parent.pid()));
@@ -128,26 +122,39 @@ fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData, code: u32, sta
 // shrink the variant would put an allocation on the signal-delivery path.
 #[allow(clippy::result_large_err)]
 fn try_ptrace_signal_stop(
-    proc_data: &ProcessData,
+    thr: &Thread,
     record: PtraceSignalRecord,
 ) -> Result<(), PtraceSignalRecord> {
+    let proc_data = &thr.proc_data;
     let signo = record.info().signo();
-    if matches!(signo, Signo::SIGKILL | Signo::SIGCONT) || proc_data.ptrace_tracer().is_none() {
+    if matches!(signo, Signo::SIGKILL | Signo::SIGCONT) || thr.ptrace_tracer().is_none() {
         return Err(record);
     }
-    proc_data.try_ptrace_signal_stop(record)?;
+    thr.try_ptrace_signal_stop(record)?;
     debug!(
         "Stopping traced process {} by signal {}",
         proc_data.proc.pid(),
         signo as u8
     );
-    notify_tracer_or_parent_stop_continue(
-        proc_data,
-        linux_raw_sys::general::CLD_TRAPPED,
-        signo as i32,
-    );
-    interrupt_stop_siblings(proc_data);
+    notify_ptrace_attach_stop(thr);
+    if let Ok(task) = get_task(thr.kernel_tid()) {
+        task.interrupt();
+    }
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn try_ptrace_process_signal_stop(
+    proc_data: &ProcessData,
+    record: PtraceSignalRecord,
+) -> Result<(), PtraceSignalRecord> {
+    let Some(task) = proc_data.ptrace_leader_task() else {
+        return Err(record);
+    };
+    let Some(thread) = task.try_as_thread() else {
+        return Err(record);
+    };
+    try_ptrace_signal_stop(thread, record)
 }
 
 fn publish_prepared_thread(
@@ -564,6 +571,9 @@ pub(crate) fn complete_signal_delivery(
 }
 
 pub(crate) fn has_pending_syscall_signal(thr: &Thread) -> bool {
+    if thr.should_wait_for_ptrace_stop() || thr.proc_data.should_exit_for_exec(thr.kernel_tid()) {
+        return true;
+    }
     let pending = thr.signal.pending();
     if pending.is_empty() {
         return false;
@@ -656,10 +666,9 @@ fn send_signal_thread_inner_with(
         do_continue(&thr.proc_data);
     }
 
-    if thr.proc_data.ptrace_tracer().is_some() && !matches!(signo, Signo::SIGKILL | Signo::SIGCONT)
-    {
+    if thr.ptrace_tracer().is_some() && !matches!(signo, Signo::SIGKILL | Signo::SIGCONT) {
         let prepared = prepare_signal_for_target(&thr.proc_data, target_cred, sig, policy)?;
-        match try_ptrace_signal_stop(&thr.proc_data, PtraceSignalRecord::thread(thr, prepared)) {
+        match try_ptrace_signal_stop(thr, PtraceSignalRecord::thread(thr, prepared)) {
             Ok(()) => {
                 task.interrupt();
                 return Ok((true, None));
@@ -877,7 +886,7 @@ fn send_signal_to_process_data_with_policy(
 
     if proc_data.ptrace_tracer().is_some() && !matches!(signo, Signo::SIGKILL | Signo::SIGCONT) {
         let prepared = prepare_signal_for_target(proc_data, target_cred, sig, policy)?;
-        match try_ptrace_signal_stop(proc_data, PtraceSignalRecord::process(prepared)) {
+        match try_ptrace_process_signal_stop(proc_data, PtraceSignalRecord::process(prepared)) {
             Ok(()) => return Ok(true),
             Err(record) => {
                 let info = record.info().clone();
@@ -998,7 +1007,7 @@ pub(crate) fn send_prepared_signal_to_process_data(
         do_continue(proc_data);
     }
     if proc_data.ptrace_tracer().is_some() && !matches!(signo, Signo::SIGKILL | Signo::SIGCONT) {
-        match try_ptrace_signal_stop(proc_data, PtraceSignalRecord::process(prepared)) {
+        match try_ptrace_process_signal_stop(proc_data, PtraceSignalRecord::process(prepared)) {
             Ok(()) => return Ok(true),
             Err(record) => {
                 let info = record.info().clone();
@@ -1043,21 +1052,35 @@ fn publish_ptrace_target(
 /// different signal first acknowledges the original timer ownership and then
 /// prepares a fresh no-info signal for the same target.
 pub(crate) fn reinject_ptrace_signal(
-    proc_data: &ProcessData,
+    thread: &Thread,
     record: Option<PtraceSignalRecord>,
     requested: Option<Signo>,
 ) -> AxResult<()> {
+    let proc_data = &*thread.proc_data;
     let Some(record) = record else {
         if let Some(signo) = requested {
             let info = SignalInfo::new_kernel(signo);
-            let target_cred = ptrace_signal_target_cred(proc_data, &PtraceSignalTarget::Process)?;
+            let target_cred = ptrace_signal_target_cred(
+                proc_data,
+                &PtraceSignalTarget::Thread {
+                    tid: thread.tid(),
+                    signal: Arc::downgrade(&thread.signal),
+                },
+            )?;
             let prepared = prepare_signal_for_target(
                 proc_data,
                 &target_cred,
                 info,
                 SignalQueuePolicy::BestEffortKill,
             )?;
-            publish_ptrace_target(proc_data, PtraceSignalTarget::Process, prepared)?;
+            publish_ptrace_target(
+                proc_data,
+                PtraceSignalTarget::Thread {
+                    tid: thread.tid(),
+                    signal: Arc::downgrade(&thread.signal),
+                },
+                prepared,
+            )?;
         }
         return Ok(());
     };
@@ -1191,7 +1214,7 @@ fn force_signal_current_thread_inner(
         thr.signal.set_blocked(blocked);
     }
 
-    if !retain_handler && thr.proc_data.ptrace_tracer().is_none() {
+    if !retain_handler && thr.ptrace_tracer().is_none() {
         thr.proc_data.signal.allow_forced_default_signal();
     }
 
@@ -1232,11 +1255,8 @@ fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
     );
 
     if proc_data.finish_stop() {
-        if proc_data
-            .current_stop_report()
-            .is_some_and(|stop| stop.traced())
-        {
-            notify_ptrace_attach_stop(proc_data);
+        if thr.ptrace_group_stop(signo) {
+            notify_ptrace_attach_stop(thr);
         } else {
             notify_tracer_or_parent_stop_continue(
                 proc_data,
@@ -1253,9 +1273,14 @@ fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
 
 /// Continues a stopped process.
 fn do_continue(proc_data: &ProcessData) {
-    if proc_data.ptrace_sigcont_wake() {
-        notify_ptrace_attach_stop(proc_data);
-        return;
+    for tid in proc_data.proc.thread_ids() {
+        if let Ok(task) = get_task(tid) {
+            let thread = task.as_thread();
+            if thread.ptrace_sigcont_wake() {
+                notify_ptrace_attach_stop(thread);
+            }
+            thread.ptrace_stop_event.wake();
+        }
     }
     match proc_data.continue_job() {
         ContinueResult::None => {}
@@ -1284,7 +1309,10 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
     let proc_data = &thr.proc_data;
     let tid = linux_pid_from_task_id(current().id().as_u64())
         .unwrap_or_else(|error| fail_closed_exit(error));
-    let publish_registers = proc_data.should_wait_for_stop();
+    if let Some(group_stop) = proc_data.current_stop_report() {
+        thr.ptrace_group_stop(group_stop.signal);
+    }
+    let publish_registers = proc_data.should_wait_for_stop() || thr.should_wait_for_ptrace_stop();
     if publish_registers {
         let mut regs = [0; super::registers::NUM_GREGS];
         super::registers::fill_gregs(
@@ -1297,7 +1325,7 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
             regs[18] &= !super::ptrace_runtime::TRAP_FLAG;
         }
         *thr.ptrace_registers.lock() = Some(regs);
-        if proc_data.ptrace_active_session().is_some() {
+        if thr.ptrace_active_session().is_some() {
             // Allocate and save in the owner task, never by dereferencing a
             // remote scheduler context. Resume installs this exact image.
             let image = axtask::snapshot_current_task_xsave().ok();
@@ -1306,12 +1334,12 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
             // Wake/report only after the user context is actually parked.
             // Early request-side notification lets a waiter mutate memory
             // while the tracee can still execute a syscall before stopping.
-            notify_ptrace_attach_stop(proc_data);
+            notify_ptrace_attach_stop(thr);
         }
     }
     while !thr.pending_exit()
         && !proc_data.should_exit_for_exec(tid)
-        && proc_data.should_wait_for_stop()
+        && (proc_data.should_wait_for_stop() || thr.should_wait_for_ptrace_stop())
     {
         // Cgroup freezing reuses the scheduler-backed stop wait but remains
         // independent from job-control/ptrace state.  A wake caused by the
@@ -1321,8 +1349,13 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
         } else {
             thr.leave_cgroup_freezer();
         }
-        match block_on_poll_set(&proc_data.stop_event, || {
-            if !proc_data.should_wait_for_stop()
+        let event = if thr.should_wait_for_ptrace_stop() {
+            &thr.ptrace_stop_event
+        } else {
+            &proc_data.stop_event
+        };
+        match block_on_poll_set(event, || {
+            if !(proc_data.should_wait_for_stop() || thr.should_wait_for_ptrace_stop())
                 || thr.pending_exit()
                 || proc_data.should_exit_for_exec(tid)
             {
@@ -1392,15 +1425,35 @@ fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
     while check_signals(thr, uctx, None) {}
 }
 
-pub fn notify_ptrace_attach_stop(proc_data: &ProcessData) {
-    if let Some(stop) = proc_data.current_stop_report()
-        && stop.ptrace_session.is_some()
-    {
-        notify_tracer_or_parent_stop_continue(
-            proc_data,
-            linux_raw_sys::general::CLD_TRAPPED,
-            stop.signal as i32 | ((stop.ptrace_event as i32) << 8),
+pub fn notify_ptrace_attach_stop(thread: &Thread) {
+    let Some(stop) = thread.current_stop_report() else {
+        return;
+    };
+    let Some(session) = stop.ptrace_session else {
+        return;
+    };
+    if !thread.ptrace_stop_ready() || !thread.claim_ptrace_stop_notification() {
+        return;
+    }
+    if let Ok(waiter) = get_process_data(session.tracer) {
+        let pid = waiter
+            .pid_ns()
+            .visible_pid_checked(thread.tid())
+            .unwrap_or(0);
+        let uid = waiter
+            .user_ns()
+            .from_kuid_munged(thread.current_cred().ids().ruid);
+        let _ = send_signal_to_process(
+            session.tracer,
+            Some(SignalInfo::new_child(
+                Signo::SIGCHLD,
+                linux_raw_sys::general::CLD_TRAPPED as i32,
+                pid,
+                uid,
+                stop.signal as i32 | ((stop.ptrace_event as i32) << 8),
+            )),
         );
+        waiter.child_exit_event.wake();
     }
 }
 

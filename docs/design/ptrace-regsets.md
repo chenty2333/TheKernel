@@ -90,14 +90,13 @@ TF. POPF/IRET opcode detection has host helper coverage, not a claim that arbitr
 user return-fault recovery is complete. The test admits at most one additional
 same-IP TRAP_TRACE observed on native Linux after the emulation entry, and checks
 that no store occurred at that stop before stepping the next instruction.
-Hardware branch stepping (SINGLEBLOCK), hardware watchpoints and real gdb/strace
-acceptance remain pending. Existing relationship and stop storage is process-wide; multithreaded
-debugging requires task-exact stop/relationship semantics, not just registers.
+Hardware branch stepping (SINGLEBLOCK) and hardware watchpoints remain pending.
+Real gdb/strace acceptance and task-exact multithread state are recorded below.
 
 ## Stop report readiness
 
 A stop request is not yet a reportable stopped context. Ptrace wait status and
-SIGCHLD notification require all owners' value-image publication. Owners notify
+SIGCHLD notification require the stopped task owner's value-image publication. Owners notify
 after snapshotting, with one notification per stop. The top-of-user-loop gate
 also covers a new stop arriving while a prior image retires. Without this barrier,
 a waiter could release a shared-memory handshake after EVENT_STOP and let the
@@ -178,7 +177,7 @@ The earlier guest run exposed ECHILD at traced-child teardown despite correct
 syscalls and target output. The terminal wait repair below addresses that cause;
 real-tool acceptance passed in guest; the final notification-readiness tightening
 passed revalidation rather than being inferred from that earlier run.
-Independent multithread stops remain required next work.
+Independent multithread stops and real Alpine GDB thread-stack commands now have guest coverage, as detailed below.
 
 ## Terminal traced-process handoff
 
@@ -195,8 +194,7 @@ its own SIGCHLD/autoreap policy; a direct-parent tracer performs the sole reap
 and usage accounting. Tracer teardown releases the same durable hold even when
 the runtime has disappeared. A handed-off marker prevents duplicate parent
 notifications when teardown/acknowledgement races final notification. Reparenting
-does not bypass a still-held report. Independent per-thread exit remains outside
-this process-final protocol.
+does not bypass a still-held report. Nonleader exits use the separate task-terminal owner below; the process-final parent handoff remains distinct.
 
 Core zombie publication is not yet ptrace wait readiness: the terminal report
 becomes visible only after its configured notification. A parent handoff also
@@ -226,3 +224,63 @@ The parent waiter is captured before report-ready publication, so an immediate
 winning reap cannot clear the child-parent link and suppress the wake needed by
 another waiting thread. This reference is transient; zombie ownership still
 retains no live runtime or address space.
+
+
+## Exact task tracing and real multithread debugger acceptance
+
+Ptrace relation/option/action/signal/private-stop state now belongs to `Thread`,
+not `ProcessData`. Shared job control and cgroup freezer state remain group-owned.
+A ptrace stop parks only its exact task; its own GPR/FP image is the readiness
+boundary. Each CLONE_THREAD child has an independent inherited relation, initial
+stop and reverse link before its first user instruction. Sorted tracer/tracee
+publication gates are taken after clone construction releases its lifecycle
+ownership, while the child remains off-runqueue and exec publication excluded.
+
+Wait candidates render exact namespace-visible TIDs, select each private report
+and consume it once. A preallocated nonleader terminal slot moves into the
+already-reserved reverse node. It retains namespace, credentials, status and
+accounting values, never a live task, process runtime or address space. Its TID
+binding survives until acknowledgement or tracer teardown. Notification precedes
+terminal readiness; repeated WNOWAIT does not consume it. Detached relationship
+credentials stay owned until lifecycle/action gates have dropped. Reverse links
+also retain the immutable core TGID as lookup metadata, so nonleader exec can
+adopt the group PID without making final wait depend on a dead scheduler TID.
+
+A paused/sigsuspended task visits the private stop boundary using its real syscall
+context, and remains asleep after a signal-free CONT. Exec retirement must unwind
+that blocked wait even though it enqueues no signal. Other interruptible syscall
+waits likewise recognize exact ptrace stops and exec retirement. The paired
+thread fixture checks independent peer progress, distinct RSP/FSBASE, independent
+resume, once-only exits and nonleader exec with a paused leader. Repeated WNOWAIT passed in the full TheKernel ABI guest; paused-leader attach/exec also passed the paired subset. Exact-session/readiness and reverse-node TID-release helpers passed host tests.
+
+A seized group-stop reports its real stop signal plus EVENT_STOP, not SIGTRAP;
+LISTEN/SIGCONT leave shared job control separate from the task's private report.
+GDB 16.3 initializes every new LWP by writing DR7=0 even for software-only debug.
+That inert reset is accepted; enabling hardware comparators still fails closed
+and hardware-watchpoint acceptance remains the next A1 item. No hardware-enabled
+state is silently accepted by this software-only stage.
+
+The signed Alpine 16.3 batch thread script passed in a complete64-case KVM debug
+suite: info threads, all-thread backtraces, switches2/3, distinct worker stacks
+with markers11/22, the main stack marker33, per-thread registers, release of the
+workers and THREADS_RESULT=12,23,34 followed by normal exit. Basic GDB variable
+mutation/single-step/finish and real strace-f fork/exec/files also passed there.
+Earlier ECHILD, recursive lifecycle-lock panic, DR7 setup hang and LISTEN signal
+mismatch runs were failures, not acceptance. The DR7 requirement was checked in
+upstream GDB16.3 nat/x86-linux-dregs.c:x86_linux_update_debug_registers.
+
+This is not complete Linux ptrace parity. SINGLEBLOCK, hardware comparators,
+general protected-private FOLL_FORCE, group-leader terminal delay across unreaped
+ptraced nonleaders, and late final group-rusage refresh after runtime teardown
+remain unsupported or incomplete. Pending shared signal routing still chooses
+the retained leader rather than a general task recipient. No /proc implementation
+was changed as part of this task. The full post-migration host suite passed (652 Python tests,3 skips; selected Rust/kernel2594), then the affected kernel was refreshed to2596 after the restart fix. All50 programs completed successfully in the TheKernel ABI guest; the Linux oracle again failed only the unchanged socket timeout jiffy-roundtrip assertion, so no full paired pass is claimed. Final baseline62/debug64 KVM guest and q35/n305 lint revalidation passed; the subsequent affected kernel host run passed2596 and the paired ptrace+wait subset passed31/267.
+
+A blocked restartable wait interrupted only for a ptrace stop must restart when
+CONT suppresses the record or default-ignore prevents any handler callback. The
+final no-handler edge resolves a still-pending restart only while the return
+value remains EINTR; an explicitly debugger-written return value wins. The new
+raw regression passed native Linux but exposed premature wait4 return in the
+guest before this fix. The raw regression then passed the paired subset; host2596 and complete baseline62/debug64 KVM guest passed, including real strace-f. The tracer
+still sees EINTR rather than Linux's internal ERESTART* sentinel for this
+interruption; exact internal syscall-exit rendering remains a parity gap.

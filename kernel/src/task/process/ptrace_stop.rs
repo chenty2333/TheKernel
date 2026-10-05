@@ -1,6 +1,5 @@
 //! Seized stop/listen/interrupt transitions; no user execution while listening.
 use super::*;
-use crate::task::AsThread;
 
 fn exec_stop_kind(options: u32, seized: bool) -> Option<u8> {
     if options & (1 << 4) != 0 {
@@ -12,31 +11,17 @@ fn exec_stop_kind(options: u32, seized: bool) -> Option<u8> {
     }
 }
 
-fn all_images_published(images: impl IntoIterator<Item = bool>) -> bool {
-    let mut saw_thread = false;
-    for ready in images {
-        saw_thread = true;
-        if !ready {
-            return false;
-        }
-    }
-    saw_thread
-}
+fn owner_image_ready(image: &Option<crate::task::registers::GeneralRegisters>) -> bool { image.is_some() }
 
-impl ProcessData {
+impl super::super::Thread {
     /// A requested stop is not yet a waitable stop. Every owner must have
     /// crossed its user boundary and published its value image first.
     pub(crate) fn ptrace_stop_ready(&self) -> bool {
-        all_images_published(self.proc.thread_ids().map(|tid| {
-            super::super::get_task(tid).ok().is_some_and(|task| {
-                task.try_as_thread()
-                    .is_some_and(|thread| thread.ptrace_registers.lock().is_some())
-            })
-        }))
+        owner_image_ready(&self.ptrace_registers.lock())
     }
 
     pub(crate) fn claim_ptrace_stop_notification(&self) -> bool {
-        let mut job = self.job_ctl.lock();
+        let mut job = self.ptrace_job_ctl.lock();
         if job
             .current_stop_report()
             .is_none_or(|stop| stop.ptrace_session.is_none())
@@ -56,7 +41,7 @@ impl ProcessData {
             return None;
         }
         let event = exec_stop_kind(control.options, control.seized)?;
-        let mut job = self.job_ctl.lock();
+        let mut job = self.ptrace_job_ctl.lock();
         if job.state != StopState::Running {
             return None;
         }
@@ -77,7 +62,7 @@ impl ProcessData {
     /// Publish syscall provenance and the wait status in one generation.
     pub(crate) fn ptrace_syscall_stop(&self, session: PtraceSession, op: u8) -> Option<bool> {
         let mut control = self.ptrace_ctl.lock();
-        let mut job = self.job_ctl.lock();
+        let mut job = self.ptrace_job_ctl.lock();
         if control.active_session() != Some(session) || job.state != StopState::Running {
             return None;
         }
@@ -94,13 +79,32 @@ impl ProcessData {
         Some(good)
     }
 
+    /// Each seized task observes the actual group-stop signal in EVENT_STOP.
+    /// Shared job control stays group-owned; ptrace report/ack stays private.
+    pub(crate) fn ptrace_group_stop(&self, signo: u8) -> bool {
+        let control = self.ptrace_ctl.lock();
+        if !control.seized { return false; }
+        let Some(session) = control.active_session() else { return false; };
+        let mut job = self.ptrace_job_ctl.lock();
+        if job.state != StopState::Running { return false; }
+        job.state = StopState::Stopped;
+        job.stop_kind = StopKind::Ptrace;
+        job.stop_signal = signo;
+        job.ptrace_event = 128;
+        job.ptrace_session = Some(session);
+        job.stop_reported = false;
+        job.stop_notified = false;
+        job.continued = false;
+        true
+    }
+
     pub(crate) fn current_stop_report(&self) -> Option<StopReport> {
-        self.job_ctl.lock().current_stop_report()
+        self.ptrace_job_ctl.lock().current_stop_report()
     }
 
     pub(crate) fn ptrace_listen(&self, session: PtraceSession) -> AxResult<bool> {
         let mut control = self.ptrace_ctl.lock();
-        let mut job = self.job_ctl.lock();
+        let mut job = self.ptrace_job_ctl.lock();
         if control.active_session() != Some(session)
             || !control.seized
             || !job.is_ptrace_inactive_for(session)
@@ -121,7 +125,7 @@ impl ProcessData {
 
     pub(crate) fn ptrace_pending_interrupt_stop(&self, session: PtraceSession) -> bool {
         let mut control = self.ptrace_ctl.lock();
-        let mut job = self.job_ctl.lock();
+        let mut job = self.ptrace_job_ctl.lock();
         if control.active_session() != Some(session)
             || !control.interrupt_pending
             || job.state != StopState::Running
@@ -148,7 +152,7 @@ impl ProcessData {
         if !control.listening {
             return false;
         }
-        let mut job = self.job_ctl.lock();
+        let mut job = self.ptrace_job_ctl.lock();
         control.listening = false;
         control.interrupt_pending = false;
         job.state = StopState::Stopped;
@@ -166,7 +170,6 @@ impl ProcessData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::AsThread;
     #[test]
     fn exec_event_legacy_and_seized_admission_are_distinct() {
         assert_eq!(exec_stop_kind(0, false), Some(0));
@@ -176,11 +179,8 @@ mod tests {
     }
 
     #[test]
-    fn a_requested_stop_is_not_reportable_until_all_owner_images_exist() {
-        assert!(!all_images_published([]));
-        assert!(!all_images_published([false]));
-        assert!(!all_images_published([true, false]));
-        assert!(all_images_published([true]));
-        assert!(all_images_published([true, true]));
+    fn only_the_exact_owners_published_image_makes_its_stop_ready() {
+        assert!(!owner_image_ready(&None));
+        assert!(owner_image_ready(&Some([0; crate::task::registers::NUM_GREGS])));
     }
 }

@@ -1059,6 +1059,14 @@ impl Drop for TaskResourceAdmission {
 
 /// The inner data of a thread.
 pub struct Thread {
+    pub(in crate::task) ptrace_ctl: SpinNoIrq<super::jobctl::PtraceControlState>,
+    pub(in crate::task) ptrace_job_ctl: SpinNoIrq<super::jobctl::JobControlState>,
+    pub(in crate::task) ptrace_suspended_tracee:
+        SpinNoIrq<Option<(u64, tk_linux_process_adapter::Pid)>>,
+    pub(in crate::task) ptrace_actions: axsync::Mutex<()>,
+    pub(in crate::task) ptrace_signal: axsync::Mutex<Option<super::signal::PtraceSignalRecord>>,
+    pub(crate) ptrace_stop_event: Arc<PollSet>,
+    pub(crate) ptrace_terminal: Arc<super::process::PtraceTaskExit>,
     /// Published only while parked at a user-context stop boundary.
     pub(crate) ptrace_registers: SpinNoIrq<Option<super::registers::GeneralRegisters>>,
     pub(crate) ptrace_orig_rax: AtomicU64,
@@ -1806,6 +1814,17 @@ impl Thread {
         // publication.
         let sem_undo = super::process::SemUndoState::try_new(namespaces.ipc())?;
         let thread = Box::try_new(Thread {
+            ptrace_terminal: Arc::try_new(super::process::PtraceTaskExit::new(
+                namespaces.pid(),
+                tid,
+            ))
+            .map_err(|_| AxError::NoMemory)?,
+            ptrace_ctl: SpinNoIrq::new(super::jobctl::PtraceControlState::default()),
+            ptrace_job_ctl: SpinNoIrq::new(super::jobctl::JobControlState::default()),
+            ptrace_suspended_tracee: SpinNoIrq::new(None),
+            ptrace_actions: axsync::Mutex::new(()),
+            ptrace_signal: axsync::Mutex::new(None),
+            ptrace_stop_event: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
             ptrace_registers: SpinNoIrq::new(None),
             ptrace_orig_rax: AtomicU64::new(u64::MAX),
             ptrace_syscall_mode: SpinNoIrq::new(None),

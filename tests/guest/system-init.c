@@ -460,6 +460,10 @@ static int test_signal_fp(void) {
  * findings as required or informational, so a non-zero result here means a
  * required contract failed rather than that a probe was unable to look. */
 #if defined(THEKERNEL_TOOL_PAYLOAD_DEBUG)
+static int test_real_gdb_threads(void) {
+    return run_guest_program("/opt/thekernel-tests/bin/thekernel-debugger-smoke", "--threads", "real-gdb-threads-child");
+}
+
 static int test_real_debugger(void) {
     return run_guest_program("/opt/thekernel-tests/bin/thekernel-debugger-smoke", NULL, "real-debugger-child");
 }
@@ -749,6 +753,10 @@ static int test_epoll_membarrier_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/epoll-membarrier-differential",
         "--thekernel", "epoll-membarrier-differential-child");
+}
+
+static int test_ptrace_threads(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-threads-differential", NULL, "ptrace-threads-child");
 }
 
 static int test_ptrace_exit(void) {
@@ -1089,6 +1097,7 @@ static int run_init(int argc, char **argv) {
         { "ptrace-exec", test_ptrace_exec, 30 },
         { "ptrace-breakpoint", test_ptrace_breakpoint, 30 },
         { "ptrace-exit", test_ptrace_exit, 45 },
+        { "ptrace-threads", test_ptrace_threads, 30 },
         { "anon-fd-flags", test_anon_fd_flags, 20 },
         { "select", test_select, 20 },
         { "exit-status", test_exit_status, 20 },
@@ -1111,6 +1120,7 @@ static int run_init(int argc, char **argv) {
         { "threads-futex", test_threads_futex, 60 },
 #if defined(THEKERNEL_TOOL_PAYLOAD_DEBUG)
         { "real-debugger", test_real_debugger, 240 },
+        { "real-gdb-threads", test_real_gdb_threads, 120 },
 #endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
         { "compiler-smoke", test_compiler_smoke, 120 },

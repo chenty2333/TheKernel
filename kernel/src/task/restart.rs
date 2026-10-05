@@ -382,7 +382,14 @@ impl RestartTracker {
         }
 
         let state = self.restart_states.pop().unwrap();
-        if state.decision == RestartDecision::Restart {
+        // Ptrace can suppress the signal, or reinject one whose disposition
+        // drops it before delivery. No handler callback then selects a restart
+        // decision. At the final user edge this is Linux's no-handler case,
+        // not an observable EINTR. A debugger-written return value must win.
+        let no_handler_restart = state.decision == RestartDecision::Pending
+            && uctx.retval() == (-4isize) as usize
+            && state.class.decide_for_non_handler() == RestartDecision::Restart;
+        if state.decision == RestartDecision::Restart || no_handler_restart {
             state.action.restore(self, uctx);
         }
     }
@@ -665,6 +672,37 @@ mod tests {
         assert_eq!(restored.ip(), 0x1000);
         assert_eq!(restored.retval(), (-4isize) as usize);
         assert!(!tracker.take_resume_restored_context());
+        assert!(tracker.restart_states.is_empty());
+    }
+
+    #[test]
+    fn no_handler_callback_after_ptrace_suppression_restarts_the_interruption() {
+        for class in [RestartClass::Sys, RestartClass::NoIntr, RestartClass::NoHand] {
+            let mut tracker = RestartTracker::try_new().unwrap();
+            let entry = make_uctx(0x11, 0x3d, 0x1000);
+            tracker.enter_syscall(&entry, false, Some(class));
+            assert!(tracker.request_syscall_restart());
+            let mut resumed = entry;
+            resumed.set_retval((-4isize) as usize);
+            // No signal delivery occurs: a ptracer suppressed its record.
+            tracker.finish_signal_resume(&mut resumed);
+            assert_eq!(resumed.sysno(), 0x3d);
+            assert_eq!(resumed.ip(), 0x1000 - SYSCALL_INSN_LEN);
+            assert!(tracker.restart_states.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_debugger_return_value_overrides_an_unresolved_restart_decision() {
+        let mut tracker = RestartTracker::try_new().unwrap();
+        let entry = make_uctx(0x11, 0x3d, 0x1000);
+        tracker.enter_syscall(&entry, false, Some(RestartClass::Sys));
+        assert!(tracker.request_syscall_restart());
+        let mut resumed = entry;
+        resumed.set_retval(42);
+        tracker.finish_signal_resume(&mut resumed);
+        assert_eq!(resumed.retval(), 42);
+        assert_eq!(resumed.ip(), 0x1000);
         assert!(tracker.restart_states.is_empty());
     }
 

@@ -24,9 +24,9 @@ use tk_linux_signal::{SignalInfo, Signo};
 use crate::{
     mm::{IoVec, UserMemoryCapability, map_usercopy_error},
     task::{
-        AsThread, ProcessData, PtraceAccessMode, PtraceRelationshipOrigin,
-        PtraceRelationshipSnapshot, PtraceReverseLink, PtraceSession, TaskParentCredentialPin,
-        Thread, check_thread_ptrace_image_access_with_actor, get_task, get_visible_task,
+        AsThread, PtraceAccessMode, PtraceRelationshipOrigin, PtraceRelationshipSnapshot,
+        PtraceReverseLink, PtraceSession, TaskParentCredentialPin, Thread,
+        check_thread_ptrace_image_access_with_actor, get_task, get_visible_task,
         notify_ptrace_attach_stop, reinject_ptrace_signal,
         security::{ProcessImageSecurityRef, PtraceTracemeContext, dispatch_ptrace_traceme},
         send_signal_to_process,
@@ -236,7 +236,7 @@ fn current_kernel_tid() -> Pid {
     current().as_thread().kernel_tid()
 }
 
-fn check_tracee(target: &ProcessData) -> AxResult<PtraceSession> {
+fn check_tracee(target: &Thread) -> AxResult<PtraceSession> {
     target
         .ptrace_session_if_traced_by(current_pid(), current_kernel_tid())
         .ok_or(AxError::NoSuchProcess)
@@ -269,12 +269,12 @@ fn scan_tracee_task_states(
     }
 }
 
-fn check_inactive_tracee(target: &ProcessData) -> AxResult<PtraceSession> {
+fn check_inactive_tracee(target: &Thread) -> AxResult<PtraceSession> {
     loop {
         let session = target
             .ptrace_inactive_session_if_traced_by(current_pid(), current_kernel_tid())
             .ok_or(AxError::NoSuchProcess)?;
-        let scan = scan_tracee_task_states(target.proc.thread_ids().map(|tid| {
+        let scan = scan_tracee_task_states([target.kernel_tid()].into_iter().map(|tid| {
             get_task(tid)
                 .map(|task| task.state())
                 .map_err(|_| AxError::NoSuchProcess)
@@ -282,7 +282,7 @@ fn check_inactive_tracee(target: &ProcessData) -> AxResult<PtraceSession> {
         match scan {
             InactiveScan::Gone => return Err(AxError::NoSuchProcess),
             InactiveScan::Retry => {
-                // The stop publisher has already interrupted every member.
+                // The stop publisher has already interrupted the exact owner.
                 // Yielding here is the wait_task_inactive analogue: it gives
                 // Ready tasks a chance to enter wait_if_stopped and does not
                 // burn a CPU in a hidden polling loop.
@@ -290,8 +290,8 @@ fn check_inactive_tracee(target: &ProcessData) -> AxResult<PtraceSession> {
             }
             InactiveScan::Inactive => {
                 // The outer ptrace action mutex prevents a sibling tracer
-                // thread from resuming the group. Revalidate the exact stop
-                // generation after observing every task blocked.
+                // thread from resuming this owner. Revalidate the exact stop
+                // generation after observing the exact task blocked.
                 if target.ptrace_inactive_session_if_traced_by(current_pid(), current_kernel_tid())
                     == Some(session)
                 {
@@ -309,10 +309,7 @@ fn check_inactive_tracee(target: &ProcessData) -> AxResult<PtraceSession> {
 /// The owned address-space handle deliberately stays in this scope so an exec
 /// publication cannot make the operation re-sample a different image between
 /// validation/population and the final transfer.
-fn pinned_tracee_memory(
-    target: &ProcessData,
-    session: PtraceSession,
-) -> AxResult<UserMemoryCapability> {
+fn pinned_tracee_memory(target: &Thread, session: PtraceSession) -> AxResult<UserMemoryCapability> {
     let aspace_handle = target
         .ptrace_inactive_image_if_session(session)
         .ok_or(AxError::NoSuchProcess)?;
@@ -344,11 +341,9 @@ fn parse_signal(data: usize) -> AxResult<Option<SignalInfo>> {
     Ok(Some(SignalInfo::new_kernel(signo)))
 }
 
-fn interrupt_process_threads(target: &ProcessData) {
-    for tid in target.proc.thread_ids() {
-        if let Ok(task) = get_task(tid) {
-            task.interrupt();
-        }
+fn interrupt_process_threads(target: &Thread) {
+    if let Ok(task) = get_task(target.kernel_tid()) {
+        task.interrupt();
     }
 }
 
@@ -362,11 +357,11 @@ fn do_attach(target_thread: &Thread, seized: bool, initial_options: u32) -> AxRe
     let tracer_data = ptracer.proc_data.clone();
     let tracer = tracer_data.proc.pid();
     let tracer_kernel_tid = ptracer.kernel_tid();
-    let target = &target_thread.proc_data;
-    if target.proc.pid() == tracer {
+    let target = target_thread;
+    if target.proc_data.proc.pid() == tracer {
         return Err(AxError::OperationNotPermitted);
     }
-    if target.exec_in_progress() {
+    if target.proc_data.exec_in_progress() {
         return Err(AxError::OperationNotPermitted);
     }
     if !ptracer
@@ -382,7 +377,7 @@ fn do_attach(target_thread: &Thread, seized: bool, initial_options: u32) -> AxRe
         PtraceAccessMode::AttachReal,
     )?;
     let reverse_link =
-        tracer_data.try_prepare_ptrace_reverse_link(target.proc.pid(), tracer_kernel_tid)?;
+        tracer_data.try_prepare_ptrace_reverse_link(target.kernel_tid(), tracer_kernel_tid)?;
     let publication = target.lock_ptrace_publication();
     let session = target.publish_ptrace_relationship(
         &publication,
@@ -412,7 +407,7 @@ fn do_continue(
     syscall_mode: u8,
     changes_tf: bool,
 ) -> AxResult<PtraceContinueOutcome> {
-    let target = &thread.proc_data;
+    let target = thread;
     let curr = current();
     let tracer_data = curr.as_thread().proc_data.clone();
     let signal = parse_signal(data)?.map(|info| info.signo());
@@ -421,11 +416,16 @@ fn do_continue(
         .is_some_and(|stop| stop.ptrace_event != 0);
     let (resume_result, record, retired_relationship) = target
         .resume_ptrace(session, detach, || {
-            crate::task::ptrace_runtime::commit_resume_mode(thread, session, syscall_mode, changes_tf);
+            crate::task::ptrace_runtime::commit_resume_mode(
+                thread,
+                session,
+                syscall_mode,
+                changes_tf,
+            );
         })
         .ok_or(AxError::NoSuchProcess)?;
     if detach {
-        tracer_data.remove_ptrace_tracee(PtraceReverseLink::new(target.proc.pid(), session));
+        tracer_data.remove_ptrace_tracee(PtraceReverseLink::new(target.kernel_tid(), session));
     }
     // Event stops are notifications, not signal-delivery stops. Linux ignores
     // the resume signal there; do not fabricate a signal without its record.
@@ -465,7 +465,7 @@ impl PtraceContinueOutcome {
     }
 }
 
-fn peek_word(target: &ProcessData, session: PtraceSession, addr: usize) -> AxResult<isize> {
+fn peek_word(target: &Thread, session: PtraceSession, addr: usize) -> AxResult<isize> {
     let memory = pinned_tracee_memory(target, session)?;
     memory
         .read_value(addr as *const usize)
@@ -473,12 +473,7 @@ fn peek_word(target: &ProcessData, session: PtraceSession, addr: usize) -> AxRes
         .map_err(|_| ptrace_io_error())
 }
 
-fn poke_word(
-    target: &ProcessData,
-    session: PtraceSession,
-    addr: usize,
-    data: usize,
-) -> AxResult<isize> {
+fn poke_word(target: &Thread, session: PtraceSession, addr: usize, data: usize) -> AxResult<isize> {
     let memory = pinned_tracee_memory(target, session)?;
     if memory.write_value(addr as *mut usize, data).is_ok() {
         return Ok(0);
@@ -508,7 +503,7 @@ fn canonical_user_address(address: u64) -> bool {
 fn ptrace_shstk_regset(
     tracer_memory: &UserMemoryCapability,
     target_task: &axtask::AxTaskRef,
-    target: &ProcessData,
+    target: &Thread,
     session: PtraceSession,
     request: u32,
     note: usize,
@@ -649,6 +644,7 @@ fn ptrace_shstk_regset(
             let mut state = snapshot_inactive_task_user_cet_state(target_task)
                 .map_err(|_| AxError::NoSuchProcess)?;
             if !target
+                .proc_data
                 .aspace()
                 .lock()
                 .cet_shadow_stack_pointer_valid(regset.ssp)
@@ -672,9 +668,14 @@ fn ptrace_get_syscall_info(
     user_size: usize,
     data: usize,
 ) -> AxResult<isize> {
-    let regs = thread.ptrace_registers.lock().ok_or(AxError::NoSuchProcess)?;
-    let provenance = thread.ptrace_stop_provenance.load(core::sync::atomic::Ordering::Acquire);
-    let op = thread.proc_data.current_stop_report().map_or(0, |stop| {
+    let regs = thread
+        .ptrace_registers
+        .lock()
+        .ok_or(AxError::NoSuchProcess)?;
+    let provenance = thread
+        .ptrace_stop_provenance
+        .load(core::sync::atomic::Ordering::Acquire);
+    let op = thread.current_stop_report().map_or(0, |stop| {
         crate::task::ptrace_runtime::syscall_info_operation(provenance, stop.ptrace_event)
     });
     let mut bytes = [0u8; 88];
@@ -684,7 +685,12 @@ fn ptrace_get_syscall_info(
     bytes[16..24].copy_from_slice(&regs[19].to_ne_bytes());
     match op {
         PTRACE_SYSCALL_INFO_ENTRY => {
-            for (i, value) in [regs[15], regs[14], regs[13], regs[12], regs[7], regs[9], regs[8]].into_iter().enumerate() {
+            for (i, value) in [
+                regs[15], regs[14], regs[13], regs[12], regs[7], regs[9], regs[8],
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 bytes[24 + i * 8..32 + i * 8].copy_from_slice(&value.to_ne_bytes());
             }
         }
@@ -710,7 +716,7 @@ fn ptrace_get_syscall_info(
 #[cfg(target_arch = "x86_64")]
 fn ptrace_arch_prctl(
     target_task: &axtask::AxTaskRef,
-    target: &ProcessData,
+    target: &Thread,
     session: PtraceSession,
     code: usize,
     requested_features: usize,
@@ -788,14 +794,14 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
     let parent_data = parent_task.as_thread().proc_data.clone();
     let mut reverse_link = Some(
         parent_data
-            .try_prepare_ptrace_reverse_link(proc_data.proc.pid(), parent_snapshot.kernel_tid())?,
+            .try_prepare_ptrace_reverse_link(child.kernel_tid(), parent_snapshot.kernel_tid())?,
     );
     // Reservation is fallible and may sleep. Re-resolve the immutable parent
     // task and hook-actor credential, then separately pin the calling child's
     // current credential which Linux stores as ptracer_cred for TRACEME.
     drop(parent_task);
     loop {
-        let publication = proc_data.lock_ptrace_traceme_publication(&parent_data)?;
+        let publication = child.lock_ptrace_traceme_publication(&parent_data)?;
         let graph = publication.task_parent_publication();
         let parent_task =
             get_task(parent_snapshot.kernel_tid()).map_err(|_| AxError::OperationNotPermitted)?;
@@ -819,7 +825,7 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
                     yield_now();
                     continue;
                 };
-                let result = proc_data.publish_ptrace_relationship(
+                let result = child.publish_ptrace_relationship(
                     &publication,
                     child,
                     parent,
@@ -896,9 +902,7 @@ fn check_ptrace_options(data: u32) -> AxResult<()> {
         filtered: tracer.seccomp_mode() != SeccompMode::Disabled,
         // `current->ptrace & PT_SUSPEND_SECCOMP`: the tracer is itself a tracee
         // whose tracer suspended its policy.
-        already_suspended: tracer
-            .proc_data
-            .ptrace_seccomp_suspended_for(tracer.kernel_tid()),
+        already_suspended: tracer.ptrace_seccomp_suspended_for(tracer.kernel_tid()),
     };
     match tk_linux_process::ptrace_options::check(data, admission) {
         Ok(()) => Ok(()),
@@ -923,7 +927,7 @@ fn sys_ptrace_for_target(
         .ok_or(AxError::NoSuchProcess)?;
     let target_task = get_visible_task(target_pid)?;
     let target_thread = target_task.as_thread();
-    let target = target_thread.proc_data.clone();
+    let target = target_thread;
     match request {
         // Relationship publication has a stronger outer lock order:
         // process_lifecycle -> ptrace_actions -> exec/image/ptrace. Keep it
@@ -967,9 +971,13 @@ fn sys_ptrace_for_target(
     // memory or usercopy.
     let ptrace_action = target.lock_ptrace_actions();
     match request {
-        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP | PTRACE_SYSEMU | PTRACE_SYSEMU_SINGLESTEP => {
-            use crate::task::ptrace_runtime::{TRACE_SYSCALL, EMULATE_SYSCALL, STEP_INSTRUCTION};
-            let session = check_inactive_tracee(&target)?;
+        PTRACE_CONT
+        | PTRACE_SYSCALL
+        | PTRACE_SINGLESTEP
+        | PTRACE_SYSEMU
+        | PTRACE_SYSEMU_SINGLESTEP => {
+            use crate::task::ptrace_runtime::{EMULATE_SYSCALL, STEP_INSTRUCTION, TRACE_SYSCALL};
+            let session = check_inactive_tracee(target)?;
             let resume_mode = match request {
                 PTRACE_SYSCALL => TRACE_SYSCALL,
                 PTRACE_SYSEMU => EMULATE_SYSCALL,
@@ -984,37 +992,37 @@ fn sys_ptrace_for_target(
         }
         // Hardware branch/block stepping is not yet implemented.
         PTRACE_SINGLEBLOCK => {
-            check_inactive_tracee(&target)?;
+            check_inactive_tracee(target)?;
             Err(ptrace_io_error())
         }
         PTRACE_DETACH => {
-            let session = check_inactive_tracee(&target)?;
+            let session = check_inactive_tracee(target)?;
             let outcome = do_continue(target_thread, session, data, true, 0, false)?;
             drop(ptrace_action);
             outcome.finish()
         }
         PTRACE_KILL => {
-            check_tracee(&target)?;
+            check_tracee(target)?;
             send_signal_to_process(
-                target.proc.pid(),
+                target.proc_data.proc.pid(),
                 Some(SignalInfo::new_kernel(Signo::SIGKILL)),
             )?;
             Ok(0)
         }
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
-            let session = check_inactive_tracee(&target)?;
-            let value = peek_word(&target, session, addr)?;
+            let session = check_inactive_tracee(target)?;
+            let value = peek_word(target, session, addr)?;
             tracer_memory
                 .write_value(data as *mut usize, value as usize)
                 .map_err(map_usercopy_error)?;
             Ok(0)
         }
         PTRACE_POKETEXT | PTRACE_POKEDATA => {
-            let session = check_inactive_tracee(&target)?;
-            poke_word(&target, session, addr, data)
+            let session = check_inactive_tracee(target)?;
+            poke_word(target, session, addr, data)
         }
         PTRACE_GETFPREGS | PTRACE_SETFPREGS => {
-            check_inactive_tracee(&target)?;
+            check_inactive_tracee(target)?;
             floating_register_transfer(
                 tracer_memory,
                 target_thread,
@@ -1025,7 +1033,7 @@ fn sys_ptrace_for_target(
             )
         }
         PTRACE_GETREGS | PTRACE_SETREGS => {
-            check_inactive_tracee(&target)?;
+            check_inactive_tracee(target)?;
             general_register_transfer(
                 tracer_memory,
                 target_thread,
@@ -1035,13 +1043,13 @@ fn sys_ptrace_for_target(
             )
         }
         PTRACE_PEEKUSER | PTRACE_POKEUSER => {
-            check_inactive_tracee(&target)?;
+            check_inactive_tracee(target)?;
             ptrace_user_word(tracer_memory, target_thread, request, addr, data)
         }
         // PTRACE_OLDSETOPTIONS (21) is the pre-0x4200 spelling of the same
         // request: kernel/ptrace.c decodes both in one arm.
         PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => {
-            let session = check_inactive_tracee(&target)?;
+            let session = check_inactive_tracee(target)?;
             // kernel/ptrace.c `ptrace_setoptions()` is the whole body of this
             // arm:
             //
@@ -1064,7 +1072,7 @@ fn sys_ptrace_for_target(
             Ok(0)
         }
         PTRACE_GETEVENTMSG => {
-            let session = check_inactive_tracee(&target)?;
+            let session = check_inactive_tracee(target)?;
             let event_message = target
                 .ptrace_event_message(session)
                 .ok_or(AxError::NoSuchProcess)?;
@@ -1074,25 +1082,25 @@ fn sys_ptrace_for_target(
             Ok(0)
         }
         PTRACE_INTERRUPT => {
-            let session = check_tracee(&target)?;
+            let session = check_tracee(target)?;
             let stopped = target
                 .ptrace_interrupt(session, Signo::SIGTRAP as u8)
                 .ok_or_else(ptrace_io_error)?;
             if stopped {
-                notify_ptrace_attach_stop(&target);
-                interrupt_process_threads(&target);
+                notify_ptrace_attach_stop(target);
+                interrupt_process_threads(target);
             }
             Ok(0)
         }
         PTRACE_LISTEN => {
-            let session = check_inactive_tracee(&target)?;
+            let session = check_inactive_tracee(target)?;
             if target.ptrace_listen(session)? {
-                notify_ptrace_attach_stop(&target);
+                notify_ptrace_attach_stop(target);
             }
             Ok(0)
         }
         PTRACE_GETSIGMASK | PTRACE_SETSIGMASK => {
-            check_inactive_tracee(&target)?;
+            check_inactive_tracee(target)?;
             if addr != 8 {
                 return Err(AxError::InvalidInput);
             }
@@ -1114,21 +1122,22 @@ fn sys_ptrace_for_target(
             Ok(0)
         }
         PTRACE_PEEKSIGINFO => {
-            check_inactive_tracee(&target)?;
+            check_inactive_tracee(target)?;
             regs::peek_siginfo(tracer_memory, target_thread, addr, data)
         }
         PTRACE_GETSIGINFO => {
-            let session = check_inactive_tracee(&target)?;
-            let info = target.ptrace_signal_info(session).or_else(|| {
-                crate::task::ptrace_runtime::synthetic_stop_signal_info(target_thread)
-            }).ok_or_else(ptrace_io_error)?;
+            let session = check_inactive_tracee(target)?;
+            let info = target
+                .ptrace_signal_info(session)
+                .or_else(|| crate::task::ptrace_runtime::synthetic_stop_signal_info(target_thread))
+                .ok_or_else(ptrace_io_error)?;
             tracer_memory
                 .write_value(data as *mut SignalInfo, info)
                 .map_err(map_usercopy_error)?;
             Ok(0)
         }
         PTRACE_SETSIGINFO => {
-            let session = check_inactive_tracee(&target)?;
+            let session = check_inactive_tracee(target)?;
             let info = tracer_memory
                 .read_value(data as *const SignalInfo)
                 .map_err(map_usercopy_error)?;
@@ -1138,8 +1147,8 @@ fn sys_ptrace_for_target(
         PTRACE_ARCH_PRCTL => {
             #[cfg(target_arch = "x86_64")]
             {
-                let session = check_tracee(&target)?;
-                return ptrace_arch_prctl(&target_task, &target, session, addr, data);
+                let session = check_tracee(target)?;
+                return ptrace_arch_prctl(&target_task, target, session, addr, data);
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
@@ -1149,11 +1158,11 @@ fn sys_ptrace_for_target(
         PTRACE_GETREGSET | PTRACE_SETREGSET => {
             #[cfg(target_arch = "x86_64")]
             {
-                let session = check_inactive_tracee(&target)?;
+                let session = check_inactive_tracee(target)?;
                 return ptrace_shstk_regset(
                     tracer_memory,
                     &target_task,
-                    &target,
+                    target,
                     session,
                     request,
                     addr,
@@ -1162,19 +1171,19 @@ fn sys_ptrace_for_target(
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
-                check_inactive_tracee(&target)?;
+                check_inactive_tracee(target)?;
                 Err(ptrace_io_error())
             }
         }
         PTRACE_GET_SYSCALL_INFO => {
             #[cfg(target_arch = "x86_64")]
             {
-                check_inactive_tracee(&target)?;
+                check_inactive_tracee(target)?;
                 return ptrace_get_syscall_info(tracer_memory, target_thread, addr, data);
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
-                check_inactive_tracee(&target)?;
+                check_inactive_tracee(target)?;
                 Err(ptrace_io_error())
             }
         }
@@ -1184,7 +1193,7 @@ fn sys_ptrace_for_target(
         // request number is -EIO -- *after* `ptrace_check_attach()` has already
         // established that the target is our stopped tracee (-ESRCH otherwise).
         _ => {
-            check_inactive_tracee(&target)?;
+            check_inactive_tracee(target)?;
             Err(ptrace_io_error())
         }
     }

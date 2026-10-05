@@ -24,7 +24,7 @@ fn mode_for_session(
 }
 
 fn mode(thr: &Thread) -> u8 {
-    let active = thr.proc_data.ptrace_active_session();
+    let active = thr.ptrace_active_session();
     mode_for_session(*thr.ptrace_syscall_mode.lock(), active)
 }
 
@@ -90,17 +90,16 @@ fn syscall_stop(thr: &Thread, uctx: &mut UserContext, op: u8) {
     if thr.pending_exit() {
         return;
     }
-    let Some(session) = thr.proc_data.ptrace_active_session() else {
+    let Some(session) = thr.ptrace_active_session() else {
         return;
     };
     // Publish provenance before waking the tracer; scheduler inactivity then
     // guarantees the corresponding GPR image is ready for remote access.
     thr.ptrace_stop_provenance.store(op, Ordering::Release);
-    if let Some(good) = thr.proc_data.ptrace_syscall_stop(session, op) {
+    if let Some(good) = thr.ptrace_syscall_stop(session, op) {
         thr.ptrace_stop_provenance
             .store(op | if good { 0x80 } else { 0 }, Ordering::Release);
-        super::signal::interrupt_stop_siblings(&thr.proc_data);
-        notify_ptrace_attach_stop(&thr.proc_data);
+        notify_ptrace_attach_stop(thr);
         wait_if_stopped(thr, uctx);
     }
     thr.ptrace_stop_provenance.store(0, Ordering::Release);
@@ -109,11 +108,11 @@ fn syscall_stop(thr: &Thread, uctx: &mut UserContext, op: u8) {
 pub(crate) fn report_exec(thr: &Thread, session: super::PtraceSession, old_pid: usize) {
     thr.ptrace_stop_provenance
         .store(LEGACY_EXEC_STOP, Ordering::Release);
-    match thr.proc_data.ptrace_exec_stop(session, old_pid) {
-        Some(0) => notify_ptrace_attach_stop(&thr.proc_data),
+    match thr.ptrace_exec_stop(session, old_pid) {
+        Some(0) => notify_ptrace_attach_stop(thr),
         Some(_) => {
             thr.ptrace_stop_provenance.store(0, Ordering::Release);
-            notify_ptrace_attach_stop(&thr.proc_data);
+            notify_ptrace_attach_stop(thr);
         }
         None => thr.ptrace_stop_provenance.store(0, Ordering::Release),
     }
@@ -121,7 +120,7 @@ pub(crate) fn report_exec(thr: &Thread, session: super::PtraceSession, old_pid: 
 
 pub(crate) fn synthetic_stop_signal_info(thr: &Thread) -> Option<SignalInfo> {
     let provenance = thr.ptrace_stop_provenance.load(Ordering::Acquire);
-    let stop = thr.proc_data.current_stop_report()?;
+    let stop = thr.current_stop_report()?;
     if stop.ptrace_event != 0 {
         return None;
     }

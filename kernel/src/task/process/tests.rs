@@ -695,12 +695,14 @@ fn process_access_ptrace_reverse_link_abort_and_limit_roll_back() {
         tracer_kernel_tid: 70,
         node: Some(Box::new(PtraceReverseLinkNode {
             tracee: 9,
+            process: 9,
             session: PtraceSession {
                 tracer: 0,
                 tracer_kernel_tid: 0,
                 generation: 0,
             },
             retired_relationship: None,
+            task_exit: None,
             next: None,
         })),
         reserved: true,
@@ -731,16 +733,22 @@ fn process_access_ptrace_reverse_links_drain_exact_tracer_task() {
     let links = SpinNoIrq::new(PtraceReverseLinks {
         head: Some(Box::new(PtraceReverseLinkNode {
             tracee: 11,
+            process: 11,
             session: session(70, 1),
             retired_relationship: None,
+            task_exit: None,
             next: Some(Box::new(PtraceReverseLinkNode {
                 tracee: 12,
+                process: 12,
                 session: session(71, 2),
                 retired_relationship: None,
+                task_exit: None,
                 next: Some(Box::new(PtraceReverseLinkNode {
                     tracee: 13,
+                    process: 13,
                     session: session(70, 3),
                     retired_relationship: None,
+                    task_exit: None,
                     next: None,
                 })),
             })),
@@ -804,13 +812,16 @@ fn process_access_ptrace_exit_drain_retains_credential_until_outer_drop_boundary
     let mut drain = PtraceReverseLinkDrain {
         next: Some(Box::new(PtraceReverseLinkNode {
             tracee: 9,
+            process: 9,
             session,
             retired_relationship: None,
+            task_exit: None,
             next: None,
         })),
         retained: None,
     };
-    assert!(drain.retain_next_retirement(|link| {
+    assert!(drain.retain_next_retirement(|link, terminal| {
+        assert!(!terminal);
         assert_eq!(link.session(), session);
         retirement.take()
     }));

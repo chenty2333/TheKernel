@@ -53,6 +53,8 @@ pub(super) fn general_register_transfer(
     Ok(0)
 }
 
+fn inert_debug_reset(addr: usize, value: usize) -> bool { addr == 904 && value == 0 }
+
 pub(super) fn ptrace_user_word(
     memory: &UserMemoryCapability,
     thread: &Thread,
@@ -80,6 +82,11 @@ pub(super) fn ptrace_user_word(
             .map_err(map_usercopy_error)?;
         return Ok(0);
     }
+    // No user debug comparator can currently be enabled. GDB clears DR7
+    // before resuming every newly discovered LWP, even without watchpoints.
+    // Accept that inert reset; nonzero controls still fail closed until the
+    // task-owned hardware debug implementation is installed.
+    if inert_debug_reset(addr, data) { return Ok(0); }
     if addr >= 216 {
         return Err(ptrace_io_error());
     }
@@ -296,9 +303,15 @@ fn validate_legacy_selectors(
 /// Inspect at most one native instruction without holding a spin guard over
 /// usercopy. An unmapped suffix terminates decoding rather than rejecting a
 /// legitimate step at the end of a page.
-pub(super) fn next_instruction_changes_tf(thread: &Thread, session: PtraceSession) -> AxResult<bool> {
-    let address = thread.ptrace_registers.lock().ok_or(AxError::NoSuchProcess)?[16] as usize;
-    let memory = pinned_tracee_memory(&thread.proc_data, session)?;
+pub(super) fn next_instruction_changes_tf(
+    thread: &Thread,
+    session: PtraceSession,
+) -> AxResult<bool> {
+    let address = thread
+        .ptrace_registers
+        .lock()
+        .ok_or(AxError::NoSuchProcess)?[16] as usize;
+    let memory = pinned_tracee_memory(thread, session)?;
     let mut bytes = [0; 15];
     let mut len = 0;
     for (offset, byte) in bytes.iter_mut().enumerate() {
@@ -307,5 +320,18 @@ pub(super) fn next_instruction_changes_tf(thread: &Thread, session: PtraceSessio
         *byte = value;
         len += 1;
     }
-    Ok(crate::task::ptrace_runtime::instruction_changes_tf(&bytes[..len]))
+    Ok(crate::task::ptrace_runtime::instruction_changes_tf(
+        &bytes[..len],
+    ))
+}
+
+#[cfg(test)]
+mod debug_reset_tests {
+    #[test]
+    fn only_the_disabled_dr7_control_is_an_inert_reset() {
+        assert!(super::inert_debug_reset(904, 0));
+        assert!(!super::inert_debug_reset(904, 1));
+        assert!(!super::inert_debug_reset(896, 0));
+        assert!(!super::inert_debug_reset(848, 0));
+    }
 }
