@@ -332,11 +332,13 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
         report
             .displays
             .iter()
-            .any(|found| found.info.bdf == bdf && found.info.device_id == 0x46d0)
+            .any(|found| found.info.bdf == bdf
+                && i915_port::native_device_supported(found.info.vendor_id,
+                    found.info.device_id, found.info.revision))
     });
     if !supported {
         return Err(String::from(
-            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0; no writes",
+            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0 exact display D0; no writes",
         ));
     }
     let (_, aperture, physical) = mapped_facts(bdf)

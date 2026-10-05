@@ -10,6 +10,14 @@ use intel_display::{
 
 use super::regs::{Meaning, Register, Registers};
 
+/// Only the exact characterized N305 SKU/stepping enters the existing native
+/// transaction. Platform identity never means an arbitrary revision is safe.
+pub(super) fn native_device_supported(vendor: u16, device_id: u16, revision: u8) -> bool {
+    device_id == 0x46d0
+        && intel_display::device::Device::identify(vendor, device_id, revision)
+            .is_ok_and(|d| d.exact_step && d.step == intel_display::device::Step::D0)
+}
+
 // A precise whitelist, not a way to turn the crate's raw offsets into arbitrary
 // aperture access. The new SCL read is pipe-A only and read-only in the adapter.
 const TIMING_READS: [Register; 7] = [
@@ -76,6 +84,17 @@ mod tests {
     extern crate std;
     use super::*;
     use crate::drm::intel::regs::mock::MockRegisters;
+    #[test]
+    fn unknown_revision_or_other_sku_never_grants_native_permission() {
+        assert!(native_device_supported(0x8086, 0x46d0, 0));
+        for revision in [1, 4, 8, 12, 255] {
+            assert!(!native_device_supported(0x8086, 0x46d0, revision));
+        }
+        for device in [0x46d1, 0x46a0, 0xa7a0, 0] {
+            assert!(!native_device_supported(0x8086, device, 0));
+        }
+        assert!(!native_device_supported(0x1234, 0x46d0, 0));
+    }
     #[test]
     #[ignore = "requires THEKERNEL_N305_CAPTURE private input; run explicitly"]
     fn captured_edid_to_tc_pll_and_preserved_cdclk() {

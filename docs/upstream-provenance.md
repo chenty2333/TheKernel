@@ -541,3 +541,10 @@ The optional C oracles load unmodified bodies/headers from the external Linux
 7.2.3 tree, build temporary host programs and remove them. Private captured
 EDID→selected timing→DKL arithmetic→preserved CDCLK is exercised in an explicit
 kernel host test, without bundling BIOS/EDID or asserting full clock policy.
+
+Kernel identity glue now delegates ADL-P/N stepping lookup to that MIT crate;
+ADL-N's source-derived display version is 13 and revision0 is D0. An inexact
+next/future lookup remains unknown in the hardware admission layer. Native
+boot admission additionally requires the characterized `8086:46d0` exact D0,
+not merely a family ID. This changes no default MMIO write policy and does
+not assert the stepping/workaround/TC hardware port is complete.

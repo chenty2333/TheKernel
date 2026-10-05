@@ -246,6 +246,23 @@ pub(crate) struct DisplayDevice {
 impl DisplayDevice {
     /// The stepping this device is at the given PCI revision.
     pub(crate) fn stepping(&self, revision: u8) -> DisplayStepping {
+        // The MIT port is the single ADL-P/N revision-map authority. Keep an
+        // inexact upstream next/future result diagnostic-only, not a known WA
+        // stepping for native programming.
+        if let Ok(device) =
+            intel_display::device::Device::identify(0x8086, self.device_id, revision)
+        {
+            if !device.exact_step {
+                return DisplayStepping::Unknown(revision);
+            }
+            return match device.step {
+                intel_display::device::Step::A0 => DisplayStepping::A0,
+                intel_display::device::Step::B0 => DisplayStepping::B0,
+                intel_display::device::Step::C0 => DisplayStepping::C0,
+                intel_display::device::Step::D0 => DisplayStepping::D0,
+                intel_display::device::Step::Future => DisplayStepping::Unknown(revision),
+            };
+        }
         self.steppings
             .iter()
             .find(|entry| entry.revision == revision)
@@ -325,19 +342,16 @@ const INTEGRATED_APERTURES: &[Aperture] = &[
 /// groups them as the ADL-N ids, and everything in this table entry is a
 /// property of the silicon family rather than of one SKU, so they share it.
 ///
-/// Two fields are deliberately empty.  There is no published PCI
-/// revision-to-stepping mapping for this part, so `steppings` is empty and a
-/// revision it has not been told about is reported as an unknown stepping
-/// rather than rounded to a known one.  And no public document states this
-/// part's display engine version, so `display_version` is `None`: a modeset
-/// driver must read that from the register reference, not from a number this
-/// table invented.
+/// Display version and revision mapping come from the MIT Linux 7.2.3 port:
+/// ADL-N is ADL-P display version 13, PCI revision0 maps to display D0. This is
+/// a source-derived platform fact, not a GMD_ID measurement or hardware proof.
+/// No per-stepping quirks are added here; unknown revisions remain unknown.
 const fn alder_lake_n(device_id: u16) -> DisplayDevice {
     DisplayDevice {
         device_id,
         name: "Alder Lake-N integrated graphics",
         generation: Generation::Gen12,
-        display_version: None,
+        display_version: Some(intel_display::device::Device::DISPLAY_VERSION),
         apertures: INTEGRATED_APERTURES,
         // Gen12 gates most of the register aperture behind forcewake, which is
         // why the probe restricts itself to the bands that do not need it.
@@ -573,7 +587,9 @@ mod tests {
                 .find(|device| device.device_id == device_id)
                 .unwrap_or_else(|| panic!("{device_id:#06x} is missing from the table"));
             assert_eq!(device.name, "Alder Lake-N integrated graphics");
-            assert_eq!(device.display_version, None, "not established publicly");
+            assert_eq!(device.display_version, Some(13));
+            assert_eq!(device.stepping(0), DisplayStepping::D0);
+            assert_eq!(device.stepping(1), DisplayStepping::Unknown(1));
         }
     }
 
@@ -691,12 +707,12 @@ mod tests {
         let text = Identity::Known(known).describe(0x04, 0x46d0);
         assert!(text.contains("Alder Lake-N"), "{text}");
         assert!(text.contains("Gen12"), "{text}");
-        // The display engine version is not something public documentation
-        // states for this part, and the report says so rather than guessing.
-        assert!(text.contains("display version not established"), "{text}");
-        // No stepping table is published for this part, so the revision is
-        // reported as an unknown stepping rather than silently called A0.
+        // Linux establishes the display family, but revision4 is not in its
+        // ADL-N stepping map. Do not substitute ADL-P B0 for this subplatform.
+        assert!(text.contains("display v13"), "{text}");
         assert!(text.contains("stepping unknown"), "{text}");
+        let exact = Identity::Known(known).describe(0, 0x46d0);
+        assert!(exact.contains("stepping D0"), "{exact}");
         let unknown = Identity::Unmodelled.describe(0x01, 0x9abc);
         assert!(unknown.contains("unmodelled"), "{unknown}");
         assert!(unknown.contains("0x9abc"), "{unknown}");
