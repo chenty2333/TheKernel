@@ -349,7 +349,10 @@ CONTRACTS.update({"ptrace-exec": ("raw-differential", "pass", "EVENT_LEGACY_AND_
 
 CONTRACTS.update({"ptrace-breakpoint": ("raw-differential", "pass", "PRIVATE_TEXT_PATCH_TRAP_STEP_AND_RESTORE")})
 
+CONTRACTS.update({"ptrace-exit": ("raw-differential", "pass", "TRACER_FIRST_EXIT_WNOWAIT_AND_NATURAL_PARENT_HANDOFF")})
+
 PROGRAM_CASES = {
+    "ptrace-exit": ("ptrace-exit",),
     "ptrace-breakpoint": ("ptrace-breakpoint",),
     "ptrace-exec": ("ptrace-exec",),
     "ptrace-stop-ready": ("ptrace-stop-ready",),
@@ -423,6 +426,7 @@ def selected_programs() -> tuple[str, ...]:
         )
     return selected
 PROGRAM_SUCCESS = {
+    "ptrace-exit": "THEKERNEL_PTRACE_EXIT_HANDOFF_OK",
     "ptrace-listen": "THEKERNEL_PTRACE_LISTEN_OK",
     "ptrace-syscall": "THEKERNEL_PTRACE_SYSCALL_OK",
     "ptrace-step": "THEKERNEL_PTRACE_STEP_OK",

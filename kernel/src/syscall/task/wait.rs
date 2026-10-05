@@ -112,6 +112,7 @@ enum WaitEvent {
         pid: Pid,
         child: Arc<Process>,
         snapshot: Arc<ZombieSnapshot>,
+        ptrace_session: Option<PtraceSession>,
     },
 }
 
@@ -337,18 +338,18 @@ fn matching_wait_candidates(
             continue;
         }
         let tracee_pid = reverse_link.tracee();
-        let Ok(tracee_data) = get_process_data(tracee_pid) else {
+        let Some(tracee) = process_domain()?.registry().get(tracee_pid) else {
             proc_data.remove_ptrace_tracee(reverse_link);
             continue;
         };
-        if tracee_data.ptrace_session_if_traced_by_process(proc.pid())
-            != Some(reverse_link.session())
-        {
+        let active_session = get_process_data(tracee_pid).ok()
+            .and_then(|data| data.ptrace_session_if_traced_by_process(proc.pid()))
+            .or_else(|| crate::task::retained_ptrace_exit_session(&tracee));
+        if active_session != Some(reverse_link.session()) {
             proc_data.remove_ptrace_tracee(reverse_link);
             continue;
         }
-        let tracee = &tracee_data.proc;
-        let Some(visible_pid) = wait_pid_applies(viewer_pid_ns, pid, tracee) else {
+        let Some(visible_pid) = wait_pid_applies(viewer_pid_ns, pid, &tracee) else {
             continue;
         };
         if let Some(candidate) = candidates
@@ -361,7 +362,7 @@ fn matching_wait_candidates(
         candidates.push(WaitCandidate {
             process: tracee.clone(),
             visible_pid,
-            allow_exit: false,
+            allow_exit: true,
             expected_ptrace_session: Some(reverse_link.session()),
         });
     }
@@ -494,7 +495,9 @@ fn select_wait_event(
 
         let event = tk_linux_process::select_child_event(
             tk_linux_process::WaitEventState {
-                exited: candidate.allow_exit && zombie.is_some(),
+                exited: candidate.allow_exit && zombie.is_some()
+                    && crate::task::ptrace_exit_report_matches(
+                        &candidate.process, candidate.expected_ptrace_session),
                 // `stop` is already the per-child gate above, so the selection
                 // must not apply the `WUNTRACED` rule a second time: a ptrace
                 // stop is reported to a bare `wait4(2)` because
@@ -515,6 +518,7 @@ fn select_wait_event(
                     pid: candidate.visible_pid,
                     child: candidate.process.clone(),
                     snapshot: zombie?,
+                    ptrace_session: candidate.expected_ptrace_session,
                 });
             }
             Some(tk_linux_process::WaitEventKind::Stopped) => {
@@ -617,7 +621,12 @@ fn write_waitid_rusage(
 /// consumed wait event; WNOWAIT alone leaves it available to another waiter.
 fn claim_wait_event(event: &WaitEvent, parent: &ProcessData, nowait: bool) -> AxResult<bool> {
     if nowait {
-        return Ok(true);
+        return Ok(match event {
+            WaitEvent::Exited { child, ptrace_session, .. } => {
+                child.is_zombie() && crate::task::ptrace_exit_report_matches(child, *ptrace_session)
+            }
+            _ => true,
+        });
     }
     match event {
         WaitEvent::Stopped {
@@ -636,8 +645,17 @@ fn claim_wait_event(event: &WaitEvent, parent: &ProcessData, nowait: bool) -> Ax
             }
         }
         WaitEvent::Exited {
-            child, snapshot, ..
+            child, snapshot, ptrace_session, ..
         } => {
+            if let Some(session) = ptrace_session {
+                match crate::task::claim_ptrace_exit(child, *session, parent) {
+                    None => return Ok(false),
+                    Some(false) => return Ok(true),
+                    Some(true) => {}
+                }
+            } else if !crate::task::ptrace_exit_report_matches(child, None) {
+                return Ok(false);
+            }
             if !reap_child(child)? {
                 return Ok(false);
             }

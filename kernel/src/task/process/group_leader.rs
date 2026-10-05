@@ -21,6 +21,9 @@ pub(crate)     scheduler: Option<Arc<SpinNoIrq<ZombieSchedulerSnapshot>>>,
 pub(crate)     landlock: Arc<SpinNoIrq<LandlockDomain>>,
     /// The process's resource limits, shared with the live `ProcessData`.
 pub(crate)     rlimits: Arc<RwLock<Rlimits>>,
+    /// Value-only wait ownership survives runtime teardown, not the address space.
+    pub(crate) ptrace_exit: PtraceExitState,
+    pub(crate) exit_autoreap: bool,
 }
 
 impl GroupLeaderSignalIdentity {
@@ -33,6 +36,8 @@ pub(crate) fn new(registration_tid: Pid, manager: Arc<ThreadSignalManager>) -> S
             scheduler_identity_token: 0,
             landlock: Arc::new(SpinNoIrq::new(LandlockDomain::default())),
             rlimits: Arc::new(RwLock::default()),
+            ptrace_exit: PtraceExitState::default(),
+            exit_autoreap: false,
         }
     }
 
@@ -52,6 +57,8 @@ pub(crate) fn new(registration_tid: Pid, manager: Arc<ThreadSignalManager>) -> S
             scheduler_identity_token: 0,
             landlock,
             rlimits,
+            ptrace_exit: PtraceExitState::default(),
+            exit_autoreap: false,
         }
     }
 

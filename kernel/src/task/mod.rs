@@ -68,6 +68,7 @@ pub(crate) use self::{
         ProcessMmLayout, ProcessReparentBatch, ProcessThreadAdmission, PtraceReverseLink,
         SemUndoState, Session, ThreadExitTransition, TimeNamespace, UTS_FIELD_LEN, UserNamespace,
         UserNamespaceId, UtsNamespace, ZombieSchedulerSnapshot, ZombieSnapshot, init_process_domain,
+        claim_ptrace_exit, ptrace_exit_report_matches, retained_ptrace_exit_session,
         is_exact_child_of_thread, prepare_session_sid_binding, process_domain, process_error,
         process_identity_pid_ns, reap_process, release_dead_session_sid_binding, set_zombie_ioprio,
         set_zombie_nice, zombie_ioprio, zombie_pid_ns, zombie_rlimit, zombie_scheduler_state,

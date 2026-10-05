@@ -195,6 +195,7 @@ mod mempolicy;
 mod namespaces;
 mod ptrace;
 mod ptrace_stop;
+mod ptrace_exit;
 mod session;
 mod zombie;
 
@@ -206,6 +207,7 @@ pub use mempolicy::Mempolicy;
 pub(crate) use mempolicy::*;
 pub(crate) use namespaces::*;
 pub(crate) use ptrace::*;
+pub(crate) use ptrace_exit::*;
 pub(crate) use session::*;
 pub(crate) use zombie::*;
 pub(crate) type ProcessGroup =

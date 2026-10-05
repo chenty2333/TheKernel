@@ -62,7 +62,7 @@ static void normalize_spacing(void) {
     *write = 0;
 }
 int main(int argc, char **argv) {
-    int follow = argc == 2 && strcmp(argv[1], "--follow-fork") == 0;
+    int follow = !(argc == 2 && strcmp(argv[1], "--files-only") == 0);
     char *gdb_version[] = {"/usr/bin/gdb", "-nx", "--version", NULL};
     char *strace_version[] = {"/usr/bin/strace", "--version", NULL};
     if (run_tool(gdb_version, "gdb-version") || !strstr(output, "GNU gdb (GDB) 16.3")) return 1;
@@ -79,11 +79,20 @@ int main(int argc, char **argv) {
         "/opt/thekernel-tests/debugger/trace-target", follow ? NULL : "--trace-child", NULL};
     if (run_tool(trace, follow ? "strace-fork-exec-file" : "strace-file")) return 1;
     normalize_spacing();
-    if ((follow && (!strstr(output, "fork(") || !strstr(output, "execve(") || !strstr(output, "TRACE_TARGET_OK"))) ||
-        !strstr(output, "/tmp/thekernel-debugger-data.txt") ||
-        !strstr(output, "O_RDWR|O_CREAT|O_TRUNC, 0600") ||
-        !strstr(output, "\"trace-data\", 10) = 10") ||
-        !strstr(output, "SEEK_SET) = 0") || !strstr(output, "read(")) return 1;
+    if (follow && (!strstr(output, "fork(") || !strstr(output, "execve(") ||
+                   !strstr(output, "TRACE_TARGET_OK"))) return 1;
+    const char *calls[] = {
+        "openat(AT_FDCWD, \"/tmp/thekernel-debugger-data.txt\", O_RDWR|O_CREAT|O_TRUNC, 0600) = 3",
+        "write(3, \"trace-data\", 10) = 10", "lseek(3, 0, SEEK_SET) = 0",
+        "read(3, \"trace-data\", 10) = 10", "close(3) = 0",
+        "unlink(\"/tmp/thekernel-debugger-data.txt\") = 0"
+    };
+    const char *cursor = output;
+    for (size_t index = 0; index < sizeof(calls) / sizeof(calls[0]); ++index) {
+        const char *found = strstr(cursor, calls[index]);
+        if (!found) return 1;
+        cursor = found + strlen(calls[index]);
+    }
     puts(follow ? "THEKERNEL_REAL_STRACE_FORK_EXEC_FILE_OK" : "THEKERNEL_REAL_STRACE_FILE_OK");
     return 0;
 }

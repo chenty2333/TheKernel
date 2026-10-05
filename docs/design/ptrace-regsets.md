@@ -172,8 +172,57 @@ its complete runtime closure and a debug-info C target. Native and guest GDB
 batch runs establish breakpoint/run/bt/registers/print/variable mutation,
 step/next/finish and normal continuation; changed input yields DEBUG_RESULT=24.
 The ordinary smoke also validates strace file syscall parameters and returns.
-The same driver with --follow-fork exercises fork/exec/file tracing; currently the
-calls and target result are correct, but strace exits with ECHILD at traced-child
-teardown. This remains a failure, not a completed strace-f claim. The traced
-relationship is currently removed before a durable zombie is visible; tracer-first
-exit handoff and independent multithread stops remain required next work.
+The default driver now exercises fork/exec/file tracing and checks the ordered
+file syscall arguments and return values; --files-only keeps the direct fixture.
+The earlier guest run exposed ECHILD at traced-child teardown despite correct
+syscalls and target output. The terminal wait repair below addresses that cause;
+real-tool acceptance passed in guest; the final notification-readiness tightening
+passed revalidation rather than being inferred from that earlier run.
+Independent multithread stops remain required next work.
+
+## Terminal traced-process handoff
+
+Before clearing a final tracee's live relationship, exit transfers its exact
+session generation into the existing preallocated durable group-leader owner.
+The tracer reverse link survives and wait resolves the authoritative core process
+registry, not merely the live runtime table. No task, ProcessData or address space
+is retained for this purpose, and final exit allocates no new owner.
+
+Natural-parent wait cannot consume or WNOWAIT-observe a terminal report held by
+a tracer. Repeated tracer WNOWAIT calls leave it intact. A consuming tracer wait
+claims its exact session once: a different natural parent receives handoff and
+its own SIGCHLD/autoreap policy; a direct-parent tracer performs the sole reap
+and usage accounting. Tracer teardown releases the same durable hold even when
+the runtime has disappeared. A handed-off marker prevents duplicate parent
+notifications when teardown/acknowledgement races final notification. Reparenting
+does not bypass a still-held report. Independent per-thread exit remains outside
+this process-final protocol.
+
+Core zombie publication is not yet ptrace wait readiness: the terminal report
+becomes visible only after its configured notification. A parent handoff also
+remains non-reportable until notification/autoreap finishes, with an extra wake
+after that publication; this prevents a polling waiter from racing notification
+or sleeping after observing the in-flight phase. Direct-parent tracers preserve
+the configured clone exit signal (including none); other tracers get SIGCHLD.
+Own-child tracer teardown does not generate a duplicate exit signal, but honors
+ignored/NOCLDWAIT and child-autoreap policy before reparenting.
+
+Native Linux's eight-scenario regression and the earlier guest runs cover
+repeated WNOWAIT, parent WNOHANG withholding, tracer acknowledgement then natural
+reap, zombie-grandchild tracer death, direct-parent SIGCHLD/SIGUSR1/no-signal clone,
+own-child zombie tracer death with default/ignored SIGCHLD, and a non-final
+pthread tracer exiting with a terminal report held while its process stays live.
+The complete repair passed native Linux, kernel2591, lint, baseline61/debug62 KVM
+guest and the paired ptrace+wait35/266 subset. Full ABI only retained the unchanged
+Linux oracle socket timeout failure; no full ABI pass is claimed.
+
+The existing exact task-parent publication gate serializes terminal parent
+selection, notification and report-ready publication with reparenting. Non-final
+tracer exit already holds that gate and passes its borrowed guard through the
+reverse-link drain; final exit acquires it only after releasing ptrace actions.
+This adds no parallel lock/graph and preserves lifecycle->parent->action ordering.
+
+The parent waiter is captured before report-ready publication, so an immediate
+winning reap cannot clear the child-parent link and suppress the wake needed by
+another waiting thread. This reference is transient; zombie ownership still
+retains no live runtime or address space.
