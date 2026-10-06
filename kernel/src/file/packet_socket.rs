@@ -1800,7 +1800,7 @@ impl FileLike for PacketSocket {
     }
 
     fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
-        socket_ifreq_ioctl(context, self.net_ns.stack(), cmd, arg)
+        socket_ifreq_ioctl(context, &self.net_ns, cmd, arg)
     }
 
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {

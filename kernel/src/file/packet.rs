@@ -2,13 +2,17 @@ use alloc::vec::Vec;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::{InterfaceInfo, InterfaceKind, IpAddress, NetStack};
-use linux_raw_sys::net::net_device_flags;
+use linux_raw_sys::{general::CAP_NET_ADMIN, net::net_device_flags};
 use tk_linux_net::{
     IFCONF_SIZE, IFREQ_SIZE, IfconfWire, IfreqOutput, IfreqRequest, IfreqWire, encode_ifconf_ipv4,
     ifconf_entry_offset, ifreq_name_eq,
 };
 
-use crate::{file::IoctlContext, mm::map_usercopy_error};
+use crate::{
+    file::IoctlContext,
+    mm::map_usercopy_error,
+    task::{NetworkNamespace, ns_capable},
+};
 
 fn read_user_bytes<const N: usize>(context: &IoctlContext, address: usize) -> AxResult<[u8; N]> {
     let mut bytes = [core::mem::MaybeUninit::<u8>::uninit(); N];
@@ -105,24 +109,60 @@ fn interface_flags(kind: InterfaceKind, administrative_up: bool) -> i16 {
     flags
 }
 
+fn interface_up_proposal(interface: &InterfaceInfo, requested: i16) -> AxResult<bool> {
+    // Only UP is implemented as writable policy. Linux preserves volatile
+    // device facts such as LOOPBACK/RUNNING, irrespective of their input bits.
+    let other_policy = net_device_flags::IFF_DEBUG as i16
+        | net_device_flags::IFF_NOTRAILERS as i16
+        | net_device_flags::IFF_NOARP as i16
+        | net_device_flags::IFF_DYNAMIC as i16
+        | net_device_flags::IFF_MULTICAST as i16
+        | net_device_flags::IFF_PORTSEL as i16
+        | net_device_flags::IFF_AUTOMEDIA as i16
+        | net_device_flags::IFF_PROMISC as i16
+        | net_device_flags::IFF_ALLMULTI as i16;
+    let current = interface_flags(interface.kind, interface.administrative_up);
+    if (requested ^ current) & other_policy != 0 {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    Ok(requested & net_device_flags::IFF_UP as i16 != 0)
+}
+
 /// Enacts interface state queries whose Linux wire decoding lives in linux-abi.
 pub fn socket_ifreq_ioctl(
     context: &IoctlContext,
-    stack: &NetStack,
+    namespace: &NetworkNamespace,
     cmd: u32,
     arg: usize,
 ) -> AxResult<usize> {
+    let stack = namespace.stack();
     let Some(request) = IfreqRequest::decode(cmd) else {
         return Err(LinuxError::ENOTTY.into());
     };
     if request == IfreqRequest::GetConfiguration {
         return socket_ifconf_ioctl(context, stack, arg);
     }
-    if matches!(request, IfreqRequest::SetFlags | IfreqRequest::SetMtu) {
+    if request == IfreqRequest::SetMtu {
         return Err(LinuxError::EOPNOTSUPP.into());
     }
-    let interfaces = stack.interfaces();
     let ifr = read_ifreq(context, arg)?;
+    if request == IfreqRequest::SetFlags {
+        if !ns_capable(
+            context.caller_cred(),
+            namespace.owner_user_ns(),
+            CAP_NET_ADMIN,
+        ) {
+            return Err(LinuxError::EPERM.into());
+        }
+        // Name selection and mutation share the router's publication lock.
+        let mut permit = stack.acquire_packet_service();
+        let interfaces = permit.interfaces()?;
+        let interface = interface_by_name(&interfaces, ifr.name()).ok_or(LinuxError::ENODEV)?;
+        let up = interface_up_proposal(interface, ifr.flags())?;
+        permit.configure_link(interface.index, None, None, Some(up))?;
+        return Ok(0); // Linux does not copy out a SIOCSIFFLAGS request.
+    }
+    let interfaces = stack.interfaces();
     let (ifr, output) = match request {
         IfreqRequest::GetIndex => (
             ifr,
@@ -186,6 +226,31 @@ pub fn socket_ifreq_ioctl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn up_proposal_ignores_volatile_facts_but_refuses_unimplemented_policy() {
+        let interface = InterfaceInfo {
+            index: 1,
+            name: "lo".into(),
+            kind: InterfaceKind::Loopback,
+            mtu: 65536,
+            administrative_up: false,
+            hardware_address: None,
+            addresses: Vec::new(),
+        };
+        assert_eq!(
+            interface_up_proposal(
+                &interface,
+                net_device_flags::IFF_UP as i16 | net_device_flags::IFF_RUNNING as i16
+            ),
+            Ok(true)
+        );
+        assert_eq!(interface_up_proposal(&interface, 0), Ok(false));
+        assert_eq!(
+            interface_up_proposal(&interface, net_device_flags::IFF_PROMISC as i16),
+            Err(LinuxError::EOPNOTSUPP.into())
+        );
+    }
+
     #[test]
     fn interface_flags_follow_administrative_state() {
         let lo = net_device_flags::IFF_LOOPBACK as i16;

@@ -163,6 +163,12 @@ impl IfreqWire {
         )
     }
 
+    /// Reads the signed short flag member, not its neighbouring padding.
+    pub fn flags(&self) -> i16 {
+        i16::from_ne_bytes(self.0[IFREQ_UNION_OFFSET..IFREQ_UNION_OFFSET + 2]
+            .try_into().expect("fixed ifreq flags width"))
+    }
+
     /// Replaces the name while preserving the interface union.
     pub fn with_name(mut self, name: &[u8]) -> Self {
         self.0[..IFNAMSIZ].copy_from_slice(&encode_ifreq_name(name));
@@ -238,6 +244,13 @@ impl IfconfWire {
 #[cfg(test)]
 mod ifreq_tests {
     use super::*;
+
+    #[test]
+    fn ifreq_flags_ignore_the_integer_members_upper_bytes() {
+        let mut bytes = [0xff; IFREQ_SIZE];
+        bytes[IFREQ_UNION_OFFSET..IFREQ_UNION_OFFSET + 2].copy_from_slice(&0x41i16.to_ne_bytes());
+        assert_eq!(IfreqWire::decode(&bytes).unwrap().flags(), 0x41);
+    }
 
     #[test]
     fn x86_64_ifreq_and_ifconf_wire_layouts_are_byte_exact() {

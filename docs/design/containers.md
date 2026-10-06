@@ -437,3 +437,21 @@ KVM system70/70 (`system-intdfb4t`) and q35/n305 lint passed. Actual signed
 crun1.30.1 now completes this read and advances to loopback bring-up, where
 SIOCSIFFLAGS still returns EOPNOTSUPP (`shell-agb7gx_p`, exit1). This establishes
 neither OCI command execution nor cgroup resource-limit acceptance.
+
+### OCI loopback activation through SIOCSIFFLAGS
+
+Socket/packet ioctl now imports the real short flag member and checks the
+captured caller's CAP_NET_ADMIN against the socket's retained network owner.
+Name selection and UP mutation use one router service permit, including real
+route-generation/wake publication; no success-only stub is used. Volatile
+LOOPBACK/RUNNING input bits cannot overwrite device facts. Other mutable flag
+policy changes and SIOCSIFMTU remain unsupported, not silently accepted.
+
+Validated: linux-net42 and kernel2639 host tests; q35 lint784; KVM system70/70
+(`system-ttj_g7n5`); paired network-basic4/259 (`abi-uk5hsr0c`). A fresh user/net
+namespace really transitions lo down/up/down, leaves the input ifreq unchanged,
+and preserves the parent's link state; a retained parent socket cannot be
+mutated with child-namespace authority, and missing-device lookup follows the
+capability gate. Actual signed crun now passes loopback activation but fails
+at `umount2 oldroot: ENOENT` (`shell-bbqx4e79`, exit1). OCI command/resource
+acceptance remains pending; fix that actual pivot/detach path next.

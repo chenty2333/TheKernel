@@ -403,7 +403,7 @@ impl FileLike for Socket {
         if cmd == FIONREAD || cmd == TIOCINQ {
             return self.inner.recv_pending_len();
         }
-        socket_ifreq_ioctl(context, self.net_ns.stack(), cmd, arg)
+        socket_ifreq_ioctl(context, &self.net_ns, cmd, arg)
     }
 
     fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {

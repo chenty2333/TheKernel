@@ -234,6 +234,42 @@ static void lifecycle_enable_loopback(void) {
     close(query);
 }
 
+/* The host only changes a fresh user-owned netns, never its real links. A
+ * retained socket also proves authority follows its owner, not current netns. */
+static void interface_flags_case(void) {
+    int outer = udp(AF_INET);
+    struct ifreq before = {0}; strcpy(before.ifr_name, "lo");
+    check("FLAGS_OUTER_QUERY", ioctl(outer, SIOCGIFFLAGS, &before) == 0);
+    pid_t child = fork(); check("FLAGS_FORK", child >= 0);
+    if (!child) {
+        check("FLAGS_PRIVATE_NS", unshare(CLONE_NEWUSER | CLONE_NEWNET) == 0);
+        struct ifreq request = {0}; strcpy(request.ifr_name, "lo");
+        request.ifr_flags = IFF_UP | IFF_RUNNING;
+        errno = 0;
+        check("FLAGS_RETAINED_OWNER", ioctl(outer, SIOCSIFFLAGS, &request) == -1 && errno == EPERM);
+        int local = udp(AF_INET);
+        check("FLAGS_INITIAL_QUERY", ioctl(local, SIOCGIFFLAGS, &request) == 0 && !(request.ifr_flags & IFF_UP));
+        request.ifr_flags = IFF_UP | IFF_RUNNING;
+        struct ifreq unchanged = request;
+        check("FLAGS_REAL_UP", ioctl(local, SIOCSIFFLAGS, &request) == 0 && !memcmp(&request, &unchanged, sizeof(request)));
+        check("FLAGS_OBSERVE_UP", ioctl(local, SIOCGIFFLAGS, &request) == 0 && (request.ifr_flags & IFF_UP) && (request.ifr_flags & IFF_LOOPBACK));
+        request.ifr_flags = 0;
+        check("FLAGS_REAL_DOWN", ioctl(local, SIOCSIFFLAGS, &request) == 0);
+        check("FLAGS_OBSERVE_DOWN", ioctl(local, SIOCGIFFLAGS, &request) == 0 && !(request.ifr_flags & IFF_UP));
+        struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3};
+        struct __user_cap_data_struct caps[2] = {{0}, {0}};
+        check("FLAGS_DROP_AUTHORITY", syscall(SYS_capset, &header, caps) == 0);
+        strcpy(request.ifr_name, "absent-tk"); errno = 0;
+        check("FLAGS_CAP_BEFORE_LOOKUP", ioctl(local, SIOCSIFFLAGS, &request) == -1 && errno == EPERM);
+        close(local); close(outer); _exit(0);
+    }
+    int status;
+    mark("IOCTL_FLAGS_PRIVATE_UP_DOWN_AUTHORITY", waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    struct ifreq after = {0}; strcpy(after.ifr_name, "lo");
+    mark("IOCTL_FLAGS_OUTER_UNCHANGED", ioctl(outer, SIOCGIFFLAGS, &after) == 0 && after.ifr_flags == before.ifr_flags);
+    close(outer);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--close-lifecycle")) {
         alarm(100);
@@ -266,7 +302,7 @@ int main(int argc, char **argv) {
     struct sockaddr_in6 *v6 = (void *)storage; v6->sin6_family = AF_INET6; v6->sin6_addr = in6addr_loopback;
     fd = udp(AF_INET6);
     errno = 0; mark("IPV6_OVERLONG_EINVAL", syscall(SYS_bind, fd, storage, 129) == -1 && errno == EINVAL);
-    close(fd); done();
+    close(fd); interface_flags_case(); done();
 
     begin("network_connect.raw-differential");
     fd = udp(AF_INET6);
