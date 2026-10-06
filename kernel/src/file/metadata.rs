@@ -22,14 +22,14 @@ static NEXT_PSEUDO_INODE: AtomicU64 = AtomicU64::new(2);
 pub(crate) struct PseudoInode {
     device: DeviceId,
     inode: u64,
-    uid: u32,
-    gid: u32,
-    times: Mutex<PseudoTimes>,
+    times: Mutex<PseudoMetadata>,
 }
 
 #[derive(Debug)]
-struct PseudoTimes {
+struct PseudoMetadata {
     mode: u32,
+    uid: u32,
+    gid: u32,
     atime: Timestamp,
     mtime: Timestamp,
     ctime: Timestamp,
@@ -40,10 +40,10 @@ impl PseudoInode {
         Self {
             device,
             inode: NEXT_PSEUDO_INODE.fetch_add(1, Ordering::Relaxed),
-            uid,
-            gid,
-            times: Mutex::new(PseudoTimes {
+            times: Mutex::new(PseudoMetadata {
                 mode,
+                uid,
+                gid,
                 atime: Timestamp::ZERO,
                 mtime: Timestamp::ZERO,
                 ctime: Timestamp::ZERO,
@@ -76,8 +76,8 @@ impl PseudoInode {
         self.inode
     }
 
-    pub(crate) const fn owner_uid(&self) -> u32 {
-        self.uid
+    pub(crate) fn owner_uid(&self) -> u32 {
+        self.times.lock().uid
     }
 
     pub(crate) fn stat(&self) -> Kstat {
@@ -87,8 +87,8 @@ impl PseudoInode {
             ino: self.inode,
             nlink: 1,
             mode: times.mode,
-            uid: self.uid,
-            gid: self.gid,
+            uid: times.uid,
+            gid: times.gid,
             blksize: 4096,
             atime: times.atime,
             mtime: times.mtime,
@@ -99,6 +99,14 @@ impl PseudoInode {
 
     pub(crate) fn chmod(&self, mode: u16, ctime: Timestamp) {
         let mut metadata = self.times.lock();
+        metadata.mode = (metadata.mode & !0o7777) | u32::from(mode & 0o7777);
+        metadata.ctime = ctime;
+    }
+
+    pub(crate) fn chown(&self, uid: u32, gid: u32, mode: u16, ctime: Timestamp) {
+        let mut metadata = self.times.lock();
+        metadata.uid = uid;
+        metadata.gid = gid;
         metadata.mode = (metadata.mode & !0o7777) | u32::from(mode & 0o7777);
         metadata.ctime = ctime;
     }
@@ -159,6 +167,18 @@ mod tests {
         assert_eq!((after.dev, after.ino, after.uid, after.gid),
                    (before.dev, before.ino, before.uid, before.gid));
         assert_eq!(after.ctime, Timestamp::new(19, 0));
+    }
+
+    #[test]
+    fn pipe_owner_and_mode_publish_in_one_inode_snapshot() {
+        let inode = PseudoInode::pipe();
+        let identity = inode.inode();
+        inode.chown(1000, 1001, 0o640, Timestamp::new(20, 0));
+        let stat = inode.stat();
+        assert_eq!((stat.uid, stat.gid, stat.mode),
+                   (1000, 1001, linux_raw_sys::general::S_IFIFO | 0o640));
+        assert_eq!(stat.ino, identity);
+        assert_eq!(stat.ctime, Timestamp::new(20, 0));
     }
 
     #[test]

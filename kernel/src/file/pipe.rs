@@ -1029,6 +1029,31 @@ pub struct Pipe {
     non_blocking: AtomicBool,
 }
 
+impl Pipe {
+    pub(crate) fn chmod_inode(
+        &self,
+        mode: u32,
+        security: &super::permission::VfsSecurityContext,
+        metadata: &axfs_ng_vfs::Metadata,
+    ) -> AxResult<()> {
+        super::permission::chmod_pseudo_inode(metadata, mode, security, |mode, ctime| {
+            self.shared.inode.chmod(mode, ctime);
+        })
+    }
+
+    pub(crate) fn chown_inode(
+        &self,
+        user: Option<crate::task::Kuid>,
+        group: Option<crate::task::Kgid>,
+        security: &super::permission::VfsSecurityContext,
+        metadata: &axfs_ng_vfs::Metadata,
+    ) -> AxResult<()> {
+        super::permission::chown_pseudo_inode(metadata, user, group, security, |uid, gid, mode, ctime| {
+            self.shared.inode.chown(uid, gid, mode, ctime);
+        })
+    }
+}
+
 /// A borrowed anonymous-pipe or FIFO endpoint.
 ///
 /// The two objects have the same byte-stream mechanics but different lifetime

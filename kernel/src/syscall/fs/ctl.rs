@@ -1829,6 +1829,15 @@ fn do_fchownat(
     // plan below; this broad gate must eventually become an inode-local Layer
     // 1 mechanism rather than part of the syscall or ABI contract.
     let _metadata_writer_fallback = mounts::namespace_operation();
+    if path.is_none_or(|path| path.as_bytes().is_empty()) && dirfd != AT_FDCWD {
+        let description = get_file_description(dirfd)?;
+        check_metadata_description_status(source, description.status_flags())?;
+        if let Some(pipe) = description.inner.downcast_ref::<crate::file::Pipe>() {
+            let (user, group) = requested_chown_ids(security.actor(), uid, gid)?;
+            pipe.chown_inode(user, group, &security, &pseudo_metadata(&pipe.stat()?))?;
+            return Ok(0);
+        }
+    }
     let loc = resolve_metadata_target(dirfd, path, flags, source, &security)?;
     // Linux's mnt_want_write() failure precedes ID conversion, inode locking,
     // security hooks, and setattr_prepare authorization.
@@ -1928,6 +1937,10 @@ fn do_fchmodat(
         check_metadata_description_status(source, description.status_flags())?;
         if let Some(socket) = description.inner.downcast_ref::<crate::file::Socket>() {
             socket.chmod_inode(mode, &security, &pseudo_metadata(&socket.stat()?))?;
+            return Ok(0);
+        }
+        if let Some(pipe) = description.inner.downcast_ref::<crate::file::Pipe>() {
+            pipe.chmod_inode(mode, &security, &pseudo_metadata(&pipe.stat()?))?;
             return Ok(0);
         }
     }

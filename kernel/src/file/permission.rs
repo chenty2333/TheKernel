@@ -667,6 +667,38 @@ pub(crate) fn chmod_pseudo_inode(
     Ok(())
 }
 
+/// Pipefs has no executable privilege xattrs or ACL provider. Preserve its
+/// identity and publish the full prepared owner/mode snapshot only after DAC
+/// and the mandatory setattr hook admit this exact metadata proposal.
+pub(crate) fn chown_pseudo_inode(
+    metadata: &Metadata,
+    user: Option<Kuid>,
+    group: Option<Kgid>,
+    security: &VfsSecurityContext,
+    publish: impl FnOnce(u32, u32, u16, Timestamp),
+) -> AxResult<()> {
+    validate_setattr_owner_pair(metadata, user, group, security.filesystem_owner_user_ns())?;
+    let node = linux_metadata_snapshot(metadata);
+    let plan = linux_plan_chown(
+        &node,
+        LinuxChownRequest::new(user.map(Kuid::into_raw), group.map(Kgid::into_raw)),
+        KernelDacCredentials::actor_bound(security.actor(), security.credentials())
+            .for_inode(node.owner_user, node.owner_group),
+    );
+    let proposal = InodeSetattrProposal::chown(
+        InodeChownIntent::new(user, group),
+        plan.hook_mode().map(inode_setattr_mode).transpose()?,
+        tk_linux_cred::InodeSetattrPrivilegeCleanup::Preserve,
+    );
+    let admission = security.begin_pseudo_inode_setattr(metadata, proposal)?;
+    let prepared = plan.prepare().map_err(map_setattr_error)?;
+    let ctime = wall_time().into();
+    let committed = prepare_metadata_setattr(metadata, prepared, ctime).committed;
+    publish(committed.uid, committed.gid, committed.mode.bits(), ctime);
+    admission.committed(InodeSetattrCommittedSecurityRef::new_pseudo(&committed));
+    Ok(())
+}
+
 /// Kernel adapter joining one exact generic Linux-VFS chmod plan to the typed
 /// credential hook contract.
 ///

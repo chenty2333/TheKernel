@@ -887,3 +887,28 @@ state/default deny. Real rootless podman/crun (`shell-d1hq9wfa`) passes the new
 sysctl setup; its next fatal is fchown of stdout fd1 returning ENOENT. The previous
 conmon chmod stdout/stderr warnings now suggest the same descriptor-only pipe
 metadata gap. Hello remains unaccepted; inspect the actual stream type next.
+
+### Anonymous pipe ownership for OCI stdio
+
+Temporary tracing confirms crun's fatal stdout fd1 is a real pipefs inode
+(S_IFIFO|0600, kernel UID/GID1000/1000), not a missing command. The pathname-only
+fchown resolver returned EBADF and musl's /proc/fd fallback yielded ENOENT.
+The temporary trace was removed before semantic validation.
+
+Anonymous pipe fchmod/fchown now use the retained shared pipe inode, so both ends
+and duplicated descriptions observe the same actual owner/mode. The existing
+Linux chmod/chown plans, requested-ID mapping, inode-aware CAP_CHOWN admission,
+pre/post setattr hooks and metadata-writer serialization remain mandatory.
+Pipefs has no executable capability xattrs to remove; its prepared mode, UID/GID
+and ctime publish as one snapshot without changing inode identity or type.
+
+Kernel2658 host tests, lint784, KVM system70/70 (`system-vuhwdwcw`) and paired
+fs-abi24/259 (`abi-9w2ete8b`) passed. Paired tests directly invoke the syscalls,
+verify real shared endpoint ownership/mode and stable identity, unchanged-ID
+sentinels, and both non-owner EPERM negatives. This does not add socket fchown or
+metadata mutation for every other anonymous descriptor family.
+The real Podman probe (`shell-oeddtvfd`) then timed out after300s without returning
+from the guest script; no hello or success marker was observed. This is not a
+passing container result. Next run this one probe with a guest-side observer to
+inspect the real runtime state; previous early fchown failure is not assumed
+resolved solely from an overall harness timeout.

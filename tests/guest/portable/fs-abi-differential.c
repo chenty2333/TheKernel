@@ -2265,6 +2265,38 @@ int main(void) {
         check(unlink(sock_addr.sun_path) == 0, "socket-chmod-unlink");
         close(sock_dup);
         close(sock);
+        int meta_pipe[2];
+        check(pipe2(meta_pipe, O_CLOEXEC) == 0, "pipe-metadata-create");
+        struct stat pipe_before, pipe_after;
+        check(fstat(meta_pipe[0], &pipe_before) == 0, "pipe-metadata-before");
+        check(syscall(SYS_fchmod, meta_pipe[1], 0640) == 0 &&
+              fstat(meta_pipe[0], &pipe_after) == 0 &&
+              S_ISFIFO(pipe_after.st_mode) && (pipe_after.st_mode & 07777) == 0640,
+              "pipe-metadata-shared-mode");
+        check(syscall(SYS_fchown, meta_pipe[1], 1000, 1001) == 0 &&
+              fstat(meta_pipe[0], &pipe_after) == 0 &&
+              pipe_after.st_uid == 1000 && pipe_after.st_gid == 1001 &&
+              pipe_after.st_ino == pipe_before.st_ino &&
+              pipe_after.st_dev == pipe_before.st_dev, "pipe-metadata-shared-owner");
+        check(syscall(SYS_fchown, meta_pipe[0], -1, -1) == 0 &&
+              fstat(meta_pipe[1], &pipe_after) == 0 &&
+              pipe_after.st_uid == 1000 && pipe_after.st_gid == 1001,
+              "pipe-metadata-owner-sentinels");
+        pid_t pipe_child = fork();
+        check(pipe_child >= 0, "pipe-metadata-child");
+        if (pipe_child == 0) {
+            if (setgid(1002) || setuid(1002)) _exit(1);
+            errno = 0;
+            if (syscall(SYS_fchmod, meta_pipe[0], 0777) != -1 || errno != EPERM) _exit(2);
+            errno = 0;
+            _exit(syscall(SYS_fchown, meta_pipe[0], 1002, 1002) == -1 && errno == EPERM ? 0 : 3);
+        }
+        int pipe_status;
+        check(waitpid(pipe_child, &pipe_status, 0) == pipe_child &&
+              WIFEXITED(pipe_status) && WEXITSTATUS(pipe_status) == 0,
+              "pipe-metadata-nonowner-denied");
+        close(meta_pipe[0]);
+        close(meta_pipe[1]);
         mark("MODE_AND_OWNER");
 
         /* fs/namei.c do_mknodat(): a FIFO is creatable and a duplicate name
