@@ -3960,6 +3960,7 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                     || Ok(format!("{}\n", current_version_string()?).into_bytes()),
                 ),
             );
+            kernel.add("cap_last_cap", super::proc_capabilities::last_cap_file(fs.clone()));
             kernel.add(
                 "pid_max",
                 SimpleFile::new_regular(

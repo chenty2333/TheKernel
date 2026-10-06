@@ -426,3 +426,14 @@ crun startup (`shell-agb7gx_p`). This was a packaging failure before guest
 execution, not a kernel ABI failure. The capability-node candidate is still
 uncommitted; the runtime now gets beyond that read and reports unsupported
 SIOCSIFFLAGS, not OCI acceptance.
+
+### Real capability ceiling required by OCI capability setup
+
+`/proc/sys/kernel/cap_last_cap` is a read-only node rendered from the same
+`CapabilityNumber::MAX` that validates credential admission (40, matching the
+Linux7.2.3 capability UAPI). It is not a guessed runtime capability count.
+The formatter/admission boundary has a host regression. Full period60 host,
+KVM system70/70 (`system-intdfb4t`) and q35/n305 lint passed. Actual signed
+crun1.30.1 now completes this read and advances to loopback bring-up, where
+SIOCSIFFLAGS still returns EOPNOTSUPP (`shell-agb7gx_p`, exit1). This establishes
+neither OCI command execution nor cgroup resource-limit acceptance.
