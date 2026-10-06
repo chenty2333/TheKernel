@@ -121,3 +121,8 @@ src/info.rs additionally ports intel_uncore.h intel_uncore_read64_2x32
 the caller; still-torn reads fail closed rather than returning a mixed counter.
 Kernel context adapter also follows set_proto_ctx_engines lookup/index semantics
 and the target Mesa26.1.2 engine/recoverable/VM CREATE_EXT chain.
+
+Valid-image lrc/rcs updates preserve the GPU-generated stream and unrelated
+values, following intel_lrc.c ring/PPGTT/WA/control update facts. Kernel cached
+images use a distinct execlists idle context and reset retirement; software
+model tags are not hardware state-save/default-state acceptance.

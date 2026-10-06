@@ -5,8 +5,8 @@
 // Full MIT grant and inventory: crates/ax/tk-intel-gt/LICENSE-MIT and NOTICE.
 //! Kernel-owned BCS copy or fixed RCS shader, no arbitrary batch/Mesa claim. Software
 //! preparation uses existing SharedPages/GGTT; DMA ownership precedes ELSQ load.
-use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{Ordering, fence};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use intel_gt::{Error, GtIo, bcs, lrc, ppgtt};
 
@@ -165,12 +165,151 @@ impl Vm {
     }
 }
 
+/// An opaque image is valid only after a confirmed hardware context switch
+/// and scoped reset retirement. Userspace cannot import a CPU-produced image.
+// Linux intel_gt.c __engines_record_defaults: reset-state inhibited request,
+// switch to a distinct kernel context, retire, then retain its opaque image.
+// Copyright ©2014 Intel Corporation; existing tk-intel-gt/LICENSE-MIT grant.
+static DEFAULTS: axsync::Mutex<[Option<Arc<Ram>>; 2]> = axsync::Mutex::new([None, None]);
+pub(super) fn isolation_classes() -> u32 {
+    let defaults = DEFAULTS.lock();
+    (u32::from(defaults[0].is_some()) * 8) | u32::from(defaults[1].is_some())
+}
+pub(crate) struct SavedContext {
+    ram: Arc<Ram>,
+    valid: AtomicBool,
+    render: bool,
+}
+impl SavedContext {
+    pub(crate) fn new(file: &crate::drm::DrmFile, render: bool) -> axerrno::AxResult<Arc<Self>> {
+        let count = if render {
+            intel_gt::rcs::CONTEXT_PAGES
+        } else {
+            lrc::CONTEXT_PAGES
+        };
+        let charge = file
+            .reserve_render_memory(count * PAGE)
+            .map_err(axerrno::AxError::from)?;
+        let ram = Arc::try_new(Ram::allocate(count).map_err(|_| axerrno::AxError::NoMemory)?)
+            .map_err(|_| axerrno::AxError::NoMemory)?;
+        ram.pages.retain_allocation_owner(charge)?;
+        let default = DEFAULTS.lock()[usize::from(render)].clone();
+        if let Some(default) = &default {
+            let count = if render { 14 } else { 2 };
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(count * PAGE)
+                .map_err(|_| axerrno::AxError::NoMemory)?;
+            bytes.resize(count * PAGE, 0);
+            default
+                .read(0, &mut bytes)
+                .map_err(|_| axerrno::AxError::Io)?;
+            ram.write(0, &bytes).map_err(|_| axerrno::AxError::Io)?;
+            ram.write(0, &[0; 4096]).map_err(|_| axerrno::AxError::Io)?;
+            // lrc_init_state/init_common_regs for a newly cloned context,
+            // not a subsequent warm request: fresh runtime and BB offset.
+            ram.write(PAGE + 35 * 4, &0u32.to_le_bytes())
+                .map_err(|_| axerrno::AxError::Io)?;
+            ram.write(PAGE + 0x71 * 4, &0u32.to_le_bytes())
+                .map_err(|_| axerrno::AxError::Io)?;
+        }
+        Arc::try_new(Self {
+            ram,
+            valid: AtomicBool::new(default.is_some()),
+            render,
+        })
+        .map_err(|_| axerrno::AxError::NoMemory)
+    }
+}
+struct SwitchAway {
+    context: Ram,
+    ring: Ram,
+    bindings: Vec<Binding>,
+    descriptor: u64,
+}
+impl SwitchAway {
+    fn new(render: bool) -> Result<Self, Error> {
+        let mut bindings = Vec::new();
+        bindings.try_reserve_exact(2).map_err(|_| Error::Refused)?;
+        Ok(Self {
+            context: Ram::allocate(if render {
+                intel_gt::rcs::CONTEXT_PAGES
+            } else {
+                lrc::CONTEXT_PAGES
+            })?,
+            ring: Ram::allocate(1)?,
+            bindings,
+            descriptor: 0,
+        })
+    }
+    fn build(&mut self, gtt: &Gtt, render: bool, root: u64, io: &impl GtIo) -> Result<(), Error> {
+        for ram in [&self.context, &self.ring] {
+            self.bindings.push(
+                gtt.bind_pages(&ram.physical)
+                    .map_err(|_| Error::Quarantined)?,
+            );
+        }
+        let context = self.bindings[0].address as u32;
+        let ring = self.bindings[1].address as u32;
+        let mut regs = [0; 1024];
+        let mut indirect = [0; 1024];
+        let mut per = [0; 1024];
+        let descriptor = if render {
+            intel_gt::rcs::build_context(
+                &mut regs,
+                &mut indirect,
+                &mut per,
+                context,
+                ring,
+                78 * 4,
+                root,
+            )?
+        } else {
+            lrc::build(&mut regs, &mut indirect, &mut per, context, ring, 120, root)?
+        };
+        // Source Gen11/12.0 descriptor SW context bits37..47. Port1 must be a
+        // distinct context to force the port0 image save before its breadcrumb.
+        self.descriptor = (descriptor & !(0x7ffu64 << 37)) | (3u64 << 37);
+        self.context.dwords(1, &regs)?;
+        self.context
+            .dwords(if render { 14 } else { 2 }, &indirect)?;
+        self.context.dwords(if render { 15 } else { 3 }, &per)?;
+        if render {
+            let mut words = [0; 78];
+            let mut normal = [0; 42];
+            intel_gt::rcs::ring(&mut normal, 0x30000, context, 1)?;
+            normal[23..26].fill(0); // source idle request has no BB dispatch.
+            words[..22].copy_from_slice(&normal[..22]);
+            words[1] |= 1 << 27;
+            intel_gt::rcs::context_wa(io, &mut words[22..36])?;
+            words[36..].copy_from_slice(&normal);
+            words[37] |= 1 << 27;
+            self.ring.dwords(0, &words)?;
+        } else {
+            let count = bcs::ring(&mut regs, 0x30000, context, 1)?;
+            regs[15..18].fill(0); // only MI_BATCH_BUFFER_START and its two address words.
+            self.ring.dwords(0, &regs[..count])?;
+        }
+        self.context.flush();
+        self.ring.flush();
+        Ok(())
+    }
+    fn release(&mut self, gtt: &Gtt) -> Result<(), Error> {
+        for binding in self.bindings.iter().rev() {
+            // SAFETY: outer selected-engine reset established full retirement.
+            unsafe { gtt.release_binding(binding) }.map_err(|_| Error::Quarantined)?;
+        }
+        self.bindings.clear();
+        Ok(())
+    }
+}
+
 pub(super) struct Memory {
     gtt: Arc<Gtt>,
     tables: Arc<Ram>,
     source: Ram,
     destination: Ram,
-    context: Ram,
+    context: Arc<Ram>,
     ring: Ram,
     batch: Ram,
     status: Ram,
@@ -179,6 +318,9 @@ pub(super) struct Memory {
     operation: bcs::Copy,
     selftest: bool,
     render: bool,
+    idle: bool,
+    saved: Option<Arc<SavedContext>>,
+    switch: Option<Box<SwitchAway>>,
 }
 impl Memory {
     fn allocate(gtt: Arc<Gtt>) -> Result<Self, Error> {
@@ -189,7 +331,7 @@ impl Memory {
             tables: Arc::try_new(Ram::allocate(8)?).map_err(|_| Error::Refused)?,
             source: Ram::allocate(6)?,
             destination: Ram::allocate(6)?,
-            context: Ram::allocate(4)?,
+            context: Arc::try_new(Ram::allocate(4)?).map_err(|_| Error::Refused)?,
             ring: Ram::allocate(1)?,
             batch: Ram::allocate(1)?,
             status: Ram::allocate(1)?,
@@ -206,6 +348,9 @@ impl Memory {
             },
             selftest: true,
             render: false,
+            idle: false,
+            saved: None,
+            switch: None,
         })
     }
     fn from_objects(
@@ -233,7 +378,7 @@ impl Memory {
         Ok(memory)
     }
     fn bind_and_build(&mut self) -> Result<(), Error> {
-        for r in [&self.context, &self.ring, &self.status] {
+        for r in [&*self.context, &self.ring, &self.status] {
             self.bindings.push(
                 self.gtt
                     .bind_pages(&r.physical)
@@ -270,11 +415,31 @@ impl Memory {
         let regs: &mut [u32; 1024] = regs_data.as_mut_slice().try_into().unwrap();
         let indirect: &mut [u32; 1024] = indirect_data.as_mut_slice().try_into().unwrap();
         let per_ctx: &mut [u32; 1024] = per_data.as_mut_slice().try_into().unwrap();
+        let restore = self
+            .saved
+            .as_ref()
+            .is_some_and(|s| s.valid.load(Ordering::Acquire));
+        if restore {
+            let mut bytes = [0; 4096];
+            self.context.read(PAGE, &mut bytes)?;
+            for (word, bytes) in regs.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                *word = u32::from_le_bytes(*bytes);
+            }
+        }
         self.descriptor = if self.render {
-            intel_gt::rcs::build_context(regs, indirect, per_ctx, ctx, ring, 78 * 4, p[0])?
+            if restore {
+                intel_gt::rcs::restore_context(regs, indirect, per_ctx, ctx, ring, 78 * 4, p[0])?
+            } else {
+                intel_gt::rcs::build_context(regs, indirect, per_ctx, ctx, ring, 78 * 4, p[0])?
+            }
         } else {
-            lrc::build(regs, indirect, per_ctx, ctx, ring, 120, p[0])?
+            if restore {
+                lrc::restore_context(regs, indirect, per_ctx, ctx, ring, 120, p[0])?
+            } else {
+                lrc::build(regs, indirect, per_ctx, ctx, ring, 120, p[0])?
+            }
         };
+        self.context.write(0, &[0; 4096])?;
         self.context.dwords(1, regs)?;
         self.context
             .dwords(if self.render { 14 } else { 2 }, indirect)?;
@@ -287,6 +452,9 @@ impl Memory {
             self.batch.dwords(0, &batch)?;
         }
         let count = bcs::ring(regs, 0x30000, ctx, 1)?;
+        if self.idle {
+            regs[15..18].fill(0);
+        }
         self.ring.dwords(0, &regs[..count])?;
         if self.selftest {
             let mut data = Vec::new();
@@ -307,7 +475,7 @@ impl Memory {
             &*self.tables,
             &self.source,
             &self.destination,
-            &self.context,
+            &*self.context,
             &self.ring,
             &self.batch,
             &self.status,
@@ -332,6 +500,9 @@ impl Memory {
         intel_gt::rcs::context_wa(io, &mut words[22..36])?;
         words[36..].copy_from_slice(&normal);
         words[37] |= 1 << 27; // after-WA full barrier.
+        if self.idle {
+            words[36 + 23..36 + 26].fill(0);
+        }
         self.ring.dwords(0, &words)?;
         self.ring.flush();
         Ok(())
@@ -360,6 +531,9 @@ impl Memory {
         Ok(())
     }
     fn release(&mut self) -> Result<(), Error> {
+        if let Some(switch) = self.switch.as_mut() {
+            switch.release(&self.gtt)?;
+        }
         for binding in self.bindings.iter().rev() {
             // SAFETY: only reached after successful source selected-engine stop/reset,
             // pending-MI-wake/ready/GDRST/cancel checks; no other engine sees
@@ -409,17 +583,30 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
     io.read(base + 0x3a0)?;
     fence(Ordering::SeqCst);
     // Gen12 ELSQ writes port1 then port0, low then high, then explicit load.
-    io.write(base + 0x518, 0)?;
-    io.write(base + 0x51c, 0)?;
+    let second = memory.switch.as_ref().map_or(0, |s| s.descriptor);
+    io.write(base + 0x518, second as u32)?;
+    io.write(base + 0x51c, (second >> 32) as u32)?;
     io.write(base + 0x510, memory.descriptor as u32)?;
     io.write(base + 0x514, (memory.descriptor >> 32) as u32)?;
     io.write(base + 0x550, 1)?;
     let start = io.now_us();
     let mut value = [0u8; 4];
     for _ in 0..100_000 {
-        memory.context.flush();
-        memory.context.read(lrc::SCRATCH as usize, &mut value)?;
+        let finished = memory
+            .switch
+            .as_ref()
+            .map_or(&*memory.context, |s| &s.context);
+        finished.flush();
+        finished.read(lrc::SCRATCH as usize, &mut value)?;
         if u32::from_le_bytes(value) == 1 {
+            memory.context.flush();
+            if memory.switch.is_some() {
+                let mut first = [0; 4];
+                memory.context.read(lrc::SCRATCH as usize, &mut first)?;
+                if u32::from_le_bytes(first) != 1 {
+                    return Err(Error::Refused);
+                }
+            }
             fence(Ordering::SeqCst);
             return Ok(());
         }
@@ -437,6 +624,9 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
 // Outer error means quiescence was not established: caller MUST retain all
 // DMA owners. An inner error can be reported after safe scoped unbinding.
 fn execute_and_quiesce(io: &impl GtIo, memory: &Memory) -> Result<Result<(), Error>, Error> {
+    if let Some(saved) = &memory.saved {
+        saved.valid.store(false, Ordering::Release);
+    }
     let executed = submit(io, memory);
     if memory.render {
         intel_gt::reset::stop_and_reset_rcs(io)
@@ -444,6 +634,13 @@ fn execute_and_quiesce(io: &impl GtIo, memory: &Memory) -> Result<Result<(), Err
         intel_gt::reset::stop_and_reset_bcs(io)
     }
     .map_err(|_| Error::Quarantined)?;
+    // WB userspace mappings may have refilled while DMA was in flight. UC GPU
+    // stores must be visible before the GEM completion is signaled, not only
+    // in the bootstrap's optional byte verifier. Retirement precedes invalidate.
+    memory.destination.flush();
+    if let Some(saved) = &memory.saved {
+        saved.valid.store(executed.is_ok(), Ordering::Release);
+    }
     Ok(executed.and_then(|()| {
         if memory.selftest {
             memory.verify()
@@ -479,7 +676,57 @@ pub(super) fn run(owner: &mut super::Owner, bdf: pci::Bdf) -> Result<(), Error> 
     let verified = execute_and_quiesce(&owner.bus, memory)?;
     memory.release()?;
     owner.memory = None;
-    verified
+    verified?;
+    record_defaults(owner, false)
+}
+
+#[cfg(target_os = "none")]
+fn record_defaults(owner: &mut super::Owner, render: bool) -> Result<(), Error> {
+    if owner.memory.is_some() || owner.lost {
+        return Err(Error::Quarantined);
+    }
+    if render {
+        intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
+    } else {
+        intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
+    }
+    owner.bus.prepare_shared()?;
+    if render {
+        intel_gt::rcs::prepare(&owner.bus)?;
+    }
+    let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+    let mut memory = Memory::allocate(gtt)?;
+    memory.render = render;
+    memory.idle = true;
+    memory.selftest = false;
+    memory.context = Arc::try_new(Ram::allocate(if render {
+        intel_gt::rcs::CONTEXT_PAGES
+    } else {
+        lrc::CONTEXT_PAGES
+    })?)
+    .map_err(|_| Error::Refused)?;
+    memory.switch = Some(Box::try_new(SwitchAway::new(render)?).map_err(|_| Error::Refused)?);
+    owner.memory = Some(memory);
+    let memory = owner.memory.as_mut().unwrap();
+    memory.bind_and_build()?;
+    if render {
+        memory.render_ring(&owner.bus)?;
+    }
+    memory.switch.as_mut().unwrap().build(
+        &memory.gtt,
+        render,
+        memory.tables.physical[0],
+        &owner.bus,
+    )?;
+    execute_and_quiesce(&owner.bus, memory)??;
+    let captured = memory.context.clone();
+    memory.release()?;
+    owner.memory = None;
+    DEFAULTS.lock()[usize::from(render)] = Some(captured);
+    if render {
+        owner.bus.prepare_shared()?;
+    }
+    Ok(())
 }
 
 /// Shader-driven 3D rectangle selftest, not BCS or a CPU-copy fallback.
@@ -493,12 +740,13 @@ pub(super) fn render_test(owner: &mut super::Owner) -> Result<(), Error> {
         return Err(Error::Refused);
     }
     owner.bus.rcs_owned.store(true, Ordering::Release);
+    record_defaults(owner, true)?;
     intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
     owner.bus.prepare_shared()?;
     intel_gt::rcs::prepare(&owner.bus)?;
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let mut memory = Memory::allocate(gtt)?;
-    memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?;
+    memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?);
     memory.render = true;
     owner.memory = Some(memory);
     let memory = owner.memory.as_mut().unwrap();
@@ -519,6 +767,7 @@ pub(super) fn render_objects(
     source: Arc<SharedPages>,
     destination: Arc<SharedPages>,
     vm: Arc<Vm>,
+    saved: Arc<SavedContext>,
 ) -> Result<(), Error> {
     if owner.lost || owner.memory.is_some() {
         return Err(Error::Quarantined);
@@ -545,11 +794,24 @@ pub(super) fn render_objects(
     };
     let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
     memory.tables = vm.tables.clone();
-    memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?;
+    memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?);
     memory.render = true;
+    if saved.render != memory.render {
+        return Err(Error::Refused);
+    }
+    memory.context = saved.ram.clone();
+    memory.saved = Some(saved);
+    memory.switch =
+        Some(Box::try_new(SwitchAway::new(memory.render)?).map_err(|_| Error::Refused)?);
     owner.memory = Some(memory);
     let memory = owner.memory.as_mut().unwrap();
     memory.bind_and_build()?;
+    memory.switch.as_mut().unwrap().build(
+        &memory.gtt,
+        memory.render,
+        memory.tables.physical[0],
+        &owner.bus,
+    )?;
     memory.render_ring(&owner.bus)?;
     let result = execute_and_quiesce(&owner.bus, memory)?;
     memory.release()?;
@@ -568,6 +830,7 @@ pub(super) fn objects(
     destination: Arc<SharedPages>,
     operation: bcs::Copy,
     vm: Arc<Vm>,
+    saved: Arc<SavedContext>,
 ) -> Result<(), Error> {
     if owner.lost || owner.memory.is_some() {
         return Err(Error::Quarantined);
@@ -593,9 +856,22 @@ pub(super) fn objects(
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
     memory.tables = vm.tables.clone();
+    if saved.render != memory.render {
+        return Err(Error::Refused);
+    }
+    memory.context = saved.ram.clone();
+    memory.saved = Some(saved);
+    memory.switch =
+        Some(Box::try_new(SwitchAway::new(memory.render)?).map_err(|_| Error::Refused)?);
     owner.memory = Some(memory);
     let memory = owner.memory.as_mut().unwrap();
     memory.bind_and_build()?;
+    memory.switch.as_mut().unwrap().build(
+        &memory.gtt,
+        memory.render,
+        memory.tables.physical[0],
+        &owner.bus,
+    )?;
     let outcome = execute_and_quiesce(&owner.bus, memory)?;
     memory.release()?;
     owner.memory = None;
@@ -624,13 +900,20 @@ pub(in crate::drm::intel) mod tests {
                 &*self.memory.tables,
                 &self.memory.source,
                 &self.memory.destination,
-                &self.memory.context,
+                &*self.memory.context,
                 &self.memory.ring,
                 &self.memory.batch,
                 &self.memory.status,
             ] {
                 if let Some(index) = ram.physical.iter().position(|&p| p == page) {
                     return Ok((ram, index * PAGE + inside));
+                }
+            }
+            if let Some(switch) = &self.memory.switch {
+                for ram in [&switch.context, &switch.ring] {
+                    if let Some(index) = ram.physical.iter().position(|&p| p == page) {
+                        return Ok((ram, index * PAGE + inside));
+                    }
                 }
             }
             Err(Error::Refused)
@@ -652,6 +935,51 @@ pub(in crate::drm::intel) mod tests {
             }
             Ok(page + (virtual_address & 4095))
         }
+        fn switch_away(&self) -> Result<(), Error> {
+            let Some(switch) = &self.memory.switch else {
+                return Ok(());
+            };
+            let base = if self.memory.render { 0x2000 } else { 0x22000 };
+            let words = self.words.borrow();
+            assert_eq!(
+                words.get(&(base + 0x518)).copied(),
+                Some(switch.descriptor as u32)
+            );
+            assert_eq!(
+                words.get(&(base + 0x51c)).copied(),
+                Some((switch.descriptor >> 32) as u32)
+            );
+            drop(words);
+            let mut tail = [0; 4];
+            switch.context.read(PAGE + 7 * 4, &mut tail)?;
+            assert_eq!(
+                u32::from_le_bytes(tail),
+                if self.memory.render { 78 * 4 } else { 120 }
+            );
+            let mut dispatch = [0; 12];
+            switch.ring.read(
+                if self.memory.render {
+                    (36 + 23) * 4
+                } else {
+                    15 * 4
+                },
+                &mut dispatch,
+            )?;
+            assert_eq!(dispatch, [0; 12]);
+            // HOST MODEL ONLY. Tags exercise opaque-image ownership/preservation,
+            // not GPU register saving, EU execution or physical graphics state.
+            if self.memory.render {
+                self.memory
+                    .context
+                    .write(2 * PAGE, &alloc::vec![0x6a;12*PAGE])?;
+            }
+            self.memory
+                .context
+                .write(PAGE + 35 * 4, &0x5544u32.to_le_bytes())?;
+            switch
+                .context
+                .write(lrc::SCRATCH as usize, &1u32.to_le_bytes())
+        }
         fn gpu(&self) -> Result<(), Error> {
             // This is deliberately a HOST MODEL interpreting the actual private
             // page tables/batch. It cannot establish physical GPU execution.
@@ -662,6 +990,22 @@ pub(in crate::drm::intel) mod tests {
             let low = u32::from_le_bytes(ctx);
             if (u64::from(high) << 32) | u64::from(low) != self.memory.tables.physical[0] {
                 return Err(Error::Refused);
+            }
+            if self.memory.idle {
+                let mut dispatch = [0; 12];
+                self.memory.ring.read(
+                    if self.memory.render {
+                        (36 + 23) * 4
+                    } else {
+                        15 * 4
+                    },
+                    &mut dispatch,
+                )?;
+                assert_eq!(dispatch, [0; 12]);
+                return self
+                    .memory
+                    .context
+                    .write(lrc::SCRATCH as usize, &1u32.to_le_bytes());
             }
             if self.memory.render {
                 // HOST MODEL only: validate the actual immutable 3D page and
@@ -751,6 +1095,7 @@ pub(in crate::drm::intel) mod tests {
             drop(words);
             if [0x22550, 0x2550].contains(&r) && self.execute {
                 self.gpu()?;
+                self.switch_away()?;
             }
             if self.fail_write.get() == Some(self.log.borrow().len()) {
                 self.fail_write.set(None);
@@ -847,7 +1192,7 @@ pub(in crate::drm::intel) mod tests {
             memory.tables = vm.tables.clone();
         }
         if render {
-            memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?;
+            memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?);
             memory.render = true;
         }
         memory.bind_and_build()?;
@@ -865,7 +1210,7 @@ pub(in crate::drm::intel) mod tests {
         let _context = crate::test_support::scheduler_test_context();
         let mut memory = memory();
         memory.release().unwrap();
-        memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES).unwrap();
+        memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES).unwrap());
         memory.render = true;
         memory.bind_and_build().unwrap();
         let io = model(&memory, true);
@@ -889,7 +1234,7 @@ pub(in crate::drm::intel) mod tests {
         let _context = crate::test_support::scheduler_test_context();
         let mut baseline = memory();
         baseline.release().unwrap();
-        baseline.context = Ram::allocate(16).unwrap();
+        baseline.context = Arc::new(Ram::allocate(16).unwrap());
         baseline.render = true;
         baseline.bind_and_build().unwrap();
         let io = model(&baseline, true);
@@ -903,7 +1248,7 @@ pub(in crate::drm::intel) mod tests {
         for prefix in 1..=count {
             let mut m = memory();
             m.release().unwrap();
-            m.context = Ram::allocate(16).unwrap();
+            m.context = Arc::new(Ram::allocate(16).unwrap());
             m.render = true;
             m.bind_and_build().unwrap();
             let io = model(&m, true);
@@ -929,7 +1274,7 @@ pub(in crate::drm::intel) mod tests {
         let _context = crate::test_support::scheduler_test_context();
         let mut memory = memory();
         memory.release().unwrap();
-        memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES).unwrap();
+        memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES).unwrap());
         memory.render = true;
         memory.bind_and_build().unwrap();
         let io = model(&memory, true);
@@ -1017,5 +1362,158 @@ pub(in crate::drm::intel) mod tests {
         assert!(io.translate(0x50000, true).is_err());
         let physical = io.translate(0x50000, false).unwrap();
         assert_eq!(physical, memory.tables.physical[7]);
+    }
+    fn build_switch(m: &mut Memory) {
+        let dummy = memory();
+        let io = model(&dummy, false);
+        m.switch
+            .as_mut()
+            .unwrap()
+            .build(&m.gtt, m.render, m.tables.physical[0], &io)
+            .unwrap();
+    }
+    #[test]
+    fn context_switch_then_reset_retains_opaque_rcs_image_and_restores_next_job() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = super::super::super::gem_exec::tests::file();
+        let saved = SavedContext::new(&file, true).unwrap();
+        let mut memory = memory();
+        memory.release().unwrap();
+        memory.render = true;
+        memory.context = saved.ram.clone();
+        memory.saved = Some(saved.clone());
+        memory.switch = Some(Box::new(SwitchAway::new(true).unwrap()));
+        memory.bind_and_build().unwrap();
+        build_switch(&mut memory);
+        let io = model(&memory, true);
+        memory.render_ring(&io).unwrap();
+        assert!(!saved.valid.load(Ordering::Acquire));
+        execute_and_quiesce(&io, &memory).unwrap().unwrap();
+        assert!(saved.valid.load(Ordering::Acquire));
+        let mut opaque = [0; 4096];
+        saved.ram.read(2 * PAGE, &mut opaque).unwrap();
+        assert!(opaque.iter().all(|b| *b == 0x6a));
+        drop(io);
+        memory.release().unwrap();
+        memory.bind_and_build().unwrap();
+        saved.ram.read(2 * PAGE, &mut opaque).unwrap();
+        assert!(opaque.iter().all(|b| *b == 0x6a));
+        let mut ctrl = [0; 4];
+        saved.ram.read(PAGE + 3 * 4, &mut ctrl).unwrap();
+        assert_eq!(u32::from_le_bytes(ctrl), 0x90008);
+        saved.ram.read(PAGE + 35 * 4, &mut ctrl).unwrap();
+        assert_eq!(u32::from_le_bytes(ctrl), 0x5544);
+        build_switch(&mut memory);
+        let io = model(&memory, true);
+        memory.render_ring(&io).unwrap();
+        execute_and_quiesce(&io, &memory).unwrap().unwrap();
+        drop(io);
+        memory.release().unwrap();
+    }
+    #[test]
+    fn switch_completion_and_safe_reset_are_both_required_before_image_publication() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = super::super::super::gem_exec::tests::file();
+        let saved = SavedContext::new(&file, false).unwrap();
+        let mut m = memory();
+        m.release().unwrap();
+        m.context = saved.ram.clone();
+        m.saved = Some(saved.clone());
+        m.switch = Some(Box::new(SwitchAway::new(false).unwrap()));
+        m.bind_and_build().unwrap();
+        build_switch(&mut m);
+        let io = model(&m, false);
+        assert!(execute_and_quiesce(&io, &m).unwrap().is_err());
+        assert!(!saved.valid.load(Ordering::Acquire));
+        drop(io);
+        m.release().unwrap();
+        m.bind_and_build().unwrap();
+        build_switch(&mut m);
+        let io = model(&m, true);
+        execute_and_quiesce(&io, &m).unwrap().unwrap();
+        assert!(saved.valid.load(Ordering::Acquire));
+        let count = io.log.borrow().len();
+        io.fail_write.set(Some(count + 1));
+        assert!(execute_and_quiesce(&io, &m).unwrap().is_err());
+        assert!(!saved.valid.load(Ordering::Acquire));
+        drop(io);
+        m.release().unwrap();
+    }
+    #[test]
+    fn reset_default_capture_uses_two_idle_contexts_without_copy_or_shader_dispatch() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        for render in [false, true] {
+            let mut m = memory();
+            m.release().unwrap();
+            m.render = render;
+            m.idle = true;
+            m.selftest = false;
+            m.context = Arc::new(Ram::allocate(if render { 16 } else { 4 }).unwrap());
+            m.switch = Some(Box::new(SwitchAway::new(render).unwrap()));
+            m.source.write(0, &[0x73; 4096]).unwrap();
+            m.destination.write(0, &[0x25; 4096]).unwrap();
+            m.bind_and_build().unwrap();
+            build_switch(&mut m);
+            let io = model(&m, true);
+            if render {
+                m.render_ring(&io).unwrap();
+            }
+            execute_and_quiesce(&io, &m).unwrap().unwrap();
+            let mut bytes = [0; 4096];
+            m.source.read(0, &mut bytes).unwrap();
+            assert_eq!(bytes, [0x73; 4096]);
+            m.destination.read(0, &mut bytes).unwrap();
+            assert_eq!(bytes, [0x25; 4096]);
+            let captured = m.context.clone();
+            drop(io);
+            m.release().unwrap();
+            let mut marker = [0; 4];
+            captured.read(lrc::SCRATCH as usize, &mut marker).unwrap();
+            assert_eq!(u32::from_le_bytes(marker), 1);
+            // Local model image only, never publish it as native DEFAULTS.
+        }
+    }
+    #[test]
+    fn two_context_submit_fault_prefixes_invalidate_state_and_reset_before_unbinding() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = super::super::super::gem_exec::tests::file();
+        let mut base = memory();
+        base.release().unwrap();
+        base.saved = Some(SavedContext::new(&file, false).unwrap());
+        base.context = base.saved.as_ref().unwrap().ram.clone();
+        base.switch = Some(Box::new(SwitchAway::new(false).unwrap()));
+        base.bind_and_build().unwrap();
+        build_switch(&mut base);
+        let io = model(&base, true);
+        submit(&io, &base).unwrap();
+        let prefixes = io.log.borrow().len();
+        drop(io);
+        base.release().unwrap();
+        for prefix in 1..=prefixes {
+            let mut m = memory();
+            m.release().unwrap();
+            let saved = SavedContext::new(&file, false).unwrap();
+            m.context = saved.ram.clone();
+            m.saved = Some(saved.clone());
+            m.switch = Some(Box::new(SwitchAway::new(false).unwrap()));
+            m.bind_and_build().unwrap();
+            build_switch(&mut m);
+            let io = model(&m, true);
+            io.fail_write.set(Some(prefix));
+            assert!(execute_and_quiesce(&io, &m).unwrap().is_err());
+            assert!(!saved.valid.load(Ordering::Acquire));
+            assert_eq!(m.bindings.len(), 3);
+            assert_eq!(m.switch.as_ref().unwrap().bindings.len(), 2);
+            assert_eq!(
+                io.log
+                    .borrow()
+                    .iter()
+                    .filter(|(r, v)| *r == 0x941c && *v == 4)
+                    .count(),
+                2
+            );
+            drop(io);
+            m.release().unwrap();
+        }
     }
 }

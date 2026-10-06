@@ -811,3 +811,12 @@ already holds forcewake; unknown/torn state returns an error. Mesa26.1.2's
 actual RCS/RCS/BCS+RECOVERABLE=0+VM create chain selects immutable engine slots.
 Scheduling/recovery, hardware/default saved images and general batch support
 are still not claimed. Compiled unmodified C is a trace oracle, not GPU evidence.
+
+Opaque context-image continuation selects Linux7.2.3 intel_lrc.c
+`lrc_update_regs`, `init_ppgtt_regs`, `__reset_stop_ring`, WA image builders and
+execlists port ordering/Gen11 SW-context tags (MIT ©2014 Intel, existing grant).
+The kernel adapter owns pins/charging, uses a distinct idle context to save the
+request image, and gates validity on two breadcrumbs plus source reset retirement.
+GPU-generated streams are not rebuilt from invented values. `intel_gt.c::__engines_record_defaults` and `intel_lrc.c::lrc_init_state`
+now guide reset-default recording/clone initialization. Physical capture remains
+unverified; general nonprivileged user batches remain unfinished.

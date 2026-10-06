@@ -18,6 +18,26 @@ fn lri(count: u32) -> u32 {
 }
 /// Caller supplies fresh zeroed context pages, never live GPU context memory.
 /// Hardware image is compared separately from any guessed firmware state.
+pub fn restore_context(
+    regs: &mut [u32; WORDS],
+    indirect: &mut [u32; WORDS],
+    per_ctx: &mut [u32; WORDS],
+    context: u32,
+    ring: u32,
+    tail: u32,
+    pml4: u64,
+) -> Result<u64, Error> {
+    let mut fresh = [0; 1024];
+    let descriptor = build(&mut fresh, indirect, per_ctx, context, ring, tail, pml4)?;
+    // Selected lrc_update_regs/init_ppgtt_regs/WA-pointer updates. Never
+    // rebuild the GPU-generated restore instruction stream or opaque values.
+    for index in [5usize, 7, 9, 11, 19, 21, 23, 49, 51] {
+        regs[index] = fresh[index];
+    }
+    regs[3] = (regs[3] & !1) | (1 << 16); // known valid image: disable restore-inhibit.
+    regs[0x61] = (regs[0x61] & !(1 << 8)) | (1 << 24); // source __reset_stop_ring.
+    Ok(descriptor)
+}
 pub fn build(
     regs: &mut [u32; WORDS],
     indirect: &mut [u32; WORDS],

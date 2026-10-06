@@ -327,9 +327,14 @@ pub(super) fn exec_with(
     if r.flags & (FENCE_IN | FENCE_OUT) != 0 {
         return Err(AxError::InvalidInput);
     }
-    exec_request(file, copy, r, Fence::new(false), None, |s, d, p, _vm| {
-        execute(s, d, p)
-    })
+    exec_request(
+        file,
+        copy,
+        r,
+        Fence::new(false),
+        None,
+        |s, d, p, _vm, _image| execute(s, d, p),
+    )
 }
 pub(super) fn exec_request(
     file: &DrmFile,
@@ -342,6 +347,7 @@ pub(super) fn exec_request(
         Arc<SharedPages>,
         Plan,
         Arc<super::gt::copy::Vm>,
+        Arc<super::gt::copy::SavedContext>,
     ) -> AxResult<()>,
 ) -> AxResult<()> {
     if r.context >> 32 != 0 {
@@ -480,6 +486,7 @@ pub(super) fn exec_request(
     previous(&objects[2], Some(Duration::from_millis(500)))?;
     let _admission = decode(&objects, &pages, start, render)?;
     let vm = context_job.begin(file)?;
+    let image = context_job.image(file, (r.flags & 0x3f) as u16, render)?;
     // Capture/wait producers before taking a shared VM execution gate: their
     // jobs may need the same root through another context.
     let _vm_job = vm.gate.lock();
@@ -509,7 +516,7 @@ pub(super) fn exec_request(
         // later pwrite is behind our completion. Mmap races cannot inject GPU
         // commands: the native adapter rebuilds this bounded decoded plan.
         let plan = decode(&objects, &pages, start, render)?;
-        execute(pages[0].clone(), pages[1].clone(), plan, vm.clone())
+        execute(pages[0].clone(), pages[1].clone(), plan, vm.clone(), image)
     })();
     if result.is_ok() {
         completion.signal();
@@ -580,13 +587,20 @@ pub(crate) fn dispatch_native(
     } else {
         None
     };
-    exec_request(file, context, request, completion, input, |s, d, p, vm| {
-        match p {
-            Plan::Copy(copy) => super::gt::submit_copy(s, d, copy, vm.clone()),
-            Plan::Render => super::gt::submit_render(s, d, vm),
-        }
-        .map_err(|_| AxError::Io)
-    })?;
+    exec_request(
+        file,
+        context,
+        request,
+        completion,
+        input,
+        |s, d, p, vm, image| {
+            match p {
+                Plan::Copy(copy) => super::gt::submit_copy(s, d, copy, vm.clone(), image),
+                Plan::Render => super::gt::submit_render(s, d, vm, image),
+            }
+            .map_err(|_| AxError::Io)
+        },
+    )?;
     finish_output(context, arg, request, output)?;
     Ok(0)
 }
@@ -1242,7 +1256,7 @@ pub(super) mod tests {
             request,
             completion.clone(),
             Some(input),
-            |_, _, _, _| {
+            |_, _, _, _, _| {
                 assert!(!completion.is_signaled());
                 assert!(table.get_description(fd).is_err());
                 assert!(Arc::ptr_eq(
@@ -1298,7 +1312,7 @@ pub(super) mod tests {
             request,
             completion.clone(),
             None,
-            |_, _, _, _| Ok(()),
+            |_, _, _, _, _| Ok(()),
         )
         .unwrap();
         assert_eq!(
@@ -1327,7 +1341,7 @@ pub(super) mod tests {
                 request,
                 error.clone(),
                 None,
-                |_, _, _, _| Err(AxError::Io)
+                |_, _, _, _, _| Err(AxError::Io)
             ),
             Err(AxError::Io)
         );
@@ -1352,7 +1366,7 @@ pub(super) mod tests {
                 request,
                 Fence::new(false),
                 Some(input),
-                |_, _, _, _| panic!("failed producer executed")
+                |_, _, _, _, _| panic!("failed producer executed")
             ),
             Err(AxError::Io)
         );
@@ -1370,7 +1384,7 @@ pub(super) mod tests {
                 request,
                 Fence::new(false),
                 None,
-                |_, _, _, _| panic!("missing producer executed")
+                |_, _, _, _, _| panic!("missing producer executed")
             ),
             Err(AxError::InvalidInput)
         );

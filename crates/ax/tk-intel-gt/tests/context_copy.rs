@@ -215,3 +215,50 @@ fn user_copy_plan_refuses_foreign_opcodes_tiling_addresses_and_out_of_object_row
     assert!(bcs::decode_copy(&words, 16384, 16383).is_err());
     assert!(bcs::decode_copy(&words, 65537, 16384).is_err());
 }
+
+#[test]
+fn valid_image_update_preserves_gpu_generated_stream_and_unrelated_register_values() {
+    for render in [false, true] {
+        let mut regs = core::array::from_fn(|i| 0xdead0000 | (i as u32));
+        let mut indirect = [0; 1024];
+        let mut per = [0; 1024];
+        let before = regs;
+        if render {
+            tk_intel_gt::rcs::restore_context(
+                &mut regs,
+                &mut indirect,
+                &mut per,
+                0x40000,
+                0x50000,
+                312,
+                0x800000,
+            )
+            .unwrap();
+        } else {
+            lrc::restore_context(
+                &mut regs,
+                &mut indirect,
+                &mut per,
+                0x40000,
+                0x50000,
+                120,
+                0x800000,
+            )
+            .unwrap();
+        }
+        for i in 0..1024 {
+            if ![3usize, 5, 7, 9, 11, 19, 21, 23, 49, 51, 0x61].contains(&i)
+                && !(render && i == 0x43)
+            {
+                assert_eq!(regs[i], before[i], "opaque image word {i}");
+            }
+        }
+        assert_eq!(regs[35], before[35]);
+        assert_eq!(regs[5], 0);
+        assert_eq!(regs[9], 0x50000);
+        assert_eq!(regs[11], 1);
+        assert_eq!(regs[51], 0x800000);
+        assert_eq!(regs[3], (before[3] & !1) | (1 << 16));
+        assert_eq!(regs[0x61], (before[0x61] & !(1 << 8)) | (1 << 24));
+    }
+}

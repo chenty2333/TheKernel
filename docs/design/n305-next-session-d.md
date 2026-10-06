@@ -132,3 +132,11 @@ Use intel-mesa-smoke --initialize NODE and --execute NODE as distinct acceptance
 steps only after the remaining general-submission/context path is implemented.
 Neither marker has been measured; default graphics images still use virgl or
 software and their success cannot substitute for these native checks.
+
+Native GT bootstrap now records reset defaults through two kernel idle contexts
+and scoped retirement before RCS shader selftest. Context-isolation class bits
+are conditional on successful native capture, never product labels or models.
+Per-slot state storage is source/model-verified only; actual repeated-context
+state saving/restoration and default captures remain physical acceptance items.
+General Mesa submission/residency is still unfinished, so do not infer iris
+initialization/pixels from minimal RCS or these new software tests.

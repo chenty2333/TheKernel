@@ -24,6 +24,7 @@ pub(crate) struct JobContext {
     vm: Option<Arc<super::gt::copy::Vm>>,
     started: bool,
     engines: Option<Vec<u16>>,
+    images: BTreeMap<u16, Arc<super::gt::copy::SavedContext>>,
 }
 impl JobContext {
     fn new() -> Self {
@@ -31,6 +32,7 @@ impl JobContext {
             vm: None,
             started: false,
             engines: None,
+            images: BTreeMap::new(),
         }
     }
     pub(super) fn render_engine(&self, selector: u16) -> AxResult<bool> {
@@ -50,6 +52,24 @@ impl JobContext {
             3 => Ok(false),
             _ => Err(AxError::InvalidInput),
         }
+    }
+    pub(super) fn image(
+        &mut self,
+        file: &DrmFile,
+        selector: u16,
+        render: bool,
+    ) -> AxResult<Arc<super::gt::copy::SavedContext>> {
+        let slot = if self.engines.is_none() {
+            if render { 0 } else { 3 }
+        } else {
+            selector
+        };
+        if let Some(image) = self.images.get(&slot) {
+            return Ok(image.clone());
+        }
+        let image = super::gt::copy::SavedContext::new(file, render)?;
+        self.images.insert(slot, image.clone());
+        Ok(image)
     }
     pub(super) fn vm(&mut self, file: &DrmFile) -> AxResult<Arc<super::gt::copy::Vm>> {
         if self.vm.is_none() {
@@ -434,7 +454,7 @@ fn getparam_value(
             1
         }
         47 => i32::from(topology()?.dss),
-        50 => 0, // Source requires captured engine default_state; not yet present.
+        50 => super::gt::context_isolation_classes() as i32, /* only completed native default-state captures. */
         51 => i32::try_from(clock()?).map_err(|_| AxError::InvalidInput)?,
         6..=8
         | 10
@@ -836,7 +856,7 @@ mod tests {
                 request,
                 crate::drm::fence::Fence::new(false),
                 None,
-                |src, dst, plan, active| {
+                |src, dst, plan, active, _image| {
                     assert!(Arc::ptr_eq(&active, &vm));
                     assert_eq!(active.root(), root);
                     let Plan::Copy(operation) = plan else {

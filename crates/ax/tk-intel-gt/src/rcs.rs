@@ -6,6 +6,27 @@
 // Full MIT grant: ../LICENSE-MIT. Only Gen12.0 single-slice RCS is selected.
 use crate::{Error, lrc, ppgtt};
 pub const CONTEXT_PAGES: usize = 16; // source14-page RCS image plus2 WA pages.
+pub fn restore_context(
+    regs: &mut [u32; 1024],
+    indirect: &mut [u32; 1024],
+    per_ctx: &mut [u32; 1024],
+    context: u32,
+    ring: u32,
+    tail: u32,
+    root: u64,
+) -> Result<u64, Error> {
+    let mut fresh = [0; 1024];
+    let descriptor = build_context(&mut fresh, indirect, per_ctx, context, ring, tail, root)?;
+    // Selected lrc_update_regs/init_ppgtt_regs/WA-pointer updates. Never
+    // rebuild the GPU-generated restore instruction stream or opaque values.
+    for index in [5usize, 7, 9, 11, 19, 21, 23, 49, 51] {
+        regs[index] = fresh[index];
+    }
+    regs[3] = (regs[3] & !1) | (1 << 16); // known valid image: disable restore-inhibit.
+    regs[0x61] = (regs[0x61] & !(1 << 8)) | (1 << 24); // source __reset_stop_ring.
+    regs[0x43] = fresh[0x43]; // whole fused-slice RPCS.
+    Ok(descriptor)
+}
 pub fn build_context(
     regs: &mut [u32; 1024],
     indirect: &mut [u32; 1024],
@@ -27,7 +48,8 @@ pub fn build_context(
         return Err(Error::Refused);
     }
     // Common timestamp/predicate semantics, rebuilt below for RCS and its14-page image.
-    lrc::build(regs, indirect, per_ctx, context, ring, tail, root)?;
+    per_ctx.fill(0);
+    per_ctx[0] = 0x05000000; // source empty N305 per-context BB.
     regs.fill(0);
     regs[1] = 0x11081019;
     regs[2] = 0x2244;

@@ -225,6 +225,13 @@ pub(super) fn timestamp() -> Result<u64, Error> {
     }
     intel_gt::info::timestamp(&owner.bus)
 }
+pub(super) fn context_isolation_classes() -> u32 {
+    let owner = OWNER.lock();
+    if !owner.as_ref().is_some_and(|o| registered() && !o.lost) {
+        return 0;
+    }
+    copy::isolation_classes()
+}
 pub(super) fn render_registered() -> bool {
     OWNER
         .lock()
@@ -367,13 +374,14 @@ pub(super) fn submit_copy(
     destination: alloc::sync::Arc<crate::mm::SharedPages>,
     operation: intel_gt::bcs::Copy,
     vm: alloc::sync::Arc<copy::Vm>,
+    saved: alloc::sync::Arc<copy::SavedContext>,
 ) -> Result<(), Error> {
     if !registered() {
         return Err(Error::Refused);
     }
     let mut state = OWNER.lock();
     let owner = state.as_mut().ok_or(Error::Refused)?;
-    let result = copy::objects(owner, source, destination, operation, vm);
+    let result = copy::objects(owner, source, destination, operation, vm, saved);
     if result.is_err() {
         owner.lost = true;
     }
@@ -384,6 +392,7 @@ pub(super) fn submit_render(
     source: alloc::sync::Arc<crate::mm::SharedPages>,
     destination: alloc::sync::Arc<crate::mm::SharedPages>,
     vm: alloc::sync::Arc<copy::Vm>,
+    saved: alloc::sync::Arc<copy::SavedContext>,
 ) -> Result<(), Error> {
     if !registered() {
         return Err(Error::Refused);
@@ -393,7 +402,7 @@ pub(super) fn submit_render(
     if !owner.render_ready {
         return Err(Error::Refused);
     }
-    let result = copy::render_objects(owner, source, destination, vm);
+    let result = copy::render_objects(owner, source, destination, vm, saved);
     if result.is_err() {
         owner.lost = true;
     }
@@ -404,6 +413,7 @@ pub(super) fn submit_render(
     _source: alloc::sync::Arc<crate::mm::SharedPages>,
     _destination: alloc::sync::Arc<crate::mm::SharedPages>,
     _vm: alloc::sync::Arc<copy::Vm>,
+    _saved: alloc::sync::Arc<copy::SavedContext>,
 ) -> Result<(), Error> {
     Err(Error::Refused)
 }
@@ -413,6 +423,7 @@ pub(super) fn submit_copy(
     _destination: alloc::sync::Arc<crate::mm::SharedPages>,
     _operation: intel_gt::bcs::Copy,
     _vm: alloc::sync::Arc<copy::Vm>,
+    _saved: alloc::sync::Arc<copy::SavedContext>,
 ) -> Result<(), Error> {
     Err(Error::Refused) // No host/native CPU-copy fallback.
 }

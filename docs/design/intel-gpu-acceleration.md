@@ -283,3 +283,31 @@ rather than approximated with non-atomic dwords. Compiled-C traces validate
 rollover; no hardware timestamp or real Mesa initialization has been measured.
 Next required implementation is general48-bit residency/cache policy and
 per-slot saved/default state plus nonprivileged arbitrary batch submission.
+
+
+Persistent per-engine-slot storage is now connected to the bounded native job
+path. The per-file context owns charged/pinned opaque image pages, with separate
+images for duplicate mapped engine slots. An admitted job borrows that image,
+queues a distinct kernel idle context in execlists port1, requires both request
+breadcrumbs, then performs the source scoped stop/reset before publishing valid
+saved-image state. Any submit/retirement ambiguity invalidates the image and
+retains the entire DMA graph. GPU-generated register streams/opaque RCS pages
+are preserved; only source ring/PPGTT/WA pointer/control updates are applied on
+reuse. The idle RCS request retains required context WAs and flushes, with no
+BB dispatch. It is not a user shader or CPU rendering fallback.
+
+Measured software tests cover switch/retirement ordering, subsequent opaque
+image reuse and validity invalidation, plus unchanged compiled-C cold images.
+The register-stream preservation test caught an accidental cold initialization
+on restore; fixed without weakening the assertion. Models deliberately tag
+opaque memory, not emulate hardware save or EU state. Native state save/restore
+has NOT been measured. The native bootstrap now also records reset defaults with two idle contexts,
+before any RCS shader runs, and retains that hardware-produced template only
+following both breadcrumbs/reset/release. New contexts clone only the source
+hardware-image pages, clear ppHWSP/runtime/BB offset, and rebuild owned WA pointers.
+HAS_CONTEXT_ISOLATION reports source class bits only for completed native captures
+and a live registered owner; host/QEMU refusal returns0. The same model checks
+that default capture dispatches neither copy nor shader and never publishes its
+synthetic image into native defaults. Physical default capture is unverified.
+General user batches remain closed pending48-bit residency/nonprivileged allowlist
+and cache semantics; no Mesa initialization/rendering or overall completion claim.
