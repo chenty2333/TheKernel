@@ -125,6 +125,7 @@ for program in programs:
 shutil.copy2(lock, out/'opt/thekernel-tools/MANIFEST')
 shutil.copy2(Path(os.environ['REPO_ROOT'])/'tests/guest/container-bwrap.sh', out/'opt/thekernel-containers-bwrap.sh')
 shutil.copy2(Path(os.environ['REPO_ROOT'])/'tests/guest/container-crun.sh', out/'opt/thekernel-containers-crun.sh')
+shutil.copy2(Path(os.environ['REPO_ROOT'])/'tests/guest/container-podman.sh', out/'opt/thekernel-containers-podman.sh')
 for name in ['newuidmap', 'newgidmap', 'fusermount3', 'catatonit']:
     dest = out/'usr/bin'/name
     dest.parent.mkdir(parents=True, exist_ok=True)

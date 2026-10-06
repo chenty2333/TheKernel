@@ -605,3 +605,20 @@ than exec EEXIST. It next fails its real CLONE_NEWUSER|CLONE_NEWNS reexec with
 EBUSY; no offline image load or OCI hello acceptance is claimed yet. The
 initial host fixture used the wrong xmas-elf p_type constructor; repaired,
 not counted as passing. Next inspect that observed fork admission.
+
+### Optional rootless offline regression staging
+
+The separate containers payload now stages container-podman.sh. Guest setup
+appends a UID/GID1000 account without replacing baseline accounts, supplies
+real subordinate ranges, delegates a v2 subtree and places the bootstrap there
+before dropping every real/effective ID/group. Podman is executed as that real
+non-root user with overlay storage, an offline podman load and
+run --rm --network=none --pull=never. Success requires both the actual UID proof
+and a standalone hello line, not a runner exit code. No guest registry pull or
+host user/container/service setup is introduced.
+
+Related Python9 and shell syntax/lint passed; exact signed131-APK staging and
+real UID1000 frontend startup were observed in shell-fjripkcl. This commits the
+independent payload/regression wiring, not Level4 acceptance: actual namespace
+reexec fails EBUSY before loading the offline image. Probe that live fork
+blocker next; retain fail-closed pin/COW safety instead of suppressing it.

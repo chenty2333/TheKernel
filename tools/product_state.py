@@ -316,6 +316,7 @@ ROOTFS_INPUT_FILES = (
     "config/containers-apks.lock",
     "tests/guest/container-bwrap.sh",
     "tests/guest/container-crun.sh",
+    "tests/guest/container-podman.sh",
     "tests/guest/inspect-tools.sh",
     "tests/guest/block-gpt-tools.sh",
     "tests/guest/container-namespace.sh",

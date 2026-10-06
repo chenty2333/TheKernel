@@ -10,6 +10,19 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ContainersPayloadTests(unittest.TestCase):
+    def test_rootless_guest_setup_keeps_real_identity_and_offline_overlay(self):
+        script = (ROOT/'tests/guest/container-podman.sh').read_text()
+        helper = (ROOT/'tests/guest/tools/container-rootless-run.c').read_text()
+        self.assertIn('tests/guest/container-podman.sh', ROOTFS_INPUT_FILES)
+        self.assertIn('--network=none --pull=never', script)
+        self.assertIn('--storage-driver=overlay', script)
+        self.assertIn('load --input /opt/thekernel-containers/images/', script)
+        self.assertIn('>> /etc/passwd', script)
+        self.assertIn('cgroup.subtree_control', script)
+        self.assertIn("'^hello$'", script)
+        self.assertIn('geteuid() != 1000', helper)
+        self.assertLess(helper.index('write(fd, pid'), helper.index('setuid(1000)'))
+
     def test_crun_memory_checks_resident_effect_and_real_oom(self):
         script = (ROOT/'tests/guest/container-crun.sh').read_text()
         probe = (ROOT/'tests/guest/tools/container-limit-probe.c').read_text()
