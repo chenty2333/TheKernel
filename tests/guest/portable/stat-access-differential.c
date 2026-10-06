@@ -98,6 +98,15 @@ static void mapped_inode_dac(void) {
         check(lchown(paths[0], 0, 1) == 0, "mapped-inode-chgrp-with-cap");
         ERROR(lchown(paths[1], 0, 1), EPERM, "unmapped-uid-chown-denied");
         ERROR(lchown(paths[2], 0, 1), EPERM, "unmapped-gid-chown-denied");
+        char device_path[512];
+        snprintf(device_path, sizeof(device_path), "%s/whiteout", paths[0]);
+        check(mknod(device_path, S_IFCHR | 0600, 0) == 0, "unprivileged-whiteout-create");
+        struct stat whiteout;
+        check(lstat(device_path, &whiteout) == 0 && S_ISCHR(whiteout.st_mode) &&
+              whiteout.st_rdev == 0, "whiteout-real-character-zero-device");
+        snprintf(device_path, sizeof(device_path), "%s/ordinary-device", paths[0]);
+        ERROR(mknod(device_path, S_IFCHR | 0600, 0x103), EPERM, "ordinary-device-remains-privileged");
+        ERROR(mknod(device_path, S_IFBLK | 0600, 0), EPERM, "zero-block-device-remains-privileged");
         struct stat intended, observed;
         check(stat(paths[0], &intended) == 0 && intended.st_uid == 0 && intended.st_gid == 1,
               "caller-visible-stat-ids");
@@ -140,6 +149,8 @@ static void mapped_inode_dac(void) {
     struct stat changed;
     check(stat(paths[0], &changed) == 0 && changed.st_uid == 1000 && changed.st_gid == 1001,
           "chown-actual-kernel-ownership");
+    snprintf(made, sizeof(made), "%s/whiteout", paths[0]);
+    check(unlink(made) == 0, "whiteout-cleanup");
     snprintf(made, sizeof(made), "%s/child", paths[0]);
     check(rmdir(made) == 0, "dac-child-cleanup");
     for (int i=0; i<3; ++i) check(rmdir(paths[i]) == 0, "dac-parent-cleanup");
@@ -174,7 +185,7 @@ int main(void) {
           "accepted-sync-flags");
     mark("NO_AUTOMOUNT_SYNC_FLAGS");
     mapped_inode_dac(); mark("MAPPED_INODE_DAC_OVERRIDE");
-    mark("MAPPED_USERNS_CHROOT"); mark("MAPPED_INODE_CHOWN"); mark("CALLER_NAMESPACE_STAT_IDS"); done();
+    mark("MAPPED_USERNS_CHROOT"); mark("MAPPED_INODE_CHOWN"); mark("CALLER_NAMESPACE_STAT_IDS"); mark("WHITEOUT_MKNOD"); done();
 
     begin("statx.raw-differential");
     struct statx sx;

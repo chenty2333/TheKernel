@@ -4999,7 +4999,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve directory identity and permissions; create typed named nodes or serialize native directory records and update cursor"]
+state = ["state:resolve directory identity and permissions; create typed named nodes or serialize native directory records and update cursor", "state:character device0:0 whiteouts follow Linux vfs_mknod CAP_MKNOD exemption while retaining parent, mechanism and security admission; block0:0 and other devices still require capability"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -5010,7 +5010,7 @@ status = "implemented"
 contract = "linux-mknodat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_mknodat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/file/namespace_mutation.rs:whiteout_exemption_does_not_admit_other_devices", "tests/guest/portable/stat-access-differential.c:mapped_inode_dac"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -6494,7 +6494,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:decode low32 device number and create a typed named node relative to AT_FDCWD"]
+state = ["state:decode low32 device number and create a typed named node relative to AT_FDCWD", "state:character device0:0 whiteouts follow Linux vfs_mknod CAP_MKNOD exemption while retaining parent, mechanism and security admission; block0:0 and other devices still require capability"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -6505,7 +6505,7 @@ status = "implemented"
 contract = "linux-mknod"
 handler = "kernel/src/syscall/dispatch.rs:compat_mknod"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main", "kernel/src/file/namespace_mutation.rs:whiteout_exemption_does_not_admit_other_devices", "tests/guest/portable/stat-access-differential.c:mapped_inode_dac"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 

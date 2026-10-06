@@ -197,10 +197,13 @@ struct PreparedCreateAttributes {
 
 fn check_named_create_capability(
     node_type: NodeType,
+    rdev: Option<DeviceId>,
     security: &VfsSecurityContext,
 ) -> AxResult<()> {
+    // Linux's character 0:0 whiteout is not an ordinary device admission.
+    let whiteout = node_type == NodeType::CharacterDevice && rdev == Some(DeviceId(0));
     if matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice)
-        && !security.has_capability(CAP_MKNOD)
+        && !whiteout && !security.has_capability(CAP_MKNOD)
     {
         return Err(AxError::OperationNotPermitted);
     }
@@ -248,7 +251,7 @@ impl KernelMutationRequest for CreateRequest<'_> {
             &parent_metadata,
             &reservation.security,
         )?;
-        check_named_create_capability(reservation.node_type, &reservation.security)?;
+        check_named_create_capability(reservation.node_type, reservation.rdev, &reservation.security)?;
         check_named_create_mechanism(&reservation.name.parent, reservation.node_type)?;
         let (mut permission, owner) = initial_named_create_owner_mode_with_security_at(
             &reservation.name.parent,
@@ -3286,10 +3289,26 @@ mod tests {
             assert!(!security.has_capability(capability));
         }
         assert_eq!(
-            check_named_create_capability(NodeType::CharacterDevice, &security),
+            check_named_create_capability(NodeType::CharacterDevice, Some(DeviceId(1)), &security),
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(probe.calls(), 0);
+    }
+
+    #[test]
+    fn whiteout_exemption_does_not_admit_other_devices() {
+        let root_ns = UserNamespace::try_new_root().unwrap();
+        let root = Cred::try_root(root_ns.clone()).unwrap();
+        let child_ns = root_ns.try_fork(crate::task::Kuid::INITIAL_ROOT, crate::task::Kgid::INITIAL_ROOT, false).unwrap();
+        let child = Cred::try_with_user_namespace(&root, child_ns).unwrap();
+        let security = VfsSecurityContext::new(child);
+        assert!(!security.has_capability(CAP_MKNOD));
+        assert!(check_named_create_capability(NodeType::CharacterDevice, Some(DeviceId(0)), &security).is_ok());
+        for (kind, device) in [(NodeType::CharacterDevice, Some(DeviceId(1))),
+                              (NodeType::CharacterDevice, None),
+                              (NodeType::BlockDevice, Some(DeviceId(0)))] {
+            assert_eq!(check_named_create_capability(kind, device, &security), Err(AxError::OperationNotPermitted));
+        }
     }
 
     #[test]

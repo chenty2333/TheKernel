@@ -779,3 +779,28 @@ Actual UID1000 podman now passes .config ownership, resolves the offline image
 with pull=never and proceeds to container storage mount (`shell-j_y85g7o`).
 It selects supplied fuse-overlayfs, whose mount fails ENOENT; hello is not yet
 accepted. Next inspect that actual native/FUSE mount provider path.
+
+### Real character0:0 whiteouts are not privileged ordinary devices
+
+Live mount tracing showed fuse.fuse-overlayfs rejected as an unregistered type,
+then its fuse fallback misrouted through block-source pathname resolution.
+The supplied FUSE helper therefore cannot currently mount through the legacy
+API; existing modern FUSE construction also synchronously waits for daemon
+INIT/GETATTR, unlike the legacy libfuse startup order. Those are real FUSE
+bounds, not evidence of working storage.
+
+The upstream storage1.62.1 native-overlay probe stops earlier at mknod of a
+character0:0 whiteout. Linux7.2.3 fs/namei.c vfs_mknod explicitly exempts this
+specific node from CAP_MKNOD. The named-create transaction now carries the
+actual rdev into capability admission and honors only that exemption; parent
+DAC, provider support, security hooks and publication remain mandatory.
+Block0:0 and every nonzero device retain the existing privileged admission.
+Host and paired coverage require genuine character0:0 creation/stat plus both
+ordinary-char and block-zero EPERM negatives, with cleanup of the real inode.
+
+Kernel2653, related Python7, lint784, system70/70 (`system-vuzguj6y`) and paired
+stat-access/fs-abi29/259 (`abi-8y3i848t`) passed. Actual podman now passes native
+whiteout creation and attempts native overlay mounts (`shell-a3oiargr`), which
+fail EINVAL. Its real rootless userxattr flag is unsupported by the overlay
+parser. Next implement that option's actual user.overlay metadata dialect,
+not ignore it or fake a native-support marker. Hello remains unaccepted.
