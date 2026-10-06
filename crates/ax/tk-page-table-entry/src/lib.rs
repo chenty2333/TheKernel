@@ -36,6 +36,8 @@ bitflags::bitflags! {
         /// x86 CET shadow-stack memory. On x86-64 this is encoded as a
         /// present, user, read-only, dirty leaf PTE (W=0, D=1).
         const SHADOW_STACK  = 1 << 10;
+        /// x86 PAT1 WC. Caller must first confirm the per-CPU palette.
+        const WRITE_COMBINING = 1 << 11;
     }
 }
 

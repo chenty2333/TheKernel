@@ -86,6 +86,12 @@ impl Bus {
         if [0x2030, 0x2034].contains(&r) {
             return !write && self.render_awake.load(Ordering::Acquire);
         }
+        if (0x4000..0x4100).contains(&r)
+            || (0x4800..0x4820).contains(&r)
+            || (0xb020..0xb0a0).contains(&r)
+        {
+            return self.awake.load(Ordering::Acquire) && self.render_awake.load(Ordering::Acquire);
+        }
         if [0xb024, 0x209c, 0x9550].contains(&r) {
             return self.render_awake.load(Ordering::Acquire)
                 && (!write || r != 0x209c || self.rcs_owned.load(Ordering::Acquire));
@@ -414,6 +420,48 @@ pub(super) fn submit_render(
         owner.lost = true;
     }
     result
+}
+pub(super) fn aperture() -> Result<(u64, u64), Error> {
+    #[cfg(target_os = "none")]
+    {
+        if !registered() {
+            return Err(Error::Refused);
+        }
+        let state = OWNER.lock();
+        let owner = state.as_ref().ok_or(Error::Refused)?;
+        super::shared_ggtt(owner.bdf)
+            .map_err(|_| Error::Refused)?
+            .capacity()
+            .map_err(|_| Error::Refused)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        Err(Error::Refused)
+    }
+}
+pub(super) fn submit_user(
+    job: alloc::sync::Arc<copy::UserJob>,
+    vm: alloc::sync::Arc<copy::Vm>,
+    saved: alloc::sync::Arc<copy::SavedContext>,
+) -> Result<(), Error> {
+    #[cfg(target_os = "none")]
+    {
+        if !registered() {
+            return Err(Error::Refused);
+        }
+        let mut state = OWNER.lock();
+        let owner = state.as_mut().ok_or(Error::Refused)?;
+        let result = copy::user_objects(owner, job, vm, saved);
+        if result.is_err() {
+            owner.lost = true;
+        }
+        result
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (job, vm, saved);
+        Err(Error::Refused)
+    }
 }
 #[cfg(not(target_os = "none"))]
 pub(super) fn submit_render(

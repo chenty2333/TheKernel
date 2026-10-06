@@ -828,3 +828,23 @@ slots/read-only/range4/NOPID fields. Same source functions compile into the
 existing temporary-C oracle, covering all24 RCS/BCS writes, plus landed-store
 and readback fault cases. The original kernel native ownership gates are kept;
 this does not itself open general Mesa batches or establish GPU execution.
+
+- Intel N305 standard residency: `kernel/src/drm/intel/gt/copy_ppgtt.rs`
+  adapts Linux7.2.3 MIT `gt/gen8_ppgtt.c` `__gen8_ppgtt_alloc` and
+  `gen8_ppgtt_insert_pte` (Intel2020), using existing GEM charging/pins and
+  stopped-engine serialization. Four-level4K only; full grant in
+  `crates/ax/tk-intel-gt/LICENSE-MIT`. Native ordinary batches reuse the
+  existing MIT `gen8_emit_bb_start_noarb` translation and Gen12 hardware
+  nonprivileged admission; no GPL command-parser body imported.
+
+- `tk-intel-gt/src/cache.rs`: Linux7.2.3 MIT `intel_mocs.c` Gen12 table,
+  unused-index selection/global-control/paired-L3 initialization (Intel2015),
+  `intel_gtt.c` private PAT initialization (Intel2020); full grant in GT license.
+  Original GEM adapter follows source domain/cache/advice/aperture behavior
+  over existing TheKernel reservations, pins and storage/PRIME ownership.
+
+- Necessary GPU CPU-map adaptation is original MIT Rust in
+  `tk-axplat-x86-pc/src/intel_cpu_cache.rs`, existing file/shared-mmap backend
+  and x86 PTE conversion. Linux7.2.3 x86 PAT initialization is a behavior
+  reference only; no GPL source body was copied. Opt-in/all-CPU proof and
+  immutable WC/UC/WB VMA types preserve the default and ownership boundaries.

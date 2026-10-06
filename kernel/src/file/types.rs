@@ -519,6 +519,7 @@ impl FixedSharedMmapRegion {
             retain_description: self.retain_description,
             mapping_lifetime: None,
             excludes_fork_and_dump: false,
+            cpu_cache_flags: axhal::paging::MappingFlags::empty(),
         }))
     }
 }
@@ -559,6 +560,7 @@ fn validate_fixed_shared_request(
 /// Its fields are private to prevent a syscall adapter from changing geometry
 /// or permissions after the owning [`FileLike`] accepted the request.
 pub struct PreparedFileMmap {
+    cpu_cache_flags: axhal::paging::MappingFlags,
     request: FileMmapRequest,
     region_offset: u64,
     pages: Arc<SharedPages>,
@@ -569,6 +571,17 @@ pub struct PreparedFileMmap {
 }
 
 impl PreparedFileMmap {
+    /// Immutable CPU memory type, distinct from userspace access permissions.
+    /// A driver must establish the CPU palette and flush prior cached writes.
+    pub(crate) fn with_cpu_cache_flags(mut self, flags: axhal::paging::MappingFlags) -> AxResult<Self> {
+        use axhal::paging::MappingFlags as F;
+        if flags.bits() & !(F::UNCACHED | F::WRITE_COMBINING).bits() != 0 ||
+            flags.contains(F::UNCACHED | F::WRITE_COMBINING) { return Err(AxError::InvalidInput); }
+        self.cpu_cache_flags = flags;
+        Ok(self)
+    }
+    pub(crate) const fn cpu_cache_flags(&self) -> axhal::paging::MappingFlags { self.cpu_cache_flags }
+
     /// The plan and live VMA fragments alone retain this lease. Its Drop must
     /// be safe under the address-space lock (spin-only or deferred cleanup).
     pub(crate) fn with_mapping_lifetime(mut self, lease: Arc<dyn core::any::Any + Send + Sync>) -> Self {

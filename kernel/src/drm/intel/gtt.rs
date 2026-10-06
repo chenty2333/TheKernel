@@ -997,6 +997,19 @@ impl Gtt {
     ///
     /// This is the aperture divided into pages, which is the window's length
     /// only when the device's GGTT size field names the whole window.
+    /// Read-only snapshot of this driver's usable GGTT and unbound capacity.
+    /// Source get_aperture subtracts pinned/reserved nodes; our firmware owners
+    /// are established from present PTEs instead of Linux's bound_list.
+    pub(crate) fn capacity(&self) -> Result<(u64, u64), GttError> {
+        let _allocation = self.next.lock();
+        let mut available = 0u64;
+        for index in (RESERVED_LOW_APERTURE / PAGE_SIZE) as usize..self.entries.saturating_sub(1) {
+            if !Pte::from_raw(self.array.read(index)).is_present() {
+                available += PAGE_SIZE;
+            }
+        }
+        Ok((self.aperture, available))
+    }
     pub(crate) fn entries(&self) -> usize {
         self.entries
     }

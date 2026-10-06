@@ -25,11 +25,12 @@ static int call(int fd, unsigned long command, void *arg) {
     return -1;
 }
 int main(int argc, char **argv) {
-    if (argc != 3 || (strcmp(argv[1], "--execute") != 0 && strcmp(argv[1],"--rcs-execute")!=0)) {
-        fprintf(stderr, "usage: intel-bcs-smoke {--execute|--rcs-execute} /dev/dri/renderD128\n");
+    if (argc != 3 || (strcmp(argv[1], "--execute") != 0 && strcmp(argv[1],"--rcs-execute")!=0 && strcmp(argv[1],"--softpin-execute")!=0)) {
+        fprintf(stderr, "usage: intel-bcs-smoke {--execute|--rcs-execute|--softpin-execute} /dev/dri/renderD128\n");
         return 2;
     }
     int render = strcmp(argv[1],"--rcs-execute")==0;
+    int softpin = strcmp(argv[1],"--softpin-execute")==0;
     int fd = open(argv[2], O_RDWR | O_CLOEXEC);
     if (fd < 0) { perror("DRM open; not tested"); return 1; }
     int result = 1, output_fd = -1;
@@ -68,7 +69,8 @@ int main(int argc, char **argv) {
     if(render) for(unsigned i=3;i<BYTES;i+=4)source[i]=255;
     /* Only the validated linear fast-copy + END shape; no user LRI/register
      * programming. The native driver reconstructs its own complete batch. */
-    const uint32_t batch[11] = {0x50800008,0x03000100,0,0x00400040,0x20000,0,0,256,0x10000,0,0x05000000};
+    uint32_t batch[12] = {0x50800008,0x03000100,0,0x00400040,0x20000,0,0,256,0x10000,0,0x05000000,0};
+    if(softpin){batch[4]=0;batch[5]=2;batch[8]=0;batch[9]=1;}
     for (unsigned i=0;i<3;i++) {
         struct drm_i915_gem_create request={.size=render?24576:BYTES};
         if (call(fd,DRM_IOCTL_I915_GEM_CREATE,&request)) goto done;
@@ -78,7 +80,7 @@ int main(int argc, char **argv) {
     if(render){ memset(guarded,0xa5,sizeof(guarded));memcpy(guarded+4096,source,BYTES);upload.size=sizeof(guarded);upload.data_ptr=(uintptr_t)guarded;}
     if (call(fd,DRM_IOCTL_I915_GEM_PWRITE,&upload)) goto done;
     if(render){memset(guarded,0x5a,sizeof(guarded));memset(guarded+4096,0,BYTES);struct drm_i915_gem_pwrite destination={.handle=handles[1],.size=sizeof(guarded),.data_ptr=(uintptr_t)guarded};if(call(fd,DRM_IOCTL_I915_GEM_PWRITE,&destination))goto done;}
-    upload=(struct drm_i915_gem_pwrite){.handle=handles[2],.size=sizeof(batch),.data_ptr=(uintptr_t)batch};
+    upload=(struct drm_i915_gem_pwrite){.handle=handles[2],.size=softpin?sizeof(batch):44,.data_ptr=(uintptr_t)batch};
     if(render){upload.size=sizeof(rcs_page);upload.data_ptr=(uintptr_t)rcs_page;}
     if (call(fd,DRM_IOCTL_I915_GEM_PWRITE,&upload)) goto done;
     struct drm_syncobj_create sync_create={0};
@@ -89,10 +91,19 @@ int main(int argc, char **argv) {
         objects[i].handle=handles[i];objects[i].offset=0x10000u*(i+1u);
         objects[i].flags=EXEC_OBJECT_PINNED|EXEC_OBJECT_SUPPORTS_48B_ADDRESS|(i==1?EXEC_OBJECT_WRITE:0);
     }
+    if(softpin){
+        for(unsigned i=0;i<3;i++){
+            objects[i].offset=((uint64_t)i+1)<<32;
+            objects[i].flags|=EXEC_OBJECT_ASYNC|EXEC_OBJECT_CAPTURE;
+        }
+        struct drm_i915_gem_exec_object2 saved=objects[2];
+        objects[2]=objects[1];objects[1]=objects[0];objects[0]=saved;
+    }
     struct drm_i915_gem_exec_fence fence={.handle=sync,.flags=I915_EXEC_FENCE_SIGNAL};
     uint64_t point=1;
     struct drm_i915_gem_execbuffer_ext_timeline_fences timeline={.base={.name=DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES},.fence_count=1,.handles_ptr=(uintptr_t)&fence,.values_ptr=(uintptr_t)&point};
-    struct drm_i915_gem_execbuffer2 exec={.buffers_ptr=(uintptr_t)objects,.buffer_count=3,.batch_len=render?1160:sizeof(batch),.rsvd1=context,.flags=(render?I915_EXEC_RENDER:I915_EXEC_BLT)|I915_EXEC_NO_RELOC|I915_EXEC_USE_EXTENSIONS|I915_EXEC_FENCE_OUT,.cliprects_ptr=(uintptr_t)&timeline};
+    struct drm_i915_gem_execbuffer2 exec={.buffers_ptr=(uintptr_t)objects,.buffer_count=3,.batch_len=render?1160:softpin?sizeof(batch):44,.rsvd1=context,.flags=(render?I915_EXEC_RENDER:I915_EXEC_BLT)|I915_EXEC_NO_RELOC|I915_EXEC_USE_EXTENSIONS|I915_EXEC_FENCE_OUT,.cliprects_ptr=(uintptr_t)&timeline};
+    if(softpin)exec.flags|=I915_EXEC_BATCH_FIRST|I915_EXEC_HANDLE_LUT;
     if (call(fd,DRM_IOCTL_I915_GEM_EXECBUFFER2_WR,&exec)) goto done;
     output_fd=(int)(exec.rsvd2>>32);
     int fdflags=fcntl(output_fd,F_GETFD);
@@ -137,7 +148,7 @@ int main(int argc, char **argv) {
     handles[1]=0;
     if(memcmp((unsigned char*)address+(render?4096:0),source,BYTES)){fprintf(stderr,"INTEL_BCS_FAIL mmap/close bytes\n");munmap(address,mapped_size);goto done;}
     munmap(address,mapped_size);
-    puts(render?"INTEL_RCS_USER_BYTES_VERIFIED bytes=16384 shader/GEM/sync/mmap; not Mesa acceptance":"INTEL_BCS_USER_BYTES_VERIFIED bytes=16384 GEM/exec/sync/mmap; not RCS/Mesa rendering");
+    puts(softpin?"INTEL_BCS_SOFTPIN_BYTES_VERIFIED high48/GEM/nonprivileged/sync/mmap; not RCS/Mesa acceptance":render?"INTEL_RCS_USER_BYTES_VERIFIED bytes=16384 shader/GEM/sync/mmap; not Mesa acceptance":"INTEL_BCS_USER_BYTES_VERIFIED bytes=16384 GEM/exec/sync/mmap; not RCS/Mesa rendering");
     result=0;
 done:
     if(vm){struct drm_i915_gem_vm_control request={.vm_id=vm};ioctl(fd,DRM_IOCTL_I915_GEM_VM_DESTROY,&request);}

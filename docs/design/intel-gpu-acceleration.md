@@ -321,3 +321,52 @@ NOPID, including after BCS reset. Readback failure stops admission rather than
 leaving an unknown permission set. Source-C24-write and every landed-store/
 readback failure comparison pass. General batches remain closed until the
 48-bit residency and target cache/mmap/submission interfaces are connected.
+
+### Standard iris object/submission chain (2026-10-06)
+
+Actual Mesa26.1.2 iris NO_RELOC/BATCH_FIRST/HANDLE_LUT submissions now use
+1..1024 distinct quota-bound system BOs (<=16MiB each), 48-bit softpins,
+per-slot saved contexts, retained VM residency and existing reservation,
+binary/timeline/sync-file completion. EXEC_OBJECT_WRITE is a synchronization
+hint, not a PTE read-only flag: ordinary writable system BOs have writable
+PTEs. ASYNC conservatively retains implicit waits; CAPTURE has no hang dump.
+Relocations, protected/local/huge-page batches and asynchronous scheduling
+remain refused. Source Gen12 requires no software privileged-command parser;
+standard user commands reach NON_SECURE batch dispatch, not fixed-rectangle
+reconstruction.
+
+Linux7.2.3 four-level4K allocation/insertion uses a preallocated stash and
+stopped-engine/shared-VM serialization. Range/canonical/overlap/physical checks
+precede publication. Leaves/directories flush before the root; table/BO/quota
+owners are retained before root publication and through retirement/quarantine.
+Unmapped addresses reach owned read-only scratch. A file VM retains its graph
+and BO pages until a stopped replacement or final release.
+
+All64 ADL-N Gen12 MOCS controls,32 L3 pairs and8 private PAT entries are
+installed behind owned wake/engine-stop/media-idle proof. Independent unchanged
+C source agrees on104 writes and all208 store/readback fault prefixes stop.
+This uses Gen12 fallback index2, not TGL's deprecated slot1.
+
+Object preparation supports SET/GET_CACHING, CPU/GTT SET_DOMAIN, retained
+MADVISE and observed usable GGTT aperture. PRIME imports share the actual GEM
+object/reservation and storage policy. CACHED uses source WB/snoop PAT0;
+NONE and DISPLAY (N305 has no eDRAM) use UC PAT3. Policy is read after admitted
+predecessors. CPU access flushes retain the same completion ordering.
+
+WC/WB/UC CPU mmap offsets share storage with immutable per-VMA types through
+fault, protection and clone. Closed handles cannot reuse typed aliases;
+alias names are weak, installed plans own the pages. CPU WC/UC requires every
+startup CPU to confirm an opted-in PAT palette; no WC-as-WB substitution.
+With intel.gt=1 only, startup verifies PAT/INVPCID and WB0/UC3/known slot1,
+sets unused PAT1 to WC with cache/TLB synchronization, preserving other entries.
+Default boot makes no PAT change. The same mapping fix preserves previously
+lost external-memory cache flags across mprotect.
+
+Verified layers: source MOCS/clock/context/UAPI comparisons, host allocation/
+wire/MMIO/PTE models and client compile/install. The explicit softpin BCS
+client now uses high addresses and standard batches; real Mesa client remains
+separate. Neither has executed on hardware. Kernel/guest final integration
+results are recorded only after completion, not inferred from these models.
+Hardware PAT/mmap, context save, real shader pixels, Mesa initialization and
+rendering remain physical acceptance items. Recovery/robustness and non-target
+formats are not claimed; controlled retirement resets are not rendering proof.

@@ -1514,6 +1514,7 @@ impl Drop for SharedPages {
 
 #[derive(Clone)]
 pub struct SharedBackend {
+    cpu_cache_flags: MappingFlags,
     start: VirtAddr,
     page_offset: usize,
     pages: Arc<SharedPages>,
@@ -1539,6 +1540,10 @@ impl SharedMapId {
 }
 
 impl SharedBackend {
+    pub(super) fn immutable_mapping_flags(&self) -> MappingFlags {
+        self.cpu_cache_flags | self.pages.mapping_flags()
+    }
+
     pub(super) fn preflight_map(&self, range: VirtAddrRange, flags: MappingFlags) -> AxResult {
         if !self.pages.external_live() {
             return Err(AxError::Io);
@@ -1576,6 +1581,7 @@ impl SharedBackend {
             page_offset,
             pages: self.pages.clone(),
             may_protect: self.may_protect,
+            cpu_cache_flags: self.cpu_cache_flags,
             map_id: self.map_id.clone(),
             status: self.status.clone(),
         })
@@ -1623,7 +1629,8 @@ impl SharedBackend {
     }
 
     pub(crate) fn compatible_with(&self, other: &Self) -> bool {
-        self.map_id.same_mapping(&other.map_id)
+        self.cpu_cache_flags == other.cpu_cache_flags
+            && self.map_id.same_mapping(&other.map_id)
             && self.start == other.start
             && self.page_offset == other.page_offset
             && Arc::ptr_eq(&self.pages, &other.pages)
@@ -1647,6 +1654,7 @@ impl SharedBackend {
             page_offset,
             pages: self.pages.clone(),
             may_protect: self.may_protect,
+            cpu_cache_flags: self.cpu_cache_flags,
             map_id,
             status: self.status.relocated(old_start, new_start)?,
         })
@@ -1781,7 +1789,7 @@ impl BackendOps for SharedBackend {
                                 pt.remap(
                                     vaddr,
                                     paddr,
-                                    page_table_flags(flags | self.pages.mapping_flags()),
+                                    page_table_flags(flags | self.immutable_mapping_flags()),
                                 )?;
                                 needs_tlb_sync = true;
                                 populated += 1;
@@ -1794,7 +1802,7 @@ impl BackendOps for SharedBackend {
                                 vaddr,
                                 paddr,
                                 self.pages.size,
-                                page_table_flags(flags | self.pages.mapping_flags()),
+                                page_table_flags(flags | self.immutable_mapping_flags()),
                             )?;
                             populated += 1;
                         }
@@ -1863,6 +1871,7 @@ impl Backend {
             page_offset: 0,
             pages,
             may_protect: may_protect & access_flags(),
+            cpu_cache_flags: MappingFlags::empty(),
             map_id: SharedMapId::Dynamic(map_id),
             status: MappingStatus::default(),
         }))
@@ -1878,6 +1887,7 @@ impl Backend {
             page_offset: 0,
             pages,
             may_protect: may_protect & access_flags(),
+            cpu_cache_flags: MappingFlags::empty(),
             map_id: SharedMapId::Dynamic(Arc::new(())),
             status: MappingStatus::default(),
         })
@@ -1897,6 +1907,7 @@ pub(crate) struct PreparedFixedSharedMapping {
     object_offset: u64,
     page_offset: usize,
     initial_flags: MappingFlags,
+    cpu_cache_flags: MappingFlags,
     may_protect: MappingFlags,
     map_id: u64,
 }
@@ -1937,6 +1948,7 @@ impl PreparedFixedSharedMapping {
             None
         };
         let may_protect = mapping_flags(plan.may_protect());
+        let cpu_cache_flags = plan.cpu_cache_flags();
         Ok(Self {
             excludes_fork_and_dump: plan.excludes_fork_and_dump(),
             mapping_lifetime: plan.take_mapping_lifetime(),
@@ -1946,6 +1958,7 @@ impl PreparedFixedSharedMapping {
             object_offset: request.offset(),
             page_offset: ((request.offset() - region_offset) / pages.page_size() as u64) as usize,
             initial_flags: mapping_flags(request.protection()),
+            cpu_cache_flags,
             may_protect,
             map_id,
         })
@@ -1965,6 +1978,7 @@ impl PreparedFixedSharedMapping {
             object_offset,
             page_offset,
             initial_flags,
+            cpu_cache_flags,
             may_protect,
             map_id,
         } = self;
@@ -1995,6 +2009,7 @@ impl PreparedFixedSharedMapping {
             page_offset,
             pages,
             may_protect: may_protect & access_flags(),
+            cpu_cache_flags,
             map_id: SharedMapId::Fixed(map_id),
             status: MappingStatus::default(),
         })
@@ -2025,6 +2040,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fixed_shared_cpu_cache_type_survives_fault_protect_and_clone() {
+        let _context = crate::test_support::scheduler_test_context();
+        for cache in [MappingFlags::WRITE_COMBINING, MappingFlags::UNCACHED] {
+            let start = VirtAddr::from(0x4000);
+            let pages = Arc::new(SharedPages::new_fixed(PAGE_SIZE_4K,PageSize::Size4K).unwrap());
+            let backing = SharedBackend { start, page_offset:0,pages,may_protect:access_flags(),
+                cpu_cache_flags:cache,map_id:SharedMapId::Fixed(FIXED_SHARED_MAPPING_ID.fetch_add(1,Ordering::Relaxed)),status:MappingStatus::default() };
+            let clone = backing.clone_for_range(start,start).unwrap();
+            assert_eq!(clone.cpu_cache_flags,cache);
+            let mut mm = AddrSpace::new_empty(start,PAGE_SIZE_4K).unwrap();
+            let flags = MappingFlags::USER|MappingFlags::READ|MappingFlags::WRITE;
+            mm.map(start,PAGE_SIZE_4K,flags,true,Backend::Shared(backing)).unwrap();
+            assert!(mm.page_table().query(start).unwrap().1.contains(cache));
+            for permissions in [MappingFlags::USER|MappingFlags::READ,MappingFlags::USER,flags] {
+                mm.prepare_protect(start,PAGE_SIZE_4K,permissions).unwrap().commit().unwrap().finish();
+                if permissions.contains(MappingFlags::READ) {
+                    assert!(mm.page_table().query(start).unwrap().1.contains(cache));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn write_only_fixed_shared_mapping_faults_and_reprotects_without_losing_backing() {
         use crate::mm::aspace::{PageFaultFailure, PageFaultResult};
 
@@ -2036,6 +2074,7 @@ mod tests {
             page_offset: 0,
             pages: pages.clone(),
             may_protect: access_flags(),
+            cpu_cache_flags: MappingFlags::empty(),
             map_id: SharedMapId::Fixed(FIXED_SHARED_MAPPING_ID.fetch_add(1, Ordering::Relaxed)),
             status: MappingStatus::default(),
         });
@@ -2244,6 +2283,7 @@ mod tests {
             page_offset: 0,
             pages,
             may_protect: access_flags(),
+            cpu_cache_flags: MappingFlags::empty(),
             map_id: SharedMapId::Fixed(1),
             status: MappingStatus::default(),
         };
@@ -2260,6 +2300,7 @@ mod tests {
             page_offset: 0,
             pages,
             may_protect: access_flags(),
+            cpu_cache_flags: MappingFlags::empty(),
             map_id: SharedMapId::Fixed(1),
             status: MappingStatus::default(),
         };
@@ -2276,6 +2317,7 @@ mod tests {
             page_offset: 0,
             pages: pages.clone(),
             may_protect: access_flags(),
+            cpu_cache_flags: MappingFlags::empty(),
             map_id: SharedMapId::Fixed(1),
             status: MappingStatus::default(),
         };
@@ -2311,6 +2353,7 @@ mod tests {
             page_offset: 0,
             pages: pages.clone(),
             may_protect: access_flags(),
+            cpu_cache_flags: MappingFlags::empty(),
             map_id: SharedMapId::Fixed(1),
             status: MappingStatus::default(),
         };
@@ -2336,6 +2379,7 @@ mod tests {
             page_offset: 0,
             pages: pages.clone(),
             may_protect: access_flags(),
+            cpu_cache_flags: MappingFlags::empty(),
             map_id: SharedMapId::Dynamic(Arc::new(())),
             status: MappingStatus::default(),
         };
@@ -2362,6 +2406,7 @@ mod tests {
             page_offset: 0,
             pages: pages.clone(),
             may_protect: access_flags(),
+            cpu_cache_flags: MappingFlags::empty(),
             map_id: map_id.clone(),
             status: MappingStatus::default(),
         };

@@ -642,7 +642,9 @@ impl MappingBackend for Backend {
             }
             return true;
         }
-        let mut leaf_flags = page_table_flags(new_flags);
+        let mut leaf_flags = page_table_flags(if let Backend::Shared(shared) = self {
+            new_flags | shared.immutable_mapping_flags()
+        } else { new_flags });
         if matches!(self, Backend::Cow(_)) {
             // Permission changes must not make fork-shared private frames
             // writable. The next write fault resolves the COW reference,

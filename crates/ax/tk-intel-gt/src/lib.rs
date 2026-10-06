@@ -5,6 +5,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 pub mod bcs;
+pub mod cache;
 pub mod lrc;
 pub mod info;
 pub mod ppgtt;

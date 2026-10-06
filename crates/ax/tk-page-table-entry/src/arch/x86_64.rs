@@ -63,6 +63,8 @@ impl From<PTF> for MappingFlags {
         }
         if f.contains(PTF::NO_CACHE) {
             ret |= Self::UNCACHED;
+        } else if f.contains(PTF::WRITE_THROUGH) {
+            ret |= Self::WRITE_COMBINING;
         }
         ret
     }
@@ -94,6 +96,8 @@ impl From<MappingFlags> for PTF {
         }
         if f.contains(MappingFlags::DEVICE) || f.contains(MappingFlags::UNCACHED) {
             ret |= Self::NO_CACHE | Self::WRITE_THROUGH;
+        } else if f.contains(MappingFlags::WRITE_COMBINING) {
+            ret |= Self::WRITE_THROUGH;
         }
         ret
     }
@@ -213,6 +217,18 @@ impl fmt::Debug for X64PTE {
 mod tests {
     use super::*;
 
+    #[test]
+    fn wc_uses_pat_one_without_confusing_the_page_size_or_uc_index() {
+        for huge in [false,true] {
+            let entry=X64PTE::new_page(PhysAddr::from(0x200000usize),MappingFlags::READ|MappingFlags::WRITE_COMBINING,huge);
+            assert_eq!(entry.bits() & 0x18,0x08);
+            assert_eq!(entry.is_huge(),huge);
+            assert!(entry.flags().contains(MappingFlags::WRITE_COMBINING));
+            assert!(!entry.flags().contains(MappingFlags::UNCACHED));
+            let uc=X64PTE::new_page(PhysAddr::from(0x200000usize),MappingFlags::READ|MappingFlags::UNCACHED,huge);
+            assert_eq!(uc.bits() & 0x18,0x18);
+        }
+    }
     #[test]
     fn protection_key_uses_only_pte_bits_59_through_62() {
         let mut entry = X64PTE::new_page(

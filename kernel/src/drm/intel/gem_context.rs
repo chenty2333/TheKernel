@@ -43,13 +43,13 @@ impl JobContext {
         } else {
             match selector {
                 0 | 1 => 0,
-                3 => 3,
+                3 => 1,
                 _ => return Err(AxError::InvalidInput),
             }
         };
         match class {
             0 => Ok(true),
-            3 => Ok(false),
+            1 => Ok(false),
             _ => Err(AxError::InvalidInput),
         }
     }
@@ -322,7 +322,7 @@ fn engine_map(
             continue;
         }
         if record.instance != 0
-            || !matches!(record.class, 0 | 3)
+            || !matches!(record.class, 0 | 1)
             || (record.class == 0 && !render_available)
         {
             return Err(AxError::NotFound);
@@ -445,8 +445,8 @@ fn getparam_value(
         // Exact device/revision are already established by GT boot admission.
         4 => 0x46d0,
         32 => 0,
-        5 | 9 | 11 | 19 | 24 | 25 | 37 | 44 | 49 | 55 => 1,
-        40 => 4, // WB mmap-offset only; no legacy GTT aperture mmap.
+        5 | 9 | 11 | 19 | 24 | 25 | 26 | 37 | 44 | 48 | 49 | 55 => 1,
+        40 => 4, // WC/WB/UC offsets; WC/UC require confirmed CPU palette, no legacy GTT mmap.
         33 => topology()?.dss.count_ones() as i32,
         34 => topology()?.eu_total() as i32,
         46 => {
@@ -460,13 +460,12 @@ fn getparam_value(
         | 10
         | 12..=18
         | 20..=23
-        | 26..=31
+        | 27..=31
         | 35
         | 36
         | 38
         | 39
         | 41..=45
-        | 48
         | 52..=54
         | 56..=59 => 0,
         1..=3 => return Err(AxError::NoSuchDevice),
@@ -570,7 +569,7 @@ pub(super) fn dispatch(
             }
             r.value = if r.param == 3 {
                 context.lock().begin(file)?;
-                0x40000
+                1u64 << 48
             } else if r.param == 9 {
                 let vm = context.lock().begin(file)?;
                 u64::from(file.intel_contexts.publish_vm(vm)?)
@@ -643,6 +642,26 @@ mod tests {
         Exec, Plan, exec_with, object,
         tests::{Adapter, Image, file, prepare},
     };
+    #[test]
+    fn implemented_iris_softpin_batch_selectors_report_their_source_uapi_capabilities() {
+        for param in [26, 48] {
+            assert_eq!(
+                getparam_value(
+                    param,
+                    || panic!("not a fuse query"),
+                    || panic!("not a clock query")
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let mut job = JobContext::new();
+        assert!(!job.render_engine(3).unwrap()); // legacy I915_EXEC_BLT
+        job.engines = Some(alloc::vec![0, 0, 1]); // source RCS/RCS/COPY classes
+        assert!(job.render_engine(0).unwrap());
+        assert!(job.render_engine(1).unwrap());
+        assert!(!job.render_engine(2).unwrap());
+    }
     #[test]
     fn created_context_is_file_local_and_retained_across_destroy_for_admitted_jobs() {
         let _scheduler = crate::test_support::scheduler_test_context();
@@ -998,7 +1017,7 @@ mod tests {
             .publish_vm(super::super::gt::copy::Vm::new().unwrap())
             .unwrap();
         write_pod(&copy, 2048, &0u64).unwrap();
-        for (i, class) in [0, 0, 3].into_iter().enumerate() {
+        for (i, class) in [0, 0, 1].into_iter().enumerate() {
             write_pod(&copy, 2056 + i * 4, &Engine { class, instance: 0 }).unwrap();
         }
         write_pod(
@@ -1116,12 +1135,12 @@ mod tests {
             &copy,
             264,
             &Engine {
-                class: 3,
+                class: 1,
                 instance: 0,
             },
         )
         .unwrap();
-        assert_eq!(engine_map(&copy, &param, false).unwrap(), [3]);
+        assert_eq!(engine_map(&copy, &param, false).unwrap(), [1]);
         write_pod(
             &copy,
             264,
@@ -1136,7 +1155,7 @@ mod tests {
             &copy,
             264,
             &Engine {
-                class: 3,
+                class: 1,
                 instance: 1,
             },
         )

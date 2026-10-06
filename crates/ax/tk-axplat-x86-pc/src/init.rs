@@ -57,6 +57,7 @@ impl InitIf for InitIfImpl {
             "BSP topology record does not match logical CPU {cpu_id}"
         );
         crate::time::init_primary();
+        crate::intel_cpu_cache::init(cpu_id);
         init_cet_fleet_member();
         #[cfg(feature = "hwp")]
         init_hwp_fleet_member();
@@ -79,6 +80,7 @@ impl InitIf for InitIfImpl {
             "AP topology record does not match logical CPU {cpu_id}"
         );
         crate::time::init_secondary();
+        crate::intel_cpu_cache::init(cpu_id);
         init_cet_fleet_member();
         #[cfg(feature = "hwp")]
         init_hwp_fleet_member();

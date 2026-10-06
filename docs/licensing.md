@@ -389,3 +389,17 @@ LLVM/SPIR-V tool packages remain isolated build dependencies, not kernel code.
 The VM/context wire adapter follows Linux7.2.3 MIT i915_gem_context.c VM/proto-
 context lifetime functions (©2011–2012 Intel), using existing per-file GEM charging
 and RAM pins. It does not replace an opaque GPU state image with guessed data.
+
+The N305 sparse residency adapter `kernel/src/drm/intel/gt/copy_ppgtt.rs`
+continues the Linux7.2.3 MIT `gen8_ppgtt.c` port (Intel2020); its full original
+grant is retained in `crates/ax/tk-intel-gt/LICENSE-MIT`. Only four-level4K
+system-memory allocation/insertion is included; no GPL command-parser body.
+
+`tk-intel-gt/src/cache.rs` retains MIT Intel2015/2020 attribution for the
+Linux7.2.3 ADL-N MOCS/L3CC/private-PAT source; grants accompany the crate.
+The existing independent temporary-C comparison now includes all104 source
+writes. No GPL body or firmware binary was added for these object interfaces.
+
+The minimal CPU PAT/mapping-type adapter is original MIT Rust, referencing
+Linux x86 PAT behavior without importing GPL bodies. Its opted-in startup
+palette and immutable mmap types preserve the default and ownership boundary.

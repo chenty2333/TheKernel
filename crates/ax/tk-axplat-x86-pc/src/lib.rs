@@ -175,3 +175,7 @@ unsafe extern "C" fn rust_entry_secondary(_magic: usize) {
 pub fn allocate_msi(handler: axplat::irq::IrqHandler) -> Option<(u64, u32, usize)> {
     apic::allocate_msi(handler)
 }
+
+mod intel_cpu_cache;
+/// All startup CPUs confirmed the opted-in native Intel WC mapping palette.
+pub fn intel_cpu_mmap_ready() -> bool { intel_cpu_cache::ready() }

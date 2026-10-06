@@ -3,7 +3,7 @@
 // Native sequence adapts Linux7.2.3 gt/intel_execlists_submission.c
 // enable_execlists/reset_csb_pointers (Copyright © 2014 Intel Corporation).
 // Full MIT grant and inventory: crates/ax/tk-intel-gt/LICENSE-MIT and NOTICE.
-//! Kernel-owned BCS copy or fixed RCS shader, no arbitrary batch/Mesa claim. Software
+//! BCS/RCS selftests and standard nonprivileged soft-pinned jobs. Software
 //! preparation uses existing SharedPages/GGTT; DMA ownership precedes ELSQ load.
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering, fence};
@@ -15,6 +15,8 @@ use super::super::{
     pci,
 };
 use crate::mm::{SharedFixedView, SharedPages};
+#[path = "copy_ppgtt.rs"]
+mod sparse;
 const PAGE: usize = 4096;
 const PAYLOAD: usize = 64 * 64 * 4;
 struct Ram {
@@ -52,7 +54,7 @@ impl Ram {
         }
         let pin = pages.fixed_view().map_err(|_| Error::Refused)?;
         let count = pin.len() / PAGE;
-        if count == 0 || count > 16 {
+        if count == 0 || count > 4096 {
             return Err(Error::Refused);
         }
         let mut physical = Vec::new();
@@ -113,11 +115,21 @@ impl Ram {
         fence(Ordering::SeqCst);
     }
 }
+pub(crate) fn sync_cpu_pages(pages: Arc<SharedPages>) -> Result<(), Error> {
+    Ram::from_pages(pages)?.flush();
+    Ok(())
+}
 /// Real, pinned private page-table ownership. Currently the admitted three
-/// windows occupy a bounded 256KiB VM; this is not arbitrary Mesa residency.
+/// windows and sparse four-level48-bit residency share the same persistent root.
 /// The gate serializes all contexts sharing this root through GPU retirement.
+struct Residency {
+    _tables: Arc<Vec<Ram>>,
+    _pages: Vec<Arc<SharedPages>>,
+}
 pub(crate) struct Vm {
     tables: Arc<Ram>,
+    charge: Option<Arc<crate::drm::gem::GemMemoryCharge>>,
+    residency: axsync::Mutex<Option<Arc<Residency>>>,
     pub(crate) gate: axsync::Mutex<()>,
 }
 impl Vm {
@@ -145,6 +157,8 @@ impl Vm {
         tables.flush();
         Arc::try_new(Self {
             tables,
+            charge: None,
+            residency: axsync::Mutex::new(None),
             gate: axsync::Mutex::new(()),
         })
         .map_err(|_| Error::Refused)
@@ -153,10 +167,11 @@ impl Vm {
         let charge = file
             .reserve_render_memory(8 * PAGE)
             .map_err(axerrno::AxError::from)?;
-        let vm = Self::new().map_err(|_| axerrno::AxError::NoMemory)?;
+        let mut vm = Self::new().map_err(|_| axerrno::AxError::NoMemory)?;
         // Charge follows the actual page-table allocation, including retained
         // DMA/quarantine owners after a file or VM handle disappears.
-        vm.tables.pages.retain_allocation_owner(charge)?;
+        vm.tables.pages.retain_allocation_owner(charge.clone())?;
+        Arc::get_mut(&mut vm).unwrap().charge = Some(charge);
         Ok(vm)
     }
     #[cfg(test)]
@@ -165,6 +180,43 @@ impl Vm {
     }
 }
 
+/// Standard soft-pinned nonprivileged batch residency, not a private shader ABI.
+pub(crate) struct UserObject {
+    pub(crate) address: u64,
+    pub(crate) pages: Arc<SharedPages>,
+    pub(crate) writable: bool,
+    pub(crate) cache: Option<Arc<core::sync::atomic::AtomicU8>>,
+}
+pub(crate) struct UserJob {
+    pub(crate) objects: Vec<UserObject>,
+    pub(crate) batch: u64,
+    pub(crate) render: bool,
+}
+impl UserJob {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        if self.objects.is_empty() || self.objects.len() > 1024 || !self.batch.is_multiple_of(8) {
+            return Err(Error::Refused);
+        }
+        for (i, object) in self.objects.iter().enumerate() {
+            let ram = Ram::from_pages(object.pages.clone())?;
+            let (start, end) = sparse::checked_range(object.address, ram.physical.len())?;
+            if i == 0 {
+                let batch = sparse::normalize(self.batch)?;
+                if batch < start || batch >= end {
+                    return Err(Error::Refused);
+                }
+            }
+            for previous in &self.objects[..i] {
+                let pin = previous.pages.fixed_view().map_err(|_| Error::Refused)?;
+                let (a, b) = sparse::checked_range(previous.address, pin.len() / PAGE)?;
+                if start < b && a < end {
+                    return Err(Error::Refused);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 /// An opaque image is valid only after a confirmed hardware context switch
 /// and scoped reset retirement. Userspace cannot import a CPU-produced image.
 // Linux intel_gt.c __engines_record_defaults: reset-state inhibited request,
@@ -173,7 +225,10 @@ impl Vm {
 static DEFAULTS: axsync::Mutex<[Option<Arc<Ram>>; 2]> = axsync::Mutex::new([None, None]);
 pub(super) fn isolation_classes() -> u32 {
     let defaults = DEFAULTS.lock();
-    (u32::from(defaults[0].is_some()) * 8) | u32::from(defaults[1].is_some())
+    captured_classes(defaults[0].is_some(), defaults[1].is_some())
+}
+fn captured_classes(copy: bool, render: bool) -> u32 {
+    (u32::from(copy) << 1) | u32::from(render)
 }
 pub(crate) struct SavedContext {
     ram: Arc<Ram>,
@@ -307,6 +362,13 @@ impl SwitchAway {
 pub(super) struct Memory {
     gtt: Arc<Gtt>,
     tables: Arc<Ram>,
+    extra_tables: Arc<Vec<Ram>>,
+    vm: Option<Arc<Vm>>,
+    retained: Option<Arc<Residency>>,
+    user: Option<Arc<UserJob>>,
+    resident: Vec<Ram>,
+    batch_address: u64,
+    table_charge: Option<Arc<crate::drm::gem::GemMemoryCharge>>,
     source: Ram,
     destination: Ram,
     context: Arc<Ram>,
@@ -329,6 +391,13 @@ impl Memory {
         Ok(Self {
             gtt,
             tables: Arc::try_new(Ram::allocate(8)?).map_err(|_| Error::Refused)?,
+            extra_tables: Arc::new(Vec::new()),
+            vm: None,
+            retained: None,
+            user: None,
+            resident: Vec::new(),
+            batch_address: 0x30000,
+            table_charge: None,
             source: Ram::allocate(6)?,
             destination: Ram::allocate(6)?,
             context: Arc::try_new(Ram::allocate(4)?).map_err(|_| Error::Refused)?,
@@ -392,23 +461,95 @@ impl Memory {
         let table: &mut [u64; 512] = table_data.as_mut_slice().try_into().unwrap();
         // Main root/PDPT/PD/PT and scratch PDPT/PD/PT/data. All unused VA
         // branches reach owned read-only scratch, not arbitrary RAM or zero.
-        ppgtt::directory(table, p[4], p[1])?;
-        self.tables.table(0, table)?;
-        ppgtt::directory(table, p[5], p[2])?;
-        self.tables.table(1, table)?;
-        ppgtt::directory(table, p[6], p[3])?;
-        self.tables.table(2, table)?;
-        ppgtt::leaf(table, p[7], 3)?;
-        ppgtt::map(table, 0x10000, &self.source.physical, 3, false)?;
-        ppgtt::map(table, 0x20000, &self.destination.physical, 3, true)?;
-        ppgtt::map(table, 0x30000, &self.batch.physical, 3, false)?;
-        self.tables.table(3, table)?;
         table.fill(ppgtt::pde(p[5])?);
         self.tables.table(4, table)?;
         table.fill(ppgtt::pde(p[6])?);
         self.tables.table(5, table)?;
         ppgtt::leaf(table, p[7], 3)?;
         self.tables.table(6, table)?;
+        let stash = if let Some(user) = &self.user {
+            self.resident
+                .try_reserve_exact(user.objects.len())
+                .map_err(|_| Error::Refused)?;
+            for object in &user.objects {
+                self.resident.push(Ram::from_pages(object.pages.clone())?);
+            }
+            let mut mappings = Vec::new();
+            mappings
+                .try_reserve_exact(self.resident.len())
+                .map_err(|_| Error::Refused)?;
+            for (ram, object) in self.resident.iter().zip(&user.objects) {
+                mappings.push(sparse::Mapping {
+                    address: object.address,
+                    pages: &ram.physical,
+                    writable: object.writable,
+                    pat: if object
+                        .cache
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::Acquire) == 1)
+                    {
+                        0
+                    } else {
+                        3
+                    },
+                });
+            }
+            sparse::populate(&self.tables, &mappings, self.table_charge.as_ref())?
+        } else {
+            sparse::populate(
+                &self.tables,
+                &[
+                    sparse::Mapping {
+                        address: 0x10000,
+                        pages: &self.source.physical,
+                        writable: false,
+                        pat: 3,
+                    },
+                    sparse::Mapping {
+                        address: 0x20000,
+                        pages: &self.destination.physical,
+                        writable: true,
+                        pat: 3,
+                    },
+                    sparse::Mapping {
+                        address: 0x30000,
+                        pages: &self.batch.physical,
+                        writable: false,
+                        pat: 3,
+                    },
+                ],
+                self.table_charge.as_ref(),
+            )?
+        };
+        let sparse::Stash { tables, root } = stash;
+        self.extra_tables = Arc::try_new(tables).map_err(|_| Error::Refused)?;
+        if self.vm.is_some() {
+            let mut pages = Vec::new();
+            pages
+                .try_reserve_exact(self.resident.len() + 3)
+                .map_err(|_| Error::Refused)?;
+            for ram in &self.resident {
+                pages.push(ram.pages.clone());
+            }
+            if self.user.is_none() {
+                pages.extend([
+                    self.source.pages.clone(),
+                    self.destination.pages.clone(),
+                    self.batch.pages.clone(),
+                ]);
+            }
+            let retained = Arc::try_new(Residency {
+                _tables: self.extra_tables.clone(),
+                _pages: pages,
+            })
+            .map_err(|_| Error::Refused)?;
+            self.retained = Some(retained);
+        }
+        self.tables.table(0, root.as_slice().try_into().unwrap())?;
+        self.tables.flush();
+        if let Some(vm) = &self.vm {
+            *vm.residency.lock() = self.retained.clone();
+        }
         let mut regs_data = zero_words::<u32>(1024)?;
         let mut indirect_data = zero_words::<u32>(1024)?;
         let mut per_data = zero_words::<u32>(1024)?;
@@ -446,12 +587,14 @@ impl Memory {
         self.context
             .dwords(if self.render { 15 } else { 3 }, per_ctx)?;
         let batch = bcs::batch(self.operation)?;
-        if self.render {
-            self.batch.dwords(0, &intel_gt::rcs_page::PAGE)?;
-        } else {
-            self.batch.dwords(0, &batch)?;
+        if self.user.is_none() {
+            if self.render {
+                self.batch.dwords(0, &intel_gt::rcs_page::PAGE)?;
+            } else {
+                self.batch.dwords(0, &batch)?;
+            }
         }
-        let count = bcs::ring(regs, 0x30000, ctx, 1)?;
+        let count = bcs::ring(regs, self.batch_address, ctx, 1)?;
         if self.idle {
             regs[15..18].fill(0);
         }
@@ -482,6 +625,9 @@ impl Memory {
         ] {
             r.flush();
         }
+        for ram in &self.resident {
+            ram.flush();
+        }
         Ok(())
     }
     fn pattern(&self, i: usize) -> u8 {
@@ -494,7 +640,12 @@ impl Memory {
     fn render_ring(&self, io: &impl GtIo) -> Result<(), Error> {
         let mut words = [0u32; 78];
         let mut normal = [0u32; 42];
-        intel_gt::rcs::ring(&mut normal, 0x30000, self.bindings[0].address as u32, 1)?;
+        intel_gt::rcs::ring(
+            &mut normal,
+            self.batch_address,
+            self.bindings[0].address as u32,
+            1,
+        )?;
         words[..22].copy_from_slice(&normal[..22]);
         words[1] |= 1 << 27; // before-WA full barrier.
         intel_gt::rcs::context_wa(io, &mut words[22..36])?;
@@ -638,6 +789,9 @@ fn execute_and_quiesce(io: &impl GtIo, memory: &Memory) -> Result<Result<(), Err
     // stores must be visible before the GEM completion is signaled, not only
     // in the bootstrap's optional byte verifier. Retirement precedes invalidate.
     memory.destination.flush();
+    for ram in &memory.resident {
+        ram.flush();
+    }
     if let Some(saved) = &memory.saved {
         saved.valid.store(executed.is_ok(), Ordering::Release);
     }
@@ -794,6 +948,8 @@ pub(super) fn render_objects(
     };
     let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
     memory.tables = vm.tables.clone();
+    memory.table_charge = vm.charge.clone();
+    memory.vm = Some(vm.clone());
     memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?);
     memory.render = true;
     if saved.render != memory.render {
@@ -813,6 +969,69 @@ pub(super) fn render_objects(
         &owner.bus,
     )?;
     memory.render_ring(&owner.bus)?;
+    let result = execute_and_quiesce(&owner.bus, memory)?;
+    memory.release()?;
+    owner.memory = None;
+    owner.bus.prepare_shared()?;
+    result
+}
+
+/// Linux gen8_emit_bb_start_noarb uses NON_SECURE bit8 for both engines;
+/// Gen12 intel_engine_init_cmd_parser needs no software privileged parser.
+/// Objects, page tables, opaque images and idle switch are retained together.
+#[cfg(target_os = "none")]
+pub(super) fn user_objects(
+    owner: &mut super::Owner,
+    job: Arc<UserJob>,
+    vm: Arc<Vm>,
+    saved: Arc<SavedContext>,
+) -> Result<(), Error> {
+    if owner.lost || owner.memory.is_some() || (job.render && !owner.render_ready) {
+        return Err(Error::Refused);
+    }
+    job.validate()?;
+    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    owner.bus.assert_media_idle()?;
+    if job.render {
+        intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
+    } else {
+        intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
+    }
+    owner.bus.prepare_shared()?;
+    if job.render {
+        intel_gt::rcs::prepare(&owner.bus)?;
+    } else {
+        bcs::apply_nonpriv(&owner.bus, false)?;
+    }
+    intel_gt::cache::prepare(&owner.bus)?;
+    if saved.render != job.render {
+        return Err(Error::Refused);
+    }
+    let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+    let mut memory = Memory::allocate(gtt)?;
+    memory.tables = vm.tables.clone();
+    memory.table_charge = vm.charge.clone();
+    memory.vm = Some(vm.clone());
+    memory.context = saved.ram.clone();
+    memory.saved = Some(saved);
+    memory.render = job.render;
+    memory.selftest = false;
+    memory.batch_address = sparse::normalize(job.batch)?;
+    memory.user = Some(job);
+    memory.switch =
+        Some(Box::try_new(SwitchAway::new(memory.render)?).map_err(|_| Error::Refused)?);
+    owner.memory = Some(memory);
+    let memory = owner.memory.as_mut().unwrap();
+    memory.bind_and_build()?;
+    memory.switch.as_mut().unwrap().build(
+        &memory.gtt,
+        memory.render,
+        memory.tables.physical[0],
+        &owner.bus,
+    )?;
+    if memory.render {
+        memory.render_ring(&owner.bus)?;
+    }
     let result = execute_and_quiesce(&owner.bus, memory)?;
     memory.release()?;
     owner.memory = None;
@@ -857,6 +1076,8 @@ pub(super) fn objects(
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
     memory.tables = vm.tables.clone();
+    memory.table_charge = vm.charge.clone();
+    memory.vm = Some(vm.clone());
     if saved.render != memory.render {
         return Err(Error::Refused);
     }
@@ -906,6 +1127,11 @@ pub(in crate::drm::intel) mod tests {
                 &self.memory.batch,
                 &self.memory.status,
             ] {
+                if let Some(index) = ram.physical.iter().position(|&p| p == page) {
+                    return Ok((ram, index * PAGE + inside));
+                }
+            }
+            for ram in self.memory.extra_tables.iter() {
                 if let Some(index) = ram.physical.iter().position(|&p| p == page) {
                     return Ok((ram, index * PAGE + inside));
                 }
@@ -1191,6 +1417,8 @@ pub(in crate::drm::intel) mod tests {
         let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
         if let Some(vm) = vm {
             memory.tables = vm.tables.clone();
+            memory.table_charge = vm.charge.clone();
+            memory.vm = Some(vm.clone());
         }
         if render {
             memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?);
@@ -1363,6 +1591,138 @@ pub(in crate::drm::intel) mod tests {
         assert!(io.translate(0x50000, true).is_err());
         let physical = io.translate(0x50000, false).unwrap();
         assert_eq!(physical, memory.tables.physical[7]);
+    }
+    #[test]
+    fn captured_context_capability_uses_uabi_classes_not_legacy_ring_selector() {
+        assert_eq!(captured_classes(false, false), 0);
+        assert_eq!(captured_classes(false, true), 1);
+        assert_eq!(captured_classes(true, false), 2);
+        assert_eq!(captured_classes(true, true), 3);
+    }
+    pub(in crate::drm::intel) fn check_user_layout(job: Arc<UserJob>) -> Result<(), Error> {
+        job.validate()?;
+        let array = super::super::super::gtt::mock::MockPageTable::new(65536);
+        let gtt = Arc::new(Gtt::over(Box::new(array)).unwrap());
+        let mut memory = Memory::allocate(gtt)?;
+        memory.render = job.render;
+        if job.render {
+            memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?);
+        }
+        memory.selftest = false;
+        memory.batch_address = sparse::normalize(job.batch)?;
+        memory.user = Some(job.clone());
+        memory.bind_and_build()?;
+        let io = model(&memory, false);
+        if job.render {
+            memory.render_ring(&io)?;
+        }
+        for (object, ram) in job.objects.iter().zip(&memory.resident) {
+            let va = sparse::normalize(object.address)?;
+            for (i, &physical) in ram.physical.iter().enumerate() {
+                assert_eq!(
+                    io.translate(va + i as u64 * PAGE as u64, object.writable)?,
+                    physical
+                );
+            }
+        }
+        let mut words = [0; PAGE];
+        memory.ring.read(0, &mut words)?;
+        let slot = if job.render { 36 + 23 } else { 15 };
+        assert_eq!(
+            u32::from_le_bytes(words[slot * 4..slot * 4 + 4].try_into().unwrap()),
+            0x18800101
+        );
+        assert_eq!(
+            u32::from_le_bytes(words[(slot + 1) * 4..(slot + 2) * 4].try_into().unwrap()),
+            memory.batch_address as u32
+        );
+        assert_eq!(
+            u32::from_le_bytes(words[(slot + 2) * 4..(slot + 3) * 4].try_into().unwrap()),
+            (memory.batch_address >> 32) as u32
+        );
+        drop(io);
+        memory.release()
+    }
+    #[test]
+    fn sparse_vm_walks_iris_high_regions_and_crosses_all_directory_boundaries() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let mut memory = memory();
+        for va in [
+            0x1ff000,
+            0x3ffff000,
+            0x7ffffff000,
+            0x1_0000_0000,
+            0x8000_0000_0000,
+            0xffff_8000_0000_0000,
+        ] {
+            let stash = sparse::populate(
+                &memory.tables,
+                &[sparse::Mapping {
+                    address: va,
+                    pages: &memory.destination.physical,
+                    writable: true,
+                    pat: 3,
+                }],
+                None,
+            )
+            .unwrap();
+            stash.publish(&memory.tables).unwrap();
+            memory.extra_tables = Arc::new(stash.tables);
+            let io = model(&memory, false);
+            for (i, &physical) in memory.destination.physical.iter().enumerate() {
+                assert_eq!(
+                    io.translate(va + i as u64 * PAGE as u64, true).unwrap(),
+                    physical
+                );
+            }
+            assert!(io.translate(0x10000, true).is_err());
+            assert_eq!(
+                io.translate(0x10000, false).unwrap(),
+                memory.tables.physical[7]
+            );
+        }
+        memory.release().unwrap();
+    }
+    #[test]
+    fn sparse_vm_rejects_overlap_overflow_and_noncanonical_before_root_publication() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let mut memory = memory();
+        let mut before = [0; PAGE];
+        memory.tables.read(0, &mut before).unwrap();
+        for va in [
+            0,
+            1,
+            0x10000,
+            0x1_0000_0000_0000,
+            0x0001_8000_0000_0000,
+            0xffff_ffff_ffff_f000,
+        ] {
+            assert!(
+                sparse::populate(
+                    &memory.tables,
+                    &[
+                        sparse::Mapping {
+                            address: 0x10000,
+                            pages: &memory.source.physical,
+                            writable: false,
+                            pat: 3
+                        },
+                        sparse::Mapping {
+                            address: va,
+                            pages: &memory.destination.physical,
+                            writable: true,
+                            pat: 3
+                        },
+                    ],
+                    None
+                )
+                .is_err()
+            );
+            let mut after = [0; PAGE];
+            memory.tables.read(0, &mut after).unwrap();
+            assert_eq!(before, after);
+        }
+        memory.release().unwrap();
     }
     fn build_switch(m: &mut Memory) {
         let dummy = memory();

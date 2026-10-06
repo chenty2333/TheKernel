@@ -133,3 +133,14 @@ Twelve source slots retain encoded permission/range bits and source ordering;
 unused entries point at RING_NOPID. Store/readback failure refuses submission.
 The kernel installs this after selected-engine reset, before requests/default
 capture. No arbitrary CPU MMIO or general user batch is enabled by this alone.
+
+Native kernel copy_ppgtt.rs additionally adapts gen8_ppgtt.c
+__gen8_ppgtt_alloc/gen8_ppgtt_insert_pte (Intel2020 MIT) using a stopped-engine
+allocation stash and retained file-accounted four-level4K residency. Ordinary
+nonprivileged batches reuse gen8_emit_bb_start_noarb; Gen12 has no software
+command-parser requirement. Older fixed-rectangle-only scope above is historical.
+
+src/cache.rs: Linux7.2.3 intel_mocs.c gen12_mocs_table/GEN11_MOCS_ENTRIES,
+get_entry_control/get_entry_l3cc/__init_mocs_table/init_l3cc_table, Intel2015;
+intel_gtt.c tgl_setup_private_ppat, Intel2020. All64+32+8 ADL-N entries,
+source unused-index2 semantics; not TGL's deprecated index1. MIT grants retained.

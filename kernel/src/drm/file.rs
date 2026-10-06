@@ -1,6 +1,6 @@
 use alloc::{
     collections::{BTreeMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -63,6 +63,7 @@ pub struct DrmFile {
 struct FileState {
     next_handle: GemHandle,
     handles: BTreeMap<GemHandle, Arc<GemObject>>,
+    intel_mmaps: BTreeMap<MmapOffset, (Weak<GemObject>, u8)>,
     cursor_framebuffers: BTreeMap<GemHandle, FramebufferId>,
     next_syncobj: super::syncobj::SyncobjHandle,
     syncobjs: BTreeMap<super::syncobj::SyncobjHandle, Arc<super::syncobj::Syncobj>>,
@@ -225,6 +226,7 @@ impl DrmFile {
             state: Mutex::new(FileState {
                 next_handle: 1,
                 handles: BTreeMap::new(),
+                intel_mmaps: BTreeMap::new(),
                 cursor_framebuffers: BTreeMap::new(),
                 next_syncobj: 1,
                 syncobjs: BTreeMap::new(),
@@ -589,6 +591,10 @@ impl DrmFile {
         self.device.fixed_mode
     }
 
+    pub(crate) fn mode_is_supported(&self, mode: Mode) -> bool {
+        self.device.adapter.mode_is_supported(mode)
+    }
+
     pub fn resources(&self) -> KmsResources {
         self.device.state.lock().resources.clone()
     }
@@ -865,6 +871,52 @@ impl DrmFile {
             .find(|object| object.mmap_offset == offset)
             .map(|object| Arc::clone(&object.backing))
             .ok_or(DrmError::NotFound)
+    }
+
+    /// Native Intel WC/UC aliases need distinct offsets but share storage.
+    /// Weak names do not keep closed GEM objects charged forever; installed
+    /// VMA plans retain the real pages through the usual shared-mmap path.
+    pub(crate) fn map_intel_cpu(&self, handle: GemHandle, mode: u8) -> DrmResult<MmapOffset> {
+        if mode == 2 {
+            return self.map_dumb(handle);
+        }
+        if !matches!(mode, 1 | 3) {
+            return Err(DrmError::Invalid);
+        }
+        let object = self.gem(handle)?;
+        {
+            let mut state = self.state.lock();
+            state
+                .intel_mmaps
+                .retain(|_, (owner, _)| owner.strong_count() != 0);
+            if let Some((&offset, _)) = state.intel_mmaps.iter().find(|(_, (owner, kind))| {
+                *kind == mode && core::ptr::eq(owner.as_ptr(), Arc::as_ptr(&object))
+            }) {
+                return Ok(offset);
+            }
+            if state.intel_mmaps.len() >= 65536 {
+                return Err(DrmError::NoMemory);
+            }
+        }
+        let offset = {
+            let mut device = self.device.state.lock();
+            let offset = device.next_mmap_offset;
+            device.next_mmap_offset = offset.checked_add(object.size).ok_or(DrmError::Overflow)?;
+            offset
+        };
+        let mut state = self.state.lock();
+        if let Some((&existing, _)) = state.intel_mmaps.iter().find(|(_, (owner, kind))| {
+            *kind == mode && core::ptr::eq(owner.as_ptr(), Arc::as_ptr(&object))
+        }) {
+            return Ok(existing);
+        }
+        if state.intel_mmaps.len() >= 65536 {
+            return Err(DrmError::NoMemory);
+        }
+        state
+            .intel_mmaps
+            .insert(offset, (Arc::downgrade(&object), mode));
+        Ok(offset)
     }
 
     pub(crate) fn map_dumb(&self, handle: GemHandle) -> DrmResult<MmapOffset> {
@@ -1182,27 +1234,48 @@ impl DrmFile {
         if self.seat_owned_primary && self.seat_revoked.load(Ordering::Acquire) {
             return Err(LinuxError::ENODEV.into());
         }
-        let object = match self
-            .state
-            .lock()
-            .handles
-            .values()
-            .find(|object| object.mmap_offset == request.offset())
-            .cloned()
-        {
-            Some(object) => object,
-            None => return Ok(None),
+        let (object, cache) = {
+            let state = self.state.lock();
+            if let Some(object) = state
+                .handles
+                .values()
+                .find(|object| object.mmap_offset == request.offset())
+                .cloned()
+            {
+                (object, 2)
+            } else if let Some((owner, cache)) = state.intel_mmaps.get(&request.offset()) {
+                let Some(object) = owner.upgrade() else {
+                    return Ok(None);
+                };
+                if !state
+                    .handles
+                    .values()
+                    .any(|handle| Arc::ptr_eq(handle, &object))
+                {
+                    return Ok(None);
+                }
+                (object, *cache)
+            } else {
+                return Ok(None);
+            }
         };
         let pages = object
             .backing
             .shared_pages()
             .map_err(axerrno::AxError::from)?;
-        crate::file::FixedSharedMmapRegion::try_new(
-            object.mmap_offset,
+        let plan = crate::file::FixedSharedMmapRegion::try_new(
+            request.offset(),
             pages,
             crate::file::FileMmapProtection::READ | crate::file::FileMmapProtection::WRITE,
         )?
-        .prepare(request)
+        .prepare(request)?;
+        let flags = match cache {
+            1 => axhal::paging::MappingFlags::WRITE_COMBINING,
+            3 => axhal::paging::MappingFlags::UNCACHED,
+            _ => axhal::paging::MappingFlags::empty(),
+        };
+        plan.map(|plan| plan.with_cpu_cache_flags(flags))
+            .transpose()
     }
 
     fn push_event(&self, event: DrmEvent) -> DrmResult<()> {

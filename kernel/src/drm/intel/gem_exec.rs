@@ -4,7 +4,11 @@
 //! Facts from Linux7.2.3 include/uapi/drm/i915_drm.h and gem execbuf validation;
 //! no GPL body is copied. No arbitrary privileged batch reaches the engine.
 use alloc::{sync::Arc, vec::Vec};
-use core::{mem::size_of, time::Duration};
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicU8, Ordering},
+    time::Duration,
+};
 
 use axerrno::{AxError, AxResult};
 
@@ -142,12 +146,20 @@ const FENCE_OUT: u64 = 1 << 17;
 const PINNED: u64 = 1 << 4;
 const ADDRESS48: u64 = 1 << 3;
 const WRITE: u64 = 1 << 2;
-const MAX_SIZE: u64 = 65536;
+const MAX_SIZE: u64 = 16 * 1024 * 1024;
+const BATCH_FIRST: u64 = 1 << 18;
+const HANDLE_LUT: u64 = 1 << 12;
+const ASYNC: u64 = 1 << 6;
+const CAPTURE: u64 = 1 << 7;
 struct Backing {
+    cache: Arc<AtomicU8>,
     pages: Arc<SharedPages>,
     _charge: Arc<GemMemoryCharge>,
 }
 impl GemBacking for Backing {
+    fn intel_cache_policy(&self) -> Option<Arc<AtomicU8>> {
+        Some(self.cache.clone())
+    }
     fn shared_pages(&self) -> crate::drm::DrmResult<Arc<SharedPages>> {
         Ok(self.pages.clone())
     }
@@ -189,6 +201,7 @@ fn create(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     // still charge memory after the originating handle/backing closes.
     pages.retain_allocation_owner(charge.clone())?;
     let backing = Arc::try_new(Backing {
+        cache: Arc::try_new(AtomicU8::new(0)).map_err(|_| AxError::NoMemory)?,
         pages,
         _charge: charge,
     })
@@ -199,6 +212,93 @@ fn create(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     if let Err(error) = write_pod(copy, arg, &request) {
         let _ = file.close_handle(request.handle);
         return Err(error);
+    }
+    Ok(())
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct Domain {
+    handle: u32,
+    read: u32,
+    write: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct Caching {
+    handle: u32,
+    caching: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct Advice {
+    handle: u32,
+    advice: u32,
+    retained: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct Aperture {
+    size: u64,
+    available: u64,
+}
+const GET_APERTURE: u32 = command::<Aperture>(0x23, 2);
+const SET_DOMAIN: u32 = command::<Domain>(0x1f, 1);
+const SET_CACHING: u32 = command::<Caching>(0x2f, 1);
+const GET_CACHING: u32 = command::<Caching>(0x30, 3);
+const MADVISE: u32 = command::<Advice>(0x26, 3);
+const _: () = {
+    assert!(
+        size_of::<Domain>() == 12
+            && size_of::<Caching>() == 8
+            && size_of::<Advice>() == 12
+            && size_of::<Aperture>() == 16
+    );
+    assert!(SET_DOMAIN == 0x400c645f && SET_CACHING == 0x4008646f && GET_CACHING == 0xc0086470);
+    assert!(MADVISE == 0xc00c6466 && GET_APERTURE == 0x80106463);
+};
+fn cpu_admit(object: &GemObject) -> AxResult<CpuCompletion> {
+    let fence = Fence::new(false);
+    if let Some(prior) = object.reservation.replace(fence.clone())
+        && let Err(error) = prior.wait(Some(Duration::from_millis(500)))
+    {
+        fence.signal_error();
+        return Err(error);
+    }
+    Ok(CpuCompletion(fence))
+}
+fn domain(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
+    let r: Domain = read_pod(copy, arg)?;
+    if r.read & !0x41 != 0 || r.write & !0x41 != 0 || (r.write != 0 && r.read != r.write) {
+        return Err(AxError::InvalidInput);
+    }
+    if r.read == 0 {
+        return Ok(());
+    }
+    let object = object(file, r.handle)?;
+    let _admission = cpu_admit(&object)?;
+    super::gt::copy::sync_cpu_pages(object.backing.shared_pages().map_err(AxError::from)?)
+        .map_err(|_| AxError::Io)
+}
+fn caching(file: &DrmFile, copy: &impl UserCopy, arg: usize, set: bool) -> AxResult<()> {
+    let mut r: Caching = read_pod(copy, arg)?;
+    if set && r.caching > 2 {
+        return Err(AxError::InvalidInput);
+    }
+    let object = object(file, r.handle)?;
+    let policy = object
+        .backing
+        .intel_cache_policy()
+        .ok_or(AxError::Unsupported)?;
+    if set {
+        let _admission = cpu_admit(&object)?;
+        super::gt::copy::sync_cpu_pages(object.backing.shared_pages().map_err(AxError::from)?)
+            .map_err(|_| AxError::Io)?;
+        // N305 has snoop and no eDRAM/WT (Linux HAS_WT=HAS_EDRAM).
+        // Display caching therefore falls back to NONE, as upstream does.
+        policy.store(if r.caching == 1 { 1 } else { 0 }, Ordering::Release);
+    } else {
+        r.caching = u32::from(policy.load(Ordering::Acquire));
+        write_pod(copy, arg, &r)?;
     }
     Ok(())
 }
@@ -239,7 +339,9 @@ fn data(file: &DrmFile, copy: &impl UserCopy, arg: usize, write: bool) -> AxResu
     let pages = object.backing.shared_pages().map_err(AxError::from)?;
     if write {
         pages.write_bytes(offset, &data)?;
+        super::gt::copy::sync_cpu_pages(pages.clone()).map_err(|_| AxError::Io)?;
     } else {
+        super::gt::copy::sync_cpu_pages(pages.clone()).map_err(|_| AxError::Io)?;
         pages.read_bytes(offset, &mut data)?;
         if count != 0 {
             copy.write(address, &data)?;
@@ -279,10 +381,11 @@ fn wait(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
         }
     })
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum Plan {
     Copy(intel_gt::bcs::Copy),
     Render,
+    User(Arc<super::gt::copy::UserJob>),
 }
 fn decode(
     file: &[Arc<GemObject>],
@@ -356,20 +459,31 @@ pub(super) fn exec_request(
     let context = file.intel_contexts.lookup(r.context as u32)?;
     let mut context_job = context.lock();
     let render = context_job.render_engine((r.flags & 0x3f) as u16)?;
-    if r.count != 3
-        || r.length
-            != if render {
-                intel_gt::rcs_page::COMMAND_BYTES
-            } else {
-                44
-            }
-        || !r.start.is_multiple_of(8)
+    let user = r.flags & BATCH_FIRST != 0;
+    if (if user {
+        r.count == 0 || r.count > 1024 || r.length == 0 || !r.length.is_multiple_of(8)
+    } else {
+        r.count != 3
+            || r.length
+                != if render {
+                    intel_gt::rcs_page::COMMAND_BYTES
+                } else {
+                    44
+                }
+    }) || !r.start.is_multiple_of(8)
         || r.dr1 != 0
         || r.dr4 != 0
         || r.context >> 32 != 0
         || (r.flags & (FENCE_IN | FENCE_OUT) == 0 && r.reserved != 0)
         || (r.flags & FENCE_IN != 0) != input.is_some()
-        || r.flags & !(FENCE_ARRAY | EXTENSIONS | FENCE_IN | FENCE_OUT | 0x3f) != NO_RELOC
+        || r.flags
+            & !(FENCE_ARRAY
+                | EXTENSIONS
+                | FENCE_IN
+                | FENCE_OUT
+                | 0x3f
+                | if user { BATCH_FIRST | HANDLE_LUT } else { 0 })
+            != NO_RELOC
         || r.fence_count > 64
         || r.flags & (FENCE_ARRAY | EXTENSIONS) == (FENCE_ARRAY | EXTENSIONS)
         || (r.flags & FENCE_ARRAY == 0 && r.fence_count != 0)
@@ -379,29 +493,49 @@ pub(super) fn exec_request(
     }
     // Lookup pins the old context through a concurrent destroy. The per-
     // context sleepable gate orders synchronous jobs without a spinlock wait.
-    let records = read_array::<Object>(copy, r.buffers, 3, 3)?;
+    let records = read_array::<Object>(copy, r.buffers, r.count as usize, 1024)?;
     let mut objects = Vec::new();
     let mut pages = Vec::new();
     objects
-        .try_reserve_exact(3)
+        .try_reserve_exact(records.len())
         .map_err(|_| AxError::NoMemory)?;
-    pages.try_reserve_exact(3).map_err(|_| AxError::NoMemory)?;
+    pages
+        .try_reserve_exact(records.len())
+        .map_err(|_| AxError::NoMemory)?;
     for (i, o) in records.iter().enumerate() {
-        let permitted = PINNED | ADDRESS48 | if i == 1 { WRITE } else { 0 };
+        let permitted = PINNED
+            | ADDRESS48
+            | if user {
+                WRITE | ASYNC | CAPTURE
+            } else if i == 1 {
+                WRITE
+            } else {
+                0
+            };
         if o.relocations != 0
             || o.relocation_pointer != 0
             || !matches!(o.alignment, 0 | 4096)
-            || o.offset != 0x10000 * (i as u64 + 1)
-            || o.flags & !(ADDRESS48 | WRITE) != PINNED
+            || (!user && o.offset != 0x10000 * (i as u64 + 1))
+            || o.flags & !(ADDRESS48 | WRITE | if user { ASYNC | CAPTURE } else { 0 }) != PINNED
             || o.flags & !permitted != 0
-            || (i == 1 && o.flags & WRITE == 0)
+            || (!user && i == 1 && o.flags & WRITE == 0)
+            || (user && i == 0 && o.flags & WRITE != 0)
             || o.reserved1 != 0
             || o.reserved2 != 0
         {
             return Err(AxError::InvalidInput);
         }
         let object = object(file, o.handle)?;
-        if object.size == 0 || object.size > MAX_SIZE || object.backing.host_resource().is_some() {
+        if object.size == 0
+            || object.size > if user { MAX_SIZE } else { 65536 }
+            || object.backing.host_resource().is_some()
+        {
+            return Err(AxError::InvalidInput);
+        }
+        if objects
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &object))
+        {
             return Err(AxError::InvalidInput);
         }
         let ram = object.backing.shared_pages().map_err(AxError::from)?;
@@ -478,23 +612,60 @@ pub(super) fn exec_request(
     for prior in &inputs {
         prior.wait(Some(Duration::from_millis(500)))?;
     }
+    let batch_index = if user { 0 } else { 2 };
     let (start, _) = range(
-        &objects[2],
+        &objects[batch_index],
         u64::from(r.start),
-        if render { 4096 } else { 44 },
+        if user {
+            u64::from(r.length)
+        } else if render {
+            4096
+        } else {
+            44
+        },
     )?;
-    previous(&objects[2], Some(Duration::from_millis(500)))?;
-    let _admission = decode(&objects, &pages, start, render)?;
+    previous(&objects[batch_index], Some(Duration::from_millis(500)))?;
+    let user_job = if user {
+        let mut resident = Vec::new();
+        resident
+            .try_reserve_exact(records.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for (index, (record, pages)) in records.iter().zip(&pages).enumerate() {
+            resident.push(super::gt::copy::UserObject {
+                address: record.offset,
+                pages: pages.clone(),
+                // EXEC_OBJECT_WRITE is a reservation hint, not PTE protection.
+                // Linux system GEM is writable unless the object is read-only;
+                // this adapter admits only its writable system backings.
+                writable: true,
+                cache: objects[index].backing.intel_cache_policy(),
+            });
+        }
+        let job = super::gt::copy::UserJob {
+            objects: resident,
+            batch: records[0]
+                .offset
+                .checked_add(u64::from(r.start))
+                .ok_or(AxError::InvalidInput)?,
+            render,
+        };
+        job.validate().map_err(|_| AxError::InvalidInput)?;
+        Some(Arc::try_new(job).map_err(|_| AxError::NoMemory)?)
+    } else {
+        decode(&objects, &pages, start, render)?;
+        None
+    };
     let vm = context_job.begin(file)?;
     let image = context_job.image(file, (r.flags & 0x3f) as u16, render)?;
     // Capture/wait producers before taking a shared VM execution gate: their
     // jobs may need the same root through another context.
     let _vm_job = vm.gate.lock();
-    let mut refs = [
-        &objects[0].reservation,
-        &objects[1].reservation,
-        &objects[2].reservation,
-    ];
+    let mut refs = Vec::new();
+    refs.try_reserve_exact(objects.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for object in &objects {
+        refs.push(&object.reservation);
+    }
     let predecessors = match Reservation::replace_many(&mut refs, completion.clone()) {
         Ok(p) => p,
         Err(e) => {
@@ -515,8 +686,18 @@ pub(super) fn exec_request(
         // and atomic reservation publication. Observe its final contents now;
         // later pwrite is behind our completion. Mmap races cannot inject GPU
         // commands: the native adapter rebuilds this bounded decoded plan.
-        let plan = decode(&objects, &pages, start, render)?;
-        execute(pages[0].clone(), pages[1].clone(), plan, vm.clone(), image)
+        let plan = if let Some(job) = user_job {
+            Plan::User(job)
+        } else {
+            decode(&objects, &pages, start, render)?
+        };
+        execute(
+            pages[0].clone(),
+            pages[if user { 0 } else { 1 }].clone(),
+            plan,
+            vm.clone(),
+            image,
+        )
     })();
     if result.is_ok() {
         completion.signal();
@@ -597,6 +778,7 @@ pub(crate) fn dispatch_native(
             match p {
                 Plan::Copy(copy) => super::gt::submit_copy(s, d, copy, vm.clone(), image),
                 Plan::Render => super::gt::submit_render(s, d, vm, image),
+                Plan::User(job) => super::gt::submit_user(job, vm, image),
             }
             .map_err(|_| AxError::Io)
         },
@@ -613,15 +795,44 @@ pub(crate) fn dispatch(
 ) -> AxResult<usize> {
     match cmd {
         CREATE => create(file, copy, arg)?,
+        GET_APERTURE => {
+            let (size, available) = super::gt::aperture().map_err(|_| AxError::NoSuchDevice)?;
+            write_pod(copy, arg, &Aperture { size, available })?;
+        }
+        SET_DOMAIN => domain(file, copy, arg)?,
+        SET_CACHING => caching(file, copy, arg, true)?,
+        GET_CACHING => caching(file, copy, arg, false)?,
+        MADVISE => {
+            let mut r: Advice = read_pod(copy, arg)?;
+            if r.advice > 1 {
+                return Err(AxError::InvalidInput);
+            }
+            let _object = object(file, r.handle)?;
+            // Advice may retain backing. Fixed DMA/mmap pages cannot be
+            // purged/replaced under active owners; quota still bounds them.
+            r.retained = 1;
+            write_pod(copy, arg, &r)?;
+        }
         PREAD => data(file, copy, arg, false)?,
         PWRITE => data(file, copy, arg, true)?,
         WAIT => wait(file, copy, arg)?,
         MMAP => {
             let mut r: Mmap = read_pod(copy, arg)?;
-            if r.pad != 0 || r.extensions != 0 || r.flags != 2 {
+            // Upstream historically ignores pad/old offset input. Only the
+            // three physical CPU map types used by iris are admitted here.
+            if r.extensions != 0 || !matches!(r.flags, 1..=3) {
                 return Err(AxError::InvalidInput);
             }
-            r.offset = file.map_dumb(r.handle).map_err(AxError::from)?;
+            if r.flags != 2 && !axhal::boot::intel_cpu_mmap_ready() {
+                return Err(AxError::NoSuchDevice);
+            }
+            let object = object(file, r.handle)?;
+            let _admission = cpu_admit(&object)?;
+            super::gt::copy::sync_cpu_pages(object.backing.shared_pages().map_err(AxError::from)?)
+                .map_err(|_| AxError::Io)?;
+            r.offset = file
+                .map_intel_cpu(r.handle, r.flags as u8)
+                .map_err(AxError::from)?;
             write_pod(copy, arg, &r)?;
         }
         BUSY => {
@@ -771,6 +982,286 @@ pub(super) mod tests {
         (handles[0], handles[1], handles[2], sync)
     }
     #[test]
+    fn typed_mmap_offsets_share_storage_preserve_type_and_do_not_retain_closed_handles() {
+        use crate::file::{FileMmapProtection, FileMmapRequest, FileMmapSharing};
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let handle = new(&file, &copy);
+        let held_object = object(&file, handle).unwrap();
+        let pages = held_object.backing.shared_pages().unwrap();
+        let wc = file.map_intel_cpu(handle, 1).unwrap();
+        let uc = file.map_intel_cpu(handle, 3).unwrap();
+        let wb = file.map_intel_cpu(handle, 2).unwrap();
+        assert_ne!(wc, uc);
+        assert_ne!(wc, wb);
+        assert_ne!(uc, wb);
+        assert_eq!(file.map_intel_cpu(handle, 1).unwrap(), wc);
+        let request = |offset| {
+            FileMmapRequest::try_new(
+                offset,
+                16384,
+                4096,
+                FileMmapProtection::READ | FileMmapProtection::WRITE,
+                FileMmapSharing::Shared,
+            )
+            .unwrap()
+        };
+        let plan = file.prepare_mmap(request(wc)).unwrap().unwrap();
+        assert!(Arc::ptr_eq(plan.pages(), &pages));
+        assert!(
+            plan.cpu_cache_flags()
+                .contains(axhal::paging::MappingFlags::WRITE_COMBINING)
+        );
+        let uncached = file.prepare_mmap(request(uc)).unwrap().unwrap();
+        assert!(
+            uncached
+                .cpu_cache_flags()
+                .contains(axhal::paging::MappingFlags::UNCACHED)
+        );
+        file.close_handle(handle).unwrap();
+        assert!(file.prepare_mmap(request(wc)).unwrap().is_none());
+        assert!(Arc::ptr_eq(plan.pages(), &pages));
+        // The host has no all-CPU native palette proof. The ioctl must not
+        // pretend WC is WB just to let a userspace initialization continue.
+        let handle = new(&file, &copy);
+        write_pod(
+            &copy,
+            0,
+            &Mmap {
+                handle,
+                flags: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(dispatch(&file, &copy, MMAP, 0), Err(AxError::NoSuchDevice));
+    }
+    #[test]
+    fn iris_cache_policy_follows_prime_storage_and_domain_advice_preserve_pages() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let handle = new(&file, &copy);
+        let bo = object(&file, handle).unwrap();
+        let alias_file = super::tests::file();
+        let alias = alias_file.import_gem(bo.clone()).unwrap();
+        for input in [1, 2, 0] {
+            write_pod(
+                &copy,
+                0,
+                &Caching {
+                    handle,
+                    caching: input,
+                },
+            )
+            .unwrap();
+            dispatch(&file, &copy, SET_CACHING, 0).unwrap();
+            write_pod(
+                &copy,
+                0,
+                &Caching {
+                    handle: alias,
+                    caching: 99,
+                },
+            )
+            .unwrap();
+            dispatch(&alias_file, &copy, GET_CACHING, 0).unwrap();
+            assert_eq!(
+                read_pod::<Caching>(&copy, 0).unwrap().caching,
+                if input == 1 { 1 } else { 0 }
+            );
+        }
+        write_pod(&copy, 0, &Caching { handle, caching: 3 }).unwrap();
+        assert_eq!(
+            dispatch(&file, &copy, SET_CACHING, 0),
+            Err(AxError::InvalidInput)
+        );
+        for read in [1, 0x40, 0x41] {
+            write_pod(
+                &copy,
+                0,
+                &Domain {
+                    handle,
+                    read,
+                    write: 0,
+                },
+            )
+            .unwrap();
+            dispatch(&file, &copy, SET_DOMAIN, 0).unwrap();
+        }
+        write_pod(
+            &copy,
+            0,
+            &Domain {
+                handle: u32::MAX,
+                read: 0,
+                write: 0,
+            },
+        )
+        .unwrap();
+        dispatch(&file, &copy, SET_DOMAIN, 0).unwrap();
+        write_pod(
+            &copy,
+            0,
+            &Domain {
+                handle,
+                read: 1,
+                write: 0x40,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(&file, &copy, SET_DOMAIN, 0),
+            Err(AxError::InvalidInput)
+        );
+        for advice in [0, 1] {
+            write_pod(
+                &copy,
+                0,
+                &Advice {
+                    handle,
+                    advice,
+                    retained: 0,
+                },
+            )
+            .unwrap();
+            dispatch(&file, &copy, MADVISE, 0).unwrap();
+            assert_eq!(read_pod::<Advice>(&copy, 0).unwrap().retained, 1);
+        }
+        assert!(Arc::ptr_eq(
+            &bo.backing.shared_pages().unwrap(),
+            &object(&alias_file, alias)
+                .unwrap()
+                .backing
+                .shared_pages()
+                .unwrap()
+        ));
+    }
+    #[test]
+    fn iris_batch_first_many_high_softpins_share_reservations_without_private_decode() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (a, b, c, sync) = prepare(&file, &copy);
+        for render in [false, true] {
+            for (i, handle) in [c, a, b].iter().enumerate() {
+                write_pod(
+                    &copy,
+                    256 + i * size_of::<Object>(),
+                    &Object {
+                        handle: *handle,
+                        offset: [0x1_0000_0000, 0x20_0000_0000, 0x40_0000_0000][i],
+                        flags: PINNED
+                            | ADDRESS48
+                            | ASYNC
+                            | CAPTURE
+                            | if i == 2 { WRITE } else { 0 },
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            write_pod(
+                &copy,
+                0,
+                &Exec {
+                    buffers: 256,
+                    count: 3,
+                    start: 8,
+                    length: 8,
+                    flags: (if render { 1 } else { 3 })
+                        | NO_RELOC
+                        | BATCH_FIRST
+                        | HANDLE_LUT
+                        | FENCE_ARRAY,
+                    fence_count: 1,
+                    fences: 512,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            exec_with(&file, &copy, 0, |_, _, plan| {
+                let Plan::User(job) = plan else {
+                    panic!("private batch decoder used for iris")
+                };
+                assert_eq!(job.objects.len(), 3);
+                assert_eq!(job.batch, 0x1_0000_0008);
+                assert_eq!(job.render, render);
+                super::super::gt::copy::tests::check_user_layout(job).map_err(|_| AxError::Io)
+            })
+            .unwrap();
+            for handle in [a, b, c] {
+                assert!(
+                    object(&file, handle)
+                        .unwrap()
+                        .reservation
+                        .predecessor()
+                        .unwrap()
+                        .is_signaled()
+                );
+            }
+            assert!(
+                file.syncobj(sync)
+                    .unwrap()
+                    .fence_at(0)
+                    .unwrap()
+                    .is_signaled()
+            );
+        }
+    }
+    #[test]
+    fn user_softpin_overlaps_and_out_of_batch_bounds_refuse_without_fence_publication() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (_, _, _, sync) = prepare(&file, &copy);
+        let mut request: Exec = read_pod(&copy, 0).unwrap();
+        request.flags |= BATCH_FIRST | HANDLE_LUT;
+        request.length = 8;
+        for start in [16384, u32::MAX & !7] {
+            request.start = start;
+            write_pod(&copy, 0, &request).unwrap();
+            assert_eq!(
+                exec_with(&file, &copy, 0, |_, _, _| panic!(
+                    "bad batch reached execution"
+                )),
+                Err(AxError::InvalidInput)
+            );
+        }
+        request.start = 0;
+        write_pod(&copy, 0, &request).unwrap();
+        let mut second: Object = read_pod(&copy, 256 + size_of::<Object>()).unwrap();
+        second.offset = 0x10000;
+        write_pod(&copy, 256 + size_of::<Object>(), &second).unwrap();
+        assert_eq!(
+            exec_with(&file, &copy, 0, |_, _, _| panic!(
+                "overlap reached execution"
+            )),
+            Err(AxError::InvalidInput)
+        );
+        second.offset = 0x20000;
+        write_pod(&copy, 256 + size_of::<Object>(), &second).unwrap();
+        let mut first: Object = read_pod(&copy, 256).unwrap();
+        first.flags |= WRITE;
+        write_pod(&copy, 256, &first).unwrap();
+        assert_eq!(
+            exec_with(&file, &copy, 0, |_, _, _| panic!("writable batch admitted")),
+            Err(AxError::InvalidInput)
+        );
+        first.flags &= !WRITE;
+        write_pod(&copy, 256, &first).unwrap();
+        second.handle = first.handle;
+        write_pod(&copy, 256 + size_of::<Object>(), &second).unwrap();
+        assert_eq!(
+            exec_with(&file, &copy, 0, |_, _, _| panic!(
+                "duplicate reservation admitted"
+            )),
+            Err(AxError::InvalidInput)
+        );
+        assert!(file.syncobj(sync).unwrap().fence_at(0).is_err());
+    }
+    #[test]
     fn gem_wire_copy_exec_result_reservation_syncobj_wait_and_mmap_share_owned_pages() {
         let _context = crate::test_support::scheduler_test_context();
         let file = file();
@@ -780,6 +1271,7 @@ pub(super) mod tests {
             match p {
                 Plan::Copy(copy) => super::super::gt::copy::tests::objects(s, d, copy),
                 Plan::Render => super::super::gt::copy::tests::render_objects(s, d),
+                Plan::User(_) => unreachable!(),
             }
             .map_err(|_| AxError::Io)
         })
