@@ -770,3 +770,18 @@ N305 GT information runtime: `tk-intel-gt/src/info.rs` selects MIT
 calls these for real fuse topology and timestamp frequency; it does not use the
 product's advertised EU count as a hardware observation. Per-file context/query
 transport is original, with independently compiled x86_64 UAPI sizes/commands.
+
+DRM completion ownership: original syncobj/fence fix follows observed Linux7.2.3
+binary SIGNAL replacement and chain dependency ordering, not producer mutation.
+The ignored explicit host oracle reads selected source `drm_syncobj_replace_fence`,
+`drm_syncobj_assign_null_handle` and `dma_fence_chain_{init,find_seqno,signaled}`,
+then compiles only a temporary licensed C transport model. MIT Red Hat/AMD and
+GPL-2.0-only AMD notices/full grant accompany that temporary source. No runtime
+GPL chain translation is present. It tests captured identity, terminal/dependency
+ordering and late points; it is not evidence of GPU execution or all fence errno.
+
+The syncobj oracle's conventional test-only `max(a,b)` macro adds one normalized
+code match at threshold25, none at40. Kernel outside-fence totals are now303/
+14code at25 and unchanged132/8code at40; fenced totals/range cites are unchanged.
+This is a short transport shim, not a retained Linux chain implementation;
+the scanner is not exempted or disabled.

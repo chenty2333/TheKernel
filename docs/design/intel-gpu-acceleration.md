@@ -201,3 +201,12 @@ GTT_SIZE reports the current bounded256KiB address range, not a fictitious full
 Mesa address space. The explicit acceptance client uses discovery and a created
 context for the actual same GEM→BCS/RCS→sync chain. Compilation/model/source-C
 checks are not unmodified iris/ANV or physical shader acceptance.
+
+Shared completion safety prerequisite: core userspace SYNCOBJ_SIGNAL must
+replace the object's backing with a completed software stub; it must not signal
+an already-published GPU/GEM reservation or captured sync_file. Timeline software
+signals append a consumer view that still depends on earlier producers, including
+late device points below a software signal. Consumer views now flatten immutable
+leaf dependencies and use existing fence waits/poll registrations; no new GPU
+scheduler or producer-fence ownership mechanism is introduced. GPU completion
+remains solely with the device path. Error propagation remains conservative.

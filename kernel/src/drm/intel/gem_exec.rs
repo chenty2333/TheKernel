@@ -757,6 +757,53 @@ pub(super) mod tests {
         );
     }
     #[test]
+    fn user_signal_during_exec_does_not_complete_gem_reservations_or_captured_output_fence() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (source, destination, _, out) = prepare(&file, &copy);
+        let output = file.syncobj(out).unwrap();
+        exec_with(&file, &copy, 0, |src, dst, plan| {
+            let producer = output.fence().unwrap();
+            assert!(!producer.is_signaled());
+            output.signal();
+            assert!(output.fence().unwrap().is_signaled());
+            assert!(!producer.is_signaled());
+            for handle in [source, destination] {
+                assert!(
+                    !object(&file, handle)
+                        .unwrap()
+                        .reservation
+                        .predecessor()
+                        .unwrap()
+                        .is_signaled()
+                );
+            }
+            let Plan::Copy(operation) = plan else {
+                panic!("copy")
+            };
+            super::super::gt::copy::tests::objects(src, dst, operation).map_err(|_| AxError::Io)
+        })
+        .unwrap();
+        assert!(
+            object(&file, destination)
+                .unwrap()
+                .reservation
+                .predecessor()
+                .unwrap()
+                .is_signaled()
+        );
+        let mut bytes = [0; 16384];
+        object(&file, destination)
+            .unwrap()
+            .backing
+            .shared_pages()
+            .unwrap()
+            .read_bytes(0, &mut bytes)
+            .unwrap();
+        assert!(bytes.iter().all(|v| *v == 0x73));
+    }
+    #[test]
     fn invalid_batch_or_alias_is_refused_before_any_completion_publication() {
         let _context = crate::test_support::scheduler_test_context();
         let file = file();

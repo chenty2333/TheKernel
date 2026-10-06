@@ -40,7 +40,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     ("kernel/src", 40): (89, 43, 20, 132, 8, 0, 0),
     ("crates/ax", 40): (0, 0, 0, 91, 84, 0, 0),
     ("crates/linux", 25): (211, 59, 22, 41, 3, 20, 21),
-    ("kernel/src", 25): (166, 53, 26, 302, 13, 0, 0),
+    ("kernel/src", 25): (166, 53, 26, 303, 14, 0, 0),
     # `crates/ax` at 25 is 4 `nullfs.rs` lines plus 14 smoltcp RFC bit-ruler rows
     # that Linux headers reprint from the same IETF figures: read the `crates/ax`
     # section of `docs/upstream-provenance.md` before counting these as text.

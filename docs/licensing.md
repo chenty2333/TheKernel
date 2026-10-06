@@ -365,3 +365,12 @@ readout (©2020 Intel), with full existing `tk-intel-gt/LICENSE-MIT` grant.
 The per-file context/UAPI transport is original code using header facts;
 no GPL query/context implementation body is copied. Independent temporary C
 oracles preserve the existing full grants and source copyrights.
+
+The producer-fence ownership fix in DRM syncobj/fence is original Rust.
+Its source-only host oracle compiles unchanged selected MIT `drm_syncobj.c`
+functions (Copyright2017 Red Hat,2016 AMD) and GPL-2.0-only dma-fence-chain
+functions (Copyright2018 AMD) only into temporary task-local C with both full
+license notices. GPL chain code is used to verify subtle dependency ordering;
+no GPL implementation body is retained in the runtime or repository.
+The conventional temporary-C transport `max(a,b)` shim is one additional kernel
+code-line scanner match at25 (none at40), reconciled with provenance/CI totals.
