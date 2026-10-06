@@ -111,3 +111,7 @@ intel_engine_cs.c::ring_is_idle hardware head/tail/MODE_IDLE checks (©2016 Inte
 existing full MIT grant). This never submits or resets media: it rejects live/
 unknown unowned consumers before shared PAT/MOCS/L3 programming. Runtime caller
 is the same independently opted-in BCS/RCS owner, not a disconnected reader.
+
+Kernel gem_context.rs adapts the MIT i915_gem_context.c VM/proto-context
+reference/ID lifetimes (©2011–2012 Intel) to retained SharedPages/GEM charging.
+No opaque saved GPU context state or full Mesa residency is fabricated.

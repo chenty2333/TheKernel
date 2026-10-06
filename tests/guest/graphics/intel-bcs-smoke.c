@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
     int fd = open(argv[2], O_RDWR | O_CLOEXEC);
     if (fd < 0) { perror("DRM open; not tested"); return 1; }
     int result = 1, output_fd = -1;
-    uint32_t handles[3] = {0}, sync = 0, context = 0;
+    uint32_t handles[3] = {0}, sync = 0, context = 0, vm = 0;
     int chipset = 0;
     drm_i915_getparam_t chipset_query = {.param=I915_PARAM_CHIPSET_ID, .value=&chipset};
     if (call(fd, DRM_IOCTL_I915_GETPARAM, &chipset_query)) goto done;
@@ -50,8 +50,16 @@ int main(int argc, char **argv) {
     int found=0;
     for (unsigned i=0;i<engines->num_engines;i++) if(engines->engines[i].engine.engine_class==(render?I915_ENGINE_CLASS_RENDER:I915_ENGINE_CLASS_COPY) && engines->engines[i].engine.engine_instance==0)found=1;
     if(!found){fprintf(stderr,"INTEL_FAIL requested engine not available\n");goto done;}
-    struct drm_i915_gem_context_create create_context={0};
-    if(call(fd,DRM_IOCTL_I915_GEM_CONTEXT_CREATE,&create_context))goto done;
+    struct drm_i915_gem_vm_control create_vm={0};
+    if(call(fd,DRM_IOCTL_I915_GEM_VM_CREATE,&create_vm))goto done;
+    vm=create_vm.vm_id;
+    struct drm_i915_gem_context_create_ext_setparam vm_param={.base={.name=I915_CONTEXT_CREATE_EXT_SETPARAM},.param={.param=I915_CONTEXT_PARAM_VM,.value=vm}};
+    struct drm_i915_gem_context_create_ext create_context={.flags=I915_CONTEXT_CREATE_FLAGS_USE_EXTENSIONS,.extensions=(uintptr_t)&vm_param};
+    if(call(fd,DRM_IOCTL_I915_GEM_CONTEXT_CREATE_EXT,&create_context))goto done;
+    /* The context must retain actual page-table ownership after ID destroy. */
+    struct drm_i915_gem_vm_control destroy_vm={.vm_id=vm};
+    if(call(fd,DRM_IOCTL_I915_GEM_VM_DESTROY,&destroy_vm))goto done;
+    vm=0;
     context=create_context.ctx_id;
     if(!context){fprintf(stderr,"INTEL_FAIL default context returned by CREATE\n");goto done;}
     unsigned char source[BYTES], output[BYTES];
@@ -132,6 +140,7 @@ int main(int argc, char **argv) {
     puts(render?"INTEL_RCS_USER_BYTES_VERIFIED bytes=16384 shader/GEM/sync/mmap; not Mesa acceptance":"INTEL_BCS_USER_BYTES_VERIFIED bytes=16384 GEM/exec/sync/mmap; not RCS/Mesa rendering");
     result=0;
 done:
+    if(vm){struct drm_i915_gem_vm_control request={.vm_id=vm};ioctl(fd,DRM_IOCTL_I915_GEM_VM_DESTROY,&request);}
     if(output_fd>=0)close(output_fd);
     if(context){struct drm_i915_gem_context_destroy request={.ctx_id=context};ioctl(fd,DRM_IOCTL_I915_GEM_CONTEXT_DESTROY,&request);}
     if(sync){struct drm_syncobj_destroy request={.handle=sync};ioctl(fd,DRM_IOCTL_SYNCOBJ_DESTROY,&request);}

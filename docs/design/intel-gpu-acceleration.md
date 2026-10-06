@@ -242,3 +242,32 @@ This is still the bounded synchronous adapter: input waits and execution have
 bounded deadlines, not Mesa's asynchronous arbitrary-batch interface. FENCE_SUBMIT
 remains unsupported. Descriptor ownership/rollback tests and client compilation
 are software checks, not physical GPU execution.
+
+
+VM_CREATE/DESTROY and CONTEXT_PARAM_VM now retain actual initialized/pinned
+PPGTT pages, with a charged RAM owner and a gate shared by contexts using that
+root. VM IDs are file-local, aliases returned by GETPARAM own independent
+references, and deleting an ID never detaches a context or admitted job. VM
+assignment is limited to mutable proto-contexts; CREATE_EXT SETPARAM uses the
+source32-byte extension header. The native bounded BCS/RCS adapter uses that
+same root, retains it on ambiguous DMA retirement, and never reuses it while
+another sharing context runs. The current256KiB address window and immutable
+batch restriction are still temporary limitations, not full Mesa VM/state
+support: per-engine saved images and general48-bit residency/submission follow.
+
+The existing target Mesa26.1.2 build was softpipe/virgl-only. The same cached
+26.1.2 source now builds iris/EGL/GBM/GLES in the Intel task's own state directory
+(`mesa-iris`, install `mesa-iris-stage`); no source version substitution. Its
+required native CLC tools were built from the same Mesa source, using isolated
+signature-checked Fedora LLVM22/SPIR-V development packages and existing host
+LLVM/tools, without installing host packages. The cross toolchain/sysroot is
+read-only; BISON_PKGDATADIR points at its existing data. No GPU was opened.
+`intel-mesa-smoke --initialize NODE` uses real GBM/EGL and validates the Intel
+renderer; `--execute NODE` compiles ES3 triangle shaders and checks interior
+and exterior pixels after actual draw/finish/readback. Loader override rejects
+software/virgl/zink fallback. It is built by the existing graphics guest-tool
+builder, not an alternative ABI harness. Compilation/no-argument refusal are
+verified; initialization/render markers have NOT been observed. Minimal RCS
+selftest, actual Mesa initialization and native Mesa pixels remain separate
+acceptance layers. Source calls next require RCS/RCS/BCS engine-map SETPARAM,
+register timestamp access, residency/cache policy and retained per-engine state.

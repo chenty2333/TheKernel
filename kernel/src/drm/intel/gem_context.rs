@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. Repository MIT license.
+// VM/proto-context lifetime adaptation follows Linux7.2.3
+// gem/i915_gem_context.c i915_gem_vm_{create,destroy}_ioctl/get_ppgtt/
+// set_proto_ctx_vm/create_setparam. Copyright © 2011-2012 Intel Corporation.
+// Full MIT grant: crates/ax/tk-intel-gt/LICENSE-MIT.
 //! Original bounded i915 context/query transport over existing per-file GEM.
 //! Wire/errno facts from Linux7.2.3 i915_drm.h/i915_query.c/i915_getparam.c;
 //! no upstream implementation body is copied. Hardware facts use ported GT IO.
@@ -14,28 +18,59 @@ use crate::drm::{
     ioctl::{UserCopy, read_pod, write_pod},
 };
 // Original per-file context lifetime adapter. Every admitted job rebuilds a
-// complete private hardware image/VM; the small immutable-job ABI does not
-// promise arbitrary retained graphics state or shared user VM extensions.
+// complete hardware image; PPGTT ownership can now persist/share across
+// contexts. Graphics register-state save and arbitrary residency are separate.
+pub(crate) struct JobContext {
+    vm: Option<Arc<super::gt::copy::Vm>>,
+    started: bool,
+}
+impl JobContext {
+    fn new() -> Self {
+        Self {
+            vm: None,
+            started: false,
+        }
+    }
+    pub(super) fn vm(&mut self, file: &DrmFile) -> AxResult<Arc<super::gt::copy::Vm>> {
+        if self.vm.is_none() {
+            self.vm = Some(super::gt::copy::Vm::new_for_file(file)?);
+        }
+        Ok(self.vm.as_ref().unwrap().clone())
+    }
+    pub(super) fn begin(&mut self, file: &DrmFile) -> AxResult<Arc<super::gt::copy::Vm>> {
+        let vm = self.vm(file)?;
+        self.started = true;
+        Ok(vm)
+    }
+}
 pub(crate) struct Contexts {
-    default: Arc<axsync::Mutex<()>>,
+    default: Arc<axsync::Mutex<JobContext>>,
     state: spin::Mutex<ContextState>,
 }
 struct ContextState {
     next: u32,
-    jobs: BTreeMap<u32, Arc<axsync::Mutex<()>>>,
+    jobs: BTreeMap<u32, Arc<axsync::Mutex<JobContext>>>,
+    next_vm: u32,
+    vms: BTreeMap<u32, Arc<super::gt::copy::Vm>>,
 }
 impl Contexts {
     pub(crate) fn new() -> Self {
         Self {
-            default: Arc::new(axsync::Mutex::new(())),
+            default: Arc::new(axsync::Mutex::new(JobContext::new())),
             state: spin::Mutex::new(ContextState {
                 next: 1,
                 jobs: BTreeMap::new(),
+                next_vm: 1,
+                vms: BTreeMap::new(),
             }),
         }
     }
     fn create(&self) -> AxResult<u32> {
-        let gate = Arc::try_new(axsync::Mutex::new(())).map_err(|_| AxError::NoMemory)?;
+        self.create_vm(None)
+    }
+    fn create_vm(&self, vm: Option<Arc<super::gt::copy::Vm>>) -> AxResult<u32> {
+        let gate = Arc::try_new(axsync::Mutex::new(JobContext { vm, started: false }))
+            .map_err(|_| AxError::NoMemory)?;
         let mut state = self.state.lock();
         if state.jobs.len() >= 256 {
             return Err(AxError::NoMemory);
@@ -45,7 +80,7 @@ impl Contexts {
         state.jobs.insert(id, gate);
         Ok(id)
     }
-    pub(super) fn lookup(&self, id: u32) -> AxResult<Arc<axsync::Mutex<()>>> {
+    pub(super) fn lookup(&self, id: u32) -> AxResult<Arc<axsync::Mutex<JobContext>>> {
         if id == 0 {
             Ok(self.default.clone())
         } else {
@@ -56,6 +91,43 @@ impl Contexts {
                 .cloned()
                 .ok_or(AxError::NotFound)
         }
+    }
+    fn publish_vm(&self, vm: Arc<super::gt::copy::Vm>) -> AxResult<u32> {
+        let mut state = self.state.lock();
+        if state.vms.len() >= 256 {
+            return Err(AxError::NoMemory);
+        }
+        let id = state.next_vm;
+        state.next_vm = id.checked_add(1).ok_or(AxError::NoMemory)?;
+        state.vms.insert(id, vm);
+        Ok(id)
+    }
+    fn vm(&self, id: u32) -> AxResult<Arc<super::gt::copy::Vm>> {
+        self.state
+            .lock()
+            .vms
+            .get(&id)
+            .cloned()
+            .ok_or(AxError::NotFound)
+    }
+    fn destroy_vm(&self, id: u32) -> AxResult<()> {
+        self.state
+            .lock()
+            .vms
+            .remove(&id)
+            .map(|_| ())
+            .ok_or(AxError::NotFound)
+    }
+    fn set_vm(&self, context: u32, id: u32) -> AxResult<()> {
+        let vm = self.vm(id)?;
+        let context = self.lookup(context)?;
+        let mut context = context.lock();
+        // Linux only changes VM while a proto-context is mutable.
+        if context.started {
+            return Err(AxError::InvalidInput);
+        }
+        context.vm = Some(vm);
+        Ok(())
     }
     fn destroy(&self, id: u32) -> AxResult<()> {
         if id == 0 {
@@ -68,6 +140,22 @@ impl Contexts {
             .map(|_| ())
             .ok_or(AxError::NotFound)
     }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct SetparamExt {
+    next: u64,
+    name: u32,
+    flags: u32,
+    reserved: [u32; 4],
+    param: ContextParam,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct VmControl {
+    extensions: u64,
+    flags: u32,
+    id: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -116,11 +204,16 @@ const CTX_CREATE: u32 = command::<ContextId>(0x2d, 3);
 const CTX_EXT: u32 = command::<ContextExt>(0x2d, 3);
 const CTX_DESTROY: u32 = command::<ContextId>(0x2e, 1);
 const CTX_GETPARAM: u32 = command::<ContextParam>(0x34, 3);
+const CTX_SETPARAM: u32 = command::<ContextParam>(0x35, 3);
+const VM_CREATE: u32 = command::<VmControl>(0x3a, 3);
+const VM_DESTROY: u32 = command::<VmControl>(0x3b, 1);
 const GETPARAM: u32 = command::<Getparam>(6, 3);
 const QUERY: u32 = command::<Query>(0x39, 3);
 // Independently compiled Linux7.2.3 x86_64 header facts.
 const _: () = {
     assert!(size_of::<ContextId>() == 8 && size_of::<ContextExt>() == 16);
+    assert!(size_of::<VmControl>() == 16 && size_of::<SetparamExt>() == 56);
+    assert!(VM_CREATE == 0xc010647a && VM_DESTROY == 0x4010647b && CTX_SETPARAM == 0xc0186475);
     assert!(size_of::<ContextParam>() == 24 && size_of::<Getparam>() == 16);
     assert!(size_of::<Query>() == 16 && size_of::<QueryItem>() == 24);
     assert!(CTX_CREATE == 0xc008646d && CTX_EXT == 0xc010646d && CTX_DESTROY == 0x4008646e);
@@ -148,10 +241,40 @@ fn context_create(
             extensions: 0,
         }
     };
-    if request.flags != 0 || request.extensions != 0 {
+    if request.flags & !3 != 0 || (!extended && request.flags != 0) {
         return Err(AxError::InvalidInput);
     }
-    request.id = file.intel_contexts.create()?;
+    let mut vm = None;
+    if request.flags & 1 != 0 {
+        let mut address = request.extensions;
+        let mut count = 0;
+        while address != 0 {
+            count += 1;
+            if count > 8 {
+                return Err(AxError::InvalidInput);
+            }
+            let ext: SetparamExt = read_pod(
+                copy,
+                usize::try_from(address).map_err(|_| AxError::BadAddress)?,
+            )?;
+            if ext.name != 0
+                || ext.flags != 0
+                || ext.reserved != [0; 4]
+                || ext.param.id != 0
+                || ext.param.size != 0
+                || ext.param.param != 9
+            {
+                return Err(AxError::InvalidInput);
+            }
+            if ext.param.value > u32::MAX as u64 {
+                return Err(AxError::NotFound);
+            }
+            vm = Some(file.intel_contexts.vm(ext.param.value as u32)?);
+            address = ext.next;
+        }
+    }
+    // Linux ignores the pointer without USE_EXTENSIONS; never dereference it.
+    request.id = file.intel_contexts.create_vm(vm)?;
     let result = if extended {
         write_pod(copy, arg, &request)
     } else {
@@ -297,12 +420,49 @@ pub(super) fn dispatch(
         }
         CTX_GETPARAM => {
             let mut r: ContextParam = read_pod(copy, arg)?;
-            let _context = file.intel_contexts.lookup(r.id)?;
-            if r.size != 0 || r.param != 3 {
+            let context = file.intel_contexts.lookup(r.id)?;
+            if r.size != 0 || !matches!(r.param, 3 | 9) {
                 return Err(AxError::InvalidInput);
             }
-            r.value = 0x40000;
-            write_pod(copy, arg, &r)?;
+            r.value = if r.param == 3 {
+                context.lock().begin(file)?;
+                0x40000
+            } else {
+                let vm = context.lock().begin(file)?;
+                u64::from(file.intel_contexts.publish_vm(vm)?)
+            };
+            if let Err(error) = write_pod(copy, arg, &r) {
+                if r.param == 9 {
+                    let _ = file.intel_contexts.destroy_vm(r.value as u32);
+                }
+                return Err(error);
+            }
+        }
+        CTX_SETPARAM => {
+            let r: ContextParam = read_pod(copy, arg)?;
+            if r.size != 0 || r.param != 9 {
+                return Err(AxError::InvalidInput);
+            }
+            if r.value > u32::MAX as u64 {
+                return Err(AxError::NotFound);
+            }
+            file.intel_contexts.set_vm(r.id, r.value as u32)?;
+        }
+        VM_CREATE | VM_DESTROY => {
+            let mut r: VmControl = read_pod(copy, arg)?;
+            if r.extensions != 0 || r.flags != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            if cmd == VM_CREATE {
+                let vm = super::gt::copy::Vm::new_for_file(file)?;
+                r.id = file.intel_contexts.publish_vm(vm)?;
+                if let Err(error) = write_pod(copy, arg, &r) {
+                    let _ = file.intel_contexts.destroy_vm(r.id);
+                    return Err(error);
+                }
+            } else {
+                file.intel_contexts.destroy_vm(r.id)?;
+            }
         }
         GETPARAM => {
             let r: Getparam = read_pod(copy, arg)?;
@@ -519,5 +679,165 @@ mod tests {
             getparam_value(51, topo, || Err(AxError::NoSuchDevice)),
             Err(AxError::NoSuchDevice)
         );
+    }
+    #[test]
+    fn shared_vm_is_real_pinned_root_retained_across_alias_destroy_and_two_jobs() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        write_pod(&copy, 0, &VmControl::default()).unwrap();
+        dispatch(&file, &copy, VM_CREATE, 0).unwrap();
+        let id = read_pod::<VmControl>(&copy, 0).unwrap().id;
+        let vm = file.intel_contexts.vm(id).unwrap();
+        let root = vm.root();
+        assert!(root != 0 && root.is_multiple_of(4096));
+        let a = file.intel_contexts.create().unwrap();
+        let b = file.intel_contexts.create().unwrap();
+        file.intel_contexts.set_vm(a, id).unwrap();
+        file.intel_contexts.set_vm(b, id).unwrap();
+        file.intel_contexts.destroy_vm(id).unwrap();
+        assert!(file.intel_contexts.vm(id).is_err());
+        assert_eq!(file.intel_contexts.set_vm(b, id), Err(AxError::NotFound));
+        for context in [a, b] {
+            let (_, dst, ..) = prepare(&file, &copy);
+            let mut request: Exec = read_pod(&copy, 0).unwrap();
+            request.context = u64::from(context);
+            super::super::gem_exec::exec_request(
+                &file,
+                &copy,
+                request,
+                crate::drm::fence::Fence::new(false),
+                None,
+                |src, dst, plan, active| {
+                    assert!(Arc::ptr_eq(&active, &vm));
+                    assert_eq!(active.root(), root);
+                    let Plan::Copy(operation) = plan else {
+                        panic!("copy")
+                    };
+                    super::super::gt::copy::tests::objects_vm(src, dst, operation, active)
+                        .map_err(|_| AxError::Io)
+                },
+            )
+            .unwrap();
+            let mut bytes = [0; 16384];
+            object(&file, dst)
+                .unwrap()
+                .backing
+                .shared_pages()
+                .unwrap()
+                .read_bytes(0, &mut bytes)
+                .unwrap();
+            assert!(bytes.iter().all(|b| *b == 0x73));
+        }
+        let replacement = file
+            .intel_contexts
+            .publish_vm(super::super::gt::copy::Vm::new().unwrap())
+            .unwrap();
+        assert_eq!(
+            file.intel_contexts.set_vm(a, replacement),
+            Err(AxError::InvalidInput)
+        );
+        file.intel_contexts.destroy(a).unwrap();
+        file.intel_contexts.destroy(b).unwrap();
+        assert_eq!(Arc::strong_count(&vm), 1);
+    }
+    #[test]
+    fn vm_create_extension_and_getparam_preserve_source_alias_and_copyout_lifetimes() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 1024]));
+        let original = file
+            .intel_contexts
+            .publish_vm(super::super::gt::copy::Vm::new().unwrap())
+            .unwrap();
+        write_pod(
+            &copy,
+            256,
+            &SetparamExt {
+                param: ContextParam {
+                    param: 9,
+                    value: u64::from(original),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_pod(
+            &copy,
+            0,
+            &ContextExt {
+                flags: 3,
+                extensions: 256,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        dispatch(&file, &copy, CTX_EXT, 0).unwrap();
+        let id = read_pod::<ContextExt>(&copy, 0).unwrap().id;
+        write_pod(
+            &copy,
+            0,
+            &ContextParam {
+                id,
+                param: 9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        dispatch(&file, &copy, CTX_GETPARAM, 0).unwrap();
+        let alias = read_pod::<ContextParam>(&copy, 0).unwrap().value as u32;
+        assert_ne!(alias, original);
+        assert!(Arc::ptr_eq(
+            &file.intel_contexts.vm(alias).unwrap(),
+            &file.intel_contexts.vm(original).unwrap()
+        ));
+        file.intel_contexts.destroy_vm(original).unwrap();
+        assert!(file.intel_contexts.vm(alias).is_ok());
+        struct Fail<'a>(&'a Image);
+        impl UserCopy for Fail<'_> {
+            fn read(&self, a: usize, b: &mut [MaybeUninit<u8>]) -> AxResult<()> {
+                self.0.read(a, b)
+            }
+            fn write(&self, _: usize, _: &[u8]) -> AxResult<()> {
+                Err(AxError::BadAddress)
+            }
+        }
+        write_pod(&copy, 0, &VmControl::default()).unwrap();
+        assert_eq!(
+            dispatch(&file, &Fail(&copy), VM_CREATE, 0),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(file.intel_contexts.state.lock().vms.len(), 1);
+        write_pod(
+            &copy,
+            0,
+            &ContextParam {
+                id,
+                param: 9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(&file, &Fail(&copy), CTX_GETPARAM, 0),
+            Err(AxError::BadAddress)
+        );
+        assert_eq!(file.intel_contexts.state.lock().vms.len(), 1);
+        write_pod(
+            &copy,
+            0,
+            &VmControl {
+                extensions: 1,
+                id: alias,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(&file, &copy, VM_DESTROY, 0),
+            Err(AxError::InvalidInput)
+        );
+        assert!(file.intel_contexts.vm(alias).is_ok());
     }
 }

@@ -794,3 +794,12 @@ register/idle predicates and fault/ownership models validate software only.
 The media idle C transport adds one conventional `I915_SELFTEST_ONLY(x) 0`
 match at25, none at40; current GT79/74, combined Intel91/76 and crates/ax119/
 108code at25 (unchanged91/84code at40) are reconciled without an exemption.
+
+Intel VM/context transport: Linux7.2.3 gem/i915_gem_context.c
+`i915_gem_vm_{create,destroy}_ioctl`, `get_ppgtt`, `set_proto_ctx_vm` and
+`create_setparam` define handle/reference/proto-context behavior; existing
+selected gen8_ppgtt.c encodings back the runtime PPGTT. Kernel lifetime/storage
+adaptation is original Rust over GEM charging/SharedPages, with no GPL body.
+Actual userspace reference stays Mesa26.1.2, including intel/common/i915/intel_gem.c
+and iris/i915/iris_{batch,bufmgr,kmd_backend}.c. Same-source iris build and the
+original real EGL/GLES client are preparation, not initialization/render evidence.

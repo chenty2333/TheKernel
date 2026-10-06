@@ -20,7 +20,12 @@ for source in "$source_dir/tests/guest/graphics/"*.c; do
     name=${name%.c}
     cflags=
     output=$name
+    libraries=
     case "$name" in
+        intel-mesa-smoke)
+            cflags=-I$STAGING_DIR/usr/include/libdrm
+            libraries="-lgbm -lEGL -lGLESv2"
+            ;;
         drm-uapi-oracle|intel-bcs-smoke)
             cflags=-I$STAGING_DIR/usr/include/libdrm
             ;;
@@ -30,7 +35,7 @@ for source in "$source_dir/tests/guest/graphics/"*.c; do
             ;;
     esac
     "$compiler" -O2 -std=c11 -Wall -Wextra -Werror $cflags \
-      "$source" \
+      "$source" $libraries \
       -o "$target/usr/local/bin/$output"
     installed="$installed $target/usr/local/bin/$output"
 done

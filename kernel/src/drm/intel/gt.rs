@@ -348,13 +348,14 @@ pub(super) fn submit_copy(
     source: alloc::sync::Arc<crate::mm::SharedPages>,
     destination: alloc::sync::Arc<crate::mm::SharedPages>,
     operation: intel_gt::bcs::Copy,
+    vm: alloc::sync::Arc<copy::Vm>,
 ) -> Result<(), Error> {
     if !registered() {
         return Err(Error::Refused);
     }
     let mut state = OWNER.lock();
     let owner = state.as_mut().ok_or(Error::Refused)?;
-    let result = copy::objects(owner, source, destination, operation);
+    let result = copy::objects(owner, source, destination, operation, vm);
     if result.is_err() {
         owner.lost = true;
     }
@@ -364,6 +365,7 @@ pub(super) fn submit_copy(
 pub(super) fn submit_render(
     source: alloc::sync::Arc<crate::mm::SharedPages>,
     destination: alloc::sync::Arc<crate::mm::SharedPages>,
+    vm: alloc::sync::Arc<copy::Vm>,
 ) -> Result<(), Error> {
     if !registered() {
         return Err(Error::Refused);
@@ -373,7 +375,7 @@ pub(super) fn submit_render(
     if !owner.render_ready {
         return Err(Error::Refused);
     }
-    let result = copy::render_objects(owner, source, destination);
+    let result = copy::render_objects(owner, source, destination, vm);
     if result.is_err() {
         owner.lost = true;
     }
@@ -383,6 +385,7 @@ pub(super) fn submit_render(
 pub(super) fn submit_render(
     _source: alloc::sync::Arc<crate::mm::SharedPages>,
     _destination: alloc::sync::Arc<crate::mm::SharedPages>,
+    _vm: alloc::sync::Arc<copy::Vm>,
 ) -> Result<(), Error> {
     Err(Error::Refused)
 }
@@ -391,6 +394,7 @@ pub(super) fn submit_copy(
     _source: alloc::sync::Arc<crate::mm::SharedPages>,
     _destination: alloc::sync::Arc<crate::mm::SharedPages>,
     _operation: intel_gt::bcs::Copy,
+    _vm: alloc::sync::Arc<copy::Vm>,
 ) -> Result<(), Error> {
     Err(Error::Refused) // No host/native CPU-copy fallback.
 }

@@ -123,3 +123,12 @@ The explicit BCS/RCS client now also requires CLOEXEC output sync_files, termina
 POLLIN and a second submission using the first descriptor as FENCE_IN, with
 fresh timeline point2. This transport is compiled/model-verified only. The
 current synchronous, immutable-job adapter is not general iris submission.
+
+The explicit acceptance client now creates a real VM and attaches it through
+CREATE_EXT/SETPARAM, then destroys the VM ID before its two jobs; success requires
+retained page-table ownership. This is not saved-context/general-Mesa proof.
+The same Mesa26.1.2 iris runtime is built in the Intel state's mesa-iris-stage.
+Use intel-mesa-smoke --initialize NODE and --execute NODE as distinct acceptance
+steps only after the remaining general-submission/context path is implemented.
+Neither marker has been measured; default graphics images still use virgl or
+software and their success cannot substitute for these native checks.

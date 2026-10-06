@@ -381,3 +381,11 @@ hardware ring-idle checks (©2016 Intel, existing full LICENSE-MIT). There is no
 media submission/reset implementation or new firmware payload.
 The selected ring-idle C oracle adds one conventional SELFTEST_ONLY transport
 macro match at25 and none at40, included in the current GT/provenance totals.
+
+`tests/guest/graphics/intel-mesa-smoke.c` is original MIT acceptance code calling
+public GBM/EGL/GLES/i915 interfaces. It contains no imported shader/driver body.
+The task-local iris/CLC builds use the existing Mesa26.1.2 archive and its licenses;
+LLVM/SPIR-V tool packages remain isolated build dependencies, not kernel code.
+The VM/context wire adapter follows Linux7.2.3 MIT i915_gem_context.c VM/proto-
+context lifetime functions (©2011–2012 Intel), using existing per-file GEM charging
+and RAM pins. It does not replace an opaque GPU state image with guessed data.

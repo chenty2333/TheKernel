@@ -113,9 +113,61 @@ impl Ram {
         fence(Ordering::SeqCst);
     }
 }
+/// Real, pinned private page-table ownership. Currently the admitted three
+/// windows occupy a bounded 256KiB VM; this is not arbitrary Mesa residency.
+/// The gate serializes all contexts sharing this root through GPU retirement.
+pub(crate) struct Vm {
+    tables: Arc<Ram>,
+    pub(crate) gate: axsync::Mutex<()>,
+}
+impl Vm {
+    pub(crate) fn new() -> Result<Arc<Self>, Error> {
+        let tables = Arc::try_new(Ram::allocate(8)?).map_err(|_| Error::Refused)?;
+        let p = &tables.physical;
+        let mut words = zero_words::<u64>(512)?;
+        let page: &mut [u64; 512] = words.as_mut_slice().try_into().unwrap();
+        // Empty low-address hierarchy plus dedicated per-level scratch. The
+        // VM ID owns real initialized page tables, not an unbacked identifier.
+        ppgtt::directory(page, p[4], p[1])?;
+        tables.table(0, page)?;
+        ppgtt::directory(page, p[5], p[2])?;
+        tables.table(1, page)?;
+        ppgtt::directory(page, p[6], p[3])?;
+        tables.table(2, page)?;
+        ppgtt::leaf(page, p[7], 3)?;
+        tables.table(3, page)?;
+        page.fill(ppgtt::pde(p[5])?);
+        tables.table(4, page)?;
+        page.fill(ppgtt::pde(p[6])?);
+        tables.table(5, page)?;
+        ppgtt::leaf(page, p[7], 3)?;
+        tables.table(6, page)?;
+        tables.flush();
+        Arc::try_new(Self {
+            tables,
+            gate: axsync::Mutex::new(()),
+        })
+        .map_err(|_| Error::Refused)
+    }
+    pub(crate) fn new_for_file(file: &crate::drm::DrmFile) -> axerrno::AxResult<Arc<Self>> {
+        let charge = file
+            .reserve_render_memory(8 * PAGE)
+            .map_err(axerrno::AxError::from)?;
+        let vm = Self::new().map_err(|_| axerrno::AxError::NoMemory)?;
+        // Charge follows the actual page-table allocation, including retained
+        // DMA/quarantine owners after a file or VM handle disappears.
+        vm.tables.pages.retain_allocation_owner(charge)?;
+        Ok(vm)
+    }
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> u64 {
+        self.tables.physical[0]
+    }
+}
+
 pub(super) struct Memory {
     gtt: Arc<Gtt>,
-    tables: Ram,
+    tables: Arc<Ram>,
     source: Ram,
     destination: Ram,
     context: Ram,
@@ -134,7 +186,7 @@ impl Memory {
         bindings.try_reserve_exact(3).map_err(|_| Error::Refused)?;
         Ok(Self {
             gtt,
-            tables: Ram::allocate(8)?,
+            tables: Arc::try_new(Ram::allocate(8)?).map_err(|_| Error::Refused)?,
             source: Ram::allocate(6)?,
             destination: Ram::allocate(6)?,
             context: Ram::allocate(4)?,
@@ -252,7 +304,7 @@ impl Memory {
         self.status.write(0x10 * 4, &[0xff; 12 * 8])?;
         self.status.write(0x2f * 4, &11u32.to_le_bytes())?;
         for r in [
-            &self.tables,
+            &*self.tables,
             &self.source,
             &self.destination,
             &self.context,
@@ -466,6 +518,7 @@ pub(super) fn render_objects(
     owner: &mut super::Owner,
     source: Arc<SharedPages>,
     destination: Arc<SharedPages>,
+    vm: Arc<Vm>,
 ) -> Result<(), Error> {
     if owner.lost || owner.memory.is_some() {
         return Err(Error::Quarantined);
@@ -491,6 +544,7 @@ pub(super) fn render_objects(
         pitch: 256,
     };
     let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
+    memory.tables = vm.tables.clone();
     memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?;
     memory.render = true;
     owner.memory = Some(memory);
@@ -513,6 +567,7 @@ pub(super) fn objects(
     source: Arc<SharedPages>,
     destination: Arc<SharedPages>,
     operation: bcs::Copy,
+    vm: Arc<Vm>,
 ) -> Result<(), Error> {
     if owner.lost || owner.memory.is_some() {
         return Err(Error::Quarantined);
@@ -536,7 +591,8 @@ pub(super) fn objects(
     // establishes a fresh engine state before loading another private context.
     intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
-    let memory = Memory::from_objects(gtt, source, destination, operation)?;
+    let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
+    memory.tables = vm.tables.clone();
     owner.memory = Some(memory);
     let memory = owner.memory.as_mut().unwrap();
     memory.bind_and_build()?;
@@ -565,7 +621,7 @@ pub(in crate::drm::intel) mod tests {
             let page = physical & !4095;
             let inside = (physical & 4095) as usize;
             for ram in [
-                &self.memory.tables,
+                &*self.memory.tables,
                 &self.memory.source,
                 &self.memory.destination,
                 &self.memory.context,
@@ -747,7 +803,7 @@ pub(in crate::drm::intel) mod tests {
         destination: Arc<SharedPages>,
         operation: bcs::Copy,
     ) -> Result<(), Error> {
-        objects_kind(source, destination, operation, false)
+        objects_kind(source, destination, operation, false, None)
     }
     pub(in crate::drm::intel) fn render_objects(
         source: Arc<SharedPages>,
@@ -766,17 +822,30 @@ pub(in crate::drm::intel) mod tests {
                 pitch: 256,
             },
             true,
+            None,
         )
+    }
+    pub(in crate::drm::intel) fn objects_vm(
+        source: Arc<SharedPages>,
+        destination: Arc<SharedPages>,
+        operation: bcs::Copy,
+        vm: Arc<Vm>,
+    ) -> Result<(), Error> {
+        objects_kind(source, destination, operation, false, Some(vm))
     }
     fn objects_kind(
         source: Arc<SharedPages>,
         destination: Arc<SharedPages>,
         operation: bcs::Copy,
         render: bool,
+        vm: Option<Arc<Vm>>,
     ) -> Result<(), Error> {
         let array = super::super::super::gtt::mock::MockPageTable::new(65536);
         let gtt = Arc::new(Gtt::over(Box::new(array)).unwrap());
         let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
+        if let Some(vm) = vm {
+            memory.tables = vm.tables.clone();
+        }
         if render {
             memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?;
             memory.render = true;
