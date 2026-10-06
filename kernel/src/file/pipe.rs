@@ -934,6 +934,12 @@ impl PipeAccess {
     }
 }
 
+struct FifoConnections {
+    readers: usize,
+    writers: usize,
+    writer_epoch: u64,
+}
+
 struct NamedPipeState {
     read_transaction: Mutex<()>,
     buffer: Mutex<PipeRing>,
@@ -941,8 +947,7 @@ struct NamedPipeState {
     poll_tx: PollSet,
     poll_open: PollSet,
     async_io: Mutex<PipeAsyncIo>,
-    readers: AtomicUsize,
-    writers: AtomicUsize,
+    connections: Mutex<FifoConnections>,
 }
 
 impl NamedPipeState {
@@ -954,38 +959,53 @@ impl NamedPipeState {
             poll_tx: PollSet::new(),
             poll_open: PollSet::new(),
             async_io: Mutex::new(PipeAsyncIo::default()),
-            readers: AtomicUsize::new(0),
-            writers: AtomicUsize::new(0),
+            connections: Mutex::new(FifoConnections { readers: 0, writers: 0, writer_epoch: 0 }),
         }
     }
 
     fn reader_count(&self) -> usize {
-        self.readers.load(Ordering::Acquire)
+        self.connections.lock().readers
     }
 
     fn writer_count(&self) -> usize {
-        self.writers.load(Ordering::Acquire)
+        self.connections.lock().writers
     }
 
-    fn add_access(&self, access: PipeAccess) {
+    fn add_access(&self, access: PipeAccess, nonblocking: bool) -> AxResult<Option<u64>> {
+        let mut connections = self.connections.lock();
+        if access == PipeAccess::Write && nonblocking && connections.readers == 0 {
+            return Err(LinuxError::ENXIO.into());
+        }
+        let initial_writer_epoch = (access == PipeAccess::Read && nonblocking && connections.writers == 0)
+            .then_some(connections.writer_epoch);
         if access.can_read() {
-            self.readers.fetch_add(1, Ordering::AcqRel);
+            connections.readers += 1;
         }
         if access.can_write() {
-            self.writers.fetch_add(1, Ordering::AcqRel);
+            connections.writers += 1;
+            connections.writer_epoch = connections.writer_epoch.wrapping_add(1);
         }
+        drop(connections);
         self.poll_open.wake();
         self.poll_rx.wake();
         self.poll_tx.wake();
+        Ok(initial_writer_epoch)
+    }
+
+    fn read_hangup(&self, initial_writer_epoch: Option<u64>) -> bool {
+        let connections = self.connections.lock();
+        connections.writers == 0 && initial_writer_epoch != Some(connections.writer_epoch)
     }
 
     fn remove_access(&self, access: PipeAccess) {
+        let mut connections = self.connections.lock();
         if access.can_read() {
-            self.readers.fetch_sub(1, Ordering::AcqRel);
+            connections.readers -= 1;
         }
         if access.can_write() {
-            self.writers.fetch_sub(1, Ordering::AcqRel);
+            connections.writers -= 1;
         }
+        drop(connections);
         self.poll_open.wake();
         self.poll_rx.wake();
         self.poll_tx.wake();
@@ -1015,6 +1035,7 @@ pub(crate) struct NamedPipe {
     location: Location,
     state: Arc<NamedPipeState>,
     non_blocking: AtomicBool,
+    initial_writer_epoch: Option<u64>,
 }
 
 impl Drop for NamedPipe {
@@ -1645,11 +1666,10 @@ impl NamedPipe {
             guard.try_get_or_insert_with(NamedPipeState::new)?
         };
 
-        if access == PipeAccess::Write && nonblocking && state.reader_count() == 0 {
-            return Err(AxError::from(LinuxError::ENXIO));
-        }
-
-        state.add_access(access);
+        // A nonblocking read opened before a writer suppresses poll HUP until
+        // this retained description has witnessed a writer epoch. Its direct
+        // read still returns EOF while writer count is zero, as on Linux.
+        let initial_writer_epoch = state.add_access(access, nonblocking)?;
 
         let waiter = NamedPipeOpenWaiter {
             state: state.as_ref(),
@@ -1703,6 +1723,7 @@ impl NamedPipe {
             location,
             state,
             non_blocking: AtomicBool::new(nonblocking),
+            initial_writer_epoch,
         })
     }
 
@@ -2162,7 +2183,7 @@ impl Pollable for NamedPipe {
         let buf = self.state.buffer.lock();
         if self.access.can_read() {
             events.set(IoEvents::READABLE, buf.occupied_len() > 0);
-            events.set(IoEvents::HANGUP, self.state.writer_count() == 0);
+            events.set(IoEvents::HANGUP, self.state.read_hangup(self.initial_writer_epoch));
         }
         if self.access.can_write() {
             events.set(
@@ -2274,6 +2295,29 @@ mod tests {
         );
         assert_eq!(fifo.state.buffer.lock().occupied_len(), 4);
         assert_eq!(reader.shared.buffer.lock().occupied_len(), 4);
+    }
+
+    #[test]
+    fn fifo_nonblocking_reader_suppresses_hup_until_a_writer_epoch() {
+        let _context = crate::test_support::scheduler_test_context();
+        let fs = crate::pseudofs::tmp::MemoryFs::new().unwrap();
+        let root = axfs_ng_vfs::Mountpoint::new_root(&fs).root_location();
+        let loc = root.create(axfs_ng_vfs::FsName::new(b"fifo-poll"),
+            axfs_ng_vfs::NodeType::Fifo,
+            axfs_ng_vfs::NodePermission::from_bits_truncate(0o600)).unwrap();
+        let reader = NamedPipe::open(loc.clone(), O_RDONLY | O_NONBLOCK).unwrap();
+        assert!(reader.poll().is_empty());
+        let writer = NamedPipe::open(loc.clone(), O_WRONLY | O_NONBLOCK).unwrap();
+        assert!(reader.poll().is_empty());
+        drop(writer);
+        assert!(reader.poll().contains(IoEvents::HANGUP));
+        let reopened = NamedPipe::open(loc.clone(), O_RDONLY | O_NONBLOCK).unwrap();
+        assert!(reopened.poll().is_empty());
+        let writer = NamedPipe::open(loc, O_WRONLY | O_NONBLOCK).unwrap();
+        writer.state.buffer.lock().bytes.push_slice(b"x");
+        drop(writer);
+        assert!(reader.poll().contains(IoEvents::READABLE | IoEvents::HANGUP));
+        assert!(reopened.poll().contains(IoEvents::READABLE | IoEvents::HANGUP));
     }
 
     #[test]

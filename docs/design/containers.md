@@ -937,3 +937,31 @@ those fixture/registry defects were corrected, not counted as a passing run.
 Actual Podman (`shell-isly4jyf`) now receives a genuine conmon exit status rather
 than hanging. That run reports container exit1 and crun start SIGPIPE before
 hello; inspect its retained OCI logs next. Full Podman acceptance is still pending.
+
+### FIFO select readiness before the first writer
+
+A diagnostic-only run retaining OCI logs (`shell-0s9sxjtf`, without --rm and
+with crun's debug flag) exposes the actual init error: read from exec.fifo
+returns EAGAIN after select said ready. The named FIFO provider advertised HUP
+before any writer ever connected. When the start writer connects between that
+spurious readiness and the nonblocking read, the empty FIFO correctly returns
+EAGAIN, and crun exits before the start handshake. This is not fixed by ignoring
+SIGPIPE, treating EAGAIN as success, or changing the supplied runtime.
+
+Linux7.2.3 fs/pipe.c retains a writer generation in each initially writerless
+nonblocking read description, suppressing initial poll HUP until a later writer
+epoch. Named FIFO connection counts and writer epoch now share one lock, and
+open retains that description's exact initial epoch. Poll suppresses only that
+initial HUP; direct read still returns EOF without writers, connected empty read
+still returns EAGAIN, and writer close exposes HUP with pending data preserved.
+The new host and paired fixtures cover poll/select initial suppression, direct
+EOF/EAGAIN distinctions, real writer/data/HUP and a fresh-reader epoch.
+Kernel2659 host tests, lint784, KVM system70/70 (`system-21uay1wq`) and paired
+fs-abi24/259 (`abi-80pl0rdr`) passed. Actual signed UID1000 Podman5.8.8 with
+crun1.30.1/conmon2.2.1 (`shell-yssdfmcq`) now loads the authentic offline Alpine
+image, uses native overlay, runs the unchanged --rm --network=none --pull=never
+alpine echo hello command, prints hello, receives exit0, removes the container
+and returns script RC0 with KTAP1 and THEKERNEL_CONTAINER_PODMAN_OK.
+This is Level4 acceptance, not just a harness RC or the diagnostic-only run.
+The nonfatal overlay storage-link rename warning remains a documented bound;
+next add an explicit empty-container-store postcondition to the guest test.

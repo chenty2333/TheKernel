@@ -12,6 +12,8 @@
 #include <fcntl.h>
 #include <linux/capability.h>
 #include <signal.h>
+#include <poll.h>
+#include <sys/select.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2297,6 +2299,45 @@ int main(void) {
               "pipe-metadata-nonowner-denied");
         close(meta_pipe[0]);
         close(meta_pipe[1]);
+        check(mkfifoat(pdir, "poll-fifo", 0600) == 0, "fifo-poll-create");
+        int fifo_reader = openat(pdir, "poll-fifo", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        check(fifo_reader >= 0, "fifo-poll-reader-open");
+        struct pollfd fifo_poll = {.fd = fifo_reader, .events = POLLIN};
+        check(poll(&fifo_poll, 1, 0) == 0 && fifo_poll.revents == 0,
+              "fifo-poll-no-initial-hup");
+        fd_set fifo_reads;
+        FD_ZERO(&fifo_reads);
+        FD_SET(fifo_reader, &fifo_reads);
+        struct timeval fifo_timeout = {0};
+        check(select(fifo_reader + 1, &fifo_reads, NULL, NULL, &fifo_timeout) == 0,
+              "fifo-select-no-initial-eof");
+        char fifo_byte;
+        check(read(fifo_reader, &fifo_byte, 1) == 0, "fifo-direct-initial-eof");
+        int fifo_writer = openat(pdir, "poll-fifo", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        check(fifo_writer >= 0, "fifo-poll-writer-open");
+        fifo_poll.revents = 0;
+        check(poll(&fifo_poll, 1, 0) == 0, "fifo-poll-connected-empty");
+        errno = 0;
+        check(read(fifo_reader, &fifo_byte, 1) == -1 && errno == EAGAIN,
+              "fifo-direct-connected-eagain");
+        close(fifo_writer);
+        fifo_poll.revents = 0;
+        check(poll(&fifo_poll, 1, 0) == 1 && (fifo_poll.revents & POLLHUP) &&
+              !(fifo_poll.revents & POLLIN), "fifo-poll-observed-writer-hup");
+        int fresh_reader = openat(pdir, "poll-fifo", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        check(fresh_reader >= 0, "fifo-poll-fresh-reader");
+        struct pollfd fresh_poll = {.fd = fresh_reader, .events = POLLIN};
+        check(poll(&fresh_poll, 1, 0) == 0, "fifo-poll-fresh-epoch");
+        fifo_writer = openat(pdir, "poll-fifo", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        check(fifo_writer >= 0 && write(fifo_writer, "x", 1) == 1, "fifo-poll-write-byte");
+        close(fifo_writer);
+        check(poll(&fresh_poll, 1, 0) == 1 &&
+              (fresh_poll.revents & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP),
+              "fifo-poll-data-and-hup");
+        check(read(fresh_reader, &fifo_byte, 1) == 1 && fifo_byte == 'x', "fifo-poll-real-data");
+        close(fresh_reader);
+        close(fifo_reader);
+        check(unlinkat(pdir, "poll-fifo", 0) == 0, "fifo-poll-cleanup");
         mark("MODE_AND_OWNER");
 
         /* fs/namei.c do_mknodat(): a FIFO is creatable and a duplicate name
