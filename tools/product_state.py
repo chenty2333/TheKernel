@@ -313,6 +313,7 @@ ROOTFS_INPUT_FILES = (
     "scripts/build-inspect-payload.sh",
     "config/inspect-apks.lock",
     "scripts/build-containers-payload.sh",
+    "scripts/install-container-filecaps.py",
     "config/containers-apks.lock",
     "tests/guest/container-bwrap.sh",
     "tests/guest/container-crun.sh",

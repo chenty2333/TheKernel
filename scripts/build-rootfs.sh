@@ -389,6 +389,12 @@ fi
     --arch "$ARCH" --stage "$STAGE" --output "$IMAGE" --size-mb "$SIZE_MB" \
     --owner-mode "$ROOTFS_OWNER_MODE"
 
+# Restore only the authenticated container helpers' package file capabilities
+# inside the offline image, never on the host staging filesystem.
+if [ "$TOOLCHAIN" = containers ]; then
+    python3 "$SCRIPT_DIR/install-container-filecaps.py" --image "$IMAGE" --payload "$TOOLS_DIR"
+fi
+
 ROOTFS_BACKUP="$WORK_ROOT/rootfs-previous"
 ROOTFS_HAD_PREVIOUS=0
 ROOTFS_PUBLISHED=0

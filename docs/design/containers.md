@@ -667,3 +667,21 @@ its capability reduction. The authenticated APK stores CAP_SETUID/CAP_SETGID
 file-capability xattrs (not setuid modes); these are absent from staged helpers.
 Next preserve those package attributes in the guest image, without privileged
 host filesystem changes or relaxing capset.
+
+### Preserve package file capabilities only inside the guest image
+
+Alpine's signed shadow-subids4.18.0-r1 helpers use security.capability xattrs,
+not setuid bits. Unprivileged APK staging cannot retain those host attributes.
+The payload now extracts their exact authenticated package xattrs into runtime
+installation metadata; a focused offline-image installer admits only the two
+original single permitted/effective bits (CAP_SETUID or CAP_SETGID), writes them
+with debugfs and reads the binary xattrs back before publishing the image.
+No host setcap, chown, sudo, helper invocation, container or account modification
+is performed. The standard payload signature/closure checks still apply.
+
+Related rootfs Python18, shell/lint and actual signed131 staging passed. Offline
+image readback verified both attributes. Actual UID1000 podman passed both real
+mapping helpers and reexec, initialized overlay/SQLite, parsed the offline Docker
+archive and reached layer extraction (`shell-8be4qa_8`). It now fails the archive
+extractor's pivot-directory mkdir with EACCES; load/hello remains unaccepted.
+Next diagnose that real rootless path/credential failure, not archive format.

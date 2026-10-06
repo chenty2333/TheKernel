@@ -3,6 +3,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import importlib.util
+import struct
 
 from tools.product_state import ROOTFS_INPUT_FILES, rootfs_image_bytes, selected_tool_payload
 
@@ -10,6 +12,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ContainersPayloadTests(unittest.TestCase):
+    def test_offline_filecaps_are_exact_signed_helper_rights(self):
+        spec = importlib.util.spec_from_file_location('container_filecaps', ROOT/'scripts/install-container-filecaps.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        valid = {path: struct.pack('<IIIII', 0x02000001, 1 << bit, 0, 0, 0).hex()
+                 for path, bit in module.TARGETS.items()}
+        self.assertEqual(set(module.validate_filecaps(valid)), set(module.TARGETS))
+        for invalid in [{}, {**valid, '/bin/sh': valid[next(iter(valid))]},
+                        {**valid, '/opt/thekernel-tools/bin/newuidmap': '00'*20}]:
+            with self.assertRaises(ValueError):
+                module.validate_filecaps(invalid)
+        builder = (ROOT/'scripts/build-containers-payload.sh').read_text()
+        self.assertIn('SCHILY.xattr.security.capability', builder)
+        self.assertIn('scripts/install-container-filecaps.py', ROOTFS_INPUT_FILES)
+        self.assertIn('install-container-filecaps.py', (ROOT/'scripts/build-rootfs.sh').read_text())
+
     def test_rootless_guest_setup_keeps_real_identity_and_offline_overlay(self):
         script = (ROOT/'tests/guest/container-podman.sh').read_text()
         helper = (ROOT/'tests/guest/tools/container-rootless-run.c').read_text()

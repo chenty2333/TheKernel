@@ -256,3 +256,7 @@ The separate BusyBox OCI root retains its dynamic loader; the offline Alpine
 image is constructed from the already pinned minirootfs release, with only the
 content digests required by the image format, not an extra provenance archive.
 The original Apache-2.0 builder/tests never replace baseline init or accounts.
+
+The container image restores shadow-subids' original signed-package binary
+file-capability attributes inside its offline ext4 image. The host staging tree
+is not made privileged, and the original helper binaries remain unmodified.

@@ -75,10 +75,10 @@ env -u LD_PRELOAD -u LD_LIBRARY_PATH "$ROOT/lib/ld-musl-x86_64.so.1" \
     --root "$ROOT" --keys-dir "$ROOT/etc/apk/keys" \
     --repositories-file "$ROOT/etc/apk/repositories" \
     --cache-dir "$CACHE/containers-apks" --no-scripts --no-chown add "${PINS[@]}" "${EXACT_APKS[@]}"
-python3 - "$ROOT" "$WORK/stage" "$REPO_ROOT/config/containers-apks.lock" "$ARCHIVE" <<'PY'
+python3 - "$ROOT" "$WORK/stage" "$REPO_ROOT/config/containers-apks.lock" "$ARCHIVE" "$CACHE/containers-apks" <<'PY'
 import gzip, hashlib, io, json, os, shutil, sys, tarfile
 from pathlib import Path
-root, out, lock, archive = map(Path, sys.argv[1:])
+root, out, lock, archive, apk_cache = map(Path, sys.argv[1:])
 expected = dict(line.split('#', 1)[0].strip().split('=', 1)
                 for line in lock.read_text().splitlines() if line.split('#', 1)[0].strip())
 actual = {}
@@ -122,6 +122,23 @@ for program in programs:
         dest.chmod(0o755)
     else:
         shutil.copy2(source, bin_dir/program)
+# Unprivileged staging cannot install security.capability on host files.
+# Preserve the signed package's exact binary xattrs for offline image insertion.
+package_stem = 'shadow-subids-' + expected['shadow-subids']
+packages = list(apk_cache.glob(package_stem + '.*.apk'))
+if (apk_cache/(package_stem + '.apk')).is_file():
+    packages.append(apk_cache/(package_stem + '.apk'))
+if len(packages) != 1:
+    raise SystemExit('ambiguous or absent authenticated subordinate-ID package')
+filecaps = {}
+with tarfile.open(packages[0]) as package:
+    for name in ['newuidmap', 'newgidmap']:
+        member = package.getmember('usr/bin/' + name)
+        value = member.pax_headers.get('SCHILY.xattr.security.capability')
+        if value is None:
+            raise SystemExit('signed subordinate-ID helper lacks file capabilities')
+        filecaps['/opt/thekernel-tools/bin/' + name] = value.encode('utf-8', 'surrogateescape').hex()
+(out/'opt/thekernel-tools/file-capabilities.json').write_text(json.dumps(filecaps, sort_keys=True) + '\n')
 shutil.copy2(lock, out/'opt/thekernel-tools/MANIFEST')
 shutil.copy2(Path(os.environ['REPO_ROOT'])/'tests/guest/container-bwrap.sh', out/'opt/thekernel-containers-bwrap.sh')
 shutil.copy2(Path(os.environ['REPO_ROOT'])/'tests/guest/container-crun.sh', out/'opt/thekernel-containers-crun.sh')
