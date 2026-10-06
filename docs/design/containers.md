@@ -586,3 +586,22 @@ span while the randomized interpreter hint can lie inside that main image;
 next fix image placement, rather than attributing exec failure to privilege.
 V1 tasks/thread-granular membership and fully pinned multi-read PID views are
 not established by this process-directed regression.
+
+### Whole interpreter envelope placement for large PIEs
+
+The main executable is now mapped before selecting an interpreter gap. The
+chooser uses actual PT_LOAD memory extents (including bss/gaps/nonzero origin),
+power-of-two alignment and checked arithmetic, then reserves a whole free
+span below the reserved heap. It also validates the returned interval against
+that boundary. No guessed executable-size ceiling, dropped bss, fixed larger
+address or privilege-specific ELF rule was added. ET_EXEC interpreter mapping
+keeps its fixed-address semantics; entry/AT_BASE use the actual mapped bias.
+
+Validated: kernel2646 host tests (envelope/align/overflow/heap-boundary failure),
+lint784, KVM system70/70 (`system-mkhr1ly5`), selected memfd-create/mount-api12/259
+(`abi-_s0249vq`). Actual signed podman5.8.8 now starts from real UID1000 and
+initializes its SQLite/overlay/crun configuration (`shell-fjripkcl`), rather
+than exec EEXIST. It next fails its real CLONE_NEWUSER|CLONE_NEWNS reexec with
+EBUSY; no offline image load or OCI hello acceptance is claimed yet. The
+initial host fixture used the wrong xmas-elf p_type constructor; repaired,
+not counted as passing. Next inspect that observed fork admission.

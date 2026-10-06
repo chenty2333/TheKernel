@@ -8,6 +8,7 @@ mod io;
 pub(crate) mod ldt;
 mod loader;
 mod elf_bounds;
+mod elf_placement;
 mod mapping_finalizer;
 mod pressure;
 mod remap;

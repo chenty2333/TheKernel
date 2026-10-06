@@ -4562,7 +4562,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate ABI arguments and user memory before committing child publication or replacement image"]
 usercopy = ["usercopy:copy supplied task ABI pointers with checked user-memory access"]
-state = ["state:replace image, reset registers and TLS, close CLOEXEC descriptors and apply exec credential transition", "state:publish main ELF initialized PT_LOAD code/data bounds, excluding dynamic linker and trampoline VMAs; preflight reads coherent cached contents including anonymous shmem; executable Location is retained across exec/fork and exposed as the genuine proc exe magic-link target"]
+state = ["state:main PT_LOAD regions precede placement of a complete aligned ET_DYN interpreter envelope in an actual free gap below the reserved heap; AT_BASE and entry use the selected load bias, so large PIE/bss cannot collide with a linker hint", "state:replace image, reset registers and TLS, close CLOEXEC descriptors and apply exec credential transition", "state:publish main ELF initialized PT_LOAD code/data bounds, excluding dynamic linker and trampoline VMAs; preflight reads coherent cached contents including anonymous shmem; executable Location is retained across exec/fork and exposed as the genuine proc exe magic-link target"]
 concurrency = ["concurrency:task and address-space ownership gates serialize publication and image replacement"]
 teardown = ["teardown:failed preparation releases staged resources; successful exit or exec releases prior ownership"]
 
@@ -4573,7 +4573,7 @@ status = "implemented"
 contract = "linux-execve"
 handler = "kernel/src/syscall/task/execve.rs:sys_execve"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec", "kernel/src/pseudofs/proc_exe.rs:executable_link_marks_unlinked_inode_without_changing_display_name", "tests/guest/portable/mount-api-differential.c:main"]
+tests = ["kernel/src/mm/elf_placement.rs:envelope_accounts_bss_gaps_and_nonzero_origin_without_bias_misalignment", "kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec", "kernel/src/pseudofs/proc_exe.rs:executable_link_marks_unlinked_inode_without_changing_display_name", "tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 
@@ -4585,7 +4585,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate ABI arguments and user memory before committing child publication or replacement image"]
 usercopy = ["usercopy:copy supplied task ABI pointers with checked user-memory access"]
-state = ["state:resolve image through dirfd or empty-path descriptor including readonly detached mount roots with retained idmaps, then commit the replacement image", "state:publish main ELF initialized PT_LOAD code/data bounds, excluding dynamic linker and trampoline VMAs; preflight reads coherent cached contents including anonymous shmem; executable Location is retained across exec/fork and exposed as the genuine proc exe magic-link target"]
+state = ["state:main PT_LOAD regions precede placement of a complete aligned ET_DYN interpreter envelope in an actual free gap below the reserved heap; AT_BASE and entry use the selected load bias, so large PIE/bss cannot collide with a linker hint", "state:resolve image through dirfd or empty-path descriptor including readonly detached mount roots with retained idmaps, then commit the replacement image", "state:publish main ELF initialized PT_LOAD code/data bounds, excluding dynamic linker and trampoline VMAs; preflight reads coherent cached contents including anonymous shmem; executable Location is retained across exec/fork and exposed as the genuine proc exe magic-link target"]
 concurrency = ["concurrency:task and address-space ownership gates serialize publication and image replacement"]
 teardown = ["teardown:failed preparation releases staged resources; successful exit or exec releases prior ownership"]
 
@@ -4596,7 +4596,7 @@ status = "implemented"
 contract = "linux-execveat"
 handler = "kernel/src/syscall/task/execve.rs:sys_execveat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec", "kernel/src/pseudofs/proc_exe.rs:executable_link_marks_unlinked_inode_without_changing_display_name", "tests/guest/portable/mount-api-differential.c:main"]
+tests = ["kernel/src/mm/elf_placement.rs:envelope_accounts_bss_gaps_and_nonzero_origin_without_bias_misalignment", "kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec", "kernel/src/pseudofs/proc_exe.rs:executable_link_marks_unlinked_inode_without_changing_display_name", "tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 

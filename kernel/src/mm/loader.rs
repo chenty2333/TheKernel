@@ -1049,13 +1049,22 @@ fn map_prepared_user_app(
 ) -> AxResult<()> {
     uspace.clear()?;
     map_trampoline(uspace)?;
-    let dynamic_linker = if let Some(ldso) = prepared.dynamic_linker.as_ref() {
-        let ldso = map_elf(uspace, layout.interp_base, ldso)?;
-        Some((ldso.base(), ldso.entry()))
-    } else {
-        None
-    };
+    // Publish main PT_LOAD regions before choosing a free interpreter span.
+    // A large PIE's bss may cover the randomized linker hint; it is not an
+    // invalid ELF or a pathname/privilege failure.
     let elf = map_elf(uspace, layout.elf_base, &prepared.executable)?;
+    let dynamic_linker = if let Some(ldso) = prepared.dynamic_linker.as_ref() {
+        let headers = ldso.borrow_elf();
+        let base = if headers.header.pt2.type_().as_type() == xmas_elf::header::Type::SharedObject {
+            let envelope = super::elf_placement::ImageEnvelope::from_headers(&headers.ph)?;
+            let limit = memory_addr::VirtAddrRange::new(
+                VirtAddr::from_usize(USER_SPACE_BASE), VirtAddr::from_usize(layout.heap_base));
+            envelope.place(layout.interp_base, limit,
+                |hint, size, limit, align| uspace.find_free_area(hint, size, limit, align))?
+        } else { layout.interp_base };
+        let ldso = map_elf(uspace, base, ldso)?;
+        Some((ldso.base(), ldso.entry()))
+    } else { None };
     let mut elf_bounds = super::ElfBounds::default();
     for ph in elf.headers().ph.iter().filter(|ph| ph.get_type() == Ok(xmas_elf::program::Type::Load)) {
         let start = usize::try_from(ph.virtual_addr).ok()
