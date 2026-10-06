@@ -14,7 +14,7 @@ use core::{
 use axallocator::{AllocResult, BaseAllocator, BitmapPageAllocator, ByteAllocator, PageAllocator};
 use kspin::SpinNoIrq;
 
-use super::{UsageKind, Usages};
+use super::{UsageKind, Usages, PageAccountingHooks, page_accounting::AccountingSlot};
 
 /// The global allocator instance for standard mode.
 #[cfg_attr(all(target_os = "none", not(test)), global_allocator)]
@@ -47,6 +47,7 @@ pub struct GlobalAllocator {
     #[cfg(not(feature = "level-1"))]
     palloc: SpinNoIrq<BitmapPageAllocator<PAGE_SIZE>>,
     usages: SpinNoIrq<Usages>,
+    accounting: AccountingSlot,
 }
 
 impl Default for GlobalAllocator {
@@ -63,7 +64,37 @@ impl GlobalAllocator {
             #[cfg(not(feature = "level-1"))]
             palloc: SpinNoIrq::new(BitmapPageAllocator::new()),
             usages: SpinNoIrq::new(Usages::new()),
+            accounting: AccountingSlot::new(),
         }
+    }
+
+    /// Installs immutable lifetime hooks before userspace allocations start.
+    /// The policy lives above this generic allocator; it may deny a physical
+    /// reservation without publishing a frame or consuming allocator usage.
+    pub fn install_page_accounting(&self, hooks: &'static PageAccountingHooks) -> bool {
+        self.accounting.install(hooks)
+    }
+
+    fn finish_page_allocation(&self, addr: usize, num_pages: usize, kind: UsageKind) -> AllocResult<usize> {
+        if !self.accounting.admit(addr, num_pages, kind) {
+            self.return_raw_pages(addr, num_pages);
+            return Err(axallocator::AllocError::NoMemory);
+        }
+        if cfg!(feature = "level-1") || !matches!(kind, UsageKind::RustHeap) {
+            self.usages.lock().alloc(kind, num_pages * PAGE_SIZE);
+        }
+        Ok(addr)
+    }
+
+    fn return_raw_pages(&self, pos: usize, num_pages: usize) {
+        #[cfg(feature = "level-1")]
+        {
+            let layout = Layout::from_size_align(num_pages * PAGE_SIZE, PAGE_SIZE).unwrap();
+            let ptr = NonNull::new(pos as *mut u8).unwrap();
+            self.balloc.lock().dealloc(ptr, layout);
+        }
+        #[cfg(not(feature = "level-1"))]
+        self.palloc.lock().dealloc_pages(pos, num_pages);
     }
 
     /// Returns the name of the allocator.
@@ -213,22 +244,13 @@ impl GlobalAllocator {
         kind: UsageKind,
     ) -> AllocResult<usize> {
         #[cfg(feature = "level-1")]
-        {
-            // single-level allocator: allocate from the byte allocator.
-            let mut balloc = self.balloc.lock();
+        let addr = {
             let layout = Layout::from_size_align(num_pages * PAGE_SIZE, align_pow2).unwrap();
-            let ptr = balloc.alloc(layout)?;
-            self.usages.lock().alloc(kind, num_pages * PAGE_SIZE);
-            Ok(ptr.as_ptr() as usize)
-        }
+            self.balloc.lock().alloc(layout)?.as_ptr() as usize
+        };
         #[cfg(not(feature = "level-1"))]
-        {
-            let addr = self.palloc.lock().alloc_pages(num_pages, align_pow2)?;
-            if !matches!(kind, UsageKind::RustHeap) {
-                self.usages.lock().alloc(kind, num_pages * PAGE_SIZE);
-            }
-            Ok(addr)
-        }
+        let addr = self.palloc.lock().alloc_pages(num_pages, align_pow2)?;
+        self.finish_page_allocation(addr, num_pages, kind)
     }
 
     /// Allocates contiguous pages starting from the given address.
@@ -256,10 +278,7 @@ impl GlobalAllocator {
                 .palloc
                 .lock()
                 .alloc_pages_at(start, num_pages, align_pow2)?;
-            if !matches!(kind, UsageKind::RustHeap) {
-                self.usages.lock().alloc(kind, num_pages * PAGE_SIZE);
-            }
-            Ok(addr)
+            self.finish_page_allocation(addr, num_pages, kind)
         }
     }
 
@@ -280,17 +299,9 @@ impl GlobalAllocator {
     /// should be the same as the one used in [`alloc_pages`]. Otherwise, the
     /// behavior is undefined.
     pub fn dealloc_pages(&self, pos: usize, num_pages: usize, kind: UsageKind) {
+        self.accounting.retire(pos, num_pages, kind);
         self.usages.lock().dealloc(kind, num_pages * PAGE_SIZE);
-        #[cfg(feature = "level-1")]
-        {
-            // single-level allocator: deallocate to the byte allocator.
-            let mut balloc = self.balloc.lock();
-            let layout = Layout::from_size_align(num_pages * PAGE_SIZE, PAGE_SIZE).unwrap();
-            let ptr = NonNull::new(pos as *mut u8).unwrap();
-            balloc.dealloc(ptr, layout);
-        }
-        #[cfg(not(feature = "level-1"))]
-        self.palloc.lock().dealloc_pages(pos, num_pages);
+        self.return_raw_pages(pos, num_pages);
     }
 
     /// Returns the number of allocated bytes in the byte allocator.
@@ -429,5 +440,52 @@ unsafe impl GlobalAlloc for GlobalAllocator {
 
         #[cfg(not(feature = "tracking"))]
         inner();
+    }
+}
+
+#[cfg(all(test, not(feature = "level-1")))]
+mod accounting_tests {
+    extern crate std;
+    use super::*;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    static FAIL: AtomicBool = AtomicBool::new(false);
+    static CHARGED: AtomicUsize = AtomicUsize::new(0);
+    static HOOKS: PageAccountingHooks = PageAccountingHooks {
+        allocated: |_, pages, _| {
+            if FAIL.load(Ordering::Relaxed) { return false; }
+            CHARGED.fetch_add(pages, Ordering::Relaxed); true
+        },
+        deallocated: |_, pages, _| { CHARGED.fetch_sub(pages, Ordering::Relaxed); },
+    };
+    #[test]
+    fn physical_lifetime_admission_refunds_rejection_and_final_frame_return() {
+        let layout = Layout::from_size_align(1024 * 1024, 1 << 30).unwrap();
+        // SAFETY: the aligned test region stays alive until the allocator and
+        // all allocations are dropped; it is freed with its original layout.
+        let region = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!region.is_null());
+        let allocator = GlobalAllocator::new();
+        allocator.init(region as usize, layout.size());
+        assert!(allocator.install_page_accounting(&HOOKS));
+        assert!(!allocator.install_page_accounting(&HOOKS));
+        let available = allocator.available_pages();
+        let addr = allocator.alloc_pages(2, PAGE_SIZE, UsageKind::VirtMem).unwrap();
+        assert_eq!(CHARGED.load(Ordering::Relaxed), 2);
+        allocator.dealloc_pages(addr, 2, UsageKind::VirtMem);
+        assert_eq!(CHARGED.load(Ordering::Relaxed), 0);
+        assert_eq!(allocator.available_pages(), available);
+        FAIL.store(true, Ordering::Relaxed);
+        assert!(allocator.alloc_pages(2, PAGE_SIZE, UsageKind::VirtMem).is_err());
+        assert_eq!(allocator.available_pages(), available);
+        assert_eq!(allocator.usages().get(UsageKind::VirtMem), 0);
+        FAIL.store(false, Ordering::Relaxed);
+        let addr = allocator.alloc_pages(1, PAGE_SIZE, UsageKind::PageCache).unwrap();
+        assert_eq!(CHARGED.load(Ordering::Relaxed), 1);
+        allocator.dealloc_pages(addr, 1, UsageKind::PageCache);
+        let addr = allocator.alloc_pages(1, PAGE_SIZE, UsageKind::Global).unwrap();
+        assert_eq!(CHARGED.load(Ordering::Relaxed), 0);
+        allocator.dealloc_pages(addr, 1, UsageKind::Global);
+        drop(allocator);
+        unsafe { std::alloc::dealloc(region, layout); }
     }
 }

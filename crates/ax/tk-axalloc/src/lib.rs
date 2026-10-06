@@ -18,6 +18,8 @@ use strum::{IntoStaticStr, VariantArray};
 const PAGE_SIZE: usize = 0x1000;
 
 mod page;
+mod page_accounting;
+pub use page_accounting::PageAccountingHooks;
 pub use page::GlobalPage;
 
 /// Tracking of memory usage, enabled with the `tracking` feature.

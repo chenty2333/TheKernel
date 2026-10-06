@@ -498,3 +498,22 @@ The first script exit1 is not counted as passed. Memory charge/OOM remains
 unimplemented/unadvertised, so Level3 as a whole is still incomplete and
 podman has not been attempted. This pids test covers fork, not all thread
 accounting combinations.
+
+### Physical allocation lifetime admission boundary
+
+The generic page allocator now has one optional, immutable accounting-hook
+slot for VirtMem/PageCache reservations. Admission happens after physical
+reservation and outside allocator locks, before frame/usage publication. A
+denial returns that exact allocation and reports NoMemory; final physical
+return invokes retirement once. VMA removal, fork aliases and deferred pins do
+not falsely refund pages which still have a physical owner. Heap/DMA/global
+allocations are not intercepted, avoiding recursive metadata admission.
+
+Validated: axalloc host1 exercises actual aligned allocator storage, accepted
+anonymous/cache frames, exact rejection rollback, unchanged allocator usage,
+final refunds and excluded Global pages; lint and KVM system70/70
+(`system-7pot597d`). The first host fixture violated the existing bitmap's
+1GiB base alignment requirement; corrected its storage alignment, not the
+allocator's capacity assertions. No kernel policy hooks are installed yet,
+so this is the independently validated ownership boundary, not memory.max or
+OOM acceptance. Next connect cgroup hierarchy budgets to these real lifetimes.
