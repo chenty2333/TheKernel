@@ -19,6 +19,7 @@ source_only=0
 check_only=0
 host_deps_dir=${THEKERNEL_GRAPHICS_HOST_DEPS_DIR:-}
 tmpdir=${THEKERNEL_GRAPHICS_TMPDIR:-}
+mesa_iris_stage=${THEKERNEL_MESA_IRIS_STAGE:-}
 fault=
 
 # The flavor manifest is the single source of truth shared with the Python
@@ -38,6 +39,7 @@ Options:
   --source-only         download package sources, do not build
   --host-deps-dir DIR   optional task-local Perl dependency prefix
   --tmpdir DIR          Buildroot temporary directory (defaults below --output)
+  --mesa-iris-stage DIR target-built Mesa 26.1.2 stage (n305-iris-smoke only)
   --fault NAME          inject one graphics fault action into a benchmark rootfs
   --check               validate this wrapper and checked-in configurations only
 
@@ -55,6 +57,7 @@ while (($#)); do
         --source-only) source_only=1; shift ;;
         --host-deps-dir) host_deps_dir=${2:-}; shift 2 ;;
         --tmpdir) tmpdir=${2:-}; shift 2 ;;
+        --mesa-iris-stage) mesa_iris_stage=${2:-}; shift 2 ;;
         --fault) fault=${2:-}; shift 2 ;;
         --check) check_only=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -87,6 +90,40 @@ flavor_session=$(flavor_field SESSION)
 flavor_backend=$(flavor_field BACKEND)
 fragment=$REPO_ROOT/config/graphics/$flavor.fragment
 
+case "$flavor" in
+    n305-iris-smoke)
+        if [ -n "$mesa_iris_stage" ]; then
+            mesa_iris_stage_input=$mesa_iris_stage
+            mesa_iris_stage=$(realpath -e "$mesa_iris_stage_input") || {
+                printf 'Mesa iris stage does not exist: %s\n' "$mesa_iris_stage_input" >&2
+                exit 1
+            }
+            iris_gallium=$mesa_iris_stage/usr/lib/libgallium-26.1.2.so
+            [ -r "$iris_gallium" ] || {
+                printf 'target Mesa iris library missing from stage: %s\n' "$iris_gallium" >&2
+                exit 1
+            }
+            command -v readelf >/dev/null || { printf '%s\n' 'readelf is required to validate the Mesa iris stage' >&2; exit 1; }
+            readelf -h "$iris_gallium" | grep -q 'Class:.*ELF64'
+            readelf -h "$iris_gallium" | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+            readelf -d "$iris_gallium" | grep -q 'SONAME.*libgallium-26\.1\.2\.so'
+            grep -aFq 'iris_driver_descriptor' "$iris_gallium" || {
+                printf 'staged libgallium does not contain the Mesa iris driver: %s\n' "$iris_gallium" >&2
+                exit 1
+            }
+        elif [ "$check_only" -ne 1 ]; then
+            printf '%s\n' '--mesa-iris-stage is required for n305-iris-smoke builds' >&2
+            exit 2
+        fi
+        ;;
+    *)
+        [ -z "$mesa_iris_stage" ] || {
+            printf '%s\n' '--mesa-iris-stage is only valid for n305-iris-smoke' >&2
+            exit 2
+        }
+        ;;
+esac
+
 # build-guest-tools.sh glob-discovers its probe sources; the wrapper derives
 # the installed guest names with the same device-lease-probe rename rule.
 graphics_probe_names() {
@@ -113,6 +150,21 @@ fi
 # resolved Buildroot .config; one table feeds both validation phases.
 flavor_br2_contract() {
     case "$1" in
+        n305-iris-smoke)
+            printf '%s\n' \
+                'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' \
+                'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' \
+                'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' \
+                'BR2_PACKAGE_VULKAN_LOADER=y' \
+                'BR2_PACKAGE_VULKAN_TOOLS=y' \
+                'BR2_PACKAGE_PIGLIT=y' \
+                'BR2_PACKAGE_XORG7=y' \
+                'BR2_PACKAGE_LIBEPOXY=y' \
+                'BR2_PACKAGE_WESTON_SHELL_DESKTOP=y' \
+                'BR2_PACKAGE_WESTON_XWAYLAND=y' \
+                'BR2_PACKAGE_FOOT=y' \
+                'BR2_TARGET_ROOTFS_EXT2_SIZE="3G"'
+            ;;
         q35-software-desktop)
             printf '%s\n' \
                 '# BR2_TARGET_GENERIC_GETTY is not set' \
@@ -205,11 +257,106 @@ require_br2_contract() {
     done
 }
 
+validate_n305_iris_checked_in() {
+    local script=$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/init.d/S90n305-iris-smoke
+    for path in \
+        "$fragment" \
+        "$REPO_ROOT/config/graphics/build-guest-tools.sh" \
+        "$REPO_ROOT/tests/guest/graphics/intel-mesa-smoke.c" \
+        "$script" \
+        "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/thekernel-graphics-flavor" \
+        "$REPO_ROOT/config/graphics/overlay/common/etc/weston/weston-headless.ini"; do
+        [ -r "$path" ] || { printf 'missing N305 iris graphics input: %s\n' "$path" >&2; return 1; }
+    done
+    [ -x "$REPO_ROOT/config/graphics/build-guest-tools.sh" ]
+    [ -x "$script" ]
+    [ -L "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/weston/weston.ini" ]
+    [ "$(readlink "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/weston/weston.ini")" = weston-headless.ini ]
+    grep -qx n305-iris-smoke "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/thekernel-graphics-flavor"
+    grep -qx 'BR2_ROOTFS_OVERLAY="@REPO_ROOT@/config/graphics/overlay/common @REPO_ROOT@/config/graphics/overlay/q35-software-desktop @REPO_ROOT@/config/graphics/overlay/q35-graphics-seatd @REPO_ROOT@/config/graphics/overlay/n305-iris-smoke"' "$fragment"
+    grep -qx 'BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-client.sh @REPO_ROOT@/config/graphics/build-q35-wayland-vulkan-client.sh"' "$fragment"
+    grep -qx 'BR2_PACKAGE_WESTON_DEFAULT_DRM=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_WESTON_HEADLESS=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_WESTON_SHELL_DESKTOP=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_MESA3D=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_EGL=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_ES=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_VULKAN_TOOLS=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_PIGLIT=y' "$fragment"
+    grep -Fq 'readlink -f /usr/lib/libgallium-26.1.2.so' "$script"
+    grep -Fq '/usr/lib64/libgallium-26.1.2.so' "$script"
+    grep -Fq 'LD_BIND_NOW=1 MESA_LOADER_DRIVER_OVERRIDE=iris' "$script"
+    grep -Fq 'echo "$marker"' "$script"
+    grep -Fq "grep -qx n305-iris-smoke /etc/thekernel-graphics-flavor && exit 0" \
+        "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
+    grep -Fq "n305-iris-smoke" "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
+    sh -n "$script"
+}
+
+validate_n305_iris_build_output() {
+    local target=$output/target resolved=$output/.config
+    local loader=$output/target/lib/ld-linux-x86-64.so.2
+    local client=/usr/local/bin/intel-mesa-smoke
+    local gallium=/usr/lib/libgallium-26.1.2.so
+    local client_deps backend_deps
+    [ -r "$resolved" ]
+    grep -qx 'BR2_PACKAGE_WESTON_DEFAULT_DRM=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_WESTON_HEADLESS=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_MESA3D=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_EGL=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_ES=y' "$resolved"
+    [ -x "$target/usr/local/bin/intel-mesa-smoke" ]
+    [ -f "$target$gallium" ]
+    grep -aFq 'iris_driver_descriptor' "$target$gallium" || {
+        printf '%s\n' 'final target libgallium does not contain Mesa iris' >&2
+        return 1
+    }
+    [ -e "$target/usr/lib/libEGL.so.1" ]
+    [ -e "$target/usr/lib/libGLESv2.so.2" ]
+    [ -e "$target/usr/lib/libgbm.so.1" ]
+    [ -e "$target/usr/lib/gbm/dri_gbm.so" ]
+    [ -x "$loader" ]
+    client_deps=$("$loader" --library-path "$target/usr/lib:$target/lib" --list "$target$client")
+    printf '%s\n' "$client_deps" | grep -Fq "libgallium-26.1.2.so => $target$gallium" || {
+        printf '%s\n' 'target Mesa client does not resolve the staged iris libgallium' >&2
+        printf '%s\n' "$client_deps" >&2
+        return 1
+    }
+    ! printf '%s\n' "$client_deps" | grep -q 'not found'
+    backend_deps=$("$loader" --library-path "$target/usr/lib:$target/lib" --list "$target/usr/lib/gbm/dri_gbm.so")
+    printf '%s\n' "$backend_deps" | grep -Fq "libgallium-26.1.2.so => $target$gallium" || {
+        printf '%s\n' 'target GBM backend does not resolve the staged iris libgallium' >&2
+        printf '%s\n' "$backend_deps" >&2
+        return 1
+    }
+    ! printf '%s\n' "$backend_deps" | grep -q 'not found'
+    local rootfs_image=$output/images/rootfs.ext2
+    [ -r "$rootfs_image" ] || { printf 'generated N305 iris rootfs image missing: %s\n' "$rootfs_image" >&2; return 1; }
+    local debugfs=$output/host/sbin/debugfs
+    [ -x "$debugfs" ] || debugfs=$(command -v debugfs || true)
+    [ -n "$debugfs" ] || { printf '%s\n' 'debugfs is required to validate the N305 iris image' >&2; return 1; }
+    "$debugfs" -R "stat $gallium" "$rootfs_image" 2>/dev/null | grep -q 'Inode:' || {
+        printf '%s\n' 'N305 iris rootfs image is missing the staged libgallium' >&2
+        return 1
+    }
+    printf '%s\n' 'N305 iris target loader and rootfs payload: OK'
+}
+
 validate_checked_in() {
     [ -r "$BUSYBOX_FRAGMENT" ] || { printf 'missing BusyBox config fragment: %s\n' "$BUSYBOX_FRAGMENT" >&2; return 1; }
     grep -qx 'CONFIG_STAT=y' "$BUSYBOX_FRAGMENT"
     grep -qx 'CONFIG_FEATURE_STAT_FORMAT=y' "$BUSYBOX_FRAGMENT"
     grep -qx 'BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="@REPO_ROOT@/config/graphics/busybox.fragment"' "$COMMON"
+    if [ "$flavor" = n305-iris-smoke ]; then
+        validate_n305_iris_checked_in
+        return
+    fi
     if [ "$flavor_session" = logind ]; then
         validate_logind_checked_in
         return
@@ -518,6 +665,22 @@ validate_build_output() {
             validate_mesa_gallium_output "$target"
             find "$target/usr" -type f -name 'virtio_icd*.json' -print -quit | grep -q .
             ;;
+        n305-iris-smoke)
+            grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
+            flavor_br2_contract "$flavor" | require_br2_contract "$resolved"
+            [ -x "$target/etc/init.d/S90n305-iris-smoke" ]
+            [ -x "$target/etc/init.d/S90q35-weston-smoke" ]
+            [ -x "$target/usr/local/bin/q35-wayland-color-client" ]
+            [ -x "$target/usr/local/bin/q35-wayland-vulkan-client" ]
+            [ -x "$target/usr/local/bin/q35-piglit-quick" ]
+            [ -x "$target/usr/local/bin/q35-piglit-result-check" ]
+            [ -x "$target/usr/bin/piglit" ]
+            [ -r "$target/usr/lib/piglit/tests/quick.meta.xml" ]
+            [ -x "$target/usr/bin/vulkaninfo" ]
+            validate_mesa_gallium_output "$target"
+            find "$target/usr" -type f -name 'virtio_icd*.json' -print -quit | grep -q .
+            validate_n305_iris_build_output
+            ;;
         q35-graphics-benchmark)
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
             flavor_br2_contract "$flavor" | require_br2_contract "$resolved"
@@ -642,6 +805,14 @@ for overlay_tree in "$REPO_ROOT"/config/graphics/overlay/*/; do
     cp -a "$overlay_tree" "$staged_overlay/$tree_name"
 done
 find "$staged_overlay" -type d -name __pycache__ -prune -exec rm -rf {} +
+if [ "$flavor" = n305-iris-smoke ]; then
+    # The staged DSO was built for this exact Buildroot 2026.05.2 target ABI.
+    # Its ELF soname is what the Buildroot EGL/GLES/GBM clients request; the
+    # /usr/lib location also matches the rootfs loader and GBM backend.
+    install -D -m 0644 \
+        "$mesa_iris_stage/usr/lib/libgallium-26.1.2.so" \
+        "$staged_overlay/$flavor_overlay/usr/lib/libgallium-26.1.2.so"
+fi
 generated_config=$output/.thekernel-graphics.config
 sed -e "s|@REPO_ROOT@/config/graphics/overlay|$staged_overlay|g" -e "s|@REPO_ROOT@|$REPO_ROOT|g" "$COMMON" >"$generated_config"
 sed -e "s|@REPO_ROOT@/config/graphics/overlay|$staged_overlay|g" -e "s|@REPO_ROOT@|$REPO_ROOT|g" "$fragment" >>"$generated_config"

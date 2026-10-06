@@ -807,6 +807,7 @@ class SystemTestGateTests(unittest.TestCase):
         flavors = product.graphics_flavors()
         self.assertEqual(flavors, (
             "headless-abi-smoke",
+            "n305-iris-smoke",
             "q35-graphics-seatd",
             "q35-software-desktop",
             "q35-graphics-benchmark",
@@ -815,6 +816,7 @@ class SystemTestGateTests(unittest.TestCase):
         ))
         self.assertEqual(product.graphics_smoke_flavors(), (
             "headless-abi-smoke",
+            "n305-iris-smoke",
             "q35-graphics-seatd",
             "q35-graphics-logind",
         ))

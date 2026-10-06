@@ -217,5 +217,5 @@ current combined Intel display+GT inventory101/80. CI baseline reconciled.
 TC signal programming addition: tc.rs retains the MIT
 intel_ddi.c::tgl_dkl_phy_set_signal_levels/intel_ddi_level, HDMI DKL table
 from intel_ddi_buf_trans.c and known Wa_16011342517 selection. Copyright
-©2012/2019/2020 Intel, full grant in LICENSE-MIT. Runtime uses verified VBT5
+©2012/2020/2023 Intel, full grant in LICENSE-MIT. Runtime uses verified VBT5
 before buffer enable; complete PHY before-image remains the rollback source.

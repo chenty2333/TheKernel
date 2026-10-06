@@ -150,3 +150,14 @@ HDA数字pin/converter、48kHz双声道可听波形，以及拔线/停止/模式
 先撤ELD再安全退休DMA。不能把模拟器analog播放或源C时序对照当HDMI声音。
 冷/unowned TC、不同sink、新CDCLK/WM策略及非目标格式仍明确拒绝；
 DMC/GuC保持可选，不是当前软件调用链前置。
+
+## 可用目标用户态镜像（2026-10-07；仅软件装载已验证）
+
+`wt-intel/graphics-n305-iris/images/rootfs.ext2` 包含同版目标构建 Mesa26.1.2
+iris 与既有 intel-mesa-smoke。通过 existing n305-iris-smoke flavor/runner
+在 TheKernel QEMU guest 验证实际库路径及 LD_BIND_NOW 全符号绑定；无参入口
+按预期拒绝，未打开任何 Intel GPU，也没有初始化/渲染成功标记。
+下次用户授权的 N305 验收先独立运行 --initialize，确认真实 Intel renderer，
+再 --execute 检查 GLSL三角形/内外像素；最小RCS、库装载与真实Mesa像素不可互代。
+镜像默认不启用硬件写入；未来启动仍需分别明确 intel.modeset=1、intel.gt=1、
+intel.rcs=1，不能增加 nvme.allow_write=1。默认Q35软件/virgl镜像保持原样。

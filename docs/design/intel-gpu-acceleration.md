@@ -378,3 +378,46 @@ waits. Its pinned, zero-allocation traversal admits bounded64MiB scanout
 backing with observed CLFLUSH/64-byte capability; execution BO admission stays
 16MiB. This prevents WB alias dirt from surviving a non-snooping plane arm.
 Physical cache/mapping correctness still requires the separate N305 acceptance.
+
+## Target iris image delivery (2026-10-07)
+
+`n305-iris-smoke` now uses the existing graphics Buildroot/runner workflow.
+The stage is a target cross-build, not a Fedora-host DSO: Buildroot2026.05.2
+GCC14.4/glibc2.43, the same Mesa26.1.2 and libdrm2.4.131. Final stage is
+`wt-intel/mesa-iris-stage-usr`, prefix `/usr`; Gallium contains
+iris/softpipe/virgl. Shared platform/GLX/EGL/GBM/GLES options match the existing
+Buildroot Mesa build. The earlier iris-only platform-disabled stage cannot be
+mixed with Buildroot EGL: actual guest immediate binding exposed missing
+`loader_dri3_get_buffers`, and that configuration was corrected, not stubbed.
+
+Buildroot's EGL/GBM/GLES and GBM module stay in place; only the same-version
+`/usr/lib/libgallium-26.1.2.so` is installed through the final native overlay.
+The ordinary Q35 images are unchanged. Rootfs image:
+`/home/ava/.cache/thekernel-targets/wt-intel/graphics-n305-iris/images/rootfs.ext2`.
+Use the existing wrapper with `--flavor n305-iris-smoke --mesa-iris-stage
+/home/ava/.cache/thekernel-targets/wt-intel/mesa-iris-stage-usr --output
+/home/ava/.cache/thekernel-targets/wt-intel/graphics-n305-iris --buildroot-dir
+/home/ava/.cache/thekernel-targets/wt-intel/buildroot-2026.05.2`. Keep its
+`--download-dir` and `--tmpdir` explicitly under the same Intel state directory;
+`--fetch-buildroot` obtains only the existing pinned source version if missing.
+Stage input is required; this parameter does not claim to rebuild Mesa source.
+
+Stage rebuild uses cached `source-cache/mesa-26.1.2`, the existing Buildroot
+`build/mesa3d-26.1.2/buildroot-build/cross-compilation.conf`, and its
+`build/mesa3d-26.1.2/meson-private/cmd_line.txt` platform options, adding iris.
+Same-source native `mesa_clc`/`vtn_bindgen2` and their task-local LLVM22 libraries
+remain the build tools; do not substitute a different Mesa/LLVM ABI. The only
+omitted recipe option is its ARM-only patched vc4-neon option, unused on x86_64.
+Reconfigure the existing `mesa-iris` build for `/usr`, build, and install with
+DESTDIR=`mesa-iris-stage-usr`. Existing readonly O/toolchain was reused via an
+owned reflink artifact, not modified or replaced.
+
+Measured final guest layer: target loader resolves both client and GBM module
+to the installed iris library; `/usr/lib64` is checked as the actual known
+alias of `/usr/lib`. `LD_BIND_NOW=1` successfully binds the real Mesa client,
+whose no-argument usage rejection exits2 before any DRM device is opened.
+Only then does the existing runner accept its exact loader-ready marker.
+This proves target ELF/symbol/loader integration, not Mesa device initialization
+or rendering. Earlier path-alias and missing-symbol runs failed and are not
+counted as passes. Future `--initialize` and `--execute` require an authorized
+real Intel node and remain distinct native acceptance items.

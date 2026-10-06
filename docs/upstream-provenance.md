@@ -882,7 +882,7 @@ this does not itself open general Mesa batches or establish GPU execution.
 - Powered TC HDMI signal programming: tc.rs ports Linux7.2.3 MIT
   intel_ddi.c::tgl_dkl_phy_set_signal_levels and intel_ddi_level with
   intel_ddi_buf_trans.c::_tgl_dkl_phy_trans_hdmi, selected ADL-P HDMI branch
-  (Intel2012/2019/2020; full grant in display LICENSE-MIT). N305 D0 matches
+  (Intel2012/2020/2023; full grant in display LICENSE-MIT). N305 D0 matches
   intel_display_wa.c Wa_16011342517 applicability. The literal source RMW
   set argument1 at594MHz is preserved, not reinterpreted as bit12. Native
   target clocks148500/297000 use the source0 branch and VBT level5.
@@ -896,3 +896,11 @@ this does not itself open general Mesa batches or establish GPU execution.
   GPL i915_irq.c master dispatcher is behavior-only, not copied. Hardware
   counter epochs adapt source intel_crtc_vblank_off/on behavior to existing
   KMS; no GPL DRM core body imported. No new firmware binary added.
+
+- Native iris payload: same cached Mesa26.1.2, Buildroot2026.05.2 GCC14.4 /
+  glibc2.43 / libdrm2.4.131 target cross-build. Common shared-DSO platform
+  options match the existing recipe; iris added without source version mixing.
+  Native flavor reuses existing Buildroot overlay and graphics runner. No
+  binary/source driver body imported into this repository; image and tools
+  remain task-owned build outputs. Guest immediate symbol binding is measured;
+  no physical GPU initialization/rendering or software fallback result claimed.

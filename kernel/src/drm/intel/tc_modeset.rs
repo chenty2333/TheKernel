@@ -3,7 +3,11 @@
 // intel_ddi_enable_transcoder_clock, intel_ddi_transcoder_func_reg_val_get,
 // intel_ddi_buf_enable/disable; intel_dpll_mgr.c: dkl_pll_write, mg_pll_enable/
 // disable; intel_display.c: intel_set_transcoder_timings and pipe enable;
-// skl_universal_plane.c: primary-plane arm. Copyright © 2006-2022 Intel.
+// skl_universal_plane.c: primary-plane arm. Original source copyrights:
+// Copyright © 2006-2007 Intel Corporation (intel_display.c).
+// Copyright © 2006-2016 Intel Corporation (intel_dpll_mgr.c).
+// Copyright © 2012 Intel Corporation (intel_ddi.c).
+// Copyright © 2020 Intel Corporation (skl_universal_plane.c).
 // MIT permission text: crates/ax/tk-intel-display/LICENSE-MIT.
 // ADL-P/N display13 legacy TC1/TC2 HDMI only; no Type-C cold exit/ownership
 // acquisition, DP, DSI, combo PHY, CDCLK/PCODE or unsupported workaround path.

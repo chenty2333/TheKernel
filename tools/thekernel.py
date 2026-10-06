@@ -1237,6 +1237,9 @@ class SmokeFlavor:
 SMOKE_FLAVORS = {
     # Pure boot smoke: the headless ABI guest has no pixel oracle.
     "headless-abi-smoke": SmokeFlavor(marker="THEKERNEL_GRAPHICS_ABI_SMOKE_READY"),
+    # Target Mesa payload smoke: resolves the explicitly selected iris DSO in
+    # a guest, but does not claim an Intel device or rendering result.
+    "n305-iris-smoke": SmokeFlavor(marker="THEKERNEL_N305_IRIS_MESA_LOADER_READY"),
     "q35-graphics-seatd": SmokeFlavor(
         marker="THEKERNEL_Q35_WESTON_READY",
         profile_markers={

@@ -415,7 +415,7 @@ HDMI HDA port/pin topology references Linux7.2.3
 sound/hda/codecs/hdmi/intelhdmi.c (GPL) as behavior only; the original HDA
 adapter remains Apache-2.0, with no GPL source body imported.
 
-The tc.rs signal-level port additionally retains MIT Intel2012/2019/2020
+The tc.rs signal-level port additionally retains MIT Intel2012/2020/2023
 source attribution for tgl_dkl_phy_set_signal_levels, intel_ddi_level and
 the HDMI DKL table; the full grant remains in the display crate.
 
@@ -423,3 +423,9 @@ The scoped display IRQ/MSI and hardware-counter epoch adapters are original
 MIT Rust using source mask/dispatch facts; GPL i915_irq.c and DRM core are
 behavior references only. Exact MIT display/hotplug function references are
 listed in irq.rs, with original retained-owner lifecycle over existing APIs.
+
+The optional n305-iris-smoke image overlays only target-built Mesa26.1.2
+libgallium from the existing same-version source/CLC/toolchain, retaining the
+Mesa/Buildroot package license obligations already registered above. No Mesa
+binary is committed. The dedicated flavor and loader check are original
+project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
