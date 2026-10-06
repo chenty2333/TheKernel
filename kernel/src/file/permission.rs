@@ -7,7 +7,7 @@ use axfs_ng_vfs::{
     path::{FinalComponent, FinalComponentKind},
 };
 use linux_raw_sys::general::{
-    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, R_OK, W_OK, X_OK,
+    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, CAP_SYS_CHROOT, R_OK, W_OK, X_OK,
 };
 use linux_vfs::{
     Access, ChmodRequest as LinuxChmodRequest, ChmodSetattrPlan as LinuxChmodSetattrPlan,
@@ -2358,6 +2358,17 @@ pub(crate) fn check_fchdir_permissions_with_security(
     ))
 }
 
+/// Chroot authority belongs to the frozen actor's own user namespace.
+pub(crate) fn check_chroot_capability_with_security(security: &VfsSecurityContext) -> AxResult {
+    if security.credentials().selected_capability(CAP_SYS_CHROOT)
+        && security.actor().has_effective_capability_in_own_user_ns(CAP_SYS_CHROOT)
+    {
+        Ok(())
+    } else {
+        Err(AxError::OperationNotPermitted)
+    }
+}
+
 /// Computes Linux `vfs_prepare_mode()` plus `inode_init_owner()` attributes
 /// for one named inode before the generic VFS publishes its name.
 ///
@@ -2825,6 +2836,19 @@ mod tests {
             !KernelDacCredentials::actor_bound(&child, &synthetic)
                 .has_capability(&(), DacCapability::Override)
         );
+    }
+
+    #[test]
+    fn chroot_uses_own_namespace_and_frozen_selected_capability() {
+        let root_ns = UserNamespace::try_new_root().unwrap();
+        let root = Cred::try_root(root_ns.clone()).unwrap();
+        let child_ns = root_ns.try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false).unwrap();
+        let child = Cred::try_with_user_namespace(&root, child_ns).unwrap();
+        let mut security = VfsSecurityContext::new(child);
+        assert!(!security.has_capability(CAP_SYS_CHROOT));
+        assert!(check_chroot_capability_with_security(&security).is_ok());
+        security.credentials = credentials(0, 0, &[], &[]);
+        assert_eq!(check_chroot_capability_with_security(&security), Err(AxError::OperationNotPermitted));
     }
 
     #[test]

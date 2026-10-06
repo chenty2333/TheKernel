@@ -4930,7 +4930,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve directory identity and permissions; create typed named nodes or serialize native directory records and update cursor"]
+state = ["state:resolve directory identity and permissions; create typed named nodes or serialize native directory records and update cursor", "state:chroot requires captured selected CAP_SYS_CHROOT with own-user-namespace authority after path/type/search checks; successful publication replaces the actual fs root"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -4941,7 +4941,7 @@ status = "implemented"
 contract = "linux-chroot"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_chroot"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "kernel/src/file/permission.rs:chroot_uses_own_namespace_and_frozen_selected_capability", "tests/guest/portable/stat-access-differential.c:mapped_inode_dac"]
 validation_gaps = ["Existing source/helper coverage does not establish the full chroot raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
 limitations = ["explicit-none"]
 

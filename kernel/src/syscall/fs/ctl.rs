@@ -982,9 +982,7 @@ pub fn sys_chroot<M: UserMemory + ?Sized>(
         return Err(AxError::NotADirectory);
     }
     check_search_permissions_with_security(&loc, &security)?;
-    if !security.has_capability(CAP_SYS_CHROOT) {
-        return Err(AxError::OperationNotPermitted);
-    }
+    crate::file::permission::check_chroot_capability_with_security(&security)?;
     fs.set_root_dir(loc)?;
     Ok(0)
 }

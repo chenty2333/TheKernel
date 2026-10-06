@@ -3,6 +3,8 @@
 #include <sched.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <linux/capability.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -84,6 +86,17 @@ static void mapped_inode_dac(void) {
             if (i == 0) check(mkdir(made, 0700) == 0, "mapped-inode-override");
             else ERROR(mkdir(made, 0700), EACCES, "unmapped-owner-denied");
         }
+        struct stat intended, observed;
+        check(stat(paths[0], &intended) == 0, "chroot-target-identity");
+        check(chroot(paths[0]) == 0 && chdir("/") == 0, "mapped-userns-chroot");
+        check(stat("/", &observed) == 0 && intended.st_ino == observed.st_ino &&
+              intended.st_dev == observed.st_dev, "chroot-actual-root-effect");
+        struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+        struct __user_cap_data_struct caps[2] = {{0}};
+        check(syscall(SYS_capget, &header, caps) == 0, "chroot-capget");
+        caps[CAP_SYS_CHROOT / 32].effective &= ~(1U << (CAP_SYS_CHROOT % 32));
+        check(syscall(SYS_capset, &header, caps) == 0, "drop-chroot-effective-cap");
+        ERROR(chroot("/"), EPERM, "no-chroot-cap-denied");
         _exit(0);
     }
     int status;
@@ -122,7 +135,8 @@ int main(void) {
     check(syscall(NR_FSTATAT, AT_FDCWD, "/", &result, AT_NO_AUTOMOUNT | 0x6000) == 0,
           "accepted-sync-flags");
     mark("NO_AUTOMOUNT_SYNC_FLAGS");
-    mapped_inode_dac(); mark("MAPPED_INODE_DAC_OVERRIDE"); done();
+    mapped_inode_dac(); mark("MAPPED_INODE_DAC_OVERRIDE");
+    mark("MAPPED_USERNS_CHROOT"); done();
 
     begin("statx.raw-differential");
     struct statx sx;

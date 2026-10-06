@@ -712,3 +712,24 @@ passed, including the positive and both mandatory unmapped-ID denials.
 Actual podman passes pivot-directory creation (`shell-te2rh1rc`) and now fails
 the extractor's fallback chroot with EPERM; image load/hello remains unaccepted.
 Next fix that specific own-user-namespace chroot capability gate.
+
+### Own-user-namespace chroot authority for extraction
+
+The real archive extractor falls back from pivot_root to chroot; the previous
+chroot gate required initial-namespace CAP_SYS_CHROOT. Linux7.2.3 fs/open.c uses
+own-user-namespace capability authority. The syscall still resolves the path,
+checks directory type/search permissions and only then checks the frozen
+selected CAP_SYS_CHROOT and ordered own-namespace security authority before
+publishing the actual fs root. No other capability, root-boundary or namespace
+admission check is relaxed.
+
+Host coverage verifies a child namespace's authority and a denied frozen
+selected-capability projection. The paired mapped-user child verifies the
+actual new root's device/inode identity, then drops effective CAP_SYS_CHROOT
+and requires EPERM on another chroot. Kernel2650, related Python7, lint784,
+KVM system70/70 (`system-nfw7e541`) and paired stat-access5/259
+(`abi-xvqft8gb`) passed. An initial ABI invocation used an unregistered program
+filter; only the correctly selected invocation counts. Actual podman now enters
+the extraction root and fails lchown of /etc/shadow with EPERM
+(`shell-kwctgnq0`); load/hello is still unaccepted. Next address the actual
+inode-scoped chown capability gate.
