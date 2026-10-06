@@ -799,7 +799,8 @@ impl<'a> ChownSetattrPolicy<'a> {
             plan: linux_plan_chown(
                 &node,
                 request,
-                KernelDacCredentials::actor_bound(actor, credentials),
+                KernelDacCredentials::actor_bound(actor, credentials)
+                    .for_inode(node.owner_user, node.owner_group),
             ),
         })
     }
@@ -1067,7 +1068,10 @@ impl<'a> KernelDacCredentials<'a> {
 
     fn has_raw_capability(&self, capability: u32) -> bool {
         if let DacCapabilityDispatch::ActorForInode(actor, uid, gid) = self.capability_dispatch {
-            return super::dac_inode::capable_wrt_inode_ids(actor, self.credentials, uid, gid, capability);
+            if matches!(capability, CAP_DAC_OVERRIDE | CAP_DAC_READ_SEARCH | CAP_CHOWN) {
+                return super::dac_inode::capable_wrt_inode_ids(actor, self.credentials, uid, gid, capability);
+            }
+            return self.credentials.has_capability(capability) && actor.has_effective_capability(capability);
         }
         if !self.credentials.has_capability(capability) {
             return false;
@@ -2836,6 +2840,30 @@ mod tests {
             !KernelDacCredentials::actor_bound(&child, &synthetic)
                 .has_capability(&(), DacCapability::Override)
         );
+    }
+
+    #[test]
+    fn child_namespace_chown_checks_old_inode_mapping_and_selected_authority() {
+        use tk_linux_cred::IdMapInputExtent;
+        let root_ns = UserNamespace::try_new_root().unwrap();
+        let root = Cred::try_root(root_ns.clone()).unwrap();
+        let child_ns = root_ns.try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false).unwrap();
+        child_ns.publish_uid_map(child_ns.try_build_uid_map(alloc::vec![IdMapInputExtent::new(0, 1000, 2)]).unwrap()).unwrap();
+        child_ns.publish_gid_map(child_ns.try_build_gid_map(alloc::vec![IdMapInputExtent::new(0, 1000, 2)]).unwrap(), false).unwrap();
+        let child = Cred::try_with_user_namespace(&root, child_ns).unwrap();
+        let dac = child.fs_dac_credentials();
+        let request = LinuxChownRequest::new(Some(1001), Some(1001));
+        let node = linux_node_metadata(0o644, 1000, 1000, NodeType::RegularFile);
+        let result = linux_plan_chown(&node, request, KernelDacCredentials::actor_bound(&child, &dac).for_inode(1000, 1000)).prepare().unwrap();
+        assert_eq!(result.owner(), Some((1001, 1001)));
+        for (uid, gid) in [(0, 1000), (1000, 0)] {
+            let node = linux_node_metadata(0o644, uid, gid, NodeType::RegularFile);
+            assert!(linux_plan_chown(&node, request, KernelDacCredentials::actor_bound(&child, &dac).for_inode(uid, gid)).prepare().is_err());
+        }
+        let no_caps = credentials(0, 0, &[], &[]);
+        assert!(linux_plan_chown(&node, request, KernelDacCredentials::actor_bound(&child, &no_caps).for_inode(1000, 1000)).prepare().is_err());
+        let root_dac = root.fs_dac_credentials();
+        assert!(KernelDacCredentials::actor_bound(&root, &root_dac).for_inode(1000, 1000).has_raw_capability(CAP_FSETID));
     }
 
     #[test]

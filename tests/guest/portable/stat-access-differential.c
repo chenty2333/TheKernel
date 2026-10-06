@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <sched.h>
+#include <grp.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -71,21 +72,32 @@ static void mapped_inode_dac(void) {
         check(mkdir(paths[i], 0755) == 0 && chown(paths[i], owners[i][0], owners[i][1]) == 0 &&
               chmod(paths[i], 0555) == 0, "dac-owner-fixture");
     }
+    int ready[2], mapped[2];
+    check(pipe(ready) == 0 && pipe(mapped) == 0, "gid-map-pipes");
     fflush(stdout);
     pid_t child = fork(); check(child >= 0, "dac-fork");
     if (!child) {
+        close(ready[0]); close(mapped[1]);
+        check(setgroups(0, NULL) == 0, "dac-clear-groups");
         check(setgid(1000) == 0 && setuid(1000) == 0, "dac-real-nonroot");
         check(prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == 0, "dac-self-map-dumpable");
         check(unshare(CLONE_NEWUSER) == 0, "dac-userns");
         map_self("/proc/self/setgroups", "deny");
         map_self("/proc/self/uid_map", "0 1000 1\n");
-        map_self("/proc/self/gid_map", "0 1000 1\n");
+        check(write(ready[1], "r", 1) == 1, "gid-map-ready");
+        close(ready[1]);
+        char signal;
+        check(read(mapped[0], &signal, 1) == 1, "parent-gid-map-complete");
+        close(mapped[0]);
         check(geteuid() == 0 && getegid() == 0, "dac-mapped-root");
         for (int i=0; i<3; ++i) {
             snprintf(made, sizeof(made), "%s/child", paths[i]);
             if (i == 0) check(mkdir(made, 0700) == 0, "mapped-inode-override");
             else ERROR(mkdir(made, 0700), EACCES, "unmapped-owner-denied");
         }
+        check(lchown(paths[0], 0, 1) == 0, "mapped-inode-chgrp-with-cap");
+        ERROR(lchown(paths[1], 0, 1), EPERM, "unmapped-uid-chown-denied");
+        ERROR(lchown(paths[2], 0, 1), EPERM, "unmapped-gid-chown-denied");
         struct stat intended, observed;
         check(stat(paths[0], &intended) == 0, "chroot-target-identity");
         check(chroot(paths[0]) == 0 && chdir("/") == 0, "mapped-userns-chroot");
@@ -99,9 +111,20 @@ static void mapped_inode_dac(void) {
         ERROR(chroot("/"), EPERM, "no-chroot-cap-denied");
         _exit(0);
     }
+    close(ready[1]); close(mapped[0]);
+    char signal, map_path[64];
+    check(read(ready[0], &signal, 1) == 1, "child-ready-for-parent-map");
+    close(ready[0]);
+    snprintf(map_path, sizeof(map_path), "/proc/%ld/gid_map", (long)child);
+    map_self(map_path, "0 1000 2\n");
+    check(write(mapped[1], "m", 1) == 1, "parent-map-release");
+    close(mapped[1]);
     int status;
     check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
           "dac-child-result");
+    struct stat changed;
+    check(stat(paths[0], &changed) == 0 && changed.st_uid == 1000 && changed.st_gid == 1001,
+          "chown-actual-kernel-ownership");
     snprintf(made, sizeof(made), "%s/child", paths[0]);
     check(rmdir(made) == 0, "dac-child-cleanup");
     for (int i=0; i<3; ++i) check(rmdir(paths[i]) == 0, "dac-parent-cleanup");
@@ -136,7 +159,7 @@ int main(void) {
           "accepted-sync-flags");
     mark("NO_AUTOMOUNT_SYNC_FLAGS");
     mapped_inode_dac(); mark("MAPPED_INODE_DAC_OVERRIDE");
-    mark("MAPPED_USERNS_CHROOT"); done();
+    mark("MAPPED_USERNS_CHROOT"); mark("MAPPED_INODE_CHOWN"); done();
 
     begin("statx.raw-differential");
     struct statx sx;

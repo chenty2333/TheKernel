@@ -733,3 +733,28 @@ filter; only the correctly selected invocation counts. Actual podman now enters
 the extraction root and fails lchown of /etc/shadow with EPERM
 (`shell-kwctgnq0`); load/hello is still unaccepted. Next address the actual
 inode-scoped chown capability gate.
+
+### Inode-scoped CAP_CHOWN for the archive's real group ownership
+
+The pinned Alpine layer's /etc/shadow is genuinely UID0/GID42/mode0640. Its
+rootless extraction failed lchown because ChownSetattrPolicy still dispatched
+CAP_CHOWN in the initial namespace. Linux7.2.3 fs/attr.c chown_ok/chgrp_ok use
+own-namespace authority with BOTH old inode IDs mapped. The chown plan now uses
+that exact inode scope and selected capability; syscall input-ID conversion,
+filesystem mapping validation, omission/error order, security hooks and
+privilege cleanup/publication remain intact. Other capabilities retain their
+prior dispatch, including initial-root CAP_FSETID preservation.
+
+Host tests cover mapped ownership transfer, both unmapped-old-owner failures,
+missing selected capability and retained initial-root FSETID authority. The
+paired child has a parent-installed two-ID group mapping, genuinely changes a
+non-member group with CAP_CHOWN, requires both unmapped-inode EPERM negatives,
+and the initial-namespace parent verifies the committed UID/GID1000/1001.
+Period75 passed Python668 (3 existing environment skips), Rust6091 (1 existing
+ignore, kernel2651), system70/70 (`system-w6h32xqp`), q35/n305 lint784 and
+paired stat-access/fs-abi29/259 (`abi-1u254qf6`). Actual UID1000 podman loaded
+both offline Alpine tags with native overlay storage (`shell-ilbyd6pb`). The
+subsequent run command exits1: .config is reported not owned by the current user
+after entering the retained user namespace. Stat still emits global IDs rather
+than the caller namespace view. Next fix that actual ABI report; hello remains
+unaccepted, and the genuine offline load is not mistaken for a successful run.

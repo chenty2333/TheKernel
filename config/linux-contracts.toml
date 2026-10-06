@@ -5275,7 +5275,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:authorize metadata changes using snapshot taken within writer gate, preserving idmap and fd/path origin"]
+state = ["state:authorize metadata changes using snapshot taken within writer gate, preserving idmap and fd/path origin", "state:CAP_CHOWN authority uses the captured selected set in the actor user namespace with both old inode IDs mapped; requested IDs retain user-namespace conversion and filesystem mapping checks"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -5286,7 +5286,7 @@ status = "implemented"
 contract = "linux-chown"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_chown"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/file/permission.rs:child_namespace_chown_checks_old_inode_mapping_and_selected_authority", "tests/guest/portable/stat-access-differential.c:mapped_inode_dac"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -5298,7 +5298,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:authorize metadata changes using snapshot taken within writer gate, preserving idmap and fd/path origin"]
+state = ["state:authorize metadata changes using snapshot taken within writer gate, preserving idmap and fd/path origin", "state:CAP_CHOWN authority uses the captured selected set in the actor user namespace with both old inode IDs mapped; requested IDs retain user-namespace conversion and filesystem mapping checks"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -5309,7 +5309,7 @@ status = "implemented"
 contract = "linux-lchown"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_lchown"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/file/permission.rs:child_namespace_chown_checks_old_inode_mapping_and_selected_authority", "tests/guest/portable/stat-access-differential.c:mapped_inode_dac"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -5321,7 +5321,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:authorize metadata changes using snapshot taken within writer gate, preserving idmap and fd/path origin"]
+state = ["state:authorize metadata changes using snapshot taken within writer gate, preserving idmap and fd/path origin", "state:CAP_CHOWN authority uses the captured selected set in the actor user namespace with both old inode IDs mapped; requested IDs retain user-namespace conversion and filesystem mapping checks"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -5332,7 +5332,7 @@ status = "implemented"
 contract = "linux-fchown"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_fchown"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/file/permission.rs:child_namespace_chown_checks_old_inode_mapping_and_selected_authority", "tests/guest/portable/stat-access-differential.c:mapped_inode_dac"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -5344,7 +5344,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:authorize metadata changes using snapshot taken within writer gate, preserving idmap and fd/path origin"]
+state = ["state:authorize metadata changes using snapshot taken within writer gate, preserving idmap and fd/path origin", "state:CAP_CHOWN authority uses the captured selected set in the actor user namespace with both old inode IDs mapped; requested IDs retain user-namespace conversion and filesystem mapping checks"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -5355,7 +5355,7 @@ status = "implemented"
 contract = "linux-fchownat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_fchownat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/file/permission.rs:child_namespace_chown_checks_old_inode_mapping_and_selected_authority", "tests/guest/portable/stat-access-differential.c:mapped_inode_dac"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
