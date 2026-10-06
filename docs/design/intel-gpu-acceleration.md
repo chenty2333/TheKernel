@@ -177,3 +177,27 @@ relocations/softpin residency and cache-domain contracts, scheduling/reset stats
 exec sync-file/timeline variants and unmodified iris/ANV program acceptance.
 The bounded renderer is not advertised as full i915/Mesa support. TC/HPD/audio
 are not prerequisite dependencies for that GT work.
+
+## Userspace discovery and bounded per-file contexts
+
+A successfully admitted live GT now identifies its DRM interface as `i915`,
+including the independent render node on the firmware-display adapter. Without
+that bootstrap the old display/virtio identity is unchanged. Existing GETPARAM
+and two-stage QUERY expose only implemented capabilities/engines, actual fused
+single-slice/DSS/paired-EU masks and source-derived hardware timestamp clock.
+Unknown readout returns an error, not a product-spec estimate. Engine discovery
+reports BCS and, only after successful opted-in RCS bootstrap, RCS; no media,
+GuC, scheduler, secure/async/timeline-exec or default-state isolation is claimed.
+In particular `HAS_CONTEXT_ISOLATION=0`: the source requires a captured engine
+`default_state`, which this bounded, inhibited-restore path does not yet have.
+
+Legacy and extension-free CREATE/DESTROY contexts are per-file and capped at256.
+Lookup pins a context gate through a concurrent destroy; new lookups return
+ENOENT, while admitted synchronous work retires safely. The existing private
+VM/hardware context is rebuilt for each complete immutable job, and a sleepable
+per-context gate orders those jobs. Arbitrary retained graphics state, shared
+VM/engine-map extensions and a general Mesa batch are still refused.
+GTT_SIZE reports the current bounded256KiB address range, not a fictitious full
+Mesa address space. The explicit acceptance client uses discovery and a created
+context for the actual same GEM→BCS/RCS→sync chain. Compilation/model/source-C
+checks are not unmodified iris/ANV or physical shader acceptance.

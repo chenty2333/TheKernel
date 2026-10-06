@@ -58,7 +58,7 @@ struct Wait {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct Exec {
+pub(super) struct Exec {
     buffers: u64,
     count: u32,
     start: u32,
@@ -68,7 +68,7 @@ struct Exec {
     fence_count: u32,
     fences: u64,
     flags: u64,
-    context: u64,
+    pub(super) context: u64,
     reserved: u64,
 }
 #[repr(C)]
@@ -89,7 +89,7 @@ struct ExecFence {
     handle: u32,
     flags: u32,
 }
-const fn command<T>(nr: u64, rw: u64) -> u32 {
+pub(super) const fn command<T>(nr: u64, rw: u64) -> u32 {
     ((rw << 30) | (size_of::<T>() as u64) << 16 | (b'd' as u64) << 8 | (0x40 + nr)) as u32
 }
 const CREATE: u32 = command::<Create>(0x1b, 3);
@@ -129,7 +129,7 @@ impl GemBacking for Backing {
         Ok(self.pages.clone())
     }
 }
-fn object(file: &DrmFile, handle: u32) -> AxResult<Arc<GemObject>> {
+pub(super) fn object(file: &DrmFile, handle: u32) -> AxResult<Arc<GemObject>> {
     file.gem(handle).map_err(AxError::from)
 }
 fn previous(object: &GemObject, timeout: Option<Duration>) -> AxResult<()> {
@@ -257,7 +257,7 @@ fn wait(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     })
 }
 #[derive(Clone, Copy)]
-enum Plan {
+pub(super) enum Plan {
     Copy(intel_gt::bcs::Copy),
     Render,
 }
@@ -293,7 +293,7 @@ fn decode(
 /// Snapshot and validate first, publish shared completion edges atomically,
 /// then execute over pinned views. Native implementations never execute the
 /// user's memory as commands, including a concurrent writable batch mapping.
-fn exec_with(
+pub(super) fn exec_with(
     file: &DrmFile,
     copy: &impl UserCopy,
     arg: usize,
@@ -311,7 +311,7 @@ fn exec_with(
         || !r.start.is_multiple_of(8)
         || r.dr1 != 0
         || r.dr4 != 0
-        || r.context != 0
+        || r.context >> 32 != 0
         || r.reserved != 0
         || r.flags & !FENCE_ARRAY != (if render { 1 } else { 3 } | NO_RELOC)
         || r.fence_count > 64
@@ -319,6 +319,10 @@ fn exec_with(
     {
         return Err(AxError::InvalidInput);
     }
+    // Lookup pins the old context through a concurrent destroy. The per-
+    // context sleepable gate orders synchronous jobs without a spinlock wait.
+    let context = file.intel_contexts.lookup(r.context as u32)?;
+    let _context_job = context.lock();
     let records = read_array::<Object>(copy, r.buffers, 3, 3)?;
     let mut objects = Vec::new();
     let mut pages = Vec::new();
@@ -462,18 +466,18 @@ pub(crate) fn dispatch(
             }
             .map_err(|_| AxError::Io)
         })?,
-        _ => return Err(AxError::OperationNotSupported), // No contexts/queries/render claims yet.
+        _ => return super::gem_context::dispatch(file, copy, cmd, arg),
     }
     Ok(0)
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use alloc::vec;
     use core::{cell::RefCell, mem::MaybeUninit};
 
     use super::*;
-    struct Image(RefCell<Vec<u8>>);
+    pub(in crate::drm::intel) struct Image(pub(in crate::drm::intel) RefCell<Vec<u8>>);
     impl UserCopy for Image {
         fn read(&self, a: usize, d: &mut [MaybeUninit<u8>]) -> AxResult<()> {
             let bytes = self.0.borrow();
@@ -494,7 +498,7 @@ mod tests {
             Ok(())
         }
     }
-    struct Adapter;
+    pub(in crate::drm::intel) struct Adapter;
     impl crate::drm::DisplayAdapter for Adapter {
         fn create_dumb(
             &self,
@@ -509,7 +513,7 @@ mod tests {
             Err(crate::drm::DrmError::Unsupported)
         }
     }
-    fn file() -> DrmFile {
+    pub(in crate::drm::intel) fn file() -> DrmFile {
         crate::drm::DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4).open_primary()
     }
     fn new(file: &DrmFile, copy: &Image) -> u32 {
@@ -525,7 +529,7 @@ mod tests {
         create(file, copy, 0).unwrap();
         read_pod::<Create>(copy, 0).unwrap().handle
     }
-    fn prepare(file: &DrmFile, copy: &Image) -> (u32, u32, u32, u32) {
+    pub(in crate::drm::intel) fn prepare(file: &DrmFile, copy: &Image) -> (u32, u32, u32, u32) {
         let handles = [new(file, copy), new(file, copy), new(file, copy)];
         let src = object(file, handles[0])
             .unwrap()

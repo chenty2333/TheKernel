@@ -762,3 +762,11 @@ and73 identical all-zero data-array rows at25/40 from the compiled IGT page.
 They are measured textual matches, not proof of copied Linux bodies or GPU
 execution. Current GT totals78/74 and combined Intel90/76; crates/ax baseline
 outside/code118/107 at25,91/84 at40, no fenced/comments/markers or exemptions.
+
+N305 GT information runtime: `tk-intel-gt/src/info.rs` selects MIT
+`gt/intel_sseu.c::gen12_sseu_info_init/gen11_compute_sseu_info` and
+`gt/intel_gt_clock_utils.c` reference/crystal/divider readout, copyrights2019/
+2020 Intel, full grant in existing LICENSE-MIT. The existing i915-wire dispatcher
+calls these for real fuse topology and timestamp frequency; it does not use the
+product's advertised EU count as a hardware observation. Per-file context/query
+transport is original, with independently compiled x86_64 UAPI sizes/commands.

@@ -86,7 +86,7 @@ impl Bus {
                 | 0x220b4 | 0x220c4 | 0x223a0 | 0x22510 | 0x22514 | 0x22518 | 0x2251c | 0x22550 => {
                     true
                 }
-                0x220b8 | 0x9138 | 0x913c => !write,
+                0x220b8 | 0x9134 | 0x9138 | 0x913c | 0xa26c | 0x44074 | 0xd00 => !write,
                 _ => false,
             }
     }
@@ -145,6 +145,31 @@ pub(super) fn registered() -> bool {
     READY.load(Ordering::Acquire)
 }
 static OWNER: Mutex<Option<Owner>> = Mutex::new(None);
+
+/// Capability probes use only a successfully bootstrapped, still-live owner.
+/// No query wakes/resets hardware or invents a fused topology/clock.
+pub(super) fn topology() -> Result<intel_gt::info::Topology, Error> {
+    let state = OWNER.lock();
+    let owner = state
+        .as_ref()
+        .filter(|o| registered() && !o.lost)
+        .ok_or(Error::Refused)?;
+    intel_gt::info::Topology::read(&owner.bus)
+}
+pub(super) fn clock_frequency() -> Result<u32, Error> {
+    let state = OWNER.lock();
+    let owner = state
+        .as_ref()
+        .filter(|o| registered() && !o.lost)
+        .ok_or(Error::Refused)?;
+    intel_gt::info::clock_frequency(&owner.bus)
+}
+pub(super) fn render_registered() -> bool {
+    OWNER
+        .lock()
+        .as_ref()
+        .is_some_and(|o| registered() && !o.lost && o.render_ready)
+}
 
 /// Independent boot hook; default path never writes forcewake or resets GT.
 #[cfg(target_os = "none")]

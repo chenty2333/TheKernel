@@ -48,6 +48,7 @@ pub enum DrmEvent {
 }
 
 pub struct DrmFile {
+    pub(crate) intel_contexts: super::intel::gem_context::Contexts,
     pinned_memory: Arc<AtomicUsize>,
     device: Arc<DrmDevice>,
     id: OpenId,
@@ -217,6 +218,7 @@ impl DrmFile {
         seat_owned_primary: bool,
     ) -> Self {
         Self {
+            intel_contexts: super::intel::gem_context::Contexts::new(),
             pinned_memory: Arc::new(AtomicUsize::new(0)),
             device,
             id,
@@ -567,7 +569,11 @@ impl DrmFile {
     }
 
     pub(crate) fn driver_name(&self) -> &'static str {
-        self.device.adapter.driver_name()
+        if self.has_intel_gt() {
+            "i915"
+        } else {
+            self.device.adapter.driver_name()
+        }
     }
     pub(crate) fn validate_adapter_state(
         &self,

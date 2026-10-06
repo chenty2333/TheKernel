@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 pub mod bcs;
 pub mod lrc;
+pub mod info;
 pub mod ppgtt;
 pub mod reset;
 pub mod rcs;

@@ -97,3 +97,11 @@ flags should refuse, and ambiguous DMA retirement should retain owners and
 close further submissions. Do not use the display fail_write switch for GT.
 This does not establish iris/OpenGL or ANV/Vulkan support; test those separately
 only after their actual general submit/context/query contracts are implemented.
+
+The explicit BCS/RCS client now first checks CHIPSET_ID and two-stage engine
+QUERY, then creates a per-file context and submits through that context. Native
+fuse topology/CS clock are available through GETPARAM/QUERY only after successful
+GT admission; missing facts fail rather than returning the product specification.
+This remains a bounded acceptance client, not evidence that Mesa initializes or
+executes. No default-state context isolation, shared user VM or general shader
+batch capability is currently advertised.

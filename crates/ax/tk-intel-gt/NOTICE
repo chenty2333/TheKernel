@@ -95,3 +95,11 @@ thresholds in the compiled-IGT-derived page that also occur in Linux arrays.
 The data rows are not copied Linux function bodies; provenance and the original
 IGT grants are retained. Combined display+GT totals90/76; crates/ax baseline
 outside/code43/32→118/107 at25,18/11→91/84 at40. No scanner exemption.
+
+src/info.rs: Linux7.2.3 gt/intel_sseu.c gen12_sseu_info_init /
+gen11_compute_sseu_info (©2019 Intel) and gt/intel_gt_clock_utils.c
+read_reference_ts_freq / gen11_get_crystal_clock_freq / gen11_read_clock_frequency
+(©2020 Intel), selected N305 single-slice6-DSS/paired-EU readout and timestamp
+clock only, full grant LICENSE-MIT. Runtime callers are existing GETPARAM and
+QUERY over the live, owned GT; unavailable/unknown facts fail closed. No register
+write, new wake or reset is performed by capability discovery.

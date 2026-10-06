@@ -358,3 +358,10 @@ COPYING retained as `tk-intel-gt/LICENSE-IGT`. The original test-only C shim
 extracts unchanged selected IGT functions, retains that full grant and performs
 no DRM ioctl or GPU action. Mesa26.1.2 Gen120 packet/cache fields are used as
 wire facts, not a copied driver/compiler. No firmware or GPL driver is bundled.
+
+GT capability discovery additionally translates selected MIT `intel_sseu.c`
+Gen12 fuse readout (©2019 Intel) and `intel_gt_clock_utils.c` Gen11+ clock
+readout (©2020 Intel), with full existing `tk-intel-gt/LICENSE-MIT` grant.
+The per-file context/UAPI transport is original code using header facts;
+no GPL query/context implementation body is copied. Independent temporary C
+oracles preserve the existing full grants and source copyrights.

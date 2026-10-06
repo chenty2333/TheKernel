@@ -32,7 +32,27 @@ int main(int argc, char **argv) {
     int fd = open(argv[2], O_RDWR | O_CLOEXEC);
     if (fd < 0) { perror("DRM open; not tested"); return 1; }
     int result = 1;
-    uint32_t handles[3] = {0}, sync = 0;
+    uint32_t handles[3] = {0}, sync = 0, context = 0;
+    int chipset = 0;
+    drm_i915_getparam_t chipset_query = {.param=I915_PARAM_CHIPSET_ID, .value=&chipset};
+    if (call(fd, DRM_IOCTL_I915_GETPARAM, &chipset_query)) goto done;
+    if (chipset!=0x46d0) {fprintf(stderr,"INTEL_FAIL wrong chipset=0x%x\n",chipset);goto done;}
+    struct drm_i915_query_item engine_item = {.query_id=DRM_I915_QUERY_ENGINE_INFO};
+    struct drm_i915_query engine_query = {.num_items=1, .items_ptr=(uintptr_t)&engine_item};
+    if (call(fd, DRM_IOCTL_I915_QUERY, &engine_query)) goto done;
+    uint64_t engine_storage[128]={0};
+    if (engine_item.length<16 || engine_item.length>(int)sizeof(engine_storage)) {fprintf(stderr,"INTEL_FAIL engine query length=%d\n",engine_item.length);goto done;}
+    engine_item.data_ptr=(uintptr_t)engine_storage;
+    if (call(fd, DRM_IOCTL_I915_QUERY, &engine_query)) goto done;
+    struct drm_i915_query_engine_info *engines=(void*)engine_storage;
+    if (engine_item.length<16 || engines->num_engines>(sizeof(engine_storage)-16)/sizeof(struct drm_i915_engine_info) || 16+engines->num_engines*sizeof(struct drm_i915_engine_info)>(unsigned)engine_item.length) goto done;
+    int found=0;
+    for (unsigned i=0;i<engines->num_engines;i++) if(engines->engines[i].engine.engine_class==(render?I915_ENGINE_CLASS_RENDER:I915_ENGINE_CLASS_COPY) && engines->engines[i].engine.engine_instance==0)found=1;
+    if(!found){fprintf(stderr,"INTEL_FAIL requested engine not available\n");goto done;}
+    struct drm_i915_gem_context_create create_context={0};
+    if(call(fd,DRM_IOCTL_I915_GEM_CONTEXT_CREATE,&create_context))goto done;
+    context=create_context.ctx_id;
+    if(!context){fprintf(stderr,"INTEL_FAIL default context returned by CREATE\n");goto done;}
     unsigned char source[BYTES], output[BYTES];
     unsigned char guarded[24576];
     for (unsigned i=0;i<BYTES;i++) source[i]=(unsigned char)((i*29u)^(i>>8)^0x73u);
@@ -61,7 +81,7 @@ int main(int argc, char **argv) {
         objects[i].flags=EXEC_OBJECT_PINNED|EXEC_OBJECT_SUPPORTS_48B_ADDRESS|(i==1?EXEC_OBJECT_WRITE:0);
     }
     struct drm_i915_gem_exec_fence fence={.handle=sync,.flags=I915_EXEC_FENCE_SIGNAL};
-    struct drm_i915_gem_execbuffer2 exec={.buffers_ptr=(uintptr_t)objects,.buffer_count=3,.batch_len=render?1160:sizeof(batch),.flags=(render?I915_EXEC_RENDER:I915_EXEC_BLT)|I915_EXEC_NO_RELOC|I915_EXEC_FENCE_ARRAY,.num_cliprects=1,.cliprects_ptr=(uintptr_t)&fence};
+    struct drm_i915_gem_execbuffer2 exec={.buffers_ptr=(uintptr_t)objects,.buffer_count=3,.batch_len=render?1160:sizeof(batch),.rsvd1=context,.flags=(render?I915_EXEC_RENDER:I915_EXEC_BLT)|I915_EXEC_NO_RELOC|I915_EXEC_FENCE_ARRAY,.num_cliprects=1,.cliprects_ptr=(uintptr_t)&fence};
     if (call(fd,DRM_IOCTL_I915_GEM_EXECBUFFER2,&exec)) goto done;
     struct drm_i915_gem_wait wait={.bo_handle=handles[1],.timeout_ns=1000000000};
     if (call(fd,DRM_IOCTL_I915_GEM_WAIT,&wait)) goto done;
@@ -95,6 +115,7 @@ int main(int argc, char **argv) {
     puts(render?"INTEL_RCS_USER_BYTES_VERIFIED bytes=16384 shader/GEM/sync/mmap; not Mesa acceptance":"INTEL_BCS_USER_BYTES_VERIFIED bytes=16384 GEM/exec/sync/mmap; not RCS/Mesa rendering");
     result=0;
 done:
+    if(context){struct drm_i915_gem_context_destroy request={.ctx_id=context};ioctl(fd,DRM_IOCTL_I915_GEM_CONTEXT_DESTROY,&request);}
     if(sync){struct drm_syncobj_destroy request={.handle=sync};ioctl(fd,DRM_IOCTL_SYNCOBJ_DESTROY,&request);}
     for(unsigned i=0;i<3;i++) if(handles[i]){struct drm_gem_close request={.handle=handles[i]};ioctl(fd,DRM_IOCTL_GEM_CLOSE,&request);}
     close(fd);return result;

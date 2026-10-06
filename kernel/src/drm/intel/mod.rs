@@ -93,6 +93,7 @@ mod gmbus;
 mod gt_probe;
 mod gt;
 pub(super) mod gem_exec;
+pub(super) mod gem_context;
 pub(crate) mod gtt;
 mod hpd;
 mod id;
