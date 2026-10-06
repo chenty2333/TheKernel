@@ -114,6 +114,27 @@ const _: () = {
     );
     assert!(core::mem::offset_of!(Object, flags) == 32);
 };
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct TimelineExt {
+    next: u64,
+    name: u32,
+    flags: u32,
+    reserved: [u32; 4],
+    count: u64,
+    handles: u64,
+    values: u64,
+}
+const EXTENSIONS: u64 = 1 << 21;
+// Independently compiled local Linux7.2.3 header: 32-byte extension header,
+// 56-byte timeline record; no implicit omission of its four reserved words.
+const _: () = {
+    assert!(size_of::<TimelineExt>() == 56);
+    assert!(core::mem::offset_of!(TimelineExt, count) == 32);
+    assert!(core::mem::offset_of!(TimelineExt, handles) == 40);
+    assert!(core::mem::offset_of!(TimelineExt, values) == 48);
+};
+
 const NO_RELOC: u64 = 1 << 11;
 const FENCE_ARRAY: u64 = 1 << 19;
 const PINNED: u64 = 1 << 4;
@@ -313,9 +334,11 @@ pub(super) fn exec_with(
         || r.dr4 != 0
         || r.context >> 32 != 0
         || r.reserved != 0
-        || r.flags & !FENCE_ARRAY != (if render { 1 } else { 3 } | NO_RELOC)
+        || r.flags & !(FENCE_ARRAY | EXTENSIONS) != (if render { 1 } else { 3 } | NO_RELOC)
         || r.fence_count > 64
-        || (r.flags & FENCE_ARRAY == 0 && (r.fence_count != 0 || r.fences != 0))
+        || r.flags & (FENCE_ARRAY | EXTENSIONS) == (FENCE_ARRAY | EXTENSIONS)
+        || (r.flags & FENCE_ARRAY == 0 && r.fence_count != 0)
+        || (r.flags & (FENCE_ARRAY | EXTENSIONS) == 0 && r.fences != 0)
     {
         return Err(AxError::InvalidInput);
     }
@@ -355,10 +378,34 @@ pub(super) fn exec_with(
         objects.push(object);
         pages.push(ram);
     }
-    let fences = if r.flags & FENCE_ARRAY != 0 {
-        read_array::<ExecFence>(copy, r.fences, r.fence_count as usize, 64)?
+    let (fences, points) = if r.flags & FENCE_ARRAY != 0 {
+        let fences = read_array::<ExecFence>(copy, r.fences, r.fence_count as usize, 64)?;
+        let mut points = Vec::new();
+        points
+            .try_reserve_exact(fences.len())
+            .map_err(|_| AxError::NoMemory)?;
+        points.resize(fences.len(), 0);
+        (fences, points)
+    } else if r.flags & EXTENSIONS != 0 && r.fences != 0 {
+        // One source timeline extension, not a generic extension interpreter.
+        let ext: TimelineExt = read_pod(
+            copy,
+            usize::try_from(r.fences).map_err(|_| AxError::BadAddress)?,
+        )?;
+        if ext.next != 0
+            || ext.name != 0
+            || ext.flags != 0
+            || ext.reserved != [0; 4]
+            || ext.count > 64
+        {
+            return Err(AxError::InvalidInput);
+        }
+        (
+            read_array::<ExecFence>(copy, ext.handles, ext.count as usize, 64)?,
+            read_array::<u64>(copy, ext.values, ext.count as usize, 64)?,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
@@ -368,16 +415,26 @@ pub(super) fn exec_with(
     outputs
         .try_reserve_exact(fences.len())
         .map_err(|_| AxError::NoMemory)?;
-    for f in fences {
-        if f.flags == 0 || f.flags & !3 != 0 {
+    for (f, point) in fences.into_iter().zip(points) {
+        if f.flags & !3 != 0 || (point != 0 && f.flags == 3) {
             return Err(AxError::InvalidInput);
         }
         let object = file.syncobj(f.handle).map_err(AxError::from)?;
         if f.flags & 1 != 0 {
-            inputs.push(object.fence().map_err(|_| AxError::InvalidInput)?);
+            // The source snapshots an already materialized input fence;
+            // missing points are EINVAL, not a fabricated successful wait.
+            inputs.push(object.fence_at(point).map_err(|_| AxError::InvalidInput)?);
         }
         if f.flags & 2 != 0 {
-            outputs.push(object);
+            if point != 0
+                && (point <= object.query_point(true)
+                    || outputs
+                        .iter()
+                        .any(|(other, p)| Arc::ptr_eq(other, &object) && *p == point))
+            {
+                return Err(AxError::InvalidInput);
+            }
+            outputs.push((object, point));
         }
     }
     // Explicit producers may be writing the batch too. Wait their original
@@ -405,10 +462,12 @@ pub(super) fn exec_with(
             return Err(e);
         }
     };
-    for out in outputs {
-        out.import_fence(completion.clone());
-    }
     let result = (|| {
+        // Publication may allocate a consumer chain or race another producer.
+        // Every post-reservation failure reaches the same terminal error below.
+        for (out, point) in outputs {
+            out.submit_point(point, completion.clone())?;
+        }
         for prior in &predecessors {
             prior.wait(Some(Duration::from_millis(500)))?;
         }
@@ -802,6 +861,163 @@ pub(super) mod tests {
             .read_bytes(0, &mut bytes)
             .unwrap();
         assert!(bytes.iter().all(|v| *v == 0x73));
+    }
+    #[test]
+    fn timeline_extension_uses_existing_gem_completion_and_preserves_producer_ownership() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (_, destination, _, out) = prepare(&file, &copy);
+        let mut request: Exec = read_pod(&copy, 0).unwrap();
+        request.flags = (request.flags & !FENCE_ARRAY) | EXTENSIONS;
+        request.fence_count = 0;
+        request.fences = 768;
+        write_pod(&copy, 0, &request).unwrap();
+        write_pod(
+            &copy,
+            768,
+            &TimelineExt {
+                count: 1,
+                handles: 512,
+                values: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_pod(&copy, 1024, &1u64).unwrap();
+        let object = file.syncobj(out).unwrap();
+        exec_with(&file, &copy, 0, |source, destination, plan| {
+            let producer = object.fence_at(1).unwrap();
+            assert!(!producer.is_signaled());
+            object.signal_point(2).unwrap();
+            assert!(!producer.is_signaled());
+            assert!(!object.fence_at(2).unwrap().is_signaled());
+            let Plan::Copy(operation) = plan else {
+                panic!("copy")
+            };
+            super::super::gt::copy::tests::objects(source, destination, operation)
+                .map_err(|_| AxError::Io)
+        })
+        .unwrap();
+        assert!(object.fence_at(2).unwrap().is_signaled());
+        assert_eq!(object.query_point(false), 2);
+        let mut bytes = [0; 16384];
+        super::object(&file, destination)
+            .unwrap()
+            .backing
+            .shared_pages()
+            .unwrap()
+            .read_bytes(0, &mut bytes)
+            .unwrap();
+        assert!(bytes.iter().all(|v| *v == 0x73));
+    }
+    #[test]
+    fn failed_timeline_submission_errors_output_and_gem_with_the_same_device_leaf() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (source, destination, _, out) = prepare(&file, &copy);
+        let mut request: Exec = read_pod(&copy, 0).unwrap();
+        request.flags = (request.flags & !FENCE_ARRAY) | EXTENSIONS;
+        request.fence_count = 0;
+        request.fences = 768;
+        write_pod(&copy, 0, &request).unwrap();
+        write_pod(
+            &copy,
+            768,
+            &TimelineExt {
+                count: 1,
+                handles: 512,
+                values: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_pod(&copy, 1024, &1u64).unwrap();
+        assert_eq!(
+            exec_with(&file, &copy, 0, |_, _, _| Err(AxError::Io)),
+            Err(AxError::Io)
+        );
+        let output = file.syncobj(out).unwrap().fence_at(1).unwrap();
+        assert!(output.is_failed());
+        for handle in [source, destination] {
+            assert!(Arc::ptr_eq(
+                &output,
+                &object(&file, handle)
+                    .unwrap()
+                    .reservation
+                    .predecessor()
+                    .unwrap()
+            ));
+        }
+    }
+    #[test]
+    fn malformed_timeline_extension_is_refused_before_gem_fences_are_published() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (source, ..) = prepare(&file, &copy);
+        let mut request: Exec = read_pod(&copy, 0).unwrap();
+        request.flags = (request.flags & !FENCE_ARRAY) | EXTENSIONS;
+        request.fence_count = 0;
+        request.fences = 768;
+        write_pod(&copy, 0, &request).unwrap();
+        write_pod(&copy, 1024, &1u64).unwrap();
+        for ext in [
+            TimelineExt {
+                count: 65,
+                ..Default::default()
+            },
+            TimelineExt {
+                next: 768,
+                ..Default::default()
+            },
+            TimelineExt {
+                name: 1,
+                ..Default::default()
+            },
+            TimelineExt {
+                flags: 1,
+                ..Default::default()
+            },
+            TimelineExt {
+                reserved: [1, 0, 0, 0],
+                ..Default::default()
+            },
+        ] {
+            write_pod(&copy, 768, &ext).unwrap();
+            assert_eq!(
+                exec_with(&file, &copy, 0, |_, _, _| panic!("invalid extension")),
+                Err(AxError::InvalidInput)
+            );
+            assert!(
+                object(&file, source)
+                    .unwrap()
+                    .reservation
+                    .predecessor()
+                    .is_none()
+            );
+        }
+        write_pod(
+            &copy,
+            768,
+            &TimelineExt {
+                count: 1,
+                handles: 512,
+                values: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut fence: ExecFence = read_pod(&copy, 512).unwrap();
+        fence.flags = 3;
+        write_pod(&copy, 512, &fence).unwrap();
+        assert_eq!(
+            exec_with(&file, &copy, 0, |_, _, _| panic!(
+                "same nonzero WAIT/SIGNAL"
+            )),
+            Err(AxError::InvalidInput)
+        );
     }
     #[test]
     fn invalid_batch_or_alias_is_refused_before_any_completion_publication() {

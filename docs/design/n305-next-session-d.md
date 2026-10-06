@@ -111,3 +111,10 @@ present VCS0/VCS2/VECS0 wake domains. A busy ring/lost ACK/unavailable mapping
 must refuse before shared PAT/MOCS/L3 changes; it must not stop or reset media.
 The firmware RCS preflight likewise requires empty head/tail and MODE_IDLE.
 These new reads/wake checks are software-verified only, not a native observation.
+
+The explicit BCS/RCS client now submits a fresh timeline output point through
+the source exec extension and checks SYNCOBJ_TIMELINE_WAIT after exact readback.
+Binary fence arrays remain supported separately. Links/unknown extensions,
+reserved words and nonzero same-point WAIT+SIGNAL are refused; source header
+layout is32 bytes plus24 timeline bytes. Client build/install and model checks
+are not a native GPU or Mesa acceptance result.

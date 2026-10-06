@@ -178,7 +178,7 @@ fn getparam_value(
         // Exact device/revision are already established by GT boot admission.
         4 => 0x46d0,
         32 => 0,
-        5 | 9 | 11 | 19 | 24 | 25 | 37 | 49 => 1,
+        5 | 9 | 11 | 19 | 24 | 25 | 37 | 49 | 55 => 1,
         40 => 4, // WB mmap-offset only; no legacy GTT aperture mmap.
         33 => topology()?.dss.count_ones() as i32,
         34 => topology()?.eu_total() as i32,
@@ -189,7 +189,19 @@ fn getparam_value(
         47 => i32::from(topology()?.dss),
         50 => 0, // Source requires captured engine default_state; not yet present.
         51 => i32::try_from(clock()?).map_err(|_| AxError::InvalidInput)?,
-        6..=8 | 10 | 12..=18 | 20..=23 | 26..=31 | 35 | 36 | 38 | 39 | 41..=45 | 48 | 52..=59 => 0,
+        6..=8
+        | 10
+        | 12..=18
+        | 20..=23
+        | 26..=31
+        | 35
+        | 36
+        | 38
+        | 39
+        | 41..=45
+        | 48
+        | 52..=54
+        | 56..=59 => 0,
         1..=3 => return Err(AxError::NoSuchDevice),
         _ => return Err(AxError::InvalidInput),
     })
@@ -499,7 +511,7 @@ mod tests {
         .unwrap();
         assert_eq!(query_with(&copy, 0, true, topo), Err(AxError::BadAddress));
         assert_eq!(read_pod::<QueryItem>(&copy, 2024).unwrap().length, 30);
-        for param in [20, 23, 35, 41, 43, 44, 55, 58] {
+        for param in [20, 23, 35, 41, 43, 44, 58] {
             assert_eq!(getparam_value(param, topo, || Ok(19_200_000)), Ok(0));
         }
         assert_eq!(getparam_value(50, topo, || Ok(0)), Ok(0));

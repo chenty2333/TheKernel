@@ -81,7 +81,9 @@ int main(int argc, char **argv) {
         objects[i].flags=EXEC_OBJECT_PINNED|EXEC_OBJECT_SUPPORTS_48B_ADDRESS|(i==1?EXEC_OBJECT_WRITE:0);
     }
     struct drm_i915_gem_exec_fence fence={.handle=sync,.flags=I915_EXEC_FENCE_SIGNAL};
-    struct drm_i915_gem_execbuffer2 exec={.buffers_ptr=(uintptr_t)objects,.buffer_count=3,.batch_len=render?1160:sizeof(batch),.rsvd1=context,.flags=(render?I915_EXEC_RENDER:I915_EXEC_BLT)|I915_EXEC_NO_RELOC|I915_EXEC_FENCE_ARRAY,.num_cliprects=1,.cliprects_ptr=(uintptr_t)&fence};
+    uint64_t point=1;
+    struct drm_i915_gem_execbuffer_ext_timeline_fences timeline={.base={.name=DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES},.fence_count=1,.handles_ptr=(uintptr_t)&fence,.values_ptr=(uintptr_t)&point};
+    struct drm_i915_gem_execbuffer2 exec={.buffers_ptr=(uintptr_t)objects,.buffer_count=3,.batch_len=render?1160:sizeof(batch),.rsvd1=context,.flags=(render?I915_EXEC_RENDER:I915_EXEC_BLT)|I915_EXEC_NO_RELOC|I915_EXEC_USE_EXTENSIONS,.cliprects_ptr=(uintptr_t)&timeline};
     if (call(fd,DRM_IOCTL_I915_GEM_EXECBUFFER2,&exec)) goto done;
     struct drm_i915_gem_wait wait={.bo_handle=handles[1],.timeout_ns=1000000000};
     if (call(fd,DRM_IOCTL_I915_GEM_WAIT,&wait)) goto done;
@@ -90,8 +92,8 @@ int main(int argc, char **argv) {
     for(unsigned i=0;i<BYTES;i++) if(output[i]!=source[i]) {
         fprintf(stderr,"INTEL_BCS_FAIL byte=%u actual=%u expected=%u\n",i,output[i],source[i]);goto done;
     }
-    struct drm_syncobj_wait sync_wait={.handles=(uintptr_t)&sync,.count_handles=1,.timeout_nsec=0};
-    if(call(fd,DRM_IOCTL_SYNCOBJ_WAIT,&sync_wait)) goto done;
+    struct drm_syncobj_timeline_wait sync_wait={.handles=(uintptr_t)&sync,.points=(uintptr_t)&point,.count_handles=1,.timeout_nsec=0};
+    if(call(fd,DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT,&sync_wait)) goto done;
     if(render){struct drm_i915_gem_pread guards={.handle=handles[1],.size=sizeof(guarded),.data_ptr=(uintptr_t)guarded};if(call(fd,DRM_IOCTL_I915_GEM_PREAD,&guards))goto done;for(unsigned i=0;i<sizeof(guarded);i++)if((i<4096||i>=4096+BYTES)&&guarded[i]!=0x5a){fprintf(stderr,"INTEL_RCS_FAIL guard=%u\n",i);goto done;}}
     if (render) {
         struct drm_i915_gem_pread unchanged = {.handle=handles[0], .size=sizeof(guarded), .data_ptr=(uintptr_t)guarded};

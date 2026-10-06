@@ -218,3 +218,16 @@ head/tail plus MODE_IDLE. Unknown fuses, lost ACK, active ring or unavailable
 MMIO refuse before PAT/MOCS/L3 writes. RCS firmware-idle preflight now also checks
 head/tail, not MODE_IDLE alone. No media work/reset/codec support is introduced;
 sole-controller GuC exclusion and default-off GT/RCS flags remain required.
+
+The same bounded EXECBUFFER2 now accepts one timeline-fence extension (up to64
+entries), separately from binary fence arrays. Input fence identities must
+already be materialized and are captured before batch snapshot; nonzero
+WAIT+SIGNAL on the same point is refused as upstream requires. Fresh positive
+output points and binary point0 use the existing completion leaf/reservations
+and consumer chains. Every post-admission failure terminally errors that leaf;
+userspace software SIGNAL cannot fake the GEM completion. Extension links,
+unknown flags/names/reserved words and mixed array/extension forms are rejected.
+The 32-byte extension header and56-byte wire record match independently compiled
+Linux headers. The explicit client uses timeline output/wait; only compilation,
+models and source comparisons are verified. Sync-file exec and persistent user
+VM/context/general Mesa batches remain unfinished.
