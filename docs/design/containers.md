@@ -409,3 +409,20 @@ Actual crun now passes detached-proc reads, enters the six configured namespace
 classes and reports the real child PID, but exits1 because
 `/proc/sys/kernel/cap_last_cap` is absent (`shell-rg_ed0t0`). OCI command/exits and
 resource limits remain pending; add that real capability-bound node next.
+
+### Rebuilding locked signed APKs after repository-index updates
+
+The live Alpine index advanced libseccomp to2.6.1-r0 and stopped offering the
+locked2.6.0-r2, although its authentic signed APK remained in the existing
+cache. The builder now supplies exact cached APK paths as explicit solver
+candidates alongside every unchanged version constraint. Ambiguous cached
+sources fail closed; signature verification and exact installed-closure checks
+remain mandatory. No --allow-untrusted, host scriptlets or version widening
+were added.
+
+Validated: related Python6 and shell syntax; repeated signed131-package build
+(110.8MiB installed/109MiB staged), formal containers guest restaging and actual
+crun startup (`shell-agb7gx_p`). This was a packaging failure before guest
+execution, not a kernel ABI failure. The capability-node candidate is still
+uncommitted; the runtime now gets beyond that read and reports unsupported
+SIOCSIFFLAGS, not OCI acceptance.

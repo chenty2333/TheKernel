@@ -36,6 +36,14 @@ class ContainersPayloadTests(unittest.TestCase):
         self.assertNotIn("out/'etc/passwd'", text)
         self.assertNotIn('sudo', text)
 
+    def test_cached_signed_versions_are_explicit_solver_candidates(self):
+        text = (ROOT/'scripts/build-containers-payload.sh').read_text()
+        self.assertIn('stem=${pin/=/-}', text)
+        self.assertIn('ambiguous cached source for $pin', text)
+        self.assertIn('add "${PINS[@]}" "${EXACT_APKS[@]}"', text)
+        self.assertNotIn('--allow-untrusted', text)
+        self.assertIn('actual != expected', text)
+
     def test_bwrap_acceptance_requests_real_isolation_and_readonly_checks(self):
         path = ROOT/'tests/guest/container-bwrap.sh'
         subprocess.run(['sh', '-n', str(path)], check=True)

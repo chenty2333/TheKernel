@@ -49,13 +49,32 @@ ROOT="$WORK/root"
 mkdir -p "$ROOT" "$CACHE/containers-apks"
 tar -xzf "$ARCHIVE" -C "$ROOT" --exclude='./dev/*'
 mapfile -t PINS < <(sed 's/[[:space:]]*#.*//' "$REPO_ROOT/config/containers-apks.lock" | sed '/^$/d')
+# Explicit signed cached APKs remain available even after the live repository
+# index removes an older pinned version. Keep every world constraint unchanged.
+shopt -s nullglob
+EXACT_APKS=()
+for pin in "${PINS[@]}"; do
+    stem=${pin/=/-}
+    matches=("$CACHE/containers-apks/$stem".*.apk)
+    if [ -f "$CACHE/containers-apks/$stem.apk" ]; then
+        matches+=("$CACHE/containers-apks/$stem.apk")
+    fi
+    if ((${#matches[@]} > 1)); then
+        echo "ambiguous cached source for $pin" >&2
+        exit 2
+    fi
+    if ((${#matches[@]} == 1)); then
+        EXACT_APKS+=("${matches[0]}")
+    fi
+done
+shopt -u nullglob
 # apk verifies repository and package signatures with the pinned release's keys.
 # Explicitly disable all host-side scriptlets, triggers and ownership changes.
 env -u LD_PRELOAD -u LD_LIBRARY_PATH "$ROOT/lib/ld-musl-x86_64.so.1" \
     --library-path "$ROOT/lib:$ROOT/usr/lib" "$ROOT/sbin/apk" \
     --root "$ROOT" --keys-dir "$ROOT/etc/apk/keys" \
     --repositories-file "$ROOT/etc/apk/repositories" \
-    --cache-dir "$CACHE/containers-apks" --no-scripts --no-chown add "${PINS[@]}"
+    --cache-dir "$CACHE/containers-apks" --no-scripts --no-chown add "${PINS[@]}" "${EXACT_APKS[@]}"
 python3 - "$ROOT" "$WORK/stage" "$REPO_ROOT/config/containers-apks.lock" "$ARCHIVE" <<'PY'
 import gzip, hashlib, io, json, os, shutil, sys, tarfile
 from pathlib import Path
