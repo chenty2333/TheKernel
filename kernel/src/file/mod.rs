@@ -26,6 +26,7 @@ pub(crate) mod af_xdp;
 #[cfg(feature = "bpf")]
 pub mod bpf;
 pub(crate) mod dnotify;
+mod dac_inode;
 pub mod epoll;
 pub mod event;
 pub(crate) mod executable;

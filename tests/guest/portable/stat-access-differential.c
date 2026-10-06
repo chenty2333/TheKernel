@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,6 +53,47 @@ static void access_case(int nr, const char *name) {
     }
     mark("EXISTS_FLAGS"); done();
 }
+static void map_self(const char *file, const char *data) {
+    int fd = open(file, O_WRONLY | O_CLOEXEC);
+    check(fd >= 0, "map-open");
+    check(write(fd, data, strlen(data)) == (ssize_t)strlen(data), "map-write");
+    check(close(fd) == 0, "map-close");
+}
+static void mapped_inode_dac(void) {
+    char base[] = "/tmp/thekernel-dac-XXXXXX";
+    check(mkdtemp(base) != NULL && chmod(base, 0755) == 0, "dac-base");
+    char paths[3][256], made[512];
+    const unsigned owners[3][2] = {{1000,1000}, {0,1000}, {1000,0}};
+    for (int i=0; i<3; ++i) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/d%d", base, i);
+        check(mkdir(paths[i], 0755) == 0 && chown(paths[i], owners[i][0], owners[i][1]) == 0 &&
+              chmod(paths[i], 0555) == 0, "dac-owner-fixture");
+    }
+    fflush(stdout);
+    pid_t child = fork(); check(child >= 0, "dac-fork");
+    if (!child) {
+        check(setgid(1000) == 0 && setuid(1000) == 0, "dac-real-nonroot");
+        check(prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == 0, "dac-self-map-dumpable");
+        check(unshare(CLONE_NEWUSER) == 0, "dac-userns");
+        map_self("/proc/self/setgroups", "deny");
+        map_self("/proc/self/uid_map", "0 1000 1\n");
+        map_self("/proc/self/gid_map", "0 1000 1\n");
+        check(geteuid() == 0 && getegid() == 0, "dac-mapped-root");
+        for (int i=0; i<3; ++i) {
+            snprintf(made, sizeof(made), "%s/child", paths[i]);
+            if (i == 0) check(mkdir(made, 0700) == 0, "mapped-inode-override");
+            else ERROR(mkdir(made, 0700), EACCES, "unmapped-owner-denied");
+        }
+        _exit(0);
+    }
+    int status;
+    check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "dac-child-result");
+    snprintf(made, sizeof(made), "%s/child", paths[0]);
+    check(rmdir(made) == 0, "dac-child-cleanup");
+    for (int i=0; i<3; ++i) check(rmdir(paths[i]) == 0, "dac-parent-cleanup");
+    check(rmdir(base) == 0, "dac-base-cleanup");
+}
 int main(void) {
     access_case(NR_ACCESS, "access.raw-differential");
     access_case(NR_FACCESSAT, "faccessat.raw-differential");
@@ -77,7 +121,8 @@ int main(void) {
     mark("EMPTY_FD_IDENTITY");
     check(syscall(NR_FSTATAT, AT_FDCWD, "/", &result, AT_NO_AUTOMOUNT | 0x6000) == 0,
           "accepted-sync-flags");
-    mark("NO_AUTOMOUNT_SYNC_FLAGS"); done();
+    mark("NO_AUTOMOUNT_SYNC_FLAGS");
+    mapped_inode_dac(); mark("MAPPED_INODE_DAC_OVERRIDE"); done();
 
     begin("statx.raw-differential");
     struct statx sx;

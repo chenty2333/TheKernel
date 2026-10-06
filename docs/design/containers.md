@@ -685,3 +685,30 @@ mapping helpers and reexec, initialized overlay/SQLite, parsed the offline Docke
 archive and reached layer extraction (`shell-8be4qa_8`). It now fails the archive
 extractor's pivot-directory mkdir with EACCES; load/hello remains unaccepted.
 Next diagnose that real rootless path/credential failure, not archive format.
+
+### Mapped inode DAC overrides in a user namespace
+
+Live mkdir diagnostics identified an owned0555 extraction directory (real
+UID/GID1000) and a caller with all effective caps in its new user namespace.
+The old DAC adapter nevertheless required initial-namespace capability authority.
+Linux7.2.3 fs/namei.c generic_permission and kernel/capability.c instead check the
+selected capability in the actor's own namespace plus BOTH inode IDs' mappings.
+The live non-idmapped DAC path now captures that inode scope; normal mode/ACL
+checks still run first, and unmapped UID or GID does not grant an override.
+Frozen selected capability bits and ordered security capability dispatch are
+both required. Synthetic real-ID snapshots and retained nonidentity mount-idmap
+capability dispatch are not broadened by this fix; those boundaries remain.
+
+Host tests cover mapped and separately unmapped UID/GID, a selected-capability
+denial and the regular-file execute-bit restriction. A paired stat-access child
+uses a real UID/GID1000 drop, self-mapped user namespace, positive owned-directory
+mkdir and mandatory EACCES for both unmapped-owner negative fixtures. Temporary
+runtime diagnostics were removed. Kernel2649, lint and system70/70
+(`system-m8ie9xj1`) passed; the paired assertion registry initially lacked the new
+marker and was corrected without weakening it. The Linux self-map fixture also
+needed PR_SET_DUMPABLE after its UID drop; this was corrected in the test, not
+proc access policy. Paired stat-access5/259 (`abi-fgg2cdxi`) and related Python7
+passed, including the positive and both mandatory unmapped-ID denials.
+Actual podman passes pivot-directory creation (`shell-te2rh1rc`) and now fails
+the extractor's fallback chroot with EPERM; image load/hello remains unaccepted.
+Next fix that specific own-user-namespace chroot capability gate.

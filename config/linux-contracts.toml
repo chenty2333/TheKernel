@@ -1640,7 +1640,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate flags and request shape; resolve pathname or fd; provider read then output copy"]
 usercopy = ["usercopy:bounded pathname import and initialized output record copy"]
-state = ["state:read retained inode and mount metadata without mutating target", "state:live proc task directories retain inode identity and report mode0555 with target effective kernel ownership"]
+state = ["state:read retained inode and mount metadata without mutating target", "state:live proc task directories retain inode identity and report mode0555 with target effective kernel ownership", "state:DAC override uses the captured selected capability in the actor user namespace only when both inode IDs map there; unmapped owner or group retains EACCES"]
 concurrency = ["concurrency:retain resolved location or OFD during provider access", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release request-owned pathname and target references on completion"]
 
@@ -4953,7 +4953,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve directory identity and permissions; create typed named nodes or serialize native directory records and update cursor"]
+state = ["state:resolve directory identity and permissions; create typed named nodes or serialize native directory records and update cursor", "state:DAC override uses the captured selected capability in the actor user namespace only when both inode IDs map there; unmapped owner or group retains EACCES"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -4964,7 +4964,7 @@ status = "implemented"
 contract = "linux-mkdir"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_mkdir"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/file/permission.rs:child_namespace_dac_override_requires_both_inode_ids_and_selected_capability", "tests/guest/portable/stat-access-differential.c:mapped_inode_dac"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -4976,7 +4976,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve directory identity and permissions; create typed named nodes or serialize native directory records and update cursor"]
+state = ["state:resolve directory identity and permissions; create typed named nodes or serialize native directory records and update cursor", "state:DAC override uses the captured selected capability in the actor user namespace only when both inode IDs map there; unmapped owner or group retains EACCES"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -4987,7 +4987,7 @@ status = "implemented"
 contract = "linux-mkdirat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_mkdirat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/file/permission.rs:child_namespace_dac_override_requires_both_inode_ids_and_selected_capability", "tests/guest/portable/stat-access-differential.c:mapped_inode_dac"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 

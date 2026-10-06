@@ -19,7 +19,7 @@ pub(super) fn task_directory_metadata(
 mod tests {
     use alloc::{string::String, sync::Arc};
 
-    use axfs_ng_vfs::{FilesystemOps, FsName, VfsError, VfsResult};
+    use axfs_ng_vfs::{FsName, VfsError, VfsResult};
     use axsync::Mutex;
     use tk_linux_cred::{Kgid, Kuid};
 

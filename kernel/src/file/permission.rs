@@ -1019,6 +1019,8 @@ enum DacCapabilityDispatch<'a> {
     SnapshotOnly,
     /// Normal live VFS operation over one exact pinned composite actor.
     Actor(&'a Cred),
+    /// DAC override on an inode whose IDs must both map into the actor namespace.
+    ActorForInode(&'a Cred, u32, u32),
     /// Descriptor operation whose mount idmap pins the namespace relative to
     /// which VFS override capabilities are evaluated.
     ActorInNamespace(&'a Cred, &'a Arc<UserNamespace>),
@@ -1056,13 +1058,24 @@ impl<'a> KernelDacCredentials<'a> {
         }
     }
 
+    fn for_inode(mut self, uid: u32, gid: u32) -> Self {
+        if let DacCapabilityDispatch::Actor(actor) = self.capability_dispatch {
+            self.capability_dispatch = DacCapabilityDispatch::ActorForInode(actor, uid, gid);
+        }
+        self
+    }
+
     fn has_raw_capability(&self, capability: u32) -> bool {
+        if let DacCapabilityDispatch::ActorForInode(actor, uid, gid) = self.capability_dispatch {
+            return super::dac_inode::capable_wrt_inode_ids(actor, self.credentials, uid, gid, capability);
+        }
         if !self.credentials.has_capability(capability) {
             return false;
         }
         match self.capability_dispatch {
             DacCapabilityDispatch::SnapshotOnly => true,
             DacCapabilityDispatch::Actor(actor) => actor.has_effective_capability(capability),
+            DacCapabilityDispatch::ActorForInode(_, _, _) => unreachable!(),
             DacCapabilityDispatch::ActorInNamespace(actor, namespace) => {
                 ns_capable(actor, namespace, capability)
             }
@@ -1232,7 +1245,7 @@ fn dac_access_allowed_with(
     check_linux_dac(
         &linux_node_metadata(perm, owner_uid, owner_gid, node_type),
         linux_access(requested),
-        &credentials,
+        &credentials.for_inode(owner_uid, owner_gid),
     )
     .is_ok()
 }
@@ -1573,7 +1586,8 @@ fn check_inode_permissions_with_projected_metadata(
         // capabilities retain their normal Linux meaning.
         let capable = |capability| {
             capability_user_ns.map_or_else(
-                || actor.has_effective_capability(capability),
+                || KernelDacCredentials::actor_bound(actor, credentials)
+                    .for_inode(metadata.uid, metadata.gid).has_raw_capability(capability),
                 |namespace| ns_capable(actor, namespace, capability),
             )
         };
@@ -2811,6 +2825,27 @@ mod tests {
             !KernelDacCredentials::actor_bound(&child, &synthetic)
                 .has_capability(&(), DacCapability::Override)
         );
+    }
+
+    #[test]
+    fn child_namespace_dac_override_requires_both_inode_ids_and_selected_capability() {
+        use tk_linux_cred::IdMapInputExtent;
+        let root_ns = UserNamespace::try_new_root().unwrap();
+        let root = Cred::try_root(root_ns.clone()).unwrap();
+        let child_ns = root_ns.try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false).unwrap();
+        child_ns.publish_uid_map(child_ns.try_build_uid_map(alloc::vec![IdMapInputExtent::new(0, 1000, 1)]).unwrap()).unwrap();
+        child_ns.publish_gid_map(child_ns.try_build_gid_map(alloc::vec![IdMapInputExtent::new(0, 1000, 1)]).unwrap(), false).unwrap();
+        let child = Cred::try_with_user_namespace(&root, child_ns).unwrap();
+        let dac = child.fs_dac_credentials();
+        assert!(!dac.has_capability(CAP_DAC_OVERRIDE));
+        assert!(check_dac_permissions_with_actor(0, 1000, 1000, NodeType::Directory, W_OK|X_OK, &child, &dac).is_ok());
+        for (uid, gid) in [(0, 1000), (1000, 0), (0, 0)] {
+            assert!(check_dac_permissions_with_actor(0, uid, gid, NodeType::Directory, W_OK|X_OK, &child, &dac).is_err());
+        }
+        let no_caps = credentials(0, 0, &[], &[]);
+        assert!(check_dac_permissions_with_actor(0, 1000, 1000, NodeType::Directory, W_OK|X_OK, &child, &no_caps).is_err());
+        assert!(check_dac_permissions_with_actor(0, 1000, 1000, NodeType::RegularFile, X_OK, &child, &dac).is_err());
+        assert!(check_dac_permissions_with_actor(0o001, 1000, 1000, NodeType::RegularFile, X_OK, &child, &dac).is_ok());
     }
 
     #[test]
