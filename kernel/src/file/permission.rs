@@ -282,6 +282,15 @@ impl VfsSecurityContext {
         })
     }
 
+    pub(crate) fn with_descriptor_mount_authority(self, description: &super::FileDescription) -> AxResult<Self> {
+        if let Some(mount) = description.inner.downcast_ref::<crate::syscall::fs::FsMountFd>() {
+            let idmap = mount.root_idmap()?;
+            self.with_fd_mount_idmap(mount.location().mountpoint().mount_id(), idmap)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// Keeps the actor/current tree while adding a retained detached fd root.
     pub(crate) fn with_fd_mount_idmap(
         mut self,

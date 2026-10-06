@@ -2762,6 +2762,11 @@ fn pseudo_fs_for_mount(source: &str, fs_type: &str, data: &str) -> AxResult<Opti
 }
 
 impl FsMountFd {
+    fn add_to_fd_table(self, cloexec: bool) -> AxResult<i32> {
+        let file: Arc<dyn FileLike> = Arc::try_new(self).map_err(|_| AxError::NoMemory)?;
+        crate::file::add_file_like_with_flags(file, cloexec, linux_raw_sys::general::O_PATH)
+    }
+
     pub(crate) fn root_idmap(&self) -> AxResult<Option<Arc<crate::mounts::MountIdmap>>> {
         let _operation = self.tree.operation.lock();
         let mount_id = self.root.mountpoint().mount_id();
@@ -5526,6 +5531,25 @@ mod tests {
             assert!(!fs_context_create_may_admin(name, &child, &actor));
             assert!(fs_context_create_may_admin(name, &root, &parent));
         }
+    }
+
+    #[test]
+    fn detached_directory_facade_keeps_original_ofd_and_path_only_access() {
+        let fs = MemoryFs::new().unwrap();
+        let root = Mountpoint::new_root(&fs).root_location();
+        let tree = FsMountTreeState::try_new(HashMap::new(), None, None, Vec::new(), Vec::new()).unwrap();
+        let mount = Arc::new(FsMountFd { root: root.clone(), tree: tree.clone() });
+        let description = crate::file::FileDescription::new_with_flags(
+            mount, linux_raw_sys::general::O_PATH,
+        ).unwrap();
+        let directory = Directory::from_description(description.clone()).unwrap();
+        assert!(directory.inner().ptr_eq(&root));
+        assert_eq!(directory.open_file_description_key(), description.id().get());
+        assert_eq!(directory.check_io_access(), Err(AxError::BadFileDescriptor));
+        drop(description);
+        assert_eq!(Arc::strong_count(&tree), 2);
+        drop(directory);
+        assert_eq!(Arc::strong_count(&tree), 1);
     }
 
     #[test]

@@ -725,6 +725,21 @@ int main(int argc, char **argv) {
     int mounted = (int)syscall(NR_FSMOUNT, ctx, FSMOUNT_CLOEXEC, 0);
     check(mounted >= 0, "mount");
     check(fcntl(mounted, F_GETFD) == FD_CLOEXEC, "mount-cloexec");
+    check((fcntl(mounted, F_GETFL) & O_PATH) == O_PATH, "mount-path-status");
+    int relative = openat(mounted, "leaf", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    check(relative >= 0, "detached-directory-create");
+    check(write(relative, "owned", 5) == 5 && close(relative) == 0, "detached-directory-write");
+    struct { uint64_t flags, mode, resolve; } how = { O_RDONLY | O_CLOEXEC, 0, 8 };
+    relative = (int)syscall(SYS_openat2, mounted, "leaf", &how, sizeof(how));
+    check(relative >= 0, "detached-directory-openat2");
+    char contents[8] = {0};
+    check(read(relative, contents, sizeof(contents)) == 5 && !strcmp(contents, "owned"), "detached-directory-read");
+    check(close(relative) == 0, "detached-directory-read-close");
+    char dirents[512];
+    ERROR(syscall(SYS_getdents64, mounted, dirents, sizeof(dirents)), EBADF, "detached-directory-no-data");
+    // Closing the sole detached mount fd disposes this private tmpfs,
+    // including its test leaf; no namespace placement is created.
+    mark("DETACHED_DIRECTORY_PATH_ONLY_LOOKUP");
     check(close(mounted) == 0, "mount-close");
     mark("TMPFS_CLONE_CLOEXEC");
     ERROR(syscall(NR_FSMOUNT, ctx, FSMOUNT_NAMESPACE, 0), EBUSY,

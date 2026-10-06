@@ -385,3 +385,27 @@ its detached fsmount proc-root fd: ENOTDIR. Upstream1.30.1's get_procfd prefers
 that new mount API; the kernel's directory-fd helper currently recognizes only
 its Directory wrapper. Fix that observed path capability next. OCI, memory and
 pids-limit acceptance remain pending; rootless podman has not been attempted.
+
+### Detached directory path capabilities
+
+Directory-fd resolution now accepts an actual directory-root FsMountFd while
+retaining its original OFD and provider-tree custody. Mount descriptors publish
+real O_PATH status: they support pathname lookup, not read/getdents data access.
+Legacy openat captures its exact dirfd once and keeps it through provider work;
+openat2 uses its existing retained description. Both carry the root's idmap
+into VFS authority, and an unscoped absolute path still ignores dirfd.
+
+Validated: kernel2637 (same OFD identity/tree custody and O_PATH data refusal),
+q35 lint784, KVM system70/70 (`system-b5xv2ge7`), selected
+mount-api/fd-lifecycle/fs-abi41/259 (`abi-38hfxsm5`). The raw detached tmpfs root
+supports openat creation and bounded openat2 read, reports O_PATH, and refuses
+getdents with EBADF. The first new fixture unnecessarily tried unlink cleanup;
+Linux returned ENOENT before candidate execution. The fixture now closes its
+sole private mount fd to dispose the whole tmpfs. That failed assertion is not
+counted as passed, and this regression does not establish unlinkat or distinct
+idmaps on recursively detached submounts.
+
+Actual crun now passes detached-proc reads, enters the six configured namespace
+classes and reports the real child PID, but exits1 because
+`/proc/sys/kernel/cap_last_cap` is absent (`shell-rg_ed0t0`). OCI command/exits and
+resource limits remain pending; add that real capability-bound node next.

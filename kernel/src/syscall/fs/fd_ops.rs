@@ -54,7 +54,7 @@ use crate::{
             initial_named_create_owner_mode_with_security_at,
         },
         pipe::{NamedPipe, PipeEndpoint},
-        prepare_file_description_with_open_lease, reserve_fd_in, resolve_at, with_path_fs,
+        prepare_file_description_with_open_lease, reserve_fd_in, resolve_at,
     },
     mm::{UserMemoryCapability, map_usercopy_error},
     pseudofs::{Device, dev::tty},
@@ -612,12 +612,7 @@ fn openat2_dirfd_base(
             return Ok(location.clone());
         }
     }
-    Ok(description
-        .file_handle()
-        .downcast::<Directory>()
-        .map_err(|_| AxError::NotADirectory)?
-        .inner()
-        .clone())
+    Ok(Directory::from_description(description)?.inner().clone())
 }
 
 fn openat2_context(
@@ -663,6 +658,7 @@ struct OpenPathSecurityContext {
     umask: u32,
     fanotify_actor: crate::file::fanotify::FanotifyEventActor,
     controlling_terminal: Option<Arc<dyn Any + Send + Sync>>,
+    retained_dirfd: Option<Arc<FileDescription>>,
 }
 
 impl OpenPathSecurityContext {
@@ -695,6 +691,7 @@ impl OpenPathSecurityContext {
             umask,
             fanotify_actor,
             controlling_terminal,
+            retained_dirfd: None,
         }
     }
 
@@ -1754,15 +1751,16 @@ pub(crate) fn openat_inner(
     let curr = current();
     let thread = curr.as_thread();
     let task_snapshot = thread.namespace_credential_fs_snapshot();
+    let retained_dirfd = if !path.is_absolute() && dirfd != AT_FDCWD {
+        get_file_description(dirfd).ok()
+    } else { None };
     let path_topology = if !path.is_absolute() && dirfd != AT_FDCWD {
-        get_file_description(dirfd)
-            .ok()
-            .and_then(|description| description.vfs_mount_topology())
+        retained_dirfd.as_ref().and_then(|description| description.vfs_mount_topology())
             .unwrap_or_else(|| task_snapshot.mount_topology.clone())
     } else {
         task_snapshot.mount_topology.clone()
     };
-    let security = OpenPathSecurityContext::with_execution_actor(
+    let mut security = OpenPathSecurityContext::with_execution_actor(
         task_snapshot.credential,
         task_snapshot.fs_context.lock().umask(),
         path_topology,
@@ -1770,6 +1768,7 @@ pub(crate) fn openat_inner(
         task_snapshot.controlling_terminal,
         crate::file::fanotify::FanotifyEventActor::current(),
     );
+    security.retained_dirfd = retained_dirfd;
     openat_inner_with_context(dirfd, path, flags, mode, security)
 }
 
@@ -1778,9 +1777,12 @@ fn openat_inner_with_context(
     path: &FsPath,
     flags: i32,
     mode: __kernel_mode_t,
-    security: OpenPathSecurityContext,
+    mut security: OpenPathSecurityContext,
 ) -> AxResult<isize> {
     let flags = normalize_legacy_open_flags(flags)?;
+    if let Some(description) = security.retained_dirfd.as_ref() {
+        security.vfs = security.vfs.clone().with_descriptor_mount_authority(description)?;
+    }
     // Named/anonymous creation is a specialized VFS+FD transaction: the FD
     // slot stays private until open construction succeeds, and the namespace
     // guard keeps writable-mount admission stable through inode publication.
@@ -1788,7 +1790,7 @@ fn openat_inner_with_context(
         open_requires_namespace_operation(flags as u32, 0).then(crate::mounts::namespace_operation);
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
         let mut policy = Openat2PathwalkPolicy::legacy()?;
-        return with_path_fs(dirfd, path, |fs| {
+        return crate::file::fs::with_path_fs_at_description(dirfd, path, security.retained_dirfd.as_ref(), |fs| {
             open_tmpfile_in_fs(
                 fs,
                 path,
@@ -1801,7 +1803,7 @@ fn openat_inner_with_context(
         });
     }
 
-    with_path_fs(dirfd, path, |fs| {
+    crate::file::fs::with_path_fs_at_description(dirfd, path, security.retained_dirfd.as_ref(), |fs| {
         open_in_fs(fs, path, flags, mode, &security)
     })
 }
@@ -2076,7 +2078,7 @@ pub(crate) fn openat2_copied_with_snapshot(
     } else {
         task_snapshot.mount_topology.clone()
     };
-    let security = OpenPathSecurityContext::with_execution_actor(
+    let mut security = OpenPathSecurityContext::with_execution_actor(
         task_snapshot.credential.clone(),
         task_snapshot.fs_snapshot.umask(),
         path_topology,
@@ -2084,6 +2086,11 @@ pub(crate) fn openat2_copied_with_snapshot(
         task_snapshot.controlling_terminal.clone(),
         fanotify_actor,
     );
+    if (!path.is_absolute() || how.resolve & RESOLVE_IN_ROOT as u64 != 0)
+        && let Some(description) = retained_dirfd
+    {
+        security.vfs = security.vfs.with_descriptor_mount_authority(description)?;
+    }
     // Use one guard for both scoped pathwalk and creation. Combining the
     // predicates before acquisition avoids recursively locking the non-
     // reentrant namespace mutex when openat2 requests both.

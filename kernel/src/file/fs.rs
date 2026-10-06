@@ -364,8 +364,8 @@ pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -
     if dirfd == AT_FDCWD {
         f(&mut fs)
     } else {
-        let dir = Directory::from_fd(dirfd)?.inner.clone();
-        f(&mut fs.with_current_dir(dir)?)
+        let dir = Directory::from_fd(dirfd)?;
+        f(&mut fs.with_current_dir(dir.inner.clone())?)
     }
 }
 
@@ -384,6 +384,21 @@ fn with_path_fs_snapshot<R>(
     path: &FsPath,
     f: impl FnOnce(&mut FsContext) -> AxResult<R>,
 ) -> AxResult<R> {
+    with_path_fs_snapshot_at(fs_context, dirfd, path, None, f)
+}
+
+pub(crate) fn with_path_fs_at_description<R>(
+    dirfd: c_int, path: &FsPath, retained: Option<&Arc<super::FileDescription>>,
+    f: impl FnOnce(&mut FsContext) -> AxResult<R>,
+) -> AxResult<R> {
+    with_path_fs_snapshot_at(&current_fs_context(), dirfd, path, retained, f)
+}
+
+fn with_path_fs_snapshot_at<R>(
+    fs_context: &Mutex<FsContext>, dirfd: c_int, path: &FsPath,
+    retained: Option<&Arc<super::FileDescription>>,
+    f: impl FnOnce(&mut FsContext) -> AxResult<R>,
+) -> AxResult<R> {
     // Pin root/cwd/umask, then release fs_struct before calling providers.
     // Procfs may inspect this very task's root while resolving a pathname.
     // Actual fs_struct mutation still goes through with_fs, not this view.
@@ -391,8 +406,11 @@ fn with_path_fs_snapshot<R>(
     if dirfd == AT_FDCWD || path.is_absolute() {
         f(&mut fs)
     } else {
-        let dir = Directory::from_fd(dirfd)?.inner.clone();
-        f(&mut fs.with_current_dir(dir)?)
+        let dir = match retained {
+            Some(description) => Directory::from_description(description.clone())?,
+            None => Directory::from_fd(dirfd)?,
+        };
+        f(&mut fs.with_current_dir(dir.inner.clone())?)
     }
 }
 
@@ -1664,6 +1682,19 @@ pub struct Directory {
 }
 
 impl Directory {
+    pub(crate) fn from_description(description: Arc<super::FileDescription>) -> AxResult<FileHandle<Self>> {
+        let handle = description.file_handle();
+        if let Ok(directory) = handle.downcast::<Self>() {
+            return Ok(directory);
+        }
+        let mount = handle.downcast_ref::<crate::syscall::fs::FsMountFd>()
+            .ok_or(AxError::NotADirectory)?;
+        let location = mount.location().clone();
+        location.check_is_dir()?;
+        let file = Arc::try_new(Self::new(location)).map_err(|_| AxError::NoMemory)?;
+        Ok(FileHandle { description, file })
+    }
+
     pub fn new(inner: Location) -> Self {
         Self {
             inner,
@@ -1755,11 +1786,7 @@ impl FileLike for Directory {
     }
 
     fn from_fd(fd: c_int) -> AxResult<FileHandle<Self>> {
-        match get_typed_file(fd) {
-            Ok(file) => Ok(file),
-            Err(AxError::InvalidInput) => Err(AxError::NotADirectory),
-            Err(err) => Err(err),
-        }
+        Self::from_description(super::get_file_description(fd)?)
     }
 }
 
