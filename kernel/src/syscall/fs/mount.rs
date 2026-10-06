@@ -1464,7 +1464,8 @@ fn legacy_overlay_options(data: &[u8]) -> AxResult<OverlayMountOptions> {
     }
     for option in data.split(|byte| *byte == b',') {
         let Some(separator) = option.iter().position(|byte| *byte == b'=') else {
-            return Err(AxError::InvalidInput);
+            options.set_flag(option)?;
+            continue;
         };
         let (key, value) = (&option[..separator], &option[separator + 1..]);
         options.set_option(key, value).map_err(AxError::from)?;
@@ -1527,6 +1528,9 @@ fn overlay_options_record_data(options: &OverlayMountOptions) -> AxResult<String
     if let Some(path) = &options.workdir {
         push(b",workdir=")?;
         push(path.as_bytes())?;
+    }
+    if options.features.userxattr {
+        push(b",userxattr")?;
     }
     for (name, enabled) in [
         (b"redirect_dir".as_slice(), options.features.redirect_dir),
@@ -2972,10 +2976,15 @@ pub fn sys_fsconfig<M: UserMemory + ?Sized>(
                 return Err(AxError::InvalidInput);
             }
             if state.fs_type == "overlay" {
-                // Overlay's feature vocabulary is explicitly `key=on|off`;
-                // accepting a generic flag would make the ledger diverge
-                // from `OverlayMountOptions`.
-                return Err(AxError::InvalidInput);
+                let entry_len = key.len().checked_add(1).ok_or(AxError::NoMemory)?;
+                if state.config_len.saturating_add(entry_len) > 4096 {
+                    return Err(AxError::InvalidInput);
+                }
+                state.overlay.as_mut().ok_or(AxError::InvalidInput)?
+                    .set_flag(key.as_bytes())?;
+                state.data = overlay_options_record_data(state.overlay.as_ref().ok_or(AxError::InvalidInput)?)?;
+                state.config_len += entry_len;
+                return Ok(0);
             }
             if state.fs_type == "xfs" && key != "norecovery" {
                 return Err(AxError::InvalidInput);

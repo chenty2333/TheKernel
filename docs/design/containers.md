@@ -804,3 +804,35 @@ whiteout creation and attempts native overlay mounts (`shell-a3oiargr`), which
 fail EINVAL. Its real rootless userxattr flag is unsupported by the overlay
 parser. Next implement that option's actual user.overlay metadata dialect,
 not ignore it or fake a native-support marker. Hello remains unaccepted.
+
+### Native overlay userxattr storage
+
+The real rootless storage probe needs Linux's bare userxattr flag, not a dummy
+support marker. Legacy mount and modern fsconfig FLAG now set the same real
+feature selection and ledger representation. Backing transactions, lookup,
+copy-up identity/index/journal attributes and merged xattr filtering select
+user.overlay.* rather than trusted.overlay.*. Userxattr rejects redirect_dir
+and metacopy conflicts and never follows a forged user redirect, matching
+Linux7.2.3 fs/overlayfs/params.c's nofollow rule. Volatile is also accepted as a
+real flag; existing string option behavior is not replaced by a parallel path.
+
+A real MemoryFs-backed overlay test exercises copied-up origin metadata, lower
+inode non-mutation, private attribute rejection/list filtering, actual whiteout,
+opaque-directory lookup, malformed user redirect nofollow and remount. It exposed
+four preexisting blockers also needed by native storage: provider readdir sinks
+must not recursively look up their locked directory (snapshot children before
+visiting); recovery must skip dot entries; missing control xattrs may be ENODATA,
+not only ENOENT; and upper-only layers must not eagerly index lower[0]. Copy-up
+also must omit rdev for non-device nodes. These were corrected without dropping
+error checks or weakening the fixture.
+
+Validated axfs232 and kernel2654 host tests, KVM system70/70 (`system-qv2qcoog`),
+q35 lint784 after removing two new redundant conversions, and paired mount-api
+11/259 (`abi-a50odpx_`). The first accidental parallel axfs run failed existing
+shared cache-accounting tests; the required serial feature-complete run passed.
+All temporary traces and the owned hung test process were removed.
+Actual UID1000 podman now proves native overlay support, loads the offline image,
+mounts its container root with userxattr/volatile and writes a real OCI spec
+(`shell-qz9q8b6h`). It reaches conmon, whose sync channel yields no JSON; stderr
+reports an oom_score_adj permission failure. Container hello remains unaccepted.
+Next inspect that genuine conmon startup/IPC failure.

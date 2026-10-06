@@ -21,6 +21,8 @@ pub(crate) mod proc;
 mod proc_exe;
 mod proc_capabilities;
 mod proc_ownership;
+#[cfg(test)]
+mod overlay_userxattr_tests;
 mod proc_inventory;
 mod proc_interrupts;
 mod proc_memory;

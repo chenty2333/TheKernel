@@ -34,6 +34,10 @@ use hashbrown::HashSet;
 /// Linux bounds the number of lower layers to avoid unbounded recursive
 /// lookup/copy-up state.  Keep the bound explicit in the provider rather than
 /// relying on a caller-side allocation limit.
+#[path = "overlay_xattr.rs"]
+mod xattr_namespace;
+use xattr_namespace::{control_key, private_name};
+
 pub const OVERLAY_MAX_LAYERS: usize = 500;
 
 /// Persistent overlay feature selection.  Each member has a real on-disk
@@ -47,6 +51,7 @@ pub struct OverlayFeatures {
     pub metacopy: bool,
     pub nfs_export: bool,
     pub volatile: bool,
+    pub userxattr: bool,
 }
 
 /// Raw, unresolved fsconfig values.  Resolution is intentionally separate:
@@ -96,6 +101,16 @@ impl OverlayMountOptions {
         Ok(())
     }
 
+    /// Applies a Linux flag parameter without manufacturing a string value.
+    pub fn set_flag(&mut self, key: &[u8]) -> VfsResult<()> {
+        match key {
+            b"userxattr" => self.features.userxattr = true,
+            b"volatile" => self.features.volatile = true,
+            _ => return Err(VfsError::InvalidInput),
+        }
+        Ok(())
+    }
+
     /// Checks the configuration combinations independent of live dentries.
     pub fn validate_shape(&self) -> VfsResult<()> {
         if self.lowerdirs.is_empty() || self.lowerdirs.len() > OVERLAY_MAX_LAYERS {
@@ -106,7 +121,8 @@ impl OverlayMountOptions {
         }
         // metacopy needs an upper metadata inode; nfs_export depends on a
         // persistent index, and volatile explicitly cannot promise it.
-        if self.features.metacopy && self.upperdir.is_none()
+        if self.features.userxattr && (self.features.redirect_dir || self.features.metacopy)
+            || self.features.metacopy && self.upperdir.is_none()
             || self.features.nfs_export && (!self.features.index || self.features.volatile)
             || self.features.volatile && self.features.nfs_export
         {
@@ -522,7 +538,9 @@ pub trait OverlayWriteBackend: Send + Sync {
 /// and is removed during mount recovery.  No operation publishes an empty
 /// upper inode and fills it later.
 #[derive(Default)]
-pub struct VfsOverlayWriteBackend;
+pub struct VfsOverlayWriteBackend {
+    userxattr: bool,
+}
 
 impl VfsOverlayWriteBackend {
     fn stage_name(&self) -> VfsResult<FsNameBuf> {
@@ -568,7 +586,7 @@ impl VfsOverlayWriteBackend {
         let provider = entry
             .xattr_provider()
             .ok_or(VfsError::OperationNotSupported)?;
-        match provider.get_xattr(OVERLAY_INDEX_KIND) {
+        match provider.get_xattr(control_key(self.userxattr, OVERLAY_INDEX_KIND)) {
             Ok(value) if value.as_slice() == OVERLAY_INDEX_FILE => Ok(OverlayIndexKind::File),
             Ok(value) if value.as_slice() == OVERLAY_INDEX_DIRECTORY_MARKER => {
                 Ok(OverlayIndexKind::DirectoryMarker)
@@ -619,12 +637,12 @@ impl VfsOverlayWriteBackend {
                 let xattrs = entry
                     .xattr_provider()
                     .ok_or(VfsError::OperationNotSupported)?;
-                let origin = match xattrs.get_xattr(OVERLAY_ORIGIN) {
+                let origin = match xattrs.get_xattr(control_key(self.userxattr, OVERLAY_ORIGIN)) {
                     Ok(value) => Self::decode_key(&value),
                     Err(VfsError::NotFound) => None,
                     Err(error) => return Err(error),
                 };
-                let pending = match xattrs.get_xattr(OVERLAY_INDEX_PENDING) {
+                let pending = match xattrs.get_xattr(control_key(self.userxattr, OVERLAY_INDEX_PENDING)) {
                     Ok(_) => true,
                     Err(VfsError::NotFound) => false,
                     Err(error) => return Err(error),
@@ -703,7 +721,7 @@ impl VfsOverlayWriteBackend {
                     let xattrs = entry
                         .xattr_provider()
                         .ok_or(VfsError::OperationNotSupported)?;
-                    let origin = match xattrs.get_xattr(OVERLAY_ORIGIN) {
+                    let origin = match xattrs.get_xattr(control_key(self.userxattr, OVERLAY_ORIGIN)) {
                         Ok(value) => Self::decode_key(&value),
                         Err(VfsError::NotFound) => None,
                         Err(error) => return Err(error),
@@ -742,14 +760,14 @@ impl VfsOverlayWriteBackend {
             // sync it before the recognisable kind.  Xattr updates are not a
             // compound atomic write, so doing this in the other order could
             // leave a durable kind that recovery mistakes for publication.
-            xattrs.set_xattr(OVERLAY_INDEX_PENDING, b"y", XattrSetMode::Upsert)?;
+            xattrs.set_xattr(control_key(self.userxattr, OVERLAY_INDEX_PENDING), b"y", XattrSetMode::Upsert)?;
             marker.sync(false)?;
             index.sync(false)?;
             work.sync(false)?;
             // A crash after this point has an unambiguous pending directory
             // marker.  Its payload/origin cannot be reused as a file index.
             xattrs.set_xattr(
-                OVERLAY_INDEX_KIND,
+                control_key(self.userxattr, OVERLAY_INDEX_KIND),
                 OVERLAY_INDEX_DIRECTORY_MARKER,
                 XattrSetMode::Upsert,
             )?;
@@ -763,7 +781,7 @@ impl VfsOverlayWriteBackend {
             self.set_origin(&marker, lower)?;
             self.set_index(&marker, lower)?;
             xattrs.set_xattr(
-                OVERLAY_INDEX_TARGET,
+                control_key(self.userxattr, OVERLAY_INDEX_TARGET),
                 &Self::encode_key(staged.object_key()),
                 XattrSetMode::Upsert,
             )?;
@@ -791,11 +809,11 @@ impl VfsOverlayWriteBackend {
         // A regular index hardlink may expose the staged inode's already
         // durable origin.  Persist pending before its file discriminator so
         // no crash can make an unpublished link look committed.
-        xattrs.set_xattr(OVERLAY_INDEX_PENDING, b"y", XattrSetMode::Upsert)?;
+        xattrs.set_xattr(control_key(self.userxattr, OVERLAY_INDEX_PENDING), b"y", XattrSetMode::Upsert)?;
         entry.sync(false)?;
         index.sync(false)?;
         work.sync(false)?;
-        xattrs.set_xattr(OVERLAY_INDEX_KIND, OVERLAY_INDEX_FILE, XattrSetMode::Upsert)?;
+        xattrs.set_xattr(control_key(self.userxattr, OVERLAY_INDEX_KIND), OVERLAY_INDEX_FILE, XattrSetMode::Upsert)?;
         entry.sync(false)?;
         index.sync(false)?;
         work.sync(false)
@@ -808,7 +826,7 @@ impl VfsOverlayWriteBackend {
         match entry
             .xattr_provider()
             .ok_or(VfsError::OperationNotSupported)?
-            .remove_xattr(OVERLAY_INDEX_PENDING)
+            .remove_xattr(control_key(self.userxattr, OVERLAY_INDEX_PENDING))
         {
             Ok(()) | Err(VfsError::NotFound) => {}
             Err(error) => return Err(error),
@@ -822,7 +840,7 @@ impl VfsOverlayWriteBackend {
         let Some(provider) = entry.xattr_provider() else {
             return Ok(None);
         };
-        match provider.get_xattr(OVERLAY_INDEX_TARGET) {
+        match provider.get_xattr(control_key(self.userxattr, OVERLAY_INDEX_TARGET)) {
             Ok(value) => {
                 let target = Self::decode_key(&value).ok_or(VfsError::InvalidInput)?;
                 if entry.len()? != 24 {
@@ -858,7 +876,7 @@ impl VfsOverlayWriteBackend {
             }
             let directory = location.entry().as_dir()?;
             let mut failure = None;
-            directory.read_dir(0, &mut |name: &FsName, _, _, _| {
+            visit_directory_entries(directory, &mut |name: &FsName, _, _, _| {
                 if name.as_bytes() == b"." || name.as_bytes() == b".." {
                     return true;
                 }
@@ -919,7 +937,7 @@ impl VfsOverlayWriteBackend {
                 )?)?,
             )),
             project_id: Some(meta.project_id),
-            rdev: Some(meta.rdev),
+            rdev: matches!(meta.node_type, NodeType::CharacterDevice | NodeType::BlockDevice).then_some(meta.rdev),
             atime: Some(meta.atime),
             mtime: Some(meta.mtime),
             ctime: Some(meta.ctime),
@@ -946,7 +964,7 @@ impl VfsOverlayWriteBackend {
         {
             // Overlay control state belongs to this transaction, never to an
             // arbitrary lower inode which may be supplied by another mount.
-            if raw_name.starts_with(b"trusted.overlay.") {
+            if private_name(self.userxattr, raw_name) {
                 continue;
             }
             let value = source.get_xattr(raw_name)?;
@@ -1025,7 +1043,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
         // after the next mount.
         let mut stale = Vec::new();
         let mut scan_error = None;
-        directory.read_dir(0, &mut |name: &FsName, _, _, _| {
+        visit_directory_entries(directory, &mut |name: &FsName, _, _, _| {
             if name.as_bytes().starts_with(b".ovl.stage.") {
                 let owned = match FsNameBuf::from_vec(name.as_bytes().to_vec()) {
                     Ok(owned) => owned,
@@ -1061,7 +1079,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
         let mut stale_index = Vec::new();
         let mut committed_pending = Vec::new();
         let mut recovery_error = None;
-        index_dir.read_dir(0, &mut |name: &FsName, _, _, _| {
+        visit_directory_entries(index_dir, &mut |name: &FsName, _, _, _| {
             let entry = match index_dir.lookup(name) {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -1088,7 +1106,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
                 recovery_error = Some(VfsError::OperationNotSupported);
                 return false;
             };
-            let origin = match xattrs.get_xattr(OVERLAY_ORIGIN) {
+            let origin = match xattrs.get_xattr(control_key(self.userxattr, OVERLAY_ORIGIN)) {
                 Ok(value) => Self::decode_key(&value),
                 // A missing origin is an explicitly invalid index record.
                 Err(VfsError::NotFound) => None,
@@ -1142,7 +1160,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
                     return false;
                 }
             };
-            let pending = match xattrs.get_xattr(OVERLAY_INDEX_PENDING) {
+            let pending = match xattrs.get_xattr(control_key(self.userxattr, OVERLAY_INDEX_PENDING)) {
                 Ok(_) => true,
                 // The marker is optional once publication has committed.
                 Err(VfsError::NotFound) => false,
@@ -1209,7 +1227,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
             match entry
                 .xattr_provider()
                 .ok_or(VfsError::OperationNotSupported)?
-                .remove_xattr(OVERLAY_INDEX_PENDING)
+                .remove_xattr(control_key(self.userxattr, OVERLAY_INDEX_PENDING))
             {
                 Ok(()) | Err(VfsError::NotFound) => {}
                 Err(error) => return Err(error),
@@ -1250,7 +1268,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
             node_type: metadata.node_type,
             permission: metadata.mode,
             owner: Some((metadata.uid, metadata.gid)),
-            rdev: Some(metadata.rdev),
+            rdev: matches!(metadata.node_type, NodeType::CharacterDevice | NodeType::BlockDevice).then_some(metadata.rdev),
             initial_data: None,
             initial_attributes: Default::default(),
         };
@@ -1417,7 +1435,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
                 .entry()
                 .xattr_provider()
                 .ok_or(VfsError::OperationNotSupported)?
-                .set_xattr(OVERLAY_WHITEOUT, b"y", XattrSetMode::Upsert)?;
+                .set_xattr(control_key(self.userxattr, OVERLAY_WHITEOUT), b"y", XattrSetMode::Upsert)?;
             whiteout.sync(false)?;
             work.sync(false)?;
             self.publish(work, &staged, upper_parent, name)?;
@@ -1462,7 +1480,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
                 .entry()
                 .xattr_provider()
                 .ok_or(VfsError::OperationNotSupported)?
-                .set_xattr(OVERLAY_WHITEOUT, b"y", XattrSetMode::Upsert)?;
+                .set_xattr(control_key(self.userxattr, OVERLAY_WHITEOUT), b"y", XattrSetMode::Upsert)?;
             whiteout.sync(false)?;
             work.sync(false)?;
             work_dir.rename(
@@ -1487,7 +1505,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
             .entry()
             .xattr_provider()
             .ok_or(VfsError::OperationNotSupported)?;
-        let mut entries = match xattr.get_xattr(OVERLAY_TOMBSTONES) {
+        let mut entries = match xattr.get_xattr(control_key(self.userxattr, OVERLAY_TOMBSTONES)) {
             Ok(entries) => entries,
             Err(VfsError::NotFound) => Vec::new(),
             Err(error) => return Err(error),
@@ -1503,7 +1521,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
             .map_err(|_| VfsError::NoMemory)?;
         entries.extend_from_slice(name.as_bytes());
         entries.push(0);
-        xattr.set_xattr(OVERLAY_TOMBSTONES, &entries, XattrSetMode::Upsert)?;
+        xattr.set_xattr(control_key(self.userxattr, OVERLAY_TOMBSTONES), &entries, XattrSetMode::Upsert)?;
         upper_parent.sync(false)
     }
 
@@ -1513,9 +1531,9 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
             .xattr_provider()
             .ok_or(VfsError::OperationNotSupported)?;
         if opaque {
-            xattr.set_xattr(OVERLAY_OPAQUE, b"y", XattrSetMode::Upsert)?;
+            xattr.set_xattr(control_key(self.userxattr, OVERLAY_OPAQUE), b"y", XattrSetMode::Upsert)?;
         } else {
-            xattr.remove_xattr(OVERLAY_OPAQUE)?;
+            xattr.remove_xattr(control_key(self.userxattr, OVERLAY_OPAQUE))?;
         }
         upper_dir.sync(false)
     }
@@ -1525,7 +1543,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
             .entry()
             .xattr_provider()
             .ok_or(VfsError::OperationNotSupported)?
-            .set_xattr(OVERLAY_REDIRECT, target.as_bytes(), XattrSetMode::Upsert)?;
+            .set_xattr(control_key(self.userxattr, OVERLAY_REDIRECT), target.as_bytes(), XattrSetMode::Upsert)?;
         upper.sync(false)
     }
 
@@ -1535,7 +1553,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
             .xattr_provider()
             .ok_or(VfsError::OperationNotSupported)?;
         provider.set_xattr(
-            OVERLAY_ORIGIN,
+            control_key(self.userxattr, OVERLAY_ORIGIN),
             &Self::encode_key(lower),
             XattrSetMode::Upsert,
         )
@@ -1547,7 +1565,7 @@ impl OverlayWriteBackend for VfsOverlayWriteBackend {
             .xattr_provider()
             .ok_or(VfsError::OperationNotSupported)?
             .set_xattr(
-                OVERLAY_INDEX,
+                control_key(self.userxattr, OVERLAY_INDEX),
                 &Self::encode_key(lower),
                 XattrSetMode::Upsert,
             )
@@ -1625,7 +1643,7 @@ impl OverlayFilesystem {
             // Keep the public storage type erased: callers of the generic
             // constructor must observe the same backend contract as callers
             // that provide a provider-specific implementation.
-            Some(Arc::new(VfsOverlayWriteBackend))
+            Some(Arc::new(VfsOverlayWriteBackend { userxattr: topology.features.userxattr }))
         } else {
             None
         };
@@ -1731,7 +1749,7 @@ impl OverlayFilesystem {
             }
             let directory = location.entry().as_dir()?;
             let mut failure = None;
-            directory.read_dir(0, &mut |name: &FsName, _, _, _| {
+            visit_directory_entries(directory, &mut |name: &FsName, _, _, _| {
                 if name.as_bytes() == b"." || name.as_bytes() == b".." {
                     return true;
                 }
@@ -1770,7 +1788,7 @@ impl OverlayFilesystem {
             let matches = location
                 .entry()
                 .xattr_provider()
-                .and_then(|xattrs| xattrs.get_xattr(OVERLAY_ORIGIN).ok())
+                .and_then(|xattrs| xattrs.get_xattr(control_key(self.topology.features.userxattr, OVERLAY_ORIGIN)).ok())
                 .and_then(|value| VfsOverlayWriteBackend::decode_key(&value))
                 == Some(origin);
             if matches {
@@ -1781,7 +1799,7 @@ impl OverlayFilesystem {
             }
             let directory = location.entry().as_dir()?;
             let mut failure = None;
-            directory.read_dir(0, &mut |name: &FsName, _, _, _| {
+            visit_directory_entries(directory, &mut |name: &FsName, _, _, _| {
                 if name.as_bytes() == b"." || name.as_bytes() == b".." {
                     return true;
                 }
@@ -1925,7 +1943,7 @@ impl FilesystemOps for OverlayFilesystem {
             .entry()
             .xattr_provider()
             .ok_or(VfsError::NotFound)?
-            .get_xattr(OVERLAY_ORIGIN)
+            .get_xattr(control_key(self.topology.features.userxattr, OVERLAY_ORIGIN))
         {
             Ok(value) => VfsOverlayWriteBackend::decode_key(&value).ok_or(VfsError::NotFound)?,
             Err(VfsError::NotFound) if location.entry().is_dir() => {
@@ -2033,7 +2051,7 @@ struct OverlayLayers {
 
 impl OverlayLayers {
     fn visible(&self) -> &Location {
-        self.upper.as_ref().unwrap_or(&self.lower[0])
+        self.upper.as_ref().unwrap_or_else(|| &self.lower[0])
     }
 }
 
@@ -2059,14 +2077,11 @@ fn redirect_path(keys: &[Location]) -> VfsResult<FsPathBuf> {
     Ok(FsPathBuf::from_vec(text.into_bytes()))
 }
 
-fn redirect_keys(location: &Location) -> VfsResult<Option<Vec<ObjectKey>>> {
-    let Some(provider) = location.entry().xattr_provider() else {
-        return Ok(None);
-    };
-    let value = match provider.get_xattr(OVERLAY_REDIRECT) {
-        Ok(value) => value,
-        Err(VfsError::NotFound) => return Ok(None),
-        Err(error) => return Err(error),
+fn redirect_keys(location: &Location, userxattr: bool) -> VfsResult<Option<Vec<ObjectKey>>> {
+    if userxattr { return Ok(None); }
+    let value = match get_overlay_control_xattr(location.entry(), control_key(userxattr, OVERLAY_REDIRECT))? {
+        Some(value) => value,
+        None => return Ok(None),
     };
     let text = core::str::from_utf8(&value).map_err(|_| VfsError::InvalidInput)?;
     let value = text
@@ -2248,13 +2263,13 @@ impl OverlayDir {
         let tombstoned = self
             .present_upper()
             .as_ref()
-            .map(|parent| location_has_tombstone(parent, name))
+            .map(|parent| location_has_tombstone(parent, name, self.fs.topology.features.userxattr))
             .transpose()?
             .unwrap_or(false);
         if let Some(parent) = self.present_upper().as_ref() {
             match parent.entry().as_dir()?.lookup(name) {
                 Ok(entry) => {
-                    if is_whiteout(&entry)? {
+                    if is_whiteout(&entry, self.fs.topology.features.userxattr)? {
                         return Err(VfsError::NotFound);
                     }
                     let node_type = entry.node_type();
@@ -2280,12 +2295,12 @@ impl OverlayDir {
         let mut lower = Vec::new();
         let upper_is_opaque = upper
             .as_ref()
-            .map(location_is_opaque)
+            .map(|location| location_is_opaque(location, self.fs.topology.features.userxattr))
             .transpose()?
             .unwrap_or(false);
         if !tombstoned && !upper_is_opaque {
             let redirected =
-                if let Some(redirects) = upper.as_ref().map(redirect_keys).transpose()?.flatten() {
+                if let Some(redirects) = upper.as_ref().map(|location| redirect_keys(location, self.fs.topology.features.userxattr)).transpose()?.flatten() {
                     lower
                         .try_reserve(redirects.len())
                         .map_err(|_| VfsError::NoMemory)?;
@@ -2345,7 +2360,7 @@ impl OverlayDir {
         for lower in &self.layers.lower {
             match lower.entry().as_dir()?.lookup(name) {
                 Ok(entry) => {
-                    if !is_whiteout(&entry)? {
+                    if !is_whiteout(&entry, self.fs.topology.features.userxattr)? {
                         return Ok(true);
                     }
                 }
@@ -2427,7 +2442,7 @@ fn materialize_overlay_tree(
 ) -> VfsResult<()> {
     let lower_dir = lower.entry().as_dir()?;
     let mut failure = None;
-    lower_dir.read_dir(0, &mut |name: &FsName, _, kind, _| {
+    visit_directory_entries(lower_dir, &mut |name: &FsName, _, kind, _| {
         if name.as_bytes() == b"." || name.as_bytes() == b".." {
             return true;
         }
@@ -2447,7 +2462,7 @@ fn materialize_overlay_tree(
             }
         };
         let upper_child = match upper_dir.lookup(name) {
-            Ok(entry) => match is_whiteout(&entry) {
+            Ok(entry) => match is_whiteout(&entry, filesystem.topology.features.userxattr) {
                 Ok(true) => return true,
                 Ok(false) => Location::new(upper.mountpoint().clone(), entry),
                 Err(error) => {
@@ -2566,7 +2581,7 @@ impl NodeOps for OverlayDir {
 /// and therefore through the copy-up transaction.
 impl axfs_ng_vfs::XattrProvider for OverlayDir {
     fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>> {
-        reject_overlay_control_xattr(name)?;
+        reject_overlay_control_xattr(name, self.fs.topology.features.userxattr)?;
         self.active_location()
             .entry()
             .xattr_provider()
@@ -2580,10 +2595,10 @@ impl axfs_ng_vfs::XattrProvider for OverlayDir {
             .xattr_provider()
             .ok_or(VfsError::OperationNotSupported)?
             .list_xattrs()?;
-        visible_xattrs(raw)
+        visible_xattrs(raw, self.fs.topology.features.userxattr)
     }
     fn set_xattr(&self, name: &[u8], value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
-        reject_overlay_control_xattr(name)?;
+        reject_overlay_control_xattr(name, self.fs.topology.features.userxattr)?;
         self.upper_location()?
             .entry()
             .xattr_provider()
@@ -2591,7 +2606,7 @@ impl axfs_ng_vfs::XattrProvider for OverlayDir {
             .set_xattr(name, value, mode)
     }
     fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
-        reject_overlay_control_xattr(name)?;
+        reject_overlay_control_xattr(name, self.fs.topology.features.userxattr)?;
         self.upper_location()?
             .entry()
             .xattr_provider()
@@ -2620,13 +2635,13 @@ impl DirNodeOps for OverlayDir {
         let mut names = HashSet::<FsNameBuf>::new();
         let mut merged = Vec::<(FsNameBuf, u64, NodeType)>::new();
         if let Some(upper) = self.present_upper().as_ref() {
-            collect_overlay_dir_entries(upper, true, &mut names, &mut merged)?;
+            collect_overlay_dir_entries(upper, true, self.fs.topology.features.userxattr, &mut names, &mut merged)?;
         }
         // Tombstones are persisted before lower-directory rename publication.
         // They only suppress lower names; an upper entry with the same name
         // remains visible and naturally takes precedence.
         if let Some(upper) = self.present_upper().as_ref() {
-            if let Some(raw) = get_overlay_control_xattr(upper.entry(), OVERLAY_TOMBSTONES)? {
+            if let Some(raw) = get_overlay_control_xattr(upper.entry(), control_key(self.fs.topology.features.userxattr, OVERLAY_TOMBSTONES))? {
                 for name in raw.split(|byte| *byte == 0).filter(|name| !name.is_empty()) {
                     let mut bytes = Vec::new();
                     bytes
@@ -2642,12 +2657,12 @@ impl DirNodeOps for OverlayDir {
         let upper_is_opaque = self
             .present_upper()
             .as_ref()
-            .map(location_is_opaque)
+            .map(|location| location_is_opaque(location, self.fs.topology.features.userxattr))
             .transpose()?
             .unwrap_or(false);
         if !upper_is_opaque {
             for lower in &self.layers.lower {
-                collect_overlay_dir_entries(lower, false, &mut names, &mut merged)?;
+                collect_overlay_dir_entries(lower, false, self.fs.topology.features.userxattr, &mut names, &mut merged)?;
             }
         }
         let mut count = 0usize;
@@ -3138,7 +3153,7 @@ impl OverlayXattr {
 
 impl axfs_ng_vfs::XattrProvider for OverlayXattr {
     fn get_xattr(&self, name: &[u8]) -> VfsResult<Vec<u8>> {
-        reject_overlay_control_xattr(name)?;
+        reject_overlay_control_xattr(name, self.fs.topology.features.userxattr)?;
         self.active()
             .entry()
             .xattr_provider()
@@ -3152,10 +3167,11 @@ impl axfs_ng_vfs::XattrProvider for OverlayXattr {
                 .xattr_provider()
                 .ok_or(VfsError::OperationNotSupported)?
                 .list_xattrs()?,
+            self.fs.topology.features.userxattr,
         )
     }
     fn set_xattr(&self, name: &[u8], value: &[u8], mode: XattrSetMode) -> VfsResult<()> {
-        reject_overlay_control_xattr(name)?;
+        reject_overlay_control_xattr(name, self.fs.topology.features.userxattr)?;
         self.upper()?
             .entry()
             .xattr_provider()
@@ -3163,7 +3179,7 @@ impl axfs_ng_vfs::XattrProvider for OverlayXattr {
             .set_xattr(name, value, mode)
     }
     fn remove_xattr(&self, name: &[u8]) -> VfsResult<()> {
-        reject_overlay_control_xattr(name)?;
+        reject_overlay_control_xattr(name, self.fs.topology.features.userxattr)?;
         self.upper()?
             .entry()
             .xattr_provider()
@@ -3401,15 +3417,44 @@ impl Pollable for OverlayFile {
     }
 }
 
+// DirEntrySink callbacks run under the provider's enumeration locks and
+// must not look up or mutate that directory. Overlay recovery/copy-up needs
+// those operations, so retain names first and visit only after read_dir ends.
+fn visit_directory_entries(directory: &DirNode, sink: &mut dyn DirEntrySink) -> VfsResult<usize> {
+    let mut entries = Vec::new();
+    let mut failure = None;
+    directory.read_dir(0, &mut |name: &FsName, ino, kind, offset| {
+        if matches!(name.as_bytes(), b"." | b"..") { return true; }
+        let owned = match try_owned_name(name) {
+            Ok(name) => name,
+            Err(error) => { failure = Some(error); return false; }
+        };
+        if entries.try_reserve(1).is_err() {
+            failure = Some(VfsError::NoMemory);
+            return false;
+        }
+        entries.push((owned, ino, kind, offset));
+        true
+    })?;
+    if let Some(error) = failure { return Err(error); }
+    let mut count = 0;
+    for (name, ino, kind, offset) in entries {
+        if !sink.accept(&name, ino, kind, offset) { break; }
+        count += 1;
+    }
+    Ok(count)
+}
+
 fn collect_overlay_dir_entries(
     parent: &Location,
     upper: bool,
+    userxattr: bool,
     names: &mut HashSet<FsNameBuf>,
     merged: &mut Vec<(FsNameBuf, u64, NodeType)>,
 ) -> VfsResult<()> {
     let directory = parent.entry().as_dir()?;
     let mut failure = None;
-    directory.read_dir(0, &mut |name: &FsName, ino, kind, _| {
+    visit_directory_entries(directory, &mut |name: &FsName, ino, kind, _| {
         if name.as_bytes() == b"." || name.as_bytes() == b".." || names.contains(name) {
             return true;
         }
@@ -3421,7 +3466,7 @@ fn collect_overlay_dir_entries(
             }
         };
         if upper {
-            let whiteout = match is_whiteout(&child) {
+            let whiteout = match is_whiteout(&child, userxattr) {
                 Ok(whiteout) => whiteout,
                 Err(error) => {
                     failure = Some(error);
@@ -3480,7 +3525,7 @@ fn get_overlay_control_xattr(entry: &DirEntry, name: &[u8]) -> VfsResult<Option<
     };
     match provider.get_xattr(name) {
         Ok(value) => Ok(Some(value)),
-        Err(VfsError::NotFound) => Ok(None),
+        Err(error) if error == VfsError::NotFound || error == LinuxError::ENODATA.into() => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -3489,8 +3534,8 @@ fn xattr_is(entry: &DirEntry, name: &[u8], expected: &[u8]) -> VfsResult<bool> {
     Ok(get_overlay_control_xattr(entry, name)?.is_some_and(|value| value == expected))
 }
 
-fn is_whiteout(entry: &DirEntry) -> VfsResult<bool> {
-    if xattr_is(entry, OVERLAY_WHITEOUT, b"y")? {
+fn is_whiteout(entry: &DirEntry, userxattr: bool) -> VfsResult<bool> {
+    if xattr_is(entry, control_key(userxattr, OVERLAY_WHITEOUT), b"y")? {
         return Ok(true);
     }
     if entry.node_type() != NodeType::CharacterDevice {
@@ -3499,30 +3544,30 @@ fn is_whiteout(entry: &DirEntry) -> VfsResult<bool> {
     Ok(entry.metadata()?.rdev.0 == 0)
 }
 
-fn location_is_opaque(location: &Location) -> VfsResult<bool> {
-    xattr_is(location.entry(), OVERLAY_OPAQUE, b"y")
+fn location_is_opaque(location: &Location, userxattr: bool) -> VfsResult<bool> {
+    xattr_is(location.entry(), control_key(userxattr, OVERLAY_OPAQUE), b"y")
 }
 
-fn location_has_tombstone(location: &Location, name: &FsName) -> VfsResult<bool> {
+fn location_has_tombstone(location: &Location, name: &FsName, userxattr: bool) -> VfsResult<bool> {
     Ok(
-        get_overlay_control_xattr(location.entry(), OVERLAY_TOMBSTONES)?.is_some_and(|raw| {
+        get_overlay_control_xattr(location.entry(), control_key(userxattr, OVERLAY_TOMBSTONES))?.is_some_and(|raw| {
             raw.split(|byte| *byte == 0)
                 .any(|entry| entry == name.as_bytes())
         }),
     )
 }
 
-fn reject_overlay_control_xattr(name: &[u8]) -> VfsResult<()> {
-    if name.starts_with(b"trusted.overlay.") {
+fn reject_overlay_control_xattr(name: &[u8], userxattr: bool) -> VfsResult<()> {
+    if private_name(userxattr, name) {
         return Err(VfsError::OperationNotSupported);
     }
     Ok(())
 }
 
-fn visible_xattrs(raw: Vec<u8>) -> VfsResult<Vec<u8>> {
+fn visible_xattrs(raw: Vec<u8>, userxattr: bool) -> VfsResult<Vec<u8>> {
     let mut visible = Vec::new();
     for name in raw.split(|byte| *byte == 0).filter(|name| !name.is_empty()) {
-        if name.starts_with(b"trusted.overlay.") {
+        if private_name(userxattr, name) {
             continue;
         }
         visible

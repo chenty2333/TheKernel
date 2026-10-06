@@ -6816,7 +6816,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:resolve stable mount identity, enforce namespace and capability authority, and query or mutate mounted filesystem ownership; legacy sysfs mounts retain the mounting network namespace for dynamic network counter views"]
+state = ["state:resolve stable mount identity, enforce namespace and capability authority, and query or mutate mounted filesystem ownership; legacy sysfs mounts retain the mounting network namespace for dynamic network counter views", "state:overlay userxattr and volatile flag parameters are parsed and serialized; userxattr selects real user.overlay control attributes and rejects redirect or metacopy conflicts"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -6827,7 +6827,7 @@ status = "partial"
 contract = "linux-mount"
 handler = "kernel/src/syscall/fs/mount.rs:sys_mount"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main", "kernel/src/pseudofs/overlay_userxattr_tests.rs:userxattr_backing_markers_drive_copyup_whiteout_opaque_and_remount"]
 validation_gaps = ["mount flag admission is exercised by the fs-abi raw differential; the provider-level journal effect has no test"]
 limitations = ["MS_SYNCHRONOUS, MS_DIRSYNC, MS_I_VERSION and MS_LAZYTIME are accepted and reported through statmount but reach no ext4 per-superblock journal mode, because this ext4 implementation has none"]
 
@@ -6931,7 +6931,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:retain fsopen creator user namespace and choose Linux FS_USERNS_MOUNT create authority versus initial-user privilege; resolve stable mount identity and retain ownership"]
+state = ["state:retain fsopen creator user namespace and choose Linux FS_USERNS_MOUNT create authority versus initial-user privilege; resolve stable mount identity and retain ownership", "state:overlay userxattr and volatile flag parameters are parsed and serialized; userxattr selects real user.overlay control attributes and rejects redirect or metacopy conflicts"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -6942,7 +6942,7 @@ status = "partial"
 contract = "linux-fsconfig"
 handler = "kernel/src/syscall/fs/mount.rs:sys_fsconfig"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/mount-api-differential.c:main"]
+tests = ["tests/guest/portable/mount-api-differential.c:main", "kernel/src/pseudofs/overlay_userxattr_tests.rs:userxattr_backing_markers_drive_copyup_whiteout_opaque_and_remount"]
 validation_gaps = ["The validation order and errno precedence are exercised by the mount-api differential; provider option consumption has no test"]
 limitations = ["SET_BINARY and non-overlay SET_PATH parameters are stored without provider consumption and CREATE_EXCL is treated as CREATE; fsmount inherits this; reconfiguration of a consumed detached context still depends on the current namespace mount ledger"]
 
