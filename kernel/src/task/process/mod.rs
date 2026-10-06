@@ -405,6 +405,7 @@ pub(crate)     foreign_cpu_timer_subscribers: ForeignCpuTimerSubscriberPool,
     /// ptrace stops.  A cgroup thaw must never manufacture SIGCONT-visible
     /// state or resume a process which was stopped for another reason.
     cgroup_freeze_requested: AtomicBool,
+    pub(crate) memory_oom_killed: AtomicBool,
     cgroup_frozen_threads: AtomicUsize,
     /// ptrace ownership and options shared by all threads in the process.
     ptrace_ctl: SpinNoIrq<PtraceControlState>,
@@ -584,6 +585,7 @@ pub(crate) fn try_new(
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
             cgroup_freeze_requested: AtomicBool::new(false),
+            memory_oom_killed: AtomicBool::new(false),
             cgroup_frozen_threads: AtomicUsize::new(0),
             ptrace_ctl: SpinNoIrq::new(PtraceControlState::default()),
             ptrace_suspended_tracee: SpinNoIrq::new(None),

@@ -273,7 +273,8 @@ payload, and is not a claim of an absent guest loader.
 
 1. util-linux unshare/nsenter: passed, noninteractive signed-tool guest regression.
 2. bubblewrap read-only bind/tmpfs and six-namespace isolation: passed.
-3. crun busybox OCI bundle and actual memory/pids enforcement: pending; requires level 2.
+3. crun busybox OCI and actual memory/pids enforcement: accepted by optional
+   signed KTAP4/4 (`shell-ujtgjal5`); advanced controller boundaries below remain.
 4. offline rootless podman with `--network=none`: pending; requires level 3.
 
 No pending level is claimed usable. Tools and images will use a separate signed
@@ -517,3 +518,48 @@ final refunds and excluded Global pages; lint and KVM system70/70
 allocator's capacity assertions. No kernel policy hooks are installed yet,
 so this is the independently validated ownership boundary, not memory.max or
 OOM acceptance. Next connect cgroup hierarchy budgets to these real lifetimes.
+
+### Enforced resident memory and scoped OOM
+
+Cgroup-v2 now advertises pids/memory; v1 stays pids-only and cpu/io are not
+advertised as placebo controls. Non-root enabled memory groups expose
+memory.max/current/peak/events/events.local. Real VirtMem/PageCache physical
+reservations own identity-bound charge tokens; shared/COW aliases do not
+multiply them, and deferred pins/cache owners refund only at physical return.
+An immutable v2 ancestor chain and one budget gate enforce every ancestor
+atomically. Sparse mmap alone consumes no resident quota. Root groups remain
+unlimited and do not expose these files, matching Linux7.2.3 CFTYPE_NOT_ON_ROOT.
+Controller token batches validate before publication; disabling resets hidden
+limits without inventing refunds. OOM denies the physical reservation and
+queues uncatchable SIGKILL to that exact allocating member outside charge
+locks, at most once per process identity. The seven Linux7.2.3 event keys report
+real max/oom/kill counters; disabled low/high/group-kill/socket-throttle classes
+remain zero because no such policy is active.
+
+Actual signed crun KTAP4/4 passed (`shell-ujtgjal5`): OCI lifecycle, seven live
+children then fork EAGAIN at pids.limit8, a 512MiB sparse mapping under a32MiB
+resident limit, real4MiB charge/refund (753664 -> 5021696 -> 827392 bytes), and a
+256MiB touching worker killed with exit137 plus positive max/oom/oom_kill
+counters and surviving parent/test shell. Every kept runtime is explicitly
+deleted. Level3's required OCI, pids and memory acceptance is now established;
+period65 full host Python666/Rust6083 (existing3 skips/1 ignore),
+KVM system70/70 (`system-j8lx7h6m`), q35/n305 lint and selected mm-contracts18/259
+(`abi-k0ybbs9n`) passed. Final victim-group event attribution additionally
+passed kernel2643, lint and KVM system70/70 (`system-y00igtpa`). Quota max/oom
+events belong to the limiting group; oom_kill belongs to the victim group
+and propagates to ancestors, as in Linux7.2.3 mm/oom_kill.c. The ancestor-limit
+host regression checks that distinction. The earlier crun leaf-limit path
+is unchanged by this attribution correction. Proceed to offline rootless
+podman after this commit.
+
+Known boundaries: this resident controller accounts user anonymous/cache
+allocations, not kernel heap/page-table/socket memory or memcg swap. Global
+kernel/background allocations without a process owner are not attributed to a
+container. Existing charges retain their original owner across migration;
+shared-mm owner selection across different cgroups has not been compared with
+Linux. Limit reduction below existing usage is enforced on subsequent charges,
+not Linux's synchronous local reclaim; quota OOM chooses the allocator rather
+than Linux badness scoring/reclaim. Peak is read-only, not Linux per-OFD reset;
+low/high/min/oom.group/proactive reclaim are absent. Advanced disable/re-enable
+charge reparenting and namespace-relative controller export are not fully
+established. These do not turn the tested memory.max into a stored-only value.

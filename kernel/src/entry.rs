@@ -242,6 +242,7 @@ pub fn init(args: &[String], envs: &[String]) {
         .expect("Failed to allocate init IPC namespace");
     let init_cgroup_ns = CgroupNamespace::try_new_root(user_ns.clone())
         .expect("Failed to allocate init cgroup namespace");
+    crate::pseudofs::cgroup::install_memory_accounting();
     let init_time_ns = TimeNamespace::try_new_root(user_ns.clone())
         .expect("Failed to allocate init time namespace");
     let init_namespaces = NamespaceProxy::try_new(

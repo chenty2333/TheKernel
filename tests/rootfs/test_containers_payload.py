@@ -10,6 +10,18 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ContainersPayloadTests(unittest.TestCase):
+    def test_crun_memory_checks_resident_effect_and_real_oom(self):
+        script = (ROOT/'tests/guest/container-crun.sh').read_text()
+        probe = (ROOT/'tests/guest/tools/container-limit-probe.c').read_text()
+        self.assertIn('"memory":{"limit":33554432}', script)
+        self.assertIn('[ "$result" = 137 ]', script)
+        self.assertIn('for event in max oom oom_kill', script)
+        self.assertIn('memory.current', script)
+        self.assertIn('memory.peak', script)
+        self.assertIn('resident - after', probe)
+        self.assertIn('512UL * 1024 * 1024', probe)
+        self.assertIn('MAP_PRIVATE | MAP_ANONYMOUS', probe)
+
     def test_crun_guest_uses_real_resources_and_kept_lifecycle(self):
         script = (ROOT/'tests/guest/container-crun.sh').read_text()
         self.assertIn('"pids":{"limit":8}', script)

@@ -41,6 +41,9 @@ use crate::{
     },
 };
 
+mod memory;
+pub(crate) use memory::install as install_memory_accounting;
+
 const CGROUP_SUPER_MAGIC: u32 = 0x0027_e0eb;
 const CGROUP2_SUPER_MAGIC: u32 = 0x6367_7270;
 const MAX_CGROUP_CHILDREN: usize = 65_536;
@@ -136,20 +139,23 @@ const CONTROL_FILES: &[&str] = &[
     "pids.current",
     "pids.events",
     "pids.peak",
+    "memory.max",
+    "memory.current",
+    "memory.peak",
+    "memory.events",
+    "memory.events.local",
     "cpu.uclamp.min",
     "cpu.uclamp.max",
 ];
 /// One global synthetic-inode budget for a cgroup filesystem.  Per-parent
 /// child limits alone do not bound a deep tree; this keeps allocator-backed
-/// identity bookkeeping finite until cgroup memory accounting exists.
+/// identity bookkeeping finite independently of resident user-page budgets.
 const MAX_CGROUP_INODES: usize = (MAX_CGROUP_CHILDREN + 1) * (CONTROL_FILES.len() + 1);
 
-/// The unified hierarchy deliberately exposes only controllers with complete
-/// task-accounting semantics.  In particular, do not advertise cpu, memory,
-/// or io merely because a userspace manager probes for them: claiming one
-/// would make its policy decisions depend on controls the kernel cannot
-/// enforce.
+/// V1 remains pids-only. V2 additionally enforces resident anonymous/cache
+/// budgets; cpu/io are not advertised as placeholder controls.
 const ALL_CONTROLLERS: &[&str] = &["pids"];
+const V2_CONTROLLERS: &[&str] = &["pids", "memory"];
 const KNOWN_V1_CONTROLLERS: &[&str] = &[
     "blkio",
     "cpu",
@@ -876,9 +882,9 @@ pub fn new_cgroup_v1(controllers: Vec<String>) -> VfsResult<Filesystem> {
 pub fn new_cgroup_v2() -> VfsResult<Filesystem> {
     let mut controllers = Vec::new();
     controllers
-        .try_reserve_exact(ALL_CONTROLLERS.len())
+        .try_reserve_exact(V2_CONTROLLERS.len())
         .map_err(|_| VfsError::NoMemory)?;
-    for controller in ALL_CONTROLLERS {
+    for controller in V2_CONTROLLERS {
         controllers.push(try_owned(controller)?);
     }
     let hierarchy = cgroup_hierarchy(CgroupVersion::V2, controllers)?;
@@ -946,9 +952,9 @@ pub(crate) fn new_cgroup_v1_for_namespace(
 fn cgroup_v2_hierarchy() -> VfsResult<Arc<CgroupHierarchy>> {
     let mut controllers = Vec::new();
     controllers
-        .try_reserve_exact(ALL_CONTROLLERS.len())
+        .try_reserve_exact(V2_CONTROLLERS.len())
         .map_err(|_| VfsError::NoMemory)?;
-    for controller in ALL_CONTROLLERS {
+    for controller in V2_CONTROLLERS {
         controllers.push(try_owned(controller)?);
     }
     cgroup_hierarchy(CgroupVersion::V2, controllers)
@@ -1224,6 +1230,7 @@ struct CgroupDir {
     pids_max: Mutex<Option<u64>>,
     pids_peak: Mutex<u64>,
     pids_events_limit: Mutex<u64>,
+    memory: Arc<memory::MemoryGroup>,
     /// `cgroup.freeze` request for this hierarchy node.  Member processes
     /// park through the task stop wait; `cgroup.events:frozen` is derived
     /// separately and becomes true only once every live member reached it.
@@ -1251,6 +1258,7 @@ impl CgroupDir {
                 CgroupFile::try_new(fs.clone(), name)?,
             );
         }
+        let memory = memory::MemoryGroup::new(parent.as_ref().and_then(Weak::upgrade).map(|dir| dir.memory.clone()))?;
         let node = CgroupNode::try_new(fs, NodeType::Directory, mode)?;
         let dir = Arc::try_new(Self {
             node,
@@ -1263,6 +1271,7 @@ impl CgroupDir {
             pids_max: Mutex::new(None),
             pids_peak: Mutex::new(0),
             pids_events_limit: Mutex::new(0),
+            memory,
             frozen: AtomicBool::new(false),
             uclamp: Mutex::new((0, 1024)),
             subtree_control: Mutex::new(HashSet::new()),
@@ -1623,6 +1632,11 @@ impl CgroupDir {
         }
     }
 
+    fn memory_controller_active(&self) -> bool {
+        self.node.fs.version == CgroupVersion::V2 && self.parent.lock().as_ref()
+            .and_then(Weak::upgrade).is_some_and(|parent| parent.subtree_control.lock().contains("memory"))
+    }
+
     fn cpu_controller_active(&self) -> bool {
         match self.node.fs.version {
             CgroupVersion::V1 => self
@@ -1672,6 +1686,7 @@ impl CgroupDir {
                 | "cgroup.freeze" => true,
                 "cgroup.kill" => self.parent.lock().is_some(),
                 _ if name.starts_with("pids.") => self.pids_controller_active(),
+                _ if name.starts_with("memory.") => self.memory_controller_active(),
                 "cpu.uclamp.min" | "cpu.uclamp.max" => self.cpu_controller_active(),
                 _ => false,
             },
@@ -1995,73 +2010,43 @@ impl CgroupDir {
 
     fn update_subtree_control(&self, data: &[u8]) -> VfsResult<()> {
         let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-        // Availability validation and the eventual controller reset belong to
-        // the same membership operation. Otherwise a parent can disable pids
-        // after a child validates `+pids` but before the child publishes it.
         let _operation = PID_CGROUPS.operation.lock();
-        let mut pids_state = None;
+        let mut changes = [None; 2];
         for token in text.split_ascii_whitespace() {
-            if token.len() < 2 {
-                return Err(VfsError::InvalidInput);
-            }
+            if token.len() < 2 { return Err(VfsError::InvalidInput); }
             let (op, name) = token.split_at(1);
-            match op {
-                "+" => {
-                    if !self.controller_available(name) {
-                        return Err(VfsError::NotFound);
-                    }
-                    if name != "pids" {
-                        return Err(VfsError::OperationNotSupported);
-                    }
-                    pids_state = Some(true);
-                }
-                "-" => {
-                    if name != "pids" {
-                        return Err(VfsError::OperationNotSupported);
-                    }
-                    pids_state = Some(false);
-                }
-                _ => return Err(VfsError::InvalidInput),
-            }
+            let index = V2_CONTROLLERS.iter().position(|candidate| *candidate == name)
+                .ok_or(VfsError::OperationNotSupported)?;
+            changes[index] = Some(match op {
+                "+" => { if !self.controller_available(name) { return Err(VfsError::NotFound); } true },
+                "-" => false, _ => return Err(VfsError::InvalidInput),
+            });
         }
-
-        if pids_state.is_none() {
-            return Ok(());
+        let mut prepared = Vec::new();
+        prepared.try_reserve_exact(2).map_err(|_| VfsError::NoMemory)?;
+        for (index, name) in V2_CONTROLLERS.iter().enumerate() {
+            if changes[index] == Some(true) {
+                if self.node.fs.version == CgroupVersion::V2 && self.parent.lock().is_some() && !self.pids.lock().is_empty() {
+                    return Err(VfsError::ResourceBusy);
+                }
+                prepared.push(Some(try_owned(name)?));
+            } else { prepared.push(None); }
+            if changes[index] == Some(false) && self.child_has_subtree_controller(name) { return Err(VfsError::ResourceBusy); }
         }
-        let prepared_name = pids_state
-            .filter(|enabled| *enabled)
-            .map(|_| try_owned("pids"))
-            .transpose()?;
-        // Membership publication, topology changes, controller reset, and
-        // pids.current/pids.peak reads share this operation domain. In
-        // particular, a pending fork cannot publish across a controller reset
-        // or observe an ancestor chain that is concurrently being renamed.
         let mut control = self.subtree_control.lock();
-        let was_enabled = control.contains("pids");
-        if pids_state == Some(true)
-            && self.node.fs.version == CgroupVersion::V2
-            && self.parent.lock().is_some()
-            && !self.pids.lock().is_empty()
-        {
-            return Err(VfsError::ResourceBusy);
-        }
-        if pids_state == Some(false) && self.child_has_subtree_controller("pids") {
-            return Err(VfsError::ResourceBusy);
-        }
-        if pids_state == Some(true) && !was_enabled {
-            control.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
-            control.insert(prepared_name.ok_or(VfsError::Io)?);
-        }
-        if pids_state == Some(false) && was_enabled {
-            control.remove("pids");
+        control.try_reserve(2).map_err(|_| VfsError::NoMemory)?;
+        let was = [control.contains("pids"), control.contains("memory")];
+        for (index, name) in V2_CONTROLLERS.iter().enumerate() {
+            match changes[index] {
+                Some(true) if !was[index] => { control.insert(prepared[index].take().ok_or(VfsError::Io)?); },
+                Some(false) if was[index] => { control.remove(*name); }, _ => {},
+            }
         }
         drop(control);
         for child in self.children.lock().values() {
-            if pids_state == Some(true) && !was_enabled {
-                child.initialize_pids_controller();
-            } else if pids_state == Some(false) && was_enabled {
-                child.reset_pids_controller();
-            }
+            if changes[0] == Some(true) && !was[0] { child.initialize_pids_controller(); }
+            else if changes[0] == Some(false) && was[0] { child.reset_pids_controller(); }
+            if changes[1].is_some_and(|enabled| enabled != was[1]) { child.memory.set_maximum(None); }
         }
         Ok(())
     }
@@ -2093,6 +2078,7 @@ fn hierarchy_key_for_dir(dir: &Arc<CgroupDir>) -> AxResult<CgroupHierarchyKey> {
 }
 
 impl PidMembershipRegistry {
+
     fn with_limits(global_limit: usize, per_cgroup_limit: usize) -> Self {
         Self {
             operation: Mutex::new(()),
@@ -3656,6 +3642,7 @@ impl CgroupFile {
             "cgroup.type" => "domain\n".to_string(),
             "cgroup.freeze" => dir.freeze_text(),
             "cgroup.kill" => return Err(VfsError::BadFileDescriptor),
+            name if name.starts_with("memory.") => dir.memory.text(name)?,
             "pids.max" => dir.pids_max_text(),
             "pids.current" => format!("{}\n", dir.recursive_live_pid_count_while_operating()),
             "pids.events" => format!("max {}\n", *dir.pids_events_limit.lock()),
@@ -3668,6 +3655,12 @@ impl CgroupFile {
 
     fn write_text(&self, data: &[u8]) -> VfsResult<()> {
         let dir = self.dir()?;
+        if self.name == "memory.max" {
+            let _operation = PID_CGROUPS.operation.lock();
+            if !dir.control_file_visible(self.name) { return Err(VfsError::NotFound); }
+            dir.memory.set_maximum(memory::parse_maximum(data)?);
+            return Ok(());
+        }
         if self.name == "pids.max" {
             // File visibility and the new limit must be one operation with
             // controller reset and fork admission. A stale open control file
@@ -3715,7 +3708,7 @@ impl CgroupFile {
             }
             "cgroup.subtree_control" => dir.update_subtree_control(data),
             "cgroup.controllers" | "cgroup.events" | "cgroup.type" | "pids.current"
-            | "pids.events" | "pids.peak" => Err(VfsError::BadFileDescriptor),
+            | "pids.events" | "pids.peak" | "memory.current" | "memory.peak" | "memory.events" | "memory.events.local" => Err(VfsError::BadFileDescriptor),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -3730,6 +3723,7 @@ fn is_read_only_control_file(name: &str) -> bool {
             | "pids.current"
             | "pids.events"
             | "pids.peak"
+            | "memory.current" | "memory.peak" | "memory.events" | "memory.events.local"
     )
 }
 
@@ -3847,6 +3841,26 @@ mod tests {
     use axfs_ng_vfs::Timestamp;
 
     use super::*;
+
+    #[test]
+    fn memory_controls_enforce_hierarchy_and_multi_controller_updates_are_atomic() {
+        let fs = CgroupFs::mount(CgroupVersion::V2, Vec::from(["pids".to_string(), "memory".to_string()])).unwrap();
+        let root = fs.root_dir().downcast::<CgroupDir>().unwrap();
+        root.update_subtree_control(b"+pids +memory").unwrap();
+        let child = fs.root_dir().as_dir().unwrap().create(FsName::new(b"mem-test"), NodeType::Directory,
+            NodePermission::from_bits_truncate(0o755)).unwrap().downcast::<CgroupDir>().unwrap();
+        assert!(child.control_file_visible("memory.max"));
+        child.files.get(FsName::new(b"memory.max")).unwrap().write_text(b"8192").unwrap();
+        let charge = child.memory.charge(8192).ok().unwrap();
+        assert!(child.memory.charge(4096).is_err());
+        assert_eq!(child.memory.current(), 8192);
+        drop(charge); assert_eq!(child.memory.current(), 0);
+        assert!(root.update_subtree_control(b"-memory +cpu").is_err());
+        assert!(child.control_file_visible("memory.max"));
+        root.update_subtree_control(b"-memory").unwrap();
+        assert!(!child.control_file_visible("memory.max"));
+        assert_eq!(child.memory.text("memory.max").unwrap(), "max\n");
+    }
 
     #[test]
     fn cgroup_inode_errseq_is_shared_across_lookups_not_with_other_inodes() {
@@ -4111,12 +4125,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_advertises_only_pids_and_exposes_domain_liveness_controls() {
+    fn v2_advertises_enforced_controllers_and_exposes_domain_liveness_controls() {
         let fs = new_cgroup_v2().unwrap();
         let root = fs.root_dir();
         let dir = root.downcast::<CgroupDir>().unwrap();
 
-        assert_eq!(dir.controllers_text().unwrap(), "pids\n");
+        assert_eq!(dir.controllers_text().unwrap(), "pids memory\n");
         assert_eq!(dir.events_text(), "populated 0\nfrozen 0\n");
         assert_eq!(dir.freeze_text(), "0\n");
         assert!(dir.control_file_visible("cgroup.type"));

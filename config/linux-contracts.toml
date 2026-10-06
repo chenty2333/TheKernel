@@ -787,7 +787,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:mapping geometry/flags/offset then VFS permissions and VM admission before publication"]
 usercopy = ["usercopy:validate user virtual range; population faults backing through VM policy"]
-state = ["state:insert VMA and mapping ownership; fixed replacement commits through address-space mutation", "state:strict overcommit uses the existing RAM-ratio estimate plus usable active swap capacity; complete committed_as and HugeTLB reservation modeling remains limited"]
+state = ["state:cgroup-v2 resident anonymous and file-cache pages are admitted against hierarchical memory.max at physical allocation, not sparse virtual reservation; final frame return refunds original ownership and quota OOM queues SIGKILL only to the allocating member", "state:insert VMA and mapping ownership; fixed replacement commits through address-space mutation", "state:strict overcommit uses the existing RAM-ratio estimate plus usable active swap capacity; complete committed_as and HugeTLB reservation modeling remains limited"]
 concurrency = ["concurrency:address-space locking and mapping generation protect replacement"]
 teardown = ["teardown:failed preparation releases unpublished backing and leaves prior VMA state"]
 
@@ -799,7 +799,7 @@ status = "partial"
 contract = "linux-mmap"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_mmap"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/mm/mmap.rs:mmap_hooks_run_file_then_address_and_stop_on_denial", "tests/guest/portable/mm-contracts-differential.c:main"]
+tests = ["kernel/src/pseudofs/cgroup/memory.rs:budget_denial_is_atomic_and_physical_token_lifetime_refunds_ancestors", "tests/guest/tools/container-limit-probe.c:memory_probe", "kernel/src/syscall/mm/mmap.rs:mmap_hooks_run_file_then_address_and_stop_on_denial", "tests/guest/portable/mm-contracts-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["a MAP_FIXED replacement deducts only the covered bytes this kernel classifies as data mappings from the RLIMIT_DATA growth charge, where Linux deducts every page the replacement detaches before either rlimit comparison, so replacing a range that holds shared, read-only or stack mappings is charged higher here and can answer ENOMEM on a request Linux admits (Linux mm/vma.c:2453 passes map->pglen - vms->nr_pages, whose vms->nr_pages counts every detached page at Linux mm/vma.c:1461, and Linux mm/mmap.c:1333-1341 compares that same net count against RLIMIT_AS and RLIMIT_DATA; this kernel nets only data_bytes_in_range() before kernel/src/mm/stats.rs:check_rlimit_data_growth)"]
 
@@ -1110,7 +1110,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:invalid or unadmitted heap endpoint returns unchanged break rather than negative errno"]
 usercopy = ["explicit-none"]
-state = ["state:grow or shrink heap VMA and publish break after address-space transaction", "state:strict overcommit uses the existing RAM-ratio estimate plus usable active swap capacity; complete committed_as and HugeTLB reservation modeling remains limited"]
+state = ["state:cgroup-v2 resident anonymous and file-cache pages are admitted against hierarchical memory.max at physical allocation, not sparse virtual reservation; final frame return refunds original ownership and quota OOM queues SIGKILL only to the allocating member", "state:grow or shrink heap VMA and publish break after address-space transaction", "state:strict overcommit uses the existing RAM-ratio estimate plus usable active swap capacity; complete committed_as and HugeTLB reservation modeling remains limited"]
 concurrency = ["concurrency:heap transaction serializes VMA changes with layout publication"]
 teardown = ["teardown:shrink releases removed backing and deferred fault wakeups"]
 
@@ -1122,7 +1122,7 @@ status = "implemented"
 contract = "linux-brk"
 handler = "kernel/src/syscall/mm/brk.rs:sys_brk"
 conditional = "explicit-none"
-tests = ["crates/linux/mm/src/tests.rs:brk_growth_respects_the_following_vma_guard_gap", "tests/guest/portable/mm-contracts-differential.c:main"]
+tests = ["kernel/src/pseudofs/cgroup/memory.rs:budget_denial_is_atomic_and_physical_token_lifetime_refunds_ancestors", "tests/guest/tools/container-limit-probe.c:memory_probe", "crates/linux/mm/src/tests.rs:brk_growth_respects_the_following_vma_guard_gap", "tests/guest/portable/mm-contracts-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
