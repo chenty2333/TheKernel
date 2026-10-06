@@ -374,3 +374,10 @@ license notices. GPL chain code is used to verify subtle dependency ordering;
 no GPL implementation body is retained in the runtime or repository.
 The conventional temporary-C transport `max(a,b)` shim is one additional kernel
 code-line scanner match at25 (none at40), reconciled with provenance/CI totals.
+
+Selected N305 media-idle cache admission extends the existing MIT uncore port
+with source forcewake/register/platform-mask facts and `intel_engine_cs.c`
+hardware ring-idle checks (©2016 Intel, existing full LICENSE-MIT). There is no
+media submission/reset implementation or new firmware payload.
+The selected ring-idle C oracle adds one conventional SELFTEST_ONLY transport
+macro match at25 and none at40, included in the current GT/provenance totals.

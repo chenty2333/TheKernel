@@ -2,7 +2,7 @@
 // Linux 7.2.3 drivers/gpu/drm/i915/intel_uncore.c: fw_domain_reset,
 // wait_ack_{set,clear}, fw_domain_wait_ack_with_fallback, fw_domain_{get,put}.
 // Copyright © 2013 Intel Corporation. Full grant: ../LICENSE-MIT.
-// N305 Gen12 GT domain only, not media/render domain enumeration or runtime PM.
+// Selected N305 GT/render and fused VDBOX0/2/VEBOX0 domains; no runtime PM.
 use crate::{Error, GtIo, masked_disable, masked_enable, wait};
 pub const GT_REQUEST: u32 = 0xa188;
 pub const GT_ACK: u32 = 0x130044;
@@ -72,4 +72,52 @@ pub fn release_gt(io: &impl GtIo) -> Result<(), Error> {
 }
 pub fn release_render(io: &impl GtIo) -> Result<(), Error> {
     release(io, RENDER_REQUEST, RENDER_ACK)
+}
+
+/// ADL-P/ADL-N source platform mask permits VCS0,VCS2,VECS0; the live
+/// GEN11_GT_VEBOX_VDBOX_DISABLE fuse removes absent instances. These domains
+/// are woken only to exclude unowned media activity before shared cache writes.
+/// Tuple: disable bit, request, acknowledge, engine MI_MODE. No media reset/job.
+pub const MEDIA: [(u32, u32, u32, u32); 3] = [
+    (1, 0xa540, 0xd50, 0x1c009c),
+    (4, 0xa548, 0xd58, 0x1d009c),
+    (1 << 16, 0xa560, 0xd70, 0x1c809c),
+];
+pub fn media_mask(disabled: u32) -> u8 {
+    MEDIA
+        .iter()
+        .enumerate()
+        .fold(0, |mask, (index, (bit, ..))| {
+            mask | if disabled & bit == 0 { 1 << index } else { 0 }
+        })
+}
+pub fn acquire_media(io: &impl GtIo, index: usize) -> Result<(), Error> {
+    let &(_, request, ack, _) = MEDIA.get(index).ok_or(Error::Refused)?;
+    acquire(io, request, ack)
+}
+/// Source intel_engine_cs.c::ring_is_idle hardware checks. The controller
+/// and software submission queues must already be excluded by the caller.
+pub fn ring_idle(io: &impl GtIo, base: u32) -> Result<bool, Error> {
+    if ![0x2000, 0x1c0000, 0x1d0000, 0x1c8000].contains(&base) {
+        return Err(Error::Refused);
+    }
+    let head = io.read(base + 0x34)? & 0x001ffffc;
+    let tail = io.read(base + 0x30)? & 0x001ffff8;
+    let mode = io.read(base + 0x9c)?;
+    Ok(head == tail && mode & (1 << 9) != 0)
+}
+/// Sole controller owner retains every acquired domain. Idle proof is required
+/// even though this driver never submits media work: PAT/MOCS/L3 are shared.
+pub fn idle_media(io: &impl GtIo, present: u8, owned: u8) -> Result<(), Error> {
+    if present & !7 != 0 || owned & present != present {
+        return Err(Error::Refused);
+    }
+    for (index, (_, _, ack, mode)) in MEDIA.iter().enumerate() {
+        if present & (1 << index) != 0
+            && (io.read(*ack)? & KERNEL == 0 || !ring_idle(io, *mode - 0x9c)?)
+        {
+            return Err(Error::Refused);
+        }
+    }
+    Ok(())
 }

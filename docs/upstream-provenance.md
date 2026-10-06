@@ -760,7 +760,7 @@ physical GPU/Mesa acceptance; no host DRM node is opened in these validations.
 The RCS additions add two conventional C-shim INVALID_MMIO_REG matches at25
 and73 identical all-zero data-array rows at25/40 from the compiled IGT page.
 They are measured textual matches, not proof of copied Linux bodies or GPU
-execution. Current GT totals78/74 and combined Intel90/76; crates/ax baseline
+execution. Current GT totals79/74 and combined Intel91/76; crates/ax baseline
 outside/code118/107 at25,91/84 at40, no fenced/comments/markers or exemptions.
 
 N305 GT information runtime: `tk-intel-gt/src/info.rs` selects MIT
@@ -785,3 +785,12 @@ code match at threshold25, none at40. Kernel outside-fence totals are now303/
 14code at25 and unchanged132/8code at40; fenced totals/range cites are unchanged.
 This is a short transport shim, not a retained Linux chain implementation;
 the scanner is not exempted or disabled.
+
+Shared-cache admission calls selected ADL-P/N media forcewake helpers and source
+`intel_engine_cs.c::ring_is_idle` head/tail/MODE_IDLE checks before existing
+PAT/MOCS/L3 writes. Platform masks/fuse and MMIO definitions are read from the
+local i915 reference; unknown/live consumers refuse. Corresponding unchanged-C
+register/idle predicates and fault/ownership models validate software only.
+The media idle C transport adds one conventional `I915_SELFTEST_ONLY(x) 0`
+match at25, none at40; current GT79/74, combined Intel91/76 and crates/ax119/
+108code at25 (unchanged91/84code at40) are reconciled without an exemption.

@@ -88,13 +88,13 @@ Source-only IGT oracle input is task-local; temporary compiler files are removed
 by the test harness. Host interpreter models memory/retirement only, not EUs.
 No real rendering, physical reset or Mesa acceptance is claimed by these tests.
 
-Current scoped excerpt inventory:78 code lines at25,74 at40 (no fenced/comment/
+Current scoped excerpt inventory:79 code lines at25,74 at40 (no fenced/comment/
 marker matches). This is the prior3/1, two additional conventional C-shim
-INVALID_MMIO_REG definitions at25, and73 repeated all-zero data rows at both
+INVALID_MMIO_REG definitions plus one I915_SELFTEST_ONLY shim at25, and73 repeated all-zero data rows at both
 thresholds in the compiled-IGT-derived page that also occur in Linux arrays.
 The data rows are not copied Linux function bodies; provenance and the original
-IGT grants are retained. Combined display+GT totals90/76; crates/ax baseline
-outside/code43/32→118/107 at25,18/11→91/84 at40. No scanner exemption.
+IGT grants are retained. Combined display+GT totals91/76; crates/ax baseline
+outside/code43/32→119/108 at25,18/11→91/84 at40. No scanner exemption.
 
 src/info.rs: Linux7.2.3 gt/intel_sseu.c gen12_sseu_info_init /
 gen11_compute_sseu_info (©2019 Intel) and gt/intel_gt_clock_utils.c
@@ -103,3 +103,11 @@ read_reference_ts_freq / gen11_get_crystal_clock_freq / gen11_read_clock_frequen
 clock only, full grant LICENSE-MIT. Runtime callers are existing GETPARAM and
 QUERY over the live, owned GT; unavailable/unknown facts fail closed. No register
 write, new wake or reset is performed by capability discovery.
+
+uncore.rs additionally selects ADL-P/N source VCS0,VCS2,VECS0 forcewake domains
+from intel_uncore.c and actual GEN11_GT_VEBOX_VDBOX_DISABLE fuses (i915_pci.c
+platform-mask facts, intel_gt_regs.h register facts). ring_idle follows selected
+intel_engine_cs.c::ring_is_idle hardware head/tail/MODE_IDLE checks (©2016 Intel,
+existing full MIT grant). This never submits or resets media: it rejects live/
+unknown unowned consumers before shared PAT/MOCS/L3 programming. Runtime caller
+is the same independently opted-in BCS/RCS owner, not a disconnected reader.

@@ -105,3 +105,9 @@ GT admission; missing facts fail rather than returning the product specification
 This remains a bounded acceptance client, not evidence that Mesa initializes or
 executes. No default-state context isolation, shared user VM or general shader
 batch capability is currently advertised.
+
+GT cache-policy preflight now reads actual media disable fuses and pins only
+present VCS0/VCS2/VECS0 wake domains. A busy ring/lost ACK/unavailable mapping
+must refuse before shared PAT/MOCS/L3 changes; it must not stop or reset media.
+The firmware RCS preflight likewise requires empty head/tail and MODE_IDLE.
+These new reads/wake checks are software-verified only, not a native observation.

@@ -406,15 +406,16 @@ pub(super) fn run(owner: &mut super::Owner, bdf: pci::Bdf) -> Result<(), Error> 
     super::super::dma::require_direct(bdf).map_err(|_| Error::Refused)?;
     intel_gt::uncore::acquire_render(&owner.bus)?;
     owner.bus.render_awake.store(true, Ordering::Release);
+    owner.bus.acquire_idle_media()?;
     // Never change shared cache policy while an abandoned firmware RCS is busy.
     let start = owner.bus.now_us();
-    while owner.bus.read(0x209c)? & (1 << 9) == 0 {
+    while !intel_gt::uncore::ring_idle(&owner.bus, 0x2000)? {
         if owner.bus.now_us().saturating_sub(start) > 100_000 {
             return Err(Error::Refused);
         }
         owner.bus.delay_us(10);
     }
-    bcs::prepare(&owner.bus)?;
+    owner.bus.prepare_shared()?;
     let gtt = super::super::shared_ggtt(bdf).map_err(|_| Error::Refused)?;
     owner.memory = Some(Memory::allocate(gtt)?);
     let memory = owner.memory.as_mut().unwrap();
@@ -436,12 +437,12 @@ pub(super) fn render_test(owner: &mut super::Owner) -> Result<(), Error> {
         return Err(Error::Quarantined);
     }
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
-    if owner.bus.read(0xc000)? & 1 == 0 || owner.bus.read(0x209c)? & (1 << 9) == 0 {
+    if owner.bus.read(0xc000)? & 1 == 0 || !intel_gt::uncore::ring_idle(&owner.bus, 0x2000)? {
         return Err(Error::Refused);
     }
     owner.bus.rcs_owned.store(true, Ordering::Release);
     intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
-    bcs::prepare(&owner.bus)?;
+    owner.bus.prepare_shared()?;
     intel_gt::rcs::prepare(&owner.bus)?;
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let mut memory = Memory::allocate(gtt)?;
@@ -456,7 +457,7 @@ pub(super) fn render_test(owner: &mut super::Owner) -> Result<(), Error> {
     owner.memory = None;
     // Render reset may lose shared render-domain L3 policy. Restore the single
     // UC policy used by subsequent BCS jobs while all engines remain stopped.
-    bcs::prepare(&owner.bus)?;
+    owner.bus.prepare_shared()?;
     verified
 }
 
@@ -477,7 +478,7 @@ pub(super) fn render_objects(
         return Err(Error::Refused);
     }
     intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
-    bcs::prepare(&owner.bus)?;
+    owner.bus.prepare_shared()?;
     intel_gt::rcs::prepare(&owner.bus)?;
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let operation = bcs::Copy {
@@ -499,7 +500,7 @@ pub(super) fn render_objects(
     let result = execute_and_quiesce(&owner.bus, memory)?;
     memory.release()?;
     owner.memory = None;
-    bcs::prepare(&owner.bus)?;
+    owner.bus.prepare_shared()?;
     result
 }
 
@@ -530,6 +531,7 @@ pub(super) fn objects(
     {
         return Err(Error::Refused);
     }
+    owner.bus.assert_media_idle()?;
     // Last job and bootstrap must already be quiescent; bounded reset also
     // establishes a fresh engine state before loading another private context.
     intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;

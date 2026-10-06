@@ -32,7 +32,7 @@ WINDOW = 14
 
 # (fenced lines, fenced blocks, files holding one, lines outside fences, of those
 # `code`, marked blocks, marker lines) -- the seven a scan's header line prints,
-# for the scope and threshold named. Intel host C oracle shims add ninety
+# for the scope and threshold named. Intel host C oracle shims add ninety-one
 # code-line matches at 25 (seventy-six at 40): conventional macros/constants and
 # MIT state-layout declarations, documented in NOTICE and provenance.
 SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
@@ -44,7 +44,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     # `crates/ax` at 25 is 4 `nullfs.rs` lines plus 14 smoltcp RFC bit-ruler rows
     # that Linux headers reprint from the same IETF figures: read the `crates/ax`
     # section of `docs/upstream-provenance.md` before counting these as text.
-    ("crates/ax", 25): (18, 15, 4, 118, 107, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 119, 108, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

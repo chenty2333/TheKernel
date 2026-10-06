@@ -4,7 +4,7 @@
 //! display modeset flag; display D0 is not used as the GT/media A0 stepping.
 #[cfg(target_os = "none")]
 use alloc::{format, string::String};
-use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering, compiler_fence};
 
 use axsync::Mutex;
 use intel_gt::{Error, GtIo};
@@ -21,8 +21,37 @@ struct Bus {
     awake: AtomicBool,
     render_awake: AtomicBool,
     rcs_owned: AtomicBool,
+    media_present: AtomicU8,
+    media_awake: AtomicU8,
 }
 impl Bus {
+    fn acquire_idle_media(&self) -> Result<(), Error> {
+        let present = intel_gt::uncore::media_mask(self.read(0x9140)?);
+        self.media_present.store(present, Ordering::Release);
+        for index in 0..intel_gt::uncore::MEDIA.len() {
+            if present & (1 << index) != 0 {
+                intel_gt::uncore::acquire_media(self, index)?;
+                self.media_awake.fetch_or(1 << index, Ordering::Release);
+            }
+        }
+        self.assert_media_idle()
+    }
+    fn assert_media_idle(&self) -> Result<(), Error> {
+        if self.read(intel_gt::uncore::GT_ACK)? & 1 == 0
+            || self.read(intel_gt::uncore::RENDER_ACK)? & 1 == 0
+        {
+            return Err(Error::Refused);
+        }
+        intel_gt::uncore::idle_media(
+            self,
+            self.media_present.load(Ordering::Acquire),
+            self.media_awake.load(Ordering::Acquire),
+        )
+    }
+    fn prepare_shared(&self) -> Result<(), Error> {
+        self.assert_media_idle()?;
+        intel_gt::bcs::prepare(self)
+    }
     fn allowed(&self, r: u32, write: bool) -> bool {
         if !r.is_multiple_of(4) || r as usize + 4 > self.window.len() {
             return false;
@@ -37,6 +66,20 @@ impl Bus {
         }
         if [intel_gt::uncore::GT_ACK, intel_gt::uncore::RENDER_ACK].contains(&r) {
             return !write;
+        }
+        for (index, (_, request, ack, mode)) in intel_gt::uncore::MEDIA.iter().enumerate() {
+            if r == *request {
+                return true;
+            }
+            if r == *ack {
+                return !write;
+            }
+            if [*mode, *mode - 0x9c + 0x30, *mode - 0x9c + 0x34].contains(&r) {
+                return !write && self.media_awake.load(Ordering::Acquire) & (1 << index) != 0;
+            }
+        }
+        if [0x2030, 0x2034].contains(&r) {
+            return !write && self.render_awake.load(Ordering::Acquire);
         }
         if [0xb024, 0x209c, 0x9550].contains(&r) {
             return self.render_awake.load(Ordering::Acquire)
@@ -86,7 +129,7 @@ impl Bus {
                 | 0x220b4 | 0x220c4 | 0x223a0 | 0x22510 | 0x22514 | 0x22518 | 0x2251c | 0x22550 => {
                     true
                 }
-                0x220b8 | 0x9134 | 0x9138 | 0x913c | 0xa26c | 0x44074 | 0xd00 => !write,
+                0x220b8 | 0x9134 | 0x9138 | 0x913c | 0x9140 | 0xa26c | 0x44074 | 0xd00 => !write,
                 _ => false,
             }
     }
@@ -215,6 +258,8 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
         awake: AtomicBool::new(false),
         render_awake: AtomicBool::new(false),
         rcs_owned: AtomicBool::new(false),
+        media_present: AtomicU8::new(0x80),
+        media_awake: AtomicU8::new(0),
     };
     if let Err(error) = intel_gt::uncore::acquire_gt(&bus) {
         *owner = Some(Owner {
@@ -356,6 +401,39 @@ mod tests {
 
     use super::*;
     #[test]
+    fn unknown_or_busy_media_is_refused_before_shared_policy_and_media_writes_are_forbidden() {
+        let mut words = vec![0u32; 0x200000 / 4];
+        // SAFETY: aligned private stable model memory, not a hardware BAR.
+        let window =
+            unsafe { RegisterWindow::from_mapped(words.as_mut_ptr() as usize, words.len() * 4) };
+        let bus = Bus {
+            window,
+            awake: AtomicBool::new(true),
+            render_awake: AtomicBool::new(true),
+            rcs_owned: AtomicBool::new(false),
+            media_present: AtomicU8::new(0x80),
+            media_awake: AtomicU8::new(0),
+        };
+        words[intel_gt::uncore::GT_ACK as usize / 4] = 1;
+        words[intel_gt::uncore::RENDER_ACK as usize / 4] = 1;
+        words[0x9138 / 4] = 1;
+        words[0x913c / 4] = 1;
+        words[0xfdc / 4] = 1 << 31;
+        assert_eq!(bus.prepare_shared(), Err(Error::Refused));
+        bus.media_present.store(1, Ordering::Release);
+        bus.media_awake.store(1, Ordering::Release);
+        words[0xd50 / 4] = 1;
+        assert_eq!(bus.prepare_shared(), Err(Error::Refused));
+        assert_eq!(words[0x9550 / 4], 0);
+        assert_eq!(words[0x400c / 4], 0);
+        assert_eq!(bus.write(0x1c009c, 1 << 8), Err(Error::Refused));
+        assert_eq!(bus.write(0x1c0030, 0), Err(Error::Refused));
+        words[0x1c009c / 4] = 1 << 9;
+        bus.assert_media_idle().unwrap();
+        words[0x1c0030 / 4] = 8;
+        assert_eq!(bus.assert_media_idle(), Err(Error::Refused));
+    }
+    #[test]
     fn native_gt_window_requires_owned_wake_and_rejects_display_or_global_reset() {
         let mut words = vec![0u32; 0x130048 / 4];
         // SAFETY: aligned owned model memory, stable allocation and lifetime;
@@ -367,6 +445,8 @@ mod tests {
             awake: AtomicBool::new(false),
             render_awake: AtomicBool::new(false),
             rcs_owned: AtomicBool::new(false),
+            media_present: AtomicU8::new(0x80),
+            media_awake: AtomicU8::new(0),
         };
         assert_eq!(bus.write(0x2209c, 0x01000100), Err(Error::Refused));
         assert_eq!(bus.read(0x22030), Err(Error::Unavailable(0x22030)));

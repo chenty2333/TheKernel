@@ -210,3 +210,11 @@ late device points below a software signal. Consumer views now flatten immutable
 leaf dependencies and use existing fence waits/poll registrations; no new GPU
 scheduler or producer-fence ownership mechanism is introduced. GPU completion
 remains solely with the device path. Error propagation remains conservative.
+
+Shared-cache admission also excludes unowned media activity. Actual disable
+fuses select only the source ADL-P/N VCS0/VCS2/VECS0 domains. Their corresponding
+forcewake ACKs must be owned, and the source hardware idle checks require empty
+head/tail plus MODE_IDLE. Unknown fuses, lost ACK, active ring or unavailable
+MMIO refuse before PAT/MOCS/L3 writes. RCS firmware-idle preflight now also checks
+head/tail, not MODE_IDLE alone. No media work/reset/codec support is introduced;
+sole-controller GuC exclusion and default-off GT/RCS flags remain required.
