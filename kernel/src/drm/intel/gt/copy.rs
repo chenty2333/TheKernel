@@ -853,6 +853,7 @@ pub(super) fn objects(
     // Last job and bootstrap must already be quiescent; bounded reset also
     // establishes a fresh engine state before loading another private context.
     intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
+    bcs::apply_nonpriv(&owner.bus, false)?;
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
     memory.tables = vm.tables.clone();

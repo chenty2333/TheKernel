@@ -172,7 +172,7 @@ pub fn prepare(io: &impl GtIo) -> Result<(), Error> {
     if io.read(0xb024)? != value {
         return Err(Error::Refused);
     }
-    Ok(())
+    apply_nonpriv(io, false)
 }
 
 /// Strict admission for one snapshotted linear fast-copy and END. The user
@@ -207,4 +207,26 @@ pub fn decode_copy(
         return Err(Error::Refused);
     }
     Ok(copy)
+}
+
+/// Linux7.2.3 intel_workarounds.c tgl_whitelist_build/allow_read_ctx_timestamp
+/// and intel_engine_apply_whitelist. Copyright ©2014-2018 Intel Corporation;
+/// full MIT grant ../LICENSE-MIT. Exact Gen12.0 RCS/BCS only.
+/// The encoded addresses are ordered as source _wa_add, including access bits.
+pub fn apply_nonpriv(io: &impl GtIo, render: bool) -> Result<(), Error> {
+    let base = if render { 0x2000 } else { 0x22000 };
+    let render_regs = [0x7010, 0x7018, 0x7304, 0x10002349];
+    let copy_regs = [0x100223a8];
+    let regs: &[u32] = if render { &render_regs } else { &copy_regs };
+    for index in 0..12 {
+        let value = regs.get(index).copied().unwrap_or(base + 0x94);
+        let register = base + 0x4d0 + (index as u32) * 4;
+        io.write(register, value)?;
+        // Safety addition: refuse failed stores/readback; no wider whitelist
+        // or permissive retry. Caller retains reset/ownership on error.
+        if io.read(register)? != value {
+            return Err(Error::Refused);
+        }
+    }
+    Ok(())
 }

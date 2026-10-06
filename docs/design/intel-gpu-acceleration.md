@@ -311,3 +311,13 @@ that default capture dispatches neither copy nor shader and never publishes its
 synthetic image into native defaults. Physical default capture is unverified.
 General user batches remain closed pending48-bit residency/nonprivileged allowlist
 and cache semantics; no Mesa initialization/rendering or overall completion claim.
+
+
+Native selected-engine preparation now installs the exact source nonprivileged
+register list: BCS read-only context timestamp; RCS read-only invocation/depth
+counter range and the three source tuning/workaround registers. Encoded values
+are sorted as `_wa_add`; all unused12-slot entries are explicitly cleared to
+NOPID, including after BCS reset. Readback failure stops admission rather than
+leaving an unknown permission set. Source-C24-write and every landed-store/
+readback failure comparison pass. General batches remain closed until the
+48-bit residency and target cache/mmap/submission interfaces are connected.

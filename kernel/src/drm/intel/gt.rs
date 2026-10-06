@@ -90,6 +90,13 @@ impl Bus {
             return self.render_awake.load(Ordering::Acquire)
                 && (!write || r != 0x209c || self.rcs_owned.load(Ordering::Acquire));
         }
+        if (0x224d0..0x22500).contains(&r) {
+            return self.awake.load(Ordering::Acquire);
+        }
+        if (0x24d0..0x2500).contains(&r) {
+            return self.rcs_owned.load(Ordering::Acquire)
+                && self.render_awake.load(Ordering::Acquire);
+        }
         if self.rcs_owned.load(Ordering::Acquire) && self.render_awake.load(Ordering::Acquire) {
             if matches!(r, 0x2030 | 0x2034 | 0x8000) {
                 return !write;

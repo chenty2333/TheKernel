@@ -298,7 +298,7 @@ pub fn prepare(io: &impl crate::GtIo) -> Result<(), Error> {
         io.write(0xb004, garb & !0x80)?;
         let threads = io.read(0x20a0)?;
         io.write(0x20a0, threads | (1 << 19))?;
-        Ok(())
+        crate::bcs::apply_nonpriv(io, true)
     })();
     let restore = (|| {
         io.write(0xfdc, before)?;

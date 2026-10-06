@@ -820,3 +820,11 @@ request image, and gates validity on two breadcrumbs plus source reset retiremen
 GPU-generated streams are not rebuilt from invented values. `intel_gt.c::__engines_record_defaults` and `intel_lrc.c::lrc_init_state`
 now guide reset-default recording/clone initialization. Physical capture remains
 unverified; general nonprivileged user batches remain unfinished.
+
+Source Gen12.0 RCS/BCS register whitelist: Linux7.2.3 intel_workarounds.c
+`tgl_whitelist_build`, `allow_read_ctx_timestamp`, `_wa_add` encoded-address
+ordering and `intel_engine_apply_whitelist`; intel_engine_regs.h supplies12
+slots/read-only/range4/NOPID fields. Same source functions compile into the
+existing temporary-C oracle, covering all24 RCS/BCS writes, plus landed-store
+and readback fault cases. The original kernel native ownership gates are kept;
+this does not itself open general Mesa batches or establish GPU execution.

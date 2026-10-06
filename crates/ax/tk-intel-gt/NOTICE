@@ -126,3 +126,10 @@ Valid-image lrc/rcs updates preserve the GPU-generated stream and unrelated
 values, following intel_lrc.c ring/PPGTT/WA/control update facts. Kernel cached
 images use a distinct execlists idle context and reset retirement; software
 model tags are not hardware state-save/default-state acceptance.
+
+N305 nonprivileged register access ports tgl_whitelist_build,
+allow_read_ctx_timestamp and intel_engine_apply_whitelist (MIT ©2014–2018 Intel).
+Twelve source slots retain encoded permission/range bits and source ordering;
+unused entries point at RING_NOPID. Store/readback failure refuses submission.
+The kernel installs this after selected-engine reset, before requests/default
+capture. No arbitrary CPU MMIO or general user batch is enabled by this alone.
