@@ -2,7 +2,6 @@ use alloc::sync::Arc;
 use core::mem::size_of;
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs_ng_vfs::NodePermission;
 use axnet::{
     MAX_LISTEN_BACKLOG, Shutdown, Socket as SocketInner, SocketAddrEx, SocketOps,
     dccp::DccpSocket,
@@ -919,7 +918,7 @@ pub fn sys_bind(
                     path.clone(),
                     &security,
                     creator_domain,
-                    NodePermission::from_bits_truncate(0o777),
+                    socket.inode_mode(),
                     snapshot.umask(),
                     |endpoint| {
                         super::cmsg::prepare_unix_endpoint_owner(

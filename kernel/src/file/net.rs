@@ -162,6 +162,21 @@ impl Socket {
         }
     }
 
+    pub(crate) fn inode_mode(&self) -> axfs_ng_vfs::NodePermission {
+        axfs_ng_vfs::NodePermission::from_bits_truncate(self.inode.stat().mode as u16)
+    }
+
+    pub(crate) fn chmod_inode(
+        &self,
+        mode: u32,
+        security: &super::permission::VfsSecurityContext,
+        metadata: &axfs_ng_vfs::Metadata,
+    ) -> AxResult<()> {
+        super::permission::chmod_pseudo_inode(metadata, mode, security, |mode, ctime| {
+            self.inode.chmod(mode, ctime);
+        })
+    }
+
     pub(crate) fn diag_inode_owner(&self) -> (u64, u32) {
         (self.inode.inode(), self.inode.owner_uid())
     }

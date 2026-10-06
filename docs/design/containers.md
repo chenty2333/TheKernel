@@ -836,3 +836,29 @@ mounts its container root with userxattr/volatile and writes a real OCI spec
 (`shell-qz9q8b6h`). It reaches conmon, whose sync channel yields no JSON; stderr
 reports an oom_score_adj permission failure. Container hello remains unaccepted.
 Next inspect that genuine conmon startup/IPC failure.
+
+### Retained anonymous socket mode before conmon bind
+
+Guest syslog and narrowly scoped temporary tracing identify conmon2.2.1's fatal
+operation as fchmod on its *unbound socket descriptor*, before bind. The descriptor
+already has a real sockfs pseudo inode, but the pathname-only metadata resolver
+returned EBADF; musl then attempted /proc/self/fd chmod and got ENOENT. The debug
+failure to decrease oom_score_adj is nonfatal and CAP_SYS_RESOURCE is unchanged.
+Empty conmon sync JSON is not evidence of NUL corruption.
+
+Descriptor chmod now uses the actual retained socket inode, the same Linux chmod
+policy plan, mandatory pre/post setattr hooks, and serialized metadata writer.
+It publishes mode and ctime coherently, preserving identity, owner and type.
+Unix pathname bind uses that inode's mode and the caller's umask, as Linux7.2.3
+net/unix/af_unix.c does. Socket and bound pathname inodes remain distinct.
+No synthetic Location, fake success or permission bypass is involved.
+
+Kernel2655 host tests, KVM system70/70 (`system-coo667em`) and paired fs-abi24/259
+(`abi-5knx8iam`) passed. The paired fixture directly invokes fchmod, checks dup
+identity/shared mode, actual pathname bind mode, subsequent descriptor/path inode
+separation, and a non-owner EPERM negative. Other descriptor-only pseudo inode
+chmod and non-network socket families are outside this fix's validation scope.
+Actual signed rootless podman (`shell-ndnfuoj_`) now passes conmon socket creation
+and launches real crun. OCI setup stops at the missing
+/proc/sys/net/ipv4/ping_group_range. Hello is not accepted; nonfatal stdout/stderr
+chmod warnings are separately recorded, not treated as the main failure.

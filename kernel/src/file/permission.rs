@@ -638,6 +638,35 @@ impl Drop for PublishedInodeSetattr<'_, '_> {
     }
 }
 
+/// Descriptor-only sockfs inodes have no pathname or ACL provider. Use the
+/// same Linux mode plan and mandatory setattr admission, publishing only on
+/// successful preparation to the retained inode supplied by the caller.
+pub(crate) fn chmod_pseudo_inode(
+    metadata: &Metadata,
+    mode: u32,
+    security: &VfsSecurityContext,
+    publish: impl FnOnce(u16, Timestamp),
+) -> AxResult<()> {
+    validate_setattr_owner_pair(metadata, None, None, security.filesystem_owner_user_ns())?;
+    let node = linux_metadata_snapshot(metadata);
+    let request = LinuxChmodRequest::new(mode as u16);
+    let plan = linux_plan_chmod(
+        &node,
+        request,
+        KernelDacCredentials::actor_bound(security.actor(), security.credentials()),
+    );
+    let proposal = InodeSetattrProposal::chmod(InodeChmodIntent::new(
+        inode_setattr_mode(plan.request().mode())?,
+    ));
+    let admission = security.begin_pseudo_inode_setattr(metadata, proposal)?;
+    let prepared = plan.prepare().map_err(map_setattr_error)?;
+    let ctime = wall_time().into();
+    let committed = prepare_metadata_setattr(metadata, prepared, ctime).committed;
+    publish(committed.mode.bits(), ctime);
+    admission.committed(InodeSetattrCommittedSecurityRef::new_pseudo(&committed));
+    Ok(())
+}
+
 /// Kernel adapter joining one exact generic Linux-VFS chmod plan to the typed
 /// credential hook contract.
 ///

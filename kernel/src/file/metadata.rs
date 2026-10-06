@@ -22,7 +22,6 @@ static NEXT_PSEUDO_INODE: AtomicU64 = AtomicU64::new(2);
 pub(crate) struct PseudoInode {
     device: DeviceId,
     inode: u64,
-    mode: u32,
     uid: u32,
     gid: u32,
     times: Mutex<PseudoTimes>,
@@ -30,6 +29,7 @@ pub(crate) struct PseudoInode {
 
 #[derive(Debug)]
 struct PseudoTimes {
+    mode: u32,
     atime: Timestamp,
     mtime: Timestamp,
     ctime: Timestamp,
@@ -40,10 +40,10 @@ impl PseudoInode {
         Self {
             device,
             inode: NEXT_PSEUDO_INODE.fetch_add(1, Ordering::Relaxed),
-            mode,
             uid,
             gid,
             times: Mutex::new(PseudoTimes {
+                mode,
                 atime: Timestamp::ZERO,
                 mtime: Timestamp::ZERO,
                 ctime: Timestamp::ZERO,
@@ -86,7 +86,7 @@ impl PseudoInode {
             dev: self.device.0,
             ino: self.inode,
             nlink: 1,
-            mode: self.mode,
+            mode: times.mode,
             uid: self.uid,
             gid: self.gid,
             blksize: 4096,
@@ -95,6 +95,12 @@ impl PseudoInode {
             ctime: times.ctime,
             ..Kstat::default()
         }
+    }
+
+    pub(crate) fn chmod(&self, mode: u16, ctime: Timestamp) {
+        let mut metadata = self.times.lock();
+        metadata.mode = (metadata.mode & !0o7777) | u32::from(mode & 0o7777);
+        metadata.ctime = ctime;
     }
 
     pub(crate) fn update_timestamps(
@@ -142,6 +148,18 @@ mod tests {
     use axfs_ng_vfs::Timestamp;
 
     use super::PseudoInode;
+
+    #[test]
+    fn socket_mode_publication_preserves_identity_and_type() {
+        let inode = PseudoInode::socket();
+        let before = inode.stat();
+        inode.chmod(0o700, Timestamp::new(19, 0));
+        let after = inode.stat();
+        assert_eq!(after.mode, linux_raw_sys::general::S_IFSOCK | 0o700);
+        assert_eq!((after.dev, after.ino, after.uid, after.gid),
+                   (before.dev, before.ino, before.uid, before.gid));
+        assert_eq!(after.ctime, Timestamp::new(19, 0));
+    }
 
     #[test]
     fn pseudo_inode_timestamp_publication_is_single_snapshot() {

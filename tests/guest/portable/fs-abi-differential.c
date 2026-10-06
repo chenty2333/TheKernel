@@ -19,6 +19,7 @@
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
@@ -2221,6 +2222,49 @@ int main(void) {
         check(fchownat(pdir, "pfile", 0, 0, 0) == 0, "fchownat");
         check(fchown(pf, 0, 0) == 0, "fchown");
         ERROR(fchmodat(pdir, "pmissing", 0600, 0), ENOENT, "fchmodat-absent");
+        /* sockfs retains the descriptor inode mode; Unix bind uses that
+         * mode, not a hardcoded 0777. The pathname inode remains distinct. */
+        int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        check(sock >= 0, "socket-chmod-create");
+        struct stat sock_before, sock_after;
+        check(fstat(sock, &sock_before) == 0, "socket-chmod-stat-before");
+        check(syscall(SYS_fchmod, sock, 0700) == 0, "socket-direct-fchmod");
+        int sock_dup = dup(sock);
+        check(sock_dup >= 0 && fstat(sock_dup, &sock_after) == 0,
+              "socket-chmod-dup-stat");
+        check(S_ISSOCK(sock_after.st_mode) && (sock_after.st_mode & 07777) == 0700 &&
+              sock_after.st_ino == sock_before.st_ino &&
+              sock_after.st_dev == sock_before.st_dev, "socket-chmod-real-inode");
+        struct sockaddr_un sock_addr = {.sun_family = AF_UNIX};
+        snprintf(sock_addr.sun_path, sizeof(sock_addr.sun_path),
+                 "/tmp/thekernel-chmod-socket-%ld", (long)getpid());
+        unlink(sock_addr.sun_path);
+        mode_t sock_umask = umask(0027);
+        check(bind(sock, (struct sockaddr *)&sock_addr, sizeof(sock_addr)) == 0,
+              "socket-chmod-bind");
+        umask(sock_umask);
+        check(lstat(sock_addr.sun_path, &sock_after) == 0 &&
+              S_ISSOCK(sock_after.st_mode) && (sock_after.st_mode & 07777) == 0700,
+              "socket-chmod-bind-mode");
+        check(syscall(SYS_fchmod, sock_dup, 0600) == 0 &&
+              fstat(sock, &sock_after) == 0 && (sock_after.st_mode & 07777) == 0600,
+              "socket-chmod-shared-inode");
+        check(lstat(sock_addr.sun_path, &sock_after) == 0 &&
+              (sock_after.st_mode & 07777) == 0700, "socket-chmod-distinct-path-inode");
+        pid_t sock_child = fork();
+        check(sock_child >= 0, "socket-chmod-owner-child");
+        if (sock_child == 0) {
+            if (setgid(1001) || setuid(1001)) _exit(1);
+            errno = 0;
+            _exit(syscall(SYS_fchmod, sock, 0777) == -1 && errno == EPERM ? 0 : 2);
+        }
+        int sock_status;
+        check(waitpid(sock_child, &sock_status, 0) == sock_child &&
+              WIFEXITED(sock_status) && WEXITSTATUS(sock_status) == 0,
+              "socket-chmod-owner-denied");
+        check(unlink(sock_addr.sun_path) == 0, "socket-chmod-unlink");
+        close(sock_dup);
+        close(sock);
         mark("MODE_AND_OWNER");
 
         /* fs/namei.c do_mknodat(): a FIFO is creatable and a duplicate name

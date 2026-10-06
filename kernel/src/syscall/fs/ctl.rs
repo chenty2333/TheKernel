@@ -1923,6 +1923,14 @@ fn do_fchmodat(
     // See the chown path above: this broad writer gate is an interim mechanism,
     // not the final per-inode metadata transaction architecture.
     let _metadata_writer_fallback = mounts::namespace_operation();
+    if path.is_none_or(|path| path.as_bytes().is_empty()) && dirfd != AT_FDCWD {
+        let description = get_file_description(dirfd)?;
+        check_metadata_description_status(source, description.status_flags())?;
+        if let Some(socket) = description.inner.downcast_ref::<crate::file::Socket>() {
+            socket.chmod_inode(mode, &security, &pseudo_metadata(&socket.stat()?))?;
+            return Ok(0);
+        }
+    }
     let loc = resolve_metadata_target(dirfd, path, flags, source, &security)?;
     check_writable_mount(&loc)?;
     inode_flags::check_nonappend_content_mutable(&loc)?;
