@@ -55,7 +55,7 @@ AUDIT_CHECKED = {"crates/linux": 55, "kernel/src": 17, "crates/ax": 0}
 # naming a callee body beside a call-site quote.
 AUDIT_ALLOWLIST = {
     "crates/linux/mm/src/userfaultfd.rs:35",
-    "crates/linux/net/src/lib.rs:347",
+    "crates/linux/net/src/lib.rs:360",
     "kernel/src/syscall/fs/io_uring.rs:765",
 }
 

@@ -524,3 +524,11 @@ retains existing raw configuration descriptor bytes and encodes the standard
 device-descriptor fields already decoded by the dependency. This is dependency
 reuse with original Rust observation additions, not a Linux-code translation.
 The package/license-file discrepancy is recorded in `docs/licensing.md`.
+
+### Interface short-flags accessor audit location (B container work)
+
+The original ifreq short-input accessor/regression moved the already-registered
+Linux7.2.3 sockaddr import excerpt marker in crates/linux/net/src/lib.rs from
+line347 to360. The range-citation audit row follows that source movement;
+excerpt content, allowed ranges and scan-category totals are unchanged. The
+period65 host check detected this drift; no threshold or assertion was relaxed.
