@@ -4,8 +4,9 @@
 // dvo_port_to_port (XELPD mapping), map_ddc_pin (ADL-P mapping), encoder_supports_*,
 // intel_bios_hdmi_max_tmds_clock and sanitize_dedicated_external.
 // Copyright © 2006 Intel Corporation.
-// intel_vbt_defs.h: vbt_header/bdb_header/bdb_general_definitions/child_device_config.
-// Copyright © 2006-2016 Intel Corporation. MIT permission text: ../LICENSE-MIT.
+// intel_vbt_defs.h: vbt_header/bdb_header/bdb_general_features/bdb_general_definitions/
+// child_device_config. Copyright © 2006-2016 Intel Corporation.
+// MIT permission text: ../LICENSE-MIT.
 // Pre-216/after-264 BDB semantic versions, other platforms, LVDS/DSI/panel blocks
 // and unused child fields omitted. Checked byte access replaces C packed loads.
 use crate::{Error, bytes, device::Port, le16, le32};
@@ -75,6 +76,25 @@ impl<'a> Vbt<'a> {
             }
         }
         Ok(None)
+    }
+    /// The display-13 DKL PLL's board-provided AFC startup override, as
+    /// interpreted by i915's `parse_general_features`. Missing/short legacy
+    /// feature blocks mean no override; the VBT version gates the 249+ field.
+    pub fn afc_startup_override(&self) -> Result<Option<u8>, Error> {
+        if self.version < 249 {
+            return Ok(None);
+        }
+        let Some(features) = self.find_raw_section(1)? else {
+            return Ok(None);
+        };
+        let Some(config) = features.get(7).map(|value| value & 3) else {
+            return Ok(None);
+        };
+        Ok(match config {
+            0 => None,
+            1 => Some(0),
+            _ => Some(7),
+        })
     }
     pub fn parse_general_definitions(&self) -> Result<GeneralDefinitions<'a>, Error> {
         if !(216..=264).contains(&self.version) {
@@ -290,6 +310,19 @@ mod tests {
         data[78..].copy_from_slice(children);
         data
     }
+    fn with_afc_feature(mut data: Vec<u8>, value: u8) -> Vec<u8> {
+        let old_sections = data[70..].to_vec();
+        let mut feature = vec![0; 8];
+        feature[7] = value;
+        let mut section = vec![1, 8, 0];
+        section.extend_from_slice(&feature);
+        section.extend_from_slice(&old_sections);
+        data.splice(70.., section);
+        let len = data.len();
+        data[24..26].copy_from_slice(&(len as u16).to_le_bytes());
+        data[68..70].copy_from_slice(&((len - 48) as u16).to_le_bytes());
+        data
+    }
     fn tc_hdmi() -> [u8; 39] {
         let mut child = [0; 39];
         child[0] = 64;
@@ -310,6 +343,20 @@ mod tests {
         assert!(!tc.usb_type_c && !tc.thunderbolt && !tc.supports_dp());
         assert_eq!(tc.hdmi_level_shift, 5);
         assert!(defs.encoder(Port::A).unwrap().is_none());
+    }
+    #[test]
+    fn general_features_afc_startup_matches_display13_vbt_policy() {
+        for (field, expected) in [(0, None), (1, Some(0)), (2, Some(7)), (3, Some(7))] {
+            let data = with_afc_feature(table(&tc_hdmi(), 39), field);
+            assert_eq!(
+                Vbt::parse(&data).unwrap().afc_startup_override(),
+                Ok(expected)
+            );
+        }
+        let data = with_afc_feature(table(&tc_hdmi(), 39), 1);
+        let mut old = data.clone();
+        old[64..66].copy_from_slice(&248u16.to_le_bytes());
+        assert_eq!(Vbt::parse(&old).unwrap().afc_startup_override(), Ok(None));
     }
     #[test]
     fn every_truncation_and_bad_extent_fails_without_panic() {

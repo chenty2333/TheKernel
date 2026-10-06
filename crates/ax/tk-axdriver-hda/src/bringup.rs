@@ -12,6 +12,7 @@ use crate::{
     Hal,
     codec::{self, Route, Verbs},
     desc::{BufferDescriptor, FORMAT, PERIOD, PERIODS, verb},
+    eld::Eld,
     regs::{self, Bus},
 };
 struct Dma<H: Hal> {
@@ -68,6 +69,10 @@ pub struct Controller<H: Hal, B: Bus> {
     rp: u16,
     stream: usize,
     route: Option<Route>,
+    present: u16,
+    hdmi_route: Option<Route>,
+    hdmi_eld: Option<Eld>,
+    route_invalidated: bool,
     pending: VecDeque<(u16, usize)>,
     retired: VecDeque<u16>,
     tail: usize,
@@ -107,6 +112,10 @@ impl<H: Hal, B: Bus> Controller<H, B> {
             running: false,
             prepared: false,
             live: true,
+            present: 0,
+            hdmi_route: None,
+            hdmi_eld: None,
+            route_invalidated: false,
             sequence: 0,
             last_poll: 0,
         };
@@ -141,6 +150,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         c.bus.write(regs::RIRBCTL, 1, 3);
         c.bus.write(regs::CORBCTL, 1, 2);
         let present = c.bus.read(regs::STATESTS, 2) as u16;
+        c.present = present;
         let route = codec::enumerate(&mut c, present)?;
         let converter = route.path.last().ok_or(DevError::Unsupported)?;
         if converter.caps & 1 == 0 {
@@ -168,6 +178,117 @@ impl<H: Hal, B: Bus> Controller<H, B> {
     }
     pub fn route(&self) -> &Route {
         self.route.as_ref().unwrap()
+    }
+
+    /// Publish/unpublish ELD for one already active DDI HDMI route.
+    ///
+    /// ADL-P's display-codec pin topology is confirmed by the enumerated widget
+    /// capabilities and route before any converter or pin verb is changed.
+    /// Changing the endpoint stops the owned stream first; if a submitted period
+    /// was retired by that transition, the extant playback owner sees one I/O
+    /// error rather than waiting forever for a token that can no longer arrive.
+    pub fn set_display_eld(&mut self, port: u8, bytes: Option<&[u8]>) -> DevResult {
+        if !self.live {
+            return Err(DevError::Io);
+        }
+        let pin = display_pin_for_port(port)?;
+        let Some(bytes) = bytes else {
+            if self
+                .hdmi_route
+                .as_ref()
+                .is_some_and(|route| route.path.first().is_some_and(|w| w.node == pin))
+            {
+                return self.restore_analog_route();
+            }
+            return Ok(());
+        };
+        let eld = Eld::parse(bytes)?;
+        if self.hdmi_route.as_ref().is_some_and(|active| {
+            active.path.first().map(|w| w.node) == Some(pin) && self.hdmi_eld.as_ref() == Some(&eld)
+        }) {
+            return Ok(());
+        }
+        self.stop_for_route_change()?;
+        let route = match codec::enumerate_hdmi(self, self.present, pin) {
+            Ok(route) => route,
+            Err(error) => {
+                if self.hdmi_route.is_some() {
+                    self.restore_analog_route()?;
+                }
+                return Err(error);
+            }
+        };
+        let converter = route.path.last().ok_or(DevError::Unsupported)?;
+        let format_node = if converter.caps & 16 != 0 {
+            converter.node
+        } else {
+            route.function
+        };
+        let pcm = self.verb(route.codec, format_node, 0xf00, 0xa)?;
+        if pcm & (1 << 6) == 0
+            || pcm & (1 << 17) == 0
+            || self.verb(route.codec, format_node, 0xf00, 0xb)? & 1 == 0
+        {
+            if self.hdmi_route.is_some() {
+                self.restore_analog_route()?;
+            }
+            return Err(DevError::Unsupported);
+        }
+        if let Some(previous) = self.hdmi_route.clone() {
+            if codec::disable_hdmi(self, &previous).is_err() {
+                self.live = false;
+                return Err(DevError::Io);
+            }
+        } else if let Some(analog) = self.route.clone()
+            && codec::disable_analog(self, &analog).is_err()
+        {
+            self.live = false;
+            return Err(DevError::Io);
+        }
+        if codec::configure_hdmi(self, &route).is_err() {
+            let restored = self
+                .route
+                .clone()
+                .is_some_and(|analog| codec::configure(self, &analog).is_ok());
+            if !restored {
+                self.live = false;
+            }
+            return Err(DevError::Io);
+        }
+        self.hdmi_route = Some(route);
+        self.hdmi_eld = Some(eld);
+        Ok(())
+    }
+
+    fn stop_for_route_change(&mut self) -> DevResult {
+        let invalidate_playback = self.prepared || self.running || !self.pending.is_empty();
+        if invalidate_playback {
+            self.abort()?;
+            self.route_invalidated = true;
+        }
+        Ok(())
+    }
+
+    fn restore_analog_route(&mut self) -> DevResult {
+        self.stop_for_route_change()?;
+        let Some(route) = self.hdmi_route.clone() else {
+            return Ok(());
+        };
+        if codec::disable_hdmi(self, &route).is_err() {
+            self.live = false;
+            return Err(DevError::Io);
+        }
+        let Some(analog) = self.route.clone() else {
+            self.live = false;
+            return Err(DevError::BadState);
+        };
+        if codec::configure(self, &analog).is_err() {
+            self.live = false;
+            return Err(DevError::Io);
+        }
+        self.hdmi_route = None;
+        self.hdmi_eld = None;
+        Ok(())
     }
     pub fn prepare(&mut self, period: u32, periods: u32) -> DevResult {
         if !self.live || period as usize != PERIOD || periods as usize != PERIODS {
@@ -250,6 +371,10 @@ impl<H: Hal, B: Bus> Controller<H, B> {
     }
     pub fn complete(&mut self) -> DevResult<Option<u16>> {
         if !self.live {
+            return Err(DevError::Io);
+        }
+        if self.route_invalidated {
+            self.route_invalidated = false;
             return Err(DevError::Io);
         }
         if self.running {
@@ -386,6 +511,17 @@ fn wait(bus: &mut impl Bus, offset: usize, width: usize, mask: u32, value: u32) 
         bus.delay_us(10);
     }
     Err(DevError::Io)
+}
+
+fn display_pin_for_port(port: u8) -> DevResult<u8> {
+    // The ADL-P HDA codec's port map assigns PORT_D/TC1 and PORT_E/TC2 to
+    // widget NIDs 0x0a and 0x0b. `enumerate_hdmi` must still confirm the live
+    // codec vendor, pin capabilities, default connectivity and digital route.
+    match port {
+        3 => Ok(0x0a),
+        4 => Ok(0x0b),
+        _ => Err(DevError::Unsupported),
+    }
 }
 impl<H: Hal, B: Bus> Drop for Controller<H, B> {
     fn drop(&mut self) {

@@ -71,6 +71,27 @@ fn connections(v: &mut impl Verbs, c: u8, n: u8) -> DevResult<Vec<u8>> {
     }
     Ok(list)
 }
+
+fn read_widgets(v: &mut impl Verbs, codec: u8, function: u8) -> DevResult<Vec<Widget>> {
+    let mut nodes = Vec::new();
+    for node in children(v, codec, function)? {
+        let n = node as u8;
+        let caps = parameter(v, codec, n, 9)?;
+        let pin = (caps >> 20) & 15 == 4;
+        nodes.push(Widget {
+            node: n,
+            caps,
+            pin_caps: if pin { parameter(v, codec, n, 0xc)? } else { 0 },
+            config: if pin { v.verb(codec, n, 0xf1c, 0)? } else { 0 },
+            connections: if caps & (1 << 8) != 0 {
+                connections(v, codec, n)?
+            } else {
+                Vec::new()
+            },
+        });
+    }
+    Ok(nodes)
+}
 fn walk(nodes: &[Widget], node: u8, visited: &mut [bool; 256], path: &mut Vec<Widget>) -> bool {
     if visited[usize::from(node)] || path.len() == 32 {
         return false;
@@ -113,6 +134,57 @@ pub fn find_route(nodes: &[Widget]) -> Option<Vec<Widget>> {
     }
     None
 }
+
+fn walk_digital(
+    nodes: &[Widget],
+    node: u8,
+    visited: &mut [bool; 256],
+    path: &mut Vec<Widget>,
+) -> bool {
+    if visited[usize::from(node)] || path.len() == 32 {
+        return false;
+    }
+    visited[usize::from(node)] = true;
+    let Some(widget) = nodes.iter().find(|w| w.node == node) else {
+        return false;
+    };
+    if widget.caps & (1 << 9) == 0 {
+        return false;
+    }
+    path.push(widget.clone());
+    if widget.kind() == 0 {
+        return true;
+    }
+    if [2, 3, 4].contains(&widget.kind()) {
+        for target in &widget.connections {
+            if walk_digital(nodes, *target, visited, path) {
+                return true;
+            }
+        }
+    }
+    path.pop();
+    false
+}
+
+/// Find a source-backed Intel display-codec pin by the already mapped display port.
+/// The requested NID is checked against live widget/pin caps and its digital path;
+/// an unchecked `pin = port + base` guess is not sufficient for admission.
+pub fn find_hdmi_route(nodes: &[Widget], requested_pin: u8) -> Option<Vec<Widget>> {
+    let pin = nodes.iter().find(|w| {
+        w.node == requested_pin
+            && w.kind() == 4
+            && w.caps & (1 << 9) != 0
+            && w.pin_caps & (1 << 4) != 0
+            && w.pin_caps & (1 << 7) != 0
+            && (w.config >> 30) & 3 != 1
+    })?;
+    let mut path = Vec::new();
+    if walk_digital(nodes, pin.node, &mut [false; 256], &mut path) {
+        Some(path)
+    } else {
+        None
+    }
+}
 pub fn enumerate(v: &mut impl Verbs, present: u16) -> DevResult<Route> {
     for c in 0..15 {
         if present & (1 << c) == 0 {
@@ -124,27 +196,40 @@ pub fn enumerate(v: &mut impl Verbs, present: u16) -> DevResult<Route> {
             if parameter(v, c, f, 5)? & 255 != 1 {
                 continue;
             }
-            let mut nodes = Vec::new();
-            for node in children(v, c, f)? {
-                let n = node as u8;
-                let caps = parameter(v, c, n, 9)?;
-                let pin = (caps >> 20) & 15 == 4;
-                nodes.push(Widget {
-                    node: n,
-                    caps,
-                    pin_caps: if pin { parameter(v, c, n, 0xc)? } else { 0 },
-                    config: if pin { v.verb(c, n, 0xf1c, 0)? } else { 0 },
-                    connections: if caps & (1 << 8) != 0 {
-                        connections(v, c, n)?
-                    } else {
-                        Vec::new()
-                    },
-                });
-            }
+            let nodes = read_widgets(v, c, f)?;
             if let Some(path) = find_route(&nodes) {
                 return Ok(Route {
                     codec: c,
                     function: f,
+                    vendor,
+                    path,
+                });
+            }
+        }
+    }
+    Err(DevError::Unsupported)
+}
+
+/// Enumerate only the Intel display codec and validate the live port-mapped pin.
+pub fn enumerate_hdmi(v: &mut impl Verbs, present: u16, requested_pin: u8) -> DevResult<Route> {
+    for codec in 0..15 {
+        if present & (1 << codec) == 0 {
+            continue;
+        }
+        let vendor = parameter(v, codec, 0, 0)?;
+        if vendor >> 16 != 0x8086 {
+            continue;
+        }
+        for function in children(v, codec, 0)? {
+            let function = function as u8;
+            if parameter(v, codec, function, 5)? & 255 != 1 {
+                continue;
+            }
+            let nodes = read_widgets(v, codec, function)?;
+            if let Some(path) = find_hdmi_route(&nodes, requested_pin) {
+                return Ok(Route {
+                    codec,
+                    function,
                     vendor,
                     path,
                 });
@@ -229,6 +314,81 @@ pub fn configure(v: &mut impl Verbs, route: &Route) -> DevResult {
             v.verb(c, w.node, 0x706, 0x10)?;
         }
     }
+    Ok(())
+}
+
+/// Stop the currently configured analog endpoint before handing the stream to
+/// the display's independent digital converter.
+pub fn disable_analog(v: &mut impl Verbs, route: &Route) -> DevResult {
+    let pin = route.path.first().ok_or(DevError::BadState)?.node;
+    let converter = route.path.last().ok_or(DevError::BadState)?.node;
+    v.verb(route.codec, pin, 0x707, 0)?;
+    v.verb(route.codec, converter, 0x706, 0)?;
+    Ok(())
+}
+
+/// Prepare one two-channel, 48-kHz PCM route and its HDMI Audio InfoFrame.
+pub fn configure_hdmi(v: &mut impl Verbs, route: &Route) -> DevResult {
+    let first = route.path.first().ok_or(DevError::BadState)?;
+    let last = route.path.last().ok_or(DevError::BadState)?;
+    if first.kind() != 4 || first.node == 0 || last.kind() != 0 {
+        return Err(DevError::Unsupported);
+    }
+    let c = route.codec;
+    v.verb(c, route.function, 0x705, 0)?;
+    for (index, widget) in route.path.iter().enumerate() {
+        if widget.caps & (1 << 10) != 0 {
+            v.verb(c, widget.node, 0x705, 0)?;
+        }
+        if let Some(next) = route.path.get(index + 1) {
+            let selected = widget
+                .connections
+                .iter()
+                .position(|node| *node == next.node)
+                .ok_or(DevError::BadState)?;
+            if widget.kind() != 2 && widget.connections.len() > 1 {
+                v.verb(c, widget.node, 0x701, selected as u16)?;
+            }
+        }
+    }
+    let pin = first.node;
+    let converter = last.node;
+    // Non-MST display codecs use entry zero. The pin NID itself was found from
+    // the source port mapping and verified against live digital HDMI pin caps.
+    v.verb(c, pin, 0x735, 0)?;
+    v.verb(c, pin, 0x707, 0x40)?;
+    v.verb(c, converter, 0x200, crate::desc::FORMAT)?;
+    v.verb(c, converter, 0x72d, 1)?; // two PCM channels are encoded as N-1.
+    v.verb(c, converter, 0x706, 0x10)?; // stream tag 1, channel 0.
+    let digital = v.verb(c, converter, 0xf0d, 0)? as u16;
+    v.verb(c, converter, 0x70d, digital | 1)?; // enable digital output, preserve status bits.
+
+    // HDMI Audio InfoFrame: stereo (CC=1), default channel allocation (CA=0).
+    let mut frame = [0u8; 14];
+    frame[0] = 0x84;
+    frame[1] = 1;
+    frame[2] = 10;
+    frame[4] = 1;
+    frame[3] = 0u8.wrapping_sub(frame.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)));
+    v.verb(c, pin, 0x730, 0)?;
+    v.verb(c, pin, 0x732, 0)?;
+    for byte in frame {
+        v.verb(c, pin, 0x731, u16::from(byte))?;
+    }
+    v.verb(c, pin, 0x730, 0)?;
+    v.verb(c, pin, 0x732, 0xc0)?;
+    Ok(())
+}
+
+pub fn disable_hdmi(v: &mut impl Verbs, route: &Route) -> DevResult {
+    let pin = route.path.first().ok_or(DevError::BadState)?.node;
+    let converter = route.path.last().ok_or(DevError::BadState)?.node;
+    v.verb(route.codec, pin, 0x730, 0)?;
+    v.verb(route.codec, pin, 0x732, 0)?;
+    v.verb(route.codec, pin, 0x707, 0)?;
+    v.verb(route.codec, converter, 0x706, 0)?;
+    let digital = v.verb(route.codec, converter, 0xf0d, 0)? as u16;
+    v.verb(route.codec, converter, 0x70d, digital & !1)?;
     Ok(())
 }
 

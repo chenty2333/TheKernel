@@ -49,6 +49,8 @@ pub(crate) mod offset {
     pub(crate) const VENDOR_ID: u16 = 0x00;
     pub(crate) const DEVICE_ID: u16 = 0x02;
     pub(crate) const COMMAND: u16 = 0x04;
+    /// PCI Status, whose Capabilities List bit gates the linked list at `0x34`.
+    pub(crate) const STATUS: u16 = 0x06;
     pub(crate) const REVISION_ID: u16 = 0x08;
     pub(crate) const PROG_IF: u16 = 0x09;
     pub(crate) const SUBCLASS: u16 = 0x0a;
@@ -203,6 +205,325 @@ pub(crate) trait ConfigSpace {
         Some((dword >> ((offset & 3) * 8)) as u8)
     }
 }
+
+/// The explicit write half used only after the native display path has taken
+/// ownership. PCI probes remain read-only; implementations write just the
+/// bounded 16/32-bit fields the MSI transaction names.
+pub(crate) trait ConfigWriteSpace: ConfigSpace {
+    fn write_u16(&mut self, bdf: Bdf, offset: u16, value: u16) -> Result<(), String>;
+    fn write_u32(&mut self, bdf: Bdf, offset: u16, value: u32) -> Result<(), String>;
+}
+
+/// Standard MSI transaction shared by target ECAM and the host capability
+/// model. MSI-X and an already-enabled MSI remain unowned and are refused.
+pub(super) trait N305DisplayMsi: ConfigWriteSpace {
+    fn prepare_n305_display_msi(
+        &mut self,
+        bdf: Bdf,
+        message_address: u64,
+        message_data: u32,
+    ) -> Result<DisplayMsiBefore, DisplayMsiPrepareError> {
+        self.prepare_n305_display_msi_inner(bdf, message_address, message_data)
+            .map_err(|message| DisplayMsiPrepareError {
+                rollback_verified: !message.contains("PCI MSI rollback unverified"),
+                message,
+            })
+    }
+
+    /// Program one MSI message for the already-owned N305 display function,
+    /// keeping MSI disabled until the caller has installed its source masks.
+    /// MSI-X and a firmware-enabled MSI are unowned and therefore refused.
+    fn prepare_n305_display_msi_inner(
+        &mut self,
+        bdf: Bdf,
+        message_address: u64,
+        message_data: u32,
+    ) -> Result<DisplayMsiBefore, String> {
+        const CAP_MSI: u8 = 0x05;
+        const CAP_MSIX: u8 = 0x11;
+        const MSI_ENABLE: u16 = 1;
+        const MSI_MME_MASK: u16 = 0x70;
+        const MSI_64BIT: u16 = 1 << 7;
+        const MSI_PVM: u16 = 1 << 8;
+        const MSIX_ENABLE: u16 = 1 << 15;
+        const PCI_COMMAND_INTX_DISABLE: u16 = 1 << 10;
+
+        let info = DeviceInfo::read(self, bdf)
+            .ok_or_else(|| String::from("display MSI: N305 PCI header is unreadable"))?;
+        if (info.vendor_id, info.device_id, info.revision) != (0x8086, 0x46d0, 0)
+            || info.header_type & 0x7f != HEADER_TYPE_STANDARD
+        {
+            return Err(String::from(
+                "display MSI: only the admitted N305 type-0 PCI function is supported",
+            ));
+        }
+        let command = info.command;
+        if command & 2 == 0 {
+            return Err(String::from(
+                "display MSI: PCI memory decode is not enabled by the firmware owner",
+            ));
+        }
+        if self
+            .read_u16(bdf, offset::STATUS)
+            .is_none_or(|status| status & (1 << 4) == 0)
+        {
+            return Err(String::from(
+                "display MSI: PCI capability list is absent or unreadable",
+            ));
+        }
+
+        let mut current = self
+            .read_u8(bdf, 0x34)
+            .ok_or_else(|| String::from("display MSI: capability head is unreadable"))?;
+        let mut seen = [0u8; 48];
+        let mut count = 0usize;
+        let mut msi = None;
+        let mut msix_enabled = false;
+        while current != 0 {
+            if !(0x40..=0xfc).contains(&current) || current & 3 != 0 || count == seen.len() {
+                return Err(String::from(
+                    "display MSI: malformed or overlong PCI capability chain",
+                ));
+            }
+            if seen[..count].contains(&current) {
+                return Err(String::from("display MSI: PCI capability chain loops"));
+            }
+            seen[count] = current;
+            count += 1;
+            let header = self
+                .read_u32(bdf, u16::from(current))
+                .ok_or_else(|| String::from("display MSI: capability header is unreadable"))?;
+            let id = header as u8;
+            let next = (header >> 8) as u8;
+            let capability = u16::from(current);
+            let control = (header >> 16) as u16;
+            match id {
+                CAP_MSI if msi.is_none() => msi = Some((capability, control)),
+                CAP_MSI => {
+                    return Err(String::from(
+                        "display MSI: duplicate MSI capabilities are refused",
+                    ));
+                }
+                CAP_MSIX => msix_enabled |= control & MSIX_ENABLE != 0,
+                _ => {}
+            }
+            current = next;
+        }
+        if msix_enabled {
+            return Err(String::from(
+                "display MSI: firmware-enabled MSI-X is unowned; refusing to change it",
+            ));
+        }
+        let (capability, control) =
+            msi.ok_or_else(|| String::from("display MSI: PCI MSI capability is absent"))?;
+        if control & MSI_ENABLE != 0 {
+            return Err(String::from(
+                "display MSI: firmware MSI is already enabled and unowned",
+            ));
+        }
+
+        let is_64bit = control & MSI_64BIT != 0;
+        let has_pvm = control & MSI_PVM != 0;
+        let address_low_offset = capability + 4;
+        let (address_high_offset, data_offset) = if is_64bit {
+            (Some(capability + 8), capability + 12)
+        } else {
+            (None, capability + 8)
+        };
+        let mask_offset = has_pvm.then_some(data_offset + 4);
+        let capability_end = capability
+            + if has_pvm {
+                if is_64bit { 24 } else { 20 }
+            } else if is_64bit {
+                14
+            } else {
+                10
+            };
+        if capability_end > 0x100 {
+            return Err(String::from(
+                "display MSI: standard MSI layout extends past conventional PCI config space",
+            ));
+        }
+        if seen[..count].iter().any(|other| {
+            let other = u16::from(*other);
+            other != capability && capability < other && other < capability_end
+        }) {
+            return Err(String::from(
+                "display MSI: another capability header overlaps the writable MSI layout",
+            ));
+        }
+        let before = DisplayMsiBefore {
+            bdf,
+            capability,
+            control,
+            command,
+            address_low: self
+                .read_u32(bdf, address_low_offset)
+                .ok_or_else(|| String::from("display MSI: message address is unreadable"))?,
+            address_high: address_high_offset
+                .map(|offset| {
+                    self.read_u32(bdf, offset)
+                        .ok_or_else(|| String::from("display MSI: 64-bit address is unreadable"))
+                })
+                .transpose()?,
+            data: self
+                .read_u16(bdf, data_offset)
+                .ok_or_else(|| String::from("display MSI: message data is unreadable"))?,
+            vector_mask: mask_offset
+                .map(|offset| {
+                    self.read_u32(bdf, offset)
+                        .ok_or_else(|| String::from("display MSI: per-vector mask is unreadable"))
+                })
+                .transpose()?,
+        };
+        if message_address > u64::from(u32::MAX) && !is_64bit {
+            return Err(String::from(
+                "display MSI: the allocated message address exceeds 32-bit MSI capability",
+            ));
+        }
+        if message_data > u32::from(u16::MAX) {
+            return Err(String::from(
+                "display MSI: allocated message data exceeds the standard 16-bit field",
+            ));
+        }
+
+        // Hold the message masked and MSI disabled until the display's source
+        // masks, IIR before-image and global dispatch have been proved.
+        let disabled_control = control & !(MSI_ENABLE | MSI_MME_MASK);
+        let prepared = (|| {
+            self.write_u16(bdf, capability + 2, disabled_control)?;
+            self.write_u16(bdf, offset::COMMAND, command | PCI_COMMAND_INTX_DISABLE)?;
+            self.write_u32(bdf, address_low_offset, message_address as u32)?;
+            if let (Some(offset), Some(high)) = (address_high_offset, before.address_high) {
+                self.write_u32(bdf, offset, (message_address >> 32) as u32)?;
+                if self.read_u32(bdf, offset) != Some((message_address >> 32) as u32) {
+                    return Err(String::from("display MSI: 64-bit address readback differs"));
+                }
+                let _ = high;
+            }
+            self.write_u16(bdf, data_offset, message_data as u16)?;
+            if self.read_u16(bdf, capability + 2) != Some(disabled_control)
+                || self.read_u16(bdf, offset::COMMAND) != Some(command | PCI_COMMAND_INTX_DISABLE)
+                || self.read_u32(bdf, address_low_offset) != Some(message_address as u32)
+                || self.read_u16(bdf, data_offset) != Some(message_data as u16)
+            {
+                return Err(String::from(
+                    "display MSI: disabled message readback differs",
+                ));
+            }
+            if let (Some(offset), Some(mask)) = (mask_offset, before.vector_mask) {
+                let masked = mask | 1;
+                self.write_u32(bdf, offset, masked)?;
+                if self.read_u32(bdf, offset) != Some(masked) {
+                    return Err(String::from(
+                        "display MSI: cannot hold the single vector masked during setup",
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            let restored = self.restore_n305_display_msi(&before);
+            return Err(match restored {
+                Ok(()) => format!("{error}; PCI MSI before-image restored"),
+                Err(rollback) => format!("{error}; PCI MSI rollback unverified: {rollback}"),
+            });
+        }
+        Ok(before)
+    }
+
+    /// Enable one previously prepared MSI message. If the capability has a
+    /// per-vector mask, it remains masked until [`Self::unmask_n305_display_msi`].
+    fn activate_n305_display_msi(&mut self, before: &DisplayMsiBefore) -> Result<(), String> {
+        const MSI_ENABLE: u16 = 1;
+        const MSI_MME_MASK: u16 = 0x70;
+        const PCI_COMMAND_INTX_DISABLE: u16 = 1 << 10;
+
+        let control = self
+            .read_u16(before.bdf, before.capability + 2)
+            .ok_or_else(|| String::from("display MSI: control is unreadable at activation"))?;
+        let enabled = (control & !MSI_MME_MASK) | MSI_ENABLE;
+        self.write_u16(before.bdf, before.capability + 2, enabled)?;
+        if self.read_u16(before.bdf, before.capability + 2) != Some(enabled)
+            || self.read_u16(before.bdf, offset::COMMAND)
+                != Some(before.command | PCI_COMMAND_INTX_DISABLE)
+        {
+            return Err(String::from(
+                "display MSI enable/INTx-disable readback differs",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Release the prepared single message after the display master is live.
+    fn unmask_n305_display_msi(&mut self, before: &DisplayMsiBefore) -> Result<(), String> {
+        if before.control & (1 << 8) == 0 {
+            return Ok(());
+        }
+        let is_64bit = before.control & (1 << 7) != 0;
+        let data_offset = before.capability + if is_64bit { 12 } else { 8 };
+        let mask_offset = data_offset + 4;
+        let current = self
+            .read_u32(before.bdf, mask_offset)
+            .ok_or_else(|| String::from("display MSI: per-vector mask is unreadable"))?;
+        let updated = current & !1;
+        self.write_u32(before.bdf, mask_offset, updated)?;
+        if self.read_u32(before.bdf, mask_offset) != Some(updated) {
+            return Err(String::from(
+                "display MSI per-vector unmask readback differs",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Restore the exact previously disabled MSI capability and PCI command.
+    /// This is called only with the Intel display master disabled.
+    fn restore_n305_display_msi(&mut self, before: &DisplayMsiBefore) -> Result<(), String> {
+        const MSI_ENABLE: u16 = 1;
+        const MSI_64BIT: u16 = 1 << 7;
+        const MSI_PVM: u16 = 1 << 8;
+        let disabled = before.control & !MSI_ENABLE;
+        self.write_u16(before.bdf, before.capability + 2, disabled)?;
+        self.write_u32(before.bdf, before.capability + 4, before.address_low)?;
+        let data_offset = if before.control & MSI_64BIT != 0 {
+            if let Some(high) = before.address_high {
+                self.write_u32(before.bdf, before.capability + 8, high)?;
+            }
+            before.capability + 12
+        } else {
+            before.capability + 8
+        };
+        if let Some(mask) = before.vector_mask {
+            self.write_u32(before.bdf, data_offset + 4, mask)?;
+        }
+        self.write_u16(before.bdf, data_offset, before.data)?;
+        self.write_u16(before.bdf, before.capability + 2, before.control)?;
+        self.write_u16(before.bdf, offset::COMMAND, before.command)?;
+        if self.read_u16(before.bdf, before.capability + 2) != Some(before.control)
+            || self.read_u16(before.bdf, offset::COMMAND) != Some(before.command)
+            || self.read_u32(before.bdf, before.capability + 4) != Some(before.address_low)
+            || self.read_u16(before.bdf, data_offset) != Some(before.data)
+        {
+            return Err(String::from(
+                "PCI MSI capability before-image readback differs",
+            ));
+        }
+        if let Some(high) = before.address_high
+            && self.read_u32(before.bdf, before.capability + 8) != Some(high)
+        {
+            return Err(String::from("PCI MSI high address before-image differs"));
+        }
+        if let Some(mask) = before.vector_mask
+            && (before.control & MSI_PVM != 0)
+            && self.read_u32(before.bdf, data_offset + 4) != Some(mask)
+        {
+            return Err(String::from("PCI MSI vector mask before-image differs"));
+        }
+        Ok(())
+    }
+}
+
+impl<T: ConfigWriteSpace> N305DisplayMsi for T {}
 
 /// How wide a memory BAR's address is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -654,6 +975,32 @@ pub(crate) struct Ecam {
     bus_end: u8,
 }
 
+/// Before-image for the N305 display function's standard MSI capability.
+///
+/// The IRQ owner keeps this only while it installs its single message; when
+/// setup refuses after a partial config write, every changed field can be
+/// restored with MSI disabled first. MSI-X is not enabled or modified here.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DisplayMsiBefore {
+    bdf: Bdf,
+    capability: u16,
+    control: u16,
+    command: u16,
+    address_low: u32,
+    address_high: Option<u32>,
+    data: u16,
+    vector_mask: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DisplayMsiPrepareError {
+    pub(super) message: String,
+    /// True when no write was attempted or the partial MSI before-image was
+    /// fully restored. False retains the vector/window for delayed-message
+    /// safety even though the root master is still disabled.
+    pub(super) rollback_verified: bool,
+}
+
 #[cfg(target_os = "none")]
 impl Ecam {
     pub(crate) fn platform() -> Option<Self> {
@@ -727,12 +1074,347 @@ impl ConfigSpace for Ecam {
     }
 }
 
+#[cfg(target_os = "none")]
+impl ConfigWriteSpace for Ecam {
+    fn write_u16(&mut self, bdf: Bdf, offset: u16, value: u16) -> Result<(), String> {
+        let address = config_address(self.mapped, self.bus_end, bdf, offset, 2)
+            .ok_or_else(|| String::from("PCI MSI 16-bit write is out of ECAM bounds"))?;
+        // SAFETY: platform() mapped this exact ECAM range and the aligned
+        // offset was bounded above. Only the named MSI/COMMAND word changes.
+        unsafe { core::ptr::write_volatile(address as *mut u16, value) };
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn write_u32(&mut self, bdf: Bdf, offset: u16, value: u32) -> Result<(), String> {
+        let address = config_address(self.mapped, self.bus_end, bdf, offset, 4)
+            .ok_or_else(|| String::from("PCI MSI 32-bit write is out of ECAM bounds"))?;
+        // SAFETY: platform() mapped this exact ECAM range and the aligned
+        // offset was bounded above. Only an MSI message field/mask changes.
+        unsafe { core::ptr::write_volatile(address as *mut u32, value) };
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
+    use alloc::{collections::BTreeMap, string::String, vec};
+    use core::cell::Cell;
 
     use super::*;
     use crate::drm::intel::testbus::{FakeBus, Header};
+
+    struct MsiModel {
+        bdf: Bdf,
+        words: BTreeMap<(Bdf, u16), u32>,
+        fail_once: Option<u16>,
+        write_count: usize,
+        fail_before_write: Option<usize>,
+        fail_after_write: Option<usize>,
+        corrupt_read_once: Cell<Option<(u16, usize)>>,
+    }
+
+    impl MsiModel {
+        fn n305(control: u16, next: u8) -> Self {
+            let bdf = Bdf::new(0, 2, 0);
+            let mut model = Self {
+                bdf,
+                words: BTreeMap::new(),
+                fail_once: None,
+                write_count: 0,
+                fail_before_write: None,
+                fail_after_write: None,
+                corrupt_read_once: Cell::new(None),
+            };
+            for (offset, value) in [
+                (0x00, 0x46d0_8086),
+                (0x04, (0x0010u32 << 16) | 0x0006),
+                (0x08, 0x0300_0000),
+                (0x0c, 0),
+                (0x2c, 0),
+                (0x3c, 0x0000_010b),
+                (0x34, 0x40),
+                (
+                    0x40,
+                    u32::from(control) << 16 | (u32::from(next) << 8) | 0x05,
+                ),
+                (0x44, 0xaabb_ccdd),
+                (0x48, 0x1122_3344),
+                (0x4c, 0x0000_0067),
+                (0x50, 0xa5a5_a5a4),
+                (0x54, 0),
+            ] {
+                model.words.insert((bdf, offset), value);
+            }
+            for slot in 0..BAR_SLOTS {
+                model.words.insert((bdf, bar_offset(slot as u8)), 0);
+            }
+            model
+        }
+
+        fn get(&self, offset: u16) -> u32 {
+            self.words.get(&(self.bdf, offset)).copied().unwrap_or(0)
+        }
+        fn fail_once_at(&mut self, offset: u16) {
+            self.fail_once = Some(offset);
+        }
+        fn insert(&mut self, offset: u16, value: u32) {
+            self.words.insert((self.bdf, offset), value);
+        }
+
+        fn inject_write(&mut self, operation: usize, landed: bool) {
+            if landed {
+                self.fail_after_write = Some(operation);
+            } else {
+                self.fail_before_write = Some(operation);
+            }
+        }
+
+        fn begin_write(&mut self) -> Result<bool, String> {
+            self.write_count += 1;
+            if self.fail_before_write == Some(self.write_count) {
+                self.fail_before_write = None;
+                return Err(String::from("injected pre-write failure"));
+            }
+            Ok(self.fail_after_write == Some(self.write_count))
+        }
+
+        fn finish_write(&mut self, landed_failure: bool) -> Result<(), String> {
+            if landed_failure {
+                self.fail_after_write = None;
+                Err(String::from("injected landed-write failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ConfigSpace for MsiModel {
+        fn read_u32(&self, bdf: Bdf, offset: u16) -> Option<u32> {
+            if bdf != self.bdf || offset >= CONFIG_WINDOW as u16 || !offset.is_multiple_of(4) {
+                return None;
+            }
+            if self
+                .corrupt_read_once
+                .get()
+                .is_some_and(|(register, after_write)| {
+                    register == offset && self.write_count >= after_write
+                })
+            {
+                self.corrupt_read_once.set(None);
+                Some(self.get(offset) ^ 1)
+            } else {
+                Some(self.get(offset))
+            }
+        }
+    }
+
+    impl ConfigWriteSpace for MsiModel {
+        fn write_u16(&mut self, bdf: Bdf, offset: u16, value: u16) -> Result<(), String> {
+            if bdf != self.bdf || offset >= CONFIG_WINDOW as u16 || !offset.is_multiple_of(2) {
+                return Err(String::from("invalid fake 16-bit config write"));
+            }
+            if self.fail_once == Some(offset) {
+                self.fail_once = None;
+                return Err(String::from("injected fake 16-bit config write failure"));
+            }
+            let landed_failure = self.begin_write()?;
+            let aligned = offset & !3;
+            let old = self.get(aligned);
+            let shift = (offset & 2) * 8;
+            let mask = u32::from(u16::MAX) << shift;
+            self.insert(aligned, (old & !mask) | (u32::from(value) << shift));
+            self.finish_write(landed_failure)
+        }
+
+        fn write_u32(&mut self, bdf: Bdf, offset: u16, value: u32) -> Result<(), String> {
+            if bdf != self.bdf || offset >= CONFIG_WINDOW as u16 || !offset.is_multiple_of(4) {
+                return Err(String::from("invalid fake 32-bit config write"));
+            }
+            if self.fail_once == Some(offset) {
+                self.fail_once = None;
+                return Err(String::from("injected fake 32-bit config write failure"));
+            }
+            let landed_failure = self.begin_write()?;
+            self.insert(offset, value);
+            self.finish_write(landed_failure)
+        }
+    }
+
+    fn msi_control(model: &MsiModel) -> u16 {
+        model.read_u16(model.bdf, 0x42).unwrap()
+    }
+
+    #[test]
+    fn n305_msi_64bit_pvm_message_activation_and_exact_rollback() {
+        let mut model = MsiModel::n305((1 << 7) | (1 << 8), 0);
+        model.insert(0x48, 0x1357_2468);
+        model.insert(0x4c, 0x0000_0067);
+        model.insert(0x50, 0xa5a5_a5a4);
+        let original = model.words.clone();
+        let before = model
+            .prepare_n305_display_msi(model.bdf, 0x1234_5678_9abc_def0, 0x45)
+            .unwrap();
+        assert_eq!(model.read_u32(model.bdf, 0x44), Some(0x9abc_def0));
+        assert_eq!(model.read_u32(model.bdf, 0x48), Some(0x1234_5678));
+        assert_eq!(model.read_u16(model.bdf, 0x4c), Some(0x45));
+        assert_eq!(model.read_u32(model.bdf, 0x50), Some(0xa5a5_a5a5));
+        assert_eq!(model.read_u16(model.bdf, offset::COMMAND), Some(0x0406));
+        assert_eq!(model.read_u16(model.bdf, offset::STATUS), Some(0x0010));
+        assert_eq!(
+            msi_control(&model) & 1,
+            0,
+            "MSI stays disabled until activate"
+        );
+
+        model.activate_n305_display_msi(&before).unwrap();
+        assert_eq!(msi_control(&model), (1 << 8) | (1 << 7) | 1);
+        assert_eq!(model.read_u32(model.bdf, 0x50), Some(0xa5a5_a5a5));
+        model.unmask_n305_display_msi(&before).unwrap();
+        assert_eq!(model.read_u32(model.bdf, 0x50), Some(0xa5a5_a5a4));
+        model.restore_n305_display_msi(&before).unwrap();
+        assert_eq!(model.words, original);
+    }
+
+    #[test]
+    fn n305_msi_32bit_data_offset_and_multiple_message_enable_are_bounded() {
+        let mut model = MsiModel::n305(0b110, 0); // MMC says four, MME must remain one vector.
+        model.insert(0x48, 0x0000_0067);
+        let before = model
+            .prepare_n305_display_msi(model.bdf, 0xfee0_0000, 0x31)
+            .unwrap();
+        assert_eq!(model.read_u32(model.bdf, 0x44), Some(0xfee0_0000));
+        assert_eq!(model.read_u16(model.bdf, 0x48), Some(0x31));
+        assert_eq!(msi_control(&model), 0b110);
+        model.activate_n305_display_msi(&before).unwrap();
+        assert_eq!(msi_control(&model), 0b111);
+        model.restore_n305_display_msi(&before).unwrap();
+    }
+
+    #[test]
+    fn n305_msi_partial_write_failure_restores_the_full_before_image() {
+        let mut model = MsiModel::n305((1 << 7) | (1 << 8), 0);
+        model.insert(0x4c, 0x0000_0067);
+        let original = model.words.clone();
+        model.fail_once_at(0x48);
+        let error = model
+            .prepare_n305_display_msi(model.bdf, 0x1234_5678_9abc_def0, 0x45)
+            .unwrap_err();
+        assert!(error.rollback_verified, "{}", error.message);
+        assert!(
+            error.message.contains("before-image restored"),
+            "{}",
+            error.message
+        );
+        assert_eq!(model.words, original);
+    }
+
+    #[test]
+    fn n305_msi_landed_write_failures_restore_each_prepare_prefix() {
+        // 64-bit MSI with PVM: capability control, PCI COMMAND, low/high
+        // address, message data, and vector mask are six distinct writes.
+        for landed_write in 1..=6 {
+            let mut model = MsiModel::n305((1 << 7) | (1 << 8), 0);
+            let original = model.words.clone();
+            model.inject_write(landed_write, true);
+            let error = model
+                .prepare_n305_display_msi(model.bdf, 0x1234_5678_9abc_def0, 0x45)
+                .unwrap_err();
+            assert!(
+                error.rollback_verified,
+                "write {landed_write}: {}",
+                error.message
+            );
+            assert_eq!(
+                model.words, original,
+                "landed write {landed_write} must restore the complete before-image"
+            );
+        }
+    }
+
+    #[test]
+    fn n305_msi_landed_activation_and_unmask_failures_restore_before_image() {
+        for fail_activation in [true, false] {
+            let mut model = MsiModel::n305((1 << 7) | (1 << 8), 0);
+            let original = model.words.clone();
+            let before = model
+                .prepare_n305_display_msi(model.bdf, 0x1234_5678_9abc_def0, 0x45)
+                .unwrap();
+            if fail_activation {
+                model.inject_write(model.write_count + 1, true);
+                assert!(model.activate_n305_display_msi(&before).is_err());
+            } else {
+                model.activate_n305_display_msi(&before).unwrap();
+                model.inject_write(model.write_count + 1, true);
+                assert!(model.unmask_n305_display_msi(&before).is_err());
+            }
+            // The IRQ installer's rollback path owns restoration after these
+            // post-prepare failures, while the global display master is off.
+            model.restore_n305_display_msi(&before).unwrap();
+            assert_eq!(model.words, original);
+        }
+    }
+
+    #[test]
+    fn n305_msi_readback_failure_restores_and_unverified_rollback_is_reported() {
+        let mut readback = MsiModel::n305((1 << 7) | (1 << 8), 0);
+        let original = readback.words.clone();
+        readback.corrupt_read_once.set(Some((0x4c, 5)));
+        let error = readback
+            .prepare_n305_display_msi(readback.bdf, 0x1234_5678_9abc_def0, 0x45)
+            .unwrap_err();
+        assert!(error.rollback_verified, "{}", error.message);
+        assert!(
+            error.message.contains("readback differs"),
+            "{}",
+            error.message
+        );
+        assert_eq!(readback.words, original);
+
+        let mut rollback = MsiModel::n305((1 << 7) | (1 << 8), 0);
+        rollback.inject_write(1, true);
+        rollback.inject_write(2, false);
+        let error = rollback
+            .prepare_n305_display_msi(rollback.bdf, 0x1234_5678_9abc_def0, 0x45)
+            .unwrap_err();
+        assert!(!error.rollback_verified, "{}", error.message);
+        assert!(error.message.contains("PCI MSI rollback unverified"));
+    }
+
+    #[test]
+    fn n305_msi_refuses_enabled_unowned_vectors_and_overlapping_capabilities() {
+        let mut already_enabled = MsiModel::n305(1, 0);
+        assert!(
+            already_enabled
+                .prepare_n305_display_msi(already_enabled.bdf, 0xfee0_0000, 0x20)
+                .is_err()
+        );
+
+        let mut msix = MsiModel::n305(0, 0x60);
+        msix.insert(0x60, 0x8000_0000 | 0x11);
+        assert!(
+            msix.prepare_n305_display_msi(msix.bdf, 0xfee0_0000, 0x20)
+                .is_err()
+        );
+
+        let mut overlap = MsiModel::n305((1 << 7) | (1 << 8), 0x50);
+        overlap.insert(0x50, 0x11);
+        assert!(
+            overlap
+                .prepare_n305_display_msi(overlap.bdf, 0x1234_5678_9abc_def0, 0x45)
+                .is_err()
+        );
+
+        let mut short_cap = MsiModel::n305((1 << 7) | (1 << 8), 0);
+        short_cap.insert(0x34, 0xfc);
+        short_cap.insert(0xfc, (u32::from((1u16 << 7) | (1u16 << 8)) << 16) | 0x05);
+        assert!(
+            short_cap
+                .prepare_n305_display_msi(short_cap.bdf, 0x1234_5678_9abc_def0, 0x45)
+                .is_err()
+        );
+    }
 
     #[test]
     fn runtime_ecam_does_not_require_the_old_configured_mmio_range() {

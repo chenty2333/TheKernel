@@ -190,3 +190,32 @@ src/pipe_config.rs:
   DSC controls are discovery/refusal evidence, not a complete PPS decoder.
   Kernel fastboot adapter now calls this and the existing plane, color, scaler,
   watermark, TC/PLL/DDI/HDMI readouts for a fixed linear TC HDMI KMS path.
+
+HDMI audio additions: src/audio.rs follows Linux7.2.3 MIT intel_audio.c
+clock/N/M-CTS and HSW DDI enable/disable (Intel2022), MIT drm_edid.c ELD
+assembly (Intel2023). Explicit unchanged-C source compares14 clock/sequence
+pairs and3 ELD layouts; the CTA parser is independently original Rust.
+New oracle shims contribute five normalized code matches at25 and two at40:
+ARRAY_SIZE, DIV_ROUND_UP, min and two layout member declarations; full source
+grants preserved in temporary compiler input. Combined Intel display+GT
+inventory is96/78 at25/40. No scanner exemption or disabled checks.
+
+Powered TC legacy HDMI runtime additions:
+  intel_dpll_mgr.c dkl_pll_write; intel_ddi.c transcoder clock/function and
+  DDI buffer enable/disable; intel_display.c timing/pipe enable;
+  skl_universal_plane.c primary arm. Copyright © 2006–2022 Intel.
+  Runtime translations in kernel/src/drm/intel/tc_modeset.rs retain the
+  LICENSE-MIT grant and immutable original-image rollback in fastboot.rs.
+  No cold TC acquisition, PCODE/CDCLK or new watermark policy is included.
+
+Preserved WM-profile comparison: original conservative predicate for exact
+linear-XRGB4K30->1080p60; temporary independent MIT skl_watermark.c /
+intel_fixed.h source oracle preserves full grants. No PCODE read or new WM
+programming. Conventional oracle shims add5 code matches at25 and2 at40;
+current combined Intel display+GT inventory101/80. CI baseline reconciled.
+
+TC signal programming addition: tc.rs retains the MIT
+intel_ddi.c::tgl_dkl_phy_set_signal_levels/intel_ddi_level, HDMI DKL table
+from intel_ddi_buf_trans.c and known Wa_16011342517 selection. Copyright
+©2012/2019/2020 Intel, full grant in LICENSE-MIT. Runtime uses verified VBT5
+before buffer enable; complete PHY before-image remains the rollback source.

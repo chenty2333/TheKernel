@@ -315,6 +315,9 @@ fn propose_with_mode(
         if file.fixed_mode().is_some_and(|fixed| mode != fixed) {
             return Err(DrmError::Invalid);
         }
+        if !file.mode_is_supported(mode) {
+            return Err(DrmError::Invalid);
+        }
         let fb = device
             .framebuffers
             .get(&next.fb)

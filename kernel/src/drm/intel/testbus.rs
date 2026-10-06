@@ -11,9 +11,9 @@
 //! It exists only in the host test build; nothing here is compiled into the
 //! kernel.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
-use super::pci::{self, Bdf, ConfigSpace, HEADER_TYPE_STANDARD};
+use super::pci::{self, Bdf, ConfigSpace, ConfigWriteSpace, HEADER_TYPE_STANDARD};
 
 /// One synthetic function's header.
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +145,7 @@ impl Header {
 /// A configuration space made of [`Header`]s.
 pub(crate) struct FakeBus {
     words: Vec<(Bdf, u16, u32)>,
+    fail_write: Option<u16>,
     /// The highest bus this synthetic platform declares, as
     /// `axconfig::devices::PCI_BUS_END` does for the real one.
     pub(crate) bus_end: u8,
@@ -160,6 +161,7 @@ impl FakeBus {
         }
         Self {
             words,
+            fail_write: None,
             bus_end: 0xff,
         }
     }
@@ -181,6 +183,50 @@ impl FakeBus {
             }
         }
         seen
+    }
+
+    pub(crate) fn fail_once_at(&mut self, offset: u16) {
+        self.fail_write = Some(offset);
+    }
+
+    fn put_word(&mut self, bdf: Bdf, offset: u16, value: u32) {
+        if let Some((_, _, existing)) = self
+            .words
+            .iter_mut()
+            .find(|(candidate, at, _)| *candidate == bdf && *at == offset)
+        {
+            *existing = value;
+        } else {
+            self.words.push((bdf, offset, value));
+        }
+    }
+}
+
+impl ConfigWriteSpace for FakeBus {
+    fn write_u16(&mut self, bdf: Bdf, offset: u16, value: u16) -> Result<(), String> {
+        pci::config_address(0xe000_0000, self.bus_end, bdf, offset, 2)
+            .ok_or_else(|| String::from("fake PCI 16-bit write is out of range"))?;
+        if self.fail_write == Some(offset) {
+            self.fail_write = None;
+            return Err(String::from("injected fake PCI 16-bit write failure"));
+        }
+        let aligned = offset & !3;
+        let old = self.read_u32(bdf, aligned).unwrap_or(0);
+        let shift = (offset & 2) * 8;
+        let mask = u32::from(u16::MAX) << shift;
+        self.put_word(bdf, aligned, (old & !mask) | (u32::from(value) << shift));
+        Ok(())
+    }
+
+    fn write_u32(&mut self, bdf: Bdf, offset: u16, value: u32) -> Result<(), String> {
+        pci::config_address(0xe000_0000, self.bus_end, bdf, offset, 4)
+            .ok_or_else(|| String::from("fake PCI 32-bit write is out of range"))?;
+        if self.fail_write == Some(offset) {
+            self.fail_write = None;
+            return Err(String::from("injected fake PCI 32-bit write failure"));
+        }
+        self.put_word(bdf, offset, value);
+        Ok(())
     }
 }
 

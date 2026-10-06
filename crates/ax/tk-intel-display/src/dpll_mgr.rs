@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Linux 7.2.3 drivers/gpu/drm/i915/display/intel_dpll_mgr.c:
-// icl_mg_pll_find_divisors, icl_calc_mg_pll_state, icl_ddi_mg_pll_get_freq.
+// icl_mg_pll_find_divisors, icl_calc_mg_pll_state, icl_ddi_mg_pll_get_freq,
+// dkl_pll_write (ADL-P/N legacy HDMI no-SSC branch).
 // Copyright © 2006-2016 Intel Corporation.
 // intel_{mg,dkl}_phy_regs.h: selected DKL/clock register fields.
 // Copyright © 2022 Intel Corporation. MIT permission text: ../LICENSE-MIT.
-// ADL-P/N display-13 DKL HDMI, no SSC only. MG PHY, DP/TBT, combo PLL,
-// other platforms and hardware enable/disable/WA writes omitted.
-// dkl_pll_get_hw_state is translated below with a preserved-selector wrapper.
-use crate::Error;
+// ADL-P/N display-13 DKL readout/programming fields only. MG PHY, DP/TBT,
+// combo PLL and hardware enable/disable/WA sequencing remain outside this file.
+// Readout restores the shared selector; programming preserves i915 RMW order.
+use crate::{
+    Error,
+    dkl_phy::{DklIo, DklRegister, TcPort, intel_dkl_phy_posting_read, intel_dkl_phy_rmw},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DklPllState {
@@ -109,9 +113,190 @@ pub fn icl_ddi_mg_pll_get_freq(state: &DklPllState, refclk_khz: u32) -> Result<u
         + ((u64::from(m1) * u64::from(m2_frac) * u64::from(refclk_khz)) >> 22);
     u32::try_from(value / (5 * div1 * u64::from(div2))).map_err(|_| Error::Refused)
 }
+
+/// Display-12/13 `dkl_pll_write`, called only after the selected DKL PLL is
+/// disabled and its TC port/core power references are held. The field masks
+/// and unconditional RMW stores match i915; the caller owns enable/lock
+/// polling and the before-image transaction.
+pub fn dkl_pll_write(
+    io: &impl DklIo,
+    port: TcPort,
+    state: &DklPllState,
+    afc_startup: Option<u8>,
+) -> Result<(), Error> {
+    if afc_startup.is_some_and(|value| value > 7) {
+        return Err(Error::Refused);
+    }
+    let write =
+        |offset, clear, value| intel_dkl_phy_rmw(io, DklRegister::new(port, offset)?, clear, value);
+    write(0x212c, 7 << 8, state.refclkin_ctl)?;
+    write(0x20d8, 0xff << 8, state.coreclkctl1)?;
+    write(
+        0x20d4,
+        (3 << 14) | (1 << 16) | (3 << 12) | (15 << 8),
+        state.hsclkctl,
+    )?;
+    write(
+        0x2200,
+        0x1f_0000
+            | (0xf << 12)
+            | (0xf << 8)
+            | 0xff
+            | if afc_startup.is_some() { 7 << 25 } else { 0 },
+        state.div0 | afc_startup.map_or(0, |value| u32::from(value) << 25),
+    )?;
+    write(0x2204, (0x1f << 16) | 0xff, state.div1)?;
+    write(
+        0x2210,
+        (7 << 29) | (0xff << 16) | (7 << 11) | (1 << 9),
+        state.ssc,
+    )?;
+    write(0x2214, (1 << 30) | (0x3f_ffff << 8), state.bias)?;
+    write(0x2218, (0xff << 8) | 0xff, state.tdc_coldst_bias)?;
+    intel_dkl_phy_posting_read(io, DklRegister::new(port, 0x2218)?)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate std;
+    use std::{collections::BTreeMap, sync::Mutex as StdMutex, vec::Vec};
+
+    #[derive(Default)]
+    struct ModelState {
+        selector: u32,
+        dkl: BTreeMap<(u32, u32), u32>,
+        operations: Vec<(bool, u32, u32)>,
+        fail_at: Option<usize>,
+    }
+    #[derive(Default)]
+    struct Model {
+        state: StdMutex<ModelState>,
+        dkl_lock: StdMutex<()>,
+    }
+    impl crate::RegisterIo for Model {
+        fn read32(&self, offset: u32) -> Result<u32, Error> {
+            let mut state = self.state.lock().unwrap();
+            let value = if offset == 0x1010a0 {
+                state.selector
+            } else if (0x168000..0x16c000).contains(&offset) {
+                let port = (offset - 0x168000) / 0x1000;
+                let internal = ((state.selector >> (port * 8)) & 15) * 0x1000 + (offset & 0xfff);
+                *state.dkl.get(&(port, internal)).unwrap_or(&0)
+            } else {
+                return Err(Error::Unavailable(offset));
+            };
+            state.operations.push((false, offset, value));
+            if state.fail_at == Some(state.operations.len()) {
+                return Err(Error::Unavailable(offset));
+            }
+            Ok(value)
+        }
+        fn write32(&self, offset: u32, value: u32) -> Result<(), Error> {
+            let mut state = self.state.lock().unwrap();
+            state.operations.push((true, offset, value));
+            if offset == 0x1010a0 {
+                state.selector = value;
+            } else if (0x168000..0x16c000).contains(&offset) {
+                let port = (offset - 0x168000) / 0x1000;
+                let internal = ((state.selector >> (port * 8)) & 15) * 0x1000 + (offset & 0xfff);
+                state.dkl.insert((port, internal), value);
+            } else {
+                return Err(Error::Unavailable(offset));
+            }
+            if state.fail_at == Some(state.operations.len()) {
+                // Model a failed accessor whose store landed in hardware.
+                return Err(Error::Unavailable(offset));
+            }
+            Ok(())
+        }
+    }
+    impl DklIo for Model {
+        fn with_dkl_lock<T>(
+            &self,
+            operation: impl FnOnce() -> Result<T, Error>,
+        ) -> Result<T, Error> {
+            let _lock = self.dkl_lock.lock().unwrap();
+            operation()
+        }
+    }
+
+    fn initial_dkl(port: TcPort) -> Model {
+        let model = Model::default();
+        let mut state = model.state.lock().unwrap();
+        for offset in [
+            0x212c, 0x20d8, 0x20d4, 0x2200, 0x2204, 0x2210, 0x2214, 0x2218,
+        ] {
+            state
+                .dkl
+                .insert((port.index(), offset), 0xa5a5_5a5a ^ offset);
+        }
+        drop(state);
+        model
+    }
+
+    #[test]
+    fn dkl_write_uses_i915_rmw_order_masks_and_tc2_window() {
+        let port = TcPort::Tc2;
+        let model = initial_dkl(port);
+        let before = model.state.lock().unwrap().dkl.clone();
+        let pll = icl_calc_mg_pll_state(148500, 19200, Some(7)).unwrap();
+        dkl_pll_write(&model, port, &pll, Some(7)).unwrap();
+        let state = model.state.lock().unwrap();
+        let writes: Vec<_> = state
+            .operations
+            .iter()
+            .filter(|(write, offset, _)| *write && *offset != 0x1010a0)
+            .map(|(_, offset, _)| *offset)
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                0x212c, 0x20d8, 0x20d4, 0x2200, 0x2204, 0x2210, 0x2214, 0x2218
+            ]
+            .map(|offset| 0x169000 + (offset & 0xfff))
+        );
+        let expected = [
+            (0x212c, 7 << 8, pll.refclkin_ctl),
+            (0x20d8, 0xff << 8, pll.coreclkctl1),
+            (
+                0x20d4,
+                (3 << 14) | (1 << 16) | (3 << 12) | (15 << 8),
+                pll.hsclkctl,
+            ),
+            (
+                0x2200,
+                0x1f_0000 | (0xf << 12) | (0xf << 8) | 0xff | (7 << 25),
+                pll.div0,
+            ),
+            (0x2204, (0x1f << 16) | 0xff, pll.div1),
+            (
+                0x2210,
+                (7 << 29) | (0xff << 16) | (7 << 11) | (1 << 9),
+                pll.ssc,
+            ),
+            (0x2214, (1 << 30) | (0x3f_ffff << 8), pll.bias),
+            (0x2218, (0xff << 8) | 0xff, pll.tdc_coldst_bias),
+        ];
+        for (offset, mask, value) in expected {
+            let old = before[&(port.index(), offset)];
+            assert_eq!(
+                state.dkl[&(port.index(), offset)],
+                (old & !mask) | (value & mask)
+            );
+        }
+    }
+
+    #[test]
+    fn dkl_program_stops_at_every_failed_mmio_prefix() {
+        let state = icl_calc_mg_pll_state(148500, 19200, None).unwrap();
+        for failure in 1..=26 {
+            let model = initial_dkl(TcPort::Tc1);
+            model.state.lock().unwrap().fail_at = Some(failure);
+            assert!(dkl_pll_write(&model, TcPort::Tc1, &state, None).is_err());
+            assert_eq!(model.state.lock().unwrap().operations.len(), failure);
+        }
+    }
+
     #[test]
     fn hdmi_1080p60_tc_pll_is_not_the_combo_wrpll() {
         let s = icl_calc_mg_pll_state(148500, 19200, None).unwrap();

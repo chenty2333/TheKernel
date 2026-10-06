@@ -401,5 +401,25 @@ The existing independent temporary-C comparison now includes all104 source
 writes. No GPL body or firmware binary was added for these object interfaces.
 
 The minimal CPU PAT/mapping-type adapter is original MIT Rust, referencing
-Linux x86 PAT behavior without importing GPL bodies. Its opted-in startup
-palette and immutable mmap types preserve the default and ownership boundary.
+Linux x86 PAT behavior without importing GPL bodies. Display audio translations
+retain the MIT Intel2022/2023 grants for intel_audio/drm_edid; the HDA bridge
+uses original behavior adaptation of Linux7.2.3 HDMI codec handling. Source C
+oracles are temporary external-input builds with original grants preserved.
+
+Powered TC legacy-HDMI mode programming translates the selected Linux7.2.3
+MIT dkl_pll_write, DDI clock/function/buffer, timing/pipe and plane-arm
+functions, retaining Intel2006–2022 attribution and the display crate's full
+MIT grant; module headers and NOTICE identify the exact restricted path.
+
+HDMI HDA port/pin topology references Linux7.2.3
+sound/hda/codecs/hdmi/intelhdmi.c (GPL) as behavior only; the original HDA
+adapter remains Apache-2.0, with no GPL source body imported.
+
+The tc.rs signal-level port additionally retains MIT Intel2012/2019/2020
+source attribution for tgl_dkl_phy_set_signal_levels, intel_ddi_level and
+the HDMI DKL table; the full grant remains in the display crate.
+
+The scoped display IRQ/MSI and hardware-counter epoch adapters are original
+MIT Rust using source mask/dispatch facts; GPL i915_irq.c and DRM core are
+behavior references only. Exact MIT display/hotplug function references are
+listed in irq.rs, with original retained-owner lifecycle over existing APIs.

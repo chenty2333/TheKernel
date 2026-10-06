@@ -1,4 +1,4 @@
-# Intel HDA analog playback (2026-10-04)
+# Intel HDA analog and bounded HDMI playback (2026-10-06)
 
 ## Facts, boundaries and references
 
@@ -11,9 +11,12 @@ and headphone waveform remain **未在硬件上验证**.
 
 Original Rust; consulted Intel HDA 1.0a §§3–7 (PDF/text under external refs/audio),
 Linux 7.2.3 `sound/hda/{controllers/intel.c,core/controller.c,common/codec.c,
-codecs/generic.c}`. Those are the relocated paths of the older `sound/pci/hda`
-files named in the request. QEMU's CORB/RIRB response-count behavior was checked
-against <https://github.com/qemu/qemu/blob/master/hw/audio/intel-hda.c>.
+codecs/generic.c,codecs/hdmi/intelhdmi.c}`. Those are the relocated paths of
+the older `sound/pci/hda` files named in the request. The HDA-side HDMI pin
+mapping and route handling are original Rust behavior adaptation; the GPL HDA
+sources are consulted for facts only, with no GPL implementation body ported.
+QEMU's CORB/RIRB response-count behavior was checked against
+<https://github.com/qemu/qemu/blob/master/hw/audio/intel-hda.c>.
 
 ## Native ALSA and retained OSS
 
@@ -40,8 +43,9 @@ Uncertain retirement retains the owner instead of admitting a new opener.
 
 The implementation is a bounded bring-up playback interface, not full ALSA
 feature parity, low latency, or a guarantee against hardware underruns. The
-backend's existing full-ring ambiguity checks still fail closed. HDMI stays
-excluded for the display-power dependencies below.
+backend's existing full-ring ambiguity checks still fail closed. HDMI is a
+separate bounded DDI/HDA route below; analog PCM availability is not evidence
+that the HDMI display route is available.
 
 ## Transport and graph
 
@@ -71,16 +75,76 @@ are released only after stop/reset proves retirement; failure retains DMA.
 If HDA is available it is the boot-selected backend for the existing sound
 endpoint, otherwise VirtIO playback continues unchanged.
 
-## HDMI dependency
+## Bounded DDI HDMI audio (software integrated; physical output unverified)
 
-Alder Lake HDMI codec availability and ELD depend on display power domains,
-DDI/transcoder configuration and a live HDMI/DP link. The firmware-framebuffer
-path does not own that sequencing, so HDMI/digital widgets are intentionally
-excluded. Future work must coordinate a display-power reference with HDA,
-read ELD after link/modeset success, configure converter/channel slots, and
-release/reset audio before the display link powers down. GuC/HuC is not an
-analog HDA requirement. No SOF DSP firmware or graphics register writes are
-performed by this driver.
+The D5 path is now wired through the same HDA playback owner. The original
+display-side implementation is `crates/ax/tk-intel-display/src/audio.rs`; the
+kernel adapter is `kernel/src/drm/intel/audio.rs`; HDA route discovery and
+ELD publication live in `crates/ax/tk-axdriver-hda`. It is deliberately
+limited to display 13 Pipe A, legacy HDMI on TC1/TC2, the enumerated HDMI audio
+pixel-clock table, and two-channel LPCM S16_LE at 48 kHz. A sink must advertise
+that format in a valid CTA audio block. Unsupported clocks, sink capabilities,
+codec routes, and uncertain status are video-only or fail-closed states, not
+guessed audio success.
+
+The display handoff consumes the same validated source EDID used by the
+connector. The original Rust CTA parser checks base/extension extents and
+checksums, then builds the ELD baseline bytes; the baseline length is ELD byte
+2. The HDA side validates the received ELD again and only admits the fixed
+stereo/48-kHz/16-bit capability. The selected HSW/DDI fields program the HDMI
+pixel-clock index and table N where available; the DDI M/CTS manual-enable
+fields are cleared so hardware calculates CTS. A compiled C oracle uses the
+unmodified Linux 7.2.3 MIT `intel_audio.c` clock/N/config/enable/disable
+functions and selected `intel_audio_regs.h` definitions; a separate oracle
+compares the unmodified MIT `drm_edid.c::drm_edid_to_eld` ELD assembly against
+the Rust ELD bytes. The ELD oracle supplies controlled CTA data-block records
+to DRM's builder, so it verifies baseline assembly, not the independent Rust
+CTA parser.
+
+The handoff is ordered after stable link and scanout proof and requires the
+display audio power domain, Pipe A, DDI HDMI function, and DC-off state to be
+already held/readable. It never requests or wakes a display power well. The
+display presence/ELD sequence runs while TC power is retained; only then is
+the validated ELD delivered to HDA. The ADL-P/N codec route maps PORT_D/TC1 to
+pin NID 0x0a and PORT_E/TC2 to 0x0b, but those hints do not authorize writes by
+themselves: live codec vendor, digital HDMI pin capabilities, connection,
+widget graph, and converter PCM caps are checked. The fixed stereo converter
+format and HDMI Audio InfoFrame are configured only on the confirmed route.
+This is an original bounded Rust HDA behavior adaptation; no Linux GPL codec
+implementation body is ported.
+
+Before a modeset or TC/link/power release, an owned session invalidates ELD,
+waits two fresh frames, disables output presence, and restores only its owned
+fields; HDA then removes the ELD and retires playback DMA before TC teardown.
+If HDA/DMA retirement or register readback is uncertain, the audio state is
+quarantined and the link/power reference is retained. If no session is owned,
+the gate reads the display output-enable and ELD-valid flags: clear flags plus
+a valid power/link proof allow an inactive skip; active or unreadable status is
+quarantined without writes or an assumption that HDA DMA stopped. A preexisting
+`AlreadyEnabled` state is not adopted. Stable two-sample HPD disconnects run
+the same retirement hook before reporting the physical connector state; an
+audio error preserves the TC link/power quarantine, and reconnect only
+re-publishes ELD after the stable video path is revalidated. A quarantined or
+unsupported audio route can therefore leave video connected while audio stays
+unavailable. There is no automatic takeover/recovery of foreign or uncertain
+audio state.
+
+Software evidence is limited to host models and source-oracle comparisons:
+`tk-intel-display` covers landed-store rollback prefixes, vblank timeout,
+inactive/active/unknown gating and clock-table decisions; HDA fake tests cover
+port-specific route discovery, ELD switch, converter/InfoFrame setup, DMA
+retirement and an unanswered mid-route verb invalidating the controller.
+The explicit Linux source-oracle tests cover 14 clock/enable-disable pairs and
+three exact ELD layouts. These tests do not exercise an N305 HDMI sink, the
+physical PW_2/DC-off behavior, real HPD unplug/reconnect timing, HDMI HDA
+converter behavior, or an audible display-speaker waveform. Existing QEMU HDA
+WAV and native ALSA WAV checks exercise the HDA/ALSA playback backend and must
+not be reported as HDMI audio acceptance. Physical HDMI output remains
+**未在硬件上验证**.
+
+GuC/HuC is not an analog HDA requirement. No SOF DSP firmware or generic
+graphics register writes are performed by the HDA controller driver; only the
+bounded kernel display adapter owns the display-side audio registers.
 
 ## Validation procedure
 

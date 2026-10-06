@@ -207,6 +207,21 @@ pub(super) fn registered() -> bool {
 }
 static OWNER: Mutex<Option<Owner>> = Mutex::new(None);
 
+/// Task-context coordination only, not proof of firmware interrupt masks.
+/// The display IRQ owner separately reads every Gen11/12 GT class ENABLE and
+/// the shared master before it changes PCI/MSI or display interrupt state.
+/// Our audited GT register allowlist never writes those class enables or the
+/// GFX master; native jobs remain completion-polled even with display MSI.
+/// Refuse concurrent preparation/submission and retained uncertain DMA owners.
+pub(super) fn display_irq_owner_idle() -> bool {
+    let Some(owner) = OWNER.try_lock() else {
+        return false;
+    };
+    owner
+        .as_ref()
+        .is_none_or(|owner| !owner.lost && owner.memory.is_none())
+}
+
 /// Capability probes use only a successfully bootstrapped, still-live owner.
 /// No query wakes/resets hardware or invents a fused topology/clock.
 pub(super) fn topology() -> Result<intel_gt::info::Topology, Error> {

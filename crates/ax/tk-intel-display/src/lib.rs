@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bios;
+pub mod audio;
 pub mod cdclk;
 pub mod color;
 pub mod ddi;

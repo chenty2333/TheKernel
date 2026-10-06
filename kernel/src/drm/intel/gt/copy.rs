@@ -116,7 +116,43 @@ impl Ram {
     }
 }
 pub(crate) fn sync_cpu_pages(pages: Arc<SharedPages>) -> Result<(), Error> {
-    Ram::from_pages(pages)?.flush();
+    // The same fixed system-RAM cache synchronization serves rendering and
+    // display pin-to-GTT preparation. Do not apply the <=16MiB execution-BO
+    // limit to a 4K scanout (or its double-height dumb backing).
+    if pages.is_external() || pages.page_size() != axhal::paging::PageSize::Size4K {
+        return Err(Error::Refused);
+    }
+    let pin = pages.fixed_view().map_err(|_| Error::Refused)?;
+    let count = pin.len() / PAGE;
+    if count == 0 || count > 16_384 {
+        return Err(Error::Refused);
+    }
+    // CLFLUSH is optional in the architecture; admit the actual executing
+    // CPU's capability/line size before accessing any page. This target is
+    // N305 only, not a cache-maintenance fallback for unknown CPU layouts.
+    let cpu = core::arch::x86_64::__cpuid(1);
+    if cpu.edx & (1 << 19) == 0 || ((cpu.ebx >> 8) & 0xff) * 8 != 64 {
+        return Err(Error::Refused);
+    }
+    for index in 0..count {
+        ppgtt::physical(
+            pages
+                .paddr_at(index)
+                .map_err(|_| Error::Refused)?
+                .as_usize() as u64,
+        )?;
+    }
+    for index in 0..count {
+        let physical = pages.paddr_at(index).map_err(|_| Error::Refused)?;
+        let base = axhal::mem::phys_to_virt(physical).as_usize();
+        for offset in (0..PAGE).step_by(64) {
+            // SAFETY: an ordinary allocator-owned, physically validated 4K
+            // page retained by `pages` and its fixed-view pin. CLFLUSH invalidates
+            // the WB alias before the non-snooping display/GT reads; no MMIO.
+            unsafe { core::arch::x86_64::_mm_clflush((base + offset) as *const u8) };
+        }
+    }
+    fence(Ordering::SeqCst);
     Ok(())
 }
 /// Real, pinned private page-table ownership. Currently the admitted three

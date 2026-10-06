@@ -84,7 +84,9 @@ GuC 70 系列最低表项为70.12.1；使用前还须检查当前CSS版本/长�
 
 ## 当前实现状态
 
-固件 fixed-mode fastboot/KMS 已接通；GT 的代码路径和测量边界见下节。
+固件 fastboot/KMS、受限 powered-TC 模式切换与 audio 软件链已接通；
+下面早期小节保留实现过程，各接口现状以末节 Standard iris object/submission chain 为准。
+GT 的代码路径和测量边界见下节。
 默认 GT 关闭，只有 `intel.gt=1` 才能进入 exact N305 admission。
 
 ## Runtime execution entry (2026-10-05)
@@ -370,3 +372,9 @@ results are recorded only after completion, not inferred from these models.
 Hardware PAT/mmap, context save, real shader pixels, Mesa initialization and
 rendering remain physical acceptance items. Recovery/robustness and non-target
 formats are not claimed; controlled retirement resets are not rendering proof.
+
+The shared fixed-page CPU flush also serves native display after KMS producer
+waits. Its pinned, zero-allocation traversal admits bounded64MiB scanout
+backing with observed CLFLUSH/64-byte capability; execution BO admission stays
+16MiB. This prevents WB alias dirt from surviving a non-snooping plane arm.
+Physical cache/mapping correctness still requires the separate N305 acceptance.

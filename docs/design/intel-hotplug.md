@@ -1,6 +1,7 @@
 # Hotplug after boot: polling the live connect state
 
-Status: implemented on `feat/intel-hpd`.  This document describes what the
+Status: the earlier polling probe is implemented; the native N305 IRQ/KMS
+integration is described first below. This document describes what the
 after-boot hotplug watch detects, how it detects it, what it deliberately does
 not do, and — the part that matters most on a machine with no serial port —
 what has been measured and what has not.
@@ -21,6 +22,40 @@ does not restate it.
 The target machine is an Acer 蜂鸟mini (SQM2270) with an Intel i3-N305 (Alder
 Lake-N), display device `8086:46d0`, **no serial port**: the screen is the only
 console, so an event that is not logged is an event nobody sees.
+
+## Native N305 IRQ/KMS integration (2026-10-06; software only)
+
+The powered, owned TC1/TC2 native path now attempts one dedicated PCI MSI after
+primary registration, only with `intel.modeset=1`. The source-backed gate reads
+all seven Gen11/12 GT class ENABLEs, shared graphics/display masters and every
+relevant display mask/enable/identity image; unowned active firmware interrupts
+refuse without replacement. PCI capability traversal rejects enabled MSI/MSI-X,
+overlaps, loops, extents, unknown identity and unsupported message layouts.
+Width-correct COMMAND writes never echo PCI Status W1C bits. Every changed
+MSI/source field has a before-image, bounded readback and error restoration.
+
+The ISR acknowledges only Pipe-A vblank and the selected TC port's HPD bits,
+then publishes atomic hints and wakes the existing DRM task with its existing
+WaitQueue. It never runs DDC, allocation, logging or modesetting. Unexpected or
+unreadable sources disable the master and retain the callback/window/vector;
+no foreign IIR bit is acknowledged. Once the final master store was attempted,
+posted MSI/ISR retirement is not presumed: even a verified hardware rollback
+keeps that software owner, rather than reusing a potentially targeted vector.
+Default/IRQ-refused boots use the existing periodic fallback.
+
+KMS sequences always use actual PIPEFRAME, not IRQ count. An explicit counter
+epoch around TC mode changes/recovery rebases resets without inventing frames,
+like source vblank off/on; fresh subsequent hardware counts retire events.
+Timestamps remain task observation timestamps, not ISR timestamps. HPD is a
+wake hint only: wait250ms after the last hint and require two stable EDID
+samples. Same boot-validated sink reconnects restore finite modes and audio;
+a different sink is explicitly outside this target path. Uncertain audio
+retirement retains link/power but does not hide physical disconnect from KMS.
+
+Measured layers are host IRQ/config/failure-prefix models, compiled source
+comparisons, and native builds only. No N305 MSI, cable, pixels or audio output
+has been observed in this task. The older read-only probe below remains for
+diagnostics and is not the native connector's IRQ implementation.
 
 ## The problem this solves
 
@@ -82,9 +117,10 @@ The pieces, and where they live:
 Three properties are deliberate, and each is a place a naive implementation
 would have gone wrong:
 
-* **The poll writes nothing at all.**  `SDEISR` is write-one-to-clear, so a poll
-  that wrote it would discard the state it came to read (reference §10.7;
-  `regs::SDEISR` is declared `read_only` for exactly this reason).  Detection is
+* **The poll writes nothing at all.** `SDEISR` is the read-only status view;
+  `SDEIIR`, not `SDEISR`, is the write-one-to-clear identity register.
+  `regs::SDEISR` stays read-only, and the diagnostic poll never acknowledges
+  interrupt identity bits.  Detection is
   already enabled — phase 2 did that — so a poll has no reason to write
   anything, and a test asserts through the mock's write log that the poll path
   leaves it empty.

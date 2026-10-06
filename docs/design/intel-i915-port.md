@@ -243,3 +243,40 @@ queried. Table/scope parsing is bounded and checksummed; firmware-pointer reads
 exclude all usable RAM. This does not implement an IOMMU mapping service.
 The single GGTT allocator is shared with future GT work, avoiding two cursors
 racing over the same page table. ADL-N's 39-bit DMA limit is checked per page.
+
+## Runtime integration update (2026-10-06)
+
+The powered firmware TC1/TC2 legacy-HDMI path now connects readout/admission,
+owned GGTT/GEM, finite source-computed modes, native atomic programming and
+SURFLIVE/fresh-frame completion. The exact firmware timing stays preferred for boot console preservation.
+A second1920x1080@60 mode is advertised only for the source-checked
+4K30->1080p60 linear-XRGB profile and matching EDID/PLL admission.
+Clock/pitch alone is not a WM proof: source method1/method2, line time,
+block/line and minimum-DDB demand are compared at equal latency.
+The existing active firmware WM/DDB policy stays unchanged; this does not
+claim to read PCODE latency or prove arbitrary programmed words sufficient. DKL PLL, VBT5 PHY levels/ADL-P workaround and
+DDI/transcoder/pipe/plane/AVI programming are source translations, not the old combo transaction. Color/scaler/WM/DDB/DBUF and
+non-AVI packets stay immutable; targets needing new bandwidth policy refuse.
+Failure before any possible display store releases only unsubmitted owners;
+landed stores require complete original image restoration (including original
+AVI bytes, plane controls and all eight modified PHY words/HIP), complete
+readback and fresh scanout before release.
+Ambiguous retirement retains DMA/power owners and closes further programming.
+
+Display audio calls the existing HDA owner with EDID-derived ELD after stable
+video, and withdraws audio before clock/link changes. Unowned active firmware
+audio or uncertain HDA retirement quarantines audio and blocks destructive
+link writes; physical disconnect still reaches KMS. This does not establish
+physical pixels, IRQ timestamps, HDMI sound, or cold/unowned TC acquisition.
+Source/model tests are separate from the pending N305 acceptance below.
+
+GT and iris integration status is maintained in intel-gpu-acceleration.md;
+its independent runtime chain is implemented, not blocked on DMC/GuC/audio.
+
+KMS waits captured explicit/implicit producer fences, then the native adapter
+flushes the ordinary fixed WB CPU alias before GGTT/SURF publication, including
+same-buffer fbdev damage. It reuses the existing CPU-page synchronization;
+zero-allocation pinned iteration supports the bounded4K/double-height backing
+(up to64MiB) without relaxing the16MiB GPU execution-BO limit. Executing-CPU
+CLFLUSH capability/line-size and every physical page are checked first.
+Host full-size tests exercise this path; no native cache/DMA observation claimed.

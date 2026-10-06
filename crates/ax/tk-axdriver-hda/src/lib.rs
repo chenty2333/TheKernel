@@ -4,6 +4,7 @@ extern crate alloc;
 pub mod bringup;
 pub mod codec;
 pub mod desc;
+pub mod eld;
 #[cfg(test)]
 mod fake;
 pub mod ids;

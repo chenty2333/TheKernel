@@ -1,9 +1,12 @@
-//! N305 firmware-preserving KMS: no clock/link/timing/WM programming.
-//! Uses the MIT i915 readouts in tk-intel-display; adapter/ownership policy is
-//! original TheKernel code. Only pipe-A TC1/TC2 legacy HDMI, opaque linear XR24,
-//! no scaling/color/DSC/VRR is admitted. Hardware writes remain opt-in.
+//! N305 firmware-preserving KMS with a restricted TC1/TC2 legacy-HDMI timing
+//! transition. The first scanout preserves the firmware display image; later
+//! admitted modes may change the DKL PLL, transcoder timing, and plane while
+//! retaining the captured WM/DDB policy. Uses MIT i915 readouts/programming in
+//! `tk-intel-display`; adapter/ownership policy is original TheKernel code.
+//! Only pipe-A, opaque linear XR24, no scaling/color/DSC/VRR is admitted.
+//! Hardware writes remain opt-in.
 use alloc::{format, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{AtomicU32, Ordering, fence};
 
 use intel_display::{
     Error, RegisterIo,
@@ -20,16 +23,166 @@ use spin::Mutex;
 use super::{
     gmbus::PollTimer,
     gtt::{Binding, Gtt},
-    regs::{Meaning, Register, Registers},
+    regs::{Meaning, Register, Registers, pipe as p},
 };
 use crate::{
     drm::{
-        DisplayAdapter, DrmError, DrmResult, DumbRequest, GemBacking, Mode, Scanout, fence::Fence,
+        DisplayAdapter, DrmError, DrmResult, DumbRequest, GemBacking, Mode as DrmMode, Scanout,
+        fence::Fence,
     },
     mm::{SharedFixedView, SharedPages},
 };
 
-static HIP_LOCK: Mutex<()> = Mutex::new(());
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeMode {
+    timing: crate::drm::modes::Mode,
+    kms: DrmMode,
+    vic: u8,
+}
+
+fn drm_mode(timing: crate::drm::modes::Mode) -> DrmMode {
+    DrmMode {
+        width: u32::from(timing.hdisplay),
+        height: u32::from(timing.vdisplay),
+        refresh_millihz: timing.refresh_millihz(),
+    }
+}
+
+fn firmware_timing(f: &Firmware) -> Result<crate::drm::modes::Mode, Error> {
+    use crate::drm::modes::{Mode, ModeFlags, TimingSource};
+    let t = f.pipe.timings;
+    if t.interlaced
+        || t.set_context_latency != 0
+        || t.hblank_start != t.hdisplay
+        || t.hblank_end != t.htotal
+        || t.vblank_start != t.vdisplay
+        || t.vblank_end != t.vtotal
+        || [
+            t.hdisplay,
+            t.htotal,
+            t.hsync_start,
+            t.hsync_end,
+            t.vdisplay,
+            t.vtotal,
+            t.vsync_start,
+            t.vsync_end,
+        ]
+        .into_iter()
+        .any(|count| count > u32::from(u16::MAX))
+    {
+        return Err(Error::Refused);
+    }
+    let hblank = t.htotal - t.hdisplay;
+    let hfront = t.hsync_start - t.hdisplay;
+    let hsync = t.hsync_end - t.hsync_start;
+    let vblank = t.vtotal - t.vdisplay;
+    let vfront = t.vsync_start - t.vdisplay;
+    let vsync = t.vsync_end - t.vsync_start;
+    let mode = Mode::from_blanking(
+        f.pixel_clock,
+        t.hdisplay as u16,
+        hblank as u16,
+        hfront as u16,
+        hsync as u16,
+        t.vdisplay as u16,
+        vblank as u16,
+        vfront as u16,
+        vsync as u16,
+        ModeFlags::NONE,
+        TimingSource::Firmware,
+    )
+    .with_polarity(f.ddi.positive_hsync, f.ddi.positive_vsync);
+    if !mode.is_well_formed() {
+        return Err(Error::Refused);
+    }
+    Ok(mode)
+}
+
+fn cta_vic(mode: &crate::drm::modes::Mode) -> Option<u8> {
+    use crate::drm::modes::ModeFlags;
+    if mode.flags != ModeFlags::NONE {
+        return None;
+    }
+    // The only cold timing transition admitted here is the measured N305
+    // HDMI route's 1080p60 request; the captured 4K30 timing remains restorable.
+    let timing = crate::drm::modes::CTA_VIC_TIMINGS
+        .iter()
+        .find(|entry| entry.vic == 16)
+        .map(|entry| entry.mode)?;
+    if mode.same_timing(&timing) {
+        return Some(16);
+    }
+    if mode.same_timing(&firmware_4k30()) {
+        return Some(95);
+    }
+    None
+}
+
+fn firmware_4k30() -> crate::drm::modes::Mode {
+    crate::drm::modes::Mode::from_blanking(
+        297_000,
+        3840,
+        560,
+        176,
+        88,
+        2160,
+        90,
+        8,
+        10,
+        crate::drm::modes::ModeFlags::NONE,
+        crate::drm::modes::TimingSource::Firmware,
+    )
+    .with_polarity(true, true)
+}
+
+fn native_modes(
+    edid: &[u8],
+    f: &Firmware,
+) -> Result<(Vec<NativeMode>, NativeMode, NativeMode), Error> {
+    use crate::drm::modes::{Edid, ModeList, collect_modes};
+    let edid = Edid::parse_lossy(edid).map_err(|_| Error::Refused)?;
+    let mut candidates = ModeList::new();
+    collect_modes(&edid, &mut candidates);
+    let current_timing = firmware_timing(f)?;
+    let current_vic = cta_vic(&current_timing).ok_or(Error::Refused)?;
+    let current = NativeMode {
+        timing: current_timing,
+        kms: drm_mode(current_timing),
+        vic: current_vic,
+    };
+    let mut modes = Vec::new();
+    modes
+        .try_reserve_exact(2)
+        .map_err(|_| Error::Unavailable(0))?;
+    // Preserve the equivalent firmware mode for boot fbdev/console. Exposing
+    // a second mode must not force a destructive PLL transition at handoff.
+    modes.push(current);
+    if let Some(target) = candidates.modes().copied().find(|mode| {
+        crate::drm::intel::modeset::is_reference_timing(mode)
+            && mode.clock_khz == 148_500
+            && cta_vic(mode) == Some(16)
+    }) {
+        let target = NativeMode {
+            timing: target,
+            kms: drm_mode(target),
+            vic: 16,
+        };
+        if !target.timing.same_timing(&current.timing)
+            && pitch_for(target.kms.width)
+                .is_some_and(|pitch| retained_watermark_budget(f, target, pitch))
+            && intel_display::dpll_mgr::icl_calc_mg_pll_state(
+                target.timing.clock_khz,
+                f.refclk,
+                f.afc_startup,
+            )
+            .is_ok()
+        {
+            modes.push(target);
+        }
+    }
+    Ok((modes, current, current))
+}
+
 fn reg(offset: u32, writable: bool) -> Register {
     if writable {
         Register::read_write("N305_FASTBOOT", offset, Meaning::BringUp, None)
@@ -81,7 +234,7 @@ impl<R: Registers> ScalerIo for PinnedIo<'_, R> {
 }
 impl<R: Registers> DklIo for PinnedIo<'_, R> {
     fn with_dkl_lock<T>(&self, op: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
-        let _lock = HIP_LOCK.lock();
+        let _lock = super::DKL_ACCESS_LOCK.lock();
         op()
     }
 }
@@ -200,6 +353,7 @@ struct Firmware {
     phy: intel_display::tc::DklPhyState,
     fia: intel_display::tc::FiaState,
     clock: intel_display::ddi::TcClockState,
+    trans_clock: u32,
     hdmi: intel_display::hdmi::HdmiReadout,
     wm: [intel_display::watermark::PlaneWatermarks; 6],
     ddb: [intel_display::watermark::DdbEntry; 6],
@@ -208,8 +362,14 @@ struct Firmware {
     scalers: [intel_display::scaler::Scaler; 2],
     refclk: u32,
     pixel_clock: u32,
+    afc_startup: Option<u8>,
 }
-fn capture(r: &impl Registers, pin: &PowerPin, port: TcPort) -> Result<Firmware, Error> {
+fn capture(
+    r: &impl Registers,
+    pin: &PowerPin,
+    port: TcPort,
+    afc_startup: Option<u8>,
+) -> Result<Firmware, Error> {
     use intel_display::{
         color, ddi, dpll_mgr, hdmi, pipe_config, scaler, tc, universal_plane, watermark,
     };
@@ -283,6 +443,7 @@ fn capture(r: &impl Registers, pin: &PowerPin, port: TcPort) -> Result<Firmware,
     }
     let fia = tc::read_fia_state(&io, port)?;
     let clock = ddi::read_tc_clock_state(&io, port)?;
+    let trans_clock = read(r, 0x46140)?;
     if !clock.enabled || clock.pll != ddi::TcPllKind::Dkl {
         return Err(Error::Refused);
     }
@@ -292,7 +453,11 @@ fn capture(r: &impl Registers, pin: &PowerPin, port: TcPort) -> Result<Firmware,
         2 => 38400,
         _ => return Err(Error::Refused),
     };
-    let pll = dpll_mgr::dkl_pll_get_hw_state(&io, port, refclk, false)?.ok_or(Error::Refused)?;
+    let pll = dpll_mgr::dkl_pll_get_hw_state(&io, port, refclk, afc_startup.is_some())?
+        .ok_or(Error::Refused)?;
+    if afc_startup.is_some_and(|value| ((pll.state.div0 >> 25) & 7) != u32::from(value)) {
+        return Err(Error::Refused);
+    }
     if pll.enable & ((1 << 31) | (1 << 30) | (1 << 27) | (1 << 26))
         != (1 << 31) | (1 << 30) | (1 << 27) | (1 << 26)
     {
@@ -348,6 +513,7 @@ fn capture(r: &impl Registers, pin: &PowerPin, port: TcPort) -> Result<Firmware,
         phy,
         fia,
         clock,
+        trans_clock,
         hdmi,
         wm,
         ddb,
@@ -356,6 +522,7 @@ fn capture(r: &impl Registers, pin: &PowerPin, port: TcPort) -> Result<Firmware,
         scalers,
         refclk,
         pixel_clock,
+        afc_startup,
     })
 }
 
@@ -405,17 +572,47 @@ fn ownership(
     }
     Ok(())
 }
-fn mode(f: &Firmware) -> Result<Mode, Error> {
+fn mode(f: &Firmware) -> Result<DrmMode, Error> {
     let t = f.pipe.timings;
     let hz = u64::from(f.pixel_clock) * 1_000_000 / (u64::from(t.htotal) * u64::from(t.vtotal));
     if !(25_000..=240_000).contains(&hz) {
         return Err(Error::Refused);
     }
-    Ok(Mode {
+    Ok(DrmMode {
         width: t.hdisplay,
         height: t.vdisplay,
         refresh_millihz: hz.try_into().map_err(|_| Error::Refused)?,
     })
+}
+fn read_route_edid<R: Registers, T: PollTimer>(
+    registers: &R,
+    timer: &T,
+    pin: super::gmbus::Pin,
+) -> Result<Vec<u8>, Error> {
+    let mut notes = super::gmbus::BusNotes::default();
+    let base = super::gmbus::read_edid_with(registers, timer, pin, &mut notes)
+        .map_err(|_| Error::Refused)?;
+    if base.extension_count() > 1 {
+        return Err(Error::Refused);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(usize::from(base.extension_count() + 1) * 128)
+        .map_err(|_| Error::Unavailable(0))?;
+    bytes.extend_from_slice(base.as_slice());
+    if base.extension_count() == 1 {
+        let extension = super::gmbus::read_edid_extension_with(registers, timer, pin)
+            .map_err(|_| Error::Refused)?
+            .ok_or(Error::Refused)?;
+        bytes.extend_from_slice(extension.as_slice());
+    }
+    let mut verify_notes = super::gmbus::BusNotes::default();
+    let verify = super::gmbus::read_edid_with(registers, timer, pin, &mut verify_notes)
+        .map_err(|_| Error::Refused)?;
+    if verify != base {
+        return Err(Error::Refused);
+    }
+    Ok(bytes)
 }
 struct RamBacking {
     pages: Arc<SharedPages>,
@@ -431,23 +628,81 @@ struct Bound {
     binding: Binding,
 }
 struct State {
+    firmware: Firmware,
+    current_mode: NativeMode,
+    connected: bool,
+    last_hpd_poll: u64,
+    last_hpd_irq: Option<u64>,
+    hpd_good_samples: u8,
+    hpd_bad_samples: u8,
+    irq_fault_reported: bool,
+    unsupported_sink_reported: bool,
     current: Option<Bound>,
     quarantine: Vec<Bound>,
     unbound_quarantine: Vec<(Arc<SharedPages>, SharedFixedView)>,
     lost: bool,
     frame_progress: Option<(u32, u64)>,
+    counter_epoch: u64,
 }
 struct Native<R, T> {
     registers: R,
     timer: T,
     gtt: Arc<Gtt>,
     power: PowerPin,
-    firmware: Firmware,
+    baseline: Firmware,
+    modes: Vec<NativeMode>,
+    preferred: DrmMode,
+    sink_edid: Vec<u8>,
+    afc_startup: Option<u8>,
     port: TcPort,
-    mode: Mode,
     pci: axdriver_display::DisplayPciIdentity,
+    irq_event_sequence: AtomicU32,
     state: Mutex<State>,
 }
+
+/// Debounce task-context DDC samples and report the physical connector state
+/// independently of whether the audio owner could retire or publish its HDA
+/// route. Audio errors are retained for diagnostics, not used to hide a
+/// confirmed cable transition; the hook must keep TC link/power ownership when
+/// HDA state is uncertain.
+fn hpd_config_transition(
+    state: &mut State,
+    sample_matches: bool,
+    preferred: DrmMode,
+    audio_transition: impl FnOnce(bool) -> Result<(), String>,
+) -> Option<(crate::drm::device::DisplayConfig, Option<String>)> {
+    if sample_matches {
+        state.hpd_good_samples = state.hpd_good_samples.saturating_add(1);
+        state.hpd_bad_samples = 0;
+    } else {
+        state.hpd_bad_samples = state.hpd_bad_samples.saturating_add(1);
+        state.hpd_good_samples = 0;
+    }
+    let connected = if state.connected && state.hpd_bad_samples >= 2 {
+        false
+    } else if !state.connected && state.hpd_good_samples >= 2 {
+        true
+    } else {
+        return None;
+    };
+    let audio_error = audio_transition(connected).err();
+    state.connected = connected;
+    state.hpd_good_samples = 0;
+    state.hpd_bad_samples = 0;
+    Some((
+        crate::drm::device::DisplayConfig {
+            connected,
+            mode: connected.then_some(preferred),
+        },
+        audio_error,
+    ))
+}
+
+fn hpd_probe_due(now: u64, last_poll: u64, last_irq: Option<u64>) -> bool {
+    now.saturating_sub(last_poll) >= 250_000
+        && last_irq.is_none_or(|last| now.saturating_sub(last) >= 250_000)
+}
+
 fn frame_count(r: &impl Registers) -> Result<u32, Error> {
     // All-ones is a valid frame just before wrap, unlike configuration words.
     r.read(reg(0x70040, false))
@@ -482,6 +737,121 @@ fn latch(r: &impl Registers, timer: &impl PollTimer, address: u32) -> Result<(),
     }
     Err(Error::Refused)
 }
+
+fn pitch_for(width: u32) -> Option<u32> {
+    width
+        .checked_mul(4)?
+        .checked_add(63)
+        .map(|pitch| pitch & !63)
+}
+
+/// Preserve firmware WM/DDB only for the source-checked linear-XRGB profile.
+/// Clock and pitch alone are not a watermark proof: method selection, line
+/// demand and DDB minima also depend on htotal/width. The exact 4K30->1080p60
+/// reduction has a matching source line time and no worse demand at every
+/// source-valid latency; unknown profiles refuse before display writes.
+fn retained_watermark_budget(baseline: &Firmware, target: NativeMode, pitch: u32) -> bool {
+    intel_display::watermark::adlp_linear_xrgb_4k30_watermark_profile_no_worse(
+        baseline.pixel_clock,
+        baseline.plane.width,
+        baseline.pipe.timings.htotal,
+        target.timing.clock_khz,
+        u32::from(target.timing.hdisplay),
+        u32::from(target.timing.htotal),
+    ) && pitch <= baseline.plane.pitch
+        && baseline.dbuf.enabled_slices != 0
+        && baseline.ddb[0].blocks() != 0
+        && baseline.wm[0].levels[0].enable
+}
+
+fn avi_frame(words: [u32; 8]) -> intel_display::hdmi::RawInfoframe {
+    let mut raw = [0; 32];
+    for (word, bytes) in words.into_iter().zip(raw.chunks_exact_mut(4)) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    intel_display::hdmi::RawInfoframe {
+        raw,
+        kind: intel_display::hdmi::FrameType::Avi,
+    }
+}
+
+fn same_mode_state(
+    observed: &Firmware,
+    baseline: &Firmware,
+    mode: NativeMode,
+    surface: u32,
+    pitch: u32,
+    pll: &intel_display::dpll_mgr::DklPllState,
+    port: TcPort,
+    expected_avi: intel_display::hdmi::RawInfoframe,
+    expected_phy: &intel_display::tc::DklPhyState,
+) -> bool {
+    let t = mode.timing;
+    let pipe = observed.pipe;
+    let same_timings = pipe.timings.hdisplay == u32::from(t.hdisplay)
+        && pipe.timings.htotal == u32::from(t.htotal)
+        && pipe.timings.hblank_start == u32::from(t.hdisplay)
+        && pipe.timings.hblank_end == u32::from(t.htotal)
+        && pipe.timings.hsync_start == u32::from(t.hsync_start)
+        && pipe.timings.hsync_end == u32::from(t.hsync_end)
+        && pipe.timings.vdisplay == u32::from(t.vdisplay)
+        && pipe.timings.vtotal == u32::from(t.vtotal)
+        && pipe.timings.vblank_start == u32::from(t.vdisplay)
+        && pipe.timings.vblank_end == u32::from(t.vtotal)
+        && pipe.timings.vsync_start == u32::from(t.vsync_start)
+        && pipe.timings.vsync_end == u32::from(t.vsync_end)
+        && pipe.timings.set_context_latency == 0
+        && !pipe.timings.interlaced;
+    let route = match port {
+        TcPort::Tc1 => Port::Tc1,
+        TcPort::Tc2 => Port::Tc2,
+        _ => return false,
+    };
+    observed.pixel_clock == t.clock_khz
+        && same_timings
+        && pipe.source == (u32::from(t.hdisplay), u32::from(t.vdisplay))
+        && observed.ddi.enabled
+        && observed.ddi.port == Some(route)
+        && observed.ddi.mode == intel_display::ddi::DdiMode::Hdmi
+        && observed.ddi.bpp == Some(24)
+        && observed.plane.native_linear_xrgb()
+        && observed.plane.pitch == pitch
+        && observed.plane.width == u32::from(t.hdisplay)
+        && observed.plane.height == u32::from(t.vdisplay)
+        && observed.plane.surface() == surface & 0xffff_f000
+        && observed.pll.state == *pll
+        && observed.pll.enable == baseline.pll.enable
+        && observed.refclk == baseline.refclk
+        && observed.afc_startup == baseline.afc_startup
+        && observed.ddi == baseline.ddi
+        && observed.clock == baseline.clock
+        && observed.trans_clock == baseline.trans_clock
+        && observed.pipe.transconf == baseline.pipe.transconf
+        && observed.pipe.dss == baseline.pipe.dss
+        && observed.pipe.chicken == baseline.pipe.chicken
+        && observed.pipe.frame_start_delay == baseline.pipe.frame_start_delay
+        && observed.pipe.vrr == baseline.pipe.vrr
+        && observed.pipe.misc.output == baseline.pipe.misc.output
+        && observed.pipe.misc.bpc == baseline.pipe.misc.bpc
+        && observed.pipe.misc.raw & !super::pipe::PIPE_MISC_OWNED_MASK
+            == baseline.pipe.misc.raw & !super::pipe::PIPE_MISC_OWNED_MASK
+        && observed.pipe.multiplier_raw == baseline.pipe.multiplier_raw
+        && observed.pipe.pixel_multiplier == baseline.pipe.pixel_multiplier
+        && observed.hdmi.control == baseline.hdmi.control
+        && observed.hdmi.enable == baseline.hdmi.enable
+        && observed.hdmi.enabled_packets == baseline.hdmi.enabled_packets
+        && observed.hdmi.gcp == baseline.hdmi.gcp
+        && observed.hdmi.frames[0] == Some(expected_avi)
+        && observed.hdmi.frames[1..] == baseline.hdmi.frames[1..]
+        && observed.wm == baseline.wm
+        && observed.ddb == baseline.ddb
+        && observed.dbuf == baseline.dbuf
+        && observed.color == baseline.color
+        && observed.scalers == baseline.scalers
+        && observed.fia == baseline.fia
+        && observed.phy == *expected_phy
+}
+
 impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for Native<R, T> {
     fn driver_name(&self) -> &'static str {
         "thekernel_intel"
@@ -489,11 +859,17 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
     fn platform_name(&self) -> Option<&'static str> {
         Some("n305-native-fastboot")
     }
-    fn preferred_mode(&self) -> Mode {
-        self.mode
+    fn preferred_mode(&self) -> DrmMode {
+        self.preferred
     }
-    fn fixed_mode(&self) -> Option<Mode> {
-        Some(self.mode)
+    fn supported_modes(&self) -> Vec<DrmMode> {
+        self.modes.iter().map(|mode| mode.kms).collect()
+    }
+    fn mode_is_supported(&self, requested: DrmMode) -> bool {
+        self.modes.iter().any(|mode| mode.kms == requested)
+    }
+    fn connector_edid(&self) -> Option<Vec<u8>> {
+        Some(self.sink_edid.clone())
     }
     fn supports_cursor(&self) -> bool {
         false
@@ -501,7 +877,108 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
     fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
         Some(self.pci)
     }
-    fn hardware_vblank_counter(&self) -> DrmResult<Option<u32>> {
+    fn display_config_changed(&self) -> DrmResult<Option<crate::drm::device::DisplayConfig>> {
+        let now = self.timer.now_micros();
+        let mut state = self.state.lock();
+        if state.lost {
+            return Err(DrmError::DeviceLost);
+        }
+        if super::irq::faulted() && !state.irq_fault_reported {
+            state.irq_fault_reported = true;
+            axlog::warn!(
+                "intel-irq: display MSI owner faulted; shared master disabled, retaining TC +                 link/power and falling back to PIPEFRAME plus debounced task-context HPD polling"
+            );
+        }
+        if super::irq::take_hpd_pending() {
+            // HPD is only a wake hint. Restart the quiet period on every
+            // notification so a bouncing cable cannot tear down scanout from
+            // one interrupt or a rapid IRQ storm.
+            state.last_hpd_irq = Some(now);
+        }
+        // The south HPD status is an interrupt latch, not a cable-level GPIO.
+        // The owned IRQ is only a wake hint: a bounded task-context GMBUS EDID
+        // probe remains the source-backed connection test for this legacy
+        // HDMI sink.
+        if !hpd_probe_due(now, state.last_hpd_poll, state.last_hpd_irq) {
+            return Ok(None);
+        }
+        state.last_hpd_irq = None;
+        state.last_hpd_poll = now;
+        if self.power.held(&self.registers).is_err() {
+            state.lost = true;
+            return Err(DrmError::DeviceLost);
+        }
+        let current_pixel_clock_khz = state.current_mode.timing.clock_khz;
+        let pin = if self.port == TcPort::Tc1 {
+            super::gmbus::Pin::Tc1
+        } else {
+            super::gmbus::Pin::Tc2
+        };
+        let observed = read_route_edid(&self.registers, &self.timer, pin);
+        let mut unsupported_sink = false;
+        let sample_matches = match observed {
+            Ok(bytes) if bytes == self.sink_edid => true,
+            Ok(_) => {
+                unsupported_sink = !state.unsupported_sink_reported;
+                state.unsupported_sink_reported = true;
+                false
+            }
+            Err(_) => false,
+        };
+        if sample_matches {
+            state.unsupported_sink_reported = false;
+        }
+        let transition =
+            hpd_config_transition(&mut state, sample_matches, self.preferred, |connected| {
+                // Retire or republish HDA only after the two-sample physical
+                // decision and while the TC link/power pin are still held.
+                // Audio errors do not falsify cable state or stop the
+                // hardware-vblank worker: the audio owner quarantines unknown
+                // HDA state, and the TC link remains powered.
+                if connected {
+                    match super::audio::after_link_enabled(
+                        &self.registers,
+                        &self.timer,
+                        self.port,
+                        current_pixel_clock_khz,
+                        &self.sink_edid,
+                    ) {
+                        Ok(super::audio::LinkAudioStatus::Enabled) => Ok(()),
+                        Ok(super::audio::LinkAudioStatus::Unavailable(reason)) => {
+                            axlog::warn!("intel-hdmi-audio: HPD reconnect video-only: {reason}");
+                            Ok(())
+                        }
+                        Err(error) => Err(format!(
+                            "HPD reconnect audio handoff unverified (TC link/power retained): \
+                             {error}"
+                        )),
+                    }
+                } else {
+                    super::audio::before_link_disable(&self.registers, &self.timer, self.port)
+                        .map_err(|error| {
+                            format!(
+                                "HPD unplug reported, but HDA DMA retirement is unverified; TC \
+                                 link/power remain held: {error}"
+                            )
+                        })
+                }
+            });
+        let (update, audio_error) = transition
+            .map(|(config, audio_error)| (Some(config), audio_error))
+            .unwrap_or((None, None));
+        drop(state);
+        if let Some(error) = audio_error {
+            axlog::error!("intel-hdmi-audio: {error}");
+        }
+        if unsupported_sink {
+            axlog::warn!(
+                "intel-hpd: TC connector EDID changed; native mode list is pinned to the \
+                 boot-validated sink, reporting disconnected"
+            );
+        }
+        Ok(update)
+    }
+    fn hardware_vblank_counter(&self) -> DrmResult<Option<(u64, u32)>> {
         let mut state = self.state.lock();
         if state.lost {
             return Err(DrmError::DeviceLost);
@@ -527,7 +1004,38 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             }
             _ => state.frame_progress = Some((counter, now)),
         }
-        Ok(Some(counter))
+        Ok(Some((state.counter_epoch, counter)))
+    }
+    fn wait_vblank_hint(
+        &self,
+        delay: core::time::Duration,
+    ) -> Option<crate::drm::device::VblankWake> {
+        let online = super::irq::online();
+        let faulted = super::irq::faulted();
+        if !online && !faulted {
+            return crate::drm::device::wait_vblank_timer(delay);
+        }
+        let observed = self.irq_event_sequence.load(Ordering::Acquire);
+        let current = super::irq::event_sequence();
+        if current != observed {
+            self.irq_event_sequence.store(current, Ordering::Release);
+            return Some(crate::drm::device::VblankWake::Interrupt);
+        }
+        if !online {
+            return crate::drm::device::wait_vblank_timer(delay);
+        }
+        match super::irq::wait_for_event(current, delay) {
+            Ok(interrupted) => {
+                self.irq_event_sequence
+                    .store(super::irq::event_sequence(), Ordering::Release);
+                Some(if interrupted {
+                    crate::drm::device::VblankWake::Interrupt
+                } else {
+                    crate::drm::device::VblankWake::Timeout
+                })
+            }
+            Err(_) => crate::drm::device::wait_vblank_timer(delay),
+        }
     }
     fn validate_atomic_state(&self, active: bool, dpms_on: bool, gamma_lut: bool) -> DrmResult<()> {
         if active && dpms_on && !gamma_lut {
@@ -543,11 +1051,22 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         size: u64,
         owner: Arc<dyn Send + Sync>,
     ) -> DrmResult<Arc<dyn GemBacking>> {
+        let mode = self.modes.iter().find(|mode| {
+            mode.kms.width == request.width
+                && request.height >= mode.kms.height
+                && request.height <= mode.kms.height.saturating_mul(2)
+        });
+        if mode.is_none() {
+            return Err(DrmError::Unsupported);
+        }
+        let expected_pitch = request
+            .width
+            .checked_mul(4)
+            .and_then(|width| width.checked_add(63))
+            .map(|width| width & !63)
+            .ok_or(DrmError::Overflow)?;
         if request.bpp != 32
-            || request.width != self.mode.width
-            || pitch != self.firmware.plane.pitch
-            || request.height < self.mode.height
-            || request.height > self.mode.height.saturating_mul(2)
+            || pitch != expected_pitch
             || size != u64::from(pitch) * u64::from(request.height)
         {
             return Err(DrmError::Unsupported);
@@ -568,11 +1087,16 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             .map_err(|_| DrmError::NoMemory)
     }
     fn present(&self, s: Scanout) -> DrmResult<Arc<Fence>> {
-        if s.mode != self.mode
-            || s.width != self.mode.width
-            || s.height != self.mode.height
+        let Some(target) = self.modes.iter().find(|mode| mode.kms == s.mode).copied() else {
+            return Err(DrmError::Unsupported);
+        };
+        let Some(expected_pitch) = pitch_for(target.kms.width) else {
+            return Err(DrmError::Overflow);
+        };
+        if s.width != target.kms.width
+            || s.height != target.kms.height
             || s.framebuffer_width != s.width
-            || s.pitch != self.firmware.plane.pitch
+            || s.pitch != expected_pitch
             || s.bpp != 32
             || s.format != intel_display::universal_plane::XRGB8888
             || s.framebuffer_offset != 0
@@ -600,6 +1124,9 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         if state.lost {
             return Err(DrmError::DeviceLost);
         }
+        if target != state.current_mode && state.counter_epoch == u64::MAX {
+            return Err(DrmError::Overflow);
+        }
         // Allocate every recovery/quarantine slot before touching hardware.
         state
             .quarantine
@@ -615,7 +1142,8 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             complete.signal_error();
             return Err(DrmError::DeviceLost);
         }
-        let mut observed = match capture(&self.registers, &self.power, self.port) {
+        let mut observed = match capture(&self.registers, &self.power, self.port, self.afc_startup)
+        {
             Ok(v) => v,
             Err(_) => {
                 state.lost = true;
@@ -623,20 +1151,37 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                 return Err(DrmError::DeviceLost);
             }
         };
-        observed.plane.surface_raw = self.firmware.plane.surface_raw;
-        if observed != self.firmware {
+        let live_surface = match read(&self.registers, p::PLANE_SURF_A.offset()) {
+            Ok(v) => v,
+            Err(_) => {
+                state.lost = true;
+                complete.signal_error();
+                return Err(DrmError::DeviceLost);
+            }
+        };
+        if observed.plane.surface_raw != live_surface
+            || read(&self.registers, p::PLANE_SURFLIVE_A.offset()).ok()
+                != Some(live_surface & 0xffff_f000)
+        {
             state.lost = true;
             complete.signal_error();
             return Err(DrmError::DeviceLost);
         }
-        let before = match read(&self.registers, 0x7019c) {
-            Ok(v) => v,
-            Err(_) => {
-                state.lost = true;
-                complete.signal_error();
-                return Err(DrmError::DeviceLost);
-            }
-        };
+        observed.plane.surface_raw = state.firmware.plane.surface_raw;
+        if observed != state.firmware {
+            state.lost = true;
+            complete.signal_error();
+            return Err(DrmError::DeviceLost);
+        }
+        // Linux pin-to-display preparation leaves the CPU domain before
+        // scanout. KMS already waited explicit/implicit producer fences; flush
+        // the owned WB alias before either GGTT/SURF publication or a retained
+        // binding update, including same-buffer fbdev damage.
+        if super::gt::copy::sync_cpu_pages(pages.clone()).is_err() {
+            complete.signal_error();
+            return Err(DrmError::Unsupported);
+        }
+        let before = live_surface;
         let mut next = None;
         let address = if let Some(current) = &state.current
             && Arc::ptr_eq(&current.pages, &pages)
@@ -680,34 +1225,315 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             address
         };
         fence(Ordering::SeqCst); // publish CPU pixels/PTEs before plane arm.
-        let surface = (address + s.offset) as u32;
-        if latch(&self.registers, &self.timer, surface).is_err() {
-            let recovered = latch(&self.registers, &self.timer, before).is_ok();
+        let Some(surface) = address
+            .checked_add(s.offset)
+            .and_then(|v| u32::try_from(v).ok())
+        else {
             if let Some(new) = next {
-                if recovered {
-                    // SAFETY: restored surface progressed through fresh frames.
+                // SAFETY: overflow is detected before this candidate's
+                // PLANE_CTL/SURF write; the previously verified before-image
+                // remains active, so the new GGTT binding has no DMA user.
+                if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                    state.quarantine.push(new);
+                    state.lost = true;
+                }
+            }
+            complete.signal_error();
+            return Err(if state.lost {
+                DrmError::DeviceLost
+            } else {
+                DrmError::Overflow
+            });
+        };
+        let changing_mode = target.timing != state.current_mode.timing;
+        if !changing_mode {
+            if latch(&self.registers, &self.timer, surface).is_err() {
+                let recovered = latch(&self.registers, &self.timer, before).is_ok();
+                if let Some(new) = next {
+                    if recovered {
+                        // SAFETY: `latch(before)` proved SURFLIVE matched the
+                        // saved, previously active surface and then observed
+                        // two fresh hardware frame counts; scanout no longer
+                        // references this candidate mapping.
+                        if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                            state.quarantine.push(new);
+                            state.lost = true;
+                        }
+                    } else {
+                        state.quarantine.push(new);
+                    }
+                }
+                if !recovered {
+                    state.lost = true;
+                }
+                complete.signal_error();
+                return Err(if recovered && !state.lost {
+                    DrmError::Busy
+                } else {
+                    DrmError::DeviceLost
+                });
+            }
+            state.firmware.plane.surface_raw = surface;
+        } else {
+            if !retained_watermark_budget(&self.baseline, target, s.pitch)
+                || state.firmware.wm != self.baseline.wm
+                || state.firmware.ddb != self.baseline.ddb
+                || state.firmware.dbuf != self.baseline.dbuf
+            {
+                if let Some(new) = next {
+                    // SAFETY: this rejection precedes `tc_modeset::program`
+                    // and every PLANE_CTL/SURF write; the verified old image
+                    // remains active and cannot address this binding.
                     if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
                         state.quarantine.push(new);
                         state.lost = true;
                     }
+                }
+                complete.signal_error();
+                return Err(if state.lost {
+                    DrmError::DeviceLost
                 } else {
-                    state.quarantine.push(new);
+                    DrmError::Unsupported
+                });
+            }
+            let Some(avi) = observed.hdmi.frames[0] else {
+                if let Some(new) = next {
+                    // SAFETY: the absent AVI packet is detected before the TC
+                    // transaction and before any plane address write; the
+                    // candidate binding has never been visible to scanout.
+                    if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                        state.quarantine.push(new);
+                        state.lost = true;
+                    }
+                }
+                complete.signal_error();
+                return Err(if state.lost {
+                    DrmError::DeviceLost
+                } else {
+                    DrmError::Unsupported
+                });
+            };
+            let avi_words = match super::tc_modeset::avi_words(avi, target.vic) {
+                Ok(words) => words,
+                Err(_) => {
+                    if let Some(new) = next {
+                        // SAFETY: AVI validation/building happens before the
+                        // TC transaction; the plane still references its
+                        // verified before-image, not this new binding.
+                        if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                            state.quarantine.push(new);
+                            state.lost = true;
+                        }
+                    }
+                    complete.signal_error();
+                    return Err(if state.lost {
+                        DrmError::DeviceLost
+                    } else {
+                        DrmError::Unsupported
+                    });
+                }
+            };
+            let expected_target_avi = avi_frame(avi_words);
+            let (target_pll, expected_target_phy) =
+                match intel_display::dpll_mgr::icl_calc_mg_pll_state(
+                    target.timing.clock_khz,
+                    self.baseline.refclk,
+                    self.afc_startup,
+                )
+                .and_then(|pll| {
+                    intel_display::tc::adlp_tc_dkl_hdmi_expected_phy_state(
+                        observed.phy,
+                        self.port,
+                        target.timing.clock_khz,
+                        5,
+                        intel_display::tc::Wa16011342517::Active,
+                    )
+                    .map(|phy| (pll, phy))
+                }) {
+                    Ok(plan) => plan,
+                    Err(_) => {
+                        if let Some(new) = next {
+                            // SAFETY: target PLL/PHY arithmetic is preflighted before
+                            // any TC or plane write; the verified before-image
+                            // still owns scanout and cannot reference this binding.
+                            if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                                state.quarantine.push(new);
+                                state.lost = true;
+                            }
+                        }
+                        complete.signal_error();
+                        return Err(if state.lost {
+                            DrmError::DeviceLost
+                        } else {
+                            DrmError::Unsupported
+                        });
+                    }
+                };
+            let old_firmware = state.firmware.clone();
+            let old_mode = state.current_mode;
+            let old_surface = before;
+            let old_pitch = old_firmware.plane.pitch;
+            let mut display_writes_started = false;
+            let transition = super::tc_modeset::program(
+                &self.registers,
+                &self.timer,
+                self.port,
+                &target.timing,
+                s.pitch,
+                surface,
+                &target_pll,
+                self.afc_startup,
+                &avi_words,
+                &self.sink_edid,
+                None,
+                None,
+                true,
+                None,
+                &mut display_writes_started,
+            )
+            .and_then(|()| {
+                let next_state = capture(&self.registers, &self.power, self.port, self.afc_startup)
+                    .map_err(|e| format!("TC modeset readback failed: {e:?}"))?;
+                if !same_mode_state(
+                    &next_state,
+                    &self.baseline,
+                    target,
+                    surface,
+                    s.pitch,
+                    &target_pll,
+                    self.port,
+                    expected_target_avi,
+                    &expected_target_phy,
+                ) {
+                    return Err(String::from(
+                        "TC modeset state did not match the full target image",
+                    ));
+                }
+                Ok(next_state)
+            });
+            if display_writes_started {
+                // Equivalent to source vblank off/on around this serialized
+                // transaction. Hardware counter resets in forward OR rollback
+                // share one new epoch, observed only after releasing this lock.
+                state.counter_epoch += 1;
+                state.frame_progress = None;
+            }
+            match transition {
+                Ok(next_state) => {
+                    state.firmware = next_state;
+                    state.current_mode = target;
+                }
+                Err(original) if !display_writes_started => {
+                    // Preflight and the HDA retirement gate precede every
+                    // display write. The old scanout remains authoritative,
+                    // so an audio-only refusal must not make the display
+                    // worker lost or run a destructive rollback against a
+                    // still-active link.
+                    if let Some(new) = next {
+                        // SAFETY: `tc_modeset::program` reports this stage
+                        // only before its first PLANE_CTL/SURF or link write;
+                        // the existing scanout remains the sole DMA owner.
+                        if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                            state.quarantine.push(new);
+                            state.lost = true;
+                        }
+                    }
+                    complete.signal_error();
+                    axlog::warn!("intel-tc-modeset: refused before display writes: {original}");
+                    return Err(if state.lost {
+                        DrmError::DeviceLost
+                    } else {
+                        DrmError::Busy
+                    });
+                }
+                Err(original) => {
+                    let old_avi_frame = old_firmware.hdmi.frames[0];
+                    let old_avi = old_avi_frame
+                        .and_then(|raw| super::tc_modeset::avi_words_preserve(raw).ok());
+                    let mut rollback_display_writes_started = false;
+                    let recovered = old_avi.is_some_and(|old_avi| {
+                        super::tc_modeset::program(
+                            &self.registers,
+                            &self.timer,
+                            self.port,
+                            &old_mode.timing,
+                            old_pitch,
+                            old_surface,
+                            &old_firmware.pll.state,
+                            self.afc_startup,
+                            &old_avi,
+                            &self.sink_edid,
+                            Some(old_firmware.pipe.misc.raw),
+                            Some(old_firmware.plane.ctl),
+                            false,
+                            Some(&old_firmware.phy),
+                            &mut rollback_display_writes_started,
+                        )
+                        .and_then(|()| {
+                            let restored =
+                                capture(&self.registers, &self.power, self.port, self.afc_startup)
+                                    .map_err(|e| format!("TC rollback readback failed: {e:?}"))?;
+                            if !same_mode_state(
+                                &restored,
+                                &self.baseline,
+                                old_mode,
+                                old_surface,
+                                old_pitch,
+                                &old_firmware.pll.state,
+                                self.port,
+                                old_avi_frame.unwrap(),
+                                &old_firmware.phy,
+                            ) {
+                                return Err(String::from(
+                                    "TC rollback did not restore the old image",
+                                ));
+                            }
+                            Ok(())
+                        })
+                        .is_ok()
+                    });
+                    if let Some(new) = next {
+                        if recovered {
+                            // SAFETY: rollback readback matched the old full
+                            // image, and `tc_modeset::program` proved its saved
+                            // SURFLIVE address across two fresh frames. The
+                            // display engine no longer references this new
+                            // mapping.
+                            if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                                state.quarantine.push(new);
+                                state.lost = true;
+                            }
+                        } else {
+                            state.quarantine.push(new);
+                        }
+                    }
+                    if !recovered {
+                        state.lost = true;
+                    }
+                    complete.signal_error();
+                    axlog::warn!(
+                        "intel-tc-modeset: {}; {}",
+                        original,
+                        if recovered {
+                            "ROLLBACK_MMIO_VERIFIED"
+                        } else {
+                            "ROLLBACK_FAILED; DMA owners quarantined"
+                        }
+                    );
+                    return Err(if recovered && !state.lost {
+                        DrmError::Busy
+                    } else {
+                        DrmError::DeviceLost
+                    });
                 }
             }
-            if !recovered {
-                state.lost = true;
-            }
-            complete.signal_error();
-            return Err(if recovered && !state.lost {
-                DrmError::Busy
-            } else {
-                DrmError::DeviceLost
-            });
         }
         if let Some(new) = next
             && let Some(old) = state.current.replace(new)
         {
-            // SAFETY: new SURFLIVE followed by another hardware frame.
+            // SAFETY: the preceding latch/modeset path proved the new
+            // SURFLIVE address followed by a second fresh hardware frame, so
+            // this replaced scanout binding is no longer referenced.
             if unsafe { self.gtt.release_binding(&old.binding) }.is_err() {
                 state.quarantine.push(old);
                 state.lost = true;
@@ -766,6 +1592,7 @@ pub(super) fn init(
         if !vbt.checksum_valid() {
             return Err(Error::InvalidHeader);
         }
+        let afc_startup = vbt.afc_startup_override()?;
         let definitions = vbt.parse_general_definitions()?;
         let route = definitions
             .encoder(if port == TcPort::Tc1 {
@@ -780,6 +1607,7 @@ pub(super) fn init(
             || route.lspcon
             || route.dynamic_port_over_tc
             || route.hdmi_level_shift != 5
+            || route.gmbus_pin() != Some(if port == TcPort::Tc1 { 9 } else { 10 })
         {
             return Err(Error::Refused);
         }
@@ -816,29 +1644,44 @@ pub(super) fn init(
             .collect();
         let pin = PowerPin::acquire(&window, port)?;
         let admitted = (|| {
-            let first = capture(&window, &pin, port)?;
+            let first = capture(&window, &pin, port, afc_startup)?;
             if first.plane.pitch != (first.plane.width * 4).div_ceil(64) * 64 {
                 return Err(Error::Refused);
             }
             ownership(&gtt, &first, &boot, aperture, stolen, &allocatable)?;
-            let second = capture(&window, &pin, port)?;
+            let ddc = if port == TcPort::Tc1 {
+                super::gmbus::Pin::Tc1
+            } else {
+                super::gmbus::Pin::Tc2
+            };
+            let sink_edid = read_route_edid(&window, &super::gmbus::MonotonicTimer, ddc)?;
+            let second = capture(&window, &pin, port, afc_startup)?;
             if first != second {
                 return Err(Error::Refused);
             }
-            let mode = mode(&first)?;
-            // Preserve the measured firmware mode, not an invented EDID target.
-            // This milestone advertises ONLY this fixed mode to KMS/Weston.
-            Ok((first, mode))
+            let (modes, preferred, current) = native_modes(&sink_edid, &first)?;
+            Ok((first, modes, preferred, current, sink_edid))
         })();
         match admitted {
-            Ok((f, m)) => Ok((pin, port, f, m, info)),
+            Ok((f, modes, preferred, current, edid)) => Ok((
+                pin,
+                port,
+                f,
+                modes,
+                preferred,
+                current,
+                edid,
+                afc_startup,
+                info,
+            )),
             Err(e) => {
                 pin.restore(&window)?;
                 Err(e)
             }
         }
     };
-    let (power, port, firmware, mode, info) = setup().map_err(message)?;
+    let (power, port, firmware, modes, preferred, current_mode, sink_edid, afc_startup, info) =
+        setup().map_err(message)?;
     let pci = axdriver_display::DisplayPciIdentity {
         bus: bdf.bus,
         device: bdf.device,
@@ -854,16 +1697,30 @@ pub(super) fn init(
         timer: super::gmbus::MonotonicTimer,
         gtt,
         power,
-        firmware,
+        baseline: firmware.clone(),
+        modes,
+        preferred: preferred.kms,
+        sink_edid,
+        afc_startup,
         port,
-        mode,
         pci,
+        irq_event_sequence: AtomicU32::new(0),
         state: Mutex::new(State {
+            firmware,
+            current_mode,
+            connected: true,
+            last_hpd_poll: 0,
+            last_hpd_irq: None,
+            hpd_good_samples: 0,
+            hpd_bad_samples: 0,
+            irq_fault_reported: false,
+            unsupported_sink_reported: false,
             current: None,
             quarantine: Vec::new(),
             unbound_quarantine: Vec::new(),
             lost: false,
             frame_progress: None,
+            counter_epoch: 0,
         }),
     });
     let adapter = match adapter {
@@ -876,14 +1733,64 @@ pub(super) fn init(
         }
     };
     let device = crate::drm::DrmDevice::new(adapter.clone(), 1, 2, 3, 4);
-    if let Err(e) = crate::drm::register_primary_device(device) {
+    if let Err(e) = crate::drm::register_primary_device(device.clone()) {
         power.restore(&window).map_err(message)?;
         return Err(format!("fastboot KMS registration failed: {e}"));
     }
+    match super::pci::Ecam::platform() {
+        Some(mut ecam) => match super::irq::install_n305(&mut ecam, bdf, port, window) {
+            Ok(()) => axlog::info!(
+                "intel-irq: owned single MSI for Pipe-A vblank and selected {port:?} HPD; \
+                 PIPEFRAME remains the KMS sequence source"
+            ),
+            Err(error) => axlog::warn!(
+                "intel-irq: dedicated MSI setup refused/unverified: {error}; display remains \
+                 active with PIPEFRAME and bounded HPD polling"
+            ),
+        },
+        None => axlog::warn!(
+            "intel-irq: PCI ECAM unavailable; display remains active with PIPEFRAME and bounded \
+             HPD polling"
+        ),
+    }
+    match super::audio::after_link_enabled(
+        &adapter.registers,
+        &adapter.timer,
+        port,
+        current_mode.timing.clock_khz,
+        &adapter.sink_edid,
+    ) {
+        Ok(super::audio::LinkAudioStatus::Enabled) => {}
+        Ok(super::audio::LinkAudioStatus::Unavailable(reason)) => {
+            axlog::warn!(
+                "intel-hdmi-audio: initial display remains active, audio is unavailable: {reason}"
+            );
+        }
+        Err(error) => {
+            // Display is already stable. An unknown HDA/ELD state keeps its
+            // own quarantine and does not tear down a working TC scanout.
+            axlog::error!(
+                "intel-hdmi-audio: initial handoff is unverified; display link/power retained: \
+                 {error}"
+            );
+        }
+    }
+    if let Err(error) = device.start_runtime_workers() {
+        axlog::warn!(
+            "intel-hpd: TC connector reconciliation worker unavailable; a later KMS request may \
+             retry: {error:?}"
+        );
+    }
     Ok(format!(
-        "intel-fastboot: native fixed-mode KMS registered {mode:?} {port:?}; firmware \
-         clocks/link/WM retained; pageflip completion requires SURFLIVE and fresh hardware \
-         frames; 未在硬件上验证"
+        "intel-fastboot: TC1/TC2 legacy-HDMI KMS registered preferred={preferred:?} \
+         firmware_mode={:?}; supported_modes={:?}; firmware WM/DDB retained; TC modeset rollback \
+         and pageflip completion require fresh SURFLIVE/hardware frames; 未在硬件上验证",
+        current_mode.kms,
+        adapter
+            .modes
+            .iter()
+            .map(|mode| mode.kms)
+            .collect::<Vec<_>>()
     ))
 }
 
@@ -904,6 +1811,7 @@ mod tests {
         frames: bool,
         writes: usize,
         fail: Option<usize>,
+        fail_offset: Option<u32>,
         stall: bool,
         fail_surface: bool,
     }
@@ -916,6 +1824,9 @@ mod tests {
                 (0x45444, 0x40),
                 (0x45504, 0),
                 (0x70008, 3 << 30),
+                (0x70000, 0),
+                (0x70028, 0),
+                (0x70024, 0),
                 (0x78000, 0),
                 (0x78004, 0),
                 (0x420c0, 0),
@@ -940,11 +1851,13 @@ mod tests {
                 (0x163880, 0),
                 (0x1638a0, 15),
                 (0x4610c, 8 << 28),
+                (0x46140, 6 << 28),
                 (0x164280, 0),
                 (0x51004, 0),
                 (0x46038, 0xcc000000),
                 (0x1010a0, 0x44332211),
-                (0x60200, 0),
+                (0x60200, 1 << 12),
+                (0x650c0, 0),
                 (0x4a480, 0),
                 (0x49028, 0),
                 (0x70034, 0),
@@ -958,6 +1871,20 @@ mod tests {
                 (0x70040, 0),
             ] {
                 words.insert(r, v);
+            }
+            let mut avi_packet = [0u8; 17];
+            avi_packet[0] = 0x82;
+            avi_packet[1] = 2;
+            avi_packet[2] = 13;
+            avi_packet[3] = intel_display::hdmi_packet::hdmi_infoframe_checksum(&avi_packet);
+            let mut avi_raw = [0u8; 32];
+            avi_raw[..3].copy_from_slice(&avi_packet[..3]);
+            avi_raw[4..18].copy_from_slice(&avi_packet[3..]);
+            for (n, bytes) in avi_raw.chunks_exact(4).enumerate() {
+                words.insert(
+                    0x60220 + n as u32 * 4,
+                    u32::from_le_bytes(bytes.try_into().unwrap()),
+                );
             }
             for i in 1..5 {
                 words.insert(0x70180 + i * 0x100, 0);
@@ -1027,6 +1954,7 @@ mod tests {
                     frames: true,
                     writes: 0,
                     fail: None,
+                    fail_offset: None,
                     stall: false,
                     fail_surface: false,
                 })),
@@ -1043,6 +1971,11 @@ mod tests {
         fn read(&self, r: Register) -> Option<u32> {
             let mut s = self.inner.lock();
             let r = r.offset();
+            if r == 0x70000 && s.frames {
+                let line = s.words.get_mut(&r)?;
+                *line = (*line + 100) % 1125;
+                return Some(*line);
+            }
             if r == 0x70040 && s.frames {
                 let v = s.words.get_mut(&r)?;
                 *v = v.wrapping_add(1);
@@ -1058,12 +1991,47 @@ mod tests {
             let mut s = self.inner.lock();
             let r = r.offset();
             s.writes += 1;
-            let fail = s.fail == Some(s.writes) || (r == 0x7019c && s.fail_surface);
+            let fail = s.fail == Some(s.writes)
+                || s.fail_offset == Some(r)
+                || (r == 0x7019c && s.fail_surface);
+            if s.fail_offset == Some(r) {
+                s.fail_offset = None;
+            }
             if r == 0x7019c {
                 s.fail_surface = false;
             }
             s.log.push((r, v));
-            if [0x45404, 0x45454, 0x45444].contains(&r) {
+            if (0x168000..0x169000).contains(&r) {
+                let bank = s.words.get(&0x1010a0).copied().unwrap_or(0) & 15;
+                s.dkl.insert(bank * 0x1000 + r - 0x168000, v);
+            } else if r == 0x46038 {
+                let mut value = v & !((1 << 30) | (1 << 26));
+                if v & (1 << 31) != 0 {
+                    value |= 1 << 30;
+                }
+                if v & (1 << 27) != 0 {
+                    value |= 1 << 26;
+                }
+                s.words.insert(r, value);
+            } else if r == 0x70008 {
+                s.words.insert(
+                    r,
+                    if v & (1 << 31) != 0 {
+                        v | (1 << 30)
+                    } else {
+                        v & !(1 << 30)
+                    },
+                );
+            } else if r == 0x64300 {
+                s.words.insert(
+                    r,
+                    if v & (1 << 31) != 0 {
+                        v & !(1 << 7)
+                    } else {
+                        v | (1 << 7)
+                    },
+                );
+            } else if [0x45404, 0x45454, 0x45444].contains(&r) {
                 let state = s.words[&r] & 0x55555555;
                 s.words.insert(r, (v & 0xaaaaaaaa) | state);
             } else {
@@ -1090,9 +2058,33 @@ mod tests {
     ) {
         let r = Model::new();
         let power = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
-        let firmware = capture(&r, &power, TcPort::Tc1).unwrap();
-        assert_eq!(firmware, capture(&r, &power, TcPort::Tc1).unwrap());
-        let mode = mode(&firmware).unwrap();
+        let firmware = capture(&r, &power, TcPort::Tc1, None).unwrap();
+        assert_eq!(firmware, capture(&r, &power, TcPort::Tc1, None).unwrap());
+        let timing = firmware_timing(&firmware).unwrap();
+        let current_mode = NativeMode {
+            timing,
+            kms: mode(&firmware).unwrap(),
+            vic: 16,
+        };
+        let target_timing = crate::drm::modes::Mode::from_blanking(
+            148_500,
+            64,
+            2135,
+            16,
+            24,
+            64,
+            1061,
+            2,
+            4,
+            crate::drm::modes::ModeFlags::NONE,
+            crate::drm::modes::TimingSource::Firmware,
+        )
+        .with_polarity(timing.hsync_positive, timing.vsync_positive);
+        let target_mode = NativeMode {
+            timing: target_timing,
+            kms: drm_mode(target_timing),
+            vic: 16,
+        };
         let array = super::super::gtt::mock::MockPageTable::new(65536);
         for i in 0..4 {
             array.write(0x200000 / 4096 + i, 0x80000001 + (i as u64) * 4096);
@@ -1103,9 +2095,12 @@ mod tests {
             timer: Timer(Arc::new(AtomicU64::new(0))),
             gtt,
             power,
-            firmware,
+            baseline: firmware.clone(),
+            modes: vec![current_mode, target_mode],
+            preferred: current_mode.kms,
+            sink_edid: Vec::new(),
+            afc_startup: None,
             port: TcPort::Tc1,
-            mode,
             pci: axdriver_display::DisplayPciIdentity {
                 bus: 0,
                 device: 2,
@@ -1116,15 +2111,193 @@ mod tests {
                 subsystem_device: 0,
                 revision: 0,
             },
+            irq_event_sequence: AtomicU32::new(0),
             state: Mutex::new(State {
+                firmware,
+                current_mode,
+                connected: true,
+                last_hpd_poll: 0,
+                last_hpd_irq: None,
+                hpd_good_samples: 0,
+                hpd_bad_samples: 0,
+                irq_fault_reported: false,
+                unsupported_sink_reported: false,
                 current: None,
                 quarantine: Vec::new(),
                 unbound_quarantine: Vec::new(),
                 lost: false,
                 frame_progress: None,
+                counter_epoch: 0,
             }),
         });
         (adapter, r, array)
+    }
+    fn expected_phy(
+        before: &intel_display::tc::DklPhyState,
+        port: TcPort,
+        clock: u32,
+    ) -> intel_display::tc::DklPhyState {
+        intel_display::tc::adlp_tc_dkl_hdmi_expected_phy_state(
+            *before,
+            port,
+            clock,
+            5,
+            intel_display::tc::Wa16011342517::Active,
+        )
+        .unwrap()
+    }
+
+    fn native_4k30_to_1080p60() -> (
+        Arc<Native<Model, Timer>>,
+        Model,
+        super::super::gtt::mock::MockPageTable,
+    ) {
+        let r = Model::new();
+        let pair = |a: u32, b: u32| (a - 1) | ((b - 1) << 16);
+        for (offset, value) in [
+            (0x60000, pair(3840, 4400)),
+            (0x60004, pair(3840, 4400)),
+            (0x60008, pair(4016, 4104)),
+            (0x6000c, pair(2160, 2250)),
+            (0x60010, pair(2160, 2250)),
+            (0x60014, pair(2168, 2178)),
+            (0x6001c, (3839 << 16) | 2159),
+            (0x70190, pair(3840, 2160)),
+            (0x70188, 15_360 / 64),
+        ] {
+            r.set(offset, value);
+        }
+        let baseline_pll =
+            intel_display::dpll_mgr::icl_calc_mg_pll_state(297_000, 24_000, None).unwrap();
+        {
+            let mut model = r.inner.lock();
+            for (offset, value) in [
+                (0x212c, baseline_pll.refclkin_ctl),
+                (0x20d4, baseline_pll.hsclkctl),
+                (0x20d8, baseline_pll.coreclkctl1),
+                (0x2200, baseline_pll.div0),
+                (0x2204, baseline_pll.div1),
+                (0x2210, baseline_pll.ssc),
+                (0x2214, baseline_pll.bias),
+                (0x2218, baseline_pll.tdc_coldst_bias),
+            ] {
+                model.dkl.insert(offset, value);
+            }
+        }
+
+        let power = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
+        let firmware = capture(&r, &power, TcPort::Tc1, None).unwrap();
+        assert_eq!(firmware, capture(&r, &power, TcPort::Tc1, None).unwrap());
+        let current_timing = firmware_timing(&firmware).unwrap();
+        assert_eq!(
+            (
+                current_timing.clock_khz,
+                current_timing.hdisplay,
+                current_timing.htotal
+            ),
+            (297_000, 3840, 4400)
+        );
+        assert_eq!(
+            (
+                firmware.plane.width,
+                firmware.plane.height,
+                firmware.plane.pitch
+            ),
+            (3840, 2160, 15_360)
+        );
+        let current_mode = NativeMode {
+            timing: current_timing,
+            kms: mode(&firmware).unwrap(),
+            vic: 95,
+        };
+        let target_timing = crate::drm::modes::CTA_VIC_TIMINGS
+            .iter()
+            .find(|entry| entry.vic == 16)
+            .unwrap()
+            .mode;
+        let target_mode = NativeMode {
+            timing: target_timing,
+            kms: drm_mode(target_timing),
+            vic: 16,
+        };
+        assert_eq!(
+            (
+                target_timing.clock_khz,
+                target_timing.hdisplay,
+                target_timing.htotal
+            ),
+            (148_500, 1920, 2200)
+        );
+
+        // The old firmware surface has a complete simulated linear-GGTT
+        // backing, not the four-page dummy used by the unrelated tiny fixture.
+        let array = super::super::gtt::mock::MockPageTable::new(65536);
+        for i in 0..firmware.plane.main_size.div_ceil(4096) as usize {
+            array.write(0x200000 / 4096 + i, 0x80000001 + (i as u64) * 4096);
+        }
+        let gtt = Arc::new(Gtt::over(Box::new(array.clone())).unwrap());
+        let adapter = Arc::new(Native {
+            registers: r.clone(),
+            timer: Timer(Arc::new(AtomicU64::new(0))),
+            gtt,
+            power,
+            baseline: firmware.clone(),
+            modes: vec![current_mode, target_mode],
+            preferred: current_mode.kms,
+            sink_edid: Vec::new(),
+            afc_startup: None,
+            port: TcPort::Tc1,
+            pci: axdriver_display::DisplayPciIdentity {
+                bus: 0,
+                device: 2,
+                function: 0,
+                vendor_id: 0x8086,
+                device_id: 0x46d0,
+                subsystem_vendor: 0,
+                subsystem_device: 0,
+                revision: 0,
+            },
+            irq_event_sequence: AtomicU32::new(0),
+            state: Mutex::new(State {
+                firmware,
+                current_mode,
+                connected: true,
+                last_hpd_poll: 0,
+                last_hpd_irq: None,
+                hpd_good_samples: 0,
+                hpd_bad_samples: 0,
+                irq_fault_reported: false,
+                unsupported_sink_reported: false,
+                current: None,
+                quarantine: Vec::new(),
+                unbound_quarantine: Vec::new(),
+                lost: false,
+                frame_progress: None,
+                counter_epoch: 0,
+            }),
+        });
+        (adapter, r, array)
+    }
+    fn edid_with_1080p60_vic16() -> Vec<u8> {
+        let mut edid = crate::drm::intel::gmbus::tests::valid_edid(1).to_vec();
+        let base = edid.get_mut(..128).unwrap();
+        let checksum = base[..127]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        base[127] = 0u8.wrapping_sub(checksum);
+
+        let mut cta = [0u8; 128];
+        cta[0] = 0x02;
+        cta[1] = 0x03;
+        cta[2] = 6; // data block collection ends before the checksum
+        cta[4] = 0x41; // one-entry video data block
+        cta[5] = 16; // 1080p60 VIC 16
+        let checksum = cta[..127]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        cta[127] = 0u8.wrapping_sub(checksum);
+        edid.extend_from_slice(&cta);
+        edid
     }
     fn scanout(a: &Native<Model, Timer>) -> Scanout {
         let backing = a
@@ -1153,9 +2326,65 @@ mod tests {
             offset: 0,
             source_x: 0,
             source_y: 0,
-            mode: a.mode,
+            mode: a.preferred,
             damage: None,
         }
+    }
+    fn scanout_for_full_mode(a: &Native<Model, Timer>, mode: NativeMode) -> Scanout {
+        let width = mode.kms.width;
+        let height = mode.kms.height;
+        let pitch = pitch_for(width).unwrap();
+        let backing_size = u64::from(pitch) * u64::from(height);
+        let backing = a
+            .create_dumb(
+                DumbRequest {
+                    width,
+                    height,
+                    bpp: 32,
+                },
+                pitch,
+                backing_size,
+                Arc::new(()),
+            )
+            .unwrap();
+        Scanout {
+            backing,
+            width,
+            height,
+            pitch,
+            bpp: 32,
+            format: intel_display::universal_plane::XRGB8888,
+            framebuffer_width: width,
+            framebuffer_height: height,
+            backing_size,
+            framebuffer_offset: 0,
+            offset: 0,
+            source_x: 0,
+            source_y: 0,
+            mode: mode.kms,
+            damage: None,
+        }
+    }
+    #[test]
+    fn native_modes_keeps_firmware_preferred_and_filters_unproven_wm_profile() {
+        let (a, ..) = native_4k30_to_1080p60();
+        let edid = edid_with_1080p60_vic16();
+        let (modes, preferred, current) = native_modes(&edid, &a.baseline).unwrap();
+        assert_eq!(current.vic, 95);
+        assert_eq!(
+            preferred, current,
+            "native exposure must not force a cold mode transition"
+        );
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0], current);
+        assert_eq!(modes[1].vic, 16);
+        assert_eq!(modes[1].timing.clock_khz, 148_500);
+
+        let mut unproven_baseline = a.baseline.clone();
+        unproven_baseline.plane.width -= 1;
+        let (modes, preferred, current) = native_modes(&edid, &unproven_baseline).unwrap();
+        assert_eq!(preferred, current);
+        assert_eq!(modes, vec![current], "inadmissible target stays hidden");
     }
     #[test]
     fn already_on_power_pin_refuses_dark_and_recovers_landed_failure() {
@@ -1202,7 +2431,7 @@ mod tests {
         assert!(
             ownership(
                 &a.gtt,
-                &a.firmware,
+                &a.baseline,
                 &boot,
                 0xc0000000,
                 0x80000000..0x90000000,
@@ -1213,7 +2442,7 @@ mod tests {
         assert!(
             ownership(
                 &a.gtt,
-                &a.firmware,
+                &a.baseline,
                 &boot,
                 0xc0000000,
                 0x80000000..0x90000000,
@@ -1224,7 +2453,7 @@ mod tests {
         assert!(
             ownership(
                 &a.gtt,
-                &a.firmware,
+                &a.baseline,
                 &boot,
                 0xd0000000,
                 0x80000000..0x90000000,
@@ -1236,7 +2465,7 @@ mod tests {
         assert!(
             ownership(
                 &a.gtt,
-                &a.firmware,
+                &a.baseline,
                 &boot,
                 0xc0000000,
                 0x80000000..0x90000000,
@@ -1270,6 +2499,310 @@ mod tests {
                 .all(|(r, _)| [0x45404, 0x45454, 0x45444, 0x1010a0, 0x7019c].contains(r))
         );
     }
+
+    #[test]
+    fn tc_modeset_publishes_only_after_full_image_and_fresh_frame_readback() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (probe, probe_registers, _) = native_4k30_to_1080p60();
+        let probe_baseline = probe.state.lock().firmware.clone();
+        let probe_target = probe.modes[1];
+        let initial_audio =
+            super::super::audio::before_link_disable(&probe_registers, &probe.timer, probe.port);
+        assert!(
+            initial_audio.is_ok(),
+            "initial unowned HDA proof: {initial_audio:?}"
+        );
+        let probe_avi = super::super::tc_modeset::avi_words(
+            probe_baseline.hdmi.frames[0].unwrap(),
+            probe_target.vic,
+        )
+        .unwrap();
+        let probe_pll = intel_display::dpll_mgr::icl_calc_mg_pll_state(
+            probe_target.timing.clock_khz,
+            probe_baseline.refclk,
+            None,
+        )
+        .unwrap();
+        let probe_pitch = pitch_for(probe_target.kms.width).unwrap();
+        let probe_surface = probe_baseline.plane.surface();
+        let mut probe_display_writes_started = false;
+        let probe_result = super::super::tc_modeset::program(
+            &probe_registers,
+            &probe.timer,
+            probe.port,
+            &probe_target.timing,
+            probe_pitch,
+            probe_surface,
+            &probe_pll,
+            None,
+            &probe_avi,
+            &[],
+            None,
+            None,
+            true,
+            None,
+            &mut probe_display_writes_started,
+        );
+        assert!(probe_result.is_ok(), "direct TC program: {probe_result:?}");
+        let probe_observed = capture(
+            &probe_registers,
+            &probe.power,
+            probe.port,
+            probe.afc_startup,
+        )
+        .unwrap();
+        assert!(
+            same_mode_state(
+                &probe_observed,
+                &probe.baseline,
+                probe_target,
+                probe_surface,
+                probe_pitch,
+                &probe_pll,
+                probe.port,
+                avi_frame(probe_avi),
+                &expected_phy(
+                    &probe_baseline.phy,
+                    probe.port,
+                    probe_target.timing.clock_khz
+                ),
+            ),
+            "TC readback mismatch: {probe_observed:#?}"
+        );
+        let (a, r, array) = native_4k30_to_1080p60();
+        let target = a.modes[1];
+        assert_eq!(
+            capture(&r, &a.power, a.port, a.afc_startup).unwrap(),
+            a.state.lock().firmware
+        );
+        let result = a.present(scanout_for_full_mode(&a, target));
+        let writes = r.inner.lock().log.clone();
+        let mmio_writes = writes
+            .iter()
+            .filter(|(offset, _)| *offset != 0x1010a0)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            result.is_ok(),
+            "TC modeset error={:?}, lost={}, MMIO={:?}",
+            result.as_ref().err(),
+            a.state.lock().lost,
+            mmio_writes
+        );
+        let done = result.unwrap();
+        assert!(done.is_signaled() && !done.is_failed());
+        let state = a.state.lock();
+        assert_eq!(state.current_mode, target);
+        let surface = u32::try_from(state.current.as_ref().unwrap().binding.address).unwrap();
+        let pitch = target.kms.width * 4;
+        assert!(retained_watermark_budget(&a.baseline, target, pitch));
+        let observed = capture(&r, &a.power, a.port, a.afc_startup).unwrap();
+        assert!(
+            same_mode_state(
+                &observed,
+                &a.baseline,
+                target,
+                surface,
+                pitch,
+                &observed.pll.state,
+                a.port,
+                avi_frame(
+                    super::super::tc_modeset::avi_words(
+                        a.baseline.hdmi.frames[0].unwrap(),
+                        target.vic,
+                    )
+                    .unwrap()
+                ),
+                &expected_phy(&a.baseline.phy, a.port, target.timing.clock_khz),
+            )
+        );
+        assert!(
+            r.inner
+                .lock()
+                .log
+                .iter()
+                .any(|(offset, _)| *offset == 0x46140)
+        );
+        let baseline_pages = a.baseline.plane.main_size.div_ceil(4096) as usize;
+        assert_eq!(array.raw(512), 0x80000001, "first retained firmware PTE");
+        assert_eq!(
+            array.raw(512 + baseline_pages - 1),
+            0x80000001 + ((baseline_pages - 1) as u64) * 4096,
+            "last retained firmware PTE"
+        );
+    }
+
+    #[test]
+    fn landed_tc_clock_select_failure_restores_complete_firmware_modeset_image() {
+        let _context = crate::test_support::scheduler_test_context();
+        for failed_offset in [0x46140, 0x1682c4, 0x1682c8, 0x168d00] {
+            let (a, r, array) = native_4k30_to_1080p60();
+            let initial_audio = super::super::audio::before_link_disable(&r, &a.timer, a.port);
+            assert!(
+                initial_audio.is_ok(),
+                "initial unowned HDA proof: {initial_audio:?}"
+            );
+            let original = a.state.lock().firmware.clone();
+            r.inner.lock().fail_offset = Some(failed_offset);
+            assert_eq!(
+                a.present(scanout_for_full_mode(&a, a.modes[1])).err(),
+                Some(DrmError::Busy)
+            );
+            assert!(!a.state.lock().lost);
+            let state = a.state.lock();
+            assert_eq!(state.current_mode, a.modes[0]);
+            assert!(state.current.is_none());
+            assert!(state.quarantine.is_empty());
+            let old_surface = original.plane.surface();
+            let observed = capture(&r, &a.power, a.port, a.afc_startup).unwrap();
+            assert_eq!(observed.pipe, original.pipe, "pipe");
+            assert_eq!(observed.plane, original.plane, "plane");
+            assert_eq!(observed.ddi, original.ddi, "DDI");
+            assert_eq!(observed.pll, original.pll, "PLL");
+            assert_eq!(observed.phy, original.phy, "PHY");
+            assert_eq!(observed.fia, original.fia, "FIA");
+            assert_eq!(observed.clock, original.clock, "TC clock");
+            assert_eq!(
+                observed.trans_clock, original.trans_clock,
+                "transcoder clock"
+            );
+            assert_eq!(observed.hdmi, original.hdmi, "HDMI packets");
+            assert_eq!(observed.wm, original.wm, "watermarks");
+            assert_eq!(observed.ddb, original.ddb, "DDB");
+            assert_eq!(observed.dbuf, original.dbuf, "DBUF");
+            assert_eq!(observed.color, original.color, "color");
+            assert_eq!(observed.scalers, original.scalers, "scalers");
+            assert_eq!(observed.refclk, original.refclk, "refclk");
+            assert_eq!(observed.pixel_clock, original.pixel_clock, "pixel clock");
+            assert_eq!(observed.afc_startup, original.afc_startup, "AFC");
+            assert!(same_mode_state(
+                &observed,
+                &a.baseline,
+                a.modes[0],
+                old_surface,
+                original.plane.pitch,
+                &original.pll.state,
+                a.port,
+                original.hdmi.frames[0].unwrap(),
+                &original.phy,
+            ));
+            assert_eq!(read(&r, 0x46140), Ok(original.trans_clock));
+            let baseline_pages = original.plane.main_size.div_ceil(4096) as usize;
+            assert_eq!(array.raw(512), 0x80000001);
+            assert_eq!(
+                array.raw(512 + baseline_pages - 1),
+                0x80000001 + ((baseline_pages - 1) as u64) * 4096,
+                "last retained firmware PTE"
+            );
+        }
+    }
+
+    #[test]
+    fn hpd_reports_stable_physical_state_and_keeps_power_when_audio_is_unverified() {
+        let (a, r, _) = native();
+        let mut state = a.state.lock();
+        let mut audio_calls = Vec::new();
+        assert!(
+            hpd_config_transition(&mut state, false, a.preferred, |connected| {
+                audio_calls.push(connected);
+                Ok(())
+            },)
+            .is_none()
+        );
+        assert!(audio_calls.is_empty(), "one bad EDID sample is not stable");
+        assert!(state.connected);
+
+        // The two-sample unplug still reaches KMS even when HDA retirement
+        // cannot be proven. Audio remains quarantined by its hook, while the
+        // display state stays live enough to finish accepted frame retirement.
+        let (disconnected, disconnect_audio_error) =
+            hpd_config_transition(&mut state, false, a.preferred, |connected| {
+                audio_calls.push(connected);
+                Err(String::from("HDA stop not proven"))
+            })
+            .unwrap();
+        assert_eq!(audio_calls, vec![false]);
+        assert!(!disconnected.connected);
+        assert_eq!(
+            disconnect_audio_error.as_deref(),
+            Some("HDA stop not proven")
+        );
+        assert!(!state.connected && !state.lost);
+
+        // A stable reconnect is likewise reported even when HDA cannot be
+        // re-enabled; video remains connected and the audio error is distinct.
+        assert!(hpd_config_transition(&mut state, true, a.preferred, |_| Ok(()),).is_none());
+        let (reconnected, reconnect_audio_error) =
+            hpd_config_transition(&mut state, true, a.preferred, |connected| {
+                audio_calls.push(connected);
+                Err(String::from("HDA route quarantined"))
+            })
+            .unwrap();
+        assert_eq!(audio_calls, vec![false, true]);
+        assert!(reconnected.connected);
+        assert_eq!(
+            reconnect_audio_error.as_deref(),
+            Some("HDA route quarantined")
+        );
+        assert!(state.connected && !state.lost);
+        drop(state);
+        assert!(a.power.held(&r).is_ok());
+    }
+
+    #[test]
+    fn modeset_counter_epoch_rebases_without_manufacturing_vblank_events() {
+        let _context = crate::test_support::scheduler_test_context();
+        let (a, r, _) = native_4k30_to_1080p60();
+        let dev = crate::drm::DrmDevice::new(a.clone(), 1, 2, 3, 4);
+        let target_scanout = scanout_for_full_mode(&a, a.modes[1]);
+        // Check preflight exhaustion on the outgoing 4K->1080 transition;
+        // reusing this full-size target avoids an unrelated second 32MiB
+        // allocation in the bounded host physical-memory test pool.
+        a.state.lock().counter_epoch = u64::MAX;
+        let writes = r.inner.lock().writes;
+        assert_eq!(
+            a.present(target_scanout.clone()).err(),
+            Some(DrmError::Overflow)
+        );
+        assert_eq!(r.inner.lock().writes, writes);
+        a.state.lock().counter_epoch = 0;
+        r.set(0x70040, 100);
+        dev.advance_vblank().unwrap();
+        dev.advance_vblank().unwrap();
+        let sequence = dev.vblank_sequence();
+        assert_eq!(sequence, 1);
+        a.present(target_scanout).unwrap();
+        assert_eq!(a.state.lock().counter_epoch, 1);
+        // Model the pipe's reset counter, not an IRQ-count substitution.
+        r.set(0x70040, 0);
+        dev.advance_vblank().unwrap();
+        assert_eq!(
+            dev.vblank_sequence(),
+            sequence,
+            "new epoch is only a baseline"
+        );
+        dev.advance_vblank().unwrap();
+        assert_eq!(
+            dev.vblank_sequence(),
+            sequence + 1,
+            "one fresh hardware frame"
+        );
+    }
+
+    #[test]
+    fn hpd_irq_is_only_a_hint_and_each_edid_sample_keeps_250ms_debounce() {
+        assert!(!hpd_probe_due(249_999, 0, None));
+        assert!(hpd_probe_due(250_000, 0, None));
+        // A recent IRQ delays a probe even if the periodic timer just elapsed;
+        // repeated notifications restart the quiet interval.
+        assert!(!hpd_probe_due(250_000, 0, Some(249_999)));
+        assert!(!hpd_probe_due(500_000, 0, Some(250_001)));
+        assert!(hpd_probe_due(500_001, 0, Some(250_001)));
+        // After the first sample, a second confirmation cannot happen early.
+        assert!(!hpd_probe_due(499_999, 250_000, None));
+        assert!(hpd_probe_due(500_000, 250_000, None));
+    }
+
     #[test]
     fn stopped_frame_never_signals_success_and_keeps_dma_quarantined() {
         let _context = crate::test_support::scheduler_test_context();
@@ -1357,7 +2890,7 @@ mod tests {
                     value: 64,
                 },
             ],
-            Some(a.mode),
+            Some(a.preferred),
             Some(17),
             true,
         )

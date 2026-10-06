@@ -848,3 +848,51 @@ this does not itself open general Mesa batches or establish GPU execution.
   and x86 PTE conversion. Linux7.2.3 x86 PAT initialization is a behavior
   reference only; no GPL source body was copied. Opt-in/all-CPU proof and
   immutable WC/UC/WB VMA types preserve the default and ownership boundaries.
+- HDMI audio C-oracle declarations add5 normalized matches at25 and2 at40
+  (ARRAY_SIZE, DIV_ROUND_UP, min and2 structure member declarations). Current
+  crates/ax counts:25=(18,15,4,124,113,0,0),40=(0,0,0,93,86,0,0); other
+  scopes unchanged. Combined Intel display+GT test shim counts96/78. These
+  are reconciled in NOTICE/baseline; no source/scanner exemptions introduced.
+
+- Powered TC legacy-HDMI modeset: dpll_mgr.rs adds source dkl_pll_write;
+  kernel tc_modeset.rs ports Linux7.2.3 MIT intel_ddi.c transcoder clock/
+  function/buffer enable-disable, intel_display.c timing/pipe and
+  skl_universal_plane.c primary arm (Intel2006–2022). Existing fastboot owns
+  exact original-image restoration, power and DMA lifetime. No GPL body,
+  cold-TC/PCODE/CDCLK or new WM computation was imported. Grant: display
+  LICENSE-MIT, function inventory in display NOTICE and module header.
+
+- HDMI audio: tk-intel-display/audio.rs translates Linux7.2.3 MIT
+  intel_audio.c clock/N/M-CTS and HSW/DDI enable/disable plus drm_edid.c ELD
+  assembly; full attribution/grant in header and display NOTICE/LICENSE-MIT.
+  CTA validation and kernel audio.rs/HDA integration are original adapters.
+  sound/hda/codecs/hdmi/intelhdmi.c (GPL) is a behavior/register-topology
+  reference only: no GPL implementation body copied into the Apache HDA crate.
+
+- Preserved-WM profile admission is an original conservative predicate, not
+  new PCODE/latency policy. The independent temporary C oracle uses unchanged
+  Linux7.2.3 MIT skl_compute_wm_params/skl_compute_plane_wm and intel_fixed.h
+  arithmetic for exact linear-XRGB4K30->1080p60. At258 normal latencies
+  target block/line/minimum-DDB demand is no worse; the same-profile method2
+  argument covers SAGV equal latencies. Actual latency is not guessed/read.
+  Conventional WM oracle shims add5 code matches at25 and2 at40; current
+  crates/ax totals25=(18,15,4,129,118,0,0),40=(0,0,0,95,88,0,0).
+  Combined Intel display+GT inventory101/80, with no scanner exemptions.
+
+- Powered TC HDMI signal programming: tc.rs ports Linux7.2.3 MIT
+  intel_ddi.c::tgl_dkl_phy_set_signal_levels and intel_ddi_level with
+  intel_ddi_buf_trans.c::_tgl_dkl_phy_trans_hdmi, selected ADL-P HDMI branch
+  (Intel2012/2019/2020; full grant in display LICENSE-MIT). N305 D0 matches
+  intel_display_wa.c Wa_16011342517 applicability. The literal source RMW
+  set argument1 at594MHz is preserved, not reinterpreted as bit12. Native
+  target clocks148500/297000 use the source0 branch and VBT level5.
+  The source helper is called before DDI_BUF enable; complete expected-PHY
+  readback and original8-word/HIP restoration feed the existing transaction.
+
+- Native display IRQ/PCI adapter (kernel intel/irq.rs, pci.rs): original MIT
+  Rust around existing MSI/WaitQueue facilities, using Linux7.2.3 MIT
+  intel_display_irq.c / intel_hotplug_irq.c source masks, W1C/selected-pin
+  behavior and register layouts. Function inventory/boundary in irq.rs header.
+  GPL i915_irq.c master dispatcher is behavior-only, not copied. Hardware
+  counter epochs adapt source intel_crtc_vblank_off/on behavior to existing
+  KMS; no GPL DRM core body imported. No new firmware binary added.

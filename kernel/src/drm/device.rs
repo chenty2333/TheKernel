@@ -27,6 +27,24 @@ use super::{
 
 pub type DrmResult<T> = Result<T, DrmError>;
 
+/// Why the display's bounded vblank wait returned. An IRQ is only a hint:
+/// native adapters still sample their physical frame counter before advancing
+/// the KMS sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VblankWake {
+    Timeout,
+    Interrupt,
+}
+
+/// Existing timer-backed cadence for adapters without an IRQ wait source.
+pub(crate) fn wait_vblank_timer(delay: Duration) -> Option<VblankWake> {
+    matches!(
+        axtask::future::block_on(axtask::future::sleep(delay)),
+        Ok(Ok(()))
+    )
+    .then_some(VblankWake::Timeout)
+}
+
 /// Read-only accounting exported through the graphics debug endpoint.  Values
 /// are deliberately object/queue counts, never transport completion records:
 /// sampling them must not consume or otherwise change GPU progress.
@@ -121,6 +139,28 @@ pub trait DisplayAdapter: Send + Sync {
     fn fixed_mode(&self) -> Option<Mode> {
         None
     }
+    /// Exact modes this adapter can actually commit. The default preserves
+    /// existing one-mode adapters; native display adapters may expose a
+    /// bounded, prevalidated mode set.
+    fn supported_modes(&self) -> Vec<Mode> {
+        alloc::vec![self.preferred_mode()]
+    }
+    /// Whether a requested mode has passed this adapter's source-specific
+    /// timing admission. Virtual adapters may construct a fresh display mode
+    /// at commit time; native hardware adapters override this with their
+    /// prevalidated finite set.
+    fn mode_is_supported(&self, _mode: Mode) -> bool {
+        true
+    }
+    /// Physical sink state sampled before KMS resources are published.
+    fn connector_connected(&self) -> bool {
+        true
+    }
+    /// A physical connector's validated EDID. `None` keeps the synthetic
+    /// adapter EDID used by virtual displays.
+    fn connector_edid(&self) -> Option<Vec<u8>> {
+        None
+    }
     fn supports_cursor(&self) -> bool {
         true
     }
@@ -147,7 +187,9 @@ pub trait DisplayAdapter: Send + Sync {
     /// Native adapters report a hardware frame counter. `None` retains the
     /// existing virtual/software cadence; a stationary native counter must not
     /// manufacture vblank events or complete an atomic commit.
-    fn hardware_vblank_counter(&self) -> DrmResult<Option<u32>> {
+    /// Stable hardware epoch and count. A modeset counter reset advances the
+    /// epoch; consumers must establish its baseline without inventing frames.
+    fn hardware_vblank_counter(&self) -> DrmResult<Option<(u64, u32)>> {
         Ok(None)
     }
     /// A lock-bounded snapshot. Implementations must not drain queues or
@@ -168,6 +210,11 @@ pub trait DisplayAdapter: Send + Sync {
     }
     fn display_config_changed(&self) -> DrmResult<Option<DisplayConfig>> {
         Ok(None)
+    }
+    /// Wait until either a vblank hint arrives or the bounded polling timeout
+    /// expires. Implementations must not advance KMS state from IRQ context.
+    fn wait_vblank_hint(&self, delay: Duration) -> Option<VblankWake> {
+        wait_vblank_timer(delay)
     }
     fn preferred_mode(&self) -> Mode {
         Mode {
@@ -271,7 +318,7 @@ pub(crate) struct DeviceState {
     pub(crate) framebuffers: BTreeMap<FramebufferId, Framebuffer>,
     pub(crate) next_framebuffer: FramebufferId,
     pub(crate) vblank: u64,
-    hardware_vblank: Option<u32>,
+    hardware_vblank: Option<(u64, u32)>,
     /// One software gamma LUT for the sole virtual CRTC, stored as RGB
     /// triplets in the legacy DRM 16-bit component representation.
     pub(crate) gamma_lut: Vec<u16>,
@@ -366,12 +413,33 @@ impl DrmDevice {
     ) -> Arc<Self> {
         let preferred_mode = adapter.preferred_mode();
         let fixed_mode = adapter.fixed_mode();
+        let mut modes = adapter.supported_modes();
+        if !modes.contains(&preferred_mode) {
+            modes.insert(0, preferred_mode);
+        } else if modes.first() != Some(&preferred_mode) {
+            if let Some(index) = modes.iter().position(|mode| *mode == preferred_mode) {
+                let preferred = modes.remove(index);
+                modes.insert(0, preferred);
+            }
+        }
+        if let Some(fixed) = fixed_mode {
+            modes.clear();
+            modes.push(fixed);
+        }
+        let connected = adapter.connector_connected();
+        let edid = adapter
+            .connector_edid()
+            .unwrap_or_else(|| default_edid(preferred_mode));
+        let edid = if edid.len() >= 128 {
+            edid
+        } else {
+            default_edid(preferred_mode)
+        };
         let cursor_plane_id = if adapter.supports_cursor() {
             primary_plane_id.checked_add(1).unwrap_or(primary_plane_id)
         } else {
             0
         };
-        let edid = default_edid(preferred_mode);
         Arc::new(Self {
             adapter,
             fixed_mode,
@@ -385,7 +453,7 @@ impl DrmDevice {
                 resources: KmsResources {
                     connector: super::kms::ConnectorInfo {
                         id: connector_id,
-                        connected: true,
+                        connected,
                         edid_blob: 1,
                     },
                     encoder_id,
@@ -397,7 +465,7 @@ impl DrmDevice {
                     primary_plane_id,
                     cursor_plane_id,
                     preferred_mode,
-                    modes: alloc::vec![preferred_mode],
+                    modes: if connected { modes.clone() } else { Vec::new() },
                 },
                 framebuffers: BTreeMap::new(),
                 next_framebuffer: 1,
@@ -424,7 +492,7 @@ impl DrmDevice {
                 atomic: super::atomic::initial(&KmsResources {
                     connector: super::kms::ConnectorInfo {
                         id: connector_id,
-                        connected: true,
+                        connected,
                         edid_blob: 1,
                     },
                     encoder_id,
@@ -436,13 +504,13 @@ impl DrmDevice {
                     primary_plane_id,
                     cursor_plane_id,
                     preferred_mode,
-                    modes: alloc::vec![preferred_mode],
+                    modes: if connected { modes.clone() } else { Vec::new() },
                 }),
                 atomic_owner: None,
                 atomic_tail: super::atomic::initial(&KmsResources {
                     connector: super::kms::ConnectorInfo {
                         id: connector_id,
-                        connected: true,
+                        connected,
                         edid_blob: 1,
                     },
                     encoder_id,
@@ -454,7 +522,7 @@ impl DrmDevice {
                     primary_plane_id,
                     cursor_plane_id,
                     preferred_mode,
-                    modes: alloc::vec![preferred_mode],
+                    modes: if connected { modes } else { Vec::new() },
                 }),
                 atomic_generation: 0,
                 atomic_generation_poisoned: false,
@@ -941,6 +1009,13 @@ impl DrmDevice {
         }
     }
 
+    /// Start the hardware-cadence worker before userspace submits its first
+    /// flip. Native adapters also use its task context for bounded connector
+    /// status reconciliation; they never poll GMBUS from interrupt context.
+    pub(crate) fn start_runtime_workers(self: &Arc<Self>) -> DrmResult<()> {
+        self.ensure_vblank_worker()
+    }
+
     /// Returns whether this vblank made the job terminal.  A successful host
     /// present is intentionally observed on the first following vblank, not
     /// in the transport completion context.
@@ -1205,13 +1280,14 @@ fn vblank_worker(device: Arc<DrmDevice>) {
             .refresh_millihz
             .max(1);
         let delay = Duration::from_nanos(1_000_000_000_000u64 / u64::from(refresh));
-        if !matches!(
-            axtask::future::block_on(axtask::future::sleep(delay)),
-            Ok(Ok(()))
-        ) {
+        // A native MSI may wake this synchronous worker early, but
+        // `advance_vblank` still samples PIPEFRAME before advancing DRM
+        // sequence or completing an accepted commit. Timer expiry is the
+        // fallback when that IRQ owner is unavailable or faulted.
+        let Some(_wake) = device.adapter.wait_vblank_hint(delay) else {
             device.worker_failed();
             return;
-        }
+        };
         match device.advance_vblank() {
             Err(DrmError::DeviceLost) => return,
             Err(_) => device.cancel_pending_commits(),
@@ -1247,7 +1323,13 @@ impl DrmDevice {
                 let Some(previous) = previous else {
                     return Ok(());
                 };
-                let delta = counter.wrapping_sub(previous);
+                // Pipe disable/re-enable (including a recovered modeset) can
+                // reset the hardware counter. Rebase an explicitly published
+                // epoch rather than treating that reset as billions of frames.
+                if counter.0 != previous.0 {
+                    return Ok(());
+                }
+                let delta = counter.1.wrapping_sub(previous.1);
                 if delta == 0 {
                     return Ok(());
                 }
@@ -1350,12 +1432,40 @@ impl DrmDevice {
         };
         let stale = {
             let mut state = self.state.lock();
-            let modes = config.mode.into_iter().collect::<Vec<_>>();
+            let modes = if config.connected {
+                let preferred = config.mode.ok_or(DrmError::Invalid)?;
+                let mut modes = self.adapter.supported_modes();
+                if let Some(index) = modes.iter().position(|mode| *mode == preferred) {
+                    let preferred = modes.remove(index);
+                    modes.insert(0, preferred);
+                } else {
+                    // Dynamic/virtual adapters often expose only their
+                    // current mode through DisplayConfig. Retain that behavior
+                    // unless their bounded mode list actually contains it.
+                    modes.clear();
+                    modes.push(preferred);
+                }
+                modes
+            } else {
+                Vec::new()
+            };
             if config.connected && modes.is_empty() {
                 return Err(DrmError::Invalid);
             }
+            let edid = self
+                .adapter
+                .connector_edid()
+                .filter(|edid| edid.len() >= 128)
+                .unwrap_or_else(|| {
+                    default_edid(config.mode.unwrap_or(state.resources.preferred_mode))
+                });
+            let current_edid = state
+                .property_blobs
+                .get(&state.resources.connector.edid_blob)
+                .map(|blob| blob.bytes.as_slice());
             let unchanged = state.resources.connector.connected == config.connected
-                && state.resources.modes == modes;
+                && state.resources.modes == modes
+                && current_edid == Some(edid.as_slice());
             if unchanged {
                 return Ok(());
             }
@@ -1364,7 +1474,7 @@ impl DrmDevice {
                 state.resources.preferred_mode = mode;
             }
             state.resources.modes = modes;
-            replace_connector_edid(&mut state)?;
+            replace_connector_edid_bytes(&mut state, edid)?;
             state.advance_atomic_generation()?;
             if config.connected {
                 // Accepted flips still own a completion event and may already
@@ -1591,13 +1701,18 @@ fn default_edid(mode: Mode) -> Vec<u8> {
 }
 
 fn replace_connector_edid(state: &mut DeviceState) -> DrmResult<()> {
+    let edid = default_edid(state.resources.preferred_mode);
+    replace_connector_edid_bytes(state, edid)
+}
+
+fn replace_connector_edid_bytes(state: &mut DeviceState, edid: Vec<u8>) -> DrmResult<()> {
     let id = state.next_property_blob;
     state.next_property_blob = id.checked_add(1).ok_or(DrmError::Overflow)?;
     state.property_blobs.insert(
         id,
         PropertyBlob {
             owner: None,
-            bytes: default_edid(state.resources.preferred_mode),
+            bytes: edid,
             // The connector owns this immutable blob until it is replaced.
             references: 1,
             destroyed: true,
@@ -2042,8 +2157,19 @@ mod tests {
         struct ChangingAdapter {
             change: Mutex<Option<DisplayConfig>>,
             present: Arc<Fence>,
+            modes: Vec<Mode>,
+            edid: Vec<u8>,
         }
         impl DisplayAdapter for ChangingAdapter {
+            fn preferred_mode(&self) -> Mode {
+                self.modes[0]
+            }
+            fn supported_modes(&self) -> Vec<Mode> {
+                self.modes.clone()
+            }
+            fn connector_edid(&self) -> Option<Vec<u8>> {
+                Some(self.edid.clone())
+            }
             fn create_dumb(
                 &self,
                 _: DumbRequest,
@@ -2061,14 +2187,26 @@ mod tests {
             }
         }
 
+        let old_mode = Mode {
+            width: 1280,
+            height: 720,
+            refresh_millihz: 60_000,
+        };
+        let new_mode = Mode {
+            width: 1536,
+            height: 800,
+            refresh_millihz: 60_000,
+        };
+        let edid = default_edid(old_mode);
         let adapter = Arc::new(ChangingAdapter {
             change: Mutex::new(None),
             present: Fence::new(false),
+            modes: alloc::vec![old_mode, new_mode],
+            edid: edid.clone(),
         });
         let device = DrmDevice::new(adapter.clone(), 1, 2, 3, 4);
         let file = device.open_fbdev_primary();
         file.become_master().unwrap();
-        let old_mode = device.state.lock().resources.preferred_mode;
         let dumb = file
             .create_dumb(DumbRequest {
                 width: old_mode.width,
@@ -2108,11 +2246,6 @@ mod tests {
 
         // A host-window resize changes the preferred mode while the old-mode
         // flip is already accepted and its host presentation is in flight.
-        let new_mode = Mode {
-            width: 1536,
-            height: 800,
-            refresh_millihz: 60_000,
-        };
         *adapter.change.lock() = Some(DisplayConfig {
             connected: true,
             mode: Some(new_mode),
@@ -2137,8 +2270,13 @@ mod tests {
         assert!(tail_after_hint.active);
         let state = device.state.lock();
         assert_eq!(state.resources.preferred_mode, new_mode);
+        assert_eq!(state.resources.modes, alloc::vec![new_mode, old_mode]);
         assert_eq!(state.resources.crtc.mode, Some(old_mode));
         assert_eq!(state.resources.crtc.framebuffer, Some(next.fb));
+        assert_eq!(
+            state.property_blobs[&state.resources.connector.edid_blob].bytes,
+            edid
+        );
         assert!(state.pending_commits.is_empty());
         assert!(state.pending_fb_pins.is_empty());
         let generation = state.atomic_generation;
@@ -2170,8 +2308,25 @@ mod tests {
         assert!(cancelled.is_failed());
         let state = device.state.lock();
         assert!(!state.resources.connector.connected);
+        assert!(state.resources.modes.is_empty());
         assert!(state.pending_commits.is_empty());
         assert!(state.pending_fb_pins.is_empty());
+        drop(state);
+
+        // Reconnect restores every adapter-admitted mode (rather than only
+        // the preferred mode hint) and republishes the physical sink EDID.
+        *adapter.change.lock() = Some(DisplayConfig {
+            connected: true,
+            mode: Some(new_mode),
+        });
+        device.advance_vblank().unwrap();
+        let state = device.state.lock();
+        assert!(state.resources.connector.connected);
+        assert_eq!(state.resources.modes, alloc::vec![new_mode, old_mode]);
+        assert_eq!(
+            state.property_blobs[&state.resources.connector.edid_blob].bytes,
+            edid
+        );
     }
 
     #[test]

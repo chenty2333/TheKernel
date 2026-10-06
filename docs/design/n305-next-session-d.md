@@ -2,7 +2,7 @@
 
 2026-10-05。**全部未在硬件上验证；这一轮不启动真机、PXE服务或写USB/NVMe。**
 下面是未来用户执行的步骤，不是已验证结果。受限 TC1/TC2 固件等价 fastboot/KMS
-调用链已接通并做主机模型测试；TC 模式重编程、RCS/Mesa、HDMI audio 仍未实现；GT BCS 软件链见下。
+调用链已接通并做主机模型测试；已接通受限 TC 模式重编程、RCS/iris 提交和 HDMI audio 软件链；真实 Mesa 初始化、像素及声音仍未验收。
 
 ## 基线和板级资料
 
@@ -36,30 +36,30 @@ ASLS/VBT、PLL/PHY/pipe/plane/WM；不会把旧 Linux capture 当本次固件状
    KMS/atomic fence 要在 SURFLIVE 和后续新硬件帧后完成，不能只看 ioctl=0。
    关闭 Weston/返回文字 VT，确认既有 fbdev atomic restore/repaint 返回可读
    console。此步骤不证明 iris/ANV/GPU渲染。
-4. DPMS、gamma、cursor、缩放、不同 pitch/格式/模式请求目前应返回不支持，
-   不能出现成功返回却没有实际效果。HPD IRQ 和真正中断时间戳尚未接通；
-   当前 vblank 是任务轮询硬件帧计数，不制造软件帧。
+4. DPMS、gamma、cursor、缩放、非目标 pitch/格式/模式请求目前应返回不支持，
+   不能出现成功返回却没有实际效果。专用 MSI 仅在源/PCI原状态可完整归属时接通，拒绝时回退轮询。
+   IRQ唤醒任务，KMS仍用硬件帧计数与模式epoch，不制造软件帧；时间戳
+   仍为任务观察值，不宣称ISR时间戳。验证插拔同一显示器的connector变化、
+   新EDID则明确拒绝；IRQ源故障保留callback/vector/window并回退。
 5. fastboot 不使用 combo-only 的 `intel.modeset.fail_write` 注入参数，带此
    参数会在写之前拒绝。当前失败恢复已在主机模型验证：plane store 可能
    已落地，恢复前一 surface 并看到 fresh frame 后才释放新 GGTT；恢复不确定
    则保留 DMA owners 并终止后续提交。真机故障注入入口尚未开放，不强行用
    旧参数测试 TC。观察画面是未来真机回滚验收的必要部分。
 
-## TC1 原生模式与失败恢复（实现前不执行）
+## TC1/TC2 原生模式与失败恢复（软件已接通，未在硬件上验证）
 
-TC hidden PHY/PLL/power before-image完整、故障前缀模型测试和bounded恢复
-通过以后，才允许用户以 `intel.modeset=1` 请求1080p60。预期是模式切换到
-1920x1080、native测试图案及清晰持续更新的console，无长期黑屏/花屏/underrun。
-新状态通过实际 SURFLIVE/scanline 和完整 register/GGTT 证明后才能发布给DRM。
-用未修改Weston DRM后端检验connector/CRTC/plane、TEST_ONLY、真实atomic
-commit/pageflip/fence；当前固定帧缓冲CPU拷贝adapter不计Intel nativeatomic。
+仅本次固件已供电并持有所有权的 legacy HDMI 可接管。确认 connector
+公布固件 exact timing 和经 EDID、PLL、CDCLK、保留 WM/DDB 容量验证的
+1080p60；未公布的模式必须拒绝。用 Weston/atomic 请求1080p60，检查
+实际分辨率、持续翻页、SURFLIVE/fresh hardware frame、清晰 console，
+再切回固件模式。不是固定帧缓冲 CPU 拷贝测试。
 
-用户确认后再做一次性失败注入。先 `intel.modeset.fail_write=1`，再按实际
-报告的forwardwrite数选择晚期前缀；超出末次写不会触发失败。屏幕应恢复
-启动前的固件模式、pitch/plane/surface并继续刷文字。`ROLLBACK_MMIO_VERIFIED`
-只证明寄存器/GGTT/scanline契约，必须再看monitor像素。`ROLLBACK_FAILED` 或
-无进展要停止后续尝试、保留DMAowners，不能当恢复成功。TC版本不能直接
-复用只懂combo的旧snapshot，必要的间接PHYselector/analog不可当普通RAM回放。
+冷端口/未知所有权、不同显示器、需要新 CDCLK/PCODE/WM 策略的模式
+仍拒绝；不要用旧 combo fail_write 参数，它在 TC 写前拒绝。TC 失败
+前缀已做模型验证，未来硬件注入必须另经授权：原 AVI、PLL/PHY、
+plane/timing/GGTT 完整恢复且 fresh frame 后才释放候选页。无法证明
+退休时保留 DMA 和电源，禁止继续写；读回正确仍需用户看实际画面。
 
 ## GT 和 HDMI 音频（各自依赖实现门槛）
 
@@ -72,14 +72,14 @@ commit/pageflip/fence；当前固定帧缓冲CPU拷贝adapter不计Intel nativea
   RCS/Mesa rendering。主机模型成功不能代替该真机验收。失败时有 bounded
   timeout/reset，无法证明退休则保留全部 DMA owners、禁止再提交；确认 console
   持续可读。当前没有开放真机故障注入，不使用旧 display fail_write 参数。
-  GEM/submit/binary-sync 软件链已接通，仅支持受限 linear BCS/no-reloc/default context；
+  GEM/submit/binary/timeline/sync-file、持久 VM/上下文和标准多 BO softpin 链已接通；
   真实用户程序尚未验收。图形镜像现在包含 `intel-bcs-smoke`，未来用户显式运行
   `intel-bcs-smoke --execute /dev/dri/renderD128`，只有真实 ioctl 提交、16384 字节
   readback、binary syncobj wait 和 mmap-after-close 全通过才出现用户态成功标记。
   本轮只编译及测试无参数拒绝入口，未打开主机 DRM。之后分别测试 RCS/iris/ANV。
   N305 GuC 应是 tgl 系列，不是 adlp_guc；display D0 不等于 GT/media A0。
-- HDMI audio依赖实际TC link、audio powerwell、ELD和HDAcomponent握手。现在
-  尚未接入，不把模拟ELD/analogcodec枚举当HDMI音频通过。将来跟modesetopt-in
+- HDMI audio依赖实际TC link、audio powerwell、ELD和HDAcomponent握手。现已
+  接入软件链，不把模拟ELD/analogcodec枚举当HDMI音频通过。跟modesetopt-in
   开启，验证显示器audio能力/ELD、HDA HDMI pin/converter、48kHz双声道真实
   输出、静音/停止/拔线的生命周期；拔线或回滚要先撤掉audio valid，再安全
   停止DMA。当前HDA模拟音频不得为了让程序exit0而冒充HDMIcodec。
@@ -103,8 +103,8 @@ QUERY, then creates a per-file context and submits through that context. Native
 fuse topology/CS clock are available through GETPARAM/QUERY only after successful
 GT admission; missing facts fail rather than returning the product specification.
 This remains a bounded acceptance client, not evidence that Mesa initializes or
-executes. No default-state context isolation, shared user VM or general shader
-batch capability is currently advertised.
+executes. Default-state isolation requires successful native capture; shared user VM and
+nonprivileged standard softpin batches are now implemented, not hardware verified.
 
 GT cache-policy preflight now reads actual media disable fuses and pins only
 present VCS0/VCS2/VECS0 wake domains. A busy ring/lost ACK/unavailable mapping
@@ -122,14 +122,15 @@ are not a native GPU or Mesa acceptance result.
 The explicit BCS/RCS client now also requires CLOEXEC output sync_files, terminal
 POLLIN and a second submission using the first descriptor as FENCE_IN, with
 fresh timeline point2. This transport is compiled/model-verified only. The
-current synchronous, immutable-job adapter is not general iris submission.
+current execution remains bounded synchronous; standard iris softpin admission
+now uses the same fence transport rather than the fixed startup shader.
 
 The explicit acceptance client now creates a real VM and attaches it through
 CREATE_EXT/SETPARAM, then destroys the VM ID before its two jobs; success requires
 retained page-table ownership. This is not saved-context/general-Mesa proof.
 The same Mesa26.1.2 iris runtime is built in the Intel state's mesa-iris-stage.
 Use intel-mesa-smoke --initialize NODE and --execute NODE as distinct acceptance
-steps only after the remaining general-submission/context path is implemented.
+steps with the implemented general-submission/context path.
 Neither marker has been measured; default graphics images still use virgl or
 software and their success cannot substitute for these native checks.
 
@@ -138,5 +139,14 @@ and scoped retirement before RCS shader selftest. Context-isolation class bits
 are conditional on successful native capture, never product labels or models.
 Per-slot state storage is source/model-verified only; actual repeated-context
 state saving/restoration and default captures remain physical acceptance items.
-General Mesa submission/residency is still unfinished, so do not infer iris
-initialization/pixels from minimal RCS or these new software tests.
+General Mesa submission/residency is software implemented. Do not infer iris
+initialization/pixels from minimal RCS or these software tests. First run
+--initialize separately, then --execute; require the real Intel renderer and
+triangle readback, never software fallback. --softpin-execute additionally
+checks high-address BCS objects through standard batch-first/handle-LUT ABI.
+
+HDMI音频软件链已接通。未来单独验收 sink ELD、TC1/TC2各自确认过的
+HDA数字pin/converter、48kHz双声道可听波形，以及拔线/停止/模式回滚时
+先撤ELD再安全退休DMA。不能把模拟器analog播放或源C时序对照当HDMI声音。
+冷/unowned TC、不同sink、新CDCLK/WM策略及非目标格式仍明确拒绝；
+DMC/GuC保持可选，不是当前软件调用链前置。

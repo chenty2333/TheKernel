@@ -81,23 +81,25 @@
 //! register reads that write nothing, and every expensive step happens in task
 //! context after the read.
 
+mod audio;
 mod clk;
 mod connect;
-mod dma;
 pub(crate) mod debugfs;
-pub(crate) mod fb;
+mod dma;
 mod fastboot;
+pub(crate) mod fb;
 mod firmware_scanout;
 mod firmware_snapshot;
-mod gmbus;
-mod gt_probe;
-mod gt;
-pub(super) mod gem_exec;
 pub(super) mod gem_context;
+pub(super) mod gem_exec;
+mod gmbus;
+mod gt;
+mod gt_probe;
 pub(crate) mod gtt;
 mod hpd;
-mod id;
 mod i915_port;
+mod id;
+mod irq;
 mod modeset;
 mod output;
 mod pattern;
@@ -112,14 +114,15 @@ mod rollback;
 pub(crate) mod scanout;
 mod sink;
 mod swing;
+mod tc_modeset;
 mod timing;
 
 #[cfg(test)]
 mod testbus;
 
-use alloc::{string::String, vec::Vec};
 #[cfg(target_os = "none")]
 use alloc::sync::Arc;
+use alloc::{string::String, vec::Vec};
 
 use spin::Mutex;
 
@@ -226,6 +229,9 @@ static HOTPLUG: Mutex<Option<HotplugWatch>> = Mutex::new(None);
 /// boot log scrolls away.  A run that did not happen, and a run that failed,
 /// both leave their reason here rather than leaving the file silent about it.
 static MODESET: Mutex<Option<String>> = Mutex::new(None);
+/// Serializes the shared ADL-P HIP selector across firmware readout, PLL
+/// programming and the optional display-audio register handoff.
+pub(super) static DKL_ACCESS_LOCK: Mutex<()> = Mutex::new(());
 static GT_REPORT: Mutex<Vec<(pci::Bdf, String)>> = Mutex::new(Vec::new());
 static FIRMWARE_STATE: Mutex<Vec<(pci::Bdf, firmware_snapshot::Snapshot)>> = Mutex::new(Vec::new());
 
@@ -372,24 +378,29 @@ fn shared_ggtt(bdf: pci::Bdf) -> Result<Arc<gtt::Gtt>, String> {
 #[cfg(target_os = "none")]
 fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, String> {
     let supported = REPORT.lock().as_ref().is_some_and(|report| {
-        report
-            .displays
-            .iter()
-            .any(|found| found.info.bdf == bdf
-                && i915_port::native_device_supported(found.info.vendor_id,
-                    found.info.device_id, found.info.revision))
+        report.displays.iter().any(|found| {
+            found.info.bdf == bdf
+                && i915_port::native_device_supported(
+                    found.info.vendor_id,
+                    found.info.device_id,
+                    found.info.revision,
+                )
+        })
     });
     if !supported {
         return Err(String::from(
-            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0 exact display D0; no writes",
+            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0 exact display \
+             D0; no writes",
         ));
     }
     let gtt = shared_ggtt(bdf)?;
     // TC fastboot has its own restricted transaction. It never routes TC
     // through the old combo-PHY modeset/rollback sequence.
     let function = window.read(regs::ddi::TRANS_DDI_FUNC_CTL_A).unwrap_or(0);
-    if matches!(intel_display::ddi::decode_function_control(function).port,
-        Some(intel_display::device::Port::Tc1 | intel_display::device::Port::Tc2)) {
+    if matches!(
+        intel_display::ddi::decode_function_control(function).port,
+        Some(intel_display::device::Port::Tc1 | intel_display::device::Port::Tc2)
+    ) {
         return fastboot::init(bdf, *window, gtt);
     }
     let image = gtt.checkpoint().map_err(|e| e.describe())?;
@@ -1287,4 +1298,6 @@ pub(crate) fn bring_up_gt_at_boot() {
     gt::init_at_boot();
 }
 
-pub(super) fn gt_registered() -> bool { gt::registered() }
+pub(super) fn gt_registered() -> bool {
+    gt::registered()
+}

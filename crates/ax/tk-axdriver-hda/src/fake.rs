@@ -1,4 +1,5 @@
 use alloc::vec;
+use core::cell::RefCell;
 
 use crate::{
     codec::{Widget, find_route},
@@ -46,6 +47,82 @@ fn prefers_headphone_and_skips_disconnected_pin() {
     nodes[2].config |= 1 << 30;
     assert_eq!(find_route(&nodes).unwrap()[0].node, 3);
 }
+
+struct HdmiVerbs(RefCell<alloc::vec::Vec<(u8, u16, u16)>>);
+impl crate::codec::Verbs for HdmiVerbs {
+    fn verb(
+        &mut self,
+        _codec: u8,
+        node: u8,
+        operation: u16,
+        payload: u16,
+    ) -> axdriver_base::DevResult<u32> {
+        self.0.borrow_mut().push((node, operation, payload));
+        Ok(0)
+    }
+}
+
+fn display_pin(node: u8, converter: u8) -> Widget {
+    Widget {
+        node,
+        caps: (4 << 20) | (1 << 9) | 1,
+        pin_caps: (1 << 7) | (1 << 4),
+        config: 0,
+        connections: vec![converter],
+    }
+}
+
+#[test]
+fn port_specific_hdmi_route_requires_live_digital_pin_and_converter() {
+    let mut pin = display_pin(0x0a, 2);
+    let mut converter = widget(2, 0, vec![]);
+    converter.caps |= 1 << 9;
+    let nodes = vec![pin.clone(), converter.clone()];
+    assert_eq!(
+        crate::codec::find_hdmi_route(&nodes, 0x0a)
+            .unwrap()
+            .iter()
+            .map(|w| w.node)
+            .collect::<alloc::vec::Vec<_>>(),
+        vec![0x0a, 2]
+    );
+    assert!(crate::codec::find_hdmi_route(&nodes, 0x0b).is_none());
+    pin.pin_caps &= !(1 << 7);
+    assert!(crate::codec::find_hdmi_route(&[pin, converter], 0x0a).is_none());
+}
+
+#[test]
+fn hdmi_setup_emits_two_channel_pcm_and_audio_infoframe_before_enable() {
+    let pin = display_pin(0x0a, 2);
+    let mut converter = widget(2, 0, vec![]);
+    converter.caps |= 1 << 9;
+    let route = crate::codec::Route {
+        codec: 2,
+        function: 1,
+        vendor: 0x8086_2815,
+        path: vec![pin, converter],
+    };
+    let mut verbs = HdmiVerbs(RefCell::new(alloc::vec::Vec::new()));
+    crate::codec::configure_hdmi(&mut verbs, &route).unwrap();
+    let writes = verbs.0.borrow();
+    assert!(writes.contains(&(0x0a, 0x707, 0x40)));
+    assert!(writes.contains(&(2, 0x200, crate::desc::FORMAT)));
+    assert!(writes.contains(&(2, 0x72d, 1)));
+    assert!(writes.contains(&(2, 0x706, 0x10)));
+    assert!(writes.contains(&(2, 0x70d, 1)));
+    assert!(writes.contains(&(0x0a, 0x732, 0xc0)));
+    let data = writes
+        .iter()
+        .filter(|(node, operation, _)| *node == 0x0a && *operation == 0x731)
+        .map(|(_, _, payload)| *payload as u8)
+        .collect::<alloc::vec::Vec<_>>();
+    assert_eq!(data.len(), 14);
+    assert_eq!(&data[..5], &[0x84, 1, 10, 0x70, 1]);
+    assert_eq!(
+        data.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+        0
+    );
+}
 #[test]
 fn wire_layout() {
     assert_eq!(core::mem::size_of::<BufferDescriptor>(), 16);
@@ -89,6 +166,9 @@ unsafe impl Hal for Host {
 struct State {
     regs: BTreeMap<usize, u32>,
     now: u64,
+    present: u16,
+    verbs: alloc::vec::Vec<(u8, u8, u16, u16)>,
+    drop_response_for: Option<(u8, u8, u16, u16)>,
 }
 struct Fake(Arc<Mutex<State>>);
 impl Fake {
@@ -101,7 +181,13 @@ impl Bus for Fake {
         let s = self.0.lock().unwrap();
         match o {
             0 => 0x1101,
-            0xe => 1,
+            0xe => {
+                if s.present == 0 {
+                    1
+                } else {
+                    s.present as u32
+                }
+            }
             0x4e | 0x5e => 0x40,
             _ => *s.regs.get(&o).unwrap_or(&0),
         }
@@ -120,30 +206,52 @@ impl Bus for Fake {
             let rirb = Self::address(&s, regs::RIRB);
             // SAFETY: controller published a valid owned CORB allocation.
             let command = unsafe { (corb as *const u32).add(value as usize).read() };
+            let codec = ((command >> 28) & 15) as u8;
             let node = (command >> 20) & 255;
             let operation = (command >> 8) & 4095;
             let payload = command & 255;
-            let response = match (node, operation, payload) {
-                (0, 0xf00, 0) => 0x10ec0999,
-                (0, 0xf00, 4) => 0x10001,
-                (1, 0xf00, 5) => 1,
-                (1, 0xf00, 4) => 0x20003,
-                (2, 0xf00, 9) => 17,
-                (3, 0xf00, 9) => 0x300100,
-                (4, 0xf00, 9) => 0x400100,
-                (2, 0xf00, 0xa) => (1 << 6) | (1 << 17),
-                (2, 0xf00, 0xb) => 1,
-                (4, 0xf00, 0xc) => 16,
-                (3 | 4, 0xf00, 0xe) => 1,
-                (3, 0xf02, _) => 2,
-                (4, 0xf02, _) => 3,
+            s.verbs
+                .push((codec, node as u8, operation as u16, payload as u16));
+            if s.drop_response_for == Some((codec, node as u8, operation as u16, payload as u16)) {
+                s.drop_response_for = None;
+                return;
+            }
+            let response: u32 = match (codec, node, operation, payload) {
+                (0, 0, 0xf00, 0) => 0x10ec0999,
+                (0, 0, 0xf00, 4) => 0x10001,
+                (0, 1, 0xf00, 5) => 1,
+                (0, 1, 0xf00, 4) => 0x20003,
+                (0, 2, 0xf00, 9) => 17,
+                (0, 3, 0xf00, 9) => 0x300100,
+                (0, 4, 0xf00, 9) => 0x400100,
+                (0, 2, 0xf00, 0xa) => (1 << 6) | (1 << 17),
+                (0, 2, 0xf00, 0xb) => 1,
+                (0, 4, 0xf00, 0xc) => 16,
+                (0, 3 | 4, 0xf00, 0xe) => 1,
+                (0, 3, 0xf02, _) => 2,
+                (0, 4, 0xf02, _) => 3,
+                (2, 0, 0xf00, 0) => 0x80862815,
+                (2, 0, 0xf00, 4) => 0x10001,
+                (2, 1, 0xf00, 5) => 1,
+                (2, 1, 0xf00, 4) => 0x20009,
+                (2, 2, 0xf00, 9) => 1 << 9,
+                (2, 10, 0xf00, 9) => (4 << 20) | (1 << 9) | (1 << 8),
+                (2, 10, 0xf00, 0xc) => (1 << 7) | (1 << 4),
+                (2, 10, 0xf00, 0x0e) => 1,
+                (2, 10, 0xf02, _) => 2,
+                (2, 1, 0xf00, 0xa) => (1 << 6) | (1 << 17),
+                (2, 1, 0xf00, 0xb) => 1,
+                (2, 2, 0xf00, 0xa) => (1 << 6) | (1 << 17),
+                (2, 2, 0xf00, 0xb) => 1,
                 _ => 0,
             };
             let wp = (*s.regs.get(&regs::RIRBWP).unwrap_or(&0) + 1) & 255;
             s.regs.insert(regs::RIRBWP, wp);
             // SAFETY: owned RIRB allocation is large enough for this published entry.
             unsafe {
-                (rirb as *mut u64).add(wp as usize).write(response);
+                (rirb as *mut u64)
+                    .add(wp as usize)
+                    .write(u64::from(response) | (u64::from(codec) << 32));
             }
         }
         if o == 0xa0 && value & 1 != 0 {
@@ -191,6 +299,81 @@ fn controller_route_bdl_and_period_completion() {
     let before = state.lock().unwrap().now;
     c.release().unwrap();
     assert!(state.lock().unwrap().now - before >= 42_666_000);
+}
+
+#[test]
+fn display_eld_selects_confirmed_codec_pin_and_retires_playback_before_restore() {
+    let state = Arc::new(Mutex::new(State {
+        present: 1 | (1 << 2),
+        ..State::default()
+    }));
+    let mut controller = Controller::<Host, _>::new(Fake(state.clone())).unwrap();
+    let mut eld = [0u8; 24];
+    eld[0] = 0x10;
+    eld[2] = 5;
+    eld[4] = 3 << 5;
+    eld[5] = 1 << 4;
+    eld[20..23].copy_from_slice(&[0x09, 1 << 2, 1]);
+
+    if let Err(error) = controller.set_display_eld(3, Some(&eld)) {
+        let verbs = state.lock().unwrap().verbs.clone();
+        drop(controller);
+        panic!("set ELD: {error:?}; verbs={verbs:?}");
+    }
+    {
+        let observed = state.lock().unwrap();
+        assert!(observed.verbs.contains(&(2, 0x0a, 0x707, 0x40)));
+        assert!(observed.verbs.contains(&(2, 2, 0x706, 0x10)));
+        assert!(observed.verbs.contains(&(2, 2, 0x70d, 1)));
+    }
+    controller.prepare(4096, 4).unwrap();
+    let _token = controller.submit(&[0x5a; PERIOD]).unwrap();
+    controller.set_display_eld(3, None).unwrap();
+    assert!(matches!(
+        controller.complete(),
+        Err(axdriver_base::DevError::Io)
+    ));
+    assert_eq!(controller.complete().unwrap(), None);
+    assert!(state.lock().unwrap().verbs.contains(&(2, 2, 0x706, 0)));
+}
+
+#[test]
+fn partial_hdmi_verb_timeout_invalidates_uncertain_controller_state() {
+    let state = Arc::new(Mutex::new(State {
+        present: 1 | (1 << 2),
+        ..State::default()
+    }));
+    let mut controller = Controller::<Host, _>::new(Fake(state.clone())).unwrap();
+    let mut eld = [0u8; 24];
+    eld[0] = 0x10;
+    eld[2] = 5;
+    eld[4] = 3 << 5;
+    eld[5] = 1 << 4;
+    eld[20..23].copy_from_slice(&[0x09, 1 << 2, 1]);
+    state.lock().unwrap().drop_response_for = Some((2, 2, 0x200, crate::desc::FORMAT));
+
+    assert!(matches!(
+        controller.set_display_eld(3, Some(&eld)),
+        Err(axdriver_base::DevError::Io)
+    ));
+    assert_eq!(controller.route().vendor, 0x10ec0999);
+    let (drop_response_for, verbs) = {
+        let observed = state.lock().unwrap();
+        (observed.drop_response_for, observed.verbs.clone())
+    };
+    assert_eq!(drop_response_for, None);
+    let failed = verbs
+        .iter()
+        .position(|verb| *verb == (2, 2, 0x200, crate::desc::FORMAT))
+        .unwrap();
+    assert!(verbs[failed + 1..].is_empty());
+    assert!(
+        matches!(
+            controller.prepare(4096, 4),
+            Err(axdriver_base::DevError::InvalidParam)
+        ),
+        "an unanswered partially landed codec verb invalidates playback"
+    );
 }
 #[test]
 fn missed_full_lap_is_not_fabricated_completion() {
