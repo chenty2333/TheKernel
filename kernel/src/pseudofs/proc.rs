@@ -4457,7 +4457,9 @@ fn is_proc_truncate_write(data: &[u8]) -> bool {
                     }
                     SimpleDir::new_maker(fs.clone(), Arc::new(conf))
                 });
-                SimpleDir::new_maker(fs.clone(), Arc::new(ipv4))
+                SimpleDir::new_maker(fs.clone(), Arc::new(ipv4.chain(
+                    super::proc_net_sysctl::PingSysctlDirectory::new(fs.clone()),
+                )))
             });
             SimpleDir::new_maker(fs.clone(), Arc::new(net))
         });

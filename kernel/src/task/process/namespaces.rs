@@ -1405,6 +1405,7 @@ pub(crate) struct NetworkNamespace {
     id: u64,
     stack: Arc<NetStack>,
     owner_user_ns: Arc<UserNamespace>,
+    ping_group_range: Mutex<[u32; 2]>,
 }
 
 impl NetworkNamespace {
@@ -1416,6 +1417,7 @@ pub(crate) fn try_new(
             id: try_allocate_proc_namespace_id()?,
             stack,
             owner_user_ns,
+            ping_group_range: Mutex::new([1, 0]),
         })
         .map_err(|_| AxError::NoMemory)?;
         // The pre-protocol seam is the XDP ingress point: a socket binding is
@@ -1528,6 +1530,14 @@ pub(crate) fn try_new_network_namespace(
         owner_user_ns: Arc<UserNamespace>,
     ) -> AxResult<Arc<Self>> {
         Self::try_new(NetStack::try_new_network_namespace()?, owner_user_ns)
+    }
+
+pub(crate) fn ping_group_range(&self) -> [u32; 2] {
+        *self.ping_group_range.lock()
+    }
+
+pub(crate) fn set_ping_group_range(&self, range: [u32; 2]) {
+        *self.ping_group_range.lock() = range;
     }
 
 pub(crate) fn stack(&self) -> &Arc<NetStack> {

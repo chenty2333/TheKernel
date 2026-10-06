@@ -862,3 +862,28 @@ Actual signed rootless podman (`shell-ndnfuoj_`) now passes conmon socket creati
 and launches real crun. OCI setup stops at the missing
 /proc/sys/net/ipv4/ping_group_range. Hello is not accepted; nonfatal stdout/stderr
 chmod warnings are separately recorded, not treated as the main failure.
+
+### OCI ping_group_range control
+
+The next real crun error is absence of /proc/sys/net/ipv4/ping_group_range.
+The network namespace now retains a coherent kernel-GID range, initialized to
+Linux's deny-all [1,0], independently for each new namespace. The non-cacheable
+IPv4 control lookup retains that namespace for the opened file; read converts
+both endpoints into the reader's user namespace, and write validates/maps both
+endpoints before atomic publication. Reversed ranges restore deny-all. File
+ownership reflects the network namespace owner's mapped root, with owner or
+CAP_NET_ADMIN admission in the writer; ordinary VFS/security checks still run.
+
+Bounds: no ICMP datagram transport provider is added (socket creation continues
+to return EPROTONOSUPPORT), so this does not establish working unprivileged ping.
+The parser currently requires exactly two complete decimal fields, unlike all
+Linux incremental sysctl writes; and non-owner NET_ADMIN's special proc-sysctl
+permission override is not implemented. OCI's mapped-root full-pair writes are
+the acceptance target, not a claim of full sysctl ABI equivalence.
+Period80 full host passed Python668 (three existing skips), Rust6098 (one
+existing ignore; kernel2657), KVM system70/70 (`system-mnh4ggzs`) and q35/n305
+lint784. The host tests cover parser invalid endpoints and independent namespace
+state/default deny. Real rootless podman/crun (`shell-d1hq9wfa`) passes the new
+sysctl setup; its next fatal is fchown of stdout fd1 returning ENOENT. The previous
+conmon chmod stdout/stderr warnings now suggest the same descriptor-only pipe
+metadata gap. Hello remains unaccepted; inspect the actual stream type next.

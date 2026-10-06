@@ -33,6 +33,11 @@ pub trait SimpleFileOps: Send + Sync + 'static {
         NodePermission::from_bits_truncate(0o444)
     }
 
+    /// Project provider ownership while preserving the retained inode identity.
+    fn file_metadata(&self, metadata: Metadata) -> Metadata {
+        metadata
+    }
+
     /// An object-backed link jumps without interpreting its display text.
     fn magic_link_target(&self) -> Option<VfsResult<Location>> {
         None
@@ -262,7 +267,7 @@ impl NodeOps for SimpleFile {
         // Recomputing size there would force read_all() during lookup and then
         // again during the actual read, which is prohibitively expensive for
         // hot procfs paths such as /proc/[pid]/stat.
-        Ok(self.node.metadata.lock().clone())
+        Ok(self.ops.file_metadata(self.node.metadata.lock().clone()))
     }
 
     fn len(&self) -> VfsResult<u64> {

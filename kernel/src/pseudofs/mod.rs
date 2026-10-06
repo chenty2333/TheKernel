@@ -20,6 +20,7 @@ pub(crate) mod nsfs;
 pub(crate) mod proc;
 mod proc_exe;
 mod proc_capabilities;
+mod proc_net_sysctl;
 mod proc_ownership;
 #[cfg(test)]
 mod overlay_userxattr_tests;
