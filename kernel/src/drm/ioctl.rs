@@ -295,7 +295,7 @@ pub(super) fn dispatch(
         // commands must work here as well as on the dedicated render node.
         _ => {
             return if file.has_intel_gt() {
-                super::intel::gem_exec::dispatch(file, context, cmd, arg)
+                super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
             } else {
                 super::render::dispatch(file, context, cmd, arg)
             };
@@ -317,7 +317,7 @@ pub(super) fn render_dispatch(
     if render_allows_core_ioctl(cmd as u64) {
         dispatch(file, context, cmd, arg)
     } else if file.has_intel_gt() {
-        super::intel::gem_exec::dispatch(file, context, cmd, arg)
+        super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
     } else {
         super::render::dispatch(file, context, cmd, arg)
     }

@@ -171,10 +171,10 @@ The host memory interpreter is not an EU simulator or proof of rendering.
 Sources/compiled-C tests cover context, WA lists, command/ring and IGT state;
 no host DRM node, physical GPU or protected-content path was exercised.
 
-Still missing for Mesa: ordinary per-file contexts/VM mapping, general shader
+Still missing for Mesa: persistent per-file context state/VM mapping, general shader
 batch validation/engine requests, complete QUERY/GETPARAM/context extensions,
 relocations/softpin residency and cache-domain contracts, scheduling/reset stats,
-exec sync-file/timeline variants and unmodified iris/ANV program acceptance.
+asynchronous execution/FENCE_SUBMIT and unmodified iris/ANV program acceptance.
 The bounded renderer is not advertised as full i915/Mesa support. TC/HPD/audio
 are not prerequisite dependencies for that GT work.
 
@@ -229,5 +229,16 @@ userspace software SIGNAL cannot fake the GEM completion. Extension links,
 unknown flags/names/reserved words and mixed array/extension forms are rejected.
 The 32-byte extension header and56-byte wire record match independently compiled
 Linux headers. The explicit client uses timeline output/wait; only compilation,
-models and source comparisons are verified. Sync-file exec and persistent user
+models and source comparisons are verified. Persistent user
 VM/context/general Mesa batches remain unfinished.
+
+EXEC_FENCE_IN/OUT now uses the caller's captured descriptor table and the same
+GEM/timeline completion leaf. Input sync_file lookup failures return EINVAL.
+Output slots are CLOEXEC, reserved/prepared before execution, invisible until
+successful execution and result copyout. Copyout failure releases the slot but
+never undoes completed GPU work or signals a different fence. OUT with the
+write-only ioctl is refused rather than reproducing Linux's documented fd leak.
+This is still the bounded synchronous adapter: input waits and execution have
+bounded deadlines, not Mesa's asynchronous arbitrary-batch interface. FENCE_SUBMIT
+remains unsupported. Descriptor ownership/rollback tests and client compilation
+are software checks, not physical GPU execution.

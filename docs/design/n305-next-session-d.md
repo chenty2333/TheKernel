@@ -118,3 +118,8 @@ Binary fence arrays remain supported separately. Links/unknown extensions,
 reserved words and nonzero same-point WAIT+SIGNAL are refused; source header
 layout is32 bytes plus24 timeline bytes. Client build/install and model checks
 are not a native GPU or Mesa acceptance result.
+
+The explicit BCS/RCS client now also requires CLOEXEC output sync_files, terminal
+POLLIN and a second submission using the first descriptor as FENCE_IN, with
+fresh timeline point2. This transport is compiled/model-verified only. The
+current synchronous, immutable-job adapter is not general iris submission.

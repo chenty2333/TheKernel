@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -31,7 +32,7 @@ int main(int argc, char **argv) {
     int render = strcmp(argv[1],"--rcs-execute")==0;
     int fd = open(argv[2], O_RDWR | O_CLOEXEC);
     if (fd < 0) { perror("DRM open; not tested"); return 1; }
-    int result = 1;
+    int result = 1, output_fd = -1;
     uint32_t handles[3] = {0}, sync = 0, context = 0;
     int chipset = 0;
     drm_i915_getparam_t chipset_query = {.param=I915_PARAM_CHIPSET_ID, .value=&chipset};
@@ -83,8 +84,22 @@ int main(int argc, char **argv) {
     struct drm_i915_gem_exec_fence fence={.handle=sync,.flags=I915_EXEC_FENCE_SIGNAL};
     uint64_t point=1;
     struct drm_i915_gem_execbuffer_ext_timeline_fences timeline={.base={.name=DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES},.fence_count=1,.handles_ptr=(uintptr_t)&fence,.values_ptr=(uintptr_t)&point};
-    struct drm_i915_gem_execbuffer2 exec={.buffers_ptr=(uintptr_t)objects,.buffer_count=3,.batch_len=render?1160:sizeof(batch),.rsvd1=context,.flags=(render?I915_EXEC_RENDER:I915_EXEC_BLT)|I915_EXEC_NO_RELOC|I915_EXEC_USE_EXTENSIONS,.cliprects_ptr=(uintptr_t)&timeline};
-    if (call(fd,DRM_IOCTL_I915_GEM_EXECBUFFER2,&exec)) goto done;
+    struct drm_i915_gem_execbuffer2 exec={.buffers_ptr=(uintptr_t)objects,.buffer_count=3,.batch_len=render?1160:sizeof(batch),.rsvd1=context,.flags=(render?I915_EXEC_RENDER:I915_EXEC_BLT)|I915_EXEC_NO_RELOC|I915_EXEC_USE_EXTENSIONS|I915_EXEC_FENCE_OUT,.cliprects_ptr=(uintptr_t)&timeline};
+    if (call(fd,DRM_IOCTL_I915_GEM_EXECBUFFER2_WR,&exec)) goto done;
+    output_fd=(int)(exec.rsvd2>>32);
+    int fdflags=fcntl(output_fd,F_GETFD);
+    if(output_fd<0 || fdflags<0 || !(fdflags&FD_CLOEXEC)){fprintf(stderr,"INTEL_BCS_FAIL output fd\n");goto done;}
+    struct pollfd completion={.fd=output_fd,.events=POLLIN};
+    if(poll(&completion,1,1000)!=1 || completion.revents!=POLLIN){fprintf(stderr,"INTEL_BCS_FAIL completion poll\n");goto done;}
+    /* Exercise the actual input descriptor transport, not a software SIGNAL. */
+    point=2;
+    exec.flags|=I915_EXEC_FENCE_IN;
+    exec.rsvd2=(uint32_t)output_fd;
+    if(call(fd,DRM_IOCTL_I915_GEM_EXECBUFFER2_WR,&exec))goto done;
+    close(output_fd);
+    output_fd=(int)(exec.rsvd2>>32);
+    completion.fd=output_fd;completion.revents=0;
+    if(poll(&completion,1,1000)!=1 || completion.revents!=POLLIN){fprintf(stderr,"INTEL_BCS_FAIL chained completion\n");goto done;}
     struct drm_i915_gem_wait wait={.bo_handle=handles[1],.timeout_ns=1000000000};
     if (call(fd,DRM_IOCTL_I915_GEM_WAIT,&wait)) goto done;
     struct drm_i915_gem_pread readback={.handle=handles[1],.offset=render?4096:0,.size=BYTES,.data_ptr=(uintptr_t)output};
@@ -117,6 +132,7 @@ int main(int argc, char **argv) {
     puts(render?"INTEL_RCS_USER_BYTES_VERIFIED bytes=16384 shader/GEM/sync/mmap; not Mesa acceptance":"INTEL_BCS_USER_BYTES_VERIFIED bytes=16384 GEM/exec/sync/mmap; not RCS/Mesa rendering");
     result=0;
 done:
+    if(output_fd>=0)close(output_fd);
     if(context){struct drm_i915_gem_context_destroy request={.ctx_id=context};ioctl(fd,DRM_IOCTL_I915_GEM_CONTEXT_DESTROY,&request);}
     if(sync){struct drm_syncobj_destroy request={.handle=sync};ioctl(fd,DRM_IOCTL_SYNCOBJ_DESTROY,&request);}
     for(unsigned i=0;i<3;i++) if(handles[i]){struct drm_gem_close request={.handle=handles[i]};ioctl(fd,DRM_IOCTL_GEM_CLOSE,&request);}

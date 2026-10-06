@@ -137,6 +137,8 @@ const _: () = {
 
 const NO_RELOC: u64 = 1 << 11;
 const FENCE_ARRAY: u64 = 1 << 19;
+const FENCE_IN: u64 = 1 << 16;
+const FENCE_OUT: u64 = 1 << 17;
 const PINNED: u64 = 1 << 4;
 const ADDRESS48: u64 = 1 << 3;
 const WRITE: u64 = 1 << 2;
@@ -321,6 +323,20 @@ pub(super) fn exec_with(
     execute: impl FnOnce(Arc<SharedPages>, Arc<SharedPages>, Plan) -> AxResult<()>,
 ) -> AxResult<()> {
     let r: Exec = read_pod(copy, arg)?;
+    // The memory-only helper cannot resolve process descriptors.
+    if r.flags & (FENCE_IN | FENCE_OUT) != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    exec_request(file, copy, r, Fence::new(false), None, execute)
+}
+fn exec_request(
+    file: &DrmFile,
+    copy: &impl UserCopy,
+    r: Exec,
+    completion: Arc<Fence>,
+    input: Option<Arc<Fence>>,
+    execute: impl FnOnce(Arc<SharedPages>, Arc<SharedPages>, Plan) -> AxResult<()>,
+) -> AxResult<()> {
     let render = r.flags & 0x3f == 1;
     if r.count != 3
         || r.length
@@ -333,8 +349,10 @@ pub(super) fn exec_with(
         || r.dr1 != 0
         || r.dr4 != 0
         || r.context >> 32 != 0
-        || r.reserved != 0
-        || r.flags & !(FENCE_ARRAY | EXTENSIONS) != (if render { 1 } else { 3 } | NO_RELOC)
+        || (r.flags & (FENCE_IN | FENCE_OUT) == 0 && r.reserved != 0)
+        || (r.flags & FENCE_IN != 0) != input.is_some()
+        || r.flags & !(FENCE_ARRAY | EXTENSIONS | FENCE_IN | FENCE_OUT)
+            != (if render { 1 } else { 3 } | NO_RELOC)
         || r.fence_count > 64
         || r.flags & (FENCE_ARRAY | EXTENSIONS) == (FENCE_ARRAY | EXTENSIONS)
         || (r.flags & FENCE_ARRAY == 0 && r.fence_count != 0)
@@ -410,8 +428,11 @@ pub(super) fn exec_with(
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     inputs
-        .try_reserve_exact(fences.len())
+        .try_reserve_exact(fences.len() + usize::from(input.is_some()))
         .map_err(|_| AxError::NoMemory)?;
+    if let Some(input) = input {
+        inputs.push(input);
+    }
     outputs
         .try_reserve_exact(fences.len())
         .map_err(|_| AxError::NoMemory)?;
@@ -449,7 +470,6 @@ pub(super) fn exec_with(
     )?;
     previous(&objects[2], Some(Duration::from_millis(500)))?;
     let _admission = decode(&objects, &pages, start, render)?;
-    let completion = Fence::new(false);
     let mut refs = [
         &objects[0].reservation,
         &objects[1].reservation,
@@ -485,6 +505,79 @@ pub(super) fn exec_with(
     }
     result
 }
+/// Use the caller's captured files table, never a worker's ambient table.
+/// Reserve and prepare the output before executing; publication is infallible
+/// and happens only after successful execution and result copyout.
+fn prepare_output(
+    table: Arc<crate::file::FdTable>,
+    limit: usize,
+    completion: Arc<Fence>,
+) -> AxResult<crate::file::PreparedFdPublication> {
+    let slot = crate::file::reserve_fd_in(table, limit, true)?;
+    let description =
+        crate::file::FileDescription::new(crate::drm::syncobj::SyncFile::new(completion))?;
+    slot.prepare_publication(description)
+}
+fn finish_output(
+    copy: &impl UserCopy,
+    arg: usize,
+    mut request: Exec,
+    output: Option<crate::file::PreparedFdPublication>,
+) -> AxResult<()> {
+    if let Some(output) = output {
+        request.reserved = (request.reserved & 0xffff_ffff) | ((output.fd() as u64) << 32);
+        // Failed copyout drops only the unpublished slot. Completed GPU work
+        // and its GEM/syncobj fences remain terminal; do not undo execution.
+        write_pod(copy, arg, &request)?;
+        output.commit();
+    }
+    Ok(())
+}
+pub(crate) fn dispatch_native(
+    file: &DrmFile,
+    context: &crate::file::IoctlContext,
+    cmd: u32,
+    arg: usize,
+) -> AxResult<usize> {
+    if !matches!(cmd, EXEC | EXEC_WR) {
+        return dispatch(file, context, cmd, arg);
+    }
+    let request: Exec = read_pod(context, arg)?;
+    // Refuse the source's documented write-only OUT-fd leak hazard.
+    if request.flags & FENCE_OUT != 0 && cmd != EXEC_WR {
+        return Err(AxError::InvalidInput);
+    }
+    let input = if request.flags & FENCE_IN != 0 {
+        Some(
+            crate::drm::syncobj::import(context, request.reserved as u32 as i32)
+                .map_err(|_| AxError::InvalidInput)?,
+        )
+    } else {
+        None
+    };
+    let completion = Fence::new(false);
+    let output = if request.flags & FENCE_OUT != 0 {
+        let limit =
+            context.caller_process().rlim.read()[linux_raw_sys::general::RLIMIT_NOFILE].current;
+        Some(prepare_output(
+            context.files().clone(),
+            limit.min(crate::task::AX_FILE_LIMIT as u64) as usize,
+            completion.clone(),
+        )?)
+    } else {
+        None
+    };
+    exec_request(file, context, request, completion, input, |s, d, p| {
+        match p {
+            Plan::Copy(copy) => super::gt::submit_copy(s, d, copy),
+            Plan::Render => super::gt::submit_render(s, d),
+        }
+        .map_err(|_| AxError::Io)
+    })?;
+    finish_output(context, arg, request, output)?;
+    Ok(0)
+}
+
 pub(crate) fn dispatch(
     file: &DrmFile,
     copy: &impl UserCopy,
@@ -1120,5 +1213,154 @@ pub(super) mod tests {
         dispatch(&file, &copy, BUSY, 0).unwrap();
         assert_ne!(read_pod::<Busy>(&copy, 0).unwrap().busy, 0);
         pending.signal();
+    }
+    #[test]
+    fn sync_file_exec_publishes_same_completion_cloexec_only_after_copyout() {
+        let _context = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (_, dst, _, sync) = prepare(&file, &copy);
+        let mut request: Exec = read_pod(&copy, 0).unwrap();
+        request.flags |= FENCE_IN | FENCE_OUT;
+        request.reserved = 17 | (0xdead_beef_u64 << 32);
+        let completion = Fence::new(false);
+        let table = Arc::new(crate::file::FdTable::new().unwrap());
+        let output = prepare_output(table.clone(), 8, completion.clone()).unwrap();
+        let fd = output.fd();
+        assert!(table.get_description(fd).is_err());
+        let input = Fence::new(true);
+        exec_request(
+            &file,
+            &copy,
+            request,
+            completion.clone(),
+            Some(input),
+            |_, _, _| {
+                assert!(!completion.is_signaled());
+                assert!(table.get_description(fd).is_err());
+                assert!(Arc::ptr_eq(
+                    &object(&file, dst)
+                        .unwrap()
+                        .reservation
+                        .predecessor()
+                        .unwrap(),
+                    &completion
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        finish_output(&copy, 0, request, Some(output)).unwrap();
+        let result: Exec = read_pod(&copy, 0).unwrap();
+        assert_eq!(result.reserved as u32, 17);
+        assert_eq!((result.reserved >> 32) as i32, fd);
+        assert!(table.get_cloexec(fd).unwrap());
+        let exported = table
+            .get_description(fd)
+            .unwrap()
+            .inner
+            .clone()
+            .downcast_arc::<crate::drm::syncobj::SyncFile>()
+            .ok()
+            .unwrap();
+        assert!(Arc::ptr_eq(&exported.fence(), &completion));
+        assert!(Arc::ptr_eq(
+            &file.syncobj(sync).unwrap().fence().unwrap(),
+            &completion
+        ));
+        assert!(completion.is_signaled() && !completion.is_failed());
+    }
+    #[test]
+    fn sync_file_output_failures_release_unpublished_slot_not_gpu_ownership() {
+        let _context = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (_, dst, ..) = prepare(&file, &copy);
+        let mut request: Exec = read_pod(&copy, 0).unwrap();
+        request.flags |= FENCE_OUT;
+        let completion = Fence::new(false);
+        let table = Arc::new(crate::file::FdTable::new().unwrap());
+        let output = prepare_output(table.clone(), 1, completion.clone()).unwrap();
+        assert!(matches!(
+            prepare_output(table.clone(), 1, completion.clone()),
+            Err(AxError::TooManyOpenFiles)
+        ));
+        exec_request(
+            &file,
+            &copy,
+            request,
+            completion.clone(),
+            None,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            finish_output(&copy, 65535, request, Some(output)),
+            Err(AxError::BadAddress)
+        );
+        assert!(table.get_description(0).is_err());
+        assert!(completion.is_signaled() && !completion.is_failed());
+        assert!(Arc::ptr_eq(
+            &object(&file, dst)
+                .unwrap()
+                .reservation
+                .predecessor()
+                .unwrap(),
+            &completion
+        ));
+        let output = prepare_output(table.clone(), 1, Fence::new(false)).unwrap();
+        assert_eq!(output.fd(), 0);
+        drop(output);
+        let error = Fence::new(false);
+        let output = prepare_output(table.clone(), 1, error.clone()).unwrap();
+        assert_eq!(
+            exec_request(&file, &copy, request, error.clone(), None, |_, _, _| Err(
+                AxError::Io
+            )),
+            Err(AxError::Io)
+        );
+        drop(output);
+        assert!(table.get_description(0).is_err());
+        assert!(error.is_failed());
+    }
+    #[test]
+    fn failed_sync_file_input_prevents_execution_and_reservation_publication() {
+        let _context = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let (_, dst, ..) = prepare(&file, &copy);
+        let mut request: Exec = read_pod(&copy, 0).unwrap();
+        request.flags |= FENCE_IN;
+        let input = Fence::new(false);
+        input.signal_error();
+        assert_eq!(
+            exec_request(
+                &file,
+                &copy,
+                request,
+                Fence::new(false),
+                Some(input),
+                |_, _, _| panic!("failed producer executed")
+            ),
+            Err(AxError::Io)
+        );
+        assert!(
+            object(&file, dst)
+                .unwrap()
+                .reservation
+                .predecessor()
+                .is_none()
+        );
+        assert_eq!(
+            exec_request(
+                &file,
+                &copy,
+                request,
+                Fence::new(false),
+                None,
+                |_, _, _| panic!("missing producer executed")
+            ),
+            Err(AxError::InvalidInput)
+        );
     }
 }
