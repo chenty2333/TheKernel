@@ -563,3 +563,26 @@ than Linux badness scoring/reclaim. Peak is read-only, not Linux per-OFD reset;
 low/high/min/oom.group/proactive reclaim are absent. Advanced disable/re-enable
 charge reparenting and namespace-relative controller export are not fully
 established. These do not turn the tested memory.max into a stored-only value.
+
+### Real caller PID namespace at cgroup migration/read boundaries
+
+The genuine rootless bootstrap first failed its positive self-PID cgroup.procs
+write with ENOENT, including when attempted before dropping privilege. The
+provider was treating user-visible numbers as kernel-wide process-table keys.
+Positive IDs now resolve strictly in the caller's active PID namespace; zero
+selects self, absent bindings report ESRCH, and a non-leader TID selects its
+actual thread group. Production member output projects into the reader's PID
+namespace and hides unseen identities. Existing credential/namespace checks
+and retained process identity remain; there is no raw-number fallback.
+
+Validated: kernel2644, lint784, KVM system70/70 (`system-jzq7oejk`), selected
+fs-abi24/259 (`abi-qg4f9dhy`); actual signed crun OCI/pids/memory KTAP4/4 remains
+accepted (`shell-t0v1xqt2`). The guest bootstrap now writes its positive PID,
+reads that same visible member back, drops all real/effective IDs/groups to1000
+and emits the real UID proof (`shell-1d1f1o06`). Podman still has not loaded an
+image: that execution fails at exec with EEXIST. A separate root execution of
+podman --version reports5.8.8 successfully. Its actual ELF has an83MiB PT_LOAD
+span while the randomized interpreter hint can lie inside that main image;
+next fix image placement, rather than attributing exec failure to privilege.
+V1 tasks/thread-granular membership and fully pinned multi-read PID views are
+not established by this process-directed regression.

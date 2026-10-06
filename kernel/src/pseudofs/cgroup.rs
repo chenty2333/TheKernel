@@ -1241,6 +1241,11 @@ struct CgroupDir {
     subtree_control: Mutex<HashSet<String>>,
 }
 
+fn cgroup_input_pid(namespace: &crate::task::PidNamespace, current_pid: Pid, requested: Pid) -> VfsResult<Pid> {
+    if requested == 0 { return Ok(current_pid); }
+    namespace.resolve_visible_pid(requested).ok_or(VfsError::NoSuchProcess)
+}
+
 impl CgroupDir {
     fn try_new_root(fs: Arc<CgroupFs>) -> VfsResult<Arc<Self>> {
         Self::try_new(fs, None)
@@ -1710,16 +1715,17 @@ impl CgroupDir {
             && !self.subtree_control.lock().is_empty()
     }
 
-    fn attach_pid(&self, pid: Pid) -> VfsResult<()> {
-        let pid = if pid == 0 {
-            axtask::current().as_thread().proc_data.proc.pid()
-        } else {
-            pid
-        };
-        if self.v2_has_enabled_child_controllers() {
-            return Err(VfsError::ResourceBusy);
-        }
-        let target = get_process_data(pid).map_err(|_| VfsError::NotFound)?;
+    fn attach_pid(&self, requested: Pid) -> VfsResult<()> {
+        let caller = axtask::current();
+        let thread = caller.as_thread();
+        let global = cgroup_input_pid(&thread.pid_ns(), thread.proc_data.proc.pid(), requested)?;
+        if self.v2_has_enabled_child_controllers() { return Err(VfsError::ResourceBusy); }
+        // A cgroup.procs write names a visible task; a non-leader TID also
+        // selects its real thread group rather than a raw process-table key.
+        let target = get_process_data(global).or_else(|_| {
+            crate::task::get_visible_task(global).map(|task| task.as_thread().proc_data.clone())
+        }).map_err(|_| VfsError::NoSuchProcess)?;
+        let pid = target.proc.pid();
         let credentials = current_file_write_credentials().ok_or(VfsError::Io)?;
         let actor_cred = current_file_operation_security_credential().ok_or(VfsError::Io)?;
         if !can_migrate_from_open_cgroup_namespace(&credentials, &actor_cred) {
@@ -1822,12 +1828,15 @@ impl CgroupDir {
                 .map(|(&pid, publication)| (pid, publication.clone())),
         );
         drop(pids);
+        let namespace = axtask::current().as_thread().pid_ns();
         for pid in snapshot.into_iter().filter_map(|(pid, publication)| {
             registry
                 .current_publication_while_operating(pid, &publication)
                 .then_some(pid)
         }) {
-            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{pid}\n"));
+            if let Some(visible) = namespace.visible_pid_checked(pid) {
+                let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{visible}\n"));
+            }
         }
         Ok(out)
     }
@@ -3695,9 +3704,10 @@ impl CgroupFile {
                 let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
                 let pid = text
                     .trim()
-                    .parse::<Pid>()
+                    .parse::<i32>()
                     .map_err(|_| VfsError::InvalidInput)?;
-                dir.attach_pid(pid)
+                if pid < 0 { return Err(VfsError::InvalidInput); }
+                dir.attach_pid(pid as Pid)
             }
             "cgroup.kill" => {
                 let text = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
@@ -3841,6 +3851,19 @@ mod tests {
     use axfs_ng_vfs::Timestamp;
 
     use super::*;
+
+    #[test]
+    fn cgroup_pid_numbers_are_caller_visible_not_unseen_global_keys() {
+        let user = crate::task::UserNamespace::try_new_root().unwrap();
+        let namespace = crate::task::PidNamespace::try_new_root(user).unwrap();
+        namespace.reserve_process(9001).unwrap().commit();
+        let visible = namespace.visible_pid_checked(9001).unwrap();
+        assert_ne!(visible, 9001);
+        assert_eq!(cgroup_input_pid(&namespace, 9001, visible), Ok(9001));
+        assert_eq!(cgroup_input_pid(&namespace, 9001, 0), Ok(9001));
+        assert_eq!(cgroup_input_pid(&namespace, 9001, 9001), Err(VfsError::NoSuchProcess));
+        assert_eq!(namespace.visible_pid_checked(9002), None);
+    }
 
     #[test]
     fn memory_controls_enforce_hierarchy_and_multi_controller_updates_are_atomic() {
