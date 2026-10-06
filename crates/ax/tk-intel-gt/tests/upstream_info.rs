@@ -135,3 +135,89 @@ fn missing_or_unknown_fuses_are_refused_not_replaced_by_a_product_spec() {
         );
     }
 }
+
+struct Counter(std::cell::RefCell<std::collections::VecDeque<(u32, u32)>>);
+impl GtIo for Counter {
+    fn read(&self, r: u32) -> Result<u32, Error> {
+        let pair = self
+            .0
+            .borrow_mut()
+            .pop_front()
+            .ok_or(Error::Unavailable(r))?;
+        assert_eq!(pair.0, r);
+        Ok(pair.1)
+    }
+    fn write(&self, _: u32, _: u32) -> Result<(), Error> {
+        panic!("timestamp wrote MMIO")
+    }
+    fn now_us(&self) -> u64 {
+        0
+    }
+    fn delay_us(&self, _: u32) {
+        panic!("timestamp added a delay")
+    }
+}
+#[test]
+#[ignore = "requires local Linux7.2.3/GCC"]
+fn timestamp_rollover_read_order_matches_unmodified_uncore_function() {
+    let root = support::reference();
+    let source = support::read(&root, "intel_uncore.h");
+    let function = support::function(&source, "intel_uncore_read64_2x32(");
+    // Signature starts after static-inline u64 on the preceding source line.
+    let prefix = r#"
+#include <stdint.h>
+#include <stdio.h>
+typedef uint32_t u32; typedef uint64_t u64; typedef u32 i915_reg_t;
+enum forcewake_domains { FORCE_NONE=0 };
+struct intel_uncore { unsigned step;u32 values[7]; };
+#define FW_REG_READ 0
+#define spin_lock_irqsave(lock, flags) ((void)0)
+#define spin_unlock_irqrestore(lock, flags) ((void)0)
+#define intel_uncore_forcewake_get__locked(u, d) ((void)0)
+#define intel_uncore_forcewake_put__locked(u, d) ((void)0)
+static unsigned intel_uncore_forcewake_for_reg(struct intel_uncore*u,u32 r,int f){return 0;}
+static u32 intel_uncore_read_fw(struct intel_uncore*u,u32 r){printf("R %u %u\n",r,u->values[u->step]);return u->values[u->step++];}
+"#;
+    let main = r#"
+int main(void){u32 cases[4][7]={{0,5,0},{0,0xffffffff,1,7,1},{0,1,1,2,2,3,2},{0,1,1,2,2,3,3}};
+for(unsigned i=0;i<4;i++){struct intel_uncore u={0};for(unsigned n=0;n<7;n++)u.values[n]=cases[i][n];printf("C %u\n",i);u64 value=intel_uncore_read64_2x32(&u,0x2358,0x235c);printf("V %llu\n",(unsigned long long)value);}}
+"#;
+    let oracle = support::compile(
+        &[prefix, "static u64", &function, main].join("\n"),
+        "gt-timestamp",
+    );
+    let out = Command::new(&oracle.executable).output().unwrap();
+    assert!(out.status.success());
+    let mut records = std::collections::VecDeque::new();
+    let mut case = 0;
+    for line in String::from_utf8(out.stdout).unwrap().lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        match fields[0] {
+            "C" => {
+                case = fields[1].parse::<u32>().unwrap();
+                records.clear();
+            }
+            "R" => records.push_back((fields[1].parse().unwrap(), fields[2].parse().unwrap())),
+            "V" => {
+                let counter = Counter(std::cell::RefCell::new(records.clone()));
+                let result = info::timestamp(&counter);
+                if case == 3 {
+                    assert_eq!(result, Err(Error::Timeout(0x2358)));
+                } else {
+                    assert_eq!(result, Ok(fields[1].parse().unwrap()));
+                }
+                assert!(counter.0.borrow().is_empty());
+            }
+            _ => panic!("oracle record"),
+        }
+    }
+}
+#[test]
+fn unavailable_timestamp_is_an_error_not_a_fabricated_clock() {
+    assert_eq!(
+        info::timestamp(&Counter(std::cell::RefCell::new(
+            std::collections::VecDeque::new()
+        ))),
+        Err(Error::Unavailable(0x235c))
+    );
+}

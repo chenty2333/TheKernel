@@ -115,3 +115,9 @@ is the same independently opted-in BCS/RCS owner, not a disconnected reader.
 Kernel gem_context.rs adapts the MIT i915_gem_context.c VM/proto-context
 reference/ID lifetimes (©2011–2012 Intel) to retained SharedPages/GEM charging.
 No opaque saved GPU context state or full Mesa residency is fabricated.
+
+src/info.rs additionally ports intel_uncore.h intel_uncore_read64_2x32
+(©2013 Intel), source three attempts. Owned native GT/render forcewake serializes
+the caller; still-torn reads fail closed rather than returning a mixed counter.
+Kernel context adapter also follows set_proto_ctx_engines lookup/index semantics
+and the target Mesa26.1.2 engine/recoverable/VM CREATE_EXT chain.

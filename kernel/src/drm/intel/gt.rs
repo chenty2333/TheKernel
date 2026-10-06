@@ -64,6 +64,11 @@ impl Bus {
         {
             return true;
         }
+        if [0x2358, 0x235c].contains(&r) {
+            return !write
+                && self.awake.load(Ordering::Acquire)
+                && self.render_awake.load(Ordering::Acquire);
+        }
         if [intel_gt::uncore::GT_ACK, intel_gt::uncore::RENDER_ACK].contains(&r) {
             return !write;
         }
@@ -206,6 +211,19 @@ pub(super) fn clock_frequency() -> Result<u32, Error> {
         .filter(|o| registered() && !o.lost)
         .ok_or(Error::Refused)?;
     intel_gt::info::clock_frequency(&owner.bus)
+}
+pub(super) fn timestamp() -> Result<u64, Error> {
+    let state = OWNER.lock();
+    let owner = state
+        .as_ref()
+        .filter(|o| registered() && !o.lost)
+        .ok_or(Error::Refused)?;
+    if owner.bus.read(intel_gt::uncore::GT_ACK)? & 1 == 0
+        || owner.bus.read(intel_gt::uncore::RENDER_ACK)? & 1 == 0
+    {
+        return Err(Error::Refused);
+    }
+    intel_gt::info::timestamp(&owner.bus)
 }
 pub(super) fn render_registered() -> bool {
     OWNER

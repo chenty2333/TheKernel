@@ -269,5 +269,17 @@ software/virgl/zink fallback. It is built by the existing graphics guest-tool
 builder, not an alternative ABI harness. Compilation/no-argument refusal are
 verified; initialization/render markers have NOT been observed. Minimal RCS
 selftest, actual Mesa initialization and native Mesa pixels remain separate
-acceptance layers. Source calls next require RCS/RCS/BCS engine-map SETPARAM,
-register timestamp access, residency/cache policy and retained per-engine state.
+acceptance layers. The actual iris CREATE_EXT chain now accepts RCS/RCS/BCS engine maps,
+RECOVERABLE=0, default PRIORITY=0 and shared VM SETPARAM. Exec ring bits index
+that immutable map (including duplicate physical-engine slots), rather than
+being misinterpreted as legacy engine numbers; empty/invalid slots, nonexistent
+instances, repeated assignment and engine extensions refuse. Creation checks
+actual runtime RCS availability, not physical platform capability alone. These
+mapped slots still run bounded complete-state jobs, not retained user images.
+Iris REG_READ uses the source RCS timestamp whitelist with8B_WA: actual owned
+forcewake ACKs precede upper/low/upper read with three source attempts. Still-torn
+reads fail instead of publishing an invented time. Legacy readq mode is refused
+rather than approximated with non-atomic dwords. Compiled-C traces validate
+rollover; no hardware timestamp or real Mesa initialization has been measured.
+Next required implementation is general48-bit residency/cache policy and
+per-slot saved/default state plus nonprivileged arbitrary batch submission.

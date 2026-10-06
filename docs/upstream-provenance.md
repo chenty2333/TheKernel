@@ -803,3 +803,11 @@ adaptation is original Rust over GEM charging/SharedPages, with no GPL body.
 Actual userspace reference stays Mesa26.1.2, including intel/common/i915/intel_gem.c
 and iris/i915/iris_{batch,bufmgr,kmd_backend}.c. Same-source iris build and the
 original real EGL/GLES client are preparation, not initialization/render evidence.
+
+Target iris context/clock continuation: Linux7.2.3 `set_proto_ctx_engines` and
+`i915_reg_read_ioctl` whitelist; `intel_uncore_read64_2x32` upper/low/upper with
+three attempts (MIT ©2013/2022 Intel, existing full grant). The native owner
+already holds forcewake; unknown/torn state returns an error. Mesa26.1.2's
+actual RCS/RCS/BCS+RECOVERABLE=0+VM create chain selects immutable engine slots.
+Scheduling/recovery, hardware/default saved images and general batch support
+are still not claimed. Compiled unmodified C is a trace oracle, not GPU evidence.

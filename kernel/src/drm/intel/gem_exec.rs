@@ -67,7 +67,7 @@ pub(super) struct Exec {
     dr4: u32,
     fence_count: u32,
     fences: u64,
-    flags: u64,
+    pub(super) flags: u64,
     pub(super) context: u64,
     reserved: u64,
 }
@@ -344,7 +344,12 @@ pub(super) fn exec_request(
         Arc<super::gt::copy::Vm>,
     ) -> AxResult<()>,
 ) -> AxResult<()> {
-    let render = r.flags & 0x3f == 1;
+    if r.context >> 32 != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let context = file.intel_contexts.lookup(r.context as u32)?;
+    let mut context_job = context.lock();
+    let render = context_job.render_engine((r.flags & 0x3f) as u16)?;
     if r.count != 3
         || r.length
             != if render {
@@ -358,8 +363,7 @@ pub(super) fn exec_request(
         || r.context >> 32 != 0
         || (r.flags & (FENCE_IN | FENCE_OUT) == 0 && r.reserved != 0)
         || (r.flags & FENCE_IN != 0) != input.is_some()
-        || r.flags & !(FENCE_ARRAY | EXTENSIONS | FENCE_IN | FENCE_OUT)
-            != (if render { 1 } else { 3 } | NO_RELOC)
+        || r.flags & !(FENCE_ARRAY | EXTENSIONS | FENCE_IN | FENCE_OUT | 0x3f) != NO_RELOC
         || r.fence_count > 64
         || r.flags & (FENCE_ARRAY | EXTENSIONS) == (FENCE_ARRAY | EXTENSIONS)
         || (r.flags & FENCE_ARRAY == 0 && r.fence_count != 0)
@@ -369,8 +373,6 @@ pub(super) fn exec_request(
     }
     // Lookup pins the old context through a concurrent destroy. The per-
     // context sleepable gate orders synchronous jobs without a spinlock wait.
-    let context = file.intel_contexts.lookup(r.context as u32)?;
-    let mut context_job = context.lock();
     let records = read_array::<Object>(copy, r.buffers, 3, 3)?;
     let mut objects = Vec::new();
     let mut pages = Vec::new();

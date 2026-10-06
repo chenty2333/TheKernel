@@ -23,12 +23,32 @@ use crate::drm::{
 pub(crate) struct JobContext {
     vm: Option<Arc<super::gt::copy::Vm>>,
     started: bool,
+    engines: Option<Vec<u16>>,
 }
 impl JobContext {
     fn new() -> Self {
         Self {
             vm: None,
             started: false,
+            engines: None,
+        }
+    }
+    pub(super) fn render_engine(&self, selector: u16) -> AxResult<bool> {
+        let class = if let Some(engines) = &self.engines {
+            *engines
+                .get(usize::from(selector))
+                .ok_or(AxError::InvalidInput)?
+        } else {
+            match selector {
+                0 | 1 => 0,
+                3 => 3,
+                _ => return Err(AxError::InvalidInput),
+            }
+        };
+        match class {
+            0 => Ok(true),
+            3 => Ok(false),
+            _ => Err(AxError::InvalidInput),
         }
     }
     pub(super) fn vm(&mut self, file: &DrmFile) -> AxResult<Arc<super::gt::copy::Vm>> {
@@ -69,8 +89,12 @@ impl Contexts {
         self.create_vm(None)
     }
     fn create_vm(&self, vm: Option<Arc<super::gt::copy::Vm>>) -> AxResult<u32> {
-        let gate = Arc::try_new(axsync::Mutex::new(JobContext { vm, started: false }))
-            .map_err(|_| AxError::NoMemory)?;
+        let mut job = JobContext::new();
+        job.vm = vm;
+        self.create_job(job)
+    }
+    fn create_job(&self, job: JobContext) -> AxResult<u32> {
+        let gate = Arc::try_new(axsync::Mutex::new(job)).map_err(|_| AxError::NoMemory)?;
         let mut state = self.state.lock();
         if state.jobs.len() >= 256 {
             return Err(AxError::NoMemory);
@@ -140,6 +164,27 @@ impl Contexts {
             .map(|_| ())
             .ok_or(AxError::NotFound)
     }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct RegisterRead {
+    offset: u64,
+    value: u64,
+}
+const REG_READ: u32 = command::<RegisterRead>(0x31, 3);
+fn register_read(
+    copy: &impl UserCopy,
+    arg: usize,
+    timestamp: impl FnOnce() -> AxResult<u64>,
+) -> AxResult<()> {
+    let mut r: RegisterRead = read_pod(copy, arg)?;
+    // Target Mesa uses this source whitelist entry plus I915_REG_READ_8B_WA.
+    // Do not expose arbitrary GT MMIO or pretend two dword reads are readq.
+    if r.offset != 0x2359 {
+        return Err(AxError::InvalidInput);
+    }
+    r.value = timestamp()?;
+    write_pod(copy, arg, &r)
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -225,11 +270,99 @@ const _: () = {
     );
 };
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct Engine {
+    class: u16,
+    instance: u16,
+}
+fn engine_map(
+    copy: &impl UserCopy,
+    param: &ContextParam,
+    render_available: bool,
+) -> AxResult<Vec<u16>> {
+    if param.size < 8 || !(param.size - 8).is_multiple_of(4) || (param.size - 8) / 4 > 64 {
+        return Err(AxError::InvalidInput);
+    }
+    let address = usize::try_from(param.value).map_err(|_| AxError::BadAddress)?;
+    let mut engines = Vec::new();
+    engines
+        .try_reserve_exact(((param.size - 8) / 4) as usize)
+        .map_err(|_| AxError::NoMemory)?;
+    // Source checks class-instance records before the extension header.
+    for i in 0..(param.size - 8) / 4 {
+        let record: Engine = read_pod(
+            copy,
+            address
+                .checked_add(8 + i as usize * 4)
+                .ok_or(AxError::BadAddress)?,
+        )?;
+        if record.class == u16::MAX && record.instance == u16::MAX {
+            engines.push(u16::MAX);
+            continue;
+        }
+        if record.instance != 0
+            || !matches!(record.class, 0 | 3)
+            || (record.class == 0 && !render_available)
+        {
+            return Err(AxError::NotFound);
+        }
+        engines.push(record.class);
+    }
+    let extensions: u64 = read_pod(copy, address)?;
+    if extensions != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(engines)
+}
+fn proto_param(
+    file: &DrmFile,
+    copy: &impl UserCopy,
+    job: &mut JobContext,
+    param: &ContextParam,
+    render_available: bool,
+) -> AxResult<()> {
+    match param.param {
+        9 => {
+            if param.size != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            if param.value > u32::MAX as u64 {
+                return Err(AxError::NotFound);
+            }
+            job.vm = Some(file.intel_contexts.vm(param.value as u32)?);
+        }
+        10 => {
+            if job.engines.is_some() {
+                return Err(AxError::InvalidInput);
+            }
+            job.engines = Some(engine_map(copy, param, render_available)?);
+        }
+        // Native failure currently wedges the owned engine graph. Do not claim
+        // reset recovery/replay or priority scheduling that does not exist.
+        8 | 6 => {
+            if param.size != 0 || param.value != 0 {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        _ => return Err(AxError::InvalidInput),
+    }
+    Ok(())
+}
 fn context_create(
     file: &DrmFile,
     copy: &impl UserCopy,
     arg: usize,
     extended: bool,
+) -> AxResult<()> {
+    context_create_with(file, copy, arg, extended, super::gt::render_registered())
+}
+fn context_create_with(
+    file: &DrmFile,
+    copy: &impl UserCopy,
+    arg: usize,
+    extended: bool,
+    render_available: bool,
 ) -> AxResult<()> {
     let mut request: ContextExt = if extended {
         read_pod(copy, arg)?
@@ -244,7 +377,7 @@ fn context_create(
     if request.flags & !3 != 0 || (!extended && request.flags != 0) {
         return Err(AxError::InvalidInput);
     }
-    let mut vm = None;
+    let mut job = JobContext::new();
     if request.flags & 1 != 0 {
         let mut address = request.extensions;
         let mut count = 0;
@@ -257,24 +390,15 @@ fn context_create(
                 copy,
                 usize::try_from(address).map_err(|_| AxError::BadAddress)?,
             )?;
-            if ext.name != 0
-                || ext.flags != 0
-                || ext.reserved != [0; 4]
-                || ext.param.id != 0
-                || ext.param.size != 0
-                || ext.param.param != 9
-            {
+            if ext.name != 0 || ext.flags != 0 || ext.reserved != [0; 4] || ext.param.id != 0 {
                 return Err(AxError::InvalidInput);
             }
-            if ext.param.value > u32::MAX as u64 {
-                return Err(AxError::NotFound);
-            }
-            vm = Some(file.intel_contexts.vm(ext.param.value as u32)?);
+            proto_param(file, copy, &mut job, &ext.param, render_available)?;
             address = ext.next;
         }
     }
     // Linux ignores the pointer without USE_EXTENSIONS; never dereference it.
-    request.id = file.intel_contexts.create_vm(vm)?;
+    request.id = file.intel_contexts.create_job(job)?;
     let result = if extended {
         write_pod(copy, arg, &request)
     } else {
@@ -421,15 +545,17 @@ pub(super) fn dispatch(
         CTX_GETPARAM => {
             let mut r: ContextParam = read_pod(copy, arg)?;
             let context = file.intel_contexts.lookup(r.id)?;
-            if r.size != 0 || !matches!(r.param, 3 | 9) {
+            if r.size != 0 || !matches!(r.param, 3 | 9 | 6 | 8) {
                 return Err(AxError::InvalidInput);
             }
             r.value = if r.param == 3 {
                 context.lock().begin(file)?;
                 0x40000
-            } else {
+            } else if r.param == 9 {
                 let vm = context.lock().begin(file)?;
                 u64::from(file.intel_contexts.publish_vm(vm)?)
+            } else {
+                0
             };
             if let Err(error) = write_pod(copy, arg, &r) {
                 if r.param == 9 {
@@ -440,13 +566,12 @@ pub(super) fn dispatch(
         }
         CTX_SETPARAM => {
             let r: ContextParam = read_pod(copy, arg)?;
-            if r.size != 0 || r.param != 9 {
+            let context = file.intel_contexts.lookup(r.id)?;
+            let mut job = context.lock();
+            if matches!(r.param, 9 | 10) && job.started {
                 return Err(AxError::InvalidInput);
             }
-            if r.value > u32::MAX as u64 {
-                return Err(AxError::NotFound);
-            }
-            file.intel_contexts.set_vm(r.id, r.value as u32)?;
+            proto_param(file, copy, &mut job, &r, super::gt::render_registered())?;
         }
         VM_CREATE | VM_DESTROY => {
             let mut r: VmControl = read_pod(copy, arg)?;
@@ -477,6 +602,9 @@ pub(super) fn dispatch(
                 &value,
             )?;
         }
+        REG_READ => register_read(copy, arg, || {
+            super::gt::timestamp().map_err(|_| AxError::Io)
+        })?,
         QUERY => query_with(copy, arg, super::gt::render_registered(), || {
             super::gt::topology().map_err(|_| AxError::NoSuchDevice)
         })?,
@@ -839,5 +967,225 @@ mod tests {
             Err(AxError::InvalidInput)
         );
         assert!(file.intel_contexts.vm(alias).is_ok());
+    }
+    #[test]
+    fn iris_engine_map_recoverable_vm_create_chain_selects_actual_bcs_slot() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let id = file
+            .intel_contexts
+            .publish_vm(super::super::gt::copy::Vm::new().unwrap())
+            .unwrap();
+        write_pod(&copy, 2048, &0u64).unwrap();
+        for (i, class) in [0, 0, 3].into_iter().enumerate() {
+            write_pod(&copy, 2056 + i * 4, &Engine { class, instance: 0 }).unwrap();
+        }
+        write_pod(
+            &copy,
+            1024,
+            &SetparamExt {
+                next: 1080,
+                param: ContextParam {
+                    param: 10,
+                    size: 20,
+                    value: 2048,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_pod(
+            &copy,
+            1080,
+            &SetparamExt {
+                next: 1136,
+                param: ContextParam {
+                    param: 8,
+                    value: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_pod(
+            &copy,
+            1136,
+            &SetparamExt {
+                param: ContextParam {
+                    param: 9,
+                    value: u64::from(id),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        write_pod(
+            &copy,
+            0,
+            &ContextExt {
+                flags: 1,
+                extensions: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        context_create_with(&file, &copy, 0, true, true).unwrap();
+        let context = read_pod::<ContextExt>(&copy, 0).unwrap().id;
+        let job = file.intel_contexts.lookup(context).unwrap();
+        {
+            let job = job.lock();
+            assert_eq!(job.render_engine(0), Ok(true));
+            assert_eq!(job.render_engine(1), Ok(true));
+            assert_eq!(job.render_engine(2), Ok(false));
+            assert_eq!(job.render_engine(3), Err(AxError::InvalidInput));
+        }
+        let (_, dst, ..) = prepare(&file, &copy);
+        let mut exec: Exec = read_pod(&copy, 0).unwrap();
+        exec.context = u64::from(context);
+        exec.flags = (exec.flags & !0x3f) | 2;
+        write_pod(&copy, 0, &exec).unwrap();
+        exec_with(&file, &copy, 0, |src, dst, plan| {
+            let Plan::Copy(operation) = plan else {
+                panic!("engine slot interpreted as legacy render")
+            };
+            super::super::gt::copy::tests::objects(src, dst, operation).map_err(|_| AxError::Io)
+        })
+        .unwrap();
+        let mut bytes = [0; 16384];
+        object(&file, dst)
+            .unwrap()
+            .backing
+            .shared_pages()
+            .unwrap()
+            .read_bytes(0, &mut bytes)
+            .unwrap();
+        assert!(bytes.iter().all(|b| *b == 0x73));
+        write_pod(
+            &copy,
+            0,
+            &ContextParam {
+                id: context,
+                param: 10,
+                size: 20,
+                value: 2048,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(&file, &copy, CTX_SETPARAM, 0),
+            Err(AxError::InvalidInput)
+        );
+    }
+    #[test]
+    fn engine_map_source_errors_empty_invalid_slots_and_duplicate_assignment() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 1024]));
+        let mut param = ContextParam {
+            param: 10,
+            size: 12,
+            value: 256,
+            ..Default::default()
+        };
+        write_pod(&copy, 256, &0u64).unwrap();
+        write_pod(
+            &copy,
+            264,
+            &Engine {
+                class: 3,
+                instance: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(engine_map(&copy, &param, false).unwrap(), [3]);
+        write_pod(
+            &copy,
+            264,
+            &Engine {
+                class: 0,
+                instance: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(engine_map(&copy, &param, false), Err(AxError::NotFound));
+        write_pod(
+            &copy,
+            264,
+            &Engine {
+                class: 3,
+                instance: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(engine_map(&copy, &param, true), Err(AxError::NotFound));
+        write_pod(
+            &copy,
+            264,
+            &Engine {
+                class: u16::MAX,
+                instance: u16::MAX,
+            },
+        )
+        .unwrap();
+        let mut job = JobContext::new();
+        proto_param(&file, &copy, &mut job, &param, true).unwrap();
+        assert_eq!(job.render_engine(0), Err(AxError::InvalidInput));
+        assert_eq!(
+            proto_param(&file, &copy, &mut job, &param, true),
+            Err(AxError::InvalidInput)
+        );
+        write_pod(&copy, 256, &1u64).unwrap();
+        assert_eq!(engine_map(&copy, &param, true), Err(AxError::InvalidInput));
+        write_pod(&copy, 256, &0u64).unwrap();
+        param.size = 8;
+        let empty = engine_map(&copy, &param, true).unwrap();
+        job.engines = Some(empty);
+        assert_eq!(job.render_engine(0), Err(AxError::InvalidInput));
+        for size in [0, 7, 9, 8 + 65 * 4] {
+            param.size = size;
+            assert_eq!(engine_map(&copy, &param, true), Err(AxError::InvalidInput));
+        }
+    }
+    #[test]
+    fn timestamp_ioctl_only_calls_source_whitelisted_wa_reader_and_preserves_errno() {
+        let copy = Image(RefCell::new(vec![0; 32]));
+        write_pod(
+            &copy,
+            0,
+            &RegisterRead {
+                offset: 0x2359,
+                value: 0,
+            },
+        )
+        .unwrap();
+        register_read(&copy, 0, || Ok(0x1234_5678_9abc_def0)).unwrap();
+        let r: RegisterRead = read_pod(&copy, 0).unwrap();
+        assert_eq!(r.offset, 0x2359);
+        assert_eq!(r.value, 0x1234_5678_9abc_def0);
+        for offset in [0, 0x2358, 0x235a, 0x235c, 0x22000, 0x2359 + (1u64 << 32)] {
+            write_pod(&copy, 0, &RegisterRead { offset, value: 7 }).unwrap();
+            assert_eq!(
+                register_read(&copy, 0, || panic!("arbitrary MMIO admitted")),
+                Err(AxError::InvalidInput)
+            );
+        }
+        write_pod(
+            &copy,
+            0,
+            &RegisterRead {
+                offset: 0x2359,
+                value: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            register_read(&copy, 0, || Err(AxError::Io)),
+            Err(AxError::Io)
+        );
+        assert_eq!(read_pod::<RegisterRead>(&copy, 0).unwrap().value, 7);
     }
 }

@@ -70,3 +70,20 @@ pub fn clock_frequency(io: &impl GtIo) -> Result<u32, Error> {
         Ok(frequency >> (3 - ((config >> 1) & 3)))
     }
 }
+
+/// Linux7.2.3 intel_uncore.h intel_uncore_read64_2x32 (©2013 Intel,
+/// full grant ../LICENSE-MIT). Caller owns both forcewake domains and serializes
+/// against engine state changes. Preserve upper/low/upper and the three tries.
+/// Safety difference: a still-torn counter is an error, not an invented time.
+pub fn timestamp(io: &impl GtIo) -> Result<u64, Error> {
+    let mut upper = io.read(0x235c)?;
+    for _ in 0..3 {
+        let old_upper = upper;
+        let lower = io.read(0x2358)?;
+        upper = io.read(0x235c)?;
+        if upper == old_upper {
+            return Ok((u64::from(upper) << 32) | u64::from(lower));
+        }
+    }
+    Err(Error::Timeout(0x2358))
+}
