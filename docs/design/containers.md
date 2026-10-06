@@ -622,3 +622,24 @@ real UID1000 frontend startup were observed in shell-fjripkcl. This commits the
 independent payload/regression wiring, not Level4 acceptance: actual namespace
 reexec fails EBUSY before loading the offline image. Probe that live fork
 blocker next; retain fail-closed pin/COW safety instead of suppressing it.
+
+### Fork keeps writable file/bss holes lazy
+
+Live stage diagnostics located the rootless namespace-clone EBUSY inside the
+main writable file/bss COW mapping, not at pin admission or namespace authority.
+The old clone path faulted every writable file-backed page under the parent mm
+lock, including untouched ELF data/bss; cache pressure is an internal retry
+from that fault path. Fork now copies only present private leaves through its
+existing transactional COW/pin-aware machinery and leaves unfaulted holes lazy,
+as in Linux7.2.3 mm/memory.c copy_pte_range. No pin fence, rollback assertion,
+COW isolation or error check was weakened, and all temporary traces were removed.
+
+Kernel2647 passed, including a real address-space/file-bss regression requiring
+both parent and fork child to retain zero resident pages for untouched holes.
+Actual UID1000 podman now creates its new user/mount namespace and invokes the
+real signed newuidmap (`shell-vtrszzq0`); it fails that helper's ownership check
+because /proc/<target> reports st_uid/st_gid0 instead of the target's1000.
+No image load/hello acceptance yet. Period70 passed Python667 (3 existing
+environment skips), Rust6087 (1 existing ignore), kernel2647, KVM system70/70
+(`system-ex0m3af9`), q35/n305 lint and paired mm-contracts/task-control/memfd-create
+34/259 (`abi-bx7w_jbl`). Next correct real proc inode ownership.

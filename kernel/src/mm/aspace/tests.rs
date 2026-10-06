@@ -2058,3 +2058,24 @@ fn vfork_clone_shares_every_fragment_of_a_rekeyed_shadow_stack_lease() {
         );
     }
 }
+
+#[test]
+fn fork_preserves_unfaulted_writable_file_bss_holes() {
+    let _context = crate::test_support::scheduler_test_context();
+    let fs = crate::pseudofs::MemoryFs::new().unwrap();
+    let root = axfs_ng_vfs::Mountpoint::new_root(&fs).root_location();
+    let file = root.create(axfs_ng_vfs::FsName::new(b"lazy-fork-bss"),
+        axfs_ng_vfs::NodeType::RegularFile,
+        axfs_ng_vfs::NodePermission::from_bits_truncate(0o600)).unwrap();
+    let start = VirtAddr::from(0x20_0000);
+    let size = 1024 * 1024;
+    let mut parent = AddrSpace::new_empty(start, size).unwrap();
+    let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+    parent.map(start, size, flags, false,
+        Backend::new_cow(start, PageSize::Size4K, file, 0, Some(0), false)).unwrap();
+    let child = parent.try_clone().unwrap();
+    assert_eq!(parent.resident_user_bytes(), 0);
+    assert_eq!(child.lock().resident_user_bytes(), 0);
+    assert!(matches!(parent.page_table().query(start), Err(PagingError::NotMapped)));
+    assert!(matches!(child.lock().page_table().query(start), Err(PagingError::NotMapped)));
+}

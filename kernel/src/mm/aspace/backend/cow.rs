@@ -1760,16 +1760,9 @@ impl BackendOps for CowBackend {
         };
         let eager_copy_flags = page_table_flags(flags);
         pages_in(range, self.size)?;
-        if self.file.is_some() && flags.contains(MappingFlags::WRITE) {
-            // Fork must snapshot the parent's current private data image, not the
-            // original ELF file contents. Populate writable file-backed pages in
-            // the parent before sharing them read-only with the child.
-            for vaddr in pages_in(range, self.size)? {
-                if matches!(old_pt.query(vaddr), Err(PagingError::NotMapped)) {
-                    self.alloc_new_at(vaddr, cow_flags, old_pt)?;
-                }
-            }
-        }
+        // Fork copies existing private data leaves through the transaction
+        // below. Untouched file/bss pages retain lazy fault semantics; forcing
+        // them resident here can exhaust cache under the parent mm lock.
         let materialized = old_pt.collect_mapped_leaves(range.start, range.size())?;
         if !materialized.is_empty() {
             self.mark_materialized();

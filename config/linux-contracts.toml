@@ -4493,7 +4493,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate ABI arguments and user memory before committing child publication or replacement image"]
 usercopy = ["usercopy:copy supplied task ABI pointers with checked user-memory access"]
-state = ["state:publish child with selected shared or copied VM, files, FS, signal and credentials; clone pidfd OFDs retain O_RDWR and thread O_EXCL status"]
+state = ["state:fork preserves unfaulted private writable file/bss holes and snapshots resident private leaves with the existing rollback-capable COW transaction; it does not populate the full ELF data image under the parent mm lock", "state:publish child with selected shared or copied VM, files, FS, signal and credentials; clone pidfd OFDs retain O_RDWR and thread O_EXCL status"]
 concurrency = ["concurrency:task and address-space ownership gates serialize publication and image replacement"]
 teardown = ["teardown:failed preparation releases staged resources; successful exit or exec releases prior ownership"]
 
@@ -4504,7 +4504,7 @@ status = "implemented"
 contract = "linux-clone"
 handler = "kernel/src/syscall/task/clone.rs:sys_clone"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/clone.rs:clone_validate_allows_detached_without_pidfd"]
+tests = ["kernel/src/mm/aspace/tests.rs:fork_preserves_unfaulted_writable_file_bss_holes", "kernel/src/syscall/task/clone.rs:clone_validate_allows_detached_without_pidfd"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 
@@ -8633,7 +8633,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:size bounds and copy_struct faults/nonzero extension precede pointer-count, exit-signal and cgroup shape EINVAL; set_tid copy EFAULT precedes flag/stack EINVAL; copy_process checks AUTOREAP/NNP/AUTOKILL combinations before AUTOKILL CAP_SYS_ADMIN EPERM; pidfd publication EFAULT precedes child visibility (Linux kernel/fork.c:2893-3052, kernel/fork.c:2062-2094)"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:copy versioned clone_args and publish a child with selected sharing, identity and stack ownership; NNP restricts only the child before publication, AUTOKILL arms the clone pidfd after complete runtime publication"]
+state = ["state:fork preserves unfaulted private writable file/bss holes and snapshots resident private leaves with the existing rollback-capable COW transaction; it does not populate the full ELF data image under the parent mm lock", "state:copy versioned clone_args and publish a child with selected sharing, identity and stack ownership; NNP restricts only the child before publication, AUTOKILL arms the clone pidfd after complete runtime publication"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -8644,7 +8644,7 @@ status = "implemented"
 contract = "linux-clone3"
 handler = "kernel/src/syscall/task/clone3.rs:sys_clone3"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
+tests = ["kernel/src/mm/aspace/tests.rs:fork_preserves_unfaulted_writable_file_bss_holes", "kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
