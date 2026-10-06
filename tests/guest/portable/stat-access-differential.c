@@ -99,7 +99,22 @@ static void mapped_inode_dac(void) {
         ERROR(lchown(paths[1], 0, 1), EPERM, "unmapped-uid-chown-denied");
         ERROR(lchown(paths[2], 0, 1), EPERM, "unmapped-gid-chown-denied");
         struct stat intended, observed;
-        check(stat(paths[0], &intended) == 0, "chroot-target-identity");
+        check(stat(paths[0], &intended) == 0 && intended.st_uid == 0 && intended.st_gid == 1,
+              "caller-visible-stat-ids");
+        check(lstat(paths[0], &observed) == 0 && observed.st_uid == 0 && observed.st_gid == 1,
+              "caller-visible-lstat-ids");
+        int retained = open(paths[0], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        check(retained >= 0 && fstat(retained, &observed) == 0 &&
+              observed.st_uid == 0 && observed.st_gid == 1, "caller-visible-retained-fstat-ids");
+        struct statx visible;
+        check(syscall(NR_STATX, retained, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &visible) == 0 &&
+              visible.stx_uid == 0 && visible.stx_gid == 1 && visible.stx_ino == intended.st_ino,
+              "caller-visible-statx-ids");
+        check(close(retained) == 0, "visible-fd-close");
+        check(stat(paths[1], &observed) == 0 && observed.st_uid == 65534 && observed.st_gid == 0,
+              "unmapped-stat-uid-overflow");
+        check(stat(paths[2], &observed) == 0 && observed.st_uid == 0 && observed.st_gid == 65534,
+              "unmapped-stat-gid-overflow");
         check(chroot(paths[0]) == 0 && chdir("/") == 0, "mapped-userns-chroot");
         check(stat("/", &observed) == 0 && intended.st_ino == observed.st_ino &&
               intended.st_dev == observed.st_dev, "chroot-actual-root-effect");
@@ -159,7 +174,7 @@ int main(void) {
           "accepted-sync-flags");
     mark("NO_AUTOMOUNT_SYNC_FLAGS");
     mapped_inode_dac(); mark("MAPPED_INODE_DAC_OVERRIDE");
-    mark("MAPPED_USERNS_CHROOT"); mark("MAPPED_INODE_CHOWN"); done();
+    mark("MAPPED_USERNS_CHROOT"); mark("MAPPED_INODE_CHOWN"); mark("CALLER_NAMESPACE_STAT_IDS"); done();
 
     begin("statx.raw-differential");
     struct statx sx;

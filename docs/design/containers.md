@@ -758,3 +758,24 @@ subsequent run command exits1: .config is reported not owned by the current user
 after entering the retained user namespace. Stat still emits global IDs rather
 than the caller namespace view. Next fix that actual ABI report; hello remains
 unaccepted, and the genuine offline load is not mistaken for a successful run.
+
+### Stat ownership is reported in the caller's user namespace
+
+After the accepted offline load, the next real podman command enters its retained
+user namespace and rejected its own .config: stat emitted kernel UID1000 while
+geteuid returned namespace UID0. Linux7.2.3 fs/stat.c projects UID/GID at native
+stat and statx copyout. A separate original helper now performs that projection
+using the actual caller credential's namespace and the existing overflow-ID
+rules. Inode/DAC ownership remains kernel-global; no owner check is bypassed.
+All stat-family path/retained-fd/empty-path paths use the same copyout helpers.
+
+Host coverage checks both native records, initial/nonidentity namespace views,
+unmapped UID/GID and unchanged inode/mode. Paired child stat/lstat/retained fstat/
+statx require namespace0/1 and both overflow negatives; the parent still observes
+actual kernel1000/1001. Kernel2652, related Python7, lint784, system70/70
+(`system-u37qc4xp`) and paired stat-access/fsattrs13/259 (`abi-_tq0n_c8`) passed.
+Advanced nonidentity mount-idmap composition is not established by these tests.
+Actual UID1000 podman now passes .config ownership, resolves the offline image
+with pull=never and proceeds to container storage mount (`shell-j_y85g7o`).
+It selects supplied fuse-overlayfs, whose mount fails ENOENT; hello is not yet
+accepted. Next inspect that actual native/FUSE mount provider path.

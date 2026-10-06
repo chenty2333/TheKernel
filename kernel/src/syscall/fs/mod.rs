@@ -18,6 +18,7 @@ mod quota;
 mod secretmem;
 mod signalfd;
 mod stat;
+mod stat_ids;
 mod timerfd;
 mod userfaultfd;
 mod xattr;

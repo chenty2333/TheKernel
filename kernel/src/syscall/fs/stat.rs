@@ -99,16 +99,20 @@ fn load_user_path<M: UserMemory + ?Sized>(
 fn write_stat<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     statbuf: *mut stat,
-    value: stat,
+    mut value: stat,
 ) -> AxResult<()> {
+    let viewer = current().as_thread().current_cred();
+    super::stat_ids::project_stat(viewer.user_ns(), &mut value);
     VmMutPtr::vm_write_abi(statbuf, memory, value).map_err(map_usercopy_error)
 }
 
 fn write_statx<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     statxbuf: *mut statx,
-    value: statx,
+    mut value: statx,
 ) -> AxResult<()> {
+    let viewer = current().as_thread().current_cred();
+    super::stat_ids::project_statx(viewer.user_ns(), &mut value);
     VmMutPtr::vm_write_abi(statxbuf, memory, value).map_err(map_usercopy_error)
 }
 

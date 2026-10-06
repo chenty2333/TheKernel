@@ -67,7 +67,7 @@ CONTRACTS.update({
     "access": ("raw-differential", "pass", "MODE_BEFORE_PATH EXISTS_FLAGS"),
     "faccessat": ("raw-differential", "pass", "MODE_BEFORE_PATH EXISTS_FLAGS"),
     "faccessat2": ("raw-differential", "pass", "MODE_BEFORE_PATH EXISTS_FLAGS"),
-    "newfstatat": ("raw-differential", "pass", "PATH_FLAG_ORDER EMPTY_FD_IDENTITY NO_AUTOMOUNT_SYNC_FLAGS MAPPED_INODE_DAC_OVERRIDE MAPPED_USERNS_CHROOT MAPPED_INODE_CHOWN"),
+    "newfstatat": ("raw-differential", "pass", "PATH_FLAG_ORDER EMPTY_FD_IDENTITY NO_AUTOMOUNT_SYNC_FLAGS MAPPED_INODE_DAC_OVERRIDE MAPPED_USERNS_CHROOT MAPPED_INODE_CHOWN CALLER_NAMESPACE_STAT_IDS"),
     "statx": ("raw-differential", "pass", "EXTENSIBLE_MASK_VALIDATION EMPTY_FD_IDENTITY PROVIDER_OPTIONAL_FIELDS EXT4_OPTIONAL_FIELDS"),
 })
 CONTRACTS.update({
