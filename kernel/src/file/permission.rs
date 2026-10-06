@@ -2237,12 +2237,7 @@ impl SecurityFsContextExt for FsContext {
         security: &VfsSecurityContext,
     ) -> AxResult<Location> {
         self.resolve_with_admission_unobserved(path, &mut |dir| {
-            check_pathwalk_search_permission_with_security(
-                dir,
-                security.actor(),
-                security.credentials(),
-                security.filesystem_owner_user_ns(),
-            )
+            check_pathwalk_search_permission_with_vfs_security(dir, security)
         })
     }
 
@@ -2252,12 +2247,7 @@ impl SecurityFsContextExt for FsContext {
         security: &VfsSecurityContext,
     ) -> AxResult<Location> {
         self.resolve_no_follow_with_admission_unobserved(path, &mut |dir| {
-            check_pathwalk_search_permission_with_security(
-                dir,
-                security.actor(),
-                security.credentials(),
-                security.filesystem_owner_user_ns(),
-            )
+            check_pathwalk_search_permission_with_vfs_security(dir, security)
         })
     }
 
@@ -2682,6 +2672,21 @@ mod tests {
             mtime: Timestamp::ZERO,
             ctime: Timestamp::ZERO,
         }
+    }
+
+    #[test]
+    fn unobserved_walk_admits_a_retained_detached_cwd_with_captured_authority() {
+        let _context = crate::test_support::scheduler_test_context();
+        let ns = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(ns).unwrap();
+        let fs = crate::pseudofs::MemoryFs::new().unwrap();
+        let mount = crate::mounts::new_detached_with_flags(&fs, 0,
+            crate::mounts::MountMetadata::try_from_parts(FsPath::new(b"none"), "tmpfs", FsPath::new(b"/"), "").unwrap()).unwrap();
+        let cwd = mount.root_location();
+        let context = FsContext::new(cwd.clone());
+        let security = VfsSecurityContext::new(actor);
+        assert!(context.resolve_security_unobserved(FsPath::new(b"."), &security).unwrap().ptr_eq(&cwd));
+        assert!(context.resolve_no_follow_security_unobserved(FsPath::new(b"."), &security).unwrap().ptr_eq(&cwd));
     }
 
     #[test]

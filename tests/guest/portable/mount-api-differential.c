@@ -78,6 +78,7 @@ enum {
 #define MOVE_MOUNT_BENEATH 0x200U
 #define MOUNT_ATTR_RDONLY 0x1ULL
 #define MOUNT_ATTR_NOATIME 0x10ULL
+#define MS_REC (1U << 14)
 #define MS_PRIVATE (1U << 18)
 #define MS_SHARED (1U << 20)
 #define MNT_DETACH 2
@@ -459,6 +460,8 @@ static void pivot_inherited_lock_case(void) {
         bytes = snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)gid);
         if (mapping < 0 || write(mapping, map, (size_t)bytes) != bytes) _exit(100);
         close(mapping);
+        int oldfd = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+        if (oldfd < 0) _exit(101);
         if (syscall(NR_MOUNT, "tmpfs", target_path, "tmpfs", 0, "mode=755") != 0) _exit(91);
         char oldpath[sizeof(target_path) + 8];
         snprintf(oldpath, sizeof(oldpath), "%s/old", target_path);
@@ -467,8 +470,13 @@ static void pivot_inherited_lock_case(void) {
         if (chdir("/") != 0) _exit(94);
         errno = 0;
         if (syscall(NR_UMOUNT2, "/", MNT_DETACH) != -1 || errno != EINVAL) _exit(95);
-        if (syscall(NR_UMOUNT2, "/old", MNT_DETACH) != 0) _exit(96);
-        if (rmdir("/old") != 0) _exit(97);
+        if (fchdir(oldfd) != 0) _exit(102);
+        if (syscall(NR_MOUNT, NULL, ".", NULL, MS_REC | MS_PRIVATE, NULL) != 0) _exit(103);
+        if (syscall(NR_UMOUNT2, ".", MNT_DETACH) != 0) _exit(96);
+        errno = 0;
+        if (syscall(NR_UMOUNT2, ".", MNT_DETACH) != -1 || errno != EINVAL) _exit(104);
+        close(oldfd);
+        if (chdir("/") != 0 || rmdir("/old") != 0) _exit(97);
         _exit(0);
     }
     if (child > 0) {
@@ -1089,6 +1097,7 @@ int main(int argc, char **argv) {
     ERROR(syscall(NR_PIVOT_ROOT, "/", file_path), ENOTDIR, "file-put-old");
     mark("LOOKUP_DIRECTORY_PUT_OLD");
     pivot_inherited_lock_case();
+    mark("DETACHED_OLD_CWD_REPEATED_UMOUNT_EINVAL");
     mark("INHERITED_PLACEMENT_LOCK_TRANSFER");
     done();
 

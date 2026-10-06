@@ -8380,7 +8380,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:unreviewed - no per-syscall Linux ordering comparison recorded against the pinned release"]
 usercopy = ["usercopy:checked input and output accesses with the syscall transfer or metadata commit rules"]
-state = ["state:authorize and detach mount ownership or perform expiry/remount lifecycle"]
+state = ["state:unobserved pathname search uses the captured VFS authority so a live detached old cwd still resolves before namespace membership rejects a repeated umount with EINVAL", "state:authorize and detach mount ownership or perform expiry/remount lifecycle"]
 concurrency = ["concurrency:retain descriptor/provider identity and serialize namespace, cursor or context mutation as applicable"]
 teardown = ["teardown:release temporary references; persistent file and context resources follow final-owner teardown"]
 
@@ -8391,7 +8391,7 @@ status = "implemented"
 contract = "linux-umount2"
 handler = "kernel/src/syscall/fs/mount.rs:sys_umount2"
 conditional = "explicit-none"
-tests = ["kernel/src/mounts.rs:first_expire_probe_records_the_epoch_and_retries", "tests/guest/portable/fs-abi-differential.c:main"]
+tests = ["kernel/src/file/permission.rs:unobserved_walk_admits_a_retained_detached_cwd_with_captured_authority", "tests/guest/portable/mount-api-differential.c:pivot_inherited_lock_case", "kernel/src/mounts.rs:first_expire_probe_records_the_epoch_and_retries", "tests/guest/portable/fs-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 

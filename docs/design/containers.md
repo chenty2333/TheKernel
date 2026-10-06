@@ -455,3 +455,26 @@ mutated with child-namespace authority, and missing-device lookup follows the
 capability gate. Actual signed crun now passes loopback activation but fails
 at `umount2 oldroot: ENOENT` (`shell-bbqx4e79`, exit1). OCI command/resource
 acceptance remains pending; fix that actual pivot/detach path next.
+
+### Repeated old-root detach after pivot
+
+The first real crun old-root detach committed; its second detach failed during
+`.` search because the unobserved security walker re-resolved legacy current
+mount membership, instead of using its already-captured VFS authority. Both
+follow/no-follow unobserved walkers now use that frozen actor/idmap/Landlock
+view. Search/DAC and the later mount-namespace membership gate remain intact:
+a live detached cwd can resolve, but cannot be unmounted again (EINVAL).
+No errno translation, fabricated mount record or tool-specific path rule was
+added. Detached cwd with previously attached nonidentity idmaps is not covered
+by this regression; their full custody remains a known boundary.
+
+Validated: kernel2640 and lint784; KVM system70/70 (`system-geigxbvd`); paired
+mount-api11/259 (`abi-fi28dwjh`) now executes saved-old-root fchdir, private
+propagation, successful lazy detach and mandatory second-detach EINVAL, while
+preserving the new-root inherited lock. Initial guest build failed only on the
+new fixture's missing MS_REC definition; repaired, not counted as acceptance.
+Temporary tracing was removed before validation. Actual signed crun1.30.1
+executes the BusyBox OCI shell, prints CRUN_REAL_HELLO, uid=0/gid=0 and its real
+cgroup namespace view 0::/, then returns0 (`shell-ujbpbqhv`). Basic OCI startup,
+command and exit are now established. True memory/pids resource acceptance is
+still pending; rootless podman must wait for those checks.
