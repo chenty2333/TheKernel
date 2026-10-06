@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* Explicit guest-only identity transition. No host user/namespace setup. */
@@ -21,8 +22,19 @@ int main(int argc, char **argv) {
     ssize_t got = fd < 0 ? -1 : read(fd, members, sizeof(members)-1);
     if (got < 1 || strtol(members, NULL, 10) != getpid()) { perror("read caller-visible cgroup member"); return 1; }
     close(fd);
+    int proc = open("/proc/self", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    struct stat before, after, path;
+    if (proc < 0 || fstat(proc, &before)) { perror("open own proc directory"); return 1; }
     if (setgroups(0, NULL) || setgid(1000) || setuid(1000)) { perror("drop rootless IDs"); return 1; }
     if (getuid() != 1000 || geteuid() != 1000 || getgid() != 1000 || getegid() != 1000) return 1;
+    if (fstat(proc, &after) || stat("/proc/self", &path) ||
+        after.st_uid != 1000 || after.st_gid != 1000 ||
+        path.st_uid != 1000 || path.st_gid != 1000 ||
+        (after.st_mode & 0777) != 0555 || (path.st_mode & 0777) != 0555 ||
+        after.st_ino != before.st_ino) {
+        fputs("proc directory must reflect live effective ownership and stable inode\n", stderr); return 1;
+    }
+    close(proc);
     puts("THEKERNEL_ROOTLESS_UID=1000"); fflush(stdout);
     execvp(argv[2], argv + 2); perror("exec rootless tool"); return 1;
 }

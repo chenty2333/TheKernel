@@ -20,6 +20,7 @@ pub(crate) mod nsfs;
 pub(crate) mod proc;
 mod proc_exe;
 mod proc_capabilities;
+mod proc_ownership;
 mod proc_inventory;
 mod proc_interrupts;
 mod proc_memory;

@@ -1571,7 +1571,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate flags and request shape; resolve pathname or fd; provider read then output copy"]
 usercopy = ["usercopy:bounded pathname import and initialized output record copy"]
-state = ["state:read retained inode and mount metadata without mutating target"]
+state = ["state:read retained inode and mount metadata without mutating target", "state:live proc task directories retain inode identity and report mode0555 with target effective kernel ownership"]
 concurrency = ["concurrency:retain resolved location or OFD during provider access", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release request-owned pathname and target references on completion"]
 
@@ -1605,7 +1605,7 @@ status = "implemented"
 contract = "linux-fstat"
 handler = "kernel/src/syscall/fs/stat.rs:sys_fstat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/stat.rs:empty_path_fd_detection_requires_the_flag_and_an_empty_path"]
+tests = ["kernel/src/syscall/fs/stat.rs:empty_path_fd_detection_requires_the_flag_and_an_empty_path", "kernel/src/pseudofs/proc_ownership.rs:retained_directory_tracks_effective_not_real_or_filesystem_ids", "tests/guest/tools/container-rootless-run.c:main"]
 validation_gaps = ["Direct Linux 7.2.3 guest entry and provider/error matrix is not yet bound and executed"]
 limitations = ["explicit-none"]
 
@@ -1617,7 +1617,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate flags and request shape; resolve pathname or fd; provider read then output copy"]
 usercopy = ["usercopy:bounded pathname import and initialized output record copy"]
-state = ["state:read retained inode and mount metadata without mutating target"]
+state = ["state:read retained inode and mount metadata without mutating target", "state:live proc task directories retain inode identity and report mode0555 with target effective kernel ownership"]
 concurrency = ["concurrency:retain resolved location or OFD during provider access", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release request-owned pathname and target references on completion"]
 
@@ -1640,7 +1640,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate flags and request shape; resolve pathname or fd; provider read then output copy"]
 usercopy = ["usercopy:bounded pathname import and initialized output record copy"]
-state = ["state:read retained inode and mount metadata without mutating target"]
+state = ["state:read retained inode and mount metadata without mutating target", "state:live proc task directories retain inode identity and report mode0555 with target effective kernel ownership"]
 concurrency = ["concurrency:retain resolved location or OFD during provider access", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release request-owned pathname and target references on completion"]
 
@@ -1801,7 +1801,7 @@ multiplexer_commands = ["explicit-none"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:validate flags and request shape; resolve pathname or fd; provider read then output copy"]
 usercopy = ["usercopy:bounded pathname import and initialized output record copy"]
-state = ["state:read retained inode and mount metadata without mutating target"]
+state = ["state:read retained inode and mount metadata without mutating target", "state:live proc task directories retain inode identity and report mode0555 with target effective kernel ownership"]
 concurrency = ["concurrency:retain resolved location or OFD during provider access", "concurrency:pathname provider callbacks use a retained fs root/cwd snapshot without holding the live fs_struct mutex; fs_struct mutations retain their writer lock"]
 teardown = ["teardown:release request-owned pathname and target references on completion"]
 

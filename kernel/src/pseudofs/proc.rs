@@ -2853,6 +2853,12 @@ impl SimpleDirOps for ZombieProcessDir {
 }
 
 impl SimpleDirOps for ThreadDir {
+    fn directory_metadata(&self, metadata: Metadata) -> Metadata {
+        let subject = self.task.upgrade()
+            .map(|task| proc_subject_cred(&task, self.show_task_dir));
+        super::proc_ownership::task_directory_metadata(metadata, subject.as_deref().map(Cred::ids))
+    }
+
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let process = task.as_thread().proc_data.proc.clone();

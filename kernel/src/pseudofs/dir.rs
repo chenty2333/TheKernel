@@ -32,6 +32,11 @@ pub trait SimpleDirOps: Send + Sync + 'static {
     /// Look up a child directory or file by name.
     fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux>;
 
+    /// Projects live provider metadata without replacing the retained inode.
+    fn directory_metadata(&self, metadata: Metadata) -> Metadata {
+        metadata
+    }
+
     /// Check if the directory is cacheable.
     ///
     /// See [`DirNodeOps::is_cacheable`].
@@ -173,7 +178,9 @@ impl<O: SimpleDirOps> SimpleDir<O> {
 impl<O: SimpleDirOps> NodeOps for SimpleDir<O> {
     fn inode(&self) -> u64;
 
-    fn metadata(&self) -> VfsResult<Metadata>;
+    fn metadata(&self) -> VfsResult<Metadata> {
+        Ok(self.ops.directory_metadata(self.node.metadata()?))
+    }
 
     fn update_metadata(&self, update: MetadataUpdate) -> VfsResult<()>;
 

@@ -643,3 +643,27 @@ No image load/hello acceptance yet. Period70 passed Python667 (3 existing
 environment skips), Rust6087 (1 existing ignore), kernel2647, KVM system70/70
 (`system-ex0m3af9`), q35/n305 lint and paired mm-contracts/task-control/memfd-create
 34/259 (`abi-bx7w_jbl`). Next correct real proc inode ownership.
+
+### Proc task directory ownership for subordinate-ID helpers
+
+The signed newuidmap's target-owner check exposed proc PID directories reporting
+static root-owned0755 metadata. Linux7.2.3 fs/proc/base.c task_dump_owner and
+pid_getattr instead expose0555 task directories with live effective ownership,
+including nondumpable credential transitions. SimpleDir now permits a live
+metadata projection while preserving its exact provider type and stable inode;
+ThreadDir delegates only that projection to a separate original module. Existing
+proc visibility/stale-process checks and all other proc file access rules remain
+unchanged; there is no ptrace or dumpability relaxation.
+
+A host test changes effective IDs while retaining root real/fs IDs and checks
+repeated metadata on the same inode. The genuine UID-drop guest helper also
+checks both fstat on a retained proc directory and a fresh /proc/self stat after
+the transition. Zombie directory ownership and caller-user-namespace stat ID
+projection are not established by this focused fix. Kernel2648, related Python9,
+lint784, KVM system70/70 (`system-tyet22g0`) and paired stat-access5/259
+(`abi-_vhy_yuw`) passed. Actual UID1000 helper passed both ownership assertions
+and signed newuidmap passed its target-owner check (`shell-sbw8cebb`), then failed
+its capability reduction. The authenticated APK stores CAP_SETUID/CAP_SETGID
+file-capability xattrs (not setuid modes); these are absent from staged helpers.
+Next preserve those package attributes in the guest image, without privileged
+host filesystem changes or relaxing capset.
