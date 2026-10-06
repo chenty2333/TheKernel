@@ -988,3 +988,27 @@ partial, and CPU quota/controller is not advertised rather than implemented as
 a value-only knob. Optional external rootless networking and physical hardware
 were not tested. B1's deferred field-level differences remain in the coverage
 report; the requested container-tool ladder is now working in KVM guests.
+
+### Final descriptor pinning repair
+
+Final review found the anonymous metadata branches could fall back to a second
+FD-number lookup for ordinary VFS files. A concurrent dup2 changing that number
+from a regular file to a pipe could therefore spuriously return EBADF instead of
+acting on either retained valid object. Both chmod and chown now retain the same
+first OFD through anonymous dispatch or VFS location selection. A paired fixture
+concurrently alternates one always-valid FD between an owner-held regular file
+and pipe while requiring every direct chmod/chown operation to succeed. This
+repairs a race introduced by the new dispatch, without changing permission policy.
+Final validation of that repair and the complete task passed: full host Python668
+(three existing skips), Rust6101 (one existing ignore; kernel2659), KVM system70/70
+(`system-27w6px4o`), q35/n305 lint784, and the complete Linux7.2.3/TheKernel KVM
+ABI comparison259/259 (`abi-a25khcgb`, including the concurrent FD replacement
+fixture). The final optional four-level guest (`shell-pv5jsatn`) again passes all
+seven KTAP cases, real limits/OOM, rootless hello/exit0 and empty --rm store.
+
+The initial final guest build was refused because its input fingerprint changed
+while the descriptor regression fixture was being added; it was rebuilt, never
+counted as a passing guest. The host kernel compilation occurred after the pinning
+repair. A shell-only result-printing typo after the test chain does not replace
+individual formal results: every suite's own completion and the final guest's
+markers were inspected. No feature scope was expanded for this repair.

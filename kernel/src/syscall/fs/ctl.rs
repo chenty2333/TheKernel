@@ -1829,8 +1829,12 @@ fn do_fchownat(
     // plan below; this broad gate must eventually become an inode-local Layer
     // 1 mechanism rather than part of the syscall or ABI contract.
     let _metadata_writer_fallback = mounts::namespace_operation();
-    if path.is_none_or(|path| path.as_bytes().is_empty()) && dirfd != AT_FDCWD {
-        let description = get_file_description(dirfd)?;
+    let descriptor = if path.is_none_or(|path| path.as_bytes().is_empty()) && dirfd != AT_FDCWD {
+        Some(get_file_description(dirfd)?)
+    } else {
+        None
+    };
+    if let Some(description) = descriptor.as_ref() {
         check_metadata_description_status(source, description.status_flags())?;
         if let Some(pipe) = description.inner.downcast_ref::<crate::file::Pipe>() {
             let (user, group) = requested_chown_ids(security.actor(), uid, gid)?;
@@ -1838,7 +1842,13 @@ fn do_fchownat(
             return Ok(0);
         }
     }
-    let loc = resolve_metadata_target(dirfd, path, flags, source, &security)?;
+    // Keep the same pinned OFD for ordinary VFS metadata too: a concurrent
+    // close/dup2 must not turn the anonymous-inode branch into a second lookup.
+    let loc = if let Some(description) = descriptor.as_ref() {
+        hardlink_location_from_description(description).ok_or(AxError::BadFileDescriptor)?
+    } else {
+        resolve_metadata_target(dirfd, path, flags, source, &security)?
+    };
     // Linux's mnt_want_write() failure precedes ID conversion, inode locking,
     // security hooks, and setattr_prepare authorization.
     check_writable_mount(&loc)?;
@@ -1932,8 +1942,12 @@ fn do_fchmodat(
     // See the chown path above: this broad writer gate is an interim mechanism,
     // not the final per-inode metadata transaction architecture.
     let _metadata_writer_fallback = mounts::namespace_operation();
-    if path.is_none_or(|path| path.as_bytes().is_empty()) && dirfd != AT_FDCWD {
-        let description = get_file_description(dirfd)?;
+    let descriptor = if path.is_none_or(|path| path.as_bytes().is_empty()) && dirfd != AT_FDCWD {
+        Some(get_file_description(dirfd)?)
+    } else {
+        None
+    };
+    if let Some(description) = descriptor.as_ref() {
         check_metadata_description_status(source, description.status_flags())?;
         if let Some(socket) = description.inner.downcast_ref::<crate::file::Socket>() {
             socket.chmod_inode(mode, &security, &pseudo_metadata(&socket.stat()?))?;
@@ -1944,7 +1958,13 @@ fn do_fchmodat(
             return Ok(0);
         }
     }
-    let loc = resolve_metadata_target(dirfd, path, flags, source, &security)?;
+    // Keep the same pinned OFD for ordinary VFS metadata too: a concurrent
+    // close/dup2 must not turn the anonymous-inode branch into a second lookup.
+    let loc = if let Some(description) = descriptor.as_ref() {
+        hardlink_location_from_description(description).ok_or(AxError::BadFileDescriptor)?
+    } else {
+        resolve_metadata_target(dirfd, path, flags, source, &security)?
+    };
     check_writable_mount(&loc)?;
     inode_flags::check_nonappend_content_mutable(&loc)?;
     let publishes_setid =

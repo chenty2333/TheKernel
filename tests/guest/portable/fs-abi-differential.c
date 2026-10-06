@@ -13,6 +13,8 @@
 #include <linux/capability.h>
 #include <signal.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sys/select.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -250,6 +252,25 @@ static void drops_to(void) {
     /* Drop every capability so CAP_* gates are exercised for real. */
     check(setresgid(65534, 65534, 65534) == 0, "drop-gid");
     check(setresuid(65534, 65534, 65534) == 0, "drop-uid");
+}
+
+struct metadata_fd_race {
+    int target, regular, pipe;
+    atomic_int stop;
+    int failed;
+};
+
+static void *replace_metadata_fd(void *arg)
+{
+    struct metadata_fd_race *race = arg;
+    while (!atomic_load_explicit(&race->stop, memory_order_acquire)) {
+        if (dup2(race->regular, race->target) != race->target ||
+            dup2(race->pipe, race->target) != race->target) {
+            race->failed = 1;
+            break;
+        }
+    }
+    return NULL;
 }
 
 int main(void) {
@@ -2338,6 +2359,28 @@ int main(void) {
         close(fresh_reader);
         close(fifo_reader);
         check(unlinkat(pdir, "poll-fifo", 0) == 0, "fifo-poll-cleanup");
+        /* Every replacement is a valid owner-held descriptor. A metadata
+         * operation may pin either object, but must never resolve the number
+         * twice and confuse a regular file with the anonymous pipe branch. */
+        int race_pipe[2];
+        check(pipe(race_pipe) == 0, "metadata-fd-race-pipe");
+        struct metadata_fd_race race = {
+            .target = dup(pf), .regular = pf, .pipe = race_pipe[0],
+            .stop = ATOMIC_VAR_INIT(0), .failed = 0,
+        };
+        check(race.target >= 0, "metadata-fd-race-target");
+        pthread_t replacer;
+        check(pthread_create(&replacer, NULL, replace_metadata_fd, &race) == 0,
+              "metadata-fd-race-thread");
+        for (unsigned round = 0; round < 2048; ++round) {
+            check(syscall(SYS_fchmod, race.target, 0600) == 0, "metadata-fd-race-chmod");
+            check(syscall(SYS_fchown, race.target, -1, -1) == 0, "metadata-fd-race-chown");
+        }
+        atomic_store_explicit(&race.stop, 1, memory_order_release);
+        check(pthread_join(replacer, NULL) == 0 && race.failed == 0, "metadata-fd-race-join");
+        close(race.target);
+        close(race_pipe[0]);
+        close(race_pipe[1]);
         mark("MODE_AND_OWNER");
 
         /* fs/namei.c do_mknodat(): a FIFO is creatable and a duplicate name
