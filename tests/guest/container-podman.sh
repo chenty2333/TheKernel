@@ -32,6 +32,10 @@ export PATH=/opt/thekernel-tools/bin:/usr/bin:/bin:/sbin
     load --input /opt/thekernel-containers/images/alpine-3.24.1.tar
 "$podman" --log-level=debug --storage-driver=overlay --root "$HOME/storage" --runroot "$XDG_RUNTIME_DIR/storage" \
     run --rm --network=none --pull=never --cgroup-parent=/tk-user-1000 alpine echo hello
+"$podman" --log-level=debug --storage-driver=overlay --root "$HOME/storage" --runroot "$XDG_RUNTIME_DIR/storage" \
+    ps --all --quiet > "$base/containers-after-run"
+[ ! -s "$base/containers-after-run" ]
+echo THEKERNEL_PODMAN_REMOVE_OK
 INNER
 chmod 755 "$base/inside.sh"
 /opt/thekernel-tests/bin/thekernel-container-rootless-run "$cg/manager/cgroup.procs" \
@@ -39,6 +43,7 @@ chmod 755 "$base/inside.sh"
 cat "$base/podman.log"
 grep -q '^THEKERNEL_ROOTLESS_UID=1000$' "$base/podman.log"
 grep -q '^hello$' "$base/podman.log"
+grep -q '^THEKERNEL_PODMAN_REMOVE_OK$' "$base/podman.log"
 echo 'KTAP version 1'
 echo '1..1'
 echo 'ok 1 - rootless offline alpine overlay OCI hello'

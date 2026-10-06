@@ -965,3 +965,26 @@ and returns script RC0 with KTAP1 and THEKERNEL_CONTAINER_PODMAN_OK.
 This is Level4 acceptance, not just a harness RC or the diagnostic-only run.
 The nonfatal overlay storage-link rename warning remains a documented bound;
 next add an explicit empty-container-store postcondition to the guest test.
+
+### Automated four-level closeout
+
+All four existing noninteractive guest tests are now available in the separate
+signed containers payload. Namespace acceptance also requires signed procps top;
+the first combined run found that binary missing from the exported tools prefix,
+not a namespace regression. It is now exported from the already authenticated
+procps APK. Podman acceptance additionally queries ps --all --quiet using the
+same real UID1000 identity/store and requires an empty result after --rm.
+
+Related rootfs Python18 and lint784 passed. The final combined optional guest run
+(`shell-mrvgumhz`) passes namespace/nsenter KTAP1, bubblewrap KTAP1, crun KTAP4
+(including real fork EAGAIN, sparse/resident charge/refund and OOM SIGKILL/events),
+and rootless offline Podman KTAP1 with hello, exit0, empty-container-store marker
+and combined RC0. No host container or service was launched.
+
+Acceptance bounds remain explicit: native overlay is the working storage route;
+legacy FUSE startup/subtype support is not established, storage-link rename emits
+a nonfatal warning, advanced memcg/reclaim/swap/kernel-memory accounting remains
+partial, and CPU quota/controller is not advertised rather than implemented as
+a value-only knob. Optional external rootless networking and physical hardware
+were not tested. B1's deferred field-level differences remain in the coverage
+report; the requested container-tool ladder is now working in KVM guests.

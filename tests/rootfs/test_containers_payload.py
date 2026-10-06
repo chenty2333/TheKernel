@@ -37,7 +37,14 @@ class ContainersPayloadTests(unittest.TestCase):
         self.assertIn('load --input /opt/thekernel-containers/images/', script)
         self.assertIn('>> /etc/passwd', script)
         self.assertIn('cgroup.subtree_control', script)
+        self.assertIn('thekernel-containers-namespace.sh',
+                      (ROOT/'scripts/build-containers-payload.sh').read_text())
+        self.assertIn("'ps', 'top', 'mount'",
+                      (ROOT/'scripts/build-containers-payload.sh').read_text())
         self.assertIn("'^hello$'", script)
+        self.assertIn("ps --all --quiet", script)
+        self.assertIn('[ ! -s "$base/containers-after-run" ]', script)
+        self.assertIn("THEKERNEL_PODMAN_REMOVE_OK", script)
         self.assertIn('geteuid() != 1000', helper)
         self.assertLess(helper.index('write(fd, pid'), helper.index('setuid(1000)'))
 

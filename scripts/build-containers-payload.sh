@@ -101,7 +101,7 @@ bin_dir = out/'opt/thekernel-tools/bin'
 bin_dir.mkdir(parents=True)
 shutil.copy2(root/'bin/busybox', bin_dir/'busybox')
 programs = ['bwrap', 'crun', 'podman', 'conmon', 'fuse-overlayfs', 'fusermount3',
-            'newuidmap', 'newgidmap', 'catatonit', 'ps', 'mount', 'unshare', 'nsenter', 'lsns']
+            'newuidmap', 'newgidmap', 'catatonit', 'ps', 'top', 'mount', 'unshare', 'nsenter', 'lsns']
 for program in programs:
     source = next((root/part/program for part in ['bin', 'sbin', 'usr/bin', 'usr/sbin']
                    if (root/part/program).exists() or (root/part/program).is_symlink()), None)
@@ -140,6 +140,7 @@ with tarfile.open(packages[0]) as package:
         filecaps['/opt/thekernel-tools/bin/' + name] = value.encode('utf-8', 'surrogateescape').hex()
 (out/'opt/thekernel-tools/file-capabilities.json').write_text(json.dumps(filecaps, sort_keys=True) + '\n')
 shutil.copy2(lock, out/'opt/thekernel-tools/MANIFEST')
+shutil.copy2(Path(os.environ['REPO_ROOT'])/'tests/guest/container-namespace.sh', out/'opt/thekernel-containers-namespace.sh')
 shutil.copy2(Path(os.environ['REPO_ROOT'])/'tests/guest/container-bwrap.sh', out/'opt/thekernel-containers-bwrap.sh')
 shutil.copy2(Path(os.environ['REPO_ROOT'])/'tests/guest/container-crun.sh', out/'opt/thekernel-containers-crun.sh')
 shutil.copy2(Path(os.environ['REPO_ROOT'])/'tests/guest/container-podman.sh', out/'opt/thekernel-containers-podman.sh')
