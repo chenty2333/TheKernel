@@ -742,3 +742,23 @@ confirm eight sizes, eight ioctl encodings, WB mapping flag and five offsets.
 Existing GEM/PRIME/mmap/reservation/binary-sync infrastructure is reused; user
 commands are bounded, decoded and rebuilt rather than run privileged. No full
 Mesa/RCS execution or physical BCS acceptance is claimed.
+
+### Bounded RCS shader chain
+
+N305 render-domain reset, source14-page context/2WA pages, whole-slice RPCS,
+command-buffer/GPR/timestamp restore, mandatory instruction-state invalidation,
+source RCS engine/context WAs and RCS flush/breadcrumb are translated from MIT
+i915 sources/functions inventoried in `tk-intel-gt/NOTICE`. A bounded licensed
+IGT Gen12 shader rectangle is adapted from Intel-hosted backport/v6.17 source
+and its original full COPYING is preserved as LICENSE-IGT. Source-only compiler
+oracles compare complete images/rings/WA lists/state pages. Original native
+memory/submit/result/retirement and strict rebuilt user-page admission reuse
+GEM reservations/binary sync. Source Mesa26.1.2 Gen120 MOCS/packet facts provide
+an explicit UC-policy/full-SBA safety adaptation. This is not EU emulation or
+physical GPU/Mesa acceptance; no host DRM node is opened in these validations.
+
+The RCS additions add two conventional C-shim INVALID_MMIO_REG matches at25
+and73 identical all-zero data-array rows at25/40 from the compiled IGT page.
+They are measured textual matches, not proof of copied Linux bodies or GPU
+execution. Current GT totals78/74 and combined Intel90/76; crates/ax baseline
+outside/code118/107 at25,91/84 at40, no fenced/comments/markers or exemptions.

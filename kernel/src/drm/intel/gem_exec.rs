@@ -256,6 +256,40 @@ fn wait(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
         }
     })
 }
+#[derive(Clone, Copy)]
+enum Plan {
+    Copy(intel_gt::bcs::Copy),
+    Render,
+}
+fn decode(
+    file: &[Arc<GemObject>],
+    pages: &[Arc<SharedPages>],
+    start: usize,
+    render: bool,
+) -> AxResult<Plan> {
+    if render {
+        if start != 0 || file[0].size < 24576 || file[1].size < 24576 || file[2].size < 4096 {
+            return Err(AxError::InvalidInput);
+        }
+        let mut bytes = [0u8; 4096];
+        pages[2].read_bytes(0, &mut bytes)?;
+        for (i, expected) in intel_gt::rcs_page::PAGE.iter().enumerate() {
+            if u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) != *expected {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        Ok(Plan::Render)
+    } else {
+        let mut bytes = [0u8; 44];
+        pages[2].read_bytes(start, &mut bytes)?;
+        let words: [u32; 11] = core::array::from_fn(|i| {
+            u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+        });
+        intel_gt::bcs::decode_copy(&words, file[0].size, file[1].size)
+            .map(Plan::Copy)
+            .map_err(|_| AxError::InvalidInput)
+    }
+}
 /// Snapshot and validate first, publish shared completion edges atomically,
 /// then execute over pinned views. Native implementations never execute the
 /// user's memory as commands, including a concurrent writable batch mapping.
@@ -263,17 +297,23 @@ fn exec_with(
     file: &DrmFile,
     copy: &impl UserCopy,
     arg: usize,
-    execute: impl FnOnce(Arc<SharedPages>, Arc<SharedPages>, intel_gt::bcs::Copy) -> AxResult<()>,
+    execute: impl FnOnce(Arc<SharedPages>, Arc<SharedPages>, Plan) -> AxResult<()>,
 ) -> AxResult<()> {
     let r: Exec = read_pod(copy, arg)?;
+    let render = r.flags & 0x3f == 1;
     if r.count != 3
-        || r.length != 44
+        || r.length
+            != if render {
+                intel_gt::rcs_page::COMMAND_BYTES
+            } else {
+                44
+            }
         || !r.start.is_multiple_of(8)
         || r.dr1 != 0
         || r.dr4 != 0
         || r.context != 0
         || r.reserved != 0
-        || r.flags & !FENCE_ARRAY != (3 | NO_RELOC)
+        || r.flags & !FENCE_ARRAY != (if render { 1 } else { 3 } | NO_RELOC)
         || r.fence_count > 64
         || (r.flags & FENCE_ARRAY == 0 && (r.fence_count != 0 || r.fences != 0))
     {
@@ -341,14 +381,13 @@ fn exec_with(
     for prior in &inputs {
         prior.wait(Some(Duration::from_millis(500)))?;
     }
-    let (start, _) = range(&objects[2], u64::from(r.start), 44)?;
+    let (start, _) = range(
+        &objects[2],
+        u64::from(r.start),
+        if render { 4096 } else { 44 },
+    )?;
     previous(&objects[2], Some(Duration::from_millis(500)))?;
-    let mut bytes = [0u8; 44];
-    pages[2].read_bytes(start, &mut bytes)?;
-    let words: [u32; 11] =
-        core::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
-    let _admission = intel_gt::bcs::decode_copy(&words, objects[0].size, objects[1].size)
-        .map_err(|_| AxError::InvalidInput)?;
+    let _admission = decode(&objects, &pages, start, render)?;
     let completion = Fence::new(false);
     let mut refs = [
         &objects[0].reservation,
@@ -373,12 +412,7 @@ fn exec_with(
         // and atomic reservation publication. Observe its final contents now;
         // later pwrite is behind our completion. Mmap races cannot inject GPU
         // commands: the native adapter rebuilds this bounded decoded plan.
-        pages[2].read_bytes(start, &mut bytes)?;
-        let words: [u32; 11] = core::array::from_fn(|i| {
-            u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
-        });
-        let plan = intel_gt::bcs::decode_copy(&words, objects[0].size, objects[1].size)
-            .map_err(|_| AxError::InvalidInput)?;
+        let plan = decode(&objects, &pages, start, render)?;
         execute(pages[0].clone(), pages[1].clone(), plan)
     })();
     if result.is_ok() {
@@ -422,7 +456,11 @@ pub(crate) fn dispatch(
             write_pod(copy, arg, &r)?;
         }
         EXEC | EXEC_WR => exec_with(file, copy, arg, |s, d, p| {
-            super::gt::submit_copy(s, d, p).map_err(|_| AxError::Io)
+            match p {
+                Plan::Copy(copy) => super::gt::submit_copy(s, d, copy),
+                Plan::Render => super::gt::submit_render(s, d),
+            }
+            .map_err(|_| AxError::Io)
         })?,
         _ => return Err(AxError::OperationNotSupported), // No contexts/queries/render claims yet.
     }
@@ -562,7 +600,11 @@ mod tests {
         let copy = Image(RefCell::new(vec![0; 65536]));
         let (src, dst, batch, sync) = prepare(&file, &copy);
         exec_with(&file, &copy, 0, |s, d, p| {
-            super::super::gt::copy::tests::objects(s, d, p).map_err(|_| AxError::Io)
+            match p {
+                Plan::Copy(copy) => super::super::gt::copy::tests::objects(s, d, copy),
+                Plan::Render => super::super::gt::copy::tests::render_objects(s, d),
+            }
+            .map_err(|_| AxError::Io)
         })
         .unwrap();
         let output = file.syncobj(sync).unwrap().fence().unwrap();
@@ -618,6 +660,97 @@ mod tests {
         let mut first = [0];
         mapping.read_bytes(0, &mut first).unwrap();
         assert_eq!(first, [0x73]);
+    }
+    #[test]
+    fn fixed_rcs_user_page_reaches_same_gem_sync_and_private_vm_renderer_model() {
+        let _context = crate::test_support::scheduler_test_context();
+        let file = file();
+        let copy = Image(RefCell::new(vec![0; 65536]));
+        let mut handles = [0; 3];
+        for h in &mut handles {
+            write_pod(
+                &copy,
+                0,
+                &Create {
+                    size: 24576,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            create(&file, &copy, 0).unwrap();
+            *h = read_pod::<Create>(&copy, 0).unwrap().handle;
+        }
+        let mut bytes = vec![0xa5; 24576];
+        for (i, b) in bytes[4096..4096 + 16384].iter_mut().enumerate() {
+            *b = if i % 4 == 3 {
+                255
+            } else {
+                (i as u8).wrapping_mul(29)
+            };
+        }
+        object(&file, handles[0])
+            .unwrap()
+            .backing
+            .shared_pages()
+            .unwrap()
+            .write_bytes(0, &bytes)
+            .unwrap();
+        let batch = object(&file, handles[2])
+            .unwrap()
+            .backing
+            .shared_pages()
+            .unwrap();
+        for (i, w) in intel_gt::rcs_page::PAGE.iter().enumerate() {
+            batch.write_bytes(i * 4, &w.to_le_bytes()).unwrap();
+        }
+        for (i, h) in handles.iter().enumerate() {
+            write_pod(
+                &copy,
+                256 + i * size_of::<Object>(),
+                &Object {
+                    handle: *h,
+                    offset: 0x10000 * (i as u64 + 1),
+                    flags: PINNED | if i == 1 { WRITE } else { 0 },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        write_pod(
+            &copy,
+            0,
+            &Exec {
+                buffers: 256,
+                count: 3,
+                length: intel_gt::rcs_page::COMMAND_BYTES,
+                flags: 1 | NO_RELOC,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        exec_with(&file, &copy, 0, |s, d, p| match p {
+            Plan::Render => {
+                super::super::gt::copy::tests::render_objects(s, d).map_err(|_| AxError::Io)
+            }
+            _ => panic!("not BCS"),
+        })
+        .unwrap();
+        let destination = object(&file, handles[1]).unwrap();
+        let mut result = vec![0; 16384];
+        destination
+            .backing
+            .shared_pages()
+            .unwrap()
+            .read_bytes(4096, &mut result)
+            .unwrap();
+        assert_eq!(result, &bytes[4096..4096 + 16384]);
+        assert!(destination.reservation.predecessor().unwrap().is_signaled());
+        // Arbitrary shader edits must never be submitted privileged.
+        batch.write_bytes(0, &0u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            exec_with(&file, &copy, 0, |_, _, _| panic!("must not submit")),
+            Err(AxError::InvalidInput)
+        );
     }
     #[test]
     fn invalid_batch_or_alias_is_refused_before_any_completion_publication() {

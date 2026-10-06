@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 318
-implemented = 299
+resolved = 317
+implemented = 298
 explicit_enosys = 19
 fallback = 0
-partial = 67
+partial = 68
 unknown = 0
 
 [[contract]]
@@ -610,13 +610,13 @@ teardown = ["teardown:request-owned usercopy state and retained OFD released on 
 [[cell]]
 number = 16
 name = "ioctl"
-status = "implemented"
+status = "partial"
 contract = "linux-ioctl"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_ioctl"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/ctl.rs:fionbio_uses_the_complete_int_and_treats_every_nonzero_as_enabled", "kernel/src/file/fiemap.rs:linux_fiemap_layout_matches_x86_64_uapi", "kernel/src/syscall/fs/namespace_visibility.rs:namespace_owner_visibility_uses_ancestry_not_a_capability_gate", "tests/guest/tools/namespace-relationships-smoke.c:main", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/drm/intel/gem_exec.rs:gem_wire_copy_exec_result_reservation_syncobj_wait_and_mmap_share_owned_pages", "kernel/src/drm/intel/gem_exec.rs:invalid_batch_or_alias_is_refused_before_any_completion_publication"]
-validation_gaps = ["Intel opt-in GEM/BCS provider: native GPU execution and user-program acceptance remain unverified; host model and compiled wire-layout checks are not physical execution"]
-limitations = ["Intel opt-in provider currently accepts <=64KiB system GEM, WB mmap offset, PREAD/PWRITE/BUSY/WAIT and default-context bounded linear BCS EXECBUFFER2 with three fixed softpin windows, NO_RELOC and optional binary fence arrays; other commands/flags/contexts and RCS/Mesa remain unsupported"]
+validation_gaps = ["Intel opt-in GEM/BCS/bounded-RCS provider: native GPU execution and user-program acceptance remain unverified; host model and compiled wire-layout checks are not physical execution"]
+limitations = ["Intel opt-in provider currently accepts <=64KiB system GEM, WB mmap offset, PREAD/PWRITE/BUSY/WAIT and default-context bounded linear BCS EXECBUFFER2 with three fixed softpin windows, NO_RELOC and optional binary fence arrays; RCS additionally requires intel.rcs=1 and accepts only the immutable64x64 linear shader page; other commands/flags/contexts and general Mesa remain unsupported"]
 
 [[contract]]
 id = "linux-landlock_create_ruleset"

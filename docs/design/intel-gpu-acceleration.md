@@ -147,3 +147,33 @@ falls back to a CPU copy or counts ENOTTY/unknown GPU as success. Native exec,
 exact16384-byte readback, binary output-sync wait and shared mmap-after-handle-
 close must all succeed. Only compilation and non-executing argument refusal
 have run here; host DRM nodes were not opened, physical acceptance is pending.
+
+## Minimal RCS software chain (physical rendering unverified)
+
+Independent GT bootstrap can additionally run a bounded shader rectangle when
+both `intel.gt=1 intel.rcs=1` are explicitly selected. It proves firmware RCS
+idle/GuC exclusion/direct DMA, owns render-only reset, reapplies source N305
+engine/context WAs and creates the14+2-page source RCS image/private VM.
+One immutable64x64 linear RGBA texture-sampled rectangle uses licensed IGT
+Gen12 PS instructions and state. No arbitrary user shader or privileged LRI
+is accepted. The state page uses explicit verified UC cache policy, rather than
+unknown firmware MOCS0. Full source RCS flush/TLB/AUX/mandatory instruction-state
+WA and a GGTT completion marker precede bounded reset retirement and exact
+source/destination/redzone checks. Completion alone is never permission to free
+context/VM memory. Uncertain binding/reset retains the entire ownership graph.
+
+After successful native RCS bootstrap, the existing GEM interface accepts only
+this exact snapshotted render page in default-context EXEC_RENDER/NO_RELOC;
+normal binary sync and GEM reservations are reused. The acceptance client has
+`--rcs-execute NODE`; it requires actual shader submission, byte/guard checks,
+output-sync wait and shared mmap-after-close before a RCS success marker.
+The host memory interpreter is not an EU simulator or proof of rendering.
+Sources/compiled-C tests cover context, WA lists, command/ring and IGT state;
+no host DRM node, physical GPU or protected-content path was exercised.
+
+Still missing for Mesa: ordinary per-file contexts/VM mapping, general shader
+batch validation/engine requests, complete QUERY/GETPARAM/context extensions,
+relocations/softpin residency and cache-domain contracts, scheduling/reset stats,
+exec sync-file/timeline variants and unmodified iris/ANV program acceptance.
+The bounded renderer is not advertised as full i915/Mesa support. TC/HPD/audio
+are not prerequisite dependencies for that GT work.

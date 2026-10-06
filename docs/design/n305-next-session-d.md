@@ -83,3 +83,17 @@ commit/pageflip/fence；当前固定帧缓冲CPU拷贝adapter不计Intel nativea
   开启，验证显示器audio能力/ELD、HDA HDMI pin/converter、48kHz双声道真实
   输出、静音/停止/拔线的生命周期；拔线或回滚要先撤掉audio valid，再安全
   停止DMA。当前HDA模拟音频不得为了让程序exit0而冒充HDMIcodec。
+
+### RCS fixed shader acceptance (software implemented; NOT hardware verified)
+
+Future user execution only: first establish the BCS baseline, then explicitly
+select `intel.gt=1 intel.rcs=1`. Expect the RCS-specific byte/guard marker only
+following real hardware completion and render-domain reset retirement. Neither
+QEMU unknown-GPU refusal nor the host memory model counts as rendering success.
+Then run `intel-bcs-smoke --rcs-execute /dev/dri/renderD128` in the graphics image;
+its fixed shader page, exact16384-byte readback, buffer guards, output binary
+sync and mmap-after-close must all pass. Unsupported revisions/layouts/pages/
+flags should refuse, and ambiguous DMA retirement should retain owners and
+close further submissions. Do not use the display fail_write switch for GT.
+This does not establish iris/OpenGL or ANV/Vulkan support; test those separately
+only after their actual general submit/context/query contracts are implemented.

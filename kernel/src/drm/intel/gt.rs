@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See the repository MIT license.
-//! Independently opted-in N305 BCS execution adapter. Never reached from the
+//! Independently opted-in N305 BCS/RCS execution adapter. Never reached from the
 //! display modeset flag; display D0 is not used as the GT/media A0 stepping.
 #[cfg(target_os = "none")]
 use alloc::{format, string::String};
 use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
-use intel_gt::{Error, GtIo};
 use axsync::Mutex;
+use intel_gt::{Error, GtIo};
 
 #[cfg(target_os = "none")]
 use super::pci;
@@ -20,6 +20,7 @@ struct Bus {
     window: RegisterWindow,
     awake: AtomicBool,
     render_awake: AtomicBool,
+    rcs_owned: AtomicBool,
 }
 impl Bus {
     fn allowed(&self, r: u32, write: bool) -> bool {
@@ -38,14 +39,53 @@ impl Bus {
             return !write;
         }
         if [0xb024, 0x209c, 0x9550].contains(&r) {
-            return self.render_awake.load(Ordering::Acquire) && (!write || r != 0x209c);
+            return self.render_awake.load(Ordering::Acquire)
+                && (!write || r != 0x209c || self.rcs_owned.load(Ordering::Acquire));
+        }
+        if self.rcs_owned.load(Ordering::Acquire) && self.render_awake.load(Ordering::Acquire) {
+            if matches!(r, 0x2030 | 0x2034 | 0x8000) {
+                return !write;
+            }
+            if matches!(
+                r,
+                0x209c
+                    | 0x229c
+                    | 0x20d0
+                    | 0x2080
+                    | 0x2098
+                    | 0x20a8
+                    | 0x20b0
+                    | 0x20b4
+                    | 0x20c4
+                    | 0x23a0
+                    | 0x2510
+                    | 0x2514
+                    | 0x2518
+                    | 0x251c
+                    | 0x2550
+                    | 0x20ec
+                    | 0xe4f4
+                    | 0xe18c
+                    | 0xe48c
+                    | 0x2050
+                    | 0x20e0
+                    | 0xb004
+                    | 0x20a0
+            ) {
+                return true;
+            }
+            if matches!(r, 0x20b8 | 0x5584) {
+                return !write;
+            }
         }
         self.awake.load(Ordering::Acquire)
             && match r {
                 0xc000 | 0x800c | 0xa2a0 | 0x22030 | 0x22034 => !write,
                 0x941c | 0x2209c | 0x2229c | 0x220d0 => true,
-                0xfdc | 0x9424 | 0x480c | 0x400c | 0x22080 | 0x22098 | 0x220a8 | 0x220b0 | 0x220b4 | 0x220c4
-                | 0x223a0 | 0x22510 | 0x22514 | 0x22518 | 0x2251c | 0x22550 => true,
+                0xfdc | 0x9424 | 0x480c | 0x400c | 0x22080 | 0x22098 | 0x220a8 | 0x220b0
+                | 0x220b4 | 0x220c4 | 0x223a0 | 0x22510 | 0x22514 | 0x22518 | 0x2251c | 0x22550 => {
+                    true
+                }
                 0x220b8 | 0x9138 | 0x913c => !write,
                 _ => false,
             }
@@ -67,12 +107,16 @@ impl GtIo for Bus {
         }
     }
     fn write(&self, r: u32, value: u32) -> Result<(), Error> {
-        if !self.allowed(r, true) || (r == 0x941c && value != 1 << 2) {
+        if !self.allowed(r, true)
+            || (r == 0x941c
+                && value != 1 << 2
+                && !(value == 1 << 1 && self.rcs_owned.load(Ordering::Acquire)))
+        {
             return Err(Error::Refused);
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same bounded owned GT allowlist. No display/global reset is
-        // allowed; GDRST is restricted to the Gen11+ BCS domain (bit2).
+        // allowed; GDRST is restricted to BCS (bit2) or owned RCS (bit1).
         unsafe { ((self.window.base() + r as usize) as *mut u32).write_volatile(value) };
         compiler_fence(Ordering::SeqCst);
         Ok(())
@@ -91,12 +135,15 @@ struct Owner {
     bdf: super::pci::Bdf,
     bus: Bus,
     lost: bool,
+    render_ready: bool,
     // Published before an ELSQ load; retained through any ambiguous reset/DMA.
     memory: Option<copy::Memory>,
 }
 pub(super) mod copy;
 static READY: AtomicBool = AtomicBool::new(false);
-pub(super) fn registered() -> bool { READY.load(Ordering::Acquire) }
+pub(super) fn registered() -> bool {
+    READY.load(Ordering::Acquire)
+}
 static OWNER: Mutex<Option<Owner>> = Mutex::new(None);
 
 /// Independent boot hook; default path never writes forcewake or resets GT.
@@ -142,12 +189,14 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
         window,
         awake: AtomicBool::new(false),
         render_awake: AtomicBool::new(false),
+        rcs_owned: AtomicBool::new(false),
     };
     if let Err(error) = intel_gt::uncore::acquire_gt(&bus) {
         *owner = Some(Owner {
             bdf,
             bus,
             lost: true,
+            render_ready: false,
             memory: None,
         });
         return Err(format!(
@@ -169,10 +218,23 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 bdf,
                 bus,
                 lost: false,
+                render_ready: false,
                 memory: None,
             };
-            let copied = copy::run(&mut device, bdf);
-            if copied.is_ok() { READY.store(true, Ordering::Release); }
+            let copied = copy::run(&mut device, bdf).and_then(|()| {
+                if axhal::boot::command_line_value("intel.rcs") == Some("1") {
+                    copy::render_test(&mut device)?;
+                    device.render_ready = true;
+                    axlog::info!(
+                        "intel-gt: RCS_SHADER_BYTES_AND_GUARDS_VERIFIED after hardware completion \
+                         and reset; not Mesa acceptance"
+                    );
+                }
+                Ok(())
+            });
+            if copied.is_ok() {
+                READY.store(true, Ordering::Release);
+            }
             if copied.is_err() {
                 device.lost = true;
             }
@@ -186,8 +248,8 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 })
                 .map_err(|e| {
                     format!(
-                        "intel-gt: BCS selftest failed {e:?}; unsafe-to-retire DMA owners retained, terminal \
-                         submission"
+                        "intel-gt: BCS selftest failed {e:?}; unsafe-to-retire DMA owners \
+                         retained, terminal submission"
                     )
                 })
         }
@@ -200,6 +262,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 bdf,
                 bus,
                 lost: true,
+                render_ready: false,
                 memory: None,
             });
             Err(format!(
@@ -211,16 +274,54 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
 }
 
 #[cfg(target_os = "none")]
-pub(super) fn submit_copy(source: alloc::sync::Arc<crate::mm::SharedPages>, destination: alloc::sync::Arc<crate::mm::SharedPages>, operation: intel_gt::bcs::Copy) -> Result<(), Error> {
-    if !registered() { return Err(Error::Refused); }
+pub(super) fn submit_copy(
+    source: alloc::sync::Arc<crate::mm::SharedPages>,
+    destination: alloc::sync::Arc<crate::mm::SharedPages>,
+    operation: intel_gt::bcs::Copy,
+) -> Result<(), Error> {
+    if !registered() {
+        return Err(Error::Refused);
+    }
     let mut state = OWNER.lock();
     let owner = state.as_mut().ok_or(Error::Refused)?;
     let result = copy::objects(owner, source, destination, operation);
-    if result.is_err() { owner.lost = true; }
+    if result.is_err() {
+        owner.lost = true;
+    }
+    result
+}
+#[cfg(target_os = "none")]
+pub(super) fn submit_render(
+    source: alloc::sync::Arc<crate::mm::SharedPages>,
+    destination: alloc::sync::Arc<crate::mm::SharedPages>,
+) -> Result<(), Error> {
+    if !registered() {
+        return Err(Error::Refused);
+    }
+    let mut state = OWNER.lock();
+    let owner = state.as_mut().ok_or(Error::Refused)?;
+    if !owner.render_ready {
+        return Err(Error::Refused);
+    }
+    let result = copy::render_objects(owner, source, destination);
+    if result.is_err() {
+        owner.lost = true;
+    }
     result
 }
 #[cfg(not(target_os = "none"))]
-pub(super) fn submit_copy(_source: alloc::sync::Arc<crate::mm::SharedPages>, _destination: alloc::sync::Arc<crate::mm::SharedPages>, _operation: intel_gt::bcs::Copy) -> Result<(), Error> {
+pub(super) fn submit_render(
+    _source: alloc::sync::Arc<crate::mm::SharedPages>,
+    _destination: alloc::sync::Arc<crate::mm::SharedPages>,
+) -> Result<(), Error> {
+    Err(Error::Refused)
+}
+#[cfg(not(target_os = "none"))]
+pub(super) fn submit_copy(
+    _source: alloc::sync::Arc<crate::mm::SharedPages>,
+    _destination: alloc::sync::Arc<crate::mm::SharedPages>,
+    _operation: intel_gt::bcs::Copy,
+) -> Result<(), Error> {
     Err(Error::Refused) // No host/native CPU-copy fallback.
 }
 
@@ -240,6 +341,7 @@ mod tests {
             window,
             awake: AtomicBool::new(false),
             render_awake: AtomicBool::new(false),
+            rcs_owned: AtomicBool::new(false),
         };
         assert_eq!(bus.write(0x2209c, 0x01000100), Err(Error::Refused));
         assert_eq!(bus.read(0x22030), Err(Error::Unavailable(0x22030)));
@@ -248,6 +350,15 @@ mod tests {
         assert_eq!(bus.write(0x941c, 1), Err(Error::Refused));
         assert_eq!(bus.write(0x941c, 8), Err(Error::Refused));
         assert_eq!(bus.write(0x46038, u32::MAX), Err(Error::Refused));
+        assert_eq!(bus.write(0x941c, 2), Err(Error::Refused));
+        assert_eq!(bus.write(0x2550, 1), Err(Error::Refused));
+        bus.render_awake.store(true, Ordering::Release);
+        assert_eq!(bus.write(0x2550, 1), Err(Error::Refused));
+        bus.rcs_owned.store(true, Ordering::Release);
+        bus.write(0x941c, 2).unwrap();
+        bus.write(0x2550, 1).unwrap();
+        assert_eq!(bus.write(0x941c, 6), Err(Error::Refused));
+        assert_eq!(bus.write(0xc000, 0), Err(Error::Refused));
         bus.write(0x941c, 4).unwrap();
         assert_eq!(words[0x941c / 4], 4);
         assert_eq!(words[0x46038 / 4], 0);

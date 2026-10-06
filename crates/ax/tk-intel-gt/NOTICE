@@ -40,7 +40,7 @@ Copyright © 2014-2018 Intel; intel_sseu.c live Gen12 single-slice/DSS facts,
 Copyright © 2019 Intel; intel_gtt.c tgl_setup_private_ppat (UC index3),
 Copyright © 2020 Intel; intel_mocs.c Gen12 UC entry3/paired L3 policy,
 Copyright © 2015 Intel; intel_gt_mcr.c multicast/steering facts,
-Copyright © 2022 Intel Corporation. No media engine or RCS WA is executed.
+Copyright © 2022 Intel Corporation. This BCS slice does not execute media engine or RCS WAs (RCS additions below).
 
 Safety scope: one kernel-owned privileged BCS context, no user batch uAPI;
 no semaphores/scheduler/preemption clients. All unused VM branches reach an
@@ -61,3 +61,37 @@ combined display+GT:15 at25,3 at40. No fenced/comment/marker matches or exemptio
 Native ELSQ/HWSP/CSB sequence adapts gt/intel_execlists_submission.c
 enable_execlists/reset_csb_pointers, Copyright © 2014 Intel Corporation,
 under this full MIT grant; memory/admission/retirement policy is original.
+
+RCS Gen12.0 additions (exact N305; not generic GPU support):
+src/rcs.rs extends source intel_lrc.c gen12_rcs_offsets,14-page render image,
+intel_sseu_make_rpcs single-slice branch, timestamp/command-buffer/GPR restore,
+AUX, mandatory Wa_18022495364 state-cache invalidation and predicate BB.
+Source gen8_engine_cs.c/.h RCS flush/breadcrumb includes depth-stall workaround,
+N305 L3 flush and source arbitration/WA tail. Source intel_workarounds.c
+engine_fake_wa_init, general_render_compute_wa_init, rcs_engine_wa_init and
+gen12_ctx_workarounds_init select exact ADL-P/ADL-N Gen12.0 branches, with
+MCR ownership/recovery and unreliable FF_MODE2 readback rule retained.
+Copyright ©2014/2014-2018/2019 Intel, full grant LICENSE-MIT.
+
+src/rcs_page.rs is an immutable bounded64x64 linear shader rectangle adapted
+from Intel-hosted IGT backport/v6.17 lib/rendercopy_gen9.c gen12_render_copy and
+_gen9_render_op (including its named state/command helpers and associated
+render/surfaceformat headers). Full original IGT COPYING is LICENSE-IGT;
+source metadata/grants are preserved also by the temporary compiler oracle.
+No GPL driver body, protected content, compression, firmware binary or shader
+compiler is imported. Shader words come from licensed source, not guessed EU
+instructions. Kernel and user acceptance payload carry the same state/page.
+Explicit cache-policy adaptation uses published Mesa26.1.2 gen110/gen120.xml
+wire facts: full22-word SBA and UC6 MOCS for address classes and vertex buffer,
+rather than inherited/unknown MOCS0; all shader/other state remains unchanged.
+Source-only IGT oracle input is task-local; temporary compiler files are removed
+by the test harness. Host interpreter models memory/retirement only, not EUs.
+No real rendering, physical reset or Mesa acceptance is claimed by these tests.
+
+Current scoped excerpt inventory:78 code lines at25,74 at40 (no fenced/comment/
+marker matches). This is the prior3/1, two additional conventional C-shim
+INVALID_MMIO_REG definitions at25, and73 repeated all-zero data rows at both
+thresholds in the compiled-IGT-derived page that also occur in Linux arrays.
+The data rows are not copied Linux function bodies; provenance and the original
+IGT grants are retained. Combined display+GT totals90/76; crates/ax baseline
+outside/code43/32→118/107 at25,18/11→91/84 at40. No scanner exemption.

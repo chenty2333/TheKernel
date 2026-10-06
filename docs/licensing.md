@@ -349,3 +349,12 @@ adapter is original MIT; no arbitrary user batches, GPL or binary firmware.
 using public i915/DRM wire facts. It is installed by the existing graphics
 image builder; it does not bundle a driver, binary firmware or a CPU-copy
 replacement. Compilation/usage checks are not native hardware validation.
+
+The N305 RCS source context/ring/reset/workaround selections remain under
+`tk-intel-gt/LICENSE-MIT` with exact functions/copyrights in NOTICE. The bounded
+RCS shader/state page and corresponding acceptance header are from licensed
+Intel-hosted IGT backport/v6.17 source, with the full original multi-author
+COPYING retained as `tk-intel-gt/LICENSE-IGT`. The original test-only C shim
+extracts unchanged selected IGT functions, retains that full grant and performs
+no DRM ioctl or GPU action. Mesa26.1.2 Gen120 packet/cache fields are used as
+wire facts, not a copied driver/compiler. No firmware or GPL driver is bundled.

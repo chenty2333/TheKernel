@@ -3,7 +3,7 @@
 // Native sequence adapts Linux7.2.3 gt/intel_execlists_submission.c
 // enable_execlists/reset_csb_pointers (Copyright © 2014 Intel Corporation).
 // Full MIT grant and inventory: crates/ax/tk-intel-gt/LICENSE-MIT and NOTICE.
-//! One kernel-owned BCS copy, no arbitrary batch or Mesa claim. Software
+//! Kernel-owned BCS copy or fixed RCS shader, no arbitrary batch/Mesa claim. Software
 //! preparation uses existing SharedPages/GGTT; DMA ownership precedes ELSQ load.
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{Ordering, fence};
@@ -126,6 +126,7 @@ pub(super) struct Memory {
     descriptor: u64,
     operation: bcs::Copy,
     selftest: bool,
+    render: bool,
 }
 impl Memory {
     fn allocate(gtt: Arc<Gtt>) -> Result<Self, Error> {
@@ -152,6 +153,7 @@ impl Memory {
                 pitch: 256,
             },
             selftest: true,
+            render: false,
         })
     }
     fn from_objects(
@@ -216,12 +218,22 @@ impl Memory {
         let regs: &mut [u32; 1024] = regs_data.as_mut_slice().try_into().unwrap();
         let indirect: &mut [u32; 1024] = indirect_data.as_mut_slice().try_into().unwrap();
         let per_ctx: &mut [u32; 1024] = per_data.as_mut_slice().try_into().unwrap();
-        self.descriptor = lrc::build(regs, indirect, per_ctx, ctx, ring, 120, p[0])?;
+        self.descriptor = if self.render {
+            intel_gt::rcs::build_context(regs, indirect, per_ctx, ctx, ring, 78 * 4, p[0])?
+        } else {
+            lrc::build(regs, indirect, per_ctx, ctx, ring, 120, p[0])?
+        };
         self.context.dwords(1, regs)?;
-        self.context.dwords(2, indirect)?;
-        self.context.dwords(3, per_ctx)?;
+        self.context
+            .dwords(if self.render { 14 } else { 2 }, indirect)?;
+        self.context
+            .dwords(if self.render { 15 } else { 3 }, per_ctx)?;
         let batch = bcs::batch(self.operation)?;
-        self.batch.dwords(0, &batch)?;
+        if self.render {
+            self.batch.dwords(0, &intel_gt::rcs_page::PAGE)?;
+        } else {
+            self.batch.dwords(0, &batch)?;
+        }
         let count = bcs::ring(regs, 0x30000, ctx, 1)?;
         self.ring.dwords(0, &regs[..count])?;
         if self.selftest {
@@ -230,7 +242,7 @@ impl Memory {
                 .map_err(|_| Error::Refused)?;
             data.resize(6 * PAGE, 0xa5);
             for (i, b) in data[PAGE..PAGE + PAYLOAD].iter_mut().enumerate() {
-                *b = pattern(i);
+                *b = self.pattern(i);
             }
             self.source.write(0, &data)?;
             data.fill(0x5a);
@@ -252,6 +264,26 @@ impl Memory {
         }
         Ok(())
     }
+    fn pattern(&self, i: usize) -> u8 {
+        if self.render && i % 4 == 3 {
+            255
+        } else {
+            pattern(i)
+        }
+    }
+    fn render_ring(&self, io: &impl GtIo) -> Result<(), Error> {
+        let mut words = [0u32; 78];
+        let mut normal = [0u32; 42];
+        intel_gt::rcs::ring(&mut normal, 0x30000, self.bindings[0].address as u32, 1)?;
+        words[..22].copy_from_slice(&normal[..22]);
+        words[1] |= 1 << 27; // before-WA full barrier.
+        intel_gt::rcs::context_wa(io, &mut words[22..36])?;
+        words[36..].copy_from_slice(&normal);
+        words[37] |= 1 << 27; // after-WA full barrier.
+        self.ring.dwords(0, &words)?;
+        self.ring.flush();
+        Ok(())
+    }
     fn verify(&self) -> Result<(), Error> {
         self.source.flush();
         self.destination.flush();
@@ -268,7 +300,7 @@ impl Memory {
                 || data[PAGE..PAGE + PAYLOAD]
                     .iter()
                     .enumerate()
-                    .any(|(i, &b)| b != pattern(i))
+                    .any(|(i, &b)| b != self.pattern(i))
             {
                 return Err(Error::Refused);
             }
@@ -277,7 +309,7 @@ impl Memory {
     }
     fn release(&mut self) -> Result<(), Error> {
         for binding in self.bindings.iter().rev() {
-            // SAFETY: only reached after successful source BCS stop/reset,
+            // SAFETY: only reached after successful source selected-engine stop/reset,
             // pending-MI-wake/ready/GDRST/cancel checks; no other engine sees
             // this private context, ring, status or PPGTT. RAM stays pinned.
             unsafe { self.gtt.release_binding(binding) }.map_err(|_| Error::Quarantined)?;
@@ -297,38 +329,39 @@ fn pattern(index: usize) -> u8 {
 }
 
 fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
+    let base = if memory.render { 0x2000 } else { 0x22000 };
     let status = memory.bindings[2].address as u32;
     // Polling selftest masks engine IRQs; USER_INTERRUPT cannot become an
     // unowned CPU IRQ. Preserve the source HWSTAM and error-clear setup.
-    io.write(0x220a8, u32::MAX)?;
-    io.write(0x22098, u32::MAX)?;
-    io.write(0x220b4, u32::MAX)?;
-    io.write(0x220b0, u32::MAX)?;
-    if io.read(0x220b8)? != 0 {
+    io.write(base + 0x0a8, u32::MAX)?;
+    io.write(base + 0x098, u32::MAX)?;
+    io.write(base + 0x0b4, u32::MAX)?;
+    io.write(base + 0x0b0, u32::MAX)?;
+    if io.read(base + 0x0b8)? != 0 {
         return Err(Error::Refused);
     }
     io.write(
-        0x2229c,
+        base + 0x29c,
         intel_gt::masked_enable(1 << 3) | intel_gt::masked_disable(1 << 10),
     )?;
-    io.write(0x2209c, intel_gt::masked_disable(1 << 8))?;
-    io.write(0x22080, status)?;
-    if io.read(0x22080)? != status {
+    io.write(base + 0x09c, intel_gt::masked_disable(1 << 8))?;
+    io.write(base + 0x080, status)?;
+    if io.read(base + 0x080)? != status {
         return Err(Error::Refused);
     }
-    io.write(0x220c4, (0x3fff << 16) | 6 | (6 << 7))?; // source UC index3 read/write.
+    io.write(base + 0x0c4, (0x3fff << 16) | 6 | (6 << 7))?; // source UC index3 read/write.
     // Source CSB read/write pointer reset: Gen11 twelve slots, invalid index11.
-    io.write(0x223a0, 0xffff0000 | (11 << 8) | 11)?;
-    io.read(0x223a0)?;
-    io.write(0x223a0, 0xffff0000 | (11 << 8) | 11)?;
-    io.read(0x223a0)?;
+    io.write(base + 0x3a0, 0xffff0000 | (11 << 8) | 11)?;
+    io.read(base + 0x3a0)?;
+    io.write(base + 0x3a0, 0xffff0000 | (11 << 8) | 11)?;
+    io.read(base + 0x3a0)?;
     fence(Ordering::SeqCst);
     // Gen12 ELSQ writes port1 then port0, low then high, then explicit load.
-    io.write(0x22518, 0)?;
-    io.write(0x2251c, 0)?;
-    io.write(0x22510, memory.descriptor as u32)?;
-    io.write(0x22514, (memory.descriptor >> 32) as u32)?;
-    io.write(0x22550, 1)?;
+    io.write(base + 0x518, 0)?;
+    io.write(base + 0x51c, 0)?;
+    io.write(base + 0x510, memory.descriptor as u32)?;
+    io.write(base + 0x514, (memory.descriptor >> 32) as u32)?;
+    io.write(base + 0x550, 1)?;
     let start = io.now_us();
     let mut value = [0u8; 4];
     for _ in 0..100_000 {
@@ -338,22 +371,27 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
             fence(Ordering::SeqCst);
             return Ok(());
         }
-        if io.read(0x220b8)? != 0 {
+        if io.read(base + 0x0b8)? != 0 {
             return Err(Error::Refused);
         }
         if io.now_us().saturating_sub(start) > 500_000 {
-            return Err(Error::Timeout(0x22550));
+            return Err(Error::Timeout(base + 0x550));
         }
         io.delay_us(10);
     }
-    Err(Error::Timeout(0x22550))
+    Err(Error::Timeout(base + 0x550))
 }
 
 // Outer error means quiescence was not established: caller MUST retain all
 // DMA owners. An inner error can be reported after safe scoped unbinding.
 fn execute_and_quiesce(io: &impl GtIo, memory: &Memory) -> Result<Result<(), Error>, Error> {
     let executed = submit(io, memory);
-    intel_gt::reset::stop_and_reset_bcs(io).map_err(|_| Error::Quarantined)?;
+    if memory.render {
+        intel_gt::reset::stop_and_reset_rcs(io)
+    } else {
+        intel_gt::reset::stop_and_reset_bcs(io)
+    }
+    .map_err(|_| Error::Quarantined)?;
     Ok(executed.and_then(|()| {
         if memory.selftest {
             memory.verify()
@@ -389,6 +427,80 @@ pub(super) fn run(owner: &mut super::Owner, bdf: pci::Bdf) -> Result<(), Error> 
     memory.release()?;
     owner.memory = None;
     verified
+}
+
+/// Shader-driven 3D rectangle selftest, not BCS or a CPU-copy fallback.
+#[cfg(target_os = "none")]
+pub(super) fn render_test(owner: &mut super::Owner) -> Result<(), Error> {
+    if owner.memory.is_some() || owner.lost {
+        return Err(Error::Quarantined);
+    }
+    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    if owner.bus.read(0xc000)? & 1 == 0 || owner.bus.read(0x209c)? & (1 << 9) == 0 {
+        return Err(Error::Refused);
+    }
+    owner.bus.rcs_owned.store(true, Ordering::Release);
+    intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
+    bcs::prepare(&owner.bus)?;
+    intel_gt::rcs::prepare(&owner.bus)?;
+    let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+    let mut memory = Memory::allocate(gtt)?;
+    memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?;
+    memory.render = true;
+    owner.memory = Some(memory);
+    let memory = owner.memory.as_mut().unwrap();
+    memory.bind_and_build()?;
+    memory.render_ring(&owner.bus)?;
+    let verified = execute_and_quiesce(&owner.bus, memory)?;
+    memory.release()?;
+    owner.memory = None;
+    // Render reset may lose shared render-domain L3 policy. Restore the single
+    // UC policy used by subsequent BCS jobs while all engines remain stopped.
+    bcs::prepare(&owner.bus)?;
+    verified
+}
+
+#[cfg(target_os = "none")]
+pub(super) fn render_objects(
+    owner: &mut super::Owner,
+    source: Arc<SharedPages>,
+    destination: Arc<SharedPages>,
+) -> Result<(), Error> {
+    if owner.lost || owner.memory.is_some() {
+        return Err(Error::Quarantined);
+    }
+    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    if owner.bus.read(intel_gt::uncore::GT_ACK)? & 1 == 0
+        || owner.bus.read(intel_gt::uncore::RENDER_ACK)? & 1 == 0
+        || owner.bus.read(0xc000)? & 1 == 0
+    {
+        return Err(Error::Refused);
+    }
+    intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
+    bcs::prepare(&owner.bus)?;
+    intel_gt::rcs::prepare(&owner.bus)?;
+    let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+    let operation = bcs::Copy {
+        source: 0x11000,
+        destination: 0x21000,
+        source_bytes: PAYLOAD as u64,
+        destination_bytes: PAYLOAD as u64,
+        width: 64,
+        height: 64,
+        pitch: 256,
+    };
+    let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
+    memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?;
+    memory.render = true;
+    owner.memory = Some(memory);
+    let memory = owner.memory.as_mut().unwrap();
+    memory.bind_and_build()?;
+    memory.render_ring(&owner.bus)?;
+    let result = execute_and_quiesce(&owner.bus, memory)?;
+    memory.release()?;
+    owner.memory = None;
+    bcs::prepare(&owner.bus)?;
+    result
 }
 
 /// Scoped synchronous execution over existing GEM SharedPages. Caller owns all
@@ -493,6 +605,28 @@ pub(in crate::drm::intel) mod tests {
             if (u64::from(high) << 32) | u64::from(low) != self.memory.tables.physical[0] {
                 return Err(Error::Refused);
             }
+            if self.memory.render {
+                // HOST MODEL only: validate the actual immutable 3D page and
+                // private mappings, then model the fixed rectangle transfer.
+                // This does not emulate EU instructions or prove GPU rendering.
+                for (i, expected) in intel_gt::rcs_page::PAGE.iter().enumerate() {
+                    let mut bytes = [0; 4];
+                    self.physical(self.translate(0x30000 + i as u64 * 4, false)?, &mut bytes)?;
+                    if u32::from_le_bytes(bytes) != *expected {
+                        return Err(Error::Refused);
+                    }
+                }
+                for i in 0..PAYLOAD {
+                    let mut value = [0];
+                    self.physical(self.translate(0x11000 + i as u64, false)?, &mut value)?;
+                    let (ram, offset) = self.ram(self.translate(0x21000 + i as u64, true)?)?;
+                    ram.write(offset, &value)?;
+                }
+                return self
+                    .memory
+                    .context
+                    .write(lrc::SCRATCH as usize, &1u32.to_le_bytes());
+            }
             let mut words = [0u32; 14];
             for (i, w) in words.iter_mut().enumerate() {
                 let mut d = [0; 4];
@@ -542,12 +676,12 @@ pub(in crate::drm::intel) mod tests {
         fn write(&self, r: u32, v: u32) -> Result<(), Error> {
             self.log.borrow_mut().push((r, v));
             let mut words = self.words.borrow_mut();
-            if [0x2209c, 0x2229c, 0x220d0].contains(&r) {
+            if [0x2209c, 0x2229c, 0x220d0, 0x209c, 0x229c, 0x20d0].contains(&r) {
                 let old = words.get(&r).copied().unwrap_or(0);
                 let value = (old & !(v >> 16)) | (v & (v >> 16));
                 words.insert(
                     r,
-                    if r == 0x220d0 && value & 1 != 0 {
+                    if [0x220d0, 0x20d0].contains(&r) && value & 1 != 0 {
                         value | 2
                     } else {
                         value
@@ -557,7 +691,7 @@ pub(in crate::drm::intel) mod tests {
                 words.insert(r, if r == 0x941c { 0 } else { v });
             }
             drop(words);
-            if r == 0x22550 && self.execute {
+            if [0x22550, 0x2550].contains(&r) && self.execute {
                 self.gpu()?;
             }
             if self.fail_write.get() == Some(self.log.borrow().len()) {
@@ -591,6 +725,14 @@ pub(in crate::drm::intel) mod tests {
                 (0x800c, 0),
                 (0xa2a0, 0),
                 (0x941c, 0),
+                (0x20b8, 0),
+                (0x209c, 1 << 9),
+                (0x229c, 0),
+                (0x20d0, 0),
+                (0x8000, 0),
+                (0xfdc, 0x80000000),
+                (0x913c, 1),
+                (0x5584, 0),
             ])),
             log: RefCell::new(Vec::new()),
             clock: Cell::new(0),
@@ -603,15 +745,132 @@ pub(in crate::drm::intel) mod tests {
         destination: Arc<SharedPages>,
         operation: bcs::Copy,
     ) -> Result<(), Error> {
+        objects_kind(source, destination, operation, false)
+    }
+    pub(in crate::drm::intel) fn render_objects(
+        source: Arc<SharedPages>,
+        destination: Arc<SharedPages>,
+    ) -> Result<(), Error> {
+        objects_kind(
+            source,
+            destination,
+            bcs::Copy {
+                source: 0x11000,
+                destination: 0x21000,
+                source_bytes: PAYLOAD as u64,
+                destination_bytes: PAYLOAD as u64,
+                width: 64,
+                height: 64,
+                pitch: 256,
+            },
+            true,
+        )
+    }
+    fn objects_kind(
+        source: Arc<SharedPages>,
+        destination: Arc<SharedPages>,
+        operation: bcs::Copy,
+        render: bool,
+    ) -> Result<(), Error> {
         let array = super::super::super::gtt::mock::MockPageTable::new(65536);
         let gtt = Arc::new(Gtt::over(Box::new(array)).unwrap());
         let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
+        if render {
+            memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?;
+            memory.render = true;
+        }
         memory.bind_and_build()?;
         let io = model(&memory, true);
+        if render {
+            memory.render_ring(&io)?;
+        }
         let outcome = execute_and_quiesce(&io, &memory)?;
         drop(io);
         memory.release()?;
         outcome
+    }
+    #[test]
+    fn rcs_driver_model_uses_real_private_page_context_and_reset_before_result_retirement() {
+        let _context = crate::test_support::scheduler_test_context();
+        let mut memory = memory();
+        memory.release().unwrap();
+        memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES).unwrap();
+        memory.render = true;
+        memory.bind_and_build().unwrap();
+        let io = model(&memory, true);
+        memory.render_ring(&io).unwrap();
+        execute_and_quiesce(&io, &memory).unwrap().unwrap();
+        assert_eq!(
+            io.log
+                .borrow()
+                .iter()
+                .filter(|(r, v)| *r == 0x941c && *v == 2)
+                .count(),
+            2
+        );
+        assert!(!io.log.borrow().iter().any(|(r, _)| *r == 0x22550));
+        drop(io);
+        memory.release().unwrap();
+        assert!(memory.bindings.is_empty());
+    }
+    #[test]
+    fn rcs_landed_submission_faults_reset_the_render_domain_before_unbinding() {
+        let _context = crate::test_support::scheduler_test_context();
+        let mut baseline = memory();
+        baseline.release().unwrap();
+        baseline.context = Ram::allocate(16).unwrap();
+        baseline.render = true;
+        baseline.bind_and_build().unwrap();
+        let io = model(&baseline, true);
+        baseline.render_ring(&io).unwrap();
+        let before = io.log.borrow().len();
+        submit(&io, &baseline).unwrap();
+        let count = io.log.borrow().len() - before;
+        intel_gt::reset::stop_and_reset_rcs(&io).unwrap();
+        drop(io);
+        baseline.release().unwrap();
+        for prefix in 1..=count {
+            let mut m = memory();
+            m.release().unwrap();
+            m.context = Ram::allocate(16).unwrap();
+            m.render = true;
+            m.bind_and_build().unwrap();
+            let io = model(&m, true);
+            m.render_ring(&io).unwrap();
+            let before = io.log.borrow().len();
+            io.fail_write.set(Some(before + prefix));
+            assert!(execute_and_quiesce(&io, &m).unwrap().is_err());
+            assert_eq!(
+                io.log
+                    .borrow()
+                    .iter()
+                    .filter(|(r, v)| *r == 0x941c && *v == 2)
+                    .count(),
+                2
+            );
+            assert_eq!(m.bindings.len(), 3);
+            drop(io);
+            m.release().unwrap();
+        }
+    }
+    #[test]
+    fn completed_rcs_breadcrumb_does_not_authorize_retirement_after_ambiguous_reset() {
+        let _context = crate::test_support::scheduler_test_context();
+        let mut memory = memory();
+        memory.release().unwrap();
+        memory.context = Ram::allocate(intel_gt::rcs::CONTEXT_PAGES).unwrap();
+        memory.render = true;
+        memory.bind_and_build().unwrap();
+        let io = model(&memory, true);
+        memory.render_ring(&io).unwrap();
+        let setup = io.log.borrow().len();
+        submit(&io, &memory).unwrap();
+        memory.verify().unwrap();
+        let writes = io.log.borrow().len() - setup;
+        io.fail_write.set(Some(setup + writes * 2 + 1));
+        assert_eq!(execute_and_quiesce(&io, &memory), Err(Error::Quarantined));
+        assert_eq!(memory.bindings.len(), 3);
+        assert!(Arc::strong_count(&memory.context.pages) > 1);
     }
     #[test]
     fn native_copy_submission_model_walks_private_vm_compares_guards_and_retires_after_reset() {
