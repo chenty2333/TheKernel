@@ -1826,7 +1826,7 @@ errno_order = ["explicit-none"]
 usercopy = ["explicit-none"]
 state = ["state:encode the low eight exit-code bits into wait status; terminate caller thread"]
 concurrency = ["concurrency:coordinate exiting task with group lifetime and waiter notification"]
-teardown = ["teardown:release exiting task resources and publish reaping state"]
+teardown = ["teardown:release exiting task resources and publish reaping state; orphan adoption searches the exiting parent PID-namespace scope, including an outer runtime's nested-init child"]
 
 [[cell]]
 number = 60
@@ -1835,7 +1835,7 @@ status = "implemented"
 contract = "linux-exit"
 handler = "kernel/src/syscall/task/exit.rs:sys_exit"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/exit-status.c:main"]
+tests = ["tests/guest/portable/exit-status.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["Raw status regression passed host Linux and TheKernel KVM; matched Linux 7.2.3 oracle and multithread group teardown matrix remain pending"]
 limitations = ["explicit-none"]
 
@@ -1849,7 +1849,7 @@ errno_order = ["explicit-none"]
 usercopy = ["explicit-none"]
 state = ["state:encode the low eight exit-code bits into wait status; terminate caller thread and its thread group"]
 concurrency = ["concurrency:coordinate exiting task with group lifetime and waiter notification"]
-teardown = ["teardown:release exiting task resources and publish reaping state"]
+teardown = ["teardown:release exiting task resources and publish reaping state; orphan adoption searches the exiting parent PID-namespace scope, including an outer runtime's nested-init child"]
 
 [[cell]]
 number = 231
@@ -1858,7 +1858,7 @@ status = "implemented"
 contract = "linux-exit_group"
 handler = "kernel/src/syscall/task/exit.rs:sys_exit_group"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/exit-status.c:main"]
+tests = ["tests/guest/portable/exit-status.c:main", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["Raw status regression passed host Linux and TheKernel KVM; matched Linux 7.2.3 oracle and multithread group teardown matrix remain pending"]
 limitations = ["explicit-none"]
 

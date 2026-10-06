@@ -912,3 +912,28 @@ from the guest script; no hello or success marker was observed. This is not a
 passing container result. Next run this one probe with a guest-side observer to
 inspect the real runtime state; previous early fchown failure is not assumed
 resolved solely from an overall harness timeout.
+
+### Outer subreaper must adopt the nested namespace init
+
+A single-probe guest observer (`shell-_unmddgn`) confirms the actual container
+starts and prints hello, but Podman/conmon remain waiting after it exits. Conmon
+reports the container is not its child. The process core chooses orphan adoption
+using the child's reaper scope, incorrectly skipping the live outer conmon
+subreaper when its crun child exits with a nested PID-namespace init child.
+Linux7.2.3 kernel/exit.c find_new_reaper searches at the *exiting father's* PID
+namespace level; its selected reaper then inherits all that father's children.
+
+The core now uses the exiting parent's scope for that search and init fallback.
+Child scope/namespace membership is unchanged. The old injected-child host
+fixture encoded the incorrect child-scope assumption; it now requires the
+parent-scope handoff for all those children, and a separate live outer-subreaper
+fixture models conmon/runtime/nested-init directly. Paired wait4 coverage blocks
+an actual nested PID1 until its outer parent exits, then requires the subreaper
+reap its genuine exit45 status and a subsequent ESRCH probe, not guessed status.
+Process/core-adapter host81, related Python7, lint784, KVM system70/70
+(`system-afzsn_bx`) and paired wait-abi21/259 (`abi-p1qwkoai`) passed. The first
+ABI attempt had an unregistered assertion set and a duplicate child-side print;
+those fixture/registry defects were corrected, not counted as a passing run.
+Actual Podman (`shell-isly4jyf`) now receives a genuine conmon exit status rather
+than hanging. That run reports container exit1 and crun start SIGPIPE before
+hello; inspect its retained OCI logs next. Full Podman acceptance is still pending.

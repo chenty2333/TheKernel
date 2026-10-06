@@ -22,6 +22,7 @@
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -622,6 +623,49 @@ int main(void)
               WEXITSTATUS(nothread_zombie_status) == 7);
         atomic_store_explicit(&nothread_stage, 5, memory_order_release);
         check("wait4-wnothread-thread-join", pthread_join(forker, NULL) == 0);
+    }
+    /* Linux exit.c chooses subreapers using the exiting father's PID
+     * namespace level, even when its orphan is a nested namespace init. */
+    {
+        int release[2], identity[2];
+        check("outer-subreaper-enable", prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+        check("outer-subreaper-release-pipe", pipe(release) == 0);
+        check("outer-subreaper-identity-pipe", pipe(identity) == 0);
+        pid_t runtime = fork();
+        if (runtime == 0) {
+            close(release[1]);
+            close(identity[0]);
+            if (unshare(CLONE_NEWPID)) _exit(41);
+            pid_t container = fork();
+            if (container < 0) _exit(42);
+            if (container == 0) {
+                close(identity[1]);
+                char byte;
+                if (getpid() != 1 || read(release[0], &byte, 1) != 1) _exit(43);
+                _exit(45);
+            }
+            if (write(identity[1], &container, sizeof(container)) != sizeof(container)) _exit(44);
+            _exit(0);
+        }
+        check("outer-subreaper-runtime-fork", runtime >= 0);
+        close(release[0]);
+        close(identity[1]);
+        pid_t container = -1;
+        check("outer-subreaper-container-identity",
+              read(identity[0], &container, sizeof(container)) == sizeof(container) && container > 0);
+        int status = -1;
+        check("outer-subreaper-runtime-reap", waitpid(runtime, &status, 0) == runtime &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        check("outer-subreaper-container-live", kill(container, 0) == 0);
+        check("outer-subreaper-container-release", write(release[1], "x", 1) == 1);
+        status = -1;
+        check("outer-subreaper-real-container-status", waitpid(container, &status, 0) == container &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 45);
+        errno = 0;
+        check("outer-subreaper-container-reaped", kill(container, 0) == -1 && errno == ESRCH);
+        close(release[1]);
+        close(identity[0]);
+        check("outer-subreaper-disable", prctl(PR_SET_CHILD_SUBREAPER, 0) == 0);
     }
     done();
 

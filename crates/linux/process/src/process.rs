@@ -703,9 +703,9 @@ pub struct ProcessDomain<Z> {
 
 /// One independent reparenting domain, normally corresponding to one PID namespace.
 ///
-/// A scope has exactly one init process.  Reparenting never selects a child
-/// subreaper from another scope and falls back to this init when no eligible
-/// ancestor exists in the scope.
+/// A scope has exactly one init process. Reparenting searches subreapers in
+/// the exiting parent's scope, not the orphan's scope, and falls back to the
+/// parent scope's init when no eligible ancestor exists.
 pub struct ReaperScope<Z> {
     registry: Weak<ProcessRegistry<Z>>,
     // Some retains the initialized identity even after reap drops the process.
@@ -1640,7 +1640,7 @@ impl<Z> ProcessExitAdmission<Z> {
                     continue;
                 }
                 let selection =
-                    select_reaper_for_exit_locked(&self.process, &child, &child.reaper_scope);
+                    select_reaper_for_exit_locked(&self.process, &child, &self.process.reaper_scope);
                 let reaper = selection.reaper;
                 let retired_first_ancestor = selection.retired_first_ancestor;
                 if batch_reaper
@@ -2953,7 +2953,7 @@ mod tests {
     }
 
     #[test]
-    fn reparenting_is_scoped_and_never_mixes_handoff_reapers() {
+    fn reparenting_uses_exiting_parent_scope_even_for_injected_children() {
         let domain = ProcessDomain::<()>::try_new().unwrap();
         let root = domain.try_new_init(1, None).unwrap();
         domain.prepare_thread(&root, 1).unwrap().commit().unwrap();
@@ -2994,19 +2994,40 @@ mod tests {
             |_| {},
             |batch| {
                 for moved in batch.reparented() {
-                    let expected = if Arc::ptr_eq(moved.child(), &scoped_child) {
-                        &scoped_init
-                    } else {
-                        &root
-                    };
-                    assert!(Arc::ptr_eq(batch.reaper(), expected));
+                    assert!(Arc::ptr_eq(batch.reaper(), &root));
+                    assert!(Arc::ptr_eq(&moved.child().parent().unwrap(), &root));
                 }
             },
         );
 
-        assert!(Arc::ptr_eq(&scoped_child.parent().unwrap(), &scoped_init));
+        assert!(Arc::ptr_eq(&scoped_child.parent().unwrap(), &root));
         assert!(Arc::ptr_eq(&scoped_init.parent().unwrap(), &root));
         assert!(Arc::ptr_eq(&root_child.parent().unwrap(), &root));
+    }
+
+    #[test]
+    fn outer_runtime_orphaned_namespace_init_is_adopted_by_outer_subreaper() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let root = domain.try_new_init(1, None).unwrap();
+        domain.prepare_thread(&root, 1).unwrap().commit().unwrap();
+        let subreaper = domain.prepare_fork(&root, 2, None).unwrap()
+            .prepare_initial_thread(2).unwrap().commit();
+        subreaper.set_child_subreaper(true);
+        let runtime = domain.prepare_fork(&subreaper, 3, None).unwrap()
+            .prepare_initial_thread(3).unwrap().commit();
+        let scope = domain.try_new_reaper_scope().unwrap();
+        let container = domain.prepare_fork_as_reaper_scope_init_with_identity(
+            &runtime, &scope, 4, None, (),
+        ).unwrap().prepare_initial_thread(4).unwrap().commit().unwrap();
+        let exit = match domain.exit_thread(&runtime, 3, 0).unwrap() {
+            ThreadExitTransition::FinalThread(exit) => exit,
+            _ => panic!("runtime final exit"),
+        };
+        exit.commit_with_reparent_handoff(Arc::new(()), |_| {}, |batch| {
+            assert!(Arc::ptr_eq(batch.reaper(), &subreaper));
+        });
+        assert!(Arc::ptr_eq(&container.parent().unwrap(), &subreaper));
+        assert!(Arc::ptr_eq(container.reaper_scope(), &scope));
     }
 
     fn fork_live_child(domain: &ProcessDomain<()>, pid: Pid) -> Arc<Process<()>> {
