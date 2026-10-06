@@ -478,3 +478,23 @@ executes the BusyBox OCI shell, prints CRUN_REAL_HELLO, uid=0/gid=0 and its real
 cgroup namespace view 0::/, then returns0 (`shell-ujbpbqhv`). Basic OCI startup,
 command and exit are now established. True memory/pids resource acceptance is
 still pending; rootless podman must wait for those checks.
+
+### Automated OCI lifecycle and real pids resource policy
+
+The optional `container-crun.sh` regression is staged only with the separate
+containers payload. It runs a real BusyBox OCI command as PID1/root with its
+own hostname, then another real crun container configured with pids.limit=8.
+The native probe retains seven simultaneously live children and requires the
+next fork to fail with EAGAIN; it releases/reaps every child. Kept runtime
+state lets the external test verify actual pids.max=8, pids.current=0 after
+exit and pids.events max>=1, then explicitly delete both runtime states.
+This is not merely checking that a limit write was accepted.
+
+Validated: host static C build, shell syntax and related Python7; lint;
+signed crun guest KTAP2/2 and test exit0 (`shell-m45k7dv7`). An initial test
+fixture called an unstaged hostname symlink; the corrected fixture uses the
+already-present BusyBox applet and reports failure logs before cleanup.
+The first script exit1 is not counted as passed. Memory charge/OOM remains
+unimplemented/unadvertised, so Level3 as a whole is still incomplete and
+podman has not been attempted. This pids test covers fork, not all thread
+accounting combinations.

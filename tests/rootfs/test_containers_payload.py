@@ -10,6 +10,15 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ContainersPayloadTests(unittest.TestCase):
+    def test_crun_guest_uses_real_resources_and_kept_lifecycle(self):
+        script = (ROOT/'tests/guest/container-crun.sh').read_text()
+        self.assertIn('"pids":{"limit":8}', script)
+        self.assertIn('run --keep', script)
+        self.assertIn('pids.events', script)
+        self.assertIn('pids.current', script)
+        self.assertIn('delete "$pids"', script)
+        self.assertIn('tests/guest/container-crun.sh', ROOTFS_INPUT_FILES)
+
     def test_separate_payload_and_declared_inputs(self):
         self.assertEqual(selected_tool_payload('containers'), 'containers')
         self.assertEqual(rootfs_image_bytes('containers'), 384 * 1024 * 1024)
