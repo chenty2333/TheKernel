@@ -35,8 +35,6 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
 
     root.add("firmware",super::acpi::firmware(fs.clone()));
     root.add("class", class_dir(fs.clone()));
-    #[cfg(any(feature="pmu",feature="hwp-uclamp"))]
-    root.add("class", super::cpu_thermal::class_dir(fs.clone()));
     root.add("block", block_dir(fs.clone()));
     root.add("dev", dev_dir(fs.clone()));
     root.add("devices", devices_dir(fs.clone()));
@@ -196,12 +194,14 @@ fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     // Device-registry publication supplies the complete graphics class
     // object.  A static empty fb0 directory would shadow that object and
     // prevent udev from reading its dev/uevent attributes.
+    let classes = super::block_inventory::class_root(fs.clone())
+        .chain(super::net_sysfs::class_root(fs.clone()))
+        .chain(super::acpi_thermal::class_root(fs.clone()));
+    #[cfg(any(feature = "pmu", feature = "hwp-uclamp"))]
+    let classes = classes.chain(super::cpu_thermal::class_root(fs.clone()));
     SimpleDir::new_maker(
         fs.clone(),
-        Arc::new(super::block_inventory::class_root(fs.clone())
-            .chain(super::net_sysfs::class_root(fs.clone()))
-            .chain(super::acpi_thermal::class_root(fs.clone()))
-            .chain(device_registry::class_root(fs))),
+        Arc::new(classes.chain(device_registry::class_root(fs))),
     )
 }
 
@@ -559,5 +559,18 @@ mod tests {
         ] {
             assert!(context.resolve(FsPath::new(path)).is_ok(), "{path:?}");
         }
+    }
+
+    #[test]
+    fn sysfs_class_providers_coexist_with_cpu_and_acpi_thermal() {
+        let _context = crate::test_support::scheduler_test_context();
+        let filesystem = new_sysfs();
+        let root = Mountpoint::new_root(&filesystem);
+        let context = FsContext::new(root.root_location());
+        for path in [b"/class/block".as_slice(), b"/class/net", b"/class/thermal"] {
+            assert!(context.resolve(FsPath::new(path)).is_ok(), "{path:?}");
+        }
+        #[cfg(any(feature = "pmu", feature = "hwp-uclamp"))]
+        assert!(context.resolve(FsPath::new(b"/class/hwmon")).is_ok());
     }
 }

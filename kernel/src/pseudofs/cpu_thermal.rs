@@ -5,7 +5,7 @@ use axfs_ng_vfs::{VfsError, VfsResult};
 use axhal::cpu_power::thermal;
 
 use super::{
-    DirMaker, DirMapping, SimpleDir, SimpleDirOps, SimpleFs,
+    DirMapping, SimpleDir, SimpleFs,
     device_registry::{self, DeviceAttribute, DeviceIdentity, DeviceRegistration},
 };
 fn add_sensor(
@@ -106,7 +106,7 @@ fn register() -> VfsResult<()> {
     }
     Ok(())
 }
-pub fn class_dir(fs: Arc<SimpleFs>) -> DirMaker {
+pub(super) fn class_root(fs: Arc<SimpleFs>) -> DirMapping {
     if let Err(error) = register() {
         warn!("coretemp sysfs registration failed: {error:?}");
     }
@@ -117,10 +117,7 @@ pub fn class_dir(fs: Arc<SimpleFs>) -> DirMaker {
             SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())),
         );
     }
-    SimpleDir::new_maker(
-        fs.clone(),
-        Arc::new(device_registry::class_root(fs).chain(extra)),
-    )
+    extra
 }
 #[cfg(test)]
 mod tests {
