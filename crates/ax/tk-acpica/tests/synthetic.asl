@@ -14,6 +14,8 @@ DefinitionBlock ("", "DSDT", 2, "TKTEST", "SYNTH", 1)
             Name (_HID, "PNP0C0C")
             Method (_STA, 0) { Return (0x0F) }
             Method (TEST, 0) { Notify (PWRB, 0x80) }
+            Name (INIC, Zero)
+            Method (_INI, 0) { Increment (INIC) }
         }
     }
 }

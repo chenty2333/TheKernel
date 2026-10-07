@@ -1,15 +1,18 @@
 //! Offline-only, simulated hardware backend for table/AML tests.
 //! Never maps /dev/mem or accesses host ports/PCI. Firmware is read from an
 //! explicit directory outside the repository, and only counts/status are logged.
+#[cfg(test)]
+use core::mem::align_of;
+use core::mem::size_of;
 use std::{
     boxed::Box,
     collections::BTreeMap,
     ffi::c_void,
-    fs,
+    fs, io,
     path::Path,
     string::String,
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -21,11 +24,45 @@ use crate::{
     backend::{Backend, BackendRegistration, IrqHandler, PciId, Work},
 };
 static START: OnceLock<Instant> = OnceLock::new();
+struct FirmwareTable {
+    storage: Box<[u64]>,
+    len: usize,
+    signature: [u8; 4],
+}
+impl FirmwareTable {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, io::Error> {
+        if bytes.len() < 36 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ACPI SDT is shorter than its header",
+            ));
+        }
+        let signature = bytes[..4].try_into().unwrap();
+        let storage = bytes
+            .chunks(size_of::<u64>())
+            .map(|chunk| {
+                let mut word = [0; size_of::<u64>()];
+                word[..chunk.len()].copy_from_slice(chunk);
+                u64::from_ne_bytes(word)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            storage,
+            len: bytes.len(),
+            signature,
+        })
+    }
+
+    fn address(&self) -> u64 {
+        self.storage.as_ptr() as u64
+    }
+}
 pub struct OfflineBackend {
     root: u64,
-    tables: Vec<Box<[u8]>>,
+    tables: Vec<FirmwareTable>,
     regions: Mutex<BTreeMap<(u64, usize), Box<[u64]>>>,
-    active: AtomicUsize,
+    active: Arc<AtomicUsize>,
 }
 fn table(signature: &[u8; 4], mut bytes: Vec<u8>) -> Box<[u8]> {
     bytes[..4].copy_from_slice(signature);
@@ -75,40 +112,46 @@ impl OfflineBackend {
         }
         Self::from_tables(aml)
     }
-    pub fn from_tables(mut aml: Vec<Box<[u8]>>) -> Result<Self, std::io::Error> {
+    pub fn from_tables(aml: Vec<Box<[u8]>>) -> Result<Self, std::io::Error> {
+        let mut aml = aml
+            .into_iter()
+            .map(|table| FirmwareTable::from_bytes(&table))
+            .collect::<Result<Vec<_>, _>>()?;
         let dsdt = aml
             .iter()
-            .find(|b| &b[..4] == b"DSDT")
+            .find(|table| &table.signature == b"DSDT")
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "DSDT missing"))?;
         let mut fadt = std::vec![0;276];
-        fadt[140..148].copy_from_slice(&(dsdt.as_ptr() as u64).to_le_bytes());
+        fadt[140..148].copy_from_slice(&dsdt.address().to_le_bytes());
         fadt[112..116].copy_from_slice(&(1u32 << 20).to_le_bytes());
         let fadt = table(b"FACP", fadt);
-        let addresses = std::iter::once(fadt.as_ptr() as u64).chain(
+        let fadt = FirmwareTable::from_bytes(&fadt)?;
+        let addresses = std::iter::once(fadt.address()).chain(
             aml.iter()
-                .filter(|t| &t[..4] == b"SSDT")
-                .map(|t| t.as_ptr() as u64),
+                .filter(|table| &table.signature == b"SSDT")
+                .map(FirmwareTable::address),
         );
         let mut xsdt = std::vec![0;36];
         for address in addresses {
             xsdt.extend_from_slice(&address.to_le_bytes());
         }
         let xsdt = table(b"XSDT", xsdt);
+        let xsdt = FirmwareTable::from_bytes(&xsdt)?;
         let mut rsdp = std::vec![0u8;36];
         rsdp[..8].copy_from_slice(b"RSD PTR ");
         rsdp[15] = 2;
         rsdp[20..24].copy_from_slice(&36u32.to_le_bytes());
-        rsdp[24..32].copy_from_slice(&(xsdt.as_ptr() as u64).to_le_bytes());
+        rsdp[24..32].copy_from_slice(&xsdt.address().to_le_bytes());
         rsdp[8] = 0u8.wrapping_sub(rsdp[..20].iter().fold(0u8, |a, b| a.wrapping_add(*b)));
         rsdp[32] = 0u8.wrapping_sub(rsdp.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
-        let rsdp = rsdp.into_boxed_slice();
-        let root = rsdp.as_ptr() as u64;
+        let rsdp = FirmwareTable::from_bytes(&rsdp)?;
+        let root = rsdp.address();
         aml.extend([fadt, xsdt, rsdp]);
         Ok(Self {
             root,
             tables: aml,
             regions: Mutex::new(BTreeMap::new()),
-            active: AtomicUsize::new(0),
+            active: Arc::new(AtomicUsize::new(0)),
         })
     }
     pub fn register(self) -> &'static BackendRegistration {
@@ -117,7 +160,7 @@ impl OfflineBackend {
 }
 // SAFETY: only owned immutable firmware buffers or private zeroed simulation
 // buffers are mapped; no real hardware access. Deferred callbacks execute on
-// host threads and active accounting is drained on termination.
+// host threads and retain their active-work counter independently of the backend.
 unsafe impl Backend for OfflineBackend {
     fn root_pointer(&self) -> u64 {
         self.root
@@ -127,8 +170,15 @@ unsafe impl Backend for OfflineBackend {
             return std::ptr::null_mut();
         }
         for table in &self.tables {
-            let start = table.as_ptr() as u64;
-            if address >= start && address + size as u64 <= start + table.len() as u64 {
+            let start = table.address();
+            let Some(end) = address.checked_add(size as u64) else {
+                return std::ptr::null_mut();
+            };
+            if address >= start
+                && start
+                    .checked_add(table.len as u64)
+                    .is_some_and(|table_end| end <= table_end)
+            {
                 return address as *mut c_void;
             }
         }
@@ -172,16 +222,16 @@ unsafe impl Backend for OfflineBackend {
     }
     fn irq_restore(&self, _flags: usize) {}
     fn execute(&self, _kind: u32, function: Work, context: *mut c_void) -> Status {
-        self.active.fetch_add(1, Ordering::AcqRel);
+        let active = Arc::clone(&self.active);
+        active.fetch_add(1, Ordering::AcqRel);
         let context = context as usize;
-        let active = &self.active as *const AtomicUsize as usize;
         match std::thread::Builder::new().spawn(move || {
-            // SAFETY: backend remains static, termination waits for this worker;
-            // ACPICA owns callback/context until completion.
+            // SAFETY: ACPICA owns callback/context until completion; the Arc
+            // keeps active accounting valid even if the backend is dropped.
             unsafe {
                 function(context as *mut c_void);
-                (*(active as *const AtomicUsize)).fetch_sub(1, Ordering::Release);
             }
+            active.fetch_sub(1, Ordering::Release);
         }) {
             Ok(_) => OK,
             Err(_) => {
@@ -236,6 +286,84 @@ mod tests {
         NOTIFIED.store(value as usize, Ordering::Release);
     }
     #[test]
+    fn firmware_tables_have_acpi_alignment() {
+        let table = include_bytes!("../tests/synthetic.aml")
+            .to_vec()
+            .into_boxed_slice();
+        let backend = OfflineBackend::from_tables(std::vec![table]).unwrap();
+        assert!((backend.root as usize).is_multiple_of(align_of::<u64>()));
+        assert!(
+            backend
+                .tables
+                .iter()
+                .all(|table| (table.address() as usize).is_multiple_of(align_of::<u64>()))
+        );
+    }
+
+    #[test]
+    fn short_sdt_is_rejected_before_signature_read() {
+        let short = std::vec![b"DS".to_vec().into_boxed_slice()];
+        assert_eq!(
+            OfflineBackend::from_tables(short).err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    struct WorkContext {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        finished: std::sync::mpsc::Sender<()>,
+    }
+
+    unsafe extern "C" fn delayed_work(context: *mut c_void) {
+        // SAFETY: the test transfers one Box to this callback and keeps it
+        // alive until this single invocation takes ownership.
+        let context = unsafe { Box::from_raw(context.cast::<WorkContext>()) };
+        context.started.send(()).unwrap();
+        context.release.recv().unwrap();
+        context.finished.send(()).unwrap();
+    }
+
+    #[test]
+    fn deferred_work_finishes_after_backend_drop() {
+        use std::sync::mpsc::channel;
+
+        let data = include_bytes!("../tests/synthetic.aml")
+            .to_vec()
+            .into_boxed_slice();
+        let backend = OfflineBackend::from_tables(std::vec![data]).unwrap();
+        let active = Arc::clone(&backend.active);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (finished_tx, finished_rx) = channel();
+        let context = Box::new(WorkContext {
+            started: started_tx,
+            release: release_rx,
+            finished: finished_tx,
+        });
+        let context = Box::into_raw(context);
+
+        // SAFETY: the boxed context is transferred to the callback, and its
+        // channels keep it valid until the callback takes and drops the Box.
+        let status = backend.execute(0, delayed_work, context.cast());
+        if status != OK {
+            // SAFETY: an error means execute did not retain the callback/context.
+            unsafe { drop(Box::from_raw(context)) };
+        }
+        assert_eq!(status, OK);
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        drop(backend);
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while active.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline, "deferred work was not reclaimed");
+        }
+    }
+
+    #[test]
     fn real_interpreter_namespace_evaluation_and_notify() {
         let data = include_bytes!("../tests/synthetic.aml")
             .to_vec()
@@ -269,6 +397,9 @@ mod tests {
         }
         e.install_notify(notification).unwrap();
         e.initialize_objects().unwrap();
+        assert_eq!(e.integer("\\_SB.PWRB.INIC").unwrap(), 1);
+        assert_eq!(e.initialize_objects(), Err(crate::ALREADY_EXISTS));
+        assert_eq!(e.integer("\\_SB.PWRB.INIC").unwrap(), 1);
         assert_eq!(
             e.evaluate("\\_S5", &[]).unwrap(),
             Value::Package(std::vec![Value::Integer(5), Value::Integer(5)])

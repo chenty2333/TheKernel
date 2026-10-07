@@ -12,7 +12,7 @@ fn main() {
         })
         .register();
     // SAFETY: exclusively owned offline backend simulates all hardware.
-    let engine = unsafe { Engine::initialize(backend, Mode::Offline) }.unwrap_or_else(|s| {
+    let mut engine = unsafe { Engine::initialize(backend, Mode::Offline) }.unwrap_or_else(|s| {
         eprintln!("namespace initialization failed: {s:#x}");
         std::process::exit(1)
     });

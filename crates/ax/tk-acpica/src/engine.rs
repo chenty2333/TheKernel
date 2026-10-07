@@ -35,6 +35,7 @@ pub enum Mode {
 pub struct Engine {
     _not_send_sync: PhantomData<*mut ()>,
     notify: bool,
+    objects_initialization_attempted: bool,
 }
 unsafe extern "C" {
     fn AcpiInitializeSubsystem() -> Status;
@@ -122,6 +123,7 @@ impl Engine {
         let engine = Self {
             _not_send_sync: PhantomData,
             notify: false,
+            objects_initialization_attempted: false,
         };
         // SAFETY: caller established the complete OSL contract; shutdown on error.
         unsafe {
@@ -188,7 +190,15 @@ impl Engine {
         owned.push_str(path);
         Ok(owned)
     }
-    pub fn initialize_objects(&self) -> Result<(), Status> {
+    /// Run `_REG`/`_STA`/`_INI` after custom handlers (notably EC) are installed.
+    /// Firmware methods may have hardware side effects; an attempt is therefore
+    /// never repeated, even when ACPICA reports failure. Discard the engine on
+    /// error instead of retrying partially completed firmware initialization.
+    pub fn initialize_objects(&mut self) -> Result<(), Status> {
+        if self.objects_initialization_attempted {
+            return Err(crate::ALREADY_EXISTS);
+        }
+        self.objects_initialization_attempted = true;
         // SAFETY: live instance, OSL is ready and hardware mode admits AML.
         unsafe { status(AcpiInitializeObjects(0)) }
     }
