@@ -481,6 +481,17 @@ fn display_eld_selects_confirmed_codec_pin_and_retires_playback_before_restore()
     controller.prepare(4096, 4).unwrap();
     controller.submit(&[0x77; PERIOD]).unwrap();
     controller.abort().unwrap();
+
+    // An owner may explicitly abort after the one-shot route interruption to
+    // discard its old generation and resume on the replacement route.
+    controller.set_display_eld(3, Some(&eld)).unwrap();
+    controller.prepare(4096, 4).unwrap();
+    controller.submit(&[0x55; PERIOD]).unwrap();
+    controller.set_display_eld(3, None).unwrap();
+    controller.abort().unwrap();
+    controller.prepare(4096, 4).unwrap();
+    controller.submit(&[0x66; PERIOD]).unwrap();
+    controller.abort().unwrap();
     assert!(state.lock().unwrap().verbs.contains(&(2, 2, 0x706, 0)));
 }
 

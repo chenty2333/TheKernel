@@ -54,6 +54,12 @@ struct State {
 
 impl State {
     fn free_bytes(&self) -> usize {
+        // There is only one staging period. If it is full but the backend has
+        // not accepted it yet, more input cannot make forward progress until
+        // the playback worker retries submission.
+        if self.partial.len() == PERIOD {
+            return 0;
+        }
         (PERIODS - self.tokens.len()) * PERIOD - self.partial.len()
     }
     fn delay_bytes(&self) -> usize {
@@ -80,7 +86,10 @@ impl State {
         Ok(())
     }
 
-    fn submit_partial(&mut self) -> AxResult<()> {
+    fn submit_partial_with(
+        &mut self,
+        mut submit: impl FnMut(&[u8]) -> AxResult<u16>,
+    ) -> AxResult<()> {
         if self.failed {
             return Err(AxError::Io);
         }
@@ -91,10 +100,86 @@ impl State {
             return Err(AxError::WouldBlock);
         }
         self.partial.resize(PERIOD, 0);
-        let token = axdriver::sound::submit(&self.partial).map_err(driver_error)?;
+        // Retain the complete staged period on backpressure. The caller has
+        // already accepted these bytes, so only clear them after token
+        // ownership has transferred to the device.
+        let token = submit(&self.partial)?;
         self.tokens.push(token);
         self.partial.clear();
         Ok(())
+    }
+
+    fn submit_partial(&mut self) -> AxResult<()> {
+        self.submit_partial_with(|bytes| axdriver::sound::submit(bytes).map_err(driver_error))
+    }
+
+    /// Prove DMA cancellation before discarding caller-visible token custody.
+    fn abort_generation_with(
+        &mut self,
+        abort: impl FnOnce(&[u16]) -> AxResult<()>,
+    ) -> AxResult<()> {
+        abort(&self.tokens)?;
+        self.tokens.clear();
+        self.partial.clear();
+        self.prepared = false;
+        self.failed = false;
+        Ok(())
+    }
+
+    fn write_bytes_with(
+        &mut self,
+        bytes: &[u8],
+        prepare: impl FnOnce() -> AxResult<()>,
+        mut submit: impl FnMut(&[u8]) -> AxResult<u16>,
+    ) -> AxResult<usize> {
+        if self.failed || self.closing {
+            return Err(AxError::Io);
+        }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if !bytes.len().is_multiple_of(FRAME) {
+            return Err(AxError::InvalidInput);
+        }
+        // A full period may have been retained after a transient Again. Retry
+        // its submission before accepting any further bytes, otherwise a
+        // successful syscall could report zero progress or overwrite it.
+        if self.partial.len() == PERIOD {
+            match self.submit_partial_with(&mut submit) {
+                Ok(()) => {}
+                Err(AxError::WouldBlock) => return Err(AxError::WouldBlock),
+                Err(error) => {
+                    self.failed = true;
+                    return Err(error);
+                }
+            }
+        }
+        if self.tokens.len() == PERIODS {
+            return Err(AxError::WouldBlock);
+        }
+        if !self.prepared {
+            if let Err(error) = prepare() {
+                self.failed = true;
+                return Err(error);
+            }
+            self.prepared = true;
+        }
+        let count = bytes.len().min(PERIOD - self.partial.len());
+        self.partial.extend_from_slice(&bytes[..count]);
+        if self.partial.len() == PERIOD {
+            match self.submit_partial_with(&mut submit) {
+                Ok(()) => {}
+                // The caller's bytes are now safely staged in `partial`; a
+                // retry belongs to the worker and must not turn backpressure
+                // into a failed stream or an unreported accepted write.
+                Err(AxError::WouldBlock) => return Ok(count),
+                Err(error) => {
+                    self.failed = true;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(count)
     }
 }
 
@@ -141,34 +226,11 @@ impl Playback {
 
     fn write_bytes(&self, bytes: &[u8]) -> AxResult<usize> {
         let mut s = self.state.lock();
-        if s.failed || s.closing {
-            return Err(AxError::Io);
-        }
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        if !bytes.len().is_multiple_of(FRAME) {
-            return Err(AxError::InvalidInput);
-        }
-        if s.tokens.len() == PERIODS {
-            return Err(AxError::WouldBlock);
-        }
-        if !s.prepared {
-            if let Err(error) = axdriver::sound::prepare(PERIOD as _, PERIODS as _) {
-                s.failed = true;
-                return Err(driver_error(error));
-            }
-            s.prepared = true;
-        }
-        let count = bytes.len().min(PERIOD - s.partial.len());
-        s.partial.extend_from_slice(&bytes[..count]);
-        if s.partial.len() == PERIOD {
-            if let Err(error) = s.submit_partial() {
-                s.failed = true;
-                return Err(error);
-            }
-        }
-        Ok(count)
+        s.write_bytes_with(
+            bytes,
+            || axdriver::sound::prepare(PERIOD as _, PERIODS as _).map_err(driver_error),
+            |period| axdriver::sound::submit(period).map_err(driver_error),
+        )
     }
 
     // One low-frequency polling worker owns DMA retirement and final close.
@@ -180,13 +242,15 @@ impl Playback {
             let wake;
             {
                 let mut s = self.state.lock();
-                let previous = s.tokens.len();
+                let previous_free = s.free_bytes();
+                let mut progressed = false;
                 if !s.failed {
                     loop {
                         match axdriver::sound::complete() {
                             Ok(Some(token)) => {
                                 if let Some(index) = s.tokens.iter().position(|t| *t == token) {
                                     s.tokens.remove(index);
+                                    progressed = true;
                                 } else {
                                     s.failed = true;
                                     break;
@@ -200,18 +264,22 @@ impl Playback {
                         }
                     }
                 }
-                if s.closing && !s.failed {
-                    if s.submit_partial().is_err() {
-                        s.failed = true;
-                    }
-                    if s.tokens.is_empty() {
-                        if !s.prepared || axdriver::sound::release().is_ok() {
-                            CLAIMED.store(false, Ordering::Release);
-                        }
-                        done = true;
+
+                // Retry an already-full staging period after the completion
+                // pass. On close, pad and submit the final partial period too.
+                if !s.failed && (s.partial.len() == PERIOD || (s.closing && !s.partial.is_empty()))
+                {
+                    match s.submit_partial() {
+                        Ok(()) => progressed = true,
+                        Err(AxError::WouldBlock) => {}
+                        Err(_) => s.failed = true,
                     }
                 }
-                if s.tokens.is_empty() || s.tokens.len() < previous {
+
+                let needs_backend_progress = !s.tokens.is_empty()
+                    || s.partial.len() == PERIOD
+                    || (s.closing && !s.partial.is_empty());
+                if progressed || !needs_backend_progress {
                     stalled = 0;
                 } else {
                     stalled += 1;
@@ -219,12 +287,44 @@ impl Playback {
                 if stalled >= 2000 {
                     s.failed = true;
                 }
-                // On hardware failure retain the global driver and its DMA buffers.
-                // Do not let a new opener reuse an uncertain device generation.
-                if s.failed && s.closing {
-                    done = true;
+
+                if s.closing {
+                    if s.failed {
+                        // A completion error can be a route invalidation after
+                        // the HDA driver already stopped the stream. Retry an
+                        // explicit abort here; only its successful retirement
+                        // proof permits releasing the global owner.
+                        if s.abort_generation_with(|tokens| {
+                            axdriver::sound::abort(tokens).map_err(driver_error)
+                        })
+                        .is_ok()
+                        {
+                            CLAIMED.store(false, Ordering::Release);
+                        }
+                        done = true;
+                    } else if s.tokens.is_empty() && s.partial.is_empty() {
+                        let released = if s.prepared {
+                            axdriver::sound::release().map_err(driver_error)
+                        } else {
+                            Ok(())
+                        };
+                        if released.is_ok() {
+                            s.prepared = false;
+                            CLAIMED.store(false, Ordering::Release);
+                        } else {
+                            s.failed = true;
+                            if s.abort_generation_with(|tokens| {
+                                axdriver::sound::abort(tokens).map_err(driver_error)
+                            })
+                            .is_ok()
+                            {
+                                CLAIMED.store(false, Ordering::Release);
+                            }
+                        }
+                        done = true;
+                    }
                 }
-                wake = s.tokens.len() != previous || s.failed || done;
+                wake = s.free_bytes() != previous_free || s.failed || done;
             }
             if wake {
                 self.ready.wake();
@@ -515,6 +615,132 @@ mod tests {
             .reset_with(|| panic!("unprepared stream must not be released again"))
             .unwrap();
     }
+
+    #[test]
+    fn transient_submit_backpressure_retains_staged_period_until_accepted() {
+        let mut state = State {
+            partial: alloc::vec![0x5a; PERIOD - 8],
+            tokens: alloc::vec![7],
+            prepared: true,
+            closing: false,
+            failed: false,
+        };
+        state.partial.extend_from_slice(&[1, 2, 3, 4]);
+        let expected = state.partial.clone();
+
+        for _ in 0..2 {
+            assert_eq!(
+                state.submit_partial_with(|bytes| {
+                    assert_eq!(&bytes[..expected.len()], &expected);
+                    assert!(bytes[expected.len()..].iter().all(|byte| *byte == 0));
+                    Err(AxError::WouldBlock)
+                }),
+                Err(AxError::WouldBlock)
+            );
+            assert_eq!(state.tokens, [7]);
+            assert_eq!(&state.partial[..expected.len()], &expected);
+            assert!(
+                state.partial[expected.len()..]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            );
+            assert_eq!(state.free_bytes(), 0);
+        }
+
+        state
+            .submit_partial_with(|bytes| {
+                assert_eq!(&bytes[..expected.len()], &expected);
+                Ok(8)
+            })
+            .unwrap();
+        assert_eq!(state.tokens, [7, 8]);
+        assert!(state.partial.is_empty());
+    }
+
+    #[test]
+    fn write_accepts_staged_data_once_and_never_reports_zero_progress() {
+        let mut state = State {
+            partial: alloc::vec![0x5a; PERIOD - 4],
+            tokens: alloc::vec![7],
+            prepared: true,
+            closing: false,
+            failed: false,
+        };
+        let mut observed = Vec::new();
+        assert_eq!(
+            state.write_bytes_with(
+                &[1, 2, 3, 4],
+                || panic!("prepared stream must not be prepared twice"),
+                |period| {
+                    observed.push(period.to_vec());
+                    Err(AxError::WouldBlock)
+                },
+            ),
+            Ok(4)
+        );
+        assert_eq!(state.partial.len(), PERIOD);
+        assert_eq!(&state.partial[PERIOD - 4..], &[1, 2, 3, 4]);
+        assert_eq!(state.tokens, [7]);
+        assert!(!state.failed);
+
+        assert_eq!(
+            state.write_bytes_with(
+                &[5, 6, 7, 8],
+                || panic!("prepared stream must not be prepared twice"),
+                |_| Err(AxError::WouldBlock),
+            ),
+            Err(AxError::WouldBlock)
+        );
+        assert_eq!(state.partial.len(), PERIOD);
+        assert_eq!(&state.partial[PERIOD - 4..], &[1, 2, 3, 4]);
+        assert_eq!(state.tokens, [7]);
+        assert!(!state.failed);
+
+        assert_eq!(
+            state.write_bytes_with(
+                &[5, 6, 7, 8],
+                || panic!("prepared stream must not be prepared twice"),
+                |period| {
+                    assert_eq!(period, observed[0]);
+                    Ok(8)
+                },
+            ),
+            Ok(4)
+        );
+        assert_eq!(state.tokens, [7, 8]);
+        assert_eq!(state.partial, [5, 6, 7, 8]);
+        assert!(!state.failed);
+    }
+
+    #[test]
+    fn failed_generation_is_cleared_only_after_abort_proves_retirement() {
+        let mut state = State {
+            partial: alloc::vec![0x33; PERIOD],
+            tokens: alloc::vec![9, 10],
+            prepared: true,
+            closing: true,
+            failed: true,
+        };
+        assert_eq!(
+            state.abort_generation_with(|tokens| {
+                assert_eq!(tokens, [9, 10]);
+                Err(AxError::Io)
+            }),
+            Err(AxError::Io)
+        );
+        assert_eq!(state.tokens, [9, 10]);
+        assert_eq!(state.partial.len(), PERIOD);
+        assert!(state.prepared && state.failed);
+
+        state
+            .abort_generation_with(|tokens| {
+                assert_eq!(tokens, [9, 10]);
+                Ok(())
+            })
+            .unwrap();
+        assert!(state.tokens.is_empty() && state.partial.is_empty());
+        assert!(!state.prepared && !state.failed);
+    }
     #[test]
     fn incomplete_frames_and_failed_streams_never_reach_the_device() {
         let playback = Playback::new().unwrap();
@@ -539,6 +765,17 @@ mod tests {
         assert_eq!(playback.poll(), IoEvents::WRITABLE);
         playback.close();
         assert_eq!(playback.poll(), IoEvents::HANGUP);
+    }
+
+    #[test]
+    fn full_staged_period_is_not_reported_writable_until_retry() {
+        let playback = Playback::new().unwrap();
+        {
+            let mut state = playback.state.lock();
+            state.prepared = true;
+            state.partial.resize(PERIOD, 0x5a);
+        }
+        assert!(playback.poll().is_empty());
     }
 
     #[test]

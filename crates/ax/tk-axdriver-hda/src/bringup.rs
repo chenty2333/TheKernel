@@ -472,6 +472,10 @@ impl<H: Hal, B: Bus> Controller<H, B> {
             self.audio.pointer.as_ptr().write_bytes(0, PERIOD * PERIODS);
         }
         self.prepared = false;
+        // An explicit abort has acknowledged and retired the invalidated
+        // stream generation. Route changes call abort first, then set this
+        // again to deliver their one-shot interruption to the old owner.
+        self.route_invalidated = false;
         Ok(())
     }
     pub fn release(&mut self) -> DevResult {

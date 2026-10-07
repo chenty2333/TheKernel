@@ -159,19 +159,30 @@ impl PcmFile {
     fn stop(&self) -> AxResult<()> {
         let mut pcm = self.pcm.lock();
         let mut s = self.playback.state.lock();
-        if s.failed || s.closing {
+        if s.closing {
             return Err(AxError::Io);
         }
-        if s.prepared
+        if s.failed {
+            // DROP is the explicit recovery point for a failed substream. Do
+            // not discard tokens or staged audio unless the backend proves
+            // that its DMA ownership has retired.
+            if let Err(error) = s.abort_generation_with(|tokens| {
+                axdriver::sound::abort(tokens).map_err(driver_error)
+            }) {
+                self.playback.ready.wake();
+                return Err(error);
+            }
+        } else if (s.prepared || !s.tokens.is_empty())
             && let Err(error) = axdriver::sound::abort(&s.tokens)
         {
             s.failed = true;
             self.playback.ready.wake();
             return Err(driver_error(error));
+        } else {
+            s.tokens.clear();
+            s.partial.clear();
+            s.prepared = false;
         }
-        s.tokens.clear();
-        s.partial.clear();
-        s.prepared = false;
         pcm.staged.clear();
         pcm.appl = 0;
         pcm.phase = 1;
