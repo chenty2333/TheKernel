@@ -148,7 +148,14 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         // QEMU throttles CORB at RINTCNT until that status is acknowledged.
         c.bus.write(0x20, 4, 0);
         c.bus.write(regs::RIRBCTL, 1, 3);
+        // Do not issue codec verbs until the response DMA engine has accepted
+        // its enable bits. CORB may otherwise run without a consumer for the
+        // responses it generates.
+        wait(&mut c.bus, regs::RIRBCTL, 1, 3, 3)?;
         c.bus.write(regs::CORBCTL, 1, 2);
+        // Likewise, a posted/ignored write must not be mistaken for an
+        // operational command ring.
+        wait(&mut c.bus, regs::CORBCTL, 1, 2, 2)?;
         let present = c.bus.read(regs::STATESTS, 2) as u16;
         c.present = present;
         let route = codec::enumerate(&mut c, present)?;
@@ -294,7 +301,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         if !self.live || period as usize != PERIOD || periods as usize != PERIODS {
             return Err(DevError::InvalidParam);
         }
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || !self.retired.is_empty() {
             return Err(DevError::ResourceBusy);
         }
         self.stop()?;
@@ -334,16 +341,30 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         Ok(())
     }
     pub fn submit(&mut self, bytes: &[u8]) -> DevResult<u16> {
+        // A route change invalidates tokens from the previous stream. Require
+        // its one-shot completion error to be observed before accepting data
+        // for the replacement route, or that error could be attributed to a
+        // newly submitted period.
+        if self.route_invalidated {
+            return Err(DevError::Io);
+        }
         if !self.live || !self.prepared || bytes.len() != PERIOD {
             return Err(DevError::InvalidParam);
+        }
+        // Observe hardware progress before reusing any ring slot. A period may
+        // have completed since the caller's last poll; accept no new data
+        // until its completion token has been collected.
+        if self.running {
+            self.poll_stream_position()?;
+            if !self.retired.is_empty() {
+                return Err(DevError::Again);
+            }
         }
         if self.pending.len() == PERIODS {
             return Err(DevError::Again);
         }
         if self.pending.is_empty() && self.running {
-            let retired = core::mem::take(&mut self.retired);
             self.prepare(PERIOD as u32, PERIODS as u32)?;
-            self.retired = retired;
         }
         let slot = self.tail;
         if self.running && (self.bus.read(self.stream + 4, 4) as usize / PERIOD) % PERIODS == slot {
@@ -363,8 +384,15 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         self.pending.push_back((token, slot));
         self.tail = (slot + 1) % PERIODS;
         if !self.running {
-            self.bus.write(self.stream, 1, 2);
+            // Treat an unacknowledged RUN write as uncertain ownership: the
+            // device may still have started DMA, so poison normal operations
+            // and keep the slot allocated until teardown proves quiescence.
             self.running = true;
+            self.bus.write(self.stream, 1, 2);
+            if let Err(error) = wait(&mut self.bus, self.stream, 1, 2, 2) {
+                self.live = false;
+                return Err(error);
+            }
             self.last_poll = self.bus.now_ns();
         }
         Ok(token)
@@ -377,6 +405,11 @@ impl<H: Hal, B: Bus> Controller<H, B> {
             self.route_invalidated = false;
             return Err(DevError::Io);
         }
+        self.poll_stream_position()?;
+        Ok(self.retired.pop_front())
+    }
+
+    fn poll_stream_position(&mut self) -> DevResult {
         if self.running {
             let now = self.bus.now_ns();
             if now.saturating_sub(self.last_poll) >= 80_000_000 {
@@ -412,12 +445,19 @@ impl<H: Hal, B: Bus> Controller<H, B> {
                 self.position = (self.position + 1) % PERIODS;
             }
         }
-        Ok(self.retired.pop_front())
+        Ok(())
     }
     fn stop(&mut self) -> DevResult {
         self.bus.write(self.stream, 1, 0);
+        if let Err(error) = wait(&mut self.bus, self.stream, 1, 2, 0) {
+            // Keep ownership and the running state intact: the device may
+            // still be fetching BDL/audio memory. Poison normal operations
+            // until teardown can prove a stop or reset.
+            self.live = false;
+            return Err(error);
+        }
         self.running = false;
-        wait(&mut self.bus, self.stream, 1, 2, 0)
+        Ok(())
     }
     /// Cancel playback only after RUN readback proves that DMA stopped.
     pub fn abort(&mut self) -> DevResult {

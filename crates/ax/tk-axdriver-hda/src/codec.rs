@@ -2,6 +2,7 @@
 use alloc::vec::Vec;
 
 use axdriver_base::{DevError, DevResult};
+const MAX_AMP_CONNECTIONS: usize = 16;
 pub trait Verbs {
     fn verb(&mut self, codec: u8, node: u8, operation: u16, payload: u16) -> DevResult<u32>;
 }
@@ -263,6 +264,18 @@ fn unmute(
     Ok(())
 }
 pub fn configure(v: &mut impl Verbs, route: &Route) -> DevResult {
+    // Set Amplifier Gain/Mute only carries a four-bit connection index. Reject
+    // such routes before issuing any verbs instead of truncating an index and
+    // partially programming a different input path.
+    for widget in &route.path {
+        if widget.caps & 2 != 0
+            && [2, 3].contains(&widget.kind())
+            && widget.connections.len() > MAX_AMP_CONNECTIONS
+        {
+            return Err(DevError::Unsupported);
+        }
+    }
+
     let c = route.codec;
     v.verb(c, route.function, 0x705, 0)?;
     for (index, w) in route.path.iter().enumerate() {

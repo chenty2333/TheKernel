@@ -165,10 +165,13 @@ unsafe impl Hal for Host {
 #[derive(Default)]
 struct State {
     regs: BTreeMap<usize, u32>,
+    writes: usize,
     now: u64,
     present: u16,
     verbs: alloc::vec::Vec<(u8, u8, u16, u16)>,
     drop_response_for: Option<(u8, u8, u16, u16)>,
+    ignored_writes: alloc::vec::Vec<usize>,
+    ignored_next_write: Option<usize>,
 }
 struct Fake(Arc<Mutex<State>>);
 impl Fake {
@@ -194,6 +197,14 @@ impl Bus for Fake {
     }
     fn write(&mut self, o: usize, _: usize, value: u32) {
         let mut s = self.0.lock().unwrap();
+        s.writes += 1;
+        if s.ignored_writes.contains(&o) {
+            return;
+        }
+        if s.ignored_next_write == Some(o) {
+            s.ignored_next_write = None;
+            return;
+        }
         s.regs.insert(o, value);
         if o == 0xa3 {
             s.regs.insert(o, 0);
@@ -302,6 +313,134 @@ fn controller_route_bdl_and_period_completion() {
 }
 
 #[test]
+fn command_rings_require_enable_readback_before_codec_verbs() {
+    for ring in [regs::RIRBCTL, regs::CORBCTL] {
+        let state = Arc::new(Mutex::new(State {
+            ignored_writes: alloc::vec![ring],
+            ..State::default()
+        }));
+        assert!(Controller::<Host, _>::new(Fake(state.clone())).is_err());
+        assert!(
+            state.lock().unwrap().verbs.is_empty(),
+            "codec verbs must not run when {ring:#x} failed to enable"
+        );
+    }
+}
+
+#[test]
+fn stream_run_requires_readback_before_submit_succeeds() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut controller = Controller::<Host, _>::new(Fake(state.clone())).unwrap();
+    controller.prepare(PERIOD as u32, 4).unwrap();
+    state.lock().unwrap().ignored_next_write = Some(0xa0);
+
+    assert!(matches!(
+        controller.submit(&[0x55; PERIOD]),
+        Err(axdriver_base::DevError::Io)
+    ));
+    assert_eq!(state.lock().unwrap().regs[&0xa0] & 2, 0);
+    let writes_after_failure = state.lock().unwrap().writes;
+    assert!(matches!(
+        controller.complete(),
+        Err(axdriver_base::DevError::Io)
+    ));
+    assert_eq!(state.lock().unwrap().writes, writes_after_failure);
+    drop(controller);
+}
+
+#[test]
+fn configure_rejects_input_amp_index_overflow_before_codec_mutations() {
+    let route = crate::codec::Route {
+        codec: 0,
+        function: 1,
+        vendor: 0,
+        path: alloc::vec![
+            Widget {
+                node: 1,
+                caps: (4 << 20) | (1 << 8),
+                pin_caps: 1 << 4,
+                config: 0,
+                connections: alloc::vec![2],
+            },
+            Widget {
+                node: 2,
+                caps: (3 << 20) | (1 << 1) | (1 << 8),
+                pin_caps: 0,
+                config: 0,
+                connections: (3..20).collect(),
+            },
+            Widget {
+                node: 20,
+                caps: 1,
+                pin_caps: 0,
+                config: 0,
+                connections: alloc::vec![],
+            },
+        ],
+    };
+    let mut verbs = HdmiVerbs(RefCell::new(alloc::vec::Vec::new()));
+
+    assert!(matches!(
+        crate::codec::configure(&mut verbs, &route),
+        Err(axdriver_base::DevError::Unsupported)
+    ));
+    assert!(verbs.0.borrow().is_empty());
+}
+
+#[test]
+fn submit_observes_completions_and_requires_token_collection_before_reuse() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut controller = Controller::<Host, _>::new(Fake(state.clone())).unwrap();
+    controller.prepare(PERIOD as u32, 4).unwrap();
+    let first = controller.submit(&[0x55; PERIOD]).unwrap();
+
+    {
+        let mut observed = state.lock().unwrap();
+        observed.regs.insert(0xa4, PERIOD as u32);
+        observed.now += 20_000_000;
+    }
+    assert!(matches!(
+        controller.submit(&[0x66; PERIOD]),
+        Err(axdriver_base::DevError::Again)
+    ));
+    assert!(matches!(
+        controller.prepare(PERIOD as u32, 4),
+        Err(axdriver_base::DevError::ResourceBusy)
+    ));
+    assert_eq!(controller.complete().unwrap(), Some(first));
+    let second = controller.submit(&[0x66; PERIOD]).unwrap();
+    assert_ne!(first, second);
+    controller.abort().unwrap();
+}
+
+#[test]
+fn failed_stream_stop_preserves_dma_ownership_until_retry() {
+    let state = Arc::new(Mutex::new(State::default()));
+    let mut controller = Controller::<Host, _>::new(Fake(state.clone())).unwrap();
+    controller.prepare(PERIOD as u32, 4).unwrap();
+    controller.submit(&[0x55; PERIOD]).unwrap();
+    state.lock().unwrap().ignored_next_write = Some(0xa0);
+
+    assert!(matches!(
+        controller.abort(),
+        Err(axdriver_base::DevError::Io)
+    ));
+    assert_eq!(
+        state.lock().unwrap().regs[&0xa0] & 2,
+        2,
+        "the ignored stop leaves RUN asserted"
+    );
+    let writes_after_failure = state.lock().unwrap().writes;
+    assert!(controller.prepare(PERIOD as u32, 4).is_err());
+    assert!(controller.submit(&[0x66; PERIOD]).is_err());
+    assert_eq!(state.lock().unwrap().writes, writes_after_failure);
+
+    // The one-shot fault is gone. Drop can now prove the stream stopped and
+    // reset the controller before releasing its DMA allocations.
+    drop(controller);
+}
+
+#[test]
 fn display_eld_selects_confirmed_codec_pin_and_retires_playback_before_restore() {
     let state = Arc::new(Mutex::new(State {
         present: 1 | (1 << 2),
@@ -329,11 +468,19 @@ fn display_eld_selects_confirmed_codec_pin_and_retires_playback_before_restore()
     controller.prepare(4096, 4).unwrap();
     let _token = controller.submit(&[0x5a; PERIOD]).unwrap();
     controller.set_display_eld(3, None).unwrap();
+    controller.prepare(4096, 4).unwrap();
+    assert!(matches!(
+        controller.submit(&[0x66; PERIOD]),
+        Err(axdriver_base::DevError::Io)
+    ));
     assert!(matches!(
         controller.complete(),
         Err(axdriver_base::DevError::Io)
     ));
     assert_eq!(controller.complete().unwrap(), None);
+    controller.prepare(4096, 4).unwrap();
+    controller.submit(&[0x77; PERIOD]).unwrap();
+    controller.abort().unwrap();
     assert!(state.lock().unwrap().verbs.contains(&(2, 2, 0x706, 0)));
 }
 
