@@ -865,6 +865,22 @@ class SystemTestGateTests(unittest.TestCase):
         self.assertEqual(spec.rootfs_transport, "module")
         self.assertIsNone(spec.stop_after_marker)
 
+    def test_guest_cmdline_cli_overrides_acpi_test_environment(self) -> None:
+        product = load_product()
+        for flags, expected in (([], "acpi=static"),
+                                (["--guest-kernel-cmdline", "cpuidle.mwait=0"],
+                                 "cpuidle.mwait=0"),
+                                (["--guest-kernel-cmdline", ""], "")):
+            with self.subTest(flags=flags):
+                args = product.build_parser().parse_args(
+                    ["test", "--suite", "guest", "--no-build", "--cpu-pm", *flags])
+                with patch.dict(os.environ, {"THEKERNEL_TEST_CMDLINE": "acpi=static"}), \
+                        patch.object(product, "run_product", return_value=0) as run:
+                    self.assertEqual(product.system_test_cmd(args), 0)
+                spec = run.call_args.args[1]
+                self.assertEqual(spec.kernel_cmdline, expected)
+                self.assertTrue(spec.cpu_pm)
+
     def test_system_test_run_cpus_selects_the_qemu_cpu_count(self) -> None:
         product = load_product()
         args = product.build_parser().parse_args(
