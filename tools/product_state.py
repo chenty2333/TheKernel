@@ -380,9 +380,9 @@ def selected_tool_payload(requested: str | None = None) -> str:
 def rootfs_image_bytes(payload: str) -> int:
     """Image size for a payload.
 
-    These are allocations, not measurements. The baseline is 128 MiB:
-    its static regression binaries exhausted the old 96 MiB image's usable
-    headroom. Payload sizes include room for their staged build trees.
+    These are allocations, not measurements. The baseline is 160 MiB:
+    the merged static test corpus leaves fewer free blocks than the root reserve
+    in a 128 MiB image, preventing non-root Linux oracle fixtures from writing. Payload sizes include room for their staged build trees.
     """
 
     # `glibc` stages a loader, a shared libc and one dynamic binary: about
@@ -394,8 +394,8 @@ def rootfs_image_bytes(payload: str) -> int:
     # used, so it reuses the nested payload's 224 MiB rather than adding a size
     # class; 160 MiB would leave under 30 MiB free, which is not enough room for
     # a compile's intermediate files.
-    return {"none": 128, "tcc": 160, "nested": 224, "glibc": 160,
-            "gcc": 224, "inspect": 160, "containers": 384, "debug": 224, "acpica": 128}[payload] * 1024 * 1024
+    return {"none": 160, "tcc": 160, "nested": 224, "glibc": 160,
+            "gcc": 224, "inspect": 160, "containers": 384, "debug": 224, "acpica": 160}[payload] * 1024 * 1024
 
 
 

@@ -11,7 +11,7 @@ class BaselineCapacityTests(unittest.TestCase):
     def test_cli_and_standalone_builders_have_the_same_regression_headroom(self):
         # The static test corpus needs writable headroom for non-root Linux
         # oracle cases and the sparse/direct-I/O filesystem fixtures.
-        expected = 128
+        expected = 160
         self.assertEqual(rootfs_image_bytes('none'), expected * 1024 * 1024)
         for script, expression in [
             ('build-rootfs.sh', r'SIZE_MB=\$\{THEKERNEL_ROOTFS_SIZE_MB:-(\d+)\}'),

@@ -72,7 +72,7 @@ class ContainersPayloadTests(unittest.TestCase):
     def test_separate_payload_and_declared_inputs(self):
         self.assertEqual(selected_tool_payload('containers'), 'containers')
         self.assertEqual(rootfs_image_bytes('containers'), 384 * 1024 * 1024)
-        self.assertEqual(rootfs_image_bytes('none'), 128 * 1024 * 1024)
+        self.assertEqual(rootfs_image_bytes('none'), 160 * 1024 * 1024)
         for name in ['scripts/build-containers-payload.sh', 'config/containers-apks.lock', 'tests/guest/container-bwrap.sh']:
             self.assertIn(name, ROOTFS_INPUT_FILES)
 
