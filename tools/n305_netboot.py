@@ -328,7 +328,8 @@ class CaptureHandler(http.server.SimpleHTTPRequestHandler):
                         destination.write(chunk); remaining -= len(chunk)
                 with tarfile.open(archive_path, "r:gz") as archive:
                     members = archive.getmembers()
-                    if not members or sum(m.size for m in members) > MAX_UPLOAD or len(members) > 20000:
+                    if (not members or any(m.size < 0 for m in members)
+                            or sum(m.size for m in members) > MAX_UPLOAD or len(members) > 20000):
                         raise ValueError("empty or oversized archive")
                     names = set()
                     for member in members:
@@ -344,7 +345,21 @@ class CaptureHandler(http.server.SimpleHTTPRequestHandler):
                     destination = received / name
                     if destination.exists(): raise ValueError("capture already received")
                     unpack = Path(staging) / "unpack"; unpack.mkdir()
-                    archive.extractall(unpack, filter="data")
+                    # Captures are data, not a filesystem image. Recreate only
+                    # validated directories and regular-file bytes in this
+                    # private tree; never restore archive ownership, modes or
+                    # links. Exclusive creates also reject duplicate files.
+                    for member in members:
+                        target = unpack.joinpath(*PurePosixPath(member.name).parts)
+                        if member.isdir():
+                            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            continue
+                        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        source = archive.extractfile(member)
+                        if source is None:
+                            raise ValueError("regular file data missing")
+                        with source, target.open("xb") as output:
+                            shutil.copyfileobj(source, output, length=65536)
                     if not (unpack / name / "capture-status.txt").is_file():
                         raise ValueError("capture status missing")
                     (unpack / name).rename(destination)

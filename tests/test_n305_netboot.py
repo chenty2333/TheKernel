@@ -143,6 +143,8 @@ class NetbootTests(unittest.TestCase):
                         with tarfile.open(fileobj=data, mode="w:gz") as archive:
                             for name, kind in members:
                                 entry = tarfile.TarInfo(name); entry.type = kind
+                                entry.mode = 0 if kind == tarfile.DIRTYPE else 0o6777
+                                entry.uid = entry.gid = 12345
                                 entry.size = 3 if kind == tarfile.REGTYPE else 0
                                 archive.addfile(entry, io.BytesIO(b"OK\n") if entry.size else None)
                         connection = http.client.HTTPConnection(*server.server_address, timeout=5)
@@ -153,9 +155,20 @@ class NetbootTests(unittest.TestCase):
                     self.assertEqual(send("/upload/wrong", valid), 403)
                     self.assertEqual(send("/upload/test-token", [("../escape", tarfile.REGTYPE)]), 400)
                     self.assertEqual(send("/upload/test-token", [("n305-20261003T000000Z/link", tarfile.SYMTYPE)]), 400)
-                    self.assertEqual(send("/upload/test-token", valid), 201)
+                    self.assertEqual(send("/upload/test-token", [("n305-20261003T000000Z/link", tarfile.LNKTYPE)]), 400)
+                    self.assertEqual(send("/upload/test-token", [("/n305-20261003T000000Z/capture-status.txt", tarfile.REGTYPE)]), 400)
+                    self.assertEqual(send("/upload/test-token", valid + valid), 400)
+                    self.assertFalse((root / "received/n305-20261003T000000Z").exists())
+                    self.assertEqual(send("/upload/test-token", [
+                        ("n305-20261003T000000Z", tarfile.DIRTYPE), *valid,
+                        ("n305-20261003T000000Z/logs/boot.txt", tarfile.REGTYPE),
+                    ]), 201)
                     self.assertEqual(send("/upload/test-token", valid), 400)
-                    self.assertEqual((root / "received/n305-20261003T000000Z/capture-status.txt").read_text(), "OK\n")
+                    saved = root / "received/n305-20261003T000000Z/capture-status.txt"
+                    self.assertEqual(saved.read_text(), "OK\n")
+                    self.assertEqual(saved.stat().st_uid, os.getuid())
+                    self.assertEqual(saved.stat().st_mode & 0o7111, 0)
+                    self.assertEqual((saved.parent / "logs/boot.txt").read_text(), "OK\n")
                 finally:
                     server.shutdown(); thread.join(timeout=5)
                     self.assertFalse(thread.is_alive())
