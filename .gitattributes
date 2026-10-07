@@ -29,3 +29,13 @@ config/graphics/patches/** whitespace=-blank-at-eol,-space-before-tab
 
 # Script files (keep executable)
 *.sh text eol=lf
+
+# Keep these unmodified upstream files byte-for-byte (including ACPICA CRLF).
+# Only their existing end-of-line whitespace is exempt; owned vendor patches
+# and all other sources retain the normal whitespace checks.
+crates/ax/tk-acpica/vendor/components/dispatcher/dsmethod.c -text whitespace=-blank-at-eol
+crates/ax/tk-acpica/vendor/components/parser/psopinfo.c -text whitespace=-blank-at-eol
+crates/ax/tk-acpica/vendor/include/acpredef.h -text whitespace=-blank-at-eol
+crates/ax/tk-acpica/vendor/include/platform/acwin.h -text whitespace=-blank-at-eol
+crates/ax/tk-acpica/vendor/include/platform/aczephyr.h -text whitespace=-blank-at-eol
+crates/vendor/crab-usb/README.md -text whitespace=-blank-at-eol

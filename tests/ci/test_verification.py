@@ -14,6 +14,38 @@ from tools.product_state import ProductError
 
 
 class VerificationTests(unittest.TestCase):
+    def test_verbatim_vendor_whitespace_preserves_bytes_without_exempting_owned_code(self):
+        root = Path(__file__).resolve().parents[2]
+        vendor_paths = [
+            "crates/ax/tk-acpica/vendor/components/dispatcher/dsmethod.c",
+            "crates/ax/tk-acpica/vendor/components/parser/psopinfo.c",
+            "crates/ax/tk-acpica/vendor/include/acpredef.h",
+            "crates/ax/tk-acpica/vendor/include/platform/acwin.h",
+            "crates/ax/tk-acpica/vendor/include/platform/aczephyr.h",
+            "crates/vendor/crab-usb/README.md",
+        ]
+        with test_tmpdir() as directory:
+            checkout = Path(directory)
+
+            def git(*args):
+                return subprocess.run(["git", *args], cwd=checkout, capture_output=True)
+
+            self.assertEqual(git("init", "-q").returncode, 0)
+            (checkout / ".gitattributes").write_bytes((root / ".gitattributes").read_bytes())
+            owned = "crates/vendor/crab-usb/src/owned-regression.rs"
+            for name in [*vendor_paths, owned]:
+                path = checkout / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fn main() {} \n" if name == owned else (root / name).read_bytes())
+            self.assertEqual(git("add", ".").returncode, 0)
+            result = git("diff", "--cached", "--check")
+            self.assertNotEqual(result.returncode, 0)
+            output = result.stdout.decode()
+            self.assertIn(owned + ":1: trailing whitespace.", output)
+            for name in vendor_paths:
+                self.assertNotIn(name + ":", output)
+                self.assertEqual(git("show", ":" + name).stdout, (root / name).read_bytes())
+
     def test_daily_is_bounded_and_does_not_build_desktop_or_run_comparisons(self):
         stages = verify.plan("daily", Path("/home/build"))
         commands = [stage.command for stage in stages]
