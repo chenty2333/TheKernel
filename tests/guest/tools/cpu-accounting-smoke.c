@@ -140,7 +140,7 @@ int main(void) {
         total = ns(t);
         user = ns(u);
         if (!(samples & 255)) {
-            uint64_t pu, ps;
+            uint64_t pu = 0, ps = 0;
             struct rusage usage;
             if (proc_ticks(tid, &pu, &ps) || getrusage(RUSAGE_SELF, &usage) ||
                 pu < proc_user || ps < proc_system ||
