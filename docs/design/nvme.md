@@ -26,6 +26,11 @@ up to two negotiated I/O queues, synchronous round-robin operations, 128-KiB
 bounce buffer capped by controller MDTS, PRP1/PRP2 or one PRP-list page. Whole
 512–4096-byte LBAs only; metadata/protection formats are rejected. Only the
 first active namespace of one controller is exposed, with a stable n1 name.
+Identify uses the full six-bit FLBAS format index and validates it against
+NLBAF before reading the selected format. MDTS scaling checks multiplication
+overflow as well as shift count; large limits retain the bounded bounce-buffer
+limit rather than wrapping to zero. A namespace must fit at least one LBA
+within the effective transfer limit.
 
 CC reset waits for CSTS.RDY to clear, CAP.TO bounds enable/reset, I/O polling
 is bounded to five seconds. Timeout/protocol identity failure poisons further

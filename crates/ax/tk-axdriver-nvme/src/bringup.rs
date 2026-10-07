@@ -210,9 +210,7 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         this.live = true;
         this.identify(0, 1)?;
         let mdts = this.bytes()[77];
-        if mdts != 0 {
-            this.max_transfer = TRANSFER.min(PAGE.checked_shl(u32::from(mdts)).unwrap_or(TRANSFER));
-        }
+        this.max_transfer = transfer_limit(mdts);
         this.identify(0, 2)?;
         let nsid = u32::from_le_bytes(this.bytes()[0..4].try_into().unwrap());
         if nsid == 0 || nsid == u32::MAX {
@@ -221,16 +219,12 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         this.nsid = nsid;
         this.identify(nsid, 0)?;
         let data = this.bytes();
-        let blocks = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let format = usize::from(data[26] & 15);
-        let offset = 128 + format * 4;
-        let metadata = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-        let shift = data[offset + 2];
-        if blocks == 0 || metadata != 0 || data[29] & 7 != 0 || !(9..=12).contains(&shift) {
+        let (blocks, block_size) = namespace_geometry(data)?;
+        if this.max_transfer < block_size {
             return Err(DevError::Unsupported);
         }
         this.blocks = blocks;
-        this.block_size = 1 << shift;
+        this.block_size = block_size;
         let mut request = Command::new(9, 0);
         request.0[10] = 7;
         request.0[11] = 0x10001;
@@ -337,6 +331,38 @@ impl<H: Hal, B: Bus> Controller<H, B> {
         Ok(())
     }
 }
+/// MDTS is expressed in minimum controller pages (CAP.MPSMIN=0 here).
+/// Check the multiplication too: checked_shl alone can discard value bits.
+pub(super) fn transfer_limit(mdts: u8) -> usize {
+    if mdts == 0 {
+        return TRANSFER;
+    }
+    1usize
+        .checked_shl(u32::from(mdts))
+        .and_then(|scale| PAGE.checked_mul(scale))
+        .unwrap_or(usize::MAX)
+        .min(TRANSFER)
+}
+
+pub(super) fn namespace_geometry(data: &[u8]) -> DevResult<(u64, usize)> {
+    if data.len() < PAGE {
+        return Err(DevError::InvalidParam);
+    }
+    let blocks = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    // FLBAS[6:5] are the upper two bits of the six-bit format index.
+    let format = usize::from(data[26] & 0x0f) | usize::from((data[26] & 0x60) >> 1);
+    if data[25] >= 64 || format > usize::from(data[25]) {
+        return Err(DevError::Unsupported);
+    }
+    let offset = 128 + format * 4;
+    let metadata = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
+    let shift = data[offset + 2];
+    if blocks == 0 || metadata != 0 || data[29] & 7 != 0 || !(9..=12).contains(&shift) {
+        return Err(DevError::Unsupported);
+    }
+    Ok((blocks, 1 << shift))
+}
+
 fn wait_ready<B: Bus>(bus: &mut B, ready: bool, timeout: u32) -> DevResult {
     for _ in 0..timeout {
         let status = bus.read32(regs::CSTS);

@@ -38,6 +38,8 @@ struct Fake {
     queues: BTreeMap<u16, (u64, u64, usize, usize, u16)>,
     disk: alloc::vec::Vec<u8>,
     commands: alloc::vec::Vec<(u16, u8)>,
+    mdts: u8,
+    namespace: [u8; 4096],
     timeout: bool,
     irq: bool,
     delay_io: bool,
@@ -50,7 +52,12 @@ impl Fake {
         let mut registers = BTreeMap::new();
         registers.insert(CAP, cap as u32);
         registers.insert(CAP + 4, (cap >> 32) as u32);
+        let mut namespace = [0; 4096];
+        namespace[..8].copy_from_slice(&2048u64.to_le_bytes());
+        namespace[130] = 9;
         Self {
+            mdts: 5,
+            namespace,
             registers,
             queues: BTreeMap::new(),
             disk: vec![0; 1024 * 1024],
@@ -81,12 +88,9 @@ impl Fake {
                     let out = unsafe { core::slice::from_raw_parts_mut(pointer as *mut u8, 4096) };
                     out.fill(0);
                     match c[10] {
-                        1 => out[77] = 5,
+                        1 => out[77] = self.mdts,
                         2 => out[..4].copy_from_slice(&1u32.to_le_bytes()),
-                        _ => {
-                            out[..8].copy_from_slice(&2048u64.to_le_bytes());
-                            out[130] = 9;
-                        }
+                        _ => out.copy_from_slice(&self.namespace),
                     }
                 }
                 9 => result = 0x10001,
@@ -103,6 +107,12 @@ impl Fake {
         } else if opcode != 0 {
             let lba = u64::from(c[10]) | (u64::from(c[11]) << 32);
             let length = ((c[12] & 65535) + 1) as usize * 512;
+            if (1..=4).contains(&self.mdts) {
+                assert!(
+                    length <= 4096usize << self.mdts,
+                    "command exceeded controller MDTS"
+                );
+            }
             let second = u64::from(c[8]) | (u64::from(c[9]) << 32);
             for offset in (0..length).step_by(4096) {
                 let address = if offset == 0 {
@@ -254,4 +264,103 @@ fn interrupts_and_lost_interrupt_polling_keep_one_cq_owner() {
             if interrupt { 3 } else { 0 }
         );
     }
+}
+
+#[test]
+fn mdts_scaling_never_truncates_or_widens_a_small_limit() {
+    for mdts in 0..=u8::MAX {
+        let expected = match mdts {
+            1..=4 => 4096usize << mdts,
+            _ => 128 * 1024,
+        };
+        assert_eq!(
+            crate::bringup::transfer_limit(mdts),
+            expected,
+            "MDTS={mdts}"
+        );
+    }
+}
+
+#[test]
+fn namespace_format_selection_and_admission() {
+    let mut data = [0u8; 4096];
+    let blocks = (1u64 << 40) + 7;
+    data[..8].copy_from_slice(&blocks.to_le_bytes());
+    // Advertise 64 formats; reject interpreting an extended index as index zero.
+    data[25] = 63;
+    data[130] = 9;
+    for format in 0..64usize {
+        data[26] = (format as u8 & 15) | ((format as u8 & 48) << 1);
+        let offset = 128 + format * 4;
+        data[offset + 2] = 12;
+        assert_eq!(
+            crate::bringup::namespace_geometry(&data).unwrap(),
+            (blocks, 4096)
+        );
+        data[offset + 2] = 0;
+    }
+    data[26] = 0;
+    data[130] = 9;
+    data[25] = 0;
+    assert_eq!(
+        crate::bringup::namespace_geometry(&data).unwrap(),
+        (blocks, 512)
+    );
+    data[26] = 1;
+    assert!(crate::bringup::namespace_geometry(&data).is_err());
+    data[26] = 0;
+    data[25] = 64;
+    assert!(crate::bringup::namespace_geometry(&data).is_err());
+    data[25] = 0;
+    data[128] = 8;
+    assert!(crate::bringup::namespace_geometry(&data).is_err());
+    data[128] = 0;
+    data[29] = 1;
+    assert!(crate::bringup::namespace_geometry(&data).is_err());
+    data[29] = 0;
+    for shift in [0, 8, 13, 63, 255] {
+        data[130] = shift;
+        assert!(crate::bringup::namespace_geometry(&data).is_err());
+    }
+    data[130] = 9;
+    data[..8].fill(0);
+    assert!(crate::bringup::namespace_geometry(&data).is_err());
+    assert!(crate::bringup::namespace_geometry(&data[..4095]).is_err());
+}
+
+#[test]
+fn large_mdts_keeps_bounded_io_working() {
+    for mdts in [52, 63, 64, 255] {
+        let mut bus = Fake::new();
+        bus.mdts = mdts;
+        let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+        let input = vec![0x6d; 128 * 1024];
+        let mut output = vec![0; input.len()];
+        controller.write_block(0, &input).unwrap();
+        controller.read_block(0, &mut output).unwrap();
+        assert_eq!(input, output);
+    }
+}
+
+#[test]
+fn selected_extended_format_controls_controller_geometry() {
+    let mut bus = Fake::new();
+    bus.namespace[25] = 17;
+    bus.namespace[26] = 0x21; // format 17, not format 1
+    bus.namespace[128 + 17 * 4 + 2] = 12;
+    let controller = Controller::<Host, _>::new(bus, false, 0x2000).unwrap();
+    assert_eq!(controller.block_size(), 4096);
+    assert_eq!(controller.num_blocks(), 2048);
+}
+
+#[test]
+fn small_mdts_splits_transfers_without_losing_content() {
+    let mut bus = Fake::new();
+    bus.mdts = 1;
+    let mut controller = Controller::<Host, _>::new(bus, true, 0x2000).unwrap();
+    let input: alloc::vec::Vec<u8> = (0..128 * 1024).map(|i| (i / 512) as u8).collect();
+    let mut output = vec![0; input.len()];
+    controller.write_block(0, &input).unwrap();
+    controller.read_block(0, &mut output).unwrap();
+    assert_eq!(input, output);
 }
