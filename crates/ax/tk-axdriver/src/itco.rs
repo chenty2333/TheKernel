@@ -115,14 +115,21 @@ pub(crate) fn probe(_root: &PciRoot, bdf: DeviceFunction, info: &DeviceFunctionI
             smi: resources.smi,
             gcs,
         };
-        let device = Tco::start(ports, version, timeout)?;
+        let mut device = Tco::new(ports, version);
+        let start = device.start(timeout);
+        if start.is_ok() || device.available() {
+            // Keep a verified running controller if takeover could not halt a
+            // firmware-started timer, or retain retryable setup state after a
+            // later control-register readback failure.
+            *DEVICE.lock() = Some(device);
+        }
+        start?;
         log::info!(
             "itco: {bdf} v{} base={:#x} armed timeout={}s; N305 hardware-unverified",
             version.number(),
             resources.tco,
             timeout
         );
-        *DEVICE.lock() = Some(device);
         Ok::<(), Error>(())
     })();
     if let Err(error) = result {
@@ -130,9 +137,12 @@ pub(crate) fn probe(_root: &PciRoot, bdf: DeviceFunction, info: &DeviceFunctionI
     }
 }
 pub fn available() -> bool {
-    DEVICE.lock().is_some()
+    DEVICE.lock().as_ref().is_some_and(Tco::available)
 }
 pub fn info() -> Option<(u32, u32, bool, bool)> {
+    // `boot_status` reports the recognized ICH9 v2 flag. False on v6 means
+    // that this driver has no supported status bit to report, not a verified
+    // absence of an earlier reset.
     DEVICE
         .lock()
         .as_ref()
@@ -141,14 +151,15 @@ pub fn info() -> Option<(u32, u32, bool, bool)> {
 pub fn keepalive() -> Result<(), Error> {
     let mut slot = DEVICE.lock();
     let d = slot.as_mut().ok_or(Error::Invalid)?;
-    d.ping();
-    Ok(())
+    d.ping()
 }
 pub fn set_timeout(value: u32) -> Result<(), Error> {
     let mut slot = DEVICE.lock();
     let d = slot.as_mut().ok_or(Error::Invalid)?;
     d.set_timeout(value)?;
-    d.ping();
+    if d.running {
+        d.ping()?;
+    }
     Ok(())
 }
 pub fn set_enabled(value: bool) -> Result<(), Error> {

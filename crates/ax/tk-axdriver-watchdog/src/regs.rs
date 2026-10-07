@@ -5,6 +5,7 @@ pub const CONTROL1: u16 = 8;
 pub const TIMER: u16 = 0x12;
 pub const HALT: u16 = 1 << 11;
 pub const NMI_NOW: u16 = 1 << 8;
+pub const BOOT_STATUS: u16 = 1 << 2;
 pub trait Bus: Send {
     fn read16(&mut self, offset: u16) -> u16;
     fn write16(&mut self, offset: u16, value: u16);

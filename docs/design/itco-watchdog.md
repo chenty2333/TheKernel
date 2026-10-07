@@ -11,6 +11,12 @@ advertise the IO resource enabled, as Linux requires. No guessed base/enable.
 TCO1_CNT writes always mask NMI_NOW to avoid its inversion behavior. Register
 readback failures refuse initialization. V2 TCO SMI is disabled under this
 explicit opt-in so firmware cannot silently clear its watchdog counter.
+The mechanism constructor is passive; start/adopt explicitly acquire control.
+SMI clear is read back before reconfiguration. Failed takeover of a still-running
+timer retains its owner so it can be fed or stopped. A verified HALT updates
+the running state even if NO_REBOOT fails, and the owner may retry that protection.
+Only the v2 boot-reset flag is recognized; a zero v6 status is not proof that
+no reset occurred.
 
 No `watchdog.timeout=N` means **no IO access and no /dev/watchdog**. The driver
 feature is compiled into the normal product but not active by default. Valid

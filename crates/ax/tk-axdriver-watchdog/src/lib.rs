@@ -14,5 +14,6 @@ pub enum Error {
     Invalid,
     Locked,
     Io,
+    BadState,
 }
 pub type Result<T = ()> = core::result::Result<T, Error>;
