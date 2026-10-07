@@ -31,6 +31,9 @@ pub(crate) fn metrics() -> (u64, u64) {
 /// One-shot fence.  Signalling is monotonic and never runs callbacks under a
 /// DRM object lock.
 pub struct Fence {
+    // Flattened leaf snapshots only: no recursive chain, producer mutation or
+    // reference cycle. Empty for device-owned completion fences.
+    dependencies: Vec<Arc<Fence>>,
     state: axgpu::Fence,
     // 0 pending, 1 success, 2 error.  A single CAS-owned terminal state
     // makes success/error races deterministic and wakes observers once.
@@ -130,6 +133,7 @@ impl Fence {
             PENDING_FENCES.fetch_add(1, Ordering::Relaxed);
         }
         Arc::new(Self {
+            dependencies: Vec::new(),
             state: axgpu::Fence::new(signaled),
             terminal: AtomicU8::new(if signaled { 1 } else { 0 }),
             deadline: spin::Mutex::new(None),
@@ -137,10 +141,71 @@ impl Fence {
             poll_waiters: PollSet::new(),
         })
     }
+    /// Consumer-only timeline view. Source dma-fence-chain waits all older
+    /// producers; software SIGNAL cannot complete one of those producers.
+    /// Flatten/deduplicate pending leaves to bound call-stack depth. One
+    /// completed error is enough to retain conservative error propagation.
+    pub(crate) fn join(fences: &[Arc<Self>]) -> AxResult<Arc<Self>> {
+        let mut dependencies = Vec::new();
+        let mut error = false;
+        for fence in fences {
+            let leaves = if fence.dependencies.is_empty() {
+                core::slice::from_ref(fence)
+            } else {
+                &fence.dependencies
+            };
+            dependencies
+                .try_reserve(leaves.len())
+                .map_err(|_| AxError::NoMemory)?;
+            for leaf in leaves {
+                if leaf.is_signaled() {
+                    if !leaf.is_failed() || error {
+                        continue;
+                    }
+                    error = true;
+                }
+                if !dependencies.iter().any(|old| Arc::ptr_eq(old, leaf)) {
+                    dependencies.push(leaf.clone());
+                }
+            }
+        }
+        if dependencies.is_empty() {
+            return Ok(Self::new(true));
+        }
+        if dependencies.len() == 1 {
+            return Ok(dependencies.pop().unwrap());
+        }
+        PENDING_FENCES.fetch_add(1, Ordering::Relaxed);
+        // A failed allocation drops this pending value and its accounting,
+        // exactly as dropping a never-submitted ordinary fence does.
+        Arc::try_new(Self {
+            dependencies,
+            state: axgpu::Fence::new(false),
+            terminal: AtomicU8::new(0),
+            deadline: spin::Mutex::new(None),
+            waiters: WaitQueue::new(),
+            poll_waiters: PollSet::new(),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+    fn refresh_dependencies(&self) {
+        if self.terminal.load(Ordering::Acquire) != 0 || self.dependencies.is_empty() {
+            return;
+        }
+        if self.dependencies.iter().all(|leaf| leaf.is_signaled()) {
+            if self.dependencies.iter().any(|leaf| leaf.is_failed()) {
+                self.signal_error();
+            } else {
+                self.signal();
+            }
+        }
+    }
     pub fn is_signaled(&self) -> bool {
+        self.refresh_dependencies();
         self.terminal.load(Ordering::Acquire) != 0
     }
     pub fn is_failed(&self) -> bool {
+        self.refresh_dependencies();
         self.terminal.load(Ordering::Acquire) == 2
     }
     pub fn signal(&self) {
@@ -177,6 +242,9 @@ impl Fence {
     /// without changing the direct-fence wait/error contract.
     pub fn set_deadline(&self, deadline: axhal::time::TimeValue) {
         *self.deadline.lock() = Some(deadline);
+        for leaf in &self.dependencies {
+            leaf.set_deadline(deadline);
+        }
     }
     pub fn deadline(&self) -> Option<axhal::time::TimeValue> {
         *self.deadline.lock()
@@ -200,9 +268,21 @@ impl Fence {
         events: IoEvents,
     ) -> Result<PollRegistration<'a>, PollRegistrationError> {
         let readable = events.intersects(IoEvents::READABLE | IoEvents::ERROR);
-        let mut prepared = axpoll::PreparedPollRegistration::try_new(readable as usize)?;
+        let count = if self.dependencies.is_empty() {
+            1
+        } else {
+            self.dependencies.len()
+        };
+        let mut prepared =
+            axpoll::PreparedPollRegistration::try_new(if readable { count } else { 0 })?;
         if readable {
-            prepared.arm(&self.poll_waiters, context.waker())?;
+            if self.dependencies.is_empty() {
+                prepared.arm(&self.poll_waiters, context.waker())?;
+            } else {
+                for leaf in &self.dependencies {
+                    prepared.arm(&leaf.poll_waiters, context.waker())?;
+                }
+            }
         }
         prepared.commit()
     }
@@ -215,12 +295,15 @@ impl Fence {
                 Ok(())
             };
         }
+        let waiters = if self.dependencies.is_empty() {
+            &self.waiters
+        } else {
+            &FENCE_SET_WAITERS
+        };
         match timeout {
             Some(duration) if duration.is_zero() => Err(AxError::WouldBlock),
             Some(duration) => {
-                if self
-                    .waiters
-                    .wait_timeout_until(duration, || self.is_signaled())?
+                if waiters.wait_timeout_until(duration, || self.is_signaled())?
                     && !self.is_signaled()
                 {
                     Err(AxError::WouldBlock)
@@ -233,7 +316,7 @@ impl Fence {
                 }
             }
             None => {
-                self.waiters
+                waiters
                     .wait_until(|| self.is_signaled())
                     .map_err(AxError::from)?;
                 if self.is_failed() {
@@ -301,6 +384,24 @@ impl Drop for Fence {
 mod tests {
     use super::*;
 
+    #[test]
+    fn joined_consumer_views_wait_all_leaves_keep_errors_and_flatten_long_chains() {
+        let first = Fence::new(false);
+        let second = Fence::new(false);
+        let mut view = Fence::join(&[first.clone(), second.clone()]).unwrap();
+        for _ in 0..10_000 {
+            view = Fence::join(&[view, Fence::new(true)]).unwrap();
+        }
+        assert_eq!(view.dependencies.len(), 2);
+        assert_eq!(view.wait(Some(Duration::ZERO)), Err(AxError::WouldBlock));
+        first.signal_error();
+        assert!(!view.is_signaled());
+        assert!(!second.is_signaled());
+        second.signal();
+        assert!(view.is_signaled());
+        assert!(view.is_failed());
+        assert_eq!(view.wait(Some(Duration::ZERO)), Err(AxError::Io));
+    }
     #[test]
     fn reservation_publishes_a_predecessor_that_waits_for_completion() {
         let reservation = Reservation::new();

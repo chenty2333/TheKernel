@@ -567,3 +567,404 @@ C library's license (the default host glibc is LGPL-2.1-or-later); this payload
 is not claimed to be BSD-only. The archive and generated tool sources remain
 in the external state cache, not the kernel's vendored runtime tree.
 The optional payload and the baseline image each use 128 MiB. It contains no OEM firmware tables.
+
+## MIT i915 ADL-P/N display translation (Codex D, 2026-10-05)
+
+Source authority: local Linux 7.2.3, `drivers/gpu/drm/i915/display/`.
+`crates/ax/tk-intel-display/NOTICE` is the function inventory, with the original
+copyright and `LICENSE-MIT`. Current source-to-Rust mapping:
+
+- `intel_display_device.c` → `src/device.rs`: ADL-P/N default display identity
+  and revision/stepping lookup; PCI ID facts from `include/drm/intel/pciids.h`.
+- `intel_bios.c` / `intel_vbt_defs.h` → `src/bios.rs`: VBT/BDB extent validation,
+  section iteration (including MIPI v3 size), general-definition child parsing,
+  XELPD DVO mapping, ADL-P DDC mapping and HDMI/DP/USB-TC flags/caps.
+- `intel_opregion.c` → `src/opregion.rs`: header/ASLE layout facts, external
+  RVDA address/size and mailbox VBT lookup only. No ASLE/ACPI/SWSCI writes.
+
+Other display platforms and old/future BDB semantic versions are omitted.
+Checked byte access, accessed-section validation and stricter ambiguous-input
+admission are documented divergences, not alleged exact equivalence to unsafe
+C inputs. The rest of the D1 inventory is planned, **not translated**.
+
+Additional slice: `intel_display.c::intel_get_transcoder_timings` (non-DSI,
+version 13) and `intel_get_pipe_src_size` → `tk-intel-display/src/display.rs`;
+register masks/offsets from MIT `intel_display_regs.h`. All seven timing reads,
+interlace correction and SET_CONTEXT_LATENCY override follow source order.
+`kernel/src/drm/intel/i915_port.rs` is original TheKernel glue, limited to an
+already-admitted powered pipe A and denying every write. No GPL helper port
+or full fastboot state-equivalence claim is introduced.
+
+Clock slice: `intel_dpll_mgr.c::{icl_mg_pll_find_divisors,icl_calc_mg_pll_state,
+icl_ddi_mg_pll_get_freq}` → `src/dpll_mgr.rs` (DKL HDMI, no SSC only).
+`intel_cdclk.c::adlp_cdclk_table`, display-13 pixel-rate minimum and
+`bxt_calc_cdclk` table search → `src/cdclk.rs` (ADL-P B0+ / ADL-N D0).
+Selected field definitions come from MIT `intel_{dkl,mg}_phy_regs.h`.
+No PLL/PHY/power/clock writes or workarounds are silently declared complete.
+The optional C oracles load unmodified bodies/headers from the external Linux
+7.2.3 tree, build temporary host programs and remove them. Private captured
+EDID→selected timing→DKL arithmetic→preserved CDCLK is exercised in an explicit
+kernel host test, without bundling BIOS/EDID or asserting full clock policy.
+
+Kernel identity glue now delegates ADL-P/N stepping lookup to that MIT crate;
+ADL-N's source-derived display version is 13 and revision0 is D0. An inexact
+next/future lookup remains unknown in the hardware admission layer. Native
+boot admission additionally requires the characterized `8086:46d0` exact D0,
+not merely a family ID. This changes no default MMIO write policy and does
+not assert the stepping/workaround/TC hardware port is complete.
+
+GT route assessment consulted local Linux 7.2.3 `i915/intel_step.c` (ADL-N
+revision0 graphics/media A0, distinct from display D0), `gt/uc/intel_uc_fw.c`
+(ADL-N selects tgl GuC via the ADL-S override), xe device/firmware tables, and
+cached Mesa 26.1.2 iris i915/xe backends. No GT/HDA code was translated by that
+assessment. The FreeBSD LinuxKPI route reference is the upstream drm-kmod
+repository linked from `docs/design/intel-gpu-acceleration.md`.
+
+The 2026-10-05 re-scan finds **one** new normalized code-line match in
+`tk-intel-display/tests/upstream_clock.rs`: the conventional C `ARRAY_SIZE`
+sizeof expression in the original oracle shim. It adds no fenced/prose quote.
+At ≥40, `crates/ax` totals are now `(0,0,0,16,9,0,0)`; at ≥25 they are
+`(18,15,4,29,18,0,0)` in the scanner's seven-category order. Other scope totals
+and range-citation counts are unchanged. `test_linux_excerpt_baseline.py` is
+reconciled to these measured totals rather than disabling/exempting the scan.
+The earlier inventory tables remain explicitly dated historical measurements.
+
+DKL readout/access extension: MIT `intel_dkl_phy.c` helpers → `src/dkl_phy.rs`,
+`intel_dpll_mgr.c::dkl_pll_get_hw_state` → `src/dpll_mgr.rs`. ADL-P TC PLL enables
+start at **0x46038, stride 8**, not the TGL/ICL MG_PLL_ENABLE registers. Backend
+contracts pin power and serialize all HIP access. Firmware-only readout encloses
+all eight reads in one lock, preserves the full shared selector and verifies its
+restoration on every fallible prefix; failure requires quarantine. This is an
+explicit safety divergence from i915's driver-owned helper (one lock per read).
+`intel_de_rmw` ultimately always writes through `intel_uncore_rmw`, contrary to
+the DKL helper's stale unchanged-value-elision comment. Port follows executable
+upstream behavior. Optional `upstream_dkl` compiles unmodified local C helpers,
+state-readout body and register masks: 192 four-operation traces and 12 masked
+PLL states/read traces. The oracle ignores only the documented preservation
+wrapper's three extra operations, not any upstream register access.
+
+Plane slice: `skl_universal_plane.c::{skl_format_to_fourcc,
+skl_get_initial_plane_config,skl_plane_stride_mult}` and ADL-P main-plane
+`intel_fb.c::intel_tile_{size,width_bytes,height}` / `intel_fb_align_height` →
+`src/universal_plane.rs`. Source format fallback is preserved for readout, but
+native admission separately requires the exact XRGB8888 raw format, linear,
+opaque/unrotated/unreflected layout, bypassed plane color and complete pitch.
+ADL-P field5 is **Yf**, not DG2 4-tile. Five universal planes are exposed per
+pipe (display13 runtime has four sprites plus primary). Main size is checked
+u64, unlike upstream u32 multiplication. Auxiliary/compression/DPT ownership
+is not proven by this slice. Optional `upstream_plane` compiles the unchanged
+format, full initial-plane reconstruction and tile/stride bodies with external
+register/format definitions: 1792 format/alpha/order/tiling/rotation/layout
+states and exact seven-read traces. No physical memory or private fixture added.
+
+Color slice: `intel_color.c` display13 `skl_get_config`, `icl_read_csc` and
+`icl_read_luts` paths, CSC matrix helpers and all used LUT read/packing helpers
+→ `src/color.rs` (exact list in NOTICE); fields from MIT `intel_color_regs.h`.
+Caller-owned LUT buffers avoid a large kernel stack object. Decoded CSC offsets
+are u16 like i915; the complete original dwords are also retained for safety.
+All indexed palettes preserve and verify firmware selectors on every error
+prefix, under the same lock as color commits. Extra wrapper operations are the
+only trace exclusions in the compiled-C oracle. Disabled tables are not read.
+The upstream multi-segment FIXME is preserved as an explicit nine-entry-only
+state, not silently zero-filled or accepted as a complete transform. ICL-only
+Wa_1406463849 does not apply to ADL-P; TGL+ CSC reads do not disarm updates.
+Measured: 192 configuration/CSC/LUT states, decoded entries and upstream MMIO
+traces agree with unchanged local C bodies; all indexed fault prefixes tested.
+
+Color-oracle inventory reconciliation: scoped scanner finds four new code-line
+matches in `tests/upstream_color.rs` at25: conventional `min`, LUT length256,
+CSC matrix members and pre/post LUT blob pointers. Only the final declaration
+also matches at40. Alongside ARRAY_SIZE, the Intel crate now has five such
+code matches at25 / two at40, no fenced/comment/marked matches. Current whole
+`crates/ax` totals supersede the pre-oracle figures above: at40, 0 fenced and
+17 outside fences (10 code); at25, 18 fenced /15 blocks /4 files and33 outside
+fences (22 code). Other scopes and citation counts are unchanged; CI baseline
+is reconciled, not suppressed. Temporary imported bodies retain the MIT grant.
+
+Scaler slice: MIT `skl_scaler.c::{skl_pipe_scaler_get_hw_state,
+skl_scaler_get_config}` → `src/scaler.rs`, display13/two scalers, no CASF.
+Offsets use **pipe stride0x800**, not transcoder/plane stride0x1000. Window
+sizes are direct pixels, not +1 fields. PANEL_FITTER power is pinned separately
+and never woken for discovery. Original extra ownership readout checks both
+controls, including active plane/reserved bindings which the pipe-only getter
+skips. Active filter/scaling state is not admitted for plane-only fastboot.
+48 compiled-C configurations and exact read traces agree; dark-domain,
+missing-register and plane/reserved-binding regressions pass.
+
+WM slice: `skl_watermark.c` display13 pipe WM/DDB getters and decoders plus
+`intel_enabled_dbuf_slices_mask` → `src/watermark.rs`. ADL-P has **six** latency
+levels and dedicated SAGV/transition offsets, not eight ordinary levels. Both
+five exposed planes and the cursor are included in upstream read order.
+DDB end0 remains disabled; nonzero inclusive ends become exclusive+1. Raw
+values are retained separately from decoded fields; safety validation is not
+upstream decode and must resolve MBUS-relative offsets/enabled slices before
+ownership. Global readout retains four irregular DBUF controls plus MBUS_CTL;
+this is not full global bandwidth reconstruction or policy. No WM/PCODE writes.
+64 compiled-C states with all decoded fields and65-register traces agree;
+missing/dark domains, DDB bounds and dedicated SAGV/cursor offsets are tested.
+
+TC readout slice: `intel_tc.c` ADL-P ready/owned predicates, display13 ownership
+condition and modular-FIA mapping/legacy pin/lane fields → `src/tc.rs`. TCSS
+status registers stride4; TC1 DDI is PORT_D (0x64300), DDI stride0x100. ADL-P
+always has two ports per modular FIA, at0x163000/0x16e000. **Display13 pin
+assignment still comes from DFLEXPA1**, not TCSS_DDI_STATUS's display20+ field.
+Core/port/legacy AUX cold-block power must already be pinned; no waking domains,
+no ownership/cold writes. Additional original DKL before-image collection reads
+19 setup-related words under the preserved-selector mechanism, with all43
+fallible MMIO prefixes checked for restoration/quarantine on all four ports.
+48 compiled-C readiness/ownership/FIA states and exact read offsets agree.
+This is not `adlp_tc_phy_get_hw_state` (which acquires power/cold), nor complete
+HPD-derived TC-mode discovery or encoder fastboot admission.
+
+DDI readout slice: selected HDMI/DVI fields in `intel_ddi_read_func_ctl`,
+display13 four-lane `intel_ddi_read_func_ctl_dvi`, `icl_ddi_tc_is_clock_enabled`
+and `icl_ddi_tc_get_pll` → `src/ddi.rs`. TGL port encoding uses `(port+1)<<27`;
+TC1=PORT_D, selector0x4610c. TC gates are bits12/13/14/**21**, not four adjacent
+bits. Unknown clock muxes return no PLL, never a guessed DKL path. Only HDMI
+mode interprets scrambling/high-TMDS flags; DVI lane count is four regardless
+of the DP width field. Combined raw clock evidence is original glue; full
+encoder/DP/audio/infoframe state is not claimed by the control decoder.
+4096 compiled-C HDMI/DVI BPC/sync/scrambling and TC mux/gate states/read traces
+agree; missing/dark domains and unknown encodings are covered.
+
+HDMI slice: display13 packet-enable/GCP/DIP read helpers in MIT `intel_hdmi.c`
+→ `src/hdmi.rs`; exact included functions in NOTICE. Enabled GCP only is read,
+then enabled AVI/SPD/vendor/DRM packets in encoder get_config order. DIP has
+an ECC/reserved hole at byte3, not a hole at the byte4 checksum. Raw control
+(including filtered-out PPS/reserved bits) and raw bytes remain available to
+strict admission; reading a packet is not proof it is valid. 256 compiled-C
+hardware-enable/software-index/GCP/data states and exact MMIO traces agree.
+Selected MIT `drivers/video/hdmi.c`/`include/linux/hdmi.h` decode helpers →
+`src/hdmi_packet.rs`: all AVI fields/bars, SPD text/SDI, vendor VIC/3D metadata,
+and HDR u16 fields, checksum/version/length checks. Full Avionic Design grant
+is in LICENSE-HDMI-MIT. Known safety difference: SPD initializer's unchecked
+string scan is replaced with field-bounded prefix/zero-pad behavior; C oracle
+input buffers have explicit trailing zeros, not undefined string accesses.
+4800 packet-field/rejection cases agree with unmodified local C functions.
+No claim of full fastboot ownership, packet programming, audio or hardware output.
+
+HDMI-oracle excerpt inventory: seven new code matches at25 in
+`tests/hdmi_packet.rs`: conventional min, five packet-size constants and HDMI
+IEEE OUI. Their normalized lengths are28–34, so at40 totals are unchanged.
+Current Intel crate totals:12 code matches at25 /2 at40, no fenced/comment/marked
+matches. Whole crates/ax at25 is now18 fenced lines /15 blocks /4 files and40
+outside fences (29 code); at40 remains0 fenced and17 outside (10 code).
+Other scopes/citation counts unchanged; the baseline is reconciled, not bypassed.
+
+### Native N305 fastboot wiring
+
+`tk-intel-display/src/pipe_config.rs` translates display13
+`intel_display.c::bdw_get_pipe_misc_output_format`, the scalar readout steps of
+`hsw_get_pipe_config`, and `intel_vrr.c::intel_vrr_get_config`, with selected
+MIT `intel_{display,vrr,vdsc}_regs.h` fields. Original Intel copyrights
+2006–2007/2020/2025/2024/2023 and the full MIT grant are in the crate NOTICE and
+LICENSE-MIT. Active DSC/joining is refused, not described as a decoded PPS.
+`kernel/src/drm/intel/fastboot.rs` is original adapter/ownership/recovery policy
+around these translated getters. Power-map and UC non-GuC GGTT ordering refer
+to local i915; the GMS size decoder independently implements published field
+facts, with no GPL text/translation. No GT reset, GuC, DMC, physical display
+acceptance or Mesa rendering is implied by this native KMS adapter.
+
+### Independently opted-in N305 GT entry
+
+The native `intel.gt=1` boot hook is independent of display fastboot/HDMI/HPD/
+DMC/audio. `tk-intel-gt` translates only Gen12 GT forcewake ownership/reset,
+source fallback-ACK workaround, BCS CS-stop/prefetch/pending-MI-forcewake and
+prepare/cancel/hardware-domain reset. MIT sources/functions/copyrights and the
+exact original uncore grant are in its NOTICE/LICENSE-MIT. Kernel MMIO adapter
+and terminal-owner policy are original MIT. Source `intel_step.c` maps N305
+revision0 to GT/media A0; display D0 is not reused. The compiled-i915 oracle
+checks BCS domain selection (Gen11 bit2, not old bit3), reset prepare/cancel,
+double GDRST and50us settle. Model tests are not physical reset/copy evidence.
+
+The GT C oracle shim's conventional `ARRAY_SIZE` definition adds one code-line
+match at both excerpt thresholds25/40. The combined Intel display+GT test
+inventory is15 code matches at25 and3 at40, with no fenced/comment/marker
+matches and no scan exemption. The CI totals are reconciled accordingly.
+
+### Kernel-owned N305 BCS execution chain
+
+`intel.gt=1` now continues from source forcewake/reset into owned SharedPages,
+39-bit physical checks, direct-DMA admission, shared scoped GGTT bindings,
+private four-level PPGTT, source Gen12 BCS LRC/indirect/predicate image, UC cache
+policy and applicable GT workarounds, execlists load, flush/breadcrumb wait,
+source stop/reset retirement, exact copied bytes/source/guard verification.
+Source/function and copyright inventory is in `tk-intel-gt/NOTICE` and its full
+original MIT grant. Unmodified compiled C compares whole register/WA images,
+PDE/PTE fields and all batch/ring words; it caught predicate WA and WA-tail
+omissions before commit. The native kernel does not have a CPU-copy fallback:
+the interpreter is host-test-only. No physical GPU execution has been observed;
+BCS is not RCS rendering, and no i915 execbuf/Mesa capability is advertised.
+
+The BCS/context C shims add two conventional `INVALID_MMIO_REG` definitions
+at25 only; GT totals are3 at25/1 at40, combined Intel15 at25/3 at40. CI
+`crates/ax` at25 changes only outside/code41/30→43/32. No exemption is used.
+
+The original kernel `intel/gem_exec.rs` adapter uses published x86_64 i915 UAPI
+facts, not a GPL execbuf body. Local Linux7.2.3 headers compiled independently
+confirm eight sizes, eight ioctl encodings, WB mapping flag and five offsets.
+Existing GEM/PRIME/mmap/reservation/binary-sync infrastructure is reused; user
+commands are bounded, decoded and rebuilt rather than run privileged. No full
+Mesa/RCS execution or physical BCS acceptance is claimed.
+
+### Bounded RCS shader chain
+
+N305 render-domain reset, source14-page context/2WA pages, whole-slice RPCS,
+command-buffer/GPR/timestamp restore, mandatory instruction-state invalidation,
+source RCS engine/context WAs and RCS flush/breadcrumb are translated from MIT
+i915 sources/functions inventoried in `tk-intel-gt/NOTICE`. A bounded licensed
+IGT Gen12 shader rectangle is adapted from Intel-hosted backport/v6.17 source
+and its original full COPYING is preserved as LICENSE-IGT. Source-only compiler
+oracles compare complete images/rings/WA lists/state pages. Original native
+memory/submit/result/retirement and strict rebuilt user-page admission reuse
+GEM reservations/binary sync. Source Mesa26.1.2 Gen120 MOCS/packet facts provide
+an explicit UC-policy/full-SBA safety adaptation. This is not EU emulation or
+physical GPU/Mesa acceptance; no host DRM node is opened in these validations.
+
+The RCS additions add two conventional C-shim INVALID_MMIO_REG matches at25
+and73 identical all-zero data-array rows at25/40 from the compiled IGT page.
+They are measured textual matches, not proof of copied Linux bodies or GPU
+execution. Current GT totals79/74 and combined Intel91/76; crates/ax baseline
+outside/code118/107 at25,91/84 at40, no fenced/comments/markers or exemptions.
+
+N305 GT information runtime: `tk-intel-gt/src/info.rs` selects MIT
+`gt/intel_sseu.c::gen12_sseu_info_init/gen11_compute_sseu_info` and
+`gt/intel_gt_clock_utils.c` reference/crystal/divider readout, copyrights2019/
+2020 Intel, full grant in existing LICENSE-MIT. The existing i915-wire dispatcher
+calls these for real fuse topology and timestamp frequency; it does not use the
+product's advertised EU count as a hardware observation. Per-file context/query
+transport is original, with independently compiled x86_64 UAPI sizes/commands.
+
+DRM completion ownership: original syncobj/fence fix follows observed Linux7.2.3
+binary SIGNAL replacement and chain dependency ordering, not producer mutation.
+The ignored explicit host oracle reads selected source `drm_syncobj_replace_fence`,
+`drm_syncobj_assign_null_handle` and `dma_fence_chain_{init,find_seqno,signaled}`,
+then compiles only a temporary licensed C transport model. MIT Red Hat/AMD and
+GPL-2.0-only AMD notices/full grant accompany that temporary source. No runtime
+GPL chain translation is present. It tests captured identity, terminal/dependency
+ordering and late points; it is not evidence of GPU execution or all fence errno.
+
+The syncobj oracle's conventional test-only `max(a,b)` macro adds one normalized
+code match at threshold25, none at40. Kernel outside-fence totals are now303/
+14code at25 and unchanged132/8code at40; fenced totals/range cites are unchanged.
+This is a short transport shim, not a retained Linux chain implementation;
+the scanner is not exempted or disabled.
+
+Shared-cache admission calls selected ADL-P/N media forcewake helpers and source
+`intel_engine_cs.c::ring_is_idle` head/tail/MODE_IDLE checks before existing
+PAT/MOCS/L3 writes. Platform masks/fuse and MMIO definitions are read from the
+local i915 reference; unknown/live consumers refuse. Corresponding unchanged-C
+register/idle predicates and fault/ownership models validate software only.
+The media idle C transport adds one conventional `I915_SELFTEST_ONLY(x) 0`
+match at25, none at40; current GT79/74, combined Intel91/76 and crates/ax119/
+108code at25 (unchanged91/84code at40) are reconciled without an exemption.
+
+Intel VM/context transport: Linux7.2.3 gem/i915_gem_context.c
+`i915_gem_vm_{create,destroy}_ioctl`, `get_ppgtt`, `set_proto_ctx_vm` and
+`create_setparam` define handle/reference/proto-context behavior; existing
+selected gen8_ppgtt.c encodings back the runtime PPGTT. Kernel lifetime/storage
+adaptation is original Rust over GEM charging/SharedPages, with no GPL body.
+Actual userspace reference stays Mesa26.1.2, including intel/common/i915/intel_gem.c
+and iris/i915/iris_{batch,bufmgr,kmd_backend}.c. Same-source iris build and the
+original real EGL/GLES client are preparation, not initialization/render evidence.
+
+Target iris context/clock continuation: Linux7.2.3 `set_proto_ctx_engines` and
+`i915_reg_read_ioctl` whitelist; `intel_uncore_read64_2x32` upper/low/upper with
+three attempts (MIT ©2013/2022 Intel, existing full grant). The native owner
+already holds forcewake; unknown/torn state returns an error. Mesa26.1.2's
+actual RCS/RCS/BCS+RECOVERABLE=0+VM create chain selects immutable engine slots.
+Scheduling/recovery, hardware/default saved images and general batch support
+are still not claimed. Compiled unmodified C is a trace oracle, not GPU evidence.
+
+Opaque context-image continuation selects Linux7.2.3 intel_lrc.c
+`lrc_update_regs`, `init_ppgtt_regs`, `__reset_stop_ring`, WA image builders and
+execlists port ordering/Gen11 SW-context tags (MIT ©2014 Intel, existing grant).
+The kernel adapter owns pins/charging, uses a distinct idle context to save the
+request image, and gates validity on two breadcrumbs plus source reset retirement.
+GPU-generated streams are not rebuilt from invented values. `intel_gt.c::__engines_record_defaults` and `intel_lrc.c::lrc_init_state`
+now guide reset-default recording/clone initialization. Physical capture remains
+unverified; general nonprivileged user batches remain unfinished.
+
+Source Gen12.0 RCS/BCS register whitelist: Linux7.2.3 intel_workarounds.c
+`tgl_whitelist_build`, `allow_read_ctx_timestamp`, `_wa_add` encoded-address
+ordering and `intel_engine_apply_whitelist`; intel_engine_regs.h supplies12
+slots/read-only/range4/NOPID fields. Same source functions compile into the
+existing temporary-C oracle, covering all24 RCS/BCS writes, plus landed-store
+and readback fault cases. The original kernel native ownership gates are kept;
+this does not itself open general Mesa batches or establish GPU execution.
+
+- Intel N305 standard residency: `kernel/src/drm/intel/gt/copy_ppgtt.rs`
+  adapts Linux7.2.3 MIT `gt/gen8_ppgtt.c` `__gen8_ppgtt_alloc` and
+  `gen8_ppgtt_insert_pte` (Intel2020), using existing GEM charging/pins and
+  stopped-engine serialization. Four-level4K only; full grant in
+  `crates/ax/tk-intel-gt/LICENSE-MIT`. Native ordinary batches reuse the
+  existing MIT `gen8_emit_bb_start_noarb` translation and Gen12 hardware
+  nonprivileged admission; no GPL command-parser body imported.
+
+- `tk-intel-gt/src/cache.rs`: Linux7.2.3 MIT `intel_mocs.c` Gen12 table,
+  unused-index selection/global-control/paired-L3 initialization (Intel2015),
+  `intel_gtt.c` private PAT initialization (Intel2020); full grant in GT license.
+  Original GEM adapter follows source domain/cache/advice/aperture behavior
+  over existing TheKernel reservations, pins and storage/PRIME ownership.
+
+- Necessary GPU CPU-map adaptation is original MIT Rust in
+  `tk-axplat-x86-pc/src/intel_cpu_cache.rs`, existing file/shared-mmap backend
+  and x86 PTE conversion. Linux7.2.3 x86 PAT initialization is a behavior
+  reference only; no GPL source body was copied. Opt-in/all-CPU proof and
+  immutable WC/UC/WB VMA types preserve the default and ownership boundaries.
+- HDMI audio C-oracle declarations add5 normalized matches at25 and2 at40
+  (ARRAY_SIZE, DIV_ROUND_UP, min and2 structure member declarations). Current
+  crates/ax counts:25=(18,15,4,124,113,0,0),40=(0,0,0,93,86,0,0); other
+  scopes unchanged. Combined Intel display+GT test shim counts96/78. These
+  are reconciled in NOTICE/baseline; no source/scanner exemptions introduced.
+
+- Powered TC legacy-HDMI modeset: dpll_mgr.rs adds source dkl_pll_write;
+  kernel tc_modeset.rs ports Linux7.2.3 MIT intel_ddi.c transcoder clock/
+  function/buffer enable-disable, intel_display.c timing/pipe and
+  skl_universal_plane.c primary arm (Intel2006–2022). Existing fastboot owns
+  exact original-image restoration, power and DMA lifetime. No GPL body,
+  cold-TC/PCODE/CDCLK or new WM computation was imported. Grant: display
+  LICENSE-MIT, function inventory in display NOTICE and module header.
+
+- HDMI audio: tk-intel-display/audio.rs translates Linux7.2.3 MIT
+  intel_audio.c clock/N/M-CTS and HSW/DDI enable/disable plus drm_edid.c ELD
+  assembly; full attribution/grant in header and display NOTICE/LICENSE-MIT.
+  CTA validation and kernel audio.rs/HDA integration are original adapters.
+  sound/hda/codecs/hdmi/intelhdmi.c (GPL) is a behavior/register-topology
+  reference only: no GPL implementation body copied into the Apache HDA crate.
+
+- Preserved-WM profile admission is an original conservative predicate, not
+  new PCODE/latency policy. The independent temporary C oracle uses unchanged
+  Linux7.2.3 MIT skl_compute_wm_params/skl_compute_plane_wm and intel_fixed.h
+  arithmetic for exact linear-XRGB4K30->1080p60. At258 normal latencies
+  target block/line/minimum-DDB demand is no worse; the same-profile method2
+  argument covers SAGV equal latencies. Actual latency is not guessed/read.
+  Conventional WM oracle shims add5 code matches at25 and2 at40; current
+  crates/ax totals25=(18,15,4,129,118,0,0),40=(0,0,0,95,88,0,0).
+  Combined Intel display+GT inventory101/80, with no scanner exemptions.
+
+- Powered TC HDMI signal programming: tc.rs ports Linux7.2.3 MIT
+  intel_ddi.c::tgl_dkl_phy_set_signal_levels and intel_ddi_level with
+  intel_ddi_buf_trans.c::_tgl_dkl_phy_trans_hdmi, selected ADL-P HDMI branch
+  (Intel2012/2020/2023; full grant in display LICENSE-MIT). N305 D0 matches
+  intel_display_wa.c Wa_16011342517 applicability. The literal source RMW
+  set argument1 at594MHz is preserved, not reinterpreted as bit12. Native
+  target clocks148500/297000 use the source0 branch and VBT level5.
+  The source helper is called before DDI_BUF enable; complete expected-PHY
+  readback and original8-word/HIP restoration feed the existing transaction.
+
+- Native display IRQ/PCI adapter (kernel intel/irq.rs, pci.rs): original MIT
+  Rust around existing MSI/WaitQueue facilities, using Linux7.2.3 MIT
+  intel_display_irq.c / intel_hotplug_irq.c source masks, W1C/selected-pin
+  behavior and register layouts. Function inventory/boundary in irq.rs header.
+  GPL i915_irq.c master dispatcher is behavior-only, not copied. Hardware
+  counter epochs adapt source intel_crtc_vblank_off/on behavior to existing
+  KMS; no GPL DRM core body imported. No new firmware binary added.
+
+- Native iris payload: same cached Mesa26.1.2, Buildroot2026.05.2 GCC14.4 /
+  glibc2.43 / libdrm2.4.131 target cross-build. Common shared-DSO platform
+  options match the existing recipe; iris added without source version mixing.
+  Native flavor reuses existing Buildroot overlay and graphics runner. No
+  binary/source driver body imported into this repository; image and tools
+  remain task-owned build outputs. Guest immediate symbol binding is measured;
+  no physical GPU initialization/rendering or software fallback result claimed.

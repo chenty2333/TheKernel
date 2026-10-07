@@ -196,3 +196,7 @@ pub fn acpi_flush_diagnostics(){console::flush_diagnostic();}
 
 #[cfg(feature = "irq")]
 pub use apic::configure_pci_intx_polarity;
+
+mod intel_cpu_cache;
+/// All startup CPUs confirmed the opted-in native Intel WC mapping palette.
+pub fn intel_cpu_mmap_ready() -> bool { intel_cpu_cache::ready() }

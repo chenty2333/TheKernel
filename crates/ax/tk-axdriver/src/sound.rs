@@ -176,3 +176,16 @@ pub fn abort(tokens: &[u16]) -> DevResult {
         Ok(())
     })
 }
+
+/// Publish an already validated display ELD to the HDA digital codec route.
+/// VirtIO and HDA-free builds return Unsupported; display remains usable.
+pub fn set_display_eld(port: u8, eld: Option<&[u8]>) -> DevResult {
+    #[cfg(feature = "intel-hda")]
+    {
+        if crate::hda::available() {
+            return crate::hda::set_display_eld(port, eld);
+        }
+    }
+    let _ = (port, eld);
+    Err(DevError::Unsupported)
+}

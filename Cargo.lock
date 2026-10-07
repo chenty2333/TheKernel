@@ -3644,6 +3644,14 @@ name = "tk-axtlb"
 version = "0.1.0"
 
 [[package]]
+name = "tk-intel-display"
+version = "0.1.0"
+
+[[package]]
+name = "tk-intel-gt"
+version = "0.1.0"
+
+[[package]]
 name = "tk-kernel"
 version = "0.1.0"
 dependencies = [
@@ -3713,6 +3721,8 @@ dependencies = [
  "tk-axsync",
  "tk-axtask",
  "tk-axtlb",
+ "tk-intel-display",
+ "tk-intel-gt",
  "tk-kernel-elf-parser",
  "tk-linux-aio",
  "tk-linux-arch-x86-64",

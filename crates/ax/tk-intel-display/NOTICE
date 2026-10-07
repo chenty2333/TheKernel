@@ -1,0 +1,221 @@
+tk-intel-display is a bounded Rust translation of MIT-licensed Linux 7.2.3
+i915 display components. The original grants are preserved in LICENSE-MIT.
+No GPL i915 ACPI/trace code is included. No firmware or private capture data
+is bundled; external capture tests read user-supplied files without modifying them.
+
+src/device.rs:
+  drivers/gpu/drm/i915/display/intel_display_device.c:
+  adl_p_steppings, adl_p_adl_n_steppings, get_pre_gmdid_step, xe_lpd_display
+  Copyright © 2023 Intel Corporation.
+  include/drm/intel/pciids.h (PCI identity facts): Copyright 2013 Intel Corporation.
+src/bios.rs:
+  drivers/gpu/drm/i915/display/intel_bios.c:
+  intel_bios_is_valid_vbt, _get_blocksize, find_raw_section,
+  child_device_expected_size, parse_general_definitions, dvo_port_to_port,
+  map_ddc_pin, intel_bios_encoder_supports_{dvi,hdmi,dp,edp,typec_usb,tbt},
+  intel_bios_hdmi_max_tmds_clock, sanitize_dedicated_external
+  Copyright © 2006 Intel Corporation.
+  drivers/gpu/drm/i915/display/intel_vbt_defs.h: selected byte-layout fields
+  Copyright © 2006-2016 Intel Corporation.
+src/opregion.rs:
+  drivers/gpu/drm/i915/display/intel_opregion.c:
+  intel_opregion_setup VBT discovery and selected header/ASLE byte-layout fields
+  Copyright 2008 Intel Corporation <hong.liu@intel.com>
+  Copyright 2008 Red Hat <mjg@redhat.com>
+
+Only display 13 ADL-P/N semantic paths are included. Safety divergences are
+explicitly documented in each file and README.md. Original TheKernel adapter
+and tests are MIT (Copyright 2026 TheKernel contributors).
+
+src/display.rs:
+  drivers/gpu/drm/i915/display/intel_display.c:
+  intel_get_transcoder_timings (non-DSI display 13), intel_get_pipe_src_size
+  Copyright © 2006-2007 Intel Corporation.
+  intel_display_regs.h: selected timing/source/register fields
+  Copyright © 2025 Intel Corporation.
+  This is partial readout, not hsw_get_pipe_config, get_config for TC PLL/PHY,
+  framebuffer reconstruction, or modeset_setup ownership/fastboot equivalence.
+
+src/dpll_mgr.rs:
+  drivers/gpu/drm/i915/display/intel_dpll_mgr.c:
+  icl_mg_pll_find_divisors, icl_calc_mg_pll_state,
+  icl_ddi_mg_pll_get_freq (display-13 DKL HDMI/no-SSC branches only)
+  Copyright © 2006-2016 Intel Corporation.
+  intel_mg_phy_regs.h / intel_dkl_phy_regs.h: selected field encodings
+  Copyright © 2022 Intel Corporation.
+src/cdclk.rs:
+  drivers/gpu/drm/i915/display/intel_cdclk.c:
+  adlp_cdclk_table, _intel_pixel_rate_to_cdclk (display-13 PPC/guardband),
+  bxt_calc_cdclk table selection for ADL-P B0+ / ADL-N D0
+  Copyright © 2006-2017 Intel Corporation.
+  No full intel_crtc_min_cdclk, plane bandwidth/audio policy, PCODE or clock writes.
+
+Optional upstream_clock/upstream_readout tests extract and compile local MIT
+C bodies and headers at runtime. They do not distribute a Linux C copy or
+implement a kernel LinuxKPI layer. Temporary oracle files are removed.
+
+The excerpt inventory scanner also finds one normalized textual C-code match
+at both thresholds25/40 in tests/upstream_clock.rs: the conventional sizeof
+ARRAY_SIZE expression used by the original host compile shim. This is not an
+imported C driver or a quoted Linux prose block. Accounted as one outside-fence
+code line in the repository's scanner baseline; no fenced quote or range marker.
+
+src/dkl_phy.rs:
+  drivers/gpu/drm/i915/display/intel_dkl_phy.c:
+  dkl_phy_set_hip_idx, intel_dkl_phy_{read,write,rmw,posting_read}
+  intel_dkl_phy_regs.h: four ADL-P TC apertures/bank/index layout
+  Copyright © 2022 Intel Corporation.
+src/dpll_mgr.rs additionally includes dkl_pll_get_hw_state, ADL-P
+  intel_tc_pll_enable_reg routing and its display_regs.h register fields.
+  Copyright © 2006-2016 / 2025 Intel Corporation.
+  Power and global HIP locking are explicit backend lifetime contracts.
+  Readout restores and verifies firmware's selector under a single lock;
+  i915 driver-owned individual access routines retain their original sequence.
+  dco_khz is derived metadata, excluded from raw state comparisons.
+
+src/universal_plane.rs:
+  drivers/gpu/drm/i915/display/skl_universal_plane.c:
+  skl_format_to_fourcc, skl_get_initial_plane_config, skl_plane_stride_mult
+  Copyright © 2020 Intel Corporation.
+  drivers/gpu/drm/i915/display/intel_fb.c:
+  intel_tile_{size,width_bytes,height}, intel_fb_align_height (ADL-P main plane)
+  Copyright © 2021 Intel Corporation.
+  skl_universal_plane_regs.h: selected plane fields
+  Copyright © 2024 Intel Corporation.
+  include/uapi/drm/drm_fourcc.h: selected format/modifier encodings
+  Copyright 2011 Intel Corporation.
+  ADL-P has five exposed universal planes, no DG2 4-tile interpretation.
+  No auxiliary plane/DPT ownership, joiner or allocation is implied by readout.
+
+src/color.rs:
+  drivers/gpu/drm/i915/display/intel_color.c (display13 branches):
+  skl_get_config, hsw_read_gamma_mode, ilk_read_csc_mode, icl_read_csc,
+  ilk_read_pipe_csc, icl_read_output_csc, icl_read_luts,
+  icl_has_{pre,post}_csc_lut, glk_read_degamma_lut, ilk_read_lut_8,
+  bdw_read_lut_10, ivb_lut_10_size, icl_read_lut_multi_segment,
+  intel_color_lut_pack, i9xx_lut_8_pack, ilk_lut_{10,12p4}_pack,
+  glk_degamma_lut_pack
+  Copyright © 2016 Intel Corporation.
+  intel_color_regs.h selected fields: Copyright © 2023 Intel Corporation.
+  Indexed reads preserve/verify firmware selectors under a backend lock.
+  Multi-segment readout retains upstream's nine-super-fine-entry limitation,
+  explicitly incomplete, never a fabricated full 1024-entry LUT.
+
+The current excerpt scanner inventory for this crate is five outside-fence
+code-line matches at25, two at40, no fenced/comment/range-marked matches.
+In addition to ARRAY_SIZE, upstream_color.rs contributes the conventional
+min expression, LEGACY_LUT_LENGTH constant and two MIT color-state member
+layouts at25; only the dual drm_property_blob pointer declaration also meets40.
+These are C compile-shim facts/declarations, not imported driver bodies or prose.
+No scanner exemption is applied. Whole crates/ax totals are registered in CI.
+
+src/scaler.rs:
+  drivers/gpu/drm/i915/display/skl_scaler.c:
+  skl_pipe_scaler_get_hw_state, skl_scaler_get_config (display13, CASF absent)
+  Copyright © 2020 Intel Corporation.
+  intel_display_regs.h: selected scaler fields
+  Copyright © 2025 Intel Corporation.
+  Additional original ownership readout checks BOTH scaler controls, including
+  plane/reserved bindings skipped by the upstream pipe-only getter. Power must
+  be pinned for PANEL_FITTER independently of the pipe. No filter programming.
+
+src/watermark.rs:
+  drivers/gpu/drm/i915/display/skl_watermark.c:
+  skl_wm_level_from_reg_val, skl_pipe_wm_get_hw_state, skl_ddb_entry_init,
+  skl_ddb_entry_init_from_hw, skl_ddb_get_hw_plane_state,
+  skl_pipe_ddb_get_hw_state, intel_enabled_dbuf_slices_mask (display13)
+  Copyright © 2022 Intel Corporation.
+  skl_universal_plane_regs.h / intel_cursor_regs.h: Copyright © 2024 Intel Corporation.
+  skl_watermark_regs.h: Copyright © 2023 Intel Corporation.
+  Six latency levels and dedicated SAGV/transitions, five planes plus cursor.
+  DDB coordinates are still MBUS-relative; raw DBUF/MBUS state is retained.
+  No WM allocation/computation, SAGV/PCODE or hardware writes are imported.
+
+src/tc.rs:
+  drivers/gpu/drm/i915/display/intel_tc.c:
+  adlp_tc_phy_is_ready, adlp_tc_phy_is_owned, tc_phy_owned_by_display,
+  tc_phy_load_fia_params and legacy get_pin_assignment/get_lane_mask fields
+  Copyright © 2019 Intel Corporation.
+  intel_display_regs.h / intel_{mg,dkl}_phy_regs.h selected fields:
+  Copyright © 2025 / 2022 Intel Corporation.
+  Original additional DKL before-image readout uses the upstream HDMI setup
+  register layout. It is not an upstream get_config or ownership-acquire port.
+  Power/cold must already be pinned; no cold unblock or ownership write.
+
+src/ddi.rs:
+  drivers/gpu/drm/i915/display/intel_ddi.c:
+  intel_ddi_read_func_ctl selected HDMI/DVI control fields,
+  intel_ddi_read_func_ctl_dvi (display13 four lanes),
+  icl_ddi_tc_is_clock_enabled, icl_ddi_tc_get_pll
+  Copyright © 2012 Intel Corporation.
+  intel_display_regs.h selected fields: Copyright © 2025 Intel Corporation.
+  DP software state, audio and infoframe get_config remain separate; unknown
+  selections do not grant a DKL PLL. Combined raw clock evidence is original.
+
+src/hdmi.rs:
+  drivers/gpu/drm/i915/display/intel_hdmi.c:
+  hsw_infoframes_enabled, hsw_infoframe_enable, hsw_dip_data_reg,
+  hsw_read_infoframe, intel_hdmi_infoframes_enabled, intel_read_infoframe,
+  intel_hdmi_read_gcp_infoframe (display13 HDMI packet branches)
+  Copyright 2006 Dave Airlie <airlied@linux.ie>
+  Copyright © 2006-2009 Intel Corporation.
+  intel_display_regs.h: Copyright © 2025 Intel Corporation.
+  GCP and AVI/SPD/vendor/DRM data are read only when enabled. DIP byte3 is
+  the hardware ECC/reserved hole; byte4 is the packet checksum. No packet writes.
+src/hdmi_packet.rs:
+  drivers/video/hdmi.c / include/linux/hdmi.h:
+  hdmi_infoframe_checksum, hdmi_infoframe_unpack (four display packet types),
+  hdmi_{avi,spd,drm}_infoframe_unpack, hdmi_vendor_any_infoframe_unpack,
+  hdmi_drm_infoframe_unpack_only and selected initialization defaults
+  Copyright (C) 2012 Avionic Design GmbH.
+  Exact permission text, including non-infringement disclaimer, is preserved
+  separately in LICENSE-HDMI-MIT and included in temporary C oracle grants.
+  Checked slices and field-bounded SPD text intentionally avoid unchecked
+  packet/string accesses. No audio codec, HDMI sink or mode programming.
+
+HDMI-oracle inventory update: hdmi_packet.rs contributes seven additional
+outside-fence code matches at25 (none at40): the conventional min expression,
+five HDMI packet-size constants, and the HDMI IEEE OUI constant. All are
+32–34 or28 normalized characters; no driver body/prose is copied into Rust.
+Current crate totals are12 code matches at25 /2 at40; no fenced/comment/range
+matches. Whole crates/ax counts are reconciled in CI, without scan exemptions.
+
+src/pipe_config.rs:
+  intel_display.c: bdw_get_pipe_misc_output_format, selected hsw_get_pipe_config
+  scalar fields, Copyright © 2006-2007 Intel Corporation;
+  intel_vrr.c: intel_vrr_get_config display13 branch,
+  Copyright © 2020 Intel Corporation;
+  intel_{display,vrr,vdsc}_regs.h selected fields,
+  Copyright © 2025 / 2024 / 2023 Intel Corporation. LICENSE-MIT applies.
+  DSC controls are discovery/refusal evidence, not a complete PPS decoder.
+  Kernel fastboot adapter now calls this and the existing plane, color, scaler,
+  watermark, TC/PLL/DDI/HDMI readouts for a fixed linear TC HDMI KMS path.
+
+HDMI audio additions: src/audio.rs follows Linux7.2.3 MIT intel_audio.c
+clock/N/M-CTS and HSW DDI enable/disable (Intel2022), MIT drm_edid.c ELD
+assembly (Intel2023). Explicit unchanged-C source compares14 clock/sequence
+pairs and3 ELD layouts; the CTA parser is independently original Rust.
+New oracle shims contribute five normalized code matches at25 and two at40:
+ARRAY_SIZE, DIV_ROUND_UP, min and two layout member declarations; full source
+grants preserved in temporary compiler input. Combined Intel display+GT
+inventory is96/78 at25/40. No scanner exemption or disabled checks.
+
+Powered TC legacy HDMI runtime additions:
+  intel_dpll_mgr.c dkl_pll_write; intel_ddi.c transcoder clock/function and
+  DDI buffer enable/disable; intel_display.c timing/pipe enable;
+  skl_universal_plane.c primary arm. Copyright © 2006–2022 Intel.
+  Runtime translations in kernel/src/drm/intel/tc_modeset.rs retain the
+  LICENSE-MIT grant and immutable original-image rollback in fastboot.rs.
+  No cold TC acquisition, PCODE/CDCLK or new watermark policy is included.
+
+Preserved WM-profile comparison: original conservative predicate for exact
+linear-XRGB4K30->1080p60; temporary independent MIT skl_watermark.c /
+intel_fixed.h source oracle preserves full grants. No PCODE read or new WM
+programming. Conventional oracle shims add5 code matches at25 and2 at40;
+current combined Intel display+GT inventory101/80. CI baseline reconciled.
+
+TC signal programming addition: tc.rs retains the MIT
+intel_ddi.c::tgl_dkl_phy_set_signal_levels/intel_ddi_level, HDMI DKL table
+from intel_ddi_buf_trans.c and known Wa_16011342517 selection. Copyright
+©2012/2020/2023 Intel, full grant in LICENSE-MIT. Runtime uses verified VBT5
+before buffer enable; complete PHY before-image remains the rollback source.

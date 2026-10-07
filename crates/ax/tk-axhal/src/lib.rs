@@ -210,6 +210,15 @@ pub mod boot {
         None
     }
 
+    /// CPU WC/UC mmap types are admitted only after every startup CPU confirms
+    /// the explicitly opted-in Intel palette; hosted models have no such proof.
+    pub fn intel_cpu_mmap_ready() -> bool {
+        #[cfg(all(target_os = "none", feature = "defplat"))]
+        { axplat_x86_pc::intel_cpu_mmap_ready() }
+        #[cfg(not(all(target_os = "none", feature = "defplat")))]
+        { false }
+    }
+
     /// Looks up one `key=value` boot parameter.
     ///
     /// Parameters are whitespace separated.  A bare `key` with no `=` is a

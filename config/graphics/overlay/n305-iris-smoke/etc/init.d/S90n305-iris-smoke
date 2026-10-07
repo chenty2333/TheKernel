@@ -1,0 +1,54 @@
+#!/bin/sh
+# This proves the N305 iris/EGL/GBM/GLES target DSOs and guest tool resolve in
+# the Buildroot guest.  Usage rejection is deliberate: QEMU has no N305 GPU,
+# so this does not attempt initialization or pretend to render.
+set -eu
+
+marker=THEKERNEL_N305_IRIS_MESA_LOADER_READY
+loader=/lib/ld-linux-x86-64.so.2
+client=/usr/local/bin/intel-mesa-smoke
+log=/run/intel-mesa-smoke-usage.log
+
+fail() {
+    echo "$marker state=FAIL reason=$1" >&2
+    exit 1
+}
+
+uses_target_gallium() {
+    loaded_gallium=$(printf '%s\n' "$1" | sed -n \
+        's/^.*libgallium-26\.1\.2\.so => \([^ ]*\).*/\1/p' | head -n 1)
+    case "$loaded_gallium" in
+        /usr/lib/libgallium-26.1.2.so|/usr/lib64/libgallium-26.1.2.so) ;;
+        *) return 1 ;;
+    esac
+    staged_gallium=$(readlink -f /usr/lib/libgallium-26.1.2.so) || return 1
+    loaded_realpath=$(readlink -f "$loaded_gallium") || return 1
+    [ "$loaded_realpath" = "$staged_gallium" ]
+}
+
+[ -x "$loader" ] || fail target_loader
+[ -x "$client" ] || fail mesa_client
+[ -r /usr/lib/libgallium-26.1.2.so ] || fail iris_gallium
+grep -Fq iris_driver_descriptor /usr/lib/libgallium-26.1.2.so || fail iris_driver
+
+client_deps=$($loader --list "$client") || fail client_dependency_resolution
+printf '%s\n' "$client_deps"
+uses_target_gallium "$client_deps" || fail client_gallium_path
+
+# The EGL/GBM client backend loads this module from /usr/lib/gbm.  Resolve its
+# dependency graph too, so a copied library cannot silently keep using another
+# libgallium on the loader search path.
+backend_deps=$($loader --list /usr/lib/gbm/dri_gbm.so) || fail gbm_backend_dependency_resolution
+printf '%s\n' "$backend_deps"
+uses_target_gallium "$backend_deps" || fail backend_gallium_path
+
+status=0
+LD_BIND_NOW=1 MESA_LOADER_DRIVER_OVERRIDE=iris "$client" >"$log" 2>&1 || status=$?
+[ "$status" -eq 2 ] || {
+    cat "$log" >&2
+    fail guest_client_load
+}
+grep -Fq 'usage: intel-mesa-smoke {--initialize|--execute}' "$log" || fail expected_usage
+cat "$log"
+echo "$marker state=PASS layer=guest_dynamic_loader renderer=not_tested"
+echo "$marker"

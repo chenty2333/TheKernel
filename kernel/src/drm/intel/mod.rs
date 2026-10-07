@@ -81,17 +81,25 @@
 //! register reads that write nothing, and every expensive step happens in task
 //! context after the read.
 
+mod audio;
 mod clk;
 mod connect;
 pub(crate) mod debugfs;
+mod dma;
+mod fastboot;
 pub(crate) mod fb;
 mod firmware_scanout;
 mod firmware_snapshot;
+pub(super) mod gem_context;
+pub(super) mod gem_exec;
 mod gmbus;
+mod gt;
 mod gt_probe;
 pub(crate) mod gtt;
 mod hpd;
+mod i915_port;
 mod id;
+mod irq;
 mod modeset;
 mod output;
 mod pattern;
@@ -106,11 +114,14 @@ mod rollback;
 pub(crate) mod scanout;
 mod sink;
 mod swing;
+mod tc_modeset;
 mod timing;
 
 #[cfg(test)]
 mod testbus;
 
+#[cfg(target_os = "none")]
+use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 
 use spin::Mutex;
@@ -218,6 +229,9 @@ static HOTPLUG: Mutex<Option<HotplugWatch>> = Mutex::new(None);
 /// boot log scrolls away.  A run that did not happen, and a run that failed,
 /// both leave their reason here rather than leaving the file silent about it.
 static MODESET: Mutex<Option<String>> = Mutex::new(None);
+/// Serializes the shared ADL-P HIP selector across firmware readout, PLL
+/// programming and the optional display-audio register handoff.
+pub(super) static DKL_ACCESS_LOCK: Mutex<()> = Mutex::new(());
 static GT_REPORT: Mutex<Vec<(pci::Bdf, String)>> = Mutex::new(Vec::new());
 static FIRMWARE_STATE: Mutex<Vec<(pci::Bdf, firmware_snapshot::Snapshot)>> = Mutex::new(Vec::new());
 
@@ -228,6 +242,8 @@ static FIRMWARE_STATE: Mutex<Vec<(pci::Bdf, firmware_snapshot::Snapshot)>> = Mut
 /// at all -- so it belongs next to the modeset in the file a person reads back,
 /// not only in a boot log that has scrolled away.
 static GTT: Mutex<Option<String>> = Mutex::new(None);
+#[cfg(target_os = "none")]
+static ADDRESS_SPACE: Mutex<Option<(pci::Bdf, Arc<gtt::Gtt>)>> = Mutex::new(None);
 
 /// A value as grouped hexadecimal, the way a register dump is written down.
 ///
@@ -323,20 +339,17 @@ pub(crate) fn bring_up_at_boot() {
     }
 }
 
-/// All allocation/capture precedes the first write. No after-boot programming
-/// bypasses this transaction; hotplug modesetting remains a separate follow-up.
+/// One allocator for display and the separately opted-in GT, never two
+/// independently locked cursors over the same hardware PTE array.
 #[cfg(target_os = "none")]
-fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, String> {
-    let supported = REPORT.lock().as_ref().is_some_and(|report| {
-        report
-            .displays
-            .iter()
-            .any(|found| found.info.bdf == bdf && found.info.device_id == 0x46d0)
-    });
-    if !supported {
-        return Err(String::from(
-            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0; no writes",
-        ));
+fn shared_ggtt(bdf: pci::Bdf) -> Result<Arc<gtt::Gtt>, String> {
+    let mut owner = ADDRESS_SPACE.lock();
+    if let Some((owned, gtt)) = &*owner {
+        return if *owned == bdf {
+            Ok(gtt.clone())
+        } else {
+            Err(String::from("different GGTT device; no writes"))
+        };
     }
     let (_, aperture, physical) = mapped_facts(bdf)
         .ok_or_else(|| String::from("Intel mapped facts unavailable; no writes"))?;
@@ -354,12 +367,50 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
     ) {
         return Err(String::from("Intel GGTT size not measured; no writes"));
     }
-    let gtt = gtt::Gtt::map(physical, bar_len, size).map_err(|e| e.describe())?;
+    let gtt = Arc::try_new(gtt::Gtt::map(physical, bar_len, size).map_err(|e| e.describe())?)
+        .map_err(|_| String::from("GGTT owner allocation failed; no writes"))?;
+    *owner = Some((bdf, gtt.clone()));
+    Ok(gtt)
+}
+
+/// All allocation/capture precedes the first write. No after-boot programming
+/// bypasses this transaction; hotplug modesetting remains a separate follow-up.
+#[cfg(target_os = "none")]
+fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, String> {
+    let supported = REPORT.lock().as_ref().is_some_and(|report| {
+        report.displays.iter().any(|found| {
+            found.info.bdf == bdf
+                && i915_port::native_device_supported(
+                    found.info.vendor_id,
+                    found.info.device_id,
+                    found.info.revision,
+                )
+        })
+    });
+    if !supported {
+        return Err(String::from(
+            "intel.modeset=1 REFUSED: rollback validated only for ADL-N 8086:46d0 exact display \
+             D0; no writes",
+        ));
+    }
+    let gtt = shared_ggtt(bdf)?;
+    // TC fastboot has its own restricted transaction. It never routes TC
+    // through the old combo-PHY modeset/rollback sequence.
+    let function = window.read(regs::ddi::TRANS_DDI_FUNC_CTL_A).unwrap_or(0);
+    if matches!(
+        intel_display::ddi::decode_function_control(function).port,
+        Some(intel_display::device::Port::Tc1 | intel_display::device::Port::Tc2)
+    ) {
+        return fastboot::init(bdf, *window, gtt);
+    }
     let image = gtt.checkpoint().map_err(|e| e.describe())?;
     *FIRMWARE_STATE.lock() = alloc::vec![(bdf, firmware_snapshot::Snapshot::capture(window))];
     let tx = rollback::Transaction::begin(window, &gmbus::MonotonicTimer).map_err(|e| {
         alloc::format!("intel.modeset=1 REFUSED before writes: {e}; firmware unchanged")
     })?;
+    // Read the MIT timing slice only after live firmware pipe-A admission.
+    let timings = i915_port::read_admitted_timings(&tx)?;
+    axlog::info!("intel-i915-readout: {timings:?}; timing slice only, not fastboot ownership");
     *FIRMWARE_STATE.lock() = alloc::vec![(bdf, tx.before.clone())];
     *GTT.lock() = Some(gtt.describe());
     if let Some(value) = axhal::boot::command_line_value("intel.modeset.fail_write") {
@@ -1239,4 +1290,14 @@ mod tests {
         assert!(text.contains("every 250 ms"), "{text}");
         assert!(text.contains("The poll writes no register"), "{text}");
     }
+}
+
+/// GT bring-up is independent of HDMI modesetting, HPD, DMC and audio.
+pub(crate) fn bring_up_gt_at_boot() {
+    #[cfg(target_os = "none")]
+    gt::init_at_boot();
+}
+
+pub(super) fn gt_registered() -> bool {
+    gt::registered()
 }

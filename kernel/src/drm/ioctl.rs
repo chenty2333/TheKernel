@@ -39,7 +39,10 @@ impl UserCopy for crate::file::IoctlContext {
     }
 }
 
-fn read_pod<T: bytemuck::AnyBitPattern>(copy: &impl UserCopy, address: usize) -> AxResult<T> {
+pub(super) fn read_pod<T: bytemuck::AnyBitPattern>(
+    copy: &impl UserCopy,
+    address: usize,
+) -> AxResult<T> {
     // `MaybeUninit<T>` avoids a generic-length stack array (not available on
     // stable Rust) while still reserving exactly the ABI record's bytes.
     // Zero first, then let UserCopy overwrite every byte before `assume_init`.
@@ -55,7 +58,7 @@ fn read_pod<T: bytemuck::AnyBitPattern>(copy: &impl UserCopy, address: usize) ->
     Ok(unsafe { value.assume_init() })
 }
 
-fn write_pod<T: bytemuck::NoUninit>(
+pub(super) fn write_pod<T: bytemuck::NoUninit>(
     copy: &impl UserCopy,
     address: usize,
     value: &T,
@@ -87,7 +90,7 @@ fn array_at(base: u64, index: usize, element_size: u64) -> AxResult<u64> {
     )
     .ok_or(AxError::BadAddress)
 }
-fn read_array<T: bytemuck::AnyBitPattern>(
+pub(super) fn read_array<T: bytemuck::AnyBitPattern>(
     copy: &impl UserCopy,
     address: u64,
     count: usize,
@@ -290,7 +293,13 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_MODE_GETFB2 => getfb2(file, copy, arg)?,
         // Compositors create GBM on the KMS primary fd, so driver rendering
         // commands must work here as well as on the dedicated render node.
-        _ => return super::render::dispatch(file, context, cmd, arg),
+        _ => {
+            return if file.has_intel_gt() {
+                super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
+            } else {
+                super::render::dispatch(file, context, cmd, arg)
+            };
+        }
     }
     Ok(0)
 }
@@ -307,6 +316,8 @@ pub(super) fn render_dispatch(
 ) -> AxResult<usize> {
     if render_allows_core_ioctl(cmd as u64) {
         dispatch(file, context, cmd, arg)
+    } else if file.has_intel_gt() {
+        super::intel::gem_exec::dispatch_native(file, context, cmd, arg)
     } else {
         super::render::dispatch(file, context, cmd, arg)
     }

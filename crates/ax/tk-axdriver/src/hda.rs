@@ -141,3 +141,10 @@ pub fn release() -> DevResult {
 pub fn abort() -> DevResult {
     with_device(|d| d.abort())
 }
+
+/// Deliver/unpublish the active Intel display sink ELD and select its matching
+/// digital codec route. Display lifetime code must call this only after a
+/// powered, stable DDI link is active; link teardown calls it before power-down.
+pub fn set_display_eld(port: u8, eld: Option<&[u8]>) -> DevResult {
+    with_device(|device| device.set_display_eld(port, eld))
+}

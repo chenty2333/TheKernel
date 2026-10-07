@@ -82,6 +82,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         flavors = manifest["FLAVORS"].split()
         self.assertEqual(flavors, [
             "headless-abi-smoke",
+            "n305-iris-smoke",
             "q35-graphics-seatd",
             "q35-software-desktop",
             "q35-graphics-benchmark",
@@ -93,7 +94,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             key = flavor.upper().replace("-", "_")
             overlay = manifest[f"FLAVOR_{key}_OVERLAY"]
             self.assertTrue((GRAPHICS / "overlay" / overlay).is_dir(), flavor)
-            self.assertIn(manifest[f"FLAVOR_{key}_SESSION"], ("seatd", "logind"))
+            self.assertIn(manifest[f"FLAVOR_{key}_SESSION"], ("seatd", "logind", "headless"))
             backend = manifest[f"FLAVOR_{key}_BACKEND"]
             self.assertIn(
                 backend,
@@ -110,6 +111,50 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             self.assertIn(flavor, flavors)
         for flavor in manifest["CI_CHECK_FLAVORS"].split():
             self.assertIn(flavor, flavors)
+        self.assertNotIn("n305-iris-smoke", manifest["CI_CHECK_FLAVORS"].split())
+
+    def test_n305_iris_flavor_overlays_target_stage_and_uses_guest_loader_smoke(self) -> None:
+        fragment = self.read("n305-iris-smoke.fragment")
+        self.assertIn("overlay/n305-iris-smoke", fragment)
+        self.assertIn("BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y", fragment)
+        self.assertIn("BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y", fragment)
+        self.assertIn("BR2_PACKAGE_MESA3D_OPENGL_EGL=y", fragment)
+        self.assertIn("BR2_PACKAGE_MESA3D_OPENGL_ES=y", fragment)
+        self.assertIn("BR2_PACKAGE_WESTON_HEADLESS=y", fragment)
+        self.assertIn("overlay/q35-graphics-seatd", fragment)
+
+        smoke = self.read("overlay/n305-iris-smoke/etc/init.d/S90n305-iris-smoke")
+        self.assertIn("loader=/lib/ld-linux-x86-64.so.2", smoke)
+        self.assertIn("$loader --list", smoke)
+        self.assertIn("/usr/lib64/libgallium-26.1.2.so", smoke)
+        self.assertIn("readlink -f /usr/lib/libgallium-26.1.2.so", smoke)
+        self.assertIn('echo "$marker"', smoke)
+        self.assertIn("/usr/lib/gbm/dri_gbm.so", smoke)
+        self.assertIn("LD_BIND_NOW=1 MESA_LOADER_DRIVER_OVERRIDE=iris", smoke)
+        self.assertIn("renderer=not_tested", smoke)
+        self.assertNotIn('$client --execute', smoke)
+        q35_smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")
+        self.assertIn("grep -qx n305-iris-smoke /etc/thekernel-graphics-flavor && exit 0", q35_smoke)
+        session = self.read("overlay/common/usr/local/bin/graphics-session")
+        self.assertIn("q35-(graphics-seatd|software-desktop)|n305-iris-smoke", session)
+
+    def test_iris_stage_argument_is_scoped_to_n305_flavor_and_check_needs_no_stage(self) -> None:
+        script = ROOT / "scripts/build-graphics-rootfs.sh"
+        subprocess.run([script, "--flavor", "n305-iris-smoke", "--check"], cwd=ROOT, check=True)
+        result = subprocess.run(
+            [script, "--flavor", "q35-graphics-seatd", "--mesa-iris-stage", "/not/a/stage", "--check"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--mesa-iris-stage is only valid for n305-iris-smoke", result.stderr)
+
+        with test_tmpdir() as directory:
+            result = subprocess.run(
+                [script, "--flavor", "n305-iris-smoke", "--output", str(pathlib.Path(directory) / "out")],
+                cwd=ROOT, capture_output=True, text=True,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--mesa-iris-stage is required for n305-iris-smoke builds", result.stderr)
 
     def test_seatd_init_waits_for_the_socket_before_weston_starts(self) -> None:
         seatd = self.read("overlay/common/etc/init.d/S70seatd")
@@ -181,7 +226,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
     def test_software_sessions_select_pixman_and_seatd_verifies_it(self) -> None:
         session = self.read("overlay/common/usr/local/bin/graphics-session")
         self.assertIn(
-            "if grep -Eqx 'q35-(graphics-seatd|software-desktop)' /etc/thekernel-graphics-flavor &&\n"
+            "if grep -Eqx 'q35-(graphics-seatd|software-desktop)|n305-iris-smoke' /etc/thekernel-graphics-flavor &&\n"
             "    [ ! -c /dev/dri/renderD128 ]; then\n"
             '    set -- "$@" --renderer=pixman\n'
             'elif [ -c /dev/dri/renderD128 ]; then\n'
@@ -471,6 +516,22 @@ sleep() { echo wait; }
         self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_GRAPHICS_ABI_SMOKE_READY")
         self.assertEqual(spec.graphics_profile, "headless")
         self.assertEqual(spec.rootfs_transport, "drive")
+
+    def test_n305_iris_smoke_uses_existing_graphics_runner_without_renderer_claim(self) -> None:
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
+        args = module.build_parser().parse_args([
+            "test", "--suite", "graphics", "--no-build", "--rootfs", "/tmp/n305-iris.ext2",
+            "--screenshot", "/tmp/n305-iris.ppm", "--flavor", "n305-iris-smoke",
+        ])
+        calls: dict[str, object] = {}
+        module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
+        with mock.patch.object(pathlib.Path, "is_file", return_value=True):
+            self.assertEqual(module.graphics_smoke_cmd(args), 0)
+        spec = calls["spec"]
+        self.assertEqual(spec.stop_after_marker, "THEKERNEL_N305_IRIS_MESA_LOADER_READY")
+        self.assertEqual(spec.graphics_profile, "headless")
+        self.assertEqual(spec.rootfs_transport, "drive")
+        self.assertIsNone(spec.qmp_screenshot_size)
 
     def test_q35_headless_graphics_smoke_keeps_the_software_marker_and_pixel_oracle(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")

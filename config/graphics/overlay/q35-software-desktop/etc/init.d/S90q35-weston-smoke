@@ -3,6 +3,9 @@ set -eu
 
 # The interactive desktop keeps Weston and its applications running.
 grep -qx q35-software-desktop /etc/thekernel-graphics-flavor && exit 0
+# The N305 iris flavor has a headless TheKernel/QEMU loader checkpoint of its
+# own and no Q35 card0 assertion to run.
+grep -qx n305-iris-smoke /etc/thekernel-graphics-flavor && exit 0
 
 marker=THEKERNEL_Q35_WESTON_READY
 virgl_marker=THEKERNEL_Q35_VIRGL_READY

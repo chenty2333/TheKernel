@@ -1,0 +1,146 @@
+MIT Linux 7.2.3 GT translations for the exact N305 Gen12/A0 BCS path.
+Full original uncore grant (including its next-paragraph clause), Intel
+copyrights and TheKernel copyright are preserved in LICENSE-MIT.
+
+src/uncore.rs: intel_uncore.c forcewake reset/get/put/wait/fallback helpers.
+Copyright © 2013 Intel Corporation.
+src/reset.rs: gt/intel_engine_cs.c stop-CS and pending MI-forcewake helpers;
+gt/intel_reset.c prepare/cancel and hardware-domain reset (BCS-only Gen12).
+Copyright © 2016 / 2008-2018 Intel Corporation.
+Only the supported generation/engine is included. No GPL, firmware binary,
+GuC submission, media/SFC reset or display programming is imported.
+Selected intel_{gt,engine}_regs.h fields: Copyright © 2022 Intel Corporation.
+Original safety differences: fallible MMIO/ACK failures return errors instead
+of merely logging and proceeding; reset cancellation is additionally verified.
+Stop/MI-forcewake timeout, Gen11+ BCS reset domain bit2, double GDRST and50us
+settling are preserved. GT/media A0 admission is separate from display D0.
+The temporary C oracle shim's conventional ARRAY_SIZE macro contributes one
+normalized code-line match at both25/40 to the excerpt inventory. It is
+explicitly inventoried, not scanner-exempted; source function bodies remain
+external inputs/temporary grant-preserving builds rather than repo quotations.
+
+Runtime private BCS copy additions (same original grants in LICENSE-MIT):
+src/ppgtt.rs: gt/gen8_ppgtt.c gen8_pde_encode/gen12_pte_encode,
+Copyright © 2020 Intel Corporation. Original private scratch/table builder.
+src/lrc.rs: gt/intel_lrc.c gen12_xcs_offsets/set_offsets, init_common_regs,
+init_ppgtt_regs, lrc_update_regs, __reset_stop_ring, init_wa_bb_regs,
+setup_predicate_disable_wa, gen12_emit_timestamp_wa/gen12_emit_restore_scratch,
+gen12_init_indirectctx_bb/gen12_init_per_ctx_bb. Copyright © 2014 Intel.
+intel_lrc_reg.h/context fields: Copyright © 2014-2018 Intel Corporation.
+src/bcs.rs: gem/selftests/i915_gem_client_blt.c prepare_blit (linear32),
+Copyright © 2019 Intel; gt/gen8_engine_cs.c/.h gen12_emit_flush_xcs,
+preparser_disable, gen12_get_aux_inv_reg/gen12_needs_ccs_aux_inv,
+gen12_emit_aux_table_inv, gen8_emit_bb_start_noarb, __gen8_emit_flush_dw,
+gen8_emit_ggtt_write, emit_xcs_breadcrumb/gen12_emit_fini_breadcrumb_tail,
+gen8_emit_wa_tail, Copyright © 2014 Intel Corporation.
+Selected intel_gpu_commands.h fields: Copyright © 2003-2018 Intel.
+BCS prepare: intel_workarounds.c icl_wa_init_mcr/__set_mcr_steering and
+Gen12 GT DFR/DOP WAs, engine_fake_wa_init/gen12_ctx_gt_mocs_init,
+Copyright © 2014-2018 Intel; intel_sseu.c live Gen12 single-slice/DSS facts,
+Copyright © 2019 Intel; intel_gtt.c tgl_setup_private_ppat (UC index3),
+Copyright © 2020 Intel; intel_mocs.c Gen12 UC entry3/paired L3 policy,
+Copyright © 2015 Intel; intel_gt_mcr.c multicast/steering facts,
+Copyright © 2022 Intel Corporation. This BCS slice does not execute media engine or RCS WAs (RCS additions below).
+
+Safety scope: one kernel-owned privileged BCS context, no user batch uAPI;
+no semaphores/scheduler/preemption clients. All unused VM branches reach an
+owned read-only scratch page. Render wake and idle are required before shared
+cache policy; MCR selection uses actual fuse bits and restores its before-image
+on every error prefix. Unknown unicast agents are refused. Source firmware-lock
+exception for DOP readback is preserved. Only N305 Gen12.0 applicable branches
+are included; KBL/DG2/fast-color/hold-switchout paths do not apply.
+The source two-word WA tail is MI_ARB_CHECK then MI_NOOP, not two NOOPs.
+RAM/VM/context/GGTT remain pinned until source stop/reset quiescence, including
+possibly-landed ELSQ failures; ambiguous reset terminally retains them.
+Host model copies are explicitly not physical GPU-output evidence.
+
+The two new C shims add two conventional INVALID_MMIO_REG definitions at
+threshold25 (none at40). Current GT inventory:3 code lines at25,1 at40;
+combined display+GT:15 at25,3 at40. No fenced/comment/marker matches or exemptions.
+
+Native ELSQ/HWSP/CSB sequence adapts gt/intel_execlists_submission.c
+enable_execlists/reset_csb_pointers, Copyright © 2014 Intel Corporation,
+under this full MIT grant; memory/admission/retirement policy is original.
+
+RCS Gen12.0 additions (exact N305; not generic GPU support):
+src/rcs.rs extends source intel_lrc.c gen12_rcs_offsets,14-page render image,
+intel_sseu_make_rpcs single-slice branch, timestamp/command-buffer/GPR restore,
+AUX, mandatory Wa_18022495364 state-cache invalidation and predicate BB.
+Source gen8_engine_cs.c/.h RCS flush/breadcrumb includes depth-stall workaround,
+N305 L3 flush and source arbitration/WA tail. Source intel_workarounds.c
+engine_fake_wa_init, general_render_compute_wa_init, rcs_engine_wa_init and
+gen12_ctx_workarounds_init select exact ADL-P/ADL-N Gen12.0 branches, with
+MCR ownership/recovery and unreliable FF_MODE2 readback rule retained.
+Copyright ©2014/2014-2018/2019 Intel, full grant LICENSE-MIT.
+
+src/rcs_page.rs is an immutable bounded64x64 linear shader rectangle adapted
+from Intel-hosted IGT backport/v6.17 lib/rendercopy_gen9.c gen12_render_copy and
+_gen9_render_op (including its named state/command helpers and associated
+render/surfaceformat headers). Full original IGT COPYING is LICENSE-IGT;
+source metadata/grants are preserved also by the temporary compiler oracle.
+No GPL driver body, protected content, compression, firmware binary or shader
+compiler is imported. Shader words come from licensed source, not guessed EU
+instructions. Kernel and user acceptance payload carry the same state/page.
+Explicit cache-policy adaptation uses published Mesa26.1.2 gen110/gen120.xml
+wire facts: full22-word SBA and UC6 MOCS for address classes and vertex buffer,
+rather than inherited/unknown MOCS0; all shader/other state remains unchanged.
+Source-only IGT oracle input is task-local; temporary compiler files are removed
+by the test harness. Host interpreter models memory/retirement only, not EUs.
+No real rendering, physical reset or Mesa acceptance is claimed by these tests.
+
+Current scoped excerpt inventory:79 code lines at25,74 at40 (no fenced/comment/
+marker matches). This is the prior3/1, two additional conventional C-shim
+INVALID_MMIO_REG definitions plus one I915_SELFTEST_ONLY shim at25, and73 repeated all-zero data rows at both
+thresholds in the compiled-IGT-derived page that also occur in Linux arrays.
+The data rows are not copied Linux function bodies; provenance and the original
+IGT grants are retained. Combined display+GT totals91/76; crates/ax baseline
+outside/code43/32→119/108 at25,18/11→91/84 at40. No scanner exemption.
+
+src/info.rs: Linux7.2.3 gt/intel_sseu.c gen12_sseu_info_init /
+gen11_compute_sseu_info (©2019 Intel) and gt/intel_gt_clock_utils.c
+read_reference_ts_freq / gen11_get_crystal_clock_freq / gen11_read_clock_frequency
+(©2020 Intel), selected N305 single-slice6-DSS/paired-EU readout and timestamp
+clock only, full grant LICENSE-MIT. Runtime callers are existing GETPARAM and
+QUERY over the live, owned GT; unavailable/unknown facts fail closed. No register
+write, new wake or reset is performed by capability discovery.
+
+uncore.rs additionally selects ADL-P/N source VCS0,VCS2,VECS0 forcewake domains
+from intel_uncore.c and actual GEN11_GT_VEBOX_VDBOX_DISABLE fuses (i915_pci.c
+platform-mask facts, intel_gt_regs.h register facts). ring_idle follows selected
+intel_engine_cs.c::ring_is_idle hardware head/tail/MODE_IDLE checks (©2016 Intel,
+existing full MIT grant). This never submits or resets media: it rejects live/
+unknown unowned consumers before shared PAT/MOCS/L3 programming. Runtime caller
+is the same independently opted-in BCS/RCS owner, not a disconnected reader.
+
+Kernel gem_context.rs adapts the MIT i915_gem_context.c VM/proto-context
+reference/ID lifetimes (©2011–2012 Intel) to retained SharedPages/GEM charging.
+No opaque saved GPU context state or full Mesa residency is fabricated.
+
+src/info.rs additionally ports intel_uncore.h intel_uncore_read64_2x32
+(©2013 Intel), source three attempts. Owned native GT/render forcewake serializes
+the caller; still-torn reads fail closed rather than returning a mixed counter.
+Kernel context adapter also follows set_proto_ctx_engines lookup/index semantics
+and the target Mesa26.1.2 engine/recoverable/VM CREATE_EXT chain.
+
+Valid-image lrc/rcs updates preserve the GPU-generated stream and unrelated
+values, following intel_lrc.c ring/PPGTT/WA/control update facts. Kernel cached
+images use a distinct execlists idle context and reset retirement; software
+model tags are not hardware state-save/default-state acceptance.
+
+N305 nonprivileged register access ports tgl_whitelist_build,
+allow_read_ctx_timestamp and intel_engine_apply_whitelist (MIT ©2014–2018 Intel).
+Twelve source slots retain encoded permission/range bits and source ordering;
+unused entries point at RING_NOPID. Store/readback failure refuses submission.
+The kernel installs this after selected-engine reset, before requests/default
+capture. No arbitrary CPU MMIO or general user batch is enabled by this alone.
+
+Native kernel copy_ppgtt.rs additionally adapts gen8_ppgtt.c
+__gen8_ppgtt_alloc/gen8_ppgtt_insert_pte (Intel2020 MIT) using a stopped-engine
+allocation stash and retained file-accounted four-level4K residency. Ordinary
+nonprivileged batches reuse gen8_emit_bb_start_noarb; Gen12 has no software
+command-parser requirement. Older fixed-rectangle-only scope above is historical.
+
+src/cache.rs: Linux7.2.3 intel_mocs.c gen12_mocs_table/GEN11_MOCS_ENTRIES,
+get_entry_control/get_entry_l3cc/__init_mocs_table/init_l3cc_table, Intel2015;
+intel_gtt.c tgl_setup_private_ppat, Intel2020. All64+32+8 ADL-N entries,
+source unused-index2 semantics; not TGL's deprecated index1. MIT grants retained.

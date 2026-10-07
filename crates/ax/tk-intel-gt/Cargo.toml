@@ -1,0 +1,16 @@
+[package]
+name = "tk-intel-gt"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license = "MIT"
+authors = ["TheKernel contributors"]
+description = "N305 Gen12 BCS i915 translations with explicit execution ownership"
+repository.workspace = true
+
+[package.metadata.thekernel]
+layer = "mechanism"
+
+[lints]
+workspace = true

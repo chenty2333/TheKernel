@@ -22,12 +22,13 @@ pub struct Syncobj {
 }
 
 struct Timeline {
-    /// Fences explicitly published for future points.  A point at or below
-    /// `signaled_through` is implicitly complete even when it is not present
-    /// here, so a late waiter never needs a placeholder allocation.
+    /// Immutable consumer snapshots, including older producer dependencies.
+    /// An absent intermediate point resolves to the next published view.
     points: BTreeMap<u64, Arc<Fence>>,
-    /// Implicitly successful points. Exact point fences are always consulted
-    /// first: a failed fence must never be hidden by this success watermark.
+    // Published consumer chain, distinct from the device's completion fence.
+    head: Option<Arc<Fence>>,
+    /// Last userspace software signal, used only for the monotonic signal
+    /// admission rule. It never completes a device producer fence.
     signaled_through: Option<u64>,
     last_submitted: u64,
     /// A generation fence used only to wait for a missing point to be
@@ -37,12 +38,43 @@ struct Timeline {
     availability: Arc<Fence>,
 }
 
+impl Timeline {
+    fn view(&self, producer: Arc<Fence>) -> AxResult<Arc<Fence>> {
+        match &self.head {
+            Some(previous) => Fence::join(&[previous.clone(), producer]),
+            None => Ok(producer),
+        }
+    }
+    fn publish(&mut self, point: u64, view: Arc<Fence>) {
+        // A source chain with a non-increasing sequence starts a new context
+        // and clamps to the previous sequence. New lookups include that head;
+        // already captured views keep their old immutable producer snapshots.
+        if point <= self.last_submitted {
+            for existing in self.points.values_mut() {
+                *existing = view.clone();
+            }
+        }
+        self.last_submitted = self.last_submitted.max(point);
+        self.points.insert(point, view.clone());
+        self.head = Some(view);
+        self.availability.signal();
+        self.availability = Fence::new(false);
+    }
+    fn lookup(&self, point: u64) -> Option<Arc<Fence>> {
+        self.points
+            .range(point..)
+            .next()
+            .map(|(_, view)| view.clone())
+    }
+}
+
 impl Syncobj {
     pub fn new(signaled: bool) -> Arc<Self> {
         Arc::new(Self {
             fence: spin::Mutex::new(signaled.then(|| Fence::new(true))),
             timeline: spin::Mutex::new(Timeline {
                 points: BTreeMap::new(),
+                head: None,
                 signaled_through: None,
                 last_submitted: 0,
                 availability: Fence::new(false),
@@ -57,6 +89,7 @@ impl Syncobj {
         *self.fence.lock() = None;
         let mut timeline = self.timeline.lock();
         timeline.points.clear();
+        timeline.head = None;
         timeline.signaled_through = None;
         timeline.last_submitted = 0;
         timeline.availability.signal();
@@ -64,14 +97,9 @@ impl Syncobj {
         self.poll_waiters.wake();
     }
     pub fn signal(&self) {
-        let mut fence = self.fence.lock();
-        match fence.as_ref() {
-            Some(fence) => fence.signal(),
-            None => *fence = Some(Fence::new(true)),
-        }
-        drop(fence);
-        self.publish_availability();
-        self.poll_waiters.wake();
+        // Linux SIGNAL assigns a new signaled stub, not dma_fence_signal on
+        // the old GPU fence. Captured sync_files/reservations keep that fence.
+        self.import_fence(Fence::new(true));
     }
     pub fn import_fence(&self, fence: Arc<Fence>) {
         *self.fence.lock() = Some(fence);
@@ -91,9 +119,22 @@ impl Syncobj {
     ) -> AxResult<()> {
         let mut binary = self.fence.lock();
         let mut timeline = self.timeline.lock();
+        let view = if point == 0 {
+            None
+        } else {
+            if !reset && timeline.points.contains_key(&point) {
+                return Err(AxError::InvalidInput);
+            }
+            Some(if reset {
+                fence.clone()
+            } else {
+                timeline.view(fence.clone())?
+            })
+        };
         if reset {
             *binary = None;
             timeline.points.clear();
+            timeline.head = None;
             timeline.signaled_through = None;
             timeline.last_submitted = 0;
             timeline.availability.signal();
@@ -105,19 +146,7 @@ impl Syncobj {
             timeline.availability = Fence::new(false);
             return Ok(());
         }
-        if timeline.points.contains_key(&point) {
-            return Err(AxError::InvalidInput);
-        }
-        timeline.last_submitted = timeline.last_submitted.max(point);
-        if timeline
-            .signaled_through
-            .is_some_and(|completed| point <= completed)
-        {
-            fence.signal();
-        }
-        timeline.points.insert(point, fence);
-        timeline.availability.signal();
-        timeline.availability = Fence::new(false);
+        timeline.publish(point, view.unwrap());
         Ok(())
     }
 
@@ -134,16 +163,7 @@ impl Syncobj {
             return self.fence();
         }
         let timeline = self.timeline.lock();
-        if let Some(fence) = timeline.points.get(&point) {
-            return Ok(fence.clone());
-        }
-        if timeline
-            .signaled_through
-            .is_some_and(|completed| point <= completed)
-        {
-            return Ok(Fence::new(true));
-        }
-        Err(AxError::NotFound)
+        timeline.lookup(point).ok_or(AxError::NotFound)
     }
 
     /// Wait until a point has a backing fence.  Missing points normally fail
@@ -168,14 +188,8 @@ impl Syncobj {
         loop {
             let availability = {
                 let timeline = self.timeline.lock();
-                if let Some(fence) = timeline.points.get(&point) {
-                    return Ok(fence.clone());
-                }
-                if timeline
-                    .signaled_through
-                    .is_some_and(|completed| point <= completed)
-                {
-                    return Ok(Fence::new(true));
+                if let Some(fence) = timeline.lookup(point) {
+                    return Ok(fence);
                 }
                 if !wait_for_submit {
                     return Err(AxError::NotFound);
@@ -199,14 +213,8 @@ impl Syncobj {
             };
         }
         let timeline = self.timeline.lock();
-        if let Some(fence) = timeline.points.get(&point) {
-            return Ok((fence.clone(), true));
-        }
-        if timeline
-            .signaled_through
-            .is_some_and(|completed| point <= completed)
-        {
-            return Ok((Fence::new(true), true));
+        if let Some(fence) = timeline.lookup(point) {
+            return Ok((fence, true));
         }
         if wait_for_submit {
             Ok((timeline.availability.clone(), false))
@@ -215,8 +223,8 @@ impl Syncobj {
         }
     }
 
-    /// Publish a fence at a timeline point. Timeline points may be submitted
-    /// in any order, but one published point retains its fence identity.
+    /// Publish a device fence in a consumer chain. Captured views remain
+    /// immutable even when a later non-increasing point changes new lookups.
     pub fn submit_point(&self, point: u64, fence: Arc<Fence>) -> AxResult<()> {
         if point == 0 {
             self.import_fence(fence);
@@ -226,21 +234,13 @@ impl Syncobj {
         if timeline.points.contains_key(&point) {
             return Err(AxError::InvalidInput);
         }
-        timeline.last_submitted = timeline.last_submitted.max(point);
-        if timeline
-            .signaled_through
-            .is_some_and(|completed| point <= completed)
-        {
-            fence.signal();
-        }
-        timeline.points.insert(point, fence);
-        timeline.availability.signal();
-        timeline.availability = Fence::new(false);
+        let view = timeline.view(fence)?;
+        timeline.publish(point, view);
         Ok(())
     }
 
-    /// Signal all timeline points up to and including `point`.  This models
-    /// the monotonic completion guarantee of a timeline semaphore.
+    /// Append a completed software point without signaling prior GPU work.
+    /// The new view still waits the existing chain of producer dependencies.
     pub fn signal_point(&self, point: u64) -> AxResult<()> {
         if point == 0 {
             self.signal();
@@ -253,13 +253,9 @@ impl Syncobj {
         {
             return Err(AxError::InvalidInput);
         }
-        timeline.last_submitted = timeline.last_submitted.max(point);
+        let view = timeline.view(Fence::new(true))?;
+        timeline.publish(point, view);
         timeline.signaled_through = Some(point);
-        for (_, fence) in timeline.points.range(..=point) {
-            fence.signal();
-        }
-        timeline.availability.signal();
-        timeline.availability = Fence::new(false);
         Ok(())
     }
 
@@ -274,9 +270,7 @@ impl Syncobj {
             .iter()
             .filter_map(|(&point, fence)| fence.is_signaled().then_some(point))
             .max()
-            .map_or(timeline.signaled_through.unwrap_or(0), |point| {
-                timeline.signaled_through.unwrap_or(0).max(point)
-            });
+            .unwrap_or(0);
         if last_submitted {
             timeline.last_submitted
         } else {
@@ -610,14 +604,40 @@ mod tests {
     }
 
     #[test]
-    fn timeline_signals_prior_points_and_rejects_a_backward_completion() {
+    fn joined_timeline_sync_file_poll_wakes_on_producers_without_claiming_early_completion() {
+        let object = Syncobj::new(false);
+        let a = Fence::new(false);
+        let b = Fence::new(false);
+        object.submit_point(1, a.clone()).unwrap();
+        object.submit_point(2, b.clone()).unwrap();
+        let file = SyncFile::new(object.fence_at(2).unwrap());
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut context = Context::from_waker(&waker);
+        let registration = file.register(&mut context, IoEvents::READABLE).unwrap();
+        a.signal();
+        assert!(wake.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(file.poll(), IoEvents::empty());
+        drop(registration);
+        let _registration = file.register(&mut context, IoEvents::READABLE).unwrap();
+        let before = wake.0.load(Ordering::SeqCst);
+        b.signal();
+        assert!(wake.0.load(Ordering::SeqCst) > before);
+        assert_eq!(file.poll(), IoEvents::READABLE);
+    }
+    #[test]
+    fn timeline_software_signal_preserves_prior_producers_and_rejects_backward_signal() {
         let object = Syncobj::new(false);
         let submitted = Fence::new(false);
         object.submit_point(4, submitted.clone()).unwrap();
 
         object.signal_point(5).unwrap();
-        assert!(submitted.is_signaled());
-        assert!(object.fence_at(3).unwrap().is_signaled());
+        assert!(!submitted.is_signaled());
+        assert!(!object.fence_at(3).unwrap().is_signaled());
+        assert!(!object.fence_at(5).unwrap().is_signaled());
+        assert_eq!(object.query_point(false), 0);
+        submitted.signal();
+        assert!(object.fence_at(5).unwrap().is_signaled());
         assert_eq!(object.query_point(false), 5);
         assert_eq!(object.query_point(true), 5);
         assert_eq!(object.signal_point(4), Err(AxError::InvalidInput));
@@ -634,13 +654,48 @@ mod tests {
         );
         let earlier = Fence::new(false);
         object.submit_point(6, earlier.clone()).unwrap();
-        assert!(Arc::ptr_eq(&object.fence_at(7).unwrap(), &first));
-        assert!(Arc::ptr_eq(&object.fence_at(6).unwrap(), &earlier));
+        let view = object.fence_at(7).unwrap();
+        assert!(!view.is_signaled());
+        assert!(!object.fence_at(6).unwrap().is_signaled());
         assert_eq!(object.query_point(true), 7);
         assert!(!first.is_signaled());
         assert!(!earlier.is_signaled());
+        first.signal();
+        assert!(!view.is_signaled());
+        earlier.signal();
+        assert!(view.is_signaled());
     }
 
+    #[test]
+    fn binary_software_signal_replaces_backing_without_completing_gpu_reservation_or_sync_file() {
+        let object = Syncobj::new(false);
+        let gpu = Fence::new(false);
+        let reservation = super::super::fence::Reservation::new();
+        reservation.publish(gpu.clone());
+        object.import_fence(gpu.clone());
+        let snapshot = SyncFile::new(gpu.clone());
+        object.signal();
+        assert!(object.fence().unwrap().is_signaled());
+        assert!(!gpu.is_signaled());
+        assert!(!reservation.predecessor().unwrap().is_signaled());
+        assert_eq!(snapshot.poll(), IoEvents::empty());
+        gpu.signal();
+        assert_eq!(snapshot.poll(), IoEvents::READABLE);
+    }
+    #[test]
+    fn late_gpu_point_below_software_signal_never_completes_the_new_producer() {
+        let object = Syncobj::new(false);
+        object.signal_point(5).unwrap();
+        let old = object.fence_at(5).unwrap();
+        assert!(old.is_signaled());
+        let gpu = Fence::new(false);
+        object.submit_point(4, gpu.clone()).unwrap();
+        assert!(!gpu.is_signaled());
+        assert!(!object.fence_at(5).unwrap().is_signaled());
+        assert!(old.is_signaled());
+        gpu.signal();
+        assert!(object.fence_at(5).unwrap().is_signaled());
+    }
     #[test]
     fn timeline_success_watermark_never_hides_an_exact_error_fence() {
         let object = Syncobj::new(false);
@@ -656,3 +711,6 @@ mod tests {
         assert!(object.fence_at(4).unwrap().is_signaled());
     }
 }
+
+#[cfg(test)]
+mod upstream;

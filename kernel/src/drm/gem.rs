@@ -6,6 +6,11 @@ use crate::mm::SharedPages;
 pub trait GemBacking: Send + Sync {
     /// The fixed pages retained by a VMA after its originating GEM handle closes.
     fn shared_pages(&self) -> super::DrmResult<Arc<SharedPages>>;
+    /// Native Intel cache policy follows storage through PRIME aliases, not
+    /// per-file handles. Other backing kinds do not acquire Intel semantics.
+    fn intel_cache_policy(&self) -> Option<Arc<core::sync::atomic::AtomicU8>> {
+        None
+    }
     /// Host VirtIO resource identity, when this backing is directly owned by
     /// a render/blob or scanout resource.  PRIME aliases retain the same
     /// backing Arc, so this identity follows imports instead of being tied to
@@ -136,6 +141,10 @@ pub(crate) struct GemMemoryCharge {
     bytes: usize,
 }
 impl GemMemoryCharge {
+    /// Charge additional native VM tables to the same retained file owner.
+    pub(crate) fn reserve_related(&self, bytes: usize) -> super::DrmResult<Arc<Self>> {
+        Self::reserve(self.owner.clone(), bytes)
+    }
     pub(crate) fn reserve(owner: Arc<AtomicUsize>, bytes: usize) -> super::DrmResult<Arc<Self>> {
         let total = axhal::mem::total_ram_size();
         let global_limit = (total / 4).min(512 * 1024 * 1024);

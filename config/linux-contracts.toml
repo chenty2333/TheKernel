@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 319
-implemented = 300
+resolved = 318
+implemented = 299
 explicit_enosys = 19
 fallback = 0
-partial = 66
+partial = 67
 unknown = 0
 
 [[contract]]
@@ -610,13 +610,13 @@ teardown = ["teardown:request-owned usercopy state and retained OFD released on 
 [[cell]]
 number = 16
 name = "ioctl"
-status = "implemented"
+status = "partial"
 contract = "linux-ioctl"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_ioctl"
 conditional = "explicit-none"
-tests = ["kernel/src/file/packet.rs:up_proposal_ignores_volatile_facts_but_refuses_unimplemented_policy", "tests/guest/portable/network-basic-differential.c:interface_flags_case", "kernel/src/syscall/fs/ctl.rs:fionbio_uses_the_complete_int_and_treats_every_nonzero_as_enabled", "kernel/src/file/fiemap.rs:linux_fiemap_layout_matches_x86_64_uapi", "kernel/src/syscall/fs/namespace_visibility.rs:namespace_owner_visibility_uses_ancestry_not_a_capability_gate", "tests/guest/tools/namespace-relationships-smoke.c:main", "tests/guest/portable/fs-abi-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["explicit-none"]
+tests = ["kernel/src/file/packet.rs:up_proposal_ignores_volatile_facts_but_refuses_unimplemented_policy", "tests/guest/portable/network-basic-differential.c:interface_flags_case", "kernel/src/syscall/fs/ctl.rs:fionbio_uses_the_complete_int_and_treats_every_nonzero_as_enabled", "kernel/src/file/fiemap.rs:linux_fiemap_layout_matches_x86_64_uapi", "kernel/src/syscall/fs/namespace_visibility.rs:namespace_owner_visibility_uses_ancestry_not_a_capability_gate", "tests/guest/tools/namespace-relationships-smoke.c:main", "tests/guest/portable/fs-abi-differential.c:main", "kernel/src/drm/intel/gem_exec.rs:gem_wire_copy_exec_result_reservation_syncobj_wait_and_mmap_share_owned_pages", "kernel/src/drm/intel/gem_exec.rs:invalid_batch_or_alias_is_refused_before_any_completion_publication", "kernel/src/drm/intel/gem_context.rs:created_context_is_file_local_and_retained_across_destroy_for_admitted_jobs", "kernel/src/drm/intel/gem_context.rs:query_size_probe_payload_and_per_item_errors_follow_i915_wire_semantics", "kernel/src/drm/syncobj.rs:binary_software_signal_replaces_backing_without_completing_gpu_reservation_or_sync_file", "kernel/src/drm/syncobj.rs:late_gpu_point_below_software_signal_never_completes_the_new_producer", "kernel/src/drm/intel/gem_exec.rs:timeline_extension_uses_existing_gem_completion_and_preserves_producer_ownership", "kernel/src/drm/intel/gem_exec.rs:sync_file_exec_publishes_same_completion_cloexec_only_after_copyout", "kernel/src/drm/intel/gem_exec.rs:sync_file_output_failures_release_unpublished_slot_not_gpu_ownership", "kernel/src/drm/intel/gem_context.rs:shared_vm_is_real_pinned_root_retained_across_alias_destroy_and_two_jobs"]
+validation_gaps = ["Intel opt-in GEM/standard-BCS-RCS and TC KMS/audio providers: native GPU/Mesa execution, modeset/flip and HDMI sound remain unverified; host model/source-C checks are not physical execution"]
+limitations = ["Intel opt-in provider accepts quota-bound <=16MiB system GEM, WC/WB/UC offsets (WC/UC require all-CPU opted-in palette), cache/domain/advice/aperture and PREAD/PWRITE/BUSY/WAIT; existing bounded BCS/IGT RCS selftests plus ordinary nonprivileged iris BATCH_FIRST|HANDLE_LUT|NO_RELOC batches with <=1024 distinct48-bit softpinned BOs share real retained four-level4K PPGTT and per-slot opaque images, reservations, binary/timeline and CLOEXEC sync-file IN/OUT; ASYNC conservatively retains implicit waits and CAPTURE has no hang-dump interface; input/execution remains bounded synchronous, WR required for OUT; RCS requires intel.rcs=1; live GETPARAM/topology/engine/counter facts are gated on ownership; actual Mesa initialization/rendering and native CPU mapping acceptance remain unverified; no physical GPU execution/state-save/rendering acceptance, relocations/local/huge pages/scheduling/reset recovery/legacy atomic readq or general extension support; intel.modeset=1 powered owned TC1/TC2 legacy HDMI exposes firmware timing plus source-admitted1080p60 atomic programming with exact rollback, frame-counter fences and same-sink reconnect; cold/unowned TC, unknown sink, new CDCLK/WM/color/scaling or IRQ timestamp proof are not supported"]
 
 [[contract]]
 id = "linux-landlock_create_ruleset"

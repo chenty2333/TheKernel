@@ -317,3 +317,213 @@ C library's license (the default host glibc is LGPL-2.1-or-later); this payload
 is not claimed to be BSD-only. The archive and generated tool sources remain
 in the external state cache, not the kernel's vendored runtime tree.
 The optional payload and the baseline image each use 128 MiB. It contains no OEM firmware tables.
+
+## MIT i915 display translation (Codex D, 2026-10-05)
+
+`crates/ax/tk-intel-display` is MIT Rust translated from the individually checked
+MIT files of Linux 7.2.3 i915, not part of the earlier “original Rust only” rule.
+Its `NOTICE` lists the exact included functions; each translation file names
+its source and retains the upstream copyright. `LICENSE-MIT` ships the full
+permission/warranty text. Currently included: ADL-P/N device/stepping selection,
+VBT/BDB routing and HDMI capabilities, and read-only OpRegion VBT discovery.
+No GPL ACPI/trace implementation, DRM C core, GT or firmware is bundled by this
+crate. Private N305 BIOS/EDID captures are external test inputs, not distributed
+MIT fixtures. Hardware behavior remains unverified.
+
+The readout slice additionally translates MIT `intel_display.c` timing/source
+functions and selected `intel_display_regs.h` register fields, with their
+2006–2007 / 2025 Intel copyrights retained in source and crate NOTICE. The
+kernel adapter remains original Apache-2.0 Rust; linking the MIT crate does
+not change the existing product's GPL obligations described above.
+
+Additional MIT arithmetic translations: selected DKL HDMI/no-SSC functions in
+`intel_dpll_mgr.c`, selected fields from `intel_{mg,dkl}_phy_regs.h`, ADL-P
+B0+/ADL-N D0 table selection and display-13 pixel-rate minimum in `intel_cdclk.c`.
+Each has original attribution and the crate's permission-text reference.
+Tests may compile local MIT source into temporary host oracles; no Linux C
+source or firmware is added to the repository by that testing workflow.
+
+GT firmware assessment inputs (not part of the repository/product): the external
+refs directory contains host linux-firmware `tgl_guc_70.bin`, `tgl_huc.bin` and
+comparison-only `adlp_guc_70.bin` with `LICENSE.i915`. These are Intel binary
+firmware under that separate grant, not MIT and not loaded. N305's i915 GuC
+selection follows its ADL-N→ADL-S override (tgl, not adlp). Temporary C oracle
+copies carry the complete crate MIT grant/source copyrights and are removed
+when the test completes. No GPL HDA/GT translation is shipped in this work.
+
+The conventional host-oracle `ARRAY_SIZE` sizeof expression produces one
+additional scanner code-line match at thresholds25/40, not a copied prose block
+or an imported C driver. The measured inventory and its CI baseline are updated
+in provenance and the crate NOTICE; the scanner remains enabled and unchanged.
+
+The DKL access/readout slice additionally translates MIT `intel_dkl_phy.c`
+(`dkl_phy_set_hip_idx`, `intel_dkl_phy_{read,write,rmw,posting_read}`) and
+`intel_dpll_mgr.c::dkl_pll_get_hw_state` into `dkl_phy.rs` / `dpll_mgr.rs`.
+The 2022 / 2006–2016 Intel copyrights and permission-text references accompany
+source; selected display register fields retain the 2025 attribution in NOTICE.
+The local C oracle uses the same temporary-source grant, not a shipped C driver.
+
+Plane reconstruction translates MIT `skl_universal_plane.c` format and initial
+plane readout/stride helpers, ADL-P main-plane tile helpers from `intel_fb.c`,
+and selected encodings in `skl_universal_plane_regs.h` / `drm_fourcc.h` into
+`universal_plane.rs`. Original 2020, 2021, 2024 and 2011 Intel copyrights are
+preserved in source, NOTICE and the bundled MIT text. No DRM core is imported.
+
+Color discovery translates individually MIT-licensed `intel_color.c` (2016
+Intel) configuration, CSC, LUT readout and packing helpers plus selected
+`intel_color_regs.h` encodings (2023 Intel) into `src/color.rs`. Source and
+NOTICE retain the exact function inventory and original copyrights; the bundled
+MIT grant covers the translation and temporary local C oracles. No color
+commit/programming code or GPL tracing is imported by this slice.
+
+The color-oracle shim contributes four normalized scanner matches at25 (one
+at40): conventional min/length expressions and MIT color-state declarations.
+These are registered in crate NOTICE/provenance and CI inventory, without a
+scanner exemption or an added GPL implementation.
+
+Scaler discovery additionally translates MIT `skl_scaler.c` pipe scaler state
+and configuration getters (2020 Intel) with selected `intel_display_regs.h`
+fields (2025 Intel) into `src/scaler.rs`. Permission/copyright references and
+function inventory accompany source/NOTICE; no GPL display trace is imported.
+
+Watermark discovery translates MIT `skl_watermark.c` display13 WM/DDB decoders
+and getters plus enabled-DBUF-slice readout (2022 Intel) into `watermark.rs`.
+Register fields come from MIT `skl_universal_plane_regs.h`, `intel_cursor_regs.h`
+(2024 Intel), and `skl_watermark_regs.h` (2023 Intel). Source/NOTICE preserve
+original attribution and the shared MIT grant. No WM programming imported yet.
+
+TC discovery translates selected MIT `intel_tc.c` ADL-P readiness/ownership,
+modular-FIA and legacy pin/lane fields (2019 Intel), with display/DKL/MG register
+facts (2025/2022 Intel) into `tc.rs`. The 2019 copyright is added to the bundled
+MIT grant and source/NOTICE. Extra DKL before-image collection is original glue,
+not an imported PHY connect/ownership implementation or GPL code.
+
+DDI discovery translates selected HDMI/DVI control fields and TC clock-enabled /
+PLL-selection helpers from MIT `intel_ddi.c` (2012 Intel), with selected MIT
+`intel_display_regs.h` fields (2025 Intel), into `ddi.rs`. Source, NOTICE and the
+bundled grant retain attribution. No DDI programming or DP software core added.
+
+HDMI discovery translates display13 packet-enable/GCP/DIP reads and the hardware
+ECC-hole layout from MIT `intel_hdmi.c` (Dave Airlie 2006; Intel 2006–2009),
+with selected `intel_display_regs.h` fields (2025 Intel), into `hdmi.rs`.
+`hdmi_packet.rs` translates selected AVI/SPD/vendor/HDR decode/checksum helpers
+from MIT `drivers/video/hdmi.c` and `include/linux/hdmi.h` (Avionic Design 2012).
+Their exact grant has a non-infringement disclaimer and is bundled separately
+as `LICENSE-HDMI-MIT`, not replaced with a different standard-MIT disclaimer.
+The C-oracle helper includes both complete grants. Source/NOTICE inventory names
+all included functions; no GPL or HDMI/audio programming code is introduced.
+
+Seven new HDMI-oracle scanner matches at25 are conventional min and HDMI size /
+OUI constants. Registered in NOTICE/provenance and CI; at40 counts are unchanged.
+These do not import a C driver, GPL body or private capture fixture.
+
+The native N305 fastboot call chain uses the MIT pipe/VRR readout translation
+in `crates/ax/tk-intel-display/src/pipe_config.rs`; functions/headers and original
+Intel grants are listed in its NOTICE. The kernel adapter, power-request pin,
+GGTT binding ownership and pageflip recovery policy are original MIT code.
+No GPL early-quirks code is copied for the independently decoded GMS facts.
+
+`crates/ax/tk-intel-gt` ports the MIT N305 Gen12 forcewake/reset path from
+`intel_uncore.c`, `gt/intel_engine_cs.c`, `gt/intel_reset.c` and selected
+`intel_{gt,engine}_regs.h` fields. Its LICENSE-MIT retains the exact uncore
+permission grant, including the next-paragraph clause, and Intel original
+copyrights; NOTICE lists functions and safety differences. Independent C
+oracles extract immutable local MIT functions into temporary builds under
+`wt-intel`, remove them afterwards, and preserve the full grant. No firmware,
+GPL compatibility layer or foreign capture is bundled.
+Its C shim's single conventional `ARRAY_SIZE` match is separately inventoried
+at25/40 in NOTICE/provenance and the CI baseline, without exemptions.
+
+The same `tk-intel-gt` grant now covers selected Gen12 system PPGTT, BCS LRC/
+indirect/predicate WAs, linear fast-copy and flush/breadcrumb/WA-tail routines
+from MIT `gt/{gen8_ppgtt,intel_lrc,gen8_engine_cs}.c/.h`, command/LRC headers,
+`gem/selftests/i915_gem_client_blt.c`, and required shared UC/MCR/GT policy from
+`gt/{intel_gtt,intel_mocs,intel_workarounds,intel_sseu,intel_gt_mcr}.c`.
+NOTICE inventories exact functions and original copyrights (2003-2018,
+2014/2014-2018/2015/2019/2020/2022). Native memory/PCI/DMA/result-retirement
+adapter is original MIT; no arbitrary user batches, GPL or binary firmware.
+
+`tests/guest/graphics/intel-bcs-smoke.c` is original MIT user acceptance code
+using public i915/DRM wire facts. It is installed by the existing graphics
+image builder; it does not bundle a driver, binary firmware or a CPU-copy
+replacement. Compilation/usage checks are not native hardware validation.
+
+The N305 RCS source context/ring/reset/workaround selections remain under
+`tk-intel-gt/LICENSE-MIT` with exact functions/copyrights in NOTICE. The bounded
+RCS shader/state page and corresponding acceptance header are from licensed
+Intel-hosted IGT backport/v6.17 source, with the full original multi-author
+COPYING retained as `tk-intel-gt/LICENSE-IGT`. The original test-only C shim
+extracts unchanged selected IGT functions, retains that full grant and performs
+no DRM ioctl or GPU action. Mesa26.1.2 Gen120 packet/cache fields are used as
+wire facts, not a copied driver/compiler. No firmware or GPL driver is bundled.
+
+GT capability discovery additionally translates selected MIT `intel_sseu.c`
+Gen12 fuse readout (©2019 Intel) and `intel_gt_clock_utils.c` Gen11+ clock
+readout (©2020 Intel), with full existing `tk-intel-gt/LICENSE-MIT` grant.
+The per-file context/UAPI transport is original code using header facts;
+no GPL query/context implementation body is copied. Independent temporary C
+oracles preserve the existing full grants and source copyrights.
+
+The producer-fence ownership fix in DRM syncobj/fence is original Rust.
+Its source-only host oracle compiles unchanged selected MIT `drm_syncobj.c`
+functions (Copyright2017 Red Hat,2016 AMD) and GPL-2.0-only dma-fence-chain
+functions (Copyright2018 AMD) only into temporary task-local C with both full
+license notices. GPL chain code is used to verify subtle dependency ordering;
+no GPL implementation body is retained in the runtime or repository.
+The conventional temporary-C transport `max(a,b)` shim is one additional kernel
+code-line scanner match at25 (none at40), reconciled with provenance/CI totals.
+
+Selected N305 media-idle cache admission extends the existing MIT uncore port
+with source forcewake/register/platform-mask facts and `intel_engine_cs.c`
+hardware ring-idle checks (©2016 Intel, existing full LICENSE-MIT). There is no
+media submission/reset implementation or new firmware payload.
+The selected ring-idle C oracle adds one conventional SELFTEST_ONLY transport
+macro match at25 and none at40, included in the current GT/provenance totals.
+
+`tests/guest/graphics/intel-mesa-smoke.c` is original MIT acceptance code calling
+public GBM/EGL/GLES/i915 interfaces. It contains no imported shader/driver body.
+The task-local iris/CLC builds use the existing Mesa26.1.2 archive and its licenses;
+LLVM/SPIR-V tool packages remain isolated build dependencies, not kernel code.
+The VM/context wire adapter follows Linux7.2.3 MIT i915_gem_context.c VM/proto-
+context lifetime functions (©2011–2012 Intel), using existing per-file GEM charging
+and RAM pins. It does not replace an opaque GPU state image with guessed data.
+
+The N305 sparse residency adapter `kernel/src/drm/intel/gt/copy_ppgtt.rs`
+continues the Linux7.2.3 MIT `gen8_ppgtt.c` port (Intel2020); its full original
+grant is retained in `crates/ax/tk-intel-gt/LICENSE-MIT`. Only four-level4K
+system-memory allocation/insertion is included; no GPL command-parser body.
+
+`tk-intel-gt/src/cache.rs` retains MIT Intel2015/2020 attribution for the
+Linux7.2.3 ADL-N MOCS/L3CC/private-PAT source; grants accompany the crate.
+The existing independent temporary-C comparison now includes all104 source
+writes. No GPL body or firmware binary was added for these object interfaces.
+
+The minimal CPU PAT/mapping-type adapter is original MIT Rust, referencing
+Linux x86 PAT behavior without importing GPL bodies. Display audio translations
+retain the MIT Intel2022/2023 grants for intel_audio/drm_edid; the HDA bridge
+uses original behavior adaptation of Linux7.2.3 HDMI codec handling. Source C
+oracles are temporary external-input builds with original grants preserved.
+
+Powered TC legacy-HDMI mode programming translates the selected Linux7.2.3
+MIT dkl_pll_write, DDI clock/function/buffer, timing/pipe and plane-arm
+functions, retaining Intel2006–2022 attribution and the display crate's full
+MIT grant; module headers and NOTICE identify the exact restricted path.
+
+HDMI HDA port/pin topology references Linux7.2.3
+sound/hda/codecs/hdmi/intelhdmi.c (GPL) as behavior only; the original HDA
+adapter remains Apache-2.0, with no GPL source body imported.
+
+The tc.rs signal-level port additionally retains MIT Intel2012/2020/2023
+source attribution for tgl_dkl_phy_set_signal_levels, intel_ddi_level and
+the HDMI DKL table; the full grant remains in the display crate.
+
+The scoped display IRQ/MSI and hardware-counter epoch adapters are original
+MIT Rust using source mask/dispatch facts; GPL i915_irq.c and DRM core are
+behavior references only. Exact MIT display/hotplug function references are
+listed in irq.rs, with original retained-owner lifecycle over existing APIs.
+
+The optional n305-iris-smoke image overlays only target-built Mesa26.1.2
+libgallium from the existing same-version source/CLC/toolchain, retaining the
+Mesa/Buildroot package license obligations already registered above. No Mesa
+binary is committed. The dedicated flavor and loader check are original
+project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
