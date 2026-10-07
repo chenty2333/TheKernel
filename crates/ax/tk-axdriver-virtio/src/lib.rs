@@ -88,6 +88,15 @@ const fn pci_irq_vector_from_line(line: u8) -> Option<usize> {
     if vector < 0xf0 { Some(vector) } else { None }
 }
 
+/// A native failure cannot fall back to a stale BIOS line. In particular a
+/// valid native route remains usable when firmware left Interrupt Line=0xff.
+#[cfg(target_arch = "x86_64")]
+fn select_pci_route(raw: u32, native: Option<Option<(u32, bool)>>) -> Option<(usize, bool)> {
+    if !(1..=4).contains(&((raw >> 8) as u8)) { return None; }
+    let (gsi, low) = match native { Some(route) => route?, None => (u32::from(raw as u8), true) };
+    Some((pci_irq_vector_from_line(u8::try_from(gsi).ok()?)?, low))
+}
+
 /// Try to probe a VirtIO MMIO device from the given memory region.
 ///
 /// If the device is recognized, returns the device type and a transport object
@@ -130,9 +139,15 @@ pub fn probe_pci_device<H: VirtIoHal>(
 ) -> Option<(DeviceType, PciTransport, Option<usize>)> {
     let dev_type = pci_device_type(dev_info)?;
     #[cfg(target_arch = "x86_64")]
-    let irq = root
-        .interrupt_line_and_pin(bdf)
-        .and_then(|(line, _pin)| pci_irq_vector_from_line(line));
+    let route = root.read_config_dword(bdf, 0x3c).and_then(|raw| {
+        #[cfg(feature = "irq")]
+        let native = axhal::pci_firmware_irq::resolve(bdf.bus, bdf.device, bdf.function, (raw >> 8) as u8);
+        #[cfg(not(feature = "irq"))]
+        let native = None;
+        select_pci_route(raw, native)
+    });
+    #[cfg(target_arch = "x86_64")]
+    let irq = route.map(|r| r.0);
     let mut transport = PciTransport::new::<H>(root, bdf).ok()?;
     // Only these wrappers publish an IRQ number to a real interrupt
     // consumer. GPU/RNG and the current socket wrapper poll and must not
@@ -142,10 +157,13 @@ pub fn probe_pci_device<H: VirtIoHal>(
         dev_type,
         DeviceType::Block | DeviceType::Net | DeviceType::Input
     ) {
-        if let Some(vector) = irq {
-            if !pci_irq::admit(&mut transport, vector) {
-                return None;
-            }
+        let Some((vector, low)) = route else {
+            log::warn!("VirtIO {:?} at {:?}: no admitted INTx route", dev_type, bdf);
+            return None;
+        };
+        if !pci_irq::admit(&mut transport, vector, low) {
+            log::warn!("VirtIO {:?} at {:?}: INTx vector {} rejected", dev_type, bdf, vector);
+            return None;
         }
     }
     #[cfg(not(feature = "irq"))]
@@ -237,4 +255,15 @@ mod tests {
         assert_eq!(pci_irq_vector_from_line(0xd0), None);
         assert_eq!(pci_irq_vector_from_line(0xff), None);
     }
+    #[test]
+    fn native_route_handles_unassigned_line_and_never_guesses_on_failure() {
+        use super::select_pci_route;
+        assert_eq!(select_pci_route(0x1ff, Some(Some((22, false)))), Some((54, false)));
+        assert_eq!(select_pci_route(0x10b, Some(None)), None);
+        assert_eq!(select_pci_route(0x1ff, None), None);
+        assert_eq!(select_pci_route(0x10b, None), Some((43, true)));
+        assert_eq!(select_pci_route(0xff, Some(Some((22, false)))), None);
+        assert_eq!(select_pci_route(0x1ff, Some(Some((208, false)))), None);
+    }
+
 }

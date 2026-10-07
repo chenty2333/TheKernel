@@ -85,6 +85,9 @@ case "$PAYLOAD" in
     containers)
         exec "$SCRIPT_DIR/build-containers-payload.sh" --output "$OUTPUT"
         ;;
+    acpica)
+        exec "$SCRIPT_DIR/build-acpica-payload.sh" --output "$OUTPUT/opt/thekernel-tests/bin" --cc "${THEKERNEL_ACPICA_CC:-gcc}"
+        ;;
     inspect)
         exec "$SCRIPT_DIR/build-inspect-payload.sh" --output "$OUTPUT"
         ;;

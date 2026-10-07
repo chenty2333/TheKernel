@@ -544,6 +544,10 @@ static int test_proc_net_route(void) {
         NULL, "proc-net-route-child");
 }
 
+static int test_acpi(void) {
+    return run_guest_program("/opt/thekernel-tests/bin/thekernel-acpi-smoke",NULL,"acpi-child");
+}
+
 static int test_pci_sysfs(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-pci-sysfs-smoke",
@@ -1197,6 +1201,7 @@ static int run_init(int argc, char **argv) {
         { "block-inventory", test_block_inventory, 30 },
         { "block-statistics", test_block_statistics, 30 },
         { "pci-sysfs", test_pci_sysfs, 30 },
+        { "acpi", test_acpi, 60 },
         { "proc-net-route", test_proc_net_route, 30 },
         { "netlink-dump-padding", test_netlink_dump_padding, 30 },
         { "socket-diag", test_socket_diag, 30 },

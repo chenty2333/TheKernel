@@ -928,6 +928,7 @@ def system_test_cmd(args: argparse.Namespace) -> int:
     return run_product(
         artifacts,
         RunSpec(
+            kernel_cmdline=os.environ.get("THEKERNEL_TEST_CMDLINE"),
             accel=args.accel,
             cpu_pm=getattr(args, "cpu_pm", False),
             kernel_cmdline=getattr(args, "guest_kernel_cmdline", None),

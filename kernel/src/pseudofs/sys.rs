@@ -33,6 +33,7 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     fs_dir.add("fuse", SimpleDir::new_maker(fs.clone(), Arc::new(fuse_dir)));
     fs_dir.add("cgroup", empty_dir(fs.clone()));
 
+    root.add("firmware",super::acpi::firmware(fs.clone()));
     root.add("class", class_dir(fs.clone()));
     #[cfg(any(feature="pmu",feature="hwp-uclamp"))]
     root.add("class", super::cpu_thermal::class_dir(fs.clone()));
@@ -184,6 +185,7 @@ fn bus_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         "event_source",
         SimpleDir::new_maker(fs.clone(), Arc::new(event_source)),
     );
+    let bus=bus.chain(super::acpi::bus_root(fs.clone()));
     SimpleDir::new_maker(
         fs.clone(),
         Arc::new(bus.chain(device_registry::bus_root(fs))),
@@ -198,6 +200,7 @@ fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         fs.clone(),
         Arc::new(super::block_inventory::class_root(fs.clone())
             .chain(super::net_sysfs::class_root(fs.clone()))
+            .chain(super::acpi_thermal::class_root(fs.clone()))
             .chain(device_registry::class_root(fs))),
     )
 }

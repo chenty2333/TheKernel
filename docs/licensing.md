@@ -291,3 +291,29 @@ Corresponding sources are the Alpine v3.24 aports linux-tools/lm-sensors and
 listed dependency origins; upstream versions and Alpine package revisions are
 preserved in the manifest. `/opt/thekernel-tools/POWER-PACKAGES.tsv` accompanies
 the binaries. The new kernel Rust only implements architectural facts/behavior.
+
+## ACPICA integration (2026-10-05)
+
+`crates/ax/tk-acpica/vendor/{components,include}` contains unchanged ACPICA
+20260930 from the [official release](https://github.com/acpica/acpica/releases/tag/20260930).
+The repository now redirects to `open-acpica/acpica`. The release archive is
+`acpica-unix-20260930.tar.gz`; its SHA256 was verified against the GitHub
+release-asset digest: `aa18901b92e30749be0edc3081c8d550c61fce4fa37546fc6a65d367a4ae71a5`.
+The elected option is **BSD-3-Clause**, with the original Intel/contributor
+copyright headers, `LICENSE.BSD-3-Clause`, and `NOTICE` retained in the crate.
+The Rust adapter and TheKernel C/platform glue are original Apache-2.0 code.
+Generated include copies insert the TheKernel platform configuration; vendored
+files are not edited. Neither Linux-tree ACPICA nor FreeBSD/Haiku code is copied.
+Firmware tables (including OEM AML and MSDM keys) are never repository inputs.
+
+### ACPICA guest inspection payload
+
+`--toolchain acpica` stages static `acpidump` and `iasl` from the same verified
+ACPICA 20260930 release archive, with its BSD-3-Clause notice. The builder is
+`scripts/build-acpica-payload.sh`; the guest downloads nothing. The build uses
+the supplied host C compiler (default GCC) and its static C library, just like
+the baseline rootfs tool build. Binary redistribution must also satisfy that
+C library's license (the default host glibc is LGPL-2.1-or-later); this payload
+is not claimed to be BSD-only. The archive and generated tool sources remain
+in the external state cache, not the kernel's vendored runtime tree.
+The optional payload and the baseline image each use 128 MiB. It contains no OEM firmware tables.

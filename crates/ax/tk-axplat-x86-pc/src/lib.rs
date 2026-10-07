@@ -184,3 +184,15 @@ pub mod cpufreq;
 
 /// Read-only, physical Intel DTS temperatures and target limits.
 pub mod thermal;
+
+/// Stable owned boot RSDP pointer for ACPICA native-RSDP mode.
+pub fn acpi_rsdp_pointer()->usize { boot_info::get().rsdp().map_or(0,|r|r.bytes().as_ptr() as usize) }
+pub use power::{register_acpica_off,record_acpica_button,publish_acpica_button,restore_static_acpi};
+#[cfg(feature="irq")]
+pub use power::{install_acpica_sci,remove_acpica_sci};
+
+/// Finish diagnostic serial transmission before power removal.
+pub fn acpi_flush_diagnostics(){console::flush_diagnostic();}
+
+#[cfg(feature = "irq")]
+pub use apic::configure_pci_intx_polarity;

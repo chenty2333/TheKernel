@@ -946,3 +946,67 @@ pub fn cpu_idle_wait() {
     #[cfg(all(target_os="none",feature="defplat"))] axplat_x86_pc::cpuidle::wait();
     #[cfg(not(all(target_os="none",feature="defplat")))] asm::enable_irqs_and_wait();
 }
+
+/// ACPI OSL hardware ownership hooks; absent on hosted builds.
+pub mod acpi {
+    pub fn rsdp_pointer()->usize {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::acpi_rsdp_pointer() }
+        #[cfg(not(all(target_os="none",feature="defplat")))] { 0 }
+    }
+    pub fn ecam()->(u64,u16,u8,u8) {
+        #[cfg(all(target_os="none",feature="defplat"))] { let (b,e)=axplat_x86_pc::pci::ecam_bus_range();(axplat_x86_pc::pci::ecam_base() as u64,0,b,e) }
+        #[cfg(not(all(target_os="none",feature="defplat")))] { (0,0,0,0) }
+    }
+    pub fn install_sci(irq:u32,handler:fn())->Option<usize> {
+        #[cfg(all(target_os="none",feature="defplat",feature="irq"))] { axplat_x86_pc::install_acpica_sci(irq,handler) }
+        #[cfg(not(all(target_os="none",feature="defplat",feature="irq")))] { let _=(irq,handler);None }
+    }
+    pub fn remove_sci(vector:usize) {
+        #[cfg(all(target_os="none",feature="defplat",feature="irq"))] { axplat_x86_pc::remove_acpica_sci(vector); }
+        #[cfg(not(all(target_os="none",feature="defplat",feature="irq")))] { let _=vector; }
+    }
+    pub fn register_off(callback:fn()->bool) {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::register_acpica_off(callback); }
+        #[cfg(not(all(target_os="none",feature="defplat")))] { let _=callback; }
+    }
+    pub fn button_event() {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::record_acpica_button(); }
+    }
+    pub fn publish_button(available:bool) {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::publish_acpica_button(available); }
+        #[cfg(not(all(target_os="none",feature="defplat")))] { let _=available; }
+    }
+    pub fn restore_static() {
+        #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::restore_static_acpi(); }
+    }
+}
+
+/// Complete diagnostic UART transmission before a firmware power transition.
+pub fn acpi_flush_diagnostics() {
+    #[cfg(all(target_os="none",feature="defplat"))] { axplat_x86_pc::acpi_flush_diagnostics(); }
+}
+
+
+/// One firmware routing provider, installed before PCI transport admission.
+pub mod pci_firmware_irq {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    pub type Router = fn(u8, u8, u8, u8) -> Option<(u32, bool)>;
+    static ROUTER: AtomicUsize = AtomicUsize::new(0);
+    pub fn install(router: Router) -> bool {
+        ROUTER.compare_exchange(0, router as usize, Ordering::Release, Ordering::Acquire).is_ok()
+    }
+    /// None means no provider (static rescue); Some(None) is an unroutable
+    /// native function, never permission to guess the old config-space line.
+    pub fn resolve(bus: u8, device: u8, function: u8, pin: u8) -> Option<Option<(u32, bool)>> {
+        let ptr = ROUTER.load(Ordering::Acquire);
+        if ptr == 0 { return None }
+        // SAFETY: install accepts only a static fn with this exact signature.
+        Some(unsafe { core::mem::transmute::<usize, Router>(ptr) }(bus, device, function, pin))
+    }
+    pub fn configure(vector: usize, active_low: bool) -> bool {
+        #[cfg(all(target_os="none",feature="defplat",feature="irq"))]
+        { axplat_x86_pc::configure_pci_intx_polarity(vector, active_low) }
+        #[cfg(not(all(target_os="none",feature="defplat",feature="irq")))]
+        { let _=(vector, active_low); false }
+    }
+}

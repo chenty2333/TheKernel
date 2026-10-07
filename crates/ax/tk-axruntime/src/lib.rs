@@ -596,73 +596,28 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         klog::fatal(format_args!("Primary task scheduler initialization failed: {error:?}"));
     }
 
+    // Establish the BSP's blocking runtime before firmware and PCI probing.
+    // AP schedulers retain their established post-device startup boundary.
+    #[cfg(feature = "irq")]
+    init_interrupt();
+    ctor_bare::call_ctors();
+    #[cfg(feature = "irq")]
+    axhal::asm::enable_irqs();
+    #[cfg(feature = "platform-services")]
+    crate_interface::call_interface!(PlatformServices::before_pci_probe);
     #[cfg(feature = "axdriver")]
-    {
-        early_screen_milestone("driver init");
-        #[allow(unused_variables)]
-        let all_devices = axdriver::init_drivers();
-        #[allow(unused_mut)]
-        let mut all_devices = all_devices;
-
-        #[cfg(feature = "fs-ng")]
-        early_screen_milestone("filesystems");
-        #[cfg(feature = "fs-ng")]
-        axfs_ng::init_filesystems(all_devices.block);
-        #[cfg(all(feature = "fs-ng", feature = "net-ng"))]
-        for device in all_devices.net.iter_mut() {
-            #[allow(unused_imports)]
-            use axdriver::prelude::NetDriverOps;
-            if let Some(path) = device.firmware_path() {
-                match read_network_firmware(path) {
-                    Some(bytes) => match device.load_firmware(&bytes) {
-                        Ok(()) => info!("NIC firmware {path}: applied; hardware-unverified"),
-                        Err(error) => warn!("\x013NIC firmware {path}: failed {error:?}; MAC may be stopped"),
-                    },
-                    None => warn!("\x013NIC firmware {path}: unavailable; degraded warm-PXE PHY only"),
-                }
-            }
-        }
-
-
-        #[cfg(feature = "net-ng")]
-        {
-            if let Err(error) = axnet_ng::init_network(all_devices.net) {
-                klog::fatal(format_args!(
-                    "Network subsystem initialization failed: {error:?}"
-                ));
-            }
-
-            #[cfg(feature = "vsock")]
-            axnet_ng::init_vsock(all_devices.vsock);
-        }
-
-        #[cfg(feature = "display")]
-        axdisplay::init_display(all_devices.display);
-
-        #[cfg(feature = "input")]
-        axinput::init_input(all_devices.input);
-    }
+    init_device_subsystems();
 
     #[cfg(feature = "smp")]
     early_screen_milestone("secondary CPU bring-up");
     #[cfg(feature = "smp")]
     self::mp::start_secondary_cpus(cpu_id);
 
-    #[cfg(feature = "irq")]
-    early_screen_milestone("interrupt init");
-    #[cfg(feature = "irq")]
-    {
-        debug!("Initialize interrupt handlers...");
-        init_interrupt();
-    }
-
     #[cfg(all(feature = "tls", not(feature = "multitask")))]
     {
         debug!("Initialize thread local storage...");
         init_tls();
     }
-
-    ctor_bare::call_ctors();
 
     boot_progress::cpu_phase(cpu_id,6);
     info!("Primary CPU {cpu_id} init OK.");
@@ -847,8 +802,7 @@ fn init_interrupt() {
     // reset state to generate the first interrupt.
     rearm_timer(axhal::time::monotonic_time_nanos());
 
-    // Enable IRQs before starting app
-    axhal::asm::enable_irqs();
+    // CPU-local timer registration is complete; enable only after constructors.
 }
 
 /// Raw context observer for the timer vector. It intentionally only writes a
@@ -911,3 +865,63 @@ fn read_network_firmware(path: &str) -> Option<alloc::vec::Vec<u8>> {
 
 #[cfg(all(feature = "fs-ng", feature = "net-ng"))]
 extern crate alloc;
+
+
+/// Firmware/IRQ routing services which must precede the initial PCI probe.
+/// Called once after heap, mappings, BSP scheduler and IRQ services; before AP startup.
+#[cfg(feature = "platform-services")]
+#[crate_interface::def_interface]
+pub trait PlatformServices {
+    fn before_pci_probe();
+}
+
+
+// Keep the large device ownership transfer out of the long-lived boot frame.
+#[cfg(feature = "axdriver")]
+#[inline(never)]
+fn init_device_subsystems() {
+        early_screen_milestone("driver init");
+        #[allow(unused_variables)]
+        let all_devices = axdriver::init_drivers();
+        #[allow(unused_mut)]
+        let mut all_devices = all_devices;
+
+        #[cfg(feature = "fs-ng")]
+        early_screen_milestone("filesystems");
+        #[cfg(feature = "fs-ng")]
+        axfs_ng::init_filesystems(all_devices.block);
+        #[cfg(all(feature = "fs-ng", feature = "net-ng"))]
+        for device in all_devices.net.iter_mut() {
+            #[allow(unused_imports)]
+            use axdriver::prelude::NetDriverOps;
+            if let Some(path) = device.firmware_path() {
+                match read_network_firmware(path) {
+                    Some(bytes) => match device.load_firmware(&bytes) {
+                        Ok(()) => info!("NIC firmware {path}: applied; hardware-unverified"),
+                        Err(error) => warn!("\x013NIC firmware {path}: failed {error:?}; MAC may be stopped"),
+                    },
+                    None => warn!("\x013NIC firmware {path}: unavailable; degraded warm-PXE PHY only"),
+                }
+            }
+        }
+
+
+        #[cfg(feature = "net-ng")]
+        {
+            if let Err(error) = axnet_ng::init_network(all_devices.net) {
+                klog::fatal(format_args!(
+                    "Network subsystem initialization failed: {error:?}"
+                ));
+            }
+
+            #[cfg(feature = "vsock")]
+            axnet_ng::init_vsock(all_devices.vsock);
+        }
+
+        #[cfg(feature = "display")]
+        axdisplay::init_display(all_devices.display);
+
+        #[cfg(feature = "input")]
+        axinput::init_input(all_devices.input);
+
+}

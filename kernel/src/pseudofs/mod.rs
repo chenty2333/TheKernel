@@ -195,3 +195,7 @@ mod tests {
         assert!(!is_missing_path_error(AxError::from(LinuxError::EEXIST)));
     }
 }
+
+mod acpi;
+
+mod acpi_thermal;

@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Authored AML policy fixtures through the formal Q35/OVMF product runner.
+
+No hardware tables or host-forced VM termination count as acceptance.
+"""
+from pathlib import Path
+import argparse
+import os
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from tools import thekernel as product
+from tools.product_state import state_root
+
+
+def ordered(text: str, *markers: str) -> None:
+    at = -1
+    for marker in markers:
+        at = text.find(marker, at + 1)
+        if at < 0:
+            raise RuntimeError("missing ordered shutdown marker: " + marker)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--no-build", action="store_true")
+    parser.add_argument("--case", choices=("thermal", "method-button", "fixed-button", "fallback", "routing-failure", "static-rescue", "all"), default="all")
+    args = parser.parse_args()
+    os.environ["THEKERNEL_TOOLCHAIN"] = "acpica"
+    run_args = product.build_parser().parse_args(["run", "--profile", "shell", "--toolchain", "acpica"])
+    artifacts = product.artifacts_for(run_args)
+    if not args.no_build:
+        product.build_cmd(run_args)
+    cases = ("thermal", "method-button", "fixed-button", "fallback", "routing-failure", "static-rescue") if args.case == "all" else (args.case,)
+    for case in cases:
+        run_case(artifacts, case)
+
+
+def run_case(artifacts, case: str) -> None:
+    directory = Path(tempfile.mkdtemp(prefix="acpica-" + case + "-", dir=state_root() / "runs"))
+    commands = directory / "commands"
+    extra = ()
+    powerdown = None
+    lines = ["/bin/busybox sleep 60", ""]
+    if case == "thermal":
+        lines = [
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/type",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/temp",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_0_temp",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_0_type",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_1_temp",
+            "/bin/busybox cat /sys/class/thermal/thermal_zone0/trip_point_1_type",
+            "/bin/busybox echo THEKERNEL_THERMAL_SYSFS_READ", *lines,
+        ]
+        fixture = "thermal.aml"
+    elif case == "method-button":
+        fixture = "button.aml"
+    elif case in ("fallback", "routing-failure"):
+        fixture = "unsupported-ecdt.bin" if case == "fallback" else "unsupported-pci.aml"
+        powerdown = "THEKERNEL_ACPI_POLICY_READY"
+    else:
+        fixture = None
+        powerdown = "THEKERNEL_ACPI_POLICY_READY"
+    if powerdown:
+        lines = ["/bin/busybox sleep 3", "/bin/busybox echo THEKERNEL_ACPI_POLICY_READY", *lines]
+    if fixture:
+        extra = ("-acpitable", "file=" + str(ROOT / "tests/guest/acpi" / fixture))
+    commands.write_text("\n".join(lines))
+    result = product.run_product(artifacts, product.RunSpec(
+        accel="kvm", timeout=120, workdir=directory, interactive=False,
+        input_after_marker="THEKERNEL_SHELL_READY", stop_after_marker=None,
+        commands=commands, extra_block=None, run_cpus=4,
+        kernel_cmdline="acpi=static" if case == "static-rescue" else None, qemu_extra_args=extra,
+        powerdown_after_marker=powerdown, qmp_timeout_secs=120,
+    ))
+    if result:
+        raise RuntimeError(f"guest failed ({result}); see {directory}")
+    console = (directory / "console.log").read_text()
+    kernel = (directory / "kernel.log").read_text()
+    if case == "thermal":
+        for value in ("acpitz", "26800", "36800", "critical", "31800", "passive"):
+            if value not in console.splitlines():
+                raise RuntimeError(f"missing actual sysfs value {value!r}; see {directory}")
+        ordered(console, "THEKERNEL_THERMAL_SYSFS_READ", "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPICA_S5_PREPARED")
+        ordered(kernel, "thermal critical trip reached")
+        ordered(console, "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPI_FILESYSTEMS_FLUSHED", "THEKERNEL_ACPICA_S5_PREPARED")
+    elif case in ("fallback", "routing-failure", "static-rescue"):
+        start = "explicit static rescue requested" if case == "static-rescue" else "static fallback restored"
+        ordered(kernel, start)
+        ordered(console, "THEKERNEL_SHELL_READY", "THEKERNEL_ACPI_FILESYSTEMS_FLUSHED")
+        if "THEKERNEL_ACPICA_S5_PREPARED" in console or "acpica: ready version" in kernel:
+            raise RuntimeError("failed initialization retained ACPICA ownership")
+        if case != "static-rescue":
+            ordered(console, "THEKERNEL_ACPICA_INIT_FAILED_STATIC_RESCUE", "THEKERNEL_SHELL_READY", "THEKERNEL_ACPI_BUTTON_EVENT")
+        else:
+            ordered(console, "THEKERNEL_SHELL_READY", "THEKERNEL_ACPI_FILESYSTEMS_FLUSHED")
+    else:
+        expected = "method-buttons=1" if case == "method-button" else "fixed-button=true"
+        ordered(kernel, expected)
+        ordered(console, "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPI_FILESYSTEMS_FLUSHED", "THEKERNEL_ACPICA_S5_PREPARED")
+        ordered(console, "THEKERNEL_ACPI_BUTTON_EVENT", "THEKERNEL_ACPICA_S5_PREPARED")
+    print("ACPICA_" + case.upper().replace("-", "_") + "_QEMU_PASS", directory, flush=True)
+
+
+if __name__ == "__main__":
+    main()
