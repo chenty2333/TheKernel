@@ -566,7 +566,7 @@ the baseline rootfs tool build. Binary redistribution must also satisfy that
 C library's license (the default host glibc is LGPL-2.1-or-later); this payload
 is not claimed to be BSD-only. The archive and generated tool sources remain
 in the external state cache, not the kernel's vendored runtime tree.
-The optional payload and the baseline image each use 128 MiB. It contains no OEM firmware tables.
+The optional payload and the merged baseline image each use 160 MiB. It contains no OEM firmware tables.
 
 ## MIT i915 ADL-P/N display translation (Codex D, 2026-10-05)
 
@@ -968,3 +968,12 @@ this does not itself open general Mesa batches or establish GPU execution.
   binary/source driver body imported into this repository; image and tools
   remain task-owned build outputs. Guest immediate symbol binding is measured;
   no physical GPU initialization/rendering or software fallback result claimed.
+
+### Combined A/B/D/E inventory (2026-10-07)
+
+The merged tree retains A's removal of the obsolete ptrace quotation and
+B's removal of obsolete mount-authority comments alongside D's MIT oracle
+shims. The scanner measures kernel/src as (86,42,20,130,8,0,0) at >=40 and
+(159,52,26,299,14,0,0) at >=25. The merged baseline uses these measured totals;
+individual-branch historical counts above are not additive. Other scopes
+retain the latest Intel inventory, with no scanner exemptions.

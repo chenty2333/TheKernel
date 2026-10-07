@@ -1,8 +1,8 @@
-# 下次 N305 真机验证：Codex A / dev
+# 下次 N305 真机验证：CPU 电源管理与平台诊断
 
-工作区 `/home/ava/Worktrees/TheKernel/dev`，独立状态目录
-`/home/ava/.cache/thekernel-targets/wt-dev`。这是 A 的独立 dev 镜像，不是
-中午 main/dev/C 审计代码的临时集成镜像；不替用户合并 B/C。**不写内部 NVMe，
+2026-10-07 起从整合后的 `/home/ava/Desktop/TheKernel` main 重建，状态目录
+`/home/ava/.cache/thekernel-targets`。此前 A 的独立验证是历史结果，不能代替
+整合后的真机验收。ACPICA 和安全准入的 MWAIT 现在均为默认路径。**不写内部 NVMe，
 不改 BIOS/SPI/主机网络；sudo 服务和 U 盘写入均由用户执行。**
 
 报告中的旧集成镜像曾完成 RTL8168H DHCP/ping/netconsole，但 3 次里 1 次
@@ -13,8 +13,8 @@
 ## 1. 重建成对 ELF/rootfs，准备前台 PXE
 
 ```sh
-cd /home/ava/Worktrees/TheKernel/dev
-export THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets/wt-dev
+cd /home/ava/Desktop/TheKernel
+export THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets
 export THEKERNEL_RTL8168_FIRMWARE_DIR=/home/ava/.cache/thekernel-targets/refs/firmware/rtl_nic
 python3 tools/thekernel.py build --platform n305 --profile shell
 scripts/n305-netboot.sh --help

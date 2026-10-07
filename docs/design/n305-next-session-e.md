@@ -3,6 +3,10 @@
 **未在硬件上验证。** This document describes a future authorized capture, not a
 result or permission to write the N305's Windows/BitLocker NVMe.
 
+Use the integrated main checkout at `/home/ava/Desktop/TheKernel`; rebuild the
+paired image rather than reusing the former ACPICA worktree kernel. Historical
+isolated-worktree tests do not establish integrated N305 acceptance.
+
 ## Safe first boot
 
 - Keep a known-good image with **explicit `acpi=static`** as rescue. Normal
@@ -10,7 +14,8 @@ result or permission to write the N305's Windows/BitLocker NVMe.
   the default-native test image after a separately authorized physical session.
 - Use the existing owned netboot/capture procedure, only after the user authorizes
   a physical session. Keep disks read-only; do not add `nvme.allow_write=1`.
-- Do not enable S3, display modesetting, CPU power experiments or watchdog changes
+- Set `cpuidle.mwait=0` for this isolated ACPI check (integrated main otherwise
+  automatically admits MWAIT). Do not enable S3, display modesetting, CPU power experiments or watchdog changes
   as part of this ACPI check. Preserve the firmware console/rescue path.
 
 ## What to inspect

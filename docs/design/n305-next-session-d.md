@@ -6,8 +6,9 @@
 
 ## 基线和板级资料
 
-1. 用已知可启动的固件帧缓冲配置构建 detached worktree 的 n305 shell。
-   状态目录 `wt-intel`，nice10、6个构建任务。无 `intel.modeset=1`、
+1. 从整合后的 `/home/ava/Desktop/TheKernel` main，以已知可启动的固件帧缓冲
+   配置重建 n305 shell；状态目录 `/home/ava/.cache/thekernel-targets`。
+   旧 `wt-intel` 镜像及测试是独立工作区历史结果，不代表整合镜像已真机验收。无 `intel.modeset=1`、
    无 `intel.gt=1`、**无 `nvme.allow_write=1`**。不要改其他Codex网络或服务。
 2. 屏幕应继续可读、可以更新文字、打开shell。记录只有默认只读Intel probe，
    不把该屏幕归功于新驱动。读 `/sys/kernel/debug/dri/0/intel_gpu`。
