@@ -38,7 +38,7 @@ Linux — https://kernel.org — GPL-2.0-only — (C) The Linux Kernel Authors
   block whose lines are all shorter than 40 characters. 110 lines in total
   across 49 blocks in 20 files. At the inclusive >= 25-character threshold the
   same scope holds 211 lines in 59 blocks in 22 files. kernel/src carries a
-  further 89 such lines in 43 blocks in 19 files.
+  further 86 such lines in 42 blocks in 20 files.
 
   The same scan without the fence restriction adds 25 more verbatim lines in 5
   crates/linux files (4 crates) that sit in unfenced `///` prose lists and in

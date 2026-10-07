@@ -708,14 +708,25 @@ impl AddrSpace {
     }
 
     /// Replaces one byte in a private file-backed executable mapping without
-    /// ever making its user PTE writable.  This is the uprobe overlay
-    /// primitive: `populate_area(WRITE)` first takes the ordinary COW path,
+    /// ever making its user PTE writable. Uprobes and authorized ptrace text
+    /// stores share this private executable patch primitive: `populate_area(WRITE)` first takes the ordinary COW path,
     /// then the physical byte is changed while the leaf retains its RX VMA
     /// policy.  Shared mappings are rejected, so an INT3 cannot escape into
     /// another process or the inode page cache.
     pub(crate) fn uprobe_cow_patch_byte(&mut self, address: VirtAddr, byte: u8) -> AxResult<u8> {
+        let area = self.areas.find(address).ok_or(AxError::BadAddress)?;
+        if !area.backend().file_mapping().is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Private) {
+            return Err(AxError::PermissionDenied);
+        }
+        self.private_executable_cow_patch_byte(address, byte)
+    }
+
+    /// Private RX COW text, including ELF loader backings which do not carry
+    /// syscall-mmap FileMapping metadata. Keep uprobe inode admission separate,
+    /// but share the actual copy, leaf validation, patch and instruction sync.
+    pub(crate) fn private_executable_cow_patch_byte(&mut self, address: VirtAddr, byte: u8) -> AxResult<u8> {
         let page = address.align_down(PAGE_SIZE_4K);
-        let (flags, private_file_cow) = {
+        let (flags, private_cow) = {
             let area = self.areas.find(address).ok_or(AxError::BadAddress)?;
             (
                 area.flags(),
@@ -724,10 +735,10 @@ impl AddrSpace {
                     && area
                         .backend()
                         .file_mapping()
-                        .is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Private),
+                        .is_none_or(|mapping| mapping.sharing() == FileMappingSharing::Private),
             )
         };
-        if !private_file_cow {
+        if !private_cow {
             return Err(AxError::PermissionDenied);
         }
 

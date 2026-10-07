@@ -99,6 +99,7 @@ def build_qemu_command(
     qmp_socket: Path | None = None,
     diagnostic_log_path: Path | None = None,
     extra_args: tuple[str, ...] = (),
+    cpu_pm: bool = False,
 ) -> tuple[str, ...]:
     """Build the deterministic architecture-specific QEMU topology."""
 
@@ -122,6 +123,8 @@ def build_qemu_command(
         raise CommandError("QMP socket path must be QEMU-safe")
     if input_backend not in {"virtio", "usb"}:
         raise CommandError(f"unsupported input backend: {input_backend}")
+    if cpu_pm and accel != "kvm":
+        raise CommandError("cpu-pm passthrough requires --accel kvm")
     _validate_extra_args(extra_args)
     if usb_boot and (arch != "x86_64" or usb_disk is None or rootfs is not None or direct_kernel):
         raise CommandError("USB boot requires x86 UEFI, USB disk, and no other root drive")
@@ -250,6 +253,8 @@ def build_qemu_command(
                             "-device", "nvme,drive=nvme-disk,serial=TK-NVME-TEST,max_ioqpairs=4"])
         if extra_block is not None:
             _append_pci_drive(command, extra_block, "extra")
+        if cpu_pm:
+            command.extend(("-overcommit", "cpu-pm=on"))
         if extra_args:
             command.extend(extra_args)
         return tuple(command)

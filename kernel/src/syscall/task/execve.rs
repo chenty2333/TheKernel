@@ -14,7 +14,6 @@ use axtask::current;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CAP_SYS_PTRACE};
 use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 use tk_linux_process_adapter::Pid;
-use tk_linux_signal::Signo;
 use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, vm_load_until_nul};
 
 use crate::{
@@ -35,7 +34,7 @@ use crate::{
         ProcessAccessState, ProcessData, PtraceRelationshipSnapshot, Thread, UserNamespace,
         check_signals, commit_exec_identity_handoff, fail_closed_exit, get_task,
         has_pending_fatal_signal, linux_pid_from_task_id, map_exec_dumpability,
-        notify_ptrace_attach_stop, ns_capable, prepare_task_alias_admission, process_error,
+        ns_capable, prepare_task_alias_admission, process_error,
         release_exec_action_then_complete, reset_current_task_extended_state,
         reset_current_user_cet_state, set_current_user_address_space,
     },
@@ -522,7 +521,7 @@ fn do_execve(
     // relationship. If this gate published first, a later attach is rejected
     // until the new image is completely visible.
     let exec_admission = ExecAdmission::begin(proc_data, curr_tid)?;
-    let exec_ptrace_relationship = proc_data.ptrace_relationship_snapshot();
+    let exec_ptrace_relationship = thr.ptrace_relationship_snapshot();
 
     // Only the terminal ELF (the shebang interpreter when the initial object
     // is a script) supplies set-ID and file-capability privilege. PT_INTERP is
@@ -665,7 +664,7 @@ fn do_execve(
     // Detach is harmless (and may leave a conservative suppression decision),
     // but a different exact session/credential is an internal invariant
     // failure rather than a retry-shaped EINTR.
-    let current_ptrace_relationship = proc_data.ptrace_relationship_snapshot();
+    let current_ptrace_relationship = thr.ptrace_relationship_snapshot();
     if !exec_ptrace_relationship_is_stable(
         exec_ptrace_relationship.as_ref(),
         current_ptrace_relationship.as_ref(),
@@ -680,6 +679,16 @@ fn do_execve(
     )) {
         return Err(AxError::OperationNotPermitted);
     }
+    // Preserve the former visible thread ID before non-leader identity handoff
+    // removes its alias. The admitted relationship is frozen by the exec gate.
+    let exec_old_pid = current_ptrace_relationship
+        .as_ref()
+        .and_then(|relationship| {
+            get_task(relationship.session().tracer_kernel_tid)
+                .ok()
+                .map(|tracer| tracer.as_thread().pid_ns().visible_pid(thr.tid()) as usize)
+        })
+        .unwrap_or(0);
     // Reserve the private sighand owner before interrupting or waiting for any
     // sibling. Its commit re-snapshots the fixed action table under the source
     // owner gate, so peer updates which linearize while siblings drain are
@@ -777,8 +786,8 @@ fn do_execve(
     // gate still excludes a fresh attach. The action gate keeps that exact
     // relationship stable through stop publication; a later attachment must
     // not inherit this already-committed exec event.
-    let exec_ptrace_action = proc_data.lock_ptrace_actions();
-    let exec_ptrace_session = proc_data.ptrace_active_session();
+    let exec_ptrace_action = thr.lock_ptrace_actions();
+    let exec_ptrace_session = thr.ptrace_active_session();
     let executable_key = exec_retirement
         .finish_executable_lease()
         .unwrap_or_else(|error| fail_closed_exit(error));
@@ -822,11 +831,10 @@ fn do_execve(
     reset_current_task_extended_state();
     reset_current_user_cet_state();
     crate::task::reset_current_xsave_state();
+    *thr.hardware_debug.lock() = Default::default();
     let _ = rseq_exec.commit();
-    if let Some(session) = exec_ptrace_session
-        && proc_data.ptrace_stop(session, Signo::SIGTRAP as u8)
-    {
-        notify_ptrace_attach_stop(proc_data);
+    if let Some(session) = exec_ptrace_session {
+        crate::task::ptrace_runtime::report_exec(thr, session, exec_old_pid);
     }
     // The old page tables and exact credential/security owners stay alive while
     // the saved task context and hardware root both name the new image. Release

@@ -1208,6 +1208,10 @@ impl ProcessSignalManager {
         }
     }
 
+    pub fn pending_snapshot(&self) -> Result<crate::PendingSignalSnapshot, AllocError> {
+        crate::snapshot_pending_queue(&self.pending)
+    }
+
     /// Gets currently pending signals.
     pub fn pending(&self) -> SignalSet {
         self.pending.lock().set

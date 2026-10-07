@@ -31,7 +31,7 @@ const PF_X: u32 = 1;
 const NT_PRSTATUS: u32 = 1;
 
 const EM_ARCH: u16 = 62; // EM_X86_64
-const NUM_GREGS: usize = 27;
+use super::registers::{NUM_GREGS, fill_gregs};
 
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
@@ -166,41 +166,6 @@ fn mapping_flags_to_elf(flags: MappingFlags) -> u32 {
 
 // ---- Core dump generation (x86_64 register extraction) ----
 
-fn fill_gregs(uctx: &UserContext, regs: &mut [u64; NUM_GREGS]) {
-    // The saved frame keeps no `orig_ax`: rax holds the syscall return value by
-    // the time a fatal signal is delivered. -1 is what the x86_64 entry code
-    // leaves in that slot for a frame that did not come from a system call.
-    let frame = uctx.linux_pt_regs(!0);
-    let gregs = [
-        frame.r15,
-        frame.r14,
-        frame.r13,
-        frame.r12,
-        frame.bp,
-        frame.bx,
-        frame.r11,
-        frame.r10,
-        frame.r9,
-        frame.r8,
-        frame.ax,
-        frame.cx,
-        frame.dx,
-        frame.si,
-        frame.di,
-        frame.orig_ax,
-        frame.ip,
-        frame.cs,
-        frame.flags,
-        frame.sp,
-        frame.ss,
-    ];
-    regs[..gregs.len()].copy_from_slice(&gregs);
-    regs[21] = uctx.fs_base;
-    regs[22] = uctx.gs_base;
-    // The saved context has no legacy segment selectors; keep those slots zero.
-    regs[23..].fill(0);
-}
-
 // ---- Public API ----
 
 /// Generates an ELF core dump file at `/tmp/core.{pid}`.
@@ -286,7 +251,7 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         pr_fpvalid: 0,
         _pad1: 0,
     };
-    fill_gregs(uctx, &mut prstatus.pr_reg);
+    fill_gregs(uctx, !0, &mut prstatus.pr_reg);
 
     // ---- Build ELF header ----
     let mut e_ident = [0u8; 16];
@@ -455,7 +420,7 @@ mod tests {
         uctx.fs_base = 0x1234_5000;
         uctx.gs_base = 0x5678_9000;
         let mut regs = [!0u64; NUM_GREGS];
-        fill_gregs(&uctx, &mut regs);
+        fill_gregs(&uctx, !0, &mut regs);
 
         assert_eq!(regs[16], 0x1234, "rip");
         assert_eq!(regs[19], 0x7fff_f000, "rsp");

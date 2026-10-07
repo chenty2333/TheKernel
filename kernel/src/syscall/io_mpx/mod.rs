@@ -255,7 +255,7 @@ pub(crate) fn wait_io_result(
 ) -> AxResult<isize> {
     let curr = current();
     let thr = curr.as_thread();
-    let old_blocked = sigmask.map(|set| thr.signal.set_blocked(set));
+    let old_blocked = sigmask.map(|set| thr.signal.begin_temporary_mask(set));
 
     if let Some(uctx) = uctx.as_deref_mut() {
         // If a handler runs while the syscall is blocked, sigreturn must
@@ -272,8 +272,8 @@ pub(crate) fn wait_io_result(
         loop {
             match wait_once() {
                 Ok(Ok(res)) => {
-                    if let Some(old_blocked) = old_blocked {
-                        thr.signal.set_blocked(old_blocked);
+                    if old_blocked.is_some() {
+                        thr.signal.end_temporary_mask(true);
                     }
                     return Ok(res);
                 }
@@ -282,29 +282,32 @@ pub(crate) fn wait_io_result(
                         let handler_depth = thr.signal_handler_depth();
                         let handled = check_signals(thr, uctx, old_blocked);
                         if handled {
-                            if let Some(old_blocked) = old_blocked
-                                && thr.signal_handler_depth() == handler_depth
+                            if old_blocked.is_some() && thr.signal_handler_depth() == handler_depth
                             {
-                                thr.signal.set_blocked(old_blocked);
+                                thr.signal.end_temporary_mask(true);
+                            }
+                            if old_blocked.is_some() && thr.signal_handler_depth() != handler_depth
+                            {
+                                thr.signal.end_temporary_mask(false);
                             }
                             return Err(AxError::Interrupted);
                         }
                     } else if has_pending_syscall_signal(thr) {
-                        if let Some(old_blocked) = old_blocked {
-                            thr.signal.set_blocked(old_blocked);
+                        if old_blocked.is_some() {
+                            thr.signal.end_temporary_mask(true);
                         }
                         return Err(AxError::Interrupted);
                     }
                 }
                 Ok(Err(err)) => {
-                    if let Some(old_blocked) = old_blocked {
-                        thr.signal.set_blocked(old_blocked);
+                    if old_blocked.is_some() {
+                        thr.signal.end_temporary_mask(true);
                     }
                     return Err(err);
                 }
                 Err(_) => {
-                    if let Some(old_blocked) = old_blocked {
-                        thr.signal.set_blocked(old_blocked);
+                    if old_blocked.is_some() {
+                        thr.signal.end_temporary_mask(true);
                     }
                     return Ok(0);
                 }

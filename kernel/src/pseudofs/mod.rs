@@ -3,6 +3,12 @@
 mod block_inventory;
 mod block_statistics;
 pub mod cgroup;
+#[cfg(any(feature="pmu",feature="hwp-uclamp"))]
+mod cpu_idle;
+#[cfg(any(feature="pmu",feature="hwp-uclamp"))]
+mod cpu_frequency;
+#[cfg(any(feature="pmu",feature="hwp-uclamp"))]
+mod cpu_thermal;
 pub mod dev;
 mod device;
 pub(crate) mod device_registry;

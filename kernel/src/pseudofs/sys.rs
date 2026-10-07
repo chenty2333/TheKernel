@@ -34,6 +34,8 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     fs_dir.add("cgroup", empty_dir(fs.clone()));
 
     root.add("class", class_dir(fs.clone()));
+    #[cfg(any(feature="pmu",feature="hwp-uclamp"))]
+    root.add("class", super::cpu_thermal::class_dir(fs.clone()));
     root.add("block", block_dir(fs.clone()));
     root.add("dev", dev_dir(fs.clone()));
     root.add("devices", devices_dir(fs.clone()));
@@ -326,6 +328,8 @@ fn cpu_root_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         );
     }
 
+    #[cfg(any(feature="pmu",feature="hwp-uclamp"))]
+    super::cpu_idle::register(&fs, &mut cpu_root);
     SimpleDir::new_maker(fs, Arc::new(cpu_root))
 }
 

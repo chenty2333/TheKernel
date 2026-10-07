@@ -382,7 +382,14 @@ impl RestartTracker {
         }
 
         let state = self.restart_states.pop().unwrap();
-        if state.decision == RestartDecision::Restart {
+        // Ptrace can suppress the signal, or reinject one whose disposition
+        // drops it before delivery. No handler callback then selects a restart
+        // decision. At the final user edge this is Linux's no-handler case,
+        // not an observable EINTR. A debugger-written return value must win.
+        let no_handler_restart = state.decision == RestartDecision::Pending
+            && uctx.retval() == (-4isize) as usize
+            && state.class.decide_for_non_handler() == RestartDecision::Restart;
+        if state.decision == RestartDecision::Restart || no_handler_restart {
             state.action.restore(self, uctx);
         }
     }
@@ -410,12 +417,65 @@ impl RestartTracker {
         core::mem::take(&mut self.resume_restored_context)
     }
 
+    /// A debugger edits the live syscall frame, not an ancestor handler's
+    /// saved restart. Keep the private replay ledger coherent with that frame.
+    fn ptrace_update_registers(
+        &mut self,
+        original_ip: usize,
+        regs: &super::registers::GeneralRegisters,
+    ) {
+        let cancel = (regs[15] as i64) < 0;
+        let update = |saved: &mut SavedSyscall| {
+            saved.sysno = regs[15] as usize;
+            saved.args = [
+                regs[14] as usize,
+                regs[13] as usize,
+                regs[12] as usize,
+                regs[7] as usize,
+                regs[9] as usize,
+                regs[8] as usize,
+            ];
+            saved.return_ip = regs[16] as usize;
+            saved.restart_ip = saved.return_ip.saturating_sub(SYSCALL_INSN_LEN);
+        };
+        if let Some(current) = self.current_restart.as_mut()
+            && current.action.syscall.return_ip == original_ip
+        {
+            if cancel {
+                self.current_restart = None;
+                self.armed_restart_block = None;
+            } else {
+                update(&mut current.action.syscall);
+            }
+        }
+        if let Some(state) = self.restart_states.last_mut()
+            && state.action.syscall.return_ip == original_ip
+        {
+            if cancel {
+                self.restart_states.pop();
+                self.armed_restart_block = None;
+            } else {
+                update(&mut state.action.syscall);
+            }
+        }
+    }
+
     fn clear_saved_syscall(&mut self) {
         self.current_restart = None;
     }
 }
 
 impl Thread {
+    pub(crate) fn ptrace_update_restart_registers(
+        &self,
+        original_ip: usize,
+        regs: &super::registers::GeneralRegisters,
+    ) {
+        self.restart
+            .lock()
+            .ptrace_update_registers(original_ip, regs);
+    }
+
     pub(crate) fn enter_syscall(
         &self,
         uctx: &UserContext,
@@ -491,6 +551,43 @@ mod tests {
         uctx.set_arg4(0x55);
         uctx.set_arg5(0x66);
         uctx
+    }
+
+    #[test]
+    fn ptrace_restart_uses_changed_arguments_even_when_orig_rax_is_unchanged() {
+        let mut tracker = RestartTracker::try_new().unwrap();
+        let mut context = make_uctx(0x11, 0x77, 0x1000);
+        tracker.enter_syscall(&context, false, Some(RestartClass::Sys));
+        assert!(tracker.request_syscall_restart());
+        tracker.finish_signal_delivery(SignalOSAction::Continue, false);
+        let mut regs = [0; super::super::registers::NUM_GREGS];
+        super::super::registers::fill_gregs(&context, 0x77, &mut regs);
+        regs[14] = 0x99;
+        regs[13] = 0x88;
+        tracker.ptrace_update_registers(context.ip(), &regs);
+        tracker.finish_signal_resume(&mut context);
+        assert_eq!(context.arg0(), 0x99);
+        assert_eq!(context.arg1(), 0x88);
+        assert_eq!(context.sysno(), 0x77);
+        assert_eq!(context.ip(), 0x1000 - SYSCALL_INSN_LEN);
+    }
+
+    #[test]
+    fn ptrace_negative_orig_rax_cancels_only_the_current_restart_frame() {
+        let mut tracker = RestartTracker::try_new().unwrap();
+        let outer = make_uctx(0x11, 0x77, 0x1000);
+        tracker.enter_syscall(&outer, false, Some(RestartClass::Sys));
+        assert!(tracker.request_syscall_restart());
+        tracker.finish_signal_delivery(SignalOSAction::Handler, true);
+        let inner = make_uctx(0x22, 0x88, 0x4000);
+        tracker.enter_syscall(&inner, true, Some(RestartClass::Sys));
+        assert!(tracker.request_syscall_restart());
+        let mut regs = [0; super::super::registers::NUM_GREGS];
+        super::super::registers::fill_gregs(&inner, u64::MAX, &mut regs);
+        tracker.ptrace_update_registers(inner.ip(), &regs);
+        assert!(tracker.current_restart.is_none());
+        assert_eq!(tracker.restart_states.len(), 1);
+        assert_eq!(tracker.restart_states[0].action.syscall.sysno, 0x77);
     }
 
     #[test]
@@ -575,6 +672,37 @@ mod tests {
         assert_eq!(restored.ip(), 0x1000);
         assert_eq!(restored.retval(), (-4isize) as usize);
         assert!(!tracker.take_resume_restored_context());
+        assert!(tracker.restart_states.is_empty());
+    }
+
+    #[test]
+    fn no_handler_callback_after_ptrace_suppression_restarts_the_interruption() {
+        for class in [RestartClass::Sys, RestartClass::NoIntr, RestartClass::NoHand] {
+            let mut tracker = RestartTracker::try_new().unwrap();
+            let entry = make_uctx(0x11, 0x3d, 0x1000);
+            tracker.enter_syscall(&entry, false, Some(class));
+            assert!(tracker.request_syscall_restart());
+            let mut resumed = entry;
+            resumed.set_retval((-4isize) as usize);
+            // No signal delivery occurs: a ptracer suppressed its record.
+            tracker.finish_signal_resume(&mut resumed);
+            assert_eq!(resumed.sysno(), 0x3d);
+            assert_eq!(resumed.ip(), 0x1000 - SYSCALL_INSN_LEN);
+            assert!(tracker.restart_states.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_debugger_return_value_overrides_an_unresolved_restart_decision() {
+        let mut tracker = RestartTracker::try_new().unwrap();
+        let entry = make_uctx(0x11, 0x3d, 0x1000);
+        tracker.enter_syscall(&entry, false, Some(RestartClass::Sys));
+        assert!(tracker.request_syscall_restart());
+        let mut resumed = entry;
+        resumed.set_retval(42);
+        tracker.finish_signal_resume(&mut resumed);
+        assert_eq!(resumed.retval(), 42);
+        assert_eq!(resumed.ip(), 0x1000);
         assert!(tracker.restart_states.is_empty());
     }
 

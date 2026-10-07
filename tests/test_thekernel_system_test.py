@@ -136,6 +136,7 @@ class SystemTestGateTests(unittest.TestCase):
         product = load_product()
         for environment, flag, expected in (
             (None, "tcc", "tcc"),
+            ("none", "debug", "debug"),
             ("none", "tcc", "tcc"),
             ("tcc", "none", "none"),
             ("tcc", None, "tcc"),
@@ -182,6 +183,7 @@ class SystemTestGateTests(unittest.TestCase):
             # `gcc` is a superset: the compiler is a dynamic glibc program, so
             # the loader case runs in its image too and the image proves its own
             # prerequisite rather than assuming it.
+            "debug": ["-DTHEKERNEL_TOOL_PAYLOAD_DEBUG=1"],
             "gcc": ["-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1",
                     "-DTHEKERNEL_TOOL_PAYLOAD_GCC=1"],
         }
@@ -191,6 +193,7 @@ class SystemTestGateTests(unittest.TestCase):
             "nested": ["compiler-smoke", "nested-tcg-hello", "nested-linux-boot"],
             "glibc": ["glibc-smoke"],
             "gcc": ["glibc-smoke", "gcc-smoke"],
+            "debug": ["real-debugger", "real-gdb-threads", "real-cpu-tools"],
         }
         with test_tmpdir() as directory:
             for payload, flags in defines.items():
@@ -204,7 +207,7 @@ class SystemTestGateTests(unittest.TestCase):
                     text = result.stdout
                     present = [name for name in ("compiler-smoke", "nested-tcg-hello",
                                                  "nested-linux-boot", "glibc-smoke",
-                                                 "gcc-smoke")
+                                                 "gcc-smoke", "real-debugger", "real-gdb-threads", "real-cpu-tools")
                                if f'{{ "{name}",' in text]
                     self.assertEqual(present, expected[payload])
                     # Both payloads are supersets of `none`, so the baseline

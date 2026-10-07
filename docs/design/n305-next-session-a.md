@@ -199,3 +199,34 @@ MCFG 为 0xc0000000，FACS checksum 为 n/a，kernel-ecam 明确来源或 UNAVAI
 FADT/PNP0C0C 枚举保留实际状态；声卡 `/proc/asound/card*/codec#*` 交给 B。
 逐个看 capture-status，不用 PCI 控制器 ID 猜 codec。新 collector 未上真机。
 调度器 Reschedule 注册空档、B 的 NVMe/HDA/GT 及主机采集卡故障不在 A 本轮范围。
+
+## CPU power management — 未在硬件上验证
+
+- 本轮没有真机授权，不启动/改动 N305。以下步骤留给有授权的现场会话。
+- 先以 `cpuidle.mwait=0` 建立 HLT 排障基线，再移除该参数验证默认自动
+  MWAIT。`cpuidle.mwait=1` 等同默认，不强制绕过硬件/深度状态准入；非法
+  值或裸参数退回 HLT，重复参数最后一项生效。保持既有受保护的启动流程，
+  不开启固件 HWP，不改变 NVMe 策略。
+- 在每个 CPU 上核对 family6/modelBE、MONITOR、CPUID.5 扩展/中断唤醒/
+  子状态、实际状态表、稳定单调时钟和已编程的 LAPIC 定时器；不猜测未知
+  硬件。GMT 的 MWAIT C1（0x00）不可用，C1E 可以准入；缺少 ARAT 必须阻断
+  C6/C8/C10，不能通过 `=1` 或 sysfs disable 写入解禁。
+- 比较默认/强制关闭的 name/desc/latency/residency/disable/usage/time；
+  运行 CPU power 回归、各 CPU 定时器唤醒、跨 CPU futex 唤醒和持续负载。
+  关闭/不支持路径必须只有 HLT，默认 MWAIT 不得导致挂起、丢唤醒或校验错误。
+- 分别记录软件 entry/time、稳定性、硬件 core/package residency 和外部墙上
+  功耗/温度；前三者不能替代节能实测。固定工作负载且没有并发编译/VM 时
+  才比较实际功耗。上述真机项目均为“未在硬件上验证”。
+- Read cpufreq_supported, cpuinfo range and sampled current frequency. If HWP
+  is not firmware enabled, or the nominal reference/package-control policy
+  is unsupported, keep the unsupported result; do not bypass admission.
+  If supported, save initial settings, explicitly select powersave/EPP and a
+  bounded min/max, verify busy APERF/MPERF behavior and scheduler uclamp clipping
+  within policy bounds. Restore saved settings after the authorized experiment.
+  Verify that default scheduling never changes the firmware request.
+- Read coretemp hwmon labels/input/max/crit/crit_alarm and run `sensors`.
+  Compare core/package temperatures with firmware/reference readings; check
+  invalid DTS status and read-only permissions. Do not clear thermal log bits.
+- Run real cpupower frequency-info/idle-info. Measure power/temperature and
+  latency under fixed independent workloads, with no concurrent builds/VMs.
+  QEMU success and the software idle counters do not establish N305 savings.

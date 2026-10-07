@@ -579,6 +579,7 @@ class RunSpec:
     kernel_cmdline: str | None = None
     qemu_extra_args: tuple[str, ...] = ()
     powerdown_after_marker: str | None = None
+    cpu_pm: bool = False
 
 
 @isolated_run
@@ -670,6 +671,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
     result = run(
         RunConfig(
             arch="x86_64",
+            cpu_pm=spec.cpu_pm,
             kernel=artifacts.kernel,
             rootfs=(None if spec.usb_boot else selected_rootfs),
             rootfs_transport=spec.rootfs_transport,
@@ -897,6 +899,7 @@ def run_cmd(args: argparse.Namespace) -> int:
             graphics_height=height,
             audio_backend=getattr(args, "audio_backend", None),
             audio_device=getattr(args, "audio_device", "virtio"),
+            cpu_pm=getattr(args, "cpu_pm", False),
             kernel_cmdline=getattr(args, "kernel_cmdline", None),
             powerdown_after_marker=getattr(args,"powerdown_after_marker",None),
             qmp_timeout_secs=args.timeout,
@@ -926,6 +929,8 @@ def system_test_cmd(args: argparse.Namespace) -> int:
         artifacts,
         RunSpec(
             accel=args.accel,
+            cpu_pm=getattr(args, "cpu_pm", False),
+            kernel_cmdline=getattr(args, "guest_kernel_cmdline", None),
             timeout=args.timeout,
             qemu_debug=getattr(args, "qemu_debug", None),
             workdir=Path(args.workdir) if args.workdir else None,
@@ -1606,6 +1611,7 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
                         help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")
     parser.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
     parser.add_argument("--kernel-cmdline", help="append literal kernel arguments to a per-run GRUB config")
+    parser.add_argument("--cpu-pm", action="store_true", help="KVM: pass HLT/MWAIT power management to the guest")
     parser.add_argument("--powerdown-after-marker", help="inject the ACPI power button with QMP after a guest marker")
     parser.add_argument("--allow-reboot", action="store_true", help="allow real VM reboots for watchdog/reset tests")
     parser.add_argument("--interactive", action="store_true")
@@ -2231,6 +2237,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     test.add_argument("--run-cpus", type=int)
     test.add_argument("--kernel-cmdline", help="fbcon only: append literal boot arguments")
+    test.add_argument("--guest-kernel-cmdline", help="guest suite: append literal boot arguments")
+    test.add_argument("--cpu-pm", action="store_true", help="KVM guest: pass HLT/MWAIT power management through")
     test.add_argument("--allow-skip", action="store_true")
     test.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
     test.add_argument("--gdb", action="store_true",

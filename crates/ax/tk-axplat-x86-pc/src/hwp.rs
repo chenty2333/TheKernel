@@ -179,6 +179,7 @@ pub fn init_current() -> Result<(), Error> {
 /// observes the abort later in its lifecycle.
 pub fn abort_current() {
     abort_fleet();
+    if !crate::cpufreq::explicit_current() { return; }
     local(|state| {
         if state.prepared {
             write(IA32_HWP_REQUEST, state.saved_request);
@@ -226,6 +227,9 @@ pub fn apply_current_clamp(min: u16, max: u16) -> Result<(), Error> {
     if !fleet_active() {
         return Err(Error::Unsupported);
     }
+    let _guard = kernel_guard::NoPreemptIrqSave::new();
+    if !crate::cpufreq::explicit_current() { return Ok(()); }
+    let (min, max) = crate::cpufreq::merge_current_clamp(min, max)?;
     local(|state| {
         if !fleet_active() || !state.prepared {
             return Err(Error::Unsupported);
@@ -503,4 +507,24 @@ mod tests {
         // Restore writes the saved request verbatim, including policy bits.
         assert_eq!(saved, 0xabcd_0123_4567_89ef);
     }
+}
+
+/// Read-only per-CPU baseline before the fleet commits. Never enables HWP.
+pub fn prepared_request_current() -> Result<(Capabilities,u8,u64),Error> {
+    local(|state| {
+        if !state.prepared {return Err(Error::Unsupported);}
+        #[cfg(target_os="none")] let guaranteed=(read(IA32_HWP_CAPABILITIES)>>16) as u8;
+        #[cfg(not(target_os="none"))] let guaranteed=0;
+        Ok((state.caps,guaranteed,state.saved_request))
+    })
+}
+/// Apply only explicitly selected desired-performance/EPP bits, on the owner.
+pub fn set_policy_bits_current(desired:u8,epp:Option<u8>)->Result<(),Error> {
+    local(|state| {
+        if !fleet_active()||!state.prepared {return Err(Error::Unsupported);}
+        let old=read(IA32_HWP_REQUEST);let mut new=(old&!(0xff<<16))|(u64::from(desired)<<16);
+        if let Some(epp)=epp {new=(new&!(0xff<<24))|(u64::from(epp)<<24);}
+        if new!=old {write(IA32_HWP_REQUEST,new);}
+        Ok(())
+    })
 }

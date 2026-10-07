@@ -112,6 +112,7 @@ pub(in crate::task) struct JobControlState {
     pub(in crate::task) ptrace_session: Option<PtraceSession>,
     pub(in crate::task) continued: bool,
     pub(in crate::task) stop_reported: bool,
+    pub(in crate::task) stop_notified: bool,
 }
 
 impl JobControlState {
@@ -165,6 +166,7 @@ impl Default for JobControlState {
             ptrace_session: None,
             continued: false,
             stop_reported: false,
+            stop_notified: false,
         }
     }
 }
@@ -231,6 +233,8 @@ pub(in crate::task) struct PtraceControlState {
     pub(in crate::task) generation: u64,
     /// Whether the current relationship was created by `PTRACE_SEIZE`.
     pub(in crate::task) seized: bool,
+    pub(in crate::task) listening: bool,
+    pub(in crate::task) interrupt_pending: bool,
     pub(in crate::task) options: u32,
     pub(in crate::task) event_message: usize,
 }
@@ -284,6 +288,8 @@ impl PtraceControlState {
         });
         self.generation = generation;
         self.seized = seized;
+        self.listening = false;
+        self.interrupt_pending = false;
         self.options = initial_options;
         self.event_message = 0;
         Some(session)
@@ -301,6 +307,8 @@ impl PtraceControlState {
         }
         let relationship = self.relationship.take();
         self.seized = false;
+        self.listening = false;
+        self.interrupt_pending = false;
         self.options = 0;
         self.event_message = 0;
         relationship
@@ -411,6 +419,7 @@ mod tests {
             ptrace_session: Some(old),
             continued: false,
             stop_reported: false,
+            stop_notified: false,
         };
         assert!(job.is_ptrace_inactive_for(old));
         let old_report = job.stop_report_for(StopFilter::Session(old)).unwrap();
@@ -461,7 +470,9 @@ mod tests {
         // accidentally hidden merely because the parent is also a tracer.
         job.stop_kind = StopKind::JobControl;
         job.ptrace_session = None;
-        let report = job.stop_report_for(StopFilter::Natural { group: 9 }).unwrap();
+        let report = job
+            .stop_report_for(StopFilter::Natural { group: 9 })
+            .unwrap();
         assert!(!report.traced());
         assert_eq!(report.ptrace_session, None);
     }

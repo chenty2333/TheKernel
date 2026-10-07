@@ -148,7 +148,7 @@ impl TryFrom<Clone3Plan> for CloneArgs {
 
 pub fn sys_clone3(
     memory: UserMemoryCapability,
-    uctx: &UserContext,
+    uctx: &mut UserContext,
     args: *const u8,
     size: usize,
 ) -> AxResult<isize> {

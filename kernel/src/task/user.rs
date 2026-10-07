@@ -10,14 +10,14 @@ use tk_linux_signal::{SignalInfo, Signo};
 use super::{
     AsThread, TimerState, check_signals, do_exit, fail_closed_exit,
     force_rseq_fault_signal_current_thread, force_signal_current_thread, has_pending_fatal_signal,
-    has_pending_syscall_signal, set_timer_state, terminate_rseq_fault_current_thread, wait_if_stopped,
+    has_pending_syscall_signal, set_timer_state, terminate_rseq_fault_current_thread,
+    wait_if_stopped,
 };
 use crate::{
     mm::{
         PageFaultFailure, PageFaultResult, UserMemoryCapability, handle_user_page_fault,
         map_usercopy_error,
     },
-    syscall::handle_syscall,
 };
 
 /// Maps an `ExceptionKind::Other` exception to the correct POSIX signal using
@@ -47,6 +47,9 @@ fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
 /// but #CP does not update it; Linux reports the trapping instruction address
 /// in `si_addr` for that exception.
 fn map_exception_signal_info(exc_info: &ExceptionInfo, instruction_pointer: usize) -> SignalInfo {
+    if exc_info.vector == 1 && exc_info.error_code & (1 << 14) != 0 {
+        return SignalInfo::new_fault(Signo::SIGTRAP, linux_raw_sys::general::TRAP_TRACE as i32, instruction_pointer);
+    }
     if exc_info.vector == 21 {
         return control_protection_signal_info(instruction_pointer);
     }
@@ -113,6 +116,11 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     .map_err(map_usercopy_error);
             }
             while !thr.pending_exit() {
+                // Covers initial inherited stops and a new stop arriving while
+                // a prior value image is being retired. No user instruction
+                // follows a reportable image until a real resume opens the gate.
+                wait_if_stopped(thr, &mut uctx);
+                if thr.pending_exit() { break; }
                 // Cgroup/sysctl clamp writes commit their policy before
                 // attempting every live runqueue transaction. A task that
                 // was migrating during that bounded pass remains marked dirty
@@ -124,6 +132,8 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                 // `run_with_return_hook`; a Retry returns here with IRQs
                 // restored so task-context scheduling/fault handling can run
                 // before the next attempt.
+                thr.ptrace_orig_rax
+                    .store(u64::MAX, core::sync::atomic::Ordering::Release);
                 let reason = loop {
                     let aspace = thr.proc_data.aspace();
                     match uctx.run_with_return_hook(|uctx| {
@@ -133,6 +143,8 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                             // task-local. Refresh or invalidate it only at
                             // this IRQ-disabled final return edge so a
                             // migration cannot expose a prior task's ports.
+                            super::ptrace_runtime::prepare_user_step(thr, uctx);
+                            uctx.debug_registers = thr.hardware_debug.lock().image();
                             thr.install_user_io_permissions();
                         }
                         action
@@ -179,7 +191,11 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                 set_timer_state(&curr, TimerState::Kernel);
 
                 match reason {
-                    ReturnReason::Syscall => handle_syscall(&mut uctx),
+                    ReturnReason::Syscall => {
+                        thr.ptrace_orig_rax
+                            .store(uctx.sysno() as u64, core::sync::atomic::Ordering::Release);
+                        super::ptrace_runtime::handle_traced_syscall(thr, &mut uctx);
+                    }
                     ReturnReason::PageFault(addr, flags) => {
                         let aspace_handle = thr.proc_data.aspace();
                         let result =
@@ -230,10 +246,13 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     ReturnReason::Interrupt => {}
                     ReturnReason::Exception(exc_info) => {
                         crate::uprobe::abort_xol(&mut uctx);
-                        deliver_fatal_user_signal_info(map_exception_signal_info(
-                            &exc_info,
-                            uctx.ip() as usize,
-                        ));
+                        let watch_address = if exc_info.vector == 1 {
+                            thr.hardware_debug.lock().trap(exc_info.error_code)
+                        } else { None };
+                        let info = watch_address.filter(|_| exc_info.error_code & (1 << 14) == 0).map(|_| SignalInfo::new_fault(
+                            Signo::SIGTRAP, linux_raw_sys::general::TRAP_HWBKPT as i32, uctx.ip(),
+                        )).unwrap_or_else(|| map_exception_signal_info(&exc_info, uctx.ip()));
+                        deliver_fatal_user_signal_info(info);
                     }
                     r => {
                         warn!("Unexpected return reason: {r:?}");
@@ -382,6 +401,15 @@ mod tests {
             task_create_error(TaskCreateError::IdentifierExhausted),
             AxError::WouldBlock
         );
+    }
+
+    #[test]
+    fn debug_bs_status_uses_trace_code_and_the_saved_instruction_address() {
+        let exception = ExceptionInfo { vector: 1, error_code: 1 << 14, cr2: 0, address: 0x1234 };
+        let info = map_exception_signal_info(&exception, exception.address);
+        assert_eq!(info.signo(), Signo::SIGTRAP);
+        assert_eq!(info.code(), linux_raw_sys::general::TRAP_TRACE as i32);
+        assert_eq!(info.fault_address(), 0x1234);
     }
 
     #[test]

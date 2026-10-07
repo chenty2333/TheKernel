@@ -90,7 +90,9 @@ fn wait_pid_applies(viewer_pid_ns: &PidNamespace, pid: WaitPid, child: &Process)
 
 #[derive(Clone)]
 struct WaitCandidate {
-    process: Arc<Process>,
+    process: Option<Arc<Process>>,
+    task_exit: Option<Arc<crate::task::PtraceTaskExit>>,
+    task: Option<axtask::AxTaskRef>,
     /// Snapshot before reaping: the namespace PID binding is released by reap.
     visible_pid: Pid,
     allow_exit: bool,
@@ -99,10 +101,16 @@ struct WaitCandidate {
 
 #[derive(Clone)]
 enum WaitEvent {
+    TaskExited {
+        pid: Pid,
+        exit: Arc<crate::task::PtraceTaskExit>,
+        report: crate::task::PtraceTaskExitReport,
+    },
     Stopped {
         pid: Pid,
         stop: StopReport,
         proc_data: Arc<ProcessData>,
+        task: Option<axtask::AxTaskRef>,
     },
     Continued {
         pid: Pid,
@@ -112,6 +120,7 @@ enum WaitEvent {
         pid: Pid,
         child: Arc<Process>,
         snapshot: Arc<ZombieSnapshot>,
+        ptrace_session: Option<PtraceSession>,
     },
 }
 
@@ -119,7 +128,7 @@ impl WaitEvent {
     fn pid(&self) -> Pid {
         match self {
             WaitEvent::Stopped { pid, .. } | WaitEvent::Continued { pid, .. } => *pid,
-            WaitEvent::Exited { pid, .. } => *pid,
+            WaitEvent::Exited { pid, .. } | WaitEvent::TaskExited { pid, .. } => *pid,
         }
     }
 
@@ -130,6 +139,7 @@ impl WaitEvent {
             }
             WaitEvent::Continued { .. } => 0xffff,
             WaitEvent::Exited { snapshot, .. } => snapshot.wait_status,
+            WaitEvent::TaskExited { report, .. } => report.wait_status,
         }
     }
 
@@ -138,12 +148,27 @@ impl WaitEvent {
         viewer_user_ns: &crate::task::UserNamespace,
     ) -> WaitIdSiginfoFields {
         match self {
+            WaitEvent::TaskExited { pid, report, .. } => {
+                let (code, status) = decode_exit_code(report.wait_status);
+                WaitIdSiginfoFields {
+                    signo: SIGCHLD as i32,
+                    code: code as i32,
+                    pid: *pid as i32,
+                    uid: viewer_user_ns.from_kuid_munged(report.credential.ids().ruid),
+                    status,
+                }
+            }
             WaitEvent::Stopped {
                 pid,
                 stop,
                 proc_data,
+                task,
             } => {
-                let uid = viewer_user_ns.from_kuid_munged(proc_data.group_leader_cred().ids().ruid);
+                let cred = task.as_ref().map_or_else(
+                    || proc_data.group_leader_cred(),
+                    |task| task.as_thread().current_cred(),
+                );
+                let uid = viewer_user_ns.from_kuid_munged(cred.ids().ruid);
                 WaitIdSiginfoFields {
                     signo: SIGCHLD as i32,
                     code: if stop.traced() {
@@ -183,6 +208,8 @@ impl WaitEvent {
     fn usage(&self) -> TaskUsage {
         match self {
             WaitEvent::Exited { snapshot, .. } => snapshot.total_usage().into(),
+            WaitEvent::TaskExited { report, .. } => get_process_data(report.process)
+                .map_or(report.usage, |data| data.total_usage()),
             WaitEvent::Stopped { proc_data, .. } | WaitEvent::Continued { proc_data, .. } => {
                 proc_data.total_usage()
             }
@@ -318,7 +345,9 @@ fn matching_wait_candidates(
         if should_wait_for_child(&process, options) {
             ok += 1;
             candidates.push(WaitCandidate {
-                process,
+                task: None,
+                process: Some(process),
+                task_exit: None,
                 visible_pid,
                 allow_exit: true,
                 expected_ptrace_session: None,
@@ -336,32 +365,75 @@ fn matching_wait_candidates(
         {
             continue;
         }
-        let tracee_pid = reverse_link.tracee();
-        let Ok(tracee_data) = get_process_data(tracee_pid) else {
+        let tracee_id = reverse_link.tracee();
+        if let Some(exit) = proc_data.ptrace_task_exit(reverse_link) {
+            let Some(report) = exit.identity(reverse_link.session()) else {
+                continue;
+            };
+            let Some(visible_pid) = viewer_pid_ns
+                .visible_pid_for(&exit.pid_ns, exit.tid)
+                .filter(|visible| pid.matches(*visible, report.pgid))
+            else {
+                continue;
+            };
+            candidates.push(WaitCandidate {
+                process: None,
+                task_exit: Some(exit),
+                task: None,
+                visible_pid,
+                allow_exit: true,
+                expected_ptrace_session: Some(reverse_link.session()),
+            });
+            continue;
+        }
+        let task = crate::task::get_task(tracee_id).ok();
+        let tracee = task
+            .as_ref()
+            .map(|task| task.as_thread().proc_data.proc.clone())
+            .or_else(|| process_domain().ok()?.registry().get(reverse_link.process()));
+        let Some(tracee) = tracee else {
             proc_data.remove_ptrace_tracee(reverse_link);
             continue;
         };
-        if tracee_data.ptrace_session_if_traced_by_process(proc.pid())
-            != Some(reverse_link.session())
-        {
+        let session = task
+            .as_ref()
+            .and_then(|task| {
+                task.as_thread()
+                    .ptrace_session_if_traced_by_process(proc.pid())
+            })
+            .or_else(|| crate::task::retained_ptrace_exit_session(&tracee));
+        if session != Some(reverse_link.session()) {
             proc_data.remove_ptrace_tracee(reverse_link);
             continue;
         }
-        let tracee = &tracee_data.proc;
-        let Some(visible_pid) = wait_pid_applies(viewer_pid_ns, pid, tracee) else {
+        let visible_pid = task
+            .as_ref()
+            .and_then(|task| {
+                viewer_pid_ns.visible_pid_for(&task.as_thread().pid_ns(), task.as_thread().tid())
+            })
+            .or_else(|| visible_process_pid(viewer_pid_ns, &tracee));
+        let Some(visible_pid) =
+            visible_pid.filter(|visible| pid.matches(*visible, tracee.group().pgid()))
+        else {
             continue;
         };
         if let Some(candidate) = candidates
             .iter_mut()
-            .find(|candidate| candidate.process.pid() == tracee.pid())
+            .find(|candidate| candidate.visible_pid == visible_pid)
         {
             candidate.expected_ptrace_session = Some(reverse_link.session());
+            candidate.task = task;
             continue;
         }
+        let allow_exit = task
+            .as_ref()
+            .is_none_or(|task| task.as_thread().tid() == tracee.pid());
         candidates.push(WaitCandidate {
-            process: tracee.clone(),
+            process: Some(tracee),
+            task_exit: None,
+            task,
             visible_pid,
-            allow_exit: false,
+            allow_exit,
             expected_ptrace_session: Some(reverse_link.session()),
         });
     }
@@ -394,9 +466,16 @@ fn pidfd_wait_candidate(
     let visible_pid =
         visible_process_pid(viewer_pid_ns, &target).ok_or(AxError::from(LinuxError::ECHILD))?;
 
-    let expected_ptrace_session = get_process_data(target.pid())
+    let task = get_process_data(target.pid())
         .ok()
-        .and_then(|target| target.ptrace_session_if_traced_by_process(proc.pid()));
+        .and_then(|target| target.ptrace_leader_task());
+    let expected_ptrace_session = task
+        .as_ref()
+        .and_then(|task| {
+            task.as_thread()
+                .ptrace_session_if_traced_by_process(proc.pid())
+        })
+        .or_else(|| crate::task::retained_ptrace_exit_session(&target));
     let ptrace = expected_ptrace_session.is_some();
 
     // `P_PIDFD` takes `do_wait_pid()`'s PIDTYPE_TGID branch, which admits the
@@ -430,7 +509,9 @@ fn pidfd_wait_candidate(
     }
 
     Ok(WaitCandidate {
-        process: target,
+        task,
+        process: Some(target),
+        task_exit: None,
         visible_pid,
         allow_exit: true,
         expected_ptrace_session,
@@ -460,6 +541,23 @@ fn select_wait_event(
 ) -> Option<WaitEvent> {
     let selection = selection_for(options, wait_exited);
     for candidate in candidates {
+        if let Some(exit) = candidate.task_exit.as_ref() {
+            if selection.exited
+                && let Some(report) = candidate
+                    .expected_ptrace_session
+                    .and_then(|session| exit.report(session))
+            {
+                return Some(WaitEvent::TaskExited {
+                    pid: candidate.visible_pid,
+                    exit: exit.clone(),
+                    report,
+                });
+            }
+            continue;
+        }
+        let Some(process) = candidate.process.as_ref() else {
+            continue;
+        };
         // The exit path must not require process data. A process that has
         // exited but not yet been reaped is no longer registered, so
         // `get_process_data()` fails for exactly the candidates this loop is
@@ -467,7 +565,7 @@ fn select_wait_event(
         // hangs the parent in `wait4(2)` forever. Only the stop and continued
         // events need the registry entry, and a missing entry means neither is
         // reportable.
-        let proc_data = get_process_data(candidate.process.pid()).ok();
+        let proc_data = get_process_data(process.pid()).ok();
 
         // A stop is reportable when it belongs to this waiter's ptrace session
         // (if any) and either it is a ptrace stop — which is always reported —
@@ -475,26 +573,33 @@ fn select_wait_event(
         // `wait_task_stopped()`'s `if (!ptrace && !(wo->wo_flags & WUNTRACED))
         // return 0;`, with `ptrace` derived from the same session identity.
         let filter = stop_filter_for(candidate.expected_ptrace_session, waiter_group);
-        let stop = proc_data
+        let stop = candidate
+            .task
             .as_ref()
-            .and_then(|proc_data| proc_data.peek_stop_status(filter))
+            .and_then(|task| task.as_thread().peek_ptrace_stop_status(filter))
+            .or_else(|| {
+                proc_data
+                    .as_ref()
+                    .and_then(|proc_data| proc_data.peek_stop_status(filter))
+            })
             .filter(|stop| stop.traced() || selection.stopped);
 
         // `delay_group_leader()`: a zombie group leader is held back while any
         // of its threads is still alive, so its exit is reported only once the
         // whole thread group is gone.
-        let zombie = candidate
-            .process
+        let zombie = process
             .is_zombie()
-            .then(|| candidate.process.zombie_payload())
+            .then(|| process.zombie_payload())
             .flatten()
-            .filter(|_| {
-                !tk_linux_process::zombie_is_delayed(true, candidate.process.thread_count())
-            });
+            .filter(|_| !tk_linux_process::zombie_is_delayed(true, process.thread_count()));
 
         let event = tk_linux_process::select_child_event(
             tk_linux_process::WaitEventState {
-                exited: candidate.allow_exit && zombie.is_some(),
+                exited: candidate.allow_exit && zombie.is_some()
+                    && crate::task::ptrace_exit_report_matches(
+                        process,
+                        candidate.expected_ptrace_session,
+                    ),
                 // `stop` is already the per-child gate above, so the selection
                 // must not apply the `WUNTRACED` rule a second time: a ptrace
                 // stop is reported to a bare `wait4(2)` because
@@ -513,8 +618,9 @@ fn select_wait_event(
             Some(tk_linux_process::WaitEventKind::Exited) => {
                 return Some(WaitEvent::Exited {
                     pid: candidate.visible_pid,
-                    child: candidate.process.clone(),
+                    child: process.clone(),
                     snapshot: zombie?,
+                    ptrace_session: candidate.expected_ptrace_session,
                 });
             }
             Some(tk_linux_process::WaitEventKind::Stopped) => {
@@ -522,6 +628,7 @@ fn select_wait_event(
                     pid: candidate.visible_pid,
                     stop: stop?,
                     proc_data: proc_data?,
+                    task: candidate.task.clone(),
                 });
             }
             Some(tk_linux_process::WaitEventKind::Continued) => {
@@ -617,16 +724,47 @@ fn write_waitid_rusage(
 /// consumed wait event; WNOWAIT alone leaves it available to another waiter.
 fn claim_wait_event(event: &WaitEvent, parent: &ProcessData, nowait: bool) -> AxResult<bool> {
     if nowait {
-        return Ok(true);
+        return Ok(match event {
+            WaitEvent::TaskExited { exit, report, .. } => {
+                let link = crate::task::PtraceReverseLink::new(exit.tid, report.session);
+                parent
+                    .ptrace_task_exit(link)
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, exit))
+                    && exit.report(report.session).is_some()
+            }
+            WaitEvent::Exited {
+                child,
+                ptrace_session,
+                ..
+            } => {
+                child.is_zombie() && crate::task::ptrace_exit_report_matches(child, *ptrace_session)
+            }
+            _ => true,
+        });
     }
     match event {
+        WaitEvent::TaskExited { exit, report, .. } => {
+            return Ok(parent.claim_ptrace_task_exit(
+                crate::task::PtraceReverseLink::new(exit.tid, report.session),
+                exit,
+            ));
+        }
         WaitEvent::Stopped {
-            stop, proc_data, ..
+            stop,
+            proc_data,
+            task,
+            ..
         } => {
             // `claim_stop_status()` matches the report itself: a stop that a
             // later ptrace relationship replaced, or that another thread of the
             // group already reaped, must not be consumed by this waiter.
-            if proc_data.claim_stop_status(*stop).is_none() {
+            let claimed = if stop.traced() {
+                task.as_ref()
+                    .and_then(|task| task.as_thread().claim_ptrace_stop_status(*stop))
+            } else {
+                proc_data.claim_stop_status(*stop)
+            };
+            if claimed.is_none() {
                 return Ok(false);
             }
         }
@@ -636,8 +774,17 @@ fn claim_wait_event(event: &WaitEvent, parent: &ProcessData, nowait: bool) -> Ax
             }
         }
         WaitEvent::Exited {
-            child, snapshot, ..
+            child, snapshot, ptrace_session, ..
         } => {
+            if let Some(session) = ptrace_session {
+                match crate::task::claim_ptrace_exit(child, *session, parent) {
+                    None => return Ok(false),
+                    Some(false) => return Ok(true),
+                    Some(true) => {}
+                }
+            } else if !crate::task::ptrace_exit_report_matches(child, None) {
+                return Ok(false);
+            }
             if !reap_child(child)? {
                 return Ok(false);
             }
@@ -729,6 +876,7 @@ pub fn sys_waitpid(
             // else.
             let (event_kind, status) = match &event {
                 WaitEvent::Exited { snapshot, .. } => (1u32, snapshot.wait_status),
+                WaitEvent::TaskExited { report, .. } => (1u32, report.wait_status),
                 WaitEvent::Stopped { stop, .. } => (2, i32::from(stop.signal)),
                 WaitEvent::Continued { .. } => (3, 0),
             };

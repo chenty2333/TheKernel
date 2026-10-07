@@ -5,17 +5,20 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PtraceReverseLink {
 pub(crate)     tracee: Pid,
+    pub(crate) process: Pid,
 pub(crate)     session: PtraceSession,
 }
 
 impl PtraceReverseLink {
 pub(crate) fn new(tracee: Pid, session: PtraceSession) -> Self {
-        Self { tracee, session }
+        Self { tracee, process: tracee, session }
     }
 
 pub(crate) fn tracee(self) -> Pid {
         self.tracee
     }
+
+pub(crate) fn process(self) -> Pid { self.process }
 
 pub(crate) fn session(self) -> PtraceSession {
         self.session
@@ -24,12 +27,22 @@ pub(crate) fn session(self) -> PtraceSession {
 
 pub(crate) struct PtraceReverseLinkNode {
 pub(crate)     tracee: Pid,
+    pub(crate) process: Pid,
 pub(crate)     session: PtraceSession,
     /// Relationship owner retired while consuming an exit drain. Reusing the
     /// already allocated reverse-link node carries credential destruction to
     /// the caller's post-lifecycle boundary without allocating under locks.
-pub(crate)     retired_relationship: Option<PtraceRelationshipSnapshot>,
-pub(crate)     next: Option<Box<Self>>,
+    pub(crate) retired_relationship: Option<PtraceRelationshipSnapshot>,
+    pub(crate) task_exit: Option<Arc<PtraceTaskExit>>,
+    pub(crate) next: Option<Box<Self>>,
+}
+
+impl Drop for PtraceReverseLinkNode {
+    fn drop(&mut self) {
+        if let Some(exit) = self.task_exit.as_ref() {
+            exit.release_tid();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -152,7 +165,7 @@ impl PtraceReverseLinkDrain {
     /// lifecycle and task-parent publication gates without a new allocation.
 pub(crate) fn retain_next_retirement(
         &mut self,
-        retire: impl FnOnce(PtraceReverseLink) -> Option<PtraceRelationshipSnapshot>,
+        retire: impl FnOnce(PtraceReverseLink, bool) -> Option<PtraceRelationshipSnapshot>,
     ) -> bool {
         let Some(mut node) = self.next.take() else {
             return false;
@@ -160,9 +173,10 @@ pub(crate) fn retain_next_retirement(
         self.next = node.next.take();
         let link = PtraceReverseLink {
             tracee: node.tracee,
+            process: node.process,
             session: node.session,
         };
-        node.retired_relationship = retire(link);
+        node.retired_relationship = retire(link, node.task_exit.is_some());
         node.next = self.retained.take();
         self.retained = Some(node);
         true
@@ -178,6 +192,7 @@ impl Iterator for PtraceReverseLinkDrain {
         debug_assert!(node.retired_relationship.is_none());
         Some(PtraceReverseLink {
             tracee: node.tracee,
+            process: node.process,
             session: node.session,
         })
     }
@@ -213,8 +228,9 @@ pub(crate)     _guard: axsync::MutexGuard<'a, ()>,
 /// the same order prevents an attach from racing past the only exit cleanup or
 /// deadlocking it with the inverse `ptrace_actions -> process_lifecycle` order.
 pub(crate) struct PtracePublicationGuard<'a> {
-pub(crate)     owner: &'a ProcessData,
-pub(crate)     tracer_owner: Option<&'a ProcessData>,
+    pub(crate) owner: &'a ProcessData,
+    pub(crate) target: &'a super::super::Thread,
+    pub(crate) tracer_owner: Option<&'a ProcessData>,
     // Fields are declared in release order: action users leave before a new
     // lifecycle transition can enter.
 pub(crate)     _actions: axsync::MutexGuard<'a, ()>,

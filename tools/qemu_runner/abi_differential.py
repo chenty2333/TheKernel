@@ -333,7 +333,37 @@ CONTRACTS.update({
     "vector-io": ("raw-differential", "pass", "POSITION_TRAVELS_IN_POS_L POS_H_IS_IGNORED OFFSET_HALVES_ARE_COMBINED IOVCNT_UIO_MAXIOV_BOUND ZERO_IOVCNT_SUCCEEDS OFFSET_BEFORE_DESCRIPTOR COPY_FILE_RANGE_FLAG_MASK COPY_FILE_RANGE_ZERO_LENGTH_SUCCEEDS COPY_FILE_RANGE_OVERLAP_EINVAL"),
 })
 
+CONTRACTS.update({"ptrace-registers": ("raw-differential", "pass", "REGISTER_AND_FP_MUTATION")})
+
+CONTRACTS.update({"ptrace-listen": ("raw-differential", "pass", "LISTEN_RETRAP_AND_DEFERRED_INTERRUPT")})
+
+CONTRACTS.update({"ptrace-syscall": ("raw-differential", "pass", "ENTRY_EXIT_MUTATION_AND_EMULATION")})
+
+CONTRACTS.update({"ptrace-step": ("raw-differential", "pass", "INSTRUCTION_SYSCALL_AND_EMULATION_STEPS")})
+
+CONTRACTS.update({"ptrace-fork": ("raw-differential", "pass", "AUTOMATIC_INHERITANCE_AND_INITIAL_CHILD_STOP")})
+
+CONTRACTS.update({"ptrace-stop-ready": ("raw-differential", "pass", "REPORT_PRECEDES_NO_FURTHER_USER_EFFECTS")})
+
+CONTRACTS.update({"ptrace-exec": ("raw-differential", "pass", "EVENT_LEGACY_AND_SEIZED_EXEC_PROTOCOL")})
+
+CONTRACTS.update({"ptrace-breakpoint": ("raw-differential", "pass", "PRIVATE_TEXT_PATCH_TRAP_STEP_AND_RESTORE")})
+
+CONTRACTS.update({"ptrace-exit": ("raw-differential", "pass", "TRACER_FIRST_EXIT_WNOWAIT_AND_NATURAL_PARENT_HANDOFF")})
+
+CONTRACTS.update({"ptrace-threads": ("raw-differential", "pass", "TASK_EXACT_STOP_REGISTERS_RESUME_AND_EXIT")})
+
 PROGRAM_CASES = {
+    "ptrace-threads": ("ptrace-threads",),
+    "ptrace-exit": ("ptrace-exit",),
+    "ptrace-breakpoint": ("ptrace-breakpoint",),
+    "ptrace-exec": ("ptrace-exec",),
+    "ptrace-stop-ready": ("ptrace-stop-ready",),
+    "ptrace-fork": ("ptrace-fork",),
+    "ptrace-step": ("ptrace-step",),
+    "ptrace-syscall": ("ptrace-syscall",),
+    "ptrace-listen": ("ptrace-listen",),
+    "ptrace-registers": ("ptrace-registers",),
     "tty-job-control": ("tty-job-control",),
     "tty-termios": ("tty-termios",),
     "unix-write-credentials": ("unix-write-credentials",),
@@ -427,6 +457,16 @@ def selected_programs() -> tuple[str, ...]:
         )
     return selected
 PROGRAM_SUCCESS = {
+    "ptrace-threads": "THEKERNEL_PTRACE_THREADS_OK",
+    "ptrace-exit": "THEKERNEL_PTRACE_EXIT_HANDOFF_OK",
+    "ptrace-listen": "THEKERNEL_PTRACE_LISTEN_OK",
+    "ptrace-syscall": "THEKERNEL_PTRACE_SYSCALL_OK",
+    "ptrace-step": "THEKERNEL_PTRACE_STEP_OK",
+    "ptrace-stop-ready": "THEKERNEL_PTRACE_STOP_READY_OK",
+    "ptrace-fork": "THEKERNEL_PTRACE_FORK_OK",
+    "ptrace-exec": "THEKERNEL_PTRACE_EXEC_OK",
+    "ptrace-breakpoint": "THEKERNEL_PTRACE_BREAKPOINT_OK",
+    "ptrace-registers": "THEKERNEL_PTRACE_REGISTERS_DIFFERENTIAL_OK",
     "tty-job-control": "THEKERNEL_TTY_JOB_CONTROL_OK",
     "tty-termios": "THEKERNEL_TTY_TERMIOS_OK",
     "unix-write-credentials": "THEKERNEL_UNIX_WRITE_CREDENTIALS_OK",

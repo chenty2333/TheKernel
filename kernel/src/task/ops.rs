@@ -294,30 +294,45 @@ fn child_exit_signal_info(child: &Process, parent: &ProcessData, signo: Signo) -
     SignalInfo::new_child(signo, code as i32, pid, uid, status)
 }
 
-fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
+pub(crate) fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
+    notify_zombie_parent(child, None);
+}
+
+pub(crate) fn notify_detached_ptrace_zombie(child: &Arc<Process>, tracer: Pid) {
+    notify_zombie_parent(child, Some(tracer));
+}
+
+fn notify_zombie_parent(child: &Arc<Process>, detached_tracer: Option<Pid>) {
+    if detached_tracer.is_none() && super::process::retained_ptrace_exit_session(child).is_some() {
+        return;
+    }
     let Some(parent) = child.parent() else {
         return;
     };
     let Ok(parent_data) = get_process_data(parent.pid()) else {
         return;
     };
-    let child_autoreap = get_process_data(child.pid()).is_ok_and(|data| {
-        // A traced child still has to stop for its tracer, so `do_notify_parent()`
-        // only honours the bit for an untraced task.
-        data.autoreap() && data.ptrace_active_session().is_none()
-    });
+    let detached_from_own_parent = detached_tracer == Some(parent.pid());
+    let child_autoreap = super::process::retained_exit_autoreap(child)
+        || get_process_data(child.pid()).is_ok_and(|data| {
+            // A traced child retains terminal wait ownership until handoff.
+            data.autoreap() && data.ptrace_tracer().is_none()
+        });
 
     let (auto_reap, suppress_exit_signal) = if child_autoreap {
         // `do_notify_parent()` short-circuits on the child's own
         // `signal_struct::autoreap`: the exit signal is dropped and the child
         // is released as it exits, whatever the parent asked for.
         (true, true)
-    } else if child.exit_signal() == Some(Signo::SIGCHLD as u8) {
+    } else if detached_from_own_parent || child.exit_signal() == Some(Signo::SIGCHLD as u8) {
         parent_sigchld_autoreap(&parent_data)
     } else {
         (false, false)
     };
 
+    // Tracer teardown does not generate a second signal for its own child;
+    // reparenting will notify the new reaper. Its autoreap policy still applies.
+    let suppress_exit_signal = suppress_exit_signal || detached_from_own_parent;
     for step in child_exit_completion_steps(auto_reap, suppress_exit_signal)
         .into_iter()
         .flatten()
@@ -1062,24 +1077,20 @@ struct ProcessPtraceExitRetirements {
 struct ExitPtraceRetirements {
     thread_reverse_links: Option<super::process::PtraceReverseLinkDrain>,
     process: Option<ProcessPtraceExitRetirements>,
+    tracee_relationship: Option<PtraceRelationshipSnapshot>,
 }
 
-fn detach_ptrace_links_on_process_exit(proc_data: &ProcessData) -> ProcessPtraceExitRetirements {
-    let pid = proc_data.proc.pid();
+fn detach_ptrace_links_on_process_exit(thread: &Thread) -> ProcessPtraceExitRetirements {
+    let proc_data = &thread.proc_data;
     let traced_relationship = {
-        let ptrace_action = proc_data.lock_ptrace_actions();
-        let relationship = proc_data.clear_ptrace();
+        let ptrace_action = thread.lock_ptrace_actions();
+        super::process::retain_ptrace_exit(thread);
+        let relationship = thread.clear_ptrace();
         drop(ptrace_action);
         relationship
     };
-    if let Some(relationship) = traced_relationship.as_ref() {
-        let session = relationship.session();
-        if let Ok(tracer_data) = get_process_data(session.tracer) {
-            tracer_data.remove_ptrace_tracee(super::PtraceReverseLink::new(pid, session));
-        }
-    }
 
-    let reverse_links = detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees());
+    let reverse_links = detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees(), None);
     ProcessPtraceExitRetirements {
         _traced_relationship: traced_relationship,
         _reverse_links: reverse_links,
@@ -1088,12 +1099,23 @@ fn detach_ptrace_links_on_process_exit(proc_data: &ProcessData) -> ProcessPtrace
 
 fn detach_ptrace_reverse_links(
     mut links: super::process::PtraceReverseLinkDrain,
+    parent_publication: Option<&super::TaskParentPublicationGuard<'_>>,
 ) -> super::process::PtraceReverseLinkDrain {
-    while links.retain_next_retirement(|link| {
-        let Ok(tracee_data) = get_process_data(link.tracee()) else {
+    while links.retain_next_retirement(|link, terminal| {
+        // A retired nonleader has its own terminal owner; never release the
+        // group's leader report merely because session numbers coincide.
+        if terminal { return None; }
+        let Ok(tracee_task) = get_task(link.tracee()) else {
+            if let Ok(domain) = process_domain()
+                && let Some(process) = domain.registry().get(link.process())
+            {
+                super::process::release_ptrace_exit(&process, link.session(), parent_publication);
+            }
             return None;
         };
-        let ptrace_action = tracee_data.lock_ptrace_actions();
+        let tracee = tracee_task.as_thread();
+        let tracee_data = &tracee.proc_data;
+        let ptrace_action = tracee.lock_ptrace_actions();
         // kernel/ptrace.c `exit_ptrace()`, which is the tracer-side teardown
         // `forget_original_parent()` runs from `exit_notify()`:
         //
@@ -1111,12 +1133,19 @@ fn detach_ptrace_reverse_links(
         // delivered only after every ptrace guard is released: it wakes the
         // tracee and queues a signal, neither of which may happen under a spin
         // lock.
-        let exitkill = tracee_data.ptrace_exitkill_requested(link.session());
-        let retired_relationship = tracee_data.end_ptrace(link.session());
+        let exitkill = tracee.ptrace_exitkill_requested(link.session());
+        let retired_relationship = tracee.end_ptrace(link.session());
         drop(ptrace_action);
+        if retired_relationship.is_none() && tracee.is_thread_group_leader() {
+            super::process::release_ptrace_exit(
+                &tracee_data.proc,
+                link.session(),
+                parent_publication,
+            );
+        }
         if exitkill {
             let _ = send_signal_to_process(
-                link.tracee(),
+                tracee_data.proc.pid(),
                 Some(SignalInfo::new_kernel(Signo::SIGKILL)),
             );
         }
@@ -1128,8 +1157,12 @@ fn detach_ptrace_reverse_links(
 fn detach_ptrace_links_on_thread_exit(
     proc_data: &ProcessData,
     tracer_kernel_tid: Pid,
+    parent_publication: Option<&super::TaskParentPublicationGuard<'_>>,
 ) -> super::process::PtraceReverseLinkDrain {
-    detach_ptrace_reverse_links(proc_data.clear_ptrace_tracees_for_task(tracer_kernel_tid))
+    detach_ptrace_reverse_links(
+        proc_data.clear_ptrace_tracees_for_task(tracer_kernel_tid),
+        parent_publication,
+    )
 }
 
 /// Poll the timer
@@ -2029,11 +2062,8 @@ fn publish_final_process_exit(
         proc_data.group_leader_signal_owner(),
         |child| notify_reaper_of_inherited_zombie(&child),
         |batch| {
-            reparent_reaper = reparent_exact_children_from_core_batch(
-                departing,
-                task_parent_publication,
-                batch,
-            );
+            reparent_reaper =
+                reparent_exact_children_from_core_batch(departing, task_parent_publication, batch);
         },
     );
     (committed, reparent_reaper)
@@ -2254,6 +2284,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // the registered user area while a task is exiting (the mapping may have
     // already disappeared), so this path must not perform a user write.
     thr.reset_rseq_on_exit();
+    *thr.hardware_debug.lock() = Default::default();
     thr.proc_data.end_exec(tid);
     // Linux `do_exit()` calls `synchronize_group_exit()` before
     // `exit_signals()`, which makes the task "will free memory" observable
@@ -2372,7 +2403,22 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // A process PID must survive until its zombie is reaped, but every other
     // thread's namespace TID becomes reusable once its core membership is
     // gone. `exit_thread` above is that authoritative removal edge.
-    if tid != process.pid() {
+    let retained_task_exit = {
+        let action = thr.lock_ptrace_actions();
+        let retained = if thr.is_thread_group_leader() {
+            // The leader terminal report is delayed until the whole group dies.
+            super::process::retain_ptrace_exit(thr);
+            false
+        } else {
+            super::process::retain_ptrace_task_exit(thr, if process.is_group_exited() { process.exit_code() } else { exit_code })
+        };
+        if !final_thread {
+            ptrace_retirements.tracee_relationship = thr.clear_ptrace();
+        }
+        drop(action);
+        retained
+    };
+    if tid != process.pid() && !retained_task_exit {
         thr.proc_data.pid_ns().release_exited_thread(tid);
     }
     if final_exit.is_some() {
@@ -2405,6 +2451,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     ptrace_retirements.thread_reverse_links = Some(detach_ptrace_links_on_thread_exit(
         &thr.proc_data,
         thr.kernel_tid(),
+        task_parent_publication.as_ref(),
     ));
 
     // A non-final task death is independent of process liveness: notify its
@@ -2537,7 +2584,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         // Drop the retired slot before publishing close notifications/zombie.
         drop(closed_fds);
         crate::file::inotify::wait_current_close_notifications();
-        ptrace_retirements.process = Some(detach_ptrace_links_on_process_exit(&thr.proc_data));
+        ptrace_retirements.process = Some(detach_ptrace_links_on_process_exit(thr));
         task_parent_publication = Some(lock_task_parent_publication());
         let task_parent_guard = task_parent_publication
             .as_ref()
@@ -2567,8 +2614,31 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         let parent_data = parent
             .as_ref()
             .and_then(|parent| get_process_data(parent.pid()).ok());
+        let terminal_owner = super::process::ptrace_exit_notification(&thr.proc_data);
+        if let super::process::PtraceExitState::Pending(session) = terminal_owner {
+            if let Ok(tracer_data) = get_process_data(session.tracer) {
+                let tracer_is_real_parent = process.parent()
+                    .is_some_and(|parent| parent.pid() == session.tracer);
+                if let Some(signo) = super::process::ptrace_exit_notification_signal(
+                    process.exit_signal(), tracer_is_real_parent,
+                ).and_then(Signo::from_repr) {
+                    let _ = send_signal_to_process(
+                        session.tracer,
+                        Some(child_exit_signal_info(process, &tracer_data, signo)),
+                    );
+                }
+                super::process::mark_ptrace_exit_notified(&thr.proc_data, session);
+                tracer_data.child_exit_event.wake();
+            } else {
+                super::process::release_ptrace_exit(process, session, None);
+            }
+        }
         let (auto_reap, suppress_exit_signal) =
-            if thr.proc_data.autoreap() && thr.proc_data.ptrace_active_session().is_none() {
+            if terminal_owner != super::process::PtraceExitState::Untraced {
+                // The tracer gets the terminal report even if it ignores SIGCHLD.
+                // Its acknowledgement/teardown performs natural-parent handoff.
+                (false, true)
+            } else if thr.proc_data.autoreap() {
                 // `clone3(CLONE_AUTOREAP)` made this child self-reaping: it drops
                 // its exit signal and is released without becoming a zombie, so
                 // `wait()` on it reports ECHILD rather than a status.
@@ -2620,6 +2690,9 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // thread-pidfd resolver must never observe removed membership paired with
     // a still-live task flag and retry the retired task identity.
     thr.set_exit();
+    if retained_task_exit {
+        super::process::publish_ptrace_task_exit(thr);
+    }
     // Both non-final and final paths have released their graph gate by here.
     // Keep this defensive take adjacent to lifecycle release so future exit
     // edits cannot accidentally move credential free callbacks back under it.

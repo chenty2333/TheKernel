@@ -108,7 +108,11 @@ case "$PAYLOAD" in
         [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
         exec "$SCRIPT_DIR/build-gcc-payload.sh" --output "$OUTPUT"
         ;;
-    *) printf '%s\n' '--payload must be none, tcc, nested, glibc or gcc' >&2; exit 2 ;;
+    debug)
+        [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
+        exec "$SCRIPT_DIR/build-debug-payload.sh" --output "$OUTPUT" --source-cache "$SOURCE_CACHE"
+        ;;
+    *) printf '%s\n' '--payload must be none, tcc, nested, glibc, gcc or debug' >&2; exit 2 ;;
 esac
 
 # `none` is a valid request that produces an empty staging tree; the caller

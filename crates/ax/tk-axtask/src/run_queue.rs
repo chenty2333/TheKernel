@@ -2405,8 +2405,9 @@ fn request_reschedule_cpu(cpu_id: usize, task: &AxTaskRef) {
 
 /// Waits on this CPU's idle task until it may have work.
 ///
-/// The final check runs with interrupts disabled and the halt is `sti; hlt`,
-/// so a wake IPI arriving after the check ends the halt.  Checking with
+/// The final check runs with IRQs disabled. Admitted MWAIT breaks on masked
+/// interrupts; fallback HLT uses `sti; hlt`. Both preserve a wake IPI arriving
+/// after the check. Checking with
 /// interrupts enabled and then halting let such an IPI be serviced just
 /// before HLT, leaving the queued task waiting for the next timer tick.
 #[cfg(all(feature = "irq", feature = "smp"))]
@@ -2423,7 +2424,7 @@ pub(crate) fn idle_wait() {
     if preempt_pending || run_queue.load.snapshot().ready_tasks != 0 {
         axhal::asm::enable_irqs();
     } else {
-        axhal::asm::enable_irqs_and_wait();
+        axhal::cpu_idle_wait();
     }
 }
 
@@ -5876,3 +5877,6 @@ mod exited_queue_tests {
         assert_eq!(task.exit_queue_fault(), None);
     }
 }
+
+#[cfg(feature="hwp-uclamp")]
+pub(crate) fn refresh_cpu_power_policy(cpu: usize) { refresh_hwp_clamp_for_cpu(cpu); }

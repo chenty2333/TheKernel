@@ -3,15 +3,18 @@
 mod access;
 mod accounting;
 pub(crate) mod coredump;
-mod creds;
 pub(crate) mod cpu_stats;
+mod creds;
 mod exec_cred;
 mod futex;
+pub(crate) mod hardware_debug;
 mod jobctl;
 mod loadavg;
 pub(crate) use loadavg::proc_runnable_tasks;
 mod ops;
 mod process;
+pub(crate) mod ptrace_runtime;
+pub(crate) mod registers;
 mod resources;
 mod restart;
 mod rseq;
@@ -65,10 +68,12 @@ pub(crate) use self::{
         NetworkNamespace, PendingThreadPublication, PidNamespace, Process, ProcessAccessState,
         ProcessGroup, ProcessIdentity, ProcessImageAccessSnapshot, ProcessInitialAdmission,
         ProcessMmLayout, ProcessReparentBatch, ProcessThreadAdmission, PtraceReverseLink,
-        SemUndoState, Session, ThreadExitTransition, TimeNamespace, UTS_FIELD_LEN, UserNamespace,
-        UserNamespaceId, UtsNamespace, ZombieSchedulerSnapshot, ZombieSnapshot, init_process_domain,
+        PtraceTaskExit, PtraceTaskExitReport, SemUndoState, Session, ThreadExitTransition,
+        TimeNamespace, UTS_FIELD_LEN, UserNamespace, UserNamespaceId, UtsNamespace,
+        ZombieSchedulerSnapshot, ZombieSnapshot, claim_ptrace_exit, init_process_domain,
         is_exact_child_of_thread, prepare_session_sid_binding, process_domain, process_error,
-        process_identity_pid_ns, reap_process, release_dead_session_sid_binding, set_zombie_ioprio,
+        process_identity_pid_ns, ptrace_exit_report_matches, reap_process,
+        release_dead_session_sid_binding, retained_ptrace_exit_session, set_zombie_ioprio,
         set_zombie_nice, zombie_ioprio, zombie_pid_ns, zombie_rlimit, zombie_scheduler_state,
     },
     restart::*,
@@ -95,8 +100,6 @@ pub(crate) fn cred_error(error: CredError) -> axerrno::AxError {
         _ => axerrno::AxError::OperationNotPermitted,
     }
 }
-pub(crate) use self::thread::SchedulerSeed;
-pub(crate) use self::usermode_helper::*;
 pub use self::{
     accounting::*,
     futex::*,
@@ -109,6 +112,7 @@ pub use self::{
     timer::*,
     user::*,
 };
+pub(crate) use self::{thread::SchedulerSeed, usermode_helper::*};
 
 /// Linearizes creation/replacement of a task's `fs_struct` with namespace-root
 /// replacement. The required lock order is this gate, then an individual

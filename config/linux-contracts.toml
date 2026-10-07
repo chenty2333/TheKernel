@@ -3790,7 +3790,7 @@ status = "implemented"
 contract = "linux-pause"
 handler = "kernel/src/syscall/signal.rs:sys_pause"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/pause-smoke.c:main", "tests/guest/portable/signal-boundary-differential.c:main"]
+tests = ["tests/guest/tools/pause-smoke.c:main", "tests/guest/portable/signal-boundary-differential.c:main", "tests/guest/portable/ptrace-threads-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -4504,7 +4504,7 @@ status = "implemented"
 contract = "linux-clone"
 handler = "kernel/src/syscall/task/clone.rs:sys_clone"
 conditional = "explicit-none"
-tests = ["kernel/src/mm/aspace/tests.rs:fork_preserves_unfaulted_writable_file_bss_holes", "kernel/src/syscall/task/clone.rs:clone_validate_allows_detached_without_pidfd"]
+tests = ["kernel/src/mm/aspace/tests.rs:fork_preserves_unfaulted_writable_file_bss_holes", "kernel/src/syscall/task/clone.rs:clone_validate_allows_detached_without_pidfd", "kernel/src/syscall/task/clone.rs:ptrace_clone_event_uses_exit_signal_and_does_not_fall_back_from_vfork", "tests/guest/portable/ptrace-fork-differential.c:main"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 
@@ -4527,7 +4527,7 @@ status = "implemented"
 contract = "linux-fork"
 handler = "kernel/src/syscall/task/clone.rs:sys_fork"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/clone.rs:clone_validate_allows_detached_without_pidfd"]
+tests = ["kernel/src/syscall/task/clone.rs:clone_validate_allows_detached_without_pidfd", "kernel/src/syscall/task/clone.rs:ptrace_clone_event_uses_exit_signal_and_does_not_fall_back_from_vfork", "tests/guest/portable/ptrace-fork-differential.c:main"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 
@@ -4550,7 +4550,7 @@ status = "implemented"
 contract = "linux-vfork"
 handler = "kernel/src/syscall/task/clone.rs:sys_vfork"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/clone.rs:clone_validate_allows_detached_without_pidfd"]
+tests = ["kernel/src/syscall/task/clone.rs:clone_validate_allows_detached_without_pidfd", "kernel/src/syscall/task/clone.rs:ptrace_clone_event_uses_exit_signal_and_does_not_fall_back_from_vfork", "tests/guest/portable/ptrace-fork-differential.c:main"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 
@@ -4573,7 +4573,7 @@ status = "implemented"
 contract = "linux-execve"
 handler = "kernel/src/syscall/task/execve.rs:sys_execve"
 conditional = "explicit-none"
-tests = ["kernel/src/mm/elf_placement.rs:envelope_accounts_bss_gaps_and_nonzero_origin_without_bias_misalignment", "kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec", "kernel/src/pseudofs/proc_exe.rs:executable_link_marks_unlinked_inode_without_changing_display_name", "tests/guest/portable/mount-api-differential.c:main"]
+tests = ["kernel/src/mm/elf_placement.rs:envelope_accounts_bss_gaps_and_nonzero_origin_without_bias_misalignment", "kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec", "kernel/src/pseudofs/proc_exe.rs:executable_link_marks_unlinked_inode_without_changing_display_name", "tests/guest/portable/mount-api-differential.c:main", "kernel/src/task/process/ptrace_stop.rs:exec_event_legacy_and_seized_admission_are_distinct", "tests/guest/portable/ptrace-exec-differential.c:main"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 
@@ -4596,7 +4596,7 @@ status = "implemented"
 contract = "linux-execveat"
 handler = "kernel/src/syscall/task/execve.rs:sys_execveat"
 conditional = "explicit-none"
-tests = ["kernel/src/mm/elf_placement.rs:envelope_accounts_bss_gaps_and_nonzero_origin_without_bias_misalignment", "kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec", "kernel/src/pseudofs/proc_exe.rs:executable_link_marks_unlinked_inode_without_changing_display_name", "tests/guest/portable/mount-api-differential.c:main"]
+tests = ["kernel/src/mm/elf_placement.rs:envelope_accounts_bss_gaps_and_nonzero_origin_without_bias_misalignment", "kernel/src/syscall/task/execve.rs:exec_replaces_old_image_registers_and_tls", "kernel/src/mm/loader.rs:preflight_reads_dirty_cached_contents_not_stale_lower_inode", "tests/guest/portable/memfd-create-differential.c:test_anonymous_exec", "kernel/src/pseudofs/proc_exe.rs:executable_link_marks_unlinked_inode_without_changing_display_name", "tests/guest/portable/mount-api-differential.c:main", "kernel/src/task/process/ptrace_stop.rs:exec_event_legacy_and_seized_admission_are_distinct"]
 validation_gaps = ["Focused implementation tests do not establish complete raw task lifecycle behavior on both Linux7.2.3 and TheKernel guests"]
 limitations = ["explicit-none"]
 
@@ -8092,9 +8092,9 @@ status = "partial"
 contract = "linux-ptrace"
 handler = "kernel/src/syscall/task/ptrace.rs:sys_ptrace"
 conditional = "explicit-none"
-tests = ["kernel/src/task/access.rs:process_access_ptrace_enforces_dumpability_image_owner_and_commoncap", "tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["the registered case probes PTRACE_GETREGSET with an unknown type only, which both guests refuse with EINVAL, so it cannot see the missing selectors or the missing request arms"]
-limitations = ["PTRACE_PEEKUSER, PTRACE_POKEUSER and PTRACE_LISTEN return fixed EIO; the regset selector admits only NT_X86_SHSTK, so NT_PRSTATUS, NT_PRFPREG and NT_X86_XSTATE are refused; PTRACE_GETREGS, PTRACE_SETREGS, PTRACE_PEEKSIGINFO, PTRACE_GETSIGMASK and PTRACE_SETSIGMASK have no request arm and fall through to EIO"]
+tests = ["kernel/src/task/hardware_debug.rs:debug_validation_and_virtual_status", "kernel/src/task/access.rs:process_access_ptrace_enforces_dumpability_image_owner_and_commoncap", "kernel/src/task/registers.rs:general_register_layout_roundtrip_and_privilege_filter", "kernel/src/task/ptrace_runtime.rs:syscall_skip_uses_entry_work_not_the_resume_request", "kernel/src/task/restart.rs:ptrace_restart_uses_changed_arguments_even_when_orig_rax_is_unchanged", "kernel/src/task/restart.rs:ptrace_negative_orig_rax_cancels_only_the_current_restart_frame", "kernel/src/task/restart.rs:no_handler_callback_after_ptrace_suppression_restarts_the_interruption", "kernel/src/task/process/ptrace_task_exit.rs:task_terminal_identity_is_not_reportable_before_notification", "kernel/src/task/process/ptrace_task_exit.rs:reverse_node_teardown_releases_tid_even_with_a_retained_snapshot", "crates/linux/signal/src/pending.rs:pending_snapshot_keeps_cross_signal_arrival_order_and_does_not_dequeue", "crates/linux/signal/src/api/thread.rs:ptrace_replaces_temporary_restore_mask_and_filters_unblockable_signals", "tests/guest/portable/ptrace-registers.c:main", "tests/guest/portable/ptrace-registers-differential.c:main", "tests/guest/portable/ptrace-listen-differential.c:main", "tests/guest/portable/ptrace-syscall-differential.c:main", "tests/guest/portable/ptrace-step-differential.c:main", "tests/guest/portable/ptrace-stop-ready-differential.c:main", "tests/guest/portable/ptrace-fork-differential.c:main", "tests/guest/portable/ptrace-exec-differential.c:main", "tests/guest/portable/ptrace-breakpoint-differential.c:main", "tests/guest/portable/ptrace-exit-differential.c:main", "tests/guest/portable/ptrace-threads-differential.c:main", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["the paired sysadmin case covers request admission but not complete register transfer; the paired register regression covers GPR/FP mutation, signal masks and private/shared queued siginfo; temporary-mask restoration has host helper coverage and paused-task ptrace stop/resume plus exec retirement have paired coverage; other blocked-wait debugger/restart combinations need more validation; real Alpine gdb basic batch, hardware watch mutation stops and strace-f fork/exec/file tracing have guest coverage; tracer-first exit, repeated WNOWAIT, natural-parent handoff and non-final tracer-task teardown have paired coverage; real Alpine GDB multithread listing, thread switching, distinct stacks/registers and normal exits have guest coverage; task-exact independent stops/registers/resume/exits and nonleader exec have paired coverage; repeated nonleader WNOWAIT and paused leader/nonleader exec passed in the complete TheKernel ABI guest; the complete paired suite remains blocked by the unchanged Linux socket timeout oracle assertion"]
+limitations = ["PTRACE_GETREGS/SETREGS and NT_PRSTATUS transfer a stopped user-context snapshot; CS/SS are restricted to the native long-mode descriptors; legacy data selectors require present ring-3 GDT/LDT data or readable code; FS/GS selector loads preserve the explicit saved bases; RIP/RSP writes outside the lower canonical user range return EIO because the user return path has no bad-IRET recovery; DR0-DR3/DR6/DR7 user comparators and TRAP_HWBKPT are supported; ptrace hardware controls and perf breakpoint descriptors conservatively exclude each other globally with EBUSY rather than sharing slots; forced POKETEXT/POKEDATA admits private RX executable COW mappings including ELF loader backings, while ordinary writes retain VMA permission checks; general Linux FOLL_FORCE writes to other protected private mappings are not implemented; seized LISTEN retains a non-accessible stop until INTERRUPT/SIGCONT re-traps it; GETFPREGS/SETFPREGS, NT_PRFPREG and CPU-sized standard NT_X86_XSTATE are supported; PEEKSIGINFO and GETSIGMASK/SETSIGMASK support queued records and temporary-mask restoration; SYSCALL entry/exit and SYSEMU skip semantics are supported for stopped user contexts; SINGLESTEP/SYSEMU_SINGLESTEP use TF with instruction and synthetic syscall-step traps; SINGLEBLOCK is unsupported; ptrace wait reports and notifications require owner context publication, with no further user execution before resume; fork/vfork/clone events including CLONE_THREAD automatically inherit tracing and park the child before its first user instruction; CLONE_UNTRACED suppresses both; TRACEEXEC emits event 4 with the former visible TID, legacy non-seized exec emits a delivery trap and seized exec without the option emits none; terminal tracing survives runtime teardown in a value-only durable owner; tracer acknowledgement hands a zombie to its natural parent, while a direct-parent tracer reaps once; relationships, private signal stops/options, GPR/FP images and resume actions are task-local; nonleader terminal snapshots retain no live task/mm and release namespace TID identity on acknowledgement/teardown; exact nonleader exec uses retained group identity, not the retired scheduler TID; group-leader terminal delay across unreaped ptraced nonleaders and final group rusage refresh after runtime teardown need further Linux parity work; suppressed/ignored-signal interruptions restart before user return but syscall-exit tracing still exposes EINTR instead of Linux internal ERESTART* codes; shared signal delivery routing still chooses the retained leader"]
 
 [[contract]]
 id = "linux-acct"
@@ -8370,7 +8370,7 @@ handler = "kernel/src/syscall/task/perf.rs:sys_perf_event_open"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/perf.rs:perf_clock_selection_accepts_only_the_monotonic_backend_clock"]
 validation_gaps = ["Observer use exercises a subset of software/tracepoint events; complete attribute, sampling, lifecycle and accounting differential verification remains missing"]
-limitations = ["Task sigtrap, namespace records, exclude_idle and PERF_SAMPLE_CGROUP are unsupported; perf ring VMA partial splits are not rejected as Linux requires, and repeated same-ring mmap charge behavior is not fully aligned"]
+limitations = ["Perf hardware breakpoint descriptors and active ptrace DR7 comparators exclude each other globally with EBUSY until a shared slot allocator exists; Task sigtrap, namespace records, exclude_idle and PERF_SAMPLE_CGROUP are unsupported; perf ring VMA partial splits are not rejected as Linux requires, and repeated same-ring mmap charge behavior is not fully aligned"]
 
 [[contract]]
 id = "linux-umount2"
@@ -8506,7 +8506,7 @@ status = "partial"
 contract = "linux-wait4"
 handler = "kernel/src/syscall/task/wait.rs:sys_waitpid"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/vfork-smoke.c:wait_success", "tests/guest/portable/wait-abi-differential.c:main"]
+tests = ["tests/guest/portable/vfork-smoke.c:wait_success", "tests/guest/portable/wait-abi-differential.c:main", "tests/guest/portable/ptrace-exit-differential.c:main", "tests/guest/portable/ptrace-threads-differential.c:main"]
 validation_gaps = ["the wait-abi raw differential exercises the same-thread, sibling-thread, any-live, own-live and zombie-group verdicts"]
 limitations = ["when several threads of the reaper process are live, the retained replacement identity is the lowest TID, where Linux's find_alive_thread() takes the first non-PF_EXITING thread in creation order; the two agree unless the lowest-TID thread is itself exiting, so a child reparented to such a process can be visible to a different set of waiters than Linux would choose"]
 
@@ -8529,7 +8529,7 @@ status = "implemented"
 contract = "linux-waitid"
 handler = "kernel/src/syscall/task/wait.rs:sys_waitid"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/ioprio-smoke.c:test_zombie_ioprio", "tests/guest/portable/wait-abi-differential.c:main"]
+tests = ["tests/guest/tools/ioprio-smoke.c:test_zombie_ioprio", "tests/guest/portable/wait-abi-differential.c:main", "tests/guest/portable/ptrace-exit-differential.c:main"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
@@ -8644,7 +8644,7 @@ status = "implemented"
 contract = "linux-clone3"
 handler = "kernel/src/syscall/task/clone3.rs:sys_clone3"
 conditional = "explicit-none"
-tests = ["kernel/src/mm/aspace/tests.rs:fork_preserves_unfaulted_writable_file_bss_holes", "kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
+tests = ["kernel/src/mm/aspace/tests.rs:fork_preserves_unfaulted_writable_file_bss_holes", "kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main", "kernel/src/syscall/task/clone.rs:ptrace_clone_event_uses_exit_signal_and_does_not_fall_back_from_vfork"]
 validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 

@@ -53,10 +53,10 @@ impl UserContext {
             // x86_64 long-mode user code/data selectors used by the native
             // Linux ABI. Signal restore additionally requires them to match
             // the embedding context, so these are never trusted blindly.
-            cs: 0x23,
+            cs: 0x33,
             rflags: 1 << 9,
             rsp: stack_pointer as u64,
-            ss: 0x1b,
+            ss: 0x2b,
             ..Self::default()
         }
     }

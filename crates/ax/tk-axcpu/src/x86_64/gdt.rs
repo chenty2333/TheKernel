@@ -1,11 +1,11 @@
 use core::arch::asm;
 
 use x86_64::{
+    PrivilegeLevel,
     addr::VirtAddr,
     instructions::tables::load_tss,
-    registers::segmentation::{Segment, SegmentSelector, CS},
+    registers::segmentation::{CS, Segment, SegmentSelector},
     structures::tss::TaskStateSegment,
-    PrivilegeLevel,
 };
 
 /// The x86 TSS IST slot dedicated to non-maskable interrupts.
@@ -90,27 +90,32 @@ static IST_STACKS: IstStacks = IstStacks::new();
 
 #[repr(C, align(16))]
 struct CpuGdt {
-    entries: [u64; 9],
+    entries: [u64; 11],
 }
 impl CpuGdt {
     const fn new() -> Self {
-        Self { entries: [0; 9] }
+        Self { entries: [0; 11] }
     }
 }
 
 #[percpu::def_percpu]
 static GDT: CpuGdt = CpuGdt::new();
+#[percpu::def_percpu]
+static LDT_BASE: usize = 0;
+#[percpu::def_percpu]
+static LDT_BYTES: usize = 0;
 
 /// Kernel code segment for 64-bit mode.
 pub const KCODE64: SegmentSelector = SegmentSelector::new(1, PrivilegeLevel::Ring0);
 /// Kernel data segment.
 pub const KDATA: SegmentSelector = SegmentSelector::new(2, PrivilegeLevel::Ring0);
 /// User data segment.
-pub const UDATA: SegmentSelector = SegmentSelector::new(3, PrivilegeLevel::Ring3);
+pub const UDATA: SegmentSelector = SegmentSelector::new(5, PrivilegeLevel::Ring3);
 /// User code segment for 64-bit mode.
-pub const UCODE64: SegmentSelector = SegmentSelector::new(4, PrivilegeLevel::Ring3);
+pub const UCODE64: SegmentSelector = SegmentSelector::new(6, PrivilegeLevel::Ring3);
 /// Reserved two-entry, per-CPU LDT system descriptor.
-pub const LDT: SegmentSelector = SegmentSelector::new(7, PrivilegeLevel::Ring0);
+pub const LDT: SegmentSelector = SegmentSelector::new(9, PrivilegeLevel::Ring0);
+const TSS_SELECTOR: SegmentSelector = SegmentSelector::new(7, PrivilegeLevel::Ring0);
 
 #[repr(C, packed)]
 struct GdtPointer {
@@ -173,6 +178,28 @@ unsafe fn refresh_ldt_data_segments(base: *const u8, bytes: usize) {
     refresh!("es");
 }
 
+/// Sanitize a saved data selector against the currently installed descriptors.
+/// Caller pins this CPU with IRQs disabled; load_ldt's owner retains the table.
+pub(super) fn sanitize_user_data_selector(selector: u16) -> u16 {
+    if selector == 0 {
+        return 0;
+    }
+    if selector & 4 == 0 {
+        return if [UDATA.index(), UCODE64.index()].contains(&(selector >> 3)) {
+            selector
+        } else {
+            0
+        };
+    }
+    let base = unsafe { *LDT_BASE.current_ref_raw() } as *const u8;
+    let bytes = unsafe { *LDT_BYTES.current_ref_raw() };
+    if ldt_data_selector_is_usable(base, bytes, selector) {
+        selector
+    } else {
+        0
+    }
+}
+
 /// Installs the current task's I/O permissions for the imminent user return.
 ///
 /// The caller must have disabled preemption and interrupts. A TSS belongs to
@@ -212,8 +239,11 @@ pub(super) fn init() {
     let gdt = unsafe { GDT.current_ref_mut_raw() };
     gdt.entries[1] = 0x00af9b000000ffff;
     gdt.entries[2] = 0x00cf93000000ffff;
-    gdt.entries[3] = 0x00cff3000000ffff;
-    gdt.entries[4] = 0x00affb000000ffff;
+    // Keep the kernel selectors unchanged during GDT reload. User slots
+    // match Linux amd64; GDB uses CS=0x33 to distinguish 64-bit inferiors.
+    // Slots 3/4 stay null: this product does not admit compatibility mode.
+    gdt.entries[5] = 0x00cff3000000ffff;
+    gdt.entries[6] = 0x00affb000000ffff;
     let tss_storage = unsafe { TSS.current_ref_mut_raw() };
     for (slot, stack) in ist_stacks.0.iter().enumerate() {
         // IST stacks grow downward, so the table names each one's top.
@@ -224,14 +254,14 @@ pub(super) fn init() {
     let limit =
         (core::mem::size_of::<TaskStateSegment>() + IO_BITMAP_BYTES + IO_BITMAP_TERMINATOR_BYTES
             - 1) as u64;
-    gdt.entries[5] = (limit & 0xffff)
+    gdt.entries[7] = (limit & 0xffff)
         | ((base & 0xffffff) << 16)
         | (9 << 40)
         | (1 << 47)
         | (((limit >> 16) & 0xf) << 48)
         | (((base >> 24) & 0xff) << 56);
-    gdt.entries[6] = base >> 32;
-    let tss = SegmentSelector::new(5, PrivilegeLevel::Ring0);
+    gdt.entries[8] = base >> 32;
+    let tss = TSS_SELECTOR;
     load_gdt(gdt);
     unsafe {
         CS::set_reg(KCODE64);
@@ -244,9 +274,13 @@ pub(super) fn init() {
 pub unsafe fn load_ldt(base: *const u8, bytes: usize) {
     debug_assert!(!crate::asm::irqs_enabled());
     let gdt = unsafe { GDT.current_ref_mut_raw() };
+    unsafe {
+        *LDT_BASE.current_ref_mut_raw() = base as usize;
+        *LDT_BYTES.current_ref_mut_raw() = bytes;
+    }
     if bytes == 0 {
-        gdt.entries[7] = 0;
-        gdt.entries[8] = 0;
+        gdt.entries[9] = 0;
+        gdt.entries[10] = 0;
         let selector: u16 = 0;
         unsafe {
             asm!("lldt {0:x}", in(reg) selector, options(nostack, preserves_flags));
@@ -257,16 +291,32 @@ pub unsafe fn load_ldt(base: *const u8, bytes: usize) {
     let table_base = base;
     let base = base as u64;
     let limit = (bytes - 1) as u64;
-    gdt.entries[7] = (limit & 0xffff)
+    gdt.entries[9] = (limit & 0xffff)
         | ((base & 0xffffff) << 16)
         | (2 << 40)
         | (1 << 47)
         | (((limit >> 16) & 0xf) << 48)
         | (((base >> 24) & 0xff) << 56);
-    gdt.entries[8] = base >> 32;
+    gdt.entries[10] = base >> 32;
     let selector = LDT.0;
     unsafe {
         asm!("lldt {0:x}", in(reg) selector, options(nostack, preserves_flags));
     }
     unsafe { refresh_ldt_data_segments(table_base, bytes) };
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+    #[test]
+    fn linux_amd64_user_selectors_do_not_overlap_system_descriptors() {
+        assert_eq!(KCODE64.0, 0x08);
+        assert_eq!(KDATA.0, 0x10);
+        assert_eq!(UDATA.0, 0x2b);
+        assert_eq!(UCODE64.0, 0x33);
+        assert_eq!(TSS_SELECTOR.index(), 7);
+        assert_eq!(LDT.index(), 9);
+        assert!(LDT.index() as usize + 1 < CpuGdt::new().entries.len());
+        assert_eq!(UDATA.0 + 8, UCODE64.0);
+    }
 }

@@ -260,3 +260,34 @@ The original Apache-2.0 builder/tests never replace baseline init or accounts.
 The container image restores shadow-subids' original signed-package binary
 file-capability attributes inside its offline ext4 image. The host staging tree
 is not made privileged, and the original helper binaries remain unmodified.
+
+## Optional Alpine debug payload (Codex A, 2026-10-05)
+
+The `debug` payload stages unmodified signed Alpine v3.24 x86_64 packages using
+an Alpine 3.24.1 minirootfs bootstrap. `config/guest-debug-apk-pins.tsv` records
+the exact package versions, source URLs, reproducibility checksums, SPDX license
+expressions and origins from Alpine's signed package metadata. Native apk verifies
+signatures before extraction; no package scripts or host installation run.
+
+GDB 16.3-r4 declares GPL-3.0-or-later AND LGPL-3.0-or-later; strace 6.19-r1 declares
+BSD-3-Clause; musl declares MIT and Python PSF-2.0. Dependencies retain their
+original package payloads/notices, with their individual declarations recorded in
+the pin file copied into the guest. This is optional userspace, not Rust kernel
+source or a change to the kernel license. Redistribution must satisfy each
+package's license and corresponding-source requirements where applicable;
+Alpine package origins identify the build recipes and upstream source projects.
+
+### CPU power diagnostic payload
+
+The debug guest optionally includes unmodified, Alpine-signed `cpupower`
+7.1.5-r0 (GPL-2.0-only, origin linux-tools) and lm-sensors3.6.0-r5
+(GPL-2.0-or-later/LGPL-2.1-or-later), with their musl/libcap/libintl/libnl3/
+pciutils/sysfsutils runtime closure. Exact package/source-origin/license rows
+are in `config/guest-power-apk-pins.tsv`; `scripts/build-power-payload.sh`
+verifies pins and Alpine signatures before extraction, using the same checksum-pinned
+Alpine3.24.1 bootstrap as the debugger payload. No package maintainer scripts,
+host installation, sensors-detect or kernel-linked GPL code are introduced.
+Corresponding sources are the Alpine v3.24 aports linux-tools/lm-sensors and
+listed dependency origins; upstream versions and Alpine package revisions are
+preserved in the manifest. `/opt/thekernel-tools/POWER-PACKAGES.tsv` accompanies
+the binaries. The new kernel Rust only implements architectural facts/behavior.

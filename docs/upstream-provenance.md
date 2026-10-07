@@ -459,8 +459,8 @@ what it was forked from.
 
 `kernel/src/**` is not covered by any `NOTICE`, and this pass did not triage it
 site by site. Measured, so the owner starts from numbers rather than an
-estimate: **89 verbatim Linux lines in 43 fenced blocks across 20 files at
-≥ 40**, **166 lines / 53 blocks / 26 files at ≥ 25**. The 2026-09-28 re-scan
+estimate: **86 verbatim Linux lines in 42 fenced blocks across 20 files at
+≥ 40**, **159 lines / 52 blocks / 26 files at ≥ 25**. The 2026-09-28 re-scan
 accounts for the split of `mm/aspace/mod.rs` quotations between `map.rs` and
 `query.rs`: file counts increase by one at both thresholds, while line and
 block counts stay unchanged. The `io_uring.rs` allowlisted citation above also
@@ -470,7 +470,7 @@ counts any category and so includes comment-only files:
 
 | Subtree | ≥ 40 fenced lines / blocks / files | ≥ 25 fenced lines / blocks / files | ≥ 40 outside fences: doc / `//` / `code` |
 | --- | --- | --- | --- |
-| `syscall/` | 65 / 31 / 29 | 116 / 37 / 34 | 5 / 108 / 8 |
+| `syscall/` | 62 / 30 / 29 | 109 / 36 / 34 | 5 / 108 / 8 |
 | `task/` | 9 / 5 / 4 | 16 / 5 / 5 | 0 / 1 / 0 |
 | `mm/` | 9 / 3 / 3 | 14 / 4 / 4 | 0 / 0 / 0 |
 | `mounts.rs` | 5 / 3 / 1 | 13 / 3 / 1 | 0 / 3 / 0 |
@@ -478,7 +478,7 @@ counts any category and so includes comment-only files:
 | `drm/` | 1 / 1 / 1 | 2 / 2 / 2 | 0 / 0 / 0 |
 | `time.rs` | 0 / 0 / 0 | 2 / 1 / 1 | 0 / 0 / 0 |
 | `bpf/` | 0 / 0 / 0 | 0 / 0 / 1 | 0 / 0 / 2 |
-| **`kernel/src` total** | **89 / 43 / 20** | **166 / 53 / 26** | 130 lines, of which 8 `code` |
+| **`kernel/src` total** | **86 / 42 / 20** | **159 / 52 / 26** | 130 lines, of which 8 `code` |
 
 The 2026-10-05 B2 create-authority correction removed the obsolete
 `mount_capable` documentation excerpts asserting no userns-mountable types.
@@ -489,8 +489,8 @@ implementation translation; removed comments are no longer counted. `kernel/src`
 has no NOTICE file to edit. The unchanged raw ≥40 count includes104 drawing
 matches under the current scope.
 
-Three things about that table need stating plainly. **Not one** of the 43 blocks
-(53 at ≥ 25) carries an `Excerpt:` marker, while `crates/linux` puts 18 of 49 in
+Three things about that table need stating plainly. **Not one** of the 42 blocks
+(52 at ≥ 25) carries an `Excerpt:` marker, while `crates/linux` puts 18 of 49 in
 that form: kernel-side citation is uniformly weaker. The ≥ 40 outside-fence count
 is **130 with the ASCII-rule filter and 234 without it**, so 104 of the raw
 matches are `// -----` drawing lines. And unlike `crates/linux`, this scope does
@@ -532,3 +532,12 @@ Linux7.2.3 sockaddr import excerpt marker in crates/linux/net/src/lib.rs from
 line347 to360. The range-citation audit row follows that source movement;
 excerpt content, allowed ranges and scan-category totals are unchanged. The
 period65 host check detected this drift; no threshold or assertion was relaxed.
+
+## Ptrace syscall-stop implementation (Codex A, 2026-10-05)
+
+Replacing the obsolete GET_SYSCALL_INFO commentary removed an existing quoted
+Linux block. The scanner-backed host inventory measured kernel/src totals of
+86 fenced lines / 42 blocks / 20 files at >=40 and 159 / 52 / 26 at >=25;
+outside-fence totals are 132 (8 code) and 301 (13 code), respectively. The
+range-citation audit remains unchanged. No new Linux quotation or translated
+implementation was added; the new runtime module uses original Rust.

@@ -720,6 +720,9 @@ impl TimeIf for TimeIfImpl {
     /// a locally calibrated countdown; both paths use measured frequencies.
     #[cfg(feature = "irq")]
     fn set_oneshot_timer(deadline_ns: u64) {
+        let _guard = kernel_guard::NoPreemptIrqSave::new();
+        crate::cpufreq::sample_current(Self::ticks_to_nanos(Self::current_ticks()));
+        crate::thermal::sample_current(Self::ticks_to_nanos(Self::current_ticks()));
         if TSC_DEADLINE_MODE.load(Ordering::Acquire) {
             let now_tsc = read_tsc();
             let now_ns = Self::ticks_to_nanos(Self::current_ticks());
@@ -727,6 +730,7 @@ impl TimeIf for TimeIfImpl {
             let delta_ticks = Self::nanos_to_ticks(delta_ns).max(1);
             let deadline_tsc = absolute_deadline_ticks(now_tsc, delta_ticks);
             unsafe { wrmsr(IA32_TSC_DEADLINE, deadline_tsc) };
+            crate::cpuidle::note_timer(deadline_ns);
             return;
         }
 
@@ -738,6 +742,7 @@ impl TimeIf for TimeIfImpl {
         unsafe {
             super::apic::local_apic().set_timer_initial(lapic_ticks);
         }
+        crate::cpuidle::note_timer(deadline_ns);
     }
 }
 
@@ -937,5 +942,28 @@ mod tests {
             100_000_000
         );
         assert_eq!(lapic_ticks_for_nanos(u64::MAX, u64::MAX), u32::MAX);
+    }
+}
+
+// A TSC selected on the BSP is insufficient if an AP does not report invariant
+// TSC itself. HPET remains a clock independent of CPU idle/frequency state.
+fn idle_clock_safe(source: ClockSource, invariant_tsc: bool) -> bool {
+    match source {
+        ClockSource::Tsc => invariant_tsc,
+        ClockSource::Hpet => true,
+        ClockSource::Uninitialized => false,
+    }
+}
+pub(crate) fn mwait_clock_safe(invariant_tsc: bool) -> bool {
+    idle_clock_safe(ClockSource::load(), invariant_tsc)
+}
+#[cfg(test)]
+mod idle_clock_tests {
+    use super::*;
+    #[test] fn each_cpu_must_have_a_clock_that_survives_idle() {
+        assert!(!idle_clock_safe(ClockSource::Uninitialized, true));
+        assert!(!idle_clock_safe(ClockSource::Tsc, false));
+        assert!(idle_clock_safe(ClockSource::Tsc, true));
+        assert!(idle_clock_safe(ClockSource::Hpet, false));
     }
 }

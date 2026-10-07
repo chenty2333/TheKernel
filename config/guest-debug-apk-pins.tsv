@@ -1,0 +1,42 @@
+# Signed Alpine v3.24 x86_64 debug closure; bootstrap minirootfs 3.24.1.
+# filename	sha256	url	license	origin
+brotli-libs-1.2.0-r1.apk	f0823de7c6d45859aeb6a7facfc5cfbf2dadb83ad4f27c794cb6ecc74e578cee	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/brotli-libs-1.2.0-r1.apk	MIT	brotli
+c-ares-1.34.8-r0.apk	123fdeadc5ec884b897787f98d865492bf70402697b251cd1f3591a00b8c9d73	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/c-ares-1.34.8-r0.apk	MIT	c-ares
+ca-certificates-bundle-20260909-r0.apk	a35f8cf2366d90294d0bb089af565fd17f3fa03721e61bcc7f02ed3d8334e7ea	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/ca-certificates-bundle-20260909-r0.apk	MPL-2.0 AND MIT	ca-certificates
+gdb-16.3-r4.apk	767c8b666daddd5cd2daf668ef1618882a11aaf85f37f891c2367c19e1b89ac3	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/gdb-16.3-r4.apk	GPL-3.0-or-later AND LGPL-3.0-or-later	gdb
+gdbm-1.26-r0.apk	3278ccba30b241168ca4ab93c919be805411b918fdc062f06d3684d12dc33ae3	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/gdbm-1.26-r0.apk	GPL-3.0-or-later	gdbm
+gmp-6.3.0-r4.apk	85323ef5bce8ff234736dc2d6592ea37aebdc6348a531e27430bdfe38364d256	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/gmp-6.3.0-r4.apk	LGPL-3.0-or-later OR GPL-2.0-or-later	gmp
+json-c-0.18-r1.apk	22dc7a8fe3eda0d22635615cca682b2a575ef25e8c2f401445e12be4cbf77302	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/json-c-0.18-r1.apk	MIT	json-c
+libbz2-1.0.8-r6.apk	2737e2b23ed08d4911ee62cd0163b5f4bf0379cacf4dc35b23a00209584c98fd	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libbz2-1.0.8-r6.apk	bzip2-1.0.6	bzip2
+libcrypto3-3.5.9-r0.apk	6632d758d8f5e9ea3b650fe966f23bbf9a202f8b8dceecac93da135dec5e3689	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcrypto3-3.5.9-r0.apk	Apache-2.0	openssl
+libcurl-8.22.0-r0.apk	40b2a8e15a8d24bc95a5f42aaeb018313a1ff457cee71d8e15aaf1328da765e8	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcurl-8.22.0-r0.apk	curl	curl
+libdebuginfod-0.195-r0.apk	6b125f8dc651d204a496c55d549e04388c9ea464e5cb9579fc454039fdfd3cc0	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libdebuginfod-0.195-r0.apk	GPL-3.0-or-later AND ( GPL-2.0-or-later OR LGPL-3.0-or-later )	elfutils
+libdw-0.195-r0.apk	e1cc3b757cf44a38f6b160cb714bf570bc28eca11cd1ba8e8b0b54eab4837ffb	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libdw-0.195-r0.apk	GPL-3.0-or-later AND ( GPL-2.0-or-later OR LGPL-3.0-or-later )	elfutils
+libelf-0.195-r0.apk	78c5a1993342ab1bdcdce30639fd0937e8000f6d0d85cea171f573d31decd036	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libelf-0.195-r0.apk	GPL-3.0-or-later AND ( GPL-2.0-or-later OR LGPL-3.0-or-later )	elfutils
+libexpat-2.8.5-r0.apk	2e56946bc495cbed9eb1ad70859a79cba9db6420016453e065a0628848b32c7e	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libexpat-2.8.5-r0.apk	MIT	expat
+libffi-3.5.2-r1.apk	6da1a19313a40c56cac756fb11e2c4d5267831e1c22fc8323f24c943c94da6e0	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libffi-3.5.2-r1.apk	MIT	libffi
+libgcc-15.2.0-r5.apk	393dcd32629f06d7d85409c272d142d0c082772d10b87ef55ee82f47de3be637	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libgcc-15.2.0-r5.apk	GPL-2.0-or-later AND LGPL-2.1-or-later	gcc
+libidn2-2.3.8-r0.apk	7d038ac558dde464964b033ce5126dd2eaf84cc414dc15e77c5424a321d0ebee	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libidn2-2.3.8-r0.apk	GPL-2.0-or-later OR LGPL-3.0-or-later	libidn2
+libncursesw-6.6_p20260516-r0.apk	cf8caa8a88bc4ce9d9e395567fefaf9ef7fbd55c50ae6155b35c1b58f3755023	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libncursesw-6.6_p20260516-r0.apk	X11	ncurses
+libpanelw-6.6_p20260516-r0.apk	057be8b1b788580f4cb72c382a6dcc03467d15bd69700f32192bd709e7a57a12	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libpanelw-6.6_p20260516-r0.apk	X11	ncurses
+libpsl-0.21.5-r3.apk	ec665a344b6e887f00f0a47015cc732c3a281b69e84641dc8662ea234fde6cdb	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libpsl-0.21.5-r3.apk	MIT	libpsl
+libssl3-3.5.9-r0.apk	05e3393fb95aa5751ca2f9d242f659f6cff82c1cc7767cc2df4a086f7ad01877	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libssl3-3.5.9-r0.apk	Apache-2.0	openssl
+libstdc++-15.2.0-r5.apk	14c987b556f5385a5db18376e788c75f37d85321b8dc1920d926ea7daac1d6f6	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libstdc++-15.2.0-r5.apk	GPL-2.0-or-later AND LGPL-2.1-or-later	gcc
+libunistring-1.4.2-r0.apk	3aa6030e603e34d96192742f327c0509f409c6769ce2e7b1463685dede38d714	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libunistring-1.4.2-r0.apk	GPL-2.0-or-later OR LGPL-3.0-or-later	libunistring
+mpdecimal-4.0.1-r0.apk	1278f374bbc8b4aad674244458cca5fc63e0780a921138eef400d5db64381a31	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/mpdecimal-4.0.1-r0.apk	BSD-2-Clause	mpdecimal
+mpfr4-4.2.2-r0.apk	93620a803d416e8c05150fb14413796df14ea370322dff6bd106455deab15646	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/mpfr4-4.2.2-r0.apk	LGPL-3.0-or-later	mpfr4
+musl-1.2.6-r2.apk	573712e2f49c15bfc20a2699f204acdfc74c772722b15e7353d768057fae0e71	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-1.2.6-r2.apk	MIT	musl
+musl-dbg-1.2.6-r2.apk	2a1a59c196861a56efb3113def256774286b338a76eaf8d95449308294d470a6	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-dbg-1.2.6-r2.apk	MIT	musl
+musl-fts-1.2.7-r7.apk	10563dc485f24f7cd987e0f3c68552e2c6417b61f5c8cb6b39cbf9af46ea09a7	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-fts-1.2.7-r7.apk	BSD-3-Clause	musl-fts
+ncurses-terminfo-base-6.6_p20260516-r0.apk	ce83be6d0bd10584a53c3a5868cc1595ce5f0f8e0b621f8f7f70b6144e521fc9	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/ncurses-terminfo-base-6.6_p20260516-r0.apk	X11	ncurses
+nghttp2-libs-1.70.0-r0.apk	f0c4014eb2f10308dcdfd84cd49c121673c7b78cb8182b6e7a1388d8ae112a3b	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/nghttp2-libs-1.70.0-r0.apk	MIT	nghttp2
+pyc-3.14.8-r0.apk	45894c74dcf5229c373b5693045df60b90c671639103fd43a37eaefb0961557f	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/pyc-3.14.8-r0.apk	PSF-2.0	python3
+python3-3.14.8-r0.apk	802caff00b3398c01bb227cd925c8f9e33585ff19f58f0f25295a761ff2509cd	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/python3-3.14.8-r0.apk	PSF-2.0	python3
+python3-pyc-3.14.8-r0.apk	f3784543adb738ac7e3816ab55bbab057f4301b545a83044ebfa21cc822fbf56	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/python3-pyc-3.14.8-r0.apk	PSF-2.0	python3
+python3-pycache-pyc0-3.14.8-r0.apk	14fb0adaa0db1d73c6d925d05134571b5cd0d7be26fbe6ccec552b6dd613bf4b	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/python3-pycache-pyc0-3.14.8-r0.apk	PSF-2.0	python3
+readline-8.3.3-r1.apk	766911ecb986a6c5cf0841a6b556cd1e9dbbf22b3559726de32416486cd15c81	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/readline-8.3.3-r1.apk	GPL-3.0-or-later	readline
+sqlite-libs-3.53.4-r0.apk	a8a216e53d22faa3f04d2e3650c1991af66f8d0b42fadff5afcdb9afb60b19e5	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/sqlite-libs-3.53.4-r0.apk	blessing	sqlite
+strace-6.19-r1.apk	d3baf0e901f9ef6d535dc3dbd8c464b8e70d047fc4e9ef04708f5c00733b5fbd	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/strace-6.19-r1.apk	BSD-3-Clause	strace
+xz-libs-5.8.4-r0.apk	ab362dd515ead04c31a6c302163248da7aa4813e283c971e6dd3f789b453a1d9	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/xz-libs-5.8.4-r0.apk	GPL-2.0-or-later AND 0BSD AND Public-Domain AND LGPL-2.1-or-later	xz
+zlib-1.3.2-r0.apk	b636306cbf8a0c15493b38de608ba11605fd8f11ade631f5ece6f7fdf5a1e09e	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zlib-1.3.2-r0.apk	Zlib	zlib
+zstd-libs-1.5.7-r2.apk	23c6065b0049b2406441564bcf0032515a43f78e80d76fcb85535a3803ef5d4e	https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zstd-libs-1.5.7-r2.apk	BSD-3-Clause OR GPL-2.0-or-later	zstd

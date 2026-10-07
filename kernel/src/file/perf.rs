@@ -3164,6 +3164,7 @@ pub(crate) struct PerfPlacementPolicy {
 }
 
 pub struct PerfEventFile {
+    _debug_lease: Option<crate::task::hardware_debug::Lease>,
     id: u64,
     event: PerfEvent,
     lifecycle: tk_linux_perf::PerfLifecycle,
@@ -3469,6 +3470,9 @@ impl PerfEventFile {
         count_kernel: bool,
         #[cfg(feature = "perf-sampling")] sampling: Option<Arc<crate::file::PerfSampleBackend>>,
     ) -> AxResult<Arc<Self>> {
+        let debug_lease = if matches!(event, PerfEvent::Breakpoint { .. }) {
+            Some(crate::task::hardware_debug::Lease::acquire(false)?)
+        } else { None };
         if let PerfEvent::Kprobe { addr, retprobe, .. } = event {
             // The descriptor owns the probe reference from this point on.
             // Every construction failure below either releases it directly or
@@ -3498,6 +3502,7 @@ impl PerfEventFile {
         }
         let now = monotonic_time_nanos();
         let file = Arc::try_new(Self {
+            _debug_lease: debug_lease,
             id,
             event,
             lifecycle,

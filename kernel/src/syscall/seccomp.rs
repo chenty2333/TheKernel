@@ -449,10 +449,7 @@ pub(super) fn enforce_syscall_seccomp(uctx: &mut UserContext) -> bool {
     // keeps enforcing its own filters. The relationship's option word is
     // cleared when the relationship ends, so a detach resumes enforcement
     // without a second bookkeeping step.
-    if thread
-        .proc_data
-        .ptrace_seccomp_suspended_for(thread.kernel_tid())
-    {
+    if thread.ptrace_seccomp_suspended_for(thread.kernel_tid()) {
         return true;
     }
 

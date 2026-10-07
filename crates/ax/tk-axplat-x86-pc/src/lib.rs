@@ -175,3 +175,12 @@ unsafe extern "C" fn rust_entry_secondary(_magic: usize) {
 pub fn allocate_msi(handler: axplat::irq::IrqHandler) -> Option<(u64, u32, usize)> {
     apic::allocate_msi(handler)
 }
+
+/// Capability-gated automatic Intel MWAIT idle state selection and counters.
+pub mod cpuidle;
+
+/// Explicit firmware-enabled HWP frequency policy and effective frequency.
+pub mod cpufreq;
+
+/// Read-only, physical Intel DTS temperatures and target limits.
+pub mod thermal;

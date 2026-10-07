@@ -55,19 +55,16 @@ fn clone_task_parent_choice(flags: CloneFlags, caller: &Thread) -> TaskParentCho
     }
 }
 
-fn clone_ptrace_event(flags: CloneFlags, options: u32) -> Option<u8> {
-    if flags.contains(CloneFlags::UNTRACED) {
-        return None;
-    }
-    if flags.contains(CloneFlags::VFORK) && options & PTRACE_O_TRACEVFORK != 0 {
-        Some(PTRACE_EVENT_VFORK)
-    } else if flags.contains(CloneFlags::THREAD) && options & PTRACE_O_TRACECLONE != 0 {
-        Some(PTRACE_EVENT_CLONE)
-    } else if !flags.contains(CloneFlags::THREAD) && options & PTRACE_O_TRACEFORK != 0 {
-        Some(PTRACE_EVENT_FORK)
+fn clone_ptrace_event(flags: CloneFlags, exit_signal: Option<Signo>, options: u32) -> Option<u8> {
+    if flags.contains(CloneFlags::UNTRACED) { return None; }
+    let (event, option) = if flags.contains(CloneFlags::VFORK) {
+        (PTRACE_EVENT_VFORK, PTRACE_O_TRACEVFORK)
+    } else if exit_signal != Some(Signo::SIGCHLD) {
+        (PTRACE_EVENT_CLONE, PTRACE_O_TRACECLONE)
     } else {
-        None
-    }
+        (PTRACE_EVENT_FORK, PTRACE_O_TRACEFORK)
+    };
+    (options & option != 0).then_some(event)
 }
 
 fn interrupt_ptrace_stop_siblings(proc_data: &ProcessData) {
@@ -637,7 +634,7 @@ impl CloneArgs {
 
     pub(super) fn do_clone(
         self,
-        uctx: &UserContext,
+        uctx: &mut UserContext,
         api: CloneApi,
         caller_memory: &UserMemoryCapability,
     ) -> AxResult<isize> {
@@ -728,10 +725,10 @@ impl CloneArgs {
         let inherited_seccomp = calling_thread.seccomp_snapshot();
         let calling_tid = linux_pid_from_task_id(curr.id().as_u64())?;
         // CLONE_UNTRACED wins over inherited tracing and suppresses the
-        // parent event. Thread clones share ProcessData and therefore do not
-        // need a second relationship, but still report TRACECLONE.
+        // parent event. Every inherited child, including CLONE_THREAD, owns
+        // its own task relationship and initial stop.
         let parent_ptrace = (!flags.contains(CloneFlags::UNTRACED))
-            .then(|| old_proc_data.ptrace_clone_snapshot(calling_thread.kernel_tid()))
+            .then(|| calling_thread.ptrace_clone_snapshot(calling_thread.kernel_tid()))
             .flatten();
         let credential_publication_kind = clone_credential_publication_kind(flags);
         // Every branch derives from one immutable calling-task snapshot.
@@ -1567,17 +1564,25 @@ impl CloneArgs {
         let clone_ptrace_tracer_data = clone_ptrace_tracer_task
             .as_ref()
             .map(|task| task.as_thread().proc_data.clone());
-        let mut clone_ptrace_reverse_link = if flags.contains(CloneFlags::PTRACE)
-            && !flags.contains(CloneFlags::THREAD)
-            && let Some(tracer) = clone_ptrace_tracer_data.as_deref()
-        {
-            Some(tracer.try_prepare_ptrace_reverse_link(
-                new_proc_data.proc.pid(),
-                task.as_thread().kernel_tid(),
-            )?)
-        } else {
-            None
-        };
+        let inherit_ptrace = parent_ptrace.as_ref().is_some_and(|(_, options, _)| {
+            flags.contains(CloneFlags::PTRACE) || clone_ptrace_event(flags, exit_signal, *options).is_some()
+        });
+        let mut clone_ptrace_reverse_link =
+            if inherit_ptrace && let Some(tracer) = clone_ptrace_tracer_data.as_deref() {
+                Some(
+                    tracer.try_prepare_ptrace_reverse_link(
+                        tid,
+                        parent_ptrace
+                            .as_ref()
+                            .expect("inherited relationship")
+                            .0
+                            .session()
+                            .tracer_kernel_tid,
+                    )?,
+                )
+            } else {
+                None
+            };
         let credential_publication = match credential_publication_kind {
             None => None,
             Some(CloneCredentialPublicationKind::Fork) => Some(
@@ -1649,69 +1654,6 @@ impl CloneArgs {
         }
         drop(task_parent_publication);
 
-        // CLONE_PTRACE is a real inherited relationship, not merely a fork
-        // event.  Publish it only after the new process has an exact core and
-        // task identity, but before it can reach the runqueue.  A tracer that
-        // exited or detached in this window simply loses the inheritance, as
-        // Linux does; the child itself remains a successful clone.
-        if let (
-            Some((relationship, inherited_options, inherited_seized)),
-            Some(tracer_task),
-            Some(tracer_data),
-            Some(reverse_link),
-        ) = (
-            parent_ptrace.as_ref(),
-            clone_ptrace_tracer_task.as_ref(),
-            clone_ptrace_tracer_data.as_ref(),
-            clone_ptrace_reverse_link.take(),
-        ) && old_proc_data.ptrace_session_if_traced_by(
-            relationship.session().tracer,
-            relationship.session().tracer_kernel_tid,
-        ) == Some(relationship.session())
-        {
-            let tracer = tracer_task.as_thread();
-            let tracer_credential = tracer.lock_credential_snapshot();
-            if let Ok(authorized) = new_proc_data.thread_image_access_snapshot(task.as_thread())
-                && let Ok(publication) = new_proc_data.lock_ptrace_traceme_publication(tracer_data)
-            {
-                let _ = new_proc_data.publish_ptrace_relationship(
-                    &publication,
-                    task.as_thread(),
-                    tracer,
-                    &tracer_credential,
-                    PtraceRelationshipOrigin::Inherited,
-                    relationship.ptracer_cred(),
-                    *inherited_seized,
-                    *inherited_options,
-                    &authorized,
-                    reverse_link,
-                );
-            }
-        }
-
-        // A ptrace fork event belongs to the traced parent, whereas the above
-        // relationship belongs to the child.  Do this after PID namespace
-        // publication so GETEVENTMSG observes the PID rendered in the
-        // tracer's namespace. CLONE_UNTRACED suppressed the snapshot itself.
-        if let Some((relationship, options, _)) = parent_ptrace.as_ref()
-            && let Some(event) = clone_ptrace_event(flags, *options)
-            && old_proc_data.ptrace_session_if_traced_by(
-                relationship.session().tracer,
-                relationship.session().tracer_kernel_tid,
-            ) == Some(relationship.session())
-            && old_proc_data.ptrace_event_stop(
-                relationship.session(),
-                event,
-                clone_ptrace_tracer_task
-                    .as_ref()
-                    .map(|tracer| tracer.as_thread().pid_ns().visible_pid(tid) as usize)
-                    .unwrap_or(0),
-            )
-        {
-            notify_ptrace_attach_stop(old_proc_data);
-            interrupt_ptrace_stop_siblings(old_proc_data);
-        }
-
         // TASK_TABLE is the primary runtime lookup. Cgroup and SysV SHM hidden
         // entries become visible only after it, so their readers can never
         // observe an unpublished child PID. PIDFD follows the same ordering:
@@ -1762,6 +1704,90 @@ impl CloneArgs {
                 publication.notify();
             }
         });
+        // Shared-mm thread clones used this same lifecycle gate above.
+        // Release construction ownership before taking the sorted tracee/
+        // tracer publication gates; the child is still off the runqueue and
+        // PendingThreadPublication keeps exec exclusion until finish below.
+        // CLONE_PTRACE is a real inherited relationship, not merely a fork
+        // event.  Publish it only after the new process has an exact core and
+        // task identity, but before it can reach the runqueue.  A tracer that
+        // exited or detached in this window simply loses the inheritance, as
+        // Linux does; the child itself remains a successful clone.
+        if let (
+            Some((relationship, inherited_options, inherited_seized)),
+            Some(tracer_task),
+            Some(tracer_data),
+            Some(reverse_link),
+        ) = (
+            parent_ptrace.as_ref(),
+            clone_ptrace_tracer_task.as_ref(),
+            clone_ptrace_tracer_data.as_ref(),
+            clone_ptrace_reverse_link.take(),
+        ) && calling_thread.ptrace_session_if_traced_by(
+            relationship.session().tracer,
+            relationship.session().tracer_kernel_tid,
+        ) == Some(relationship.session())
+        {
+            let tracer = tracer_task.as_thread();
+            let tracer_credential = tracer.lock_credential_snapshot();
+            if let Ok(authorized) = new_proc_data.thread_image_access_snapshot(task.as_thread())
+                && let Ok(publication) = task
+                    .as_thread()
+                    .lock_ptrace_traceme_publication(tracer_data)
+            {
+                let inherited_session = task.as_thread().publish_ptrace_relationship(
+                    &publication,
+                    task.as_thread(),
+                    tracer,
+                    &tracer_credential,
+                    PtraceRelationshipOrigin::Inherited,
+                    relationship.ptracer_cred(),
+                    *inherited_seized,
+                    *inherited_options,
+                    &authorized,
+                    reverse_link,
+                );
+                if let Ok(session) = inherited_session {
+                    let stopped = if *inherited_seized {
+                        task.as_thread().ptrace_event_stop(session, 128, 0)
+                    } else {
+                        task.as_thread().ptrace_stop_provenance.store(
+                            crate::task::ptrace_runtime::INHERITED_SIGNAL_STOP,
+                            core::sync::atomic::Ordering::Release,
+                        );
+                        task.as_thread().ptrace_stop(session, Signo::SIGSTOP as u8)
+                    };
+                    if stopped {
+                        notify_ptrace_attach_stop(task.as_thread());
+                    }
+                }
+            }
+        }
+
+        // A ptrace fork event belongs to the traced parent, whereas the above
+        // relationship belongs to the child.  Do this after PID namespace
+        // publication so GETEVENTMSG observes the PID rendered in the
+        // tracer's namespace. CLONE_UNTRACED suppressed the snapshot itself.
+        let parent_event_stopped = if let Some((relationship, options, _)) = parent_ptrace.as_ref()
+            && let Some(event) = clone_ptrace_event(flags, exit_signal, *options)
+            && calling_thread.ptrace_session_if_traced_by(
+                relationship.session().tracer,
+                relationship.session().tracer_kernel_tid,
+            ) == Some(relationship.session())
+            && calling_thread.ptrace_event_stop(
+                relationship.session(),
+                event,
+                clone_ptrace_tracer_task
+                    .as_ref()
+                    .map(|tracer| tracer.as_thread().pid_ns().visible_pid(tid) as usize)
+                    .unwrap_or(0),
+            ) {
+            notify_ptrace_attach_stop(calling_thread);
+            true
+        } else {
+            false
+        };
+
         let published_task = publish_prepared_task(task_publication);
         debug_assert!(Arc::ptr_eq(&published_task, &task));
         drop(published_task);
@@ -1774,6 +1800,13 @@ impl CloneArgs {
             child_exit_signal.map_or(0, |signo| signo as u32),
         );
         thread_completion.finish();
+        if parent_event_stopped {
+            // Child publication is complete before parking. In particular a
+            // vfork parent must publish its GPR image before waiting for the
+            // child to exec/exit; it cannot park inside the vfork poll first.
+            uctx.rax = -LinuxError::ENOSYS.code() as i64 as u64;
+            crate::task::wait_if_stopped(calling_thread, uctx);
+        }
         // Thread/vfork-style clones often rely on immediate child progress for
         // futex or parent/child tid handshakes. Plain fork children are seeded
         // behind the parent in EEVDF, so the parent can finish post-fork setup
@@ -1792,7 +1825,7 @@ impl CloneArgs {
 
 pub fn sys_clone(
     caller_memory: UserMemoryCapability,
-    uctx: &UserContext,
+    uctx: &mut UserContext,
     flags: u32,
     stack: usize,
     parent_tid: usize,
@@ -1839,7 +1872,7 @@ fn map_clone_abi_error(error: ProcessAbiError) -> AxError {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn sys_fork(caller_memory: UserMemoryCapability, uctx: &UserContext) -> AxResult<isize> {
+pub fn sys_fork(caller_memory: UserMemoryCapability, uctx: &mut UserContext) -> AxResult<isize> {
     sys_clone(caller_memory, uctx, SIGCHLD, 0, 0, 0, 0)
 }
 
@@ -1848,7 +1881,7 @@ pub fn sys_fork(caller_memory: UserMemoryCapability, uctx: &UserContext) -> AxRe
 /// alive, and the parent remains blocked until the child's exec or final exit
 /// releases the `CLONE_VFORK` publication gate.
 #[cfg(target_arch = "x86_64")]
-pub fn sys_vfork(caller_memory: UserMemoryCapability, uctx: &UserContext) -> AxResult<isize> {
+pub fn sys_vfork(caller_memory: UserMemoryCapability, uctx: &mut UserContext) -> AxResult<isize> {
     sys_clone(
         caller_memory,
         uctx,
@@ -1894,6 +1927,22 @@ mod tests {
         fn drop(&mut self) {
             self.state.set(self.state.get() | self.bit);
         }
+    }
+
+    #[test]
+    fn ptrace_clone_event_uses_exit_signal_and_does_not_fall_back_from_vfork() {
+        use tk_linux_signal::Signo;
+
+        use super::{
+            PTRACE_O_TRACECLONE, PTRACE_O_TRACEFORK, PTRACE_O_TRACEVFORK, clone_ptrace_event,
+        };
+        let all = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE;
+        assert_eq!(clone_ptrace_event(CloneFlags::empty(), Some(Signo::SIGCHLD), all), Some(1));
+        assert_eq!(clone_ptrace_event(CloneFlags::empty(), None, all), Some(3));
+        assert_eq!(clone_ptrace_event(CloneFlags::empty(), Some(Signo::SIGUSR1), all), Some(3));
+        assert_eq!(clone_ptrace_event(CloneFlags::VFORK, Some(Signo::SIGCHLD), all), Some(2));
+        assert_eq!(clone_ptrace_event(CloneFlags::VFORK, Some(Signo::SIGCHLD), PTRACE_O_TRACEFORK), None);
+        assert_eq!(clone_ptrace_event(CloneFlags::UNTRACED, Some(Signo::SIGCHLD), all), None);
     }
 
     #[test]

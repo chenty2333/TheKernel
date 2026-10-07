@@ -447,6 +447,10 @@ static int test_io_uring_buffers(void) {
         "io-uring-buffers-child");
 }
 
+static int test_cpu_power(void) {
+    return run_guest_program("/opt/thekernel-tests/bin/thekernel-cpu-power-smoke", NULL, "cpu-power-child");
+}
+
 static int test_signal_fp(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-signal-fp-smoke",
@@ -459,6 +463,20 @@ static int test_signal_fp(void) {
  * contract a compiler or an emulator depends on and classifies its own
  * findings as required or informational, so a non-zero result here means a
  * required contract failed rather than that a probe was unable to look. */
+#if defined(THEKERNEL_TOOL_PAYLOAD_DEBUG)
+static int test_real_cpu_tools(void) {
+    return run_guest_program("/opt/thekernel-tests/bin/thekernel-cpu-power-smoke", "--tools", "real-cpu-tools-child");
+}
+
+static int test_real_gdb_threads(void) {
+    return run_guest_program("/opt/thekernel-tests/bin/thekernel-debugger-smoke", "--threads", "real-gdb-threads-child");
+}
+
+static int test_real_debugger(void) {
+    return run_guest_program("/opt/thekernel-tests/bin/thekernel-debugger-smoke", NULL, "real-debugger-child");
+}
+#endif
+
 static int test_jit_mem(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-jit-mem-smoke",
@@ -853,6 +871,46 @@ static int test_epoll_membarrier_differential(void) {
         "--thekernel", "epoll-membarrier-differential-child");
 }
 
+static int test_ptrace_threads(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-threads-differential", NULL, "ptrace-threads-child");
+}
+
+static int test_ptrace_exit(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-exit-differential", NULL, "ptrace-exit-child");
+}
+
+static int test_ptrace_breakpoint(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-breakpoint-differential", NULL, "ptrace-breakpoint-child");
+}
+
+static int test_ptrace_exec(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-exec-differential", NULL, "ptrace-exec-child");
+}
+
+static int test_ptrace_fork(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-fork-differential", NULL, "ptrace-fork-child");
+}
+
+static int test_ptrace_stop_ready(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-stop-ready-differential", NULL, "ptrace-stop-ready-child");
+}
+
+static int test_ptrace_step(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-step-differential", NULL, "ptrace-step-child");
+}
+
+static int test_ptrace_syscall(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-syscall-differential", NULL, "ptrace-syscall-child");
+}
+
+static int test_ptrace_listen(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-listen-differential", NULL, "ptrace-listen-child");
+}
+
+static int test_ptrace_registers(void) {
+    return run_guest_program("/opt/thekernel-tests/portable/ptrace-registers", NULL, "ptrace-registers-child");
+}
+
 static int test_eventfd_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/eventfd-differential", NULL,
@@ -1164,6 +1222,16 @@ static int run_init(int argc, char **argv) {
         { "epoll", test_epoll_differential, 60 },
         { "epoll-membarrier", test_epoll_membarrier_differential, 60 },
         { "eventfd", test_eventfd_differential, 60 },
+        { "ptrace-registers", test_ptrace_registers, 60 },
+        { "ptrace-listen", test_ptrace_listen, 30 },
+        { "ptrace-syscall", test_ptrace_syscall, 30 },
+        { "ptrace-step", test_ptrace_step, 30 },
+        { "ptrace-stop-ready", test_ptrace_stop_ready, 30 },
+        { "ptrace-fork", test_ptrace_fork, 45 },
+        { "ptrace-exec", test_ptrace_exec, 30 },
+        { "ptrace-breakpoint", test_ptrace_breakpoint, 30 },
+        { "ptrace-exit", test_ptrace_exit, 45 },
+        { "ptrace-threads", test_ptrace_threads, 30 },
         { "anon-fd-flags", test_anon_fd_flags, 20 },
         { "select", test_select, 20 },
         { "exit-status", test_exit_status, 20 },
@@ -1180,10 +1248,16 @@ static int run_init(int argc, char **argv) {
         { "creat", test_creat_differential, 60 },
         { "time", test_time_differential, 60 },
         { "umask", test_umask_differential, 60 },
+        { "cpu-power", test_cpu_power, 30 },
         { "signal-fp", test_signal_fp, 60 },
         { "jit-mem", test_jit_mem, 30 },
         { "proc-shape", test_proc_shape, 30 },
         { "threads-futex", test_threads_futex, 60 },
+#if defined(THEKERNEL_TOOL_PAYLOAD_DEBUG)
+        { "real-debugger", test_real_debugger, 240 },
+        { "real-gdb-threads", test_real_gdb_threads, 120 },
+        { "real-cpu-tools", test_real_cpu_tools, 30 },
+#endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
         { "compiler-smoke", test_compiler_smoke, 120 },
 #endif
