@@ -553,10 +553,12 @@ enable/lock and disable/power-off sequences from `combo_pll_enable()` and
 policy. It also adds the TBT PLL's CFGCR0/1 register declarations and
 power/enable/disable sequence from `icl_tbt_pll_enable()`/
 `icl_tbt_pll_disable()`. These adapters are still not called by modeset.
-`tk-intel-display/src/dpll.rs` additionally
-translates the generic CRTC dispatch guards, stale-state clear, and ±1 kHz
-clock-match helper from Linux 7.2.3 `intel_dpll.c` (MIT, Copyright © 2020
-Intel). Those functions have no kernel atomic-state call site yet.
+`tk-intel-display/src/dpll.rs` additionally translates the generic CRTC
+dispatch guards, stale-state clear, ±1 kHz clock-match helper, platform hook
+selection, and HSW+ DSI/PCH adjusted-dotclock path from Linux 7.2.3
+`intel_dpll.c` (MIT, Copyright © 2020 Intel). Display-12/13 are pinned to the
+HSW shared-DPLL callback family; these functions have no kernel atomic-state
+call site yet.
 
 The kernel adapter also exposes DKL/MG TC PLL enable/disable. It serializes the
 shared HIP selector, bounds raw MMIO to the fixed DKL apertures, routes only

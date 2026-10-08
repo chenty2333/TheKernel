@@ -1138,6 +1138,9 @@ preparation and ±1 kHz clock comparison from Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_dpll.c` (MIT, Copyright © 2020 Intel).
 The dispatcher is exposed as a pure helper and not yet wired to the kernel
 atomic modeset path.
+The same file also translates `intel_dpll_init_clock_hook()` platform order and
+`hsw_crtc_compute_clock()` dispatch/dotclock update; display-12/13 profile tests
+select the HSW shared-DPLL family.
 
 `kernel/src/drm/intel/pll.rs::enable_combo_pll()` and
 `disable_combo_pll()` translate the combo DPLL0/1 power-state, CFGCR write,
