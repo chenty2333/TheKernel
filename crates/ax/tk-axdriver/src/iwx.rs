@@ -87,6 +87,7 @@ impl DmaRegion for PlatformDmaRegion {
 }
 
 impl Drop for PlatformDmaRegion {
+    // upstream: if_iwx.c iwx_dma_contig_free()
     fn drop(&mut self) {
         global_allocator().dealloc_pages(self.cpu.as_ptr() as usize, self.pages, UsageKind::Dma);
     }
@@ -95,6 +96,7 @@ impl Drop for PlatformDmaRegion {
 struct PlatformDmaAllocator;
 impl DmaAllocator for PlatformDmaAllocator {
     type Region = PlatformDmaRegion;
+    // upstream: if_iwx.c iwx_dma_contig_alloc()
     fn allocate(&mut self, size: usize) -> Result<Self::Region, DmaError> {
         let pages = size.max(1).div_ceil(4096);
         let virtual_address = global_allocator()

@@ -120,6 +120,11 @@ STA_CONFIG_CMD v1/v2 variants, source EDCA/protection/rate fields, and the
 ordered add/modify/configure and remove/deactivate/delete operations. The
 platform still supplies the station/node state consumed by these builders.
 
+Contiguous DMA allocation/free is adapted by the PCI layer to `UsageKind::Dma`
+page ownership; Rust-owned firmware, RX, and TX DMA regions are released by
+their owner types instead of the explicit OpenBSD `*_free` loops. The checked
+register facade also keeps the source NIC-lock assertion for PRPH access.
+
 The netif TX scheduler keeps management traffic eligible outside RUN, blocks
 data on queue-full/flush/management-only state, preserves encapsulation and
 node-release error paths, and retains the 500ms MFP leave wait.

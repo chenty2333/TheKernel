@@ -57,7 +57,6 @@ pub enum DeviceFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterError {
     Busy,
-    NotLocked,
 }
 
 /// Serialized CSR/HBUS access and reentrant NIC-access ownership.
@@ -86,6 +85,12 @@ impl<B: CsrAccess> IwxRegisters<B> {
     }
     pub const fn nic_lock_count(&self) -> u32 {
         self.nic_locks
+    }
+
+    /// Assert the source NIC ownership precondition for checked PRPH accesses.
+    // upstream: if_iwx.c iwx_nic_assert_locked()
+    pub fn assert_nic_locked(&self) {
+        assert!(self.nic_locks > 0, "iwx peripheral access without NIC lock");
     }
 
     /// Force-clear firmware ownership after stop, matching the source stop path.
@@ -234,9 +239,7 @@ impl<B: CsrAccess> IwxRegisters<B> {
     /// Read an internal peripheral register while NIC ownership is held.
     // upstream: if_iwx.c iwx_read_prph()
     pub fn read_prph(&mut self, address: u32) -> Result<u32, RegisterError> {
-        if self.nic_locks == 0 {
-            return Err(RegisterError::NotLocked);
-        }
+        self.assert_nic_locked();
         Ok(self.read_prph_unlocked(address))
     }
 
@@ -254,9 +257,7 @@ impl<B: CsrAccess> IwxRegisters<B> {
     /// Write an internal peripheral register while NIC ownership is held.
     // upstream: if_iwx.c iwx_write_prph()
     pub fn write_prph(&mut self, address: u32, value: u32) -> Result<(), RegisterError> {
-        if self.nic_locks == 0 {
-            return Err(RegisterError::NotLocked);
-        }
+        self.assert_nic_locked();
         self.write_prph_unlocked(address, value);
         Ok(())
     }
@@ -347,6 +348,12 @@ impl<B: CsrAccess> IwxRegisters<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "iwx peripheral access without NIC lock")]
+    fn nic_assert_requires_held_access() {
+        IwxRegisters::new(TestBus, DeviceFamily::Ax210, 0).assert_nic_locked();
+    }
 
     #[test]
     fn prph_address_width_changes_at_ax210() {
