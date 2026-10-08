@@ -342,6 +342,111 @@ pub trait E1000PhyMdicOps: E1000RegisterIo {
     fn write_mdic(&mut self, offset: u32, data: u16) -> DevResult;
     fn acquire(&mut self) -> DevResult;
     fn release(&mut self);
+    fn set_phy_address(&mut self, _address: u8) {}
+}
+
+/// upstream: e1000_phy.c e1000_get_cfg_done_generic()
+pub fn get_cfg_done_generic<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    io.delay_us(10_000);
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_phy_init_script_igp3()
+pub fn phy_init_script_igp3<I: E1000PhyMdicOps>(io: &mut I) -> DevResult {
+    const SCRIPT: &[(u32, u16)] = &[
+        (0x2f5b, 0x9018),
+        (0x2f52, 0x0000),
+        (0x2fb1, 0x8b24),
+        (0x2fb2, 0xf8f0),
+        (0x2010, 0x10b0),
+        (0x2011, 0x0000),
+        (0x20dd, 0x249a),
+        (0x20de, 0x00d3),
+        (0x28b4, 0x04ce),
+        (0x2f70, 0x29e4),
+        (0x0000, 0x0140),
+        (0x1f30, 0x1606),
+        (0x1f31, 0xb814),
+        (0x1f35, 0x002a),
+        (0x1f3e, 0x0067),
+        (0x1f54, 0x0065),
+        (0x1f55, 0x002a),
+        (0x1f56, 0x002a),
+        (0x1f72, 0x3fb0),
+        (0x1f76, 0xc0ff),
+        (0x1f77, 0x1dec),
+        (0x1f78, 0xf9ef),
+        (0x1f79, 0x0210),
+        (0x1895, 0x0003),
+        (0x1796, 0x0008),
+        (0x1798, 0xd008),
+        (0x1898, 0xd918),
+        (0x187a, 0x0800),
+        (0x0019, 0x008d),
+        (0x001b, 0x2080),
+        (0x0014, 0x0045),
+        (0x0000, 0x1340),
+    ];
+    for (register, value) in SCRIPT {
+        let _ = io.write_mdic(*register, *value);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E1000PhyType {
+    Unknown,
+    M88,
+    Igp2,
+    Gg82563,
+    Igp3,
+    Ife,
+    Bm,
+    I82578,
+    I82577,
+    I82579,
+    I217,
+    I82580,
+    I210,
+}
+
+/// upstream: e1000_phy.c e1000_get_phy_type_from_id()
+pub const fn get_phy_type_from_id(phy_id: u32) -> E1000PhyType {
+    match phy_id {
+        0x0141_0c30 | 0x0141_0c50 | 0x0141_0cc0 | 0x0141_0c20 | 0x0141_0ea0 | 0x0141_0dd0
+        | 0x0141_0dc0 | 0x0141_0c90 | 0x0141_0df0 => E1000PhyType::M88,
+        0x02a8_0380 => E1000PhyType::Igp2,
+        0x0141_0ca0 => E1000PhyType::Gg82563,
+        0x02a8_0390 => E1000PhyType::Igp3,
+        0x02a8_0330 | 0x02a8_0320 | 0x02a8_0310 => E1000PhyType::Ife,
+        0x0141_0cb0 | 0x0141_0cb1 => E1000PhyType::Bm,
+        0x004d_d040 => E1000PhyType::I82578,
+        0x0154_0050 => E1000PhyType::I82577,
+        0x0154_0090 => E1000PhyType::I82579,
+        0x0154_00a0 => E1000PhyType::I217,
+        0x0154_03a0 => E1000PhyType::I82580,
+        0x0141_0c00 => E1000PhyType::I210,
+        _ => E1000PhyType::Unknown,
+    }
+}
+
+/// upstream: e1000_phy.c e1000_determine_phy_address()
+pub fn determine_phy_address<I: E1000PhyMdicOps>(io: &mut I) -> DevResult<(u8, u32, E1000PhyType)> {
+    for address in 0..8u8 {
+        io.set_phy_address(address);
+        for _ in 0..10 {
+            let id1 = io.read_mdic(u32::from(PHY_ID1))?;
+            io.delay_us(20);
+            let id2 = io.read_mdic(u32::from(PHY_ID2))?;
+            let phy_id = (u32::from(id1) << 16) | u32::from(id2 & !PHY_REVISION_MASK);
+            let phy_type = get_phy_type_from_id(phy_id);
+            if phy_type != E1000PhyType::Unknown {
+                return Ok((address, phy_id, phy_type));
+            }
+            io.delay_us(1000);
+        }
+    }
+    Err(DevError::Io)
 }
 
 /// upstream: e1000_phy.c e1000_read_phy_reg_m88()
@@ -765,6 +870,9 @@ mod tests {
         locks: usize,
         unlocks: usize,
         kmrn_data: u16,
+        phy_address: u8,
+        use_phy_ids: bool,
+        phy_ids: [(u16, u16); 8],
     }
     impl E1000RegisterIo for Io {
         fn read_register(&mut self, register: u32) -> DevResult<u32> {
@@ -841,6 +949,14 @@ mod tests {
     impl E1000PhyMdicOps for Io {
         fn read_mdic(&mut self, offset: u32) -> DevResult<u16> {
             self.mdic_reads.push(offset);
+            if self.use_phy_ids {
+                let (id1, id2) = self.phy_ids[self.phy_address as usize];
+                return match offset {
+                    value if value == u32::from(PHY_ID1) => Ok(id1),
+                    value if value == u32::from(PHY_ID2) => Ok(id2),
+                    _ => Ok(self.mdic_data),
+                };
+            }
             Ok(self.mdic_data)
         }
         fn write_mdic(&mut self, offset: u32, data: u16) -> DevResult {
@@ -853,6 +969,9 @@ mod tests {
         }
         fn release(&mut self) {
             self.unlocks += 1;
+        }
+        fn set_phy_address(&mut self, address: u8) {
+            self.phy_address = address;
         }
     }
 
@@ -1057,5 +1176,29 @@ mod tests {
             io.phy_writes.last(),
             Some(&(MII_1000T_CTRL, CR_1000T_MS_ENABLE))
         );
+    }
+
+    #[test]
+    fn generic_phy_type_scan_and_igp3_script_preserve_source_table() {
+        assert_eq!(get_phy_type_from_id(0x0141_0c30), E1000PhyType::M88);
+        assert_eq!(get_phy_type_from_id(0x02a8_0390), E1000PhyType::Igp3);
+        assert_eq!(get_phy_type_from_id(0), E1000PhyType::Unknown);
+        let mut io = Io::default();
+        io.use_phy_ids = true;
+        io.phy_ids[3] = (0x0141, 0x0cc2);
+        assert_eq!(
+            determine_phy_address(&mut io).unwrap(),
+            (3, 0x0141_0cc0, E1000PhyType::M88)
+        );
+        assert_eq!(io.phy_address, 3);
+
+        let mut script = Io::default();
+        phy_init_script_igp3(&mut script).unwrap();
+        assert_eq!(script.mdic_writes.len(), 32);
+        assert_eq!(script.mdic_writes[0], (0x2f5b, 0x9018));
+        assert_eq!(script.mdic_writes[31], (0x0000, 0x1340));
+        let mut delay = Io::default();
+        get_cfg_done_generic(&mut delay).unwrap();
+        assert_eq!(delay.delay, 10_000);
     }
 }
