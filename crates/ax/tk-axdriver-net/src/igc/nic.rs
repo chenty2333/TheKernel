@@ -194,7 +194,7 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
     pub fn init(bus: WindowBus<H>, station: &StationAddress) -> DevResult<Self> {
         // One descriptor is always left unused, so a ring of one descriptor
         // could never hand anything over.
-        if QS < 2 {
+        if QS < 2 || !QS.is_power_of_two() {
             return Err(DevError::InvalidParam);
         }
         let Some(ring_length) = RingLength::new(QS, DESCRIPTOR_BYTES) else {
@@ -439,13 +439,14 @@ impl<H: IgcHal, const QS: usize> NetDriverOps for IgcNic<H, QS> {
     }
 
     fn recycle_tx_buffers(&mut self) -> DevResult {
-        // The hardware writes the done bit in ring order, so reclamation is a
-        // walk from the driver's own cursor while the bit is set.
-        while self.tx_ring.outstanding() > 0 {
-            let index = self.tx_ring.next_to_clean();
-            if !self.tx_memory.tx_done(index) {
-                break;
-            }
+        // Feed the device's write-back status into the translated report-
+        // status ring, then use FreeBSD's credit walk to decide how many
+        // descriptors are reusable.
+        for (index, descriptor) in self.tx_source_state.desc.iter_mut().enumerate() {
+            descriptor[3] = self.tx_memory.tx_status(index).unwrap_or(0);
+        }
+        let credits = super::txrx::igc_isc_txd_credits_update(&mut self.tx_source_state, true);
+        for _ in 0..credits {
             let Ok(index) = self.tx_ring.release() else {
                 break;
             };

@@ -110,7 +110,9 @@ impl TxRingState {
             rs_queue: alloc::vec![0;count],
             rs_pidx: 0,
             rs_cidx: 0,
-            cidx_processed: 0,
+            // FreeBSD initializes this to ntxd - 1 so a report-status
+            // descriptor at index zero has a positive reclaim distance.
+            cidx_processed: count.saturating_sub(1),
             bytes: 0,
             packets: 0,
             queue_index: 0,
@@ -586,11 +588,22 @@ mod tests {
         assert_eq!(tx.packets, 1);
         tx.desc[1][3] |= TXD_STAT_DD;
         assert_eq!(igc_isc_txd_credits_update(&mut tx, false), 1);
-        assert_eq!(igc_isc_txd_credits_update(&mut tx, true), 1);
+        assert_eq!(igc_isc_txd_credits_update(&mut tx, true), 2);
         let mut io = Fake::default();
         igc_isc_txd_flush(&mut io, &tx, next);
         assert_eq!(io.tdt, [(0, next)]);
         assert_eq!(io.tx_publish, 1);
+        let mut single = TxRingState::new(8);
+        let mut raw = packet();
+        raw.segments.truncate(1);
+        raw.len = 64;
+        raw.segments[0].length = 64;
+        raw.ip_type = TxIpType::Other(0);
+        raw.ip_hlen = 0;
+        raw.tcp_hlen = 0;
+        assert_eq!(igc_isc_txd_encap(&mut single, &raw, 8).unwrap(), 1);
+        single.desc[0][3] |= TXD_STAT_DD;
+        assert_eq!(igc_isc_txd_credits_update(&mut single, true), 1);
         let mut t = TxRingState::new(8);
         let mut tso = packet();
         tso.tso = true;
