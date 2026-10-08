@@ -380,6 +380,64 @@ pub(super) fn avi_words_preserve(frame: RawInfoframe) -> Result<[u32; 8], String
     }))
 }
 
+/// Ask the translated i915 HDMI clock policy whether this TC request can be
+/// driven by the deliberately limited native path.  The kernel currently
+/// supports only HDMI RGB at 8 bpc and does not implement scrambling/SCDC, so
+/// the 300 MHz source ceiling is intentional. EDID sink TMDS limits are not
+/// parsed here, so this does not claim that the sink's downstream ceiling was
+/// verified; it only applies the source/mode policy for the implemented path.
+/// Returning the source-computed TMDS rate also makes the assumption explicit
+/// to the caller (for RGB 8 bpc it equals the pixel clock).
+fn source_hdmi_tmds_clock(mode: &Mode) -> Option<u32> {
+    use intel_display::intel_hdmi_full::{
+        ClockLimits, HdmiMode, HdmiPortClass, OutputFormat, PortPlatform, SinkCapabilities,
+        intel_hdmi_compute_clock,
+    };
+
+    let mut pipe_bpp = 24;
+    let adjusted = HdmiMode {
+        clock_khz: i32::try_from(mode.clock_khz).ok()?,
+        hdisplay: i32::from(mode.hdisplay),
+        htotal: i32::from(mode.htotal),
+        hblank_start: i32::from(mode.hdisplay),
+        hblank_end: i32::from(mode.htotal),
+        hsync_start: i32::from(mode.hsync_start),
+        hsync_end: i32::from(mode.hsync_end),
+        // Interlace and double-clock modes are rejected by the caller before
+        // this helper; the upstream helper only consumes DBLCLK here.
+        flags: 0,
+    };
+    let sink = SinkCapabilities {
+        has_hdmi_sink: true,
+        ycbcr420_allowed: false,
+        mode_is_420: false,
+        rgb_10bpc: false,
+        rgb_12bpc: false,
+        y420_10bpc: false,
+        y420_12bpc: false,
+        gmch: false,
+        display_version: 13,
+    };
+    let limits = ClockLimits {
+        platform: PortPlatform::Display(13),
+        port: HdmiPortClass::TypeC,
+        source_limit_khz: 300_000,
+        dp_dual_mode_limit_khz: None,
+        sink_limit_khz: None,
+        has_hdmi_sink: true,
+        respect_downstream_limits: false,
+    };
+    u32::try_from(intel_hdmi_compute_clock(
+        &mut pipe_bpp,
+        adjusted,
+        OutputFormat::Rgb,
+        sink,
+        limits,
+        false,
+    )?)
+    .ok()
+}
+
 /// Program one validated progressive RGB/XRGB timing on an already-active,
 /// already-owned legacy TC port. No cold transition or new PHY ownership is
 /// attempted. The DDB allocation and DBUF slice programming remain the
@@ -412,7 +470,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         || mode
             .flags
             .contains(crate::drm::modes::ModeFlags::DOUBLE_CLOCK)
-        || !(25_000..=300_000).contains(&mode.clock_khz)
+        || !matches!(source_hdmi_tmds_clock(mode), Some(25_000..=300_000))
         || surface == 0
         || surface & 0xfff != 0
         || pitch < u32::from(mode.hdisplay) * 4
@@ -601,4 +659,34 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_hdmi_tmds_clock;
+    use crate::drm::modes::{Mode, ModeFlags, TimingSource};
+
+    fn mode(clock_khz: u32) -> Mode {
+        Mode::from_blanking(
+            clock_khz,
+            1920,
+            280,
+            88,
+            44,
+            1080,
+            45,
+            4,
+            5,
+            ModeFlags::NONE,
+            TimingSource::CtaVic(16),
+        )
+    }
+
+    #[test]
+    fn active_tc_hdmi_uses_source_tmds_policy() {
+        assert_eq!(source_hdmi_tmds_clock(&mode(148_500)), Some(148_500));
+        assert_eq!(source_hdmi_tmds_clock(&mode(300_000)), Some(300_000));
+        assert_eq!(source_hdmi_tmds_clock(&mode(300_001)), None);
+        assert_eq!(source_hdmi_tmds_clock(&mode(24_999)), None);
+    }
 }

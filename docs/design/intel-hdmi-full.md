@@ -10,6 +10,10 @@ narrow traits. Omitted definitions are `intel_hdmi_add_properties`,
 `intel_hdmi_connector_unregister`, `intel_hdmi_get_modes`, and
 `intel_infoframe_init`, which are generic DRM connector/property/modes or
 registration wrappers. The full MIT grant is preserved in the module and
-`LICENSE-MIT`. The module is exported and compiles with the crate; the active
-N305 connector/modeset path still uses the previous narrower HDMI helpers, so
-this source state machine and packet pipeline are not yet live there.
+`LICENSE-MIT`. The module is exported and compiles with the crate. The native
+ADL-N TC modeset now calls the translated `intel_hdmi_compute_clock()` before
+its first destructive write, using the implemented RGB/8-bpc/no-scrambling
+limits to reject rates outside 25–300 MHz. This is a narrow admission hook, not
+a complete HDMI backend: sink TMDS limits are not parsed, and the infoframe,
+SCDC, HDCP, FRL, connector, and DSC pipelines are still not live in the kernel
+path.
