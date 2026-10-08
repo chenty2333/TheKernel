@@ -211,17 +211,7 @@ impl FirmwareImage {
                     }
                 }
                 TLV_DEF_CALIB => {
-                    if data.len() != 12 {
-                        return Err(FirmwareError::InvalidImage);
-                    }
-                    let kind = read_u32(data, 0)? as usize;
-                    if kind >= UCODE_TYPE_MAX {
-                        return Err(FirmwareError::InvalidImage);
-                    }
-                    image.default_calibration[kind] = Some(DefaultCalibration {
-                        flow_trigger: read_u32(data, 4)?,
-                        event_trigger: read_u32(data, 8)?,
-                    });
+                    set_default_calibration(&mut image, data)?;
                 }
                 TLV_PHY_SKU => {
                     if data.len() != 4 {
@@ -594,6 +584,23 @@ fn store_section(
         bytes: data[4..].to_vec(),
     });
     *count += 1;
+    Ok(())
+}
+
+/// Store the init/regular uCode calibration event and flow triggers.
+// upstream: if_iwx.c iwx_set_default_calib()
+fn set_default_calibration(image: &mut FirmwareImage, data: &[u8]) -> Result<(), FirmwareError> {
+    if data.len() != 12 {
+        return Err(FirmwareError::InvalidImage);
+    }
+    let kind = read_u32(data, 0)? as usize;
+    if kind >= UCODE_TYPE_MAX {
+        return Err(FirmwareError::InvalidImage);
+    }
+    image.default_calibration[kind] = Some(DefaultCalibration {
+        flow_trigger: read_u32(data, 4)?,
+        event_trigger: read_u32(data, 8)?,
+    });
     Ok(())
 }
 

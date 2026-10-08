@@ -51,6 +51,12 @@ pub enum PnvmLoadError<E> {
     NotCompleted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopDeviceError {
+    Ring(crate::RingError),
+    Prepare(ApmError),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ControllerUcodeStartError<F, P> {
     Firmware(ControllerError<F>),
@@ -112,6 +118,30 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         Ok(self.hardware_rfkill)
     }
 
+    /// Stop uCode, reset DMA rings, release PNVM and re-prepare card/RF-kill state.
+    // upstream: if_iwx.c iwx_stop_device()
+    pub fn stop_device(&mut self) -> Result<bool, StopDeviceError> {
+        crate::disable_interrupts(&mut self.registers, &self.interrupt_masks);
+        let _ = crate::disable_rx_dma(&mut self.registers);
+        self.resources
+            .rx_queue
+            .reset()
+            .map_err(StopDeviceError::Ring)?;
+        for ring in &mut self.resources.tx_queues {
+            ring.reset().map_err(StopDeviceError::Ring)?;
+        }
+        self.registers.force_clear_nic_locks();
+        let _ = crate::apm_stop(&mut self.registers);
+        crate::software_reset(&mut self.registers);
+        crate::configure_msix_hardware(&mut self.registers, &self.interrupt_masks, true);
+        crate::disable_interrupts(&mut self.registers, &self.interrupt_masks);
+        crate::enable_rfkill_interrupts(&mut self.registers, &mut self.interrupt_masks);
+        self.hardware_rfkill = crate::hardware_rfkill(&mut self.registers);
+        crate::prepare_card_hw(&mut self.registers).map_err(StopDeviceError::Prepare)?;
+        self.pnvm_dma.take();
+        Ok(self.hardware_rfkill)
+    }
+
     /// Apply firmware/stepping NIC setup before firmware DMA publication.
     // upstream: if_iwx.c iwx_nic_init()
     pub fn initialize_nic(
@@ -140,6 +170,26 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             command,
             external,
         )
+    }
+
+    /// Build and submit a single-payload PDU through the active TX command ring.
+    // upstream: if_iwx.c iwx_send_cmd_pdu()
+    pub fn send_command_pdu(
+        &mut self,
+        command_id: u32,
+        flags: u32,
+        payload: &[u8],
+        response_capacity: usize,
+        external: Option<&mut A::Region>,
+    ) -> Result<crate::CommandTicket, crate::CommandError> {
+        let parts = [payload];
+        let command = HostCommand {
+            id: command_id,
+            flags,
+            response_capacity,
+            parts: &parts,
+        };
+        self.send_command(&command, external)
     }
 
     /// Drain completed FH RX buffers, retain command replies, and dispatch firmware/data packets.
@@ -288,6 +338,31 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         self.send_command_wait(&host, external, dispatch)
     }
 
+    /// Send a PDU and return its firmware response status word.
+    // upstream: if_iwx.c iwx_send_cmd_pdu_status()
+    pub fn send_command_pdu_status<E>(
+        &mut self,
+        command_id: u32,
+        flags: u32,
+        payload: &[u8],
+        response_capacity: usize,
+        external: Option<&mut A::Region>,
+        dispatch: impl FnMut(&crate::RxPacket<'_>, crate::RxMbufPlan) -> Result<bool, E>,
+    ) -> Result<(crate::CompletedCommand, u32), SyncCommandError<E>> {
+        let parts = [payload];
+        let command = HostCommand {
+            id: command_id,
+            flags,
+            response_capacity,
+            parts: &parts,
+        };
+        let completed = self.send_command_wait(&command, external, dispatch)?;
+        let status =
+            crate::command_response_status(completed.response.as_deref().unwrap_or(&[]), false)
+                .map_err(SyncCommandError::Command)?;
+        Ok((completed, status))
+    }
+
     /// Decode an RX_MPDU descriptor and apply the source decrypt/replay/duplicate gates.
     // upstream: if_iwx.c iwx_rx_mpdu_mq() / iwx_rx_hwdecrypt() / iwx_detect_duplicate()
     pub fn process_rx_mpdu(
@@ -327,7 +402,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         }
         self.rx_ba_sessions.reorder_mpdu(
             baid,
-            frame.tid_index,
+            frame.reorder_tid,
             ((reorder & REORDER_SN_MASK) >> REORDER_SN_SHIFT) as u16,
             (reorder & REORDER_NSSN_MASK) as u16,
             frame.metadata.is_amsdu(),
@@ -798,6 +873,7 @@ mod tests {
             hardware_decrypted: false,
             same_sequence: false,
             tid_index: 3,
+            reorder_tid: 3,
         };
         let result = controller.reorder_rx_mpdu(frame, 1).unwrap().unwrap();
         assert!(!result.consumed);

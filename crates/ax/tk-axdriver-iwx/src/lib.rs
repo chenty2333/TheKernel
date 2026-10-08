@@ -113,7 +113,7 @@ pub use control::{
 };
 pub use controller::{
     ControllerError, ControllerUcodeStartError, IwxController, PnvmLoadError, RxServiceError,
-    SyncCommandError,
+    StopDeviceError, SyncCommandError,
 };
 pub use diagnostics::{
     BZ_ERROR_TABLE_MIN, DriverDebugStatus, ERROR_ELEMENT_SIZE_BYTES, ERROR_START_OFFSET_BYTES,
@@ -193,8 +193,8 @@ pub use phy::{
     PHY_CONTEXT_ACTION_REMOVE, PHY_CONTEXT_COMMAND, PHY_RX_CHAIN_COUNT_SHIFT,
     PHY_RX_CHAIN_MIMO_COUNT_SHIFT, PHY_RX_CHAIN_VALID_SHIFT, PHY_WIDTH_20, PHY_WIDTH_40,
     PHY_WIDTH_80, PHY_WIDTH_160, PhyContextConfig, PhyContextError, PhyUpdateError, PhyUpdateStage,
-    RLC_CONFIG_COMMAND, RLC_CONFIG_VERSION, phy_context_command, rlc_config_command,
-    update_phy_context,
+    RLC_CONFIG_COMMAND, RLC_CONFIG_VERSION, phy_context_command, phy_context_command_uhb_v3_v4,
+    phy_context_command_v3_v4, rlc_config_command, update_phy_context,
 };
 pub use pm::{
     Activation, ActivationAction, InitTaskAction, InitTaskState, ResumeAction, WakeAction,
@@ -217,15 +217,17 @@ pub use queue::{
     queue_cb_size, scheduler_queue_command, validate_enable_response,
 };
 pub use rate::{
-    HtRateSet, MCS_TO_RATE_INDEX, PeerTxRateState, RATES, Rate, TLC_CHAIN_A, TLC_CHAIN_B,
-    TLC_CONFIG_COMMAND, TLC_CONFIG_GROUP, TLC_FLAG_STBC, TLC_MODE_HT, TLC_MODE_NON_HT,
+    HtRateCapabilities, HtRateSet, MCS_TO_RATE_INDEX, PeerTxRateState, RATES, Rate, TLC_CHAIN_A,
+    TLC_CHAIN_B, TLC_CONFIG_COMMAND, TLC_CONFIG_GROUP, TLC_FLAG_STBC, TLC_MODE_HT, TLC_MODE_NON_HT,
     TLC_MODE_VHT, TLC_RATE_STATION_ID, TLC_RATE_UPDATE_FLAG, TLC_SGI_20, TLC_SGI_40, TLC_SGI_80,
     TLC_SGI_160, TLC_UPDATE_NOTIFICATION, TLC_WIDTH_20, TLC_WIDTH_40, TLC_WIDTH_80, TLC_WIDTH_160,
     TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY, TlRateConfig, TlRateConfigError, TxRateError,
-    TxRateInput, TxRateSelection, ack_rate_masks, apply_tlc_rate_update, fw_rate_index_cck,
-    fw_rate_index_ofdm, init_rate_command, legacy_rate_index, rate_index_to_peer_rate,
-    rate_value_to_index, rateset_11g_index, rateset_ht_bitmap, rateset_vht_bitmap, select_tx_rate,
-    tlc_rate_command_v3, tlc_rate_command_v4,
+    TxRateInput, TxRateSelection, VhtRateCapabilities, ack_rate_masks, antenna_count,
+    apply_tlc_rate_update, fw_rate_index_cck, fw_rate_index_ofdm, init_rate_command,
+    legacy_rate_index, mimo_enabled, rate_index_to_peer_rate, rate_value_to_index,
+    rateset_11g_index, rateset_ht_bitmap, rateset_vht_bitmap, select_tx_rate,
+    setup_ht_rate_capabilities, setup_vht_rate_capabilities, tlc_rate_command_v3,
+    tlc_rate_command_v4, valid_antenna_masks, valid_rx_antenna_mask, valid_tx_antenna_mask,
 };
 pub use registers::{CsrAccess, DeviceFamily, IoBarrier, IwxRegisters, RegisterError};
 pub use rings::{

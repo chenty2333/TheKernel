@@ -88,6 +88,20 @@ impl<B: CsrAccess> IwxRegisters<B> {
         self.nic_locks
     }
 
+    /// Force-clear firmware ownership after stop, matching the source stop path.
+    pub fn force_clear_nic_locks(&mut self) {
+        const CSR_GP_CNTRL: u32 = 0x024;
+        const CSR_GP_MAC_ACCESS_REQ: u32 = 1 << 3;
+        const CSR_GP_BZ_MAC_ACCESS_REQ: u32 = 1 << 21;
+        let request = if self.family >= DeviceFamily::Bz {
+            CSR_GP_BZ_MAC_ACCESS_REQ
+        } else {
+            CSR_GP_MAC_ACCESS_REQ
+        };
+        self.clear_csr_bits(CSR_GP_CNTRL, request);
+        self.nic_locks = 0;
+    }
+
     /// Read a CSR register directly through the PCI BAR.
     pub fn read_csr(&mut self, offset: u32) -> u32 {
         self.bus.read32(offset)

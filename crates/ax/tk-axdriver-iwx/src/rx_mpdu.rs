@@ -168,6 +168,7 @@ pub struct ProcessedRxMpdu {
     pub hardware_decrypted: bool,
     pub same_sequence: bool,
     pub tid_index: u8,
+    pub reorder_tid: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +218,8 @@ pub fn process_rx_mpdu(
             )
             .map_err(RxMpduProcessError::CcmpReplay)?;
     }
+    let frame_tid = frame_tid_index(&frame).map_err(RxMpduProcessError::Descriptor)?;
+    let reorder_tid = if frame_tid == 8 { 0 } else { frame_tid as u8 };
     let duplicate = duplicates
         .check(&frame, metadata.is_amsdu(), metadata.amsdu_subframe())
         .map_err(RxMpduProcessError::Duplicate)?;
@@ -229,16 +232,20 @@ pub fn process_rx_mpdu(
         hardware_decrypted,
         same_sequence: duplicate.same_sequence,
         tid_index: duplicate.tid_index,
+        reorder_tid,
     }))
 }
 
 fn frame_tid_index(frame: &[u8]) -> Result<usize, RxMpduError> {
-    if frame.len() < 24 {
+    if frame.len() < 2 {
         return Err(RxMpduError::InvalidHeaderLength);
     }
     let is_qos_data = frame[0] & FC_TYPE_MASK == FC_TYPE_DATA && frame[0] & FC_SUBTYPE_QOS != 0;
     if !is_qos_data {
         return Ok(8);
+    }
+    if frame.len() < 24 {
+        return Err(RxMpduError::InvalidHeaderLength);
     }
     let offset = 24 + if frame[1] & 0x03 == 0x03 { 6 } else { 0 };
     let qos = frame

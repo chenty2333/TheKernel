@@ -205,7 +205,7 @@ enum FirmwareBootstrapError {
     MacAddressUnavailable,
     MissingNvmResponse,
     Nvm(axdriver_iwx::NvmError),
-    HardwareStopFailed,
+    Stop(axdriver_iwx::StopDeviceError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,10 +386,9 @@ fn bootstrap_init_firmware(
         &bundle.image.enabled_capabilities,
     )
     .map_err(FirmwareBootstrapError::Nvm)?;
-    axdriver_iwx::disable_interrupts(&mut controller.registers, &controller.interrupt_masks);
-    if !axdriver_iwx::apm_stop(&mut controller.registers) {
-        return Err(FirmwareBootstrapError::HardwareStopFailed);
-    }
+    controller
+        .stop_device()
+        .map_err(FirmwareBootstrapError::Stop)?;
     Ok(nvm)
 }
 
@@ -452,8 +451,8 @@ fn log_bootstrap_error(bdf: Bdf, error: FirmwareBootstrapError) {
         FirmwareBootstrapError::Nvm(error) => {
             warn!("iwx: {bdf:?}: NVM response invalid: {error:?}")
         }
-        FirmwareBootstrapError::HardwareStopFailed => {
-            warn!("iwx: {bdf:?}: stop after init/NVM bootstrap failed")
+        FirmwareBootstrapError::Stop(error) => {
+            warn!("iwx: {bdf:?}: stop after init/NVM bootstrap failed: {error:?}")
         }
     }
 }

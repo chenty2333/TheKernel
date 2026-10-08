@@ -671,8 +671,121 @@ pub fn select_tx_rate(input: TxRateInput<'_>) -> Result<TxRateSelection, TxRateE
     })
 }
 
+const FW_PHY_TX_CHAIN_SHIFT: u32 = 16;
+const FW_PHY_RX_CHAIN_SHIFT: u32 = 20;
+const ANT_A: u8 = 1 << 0;
+const ANT_B: u8 = 1 << 1;
+const ANT_C: u8 = 1 << 2;
+const ANT_AB: u8 = ANT_A | ANT_B;
+const ANT_BC: u8 = ANT_B | ANT_C;
+const VHT_MCS_0_9: u16 = 2;
+const VHT_MCS_NOT_SUPPORTED: u16 = 3;
+
+/// Intersect the firmware transmit-chain mask with NVM's valid chains.
+// upstream: if_iwx.c iwx_fw_valid_tx_ant()
+pub const fn valid_tx_antenna_mask(firmware_phy_config: u32, nvm: &crate::NvmInfo) -> u8 {
+    let mut tx = ((firmware_phy_config >> FW_PHY_TX_CHAIN_SHIFT) & 0xf) as u8;
+    if nvm.valid_tx_antennas != 0 {
+        tx &= nvm.valid_tx_antennas;
+    }
+    tx
+}
+
+/// Intersect the firmware receive-chain mask with NVM's valid chains.
+// upstream: if_iwx.c iwx_fw_valid_rx_ant()
+pub const fn valid_rx_antenna_mask(firmware_phy_config: u32, nvm: &crate::NvmInfo) -> u8 {
+    let mut rx = ((firmware_phy_config >> FW_PHY_RX_CHAIN_SHIFT) & 0xf) as u8;
+    if nvm.valid_rx_antennas != 0 {
+        rx &= nvm.valid_rx_antennas;
+    }
+    rx
+}
+
+/// Collect both firmware/NVM chain masks for a single caller.
+pub const fn valid_antenna_masks(firmware_phy_config: u32, nvm: &crate::NvmInfo) -> (u8, u8) {
+    let tx = valid_tx_antenna_mask(firmware_phy_config, nvm);
+    let rx = valid_rx_antenna_mask(firmware_phy_config, nvm);
+    (tx, rx)
+}
+
+/// Count only the three physical antenna-chain bits known to OpenBSD iwx.
+// upstream: if_iwx.c iwx_fw_num_ant()
+pub const fn antenna_count(mask: u8) -> u8 {
+    ((mask & ANT_A != 0) as u8) + ((mask & ANT_B != 0) as u8) + ((mask & ANT_C != 0) as u8)
+}
+
+/// MIMO is disabled by either the NVM SKU or the user's NO MIMO option.
+// upstream: if_iwx.c iwx_mimo_enabled()
+pub const fn mimo_enabled(nvm: &crate::NvmInfo, user_no_mimo: bool) -> bool {
+    !nvm.mimo_disabled && !user_no_mimo
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HtRateCapabilities {
+    pub tx_mcs_set_defined: bool,
+    pub supported_mcs: [u8; 16],
+    pub tx_stbc: bool,
+    pub rx_stbc_streams: u8,
+}
+
+/// Build the HT MCS bitmap and STBC caps from the selected antenna masks.
+// upstream: if_iwx.c iwx_setup_ht_rates()
+pub fn setup_ht_rate_capabilities(tx_ant: u8, rx_ant: u8, mimo: bool) -> HtRateCapabilities {
+    let mut supported_mcs = [0; 16];
+    supported_mcs[0] = 0xff;
+    if mimo && (rx_ant & ANT_AB == ANT_AB || rx_ant & ANT_BC == ANT_BC) {
+        supported_mcs[1] = 0xff;
+    }
+    HtRateCapabilities {
+        tx_mcs_set_defined: true,
+        supported_mcs,
+        tx_stbc: antenna_count(tx_ant) > 1,
+        rx_stbc_streams: 1,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VhtRateCapabilities {
+    pub rx_mcs_map: u16,
+    pub tx_mcs_map: u16,
+    pub rx_stbc_streams: u8,
+    pub rx_antenna_pattern: bool,
+    pub tx_stbc: bool,
+    pub tx_antenna_pattern: bool,
+}
+
+/// Build the per-stream VHT MCS map and antenna-pattern/STBC policy.
+// upstream: if_iwx.c iwx_setup_vht_rates()
+pub fn setup_vht_rate_capabilities(tx_ant: u8, rx_ant: u8, mimo: bool) -> VhtRateCapabilities {
+    let mut rx_count = antenna_count(rx_ant);
+    let mut tx_count = antenna_count(tx_ant);
+    if !mimo {
+        rx_count = 1;
+        tx_count = 1;
+    }
+    let mut mcs_map = VHT_MCS_0_9;
+    if mimo && (rx_ant & ANT_AB == ANT_AB || rx_ant & ANT_BC == ANT_BC) {
+        mcs_map |= VHT_MCS_0_9 << 2;
+    } else {
+        mcs_map |= VHT_MCS_NOT_SUPPORTED << 2;
+    }
+    for stream in 3..=8 {
+        mcs_map |= VHT_MCS_NOT_SUPPORTED << (2 * (stream - 1));
+    }
+    VhtRateCapabilities {
+        rx_mcs_map: mcs_map,
+        tx_mcs_map: mcs_map,
+        rx_stbc_streams: 1,
+        rx_antenna_pattern: rx_count == 1,
+        tx_stbc: tx_count > 1,
+        tx_antenna_pattern: tx_count <= 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::*;
 
     #[test]
@@ -854,5 +967,48 @@ mod tests {
             rateset_vht_bitmap(0, 0, true),
             Err(TxRateError::InvalidSpatialStream)
         );
+    }
+
+    #[test]
+    fn antenna_and_ht_vht_caps_follow_firmware_nvm_and_mimo_policy() {
+        let nvm = crate::NvmInfo {
+            hardware_address: [2, 1, 2, 3, 4, 5],
+            nvm_version: 1,
+            board_type: 0,
+            hardware_address_count: 1,
+            empty_otp: false,
+            band_24ghz: true,
+            band_52ghz: true,
+            supports_11n: true,
+            supports_11ac: true,
+            supports_11ax: true,
+            mimo_disabled: false,
+            valid_tx_antennas: 0x3,
+            valid_rx_antennas: 0x6,
+            lar_enabled: false,
+            channel_profiles: Vec::new(),
+        };
+        let firmware_phy = (0x7 << FW_PHY_TX_CHAIN_SHIFT) | (0x7 << FW_PHY_RX_CHAIN_SHIFT);
+        let (tx, rx) = valid_antenna_masks(firmware_phy, &nvm);
+        assert_eq!((tx, rx), (0x3, 0x6));
+        assert_eq!(antenna_count(0x7), 3);
+        assert!(mimo_enabled(&nvm, false));
+
+        let ht = setup_ht_rate_capabilities(tx, rx, true);
+        assert!(ht.tx_mcs_set_defined && ht.tx_stbc);
+        assert_eq!(ht.supported_mcs[0], 0xff);
+        assert_eq!(ht.supported_mcs[1], 0xff); // B+C receive pair
+        assert_eq!(ht.rx_stbc_streams, 1);
+
+        let vht = setup_vht_rate_capabilities(tx, rx, true);
+        assert_eq!(vht.rx_mcs_map & 0x03, VHT_MCS_0_9);
+        assert_eq!((vht.rx_mcs_map >> 2) & 0x03, VHT_MCS_0_9);
+        assert!(vht.tx_stbc);
+        assert!(!vht.tx_antenna_pattern);
+
+        let single = setup_vht_rate_capabilities(1, ANT_A, false);
+        assert_eq!((single.rx_mcs_map >> 2) & 0x03, VHT_MCS_NOT_SUPPORTED);
+        assert!(single.rx_antenna_pattern && single.tx_antenna_pattern);
+        assert!(!mimo_enabled(&nvm, true));
     }
 }

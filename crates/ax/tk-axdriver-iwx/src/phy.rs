@@ -58,9 +58,43 @@ pub struct PhyContextConfig {
     pub command_version: u8,
 }
 
-/// Build PHY_CONTEXT_CMD v3/v4, including the larger UHB channel-info layout.
+/// Select the standard or UHB PHY_CONTEXT_CMD v3/v4 builder.
 // upstream: if_iwx.c iwx_phy_ctxt_cmd()
 pub fn phy_context_command(
+    config: PhyContextConfig,
+    slot: u8,
+    queue: u8,
+) -> Result<EncodedCommand, PhyContextError> {
+    if config.ultra_high_band_channels {
+        phy_context_command_uhb_v3_v4(config, slot, queue)
+    } else {
+        phy_context_command_v3_v4(config, slot, queue)
+    }
+}
+
+/// Build the standard-band v3/v4 PHY context layout.
+// upstream: if_iwx.c iwx_phy_ctxt_cmd_v3_v4()
+pub fn phy_context_command_v3_v4(
+    mut config: PhyContextConfig,
+    slot: u8,
+    queue: u8,
+) -> Result<EncodedCommand, PhyContextError> {
+    config.ultra_high_band_channels = false;
+    build_phy_context_command(config, slot, queue)
+}
+
+/// Build the UHB v3/v4 PHY context with its wider channel-info structure.
+// upstream: if_iwx.c iwx_phy_ctxt_cmd_uhb_v3_v4()
+pub fn phy_context_command_uhb_v3_v4(
+    mut config: PhyContextConfig,
+    slot: u8,
+    queue: u8,
+) -> Result<EncodedCommand, PhyContextError> {
+    config.ultra_high_band_channels = true;
+    build_phy_context_command(config, slot, queue)
+}
+
+fn build_phy_context_command(
     config: PhyContextConfig,
     slot: u8,
     queue: u8,

@@ -130,7 +130,9 @@ When rootfs firmware becomes available, it runs the Init ucode ALIVE/INIT
 sequence by polling and servicing the source interrupt/RX rings, reads the
 strap/OTP MAC and NVM_GET_INFO response, then masks device interrupts and stops
 the NIC as OpenBSD's preinit path does. PCI INTx is disabled while this
-synchronous polling adapter is used. The normal runtime ucode/PNVM sequence,
+synchronous polling adapter is used. Controller stop now resets RX/TX rings,
+clears held NIC access, stops/resets the APM, restores RF-kill routing, and
+re-prepares the card after NVM read. The normal runtime ucode/PNVM sequence,
 including regular ucode, PNVM doorbell completion, and post-ALIVE setup, is
 exposed in source order on the controller but is not yet called by an if-up
 hook. The installed runtime interrupt worker and wlan0 publication remain
