@@ -382,6 +382,116 @@ pub struct MmcCid {
     pub manufacturing_month: u8,
 }
 
+/// Fields decoded from an SD or MMC CSD register.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MmcCsd {
+    pub structure: u8,
+    pub spec_version: u8,
+    pub transfer_rate_hz: u32,
+    pub command_classes: u16,
+    pub read_block_len: u32,
+    pub write_block_len: u32,
+    pub capacity_bytes: u64,
+    pub erase_block_sectors: u32,
+    pub read_current_min_ma: u32,
+    pub read_current_max_ma: u32,
+    pub write_current_min_ma: u32,
+    pub write_current_max_ma: u32,
+    pub read_partial: bool,
+    pub write_partial: bool,
+    pub read_misaligned: bool,
+    pub write_misaligned: bool,
+    pub write_protect_group_size: u32,
+    pub write_protect_group_enabled: bool,
+    pub write_to_read_factor: u32,
+}
+
+const MMC_EXP: [u32; 8] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
+const MMC_MANT: [u32; 16] = [
+    0, 10, 12, 13, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80,
+];
+const MMC_CUR_MIN: [u32; 8] = [500, 1_000, 5_000, 10_000, 25_000, 35_000, 60_000, 100_000];
+const MMC_CUR_MAX: [u32; 8] = [
+    1_000, 5_000, 10_000, 25_000, 35_000, 45_000, 800_000, 200_000,
+];
+
+// upstream: mmc.c mmc_decode_csd_sd() and mmc_decode_csd_mmc()
+pub fn decode_csd(response: SdhciResponse, mmc: bool) -> Option<MmcCsd> {
+    let structure = response_bits(response, 126, 2) as u8;
+    if !mmc && structure > 1 {
+        return None;
+    }
+    let mmc_structure = response_bits(response, 126, 2) as u8;
+    let read_block_len = 1u32.checked_shl(response_bits(response, 80, 4))?;
+    let write_block_len = 1u32.checked_shl(response_bits(response, 22, 4))?;
+    let (capacity_bytes, erase_block_sectors) = if !mmc && structure == 1 {
+        (
+            (u64::from(response_bits(response, 48, 22)) + 1) * 512 * 1024,
+            response_bits(response, 46, 1) * (response_bits(response, 39, 7) + 1)
+                + (1 - response_bits(response, 46, 1)),
+        )
+    } else if !mmc {
+        let size = u64::from(response_bits(response, 62, 12) + 1);
+        let multiplier = response_bits(response, 47, 3) + 2;
+        (
+            size.checked_shl(multiplier + read_block_len.trailing_zeros())?,
+            response_bits(response, 46, 1) * (response_bits(response, 39, 7) + 1)
+                + (1 - response_bits(response, 46, 1)),
+        )
+    } else {
+        let size = u64::from(response_bits(response, 62, 12) + 1);
+        let multiplier = response_bits(response, 47, 3) + 2;
+        (
+            size.checked_shl(multiplier + read_block_len.trailing_zeros())?,
+            (response_bits(response, 42, 5) + 1) * (response_bits(response, 37, 5) + 1),
+        )
+    };
+    let transfer_rate = MMC_EXP[response_bits(response, 96, 3) as usize]
+        .saturating_mul(10_000)
+        .saturating_mul(MMC_MANT[response_bits(response, 99, 4) as usize]);
+    Some(MmcCsd {
+        structure: if mmc { mmc_structure } else { structure },
+        spec_version: if mmc {
+            response_bits(response, 122, 4) as u8
+        } else {
+            0
+        },
+        transfer_rate_hz: transfer_rate,
+        command_classes: response_bits(response, 84, 12) as u16,
+        read_block_len,
+        write_block_len,
+        capacity_bytes,
+        erase_block_sectors,
+        read_current_min_ma: if mmc || structure == 0 {
+            MMC_CUR_MIN[response_bits(response, 59, 3) as usize]
+        } else {
+            0
+        },
+        read_current_max_ma: if mmc || structure == 0 {
+            MMC_CUR_MAX[response_bits(response, 56, 3) as usize]
+        } else {
+            0
+        },
+        write_current_min_ma: if mmc || structure == 0 {
+            MMC_CUR_MIN[response_bits(response, 53, 3) as usize]
+        } else {
+            0
+        },
+        write_current_max_ma: if mmc || structure == 0 {
+            MMC_CUR_MAX[response_bits(response, 50, 3) as usize]
+        } else {
+            0
+        },
+        read_partial: response_bits(response, 79, 1) != 0,
+        write_partial: response_bits(response, 21, 1) != 0,
+        read_misaligned: response_bits(response, 77, 1) != 0,
+        write_misaligned: response_bits(response, 78, 1) != 0,
+        write_protect_group_size: response_bits(response, 32, if mmc { 5 } else { 7 }),
+        write_protect_group_enabled: response_bits(response, 31, 1) != 0,
+        write_to_read_factor: 1u32.checked_shl(response_bits(response, 26, 3))?,
+    })
+}
+
 /// Format the upstream MMC card ID and serial strings used by mmcsd.
 // upstream: mmc.c mmc_format_card_id_string()
 pub fn format_card_id(cid: MmcCid, mmc: bool, high_capacity: bool) -> (String, String) {
@@ -399,7 +509,13 @@ pub fn format_card_id(cid: MmcCid, mmc: bool, high_capacity: bool) -> (String, S
     let product_end = if mmc { 6 } else { 5 };
     let product: String = cid.product_name[..product_end]
         .iter()
-        .map(|byte| if byte.is_ascii_graphic() { *byte as char } else { '?' })
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                *byte as char
+            } else {
+                '?'
+            }
+        })
         .collect();
     let card_type = if mmc { "MMC" } else { "SD" };
     let capacity = if high_capacity { "HC" } else { "" };
@@ -765,8 +881,7 @@ impl<I: SdhciIo> SdhciHost<I> {
             self.io
                 .write8(SDHCI_POWER_CONTROL as usize, power_control | 0x10);
             self.io.delay_us(10);
-            self.io
-                .write8(SDHCI_POWER_CONTROL as usize, power_control);
+            self.io.write8(SDHCI_POWER_CONTROL as usize, power_control);
             self.io.delay_us(300);
         }
         Ok(())
@@ -1321,26 +1436,12 @@ fn mmc_send_status<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> Result<u32,
 }
 
 // upstream: mmc.c mmc_decode_csd() capacity fields
-fn mmc_csd_sectors(csd: SdhciResponse, high_capacity: bool) -> Result<u64, SdhciError> {
-    if high_capacity {
-        Ok((u64::from(response_bits(csd, 48, 22)) + 1) * 1024)
-    } else {
-        let read_len = response_bits(csd, 80, 4);
-        let c_size = u64::from(response_bits(csd, 62, 12));
-        let c_mult = response_bits(csd, 47, 3);
-        ((c_size + 1)
-            .checked_shl(c_mult + 2 + read_len)
-            .ok_or(SdhciError::InvalidTransfer)?)
-        .checked_div(512)
-        .ok_or(SdhciError::InvalidTransfer)
-    }
-}
-
 /// SD card block device initialized through the generic SDHCI command path.
 pub struct SdhciDisk<I: SdhciIo> {
     host: SdhciHost<I>,
     rca: u16,
     cid: MmcCid,
+    csd: MmcCsd,
     sectors: u64,
     high_capacity: bool,
     erase_group_sectors: u32,
@@ -1362,12 +1463,9 @@ impl<I: SdhciIo> SdhciDisk<I> {
         let rca = mmc_send_relative_addr(&mut host, mmc)?;
         let csd = mmc_send_csd(&mut host, rca)?;
         mmc_select_card(&mut host, rca)?;
-        let mut sectors = mmc_csd_sectors(csd, high_capacity)?;
-        let mut erase_group_sectors = if response_bits(csd, 46, 1) != 0 {
-            1
-        } else {
-            response_bits(csd, 39, 7).saturating_add(1)
-        };
+        let csd_info = decode_csd(csd, mmc).ok_or(SdhciError::InvalidTransfer)?;
+        let mut sectors = csd_info.capacity_bytes / 512;
+        let mut erase_group_sectors = csd_info.erase_block_sectors;
         let mut ext_csd_bytes = [0u8; 512];
         let mut ext_csd = None;
         if mmc && high_capacity {
@@ -1426,6 +1524,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             host,
             rca,
             cid,
+            csd: csd_info,
             sectors,
             high_capacity,
             erase_group_sectors: erase_group_sectors.max(1),
@@ -1449,6 +1548,10 @@ impl<I: SdhciIo> SdhciDisk<I> {
 
     pub const fn cid(&self) -> MmcCid {
         self.cid
+    }
+
+    pub const fn csd(&self) -> MmcCsd {
+        self.csd
     }
 
     // upstream: mmcsd.c mmcsd_attach() user/boot partition publication
@@ -2115,6 +2218,27 @@ mod tests {
     }
 
     #[test]
+    fn csd_decoder_matches_sd_structure_capacity_and_transfer_fields() {
+        let mut raw = 0u128;
+        raw |= 1u128 << 126;
+        raw |= 0x12345u128 << 48;
+        raw |= 12u128 << 99;
+        raw |= 1u128 << 96;
+        raw |= 1u128 << 46;
+        let response = SdhciResponse([
+            (raw >> 96) as u32,
+            (raw >> 64) as u32,
+            (raw >> 32) as u32,
+            raw as u32,
+        ]);
+        let csd = decode_csd(response, false).unwrap();
+        assert_eq!(csd.structure, 1);
+        assert_eq!(csd.capacity_bytes, (0x12345 + 1) * 512 * 1024);
+        assert_eq!(csd.erase_block_sectors, 1);
+        assert_eq!(csd.transfer_rate_hz, MMC_EXP[1] * 10_000 * MMC_MANT[12]);
+    }
+
+    #[test]
     fn host_reset_clock_and_command_response_are_bounded() {
         let mut io = MockIo::default();
         io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
@@ -2281,6 +2405,7 @@ mod tests {
             host,
             rca: 1,
             cid: MmcCid::default(),
+            csd: MmcCsd::default(),
             sectors: 16,
             high_capacity: true,
             erase_group_sectors: 1,
@@ -2303,6 +2428,7 @@ mod tests {
             host,
             rca: 1,
             cid: MmcCid::default(),
+            csd: MmcCsd::default(),
             sectors: 10_000,
             high_capacity: true,
             erase_group_sectors: 1,
@@ -2337,6 +2463,7 @@ mod tests {
             host,
             rca: 1,
             cid: MmcCid::default(),
+            csd: MmcCsd::default(),
             sectors: 10,
             high_capacity: true,
             erase_group_sectors: 1,

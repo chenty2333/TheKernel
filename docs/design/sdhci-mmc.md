@@ -4,7 +4,8 @@ The register/quirk definitions in `tk-axdriver-block::sdhci` are translated
 from FreeBSD `sys/dev/sdhci/sdhci.h` at
 `c2b7fe4a9e94a0edba9dd2772874928b565c4f9e` (BSD-2-Clause). The Rust path now
 includes bounded host reset/clock/command/PIO, SD and MMC OCR initialization,
-CSD and EXT_CSD capacity/partition metadata parsing, CMD55 APP_CMD validation,
+CSD and EXT_CSD capacity/partition metadata parsing, CID identity and mmcsd
+card-ID formatting, CMD55 APP_CMD validation,
 idempotent-command retries with CMD/DAT reset,
 function-separated MMC CMD8/OCR/CID/RCA/CSD/select/status initialization helpers,
 single/multi-block CMD17/18/24/25 I/O,
