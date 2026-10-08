@@ -1241,6 +1241,35 @@ struct MappedPowerWellIo<'a, R> {
 }
 
 impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
+    fn sync_well(
+        &mut self,
+        group: PowerWellGroup,
+        instance: PowerWellInstance,
+        _: u32,
+    ) -> Result<(), intel_display::Error> {
+        if instance.always_on || group.ops == WellOps::AlwaysOn || group.ops == WellOps::DcOff {
+            return Ok(());
+        }
+        if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
+            return Err(intel_display::Error::Refused);
+        }
+        let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
+        let adapter = HswPowerWellAdapter { regs: self.regs };
+        intel_display::power_well::hsw_power_well_sync_hw(
+            &adapter,
+            intel_display::power_well::HswWellRegisters {
+                bios: well.request_registers.bios.offset(),
+                driver: well.register.offset(),
+                kvmr: well.request_registers.kvmr.map(Register::offset),
+                debug: well.request_registers.debug.offset(),
+                fuse_status: regs::SKL_FUSE_STATUS.offset(),
+                gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
+            },
+            well.index as u8,
+        )
+        .map(|_| ())
+    }
+
     fn enable_well(
         &mut self,
         group: PowerWellGroup,
@@ -1525,6 +1554,20 @@ fn bring_up_inner(
     let platform = DmcPlatform::AlderLakeN;
     let power_map = power_wells(platform);
     let mut power_domains = PowerDomainState::new(power_map);
+    power_domains
+        .sync_domain(
+            power_map,
+            PowerDomain::PipeA,
+            &mut MappedPowerWellIo { regs, platform },
+        )
+        .map_err(|error| {
+            unwind(
+                regs,
+                we_requested,
+                "PIPE_A power-well BIOS handoff",
+                PowerError::PowerDomain(format!("{error:?}")),
+            )
+        })?;
     power_domains
         .get(
             power_map,

@@ -108,6 +108,12 @@ pub enum PowerDomainError {
 
 /// Hardware backend corresponding to `intel_power_well_{get,put,is_enabled}`.
 pub trait PowerDomainIo {
+    fn sync_well(
+        &mut self,
+        group: PowerWellGroup,
+        instance: PowerWellInstance,
+        use_count: u32,
+    ) -> Result<(), Error>;
     fn enable_well(
         &mut self,
         group: PowerWellGroup,
@@ -182,6 +188,28 @@ impl PowerDomainState {
             .iter()
             .find(|(candidate, _)| *candidate == domain)
             .map_or(0, |(_, count)| *count)
+    }
+
+    /// Synchronize the request state for every well owned by one domain.
+    // upstream: intel_display_power.c intel_power_domains_sync_hw()
+    pub fn sync_domain(
+        &self,
+        map: &[PowerWellGroup],
+        domain: PowerDomain,
+        io: &mut impl PowerDomainIo,
+    ) -> Result<(), PowerDomainError> {
+        self.validate_map(map)?;
+        let mut flat = 0;
+        for group in map {
+            for instance in group.instances.iter().copied() {
+                if has_domain(instance, domain) {
+                    io.sync_well(*group, instance, self.well_counts[flat])
+                        .map_err(PowerDomainError::Backend)?;
+                }
+                flat += 1;
+            }
+        }
+        Ok(())
     }
 
     pub fn well_use_count(
@@ -383,11 +411,21 @@ mod tests {
 
     #[derive(Default)]
     struct FakePower {
+        synced: Vec<&'static str>,
         enabled: Vec<&'static str>,
         disabled: Vec<&'static str>,
     }
 
     impl PowerDomainIo for FakePower {
+        fn sync_well(
+            &mut self,
+            _: PowerWellGroup,
+            instance: PowerWellInstance,
+            _: u32,
+        ) -> Result<(), Error> {
+            self.synced.push(instance.name);
+            Ok(())
+        }
         fn enable_well(
             &mut self,
             _: PowerWellGroup,
@@ -440,5 +478,14 @@ mod tests {
                 .is_enabled(map, PowerDomain::PipeA, true, &io)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn sync_domain_visits_only_source_mapped_wells_in_map_order() {
+        let map = power_wells(DmcPlatform::AlderLakeN);
+        let state = PowerDomainState::new(map);
+        let mut io = FakePower::default();
+        state.sync_domain(map, PowerDomain::PipeA, &mut io).unwrap();
+        assert_eq!(io.synced, ["always-on", "PW_A"]);
     }
 }

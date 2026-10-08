@@ -1063,3 +1063,9 @@ The kernel maps `PowerWellInstance::irq_pipe_mask` into the HSW power-well
 sequence. While the parent IRQ is offline the upstream hooks are no-ops; while
 it is live the unsupported pipe transition fails closed instead of replacing
 the descriptor mask with zero.
+
+`power_domains.rs` adds the mapped `sync_domain()` traversal from
+`intel_display_power.c`; the kernel invokes it for Pipe-A before acquiring that
+domain, and `MappedPowerWellIo` maps the HSW group to
+`hsw_power_well_sync_hw()`. Other power domains and their well operations remain
+unintegrated.

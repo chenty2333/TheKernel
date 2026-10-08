@@ -594,3 +594,8 @@ The kernel power-well adapter carries each map descriptor's `irq_pipe_mask` to
 `HswWellSpec`; when its parent IRQ is live, untranslated per-pipe IRQ changes
 are refused rather than silently bypassed (mapping metadata from MIT
 `intel_display_power_map.c`, Copyright © 2022 Intel).
+
+`PowerDomainState::sync_domain()` and the kernel Pipe-A initialization hook
+translate the source's mapped-well hardware sync pass, including HSW BIOS
+request handoff (`intel_display_power.c`/`intel_display_power_well.c`, MIT,
+Copyright © 2022 Intel). Only the Pipe-A domain is integrated at present.
