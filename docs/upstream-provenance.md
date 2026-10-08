@@ -987,3 +987,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - FreeBSD `sys/dev/ahci/ahci_pci.c` `ahci_ids[]` at `c2b7fe4a9e94a0edba9dd2772874928b565c4f9e` (BSD-2-Clause): all 317 non-sentinel PCI ID/revision/name/quirk rows are translated in `crates/ax/tk-axdriver/src/ahci/pci_ids.rs`; full grant in `crates/ax/tk-axdriver/LICENSES/BSD-2-Clause-FreeBSD-AHCI.txt`.
 
 - FreeBSD `sys/dev/ahci/ahci.c` `ahci_process_read_log()` at `c2b7fe4a9e94a0edba9dd2772874928b565c4f9e` (BSD-2-Clause): the serialized NCQ-error READ LOG EXT recovery path is adapted in `crates/ax/tk-axdriver-block/src/ahci/disk.rs`; one-at-a-time BlockDriverOps completion avoids CAM held-command CCB fanout.
+
+- FreeBSD `sys/dev/sdhci/sdhci.h` at `c2b7fe4a9e94a0edba9dd2772874928b565c4f9e` (BSD-2-Clause): SDHCI register offsets, capability/interrupt masks, controller quirk and slot flags are translated into `crates/ax/tk-axdriver-block/src/sdhci.rs`; FreeBSD bus/task/CAM types are omitted. Full license: `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-SDHCI.txt`.

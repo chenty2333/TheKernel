@@ -12,6 +12,9 @@ pub mod ramdisk_static;
 /// Read-only storage backed by an immutable bootloader module.
 pub mod boot_module;
 
+/// SDHCI/MMC host-controller register definitions and protocol helpers.
+pub mod sdhci;
+
 #[cfg(feature = "ahci")]
 pub mod ahci;
 
