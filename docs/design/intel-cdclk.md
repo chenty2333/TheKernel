@@ -1,5 +1,10 @@
 # Intel CDCLK and PLL transition work
 
+`crates/ax/tk-intel-display/src/intel_cdclk_full.rs` now translates the full
+Linux 7.2.3 `intel_cdclk.c`: 152/152 ctags functions in source order. Its
+`IntelCdclkIo` backend makes MMIO, PCI, PCODE, atomic and platform operations
+explicit. It is exported and compiles as part of `tk-intel-display`.
+
 `crates/ax/tk-intel-display/src/cdclk.rs` owns the table-driven ADLP CDCLK
 selection and the platform-independent transition predicates. This change adds
 the source conditions for `intel_cdclk_can_crawl()`,
@@ -22,5 +27,5 @@ Still unported from the upstream file are caller-side PCode pre/post
 notifications, audio/PSR/GMBUS/AUX locking and coordination, atomic CDCLK
 state calculation, per-plane/bandwidth/watermark minima, maximum-frequency
 readout, and debugfs. The existing `bring_up()` remains the N305 boot-time
-CDCLK/RAWCLK entry point; runtime transition code is present but not invoked by
-a modeset caller yet.
+CDCLK/RAWCLK entry point; neither the full translation's backend nor the
+existing runtime transition adapter is invoked by a modeset caller yet.

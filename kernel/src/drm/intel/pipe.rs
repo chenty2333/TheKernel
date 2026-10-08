@@ -1015,7 +1015,7 @@ impl WatermarkProgram {
         &self.levels
     }
 
-    #[cfg(test)]
+    /// The level-zero register value, also retained in phase-6 underrun reports.
     pub(crate) const fn level_zero_value(&self) -> u32 {
         self.levels[0].register_value()
     }
