@@ -72,3 +72,6 @@ passive scan and clearing only the channel actually submitted to scan.
 Input header parsing now accounts for address-4, QoS and HTC fields, rejects
 unsupported control-frame header-length queries, validates truncation, and
 extracts QoS control in little-endian order.
+EDCA/WMM parsing retains the four AC record order and low-nibble update-count
+suppression; changed parameters request a driver update only when QoS is enabled.
+Both standard EDCA and vendor WMM element offsets are checked before decoding.

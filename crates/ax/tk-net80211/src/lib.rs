@@ -29,8 +29,9 @@ pub use channel::{
 };
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
 pub use input::{
-    HeaderError, has_address4, has_ht_control, has_qos_control, has_sequence_control,
-    header_length, qos_control,
+    EdcaAcParams, EdcaError, EdcaState, EdcaUpdate, HeaderError, has_address4, has_ht_control,
+    has_qos_control, has_sequence_control, header_length, parse_edca_body, parse_edca_ie,
+    parse_wmm_params, parse_wmm_qos_info, qos_control,
 };
 pub use node::{
     AKM_8021X, AKM_PSK, AKM_SHA256_8021X, AKM_SHA256_PSK, ASSOCFAIL_BASIC_RATE, ASSOCFAIL_BSSID,

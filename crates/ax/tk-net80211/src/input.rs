@@ -23,6 +23,33 @@ pub enum HeaderError {
     NotQosData,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdcaAcParams {
+    pub admission_control_mandatory: bool,
+    pub aifsn: u8,
+    pub ecw_min: u8,
+    pub ecw_max: u8,
+    pub txop_limit: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdcaState {
+    pub update_count: u8,
+    /// Records remain in OpenBSD AC order: BE, BK, VI, VO.
+    pub access_categories: [EdcaAcParams; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdcaError {
+    InvalidInformationElement,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdcaUpdate {
+    pub changed: bool,
+    pub notify_driver: bool,
+}
+
 // upstream: ieee80211_node.h ieee80211_has_seq()
 pub fn has_sequence_control(fc0: u8) -> bool {
     fc0 & FC0_TYPE_MASK != FC0_TYPE_CTL
@@ -80,6 +107,70 @@ pub fn qos_control(frame: &[u8]) -> Result<u16, HeaderError> {
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
+/// Parse an EDCA parameter body and detect 4-bit update-count changes.
+// upstream: ieee80211_input.c ieee80211_parse_edca_params_body()
+pub fn parse_edca_body(
+    state: &mut EdcaState,
+    body: &[u8],
+    qos_enabled: bool,
+) -> Result<EdcaUpdate, EdcaError> {
+    if body.len() < 18 {
+        return Err(EdcaError::InvalidInformationElement);
+    }
+    let update_count = body[0] & 0x0f;
+    if update_count == state.update_count {
+        return Ok(EdcaUpdate::default());
+    }
+    state.update_count = update_count;
+    for (index, ac) in state.access_categories.iter_mut().enumerate() {
+        let offset = 2 + index * 4;
+        ac.admission_control_mandatory = body[offset] & 0x10 != 0;
+        ac.aifsn = body[offset] & 0x0f;
+        ac.ecw_min = body[offset + 1] & 0x0f;
+        ac.ecw_max = body[offset + 1] >> 4;
+        ac.txop_limit = u16::from_le_bytes([body[offset + 2], body[offset + 3]]);
+    }
+    Ok(EdcaUpdate {
+        changed: true,
+        notify_driver: qos_enabled,
+    })
+}
+
+/// Parse an EDCA Parameter Set information element.
+// upstream: ieee80211_input.c ieee80211_parse_edca_params()
+pub fn parse_edca_ie(
+    state: &mut EdcaState,
+    ie: &[u8],
+    qos_enabled: bool,
+) -> Result<EdcaUpdate, EdcaError> {
+    if ie.len() < 2 || usize::from(ie[1]) < 18 || ie.len() < 20 {
+        return Err(EdcaError::InvalidInformationElement);
+    }
+    parse_edca_body(state, &ie[2..], qos_enabled)
+}
+
+/// Parse a WMM Parameter IE, preserving its source fixed-header offset.
+// upstream: ieee80211_input.c ieee80211_parse_wmm_params()
+pub fn parse_wmm_params(
+    state: &mut EdcaState,
+    ie: &[u8],
+    qos_enabled: bool,
+) -> Result<EdcaUpdate, EdcaError> {
+    if ie.len() < 2 || usize::from(ie[1]) < 24 || ie.len() < 26 {
+        return Err(EdcaError::InvalidInformationElement);
+    }
+    parse_edca_body(state, &ie[8..], qos_enabled)
+}
+
+/// Return the QoS Info byte in a WMM information/parameter element.
+// upstream: ieee80211_input.c ieee80211_parse_wmm_qosinfo()
+pub fn parse_wmm_qos_info(ie: &[u8]) -> Result<u8, EdcaError> {
+    if ie.len() < 2 || usize::from(ie[1]) < 7 || ie.len() < 9 {
+        return Err(EdcaError::InvalidInformationElement);
+    }
+    Ok(ie[8])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +208,45 @@ mod tests {
         qos[25] = 0x12;
         assert_eq!(qos_control(&qos), Ok(0x1234));
         assert_eq!(qos_control(&[0; 26]), Err(HeaderError::NotQosData));
+    }
+
+    #[test]
+    fn edca_wmm_parameter_updates_follow_update_count_and_field_order() {
+        let mut state = EdcaState::default();
+        let mut body = [0u8; 18];
+        body[0] = 1;
+        body[2] = 0x1f;
+        body[3] = 0x43;
+        body[4] = 0x34;
+        body[5] = 0x12;
+        let update = parse_edca_body(&mut state, &body, true).unwrap();
+        assert_eq!(
+            update,
+            EdcaUpdate {
+                changed: true,
+                notify_driver: true
+            }
+        );
+        assert_eq!(
+            state.access_categories[0],
+            EdcaAcParams {
+                admission_control_mandatory: true,
+                aifsn: 15,
+                ecw_min: 3,
+                ecw_max: 4,
+                txop_limit: 0x1234
+            }
+        );
+        assert!(!parse_edca_body(&mut state, &body, true).unwrap().changed);
+        assert_eq!(
+            parse_wmm_qos_info(&[221, 7, 0, 0, 0, 2, 1, 1, 0x8f]),
+            Ok(0x8f)
+        );
+        let mut wmm = [0u8; 26];
+        wmm[1] = 24;
+        wmm[8] = 2;
+        wmm[10] = 0x1f;
+        assert!(parse_wmm_params(&mut state, &wmm, false).unwrap().changed);
+        assert_eq!(state.access_categories[0].admission_control_mandatory, true);
     }
 }
