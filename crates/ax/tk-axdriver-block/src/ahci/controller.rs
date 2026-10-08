@@ -25,6 +25,11 @@ pub struct AhciController<I> {
     pub quirks: u32,
     pub ccc: u16,
     pub ccc_vector: u8,
+    pub version: u32,
+    pub enclosure_capabilities: u32,
+    pub enclosure_location: u32,
+    pub implemented_ports: u32,
+    pub num_channels: u8,
 }
 
 impl<I: AhciIo> AhciController<I> {
@@ -37,6 +42,11 @@ impl<I: AhciIo> AhciController<I> {
             quirks,
             ccc: 0,
             ccc_vector: 0,
+            version: 0,
+            enclosure_capabilities: 0,
+            enclosure_location: 0,
+            implemented_ports: 0,
+            num_channels: 0,
         }
     }
 
@@ -59,6 +69,70 @@ impl<I: AhciIo> AhciController<I> {
         } else {
             value
         }
+    }
+
+    /// FreeBSD `ahci_attach`: discover HBA version/capabilities, apply the
+    /// channel-count quirks, and record the implemented-port topology.
+    ///
+    /// The bus-resource manager, DMA-tag creation, interrupt allocation,
+    /// child-device attachment, and verbose diagnostics are platform services
+    /// and are handled by the binding layer; this method ports the register and
+    /// capability state transitions from the function body.
+    // upstream: ahci.c ahci_attach()
+    pub fn ahci_attach(&mut self, requested_ccc_ms: u16) {
+        self.ccc = requested_ccc_ms;
+        self.version = self.io.read32(AHCI_VS);
+        self.capabilities = self.io.read32(AHCI_CAP);
+        if self.version >= 0x0001_0200 {
+            self.capabilities2 = self.io.read32(AHCI_CAP2);
+        } else {
+            self.capabilities2 = 0;
+        }
+        if self.capabilities & AHCI_CAP_EMS != 0 {
+            self.enclosure_capabilities = self.io.read32(AHCI_EM_CTL);
+        } else {
+            self.enclosure_capabilities = 0;
+        }
+
+        if self.quirks & AHCI_Q_FORCE_PI != 0 {
+            let num_ports = (self.capabilities & AHCI_CAP_NPMASK) + 1;
+            let port_mask = if num_ports >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << num_ports) - 1
+            };
+            self.io.write32(AHCI_PI, port_mask);
+        }
+        self.implemented_ports = self.io.read32(AHCI_PI);
+
+        if self.quirks & AHCI_Q_ALTSIG != 0 && self.capabilities & AHCI_CAP_SPM == 0 {
+            self.quirks |= AHCI_Q_NOBSYRES;
+        }
+        if self.quirks & AHCI_Q_1CH != 0 {
+            self.capabilities &= !AHCI_CAP_NPMASK;
+            self.implemented_ports &= 0x01;
+        }
+        if self.quirks & AHCI_Q_2CH != 0 {
+            self.capabilities = (self.capabilities & !AHCI_CAP_NPMASK) | 1;
+            self.implemented_ports &= 0x03;
+        }
+        if self.quirks & AHCI_Q_4CH != 0 {
+            self.capabilities = (self.capabilities & !AHCI_CAP_NPMASK) | 3;
+            self.implemented_ports &= 0x0f;
+        }
+        let implemented_count = 32 - self.implemented_ports.leading_zeros();
+        let capability_count = (self.capabilities & AHCI_CAP_NPMASK) + 1;
+        self.num_channels = implemented_count.max(capability_count) as u8;
+        if self.quirks & AHCI_Q_NOPMP != 0 {
+            self.capabilities &= !AHCI_CAP_SPM;
+        }
+        if self.quirks & AHCI_Q_NONCQ != 0 {
+            self.capabilities &= !AHCI_CAP_SNCQ;
+        }
+        if self.capabilities & AHCI_CAP_CCCS == 0 {
+            self.ccc = 0;
+        }
+        self.enclosure_location = self.io.read32(AHCI_EM_LOC);
     }
 
     /// FreeBSD `ahci_ctlr_setup`: clear controller interrupts, optionally
@@ -239,5 +313,34 @@ mod tests {
                 .count(),
             1_000
         );
+    }
+    #[test]
+    fn attach_reads_version_and_resolves_port_quirks() {
+        let mut io = FakeAhciIo::default();
+        io.regs[AHCI_VS / 4] = 0x0001_0200;
+        io.regs[AHCI_CAP / 4] = AHCI_CAP_CCCS | AHCI_CAP_SPM | 3;
+        io.regs[AHCI_CAP2 / 4] = AHCI_CAP2_BOH;
+        io.regs[AHCI_PI / 4] = 0b1011;
+        io.regs[AHCI_EM_LOC / 4] = 0x1234;
+        let mut ctlr = AhciController::new(io, 0, 0, AHCI_Q_2CH | AHCI_Q_NONCQ);
+        ctlr.ahci_attach(20);
+        assert_eq!(ctlr.version, 0x0001_0200);
+        assert_eq!(ctlr.capabilities2, AHCI_CAP2_BOH);
+        assert_eq!(ctlr.implemented_ports, 0b0011);
+        assert_eq!(ctlr.num_channels, 2);
+        assert_eq!(ctlr.ccc, 20);
+        assert_eq!(ctlr.enclosure_location, 0x1234);
+        assert_eq!(ctlr.capabilities & AHCI_CAP_SNCQ, 0);
+    }
+
+    #[test]
+    fn attach_forces_pi_without_overflowing_at_32_ports() {
+        let mut io = FakeAhciIo::default();
+        io.regs[AHCI_CAP / 4] = AHCI_CAP_NPMASK;
+        let mut ctlr = AhciController::new(io, 0, 0, AHCI_Q_FORCE_PI);
+        ctlr.ahci_attach(0);
+        assert_eq!(ctlr.implemented_ports, u32::MAX);
+        assert!(ctlr.io.writes[..ctlr.io.write_count].contains(&(AHCI_PI, u32::MAX)));
+        assert_eq!(ctlr.num_channels, 32);
     }
 }
