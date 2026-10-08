@@ -1,7 +1,12 @@
 //! Linux AF_BLUETOOTH HCI socket shell for device discovery and monitor setup.
 //! Protocol framing follows the Bluetooth Core and Linux UAPI; no GPL net stack
 //! implementation is copied here.
-use alloc::{borrow::Cow, collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    collections::VecDeque,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     sync::atomic::{AtomicBool, Ordering},
     task::Context,
@@ -163,6 +168,23 @@ mod tests {
     }
 
     #[test]
+    fn management_event_fanout_reaches_each_control_socket() {
+        let first = HciSocket::new();
+        let second = HciSocket::new();
+        let address = SockaddrHci {
+            family: AF_BLUETOOTH as u16,
+            device: HCI_DEV_NONE,
+            channel: HCI_CHANNEL_CONTROL,
+        };
+        first.bind(address).unwrap();
+        second.bind(address).unwrap();
+        let event = alloc::vec![6, 0, 0, 0, 4, 0, 1, 0, 0, 0];
+        fanout_mgmt_event(event.clone());
+        assert_eq!(first.control.rx.lock().pop_front(), Some(event.clone()));
+        assert_eq!(second.control.rx.lock().pop_front(), Some(event));
+    }
+
+    #[test]
     fn hci_dev_list_records_include_aligned_flags() {
         assert_eq!(
             encode_dev_req(0x1234, false),
@@ -244,8 +266,44 @@ pub struct HciSocket {
     inode: PseudoInode,
     nonblocking: AtomicBool,
     binding: SpinMutex<Option<BoundChannel>>,
-    control_rx: SpinMutex<VecDeque<Vec<u8>>>,
-    control_readiness: Arc<PollSet<32>>,
+    control: Arc<MgmtSubscriber>,
+}
+
+struct MgmtSubscriber {
+    rx: SpinMutex<VecDeque<Vec<u8>>>,
+    readiness: Arc<PollSet<32>>,
+}
+
+static MGMT_SUBSCRIBERS: spin::Once<SpinMutex<Vec<Weak<MgmtSubscriber>>>> = spin::Once::new();
+
+fn register_mgmt_subscriber(subscriber: &Arc<MgmtSubscriber>) {
+    MGMT_SUBSCRIBERS
+        .call_once(|| SpinMutex::new(Vec::new()))
+        .lock()
+        .push(Arc::downgrade(subscriber));
+}
+
+fn fanout_mgmt_event(event: Vec<u8>) {
+    let Some(registry) = MGMT_SUBSCRIBERS.get() else {
+        return;
+    };
+    let mut registry = registry.lock();
+    registry.retain(|subscriber| {
+        let Some(subscriber) = subscriber.upgrade() else {
+            return false;
+        };
+        let mut queue = subscriber.rx.lock();
+        if queue.len() < 64 {
+            let mut copy = Vec::new();
+            if copy.try_reserve_exact(event.len()).is_ok() {
+                copy.extend_from_slice(&event);
+                queue.push_back(copy);
+                drop(queue);
+                subscriber.readiness.wake();
+            }
+        }
+        true
+    });
 }
 
 impl HciSocket {
@@ -254,8 +312,10 @@ impl HciSocket {
             inode: PseudoInode::socket(),
             nonblocking: AtomicBool::new(false),
             binding: SpinMutex::new(None),
-            control_rx: SpinMutex::new(VecDeque::new()),
-            control_readiness: Arc::new(PollSet::new()),
+            control: Arc::new(MgmtSubscriber {
+                rx: SpinMutex::new(VecDeque::new()),
+                readiness: Arc::new(PollSet::new()),
+            }),
         }
     }
 
@@ -324,6 +384,9 @@ impl HciSocket {
             channel: address.channel,
             adapter,
         });
+        if address.channel == HCI_CHANNEL_CONTROL {
+            register_mgmt_subscriber(&self.control);
+        }
         Ok(())
     }
 
@@ -429,7 +492,7 @@ impl Pollable for HciSocket {
         };
         let mut events = IoEvents::WRITABLE;
         if binding.channel == HCI_CHANNEL_CONTROL {
-            if !self.control_rx.lock().is_empty() {
+            if !self.control.rx.lock().is_empty() {
                 events |= IoEvents::READABLE;
             }
             return events;
@@ -455,7 +518,7 @@ impl Pollable for HciSocket {
             return axpoll::PollRegistration::empty();
         };
         if binding.channel == HCI_CHANNEL_CONTROL {
-            return PollRegistration::single(&self.control_readiness, context.waker());
+            return PollRegistration::single(&self.control.readiness, context.waker());
         }
         #[cfg(feature = "input")]
         if let Some(adapter) = &binding.adapter {
@@ -476,7 +539,8 @@ impl FileLike for HciSocket {
             .ok_or(LinuxError::ENODEV)?;
         if channel == HCI_CHANNEL_CONTROL {
             let packet = self
-                .control_rx
+                .control
+                .rx
                 .lock()
                 .pop_front()
                 .ok_or(LinuxError::EAGAIN)?;
@@ -641,16 +705,16 @@ impl HciSocket {
         packet.truncate(read);
         let (response, setting_event) = management_controller_command(&packet)?
             .unwrap_or((management_response(&packet)?, None));
-        let mut queue = self.control_rx.lock();
-        if queue.len() + 1 + usize::from(setting_event.is_some()) > 64 {
+        let mut queue = self.control.rx.lock();
+        if queue.len() >= 64 {
             return Err(LinuxError::ENOBUFS.into());
         }
         queue.push_back(response);
-        if let Some(event) = setting_event {
-            queue.push_back(event);
-        }
         drop(queue);
-        self.control_readiness.wake();
+        if let Some(event) = setting_event {
+            fanout_mgmt_event(event);
+        }
+        self.control.readiness.wake();
         Ok(read)
     }
 }
