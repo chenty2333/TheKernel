@@ -46,7 +46,9 @@ const MSIX_HW_RF_KILL: u32 = 1 << 7;
 const MSIX_HW_SW_ERR: u32 = 1 << 25;
 const MSIX_HW_HW_ERR: u32 = 1 << 29;
 const CSR_MSIX_FH_CAUSES: u32 = 0x2800;
+const CSR_MSIX_FH_MASK: u32 = 0x2804;
 const CSR_MSIX_HW_CAUSES: u32 = 0x2808;
+const CSR_MSIX_HW_MASK: u32 = 0x280c;
 const CSR_MSIX_AUTOMASK: u32 = 0x2810;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,6 +363,19 @@ pub fn service_msix_interrupt<B: CsrAccess>(
         registers.write_csr(CSR_MSIX_AUTOMASK, 1);
     }
     work
+}
+
+/// Service one MSI-X vector using the currently programmed active-low masks.
+pub fn service_msix_interrupt_from_hardware<B: CsrAccess>(
+    registers: &mut IwxRegisters<B>,
+) -> MsixInterruptWork {
+    let masks = InterruptMasks {
+        msix: true,
+        fh_mask: !registers.read_csr(CSR_MSIX_FH_MASK),
+        hw_mask: !registers.read_csr(CSR_MSIX_HW_MASK),
+        ..InterruptMasks::default()
+    };
+    service_msix_interrupt(registers, &masks)
 }
 
 #[cfg(test)]

@@ -173,7 +173,7 @@ pub use interrupts::{
 pub use intr::{
     ICT_ADDRESS_SHIFT, ICT_ENTRY_COUNT, ICT_SIZE_BYTES, IctError, InterruptCauseTable,
     LegacyInterruptWork, MsixInterruptWork, plan_legacy_interrupt, plan_msix_interrupt, reset_ict,
-    service_legacy_interrupt, service_msix_interrupt,
+    service_legacy_interrupt, service_msix_interrupt, service_msix_interrupt_from_hardware,
 };
 pub use keys::{
     ADD_STA_KEY_COMMAND, ADD_STA_STATUS_MASK, ADD_STA_SUCCESS,

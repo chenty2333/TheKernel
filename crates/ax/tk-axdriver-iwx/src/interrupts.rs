@@ -59,6 +59,8 @@ const UREG_CHICK_MSIX_ENABLE: u32 = 1 << 25;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InterruptMasks {
     pub msix: bool,
+    /// Set only when PCI MSI (not MSI-X) is actually programmed by the platform.
+    pub msi: bool,
     pub interrupt_mask: u32,
     pub fh_init_mask: u32,
     pub fh_mask: u32,
@@ -74,7 +76,7 @@ pub fn configure_msix_hardware<B: CsrAccess>(
     stopped: bool,
 ) {
     if !masks.msix {
-        if !stopped && registers.nic_lock().is_ok() {
+        if !stopped && masks.msi && registers.nic_lock().is_ok() {
             let _ = registers.write_umac_prph_unlocked(UREG_CHICK, UREG_CHICK_MSI_ENABLE);
             let _ = registers.nic_unlock();
         }
@@ -281,10 +283,18 @@ mod tests {
     }
 
     #[test]
+    fn polling_fallback_does_not_enable_unallocated_msi() {
+        let mut regs = IwxRegisters::new(MockCsr::default(), crate::DeviceFamily::Ax210, 0);
+        configure_msix_hardware(&mut regs, &InterruptMasks::default(), false);
+        assert!(regs.into_inner().writes.is_empty());
+    }
+
+    #[test]
     fn msix_masks_are_active_low_and_track_enabled_causes() {
         let mut regs = IwxRegisters::new(MockCsr::default(), crate::DeviceFamily::Ax210, 0);
         let mut masks = InterruptMasks {
             msix: true,
+            msi: false,
             fh_init_mask: 0x30,
             fh_mask: 0,
             hw_init_mask: 0x81,

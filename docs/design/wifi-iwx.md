@@ -208,7 +208,18 @@ association response and firmware context updates). The four-way handshake
 remains in the userspace supplicant; WPA/RSN key operations install CCMP
 software keys, with Ethernet data encrypted/decrypted through net80211 while
 EAPOL remains on the unprotected control port. TKIP/WEP, MFP/IGTK hardware
-offload, and other AKMs are not admitted. There is no MSI-X/IRQ worker yet.
+offload, and other AKMs are not admitted.
+
+When the PCI MSI-X capability and a complete table in an assigned memory BAR
+are available, the probe installs and enables one vector using the NVMe
+driver's `allocate_msi`/table-programming pattern. The entry maps all iwx causes
+to vector zero; the hard-IRQ callback translates/acks the live MSI-X cause
+masks (`iwx_intr_msix()`), then axhal's IRQ hook wakes axnet's task-context RX
+worker. The worker drains RX and command notifications without taking
+`ATTACHED_DMA` in interrupt context. A 100 ms task-context receive poll remains
+armed as an MSI-X recovery fallback; when no valid MSI-X route exists, the
+adapter retains its 10 ms polling path. Init-uCode command/ALIVE waits also
+keep their bounded polling fallback because rootfs initialization is synchronous.
 
 The init-net handoff now accepts an explicitly named wireless `NetDriverOps`
 as a second Ethernet-compatible link after rootfs-ready firmware staging. It

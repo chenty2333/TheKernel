@@ -4,6 +4,8 @@
 //! wires the upstream PCI match decision into TheKernel's PCI driver walk.
 
 use alloc::{collections::VecDeque, vec::Vec};
+#[cfg(feature = "irq")]
+use core::sync::atomic::AtomicUsize;
 use core::{
     convert::Infallible,
     ptr::NonNull,
@@ -18,6 +20,8 @@ use axdriver_iwx::{
     IwxController, NvmInfo, PreinitPlan, RuntimeConfig, attach_profile, matches_pci_device,
     preinit_plan,
 };
+#[cfg(feature = "irq")]
+use axdriver_iwx::{DeviceFamily, IwxRegisters};
 use axdriver_net::{
     EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps, WirelessFrequency,
     WirelessHtCapabilities, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation,
@@ -40,6 +44,265 @@ const IWX_SCAN_RATES_2GHZ: [u8; 12] = [
 ];
 const IWX_SCAN_RATES_5GHZ: [u8; 8] = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
 const IWX_STATION_DATA_QUEUE: u8 = axdriver_iwx::DQA_CMD_QUEUE + 2;
+const PCI_CAPABILITY_MSIX: u8 = 0x11;
+#[cfg(feature = "irq")]
+const MAX_IWX_MSIX_DEVICES: usize = 8;
+#[cfg(feature = "irq")]
+const CSR_MSIX_FH_CAUSES: u32 = 0x2800;
+#[cfg(feature = "irq")]
+const CSR_MSIX_HW_CAUSES: u32 = 0x2808;
+
+#[cfg(any(feature = "irq", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IwxMsixTable {
+    bir: u8,
+    offset: usize,
+    vectors: usize,
+}
+
+fn disable_msix_configuration(root: &mut PciRoot, bdf: DeviceFunction) {
+    if let Some(capability) = root
+        .capabilities(bdf)
+        .take(48)
+        .find(|capability| capability.id == PCI_CAPABILITY_MSIX && capability.offset <= 0xf4)
+    {
+        root.write_config_u16(
+            bdf,
+            capability.offset + 2,
+            (capability.private_header | 0x4000) & !0x8000,
+        );
+        let _ = root.read_config_dword(bdf, capability.offset);
+    }
+}
+
+#[cfg(any(feature = "irq", test))]
+impl IwxMsixTable {
+    fn decode(control: u16, table: u32) -> Option<Self> {
+        let bir = (table & 7) as u8;
+        if bir >= 6 {
+            return None;
+        }
+        Some(Self {
+            bir,
+            offset: (table & !7) as usize,
+            vectors: usize::from(control & 0x07ff) + 1,
+        })
+    }
+
+    fn fits(self, bytes: usize) -> bool {
+        self.vectors
+            .checked_mul(16)
+            .and_then(|length| self.offset.checked_add(length))
+            .is_some_and(|end| end <= bytes)
+    }
+}
+
+#[cfg(feature = "irq")]
+struct IwxIrqSlot {
+    bar_base: AtomicUsize,
+    bar_size: AtomicUsize,
+}
+
+#[cfg(feature = "irq")]
+impl IwxIrqSlot {
+    const fn new() -> Self {
+        Self {
+            bar_base: AtomicUsize::new(0),
+            bar_size: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "irq")]
+static IWX_IRQ_SLOTS: [IwxIrqSlot; MAX_IWX_MSIX_DEVICES] =
+    [const { IwxIrqSlot::new() }; MAX_IWX_MSIX_DEVICES];
+
+/// The hard-IRQ half only acknowledges cause state and lets axhal's shared
+/// IRQ hook wake the permanent net RX worker; packet/command processing stays
+/// in task context, outside `ATTACHED_DMA`'s lock.
+#[cfg(feature = "irq")]
+fn service_iwx_msix_slot(index: usize) {
+    let Some(slot) = IWX_IRQ_SLOTS.get(index) else {
+        return;
+    };
+    let base = slot.bar_base.load(Ordering::Acquire);
+    let size = slot.bar_size.load(Ordering::Acquire);
+    if base == 0 || size < CSR_MSIX_HW_CAUSES as usize + 4 {
+        return;
+    }
+    let mut bus = MmioCsrAccess { base, size };
+    let flow = bus.read32(CSR_MSIX_FH_CAUSES);
+    let hardware = bus.read32(CSR_MSIX_HW_CAUSES);
+    if flow == 0 && hardware == 0 || flow == u32::MAX || hardware == u32::MAX {
+        return;
+    }
+    let mut registers = IwxRegisters::new(bus, DeviceFamily::Legacy, 0);
+    let work = axdriver_iwx::service_msix_interrupt_from_hardware(&mut registers);
+    if work.top_fatal_error || work.software_error || work.hardware_error {
+        warn!("iwx: MSI-X reported fatal hardware/firmware cause; vector remains masked");
+    }
+}
+
+#[cfg(feature = "irq")]
+macro_rules! msix_slot_handler {
+    ($handler:ident, $index:expr) => {
+        fn $handler() {
+            service_iwx_msix_slot($index);
+        }
+    };
+}
+
+#[cfg(feature = "irq")]
+msix_slot_handler!(iwx_msix_interrupt_0, 0);
+#[cfg(feature = "irq")]
+msix_slot_handler!(iwx_msix_interrupt_1, 1);
+#[cfg(feature = "irq")]
+msix_slot_handler!(iwx_msix_interrupt_2, 2);
+#[cfg(feature = "irq")]
+msix_slot_handler!(iwx_msix_interrupt_3, 3);
+#[cfg(feature = "irq")]
+msix_slot_handler!(iwx_msix_interrupt_4, 4);
+#[cfg(feature = "irq")]
+msix_slot_handler!(iwx_msix_interrupt_5, 5);
+#[cfg(feature = "irq")]
+msix_slot_handler!(iwx_msix_interrupt_6, 6);
+#[cfg(feature = "irq")]
+msix_slot_handler!(iwx_msix_interrupt_7, 7);
+
+#[cfg(feature = "irq")]
+const IWX_MSIX_HANDLERS: [fn(); MAX_IWX_MSIX_DEVICES] = [
+    iwx_msix_interrupt_0,
+    iwx_msix_interrupt_1,
+    iwx_msix_interrupt_2,
+    iwx_msix_interrupt_3,
+    iwx_msix_interrupt_4,
+    iwx_msix_interrupt_5,
+    iwx_msix_interrupt_6,
+    iwx_msix_interrupt_7,
+];
+
+#[cfg(feature = "irq")]
+fn reserve_iwx_irq_slot(base: usize, size: usize) -> Option<usize> {
+    IWX_IRQ_SLOTS.iter().position(|slot| {
+        if slot
+            .bar_base
+            .compare_exchange(0, base, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            slot.bar_size.store(size, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(feature = "irq")]
+fn release_iwx_irq_slot(index: usize) {
+    let slot = &IWX_IRQ_SLOTS[index];
+    slot.bar_size.store(0, Ordering::Release);
+    slot.bar_base.store(0, Ordering::Release);
+}
+
+#[cfg(feature = "irq")]
+struct IwxMsixRoute {
+    table: usize,
+    capability: u8,
+    control: u16,
+    vector: usize,
+}
+
+#[cfg(feature = "irq")]
+impl IwxMsixRoute {
+    fn disable(root: &mut PciRoot, bdf: DeviceFunction) {
+        disable_msix_configuration(root, bdf);
+    }
+
+    fn prepare(
+        root: &mut PciRoot,
+        bdf: DeviceFunction,
+        bar0_base: usize,
+        bar0_size: usize,
+    ) -> Option<Self> {
+        let capability = root
+            .capabilities(bdf)
+            .take(48)
+            .find(|capability| capability.id == PCI_CAPABILITY_MSIX && capability.offset <= 0xf4)?;
+        let layout = IwxMsixTable::decode(
+            capability.private_header,
+            root.read_config_dword(bdf, capability.offset + 4)?,
+        )?;
+        let BarInfo::Memory { address, size, .. } = root.bar_info(bdf, layout.bir).ok()? else {
+            return None;
+        };
+        if address == 0 || !layout.fits(size as usize) {
+            return None;
+        }
+        let mapped = axklib::mem::iomap((address as usize).into(), size as usize).ok()?;
+        let table = mapped.as_usize().checked_add(layout.offset)?;
+        let irq_slot = reserve_iwx_irq_slot(bar0_base, bar0_size)?;
+        let Some((message, data, vector)) = axhal::irq::allocate_msi(IWX_MSIX_HANDLERS[irq_slot])
+        else {
+            release_iwx_irq_slot(irq_slot);
+            return None;
+        };
+        let control = capability.private_header | 0xc000;
+        if !root.write_config_u16(bdf, capability.offset + 2, control) {
+            release_iwx_irq_slot(irq_slot);
+            return None;
+        }
+        // SAFETY: the whole table range is bounded by the selected mapped BAR;
+        // function masking is held until every vector entry is initialized.
+        unsafe {
+            for index in 0..layout.vectors {
+                ((table + index * 16 + 12) as *mut u32).write_volatile(1);
+            }
+            (table as *mut u32).write_volatile(message as u32);
+            ((table + 4) as *mut u32).write_volatile((message >> 32) as u32);
+            ((table + 8) as *mut u32).write_volatile(data);
+            let _ = ((table + 12) as *const u32).read_volatile();
+        }
+        Some(Self {
+            table,
+            capability: capability.offset,
+            control,
+            vector,
+        })
+    }
+
+    fn enable(&self, root: &mut PciRoot, bdf: DeviceFunction) {
+        // SAFETY: entry zero is initialized and has a permanent MSI handler.
+        unsafe { ((self.table + 12) as *mut u32).write_volatile(0) };
+        root.write_config_u16(bdf, self.capability + 2, self.control & !0x4000);
+        let _ = root.read_config_dword(bdf, self.capability);
+        // Firmware bootstrap is performed before netdev publication; enable
+        // the permanent route now so the same handler services init-uCode.
+        axhal::irq::set_enable(self.vector, true);
+    }
+}
+
+#[cfg(not(feature = "irq"))]
+struct IwxMsixRoute {
+    vector: usize,
+}
+
+#[cfg(not(feature = "irq"))]
+impl IwxMsixRoute {
+    fn disable(root: &mut PciRoot, bdf: DeviceFunction) {
+        disable_msix_configuration(root, bdf);
+    }
+
+    fn prepare(
+        _root: &mut PciRoot,
+        _bdf: DeviceFunction,
+        _bar0_base: usize,
+        _bar0_size: usize,
+    ) -> Option<Self> {
+        None
+    }
+
+    fn enable(&self, _root: &mut PciRoot, _bdf: DeviceFunction) {}
+}
 
 struct PlatformDmaRegion {
     cpu: NonNull<u8>,
@@ -195,6 +458,7 @@ struct AttachedDevice {
     bar_base: usize,
     bar_size: usize,
     hardware_revision: u32,
+    msix_vector: Option<usize>,
     controller: IwxController<MmioCsrAccess, PlatformDmaAllocator>,
     firmware: Option<Result<FirmwareBundle, FirmwareRequestError>>,
     nvm: Option<NvmInfo>,
@@ -312,6 +576,14 @@ impl BaseDriverOps for IwxNetDevice {
 
     fn device_type(&self) -> DeviceType {
         DeviceType::Net
+    }
+
+    fn irq_num(&self) -> Option<usize> {
+        ATTACHED_DMA
+            .lock()
+            .iter()
+            .find(|device| device.bdf == self.bdf)
+            .and_then(|device| device.msix_vector)
     }
 }
 
@@ -624,7 +896,11 @@ impl NetDriverOps for IwxNetDevice {
     }
 
     fn rx_poll_interval_micros(&self) -> Option<u64> {
-        Some(10_000)
+        Some(if self.irq_num().is_some() {
+            100_000
+        } else {
+            10_000
+        })
     }
 }
 
@@ -707,6 +983,7 @@ fn allocate_resources(
     hardware_revision: u32,
     pcie_link_control: u16,
     pcie_device_control2: u16,
+    msix_vector: Option<usize>,
 ) -> Result<(), AttachAllocationError> {
     let key = Bdf(bdf.bus, bdf.device, bdf.function);
     let mut attached = ATTACHED_DMA.lock();
@@ -723,6 +1000,7 @@ fn allocate_resources(
         profile.umac_prph_offset,
         0,
     )?;
+    controller.interrupt_masks.msix = msix_vector.is_some();
     controller.set_pcie_power_registers(pcie_link_control, pcie_device_control2);
     attached.try_reserve(1).map_err(|_| {
         AttachAllocationError::Allocation(
@@ -737,6 +1015,7 @@ fn allocate_resources(
         bar_base,
         bar_size,
         hardware_revision,
+        msix_vector,
         controller,
         firmware: None,
         nvm: None,
@@ -2830,9 +3109,8 @@ pub(crate) fn probe(
                 root.endpoint_subsystem_ids(bdf).0,
                 subsystem,
             );
-            // Use MMIO and bus mastering for controller DMA, but keep legacy
-            // INTx disabled: initialization pumps the source interrupt/RX path
-            // synchronously until the later network IRQ worker is installed.
+            // Use MMIO and bus mastering for controller DMA; keep INTx disabled
+            // and prefer one-vector MSI-X, with task-context polling fallback.
             let Some(command_status) = root.read_config_dword(bdf, 4) else {
                 warn!("iwx: {bdf}: could not read PCI command register");
                 return BusProbeResult::Claimed;
@@ -2843,6 +3121,8 @@ pub(crate) fn probe(
                 return BusProbeResult::Claimed;
             }
             let (link_control, device_control2) = pcie_power_registers(root, bdf);
+            IwxMsixRoute::disable(root, bdf);
+            let msix = IwxMsixRoute::prepare(root, bdf, base, bar.1 as usize);
             if let Err(error) = allocate_resources(
                 bdf,
                 profile,
@@ -2852,10 +3132,22 @@ pub(crate) fn probe(
                 hardware_revision,
                 link_control,
                 device_control2,
+                msix.as_ref().map(|route| route.vector),
             ) {
                 warn!("iwx: {bdf}: attach DMA allocation failed: {error:?}");
                 return BusProbeResult::Claimed;
             }
+            if let Some(route) = &msix {
+                route.enable(root, bdf);
+            }
+            info!(
+                "iwx: {bdf}: receive service={}",
+                if msix.is_some() {
+                    "MSI-X + 100ms fallback"
+                } else {
+                    "10ms polling fallback"
+                }
+            );
             register_rootfs_firmware_callback();
             publish_device = true;
         }
@@ -2895,6 +3187,16 @@ mod tests {
     use axdriver_net::NetDriverOps;
 
     use super::*;
+
+    #[test]
+    fn msix_table_layout_checks_bir_and_complete_vector_bounds() {
+        let layout = IwxMsixTable::decode(64, 0x2004).unwrap();
+        assert_eq!(layout.bir, 4);
+        assert_eq!(layout.vectors, 65);
+        assert!(!layout.fits(0x2010));
+        assert!(layout.fits(0x2410));
+        assert!(IwxMsixTable::decode(0, 6).is_none());
+    }
 
     #[test]
     fn openbsd_pci_match_table_and_bz_gf_exception_are_preserved() {
