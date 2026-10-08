@@ -263,6 +263,25 @@ pub(crate) fn entry_for(clock: ReferenceClock, cdclk_khz: u32, ratio: u32) -> Op
     })
 }
 
+/// Select the lowest source-listed CDCLK that can carry a requested clock.
+/// The N305 native path uses this conservative one-pixel-per-clock bound until
+/// the complete i915 atomic bandwidth calculation is connected.
+pub(crate) fn entry_at_least(clock: ReferenceClock, min_cdclk_khz: u32) -> Option<CdclkEntry> {
+    ADL_N_CDCLK_TABLE
+        .iter()
+        .copied()
+        .filter(|entry| entry.reference_khz == clock.khz() && entry.cdclk_khz >= min_cdclk_khz)
+        .min_by_key(|entry| entry.cdclk_khz)
+}
+
+pub(crate) fn maximum_cdclk(clock: ReferenceClock) -> Option<u32> {
+    ADL_N_CDCLK_TABLE
+        .iter()
+        .filter(|entry| entry.reference_khz == clock.khz())
+        .map(|entry| entry.cdclk_khz)
+        .max()
+}
+
 /// The CD2X divider, as `CDCLK_CTL[23:22]` encodes it.
 ///
 /// `[I915]` `bxt_cdclk_cd2x_div_sel` (`display/intel_cdclk.c`) and
@@ -1192,6 +1211,24 @@ pub(crate) fn poll(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdclk_target_is_the_lowest_row_at_or_above_the_requested_ceiling() {
+        assert_eq!(
+            entry_at_least(ReferenceClock::Mhz19_2, 241_500)
+                .unwrap()
+                .cdclk_khz,
+            307_200
+        );
+        assert_eq!(
+            entry_at_least(ReferenceClock::Mhz38_4, 148_500)
+                .unwrap()
+                .cdclk_khz,
+            179_200
+        );
+        assert_eq!(entry_at_least(ReferenceClock::Mhz24, 648_001), None);
+        assert_eq!(maximum_cdclk(ReferenceClock::Mhz24), Some(648_000));
+    }
     use crate::drm::intel::regs::mock::MockRegisters;
 
     /// Every reference frequency, for the table-driven tests.

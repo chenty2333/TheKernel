@@ -19,13 +19,18 @@ waveform. `transition()` follows `_bxt_set_cdclk()`'s selection order: use a
 crawl+squash midpoint where available, otherwise crawl, squash, update only
 CD2X, or require a full PLL update. The kernel `clk::transition()` adapter now
 executes the Gen12 ratio/enable/lock or crawl/request/ack sequence and writes
-`CDCLK_CTL`, retaining i915's warning-only PLL poll outcomes. Host unit tests
-cover the pure plan and compile-check covers the kernel adapter; its modeset
-call site is not yet connected.
+`CDCLK_CTL`, retaining i915's warning-only PLL poll outcomes. The opt-in N305
+boot modeset now invokes the adapter only after all four pipes and the combo
+DDI link are proven off,
+with PCode PREPARE / voltage update around the change and a reverse transaction
+path restoring both clock registers and the old PCODE voltage on later
+modeset failure. Active-pipe atomic CDCLK transitions remain unconnected.
 
 Still unported from the upstream file are caller-side PCode pre/post
 notifications, audio/PSR/GMBUS/AUX locking and coordination, atomic CDCLK
 state calculation, per-plane/bandwidth/watermark minima, maximum-frequency
 readout, and debugfs. The existing `bring_up()` remains the N305 boot-time
-CDCLK/RAWCLK entry point; neither the full translation's backend nor the
-existing runtime transition adapter is invoked by a modeset caller yet.
+CDCLK/RAWCLK entry point; the full translation's `IntelCdclkIo` backend is not
+yet wired. The opt-in rollback transaction still denies generic CDCLK writes
+and journals PCODE side effects only through its explicit clock-transition
+method, which pairs the source order and reverse recovery.

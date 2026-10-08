@@ -95,8 +95,9 @@ fn policy(register: Register) -> (Class, u32) {
         }
     }
     if [regs::CDCLK_CTL, regs::CDCLK_PLL_ENABLE].contains(&register) {
-        // A valid firmware CDCLK is retained. Crawl/squash/PCODE changes are
-        // not this boot modeset's transaction and cannot be smuggled through it.
+        // Generic MMIO writes cannot change CDCLK. The only supported mutation
+        // is Transaction::transition_cdclk(), which pairs PCODE and records
+        // an explicit reverse transition for rollback.
         return (Class::Forbidden, 0);
     }
     if [
@@ -279,6 +280,7 @@ struct Journal {
     failed: bool,
     attempts: usize,
     fail_at: Option<usize>,
+    clock_transitioned: bool,
 }
 pub(crate) struct Transaction<'a, R: Registers> {
     pub(crate) before: Snapshot,
@@ -286,6 +288,7 @@ pub(crate) struct Transaction<'a, R: Registers> {
     pub(crate) ddi: Ddi,
     pub(crate) pll_id: u8,
     pub(crate) reusable_phys: Vec<super::phy::PhyState>,
+    cdclk_before: clk::CdclkObservation,
     device: &'a R,
     journal: Mutex<Journal>,
 }
@@ -334,10 +337,11 @@ impl<'a, R: Registers> Transaction<'a, R> {
             ));
         }
 
-        if !clk::observe(device).map_err(|e| e.describe())?.usable() {
+        let cdclk_before = clk::observe(device).map_err(|e| e.describe())?;
+        if !cdclk_before.usable() {
             return Err(String::from(
-                "firmware CDCLK not usable; clock reprogramming requires a separate PCODE-safe \
-                 transaction",
+                "firmware CDCLK not usable; firmware-preserving modeset requires a usable \
+                 starting clock",
             ));
         }
         let index = ddi.index();
@@ -395,14 +399,107 @@ impl<'a, R: Registers> Transaction<'a, R> {
             ddi,
             pll_id: selected_pll,
             reusable_phys,
+            cdclk_before,
             device,
             journal: Mutex::new(Journal {
                 touched,
                 failed: false,
                 attempts: 0,
                 fail_at: None,
+                clock_transitioned: false,
             }),
         })
+    }
+    pub(crate) fn pipes_disabled(&self) -> bool {
+        let pipes_off = [p::PIPECONF_A, p::PIPECONF_B, p::PIPECONF_C, p::PIPECONF_D]
+            .into_iter()
+            .all(|register| {
+                self.device
+                    .read(register)
+                    .is_some_and(|value| value & ENABLE == 0)
+            });
+        let link_off = [
+            (d::TRANS_DDI_FUNC_CTL_A, ENABLE),
+            (d::DDI_BUF_CTL_A, ENABLE),
+            (d::DDI_BUF_CTL_B, ENABLE),
+        ]
+        .into_iter()
+        .all(|(register, mask)| {
+            self.device
+                .read(register)
+                .is_some_and(|value| value & mask == 0)
+        });
+        pipes_off && link_off
+    }
+
+    /// Change CDCLK only after the old firmware pipe/link has been quiesced.
+    /// The transaction records the need to restore both CDCLK and PCODE's
+    /// voltage request if any later modeset step fails.
+    pub(crate) fn transition_cdclk(
+        &self,
+        timer: &impl PollTimer,
+        target: clk::CdclkEntry,
+    ) -> Result<clk::CdclkTransitionReport, String> {
+        if !self.pipes_disabled() {
+            return Err(String::from(
+                "CDCLK transition requires all display pipes disabled",
+            ));
+        }
+        let old = clk::observe(self.device).map_err(|e| e.describe())?;
+        if !old.usable() {
+            return Err(String::from("CDCLK transition requires usable old state"));
+        }
+        super::pcode::prepare_cdclk_change(self.device, timer)
+            .map_err(|error| format!("CDCLK PCode PREPARE failed: {error:?}"))?;
+        self.journal.lock().clock_transitioned = true;
+        let transition = clk::transition(self.device, old, target, None, true)
+            .map_err(|error| format!("CDCLK transition failed: {}", error.describe()))?;
+        if !transition.after.usable() || transition.after.entry != Some(target) {
+            return Err(format!(
+                "CDCLK transition did not read back the requested table row: {} kHz",
+                transition.after.cdclk_khz
+            ));
+        }
+        super::pcode::commit_cdclk_voltage(self.device, timer, transition.after.cdclk_khz)
+            .map_err(|error| format!("CDCLK PCode voltage update failed: {error:?}"))?;
+        Ok(transition)
+    }
+
+    fn restore_cdclk(&self, timer: &impl PollTimer) -> Result<(), String> {
+        if !self.pipes_disabled() {
+            return Err(String::from(
+                "CDCLK rollback requires all display pipes disabled",
+            ));
+        }
+        let target = self
+            .cdclk_before
+            .entry
+            .ok_or_else(|| String::from("original CDCLK had no source table row"))?;
+        let old_pipe = match self.cdclk_before.pipe_field {
+            pipe @ 0..=3 => Some(pipe as u8),
+            7 => None,
+            field => {
+                return Err(format!(
+                    "original CDCLK pipe field {field} cannot be restored safely"
+                ));
+            }
+        };
+        let old = clk::observe(self.device).map_err(|error| error.describe())?;
+        super::pcode::prepare_cdclk_change(self.device, timer)
+            .map_err(|error| format!("CDCLK rollback PCode PREPARE failed: {error:?}"))?;
+        let transition = clk::transition(self.device, old, target, old_pipe, true)
+            .map_err(|error| format!("CDCLK rollback transition failed: {}", error.describe()))?;
+        if !transition.after.usable()
+            || transition.after.entry != Some(target)
+            || transition.after.cdclk_khz != self.cdclk_before.cdclk_khz
+        {
+            return Err(format!(
+                "CDCLK rollback did not restore original {} kHz table row",
+                self.cdclk_before.cdclk_khz
+            ));
+        }
+        super::pcode::commit_cdclk_voltage(self.device, timer, transition.after.cdclk_khz)
+            .map_err(|error| format!("CDCLK rollback PCode voltage update failed: {error:?}"))
     }
     /// Explicit opt-in hardware rollback exercise, after admission/capture.
     pub(crate) fn inject_failure(&self, attempt: usize) -> Result<(), String> {
@@ -488,6 +585,9 @@ impl<'a, R: Registers> Transaction<'a, R> {
         )?;
         plane_disable_latched(self.device, timer)?;
         self.disable_link(self.device, timer)?;
+        if self.journal.lock().clock_transitioned {
+            self.restore_cdclk(timer)?;
+        }
         // SAFETY: native plane/pipe/link are off; changed GGTT entries were
         // allocated only for our retained framebuffer, never submitted to GT.
         unsafe { gtt.restore_checkpoint(image) }.map_err(|e| e.describe())?;
@@ -610,7 +710,8 @@ impl<'a, R: Registers> Transaction<'a, R> {
                 return Err(format!("{} final restore mismatch", reg.name()));
             }
         }
-        // CDCLK was not mutated: still verify the original clock image.
+        // Verify the original clock image, whether or not a source-ordered
+        // runtime change had to be reversed above.
         for reg in [regs::CDCLK_CTL, regs::CDCLK_PLL_ENABLE] {
             let mask = if reg == regs::CDCLK_PLL_ENABLE {
                 !LOCK

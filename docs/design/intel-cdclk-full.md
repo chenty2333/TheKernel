@@ -8,9 +8,18 @@ are required `IntelCdclkIo` backend methods rather than success defaults.
 
 The crate exports the module and `cargo check -p tk-intel-display --lib` plus
 `cargo test -p tk-intel-display --lib` compile the translation; the latter's
-149 tests pass. The parameterized raw-clock and PLL-ratio macros are expanded
+150 tests pass. The parameterized raw-clock and PLL-ratio macros are expanded
 from the matching `intel_display_regs.h` definitions, and the CNP fractional
-raw-clock fields have a focused test. The kernel currently uses its separate CDCLK bring-up and
-runtime-MMIO adapters, but does not yet invoke this full source module or
-connect the atomic runtime transition to the active modeset path. That caller
-integration remains part of the clock task.
+raw-clock fields have a focused test.
+
+The kernel does not yet implement an `IntelCdclkIo` backend for this full
+module. Its existing typed runtime adapter is now called by the explicit
+`intel.modeset=1` boot transaction only when every pipe and the combo DDI link
+read disabled, the current CDCLK is a usable table row, and the chosen mode
+exceeds that rate.
+It raises to the lowest table row at or above the conservative one-pixel
+clock ceiling, executes PCode PREPARE → clock transition/readback → PCode
+voltage update, and records that the rollback transaction must reverse the
+clock and restore the old PCode voltage if a later step fails. Generic writes
+still reject CDCLK; active-pipe atomic transitions and complete bandwidth /
+watermark-derived minima remain unconnected.

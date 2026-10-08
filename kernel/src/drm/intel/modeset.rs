@@ -1544,8 +1544,24 @@ pub(crate) fn preflight_mode<R: Registers>(
             detail: cdclk.describe(),
         });
     }
+    preflight_mode_at_cdclk(plan, edid, cdclk.cdclk_khz)
+}
 
-    let choice = choose_mode(plan, edid, EngineLimits::at_cdclk(cdclk.cdclk_khz));
+/// Preflight against a clock ceiling already admitted by the caller. The boot
+/// rollback transaction uses this before a CDCLK increase, but only after its
+/// own all-pipes-disabled check.
+pub(crate) fn preflight_mode_at_cdclk(
+    plan: &ModePlan,
+    edid: &[u8],
+    cdclk_khz: u32,
+) -> Result<(ModeChoice, Mode), ModesetError> {
+    if cdclk_khz == 0 {
+        return Err(ModesetError::NoCdclk {
+            cdclk_khz,
+            detail: String::from("CDCLK ceiling must be non-zero"),
+        });
+    }
+    let choice = choose_mode(plan, edid, EngineLimits::at_cdclk(cdclk_khz));
     let mode = match choice.into_mode() {
         Ok(mode) => mode,
         Err(refusal) => return Err(ModesetError::Refused(refusal)),
@@ -1553,7 +1569,7 @@ pub(crate) fn preflight_mode<R: Registers>(
 
     let i915_caps = I915DisplayCaps {
         display_version: 13,
-        cdclk_max_dotclock: cdclk.cdclk_khz,
+        cdclk_max_dotclock: cdclk_khz,
         ..I915DisplayCaps::default()
     };
     let i915_mode = I915DisplayMode {

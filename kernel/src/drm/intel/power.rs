@@ -695,6 +695,9 @@ pub(crate) struct PowerState {
     /// Refcounted pipe-A domain and its map-backed wells.
     pub(crate) power_domains: PowerDomainState,
     pub(crate) cdclk: clk::CdclkState,
+    /// Successful opt-in modeset CDCLK transition, if one was needed after
+    /// the initial firmware/bring-up observation.
+    pub(crate) runtime_cdclk_transition: Option<clk::CdclkTransitionReport>,
     /// PCODE acknowledged PREPARE when initial CDCLK state required a change.
     pub(crate) pcode_cdclk_prepared: bool,
     /// Voltage level accepted by PCODE after a newly programmed CDCLK.
@@ -863,6 +866,17 @@ impl PowerState {
             ));
         }
         line(self.cdclk.describe());
+        if let Some(transition) = self.runtime_cdclk_transition {
+            line(format!(
+                "runtime CDCLK: {:?}, now {} kHz; PCODE PREPARE and voltage update succeeded \
+                 (unlock timeout {}, lock timeout {}, crawl ACK timeout {})",
+                transition.method,
+                transition.after.cdclk_khz,
+                transition.unlock_timed_out,
+                transition.lock_timed_out,
+                transition.crawl_ack_timed_out,
+            ));
+        }
         line(format!(
             "PCode CDCLK: prepare acknowledged {}, voltage level {}",
             u8::from(self.pcode_cdclk_prepared),
@@ -1887,6 +1901,7 @@ fn bring_up_inner(
         pw1,
         power_domains,
         cdclk,
+        runtime_cdclk_transition: None,
         pcode_cdclk_prepared,
         pcode_voltage_level,
         wm_latencies,

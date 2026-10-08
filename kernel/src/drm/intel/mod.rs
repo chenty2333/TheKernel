@@ -478,12 +478,18 @@ fn bring_up_native(bdf: pci::Bdf, window: &RegisterWindow) -> Result<String, Str
 /// dependency-aware rollback. Both failed and successful DMA surfaces remain
 /// owned; no old-GOP-console claim is made merely from an allocation/address.
 #[cfg(target_os = "none")]
-fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<String, String> {
+fn modeset_at_boot<R: Registers>(
+    tx: &rollback::Transaction<'_, R>,
+    gtt: &gtt::Gtt,
+    pll_id: u8,
+) -> Result<String, String> {
     use alloc::sync::Arc;
+    let regs = tx;
     let report = CONNECT
         .lock()
         .take()
         .ok_or_else(|| String::from("connector report absent"))?;
+    let mut runtime_cdclk_transition = None;
     let result = (|| {
         let connector = report
             .connectors
@@ -496,8 +502,55 @@ fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<
         if let Some(extension) = &connector.extension {
             edid.extend_from_slice(extension.as_slice());
         }
-        let (_, mode) =
-            modeset::preflight_mode(regs, &connector.plan, &edid).map_err(|e| e.describe())?;
+        let clock_before = clk::observe(regs).map_err(|error| error.describe())?;
+        if !clock_before.usable() {
+            return Err(clock_before.describe());
+        }
+        // Pipe A was quiesced by this transaction. Raise CDCLK only if every
+        // pipe is now disabled; otherwise mode choice stays bounded by the
+        // live firmware clock and no transition is attempted.
+        let can_reclock = tx.pipes_disabled();
+        let selection_cdclk = if can_reclock {
+            clk::maximum_cdclk(clock_before.reference).unwrap_or(clock_before.cdclk_khz)
+        } else {
+            clock_before.cdclk_khz
+        };
+        let (_, mode) = modeset::preflight_mode_at_cdclk(&connector.plan, &edid, selection_cdclk)
+            .map_err(|error| error.describe())?;
+        if mode.clock_khz > clock_before.cdclk_khz {
+            if !can_reclock {
+                return Err(String::from(
+                    "CDCLK increase refused while any display pipe is active or unreadable",
+                ));
+            }
+            let target =
+                clk::entry_at_least(clock_before.reference, mode.clock_khz).ok_or_else(|| {
+                    alloc::format!(
+                        "no source CDCLK row can carry selected mode clock {} kHz",
+                        mode.clock_khz
+                    )
+                })?;
+            let timer = gmbus::MonotonicTimer;
+            let transition = tx.transition_cdclk(&timer, target)?;
+            if transition.after.cdclk_khz < mode.clock_khz {
+                return Err(alloc::format!(
+                    "CDCLK transition read back {} kHz, below selected mode {} kHz",
+                    transition.after.cdclk_khz,
+                    mode.clock_khz
+                ));
+            }
+            axlog::info!(
+                "intel-cdclk: raised CDCLK from {} to {} kHz before modeset ({:?}, unlock timeout \
+                 {}, lock timeout {}, crawl ACK timeout {})",
+                clock_before.cdclk_khz,
+                transition.after.cdclk_khz,
+                transition.method,
+                transition.unlock_timed_out,
+                transition.lock_timed_out,
+                transition.crawl_ack_timed_out,
+            );
+            runtime_cdclk_transition = Some(transition);
+        }
         axlog::info!(
             "intel-modeset: EDID selected {}x{} clock={} kHz",
             mode.hdisplay,
@@ -550,6 +603,11 @@ fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<
                     }),
                 );
                 if success {
+                    if let Some(transition) = runtime_cdclk_transition {
+                        if let Some(state) = POWER.lock().as_mut() {
+                            state.runtime_cdclk_transition = Some(transition);
+                        }
+                    }
                     Ok(text)
                 } else {
                     Err(alloc::format!("native scanout not proven: {text}"))
