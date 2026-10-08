@@ -108,6 +108,9 @@ impl Bus {
         if [0xc064, 0x13816c].contains(&r) {
             return write && self.awake.load(Ordering::Acquire);
         }
+        if r == 0xd3b0 {
+            return !write && self.awake.load(Ordering::Acquire);
+        }
         if (0xc200..=0xc2fc).contains(&r) {
             return write && self.awake.load(Ordering::Acquire);
         }

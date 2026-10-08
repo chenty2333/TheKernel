@@ -172,3 +172,6 @@ for WOPCM destinations; uncertain DMA retirement is quarantined.
 src/guc_fw.rs maps intel_guc_fw.c intel_guc_fw_upload()/guc_xfer_rsa_mmio()
 and intel_huc_fw.c intel_huc_fw_upload() to explicit GGTT/DMA inputs.
 Copyright © 2014-2019 Intel Corporation; MIT grant retained.
+src/guc_fw.rs also translates the GEN11 HuC-authenticated status bit and
+intel_huc_wait_for_auth_complete() polling boundary (MIT, © 2014-2019 Intel).
+GuC CT authentication dispatch is not wired yet.

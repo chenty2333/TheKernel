@@ -21,6 +21,8 @@ const START_DMA: u32 = 1;
 const UOS_MOVE: u32 = 1 << 4;
 const HUC_UKERNEL: u32 = 1 << 9;
 const DMA_ADDRESS_SPACE_WOPCM: u32 = 7 << 16;
+const HUC_STATUS2: u32 = 0xd3b0;
+const HUC_FW_VERIFIED: u32 = 1 << 7;
 const UOS_RSA_SCRATCH: u32 = 0xc200;
 const UOS_RSA_SCRATCH_COUNT: usize = 64;
 
@@ -143,6 +145,29 @@ pub fn huc_upload(
         .and_then(|v| u32::try_from(v).ok())
         .ok_or(Error::Refused)?;
     firmware_dma_xfer(io, source_ggtt, 0, code_bytes, HUC_UKERNEL)
+}
+
+// upstream: intel_huc.c intel_huc_is_authenticated()
+pub fn huc_is_authenticated(status2: u32) -> bool {
+    status2 & HUC_FW_VERIFIED == HUC_FW_VERIFIED
+}
+
+// upstream: intel_huc.c intel_huc_wait_for_auth_complete()
+pub fn wait_huc_auth(io: &impl GtIo) -> Result<u32, Error> {
+    for _ in 0..3 {
+        let start = io.now_us();
+        loop {
+            let status = io.read(HUC_STATUS2)?;
+            if huc_is_authenticated(status) {
+                return Ok(status);
+            }
+            if io.now_us().saturating_sub(start) >= 1_000_000 {
+                break;
+            }
+            io.delay_us(2);
+        }
+    }
+    Err(Error::Timeout(HUC_STATUS2))
 }
 
 // upstream: intel_guc_fw.c guc_prepare_xfer()
@@ -309,6 +334,9 @@ mod tests {
             if offset == 0xc000 {
                 return Ok(0xf0 << 8);
             }
+            if offset == HUC_STATUS2 {
+                return Ok(HUC_FW_VERIFIED);
+            }
             if offset == DMA_CTRL {
                 return Ok(u32::from(self.stuck));
             }
@@ -452,5 +480,24 @@ mod tests {
             io.writes.borrow()[5],
             (DMA_CTRL, crate::masked_enable(HUC_UKERNEL | START_DMA))
         );
+    }
+
+    #[test]
+    fn huc_authentication_status_requires_the_verified_bit() {
+        assert!(!huc_is_authenticated(0));
+        assert!(!huc_is_authenticated(HUC_FW_VERIFIED >> 1));
+        assert!(huc_is_authenticated(HUC_FW_VERIFIED));
+        assert!(huc_is_authenticated(HUC_FW_VERIFIED | 0x1234));
+    }
+
+    #[test]
+    fn huc_auth_wait_reads_verified_status() {
+        let io = DmaIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            time: core::cell::Cell::new(0),
+            stuck: false,
+            fail_start: false,
+        };
+        assert_eq!(wait_huc_auth(&io), Ok(HUC_FW_VERIFIED));
     }
 }
