@@ -5,12 +5,114 @@
 //! <info@genua.de>; Copyright (c) 2014 Fixup Software Ltd.; Copyright (c)
 //! 2017, 2019, 2020 Stefan Sperling <stsp@openbsd.org>.
 
-use crate::{CommandError, EncodedCommand, HostCommand};
+use alloc::vec::Vec;
+
+use crate::{CHAN_2GHZ, ChannelInfo, CommandError, EncodedCommand, HostCommand};
 
 pub const LONG_GROUP: u8 = 1;
 pub const UMAC_SCAN_REQ: u8 = 0x0d;
 pub const UMAC_SCAN_ABORT: u8 = 0x0e;
 pub const UMAC_SCAN_COMPLETE: u8 = 0x0f;
+pub const SCAN_BAND_5GHZ: u8 = 0;
+pub const SCAN_BAND_24GHZ: u8 = 1;
+pub const SCAN_BAND_FLAG_SHIFT: u32 = 30;
+pub const SCAN_PASSIVE_MAX_PSD: u8 = 0x80;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanChannelConfig {
+    pub flags: u32,
+    pub channel_num: u8,
+    pub band: Option<u8>,
+    pub iter_count: u8,
+    pub iter_interval: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanChannelConfigV5 {
+    pub flags: u32,
+    pub channel_num: u8,
+    pub psd_20: u8,
+    pub iter_count: u8,
+    pub iter_interval: u8,
+}
+
+/// Fill source-order valid UMAC channels with API v1-v4 channel layouts.
+// upstream: if_iwx.c iwx_umac_scan_fill_channels()
+pub fn fill_umac_scan_channels(
+    channels: &[ChannelInfo],
+    item_capacity: usize,
+    firmware_channel_limit: usize,
+    extended_channel_version: bool,
+    channel_flags: u32,
+) -> Vec<ScanChannelConfig> {
+    let mut result = Vec::new();
+    let count = channels
+        .iter()
+        .filter(|channel| channel.flags != 0)
+        .count()
+        .min(item_capacity)
+        .min(firmware_channel_limit);
+    if result.try_reserve_exact(count).is_err() {
+        return result;
+    }
+    for channel in channels
+        .iter()
+        .filter(|channel| channel.flags != 0)
+        .take(count)
+    {
+        result.push(ScanChannelConfig {
+            flags: channel_flags,
+            channel_num: channel.channel,
+            band: extended_channel_version.then_some(if channel.flags & CHAN_2GHZ != 0 {
+                SCAN_BAND_24GHZ
+            } else {
+                SCAN_BAND_5GHZ
+            }),
+            iter_count: 1,
+            iter_interval: 0,
+        });
+    }
+    result
+}
+
+/// Fill v5 channel entries with band bits in flags and a fresh PSD sentinel.
+// upstream: if_iwx.c iwx_umac_scan_fill_channels_v5()
+pub fn fill_umac_scan_channels_v5(
+    channels: &[ChannelInfo],
+    item_capacity: usize,
+    firmware_channel_limit: usize,
+    channel_flags: u32,
+) -> Vec<ScanChannelConfigV5> {
+    let mut result = Vec::new();
+    let count = channels
+        .iter()
+        .filter(|channel| channel.flags != 0)
+        .count()
+        .min(item_capacity)
+        .min(firmware_channel_limit);
+    if result.try_reserve_exact(count).is_err() {
+        return result;
+    }
+    for channel in channels
+        .iter()
+        .filter(|channel| channel.flags != 0)
+        .take(count)
+    {
+        let band = if channel.flags & CHAN_2GHZ != 0 {
+            SCAN_BAND_24GHZ
+        } else {
+            SCAN_BAND_5GHZ
+        };
+        result.push(ScanChannelConfigV5 {
+            flags: channel_flags | (u32::from(band) << SCAN_BAND_FLAG_SHIFT),
+            channel_num: channel.channel,
+            psd_20: SCAN_PASSIVE_MAX_PSD,
+            iter_count: 1,
+            iter_interval: 0,
+        });
+    }
+    result
+}
 
 /// Current driver flags and net80211 state that `iwx_scan()` mutates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -119,6 +221,7 @@ mod tests {
     use core::cell::RefCell;
 
     use super::*;
+    use crate::CHAN_A;
 
     #[test]
     fn scan_abort_command_has_source_wide_id_and_zero_payload() {
@@ -128,6 +231,61 @@ mod tests {
             (u32::from(LONG_GROUP) << 8) | u32::from(UMAC_SCAN_ABORT)
         );
         assert_eq!(&command.bytes[8..], &[0; 8]);
+    }
+
+    #[test]
+    fn channel_fill_respects_valid_channel_caps_and_generation_layouts() {
+        let channels = [
+            ChannelInfo {
+                channel: 1,
+                frequency_mhz: 2412,
+                flags: CHAN_2GHZ,
+                extended_flags: 0,
+            },
+            ChannelInfo {
+                channel: 2,
+                frequency_mhz: 0,
+                flags: 0,
+                extended_flags: 0,
+            },
+            ChannelInfo {
+                channel: 36,
+                frequency_mhz: 5180,
+                flags: 0,
+                extended_flags: 0,
+            },
+            ChannelInfo {
+                channel: 40,
+                frequency_mhz: 5200,
+                flags: CHAN_A,
+                extended_flags: 0,
+            },
+        ];
+        let old = fill_umac_scan_channels(&channels, 8, 1, false, 0x1234);
+        assert_eq!(
+            old,
+            [ScanChannelConfig {
+                flags: 0x1234,
+                channel_num: 1,
+                band: None,
+                iter_count: 1,
+                iter_interval: 0
+            }]
+        );
+        let extended = fill_umac_scan_channels(&channels, 8, 8, true, 0x55);
+        assert_eq!(extended[0].band, Some(SCAN_BAND_24GHZ));
+        assert_eq!(extended[1].band, Some(SCAN_BAND_5GHZ));
+        let v5 = fill_umac_scan_channels_v5(&channels, 1, 4, 0x12);
+        assert_eq!(
+            v5,
+            [ScanChannelConfigV5 {
+                flags: 0x12 | (1 << SCAN_BAND_FLAG_SHIFT),
+                channel_num: 1,
+                psd_20: SCAN_PASSIVE_MAX_PSD,
+                iter_count: 1,
+                iter_interval: 0
+            }]
+        );
     }
 
     #[test]

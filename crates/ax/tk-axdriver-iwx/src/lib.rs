@@ -166,8 +166,10 @@ pub use rx_packet::{
     RX_PACKET_HEADER_BYTES, RxPacket, RxPacketError, parse_rx_packet,
 };
 pub use scan::{
-    LONG_GROUP as IWX_LONG_GROUP, ScanError, ScanState, UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE,
-    UMAC_SCAN_REQ, abort_scan, begin_background_scan, begin_foreground_scan, end_scan,
+    LONG_GROUP as IWX_LONG_GROUP, SCAN_BAND_5GHZ, SCAN_BAND_24GHZ, SCAN_BAND_FLAG_SHIFT,
+    SCAN_PASSIVE_MAX_PSD, ScanChannelConfig, ScanChannelConfigV5, ScanError, ScanState,
+    UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ, abort_scan, begin_background_scan,
+    begin_foreground_scan, end_scan, fill_umac_scan_channels, fill_umac_scan_channels_v5,
     scan_abort_command,
 };
 pub use station::{
