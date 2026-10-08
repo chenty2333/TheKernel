@@ -61,6 +61,7 @@ pub mod nvm;
 pub mod mac;
 pub mod phy;
 pub mod txrx;
+pub mod if_igc;
 pub mod bringup;
 pub mod desc;
 pub mod i225;

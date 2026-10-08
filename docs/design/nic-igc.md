@@ -349,3 +349,5 @@ The remaining `igc_i225.c` entrypoints are translated as well: reset preserves t
 `igc_phy.c` now has 26/26 source functions in `src/igc/phy.rs`, covering generic operation table defaults, MDIC transactions, 10/100/1G/2.5G advertisements and pause resolution, PHY reset/link polling, LPLU, GPY MMD and XMDIO access. They remain adapter-backed and are not yet the live probe/packet path.
 
 `igc_txrx.c` has its 11 operational ctags callbacks translated in `src/igc/txrx.rs`; each source callback has a marker. `igc_dump_rs` is the only omitted definition and only prints descriptor/RS state for debugging, so its one-line omission rationale is recorded in `progress-S.md`.
+
+`if_igc.c` translation has started in `src/igc/if_igc.rs` with 18/91 ctags definitions: adaptive interrupt-rate arithmetic, VLAN/promiscuous-multicast policy, I225 IPG workaround and helper boundaries. This is not yet the live `IgcNic` lifecycle or queue path.
