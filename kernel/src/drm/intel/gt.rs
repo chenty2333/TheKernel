@@ -229,6 +229,8 @@ struct Owner {
     memory: Option<copy::Memory>,
     // Firmware source mapping retained if DMA completion cannot be proven.
     uc_memory: Option<copy::UcDmaMemory>,
+    // ADS GGTT VMA retained once its address has been published to GuC.
+    ads_memory: Option<copy::AdsDmaMemory>,
     // GuC CTB buffers/descriptor VMA retained while GuC may reference it.
     ct_memory: Option<copy::CtDmaMemory>,
 }
@@ -491,6 +493,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             render_ready: false,
             memory: None,
             uc_memory: None,
+            ads_memory: None,
             ct_memory: None,
         });
         return Err(format!(
@@ -516,6 +519,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 render_ready: false,
                 memory: None,
                 uc_memory: None,
+                ads_memory: None,
                 ct_memory: None,
             };
             let copied = copy::run(&mut device, bdf).and_then(|()| {
@@ -565,6 +569,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 render_ready: false,
                 memory: None,
                 uc_memory: None,
+                ads_memory: None,
                 ct_memory: None,
             });
             Err(format!(

@@ -454,6 +454,140 @@ pub(super) struct CtDmaMemory {
 }
 
 #[cfg(target_os = "none")]
+pub(super) struct AdsDmaMemory {
+    _gtt: Arc<Gtt>,
+    _ram: Ram,
+    binding: Binding,
+    input: intel_gt::guc_ads::AdsBuildInput,
+    layout: intel_gt::guc_ads::AdsLayout,
+    blob: Vec<u8>,
+    registered: bool,
+}
+
+#[cfg(target_os = "none")]
+impl AdsDmaMemory {
+    fn release(self) -> Result<(), Self> {
+        if self.registered {
+            return Err(self);
+        }
+        // SAFETY: ADS has not been published to GuC, or GuC was reset before
+        // the caller cleared `registered`.
+        if unsafe { self._gtt.release_binding(&self.binding) }.is_err() {
+            Err(self)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Allocate and populate the ADS GGTT VMA. Caller-provided data must come
+    /// from probed engine/MCR/system-info/context state, not guessed defaults.
+    /// upstream: intel_guc_ads.c intel_guc_ads_create()/__guc_ads_init().
+    pub(super) fn initialize(
+        owner: &mut super::Owner,
+        mut input: intel_gt::guc_ads::AdsBuildInput,
+    ) -> Result<(), Error> {
+        if owner.lost || owner.ads_memory.is_some() {
+            return Err(Error::Quarantined);
+        }
+        // The required allocation size is independent of the eventual GGTT
+        // address; use an aligned placeholder to run the checked builder once.
+        input.base_ggtt = PAGE as u32;
+        let (layout, _) = intel_gt::guc_ads::build_ads(&input).map_err(|_| Error::Refused)?;
+        let pages = layout
+            .total_size
+            .checked_add(PAGE - 1)
+            .ok_or(Error::Refused)?
+            / PAGE;
+        let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+        let ram = Ram::allocate(pages)?;
+        let binding = gtt
+            .bind_pages(&ram.physical)
+            .map_err(|_| Error::Quarantined)?;
+        let base = match u32::try_from(binding.address) {
+            Ok(base) if base != 0 && base.is_multiple_of(PAGE as u32) => base,
+            _ => {
+                let memory = Self {
+                    _gtt: gtt,
+                    _ram: ram,
+                    binding,
+                    input,
+                    layout,
+                    blob: Vec::new(),
+                    registered: false,
+                };
+                if let Err(memory) = memory.release() {
+                    owner.ads_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        input.base_ggtt = base;
+        let (actual_layout, blob) = match intel_gt::guc_ads::build_ads(&input) {
+            Ok(built) if built.0.total_size == layout.total_size => built,
+            _ => {
+                let memory = Self {
+                    _gtt: gtt,
+                    _ram: ram,
+                    binding,
+                    input,
+                    layout,
+                    blob: Vec::new(),
+                    registered: false,
+                };
+                if let Err(memory) = memory.release() {
+                    owner.ads_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        let memory = Self {
+            _gtt: gtt,
+            _ram: ram,
+            binding,
+            input,
+            layout: actual_layout,
+            blob,
+            registered: false,
+        };
+        if let Err(error) = memory._ram.write(0, &memory.blob) {
+            if let Err(memory) = memory.release() {
+                owner.ads_memory = Some(memory);
+                return Err(Error::Quarantined);
+            }
+            return Err(error);
+        }
+        memory._ram.flush();
+        owner.ads_memory = Some(memory);
+        Ok(())
+    }
+
+    pub(super) fn ggtt_address(&self) -> Result<u32, Error> {
+        u32::try_from(self.binding.address).map_err(|_| Error::Refused)
+    }
+
+    /// Rebuild all ADS regions after GuC reset and publish the bytes before
+    /// re-registering the VMA.
+    /// upstream: intel_guc_ads.c intel_guc_ads_reset().
+    pub(super) fn reset_after_guc_reset(&mut self) -> Result<(), Error> {
+        let layout = intel_gt::guc_ads::intel_guc_ads_reset(&self.input, &mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        if layout.total_size != self.layout.total_size {
+            return Err(Error::Quarantined);
+        }
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        self.registered = false;
+        Ok(())
+    }
+
+    pub(super) fn mark_registered(&mut self) {
+        self.registered = true;
+    }
+}
+
+#[cfg(target_os = "none")]
 impl CtDmaMemory {
     fn release(self) -> Result<(), Self> {
         // SAFETY: the CTB KLVs have not been registered with GuC yet.
