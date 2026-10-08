@@ -1,5 +1,58 @@
 use super::*;
 
+#[test]
+fn combo_pll_power_cfg_enable_and_disable_follow_i915_order() {
+    let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+    regs.derive(regs::dpll::DPLL0_ENABLE, |written| {
+        let mut value = written;
+        if written & PLL_POWER_ENABLE != 0 {
+            value |= PLL_POWER_STATE;
+        } else {
+            value &= !PLL_POWER_STATE;
+        }
+        if written & PLL_ENABLE != 0 {
+            value |= PLL_LOCK;
+        } else {
+            value &= !PLL_LOCK;
+        }
+        value
+    });
+
+    let config = PllRegisters {
+        cfgcr0: 0x1234,
+        cfgcr1: 0x5678,
+    };
+    let enabled = enable_combo_pll(&regs, ComboPllId::Dpll0, config).unwrap();
+    assert!(!enabled.power_state_timed_out);
+    assert!(!enabled.lock_timed_out);
+    assert_eq!(
+        regs.writes(),
+        alloc::vec![
+            ("DPLL0_ENABLE", PLL_POWER_ENABLE),
+            ("DPLL0_CFGCR0", config.cfgcr0),
+            ("DPLL0_CFGCR1", config.cfgcr1),
+            (
+                "DPLL0_ENABLE",
+                PLL_POWER_ENABLE | PLL_POWER_STATE | PLL_ENABLE
+            ),
+        ]
+    );
+
+    let disabled = disable_combo_pll(&regs, ComboPllId::Dpll0).unwrap();
+    assert!(!disabled.power_state_timed_out);
+    assert!(!disabled.lock_timed_out);
+    assert_eq!(
+        &regs.writes()[4..],
+        &[
+            (
+                "DPLL0_ENABLE",
+                PLL_POWER_ENABLE | PLL_POWER_STATE | PLL_LOCK
+            ),
+            ("DPLL0_ENABLE", PLL_POWER_STATE),
+        ]
+    );
+}
+
 /// The reference frequency the ADL-N PLL strips use most often, and the one
 /// the worked example in the reference document uses.
 const REF_24: u32 = 24_000;

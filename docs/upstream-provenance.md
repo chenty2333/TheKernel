@@ -1131,3 +1131,10 @@ preparation and ±1 kHz clock comparison from Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_dpll.c` (MIT, Copyright © 2020 Intel).
 The dispatcher is exposed as a pure helper and not yet wired to the kernel
 atomic modeset path.
+
+`kernel/src/drm/intel/pll.rs::enable_combo_pll()` and
+`disable_combo_pll()` translate the combo DPLL0/1 power-state, CFGCR write,
+lock and power-off sequence from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
+Intel). The adapter retains i915's warning-only timeout outcome and is not yet
+called by atomic modeset.

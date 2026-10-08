@@ -6,7 +6,7 @@
 //! dividers right is what makes a mode appear at the right size and in the
 //! right place; getting them wrong produces a monitor that reports no signal
 //! and gives no reason.
-//!
+
 //! Everything here is integer arithmetic over the numbers in the request and
 //! the numbers in the result.  There is no MMIO, no register window and no
 //! device: a caller hands in a pixel clock, a reference frequency and which
@@ -144,6 +144,8 @@
 //! what §13.4's read-back is for.
 
 use core::fmt;
+
+use super::regs::{self, Register, Registers};
 
 /// The PRM's DCO window, in kHz.
 ///
@@ -790,6 +792,125 @@ impl PllRegisters {
         let divisor = 5 * u64::from(p) * u64::from(q) * u64::from(k);
         Ok(dco_hz / divisor)
     }
+}
+
+/// One of the two ICL/TGL combo PHY PLLs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ComboPllId {
+    Dpll0,
+    Dpll1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PllRuntimeError {
+    Unreadable(&'static str),
+    WriteRefused(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PllRuntimeReport {
+    pub(crate) power_state_timed_out: bool,
+    pub(crate) lock_timed_out: bool,
+}
+
+const PLL_POWER_ENABLE: u32 = 1 << 27;
+const PLL_POWER_STATE: u32 = 1 << 26;
+const PLL_ENABLE: u32 = 1 << 31;
+const PLL_LOCK: u32 = 1 << 30;
+const PLL_POWER_TIMEOUT_US: u32 = 1_000;
+const PLL_LOCK_TIMEOUT_US: u32 = 1_000;
+
+fn combo_pll_registers(id: ComboPllId) -> (Register, Register, Register) {
+    match id {
+        ComboPllId::Dpll0 => (
+            regs::dpll::DPLL0_ENABLE,
+            regs::dpll::DPLL0_CFGCR0,
+            regs::dpll::DPLL0_CFGCR1,
+        ),
+        ComboPllId::Dpll1 => (
+            regs::dpll::DPLL1_ENABLE,
+            regs::dpll::DPLL1_CFGCR0,
+            regs::dpll::DPLL1_CFGCR1,
+        ),
+    }
+}
+
+fn pll_read<R: Registers>(regs: &R, register: Register) -> Result<u32, PllRuntimeError> {
+    regs.read(register)
+        .ok_or(PllRuntimeError::Unreadable(register.name()))
+}
+
+fn pll_write<R: Registers>(
+    regs: &R,
+    register: Register,
+    value: u32,
+) -> Result<(), PllRuntimeError> {
+    regs.write(register, value)
+        .then_some(())
+        .ok_or(PllRuntimeError::WriteRefused(register.name()))
+}
+
+fn pll_poll<R: Registers>(
+    regs: &R,
+    register: Register,
+    mask: u32,
+    value: u32,
+    timeout_us: u32,
+) -> Result<bool, PllRuntimeError> {
+    regs::poll(regs, register, mask, value, timeout_us)
+        .ok_or(PllRuntimeError::Unreadable(register.name()))
+}
+
+/// Power and enable one combo PLL, preserving the i915 CFGCR and readback order.
+// upstream: intel_dpll_mgr.c combo_pll_enable()/icl_pll_power_enable()/icl_pll_enable()
+pub(crate) fn enable_combo_pll<R: Registers>(
+    regs: &R,
+    id: ComboPllId,
+    state: PllRegisters,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let (enable, cfgcr0, cfgcr1) = combo_pll_registers(id);
+    let mut value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value | PLL_POWER_ENABLE)?;
+    let power_state_timed_out = !pll_poll(
+        regs,
+        enable,
+        PLL_POWER_STATE,
+        PLL_POWER_STATE,
+        PLL_POWER_TIMEOUT_US,
+    )?;
+
+    // icl_dpll_write() posts CFGCR1 after the pair of full register writes.
+    pll_write(regs, cfgcr0, state.cfgcr0)?;
+    pll_write(regs, cfgcr1, state.cfgcr1)?;
+    let _ = pll_read(regs, cfgcr1)?;
+
+    value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value | PLL_ENABLE)?;
+    let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, PLL_LOCK, PLL_LOCK_TIMEOUT_US)?;
+    Ok(PllRuntimeReport {
+        power_state_timed_out,
+        lock_timed_out,
+    })
+}
+
+/// Disable one combo PLL: disable/lock-clear first, then power-off/state-clear.
+// upstream: intel_dpll_mgr.c combo_pll_disable()/icl_pll_disable()
+pub(crate) fn disable_combo_pll<R: Registers>(
+    regs: &R,
+    id: ComboPllId,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let (enable, ..) = combo_pll_registers(id);
+    let mut value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value & !PLL_ENABLE)?;
+    let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, 0, PLL_LOCK_TIMEOUT_US)?;
+
+    value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value & !PLL_POWER_ENABLE)?;
+    let power_state_timed_out = !pll_poll(regs, enable, PLL_POWER_STATE, 0, PLL_POWER_TIMEOUT_US)?;
+    Ok(PllRuntimeReport {
+        power_state_timed_out,
+        lock_timed_out,
+    })
 }
 
 /// Decode `SKL_DSSM`'s reference-clock field into a frequency in kHz.
