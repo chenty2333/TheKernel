@@ -86,12 +86,14 @@ pub struct WirelessConnectRequest {
 }
 
 /// The peer status fields consumed by nl80211 GET_STATION.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WirelessStationInfo {
     pub bssid: [u8; 6],
     pub frequency_mhz: u32,
     pub signal_mbm: i32,
     pub association_id: u16,
+    pub request_ies: alloc::vec::Vec<u8>,
+    pub response_ies: alloc::vec::Vec<u8>,
 }
 
 /// One nl80211-installed temporal/group key from userspace.

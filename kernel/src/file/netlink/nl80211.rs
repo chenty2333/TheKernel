@@ -61,6 +61,8 @@ const ATTR_CIPHER_SUITES_PAIRWISE: u16 = 73;
 const ATTR_CIPHER_SUITE_GROUP: u16 = 74;
 const ATTR_WPA_VERSIONS: u16 = 75;
 const ATTR_AKM_SUITES: u16 = 76;
+const ATTR_REQ_IE: u16 = 77;
+const ATTR_RESP_IE: u16 = 78;
 const ATTR_BSS: u16 = 47;
 const ATTR_SCAN_FREQUENCIES: u16 = 44;
 const ATTR_SCAN_SSIDS: u16 = 45;
@@ -219,6 +221,12 @@ fn connect_event_message(ifindex: u32, station: &axnet::WirelessStationInfo) -> 
         ATTR_WIPHY_FREQ,
         &station.frequency_mhz.to_ne_bytes(),
     );
+    if !station.request_ies.is_empty() {
+        push_attr(&mut payload, ATTR_REQ_IE, &station.request_ies);
+    }
+    if !station.response_ies.is_empty() {
+        push_attr(&mut payload, ATTR_RESP_IE, &station.response_ies);
+    }
     let request = NlMsgHdr {
         nlmsg_len: (size_of::<NlMsgHdr>() + payload.len()) as u32,
         nlmsg_type: FAMILY_ID,
@@ -1093,6 +1101,8 @@ mod tests {
         assert_eq!(CMD_DEL_KEY, 12);
         assert_eq!(ATTR_WIPHY_FREQ, 38);
         assert_eq!(ATTR_STATUS_CODE, 72);
+        assert_eq!(ATTR_REQ_IE, 77);
+        assert_eq!(ATTR_RESP_IE, 78);
         assert_eq!(ATTR_REG_ALPHA2, 33);
         assert_eq!(ATTR_IFINDEX, 3);
         assert_eq!(ATTR_IFNAME, 4);
@@ -1603,6 +1613,8 @@ mod tests {
             frequency_mhz: 2437,
             signal_mbm: -6123,
             association_id: 17,
+            request_ies: Vec::new(),
+            response_ies: Vec::new(),
         };
         let message = station_message(&request, 9, &interface, &station, true);
         let generic = size_of::<NlMsgHdr>();
@@ -1643,12 +1655,16 @@ mod tests {
             frequency_mhz: 5180,
             signal_mbm: -4500,
             association_id: 17,
+            request_ies: vec![0, 1, b'a'],
+            response_ies: vec![1, 1, 2],
         };
         let message = connect_event_message(12, &station);
         let generic = size_of::<NlMsgHdr>();
         assert_eq!(message[generic], CMD_CONNECT);
         let mut status = None;
         let mut frequency = None;
+        let mut request_ies = None;
+        let mut response_ies = None;
         for_each_rtattr(
             &message[generic + size_of::<GenlMsgHdr>()..],
             |kind, value| {
@@ -1656,6 +1672,10 @@ mod tests {
                     status = Some(u16::from_ne_bytes(value.try_into().unwrap()));
                 } else if kind == ATTR_WIPHY_FREQ {
                     frequency = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+                } else if kind == ATTR_REQ_IE {
+                    request_ies = Some(value.to_vec());
+                } else if kind == ATTR_RESP_IE {
+                    response_ies = Some(value.to_vec());
                 }
                 Ok(())
             },
@@ -1663,6 +1683,8 @@ mod tests {
         .unwrap();
         assert_eq!(status, Some(0));
         assert_eq!(frequency, Some(5180));
+        assert_eq!(request_ies, Some(station.request_ies));
+        assert_eq!(response_ies, Some(station.response_ies));
     }
 
     #[test]

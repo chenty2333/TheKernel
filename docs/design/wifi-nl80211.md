@@ -57,7 +57,8 @@ observed RSN BSS and fails closed for unsupported AKM/cipher combinations.
 The userspace supplicant owns the EAPOL four-way handshake; NEW_KEY/SET_KEY/
 GET_KEY/DEL_KEY install software CCMP keys and GET_KEY returns the packet
 sequence without disclosing key bytes. Successful CONNECT and DISCONNECT
-queue their standard command events on the `mlme` group. GET_STATION encodes
+queue their standard command events on the `mlme` group; CONNECT carries the
+association request/response IEs retained by the driver. GET_STATION encodes
 the associated BSSID and signed signal value from the live driver record.
 Other station/authentication events and regulatory rule operations remain
 incomplete.

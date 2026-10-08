@@ -233,6 +233,8 @@ struct StationConnection {
     signal_mbm: i32,
     association_id: u16,
     security_enabled: bool,
+    request_ies: Vec<u8>,
+    response_ies: Vec<u8>,
     tx_sequence: tk_net80211::ManagementTxSequence,
     data_sequence: u16,
     rx_ethernet: VecDeque<Vec<u8>>,
@@ -437,6 +439,8 @@ impl NetDriverOps for IwxNetDevice {
                 frequency_mhz: station.frequency_mhz,
                 signal_mbm: station.signal_mbm,
                 association_id: station.association_id,
+                request_ies: station.request_ies.clone(),
+                response_ies: station.response_ies.clone(),
             })
     }
 
@@ -1420,6 +1424,7 @@ fn connect_station(
         he_caps: None,
     })
     .map_err(|_| RuntimeStartError::Firmware)?;
+    let request_ies = request_body.get(4..).unwrap_or_default().to_vec();
     let assoc_frame = tx_sequence
         .frame(
             0x00,
@@ -1433,6 +1438,7 @@ fn connect_station(
         .map_err(|_| RuntimeStartError::Transmission)?;
     send_station_management_frame_locked(device, &assoc_frame, |_| {})?;
     let assoc_response = station_management_response(device, bss.bssid, 0x10)?;
+    let response_ies = assoc_response.get(30..).unwrap_or_default().to_vec();
     let mut nodes = tk_net80211::NodeTable::default();
     let local_phy = tk_net80211::LocalPhyConfig {
         modecaps: 0,
@@ -1529,6 +1535,8 @@ fn connect_station(
         signal_mbm: bss.signal_mbm,
         association_id: assoc.association_id & 0x3fff,
         security_enabled,
+        request_ies,
+        response_ies,
         tx_sequence,
         data_sequence: 0,
         rx_ethernet: VecDeque::new(),
