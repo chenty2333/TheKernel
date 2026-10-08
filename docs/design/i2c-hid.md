@@ -83,3 +83,10 @@ helpers (`hid_clear_local`, `hid_switch_rid`, `hid_start_parse`,
 `hid_end_parse`, `hid_get_byte`, `hid_get_item`), quirk registration/dispatch,
 and generic `hid_ioctl` are not yet direct source translations; the shared
 bounded parser remains independently implemented.
+
+All eight `hmt.c` entry points now have a TheKernel mapping, including detach
+through the owning evdev driver's RAII teardown. That function coverage does
+not imply full source behavior: THQA handling, scan timestamps, and model
+quirks remain unsupported, and the full `hmt_intr()` geometry/options path is
+partly implemented in the generic report decoder rather than as a copied
+function body.

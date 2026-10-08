@@ -733,6 +733,7 @@ impl I2cInput {
 
 impl Drop for I2cInput {
     // upstream: iichid.c iichid_detach()
+    // upstream: hmt.c hmt_detach() (evdev registration is released by owner)
     fn drop(&mut self) {
         let state = self.state.get_mut();
         if state.opened && !state.suspended {
