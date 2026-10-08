@@ -8,7 +8,9 @@ are required `IntelCdclkIo` backend methods rather than success defaults.
 
 The crate exports the module and `cargo check -p tk-intel-display --lib` plus
 `cargo test -p tk-intel-display --lib` compile the translation; the latter's
-149 tests pass. The kernel currently uses its separate CDCLK bring-up and
+149 tests pass. The parameterized raw-clock and PLL-ratio macros are expanded
+from the matching `intel_display_regs.h` definitions, and the CNP fractional
+raw-clock fields have a focused test. The kernel currently uses its separate CDCLK bring-up and
 runtime-MMIO adapters, but does not yet invoke this full source module or
 connect the atomic runtime transition to the active modeset path. That caller
 integration remains part of the clock task.

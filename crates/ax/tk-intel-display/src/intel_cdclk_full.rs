@@ -356,12 +356,11 @@ pub fn i85x_get_cdclk<I: IntelCdclkIo>(
     config: &mut IntelCdclkConfig,
 ) {
     let revision = io.pci_read16("PCI_REVISION_ID");
-    let mut hpllcc = 0u16;
     if revision == 0x1 {
         config.cdclk = 133333;
         return;
     }
-    hpllcc = io.pci_bus_read16(3, "HPLLCC");
+    let hpllcc = io.pci_bus_read16(3, "HPLLCC");
     match (hpllcc as u32) & c(io, "GC_CLOCK_CONTROL_MASK") {
         x if x == c(io, "GC_CLOCK_133_200")
             || x == c(io, "GC_CLOCK_133_200_2")
@@ -2652,12 +2651,7 @@ pub fn bxt_de_pll_disable<I: IntelCdclkIo>(io: &mut I, display: &mut IntelDispla
 // upstream: intel_cdclk.c bxt_de_pll_enable()
 pub fn bxt_de_pll_enable<I: IntelCdclkIo>(io: &mut I, display: &mut IntelDisplay, vco: i32) {
     let ratio = round_closest(vco as i64, display.cdclk.hw.refclk as i64) as u32;
-    rmw(
-        io,
-        "BXT_DE_PLL_CTL",
-        c(io, "BXT_DE_PLL_RATIO_MASK"),
-        c(io, "BXT_DE_PLL_RATIO(ratio)"),
-    );
+    rmw(io, "BXT_DE_PLL_CTL", c(io, "BXT_DE_PLL_RATIO_MASK"), ratio);
     wr(io, "BXT_DE_PLL_ENABLE", c(io, "BXT_DE_PLL_PLL_ENABLE"));
     if io.wait(
         "BXT_DE_PLL_ENABLE",
@@ -2691,7 +2685,7 @@ pub fn icl_cdclk_pll_disable<I: IntelCdclkIo>(io: &mut I, display: &mut IntelDis
 // upstream: intel_cdclk.c icl_cdclk_pll_enable()
 pub fn icl_cdclk_pll_enable<I: IntelCdclkIo>(io: &mut I, display: &mut IntelDisplay, vco: i32) {
     let ratio = round_closest(vco as i64, display.cdclk.hw.refclk as i64) as u32;
-    let mut val = c(io, "ICL_CDCLK_PLL_RATIO(ratio)");
+    let mut val = ratio;
     wr(io, "BXT_DE_PLL_ENABLE", val);
     val |= c(io, "BXT_DE_PLL_PLL_ENABLE");
     wr(io, "BXT_DE_PLL_ENABLE", val);
@@ -2710,7 +2704,7 @@ pub fn icl_cdclk_pll_enable<I: IntelCdclkIo>(io: &mut I, display: &mut IntelDisp
 // upstream: intel_cdclk.c adlp_cdclk_pll_crawl()
 pub fn adlp_cdclk_pll_crawl<I: IntelCdclkIo>(io: &mut I, display: &mut IntelDisplay, vco: i32) {
     let ratio = round_closest(vco as i64, display.cdclk.hw.refclk as i64) as u32;
-    let mut val = c(io, "ICL_CDCLK_PLL_RATIO(ratio)") | c(io, "BXT_DE_PLL_PLL_ENABLE");
+    let mut val = ratio | c(io, "BXT_DE_PLL_PLL_ENABLE");
     wr(io, "BXT_DE_PLL_ENABLE", val);
     val |= c(io, "BXT_DE_PLL_FREQ_REQ");
     wr(io, "BXT_DE_PLL_ENABLE", val);
@@ -4058,6 +4052,24 @@ pub fn intel_cdclk_update_hw_state<I: IntelCdclkIo>(io: &mut I, display: &mut In
     state.dbuf_bw_min_cdclk = hook(io, "intel_dbuf_bw_min_cdclk", &[]) as i32;
 }
 
+#[cfg(test)]
+mod source_field_tests {
+    use super::*;
+
+    #[test]
+    fn cnp_rawclk_macro_fields_keep_integer_fraction_and_icp_numerator() {
+        assert_eq!(cnp_rawclk_fields(24_000, 0, false), 24 << 16);
+        assert_eq!(
+            cnp_rawclk_fields(19_000, 200, false),
+            (19 << 16) | (4 << 26)
+        );
+        assert_eq!(
+            cnp_rawclk_fields(19_000, 200, true),
+            (19 << 16) | (4 << 26) | (1 << 11)
+        );
+    }
+}
+
 // upstream: intel_cdclk.c intel_cdclk_crtc_disable_noatomic()
 pub fn intel_cdclk_crtc_disable_noatomic<I: IntelCdclkIo>(
     io: &mut I,
@@ -4176,19 +4188,25 @@ pub fn cnp_rawclk<I: IntelCdclkIo>(io: &mut I, display: &IntelDisplay) -> i32 {
     } else {
         (19000, 200)
     };
-    let mut rawclk = c(io, "CNP_RAWCLK_DIV(divider / 1000)");
-    if fraction != 0 {
-        let numerator = 1;
-        rawclk |= c(
-            io,
-            "CNP_RAWCLK_DEN(DIV_ROUND_CLOSEST(numerator * 1000, fraction) - 1)",
-        );
-        if display.pch_type >= c(io, "PCH_ICP") {
-            rawclk |= c(io, "ICP_RAWCLK_NUM(numerator)");
-        }
-    }
+    let rawclk = cnp_rawclk_fields(divider, fraction, display.pch_type >= c(io, "PCH_ICP"));
     wr(io, "PCH_RAWCLK_FREQ", rawclk);
     divider + fraction
+}
+
+fn cnp_rawclk_fields(divider: i32, fraction: i32, has_icp: bool) -> u32 {
+    // intel_display_regs.h defines CNP_RAWCLK_DIV(x) as x << 16.
+    let mut rawclk = (divider as u32 / 1000) << 16;
+    if fraction != 0 {
+        let numerator = 1;
+        // CNP_RAWCLK_DEN(DIV_ROUND_CLOSEST(numerator * 1000, fraction) - 1).
+        let denominator = round_closest(numerator * 1000, fraction as i64) - 1;
+        rawclk |= (denominator as u32) << 26;
+        if has_icp {
+            // ICP_RAWCLK_NUM(numerator) is numerator << 11.
+            rawclk |= (numerator as u32) << 11;
+        }
+    }
+    rawclk
 }
 
 // upstream: intel_cdclk.c pch_rawclk()
