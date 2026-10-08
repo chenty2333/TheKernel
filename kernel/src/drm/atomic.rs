@@ -569,6 +569,30 @@ fn validate_ctm_blob(device: &super::device::DeviceState, blob: u32) -> DrmResul
 mod tests {
     use super::*;
 
+    struct Display13ColorAdapter;
+    impl super::super::device::DisplayAdapter for Display13ColorAdapter {
+        fn create_dumb(
+            &self,
+            _: super::super::gem::DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: alloc::sync::Arc<dyn Send + Sync>,
+        ) -> DrmResult<alloc::sync::Arc<dyn super::super::gem::GemBacking>> {
+            Err(DrmError::Unsupported)
+        }
+
+        fn present(
+            &self,
+            _: super::super::device::Scanout,
+        ) -> DrmResult<alloc::sync::Arc<super::super::fence::Fence>> {
+            Ok(super::super::fence::Fence::new(true))
+        }
+
+        fn degamma_lut_size(&self) -> u32 {
+            131
+        }
+    }
+
     #[test]
     fn every_color_blob_change_is_reported_to_the_adapter() {
         let old = State::default();
@@ -588,5 +612,24 @@ mod tests {
         }
         // Resetting a previously configured property is also a hardware change.
         assert!(color_pipeline_changed(State { ctm_blob: 9, ..old }, old));
+    }
+
+    #[test]
+    fn color_blob_validation_uses_generation_specific_lut_count() {
+        let device = super::super::device::DrmDevice::new(
+            alloc::sync::Arc::new(Display13ColorAdapter),
+            11,
+            12,
+            13,
+            14,
+        );
+        let file = device.open_primary();
+        let blob = file.create_blob(alloc::vec![0; 131 * 8]).unwrap();
+        let state = device.state.lock();
+        assert!(validate_gamma_lut_blob(&state, blob, state.resources.degamma_lut_size,).is_ok());
+        assert_eq!(
+            validate_gamma_lut_blob(&state, blob, state.resources.gamma_lut_size),
+            Err(DrmError::Invalid),
+        );
     }
 }
