@@ -14,3 +14,12 @@ layer = "mechanism"
 
 [lints]
 workspace = true
+
+[features]
+default = []
+# Keep the source-order Linux 7.2.3 translations opt-in until their LinuxKPI
+# bindings are complete. This is deliberately not enabled by the product.
+upstream-gt = ["dep:axlog"]
+
+[dependencies]
+axlog = { workspace = true, optional = true }

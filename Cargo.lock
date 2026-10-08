@@ -3650,6 +3650,9 @@ version = "0.1.0"
 [[package]]
 name = "tk-intel-gt"
 version = "0.1.0"
+dependencies = [
+ "axlog",
+]
 
 [[package]]
 name = "tk-kernel"

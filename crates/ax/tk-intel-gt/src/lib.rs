@@ -3,10 +3,24 @@
 //! N305 GT/media A0 is independent of display D0. No implicit hardware access,
 //! firmware load or userspace command stream. Kernel intel.gt=1 owns invocation.
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
+#[cfg(feature = "upstream-gt")]
+pub mod linux_config;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[macro_use]
+mod linux_macros;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[macro_use]
+pub(crate) mod linux_heap;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+#[macro_use]
+pub(crate) mod linux_list;
 pub mod bcs;
 pub mod cache;
 pub mod guc_ads;
@@ -16,6 +30,30 @@ pub mod guc_ct;
 pub mod guc_fw;
 pub mod guc_log;
 pub mod guc_submission;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod guc_submission_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_breadcrumbs_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_context_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_engine_cs_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_lrc_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_execlists_submission_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_timeline_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod intel_workarounds_upstream;
 pub mod execlists;
 pub mod huc;
 pub mod info;
