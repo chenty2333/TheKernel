@@ -3648,6 +3648,13 @@ name = "tk-i2c"
 version = "0.1.0"
 
 [[package]]
+name = "tk-i2c-hid"
+version = "0.1.0"
+dependencies = [
+ "tk-i2c",
+]
+
+[[package]]
 name = "tk-intel-display"
 version = "0.1.0"
 
