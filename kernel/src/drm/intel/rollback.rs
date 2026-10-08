@@ -99,7 +99,24 @@ fn policy(register: Register) -> (Class, u32) {
         // not this boot modeset's transaction and cannot be smuggled through it.
         return (Class::Forbidden, 0);
     }
-    if [regs::GMBUS1, regs::GMBUS3].contains(&register) {
+    if [
+        regs::GMBUS1,
+        regs::GMBUS3,
+        regs::aux::DP_AUX_CH_CTL_A,
+        regs::aux::DP_AUX_CH_DATA0_A,
+        regs::aux::DP_AUX_CH_DATA1_A,
+        regs::aux::DP_AUX_CH_DATA2_A,
+        regs::aux::DP_AUX_CH_DATA3_A,
+        regs::aux::DP_AUX_CH_DATA4_A,
+        regs::aux::DP_AUX_CH_CTL_B,
+        regs::aux::DP_AUX_CH_DATA0_B,
+        regs::aux::DP_AUX_CH_DATA1_B,
+        regs::aux::DP_AUX_CH_DATA2_B,
+        regs::aux::DP_AUX_CH_DATA3_B,
+        regs::aux::DP_AUX_CH_DATA4_B,
+    ]
+    .contains(&register)
+    {
         return (Class::Transient, u32::MAX);
     }
     if [

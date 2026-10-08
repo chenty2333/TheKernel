@@ -17,7 +17,7 @@ use super::{
     POWER,
     gmbus::{MonotonicTimer, PollTimer},
     regs::{
-        Register, RegisterWindow, Registers,
+        Register, Registers,
         aux::{
             DP_AUX_CH_CTL_A, DP_AUX_CH_CTL_B, DP_AUX_CH_DATA0_A, DP_AUX_CH_DATA0_B,
             DP_AUX_CH_DATA1_A, DP_AUX_CH_DATA1_B, DP_AUX_CH_DATA2_A, DP_AUX_CH_DATA2_B,
@@ -32,8 +32,8 @@ static AUX_B_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 const POWER_DOMAIN_A: u16 = 0;
 const POWER_DOMAIN_B: u16 = 1;
 
-pub(crate) struct DpAuxKernel<'a> {
-    registers: &'a RegisterWindow,
+pub(crate) struct DpAuxKernel<'a, R: Registers> {
+    registers: &'a R,
     timer: MonotonicTimer,
     connected: bool,
     channel: AuxChannel,
@@ -42,9 +42,9 @@ pub(crate) struct DpAuxKernel<'a> {
     diagnostics: Vec<String>,
 }
 
-impl<'a> DpAuxKernel<'a> {
+impl<'a, R: Registers> DpAuxKernel<'a, R> {
     pub(crate) fn new(
-        registers: &'a RegisterWindow,
+        registers: &'a R,
         channel: AuxChannel,
         connected: bool,
     ) -> Result<Self, AuxError> {
@@ -138,7 +138,7 @@ impl<'a> DpAuxKernel<'a> {
     }
 }
 
-impl DpAuxIo for DpAuxKernel<'_> {
+impl<R: Registers> DpAuxIo for DpAuxKernel<'_, R> {
     fn lock_port(&mut self) -> Result<(), AuxError> {
         if self.port_lock.is_some() {
             return Err(AuxError::Busy);
@@ -271,7 +271,7 @@ pub(crate) const fn aux_platform() -> AuxPlatform {
 /// Read a bounded DPCD span through the source-shaped AUX message helper.
 /// Native AUX reads carry at most 16 payload bytes per request.
 pub(crate) fn read_dpcd(
-    registers: &RegisterWindow,
+    registers: &impl Registers,
     channel: AuxChannel,
     connected: bool,
     address: u32,
@@ -321,16 +321,29 @@ pub(crate) fn read_dpcd(
 mod tests {
     use intel_display::dp_aux::intel_dp_aux_register;
 
-    use super::*;
+    use super::{super::regs::RegisterWindow, *};
 
     #[test]
     fn maps_only_typed_adl_n_aux_a_b_registers() {
         let platform = aux_platform();
         let aux_a = intel_dp_aux_register(platform, AuxChannel::A, Some(4));
         let aux_b = intel_dp_aux_register(platform, AuxChannel::B, Some(4));
-        assert_eq!(DpAuxKernel::register(aux_a).unwrap().offset(), 0x64024);
-        assert_eq!(DpAuxKernel::register(aux_b).unwrap().offset(), 0x64124);
+        assert_eq!(
+            DpAuxKernel::<RegisterWindow>::register(aux_a)
+                .unwrap()
+                .offset(),
+            0x64024
+        );
+        assert_eq!(
+            DpAuxKernel::<RegisterWindow>::register(aux_b)
+                .unwrap()
+                .offset(),
+            0x64124
+        );
         let unsupported = intel_dp_aux_register(platform, AuxChannel::C, None);
-        assert_eq!(DpAuxKernel::register(unsupported), Err(AuxError::Invalid));
+        assert_eq!(
+            DpAuxKernel::<RegisterWindow>::register(unsupported),
+            Err(AuxError::Invalid)
+        );
     }
 }

@@ -10,9 +10,10 @@ display-14+-only `mtl_max_source_rate()` are omitted.
 
 The source-sized mechanism is composed of `DpAuxIo`, `DpFramework`, and mode /
 PCON hooks. `intel_dp_link_training_full.rs` carries the separate link-training
-translation; `dp_aux.rs` owns the AUX transport mechanics. The kernel currently
-has a partial A/B polling adapter, but this module has not yet been wired into
-connector detection or the modeset path, and its full AUX/PHY/TC/PSR/HDCP
-framework implementations are not present. Its crate tests exercise the
-platform source-rate selection, coding clock, and conservative sink fallback.
+translation; `dp_aux.rs` owns the AUX transport mechanics. The kernel's A/B
+polling adapter now supplies a DPCD capability read to connector reporting, but
+this module's bandwidth configuration and link training are not yet called by
+the modeset path, and its full PHY/TC/PSR/HDCP framework implementations are
+not present. Its crate tests exercise the platform source-rate selection,
+coding clock, and conservative sink fallback.
 The full MIT text is in `crates/ax/tk-intel-display/LICENSE-MIT`.

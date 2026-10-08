@@ -43,6 +43,7 @@
 use alloc::{format, string::String, vec::Vec};
 
 use axlog::{info, warn};
+use intel_display::dp_aux::{AuxChannel, AuxError};
 
 use super::{
     gmbus::{AuxWell, EdidBytes, GmbusError, MonotonicTimer, Pin, PollTimer, SinkProbe},
@@ -96,6 +97,12 @@ pub(crate) struct Connector {
     pub(crate) extension: Option<EdidBytes>,
     /// `drm::modes::plan_modeset`'s result over the blocks above.
     pub(crate) plan: ModePlan,
+    /// Base DPCD capabilities read over AUX on live DDI A/B, when available.
+    /// This identifies DP-capable sinks, but output link setup does not yet
+    /// consume these caps.
+    pub(crate) dpcd_caps: Option<[u8; 16]>,
+    /// Reason an optional live DPCD read did not complete.
+    pub(crate) dpcd_error: Option<AuxError>,
     /// The live hotplug state for this connector's DDI.
     pub(crate) hotplug: HpdStatus,
     /// What phase 2.1 found for each candidate well, for the log.
@@ -110,7 +117,7 @@ impl Connector {
     /// a reader comparing this line against those steps should not have to
     /// translate.
     pub(crate) fn describe(&self) -> String {
-        format!(
+        let mut text = format!(
             "display {}: {} carries DDI {}, {}; mode layer chose {} ({:?}{})",
             self.bdf,
             self.pin,
@@ -123,7 +130,13 @@ impl Connector {
             } else {
                 ", lenient parse"
             },
-        )
+        );
+        if let Some(caps) = self.dpcd_caps {
+            text.push_str(&format!("; DPCD revision {:#04x}", caps[0]));
+        } else if let Some(error) = self.dpcd_error {
+            text.push_str(&format!("; DPCD AUX read {error:?}"));
+        }
+        text
     }
 }
 
@@ -405,6 +418,30 @@ pub(crate) fn resolve_device<R: Registers, T: PollTimer>(
             }
         };
 
+        // A live GMBUS DDC result identifies a DDI A/B pair. Query the
+        // corresponding native AUX channel once for the 16-byte receiver-cap
+        // block. Host connector models stay pure and never access global power
+        // state or pretend to have an AUX receiver.
+        let (dpcd_caps, dpcd_error) = if cfg!(target_os = "none") && hotplug.connected {
+            let channel = match pin {
+                Pin::DdiA => Some(AuxChannel::A),
+                Pin::DdiB => Some(AuxChannel::B),
+                _ => None,
+            };
+            match channel {
+                Some(channel) => match super::dp_aux::read_dpcd(regs, channel, true, 0, 16) {
+                    Ok(bytes) => match <[u8; 16]>::try_from(bytes) {
+                        Ok(caps) => (Some(caps), None),
+                        Err(_) => (None, Some(AuxError::Invalid)),
+                    },
+                    Err(error) => (None, Some(error)),
+                },
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
         Ok(Connector {
             bdf,
             pin,
@@ -412,6 +449,8 @@ pub(crate) fn resolve_device<R: Registers, T: PollTimer>(
             edid,
             extension: device.extension,
             plan,
+            dpcd_caps,
+            dpcd_error,
             hotplug,
             wells: records,
         })
