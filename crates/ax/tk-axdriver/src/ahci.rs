@@ -21,7 +21,6 @@ use core::{
 static NEXT_DISK_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 use axalloc::{UsageKind, global_allocator};
-use axdriver_base::BaseDriverOps;
 use axdriver_block::{
     BlockDriverOps,
     ahci::{

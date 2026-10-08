@@ -524,7 +524,26 @@ fn intx_vector(line: u8, pin: u8, route: Option<(u32, bool)>) -> Option<(usize, 
 
 #[cfg(test)]
 mod tests {
-    use super::intx_vector;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use axdriver_pci::DeviceFunction;
+
+    use super::{
+        BlockIrqMode, PciBlockInterrupt, deliver, endpoint_activate, endpoint_publish_vector,
+        intx_vector, reserve,
+    };
+
+    static ACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static NOTIFY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn acknowledge(_context: usize) -> bool {
+        ACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn notify(_context: usize) {
+        NOTIFY_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
 
     #[test]
     fn intx_fallback_requires_a_valid_firmware_route() {
@@ -533,5 +552,33 @@ mod tests {
         assert_eq!(intx_vector(0x20, 0, Some((20, true))), None);
         assert_eq!(intx_vector(0x20, 5, Some((20, true))), None);
         assert_eq!(intx_vector(0x20, 1, None), None);
+    }
+
+    #[test]
+    fn acknowledged_completion_publishes_generation_then_notifies() {
+        ACK_COUNT.store(0, Ordering::Relaxed);
+        NOTIFY_COUNT.store(0, Ordering::Relaxed);
+        let endpoint = reserve(1, acknowledge).expect("bounded endpoint slot");
+        endpoint_publish_vector(endpoint, 0x45);
+        let token = PciBlockInterrupt {
+            endpoint,
+            vector: 0x45,
+            mode: BlockIrqMode::Msi,
+            bdf: DeviceFunction {
+                bus: 0,
+                device: 0,
+                function: 0,
+            },
+            capability: None,
+            msix_table_entry: None,
+        };
+        assert!(token.install_completion_notifier(Some(notify), 1));
+        endpoint_activate(endpoint);
+        assert_eq!(token.generation(), 0);
+        assert!(deliver(endpoint, 0x45));
+        assert_eq!(token.generation(), 1);
+        assert_eq!(ACK_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(NOTIFY_COUNT.load(Ordering::Relaxed), 1);
+        assert!(token.install_completion_notifier(None, 1));
     }
 }
