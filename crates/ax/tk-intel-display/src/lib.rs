@@ -1,26 +1,27 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See ../LICENSE-MIT.
-//! ADL-P/N display-only i915 translations. No platform mapping or implicit writes.
+//! Display-12/13 i915 translations. Callers still own platform admission and writes.
 //! Readout is not ownership of firmware scanout, nor proof of monitor pixels.
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
-pub mod intel_bios;
 pub mod audio;
 pub mod cdclk;
 pub mod color;
 pub mod ddi;
 pub mod device;
-pub mod dmc;
 pub mod display;
 pub mod dkl_phy;
+pub mod dmc;
 pub mod dpll_mgr;
 pub mod hdmi;
 pub mod hdmi_packet;
+pub mod intel_bios;
 pub mod opregion;
 pub mod pipe_config;
+pub mod power_map;
 pub mod scaler;
 pub mod tc;
 pub mod universal_plane;

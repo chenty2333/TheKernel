@@ -250,3 +250,9 @@ parse_dmc_fw_header(), and fw_info_matches_stepping(). Copyright ©2014 Intel
 Corporation; full grant in LICENSE-MIT. Rootfs binary inputs are external and
 carry Intel's separate LICENSE.i915; this crate contains no DMC image or MMIO
 programming.
+
+Display power-well data: src/power_map.rs translates the display-12 TGL/RKL/
+ADL-S and display-13 XELPD domain lists, well groups, platform order, and
+instance metadata from intel_display_power_map.c. Copyright ©2022 Intel
+Corporation; full grant in LICENSE-MIT. Kernel MMIO/refcount integration is
+separate and remains in progress.

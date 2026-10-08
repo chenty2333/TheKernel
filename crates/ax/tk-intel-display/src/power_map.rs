@@ -1,0 +1,1400 @@
+// SPDX-License-Identifier: MIT
+// Translated from Linux v7.2.3 drivers/gpu/drm/i915/display/intel_display_power_map.c.
+// Copyright © 2022 Intel Corporation. Full grant: ../LICENSE-MIT.
+//! Display-12/13 power-domain dependencies and power-well instance maps.
+//!
+//! The table preserves i915's descriptor grouping, instance names, domain
+//! ownership sets, fuse/IRQ metadata, controller selectors, and platform order.
+//! Register programming and refcount policy are implemented by the kernel.
+
+use crate::dmc::DmcPlatform;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PowerDomain {
+    Init,
+    DcOff,
+    PipeA,
+    PipeB,
+    PipeC,
+    PipeD,
+    PipePanelFitterA,
+    PipePanelFitterB,
+    PipePanelFitterC,
+    PipePanelFitterD,
+    TranscoderA,
+    TranscoderB,
+    TranscoderC,
+    TranscoderD,
+    TranscoderVdscPw2,
+    PortDdiLanesB,
+    PortDdiLanesC,
+    PortDdiLanesD,
+    PortDdiLanesE,
+    PortDdiLanesTc1,
+    PortDdiLanesTc2,
+    PortDdiLanesTc3,
+    PortDdiLanesTc4,
+    PortDdiLanesTc5,
+    PortDdiLanesTc6,
+    PortDdiIoA,
+    PortDdiIoB,
+    PortDdiIoC,
+    PortDdiIoD,
+    PortDdiIoE,
+    PortDdiIoF,
+    PortDdiIoTc1,
+    PortDdiIoTc2,
+    PortDdiIoTc3,
+    PortDdiIoTc4,
+    PortDdiIoTc5,
+    PortDdiIoTc6,
+    PortDsi,
+    PortCrt,
+    Vga,
+    AudioMmio,
+    AudioPlayback,
+    AuxIoA,
+    AuxIoB,
+    AuxIoC,
+    AuxIoD,
+    AuxIoE,
+    AuxIoF,
+    AuxA,
+    AuxB,
+    AuxC,
+    AuxD,
+    AuxE,
+    AuxF,
+    AuxUsbc1,
+    AuxUsbc2,
+    AuxUsbc3,
+    AuxUsbc4,
+    AuxUsbc5,
+    AuxUsbc6,
+    AuxTbt1,
+    AuxTbt2,
+    AuxTbt3,
+    AuxTbt4,
+    AuxTbt5,
+    AuxTbt6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DomainList {
+    /// Linux's zero-length power-domain list, which assigns every domain.
+    All,
+    /// Linux's NULL power-domain list, which assigns none.
+    None,
+    Set(&'static [PowerDomain]),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WellControl {
+    IclPw1,
+    IclPw2,
+    IclPw3,
+    IclPw4,
+    TglPw5,
+    TglDdiTc1,
+    TglDdiTc2,
+    TglDdiTc3,
+    TglDdiTc4,
+    TglDdiTc5,
+    TglDdiTc6,
+    IclDdiA,
+    IclDdiB,
+    IclDdiC,
+    IclDdiD,
+    IclDdiE,
+    IclDdiF,
+    IclAuxA,
+    IclAuxB,
+    IclAuxC,
+    IclAuxD,
+    IclAuxE,
+    IclAuxF,
+    TglAuxTc1,
+    TglAuxTc2,
+    TglAuxTc3,
+    TglAuxTc4,
+    TglAuxTc5,
+    TglAuxTc6,
+    TglAuxTbt1,
+    TglAuxTbt2,
+    TglAuxTbt3,
+    TglAuxTbt4,
+    TglAuxTbt5,
+    TglAuxTbt6,
+    XelpdPwA,
+    XelpdPwB,
+    XelpdPwC,
+    XelpdPwD,
+    XelpdDdiD,
+    XelpdDdiE,
+    XelpdAuxD,
+    XelpdAuxE,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WellId {
+    SklDispPw1,
+    SklDispPw2,
+    IclDispPw3,
+    SklDispDcOff,
+    TglDispTcColdOff,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WellOps {
+    AlwaysOn,
+    Hsw,
+    DcOff,
+    Ddi,
+    Aux,
+    TcColdOff,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PowerWellInstance {
+    pub name: &'static str,
+    pub domains: DomainList,
+    pub control: Option<WellControl>,
+    pub id: Option<WellId>,
+    pub irq_pipe_mask: u8,
+    pub has_fuses: bool,
+    pub always_on: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PowerWellGroup {
+    pub ops: WellOps,
+    pub instances: &'static [PowerWellInstance],
+    pub is_tc_tbt: bool,
+    pub fixed_enable_delay: bool,
+    pub enable_timeout_ms: Option<u16>,
+}
+
+const ALL: DomainList = DomainList::All;
+const NONE: DomainList = DomainList::None;
+const PIPE_A: &[PowerDomain] = &[
+    PowerDomain::PipeA,
+    PowerDomain::PipePanelFitterA,
+    PowerDomain::Init,
+];
+const PIPE_B: &[PowerDomain] = &[
+    PowerDomain::PipeB,
+    PowerDomain::PipePanelFitterB,
+    PowerDomain::TranscoderB,
+    PowerDomain::Init,
+];
+const PIPE_C: &[PowerDomain] = &[
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::TranscoderC,
+    PowerDomain::Init,
+];
+const PIPE_D: &[PowerDomain] = &[
+    PowerDomain::PipeD,
+    PowerDomain::PipePanelFitterD,
+    PowerDomain::TranscoderD,
+    PowerDomain::Init,
+];
+const ALWAYS_ON_INSTANCES: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "always-on",
+    domains: ALL,
+    control: None,
+    id: None,
+    irq_pipe_mask: 0,
+    has_fuses: false,
+    always_on: true,
+}];
+const PW1_INSTANCES: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_1",
+    domains: NONE,
+    control: Some(WellControl::IclPw1),
+    id: Some(WellId::SklDispPw1),
+    irq_pipe_mask: 0,
+    has_fuses: true,
+    always_on: true,
+}];
+
+const TGL_PW3_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PipeB,
+    PowerDomain::PipePanelFitterB,
+    PowerDomain::TranscoderB,
+    PowerDomain::PortDdiLanesTc1,
+    PowerDomain::PortDdiLanesTc2,
+    PowerDomain::PortDdiLanesTc3,
+    PowerDomain::PortDdiLanesTc4,
+    PowerDomain::PortDdiLanesTc5,
+    PowerDomain::PortDdiLanesTc6,
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::TranscoderC,
+    PowerDomain::PipeD,
+    PowerDomain::PipePanelFitterD,
+    PowerDomain::TranscoderD,
+    PowerDomain::Vga,
+    PowerDomain::AudioMmio,
+    PowerDomain::AudioPlayback,
+    PowerDomain::AuxUsbc1,
+    PowerDomain::AuxUsbc2,
+    PowerDomain::AuxUsbc3,
+    PowerDomain::AuxUsbc4,
+    PowerDomain::AuxUsbc5,
+    PowerDomain::AuxUsbc6,
+    PowerDomain::AuxTbt1,
+    PowerDomain::AuxTbt2,
+    PowerDomain::AuxTbt3,
+    PowerDomain::AuxTbt4,
+    PowerDomain::AuxTbt5,
+    PowerDomain::AuxTbt6,
+    PowerDomain::Init,
+];
+const TGL_PW4_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::TranscoderC,
+    PowerDomain::PipeD,
+    PowerDomain::PipePanelFitterD,
+    PowerDomain::TranscoderD,
+    PowerDomain::Init,
+];
+const TGL_PW5_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PipeD,
+    PowerDomain::PipePanelFitterD,
+    PowerDomain::TranscoderD,
+    PowerDomain::Init,
+];
+const TGL_DC_OFF_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PipeB,
+    PowerDomain::PipePanelFitterB,
+    PowerDomain::TranscoderB,
+    PowerDomain::PortDdiLanesTc1,
+    PowerDomain::PortDdiLanesTc2,
+    PowerDomain::PortDdiLanesTc3,
+    PowerDomain::PortDdiLanesTc4,
+    PowerDomain::PortDdiLanesTc5,
+    PowerDomain::PortDdiLanesTc6,
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::TranscoderC,
+    PowerDomain::PipeD,
+    PowerDomain::PipePanelFitterD,
+    PowerDomain::TranscoderD,
+    PowerDomain::Vga,
+    PowerDomain::AudioMmio,
+    PowerDomain::AudioPlayback,
+    PowerDomain::AuxUsbc1,
+    PowerDomain::AuxUsbc2,
+    PowerDomain::AuxUsbc3,
+    PowerDomain::AuxUsbc4,
+    PowerDomain::AuxUsbc5,
+    PowerDomain::AuxUsbc6,
+    PowerDomain::AuxTbt1,
+    PowerDomain::AuxTbt2,
+    PowerDomain::AuxTbt3,
+    PowerDomain::AuxTbt4,
+    PowerDomain::AuxTbt5,
+    PowerDomain::AuxTbt6,
+    PowerDomain::AuxA,
+    PowerDomain::AuxB,
+    PowerDomain::AuxC,
+    PowerDomain::DcOff,
+    PowerDomain::Init,
+];
+const RKL_PW4_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::TranscoderC,
+    PowerDomain::Init,
+];
+const RKL_PW3_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::TranscoderC,
+    PowerDomain::PipeB,
+    PowerDomain::PipePanelFitterB,
+    PowerDomain::TranscoderB,
+    PowerDomain::PortDdiLanesTc1,
+    PowerDomain::PortDdiLanesTc2,
+    PowerDomain::Vga,
+    PowerDomain::AudioMmio,
+    PowerDomain::AudioPlayback,
+    PowerDomain::AuxUsbc1,
+    PowerDomain::AuxUsbc2,
+    PowerDomain::Init,
+];
+const RKL_DC_OFF_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::TranscoderC,
+    PowerDomain::PipeB,
+    PowerDomain::PipePanelFitterB,
+    PowerDomain::TranscoderB,
+    PowerDomain::PortDdiLanesTc1,
+    PowerDomain::PortDdiLanesTc2,
+    PowerDomain::Vga,
+    PowerDomain::AudioMmio,
+    PowerDomain::AudioPlayback,
+    PowerDomain::AuxUsbc1,
+    PowerDomain::AuxUsbc2,
+    PowerDomain::AuxA,
+    PowerDomain::AuxB,
+    PowerDomain::DcOff,
+    PowerDomain::Init,
+];
+const ADLP_PW2_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PipeB,
+    PowerDomain::PipePanelFitterB,
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::PipeD,
+    PowerDomain::PipePanelFitterD,
+    PowerDomain::TranscoderB,
+    PowerDomain::TranscoderC,
+    PowerDomain::TranscoderD,
+    PowerDomain::PortDdiLanesC,
+    PowerDomain::PortDdiLanesD,
+    PowerDomain::PortDdiLanesE,
+    PowerDomain::PortDdiLanesTc1,
+    PowerDomain::PortDdiLanesTc2,
+    PowerDomain::PortDdiLanesTc3,
+    PowerDomain::PortDdiLanesTc4,
+    PowerDomain::Vga,
+    PowerDomain::AudioPlayback,
+    PowerDomain::AuxIoC,
+    PowerDomain::AuxIoD,
+    PowerDomain::AuxIoE,
+    PowerDomain::AuxC,
+    PowerDomain::AuxD,
+    PowerDomain::AuxE,
+    PowerDomain::AuxUsbc1,
+    PowerDomain::AuxUsbc2,
+    PowerDomain::AuxUsbc3,
+    PowerDomain::AuxUsbc4,
+    PowerDomain::AuxTbt1,
+    PowerDomain::AuxTbt2,
+    PowerDomain::AuxTbt3,
+    PowerDomain::AuxTbt4,
+    PowerDomain::Init,
+];
+const ADLP_DC_OFF_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PortDdiLanesC,
+    PowerDomain::PortDdiLanesD,
+    PowerDomain::PortDdiLanesE,
+    PowerDomain::PortDdiLanesTc1,
+    PowerDomain::PortDdiLanesTc2,
+    PowerDomain::PortDdiLanesTc3,
+    PowerDomain::PortDdiLanesTc4,
+    PowerDomain::Vga,
+    PowerDomain::AudioPlayback,
+    PowerDomain::AuxIoC,
+    PowerDomain::AuxIoD,
+    PowerDomain::AuxIoE,
+    PowerDomain::AuxC,
+    PowerDomain::AuxD,
+    PowerDomain::AuxE,
+    PowerDomain::AuxUsbc1,
+    PowerDomain::AuxUsbc2,
+    PowerDomain::AuxUsbc3,
+    PowerDomain::AuxUsbc4,
+    PowerDomain::AuxTbt1,
+    PowerDomain::AuxTbt2,
+    PowerDomain::AuxTbt3,
+    PowerDomain::AuxTbt4,
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::PipeD,
+    PowerDomain::PipePanelFitterD,
+    PowerDomain::PortDsi,
+    PowerDomain::AudioMmio,
+    PowerDomain::AuxA,
+    PowerDomain::AuxB,
+    PowerDomain::DcOff,
+    PowerDomain::Init,
+];
+const TGL_DC_OFF_WELL: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "DC_off",
+    domains: DomainList::Set(TGL_DC_OFF_DOMAINS),
+    control: None,
+    id: Some(WellId::SklDispDcOff),
+    irq_pipe_mask: 0,
+    has_fuses: false,
+    always_on: false,
+}];
+const RKL_DC_OFF_WELL: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "DC_off",
+    domains: DomainList::Set(RKL_DC_OFF_DOMAINS),
+    control: None,
+    id: Some(WellId::SklDispDcOff),
+    irq_pipe_mask: 0,
+    has_fuses: false,
+    always_on: false,
+}];
+const ADLP_DC_OFF_WELL: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "DC_off",
+    domains: DomainList::Set(ADLP_DC_OFF_DOMAINS),
+    control: None,
+    id: Some(WellId::SklDispDcOff),
+    irq_pipe_mask: 0,
+    has_fuses: false,
+    always_on: false,
+}];
+const ADLP_PW2: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_2",
+    domains: DomainList::Set(ADLP_PW2_DOMAINS),
+    control: Some(WellControl::IclPw2),
+    id: Some(WellId::SklDispPw2),
+    irq_pipe_mask: 0,
+    has_fuses: true,
+    always_on: false,
+}];
+const ADLP_DDI: &[PowerWellInstance] = &[
+    PowerWellInstance {
+        name: "DDI_IO_A",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoA]),
+        control: Some(WellControl::IclDdiA),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_B",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoB]),
+        control: Some(WellControl::IclDdiB),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_C",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoC]),
+        control: Some(WellControl::IclDdiC),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_D",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoD]),
+        control: Some(WellControl::XelpdDdiD),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_E",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoE]),
+        control: Some(WellControl::XelpdDdiE),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC1",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc1]),
+        control: Some(WellControl::TglDdiTc1),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC2",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc2]),
+        control: Some(WellControl::TglDdiTc2),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC3",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc3]),
+        control: Some(WellControl::TglDdiTc3),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC4",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc4]),
+        control: Some(WellControl::TglDdiTc4),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+];
+const ADLP_AUX: &[PowerWellInstance] = &[
+    PowerWellInstance {
+        name: "AUX_A",
+        domains: DomainList::Set(&[PowerDomain::AuxIoA, PowerDomain::AuxA]),
+        control: Some(WellControl::IclAuxA),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_B",
+        domains: DomainList::Set(&[PowerDomain::AuxIoB, PowerDomain::AuxB]),
+        control: Some(WellControl::IclAuxB),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_C",
+        domains: DomainList::Set(&[PowerDomain::AuxIoC, PowerDomain::AuxC]),
+        control: Some(WellControl::IclAuxC),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_D",
+        domains: DomainList::Set(&[PowerDomain::AuxIoD, PowerDomain::AuxD]),
+        control: Some(WellControl::XelpdAuxD),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_E",
+        domains: DomainList::Set(&[PowerDomain::AuxIoE, PowerDomain::AuxE]),
+        control: Some(WellControl::XelpdAuxE),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+];
+const ADLP_AUX_TC: &[PowerWellInstance] = &[
+    PowerWellInstance {
+        name: "AUX_USBC1",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc1]),
+        control: Some(WellControl::TglAuxTc1),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC2",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc2]),
+        control: Some(WellControl::TglAuxTc2),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC3",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc3]),
+        control: Some(WellControl::TglAuxTc3),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC4",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc4]),
+        control: Some(WellControl::TglAuxTc4),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+];
+const ADLP_AUX_TBT: &[PowerWellInstance] = &[
+    PowerWellInstance {
+        name: "AUX_TBT1",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt1]),
+        control: Some(WellControl::TglAuxTbt1),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_TBT2",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt2]),
+        control: Some(WellControl::TglAuxTbt2),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_TBT3",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt3]),
+        control: Some(WellControl::TglAuxTbt3),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_TBT4",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt4]),
+        control: Some(WellControl::TglAuxTbt4),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+];
+const TGL_PW2_DOMAINS: &[PowerDomain] = &[
+    PowerDomain::PipeB,
+    PowerDomain::PipePanelFitterB,
+    PowerDomain::TranscoderB,
+    PowerDomain::PortDdiLanesTc1,
+    PowerDomain::PortDdiLanesTc2,
+    PowerDomain::PortDdiLanesTc3,
+    PowerDomain::PortDdiLanesTc4,
+    PowerDomain::PortDdiLanesTc5,
+    PowerDomain::PortDdiLanesTc6,
+    PowerDomain::PipeC,
+    PowerDomain::PipePanelFitterC,
+    PowerDomain::TranscoderC,
+    PowerDomain::PipeD,
+    PowerDomain::PipePanelFitterD,
+    PowerDomain::TranscoderD,
+    PowerDomain::Vga,
+    PowerDomain::AudioMmio,
+    PowerDomain::AudioPlayback,
+    PowerDomain::AuxUsbc1,
+    PowerDomain::AuxUsbc2,
+    PowerDomain::AuxUsbc3,
+    PowerDomain::AuxUsbc4,
+    PowerDomain::AuxUsbc5,
+    PowerDomain::AuxUsbc6,
+    PowerDomain::AuxTbt1,
+    PowerDomain::AuxTbt2,
+    PowerDomain::AuxTbt3,
+    PowerDomain::AuxTbt4,
+    PowerDomain::AuxTbt5,
+    PowerDomain::AuxTbt6,
+    PowerDomain::TranscoderVdscPw2,
+    PowerDomain::Init,
+];
+const TGL_PW2: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_2",
+    domains: DomainList::Set(TGL_PW2_DOMAINS),
+    control: Some(WellControl::IclPw2),
+    id: Some(WellId::SklDispPw2),
+    irq_pipe_mask: 0,
+    has_fuses: true,
+    always_on: false,
+}];
+const TGL_PW3: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_3",
+    domains: DomainList::Set(TGL_PW3_DOMAINS),
+    control: Some(WellControl::IclPw3),
+    id: Some(WellId::IclDispPw3),
+    irq_pipe_mask: 1 << 1,
+    has_fuses: true,
+    always_on: false,
+}];
+const TGL_PW4: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_4",
+    domains: DomainList::Set(TGL_PW4_DOMAINS),
+    control: Some(WellControl::IclPw4),
+    id: None,
+    irq_pipe_mask: 1 << 2,
+    has_fuses: true,
+    always_on: false,
+}];
+const TGL_PW5: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_5",
+    domains: DomainList::Set(TGL_PW5_DOMAINS),
+    control: Some(WellControl::TglPw5),
+    id: None,
+    irq_pipe_mask: 1 << 3,
+    has_fuses: true,
+    always_on: false,
+}];
+
+const TGL_DDI: &[PowerWellInstance] = &[
+    PowerWellInstance {
+        name: "DDI_IO_A",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoA]),
+        control: Some(WellControl::IclDdiA),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_B",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoB]),
+        control: Some(WellControl::IclDdiB),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_C",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoC]),
+        control: Some(WellControl::IclDdiC),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC1",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc1]),
+        control: Some(WellControl::TglDdiTc1),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC2",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc2]),
+        control: Some(WellControl::TglDdiTc2),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC3",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc3]),
+        control: Some(WellControl::TglDdiTc3),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC4",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc4]),
+        control: Some(WellControl::TglDdiTc4),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC5",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc5]),
+        control: Some(WellControl::TglDdiTc5),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC6",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc6]),
+        control: Some(WellControl::TglDdiTc6),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+];
+
+const TGL_AUX: &[PowerWellInstance] = &[
+    PowerWellInstance {
+        name: "AUX_A",
+        domains: DomainList::Set(&[PowerDomain::AuxIoA, PowerDomain::AuxA]),
+        control: Some(WellControl::IclAuxA),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_B",
+        domains: DomainList::Set(&[PowerDomain::AuxIoB, PowerDomain::AuxB]),
+        control: Some(WellControl::IclAuxB),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_C",
+        domains: DomainList::Set(&[PowerDomain::AuxIoC, PowerDomain::AuxC]),
+        control: Some(WellControl::IclAuxC),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC1",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc1]),
+        control: Some(WellControl::TglAuxTc1),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC2",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc2]),
+        control: Some(WellControl::TglAuxTc2),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC3",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc3]),
+        control: Some(WellControl::TglAuxTc3),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC4",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc4]),
+        control: Some(WellControl::TglAuxTc4),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC5",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc5]),
+        control: Some(WellControl::TglAuxTc5),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC6",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc6]),
+        control: Some(WellControl::TglAuxTc6),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+];
+
+const TGL_TBT: &[PowerWellInstance] = &[
+    PowerWellInstance {
+        name: "AUX_TBT1",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt1]),
+        control: Some(WellControl::TglAuxTbt1),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_TBT2",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt2]),
+        control: Some(WellControl::TglAuxTbt2),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_TBT3",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt3]),
+        control: Some(WellControl::TglAuxTbt3),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_TBT4",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt4]),
+        control: Some(WellControl::TglAuxTbt4),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_TBT5",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt5]),
+        control: Some(WellControl::TglAuxTbt5),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_TBT6",
+        domains: DomainList::Set(&[PowerDomain::AuxTbt6]),
+        control: Some(WellControl::TglAuxTbt6),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+];
+
+const TGL_COLD_OFF: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "TC_cold_off",
+    domains: DomainList::Set(&[
+        PowerDomain::AuxUsbc1,
+        PowerDomain::AuxUsbc2,
+        PowerDomain::AuxUsbc3,
+        PowerDomain::AuxUsbc4,
+        PowerDomain::AuxUsbc5,
+        PowerDomain::AuxUsbc6,
+        PowerDomain::AuxTbt1,
+        PowerDomain::AuxTbt2,
+        PowerDomain::AuxTbt3,
+        PowerDomain::AuxTbt4,
+        PowerDomain::AuxTbt5,
+        PowerDomain::AuxTbt6,
+        PowerDomain::Init,
+    ]),
+    control: None,
+    id: Some(WellId::TglDispTcColdOff),
+    irq_pipe_mask: 0,
+    has_fuses: false,
+    always_on: false,
+}];
+
+const ALWAYS_ON_GROUP: PowerWellGroup = PowerWellGroup {
+    ops: WellOps::AlwaysOn,
+    instances: ALWAYS_ON_INSTANCES,
+    is_tc_tbt: false,
+    fixed_enable_delay: false,
+    enable_timeout_ms: None,
+};
+const PW1_GROUP: PowerWellGroup = PowerWellGroup {
+    ops: WellOps::Hsw,
+    instances: PW1_INSTANCES,
+    is_tc_tbt: false,
+    fixed_enable_delay: false,
+    enable_timeout_ms: None,
+};
+const TGL_MAIN_GROUPS: &[PowerWellGroup] = &[
+    PowerWellGroup {
+        ops: WellOps::DcOff,
+        instances: TGL_DC_OFF_WELL,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: TGL_PW2,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: TGL_PW3,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Ddi,
+        instances: TGL_DDI,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: TGL_PW4,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: TGL_PW5,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Aux,
+        instances: TGL_AUX,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Aux,
+        instances: TGL_TBT,
+        is_tc_tbt: true,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+];
+const TGL_COLD_OFF_GROUP: PowerWellGroup = PowerWellGroup {
+    ops: WellOps::TcColdOff,
+    instances: TGL_COLD_OFF,
+    is_tc_tbt: false,
+    fixed_enable_delay: false,
+    enable_timeout_ms: None,
+};
+const TGL_GROUPS: &[PowerWellGroup] = &[
+    ALWAYS_ON_GROUP,
+    PW1_GROUP,
+    TGL_MAIN_GROUPS[0],
+    TGL_MAIN_GROUPS[1],
+    TGL_MAIN_GROUPS[2],
+    TGL_MAIN_GROUPS[3],
+    TGL_MAIN_GROUPS[4],
+    TGL_MAIN_GROUPS[5],
+    TGL_COLD_OFF_GROUP,
+    TGL_MAIN_GROUPS[6],
+    TGL_MAIN_GROUPS[7],
+];
+
+const RKL_PW3_WELL: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_3",
+    domains: DomainList::Set(RKL_PW3_DOMAINS),
+    control: Some(WellControl::IclPw3),
+    id: Some(WellId::IclDispPw3),
+    irq_pipe_mask: 1 << 1,
+    has_fuses: true,
+    always_on: false,
+}];
+const RKL_PW4_WELL: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_4",
+    domains: DomainList::Set(RKL_PW4_DOMAINS),
+    control: Some(WellControl::IclPw4),
+    id: None,
+    irq_pipe_mask: 1 << 2,
+    has_fuses: true,
+    always_on: false,
+}];
+const RKL_DDI: &[PowerWellInstance] = &[
+    PowerWellInstance {
+        name: "DDI_IO_A",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoA]),
+        control: Some(WellControl::IclDdiA),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_B",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoB]),
+        control: Some(WellControl::IclDdiB),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC1",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc1]),
+        control: Some(WellControl::TglDdiTc1),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "DDI_IO_TC2",
+        domains: DomainList::Set(&[PowerDomain::PortDdiIoTc2]),
+        control: Some(WellControl::TglDdiTc2),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+];
+const RKL_AUX: &[PowerWellInstance] = &[
+    PowerWellInstance {
+        name: "AUX_A",
+        domains: DomainList::Set(&[PowerDomain::AuxIoA, PowerDomain::AuxA]),
+        control: Some(WellControl::IclAuxA),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_B",
+        domains: DomainList::Set(&[PowerDomain::AuxIoB, PowerDomain::AuxB]),
+        control: Some(WellControl::IclAuxB),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC1",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc1]),
+        control: Some(WellControl::TglAuxTc1),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+    PowerWellInstance {
+        name: "AUX_USBC2",
+        domains: DomainList::Set(&[PowerDomain::AuxUsbc2]),
+        control: Some(WellControl::TglAuxTc2),
+        id: None,
+        irq_pipe_mask: 0,
+        has_fuses: false,
+        always_on: false,
+    },
+];
+const RKL_MAIN_GROUPS: &[PowerWellGroup] = &[
+    PowerWellGroup {
+        ops: WellOps::DcOff,
+        instances: RKL_DC_OFF_WELL,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: RKL_PW3_WELL,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: RKL_PW4_WELL,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Ddi,
+        instances: RKL_DDI,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Aux,
+        instances: RKL_AUX,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+];
+const RKL_GROUPS: &[PowerWellGroup] = &[
+    ALWAYS_ON_GROUP,
+    PW1_GROUP,
+    RKL_MAIN_GROUPS[0],
+    RKL_MAIN_GROUPS[1],
+    RKL_MAIN_GROUPS[2],
+    RKL_MAIN_GROUPS[3],
+    RKL_MAIN_GROUPS[4],
+];
+const ADLS_GROUPS: &[PowerWellGroup] = &[
+    ALWAYS_ON_GROUP,
+    PW1_GROUP,
+    TGL_MAIN_GROUPS[0],
+    TGL_MAIN_GROUPS[1],
+    TGL_MAIN_GROUPS[2],
+    TGL_MAIN_GROUPS[3],
+    TGL_MAIN_GROUPS[4],
+    TGL_MAIN_GROUPS[5],
+    TGL_MAIN_GROUPS[6],
+    TGL_MAIN_GROUPS[7],
+];
+
+const ADLP_PW_A: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_A",
+    domains: DomainList::Set(PIPE_A),
+    control: Some(WellControl::XelpdPwA),
+    id: None,
+    irq_pipe_mask: 1,
+    has_fuses: true,
+    always_on: false,
+}];
+const ADLP_PW_B: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_B",
+    domains: DomainList::Set(PIPE_B),
+    control: Some(WellControl::XelpdPwB),
+    id: None,
+    irq_pipe_mask: 2,
+    has_fuses: true,
+    always_on: false,
+}];
+const ADLP_PW_C: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_C",
+    domains: DomainList::Set(PIPE_C),
+    control: Some(WellControl::XelpdPwC),
+    id: None,
+    irq_pipe_mask: 4,
+    has_fuses: true,
+    always_on: false,
+}];
+const ADLP_PW_D: &[PowerWellInstance] = &[PowerWellInstance {
+    name: "PW_D",
+    domains: DomainList::Set(PIPE_D),
+    control: Some(WellControl::XelpdPwD),
+    id: None,
+    irq_pipe_mask: 8,
+    has_fuses: true,
+    always_on: false,
+}];
+const ADLP_DCOFF_GROUP: PowerWellGroup = PowerWellGroup {
+    ops: WellOps::DcOff,
+    instances: ADLP_DC_OFF_WELL,
+    is_tc_tbt: false,
+    fixed_enable_delay: false,
+    enable_timeout_ms: None,
+};
+const ADLP_MAIN_GROUPS: &[PowerWellGroup] = &[
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: ADLP_PW2,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: ADLP_PW_A,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: ADLP_PW_B,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: ADLP_PW_C,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Hsw,
+        instances: ADLP_PW_D,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Ddi,
+        instances: ADLP_DDI,
+        is_tc_tbt: false,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Aux,
+        instances: ADLP_AUX,
+        is_tc_tbt: false,
+        fixed_enable_delay: true,
+        enable_timeout_ms: None,
+    },
+    PowerWellGroup {
+        ops: WellOps::Aux,
+        instances: ADLP_AUX_TC,
+        is_tc_tbt: false,
+        fixed_enable_delay: true,
+        enable_timeout_ms: Some(500),
+    },
+    PowerWellGroup {
+        ops: WellOps::Aux,
+        instances: ADLP_AUX_TBT,
+        is_tc_tbt: true,
+        fixed_enable_delay: false,
+        enable_timeout_ms: None,
+    },
+];
+const XELPD_GROUPS: &[PowerWellGroup] = &[
+    ALWAYS_ON_GROUP,
+    PW1_GROUP,
+    ADLP_DCOFF_GROUP,
+    ADLP_MAIN_GROUPS[0],
+    ADLP_MAIN_GROUPS[1],
+    ADLP_MAIN_GROUPS[2],
+    ADLP_MAIN_GROUPS[3],
+    ADLP_MAIN_GROUPS[4],
+    ADLP_MAIN_GROUPS[5],
+    ADLP_MAIN_GROUPS[6],
+    ADLP_MAIN_GROUPS[7],
+    ADLP_MAIN_GROUPS[8],
+];
+
+/// Return the ordered display power-well descriptors for a display-12/13 part.
+// upstream: intel_display_power_map.c tgl_power_wells, rkl_power_wells, adls_power_wells, xelpd_power_wells
+pub fn power_wells(platform: DmcPlatform) -> &'static [PowerWellGroup] {
+    match platform {
+        DmcPlatform::TigerLake => TGL_GROUPS,
+        DmcPlatform::RocketLake => RKL_GROUPS,
+        DmcPlatform::AlderLakeS => ADLS_GROUPS,
+        DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN => XELPD_GROUPS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tgl_has_tc_cold_off_and_display13_has_independent_pipe_wells() {
+        let tgl = power_wells(DmcPlatform::TigerLake);
+        assert!(tgl.iter().any(|group| group.ops == WellOps::TcColdOff));
+        assert!(
+            tgl.iter()
+                .any(|group| group.instances.iter().any(|well| well.name == "PW_5"))
+        );
+        assert_eq!(
+            tgl.iter()
+                .find(|group| group.is_tc_tbt)
+                .unwrap()
+                .instances
+                .len(),
+            6
+        );
+        let adlp = power_wells(DmcPlatform::AlderLakeP);
+        assert!(!adlp.iter().any(|group| group.ops == WellOps::TcColdOff));
+        for name in ["PW_A", "PW_B", "PW_C", "PW_D"] {
+            assert!(
+                adlp.iter()
+                    .any(|group| group.instances.iter().any(|well| well.name == name))
+            );
+        }
+        let pw_b = adlp
+            .iter()
+            .flat_map(|group| group.instances)
+            .find(|well| well.name == "PW_B")
+            .unwrap();
+        assert!(
+            matches!(pw_b.domains, DomainList::Set(domains) if domains.contains(&PowerDomain::TranscoderB))
+        );
+        assert!(
+            adlp.iter()
+                .any(|group| group.enable_timeout_ms == Some(500))
+        );
+    }
+}

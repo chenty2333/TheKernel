@@ -994,3 +994,9 @@ from `intel_dmc.c` `parse_dmc_fw()`, `parse_dmc_fw_header()`, and
 selects by PCI revision after the rootfs-ready callback and retains the parsed
 program records; event-handler fixups and DMC MMIO programming remain pending.
 This supersedes the earlier statement above that no firmware parser was added.
+
+`crates/ax/tk-intel-display/src/power_map.rs` translates the display-12/13
+power-well domain lists and descriptor groups from Linux v7.2.3
+`drivers/gpu/drm/i915/display/intel_display_power_map.c` (`tgl_power_wells`,
+`rkl_power_wells`, `adls_power_wells`, and `xelpd_power_wells`; MIT, Copyright
+© 2022 Intel). The kernel sequence still needs to consume these descriptors.

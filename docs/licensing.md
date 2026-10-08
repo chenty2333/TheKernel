@@ -544,3 +544,8 @@ engineering of the firmware binary. It parses CSS/package metadata and v1/v3
 DMC headers without altering, decompiling, or disassembling the image. Event
 fixups and MMIO programming remain incomplete. This updates the earlier
 statement above: package parsing is now implemented; the MMIO loader is not.
+
+`tk-intel-display/src/power_map.rs` also translates the MIT TGL/RKL/ADLS/XELPD
+power-domain and power-well tables from Linux v7.2.3
+`intel_display_power_map.c` (Copyright © 2022 Intel). The tables add no firmware
+or binary inputs; register/refcount use remains a separate kernel task.
