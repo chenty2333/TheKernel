@@ -224,6 +224,80 @@ pub struct GoldenContext {
     pub image: Vec<u8>,
 }
 
+pub struct EngineDefaultState<'a> {
+    pub engine_class: u8,
+    pub default_state: Option<&'a [u8]>,
+}
+
+/// upstream: intel_guc_ads.c find_engine_state().
+pub fn find_engine_state<'a>(
+    engines: &'a [EngineDefaultState<'a>],
+    engine_class: u8,
+) -> Option<&'a [u8]> {
+    engines
+        .iter()
+        .find(|engine| engine.engine_class == engine_class && engine.default_state.is_some())
+        .and_then(|engine| engine.default_state)
+}
+
+/// Select and copy the first default LRC image per enabled Gen12 GuC class.
+/// Missing defaults are omitted so ADS reservation remains zeroed, matching
+/// `guc_init_golden_context()`; the builder still reserves an enabled slot.
+/// upstream: intel_guc_ads.c guc_init_golden_context().
+pub fn guc_init_golden_contexts(
+    enabled_masks: &[u32; GUC_MAX_ENGINE_CLASSES],
+    engines: &[EngineDefaultState<'_>],
+) -> Result<Vec<GoldenContext>, Error> {
+    let mut contexts = Vec::new();
+    contexts.try_reserve_exact(6).map_err(|_| Error::Refused)?;
+    for guc_class in 0u8..=5 {
+        if enabled_masks[usize::from(guc_class)] == 0 {
+            continue;
+        }
+        let Some(engine_class) = guc_class_to_engine_class(guc_class) else {
+            return Err(Error::Refused);
+        };
+        if let Some(image) = find_engine_state(engines, engine_class) {
+            let mut saved = Vec::new();
+            saved
+                .try_reserve_exact(image.len())
+                .map_err(|_| Error::Refused)?;
+            saved.extend_from_slice(image);
+            contexts.push(GoldenContext {
+                guc_class,
+                image: saved,
+            });
+        }
+    }
+    Ok(contexts)
+}
+
+/// upstream: intel_guc_fwif.h engine_class_to_guc_class().
+pub const fn engine_class_to_guc_class(engine_class: u8) -> Option<u8> {
+    match engine_class {
+        0 => Some(0), // render
+        1 => Some(1), // video decode
+        2 => Some(2), // video enhancement
+        3 => Some(3), // copy -> blitter
+        4 => Some(5), // other/GSC
+        5 => Some(4), // compute
+        _ => None,
+    }
+}
+
+/// upstream: intel_guc_fwif.h guc_class_to_engine_class().
+pub const fn guc_class_to_engine_class(guc_class: u8) -> Option<u8> {
+    match guc_class {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        4 => Some(5),
+        5 => Some(4),
+        _ => None,
+    }
+}
+
 /// One GuC capture-list image. `capture_class` is the GuC capture bucket,
 /// not an engine class; instance lists use the engine's instance as `slot`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1142,6 +1216,52 @@ mod tests {
                 logical_index: 0,
             },
         ]
+    }
+
+    #[test]
+    fn gen12_engine_class_maps_and_default_state_selection_match_i915() {
+        assert_eq!(
+            (0..=5).map(engine_class_to_guc_class).collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2), Some(3), Some(5), Some(4)]
+        );
+        assert_eq!(
+            (0..=5).map(guc_class_to_engine_class).collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2), Some(3), Some(5), Some(4)]
+        );
+
+        let render = [0x11, 0x12];
+        let copy = [0x31];
+        let compute = [0x51];
+        let engines = [
+            EngineDefaultState {
+                engine_class: 0,
+                default_state: None,
+            },
+            EngineDefaultState {
+                engine_class: 0,
+                default_state: Some(&render),
+            },
+            EngineDefaultState {
+                engine_class: 3,
+                default_state: Some(&copy),
+            },
+            EngineDefaultState {
+                engine_class: 5,
+                default_state: Some(&compute),
+            },
+        ];
+        let mut masks = [0; GUC_MAX_ENGINE_CLASSES];
+        masks[0] = 1;
+        masks[3] = 1;
+        masks[4] = 1;
+        let contexts = guc_init_golden_contexts(&masks, &engines).unwrap();
+        assert_eq!(contexts.len(), 3);
+        assert_eq!(contexts[0].guc_class, 0);
+        assert_eq!(contexts[0].image, render);
+        assert_eq!(contexts[1].guc_class, 3);
+        assert_eq!(contexts[1].image, copy);
+        assert_eq!(contexts[2].guc_class, 4);
+        assert_eq!(contexts[2].image, compute);
     }
 
     #[test]
