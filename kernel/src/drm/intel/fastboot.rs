@@ -1311,6 +1311,34 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             });
         };
         let changing_mode = target.timing != state.current_mode.timing;
+        if changing_mode
+            && super::atomic_modeset_wiring::preflight_native_mode_change(
+                state.current_mode.timing,
+                target.timing,
+                self.port,
+            )
+            .is_err()
+        {
+            // The translated-state projection is pure and runs before the
+            // existing TC transaction. It only admits the same Pipe-A, TC1/2,
+            // linear-XRGB8888, RGB 8-bpc, VIC 16/95 subset; it does not execute
+            // any atomic hook or replace `tc_modeset::program`.
+            if let Some(new) = next {
+                // SAFETY: the preflight only inspects CPU-side state, before
+                // any plane or link write; the verified old scanout remains
+                // the sole DMA owner of a display surface.
+                if unsafe { self.gtt.release_binding(&new.binding) }.is_err() {
+                    state.quarantine.push(new);
+                    state.lost = true;
+                }
+            }
+            complete.signal_error();
+            return Err(if state.lost {
+                DrmError::DeviceLost
+            } else {
+                DrmError::Unsupported
+            });
+        }
         if !changing_mode {
             if latch(&self.registers, &self.timer, surface).is_err() {
                 let recovered = latch(&self.registers, &self.timer, before).is_ok();

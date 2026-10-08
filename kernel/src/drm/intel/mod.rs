@@ -82,6 +82,7 @@
 //! context after the read.
 
 mod audio;
+pub(super) mod atomic_modeset_wiring;
 mod clk;
 mod combo_phy_full;
 mod connect;
