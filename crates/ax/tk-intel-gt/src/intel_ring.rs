@@ -69,7 +69,6 @@ pub struct Ring {
     pub space: usize,
     pub wrap: u32,
     pub pin_count: AtomicUsize,
-    pub vaddr: Vec<u32>,
 }
 
 pub struct Request {
@@ -77,12 +76,33 @@ pub struct Request {
     pub reserved_space: usize,
 }
 
+/// Safe Rust equivalent of the pointer returned by `intel_ring_begin()`.
+/// The adapter writes commands to the mapped GEM object using this span.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RingSpan {
+    pub byte_offset: usize,
+    pub dwords: usize,
+}
+
 /// Adapter for i915 GEM, GGTT, timeline, and request operations.
 pub trait RingBackend {
     fn ggtt_pin_bias(&mut self, vma: &RingVma) -> u32;
     fn ggtt_pin(&mut self, vma: &mut RingVma, flags: VmaFlags) -> Result<(), RingError>;
-    fn map_iomap(&mut self, vma: &RingVma) -> Result<Vec<u32>, RingError>;
-    fn coherent_map(&mut self, vma: &RingVma) -> Result<Vec<u32>, RingError>;
+    fn map_iomap(&mut self, vma: &RingVma) -> Result<(), RingError>;
+    fn coherent_map(&mut self, vma: &RingVma) -> Result<(), RingError>;
+    fn fill_ring_words(
+        &mut self,
+        vma: &RingVma,
+        byte_offset: usize,
+        dwords: usize,
+        value: u32,
+    ) -> Result<(), RingError>;
+    fn write_ring_words(
+        &mut self,
+        vma: &RingVma,
+        byte_offset: usize,
+        words: &[u32],
+    ) -> Result<(), RingError>;
     fn unmap_iomap(&mut self, vma: &RingVma);
     fn unmap_object(&mut self, vma: &RingVma);
     fn make_unshrinkable(&mut self, vma: &RingVma);
@@ -150,22 +170,11 @@ pub fn intel_ring_pin(ring: &mut Ring, backend: &mut impl RingBackend) -> Result
         backend.coherent_map(&ring.vma)
     };
     match mapping {
-        Ok(vaddr) if vaddr.len().saturating_mul(core::mem::size_of::<u32>()) >= ring.size => {
+        Ok(()) => {
             backend.make_unshrinkable(&ring.vma);
             // Discard unused bytes beyond that submitted to hw.
             intel_ring_reset(ring, ring.emit);
-            ring.vaddr = vaddr;
             Ok(())
-        }
-        Ok(_) => {
-            if ring.vma.map_and_fenceable && !ring.vma.has_llc {
-                backend.unmap_iomap(&ring.vma);
-            } else {
-                backend.unmap_object(&ring.vma);
-            }
-            backend.vma_unpin(&mut ring.vma);
-            ring.pin_count.fetch_sub(1, Ordering::AcqRel);
-            Err(RingError::Invalid)
         }
         Err(error) => {
             backend.vma_unpin(&mut ring.vma);
@@ -200,7 +209,6 @@ pub fn intel_ring_unpin(ring: &mut Ring, backend: &mut impl RingBackend) {
     }
     backend.make_purgeable(&ring.vma);
     backend.vma_unpin(&mut ring.vma);
-    ring.vaddr.clear();
 }
 
 // upstream: intel_ring.c create_ring_vma()
@@ -253,7 +261,6 @@ pub fn intel_engine_create_ring(
         space: 0,
         wrap: 32 - size.trailing_zeros(),
         pin_count: AtomicUsize::new(0),
-        vaddr: Vec::new(),
     };
 
     // Workaround an erratum on i830/i845G: tail in the final two cachelines hangs.
@@ -299,13 +306,16 @@ fn wait_for_space(
 }
 
 // upstream: intel_ring.c intel_ring_begin()
-pub fn intel_ring_begin<'a>(
-    ring: &'a mut Ring,
+pub fn intel_ring_begin(
+    ring: &mut Ring,
     request: &Request,
     timeline: &Timeline,
     num_dwords: usize,
     backend: &mut impl RingBackend,
-) -> Result<&'a mut [u32], RingError> {
+) -> Result<RingSpan, RingError> {
+    if ring.pin_count.load(Ordering::Acquire) == 0 {
+        return Err(RingError::Invalid);
+    }
     if request.ring_id != ring.id || num_dwords & 1 != 0 {
         return Err(RingError::Invalid);
     }
@@ -346,19 +356,13 @@ pub fn intel_ring_begin<'a>(
         wait_for_space(ring, timeline, total_bytes, backend)?;
     }
 
-    if ring.vaddr.len() < ring.size / core::mem::size_of::<u32>() {
-        return Err(RingError::Invalid);
-    }
-
     if need_wrap != 0 {
         need_wrap &= !1;
         if need_wrap > ring.space || ring.emit + need_wrap > ring.size {
             return Err(RingError::Invalid);
         }
         // Fill the ring tail with MI_NOOP qwords before wrapping to offset 0.
-        let start = ring.emit / core::mem::size_of::<u32>();
-        let count = need_wrap / core::mem::size_of::<u32>();
-        ring.vaddr[start..start + count].fill(MI_NOOP);
+        backend.fill_ring_words(&ring.vma, ring.emit, need_wrap / 4, MI_NOOP)?;
         ring.space -= need_wrap;
         ring.emit = 0;
     }
@@ -366,16 +370,38 @@ pub fn intel_ring_begin<'a>(
     if ring.emit > ring.size - bytes || ring.space < bytes {
         return Err(RingError::Invalid);
     }
-    let start = ring.emit / core::mem::size_of::<u32>();
+    let start = ring.emit;
     ring.emit += bytes;
     ring.space -= bytes;
-    Ok(&mut ring.vaddr[start..start + num_dwords])
+    Ok(RingSpan {
+        byte_offset: start,
+        dwords: num_dwords,
+    })
+}
+
+/// Commit the command payload into the mapped ring reservation returned by
+/// `intel_ring_begin()`. The C API returns `u32 *`; the Rust adapter keeps the
+/// same byte offset/length but performs the write through the GEM mapping.
+pub fn intel_ring_emit(
+    ring: &Ring,
+    span: RingSpan,
+    words: &[u32],
+    backend: &mut impl RingBackend,
+) -> Result<(), RingError> {
+    let bytes = span.dwords.checked_mul(4).ok_or(RingError::Invalid)?;
+    let end = span
+        .byte_offset
+        .checked_add(bytes)
+        .ok_or(RingError::Invalid)?;
+    if ring.pin_count.load(Ordering::Acquire) == 0 || words.len() != span.dwords || end > ring.size
+    {
+        return Err(RingError::Invalid);
+    }
+    backend.write_ring_words(&ring.vma, span.byte_offset, words)
 }
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-
     use super::*;
 
     #[test]
@@ -406,7 +432,6 @@ mod tests {
             space: 0,
             wrap: 20,
             pin_count: AtomicUsize::new(0),
-            vaddr: vec![0; 1024],
         };
         let mut ring = ring;
         intel_ring_reset(&mut ring, 4097);
