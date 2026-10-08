@@ -715,6 +715,39 @@ fn frame_count(r: &impl Registers) -> Result<u32, Error> {
     r.read(reg(0x70040, false))
         .ok_or(Error::Unavailable(0x70040))
 }
+
+/// The display-12/13 PIPEFRAME and PIPEFRAMEPIXEL pair is not synchronized.
+/// This adapter samples the high counter on both sides of the pixel register,
+/// matching intel_vblank.c's stable 64-bit read before its vblank-boundary
+/// adjustment.  A failed MMIO read is reported to the caller rather than
+/// becoming a fabricated zero counter.
+struct VblankCounterIo<'a, R> {
+    registers: &'a R,
+    valid: bool,
+}
+
+impl<R: Registers> intel_display::intel_vblank_full::VblankIo for VblankCounterIo<'_, R> {
+    fn read64_frame_pixel(&mut self, _pipe: u8) -> u64 {
+        for _ in 0..4 {
+            let high_before = self.registers.read(reg(0x70040, false));
+            let pixel = self.registers.read(reg(0x70044, false));
+            let high_after = self.registers.read(reg(0x70040, false));
+            match (high_before, pixel, high_after) {
+                (Some(before), Some(pixel), Some(after)) if before == after => {
+                    return (u64::from(before & 0xffff) << 32) | u64::from(pixel);
+                }
+                (Some(_), Some(_), Some(_)) => {}
+                _ => {
+                    self.valid = false;
+                    return 0;
+                }
+            }
+        }
+        self.valid = false;
+        0
+    }
+}
+
 fn latch(r: &impl Registers, timer: &impl PollTimer, address: u32) -> Result<(), Error> {
     let initial = frame_count(r)?;
     let start = timer.now_micros();
@@ -994,13 +1027,38 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             state.lost = true;
             return Err(DrmError::DeviceLost);
         }
-        let counter = match frame_count(&self.registers) {
-            Ok(v) => v,
-            Err(_) => {
-                state.lost = true;
-                return Err(DrmError::DeviceLost);
-            }
+        let timing = state.current_mode.timing;
+        let mut vblank_io = VblankCounterIo {
+            registers: &self.registers,
+            valid: true,
         };
+        let counter = intel_display::intel_vblank_full::i915_get_vblank_counter(
+            &mut vblank_io,
+            intel_display::intel_vblank_full::Display {
+                display_ver: 13,
+                ddi: true,
+                ..Default::default()
+            },
+            0,
+            intel_display::intel_vblank_full::VblankCrtc {
+                hwmode: intel_display::intel_vblank_full::Mode {
+                    clock: timing.clock_khz,
+                    crtc_clock: timing.clock_khz,
+                    htotal: i32::from(timing.htotal),
+                    hsync_start: i32::from(timing.hsync_start),
+                    vdisplay: i32::from(timing.vdisplay),
+                    vblank_start: i32::from(timing.vdisplay),
+                    vblank_end: i32::from(timing.vtotal),
+                    vtotal: i32::from(timing.vtotal),
+                    ..Default::default()
+                },
+                max_vblank_count: 0x00ff_ffff,
+            },
+        );
+        if !vblank_io.valid {
+            state.lost = true;
+            return Err(DrmError::DeviceLost);
+        }
         let now = self.timer.now_micros();
         match state.frame_progress {
             Some((previous, since)) if previous == counter => {
