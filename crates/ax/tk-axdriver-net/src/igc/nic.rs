@@ -51,7 +51,11 @@ use super::{
     bringup::StationAddress,
     desc::{
         BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES,
-        RX_HEADER_BYTES, RingError, RxRing, TxRing, tx_command_length, tx_offload_status,
+        RX_HEADER_BYTES, RingError, RxRing, TxRing,
+    },
+    txrx::{
+        TxChecksum, TxIpType, TxPacketInfo, TxProtocol, TxRingState, TxRxError, TxSegment,
+        igc_isc_txd_encap,
     },
     regs::{
         self, QueueControl, ReceiveControl, RingBase, RingLength, SplitReceiveControl,
@@ -144,6 +148,9 @@ pub struct IgcNic<H: IgcHal, const QS: usize> {
     mac: [u8; 6],
     tx_memory: DescriptorMemory,
     tx_ring: TxRing,
+    /// FreeBSD `igc_isc_txd_encap` shadow state; the coherent descriptor ring
+    /// remains the device-visible copy.
+    tx_source_state: TxRingState,
     tx_pool: BufferPool,
     tx_free: Vec<usize>,
     /// Which slots are currently out with the *caller*, not with the ring.
@@ -227,6 +234,7 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
             mac: station.bytes,
             tx_memory,
             tx_ring: TxRing::new(QS),
+            tx_source_state: TxRingState::new(QS),
             tx_pool,
             tx_free: (0..QS).rev().collect(),
             tx_in_flight: vec![false; QS],
@@ -466,12 +474,38 @@ impl<H: IgcHal, const QS: usize> NetDriverOps for IgcNic<H, QS> {
         // The descriptor's three words, then the tail.  The tail write is what
         // hands the descriptor over, so it comes after the descriptor is
         // complete and after a fence, which `write_tx` performs.
-        if !self.tx_memory.write_tx(
-            index,
-            address,
-            tx_command_length(length),
-            tx_offload_status(length),
-        ) {
+        let packet = TxPacketInfo {
+            pidx: index,
+            segments: vec![TxSegment {
+                address,
+                length: length as u32,
+            }],
+            len: length as u32,
+            ehdrlen: 14,
+            ip_hlen: 0,
+            tcp_hlen: 0,
+            tso_segsz: 0,
+            tso: false,
+            vlan_tag: None,
+            ip_type: TxIpType::Other(0),
+            protocol: TxProtocol::Other(0),
+            checksum: TxChecksum::default(),
+            tx_interrupt: true,
+        };
+        if let Err(error) = igc_isc_txd_encap(&mut self.tx_source_state, &packet, QS) {
+            log::error!("igc: translated TX encapsulation failed: {error:?}");
+            return Err(match error {
+                TxRxError::NoDescriptor => DevError::Again,
+                TxRxError::Bounds | TxRxError::Unsupported | TxRxError::BadMessage => {
+                    DevError::BadState
+                }
+            });
+        }
+        let descriptor = self.tx_source_state.desc[index];
+        if !self
+            .tx_memory
+            .write_tx(index, address, descriptor[2], descriptor[3])
+        {
             return Err(DevError::BadState);
         }
         self.tx_owner[index] = slot;
@@ -1059,6 +1093,23 @@ mod tests {
         harness.complete_transmit(0);
         harness.nic.recycle_tx_buffers().unwrap();
         assert_eq!(harness.nic.test_free_tx_slots(), QS);
+    }
+
+    #[test]
+    fn live_transmit_uses_the_translated_freebsd_data_descriptor_builder() {
+        let mut harness = Harness::new();
+        let (tx_descriptors, ..) = harness.regions();
+        let buffer = harness.nic.alloc_tx_buffer(64).unwrap();
+        let slot = harness.nic.transmit_slot(&buffer).unwrap();
+        let expected_address = harness.nic.tx_pool.bus_address(slot).unwrap();
+        harness.nic.transmit(buffer).unwrap();
+        assert_eq!(harness.descriptor_address(tx_descriptors, 0), expected_address);
+        let command = harness.word(tx_descriptors, 2 * 4);
+        assert_eq!(command & 0x0030_0000, 0x0030_0000); // advanced data type
+        assert_eq!(command & (0x0100_0000 | 0x0200_0000 | 0x0800_0000 | 0x2000_0000),
+            0x0100_0000 | 0x0200_0000 | 0x0800_0000 | 0x2000_0000);
+        assert_eq!(command & 0xffff, 64);
+        assert_eq!(harness.word(tx_descriptors, 3 * 4), 64 << 14);
     }
 
     #[test]
