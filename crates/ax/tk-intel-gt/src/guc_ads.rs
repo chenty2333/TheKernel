@@ -326,8 +326,10 @@ pub struct AdsBuildInput {
     pub runtime: AdsRuntimeInfo,
     pub engines: Vec<EngineMapEntry>,
     pub regsets: Vec<EngineRegset>,
-    /// Real LRC sizes for enabled GuC engine classes, even when no default
-    /// engine-state image is currently available.
+    /// Full LRC image sizes for enabled GuC engine classes, even when no
+    /// default engine-state image is currently available. ADS reserves the
+    /// page-aligned full image; `LRC_SKIP_SIZE` is subtracted only for the
+    /// `engine_state_size` ABI field.
     pub engine_context_sizes: Vec<(u8, usize)>,
     pub golden_contexts: Vec<GoldenContext>,
     pub capture_lists: Vec<CaptureList>,
@@ -1506,6 +1508,10 @@ mod tests {
         assert_eq!(
             dword(&bytes, offset_of!(AdsFixed, ads.golden_context_lrca)),
             input.base_ggtt + layout.golden_context_offset as u32
+        );
+        assert_eq!(
+            layout.workaround_klv_offset,
+            layout.golden_context_offset + 8192
         );
         assert_eq!(
             dword(&bytes, offset_of!(AdsFixed, ads.engine_state_size)),

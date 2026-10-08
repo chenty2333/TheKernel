@@ -1635,7 +1635,13 @@ fn n305_guc_ads_input(
             } else {
                 other_context
             };
-            engine_context_sizes.push((class, total.checked_sub(skip).ok_or(Error::Refused)?));
+            // ADS reserves a page-aligned slot for the full default LRC
+            // image. Only its engine_state_size ABI field excludes the
+            // common execlists/HWSP prefix.
+            if total <= skip {
+                return Err(Error::Refused);
+            }
+            engine_context_sizes.push((class, total));
         }
     }
     let mut generic_gt_sysinfo = [0; intel_gt::guc_ads::GUC_GENERIC_GT_SYSINFO_MAX];
