@@ -135,9 +135,12 @@ pub use nvm::{
     REGULATORY_AND_NVM_GROUP, nvm_get_command, parse_nvm_response, request_nvm_info,
 };
 pub use phy::{
-    PHY_BAND_5GHZ, PHY_BAND_24GHZ, PHY_CONTEXT_COMMAND, PHY_RX_CHAIN_COUNT_SHIFT,
+    PHY_BAND_5GHZ, PHY_BAND_24GHZ, PHY_CONTEXT_ACTION_ADD, PHY_CONTEXT_ACTION_MODIFY,
+    PHY_CONTEXT_ACTION_REMOVE, PHY_CONTEXT_COMMAND, PHY_RX_CHAIN_COUNT_SHIFT,
     PHY_RX_CHAIN_MIMO_COUNT_SHIFT, PHY_RX_CHAIN_VALID_SHIFT, PHY_WIDTH_20, PHY_WIDTH_40,
-    PHY_WIDTH_80, PHY_WIDTH_160, PhyContextConfig, PhyContextError, phy_context_command,
+    PHY_WIDTH_80, PHY_WIDTH_160, PhyContextConfig, PhyContextError, PhyUpdateError, PhyUpdateStage,
+    RLC_CONFIG_COMMAND, RLC_CONFIG_VERSION, phy_context_command, rlc_config_command,
+    update_phy_context,
 };
 pub use power::{
     BEACON_FILTER_COMMAND, BEACON_FILTER_CONFIG_BYTES, BeaconFilterError, BeaconFilterState,

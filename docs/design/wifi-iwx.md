@@ -53,3 +53,6 @@ capability discovery remains a net80211 input.
 Rate-update notifications decode legacy/HT/VHT initial-rate formats by the
 firmware notification version and update peer MCS, stream count, or legacy
 rate index only for the driver's station ID and rate-update event.
+
+PHY updates now preserve the cross-band CDB remove/add ordering, update-only
+path, metadata transition timing, and optional RLC API-v2 receive-chain update.

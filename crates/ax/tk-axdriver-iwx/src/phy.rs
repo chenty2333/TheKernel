@@ -19,6 +19,11 @@ pub const PHY_WIDTH_160: u8 = 3;
 pub const PHY_RX_CHAIN_VALID_SHIFT: u32 = 1;
 pub const PHY_RX_CHAIN_COUNT_SHIFT: u32 = 10;
 pub const PHY_RX_CHAIN_MIMO_COUNT_SHIFT: u32 = 12;
+pub const RLC_CONFIG_COMMAND: u8 = 0x08;
+pub const RLC_CONFIG_VERSION: u8 = 2;
+pub const PHY_CONTEXT_ACTION_ADD: u32 = 1;
+pub const PHY_CONTEXT_ACTION_MODIFY: u32 = 2;
+pub const PHY_CONTEXT_ACTION_REMOVE: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhyContextError {
@@ -135,8 +140,104 @@ pub fn phy_context_command(
     Ok(EncodedCommand::encode(&command, slot, queue)?)
 }
 
+/// Build API-v2 RLC_CONFIG with valid/static/dynamic receive-chain fields.
+// upstream: if_iwx.c iwx_phy_send_rlc()
+pub fn rlc_config_command(
+    phy_id: u32,
+    valid_rx_antennas: u8,
+    chains_static: u8,
+    chains_dynamic: u8,
+    slot: u8,
+) -> Result<EncodedCommand, PhyContextError> {
+    let chain_info = (u32::from(valid_rx_antennas) << PHY_RX_CHAIN_VALID_SHIFT)
+        | (u32::from(chains_static) << PHY_RX_CHAIN_COUNT_SHIFT)
+        | (u32::from(chains_dynamic) << PHY_RX_CHAIN_MIMO_COUNT_SHIFT);
+    let mut payload = [0u8; 32];
+    payload[0..4].copy_from_slice(&phy_id.to_le_bytes());
+    payload[4..8].copy_from_slice(&chain_info.to_le_bytes());
+    let command = HostCommand {
+        id: (u32::from(RLC_CONFIG_VERSION) << 16)
+            | (u32::from(crate::DATA_PATH_GROUP) << 8)
+            | u32::from(RLC_CONFIG_COMMAND),
+        flags: 0,
+        response_capacity: 0,
+        parts: &[&payload],
+    };
+    Ok(EncodedCommand::encode(&command, slot, 0)?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhyUpdateStage {
+    RemoveOld,
+    AddNew,
+    Modify,
+    Rlc,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhyUpdateError<E> {
+    Build(PhyContextError),
+    Send { stage: PhyUpdateStage, error: E },
+}
+
+/// Apply the source remove/add on cross-band CDB transition, else modify in place.
+// upstream: if_iwx.c iwx_phy_ctxt_update()
+pub fn update_phy_context<E>(
+    current: &mut PhyContextConfig,
+    mut next: PhyContextConfig,
+    cdb_supported: bool,
+    slot: u8,
+    mut send: impl FnMut(&EncodedCommand) -> Result<(), E>,
+) -> Result<(), PhyUpdateError<E>> {
+    let cross_band = (current.is_24ghz != next.is_24ghz) && cdb_supported;
+    if cross_band {
+        let mut remove = *current;
+        remove.action = PHY_CONTEXT_ACTION_REMOVE;
+        let command = phy_context_command(remove, slot, 0).map_err(PhyUpdateError::Build)?;
+        send(&command).map_err(|error| PhyUpdateError::Send {
+            stage: PhyUpdateStage::RemoveOld,
+            error,
+        })?;
+        current.channel = next.channel;
+        current.is_24ghz = next.is_24ghz;
+        next.action = PHY_CONTEXT_ACTION_ADD;
+        let command = phy_context_command(next, slot, 0).map_err(PhyUpdateError::Build)?;
+        send(&command).map_err(|error| PhyUpdateError::Send {
+            stage: PhyUpdateStage::AddNew,
+            error,
+        })?;
+    } else {
+        current.channel = next.channel;
+        current.is_24ghz = next.is_24ghz;
+        next.action = PHY_CONTEXT_ACTION_MODIFY;
+        let command = phy_context_command(next, slot, 0).map_err(PhyUpdateError::Build)?;
+        send(&command).map_err(|error| PhyUpdateError::Send {
+            stage: PhyUpdateStage::Modify,
+            error,
+        })?;
+    }
+    current.sco = next.sco;
+    current.vht_width = next.vht_width;
+    if next.rlc_command_version == RLC_CONFIG_VERSION {
+        let command = rlc_config_command(
+            next.id_and_color & 0xff,
+            next.valid_rx_antennas,
+            next.static_chains,
+            next.dynamic_chains,
+            slot,
+        )
+        .map_err(PhyUpdateError::Build)?;
+        send(&command).map_err(|error| PhyUpdateError::Send {
+            stage: PhyUpdateStage::Rlc,
+            error,
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::*;
     use crate::{command::LONG_GROUP, command_group_id};
 
@@ -194,5 +295,51 @@ mod tests {
         assert_eq!(command.bytes[22], 2);
         assert_eq!(&command.bytes[28..32], &[0; 4]);
         assert_eq!(command_group_id(command.wire_id), LONG_GROUP);
+    }
+
+    #[test]
+    fn rlc_chain_update_and_cross_band_phy_change_keep_source_order() {
+        let rlc = rlc_config_command(2, 3, 1, 2, 4).unwrap();
+        assert_eq!(
+            rlc.wire_id,
+            (2 << 16) | (5 << 8) | RLC_CONFIG_COMMAND as u32
+        );
+        assert_eq!(rlc.bytes.len(), 8 + 32);
+        assert_eq!(&rlc.bytes[8..12], &2u32.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(rlc.bytes[12..16].try_into().unwrap()),
+            (3 << PHY_RX_CHAIN_VALID_SHIFT)
+                | (1 << PHY_RX_CHAIN_COUNT_SHIFT)
+                | (2 << PHY_RX_CHAIN_MIMO_COUNT_SHIFT)
+        );
+
+        let mut current = config();
+        let mut next = current;
+        next.channel = 1;
+        next.is_24ghz = true;
+        next.sco = 3;
+        next.vht_width = PHY_WIDTH_40;
+        next.rlc_command_version = RLC_CONFIG_VERSION;
+        let mut actions = Vec::new();
+        assert_eq!(
+            update_phy_context(&mut current, next, true, 0, |cmd| {
+                actions.push(if cmd.wire_id == rlc.wire_id {
+                    "rlc"
+                } else {
+                    match u32::from_le_bytes(cmd.bytes[12..16].try_into().unwrap()) {
+                        PHY_CONTEXT_ACTION_REMOVE => "remove",
+                        PHY_CONTEXT_ACTION_ADD => "add",
+                        _ => "modify",
+                    }
+                });
+                Ok::<_, ()>(())
+            }),
+            Ok(())
+        );
+        assert_eq!(actions, ["remove", "add", "rlc"]);
+        assert_eq!(current.channel, 1);
+        assert!(current.is_24ghz);
+        assert_eq!(current.sco, 3);
+        assert_eq!(current.vht_width, PHY_WIDTH_40);
     }
 }
