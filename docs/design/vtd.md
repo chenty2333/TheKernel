@@ -83,3 +83,12 @@ partial removal and delayed entry release, and the IOVA facade now delegates to
 it. For platform fit, the source's augmented intrusive RB tree is represented
 as an ordered vector with linear gap scans; this preserves layout behavior but
 has O(n) lookup cost under many active mappings.
+
+FreeBSD `busdma_iommu.c` core map load/unload is represented in
+`tk-vtd/src/busdma.rs` (2/34 source functions): the translated load path maps
+bounded physical ranges into device-visible segments and rolls back partial
+work on failure; unload retires every entry. FreeBSD busdma tags, VM-page
+lookup, KMSAN, callback locks, and delayed taskqueue wrappers are framework
+adapters. TheKernel callers provide physical ranges to the DMA interface. The
+adapter enforces segment count/size, alignment, boundary, and low-address
+constraints, but is not yet wired as a tag layer into every kernel DMA client.

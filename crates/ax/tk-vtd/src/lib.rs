@@ -13,6 +13,7 @@ extern crate std;
 use alloc::vec::Vec;
 
 pub mod context;
+pub mod busdma;
 pub mod dmar;
 pub mod driver;
 pub mod fault;
