@@ -29,6 +29,7 @@ pub mod intel_cursor_full;
 pub mod intel_crtc_full;
 pub mod intel_fb_full;
 pub mod intel_modeset_verify_full;
+pub mod intel_modeset_setup_full;
 pub mod intel_ddi_full;
 pub mod intel_dp_link_training_full;
 pub mod intel_dp_full;
