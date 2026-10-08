@@ -17,6 +17,7 @@ mod channel;
 mod command;
 mod config;
 mod context;
+mod context_task;
 mod control;
 mod controller;
 mod diagnostics;
@@ -115,6 +116,11 @@ pub use context::{
     ContextError, ContextQueueAddresses, GEN2_CONTEXT_BYTES, GEN3_CONTEXT_BYTES,
     PRPH_SCRATCH_BYTES, build_gen2_context, build_gen3_context, build_gen3_prph_scratch,
     set_gen3_pnvm, start_gen2_context, start_gen3_context,
+};
+pub use context_task::{
+    ContextTaskEligibility, ContextTaskKind, HT_SECONDARY_NONE, MacContextTaskOutcome,
+    PhyContextTaskConfig, PhyContextTaskOutcome, run_mac_context_task, run_phy_context_task,
+    updatechan, updatedtim, updateedca, updateprot, updateslot,
 };
 pub use control::{
     IoctlAction, IoctlError, IoctlKind, NetworkIoctlResult, WatchdogAction, WatchdogOutcome,
