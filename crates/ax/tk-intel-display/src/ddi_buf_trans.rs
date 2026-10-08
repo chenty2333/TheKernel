@@ -132,6 +132,20 @@ const TGL_DP_HBR2: [DdiBufferTransEntry; 10] = [
 // upstream: intel_ddi_buf_trans.c _tgl_combo_phy_trans_edp_hbr2_hobl[]
 const TGL_EDP_HOBL: [DdiBufferTransEntry; 9] = [combo(6, 0x7f, 0x3f, 0, 0); 9];
 
+// upstream: intel_ddi_buf_trans.c _tgl_uy_combo_phy_trans_dp_hbr2[]
+const TGL_UY_DP_HBR2: [DdiBufferTransEntry; 10] = [
+    combo(0x0a, 0x35, 0x3f, 0, 0),
+    combo(0x0a, 0x4f, 0x36, 0, 9),
+    combo(0x0c, 0x60, 0x32, 0, 13),
+    combo(0x0c, 0x7f, 0x2d, 0, 18),
+    combo(0x0c, 0x47, 0x3f, 0, 0),
+    combo(0x0c, 0x6f, 0x36, 0, 9),
+    combo(0x06, 0x7d, 0x32, 0, 13),
+    combo(0x06, 0x60, 0x3c, 0, 3),
+    combo(0x06, 0x7f, 0x34, 0, 11),
+    combo(0x06, 0x7f, 0x3f, 0, 0),
+];
+
 // upstream: intel_ddi_buf_trans.c _rkl_combo_phy_trans_dp_hbr[]
 const RKL_DP_HBR: [DdiBufferTransEntry; 10] = [
     combo(0x0a, 0x2f, 0x3f, 0, 0),
@@ -311,6 +325,7 @@ pub struct DdiBufferTransRequest {
     pub port_clock_khz: u32,
     pub use_edp_low_vswing: bool,
     pub use_edp_hobl: bool,
+    pub tigerlake_uy: bool,
 }
 
 const fn table(
@@ -577,6 +592,17 @@ pub fn intel_ddi_buf_trans_get(
             Platform::TigerLake,
             BufferPhy::Combo,
             BufferOutput::DisplayPort | BufferOutput::EmbeddedDisplayPort,
+        ) if request.port_clock_khz > 270_000 && request.tigerlake_uy => Ok(table(
+            "tgl_uy_combo_phy_trans_dp_hbr2",
+            BufferPhy::Combo,
+            &TGL_UY_DP_HBR2,
+            None,
+            false,
+        )),
+        (
+            Platform::TigerLake,
+            BufferPhy::Combo,
+            BufferOutput::DisplayPort | BufferOutput::EmbeddedDisplayPort,
         ) if request.port_clock_khz > 270_000 => Ok(table(
             "tgl_combo_phy_trans_dp_hbr2",
             BufferPhy::Combo,
@@ -622,7 +648,6 @@ pub fn intel_ddi_buf_trans_get(
 
 /// Source-shaped convenience for callers that only need the table's entries.
 // upstream: intel_ddi_buf_trans.c intel_get_buf_trans()
-// upstream: intel_ddi_buf_trans.c intel_get_buf_trans()
 pub fn intel_get_buf_trans(table: DdiBufferTransTable) -> &'static [DdiBufferTransEntry] {
     table.entries
 }
@@ -644,6 +669,7 @@ mod tests {
             port_clock_khz: clock,
             use_edp_low_vswing: false,
             use_edp_hobl: false,
+            tigerlake_uy: false,
         }
     }
 
@@ -731,6 +757,16 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(tgl.name, "tgl_combo_phy_trans_dp_hbr");
+        let mut tgl_uy_request = request(
+            Platform::TigerLake,
+            BufferPhy::Combo,
+            BufferOutput::DisplayPort,
+            540_000,
+        );
+        tgl_uy_request.tigerlake_uy = true;
+        let tgl_uy = intel_ddi_buf_trans_get(tgl_uy_request).unwrap();
+        assert_eq!(tgl_uy.name, "tgl_uy_combo_phy_trans_dp_hbr2");
+        assert_eq!(tgl_uy.entries[1], combo(0x0a, 0x4f, 0x36, 0, 9));
         assert_eq!(rkl.name, "rkl_combo_phy_trans_dp_hbr");
         assert_eq!(adls.name, "tgl_combo_phy_trans_dp_hbr");
         assert_ne!(intel_get_buf_trans(tgl)[0], intel_get_buf_trans(rkl)[0]);

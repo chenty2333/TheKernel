@@ -573,6 +573,7 @@ fn combo_default_swing(
         port_clock_khz,
         use_edp_low_vswing: false,
         use_edp_hobl: false,
+        tigerlake_uy: false,
     })
     .map_err(|_| OutputError::MissingBufferTranslation {
         port_type,
