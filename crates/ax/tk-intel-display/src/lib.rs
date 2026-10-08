@@ -29,6 +29,7 @@ pub mod power_map;
 pub mod power_well;
 pub mod scaler;
 pub mod tc;
+pub mod tc_state_machine;
 pub mod universal_plane;
 pub mod watermark;
 

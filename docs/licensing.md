@@ -656,3 +656,8 @@ HDMI SPD defaults and DRM metadata gates in `tk-intel-display/src/hdmi.rs` follo
 `tk-intel-display/src/hdmi.rs::intel_hdmi_infoframe_enable` translates the
 HDMI/DP packet-type software-slot mapping from `intel_hdmi.c` (MIT, © 2006-2009
 Intel).
+
+`tk-intel-display/src/tc_state_machine.rs` translates the display-12/13 Type-C
+state machine from `intel_tc.c` (MIT, Copyright © 2019 Intel); the only omitted
+applicable source function is the C pointer cast `to_tc_port()`. The complete
+MIT grant is in `LICENSE-MIT`.
