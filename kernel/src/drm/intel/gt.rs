@@ -248,10 +248,13 @@ fn load_uc_firmware() {
     let mut state = UC_FIRMWARE.lock();
     match guc {
         Ok(image) => {
+            let css = uc::guc_css_info(image.blob.version, image.css);
             axlog::info!(
-                "intel-gt: GuC firmware {} selected, {:?} CSS, {} bytes",
+                "intel-gt: GuC firmware {} selected, CSS {:?}, submission {:?}, private data {} bytes, image {} bytes",
                 image.blob.path,
                 image.css.version,
+                css.submission_version,
+                css.private_data_bytes,
                 image.bytes.len()
             );
             state.guc = Some(image);

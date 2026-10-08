@@ -155,3 +155,6 @@ unimplemented.
 src/guc_fw.rs: Linux 7.2.3 gt/uc/intel_guc_fw.c guc_load_done() terminal
 GuC status classification (MIT, Copyright © 2014-2019 Intel Corporation).
 Register observation stays behind the existing GtIo interface.
+CSS info in src/uc.rs additionally ports uc_unpack_css_version and GuC
+submission-version compatibility from intel_uc_fw.c guc_read_css_info() for
+Gen12 firmware. Copyright © 2016-2019 Intel Corporation; MIT grant retained.

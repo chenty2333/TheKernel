@@ -48,6 +48,7 @@ pub struct CssInfo {
     pub microcode_bytes: usize,
     pub rsa_bytes: usize,
     pub version: (u8, u8, u8),
+    pub vf_version: u32,
     pub private_data_bytes: usize,
 }
 
@@ -141,8 +142,46 @@ pub fn parse_css(data: &[u8], wopcm_bytes: usize) -> Result<CssInfo, CssError> {
             ((version_word >> 8) & 0xff) as u8,
             (version_word & 0xff) as u8,
         ),
+        vf_version: dword(68),
         private_data_bytes: dword(120) as usize,
     })
+}
+
+// upstream: intel_uc_fw.c uc_unpack_css_version()
+fn unpack_css_version(value: u32) -> (u8, u8, u8) {
+    (
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 8) & 0xff) as u8,
+        (value & 0xff) as u8,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GucCssInfo {
+    pub submission_version: (u8, u8, u8),
+    pub private_data_bytes: usize,
+}
+
+// upstream: intel_uc_fw.c guc_read_css_info()
+pub fn guc_css_info(firmware: (u8, u8, u8), css: CssInfo) -> GucCssInfo {
+    let submission_version = if firmware.0 >= 70 {
+        if firmware.1 >= 6 {
+            // CSS vf_version packs the three ABI components into low 24 bits.
+            unpack_css_version(css.vf_version)
+        } else if firmware.1 >= 3 {
+            (1, 1, 0)
+        } else {
+            (1, 0, 0)
+        }
+    } else if firmware.0 >= 69 {
+        (0, 10, 0)
+    } else {
+        (0, 1, 0)
+    };
+    GucCssInfo {
+        submission_version,
+        private_data_bytes: css.private_data_bytes,
+    }
 }
 
 const TGL_GUC: &[Blob] = &[Blob {
@@ -263,6 +302,7 @@ mod tests {
                 microcode_bytes: 256,
                 rsa_bytes: 16,
                 version: (70, 12, 1),
+                vf_version: 0,
                 private_data_bytes: 0x2000,
             })
         );
@@ -301,5 +341,23 @@ mod tests {
         assert_eq!(loaded.blob.path, "i915/tgl_guc_70.1.1.bin");
         assert_eq!(loaded.bytes, image);
         assert_eq!(loaded.css.version, (70, 1, 1));
+    }
+
+    #[test]
+    fn guc_css_info_tracks_firmware_compatibility_rules() {
+        let mut css = css_image(64, 128);
+        css[68..72].copy_from_slice(&0x0002_0304u32.to_le_bytes());
+        let css = parse_css(&css, 4096).unwrap();
+        assert_eq!(
+            guc_css_info((70, 12, 1), css),
+            GucCssInfo {
+                submission_version: (2, 3, 4),
+                private_data_bytes: 0x2000,
+            }
+        );
+        assert_eq!(guc_css_info((70, 3, 0), css).submission_version, (1, 1, 0));
+        assert_eq!(guc_css_info((70, 1, 1), css).submission_version, (1, 0, 0));
+        assert_eq!(guc_css_info((69, 0, 3), css).submission_version, (0, 10, 0));
+        assert_eq!(guc_css_info((68, 1, 0), css).submission_version, (0, 1, 0));
     }
 }

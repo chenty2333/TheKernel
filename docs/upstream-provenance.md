@@ -983,3 +983,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 `crates/ax/tk-intel-gt/src/uc.rs::parse_css`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::__check_ccs_header` size-field validation, translated with checked arithmetic (MIT, Copyright © 2016-2019 Intel Corporation); WOPCM and file-size checks retained.
 
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_fw.c::guc_load_done`, terminal GuC/BootROM status decoding (MIT, Copyright © 2014-2019 Intel Corporation); register access remains through existing `GtIo`.
+
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::uc_unpack_css_version` and `guc_read_css_info`, CSS ABI version extraction and GuC 69/70 compatibility branches (MIT, Copyright © 2016-2019 Intel Corporation).
