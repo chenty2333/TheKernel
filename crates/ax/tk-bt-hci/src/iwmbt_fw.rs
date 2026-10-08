@@ -250,6 +250,17 @@ pub fn get_fwname(
     }
 }
 
+/// Fallback filename used by `iwmbt_get_fwname()` for 7260/7265 when the
+/// fully versioned BSEQ image is not present in the firmware store.
+pub fn get_fwname_fallback(ver: &Version, prefix: &str, suffix: &str) -> Option<String> {
+    matches!(ver.hw_variant, 0x07 | 0x08).then(|| {
+        format!(
+            "{prefix}/ibt-hw-{:x}.{:x}.{suffix}",
+            ver.hw_platform, ver.hw_variant
+        )
+    })
+}
+
 /// Translate `iwmbt_get_fwname_tlv()`.
 // upstream: iwmbt_fw.c iwmbt_get_fwname_tlv()
 pub fn get_fwname_tlv(ver: &VersionTlv, prefix: &str, suffix: &str) -> String {

@@ -509,7 +509,10 @@ def rootfs_fingerprint() -> str:
             raise ProductError(f"missing Intel Bluetooth firmware license: {license_path}")
         digest.update(license_path.read_bytes())
         files = set()
-        for pattern in ("ibt-*.sfi", "ibt-*.sfi.xz", "ibt-*.ddc", "ibt-*.ddc.xz"):
+        for pattern in (
+            "ibt-*.sfi", "ibt-*.sfi.xz", "ibt-*.ddc", "ibt-*.ddc.xz",
+            "ibt-*.bseq", "ibt-*.bseq.xz",
+        ):
             files.update(source.glob(pattern))
         if not files:
             raise ProductError(f"no Intel ibt SFI/DDC files found in {source}")

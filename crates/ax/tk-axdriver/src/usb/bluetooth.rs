@@ -258,15 +258,83 @@ impl UsbBluetoothHci {
         self.adapter.intel_set_event_mask()
     }
 
-    // upstream: main.c handle_9260()
     fn load_intel_firmware_after_rootfs(&mut self) -> Result<(), Error> {
-        if self.family_hint != tk_bt_hci::DeviceFamily::I9260 {
+        if self.family_hint == tk_bt_hci::DeviceFamily::Unknown {
             return Ok(());
         }
         self.set_up(true)?;
-        if self.intel_identify()? != tk_bt_hci::DeviceFamily::I9260 {
+        match self.intel_identify()? {
+            tk_bt_hci::DeviceFamily::I7260 => self.handle_7260_firmware(),
+            tk_bt_hci::DeviceFamily::I8260 => self.handle_8260_firmware(),
+            tk_bt_hci::DeviceFamily::I9260 => self.handle_9260_firmware(),
+            tk_bt_hci::DeviceFamily::Unknown => Err(Error::Unsupported),
+        }
+    }
+
+    // upstream: main.c handle_7260()
+    fn handle_7260_firmware(&mut self) -> Result<(), Error> {
+        let version = self.intel_get_version()?;
+        if version.fw_patch_num != 0 {
+            return Ok(());
+        }
+        let primary = tk_bt_hci::get_fwname(&version, None, "/lib/firmware/intel", "bseq")
+            .ok_or(Error::Unsupported)?;
+        let firmware = axdriver_base::firmware::request(&primary, MAX_INTEL_FIRMWARE)
+            .or_else(|| {
+                tk_bt_hci::get_fwname_fallback(&version, "/lib/firmware/intel", "bseq")
+                    .and_then(|path| axdriver_base::firmware::request(&path, MAX_INTEL_FIRMWARE))
+            })
+            .ok_or(Error::NoDevice)?;
+        self.intel_enter_manufacturer()?;
+        let activate = match self.run_intel_patch(&firmware) {
+            Ok(activate) => activate,
+            Err(error) => {
+                let _ = self.intel_exit_manufacturer(1);
+                return Err(error);
+            }
+        };
+        self.intel_exit_manufacturer(if activate { 2 } else { 0 })?;
+        let _ = self.intel_get_version();
+        if self.intel_enter_manufacturer().is_ok() {
+            let _ = self.intel_set_event_mask();
+            let _ = self.intel_exit_manufacturer(0);
+        }
+        Ok(())
+    }
+
+    // upstream: main.c handle_8260()
+    fn handle_8260_firmware(&mut self) -> Result<(), Error> {
+        let version = self.intel_get_version()?;
+        if version.fw_variant == 0x23 {
+            return Ok(());
+        }
+        if version.fw_variant != 0x06 {
             return Err(Error::Unsupported);
         }
+        let params = self.intel_get_boot_params()?;
+        self.address = params.otp_bdaddr;
+        if params.limited_cce != 0 {
+            return Err(Error::Unsupported);
+        }
+        let path = tk_bt_hci::get_fwname(&version, Some(&params), "/lib/firmware/intel", "sfi")
+            .ok_or(Error::Unsupported)?;
+        let firmware =
+            axdriver_base::firmware::request(&path, MAX_INTEL_FIRMWARE).ok_or(Error::NoDevice)?;
+        let boot_param = self.intel_init_firmware(&firmware, version.hw_variant, 0)?;
+        self.intel_reset(boot_param)?;
+        let operational = self.intel_get_version().unwrap_or(version);
+        if let Some(path) =
+            tk_bt_hci::get_fwname(&operational, Some(&params), "/lib/firmware/intel", "ddc")
+            && let Some(ddc) = axdriver_base::firmware::request(&path, MAX_INTEL_FIRMWARE)
+        {
+            let _ = self.intel_load_ddc(&ddc);
+        }
+        let _ = self.intel_set_event_mask();
+        Ok(())
+    }
+
+    // upstream: main.c handle_9260()
+    fn handle_9260_firmware(&mut self) -> Result<(), Error> {
         let mut raw = [0u8; 255];
         let len = self.intel_get_version_tlv(&mut raw)?;
         let mut version = tk_bt_hci::VersionTlv::default();
@@ -343,7 +411,7 @@ impl UsbTransport for Transport {
 pub type RegisteredHci = Arc<Mutex<UsbBluetoothHci>>;
 static DEVICES: spin::Once<Mutex<Vec<RegisteredHci>>> = spin::Once::new();
 pub(super) fn register(device: UsbBluetoothHci) {
-    let intel = device.family_hint == tk_bt_hci::DeviceFamily::I9260;
+    let intel = device.family_hint != tk_bt_hci::DeviceFamily::Unknown;
     let Ok(device) = Arc::try_new(Mutex::new(device)) else {
         warn!("USB Bluetooth adapter registry allocation failed");
         return;

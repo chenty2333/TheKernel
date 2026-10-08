@@ -14,7 +14,8 @@ use alloc::collections::VecDeque;
 
 pub use iwmbt_fw::{
     BootParams, DeviceFamily, FirmwareError, PatchCommand, Version, VersionTlv, get_fwname,
-    get_fwname_tlv, parse_patch, parse_tlv, parse_version_event, supported_device,
+    get_fwname_fallback, get_fwname_tlv, parse_patch, parse_tlv, parse_version_event,
+    supported_device,
 };
 
 pub const AF_BLUETOOTH: i32 = 31;
@@ -721,6 +722,19 @@ mod tests {
             )
             .unwrap(),
             "intel/ibt-12-42.sfi"
+        );
+        assert_eq!(
+            get_fwname_fallback(
+                &Version {
+                    hw_platform: 0x37,
+                    hw_variant: 7,
+                    ..Version::default()
+                },
+                "intel",
+                "bseq"
+            )
+            .as_deref(),
+            Some("intel/ibt-hw-37.7.bseq")
         );
     }
 
