@@ -714,3 +714,8 @@ in the source header and crate `LICENSE-MIT`.
 `tk-intel-display/src/skl_watermark_full.rs` translates all 140 watermark/DBUF
 functions in Linux 7.2.3 `skl_watermark.c` (MIT, © 2022 Intel); the MIT grant
 is covered by the file SPDX identifier and crate `LICENSE-MIT`.
+
+`tk-intel-display/src/skl_universal_plane_full.rs` translates all 112
+universal-plane functions in Linux 7.2.3 `skl_universal_plane.c` (MIT,
+© 2020 Intel); the full grant is preserved in the file SPDX tag and crate
+`LICENSE-MIT`.

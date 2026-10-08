@@ -1232,3 +1232,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `crates/ax/tk-intel-display/src/skl_scaler_full.rs` translates all 43 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/skl_scaler.c` (MIT, Copyright © 2020 Intel Corporation); DRM atomic state, CASF and DSB/MMIO are explicit hooks. `LICENSE-MIT`.
 
 `crates/ax/tk-intel-display/src/skl_watermark_full.rs` translates all 140 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/skl_watermark.c` (MIT, Copyright © 2022 Intel Corporation); DRM atomic objects, PCODE, MMIO and debugfs are trait boundaries. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/skl_universal_plane_full.rs` translates all 112 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/skl_universal_plane.c` (MIT, Copyright © 2020 Intel Corporation); DRM/FB/atomic/IRQ/DSB/MMIO boundaries are traits. `LICENSE-MIT`.
