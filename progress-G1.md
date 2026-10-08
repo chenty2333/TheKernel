@@ -62,4 +62,6 @@
 
 8b. DP MST source translation | 部分完成 | 55831f2f | 新增 `intel_dp_mst_full.rs`，`intel_dp_mst.c` 68/68 ctags 函数按顺序翻译；带宽/payload/atomic policy/stream 阶段使用 Rust 算法，DRM topology、sideband/AUX、MMIO 经 `MstBackend`。`cargo test -p tk-intel-display --lib` 147/147 通过；kernel MST topology/adapter 和现行单连接器 KMS 接入未完成。
 
-8c. PSR/Panel Replay source translation | 部分完成 | ed2a9786,follow-up pending | 新增 `intel_psr_full.rs`，`intel_psr.c` 155/155 ctags 函数、4,487 Rust 行，marker按源序完全覆盖。包含PSR1/2、Panel Replay、selective update、AUX/DPCD能力/配置、IRQ/frontbuffer/recovery流程，后端由`PsrIo`抽象；worker独立rustc首次失败后未重跑；主代理发现并修复no_std format/借用/常量问题，`cargo test -p tk-intel-display --lib` 147/147通过，product lint及n305 lint通过；kernel adapter/当前modeset接线未完成。
+8c. PSR/Panel Replay source translation | 部分完成 | ed2a9786,9fdee8e2 | 新增 `intel_psr_full.rs`，`intel_psr.c` 155/155 ctags 函数、4,487 Rust 行，marker按源序完全覆盖。包含PSR1/2、Panel Replay、selective update、AUX/DPCD能力/配置、IRQ/frontbuffer/recovery流程，后端由`PsrIo`抽象；worker独立rustc首次失败后未重跑；主代理发现并修复no_std format/借用/常量问题，`cargo test -p tk-intel-display --lib` 147/147通过，product lint及n305 lint通过；kernel adapter/当前modeset接线未完成。
+
+8d. FBC source translation | 部分完成 | pending | 新增 `intel_fbc_full.rs`，`intel_fbc.c` 134 个ctags函数翻译126个、Rust 2,533行；遗漏4个display35+/XE3P system-cache和4个DRM debugfs框架函数。覆盖资格、CFB/stolen-memory、register order、frontbuffer/dirty rect/flip/underrun/false-color/init/cleanup；接口经`FbcRegisterIo`/`StolenAllocator`/`FbcControlHooks`/`FbcPipeGraph`。worker独立cargo check通过；kernel FBC adapter/current modeset hookup未完成。

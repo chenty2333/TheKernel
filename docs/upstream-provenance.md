@@ -1268,3 +1268,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `crates/ax/tk-intel-display/src/intel_dp_mst_full.rs` translates all 68 ctags definitions from Linux 7.2.3 `intel_dp_mst.c` (MIT; Copyright © 2008 Intel and 2014 Red Hat); full grant retained in source and `LICENSES/Intel-i915-DP-MST-MIT.txt`.
 
 `crates/ax/tk-intel-display/src/intel_psr_full.rs` translates 155/155 ctags functions from Linux 7.2.3 `intel_psr.c` (MIT, Copyright © 2014 Intel Corporation); the full grant is retained in the Rust source and `LICENSES/Intel-i915-PSR-MIT.txt`.
+
+`crates/ax/tk-intel-display/src/intel_fbc_full.rs` translates 126/134 ctags functions from Linux 7.2.3 `intel_fbc.c` (MIT-style Intel grant; Copyright © 2014 Intel Corporation); eight display-35+ system-cache or DRM debugfs functions are excluded with reasons in `docs/design/intel-fbc-full.md`.
