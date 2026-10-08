@@ -314,8 +314,9 @@ pub(crate) fn commit_cdclk_voltage<R: Registers, T: PollTimer>(
     io.result(status)
 }
 
-/// Read one source-defined GEN9 display memory-latency dword. `skl_wm_latency`
-/// consumes indices zero and one for the eight watermark latency slots.
+/// Read one source-defined GEN9 display memory-latency dword. The mailbox
+/// command is constant; the 0/1 selector is the DATA input value, as required
+/// by `skl_read_wm_latency()` before `intel_pcode_read()`.
 pub(crate) fn read_wm_latency<R: Registers, T: PollTimer>(
     regs: &R,
     timer: &T,
@@ -324,9 +325,8 @@ pub(crate) fn read_wm_latency<R: Registers, T: PollTimer>(
     if index > 1 {
         return Err(PcodeError::MailboxStatus(-intel_pcode_full::EINVAL));
     }
-    let mailbox = intel_pcode_full::GEN9_PCODE_READ_MEM_LATENCY
-        | ((index << 8) & intel_pcode_full::GEN6_PCODE_MB_PARAM1);
-    let mut value = 0u32;
+    let mailbox = intel_pcode_full::GEN9_PCODE_READ_MEM_LATENCY;
+    let mut value = index;
     let mut io = RegisterPcode::new(regs, timer, 12, false);
     let status = intel_pcode_full::snb_pcode_read(&mut io, mailbox, &mut value, None);
     io.result(status)?;
@@ -349,4 +349,89 @@ pub(crate) fn read_sagv_block_time_us<R: Registers, T: PollTimer>(
     );
     io.result(status)?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use spin::Mutex;
+
+    use super::*;
+    use crate::drm::intel::regs::Register;
+
+    #[derive(Default)]
+    struct State {
+        mailbox: u32,
+        data: u32,
+        requests: Vec<(u32, u32)>,
+    }
+
+    #[derive(Default)]
+    struct PcodeModel(Mutex<State>);
+
+    impl Registers for PcodeModel {
+        fn read(&self, register: Register) -> Option<u32> {
+            let state = self.0.lock();
+            Some(match register.offset() {
+                offset if offset == regs::pcode::GEN6_PCODE_MAILBOX.offset() => state.mailbox,
+                offset if offset == regs::pcode::GEN6_PCODE_DATA.offset() => state.data,
+                offset if offset == regs::pcode::GEN6_PCODE_DATA1.offset() => 0,
+                _ => return None,
+            })
+        }
+
+        fn read64(&self, _register: Register) -> Option<u64> {
+            None
+        }
+
+        fn write(&self, register: Register, value: u32) -> bool {
+            let mut state = self.0.lock();
+            match register.offset() {
+                offset if offset == regs::pcode::GEN6_PCODE_DATA.offset() => state.data = value,
+                offset if offset == regs::pcode::GEN6_PCODE_DATA1.offset() => {}
+                offset if offset == regs::pcode::GEN6_PCODE_MAILBOX.offset() => {
+                    if value & intel_pcode_full::GEN6_PCODE_READY != 0 {
+                        let selector = state.data;
+                        state
+                            .requests
+                            .push((value & !intel_pcode_full::GEN6_PCODE_READY, selector));
+                        state.data = match selector {
+                            0 => 0x4433_2211,
+                            1 => 0x8877_6655,
+                            _ => return false,
+                        };
+                        state.mailbox = 0;
+                    } else {
+                        state.mailbox = value;
+                    }
+                }
+                _ => return false,
+            }
+            true
+        }
+    }
+
+    struct NoTime;
+    impl PollTimer for NoTime {
+        fn now_micros(&self) -> u64 {
+            0
+        }
+        fn pause(&self) {}
+    }
+
+    #[test]
+    fn watermark_latency_index_is_sent_as_mailbox_data() {
+        let _context = crate::test_support::scheduler_test_context();
+        let regs = PcodeModel::default();
+        assert_eq!(read_wm_latency(&regs, &NoTime, 0), Ok(0x4433_2211));
+        assert_eq!(read_wm_latency(&regs, &NoTime, 1), Ok(0x8877_6655));
+        assert_eq!(
+            regs.0.lock().requests,
+            [
+                (intel_pcode_full::GEN9_PCODE_READ_MEM_LATENCY, 0),
+                (intel_pcode_full::GEN9_PCODE_READ_MEM_LATENCY, 1),
+            ]
+        );
+    }
 }
