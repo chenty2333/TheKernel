@@ -389,6 +389,13 @@ pub(super) fn avi_words_preserve(frame: RawInfoframe) -> Result<[u32; 8], String
 /// Returning the source-computed TMDS rate also makes the assumption explicit
 /// to the caller (for RGB 8 bpc it equals the pixel clock).
 fn source_hdmi_tmds_clock(mode: &Mode, edid_bytes: &[u8]) -> Option<u32> {
+    let sink_limit_khz = crate::drm::modes::Edid::parse_lossy(edid_bytes)
+        .ok()
+        .and_then(|edid| edid.max_tmds_clock_khz());
+    source_hdmi_tmds_clock_with_limit(mode, sink_limit_khz)
+}
+
+fn source_hdmi_tmds_clock_with_limit(mode: &Mode, sink_limit_khz: Option<u32>) -> Option<u32> {
     use intel_display::intel_hdmi_full::{
         ClockLimits, HdmiMode, HdmiPortClass, OutputFormat, PortPlatform, SinkCapabilities,
         intel_hdmi_compute_clock,
@@ -423,10 +430,7 @@ fn source_hdmi_tmds_clock(mode: &Mode, edid_bytes: &[u8]) -> Option<u32> {
         port: HdmiPortClass::TypeC,
         source_limit_khz: 300_000,
         dp_dual_mode_limit_khz: None,
-        sink_limit_khz: crate::drm::modes::Edid::parse_lossy(edid_bytes)
-            .ok()
-            .and_then(|edid| edid.max_tmds_clock_khz())
-            .and_then(|clock| i32::try_from(clock).ok()),
+        sink_limit_khz: sink_limit_khz.and_then(|clock| i32::try_from(clock).ok()),
         has_hdmi_sink: true,
         respect_downstream_limits: true,
     };
@@ -666,7 +670,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
 
 #[cfg(test)]
 mod tests {
-    use super::source_hdmi_tmds_clock;
+    use super::source_hdmi_tmds_clock_with_limit;
     use crate::drm::modes::{Mode, ModeFlags, TimingSource};
 
     fn mode(clock_khz: u32) -> Mode {
@@ -687,9 +691,26 @@ mod tests {
 
     #[test]
     fn active_tc_hdmi_uses_source_tmds_policy() {
-        assert_eq!(source_hdmi_tmds_clock(&mode(148_500), &[]), Some(148_500));
-        assert_eq!(source_hdmi_tmds_clock(&mode(300_000), &[]), Some(300_000));
-        assert_eq!(source_hdmi_tmds_clock(&mode(300_001), &[]), None);
-        assert_eq!(source_hdmi_tmds_clock(&mode(24_999), &[]), None);
+        assert_eq!(
+            source_hdmi_tmds_clock_with_limit(&mode(148_500), None),
+            Some(148_500)
+        );
+        assert_eq!(
+            source_hdmi_tmds_clock_with_limit(&mode(300_000), None),
+            Some(300_000)
+        );
+        assert_eq!(
+            source_hdmi_tmds_clock_with_limit(&mode(300_001), None),
+            None
+        );
+        assert_eq!(source_hdmi_tmds_clock_with_limit(&mode(24_999), None), None);
+        assert_eq!(
+            source_hdmi_tmds_clock_with_limit(&mode(148_500), Some(100_000)),
+            None
+        );
+        assert_eq!(
+            source_hdmi_tmds_clock_with_limit(&mode(148_500), Some(200_000)),
+            Some(148_500)
+        );
     }
 }
