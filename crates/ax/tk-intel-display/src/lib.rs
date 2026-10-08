@@ -31,6 +31,7 @@ pub mod intel_gmbus_full;
 pub mod intel_hdmi_full;
 pub mod intel_hotplug_full;
 pub mod intel_hotplug_irq_full;
+pub mod intel_vblank_full;
 pub mod opregion;
 pub mod pipe_config;
 pub mod power_domains;
