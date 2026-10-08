@@ -106,6 +106,12 @@ const IFE_PMC_FORCE_MDIX: u16 = 0x0040;
 const IFE_PMC_AUTO_MDIX: u16 = 0x0080;
 const I82577_PHY_STATUS_2: u8 = 26;
 const I82577_PHY_STATUS2_REV_POLARITY: u16 = 0x0400;
+const I82577_PHY_STATUS2_MDIX: u16 = 0x0800;
+const I82577_PHY_STATUS2_SPEED_MASK: u16 = 0x0300;
+const I82577_PHY_STATUS2_SPEED_1000MBPS: u16 = 0x0200;
+const I82577_PHY_DIAG_STATUS: u8 = 31;
+const I82577_DSTATUS_CABLE_LENGTH: u16 = 0x03fc;
+const I82577_DSTATUS_CABLE_LENGTH_SHIFT: u32 = 2;
 const I82577_CFG_REG: u8 = 22;
 const I82577_CFG_ASSERT_CRS_ON_TX: u16 = 1 << 15;
 const I82577_CFG_ENABLE_DOWNSHIFT: u16 = 3 << 10;
@@ -163,6 +169,9 @@ const BM_WUC_ME_WU_BIT: u16 = 1 << 3;
 const BM_WUC_HOST_WU_BIT: u16 = 1 << 4;
 const BM_WUC_ADDRESS_OPCODE: u32 = 0x11;
 const BM_WUC_DATA_OPCODE: u32 = 0x12;
+const HV_INTC_FC_PAGE_START: u32 = 768;
+const I82578_ADDR_REG: u32 = 29;
+const I82577_ADDR_REG: u32 = 16;
 const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
 const KMRNCTRLSTA_OFFSET_SHIFT: u32 = 16;
 const KMRNCTRLSTA_REN: u32 = 0x0020_0000;
@@ -771,12 +780,244 @@ pub fn phy_force_speed_duplex_ife<I: E1000PhyRegisterIo>(
     Ok(())
 }
 
+/// upstream: e1000_phy.c e1000_phy_force_speed_duplex_82577()
+pub fn phy_force_speed_duplex_82577<I, L>(
+    io: &mut I,
+    forced_speed_duplex: u16,
+    wait_to_complete: bool,
+    flow_control: &mut FlowControlMode,
+    mut poll_link: L,
+) -> DevResult
+where
+    I: E1000PhyRegisterIo,
+    L: FnMut(u32, u32) -> DevResult<bool>,
+{
+    let phy_control = io.read_phy_register(PHY_CONTROL)?;
+    let phy_control =
+        phy_force_speed_duplex_setup(io, flow_control, forced_speed_duplex, phy_control)?;
+    io.write_phy_register(PHY_CONTROL, phy_control)?;
+    if wait_to_complete {
+        let _ = poll_link(PHY_FORCE_LIMIT, 100_000)?;
+        let _ = poll_link(PHY_FORCE_LIMIT, 100_000)?;
+    }
+    Ok(())
+}
+
 pub trait E1000PhyMdicOps: E1000RegisterIo {
     fn read_mdic(&mut self, offset: u32) -> DevResult<u16>;
     fn write_mdic(&mut self, offset: u32, data: u16) -> DevResult;
     fn acquire(&mut self) -> DevResult;
     fn release(&mut self);
     fn set_phy_address(&mut self, _address: u8) {}
+
+    fn access_wakeup_page(
+        &mut self,
+        offset: u32,
+        data: Option<u16>,
+        page_set: bool,
+    ) -> DevResult<Option<u16>>
+    where
+        Self: Sized,
+    {
+        access_phy_wakeup_reg_bm(self, offset, data, page_set)
+    }
+
+    fn access_debug_page(
+        &mut self,
+        offset: u32,
+        data: Option<u16>,
+        phy_82578: bool,
+    ) -> DevResult<Option<u16>>
+    where
+        Self: Sized,
+    {
+        access_phy_debug_regs_hv(self, offset, data, phy_82578)
+    }
+}
+
+/// upstream: e1000_phy.c e1000_access_phy_debug_regs_hv()
+pub fn access_phy_debug_regs_hv<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: Option<u16>,
+    phy_82578: bool,
+) -> DevResult<Option<u16>> {
+    let address_reg = if phy_82578 {
+        I82578_ADDR_REG
+    } else {
+        I82577_ADDR_REG
+    };
+    io.set_phy_address(2);
+    io.write_mdic(address_reg, (offset & 0x3f) as u16)?;
+    if let Some(data) = data {
+        io.write_mdic(address_reg + 1, data)?;
+        Ok(None)
+    } else {
+        io.read_mdic(address_reg + 1).map(Some)
+    }
+}
+
+/// upstream: e1000_phy.c e1000_get_phy_addr_for_hv_page()
+pub const fn get_phy_addr_for_hv_page(page: u32) -> u8 {
+    if page >= HV_INTC_FC_PAGE_START { 1 } else { 2 }
+}
+
+/// upstream: e1000_phy.c __e1000_read_phy_reg_hv()
+pub fn read_phy_reg_hv_internal<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    locked: bool,
+    page_set: bool,
+    phy_82578: bool,
+) -> DevResult<u16> {
+    if !locked {
+        io.acquire()?;
+    }
+    let page = offset >> IGP_PAGE_SHIFT;
+    let register = offset & MAX_PHY_REG_ADDRESS;
+    let address = get_phy_addr_for_hv_page(page);
+    io.set_phy_address(address);
+    let result = (|| {
+        if page == BM_WUC_PAGE {
+            return io
+                .access_wakeup_page(offset, None, page_set)?
+                .ok_or(DevError::Io);
+        }
+        if page > 0 && page < HV_INTC_FC_PAGE_START {
+            return io
+                .access_debug_page(offset, None, phy_82578)?
+                .ok_or(DevError::Io);
+        }
+        if !page_set {
+            let page = if page == HV_INTC_FC_PAGE_START {
+                0
+            } else {
+                page
+            };
+            if register > MAX_PHY_MULTI_PAGE_REG {
+                set_page_igp(io, (page << IGP_PAGE_SHIFT) as u16)?;
+                io.set_phy_address(address);
+            }
+        }
+        io.read_mdic(register)
+    })();
+    if !locked {
+        io.release();
+    }
+    result
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_hv()
+pub fn read_phy_reg_hv<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    phy_82578: bool,
+) -> DevResult<u16> {
+    read_phy_reg_hv_internal(io, offset, false, false, phy_82578)
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_hv_locked()
+pub fn read_phy_reg_hv_locked<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    phy_82578: bool,
+) -> DevResult<u16> {
+    read_phy_reg_hv_internal(io, offset, true, false, phy_82578)
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_page_hv()
+pub fn read_phy_reg_page_hv<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    phy_82578: bool,
+) -> DevResult<u16> {
+    read_phy_reg_hv_internal(io, offset, true, true, phy_82578)
+}
+
+/// upstream: e1000_phy.c __e1000_write_phy_reg_hv()
+pub fn write_phy_reg_hv_internal<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    locked: bool,
+    page_set: bool,
+    phy_82578: bool,
+    revision: u8,
+) -> DevResult {
+    if !locked {
+        io.acquire()?;
+    }
+    let page = offset >> IGP_PAGE_SHIFT;
+    let register = offset & MAX_PHY_REG_ADDRESS;
+    let address = get_phy_addr_for_hv_page(page);
+    io.set_phy_address(address);
+    let result = (|| {
+        if page == BM_WUC_PAGE {
+            io.access_wakeup_page(offset, Some(data), page_set)?;
+            return Ok(());
+        }
+        if page > 0 && page < HV_INTC_FC_PAGE_START {
+            io.access_debug_page(offset, Some(data), phy_82578)?;
+            return Ok(());
+        }
+        if !page_set {
+            let page = if page == HV_INTC_FC_PAGE_START {
+                0
+            } else {
+                page
+            };
+            if phy_82578
+                && revision >= 1
+                && address == 2
+                && register == 0
+                && data & MII_CR_POWER_DOWN != 0
+            {
+                io.access_debug_page((1 << 6) | 3, Some(0x7eff), true)?;
+            }
+            if register > MAX_PHY_MULTI_PAGE_REG {
+                set_page_igp(io, (page << IGP_PAGE_SHIFT) as u16)?;
+                io.set_phy_address(address);
+            }
+        }
+        io.write_mdic(register, data)
+    })();
+    if !locked {
+        io.release();
+    }
+    result
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_hv()
+pub fn write_phy_reg_hv<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    phy_82578: bool,
+    revision: u8,
+) -> DevResult {
+    write_phy_reg_hv_internal(io, offset, data, false, false, phy_82578, revision)
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_hv_locked()
+pub fn write_phy_reg_hv_locked<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    phy_82578: bool,
+    revision: u8,
+) -> DevResult {
+    write_phy_reg_hv_internal(io, offset, data, true, false, phy_82578, revision)
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_page_hv()
+pub fn write_phy_reg_page_hv<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    phy_82578: bool,
+    revision: u8,
+) -> DevResult {
+    write_phy_reg_hv_internal(io, offset, data, true, true, phy_82578, revision)
 }
 
 /// upstream: e1000_phy.c e1000_get_phy_addr_for_bm_page()
@@ -1406,6 +1647,59 @@ where
     diagnostics.cable_length = CABLE_LENGTH_UNDEFINED;
     diagnostics.local_rx = ReceiverStatus::Undefined;
     diagnostics.remote_rx = ReceiverStatus::Undefined;
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_get_cable_length_82577()
+pub fn get_cable_length_82577<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult {
+    let status = io.read_phy_register(I82577_PHY_DIAG_STATUS)?;
+    let length = (status & I82577_DSTATUS_CABLE_LENGTH) >> I82577_DSTATUS_CABLE_LENGTH_SHIFT;
+    if length == CABLE_LENGTH_UNDEFINED {
+        return Err(DevError::Io);
+    }
+    diagnostics.cable_length = length;
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_get_phy_info_82577()
+pub fn get_phy_info_82577<I, C>(
+    io: &mut I,
+    link_up: bool,
+    mut get_cable_length: C,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult
+where
+    I: E1000PhyRegisterIo,
+    C: FnMut() -> DevResult,
+{
+    if !link_up {
+        return Err(DevError::InvalidParam);
+    }
+    diagnostics.polarity_correction = true;
+    check_polarity_82577(io, diagnostics)?;
+    let status = io.read_phy_register(I82577_PHY_STATUS_2)?;
+    diagnostics.is_mdix = status & I82577_PHY_STATUS2_MDIX != 0;
+    if status & I82577_PHY_STATUS2_SPEED_MASK == I82577_PHY_STATUS2_SPEED_1000MBPS {
+        get_cable_length()?;
+        let receiver = io.read_phy_register(PHY_1000T_STATUS as u8)?;
+        diagnostics.local_rx = if receiver & SR_1000T_LOCAL_RX_STATUS != 0 {
+            ReceiverStatus::Ok
+        } else {
+            ReceiverStatus::NotOk
+        };
+        diagnostics.remote_rx = if receiver & SR_1000T_REMOTE_RX_STATUS != 0 {
+            ReceiverStatus::Ok
+        } else {
+            ReceiverStatus::NotOk
+        };
+    } else {
+        diagnostics.cable_length = CABLE_LENGTH_UNDEFINED;
+        diagnostics.local_rx = ReceiverStatus::Undefined;
+        diagnostics.remote_rx = ReceiverStatus::Undefined;
+    }
     Ok(())
 }
 
@@ -2606,6 +2900,35 @@ mod tests {
     }
 
     #[test]
+    fn generic_82577_phy_info_and_cable_length_use_diag_status() {
+        let mut io = Io::default();
+        io.phy[I82577_PHY_STATUS_2 as usize] = I82577_PHY_STATUS2_REV_POLARITY
+            | I82577_PHY_STATUS2_MDIX
+            | I82577_PHY_STATUS2_SPEED_1000MBPS;
+        io.phy[PHY_1000T_STATUS as usize] = SR_1000T_LOCAL_RX_STATUS | SR_1000T_REMOTE_RX_STATUS;
+        io.phy[I82577_PHY_DIAG_STATUS as usize] = 37 << I82577_DSTATUS_CABLE_LENGTH_SHIFT;
+        let mut diagnostics = PhyDiagnostics::default();
+        let mut cable = false;
+        get_phy_info_82577(
+            &mut io,
+            true,
+            || {
+                cable = true;
+                Ok(())
+            },
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(cable);
+        assert_eq!(diagnostics.cable_polarity, Some(CablePolarity::Reversed));
+        assert!(diagnostics.is_mdix);
+        get_cable_length_82577(&mut io, &mut diagnostics).unwrap();
+        assert_eq!(diagnostics.cable_length, 37);
+        assert_eq!(diagnostics.local_rx, ReceiverStatus::Ok);
+        assert_eq!(diagnostics.remote_rx, ReceiverStatus::Ok);
+    }
+
+    #[test]
     fn generic_bm_page_access_selects_phy_and_page_and_honors_wakeup_callback() {
         assert_eq!(get_phy_addr_for_bm_page(768, 2), 1);
         assert_eq!(get_phy_addr_for_bm_page(0, 25), 1);
@@ -2687,6 +3010,37 @@ mod tests {
     }
 
     #[test]
+    fn generic_hv_page_access_handles_debug_wakeup_normal_and_power_down_workaround() {
+        assert_eq!(get_phy_addr_for_hv_page(767), 2);
+        assert_eq!(get_phy_addr_for_hv_page(768), 1);
+        let mut io = Io {
+            mdic_data: 0x55aa,
+            ..Io::default()
+        };
+        assert_eq!(
+            read_phy_reg_hv(&mut io, (1 << IGP_PAGE_SHIFT) | 4, false).unwrap(),
+            0x55aa
+        );
+        assert_eq!(io.phy_address, 2);
+        assert_eq!(io.mdic_writes, [(I82577_ADDR_REG, 36)]);
+        assert_eq!(io.mdic_reads, [I82577_ADDR_REG + 1]);
+        assert_eq!((io.locks, io.unlocks), (1, 1));
+
+        io.mdic_writes.clear();
+        assert_eq!(
+            read_phy_reg_page_hv(&mut io, (BM_WUC_PAGE << IGP_PAGE_SHIFT) | 1, false).unwrap(),
+            0x55aa
+        );
+        assert!(io.mdic_writes.contains(&(BM_WUC_ADDRESS_OPCODE, 1)));
+
+        io.mdic_writes.clear();
+        write_phy_reg_hv(&mut io, 0, MII_CR_POWER_DOWN, true, 1).unwrap();
+        assert_eq!(io.mdic_writes[0], (I82578_ADDR_REG, 3));
+        assert_eq!(io.mdic_writes[1], (I82578_ADDR_REG + 1, 0x7eff));
+        assert_eq!(io.mdic_writes[2], (0, MII_CR_POWER_DOWN));
+    }
+
+    #[test]
     fn generic_ife_force_speed_disables_autocrossover_and_rechecks_link() {
         let mut io = Io::default();
         io.phy[PHY_CONTROL as usize] = MII_CR_AUTO_NEG_EN;
@@ -2704,6 +3058,33 @@ mod tests {
             0xffff & !IFE_PMC_AUTO_MDIX & !IFE_PMC_FORCE_MDIX
         );
         assert_eq!(io.delay, 1);
+    }
+
+    #[test]
+    fn generic_82577_forced_speed_retries_bounded_link_poll() {
+        let mut io = Io::default();
+        io.phy[PHY_CONTROL as usize] = MII_CR_AUTO_NEG_EN;
+        let mut flow = FlowControlMode::Full;
+        let mut polls = 0;
+        phy_force_speed_duplex_82577(
+            &mut io,
+            ADVERTISE_10_HALF,
+            true,
+            &mut flow,
+            |iterations, interval| {
+                assert_eq!((iterations, interval), (PHY_FORCE_LIMIT, 100_000));
+                polls += 1;
+                Ok(polls == 2)
+            },
+        )
+        .unwrap();
+        assert_eq!(polls, 2);
+        assert_eq!(flow, FlowControlMode::None);
+        assert!(
+            io.phy_writes.iter().any(
+                |(register, value)| *register == PHY_CONTROL && value & MII_CR_FULL_DUPLEX == 0
+            )
+        );
     }
 
     #[test]
