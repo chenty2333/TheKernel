@@ -8,9 +8,9 @@
 use crate::{
     ApmError, AttachAllocationError, CsrAccess, DeviceFamily, DmaAllocator, DmaError, DmaRegion,
     FirmwareDmaImages, FirmwareImage, HostCommand, InterruptMasks, IwxAttachResources,
-    IwxRegisters, RegisterError, allocate_attach_resources, initialize_firmware_sections,
-    initialize_init_firmware_sections, post_alive as configure_post_alive, send_host_command,
-    start_gen2_context, start_gen3_context,
+    IwxRegisters, PnvmDmaImage, RegisterError, allocate_attach_resources,
+    initialize_firmware_sections, initialize_init_firmware_sections,
+    post_alive as configure_post_alive, send_host_command, start_gen2_context, start_gen3_context,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -41,6 +41,16 @@ pub enum SyncCommandError<E> {
     Timeout,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum PnvmLoadError<E> {
+    Firmware(crate::FirmwareError),
+    Dma(DmaError),
+    Context(crate::ContextError),
+    Register(RegisterError),
+    Wait(E),
+    NotCompleted,
+}
+
 /// Owned state shared by firmware commands, interrupt dispatch, and network datapath.
 pub struct IwxController<B: CsrAccess, A: DmaAllocator> {
     pub registers: IwxRegisters<B>,
@@ -49,6 +59,7 @@ pub struct IwxController<B: CsrAccess, A: DmaAllocator> {
     pub family: DeviceFamily,
     pub interrupt_masks: InterruptMasks,
     pub command_slots: crate::CommandSlots,
+    pub pnvm_dma: Option<PnvmDmaImage<A::Region>>,
     pub generation: u32,
     pub hardware_rfkill: bool,
 }
@@ -71,6 +82,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             family,
             interrupt_masks: InterruptMasks::default(),
             command_slots: crate::CommandSlots::new(0, generation),
+            pnvm_dma: None,
             generation,
             hardware_rfkill: false,
         })
@@ -372,6 +384,67 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         Ok(())
     }
 
+    /// Stage the SKU-matched platform NVM and ring the PNVM doorbell until completion.
+    // upstream: if_iwx.c iwx_load_pnvm() / iwx_ctxt_info_gen3_set_pnvm()
+    pub fn load_pnvm<E>(
+        &mut self,
+        firmware: &FirmwareImage,
+        external_pnvm: Option<&[u8]>,
+        sku_id: [u32; 3],
+        mac_type: u16,
+        rf_type: u16,
+        mut wait_for_complete: impl FnMut(&mut Self, u64) -> Result<bool, E>,
+    ) -> Result<(), PnvmLoadError<E>> {
+        if self.family < DeviceFamily::Ax210 || sku_id == [0; 3] {
+            return Ok(());
+        }
+        let source = firmware.pnvm.as_deref().or(external_pnvm);
+        let staged = if self.pnvm_dma.is_none() {
+            let selected = if let Some(source) = source {
+                crate::select_pnvm(source, sku_id, mac_type, rf_type)
+                    .map_err(PnvmLoadError::Firmware)?
+            } else {
+                None
+            };
+            selected
+                .as_ref()
+                .map(|pnvm| crate::setup_pnvm(&mut self.allocator, pnvm, true))
+                .transpose()
+                .map_err(PnvmLoadError::Dma)?
+        } else {
+            None
+        };
+        let current = staged.as_ref().or(self.pnvm_dma.as_ref());
+        if let Some(pnvm) = current {
+            let scratch = self
+                .resources
+                .prph_scratch
+                .as_mut()
+                .ok_or(PnvmLoadError::Dma(DmaError::RegionTooSmall))?;
+            let mut bytes = alloc::vec::Vec::new();
+            bytes
+                .try_reserve_exact(crate::PRPH_SCRATCH_BYTES)
+                .map_err(|_| PnvmLoadError::Dma(DmaError::AllocationFailed))?;
+            bytes.resize(crate::PRPH_SCRATCH_BYTES, 0);
+            scratch.read_at(0, &mut bytes).map_err(PnvmLoadError::Dma)?;
+            crate::set_gen3_pnvm(&mut bytes, pnvm).map_err(PnvmLoadError::Context)?;
+            scratch.write_at(0, &bytes).map_err(PnvmLoadError::Dma)?;
+        }
+        if staged.is_some() {
+            self.pnvm_dma = staged;
+        }
+        self.registers.nic_lock().map_err(PnvmLoadError::Register)?;
+        let write_result = self.registers.write_umac_prph(0x00a0_5c04, 1 << 20);
+        self.registers.nic_unlock();
+        write_result.map_err(PnvmLoadError::Register)?;
+        let completed = wait_for_complete(self, 2_000_000_000).map_err(PnvmLoadError::Wait)?;
+        if completed {
+            Ok(())
+        } else {
+            Err(PnvmLoadError::NotCompleted)
+        }
+    }
+
     /// Configure the ICT and firmware-versioned TX rate format after ALIVE.
     // upstream: if_iwx.c iwx_post_alive()
     pub fn post_alive(
@@ -396,7 +469,7 @@ mod tests {
     use core::cell::Cell;
 
     use super::*;
-    use crate::{DmaRegion, IoBarrier};
+    use crate::{DmaRegion, IoBarrier, firmware::test_image};
 
     struct Region {
         address: u64,
@@ -448,8 +521,8 @@ mod tests {
         writes: Vec<(u32, u32)>,
     }
     impl CsrAccess for Bus {
-        fn read32(&mut self, _: u32) -> u32 {
-            0
+        fn read32(&mut self, offset: u32) -> u32 {
+            if offset == 0x024 { 1 } else { 0 }
         }
         fn write32(&mut self, offset: u32, value: u32) {
             self.writes.push((offset, value));
@@ -533,5 +606,24 @@ mod tests {
         assert!(completed.response.is_none());
         assert!(completed.external_payload_released);
         assert_eq!(controller.command_slots.queued(), 0);
+    }
+
+    #[test]
+    fn gen3_pnvm_request_waits_for_completion_even_when_no_sku_section_matches() {
+        let allocator = Allocator(Cell::new(0x300000));
+        let mut controller =
+            IwxController::attach(Bus::default(), allocator, DeviceFamily::Ax210, 0x300000, 11)
+                .unwrap();
+        let firmware = FirmwareImage::parse(&test_image(&[])).unwrap();
+        let mut waited = false;
+        controller
+            .load_pnvm(&firmware, None, [1, 2, 3], 0x43, 0x10d, |_, timeout| {
+                assert_eq!(timeout, 2_000_000_000);
+                waited = true;
+                Ok::<_, ()>(true)
+            })
+            .unwrap();
+        assert!(waited);
+        assert!(controller.pnvm_dma.is_none());
     }
 }
