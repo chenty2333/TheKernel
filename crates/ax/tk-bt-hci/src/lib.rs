@@ -125,6 +125,20 @@ pub struct DeviceInfo {
     pub name: [u8; 8],
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Statistics {
+    pub err_rx: u32,
+    pub err_tx: u32,
+    pub cmd_tx: u32,
+    pub evt_rx: u32,
+    pub acl_tx: u32,
+    pub acl_rx: u32,
+    pub sco_tx: u32,
+    pub sco_rx: u32,
+    pub byte_rx: u32,
+    pub byte_tx: u32,
+}
+
 /// Small HCI device/channel owner independent of AF_BLUETOOTH socket plumbing.
 pub struct Adapter<T> {
     transport: T,
@@ -134,6 +148,7 @@ pub struct Adapter<T> {
     raw_users: u16,
     monitor_users: u16,
     monitor: VecDeque<[u8; 272]>,
+    stats: Statistics,
 }
 
 impl<T: UsbTransport> Adapter<T> {
@@ -146,6 +161,7 @@ impl<T: UsbTransport> Adapter<T> {
             raw_users: 0,
             monitor_users: 0,
             monitor: VecDeque::new(),
+            stats: Statistics::default(),
         }
     }
     pub fn index(&self) -> u16 {
@@ -153,6 +169,9 @@ impl<T: UsbTransport> Adapter<T> {
     }
     pub fn is_up(&self) -> bool {
         self.up
+    }
+    pub fn statistics(&self) -> Statistics {
+        self.stats
     }
     pub fn open(&mut self, channel: Channel) -> Result<(), Error> {
         match channel {
@@ -202,12 +221,18 @@ impl<T: UsbTransport> Adapter<T> {
         Packet::parse(kind, bytes)?;
         match kind {
             PacketType::Command => {
+                self.transport.control_command(bytes)?;
                 self.queue_monitor(2, bytes);
-                self.transport.control_command(bytes)
+                self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
+                self.stats.byte_tx = self.stats.byte_tx.saturating_add(bytes.len() as u32);
+                Ok(())
             }
             PacketType::Acl => {
+                self.transport.bulk_acl_out(bytes)?;
                 self.queue_monitor(4, bytes);
-                self.transport.bulk_acl_out(bytes)
+                self.stats.acl_tx = self.stats.acl_tx.saturating_add(1);
+                self.stats.byte_tx = self.stats.byte_tx.saturating_add(bytes.len() as u32);
+                Ok(())
             }
             _ => Err(Error::Unsupported),
         }
@@ -216,6 +241,8 @@ impl<T: UsbTransport> Adapter<T> {
     /// type byte. This bounded queue drops the oldest packet on overflow.
     pub fn receive_event(&mut self, bytes: &[u8]) -> Result<(), Error> {
         Packet::parse(PacketType::Event, bytes)?;
+        self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+        self.stats.byte_rx = self.stats.byte_rx.saturating_add(bytes.len() as u32);
         if self.monitor_users != 0 {
             self.queue_monitor(3, bytes);
         }
@@ -223,6 +250,8 @@ impl<T: UsbTransport> Adapter<T> {
     }
     pub fn receive_acl(&mut self, bytes: &[u8]) -> Result<(), Error> {
         Packet::parse(PacketType::Acl, bytes)?;
+        self.stats.acl_rx = self.stats.acl_rx.saturating_add(1);
+        self.stats.byte_rx = self.stats.byte_rx.saturating_add(bytes.len() as u32);
         if self.monitor_users != 0 {
             self.queue_monitor(5, bytes);
         }
@@ -670,6 +699,16 @@ mod tests {
         a.open(Channel::Monitor).unwrap();
         a.receive_event(&[0x0e, 0]).unwrap();
         assert_eq!(&a.pop_monitor().unwrap()[..2], &3u16.to_le_bytes());
+        assert_eq!(
+            a.statistics(),
+            Statistics {
+                cmd_tx: 1,
+                evt_rx: 2,
+                byte_rx: 4,
+                byte_tx: 4,
+                ..Statistics::default()
+            }
+        );
         a.set_up(false).unwrap();
         assert!(a.transport.stopped);
         assert_eq!(a.transport.commands, 1);

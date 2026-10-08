@@ -285,6 +285,19 @@ impl HciSocket {
             }
             info.flags = if adapter.is_up() { 1 } else { 0 };
             info.device_type = 1; // HCI_USB
+            let stats = adapter.statistics();
+            info.stats = HciDevStats {
+                err_rx: stats.err_rx,
+                err_tx: stats.err_tx,
+                cmd_tx: stats.cmd_tx,
+                evt_rx: stats.evt_rx,
+                acl_tx: stats.acl_tx,
+                acl_rx: stats.acl_rx,
+                sco_tx: stats.sco_tx,
+                sco_rx: stats.sco_rx,
+                byte_rx: stats.byte_rx,
+                byte_tx: stats.byte_tx,
+            };
             Ok(info)
         }
         #[cfg(not(feature = "input"))]

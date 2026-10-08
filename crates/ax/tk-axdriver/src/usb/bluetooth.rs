@@ -104,6 +104,9 @@ impl UsbBluetoothHci {
     pub fn address(&self) -> [u8; 6] {
         self.address
     }
+    pub fn statistics(&self) -> tk_bt_hci::Statistics {
+        self.adapter.statistics()
+    }
     pub fn set_up(&mut self, up: bool) -> Result<(), Error> {
         self.adapter.set_up(up)
     }
