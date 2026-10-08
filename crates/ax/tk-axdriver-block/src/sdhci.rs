@@ -435,7 +435,16 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.set_clock(400_000)?;
         // Use the largest host timeout exponent unless a future platform
         // integration provides the per-card timeout derived from CSD/EXT_CSD.
-        self.io.write8(SDHCI_TIMEOUT_CONTROL as usize, 0x0e);
+        let timeout = if self.quirks
+            & (SDHCI_QUIRK_INCR_TIMEOUT_CONTROL | SDHCI_QUIRK_BROKEN_TIMEOUT_VAL)
+            != 0
+        {
+            0x0f
+        } else {
+            0x0e
+        };
+        self.io
+            .write8(SDHCI_TIMEOUT_CONTROL as usize, timeout as u8);
         self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
         self.io.write32(
             SDHCI_INT_ENABLE as usize,
@@ -540,6 +549,25 @@ impl<I: SdhciIo> SdhciHost<I> {
         Err(SdhciError::Timeout)
     }
 
+    // upstream: sdhci.c sdhci_card_present()
+    fn card_present(&mut self) -> bool {
+        if self.quirks & SDHCI_QUIRK_ALL_SLOTS_NON_REMOVABLE != 0
+            || self.capabilities & SDHCI_SLOTTYPE_MASK == SDHCI_SLOTTYPE_EMBEDDED
+        {
+            return true;
+        }
+        if self.quirks & SDHCI_QUIRK_POLL_CARD_PRESENT != 0 {
+            for _ in 0..self.timeout_polls {
+                if self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_CARD_PRESENT != 0 {
+                    return true;
+                }
+                self.io.delay_us(10);
+            }
+            return false;
+        }
+        self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_CARD_PRESENT != 0
+    }
+
     // upstream: mmc.c mmc_wait_for_app_cmd()
     fn application_command(
         &mut self,
@@ -581,7 +609,6 @@ impl<I: SdhciIo> SdhciHost<I> {
                 Ok(response) => {
                     if command_flags & SDHCI_CMD_RESP_MASK as u16
                         == SDHCI_CMD_RESP_SHORT_BUSY as u16
-                        && self.quirks & SDHCI_QUIRK_WAIT_WHILE_BUSY != 0
                     {
                         self.wait_busy()?;
                     }
@@ -610,7 +637,7 @@ impl<I: SdhciIo> SdhciHost<I> {
         data: Option<&mut [u8]>,
         block_size: usize,
     ) -> Result<SdhciResponse, SdhciError> {
-        if self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_CARD_PRESENT == 0 {
+        if !self.card_present() {
             return Err(SdhciError::NoCard);
         }
         let (transfer, blocks) = if let Some(buffer) = data.as_ref() {
@@ -674,7 +701,11 @@ impl<I: SdhciIo> SdhciHost<I> {
             let mut extra = 0u32;
             for n in 0..4 {
                 let value = self.io.read32(SDHCI_RESPONSE as usize + n * 4);
-                response.0[3 - n] = (value << 8) | extra;
+                response.0[3 - n] = if self.quirks & SDHCI_QUIRK_DONT_SHIFT_RESPONSE != 0 {
+                    value
+                } else {
+                    (value << 8) | extra
+                };
                 extra = value >> 24;
             }
         } else {
@@ -1452,6 +1483,31 @@ mod tests {
             (8 << 8) | SDHCI_CMD_RESP_SHORT as u16
         );
         assert_eq!(host.io_mut().argument, 0x1aa);
+    }
+
+    #[test]
+    fn dont_shift_response_quirk_preserves_raw_r2_register_words() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        io.registers[SDHCI_RESPONSE as usize / 4] = 0x1020_3040;
+        io.registers[SDHCI_RESPONSE as usize / 4 + 1] = 0x5060_7080;
+        io.registers[SDHCI_RESPONSE as usize / 4 + 2] = 0x90a0_b0c0;
+        io.registers[SDHCI_RESPONSE as usize / 4 + 3] = 0xd0e0_f000;
+        let host = SdhciHost::new_with_quirks(
+            io,
+            50 << SDHCI_CLOCK_BASE_SHIFT,
+            0,
+            3,
+            SDHCI_QUIRK_DONT_SHIFT_RESPONSE,
+        );
+        let mut host = host;
+        let response = host
+            .command(SD_CMD_ALL_SEND_CID, 0, SD_R2, None, 0)
+            .unwrap();
+        assert_eq!(
+            response.0,
+            [0xd0e0_f000, 0x90a0_b0c0, 0x5060_7080, 0x1020_3040]
+        );
     }
 
     #[test]

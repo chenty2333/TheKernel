@@ -33,3 +33,9 @@ marker after clean shutdown. The repeatable guest operation is
 this run; the guest does not yet rescan partitions created after boot and the
 current BusyBox image has no `mkfs.ext4`, so guest-side partitioning/formatting
 remains unverified. The QEMU SD-card path does not exercise N305 eMMC.
+
+The generic host also applies the translated response-shift, card-presence,
+reset-order, timeout-control, and per-controller quirk behavior where its PIO
+path has a direct equivalent. The exact PCI ID/quirk table is in
+`tk-axdriver::sdhci`; unsupported DMA-specific quirk actions remain inert because
+this path does not use SDMA/ADMA.
