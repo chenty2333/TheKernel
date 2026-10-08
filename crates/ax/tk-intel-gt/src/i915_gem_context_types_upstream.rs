@@ -19,9 +19,8 @@ use crate::{
     i915_scheduler_types_upstream::I915SchedAttr,
     intel_context_types_upstream::{I915SwFence, IntelContext, intel_wakeref_t},
     intel_context_upstream::{I915AddressSpace, Kref, RcuHead, XArray},
-    intel_engine_cs_upstream::{
-        AtomicT, IntelEngineCs, IntelSseu, ListHead, Mutex, Spinlock, WorkStruct,
-    },
+    intel_engine_cs_upstream::{AtomicT, IntelEngineCs, ListHead, Mutex, Spinlock, WorkStruct},
+    intel_sseu_types_upstream::IntelSseu,
 };
 
 #[repr(C)]

@@ -11,6 +11,7 @@
 use core::ffi::{c_int, c_ulong, c_void};
 
 use crate::{
+    i915_vma_api_upstream::*,
     intel_context_upstream::*,
     intel_engine_cs_upstream::*,
     linux::{
@@ -22,6 +23,7 @@ use crate::{
         i915::{
             HAS_FLAT_CCS, HAS_LLC, INTEL_INFO, IS_DGFX, IS_ELKHARTLAKE, IS_JASPERLAKE, to_i915,
         },
+        iosys_map::IosysMap,
         list::*,
         locks::*,
         memory::*,

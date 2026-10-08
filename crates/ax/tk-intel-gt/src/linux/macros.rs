@@ -227,37 +227,70 @@ macro_rules! RB_ROOT_CACHED {
 }
 
 macro_rules! ENGINE_READ {
-    ($engine:expr, $reg:ident) => {{ intel_uncore_read((*$engine).uncore, $reg((*$engine).mmio_base)) }};
+    ($engine:expr, $reg:expr) => {{
+        $crate::intel_uncore_types_upstream::intel_uncore_read(
+            (*$engine).uncore,
+            ($reg)((*$engine).mmio_base),
+        )
+    }};
 }
 
 macro_rules! ENGINE_READ_FW {
-    ($engine:expr, $reg:ident) => {{ intel_uncore_read_fw((*$engine).uncore, $reg((*$engine).mmio_base)) }};
+    ($engine:expr, $reg:expr) => {{
+        $crate::intel_uncore_types_upstream::intel_uncore_read_fw(
+            (*$engine).uncore,
+            ($reg)((*$engine).mmio_base),
+        )
+    }};
 }
 
 macro_rules! ENGINE_POSTING_READ {
-    ($engine:expr, $reg:ident) => {{ intel_uncore_posting_read_fw((*$engine).uncore, $reg((*$engine).mmio_base)) }};
+    ($engine:expr, $reg:expr) => {{
+        $crate::intel_uncore_types_upstream::intel_uncore_posting_read_fw(
+            (*$engine).uncore,
+            ($reg)((*$engine).mmio_base),
+        )
+    }};
 }
 
 macro_rules! ENGINE_READ64 {
-    ($engine:expr, $lower:ident, $upper:ident) => {{
-        intel_uncore_read64_2x32(
+    ($engine:expr, $lower:expr, $upper:expr) => {{
+        $crate::intel_uncore_types_upstream::intel_uncore_read64_2x32(
             (*$engine).uncore,
-            $lower((*$engine).mmio_base),
-            $upper((*$engine).mmio_base),
+            ($lower)((*$engine).mmio_base),
+            ($upper)((*$engine).mmio_base),
         )
     }};
 }
 
 macro_rules! ENGINE_WRITE {
-    ($engine:expr, $reg:ident, $value:expr) => {{ intel_uncore_write((*$engine).uncore, $reg((*$engine).mmio_base), $value) }};
+    ($engine:expr, $reg:expr, $value:expr) => {{
+        $crate::intel_uncore_types_upstream::intel_uncore_write(
+            (*$engine).uncore,
+            ($reg)((*$engine).mmio_base),
+            $value,
+        )
+    }};
 }
 
 macro_rules! ENGINE_WRITE16 {
-    ($engine:expr, $reg:ident, $value:expr) => {{ intel_uncore_write16((*$engine).uncore, $reg((*$engine).mmio_base), $value) }};
+    ($engine:expr, $reg:expr, $value:expr) => {{
+        $crate::intel_uncore_types_upstream::intel_uncore_write16(
+            (*$engine).uncore,
+            ($reg)((*$engine).mmio_base),
+            $value,
+        )
+    }};
 }
 
 macro_rules! ENGINE_WRITE_FW {
-    ($engine:expr, $reg:ident, $value:expr) => {{ intel_uncore_write_fw((*$engine).uncore, $reg((*$engine).mmio_base), $value) }};
+    ($engine:expr, $reg:expr, $value:expr) => {{
+        $crate::intel_uncore_types_upstream::intel_uncore_write_fw(
+            (*$engine).uncore,
+            ($reg)((*$engine).mmio_base),
+            $value,
+        )
+    }};
 }
 
 macro_rules! for_each_engine_masked {

@@ -121,3 +121,6 @@ const _: [(); 80] = [(); core::mem::offset_of!(I915SchedEngine, default_priolist
 const _: [(); 136] = [(); core::mem::offset_of!(I915SchedEngine, queue)];
 const _: [(); 168] = [(); core::mem::offset_of!(I915SchedEngine, destroy)];
 const _: [(); 208] = [(); core::mem::offset_of!(I915SchedEngine, schedule)];
+
+/// C tag alias used by `i915_priolist_types.h` consumers.
+pub type i915_priolist = I915Priolist;

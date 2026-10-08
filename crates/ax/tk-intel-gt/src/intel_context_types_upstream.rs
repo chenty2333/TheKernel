@@ -25,9 +25,10 @@ use crate::{
         IntelRing, Kref, RcuHead, WaitQueueHead,
     },
     intel_engine_cs_upstream::{
-        AtomicT, DelayedWork, IntelEngineCs, IntelSseu, ListHead, LlistHead, Mutex, RbRoot,
-        Spinlock, WorkStruct,
+        AtomicT, DelayedWork, IntelEngineCs, ListHead, LlistHead, Mutex, RbRoot, Spinlock,
+        WorkStruct,
     },
+    intel_sseu_types_upstream::IntelSseu,
     intel_timeline_types_upstream::IntelTimeline,
 };
 

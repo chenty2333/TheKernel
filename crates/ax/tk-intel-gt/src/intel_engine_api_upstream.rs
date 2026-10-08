@@ -436,7 +436,7 @@ macro_rules! INTEL_HWS_CSB_WRITE_INDEX {
 
 // C entry points declared by intel_engine.h.
 unsafe extern "C" {
-    fn drm_clflush_virt_range(addr: *mut c_void, length: c_ulong);
+    pub fn drm_clflush_virt_range(addr: *mut c_void, length: c_ulong);
     pub fn intel_engine_stop(engine: *mut IntelEngineCs);
     pub fn intel_engine_cleanup(engine: *mut IntelEngineCs);
     pub fn intel_engines_init_mmio(gt: *mut IntelGt) -> i32;

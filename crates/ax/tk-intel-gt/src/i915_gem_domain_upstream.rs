@@ -8,6 +8,10 @@
 use core::ffi::c_void;
 
 use crate::{
+    i915_gem_object_upstream::{
+        i915_gem_object_has_struct_page, i915_gem_object_set_cache_coherency,
+    },
+    i915_vma_api_upstream::*,
     intel_context_upstream::{DrmI915GemObject, I915GemWwCtx, I915GttView, I915Vma},
     linux_config::*,
     linux_i915_private::DrmI915Private,

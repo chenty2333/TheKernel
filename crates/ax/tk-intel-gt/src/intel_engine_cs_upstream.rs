@@ -34,6 +34,7 @@ use crate::{
     intel_breadcrumbs_upstream::intel_engine_print_breadcrumbs,
     intel_context_types_upstream::*,
     intel_context_upstream::*,
+    intel_engine_regs_upstream,
     intel_execlists_submission_upstream::{
         intel_execlists_dump_active_requests, intel_execlists_show_requests,
         intel_execlists_submission_setup,
@@ -57,7 +58,7 @@ use crate::{
         intel_engine_apply_whitelist, intel_engine_apply_workarounds, intel_engine_init_ctx_wa,
         intel_engine_init_whitelist, intel_engine_init_workarounds,
     },
-    linux::i915::HAS_EXECLISTS,
+    linux::i915::{CCS_MASK, HAS_ENGINE, HAS_EXECLISTS, RCS_MASK, VDBOX_MASK, VEBOX_MASK},
     linux_config::*,
     linux_heap::kmem_cache_free,
     linux_list::*,
@@ -720,9 +721,9 @@ pub unsafe fn intel_engine_set_hwsp_writemask(engine: *mut IntelEngineCs, mask: 
     }
 
     if GRAPHICS_VER((*engine).i915) >= 3 {
-        ENGINE_WRITE!(engine, RING_HWSTAM, mask);
+        ENGINE_WRITE!(engine, intel_engine_regs_upstream::RING_HWSTAM, mask);
     } else {
-        ENGINE_WRITE16!(engine, RING_HWSTAM, mask);
+        ENGINE_WRITE16!(engine, intel_engine_regs_upstream::RING_HWSTAM, mask);
     }
 }
 
@@ -1814,9 +1815,13 @@ pub unsafe fn intel_engine_get_active_head(engine: *const IntelEngineCs) -> u64 
     let acthd: u64;
 
     if GRAPHICS_VER(i915) >= 8 {
-        acthd = ENGINE_READ64!(engine, RING_ACTHD, RING_ACTHD_UDW);
+        acthd = ENGINE_READ64!(
+            engine,
+            intel_engine_regs_upstream::RING_ACTHD,
+            intel_engine_regs_upstream::RING_ACTHD_UDW
+        );
     } else if GRAPHICS_VER(i915) >= 4 {
-        acthd = ENGINE_READ!(engine, RING_ACTHD);
+        acthd = ENGINE_READ!(engine, intel_engine_regs_upstream::RING_ACTHD);
     } else {
         acthd = ENGINE_READ!(engine, ACTHD);
     }
@@ -1829,9 +1834,13 @@ pub unsafe fn intel_engine_get_last_batch_head(engine: *const IntelEngineCs) -> 
     let bbaddr: u64;
 
     if GRAPHICS_VER((*engine).i915) >= 8 {
-        bbaddr = ENGINE_READ64!(engine, RING_BBADDR, RING_BBADDR_UDW);
+        bbaddr = ENGINE_READ64!(
+            engine,
+            intel_engine_regs_upstream::RING_BBADDR,
+            intel_engine_regs_upstream::RING_BBADDR_UDW
+        );
     } else {
-        bbaddr = ENGINE_READ!(engine, RING_BBADDR);
+        bbaddr = ENGINE_READ!(engine, intel_engine_regs_upstream::RING_BBADDR);
     }
 
     bbaddr
@@ -1853,16 +1862,20 @@ unsafe fn __intel_engine_stop_cs(
     slow_timeout_ms: i32,
 ) -> i32 {
     let uncore = (*engine).uncore;
-    let mode = RING_MI_MODE((*engine).mmio_base);
+    let mode = intel_engine_regs_upstream::RING_MI_MODE((*engine).mmio_base);
     let mut err: i32;
 
-    intel_uncore_write_fw(uncore, mode, REG_MASKED_FIELD_ENABLE!(STOP_RING));
+    intel_uncore_write_fw(
+        uncore,
+        mode,
+        REG_MASKED_FIELD_ENABLE!(intel_engine_regs_upstream::STOP_RING),
+    );
 
     if intel_engine_reset_needs_wa_22011802037((*engine).gt) {
         intel_uncore_write_fw(
             uncore,
-            RING_MODE_GEN7((*engine).mmio_base),
-            REG_MASKED_FIELD_ENABLE!(GEN12_GFX_PREFETCH_DISABLE),
+            intel_engine_regs_upstream::RING_MODE_GEN7((*engine).mmio_base),
+            REG_MASKED_FIELD_ENABLE!(intel_engine_regs_upstream::GEN12_GFX_PREFETCH_DISABLE),
         );
     }
 
@@ -1892,13 +1905,17 @@ pub unsafe fn intel_engine_stop_cs(engine: *mut IntelEngineCs) -> i32 {
     if __intel_engine_stop_cs(engine, 1000, stop_timeout(engine) as i32) != 0 {
         ENGINE_TRACE!(
             engine,
-            "timed out on STOP_RING -> IDLE; HEAD:%04x, TAIL:%04x\n",
-            ENGINE_READ_FW!(engine, RING_HEAD) & HEAD_ADDR,
-            ENGINE_READ_FW!(engine, RING_TAIL) & TAIL_ADDR,
+            "timed out on intel_engine_regs_upstream::STOP_RING -> IDLE; HEAD:%04x, TAIL:%04x\n",
+            ENGINE_READ_FW!(engine, intel_engine_regs_upstream::RING_HEAD)
+                & intel_engine_regs_upstream::HEAD_ADDR,
+            ENGINE_READ_FW!(engine, intel_engine_regs_upstream::RING_TAIL)
+                & intel_engine_regs_upstream::TAIL_ADDR,
         );
 
-        if (ENGINE_READ_FW!(engine, RING_HEAD) & HEAD_ADDR)
-            != (ENGINE_READ_FW!(engine, RING_TAIL) & TAIL_ADDR)
+        if (ENGINE_READ_FW!(engine, intel_engine_regs_upstream::RING_HEAD)
+            & intel_engine_regs_upstream::HEAD_ADDR)
+            != (ENGINE_READ_FW!(engine, intel_engine_regs_upstream::RING_TAIL)
+                & intel_engine_regs_upstream::TAIL_ADDR)
         {
             err = -ETIMEDOUT;
         }
@@ -1910,7 +1927,11 @@ pub unsafe fn intel_engine_stop_cs(engine: *mut IntelEngineCs) -> i32 {
 // upstream: intel_engine_cs.c intel_engine_cancel_stop_cs()
 pub unsafe fn intel_engine_cancel_stop_cs(engine: *mut IntelEngineCs) {
     ENGINE_TRACE!(engine, "\n");
-    ENGINE_WRITE_FW!(engine, RING_MI_MODE, REG_MASKED_FIELD_DISABLE!(STOP_RING));
+    ENGINE_WRITE_FW!(
+        engine,
+        intel_engine_regs_upstream::RING_MI_MODE,
+        REG_MASKED_FIELD_DISABLE!(intel_engine_regs_upstream::STOP_RING)
+    );
 }
 
 // upstream: intel_engine_cs.c __cs_pending_mi_force_wakes()
@@ -1989,7 +2010,8 @@ pub unsafe fn intel_engine_get_instdone(
     memset(instdone as *mut c_void, 0, size_of::<IntelInstdone>());
 
     if GRAPHICS_VER(i915) >= 8 {
-        (*instdone).instdone = intel_uncore_read(uncore, RING_INSTDONE(mmio_base));
+        (*instdone).instdone =
+            intel_uncore_read(uncore, intel_engine_regs_upstream::RING_INSTDONE(mmio_base));
 
         if (*engine).id != RCS0 {
             return;
@@ -2015,7 +2037,8 @@ pub unsafe fn intel_engine_get_instdone(
             });
         }
     } else if GRAPHICS_VER(i915) >= 7 {
-        (*instdone).instdone = intel_uncore_read(uncore, RING_INSTDONE(mmio_base));
+        (*instdone).instdone =
+            intel_uncore_read(uncore, intel_engine_regs_upstream::RING_INSTDONE(mmio_base));
 
         if (*engine).id != RCS0 {
             return;
@@ -2025,7 +2048,8 @@ pub unsafe fn intel_engine_get_instdone(
         (*instdone).sampler[0][0] = intel_uncore_read(uncore, GEN7_SAMPLER_INSTDONE);
         (*instdone).row[0][0] = intel_uncore_read(uncore, GEN7_ROW_INSTDONE);
     } else if GRAPHICS_VER(i915) >= 4 {
-        (*instdone).instdone = intel_uncore_read(uncore, RING_INSTDONE(mmio_base));
+        (*instdone).instdone =
+            intel_uncore_read(uncore, intel_engine_regs_upstream::RING_INSTDONE(mmio_base));
         if (*engine).id == RCS0 {
             (*instdone).slice_common = intel_uncore_read(uncore, GEN4_INSTDONE1);
         }
@@ -2046,13 +2070,17 @@ unsafe fn ring_is_idle(engine: *mut IntelEngineCs) -> bool {
         return true;
     }
 
-    if (ENGINE_READ!(engine, RING_HEAD) & HEAD_ADDR)
-        != (ENGINE_READ!(engine, RING_TAIL) & TAIL_ADDR)
+    if (ENGINE_READ!(engine, intel_engine_regs_upstream::RING_HEAD)
+        & intel_engine_regs_upstream::HEAD_ADDR)
+        != (ENGINE_READ!(engine, intel_engine_regs_upstream::RING_TAIL)
+            & intel_engine_regs_upstream::TAIL_ADDR)
     {
         idle = false;
     }
 
-    if GRAPHICS_VER((*engine).i915) > 2 && (ENGINE_READ!(engine, RING_MI_MODE) & MODE_IDLE) == 0 {
+    if GRAPHICS_VER((*engine).i915) > 2
+        && (ENGINE_READ!(engine, intel_engine_regs_upstream::RING_MI_MODE) & MODE_IDLE) == 0
+    {
         idle = false;
     }
 
@@ -2284,7 +2312,7 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
         drm_printf!(
             m,
             "\tEL_STAT_HI: 0x%08x\n",
-            ENGINE_READ!(engine, RING_EXECLIST_STATUS_HI),
+            ENGINE_READ!(engine, intel_engine_regs_upstream::RING_EXECLIST_STATUS_HI),
         );
         drm_printf!(
             m,
@@ -2295,23 +2323,29 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
     drm_printf!(
         m,
         "\tRING_START: 0x%08x\n",
-        ENGINE_READ!(engine, RING_START)
+        ENGINE_READ!(engine, intel_engine_regs_upstream::RING_START)
     );
     drm_printf!(
         m,
         "\tRING_HEAD:  0x%08x\n",
-        ENGINE_READ!(engine, RING_HEAD) & HEAD_ADDR
+        ENGINE_READ!(engine, intel_engine_regs_upstream::RING_HEAD)
+            & intel_engine_regs_upstream::HEAD_ADDR
     );
     drm_printf!(
         m,
         "\tRING_TAIL:  0x%08x\n",
-        ENGINE_READ!(engine, RING_TAIL) & TAIL_ADDR
+        ENGINE_READ!(engine, intel_engine_regs_upstream::RING_TAIL)
+            & intel_engine_regs_upstream::TAIL_ADDR
     );
     drm_printf!(
         m,
         "\tRING_CTL:   0x%08x%s\n",
-        ENGINE_READ!(engine, RING_CTL),
-        if ENGINE_READ!(engine, RING_CTL) & (RING_WAIT | RING_WAIT_SEMAPHORE) != 0 {
+        ENGINE_READ!(engine, intel_engine_regs_upstream::RING_CTL),
+        if ENGINE_READ!(engine, intel_engine_regs_upstream::RING_CTL)
+            & (intel_engine_regs_upstream::RING_WAIT
+                | intel_engine_regs_upstream::RING_WAIT_SEMAPHORE)
+            != 0
+        {
             " [waiting]"
         } else {
             ""
@@ -2321,8 +2355,8 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
         drm_printf!(
             m,
             "\tRING_MODE:  0x%08x%s\n",
-            ENGINE_READ!(engine, RING_MI_MODE),
-            if ENGINE_READ!(engine, RING_MI_MODE) & MODE_IDLE != 0 {
+            ENGINE_READ!(engine, intel_engine_regs_upstream::RING_MI_MODE),
+            if ENGINE_READ!(engine, intel_engine_regs_upstream::RING_MI_MODE) & MODE_IDLE != 0 {
                 " [idle]"
             } else {
                 ""
@@ -2331,10 +2365,26 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
     }
 
     if GRAPHICS_VER(i915) >= 6 {
-        drm_printf!(m, "\tRING_IMR:   0x%08x\n", ENGINE_READ!(engine, RING_IMR));
-        drm_printf!(m, "\tRING_ESR:   0x%08x\n", ENGINE_READ!(engine, RING_ESR));
-        drm_printf!(m, "\tRING_EMR:   0x%08x\n", ENGINE_READ!(engine, RING_EMR));
-        drm_printf!(m, "\tRING_EIR:   0x%08x\n", ENGINE_READ!(engine, RING_EIR));
+        drm_printf!(
+            m,
+            "\tRING_IMR:   0x%08x\n",
+            ENGINE_READ!(engine, intel_engine_regs_upstream::RING_IMR)
+        );
+        drm_printf!(
+            m,
+            "\tRING_ESR:   0x%08x\n",
+            ENGINE_READ!(engine, intel_engine_regs_upstream::RING_ESR)
+        );
+        drm_printf!(
+            m,
+            "\tRING_EMR:   0x%08x\n",
+            ENGINE_READ!(engine, intel_engine_regs_upstream::RING_EMR)
+        );
+        drm_printf!(
+            m,
+            "\tRING_EIR:   0x%08x\n",
+            ENGINE_READ!(engine, intel_engine_regs_upstream::RING_EIR)
+        );
     }
 
     addr = intel_engine_get_active_head(engine);
@@ -2352,9 +2402,13 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
         lower_32_bits(addr)
     );
     if GRAPHICS_VER(i915) >= 8 {
-        addr = ENGINE_READ64!(engine, RING_DMA_FADD, RING_DMA_FADD_UDW);
+        addr = ENGINE_READ64!(
+            engine,
+            intel_engine_regs_upstream::RING_DMA_FADD,
+            intel_engine_regs_upstream::RING_DMA_FADD_UDW
+        );
     } else if GRAPHICS_VER(i915) >= 4 {
-        addr = ENGINE_READ!(engine, RING_DMA_FADD);
+        addr = ENGINE_READ!(engine, intel_engine_regs_upstream::RING_DMA_FADD);
     } else {
         addr = ENGINE_READ!(engine, DMA_FADD_I8XX);
     }
@@ -2365,8 +2419,16 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
         lower_32_bits(addr)
     );
     if GRAPHICS_VER(i915) >= 4 {
-        drm_printf!(m, "\tIPEIR: 0x%08x\n", ENGINE_READ!(engine, RING_IPEIR));
-        drm_printf!(m, "\tIPEHR: 0x%08x\n", ENGINE_READ!(engine, RING_IPEHR));
+        drm_printf!(
+            m,
+            "\tIPEIR: 0x%08x\n",
+            ENGINE_READ!(engine, intel_engine_regs_upstream::RING_IPEIR)
+        );
+        drm_printf!(
+            m,
+            "\tIPEHR: 0x%08x\n",
+            ENGINE_READ!(engine, intel_engine_regs_upstream::RING_IPEHR)
+        );
     } else {
         drm_printf!(m, "\tIPEIR: 0x%08x\n", ENGINE_READ!(engine, IPEIR));
         drm_printf!(m, "\tIPEHR: 0x%08x\n", ENGINE_READ!(engine, IPEHR));
@@ -2400,7 +2462,7 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
             m,
             "\tExeclist status: 0x%08x %08x; CSB read:%d, write:%d, entries:%d\n",
             ENGINE_READ!(engine, RING_EXECLIST_STATUS_LO),
-            ENGINE_READ!(engine, RING_EXECLIST_STATUS_HI),
+            ENGINE_READ!(engine, intel_engine_regs_upstream::RING_EXECLIST_STATUS_HI),
             read,
             write,
             num_entries,

@@ -145,6 +145,11 @@ pub enum I915RequestState {
     Queued   = 3,
     Active   = 4,
 }
+pub const I915_REQUEST_UNKNOWN: I915RequestState = I915RequestState::Unknown;
+pub const I915_REQUEST_COMPLETE: I915RequestState = I915RequestState::Complete;
+pub const I915_REQUEST_PENDING: I915RequestState = I915RequestState::Pending;
+pub const I915_REQUEST_QUEUED: I915RequestState = I915RequestState::Queued;
+pub const I915_REQUEST_ACTIVE: I915RequestState = I915RequestState::Active;
 
 // Layout assertions for the configured Linux 7.2.3 x86_64 target. The target
 // has 64-bit long/pointers, lockdep disabled (zero-sized pin_cookie), capture

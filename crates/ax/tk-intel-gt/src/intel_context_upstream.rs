@@ -13,23 +13,28 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
-pub use crate::i915_vma_resource_types_upstream::{I915PageSizes, I915VmaResource};
 use crate::{
     i915_gem_context_types_upstream::I915GemContext,
     i915_request_types_upstream::*,
     i915_scheduler_types_upstream::{
         I915Dependency, I915Priolist, I915SchedAttr, I915SchedEngine, I915SchedNode, TaskletStruct,
     },
+    i915_vma_api_upstream::*,
     intel_context_types_upstream::*,
+    intel_sseu_types_upstream::IntelSseu,
     intel_timeline_types_upstream::{I915Syncmap, IntelTimeline},
+};
+pub use crate::{
+    i915_vma_resource_types_upstream::{I915PageSizes, I915VmaResource},
+    i915_vma_types_upstream::I915Vma,
 };
 pub type IntelWakerefHandle = crate::intel_context_types_upstream::IntelWakerefT;
 pub type RefTracker = IntelRefTracker;
 use crate::{
     guc_submission::GUC_INVALID_CONTEXT_ID,
     intel_engine_cs_upstream::{
-        AtomicT, DelayedWork, IntelSseu, ListHead, LlistHead, LlistNode, Mutex, RbNode, RbRoot,
-        RbRootCached, Spinlock, WorkStruct,
+        AtomicT, DelayedWork, ListHead, LlistHead, LlistNode, Mutex, RbNode, RbRoot, RbRootCached,
+        Spinlock, WorkStruct,
     },
     intel_engine_types_upstream::IntelEngineCs,
     intel_gt_types_upstream::IntelGt,
@@ -260,36 +265,6 @@ pub struct DrmVmaOffsetNode {
     _opaque: [u8; 192],
 }
 const _: [(); 192] = [(); core::mem::size_of::<DrmVmaOffsetNode>()];
-#[repr(C)]
-pub struct I915Vma {
-    pub node: DrmMmNode,
-    pub vm: *mut I915AddressSpace,
-    pub ops: *const I915VmaOps,
-    pub obj: *mut DrmI915GemObject,
-    pub pages: *mut SgTable,
-    pub iomap: *mut c_void,
-    pub private: *mut c_void,
-    pub fence: *mut I915FenceReg,
-    pub size: u64,
-    pub page_sizes: I915PageSizes,
-    pub mmo: *mut I915MmapOffset,
-    pub guard: u32,
-    pub fence_size: u32,
-    pub fence_alignment: u32,
-    pub display_alignment: u32,
-    pub open_count: AtomicT,
-    pub flags: AtomicT,
-    pub active: I915Active,
-    pub pages_count: AtomicT,
-    pub vm_ddestroy: bool,
-    pub gtt_view: I915GttView,
-    pub vm_link: ListHead,
-    pub obj_link: ListHead,
-    pub obj_node: RbNode,
-    pub evict_link: ListHead,
-    pub closed_link: ListHead,
-    pub resource: *mut I915VmaResource,
-}
 
 #[repr(C)]
 pub struct IntelRing {
@@ -481,15 +456,6 @@ const _: [(); 168] = [(); core::mem::size_of::<DrmMmNode>()];
 const _: [(); 8] = [(); core::mem::align_of::<DrmMmNode>()];
 const _: [(); 56] = [(); core::mem::size_of::<I915GttView>()];
 const _: [(); 8] = [(); core::mem::align_of::<I915GttView>()];
-const _: [(); 584] = [(); core::mem::size_of::<I915Vma>()];
-const _: [(); 8] = [(); core::mem::align_of::<I915Vma>()];
-const _: [(); 168] = [(); core::mem::offset_of!(I915Vma, vm)];
-const _: [(); 184] = [(); core::mem::offset_of!(I915Vma, obj)];
-const _: [(); 272] = [(); core::mem::offset_of!(I915Vma, active)];
-const _: [(); 432] = [(); core::mem::offset_of!(I915Vma, gtt_view)];
-const _: [(); 488] = [(); core::mem::offset_of!(I915Vma, vm_link)];
-const _: [(); 520] = [(); core::mem::offset_of!(I915Vma, obj_node)];
-const _: [(); 576] = [(); core::mem::offset_of!(I915Vma, resource)];
 const _: [(); 56] = [(); core::mem::size_of::<IntelRing>()];
 const _: [(); 8] = [(); core::mem::align_of::<IntelRing>()];
 const _: [(); 8] = [(); core::mem::offset_of!(IntelRing, vma)];

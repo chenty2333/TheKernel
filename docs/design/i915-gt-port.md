@@ -78,3 +78,7 @@ Latest owner-header integration update: the `intel_uncore.h` record/runtime MMIO
 ### Owner-header/API integration progress (2026-10-09)
 
 The canonical owner-header split now includes the source-order `intel_gt.h` API binding and the separate `intel_gt_defines.h` constant owner. Engine C translation imports several previously missing declarations from their owning uncore, SSEU, GuC submission, GEM object, ring, workarounds, execlists, and breadcrumbs modules rather than changing their C behavior. The feature-gated upstream crate remains compile-incomplete (latest check: 2,011 errors) and default-off; the ordinary crate suite passes. A full `i915_request.c` translation and `i915_vma.h` owner binding are in progress. These are compile/translation artifacts, not hardware evidence or complete submission/GEM functionality.
+
+### VMA owner integration progress (2026-10-09)
+
+Added and registered the MIT `i915_vma_types.h` layout/constants and `i915_vma.h` API binding, and removed the duplicate context-source `I915Vma` record so that the older translation re-exports the canonical owner. GEM/context/GuC callsites now import the VMA API owner for available helpers. The opt-in build remains incomplete at 1,935 errors; default crate tests (110 unit + 6 enabled integration) and package formatting check pass. DRM MM/GTT-view/fence framework members and VMA lifecycle APIs remain incomplete.

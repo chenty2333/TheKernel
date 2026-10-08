@@ -21,18 +21,21 @@ use crate::{
     },
     i915_request_types_upstream::{
         DrmI915GemObject as drm_i915_gem_object, I915Request as i915_request,
+        i915_request_notify_execute_cb_imm, i915_test_request_state,
     },
-    i915_scheduler_types_upstream::I915SchedEngine as i915_sched_engine,
+    i915_scheduler_types_upstream::{I915SchedEngine as i915_sched_engine, i915_priolist},
+    i915_vma_api_upstream::*,
     intel_breadcrumbs_types_upstream::intel_breadcrumbs,
     intel_context_types_upstream::{
         COPS_RUNTIME_CYCLES, I915SwFence as i915_sw_fence, IntelContext as intel_context,
-        IntelContextOps, IrqWork as irq_work, *,
+        IntelContextOps, *,
     },
     intel_context_upstream::{
-        I915GemWwCtx as i915_gem_ww_ctx, I915Vma as i915_vma, Kref as kref,
+        I915GemWwCtx as i915_gem_ww_ctx, I915Vma as i915_vma, IrqWork as irq_work, Kref as kref,
         TaskletStruct as tasklet_struct, WaitQueueEntry as wait_queue_entry,
-        WaitQueueHead as wait_queue_head, intel_context_bind_parent_child,
+        WaitQueueHead as wait_queue_head, intel_context_bind_parent_child, intel_context_init,
     },
+    intel_engine_api_upstream::{drm_clflush_virt_range, intel_engine_dump_active_requests},
     intel_engine_cs_upstream::{
         ALL_ENGINES, AtomicT as atomic_t, COMPUTE_CLASS, DelayedWork as delayed_work,
         I915_NUM_ENGINES, ListHead as list_head, LlistHead as llist_head, LlistNode as llist_node,
@@ -42,6 +45,7 @@ use crate::{
         IntelEngineCs as intel_engine_cs, IntelEngineId as intel_engine_id_t,
         IntelEngineMask as intel_engine_mask_t, RENDER_CLASS, VIRTUAL_ENGINES,
     },
+    intel_gt_api_upstream::guc_to_i915,
     intel_gt_types_upstream::IntelGt as intel_gt,
     intel_guc_ct_types_upstream::{
         IntelGucCt, IntelGucCtBuffer, IntelGucCtBuffers, IntelGucCtRequests,
@@ -51,11 +55,15 @@ use crate::{
     intel_guc_submission_types_upstream::intel_guc_submission_is_supported,
     intel_guc_types_upstream::{
         IntelGuc, IntelGucInterrupts, IntelGucSendRegs, IntelGucSubmissionState, IntelGucTimestamp,
-        IntelGucTlbWait as intel_guc_tlb_wait,
+        IntelGucTlbWait as intel_guc_tlb_wait, intel_guc_is_fw_running, intel_guc_is_supported,
     },
+    intel_ring::intel_ring_begin,
     intel_timeline_types_upstream::IntelTimeline,
     intel_uc_fw_types_upstream::{IntelUcFw as IntelUcFwLayout, IntelUcFwVersion as IntelUcFwVer},
     intel_uc_types_upstream::{IntelUc as intel_uc, intel_uc_uses_guc_submission},
+    intel_uncore_types_upstream::{
+        assert_forcewakes_active, intel_uncore_read, intel_uncore_read64_2x32, intel_uncore_write,
+    },
     intel_workarounds_types_upstream::I915RegT as i915_reg_t,
     linux::{
         idr::{Ida, ida_alloc_range, ida_free, ida_init},

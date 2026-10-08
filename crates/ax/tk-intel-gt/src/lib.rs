@@ -117,7 +117,13 @@ pub mod i915_request_types_upstream;
 pub mod i915_scheduler_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_vma_api_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_vma_resource_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod i915_vma_types_upstream;
 pub mod info;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
@@ -206,9 +212,6 @@ pub mod intel_lrc_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_migrate_types_upstream;
-#[cfg(feature = "upstream-gt")]
-#[allow(unsafe_code)]
-pub mod intel_migrate_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
 pub mod intel_migrate_upstream;

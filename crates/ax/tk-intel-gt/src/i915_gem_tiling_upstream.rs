@@ -11,6 +11,7 @@
 use core::ffi::c_void;
 
 use crate::{
+    i915_vma_api_upstream::*,
     intel_context_upstream::{DrmI915GemObject, I915Vma},
     intel_engine_cs_upstream::ListHead,
     linux::{bits::IS_ALIGNED, i915::GRAPHICS_VER},
