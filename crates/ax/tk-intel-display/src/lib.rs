@@ -25,6 +25,7 @@ pub mod hdmi_packet;
 pub mod intel_bios;
 pub mod intel_dp_link_training_full;
 pub mod intel_gmbus_full;
+pub mod intel_hotplug_full;
 pub mod opregion;
 pub mod pipe_config;
 pub mod power_domains;

@@ -685,3 +685,7 @@ Copyright © 2008-2015 Intel). Its grant is included in `LICENSE-MIT`.
 `tk-intel-display/src/intel_gmbus_full.rs` translates 30 protocol and GPIO
 functions from `intel_gmbus.c` (MIT, © 2006 Dave Airlie and © 2006-2008,
 2010 Intel). The full grant is preserved in the module header and `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_hotplug_full.rs` translates 37 HPD policy and
+workqueue functions from `intel_hotplug.c` (MIT, © 2015 Intel); its module
+header preserves the complete grant.
