@@ -2,7 +2,7 @@
 //! `ng_ubt.c` (BSD-2-Clause, rev 1.16), with netgraph node management omitted.
 //! Copyright (c) 2001-2009 Maksim Yevmenkin <m_evmenkin@yahoo.com>
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 
 use axdriver_base::{DevError, DevResult};
 use axpoll::PollSet;
@@ -22,10 +22,11 @@ use super::*;
 const MAX_INTEL_FIRMWARE: usize = 16 * 1024 * 1024;
 const MGMT_SETTING_POWERED: u32 = 1 << 0;
 const MGMT_SETTING_CONNECTABLE: u32 = 1 << 1;
-const MGMT_SETTING_DISCOVERABLE: u32 = 1 << 2;
-const MGMT_SETTING_BONDABLE: u32 = 1 << 3;
-const MGMT_SETTING_SSP: u32 = 1 << 4;
+const MGMT_SETTING_DISCOVERABLE: u32 = 1 << 3;
+const MGMT_SETTING_BONDABLE: u32 = 1 << 4;
+const MGMT_SETTING_SSP: u32 = 1 << 6;
 const MGMT_SETTING_LE: u32 = 1 << 9;
+const MGMT_SETTING_BREDR: u32 = 1 << 7;
 static FIRMWARE_CALLBACK_REGISTERED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -36,6 +37,12 @@ pub struct UsbBluetoothHci {
     capabilities: tk_bt_hci::HciCapabilities,
     management_settings: u32,
     discovery_type: u8,
+    link_keys: Vec<[u8; 25]>,
+    long_term_keys: Vec<[u8; 36]>,
+    irks: Vec<[u8; 23]>,
+    connections: Vec<([u8; 6], u8, u16)>,
+    recently_disconnected: VecDeque<(u16, [u8; 6], u8)>,
+    management_events: VecDeque<Vec<u8>>,
     receive_readiness: Arc<PollSet<32>>,
 }
 
@@ -210,6 +217,12 @@ impl UsbBluetoothHci {
             capabilities: tk_bt_hci::HciCapabilities::default(),
             management_settings: 0,
             discovery_type: 0,
+            link_keys: Vec::new(),
+            long_term_keys: Vec::new(),
+            irks: Vec::new(),
+            connections: Vec::new(),
+            recently_disconnected: VecDeque::new(),
+            management_events: VecDeque::new(),
             receive_readiness: Arc::new(PollSet::new()),
         })
     }
@@ -236,7 +249,18 @@ impl UsbBluetoothHci {
         }
     }
     pub fn pump_receive(&mut self) -> Result<bool, Error> {
-        self.adapter.pump_receive()
+        let received = self.adapter.pump_receive()?;
+        while let Some(event) = self.adapter.pop_observed_event() {
+            self.observe_hci_event(&event);
+            if self.management_events.len() == 64 {
+                self.management_events.pop_front();
+            }
+            self.management_events.push_back(event);
+        }
+        Ok(received)
+    }
+    pub fn pop_management_event(&mut self) -> Option<Vec<u8>> {
+        self.management_events.pop_front()
     }
     pub fn statistics(&self) -> tk_bt_hci::Statistics {
         self.adapter.statistics()
@@ -283,10 +307,156 @@ impl UsbBluetoothHci {
             return Err(error);
         }
         self.management_settings |= MGMT_SETTING_POWERED;
+        if self.family_hint != tk_bt_hci::DeviceFamily::Unknown {
+            self.management_settings |= MGMT_SETTING_BREDR | MGMT_SETTING_LE;
+        }
         Ok(())
     }
     pub fn management_settings(&self) -> u32 {
         self.management_settings
+    }
+    /// Replace the host key database from a Linux mgmt LOAD_* command.
+    /// The wire records are validated by the socket layer before this method.
+    pub fn management_load_keys(&mut self, opcode: u16, parameters: &[u8]) -> Result<(), Error> {
+        match opcode {
+            0x0012 => {
+                if parameters.len() < 3 || parameters[0] > 1 {
+                    return Err(Error::InvalidLength);
+                }
+                let count = usize::from(u16::from_le_bytes([parameters[1], parameters[2]]));
+                if count.checked_mul(25).and_then(|v| v.checked_add(3)) != Some(parameters.len()) {
+                    return Err(Error::InvalidLength);
+                }
+                self.link_keys.clear();
+                self.link_keys
+                    .try_reserve(count)
+                    .map_err(|_| Error::NoMemory)?;
+                for record in parameters[3..].chunks_exact(25) {
+                    let mut key = [0; 25];
+                    key.copy_from_slice(record);
+                    self.link_keys.push(key);
+                }
+            }
+            0x0013 => {
+                if parameters.len() < 2 {
+                    return Err(Error::InvalidLength);
+                }
+                let count = usize::from(u16::from_le_bytes([parameters[0], parameters[1]]));
+                if count.checked_mul(36).and_then(|v| v.checked_add(2)) != Some(parameters.len()) {
+                    return Err(Error::InvalidLength);
+                }
+                self.long_term_keys.clear();
+                self.long_term_keys
+                    .try_reserve(count)
+                    .map_err(|_| Error::NoMemory)?;
+                for record in parameters[2..].chunks_exact(36) {
+                    let mut key = [0; 36];
+                    key.copy_from_slice(record);
+                    self.long_term_keys.push(key);
+                }
+            }
+            0x0030 => {
+                if parameters.len() < 2 {
+                    return Err(Error::InvalidLength);
+                }
+                let count = usize::from(u16::from_le_bytes([parameters[0], parameters[1]]));
+                if count.checked_mul(23).and_then(|v| v.checked_add(2)) != Some(parameters.len()) {
+                    return Err(Error::InvalidLength);
+                }
+                self.irks.clear();
+                self.irks.try_reserve(count).map_err(|_| Error::NoMemory)?;
+                for record in parameters[2..].chunks_exact(23) {
+                    let mut key = [0; 23];
+                    key.copy_from_slice(record);
+                    self.irks.push(key);
+                }
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        Ok(())
+    }
+    pub fn management_pair_device(
+        &mut self,
+        address: [u8; 6],
+        address_type: u8,
+        _io_capability: u8,
+    ) -> Result<(), Error> {
+        if !self.adapter.is_up() {
+            return Err(Error::NotUp);
+        }
+        let mut command = [0u8; 28];
+        let length = match address_type {
+            0 if self.management_settings & MGMT_SETTING_BREDR != 0 => {
+                command[..2].copy_from_slice(&0x0405u16.to_le_bytes());
+                command[2] = 13;
+                command[3..9].copy_from_slice(&address);
+                command[9..11].copy_from_slice(&0xcc18u16.to_le_bytes());
+                command[11] = 1; // page scan repetition mode
+                command[13..15].copy_from_slice(&0u16.to_le_bytes());
+                command[15] = 1; // allow role switch
+                16
+            }
+            1 | 2 if self.management_settings & MGMT_SETTING_LE != 0 => {
+                command[..2].copy_from_slice(&0x200du16.to_le_bytes());
+                command[2] = 25;
+                command[3..5].copy_from_slice(&0x0060u16.to_le_bytes());
+                command[5..7].copy_from_slice(&0x0030u16.to_le_bytes());
+                command[7] = 0; // peer address filter policy
+                command[8] = address_type - 1;
+                command[9..15].copy_from_slice(&address);
+                command[15] = 0; // public own address
+                command[16..18].copy_from_slice(&0x0018u16.to_le_bytes());
+                command[18..20].copy_from_slice(&0x0028u16.to_le_bytes());
+                command[22..24].copy_from_slice(&0x01f4u16.to_le_bytes());
+                28
+            }
+            0..=2 => return Err(Error::Unsupported),
+            _ => return Err(Error::InvalidLength),
+        };
+        self.command_status(&command[..length])
+    }
+    pub fn management_disconnect(
+        &mut self,
+        address: [u8; 6],
+        address_type: u8,
+    ) -> Result<(), Error> {
+        if !self.adapter.is_up() {
+            return Err(Error::NotUp);
+        }
+        let Some((_, _, handle)) = self
+            .connections
+            .iter()
+            .find(|(peer, kind, _)| *peer == address && *kind == address_type)
+            .copied()
+        else {
+            return Err(Error::Unsupported);
+        };
+        let mut command = [0u8; 6];
+        command[..2].copy_from_slice(&0x0406u16.to_le_bytes());
+        command[2] = 3;
+        command[3..5].copy_from_slice(&handle.to_le_bytes());
+        command[5] = 0x13; // Remote User Terminated Connection
+        self.command_status(&command)
+    }
+    pub fn management_peer_for_handle(&self, handle: u16) -> Option<([u8; 6], u8)> {
+        self.connections
+            .iter()
+            .find(|(_, _, connection)| *connection == handle)
+            .map(|(address, kind, _)| (*address, *kind))
+            .or_else(|| {
+                self.recently_disconnected
+                    .iter()
+                    .find(|(connection, ..)| *connection == handle)
+                    .map(|(_, address, kind)| (*address, *kind))
+            })
+    }
+    pub fn take_management_peer_for_handle(&mut self, handle: u16) -> Option<([u8; 6], u8)> {
+        let index = self
+            .recently_disconnected
+            .iter()
+            .position(|(connection, ..)| *connection == handle)?;
+        let (_, address, kind) = self.recently_disconnected.remove(index)?;
+        Some((address, kind))
     }
     pub fn management_reset(&mut self) -> Result<(), Error> {
         if !self.adapter.is_up() {
@@ -332,6 +502,9 @@ impl UsbBluetoothHci {
                 };
             }
             if discovery_type == 1 {
+                if self.management_settings & MGMT_SETTING_BREDR == 0 {
+                    return Err(Error::Unsupported);
+                }
                 let command = [0x01, 0x04, 5, 0x33, 0x8b, 0x9e, 8, 0];
                 self.command_status(&command)?;
             } else {
@@ -356,7 +529,7 @@ impl UsbBluetoothHci {
     /// Host-only Bondable state is maintained here; scan flags, SSP, and LE
     /// are not published until the matching HCI Command Complete succeeds.
     pub fn set_management_setting(&mut self, setting: u32, enabled: bool) -> Result<u32, Error> {
-        if !self.adapter.is_up() {
+        if !self.adapter.is_up() && setting != MGMT_SETTING_BREDR {
             return Err(Error::NotUp);
         }
         let mut next = self.management_settings;
@@ -405,6 +578,13 @@ impl UsbBluetoothHci {
                     next |= setting
                 } else {
                     next &= !setting
+                }
+            }
+            MGMT_SETTING_BREDR => {
+                if enabled {
+                    next |= setting
+                } else {
+                    next &= !setting;
                 }
             }
             MGMT_SETTING_BONDABLE => {
@@ -548,6 +728,9 @@ impl UsbBluetoothHci {
             return Err(Error::InvalidLength);
         }
         let (kind, length) = self.adapter.receive_packet(&mut out[1..], nonblocking)?;
+        if kind == tk_bt_hci::PacketType::Event {
+            self.observe_hci_event(&out[1..1 + length]);
+        }
         if channel == 2 {
             let frame = self.adapter.pop_monitor().ok_or(Error::Again)?;
             if frame.len() > out.len() {
@@ -562,6 +745,59 @@ impl UsbBluetoothHci {
             _ => return Err(Error::Unsupported),
         };
         Ok(length + 1)
+    }
+    fn observe_hci_event(&mut self, event: &[u8]) {
+        if event.len() < 2 || event.len() != usize::from(event[1]) + 2 {
+            return;
+        }
+        match event[0] {
+            0x03 if event.len() >= 11 => {
+                let status = event[2];
+                let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
+                let mut address = [0; 6];
+                address.copy_from_slice(&event[5..11]);
+                self.update_connection(address, 0, handle, status == 0);
+            }
+            0x3e if event.len() >= 14 && event[2] == 0x01 => {
+                let status = event[3];
+                let handle = u16::from_le_bytes([event[4], event[5]]) & 0x0fff;
+                let kind = match event[7] {
+                    0 => 1,
+                    1 => 2,
+                    _ => return,
+                };
+                let mut address = [0; 6];
+                address.copy_from_slice(&event[8..14]);
+                self.update_connection(address, kind, handle, status == 0);
+            }
+            0x05 if event.len() >= 6 => {
+                let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
+                let peer = self.management_peer_for_handle(handle);
+                self.connections
+                    .retain(|(_, _, connected)| *connected != handle);
+                if let Some((address, kind)) = peer {
+                    if self.recently_disconnected.len() == 64 {
+                        self.recently_disconnected.pop_front();
+                    }
+                    self.recently_disconnected
+                        .push_back((handle, address, kind));
+                }
+            }
+            _ => {}
+        }
+    }
+    fn update_connection(
+        &mut self,
+        address: [u8; 6],
+        address_type: u8,
+        handle: u16,
+        connected: bool,
+    ) {
+        self.connections
+            .retain(|(peer, kind, _)| *peer != address || *kind != address_type);
+        if connected {
+            self.connections.push((address, address_type, handle));
+        }
     }
     pub fn submit(
         &mut self,

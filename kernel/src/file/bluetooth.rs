@@ -55,6 +55,7 @@ fn map_transport_error(error: axdriver::BluetoothError) -> AxError {
             AxError::InvalidInput
         }
         axdriver::BluetoothError::Unsupported => LinuxError::EOPNOTSUPP.into(),
+        axdriver::BluetoothError::NoMemory => AxError::NoMemory,
     }
 }
 
@@ -214,14 +215,46 @@ mod tests {
     #[test]
     fn management_commands_advertise_only_supported_operations() {
         let commands = management_response(&[2, 0, 0xff, 0xff, 0, 0]).unwrap();
-        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 10);
-        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 2);
-        assert_eq!(commands.len(), 9 + 4 + 2 * 12);
+        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 16);
+        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 7);
+        assert_eq!(commands.len(), 9 + 4 + 2 * 23);
         assert_eq!(
-            &commands[13..37],
+            &commands[13..59],
             &[
-                3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 0x23, 0, 0x24, 0, 6, 0, 0x13, 0,
+                3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 18, 0, 19, 0, 20, 0, 25, 0, 35,
+                0, 36, 0, 42, 0, 48, 0, 6, 0, 9, 0, 0x0b, 0, 0x0c, 0, 0x11, 0, 0x13, 0,
             ]
+        );
+    }
+
+    #[test]
+    fn management_key_load_records_are_length_and_field_checked() {
+        let mut link_keys = alloc::vec![0u8; 28];
+        link_keys[1] = 1;
+        link_keys[3 + 24] = 16;
+        assert!(valid_load_link_keys(&link_keys));
+        link_keys[3 + 6] = 3;
+        assert!(!valid_load_link_keys(&link_keys));
+
+        let mut ltks = alloc::vec![0u8; 38];
+        ltks[0] = 1;
+        ltks[2 + 9] = 16;
+        assert!(valid_load_long_term_keys(&ltks));
+        ltks[2 + 9] = 6;
+        assert!(!valid_load_long_term_keys(&ltks));
+
+        let mut irks = alloc::vec![0u8; 25];
+        irks[0] = 1;
+        assert!(valid_load_irks(&irks));
+        irks[8] = 3;
+        assert!(!valid_load_irks(&irks));
+    }
+
+    #[test]
+    fn management_event_header_uses_little_endian_lengths() {
+        assert_eq!(
+            mgmt_event_packet(0x1234, 2, &[1, 2]).unwrap(),
+            [0x34, 0x12, 2, 0, 2, 0, 1, 2]
         );
     }
 
@@ -239,6 +272,7 @@ mod tests {
             &[9, 0, 0, 0, 1, 0, 1],                         // SET_BONDABLE
             &[11, 0, 0, 0, 1, 0, 1],                        // SET_SSP
             &[13, 0, 0, 0, 1, 0, 1],                        // SET_LE
+            &[0x2a, 0, 0, 0, 1, 0, 1],                      // SET_BREDR
             &[18, 0, 0, 0, 3, 0, 0, 0, 0],                  // LOAD_LINK_KEYS, empty set
             &[19, 0, 0, 0, 2, 0, 0, 0],                     // LOAD_LONG_TERM_KEYS, empty set
             &[0x30, 0, 0, 0, 2, 0, 0, 0],                   // LOAD_IRKS, empty set
@@ -541,6 +575,7 @@ impl FileLike for HciSocket {
             .map(|binding| binding.channel)
             .ok_or(LinuxError::ENODEV)?;
         if channel == HCI_CHANNEL_CONTROL {
+            drain_bluetooth_management_events();
             let packet = self
                 .control
                 .rx
@@ -559,14 +594,17 @@ impl FileLike for HciSocket {
                 .try_reserve_exact(capacity)
                 .map_err(|_| AxError::NoMemory)?;
             packet.resize(capacity, 0);
+            let mut adapter = adapter.lock();
             let length = adapter
-                .lock()
                 .receive_channel_packet(
                     binding.channel,
                     &mut packet,
                     self.nonblocking.load(Ordering::Acquire),
                 )
                 .map_err(map_transport_error)?;
+            if binding.channel == 0 && length >= 3 && packet[0] == 4 {
+                fanout_hci_management_events(adapter.index(), &packet[1..length]);
+            }
             return dst.write(&packet[..length]);
         }
         let _ = binding;
@@ -687,6 +725,23 @@ impl FileLike for HciSocket {
     }
 }
 
+fn drain_bluetooth_management_events() {
+    #[cfg(feature = "input")]
+    for adapter in axdriver::bluetooth_devices() {
+        let mut adapter = adapter.lock();
+        let _ = adapter.pump_receive();
+        let index = adapter.index();
+        let mut events = Vec::new();
+        while let Some(event) = adapter.pop_management_event() {
+            events.push(event);
+        }
+        drop(adapter);
+        for event in events {
+            fanout_hci_management_events(index, &event);
+        }
+    }
+}
+
 impl Default for HciSocket {
     fn default() -> Self {
         Self::new()
@@ -722,6 +777,145 @@ impl HciSocket {
     }
 }
 
+#[cfg(feature = "input")]
+fn mgmt_event_packet(code: u16, index: u16, parameters: &[u8]) -> AxResult<Vec<u8>> {
+    let length = u16::try_from(parameters.len()).map_err(|_| AxError::InvalidInput)?;
+    let mut packet = Vec::new();
+    packet
+        .try_reserve_exact(6 + parameters.len())
+        .map_err(|_| AxError::NoMemory)?;
+    packet.extend_from_slice(&code.to_le_bytes());
+    packet.extend_from_slice(&index.to_le_bytes());
+    packet.extend_from_slice(&length.to_le_bytes());
+    packet.extend_from_slice(parameters);
+    Ok(packet)
+}
+
+/// Convert controller events that carry the management API's address/state
+/// records. SMP key events are produced by the host pairing engine, not by a
+/// raw LE HCI event that omits key material.
+#[cfg(feature = "input")]
+fn fanout_hci_management_events(index: u16, event: &[u8]) {
+    if event.len() < 2 || event.len() != usize::from(event[1]) + 2 {
+        return;
+    }
+    let mut publish = |code, parameters: &[u8]| {
+        if let Ok(packet) = mgmt_event_packet(code, index, parameters) {
+            fanout_mgmt_event(packet);
+        }
+    };
+    match event[0] {
+        // HCI Connection Complete -> Device Connected.
+        0x03 if event.len() >= 11 && event[2] == 0 => {
+            let mut parameters = Vec::with_capacity(13);
+            parameters.extend_from_slice(&event[5..11]);
+            parameters.push(0); // BR/EDR address
+            parameters.extend_from_slice(&0u32.to_le_bytes()); // flags
+            parameters.extend_from_slice(&0u16.to_le_bytes()); // EIR length
+            publish(0x000b, &parameters);
+        }
+        // HCI Disconnection Complete -> Device Disconnected.
+        0x05 if event.len() >= 6 && event[2] == 0 => {
+            let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
+            if let Some(adapter) = usb_adapter(index)
+                && let Some((address, address_type)) = {
+                    let mut adapter = adapter.lock();
+                    adapter
+                        .take_management_peer_for_handle(handle)
+                        .or_else(|| adapter.management_peer_for_handle(handle))
+                }
+            {
+                let mut parameters = Vec::with_capacity(8);
+                parameters.extend_from_slice(&address);
+                parameters.push(address_type);
+                parameters.push(match event[5] {
+                    0x08 => 0x01, // timeout
+                    0x16 => 0x02, // local host
+                    0x13 => 0x03, // remote
+                    0x05 => 0x04, // authentication failure
+                    _ => 0,
+                });
+                publish(0x000c, &parameters);
+            }
+        }
+        // HCI Authentication Complete -> Authentication Failed.
+        0x06 if event.len() >= 5 && event[2] != 0 => {
+            let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
+            if let Some(adapter) = usb_adapter(index)
+                && let Some((address, address_type)) =
+                    adapter.lock().management_peer_for_handle(handle)
+            {
+                let mut parameters = Vec::with_capacity(8);
+                parameters.extend_from_slice(&address);
+                parameters.push(address_type);
+                parameters.push(event[2]);
+                publish(0x0011, &parameters);
+            }
+        }
+        // HCI Link Key Notification contains the key bytes for classic links.
+        0x18 if event.len() >= 25 => {
+            let mut parameters = Vec::with_capacity(26);
+            parameters.push(1); // persistent key
+            parameters.extend_from_slice(&event[2..8]);
+            parameters.push(0); // BR/EDR
+            parameters.push(event[24]); // key type
+            parameters.extend_from_slice(&event[8..24]);
+            parameters.push(0); // PIN length is not carried in the HCI event.
+            publish(0x0009, &parameters);
+        }
+        // HCI Inquiry Result: report each 13-byte response without optional EIR.
+        0x02 if event.len() >= 3 => {
+            let count = usize::from(event[2]);
+            if event.len() != 3 + count * 13 {
+                return;
+            }
+            for record in event[3..].chunks_exact(13) {
+                let mut parameters = Vec::with_capacity(13);
+                parameters.extend_from_slice(&record[..6]);
+                parameters.extend_from_slice(&[0, 0]); // address type, RSSI unavailable
+                parameters.extend_from_slice(&0u32.to_le_bytes()); // flags
+                parameters.extend_from_slice(&0u16.to_le_bytes()); // EIR length
+                publish(0x0012, &parameters);
+            }
+        }
+        // LE Advertising Report carries the advertising data and RSSI.
+        0x3e if event.len() >= 4 && event[2] == 0x02 => {
+            let count = usize::from(event[3]);
+            let mut at = 4usize;
+            for _ in 0..count {
+                let Some(fixed) = event.get(at..at + 9) else {
+                    return;
+                };
+                let address_type = match fixed[1] {
+                    0 => 1,
+                    1 => 2,
+                    _ => return,
+                };
+                let data_len = usize::from(fixed[8]);
+                let Some(record) = event.get(at..at + 10 + data_len) else {
+                    return;
+                };
+                let mut parameters = Vec::with_capacity(14 + data_len);
+                parameters.extend_from_slice(&record[2..8]);
+                parameters.push(address_type);
+                parameters.push(record[9 + data_len]); // RSSI
+                parameters.extend_from_slice(&0u32.to_le_bytes()); // flags
+                parameters.extend_from_slice(&(data_len as u16).to_le_bytes());
+                parameters.extend_from_slice(&record[9..9 + data_len]);
+                publish(0x0012, &parameters);
+                at += 10 + data_len;
+            }
+            if at != event.len() {
+                return;
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(feature = "input"))]
+fn fanout_hci_management_events(_index: u16, _event: &[u8]) {}
+
 fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const MGMT_INDEX_NONE: u16 = 0xffff;
     const CMD_COMPLETE: u16 = 1;
@@ -738,15 +932,17 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const LOAD_LINK_KEYS: u16 = 18;
     const LOAD_LONG_TERM_KEYS: u16 = 19;
     const LOAD_IRKS: u16 = 0x30;
-    const DISCONNECT: u16 = 0x14;
     const PAIR_DEVICE: u16 = 0x19;
+    const DISCONNECT: u16 = 0x14;
+    const SET_BREDR: u16 = 0x2a;
     const START_DISCOVERY: u16 = 0x23;
     const STOP_DISCOVERY: u16 = 0x24;
     const UNKNOWN_COMMAND: u8 = 1;
     const NOT_SUPPORTED: u8 = 0x0c;
     const INVALID_PARAMS: u8 = 0x0d;
     const INVALID_INDEX: u8 = 0x11;
-    const SUPPORTED_SETTINGS: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 9);
+    const SUPPORTED_SETTINGS: u32 =
+        (1 << 0) | (1 << 1) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 9);
     if request.len() < 6 {
         return Err(AxError::InvalidInput);
     }
@@ -774,10 +970,16 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 SET_BONDABLE,
                 SET_SSP,
                 SET_LE,
+                LOAD_LINK_KEYS,
+                LOAD_LONG_TERM_KEYS,
+                DISCONNECT,
+                PAIR_DEVICE,
                 START_DISCOVERY,
                 STOP_DISCOVERY,
+                SET_BREDR,
+                LOAD_IRKS,
             ];
-            let events = [6u16, 0x13]; // NEW_SETTINGS, DISCOVERING
+            let events = [6u16, 0x09, 0x0b, 0x0c, 0x11, 0x12, 0x13];
             data.extend_from_slice(&(commands.len() as u16).to_le_bytes());
             data.extend_from_slice(&(events.len() as u16).to_le_bytes());
             for item in commands.into_iter().chain(events) {
@@ -844,7 +1046,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
         SET_DISCOVERABLE if parameters.len() == 3 && parameters[0] <= 1 => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
-        SET_CONNECTABLE | SET_BONDABLE | SET_SSP | SET_LE
+        SET_CONNECTABLE | SET_BONDABLE | SET_SSP | SET_LE | SET_BREDR
             if parameters.len() == 1 && parameters[0] <= 1 =>
         {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
@@ -858,10 +1060,10 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
         LOAD_IRKS if valid_load_irks(parameters) => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
-        PAIR_DEVICE if parameters.len() == 8 && parameters[6] <= 4 && parameters[7] <= 4 => {
+        PAIR_DEVICE if parameters.len() == 8 && parameters[6] <= 2 && parameters[7] <= 4 => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
-        DISCONNECT if parameters.len() == 7 && parameters[6] <= 4 => {
+        DISCONNECT if parameters.len() == 7 && parameters[6] <= 2 => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
         START_DISCOVERY if parameters.len() == 1 && matches!(parameters[0], 1 | 6) => {
@@ -882,6 +1084,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 | SET_BONDABLE
                 | SET_SSP
                 | SET_LE
+                | SET_BREDR
                 | LOAD_LINK_KEYS
                 | LOAD_LONG_TERM_KEYS
                 | LOAD_IRKS
@@ -922,13 +1125,17 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
     const LOAD_LINK_KEYS: u16 = 18;
     const LOAD_LONG_TERM_KEYS: u16 = 19;
     const LOAD_IRKS: u16 = 0x30;
+    const PAIR_DEVICE: u16 = 0x19;
+    const DISCONNECT: u16 = 0x14;
+    const SET_BREDR: u16 = 0x2a;
     const START_DISCOVERY: u16 = 0x23;
     const STOP_DISCOVERY: u16 = 0x24;
     const MGMT_SETTING_CONNECTABLE: u32 = 1 << 1;
-    const MGMT_SETTING_DISCOVERABLE: u32 = 1 << 2;
-    const MGMT_SETTING_BONDABLE: u32 = 1 << 3;
-    const MGMT_SETTING_SSP: u32 = 1 << 4;
+    const MGMT_SETTING_DISCOVERABLE: u32 = 1 << 3;
+    const MGMT_SETTING_BONDABLE: u32 = 1 << 4;
+    const MGMT_SETTING_SSP: u32 = 1 << 6;
     const MGMT_SETTING_LE: u32 = 1 << 9;
+    const MGMT_SETTING_BREDR: u32 = 1 << 7;
     const INVALID_INDEX: u8 = 0x11;
     const NOT_SUPPORTED: u8 = 0x0c;
     const FAILED: u8 = 0x03;
@@ -943,21 +1150,73 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
         return Err(AxError::InvalidInput);
     }
     let parameters = &request[6..];
-    let empty_key_load = (opcode == LOAD_LINK_KEYS
-        && valid_load_link_keys(parameters)
-        && u16::from_le_bytes([parameters[1], parameters[2]]) == 0)
-        || (opcode == LOAD_LONG_TERM_KEYS
-            && valid_load_long_term_keys(parameters)
-            && u16::from_le_bytes([parameters[0], parameters[1]]) == 0)
-        || (opcode == LOAD_IRKS
-            && valid_load_irks(parameters)
-            && u16::from_le_bytes([parameters[0], parameters[1]]) == 0);
-    if empty_key_load {
-        if usb_adapter(index).is_none() {
+    if (opcode == LOAD_LINK_KEYS && valid_load_link_keys(parameters))
+        || (opcode == LOAD_LONG_TERM_KEYS && valid_load_long_term_keys(parameters))
+        || (opcode == LOAD_IRKS && valid_load_irks(parameters))
+    {
+        let Some(adapter) = usb_adapter(index) else {
             return Ok(None);
-        }
+        };
+        let status = match adapter.lock().management_load_keys(opcode, parameters) {
+            Ok(()) => 0,
+            Err(axdriver::BluetoothError::NoMemory) => 7,
+            Err(axdriver::BluetoothError::InvalidLength) => 0x0d,
+            Err(_) => FAILED,
+        };
         return Ok(Some((
-            management_command_complete(index, opcode, 0, &[])?,
+            management_command_complete(index, opcode, status, &[])?,
+            None,
+        )));
+    }
+    if opcode == PAIR_DEVICE && parameters.len() == 8 && parameters[6] <= 2 && parameters[7] <= 4 {
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let mut address = [0; 6];
+        address.copy_from_slice(&parameters[..6]);
+        let status =
+            match adapter
+                .lock()
+                .management_pair_device(address, parameters[6], parameters[7])
+            {
+                Ok(()) => 0,
+                Err(axdriver::BluetoothError::NotUp) => 0x0f,
+                Err(axdriver::BluetoothError::NoDevice) => INVALID_INDEX,
+                Err(axdriver::BluetoothError::Busy) => 0x0a,
+                Err(axdriver::BluetoothError::Unsupported) => NOT_SUPPORTED,
+                Err(_) => 0x04,
+            };
+        let data = if status == 0 {
+            parameters[..7].to_vec()
+        } else {
+            Vec::new()
+        };
+        return Ok(Some((
+            management_command_complete(index, opcode, status, &data)?,
+            None,
+        )));
+    }
+    if opcode == DISCONNECT && parameters.len() == 7 && parameters[6] <= 2 {
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let mut address = [0; 6];
+        address.copy_from_slice(&parameters[..6]);
+        let status = match adapter.lock().management_disconnect(address, parameters[6]) {
+            Ok(()) => 0,
+            Err(axdriver::BluetoothError::NotUp) => 0x0f,
+            Err(axdriver::BluetoothError::NoDevice) => INVALID_INDEX,
+            Err(axdriver::BluetoothError::Busy) => 0x0a,
+            Err(axdriver::BluetoothError::Unsupported) => 0x02,
+            Err(_) => FAILED,
+        };
+        let data = if status == 0 {
+            parameters.to_vec()
+        } else {
+            Vec::new()
+        };
+        return Ok(Some((
+            management_command_complete(index, opcode, status, &data)?,
             None,
         )));
     }
@@ -1029,7 +1288,7 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
         {
             (MGMT_SETTING_DISCOVERABLE, parameters[0] != 0)
         }
-        SET_CONNECTABLE | SET_BONDABLE | SET_SSP | SET_LE
+        SET_CONNECTABLE | SET_BONDABLE | SET_SSP | SET_LE | SET_BREDR
             if parameters.len() == 1 && parameters[0] <= 1 =>
         {
             let setting = match opcode {
@@ -1037,6 +1296,7 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
                 SET_BONDABLE => MGMT_SETTING_BONDABLE,
                 SET_SSP => MGMT_SETTING_SSP,
                 SET_LE => MGMT_SETTING_LE,
+                SET_BREDR => MGMT_SETTING_BREDR,
                 _ => unreachable!(),
             };
             (setting, parameters[0] != 0)
@@ -1163,6 +1423,9 @@ fn valid_load_link_keys(parameters: &[u8]) -> bool {
     }
     let count = usize::from(u16::from_le_bytes([parameters[1], parameters[2]]));
     count.checked_mul(25).and_then(|size| size.checked_add(3)) == Some(parameters.len())
+        && parameters[3..]
+            .chunks_exact(25)
+            .all(|key| key[6] <= 2 && key[7] <= 8 && key[24] <= 16)
 }
 
 fn valid_load_long_term_keys(parameters: &[u8]) -> bool {
@@ -1171,6 +1434,9 @@ fn valid_load_long_term_keys(parameters: &[u8]) -> bool {
     }
     let count = usize::from(u16::from_le_bytes([parameters[0], parameters[1]]));
     count.checked_mul(36).and_then(|size| size.checked_add(2)) == Some(parameters.len())
+        && parameters[2..]
+            .chunks_exact(36)
+            .all(|key| key[6] <= 2 && key[7] <= 4 && key[8] <= 1 && (7..=16).contains(&key[9]))
 }
 
 fn valid_load_irks(parameters: &[u8]) -> bool {
@@ -1184,5 +1450,5 @@ fn valid_load_irks(parameters: &[u8]) -> bool {
     if parameters.len() != expected {
         return false;
     }
-    parameters[2..].chunks_exact(23).all(|irk| irk[6] <= 4)
+    parameters[2..].chunks_exact(23).all(|irk| irk[6] <= 2)
 }

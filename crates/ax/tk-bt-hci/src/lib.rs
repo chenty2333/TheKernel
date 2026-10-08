@@ -60,6 +60,7 @@ pub enum Error {
     InvalidLength,
     Unsupported,
     NoDevice,
+    NoMemory,
     Busy,
     NotUp,
     Again,
@@ -179,6 +180,7 @@ pub struct Adapter<T> {
     monitor_users: u16,
     monitor: VecDeque<Vec<u8>>,
     incoming: VecDeque<(PacketType, Vec<u8>)>,
+    observed_events: VecDeque<Vec<u8>>,
     stats: Statistics,
 }
 
@@ -193,6 +195,7 @@ impl<T: UsbTransport> Adapter<T> {
             monitor_users: 0,
             monitor: VecDeque::new(),
             incoming: VecDeque::new(),
+            observed_events: VecDeque::new(),
             stats: Statistics::default(),
         }
     }
@@ -452,6 +455,10 @@ impl<T: UsbTransport> Adapter<T> {
             PacketType::Event => {
                 self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
                 self.queue_monitor(3, &bytes[..length]);
+                if self.observed_events.len() == 64 {
+                    self.observed_events.pop_front();
+                }
+                self.observed_events.push_back(Vec::from(&bytes[..length]));
             }
             PacketType::Acl => {
                 self.stats.acl_rx = self.stats.acl_rx.saturating_add(1);
@@ -466,6 +473,12 @@ impl<T: UsbTransport> Adapter<T> {
         }
         self.incoming.push_back((kind, Vec::from(&bytes[..length])));
         Ok(true)
+    }
+    /// Pop a raw HCI event observed by the asynchronous receiver. Upper
+    /// protocols use this tap for management notifications without consuming
+    /// the event from raw/user HCI sockets.
+    pub fn pop_observed_event(&mut self) -> Option<Vec<u8>> {
+        self.observed_events.pop_front()
     }
     // upstream: iwmbt_hw.c iwmbt_hci_command()
     /// Send an HCI command and read its matching Command Complete event. This
