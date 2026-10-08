@@ -51,3 +51,6 @@ Peer rate setup bounds Supported/Extended Supported Rates to the 15-entry
 upstream set, records truncated extensions, infers ERP/11g from 2.4-GHz OFDM
 rates, and delegates mutual-rate selection to the protocol layer. Legacy ABG
 mode resolves from a fixed local choice or the peer's band/ERP state.
+Inline node predicates now determine HT/VHT/HE support from both capability
+presence and usable first-stream MCS masks, and gate SGI and wide-channel
+operation on both peer capabilities and the accepted operation IE.

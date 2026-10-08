@@ -35,6 +35,12 @@ pub const VHTCAP_CHAN_WIDTH_160_8080: u32 = 2;
 pub const VHTCAP_EXT_NSS_BW_MASK: u32 = 0xc000_0000;
 pub const VHTCAP_EXT_NSS_BW_SHIFT: u32 = 30;
 pub const VHT_EXT_NSS_BW_CAPABLE: u16 = 1 << 13;
+pub const HTCAP_CBW20_40: u16 = 0x0002;
+pub const HTCAP_SGI20: u16 = 0x0020;
+pub const HTCAP_SGI40: u16 = 0x0040;
+pub const HTOP0_CHW: u8 = 0x04;
+pub const VHT_MCS_SS_NOT_SUPP: u16 = 3;
+pub const HE_MCS_SS_NOT_SUPP: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HtCapabilities {
@@ -367,6 +373,74 @@ pub fn vht_channel_width(
     }
 }
 
+// upstream: ieee80211_node.h ieee80211_node_supports_ht()
+pub fn supports_ht(node: &HtCapabilities) -> bool {
+    node.flags & NODE_HTCAP != 0 && node.rx_mcs[0] != 0
+}
+
+// upstream: ieee80211_node.h ieee80211_node_supports_ht_sgi20()
+pub fn supports_ht_sgi20(node: &HtCapabilities) -> bool {
+    supports_ht(node) && node.caps & HTCAP_SGI20 != 0
+}
+
+// upstream: ieee80211_node.h ieee80211_node_supports_ht_sgi40()
+pub fn supports_ht_sgi40(node: &HtCapabilities) -> bool {
+    supports_ht(node) && node.caps & HTCAP_SGI40 != 0
+}
+
+// upstream: ieee80211_node.h ieee80211_node_supports_ht_chan40()
+pub fn supports_ht_chan40(node: &HtCapabilities, htop0: u8) -> bool {
+    supports_ht(node) && node.caps & HTCAP_CBW20_40 != 0 && htop0 & HTOP0_CHW != 0
+}
+
+// upstream: ieee80211_node.h ieee80211_node_supports_vht()
+pub fn supports_vht(node: &VhtCapabilities) -> bool {
+    node.flags & NODE_VHTCAP != 0 && node.rx_mcs & 0x03 != VHT_MCS_SS_NOT_SUPP
+}
+
+// upstream: ieee80211_node.h ieee80211_node_supports_vht_sgi80()
+pub fn supports_vht_sgi80(node: &VhtCapabilities) -> bool {
+    supports_vht(node) && node.caps & (1 << 5) != 0
+}
+
+// upstream: ieee80211_node.h ieee80211_node_supports_vht_sgi160()
+pub fn supports_vht_sgi160(node: &VhtCapabilities) -> bool {
+    supports_vht(node) && node.caps & (1 << 6) != 0
+}
+
+// upstream: ieee80211_node.h ieee80211_node_supports_vht_chan80()
+pub fn supports_vht_chan80(node: &VhtCapabilities, operation: &VhtOperation) -> bool {
+    let cap_width = (node.caps & VHTCAP_CHAN_WIDTH_MASK) >> VHTCAP_CHAN_WIDTH_SHIFT;
+    let op_width = operation.channel_width & 0x03;
+    supports_vht(node)
+        && matches!(
+            cap_width,
+            0 | VHTCAP_CHAN_WIDTH_160 | VHTCAP_CHAN_WIDTH_160_8080
+        )
+        && matches!(
+            op_width,
+            VHTOP0_CHAN_WIDTH_80 | VHTOP0_CHAN_WIDTH_160 | VHTOP0_CHAN_WIDTH_8080
+        )
+}
+
+// upstream: ieee80211_node.h ieee80211_node_supports_vht_chan160()
+pub fn supports_vht_chan160(node: &VhtCapabilities, operation: &VhtOperation) -> bool {
+    let cap_width = (node.caps & VHTCAP_CHAN_WIDTH_MASK) >> VHTCAP_CHAN_WIDTH_SHIFT;
+    let ext_nss = node.caps & VHTCAP_EXT_NSS_BW_MASK != 0;
+    let op_width = operation.channel_width & 0x03;
+    supports_vht(node)
+        && (matches!(
+            cap_width,
+            VHTCAP_CHAN_WIDTH_160 | VHTCAP_CHAN_WIDTH_160_8080
+        ) || (ext_nss && node.tx_max_lgi_mbps & VHT_EXT_NSS_BW_CAPABLE != 0))
+        && op_width == VHTOP0_CHAN_WIDTH_160
+}
+
+// upstream: ieee80211_node.h ieee80211_node_supports_he()
+pub fn supports_he(node: &HeCapabilities) -> bool {
+    node.flags & NODE_HECAP != 0 && node.rx_mcs_80 & 0x03 != HE_MCS_SS_NOT_SUPP
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +549,45 @@ mod tests {
             0,
             &[0; 4]
         ));
+    }
+
+    #[test]
+    fn peer_capability_predicates_require_ie_mcs_and_operation_support() {
+        let mut ht = HtCapabilities {
+            flags: NODE_HTCAP,
+            rx_mcs: [1; 10],
+            caps: HTCAP_CBW20_40 | HTCAP_SGI20 | HTCAP_SGI40,
+            ..Default::default()
+        };
+        assert!(supports_ht(&ht));
+        assert!(supports_ht_sgi20(&ht));
+        assert!(supports_ht_sgi40(&ht));
+        assert!(supports_ht_chan40(&ht, HTOP0_CHW));
+        assert!(!supports_ht_chan40(&ht, 0));
+        ht.rx_mcs[0] = 0;
+        assert!(!supports_ht(&ht));
+        let vht = VhtCapabilities {
+            flags: NODE_VHTCAP,
+            caps: VHTCAP_CHAN_WIDTH_160 << VHTCAP_CHAN_WIDTH_SHIFT | (1 << 5) | (1 << 6),
+            rx_mcs: 0,
+            tx_max_lgi_mbps: 0,
+            ..Default::default()
+        };
+        let op = VhtOperation {
+            channel_width: VHTOP0_CHAN_WIDTH_160,
+            ..Default::default()
+        };
+        assert!(supports_vht(&vht));
+        assert!(supports_vht_sgi80(&vht));
+        assert!(supports_vht_sgi160(&vht));
+        assert!(supports_vht_chan80(&vht, &op));
+        assert!(supports_vht_chan160(&vht, &op));
+        let he = HeCapabilities {
+            flags: NODE_HECAP,
+            rx_mcs_80: 0,
+            ..Default::default()
+        };
+        assert!(supports_he(&he));
     }
 
     #[test]

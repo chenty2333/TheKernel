@@ -42,7 +42,9 @@ pub use node_caps::{
     VHTOP0_CHAN_WIDTH_160, VHTOP0_CHAN_WIDTH_8080, VHTOP0_CHAN_WIDTH_HT, VhtCapabilities,
     clear_he_caps, clear_ht_caps, clear_vht_caps, ht_secondary_offset, setup_he_caps,
     setup_he_operation, setup_ht_caps, setup_ht_operation, setup_vht_caps, setup_vht_operation,
-    vht_channel_width,
+    supports_he, supports_ht, supports_ht_chan40, supports_ht_sgi20, supports_ht_sgi40,
+    supports_vht, supports_vht_chan80, supports_vht_chan160, supports_vht_sgi80,
+    supports_vht_sgi160, vht_channel_width,
 };
 pub use node_rates::{
     CHAN_DYN as NODE_CHAN_DYN, CHAN_OFDM as NODE_CHAN_OFDM, NODE_ERP, PeerRateState, RateIeError,
