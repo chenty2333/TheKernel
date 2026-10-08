@@ -747,3 +747,7 @@ and crate `LICENSE-MIT` preserve the grant.
 `tk-intel-display/src/intel_modeset_verify_full.rs` translates all 7
 modeset-verification functions in Linux 7.2.3 `intel_modeset_verify.c` (MIT,
 © 2022 Intel); its SPDX tag and crate `LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_modeset_setup_full.rs` translates all 25
+modeset-setup functions in Linux 7.2.3 `intel_modeset_setup.c` (MIT, © 2022
+Intel); its SPDX tag and crate `LICENSE-MIT` preserve the grant.

@@ -1248,3 +1248,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `crates/ax/tk-intel-display/src/intel_atomic_full.rs` translates all 15 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_atomic.c` (MIT, Copyright © 2015 Intel Corporation); DRM object allocation, state ownership, HDCP and DP tunnel helpers remain explicit hooks. `LICENSE-MIT`.
 
 `crates/ax/tk-intel-display/src/intel_modeset_verify_full.rs` translates all 7 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_modeset_verify.c` (MIT, Copyright © 2022 Intel Corporation); DRM object traversal, state readout and diagnostics remain hooks. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_modeset_setup_full.rs` translates all 25 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_modeset_setup.c` (MIT, Copyright © 2022 Intel Corporation); DRM state/object enumeration and diagnostics remain hooks. `LICENSE-MIT`.
