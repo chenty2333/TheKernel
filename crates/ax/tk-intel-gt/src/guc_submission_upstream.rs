@@ -1540,27 +1540,29 @@ fn __reset_guc_busyness_stats(guc: &mut intel_guc) {
     spin_lock_irqsave(&mut guc.timestamp.lock, &mut flags);
     guc_update_pm_timestamp(guc, &mut unused);
     for_each_engine!(engine, id, gt, {
-        let stats = &mut engine.stats.guc;
+        let stats = core::ptr::addr_of_mut!(engine.stats.guc);
         guc_update_engine_gt_clks(engine);
         // A running context reset has no context-switch record, so account for
         // its current active interval explicitly.
-        if stats.running {
-            let clk = guc.timestamp.gt_stamp - stats.start_gt_clk;
-            stats.total_gt_clks += clk;
+        if unsafe { (*stats).running } {
+            let clk = guc.timestamp.gt_stamp - unsafe { (*stats).start_gt_clk };
+            unsafe { (*stats).total_gt_clks += clk };
         }
-        stats.prev_total = 0;
-        stats.running = false;
+        unsafe {
+            (*stats).prev_total = 0;
+            (*stats).running = false;
+        }
     });
     spin_unlock_irqrestore(&mut guc.timestamp.lock, flags);
 }
 
 // upstream: intel_guc_submission.c __update_guc_busyness_running_state()
 fn __update_guc_busyness_running_state(guc: &mut intel_guc) {
-    let gt = guc_to_gt(guc);
+    let gt = unsafe { guc_to_gt(guc) };
     let mut flags: c_ulong = 0;
     spin_lock_irqsave(&mut guc.timestamp.lock, &mut flags);
     for_each_engine!(engine, id, gt, {
-        engine.stats.guc.running = false;
+        unsafe { engine.stats.guc.running = false };
     });
     spin_unlock_irqrestore(&mut guc.timestamp.lock, flags);
 }

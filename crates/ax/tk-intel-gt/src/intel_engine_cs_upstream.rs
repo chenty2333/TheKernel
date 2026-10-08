@@ -14,6 +14,7 @@
 use core::{
     ffi::{c_char, c_ulong, c_void},
     mem::{offset_of, size_of},
+    ops::{Deref, DerefMut},
 };
 
 use crate::{
@@ -376,6 +377,26 @@ pub union IntelEngineStatsData {
 pub struct IntelEngineStats {
     pub data: IntelEngineStatsData,
     pub rps: i64,
+}
+const _: [(); 32] = [(); size_of::<IntelEngineStatsData>()];
+const _: [(); 40] = [(); size_of::<IntelEngineStats>()];
+const _: [(); 32] = [(); offset_of!(IntelEngineStats, rps)];
+
+// The upstream struct has an anonymous union, so C exposes `stats.guc` and
+// `stats.execlists` directly. Keep the union at the asserted C offset and
+// provide the same named-member lookup to source-order Rust callers.
+impl Deref for IntelEngineStats {
+    type Target = IntelEngineStatsData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl DerefMut for IntelEngineStats {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
 }
 
 #[repr(C)]
