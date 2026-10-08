@@ -30,11 +30,36 @@ const NVM_RW_REG_DONE: u32 = 2;
 const NVM_RW_REG_START: u32 = 1;
 const NVM_CHECKSUM_REG: u16 = 0x003f;
 const NVM_SUM: u16 = 0xbaba;
+const EECD: u32 = 0x00010;
+const EECD_FLASH_DETECTED: u32 = 0x0008_0000;
+const EECD_FLUPD: u32 = 0x0080_0000;
+const EECD_FLUDONE: u32 = 0x0400_0000;
+const EECD_SEC1VAL: u32 = 0x0200_0000;
+const FLSECU: u32 = 0x12114;
+const FLSECU_BLK_SW_ACCESS: u32 = 0x4;
+const FWSM: u32 = 0x05b54;
+const FWSM_FW_VALID: u32 = 0x8000;
+const FLSWCTL: u32 = 0x12048;
+const FLSWDATA: u32 = 0x1204c;
+const FLSWCNT: u32 = 0x12050;
+const FLSWCTL_DONE: u32 = 0x4000_0000;
+const FLSWCTL_CMDV: u32 = 0x1000_0000;
+const ERASE_CMD_OPCODE: u32 = 0x0200_0000;
+const WRITE_CMD_OPCODE: u32 = 0x0100_0000;
+const SHADOW_RAM_SIZE: u32 = 4096;
+const NVM_GRANT_ATTEMPTS: u32 = 1000;
+const FLUDONE_ATTEMPTS: u32 = 20_000;
+const I225_PHPM_DIS_1000: u32 = 0x0040;
+const I225_PHPM_DIS_2500: u32 = 0x0800;
+const I225_PHPM_DIS_100_D3: u32 = 0x0200;
+const I225_PHPM_DIS_1000_D3: u32 = 0x0008;
+const I225_PHPM_DIS_2500_D3: u32 = 0x1000;
 
 pub trait IgcI225NvmIo: IgcI225Io {
     fn read_nvm_eerd(&mut self, offset: u16, data: &mut [u16]) -> Result<(), I225NvmError>;
     fn validate_nvm_checksum_generic(&mut self) -> Result<(), I225NvmError>;
     fn update_flash_i225(&mut self) -> Result<(), I225NvmError>;
+    fn poll_eerd_read_done(&mut self) -> Result<(), I225NvmError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +179,125 @@ pub fn igc_update_nvm_checksum_i225<I: IgcI225NvmIo>(io: &mut I) -> Result<(), I
     }
     igc_release_nvm_i225(io);
     io.update_flash_i225()
+}
+
+// upstream: igc_i225.c igc_get_flash_presence_i225()
+pub fn igc_get_flash_presence_i225<I: IgcI225Io>(io: &mut I) -> bool {
+    io.read(EECD) & EECD_FLASH_DETECTED != 0
+}
+
+// upstream: igc_i225.c igc_set_flsw_flash_burst_counter_i225()
+pub fn igc_set_flsw_flash_burst_counter_i225<I: IgcI225Io>(
+    io: &mut I,
+    burst_counter: u32,
+) -> Result<(), I225NvmError> {
+    if burst_counter < SHADOW_RAM_SIZE {
+        io.write(FLSWCNT, burst_counter);
+        Ok(())
+    } else {
+        Err(I225NvmError::Bounds)
+    }
+}
+
+// upstream: igc_i225.c igc_write_erase_flash_command_i225()
+pub fn igc_write_erase_flash_command_i225<I: IgcI225Io>(
+    io: &mut I,
+    opcode: u32,
+    address: u32,
+) -> Result<(), I225NvmError> {
+    let mut flswctl = io.read(FLSWCTL);
+    let mut timeout = NVM_GRANT_ATTEMPTS;
+    while timeout != 0 {
+        if flswctl & FLSWCTL_DONE != 0 {
+            break;
+        }
+        io.delay_us(5);
+        flswctl = io.read(FLSWCTL);
+        timeout -= 1;
+    }
+    if timeout == 0 {
+        return Err(I225NvmError::Timeout);
+    }
+    io.write(FLSWCTL, address | opcode);
+    if io.read(FLSWCTL) & FLSWCTL_CMDV == 0 {
+        return Err(I225NvmError::Bounds);
+    }
+    Ok(())
+}
+
+// upstream: igc_i225.c igc_pool_flash_update_done_i225()
+pub fn igc_pool_flash_update_done_i225<I: IgcI225Io>(io: &mut I) -> Result<(), I225NvmError> {
+    for _ in 0..FLUDONE_ATTEMPTS {
+        if io.read(EECD) & EECD_FLUDONE != 0 {
+            return Ok(());
+        }
+        io.delay_us(5);
+    }
+    Err(I225NvmError::Timeout)
+}
+
+// upstream: igc_i225.c igc_update_flash_i225()
+pub fn igc_update_flash_i225<I: IgcI225NvmIo>(io: &mut I) -> Result<(), I225NvmError> {
+    let block_sw_protect = io.read(FLSECU) & FLSECU_BLK_SW_ACCESS;
+    let fw_valid = io.read(FWSM) & FWSM_FW_VALID;
+    if fw_valid != 0 {
+        igc_pool_flash_update_done_i225(io)?;
+        let flup = io.read(EECD) | EECD_FLUPD;
+        io.write(EECD, flup);
+        return igc_pool_flash_update_done_i225(io);
+    }
+    if block_sw_protect == 0 {
+        let base_address = if io.read(EECD) & EECD_SEC1VAL != 0 {
+            0x1000
+        } else {
+            0
+        };
+        let erase = igc_write_erase_flash_command_i225(io, ERASE_CMD_OPCODE, base_address);
+        // Preserve the source's `if (!ret_val) goto out` behavior after this
+        // call, including its unusual success-path exit.
+        if erase.is_ok() {
+            return Ok(());
+        }
+        let mut current_offset = base_address as u16;
+        for _ in 0..(SHADOW_RAM_SIZE / 2) {
+            igc_set_flsw_flash_burst_counter_i225(io, 2)?;
+            igc_write_erase_flash_command_i225(
+                io,
+                WRITE_CMD_OPCODE,
+                2 * u32::from(current_offset),
+            )?;
+            let mut word = [0u16; 1];
+            io.read_nvm_eerd(current_offset, &mut word)?;
+            io.write(FLSWDATA, u32::from(word[0]));
+            current_offset = current_offset.wrapping_add(1);
+            io.poll_eerd_read_done()?;
+            io.delay_us(1000);
+        }
+    }
+    Ok(())
+}
+
+// upstream: igc_i225.c igc_set_d0_lplu_state_i225()
+pub fn igc_set_d0_lplu_state_i225<I: IgcI225Io>(io: &mut I, active: bool) {
+    let mut data = io.read(I225_PHPM);
+    if active {
+        data |= I225_PHPM_DIS_1000 | I225_PHPM_DIS_2500;
+    } else {
+        data &= !(I225_PHPM_DIS_1000 | I225_PHPM_DIS_2500);
+    }
+    io.write(I225_PHPM, data);
+}
+
+// upstream: igc_i225.c igc_set_d3_lplu_state_i225()
+pub fn igc_set_d3_lplu_state_i225<I: IgcI225Io>(io: &mut I, active: bool) {
+    let mut data = io.read(I225_PHPM);
+    let mask = I225_PHPM_DIS_100_D3 | I225_PHPM_DIS_1000_D3 | I225_PHPM_DIS_2500_D3;
+    if active {
+        data |= mask;
+    } else {
+        data &= !mask;
+    }
+    io.write(I225_PHPM, data);
 }
 
 pub trait IgcI225Io {
@@ -463,7 +607,14 @@ mod tests {
     }
     impl IgcI225Io for SemIo {
         fn read(&mut self, r: u32) -> u32 {
-            self.read_reg(r) | if r == SRWR { NVM_RW_REG_DONE } else { 0 }
+            self.read_reg(r)
+                | if r == SRWR {
+                    NVM_RW_REG_DONE
+                } else if r == FLSWCTL {
+                    FLSWCTL_DONE | FLSWCTL_CMDV
+                } else {
+                    0
+                }
         }
         fn write(&mut self, r: u32, v: u32) {
             self.write_reg(r, v)
@@ -504,6 +655,9 @@ mod tests {
             self.flash_updates += 1;
             Ok(())
         }
+        fn poll_eerd_read_done(&mut self) -> Result<(), I225NvmError> {
+            Ok(())
+        }
     }
     #[test]
     fn swfw_access_sets_software_bit_and_release_clears_only_requested_bit() {
@@ -539,5 +693,28 @@ mod tests {
                 .fold(0u16, u16::wrapping_add),
         );
         assert_eq!((io.read_reg(SRWR) >> NVM_RW_REG_DATA) as u16, checksum);
+    }
+
+    #[test]
+    fn flash_register_helpers_apply_bounds_completion_and_lplu_masks() {
+        let mut io = SemIo::default();
+        assert!(igc_get_flash_presence_i225(&mut io) == false);
+        io.write_reg(EECD, EECD_FLASH_DETECTED);
+        assert!(igc_get_flash_presence_i225(&mut io));
+        assert!(igc_set_flsw_flash_burst_counter_i225(&mut io, SHADOW_RAM_SIZE - 1).is_ok());
+        assert!(igc_set_flsw_flash_burst_counter_i225(&mut io, SHADOW_RAM_SIZE).is_err());
+        assert!(igc_write_erase_flash_command_i225(&mut io, WRITE_CMD_OPCODE, 8).is_ok());
+        io.write_reg(I225_PHPM, 0);
+        igc_set_d0_lplu_state_i225(&mut io, true);
+        assert_eq!(
+            io.read_reg(I225_PHPM),
+            I225_PHPM_DIS_1000 | I225_PHPM_DIS_2500
+        );
+        io.write_reg(I225_PHPM, 0);
+        igc_set_d3_lplu_state_i225(&mut io, true);
+        assert_eq!(
+            io.read_reg(I225_PHPM),
+            I225_PHPM_DIS_100_D3 | I225_PHPM_DIS_1000_D3 | I225_PHPM_DIS_2500_D3
+        );
     }
 }
