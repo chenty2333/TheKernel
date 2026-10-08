@@ -4770,6 +4770,36 @@ pub fn em_sysctl_rx_ring_handler<I: E1000RegisterIo>(
     })
 }
 
+/// upstream: if_em.c em_sysctl_interrupt_rate_handler()
+pub fn em_sysctl_interrupt_rate_handler<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    msix: bool,
+    vector: u16,
+) -> DevResult<u32> {
+    let register = if mac >= E1000MacType::I82575 || (mac == E1000MacType::I82574 && msix) {
+        0x01680 + u32::from(vector) * 4
+    } else {
+        E1000_ITR
+    };
+    let value = io.read_register(register)?;
+    let rate = if mac < E1000MacType::I82575 {
+        if value == 0 {
+            0
+        } else {
+            (1_000_000_000u64 / (u64::from(value) * 256)) as u32
+        }
+    } else {
+        let interval = value & EITR_MASK;
+        if interval == 0 {
+            0
+        } else {
+            4_000_000 / interval
+        }
+    };
+    Ok(rate)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeMap;
@@ -6000,5 +6030,30 @@ mod tests {
         io.0.insert(rx_desc_tail(2), 9);
         assert_eq!(em_sysctl_tx_ring_handler(&mut io, 1, true).unwrap(), 4);
         assert_eq!(em_sysctl_rx_ring_handler(&mut io, 2, false).unwrap(), 9);
+    }
+
+    #[test]
+    fn interrupt_rate_reporting_selects_legacy_82574_and_igb_vectors() {
+        let mut io = RegisterMock::default();
+        io.0.insert(E1000_ITR, 1953);
+        io.0.insert(0x01680 + 2 * 4, 8192);
+        io.0.insert(0x01680 + 3 * 4, 2560);
+        assert_eq!(
+            em_sysctl_interrupt_rate_handler(&mut io, E1000MacType::I82540, false, 0).unwrap(),
+            2000
+        );
+        assert_eq!(
+            em_sysctl_interrupt_rate_handler(&mut io, E1000MacType::I82574, true, 2).unwrap(),
+            476
+        );
+        assert_eq!(
+            em_sysctl_interrupt_rate_handler(&mut io, E1000MacType::I82576, true, 3).unwrap(),
+            1562
+        );
+        io.0.insert(E1000_ITR, 0);
+        assert_eq!(
+            em_sysctl_interrupt_rate_handler(&mut io, E1000MacType::I82540, false, 0).unwrap(),
+            0
+        );
     }
 }
