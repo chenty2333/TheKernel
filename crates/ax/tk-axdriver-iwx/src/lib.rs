@@ -39,6 +39,7 @@ mod nvm;
 mod phy;
 mod pm;
 mod power;
+mod preinit;
 mod queue;
 mod rate;
 mod registers;
@@ -238,6 +239,7 @@ pub use power::{
     set_beacon_filter, uapsd_ac_flags, uapsd_ac_mask, uapsd_qndp_tid, uapsd_service_period,
     update_beacon_abort,
 };
+pub use preinit::{PreinitPlan, preinit_plan};
 pub use queue::{
     CMD_VERSION_UNKNOWN as QUEUE_CMD_VERSION_UNKNOWN, DATA_PATH_GROUP as TX_DATA_PATH_GROUP,
     DEFAULT_QUEUE_SIZE, DQA_CMD_QUEUE, DQA_QUEUE_ADD, DQA_QUEUE_REMOVE, MGMT_TID, QueueConfig,

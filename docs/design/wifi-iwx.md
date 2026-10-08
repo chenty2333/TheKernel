@@ -136,6 +136,11 @@ rates before narrowing and after widening the channel context.
 CRF/CNV PRPH identity reads enable the WFPM auxiliary MAC owner and apply the
 BZ/BZ-W stepping exceptions, including BZ-U's A-to-B promotion.
 
+After Init/NVM, preinit planning now retains the selected hardware address,
+NVM-derived channel map, HT/VHT rate/STBC capabilities, 5-GHz rate availability,
+and the already-attached address-refresh fast path for later interface
+publication.
+
 TX queues now track occupied descriptor slots through the source consumer SSN,
 reclaim descriptor/byte-count state, retain owned payload DMA buffers until
 completion, retire host-command queue occupancy on CMD_DONE, and expose the

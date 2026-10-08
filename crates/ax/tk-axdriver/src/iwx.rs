@@ -14,7 +14,8 @@ use axalloc::{UsageKind, global_allocator};
 use axdriver_iwx::{
     AX211_DEVICE_ID, AttachAllocationError, AttachProfile, CsrAccess, DmaAllocator, DmaError,
     DmaRegion, FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IoBarrier,
-    IwxController, NvmInfo, RuntimeConfig, attach_profile, matches_pci_device,
+    IwxController, NvmInfo, PreinitPlan, RuntimeConfig, attach_profile, matches_pci_device,
+    preinit_plan,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -185,6 +186,7 @@ struct AttachedDevice {
     controller: IwxController<MmioCsrAccess, PlatformDmaAllocator>,
     firmware: Option<Result<FirmwareBundle, FirmwareRequestError>>,
     nvm: Option<NvmInfo>,
+    preinit: Option<PreinitPlan>,
 }
 
 #[derive(Debug)]
@@ -293,6 +295,7 @@ fn allocate_resources(
         controller,
         firmware: None,
         nvm: None,
+        preinit: None,
     });
     Ok(())
 }
@@ -565,6 +568,13 @@ fn stage_rootfs_firmware() {
                                 nvm.hardware_address[5],
                                 nvm.channel_profiles.len(),
                             );
+                            device.preinit = Some(preinit_plan(
+                                false,
+                                nvm.hardware_address,
+                                &nvm,
+                                device.profile.uhb_supported,
+                                false,
+                            ));
                             device.nvm = Some(nvm);
                         }
                         Err(error) => log_bootstrap_error(bdf, error),
