@@ -1006,3 +1006,9 @@ requester, fuse, enable/disable, and state-query helpers from Linux v7.2.3
 `intel_display_power_well.c` (MIT, Copyright © 2022 Intel). The typed kernel
 register adapter consumes the translated handshake for the current PW_1 and
 DDI-IO paths; IRQ-coupled wells and full refcount lifecycle remain.
+
+`crates/ax/tk-intel-display/src/dc_state.rs` translates the display-12/13
+`gen9_dc_mask()` and `gen9_write_dc_state()` logic plus the field read-modify-
+write part of `gen9_set_dc_state()` from the same MIT source file (Copyright
+© 2022 Intel). `kernel/src/drm/intel/power.rs` uses it for the boot-time DC
+disable sequence; asynchronous DC5/6/9 transitions are not yet wired.

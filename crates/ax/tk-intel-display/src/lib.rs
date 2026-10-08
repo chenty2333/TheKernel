@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod audio;
 pub mod cdclk;
+pub mod dc_state;
 pub mod color;
 pub mod ddi;
 pub mod device;

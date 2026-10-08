@@ -263,3 +263,9 @@ gen9_wait_for_power_well_fuses(), hsw_wait_for_power_well_enable/disable(),
 hsw_power_well_enable/disable(), and hsw_power_well_enabled() (MIT, Copyright
 ©2022 Intel). The kernel's typed register adapter uses this path for PW_1 and
 the current DDI-IO power requests; interrupt-dependent well variants remain.
+
+DC state fields: src/dc_state.rs translates intel_display_power_well.c
+gen9_dc_mask(), gen9_write_dc_state(), and the MMIO field portion of
+gen9_set_dc_state(). Copyright ©2022 Intel Corporation; full grant in
+LICENSE-MIT. The kernel uses this for initial DC-state disable and records
+the source retry outcome; DMC target-state and refcount lifecycle remain.

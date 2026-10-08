@@ -197,13 +197,6 @@ pub(crate) const WELL_FUSE_TIMEOUT_US: u32 = 1_000;
 /// outcome, because it reports the value it actually saw.
 pub(crate) const DBUF_STATE_TIMEOUT_US: u32 = 10;
 
-/// How many times the `DC_STATE_EN` write may be retried.
-///
-/// `[I915]` `gen9_write_dc_state` rewrites up to 100 times, because the
-/// hardware is documented to ignore a DC state change while it is still
-/// restoring register state.  Reference §12.1.
-pub(crate) const DC_STATE_ATTEMPTS: u32 = 100;
-
 /// One power well: its name, where its request bit lives, its index, and which
 /// power gate's fuse bit announces it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -530,12 +523,13 @@ pub(crate) struct DcStateObservation {
     pub(crate) already_disabled: bool,
     /// How many writes it took.  Zero when the field was already clear.
     pub(crate) writes: u32,
+    pub(crate) state_stuck: bool,
 }
 
 impl DcStateObservation {
     pub(crate) fn describe(&self) -> String {
         format!(
-            "DC states: {:#010x} -> {:#010x} (field {:#x} {}{})",
+            "DC states: {:#010x} -> {:#010x} (field {:#x} {}{}, {})",
             self.before,
             self.after,
             self.after & DC_STATE_MASK,
@@ -548,6 +542,11 @@ impl DcStateObservation {
                 0 => String::new(),
                 1 => String::from(", one write"),
                 n => format!(", {n} writes"),
+            },
+            if self.state_stuck {
+                "still not matched after the i915 retry loop"
+            } else {
+                "readback matched"
             },
         )
     }
@@ -771,12 +770,6 @@ pub(crate) enum PowerError {
     DisplayDisabledStrap {
         sfuse_strap: u32,
     },
-    /// `DC_STATE_EN` would not take the disable.
-    DcStateNotDisabled {
-        wrote: u32,
-        readback: u32,
-        writes: u32,
-    },
     Phy(phy::PhyError),
     /// A phase after `PW_1` came up failed.
     ///
@@ -833,15 +826,6 @@ impl PowerError {
                 "SFUSE_STRAP reads {sfuse_strap:#010x} with bit 7 set, so this SKU declares the \
                  display disabled.  Reference section 3.5; section 3.6 notes the OpRegion's \
                  PCON_HEADLESS_SKU bit as the other way a machine says this"
-            ),
-            Self::DcStateNotDisabled {
-                wrote,
-                readback,
-                writes,
-            } => format!(
-                "DC_STATE_EN did not take {wrote:#010x} after {writes} writes; it reads \
-                 {readback:#010x}.  Reference section 11 phase 1.1: with DC states enabled the \
-                 hardware may power-gate what the driver is programming, intermittently"
             ),
             Self::Phy(error) => error.describe(),
             Self::AfterPowerUp {
@@ -936,6 +920,7 @@ impl<R: Registers> HswPowerWellAdapter<'_, R> {
             regs::ICL_PWR_WELL_CTL_AUX2,
             regs::SKL_FUSE_STATUS,
             regs::GEN8_CHICKEN_DCPR_1,
+            regs::DC_STATE_EN,
         ]
         .into_iter()
         .find(|register| register.offset() == offset)
@@ -1007,38 +992,39 @@ impl<R: Registers> intel_display::power_well::HswPowerWellIo for HswPowerWellAda
 /// so a kernel with no DMC firmware is viable and the wells stay under the
 /// driver's control.
 ///
-/// The write is a read-modify-write of the field software owns, not a write of
-/// zero: `DC_STATE_EN` also carries status and hardware-communication bits,
-/// and §12.1 says software must not change bits 9, 8 and 4.  `[I915]`
-/// `gen9_write_dc_state` retries up to 100 times, because the hardware is
-/// documented to ignore a DC state change while it is restoring register state,
-/// so a single write and a read-back would be a false failure waiting to
-/// happen.
-pub(crate) fn disable_dc_states(regs: &impl Registers) -> Result<DcStateObservation, PowerError> {
-    let before = read(regs, regs::DC_STATE_EN)?;
-    let already_disabled = before & DC_STATE_MASK == DC_STATE_DISABLE;
-    let mut after = before;
-    let mut writes = 0;
-    let mut last_written = before;
-    while after & DC_STATE_MASK != DC_STATE_DISABLE && writes < DC_STATE_ATTEMPTS {
-        last_written = (after & !DC_STATE_MASK) | DC_STATE_DISABLE;
-        write(regs, regs::DC_STATE_EN, last_written)?;
-        writes += 1;
-        after = read(regs, regs::DC_STATE_EN)?;
-    }
-
-    if after & DC_STATE_MASK != DC_STATE_DISABLE {
-        return Err(PowerError::DcStateNotDisabled {
-            wrote: last_written,
-            readback: after,
-            writes,
-        });
-    }
+/// The translated `gen9_dc_mask` preserves status and hardware-communication
+/// fields; `gen9_write_dc_state` performs i915's initial write and up to 100
+/// rewrites. A persistent mismatch is recorded in `state_stuck` rather than
+/// converted into a new fatal policy.
+pub(crate) fn disable_dc_states<R: Registers>(regs: &R) -> Result<DcStateObservation, PowerError> {
+    let adapter = HswPowerWellAdapter { regs };
+    let state = intel_display::dc_state::gen9_set_dc_state_field(
+        &adapter,
+        regs::DC_STATE_EN.offset(),
+        13,
+        false,
+        DC_STATE_DISABLE,
+    )
+    .map_err(|error| match error {
+        intel_display::Error::Unavailable(offset) => PowerError::Unreadable {
+            register: HswPowerWellAdapter::<R>::register(offset)
+                .map(Register::name)
+                .unwrap_or(regs::DC_STATE_EN.name()),
+        },
+        _ => PowerError::WriteRefused {
+            register: regs::DC_STATE_EN.name(),
+        },
+    })?;
+    let mask = intel_display::dc_state::gen9_dc_mask(13, false);
+    let before = state.before.ok_or(PowerError::Unreadable {
+        register: regs::DC_STATE_EN.name(),
+    })?;
     Ok(DcStateObservation {
         before,
-        after,
-        already_disabled,
-        writes,
+        after: state.readback,
+        already_disabled: before & mask == DC_STATE_DISABLE,
+        writes: 1 + u32::from(state.rewrites),
+        state_stuck: state.readback & mask != DC_STATE_DISABLE,
     })
 }
 
@@ -1598,29 +1584,24 @@ mod tests {
             "the other bits survive"
         );
 
-        // A machine that already had DC disabled is not rewritten.
+        // i915 still writes the selected field when it already reads clear.
         let regs = powered_machine();
         regs.set(regs::DC_STATE_EN, 1 << 4);
         let observation = disable_dc_states(&regs).unwrap();
         assert!(observation.already_disabled);
-        assert!(regs.writes().is_empty());
+        assert_eq!(observation.writes, 1);
+        assert_eq!(regs.writes().len(), 1);
     }
 
     #[test]
-    fn a_dc_state_that_will_not_take_the_write_is_an_error() {
-        // i915 retries up to 100 times because the hardware ignores the write
-        // while it restores state; when it never takes, that is a real failure
-        // and the count is in the message.
+    fn a_dc_state_that_ignores_the_write_records_i915_retry_exhaustion() {
         let regs = powered_machine();
         regs.set(regs::DC_STATE_EN, 1);
         regs.derive(regs::DC_STATE_EN, |_| 1); // the write never lands
-        let error = disable_dc_states(&regs).unwrap_err();
-        assert!(matches!(
-            error,
-            PowerError::DcStateNotDisabled { writes: 100, .. }
-        ));
-        let text = error.describe();
-        assert!(text.contains("intermittently"), "{text}");
+        let state = disable_dc_states(&regs).unwrap();
+        assert!(state.state_stuck);
+        assert_eq!(state.writes, 101); // initial write + 100 rewrites
+        assert_eq!(state.after, 1);
     }
 
     #[test]

@@ -554,3 +554,8 @@ The MIT `intel_display_power_well.c` request/fuse helpers are translated in
 `tk-intel-display/src/power_well.rs` (Copyright © 2022 Intel), with the current
 kernel adapter invoking them using typed register access. No firmware or binary
 payload is imported by this code.
+
+The MIT `intel_display_power_well.c` DC mask and write-retry functions are
+translated in `tk-intel-display/src/dc_state.rs` (Copyright © 2022 Intel).
+The kernel uses the source retry loop for the initial disable request; the
+larger DMC-controlled DC transition and runtime lifecycle are not included.
