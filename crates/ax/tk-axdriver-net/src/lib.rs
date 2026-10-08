@@ -33,6 +33,13 @@ pub use self::net_buf::{NetBuf, NetBufBox, NetBufPool, NetBufPtr};
 /// The ethernet address of the NIC (MAC address).
 pub struct EthernetAddress(pub [u8; 6]);
 
+/// One validated frequency made available by a wireless hardware radio.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WirelessFrequency {
+    pub frequency_mhz: u32,
+    pub no_ir: bool,
+}
+
 /// Operations that require a network device (NIC) driver to implement.
 pub trait NetDriverOps: BaseDriverOps {
     /// Preferred init-net interface name, when the driver owns a named link.
@@ -59,6 +66,11 @@ pub trait NetDriverOps: BaseDriverOps {
     /// Change software rfkill state when this wireless adapter can serialize it.
     fn set_rfkill_soft_blocked(&mut self, _blocked: bool) -> DevResult {
         Err(DevError::Unsupported)
+    }
+
+    /// Frequencies validated by the device NVM/regulatory admission path.
+    fn wireless_frequencies(&self) -> alloc::vec::Vec<WirelessFrequency> {
+        alloc::vec::Vec::new()
     }
 
     /// Change administrative radio state before the interface state is published.

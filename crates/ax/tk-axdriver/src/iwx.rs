@@ -18,7 +18,9 @@ use axdriver_iwx::{
     IwxController, NvmInfo, PreinitPlan, RuntimeConfig, attach_profile, matches_pci_device,
     preinit_plan,
 };
-use axdriver_net::{EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps};
+use axdriver_net::{
+    EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps, WirelessFrequency,
+};
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
 use spin::Mutex;
@@ -293,6 +295,24 @@ impl NetDriverOps for IwxNetDevice {
 
     fn set_rfkill_soft_blocked(&mut self, blocked: bool) -> DevResult {
         set_soft_blocked(self.bdf, blocked).map_err(|_| DevError::BadState)
+    }
+
+    fn wireless_frequencies(&self) -> Vec<WirelessFrequency> {
+        let devices = ATTACHED_DMA.lock();
+        let Some(device) = devices.iter().find(|device| device.bdf == self.bdf) else {
+            return Vec::new();
+        };
+        let Some(nvm) = device.nvm.as_ref() else {
+            return Vec::new();
+        };
+        axdriver_iwx::init_channel_map(nvm, device.profile.uhb_supported)
+            .into_iter()
+            .filter(|channel| channel.flags != 0)
+            .map(|channel| WirelessFrequency {
+                frequency_mhz: u32::from(channel.frequency_mhz),
+                no_ir: channel.flags & axdriver_iwx::CHAN_PASSIVE != 0,
+            })
+            .collect()
     }
 
     fn set_link_up(&mut self, up: bool) -> DevResult {

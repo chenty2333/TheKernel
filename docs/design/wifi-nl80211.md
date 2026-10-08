@@ -30,13 +30,12 @@ The kernel registers the family id/name and multicast-group names and encodes
 GET_INTERFACE/GET_WIPHY records from the wireless-link registry. Both dump
 requests return a multipart NLMSG_DONE when there are no wireless devices,
 which is the empty-radio path used by `iw dev` and `iw phy`. The registered-radio
-record path currently carries interface identity and station type. GET_REG returns
-the global world alpha2 value; regulatory rule tables and per-phy domains are
-not yet emitted. GET_SCAN
+record path currently carries interface identity, station type, and valid 2.4/5
+GHz NVM frequencies with NO_IR flags. It does not yet emit legacy/HT/VHT/HE
+rates or supported ciphers. GET_REG returns the global world alpha2 value;
+regulatory rule tables and per-phy domains are not yet emitted. GET_SCAN
 accepts a dump request for a registered interface and emits an empty multipart
-result until a scan cache is connected; it does not start scans. The family does
-not yet implement bands/frequencies or the command/event operations listed
-above.
-It therefore does not advertise scan, connection, key, regulatory, or station
-operations as available. The required no-radio QEMU acceptance is deferred
+result until a scan cache is connected; it does not start scans. TRIGGER_SCAN,
+scan events, connection/authentication, key, station and regulatory rule
+operations remain incomplete. The required no-radio QEMU acceptance is deferred
 until the task-5 command surface is complete; no fake radio is used.

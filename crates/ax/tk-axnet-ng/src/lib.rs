@@ -90,6 +90,12 @@ pub const MAX_LISTEN_BACKLOG: usize = consts::LISTEN_QUEUE_SIZE;
 static DEFAULT_STACK: Once<Arc<NetStack>> = Once::new();
 
 /// One published 802.11 interface backed by an Ethernet-compatible netdev.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WirelessFrequencyInfo {
+    pub frequency_mhz: u32,
+    pub no_ir: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WirelessInterfaceInfo {
     pub name: alloc::string::String,
@@ -97,6 +103,7 @@ pub struct WirelessInterfaceInfo {
     pub phy_index: u32,
     pub rfkill_index: u32,
     pub mac_address: [u8; 6],
+    pub frequencies: alloc::vec::Vec<WirelessFrequencyInfo>,
     pub soft_blocked: bool,
     pub hard_blocked: bool,
 }
@@ -237,6 +244,14 @@ pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
     let mac_address = dev.mac_address().0;
     let soft_blocked = dev.rfkill_soft_blocked();
     let hard_blocked = dev.rfkill_hard_blocked();
+    let frequencies = dev
+        .wireless_frequencies()
+        .into_iter()
+        .map(|frequency| WirelessFrequencyInfo {
+            frequency_mhz: frequency.frequency_mhz,
+            no_ir: frequency.no_ir,
+        })
+        .collect();
     let stack = default_stack();
     let interface = Box::new(EthernetDevice::new(
         name.to_owned(),
@@ -269,6 +284,7 @@ pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
         phy_index,
         rfkill_index: phy_index,
         mac_address,
+        frequencies,
         soft_blocked,
         hard_blocked,
     });

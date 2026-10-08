@@ -28,9 +28,13 @@ const ATTR_IFINDEX: u16 = 3;
 const ATTR_IFNAME: u16 = 4;
 const ATTR_IFTYPE: u16 = 5;
 const ATTR_MAC: u16 = 6;
+const ATTR_WIPHY_BANDS: u16 = 22;
 const ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
 const ATTR_REG_ALPHA2: u16 = 33;
+const BAND_ATTR_FREQS: u16 = 1;
+const FREQ_ATTR_FREQ: u16 = 1;
+const FREQ_ATTR_NO_IR: u16 = 3;
 const IFTYPE_STATION: u32 = 2;
 const IFTYPE_STATION_ATTR: u16 = 2;
 const NLM_F_DUMP: u16 = 0x0300;
@@ -270,6 +274,39 @@ fn wiphy_message(
         ATTR_SUPPORTED_IFTYPES | NLA_F_NESTED,
         &interface_types,
     );
+    let mut bands = Vec::new();
+    for (band_id, is_2ghz) in [(0u16, true), (1u16, false)] {
+        let mut frequencies = Vec::new();
+        for (index, frequency) in interface
+            .frequencies
+            .iter()
+            .filter(|frequency| (frequency.frequency_mhz < 3000) == is_2ghz)
+            .enumerate()
+        {
+            let mut attributes = Vec::new();
+            push_attr(
+                &mut attributes,
+                FREQ_ATTR_FREQ,
+                &frequency.frequency_mhz.to_ne_bytes(),
+            );
+            if frequency.no_ir {
+                push_attr(&mut attributes, FREQ_ATTR_NO_IR, &[]);
+            }
+            push_attr(&mut frequencies, (index + 1) as u16, &attributes);
+        }
+        if !frequencies.is_empty() {
+            let mut attributes = Vec::new();
+            push_attr(
+                &mut attributes,
+                BAND_ATTR_FREQS | NLA_F_NESTED,
+                &frequencies,
+            );
+            push_attr(&mut bands, band_id | NLA_F_NESTED, &attributes);
+        }
+    }
+    if !bands.is_empty() {
+        push_attr(&mut payload, ATTR_WIPHY_BANDS | NLA_F_NESTED, &bands);
+    }
     nl80211_message(request, port_id, FAMILY_ID, payload, multipart)
 }
 
@@ -427,6 +464,16 @@ mod tests {
             phy_index: 2,
             rfkill_index: 2,
             mac_address: [2, 0, 0, 0, 0, 9],
+            frequencies: alloc::vec![
+                axnet::WirelessFrequencyInfo {
+                    frequency_mhz: 2412,
+                    no_ir: false,
+                },
+                axnet::WirelessFrequencyInfo {
+                    frequency_mhz: 5180,
+                    no_ir: true,
+                },
+            ],
             soft_blocked: false,
             hard_blocked: false,
         };
@@ -467,6 +514,39 @@ mod tests {
             read_unaligned::<NlMsgHdr>(&message).unwrap().nlmsg_flags & NLM_F_MULTI,
             0
         );
+        let attrs = &message[generic + size_of::<GenlMsgHdr>()..];
+        let mut frequencies = Vec::new();
+        for_each_rtattr(attrs, |kind, value| {
+            if kind == ATTR_WIPHY_BANDS {
+                for_each_rtattr(value, |band, band_attributes| {
+                    for_each_rtattr(band_attributes, |band_kind, band_value| {
+                        if band_kind == BAND_ATTR_FREQS {
+                            for_each_rtattr(band_value, |_, frequency_attributes| {
+                                let mut mhz = None;
+                                let mut no_ir = false;
+                                for_each_rtattr(frequency_attributes, |frequency_kind, bytes| {
+                                    match frequency_kind {
+                                        FREQ_ATTR_FREQ => {
+                                            mhz =
+                                                Some(u32::from_ne_bytes(bytes.try_into().unwrap()));
+                                        }
+                                        FREQ_ATTR_NO_IR => no_ir = true,
+                                        _ => {}
+                                    }
+                                    Ok(())
+                                })?;
+                                frequencies.push((band, mhz.ok_or(AxError::InvalidInput)?, no_ir));
+                                Ok(())
+                            })?;
+                        }
+                        Ok(())
+                    })
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frequencies, [(0, 2412, false), (1, 5180, true)]);
     }
 
     #[test]
