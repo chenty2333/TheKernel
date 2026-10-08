@@ -86,6 +86,30 @@ pub fn begin_scan(progress: &mut ScanProgress, hostap_mode: bool) {
     }
 }
 
+/// Restore the active channel bitmap and prime the ANY-channel BSS sentinel.
+// upstream: ieee80211_node.c ieee80211_reset_scan()
+pub fn reset_scan_channels(
+    active: &[bool],
+    pending: &mut [bool],
+    current: &mut usize,
+    bss_channel_is_any: bool,
+) -> Result<(), ScanError> {
+    if active.is_empty() {
+        return Err(ScanError::EmptyChannelSet);
+    }
+    if active.len() != pending.len() {
+        return Err(ScanError::PendingSetLengthMismatch);
+    }
+    if !bss_channel_is_any && *current >= active.len() {
+        return Err(ScanError::CurrentChannelOutOfRange);
+    }
+    pending.copy_from_slice(active);
+    if bss_channel_is_any {
+        *current = active.len() - 1;
+    }
+    Ok(())
+}
+
 /// Pick and clear the next pending channel, wrapping once and skipping passive channels in active mode.
 // upstream: ieee80211_node.c ieee80211_next_scan()
 pub fn next_scan_channel(
@@ -222,5 +246,20 @@ mod tests {
             Ok(ScanStep::NextChannel(2))
         );
         assert!(!pending[2]);
+    }
+
+    #[test]
+    fn reset_scan_restores_active_mask_and_any_channel_starts_before_first_entry() {
+        let active = [true, false, true, true];
+        let mut pending = [false; 4];
+        let mut current = 1;
+        let channels = [NetChannel::default(); 4];
+        reset_scan_channels(&active, &mut pending, &mut current, true).unwrap();
+        assert_eq!(pending, active);
+        assert_eq!(current, active.len() - 1);
+        assert_eq!(
+            next_scan_channel(&channels, &mut pending, active.len() - 1, false),
+            Ok(ScanStep::NextChannel(0))
+        );
     }
 }

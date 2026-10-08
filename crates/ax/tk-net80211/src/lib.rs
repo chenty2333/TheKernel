@@ -156,4 +156,5 @@ pub use sa_query::{
 pub use scan::{
     BackgroundScanEffects, BackgroundScanPolicy, ScanError, ScanProgress, ScanStep,
     background_scan_timeout, begin_background_scan, begin_scan, next_scan_channel,
+    reset_scan_channels,
 };

@@ -223,3 +223,8 @@ The generic management watchdog helper preserves the countdown and timer-rearm
 behavior, moves any expired management state to SCAN, and adds station peer
 failure/auto-join deselection effects only for AUTH/ASSOC timeouts. The timer
 scheduler and actual state transition remain owned by the caller.
+
+OpenBSD `ieee80211_reset_scan()` is represented by `reset_scan_channels()`:
+it copies the active-channel bitmap back to the pending bitmap, and when the
+BSS channel is ANY it positions the channel cursor one entry before the first
+slot so the next-channel walk wraps to channel zero.

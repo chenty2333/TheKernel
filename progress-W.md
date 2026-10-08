@@ -96,3 +96,4 @@
 - nl80211 GET_REG now returns the UAPI-encoded global world alpha2 attribute and validates optional wiphy selection; regulatory rule tables and per-radio regulatory state remain open.
 - `ieee80211.c` background scan start/timeout helpers are now translated as a driver callback plan with source state/re-entry/timer/RSN-port gates and scan-node/cache effects; ieee80211.c marker coverage advances from 13/25 to 15/25; net80211 tests increased to 98.
 - `ieee80211.c` management watchdog countdown/rearm and station AUTH/ASSOC timeout effects now map to a typed transition plan; source-function marker coverage advances from 15/25 to 16/25.
+- `ieee80211_node.c` `ieee80211_reset_scan()` now restores the active channel mask and preserves ANY-channel wrap-to-first selection; node.c marker coverage advances from 39/110 to 40/110.
