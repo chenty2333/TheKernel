@@ -33,7 +33,7 @@ which is the empty-radio path used by `iw dev` and `iw phy`. The registered-radi
 record path currently carries interface identity, station type, and valid 2.4/5
 GHz NVM frequencies with NO_IR flags. Legacy 2.4/5 GHz bitrate tables and
 NVM/antenna-derived HT/VHT capability, MCS, and A-MPDU attributes are emitted;
-HE maps and supported cipher suites are not yet advertised. Rates use the
+HE maps are not yet advertised. Rates use the
 matching 100-kbit/s UAPI units and 2.4 GHz short-preamble flags.
 The wiphy advertises a one-SSID scan limit and the GET_WIPHY,
 GET_INTERFACE, TRIGGER_SCAN, ABORT_SCAN, GET_SCAN, GET_REG, CONNECT,
@@ -55,16 +55,20 @@ the global world alpha2 value; regulatory rule tables and per-phy domains are
 not yet emitted. CONNECT admits either an open BSS or WPA2-PSK/CCMP on an
 observed RSN BSS and fails closed for unsupported AKM/cipher combinations.
 The userspace supplicant owns the EAPOL four-way handshake; NEW_KEY/SET_KEY/
-GET_KEY/DEL_KEY install software CCMP keys and GET_KEY returns the packet
-sequence without disclosing key bytes. SET_PMKSA/DEL_PMKSA/FLUSH_PMKSA validate
+GET_KEY/DEL_KEY install software CCMP keys and BIP-CMAC-128 IGTK/BIGTK receive
+keys, and GET_KEY returns the packet/IPN sequence without disclosing key bytes.
+SET_PMKSA/DEL_PMKSA/FLUSH_PMKSA validate
 standard peer/PMKID attributes but do not cache key material in the kernel;
 the supplicant owns PMKSA state and supplies any selected PMKID in CONNECT IEs.
-CONNECT also accepts the nl80211 frequency selector and the wpa_supplicant
-control-port tuple for EAPOL (0x888e); EAPOL remains unencrypted on the
-Ethernet-compatible station port. BSSID/frequency hints are treated only as
-hints, while a requested frequency is matched against the cached BSS. MFP
-requests other than disabled are rejected because management protection is not
-implemented.
+CONNECT also accepts the nl80211 frequency selector, wpa_supplicant control
+port tuple for EAPOL (0x888e), and USE_MFP values NO/REQUIRED/OPTIONAL. The
+wiphy advertises `MFP_OPTIONAL`, and the cipher suite list includes BIP-CMAC-
+128 for IGTK/BIGTK IDs 4-7. EAPOL remains unencrypted on the Ethernet-compatible
+station port. BSSID/frequency hints are treated only as hints, while a
+requested frequency is matched against the cached BSS. MFP negotiation is
+fail-closed against the AP RSN capabilities/group-management cipher. SET_KEY
+accepts KEY_DEFAULT_MGMT and the task-context RX path publishes authenticated
+MFP deauth/disassoc events on `mlme`.
 Successful CONNECT and DISCONNECT
 queue their standard command events on the `mlme` group; CONNECT carries the
 association request/response IEs retained by the driver. GET_STATION encodes

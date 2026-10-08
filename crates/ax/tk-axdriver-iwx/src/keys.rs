@@ -466,6 +466,11 @@ mod tests {
         assert_eq!(v2.bytes.len(), 60);
         assert_eq!(&v1.bytes[60..64], &4u32.to_le_bytes());
         assert_eq!(&v2.bytes[44..48], &4u32.to_le_bytes());
+        for key_id in 4..=7 {
+            let big_or_integrity_key = KeyConfig { key_id, ..igtk };
+            let command = igtk_command(&big_or_integrity_key, 0, true, false, 0).unwrap();
+            assert_eq!(&command.bytes[44..48], &u32::from(key_id).to_le_bytes());
+        }
         assert!(
             igtk_command(
                 &KeyConfig {

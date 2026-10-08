@@ -29,7 +29,7 @@ pub use {
     axdriver_net::{
         NetBufPtr, NetDriverOps, WirelessBssInfo, WirelessConnectRequest, WirelessFrequency,
         WirelessHtCapabilities, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation,
-        WirelessPhyCapabilities, WirelessScanEvent, WirelessScanRequest, WirelessStationInfo,
+        WirelessDisconnectEvent, WirelessPhyCapabilities, WirelessScanEvent, WirelessScanRequest, WirelessStationInfo,
         WirelessVhtCapabilities,
     },
 };

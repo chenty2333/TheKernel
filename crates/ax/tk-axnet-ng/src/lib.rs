@@ -63,12 +63,13 @@ pub use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use spin::Once;
 
 pub use axdriver::prelude::{
-    WirelessBssInfo, WirelessConnectRequest, WirelessHtCapabilities, WirelessPhyCapabilities,
-    WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation, WirelessScanEvent,
+    WirelessBssInfo, WirelessConnectRequest, WirelessDisconnectEvent, WirelessHtCapabilities,
+    WirelessPhyCapabilities, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation, WirelessScanEvent,
     WirelessScanRequest, WirelessStationInfo, WirelessVhtCapabilities,
 };
 
 static WIRELESS_SCAN_EVENT_CALLBACK: Once<fn(u32, WirelessScanEvent)> = Once::new();
+static WIRELESS_DISCONNECT_EVENT_CALLBACK: Once<fn(u32, WirelessDisconnectEvent)> = Once::new();
 
 /// Register the kernel nl80211 recipient for completed firmware scans.
 pub fn register_wireless_scan_event_callback(callback: fn(u32, WirelessScanEvent)) {
@@ -77,6 +78,20 @@ pub fn register_wireless_scan_event_callback(callback: fn(u32, WirelessScanEvent
 
 pub(crate) fn publish_wireless_scan_event(ifindex: u32, event: WirelessScanEvent) {
     if let Some(callback) = WIRELESS_SCAN_EVENT_CALLBACK.get() {
+        callback(ifindex, event);
+    }
+}
+
+/// Register the kernel nl80211 recipient for unsolicited wireless disconnects.
+pub fn register_wireless_disconnect_event_callback(callback: fn(u32, WirelessDisconnectEvent)) {
+    let _ = WIRELESS_DISCONNECT_EVENT_CALLBACK.call_once(|| callback);
+}
+
+pub(crate) fn publish_wireless_disconnect_event(
+    ifindex: u32,
+    event: WirelessDisconnectEvent,
+) {
+    if let Some(callback) = WIRELESS_DISCONNECT_EVENT_CALLBACK.get() {
         callback(ifindex, event);
     }
 }

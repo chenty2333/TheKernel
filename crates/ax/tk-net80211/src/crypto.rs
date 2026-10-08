@@ -172,7 +172,7 @@ pub fn select_rx_key(
         return None;
     }
     let key_id = u16::from_le_bytes([mmie[2], mmie[3]]);
-    if key_id != 4 && key_id != 5 {
+    if !(4..=7).contains(&key_id) {
         return None;
     }
     Some(KeySelection::Group(key_id as u8))
@@ -249,6 +249,13 @@ mod tests {
             select_rx_key(&mfp, 24, true, false),
             Some(KeySelection::Group(4))
         );
+        for key_id in 4..=7 {
+            mfp[off + 2..off + 4].copy_from_slice(&u16::from(key_id).to_le_bytes());
+            assert_eq!(
+                select_rx_key(&mfp, 24, true, false),
+                Some(KeySelection::Group(key_id))
+            );
+        }
         mfp[off + 2] = 8;
         assert_eq!(select_rx_key(&mfp, 24, true, false), None);
     }

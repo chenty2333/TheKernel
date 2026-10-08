@@ -50,6 +50,7 @@ const ATTR_KEY_IDX: u16 = 9;
 const ATTR_KEY_CIPHER: u16 = 10;
 const ATTR_KEY_SEQ: u16 = 11;
 const ATTR_KEY_DEFAULT: u16 = 12;
+const ATTR_KEY_DEFAULT_MGMT: u16 = 40;
 const ATTR_KEY_DEFAULT_TYPES: u16 = 110;
 const KEY_DEFAULT_TYPE_UNICAST: u16 = 1;
 const KEY_DEFAULT_TYPE_MULTICAST: u16 = 2;
@@ -83,6 +84,8 @@ const ATTR_SUPPORTED_COMMANDS: u16 = 50;
 const ATTR_CIPHER_SUITES: u16 = 57;
 const ATTR_MAX_NUM_PMKIDS: u16 = 86;
 const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
+const ATTR_EXT_FEATURES: u16 = 217;
+const NL80211_EXT_FEATURE_MFP_OPTIONAL: usize = 21;
 const ATTR_REG_ALPHA2: u16 = 33;
 const BAND_ATTR_FREQS: u16 = 1;
 const BAND_ATTR_RATES: u16 = 2;
@@ -126,6 +129,7 @@ const MULTICAST_GROUPS: [&str; 7] = [
 
 pub(super) fn family_message(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
     axnet::register_wireless_scan_event_callback(publish_wireless_scan_event);
+    axnet::register_wireless_disconnect_event_callback(publish_wireless_disconnect_event);
     let mut payload = payload_with(&GenlMsgHdr {
         cmd: CTRL_CMD_NEWFAMILY,
         version: 2,
@@ -189,6 +193,10 @@ fn publish_connect_event(ifindex: u32, station: &axnet::WirelessStationInfo) {
         connect_event_message(ifindex, station),
         NL80211_MLME_GROUP_MASK,
     );
+}
+
+fn publish_wireless_disconnect_event(ifindex: u32, event: axnet::WirelessDisconnectEvent) {
+    publish_disconnect_event(ifindex, event.bssid, event.reason);
 }
 
 fn publish_disconnect_event(ifindex: u32, bssid: [u8; 6], reason: u16) {
@@ -386,6 +394,7 @@ pub(super) fn handle(
             CMD_SET_KEY => axnet::WirelessKeyOperation::SetDefault {
                 unicast: false,
                 multicast: true,
+                management: false,
             },
             CMD_GET_KEY => axnet::WirelessKeyOperation::GetSequence,
             CMD_DEL_KEY => axnet::WirelessKeyOperation::Delete,
@@ -395,7 +404,9 @@ pub(super) fn handle(
         if request.cmd == CMD_SET_KEY {
             operation = axnet::WirelessKeyOperation::SetDefault {
                 unicast: key.default_unicast || (key.peer.is_some() && !key.default_multicast),
-                multicast: key.default_multicast || (key.peer.is_none() && !key.default_unicast),
+                multicast: !key.default_management
+                    && (key.default_multicast || (key.peer.is_none() && !key.default_unicast)),
+                management: key.default_management,
             };
         }
         if !interfaces
@@ -568,6 +579,7 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
     let mut control_port_ethertype = None;
     let mut control_port_no_encrypt = false;
     let mut use_mfp_seen = false;
+    let mut use_mfp = None;
     for_each_rtattr(attributes, |kind, value| match kind {
         ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
             ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
@@ -639,10 +651,11 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
         }
         ATTR_USE_MFP if !use_mfp_seen && value.len() == 4 => {
             use_mfp_seen = true;
-            let use_mfp = u32::from_ne_bytes(value.try_into().unwrap());
-            if use_mfp != 0 {
+            let requested = u32::from_ne_bytes(value.try_into().unwrap());
+            if requested > 2 {
                 return Err(AxError::OperationNotSupported);
             }
+            use_mfp = Some(requested);
             Ok(())
         }
         ATTR_MAC_HINT if value.len() == 6 => Ok(()),
@@ -655,7 +668,8 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
         | ATTR_CIPHER_SUITE_GROUP
         | ATTR_CIPHER_SUITES_PAIRWISE
         | ATTR_AKM_SUITES
-        | ATTR_CONNECT_IE => Err(AxError::InvalidInput),
+        | ATTR_CONNECT_IE
+        | ATTR_USE_MFP => Err(AxError::InvalidInput),
         _ => Err(AxError::OperationNotSupported),
     })?;
     if pairwise_ciphers.len() > 8 || akm_suites.len() > 8 {
@@ -674,6 +688,7 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
             bssid,
             frequency_mhz,
             authentication_type: authentication_type.unwrap_or(0),
+            use_mfp: use_mfp.unwrap_or(0),
             wpa_versions: wpa_versions.unwrap_or(0),
             pairwise_ciphers,
             group_cipher,
@@ -730,6 +745,7 @@ fn parse_key_request(attributes: &[u8], command: u8) -> AxResult<(u32, axnet::Wi
     let mut sequence = None;
     let mut peer = None;
     let mut default_flag = false;
+    let mut default_management = false;
     let mut default_types_present = false;
     let mut default_unicast = false;
     let mut default_multicast = false;
@@ -762,6 +778,10 @@ fn parse_key_request(attributes: &[u8], command: u8) -> AxResult<(u32, axnet::Wi
             default_flag = true;
             Ok(())
         }
+        ATTR_KEY_DEFAULT_MGMT if !default_management && value.is_empty() => {
+            default_management = true;
+            Ok(())
+        }
         ATTR_KEY_DEFAULT_TYPES if !default_types_present => {
             default_types_present = true;
             for_each_rtattr(value, |kind, flag| {
@@ -786,16 +806,18 @@ fn parse_key_request(attributes: &[u8], command: u8) -> AxResult<(u32, axnet::Wi
         | ATTR_KEY_SEQ
         | ATTR_MAC
         | ATTR_KEY_DEFAULT
+        | ATTR_KEY_DEFAULT_MGMT
         | ATTR_KEY_DEFAULT_TYPES => Err(AxError::InvalidInput),
         _ => Err(AxError::OperationNotSupported),
     })?;
     let index = index.ok_or(AxError::InvalidInput)?;
-    if index > 3 {
+    if index > 7 {
         return Err(AxError::InvalidInput);
     }
     match command {
         CMD_NEW_KEY if key_data.is_some() && cipher.is_some() && !default_flag => {}
-        CMD_SET_KEY if key_data.is_none() && cipher.is_none() && default_flag => {}
+        CMD_SET_KEY
+            if key_data.is_none() && cipher.is_none() && (default_flag || default_management) => {}
         CMD_GET_KEY | CMD_DEL_KEY if key_data.is_none() && cipher.is_none() && !default_flag => {}
         _ => return Err(AxError::InvalidInput),
     }
@@ -809,6 +831,7 @@ fn parse_key_request(attributes: &[u8], command: u8) -> AxResult<(u32, axnet::Wi
             sequence: sequence.unwrap_or_default(),
             default_unicast,
             default_multicast,
+            default_management,
         },
     ))
 }
@@ -936,6 +959,9 @@ fn key_message(
     if let Some(peer) = key.peer {
         push_attr(&mut payload, ATTR_MAC, &peer);
     }
+    if key.default_management {
+        push_attr(&mut payload, ATTR_KEY_DEFAULT_MGMT, &[]);
+    }
     nl80211_message(request, port_id, FAMILY_ID, payload, false)
 }
 
@@ -1030,11 +1056,14 @@ fn wiphy_message(
         &interface_types,
     );
     push_attr(&mut payload, ATTR_MAX_NUM_SCAN_SSIDS, &[1]);
-    push_attr(
-        &mut payload,
-        ATTR_CIPHER_SUITES,
-        &0x000fac04u32.to_ne_bytes(),
-    );
+    let mut ciphers = Vec::new();
+    ciphers.extend_from_slice(&0x000fac04u32.to_ne_bytes());
+    ciphers.extend_from_slice(&0x000fac06u32.to_ne_bytes());
+    push_attr(&mut payload, ATTR_CIPHER_SUITES, &ciphers);
+    let mut extended_features = [0u8; NL80211_EXT_FEATURE_MFP_OPTIONAL / 8 + 1];
+    extended_features[NL80211_EXT_FEATURE_MFP_OPTIONAL / 8] |=
+        1 << (NL80211_EXT_FEATURE_MFP_OPTIONAL % 8);
+    push_attr(&mut payload, ATTR_EXT_FEATURES, &extended_features);
     push_attr(&mut payload, ATTR_MAX_NUM_PMKIDS, &0u32.to_ne_bytes());
     let mut supported_commands = Vec::new();
     for (index, command) in [
@@ -1487,6 +1516,7 @@ mod tests {
         );
         let mut max_ssids = None;
         let mut cipher_suites = Vec::new();
+        let mut mfp_optional = false;
         let mut max_pmkids = None;
         let mut commands = Vec::new();
         for_each_rtattr(attrs, |kind, value| {
@@ -1501,6 +1531,10 @@ mod tests {
                 }
             } else if kind == ATTR_MAX_NUM_PMKIDS {
                 max_pmkids = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            } else if kind == ATTR_EXT_FEATURES {
+                mfp_optional = value
+                    .get(NL80211_EXT_FEATURE_MFP_OPTIONAL / 8)
+                    .is_some_and(|byte| byte & (1 << (NL80211_EXT_FEATURE_MFP_OPTIONAL % 8)) != 0);
             } else if kind == ATTR_SUPPORTED_COMMANDS {
                 for_each_rtattr(value, |_, command| {
                     commands.push(u32::from_ne_bytes(command.try_into().unwrap()));
@@ -1511,7 +1545,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(max_ssids, Some(1));
-        assert_eq!(cipher_suites, [0x000fac04]);
+        assert_eq!(cipher_suites, [0x000fac04, 0x000fac06]);
+        assert!(mfp_optional);
         assert_eq!(max_pmkids, Some(0));
         assert_eq!(commands, [1, 5, 33, 114, 32, 31, 46, 48, 17, 9, 10, 11, 12]);
     }
@@ -1603,9 +1638,14 @@ mod tests {
         let mut mfp_required = Vec::new();
         push_attr(&mut mfp_required, ATTR_IFINDEX, &12u32.to_ne_bytes());
         push_attr(&mut mfp_required, ATTR_SSID, b"secure");
-        push_attr(&mut mfp_required, ATTR_USE_MFP, &2u32.to_ne_bytes());
+        push_attr(&mut mfp_required, ATTR_USE_MFP, &1u32.to_ne_bytes());
+        assert_eq!(parse_connect_request(&mfp_required).unwrap().1.use_mfp, 1);
+        let mut mfp_unsupported = Vec::new();
+        push_attr(&mut mfp_unsupported, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut mfp_unsupported, ATTR_SSID, b"secure");
+        push_attr(&mut mfp_unsupported, ATTR_USE_MFP, &3u32.to_ne_bytes());
         assert_eq!(
-            parse_connect_request(&mfp_required),
+            parse_connect_request(&mfp_unsupported),
             Err(AxError::OperationNotSupported)
         );
 
@@ -1670,6 +1710,26 @@ mod tests {
         assert_eq!(parsed_default.index, 1);
         assert!(parsed_default.default_multicast);
         assert!(!parsed_default.default_unicast);
+
+        let mut igtk = Vec::new();
+        push_attr(&mut igtk, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut igtk, ATTR_KEY_IDX, &[6]);
+        push_attr(&mut igtk, ATTR_KEY_CIPHER, &0x000fac06u32.to_ne_bytes());
+        push_attr(&mut igtk, ATTR_KEY_DATA, &[0x33; 16]);
+        push_attr(&mut igtk, ATTR_KEY_SEQ, &[1, 0, 0, 0, 0, 0]);
+        let parsed_igtk = parse_key_request(&igtk, CMD_NEW_KEY).unwrap().1;
+        assert_eq!(parsed_igtk.index, 6);
+        assert_eq!(parsed_igtk.cipher_suite, 0x000fac06);
+        assert_eq!(parsed_igtk.key_data, [0x33; 16]);
+
+        let mut default_management = Vec::new();
+        push_attr(&mut default_management, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut default_management, ATTR_KEY_IDX, &[6]);
+        push_attr(&mut default_management, ATTR_KEY_DEFAULT_MGMT, &[]);
+        let key = parse_key_request(&default_management, CMD_SET_KEY)
+            .unwrap()
+            .1;
+        assert!(key.default_management);
     }
 
     #[test]

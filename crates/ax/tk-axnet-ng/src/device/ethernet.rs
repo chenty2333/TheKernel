@@ -701,6 +701,10 @@ impl Device for EthernetDevice {
         self.inner.take_wireless_scan_event()
     }
 
+    fn take_wireless_disconnect_event(&mut self) -> Option<WirelessDisconnectEvent> {
+        self.inner.take_wireless_disconnect_event()
+    }
+
     fn has_rx_backlog(&self) -> bool {
         !self.quarantined && self.inner.can_receive()
     }
@@ -762,6 +766,9 @@ impl Device for EthernetDevice {
         let rx = self.inner.receive();
         if let Some(event) = self.inner.take_wireless_scan_event() {
             crate::publish_wireless_scan_event(context.interface_index(), event);
+        }
+        if let Some(event) = self.inner.take_wireless_disconnect_event() {
+            crate::publish_wireless_disconnect_event(context.interface_index(), event);
         }
         let rx_buf = match rx {
             Ok(buf) => buf,

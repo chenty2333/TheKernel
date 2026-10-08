@@ -207,8 +207,13 @@ wired for open networks and WPA2-PSK with CCMP (Open-System authentication,
 association response and firmware context updates). The four-way handshake
 remains in the userspace supplicant; WPA/RSN key operations install CCMP
 software keys, with Ethernet data encrypted/decrypted through net80211 while
-EAPOL remains on the unprotected control port. TKIP/WEP, MFP/IGTK hardware
-offload, and other AKMs are not admitted.
+EAPOL remains on the unprotected control port. Open and WPA2-PSK/CCMP links can
+negotiate MFP when requested and advertised by the AP. Robust unicast
+management frames use the pairwise CCMP software context; IGTK/BIGTK IDs 4-7
+accept BIP-CMAC-128, are installed into the firmware RX management-key command,
+and use net80211's BIP MIC/replay context on receive. Group robust-management
+transmit and other BIP suites (GMAC/256) remain fail-closed; TKIP/WEP and other
+AKMs are not admitted.
 
 When the PCI MSI-X capability and a complete table in an assigned memory BAR
 are available, the probe installs and enables one vector using the NVMe
@@ -256,9 +261,12 @@ data TX is encapsulated on that queue; RX notifications pass through iwx
 descriptor/duplicate handling and the net80211 station receive path before
 being queued to axnet. Open and WPA2-PSK/CCMP stations send deauthentication
 and remove their firmware station/binding/MAC/PHY contexts on disconnect.
-CCMP key material stays in the net80211 software cipher context rather than
-firmware offload. Other cipher suites, AKMs, MFP/IGTK hardware offload and
-unsolicited/asynchronous MLME events remain incomplete.
+CCMP key material stays in the net80211 software cipher context; MFP pairwise
+management uses that CCMP path while IGTK/BIGTK receive keys use firmware
+management-key commands plus BIP-CMAC software MIC/replay checks. Group
+protected-management transmit and BIP-GMAC/256 are not implemented; other
+cipher suites/AKMs and unsolicited/asynchronous MLME event classes remain
+incomplete.
 
 
 ## Guest user-space payload

@@ -79,6 +79,8 @@ pub struct WirelessConnectRequest {
     pub bssid: Option<[u8; 6]>,
     pub frequency_mhz: Option<u32>,
     pub authentication_type: u32,
+    /// nl80211 MFP mode: 0 disabled, 1 required, 2 optional.
+    pub use_mfp: u32,
     pub wpa_versions: u32,
     pub pairwise_ciphers: alloc::vec::Vec<u32>,
     pub group_cipher: Option<u32>,
@@ -97,6 +99,13 @@ pub struct WirelessStationInfo {
     pub response_ies: alloc::vec::Vec<u8>,
 }
 
+/// A firmware-authenticated station disconnection to publish on nl80211 mlme.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WirelessDisconnectEvent {
+    pub bssid: [u8; 6],
+    pub reason: u16,
+}
+
 /// One nl80211-installed temporal/group key from userspace.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WirelessKeyConfig {
@@ -107,13 +116,18 @@ pub struct WirelessKeyConfig {
     pub sequence: alloc::vec::Vec<u8>,
     pub default_unicast: bool,
     pub default_multicast: bool,
+    pub default_management: bool,
 }
 
 /// Key operations requested through nl80211.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WirelessKeyOperation {
     Install,
-    SetDefault { unicast: bool, multicast: bool },
+    SetDefault {
+        unicast: bool,
+        multicast: bool,
+        management: bool,
+    },
     GetSequence,
     Delete,
 }
@@ -205,6 +219,11 @@ pub trait NetDriverOps: BaseDriverOps {
 
     /// Return the currently associated peer for GET_STATION.
     fn wireless_station_info(&self) -> Option<WirelessStationInfo> {
+        None
+    }
+
+    /// Take one unsolicited, authenticated station disconnect indication.
+    fn take_wireless_disconnect_event(&mut self) -> Option<WirelessDisconnectEvent> {
         None
     }
 

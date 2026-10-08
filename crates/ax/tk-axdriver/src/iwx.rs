@@ -23,9 +23,9 @@ use axdriver_iwx::{
 #[cfg(feature = "irq")]
 use axdriver_iwx::{DeviceFamily, IwxRegisters};
 use axdriver_net::{
-    EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps, WirelessFrequency,
-    WirelessHtCapabilities, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation,
-    WirelessPhyCapabilities, WirelessScanEvent, WirelessVhtCapabilities,
+    EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps, WirelessDisconnectEvent,
+    WirelessFrequency, WirelessHtCapabilities, WirelessKeyConfig, WirelessKeyInfo,
+    WirelessKeyOperation, WirelessPhyCapabilities, WirelessScanEvent, WirelessVhtCapabilities,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -51,6 +51,7 @@ const MAX_IWX_MSIX_DEVICES: usize = 8;
 const CSR_MSIX_FH_CAUSES: u32 = 0x2800;
 #[cfg(feature = "irq")]
 const CSR_MSIX_HW_CAUSES: u32 = 0x2808;
+const IWX_UCODE_TLV_CAPA_MULTI_QUEUE_RX_SUPPORT: usize = 68;
 
 #[cfg(any(feature = "irq", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,6 +472,7 @@ struct AttachedDevice {
     session_protection: axdriver_iwx::SessionProtectionState,
     security_keys: IwxSecurityKeys,
     station: Option<StationConnection>,
+    disconnect_event: Option<WirelessDisconnectEvent>,
     runtime_started: bool,
     interface_up: bool,
     soft_blocked: bool,
@@ -480,7 +482,9 @@ struct AttachedDevice {
 struct IwxSecurityKeys {
     pairwise: Option<IwxKeySlot>,
     groups: [Option<IwxKeySlot>; 4],
+    management: [Option<IwxKeySlot>; 4],
     default_group: u8,
+    default_management: u8,
 }
 
 struct IwxKeySlot {
@@ -497,6 +501,8 @@ struct StationConnection {
     signal_mbm: i32,
     association_id: u16,
     security_enabled: bool,
+    mfp_negotiated: bool,
+    disconnected: bool,
     request_ies: Vec<u8>,
     response_ies: Vec<u8>,
     tx_sequence: tk_net80211::ManagementTxSequence,
@@ -706,6 +712,7 @@ impl NetDriverOps for IwxNetDevice {
             .iter()
             .find(|device| device.bdf == self.bdf)
             .and_then(|device| device.station.as_ref())
+            .filter(|station| !station.disconnected)
             .map(|station| axdriver_net::WirelessStationInfo {
                 bssid: station.bssid,
                 frequency_mhz: station.frequency_mhz,
@@ -714,6 +721,14 @@ impl NetDriverOps for IwxNetDevice {
                 request_ies: station.request_ies.clone(),
                 response_ies: station.response_ies.clone(),
             })
+    }
+
+    fn take_wireless_disconnect_event(&mut self) -> Option<WirelessDisconnectEvent> {
+        ATTACHED_DMA
+            .lock()
+            .iter_mut()
+            .find(|device| device.bdf == self.bdf)
+            .and_then(|device| device.disconnect_event.take())
     }
 
     fn wireless_key_operation(
@@ -778,7 +793,10 @@ impl NetDriverOps for IwxNetDevice {
                 device.interface_up
                     && device.runtime_started
                     && !device.soft_blocked
-                    && device.station.is_some()
+                    && device
+                        .station
+                        .as_ref()
+                        .is_some_and(|station| !station.disconnected)
             })
     }
 
@@ -788,7 +806,7 @@ impl NetDriverOps for IwxNetDevice {
             .iter()
             .find(|device| device.bdf == self.bdf)
             .and_then(|device| device.station.as_ref())
-            .is_some_and(|station| !station.rx_ethernet.is_empty())
+            .is_some_and(|station| !station.disconnected && !station.rx_ethernet.is_empty())
     }
 
     fn rx_queue_size(&self) -> usize {
@@ -822,7 +840,11 @@ impl NetDriverOps for IwxNetDevice {
             .find(|device| device.bdf == self.bdf)
             .ok_or(DevError::BadState)?;
         let station = device.station.as_mut().ok_or(DevError::BadState)?;
-        if device.soft_blocked || !device.interface_up || !device.runtime_started {
+        if device.soft_blocked
+            || !device.interface_up
+            || !device.runtime_started
+            || station.disconnected
+        {
             return Err(DevError::BadState);
         }
         let mut frame =
@@ -1028,6 +1050,7 @@ fn allocate_resources(
         session_protection: axdriver_iwx::SessionProtectionState::default(),
         security_keys: IwxSecurityKeys::default(),
         station: None,
+        disconnect_event: None,
         runtime_started: false,
         interface_up: false,
         soft_blocked: false,
@@ -1364,6 +1387,7 @@ fn is_open_station_request(request: &axdriver_net::WirelessConnectRequest) -> bo
         && request.ssid.len() <= 32
         && request.authentication_type == 0
         && request.wpa_versions == 0
+        && request.use_mfp == 0
         && request.pairwise_ciphers.is_empty()
         && request.group_cipher.is_none()
         && request.akm_suites.is_empty()
@@ -1391,6 +1415,7 @@ fn supplicant_rsn_policy(
     const AKM_PSK_SUITE: u32 = 0x000f_ac02;
     if request.wpa_versions & 2 == 0
         || request.wpa_versions & !3 != 0
+        || request.use_mfp > 2
         || !request.pairwise_ciphers.contains(&CCMP_128_SUITE)
         || request.group_cipher != Some(CCMP_128_SUITE)
         || !request.akm_suites.contains(&AKM_PSK_SUITE)
@@ -1405,6 +1430,10 @@ fn supplicant_rsn_policy(
     if parsed.group_cipher != tk_net80211::Cipher::Ccmp
         || parsed.pairwise_ciphers & (tk_net80211::Cipher::Ccmp as u32) == 0
         || parsed.akms & (tk_net80211::Akm::Psk as u32) == 0
+        || (request.use_mfp == 0 && parsed.capabilities & tk_net80211::RSNCAP_MFPR != 0)
+        || (request.use_mfp == 1 && parsed.capabilities & tk_net80211::RSNCAP_MFPC == 0)
+        || (parsed.capabilities & tk_net80211::RSNCAP_MFPC != 0
+            && parsed.group_management_cipher != tk_net80211::Cipher::Bip)
     {
         return Err(RuntimeStartError::UnsupportedSecurity);
     }
@@ -1414,13 +1443,17 @@ fn supplicant_rsn_policy(
         pairwise_ciphers: tk_net80211::Cipher::Ccmp as u32,
         akms: tk_net80211::Akm::Psk as u32,
         peer_capabilities: parsed.capabilities,
-        mfp_capable: false,
+        mfp_capable: request.use_mfp != 0,
         station_mode: true,
-        mfp_required: false,
+        mfp_required: request.use_mfp == 1,
         pbac: false,
         // PMKSA cache management is not part of this adapter yet.
         pmkid: None,
-        group_management_cipher: 0,
+        group_management_cipher: if request.use_mfp != 0 {
+            tk_net80211::IE_CIPHER_BIP
+        } else {
+            0
+        },
     })
 }
 
@@ -1430,6 +1463,7 @@ fn iwx_key_operation(
     request: &WirelessKeyConfig,
 ) -> Result<Option<WirelessKeyInfo>, RuntimeStartError> {
     const CCMP_128_SUITE: u32 = 0x000f_ac04;
+    const BIP_CMAC_128_SUITE: u32 = 0x000f_ac06;
     let mut devices = ATTACHED_DMA.lock();
     let device = devices
         .iter_mut()
@@ -1439,16 +1473,46 @@ fn iwx_key_operation(
         .station
         .as_ref()
         .ok_or(RuntimeStartError::FirmwareNotReady)?;
-    if request.index > 3 {
-        return Err(RuntimeStartError::InvalidRequest);
-    }
+    let station_bssid = station.bssid;
+    let station_mfp = station.mfp_negotiated;
+    let station_security = station.security_enabled;
     let is_pairwise = request.peer.is_some();
-    if request.peer.is_some_and(|peer| peer != station.bssid) {
+    if request.index > 7 || request.peer.is_some_and(|peer| peer != station_bssid) {
         return Err(RuntimeStartError::InvalidRequest);
     }
     match operation {
         WirelessKeyOperation::Install => {
-            if !station.security_enabled {
+            if request.cipher_suite == BIP_CMAC_128_SUITE {
+                if !station_mfp
+                    || is_pairwise
+                    || !(4..=7).contains(&request.index)
+                    || request.key_data.len() != 16
+                    || request.sequence.len() > 6
+                {
+                    return Err(RuntimeStartError::UnsupportedSecurity);
+                }
+                send_firmware_management_key(device, request, false)?;
+                let mut software = tk_net80211::set_software_key(
+                    tk_net80211::Cipher::Bip,
+                    request.index,
+                    &request.key_data,
+                    true,
+                )
+                .map_err(|_| RuntimeStartError::InvalidRequest)?;
+                if let tk_net80211::SoftwareKey::Bip(key) = &mut software {
+                    let mut replay = [0u8; 8];
+                    replay[..request.sequence.len()].copy_from_slice(&request.sequence);
+                    key.management_replay_counter = u64::from_le_bytes(replay);
+                }
+                device.security_keys.management[usize::from(request.index - 4)] =
+                    Some(IwxKeySlot {
+                        index: request.index,
+                        cipher_suite: request.cipher_suite,
+                        software,
+                    });
+                return Ok(None);
+            }
+            if !station_security || request.index > 3 {
                 return Err(RuntimeStartError::UnsupportedSecurity);
             }
             if request.cipher_suite != CCMP_128_SUITE {
@@ -1481,7 +1545,19 @@ fn iwx_key_operation(
             }
             Ok(None)
         }
-        WirelessKeyOperation::SetDefault { unicast, multicast } => {
+        WirelessKeyOperation::SetDefault {
+            unicast,
+            multicast,
+            management,
+        } => {
+            let management_slot = (4..=7)
+                .contains(&request.index)
+                .then(|| device.security_keys.management[usize::from(request.index - 4)].as_ref())
+                .flatten()
+                .filter(|slot| slot.index == request.index);
+            if management && management_slot.is_none() {
+                return Err(RuntimeStartError::FirmwareNotReady);
+            }
             if unicast
                 && device
                     .security_keys
@@ -1491,16 +1567,26 @@ fn iwx_key_operation(
             {
                 return Err(RuntimeStartError::FirmwareNotReady);
             }
+            if multicast
+                && (request.index > 3
+                    || device.security_keys.groups[usize::from(request.index)].is_none())
+            {
+                return Err(RuntimeStartError::FirmwareNotReady);
+            }
+            if management {
+                device.security_keys.default_management = request.index;
+            }
             if multicast {
-                if device.security_keys.groups[usize::from(request.index)].is_none() {
-                    return Err(RuntimeStartError::FirmwareNotReady);
-                }
                 device.security_keys.default_group = request.index;
             }
             Ok(None)
         }
         WirelessKeyOperation::GetSequence => {
-            let slot = if is_pairwise {
+            let slot = if (4..=7).contains(&request.index) {
+                device.security_keys.management[usize::from(request.index - 4)].as_ref()
+            } else if request.index > 7 {
+                None
+            } else if is_pairwise {
                 device.security_keys.pairwise.as_ref()
             } else {
                 device.security_keys.groups[usize::from(request.index)].as_ref()
@@ -1508,8 +1594,14 @@ fn iwx_key_operation(
             .filter(|slot| slot.index == request.index)
             .ok_or(RuntimeStartError::FirmwareNotReady)?;
             let mut sequence = Vec::new();
-            if let tk_net80211::SoftwareKey::Ccmp(key) = &slot.software {
-                sequence.extend_from_slice(&key.tx_packet_number.to_le_bytes()[..6]);
+            match &slot.software {
+                tk_net80211::SoftwareKey::Ccmp(key) => {
+                    sequence.extend_from_slice(&key.tx_packet_number.to_le_bytes()[..6]);
+                }
+                tk_net80211::SoftwareKey::Bip(key) => {
+                    sequence.extend_from_slice(&key.management_replay_counter.to_le_bytes()[..6]);
+                }
+                _ => return Err(RuntimeStartError::UnsupportedSecurity),
             }
             Ok(Some(WirelessKeyInfo {
                 cipher_suite: slot.cipher_suite,
@@ -1517,6 +1609,22 @@ fn iwx_key_operation(
             }))
         }
         WirelessKeyOperation::Delete => {
+            if (4..=7).contains(&request.index) {
+                let slot = device.security_keys.management[usize::from(request.index - 4)]
+                    .as_ref()
+                    .filter(|slot| slot.index == request.index)
+                    .ok_or(RuntimeStartError::FirmwareNotReady)?;
+                let _ = slot;
+                send_firmware_management_key(device, request, true)?;
+                device.security_keys.management[usize::from(request.index - 4)] = None;
+                if device.security_keys.default_management == request.index {
+                    device.security_keys.default_management = 0;
+                }
+                return Ok(None);
+            }
+            if request.index > 3 {
+                return Err(RuntimeStartError::InvalidRequest);
+            }
             if is_pairwise {
                 if device
                     .security_keys
@@ -1536,6 +1644,73 @@ fn iwx_key_operation(
             Ok(None)
         }
     }
+}
+
+fn send_firmware_management_key(
+    device: &mut AttachedDevice,
+    request: &WirelessKeyConfig,
+    remove: bool,
+) -> Result<(), RuntimeStartError> {
+    let bundle = device
+        .firmware
+        .as_ref()
+        .and_then(|bundle| bundle.as_ref().ok())
+        .ok_or(RuntimeStartError::FirmwareNotReady)?;
+    let mut key_bytes = [0u8; 32];
+    key_bytes[..request.key_data.len()].copy_from_slice(&request.key_data);
+    let mut receive_sequence = [0u8; 8];
+    receive_sequence[..request.sequence.len()].copy_from_slice(&request.sequence);
+    let key = axdriver_iwx::KeyConfig {
+        cipher: axdriver_iwx::KeyCipher::Bip,
+        key_id: request.index,
+        key: key_bytes,
+        key_len: u8::try_from(request.key_data.len())
+            .map_err(|_| RuntimeStartError::InvalidRequest)?,
+        tx_sequence: 0,
+        mgmt_rx_sequence: u64::from_le_bytes(receive_sequence),
+        group: false,
+        integrity_group: true,
+        node_mfp: true,
+        is_pairwise_key_slot: false,
+    };
+    let multi_queue_rx = bundle
+        .image
+        .enabled_capabilities
+        .get(IWX_UCODE_TLV_CAPA_MULTI_QUEUE_RX_SUPPORT / 32)
+        .is_some_and(|word| {
+            word & (1 << (IWX_UCODE_TLV_CAPA_MULTI_QUEUE_RX_SUPPORT % 32)) != 0
+        });
+    let version = bundle.image.lookup_command_version(
+        axdriver_iwx::DATA_PATH_GROUP,
+        axdriver_iwx::SEC_KEY_COMMAND as u8,
+    );
+    let command = if remove {
+        axdriver_iwx::delete_key_command(
+            &key,
+            axdriver_iwx::STA_ID_LINK,
+            device.runtime_started,
+            version,
+            multi_queue_rx,
+            0,
+        )
+    } else {
+        axdriver_iwx::station_key_command(
+            &key,
+            axdriver_iwx::STA_ID_LINK,
+            version,
+            multi_queue_rx,
+            0,
+        )
+        .map(Some)
+    }
+    .map_err(|_| RuntimeStartError::Firmware)?;
+    if let Some(command) = command {
+        device
+            .controller
+            .send_encoded_command_wait(&command, None, |_, _| Ok::<_, Infallible>(true))
+            .map_err(|_| RuntimeStartError::Firmware)?;
+    }
+    Ok(())
 }
 
 fn station_management_response(
@@ -1606,7 +1781,11 @@ fn connect_station(
     if device.station.is_some() {
         return Err(RuntimeStartError::AlreadyStarted);
     }
-    if request.ssid.is_empty() || request.ssid.len() > 32 || request.authentication_type != 0 {
+    if request.ssid.is_empty()
+        || request.ssid.len() > 32
+        || request.authentication_type != 0
+        || request.use_mfp > 2
+    {
         return Err(RuntimeStartError::InvalidRequest);
     }
     let security_enabled = !is_open_station_request(request);
@@ -1836,6 +2015,10 @@ fn connect_station(
         signal_mbm: bss.signal_mbm,
         association_id: assoc.association_id & 0x3fff,
         security_enabled,
+        mfp_negotiated: rsn_policy.is_some_and(|policy| {
+            policy.mfp_capable && policy.peer_capabilities & tk_net80211::RSNCAP_MFPC != 0
+        }),
+        disconnected: false,
         request_ies,
         response_ies,
         tx_sequence,
@@ -1868,18 +2051,23 @@ fn disconnect_station(bdf: Bdf, reason: u16) -> Result<(), RuntimeStartError> {
         .hardware_address;
     let mut tx_sequence = station.tx_sequence;
     let body = tk_net80211::build_deauth_body(reason);
-    let frame = tx_sequence
-        .frame(
-            tk_net80211::MGMT_SUBTYPE_DEAUTH,
-            station.bssid,
-            local_address,
-            station.bssid,
-            &body,
-            false,
-            false,
-        )
-        .map_err(|_| RuntimeStartError::Transmission)?;
-    send_station_management_frame_locked(device, &frame, |_| {})?;
+    let protect_management = station.mfp_negotiated
+        && device.security_keys.pairwise.is_some()
+        && device.security_keys.management.iter().any(Option::is_some);
+    if !station.disconnected {
+        let frame = tx_sequence
+            .frame(
+                tk_net80211::MGMT_SUBTYPE_DEAUTH,
+                station.bssid,
+                local_address,
+                station.bssid,
+                &body,
+                station.mfp_negotiated,
+                protect_management,
+            )
+            .map_err(|_| RuntimeStartError::Transmission)?;
+        send_station_management_frame_locked(device, &frame, |_| {})?;
+    }
 
     let bundle = match device.firmware.as_ref() {
         Some(Ok(bundle)) => bundle,
@@ -2058,6 +2246,8 @@ fn pump_tx_completions(device: &mut AttachedDevice) -> Result<(), RuntimeStartEr
 fn pump_station_rx(device: &mut AttachedDevice) -> Result<(), RuntimeStartError> {
     let family = device.profile.family;
     let mut payloads = Vec::new();
+    let mut mfp_disconnect_reason = None;
+    let mut sa_query_response = None;
     let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
         &mut device.controller.registers,
         &device.controller.interrupt_masks,
@@ -2099,10 +2289,24 @@ fn pump_station_rx(device: &mut AttachedDevice) -> Result<(), RuntimeStartError>
         let Some(station) = device.station.as_mut() else {
             continue;
         };
+        if station.disconnected {
+            continue;
+        }
         let mut frame = received.frame;
+        let was_protected = frame.get(1).is_some_and(|control| control & 0x40 != 0);
+        let is_management = frame.first().is_some_and(|control| control & 0x0c == 0);
+        let subtype = frame.first().map_or(0, |control| control & 0xf0);
+        let robust_management = is_management && matches!(subtype, 0xa0 | 0xc0 | 0xd0);
+        if station.mfp_negotiated && robust_management && !was_protected {
+            // 802.11w robust management traffic is never accepted in clear.
+            continue;
+        }
         let mut security_decrypted = false;
-        if frame.get(1).is_some_and(|control| control & 0x40 != 0) {
+        if was_protected {
             if !station.security_enabled {
+                continue;
+            }
+            if is_management && !station.mfp_negotiated {
                 continue;
             }
             let Ok(header_len) = tk_net80211::header_length(&frame) else {
@@ -2114,6 +2318,10 @@ fn pump_station_rx(device: &mut AttachedDevice) -> Result<(), RuntimeStartError>
             };
             let key = match selection {
                 tk_net80211::KeySelection::Pairwise => device.security_keys.pairwise.as_mut(),
+                tk_net80211::KeySelection::Group(index) if is_management => (4..=7)
+                    .contains(&index)
+                    .then(|| device.security_keys.management[usize::from(index - 4)].as_mut())
+                    .flatten(),
                 tk_net80211::KeySelection::Group(index) => device
                     .security_keys
                     .groups
@@ -2121,8 +2329,15 @@ fn pump_station_rx(device: &mut AttachedDevice) -> Result<(), RuntimeStartError>
                     .and_then(Option::as_mut),
             };
             let Some(key) = key else { continue };
-            let Some(key_id) = frame.get(header_len + 3).map(|byte| byte >> 6) else {
-                continue;
+            let key_id = match &key.software {
+                tk_net80211::SoftwareKey::Bip(key) => key.key_id as u8,
+                tk_net80211::SoftwareKey::Ccmp(_) => {
+                    let Some(key_id) = frame.get(header_len + 3).map(|byte| byte >> 6) else {
+                        continue;
+                    };
+                    key_id
+                }
+                _ => continue,
             };
             if key.index != key_id {
                 continue;
@@ -2134,6 +2349,47 @@ fn pump_station_rx(device: &mut AttachedDevice) -> Result<(), RuntimeStartError>
             };
             frame = decrypted;
             security_decrypted = true;
+        }
+        if is_management {
+            if station.mfp_negotiated && robust_management && security_decrypted {
+                let policy = tk_net80211::DisconnectPolicy {
+                    mode: tk_net80211::RxOperatingMode::Station,
+                    state: tk_net80211::ProtocolState::Run,
+                    background_scan: false,
+                    stay_authenticated: false,
+                    peer_is_bss: true,
+                    peer_authenticated: true,
+                    peer_associated: true,
+                };
+                let received_disconnect = match subtype {
+                    0xc0 => tk_net80211::receive_deauthentication(&frame, policy),
+                    0xa0 => tk_net80211::receive_disassociation(&frame, policy),
+                    0xd0 => {
+                        if let Ok(tk_net80211::SaQueryOutcome::SendResponse { transaction_id }) =
+                            tk_net80211::receive_sa_query_request(
+                                &frame,
+                                &mut tk_net80211::SaQueryState {
+                                    station_mode: true,
+                                    management_frame_protection: true,
+                                    ..Default::default()
+                                },
+                            )
+                        {
+                            if frame[4] & 1 == 0 {
+                                sa_query_response = Some(transaction_id);
+                            }
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if let Ok(disconnect) = received_disconnect {
+                    mfp_disconnect_reason = Some(disconnect.reason);
+                }
+            }
+            // Management frames are consumed by the state path, never passed
+            // to the Ethernet data decapsulator.
+            continue;
         }
         if station.security_enabled
             && frame.get(1).is_some_and(|control| control & 0x40 == 0)
@@ -2183,6 +2439,40 @@ fn pump_station_rx(device: &mut AttachedDevice) -> Result<(), RuntimeStartError>
                     station.rx_ethernet.push_back(ethernet);
                 }
             }
+        }
+    }
+    if mfp_disconnect_reason.is_none()
+        && let (Some(transaction_id), Some(address)) = (
+            sa_query_response,
+            device.nvm.as_ref().map(|nvm| nvm.hardware_address),
+        )
+        && let Some(station) = device
+            .station
+            .as_mut()
+            .filter(|station| !station.disconnected)
+    {
+        let body =
+            tk_net80211::build_sa_query_body(tk_net80211::ACTION_SA_QUERY_RESPONSE, transaction_id);
+        let frame = station
+            .tx_sequence
+            .frame(
+                tk_net80211::MGMT_SUBTYPE_ACTION,
+                station.bssid,
+                address,
+                station.bssid,
+                &body,
+                true,
+                true,
+            )
+            .map_err(|_| RuntimeStartError::Transmission)?;
+        send_station_management_frame_locked(device, &frame, |_| {})?;
+    }
+    if let Some(reason) = mfp_disconnect_reason {
+        if let Some(station) = device.station.as_mut() {
+            let bssid = station.bssid;
+            station.disconnected = true;
+            station.rx_ethernet.clear();
+            device.disconnect_event = Some(WirelessDisconnectEvent { bssid, reason });
         }
     }
     Ok(())
@@ -2714,21 +3004,43 @@ fn send_station_management_frame_locked(
     const IEEE80211_HEADER_BYTES: usize = 24;
     const MANAGEMENT_QUEUE: u8 = axdriver_iwx::DQA_CMD_QUEUE + 1;
     const MANAGEMENT_TIMEOUT_US: u32 = 500_000;
-    if frame.len() < IEEE80211_HEADER_BYTES || frame[1] & 0x40 != 0 {
-        // MFP data/control key installation is still not connected; refuse a
-        // Protected management frame rather than transmit it in cleartext.
+    if frame.len() < IEEE80211_HEADER_BYTES {
         return Err(RuntimeStartError::Transmission);
     }
     if !device.runtime_started || device.soft_blocked {
         return Err(RuntimeStartError::FirmwareNotReady);
     }
+    let protected_management = frame[1] & 0x40 != 0;
+    let transmitted_frame = if protected_management {
+        let is_management = frame[0] & 0x0c == 0;
+        let is_group = frame[4] & 1 != 0;
+        let station = device
+            .station
+            .as_ref()
+            .ok_or(RuntimeStartError::FirmwareNotReady)?;
+        if !is_management || is_group || !station.mfp_negotiated {
+            // The iwx station path only transmits protected unicast robust
+            // management frames with the negotiated pairwise CCMP key; group
+            // MFP transmit (IGTK/BIGTK) remains unavailable in this path.
+            return Err(RuntimeStartError::UnsupportedSecurity);
+        }
+        let key = device
+            .security_keys
+            .pairwise
+            .as_mut()
+            .ok_or(RuntimeStartError::FirmwareNotReady)?;
+        tk_net80211::encrypt_software(&mut key.software, frame, IEEE80211_HEADER_BYTES, 0)
+            .map_err(|_| RuntimeStartError::Transmission)?
+    } else {
+        frame.to_vec()
+    };
     let target_slot = device
         .controller
         .submit_data_frame(
             MANAGEMENT_QUEUE,
             axdriver_iwx::STA_ID_LINK,
-            &frame[..IEEE80211_HEADER_BYTES],
-            &frame[IEEE80211_HEADER_BYTES..],
+            &transmitted_frame[..IEEE80211_HEADER_BYTES],
+            &transmitted_frame[IEEE80211_HEADER_BYTES..],
             0,
             0,
             false,
@@ -3297,6 +3609,43 @@ mod tests {
         unsupported.wpa_versions = 1;
         assert_eq!(
             supplicant_rsn_policy(&unsupported, &bss),
+            Err(RuntimeStartError::UnsupportedSecurity)
+        );
+
+        let mfp_body = tk_net80211::build_rsn_body(&tk_net80211::RsnIePolicy {
+            group_cipher: tk_net80211::CIPHER_CCMP,
+            pairwise_ciphers: tk_net80211::CIPHER_CCMP,
+            akms: tk_net80211::AKM_PSK,
+            peer_capabilities: tk_net80211::RSNCAP_MFPC,
+            mfp_capable: true,
+            station_mode: true,
+            group_management_cipher: tk_net80211::IE_CIPHER_BIP,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut mfp_bss = bss.clone();
+        mfp_bss.information_elements.truncate(6);
+        mfp_bss.information_elements.push(48);
+        mfp_bss.information_elements.push(mfp_body.len() as u8);
+        mfp_bss.information_elements.extend_from_slice(&mfp_body);
+        let mut required = request.clone();
+        required.use_mfp = 1;
+        let required_policy = supplicant_rsn_policy(&required, &mfp_bss).unwrap();
+        assert!(required_policy.mfp_capable && required_policy.mfp_required);
+        assert_eq!(
+            required_policy.group_management_cipher,
+            tk_net80211::IE_CIPHER_BIP
+        );
+
+        let mut optional = request.clone();
+        optional.use_mfp = 2;
+        let optional_policy = supplicant_rsn_policy(&optional, &mfp_bss).unwrap();
+        assert!(optional_policy.mfp_capable && !optional_policy.mfp_required);
+
+        let mut required_without_peer_mfpc = request;
+        required_without_peer_mfpc.use_mfp = 1;
+        assert_eq!(
+            supplicant_rsn_policy(&required_without_peer_mfpc, &bss),
             Err(RuntimeStartError::UnsupportedSecurity)
         );
     }

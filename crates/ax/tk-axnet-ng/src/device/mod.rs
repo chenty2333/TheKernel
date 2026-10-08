@@ -2,7 +2,7 @@ use alloc::{string::String, vec::Vec};
 use core::task::Waker;
 
 use axdriver::prelude::{
-    WirelessBssInfo, WirelessConnectRequest, WirelessKeyConfig, WirelessKeyInfo,
+    WirelessBssInfo, WirelessConnectRequest, WirelessDisconnectEvent, WirelessKeyConfig, WirelessKeyInfo,
     WirelessKeyOperation, WirelessScanEvent, WirelessScanRequest, WirelessStationInfo,
 };
 use axerrno::{AxError, AxResult};
@@ -279,6 +279,11 @@ pub trait Device: Send + Sync {
     }
 
     fn take_wireless_scan_event(&mut self) -> Option<WirelessScanEvent> {
+        None
+    }
+
+    /// Take one authenticated spontaneous wireless disconnect indication.
+    fn take_wireless_disconnect_event(&mut self) -> Option<WirelessDisconnectEvent> {
         None
     }
 
