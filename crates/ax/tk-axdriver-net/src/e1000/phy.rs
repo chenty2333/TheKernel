@@ -83,6 +83,9 @@ const IFE_PHY_EXTENDED_STATUS_CONTROL: u8 = 0x10;
 const IFE_PHY_SPECIAL_CONTROL: u8 = 0x11;
 const IFE_PESC_POLARITY_REVERSED: u16 = 0x0100;
 const IFE_PSC_FORCE_POLARITY: u16 = 0x0020;
+const IFE_PHY_MDIX_CONTROL: u8 = 0x1c;
+const IFE_PMC_FORCE_MDIX: u16 = 0x0040;
+const IFE_PMC_AUTO_MDIX: u16 = 0x0080;
 const I82577_PHY_STATUS_2: u8 = 26;
 const I82577_PHY_STATUS2_REV_POLARITY: u16 = 0x0400;
 const I82577_CFG_REG: u8 = 22;
@@ -714,6 +717,28 @@ where
     }
     let extended = io.read_phy_register(M88E1000_EXT_PHY_SPEC_CTRL)? | M88E1000_EPSCR_TX_CLK_25;
     io.write_phy_register(M88E1000_EXT_PHY_SPEC_CTRL, extended)
+}
+
+/// upstream: e1000_phy.c e1000_phy_force_speed_duplex_ife()
+pub fn phy_force_speed_duplex_ife<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    forced_speed_duplex: u16,
+    wait_to_complete: bool,
+    flow_control: &mut FlowControlMode,
+) -> DevResult {
+    let phy_control = io.read_phy_register(PHY_CONTROL)?;
+    let phy_control =
+        phy_force_speed_duplex_setup(io, flow_control, forced_speed_duplex, phy_control)?;
+    io.write_phy_register(PHY_CONTROL, phy_control)?;
+    let mdix =
+        io.read_phy_register(IFE_PHY_MDIX_CONTROL)? & !IFE_PMC_AUTO_MDIX & !IFE_PMC_FORCE_MDIX;
+    io.write_phy_register(IFE_PHY_MDIX_CONTROL, mdix)?;
+    io.delay_us(1);
+    if wait_to_complete {
+        let _ = phy_has_link_generic(io, PHY_FORCE_LIMIT, 100_000, true)?;
+        let _ = phy_has_link_generic(io, PHY_FORCE_LIMIT, 100_000, true)?;
+    }
+    Ok(())
 }
 
 pub trait E1000PhyMdicOps: E1000RegisterIo {
@@ -2119,6 +2144,26 @@ mod tests {
             &(M88E1000_EXT_PHY_SPEC_CTRL, M88E1000_EPSCR_TX_CLK_25)
         );
         assert_eq!(flow, FlowControlMode::None);
+    }
+
+    #[test]
+    fn generic_ife_force_speed_disables_autocrossover_and_rechecks_link() {
+        let mut io = Io::default();
+        io.phy[PHY_CONTROL as usize] = MII_CR_AUTO_NEG_EN;
+        io.phy[IFE_PHY_MDIX_CONTROL as usize] = 0xffff;
+        io.phy[PHY_STATUS as usize] = MII_SR_LINK_STATUS;
+        let mut flow = FlowControlMode::Full;
+        phy_force_speed_duplex_ife(&mut io, ADVERTISE_100_FULL, true, &mut flow).unwrap();
+        assert_eq!(flow, FlowControlMode::None);
+        assert_eq!(
+            io.phy_writes
+                .iter()
+                .find(|(reg, _)| *reg == IFE_PHY_MDIX_CONTROL)
+                .unwrap()
+                .1,
+            0xffff & !IFE_PMC_AUTO_MDIX & !IFE_PMC_FORCE_MDIX
+        );
+        assert_eq!(io.delay, 1);
     }
 
     #[test]
