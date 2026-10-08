@@ -59,6 +59,13 @@ pub enum NvmError {
     AllocationFailed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum NvmFetchError<E> {
+    Command(E),
+    CommandEncoding(CommandError),
+    InvalidResponse(NvmError),
+}
+
 /// Encode an NVM request, permitting it while hardware RF-kill is active.
 // upstream: if_iwx.c iwx_nvm_get() host command setup
 pub fn nvm_get_command(
@@ -79,6 +86,27 @@ pub fn nvm_get_command(
         parts: &[&request],
     };
     EncodedCommand::encode(&command, slot, command_queue)
+}
+
+/// Issue NVM_GET_INFO and parse the negotiated v3/v4 response.
+// upstream: if_iwx.c iwx_nvm_get()
+pub fn request_nvm_info<E>(
+    regulatory_v4: bool,
+    slot: u8,
+    hardware_address: Option<MacAddress>,
+    enabled_capabilities: &[u32],
+    mut send_sync: impl FnMut(&EncodedCommand) -> Result<Vec<u8>, E>,
+) -> Result<NvmInfo, NvmFetchError<E>> {
+    let command =
+        nvm_get_command(regulatory_v4, slot, 0).map_err(NvmFetchError::CommandEncoding)?;
+    let response = send_sync(&command).map_err(NvmFetchError::Command)?;
+    parse_nvm_response(
+        &response,
+        regulatory_v4,
+        hardware_address,
+        enabled_capabilities,
+    )
+    .map_err(NvmFetchError::InvalidResponse)
 }
 
 /// Decode v3/v4 regulatory NVM payload and combine SKU, antennas, MAC and LAR.
@@ -226,5 +254,20 @@ mod tests {
             ),
             Err(NvmError::InvalidMacAddress)
         );
+    }
+
+    #[test]
+    fn runtime_nvm_request_sends_rfkill_command_before_parsing() {
+        let address = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut response = vec![0; NVM_V4_RESPONSE_BYTES];
+        response[8..12].copy_from_slice(&MAC_SKU_BAND_24.to_le_bytes());
+        let info = request_nvm_info(true, 7, Some(address), &[], |command| {
+            assert_eq!(command.flags, CMD_WANT_RESPONSE | CMD_SEND_DURING_RFKILL);
+            assert_eq!(command.bytes[2], 7);
+            Ok::<_, ()>(response.clone())
+        })
+        .unwrap();
+        assert_eq!(info.hardware_address, address);
+        assert!(info.band_24ghz);
     }
 }

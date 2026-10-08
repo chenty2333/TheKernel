@@ -23,4 +23,5 @@
 - `iwx_disable_rx_dma()` now performs the family-specific RFH disable and bounded idle poll (`c47be738`).
 - `iwx_enable_txq()`/`iwx_disable_txq()` now include response-requesting commands, response validation, and queue-mask/TID lifecycle adapters (`80431bbb`).
 - RX BA session management now translates reorder-window initialization/clear, BAID and ADD_STA command layouts/status checks, session timeout decisions, and BAR release validation ( `7ae4fc26` ).
+- `iwx_nvm_get()` now wraps its RF-kill-capable response command and v3/v4 parsing in one request adapter (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
