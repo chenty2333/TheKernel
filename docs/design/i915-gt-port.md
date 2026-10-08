@@ -27,7 +27,7 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 `guc_capture.rs` 是 `intel_guc_capture.c` 的数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，快照 log state 并按 overflow/invalid offset 选择全环重读，保留原始 metadata/order、跳过未知 capture type，依赖引擎 reset group 将 lists 切分为节点并克隆 shared global/class data，含 1536 节点/每 list 有界寄存器池并在压力下回收 outlist 节点，按 GuC ID、context ID 和页对齐 LRCA 匹配/移除节点并提取 IPEHR/INSTDONE，含 Xe_LP 静态寄存器 offset/name 表、12.55+ steered geometry register gate、按拓扑展开 steered registers、选择 base/ext register lists，构造 page-aligned ADS list、3x overbuffer size assessment 和可独立调用的 coredump text formatter。ADS owner wire-up、cache node 与 CT event/coredump 真实生命周期接入仍未完成。
 
-`guc_log.rs` 已有 log sizing、overflow/read-pointer/relay snapshot 之外，补齐 control-log、force-flush、flush-complete 的 GuC action payload，并实现重复 level request elision/成功后提交状态的 controller；`copy.rs` 可按 sizing ABI 分配/清零并保留 log GGTT VMA，且新增 input-driven ADS GGTT builder/VMA owner。GuC startup params、真实 ADS/log input collection、flush/relay worker 以及 CT action callers 仍未接入。
+`guc_log.rs` 已有 log sizing、overflow/read-pointer/relay snapshot 之外，补齐 control-log、force-flush、flush-complete 的 GuC action payload，并实现重复 level request elision/成功后提交状态的 controller；`copy.rs` 可按 sizing ABI 分配/清零并保留 log GGTT VMA，新增 input-driven ADS GGTT builder/VMA owner，并提供在 GuC 仍处于 MIA reset 时验证 ADS/log 地址后写入 14-dword scratch config 的 helper。GT-derived inputs/options, firmware loader caller, flush/relay worker and CT action callers remain pending。
 
 `guc_fw::suspend_guc` 镜像 `intel_guc_suspend()`：submission active 时尝试 CLIENT_SOFT_RESET、忽略其失败并复位 GuC 域；resume 无额外 GuC action。其 PM callback、work flush、CT/ADS/log owner teardown 仍未集成。
 

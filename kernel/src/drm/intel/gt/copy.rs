@@ -571,6 +571,46 @@ impl LogDmaMemory {
     }
 }
 
+/// Publish GuC scratch parameters only after matching pinned ADS/log buffers
+/// exist. The GuC must still be held in MIA reset; after any write succeeds,
+/// retain both VMA owners before firmware transfer can consume the pointers.
+/// upstream: intel_guc.c intel_guc_write_params().
+pub(super) fn write_guc_init_params(
+    owner: &mut super::Owner,
+    options: intel_gt::guc_config::GucOptions,
+) -> Result<[u32; intel_gt::guc_config::GUC_CTL_MAX_DWORDS], Error> {
+    if owner.lost || !owner.bus.awake.load(Ordering::Acquire) {
+        return Err(Error::Refused);
+    }
+    if owner.bus.read(0xc000)? & 1 == 0 {
+        return Err(Error::Refused);
+    }
+    let ads_address = owner
+        .ads_memory
+        .as_ref()
+        .ok_or(Error::Refused)?
+        .ggtt_address()?;
+    let log_config = owner.log_memory.as_ref().ok_or(Error::Refused)?.config();
+    if options.ads_ggtt_address != ads_address
+        || options.log.ggtt_address != log_config.ggtt_address
+    {
+        return Err(Error::Refused);
+    }
+    let params = intel_gt::guc_config::guc_init_params(options).map_err(|_| Error::Refused)?;
+    intel_gt::guc_config::write_params(&owner.bus, &params)?;
+    owner
+        .ads_memory
+        .as_mut()
+        .ok_or(Error::Quarantined)?
+        .mark_registered();
+    owner
+        .log_memory
+        .as_mut()
+        .ok_or(Error::Quarantined)?
+        .mark_registered();
+    Ok(params)
+}
+
 #[cfg(target_os = "none")]
 impl AdsDmaMemory {
     fn release(self) -> Result<(), Self> {
