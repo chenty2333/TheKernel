@@ -220,16 +220,20 @@ and reached `VTD_INTREMAP_REQID_ACCEPTANCE_DONE`. This run used the conservative
 shared DMA context; it verifies the remapping-enabled boot path and disk/network
 operation, not per-device DMA isolation or physical APIC behavior.
 
-Requester-specific second-level domains are available only with
-`iommu_domains=on` pending acceptance. The kernel derives the DMAR PCI scope
-path by walking the configured ECAM topology and allocates a distinct DID and
-page table per requester; VirtIO queue/data mappings and NVMe queue/buffer
-allocations carry their PCI requester through the HAL. The first translated
-QEMU attempts with this mode did not reach the shell: a requester was initially
-rejected because scope matching used only the endpoint bus; after adding bridge
-path resolution, QEMU reported an untranslated physical address for requester
-`00:01.0`, followed by a DMA unmap `MapFailed` (earlier run) or startup stall
-(latest run). The precise missing DMA owner/context is not established. Do not
-enable `iommu_domains=on` by default or describe isolation as accepted until a
-QEMU run with that flag passes block, network, and NVMe I/O without translation
-faults. The successful `intremap=on` run used the default shared DMA context.
+Requester-specific second-level domains are enabled with `iommu_domains=on`.
+The kernel derives the DMAR PCI scope path by walking the configured ECAM
+topology and allocates a distinct DID and page table per requester; VirtIO
+queue/data mappings and NVMe queue/buffer allocations carry their PCI requester
+through the HAL. Initial attempts failed because matching used only the
+endpoint bus and then because the normal graphics profile exercised an
+unresolved VirtIO-GPU DMA path. With bridge-path resolution, a Q35/KVM
+`firmware-fb` run (no VirtIO-GPU) passed under both `intremap=on` and
+`iommu_domains=on` while attaching the VirtIO block rootfs, a separate VirtIO
+block disk, an NVMe test disk, and VirtIO-net. The guest read an NVMe sector,
+pinged 10.0.2.2 with 0% loss, and reached `VTD_INTREMAP_REQID_ACCEPTANCE_DONE`;
+a separate isolated-mode block+net run also passed. This demonstrates the
+requester-specific path for the tested VirtIO block, NVMe, and network
+requesters on QEMU, not every platform DMA master. The standard graphics profile
+has not passed with isolated domains, and I2C/GPU/other PCI DMA clients are not
+all requester-aware; therefore keep the isolated mode opt-in rather than
+enabling it globally. No native-hardware or physical APIC validation is implied.
