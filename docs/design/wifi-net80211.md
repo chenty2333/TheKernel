@@ -157,3 +157,7 @@ hostap peer-removal decisions into explicit protocol effects.
 Block-Ack action receive helpers decode ADDBA/DELBA/BAR layouts and surface
 agreement, timeout, refusal and reorder-window effects; actual DMA reorder
 buffers and queue stop/start remain owned by the wireless device adapter.
+
+Station MFP SA Query request/response handlers preserve the peer transaction
+identifier, request the matching response, and clear the active query only for
+a matching response; the management timer remains a caller-managed effect.

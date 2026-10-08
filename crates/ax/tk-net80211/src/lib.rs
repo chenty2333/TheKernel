@@ -26,6 +26,7 @@ mod rates;
 mod regdomain;
 mod rsn;
 mod rssadapt;
+mod sa_query;
 mod scan;
 
 pub use assoc_rx::{AssocRxError, AssocRxPolicy, AssocRxResult, receive_assoc_response};
@@ -142,5 +143,8 @@ pub use rssadapt::{
     LegacyRateSet, RATE_BASIC, RATE_SIZE, RATE_VALUE, RSSADAPT_BUCKET_POWER, RSSADAPT_BUCKET0,
     RSSADAPT_BUCKETS, RssAdapt, RssDescriptor, choose_rate, input_rssi, lower_rate, raise_rate,
     update_stats,
+};
+pub use sa_query::{
+    SaQueryError, SaQueryOutcome, SaQueryState, receive_sa_query_request, receive_sa_query_response,
 };
 pub use scan::{ScanError, ScanProgress, ScanStep, begin_scan, next_scan_channel};

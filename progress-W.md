@@ -71,3 +71,4 @@
 - `ieee80211_input.c` station association/reassociation response path translated through the BSS node and protocol capability helpers; `tk-net80211` check/tests pass (75 tests); input.c coverage advances to 14/48 functions.
 - `ieee80211_input.c` deauthentication and disassociation receive functions translated with station/bgscan/stay-auth and hostap peer-leave effects; check/tests pass (79 tests); input.c coverage advances to 16/48 functions.
 - `ieee80211_input.c` ADDBA request/response, accept/refuse, DELBA and BAR receive functions translated into bounded BA state/effect helpers; check/tests pass (82 tests); input.c coverage advances to 24/48 functions. Reorder-buffer storage remains in device/driver ownership.
+- `ieee80211_input.c` station SA Query request/response handlers translated with MFP gating and matching transaction-ID semantics; check/tests pass (85 tests); input.c coverage advances to 26/48 functions.
