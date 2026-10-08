@@ -11,7 +11,8 @@ idempotent-command retries with CMD/DAT reset,
 function-separated MMC CMD8/OCR/CID/RCA/CSD/select/status initialization helpers,
 single/multi-block CMD17/18/24/25 I/O,
 CMD12 multi-block stop, MMC bus-width/HS_TIMING selection, and erase-group-
-aligned discard via CMD32/33/38; the
+aligned discard via CMD32/33/38 (using SD Status allocation-unit geometry when
+available); the
 PCI binding class-matches SD host controllers, decodes PCI slot-info and maps
 each advertised slot BAR. FreeBSD newbus, task/callout, CAM, and bus-DMA
 frameworks are not copied.

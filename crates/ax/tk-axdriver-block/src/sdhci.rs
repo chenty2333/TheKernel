@@ -1573,6 +1573,11 @@ impl<I: SdhciIo> SdhciDisk<I> {
         let csd_info = decode_csd(csd, mmc).ok_or(SdhciError::InvalidTransfer)?;
         let mut sectors = csd_info.capacity_bytes / 512;
         let mut erase_group_sectors = csd_info.erase_block_sectors;
+        if let Some(status) = sd_status {
+            if status.allocation_unit_size != 0 {
+                erase_group_sectors = 16u32 << status.allocation_unit_size;
+            }
+        }
         let mut ext_csd_bytes = [0u8; 512];
         let mut ext_csd = None;
         if mmc && high_capacity {
