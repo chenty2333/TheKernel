@@ -24,6 +24,13 @@ const PCIE_LINK_WIDTH_MASK: u16 = 0x03f0;
 const PCIE_LINK_WIDTH_SHIFT: u32 = 4;
 const AUTO_READ_DONE_TIMEOUT_MS: usize = 10;
 const SWFW_SYNC_TIMEOUT: usize = 200;
+const MASTER_DISABLE_TIMEOUT: usize = 800;
+const PCIE_NO_SNOOP_ALL: u32 = 0x0000000f;
+const IFS_MIN: u32 = 40;
+const IFS_MAX: u32 = 80;
+const IFS_STEP: u32 = 10;
+const IFS_RATIO: u32 = 4;
+const MIN_NUM_XMITS: u32 = 1000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum E1000BusType {
@@ -80,6 +87,95 @@ pub struct LedModes {
     pub default: u32,
     pub mode1: u32,
     pub mode2: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdaptiveIfs {
+    pub enabled: bool,
+    pub current: u32,
+    pub min: u32,
+    pub max: u32,
+    pub step: u32,
+    pub ratio: u32,
+    pub in_mode: bool,
+    pub collision_delta: u32,
+    pub tx_packet_delta: u32,
+}
+
+/// upstream: e1000_mac.c e1000_reset_adaptive_generic()
+pub fn reset_adaptive_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    state: &mut AdaptiveIfs,
+) -> DevResult {
+    if !state.enabled {
+        return Ok(());
+    }
+    state.current = 0;
+    state.min = IFS_MIN;
+    state.max = IFS_MAX;
+    state.step = IFS_STEP;
+    state.ratio = IFS_RATIO;
+    state.in_mode = false;
+    io.write_register(E1000_AIT, 0)
+}
+
+/// upstream: e1000_mac.c e1000_update_adaptive_generic()
+pub fn update_adaptive_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    state: &mut AdaptiveIfs,
+) -> DevResult {
+    if !state.enabled {
+        return Ok(());
+    }
+    if state.collision_delta.wrapping_mul(state.ratio) > state.tx_packet_delta {
+        if state.tx_packet_delta > MIN_NUM_XMITS {
+            state.in_mode = true;
+            if state.current < state.max {
+                state.current = if state.current == 0 {
+                    state.min
+                } else {
+                    state.current + state.step
+                };
+                io.write_register(E1000_AIT, state.current)?;
+            }
+        }
+    } else if state.in_mode && state.tx_packet_delta <= MIN_NUM_XMITS {
+        state.current = 0;
+        state.in_mode = false;
+        io.write_register(E1000_AIT, 0)?;
+    }
+    Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_set_pcie_no_snoop_generic()
+pub fn set_pcie_no_snoop_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    bus_is_pcie: bool,
+    no_snoop: u32,
+) -> DevResult {
+    if !bus_is_pcie || no_snoop == 0 {
+        return Ok(());
+    }
+    let mut gcr = io.read_register(E1000_GCR)?;
+    gcr &= !PCIE_NO_SNOOP_ALL;
+    gcr |= no_snoop;
+    io.write_register(E1000_GCR, gcr)
+}
+
+/// upstream: e1000_mac.c e1000_disable_pcie_master_generic()
+pub fn disable_pcie_master_generic<I: E1000RegisterIo>(io: &mut I, bus_is_pcie: bool) -> DevResult {
+    if !bus_is_pcie {
+        return Ok(());
+    }
+    let ctrl = io.read_register(E1000_CTRL)? | E1000_CTRL_GIO_MASTER_DISABLE;
+    io.write_register(E1000_CTRL, ctrl)?;
+    for _ in 0..MASTER_DISABLE_TIMEOUT {
+        if io.read_register(E1000_STATUS)? & E1000_STATUS_GIO_MASTER_ENABLE == 0 {
+            return Ok(());
+        }
+        io.delay_us(100);
+    }
+    Err(DevError::ResourceBusy)
 }
 
 /// upstream: e1000_mac.c e1000_valid_led_default_generic()
@@ -893,6 +989,39 @@ mod tests {
         assert_eq!(io.writes.last(), Some(&(E1000_LEDCTL, modes.default)));
         led_off_generic(&mut io, E1000MediaType::Other, modes).unwrap();
         assert_eq!(io.writes.len(), 4);
+    }
+
+    #[test]
+    fn generic_adaptive_and_pcie_helpers_update_state_and_registers() {
+        let mut io = Registers::default();
+        let mut ifs = AdaptiveIfs {
+            enabled: true,
+            collision_delta: 600,
+            tx_packet_delta: 2000,
+            ..AdaptiveIfs::default()
+        };
+        reset_adaptive_generic(&mut io, &mut ifs).unwrap();
+        update_adaptive_generic(&mut io, &mut ifs).unwrap();
+        assert_eq!(ifs.current, IFS_MIN);
+        assert!(ifs.in_mode);
+        assert_eq!(io.writes.last(), Some(&(E1000_AIT, IFS_MIN)));
+        ifs.tx_packet_delta = MIN_NUM_XMITS;
+        ifs.collision_delta = 0;
+        update_adaptive_generic(&mut io, &mut ifs).unwrap();
+        assert!(!ifs.in_mode);
+        assert_eq!(io.writes.last(), Some(&(E1000_AIT, 0)));
+
+        set_pcie_no_snoop_generic(&mut io, false, 0xf).unwrap();
+        let before = io.writes.len();
+        set_pcie_no_snoop_generic(&mut io, true, 0x5).unwrap();
+        assert_eq!(io.writes.len(), before + 1);
+        assert_eq!(io.writes.last(), Some(&(E1000_GCR, 0x5)));
+        disable_pcie_master_generic(&mut io, false).unwrap();
+        disable_pcie_master_generic(&mut io, true).unwrap();
+        assert_eq!(
+            io.writes.last(),
+            Some(&(E1000_CTRL, E1000_CTRL_GIO_MASTER_DISABLE))
+        );
     }
 
     #[test]
