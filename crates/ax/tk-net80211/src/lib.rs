@@ -52,8 +52,8 @@ pub use ba_tx::{
     ADD_BA_WINDOW_SHIFT, AddbaTxOutcome, AddbaTxPolicy, BA_TID_COUNT, DELBA_REASON_AUTH_LEAVE,
     DELBA_REASON_SETUP_REQUIRED, DELBA_REASON_TIMEOUT, DelbaRequestEffects, RxBaTimeoutEffects,
     StopAmpduTidEffect, TX_BA_AGREED, TX_BA_INIT, TX_BA_REQUESTED, TxBaAgreement,
-    TxBaTimeoutEffects, request_delba, rx_ba_timeout, start_addba_request, stop_ampdu_tx,
-    tx_ba_timeout,
+    TxBaClearEffects, TxBaTimeoutEffects, clear_tx_ba, request_delba, rx_ba_timeout,
+    start_addba_request, stop_ampdu_tx, tx_ba_timeout,
 };
 pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{

@@ -35,6 +35,19 @@ pub struct TxBaAgreement {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxBaClearEffects {
+    pub cancel_timeout: bool,
+}
+
+/// Clear one peer's transmit BA state and cancel its live retry timer.
+// upstream: ieee80211_node.c ieee80211_node_tx_ba_clear()
+pub fn clear_tx_ba(agreement: &mut TxBaAgreement, timeout_pending: bool) -> TxBaClearEffects {
+    let cancel_timeout = agreement.state != TX_BA_INIT && timeout_pending;
+    *agreement = TxBaAgreement::default();
+    TxBaClearEffects { cancel_timeout }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AddbaTxPolicy {
     pub delayed_ba: bool,
     pub tx_start_offload: bool,
@@ -403,5 +416,21 @@ mod tests {
         assert_eq!(effects.len(), 2);
         assert!(effects.iter().all(|effect| effect.delba_reason.is_some()));
         assert_eq!(agreements[2], TxBaAgreement::default());
+    }
+
+    #[test]
+    fn clear_tx_ba_cancels_only_a_pending_timer_for_live_agreement() {
+        let mut tx = TxBaAgreement {
+            state: TX_BA_AGREED,
+            ..Default::default()
+        };
+        assert_eq!(
+            clear_tx_ba(&mut tx, true),
+            TxBaClearEffects {
+                cancel_timeout: true
+            }
+        );
+        assert_eq!(tx, TxBaAgreement::default());
+        assert_eq!(clear_tx_ba(&mut tx, true), TxBaClearEffects::default());
     }
 }

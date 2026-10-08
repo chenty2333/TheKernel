@@ -358,3 +358,6 @@ The station-only `needs_rxnode`/`find_rxnode` policy now routes ordinary STA
 traffic to the BSS record and monitor captures to a referenced peer record,
 allocating a duplicate-BSS peer only on cache miss. AP/IBSS address admission
 remains outside this station subset.
+
+The station TX Block-Ack clear helper resets one agreement and reports only
+the retry-timer cancellation the task scheduler must perform.
