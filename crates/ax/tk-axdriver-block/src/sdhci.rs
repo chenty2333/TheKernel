@@ -1469,7 +1469,11 @@ impl<I: SdhciIo> SdhciHost<I> {
     ) -> Result<SdhciResponse, SdhciError> {
         let read = matches!(
             index,
-            8 | SD_ACMD_SEND_SCR | SD_ACMD_SD_STATUS | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE
+            8 | MMC_CMD_BUS_TEST_R
+                | SD_ACMD_SEND_SCR
+                | SD_ACMD_SD_STATUS
+                | SD_CMD_READ_SINGLE
+                | SD_CMD_READ_MULTIPLE
         ) || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
         let retries = if data.is_none() || read { 3 } else { 1 };
         let mut data = data;
@@ -1673,7 +1677,11 @@ impl<I: SdhciIo> SdhciHost<I> {
             });
         let read_transfer = matches!(
             index,
-            8 | SD_ACMD_SEND_SCR | SD_ACMD_SD_STATUS | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE
+            8 | MMC_CMD_BUS_TEST_R
+                | SD_ACMD_SEND_SCR
+                | SD_ACMD_SD_STATUS
+                | SD_CMD_READ_SINGLE
+                | SD_CMD_READ_MULTIPLE
         ) || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
         self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
         if let (Some(mode), Some(buffer)) = (transfer, data.as_ref()) {
@@ -1932,7 +1940,11 @@ fn transfer_mode_flags(index: u8, command_flags: u16, blocks: u16, has_data: boo
     if command_flags & SDHCI_CMD_DATA as u16 != 0
         && (matches!(
             index,
-            8 | SD_ACMD_SEND_SCR | SD_ACMD_SD_STATUS | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE
+            8 | MMC_CMD_BUS_TEST_R
+                | SD_ACMD_SEND_SCR
+                | SD_ACMD_SD_STATUS
+                | SD_CMD_READ_SINGLE
+                | SD_CMD_READ_MULTIPLE
         ) || matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21))
     {
         mode |= SDHCI_TRNS_READ as u16;
@@ -1972,6 +1984,8 @@ fn encode_adma2_descriptors(table: &mut [u8], bus_address: u32, data_len: usize)
 const SD_CMD_GO_IDLE: u8 = 0;
 const MMC_CMD_SEND_OP_COND: u8 = 1;
 const MMC_CMD_SWITCH: u8 = 6;
+const MMC_CMD_BUS_TEST_R: u8 = 14;
+const MMC_CMD_BUS_TEST_W: u8 = 19;
 const SD_CMD_ALL_SEND_CID: u8 = 2;
 const SD_CMD_SEND_RELATIVE_ADDR: u8 = 3;
 const SD_CMD_SEND_CSD: u8 = 9;
@@ -2145,6 +2159,63 @@ fn mmc_set_card_bus_width<I: SdhciIo>(
     Ok(())
 }
 
+// MMC bus-test data patterns from the upstream mmc_test_bus_width() routine.
+fn mmc_bus_test_patterns(width: u8) -> Option<([u8; 8], [u8; 8], usize)> {
+    match width {
+        8 => Some((
+            [0x55, 0xaa, 0, 0, 0, 0, 0, 0],
+            [0xaa, 0x55, 0, 0, 0, 0, 0, 0],
+            8,
+        )),
+        4 => Some(([0x5a, 0, 0, 0, 0, 0, 0, 0], [0xa5, 0, 0, 0, 0, 0, 0, 0], 4)),
+        _ => None,
+    }
+}
+
+// upstream: mmc.c mmc_test_bus_width()
+fn mmc_test_bus_width<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> u8 {
+    let supports_8bit = host.capabilities & SDHCI_CAN_DO_8BITBUS != 0;
+    let candidates = if supports_8bit { [8, 4] } else { [4, 0] };
+    for width in candidates {
+        if width == 0 {
+            continue;
+        }
+        let Some((write_pattern, expected, length)) = mmc_bus_test_patterns(width) else {
+            continue;
+        };
+        if mmc_set_card_bus_width(host, true, rca, width).is_err() {
+            let _ = mmc_set_card_bus_width(host, true, rca, 1);
+            host.set_bus_width(1);
+            continue;
+        }
+        let mut write_data = write_pattern;
+        let mut read_data = [0u8; 8];
+        let result = host
+            .command(
+                MMC_CMD_BUS_TEST_W,
+                0,
+                SD_R1 | SD_DATA,
+                Some(&mut write_data[..length]),
+                length,
+            )
+            .and_then(|_| {
+                host.command(
+                    MMC_CMD_BUS_TEST_R,
+                    0,
+                    SD_R1 | SD_DATA,
+                    Some(&mut read_data[..length]),
+                    length,
+                )
+            });
+        if result.is_ok() && read_data[..length] == expected[..length] {
+            return width;
+        }
+        let _ = mmc_set_card_bus_width(host, true, rca, 1);
+        host.set_bus_width(1);
+    }
+    1
+}
+
 // upstream: mmc.c mmc_send_status()
 fn mmc_send_status<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> Result<u32, SdhciError> {
     host.command(SD_CMD_SEND_STATUS, u32::from(rca) << 16, SD_R1, None, 0)
@@ -2245,12 +2316,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             mmc_set_blocklen(&mut host, 512)?;
         }
         if mmc && high_capacity {
-            let bus_width = if host.capabilities & SDHCI_CAN_DO_8BITBUS != 0 {
-                8
-            } else {
-                4
-            };
-            mmc_set_card_bus_width(&mut host, true, rca, bus_width)?;
+            let bus_width = mmc_test_bus_width(&mut host, rca);
             // Only use the MMC high-speed timing supported by this host path;
             // HS200/HS400 need the full VCCQ/width/tuning transition sequence.
             let card_type = ext_csd.map_or(0, |csd| csd.card_type);
@@ -3065,6 +3131,23 @@ mod tests {
         assert_eq!(select_mmc_vccq(false, false), MmcVccq::V330);
         assert_eq!(select_mmc_vccq(false, true), MmcVccq::V180);
         assert_eq!(select_mmc_vccq(true, true), MmcVccq::V120);
+    }
+
+    #[test]
+    fn mmc_bus_width_test_patterns_match_upstream() {
+        assert_eq!(
+            mmc_bus_test_patterns(8),
+            Some((
+                [0x55, 0xaa, 0, 0, 0, 0, 0, 0],
+                [0xaa, 0x55, 0, 0, 0, 0, 0, 0],
+                8
+            ))
+        );
+        assert_eq!(
+            mmc_bus_test_patterns(4),
+            Some(([0x5a, 0, 0, 0, 0, 0, 0, 0], [0xa5, 0, 0, 0, 0, 0, 0, 0], 4))
+        );
+        assert_eq!(mmc_bus_test_patterns(1), None);
     }
 
     #[test]
