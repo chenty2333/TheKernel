@@ -889,6 +889,18 @@ impl<I: SdhciIo> SdhciHost<I> {
         !self.single_block_only
     }
 
+    // upstream: mmcsd.c mmcsd_bus_bit_width()
+    pub fn bus_width(&mut self) -> u8 {
+        let control = self.io.read8(SDHCI_HOST_CONTROL as usize);
+        if control & SDHCI_CTRL_8BITBUS as u8 != 0 {
+            8
+        } else if control & SDHCI_CTRL_4BITBUS as u8 != 0 {
+            4
+        } else {
+            1
+        }
+    }
+
     pub const fn clock_hz(&self) -> u32 {
         self.clock_hz
     }
@@ -2889,6 +2901,7 @@ mod tests {
             host.io.read8(SDHCI_HOST_CONTROL as usize) & SDHCI_CTRL_4BITBUS as u8,
             0
         );
+        assert_eq!(host.bus_width(), 4);
     }
 
     #[test]
