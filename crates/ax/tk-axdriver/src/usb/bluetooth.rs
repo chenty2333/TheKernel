@@ -42,6 +42,8 @@ pub struct UsbBluetoothHci {
     irks: Vec<[u8; 23]>,
     connections: Vec<([u8; 6], u8, u16)>,
     recently_disconnected: VecDeque<(u16, [u8; 6], u8)>,
+    pending_pairing: Vec<([u8; 6], u8, u8)>,
+    io_capability: u8,
     management_events: VecDeque<Vec<u8>>,
     receive_readiness: Arc<PollSet<32>>,
 }
@@ -222,6 +224,8 @@ impl UsbBluetoothHci {
             irks: Vec::new(),
             connections: Vec::new(),
             recently_disconnected: VecDeque::new(),
+            pending_pairing: Vec::new(),
+            io_capability: 3,
             management_events: VecDeque::new(),
             receive_readiness: Arc::new(PollSet::new()),
         })
@@ -379,14 +383,18 @@ impl UsbBluetoothHci {
         &mut self,
         address: [u8; 6],
         address_type: u8,
-        _io_capability: u8,
+        io_capability: u8,
     ) -> Result<(), Error> {
         if !self.adapter.is_up() {
             return Err(Error::NotUp);
         }
         let mut command = [0u8; 28];
+        let mut pairing = false;
         let length = match address_type {
             0 if self.management_settings & MGMT_SETTING_BREDR != 0 => {
+                if io_capability > 4 {
+                    return Err(Error::InvalidLength);
+                }
                 command[..2].copy_from_slice(&0x0405u16.to_le_bytes());
                 command[2] = 13;
                 command[3..9].copy_from_slice(&address);
@@ -394,6 +402,7 @@ impl UsbBluetoothHci {
                 command[11] = 1; // page scan repetition mode
                 command[13..15].copy_from_slice(&0u16.to_le_bytes());
                 command[15] = 1; // allow role switch
+                pairing = true;
                 16
             }
             1 | 2 if self.management_settings & MGMT_SETTING_LE != 0 => {
@@ -413,7 +422,60 @@ impl UsbBluetoothHci {
             0..=2 => return Err(Error::Unsupported),
             _ => return Err(Error::InvalidLength),
         };
-        self.command_status(&command[..length])
+        if pairing {
+            self.pending_pairing
+                .try_reserve(1)
+                .map_err(|_| Error::NoMemory)?;
+            self.pending_pairing
+                .push((address, address_type, io_capability));
+        }
+        if let Err(error) = self.command_status(&command[..length]) {
+            if pairing {
+                self.pending_pairing
+                    .retain(|(peer, kind, _)| *peer != address || *kind != address_type);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+    pub fn management_set_io_capability(&mut self, io_capability: u8) -> Result<(), Error> {
+        if io_capability > 4 {
+            return Err(Error::InvalidLength);
+        }
+        self.io_capability = io_capability;
+        Ok(())
+    }
+    pub fn management_user_confirmation(
+        &mut self,
+        address: [u8; 6],
+        accept: bool,
+    ) -> Result<(), Error> {
+        if !self.adapter.is_up() {
+            return Err(Error::NotUp);
+        }
+        self.command_complete(if accept { 0x042c } else { 0x042d }, &address)
+    }
+    pub fn management_pin_code_reply(
+        &mut self,
+        address: [u8; 6],
+        pin: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        if !self.adapter.is_up() {
+            return Err(Error::NotUp);
+        }
+        let mut parameters = [0u8; 23];
+        parameters[..6].copy_from_slice(&address);
+        let opcode = if let Some(pin) = pin {
+            if pin.is_empty() || pin.len() > 16 {
+                return Err(Error::InvalidLength);
+            }
+            parameters[6] = pin.len() as u8;
+            parameters[7..7 + pin.len()].copy_from_slice(pin);
+            0x040d
+        } else {
+            0x040e
+        };
+        self.command_complete(opcode, &parameters[..if pin.is_some() { 23 } else { 6 }])
     }
     pub fn management_disconnect(
         &mut self,
@@ -751,6 +813,24 @@ impl UsbBluetoothHci {
             return;
         }
         match event[0] {
+            // HCI IO Capability Request; use the per-pair mgmt override or
+            // the persistent setting.
+            0x31 if event.len() == 8 => {
+                let mut address = [0; 6];
+                address.copy_from_slice(&event[2..8]);
+                let capability = self
+                    .pending_pairing
+                    .iter()
+                    .find(|(peer, kind, _)| *peer == address && *kind == 0)
+                    .map(|(_, _, capability)| *capability)
+                    .unwrap_or(self.io_capability);
+                let mut parameters = [0u8; 9];
+                parameters[..6].copy_from_slice(&address);
+                parameters[6] = capability;
+                parameters[7] = 0; // no OOB data
+                parameters[8] = 0; // no MITM requirement
+                let _ = self.command_complete(0x042b, &parameters);
+            }
             // HCI Link Key Request: answer from the host key database or
             // explicitly report that no stored key is available.
             0x17 if event.len() == 8 => {
@@ -771,6 +851,18 @@ impl UsbBluetoothHci {
                 let mut address = [0; 6];
                 address.copy_from_slice(&event[5..11]);
                 self.update_connection(address, 0, handle, status == 0);
+                if status == 0
+                    && self
+                        .pending_pairing
+                        .iter()
+                        .any(|(peer, kind, _)| *peer == address && *kind == 0)
+                {
+                    let mut command = [0u8; 5];
+                    command[..2].copy_from_slice(&0x0411u16.to_le_bytes());
+                    command[2] = 2;
+                    command[3..5].copy_from_slice(&handle.to_le_bytes());
+                    let _ = self.command_status(&command);
+                }
             }
             0x3e if event.len() >= 14 && event[2] == 0x01 => {
                 let status = event[3];
@@ -820,6 +912,13 @@ impl UsbBluetoothHci {
                     }
                     self.recently_disconnected
                         .push_back((handle, address, kind));
+                }
+            }
+            0x06 if event.len() >= 5 => {
+                let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
+                if let Some((address, address_type)) = self.management_peer_for_handle(handle) {
+                    self.pending_pairing
+                        .retain(|(peer, kind, _)| *peer != address || *kind != address_type);
                 }
             }
             _ => {}

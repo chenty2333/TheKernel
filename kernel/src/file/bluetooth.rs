@@ -215,14 +215,15 @@ mod tests {
     #[test]
     fn management_commands_advertise_only_supported_operations() {
         let commands = management_response(&[2, 0, 0xff, 0xff, 0, 0]).unwrap();
-        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 16);
-        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 7);
-        assert_eq!(commands.len(), 9 + 4 + 2 * 23);
+        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 21);
+        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 9);
+        assert_eq!(commands.len(), 9 + 4 + 2 * 30);
         assert_eq!(
-            &commands[13..59],
+            &commands[13..73],
             &[
-                3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 18, 0, 19, 0, 20, 0, 25, 0, 35,
-                0, 36, 0, 42, 0, 48, 0, 6, 0, 9, 0, 0x0b, 0, 0x0c, 0, 0x11, 0, 0x13, 0,
+                3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 18, 0, 19, 0, 20, 0, 22, 0, 23,
+                0, 24, 0, 25, 0, 28, 0, 29, 0, 35, 0, 36, 0, 42, 0, 48, 0, 6, 0, 9, 0, 0x0b, 0,
+                0x0c, 0, 0x0e, 0, 0x0f, 0, 0x11, 0, 0x12, 0, 0x13, 0,
             ]
         );
     }
@@ -278,6 +279,30 @@ mod tests {
     }
 
     #[test]
+    fn pairing_prompts_are_translated_to_mgmt_events() {
+        let socket = HciSocket::new();
+        socket
+            .bind(SockaddrHci {
+                family: AF_BLUETOOTH as u16,
+                device: HCI_DEV_NONE,
+                channel: HCI_CHANNEL_CONTROL,
+            })
+            .unwrap();
+        fanout_hci_management_events(4, &[0x16, 6, 1, 2, 3, 4, 5, 6]);
+        let pin = socket.control.rx.lock().pop_front().unwrap();
+        assert_eq!(&pin[..6], &[0x0e, 0, 4, 0, 8, 0]);
+        assert_eq!(&pin[6..], &[1, 2, 3, 4, 5, 6, 0, 0]);
+
+        fanout_hci_management_events(4, &[0x33, 10, 1, 2, 3, 4, 5, 6, 0x78, 0x56, 0x34, 0x12]);
+        let confirm = socket.control.rx.lock().pop_front().unwrap();
+        assert_eq!(&confirm[..6], &[0x0f, 0, 4, 0, 12, 0]);
+        assert_eq!(
+            &confirm[6..],
+            &[1, 2, 3, 4, 5, 6, 0, 1, 0x78, 0x56, 0x34, 0x12]
+        );
+    }
+
+    #[test]
     fn management_command_complete_encodes_status_and_settings_payload() {
         let response = management_command_complete(4, 7, 0, &0x212u32.to_le_bytes()).unwrap();
         assert_eq!(&response, &[1, 0, 4, 0, 7, 0, 7, 0, 0, 0x12, 0x02, 0, 0]);
@@ -291,6 +316,10 @@ mod tests {
             &[9, 0, 0, 0, 1, 0, 1],                         // SET_BONDABLE
             &[11, 0, 0, 0, 1, 0, 1],                        // SET_SSP
             &[13, 0, 0, 0, 1, 0, 1],                        // SET_LE
+            &[0x18, 0, 0, 0, 1, 0, 3],                      // SET_IO_CAPABILITY
+            &[0x17, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0],    // PIN_CODE_NEG_REPLY
+            &[0x1c, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0],    // USER_CONFIRM_REPLY
+            &[0x1d, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0],    // USER_CONFIRM_NEG_REPLY
             &[0x2a, 0, 0, 0, 1, 0, 1],                      // SET_BREDR
             &[18, 0, 0, 0, 3, 0, 0, 0, 0],                  // LOAD_LINK_KEYS, empty set
             &[19, 0, 0, 0, 2, 0, 0, 0],                     // LOAD_LONG_TERM_KEYS, empty set
@@ -310,6 +339,11 @@ mod tests {
                 u16::from_le_bytes([request[0], request[1]])
             );
         }
+        let mut pin_reply = [0u8; 30];
+        pin_reply[0] = 0x16;
+        pin_reply[4] = 24;
+        pin_reply[13] = 1;
+        assert_eq!(management_response(&pin_reply).unwrap()[8], 0x11);
 
         let invalid_connectable = management_response(&[7, 0, 0, 0, 1, 0, 2]).unwrap();
         assert_eq!(invalid_connectable[8], 0x0d);
@@ -885,6 +919,23 @@ fn fanout_hci_management_events(index: u16, event: &[u8]) {
                 publish(0x0011, &parameters);
             }
         }
+        // HCI PIN Code Request -> BlueZ PIN prompt.
+        0x16 if event.len() == 8 => {
+            let mut parameters = Vec::with_capacity(8);
+            parameters.extend_from_slice(&event[2..8]);
+            parameters.push(0); // BR/EDR
+            parameters.push(0); // legacy PIN request is not marked secure
+            publish(0x000e, &parameters);
+        }
+        // HCI User Confirmation Request -> BlueZ numeric-comparison prompt.
+        0x33 if event.len() == 12 => {
+            let mut parameters = Vec::with_capacity(12);
+            parameters.extend_from_slice(&event[2..8]);
+            parameters.push(0); // BR/EDR
+            parameters.push(1); // confirmation is required
+            parameters.extend_from_slice(&event[8..12]);
+            publish(0x000f, &parameters);
+        }
         // HCI Encryption Change can also report an LE security failure.
         0x08 if event.len() >= 5 && event[2] != 0 => {
             let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
@@ -992,6 +1043,11 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const SET_BONDABLE: u16 = 9;
     const SET_SSP: u16 = 11;
     const SET_LE: u16 = 13;
+    const SET_IO_CAPABILITY: u16 = 0x18;
+    const PIN_CODE_REPLY: u16 = 0x16;
+    const PIN_CODE_NEG_REPLY: u16 = 0x17;
+    const USER_CONFIRM_REPLY: u16 = 0x1c;
+    const USER_CONFIRM_NEG_REPLY: u16 = 0x1d;
     const LOAD_LINK_KEYS: u16 = 18;
     const LOAD_LONG_TERM_KEYS: u16 = 19;
     const LOAD_IRKS: u16 = 0x30;
@@ -1036,13 +1092,18 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 LOAD_LINK_KEYS,
                 LOAD_LONG_TERM_KEYS,
                 DISCONNECT,
+                PIN_CODE_REPLY,
+                PIN_CODE_NEG_REPLY,
+                SET_IO_CAPABILITY,
                 PAIR_DEVICE,
+                USER_CONFIRM_REPLY,
+                USER_CONFIRM_NEG_REPLY,
                 START_DISCOVERY,
                 STOP_DISCOVERY,
                 SET_BREDR,
                 LOAD_IRKS,
             ];
-            let events = [6u16, 0x09, 0x0b, 0x0c, 0x11, 0x12, 0x13];
+            let events = [6u16, 0x09, 0x0b, 0x0c, 0x0e, 0x0f, 0x11, 0x12, 0x13];
             data.extend_from_slice(&(commands.len() as u16).to_le_bytes());
             data.extend_from_slice(&(events.len() as u16).to_le_bytes());
             for item in commands.into_iter().chain(events) {
@@ -1109,6 +1170,9 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
         SET_DISCOVERABLE if parameters.len() == 3 && parameters[0] <= 1 => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
+        SET_IO_CAPABILITY if parameters.len() == 1 && parameters[0] <= 4 => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
         SET_CONNECTABLE | SET_BONDABLE | SET_SSP | SET_LE | SET_BREDR
             if parameters.len() == 1 && parameters[0] <= 1 =>
         {
@@ -1129,6 +1193,17 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
         DISCONNECT if parameters.len() == 7 && parameters[6] <= 2 => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
+        PIN_CODE_REPLY if parameters.len() == 24 && parameters[6] == 0 && parameters[7] <= 16 => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        PIN_CODE_NEG_REPLY if parameters.len() == 7 && parameters[6] == 0 => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        USER_CONFIRM_REPLY | USER_CONFIRM_NEG_REPLY
+            if parameters.len() == 7 && parameters[6] <= 2 =>
+        {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
         START_DISCOVERY if parameters.len() == 1 && matches!(parameters[0], 1 | 6) => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
@@ -1147,12 +1222,17 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 | SET_BONDABLE
                 | SET_SSP
                 | SET_LE
+                | SET_IO_CAPABILITY
                 | SET_BREDR
                 | LOAD_LINK_KEYS
                 | LOAD_LONG_TERM_KEYS
                 | LOAD_IRKS
                 | PAIR_DEVICE
                 | DISCONNECT
+                | PIN_CODE_REPLY
+                | PIN_CODE_NEG_REPLY
+                | USER_CONFIRM_REPLY
+                | USER_CONFIRM_NEG_REPLY
                 | START_DISCOVERY
                 | STOP_DISCOVERY
         ) =>
@@ -1185,6 +1265,11 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
     const SET_BONDABLE: u16 = 9;
     const SET_SSP: u16 = 11;
     const SET_LE: u16 = 13;
+    const SET_IO_CAPABILITY: u16 = 0x18;
+    const PIN_CODE_REPLY: u16 = 0x16;
+    const PIN_CODE_NEG_REPLY: u16 = 0x17;
+    const USER_CONFIRM_REPLY: u16 = 0x1c;
+    const USER_CONFIRM_NEG_REPLY: u16 = 0x1d;
     const LOAD_LINK_KEYS: u16 = 18;
     const LOAD_LONG_TERM_KEYS: u16 = 19;
     const LOAD_IRKS: u16 = 0x30;
@@ -1275,6 +1360,86 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
         };
         let data = if status == 0 {
             parameters.to_vec()
+        } else {
+            Vec::new()
+        };
+        return Ok(Some((
+            management_command_complete(index, opcode, status, &data)?,
+            None,
+        )));
+    }
+    if opcode == SET_IO_CAPABILITY && parameters.len() == 1 && parameters[0] <= 4 {
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let status = match adapter.lock().management_set_io_capability(parameters[0]) {
+            Ok(()) => 0,
+            Err(axdriver::BluetoothError::NoDevice) => INVALID_INDEX,
+            Err(axdriver::BluetoothError::InvalidLength) => 0x0d,
+            Err(_) => FAILED,
+        };
+        return Ok(Some((
+            management_command_complete(index, opcode, status, &[])?,
+            None,
+        )));
+    }
+    if opcode == USER_CONFIRM_REPLY || opcode == USER_CONFIRM_NEG_REPLY {
+        if parameters.len() != 7 || parameters[6] > 2 {
+            return Ok(None);
+        }
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let mut address = [0; 6];
+        address.copy_from_slice(&parameters[..6]);
+        let status = match adapter
+            .lock()
+            .management_user_confirmation(address, opcode == USER_CONFIRM_REPLY)
+        {
+            Ok(()) => 0,
+            Err(axdriver::BluetoothError::NotUp) => 0x0f,
+            Err(axdriver::BluetoothError::NoDevice) => INVALID_INDEX,
+            Err(axdriver::BluetoothError::Unsupported) => NOT_SUPPORTED,
+            Err(_) => FAILED,
+        };
+        let data = if status == 0 {
+            parameters.to_vec()
+        } else {
+            Vec::new()
+        };
+        return Ok(Some((
+            management_command_complete(index, opcode, status, &data)?,
+            None,
+        )));
+    }
+    if opcode == PIN_CODE_REPLY || opcode == PIN_CODE_NEG_REPLY {
+        let expected_len = if opcode == PIN_CODE_REPLY { 24 } else { 7 };
+        if parameters.len() != expected_len || parameters[6] != 0 {
+            return Ok(None);
+        }
+        let pin = if opcode == PIN_CODE_REPLY {
+            let pin_len = usize::from(parameters[7]);
+            if pin_len == 0 || pin_len > 16 {
+                return Ok(None);
+            }
+            Some(&parameters[8..8 + pin_len])
+        } else {
+            None
+        };
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let mut address = [0; 6];
+        address.copy_from_slice(&parameters[..6]);
+        let status = match adapter.lock().management_pin_code_reply(address, pin) {
+            Ok(()) => 0,
+            Err(axdriver::BluetoothError::NotUp) => 0x0f,
+            Err(axdriver::BluetoothError::NoDevice) => INVALID_INDEX,
+            Err(axdriver::BluetoothError::InvalidLength) => 0x0d,
+            Err(_) => FAILED,
+        };
+        let data = if status == 0 {
+            parameters[..7].to_vec()
         } else {
             Vec::new()
         };
