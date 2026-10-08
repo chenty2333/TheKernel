@@ -28,6 +28,10 @@ const PCIX_COMMAND_MMRBC_MASK: u16 = 0x000c;
 const PCIX_COMMAND_MMRBC_SHIFT: u32 = 2;
 const PCIX_STATUS_HI_MMRBC_MASK: u16 = 0x0060;
 const PCIX_STATUS_HI_MMRBC_SHIFT: u32 = 5;
+const NVM_ID_LED_SETTINGS: u16 = 0x0004;
+const NVM_INIT_CONTROL2_REG: u16 = 0x000f;
+const NVM_WORD0F_PAUSE_MASK: u16 = 0x3000;
+const NVM_WORD0F_ASM_DIR: u16 = 0x2000;
 const AUTO_READ_DONE_TIMEOUT_MS: usize = 10;
 const SWFW_SYNC_TIMEOUT: usize = 200;
 const MASTER_DISABLE_TIMEOUT: usize = 800;
@@ -93,6 +97,47 @@ pub struct LedModes {
     pub default: u32,
     pub mode1: u32,
     pub mode2: u32,
+}
+
+pub trait E1000NvmReader {
+    fn read_word(&mut self, offset: u16) -> DevResult<u16>;
+}
+
+fn normalize_led_default(mut data: u16) -> u16 {
+    if data == 0 || data == u16::MAX {
+        data = (0x8u16 << 12) | (0x9u16 << 8) | (0x1u16 << 4) | 0x1;
+    }
+    data
+}
+
+/// upstream: e1000_mac.c e1000_valid_led_default_generic()
+pub fn valid_led_default_generic<N: E1000NvmReader>(nvm: &mut N) -> DevResult<u16> {
+    Ok(normalize_led_default(nvm.read_word(NVM_ID_LED_SETTINGS)?))
+}
+
+/// upstream: e1000_mac.c e1000_set_default_fc_generic()
+pub fn set_default_fc_generic<N: E1000NvmReader>(
+    nvm: &mut N,
+    i350: bool,
+    lan_function: u8,
+) -> DevResult<FlowControlMode> {
+    let offset = if i350 && lan_function != 0 {
+        0x40u16
+            .checked_add(
+                0x40u16
+                    .checked_mul(u16::from(lan_function))
+                    .ok_or(DevError::InvalidParam)?,
+            )
+            .ok_or(DevError::InvalidParam)?
+    } else {
+        0
+    };
+    let data = nvm.read_word(NVM_INIT_CONTROL2_REG + offset)?;
+    Ok(match data & NVM_WORD0F_PAUSE_MASK {
+        0 => FlowControlMode::None,
+        NVM_WORD0F_ASM_DIR => FlowControlMode::TxPause,
+        _ => FlowControlMode::Full,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -257,16 +302,9 @@ pub fn clear_hw_cntrs_base_generic<I: E1000RegisterIo>(io: &mut I) -> DevResult 
 }
 
 /// upstream: e1000_mac.c e1000_valid_led_default_generic()
-pub const fn valid_led_default_generic(mut data: u16) -> u16 {
-    if data == 0 || data == u16::MAX {
-        data = (0x8u16 << 12) | (0x9u16 << 8) | (0x1u16 << 4) | 0x1;
-    }
-    data
-}
-
 /// upstream: e1000_mac.c e1000_id_led_init_generic()
-pub fn id_led_init_generic(data: u16, ledctl: u32) -> LedModes {
-    let data = valid_led_default_generic(data);
+pub fn id_led_init_generic<N: E1000NvmReader>(nvm: &mut N, ledctl: u32) -> DevResult<LedModes> {
+    let data = valid_led_default_generic(nvm)?;
     let mut mode1 = ledctl;
     let mut mode2 = ledctl;
     for led in 0..4u32 {
@@ -295,11 +333,11 @@ pub fn id_led_init_generic(data: u16, ledctl: u32) -> LedModes {
             _ => {}
         }
     }
-    LedModes {
+    Ok(LedModes {
         default: ledctl,
         mode1,
         mode2,
-    }
+    })
 }
 
 /// upstream: e1000_mac.c e1000_setup_led_generic()
@@ -863,6 +901,17 @@ mod tests {
         words: [u16; 128],
         pcie: Option<u32>,
     }
+
+    struct Nvm {
+        word: u16,
+        last_offset: Option<u16>,
+    }
+    impl E1000NvmReader for Nvm {
+        fn read_word(&mut self, offset: u16) -> DevResult<u16> {
+            self.last_offset = Some(offset);
+            Ok(self.word)
+        }
+    }
     impl Default for Pci {
         fn default() -> Self {
             Self {
@@ -1005,6 +1054,35 @@ mod tests {
     }
 
     #[test]
+    fn generic_nvm_modes_read_led_and_per_lan_flow_control_words() {
+        let mut led_nvm = Nvm {
+            word: 0,
+            last_offset: None,
+        };
+        assert_eq!(valid_led_default_generic(&mut led_nvm).unwrap(), 0x8911);
+        assert_eq!(led_nvm.last_offset, Some(NVM_ID_LED_SETTINGS));
+        led_nvm.word = 0x0055;
+        let modes = id_led_init_generic(&mut led_nvm, 0).unwrap();
+        assert_eq!(modes.mode1 & 0xff, E1000_LEDCTL_MODE_LED_ON);
+        assert_eq!(modes.mode2 & 0xff, E1000_LEDCTL_MODE_LED_ON);
+
+        let mut fc_nvm = Nvm {
+            word: NVM_WORD0F_ASM_DIR,
+            last_offset: None,
+        };
+        assert_eq!(
+            set_default_fc_generic(&mut fc_nvm, true, 2).unwrap(),
+            FlowControlMode::TxPause
+        );
+        assert_eq!(fc_nvm.last_offset, Some(NVM_INIT_CONTROL2_REG + 0xc0));
+        fc_nvm.word = 0;
+        assert_eq!(
+            set_default_fc_generic(&mut fc_nvm, false, 2).unwrap(),
+            FlowControlMode::None
+        );
+    }
+
+    #[test]
     fn generic_phy_mdi_and_register_semaphore_paths_are_bounded() {
         let mut mdi = 3;
         assert!(validate_mdi_setting_generic(false, &mut mdi).is_err());
@@ -1045,9 +1123,11 @@ mod tests {
 
     #[test]
     fn generic_led_nvm_defaults_and_modes_match_source_fields() {
-        assert_eq!(valid_led_default_generic(0), 0x8911);
-        assert_eq!(valid_led_default_generic(u16::MAX), 0x8911);
-        let modes = id_led_init_generic(0x0055, 0);
+        let mut nvm = Nvm {
+            word: 0x0055,
+            last_offset: None,
+        };
+        let modes = id_led_init_generic(&mut nvm, 0).unwrap();
         assert_eq!(modes.mode1 & 0xff, E1000_LEDCTL_MODE_LED_ON);
         assert_eq!(modes.mode2 & 0xff, E1000_LEDCTL_MODE_LED_ON);
         let mut io = Registers::default();
