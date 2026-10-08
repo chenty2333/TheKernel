@@ -63,6 +63,9 @@ pub(crate) struct Report {
     mt_contact_count: Option<HidLocation>,
     mt_contacts_per_report: usize,
     mt_contacts_remaining: usize,
+    mt_prev_touch: bool,
+    mt_scan_time: u32,
+    mt_timestamp_us: u32,
     pointer: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -650,6 +653,9 @@ impl Report {
             mt_contact_count: None,
             mt_contacts_per_report: 1,
             mt_contacts_remaining: 0,
+            mt_prev_touch: false,
+            mt_scan_time: 0,
+            mt_timestamp_us: 0,
             pointer,
         })
     }
@@ -809,6 +815,7 @@ impl Report {
                 visit(3, 0x31);
                 visit(3, 0x34);
             }
+            Mapping::MtScanTime => visit(4, 5),
         };
         for f in &self.fields {
             if f.slot.is_some() {
@@ -848,6 +855,7 @@ impl Report {
             Mapping::MtTipSwitch | Mapping::MtConfidence => {}
             Mapping::MtWidth => found |= ty == 3 && matches!(code, 0x30 | 0x34),
             Mapping::MtHeight => found |= ty == 3 && matches!(code, 0x31 | 0x34),
+            Mapping::MtScanTime => found |= ty == 4 && code == 5,
         };
         for field in self
             .fields
@@ -994,6 +1002,7 @@ impl Report {
         let mut contact_widths = [0i32; 256];
         let mut contact_heights = [0i32; 256];
         let mut assigned_slots = [-1i16; 256];
+        let mut scan_time_value = None;
         let descriptor_slots = self
             .fields
             .iter()
@@ -1004,6 +1013,11 @@ impl Report {
             .min(assigned_slots.len());
         let slots_to_process = contacts_to_process.min(descriptor_slots);
         for f in self.fields.iter().filter(|f| f.id == id) {
+            if matches!(f.kind, Kind::Variable(Mapping::MtScanTime)) {
+                let raw = extract(report, usize::from(f.bit), f.size, f.min < 0);
+                scan_time_value = Some((raw.max(0) as u32, f.max.max(0) as u32));
+                continue;
+            }
             let Some(slot) = f.slot.map(usize::from) else {
                 continue;
             };
@@ -1215,6 +1229,7 @@ impl Report {
                 }
                 Mapping::MtTipSwitch => {}
                 Mapping::MtConfidence => {}
+                Mapping::MtScanTime => {}
                 Mapping::MtWidth | Mapping::MtHeight => {
                     let Some(slot) = f.slot.map(usize::from) else {
                         continue;
@@ -1234,6 +1249,31 @@ impl Report {
                         }
                     }
                 }
+            }
+        }
+        if finish_contact_batch && let Some((scan_time, scan_time_max)) = scan_time_value {
+            let touching =
+                (0..slots_to_process).any(|slot| contact_tips[slot] && contact_confidence[slot]);
+            let delta = if self.mt_prev_touch {
+                let delta = scan_time as i64 - self.mt_scan_time as i64;
+                if delta < 0 {
+                    delta + i64::from(scan_time_max)
+                } else {
+                    delta
+                }
+            } else {
+                0
+            };
+            self.mt_scan_time = scan_time;
+            self.mt_timestamp_us = self.mt_timestamp_us.saturating_add(
+                u32::try_from(delta.max(0))
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(100),
+            );
+            emit(events, 4, 5, self.mt_timestamp_us as i32);
+            self.mt_prev_touch = touching;
+            if !touching {
+                self.mt_timestamp_us = 0;
             }
         }
         if events.len() != before && finish_contact_batch {
@@ -1659,5 +1699,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hmt_scan_time_wraps_and_accumulates_in_microseconds() {
+        let descriptor = [
+            0x05, 0x0d, 0x09, 0x05, 0xa1, 1, // Touchpad application
+            0x09, 0x22, 0xa1, 2, // Finger collection
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // Tip Switch
+            0x75, 7, 0x95, 1, 0x81, 3, // Padding
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
+            0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
+            0x05, 0x0d, 0x09, 0x56, 0x15, 0, 0x25, 0xff, 0x75, 8, 0x95, 1, 0x81,
+            2, // Scan time
+            0xc0, 0xc0,
+        ];
+        let mut report = Report::parse(&descriptor).unwrap();
+        let mut events = VecDeque::new();
+        assert!(report.decode(&[1, 1, 20, 30, 250], &mut events));
+        assert!(
+            events
+                .iter()
+                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 0))
+        );
+        events.clear();
+        assert!(report.decode(&[1, 1, 20, 30, 5], &mut events));
+        assert!(
+            events
+                .iter()
+                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 1_100))
+        );
+        events.clear();
+        assert!(report.decode(&[0, 1, 20, 30, 10], &mut events));
+        assert!(
+            events
+                .iter()
+                .any(|e| (e.event_type, e.code, e.value) == (4, 5, 1_600))
+        );
     }
 }

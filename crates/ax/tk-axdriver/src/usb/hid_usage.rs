@@ -14,6 +14,7 @@ pub(super) enum Mapping {
     MtConfidence,
     MtWidth,
     MtHeight,
+    MtScanTime,
     Hat,
     Wheel(u16),
 }
@@ -165,6 +166,7 @@ pub(super) fn mapping(usage: Usage, application: Usage, relative: bool) -> Optio
             0x30 => Some(Mapping::Axis(3, 0x3a)), // ABS_MT_PRESSURE
             0x32 => Some(Mapping::Axis(3, 0x3b)), // ABS_MT_DISTANCE / IN_RANGE
             0x42 => Some(Mapping::Key(0x14a)),    // BTN_TOUCH
+            0x56 => Some(Mapping::MtScanTime),    // HMT hardware scan timestamp
             _ => None,
         },
         _ => None,
