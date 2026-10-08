@@ -145,7 +145,7 @@
 
 use core::fmt;
 
-use super::regs::{self, Register, Registers};
+use super::regs::{self, Meaning, Register, Registers};
 
 /// The PRM's DCO window, in kHz.
 ///
@@ -905,6 +905,136 @@ pub(crate) fn disable_combo_pll<R: Registers>(
     let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, 0, PLL_LOCK_TIMEOUT_US)?;
 
     value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value & !PLL_POWER_ENABLE)?;
+    let power_state_timed_out = !pll_poll(regs, enable, PLL_POWER_STATE, 0, PLL_POWER_TIMEOUT_US)?;
+    Ok(PllRuntimeReport {
+        power_state_timed_out,
+        lock_timed_out,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TcPllPlatform {
+    TigerLake,
+    AlderLakeP,
+    AlderLakeN,
+}
+
+static DKL_PHY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+struct DynamicDklIo<'a, R> {
+    regs: &'a R,
+}
+
+fn dkl_dynamic_register(offset: u32, writable: bool) -> Option<Register> {
+    if offset & 3 != 0 || !(offset == 0x1010a0 || (0x168000..=0x16bffc).contains(&offset)) {
+        return None;
+    }
+    Some(if writable {
+        Register::read_write("DKL_PHY_MMIO", offset, Meaning::BringUp, None)
+    } else {
+        Register::read_only("DKL_PHY_MMIO", offset, Meaning::BringUp, None)
+    })
+}
+
+impl<R: Registers> intel_display::RegisterIo for DynamicDklIo<'_, R> {
+    fn read32(&self, offset: u32) -> Result<u32, intel_display::Error> {
+        let register =
+            dkl_dynamic_register(offset, false).ok_or(intel_display::Error::Unavailable(offset))?;
+        self.regs
+            .read(register)
+            .ok_or(intel_display::Error::Unavailable(offset))
+    }
+
+    fn write32(&self, offset: u32, value: u32) -> Result<(), intel_display::Error> {
+        let register =
+            dkl_dynamic_register(offset, true).ok_or(intel_display::Error::Unavailable(offset))?;
+        self.regs
+            .write(register, value)
+            .then_some(())
+            .ok_or(intel_display::Error::Unavailable(offset))
+    }
+}
+
+impl<R: Registers> intel_display::dkl_phy::DklIo for DynamicDklIo<'_, R> {
+    fn with_dkl_lock<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, intel_display::Error>,
+    ) -> Result<T, intel_display::Error> {
+        let _guard = DKL_PHY_LOCK.lock();
+        operation()
+    }
+}
+
+fn tc_pll_enable_register(
+    port: intel_display::dkl_phy::TcPort,
+    platform: TcPllPlatform,
+) -> Result<Register, PllRuntimeError> {
+    let offset = match (platform, port) {
+        (TcPllPlatform::TigerLake, intel_display::dkl_phy::TcPort::Tc1) => 0x4_6030,
+        (TcPllPlatform::TigerLake, intel_display::dkl_phy::TcPort::Tc2) => 0x4_6034,
+        (TcPllPlatform::AlderLakeP, intel_display::dkl_phy::TcPort::Tc1)
+        | (TcPllPlatform::AlderLakeN, intel_display::dkl_phy::TcPort::Tc1) => 0x4_6038,
+        (TcPllPlatform::AlderLakeP, intel_display::dkl_phy::TcPort::Tc2)
+        | (TcPllPlatform::AlderLakeN, intel_display::dkl_phy::TcPort::Tc2) => 0x4_6040,
+        _ => return Err(PllRuntimeError::Unreadable("unmapped TC PLL enable")),
+    };
+    Ok(Register::read_write(
+        "TC_PLL_ENABLE",
+        offset,
+        Meaning::BringUp,
+        None,
+    ))
+}
+
+fn dkl_error(_: intel_display::Error) -> PllRuntimeError {
+    PllRuntimeError::Unreadable("DKL PHY MMIO")
+}
+
+/// Enable a display-12/13 DKL/MG PLL after its port power references are held.
+// upstream: intel_dpll_mgr.c mg_pll_enable()/icl_pll_power_enable()/icl_pll_enable()
+pub(crate) fn enable_tc_dkl_pll<R: Registers>(
+    regs: &R,
+    port: intel_display::dkl_phy::TcPort,
+    platform: TcPllPlatform,
+    state: &intel_display::dpll_mgr::DklPllState,
+    afc_startup: Option<u8>,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let enable = tc_pll_enable_register(port, platform)?;
+    let value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value | PLL_POWER_ENABLE)?;
+    let power_state_timed_out = !pll_poll(
+        regs,
+        enable,
+        PLL_POWER_STATE,
+        PLL_POWER_STATE,
+        PLL_POWER_TIMEOUT_US,
+    )?;
+
+    let io = DynamicDklIo { regs };
+    intel_display::dpll_mgr::dkl_pll_write(&io, port, state, afc_startup).map_err(dkl_error)?;
+
+    let value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value | PLL_ENABLE)?;
+    let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, PLL_LOCK, PLL_LOCK_TIMEOUT_US)?;
+    Ok(PllRuntimeReport {
+        power_state_timed_out,
+        lock_timed_out,
+    })
+}
+
+/// Disable a DKL/MG PLL after its DDI has been disabled by the modeset caller.
+// upstream: intel_dpll_mgr.c mg_pll_disable()/icl_pll_disable()
+pub(crate) fn disable_tc_dkl_pll<R: Registers>(
+    regs: &R,
+    port: intel_display::dkl_phy::TcPort,
+    platform: TcPllPlatform,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let enable = tc_pll_enable_register(port, platform)?;
+    let value = pll_read(regs, enable)?;
+    pll_write(regs, enable, value & !PLL_ENABLE)?;
+    let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, 0, PLL_LOCK_TIMEOUT_US)?;
+    let value = pll_read(regs, enable)?;
     pll_write(regs, enable, value & !PLL_POWER_ENABLE)?;
     let power_state_timed_out = !pll_poll(regs, enable, PLL_POWER_STATE, 0, PLL_POWER_TIMEOUT_US)?;
     Ok(PllRuntimeReport {

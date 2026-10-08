@@ -53,6 +53,40 @@ fn combo_pll_power_cfg_enable_and_disable_follow_i915_order() {
     );
 }
 
+#[test]
+fn tc_dkl_pll_adapter_limits_enable_register_map_to_known_tc1_tc2_offsets() {
+    use intel_display::dkl_phy::TcPort;
+
+    assert_eq!(
+        tc_pll_enable_register(TcPort::Tc1, TcPllPlatform::TigerLake)
+            .unwrap()
+            .offset(),
+        0x46030
+    );
+    assert_eq!(
+        tc_pll_enable_register(TcPort::Tc2, TcPllPlatform::TigerLake)
+            .unwrap()
+            .offset(),
+        0x46034
+    );
+    assert_eq!(
+        tc_pll_enable_register(TcPort::Tc1, TcPllPlatform::AlderLakeN)
+            .unwrap()
+            .offset(),
+        0x46038
+    );
+    assert_eq!(
+        tc_pll_enable_register(TcPort::Tc2, TcPllPlatform::AlderLakeP)
+            .unwrap()
+            .offset(),
+        0x46040
+    );
+    assert!(tc_pll_enable_register(TcPort::Tc3, TcPllPlatform::AlderLakeN).is_err());
+    assert!(dkl_dynamic_register(0x16c000, true).is_none());
+    assert!(dkl_dynamic_register(0x168001, true).is_none());
+    assert!(dkl_dynamic_register(0x1010a0, true).is_some());
+}
+
 /// The reference frequency the ADL-N PLL strips use most often, and the one
 /// the worked example in the reference document uses.
 const REF_24: u32 = 24_000;

@@ -1139,6 +1139,15 @@ lock and power-off sequence from Linux 7.2.3
 Intel). The adapter retains i915's warning-only timeout outcome and is not yet
 called by atomic modeset.
 
+`kernel/src/drm/intel/pll.rs::enable_tc_dkl_pll()` and
+`disable_tc_dkl_pll()` connect the DKL PHY writer to a checked dynamic-register
+backend and perform the TC PLL power/lock sequence. The selector is serialized
+and the adapter currently admits only known TGL/ADL-P/N TC1/TC2 enable offsets;
+the caller must hold display/PHY power references. The function order follows
+`mg_pll_enable()`/`mg_pll_disable()` and `icl_pll_power_enable()`/
+`icl_pll_disable()` in the same MIT source file; no native modeset call site is
+connected yet.
+
 `tk-intel-display/src/dpll_mgr.rs` extends the DKL MG PLL calculation to
 source-shaped DisplayPort 8.1-GHz DCO and HDMI `[7992,10000]`-MHz window
 selection, preserving `icl_mg_pll_find_divisors()` search priority and

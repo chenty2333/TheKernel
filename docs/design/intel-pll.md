@@ -545,7 +545,7 @@ The fixed DP/TBT tables, source candidate ordering, DCO window and midpoint,
 38.4→19.2 reference division, Gen11/12 CFGCR selector, and display-12
 38.4-MHz fraction workaround have host tests. This is not yet the full manager:
 atomic modeset integration, active-port mux updates, MG PHY DP/TBT register
-writes, DKL PLL enable/lock/disable wrapper, clock routing/reference-clock updates, readout/sanitization, and full
+writes, clock routing/reference-clock updates, readout/sanitization, and full
 display-12/13 `intel_dpll.c` state ownership are still not translated or wired.
 `kernel/src/drm/intel/pll.rs` now adds the combo DPLL0/1 power-state, CFGCR,
 enable/lock and disable/power-off sequences from `combo_pll_enable()` and
@@ -554,6 +554,15 @@ policy; no modeset call site invokes them yet. `tk-intel-display/src/dpll.rs` ad
 translates the generic CRTC dispatch guards, stale-state clear, and ±1 kHz
 clock-match helper from Linux 7.2.3 `intel_dpll.c` (MIT, Copyright © 2020
 Intel). Those functions have no kernel atomic-state call site yet.
+
+The kernel adapter also exposes DKL/MG TC PLL enable/disable. It serializes the
+shared HIP selector, bounds raw MMIO to the fixed DKL apertures, routes only
+known TC1/TC2 enable offsets for TGL and ADL-P/N, and composes the previously
+translated `dkl_pll_write()` sequence with power/lock polling. Its API requires
+the caller to hold the corresponding display/PHY power references; no current
+modeset call site invokes it. The adapter has compile-checked map tests but its
+kernel-host unit binary is not run due the known bare-metal relocation linker
+failure.
 
 The same module additionally carries the display-12/13 candidate-mask and
 shared-resource policy from `icl_get_combo_phy_dpll()`,
