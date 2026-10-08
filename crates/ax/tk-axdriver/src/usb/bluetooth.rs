@@ -26,6 +26,7 @@ pub struct UsbBluetoothHci {
     adapter: Adapter<Transport>,
     family_hint: tk_bt_hci::DeviceFamily,
     address: [u8; 6],
+    capabilities: tk_bt_hci::HciCapabilities,
 }
 
 struct Transport {
@@ -93,6 +94,7 @@ impl UsbBluetoothHci {
             ),
             family_hint,
             address: [0; 6],
+            capabilities: tk_bt_hci::HciCapabilities::default(),
         })
     }
     pub fn index(&self) -> u16 {
@@ -104,6 +106,9 @@ impl UsbBluetoothHci {
     pub fn address(&self) -> [u8; 6] {
         self.address
     }
+    pub fn capabilities(&self) -> tk_bt_hci::HciCapabilities {
+        self.capabilities
+    }
     pub fn statistics(&self) -> tk_bt_hci::Statistics {
         self.adapter.statistics()
     }
@@ -112,8 +117,14 @@ impl UsbBluetoothHci {
     }
     pub fn set_device_up(&mut self, up: bool) -> Result<(), Error> {
         self.adapter.set_up(up)?;
-        if up && self.family_hint != tk_bt_hci::DeviceFamily::Unknown {
-            self.adapter.intel_set_event_mask()?;
+        if up {
+            if self.family_hint != tk_bt_hci::DeviceFamily::Unknown {
+                self.adapter.intel_set_event_mask()?;
+            }
+            if let Ok(capabilities) = self.adapter.read_capabilities() {
+                self.address = capabilities.address;
+                self.capabilities = capabilities;
+            }
         }
         Ok(())
     }

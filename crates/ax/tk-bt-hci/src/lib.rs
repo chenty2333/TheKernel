@@ -139,6 +139,16 @@ pub struct Statistics {
     pub byte_tx: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HciCapabilities {
+    pub address: [u8; 6],
+    pub features: [u8; 8],
+    pub acl_mtu: u16,
+    pub acl_packets: u16,
+    pub sco_mtu: u16,
+    pub sco_packets: u16,
+}
+
 /// Small HCI device/channel owner independent of AF_BLUETOOTH socket plumbing.
 pub struct Adapter<T> {
     transport: T,
@@ -172,6 +182,33 @@ impl<T: UsbTransport> Adapter<T> {
     }
     pub fn statistics(&self) -> Statistics {
         self.stats
+    }
+    /// Query the standard controller address, feature bitmap and ACL/SCO
+    /// buffer limits for HCIGETDEVINFO. Values are device replies, not guesses.
+    pub fn read_capabilities(&mut self) -> Result<HciCapabilities, Error> {
+        let mut capabilities = HciCapabilities::default();
+        let mut event = [0u8; 32];
+        let length = self.command_complete(&[0x09, 0x10, 0], &mut event)?;
+        if length < 12 || event[0] != 0x0e || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        capabilities.address.copy_from_slice(&event[6..12]);
+
+        let length = self.command_complete(&[0x03, 0x10, 0], &mut event)?;
+        if length < 14 || event[0] != 0x0e || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        capabilities.features.copy_from_slice(&event[6..14]);
+
+        let length = self.command_complete(&[0x05, 0x10, 0], &mut event)?;
+        if length < 13 || event[0] != 0x0e || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        capabilities.acl_mtu = u16::from_le_bytes([event[6], event[7]]);
+        capabilities.sco_mtu = u16::from(event[8]);
+        capabilities.acl_packets = u16::from_le_bytes([event[9], event[10]]);
+        capabilities.sco_packets = u16::from_le_bytes([event[11], event[12]]);
+        Ok(capabilities)
     }
     pub fn open(&mut self, channel: Channel) -> Result<(), Error> {
         match channel {
@@ -639,7 +676,7 @@ pub fn no_device_ioctl(command: u32) -> Result<IoctlOutcome, Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, vec::Vec};
+    use std::{collections::VecDeque, vec, vec::Vec};
 
     use super::*;
     struct Fake {
@@ -875,6 +912,32 @@ mod tests {
         let mut event = [0; 16];
         assert_eq!(adapter.command_complete(&[1, 0x10, 0], &mut event), Ok(6));
         assert_eq!(&event[..6], &[0x0e, 4, 1, 1, 0x10, 0]);
+    }
+    #[test]
+    fn hci_capabilities_are_decoded_from_standard_command_replies() {
+        let mut adapter = Adapter::new(
+            FirmwareFake {
+                events: VecDeque::from([
+                    vec![0x0e, 10, 1, 0x09, 0x10, 0, 1, 2, 3, 4, 5, 6],
+                    vec![0x0e, 12, 1, 0x03, 0x10, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+                    vec![0x0e, 11, 1, 0x05, 0x10, 0, 0x40, 0, 0x20, 2, 0, 1, 0],
+                ]),
+                bulk: Vec::new(),
+            },
+            0,
+        );
+        adapter.set_up(true).unwrap();
+        assert_eq!(
+            adapter.read_capabilities(),
+            Ok(HciCapabilities {
+                address: [1, 2, 3, 4, 5, 6],
+                features: [1, 2, 3, 4, 5, 6, 7, 8],
+                acl_mtu: 64,
+                acl_packets: 2,
+                sco_mtu: 32,
+                sco_packets: 1,
+            })
+        );
     }
 
     #[test]

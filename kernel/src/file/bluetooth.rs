@@ -264,6 +264,7 @@ impl HciSocket {
         {
             let adapter = usb_adapter(index).ok_or(LinuxError::ENODEV)?;
             let adapter = adapter.lock();
+            let capabilities = adapter.capabilities();
             let mut info = HciDevInfo::zeroed();
             info.dev_id = index;
             info.bdaddr = adapter.address();
@@ -285,6 +286,11 @@ impl HciSocket {
             }
             info.flags = if adapter.is_up() { 1 } else { 0 };
             info.device_type = 1; // HCI_USB
+            info.features = capabilities.features;
+            info.acl_mtu = capabilities.acl_mtu;
+            info.acl_packets = capabilities.acl_packets;
+            info.sco_mtu = capabilities.sco_mtu;
+            info.sco_packets = capabilities.sco_packets;
             let stats = adapter.statistics();
             info.stats = HciDevStats {
                 err_rx: stats.err_rx,
