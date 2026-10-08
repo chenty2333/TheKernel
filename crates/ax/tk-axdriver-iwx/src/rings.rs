@@ -567,6 +567,22 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingBus {
+        writes: Vec<(u32, u32)>,
+    }
+    impl crate::CsrAccess for RecordingBus {
+        fn read32(&mut self, _offset: u32) -> u32 {
+            0
+        }
+        fn write32(&mut self, offset: u32, value: u32) {
+            self.writes.push((offset, value));
+        }
+        fn write8(&mut self, _offset: u32, _value: u8) {}
+        fn barrier(&mut self, _direction: crate::IoBarrier) {}
+        fn delay_us(&mut self, _micros: u32) {}
+    }
+
     #[test]
     fn ax210_rx_ring_uses_expected_alignment_and_rbid_addresses() {
         let mut alloc = Alloc(Cell::new(0x100000));
@@ -719,5 +735,24 @@ mod tests {
             address
         );
         assert!(ring.take_payload_buffer(0).unwrap().is_none());
+    }
+
+    #[test]
+    fn outbound_tx_tfd_publishes_hbus_write_pointer_for_device_queue() {
+        let mut allocator = Alloc(Cell::new(0x1000));
+        let mut ring =
+            allocate_tx_ring_for_family(&mut allocator, 7, crate::DeviceFamily::Ax210).unwrap();
+        let mut registers =
+            crate::IwxRegisters::new(RecordingBus::default(), crate::DeviceFamily::Ax210, 0);
+        ring.submit_and_kick(
+            &mut registers,
+            &[TxSegment {
+                address: 0x8000,
+                length: 32,
+            }],
+            32,
+        )
+        .unwrap();
+        assert_eq!(registers.into_inner().writes, [(0x0460, (7u32 << 16) | 1)]);
     }
 }
