@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 TheKernel contributors. See the repository MIT license.
-//! Independently opted-in N305 BCS/RCS execution adapter. Never reached from the
-//! display modeset flag; display D0 is not used as the GT/media A0 stepping.
+//! Independently opted-in Gen12 BCS and N305 RCS execution adapter. Never
+//! reached from the display modeset flag; display D0 is not the GT/media step.
 #[cfg(target_os = "none")]
 use alloc::{format, string::String};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering, compiler_fence};
 
 use axsync::Mutex;
 #[cfg(target_os = "none")]
-use intel_gt::uc::{self, FirmwareImage, Kind, Platform};
-use intel_gt::{Error, GtIo};
+use intel_gt::uc::{self, FirmwareImage, Kind};
+use intel_gt::{Error, GtIo, uc::Platform};
 
 #[cfg(target_os = "none")]
 use super::pci;
@@ -161,7 +161,7 @@ impl Bus {
         }
         self.awake.load(Ordering::Acquire)
             && match r {
-                0xc000 | 0x800c | 0xa2a0 | 0x22030 | 0x22034 => !write,
+                0xc000 | 0xc1dc | 0x800c | 0xa2a0 | 0x22030 | 0x22034 => !write,
                 0x941c | 0x2209c | 0x2229c | 0x220d0 => true,
                 0xfdc | 0x9424 | 0x480c | 0x400c | 0x22080 | 0x22098 | 0x220a8 | 0x220b0
                 | 0x220b4 | 0x220c4 | 0x223a0 | 0x22510 | 0x22514 | 0x22518 | 0x2251c | 0x22550 => {
@@ -214,6 +214,7 @@ impl GtIo for Bus {
 }
 struct Owner {
     bdf: super::pci::Bdf,
+    platform: Platform,
     bus: Bus,
     lost: bool,
     render_ready: bool,
@@ -243,31 +244,42 @@ static UC_FIRMWARE: Mutex<UcFirmware> = Mutex::new(UcFirmware {
 
 /// Runs after the rootfs reader is installed; no probe-time filesystem access.
 #[cfg(target_os = "none")]
+// upstream: intel_uc.c __uc_init_hw()
 fn load_uc_firmware() {
     const MAX_UC_BYTES: usize = 2 * 1024 * 1024;
     const WOPCM_BYTES: usize = 2 * 1024 * 1024;
-    let enable_guc = uc::default_enable_mask(Platform::AlderLakeN);
-    axlog::info!("intel-gt: upstream ADL-S/N uC default enable_guc={enable_guc:#x}");
+    let platform = OWNER
+        .lock()
+        .as_ref()
+        .filter(|owner| !owner.lost)
+        .map(|owner| owner.platform);
+    let Some(platform) = platform else {
+        axlog::warn!("intel-gt: no live GT owner for firmware load");
+        return;
+    };
+    let enable_guc = uc::default_enable_mask(platform);
+    axlog::info!("intel-gt: platform {platform:?} upstream uC default enable_guc={enable_guc:#x}");
+    if enable_guc & uc::ENABLE_GUC_LOAD_HUC == 0 {
+        return;
+    }
     let mut request = |path: &str, max_len: usize| {
         axdriver::prelude::firmware::request(&alloc::format!("/lib/firmware/{path}"), max_len)
     };
-    let guc = uc::load(
-        Platform::AlderLakeN,
-        Kind::GuC,
-        MAX_UC_BYTES,
-        WOPCM_BYTES,
-        &mut request,
-    );
-    let huc = uc::load(
-        Platform::AlderLakeN,
-        Kind::HuC,
-        MAX_UC_BYTES,
-        WOPCM_BYTES,
-        &mut request,
-    );
+    let guc = uc::load(platform, Kind::GuC, MAX_UC_BYTES, WOPCM_BYTES, &mut request);
+    let huc = uc::load(platform, Kind::HuC, MAX_UC_BYTES, WOPCM_BYTES, &mut request);
     let mut state = UC_FIRMWARE.lock();
     match guc {
         Ok(image) => {
+            if image.old_version {
+                let wanted = uc::candidates(platform, Kind::GuC)[0];
+                axlog::warn!(
+                    "intel-gt: GuC {} ({:?}) recommended but only {} ({:?}) was found",
+                    wanted.path,
+                    wanted.version,
+                    image.blob.path,
+                    image.css.version
+                );
+            }
             let css = uc::guc_css_info(image.css.version, image.css);
             axlog::info!(
                 "intel-gt: GuC firmware {} selected, CSS {:?}, submission {:?}, private data {} \
@@ -284,6 +296,16 @@ fn load_uc_firmware() {
     }
     match huc {
         Ok(image) => {
+            if image.old_version {
+                let wanted = uc::candidates(platform, Kind::HuC)[0];
+                axlog::warn!(
+                    "intel-gt: HuC {} ({:?}) recommended but only {} ({:?}) was found",
+                    wanted.path,
+                    wanted.version,
+                    image.blob.path,
+                    image.css.version
+                );
+            }
             axlog::info!(
                 "intel-gt: HuC firmware {} selected, {:?} CSS, {} bytes",
                 image.blob.path,
@@ -308,7 +330,13 @@ fn load_uc_firmware() {
             }
         };
         if guc_status & 1 == 0 {
-            axlog::warn!("intel-gt: GuC is not confirmed in reset; refuse uC DMA upload");
+            // Upstream first calls intel_reset_guc() and then warns if MIA
+            // remains active. We deliberately keep the stricter refusal here
+            // until GT-wide reset ownership exists; proceeding could race a
+            // firmware/submission controller while DMA mutates WOPCM.
+            axlog::warn!(
+                "intel-gt: GuC is not confirmed in reset; no uC DMA without owned GuC reset"
+            );
             return;
         }
         match copy::upload_uc_firmware(owner, guc, huc) {
@@ -392,7 +420,7 @@ pub(super) fn init_at_boot() {
     let windows = super::mapped_windows();
     let result = if windows.len() != 1 {
         Err(String::from(
-            "intel.gt=1 refused: require one mapped N305 GPU",
+            "intel.gt=1 refused: require one mapped supported Gen12 GPU",
         ))
     } else {
         let (bdf, window) = windows[0];
@@ -420,10 +448,16 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
         pci::Ecam::platform().ok_or_else(|| String::from("GT PCI facts unavailable; no writes"))?;
     let info = pci::DeviceInfo::read(&ecam, bdf)
         .ok_or_else(|| String::from("GT PCI device unavailable; no writes"))?;
-    // Local i915 intel_step.c::adlp_n_revids[0] COMMON_STEP(A0), not display D0.
-    if (info.vendor_id, info.device_id, info.revision) != (0x8086, 0x46d0, 0) {
+    let platform = uc::platform_from_device_id(info.device_id)
+        .ok_or_else(|| String::from("unsupported Gen12 GT PCI ID; no writes"))?;
+    if info.vendor_id != 0x8086 {
+        return Err(String::from("GT requires Intel vendor ID; no writes"));
+    }
+    if platform == Platform::AlderLakeN && (info.device_id != 0x46d0 || info.revision != 0) {
+        // The N305 BCS/PPGTT path is qualified against local i915
+        // intel_step.c::adlp_n_revids[0] COMMON_STEP(A0), not display D0.
         return Err(String::from(
-            "GT requires exact N305 Gen12/media A0; no writes",
+            "N305 GT requires exact Gen12/media A0; no writes",
         ));
     }
     let bus = Bus {
@@ -437,6 +471,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
     if let Err(error) = intel_gt::uncore::acquire_gt(&bus) {
         *owner = Some(Owner {
             bdf,
+            platform,
             bus,
             lost: true,
             render_ready: false,
@@ -460,6 +495,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
         Ok(()) => {
             let mut device = Owner {
                 bdf,
+                platform,
                 bus,
                 lost: false,
                 render_ready: false,
@@ -467,7 +503,9 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 uc_memory: None,
             };
             let copied = copy::run(&mut device, bdf).and_then(|()| {
-                if axhal::boot::command_line_value("intel.rcs") == Some("1") {
+                if axhal::boot::command_line_value("intel.rcs") == Some("1")
+                    && platform == Platform::AlderLakeN
+                {
                     copy::render_test(&mut device)?;
                     device.render_ready = true;
                     axlog::info!(
@@ -486,10 +524,10 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             *owner = Some(device);
             copied
                 .map(|_| {
-                    String::from(
+                    String::from(format!(
                         "intel-gt: BCS_COPY_BYTES_AND_GUARDS_VERIFIED after hardware breadcrumb \
-                         and reset retirement; GT/media A0; not RCS/Mesa rendering",
-                    )
+                         and reset retirement; {platform:?}; not Mesa rendering"
+                    ))
                 })
                 .map_err(|e| {
                     format!(
@@ -505,6 +543,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             }
             *owner = Some(Owner {
                 bdf,
+                platform,
                 bus,
                 lost: true,
                 render_ready: false,

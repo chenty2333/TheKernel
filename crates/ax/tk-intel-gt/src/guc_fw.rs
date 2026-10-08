@@ -23,8 +23,8 @@ const START_DMA: u32 = 1;
 const UOS_MOVE: u32 = 1 << 4;
 const HUC_UKERNEL: u32 = 1 << 9;
 const DMA_ADDRESS_SPACE_WOPCM: u32 = 7 << 16;
-const HUC_STATUS2: u32 = 0xd3b0;
-const HUC_FW_VERIFIED: u32 = 1 << 7;
+const GEN11_HUC_KERNEL_LOAD_INFO: u32 = 0xc1dc;
+const HUC_LOAD_SUCCESSFUL: u32 = 1 << 0;
 const GEN11_GUC_SEND_BASE: u32 = 0x190240;
 const GEN11_GUC_HOST_INTERRUPT: u32 = 0x1901f0;
 const GEN11_GUC_SEND_COUNT: usize = 4;
@@ -52,7 +52,6 @@ pub fn notify(io: &impl GtIo) -> Result<(), Error> {
     io.write(GEN11_GUC_HOST_INTERRUPT, GUC_SEND_TRIGGER)
 }
 
-// upstream: intel_uc_fw.c uc_fw_xfer()
 /// Caller must keep the firmware bytes and their GGTT binding alive until this
 /// returns success and hold GT forcewake. An uncertain completion quarantines
 /// the owner because DMA may continue.
@@ -66,6 +65,7 @@ pub fn firmware_dma_xfer(
     firmware_dma_xfer_with_timeout(io, source_ggtt, destination, byte_count, flags, 100_000)
 }
 
+// upstream: intel_uc_fw.c uc_fw_xfer()
 fn firmware_dma_xfer_with_timeout(
     io: &impl GtIo,
     source_ggtt: u64,
@@ -101,9 +101,7 @@ fn firmware_dma_xfer_with_timeout(
     Ok(())
 }
 
-// upstream: intel_guc_fw.c guc_xfer_rsa_mmio()
-// The ADL-N MMIO path is the fixed 256-byte key; larger signatures require
-// the upstream GGTT-pinned RSA VMA path and are refused until implemented.
+// upstream: intel_uc_fw.c intel_uc_fw_copy_rsa()
 fn rsa_words(image: &FirmwareImage) -> Result<[u32; UOS_RSA_SCRATCH_COUNT], Error> {
     const RSA_BYTES: usize = UOS_RSA_SCRATCH_COUNT * 4;
     if image.css.rsa_bytes != RSA_BYTES {
@@ -123,6 +121,36 @@ fn rsa_words(image: &FirmwareImage) -> Result<[u32; UOS_RSA_SCRATCH_COUNT], Erro
     Ok(words)
 }
 
+// upstream: intel_guc_fw.c guc_xfer_rsa_mmio()
+fn guc_xfer_rsa_mmio(io: &impl GtIo, image: &FirmwareImage) -> Result<(), Error> {
+    let rsa = rsa_words(image)?;
+    for (index, word) in rsa.into_iter().enumerate() {
+        io.write(UOS_RSA_SCRATCH + index as u32 * 4, word)?;
+    }
+    Ok(())
+}
+
+// upstream: intel_guc_fw.c guc_xfer_rsa_vma()
+fn guc_xfer_rsa_vma(io: &impl GtIo, source_ggtt: u64, image: &FirmwareImage) -> Result<(), Error> {
+    let rsa_offset = image
+        .css
+        .header_bytes
+        .checked_add(image.css.microcode_bytes)
+        .and_then(|offset| u64::try_from(offset).ok()?.checked_add(source_ggtt))
+        .and_then(|offset| u32::try_from(offset).ok())
+        .ok_or(Error::Refused)?;
+    io.write(UOS_RSA_SCRATCH, rsa_offset)
+}
+
+// upstream: intel_guc_fw.c guc_xfer_rsa()
+fn guc_xfer_rsa(io: &impl GtIo, source_ggtt: u64, image: &FirmwareImage) -> Result<(), Error> {
+    if image.css.rsa_bytes > UOS_RSA_SCRATCH_COUNT * 4 {
+        guc_xfer_rsa_vma(io, source_ggtt, image)
+    } else {
+        guc_xfer_rsa_mmio(io, image)
+    }
+}
+
 // upstream: intel_guc_fw.c intel_guc_fw_upload()
 /// Caller supplies a pinned firmware GGTT image and owns forcewake. This
 /// Gen12.0 path transfers the RSA key, copies CSS+uKernel to WOPCM, then waits
@@ -138,11 +166,7 @@ pub fn guc_upload(
     for write in gen12_prepare_xfer() {
         io.write(write.offset, write.value).map_err(LoadError::Io)?;
     }
-    let rsa = rsa_words(image).map_err(LoadError::Io)?;
-    for (index, word) in rsa.into_iter().enumerate() {
-        let offset = UOS_RSA_SCRATCH + (index as u32) * 4;
-        io.write(offset, word).map_err(LoadError::Io)?;
-    }
+    guc_xfer_rsa(io, source_ggtt, image).map_err(LoadError::Io)?;
     let code_bytes = image
         .css
         .header_bytes
@@ -174,8 +198,8 @@ pub fn huc_upload(
 }
 
 // upstream: intel_huc.c intel_huc_is_authenticated()
-pub fn huc_is_authenticated(status2: u32) -> bool {
-    status2 & HUC_FW_VERIFIED == HUC_FW_VERIFIED
+pub fn huc_is_authenticated(status: u32) -> bool {
+    status & HUC_LOAD_SUCCESSFUL == HUC_LOAD_SUCCESSFUL
 }
 
 // upstream: intel_huc.c intel_huc_wait_for_auth_complete()
@@ -183,7 +207,7 @@ pub fn wait_huc_auth(io: &impl GtIo) -> Result<u32, Error> {
     for _ in 0..3 {
         let start = io.now_us();
         loop {
-            let status = io.read(HUC_STATUS2)?;
+            let status = io.read(GEN11_HUC_KERNEL_LOAD_INFO)?;
             if huc_is_authenticated(status) {
                 return Ok(status);
             }
@@ -193,7 +217,7 @@ pub fn wait_huc_auth(io: &impl GtIo) -> Result<u32, Error> {
             io.delay_us(2);
         }
     }
-    Err(Error::Timeout(HUC_STATUS2))
+    Err(Error::Timeout(GEN11_HUC_KERNEL_LOAD_INFO))
 }
 
 // upstream: intel_guc.c intel_guc_send_mmio()
@@ -305,11 +329,11 @@ pub enum LoadError {
     Timeout { status: u32, attempts: u8 },
 }
 
-// upstream: intel_guc_fw.c guc_wait_ucode()
 pub fn wait_ucode(io: &impl GtIo) -> Result<u32, LoadError> {
     wait_ucode_with(io, 1_000_000, 3)
 }
 
+// upstream: intel_guc_fw.c guc_wait_ucode()
 fn wait_ucode_with(io: &impl GtIo, wait_us: u64, attempts: u8) -> Result<u32, LoadError> {
     let mut status = 0;
     for attempt in 0..attempts {
@@ -465,8 +489,8 @@ mod tests {
             if offset == 0xc000 {
                 return Ok(0xf0 << 8);
             }
-            if offset == HUC_STATUS2 {
-                return Ok(HUC_FW_VERIFIED);
+            if offset == GEN11_HUC_KERNEL_LOAD_INFO {
+                return Ok(HUC_LOAD_SUCCESSFUL);
             }
             if offset == DMA_CTRL {
                 return Ok(u32::from(self.stuck));
@@ -559,6 +583,7 @@ mod tests {
             kind: crate::uc::Kind::HuC,
             blob: crate::uc::candidates(crate::uc::Platform::AlderLakeN, crate::uc::Kind::HuC)[0],
             css,
+            old_version: false,
             bytes,
         }
     }
@@ -595,6 +620,21 @@ mod tests {
     }
 
     #[test]
+    fn guc_large_rsa_uses_the_pinned_ggtt_vma_path() {
+        let mut image = huc_fixture();
+        image.kind = crate::uc::Kind::GuC;
+        image.css.rsa_bytes = UOS_RSA_SCRATCH_COUNT * 4 + 4;
+        let io = DmaIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            time: core::cell::Cell::new(0),
+            stuck: false,
+            fail_start: false,
+        };
+        assert_eq!(guc_xfer_rsa(&io, 0x10_0000, &image), Ok(()));
+        assert_eq!(*io.writes.borrow(), [(UOS_RSA_SCRATCH, 0x10_0100)]);
+    }
+
+    #[test]
     fn huc_upload_uses_zero_destination_and_refuses_gsc_owned_firmware() {
         let image = huc_fixture();
         let io = DmaIo {
@@ -614,22 +654,22 @@ mod tests {
     }
 
     #[test]
-    fn huc_authentication_status_requires_the_verified_bit() {
+    fn huc_authentication_status_requires_the_gen11_success_bit() {
         assert!(!huc_is_authenticated(0));
-        assert!(!huc_is_authenticated(HUC_FW_VERIFIED >> 1));
-        assert!(huc_is_authenticated(HUC_FW_VERIFIED));
-        assert!(huc_is_authenticated(HUC_FW_VERIFIED | 0x1234));
+        assert!(!huc_is_authenticated(1 << 1));
+        assert!(huc_is_authenticated(HUC_LOAD_SUCCESSFUL));
+        assert!(huc_is_authenticated(HUC_LOAD_SUCCESSFUL | 0x1234));
     }
 
     #[test]
-    fn huc_auth_wait_reads_verified_status() {
+    fn huc_auth_wait_reads_gen11_load_info() {
         let io = DmaIo {
             writes: core::cell::RefCell::new(std::vec::Vec::new()),
             time: core::cell::Cell::new(0),
             stuck: false,
             fail_start: false,
         };
-        assert_eq!(wait_huc_auth(&io), Ok(HUC_FW_VERIFIED));
+        assert_eq!(wait_huc_auth(&io), Ok(HUC_LOAD_SUCCESSFUL));
     }
 
     #[test]

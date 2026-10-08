@@ -513,6 +513,7 @@ fn upload_huc_for_auth(
 }
 
 #[cfg(target_os = "none")]
+// upstream: intel_uc_fw.c intel_uc_fw_upload()
 fn upload_uc_one(
     owner: &mut super::Owner,
     image: &intel_gt::uc::FirmwareImage,
@@ -575,9 +576,11 @@ fn upload_uc_one(
     Ok(())
 }
 
-/// Upload HuC first, then GuC, and request HuC authentication as in
-/// intel_uc_init_hw(). ADL-N does not enable GuC submission queues here.
+/// Upload HuC then GuC and authenticate it as in intel_uc_init_hw(). ADL-N
+/// defaults to HuC authentication plus GuC submission; submission setup is a
+/// separate stage and must not be treated as complete by this loader.
 #[cfg(target_os = "none")]
+// upstream: intel_uc.c __uc_init_hw()
 pub(super) fn upload_uc_firmware(
     owner: &mut super::Owner,
     guc: &intel_gt::uc::FirmwareImage,

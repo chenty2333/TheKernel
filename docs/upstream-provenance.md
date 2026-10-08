@@ -978,7 +978,7 @@ shims. The scanner measures kernel/src as (86,42,20,130,8,0,0) at >=40 and
 individual-branch historical counts above are not additive. Other scopes
 retain the latest Intel inventory, with no scanner exemptions.
 
-`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c`, `__uc_fw_auto_select` platform GuC/HuC filename/version table for TGL/RKL/ADL-S/ADL-P (MIT, Copyright © 2016-2019 Intel Corporation); ADL-N follows upstream ADL-S classification. Metadata only; no binary included.
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c`, `__uc_fw_auto_select` platform GuC/HuC filename/version table for TGL/RKL/ADL-S/ADL-P (MIT, Copyright © 2016-2019 Intel Corporation); ADL-N selects ADL-S firmware, while its runtime platform defaults remain ADL-P/N. Metadata only; no binary included.
 
 `crates/ax/tk-intel-gt/src/uc.rs::parse_css`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::__check_ccs_header` size-field validation, translated with checked arithmetic (MIT, Copyright © 2016-2019 Intel Corporation); WOPCM and file-size checks retained.
 
@@ -986,7 +986,7 @@ retain the latest Intel inventory, with no scanner exemptions.
 
 `crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c::uc_unpack_css_version` and `guc_read_css_info`, CSS ABI version extraction and GuC 69/70 compatibility branches (MIT, Copyright © 2016-2019 Intel Corporation).
 
-`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc.c::uc_expand_default_options`, Gen12 TGL/RKL/ADL-S/ADL-P GuC/HuC defaults (MIT, Copyright © 2016-2019 Intel Corporation); ADL-N follows upstream ADL-S policy.
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc.c::uc_expand_default_options`, Gen12 TGL/RKL/ADL-S/ADL-P GuC/HuC defaults (MIT, Copyright © 2016-2019 Intel Corporation); ADL-N follows the default branch and enables both HuC authentication and GuC submission.
 
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_fw.c::guc_prepare_xfer`, Gen12.0 shim-control and doorbell-enable writes in source order (MIT, Copyright © 2014-2019 Intel Corporation).
 
@@ -998,7 +998,9 @@ retain the latest Intel inventory, with no scanner exemptions.
 
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `intel_guc_fw.c::intel_guc_fw_upload`/`guc_xfer_rsa_mmio` and `intel_huc_fw.c::intel_huc_fw_upload`, Gen12.0 RSA scratch, WOPCM destination and HuC ukernel DMA paths (MIT, Copyright © 2014-2019 Intel Corporation); GGTT source residency/forcewake are explicit caller inputs.
 
-`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_huc.c::intel_huc_is_authenticated` and `intel_huc_wait_for_auth_complete`, `HUC_STATUS2` verified-bit poll (MIT, Copyright © 2014-2019 Intel Corporation); GuC authentication is sent through the MMIO HXG transport, while GuC CT remains unimplemented.
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_huc.c::intel_huc_is_authenticated` and `intel_huc_wait_for_auth_complete`, `GEN11_HUC_KERNEL_LOAD_INFO` / `HUC_LOAD_SUCCESSFUL` poll for Gen11+ (MIT, Copyright © 2014-2019 Intel Corporation); GuC authentication is sent through the MMIO HXG transport, while GuC CT remains unimplemented.
 
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.c::intel_guc_send_mmio` and `intel_guc_auth_huc`, Gen11+ HXG busy/retry/failure handling and HuC-auth action transport (MIT, Copyright © 2014-2019 Intel Corporation); register ownership and forcewake remain with the caller.
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.c::guc_send_reg` and `intel_guc_notify`, four-dword GuC send-register indexing and H2G notification write (MIT, Copyright © 2014-2019 Intel Corporation).
+
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `include/drm/intel/pciids.h` TGL/RKL/ADL-S/ADL-P/ADL-N device-ID tables (MIT, Copyright 2013 Intel Corporation), translated to a runtime `Platform` selector.

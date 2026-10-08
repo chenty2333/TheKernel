@@ -2,6 +2,8 @@
 // Linux 7.2.3 drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c:
 // GuC/HuC platform firmware selection for TGL/RKL/ADL-S/ADL-P.
 // Copyright © 2016-2019 Intel Corporation.
+// Gen12 PCI-ID mapping from include/drm/intel/pciids.h.
+// Copyright 2013 Intel Corporation.
 // Full MIT grant: ../LICENSE-MIT.
 //! Intel Gen12 GuC/HuC firmware filename/version table.
 //!
@@ -67,9 +69,11 @@ pub struct FirmwareImage {
     pub kind: Kind,
     pub blob: Blob,
     pub css: CssInfo,
+    pub old_version: bool,
     pub bytes: Vec<u8>,
 }
 
+// upstream: intel_uc_fw.c intel_uc_fw_fetch()
 /// Requests candidate files in table order and validates the first file found.
 pub fn load(
     platform: Platform,
@@ -78,25 +82,29 @@ pub fn load(
     wopcm_bytes: usize,
     mut request: impl FnMut(&str, usize) -> Option<Vec<u8>>,
 ) -> Result<FirmwareImage, FirmwareError> {
+    let mut fallback_candidate = false;
     for blob in candidates(platform, kind) {
         let Some(bytes) = request(blob.path, max_bytes) else {
+            fallback_candidate = true;
             continue;
         };
         let css = parse_css(&bytes, wopcm_bytes).map_err(FirmwareError::Css)?;
-        check_file_version(blob.version, css.version, false)
-            .map_err(|_| FirmwareError::UnexpectedVersion)?;
-        if kind == Kind::GuC
-            && !guc_versions_valid(
+        if kind == Kind::GuC {
+            if !guc_versions_valid(
                 css.version,
                 guc_css_info(css.version, css).submission_version,
-            )
-        {
-            return Err(FirmwareError::VersionRange);
+            ) {
+                return Err(FirmwareError::VersionRange);
+            }
         }
+        let old_version = check_file_version(blob.version, css.version, false)
+            .map_err(|_| FirmwareError::UnexpectedVersion)?
+            || fallback_candidate;
         return Ok(FirmwareImage {
             kind,
             blob: *blob,
             css,
+            old_version,
             bytes,
         });
     }
@@ -227,6 +235,7 @@ pub fn guc_css_info(firmware: (u8, u8, u8), css: CssInfo) -> GucCssInfo {
     }
 }
 
+// upstream: intel_uc_fw.c __uc_fw_auto_select() (Gen12 firmware table)
 const TGL_GUC: &[Blob] = &[Blob {
     path: "i915/tgl_guc_70.1.1.bin",
     version: (70, 1, 1),
@@ -299,8 +308,39 @@ pub fn candidates(platform: Platform, kind: Kind) -> &'static [Blob] {
 pub fn default_enable_mask(platform: Platform) -> u32 {
     match platform {
         Platform::TigerLake | Platform::RocketLake => 0,
-        Platform::AlderLakeS | Platform::AlderLakeN => ENABLE_GUC_LOAD_HUC,
-        Platform::AlderLakeP => ENABLE_GUC_LOAD_HUC | ENABLE_GUC_SUBMISSION,
+        Platform::AlderLakeS => ENABLE_GUC_LOAD_HUC,
+        Platform::AlderLakeP | Platform::AlderLakeN => ENABLE_GUC_LOAD_HUC | ENABLE_GUC_SUBMISSION,
+    }
+}
+
+/// Map Gen12 integrated-GPU IDs from `include/drm/intel/pciids.h` to the
+/// platform family used by the uC firmware policy. ADL-N uses ADL-S blobs but
+/// retains ADL-P/N option defaults.
+pub fn platform_from_device_id(device_id: u16) -> Option<Platform> {
+    const TGL: &[u16] = &[
+        0x9a60, 0x9a68, 0x9a70, 0x9a40, 0x9a49, 0x9a59, 0x9a78, 0x9ac0, 0x9ac9, 0x9ad9, 0x9af8,
+    ];
+    const RKL: &[u16] = &[0x4c80, 0x4c8a, 0x4c8b, 0x4c8c, 0x4c90, 0x4c9a];
+    const ADLS: &[u16] = &[
+        0x4680, 0x4682, 0x4688, 0x468a, 0x468b, 0x4690, 0x4692, 0x4693,
+    ];
+    const ADLP: &[u16] = &[
+        0x46a0, 0x46a1, 0x46a2, 0x46a3, 0x46a6, 0x46a8, 0x46aa, 0x462a, 0x4626, 0x4628, 0x46b0,
+        0x46b1, 0x46b2, 0x46b3, 0x46c0, 0x46c1, 0x46c2, 0x46c3,
+    ];
+    const ADLN: &[u16] = &[0x46d0, 0x46d1, 0x46d2, 0x46d3, 0x46d4];
+    if TGL.contains(&device_id) {
+        Some(Platform::TigerLake)
+    } else if RKL.contains(&device_id) {
+        Some(Platform::RocketLake)
+    } else if ADLS.contains(&device_id) {
+        Some(Platform::AlderLakeS)
+    } else if ADLP.contains(&device_id) {
+        Some(Platform::AlderLakeP)
+    } else if ADLN.contains(&device_id) {
+        Some(Platform::AlderLakeN)
+    } else {
+        None
     }
 }
 
@@ -338,12 +378,22 @@ mod tests {
         );
         assert_eq!(
             default_enable_mask(Platform::AlderLakeN),
-            ENABLE_GUC_LOAD_HUC
+            ENABLE_GUC_LOAD_HUC | ENABLE_GUC_SUBMISSION
         );
         assert_eq!(
             default_enable_mask(Platform::AlderLakeP),
             ENABLE_GUC_LOAD_HUC | ENABLE_GUC_SUBMISSION
         );
+    }
+
+    #[test]
+    fn gen12_device_ids_select_runtime_uc_platform() {
+        assert_eq!(platform_from_device_id(0x9a40), Some(Platform::TigerLake));
+        assert_eq!(platform_from_device_id(0x4c80), Some(Platform::RocketLake));
+        assert_eq!(platform_from_device_id(0x4680), Some(Platform::AlderLakeS));
+        assert_eq!(platform_from_device_id(0x46a0), Some(Platform::AlderLakeP));
+        assert_eq!(platform_from_device_id(0x46d0), Some(Platform::AlderLakeN));
+        assert_eq!(platform_from_device_id(0x1234), None);
     }
 
     fn css_image(header_dwords: u32, image_dwords: u32) -> std::vec::Vec<u8> {
@@ -409,6 +459,7 @@ mod tests {
         assert_eq!(requested[0], "i915/tgl_guc_70.bin");
         assert_eq!(requested[1], "i915/tgl_guc_70.1.1.bin");
         assert_eq!(loaded.blob.path, "i915/tgl_guc_70.1.1.bin");
+        assert!(loaded.old_version);
         assert_eq!(loaded.bytes, image);
         assert_eq!(loaded.css.version, (70, 1, 1));
     }
