@@ -19,7 +19,7 @@ const PCI_COMMAND: u8 = 0x04;
 const PCI_COMMAND_MEMORY: u16 = 0x0002;
 const PCI_CLASS_SYSTEM_PERIPHERAL: u8 = 0x08;
 const PCI_SUBCLASS_SD_HOST: u8 = 0x05;
-const SDHCI_BAR: u8 = 0;
+const PCI_SLOT_INFO: u8 = 0x40;
 const SDHCI_BAR_MIN_BYTES: usize = 0x100;
 const INTEL_EMMC_VID: u16 = 0x8086;
 const INTEL_EMMC_DID: u16 = 0x54c4;
@@ -154,6 +154,14 @@ fn quirks_for_device(vendor_id: u16, device_id: u16) -> u32 {
         .map_or(0, |entry| entry.quirks)
 }
 
+// upstream: sdhci_pci.c PCI_SLOT_INFO_SLOTS()/PCI_SLOT_INFO_FIRST_BAR()
+fn decode_slot_info(slot_info: u8) -> (usize, u8) {
+    (
+        usize::from(((slot_info >> 4) & 0x07) + 1).min(6),
+        slot_info & 0x07,
+    )
+}
+
 struct SdhciWindow {
     base: NonNull<u8>,
     size: usize,
@@ -208,62 +216,51 @@ impl SdhciIo for SdhciWindow {
     }
 }
 
-/// FreeBSD `sdhci_pci_attach()` resource/slot adaptation: map BAR0, enable MMIO,
-/// initialize the host and card, then return the block device and GPT children.
-// upstream: sdhci_pci.c sdhci_pci_attach()
-pub(crate) fn probe(
+/// Attach one FreeBSD PCI slot and publish its user/boot areas.
+// upstream: sdhci_pci.c sdhci_pci_attach() per-slot body
+fn probe_slot(
     root: &mut PciRoot,
     bdf: DeviceFunction,
     info: &DeviceFunctionInfo,
-) -> super::drivers::BusProbeResult {
-    use super::drivers::BusProbeResult;
-    if info.class != PCI_CLASS_SYSTEM_PERIPHERAL || info.subclass != PCI_SUBCLASS_SD_HOST {
-        return BusProbeResult::NotMatched;
-    }
-    let (address, size) = match root.bar_info(bdf, SDHCI_BAR) {
+    bar_index: u8,
+    disk_index: usize,
+    quirks: u32,
+    read_only: bool,
+) -> alloc::vec::Vec<crate::AxDeviceEnum> {
+    let (address, size) = match root.bar_info(bdf, bar_index) {
         Ok(BarInfo::Memory { address, size, .. })
             if address != 0 && size as usize >= SDHCI_BAR_MIN_BYTES =>
         {
             (address, size as usize)
         }
         _ => {
-            warn!("sdhci: {bdf} has no usable MMIO BAR0");
-            return BusProbeResult::Claimed;
+            warn!("sdhci: {bdf} has no usable MMIO BAR{bar_index} for slot {disk_index}");
+            return alloc::vec::Vec::new();
         }
     };
-    let Some(command) = root.read_config_dword(bdf, PCI_COMMAND) else {
-        return BusProbeResult::Claimed;
-    };
-    if !root.write_config_u16(bdf, PCI_COMMAND, command as u16 | PCI_COMMAND_MEMORY) {
-        warn!("sdhci: {bdf} could not enable memory decoding");
-        return BusProbeResult::Claimed;
-    }
     let Ok(mapped) = axklib::mem::iomap((address as usize).into(), size) else {
-        warn!("sdhci: {bdf} BAR0 mapping failed");
-        return BusProbeResult::Claimed;
+        warn!("sdhci: {bdf} BAR{bar_index} mapping failed");
+        return alloc::vec::Vec::new();
     };
     let Some(base) = NonNull::new(mapped.as_usize() as *mut u8) else {
-        return BusProbeResult::Claimed;
+        return alloc::vec::Vec::new();
     };
     let mut io = SdhciWindow { base, size };
     let capabilities = io.read32(SDHCI_CAPABILITIES as usize);
     let capabilities2 = io.read32(SDHCI_CAPABILITIES2 as usize);
     let version = (io.read16(SDHCI_HOST_VERSION as usize) & SDHCI_SPEC_VER_MASK as u16) as u8;
-    let quirks = quirks_for_device(info.vendor_id, info.device_id);
     let host = SdhciHost::new_with_quirks(io, capabilities, capabilities2, version, quirks);
     let disk = match SdhciDisk::attach(host) {
         Ok(disk) => disk,
         Err(error) => {
-            warn!("sdhci: {bdf} card initialization failed: {error:?}");
-            return BusProbeResult::Claimed;
+            warn!("sdhci: {bdf} slot {disk_index} card initialization failed: {error:?}");
+            return alloc::vec::Vec::new();
         }
     };
-    let read_only = info.vendor_id == INTEL_EMMC_VID
-        && info.device_id == INTEL_EMMC_DID
-        && axhal::boot::command_line_value("mmc.allow_write") != Some("1");
-    let partitions = disk.into_partition_devices(read_only);
+    let partitions = disk.into_partition_devices(read_only, disk_index);
     info!(
-        "sdhci: {bdf} {:04x}:{:04x} published {} MMC block areas read_only={read_only}",
+        "sdhci: {bdf} BAR{bar_index} {:04x}:{:04x} published {} MMC block areas \
+         read_only={read_only}",
         info.vendor_id,
         info.device_id,
         partitions.len()
@@ -272,7 +269,7 @@ pub(crate) fn probe(
     let mut devices = alloc::vec::Vec::new();
     for partition in partitions {
         let _name = alloc::string::String::from(partition.device_name());
-        let _user_area = _name == "mmcblk0";
+        let _user_area = _name == alloc::format!("mmcblk{disk_index}");
         #[cfg(feature = "shared-block")]
         {
             #[cfg(feature = "dyn")]
@@ -304,6 +301,44 @@ pub(crate) fn probe(
             )));
         }
     }
+    devices
+}
+
+/// FreeBSD `sdhci_pci_attach()` slot enumeration and resource adaptation.
+// upstream: sdhci_pci.c sdhci_pci_attach()
+pub(crate) fn probe(
+    root: &mut PciRoot,
+    bdf: DeviceFunction,
+    info: &DeviceFunctionInfo,
+) -> super::drivers::BusProbeResult {
+    use super::drivers::BusProbeResult;
+    if info.class != PCI_CLASS_SYSTEM_PERIPHERAL || info.subclass != PCI_SUBCLASS_SD_HOST {
+        return BusProbeResult::NotMatched;
+    }
+    let Some(command) = root.read_config_dword(bdf, PCI_COMMAND) else {
+        return BusProbeResult::Claimed;
+    };
+    if !root.write_config_u16(bdf, PCI_COMMAND, command as u16 | PCI_COMMAND_MEMORY) {
+        warn!("sdhci: {bdf} could not enable memory decoding");
+        return BusProbeResult::Claimed;
+    }
+    let slot_info = root
+        .read_config_dword(bdf, PCI_SLOT_INFO)
+        .map_or(0, |value| value as u8);
+    let (slots, first_bar) = decode_slot_info(slot_info);
+    let quirks = quirks_for_device(info.vendor_id, info.device_id);
+    let read_only = info.vendor_id == INTEL_EMMC_VID
+        && info.device_id == INTEL_EMMC_DID
+        && axhal::boot::command_line_value("mmc.allow_write") != Some("1");
+    let mut devices = alloc::vec::Vec::new();
+    for slot in 0..slots {
+        let bar = first_bar.saturating_add(slot as u8);
+        if bar > 5 {
+            warn!("sdhci: {bdf} slot {slot} maps outside PCI BAR0..5");
+            continue;
+        }
+        devices.extend(probe_slot(root, bdf, info, bar, slot, quirks, read_only));
+    }
     if devices.is_empty() {
         BusProbeResult::Claimed
     } else {
@@ -327,5 +362,7 @@ mod tests {
                 | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN
         );
         assert_eq!(quirks_for_device(0x1234, 0x5678), 0);
+        assert_eq!(decode_slot_info(0), (1, 0));
+        assert_eq!(decode_slot_info(0x25), (3, 5));
     }
 }

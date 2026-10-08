@@ -9,18 +9,18 @@ idempotent-command retries with CMD/DAT reset,
 single/multi-block CMD17/18/24/25 I/O,
 CMD12 multi-block stop, SD four-bit bus selection and legacy high-speed switch,
 MMC HS_TIMING selection, and erase-group-aligned discard via CMD32/33/38; the
-PCI binding class-matches SD host controllers and
-maps BAR0. FreeBSD newbus, task/callout, CAM, and bus-DMA frameworks are not
-copied.
+PCI binding class-matches SD host controllers, decodes PCI slot-info and maps
+each advertised slot BAR. FreeBSD newbus, task/callout, CAM, and bus-DMA
+frameworks are not copied.
 
 Product builds include SDHCI by default. The N305 Intel eMMC (`8086:54c4`) is
 read-only by default; `mmc.allow_write=1` is required to permit writes, and the
 block driver itself enforces the write restriction. The PCI binding maps the
 FreeBSD `sdhci_devices[]` IDs and their quirk bits, but does not yet implement
-all behavior attached to those quirks, interrupt handling, full slot/card
-removal lifecycle, SDMA/ADMA2, 1.8V switching, tuning, UHS/HS200/HS400,
-boot/RPMB eMMC child devices, full quirk coverage, interrupt-driven completion,
-and the full upstream function set. User-area and any advertised boot0/boot1 areas are published as separate views;
+all behavior attached to those quirks, interrupt handling, full card-removal
+lifecycle, SDMA/ADMA2, 1.8V switching, tuning, UHS/HS200/HS400, and the full
+upstream function set. User-area and any advertised boot0/boot1 areas are
+published as separate views;
 boot area writes follow the same default-read-only policy for Intel eMMC. RPMB
 metadata is decoded but its authenticated key/frame protocol is not exposed as a
 generic block device, preventing unauthenticated writes.

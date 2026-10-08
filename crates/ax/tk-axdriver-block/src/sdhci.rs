@@ -918,6 +918,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
     pub fn into_partition_devices(
         mut self,
         read_only: bool,
+        disk_index: usize,
     ) -> alloc::vec::Vec<SdhciPartitionDisk<I>> {
         self.read_only = read_only;
         let metadata = self.ext_csd;
@@ -925,7 +926,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         let mut partitions = alloc::vec![SdhciPartitionDisk {
             shared: shared.clone(),
             access: 0,
-            name: "mmcblk0",
+            name: alloc::format!("mmcblk{disk_index}"),
             sectors: metadata.map_or(shared.lock().sectors, |csd| u64::from(csd.sectors)),
             read_only,
         }];
@@ -934,14 +935,14 @@ impl<I: SdhciIo> SdhciDisk<I> {
                 partitions.push(SdhciPartitionDisk {
                     shared: shared.clone(),
                     access: 1,
-                    name: "mmcblk0boot0",
+                    name: alloc::format!("mmcblk{disk_index}boot0"),
                     sectors: u64::from(metadata.boot_sectors),
                     read_only,
                 });
                 partitions.push(SdhciPartitionDisk {
                     shared,
                     access: 2,
-                    name: "mmcblk0boot1",
+                    name: alloc::format!("mmcblk{disk_index}boot1"),
                     sectors: u64::from(metadata.boot_sectors),
                     read_only,
                 });
@@ -1047,14 +1048,14 @@ impl<I: SdhciIo> SdhciDisk<I> {
 pub struct SdhciPartitionDisk<I: SdhciIo> {
     shared: Arc<Mutex<SdhciDisk<I>>>,
     access: u8,
-    name: &'static str,
+    name: alloc::string::String,
     sectors: u64,
     read_only: bool,
 }
 
 impl<I: SdhciIo> crate::BaseDriverOps for SdhciPartitionDisk<I> {
     fn device_name(&self) -> &str {
-        self.name
+        &self.name
     }
 
     fn device_type(&self) -> crate::DeviceType {
@@ -1528,7 +1529,7 @@ mod tests {
             active_partition: 0,
             read_only: false,
         };
-        let areas = disk.into_partition_devices(true);
+        let areas = disk.into_partition_devices(true, 0);
         assert_eq!(areas.len(), 3);
         assert_eq!(areas[0].device_name(), "mmcblk0");
         assert_eq!(areas[1].device_name(), "mmcblk0boot0");
