@@ -97,3 +97,6 @@ handling, command-response retirement, and notification ACK suppression.
 The firmware-event classifier covers the remaining UAPSD, thermal, MCC,
 session-protection, channel-switch, statistics, RLC/TLC, and ignorable command
 branches so the platform dispatcher can apply side effects without losing ACKs.
+Critical-temperature handling, matching time-event completion, UAPSD disable,
+session-protection completion, and station-only channel-switch recovery now
+have explicit state-policy updates.

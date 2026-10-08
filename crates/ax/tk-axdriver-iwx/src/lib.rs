@@ -218,8 +218,8 @@ pub use rx_buffer::{
     RxMbufPlan, process_rx_buffer, rx_buffer_packet_error,
 };
 pub use rx_event::{
-    DriverFirmwareEvent, FirmwareEvent, decode_driver_event, decode_firmware_event,
-    process_command_response,
+    DriverFirmwareEvent, EventPolicyAction, EventPolicyError, FirmwareEvent, FirmwarePolicyState,
+    apply_event_policy, decode_driver_event, decode_firmware_event, process_command_response,
 };
 pub use rx_packet::{
     FH_FRAME_ALIGNMENT, FH_FRAME_INVALID, FH_FRAME_SIZE_MASK, NOTIFICATION_ORIGIN,

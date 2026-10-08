@@ -179,6 +179,100 @@ pub enum DriverFirmwareEvent<'a> {
     Unknown { command_id: u32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventPolicyError {
+    TruncatedPayload,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventPolicyAction {
+    ScheduleInit,
+    EndTimeEvent,
+    DisableUapsd {
+        station_id: u32,
+        power_level: Option<u8>,
+    },
+    SystemStatisticsCleared,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirmwarePolicyState {
+    pub hardware_error: bool,
+    pub shutdown: bool,
+    pub station_mode: bool,
+    pub run_state: bool,
+    pub time_event_active: bool,
+    pub time_event_uid: u32,
+    pub uapsd_enabled: bool,
+    pub power_management_enabled: bool,
+    pub system_statistics_cleared: bool,
+}
+
+/// Apply the state changes and deferred work caused by non-packet firmware notifications.
+// upstream: if_iwx.c iwx_rx_pkt() notification handlers
+pub fn apply_event_policy(
+    event: DriverFirmwareEvent<'_>,
+    state: &mut FirmwarePolicyState,
+) -> Result<Option<EventPolicyAction>, EventPolicyError> {
+    match event {
+        DriverFirmwareEvent::CriticalTemperature(payload) => {
+            if payload.len() < 2 {
+                return Err(EventPolicyError::TruncatedPayload);
+            }
+            state.hardware_error = true;
+            Ok(Some(EventPolicyAction::ScheduleInit))
+        }
+        DriverFirmwareEvent::TimeEvent(payload) => {
+            if payload.len() < 20 {
+                return Err(EventPolicyError::TruncatedPayload);
+            }
+            let uid = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let action = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+            if uid == state.time_event_uid && action & (1 << 1) != 0 {
+                state.time_event_active = false;
+                Ok(Some(EventPolicyAction::EndTimeEvent))
+            } else {
+                Ok(None)
+            }
+        }
+        DriverFirmwareEvent::UapsdMisbehaving(payload) => {
+            if payload.len() < 4 {
+                return Err(EventPolicyError::TruncatedPayload);
+            }
+            if !state.uapsd_enabled {
+                return Ok(None);
+            }
+            state.uapsd_enabled = false;
+            Ok(Some(EventPolicyAction::DisableUapsd {
+                station_id: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+                power_level: state.power_management_enabled.then_some(3),
+            }))
+        }
+        DriverFirmwareEvent::SessionProtection(payload) => {
+            if payload.len() < 16 {
+                return Err(EventPolicyError::TruncatedPayload);
+            }
+            let status = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+            let start = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            let conf_id = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+            if status == 1 && start == 0 && conf_id == 0 {
+                state.time_event_active = false;
+                Ok(Some(EventPolicyAction::EndTimeEvent))
+            } else {
+                Ok(None)
+            }
+        }
+        DriverFirmwareEvent::ChannelSwitch
+            if state.station_mode && state.run_state && !state.shutdown =>
+        {
+            Ok(Some(EventPolicyAction::ScheduleInit))
+        }
+        DriverFirmwareEvent::SystemStatisticsEnd(_) => {
+            state.system_statistics_cleared = true;
+            Ok(Some(EventPolicyAction::SystemStatisticsCleared))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Classify every event branch in iwx_rx_pkt(), including lifecycle notifications.
 // upstream: if_iwx.c iwx_rx_pkt() notification switch
 pub fn decode_driver_event<'a>(packet: &'a RxPacket<'a>) -> DriverFirmwareEvent<'a> {
@@ -354,5 +448,54 @@ mod tests {
             decode_driver_event(&packet),
             DriverFirmwareEvent::SystemStatistics(_)
         ));
+    }
+
+    #[test]
+    fn notification_policy_updates_kill_uapsd_session_and_statistics_state() {
+        let mut state = FirmwarePolicyState {
+            hardware_error: false,
+            shutdown: false,
+            station_mode: true,
+            run_state: true,
+            time_event_active: true,
+            time_event_uid: 7,
+            uapsd_enabled: true,
+            power_management_enabled: true,
+            system_statistics_cleared: false,
+        };
+        assert_eq!(
+            apply_event_policy(
+                DriverFirmwareEvent::CriticalTemperature(&[90, 0]),
+                &mut state
+            ),
+            Ok(Some(EventPolicyAction::ScheduleInit))
+        );
+        assert!(state.hardware_error);
+        let mut time_event = [0u8; 24];
+        time_event[8..12].copy_from_slice(&7u32.to_le_bytes());
+        time_event[16..20].copy_from_slice(&(1u32 << 1).to_le_bytes());
+        assert_eq!(
+            apply_event_policy(DriverFirmwareEvent::TimeEvent(&time_event), &mut state),
+            Ok(Some(EventPolicyAction::EndTimeEvent))
+        );
+        let mut uapsd = [0u8; 8];
+        uapsd[..4].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            apply_event_policy(DriverFirmwareEvent::UapsdMisbehaving(&uapsd), &mut state),
+            Ok(Some(EventPolicyAction::DisableUapsd {
+                station_id: 3,
+                power_level: Some(3)
+            }))
+        );
+        assert!(!state.uapsd_enabled);
+        assert_eq!(
+            apply_event_policy(DriverFirmwareEvent::ChannelSwitch, &mut state),
+            Ok(Some(EventPolicyAction::ScheduleInit))
+        );
+        assert_eq!(
+            apply_event_policy(DriverFirmwareEvent::SystemStatisticsEnd(&[]), &mut state),
+            Ok(Some(EventPolicyAction::SystemStatisticsCleared))
+        );
+        assert!(state.system_statistics_cleared);
     }
 }
