@@ -75,3 +75,11 @@ this is behaviorally bounded by domain entries but has O(n) scans rather than
 RB-tree logarithmic lookup. A product lint attempt after the previous five-commit
 batch stopped on seven existing undocumented-unsafe errors under
 `crates/ax/tk-axallocator/{slab,tlsf}.rs`; no unrelated allocator edits were made.
+
+The scoped `iommu_gas.c` address-space core is now ported in `tk-vtd/src/gas.rs`
+(31/33 functions); the two DDB-only inspection commands are omitted. It retains
+first-fit bounds/guard-page/alignment/boundary behavior, fixed/RMRR reservations,
+partial removal and delayed entry release, and the IOVA facade now delegates to
+it. For platform fit, the source's augmented intrusive RB tree is represented
+as an ordered vector with linear gap scans; this preserves layout behavior but
+has O(n) lookup cost under many active mappings.
