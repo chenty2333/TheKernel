@@ -57,6 +57,37 @@ pub const RSN_OUI: [u8; 3] = [0x00, 0x0f, 0xac];
 pub const WPA_OUI: [u8; 3] = [0x00, 0x50, 0xf2];
 pub const RATE_SIZE: usize = 8;
 pub const SSID_MAX_LEN: usize = 32;
+const AC_BE: u8 = 0;
+const AC_BK: u8 = 1;
+const AC_VI: u8 = 2;
+const AC_VO: u8 = 3;
+
+/// Map 802.1D user priority to EDCA AC, downgrading ACM categories for STA mode.
+// upstream: ieee80211_output.c ieee80211_up_to_ac()
+pub fn user_priority_to_access_category(
+    user_priority: u8,
+    admission_control_mandatory: [bool; 4],
+    hostap_mode: bool,
+) -> u8 {
+    let mut access_category = match user_priority {
+        1 | 2 => AC_BK,
+        4 | 5 => AC_VI,
+        6 | 7 => AC_VO,
+        _ => AC_BE,
+    };
+    if hostap_mode {
+        return access_category;
+    }
+    while access_category != AC_BK && admission_control_mandatory[access_category as usize] {
+        access_category = match access_category {
+            AC_BE => AC_BK,
+            AC_VI => AC_BE,
+            AC_VO => AC_VI,
+            _ => break,
+        };
+    }
+    access_category
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IeError {
@@ -936,5 +967,30 @@ mod tests {
         assert_eq!(out[start], ELEMID_EXTENSION);
         assert_eq!(out[start + 1], 1 + 17 + 8);
         assert_eq!(out[start + 2], ELEMID_EXT_HE_CAPS);
+    }
+
+    #[test]
+    fn user_priority_maps_and_downgrades_admission_control() {
+        let expected = [AC_BE, AC_BK, AC_BK, AC_BE, AC_VI, AC_VI, AC_VO, AC_VO];
+        for (up, ac) in expected.into_iter().enumerate() {
+            assert_eq!(
+                user_priority_to_access_category(up as u8, [false; 4], false),
+                ac
+            );
+        }
+        assert_eq!(
+            user_priority_to_access_category(8, [false; 4], false),
+            AC_BE
+        );
+
+        let acm = [false, false, true, true];
+        assert_eq!(user_priority_to_access_category(6, acm, false), AC_BE);
+        assert_eq!(user_priority_to_access_category(4, acm, false), AC_BE);
+        assert_eq!(user_priority_to_access_category(3, acm, false), AC_BE);
+        assert_eq!(user_priority_to_access_category(6, acm, true), AC_VO);
+
+        let all_acm = [true; 4];
+        assert_eq!(user_priority_to_access_category(0, all_acm, false), AC_BK);
+        assert_eq!(user_priority_to_access_category(7, all_acm, false), AC_BK);
     }
 }

@@ -94,6 +94,8 @@ management cipher. Wire output round-trips through the crate's RSN parser.
 EDCA/WMM transmit elements now carry the source 11b versus OFDM AC tables,
 AC-order identifiers, congestion-window encodings, TXOP limits and station
 U-APSD AC/service-period bits.
+The output-side user-priority map and non-AP ACM downgrade loop are also
+translated; AP mode preserves the requested AC without downgrade.
 Management frame helpers also encode Capability Information, DS channel and
 ERP NonERP/protection/Barker fields from station/AP mode, channel and local
 preamble state.

@@ -112,3 +112,4 @@
 - Node-copy effects used by the station BSS join now also request destination BA/reorder teardown and unreference-callback retirement before replacing BSS state.
 - `ieee80211_node.c` `ieee80211_begin_scan()` coverage was completed as a typed effect plan: active/passive counter, station BSS cleanup/node aging, AUTO/current mode selection, scan-count reset and next-channel request are explicit; marker coverage remains 50/110.
 - `ieee80211_node.c` begin_scan now returns full source station effects and active/passive stats; driver/channel scheduling remains a caller effect; input 35/48, ieee80211.c 16/25, node.c 50/110.
+- `ieee80211_output.c` `ieee80211_up_to_ac()` now maps all eight user priorities and downgrades ACM ACs for non-AP stations; `output.c` marker coverage advances from 24/50 to 25/50.

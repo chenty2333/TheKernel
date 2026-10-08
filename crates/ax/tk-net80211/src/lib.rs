@@ -117,6 +117,7 @@ pub use output::{
     append_supported_rates_ie, append_vht_caps_ie, append_wme_info_ie, append_wme_parameter_ie,
     append_wpa_ie, build_assoc_request_body, build_auth_body, build_deauth_body,
     build_disassoc_body, build_probe_request_ies, build_rsn_body, uapsd_qos_info,
+    user_priority_to_access_category,
 };
 pub use proto::{
     CAP_SHORT_PREAMBLE, CAP_SHORT_SLOT, ErpState, FIX_RATE_DELETE, FIX_RATE_FIXED,
