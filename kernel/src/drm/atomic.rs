@@ -153,6 +153,12 @@ pub(crate) fn referenced_blobs(state: &State) -> [u32; 5] {
     ]
 }
 
+fn color_pipeline_changed(previous: State, next: State) -> bool {
+    previous.gamma_lut_blob != next.gamma_lut_blob
+        || previous.degamma_lut_blob != next.degamma_lut_blob
+        || previous.ctm_blob != next.ctm_blob
+}
+
 pub fn propose(
     file: &DrmFile,
     changes: &[Change],
@@ -329,14 +335,12 @@ fn propose_with_mode(
     {
         return Err(DrmError::Invalid);
     }
-    let color_pipeline_changed = next.gamma_lut_blob != base.gamma_lut_blob
-        || next.degamma_lut_blob != base.degamma_lut_blob
-        || next.ctm_blob != base.ctm_blob;
+    let color_changed = color_pipeline_changed(base, next);
     file.validate_adapter_state(
         next.active,
         next.dpms == DPMS_ON,
         next.gamma_lut_blob != 0,
-        color_pipeline_changed,
+        color_changed,
     )?;
     let fb = if next.active {
         if !r.connector.connected {
@@ -548,4 +552,30 @@ fn validate_ctm_blob(device: &super::device::DeviceState, blob: u32) -> DrmResul
         return Err(DrmError::Invalid);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_color_blob_change_is_reported_to_the_adapter() {
+        let old = State::default();
+        assert!(!color_pipeline_changed(old, old));
+        for changed in [
+            State {
+                gamma_lut_blob: 1,
+                ..old
+            },
+            State {
+                degamma_lut_blob: 1,
+                ..old
+            },
+            State { ctm_blob: 1, ..old },
+        ] {
+            assert!(color_pipeline_changed(old, changed));
+        }
+        // Resetting a previously configured property is also a hardware change.
+        assert!(color_pipeline_changed(State { ctm_blob: 9, ..old }, old));
+    }
 }
