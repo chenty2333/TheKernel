@@ -24,7 +24,7 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 `guc_ct.rs` 已提供同步 TLB 完成和 FIFO deferred-event dispatch adapter（分别对应上游 receive-context 路径与 incoming-request worker）、nonblocking send busy-loop、ring reset 和 firmware-running 时的显式 disable action；GuC 事件业务 handler、VMA fini/owner teardown 以及 kernel 侧 G2H interrupt/tasklet/workqueue 调用链仍未接入。
 
-`guc_capture.rs` 是 `intel_guc_capture.c` 的首个数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，保留原始 metadata/order，并跳过未知 capture type。静态 Gen12 register lists、ADS wire-up、preallocated capture-node cache、engine/core-dump matching/printing 及 CT event caller 尚未实现。
+`guc_capture.rs` 是 `intel_guc_capture.c` 的数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，保留原始 metadata/order、跳过未知 capture type，并按 `guc_debug_capture_list` ABI 构造 page-aligned ADS list。静态 Gen12 register lists、ADS owner wire-up、preallocated capture-node cache、engine/core-dump matching/printing 及 CT event caller 尚未实现。
 
 ## 移植边界
 

@@ -11,6 +11,10 @@ pub const CAPTURE_TYPE_MAX: u8 = 3;
 pub const CAPTURE_GROUP_FULL: u8 = 0;
 pub const CAPTURE_GROUP_PARTIAL: u8 = 1;
 pub const CAPTURE_GROUP_TYPE_MAX: u8 = 2;
+pub const CAPTURE_LIST_HEADER_DWORDS: usize = 1;
+pub const CAPTURE_LIST_ENTRY_DWORDS: usize = 4;
+pub const CAPTURE_REGISTER_VALUE_PLACEHOLDER: u32 = 0xdead_f00d;
+pub const PAGE_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureError {
@@ -108,6 +112,46 @@ pub struct CaptureRegister {
     pub value: u32,
     pub flags: u32,
     pub mask: u32,
+}
+
+/// Build the page-sized `guc_debug_capture_list` image consumed by ADS.
+/// upstream: intel_guc_capture.c guc_capture_getlistsize()/guc_capture_list_init().
+pub fn build_ads_capture_list(registers: &[CaptureRegister]) -> Result<Vec<u8>, CaptureError> {
+    if registers.is_empty() || registers.len() > u16::MAX as usize {
+        return Err(CaptureError::InvalidBuffer);
+    }
+    let data_size = CAPTURE_LIST_HEADER_DWORDS
+        .checked_add(
+            registers
+                .len()
+                .checked_mul(CAPTURE_LIST_ENTRY_DWORDS)
+                .ok_or(CaptureError::InvalidBuffer)?,
+        )
+        .and_then(|dwords| dwords.checked_mul(4))
+        .ok_or(CaptureError::InvalidBuffer)?;
+    let size = data_size
+        .checked_add(PAGE_SIZE - 1)
+        .ok_or(CaptureError::InvalidBuffer)?
+        & !(PAGE_SIZE - 1);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| CaptureError::InvalidBuffer)?;
+    bytes.resize(size, 0);
+    bytes[..4].copy_from_slice(&(registers.len() as u32).to_le_bytes());
+    let mut offset = 4;
+    for register in registers {
+        for value in [
+            register.offset,
+            CAPTURE_REGISTER_VALUE_PLACEHOLDER,
+            register.flags,
+            register.mask,
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            offset += 4;
+        }
+    }
+    Ok(bytes)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,6 +283,27 @@ mod tests {
         assert_eq!(ring.read_dword(), Ok(10));
         assert_eq!(ring.read_dword(), Ok(11));
         assert_eq!(ring.count(), 0);
+    }
+
+    #[test]
+    fn ads_capture_list_is_packed_and_page_aligned() {
+        let registers = [CaptureRegister {
+            offset: 0x1234,
+            value: 0,
+            flags: 3,
+            mask: 0xff,
+        }];
+        let bytes = build_ads_capture_list(&registers).unwrap();
+        assert_eq!(bytes.len(), PAGE_SIZE);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0x1234);
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            CAPTURE_REGISTER_VALUE_PLACEHOLDER
+        );
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 0xff);
+        assert!(bytes[20..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
