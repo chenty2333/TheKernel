@@ -6,7 +6,7 @@ Source baseline: Linux `v7.2.3`, `drivers/gpu/drm/i915/display/`. Scope is displ
 
 | Work item | Linux source files | Existing Rust destination / integration |
 |---|---|---|
-| VBT and display power | `intel_bios.c`, `intel_display_power.c`, `intel_display_power_map.c`, `intel_display_power_well.c`, `intel_dmc.c` | `tk-intel-display::{bios,opregion,device,dmc}`; `kernel/src/drm/intel/{power,regs}`; DMC currently has the display-12/13 firmware-path/size selector and licensed-input rootfs staging; runtime request, firmware parsing/programming and power-well behavior remain to be ported |
+| VBT and display power | `intel_bios.c`, `intel_display_power.c`, `intel_display_power_map.c`, `intel_display_power_well.c`, `intel_dmc.c` | `tk-intel-display::{bios,opregion,device,dmc}`; `kernel/src/drm/intel/{power,dmc,regs}`; DMC path selection, deferred rootfs request and licensed-input staging exist; firmware parsing/programming and complete power-well mapping/behavior remain to be ported |
 | Clock / PLL | `intel_cdclk.c`, `intel_dpll_mgr.c`, `intel_dpll.c` | `tk-intel-display::{cdclk,dpll_mgr,dkl_phy}`; `kernel/src/drm/intel/{clk,pll,phy,regs}` |
 | DDI / PHY / TC / HDMI | `intel_ddi.c`, `intel_ddi_buf_trans.c`, `intel_combo_phy.c`, `intel_tc.c`, `intel_hdmi.c` | `tk-intel-display::{ddi,tc,hdmi,device}`; `kernel/src/drm/intel/{output,tc_modeset,swing,phy,regs}` |
 | DP / AUX / DDC / HPD | `intel_dp.c`, `intel_dp_link_training.c`, `intel_dp_aux.c`, `intel_gmbus.c`, `intel_hotplug.c`, `intel_hotplug_irq.c` | `tk-intel-display::{ddi,tc}` and new focused modules as needed; `kernel/src/drm/intel::{connect,gmbus,hpd,irq,sink,output}`; common I2C/DRM interfaces |

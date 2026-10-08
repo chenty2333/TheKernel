@@ -86,6 +86,7 @@ mod clk;
 mod connect;
 pub(crate) mod debugfs;
 mod dma;
+mod dmc;
 mod fastboot;
 pub(crate) mod fb;
 mod firmware_scanout;
@@ -309,6 +310,9 @@ pub(crate) fn bring_up_at_boot() {
     if windows.is_empty() {
         axlog::info!("intel-gpu: no mapped display; no writes");
         return;
+    }
+    if let Some(device) = identified_device() {
+        dmc::request_for_device(device);
     }
     if axhal::boot::command_line_value("intel.modeset") != Some("1") {
         axlog::warn!(

@@ -533,8 +533,9 @@ size selection from MIT `intel_dmc.c::dmc_firmware_default()` (2014 Intel).
 The rootfs builder accepts pre-decompressed firmware only through
 `THEKERNEL_I915_DMC_FIRMWARE_DIR`, requires the Intel `LICENSE.i915` notice,
 and stages that notice beside the five TGL/RKL/ADL-S/ADL-P DMC images. The
-binary blobs are external build inputs, never repository files; no runtime
-request/parser/MMIO loader is wired yet. The Intel binary grant permits
+binary blobs are external build inputs, never repository files. A deferred
+rootfs request retains the bytes for later parser/load work; no parser/MMIO
+loader is wired yet. The Intel binary grant permits
 unmodified binary redistribution with its conditions/disclaimer and forbids
 reverse engineering/decompilation/disassembly; input preparation must respect
 that restriction.
