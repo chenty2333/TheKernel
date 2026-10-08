@@ -85,6 +85,33 @@ const IFE_PESC_POLARITY_REVERSED: u16 = 0x0100;
 const IFE_PSC_FORCE_POLARITY: u16 = 0x0020;
 const I82577_PHY_STATUS_2: u8 = 26;
 const I82577_PHY_STATUS2_REV_POLARITY: u16 = 0x0400;
+const I82577_CFG_REG: u8 = 22;
+const I82577_CFG_ASSERT_CRS_ON_TX: u16 = 1 << 15;
+const I82577_CFG_ENABLE_DOWNSHIFT: u16 = 3 << 10;
+const I82577_PHY_CTRL_2: u8 = 18;
+const I82577_PHY_CTRL2_MANUAL_MDIX: u16 = 0x0200;
+const I82577_PHY_CTRL2_AUTO_MDI_MDIX: u16 = 0x0400;
+const I82577_PHY_CTRL2_MDIX_CFG_MASK: u16 = 0x0600;
+const M88E1000_PHY_SPEC_CTRL: u8 = 0x10;
+const M88E1000_EXT_PHY_SPEC_CTRL: u8 = 0x14;
+const M88E1000_PSCR_POLARITY_REVERSAL: u16 = 0x0002;
+const M88E1000_PSCR_MDI_MANUAL_MODE: u16 = 0x0000;
+const M88E1000_PSCR_MDIX_MANUAL_MODE: u16 = 0x0020;
+const M88E1000_PSCR_AUTO_X_1000T: u16 = 0x0040;
+const M88E1000_PSCR_AUTO_X_MODE: u16 = 0x0060;
+const M88E1000_PSCR_ASSERT_CRS_ON_TX: u16 = 0x0800;
+const M88E1000_EPSCR_MASTER_DOWNSHIFT_MASK: u16 = 0x0c00;
+const M88E1000_EPSCR_MASTER_DOWNSHIFT_1X: u16 = 0;
+const M88E1000_EPSCR_SLAVE_DOWNSHIFT_MASK: u16 = 0x0300;
+const M88E1000_EPSCR_SLAVE_DOWNSHIFT_1X: u16 = 0x0100;
+const M88E1000_EPSCR_TX_CLK_25: u16 = 0x0070;
+const M88EC018_EPSCR_DOWNSHIFT_COUNTER_MASK: u16 = 0x0e00;
+const M88EC018_EPSCR_DOWNSHIFT_COUNTER_5X: u16 = 0x0800;
+const I82578_EPSCR_DOWNSHIFT_ENABLE: u16 = 0x0020;
+const I82578_EPSCR_DOWNSHIFT_COUNTER_MASK: u16 = 0x001c;
+const BME1000_PSCR_ENABLE_DOWNSHIFT: u16 = 0x0800;
+const BME1000_E_PHY_ID_R2: u32 = 0x0141_0cb1;
+const M88E1111_I_PHY_ID: u32 = 0x0141_0cc0;
 const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
 const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
@@ -378,6 +405,101 @@ pub fn set_master_slave_mode<I: E1000PhyRegisterIo>(
     }
     io.write_phy_register(MII_1000T_CTRL, control)?;
     Ok(original)
+}
+
+/// upstream: e1000_phy.c e1000_copper_link_setup_82577()
+pub fn copper_link_setup_82577<I, R>(
+    io: &mut I,
+    reset_82580: bool,
+    mdix: u8,
+    master_slave: MasterSlaveMode,
+    mut reset_phy: R,
+) -> DevResult<MasterSlaveMode>
+where
+    I: E1000PhyRegisterIo,
+    R: FnMut() -> DevResult,
+{
+    if reset_82580 {
+        reset_phy()?;
+    }
+    let cfg = io.read_phy_register(I82577_CFG_REG)?
+        | I82577_CFG_ASSERT_CRS_ON_TX
+        | I82577_CFG_ENABLE_DOWNSHIFT;
+    io.write_phy_register(I82577_CFG_REG, cfg)?;
+    let mut control = io.read_phy_register(I82577_PHY_CTRL_2)?;
+    control &= !I82577_PHY_CTRL2_MDIX_CFG_MASK;
+    match mdix {
+        1 => {}
+        2 => control |= I82577_PHY_CTRL2_MANUAL_MDIX,
+        _ => control |= I82577_PHY_CTRL2_AUTO_MDI_MDIX,
+    }
+    io.write_phy_register(I82577_PHY_CTRL_2, control)?;
+    set_master_slave_mode(io, master_slave)
+}
+
+/// upstream: e1000_phy.c e1000_copper_link_setup_m88()
+pub fn copper_link_setup_m88<I, C>(
+    io: &mut I,
+    phy_type: E1000PhyType,
+    phy_id: u32,
+    revision: u8,
+    mdix: u8,
+    disable_polarity_correction: bool,
+    mut commit: C,
+) -> DevResult
+where
+    I: E1000PhyRegisterIo,
+    C: FnMut() -> DevResult,
+{
+    let mut phy_data = io.read_phy_register(M88E1000_PHY_SPEC_CTRL)?;
+    if phy_type != E1000PhyType::Bm {
+        phy_data |= M88E1000_PSCR_ASSERT_CRS_ON_TX;
+    }
+    phy_data &= !M88E1000_PSCR_AUTO_X_MODE;
+    phy_data |= match mdix {
+        1 => M88E1000_PSCR_MDI_MANUAL_MODE,
+        2 => M88E1000_PSCR_MDIX_MANUAL_MODE,
+        3 => M88E1000_PSCR_AUTO_X_1000T,
+        _ => M88E1000_PSCR_AUTO_X_MODE,
+    };
+    phy_data &= !M88E1000_PSCR_POLARITY_REVERSAL;
+    if disable_polarity_correction {
+        phy_data |= M88E1000_PSCR_POLARITY_REVERSAL;
+    }
+    if phy_type == E1000PhyType::Bm {
+        if phy_id == BME1000_E_PHY_ID_R2 {
+            phy_data &= !BME1000_PSCR_ENABLE_DOWNSHIFT;
+            io.write_phy_register(M88E1000_PHY_SPEC_CTRL, phy_data)?;
+            commit()?;
+        }
+        phy_data |= BME1000_PSCR_ENABLE_DOWNSHIFT;
+    }
+    io.write_phy_register(M88E1000_PHY_SPEC_CTRL, phy_data)?;
+    if phy_type == E1000PhyType::M88 && revision < 4 && phy_id != BME1000_E_PHY_ID_R2 {
+        let mut extended = io.read_phy_register(M88E1000_EXT_PHY_SPEC_CTRL)?;
+        extended |= M88E1000_EPSCR_TX_CLK_25;
+        if revision == 2 && phy_id == M88E1111_I_PHY_ID {
+            extended &= !M88EC018_EPSCR_DOWNSHIFT_COUNTER_MASK;
+            extended |= M88EC018_EPSCR_DOWNSHIFT_COUNTER_5X;
+        } else {
+            extended &=
+                !(M88E1000_EPSCR_MASTER_DOWNSHIFT_MASK | M88E1000_EPSCR_SLAVE_DOWNSHIFT_MASK);
+            extended |= M88E1000_EPSCR_MASTER_DOWNSHIFT_1X | M88E1000_EPSCR_SLAVE_DOWNSHIFT_1X;
+        }
+        io.write_phy_register(M88E1000_EXT_PHY_SPEC_CTRL, extended)?;
+    }
+    if phy_type == E1000PhyType::Bm && phy_id == BME1000_E_PHY_ID_R2 {
+        io.write_phy_register(29, 0x0003)?;
+        io.write_phy_register(30, 0)?;
+    }
+    commit()?;
+    if phy_type == E1000PhyType::I82578 {
+        let mut extended = io.read_phy_register(M88E1000_EXT_PHY_SPEC_CTRL)?;
+        extended |= I82578_EPSCR_DOWNSHIFT_ENABLE;
+        extended &= !I82578_EPSCR_DOWNSHIFT_COUNTER_MASK;
+        io.write_phy_register(M88E1000_EXT_PHY_SPEC_CTRL, extended)?;
+    }
+    Ok(())
 }
 
 pub trait E1000PhyMdicOps: E1000RegisterIo {
@@ -1756,5 +1878,72 @@ mod tests {
         assert_eq!(hw.writes[1], (E1000_CTRL, 0));
         assert_eq!(hw.delay, 15_150);
         assert_eq!((hw.locks, hw.unlocks), (1, 1));
+    }
+
+    #[test]
+    fn generic_82577_link_setup_programs_crs_downshift_mdix_and_master_slave() {
+        let mut io = Io::default();
+        io.phy[I82577_CFG_REG as usize] = 0x0001;
+        io.phy[I82577_PHY_CTRL_2 as usize] = 0xffff;
+        io.phy[MII_1000T_CTRL as usize] = CR_1000T_MS_ENABLE;
+        let mut reset = false;
+        let original =
+            copper_link_setup_82577(&mut io, true, 2, MasterSlaveMode::ForceMaster, || {
+                reset = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(reset);
+        assert_eq!(original, MasterSlaveMode::ForceSlave);
+        assert_eq!(
+            io.phy_writes[0],
+            (
+                I82577_CFG_REG,
+                0x0001 | I82577_CFG_ASSERT_CRS_ON_TX | I82577_CFG_ENABLE_DOWNSHIFT
+            )
+        );
+        assert_eq!(
+            io.phy_writes[1],
+            (
+                I82577_PHY_CTRL_2,
+                (0xffff & !I82577_PHY_CTRL2_MDIX_CFG_MASK) | I82577_PHY_CTRL2_MANUAL_MDIX
+            )
+        );
+        assert_eq!(
+            io.phy_writes[2],
+            (MII_1000T_CTRL, CR_1000T_MS_ENABLE | CR_1000T_MS_VALUE)
+        );
+    }
+
+    #[test]
+    fn generic_m88_copper_setup_preserves_mdi_polarity_and_revision_workaround() {
+        let mut io = Io::default();
+        io.phy[M88E1000_PHY_SPEC_CTRL as usize] = 0;
+        io.phy[M88E1000_EXT_PHY_SPEC_CTRL as usize] = 0xffff;
+        let mut commits = 0;
+        copper_link_setup_m88(
+            &mut io,
+            E1000PhyType::M88,
+            M88E1111_I_PHY_ID,
+            2,
+            3,
+            true,
+            || {
+                commits += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(io.phy_writes[0], (M88E1000_PHY_SPEC_CTRL, 0x0842));
+        let extended = io.phy_writes[1].1;
+        assert_eq!(
+            extended & M88E1000_EPSCR_TX_CLK_25,
+            M88E1000_EPSCR_TX_CLK_25
+        );
+        assert_eq!(
+            extended & M88EC018_EPSCR_DOWNSHIFT_COUNTER_MASK,
+            M88EC018_EPSCR_DOWNSHIFT_COUNTER_5X
+        );
+        assert_eq!(commits, 1);
     }
 }
