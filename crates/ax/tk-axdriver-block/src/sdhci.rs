@@ -267,9 +267,282 @@ pub const SDHCI_RETUNE_REQ_RESET: u32 = 0x02;
 pub const SDHCI_USE_DMA: u32 = 4;
 pub const SDHCI_VERSION: u32 = 2;
 
+/// Minimal MMIO boundary for one SDHCI slot.
+pub trait SdhciIo: Send + Sync {
+    fn read8(&mut self, offset: usize) -> u8;
+    fn read16(&mut self, offset: usize) -> u16;
+    fn read32(&mut self, offset: usize) -> u32;
+    fn write8(&mut self, offset: usize, value: u8);
+    fn write16(&mut self, offset: usize, value: u16);
+    fn write32(&mut self, offset: usize, value: u32);
+    fn delay_us(&mut self, micros: u32);
+}
+
+/// Error from a bounded SDHCI command or data transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SdhciError {
+    Timeout,
+    Controller(u32),
+    NoCard,
+    InvalidTransfer,
+    UnsupportedClock,
+}
+
+/// The four response registers returned by the controller.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SdhciResponse(pub [u32; 4]);
+
+/// One bounded, polling SDHCI host slot. The platform supplies MMIO access;
+/// command and PIO sequencing follows the generic FreeBSD SDHCI engine.
+pub struct SdhciHost<I: SdhciIo> {
+    io: I,
+    capabilities: u32,
+    capabilities2: u32,
+    version: u8,
+    base_clock_hz: u32,
+    clock_hz: u32,
+    timeout_polls: usize,
+}
+
+impl<I: SdhciIo> SdhciHost<I> {
+    pub const fn new(io: I, capabilities: u32, capabilities2: u32, version: u8) -> Self {
+        let base_mhz = (capabilities & SDHCI_CLOCK_V3_BASE_MASK) >> SDHCI_CLOCK_BASE_SHIFT;
+        Self {
+            io,
+            capabilities,
+            capabilities2,
+            version,
+            base_clock_hz: base_mhz * 1_000_000,
+            clock_hz: 0,
+            timeout_polls: 100_000,
+        }
+    }
+
+    pub fn io_mut(&mut self) -> &mut I {
+        &mut self.io
+    }
+
+    pub const fn capabilities(&self) -> u32 {
+        self.capabilities
+    }
+
+    pub const fn capabilities2(&self) -> u32 {
+        self.capabilities2
+    }
+
+    pub const fn clock_hz(&self) -> u32 {
+        self.clock_hz
+    }
+
+    /// Reset command/data engines and establish the initial 400 kHz clock.
+    // upstream: sdhci.c sdhci_generic_reset()
+    pub fn initialize(&mut self) -> Result<(), SdhciError> {
+        self.reset(SDHCI_RESET_ALL as u8)?;
+        self.io.write8(SDHCI_POWER_CONTROL as usize, (SDHCI_POWER_330 | SDHCI_POWER_ON) as u8);
+        self.set_clock(400_000)?;
+        self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
+        self.io.write32(SDHCI_INT_ENABLE as usize, SDHCI_INT_RESPONSE
+            | SDHCI_INT_DATA_END | SDHCI_INT_SPACE_AVAIL | SDHCI_INT_DATA_AVAIL
+            | SDHCI_INT_ERROR | SDHCI_INT_CMD_ERROR_MASK | SDHCI_INT_DATA_TIMEOUT
+            | SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT);
+        self.io.write32(SDHCI_SIGNAL_ENABLE as usize, 0);
+        Ok(())
+    }
+
+    fn reset(&mut self, mask: u8) -> Result<(), SdhciError> {
+        self.io.write8(SDHCI_SOFTWARE_RESET as usize, mask);
+        for _ in 0..self.timeout_polls {
+            if self.io.read8(SDHCI_SOFTWARE_RESET as usize) & mask == 0 {
+                return Ok(());
+            }
+            self.io.delay_us(10);
+        }
+        Err(SdhciError::Timeout)
+    }
+
+    fn set_clock(&mut self, target_hz: u32) -> Result<(), SdhciError> {
+        if self.base_clock_hz == 0 || target_hz == 0 {
+            return Err(SdhciError::UnsupportedClock);
+        }
+        self.io.write16(SDHCI_CLOCK_CONTROL as usize, 0);
+        let mut divisor = 1u32;
+        while self.base_clock_hz / divisor > target_hz && divisor < 2046 {
+            divisor <<= 1;
+        }
+        let encoded = if self.version >= SDHCI_SPEC_300 as u8 {
+            (((divisor >> 1) & SDHCI_DIVIDER_MASK) << SDHCI_DIVIDER_SHIFT)
+                | (((divisor >> 9) & SDHCI_DIVIDER_HI_MASK) << SDHCI_DIVIDER_HI_SHIFT)
+        } else {
+            ((divisor >> 1) & SDHCI_DIVIDER_MASK) << SDHCI_DIVIDER_SHIFT
+        } as u16;
+        self.io.write16(SDHCI_CLOCK_CONTROL as usize, encoded | SDHCI_CLOCK_INT_EN as u16);
+        for _ in 0..self.timeout_polls {
+            if self.io.read16(SDHCI_CLOCK_CONTROL as usize) & SDHCI_CLOCK_INT_STABLE as u16 != 0 {
+                self.io.write16(SDHCI_CLOCK_CONTROL as usize,
+                    encoded | SDHCI_CLOCK_INT_EN as u16 | SDHCI_CLOCK_CARD_EN as u16);
+                self.clock_hz = self.base_clock_hz / divisor;
+                return Ok(());
+            }
+            self.io.delay_us(10);
+        }
+        Err(SdhciError::Timeout)
+    }
+
+    fn wait_status(&mut self, mask: u32) -> Result<u32, SdhciError> {
+        for _ in 0..self.timeout_polls {
+            let status = self.io.read32(SDHCI_INT_STATUS as usize);
+            let errors = status & SDHCI_INT_ERROR_MASK;
+            if errors != 0 {
+                self.io.write32(SDHCI_INT_STATUS as usize, status);
+                return Err(SdhciError::Controller(errors));
+            }
+            if status & mask != 0 {
+                self.io.write32(SDHCI_INT_STATUS as usize, status & mask);
+                return Ok(status);
+            }
+            self.io.delay_us(10);
+        }
+        Err(SdhciError::Timeout)
+    }
+
+    /// Issue one command and optional PIO data transfer. Multi-block requests
+    /// are bounded by the 16-bit SDHCI block-count register.
+    // upstream: sdhci.c sdhci_generic_request()
+    pub fn command(
+        &mut self,
+        index: u8,
+        argument: u32,
+        command_flags: u16,
+        data: Option<&mut [u8]>,
+        block_size: usize,
+    ) -> Result<SdhciResponse, SdhciError> {
+        if self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_CARD_PRESENT == 0 {
+            return Err(SdhciError::NoCard);
+        }
+        let (transfer, blocks) = if let Some(buffer) = data.as_ref() {
+            if block_size == 0 || !buffer.len().is_multiple_of(block_size)
+                || buffer.len() / block_size > u16::MAX as usize {
+                return Err(SdhciError::InvalidTransfer);
+            }
+            let count = buffer.len() / block_size;
+            let mut mode = SDHCI_TRNS_BLK_CNT_EN as u16;
+            if count > 1 { mode |= SDHCI_TRNS_MULTI as u16; }
+            if command_flags & SDHCI_CMD_DATA as u16 != 0 && index == 17 || index == 18 {
+                mode |= SDHCI_TRNS_READ as u16;
+            }
+            (Some(mode), count as u16)
+        } else { (None, 0) };
+        let inhibit = SDHCI_CMD_INHIBIT | if transfer.is_some() { SDHCI_DAT_INHIBIT } else { 0 };
+        for _ in 0..self.timeout_polls {
+            if self.io.read32(SDHCI_PRESENT_STATE as usize) & inhibit == 0 { break; }
+            self.io.delay_us(10);
+        }
+        if self.io.read32(SDHCI_PRESENT_STATE as usize) & inhibit != 0 {
+            return Err(SdhciError::Timeout);
+        }
+        self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
+        if let (Some(_), Some(buffer)) = (transfer, data.as_ref()) {
+            self.io.write16(SDHCI_BLOCK_SIZE as usize,
+                make_block_size(0, block_size as u32) as u16);
+            self.io.write16(SDHCI_BLOCK_COUNT as usize, blocks);
+            self.io.write16(SDHCI_TRANSFER_MODE as usize, transfer.unwrap());
+            let _ = buffer;
+        }
+        self.io.write32(SDHCI_ARGUMENT as usize, argument);
+        self.io.write16(SDHCI_COMMAND_FLAGS as usize,
+            ((index as u16) << 8) | command_flags);
+        let mut response = SdhciResponse::default();
+        self.wait_status(SDHCI_INT_RESPONSE)?;
+        for (n, word) in response.0.iter_mut().enumerate() {
+            *word = self.io.read32(SDHCI_RESPONSE as usize + n * 4);
+        }
+        if let Some(buffer) = data {
+            let mut offset = 0usize;
+            while offset < buffer.len() {
+                self.wait_status(if index == 17 || index == 18 {
+                    SDHCI_INT_DATA_AVAIL
+                } else { SDHCI_INT_SPACE_AVAIL })?;
+                let end = (offset + 4).min(buffer.len());
+                if index == 17 || index == 18 {
+                    let word = self.io.read32(SDHCI_BUFFER as usize).to_le_bytes();
+                    buffer[offset..end].copy_from_slice(&word[..end - offset]);
+                } else {
+                    let mut bytes = [0u8; 4];
+                    bytes[..end - offset].copy_from_slice(&buffer[offset..end]);
+                    self.io.write32(SDHCI_BUFFER as usize, u32::from_le_bytes(bytes));
+                }
+                offset = end;
+            }
+            self.wait_status(SDHCI_INT_DATA_END)?;
+        }
+        Ok(response)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct MockIo {
+        registers: [u32; 64],
+        command: u16,
+        argument: u32,
+    }
+
+    impl Default for MockIo {
+        fn default() -> Self {
+            Self { registers: [0; 64], command: 0, argument: 0 }
+        }
+    }
+
+    impl SdhciIo for MockIo {
+        fn read8(&mut self, offset: usize) -> u8 {
+            (self.registers[offset / 4] >> ((offset % 4) * 8)) as u8
+        }
+        fn read16(&mut self, offset: usize) -> u16 {
+            if offset == SDHCI_CLOCK_CONTROL as usize {
+                return SDHCI_CLOCK_INT_STABLE as u16;
+            }
+            (self.registers[offset / 4] >> ((offset % 4) * 8)) as u16
+        }
+        fn read32(&mut self, offset: usize) -> u32 {
+            if offset == SDHCI_INT_STATUS as usize {
+                return self.registers[offset / 4];
+            }
+            self.registers[offset / 4]
+        }
+        fn write8(&mut self, offset: usize, value: u8) {
+            if offset == SDHCI_SOFTWARE_RESET as usize {
+                let _ = value;
+                return;
+            }
+            self.registers[offset / 4] &= !(0xff << ((offset % 4) * 8));
+            self.registers[offset / 4] |= u32::from(value) << ((offset % 4) * 8);
+        }
+        fn write16(&mut self, offset: usize, value: u16) {
+            if offset == SDHCI_COMMAND_FLAGS as usize {
+                self.command = value;
+                self.registers[SDHCI_INT_STATUS as usize / 4] = SDHCI_INT_RESPONSE;
+                return;
+            }
+            if offset == SDHCI_ARGUMENT as usize {
+                self.argument = u32::from(value);
+                return;
+            }
+            self.registers[offset / 4] &= !(0xffff << ((offset % 4) * 8));
+            self.registers[offset / 4] |= u32::from(value) << ((offset % 4) * 8);
+        }
+        fn write32(&mut self, offset: usize, value: u32) {
+            if offset == SDHCI_INT_STATUS as usize {
+                self.registers[offset / 4] &= !value;
+            } else if offset == SDHCI_ARGUMENT as usize {
+                self.argument = value;
+            } else {
+                self.registers[offset / 4] = value;
+            }
+        }
+        fn delay_us(&mut self, _: u32) {}
+    }
 
     #[test]
     fn block_size_and_sdma_boundary_match_upstream_encoding() {
@@ -285,5 +558,20 @@ mod tests {
         assert_eq!(SDHCI_CAPABILITIES2, 0x44);
         assert_eq!(SDHCI_INT_CMD_MASK, 0x000f_0001);
         assert_eq!(SDHCI_SLOTTYPE_MASK, 0xc000_0000);
+    }
+
+    #[test]
+    fn host_reset_clock_and_command_response_are_bounded() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        io.registers[SDHCI_RESPONSE as usize / 4] = 0x1234_5678;
+        let caps = 50 << SDHCI_CLOCK_BASE_SHIFT;
+        let mut host = SdhciHost::new(io, caps, 0, SDHCI_SPEC_300 as u8);
+        host.initialize().unwrap();
+        assert!(host.clock_hz() <= 400_000);
+        let response = host.command(8, 0x1aa, SDHCI_CMD_RESP_SHORT as u16, None, 0).unwrap();
+        assert_eq!(response.0[0], 0x1234_5678);
+        assert_eq!(host.io_mut().command, (8 << 8) | SDHCI_CMD_RESP_SHORT as u16);
+        assert_eq!(host.io_mut().argument, 0x1aa);
     }
 }
