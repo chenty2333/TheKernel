@@ -1216,3 +1216,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `crates/ax/tk-intel-display/src/intel_dp_link_training_full.rs` translates 66 of 78 definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dp_link_training.c` (MIT, Copyright © 2008-2015 Intel Corporation); the twelve unported functions are DRM debugfs wrappers. `LICENSE-MIT`.
 
 `crates/ax/tk-intel-display/src/intel_gmbus_full.rs` translates 30 of 39 definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_gmbus.c` (MIT, Copyright © 2006 Dave Airlie and © 2006-2008, 2010 Intel); nine I2C framework wiring/registration methods are excluded. `LICENSE-MIT`.
+
+`kernel/src/drm/intel/regs/aux.rs` declares the display-12/13 DP AUX channel A/B control and data register offsets from `intel_dp_aux_regs.h` (MIT, Copyright © 2023 Intel Corporation). No channel-specific kernel transfer backend is enabled by the declarations.

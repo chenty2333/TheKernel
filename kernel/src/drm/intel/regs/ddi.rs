@@ -481,10 +481,9 @@ pub(crate) const DDI_BUF_TRANS_HI_B9: Register =
  *   instances of each and says which one the sequence uses.
  *
  * Registers deliberately left out
- * - `DP_AUX_CH_CTL` (`0x64010`/`0x64110`) and `DP_AUX_CH_DATA(i)` (`0x64014 +
- *   i*4`, five registers): section 8.4 documents them, but section 11's bring-up
- *   reads EDID over GMBUS and the section 8.6 sequence never touches AUX.  They
- *   belong to the DP path (sections 8.7 and 9.6).
+ * - `DP_AUX_CH_CTL` and `DP_AUX_CH_DATA(i)` are declared in `regs/aux.rs` for
+ *   the A/B channels currently used by the translated DP AUX transport;
+ *   additional channels require their platform-specific power/register map.
  * - `ICL_DPCLKA_CFGCR0` (`0x164280`) and the per-PHY `DDI_CLK_OFF` bits: written
  *   by section 8.6 step 4 and section 11 step 5.2, but the document gives them
  *   as PLL routing (section 6.3) and the clock workstream owns them.

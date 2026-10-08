@@ -14,6 +14,9 @@ interrupt waits, and diagnostics to `DpAuxIo`. There is not yet a kernel
 the former hand-written GMBUS implementation is not evidence of an AUX transport.
 Consequently DP link training and DPCD-dependent output selection must remain
 refused until the typed register adapter and the port lifecycle are wired.
+`kernel/src/drm/intel/regs/aux.rs` now declares the A/B channel-control and five
+data dwords from the MIT `intel_dp_aux_regs.h` table, but these entries do not
+yet constitute a `DpAuxIo` backend or authorize a caller to start AUX traffic.
 The upstream debugfs-independent AUX helpers are translated; framework calls
 are represented by the adapter rather than importing DRM AUX infrastructure.
 

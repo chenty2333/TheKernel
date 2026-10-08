@@ -388,13 +388,10 @@ pub(crate) const PORT_TX_DW7_LN3_B: Register =
  *     the combo PHY's `PORT_TX_DW2`/`DW4`/`DW5`/`DW7` directly, and no step of
  *     section 11 writes the indexed table registers -- `BUF_TRANS_SELECT` is
  *     only an index field in `DDI_BUF_CTL`.
- *   - `DP_AUX_CH_CTL` and `DP_AUX_CH_DATA(i)` (section 8.4: 0x64010/0x64110 and
- *     0x64014 + 4i / 0x64114 + 4i; section 9.6 repeats both): the document
- *     places them in the DDI table, but section 9.6 says to skip AUX unless the
- *     output is DisplayPort, and no step of section 11 touches them -- the EDID
- *     path is GMBUS (section 11 phase 2.3) and the mode path is HDMI/DVI
- *     (section 11 phase 5.5).  The AUX/DDC power well section 11 phase 2.1 does
- *     need is `ICL_PWR_WELL_CTL_AUX2`, already declared.
+ *   - `DP_AUX_CH_CTL` and `DP_AUX_CH_DATA(i)` are declared for channels A/B in
+ *     `aux.rs` now that the DP transport has a typed source module; the other
+ *     platform/channel instances remain out of scope until their register and
+ *     power maps are wired. Section 9.6 says skip AUX unless the output is DP.
  *   - `TRANS_CLK_SEL` (used by section 11 phase 5.4 with the value 0x10000000
  *     for port A): its offset `0x46140 + tran*4` is stated in section 6.3, not
  *     in sections 8.2-8.5, so it belongs to the port-clock/PLL group.

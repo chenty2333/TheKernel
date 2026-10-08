@@ -48,6 +48,7 @@ use super::id::Quirk;
 
 pub(crate) mod ddi;
 pub(crate) mod dpll;
+pub(crate) mod aux;
 pub(crate) mod interrupt;
 pub(crate) mod pipe;
 pub(crate) mod port;
@@ -130,9 +131,9 @@ pub(crate) enum Meaning {
     StolenMemoryBase,
     /// The physical base of the global page table.
     GttBase,
-    /// One register of the GMBUS controller, the I2C master that carries DDC
-    /// and therefore EDID.  The probe's report does not read these; the
-    /// protocol that gives them meaning lives in [`super::gmbus`].
+    /// One register of a display bus controller: GMBUS I2C/DDC or a DP AUX
+    /// channel. The probe does not read these; the corresponding transaction
+    /// mechanisms live in [`super::gmbus`] and the display crate's `dp_aux`.
     BusController,
     /// A register of the south display's hotplug-detect block: the per-DDI
     /// enable, the latched detect field, the live connect state and the board
@@ -962,6 +963,18 @@ pub(crate) const POWER_AND_CLOCK_REGISTERS: &[Register] = &[
 ///   write-one-to-clear, so a stray write would discard the state a caller
 ///   came to read.
 pub(crate) const BUS: &[Register] = &[
+    aux::DP_AUX_CH_CTL_A,
+    aux::DP_AUX_CH_DATA0_A,
+    aux::DP_AUX_CH_DATA1_A,
+    aux::DP_AUX_CH_DATA2_A,
+    aux::DP_AUX_CH_DATA3_A,
+    aux::DP_AUX_CH_DATA4_A,
+    aux::DP_AUX_CH_CTL_B,
+    aux::DP_AUX_CH_DATA0_B,
+    aux::DP_AUX_CH_DATA1_B,
+    aux::DP_AUX_CH_DATA2_B,
+    aux::DP_AUX_CH_DATA3_B,
+    aux::DP_AUX_CH_DATA4_B,
     GMBUS0,
     GMBUS1,
     GMBUS2,
@@ -1621,9 +1634,10 @@ mod tests {
                 register.name()
             );
         }
-        // The window the probe maps must cover the south display block these
-        // registers live in, or nothing here could be reached on the target.
+        // The window the probe maps must cover both the south GMBUS block and
+        // the DP AUX A/B register blocks.
         assert!(PROBE_WINDOW as u32 > 0xc5120 + 4, "the GMBUS block");
+        assert!(PROBE_WINDOW as u32 > 0x64124 + 4, "DP AUX channels A/B");
     }
 
     #[test]
@@ -1639,6 +1653,18 @@ mod tests {
         assert_eq!(
             writable,
             vec![
+                "DP_AUX_CH_CTL(A)",
+                "DP_AUX_CH_DATA(A,0)",
+                "DP_AUX_CH_DATA(A,1)",
+                "DP_AUX_CH_DATA(A,2)",
+                "DP_AUX_CH_DATA(A,3)",
+                "DP_AUX_CH_DATA(A,4)",
+                "DP_AUX_CH_CTL(B)",
+                "DP_AUX_CH_DATA(B,0)",
+                "DP_AUX_CH_DATA(B,1)",
+                "DP_AUX_CH_DATA(B,2)",
+                "DP_AUX_CH_DATA(B,3)",
+                "DP_AUX_CH_DATA(B,4)",
                 "GMBUS0",           // pin select and rate
                 "GMBUS1",           // the transaction itself
                 "GMBUS4",           // interrupt mask, cleared to zero
@@ -1656,6 +1682,31 @@ mod tests {
                 .find(|register| register.name() == name)
                 .unwrap_or_else(|| panic!("{name} is not in the bus table"));
             assert!(!register.is_writable(), "{name} must stay read-only");
+        }
+    }
+
+    #[test]
+    fn dp_aux_a_b_registers_follow_the_i915_channel_stride() {
+        use aux::*;
+
+        let expected = [
+            (DP_AUX_CH_CTL_A, 0x64010),
+            (DP_AUX_CH_DATA0_A, 0x64014),
+            (DP_AUX_CH_DATA1_A, 0x64018),
+            (DP_AUX_CH_DATA2_A, 0x6401c),
+            (DP_AUX_CH_DATA3_A, 0x64020),
+            (DP_AUX_CH_DATA4_A, 0x64024),
+            (DP_AUX_CH_CTL_B, 0x64110),
+            (DP_AUX_CH_DATA0_B, 0x64114),
+            (DP_AUX_CH_DATA1_B, 0x64118),
+            (DP_AUX_CH_DATA2_B, 0x6411c),
+            (DP_AUX_CH_DATA3_B, 0x64120),
+            (DP_AUX_CH_DATA4_B, 0x64124),
+        ];
+        for (register, offset) in expected {
+            assert_eq!(register.offset(), offset, "{}", register.name());
+            assert!(register.is_writable(), "{}", register.name());
+            assert!(BUS.iter().any(|candidate| *candidate == register));
         }
     }
 
