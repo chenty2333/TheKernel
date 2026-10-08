@@ -179,6 +179,15 @@ pub unsafe fn intel_engine_reset_needs_wa_22011802037(gt: *mut IntelGt) -> bool 
     true
 }
 
+/// `intel_gt_clock_interval_to_ns()` from gt/intel_gt_clock_utils.c.
+/// Uses a full-width product, matching `mul_u64_u32_div(count, 1e9, freq)`.
+pub unsafe fn intel_gt_clock_interval_to_ns(gt: *const IntelGt, count: u64) -> u64 {
+    assert!(!gt.is_null());
+    let frequency = unsafe { (*gt).clock_frequency };
+    assert_ne!(frequency, 0, "GEM_BUG_ON: GT clock frequency is unset");
+    ((count as u128 * 1_000_000_000u128) / frequency as u128) as u64
+}
+
 /// N305/Gen12.55 MCR locking path from intel_gt_mcr.c. The later hardware
 /// semaphore/forcewake path is deliberately refused until an owned uncore
 /// MMIO backend is available; a spinlock alone is not equivalent there.

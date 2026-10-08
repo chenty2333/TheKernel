@@ -530,7 +530,7 @@ pub struct IntelEngineCs {
     pub default_state: *mut c_void,
     pub legacy: IntelEngineLegacy,
     pub latency: c_ulong,
-    pub breadcrumbs: *mut c_void,
+    pub breadcrumbs: *mut IntelBreadcrumbs,
     pub pmu: IntelEnginePmu,
     pub status_page: IntelHwStatusPage,
     pub wa_ctx: I915CtxWorkarounds,

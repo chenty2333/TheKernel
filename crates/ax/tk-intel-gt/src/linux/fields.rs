@@ -152,7 +152,7 @@ pub struct IntelEngineCaptureVma {}
 
 const _: [(); 128] = [(); size_of::<IntelBreadcrumbs>()];
 const _: [(); 8] = [(); align_of::<IntelBreadcrumbs>()];
-const _: [(); 0] = [(); offset_of!(IntelBreadcrumbs, r#ref)];
+const _: [(); 0] = [(); offset_of!(IntelBreadcrumbs, ref_)];
 const _: [(); 4] = [(); offset_of!(IntelBreadcrumbs, active)];
 const _: [(); 8] = [(); offset_of!(IntelBreadcrumbs, signalers_lock)];
 const _: [(); 16] = [(); offset_of!(IntelBreadcrumbs, signalers)];

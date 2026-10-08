@@ -46,7 +46,7 @@ unsafe fn __intel_breadcrumbs_arm_irq(b: *mut IntelBreadcrumbs) {
     // Requests may have completed before we could enable the interrupt.
     let was_disabled = (*b).irq_enabled == 0;
     (*b).irq_enabled += 1;
-    if was_disabled && ((*b).irq_enable)(b) {
+    if was_disabled && ((*b).irq_enable.unwrap())(b) {
         irq_work_queue(&mut (*b).irq_work);
     }
 }
@@ -71,7 +71,7 @@ unsafe fn __intel_breadcrumbs_disarm_irq(b: *mut IntelBreadcrumbs) {
     GEM_BUG_ON!((*b).irq_enabled == 0);
     (*b).irq_enabled -= 1;
     if (*b).irq_enabled == 0 {
-        ((*b).irq_disable)(b);
+        ((*b).irq_disable.unwrap())(b);
     }
 
     WRITE_ONCE!((*b).irq_armed, None);
@@ -293,7 +293,7 @@ unsafe extern "C" fn signal_irq_work(work: *mut IrqWork) {
 }
 
 // upstream: intel_breadcrumbs.c intel_breadcrumbs_create()
-unsafe fn intel_breadcrumbs_create(irq_engine: *mut IntelEngineCs) -> *mut IntelBreadcrumbs {
+pub unsafe fn intel_breadcrumbs_create(irq_engine: *mut IntelEngineCs) -> *mut IntelBreadcrumbs {
     let mut b: *mut IntelBreadcrumbs;
 
     b = kzalloc_obj::<IntelBreadcrumbs>();
@@ -311,8 +311,8 @@ unsafe fn intel_breadcrumbs_create(irq_engine: *mut IntelEngineCs) -> *mut Intel
     init_irq_work(&mut (*b).irq_work, signal_irq_work);
 
     (*b).irq_engine = irq_engine;
-    (*b).irq_enable = irq_enable;
-    (*b).irq_disable = irq_disable;
+    (*b).irq_enable = Some(irq_enable);
+    (*b).irq_disable = Some(irq_disable);
 
     b
 }
@@ -328,9 +328,9 @@ pub unsafe fn intel_breadcrumbs_reset(b: *mut IntelBreadcrumbs) {
     spin_lock_irqsave(&mut (*b).irq_lock, &mut flags);
 
     if (*b).irq_enabled != 0 {
-        ((*b).irq_enable)(b);
+        ((*b).irq_enable.unwrap())(b);
     } else {
-        ((*b).irq_disable)(b);
+        ((*b).irq_disable.unwrap())(b);
     }
 
     spin_unlock_irqrestore(&mut (*b).irq_lock, flags);

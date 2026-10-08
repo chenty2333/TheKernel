@@ -322,6 +322,39 @@ type intel_guc = IntelGuc;
 #[allow(non_camel_case_types)]
 type intel_guc_ct = IntelGucCt;
 
+const INTEL_UC_FIRMWARE_RUNNING: i32 = 10;
+
+trait IntelGucPtr {
+    fn intel_guc_ptr(self) -> *const IntelGuc;
+}
+impl IntelGucPtr for *const IntelGuc {
+    fn intel_guc_ptr(self) -> *const IntelGuc {
+        self
+    }
+}
+impl IntelGucPtr for *mut IntelGuc {
+    fn intel_guc_ptr(self) -> *const IntelGuc {
+        self.cast_const()
+    }
+}
+impl IntelGucPtr for &IntelGuc {
+    fn intel_guc_ptr(self) -> *const IntelGuc {
+        self
+    }
+}
+impl IntelGucPtr for &mut IntelGuc {
+    fn intel_guc_ptr(self) -> *const IntelGuc {
+        self
+    }
+}
+
+// upstream: intel_guc.h intel_guc_is_ready()
+unsafe fn intel_guc_is_ready<G: IntelGucPtr>(guc: G) -> bool {
+    let guc = guc.intel_guc_ptr();
+    assert!(!guc.is_null());
+    unsafe { (*guc).fw.status == INTEL_UC_FIRMWARE_RUNNING && (*guc).ct.enabled }
+}
+
 // `GUC_SUBMIT_VER(guc)` from intel_guc.h, adapted from the C macro to a typed
 // helper so the private firmware-version layout stays encapsulated here.
 #[allow(non_snake_case)]
@@ -1495,10 +1528,10 @@ fn guc_engine_busyness(engine: &mut intel_engine_cs, now: &mut ktime_t) -> ktime
         }
     }
 
-    total = intel_gt_clock_interval_to_ns(gt, stats.total_gt_clks);
+    total = unsafe { intel_gt_clock_interval_to_ns(gt, stats.total_gt_clks) };
     if stats.running {
         let clk = guc.timestamp.gt_stamp - stats.start_gt_clk;
-        total += intel_gt_clock_interval_to_ns(gt, clk);
+        total += unsafe { intel_gt_clock_interval_to_ns(gt, clk) };
     }
     if total > stats.total {
         stats.total = total;
@@ -2032,7 +2065,8 @@ fn intel_guc_submission_reset_finish(guc: &mut intel_guc) {
 
 // upstream: intel_guc_submission.c intel_guc_tlb_invalidation_is_available()
 fn intel_guc_tlb_invalidation_is_available(guc: &intel_guc) -> bool {
-    HAS_GUC_TLB_INVALIDATION(guc_to_gt(guc).i915) && intel_guc_is_ready(guc)
+    HAS_GUC_TLB_INVALIDATION(unsafe { (*guc_to_gt(guc)).i915 })
+        && unsafe { intel_guc_is_ready(guc) }
 }
 
 // upstream: intel_guc_submission.c init_tlb_lookup()
@@ -3309,7 +3343,7 @@ fn deregister_destroyed_contexts(guc: &mut intel_guc) {
 fn destroyed_worker_func(w: &mut work_struct) {
     let guc = container_of!(w, intel_guc, submission_state.destroyed_worker);
     let gt = guc_to_gt(guc);
-    if !intel_guc_is_ready(guc) {
+    if !unsafe { intel_guc_is_ready(guc) } {
         // Pending destroys are handled at GuC reset at suspend, or another
         // destruction trigger after resume.
         return;
@@ -3777,17 +3811,21 @@ fn guc_create_parallel(
 }
 
 // upstream: intel_guc_submission.c guc_irq_enable_breadcrumbs()
-fn guc_irq_enable_breadcrumbs(b: &intel_breadcrumbs) -> bool {
+unsafe fn guc_irq_enable_breadcrumbs(b: *mut intel_breadcrumbs) -> bool {
     let mut result = false;
-    for_each_engine_masked!(sibling, tmp, b.irq_engine.gt, b.engine_mask, {
+    let gt = unsafe { (*(*b).irq_engine).gt };
+    let engine_mask = unsafe { (*b).engine_mask };
+    for_each_engine_masked!(sibling, tmp, gt, engine_mask, {
         result |= intel_engine_irq_enable(sibling);
     });
     result
 }
 
 // upstream: intel_guc_submission.c guc_irq_disable_breadcrumbs()
-fn guc_irq_disable_breadcrumbs(b: &intel_breadcrumbs) {
-    for_each_engine_masked!(sibling, tmp, b.irq_engine.gt, b.engine_mask, {
+unsafe fn guc_irq_disable_breadcrumbs(b: *mut intel_breadcrumbs) {
+    let gt = unsafe { (*(*b).irq_engine).gt };
+    let engine_mask = unsafe { (*b).engine_mask };
+    for_each_engine_masked!(sibling, tmp, gt, engine_mask, {
         intel_engine_irq_disable(sibling);
     });
 }
@@ -3808,9 +3846,11 @@ fn guc_init_breadcrumbs(engine: &mut intel_engine_cs) {
         }
     }
     if !engine.breadcrumbs.is_null() {
-        engine.breadcrumbs.engine_mask |= engine.mask;
-        engine.breadcrumbs.irq_enable = guc_irq_enable_breadcrumbs;
-        engine.breadcrumbs.irq_disable = guc_irq_disable_breadcrumbs;
+        unsafe {
+            (*engine.breadcrumbs).engine_mask |= engine.mask;
+            (*engine.breadcrumbs).irq_enable = Some(guc_irq_enable_breadcrumbs);
+            (*engine.breadcrumbs).irq_disable = Some(guc_irq_disable_breadcrumbs);
+        }
     }
 }
 

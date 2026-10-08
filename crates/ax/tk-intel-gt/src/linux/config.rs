@@ -39,7 +39,8 @@ pub(crate) use crate::{
         WQ_STATUS_ACTIVE, WQ_TYPE_MULTI_LRC,
     },
     intel_breadcrumbs_upstream::{
-        intel_breadcrumbs_get, intel_breadcrumbs_put, intel_breadcrumbs_reset,
+        intel_breadcrumbs_create, intel_breadcrumbs_get, intel_breadcrumbs_put,
+        intel_breadcrumbs_reset,
     },
     intel_context_upstream::{
         I915Request, intel_context_enter_engine, intel_context_exit_engine, intel_context_fini,
