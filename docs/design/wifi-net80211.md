@@ -17,3 +17,8 @@ where their abstractions fit. Linux cfg80211/mac80211 are not imported. The
 4-way handshake uses unmodified `wpa_supplicant` via nl80211; no in-kernel PAE
 is planned. The netdevice and nl80211 adapter remain separate kernel-facing
 layers.
+
+The regulatory adapter translates OpenBSD's country/domain name and band map
+lookups into static Rust tables used by the later `REG_GET` nl80211 response.
+It deliberately retains the upstream domain flags and 2/5 GHz decision range;
+actual channel admission remains driven by the selected wireless-regdb payload.

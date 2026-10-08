@@ -541,3 +541,5 @@ OpenBSD custom ISC-style grant for HT rate adaptation. Their copyright lines
 and full grant texts are retained in the crate's `LICENSES/`. Fuchsia BSD-3-
 Clause WLAN libraries remain the selected source for later EAPOL/RSN/MLME
 reuse.
+The OpenBSD HT rate adaptation and regulatory-domain translations in
+`tk-net80211` retain their ISC-style source grants in `LICENSES/OpenBSD-ISC.txt`.

@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod frame;
 mod ra;
+mod regdomain;
 mod rsn;
 mod rssadapt;
 
@@ -20,6 +21,12 @@ pub use ra::{
     next_lower_intra_rate, next_mcs, next_rateset, node_init, probe_clear, probe_done,
     probe_next_rate, probe_next_rateset, probe_valid, trigger_next_rateset, use_ht_sgi,
     valid_rates, valid_tx_mcs,
+};
+pub use regdomain::{
+    CHANNELS_5GHZ_MAX, CHANNELS_5GHZ_MIN, COUNTRY_NAMES, CountryName, DMN_DEBUG, DMN_DEFAULT,
+    REGDOMAIN_MAP, REGDOMAIN_NAMES, RegdomainMap, RegdomainName, compare_country_name,
+    compare_regdomain_name, country_code_to_name, country_code_to_regdomain, name_to_country_code,
+    name_to_regdomain, regdomain_to_flag, regdomain_to_name,
 };
 pub use rsn::{Akm, Cipher, RsnParams, RsnStatus, parse_akm, parse_cipher, parse_rsn, parse_wpa};
 pub use rssadapt::{
