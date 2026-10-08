@@ -202,6 +202,11 @@ impl I2cInput {
         }
         let mut hmt = crate::hmt::MultiTouch::probe(&parser);
         if let Some(info) = &mut hmt {
+            if let Some(location) =
+                parser.locate_usage(crate::hid_report::ReportKind::Input, 0x0d, 0x54, 0)
+            {
+                parser.configure_mt_contact_count(location);
+            }
             let location =
                 parser.locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x55, 0);
             if let Some(location) = location {

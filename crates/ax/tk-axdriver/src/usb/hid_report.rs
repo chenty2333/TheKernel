@@ -57,6 +57,9 @@ pub(crate) struct Report {
     mt_tracking_ids: [i32; 32],
     mt_slot_limit: usize,
     mt_geometry: [[i32; 3]; 32],
+    mt_contact_count: Option<HidLocation>,
+    mt_contacts_per_report: usize,
+    mt_contacts_remaining: usize,
     pointer: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -589,6 +592,9 @@ impl Report {
             mt_tracking_ids: [-1; 32],
             mt_slot_limit: 32,
             mt_geometry: [[i32::MIN; 3]; 32],
+            mt_contact_count: None,
+            mt_contacts_per_report: 1,
+            mt_contacts_remaining: 0,
             pointer,
         })
     }
@@ -631,6 +637,18 @@ impl Report {
         for tracking_id in &mut self.mt_tracking_ids[self.mt_slot_limit..] {
             *tracking_id = -1;
         }
+    }
+    pub(crate) fn configure_mt_contact_count(&mut self, location: HidLocation) {
+        self.mt_contacts_per_report = self
+            .fields
+            .iter()
+            .filter(|field| matches!(field.kind, Kind::Variable(Mapping::MtContactId)))
+            .filter_map(|field| field.slot)
+            .max()
+            .map_or(1, |slot| usize::from(slot) + 1)
+            .max(1);
+        self.mt_contact_count = Some(location);
+        self.mt_contacts_remaining = 0;
     }
     pub(crate) fn release_all_contacts(&mut self, events: &mut VecDeque<Event>) {
         let mut released = false;
@@ -804,12 +822,33 @@ impl Report {
         if bits == 0 || report.len() * 8 < usize::from(bits) {
             return false;
         }
+        // upstream: hmt_intr() serial/hybrid Contact Count batching. Only
+        // synchronize after all contacts announced by the first packet have
+        // been delivered; later packets carry a zero Contact Count.
+        let mut next_contacts_remaining = self.mt_contacts_remaining;
+        let finish_contact_batch = if let Some(location) = self.mt_contact_count {
+            if location.report_id != id {
+                return false;
+            }
+            let Some(count) = get_hid_data(report, location, false) else {
+                return false;
+            };
+            if count > 0 {
+                next_contacts_remaining = usize::try_from(count).unwrap_or(32).min(32);
+            }
+            let delivered = next_contacts_remaining.min(self.mt_contacts_per_report);
+            next_contacts_remaining -= delivered;
+            next_contacts_remaining == 0
+        } else {
+            true
+        };
         let Ok(mut next) = reserved::<u16>(512) else {
             return false;
         };
         if events.try_reserve(2048).is_err() {
             return false;
         }
+        self.mt_contacts_remaining = next_contacts_remaining;
         // hmt.c uses Contact ID as the Type-B tracking ID, but only while the
         // matching Tip Switch (and Confidence, when present) says contact is
         // active. Resolve these companion fields before emitting a slot.
@@ -1054,7 +1093,7 @@ impl Report {
                 }
             }
         }
-        if events.len() != before {
+        if events.len() != before && finish_contact_batch {
             emit(events, 0, 0, 0);
         }
         true
@@ -1074,6 +1113,31 @@ mod tests {
             .iter()
             .map(|e| (e.event_type, e.code, e.value as i32))
             .collect()
+    }
+    #[test]
+    fn multitouch_serial_batches_sync_after_contact_count_is_delivered() {
+        let descriptor = [
+            0x05, 0x0d, 0x09, 0x05, 0xa1, 1, // Touchpad
+            0x09, 0x54, 0x15, 0, 0x25, 10, 0x75, 8, 0x95, 1, 0x81, 2, // Contact Count
+            0x09, 0x22, 0xa1, 2, // Finger
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // Tip
+            0x75, 7, 0x95, 1, 0x81, 3, // Padding
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
+            0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
+            0xc0, 0xc0,
+        ];
+        let mut parser = Report::parse(&descriptor).unwrap();
+        let location = parser
+            .locate_usage(ReportKind::Input, 0x0d, 0x54, 0)
+            .unwrap();
+        parser.configure_mt_contact_count(location);
+        let mut events = VecDeque::new();
+        assert!(parser.decode(&[2, 1, 7, 50, 60], &mut events));
+        assert!(!triples(&events).contains(&(0, 0, 0)));
+        events.clear();
+        assert!(parser.decode(&[0, 1, 8, 70, 80], &mut events));
+        assert!(triples(&events).contains(&(0, 0, 0)));
     }
     fn pointer(absolute: bool, id: Option<u8>) -> Vec<u8> {
         let mut d = alloc::vec![0x05, 1, 0x09, 2, 0xa1, 1];
