@@ -98,3 +98,14 @@ registration/RAII release and to evdev's scheduled polling/read lifecycle;
 control plane for input drivers, and polling currently uses the translated
 80/10 Hz adaptive behavior with fixed defaults. This does not claim the source
 sysctl behavior or caller runtime reconfiguration.
+
+2026-10-09 THQA follow-up: HMT now locates Microsoft's `0xff00:0x00c5`
+feature usage within the selected multitouch top-level collection and fetches
+its feature report during attach (unless already fetched through the shared
+Contact Count Maximum report). A composite keyboard+touch descriptor test
+checks TLC scoping. This mirrors the upstream unlock side effect; hardware
+acceptance remains unavailable. Scan-time `MSC_TIMESTAMP` emission and model
+quirk selection remain open. The shared parser already handles HID global/local
+state, push/pop, collection/report IDs, arrays, variables, and report sizes,
+but does not expose FreeBSD's item-at-a-time iterator or its dynamic quirk
+registry.

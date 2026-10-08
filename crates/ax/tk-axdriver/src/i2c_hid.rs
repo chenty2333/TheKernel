@@ -293,6 +293,7 @@ impl I2cInput {
                     }
                 }
             }
+            crate::hmt::MultiTouch::fetch_thqa(&parser, tlc_index, &mut device, contact_feature_id);
             if let Err(error) = info.set_input_mode(&mut device, &parser, 3) {
                 warn!("i2c-hid: failed to select multitouch input mode: {error:?}");
             }

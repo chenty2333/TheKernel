@@ -92,6 +92,43 @@ impl MultiTouch {
         let (report_id, feature) = input_mode_feature_report(report, mode, self.tlc_index)?;
         device.set_report(3, report_id, &feature)
     }
+
+    /// Upstream `hmt_hid_parse()` locates the Microsoft THQA certificate
+    /// feature report and `hmt_attach()` reads it to unlock some touch devices.
+    pub(super) fn thqa_feature_report(report: &Report, tlc_index: u8) -> Option<(u8, usize)> {
+        let location = crate::hidbus::locate(
+            report,
+            crate::hid_report::ReportKind::Feature,
+            0xff00,
+            0x00c5,
+            tlc_index,
+            0,
+        )?;
+        Some((
+            location.report_id,
+            report.report_size(crate::hid_report::ReportKind::Feature, location.report_id),
+        ))
+    }
+
+    pub(super) fn fetch_thqa<T: Transport>(
+        report: &Report,
+        tlc_index: u8,
+        device: &mut Device<T>,
+        already_fetched_report_id: Option<u8>,
+    ) {
+        let Some((report_id, length)) = Self::thqa_feature_report(report, tlc_index) else {
+            return;
+        };
+        if length <= 1 || already_fetched_report_id == Some(report_id) {
+            return;
+        }
+        let mut feature = Vec::new();
+        if feature.try_reserve_exact(length).is_err() {
+            return;
+        }
+        feature.resize(length, 0);
+        let _ = device.get_report(3, report_id, &mut feature);
+    }
 }
 
 fn input_mode_feature_report(
@@ -237,5 +274,16 @@ mod tests {
         let (report_id, feature) = input_mode_feature_report(&report, 3, 0).unwrap();
         assert_eq!(report_id, 1);
         assert_eq!(feature, [1, 0x0f]);
+    }
+
+    #[test]
+    fn thqa_feature_is_scoped_to_the_touch_top_level_collection() {
+        let descriptor = [
+            0x05, 1, 0x09, 6, 0xa1, 1, 0x09, 0xc5, 0x75, 8, 0x95, 2, 0xb1, 2, 0xc0, 0x05, 0x0d,
+            0x09, 5, 0xa1, 1, 0x85, 2, 0x05, 0xff, 0x09, 0xc5, 0x75, 8, 0x95, 4, 0xb1, 2, 0xc0,
+        ];
+        let report = Report::parse(&descriptor).unwrap();
+        assert_eq!(MultiTouch::thqa_feature_report(&report, 0), None);
+        assert_eq!(MultiTouch::thqa_feature_report(&report, 1), Some((2, 4)));
     }
 }
