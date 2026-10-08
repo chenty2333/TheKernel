@@ -12,6 +12,7 @@ pub const CONFIG_DRM_I915_GVT: bool = false;
 pub const CONFIG_DRM_I915_SELFTEST: bool = false;
 pub const CONFIG_DRM_I915_SW_FENCE_CHECK_DAG: bool = false;
 pub const CONFIG_LOCKDEP: bool = false;
+pub const CONFIG_DEBUG_MUTEXES: bool = false;
 pub const CONFIG_PREEMPT_RT: bool = false;
 
 pub const CONFIG_DRM_I915_HEARTBEAT_INTERVAL: u64 = 2500;
@@ -26,6 +27,8 @@ pub const HZ: u32 = CONFIG_HZ;
 pub(crate) use axtask::current;
 pub const GFP_KERNEL: u32 = 0x0cc0;
 pub const GFP_ATOMIC: u32 = 0x0820;
+pub const __GFP_NOWARN: u32 = 1 << 13;
+pub const DMA_RESV_USAGE_KERNEL: u32 = 0;
 pub const FW_REG_READ: u32 = 1;
 pub const FW_REG_WRITE: u32 = 2;
 
@@ -124,20 +127,11 @@ pub const I915_BO_PREALLOC: u32 = 1 << 9;
 pub const I915_BO_ALLOC_FLAGS: u32 = (1 << 10) - 1;
 pub const I915_BO_FLAG_STRUCT_PAGE: u32 = 1 << 0;
 pub const I915_BO_FLAG_IOMEM: u32 = 1 << 1;
-pub const INTEL_REGION_SMEM: i32 = 0;
-pub const INTEL_REGION_LMEM_0: i32 = 1;
-pub const INTEL_REGION_LMEM_1: i32 = 2;
-pub const INTEL_REGION_LMEM_2: i32 = 3;
-pub const INTEL_REGION_LMEM_3: i32 = 4;
-pub const INTEL_REGION_STOLEN_SMEM: i32 = 5;
-pub const INTEL_REGION_STOLEN_LMEM: i32 = 6;
-pub const INTEL_REGION_UNKNOWN: i32 = 7;
 pub const INTEL_MEMORY_SYSTEM: i32 = 0;
 pub const INTEL_MEMORY_LOCAL: i32 = 1;
 pub const INTEL_MEMORY_STOLEN_SYSTEM: i32 = 2;
 pub const INTEL_MEMORY_STOLEN_LOCAL: i32 = 3;
 pub const INTEL_MEMORY_MOCK: i32 = 4;
-pub type IntelRegionId = i32;
 pub type IntelMemoryType = i32;
 // `arch/x86/include/asm/cpufeatures.h`: CPUID feature word 0, bit 19.
 pub const X86_FEATURE_CLFLUSH: u32 = 19;

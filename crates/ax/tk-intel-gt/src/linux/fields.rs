@@ -25,13 +25,13 @@ use crate::{
 #[inline]
 pub unsafe fn i915_gem_object_cache_dirty(obj: *const DrmI915GemObject) -> bool {
     assert!(!obj.is_null());
-    unsafe { (*obj).prefix.cache_bits & (1 << 9) != 0 }
+    unsafe { (*obj).cache_bits & (1 << 9) != 0 }
 }
 
 #[inline]
 pub unsafe fn i915_gem_object_set_cache_dirty(obj: *mut DrmI915GemObject, dirty: bool) {
     assert!(!obj.is_null());
-    let bits = unsafe { &mut (*obj).prefix.cache_bits };
+    let bits = unsafe { &mut (*obj).cache_bits };
     if dirty {
         *bits |= 1 << 9;
     } else {
@@ -42,38 +42,37 @@ pub unsafe fn i915_gem_object_set_cache_dirty(obj: *mut DrmI915GemObject, dirty:
 #[inline]
 pub unsafe fn i915_gem_object_cache_coherent(obj: *const DrmI915GemObject) -> u32 {
     assert!(!obj.is_null());
-    ((unsafe { (*obj).prefix.cache_bits } >> 7) & 0x3) as u32
+    ((unsafe { (*obj).cache_bits } >> 7) & 0x3) as u32
 }
 
 #[inline]
 pub unsafe fn i915_gem_object_is_dpt(obj: *const DrmI915GemObject) -> bool {
     assert!(!obj.is_null());
-    unsafe { (*obj).prefix.cache_bits & (1 << 10) != 0 }
+    unsafe { (*obj).cache_bits & (1 << 10) != 0 }
 }
 
 #[inline]
 pub unsafe fn i915_gem_object_pat_set_by_user(obj: *const DrmI915GemObject) -> bool {
     assert!(!obj.is_null());
-    unsafe { (*obj).prefix.cache_bits & (1 << 6) != 0 }
+    unsafe { (*obj).cache_bits & (1 << 6) != 0 }
 }
 
 /// `i915_gem_object_is_framebuffer()` from gem/i915_gem_object.h.
 pub unsafe fn i915_gem_object_is_framebuffer(obj: *const DrmI915GemObject) -> bool {
     assert!(!obj.is_null());
-    let frontbuffer =
-        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*obj).prefix.frontbuffer)) };
+    let frontbuffer = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*obj).frontbuffer)) };
     !frontbuffer.is_null() || unsafe { i915_gem_object_is_dpt(obj) }
 }
 
 /// `i915_gem_object_get_tiling()` and `get_stride()` from gem/i915_gem_object.h.
 pub unsafe fn i915_gem_object_get_tiling(obj: *const DrmI915GemObject) -> u32 {
     assert!(!obj.is_null());
-    unsafe { (*obj).prefix.tiling_and_stride & 0x7f }
+    unsafe { (*obj).tiling_and_stride & 0x7f }
 }
 
 pub unsafe fn i915_gem_object_get_stride(obj: *const DrmI915GemObject) -> u32 {
     assert!(!obj.is_null());
-    unsafe { (*obj).prefix.tiling_and_stride & !0x7f }
+    unsafe { (*obj).tiling_and_stride & !0x7f }
 }
 
 #[inline]
@@ -89,8 +88,8 @@ pub unsafe fn i915_gem_object_has_cache_level(obj: *const DrmI915GemObject, leve
     if unsafe { i915_gem_object_pat_set_by_user(obj) } {
         return true;
     }
-    let i915 = unsafe { crate::linux::i915::to_i915((*obj).prefix.base.dev) };
-    let pat_index = unsafe { (*obj).prefix.cache_bits & 0x3f };
+    let i915 = unsafe { crate::linux::i915::to_i915((*obj).base.dev) };
+    let pat_index = unsafe { (*obj).cache_bits & 0x3f };
     pat_index == unsafe { crate::linux::i915::i915_gem_get_pat_index(i915, level) }
 }
 

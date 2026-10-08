@@ -18,6 +18,7 @@ use crate::{
         AtomicT, DelayedWork, IntelEngineCs, IntelGt, IntelSseu, ListHead, LlistHead, LlistNode,
         Mutex, RbNode, RbRoot, RbRootCached, Spinlock, WorkStruct,
     },
+    linux::gem_memory::IntelMemoryRegion,
     linux_config::*,
     linux_heap::{
         KmCache, SLAB_HWCACHE_ALIGN, kmem_cache_destroy, kmem_cache_free, kmem_cache_zalloc,
@@ -177,7 +178,7 @@ pub struct I915AddressSpace {
     _pad_bind: [u8; 4],
     pub mutex: Mutex,
     _resv_ref: Kref,
-    _resv: [u8; 40],
+    pub _resv: [u8; 40],
     _scratch: [*mut c_void; 4],
     pub bound_list: ListHead,
     pub unbound_list: ListHead,
@@ -203,8 +204,25 @@ const _: [(); 520] = [(); core::mem::offset_of!(I915AddressSpace, vm_flags)];
 
 #[repr(C)]
 pub struct I915GemContext {
-    _opaque: [u8; 0],
+    pub i915: *mut c_void,
+    pub file_priv: *mut c_void,
+    _before_handles_vma: [u8; 248],
+    pub handles_vma: XArray,
+    pub lut_mutex: Mutex,
+    _tail: [u8; 48],
 }
+const _: [(); 352] = [(); core::mem::size_of::<I915GemContext>()];
+const _: [(); 8] = [(); core::mem::offset_of!(I915GemContext, file_priv)];
+const _: [(); 264] = [(); core::mem::offset_of!(I915GemContext, handles_vma)];
+const _: [(); 280] = [(); core::mem::offset_of!(I915GemContext, lut_mutex)];
+
+#[repr(C)]
+pub struct XArray {
+    pub xa_lock: Spinlock,
+    pub xa_flags: u32,
+    pub xa_head: *mut c_void,
+}
+const _: [(); 16] = [(); core::mem::size_of::<XArray>()];
 
 #[repr(C)]
 pub struct I915GemWwCtx {
@@ -346,13 +364,30 @@ pub struct SgTable {
     _opaque: [u8; 0],
 }
 #[repr(C)]
+pub struct SgEntry {
+    _opaque: [u8; 0],
+}
+#[repr(C)]
 pub struct I915FenceReg {
     _opaque: [u8; 0],
 }
 #[repr(C)]
 pub struct I915MmapOffset {
-    _opaque: [u8; 0],
+    pub vma_node: DrmVmaOffsetNode,
+    pub obj: *mut DrmI915GemObject,
+    pub mmap_type: i32,
+    _pad: [u8; 4],
+    pub offset: RbNode,
 }
+const _: [(); 232] = [(); core::mem::size_of::<I915MmapOffset>()];
+const _: [(); 192] = [(); core::mem::offset_of!(I915MmapOffset, obj)];
+const _: [(); 208] = [(); core::mem::offset_of!(I915MmapOffset, offset)];
+
+#[repr(C, align(8))]
+pub struct DrmVmaOffsetNode {
+    _opaque: [u8; 192],
+}
+const _: [(); 192] = [(); core::mem::size_of::<DrmVmaOffsetNode>()];
 #[repr(C)]
 pub struct I915VmaResource {
     _opaque: [u8; 0],
@@ -448,13 +483,26 @@ pub struct IntelRing {
     pub effective_size: u32,
 }
 
-// drm_i915_gem_object.mm layout from gem/i915_gem_object_types.h. The object
-// prefix/suffix remain opaque; mm and its dirty bitfield word are represented
-// so the one source access has the real C byte offset and bit semantics.
+// drm_i915_gem_object.mm layout from gem/i915_gem_object_types.h. The page
+// iterators include the source sg/xarray/mutex storage used by these paths.
 #[repr(C, align(8))]
 pub struct I915GemObjectPageIter {
-    _opaque: [u8; 56],
+    pub sg_pos: *mut SgEntry,
+    pub sg_idx: u32,
+    _pad_sg_idx: [u8; 4],
+    pub radix: RadixTreeRoot,
+    pub lock: Mutex,
 }
+const _: [(); 56] = [(); core::mem::size_of::<I915GemObjectPageIter>()];
+const _: [(); 32] = [(); core::mem::offset_of!(I915GemObjectPageIter, lock)];
+
+#[repr(C)]
+pub struct RadixTreeRoot {
+    pub height: u32,
+    pub gfp_mask: u32,
+    pub rnode: *mut c_void,
+}
+const _: [(); 16] = [(); core::mem::size_of::<RadixTreeRoot>()];
 
 #[repr(C)]
 pub struct I915GemObjectMm {
@@ -466,7 +514,7 @@ pub struct I915GemObjectMm {
     pub placements: *mut *mut c_void,
     pub n_placements: i32,
     pub _pad1: [u8; 4],
-    pub region: *mut c_void,
+    pub region: *mut IntelMemoryRegion,
     pub res: *mut c_void,
     pub region_link: ListHead,
     pub rsgt: *mut c_void,
@@ -488,16 +536,26 @@ impl I915GemObjectMm {
     }
 }
 
-/// Exact prefix of Linux v7.2.3 `struct drm_i915_gem_object` from the
-/// configured x86_64 kernel layout. The `drm_gem_object` base is opaque except
-/// for its source `dev` member at byte 8, which the imported inline `to_i915()`
-/// uses. The enclosing object overlays these named prefix fields over the same
-/// 688 bytes previously carried as opaque storage.
+/// Exact Linux v7.2.3 x86_64 `drm_gem_object` fields accessed by the i915 GEM
+/// paths. Its 480-byte storage reflects the C union with `ttm_buffer_object`;
+/// only the DRM-object member fields used here are named.
 #[repr(C, align(8))]
 pub struct DrmGemObjectBaseLayout {
     _refcount: [u8; 8],
     pub dev: *mut c_void,
-    _opaque_tail: [u8; 464],
+    pub filp: *mut c_void,
+    _vma_node: [u8; 192],
+    pub size: u64,
+    _name_and_padding: [u8; 8],
+    pub dma_buf: *mut c_void,
+    pub import_attach: *mut c_void,
+    pub resv: *mut c_void,
+    _resv: [u8; 40],
+    _gpuva: [u8; 40],
+    pub funcs: *const c_void,
+    _lru_node: [u8; 16],
+    _lru: *mut c_void,
+    _union_tail: [u8; 112],
 }
 
 #[repr(C)]
@@ -515,38 +573,12 @@ pub struct I915GemObjectMmoLayout {
     pub offsets: RbRoot,
 }
 
-#[repr(C, align(8))]
-pub struct DrmI915GemObjectPrefix {
-    pub base: DrmGemObjectBaseLayout,
-    pub ops: *const c_void,
-    pub vma: I915GemObjectVmaLayout,
-    pub lut_list: ListHead,
-    pub lut_lock: Spinlock,
-    _pad_lut_lock: [u8; 4],
-    pub obj_link: ListHead,
-    pub shares_resv_from: *mut I915AddressSpace,
-    pub client: *mut c_void,
-    pub client_link: ListHead,
-    pub rcu_or_freed: [u8; 16],
-    pub userfault_count: u32,
-    _pad_userfault: [u8; 4],
-    pub userfault_link: ListHead,
-    pub mmo: I915GemObjectMmoLayout,
-    pub flags: c_ulong,
-    pub mem_flags: u32,
-    /// Source bitfields pat_index/pat_set_by_user/cache_coherent/cache_dirty/
-    /// is_dpt occupy the low 11 bits of this little-endian u16.
-    pub cache_bits: u16,
-    pub read_domains: u16,
-    pub write_domain: u16,
-    _pad_frontbuffer: [u8; 6],
-    pub frontbuffer: *mut c_void,
-    pub tiling_and_stride: u32,
-    _pad_to_mm: [u8; 4],
-}
-
 const _: [(); 480] = [(); core::mem::size_of::<DrmGemObjectBaseLayout>()];
 const _: [(); 8] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, dev)];
+const _: [(); 16] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, filp)];
+const _: [(); 216] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, size)];
+const _: [(); 248] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, resv)];
+const _: [(); 336] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, funcs)];
 const _: [(); 32] = [(); core::mem::size_of::<I915GemObjectVmaLayout>()];
 const _: [(); 16] = [(); core::mem::size_of::<I915GemObjectMmoLayout>()];
 const _: [(); 688] = [(); core::mem::size_of::<DrmI915GemObjectPrefix>()];
@@ -564,7 +596,32 @@ const _: [(); 680] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, tiling_a
 
 #[repr(C, align(8))]
 pub struct DrmI915GemObject {
-    pub prefix: DrmI915GemObjectPrefix,
+    pub base: DrmGemObjectBaseLayout,
+    pub ops: *const c_void,
+    pub vma: I915GemObjectVmaLayout,
+    pub lut_list: ListHead,
+    pub lut_lock: Spinlock,
+    _pad_lut_lock: [u8; 4],
+    pub obj_link: ListHead,
+    pub shares_resv_from: *mut I915AddressSpace,
+    pub client: *mut c_void,
+    pub client_link: ListHead,
+    pub rcu: RcuHead,
+    pub userfault_count: u32,
+    _pad_userfault: [u8; 4],
+    pub userfault_link: ListHead,
+    pub mmo: I915GemObjectMmoLayout,
+    pub flags: c_ulong,
+    pub mem_flags: u32,
+    /// Source bitfields pat_index/pat_set_by_user/cache_coherent/cache_dirty/
+    /// is_dpt occupy the low 11 bits of this little-endian u16.
+    pub cache_bits: u16,
+    pub read_domains: u16,
+    pub write_domain: u16,
+    _pad_frontbuffer: [u8; 6],
+    pub frontbuffer: *mut c_void,
+    pub tiling_and_stride: u32,
+    _pad_to_mm: [u8; 4],
     pub mm: I915GemObjectMm,
     _ttm: [u8; 80],
     pub pxp_key_instance: u32,
@@ -572,22 +629,30 @@ pub struct DrmI915GemObject {
     pub bit_17: *mut c_ulong,
     _suffix: [u8; 120],
 }
+const _: [(); 1144] = [(); core::mem::size_of::<DrmI915GemObject>()];
+const _: [(); 480] = [(); core::mem::offset_of!(DrmI915GemObject, ops)];
+const _: [(); 488] = [(); core::mem::offset_of!(DrmI915GemObject, vma)];
+const _: [(); 520] = [(); core::mem::offset_of!(DrmI915GemObject, lut_list)];
+const _: [(); 608] = [(); core::mem::offset_of!(DrmI915GemObject, userfault_count)];
+const _: [(); 632] = [(); core::mem::offset_of!(DrmI915GemObject, mmo)];
+const _: [(); 648] = [(); core::mem::offset_of!(DrmI915GemObject, flags)];
+const _: [(); 660] = [(); core::mem::offset_of!(DrmI915GemObject, cache_bits)];
+const _: [(); 662] = [(); core::mem::offset_of!(DrmI915GemObject, read_domains)];
+const _: [(); 664] = [(); core::mem::offset_of!(DrmI915GemObject, write_domain)];
+const _: [(); 672] = [(); core::mem::offset_of!(DrmI915GemObject, frontbuffer)];
+const _: [(); 680] = [(); core::mem::offset_of!(DrmI915GemObject, tiling_and_stride)];
 const _: [(); 1008] = [(); core::mem::offset_of!(DrmI915GemObject, pxp_key_instance)];
 const _: [(); 1016] = [(); core::mem::offset_of!(DrmI915GemObject, bit_17)];
 
-impl Deref for DrmI915GemObject {
-    type Target = DrmI915GemObjectPrefix;
-
-    fn deref(&self) -> &Self::Target {
-        &self.prefix
-    }
+#[repr(C)]
+pub struct TtmBufferObjectLayout {
+    pub base: DrmGemObjectBaseLayout,
 }
 
-impl DerefMut for DrmI915GemObject {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.prefix
-    }
-}
+const _: [(); 480] = [(); core::mem::size_of::<TtmBufferObjectLayout>()];
+const _: [(); 0] = [(); core::mem::offset_of!(TtmBufferObjectLayout, base)];
+const _: [(); 8] = [(); core::mem::align_of::<DrmI915GemObject>()];
+const _: [(); 0] = [(); core::mem::offset_of!(DrmI915GemObject, base)];
 
 #[repr(C)]
 pub struct I915Syncmap {

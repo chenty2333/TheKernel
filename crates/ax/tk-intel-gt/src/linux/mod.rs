@@ -15,6 +15,8 @@ pub(crate) use crate::{
 pub(crate) mod bits;
 pub(crate) mod contexts;
 pub(crate) mod fields;
+pub(crate) mod gem;
+pub(crate) mod gem_memory;
 pub(crate) mod i915;
 pub(crate) mod irq;
 pub(crate) mod primitives;

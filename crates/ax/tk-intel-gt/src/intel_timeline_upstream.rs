@@ -134,7 +134,7 @@ pub unsafe fn intel_gt_init_timelines(gt: *mut IntelGt) {
 }
 
 // upstream: intel_timeline.c intel_timeline_fini()
-unsafe fn intel_timeline_fini(rcu: *mut RcuHead) {
+unsafe extern "C" fn intel_timeline_fini(rcu: *mut RcuHead) {
     let timeline = container_of!(rcu, IntelTimeline, rcu);
 
     if !(*timeline).hwsp_map.is_null() {

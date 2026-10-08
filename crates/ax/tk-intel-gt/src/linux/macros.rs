@@ -311,3 +311,24 @@ macro_rules! GEM_SHOW_DEBUG {
 macro_rules! IS_ENABLED {
     ($config:expr) => {{ crate::linux_config::IS_ENABLED($config) }};
 }
+
+macro_rules! IS_ALIGNED {
+    ($address:expr, $alignment:expr $(,)?) => {{
+        let __address = $address;
+        let __alignment = $alignment;
+        __alignment != 0 && (__address & (__alignment - 1)) == 0
+    }};
+}
+
+macro_rules! overflows_type {
+    ($value:expr, $type:ty $(,)?) => {{ <$type as core::convert::TryFrom<_>>::try_from($value).is_err() }};
+}
+
+macro_rules! INIT_RADIX_TREE {
+    ($root:expr, $gfp:expr $(,)?) => {{
+        let __root = &mut *($root);
+        __root.height = 0;
+        __root.gfp_mask = $gfp;
+        __root.rnode = core::ptr::null_mut();
+    }};
+}

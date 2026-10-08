@@ -102,6 +102,9 @@ pub mod huc;
 pub mod i915_gem_domain_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod i915_gem_object_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod i915_gem_tiling_upstream;
 pub mod info;
 #[cfg(feature = "upstream-gt")]

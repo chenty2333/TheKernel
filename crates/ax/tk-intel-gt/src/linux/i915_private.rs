@@ -11,7 +11,7 @@ use core::{
 
 use crate::{
     intel_engine_cs_upstream::{AtomicT, IntelEngineCs, IntelGt, Spinlock},
-    linux::i915::IntelRuntimeInfo,
+    linux::{gem_memory::I915GemMm, i915::IntelRuntimeInfo},
     linux_memory::{atomic_inc, atomic_read},
 };
 
@@ -76,11 +76,13 @@ pub struct DrmI915Private {
     pub params: I915Params,
     pub info: *const c_void,
     pub runtime: IntelRuntimeInfo,
-    _before_unordered_wq: [u8; 852],
+    _before_wq: [u8; 844],
+    pub wq: *mut c_void,
     pub unordered_wq: *mut c_void,
     _before_gem_quirks: [u8; 8],
     pub gem_quirks: c_ulong,
-    _before_edram_size: [u8; 544],
+    pub mm: I915GemMm,
+    _l3_parity: [u8; 56],
     pub edram_size_mb: u32,
     _align_gpu_error: [u8; 4],
     pub gpu_error: I915GpuError,
@@ -130,7 +132,10 @@ const _: [(); 8] = [(); align_of::<DrmDevicePrefix>()];
 
 const _: [(); 80] = [(); size_of::<I915Params>()];
 const _: [(); 8] = [(); align_of::<I915Params>()];
+const _: [(); 2536] = [(); offset_of!(DrmI915Private, wq)];
+const _: [(); 2544] = [(); offset_of!(DrmI915Private, unordered_wq)];
 const _: [(); 2560] = [(); offset_of!(DrmI915Private, gem_quirks)];
+const _: [(); 2568] = [(); offset_of!(DrmI915Private, mm)];
 const _: [(); 3112] = [(); offset_of!(DrmI915Private, edram_size_mb)];
 const _: [(); 3120] = [(); offset_of!(DrmI915Private, gpu_error)];
 const _: [(); 4] = [(); offset_of!(I915Params, enable_guc)];

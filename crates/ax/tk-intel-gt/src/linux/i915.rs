@@ -406,6 +406,20 @@ const _: [(); 28] = [(); offset_of!(IntelDeviceInfoOverlay, flags)];
 const _: [(); 72] = [(); offset_of!(IntelDeviceInfoOverlay, cachelevel_to_pat)];
 const _: [(); 88] = [(); offset_of!(IntelDeviceInfoOverlay, max_pat_index)];
 
+/// `INTEL_INFO(i915)` source accessor for the configured device-info overlay.
+pub unsafe fn INTEL_INFO<P: I915PrivatePtr>(i915: P) -> *const IntelDeviceInfoOverlay {
+    (*(i915.as_i915_private().cast::<DrmI915Private>()))
+        .info
+        .cast::<IntelDeviceInfoOverlay>()
+}
+
+/// `HAS_FLAT_CCS(i915)` from i915_drv.h; source flag bit 9.
+#[allow(non_snake_case)]
+pub unsafe fn HAS_FLAT_CCS<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = INTEL_INFO(i915);
+    !info.is_null() && ((*info).flags[1] & (1 << 1)) != 0
+}
+
 /// Prefix overlay for `drm_i915_private.__runtime`. Offset and runtime size
 /// were obtained from the source kernel's x86_64 v7.2.3 compile configuration.
 #[repr(C)]

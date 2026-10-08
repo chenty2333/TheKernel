@@ -12,7 +12,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::intel_engine_cs_upstream::Mutex;
+use crate::{intel_engine_cs_upstream::Mutex, linux_config::CONFIG_DEBUG_MUTEXES};
 
 static MUTEX_WAITERS: axtask::WaitQueue = axtask::WaitQueue::new();
 
@@ -20,6 +20,14 @@ const _: [(); 24] = [(); size_of::<Mutex>()];
 const OWNER_OFFSET: usize = 0;
 const _: [(); 0] = [(); OWNER_OFFSET];
 const _: [(); 8] = [(); core::mem::align_of::<Mutex>()];
+
+/// Linux `mutex_destroy()` is compiled away when DEBUG_MUTEXES is disabled.
+#[inline]
+pub fn mutex_destroy(_mutex: &mut Mutex) {
+    if CONFIG_DEBUG_MUTEXES {
+        panic!("DEBUG_MUTEXES requires the Linux mutex debugging backend");
+    }
+}
 
 #[inline]
 unsafe fn owner_word<'a>(mutex: *mut Mutex) -> &'a AtomicUsize {

@@ -28,10 +28,17 @@ pub fn rcu_read_unlock() {
     kernel_guard::NoPreempt::release(());
 }
 
+/// Header initializer for `struct rcu_head`.
+#[inline]
+pub fn init_rcu_head(head: &mut RcuHead) {
+    head.next = core::ptr::null_mut();
+    head.func = None;
+}
+
 /// Queue a Linux RCU reclamation callback. If task allocation is temporarily
 /// unavailable, retain the object rather than invoke a destructor before a
 /// grace period; the caller's reference remains leaked but safe.
-pub fn call_rcu(head: *mut RcuHead, callback: unsafe fn(*mut RcuHead)) {
+pub fn call_rcu(head: *mut RcuHead, callback: unsafe extern "C" fn(*mut RcuHead)) {
     if head.is_null() {
         return;
     }
