@@ -40,9 +40,10 @@ Current controller-backed mgmt status (supersedes the earlier implementation sna
 the signed `bluez-btmon` and `bluez-deprecated` packages, pinning `btmon` and
 `hciconfig` alongside the daemon and current tools. The HCI socket now retains
 the `SOL_HCI` data-direction/timestamp controls and the `SOL_SOCKET`
-timestamp/pass-credentials toggles required for `btmon` startup. Ancillary
-timestamp/credential control messages are not implemented, so this evidence is
-strictly the no-controller path: in QEMU, `hciconfig` enumerates no adapters,
+timestamp/pass-credentials toggles required for `btmon` startup. Ancillary HCI receive metadata now emits `HCI_CMSG_DIR` (incoming direction) and
+`HCI_CMSG_TSTAMP` (microsecond timeval) when enabled; timestamp capture comes from
+the receive/pump path. `SCM_CREDENTIALS` payload delivery remains unsupported. This
+evidence is strictly the no-controller path: in QEMU, `hciconfig` enumerates no adapters,
 `hciconfig hci0` gets `ENODEV`, and `btmon -i 0` starts waiting until the test
 stops it. The existing BlueZ daemon, `btmgmt info`, and `bluetoothctl list`
 no-controller checks also pass. No active-controller/monitor-frame behavior is

@@ -34,6 +34,8 @@ const HCI_CHANNEL_CONTROL: u16 = 3;
 const HCI_OPT_DATA_DIR: u32 = 1;
 const HCI_OPT_TIME_STAMP: u32 = 3;
 const HCI_OPT_PASS_CREDENTIALS: u32 = 0x1_0000;
+pub(crate) const HCI_CMSG_DIR: u32 = 1;
+pub(crate) const HCI_CMSG_TSTAMP: u32 = 2;
 const MAX_HCI_PACKET: usize = 65_536;
 const HCI_UP: u32 = 1 << 0;
 
@@ -391,6 +393,12 @@ struct HciSocketOptions {
     pass_credentials: i32,
 }
 
+pub(crate) struct HciReceiveInfo {
+    pub(crate) length: usize,
+    pub(crate) timestamp_nanos: u64,
+    pub(crate) cmsg_mask: u8,
+}
+
 struct MgmtSubscriber {
     rx: SpinMutex<VecDeque<Vec<u8>>>,
     readiness: Arc<PollSet<32>>,
@@ -466,6 +474,64 @@ impl HciSocket {
             HCI_OPT_PASS_CREDENTIALS => Ok(options.pass_credentials),
             _ => Err(LinuxError::ENOPROTOOPT.into()),
         }
+    }
+
+    pub(crate) fn receive_into(&self, out: &mut [u8]) -> AxResult<HciReceiveInfo> {
+        let (channel, adapter) = self
+            .binding
+            .lock()
+            .as_ref()
+            .map(|binding| (binding.channel, binding.adapter.clone()))
+            .ok_or(LinuxError::ENODEV)?;
+        if channel == HCI_CHANNEL_CONTROL {
+            let packet = self
+                .control
+                .rx
+                .lock()
+                .pop_front()
+                .ok_or(LinuxError::EAGAIN)?;
+            if packet.len() > out.len() {
+                return Err(AxError::InvalidInput);
+            }
+            out[..packet.len()].copy_from_slice(&packet);
+            return Ok(HciReceiveInfo {
+                length: packet.len(),
+                timestamp_nanos: crate::time::wall_time_nanos(),
+                cmsg_mask: 0,
+            });
+        }
+        #[cfg(feature = "input")]
+        if let Some(adapter) = &adapter {
+            let (length, timestamp_nanos) = adapter
+                .lock()
+                .receive_channel_packet(channel, out, self.nonblocking.load(Ordering::Acquire))
+                .map_err(map_transport_error)?;
+            let options = self.socket_options.lock();
+            let cmsg_mask = if matches!(channel, 0 | 1) {
+                (u8::from(options.data_direction != 0) * HCI_CMSG_DIR as u8)
+                    | (u8::from(options.timestamps != 0) * HCI_CMSG_TSTAMP as u8)
+            } else {
+                0
+            };
+            return Ok(HciReceiveInfo {
+                length,
+                timestamp_nanos,
+                cmsg_mask,
+            });
+        }
+        Err(LinuxError::ENODEV.into())
+    }
+
+    pub(crate) fn receive_packet(&self) -> AxResult<(Vec<u8>, HciReceiveInfo)> {
+        let capacity = MAX_HCI_PACKET.checked_add(6).ok_or(AxError::InvalidInput)?;
+        let mut packet = Vec::new();
+        packet
+            .try_reserve_exact(capacity)
+            .map_err(|_| AxError::NoMemory)?;
+        packet.resize(capacity, 0);
+        let info = self.receive_into(&mut packet)?;
+        packet.truncate(info.length);
+        Ok((packet, info))
     }
 
     pub(crate) fn validate_socket_type(ty: u32, protocol: u32) -> AxResult<()> {
@@ -703,43 +769,9 @@ impl FileLike for HciSocket {
             .ok_or(LinuxError::ENODEV)?;
         if channel == HCI_CHANNEL_CONTROL {
             drain_bluetooth_management_events();
-            let packet = self
-                .control
-                .rx
-                .lock()
-                .pop_front()
-                .ok_or(LinuxError::EAGAIN)?;
-            return dst.write(&packet);
         }
-        let binding = self.binding.lock();
-        let binding = binding.as_ref().ok_or(LinuxError::ENODEV)?;
-        #[cfg(feature = "input")]
-        if let Some(adapter) = &binding.adapter {
-            let capacity = MAX_HCI_PACKET.checked_add(6).ok_or(AxError::InvalidInput)?;
-            let mut packet = Vec::new();
-            packet
-                .try_reserve_exact(capacity)
-                .map_err(|_| AxError::NoMemory)?;
-            packet.resize(capacity, 0);
-            let mut adapter = adapter.lock();
-            let length = adapter
-                .receive_channel_packet(
-                    binding.channel,
-                    &mut packet,
-                    self.nonblocking.load(Ordering::Acquire),
-                )
-                .map_err(map_transport_error)?;
-            return dst.write(&packet[..length]);
-        }
-        let _ = binding;
-        if binding.channel == HCI_CHANNEL_MONITOR {
-            return Err(LinuxError::EAGAIN.into());
-        }
-        Err(if self.nonblocking.load(Ordering::Acquire) {
-            LinuxError::EAGAIN.into()
-        } else {
-            LinuxError::ENODEV.into()
-        })
+        let (packet, _) = self.receive_packet()?;
+        dst.write(&packet)
     }
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let channel = self

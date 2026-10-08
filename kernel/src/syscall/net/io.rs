@@ -38,8 +38,8 @@ use super::{
 };
 use crate::{
     file::{
-        FileLike, PacketSocket, PinnedSocketDescription, PreparedSocketMessage, SocketBackendKind, WriteBuf,
-        af_alg::AfAlgSendRequest, netlink::SockaddrNl, permission::VfsSecurityContext,
+        FileLike, PacketSocket, PinnedSocketDescription, PreparedSocketMessage, SocketBackendKind,
+        WriteBuf, af_alg::AfAlgSendRequest, netlink::SockaddrNl, permission::VfsSecurityContext,
     },
     mm::{
         IoVec, IoVectorBuf, IoVectorBufIo, UserConstPtr, UserMemoryCapability, UserPtr,
@@ -61,6 +61,9 @@ const MSG_WAITFORONE: u32 = 0x1_0000;
 const MAX_SENDMSG_CONTROL_LEN: usize = 64 * 1024;
 const SOL_SCTP: u32 = 132;
 const SOL_DCCP: u32 = 269;
+const SOL_HCI: u32 = 0;
+const HCI_CMSG_DIR: u32 = 1;
+const HCI_CMSG_TSTAMP: u32 = 2;
 const DCCP_SCM_PRIORITY: u32 = 1;
 const SCTP_SNDRCV: u32 = 1;
 const SCTP_SNDINFO: u32 = 2;
@@ -1067,6 +1070,15 @@ fn should_raise_sigpipe(error: AxError, flags: u32) -> bool {
     error == AxError::BrokenPipe && flags & MSG_NOSIGNAL == 0
 }
 
+fn hci_timestamp_timeval(timestamp_nanos: u64) -> [u8; 16] {
+    let mut timeval = [0u8; 16];
+    let seconds = (timestamp_nanos / 1_000_000_000) as i64;
+    let microseconds = ((timestamp_nanos % 1_000_000_000) / 1_000) as i64;
+    timeval[..8].copy_from_slice(&seconds.to_ne_bytes());
+    timeval[8..].copy_from_slice(&microseconds.to_ne_bytes());
+    timeval
+}
+
 const fn effective_message_flags(flags: u32, nonblocking: bool) -> u32 {
     if nonblocking {
         flags | MSG_DONTWAIT
@@ -1287,8 +1299,13 @@ fn send_impl(
         return Ok(0);
     }
     if backend == SocketBackendKind::Bluetooth {
-        if !cmsg.is_empty() { return Err(AxError::OperationNotSupported); }
-        return socket.bluetooth()?.write(&mut src).map(|sent| sent as isize);
+        if !cmsg.is_empty() {
+            return Err(AxError::OperationNotSupported);
+        }
+        return socket
+            .bluetooth()?
+            .write(&mut src)
+            .map(|sent| sent as isize);
     }
     if backend != SocketBackendKind::Network {
         return Err(AxError::NotASocket);
@@ -1874,12 +1891,28 @@ fn recv_impl(
         return Err(LinuxError::EOPNOTSUPP.into());
     }
     if socket.backend()? == SocketBackendKind::Bluetooth {
-        let length = socket.bluetooth()?.read(&mut dst)?;
+        let (packet, info) = socket.bluetooth()?.receive_packet()?;
+        let copied = packet.len().min(dst.remaining_mut());
+        dst.write_all(&packet[..copied])?;
+        let mut control_truncated = info.cmsg_mask != 0 && cmsg_builder.is_none();
+        if let Some(mut builder) = cmsg_builder {
+            if info.cmsg_mask & HCI_CMSG_DIR as u8 != 0
+                && !builder.push_fixed(SOL_HCI, HCI_CMSG_DIR, &1i32.to_ne_bytes())
+            {
+                control_truncated = true;
+            }
+            if info.cmsg_mask & HCI_CMSG_TSTAMP as u8 != 0 {
+                let timeval = hci_timestamp_timeval(info.timestamp_nanos);
+                if !builder.push_fixed(SOL_HCI, HCI_CMSG_TSTAMP, &timeval) {
+                    control_truncated = true;
+                }
+            }
+        }
         return Ok(ReceiveOutcome {
-            returned_len: length as isize,
-            message_truncated: false,
+            returned_len: copied as isize,
+            message_truncated: copied < packet.len(),
             message_eor: false,
-            control_truncated: false,
+            control_truncated,
             address: want_address.then_some(ReceivedSocketAddress::Unspecified),
         });
     }
@@ -2630,6 +2663,16 @@ pub fn sys_recvmmsg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hci_cmsg_timestamp_uses_microsecond_timeval() {
+        let timestamp = hci_timestamp_timeval(1_234_567_890);
+        assert_eq!(i64::from_ne_bytes(timestamp[..8].try_into().unwrap()), 1);
+        assert_eq!(
+            i64::from_ne_bytes(timestamp[8..].try_into().unwrap()),
+            234_567
+        );
+    }
 
     #[test]
     fn explicit_scm_credentials_validate_and_last_valid_header_wins() {

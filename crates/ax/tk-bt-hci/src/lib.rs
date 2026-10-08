@@ -179,9 +179,15 @@ pub struct Adapter<T> {
     raw_users: u16,
     monitor_users: u16,
     monitor: VecDeque<Vec<u8>>,
-    incoming: VecDeque<(PacketType, Vec<u8>)>,
+    incoming: VecDeque<IncomingPacket>,
     observed_events: VecDeque<Vec<u8>>,
     stats: Statistics,
+}
+
+struct IncomingPacket {
+    kind: PacketType,
+    bytes: Vec<u8>,
+    timestamp_nanos: u64,
 }
 
 impl<T: UsbTransport> Adapter<T> {
@@ -400,13 +406,22 @@ impl<T: UsbTransport> Adapter<T> {
         out: &mut [u8],
         nonblocking: bool,
     ) -> Result<(PacketType, usize), Error> {
-        if let Some((kind, bytes)) = self.incoming.pop_front() {
-            if bytes.len() > out.len() {
+        self.receive_packet_at(out, nonblocking, 0)
+            .map(|(kind, length, _)| (kind, length))
+    }
+    pub fn receive_packet_at(
+        &mut self,
+        out: &mut [u8],
+        nonblocking: bool,
+        timestamp_nanos: u64,
+    ) -> Result<(PacketType, usize, u64), Error> {
+        if let Some(packet) = self.incoming.pop_front() {
+            if packet.bytes.len() > out.len() {
                 self.stats.err_rx = self.stats.err_rx.saturating_add(1);
                 return Err(Error::InvalidLength);
             }
-            out[..bytes.len()].copy_from_slice(&bytes);
-            return Ok((kind, bytes.len()));
+            out[..packet.bytes.len()].copy_from_slice(&packet.bytes);
+            return Ok((packet.kind, packet.bytes.len(), packet.timestamp_nanos));
         }
         let Some((kind, length)) = self.transport.read_packet(out, nonblocking)? else {
             return Err(Error::Again);
@@ -433,13 +448,16 @@ impl<T: UsbTransport> Adapter<T> {
             _ => return Err(Error::Unsupported),
         }
         self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
-        Ok((kind, length))
+        Ok((kind, length, timestamp_nanos))
     }
 
     /// Pump one already-submitted USB receive completion into the shared
     /// adapter queue. The host task may call this independently of socket
     /// reads, making event/ACL readiness observable to poll and epoll.
     pub fn pump_receive(&mut self) -> Result<bool, Error> {
+        self.pump_receive_at(0)
+    }
+    pub fn pump_receive_at(&mut self, timestamp_nanos: u64) -> Result<bool, Error> {
         if !self.up {
             return Ok(false);
         }
@@ -471,7 +489,11 @@ impl<T: UsbTransport> Adapter<T> {
             self.stats.err_rx = self.stats.err_rx.saturating_add(1);
             return Ok(false);
         }
-        self.incoming.push_back((kind, Vec::from(&bytes[..length])));
+        self.incoming.push_back(IncomingPacket {
+            kind,
+            bytes: Vec::from(&bytes[..length]),
+            timestamp_nanos,
+        });
         Ok(true)
     }
     /// Pop a raw HCI event observed by the asynchronous receiver. Upper
@@ -615,8 +637,11 @@ impl<T: UsbTransport> Adapter<T> {
             self.stats.err_rx = self.stats.err_rx.saturating_add(1);
             return Err(Error::Busy);
         }
-        self.incoming
-            .push_back((PacketType::Event, Vec::from(bytes)));
+        self.incoming.push_back(IncomingPacket {
+            kind: PacketType::Event,
+            bytes: Vec::from(bytes),
+            timestamp_nanos: 0,
+        });
         if self.observed_events.len() == 64 {
             self.observed_events.pop_front();
         }
@@ -1200,12 +1225,12 @@ mod tests {
         adapter.open(Channel::Raw).unwrap();
         adapter.set_up(true).unwrap();
         assert!(!adapter.receive_ready());
-        assert_eq!(adapter.pump_receive(), Ok(true));
+        assert_eq!(adapter.pump_receive_at(1_234_567_890), Ok(true));
         assert!(adapter.receive_ready());
         let mut bytes = [0u8; 8];
         assert_eq!(
-            adapter.receive_packet(&mut bytes, true),
-            Ok((PacketType::Event, 2))
+            adapter.receive_packet_at(&mut bytes, true, 0),
+            Ok((PacketType::Event, 2, 1_234_567_890))
         );
         assert_eq!(&bytes[..2], &[0x0e, 0]);
         assert!(!adapter.receive_ready());

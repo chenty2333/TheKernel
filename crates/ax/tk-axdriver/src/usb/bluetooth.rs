@@ -260,7 +260,9 @@ impl UsbBluetoothHci {
         }
     }
     pub fn pump_receive(&mut self) -> Result<bool, Error> {
-        let received = self.adapter.pump_receive()?;
+        let received = self
+            .adapter
+            .pump_receive_at(axhal::time::wall_time_nanos())?;
         self.drain_observed_hci_events();
         Ok(received)
     }
@@ -843,7 +845,7 @@ impl UsbBluetoothHci {
         channel: u16,
         out: &mut [u8],
         nonblocking: bool,
-    ) -> Result<usize, Error> {
+    ) -> Result<(usize, u64), Error> {
         self.drain_observed_hci_events();
         if channel == 2 {
             if let Some(frame) = self.adapter.pop_monitor() {
@@ -851,13 +853,17 @@ impl UsbBluetoothHci {
                     return Err(Error::InvalidLength);
                 }
                 out[..frame.len()].copy_from_slice(&frame);
-                return Ok(frame.len());
+                return Ok((frame.len(), axhal::time::wall_time_nanos()));
             }
         }
         if out.is_empty() {
             return Err(Error::InvalidLength);
         }
-        let (kind, length) = self.adapter.receive_packet(&mut out[1..], nonblocking)?;
+        let (kind, length, timestamp_nanos) = self.adapter.receive_packet_at(
+            &mut out[1..],
+            nonblocking,
+            axhal::time::wall_time_nanos(),
+        )?;
         if kind == tk_bt_hci::PacketType::Event {
             let event = &out[1..1 + length];
             if self
@@ -880,14 +886,14 @@ impl UsbBluetoothHci {
                 return Err(Error::InvalidLength);
             }
             out[..frame.len()].copy_from_slice(&frame);
-            return Ok(frame.len());
+            return Ok((frame.len(), timestamp_nanos));
         }
         out[0] = match kind {
             tk_bt_hci::PacketType::Event => 4,
             tk_bt_hci::PacketType::Acl => 2,
             _ => return Err(Error::Unsupported),
         };
-        Ok(length + 1)
+        Ok((length + 1, timestamp_nanos))
     }
     fn observe_hci_event(&mut self, event: &[u8]) {
         if event.len() < 2 || event.len() != usize::from(event[1]) + 2 {
