@@ -77,3 +77,8 @@ watermarks and timeout matrices and are omitted when firmware reports offload.
 Init-time BT/SOC/DQA, MCC update/response validation, temperature-threshold,
 LTR-tolerant hardware setup ordering, and NIC-lock release branches are also
 represented in the driver crate.
+
+Interface initialization now captures generation validation, monitor-vs-scan
+startup, and the one-second scan-state wait; shutdown drains/cancels the source
+task set before device stop and software-state reset. Multicast filter requests
+pass all groups for the active BSSID.

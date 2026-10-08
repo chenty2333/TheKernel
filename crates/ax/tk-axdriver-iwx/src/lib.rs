@@ -22,6 +22,7 @@ mod init_cmd;
 mod interrupts;
 mod intr;
 mod keys;
+mod lifecycle;
 mod mac;
 mod mac_context;
 mod nic;
@@ -131,6 +132,11 @@ pub use keys::{
     SetKeyDecision, SetKeyQueue, delete_key_command, drain_key_install_queue, igtk_command,
     key_install_succeeded, legacy_delete_key_command, legacy_station_key_command,
     mld_station_key_command, set_key, station_key_command, validate_legacy_key_response,
+};
+pub use lifecycle::{
+    InitAction, InitOutcome, InterfaceInitState, InterfaceStopState, MCAST_FILTER_COMMAND,
+    MCAST_FILTER_PAYLOAD_BYTES, StopAction, allow_multicast_command, initialize_interface,
+    stop_interface,
 };
 pub use mac::{MacAddress, flip_hardware_address, is_valid_mac_address, select_csr_mac_address};
 pub use mac_context::{
