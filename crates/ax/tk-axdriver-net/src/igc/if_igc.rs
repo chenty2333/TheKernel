@@ -251,6 +251,8 @@ const ALGNERRC: u32 = 0x04004;
 const TNCRS: u32 = 0x04034;
 const HTDPMC: u32 = 0x0403c;
 const TSCTC: u32 = 0x040f8;
+const DTXTCPFLGL: u32 = 0x0359c;
+const DTXTCPFLGH: u32 = 0x035a0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MainError {
@@ -493,6 +495,147 @@ pub enum MediaSubtype {
     Speed10,
     Other,
 }
+
+/// Mutable flow-control policy used by the FreeBSD `igc_set_flowcntl`
+/// sysctl callback.  The sysctl registration itself belongs to the host
+/// configuration framework, but validation and reinitialization policy do
+/// not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlowControlSetting {
+    pub mode: super::mac::FlowMode,
+    pub interface_up: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowControlRequestError {
+    InvalidMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmacSetting {
+    /// `0` disables coalescing; all nonzero values are the timer in usec.
+    pub timer_us: u32,
+    pub interface_up: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmacRequestError;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EeeSetting {
+    pub disabled: bool,
+    pub interface_up: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TsoFlagBank {
+    LowLower,
+    LowUpper,
+    HighLower,
+}
+
+/// The return value records whether FreeBSD's callback would request an
+/// iflib reinitialization.  The local NetDriverOps does not expose a generic
+/// deferred-reset scheduler; its owner can apply the new mode on its next
+/// initialization instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlowControlUpdate {
+    pub changed: bool,
+    pub request_reinit: bool,
+}
+
+// upstream: if_igc.c igc_set_flowcntl()
+pub fn igc_set_flowcntl(
+    setting: &mut FlowControlSetting,
+    input: i32,
+) -> Result<FlowControlUpdate, FlowControlRequestError> {
+    let mode = match input {
+        0 => super::mac::FlowMode::None,
+        1 => super::mac::FlowMode::RxPause,
+        2 => super::mac::FlowMode::TxPause,
+        3 => super::mac::FlowMode::Full,
+        _ => return Err(FlowControlRequestError::InvalidMode),
+    };
+
+    if mode == setting.mode {
+        return Ok(FlowControlUpdate {
+            changed: false,
+            request_reinit: false,
+        });
+    }
+
+    setting.mode = mode;
+    Ok(FlowControlUpdate {
+        changed: true,
+        request_reinit: setting.interface_up,
+    })
+}
+
+// upstream: if_igc.c igc_sysctl_dmac()
+pub fn igc_sysctl_dmac(setting: &mut DmacSetting, input: i32) -> Result<bool, DmacRequestError> {
+    let requested = match input {
+        0 => 0,
+        1 => 1000,
+        250 | 500 => input as u32,
+        1000..=10000 if input % 1000 == 0 => input as u32,
+        _ => {
+            setting.timer_us = 0;
+            return Err(DmacRequestError);
+        }
+    };
+    setting.timer_us = requested;
+    Ok(igc_sysctl_request_reinit(setting.interface_up))
+}
+
+// upstream: if_igc.c igc_sysctl_eee()
+pub fn igc_sysctl_eee(setting: &mut EeeSetting, input: i32) -> bool {
+    let disabled = input != 0;
+    setting.disabled = disabled;
+    igc_sysctl_request_reinit(setting.interface_up)
+}
+
+// upstream: if_igc.c igc_sysctl_request_reinit()
+pub const fn igc_sysctl_request_reinit(interface_up: bool) -> bool {
+    interface_up
+}
+
+// upstream: if_igc.c igc_sysctl_interrupt_rate_handler()
+pub fn igc_sysctl_interrupt_rate_handler<I: IgcMainIo>(io: &mut I, vector: u16) -> u32 {
+    let value = io.read(EITR_BASE + u32::from(vector) * 4) & EITR_QVECTOR_MASK;
+    if value == 0 {
+        0
+    } else {
+        (EITR_DIVIDEND << EITR_SHIFT) / value
+    }
+}
+
+// upstream: if_igc.c igc_sysctl_reg_handler()
+pub fn igc_sysctl_reg_handler<I: IgcMainIo>(io: &mut I, register: u32) -> u32 {
+    io.read(register)
+}
+
+// upstream: if_igc.c igc_sysctl_tso_tcp_flags_mask()
+pub fn igc_sysctl_tso_tcp_flags_mask<I: IgcMainIo>(
+    io: &mut I,
+    bank: TsoFlagBank,
+    mask: i32,
+) -> Result<(), MainError> {
+    if !(0..=0x0fff).contains(&mask) {
+        return Err(MainError::Bounds);
+    }
+    let (register, shift) = match bank {
+        TsoFlagBank::LowLower => (DTXTCPFLGL, 0),
+        TsoFlagBank::LowUpper => (DTXTCPFLGL, 16),
+        TsoFlagBank::HighLower => (DTXTCPFLGH, 0),
+    };
+    let value = io.read(register);
+    io.write(
+        register,
+        (value & !(0x0fff << shift)) | ((mask as u32) << shift),
+    );
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MediaStatus {
     pub valid: bool,
@@ -3040,5 +3183,99 @@ mod tests {
                 "set-mac"
             ]
         );
+    }
+
+    #[test]
+    fn flow_control_sysctl_policy_validates_and_requests_reinit_only_when_up() {
+        let mut setting = FlowControlSetting {
+            mode: super::super::mac::FlowMode::Full,
+            interface_up: true,
+        };
+        assert_eq!(
+            igc_set_flowcntl(&mut setting, 3),
+            Ok(FlowControlUpdate {
+                changed: false,
+                request_reinit: false,
+            })
+        );
+        assert_eq!(
+            igc_set_flowcntl(&mut setting, 1),
+            Ok(FlowControlUpdate {
+                changed: true,
+                request_reinit: true,
+            })
+        );
+        assert_eq!(setting.mode, super::super::mac::FlowMode::RxPause);
+        assert_eq!(
+            igc_set_flowcntl(&mut setting, 4),
+            Err(FlowControlRequestError::InvalidMode)
+        );
+        setting.interface_up = false;
+        assert_eq!(
+            igc_set_flowcntl(&mut setting, 0),
+            Ok(FlowControlUpdate {
+                changed: true,
+                request_reinit: false,
+            })
+        );
+    }
+
+    #[test]
+    fn dmac_and_eee_sysctl_updates_keep_source_policy() {
+        let mut dmac = DmacSetting {
+            timer_us: 500,
+            interface_up: true,
+        };
+        assert_eq!(igc_sysctl_dmac(&mut dmac, 1), Ok(true));
+        assert_eq!(dmac.timer_us, 1000);
+        assert_eq!(igc_sysctl_dmac(&mut dmac, 750), Err(DmacRequestError));
+        assert_eq!(dmac.timer_us, 0);
+        dmac.interface_up = false;
+        assert_eq!(igc_sysctl_dmac(&mut dmac, 500), Ok(false));
+
+        let mut eee = EeeSetting {
+            disabled: false,
+            interface_up: true,
+        };
+        assert!(igc_sysctl_eee(&mut eee, 1));
+        assert!(eee.disabled);
+        eee.interface_up = false;
+        assert!(!igc_sysctl_eee(&mut eee, 0));
+        assert!(!eee.disabled);
+    }
+
+    #[test]
+    fn tso_tcp_flag_sysctl_masks_and_selects_register_half() {
+        let mut io = Fake::default();
+        io.set(DTXTCPFLGL, 0xa5a5_5a5a);
+        io.set(DTXTCPFLGH, 0x1234_ffff);
+        igc_sysctl_tso_tcp_flags_mask(&mut io, TsoFlagBank::LowUpper, 0x321).unwrap();
+        assert_eq!(
+            io.get(DTXTCPFLGL),
+            (0xa5a5_5a5a & !(0x0fff << 16)) | (0x321 << 16)
+        );
+        igc_sysctl_tso_tcp_flags_mask(&mut io, TsoFlagBank::HighLower, 0x456).unwrap();
+        assert_eq!(io.get(DTXTCPFLGH), (0x1234_ffff & !0x0fff) | 0x456);
+        assert_eq!(
+            igc_sysctl_tso_tcp_flags_mask(&mut io, TsoFlagBank::LowLower, -1),
+            Err(MainError::Bounds)
+        );
+        assert_eq!(
+            igc_sysctl_tso_tcp_flags_mask(&mut io, TsoFlagBank::LowLower, 0x1000),
+            Err(MainError::Bounds)
+        );
+    }
+
+    #[test]
+    fn interrupt_rate_sysctl_reads_eitr_and_applies_inverse_conversion() {
+        let mut io = Fake::default();
+        io.set(CTRL, 0x1234_5678);
+        assert_eq!(igc_sysctl_reg_handler(&mut io, CTRL), 0x1234_5678);
+        io.set(EITR_BASE + 8, (100 << EITR_SHIFT) | 0x8000_0000);
+        assert_eq!(igc_sysctl_interrupt_rate_handler(&mut io, 2), 10_000);
+        io.set(EITR_BASE + 12, 0x8000_0000);
+        assert_eq!(igc_sysctl_interrupt_rate_handler(&mut io, 3), 0);
+        assert!(igc_sysctl_request_reinit(true));
+        assert!(!igc_sysctl_request_reinit(false));
     }
 }
