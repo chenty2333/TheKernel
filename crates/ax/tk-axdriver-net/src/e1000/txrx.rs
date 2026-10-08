@@ -549,6 +549,264 @@ pub fn em_isc_txd_encap(
     })
 }
 
+const RX_FRAME_ERROR_MASK: u32 = 0x97;
+const RX_EXT_FRAME_ERROR_MASK: u32 = 0x9700_0000;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmLegacyRxDescriptor {
+    pub address: u64,
+    pub length: u16,
+    pub checksum: u16,
+    pub status: u8,
+    pub errors: u8,
+    pub special: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmAdvancedRxDescriptor {
+    pub address: u64,
+    pub status_error: u32,
+    pub length: u16,
+    pub vlan: u16,
+    pub packet_info: u32,
+    pub rss_hash: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmRxFragment {
+    pub index: usize,
+    pub length: u16,
+    pub free_list: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmRxStats {
+    pub bytes: u64,
+    pub packets: u64,
+    pub dropped: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EmRxPacket {
+    pub length: u32,
+    pub fragments: Vec<EmRxFragment>,
+    pub checksum: EmRxChecksum,
+    pub vlan_tag: Option<u16>,
+    pub flow_id: Option<u32>,
+    pub rss_type: EmRssType,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmRxCapabilities {
+    pub checksum: bool,
+    pub vlan_tagging: bool,
+}
+
+fn rx_available<I, F>(descriptors: &[I], index: usize, budget: usize, mut status: F) -> usize
+where
+    F: FnMut(&I) -> (u32, u32),
+{
+    if descriptors.is_empty() || index >= descriptors.len() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut cursor = index;
+    let mut scanned = 0;
+    while scanned < descriptors.len() && count <= budget {
+        let (staterr, _) = status(&descriptors[cursor]);
+        if staterr & E1000_RXD_STAT_DD == 0 {
+            break;
+        }
+        cursor = advance(cursor, descriptors.len());
+        scanned += 1;
+        if staterr & E1000_RXD_STAT_EOP != 0 {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// upstream: em_txrx.c lem_isc_rxd_refill()
+pub fn lem_isc_rxd_refill(
+    descriptors: &mut [EmLegacyRxDescriptor],
+    start: usize,
+    addresses: &[u64],
+) -> DevResult<usize> {
+    if descriptors.is_empty() || start >= descriptors.len() || addresses.len() > descriptors.len() {
+        return Err(DevError::InvalidParam);
+    }
+    let mut cursor = start;
+    for &address in addresses {
+        descriptors[cursor].address = address;
+        descriptors[cursor].status = 0;
+        cursor = advance(cursor, descriptors.len());
+    }
+    Ok(cursor)
+}
+
+/// upstream: em_txrx.c em_isc_rxd_refill()
+pub fn em_isc_rxd_refill(
+    descriptors: &mut [EmAdvancedRxDescriptor],
+    start: usize,
+    addresses: &[u64],
+) -> DevResult<usize> {
+    if descriptors.is_empty() || start >= descriptors.len() || addresses.len() > descriptors.len() {
+        return Err(DevError::InvalidParam);
+    }
+    let mut cursor = start;
+    for &address in addresses {
+        descriptors[cursor].address = address;
+        descriptors[cursor].status_error = 0;
+        cursor = advance(cursor, descriptors.len());
+    }
+    Ok(cursor)
+}
+
+pub trait EmRxPublishOps {
+    fn publish_aim_rx(&mut self) -> DevResult;
+}
+
+/// upstream: em_txrx.c em_isc_rxd_flush()
+pub fn em_isc_rxd_flush<I: E1000RegisterIo, O: EmRxPublishOps>(
+    io: &mut I,
+    ops: &mut O,
+    mac: super::api::E1000MacType,
+    queue: u32,
+    producer: u32,
+) -> DevResult {
+    io.write_register(rx_desc_tail(queue), producer)?;
+    if mac >= super::api::E1000MacType::I82540 {
+        ops.publish_aim_rx()?;
+    }
+    Ok(())
+}
+
+/// upstream: em_txrx.c lem_isc_rxd_available()
+pub fn lem_isc_rxd_available(
+    descriptors: &[EmLegacyRxDescriptor],
+    index: usize,
+    budget: usize,
+) -> usize {
+    rx_available(descriptors, index, budget, |descriptor| {
+        (u32::from(descriptor.status), u32::from(descriptor.errors))
+    })
+}
+
+/// upstream: em_txrx.c em_isc_rxd_available()
+pub fn em_isc_rxd_available(
+    descriptors: &[EmAdvancedRxDescriptor],
+    index: usize,
+    budget: usize,
+) -> usize {
+    rx_available(descriptors, index, budget, |descriptor| {
+        (descriptor.status_error, descriptor.status_error >> 24)
+    })
+}
+
+/// upstream: em_txrx.c lem_isc_rxd_pkt_get()
+pub fn lem_isc_rxd_pkt_get(
+    descriptors: &mut [EmLegacyRxDescriptor],
+    index: usize,
+    capabilities: EmRxCapabilities,
+    stats: &mut EmRxStats,
+) -> DevResult<EmRxPacket> {
+    if descriptors.is_empty() || index >= descriptors.len() {
+        return Err(DevError::InvalidParam);
+    }
+    let mut packet = EmRxPacket::default();
+    let mut cursor = index;
+    loop {
+        let descriptor = &mut descriptors[cursor];
+        if u32::from(descriptor.status) & E1000_RXD_STAT_DD == 0 {
+            return Err(DevError::BadState);
+        }
+        let status = descriptor.status;
+        let errors = descriptor.errors;
+        let length = descriptor.length;
+        packet.length += u32::from(length);
+        let eop = u32::from(status) & E1000_RXD_STAT_EOP != 0;
+        if u32::from(errors) & RX_FRAME_ERROR_MASK != 0 {
+            stats.dropped += 1;
+            return Err(DevError::Io);
+        }
+        packet.fragments.push(EmRxFragment {
+            index: cursor,
+            length,
+            free_list: 0,
+        });
+        descriptor.status = 0;
+        if eop {
+            if capabilities.checksum {
+                packet.checksum = em_receive_checksum(u16::from(status), errors);
+            }
+            if capabilities.vlan_tagging && u32::from(status) & E1000_RXD_STAT_VP != 0 {
+                packet.vlan_tag = Some(descriptor.special);
+            }
+            break;
+        }
+        cursor = advance(cursor, descriptors.len());
+        if packet.fragments.len() == descriptors.len() {
+            return Err(DevError::BadState);
+        }
+    }
+    stats.bytes += u64::from(packet.length);
+    stats.packets += 1;
+    Ok(packet)
+}
+
+/// upstream: em_txrx.c em_isc_rxd_pkt_get()
+pub fn em_isc_rxd_pkt_get(
+    descriptors: &mut [EmAdvancedRxDescriptor],
+    index: usize,
+    capabilities: EmRxCapabilities,
+    stats: &mut EmRxStats,
+) -> DevResult<EmRxPacket> {
+    if descriptors.is_empty() || index >= descriptors.len() {
+        return Err(DevError::InvalidParam);
+    }
+    let mut packet = EmRxPacket::default();
+    let mut cursor = index;
+    loop {
+        let descriptor = &mut descriptors[cursor];
+        let staterr = descriptor.status_error;
+        if staterr & E1000_RXD_STAT_DD == 0 {
+            return Err(DevError::BadState);
+        }
+        let packet_info = descriptor.packet_info;
+        let length = descriptor.length;
+        packet.length += u32::from(length);
+        let eop = staterr & E1000_RXD_STAT_EOP != 0;
+        if staterr & RX_EXT_FRAME_ERROR_MASK != 0 {
+            stats.dropped += 1;
+            return Err(DevError::Io);
+        }
+        packet.fragments.push(EmRxFragment {
+            index: cursor,
+            length,
+            free_list: 0,
+        });
+        descriptor.status_error &= !0xff;
+        if eop {
+            if capabilities.checksum {
+                packet.checksum = em_receive_checksum(staterr as u16, (staterr >> 24) as u8);
+            }
+            if capabilities.vlan_tagging && staterr & E1000_RXD_STAT_VP != 0 {
+                packet.vlan_tag = Some(descriptor.vlan);
+            }
+            packet.flow_id = Some(descriptor.rss_hash);
+            packet.rss_type = em_determine_rsstype(packet_info);
+            break;
+        }
+        cursor = advance(cursor, descriptors.len());
+        if packet.fragments.len() == descriptors.len() {
+            return Err(DevError::BadState);
+        }
+    }
+    stats.bytes += u64::from(packet.length);
+    stats.packets += 1;
+    Ok(packet)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EmRxChecksum {
     pub ip_checked: bool,
@@ -630,6 +888,12 @@ mod tests {
     struct AimMock(usize);
     impl EmTxPublishOps for AimMock {
         fn publish_aim(&mut self) -> DevResult {
+            self.0 += 1;
+            Ok(())
+        }
+    }
+    impl EmRxPublishOps for AimMock {
+        fn publish_aim_rx(&mut self) -> DevResult {
             self.0 += 1;
             Ok(())
         }
@@ -866,5 +1130,114 @@ mod tests {
         assert_eq!(clear.credits, 5);
         assert_eq!(clear.report_status_cidx, 2);
         assert_eq!(clear.processed_cidx, 5);
+    }
+
+    #[test]
+    fn rx_refill_available_and_flush_keep_legacy_advanced_ring_rules() {
+        let mut legacy = alloc::vec![EmLegacyRxDescriptor::default(); 4];
+        legacy[3].status = E1000_RXD_STAT_DD as u8;
+        let next = lem_isc_rxd_refill(&mut legacy, 3, &[0x1000, 0x2000]).unwrap();
+        assert_eq!(next, 1);
+        assert_eq!(legacy[3].address, 0x1000);
+        assert_eq!(legacy[0].address, 0x2000);
+        assert_eq!(legacy[3].status, 0);
+        legacy[0].status = (E1000_RXD_STAT_DD | E1000_RXD_STAT_EOP) as u8;
+        legacy[1].status = (E1000_RXD_STAT_DD | E1000_RXD_STAT_EOP) as u8;
+        assert_eq!(lem_isc_rxd_available(&legacy, 0, 0), 1);
+
+        let mut advanced = alloc::vec![EmAdvancedRxDescriptor::default(); 4];
+        advanced[3].status_error = E1000_RXD_STAT_DD;
+        assert_eq!(em_isc_rxd_refill(&mut advanced, 3, &[0x3000]).unwrap(), 0);
+        assert_eq!(advanced[3].address, 0x3000);
+        assert_eq!(advanced[3].status_error, 0);
+        advanced[3].status_error = E1000_RXD_STAT_DD | E1000_RXD_STAT_EOP;
+        assert_eq!(em_isc_rxd_available(&advanced, 3, 0), 1);
+
+        let mut io = RegisterMock::default();
+        let mut aim = AimMock::default();
+        em_isc_rxd_flush(
+            &mut io,
+            &mut aim,
+            super::super::api::E1000MacType::I82540,
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!(io.0[&rx_desc_tail(1)], 2);
+        assert_eq!(aim.0, 1);
+    }
+
+    #[test]
+    fn rx_packet_get_accumulates_fragments_and_drops_frame_errors() {
+        let mut descriptors = alloc::vec![EmLegacyRxDescriptor::default(); 4];
+        descriptors[2] = EmLegacyRxDescriptor {
+            length: 64,
+            status: E1000_RXD_STAT_DD as u8,
+            ..EmLegacyRxDescriptor::default()
+        };
+        descriptors[3] = EmLegacyRxDescriptor {
+            length: 20,
+            status: (E1000_RXD_STAT_DD
+                | E1000_RXD_STAT_EOP
+                | E1000_RXD_STAT_VP
+                | E1000_RXD_STAT_IPCS
+                | E1000_RXD_STAT_TCPCS) as u8,
+            special: 321,
+            ..EmLegacyRxDescriptor::default()
+        };
+        let mut stats = EmRxStats::default();
+        let packet = lem_isc_rxd_pkt_get(
+            &mut descriptors,
+            2,
+            EmRxCapabilities {
+                checksum: true,
+                vlan_tagging: true,
+            },
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(packet.length, 84);
+        assert_eq!(packet.fragments.len(), 2);
+        assert_eq!(packet.vlan_tag, Some(321));
+        assert!(packet.checksum.ip_valid && packet.checksum.data_valid);
+        assert_eq!((stats.bytes, stats.packets), (84, 1));
+        assert_eq!((descriptors[2].status, descriptors[3].status), (0, 0));
+
+        let mut advanced = alloc::vec![EmAdvancedRxDescriptor::default(); 2];
+        advanced[1] = EmAdvancedRxDescriptor {
+            status_error: E1000_RXD_STAT_DD
+                | E1000_RXD_STAT_EOP
+                | E1000_RXD_STAT_VP
+                | E1000_RXD_STAT_IPCS,
+            length: 88,
+            vlan: 77,
+            packet_info: 1,
+            rss_hash: 0x1234,
+            ..EmAdvancedRxDescriptor::default()
+        };
+        let packet = em_isc_rxd_pkt_get(
+            &mut advanced,
+            1,
+            EmRxCapabilities {
+                checksum: true,
+                vlan_tagging: true,
+            },
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(packet.vlan_tag, Some(77));
+        assert_eq!(packet.flow_id, Some(0x1234));
+        assert_eq!(packet.rss_type, EmRssType::TcpIpv4);
+        assert_eq!(advanced[1].status_error & 0xff, 0);
+
+        let mut bad = alloc::vec![EmLegacyRxDescriptor::default(); 1];
+        bad[0] = EmLegacyRxDescriptor {
+            status: E1000_RXD_STAT_DD as u8,
+            errors: 1,
+            ..EmLegacyRxDescriptor::default()
+        };
+        assert!(lem_isc_rxd_pkt_get(&mut bad, 0, EmRxCapabilities::default(), &mut stats).is_err());
+        assert_eq!(stats.dropped, 1);
+        assert_ne!(bad[0].status, 0);
     }
 }
