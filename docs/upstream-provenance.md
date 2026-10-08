@@ -1148,3 +1148,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): station-only RX-node admission and BSS/monitor peer lookup translated in `tk-net80211/src/node_table.rs`.
 - OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 (BSD-3-Clause): management-frame 802.11 header, sequence and MFP protection logic translated in `tk-net80211/src/output.rs`.
 - OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): transmit BA-state reset and retry-timer cancellation effects translated in `tk-net80211/src/ba_tx.rs`.
+- OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): station background-roam TX-drain and BSS-switch callbacks translated to explicit caller effects in `tk-net80211/src/node.rs`.

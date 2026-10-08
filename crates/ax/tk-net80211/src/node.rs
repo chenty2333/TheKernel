@@ -85,6 +85,70 @@ pub struct EssSelection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxStoppedPlan {
+    Ignore,
+    SendDeauthThenSwitch {
+        reason: u16,
+    },
+    DeauthFailedRestartScan {
+        clear_background_scan: bool,
+        free_unref_callback: bool,
+    },
+}
+
+/// Plan the background-roam completion after TX has drained.
+// upstream: ieee80211_node.c ieee80211_node_tx_stopped()
+pub const fn node_tx_stopped_plan(background_scan: bool, deauth_succeeded: bool) -> TxStoppedPlan {
+    if !background_scan {
+        TxStoppedPlan::Ignore
+    } else if deauth_succeeded {
+        TxStoppedPlan::SendDeauthThenSwitch { reason: 3 }
+    } else {
+        TxStoppedPlan::DeauthFailedRestartScan {
+            clear_background_scan: true,
+            free_unref_callback: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchBssPlan {
+    Ignore,
+    RestartScan {
+        clear_background_scan: bool,
+        free_unref_callback: bool,
+    },
+    JoinSelected {
+        clear_tx_management_only: bool,
+        move_current_to_cache: bool,
+        join_selected_bss: bool,
+    },
+}
+
+/// Resolve the BSS switch callback after a background roam TX drain.
+// upstream: ieee80211_node.c ieee80211_node_switch_bss()
+pub const fn node_switch_bss_plan(
+    background_scan: bool,
+    selected_node_found: bool,
+    current_node_found: bool,
+) -> SwitchBssPlan {
+    if !background_scan {
+        SwitchBssPlan::Ignore
+    } else if !selected_node_found || !current_node_found {
+        SwitchBssPlan::RestartScan {
+            clear_background_scan: true,
+            free_unref_callback: true,
+        }
+    } else {
+        SwitchBssPlan::JoinSelected {
+            clear_tx_management_only: true,
+            move_current_to_cache: true,
+            join_selected_bss: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalRsnPolicy {
     pub protocols: u32,
     pub akms: u32,
@@ -1194,5 +1258,36 @@ mod tests {
         assert!(ess_is_better(&current, &candidate, true, true, 0));
         current.previous_failures = 1;
         assert_eq!(ess_calculate_score(&current, true, 0), 32 + 16 + 4 + 1);
+    }
+
+    #[test]
+    fn background_roam_tx_drain_and_bss_switch_preserve_callback_order() {
+        assert_eq!(node_tx_stopped_plan(false, false), TxStoppedPlan::Ignore);
+        assert_eq!(
+            node_tx_stopped_plan(true, true),
+            TxStoppedPlan::SendDeauthThenSwitch { reason: 3 }
+        );
+        assert_eq!(
+            node_tx_stopped_plan(true, false),
+            TxStoppedPlan::DeauthFailedRestartScan {
+                clear_background_scan: true,
+                free_unref_callback: true,
+            }
+        );
+        assert_eq!(
+            node_switch_bss_plan(true, true, false),
+            SwitchBssPlan::RestartScan {
+                clear_background_scan: true,
+                free_unref_callback: true,
+            }
+        );
+        assert_eq!(
+            node_switch_bss_plan(true, true, true),
+            SwitchBssPlan::JoinSelected {
+                clear_tx_management_only: true,
+                move_current_to_cache: true,
+                join_selected_bss: true,
+            }
+        );
     }
 }

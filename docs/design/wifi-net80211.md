@@ -361,3 +361,8 @@ remains outside this station subset.
 
 The station TX Block-Ack clear helper resets one agreement and reports only
 the retry-timer cancellation the task scheduler must perform.
+
+Background roam TX-drain and BSS-switch callbacks now produce explicit
+send-deauth/switch/restart-scan plans, including cleanup when the current or
+selected station node disappeared; command submission and callback lifetime
+remain driver-owned.
