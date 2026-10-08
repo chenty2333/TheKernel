@@ -1069,3 +1069,7 @@ the descriptor mask with zero.
 domain, and `MappedPowerWellIo` maps the HSW group to
 `hsw_power_well_sync_hw()`. Other power domains and their well operations remain
 unintegrated.
+
+`dc_state.rs` translates `sanitize_disable_power_well_option()` from
+`intel_display_power.c` (MIT, Copyright © 2022 Intel); negative values select
+the source default of disabling power wells.

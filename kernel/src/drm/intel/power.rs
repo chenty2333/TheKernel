@@ -1590,7 +1590,7 @@ fn bring_up_inner(
             dg1: false,
             geminilake: false,
             broxton: false,
-            disable_power_well: true,
+            disable_power_well: intel_display::dc_state::sanitize_disable_power_well_option(-1),
         },
         -1,
     );

@@ -599,3 +599,6 @@ are refused rather than silently bypassed (mapping metadata from MIT
 translate the source's mapped-well hardware sync pass, including HSW BIOS
 request handoff (`intel_display_power.c`/`intel_display_power_well.c`, MIT,
 Copyright © 2022 Intel). Only the Pipe-A domain is integrated at present.
+
+The source `sanitize_disable_power_well_option()` defaulting helper is also
+translated in `tk-intel-display/src/dc_state.rs` (MIT, Copyright © 2022 Intel).

@@ -23,6 +23,12 @@ pub struct DcStateCaps {
     pub disable_power_well: bool,
 }
 
+/// Sanitize `disable_power_well`: negative means the source default enabled.
+// upstream: intel_display_power.c sanitize_disable_power_well_option()
+pub const fn sanitize_disable_power_well_option(value: i32) -> bool {
+    if value >= 0 { value != 0 } else { true }
+}
+
 /// Calculate the i915 DC states that this display may request.
 // upstream: intel_display_power.c get_allowed_dc_mask()
 pub const fn get_allowed_dc_mask(caps: DcStateCaps, enable_dc: i32) -> u32 {
@@ -382,6 +388,9 @@ mod tests {
 
     #[test]
     fn allowed_dc_mask_and_target_sanitization_follow_i915_priority() {
+        assert!(sanitize_disable_power_well_option(-1));
+        assert!(sanitize_disable_power_well_option(1));
+        assert!(!sanitize_disable_power_well_option(0));
         let caps = DcStateCaps {
             display_version: 13,
             has_display: true,
