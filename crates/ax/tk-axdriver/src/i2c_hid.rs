@@ -141,6 +141,8 @@ struct InputState {
     sample_rate_hz: u8,
     missing_samples: u8,
     duplicate_samples: u8,
+    opened: bool,
+    suspended: bool,
 }
 
 pub struct I2cInput {
@@ -193,12 +195,36 @@ impl I2cInput {
         let actual = device
             .report_descriptor(&mut report_descriptor)
             .map_err(map_hid_error)?;
-        let (parser, report_info) =
+        let (mut parser, report_info) =
             crate::hidbus::attach_report_descriptor(&report_descriptor[..actual])?;
         if report_info.input.bytes > usize::from(descriptor.max_input_length).saturating_sub(2) {
             return Err(DevError::Unsupported);
         }
-        let hmt = crate::hmt::MultiTouch::probe(&parser);
+        let mut hmt = crate::hmt::MultiTouch::probe(&parser);
+        if let Some(info) = &mut hmt {
+            let location =
+                parser.locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x55, 0);
+            if let Some(location) = location {
+                let mut feature = Vec::new();
+                feature
+                    .try_reserve_exact(report_info.feature.bytes)
+                    .map_err(|_| DevError::NoMemory)?;
+                feature.resize(report_info.feature.bytes, 0);
+                if device
+                    .get_report(3, location.report_id, &mut feature)
+                    .is_ok_and(|actual| {
+                        actual.saturating_mul(8)
+                            >= usize::from(location.bit_offset) + usize::from(location.size)
+                    })
+                    && let Some(max_contacts) =
+                        crate::hid_report::get_hid_data(&feature, location, false)
+                    && max_contacts > 0
+                {
+                    info.slots = u16::try_from(max_contacts).unwrap_or(32).min(32);
+                }
+            }
+            parser.set_mt_slot_limit(info.slots);
+        }
         let mut input = Vec::new();
         let input_length = usize::from(descriptor.max_input_length).saturating_sub(2);
         input
@@ -210,6 +236,9 @@ impl I2cInput {
             .try_reserve_exact(input_length)
             .map_err(|_| DevError::NoMemory)?;
         previous_input.resize(input_length, 0);
+        if let Err(error) = device.set_power(Power::Off) {
+            warn!("i2c-hid: failed to power off after attach: {error:?}");
+        }
         let id = InputDeviceId {
             bus_type: BUS_I2C,
             vendor: descriptor.vendor_id,
@@ -237,6 +266,8 @@ impl I2cInput {
                 sample_rate_hz: tk_i2c_hid::INPUT_SAMPLING_FAST_HZ,
                 missing_samples: 0,
                 duplicate_samples: 0,
+                opened: false,
+                suspended: false,
             }),
             info,
             location: format!("i2c-{bus}/{}", child.slave_address),
@@ -372,6 +403,26 @@ impl BaseDriverOps for I2cInput {
 }
 
 impl InputDriverOps for I2cInput {
+    // upstream: hmt.c hmt_ev_open() / iichid.c iichid_set_power_state()
+    fn open_input(&mut self) -> DevResult<()> {
+        let state = self.state.get_mut();
+        if !state.opened && !state.suspended {
+            state.device.set_power(Power::On).map_err(map_hid_error)?;
+            state.opened = true;
+        }
+        Ok(())
+    }
+
+    // upstream: hmt.c hmt_ev_close() / iichid.c iichid_set_power_state()
+    fn close_input(&mut self) -> DevResult<()> {
+        let state = self.state.get_mut();
+        if state.opened && !state.suspended {
+            state.device.set_power(Power::Off).map_err(map_hid_error)?;
+        }
+        state.opened = false;
+        Ok(())
+    }
+
     fn device_id(&self) -> InputDeviceId {
         self.info.id
     }
@@ -417,6 +468,17 @@ impl InputDriverOps for I2cInput {
     }
     // upstream: hmt.c hmt_attach()
     fn get_abs_info(&mut self, axis: u8) -> DevResult<Option<AbsInfo>> {
+        if axis == 0x2f
+            && let Some(hmt) = self.state.get_mut().hmt
+        {
+            return Ok(Some(AbsInfo {
+                min: 0,
+                max: u32::from(hmt.slots.saturating_sub(1)),
+                fuzz: 0,
+                flat: 0,
+                res: 0,
+            }));
+        }
         Ok(self
             .state
             .get_mut()
@@ -433,6 +495,9 @@ impl InputDriverOps for I2cInput {
     // upstream: iichid.c iichid_intr() and hmt.c hmt_intr()
     fn read_event(&mut self) -> DevResult<Event> {
         let state = self.state.get_mut();
+        if !state.opened || state.suspended {
+            return Err(DevError::Again);
+        }
         if let Some(event) = state.events.pop_front() {
             return Ok(event);
         }
@@ -484,29 +549,38 @@ impl InputDriverOps for I2cInput {
 impl I2cInput {
     // upstream: iichid.c iichid_suspend()
     pub fn suspend(&mut self) -> DevResult<()> {
-        self.state
-            .get_mut()
-            .device
-            .set_power(Power::Off)
-            .map_err(map_hid_error)
+        let state = self.state.get_mut();
+        state.suspended = true;
+        if state.opened {
+            state.device.set_power(Power::Off).map_err(map_hid_error)?;
+        }
+        Ok(())
     }
 
     // upstream: iichid.c iichid_resume()
     pub fn resume(&mut self) -> DevResult<()> {
-        let device = &mut self.state.get_mut().device;
-        device.set_power(Power::On).map_err(map_hid_error)?;
-        device.delay_ms(1);
-        match device.reset(tk_i2c_hid::RESET_TIMEOUT_SECONDS) {
-            Ok(()) | Err(HidError::ResetTimeout) => Ok(()),
-            Err(error) => Err(map_hid_error(error)),
+        let state = self.state.get_mut();
+        state.suspended = false;
+        if state.opened {
+            let device = &mut state.device;
+            device.set_power(Power::On).map_err(map_hid_error)?;
+            device.delay_ms(1);
+            match device.reset(tk_i2c_hid::RESET_TIMEOUT_SECONDS) {
+                Ok(()) | Err(HidError::ResetTimeout) => {}
+                Err(error) => return Err(map_hid_error(error)),
+            }
         }
+        Ok(())
     }
 }
 
 impl Drop for I2cInput {
     // upstream: iichid.c iichid_detach()
     fn drop(&mut self) {
-        let _ = self.state.get_mut().device.set_power(Power::Off);
+        let state = self.state.get_mut();
+        if state.opened && !state.suspended {
+            let _ = state.device.set_power(Power::Off);
+        }
     }
 }
 

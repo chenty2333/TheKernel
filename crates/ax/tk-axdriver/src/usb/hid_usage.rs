@@ -12,6 +12,8 @@ pub(super) enum Mapping {
     MtContactId,
     MtTipSwitch,
     MtConfidence,
+    MtWidth,
+    MtHeight,
     Hat,
     Wheel(u16),
 }

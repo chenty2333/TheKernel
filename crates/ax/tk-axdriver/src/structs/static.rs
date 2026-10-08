@@ -513,6 +513,24 @@ impl axdriver_base::BaseDriverOps for AxInputDevice {
 
 #[cfg(feature = "input")]
 impl axdriver_input::InputDriverOps for AxInputDevice {
+    fn open_input(&mut self) -> axdriver_base::DevResult<()> {
+        match self {
+            Self::Existing(device) => device.open_input(),
+            #[cfg(feature = "usb-xhci")]
+            Self::Usb(device) => device.open_input(),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.open_input(),
+        }
+    }
+    fn close_input(&mut self) -> axdriver_base::DevResult<()> {
+        match self {
+            Self::Existing(device) => device.close_input(),
+            #[cfg(feature = "usb-xhci")]
+            Self::Usb(device) => device.close_input(),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.close_input(),
+        }
+    }
     fn device_id(&self) -> axdriver_input::InputDeviceId {
         match self {
             Self::Existing(device) => device.device_id(),

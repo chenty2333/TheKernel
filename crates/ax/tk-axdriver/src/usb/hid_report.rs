@@ -10,6 +10,7 @@ use super::hid_usage::{Mapping, Usage, mapping};
 
 const MAX_FIELDS: usize = 256;
 const MAX_USAGES: usize = 1024;
+const MAX_LOCATIONS: usize = 4096;
 #[derive(Clone, Copy, Default)]
 struct Global {
     page: u32,
@@ -40,11 +41,14 @@ pub(crate) struct Report {
     fields: Vec<Field>,
     bits: [u16; 256],
     report_sizes: [[u16; 256]; 3],
+    locations: Vec<ReportLocation>,
     ids: bool,
     // Report-ID ownership prevents a Consumer release from lifting keys held
     // by a separate keyboard report. Maximum retained owners is 1024.
     keys: Vec<(u8, u16)>,
     mt_tracking_ids: [i32; 32],
+    mt_slot_limit: usize,
+    mt_geometry: [[i32; 3]; 32],
     pointer: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +56,49 @@ pub(crate) enum ReportKind {
     Input   = 0,
     Output  = 1,
     Feature = 2,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HidLocation {
+    pub report_id: u8,
+    pub bit_offset: u16,
+    pub size: u8,
+    pub flags: u8,
+    pub logical_min: i32,
+    pub logical_max: i32,
+}
+struct ReportLocation {
+    kind: ReportKind,
+    usage: Usage,
+    location: HidLocation,
+}
+fn record_location(
+    locations: &mut Vec<ReportLocation>,
+    kind: ReportKind,
+    report_id: u8,
+    usage: Usage,
+    bit_offset: u32,
+    size: u32,
+    flags: u8,
+    min: i32,
+    max: i32,
+) -> DevResult<()> {
+    if locations.len() == MAX_LOCATIONS || bit_offset > u32::from(u16::MAX) {
+        return Err(DevError::Unsupported);
+    }
+    locations.try_reserve(1).map_err(|_| DevError::NoMemory)?;
+    locations.push(ReportLocation {
+        kind,
+        usage,
+        location: HidLocation {
+            report_id,
+            bit_offset: bit_offset as u16,
+            size: size.min(32) as u8,
+            flags,
+            logical_min: min,
+            logical_max: max,
+        },
+    });
+    Ok(())
 }
 fn reserved<T>(count: usize) -> DevResult<Vec<T>> {
     let mut v = Vec::new();
@@ -93,6 +140,47 @@ fn emit(events: &mut VecDeque<Event>, ty: u16, code: u16, value: i32) {
         value: value as u32,
     });
 }
+
+// upstream: hid.c hid_get_data_sub(), hid_get_data(), hid_get_udata()
+pub(crate) fn get_hid_data(bytes: &[u8], location: HidLocation, signed: bool) -> Option<i32> {
+    let size = usize::from(location.size.min(32));
+    let start = usize::from(location.bit_offset);
+    let end = start.checked_add(size)?;
+    if size == 0 || end > bytes.len().checked_mul(8)? {
+        return None;
+    }
+    let mut value = 0u32;
+    for bit in 0..size {
+        value |= u32::from((bytes[(start + bit) / 8] >> ((start + bit) % 8)) & 1) << bit;
+    }
+    if signed && size < 32 && value & (1 << (size - 1)) != 0 {
+        Some((value | (!0u32 << size)) as i32)
+    } else {
+        Some(value as i32)
+    }
+}
+
+// upstream: hid.c hid_put_udata()
+pub(crate) fn put_hid_udata(bytes: &mut [u8], location: HidLocation, value: u32) -> bool {
+    let size = usize::from(location.size.min(32));
+    let start = usize::from(location.bit_offset);
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    if size == 0 || end > bytes.len().saturating_mul(8) {
+        return false;
+    }
+    for bit in 0..size {
+        let mask = 1u8 << ((start + bit) % 8);
+        let byte = &mut bytes[(start + bit) / 8];
+        if value & (1 << bit) != 0 {
+            *byte |= mask;
+        } else {
+            *byte &= !mask;
+        }
+    }
+    true
+}
 impl Report {
     pub(crate) fn parse(bytes: &[u8]) -> DevResult<Self> {
         if bytes.len() > 4096 {
@@ -111,6 +199,7 @@ impl Report {
         let mut pointer = false;
         let mut bits = [0u16; 256];
         let mut report_sizes = [[0u16; 256]; 3];
+        let mut locations = reserved(128)?;
         let mut ids = false;
         let mut offset = 0;
         let mut usage_budget = 0usize;
@@ -236,6 +325,19 @@ impl Report {
                             if fields.len() == MAX_FIELDS || usage_budget + usages.len() > 4096 {
                                 return Err(DevError::Unsupported);
                             }
+                            for usage in &usages {
+                                record_location(
+                                    &mut locations,
+                                    ReportKind::Input,
+                                    g.id,
+                                    *usage,
+                                    u32::from(*at),
+                                    g.size,
+                                    value as u8,
+                                    g.min,
+                                    g.max,
+                                )?;
+                            }
                             let mut choices = reserved(usages.len())?;
                             choices.extend_from_slice(&usages);
                             usage_budget += choices.len();
@@ -259,6 +361,17 @@ impl Report {
                                     .or(usages.last())
                                     .copied()
                                     .unwrap_or_default();
+                                record_location(
+                                    &mut locations,
+                                    ReportKind::Input,
+                                    g.id,
+                                    usage,
+                                    u32::from(*at) + index * g.size,
+                                    g.size,
+                                    value as u8,
+                                    g.min,
+                                    g.max,
+                                )?;
                                 let mapped = if current_slot.is_some() {
                                     match (usage.page, usage.code) {
                                         (1, 0x30) => Some(Mapping::Axis(3, 0x35)),
@@ -266,6 +379,8 @@ impl Report {
                                         (0x0d, 0x51) => Some(Mapping::MtContactId),
                                         (0x0d, 0x42) => Some(Mapping::MtTipSwitch),
                                         (0x0d, 0x47) => Some(Mapping::MtConfidence),
+                                        (0x0d, 0x48) => Some(Mapping::MtWidth),
+                                        (0x0d, 0x49) => Some(Mapping::MtHeight),
                                         _ => mapping(usage, app, value & 4 != 0),
                                     }
                                 } else {
@@ -317,6 +432,26 @@ impl Report {
                     if end > 512 {
                         return Err(DevError::Unsupported);
                     }
+                    let report_id = g.id;
+                    let bit_start = u32::from(*at);
+                    for index in 0..g.count {
+                        let usage = usages
+                            .get(index as usize)
+                            .or(usages.last())
+                            .copied()
+                            .unwrap_or_default();
+                        record_location(
+                            &mut locations,
+                            kind,
+                            report_id,
+                            usage,
+                            bit_start + index * g.size,
+                            g.size,
+                            value as u8,
+                            g.min,
+                            g.max,
+                        )?;
+                    }
                     *at = end as u16;
                 }
                 _ => {}
@@ -339,9 +474,12 @@ impl Report {
             fields,
             bits,
             report_sizes,
+            locations,
             ids,
             keys: reserved(1024)?,
             mt_tracking_ids: [-1; 32],
+            mt_slot_limit: 32,
+            mt_geometry: [[i32::MIN; 3]; 32],
             pointer,
         })
     }
@@ -359,9 +497,40 @@ impl Report {
             .map(|(id, bits)| (id as u8, usize::from(*bits).div_ceil(8)))
             .unwrap_or((0, 0))
     }
+    // upstream: hid.c hid_locate() / hidbus.c hidbus_locate()
+    pub(crate) fn locate_usage(
+        &self,
+        kind: ReportKind,
+        page: u32,
+        code: u32,
+        index: usize,
+    ) -> Option<HidLocation> {
+        self.locations
+            .iter()
+            .filter(|item| item.kind == kind && item.usage.page == page && item.usage.code == code)
+            .nth(index)
+            .map(|item| item.location)
+    }
+    // upstream: hid.c hid_is_collection(), hid_is_mouse(), hid_is_keyboard()
+    pub(crate) fn has_collection_usage(&self, page: u32, code: u32) -> bool {
+        self.fields
+            .iter()
+            .any(|field| field.app.page == page && field.app.code == code)
+    }
+    pub(crate) fn set_mt_slot_limit(&mut self, slots: u16) {
+        self.mt_slot_limit = usize::from(slots).clamp(1, self.mt_tracking_ids.len());
+        for tracking_id in &mut self.mt_tracking_ids[self.mt_slot_limit..] {
+            *tracking_id = -1;
+        }
+    }
     pub(crate) fn release_all_contacts(&mut self, events: &mut VecDeque<Event>) {
         let mut released = false;
-        for (slot, tracking_id) in self.mt_tracking_ids.iter_mut().enumerate() {
+        for (slot, tracking_id) in self
+            .mt_tracking_ids
+            .iter_mut()
+            .take(self.mt_slot_limit)
+            .enumerate()
+        {
             if *tracking_id >= 0 {
                 if events.try_reserve(3).is_err() {
                     return;
@@ -369,6 +538,7 @@ impl Report {
                 emit(events, 3, 0x2f, slot as i32);
                 emit(events, 3, 0x39, -1);
                 *tracking_id = -1;
+                self.mt_geometry[slot] = [i32::MIN; 3];
                 released = true;
             }
         }
@@ -380,9 +550,10 @@ impl Report {
         self.pointer
     }
     pub(crate) fn is_touchpad(&self) -> bool {
-        self.fields
-            .iter()
-            .any(|field| field.app.page == 0x0d && field.app.code == 0x05)
+        self.has_collection_usage(0x0d, 0x05)
+    }
+    pub(crate) fn is_touchscreen(&self) -> bool {
+        self.has_collection_usage(0x0d, 0x04)
     }
     pub(crate) fn has_mt_tip_switch(&self) -> bool {
         self.fields
@@ -404,6 +575,14 @@ impl Report {
             Mapping::MtContactId => visit(3, 0x39),
             Mapping::MtTipSwitch => {}
             Mapping::MtConfidence => {}
+            Mapping::MtWidth => {
+                visit(3, 0x30);
+                visit(3, 0x34);
+            }
+            Mapping::MtHeight => {
+                visit(3, 0x31);
+                visit(3, 0x34);
+            }
         };
         for f in &self.fields {
             if f.slot.is_some() {
@@ -455,6 +634,11 @@ impl Report {
             let r = match f.kind {
                 Kind::Variable(Mapping::Axis(3, c)) if c == u16::from(code) => Some((f.min, f.max)),
                 Kind::Variable(Mapping::MtContactId) if code == 0x39 => Some((f.min, f.max)),
+                Kind::Variable(Mapping::MtWidth) if code == 0x30 => Some((f.min / 2, f.max / 2)),
+                Kind::Variable(Mapping::MtHeight) if code == 0x31 => Some((f.min / 2, f.max / 2)),
+                Kind::Variable(Mapping::MtWidth | Mapping::MtHeight) if code == 0x34 => {
+                    Some((-1, 1))
+                }
                 Kind::Variable(Mapping::Hat) if matches!(code, 16 | 17) => Some((-1, 1)),
                 _ => None,
             };
@@ -493,6 +677,8 @@ impl Report {
         let mut contact_ids = [0i32; 256];
         let mut contact_tips = [!has_tip_switch; 256];
         let mut contact_confidence = [true; 256];
+        let mut contact_widths = [0i32; 256];
+        let mut contact_heights = [0i32; 256];
         for f in self.fields.iter().filter(|f| f.id == id) {
             let Some(slot) = f.slot.map(usize::from) else {
                 continue;
@@ -505,6 +691,8 @@ impl Report {
                 Kind::Variable(Mapping::MtContactId) => contact_ids[slot] = raw,
                 Kind::Variable(Mapping::MtTipSwitch) => contact_tips[slot] = raw != 0,
                 Kind::Variable(Mapping::MtConfidence) => contact_confidence[slot] = raw != 0,
+                Kind::Variable(Mapping::MtWidth) => contact_widths[slot] = raw,
+                Kind::Variable(Mapping::MtHeight) => contact_heights[slot] = raw,
                 _ => {}
             }
         }
@@ -524,10 +712,12 @@ impl Report {
                 let physical_slot = self
                     .mt_tracking_ids
                     .iter()
+                    .take(self.mt_slot_limit)
                     .position(|&existing| existing == tracking_id)
                     .or_else(|| {
                         self.mt_tracking_ids
                             .iter()
+                            .take(self.mt_slot_limit)
                             .position(|&existing| existing < 0)
                     });
                 if let Some(physical_slot) = physical_slot {
@@ -537,11 +727,31 @@ impl Report {
             } else if let Some(physical_slot) = self
                 .mt_tracking_ids
                 .iter()
+                .take(self.mt_slot_limit)
                 .position(|&existing| existing == tracking_id)
             {
                 self.mt_tracking_ids[physical_slot] = -1;
+                self.mt_geometry[physical_slot] = [i32::MIN; 3];
                 assigned_slots[descriptor_slot] = physical_slot as i16;
             }
+        }
+        let mut contact_geometry = [[0i32; 3]; 32];
+        for descriptor_slot in 0..descriptor_slots {
+            let physical_slot = assigned_slots[descriptor_slot];
+            if physical_slot < 0
+                || !contact_tips[descriptor_slot]
+                || !contact_confidence[descriptor_slot]
+            {
+                continue;
+            }
+            let width = contact_widths[descriptor_slot].max(0) / 2;
+            let height = contact_heights[descriptor_slot].max(0) / 2;
+            let geometry_slot = usize::from(physical_slot as u16);
+            contact_geometry[geometry_slot] = [
+                width.max(height),
+                width.min(height),
+                i32::from(width > height),
+            ];
         }
         for f in self.fields.iter().filter(|f| f.id == id) {
             match &f.kind {
@@ -617,6 +827,14 @@ impl Report {
             }
             match mapped {
                 Mapping::Axis(ty, code) => {
+                    if f.slot.is_some_and(|slot| {
+                        let slot = usize::from(slot);
+                        slot >= contact_tips.len()
+                            || !contact_tips[slot]
+                            || !contact_confidence[slot]
+                    }) {
+                        continue;
+                    }
                     let value = raw.clamp(f.min, f.max);
                     if (ty == 2 && value != 0) || (ty == 3 && f.previous != Some(value)) {
                         emit(events, ty, code, value);
@@ -672,6 +890,28 @@ impl Report {
                 }
                 Mapping::MtTipSwitch => {}
                 Mapping::MtConfidence => {}
+                Mapping::MtWidth | Mapping::MtHeight => {
+                    let Some(slot) = f.slot.map(usize::from) else {
+                        continue;
+                    };
+                    let Some(&physical_slot) = assigned_slots.get(slot) else {
+                        continue;
+                    };
+                    if physical_slot < 0
+                        || !contact_tips[slot]
+                        || !contact_confidence[slot]
+                    {
+                        continue;
+                    }
+                    let physical_slot = usize::from(physical_slot as u16);
+                    let geometry = contact_geometry[physical_slot];
+                    for (index, code) in [0x30u16, 0x31, 0x34].into_iter().enumerate() {
+                        if self.mt_geometry[physical_slot][index] != geometry[index] {
+                            emit(events, 3, code, geometry[index]);
+                            self.mt_geometry[physical_slot][index] = geometry[index];
+                        }
+                    }
+                }
             }
         }
         if events.len() != before {
@@ -849,6 +1089,28 @@ mod tests {
         let mut ev = VecDeque::new();
         assert!(p.decode(&[2], &mut ev));
         assert_eq!(triples(&ev), [(1, 0x100, 1), (0, 0, 0)]);
+    }
+
+    #[test]
+    fn locates_feature_usage_and_reads_writes_bounded_report_bits() {
+        let descriptor = [
+            0x05, 0x0d, 0x09, 0x55, 0x15, 0, 0x25, 10, 0x85, 1, 0x75, 8, 0x95, 1, 0xb1, 2, 0x05, 1,
+            0x09, 2, 0xa1, 1, 0x09, 0x30, 0x15, 0, 0x25, 10, 0x75, 8, 0x95, 1, 0x81, 2, 0xc0,
+        ];
+        let report = Report::parse(&descriptor).unwrap();
+        let location = report
+            .locate_usage(ReportKind::Feature, 0x0d, 0x55, 0)
+            .unwrap();
+        assert_eq!(
+            (location.report_id, location.bit_offset, location.size),
+            (1, 8, 8)
+        );
+        assert_eq!(get_hid_data(&[1, 7], location, false), Some(7));
+        let mut packet = [1, 0];
+        assert!(put_hid_udata(&mut packet, location, 9));
+        assert_eq!(packet, [1, 9]);
+        assert_eq!(get_hid_data(&packet, location, false), Some(9));
+        assert_eq!(get_hid_data(&[1], location, false), None);
     }
     #[test]
     fn wheel_emits_legacy_and_high_resolution_codes() {
