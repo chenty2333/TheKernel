@@ -174,7 +174,7 @@ fn publish_disk(mut disk: AhciDisk<Window>, devices: &mut alloc::vec::Vec<crate:
 /// FreeBSD `ahci_probe`/`ahci_pci_attach` adaptation: match an AHCI class
 /// function, enable memory and bus mastering, reset the HBA, and publish the
 /// first attached ATA disk as a TheKernel block device.
-// upstream: ahci_pci.c ahci_pci_attach()
+// upstream: ahci_pci.c ahci_probe() + ahci_pci_attach()
 pub(crate) fn probe(
     root: &mut PciRoot,
     bdf: DeviceFunction,
@@ -186,11 +186,28 @@ pub(crate) fn probe(
     let id_quirk = pci_ids::identify(info.vendor_id, info.device_id, info.revision);
     let ahci_class = info.subclass == PCI_SUBCLASS_SATA && info.prog_if == PCI_PROGIF_AHCI;
     // FreeBSD also admits known AHCI controllers that advertise RAID class.
-    if !ahci_class && !(info.subclass == PCI_SUBCLASS_RAID && id_quirk.is_some()) {
+    let force_ahci = axhal::boot::command_line_value("ahci.force_ahci") == Some("1");
+    if !ahci_class
+        && !(info.subclass == PCI_SUBCLASS_RAID && id_quirk.is_some())
+        && !(force_ahci
+            && id_quirk.is_some_and(|entry| {
+                entry.quirks & axdriver_block::ahci::regs::AHCI_Q_NOFORCE == 0
+            }))
+    {
         return BusProbeResult::NotMatched;
     }
     let mut quirks = id_quirk.map_or(0, |entry| entry.quirks);
     let (subsystem_vendor, subsystem_device) = root.endpoint_subsystem_ids(bdf);
+    if info.vendor_id == 0x197b
+        && id_quirk.is_some_and(|entry| {
+            entry.quirks & axdriver_block::ahci::regs::AHCI_Q_NOFORCE != 0
+        })
+        && root
+            .read_config_dword(bdf, 0xdc)
+            .is_some_and(|value| ((value >> 24) as u8 & 0x40) == 0)
+    {
+        return BusProbeResult::NotMatched;
+    }
     if info.vendor_id == 0x197b
         && info.device_id == 0x2363
         && subsystem_vendor == 0x1043
@@ -272,6 +289,9 @@ pub(crate) fn probe(
         port.quirks = quirks;
         if quirks & axdriver_block::ahci::regs::AHCI_Q_SATA1_UNIT0 != 0 && index == 0 {
             port.user_revision[0] = 1;
+        }
+        if quirks & axdriver_block::ahci::regs::AHCI_Q_SATA2 != 0 {
+            port.user_revision[0] = 2;
         }
         port.channel_capabilities = controller
             .io_mut()

@@ -1940,13 +1940,15 @@ pub const AHCI_PCI_IDS: &[PciIdQuirk] = &[
     },
 ];
 
-/// Find the first upstream table row whose minimum revision is met.
+/// Scan all upstream rows for an ID and retain the most specific applicable
+/// revision (the table may contain multiple revision-qualified rows).
 pub fn identify(vendor_id: u16, device_id: u16, revision: u8) -> Option<PciIdQuirk> {
     let id = (u32::from(device_id) << 16) | u32::from(vendor_id);
     AHCI_PCI_IDS
         .iter()
         .copied()
-        .find(|entry| entry.id == id && entry.revision <= revision)
+        .filter(|entry| entry.id == id && entry.revision <= revision)
+        .max_by_key(|entry| entry.revision)
 }
 
 #[cfg(test)]

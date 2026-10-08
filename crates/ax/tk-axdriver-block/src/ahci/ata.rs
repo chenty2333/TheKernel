@@ -230,6 +230,7 @@ pub fn setup_register_fis(
     Ok((fis, attributes))
 }
 
+// upstream: ahci.c ahci_setup_fis()
 fn set_target(fis: &mut [u8; 20], pmp_port: u8) -> Result<(), AtaRequestError> {
     if pmp_port >= 16 {
         return Err(AtaRequestError::InvalidPmpPort);

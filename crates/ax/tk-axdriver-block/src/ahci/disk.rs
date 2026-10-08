@@ -37,6 +37,7 @@ const RECEIVED_FIS_BYTES: usize = 256;
 const COMMAND_TABLE_HEADER_BYTES: usize = 128;
 const PRD_BYTES: usize = 16;
 const COMMAND_TIMEOUT_POLLS: usize = 50_000;
+const READ_LOG_TIMEOUT_POLLS: usize = 10_000;
 const POLL_DELAY_US: u32 = 100;
 const MAX_ASYNC_SEGMENTS: usize = 16;
 
@@ -245,6 +246,7 @@ impl<I: AhciIo> AhciDisk<I> {
     /// Workspace allocations are retained by the returned driver. On a failed
     /// attach, command/FIS DMA is stopped before the allocations are released;
     /// if stop cannot prove DMA quiescence they are deliberately leaked.
+    // upstream: ahci.c ahci_ch_attach()
     pub fn attach(
         mut controller: AhciController<I>,
         mut port: PortState,
@@ -342,6 +344,7 @@ impl<I: AhciIo> AhciDisk<I> {
     /// I/O error; when a medium is reinserted, IDENTIFY must match both the
     /// saved geometry and stable serial/model/capacity fields before the old
     /// block-device identity may resume I/O.
+    // upstream: ahci.c ahci_sata_connect()
     fn ensure_connected(&mut self) -> Result<(), AhciDiskError> {
         if self.poisoned {
             return Err(AhciDiskError::CommandTimeout);
@@ -351,9 +354,11 @@ impl<I: AhciIo> AhciDisk<I> {
             .controller
             .io_mut()
             .read32(base + super::regs::AHCI_P_SSTS);
+        let serr = self.controller.io_mut().read32(base + super::regs::AHCI_P_SERR);
         if status & super::regs::ATA_SS_DET_MASK == super::regs::ATA_SS_DET_PHY_ONLINE
             && status & super::regs::ATA_SS_SPD_MASK != super::regs::ATA_SS_SPD_NO_SPEED
             && status & super::regs::ATA_SS_IPM_MASK == super::regs::ATA_SS_IPM_ACTIVE
+            && serr & super::regs::ATA_SE_PHY_CHANGED == 0
         {
             return Ok(());
         }
@@ -488,6 +493,7 @@ impl<I: AhciIo> AhciDisk<I> {
         self.controller.io_mut().write32(base + AHCI_P_CI, 1);
     }
 
+    // upstream: ahci.c ahci_ch_intr_main()
     fn sample_command(&mut self, ncq: bool) -> Option<Result<(), AhciDiskError>> {
         let base = self.port.register_base();
         let command_active = self.controller.io_mut().read32(base + AHCI_P_CI) & 1 != 0;
@@ -500,7 +506,20 @@ impl<I: AhciIo> AhciDisk<I> {
         fence(Ordering::Acquire);
         let status = self.controller.io_mut().read32(base + AHCI_P_TFD);
         let interrupt = self.controller.io_mut().read32(base + AHCI_P_IS);
-        if status & ATA_S_ERROR != 0 || interrupt & AHCI_P_IX_TFE != 0 {
+        // With AHCI_Q_NOCCS the upstream marks all running slots as failed;
+        // this driver has exactly one possible running slot (slot zero), so
+        // the condition below fails that entire running set without reading
+        // the unreliable CCS field.
+        let transport_error = interrupt
+            & (AHCI_P_IX_TFE
+                | super::regs::AHCI_P_IX_OF
+                | super::regs::AHCI_P_IX_IF
+                | super::regs::AHCI_P_IX_HBD
+                | super::regs::AHCI_P_IX_HBF)
+            != 0;
+        let no_ccs_running_slot_failed =
+            self.port.quirks & super::regs::AHCI_Q_NOCCS != 0 && transport_error;
+        if status & ATA_S_ERROR != 0 || transport_error || no_ccs_running_slot_failed {
             Some(Err(AhciDiskError::DeviceError(status)))
         } else {
             Some(Ok(()))
@@ -508,10 +527,29 @@ impl<I: AhciIo> AhciDisk<I> {
     }
 
     fn timeout_command(&mut self) -> bool {
-        self.poisoned = true;
         let fis_stopped = self.controller.ahci_stop_fr(&self.port);
         let command_stopped = self.controller.ahci_stop(&mut self.port);
+        if fis_stopped && command_stopped {
+            if !self.recover_port() {
+                self.poisoned = true;
+            }
+        } else {
+            self.poisoned = true;
+        }
         fis_stopped && command_stopped
+    }
+
+    fn recover_port(&mut self) -> bool {
+        if !self.controller.ahci_clo(&self.port) {
+            // FreeBSD logs CLO failure but continues the reset/restart path.
+            log::warn!("ahci: CLO timed out during reset; continuing");
+        }
+        if !self.controller.ahci_sata_phy_reset(&mut self.port) {
+            return false;
+        }
+        self.controller.ahci_start_fr(&self.port);
+        self.controller.ahci_start(&mut self.port, true);
+        true
     }
 
     /// FreeBSD `ahci_execute_transaction()`'s serialized completion path.
@@ -542,21 +580,16 @@ impl<I: AhciIo> AhciDisk<I> {
     /// then restarts the channel before releasing it. This driver has one slot,
     /// so it reads the error log and reinitializes the engine before returning
     /// the exact failed request; no unrelated queued victim exists.
-    // upstream: ahci.c ahci_process_read_log()
+    // upstream: ahci.c ahci_end_transaction() + ahci_issue_recovery()
     fn recover_command_error(&mut self, ncq: bool) -> bool {
-        if ncq && !self.read_ncq_error_log() {
-            return false;
+        if ncq {
+            let _ = self.read_ncq_error_log();
         }
+        let _ = self.controller.ahci_stop_fr(&self.port);
         if !self.controller.ahci_stop(&mut self.port) {
             return false;
         }
-        if !self.controller.ahci_clo(&self.port) {
-            return false;
-        }
-        self.controller.ahci_start(&mut self.port, false);
-        self.controller
-            .ahci_wait_ready(&self.port, 1_000, 0)
-            .is_ok()
+        self.recover_port()
     }
 
     fn read_ncq_error_log(&mut self) -> bool {
@@ -568,9 +601,17 @@ impl<I: AhciIo> AhciDisk<I> {
         };
         debug_assert!(!ncq);
         self.publish_command(false);
-        for _ in 0..COMMAND_TIMEOUT_POLLS {
+        for _ in 0..READ_LOG_TIMEOUT_POLLS {
             if let Some(result) = self.sample_command(false) {
-                return result.is_ok();
+                if result.is_err() {
+                    return false;
+                }
+                let log = self.workspace().bounce.cpu.as_ptr();
+                // SAFETY: READ LOG EXT completed and DMA is quiescent.
+                let status = unsafe { ptr::read_volatile(log) };
+                let tag = status & 0x1f;
+                let nq = status & 0x80 != 0;
+                return !nq && tag == 0;
             }
             self.controller.io_mut().delay_us(POLL_DELAY_US);
         }
@@ -803,6 +844,7 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         })
     }
 
+    // upstream: ahci.c ahci_begin_transaction()
     fn submit_async_batch(
         &mut self,
         requests: &mut [BlockQueueRequest<'_>],
@@ -817,16 +859,7 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
                 queue_full: true,
             });
         }
-        let link_status = self
-            .controller
-            .io_mut()
-            .read32(self.port.register_base() + super::regs::AHCI_P_SSTS);
-        if link_status & super::regs::ATA_SS_DET_MASK != super::regs::ATA_SS_DET_PHY_ONLINE
-            || link_status & super::regs::ATA_SS_SPD_MASK == super::regs::ATA_SS_SPD_NO_SPEED
-            || link_status & super::regs::ATA_SS_IPM_MASK != super::regs::ATA_SS_IPM_ACTIVE
-        {
-            return Err(DevError::Again);
-        }
+        self.ensure_connected().map_err(map_error)?;
         let request = &mut requests[0];
         if request.segments.len() > MAX_ASYNC_SEGMENTS {
             return Err(DevError::InvalidParam);

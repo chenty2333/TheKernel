@@ -44,3 +44,10 @@ not implemented, and the guest BusyBox image does not include `mkfs.ext4`, so
 this does not satisfy the requested guest-side partitioning/formatting step.
 The ATA disk path does not yet implement all of FreeBSD `ahci.c`/`ahci_pci.c`;
 see the untranslated functions listed above.
+
+`AHCI_Q_IOMMU_BUSWIDE` is retained in the translated PCI quirk table, but cannot
+be applied by this driver until the platform IOMMU provides a bus-wide DMA
+identity/domain API. PHY-change events on an existing disk force link reset and
+IDENTIFY fingerprint validation; automatic enumeration of a newly inserted disk
+on a port that was empty at boot remains blocked by the missing runtime block
+registry/device-node publication API.
