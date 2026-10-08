@@ -10,6 +10,7 @@ extern crate alloc;
 extern crate std;
 
 mod iwmbt_fw;
+pub mod smp_crypto;
 use alloc::{collections::VecDeque, vec::Vec};
 
 pub use iwmbt_fw::{

@@ -48,3 +48,17 @@ evidence is strictly the no-controller path: in QEMU, `hciconfig` enumerates no 
 stops it. The existing BlueZ daemon, `btmgmt info`, and `bluetoothctl list`
 no-controller checks also pass. No active-controller/monitor-frame behavior is
 claimed by this smoke.
+
+## LE SMP implementation status (2026-10-09)
+
+The no-std `tk-bt-hci::smp_crypto` module now provides AES-128, RFC 4493
+AES-CMAC, legacy `c1`/`s1`, Secure Connections `f4`/`f5`/`f6`/`g2`, resolvable
+address `ah`, and P-256 public-key/ECDH helpers. Crypto arrays use the most-
+significant-octet-first order from Core Vol 3 Part H Appendix D; SMP wire fields
+are little-endian and require explicit conversion at their caller. RFC 4493 and
+Core Appendix D vectors cover CMAC, f4-f6, g2, and ah; P-256 ECDH has symmetry
+and invalid-point checks. The cryptographic building blocks are not yet an SMP
+transaction engine: LE `PAIR_DEVICE`, ACL/CID 6 dispatch, Pairing Feature /
+Confirm / Random / Public Key / DHKey Check exchange, encryption transition,
+key distribution and mgmt `NEW_LONG_TERM_KEY`/`NEW_IRK` remain unimplemented.
+No LE pairing success or key-generation claim is made.
