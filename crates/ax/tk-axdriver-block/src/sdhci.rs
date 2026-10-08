@@ -342,6 +342,26 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.clock_hz
     }
 
+    // upstream: sdhci.c sdhci_set_bus_width()
+    fn set_bus_width(&mut self, width: u8) {
+        let mut control = self.io.read8(SDHCI_HOST_CONTROL as usize);
+        control &= !(SDHCI_CTRL_4BITBUS | SDHCI_CTRL_8BITBUS) as u8;
+        if width == 4 {
+            control |= SDHCI_CTRL_4BITBUS as u8;
+        } else if width == 8 {
+            control |= SDHCI_CTRL_8BITBUS as u8;
+        }
+        self.io.write8(SDHCI_HOST_CONTROL as usize, control);
+    }
+
+    // upstream: sdhci.c sdhci_set_uhs_timing() (legacy high-speed subset)
+    fn set_high_speed(&mut self, clock_hz: u32) -> Result<(), SdhciError> {
+        let mut control = self.io.read8(SDHCI_HOST_CONTROL as usize);
+        control |= SDHCI_CTRL_HISPD as u8;
+        self.io.write8(SDHCI_HOST_CONTROL as usize, control);
+        self.set_clock(clock_hz)
+    }
+
     /// Reset command/data engines and establish the initial 400 kHz clock.
     // upstream: sdhci.c sdhci_generic_reset()
     pub fn initialize(&mut self) -> Result<(), SdhciError> {
@@ -429,6 +449,19 @@ impl<I: SdhciIo> SdhciHost<I> {
         Err(SdhciError::Timeout)
     }
 
+    // upstream: sdhci.c sdhci_wait_for_busy()
+    fn wait_busy(&mut self) -> Result<(), SdhciError> {
+        for _ in 0..self.timeout_polls {
+            if self.io.read32(SDHCI_PRESENT_STATE as usize) & (SDHCI_DAT_INHIBIT | SDHCI_DAT_ACTIVE)
+                == 0
+            {
+                return Ok(());
+            }
+            self.io.delay_us(10);
+        }
+        Err(SdhciError::Timeout)
+    }
+
     /// Issue one command and optional PIO data transfer. Multi-block requests
     /// are bounded by the 16-bit SDHCI block-count register.
     // upstream: sdhci.c sdhci_generic_request()
@@ -455,7 +488,9 @@ impl<I: SdhciIo> SdhciHost<I> {
             if count > 1 {
                 mode |= SDHCI_TRNS_MULTI as u16;
             }
-            if command_flags & SDHCI_CMD_DATA as u16 != 0 && matches!(index, 8 | 17 | 18) {
+            if command_flags & SDHCI_CMD_DATA as u16 != 0
+                && matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
+            {
                 mode |= SDHCI_TRNS_READ as u16;
             }
             (Some(mode), count as u16)
@@ -509,24 +544,28 @@ impl<I: SdhciIo> SdhciHost<I> {
             response.0[0] = self.io.read32(SDHCI_RESPONSE as usize);
         }
         if let Some(buffer) = data {
-            self.wait_status(if matches!(index, 8 | 17 | 18) {
-                SDHCI_INT_DATA_AVAIL
-            } else {
-                SDHCI_INT_SPACE_AVAIL
-            })?;
+            let read = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE);
             let mut offset = 0usize;
             while offset < buffer.len() {
-                let end = (offset + 4).min(buffer.len());
-                if matches!(index, 8 | 17 | 18) {
-                    let word = self.io.read32(SDHCI_BUFFER as usize).to_le_bytes();
-                    buffer[offset..end].copy_from_slice(&word[..end - offset]);
+                self.wait_status(if read {
+                    SDHCI_INT_DATA_AVAIL
                 } else {
-                    let mut bytes = [0u8; 4];
-                    bytes[..end - offset].copy_from_slice(&buffer[offset..end]);
-                    self.io
-                        .write32(SDHCI_BUFFER as usize, u32::from_le_bytes(bytes));
+                    SDHCI_INT_SPACE_AVAIL
+                })?;
+                let block_end = (offset + block_size).min(buffer.len());
+                while offset < block_end {
+                    let end = (offset + 4).min(block_end);
+                    if read {
+                        let word = self.io.read32(SDHCI_BUFFER as usize).to_le_bytes();
+                        buffer[offset..end].copy_from_slice(&word[..end - offset]);
+                    } else {
+                        let mut bytes = [0u8; 4];
+                        bytes[..end - offset].copy_from_slice(&buffer[offset..end]);
+                        self.io
+                            .write32(SDHCI_BUFFER as usize, u32::from_le_bytes(bytes));
+                    }
+                    offset = end;
                 }
-                offset = end;
             }
             self.wait_status(SDHCI_INT_DATA_END)?;
         }
@@ -536,14 +575,22 @@ impl<I: SdhciIo> SdhciHost<I> {
 
 const SD_CMD_GO_IDLE: u8 = 0;
 const MMC_CMD_SEND_OP_COND: u8 = 1;
+const MMC_CMD_SWITCH: u8 = 6;
 const SD_CMD_ALL_SEND_CID: u8 = 2;
 const SD_CMD_SEND_RELATIVE_ADDR: u8 = 3;
 const SD_CMD_SEND_CSD: u8 = 9;
 const SD_CMD_SELECT_CARD: u8 = 7;
+const SD_CMD_STOP_TRANSMISSION: u8 = 12;
 const SD_CMD_SEND_STATUS: u8 = 13;
+const SD_CMD_SWITCH_FUNC: u8 = 6;
 const SD_CMD_SET_BLOCKLEN: u8 = 16;
 const SD_CMD_READ_SINGLE: u8 = 17;
+const SD_CMD_READ_MULTIPLE: u8 = 18;
+const SD_CMD_ERASE_START: u8 = 32;
+const SD_CMD_ERASE_END: u8 = 33;
+const SD_CMD_ERASE: u8 = 38;
 const SD_CMD_WRITE_SINGLE: u8 = 24;
+const SD_CMD_WRITE_MULTIPLE: u8 = 25;
 const SD_CMD_APP: u8 = 55;
 const SD_ACMD_OP_COND: u8 = 41;
 const SD_ACMD_SET_WIDTH: u8 = 6;
@@ -564,6 +611,7 @@ pub struct SdhciDisk<I: SdhciIo> {
     rca: u16,
     sectors: u64,
     high_capacity: bool,
+    erase_group_sectors: u32,
     read_only: bool,
 }
 
@@ -636,13 +684,22 @@ impl<I: SdhciIo> SdhciDisk<I> {
                 .ok_or(SdhciError::InvalidTransfer)?)
                 / 512
         };
+        let mut erase_group_sectors = if response_bits(csd, 46, 1) != 0 {
+            1
+        } else {
+            response_bits(csd, 39, 7).saturating_add(1)
+        };
+        let mut ext_csd = [0u8; 512];
         if mmc && high_capacity {
-            let mut ext_csd = [0u8; 512];
             host.command(8, 0, SD_R1 | SD_DATA, Some(&mut ext_csd), 512)?;
             let ext_sectors =
                 u32::from_le_bytes([ext_csd[212], ext_csd[213], ext_csd[214], ext_csd[215]]);
             if ext_sectors != 0 {
                 sectors = u64::from(ext_sectors);
+            }
+            if ext_csd[224] != 0 {
+                // EXT_CSD[224] is the erase-group multiplier in 512 KiB units.
+                erase_group_sectors = u32::from(ext_csd[224]) * 1024;
             }
         }
         if sectors == 0 {
@@ -651,17 +708,60 @@ impl<I: SdhciIo> SdhciDisk<I> {
         if !high_capacity {
             host.command(SD_CMD_SET_BLOCKLEN, 512, SD_R1, None, 0)?;
         }
-        if !mmc {
+        if mmc && high_capacity {
+            // EXT_CSD[185] (HS_TIMING) value 1 selects legacy MMC high speed.
+            // Only use it when the card advertises a 26/52 MHz timing mode.
+            let card_type = ext_csd[196];
+            if card_type & 0x03 != 0 {
+                let arg = (3 << 24) | (185 << 16) | (1 << 8);
+                host.command(MMC_CMD_SWITCH, arg, SD_R1B, None, 0)?;
+                host.wait_busy()?;
+                let target = if card_type & 0x02 != 0 {
+                    52_000_000
+                } else {
+                    26_000_000
+                };
+                host.set_high_speed(target.min(host.base_clock_hz))?;
+            }
+            // PARTITION_CONFIG is intentionally retained for future boot/RPMB
+            // child devices; the current registry exposes only user area.
+            let _partition_config = ext_csd[179];
+            let _partition_support = ext_csd[160];
+        } else {
             host.command(SD_CMD_APP, u32::from(rca) << 16, SD_R1, None, 0)?;
-            host.command(SD_ACMD_SET_WIDTH, 0, SD_R1, None, 0)?;
+            host.command(SD_ACMD_SET_WIDTH, 2, SD_R1, None, 0)?;
+            host.set_bus_width(4);
+            let mut switch_status = [0u8; 64];
+            host.command(
+                SD_CMD_SWITCH_FUNC,
+                0x00ff_fff1,
+                SD_R1 | SD_DATA,
+                Some(&mut switch_status),
+                64,
+            )?;
+            if switch_status[13] & 0x02 != 0 && host.capabilities & SDHCI_CAN_DO_HISPD != 0 {
+                host.command(
+                    SD_CMD_SWITCH_FUNC,
+                    0x80ff_fff1,
+                    SD_R1 | SD_DATA,
+                    Some(&mut switch_status),
+                    64,
+                )?;
+                if switch_status[16] & 0x0f == 1 {
+                    host.set_high_speed(host.base_clock_hz.min(50_000_000))?;
+                }
+            }
         }
-        let target = host.base_clock_hz.min(25_000_000);
-        host.set_clock(target)?;
+        if host.clock_hz == 0 {
+            let target = host.base_clock_hz.min(25_000_000);
+            host.set_clock(target)?;
+        }
         Ok(Self {
             host,
             rca,
             sectors,
             high_capacity,
+            erase_group_sectors: erase_group_sectors.max(1),
             read_only: false,
         })
     }
@@ -701,23 +801,44 @@ impl<I: SdhciIo> SdhciDisk<I> {
         Err(SdhciError::Timeout)
     }
 
-    // upstream: mmcsd.c mmcsd_rw() single-block transaction
+    // upstream: mmcsd.c mmcsd_rw() CMD17/CMD18/CMD24/CMD25 block transaction
     fn transfer(&mut self, lba: u64, data: &mut [u8], write: bool) -> Result<(), SdhciError> {
-        if data.len() != 512 || lba >= self.sectors {
+        if data.is_empty()
+            || !data.len().is_multiple_of(512)
+            || lba
+                .checked_add((data.len() / 512) as u64)
+                .is_none_or(|end| end > self.sectors)
+        {
             return Err(SdhciError::InvalidTransfer);
         }
-        let command = if write {
+        let multiple = data.len() > 512;
+        let command = if write && multiple {
+            SD_CMD_WRITE_MULTIPLE
+        } else if write {
             SD_CMD_WRITE_SINGLE
+        } else if multiple {
+            SD_CMD_READ_MULTIPLE
         } else {
             SD_CMD_READ_SINGLE
         };
-        self.host.command(
+        let transfer = self.host.command(
             command,
             self.card_address(lba)?,
             SD_R1 | SD_DATA,
             Some(data),
             512,
-        )?;
+        );
+        if multiple {
+            // Auto CMD12 is not enabled on this host, so issue the generic
+            // SD/MMC stop-transmission sequence after a multi-block request.
+            let stop = self
+                .host
+                .command(SD_CMD_STOP_TRANSMISSION, 0, SD_R1B, None, 0);
+            transfer?;
+            stop?;
+        } else {
+            transfer?;
+        }
         if write {
             self.wait_ready()?;
         }
@@ -750,8 +871,8 @@ impl<I: SdhciIo> crate::BlockDriverOps for SdhciDisk<I> {
         {
             return Err(crate::DevError::InvalidParam);
         }
-        for (index, sector) in output.chunks_exact_mut(512).enumerate() {
-            self.transfer(block + index as u64, sector, false)
+        for (index, chunk) in output.chunks_mut(512 * 128).enumerate() {
+            self.transfer(block + (index * 128) as u64, chunk, false)
                 .map_err(map_sdhci_error)?;
         }
         Ok(())
@@ -768,10 +889,9 @@ impl<I: SdhciIo> crate::BlockDriverOps for SdhciDisk<I> {
         {
             return Err(crate::DevError::InvalidParam);
         }
-        for (index, chunk) in input.chunks_exact(512).enumerate() {
-            let mut sector = [0u8; 512];
-            sector.copy_from_slice(chunk);
-            self.transfer(block + index as u64, &mut sector, true)
+        for (index, chunk) in input.chunks(512 * 128).enumerate() {
+            let mut write_data = alloc::vec::Vec::from(chunk);
+            self.transfer(block + (index * 128) as u64, &mut write_data, true)
                 .map_err(map_sdhci_error)?;
         }
         Ok(())
@@ -782,6 +902,64 @@ impl<I: SdhciIo> crate::BlockDriverOps for SdhciDisk<I> {
 
     fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    fn block_capabilities(&self) -> crate::BlockCapabilities {
+        crate::BlockCapabilities {
+            flush: true,
+            discard: self.erase_group_sectors != 0,
+            ..crate::BlockCapabilities::default()
+        }
+    }
+
+    // upstream: mmcsd.c mmcsd_delete() + mmc.c mmc_sd_erase()
+    fn discard_blocks(&mut self, range: crate::BlockRange) -> crate::DevResult {
+        if self.read_only {
+            return Err(crate::DevError::Unsupported);
+        }
+        if range.blocks == 0
+            || !range
+                .start
+                .is_multiple_of(u64::from(self.erase_group_sectors))
+            || !range
+                .blocks
+                .is_multiple_of(u64::from(self.erase_group_sectors))
+            || !(crate::BlockGeometry {
+                block_size: 512,
+                blocks: self.sectors,
+            })
+            .contains(range)
+        {
+            return Err(crate::DevError::InvalidParam);
+        }
+        let end = range
+            .start
+            .checked_add(range.blocks)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or(crate::DevError::InvalidParam)?;
+        self.host
+            .command(
+                SD_CMD_ERASE_START,
+                self.card_address(range.start).map_err(map_sdhci_error)?,
+                SD_R1,
+                None,
+                0,
+            )
+            .map_err(map_sdhci_error)?;
+        self.host
+            .command(
+                SD_CMD_ERASE_END,
+                self.card_address(end).map_err(map_sdhci_error)?,
+                SD_R1,
+                None,
+                0,
+            )
+            .map_err(map_sdhci_error)?;
+        self.host
+            .command(SD_CMD_ERASE, 0, SD_R1B, None, 0)
+            .map_err(map_sdhci_error)?;
+        self.host.wait_busy().map_err(map_sdhci_error)?;
+        self.wait_ready().map_err(map_sdhci_error)
     }
 }
 
@@ -814,6 +992,9 @@ mod tests {
         registers: [u32; 64],
         command: u16,
         argument: u32,
+        block_count: u16,
+        transfer_mode: u16,
+        data_blocks: u16,
     }
 
     impl Default for MockIo {
@@ -822,6 +1003,9 @@ mod tests {
                 registers: [0; 64],
                 command: 0,
                 argument: 0,
+                block_count: 0,
+                transfer_mode: 0,
+                data_blocks: 0,
             }
         }
     }
@@ -838,7 +1022,15 @@ mod tests {
         }
         fn read32(&mut self, offset: usize) -> u32 {
             if offset == SDHCI_INT_STATUS as usize {
-                return self.registers[offset / 4];
+                let mut status = self.registers[offset / 4];
+                if self.data_blocks != 0 {
+                    status |= SDHCI_INT_DATA_AVAIL;
+                } else if self.transfer_mode & SDHCI_TRNS_BLK_CNT_EN as u16 != 0
+                    && self.block_count != 0
+                {
+                    status |= SDHCI_INT_DATA_END;
+                }
+                return status;
             }
             self.registers[offset / 4]
         }
@@ -853,8 +1045,17 @@ mod tests {
         fn write16(&mut self, offset: usize, value: u16) {
             if offset == SDHCI_COMMAND_FLAGS as usize {
                 self.command = value;
+                if value & (SDHCI_CMD_DATA as u16) != 0 {
+                    self.data_blocks = self.block_count;
+                }
                 self.registers[SDHCI_INT_STATUS as usize / 4] = SDHCI_INT_RESPONSE;
                 return;
+            }
+            if offset == SDHCI_BLOCK_COUNT as usize {
+                self.block_count = value;
+            }
+            if offset == SDHCI_TRANSFER_MODE as usize {
+                self.transfer_mode = value;
             }
             if offset == SDHCI_ARGUMENT as usize {
                 self.argument = u32::from(value);
@@ -866,6 +1067,9 @@ mod tests {
         fn write32(&mut self, offset: usize, value: u32) {
             if offset == SDHCI_INT_STATUS as usize {
                 self.registers[offset / 4] &= !value;
+                if value & SDHCI_INT_DATA_AVAIL != 0 && self.data_blocks != 0 {
+                    self.data_blocks -= 1;
+                }
             } else if offset == SDHCI_ARGUMENT as usize {
                 self.argument = value;
             } else {
@@ -920,6 +1124,29 @@ mod tests {
     }
 
     #[test]
+    fn multiblock_read_sets_count_mode_and_consumes_each_pio_block() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        io.registers[SDHCI_RESPONSE as usize / 4] = 0xfeed_beef;
+        let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        let mut blocks = [0u8; 1024];
+        host.command(
+            SD_CMD_READ_MULTIPLE,
+            4,
+            SD_R1 | SD_DATA,
+            Some(&mut blocks),
+            512,
+        )
+        .unwrap();
+        assert_eq!(host.io_mut().block_count, 2);
+        assert_eq!(
+            host.io_mut().transfer_mode,
+            (SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI | SDHCI_TRNS_READ) as u16
+        );
+        assert_eq!(host.io_mut().data_blocks, 0);
+    }
+
+    #[test]
     fn read_only_card_rejects_write_before_issuing_a_command() {
         let host = SdhciHost::new(MockIo::default(), 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
         let mut disk = SdhciDisk {
@@ -927,6 +1154,7 @@ mod tests {
             rca: 1,
             sectors: 16,
             high_capacity: true,
+            erase_group_sectors: 1,
             read_only: true,
         };
         assert!(crate::BlockDriverOps::is_read_only(&disk));

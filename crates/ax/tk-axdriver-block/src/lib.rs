@@ -3,6 +3,8 @@
 #![no_std]
 #![cfg_attr(doc, feature(doc_cfg))]
 
+extern crate alloc;
+
 #[cfg(feature = "ramdisk")]
 pub mod ramdisk;
 
