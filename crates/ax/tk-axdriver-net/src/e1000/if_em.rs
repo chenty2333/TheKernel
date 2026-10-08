@@ -2498,6 +2498,15 @@ pub fn em_if_update_admin_status<O: EmAdminOps>(
     Ok(())
 }
 
+/// upstream: if_em.c em_if_timer()
+pub fn em_if_timer<O: EmAdminOps>(ops: &mut O, state: &mut EmAdminStatus, queue: u16) {
+    if queue != 0 {
+        return;
+    }
+    state.stats_pending = true;
+    ops.defer_admin();
+}
+
 pub trait EmRxUnitOps {
     fn initialize_rss(&mut self) -> DevResult;
     fn initialize_advanced_rx_rings(&mut self, drop: bool) -> DevResult;
@@ -4295,5 +4304,17 @@ mod tests {
         assert_eq!(state.link, EmLinkState::DownResetPending);
         assert_eq!((ops.resets, ops.defers), (1, 1));
         assert_eq!(ops.publications.last(), Some(&(false, 0)));
+    }
+
+    #[test]
+    fn admin_timer_only_schedules_global_stats_queue() {
+        let mut state = EmAdminStatus::default();
+        let mut ops = AdminMock::default();
+        em_if_timer(&mut ops, &mut state, 1);
+        assert!(!state.stats_pending);
+        assert_eq!(ops.defers, 0);
+        em_if_timer(&mut ops, &mut state, 0);
+        assert!(state.stats_pending);
+        assert_eq!(ops.defers, 1);
     }
 }
