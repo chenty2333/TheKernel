@@ -59,6 +59,73 @@ pub struct E1000BusInfo {
     pub function: u8,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowControlMode {
+    None,
+    RxPause,
+    TxPause,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlowControl {
+    pub mode: FlowControlMode,
+    pub low_water: u32,
+    pub high_water: u32,
+    pub pause_time: u32,
+    pub send_xon: bool,
+}
+
+/// upstream: e1000_mac.c e1000_set_fc_watermarks_generic()
+pub fn set_fc_watermarks_generic<I: E1000RegisterIo>(io: &mut I, fc: FlowControl) -> DevResult {
+    let tx_pause = matches!(fc.mode, FlowControlMode::TxPause | FlowControlMode::Full);
+    let (mut low, high) = if tx_pause {
+        (fc.low_water, fc.high_water)
+    } else {
+        (0, 0)
+    };
+    if tx_pause && fc.send_xon {
+        low |= E1000_FCRTL_XONE;
+    }
+    io.write_register(E1000_FCRTL, low)?;
+    io.write_register(E1000_FCRTH, high)?;
+    Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_force_mac_fc_generic()
+pub fn force_mac_fc_generic<I: E1000RegisterIo>(io: &mut I, mode: FlowControlMode) -> DevResult {
+    let mut control = io.read_register(E1000_CTRL)?;
+    match mode {
+        FlowControlMode::None => control &= !(E1000_CTRL_TFCE | E1000_CTRL_RFCE),
+        FlowControlMode::RxPause => {
+            control &= !E1000_CTRL_TFCE;
+            control |= E1000_CTRL_RFCE;
+        }
+        FlowControlMode::TxPause => {
+            control &= !E1000_CTRL_RFCE;
+            control |= E1000_CTRL_TFCE;
+        }
+        FlowControlMode::Full => control |= E1000_CTRL_TFCE | E1000_CTRL_RFCE,
+    }
+    io.write_register(E1000_CTRL, control)
+}
+
+/// upstream: e1000_mac.c e1000_commit_fc_settings_generic()
+pub fn commit_fc_settings_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    mode: FlowControlMode,
+) -> DevResult<u32> {
+    let txcw = E1000_TXCW_ANE
+        | E1000_TXCW_FD
+        | match mode {
+            FlowControlMode::None => 0,
+            FlowControlMode::RxPause | FlowControlMode::Full => E1000_TXCW_PAUSE_MASK,
+            FlowControlMode::TxPause => E1000_TXCW_ASM_DIR,
+        };
+    io.write_register(E1000_TXCW, txcw)?;
+    Ok(txcw)
+}
+
 /// upstream: e1000_mac.c e1000_set_lan_id_multi_port_pcie()
 pub fn set_lan_id_multi_port_pcie<I: E1000RegisterIo>(io: &mut I) -> DevResult<u8> {
     Ok(
@@ -479,6 +546,36 @@ mod tests {
         let mut not_ready = Registers::default();
         assert!(get_auto_rd_done_generic(&mut not_ready).is_err());
         assert_eq!(not_ready.delays, AUTO_READ_DONE_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn generic_flow_control_programming_preserves_mode_bits() {
+        let fc = FlowControl {
+            mode: FlowControlMode::Full,
+            low_water: 0x1230,
+            high_water: 0x4560,
+            pause_time: 0x100,
+            send_xon: true,
+        };
+        let mut io = Registers::default();
+        set_fc_watermarks_generic(&mut io, fc).unwrap();
+        assert_eq!(
+            io.writes,
+            [(E1000_FCRTL, 0x8000_1230), (E1000_FCRTH, 0x4560)]
+        );
+        assert_eq!(
+            commit_fc_settings_generic(&mut io, FlowControlMode::TxPause).unwrap(),
+            E1000_TXCW_ANE | E1000_TXCW_FD | E1000_TXCW_ASM_DIR
+        );
+        force_mac_fc_generic(&mut io, FlowControlMode::Full).unwrap();
+        assert_eq!(
+            io.writes.last(),
+            Some(&(E1000_CTRL, E1000_CTRL_TFCE | E1000_CTRL_RFCE))
+        );
+        assert_eq!(
+            commit_fc_settings_generic(&mut io, FlowControlMode::None).unwrap(),
+            E1000_TXCW_ANE | E1000_TXCW_FD
+        );
     }
 
     #[test]
