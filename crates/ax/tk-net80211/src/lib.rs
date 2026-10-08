@@ -27,12 +27,13 @@ pub use channel::{
 };
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
 pub use node::{
-    ASSOCFAIL_ESSID, ASSOCFAIL_PRIVACY, ASSOCFAIL_WPA_PROTO, AccessPoint, ESS_PSK, ESS_RSN_ON,
-    ESS_WEP_ON, EssSelection, FLAG_AUTO_JOIN, HTOP0_SCO_MASK, HTOP0_SCO_SCA, HTOP0_SCO_SCB,
-    HTOP0_SCO_SCN, HTOP0_SCO_SHIFT, NetworkProfile, PRIVACY, PROTO_RSN, PROTO_WPA, ess_adjust_rssi,
-    ess_calculate_score, ess_is_better, get_ess, match_ess, switch_ess,
-    valid_40mhz_center_frequency, valid_40mhz_secondary_above, valid_40mhz_secondary_below,
-    valid_80mhz_center_frequency,
+    AKM_8021X, AKM_PSK, AKM_SHA256_8021X, AKM_SHA256_PSK, ASSOCFAIL_ESSID, ASSOCFAIL_PRIVACY,
+    ASSOCFAIL_WPA_PROTO, AccessPoint, CIPHER_CCMP, CIPHER_TKIP, ESS_PSK, ESS_RSN_ON, ESS_WEP_ON,
+    EssSelection, FLAG_AUTO_JOIN, HTOP0_SCO_MASK, HTOP0_SCO_SCA, HTOP0_SCO_SCB, HTOP0_SCO_SCN,
+    HTOP0_SCO_SHIFT, LOCAL_CAP_MFP, NetworkProfile, PRIVACY, PROTO_RSN, PROTO_WPA, RSN_CAP_MFPC,
+    check_rssi, choose_rsn_params, ess_adjust_rssi, ess_calculate_score, ess_is_better, get_ess,
+    get_rate, get_rssi, match_ess, switch_ess, valid_40mhz_center_frequency,
+    valid_40mhz_secondary_above, valid_40mhz_secondary_below, valid_80mhz_center_frequency,
 };
 pub use node_caps::{
     HE_FIXED_CAPS_LEN, HE_MAC_CAPS_LEN, HE_MCS_NSS_80_LEN, HE_PHY_CAPS_LEN,

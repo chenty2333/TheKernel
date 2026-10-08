@@ -15,6 +15,14 @@ pub const ASSOCFAIL_PRIVACY: u32 = 0x04;
 pub const ASSOCFAIL_ESSID: u32 = 0x10;
 pub const ASSOCFAIL_WPA_PROTO: u32 = 0x40;
 pub const FLAG_AUTO_JOIN: u32 = 0x1000_0000;
+pub const RSN_CAP_MFPC: u16 = 0x0080;
+pub const LOCAL_CAP_MFP: u32 = 0x0000_2000;
+pub const AKM_8021X: u32 = 0x01;
+pub const AKM_PSK: u32 = 0x02;
+pub const AKM_SHA256_8021X: u32 = 0x04;
+pub const AKM_SHA256_PSK: u32 = 0x08;
+pub const CIPHER_TKIP: u32 = 0x04;
+pub const CIPHER_CCMP: u32 = 0x08;
 pub const HTOP0_SCO_MASK: u8 = 0x03;
 pub const HTOP0_SCO_SHIFT: u8 = 0;
 pub const HTOP0_SCO_SCN: u8 = 0;
@@ -57,6 +65,24 @@ pub struct AccessPoint {
 pub struct EssSelection {
     pub access_point: usize,
     pub profile: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalRsnPolicy {
+    pub protocols: u32,
+    pub akms: u32,
+    pub ciphers: u32,
+    pub flags: u32,
+    pub capabilities: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RsnChoice {
+    pub protocol: u32,
+    pub akm: u32,
+    pub cipher: u32,
+    pub pmkid: Option<[u8; 16]>,
+    pub mfp: bool,
 }
 
 impl AccessPoint {
@@ -237,6 +263,92 @@ pub fn switch_ess(
     }
 }
 
+/// Prefer RSN/SHA-256/CCMP while intersecting local and peer capabilities.
+// upstream: ieee80211_node.c ieee80211_choose_rsnparams()
+pub fn choose_rsn_params(
+    peer_protocols: u32,
+    peer_akms: u32,
+    peer_ciphers: u32,
+    peer_capabilities: u16,
+    local: LocalRsnPolicy,
+    cached_pmkid: Option<[u8; 16]>,
+) -> RsnChoice {
+    let protocols = peer_protocols & local.protocols;
+    let protocol = if protocols & PROTO_RSN != 0 {
+        PROTO_RSN
+    } else {
+        PROTO_WPA
+    };
+    let akms = peer_akms & local.akms;
+    let akm = if local.flags & ESS_PSK != 0 && akms & (AKM_PSK | AKM_SHA256_PSK) != 0 {
+        if akms & AKM_SHA256_PSK != 0 {
+            AKM_SHA256_PSK
+        } else {
+            AKM_PSK
+        }
+    } else if akms & AKM_SHA256_8021X != 0 {
+        AKM_SHA256_8021X
+    } else {
+        AKM_8021X
+    };
+    let ciphers = peer_ciphers & local.ciphers;
+    let cipher = if ciphers & CIPHER_CCMP != 0 {
+        CIPHER_CCMP
+    } else {
+        CIPHER_TKIP
+    };
+    RsnChoice {
+        protocol,
+        akm,
+        cipher,
+        pmkid: if protocol == PROTO_RSN && akm & (AKM_8021X | AKM_SHA256_8021X) != 0 {
+            cached_pmkid
+        } else {
+            None
+        },
+        mfp: local.capabilities & LOCAL_CAP_MFP != 0 && peer_capabilities & RSN_CAP_MFPC != 0,
+    }
+}
+
+/// Return the fixed or negotiated legacy rate without its Basic flag.
+// upstream: ieee80211_node.c ieee80211_get_rate()
+pub fn get_rate(
+    rates: &crate::RateSet,
+    fixed_rate: Option<usize>,
+    interface_running: bool,
+    negotiated_tx_rate: usize,
+) -> u8 {
+    let index = fixed_rate.or_else(|| interface_running.then_some(negotiated_tx_rate));
+    index
+        .and_then(|index| rates.rates.get(index).copied())
+        .unwrap_or(0)
+        & crate::LEGACY_RATE_VALUE
+}
+
+// upstream: ieee80211_node.c ieee80211_node_getrssi()
+pub fn get_rssi(ap: &AccessPoint) -> u8 {
+    ap.rssi
+}
+
+/// Check roaming RSSI using calibrated percentage thresholds or raw defaults.
+// upstream: ieee80211_node.c ieee80211_node_checkrssi()
+pub fn check_rssi(ap: &AccessPoint, channel_valid: bool, max_rssi: u8) -> bool {
+    if !channel_valid {
+        return false;
+    }
+    if max_rssi != 0 {
+        let threshold = if ap.is_2ghz { 60 } else { 50 };
+        u16::from(ap.rssi) * 100 / u16::from(max_rssi) >= threshold
+    } else {
+        let threshold = if ap.is_2ghz {
+            (-60i8) as u8
+        } else {
+            (-70i8) as u8
+        };
+        ap.rssi >= threshold
+    }
+}
+
 // upstream: ieee80211_node.c ieee80211_40mhz_valid_secondary_above()
 pub fn valid_40mhz_secondary_above(primary_channel: u8) -> bool {
     if !((1..=9).contains(&primary_channel) || (36..=157).contains(&primary_channel)) {
@@ -318,6 +430,58 @@ mod tests {
         node.capability_info = PRIVACY;
         assert!(!match_ess(&open, &mut node));
         assert_eq!(node.association_failures, ASSOCFAIL_PRIVACY);
+    }
+
+    #[test]
+    fn reported_rate_and_roaming_rssi_keep_source_defaults() {
+        let rates = crate::RateSet::new(&[0x82, 0x8c, 24]);
+        assert_eq!(get_rate(&rates, Some(1), false, 0), 12);
+        assert_eq!(get_rate(&rates, None, true, 2), 24);
+        assert_eq!(get_rate(&rates, None, false, 2), 0);
+        let two = ap(b"two", false, 59);
+        let five = ap(b"five", true, 50);
+        assert_eq!(get_rssi(&two), 59);
+        assert!(!check_rssi(&two, true, 100));
+        assert!(check_rssi(&two, true, 98));
+        assert!(check_rssi(&five, true, 100));
+        assert!(check_rssi(&ap(b"raw", false, 200), true, 0));
+        assert!(!check_rssi(&two, false, 100));
+    }
+
+    #[test]
+    fn rsn_choice_prefers_stronger_suites_and_reuses_enterprise_pmkid() {
+        let policy = LocalRsnPolicy {
+            protocols: PROTO_RSN | PROTO_WPA,
+            akms: AKM_8021X | AKM_PSK | AKM_SHA256_8021X | AKM_SHA256_PSK,
+            ciphers: CIPHER_TKIP | CIPHER_CCMP,
+            flags: ESS_PSK,
+            capabilities: LOCAL_CAP_MFP,
+        };
+        let psk = choose_rsn_params(
+            PROTO_RSN | PROTO_WPA,
+            AKM_PSK | AKM_SHA256_PSK,
+            CIPHER_TKIP | CIPHER_CCMP,
+            RSN_CAP_MFPC,
+            policy,
+            None,
+        );
+        assert_eq!(psk.protocol, PROTO_RSN);
+        assert_eq!(psk.akm, AKM_SHA256_PSK);
+        assert_eq!(psk.cipher, CIPHER_CCMP);
+        assert!(psk.mfp);
+        assert_eq!(psk.pmkid, None);
+        let pmkid = [0x5a; 16];
+        let enterprise = choose_rsn_params(
+            PROTO_RSN,
+            AKM_8021X | AKM_SHA256_8021X,
+            CIPHER_TKIP,
+            RSN_CAP_MFPC,
+            LocalRsnPolicy { flags: 0, ..policy },
+            Some(pmkid),
+        );
+        assert_eq!(enterprise.akm, AKM_SHA256_8021X);
+        assert_eq!(enterprise.pmkid, Some(pmkid));
+        assert_eq!(enterprise.cipher, CIPHER_TKIP);
     }
 
     #[test]

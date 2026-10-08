@@ -54,3 +54,7 @@ mode resolves from a fixed local choice or the peer's band/ERP state.
 Inline node predicates now determine HT/VHT/HE support from both capability
 presence and usable first-stream MCS masks, and gate SGI and wide-channel
 operation on both peer capabilities and the accepted operation IE.
+RSN policy selection now intersects peer/local suites and applies OpenBSD's
+RSN-over-WPA, SHA-256 AKM, CCMP-over-TKIP preferences, enterprise PMKID reuse
+and MFP intersection. Link-rate/RSSI accessors preserve fixed-rate and band-
+specific roaming thresholds.
