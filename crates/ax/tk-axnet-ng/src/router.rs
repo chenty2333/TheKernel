@@ -904,7 +904,8 @@ impl Router {
 
     pub(crate) fn device_stats(&self) -> Vec<(String, DeviceStats)> {
         self.devices
-            .iter().enumerate()
+            .iter()
+            .enumerate()
             .map(|(slot, device)| (self.links[slot].name.clone(), device.stats()))
             .collect()
     }
@@ -2095,6 +2096,55 @@ mod tests {
         }
     }
 
+    struct WirelessLinkDevice(Arc<Mutex<Vec<bool>>>);
+    impl Device for WirelessLinkDevice {
+        fn name(&self) -> &str {
+            "wlan0"
+        }
+        fn stats(&self) -> DeviceStats {
+            DeviceStats::default()
+        }
+        fn interface_kind(&self) -> crate::device::InterfaceKind {
+            crate::device::InterfaceKind::Ethernet
+        }
+        fn mtu(&self) -> usize {
+            LOOPBACK_MTU
+        }
+        fn initial_link_up(&self) -> bool {
+            false
+        }
+        fn set_link_up(&mut self, up: bool) -> AxResult {
+            self.0.lock().unwrap().push(up);
+            Ok(())
+        }
+        fn rx_wake_required(&self) -> bool {
+            true
+        }
+        fn rx_poll_interval_micros(&self) -> Option<u64> {
+            Some(10_000)
+        }
+        fn recv(
+            &mut self,
+            _context: PacketDeviceContext<'_>,
+            _buffer: &mut IngressPacketBuffer,
+            _timestamp: Instant,
+        ) -> RxStep {
+            RxStep::Idle
+        }
+        fn send(
+            &mut self,
+            _context: PacketDeviceContext<'_>,
+            _next_hop: IpAddress,
+            _packet: &[u8],
+            _timestamp: Instant,
+        ) -> bool {
+            false
+        }
+        fn register_waker(&self, _: &Waker) -> Result<(), axpoll::PollRegistrationError> {
+            Ok(())
+        }
+    }
+
     fn router_with_devices(devices: impl IntoIterator<Item = Box<dyn Device>>) -> Router {
         let listen_table = Arc::new(ListenTable::try_new().unwrap());
         let mut router = Router::try_new_loopback_only(listen_table).unwrap();
@@ -2176,6 +2226,19 @@ mod tests {
         // Ethernet-shaped interfaces.
         let (software, _) = FakeDevice::new("software", core::iter::empty());
         assert_eq!(router.try_add_device(Box::new(software)), Ok(1));
+    }
+
+    #[test]
+    fn wireless_link_starts_down_and_applies_only_admin_transitions() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut router =
+            router_with_devices([Box::new(WirelessLinkDevice(events.clone())) as Box<dyn Device>]);
+        assert!(!router.interfaces()[0].administrative_up);
+        router.configure_link(1, None, None, Some(true)).unwrap();
+        router.configure_link(1, None, None, Some(true)).unwrap();
+        assert!(router.interfaces()[0].administrative_up);
+        router.configure_link(1, None, None, Some(false)).unwrap();
+        assert_eq!(*events.lock().unwrap(), [true, false]);
     }
 
     #[test]

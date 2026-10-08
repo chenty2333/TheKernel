@@ -7,6 +7,8 @@
 //! (C) 2018-2026 Intel Corporation. The complete grant is retained in
 //! `kernel/LICENSES/ISC.txt`.
 
+use alloc::format;
+
 use super::*;
 
 pub(super) const FAMILY_ID: u16 = 0x12;
@@ -15,12 +17,18 @@ const FAMILY_VERSION: u8 = 1;
 const FAMILY_MAX_ATTRIBUTE: u32 = 366;
 
 pub(super) const CMD_GET_WIPHY: u8 = 1;
+const CMD_NEW_WIPHY: u8 = 3;
 pub(super) const CMD_GET_INTERFACE: u8 = 5;
+const CMD_NEW_INTERFACE: u8 = 7;
 const ATTR_WIPHY: u16 = 1;
 const ATTR_WIPHY_NAME: u16 = 2;
 const ATTR_IFINDEX: u16 = 3;
 const ATTR_IFNAME: u16 = 4;
+const ATTR_IFTYPE: u16 = 5;
+const ATTR_MAC: u16 = 6;
+const ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
+const IFTYPE_STATION: u16 = 2;
 const NLM_F_DUMP: u16 = 0x0300;
 
 const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
@@ -89,20 +97,52 @@ pub(super) fn handle(
     if !matches!(request.cmd, CMD_GET_WIPHY | CMD_GET_INTERFACE) {
         return Err(AxError::OperationNotSupported);
     }
-    validate_selectors(&payload[size_of::<GenlMsgHdr>()..])?;
+    let selectors = parse_selectors(&payload[size_of::<GenlMsgHdr>()..])?;
     let dump = header.nlmsg_flags & NLM_F_DUMP != 0;
     let interfaces = axnet::wireless_interfaces();
-    if !interfaces.is_empty() {
-        // Do not advertise an empty radio once a WLAN adapter is registered;
-        // concrete wiphy and interface records are added with the command
-        // handlers rather than fabricated from the PCI match alone.
-        return Err(AxError::OperationNotSupported);
+    let port_id = permit.port_id();
+    let mut records = Vec::new();
+    match request.cmd {
+        CMD_GET_INTERFACE => {
+            for interface in interfaces.iter().filter(|interface| {
+                selectors
+                    .ifindex
+                    .is_none_or(|ifindex| interface.ifindex == ifindex)
+                    && selectors
+                        .ifname
+                        .as_deref()
+                        .is_none_or(|name| interface.name == name)
+            }) {
+                records.push(interface_message(header, port_id, interface, dump));
+            }
+        }
+        CMD_GET_WIPHY => {
+            let mut written_phys = alloc::collections::BTreeSet::new();
+            for interface in interfaces.iter().filter(|interface| {
+                selectors
+                    .wiphy
+                    .is_none_or(|wiphy| interface.phy_index == wiphy)
+                    && selectors
+                        .wiphy_name
+                        .as_deref()
+                        .is_none_or(|name| format!("phy{}", interface.phy_index) == name)
+            }) {
+                if written_phys.insert(interface.phy_index) {
+                    records.push(wiphy_message(header, port_id, interface, dump));
+                }
+            }
+        }
+        _ => unreachable!(),
     }
-    if !dump {
+    if records.is_empty() && !dump {
         return Err(AxError::NotFound);
     }
-    let port_id = permit.port_id();
-    socket.enqueue_kernel_permitted(permit, empty_dump_response(header, port_id));
+    for record in records {
+        socket.enqueue_kernel_permitted(permit, record);
+    }
+    if dump {
+        socket.enqueue_kernel_permitted(permit, empty_dump_response(header, port_id));
+    }
     Ok(())
 }
 
@@ -110,33 +150,107 @@ fn empty_dump_response(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
     wiremsg::done_message(request, port_id)
 }
 
-fn validate_selectors(attributes: &[u8]) -> AxResult {
-    let mut seen_wiphy = false;
-    let mut seen_ifindex = false;
-    let mut seen_wiphy_name = false;
-    let mut seen_ifname = false;
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Selectors {
+    wiphy: Option<u32>,
+    ifindex: Option<u32>,
+    wiphy_name: Option<String>,
+    ifname: Option<String>,
+}
+
+fn parse_selectors(attributes: &[u8]) -> AxResult<Selectors> {
+    let mut selectors = Selectors::default();
     for_each_rtattr(attributes, |kind, value| match kind {
-        ATTR_WIPHY if !seen_wiphy && value.len() == 4 => {
-            seen_wiphy = true;
+        ATTR_WIPHY if selectors.wiphy.is_none() && value.len() == 4 => {
+            selectors.wiphy = Some(u32::from_ne_bytes(value.try_into().unwrap()));
             Ok(())
         }
-        ATTR_IFINDEX if !seen_ifindex && value.len() == 4 => {
-            seen_ifindex = true;
+        ATTR_IFINDEX if selectors.ifindex.is_none() && value.len() == 4 => {
+            selectors.ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
             Ok(())
         }
-        ATTR_WIPHY_NAME if !seen_wiphy_name => {
-            let _ = decode_link_name(value)?;
-            seen_wiphy_name = true;
+        ATTR_WIPHY_NAME if selectors.wiphy_name.is_none() => {
+            selectors.wiphy_name = Some(decode_link_name(value)?);
             Ok(())
         }
-        ATTR_IFNAME if !seen_ifname => {
-            let _ = decode_link_name(value)?;
-            seen_ifname = true;
+        ATTR_IFNAME if selectors.ifname.is_none() => {
+            selectors.ifname = Some(decode_link_name(value)?);
             Ok(())
         }
         ATTR_SPLIT_WIPHY_DUMP if value.is_empty() => Ok(()),
         _ => Err(AxError::InvalidInput),
-    })
+    })?;
+    Ok(selectors)
+}
+
+fn interface_message(
+    request: &NlMsgHdr,
+    port_id: u32,
+    interface: &axnet::WirelessInterfaceInfo,
+    multipart: bool,
+) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: CMD_NEW_INTERFACE,
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr(&mut payload, ATTR_WIPHY, &interface.phy_index.to_ne_bytes());
+    push_attr(&mut payload, ATTR_IFINDEX, &interface.ifindex.to_ne_bytes());
+    push_attr_string(&mut payload, ATTR_IFNAME, &interface.name);
+    push_attr(&mut payload, ATTR_IFTYPE, &IFTYPE_STATION.to_ne_bytes());
+    push_attr(&mut payload, ATTR_MAC, &interface.mac_address);
+    nl80211_message(request, port_id, FAMILY_ID, payload, multipart)
+}
+
+fn wiphy_message(
+    request: &NlMsgHdr,
+    port_id: u32,
+    interface: &axnet::WirelessInterfaceInfo,
+    multipart: bool,
+) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: CMD_NEW_WIPHY,
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr(&mut payload, ATTR_WIPHY, &interface.phy_index.to_ne_bytes());
+    push_attr_string(
+        &mut payload,
+        ATTR_WIPHY_NAME,
+        &format!("phy{}", interface.phy_index),
+    );
+    let mut interface_types = Vec::new();
+    push_attr(&mut interface_types, IFTYPE_STATION, &[]);
+    push_attr(
+        &mut payload,
+        ATTR_SUPPORTED_IFTYPES | NLA_F_NESTED,
+        &interface_types,
+    );
+    nl80211_message(request, port_id, FAMILY_ID, payload, multipart)
+}
+
+fn nl80211_message(
+    request: &NlMsgHdr,
+    port_id: u32,
+    family: u16,
+    mut payload: Vec<u8>,
+    multipart: bool,
+) -> Vec<u8> {
+    let header_len = size_of::<NlMsgHdr>();
+    let mut message = vec![0; header_len];
+    message.append(&mut payload);
+    let message_len = message.len() as u32;
+    write_struct(
+        &mut message[..header_len],
+        &NlMsgHdr {
+            nlmsg_len: message_len,
+            nlmsg_type: family,
+            nlmsg_flags: if multipart { NLM_F_MULTI } else { 0 },
+            nlmsg_seq: request.nlmsg_seq,
+            nlmsg_pid: port_id,
+        },
+    );
+    message
 }
 
 #[cfg(test)]
@@ -228,14 +342,70 @@ mod tests {
     }
 
     #[test]
+    fn registered_interface_and_wiphy_records_match_uapi_attribute_layout() {
+        let request = NlMsgHdr {
+            nlmsg_len: size_of::<NlMsgHdr>() as u32,
+            nlmsg_type: FAMILY_ID,
+            nlmsg_flags: 0,
+            nlmsg_seq: 4,
+            nlmsg_pid: 8,
+        };
+        let interface = axnet::WirelessInterfaceInfo {
+            name: "wlan0".into(),
+            ifindex: 9,
+            phy_index: 2,
+            mac_address: [2, 0, 0, 0, 0, 9],
+            soft_blocked: false,
+            hard_blocked: false,
+        };
+        let message = interface_message(&request, 8, &interface, false);
+        let header = read_unaligned::<NlMsgHdr>(&message).unwrap();
+        assert_eq!(header.nlmsg_type, FAMILY_ID);
+        assert_eq!(header.nlmsg_flags, 0);
+        let generic = size_of::<NlMsgHdr>();
+        assert_eq!(message[generic], CMD_NEW_INTERFACE);
+        let attrs = &message[generic + size_of::<GenlMsgHdr>()..];
+        let mut ifindex = None;
+        let mut ifname = None;
+        let mut iftype = None;
+        for_each_rtattr(attrs, |kind, value| match kind {
+            ATTR_IFINDEX => {
+                ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+                Ok(())
+            }
+            ATTR_IFNAME => {
+                ifname = Some(decode_link_name(value)?);
+                Ok(())
+            }
+            ATTR_IFTYPE => {
+                iftype = Some(u16::from_ne_bytes(value.try_into().unwrap()));
+                Ok(())
+            }
+            _ => Ok(()),
+        })
+        .unwrap();
+        assert_eq!(ifindex, Some(9));
+        assert_eq!(ifname.as_deref(), Some("wlan0"));
+        assert_eq!(iftype, Some(IFTYPE_STATION));
+
+        let message = wiphy_message(&request, 8, &interface, true);
+        let generic = size_of::<NlMsgHdr>();
+        assert_eq!(message[generic], CMD_NEW_WIPHY);
+        assert_ne!(
+            read_unaligned::<NlMsgHdr>(&message).unwrap().nlmsg_flags & NLM_F_MULTI,
+            0
+        );
+    }
+
+    #[test]
     fn selectors_reject_truncation_duplicates_and_malformed_names() {
         let mut attrs = Vec::new();
         push_attr(&mut attrs, ATTR_IFINDEX, &7u32.to_ne_bytes());
-        assert!(validate_selectors(&attrs).is_ok());
+        assert_eq!(parse_selectors(&attrs).unwrap().ifindex, Some(7));
         push_attr(&mut attrs, ATTR_IFINDEX, &8u32.to_ne_bytes());
-        assert_eq!(validate_selectors(&attrs), Err(AxError::InvalidInput));
+        assert_eq!(parse_selectors(&attrs), Err(AxError::InvalidInput));
         let mut bad_name = Vec::new();
         push_attr(&mut bad_name, ATTR_IFNAME, b"wlan0");
-        assert_eq!(validate_selectors(&bad_name), Err(AxError::InvalidInput));
+        assert_eq!(parse_selectors(&bad_name), Err(AxError::InvalidInput));
     }
 }

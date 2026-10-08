@@ -458,6 +458,96 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         Ok(())
     }
 
+    /// Enable one scheduler TX queue and publish it only after firmware ACK.
+    pub fn enable_tx_queue(
+        &mut self,
+        config: crate::QueueConfig,
+        command_version: u8,
+    ) -> Result<(), crate::TxQueueError<SyncCommandError<core::convert::Infallible>>> {
+        let queue_index = usize::from(config.queue_id);
+        if queue_index >= 32 {
+            return Err(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidQueueId,
+            ));
+        }
+        let (write_pointer, slot) =
+            {
+                let ring = self.resources.tx_queues.get_mut(queue_index).ok_or(
+                    crate::TxQueueError::Queue(crate::QueueError::InvalidQueueId),
+                )?;
+                ring.reset()
+                    .map_err(|error| crate::TxQueueError::Queue(crate::QueueError::Ring(error)))?;
+                if ring.queue_id != u16::from(config.queue_id) {
+                    return Err(crate::TxQueueError::Queue(
+                        crate::QueueError::InvalidQueueId,
+                    ));
+                }
+                (ring.current_hardware as u16, ring.current as u8)
+            };
+        let command = crate::scheduler_queue_command(command_version, config, true, slot)
+            .map_err(crate::TxQueueError::Queue)?;
+        let response = self
+            .send_encoded_command_wait(&command, None, |_, _| {
+                Ok::<_, core::convert::Infallible>(true)
+            })
+            .map_err(crate::TxQueueError::Send)?
+            .response
+            .ok_or(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidResponse,
+            ))?;
+        crate::validate_enable_response(&response, config.queue_id, write_pointer)
+            .map_err(crate::TxQueueError::Queue)?;
+        self.tx_queue_state.enabled_mask |= 1 << queue_index;
+        self.tx_queue_state.tid[queue_index] = config.tid;
+        Ok(())
+    }
+
+    /// Disable one scheduler TX queue, then reset its retained descriptor state.
+    pub fn disable_tx_queue(
+        &mut self,
+        config: crate::QueueConfig,
+        command_version: u8,
+    ) -> Result<bool, crate::TxQueueError<SyncCommandError<core::convert::Infallible>>> {
+        if command_version == 0 || command_version == crate::QUEUE_CMD_VERSION_UNKNOWN {
+            return Ok(false);
+        }
+        let queue_index = usize::from(config.queue_id);
+        let ring = self
+            .resources
+            .tx_queues
+            .get(queue_index)
+            .ok_or(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidQueueId,
+            ))?;
+        if ring.queue_id != u16::from(config.queue_id) {
+            return Err(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidQueueId,
+            ));
+        }
+        let command =
+            crate::scheduler_queue_command(command_version, config, false, ring.current as u8)
+                .map_err(crate::TxQueueError::Queue)?;
+        let response = self
+            .send_encoded_command_wait(&command, None, |_, _| {
+                Ok::<_, core::convert::Infallible>(true)
+            })
+            .map_err(crate::TxQueueError::Send)?
+            .response
+            .ok_or(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidResponse,
+            ))?;
+        if response.len() < 8 {
+            return Err(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidResponse,
+            ));
+        }
+        self.tx_queue_state.enabled_mask &= !(1 << queue_index);
+        self.resources.tx_queues[queue_index]
+            .reset()
+            .map_err(|error| crate::TxQueueError::Queue(crate::QueueError::Ring(error)))?;
+        Ok(true)
+    }
+
     /// Remove the management queue only when legacy firmware requires explicit removal.
     // upstream: if_iwx.c iwx_disable_mgmt_queue()
     pub fn disable_management_queue(

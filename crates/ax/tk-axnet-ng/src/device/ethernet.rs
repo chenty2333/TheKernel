@@ -662,8 +662,12 @@ impl Device for EthernetDevice {
     }
 
     fn rx_poll_interval_micros(&self) -> Option<u64> {
-        if self.quarantined { None } else {
-            self.inner.rx_poll_interval_micros().or_else(|| self.irq.is_none().then_some(10_000))
+        if self.quarantined {
+            None
+        } else {
+            self.inner
+                .rx_poll_interval_micros()
+                .or_else(|| self.irq.is_none().then_some(10_000))
         }
     }
 
