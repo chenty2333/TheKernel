@@ -135,7 +135,8 @@ strap/OTP MAC and NVM_GET_INFO response, then masks device interrupts and stops
 the NIC as OpenBSD's preinit path does. PCI INTx is disabled while this
 synchronous polling adapter is used. Controller stop now resets RX/TX rings,
 clears held NIC access, stops/resets the APM, restores RF-kill routing, and
-re-prepares the card after NVM read. The normal runtime ucode/PNVM sequence,
+re-prepares the card after NVM read. PCIe Link Control and Device Control 2
+populate the APM L0s/LTR state used by later power policy. The normal runtime ucode/PNVM sequence,
 including regular ucode, PNVM doorbell completion, and post-ALIVE setup, is
 exposed in source order on the controller but is not yet called by an if-up
 hook. The installed runtime interrupt worker and wlan0 publication remain

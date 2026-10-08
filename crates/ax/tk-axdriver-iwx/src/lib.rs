@@ -63,8 +63,8 @@ pub use alive::{
     parse_alive,
 };
 pub use apm::{
-    ApmError, apm_init, apm_stop, clear_persistence_bit, force_power_gating, prepare_card_hw,
-    set_hw_ready, software_reset, start_hardware,
+    ApmError, ApmPcieFeatures, apm_init, apm_stop, clear_persistence_bit, configure_apm_pcie,
+    force_power_gating, prepare_card_hw, set_hw_ready, software_reset, start_hardware,
 };
 pub use attach::{
     AttachAllocationError, AttachAllocationStage, ICT_ALIGNMENT, ICT_BYTES, IwxAttachResources,

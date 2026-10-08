@@ -230,19 +230,42 @@ fn pci_match_decision(vendor_id: u16, device_id: u16, rf_id: Option<u32>) -> boo
     })
 }
 
+fn pcie_power_registers(root: &PciRoot, bdf: DeviceFunction) -> (u16, u16) {
+    let Some(capability) = root
+        .capabilities(bdf)
+        .take(48)
+        .find(|capability| capability.id == 0x10)
+    else {
+        return (0, 0);
+    };
+    let link_control = capability
+        .offset
+        .checked_add(0x10)
+        .and_then(|offset| root.read_config_dword(bdf, offset))
+        .map_or(0, |value| value as u16);
+    let device_control2 = capability
+        .offset
+        .checked_add(0x28)
+        .and_then(|offset| root.read_config_dword(bdf, offset))
+        .map_or(0, |value| value as u16);
+    (link_control, device_control2)
+}
+
 fn allocate_resources(
     bdf: DeviceFunction,
     profile: AttachProfile,
     bar_base: usize,
     bar_size: usize,
     hardware_revision: u32,
+    pcie_link_control: u16,
+    pcie_device_control2: u16,
 ) -> Result<(), AttachAllocationError> {
     let key = Bdf(bdf.bus, bdf.device, bdf.function);
     let mut attached = ATTACHED_DMA.lock();
     if attached.iter().any(|entry| entry.bdf == key) {
         return Ok(());
     }
-    let controller = IwxController::attach(
+    let mut controller = IwxController::attach(
         MmioCsrAccess {
             base: bar_base,
             size: bar_size,
@@ -252,6 +275,7 @@ fn allocate_resources(
         profile.umac_prph_offset,
         0,
     )?;
+    controller.set_pcie_power_registers(pcie_link_control, pcie_device_control2);
     attached.try_reserve(1).map_err(|_| {
         AttachAllocationError::Allocation(
             axdriver_iwx::AttachAllocationStage::ContextInfo,
@@ -646,9 +670,16 @@ pub(crate) fn probe(
                 warn!("iwx: {bdf}: could not enable PCI memory/bus-master command bits");
                 return BusProbeResult::Claimed;
             }
-            if let Err(error) =
-                allocate_resources(bdf, profile, base, bar.1 as usize, hardware_revision)
-            {
+            let (link_control, device_control2) = pcie_power_registers(root, bdf);
+            if let Err(error) = allocate_resources(
+                bdf,
+                profile,
+                base,
+                bar.1 as usize,
+                hardware_revision,
+                link_control,
+                device_control2,
+            ) {
                 warn!("iwx: {bdf}: attach DMA allocation failed: {error:?}");
                 return BusProbeResult::Claimed;
             }

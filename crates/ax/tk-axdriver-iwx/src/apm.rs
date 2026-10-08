@@ -46,6 +46,28 @@ const HPM_DEBUG: u32 = 0x00a0_3440;
 const HPM_PERSISTENCE_BIT: u32 = 1 << 12;
 const PREG_PRPH_WPROT_22000: u32 = 0x00a0_4d00;
 const PREG_WFPM_ACCESS: u32 = 1 << 12;
+const PCIE_LCSR_ASPM_L0S: u16 = 0x0001;
+const PCIE_DCSR2_LTR_ENABLE: u16 = 0x0400;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApmPcieFeatures {
+    pub power_management_supported: bool,
+    pub ltr_enabled: bool,
+}
+
+/// Disable unstable L0s and decode PCIe ASPM/LTR support for later power policy.
+// upstream: if_iwx.c iwx_apm_config()
+pub fn configure_apm_pcie<B: CsrAccess>(
+    registers: &mut IwxRegisters<B>,
+    link_control: u16,
+    device_control2: u16,
+) -> ApmPcieFeatures {
+    registers.set_csr_bits(CSR_GIO_REG, GIO_L0S_DISABLED);
+    ApmPcieFeatures {
+        power_management_supported: link_control & PCIE_LCSR_ASPM_L0S == 0,
+        ltr_enabled: device_control2 & PCIE_DCSR2_LTR_ENABLE != 0,
+    }
+}
 
 /// A power-sequence operation failed before the device could be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,5 +363,19 @@ mod tests {
         let mut regs = IwxRegisters::new(bus, DeviceFamily::Family22000, 0);
         clear_persistence_bit(&mut regs).unwrap();
         assert_eq!(regs.into_inner().prph[&hpm_addr], 0xa5a5_a5a0);
+    }
+
+    #[test]
+    fn apm_pcie_config_disables_l0s_and_decodes_aspm_ltr_flags() {
+        let mut registers = IwxRegisters::new(Bus::default(), DeviceFamily::Ax210, 0);
+        let features = configure_apm_pcie(&mut registers, 1, PCIE_DCSR2_LTR_ENABLE);
+        assert_eq!(
+            features,
+            ApmPcieFeatures {
+                power_management_supported: false,
+                ltr_enabled: true,
+            }
+        );
+        assert_eq!(registers.into_inner().regs[&CSR_GIO_REG], GIO_L0S_DISABLED);
     }
 }

@@ -57,3 +57,4 @@
 - RX_MPDU now has generation-specific descriptor decode, padding/A-MSDU repair, CCMP hardware-status/replay checks, duplicate tracking, and BAID/TID reorder/NSSN release; controller owns and routes these states for caller delivery.
 - Controller `iwx_stop_device()` now resets RX/TX rings, force-clears NIC access, stops/resets APM, restores RF-kill cause routing, re-prepares the card, and retires PNVM DMA; rootfs Init/NVM path uses it.
 - Firmware/NVM antenna intersections now derive source HT/VHT MCS/STBC caps; PHY context standard/UHB v3/v4 encoders have distinct source-matched helpers. Reorder release framing is split into its own OpenBSD function mapping.
+- PCIe capability Link Control and Device Control 2 are retained from config space and applied by the controller's source APM-config adapter to disable L0s and record ASPM/LTR support.

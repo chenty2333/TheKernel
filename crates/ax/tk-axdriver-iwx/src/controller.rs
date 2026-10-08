@@ -76,6 +76,9 @@ pub struct IwxController<B: CsrAccess, A: DmaAllocator> {
     pub rx_replay_windows: [crate::CcmpReplayWindow; 9],
     pub rx_duplicates: RxDuplicateState,
     pub rx_ba_sessions: RxBaTable<ProcessedRxMpdu>,
+    pub pcie_link_control: u16,
+    pub pcie_device_control2: u16,
+    pub pcie_features: crate::ApmPcieFeatures,
     pub generation: u32,
     pub hardware_rfkill: bool,
 }
@@ -102,6 +105,12 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             rx_replay_windows: [crate::CcmpReplayWindow::new(); 9],
             rx_duplicates: RxDuplicateState::new(),
             rx_ba_sessions: RxBaTable::default(),
+            pcie_link_control: 0,
+            pcie_device_control2: 0,
+            pcie_features: crate::ApmPcieFeatures {
+                power_management_supported: true,
+                ltr_enabled: false,
+            },
             generation,
             hardware_rfkill: false,
         })
@@ -115,6 +124,11 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             &mut self.interrupt_masks,
             integrated_22000,
         )?;
+        self.pcie_features = crate::configure_apm_pcie(
+            &mut self.registers,
+            self.pcie_link_control,
+            self.pcie_device_control2,
+        );
         Ok(self.hardware_rfkill)
     }
 
@@ -149,7 +163,18 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         firmware_phy_config: u32,
         hardware_revision: u32,
     ) -> Result<(), ApmError> {
+        self.pcie_features = crate::configure_apm_pcie(
+            &mut self.registers,
+            self.pcie_link_control,
+            self.pcie_device_control2,
+        );
         crate::initialize_nic(&mut self.registers, firmware_phy_config, hardware_revision)
+    }
+
+    /// Store the PCIe Link Control and Device Control 2 words read by the PCI adapter.
+    pub fn set_pcie_power_registers(&mut self, link_control: u16, device_control2: u16) {
+        self.pcie_link_control = link_control;
+        self.pcie_device_control2 = device_control2;
     }
 
     /// Submit host commands through the attached command ring and HBUS doorbell.
