@@ -220,6 +220,30 @@ impl<T: UsbTransport> Adapter<T> {
     pub fn read_acl(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         self.transport.read_bulk_acl(out)
     }
+    // upstream: iwmbt_hw.c iwmbt_hci_command()
+    /// Send an HCI command and read its matching Command Complete event. This
+    /// is used by the Intel boot-time firmware query sequence.
+    pub fn command_complete(&mut self, command: &[u8], event: &mut [u8]) -> Result<usize, Error> {
+        let parsed = Packet::parse(PacketType::Command, command)?;
+        if !self.up {
+            return Err(Error::NotUp);
+        }
+        let opcode = u16::from_le_bytes([parsed.payload[0], parsed.payload[1]]);
+        self.transport.control_command(command)?;
+        let length = self.transport.read_interrupt_event(event)?;
+        if length > event.len() {
+            return Err(Error::InvalidLength);
+        }
+        let received = Packet::parse(PacketType::Event, &event[..length])?;
+        if received.payload[0] != 0x0e || length < 5 {
+            return Err(Error::InvalidLength);
+        }
+        let completed = u16::from_le_bytes([received.payload[3], received.payload[4]]);
+        if completed != opcode {
+            return Err(Error::Unsupported);
+        }
+        Ok(length)
+    }
     pub fn into_transport(self) -> T {
         self.transport
     }
@@ -262,8 +286,13 @@ mod tests {
             self.acl += 1;
             Ok(())
         }
-        fn read_interrupt_event(&mut self, _: &mut [u8]) -> Result<usize, Error> {
-            Ok(0)
+        fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+            let event = [0x0e, 4, 1, 1, 0x10, 0];
+            if out.len() < event.len() {
+                return Err(Error::InvalidLength);
+            }
+            out[..event.len()].copy_from_slice(&event);
+            Ok(event.len())
         }
         fn read_bulk_acl(&mut self, _: &mut [u8]) -> Result<usize, Error> {
             Ok(0)
@@ -400,5 +429,22 @@ mod tests {
             }]
         );
         assert_eq!(parse_patch(&[1, 0x01]), Err(FirmwareError::InvalidPatch));
+    }
+
+    #[test]
+    fn intel_hci_command_waits_for_matching_command_complete() {
+        let mut adapter = Adapter::new(
+            Fake {
+                stopped: false,
+                commands: 0,
+                acl: 0,
+            },
+            0,
+        );
+        adapter.open(Channel::User).unwrap();
+        adapter.set_up(true).unwrap();
+        let mut event = [0; 16];
+        assert_eq!(adapter.command_complete(&[1, 0x10, 0], &mut event), Ok(6));
+        assert_eq!(&event[..6], &[0x0e, 4, 1, 1, 0x10, 0]);
     }
 }
