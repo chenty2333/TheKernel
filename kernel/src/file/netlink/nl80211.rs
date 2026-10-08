@@ -20,6 +20,8 @@ pub(super) const CMD_GET_WIPHY: u8 = 1;
 const CMD_NEW_WIPHY: u8 = 3;
 pub(super) const CMD_GET_INTERFACE: u8 = 5;
 const CMD_NEW_INTERFACE: u8 = 7;
+const CMD_GET_SCAN: u8 = 32;
+const CMD_GET_REG: u8 = 31;
 const ATTR_WIPHY: u16 = 1;
 const ATTR_WIPHY_NAME: u16 = 2;
 const ATTR_IFINDEX: u16 = 3;
@@ -28,6 +30,7 @@ const ATTR_IFTYPE: u16 = 5;
 const ATTR_MAC: u16 = 6;
 const ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
+const ATTR_REG_ALPHA2: u16 = 33;
 const IFTYPE_STATION: u32 = 2;
 const IFTYPE_STATION_ATTR: u16 = 2;
 const NLM_F_DUMP: u16 = 0x0300;
@@ -95,7 +98,10 @@ pub(super) fn handle(
     if request.version > FAMILY_VERSION || request.reserved != 0 {
         return Err(AxError::InvalidInput);
     }
-    if !matches!(request.cmd, CMD_GET_WIPHY | CMD_GET_INTERFACE) {
+    if !matches!(
+        request.cmd,
+        CMD_GET_WIPHY | CMD_GET_INTERFACE | CMD_GET_SCAN | CMD_GET_REG
+    ) {
         return Err(AxError::OperationNotSupported);
     }
     let selectors = parse_selectors(&payload[size_of::<GenlMsgHdr>()..])?;
@@ -104,6 +110,33 @@ pub(super) fn handle(
     let port_id = permit.port_id();
     let mut records = Vec::new();
     match request.cmd {
+        CMD_GET_REG => {
+            if selectors.wiphy.is_some_and(|wiphy| {
+                !interfaces
+                    .iter()
+                    .any(|interface| interface.phy_index == wiphy)
+            }) {
+                return Err(AxError::NotFound);
+            }
+            socket.enqueue_kernel_permitted(permit, regulatory_message(header, port_id));
+            return Ok(());
+        }
+        CMD_GET_SCAN => {
+            if !dump {
+                return Err(AxError::InvalidInput);
+            }
+            if !interfaces.iter().any(|interface| {
+                selectors
+                    .ifindex
+                    .is_none_or(|ifindex| interface.ifindex == ifindex)
+                    && selectors
+                        .ifname
+                        .as_deref()
+                        .is_none_or(|name| interface.name == name)
+            }) {
+                return Err(AxError::NotFound);
+            }
+        }
         CMD_GET_INTERFACE => {
             for interface in interfaces.iter().filter(|interface| {
                 selectors
@@ -149,6 +182,16 @@ pub(super) fn handle(
 
 fn empty_dump_response(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
     wiremsg::done_message(request, port_id)
+}
+
+fn regulatory_message(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: CMD_GET_REG,
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr_string(&mut payload, ATTR_REG_ALPHA2, "00");
+    nl80211_message(request, port_id, FAMILY_ID, payload, false)
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -262,6 +305,9 @@ mod tests {
     fn uapi_command_and_attribute_ids_match_the_header() {
         assert_eq!(CMD_GET_WIPHY, 1);
         assert_eq!(CMD_GET_INTERFACE, 5);
+        assert_eq!(CMD_GET_SCAN, 32);
+        assert_eq!(CMD_GET_REG, 31);
+        assert_eq!(ATTR_REG_ALPHA2, 33);
         assert_eq!(ATTR_IFINDEX, 3);
         assert_eq!(ATTR_IFNAME, 4);
         assert_eq!(MULTICAST_GROUPS[1], "scan");
@@ -340,6 +386,30 @@ mod tests {
         assert_eq!(header.nlmsg_pid, 9);
         assert_ne!(header.nlmsg_flags & NLM_F_MULTI, 0);
         assert_eq!(response.len(), size_of::<NlMsgHdr>() + size_of::<i32>());
+    }
+
+    #[test]
+    fn regulatory_get_encodes_the_global_world_alpha2_attribute() {
+        let request = NlMsgHdr {
+            nlmsg_len: size_of::<NlMsgHdr>() as u32,
+            nlmsg_type: FAMILY_ID,
+            nlmsg_flags: 0,
+            nlmsg_seq: 2,
+            nlmsg_pid: 3,
+        };
+        let message = regulatory_message(&request, 3);
+        let generic = size_of::<NlMsgHdr>();
+        assert_eq!(message[generic], CMD_GET_REG);
+        let attrs = &message[generic + size_of::<GenlMsgHdr>()..];
+        let mut alpha2 = None;
+        for_each_rtattr(attrs, |kind, value| {
+            if kind == ATTR_REG_ALPHA2 {
+                alpha2 = Some(decode_link_name(value)?);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(alpha2.as_deref(), Some("00"));
     }
 
     #[test]
