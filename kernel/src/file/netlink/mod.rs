@@ -700,6 +700,7 @@ static PENDING_GENERIC_MULTICAST: Lazy<Mutex<VecDeque<PendingGenericMulticast>>>
 struct PendingGenericMulticast {
     data: Vec<u8>,
     group_mask: u32,
+    net_ns: Option<Arc<NetworkNamespace>>,
 }
 
 /// Defer a generic-netlink multicast from an RX-service callback.  The netdev
@@ -715,7 +716,12 @@ pub(crate) fn queue_nl80211_multicast(data: Vec<u8>, group_mask: u32) {
         if pending.len() == 64 {
             pending.pop_front();
         }
-        pending.push_back(PendingGenericMulticast { data, group_mask });
+        let net_ns = INIT_NETWORK_NAMESPACE.lock().clone();
+        pending.push_back(PendingGenericMulticast {
+            data,
+            group_mask,
+            net_ns,
+        });
     }
     let mut sockets = GENERIC_NETLINK_SOCKETS.lock();
     sockets.retain(|weak| weak.strong_count() != 0);
@@ -750,6 +756,13 @@ fn flush_pending_generic_multicast() {
     };
     for event in events {
         for listener in &listeners {
+            if event
+                .net_ns
+                .as_ref()
+                .is_some_and(|net_ns| !Arc::ptr_eq(net_ns, &listener.net_ns))
+            {
+                continue;
+            }
             let state = listener.state.lock();
             if state.groups & u64::from(event.group_mask) == 0 {
                 continue;
@@ -3916,8 +3929,10 @@ mod tests {
     fn generic_multicast_is_deferred_and_delivered_only_to_subscribed_scan_group() {
         let _context = crate::test_support::scheduler_test_context();
         PENDING_GENERIC_MULTICAST.lock().clear();
-        let user_ns = UserNamespace::try_new_root().unwrap();
-        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let net_ns = INIT_NETWORK_NAMESPACE.lock().clone().unwrap_or_else(|| {
+            let user_ns = UserNamespace::try_new_root().unwrap();
+            NetworkNamespace::try_new_loopback_only(user_ns).unwrap()
+        });
         let subscribed = NetlinkSocket::try_new(NETLINK_GENERIC, SOCK_RAW, net_ns.clone()).unwrap();
         let unsubscribed = NetlinkSocket::try_new(NETLINK_GENERIC, SOCK_RAW, net_ns).unwrap();
         subscribed.state.lock().groups = 1 << 1;
