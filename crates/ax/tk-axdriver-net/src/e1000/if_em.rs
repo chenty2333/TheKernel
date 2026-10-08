@@ -52,6 +52,62 @@ pub struct EmHardwareStats {
     pub pause_frames: bool,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmVfStats {
+    pub last: [u32; 9],
+    pub total: [u64; 9],
+    pub valid: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmIfCounter {
+    Collisions,
+    InputErrors,
+    OutputErrors,
+    Other,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VftaTable {
+    pub words: [u32; 128],
+    pub stale: [u32; 128],
+    pub count: u32,
+}
+impl Default for VftaTable {
+    fn default() -> Self {
+        Self {
+            words: [0; 128],
+            stale: [0; 128],
+            count: 0,
+        }
+    }
+}
+pub trait EmVlanOps {
+    fn set_vf_vlan(&mut self, vid: u16, add: bool) -> DevResult;
+    fn rebuild_iov_vlan(&mut self);
+    fn write_vfta(&mut self, index: u32, value: u32) -> DevResult;
+    fn set_pf_vlan_promisc(&mut self, enabled: bool);
+    fn retry_add(&mut self, vid: u16);
+    fn retry_clear(&mut self, vid: u16);
+    fn write_rlpml(&mut self, size: u32) -> DevResult;
+}
+pub trait EmMulticastOps {
+    fn update_multicast(&mut self, addresses: &[[u8; 6]]) -> DevResult;
+    fn update_vf_unicast(&mut self) -> DevResult;
+    fn set_vf_promisc(&mut self, promisc: bool, allmulti: bool) -> DevResult;
+    fn rebuild_iov_mta(&mut self) -> DevResult;
+    fn rebuild_iov_vlan(&mut self) -> DevResult;
+    fn update_iov_vmolr(&mut self) -> DevResult;
+    fn clear_pci_mwi(&mut self) -> DevResult;
+    fn set_pci_mwi(&mut self) -> DevResult;
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmPromiscState {
+    pub promisc: bool,
+    pub allmulti: bool,
+    pub vf: bool,
+    pub iov: bool,
+    pub num_multicast: u16,
+    pub flags_pending: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TsoAutoMask {
     pub capability_enabled: bool,
     pub automasked: bool,
@@ -1105,6 +1161,161 @@ pub fn em_handle_fatal_error_admin<I: E1000RegisterIo, O: EmFatalAdminOps>(
     Ok(true)
 }
 
+/// upstream: if_em.c em_finish_fatal_error_reset()
+pub fn em_finish_fatal_error_reset<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    error: &mut EmFatalError,
+) -> DevResult {
+    if !matches!(
+        error.state,
+        EmFatalState::ResetRequested | EmFatalState::ResetPrepared
+    ) {
+        return Ok(());
+    }
+    if em_has_82575_memory_errors(mac) {
+        error.dma_tx = 0;
+        error.dma_rx = 0;
+    } else if em_has_82576_memory_errors(mac) {
+        let _ = io.read_register(E1000_PEIND)?;
+        error.peind = 0;
+    } else if em_has_82580_memory_errors(mac) {
+        let pcie = error.pcie | io.read_register(E1000_PCIEERRSTS)?;
+        if pcie != 0 {
+            io.write_register(E1000_PCIEERRSTS, pcie)?;
+        }
+        let ecc = error.pcie_ecc
+            | (io.read_register(E1000_PCIEECCSTS)? & E1000_PCIEECCSTS_82580_ERROR_MASK);
+        if ecc != 0 {
+            io.write_register(E1000_PCIEECCSTS, ecc)?;
+        }
+        for (reg, saved) in [
+            (E1000_DTPARS_82580, error.dma_tx),
+            (E1000_DRPARS_82580, error.dma_rx),
+            (E1000_DDPARS_82580, error.dma_host),
+        ] {
+            let status = saved | io.read_register(reg)?;
+            if status != 0 {
+                io.write_register(reg, status)?;
+            }
+        }
+        let _ = io.read_register(E1000_LANPERRSTS)? & E1000_LANPERRSTS_82580_ERROR_MASK;
+        let _ = io.read_register(E1000_PEIND)?;
+        error.peind = 0;
+        error.pcie = 0;
+        error.pcie_ecc = 0;
+        error.lan = 0;
+        error.dma_tx = 0;
+        error.dma_rx = 0;
+        error.dma_host = 0;
+    } else if em_has_peind_memory_errors(mac) {
+        let pcie =
+            error.pcie | (io.read_register(E1000_PCIEERRSTS)? & em_pcie_fatal_error_mask(mac));
+        if pcie != 0 {
+            io.write_register(E1000_PCIEERRSTS, pcie)?;
+        }
+        if em_has_i350_i354_memory_errors(mac) {
+            for (reg, saved, mask) in [
+                (E1000_DTPARS, error.dma_tx, E1000_DTPARS_FATAL_MASK),
+                (E1000_DRPARS, error.dma_rx, E1000_DRPARS_FATAL_MASK),
+            ] {
+                let status = saved | (io.read_register(reg)? & mask);
+                if status != 0 {
+                    io.write_register(reg, status)?;
+                }
+            }
+        }
+        let lanmask = if em_has_i350_i354_memory_errors(mac) {
+            E1000_LANPERRSTS_I350_I354_FATAL_MASK
+        } else {
+            E1000_LANPERRSTS_RETX_BUF
+        };
+        let lan = error.lan | (io.read_register(E1000_LANPERRSTS)? & lanmask);
+        if lan != 0 {
+            io.write_register(E1000_LANPERRSTS, lan)?;
+        }
+        let _ = io.read_register(E1000_PEIND)?;
+        error.peind = 0;
+        error.pcie = 0;
+        error.pcie_ecc = 0;
+        error.lan = 0;
+        error.dma_tx = 0;
+        error.dma_rx = 0;
+        error.dma_host = 0;
+    }
+    error.icr = 0;
+    error.pbeccsts = 0;
+    error.state = EmFatalState::None;
+    Ok(())
+}
+
+pub trait EmFlushOps {
+    fn write_dummy_tx_descriptor(
+        &mut self,
+        index: u16,
+        bus_address: u64,
+        command_length: u32,
+    ) -> DevResult;
+    fn write_memory_barrier(&mut self);
+    fn read_descriptor_ring_status(&mut self) -> DevResult<u16>;
+}
+
+/// upstream: if_em.c em_flush_tx_ring()
+pub fn em_flush_tx_ring<I: E1000RegisterIo, O: EmFlushOps>(
+    io: &mut I,
+    ops: &mut O,
+    ring_bus: u64,
+    processed_index: u16,
+) -> DevResult {
+    let tctl = io.read_register(E1000_TCTL)?;
+    io.write_register(E1000_TCTL, tctl | E1000_TCTL_EN)?;
+    ops.write_dummy_tx_descriptor(processed_index, ring_bus, E1000_TXD_CMD_IFCS | 512)?;
+    ops.write_memory_barrier();
+    io.write_register(tx_desc_tail(0), u32::from(processed_index))?;
+    ops.write_memory_barrier();
+    io.delay_us(250);
+    Ok(())
+}
+
+/// upstream: if_em.c em_flush_rx_ring()
+pub fn em_flush_rx_ring<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    let rctl = io.read_register(E1000_RCTL)?;
+    io.write_register(E1000_RCTL, rctl & !E1000_RCTL_EN)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    io.delay_us(150);
+    let reg = rx_desc_control(0);
+    let mut rxdctl = io.read_register(reg)? & 0xffff_c000;
+    rxdctl |= 0x1f | (1 << 8) | 0x0100_0000;
+    io.write_register(reg, rxdctl)?;
+    io.write_register(E1000_RCTL, rctl | E1000_RCTL_EN)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    io.delay_us(150);
+    io.write_register(E1000_RCTL, rctl & !E1000_RCTL_EN)
+}
+
+/// upstream: if_em.c em_flush_desc_rings()
+pub fn em_flush_desc_rings<I: E1000RegisterIo, P: E1000PciConfig, O: EmFlushOps>(
+    io: &mut I,
+    pci: &mut P,
+    ops: &mut O,
+    tx_ring_bus: u64,
+    processed_index: u16,
+) -> DevResult {
+    let value = io.read_register(E1000_FEXTNVM11)? | 0x0000_2000;
+    io.write_register(E1000_FEXTNVM11, value)?;
+    let length = io.read_register(tx_desc_length(0))?;
+    let status = pci.read_config_u16(0xe4).ok_or(DevError::Io)?;
+    if status & 0x100 == 0 || length == 0 {
+        return Ok(());
+    }
+    em_flush_tx_ring(io, ops, tx_ring_bus, processed_index)?;
+    let status = pci.read_config_u16(0xe4).ok_or(DevError::Io)?;
+    if status & 0x100 != 0 {
+        em_flush_rx_ring(io)?;
+    }
+    Ok(())
+}
+
 /// upstream: if_em.c em_prepare_fatal_error_reset()
 pub fn em_prepare_fatal_error_reset<I: E1000RegisterIo, O: EmFatalResetOps>(
     io: &mut I,
@@ -1995,6 +2206,465 @@ pub fn em_update_stats_counters<I: E1000RegisterIo>(
     Ok(())
 }
 
+fn read_vf_stat_registers<I: E1000RegisterIo>(io: &mut I, vf_82576: bool) -> DevResult<[u32; 9]> {
+    let mut values = [0u32; 9];
+    for (i, reg) in [
+        E1000_VFGPRC,
+        E1000_VFGORC,
+        E1000_VFGPTC,
+        E1000_VFGOTC,
+        if vf_82576 { E1000_VFMPRC } else { 0 },
+        E1000_VFGOTLBC,
+        E1000_VFGPTLBC,
+        E1000_VFGORLBC,
+        E1000_VFGPRLBC,
+    ]
+    .iter()
+    .enumerate()
+    {
+        if *reg != 0 {
+            values[i] = io.read_register(*reg)?;
+        }
+    }
+    Ok(values)
+}
+
+/// upstream: if_em.c em_initialize_vf_stats()
+pub fn em_initialize_vf_stats<I: E1000RegisterIo>(
+    io: &mut I,
+    stats: &mut EmVfStats,
+    vf_82576: bool,
+    hyperv: bool,
+) -> DevResult {
+    *stats = EmVfStats::default();
+    em_rebase_vf_stats(io, stats, vf_82576, hyperv)
+}
+
+/// upstream: if_em.c em_rebase_vf_stats()
+pub fn em_rebase_vf_stats<I: E1000RegisterIo>(
+    io: &mut I,
+    stats: &mut EmVfStats,
+    vf_82576: bool,
+    hyperv: bool,
+) -> DevResult {
+    stats.valid = false;
+    if hyperv && io.read_register(E1000_STATUS)? == u32::MAX {
+        return Ok(());
+    }
+    stats.last = read_vf_stat_registers(io, vf_82576)?;
+    stats.valid = !hyperv || io.read_register(E1000_STATUS)? != u32::MAX;
+    Ok(())
+}
+
+/// upstream: if_em.c em_update_vf_stats_counters()
+pub fn em_update_vf_stats_counters<I: E1000RegisterIo>(
+    io: &mut I,
+    stats: &mut EmVfStats,
+    vf_82576: bool,
+    hyperv: bool,
+    mut check_reset: impl FnMut() -> bool,
+) -> DevResult {
+    if hyperv && io.read_register(E1000_STATUS)? == u32::MAX {
+        stats.valid = false;
+        return Ok(());
+    }
+    let mut reset = hyperv && check_reset();
+    if hyperv && !stats.valid {
+        reset = true
+    }
+    if hyperv && io.read_register(tx_desc_control(0))? & 0x0200_0000 == 0 {
+        reset = true
+    }
+    let sample = read_vf_stat_registers(io, vf_82576)?;
+    let mut next = *stats;
+    for index in 0..9 {
+        if index == 4 && !vf_82576 {
+            continue;
+        }
+        next.total[index] =
+            next.total[index].wrapping_add(u64::from(sample[index].wrapping_sub(next.last[index])));
+        next.last[index] = sample[index];
+    }
+    if hyperv {
+        if check_reset() {
+            reset = true
+        }
+        if io.read_register(tx_desc_control(0))? & 0x0200_0000 == 0 {
+            reset = true
+        }
+        if io.read_register(E1000_STATUS)? == u32::MAX {
+            stats.valid = false;
+            return Ok(());
+        }
+    }
+    if reset {
+        em_rebase_vf_stats(io, stats, vf_82576, hyperv)?
+    } else {
+        next.valid = true;
+        *stats = next;
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_if_get_vf_counter()
+pub fn em_if_get_vf_counter(counter: EmIfCounter, dropped: u64, default: u64) -> u64 {
+    if counter == EmIfCounter::InputErrors {
+        dropped
+    } else {
+        default
+    }
+}
+
+/// upstream: if_em.c em_if_get_counter()
+pub fn em_if_get_counter(
+    counter: EmIfCounter,
+    vf: bool,
+    dropped: u64,
+    stats: &EmHardwareStats,
+    default: u64,
+) -> u64 {
+    if vf {
+        return em_if_get_vf_counter(counter, dropped, default);
+    }
+    let value = |register: u32| *stats.counters.get(&register).unwrap_or(&0);
+    match counter {
+        EmIfCounter::Collisions => value(E1000_COLC),
+        EmIfCounter::InputErrors => {
+            dropped
+                + value(E1000_RXERRC)
+                + value(E1000_CRCERRS)
+                + value(E1000_ALGNERRC)
+                + value(E1000_RUC)
+                + value(E1000_ROC)
+                + value(E1000_MPC)
+                + value(E1000_CEXTERR)
+        }
+        EmIfCounter::OutputErrors => default + value(E1000_ECOL) + value(E1000_LATECOL),
+        EmIfCounter::Other => default,
+    }
+}
+
+/// upstream: if_em.c em_if_needs_restart()
+pub const fn em_if_needs_restart(_event: u32) -> bool {
+    false
+}
+
+/// upstream: if_em.c em_if_vlan_register()
+pub fn em_if_vlan_register<V: EmVlanOps>(
+    ops: &mut V,
+    table: &mut VftaTable,
+    vid: u16,
+    vf: bool,
+    hyperv: bool,
+    iov: bool,
+) -> DevResult {
+    if hyperv {
+        return Ok(());
+    }
+    let index = usize::from((vid >> 5) & 0x7f);
+    let mask = 1u32 << (vid & 0x1f);
+    let present = table.words[index] & mask != 0;
+    table.words[index] |= mask;
+    table.stale[index] &= !mask;
+    if !present {
+        table.count += 1;
+    }
+    if vf {
+        if ops.set_vf_vlan(vid, true).is_err() {
+            ops.retry_add(vid)
+        } else {
+            ops.retry_clear(vid)
+        }
+    } else if iov {
+        ops.rebuild_iov_vlan()
+    } else {
+        ops.write_vfta(index as u32, table.words[index])?;
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_if_vlan_unregister()
+pub fn em_if_vlan_unregister<V: EmVlanOps>(
+    ops: &mut V,
+    table: &mut VftaTable,
+    vid: u16,
+    vf: bool,
+    hyperv: bool,
+    iov: bool,
+) -> DevResult {
+    if hyperv {
+        return Ok(());
+    }
+    let index = usize::from((vid >> 5) & 0x7f);
+    let mask = 1u32 << (vid & 0x1f);
+    let present = table.words[index] & mask != 0;
+    if vf {
+        ops.retry_clear(vid)
+    }
+    if vf && ops.set_vf_vlan(vid, false).is_err() {
+        table.stale[index] |= mask;
+    } else {
+        table.stale[index] &= !mask;
+    }
+    table.words[index] &= !mask;
+    if present {
+        table.count = table.count.saturating_sub(1)
+    }
+    if !vf {
+        if iov {
+            ops.rebuild_iov_vlan()
+        } else {
+            ops.write_vfta(index as u32, table.words[index])?;
+        }
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_if_vlan_filter_capable()
+pub const fn em_if_vlan_filter_capable(
+    vlan_hwfilter_enabled: bool,
+    disable_crc_stripping: bool,
+) -> bool {
+    vlan_hwfilter_enabled && !disable_crc_stripping
+}
+/// upstream: if_em.c em_if_vlan_filter_used()
+pub fn em_if_vlan_filter_used(table: &VftaTable, capable: bool) -> bool {
+    capable && table.words.iter().any(|word| *word != 0)
+}
+
+/// upstream: if_em.c em_if_vlan_filter_enable()
+pub fn em_if_vlan_filter_enable<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    let mut rctl = io.read_register(E1000_RCTL)?;
+    rctl &= !E1000_RCTL_CFIEN;
+    rctl |= E1000_RCTL_VFE;
+    io.write_register(E1000_RCTL, rctl)
+}
+/// upstream: if_em.c em_if_vlan_filter_disable()
+pub fn em_if_vlan_filter_disable<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    let rctl = io.read_register(E1000_RCTL)?;
+    io.write_register(E1000_RCTL, rctl & !(E1000_RCTL_VFE | E1000_RCTL_CFIEN))
+}
+/// upstream: if_em.c em_if_vlan_filter_write()
+pub fn em_if_vlan_filter_write<V: EmVlanOps>(
+    ops: &mut V,
+    table: &VftaTable,
+    changed_index: usize,
+    legacy_interrupts: bool,
+    mut disable: impl FnMut() -> DevResult,
+    mut enable: impl FnMut() -> DevResult,
+) -> DevResult {
+    if legacy_interrupts {
+        disable()?;
+    }
+    for (index, value) in table.words.iter().enumerate() {
+        if *value != 0 || index == changed_index {
+            ops.write_vfta(index as u32, *value)?;
+        }
+    }
+    if legacy_interrupts {
+        enable()?;
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_setup_vlan_hw_support()
+pub fn em_setup_vlan_hw_support<I: E1000RegisterIo, V: EmVlanOps>(
+    io: &mut I,
+    ops: &mut V,
+    table: &mut VftaTable,
+    mac_tagging: bool,
+    crc_stripping_disabled: bool,
+    vf: bool,
+    hyperv: bool,
+    iov: bool,
+    max_frame_size: u32,
+    vlan_tagging_enabled: bool,
+) -> DevResult {
+    if hyperv {
+        return Ok(());
+    }
+    if vf {
+        ops.write_rlpml((max_frame_size + 4).min(0x2600))?;
+        for vid in 0..4096 {
+            let mask = 1u32 << (vid & 0x1f);
+            if table.words[(vid >> 5) as usize] & mask != 0 {
+                if ops.set_vf_vlan(vid as u16, true).is_err() {
+                    ops.retry_add(vid as u16)
+                } else {
+                    ops.retry_clear(vid as u16)
+                }
+            }
+        }
+        return Ok(());
+    }
+    let mut ctrl = io.read_register(E1000_CTRL)?;
+    if vlan_tagging_enabled && !crc_stripping_disabled {
+        ctrl |= E1000_CTRL_VME
+    } else {
+        ctrl &= !E1000_CTRL_VME
+    }
+    io.write_register(E1000_CTRL, ctrl)?;
+    if !em_if_vlan_filter_capable(mac_tagging, crc_stripping_disabled) {
+        if iov {
+            ops.set_pf_vlan_promisc(true);
+            em_if_vlan_filter_enable(io)?;
+        } else {
+            em_if_vlan_filter_disable(io)?;
+        }
+        return Ok(());
+    }
+    if iov {
+        ops.set_pf_vlan_promisc(false)
+    }
+    em_if_vlan_register(ops, table, 0, false, false, iov)?;
+    em_if_vlan_filter_enable(io)
+}
+
+/// upstream: if_em.c em_if_defer_promisc()
+pub const fn em_if_defer_promisc(mac: E1000MacType) -> bool {
+    matches!(
+        mac,
+        E1000MacType::I82576
+            | E1000MacType::I350
+            | E1000MacType::VfAdapt
+            | E1000MacType::VfAdaptI350
+    )
+}
+
+/// upstream: if_em.c em_if_set_promisc()
+pub fn em_if_set_promisc(state: &mut EmPromiscState, mac: E1000MacType) -> bool {
+    if em_if_defer_promisc(mac) {
+        state.flags_pending = true;
+        true
+    } else {
+        false
+    }
+}
+
+/// upstream: if_em.c em_if_set_promisc_impl()
+pub fn em_if_set_promisc_impl<I: E1000RegisterIo, V: EmVlanOps, M: EmMulticastOps>(
+    io: &mut I,
+    vlan: &mut V,
+    ops: &mut M,
+    table: &VftaTable,
+    state: EmPromiscState,
+    disable_crc_stripping: bool,
+) -> DevResult {
+    if state.vf {
+        return ops.set_vf_promisc(state.promisc, state.allmulti);
+    }
+    let mut rctl = io.read_register(E1000_RCTL)?;
+    rctl &= !(E1000_RCTL_SBP | E1000_RCTL_UPE);
+    let mcnt = if state.allmulti {
+        128
+    } else {
+        state.num_multicast
+    };
+    if mcnt < 128 {
+        rctl &= !E1000_RCTL_MPE;
+    }
+    io.write_register(E1000_RCTL, rctl)?;
+    if state.promisc {
+        rctl |= E1000_RCTL_UPE | E1000_RCTL_MPE;
+        io.write_register(E1000_RCTL, rctl)?;
+        if state.iov {
+            em_if_vlan_filter_enable(io)?;
+        } else {
+            em_if_vlan_filter_disable(io)?;
+        }
+    } else {
+        if state.allmulti {
+            rctl |= E1000_RCTL_MPE;
+            rctl &= !E1000_RCTL_UPE;
+            io.write_register(E1000_RCTL, rctl)?;
+        }
+        if state.iov
+            || em_if_vlan_filter_used(
+                table,
+                em_if_vlan_filter_capable(true, disable_crc_stripping),
+            )
+        {
+            em_if_vlan_filter_enable(io)?;
+        }
+    }
+    ops.update_iov_vmolr()?;
+    ops.rebuild_iov_vlan()?;
+    let _ = vlan;
+    Ok(())
+}
+
+/// upstream: if_em.c em_copy_maddr()
+pub fn em_copy_maddr(destination: &mut [u8], address: [u8; 6], index: usize) -> u32 {
+    if index >= 128 || destination.len() < index * 6 + 6 {
+        return 0;
+    }
+    destination[index * 6..index * 6 + 6].copy_from_slice(&address);
+    1
+}
+
+/// upstream: if_em.c em_fill_wakeup_mta()
+pub fn em_fill_wakeup_mta<I: E1000RegisterIo>(io: &mut I, mta_registers: u16) -> DevResult {
+    for index in (0..mta_registers).rev() {
+        io.write_register(E1000_MTA + u32::from(index) * 4, u32::MAX)?;
+    }
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
+
+/// upstream: if_em.c em_if_multi_set()
+pub fn em_if_multi_set<I: E1000RegisterIo, V: EmMulticastOps>(
+    io: &mut I,
+    ops: &mut V,
+    mac: E1000MacType,
+    revision: u8,
+    addresses: &[[u8; 6]],
+    vf: bool,
+    iov: bool,
+    promisc: bool,
+    allmulti: bool,
+    pci_mwi: bool,
+) -> DevResult {
+    let reset = mac == E1000MacType::I82542 && revision == 2;
+    if reset {
+        let rctl = io.read_register(E1000_RCTL)?;
+        if pci_mwi {
+            ops.clear_pci_mwi()?;
+        }
+        io.write_register(E1000_RCTL, rctl | E1000_RCTL_RST)?;
+        io.delay_us(5000);
+    }
+    let count = addresses.len().min(128);
+    let list = &addresses[..count];
+    if vf {
+        ops.update_multicast(list)?;
+        ops.update_vf_unicast()?;
+        return Ok(());
+    }
+    if count < 128 && !iov {
+        ops.update_multicast(list)?;
+    }
+    let mut rctl = io.read_register(E1000_RCTL)?;
+    if promisc {
+        rctl |= E1000_RCTL_UPE | E1000_RCTL_MPE;
+    } else if count >= 128 || allmulti {
+        rctl |= E1000_RCTL_MPE;
+        rctl &= !E1000_RCTL_UPE;
+    } else {
+        rctl &= !(E1000_RCTL_UPE | E1000_RCTL_MPE);
+    }
+    io.write_register(E1000_RCTL, rctl)?;
+    if reset {
+        rctl = io.read_register(E1000_RCTL)?;
+        io.write_register(E1000_RCTL, rctl & !E1000_RCTL_RST)?;
+        io.delay_us(5000);
+        if pci_mwi {
+            ops.set_pci_mwi()?;
+        }
+    }
+    ops.rebuild_iov_mta()?;
+    ops.update_iov_vmolr()
+}
+
 /// upstream: if_em.c em_get_hw_control()
 pub fn em_get_hw_control<I: E1000RegisterIo>(
     io: &mut I,
@@ -2217,6 +2887,130 @@ pub fn em_initialize_receive_unit<I: E1000RegisterIo, O: EmRxUnitOps>(
     io.write_register(E1000_RCTL, rctl)
 }
 
+/// upstream: if_em.c igb_rxdctl()
+pub const fn igb_rxdctl(mac: E1000MacType, msix: bool, current: u32) -> u32 {
+    let (mut mask, mut pthresh, mut wthresh) = (0x001f_1f1f, 8u32, 4u32);
+    match mac {
+        E1000MacType::I82575 => {
+            mask = 0x003f_3f3f;
+        }
+        E1000MacType::I82576 => {
+            wthresh = if msix { 1 } else { 4 };
+        }
+        E1000MacType::VfAdapt => {
+            wthresh = 1;
+        }
+        E1000MacType::I354 => {
+            pthresh = 12;
+        }
+        _ => {}
+    }
+    (current & !mask) | pthresh | (8 << 8) | (wthresh << 16) | 0x0200_0000
+}
+
+/// upstream: if_em.c igb_initialize_rss_mapping()
+pub fn igb_initialize_rss_mapping<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    rx_queues: u16,
+    rss_key: &[u32; 10],
+) -> DevResult {
+    if rx_queues == 0 {
+        return Err(DevError::InvalidParam);
+    }
+    let shift = if mac == E1000MacType::I82575 { 6 } else { 0 };
+    let mut reta = 0u32;
+    for i in 0..128u32 {
+        let queue = (i % u32::from(rx_queues)) << shift;
+        reta = (reta >> 8) | (queue << 24);
+        if i & 3 == 3 {
+            io.write_register(0x05c00 + (i >> 2) * 4, reta)?;
+            reta = 0;
+        }
+    }
+    for (i, value) in rss_key.iter().enumerate() {
+        io.write_register(0x05c80 + i as u32 * 4, *value)?;
+    }
+    io.write_register(
+        E1000_MRQC,
+        0x0000_0002
+            | E1000_MRQC_RSS_FIELD_IPV4
+            | E1000_MRQC_RSS_FIELD_IPV4_TCP
+            | E1000_MRQC_RSS_FIELD_IPV6
+            | E1000_MRQC_RSS_FIELD_IPV6_TCP
+            | 0x0040_0000
+            | 0x0080_0000
+            | 0x0100_0000
+            | E1000_MRQC_RSS_FIELD_IPV6_TCP_EX,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IgbRxRingConfig {
+    pub queue: u32,
+    pub dma_base: u64,
+    pub descriptor_count: u32,
+    pub descriptor_size: u32,
+}
+
+/// upstream: if_em.c igb_initialize_receive_rings()
+pub fn igb_initialize_receive_rings<I: E1000RegisterIo>(
+    io: &mut I,
+    rx_mbuf_size: u32,
+    drop: bool,
+    mac: E1000MacType,
+    msix: bool,
+    rings: &[IgbRxRingConfig],
+) -> DevResult {
+    let mut srrctl = ((rx_mbuf_size + 1023) >> 10) | 0x0200_0000;
+    if drop {
+        srrctl |= 0x8000_0000;
+    }
+    for ring in rings {
+        let control = rx_desc_control(ring.queue);
+        let rxdctl = io.read_register(control)?;
+        io.write_register(control, rxdctl & !0x0200_0000)?;
+        let _ = io.read_register(E1000_STATUS)?;
+        io.write_register(
+            rx_desc_length(ring.queue),
+            ring.descriptor_count * ring.descriptor_size,
+        )?;
+        io.write_register(rx_desc_base_high(ring.queue), (ring.dma_base >> 32) as u32)?;
+        io.write_register(rx_desc_base_low(ring.queue), ring.dma_base as u32)?;
+        io.write_register(rx_desc_head(ring.queue), 0)?;
+        io.write_register(rx_desc_tail(ring.queue), 0)?;
+        io.write_register(rx_split_control(ring.queue), srrctl)?;
+        io.write_register(control, igb_rxdctl(mac, msix, rxdctl))?;
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c igb_initialize_interrupt_rate()
+pub fn igb_initialize_interrupt_rate<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    rx_vectors: &[u16],
+    link_vector: Option<u16>,
+    rate: u32,
+) -> DevResult {
+    if rate == 0 {
+        return Err(DevError::InvalidParam);
+    }
+    let mut value = ((EITR_RATE_DIVIDEND / rate) << EITR_SHIFT) & EITR_MASK;
+    if mac == E1000MacType::I82575 {
+        value |= value << 16;
+    } else {
+        value |= EITR_COUNT_IGNORE;
+    }
+    for vector in rx_vectors {
+        io.write_register(0x01680 + u32::from(*vector) * 4, value)?;
+    }
+    if let Some(vector) = link_vector {
+        io.write_register(0x01680 + u32::from(vector) * 4, value)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeMap;
@@ -2248,6 +3042,31 @@ mod tests {
         }
         fn find_capability(&mut self, id: u8) -> Option<u32> {
             (id == 0x10).then_some(0x40)
+        }
+    }
+    #[derive(Default)]
+    struct VlanMock {
+        writes: Vec<(u32, u32)>,
+        fail_remove: bool,
+    }
+    impl EmVlanOps for VlanMock {
+        fn set_vf_vlan(&mut self, _vid: u16, add: bool) -> DevResult {
+            if !add && self.fail_remove {
+                Err(DevError::Io)
+            } else {
+                Ok(())
+            }
+        }
+        fn rebuild_iov_vlan(&mut self) {}
+        fn write_vfta(&mut self, index: u32, value: u32) -> DevResult {
+            self.writes.push((index, value));
+            Ok(())
+        }
+        fn set_pf_vlan_promisc(&mut self, _enabled: bool) {}
+        fn retry_add(&mut self, _vid: u16) {}
+        fn retry_clear(&mut self, _vid: u16) {}
+        fn write_rlpml(&mut self, _size: u32) -> DevResult {
+            Ok(())
         }
     }
 
@@ -2288,6 +3107,21 @@ mod tests {
         em_release_manageability(&mut io, true).unwrap();
         assert_ne!(io.0[&E1000_MANC] & E1000_MANC_ARP_EN, 0);
         assert_eq!(io.0[&E1000_MANC] & E1000_MANC_EN_MNG2HOST, 0);
+    }
+    #[test]
+    fn vlan_shadow_tracks_registered_and_stale_vf_ids() {
+        let mut ops = VlanMock::default();
+        let mut table = VftaTable::default();
+        em_if_vlan_register(&mut ops, &mut table, 100, false, false, false).unwrap();
+        assert_eq!(table.count, 1);
+        assert_eq!(ops.writes.last(), Some(&(3, 1 << 4)));
+        em_if_vlan_unregister(&mut ops, &mut table, 100, false, false, false).unwrap();
+        assert_eq!(table.count, 0);
+        assert_eq!(ops.writes.last(), Some(&(3, 0)));
+        ops.fail_remove = true;
+        em_if_vlan_register(&mut ops, &mut table, 9, true, false, false).unwrap();
+        em_if_vlan_unregister(&mut ops, &mut table, 9, true, false, false).unwrap();
+        assert_ne!(table.stale[0] & (1 << 9), 0);
     }
     #[test]
     fn queue_limits_and_aim_deltas_match_generation_policy() {
