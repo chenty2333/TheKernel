@@ -1020,3 +1020,5 @@ SDVO/VBT helpers, platform DDC routing, MIPI sequence repair, and display-12/13
 panel parsing. Linux's panel object allocation/lifetime (`intel_bios_init_panel_early/late`
 and `intel_bios_fini_panel`) is represented by the owned `PanelVbtData` result
 and Rust drop rather than importing DRM panel lifecycle APIs.
+The VBT byte getter is exposed for an adapter; DRM debugfs registration and
+log-only DDI port printing remain framework diagnostics and are not copied.
