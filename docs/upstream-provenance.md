@@ -1033,3 +1033,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): packed probe-request segment descriptors and 512-byte frame block serialization translated in `tk-axdriver-iwx/src/scan_probe.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): UMAC scan request v14/v17 serialization, dwell/channel parameters, direct SSID and background async mode translated in `tk-axdriver-iwx/src/scan.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): reduced SCAN_CFG API gate, antenna masks and broadcast station compatibility field translated in `tk-axdriver-iwx/src/scan.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): rate-set index conversion and mandatory-rate CCK/OFDM ACK masks translated in `tk-axdriver-iwx/src/rate.rs`.

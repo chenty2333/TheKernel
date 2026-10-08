@@ -149,8 +149,9 @@ pub use queue::{
 };
 pub use rate::{
     HtRateSet, MCS_TO_RATE_INDEX, RATES, Rate, TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY,
-    TxRateError, TxRateInput, TxRateSelection, fw_rate_index_cck, fw_rate_index_ofdm,
-    rate_value_to_index, rateset_11g_index, rateset_ht_bitmap, rateset_vht_bitmap, select_tx_rate,
+    TxRateError, TxRateInput, TxRateSelection, ack_rate_masks, fw_rate_index_cck,
+    fw_rate_index_ofdm, legacy_rate_index, rate_index_to_peer_rate, rate_value_to_index,
+    rateset_11g_index, rateset_ht_bitmap, rateset_vht_bitmap, select_tx_rate,
 };
 pub use registers::{CsrAccess, DeviceFamily, IoBarrier, IwxRegisters, RegisterError};
 pub use rings::{

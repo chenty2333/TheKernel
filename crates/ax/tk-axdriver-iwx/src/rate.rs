@@ -153,6 +153,68 @@ pub fn rate_value_to_index(rate: u16) -> usize {
         .unwrap_or(RATES.len())
 }
 
+/// Find the peer's original rate-set byte for one iwx rate-table index.
+// upstream: if_iwx.c iwx_ridx2rate()
+pub fn rate_index_to_peer_rate(peer_rates: &[u8], rate_index: usize) -> u8 {
+    let Some(rate) = RATES.get(rate_index) else {
+        return 0;
+    };
+    peer_rates
+        .iter()
+        .copied()
+        .find(|value| u16::from(*value & 0x7f) == rate.value)
+        .unwrap_or(0)
+}
+
+/// Convert an 802.11 legacy rate to the exact iwx table row or sentinel.
+// upstream: if_iwx.c iwx_rval2ridx()
+pub fn legacy_rate_index(rate: u8) -> usize {
+    RATES
+        .iter()
+        .position(|entry| entry.legacy_plcp.is_some() && entry.value == u16::from(rate))
+        .unwrap_or(RATES.len())
+}
+
+/// Build the firmware CCK/OFDM basic-rate masks, adding lower mandatory rates.
+// upstream: if_iwx.c iwx_ack_rates()
+pub fn ack_rate_masks(peer_rates: &[u8], two_ghz: bool) -> (u32, u32) {
+    const RATE_BASIC: u8 = 0x80;
+    let mut cck = 0u32;
+    let mut ofdm = 0u32;
+    let mut lowest_cck = None;
+    let mut lowest_ofdm = None;
+    if two_ghz {
+        for index in 0..4 {
+            if rate_index_to_peer_rate(peer_rates, index) & RATE_BASIC != 0 {
+                cck |= 1 << index;
+                lowest_cck = Some(lowest_cck.map_or(index, |low: usize| low.min(index)));
+            }
+        }
+    }
+    for index in 4..=15 {
+        if rate_index_to_peer_rate(peer_rates, index) & RATE_BASIC != 0 {
+            ofdm |= 1 << (index - 4);
+            lowest_ofdm = Some(lowest_ofdm.map_or(index, |low: usize| low.min(index)));
+        }
+    }
+    if lowest_ofdm.is_some_and(|lowest| 9 < lowest) {
+        ofdm |= 1 << (9 - 4);
+    }
+    if lowest_ofdm.is_some_and(|lowest| 6 < lowest) {
+        ofdm |= 1 << (6 - 4);
+    }
+    ofdm |= 1; // 6 Mbps is mandatory for OFDM.
+    if two_ghz {
+        for index in (0..4).rev() {
+            if lowest_cck.is_some_and(|lowest| index < lowest) {
+                cck |= 1 << index;
+            }
+        }
+        cck |= 1; // 1 Mbps is mandatory for DSSS/HR-DSSS.
+    }
+    (cck, ofdm)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxRateInput<'a> {
     pub multicast: bool,
@@ -322,6 +384,17 @@ mod tests {
         assert_eq!(fw_rate_index_cck(22), 3);
         assert_eq!(fw_rate_index_cck(0), 0);
         assert_eq!(rate_value_to_index(26), RATES.len());
+    }
+
+    #[test]
+    fn ack_masks_add_lower_mandatory_rates_and_keep_basic_bits() {
+        let peer_rates = [0x82, 0x8b, 0xb0, 0xec]; // 1/5.5 Mbps CCK; 24/54 Mbps OFDM.
+        assert_eq!(rate_index_to_peer_rate(&peer_rates, 0), 0x82);
+        assert_eq!(legacy_rate_index(11), 2);
+        let (cck, ofdm) = ack_rate_masks(&peer_rates, true);
+        assert_eq!(cck, (1 << 0) | (1 << 2));
+        assert_eq!(ofdm, (1 << 0) | (1 << 2) | (1 << 5) | (1 << 11));
+        assert_eq!(ack_rate_masks(&peer_rates, false).0, 0);
     }
 
     #[test]
