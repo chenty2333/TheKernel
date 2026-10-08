@@ -781,8 +781,8 @@ pub(super) fn upload_uc_firmware(
         }
         return Err(error);
     }
-    let authentication = intel_gt::guc_fw::authenticate_huc(&owner.bus, rsa_offset)
-        .and_then(|_| intel_gt::guc_fw::wait_huc_auth(&owner.bus).map(|_| ()))
+    let authentication = intel_gt::huc::authenticate_by_guc(&owner.bus, rsa_offset)
+        .map(|_| ())
         .map_err(|_| Error::Quarantined);
     if let Err(error) = authentication {
         let _ = huc.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
