@@ -28,6 +28,10 @@ pub enum CommandError {
     TooManyParts,
     PayloadTooLarge,
     InvalidResponse,
+    InvalidIndex,
+    SlotBusy,
+    WrongQueue,
+    NoResponseSlot,
     Ring(RingError),
     Dma(DmaError),
 }
@@ -138,6 +142,201 @@ impl EncodedCommand {
     }
 }
 
+/// A command slot's interrupt-visible response and transmit-lifetime state.
+#[derive(Debug, PartialEq, Eq)]
+struct CommandSlot {
+    active: bool,
+    generation: u32,
+    wants_response: bool,
+    response_capacity: usize,
+    response: Option<Vec<u8>>,
+    acknowledged: bool,
+    external_payload_released: bool,
+}
+
+impl CommandSlot {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            generation: 0,
+            wants_response: false,
+            response_capacity: 0,
+            response: None,
+            acknowledged: false,
+            external_payload_released: false,
+        }
+    }
+}
+
+/// Command queue state needed to receive notifications and retire command
+/// storage. Sleeping/wakeup is deliberately supplied by the kernel adapter.
+pub struct CommandSlots {
+    queue_id: u8,
+    generation: u32,
+    queued: usize,
+    slots: [CommandSlot; 256],
+}
+
+/// Result reported when a command acknowledgement wakes its synchronous waiter.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompletedCommand {
+    pub response: Option<Vec<u8>>,
+    pub external_payload_released: bool,
+}
+
+impl CommandSlots {
+    pub fn new(queue_id: u8, generation: u32) -> Self {
+        Self {
+            queue_id,
+            generation,
+            queued: 0,
+            slots: core::array::from_fn(|_| CommandSlot::empty()),
+        }
+    }
+
+    pub const fn queued(&self) -> usize {
+        self.queued
+    }
+
+    /// Reserve the response buffer before publishing the TX descriptor.
+    // upstream: if_iwx.c iwx_send_cmd() response-buffer allocation
+    pub fn reserve(
+        &mut self,
+        index: usize,
+        generation: u32,
+        flags: u32,
+        response_capacity: usize,
+        external_payload: bool,
+    ) -> Result<(), CommandError> {
+        if index >= self.slots.len() {
+            return Err(CommandError::InvalidIndex);
+        }
+        if generation != self.generation {
+            return Err(CommandError::InvalidResponse);
+        }
+        let wants_response = flags & CMD_WANT_RESPONSE != 0;
+        if wants_response
+            && (flags & CMD_ASYNC != 0
+                || response_capacity < 8
+                || response_capacity > MAX_RESPONSE_BYTES)
+        {
+            return Err(CommandError::InvalidResponse);
+        }
+        let slot = &mut self.slots[index];
+        if slot.active {
+            return Err(CommandError::SlotBusy);
+        }
+        let mut response = None;
+        if wants_response {
+            let mut buffer = Vec::new();
+            buffer
+                .try_reserve_exact(response_capacity)
+                .map_err(|_| CommandError::PayloadTooLarge)?;
+            response = Some(buffer);
+        }
+        *slot = CommandSlot {
+            active: true,
+            generation,
+            wants_response,
+            response_capacity: if wants_response { response_capacity } else { 0 },
+            response,
+            acknowledged: false,
+            external_payload_released: !external_payload,
+        };
+        self.queued += 1;
+        Ok(())
+    }
+
+    /// Store a matched command notification, rejecting failed or oversized replies.
+    // upstream: if_iwx.c RX command-response cases in iwx_notif_intr()
+    pub fn receive_response(
+        &mut self,
+        queue_id: u8,
+        index: usize,
+        generation: u32,
+        packet: &[u8],
+        failed: bool,
+    ) -> Result<(), CommandError> {
+        if queue_id != self.queue_id {
+            return Err(CommandError::WrongQueue);
+        }
+        let slot = self
+            .slots
+            .get_mut(index)
+            .ok_or(CommandError::InvalidIndex)?;
+        if !slot.active || slot.generation != generation || !slot.wants_response {
+            return Err(CommandError::NoResponseSlot);
+        }
+        let Some(response) = slot.response.as_mut() else {
+            return Err(CommandError::NoResponseSlot);
+        };
+        if failed || packet.len() > slot.response_capacity {
+            slot.response = None;
+            return Err(CommandError::InvalidResponse);
+        }
+        response.extend_from_slice(packet);
+        Ok(())
+    }
+
+    /// Retire one command acknowledgement; unrelated queues are ignored.
+    // upstream: if_iwx.c iwx_cmd_done()
+    pub fn command_done(
+        &mut self,
+        queue_id: u8,
+        index: usize,
+        generation: u32,
+    ) -> Result<bool, CommandError> {
+        if queue_id != self.queue_id {
+            return Ok(false);
+        }
+        let slot = self
+            .slots
+            .get_mut(index)
+            .ok_or(CommandError::InvalidIndex)?;
+        if !slot.active || slot.generation != generation {
+            return Ok(false);
+        }
+        if self.queued == 0 {
+            return Err(CommandError::InvalidResponse);
+        }
+        self.queued -= 1;
+        slot.acknowledged = true;
+        slot.external_payload_released = true;
+        Ok(true)
+    }
+
+    /// Hand an acknowledged response to the waiter and release the slot.
+    pub fn take_completed(
+        &mut self,
+        index: usize,
+        generation: u32,
+    ) -> Result<CompletedCommand, CommandError> {
+        let slot = self
+            .slots
+            .get_mut(index)
+            .ok_or(CommandError::InvalidIndex)?;
+        if !slot.active || slot.generation != generation || !slot.acknowledged {
+            return Err(CommandError::NoResponseSlot);
+        }
+        let response = slot.response.take();
+        let external_payload_released = slot.external_payload_released;
+        *slot = CommandSlot::empty();
+        Ok(CompletedCommand {
+            response,
+            external_payload_released,
+        })
+    }
+
+    /// Drop every response slot after hardware reset changes the generation.
+    pub fn reset(&mut self, generation: u32) {
+        self.generation = generation;
+        self.queued = 0;
+        for slot in &mut self.slots {
+            *slot = CommandSlot::empty();
+        }
+    }
+}
+
 /// Submit a prepared command on the queue and copy its wire bytes into either
 /// the inline command array or the caller-provided external DMA buffer.
 // upstream: if_iwx.c iwx_send_cmd() descriptor write, sync and queue kick preparation
@@ -177,6 +376,39 @@ pub const fn command_version(id: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_slots_hold_bounded_responses_until_ack_and_release_payload() {
+        let mut slots = CommandSlots::new(9, 4);
+        slots.reserve(2, 4, CMD_WANT_RESPONSE, 24, true).unwrap();
+        assert_eq!(slots.queued(), 1);
+        slots.receive_response(9, 2, 4, &[1, 2, 3], false).unwrap();
+        assert_eq!(
+            slots.receive_response(9, 2, 4, &[0; 25], false),
+            Err(CommandError::InvalidResponse)
+        );
+        assert_eq!(slots.command_done(8, 2, 4), Ok(false));
+        assert_eq!(slots.queued(), 1);
+        assert_eq!(slots.command_done(9, 2, 4), Ok(true));
+        let complete = slots.take_completed(2, 4).unwrap();
+        assert_eq!(complete.response, None); // invalid oversized response is discarded
+        assert!(complete.external_payload_released);
+        assert_eq!(slots.queued(), 0);
+    }
+
+    #[test]
+    fn command_slot_reset_cancels_old_generation_and_releases_responses() {
+        let mut slots = CommandSlots::new(7, 1);
+        slots.reserve(0, 1, CMD_WANT_RESPONSE, 24, false).unwrap();
+        slots.receive_response(7, 0, 1, &[9], false).unwrap();
+        slots.reset(2);
+        assert_eq!(slots.queued(), 0);
+        assert_eq!(slots.command_done(7, 0, 1), Ok(false));
+        assert_eq!(
+            slots.reserve(0, 1, 0, 0, false),
+            Err(CommandError::InvalidResponse)
+        );
+    }
 
     #[test]
     fn legacy_group_command_uses_wide_long_group_header() {

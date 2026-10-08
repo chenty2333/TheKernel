@@ -19,7 +19,8 @@ mod rx;
 
 pub use command::{
     CMD_ASYNC, CMD_FAILED_MASK, CMD_SEND_DURING_RFKILL, CMD_WANT_RESPONSE, CommandError,
-    EncodedCommand, HostCommand, command_group_id, command_opcode, command_version, submit_command,
+    CommandSlots, CompletedCommand, EncodedCommand, HostCommand, command_group_id, command_opcode,
+    command_version, submit_command,
 };
 pub use config::{
     AX211_DEVICE_ID, DeviceConfig, FirmwareConfig, INTEL_VENDOR_ID, RuntimeConfig, lookup_config,
