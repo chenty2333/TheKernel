@@ -45,21 +45,28 @@ pub fn take_staged() -> Option<Result<FirmwareBundle, FirmwareRequestError>> {
 }
 
 fn load_ax211_firmware() {
-    let result = load_bundle(axdriver_base::firmware::request);
+    let result = load_bundle(axdriver_base::firmware::request, None);
     *STAGED.lock() = Some(result);
 }
 
+// upstream: if_iwx.c iwx_read_firmware() and iwx_load_pnvm() file request paths
 fn load_bundle(
     mut request: impl FnMut(&str, usize) -> Option<Vec<u8>>,
+    sku_id: Option<[u32; 3]>,
 ) -> Result<FirmwareBundle, FirmwareRequestError> {
     let config = DeviceConfig::SoGfAx211.firmware();
     let bytes =
         request(config.firmware, FW_MAX_BYTES).ok_or(FirmwareRequestError::FirmwareMissing)?;
     let image = FirmwareImage::parse(&bytes).map_err(FirmwareRequestError::FirmwareInvalid)?;
-    let pnvm_file = match (image.pnvm.is_some(), config.pnvm) {
-        (true, _) | (_, None) => None,
-        (false, Some(path)) => {
-            Some(request(path, PNVM_MAX_BYTES).ok_or(FirmwareRequestError::PnvmMissing)?)
+    let pnvm_file = if sku_id == Some([0; 3]) {
+        // upstream: iwx_load_pnvm() returns immediately for an all-zero SKU.
+        None
+    } else {
+        match (image.pnvm.is_some(), config.pnvm) {
+            (true, _) | (_, None) => None,
+            (false, Some(path)) => {
+                Some(request(path, PNVM_MAX_BYTES).ok_or(FirmwareRequestError::PnvmMissing)?)
+            }
         }
     };
     Ok(FirmwareBundle { image, pnvm_file })
@@ -81,14 +88,17 @@ mod tests {
     #[test]
     fn requests_linux_firmware_paths_with_size_caps() {
         let mut requests = Vec::new();
-        let bundle = load_bundle(|path, max| {
-            requests.push((path.to_owned(), max));
-            match path {
-                "/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode" => Some(minimal_api89_image()),
-                "/lib/firmware/iwlwifi-so-a0-gf-a0.pnvm" => Some(vec![1, 2, 3]),
-                _ => None,
-            }
-        })
+        let bundle = load_bundle(
+            |path, max| {
+                requests.push((path.to_owned(), max));
+                match path {
+                    "/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode" => Some(minimal_api89_image()),
+                    "/lib/firmware/iwlwifi-so-a0-gf-a0.pnvm" => Some(vec![1, 2, 3]),
+                    _ => None,
+                }
+            },
+            Some([1, 2, 3]),
+        )
         .unwrap();
         assert!(bundle.image.sections.is_empty());
         assert_eq!(bundle.pnvm_file.as_deref(), Some(&[1, 2, 3][..]));
@@ -108,9 +118,24 @@ mod tests {
     }
 
     #[test]
+    fn zero_sku_skips_external_pnvm_request() {
+        let mut requested = Vec::new();
+        let bundle = load_bundle(
+            |path, _| {
+                requested.push(path.to_owned());
+                (path == "/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode").then(minimal_api89_image)
+            },
+            Some([0; 3]),
+        )
+        .unwrap();
+        assert!(bundle.pnvm_file.is_none());
+        assert_eq!(requested, ["/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode"]);
+    }
+
+    #[test]
     fn refuses_when_required_firmware_is_missing() {
         assert_eq!(
-            load_bundle(|_, _| None).unwrap_err(),
+            load_bundle(|_, _| None, None).unwrap_err(),
             FirmwareRequestError::FirmwareMissing
         );
     }
