@@ -751,6 +751,20 @@ impl UsbBluetoothHci {
             return;
         }
         match event[0] {
+            // HCI Link Key Request: answer from the host key database or
+            // explicitly report that no stored key is available.
+            0x17 if event.len() == 8 => {
+                let mut address = [0; 6];
+                address.copy_from_slice(&event[2..8]);
+                if let Some(record) = self.link_keys.iter().find(|key| key[..6] == address) {
+                    let mut parameters = [0u8; 22];
+                    parameters[..6].copy_from_slice(&address);
+                    parameters[6..].copy_from_slice(&record[8..24]);
+                    let _ = self.command_complete(0x040b, &parameters);
+                } else {
+                    let _ = self.command_complete(0x040c, &address);
+                }
+            }
             0x03 if event.len() >= 11 => {
                 let status = event[2];
                 let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
@@ -769,6 +783,31 @@ impl UsbBluetoothHci {
                 let mut address = [0; 6];
                 address.copy_from_slice(&event[8..14]);
                 self.update_connection(address, kind, handle, status == 0);
+            }
+            // HCI LE Long Term Key Request: look up the exact address,
+            // address type, EDIV and Rand tuple supplied in the mgmt key.
+            0x3e if event.len() == 15 && event[2] == 0x05 => {
+                let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
+                let ediv = u16::from_le_bytes([event[13], event[14]]);
+                let mut random = [0; 8];
+                random.copy_from_slice(&event[5..13]);
+                let peer = self.management_peer_for_handle(handle);
+                let key = peer.and_then(|(address, address_type)| {
+                    self.long_term_keys.iter().find(|record| {
+                        record[..6] == address
+                            && record[6] == address_type
+                            && u16::from_le_bytes([record[10], record[11]]) == ediv
+                            && record[12..20] == random
+                    })
+                });
+                if let Some(record) = key {
+                    let mut parameters = [0u8; 18];
+                    parameters[..2].copy_from_slice(&handle.to_le_bytes());
+                    parameters[2..].copy_from_slice(&record[20..36]);
+                    let _ = self.command_complete(0x201a, &parameters);
+                } else {
+                    let _ = self.command_complete(0x201b, &handle.to_le_bytes());
+                }
             }
             0x05 if event.len() >= 6 => {
                 let handle = u16::from_le_bytes([event[3], event[4]]) & 0x0fff;
