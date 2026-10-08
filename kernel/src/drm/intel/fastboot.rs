@@ -269,12 +269,6 @@ struct PowerPin {
     masks: [u32; 3],
 }
 
-fn source_watermark_config() -> Option<super::pipe::WatermarkConfig> {
-    super::POWER
-        .lock()
-        .as_ref()
-        .map(super::power::PowerState::watermark_config)
-}
 impl PowerPin {
     fn acquire(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
         // i915 XELPD power map: PW1, PW2 and PWA; DDI_IO and legacy AUX.
@@ -661,6 +655,7 @@ struct Native<R, T> {
     preferred: DrmMode,
     sink_edid: Vec<u8>,
     afc_startup: Option<u8>,
+    watermark: super::pipe::WatermarkConfig,
     port: TcPort,
     pci: axdriver_display::DisplayPciIdentity,
     irq_event_sequence: AtomicU32,
@@ -1477,10 +1472,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             let old_mode = state.current_mode;
             let old_surface = before;
             let old_pitch = old_firmware.plane.pitch;
-            let Some(watermark) = source_watermark_config() else {
-                complete.signal_error();
-                return Err(DrmError::DeviceLost);
-            };
+            let watermark = self.watermark;
             let mut display_writes_started = false;
             let transition = super::tc_modeset::program(
                 &self.registers,
@@ -1781,6 +1773,14 @@ pub(super) fn init(
         let pin = PowerPin::acquire(&window, port)?;
         super::dmc::display_power_ready(window, intel_display::dmc::DmcPlatform::AlderLakeN);
         let admitted = (|| {
+            let watermark =
+                super::power::read_source_watermark_config(&window, &super::gmbus::MonotonicTimer)
+                    .map_err(|error| {
+                        axlog::warn!(
+                            "intel-fastboot: source watermark profile unavailable: {error}"
+                        );
+                        Error::Refused
+                    })?;
             let first = capture(&window, &pin, port, afc_startup)?;
             if first.plane.pitch != (first.plane.width * 4).div_ceil(64) * 64 {
                 return Err(Error::Refused);
@@ -1797,10 +1797,10 @@ pub(super) fn init(
                 return Err(Error::Refused);
             }
             let (modes, preferred, current) = native_modes(&sink_edid, &first)?;
-            Ok((first, modes, preferred, current, sink_edid))
+            Ok((first, modes, preferred, current, sink_edid, watermark))
         })();
         match admitted {
-            Ok((f, modes, preferred, current, edid)) => Ok((
+            Ok((f, modes, preferred, current, edid, watermark)) => Ok((
                 pin,
                 port,
                 f,
@@ -1809,6 +1809,7 @@ pub(super) fn init(
                 current,
                 edid,
                 afc_startup,
+                watermark,
                 info,
             )),
             Err(e) => {
@@ -1817,8 +1818,18 @@ pub(super) fn init(
             }
         }
     };
-    let (power, port, firmware, modes, preferred, current_mode, sink_edid, afc_startup, info) =
-        setup().map_err(message)?;
+    let (
+        power,
+        port,
+        firmware,
+        modes,
+        preferred,
+        current_mode,
+        sink_edid,
+        afc_startup,
+        watermark,
+        info,
+    ) = setup().map_err(message)?;
     let pci = axdriver_display::DisplayPciIdentity {
         bus: bdf.bus,
         device: bdf.device,
@@ -1839,6 +1850,7 @@ pub(super) fn init(
         preferred: preferred.kms,
         sink_edid,
         afc_startup,
+        watermark,
         port,
         pci,
         irq_event_sequence: AtomicU32::new(0),
@@ -1937,6 +1949,16 @@ mod tests {
     use core::sync::atomic::AtomicU64;
 
     use super::{super::gtt::PageTable, *};
+
+    fn source_watermark_fixture() -> super::super::pipe::WatermarkConfig {
+        super::super::pipe::WatermarkConfig {
+            display_ver: 13,
+            latencies: [2, 4, 6, 8, 14, 16, 0, 0],
+            num_levels: 6,
+            sagv_block_time_us: 0,
+        }
+    }
+
     #[derive(Clone)]
     struct Model {
         inner: Arc<Mutex<ModelState>>,
@@ -2247,6 +2269,7 @@ mod tests {
             preferred: current_mode.kms,
             sink_edid: Vec::new(),
             afc_startup: None,
+            watermark: source_watermark_fixture(),
             port: TcPort::Tc1,
             pci: axdriver_display::DisplayPciIdentity {
                 bus: 0,
@@ -2393,6 +2416,7 @@ mod tests {
             preferred: current_mode.kms,
             sink_edid: Vec::new(),
             afc_startup: None,
+            watermark: source_watermark_fixture(),
             port: TcPort::Tc1,
             pci: axdriver_display::DisplayPciIdentity {
                 bus: 0,

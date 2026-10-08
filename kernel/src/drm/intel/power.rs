@@ -1100,6 +1100,48 @@ impl<R: Registers, T: super::gmbus::PollTimer> WmLatencyIo for PcodeWmLatency<'_
     }
 }
 
+/// Read the source watermark latency profile without running the mutating
+/// display bring-up phases. The legacy TC fastboot route already owns a live
+/// firmware scanout and cannot construct a `PowerState` by quiescing it first.
+pub(crate) fn read_source_watermark_config<R: Registers, T: super::gmbus::PollTimer>(
+    regs: &R,
+    timer: &T,
+) -> Result<super::pipe::WatermarkConfig, String> {
+    let mut latencies = [0u32; skl_watermark_full::WM_LEVELS];
+    let display = WatermarkDisplayCaps {
+        display_ver: 13,
+        display_ver_fixed: 13,
+        alderlake_p: true,
+        sagv: true,
+        sagv_wm: true,
+        has_hw_sagv_wm: true,
+        ..WatermarkDisplayCaps::default()
+    };
+    let num_levels = skl_watermark_full::skl_setup_wm_latency(
+        &PcodeWmLatency { regs, timer },
+        &display,
+        &mut latencies,
+    )
+    .map_err(|error| format!("PCode watermark-latency read returned errno {error}"))?;
+    let sagv_block_time_us = match super::pcode::read_sagv_block_time_us(regs, timer) {
+        Ok(value) if value <= u16::MAX as u32 => value,
+        Ok(value) => {
+            axlog::warn!("intel-gpu: PCode SAGV block time {value}us exceeds i915's 16-bit limit");
+            0
+        }
+        Err(error) => {
+            axlog::debug!("intel-gpu: could not read PCode SAGV block time: {error:?}");
+            0
+        }
+    };
+    Ok(super::pipe::WatermarkConfig {
+        display_ver: 13,
+        latencies,
+        num_levels,
+        sagv_block_time_us,
+    })
+}
+
 struct HswPowerWellAdapter<'a, R: Registers> {
     regs: &'a R,
 }
