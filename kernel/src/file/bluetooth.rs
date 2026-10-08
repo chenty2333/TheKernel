@@ -26,6 +26,7 @@ const HCIGETDEVINFO: u32 = 0x8004_48d3;
 const HCI_DEV_NONE: u16 = 0xffff;
 const HCI_CHANNEL_MONITOR: u16 = 2;
 const MAX_HCI_PACKET: usize = 65_536;
+const HCI_UP: u32 = 1 << 0;
 
 #[cfg(feature = "input")]
 type UsbAdapter = Arc<SpinMutex<axdriver::UsbBluetoothHci>>;
@@ -55,6 +56,15 @@ fn usb_adapter(index: u16) -> Option<UsbAdapter> {
     axdriver::bluetooth_devices()
         .into_iter()
         .find(|adapter| adapter.lock().index() == index)
+}
+
+fn encode_dev_req(index: u16, is_up: bool) -> [u8; 8] {
+    // Linux `struct hci_dev_req` has u16 dev_id followed by aligned u32
+    // dev_opt; preserve the two padding bytes in its native ABI layout.
+    let mut request = [0u8; 8];
+    request[..2].copy_from_slice(&index.to_ne_bytes());
+    request[4..].copy_from_slice(&(if is_up { HCI_UP } else { 0 }).to_ne_bytes());
+    request
 }
 
 #[repr(C)]
@@ -137,6 +147,15 @@ mod tests {
             HciSocket::validate_socket_type(SOCK_RAW as u32, BTPROTO_HCI),
             Ok(())
         );
+    }
+
+    #[test]
+    fn hci_dev_list_records_include_aligned_flags() {
+        assert_eq!(
+            encode_dev_req(0x1234, false),
+            [0x34, 0x12, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(encode_dev_req(0x1234, true), [0x34, 0x12, 0, 0, 1, 0, 0, 0]);
     }
 }
 
@@ -368,14 +387,16 @@ impl FileLike for HciSocket {
                 let count = usize::from(requested).min(devices.len());
                 for (slot, adapter) in devices.iter().take(count).enumerate() {
                     #[cfg(feature = "input")]
-                    let index = adapter.lock().index();
-                    #[cfg(not(feature = "input"))]
-                    let index = {
-                        let _ = adapter;
-                        0u16
+                    let (index, is_up) = {
+                        let adapter = adapter.lock();
+                        (adapter.index(), adapter.is_up())
                     };
-                    let mut request = [0u8; 8];
-                    request[..2].copy_from_slice(&index.to_ne_bytes());
+                    #[cfg(not(feature = "input"))]
+                    let (index, is_up) = {
+                        let _ = adapter;
+                        (0u16, false)
+                    };
+                    let request = encode_dev_req(index, is_up);
                     context
                         .user_memory()
                         .write_bytes(
