@@ -696,6 +696,7 @@ struct Native<R, T> {
     timer: T,
     gtt: Arc<Gtt>,
     power: PowerPin,
+    shared_dpll: Mutex<super::shared_dpll::SharedDpllState>,
     baseline: Firmware,
     modes: Vec<NativeMode>,
     preferred: DrmMode,
@@ -706,6 +707,33 @@ struct Native<R, T> {
     pci: axdriver_display::DisplayPciIdentity,
     irq_event_sequence: AtomicU32,
     state: Mutex<State>,
+}
+
+/// Re-read the selected TC PLL through the translated generic manager while
+/// the Native-owned pin keeps the source-mapped display/PHY domains alive.
+fn translated_tc_dpll_enabled<R: Registers, T: PollTimer>(
+    native: &Native<R, T>,
+) -> Result<bool, String> {
+    let identity = super::shared_dpll::AdlNIdentity::verify(
+        native.pci.vendor_id,
+        native.pci.device_id,
+        native.pci.revision,
+    )
+    .map_err(|error| format!("shared DPLL identity changed: {error:?}"))?;
+    let mut power =
+        super::shared_dpll::PinnedDpllPower::new(&native.power, identity, native.baseline.refclk)
+            .map_err(|error| format!("shared DPLL power context unavailable: {error:?}"))?;
+    native
+        .shared_dpll
+        .lock()
+        .get_hw_state(
+            &native.registers,
+            &native.timer,
+            &mut power,
+            (3 + native.port.index()) as usize,
+        )
+        .map(|(enabled, _)| enabled)
+        .map_err(|error| format!("translated shared DPLL readout refused: {error:?}"))
 }
 
 /// Debounce task-context DDC samples and report the physical connector state
@@ -1520,44 +1548,60 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             let old_pitch = old_firmware.plane.pitch;
             let watermark = self.watermark;
             let mut display_writes_started = false;
-            let transition = super::tc_modeset::program(
-                &self.registers,
-                &self.timer,
-                self.port,
-                &target.timing,
-                s.pitch,
-                surface,
-                Some(watermark),
-                &target_pll,
-                self.afc_startup,
-                &avi_words,
-                &self.sink_edid,
-                None,
-                None,
-                true,
-                None,
-                &mut display_writes_started,
-            )
-            .and_then(|()| {
-                let next_state = capture(&self.registers, &self.power, self.port, self.afc_startup)
-                    .map_err(|e| format!("TC modeset readback failed: {e:?}"))?;
-                if !same_mode_state(
-                    &next_state,
-                    &self.baseline,
-                    target,
-                    surface,
-                    s.pitch,
-                    &target_pll,
-                    self.port,
-                    expected_target_avi,
-                    &expected_target_phy,
-                ) {
-                    return Err(String::from(
-                        "TC modeset state did not match the full target image",
-                    ));
-                }
-                Ok(next_state)
-            });
+            let transition = translated_tc_dpll_enabled(self)
+                .and_then(|enabled| {
+                    if enabled != (old_firmware.pll.enable != 0) {
+                        return Err(String::from(
+                            "translated shared DPLL no longer matches the active before-image",
+                        ));
+                    }
+                    super::tc_modeset::program(
+                        &self.registers,
+                        &self.timer,
+                        self.port,
+                        &target.timing,
+                        s.pitch,
+                        surface,
+                        Some(watermark),
+                        &target_pll,
+                        self.afc_startup,
+                        &avi_words,
+                        &self.sink_edid,
+                        None,
+                        None,
+                        true,
+                        None,
+                        &mut display_writes_started,
+                    )
+                })
+                .and_then(|()| {
+                    let next_state =
+                        capture(&self.registers, &self.power, self.port, self.afc_startup)
+                            .map_err(|e| format!("TC modeset readback failed: {e:?}"))?;
+                    let manager_pll_on = translated_tc_dpll_enabled(self)?;
+                    if manager_pll_on != (next_state.pll.enable != 0) {
+                        return Err(String::from(
+                            "firmware and translated TC DPLL enable readouts disagree after \
+                             modeset",
+                        ));
+                    }
+                    if !same_mode_state(
+                        &next_state,
+                        &self.baseline,
+                        target,
+                        surface,
+                        s.pitch,
+                        &target_pll,
+                        self.port,
+                        expected_target_avi,
+                        &expected_target_phy,
+                    ) {
+                        return Err(String::from(
+                            "TC modeset state did not match the full target image",
+                        ));
+                    }
+                    Ok(next_state)
+                });
             if display_writes_started {
                 // Equivalent to source vblank off/on around this serialized
                 // transaction. Hardware counter resets in forward OR rollback
@@ -1871,7 +1915,7 @@ pub(super) fn init(
                     );
                     Error::Refused
                 })?;
-            if manager_pll_on != first.pll.enable {
+            if manager_pll_on != (first.pll.enable != 0) {
                 axlog::warn!(
                     "intel-fastboot: firmware and translated TC DPLL enable readouts disagree: \
                      firmware={} manager={}",
@@ -1895,10 +1939,18 @@ pub(super) fn init(
                 return Err(Error::Refused);
             }
             let (modes, preferred, current) = native_modes(&sink_edid, &first)?;
-            Ok((first, modes, preferred, current, sink_edid, watermark))
+            Ok((
+                first,
+                modes,
+                preferred,
+                current,
+                sink_edid,
+                watermark,
+                shared_dpll,
+            ))
         })();
         match admitted {
-            Ok((f, modes, preferred, current, edid, watermark)) => Ok((
+            Ok((f, modes, preferred, current, edid, watermark, shared_dpll)) => Ok((
                 pin,
                 port,
                 f,
@@ -1908,6 +1960,7 @@ pub(super) fn init(
                 edid,
                 afc_startup,
                 watermark,
+                shared_dpll,
                 info,
             )),
             Err(e) => {
@@ -1926,6 +1979,7 @@ pub(super) fn init(
         sink_edid,
         afc_startup,
         watermark,
+        shared_dpll,
         info,
     ) = setup().map_err(message)?;
     let pci = axdriver_display::DisplayPciIdentity {
@@ -1943,6 +1997,7 @@ pub(super) fn init(
         timer: super::gmbus::MonotonicTimer,
         gtt,
         power,
+        shared_dpll: Mutex::new(shared_dpll),
         baseline: firmware.clone(),
         modes,
         preferred: preferred.kms,
@@ -2318,6 +2373,20 @@ mod tests {
             self.0.fetch_add(1000, Ordering::Relaxed)
         }
     }
+    fn test_shared_dpll(
+        r: &Model,
+        pin: &PowerPin,
+        refclk: u32,
+    ) -> super::super::shared_dpll::SharedDpllState {
+        let identity = super::super::shared_dpll::AdlNIdentity::verify(0x8086, 0x46d0, 0).unwrap();
+        let mut manager = super::super::shared_dpll::SharedDpllState::new(identity, 0);
+        let mut power =
+            super::super::shared_dpll::PinnedDpllPower::new(pin, identity, refclk).unwrap();
+        manager
+            .init(r, &Timer(Arc::new(AtomicU64::new(0))), &mut power)
+            .unwrap();
+        manager
+    }
     fn native() -> (
         Arc<Native<Model, Timer>>,
         Model,
@@ -2357,11 +2426,13 @@ mod tests {
             array.write(0x200000 / 4096 + i, 0x80000001 + (i as u64) * 4096);
         }
         let gtt = Arc::new(Gtt::over(Box::new(array.clone())).unwrap());
+        let shared_dpll = test_shared_dpll(&r, &power, firmware.refclk);
         let adapter = Arc::new(Native {
             registers: r.clone(),
             timer: Timer(Arc::new(AtomicU64::new(0))),
             gtt,
             power,
+            shared_dpll: Mutex::new(shared_dpll),
             baseline: firmware.clone(),
             modes: vec![current_mode, target_mode],
             preferred: current_mode.kms,
@@ -2504,11 +2575,13 @@ mod tests {
             array.write(0x200000 / 4096 + i, 0x80000001 + (i as u64) * 4096);
         }
         let gtt = Arc::new(Gtt::over(Box::new(array.clone())).unwrap());
+        let shared_dpll = test_shared_dpll(&r, &power, firmware.refclk);
         let adapter = Arc::new(Native {
             registers: r.clone(),
             timer: Timer(Arc::new(AtomicU64::new(0))),
             gtt,
             power,
+            shared_dpll: Mutex::new(shared_dpll),
             baseline: firmware.clone(),
             modes: vec![current_mode, target_mode],
             preferred: current_mode.kms,

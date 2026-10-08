@@ -16,12 +16,13 @@ Both modules are exported and compiled by `cargo check -p tk-intel-display
 module was added. The active N305 HDMI planner consumes the translated
 `icl_calc_wrpll()` and `icl_calc_dpll_state()` values. The kernel-side ADL-N
 shared-DPLL adapter now has both the original `PowerState` backend and a
-read-only fastboot-pin backend. Native fastboot initializes a temporary
-manager and calls the translated generic DKL `get_hw_state` for the selected
-TC1/TC2 PLL, refusing admission if it disagrees with the firmware PLL enable
-readout. This validates the dispatch on the live admission path but is not a
-persistent atomic-state manager: TC modesets still use the restricted
-transaction and direct DKL enable/disable sequence. Type-C/MG PHY runtime
+read-only fastboot-pin backend. Native fastboot persists one manager for the
+KMS lifetime and calls its generic DKL `get_hw_state` for the selected
+TC1/TC2 PLL at admission and on both sides of each restricted modeset,
+refusing if it disagrees with the firmware PLL enable readout. This wires
+source readout onto active paths but is not yet an atomic-state allocator:
+TC modesets still use the restricted transaction and direct DKL
+enable/disable sequence. Type-C/MG PHY runtime
 paths and DP/Thunderbolt output call sites are also not connected. See
 `intel-shared-dpll-kernel.md` for the required integration order and boundary.
 

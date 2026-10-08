@@ -18,12 +18,13 @@ the outer display transaction has independently verified its hardware
 rollback. Recreating the state for each modeset or sanitizing before complete
 CRTC readout is invalid.
 
-Native fastboot now creates a temporary manager on admission and uses its
-generic DKL `get_hw_state` dispatcher for the selected TC1/TC2 PLL, checking
-that its enable bit agrees with the independent firmware capture. This is a
-read-only live-path integration only: the manager is not persisted across
-atomic commits, and `tc_modeset` still owns the direct DKL enable/disable
-sequence. The pin backend revalidates held source-mapped power requests, D0,
+Native fastboot now persists the manager for the KMS-device lifetime and uses
+its generic DKL `get_hw_state` dispatcher for the selected TC1/TC2 PLL during
+admission and before/after each restricted modeset, checking that its enable
+bit agrees with the independent firmware capture. This is a read-only
+live-path integration only: atomic reservation/commit still does not use the
+manager, and `tc_modeset` owns the direct DKL enable/disable sequence. The pin
+backend revalidates held source-mapped power requests, D0,
 DC-state, and refclk on every hook/access; logical DPLL power cookies never
 manufacture `PowerState` reference counts or change wells.
 
