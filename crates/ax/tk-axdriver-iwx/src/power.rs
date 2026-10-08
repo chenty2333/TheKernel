@@ -347,6 +347,44 @@ mod tests {
         );
         assert_eq!(events.borrow()[2], 1);
     }
+
+    #[test]
+    fn beacon_filter_defaults_zero_disable_and_tracks_abort_state() {
+        let enabled = beacon_filter_command(true, false, 1, 0).unwrap();
+        assert_eq!(enabled.bytes.len(), 8 + BEACON_FILTER_CONFIG_BYTES);
+        assert_eq!(&enabled.bytes[8..12], &5u32.to_le_bytes());
+        assert_eq!(&enabled.bytes[32..36], &1u32.to_le_bytes());
+        assert_eq!(&enabled.bytes[40..44], &50u32.to_le_bytes());
+        assert_eq!(&enabled.bytes[48..52], &0u32.to_le_bytes());
+        assert_eq!(&enabled.bytes[52..56], &0u32.to_le_bytes());
+        assert_eq!(&enabled.bytes[56..60], &0u32.to_le_bytes());
+        assert!(
+            beacon_filter_command(false, false, 1, 0).unwrap().bytes[8..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+
+        let mut state = BeaconFilterState::default();
+        let mut sent = 0;
+        update_beacon_abort(&mut state, true, 1, 0, |_| {
+            sent += 1;
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(sent, 0);
+        set_beacon_filter(&mut state, true, 1, 0, |_| {
+            sent += 1;
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        update_beacon_abort(&mut state, true, 1, 0, |_| {
+            sent += 1;
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(sent, 2);
+        assert!(state.filter_enabled && state.beacon_abort_enabled);
+    }
 }
 use crate::{CMD_ASYNC, CommandError, EncodedCommand, HostCommand};
 
@@ -360,3 +398,79 @@ pub const POWER_UAPSD_MISBEHAVING_ENABLE: u16 = 1 << 12;
 pub const UAPSD_RX_DATA_TIMEOUT: u32 = 50 * 1000;
 pub const UAPSD_TX_DATA_TIMEOUT: u32 = 50 * 1000;
 pub const POWER_KEEP_ALIVE_PERIOD_SEC: u64 = 25;
+pub const BEACON_FILTER_COMMAND: u32 = 0xd2;
+pub const BEACON_FILTER_CONFIG_BYTES: usize = 56;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BeaconFilterState {
+    pub filter_enabled: bool,
+    pub beacon_abort_enabled: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BeaconFilterError<E> {
+    Encode(CommandError),
+    Send(E),
+}
+
+/// Build the default beacon-filter configuration or a zeroed disable command.
+// upstream: if_iwx.c iwx_beacon_filter_send_cmd()
+pub fn beacon_filter_command(
+    enable_filter: bool,
+    abort_enabled: bool,
+    slot: u8,
+    queue: u8,
+) -> Result<EncodedCommand, CommandError> {
+    let mut payload = [0u8; BEACON_FILTER_CONFIG_BYTES];
+    if enable_filter {
+        for (index, value) in [5u32, 1, 72, 112, 1, 5, 1, 0, 50, 6]
+            .into_iter()
+            .enumerate()
+        {
+            payload[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        payload[40..44].copy_from_slice(&u32::from(abort_enabled).to_le_bytes());
+    }
+    let command = HostCommand {
+        id: BEACON_FILTER_COMMAND,
+        flags: 0,
+        response_capacity: 0,
+        parts: &[&payload],
+    };
+    Ok(EncodedCommand::encode(&command, slot, queue)?)
+}
+
+/// Enable/disable filtering, recording state only after successful send.
+// upstream: if_iwx.c iwx_enable_beacon_filter() / iwx_disable_beacon_filter()
+pub fn set_beacon_filter<E>(
+    state: &mut BeaconFilterState,
+    enabled: bool,
+    slot: u8,
+    queue: u8,
+    mut send: impl FnMut(&EncodedCommand) -> Result<(), E>,
+) -> Result<(), BeaconFilterError<E>> {
+    let command = beacon_filter_command(enabled, state.beacon_abort_enabled, slot, queue)
+        .map_err(BeaconFilterError::Encode)?;
+    send(&command).map_err(BeaconFilterError::Send)?;
+    state.filter_enabled = enabled;
+    Ok(())
+}
+
+/// Toggle beacon abort only when filtering is active; record the flag before
+/// issuing the command, matching upstream's update order.
+// upstream: if_iwx.c iwx_update_beacon_abort()
+pub fn update_beacon_abort<E>(
+    state: &mut BeaconFilterState,
+    enabled: bool,
+    slot: u8,
+    queue: u8,
+    mut send: impl FnMut(&EncodedCommand) -> Result<(), E>,
+) -> Result<(), BeaconFilterError<E>> {
+    if !state.filter_enabled {
+        return Ok(());
+    }
+    state.beacon_abort_enabled = enabled;
+    let command =
+        beacon_filter_command(true, enabled, slot, queue).map_err(BeaconFilterError::Encode)?;
+    send(&command).map_err(BeaconFilterError::Send)
+}
