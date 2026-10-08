@@ -1012,3 +1012,11 @@ DDI-IO paths; IRQ-coupled wells and full refcount lifecycle remain.
 write part of `gen9_set_dc_state()` from the same MIT source file (Copyright
 © 2022 Intel). `kernel/src/drm/intel/power.rs` uses it for the boot-time DC
 disable sequence; asynchronous DC5/6/9 transitions are not yet wired.
+
+The display-12/13 subset of `intel_bios.c` and its MIT-licensed
+`intel_vbt_defs.h` helpers in `crates/ax/tk-intel-display/src/intel_bios.rs`
+now includes BDB block initialization/fixups, panel index and PnP selection,
+SDVO/VBT helpers, platform DDC routing, MIPI sequence repair, and display-12/13
+panel parsing. Linux's panel object allocation/lifetime (`intel_bios_init_panel_early/late`
+and `intel_bios_fini_panel`) is represented by the owned `PanelVbtData` result
+and Rust drop rather than importing DRM panel lifecycle APIs.

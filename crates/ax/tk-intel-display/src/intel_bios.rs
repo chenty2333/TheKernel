@@ -5,6 +5,7 @@
 // Copyright © 2025 Intel Corporation (intel_dsi_vbt_defs.h).
 // Author: Eric Anholt <eric@anholt.net>. Full grants: ../LICENSE-MIT.
 use alloc::{vec, vec::Vec};
+
 use crate::{Error, bytes, device::Port, dmc::DmcPlatform, le16, le32};
 
 /// Read a BDB block's payload size from its three-byte block header.
@@ -36,12 +37,7 @@ pub fn find_raw_section(
             return Ok(None);
         }
         if current_id == section_id {
-            let mipi_header = usize::from(current_id == 53 && bdb[index] >= 3) * 5;
-            let data_end = end.checked_add(mipi_header).ok_or(Error::Truncated)?;
-            if data_end > total {
-                return Ok(None);
-            }
-            return Ok(Some(&bdb[index..data_end]));
+            return Ok(Some(&bdb[index..end]));
         }
         index = end;
     }
@@ -153,6 +149,11 @@ impl<'a> Vbt<'a> {
     pub fn data(&self) -> &'a [u8] {
         self.data
     }
+    /// The validated BDB header bytes, corresponding to `get_bdb_header()`.
+    // upstream: intel_bios.c get_bdb_header()
+    pub fn bdb_header(&self) -> &'a [u8] {
+        &self.bdb[..22]
+    }
     pub fn checksum_valid(&self) -> bool {
         self.data.iter().fold(0u8, |a, b| a.wrapping_add(*b)) == 0
     }
@@ -177,20 +178,22 @@ impl<'a> Vbt<'a> {
     }
     /// Decode the optional display-13 AFC startup field after parsing the
     /// general-features structure.
+    // upstream: intel_bios.c intel_bios_init() AFC startup override
     pub fn afc_startup_override(&self) -> Result<Option<u8>, Error> {
         let general = self.parse_general_features(13)?;
         if self.version >= 249 && general.afc_startup_config != 0 {
-            Ok(Some(if general.afc_startup_config == 1 { 0 } else { 7 }))
+            Ok(Some(if general.afc_startup_config == 1 {
+                0
+            } else {
+                7
+            }))
         } else {
             Ok(None)
         }
     }
     /// Translate the BDB general-features block into the fields consumed by i915.
     // upstream: intel_bios.c parse_general_features()
-    pub fn parse_general_features(
-        &self,
-        display_version: u8,
-    ) -> Result<GeneralFeatures, Error> {
+    pub fn parse_general_features(&self, display_version: u8) -> Result<GeneralFeatures, Error> {
         let Some(raw) = self.find_raw_section(1)? else {
             return Ok(GeneralFeatures::default());
         };
@@ -198,14 +201,22 @@ impl<'a> Vbt<'a> {
         let byte = |index: usize| raw.get(index).copied().unwrap_or(0);
         Ok(GeneralFeatures {
             enable_ssc: byte(1) & (1 << 1) != 0,
-            ssc_frequency_khz: intel_bios_ssc_frequency(
-                byte(1) & (1 << 2) != 0,
-                display_version,
-            ),
+            ssc_frequency_khz: intel_bios_ssc_frequency(byte(1) & (1 << 2) != 0, display_version),
             display_clock_mode: byte(1) & (1 << 6) != 0,
             rotate_180: self.version >= 181 && byte(2) & (1 << 2) != 0,
+            orientation: if self.version < 181 {
+                PanelOrientation::Unknown
+            } else if byte(2) & (1 << 2) != 0 {
+                PanelOrientation::BottomUp
+            } else {
+                PanelOrientation::Normal
+            },
             fdi_rx_polarity_inverted: byte(2) & (1 << 3) != 0,
-            int_crt_support: self.version >= 155 && byte(4) & 1 != 0,
+            int_crt_support: if self.version >= 155 && display_version >= 5 {
+                byte(4) & 1 != 0
+            } else {
+                true
+            },
             int_tv_support: byte(4) & (1 << 1) != 0,
             afc_startup_config: if self.version >= 249 { byte(6) & 3 } else { 0 },
         })
@@ -220,10 +231,14 @@ impl<'a> Vbt<'a> {
             return Ok(None);
         };
         let driver_flags = u16_zero_padded(raw, 17);
-        let lvds_config = ((u16_zero_padded(raw, 7) >> 10) & 3) as u8;
-        let int_lvds_support = (display_version < 5)
-            .then_some(lvds_config == 1 || (self.version >= 134 && lvds_config == 3))
-            .unwrap_or(lvds_config == 1);
+        let lvds_config = ((u16_zero_padded(raw, 7) >> 11) & 3) as u8;
+        let int_lvds_support = if display_version >= 5 {
+            lvds_config == 1
+        } else if self.version >= 134 {
+            lvds_config == 1 || lvds_config == 3
+        } else {
+            true
+        };
         Ok(Some(DriverFeatures {
             int_lvds_support,
             drrs_enabled: driver_flags & (1 << 5) != 0,
@@ -276,9 +291,7 @@ impl<'a> Vbt<'a> {
         };
         let bit = u32::from(panel_type);
         result.psr_enabled = (u16_zero_padded(power, 24) >> bit) & 1 != 0;
-        if (u16_zero_padded(power, 26) >> bit) & 1 == 0
-            && result.drrs_type != DrrsType::None
-        {
+        if (u16_zero_padded(power, 26) >> bit) & 1 == 0 && result.drrs_type != DrrsType::None {
             result.drrs_type = if (u16_zero_padded(power, 32) >> bit) & 1 != 0 {
                 DrrsType::Static
             } else {
@@ -336,11 +349,15 @@ impl<'a> Vbt<'a> {
             cabc_supported,
             backlight_ports: 0,
             cabc_ports: 0,
-            orientation: match rotation {
-                1 => PanelOrientation::RightUp,
-                2 => PanelOrientation::BottomUp,
-                3 => PanelOrientation::LeftUp,
-                _ => PanelOrientation::Unknown,
+            orientation: if self.version < 181 {
+                PanelOrientation::Unknown
+            } else {
+                match rotation {
+                    1 => PanelOrientation::RightUp,
+                    2 => PanelOrientation::BottomUp,
+                    3 => PanelOrientation::LeftUp,
+                    _ => PanelOrientation::Normal,
+                }
             },
             pps,
             pwm_delays: [
@@ -379,6 +396,16 @@ impl<'a> Vbt<'a> {
         let Some(raw) = self.find_raw_section(53)? else {
             return Ok(None);
         };
+        let raw = if raw.first().is_some_and(|version| *version >= 3) {
+            let offset = raw_block_offset(self.bdb, self.header_size, 53)?;
+            bytes(
+                self.bdb,
+                offset,
+                raw.len().checked_add(5).ok_or(Error::Truncated)?,
+            )?
+        } else {
+            raw
+        };
         let version = raw.first().copied().unwrap_or(0);
         if version >= 4 {
             return Err(Error::UnsupportedVersion);
@@ -404,9 +431,6 @@ impl<'a> Vbt<'a> {
             sequences[usize::from(sequence_id)] = Some(&sequence_data[index..next]);
             index = next;
         }
-        if display_version >= 11 && sequences[2].is_none() && sequences[3].is_some() {
-            sequences.swap(2, 3);
-        }
         Ok(Some(MipiSequences {
             version,
             sequence_data,
@@ -419,19 +443,14 @@ impl<'a> Vbt<'a> {
         &self,
         child: ChildDevice<'_>,
     ) -> Result<Option<DscCompressionParameters>, Error> {
-        if self.version < 198
-            || !child.compression_enable
-            || child.compression_method_cps
-        {
+        if self.version < 198 || !child.compression_enable || child.compression_method_cps {
             return Ok(None);
         }
         let Some(raw) = self.find_raw_section(56)? else {
             return Ok(None);
         };
         const ENTRY_SIZE: usize = 13;
-        if u16_zero_padded(raw, 0) as usize != ENTRY_SIZE
-            || raw.len() < 2 + ENTRY_SIZE * 16
-        {
+        if u16_zero_padded(raw, 0) as usize != ENTRY_SIZE || raw.len() < 2 + ENTRY_SIZE * 16 {
             return Ok(None);
         }
         let offset = 2 + usize::from(child.compression_structure_index) * ENTRY_SIZE;
@@ -502,6 +521,90 @@ impl<'a> Vbt<'a> {
             _ => DrrsType::None,
         };
         Ok(Some(result))
+    }
+    /// Select the panel type stored in BDB block 40 (including the second LFP).
+    // upstream: intel_bios.c vbt_get_panel_type()
+    pub fn vbt_panel_type(&self, second_panel: bool) -> Option<u8> {
+        let options = self.find_raw_section(40).ok().flatten()?;
+        let panel_type = if second_panel && self.version >= 212 {
+            options.get(1).copied()?
+        } else {
+            *options.first()?
+        };
+        is_panel_type_valid_or_pnp(i16::from(panel_type)).then_some(panel_type)
+    }
+
+    /// Match the EDID product ID against the 16 LFP PnP records.
+    // upstream: intel_bios.c pnpid_get_panel_type()
+    pub fn pnpid_panel_type(&self, edid: PanelPnpId) -> Option<u8> {
+        let pointers = self.parse_lfp_data_pointers().ok().flatten()?;
+        let data = self.find_raw_section(42).ok().flatten()?;
+        let mut no_date = None;
+        for index in 0..16u8 {
+            let candidate = parse_panel_pnp_id(get_lfp_pnp_id(data, &pointers, index)?)?;
+            if candidate == edid {
+                return Some(index);
+            }
+            if candidate.manufacturer == edid.manufacturer
+                && candidate.product_code == edid.product_code
+                && candidate.serial == edid.serial
+                && candidate.manufacture_week == 0
+                && candidate.manufacture_year == 0
+                && no_date.is_none()
+            {
+                no_date = Some(index);
+            }
+        }
+        no_date
+    }
+
+    /// Decode SDVO LVDS mode data, honoring the VBT panel override semantics.
+    // upstream: intel_bios.c parse_sdvo_lvds_data()
+    pub fn parse_sdvo_lvds_data(&self, panel_override: i16) -> Result<Option<DvoTiming>, Error> {
+        if panel_override == -2 {
+            return Ok(None);
+        }
+        let panel_index = if panel_override == -1 {
+            let Some(options) = self.find_raw_section(22)? else {
+                return Ok(None);
+            };
+            i16::from(*options.get(2).unwrap_or(&0))
+        } else {
+            panel_override
+        };
+        if !(0..4).contains(&panel_index) {
+            return Ok(None);
+        }
+        let Some(raw) = self.find_raw_section(23)? else {
+            return Ok(None);
+        };
+        let offset = usize::try_from(panel_index).unwrap() * 18;
+        Ok(Some(fill_detail_timing_data(bytes(raw, offset, 18)?)?))
+    }
+
+    /// Parse up to the two SDVO device mappings from child records.
+    // upstream: intel_bios.c parse_sdvo_device_mapping()
+    pub fn parse_sdvo_device_mappings(
+        &self,
+        definitions: &GeneralDefinitions<'_>,
+    ) -> [Option<SdvoDeviceMapping>; 2] {
+        let mut mappings = [None, None];
+        for child in definitions.children() {
+            if !matches!(child.target_addr, 0x70 | 0x72) || !matches!(child.dvo_port, 1 | 2) {
+                continue;
+            }
+            let index = usize::from(child.dvo_port - 1);
+            if mappings[index].is_none() {
+                mappings[index] = Some(SdvoDeviceMapping {
+                    dvo_port: child.dvo_port,
+                    target_addr: child.target_addr,
+                    dvo_wiring: child.dvo_wiring,
+                    ddc_pin: child.ddc_pin,
+                    i2c_pin: child.i2c_pin,
+                });
+            }
+        }
+        mappings
     }
     /// Parse the version-229+ generic DTD for a panel index.
     // upstream: intel_bios.c parse_generic_dtd()
@@ -596,6 +699,9 @@ impl<'a> Vbt<'a> {
             if scale {
                 minimum /= 255;
             }
+            if minimum > 255 {
+                result.brightness_level = 255;
+            }
             result.min_brightness = minimum;
             result.brightness_precision_bits = precision;
         } else {
@@ -623,7 +729,11 @@ impl<'a> Vbt<'a> {
         let child_count = (data.len() - 5) / child_size;
         let children_end = 5 + child_count * child_size;
         Ok(GeneralDefinitions {
-            crt_ddc_pin: data[0],
+            crt_ddc_pin: if (1..=14).contains(&data[0]) {
+                data[0]
+            } else {
+                2
+            },
             dpms_non_acpi: data[1] & 1 != 0,
             skip_boot_crt_detect: data[1] & 2 != 0,
             dpms_aim: data[1] & 4 != 0,
@@ -639,10 +749,7 @@ impl<'a> Vbt<'a> {
     }
     /// Parse the panel-specific eDP settings from BDB block 27.
     // upstream: intel_bios.c parse_edp()
-    pub fn parse_edp(
-        &self,
-        panel_type: u8,
-    ) -> Result<Option<EdpConfig>, Error> {
+    pub fn parse_edp(&self, panel_type: u8) -> Result<Option<EdpConfig>, Error> {
         if panel_type >= 16 {
             return Err(Error::InvalidBlock);
         }
@@ -650,7 +757,7 @@ impl<'a> Vbt<'a> {
             return Ok(None);
         };
         let index = usize::from(panel_type);
-        let power = index * 10;
+        let pps = vbt_edp_to_pps_delays(edp, panel_type)?;
         let (rate_khz, lanes, preemphasis, vswing) = if self.version >= 224 {
             let rate = u32::from(u16_zero_padded(edp, 748 + index * 2)) * 20;
             let legacy = [
@@ -660,8 +767,8 @@ impl<'a> Vbt<'a> {
             (
                 rate,
                 decode_edp_lanes(legacy[0] >> 4),
-                Some(legacy[1] & 0x0f),
-                Some(legacy[1] >> 4),
+                decode_edp_preemphasis(legacy[1] & 0x0f),
+                decode_edp_vswing(legacy[1] >> 4),
             )
         } else {
             let legacy = [
@@ -671,8 +778,8 @@ impl<'a> Vbt<'a> {
             (
                 decode_edp_rate(legacy[0] & 0x0f),
                 decode_edp_lanes(legacy[0] >> 4),
-                Some(legacy[1] & 0x0f),
-                Some(legacy[1] >> 4),
+                decode_edp_preemphasis(legacy[1] & 0x0f),
+                decode_edp_vswing(legacy[1] >> 4),
             )
         };
         let color_depth = (u32_zero_padded(edp, 160) >> (usize::from(panel_type) * 2)) & 3;
@@ -706,13 +813,7 @@ impl<'a> Vbt<'a> {
                 2 => Some(30),
                 _ => None,
             },
-            pps: PpsDelays {
-                power_up: u16_zero_padded(edp, power),
-                backlight_on: u16_zero_padded(edp, power + 2),
-                backlight_off: u16_zero_padded(edp, power + 4),
-                power_down: u16_zero_padded(edp, power + 6),
-                power_cycle: u16_zero_padded(edp, power + 8),
-            },
+            pps,
             rate_khz,
             lanes,
             preemphasis,
@@ -731,6 +832,17 @@ impl<'a> Vbt<'a> {
         panel_type: u8,
         display_version: u8,
     ) -> Result<Option<PsrConfig>, Error> {
+        self.parse_psr_for_platform(panel_type, display_version, false)
+    }
+
+    /// Platform-specific PSR parser; Broxton retains the legacy decimal fields.
+    // upstream: intel_bios.c parse_psr()
+    pub fn parse_psr_for_platform(
+        &self,
+        panel_type: u8,
+        display_version: u8,
+        broxton: bool,
+    ) -> Result<Option<PsrConfig>, Error> {
         if panel_type >= 16 {
             return Err(Error::InvalidBlock);
         }
@@ -742,21 +854,21 @@ impl<'a> Vbt<'a> {
         let waits = psr.get(table + 1).copied().unwrap_or(0);
         let tp1 = u16_zero_padded(psr, table + 2);
         let tp2_tp3 = u16_zero_padded(psr, table + 4);
-        let modern_wakeup = self.version >= 205 && display_version >= 9;
+        let modern_wakeup = self.version >= 205 && display_version >= 9 && !broxton;
         let tp1_wakeup_us = if modern_wakeup {
-            psr_wakeup_time(tp1 as u8, false)
+            psr_wakeup_time(tp1, false)
         } else {
             u32::from(tp1) * 100
         };
         let tp2_tp3_wakeup_us = if modern_wakeup {
-            psr_wakeup_time(tp2_tp3 as u8, false)
+            psr_wakeup_time(tp2_tp3, false)
         } else {
             u32::from(tp2_tp3) * 100
         };
         let psr2_tp2_tp3_wakeup_us = if self.version >= 226 {
             let all_panel = u32_zero_padded(psr, 96);
             let code = ((all_panel >> (u32::from(panel_type) * 2)) & 3) as u8;
-            psr_wakeup_time(code, true)
+            psr_wakeup_time(u16::from(code), true)
         } else {
             tp2_tp3_wakeup_us
         };
@@ -771,6 +883,7 @@ impl<'a> Vbt<'a> {
         }))
     }
     /// Resolve the BDB LFP pointers, synthesizing the modern missing block.
+    // upstream: intel_bios.c parse_lfp_data_ptrs()
     pub fn parse_lfp_data_pointers(&self) -> Result<Option<LfpDataPointers>, Error> {
         let mut pointers = if let Some(raw) = self.find_raw_section(41)? {
             parse_lfp_data_ptrs(raw)
@@ -819,9 +932,7 @@ impl<'a> Vbt<'a> {
         let Some(data) = self.find_raw_section(42)? else {
             return Ok(None);
         };
-        let pnp = get_lfp_pnp_id(data, &pointers, panel_type)
-            .and_then(parse_panel_pnp_id)
-            .ok_or(Error::InvalidBlock)?;
+        let pnp = get_lfp_pnp_id(data, &pointers, panel_type).and_then(parse_panel_pnp_id);
         let timing = if has_fixed_mode {
             None
         } else {
@@ -866,6 +977,41 @@ impl<'a> Vbt<'a> {
     }
 }
 
+/// Candidate bytes supplied by firmware/OpRegion/ROM discovery adapters.
+pub struct VbtCandidates<'a> {
+    pub firmware: Option<&'a [u8]>,
+    pub opregion: Option<&'a [u8]>,
+    pub spi_rom: Option<&'a [u8]>,
+    pub pci_rom: Option<&'a [u8]>,
+}
+
+/// Validate the named firmware candidate instead of trusting its contents.
+// upstream: intel_bios.c firmware_get_vbt()
+pub fn firmware_get_vbt(firmware: Option<&[u8]>) -> Option<Vbt<'_>> {
+    firmware.and_then(|data| Vbt::parse(data).ok())
+}
+
+/// Find and validate an embedded VBT in an option-ROM image.
+// upstream: intel_bios.c oprom_get_vbt()
+pub fn oprom_get_vbt(rom: &[u8]) -> Option<Vbt<'_>> {
+    rom.windows(4)
+        .position(|signature| signature == b"$VBT")
+        .and_then(|offset| Vbt::parse(&rom[offset..]).ok())
+}
+
+/// Select VBT sources in i915 order: firmware, OpRegion, SPI ROM, PCI ROM.
+// upstream: intel_bios.c intel_bios_get_vbt()
+pub fn intel_bios_get_vbt(candidates: VbtCandidates<'_>, dgfx: bool) -> Option<Vbt<'_>> {
+    firmware_get_vbt(candidates.firmware)
+        .or_else(|| firmware_get_vbt(candidates.opregion))
+        .or_else(|| {
+            dgfx.then(|| candidates.spi_rom)
+                .flatten()
+                .and_then(oprom_get_vbt)
+        })
+        .or_else(|| candidates.pci_rom.and_then(oprom_get_vbt))
+}
+
 #[derive(Clone, Copy)]
 struct BdbBlockDescriptor {
     id: u8,
@@ -873,22 +1019,64 @@ struct BdbBlockDescriptor {
 }
 
 const BDB_BLOCKS: [BdbBlockDescriptor; 16] = [
-    BdbBlockDescriptor { id: 1, min_size: 12 },
+    BdbBlockDescriptor { id: 1, min_size: 7 },
     BdbBlockDescriptor { id: 2, min_size: 5 },
-    BdbBlockDescriptor { id: 9, min_size: 100 },
-    BdbBlockDescriptor { id: 12, min_size: 19 },
-    BdbBlockDescriptor { id: 22, min_size: 24 },
-    BdbBlockDescriptor { id: 23, min_size: 72 },
-    BdbBlockDescriptor { id: 27, min_size: 850 },
-    BdbBlockDescriptor { id: 40, min_size: 34 },
-    BdbBlockDescriptor { id: 41, min_size: 148 },
-    BdbBlockDescriptor { id: 42, min_size: 0 },
-    BdbBlockDescriptor { id: 43, min_size: 305 },
-    BdbBlockDescriptor { id: 44, min_size: 136 },
-    BdbBlockDescriptor { id: 52, min_size: 822 },
-    BdbBlockDescriptor { id: 53, min_size: 1 },
-    BdbBlockDescriptor { id: 56, min_size: 210 },
-    BdbBlockDescriptor { id: 58, min_size: 2 },
+    BdbBlockDescriptor {
+        id: 9,
+        min_size: 100,
+    },
+    BdbBlockDescriptor {
+        id: 12,
+        min_size: 19,
+    },
+    BdbBlockDescriptor {
+        id: 22,
+        min_size: 22,
+    },
+    BdbBlockDescriptor {
+        id: 23,
+        min_size: 72,
+    },
+    BdbBlockDescriptor {
+        id: 27,
+        min_size: 850,
+    },
+    BdbBlockDescriptor {
+        id: 40,
+        min_size: 34,
+    },
+    BdbBlockDescriptor {
+        id: 41,
+        min_size: 148,
+    },
+    BdbBlockDescriptor {
+        id: 42,
+        min_size: 0,
+    },
+    BdbBlockDescriptor {
+        id: 43,
+        min_size: 305,
+    },
+    BdbBlockDescriptor {
+        id: 44,
+        min_size: 136,
+    },
+    BdbBlockDescriptor {
+        id: 52,
+        min_size: 822,
+    },
+    BdbBlockDescriptor {
+        id: 53,
+        min_size: 1,
+    },
+    BdbBlockDescriptor {
+        id: 56,
+        min_size: 210,
+    },
+    BdbBlockDescriptor {
+        id: 58,
+        min_size: 2,
+    },
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -951,12 +1139,36 @@ fn init_bdb_block(
         let original = bytes(vbt.bdb, header_offset, 3)?;
         [original[0], original[1], original[2]]
     };
-    let mut data = vec![0; min_size.max(raw.len())];
-    data[..raw.len()].copy_from_slice(raw);
+    let mut copy_size = raw.len();
+    let source = if section_id == 53 && raw.first().is_some_and(|version| *version >= 3) {
+        copy_size = copy_size.checked_add(5).ok_or(Error::Truncated)?;
+        let offset = raw_block_offset(vbt.bdb, vbt.header_size, section_id)?;
+        bytes(vbt.bdb, offset, copy_size)?
+    } else {
+        raw
+    };
+    let mut data = vec![0; min_size.max(copy_size)];
+    data[..copy_size].copy_from_slice(source);
+    if section_id == 41 {
+        let data_offset = raw_block_offset(vbt.bdb, vbt.header_size, 42)?;
+        let mut pointers = parse_lfp_data_ptrs(&data);
+        if !fixup_lfp_data_ptrs(
+            data_offset,
+            &bytes(
+                vbt.bdb,
+                data_offset,
+                _get_blocksize(&vbt.bdb[data_offset - 3..])?,
+            )?,
+            &mut pointers,
+        ) {
+            return Ok(None);
+        }
+        data = encode_lfp_data_ptrs(&pointers);
+    }
     Ok(Some(BdbBlock {
         id: section_id,
         header,
-        original_size: raw.len(),
+        original_size: copy_size,
         data,
     }))
 }
@@ -985,6 +1197,23 @@ pub struct PpsDelays {
     pub backlight_off: u16,
     pub power_down: u16,
     pub power_cycle: u16,
+}
+
+/// Convert the packed VBT eDP timing record to the panel PPS fields.
+// upstream: intel_bios.c vbt_edp_to_pps_delays()
+pub fn vbt_edp_to_pps_delays(data: &[u8], panel_type: u8) -> Result<PpsDelays, Error> {
+    if panel_type >= 16 {
+        return Err(Error::InvalidBlock);
+    }
+    let offset = usize::from(panel_type) * 10;
+    bytes(data, offset, 10)?;
+    Ok(PpsDelays {
+        power_up: u16_zero_padded(data, offset),
+        backlight_on: u16_zero_padded(data, offset + 2),
+        backlight_off: u16_zero_padded(data, offset + 4),
+        power_down: u16_zero_padded(data, offset + 6),
+        power_cycle: u16_zero_padded(data, offset + 8),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1069,10 +1298,7 @@ pub fn get_lfp_pnp_id<'a>(
 
 /// Return the optional panel-name and additional LFP data tail.
 // upstream: intel_bios.c get_lfp_data_tail()
-pub fn get_lfp_data_tail<'a>(
-    data: &'a [u8],
-    pointers: &LfpDataPointers,
-) -> Option<&'a [u8]> {
+pub fn get_lfp_data_tail<'a>(data: &'a [u8], pointers: &LfpDataPointers) -> Option<&'a [u8]> {
     if pointers.panel_name.table_size == 0 {
         return None;
     }
@@ -1106,16 +1332,76 @@ pub struct PanelPnpId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SdvoDeviceMapping {
+    pub dvo_port: u8,
+    pub target_addr: u8,
+    pub dvo_wiring: u8,
+    pub ddc_pin: u8,
+    pub i2c_pin: u8,
+}
+
+/// The panel selector's four upstream candidates, kept in priority order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PanelTypeCandidates {
+    pub opregion: Option<u8>,
+    pub vbt: Option<u8>,
+    pub pnpid: Option<u8>,
+    pub use_fallback: bool,
+}
+
+// upstream: intel_bios.c is_panel_type_valid()
+pub const fn is_panel_type_valid(panel_type: i16) -> bool {
+    panel_type >= 0 && panel_type < 16
+}
+
+// upstream: intel_bios.c is_panel_type_pnp()
+pub const fn is_panel_type_pnp(panel_type: i16) -> bool {
+    panel_type == 0xff
+}
+
+// upstream: intel_bios.c is_panel_type_valid_or_pnp()
+pub const fn is_panel_type_valid_or_pnp(panel_type: i16) -> bool {
+    is_panel_type_valid(panel_type) || is_panel_type_pnp(panel_type)
+}
+
+/// Port of `get_panel_type()` candidate priority and fallback selection.
+// upstream: intel_bios.c get_panel_type()
+pub fn get_panel_type(candidates: PanelTypeCandidates) -> Option<u8> {
+    if let Some(panel_type) = candidates.opregion
+        && is_panel_type_valid(panel_type as i16)
+    {
+        return Some(panel_type);
+    }
+    if candidates.vbt == Some(u8::MAX)
+        && let Some(panel_type) = candidates.pnpid
+        && is_panel_type_valid(panel_type as i16)
+    {
+        return Some(panel_type);
+    }
+    if let Some(panel_type) = candidates.vbt
+        && is_panel_type_valid(panel_type as i16)
+    {
+        return Some(panel_type);
+    }
+    if candidates.use_fallback {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LfpPanelData {
     pub timing: Option<DvoTiming>,
-    pub pnp: PanelPnpId,
+    pub pnp: Option<PanelPnpId>,
     pub panel_name: Option<[u8; 13]>,
     pub seamless_drrs_min_refresh_rate: Option<u8>,
     pub bios_lvds_value: Option<u32>,
 }
 
+// upstream: intel_bios.c parse_panel_pnp_id()
 fn parse_panel_pnp_id(data: &[u8]) -> Option<PanelPnpId> {
-    if data.len() < 12 {
+    if data.len() < 10 {
         return None;
     }
     Some(PanelPnpId {
@@ -1137,8 +1423,8 @@ pub fn fill_detail_timing_data(data: &[u8]) -> Result<DvoTiming, Error> {
     let vblank = u16::from(data[6]) | (u16::from(data[7] & 0x0f) << 8);
     let hsync_offset = u16::from(data[8]) | (u16::from(data[11] >> 6) << 8);
     let hsync_pulse = u16::from(data[9]) | (u16::from((data[11] >> 4) & 3) << 8);
-    let vsync_offset = u16::from(data[10] & 0x0f) | (u16::from((data[11] >> 2) & 3) << 4);
-    let vsync_pulse = u16::from(data[10] >> 4) | (u16::from(data[11] & 3) << 4);
+    let vsync_offset = u16::from(data[10] >> 4) | (u16::from((data[11] >> 2) & 3) << 4);
+    let vsync_pulse = u16::from(data[10] & 0x0f) | (u16::from(data[11] & 3) << 4);
     let htotal = hdisplay + hblank;
     let vtotal = vdisplay + vblank;
     let hsync_start = hdisplay + hsync_offset;
@@ -1186,11 +1472,7 @@ fn parse_lfp_data_ptrs(raw: &[u8]) -> LfpDataPointers {
 
 /// Relocate BDB-relative pointers and validate the resulting panel tables.
 // upstream: intel_bios.c fixup_lfp_data_ptrs()
-fn fixup_lfp_data_ptrs(
-    data_offset: usize,
-    data: &[u8],
-    pointers: &mut LfpDataPointers,
-) -> bool {
+fn fixup_lfp_data_ptrs(data_offset: usize, data: &[u8], pointers: &mut LfpDataPointers) -> bool {
     for entry in &mut pointers.entries {
         let Some(offset) = entry.fp_timing.offset.checked_sub(data_offset) else {
             return false;
@@ -1225,7 +1507,7 @@ fn validate_lfp_data_ptrs(data: &[u8], pointers: &LfpDataPointers) -> bool {
     let dvo_timing_size = pointers.entries[0].dvo_timing.table_size;
     let pnp_size = pointers.entries[0].panel_pnp_id.table_size;
     let panel_name_size = pointers.panel_name.table_size;
-    if fp_timing_size < 32 || dvo_timing_size != 18 || pnp_size != 12 {
+    if fp_timing_size < 32 || dvo_timing_size != 18 || pnp_size != 10 {
         return false;
     }
     if panel_name_size != 0 && panel_name_size != 13 {
@@ -1247,11 +1529,20 @@ fn validate_lfp_data_ptrs(data: &[u8], pointers: &LfpDataPointers) -> bool {
         if current.fp_timing.table_size != fp_timing_size
             || current.dvo_timing.table_size != dvo_timing_size
             || current.panel_pnp_id.table_size != pnp_size
-            || current.fp_timing.offset.checked_sub(previous.fp_timing.offset)
+            || current
+                .fp_timing
+                .offset
+                .checked_sub(previous.fp_timing.offset)
                 != Some(lfp_data_size)
-            || current.dvo_timing.offset.checked_sub(previous.dvo_timing.offset)
+            || current
+                .dvo_timing
+                .offset
+                .checked_sub(previous.dvo_timing.offset)
                 != Some(lfp_data_size)
-            || current.panel_pnp_id.offset.checked_sub(previous.panel_pnp_id.offset)
+            || current
+                .panel_pnp_id
+                .offset
+                .checked_sub(previous.panel_pnp_id.offset)
                 != Some(lfp_data_size)
         {
             return false;
@@ -1267,8 +1558,7 @@ fn validate_lfp_data_ptrs(data: &[u8], pointers: &LfpDataPointers) -> bool {
     }
     let first = pointers.entries[0];
     if first.fp_timing.offset.checked_add(fp_timing_size) != Some(first.dvo_timing.offset)
-        || first.dvo_timing.offset.checked_add(dvo_timing_size)
-            != Some(first.panel_pnp_id.offset)
+        || first.dvo_timing.offset.checked_add(dvo_timing_size) != Some(first.panel_pnp_id.offset)
         || first.panel_pnp_id.offset.checked_add(pnp_size) != Some(lfp_data_size)
     {
         return false;
@@ -1337,7 +1627,7 @@ fn generate_lfp_data_ptrs(vbt: &Vbt<'_>) -> Result<Option<LfpDataPointers>, Erro
     };
     let fp_timing_size = 38;
     let dvo_timing_size = 18;
-    let pnp_size = 12;
+    let pnp_size = 10;
     let stride = fp_timing_size + dvo_timing_size + pnp_size;
     if stride * 16 > data.len() {
         return Ok(None);
@@ -1386,7 +1676,7 @@ fn generate_lfp_data_ptrs(vbt: &Vbt<'_>) -> Result<Option<LfpDataPointers>, Erro
     Ok(Some(pointers))
 }
 
-const fn psr_wakeup_time(code: u8, psr2: bool) -> u32 {
+const fn psr_wakeup_time(code: u16, psr2: bool) -> u32 {
     match code {
         0 => 500,
         1 => 100,
@@ -1401,6 +1691,26 @@ const fn decode_edp_lanes(lanes: u8) -> Option<u8> {
         0 => Some(1),
         1 => Some(2),
         3 => Some(4),
+        _ => None,
+    }
+}
+
+const fn decode_edp_preemphasis(value: u8) -> Option<u8> {
+    match value {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        _ => None,
+    }
+}
+
+const fn decode_edp_vswing(value: u8) -> Option<u8> {
+    match value {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
         _ => None,
     }
 }
@@ -1420,6 +1730,7 @@ pub struct GeneralFeatures {
     pub ssc_frequency_khz: u32,
     pub display_clock_mode: bool,
     pub rotate_180: bool,
+    pub orientation: PanelOrientation,
     pub fdi_rx_polarity_inverted: bool,
     pub int_crt_support: bool,
     pub int_tv_support: bool,
@@ -1473,11 +1784,18 @@ pub struct DefaultChildDevice {
 
 /// Create fixed-port fallback children when the BIOS supplied no valid VBT.
 // upstream: intel_bios.c init_vbt_missing_defaults()
-pub fn init_vbt_missing_defaults(
+pub fn init_vbt_missing_defaults(has_ddi: bool, ports: &[Port]) -> Vec<DefaultChildDevice> {
+    init_vbt_missing_defaults_for_platform(has_ddi, false, ports)
+}
+
+/// Create fallback children for DDI or Cherryview even without a DDI flag.
+// upstream: intel_bios.c init_vbt_missing_defaults()
+pub fn init_vbt_missing_defaults_for_platform(
     has_ddi: bool,
+    cherryview: bool,
     ports: &[Port],
 ) -> Vec<DefaultChildDevice> {
-    if !has_ddi {
+    if !has_ddi && !cherryview {
         return Vec::new();
     }
     let mut children = Vec::new();
@@ -1517,6 +1835,7 @@ pub struct IntelBios<'a> {
     pub vbt: Option<Vbt<'a>>,
     pub platform: DmcPlatform,
     pub display_version: u8,
+    pub vbt_version: u16,
     pub defaults: VbtDefaults,
     pub general_features: GeneralFeatures,
     pub definitions: Option<GeneralDefinitions<'a>>,
@@ -1533,7 +1852,7 @@ pub struct ChildDscParameters {
     pub parameters: DscCompressionParameters,
 }
 
-pub struct PanelVbtData<'a> {
+pub struct PanelVbtData {
     pub panel_type: u8,
     pub defaults: VbtPanelDefaults,
     pub options: Option<PanelOptions>,
@@ -1544,13 +1863,31 @@ pub struct PanelVbtData<'a> {
     pub edp: Option<EdpConfig>,
     pub psr: Option<PsrConfig>,
     pub mipi: Option<MipiConfig>,
-    pub mipi_sequences: Option<MipiSequences<'a>>,
+    pub mipi_sequences: Option<FixedMipiSequences>,
 }
 
 impl<'a> IntelBios<'a> {
+    /// Resolve a panel index using OpRegion, VBT, PnP match and fallback order.
+    // upstream: intel_bios.c get_panel_type()
+    pub fn select_panel_type(
+        &self,
+        opregion_panel_type: Option<u8>,
+        edid_product_id: Option<PanelPnpId>,
+        second_panel: bool,
+        use_fallback: bool,
+    ) -> Option<u8> {
+        let vbt = self.vbt.as_ref();
+        get_panel_type(PanelTypeCandidates {
+            opregion: opregion_panel_type,
+            vbt: vbt.and_then(|vbt| vbt.vbt_panel_type(second_panel)),
+            pnpid: vbt.and_then(|vbt| edid_product_id.and_then(|edid| vbt.pnpid_panel_type(edid))),
+            use_fallback,
+        })
+    }
+
     /// Parse per-panel information after the caller has selected panel_type.
     // upstream: intel_bios.c intel_bios_init_panel()
-    pub fn init_panel(&self, panel_type: u8, display_version: u8) -> PanelVbtData<'a> {
+    pub fn init_panel(&self, panel_type: u8, display_version: u8) -> PanelVbtData {
         let defaults = init_vbt_panel_defaults();
         let Some(vbt) = &self.vbt else {
             return PanelVbtData {
@@ -1594,14 +1931,14 @@ impl<'a> IntelBios<'a> {
                 present: defaults.backlight_present,
                 ..BacklightConfig::default()
             });
-        let mut power = vbt
-            .parse_panel_driver_features(drrs_type, false)
-            .unwrap_or(PanelPowerFeatures {
-                drrs_type,
-                psr_enabled: false,
-                vrr_enabled: true,
-                hobl_enabled: false,
-            });
+        let mut power =
+            vbt.parse_panel_driver_features(drrs_type, false)
+                .unwrap_or(PanelPowerFeatures {
+                    drrs_type,
+                    psr_enabled: false,
+                    vrr_enabled: true,
+                    hobl_enabled: false,
+                });
         power = vbt
             .parse_power_conservation_features(panel_type, power)
             .unwrap_or(power);
@@ -1614,7 +1951,15 @@ impl<'a> IntelBios<'a> {
         let mipi_sequences = vbt
             .parse_mipi_sequence(u16::from(panel_type), display_version, self.platform)
             .ok()
-            .flatten();
+            .flatten()
+            .map(|sequences| {
+                fixup_mipi_sequences(
+                    &sequences,
+                    mipi.is_some_and(|config| config.command_mode),
+                    display_version,
+                    false,
+                )
+            });
         PanelVbtData {
             panel_type,
             defaults: VbtPanelDefaults {
@@ -1637,12 +1982,14 @@ impl<'a> IntelBios<'a> {
 /// Initialize the translated VBT state from the selected firmware/OpRegion bytes.
 /// Source discovery (rootfs firmware, OpRegion, or ROM) belongs to the kernel
 /// adapter; this function owns the C `intel_bios_init()` parse order.
+// upstream: intel_bios.c intel_bios_init()
 pub fn intel_bios_init<'a>(
     vbt_bytes: Option<&'a [u8]>,
     display_version: u8,
     platform: DmcPlatform,
     has_pch_split: bool,
     has_ddi: bool,
+    cherryview: bool,
     ports: &[Port],
 ) -> IntelBios<'a> {
     let defaults = init_vbt_defaults(display_version, has_pch_split);
@@ -1653,7 +2000,9 @@ pub fn intel_bios_init<'a>(
         int_tv_support: defaults.int_tv_support,
         ..GeneralFeatures::default()
     };
-    let vbt = vbt_bytes.and_then(|data| Vbt::parse(data).ok());
+    let vbt = (display_version != 0)
+        .then(|| vbt_bytes.and_then(|data| Vbt::parse(data).ok()))
+        .flatten();
     let mut definitions = None;
     let mut driver_features = None;
     let mut dsc_parameters = Vec::new();
@@ -1681,10 +2030,16 @@ pub fn intel_bios_init<'a>(
                 }
             }
         }
-    } else {
-        fallback_children = init_vbt_missing_defaults(has_ddi, ports);
+    } else if display_version != 0 {
+        fallback_children = init_vbt_missing_defaults_for_platform(has_ddi, cherryview, ports);
     }
+    let vbt_version = vbt
+        .as_ref()
+        .map_or(if fallback_children.is_empty() { 0 } else { 155 }, |vbt| {
+            vbt.version
+        });
     IntelBios {
+        vbt_version,
         vbt,
         platform,
         display_version,
@@ -1740,9 +2095,11 @@ pub struct BacklightConfig {
     pub hdr_dpcd_refresh_timeout: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PanelOrientation {
+    #[default]
     Unknown,
+    Normal,
     RightUp,
     BottomUp,
     LeftUp,
@@ -1780,6 +2137,77 @@ pub struct MipiSequences<'a> {
     pub version: u8,
     pub sequence_data: &'a [u8],
     pub sequences: [Option<&'a [u8]>; 12],
+}
+
+/// Owned form used for the upstream pre-modeset MIPI sequence fixups.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixedMipiSequences {
+    pub version: u8,
+    pub sequences: [Option<Vec<u8>>; 12],
+}
+
+/// Find the INIT_OTP prefix that performs reset deassert before its first packet.
+// upstream: intel_bios.c get_init_otp_deassert_fragment_len()
+pub fn get_init_otp_deassert_fragment_len(data: Option<&[u8]>, version: u8) -> usize {
+    if version >= 3 {
+        return 0;
+    }
+    let Some(data) = data else { return 0 };
+    let mut index = 1usize;
+    while let Some(&operation) = data.get(index) {
+        let length = match operation {
+            0 => return 0,
+            1 => return if index == 1 { 0 } else { index },
+            2 => 5,
+            3 => 3,
+            _ => return 0,
+        };
+        index = match index.checked_add(length) {
+            Some(index) if index <= data.len() => index,
+            _ => return 0,
+        };
+    }
+    0
+}
+
+/// Apply the VLV deassert split and ICL INIT_OTP/DISPLAY_ON swap.
+// upstream: intel_bios.c fixup_mipi_sequences(), vlv_fixup_mipi_sequences(), icl_fixup_mipi_sequences()
+pub fn fixup_mipi_sequences(
+    input: &MipiSequences<'_>,
+    command_mode: bool,
+    display_version: u8,
+    valleyview: bool,
+) -> FixedMipiSequences {
+    let mut sequences: [Option<Vec<u8>>; 12] =
+        core::array::from_fn(|index| input.sequences[index].map(<[u8]>::to_vec));
+    if display_version >= 11 {
+        if sequences[2].is_none() && sequences[3].is_some() {
+            sequences.swap(2, 3);
+        }
+    } else if valleyview
+        && !command_mode
+        && input.version < 3
+        && sequences[2].is_some()
+        && sequences[5].is_some()
+        && sequences[1].is_none()
+    {
+        let old_init = sequences[2].as_deref();
+        let length = get_init_otp_deassert_fragment_len(old_init, input.version);
+        if length != 0 {
+            let old = sequences[2].take().unwrap();
+            let mut deassert = old[..length].to_vec();
+            deassert[0] = 1;
+            deassert.push(0);
+            let mut init = old[length - 1..].to_vec();
+            init[0] = 2;
+            sequences[1] = Some(deassert);
+            sequences[2] = Some(init);
+        }
+    }
+    FixedMipiSequences {
+        version: input.version,
+        sequences,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1877,7 +2305,9 @@ fn find_panel_sequence_block<'a>(
         } else {
             usize::from(le16(data, index + 1)?)
         };
-        let end = header_end.checked_add(current_size).ok_or(Error::Truncated)?;
+        let end = header_end
+            .checked_add(current_size)
+            .ok_or(Error::Truncated)?;
         if end > total || end > data.len() {
             return Ok(None);
         }
@@ -1959,9 +2389,27 @@ fn goto_next_sequence_v3(data: &[u8], sequence_start: usize) -> Result<usize, Er
 // upstream: intel_bios.c intel_bios_ssc_frequency()
 pub const fn intel_bios_ssc_frequency(alternate: bool, display_version: u8) -> u32 {
     match display_version {
-        2 => if alternate { 66_667 } else { 48_000 },
-        3 | 4 => if alternate { 100_000 } else { 96_000 },
-        _ => if alternate { 100_000 } else { 120_000 },
+        2 => {
+            if alternate {
+                66_667
+            } else {
+                48_000
+            }
+        }
+        3 | 4 => {
+            if alternate {
+                100_000
+            } else {
+                96_000
+            }
+        }
+        _ => {
+            if alternate {
+                100_000
+            } else {
+                120_000
+            }
+        }
     }
 }
 
@@ -2012,6 +2460,7 @@ pub struct GeneralDefinitions<'a> {
 impl<'a> GeneralDefinitions<'a> {
     /// Empty child records are omitted, in upstream list order. Unknown ports
     /// remain visible as None; parsing is not a claim that the PHY is present.
+    // upstream: intel_bios.c intel_bios_for_each_encoder()
     pub fn children(&self) -> impl Iterator<Item = ChildDevice<'a>> + '_ {
         self.children
             .chunks_exact(self.record_size)
@@ -2022,20 +2471,17 @@ impl<'a> GeneralDefinitions<'a> {
                 }
                 let byte = |index| record.get(index).copied().unwrap_or(0);
                 let dedicated = self.version >= 264 && byte(33) & 4 != 0;
-                let mut child = ChildDevice {
+                let child = ChildDevice {
                     raw_record: record,
                     handle: u16::from_le_bytes([record[0], record[1]]),
                     device_type,
                     addin_offset: u16::from_le_bytes([record[14], record[15]]),
                     dvo_port: byte(16),
-                    port: intel_bios_encoder_port(
-                        byte(16),
-                        self.display_version,
-                        self.platform,
-                    ),
+                    port: intel_bios_encoder_port(byte(16), self.display_version, self.platform),
                     i2c_pin: byte(17),
                     target_addr: byte(18),
                     ddc_pin: byte(19),
+                    mapped_ddc_pin: map_ddc_pin_for_platform(byte(19), self.platform),
                     edid_ptr: u16::from_le_bytes([byte(20), byte(21)]),
                     dvo_cfg: byte(22),
                     dvo2_port: byte(23),
@@ -2052,8 +2498,16 @@ impl<'a> GeneralDefinitions<'a> {
                     } else {
                         0
                     },
-                    dp_iboost_level: if self.version >= 196 { byte(37) & 0x0f } else { 0 },
-                    hdmi_iboost_level: if self.version >= 196 { byte(37) >> 4 } else { 0 },
+                    dp_iboost_level: if self.version >= 196 {
+                        byte(37) & 0x0f
+                    } else {
+                        0
+                    },
+                    hdmi_iboost_level: if self.version >= 196 {
+                        byte(37) >> 4
+                    } else {
+                        0
+                    },
                     dp_max_link_rate: if self.version >= 216 { byte(38) & 7 } else { 0 },
                     efp_index: if self.version >= 256 { byte(39) } else { 0 },
                     edp_data_rate_override: if self.version >= 263 {
@@ -2061,17 +2515,21 @@ impl<'a> GeneralDefinitions<'a> {
                     } else {
                         0
                     },
-                    aux_channel: if self.version >= 158 { byte(25) } else { 0 },
-                    hdmi_level_shift: if self.version >= 158 { byte(7) & 0x1f } else { 0 },
+                    aux_channel: byte(25),
+                    hdmi_level_shift: if self.version >= 158 {
+                        byte(7) & 0x1f
+                    } else {
+                        0
+                    },
                     hdmi_max_tmds_khz: if self.version >= 204 {
                         hdmi_max_tmds_clock(byte(7) >> 5)
                     } else {
                         0
                     },
-                    lane_reversal: self.version >= 184 && byte(23) & 2 != 0,
-                    hpd_invert: self.version >= 196 && byte(23) & 16 != 0,
+                    lane_reversal: byte(23) & 2 != 0,
+                    hpd_invert: byte(23) & 16 != 0,
                     use_vbt_vswing: self.version >= 218 && byte(23) & 32 != 0,
-                    lspcon: self.version >= 192 && byte(23) & 4 != 0,
+                    lspcon: byte(23) & 4 != 0,
                     iboost: self.version >= 196 && byte(23) & 8 != 0,
                     dp_max_lane_count: if self.version >= 244 {
                         byte(23) >> 6
@@ -2090,9 +2548,15 @@ impl<'a> GeneralDefinitions<'a> {
                         0
                     },
                 };
-                sanitize_dedicated_external(&mut child);
                 Some(child)
             })
+    }
+    /// Return a child record by stride without inventing a typed packed reference.
+    // upstream: intel_bios.c child_device_ptr()
+    pub fn child_device_ptr(&self, index: usize) -> Option<&'a [u8]> {
+        let start = index.checked_mul(self.record_size)?;
+        self.children
+            .get(start..start.checked_add(self.record_size)?)
     }
     // upstream: intel_bios.c intel_bios_encoder_data_lookup()
     pub fn encoder(&self, port: Port) -> Option<ChildDevice<'a>> {
@@ -2103,9 +2567,7 @@ impl<'a> GeneralDefinitions<'a> {
     pub fn is_dsi_present(&self, display_version: u8) -> Option<Port> {
         self.children()
             .filter(|child| child.supports_dsi())
-            .find_map(|child| {
-                intel_bios_encoder_port(child.dvo_port, display_version, self.platform)
-            })
+            .find_map(|child| dsi_dvo_port_to_port(child.dvo_port, display_version))
     }
     /// Report whether an integrated TV device is present in the VBT.
     // upstream: intel_bios.c intel_bios_is_tv_present()
@@ -2132,7 +2594,7 @@ impl<'a> GeneralDefinitions<'a> {
             if child.device_type != 0x1022 && child.device_type != 0x0022 {
                 continue;
             }
-            let pin = map_ddc_pin(child.i2c_pin);
+            let pin = (1..=14).contains(&child.i2c_pin).then_some(child.i2c_pin);
             if child.addin_offset != 0 {
                 return (true, pin);
             }
@@ -2143,11 +2605,40 @@ impl<'a> GeneralDefinitions<'a> {
     /// Report whether the display-13 VBT declares a digital output port.
     // upstream: intel_bios.c intel_bios_is_port_present()
     pub fn is_port_present(&self, port: Port) -> bool {
+        if !self.is_port_valid(port) {
+            return false;
+        }
+        self.children().any(|child| {
+            dvo_port_to_port(child.dvo_port, self.display_version, self.platform) == Some(port)
+        })
+    }
+    // upstream: intel_bios.c is_port_valid()
+    fn is_port_valid(&self, port: Port) -> bool {
+        port != Port::F || self.platform == DmcPlatform::TigerLake
+    }
+    /// Apply the DDI parse/sanitize steps, including port-validity admission.
+    // upstream: intel_bios.c parse_ddi_port()
+    pub fn parse_ddi_port(&self, mut child: ChildDevice<'a>) -> Option<ChildDevice<'a>> {
+        let port = child.port?;
+        if !self.is_port_valid(port) {
+            return None;
+        }
+        sanitize_dedicated_external(&mut child);
+        sanitize_device_type(&mut child, self.display_version);
+        child.hdmi_level_shift =
+            sanitize_hdmi_level_shift(child.hdmi_level_shift, child.supports_dvi(), false);
+        Some(child)
+    }
+
+    /// Return all DDI children only on display versions with DDI port info.
+    // upstream: intel_bios.c parse_ddi_ports()
+    pub fn parse_ddi_ports(&self, g4x: bool) -> Vec<ChildDevice<'a>> {
+        if !has_ddi_port_info(self.display_version, g4x) {
+            return Vec::new();
+        }
         self.children()
-            .any(|child| {
-                dvo_port_to_port(child.dvo_port, self.display_version, self.platform)
-                    == Some(port)
-            })
+            .filter_map(|child| self.parse_ddi_port(child))
+            .collect()
     }
     /// Whether more than one DP child is assigned the same AUX selector.
     // upstream: intel_bios.c intel_bios_dp_has_shared_aux_ch()
@@ -2173,6 +2664,7 @@ pub struct ChildDevice<'a> {
     pub target_addr: u8,
     /// Raw BIOS DDC pin, NOT the hardware GMBUS selector.
     pub ddc_pin: u8,
+    mapped_ddc_pin: Option<u8>,
     pub edid_ptr: u16,
     pub dvo_cfg: u8,
     pub dvo2_port: u8,
@@ -2232,8 +2724,9 @@ impl ChildDevice<'_> {
     pub const fn supports_dsi(self) -> bool {
         self.device_type & (1 << 10) != 0
     }
+    // upstream: intel_bios.c intel_bios_encoder_hdmi_ddc_pin()
     pub const fn gmbus_pin(self) -> Option<u8> {
-        map_ddc_pin(self.ddc_pin)
+        self.mapped_ddc_pin
     }
     // upstream: intel_bios.c intel_bios_encoder_supports_dp_dual_mode()
     pub const fn supports_dp_dual_mode(self) -> bool {
@@ -2310,9 +2803,23 @@ impl ChildDevice<'_> {
     }
     // upstream: intel_bios.c intel_bios_hdmi_ddc_pin()
     pub const fn hdmi_ddc_pin(self) -> u8 {
-        match map_ddc_pin(self.ddc_pin) {
+        match self.mapped_ddc_pin {
             Some(pin) => pin,
             None => 0,
+        }
+    }
+    // upstream: intel_bios.c intel_bios_encoder_is_lspcon()
+    pub const fn is_lspcon(self, has_lspcon: bool) -> bool {
+        has_lspcon && self.lspcon
+    }
+
+    /// Return a VBT HDMI buffer shift only for versions where the field exists.
+    // upstream: intel_bios.c intel_bios_hdmi_level_shift()
+    pub const fn hdmi_level_shift_for(self, vbt_version: u16, display_version: u8) -> Option<u8> {
+        if vbt_version < 158 || display_version >= 14 {
+            None
+        } else {
+            Some(self.hdmi_level_shift)
         }
     }
     // upstream: intel_bios.c intel_bios_dp_aux_ch()
@@ -2456,13 +2963,35 @@ pub fn sanitize_dedicated_external(child: &mut ChildDevice<'_>) {
     child.dynamic_port_over_tc = false;
 }
 
+/// Correct legacy port-A DVI signaling exactly as i915 does before display 12.
+// upstream: intel_bios.c sanitize_device_type()
+pub fn sanitize_device_type(child: &mut ChildDevice<'_>, display_version: u8) {
+    if child.port != Some(Port::A) || display_version >= 12 || !child.supports_dvi() {
+        return;
+    }
+    child.device_type &= !(1 << 4);
+    child.device_type |= 1 << 11;
+}
+
+/// Clamp a Broadwell DVI level-shifter value to the documented maximum.
+// upstream: intel_bios.c sanitize_hdmi_level_shift()
+pub const fn sanitize_hdmi_level_shift(value: u8, supports_dvi: bool, broadwell: bool) -> u8 {
+    if supports_dvi && broadwell && value > 9 {
+        9
+    } else {
+        value
+    }
+}
+
+/// Whether the source calls for DDI child processing on this display.
+// upstream: intel_bios.c has_ddi_port_info()
+pub const fn has_ddi_port_info(display_version: u8, g4x: bool) -> bool {
+    display_version >= 5 || g4x
+}
+
 /// Map the DVO port-letter table selected for a display version/platform.
 // upstream: intel_bios.c dvo_port_to_port()
-pub const fn dvo_port_to_port(
-    dvo: u8,
-    display_version: u8,
-    platform: DmcPlatform,
-) -> Option<Port> {
+pub const fn dvo_port_to_port(dvo: u8, display_version: u8, platform: DmcPlatform) -> Option<Port> {
     if display_version >= 13 {
         return match dvo {
             0 | 10 => Some(Port::A),
@@ -2557,11 +3086,12 @@ fn parse_dsi_backlight_ports(
         return;
     }
     let port_a = 1u32 << port_index(Port::A);
-    let port_bc = 1u32 << port_index(if display_version >= 11 {
-        Port::B
-    } else {
-        Port::C
-    });
+    let port_bc = 1u32
+        << port_index(if display_version >= 11 {
+            Port::B
+        } else {
+            Port::C
+        });
     let select = |value| match value {
         0 => port_a,
         1 => port_bc,
@@ -2576,6 +3106,7 @@ fn parse_dsi_backlight_ports(
     };
 }
 
+// upstream: intel_bios.c parse_dsi_backlight_ports()
 const fn port_index(port: Port) -> u8 {
     match port {
         Port::A => 0,
@@ -2590,17 +3121,70 @@ const fn port_index(port: Port) -> u8 {
         Port::Tc4 => 8,
     }
 }
-/// ADL-P BIOS DDC bus 3 is GMBUS 9 (TC1), never GMBUS 3 (combo C).
-pub const fn map_ddc_pin(vbt_pin: u8) -> Option<u8> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DdcPinMap {
+    Cnp,
+    Icp,
+    RocketLakeTgp,
+    AdlS,
+    Gen9Tgp,
+    AdlP,
+    Direct,
+}
+
+/// Translate VBT DDC selectors through the seven i915 platform tables.
+// upstream: intel_bios.c map_ddc_pin()
+pub const fn map_ddc_pin_for_map(vbt_pin: u8, map: DdcPinMap) -> Option<u8> {
     match vbt_pin {
         1 => Some(1),
-        2 => Some(2),
-        3 => Some(9),
-        4 => Some(10),
-        5 => Some(11),
-        6 => Some(12),
+        2 => match map {
+            DdcPinMap::AdlS => Some(9),
+            _ => Some(2),
+        },
+        3 => match map {
+            DdcPinMap::Cnp => Some(4),
+            DdcPinMap::Icp => Some(3),
+            DdcPinMap::RocketLakeTgp => Some(9),
+            DdcPinMap::AdlS => Some(10),
+            DdcPinMap::Gen9Tgp => Some(9),
+            DdcPinMap::AdlP => Some(9),
+            DdcPinMap::Direct => Some(3),
+        },
+        4 => match map {
+            DdcPinMap::Cnp => Some(3),
+            DdcPinMap::Icp => Some(9),
+            DdcPinMap::RocketLakeTgp => Some(10),
+            DdcPinMap::AdlS => Some(11),
+            DdcPinMap::Gen9Tgp => Some(10),
+            DdcPinMap::AdlP => Some(10),
+            DdcPinMap::Direct => Some(4),
+        },
+        5 if matches!(map, DdcPinMap::AdlS) => Some(12),
+        5 if matches!(map, DdcPinMap::Icp) => Some(10),
+        6 if matches!(map, DdcPinMap::Icp) => Some(11),
+        7 if matches!(map, DdcPinMap::Icp) => Some(12),
+        8 if matches!(map, DdcPinMap::Icp) => Some(13),
+        9 if matches!(map, DdcPinMap::Icp) => Some(14),
+        5 if matches!(map, DdcPinMap::AdlP) => Some(11),
+        6 if matches!(map, DdcPinMap::AdlP) => Some(12),
+        pin if matches!(map, DdcPinMap::Direct) => Some(pin),
         _ => None,
     }
+}
+
+pub const fn map_ddc_pin_for_platform(vbt_pin: u8, platform: DmcPlatform) -> Option<u8> {
+    let map = match platform {
+        DmcPlatform::TigerLake => DdcPinMap::Icp,
+        DmcPlatform::RocketLake => DdcPinMap::RocketLakeTgp,
+        DmcPlatform::AlderLakeS => DdcPinMap::AdlS,
+        DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN => DdcPinMap::AdlP,
+    };
+    map_ddc_pin_for_map(vbt_pin, map)
+}
+
+/// Display-13 mapping used by the original callers before platform threading.
+pub const fn map_ddc_pin(vbt_pin: u8) -> Option<u8> {
+    map_ddc_pin_for_map(vbt_pin, DdcPinMap::AdlP)
 }
 // upstream: intel_bios.c intel_bios_hdmi_max_tmds_clock()
 pub const fn hdmi_max_tmds_clock(rate: u8) -> u32 {
@@ -2681,7 +3265,9 @@ mod tests {
     fn legacy_hdmi_on_tc1_is_not_combo_or_usb_type_c() {
         let data = table(&tc_hdmi(), 39);
         let vbt = Vbt::parse(&data).unwrap();
-        let defs = vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).unwrap();
+        let defs = vbt
+            .parse_general_definitions(13, DmcPlatform::AlderLakeN)
+            .unwrap();
         let tc = defs.encoder(Port::Tc1).unwrap();
         assert_eq!(tc.gmbus_pin(), Some(9));
         assert!(tc.supports_hdmi());
@@ -2749,7 +3335,11 @@ mod tests {
         psr[96..100].copy_from_slice(&((3u32) << 2).to_le_bytes());
         let mut data = append_section(table(&tc_hdmi(), 39), 9, &psr);
         data[64..66].copy_from_slice(&226u16.to_le_bytes());
-        let parsed = Vbt::parse(&data).unwrap().parse_psr(1, 13).unwrap().unwrap();
+        let parsed = Vbt::parse(&data)
+            .unwrap()
+            .parse_psr(1, 13)
+            .unwrap()
+            .unwrap();
         assert!(parsed.full_link && parsed.require_aux_wakeup);
         assert_eq!((parsed.idle_frames, parsed.lines_to_wait), (7, 5));
         assert_eq!(parsed.tp1_wakeup_us, 100);
@@ -2759,7 +3349,7 @@ mod tests {
     #[test]
     fn driver_and_power_conservation_features_apply_versioned_panel_policy() {
         let mut driver = vec![0u8; 19];
-        driver[7..9].copy_from_slice(&(1u16 << 10).to_le_bytes());
+        driver[7..9].copy_from_slice(&(1u16 << 11).to_le_bytes());
         driver[17..19].copy_from_slice(&((1u16 << 5) | (1u16 << 9) | (1u16 << 12)).to_le_bytes());
         let mut legacy = append_section(table(&tc_hdmi(), 39), 12, &driver);
         legacy[64..66].copy_from_slice(&227u16.to_le_bytes());
@@ -2842,8 +3432,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(parsed.version, 3);
-        assert!(parsed.sequences[2].is_some()); // moved DISPLAY_ON to INIT_OTP
-        assert!(parsed.sequences[3].is_none());
+        let fixed = fixup_mipi_sequences(&parsed, false, 13, false);
+        assert!(fixed.sequences[2].is_some()); // moved DISPLAY_ON to INIT_OTP
+        assert!(fixed.sequences[3].is_none());
     }
     #[test]
     fn child_device_helpers_cover_presence_dual_mode_boost_and_aux_facts() {
@@ -2858,7 +3449,9 @@ mod tests {
         let mut data = table(&child, 39);
         data[64..66].copy_from_slice(&218u16.to_le_bytes());
         let vbt = Vbt::parse(&data).unwrap();
-        let defs = vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).unwrap();
+        let defs = vbt
+            .parse_general_definitions(13, DmcPlatform::AlderLakeN)
+            .unwrap();
         let route = defs.encoder(Port::B).unwrap();
         assert!(route.supports_dp_dual_mode());
         assert_eq!(route.dp_boost_level(vbt.version), 3);
@@ -2874,8 +3467,16 @@ mod tests {
         tv[14..16].copy_from_slice(&1u16.to_le_bytes());
         let tv_data = table(&tv, 39);
         let tv_vbt = Vbt::parse(&tv_data).unwrap();
-        let features = GeneralFeatures { int_tv_support: true, ..GeneralFeatures::default() };
-        assert!(tv_vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).unwrap().is_tv_present(features));
+        let features = GeneralFeatures {
+            int_tv_support: true,
+            ..GeneralFeatures::default()
+        };
+        assert!(
+            tv_vbt
+                .parse_general_definitions(13, DmcPlatform::AlderLakeN)
+                .unwrap()
+                .is_tv_present(features)
+        );
     }
     #[test]
     fn dsc_parameter_selector_and_platform_aux_maps_match_i915_tables() {
@@ -2915,13 +3516,34 @@ mod tests {
         assert_eq!(filled.rc_model_size, 98_304);
         assert_eq!(filled.line_buf_depth, 17);
         assert_eq!(filled.slices_per_line, 4);
-        assert_eq!(map_aux_ch(0x30, crate::dmc::DmcPlatform::AlderLakeP), AuxChannel::H);
-        assert_eq!(map_aux_ch(0x60, crate::dmc::DmcPlatform::AlderLakeP), AuxChannel::D);
-        assert_eq!(map_aux_ch(0x40, crate::dmc::DmcPlatform::AlderLakeS), AuxChannel::A);
-        assert_eq!(map_aux_ch(0x10, crate::dmc::DmcPlatform::AlderLakeS), AuxChannel::D);
-        assert_eq!(map_aux_ch(0x20, crate::dmc::DmcPlatform::RocketLake), AuxChannel::D);
-        assert_eq!(map_aux_ch(0x40, crate::dmc::DmcPlatform::RocketLake), AuxChannel::A);
-        assert_eq!(map_aux_ch(0x90, crate::dmc::DmcPlatform::TigerLake), AuxChannel::I);
+        assert_eq!(
+            map_aux_ch(0x30, crate::dmc::DmcPlatform::AlderLakeP),
+            AuxChannel::H
+        );
+        assert_eq!(
+            map_aux_ch(0x60, crate::dmc::DmcPlatform::AlderLakeP),
+            AuxChannel::D
+        );
+        assert_eq!(
+            map_aux_ch(0x40, crate::dmc::DmcPlatform::AlderLakeS),
+            AuxChannel::A
+        );
+        assert_eq!(
+            map_aux_ch(0x10, crate::dmc::DmcPlatform::AlderLakeS),
+            AuxChannel::D
+        );
+        assert_eq!(
+            map_aux_ch(0x20, crate::dmc::DmcPlatform::RocketLake),
+            AuxChannel::D
+        );
+        assert_eq!(
+            map_aux_ch(0x40, crate::dmc::DmcPlatform::RocketLake),
+            AuxChannel::A
+        );
+        assert_eq!(
+            map_aux_ch(0x90, crate::dmc::DmcPlatform::TigerLake),
+            AuxChannel::I
+        );
     }
     #[test]
     fn lfp_options_generic_dtd_and_backlight_follow_vbt_versions() {
@@ -2954,7 +3576,11 @@ mod tests {
         generic[26] = 0xc0;
         let mut data = append_section(table(&tc_hdmi(), 39), 58, &generic);
         data[64..66].copy_from_slice(&229u16.to_le_bytes());
-        let timing = Vbt::parse(&data).unwrap().parse_generic_dtd(0).unwrap().unwrap();
+        let timing = Vbt::parse(&data)
+            .unwrap()
+            .parse_generic_dtd(0)
+            .unwrap()
+            .unwrap();
         assert_eq!((timing.hdisplay, timing.htotal), (1920, 2200));
         assert_eq!((timing.vdisplay, timing.vtotal), (1080, 1125));
         assert_eq!((timing.width_mm, timing.height_mm), (530, 300));
@@ -2972,15 +3598,22 @@ mod tests {
         backlight[273..275].copy_from_slice(&251u16.to_le_bytes());
         let mut data = append_section(table(&tc_hdmi(), 39), 43, &backlight);
         data[64..66].copy_from_slice(&239u16.to_le_bytes());
-        let parsed = Vbt::parse(&data).unwrap().parse_lfp_backlight(0).unwrap().unwrap();
+        let parsed = Vbt::parse(&data)
+            .unwrap()
+            .parse_lfp_backlight(0)
+            .unwrap()
+            .unwrap();
         assert!(parsed.present && parsed.active_low_pwm);
         assert_eq!(parsed.pwm_frequency_hz, 25_000);
-        assert_eq!((parsed.min_brightness, parsed.brightness_level), (1, 10_000));
+        assert_eq!(
+            (parsed.min_brightness, parsed.brightness_level),
+            (1, 10_000)
+        );
         assert_eq!(parsed.hdr_dpcd_refresh_timeout, 3);
     }
     #[test]
     fn lfp_pointer_generation_uses_upstream_stride_and_validates_terminators() {
-        let stride = 38 + 18 + 12;
+        let stride = 38 + 18 + 10;
         let mut data_block = vec![0u8; stride * 16];
         data_block[0..2].copy_from_slice(&1920u16.to_le_bytes());
         data_block[2..4].copy_from_slice(&1080u16.to_le_bytes());
@@ -3018,24 +3651,27 @@ mod tests {
         assert_eq!(vbt.lfp_data_min_size().unwrap(), 1216);
         let panel = vbt.parse_lfp_data(0, false).unwrap().unwrap();
         assert_eq!(panel.timing.unwrap().clock_khz, 148_500);
-        assert_eq!(panel.pnp.product_code, 0x5678);
-        assert_eq!(panel.pnp.manufacture_week, 4);
-        assert_eq!(panel.pnp.manufacture_year, 23);
+        let pnp = panel.pnp.unwrap();
+        assert_eq!(pnp.product_code, 0x5678);
+        assert_eq!(pnp.manufacture_week, 4);
+        assert_eq!(pnp.manufacture_year, 23);
         assert_eq!(panel.bios_lvds_value, Some(0xdead_beef));
 
         let mut bad = data_block;
         bad[36..38].fill(0);
         let bad_data = append_section(table(&tc_hdmi(), 39), 42, &bad);
-        assert!(Vbt::parse(&bad_data)
-            .unwrap()
-            .parse_lfp_data_pointers()
-            .unwrap()
-            .is_none());
+        assert!(
+            Vbt::parse(&bad_data)
+                .unwrap()
+                .parse_lfp_data_pointers()
+                .unwrap()
+                .is_none()
+        );
     }
     #[test]
     fn bdb_initialization_keeps_i915_block_order_and_zero_extends_known_layouts() {
         let mut lfp_data = vec![0u8; 1216];
-        let stride = 68;
+        let stride = 66;
         for panel in 0..16 {
             let term = panel * stride + 36;
             lfp_data[term..term + 2].copy_from_slice(&u16::MAX.to_le_bytes());
@@ -3050,7 +3686,7 @@ mod tests {
         assert_eq!(ids, [1, 2, 41, 42]);
         let general = blocks.find_section(1).unwrap();
         assert_eq!(&general[..2], &[0xaa, 0xbb]);
-        assert_eq!(general.len(), 12);
+        assert_eq!(general.len(), 7);
         assert!(general[2..].iter().all(|byte| *byte == 0));
         let pointer_block = blocks.iter().find(|block| block.id == 41).unwrap();
         assert_eq!(pointer_block.header[0], 41);
@@ -3066,6 +3702,7 @@ mod tests {
             DmcPlatform::AlderLakeN,
             false,
             true,
+            false,
             &[Port::A, Port::B, Port::Tc1, Port::Tc2],
         );
         assert!(init.vbt.is_none());
@@ -3078,7 +3715,15 @@ mod tests {
         assert!(init.fallback_children[0].device_type & (1 << 12) != 0);
         assert!(init.fallback_children[1].device_type & (1 << 4) != 0);
 
-        let invalid = intel_bios_init(Some(b"not a vbt"), 13, DmcPlatform::AlderLakeN, true, true, &[Port::A]);
+        let invalid = intel_bios_init(
+            Some(b"not a vbt"),
+            13,
+            DmcPlatform::AlderLakeN,
+            true,
+            true,
+            false,
+            &[Port::A],
+        );
         assert!(invalid.vbt.is_none());
         assert_eq!(invalid.fallback_children.len(), 1);
     }
@@ -3103,7 +3748,7 @@ mod tests {
         assert_eq!((timing.hdisplay, timing.htotal), (1920, 2200));
         assert_eq!((timing.vdisplay, timing.vtotal), (1080, 1125));
         assert_eq!((timing.hsync_start, timing.hsync_end), (2008, 2052));
-        assert_eq!((timing.vsync_start, timing.vsync_end), (1084, 1089));
+        assert_eq!((timing.vsync_start, timing.vsync_end), (1085, 1089));
         assert_eq!(timing.clock_khz, 148_500);
         assert_eq!((timing.width_mm, timing.height_mm), (0x512, 0x634));
         assert!(timing.hsync_positive && timing.vsync_positive);
@@ -3136,7 +3781,10 @@ mod tests {
         data[24..26].copy_from_slice(&(n as u16).to_le_bytes());
         data[68..70].copy_from_slice(&((n - 48) as u16).to_le_bytes());
         let vbt = Vbt::parse(&data).unwrap();
-        assert!(vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).is_ok());
+        assert!(
+            vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN)
+                .is_ok()
+        );
         assert_eq!(vbt.find_raw_section(250).unwrap(), None);
     }
     #[test]
@@ -3170,7 +3818,9 @@ mod tests {
     fn absent_tail_is_zero_extended_but_reported_unexpected() {
         let data = table(&tc_hdmi()[..33], 33);
         let vbt = Vbt::parse(&data).unwrap();
-        let defs = vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).unwrap();
+        let defs = vbt
+            .parse_general_definitions(13, DmcPlatform::AlderLakeN)
+            .unwrap();
         assert!(!defs.record_size_expected);
         assert_eq!(defs.children().count(), 1);
         assert!(!defs.children().next().unwrap().usb_type_c);
@@ -3183,20 +3833,18 @@ mod tests {
         let mut data = table(&child, 44);
         data[64..66].copy_from_slice(&264u16.to_le_bytes());
         let vbt = Vbt::parse(&data).unwrap();
-        let tc = vbt
+        let defs = vbt
             .parse_general_definitions(13, DmcPlatform::AlderLakeN)
-            .unwrap()
-            .encoder(Port::Tc1)
             .unwrap();
+        let tc = defs.parse_ddi_ports(false).into_iter().next().unwrap();
         assert!(tc.dedicated_external);
         assert!(!tc.usb_type_c && !tc.thunderbolt && !tc.dynamic_port_over_tc);
         data[64..66].copy_from_slice(&263u16.to_le_bytes());
         let vbt = Vbt::parse(&data).unwrap();
-        let tc = vbt
+        let defs = vbt
             .parse_general_definitions(13, DmcPlatform::AlderLakeN)
-            .unwrap()
-            .encoder(Port::Tc1)
             .unwrap();
+        let tc = defs.parse_ddi_ports(false).into_iter().next().unwrap();
         assert!(!tc.dedicated_external);
         assert!(tc.usb_type_c && tc.thunderbolt);
     }
@@ -3210,7 +3858,7 @@ mod tests {
         let vbt = Vbt::parse(&data).unwrap();
         assert_eq!(
             vbt.find_raw_section(53).unwrap().unwrap().len(),
-            size as usize + 5
+            size as usize
         );
         data[74..78].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
@@ -3232,8 +3880,14 @@ mod tests {
             (20, 19, Port::Tc4),
         ];
         for (hdmi, dp, port) in pairs {
-            assert_eq!(dvo_port_to_port(hdmi, 13, DmcPlatform::AlderLakeN), Some(port));
-            assert_eq!(dvo_port_to_port(dp, 13, DmcPlatform::AlderLakeN), Some(port));
+            assert_eq!(
+                dvo_port_to_port(hdmi, 13, DmcPlatform::AlderLakeN),
+                Some(port)
+            );
+            assert_eq!(
+                dvo_port_to_port(dp, 13, DmcPlatform::AlderLakeN),
+                Some(port)
+            );
         }
         for n in [4, 5, 6, 21, 255] {
             assert_eq!(dvo_port_to_port(n, 13, DmcPlatform::AlderLakeN), None);
@@ -3241,6 +3895,101 @@ mod tests {
         for pin in [0, 7, 8, 9, 255] {
             assert_eq!(map_ddc_pin(pin), None);
         }
+    }
+
+    #[test]
+    fn panel_type_priority_and_valid_pnp_sentinel_match_i915() {
+        assert_eq!(
+            get_panel_type(PanelTypeCandidates {
+                opregion: Some(2),
+                vbt: Some(3),
+                pnpid: Some(4),
+                use_fallback: true,
+            }),
+            Some(2)
+        );
+        assert_eq!(
+            get_panel_type(PanelTypeCandidates {
+                opregion: None,
+                vbt: Some(u8::MAX),
+                pnpid: Some(4),
+                use_fallback: false,
+            }),
+            Some(4)
+        );
+        assert_eq!(
+            get_panel_type(PanelTypeCandidates {
+                opregion: None,
+                vbt: Some(16),
+                pnpid: Some(17),
+                use_fallback: true,
+            }),
+            Some(0)
+        );
+        assert!(is_panel_type_valid_or_pnp(255));
+        assert!(!is_panel_type_valid_or_pnp(16));
+    }
+
+    #[test]
+    fn vlv_mipi_fixup_splits_init_otp_reset_prefix_and_preserves_packet_tail() {
+        let init = [2, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let asserted = [5, 0];
+        let mut sequences = [None; 12];
+        sequences[2] = Some(&init[..]);
+        sequences[5] = Some(&asserted[..]);
+        assert_eq!(get_init_otp_deassert_fragment_len(Some(&init), 1), 6);
+        let input = MipiSequences {
+            version: 1,
+            sequence_data: &[],
+            sequences,
+        };
+        let fixed = fixup_mipi_sequences(&input, false, 8, true);
+        assert_eq!(
+            fixed.sequences[1].as_deref(),
+            Some(&[1, 2, 0, 0, 0, 0, 0][..])
+        );
+        assert_eq!(fixed.sequences[2].as_deref(), Some(&[2, 1, 0, 0, 0, 0][..]));
+        assert!(get_init_otp_deassert_fragment_len(Some(&init), 3) == 0);
+    }
+
+    #[test]
+    fn edid_panel_pnp_match_and_sdvo_legacy_mode_read_follow_record_offsets() {
+        let mut lfp = vec![0u8; 1216];
+        let stride = 66;
+        for panel in 0..16 {
+            let base = panel * stride;
+            lfp[base + 56..base + 66].copy_from_slice(&[0x34, 0x12, 0x78, 0x56, 1, 2, 3, 4, 0, 0]);
+            lfp[base + 36..base + 38].copy_from_slice(&u16::MAX.to_le_bytes());
+        }
+        let mut data = append_section(table(&tc_hdmi(), 39), 42, &lfp);
+        data = append_section(data, 22, &[0, 0, 1]);
+        let mut dtds = vec![0u8; 72];
+        dtds[18..36].copy_from_slice(&[0; 18]);
+        data = append_section(data, 23, &dtds);
+        let vbt = Vbt::parse(&data).unwrap();
+        assert_eq!(
+            vbt.pnpid_panel_type(PanelPnpId {
+                manufacturer: 0x1234,
+                product_code: 0x5678,
+                serial: 0x0403_0201,
+                manufacture_week: 9,
+                manufacture_year: 9,
+            }),
+            Some(0)
+        );
+        assert_eq!(vbt.parse_sdvo_lvds_data(-1).unwrap().unwrap().clock_khz, 0);
+    }
+
+    #[test]
+    fn ddc_pin_mapping_uses_all_platform_mux_tables() {
+        assert_eq!(map_ddc_pin_for_map(3, DdcPinMap::Cnp), Some(4));
+        assert_eq!(map_ddc_pin_for_map(4, DdcPinMap::Cnp), Some(3));
+        assert_eq!(map_ddc_pin_for_map(4, DdcPinMap::Icp), Some(9));
+        assert_eq!(map_ddc_pin_for_map(3, DdcPinMap::RocketLakeTgp), Some(9));
+        assert_eq!(map_ddc_pin_for_map(2, DdcPinMap::AdlS), Some(9));
+        assert_eq!(map_ddc_pin_for_map(3, DdcPinMap::Gen9Tgp), Some(9));
+        assert_eq!(map_ddc_pin_for_map(3, DdcPinMap::AdlP), Some(9));
+        assert_eq!(map_ddc_pin_for_map(37, DdcPinMap::Direct), Some(37));
     }
 
     #[test]
