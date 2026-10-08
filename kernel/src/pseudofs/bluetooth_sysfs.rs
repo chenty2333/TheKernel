@@ -65,6 +65,10 @@ impl SimpleDirOps for BluetoothClass {
                 SimpleFile::new_regular(self.fs.clone(), move || Ok(format!("{device_name}\n"))),
             );
             files.add(
+                "dev_id",
+                SimpleFile::new_regular(self.fs.clone(), move || Ok(format!("{index}\n"))),
+            );
+            files.add(
                 "type",
                 SimpleFile::new_regular(self.fs.clone(), || {
                     Ok::<String, VfsError>("Primary Controller\n".into())
@@ -78,6 +82,40 @@ impl SimpleDirOps for BluetoothClass {
                 "manufacturer",
                 SimpleFile::new_regular(self.fs.clone(), || {
                     Ok::<String, VfsError>("Intel\n".into())
+                }),
+            );
+            let feature_device = adapter.clone();
+            files.add(
+                "features",
+                SimpleFile::new_regular(self.fs.clone(), move || {
+                    let capabilities = feature_device.lock().capabilities();
+                    let mut value = String::new();
+                    for byte in capabilities.features {
+                        use core::fmt::Write;
+                        let _ = write!(value, "{byte:02x}");
+                    }
+                    value.push('\n');
+                    Ok(value)
+                }),
+            );
+            let version_device = adapter.clone();
+            files.add(
+                "hci_version",
+                SimpleFile::new_regular(self.fs.clone(), move || {
+                    Ok(format!(
+                        "{}\n",
+                        version_device.lock().capabilities().hci_version
+                    ))
+                }),
+            );
+            let revision_device = adapter.clone();
+            files.add(
+                "hci_revision",
+                SimpleFile::new_regular(self.fs.clone(), move || {
+                    Ok(format!(
+                        "0x{:04x}\n",
+                        revision_device.lock().capabilities().hci_revision
+                    ))
                 }),
             );
             let up = adapter.clone();

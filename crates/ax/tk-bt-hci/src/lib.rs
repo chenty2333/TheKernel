@@ -153,6 +153,9 @@ pub struct Statistics {
 pub struct HciCapabilities {
     pub address: [u8; 6],
     pub features: [u8; 8],
+    pub hci_version: u8,
+    pub hci_revision: u16,
+    pub manufacturer: u16,
     pub acl_mtu: u16,
     pub acl_packets: u16,
     pub sco_mtu: u16,
@@ -211,6 +214,14 @@ impl<T: UsbTransport> Adapter<T> {
             return Err(Error::InvalidLength);
         }
         capabilities.features.copy_from_slice(&event[6..14]);
+
+        let length = self.command_complete(&[0x01, 0x10, 0], &mut event)?;
+        if length < 14 || event[0] != 0x0e || event[5] != 0 {
+            return Err(Error::InvalidLength);
+        }
+        capabilities.hci_version = event[6];
+        capabilities.hci_revision = u16::from_le_bytes([event[7], event[8]]);
+        capabilities.manufacturer = u16::from_le_bytes([event[10], event[11]]);
 
         let length = self.command_complete(&[0x05, 0x10, 0], &mut event)?;
         if length < 13 || event[0] != 0x0e || event[5] != 0 {
@@ -1229,6 +1240,9 @@ mod tests {
                 events: VecDeque::from([
                     vec![0x0e, 10, 1, 0x09, 0x10, 0, 1, 2, 3, 4, 5, 6],
                     vec![0x0e, 12, 1, 0x03, 0x10, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+                    vec![
+                        0x0e, 12, 1, 0x01, 0x10, 0, 0x0c, 0x34, 0x12, 0x0c, 2, 0, 0, 0,
+                    ],
                     vec![0x0e, 11, 1, 0x05, 0x10, 0, 0x40, 0, 0x20, 2, 0, 1, 0],
                 ]),
                 bulk: Vec::new(),
@@ -1241,6 +1255,9 @@ mod tests {
             Ok(HciCapabilities {
                 address: [1, 2, 3, 4, 5, 6],
                 features: [1, 2, 3, 4, 5, 6, 7, 8],
+                hci_version: 0x0c,
+                hci_revision: 0x1234,
+                manufacturer: 2,
                 acl_mtu: 64,
                 acl_packets: 2,
                 sco_mtu: 32,

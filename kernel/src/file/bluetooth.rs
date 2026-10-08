@@ -670,10 +670,14 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
             if let Some(adapter) = adapter {
                 let adapter = adapter.lock();
                 let address = adapter.address();
+                let capabilities = adapter.capabilities();
                 // mgmt_rp_read_info, with only currently observed controller
                 // properties populated. Unimplemented capabilities stay clear.
                 data.extend_from_slice(&address);
-                data.extend_from_slice(&[0; 11]);
+                data.push(capabilities.hci_version);
+                data.extend_from_slice(&capabilities.manufacturer.to_le_bytes());
+                data.extend_from_slice(&1u32.to_le_bytes()); // powered is controllable
+                data.extend_from_slice(&(u32::from(adapter.is_up())).to_le_bytes());
                 data.extend_from_slice(&[0; 3 + 249 + 11]);
             } else {
                 status = INVALID_INDEX;
