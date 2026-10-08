@@ -17,6 +17,16 @@ class InspectPayloadTests(unittest.TestCase):
                      'tests/guest/inspect-tools.sh', 'tests/guest/block-gpt-tools.sh']:
             self.assertIn(name, ROOTFS_INPUT_FILES)
 
+    def test_e2fsprogs_and_partition_tools_are_pinned_and_staged(self):
+        lines = [line.split('#', 1)[0].strip()
+                 for line in (ROOT/'config/inspect-apks.lock').read_text().splitlines()]
+        pins = dict(line.split('=', 1) for line in lines if line)
+        self.assertEqual(pins['e2fsprogs'], '1.47.4-r0')
+        self.assertEqual(pins['e2fsprogs-libs'], '1.47.4-r0')
+        builder = (ROOT/'scripts/build-inspect-payload.sh').read_text()
+        for tool in ['sfdisk', 'mke2fs', 'mkfs.ext4', 'e2fsck']:
+            self.assertIn(f"'{tool}'", builder)
+
     def test_namespace_acceptance_is_staged_as_an_optional_guest_script(self):
         self.assertIn('tests/guest/container-namespace.sh', ROOTFS_INPUT_FILES)
         builder = (ROOT/'scripts/build-inspect-payload.sh').read_text()

@@ -97,7 +97,8 @@ bin_dir.mkdir(parents=True)
 shutil.copy2(root/'bin/busybox', bin_dir/'busybox')
 programs = ['ps', 'top', 'free', 'vmstat', 'uptime', 'pmap', 'pidstat', 'htop',
             'lsblk', 'findmnt', 'mount', 'df', 'lscpu', 'lsns', 'lspci', 'lsusb',
-            'iostat', 'mpstat', 'ip', 'ss', 'netstat', 'unshare', 'nsenter']
+            'iostat', 'mpstat', 'ip', 'ss', 'netstat', 'unshare', 'nsenter',
+            'sfdisk', 'mke2fs', 'mkfs.ext4', 'e2fsck']
 for program in programs:
     source = next((root/part/program for part in ['bin', 'sbin', 'usr/bin', 'usr/sbin']
                    if (root/part/program).exists() or (root/part/program).is_symlink()), None)

@@ -544,3 +544,9 @@ The SDHCI PCI binding retains FreeBSD BSD-2-Clause attribution in
 
 The Intel e1000 shared register definitions retain the BSD-3-Clause grant at
 `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+The optional inspect guest payload stages signed Alpine `e2fsprogs` 1.47.4-r0
+(`mkfs.ext4`, `mke2fs`, and `e2fsck`) and its runtime libraries. Its package
+metadata reports GPL-2.0-or-later, LGPL-2.0-or-later, BSD-3-Clause, and MIT
+components; these are unmodified distribution binaries, not translated kernel
+code.
