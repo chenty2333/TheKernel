@@ -43,6 +43,7 @@ use axdriver_net::igc::{
     },
     mac::FlowMode,
     phy::{self, IgcPhyIo, PhyError, PhyState},
+    if_igc::{IgcPciIo, igc_enable_pci_busmaster},
     probe::{BarFacts, Candidate, ConfigFacts, MsixFacts},
     regs::{self, RegisterWindow, WINDOW_BYTES},
 };
@@ -62,6 +63,68 @@ impl IgcApiBackend for ApiTableOnlyBackend {
         _request: IgcApiRequest,
     ) -> axdriver_base::DevResult<IgcApiValue> {
         Err(axdriver_base::DevError::Unsupported)
+    }
+}
+
+/// PCI config-space adapter for the translated FreeBSD bus-master admission
+/// helper. This is deliberately narrow: the current port polls and does not
+/// allocate MSI-X or L1SS state through this adapter.
+struct I225PciIo<'a> {
+    root: &'a mut axdriver_pci::PciRoot,
+    bdf: axdriver_pci::DeviceFunction,
+}
+
+impl IgcPciIo for I225PciIo<'_> {
+    fn read_config(&mut self, offset: u16, width: u8) -> u32 {
+        let Ok(offset) = u8::try_from(offset) else {
+            return u32::MAX;
+        };
+        let Some(value) = self.root.read_config_dword(self.bdf, offset & !3) else {
+            return u32::MAX;
+        };
+        let shift = u32::from(offset & 3) * 8;
+        match width {
+            1 => (value >> shift) & 0xff,
+            2 => (value >> shift) & 0xffff,
+            4 if offset & 3 == 0 => value,
+            _ => u32::MAX,
+        }
+    }
+
+    fn write_config(&mut self, offset: u16, width: u8, value: u32) {
+        if width == 2 {
+            if let Ok(offset) = u8::try_from(offset) {
+                let _ = self
+                    .root
+                    .write_config_u16(self.bdf, offset, value as u16);
+            }
+        }
+    }
+
+    fn enable_busmaster(&mut self) -> Result<(), axdriver_net::igc::if_igc::MainError> {
+        const PCI_COMMAND: u8 = 0x04;
+        const PCI_BUSMASTER_ENABLE: u16 = 0x0004;
+        let Some(config) = self.root.read_config_dword(self.bdf, PCI_COMMAND) else {
+            return Err(axdriver_net::igc::if_igc::MainError::Io);
+        };
+        let command = config as u16 | PCI_BUSMASTER_ENABLE;
+        if self.root.write_config_u16(self.bdf, PCI_COMMAND, command) {
+            Ok(())
+        } else {
+            Err(axdriver_net::igc::if_igc::MainError::Io)
+        }
+    }
+
+    fn find_l1ss_capability(&mut self) -> Option<u16> {
+        None
+    }
+
+    fn l1ss_aspm_l12_mask(&self) -> u32 {
+        0
+    }
+
+    fn l1ss_pcipm_l12_mask(&self) -> u32 {
+        0
     }
 }
 
@@ -363,7 +426,8 @@ fn probe(
         return None;
     };
 
-    let facts = config_facts(root, bdf, dev_info);
+    let pci_bdf = bdf;
+    let facts = config_facts(root, pci_bdf, dev_info);
     let bdf = facts.bdf.clone();
     let mut shared = IgcHardware::new(facts.device_id, true);
     shared.revision_id = facts.revision;
@@ -419,6 +483,15 @@ fn probe(
         );
         return Some(None);
     }
+
+    // Match FreeBSD's bus-master gate before the translated PHY helper and
+    // later DMA-ring setup can let the device access memory.
+    let mut pci_io = I225PciIo { root, bdf: pci_bdf };
+    if let Err(error) = igc_enable_pci_busmaster(&mut pci_io) {
+        warn!("igc: {bdf}: PCI bus-master enable failed: {error:?}");
+        return Some(None);
+    }
+    drop(pci_io);
 
     // Install the FreeBSD shared-code operation tables for the identified
     // I225, then run translated MAC and NVM parameter initialization against
