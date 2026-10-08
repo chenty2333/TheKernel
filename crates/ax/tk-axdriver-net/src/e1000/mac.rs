@@ -32,6 +32,8 @@ const NVM_ID_LED_SETTINGS: u16 = 0x0004;
 const NVM_INIT_CONTROL2_REG: u16 = 0x000f;
 const NVM_WORD0F_PAUSE_MASK: u16 = 0x3000;
 const NVM_WORD0F_ASM_DIR: u16 = 0x2000;
+const NVM_COMPAT: u16 = 0x0003;
+const NVM_ALT_MAC_ADDR_PTR: u16 = 0x0037;
 const AUTO_READ_DONE_TIMEOUT_MS: usize = 10;
 const SWFW_SYNC_TIMEOUT: usize = 200;
 const MASTER_DISABLE_TIMEOUT: usize = 800;
@@ -101,6 +103,159 @@ pub struct LedModes {
 
 pub trait E1000NvmReader {
     fn read_word(&mut self, offset: u16) -> DevResult<u16>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E1000MacCallback {
+    NullOps,
+    NullMac,
+    NullLinkInfo,
+    NullMngMode,
+    NullUpdateMc,
+    NullWriteVfta,
+    NullSetObffTimer,
+    SetLanIdMultiPortPcie,
+    ReadMacAddrGeneric,
+    ConfigCollisionDistanceGeneric,
+    UpdateMcAddrListGeneric,
+    ClearVftaGeneric,
+    WriteVftaGeneric,
+    RarSetGeneric,
+    ValidateMdiSettingGeneric,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct E1000MacOps {
+    pub init_params: E1000MacCallback,
+    pub init_hw: E1000MacCallback,
+    pub reset_hw: E1000MacCallback,
+    pub setup_physical_interface: E1000MacCallback,
+    pub get_bus_info: E1000MacCallback,
+    pub set_lan_id: E1000MacCallback,
+    pub read_mac_addr: E1000MacCallback,
+    pub config_collision_dist: E1000MacCallback,
+    pub clear_hw_cntrs: E1000MacCallback,
+    pub cleanup_led: E1000MacCallback,
+    pub setup_led: E1000MacCallback,
+    pub blink_led: E1000MacCallback,
+    pub led_on: E1000MacCallback,
+    pub led_off: E1000MacCallback,
+    pub setup_link: E1000MacCallback,
+    pub get_link_up_info: E1000MacCallback,
+    pub check_for_link: E1000MacCallback,
+    pub set_obff_timer: E1000MacCallback,
+    pub check_mng_mode: E1000MacCallback,
+    pub update_mc_addr_list: E1000MacCallback,
+    pub clear_vfta: E1000MacCallback,
+    pub write_vfta: E1000MacCallback,
+    pub rar_set: E1000MacCallback,
+    pub validate_mdi_setting: E1000MacCallback,
+}
+
+/// upstream: e1000_mac.c e1000_init_mac_ops_generic()
+pub const fn init_mac_ops_generic() -> E1000MacOps {
+    use E1000MacCallback::*;
+    E1000MacOps {
+        init_params: NullOps,
+        init_hw: NullOps,
+        reset_hw: NullOps,
+        setup_physical_interface: NullOps,
+        get_bus_info: NullOps,
+        set_lan_id: SetLanIdMultiPortPcie,
+        read_mac_addr: ReadMacAddrGeneric,
+        config_collision_dist: ConfigCollisionDistanceGeneric,
+        clear_hw_cntrs: NullMac,
+        cleanup_led: NullOps,
+        setup_led: NullOps,
+        blink_led: NullOps,
+        led_on: NullOps,
+        led_off: NullOps,
+        setup_link: NullOps,
+        get_link_up_info: NullLinkInfo,
+        check_for_link: NullOps,
+        set_obff_timer: NullSetObffTimer,
+        check_mng_mode: NullMngMode,
+        update_mc_addr_list: NullUpdateMc,
+        clear_vfta: NullMac,
+        write_vfta: NullWriteVfta,
+        rar_set: RarSetGeneric,
+        validate_mdi_setting: ValidateMdiSettingGeneric,
+    }
+}
+
+/// upstream: e1000_mac.c e1000_init_rx_addrs_generic()
+pub fn init_rx_addrs_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    mac_address: [u8; ETHER_ADDR_LEN],
+    rar_count: u16,
+) -> DevResult {
+    rar_set_generic(io, mac_address, 0)?;
+    for index in 1..rar_count {
+        rar_set_generic(io, [0; ETHER_ADDR_LEN], u32::from(index))?;
+    }
+    Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_check_alt_mac_addr_generic()
+pub fn check_alt_mac_addr_generic<N: E1000NvmReader, I: E1000RegisterIo>(
+    nvm: &mut N,
+    io: &mut I,
+    unsupported_older_or_82573: bool,
+    option_rom_managed: bool,
+    lan_function: u8,
+) -> DevResult {
+    let _compatibility = nvm.read_word(NVM_COMPAT)?;
+    if unsupported_older_or_82573 || option_rom_managed {
+        return Ok(());
+    }
+    let mut offset = nvm.read_word(NVM_ALT_MAC_ADDR_PTR)?;
+    if offset == 0 || offset == u16::MAX {
+        return Ok(());
+    }
+    offset = offset
+        .checked_add(match lan_function {
+            1 => 3,
+            2 => 6,
+            3 => 9,
+            _ => 0,
+        })
+        .ok_or(DevError::InvalidParam)?;
+    let mut address = [0u8; ETHER_ADDR_LEN];
+    for pair in 0..3u16 {
+        let word = nvm.read_word(offset.checked_add(pair).ok_or(DevError::InvalidParam)?)?;
+        address[(pair * 2) as usize] = word as u8;
+        address[(pair * 2 + 1) as usize] = (word >> 8) as u8;
+    }
+    if address[0] & 1 != 0 {
+        return Ok(());
+    }
+    rar_set_generic(io, address, 0)
+}
+
+/// upstream: e1000_mac.c e1000_i21x_check_mta()
+pub fn i21x_check_mta<I: E1000RegisterIo>(io: &mut I, shadow: &[u32]) -> DevResult {
+    if shadow.len() > MTA_REG_COUNT {
+        return Err(DevError::InvalidParam);
+    }
+    for attempt in 0..3 {
+        let mut failed = false;
+        for index in (0..shadow.len()).rev() {
+            let register = array_register(E1000_MTA, index, MTA_REG_COUNT, 0x6000)?;
+            if io.read_register(register)? == shadow[index] {
+                continue;
+            }
+            failed = true;
+            io.write_register(register, shadow[index])?;
+            let _ = io.read_register(E1000_STATUS)?;
+        }
+        if !failed {
+            break;
+        }
+        if attempt == 2 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn normalize_led_default(mut data: u16) -> u16 {
@@ -759,8 +914,15 @@ fn array_register(base: u32, index: usize, count: usize, limit: u32) -> DevResul
 /// upstream: e1000_mac.c e1000_rar_set_generic()
 pub fn rar_set_generic<I: E1000RegisterIo>(io: &mut I, address: [u8; 6], index: u32) -> DevResult {
     let index = usize::try_from(index).map_err(|_| DevError::InvalidParam)?;
-    let low_reg = array_register(RAL, index, 16, 0x6000)?;
-    let high_reg = array_register(RAH, index, 16, 0x6000)?;
+    if index >= 16 {
+        return Err(DevError::InvalidParam);
+    }
+    let rar_offset = u32::try_from(index)
+        .map_err(|_| DevError::InvalidParam)?
+        .checked_mul(8)
+        .ok_or(DevError::InvalidParam)?;
+    let low_reg = RAL.checked_add(rar_offset).ok_or(DevError::InvalidParam)?;
+    let high_reg = RAH.checked_add(rar_offset).ok_or(DevError::InvalidParam)?;
     let low = u32::from(address[0])
         | (u32::from(address[1]) << 8)
         | (u32::from(address[2]) << 16)
@@ -1080,6 +1242,33 @@ mod tests {
             set_default_fc_generic(&mut fc_nvm, false, 2).unwrap(),
             FlowControlMode::None
         );
+    }
+
+    #[test]
+    fn generic_mac_operation_defaults_and_receive_address_setup() {
+        let ops = init_mac_ops_generic();
+        assert_eq!(ops.set_lan_id, E1000MacCallback::SetLanIdMultiPortPcie);
+        assert_eq!(ops.rar_set, E1000MacCallback::RarSetGeneric);
+        assert_eq!(ops.setup_link, E1000MacCallback::NullOps);
+        let mut io = Registers::default();
+        init_rx_addrs_generic(&mut io, [2, 1, 2, 3, 4, 5], 3).unwrap();
+        assert_eq!(io.writes.len(), 6);
+        assert_eq!(io.writes[0], (RAL, 0x0302_0102));
+        assert_eq!(io.writes[2], (RAL + 8, 0));
+        assert_eq!(io.writes[4], (RAL + 16, 0));
+    }
+
+    #[test]
+    fn generic_alternate_mac_uses_nvm_words_and_lan_offset() {
+        let mut nvm = Nvm {
+            word: 0x10,
+            last_offset: None,
+        };
+        let mut io = Registers::default();
+        check_alt_mac_addr_generic(&mut nvm, &mut io, false, false, 2).unwrap();
+        assert_eq!(nvm.last_offset, Some(0x18));
+        assert_eq!(io.writes[0], (RAL, 0x0010_0010));
+        assert_eq!(io.writes[1], (RAH, E1000_RAH_AV | 0x0010));
     }
 
     #[test]
