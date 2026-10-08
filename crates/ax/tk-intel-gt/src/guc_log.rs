@@ -341,6 +341,7 @@ pub fn default_log_level(debug_guc: bool, debug_gem: bool, requested: i32) -> u8
 }
 
 impl GucLogLayout {
+    /// upstream: intel_guc_log.c guc_log_init_sizes() to GuC control fields.
     pub fn control_config(self, ggtt_address: u32) -> LogConfig {
         let section = |size: SectionSize| LogSection {
             flags: size.flags,

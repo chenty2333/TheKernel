@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
 
-use crate::{Error, GtIo};
+use crate::Error;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const GUC_MAX_ENGINE_CLASSES: usize = 16;
@@ -210,6 +210,8 @@ pub struct AdsRuntimeInfo {
     pub generic_gt_sysinfo: [u32; GUC_GENERIC_GT_SYSINFO_MAX],
     pub graphics_ip_major: u8,
     pub graphics_ip_minor: u8,
+    pub media_ip_major: u8,
+    pub media_ip_minor: u8,
     pub firmware_version: (u8, u8, u8),
     pub dgfx: bool,
 }
@@ -221,6 +223,9 @@ pub struct AdsBuildInput {
     pub runtime: AdsRuntimeInfo,
     pub engines: Vec<EngineMapEntry>,
     pub regsets: Vec<EngineRegset>,
+    /// Real LRC sizes for enabled GuC engine classes, even when no default
+    /// engine-state image is currently available.
+    pub engine_context_sizes: Vec<(u8, usize)>,
     pub golden_contexts: Vec<GoldenContext>,
     pub capture_lists: Vec<CaptureList>,
     pub private_data_size: usize,
@@ -312,24 +317,36 @@ pub fn policy_info(policies: Policies) -> (u32, u32, u32) {
     )
 }
 
-/// upstream: intel_guc_ads.c guc_action_policies_update().
-pub fn action_policies_update(io: &impl GtIo, policy_ggtt: u32) -> Result<(), Error> {
-    let response =
-        crate::guc_fw::send_mmio(io, &[ACTION_GLOBAL_SCHED_POLICY_CHANGE, policy_ggtt], None)?;
-    if response == 0 {
-        Ok(())
-    } else {
-        Err(Error::Unavailable(ACTION_GLOBAL_SCHED_POLICY_CHANGE))
+/// upstream: intel_guc_ads.c guc_action_policies_update(). CTB is the GuC
+/// submission transport; refresh/wait is supplied by the CT owner on EBUSY.
+pub fn action_policies_update(
+    pair: &mut crate::guc_ct::CtbPair,
+    policy_ggtt: u32,
+    mut refresh_ctb: impl FnMut(&mut crate::guc_ct::CtbPair) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if policy_ggtt == 0 || policy_ggtt & 3 != 0 {
+        return Err(Error::Refused);
+    }
+    loop {
+        match pair.send_nonblocking(
+            &[ACTION_GLOBAL_SCHED_POLICY_CHANGE, policy_ggtt],
+            crate::guc_ct::CT_SEND_NB,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(crate::guc_ct::CtError::NoRoom) => refresh_ctb(pair)?,
+            Err(_) => return Err(Error::Refused),
+        }
     }
 }
 
 /// upstream: intel_guc_ads.c intel_guc_global_policies_update().
 pub fn global_policies_update(
-    io: &impl GtIo,
+    pair: &mut crate::guc_ct::CtbPair,
     bytes: &mut [u8],
     policy_ggtt: u32,
     reset_parameter: u8,
     guc_ready: bool,
+    refresh_ctb: impl FnMut(&mut crate::guc_ct::CtbPair) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if policy_ggtt == 0 || policy_ggtt & 3 != 0 || bytes.len() < size_of::<AdsFixed>() {
         return Err(Error::Refused);
@@ -357,7 +374,7 @@ pub fn global_policies_update(
         policies.is_valid,
     )?;
     if guc_ready {
-        action_policies_update(io, policy_ggtt)?;
+        action_policies_update(pair, policy_ggtt, refresh_ctb)?;
     }
     Ok(())
 }
@@ -512,9 +529,9 @@ pub fn sorted_unique_regset(registers: &[MmioReg]) -> Result<Vec<MmioReg>, Error
 pub fn capture_class_mask(capture_class: u8, enabled_masks: &[u32; GUC_MAX_ENGINE_CLASSES]) -> u32 {
     match capture_class {
         0 => enabled_masks[0] | enabled_masks[4], // render + compute
-        1 => enabled_masks[2],                    // video
-        2 => enabled_masks[3],                    // video-enhance
-        3 => enabled_masks[4],                    // blitter
+        1 => enabled_masks[1],                    // video
+        2 => enabled_masks[2],                    // video-enhance
+        3 => enabled_masks[3],                    // blitter
         4 => enabled_masks[5],                    // GSC/other
         _ => 0,
     }
@@ -572,42 +589,77 @@ fn prepare_golden_contexts(
     bytes: &mut [u8],
     base: u32,
     layout: AdsLayout,
+    engine_context_sizes: &[(u8, usize)],
+    enabled_masks: &[u32; GUC_MAX_ENGINE_CLASSES],
     contexts: &[GoldenContext],
 ) -> Result<(), Error> {
     let mut cursor = layout.golden_context_offset;
-    for context in contexts {
-        let class = usize::from(context.guc_class);
-        if class >= GUC_MAX_ENGINE_CLASSES
-            || context.engine_state_offset > context.image.len()
-            || context.image.is_empty()
-        {
+    for (class, enabled_mask) in enabled_masks.iter().copied().enumerate() {
+        if enabled_mask == 0 {
+            if contexts
+                .iter()
+                .any(|context| usize::from(context.guc_class) == class)
+            {
+                return Err(Error::Refused);
+            }
+            continue;
+        }
+        let guc_class = u8::try_from(class).map_err(|_| Error::Refused)?;
+        let mut sizes = engine_context_sizes
+            .iter()
+            .filter(|(candidate, _)| *candidate == guc_class);
+        let Some((_, real_size)) = sizes.next() else {
+            return Err(Error::Refused);
+        };
+        if sizes.next().is_some() || *real_size == 0 {
             return Err(Error::Refused);
         }
-        let allocation = page_align(context.image.len())?;
+        let allocation = page_align(*real_size)?;
         let end = cursor.checked_add(allocation).ok_or(Error::Refused)?;
         if end > layout.workaround_klv_offset {
             return Err(Error::Refused);
         }
-        let image_end = cursor
-            .checked_add(context.image.len())
-            .ok_or(Error::Refused)?;
-        bytes
-            .get_mut(cursor..image_end)
-            .ok_or(Error::Refused)?
-            .copy_from_slice(&context.image);
-        write_u32(
-            bytes,
-            offset_of!(AdsFixed, ads.golden_context_lrca) + class * 4,
-            base.checked_add(u32::try_from(cursor).map_err(|_| Error::Refused)?)
-                .ok_or(Error::Refused)?,
-        )?;
-        write_u32(
-            bytes,
-            offset_of!(AdsFixed, ads.engine_state_size) + class * 4,
-            u32::try_from(context.image.len() - context.engine_state_offset)
-                .map_err(|_| Error::Refused)?,
-        )?;
+        if let Some(context) = contexts
+            .iter()
+            .find(|context| context.guc_class == guc_class)
+        {
+            if context.image.len() != *real_size || context.engine_state_offset > *real_size {
+                return Err(Error::Refused);
+            }
+            let image_end = cursor
+                .checked_add(context.image.len())
+                .ok_or(Error::Refused)?;
+            bytes
+                .get_mut(cursor..image_end)
+                .ok_or(Error::Refused)?
+                .copy_from_slice(&context.image);
+            write_u32(
+                bytes,
+                offset_of!(AdsFixed, ads.golden_context_lrca) + class * 4,
+                base.checked_add(u32::try_from(cursor).map_err(|_| Error::Refused)?)
+                    .ok_or(Error::Refused)?,
+            )?;
+            write_u32(
+                bytes,
+                offset_of!(AdsFixed, ads.engine_state_size) + class * 4,
+                u32::try_from(*real_size - context.engine_state_offset)
+                    .map_err(|_| Error::Refused)?,
+            )?;
+        }
         cursor = end;
+    }
+    if contexts.iter().any(|context| {
+        usize::from(context.guc_class) >= GUC_MAX_ENGINE_CLASSES
+            || enabled_masks[usize::from(context.guc_class)] == 0
+    }) {
+        return Err(Error::Refused);
+    }
+    if engine_context_sizes.iter().any(|(class, bytes)| {
+        usize::from(*class) >= GUC_MAX_ENGINE_CLASSES
+            || enabled_masks[usize::from(*class)] == 0
+            || *bytes == 0
+    }) {
+        return Err(Error::Refused);
     }
     Ok(())
 }
@@ -747,14 +799,18 @@ fn prepare_workaround_klvs(
 /// upstream: intel_guc_ads.c guc_waklv_init() platform/firmware gates.
 pub fn workaround_klv_ids(runtime: AdsRuntimeInfo) -> Vec<u16> {
     let graphics_ip = (runtime.graphics_ip_major, runtime.graphics_ip_minor);
+    let media_ip = (runtime.media_ip_major, runtime.media_ip_minor);
     let mut ids = Vec::new();
+    if runtime.firmware_version < (70, 10, 0) {
+        return ids;
+    }
     if (12, 70) <= graphics_ip && graphics_ip < (12, 75) {
         ids.push(GUC_WORKAROUND_KLV_SERIALIZED_RA_MODE);
         ids.push(GUC_WORKAROUND_KLV_AVOID_GFX_CLEAR_WHILE_ACTIVE);
     }
     if runtime.firmware_version >= (70, 21, 1)
         && (((12, 70) <= graphics_ip && graphics_ip < (12, 75))
-            || graphics_ip == (13, 0)
+            || media_ip == (13, 0)
             || runtime.dgfx)
     {
         ids.push(GUC_WORKAROUND_KLV_BLOCK_INTERRUPTS_WHEN_MGSR_BLOCKED);
@@ -792,13 +848,27 @@ pub fn build_ads(input: &AdsBuildInput) -> Result<(AdsLayout, Vec<u8>), Error> {
             return Err(Error::Refused);
         }
     }
-    let golden_size = input
-        .golden_contexts
-        .iter()
-        .try_fold(0usize, |sum, context| {
-            sum.checked_add(page_align(context.image.len())?)
-                .ok_or(Error::Refused)
-        })?;
+    let enabled_masks = fill_engine_enable_masks(&input.engines)?;
+    let mut golden_size = 0usize;
+    for (class, mask) in enabled_masks.iter().copied().enumerate() {
+        if mask == 0 {
+            continue;
+        }
+        let guc_class = u8::try_from(class).map_err(|_| Error::Refused)?;
+        let mut sizes = input
+            .engine_context_sizes
+            .iter()
+            .filter(|(candidate, _)| *candidate == guc_class);
+        let Some((_, bytes)) = sizes.next() else {
+            return Err(Error::Refused);
+        };
+        if sizes.next().is_some() || *bytes == 0 {
+            return Err(Error::Refused);
+        }
+        golden_size = golden_size
+            .checked_add(page_align(*bytes)?)
+            .ok_or(Error::Refused)?;
+    }
     let capture_size = input
         .capture_lists
         .iter()
@@ -806,7 +876,7 @@ pub fn build_ads(input: &AdsBuildInput) -> Result<(AdsLayout, Vec<u8>), Error> {
             sum.checked_add(list.bytes.len()).ok_or(Error::Refused)
         })?;
     let klv_ids = workaround_klv_ids(input.runtime);
-    let klv_size = klv_ids.len().checked_mul(4).ok_or(Error::Refused)?;
+    let klv_size = PAGE_SIZE.max(klv_ids.len().checked_mul(4).ok_or(Error::Refused)?);
     let layout = layout(AdsSizes {
         regset: regset.len(),
         golden_context: golden_size,
@@ -853,7 +923,14 @@ pub fn build_ads(input: &AdsBuildInput) -> Result<(AdsLayout, Vec<u8>), Error> {
         .copy_from_slice(&regset);
 
     // Upstream reserves rounded context slots; callers provide saved LRCs.
-    prepare_golden_contexts(&mut bytes, input.base_ggtt, layout, &input.golden_contexts)?;
+    prepare_golden_contexts(
+        &mut bytes,
+        input.base_ggtt,
+        layout,
+        &input.engine_context_sizes,
+        &enabled_masks,
+        &input.golden_contexts,
+    )?;
     prepare_capture_lists(&mut bytes, input.base_ggtt, layout, &input.capture_lists)?;
     prepare_workaround_klvs(&mut bytes, input.base_ggtt, layout, &klv_ids)?;
     let info_offset = offset_of!(AdsFixed, system_info.generic_gt_sysinfo);
@@ -911,20 +988,6 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-
-    struct TestIo;
-    impl GtIo for TestIo {
-        fn read(&self, offset: u32) -> Result<u32, Error> {
-            Err(Error::Unavailable(offset))
-        }
-        fn write(&self, offset: u32, _value: u32) -> Result<(), Error> {
-            Err(Error::Unavailable(offset))
-        }
-        fn now_us(&self) -> u64 {
-            0
-        }
-        fn delay_us(&self, _micros: u32) {}
-    }
 
     fn entries() -> [EngineMapEntry; 2] {
         [
@@ -1054,6 +1117,8 @@ mod tests {
                 generic_gt_sysinfo: [0x55; GUC_GENERIC_GT_SYSINFO_MAX],
                 graphics_ip_major: 12,
                 graphics_ip_minor: 0,
+                media_ip_major: 12,
+                media_ip_minor: 0,
                 firmware_version: (70, 10, 0),
                 dgfx: false,
             },
@@ -1081,6 +1146,7 @@ mod tests {
                     },
                 ],
             }],
+            engine_context_sizes: vec![(0, 32)],
             golden_contexts: vec![GoldenContext {
                 guc_class: 0,
                 image: vec![0xaa; 32],
@@ -1131,6 +1197,55 @@ mod tests {
     }
 
     #[test]
+    fn enabled_engine_without_saved_state_keeps_reserved_golden_slot_zeroed() {
+        let input = AdsBuildInput {
+            base_ggtt: 0x50_0000,
+            reset_parameter: 2,
+            runtime: AdsRuntimeInfo {
+                generic_gt_sysinfo: [0; GUC_GENERIC_GT_SYSINFO_MAX],
+                graphics_ip_major: 12,
+                graphics_ip_minor: 0,
+                media_ip_major: 12,
+                media_ip_minor: 0,
+                firmware_version: (70, 10, 0),
+                dgfx: false,
+            },
+            engines: vec![EngineMapEntry {
+                guc_class: 0,
+                instance: 0,
+                logical_index: 0,
+            }],
+            regsets: vec![],
+            engine_context_sizes: vec![(0, 5000)],
+            golden_contexts: vec![],
+            capture_lists: vec![],
+            private_data_size: 0,
+        };
+        let (layout, bytes) = build_ads(&input).unwrap();
+        assert_eq!(
+            layout.workaround_klv_offset,
+            layout.golden_context_offset + 8192
+        );
+        assert_eq!(
+            dword(&bytes, offset_of!(AdsFixed, ads.golden_context_lrca)),
+            0
+        );
+        assert_eq!(
+            dword(&bytes, offset_of!(AdsFixed, ads.engine_state_size)),
+            0
+        );
+        assert!(
+            bytes[layout.golden_context_offset..layout.workaround_klv_offset]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(
+            layout.capture_offset,
+            layout.workaround_klv_offset + PAGE_SIZE
+        );
+    }
+
+    #[test]
     fn ads_capture_lists_use_reserved_null_page_and_separate_class_instance_global_slots() {
         let page = vec![0x11, 0x22];
         let input = AdsBuildInput {
@@ -1140,11 +1255,14 @@ mod tests {
                 generic_gt_sysinfo: [0; GUC_GENERIC_GT_SYSINFO_MAX],
                 graphics_ip_major: 12,
                 graphics_ip_minor: 0,
+                media_ip_major: 12,
+                media_ip_minor: 0,
                 firmware_version: (70, 10, 0),
                 dgfx: false,
             },
             engines: vec![],
             regsets: vec![],
+            engine_context_sizes: vec![],
             golden_contexts: vec![],
             capture_lists: vec![
                 CaptureList {
@@ -1199,6 +1317,8 @@ mod tests {
             generic_gt_sysinfo: [0; GUC_GENERIC_GT_SYSINFO_MAX],
             graphics_ip_major: 12,
             graphics_ip_minor: 70,
+            media_ip_major: 12,
+            media_ip_minor: 0,
             firmware_version: (70, 21, 1),
             dgfx: false,
         };
@@ -1206,6 +1326,22 @@ mod tests {
         assert!(
             workaround_klv_ids(AdsRuntimeInfo {
                 graphics_ip_minor: 0,
+                ..runtime
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            workaround_klv_ids(AdsRuntimeInfo {
+                graphics_ip_minor: 0,
+                media_ip_major: 13,
+                media_ip_minor: 0,
+                ..runtime
+            }),
+            [GUC_WORKAROUND_KLV_BLOCK_INTERRUPTS_WHEN_MGSR_BLOCKED]
+        );
+        assert!(
+            workaround_klv_ids(AdsRuntimeInfo {
+                firmware_version: (70, 9, 9),
                 ..runtime
             })
             .is_empty()
@@ -1223,7 +1359,8 @@ mod tests {
         })
         .unwrap();
         let mut bytes = build_static_ads(0x80_0000, layout, 2, &[]).unwrap();
-        global_policies_update(&TestIo, &mut bytes, 0x80_1000, 1, false).unwrap();
+        let mut pair = crate::guc_ct::CtbPair::new().unwrap();
+        global_policies_update(&mut pair, &mut bytes, 0x80_1000, 1, false, |_| Ok(())).unwrap();
         let policy = offset_of!(AdsFixed, policies);
         assert_eq!(
             dword(&bytes, policy + offset_of!(Policies, dpc_promote_time)),
@@ -1238,5 +1375,29 @@ mod tests {
             GLOBAL_POLICY_DISABLE_ENGINE_RESET
         );
         assert_eq!(dword(&bytes, policy + offset_of!(Policies, is_valid)), 1);
+        assert_eq!(pair.send.descriptor.tail, 0);
+        global_policies_update(&mut pair, &mut bytes, 0x80_1000, 1, true, |_| Ok(())).unwrap();
+        assert_eq!(pair.send.descriptor.tail, 3);
+    }
+
+    #[test]
+    fn global_policy_action_retries_ctb_backpressure_after_peer_progress() {
+        let mut pair = crate::guc_ct::CtbPair::new().unwrap();
+        for _ in 0..crate::guc_ct::CTB_H2G_BUFFER_SIZE / 4 {
+            if pair
+                .send_nonblocking(&[0x1000], crate::guc_ct::CT_SEND_NB)
+                .is_err()
+            {
+                break;
+            }
+        }
+        let mut retries = 0;
+        action_policies_update(&mut pair, 0x40_0000, |pair| {
+            retries += 1;
+            let peer_head = pair.send.descriptor.tail;
+            pair.send.update_peer(peer_head).map_err(|_| Error::Refused)
+        })
+        .unwrap();
+        assert_eq!(retries, 1);
     }
 }

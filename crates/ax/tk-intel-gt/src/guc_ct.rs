@@ -126,6 +126,9 @@ pub const ACTION_STATE_CAPTURE_NOTIFICATION: u16 = 0x8002;
 pub const ACTION_NOTIFY_FLUSH_LOG_BUFFER_TO_FILE: u16 = 0x8003;
 pub const ACTION_NOTIFY_CRASH_DUMP_POSTED: u16 = 0x8004;
 pub const ACTION_NOTIFY_EXCEPTION: u16 = 0x8005;
+pub const CTB_DEADLOCK_TIMEOUT_US: u64 = 1_500_000;
+pub const CTB_RESPONSE_TIMEOUT_SHORT_US: u64 = 10_000;
+pub const CTB_RESPONSE_TIMEOUT_LONG_US: u64 = 1_000_000;
 
 /// The shared descriptor is 16 dwords; only the first three are writable.
 #[repr(C)]
@@ -156,6 +159,9 @@ pub enum CtError {
     Broken(u32),
     Incomplete,
     UnexpectedResponse,
+    Timeout,
+    Deadlocked,
+    Failure { error: u16, hint: u16 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,9 +197,24 @@ pub fn register_buffer(
     buffer: u32,
     size_bytes: u32,
 ) -> Result<(), Error> {
-    if descriptor == 0 || buffer == 0 || size_bytes == 0 || size_bytes % 4096 != 0 {
-        return Err(Error::Refused);
-    }
+    register_buffer_with_regs(
+        io,
+        crate::guc_fw::GT_GUC_SEND_REGS,
+        send,
+        descriptor,
+        buffer,
+        size_bytes,
+    )
+}
+
+pub fn register_buffer_with_regs(
+    io: &impl GtIo,
+    regs: crate::guc_fw::GucSendRegs,
+    send: bool,
+    descriptor: u32,
+    buffer: u32,
+    size_bytes: u32,
+) -> Result<(), Error> {
     let (desc_key, buffer_key, size_key) = if send {
         (
             KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR,
@@ -207,19 +228,32 @@ pub fn register_buffer(
             KLV_SELF_CFG_G2H_CTB_SIZE,
         )
     };
-    crate::guc_fw::self_config64(io, desc_key, u64::from(descriptor))?;
-    crate::guc_fw::self_config64(io, buffer_key, u64::from(buffer))?;
-    crate::guc_fw::self_config32(io, size_key, size_bytes)
+    crate::guc_fw::self_config64_with_regs(io, regs, desc_key, u64::from(descriptor))?;
+    crate::guc_fw::self_config64_with_regs(io, regs, buffer_key, u64::from(buffer))?;
+    crate::guc_fw::self_config32_with_regs(io, regs, size_key, size_bytes)
 }
 
 /// upstream: intel_guc_ct.c guc_action_control_ctb()/ct_control_enable().
 pub fn control_buffer_transport(io: &impl GtIo, enable: bool) -> Result<(), Error> {
+    control_buffer_transport_with_regs(io, crate::guc_fw::GT_GUC_SEND_REGS, enable)
+}
+
+pub fn control_buffer_transport_with_regs(
+    io: &impl GtIo,
+    regs: crate::guc_fw::GucSendRegs,
+    enable: bool,
+) -> Result<(), Error> {
     let control = if enable {
         CTB_CONTROL_ENABLE
     } else {
         CTB_CONTROL_DISABLE
     };
-    let result = crate::guc_fw::send_mmio(io, &[ACTION_HOST2GUC_CONTROL_CTB, control], None)?;
+    let result = crate::guc_fw::send_mmio_with_regs(
+        io,
+        regs,
+        &[ACTION_HOST2GUC_CONTROL_CTB, control],
+        None,
+    )?;
     if result == 0 {
         Ok(())
     } else {
@@ -229,21 +263,31 @@ pub fn control_buffer_transport(io: &impl GtIo, enable: bool) -> Result<(), Erro
 
 /// upstream: intel_guc_ct.c intel_guc_ct_enable(). G2H is registered first.
 pub fn enable_buffer_transport(io: &impl GtIo, addresses: CtbAddresses) -> Result<(), Error> {
-    register_buffer(
+    enable_buffer_transport_with_regs(io, crate::guc_fw::GT_GUC_SEND_REGS, addresses)
+}
+
+pub fn enable_buffer_transport_with_regs(
+    io: &impl GtIo,
+    regs: crate::guc_fw::GucSendRegs,
+    addresses: CtbAddresses,
+) -> Result<(), Error> {
+    register_buffer_with_regs(
         io,
+        regs,
         false,
         addresses.receive_descriptor,
         addresses.receive_buffer,
         CTB_G2H_BUFFER_SIZE as u32,
     )?;
-    register_buffer(
+    register_buffer_with_regs(
         io,
+        regs,
         true,
         addresses.send_descriptor,
         addresses.send_buffer,
         CTB_H2G_BUFFER_SIZE as u32,
     )?;
-    control_buffer_transport(io, true)
+    control_buffer_transport_with_regs(io, regs, true)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -299,7 +343,6 @@ pub fn parse_message(words: &[u32]) -> Result<CtbMessage<'_>, CtError> {
     if words.len() < CTB_HXG_MSG_MIN_LEN
         || words.len() > CTB_MSG_MAX_LEN
         || (words[0] & CTB_MSG_0_FORMAT_MASK) != CTB_FORMAT_HXG << 12
-        || (words[0] & CTB_MSG_0_RESERVED_MASK) != 0
         || (words[0] & CTB_MSG_0_NUM_DWORDS_MASK) as usize + CTB_HDR_LEN != words.len()
     {
         return Err(CtError::InvalidMessage);
@@ -387,6 +430,7 @@ impl CtbBuffer {
     }
 
     /// Apply the peer-owned descriptor head (send) or tail (receive).
+    /// upstream: intel_guc_ct.c ct_write()/ct_read() descriptor import.
     pub fn update_peer(&mut self, position: u32) -> Result<(), CtError> {
         if position >= self.capacity_dwords() {
             self.descriptor.status |= CTB_STATUS_OVERFLOW;
@@ -401,6 +445,7 @@ impl CtbBuffer {
         self.refresh_space()
     }
 
+    /// upstream: intel_guc_ct.c h2g_has_room()/g2h_has_room().
     fn refresh_space(&mut self) -> Result<(), CtError> {
         if self.broken || self.descriptor.status != 0 {
             self.broken = true;
@@ -524,6 +569,7 @@ impl CtbBuffer {
         Ok(())
     }
 
+    /// upstream: intel_guc_ct.c guc_ct_buffer_reset().
     pub fn reset(&mut self) {
         self.descriptor = CtbDescriptor::default();
         self.local_head = 0;
@@ -537,6 +583,8 @@ impl CtbBuffer {
 pub struct CtbPair {
     pub send: CtbBuffer,
     pub receive: CtbBuffer,
+    /// Set when the peer posts G2H after CT shutdown; caller should diagnose.
+    pub unused_receive_status_seen: bool,
     next_fence: u16,
     pending: Vec<PendingRequest>,
 }
@@ -546,6 +594,7 @@ impl CtbPair {
         Ok(Self {
             send: CtbBuffer::new(CTB_H2G_BUFFER_SIZE, 0)?,
             receive: CtbBuffer::new(CTB_G2H_BUFFER_SIZE, G2H_ROOM_BUFFER_SIZE)?,
+            unused_receive_status_seen: false,
             next_fence: 0,
             pending: Vec::new(),
         })
@@ -565,8 +614,14 @@ impl CtbPair {
         Ok(fence)
     }
 
+    /// upstream: intel_guc_ct.c g2h_release_space().
     pub fn release_response_space(&mut self, dwords: u32) -> Result<(), CtError> {
         self.receive.release_response_space(dwords)
+    }
+
+    /// Report/clear the upstream UNUSED-status notification after CT shutdown.
+    pub fn take_unused_receive_status_seen(&mut self) -> bool {
+        core::mem::replace(&mut self.unused_receive_status_seen, false)
     }
 
     /// Initial shared blob created by intel_guc_ct_init().
@@ -581,6 +636,7 @@ impl CtbPair {
     }
 
     /// Import peer-owned descriptor fields and G2H command dwords before read.
+    /// upstream: intel_guc_ct.c ct_read() peer descriptor/data import.
     pub fn sync_from_blob(&mut self, blob: &[u8]) -> Result<(), CtError> {
         if blob.len() < CTB_BLOB_SIZE {
             return Err(CtError::InvalidSize);
@@ -595,7 +651,9 @@ impl CtbPair {
 
         self.receive.descriptor.head = read_dword(blob, CTB_RECV_DESC_OFFSET)?;
         self.receive.descriptor.tail = read_dword(blob, CTB_RECV_DESC_OFFSET + 4)?;
-        self.receive.descriptor.status = read_dword(blob, CTB_RECV_DESC_OFFSET + 8)?;
+        let receive_status = read_dword(blob, CTB_RECV_DESC_OFFSET + 8)?;
+        self.unused_receive_status_seen |= receive_status & CTB_STATUS_UNUSED != 0;
+        self.receive.descriptor.status = receive_status & !CTB_STATUS_UNUSED;
         if self.receive.descriptor.head != self.receive.local_head {
             self.receive.descriptor.status |= CTB_STATUS_MISMATCH;
         }
@@ -605,6 +663,7 @@ impl CtbPair {
     }
 
     /// Publish host-owned H2G dwords and descriptor positions to the shared blob.
+    /// upstream: intel_guc_ct.c ct_write() host-owned descriptor/data publish.
     pub fn sync_to_blob(&self, blob: &mut [u8]) -> Result<(), CtError> {
         if blob.len() < CTB_BLOB_SIZE {
             return Err(CtError::InvalidSize);
@@ -644,6 +703,61 @@ impl CtbPair {
             completion: None,
         });
         Ok(fence)
+    }
+
+    /// upstream: intel_guc_ct.c ct_send() wait/retry loop and ct_deadlocked().
+    /// `exchange` synchronizes the shared blob, notifies GuC for `Some(fence)`,
+    /// polls the peer response using the supplied short/long deadlines, and
+    /// refreshes peer head state when called with `None` after ring backpressure.
+    pub fn send_request_with_retry(
+        &mut self,
+        io: &impl crate::GtIo,
+        action: &[u32],
+        response_capacity: usize,
+        mut exchange: impl FnMut(&mut Self, Option<u16>, u64, u64) -> Result<(), CtError>,
+    ) -> Result<CtCompletion, CtError> {
+        let mut stall_start = io.now_us();
+        loop {
+            match self.send_request(action, response_capacity) {
+                Ok(fence) => {
+                    let response_start = io.now_us();
+                    exchange(
+                        self,
+                        Some(fence),
+                        CTB_RESPONSE_TIMEOUT_SHORT_US,
+                        CTB_RESPONSE_TIMEOUT_LONG_US,
+                    )?;
+                    if io.now_us().saturating_sub(response_start)
+                        > CTB_RESPONSE_TIMEOUT_SHORT_US + CTB_RESPONSE_TIMEOUT_LONG_US
+                    {
+                        return Err(CtError::Timeout);
+                    }
+                    match self.finish_request(fence)? {
+                        completion @ CtCompletion::Success { .. } => return Ok(completion),
+                        CtCompletion::Failure { error, hint } => {
+                            return Err(CtError::Failure { error, hint });
+                        }
+                        CtCompletion::Retry { .. } => {
+                            stall_start = io.now_us();
+                            continue;
+                        }
+                    }
+                }
+                Err(CtError::NoRoom) => {
+                    if io.now_us().saturating_sub(stall_start) > CTB_DEADLOCK_TIMEOUT_US {
+                        return Err(CtError::Deadlocked);
+                    }
+                    exchange(
+                        self,
+                        None,
+                        CTB_RESPONSE_TIMEOUT_SHORT_US,
+                        CTB_RESPONSE_TIMEOUT_LONG_US,
+                    )?;
+                    io.delay_us(1000);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// upstream: intel_guc_ct.c ct_handle_response().
@@ -725,6 +839,7 @@ impl CtbPair {
 
     /// Consume a completed request and release the full maximum-size G2H
     /// reservation, matching ct_send() after its wait finishes.
+    /// upstream: intel_guc_ct.c ct_send() wait completion and release credits.
     pub fn finish_request(&mut self, fence: u16) -> Result<CtCompletion, CtError> {
         let index = self
             .pending
@@ -793,6 +908,22 @@ mod tests {
     use core::cell::{Cell, RefCell};
 
     use super::*;
+
+    struct ClockIo(Cell<u64>);
+    impl crate::GtIo for ClockIo {
+        fn read(&self, offset: u32) -> Result<u32, Error> {
+            Err(Error::Unavailable(offset))
+        }
+        fn write(&self, offset: u32, _value: u32) -> Result<(), Error> {
+            Err(Error::Unavailable(offset))
+        }
+        fn now_us(&self) -> u64 {
+            self.0.get()
+        }
+        fn delay_us(&self, micros: u32) {
+            self.0.set(self.0.get().saturating_add(u64::from(micros)));
+        }
+    }
 
     struct MmioIo {
         writes: RefCell<Vec<(u32, u32)>>,
@@ -868,6 +999,14 @@ mod tests {
         assert_eq!(writes[11], (0x190244, (0x0907 << 16) | 1));
         assert_eq!(writes[12], (0x190248, CTB_G2H_BUFFER_SIZE as u32));
         assert_eq!(io.notifications.get(), 3);
+        drop(writes);
+
+        let pass_through = MmioIo {
+            writes: RefCell::new(Vec::new()),
+            notifications: Cell::new(0),
+            response_data: 1,
+        };
+        register_buffer(&pass_through, true, 0, 0, 1).unwrap();
     }
 
     #[test]
@@ -952,6 +1091,27 @@ mod tests {
     }
 
     #[test]
+    fn unused_receive_status_is_ignored_but_real_status_bits_break_the_ctb() {
+        let mut pair = CtbPair::new().unwrap();
+        let mut blob = pair.initial_blob();
+        write_dword(&mut blob, CTB_RECV_DESC_OFFSET + 8, CTB_STATUS_UNUSED).unwrap();
+        pair.sync_from_blob(&blob).unwrap();
+        assert!(!pair.receive.broken);
+        assert!(pair.unused_receive_status_seen);
+
+        write_dword(
+            &mut blob,
+            CTB_RECV_DESC_OFFSET + 8,
+            CTB_STATUS_UNUSED | CTB_STATUS_OVERFLOW,
+        )
+        .unwrap();
+        assert_eq!(
+            pair.sync_from_blob(&blob),
+            Err(CtError::Broken(CTB_STATUS_OVERFLOW))
+        );
+    }
+
+    #[test]
     fn ctb_rejects_corrupt_or_incomplete_peer_messages() {
         let mut buffer = CtbBuffer::new(64, 16).unwrap();
         buffer.descriptor.status = CTB_STATUS_OVERFLOW;
@@ -987,6 +1147,14 @@ mod tests {
             HXG_ORIGIN_GUC | HXG_TYPE_FAST_REQUEST,
         ];
         assert_eq!(parse_message(&unsupported), Err(CtError::InvalidMessage));
+        let reserved_header = [
+            ctb_message_header(0, 1) | CTB_MSG_0_RESERVED_MASK,
+            HXG_ORIGIN_GUC | HXG_TYPE_EVENT,
+        ];
+        assert_eq!(
+            parse_message(&reserved_header).unwrap().hxg_type,
+            HxgType::Event
+        );
     }
 
     #[test]
@@ -1057,6 +1225,43 @@ mod tests {
         assert_eq!(
             pair.finish_request(retry_fence),
             Ok(CtCompletion::Retry { reason: 3 })
+        );
+    }
+
+    #[test]
+    fn synchronous_send_resends_retry_response_with_new_fence_and_timeout_policy() {
+        let mut pair = CtbPair::new().unwrap();
+        let io = ClockIo(Cell::new(0));
+        let mut fences = Vec::new();
+        let mut replies = 0;
+        let completion = pair
+            .send_request_with_retry(&io, &[0x4000, 0x1234], 0, |pair, fence, short, long| {
+                assert_eq!(short, CTB_RESPONSE_TIMEOUT_SHORT_US);
+                assert_eq!(long, CTB_RESPONSE_TIMEOUT_LONG_US);
+                let fence = fence.ok_or(CtError::InvalidMessage)?;
+                fences.push(fence);
+                let (hxg_type, aux) = if replies == 0 {
+                    (HxgType::NoResponseRetry, 7)
+                } else {
+                    (HxgType::ResponseSuccess, 9)
+                };
+                replies += 1;
+                pair.handle_response(CtbMessage {
+                    fence,
+                    hxg_type,
+                    aux,
+                    payload: &[],
+                })
+            })
+            .unwrap();
+        assert_eq!(fences, [1, 2]);
+        assert_eq!(
+            completion,
+            CtCompletion::Success {
+                data0: 9,
+                payload: vec![],
+                truncated: false,
+            }
         );
     }
 }

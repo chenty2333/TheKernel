@@ -649,6 +649,9 @@ impl CtDmaMemory {
         self.pair
             .sync_from_blob(&self.blob)
             .map_err(|_| Error::Quarantined)?;
+        if self.pair.take_unused_receive_status_seen() {
+            axlog::warn!("intel-gt: unexpected GuC G2H after CT shutdown (UNUSED status)");
+        }
         let words = match self
             .pair
             .receive

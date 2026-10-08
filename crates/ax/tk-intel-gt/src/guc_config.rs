@@ -25,12 +25,17 @@ const GUC_LOG_VERBOSITY_SHIFT: u32 = 0;
 const GUC_LOG_DISABLED: u32 = 1 << 6;
 
 const GUC_WA_PRE_PARSER: u32 = 1 << 14;
+const GUC_WA_CONTEXT_ISOLATION: u32 = 1 << 15;
+const GUC_WA_RCS_CCS_SWITCHOUT: u32 = 1 << 16;
+const GUC_WA_HOLD_CCS_SWITCHOUT: u32 = 1 << 17;
 const GUC_WA_POLLCS: u32 = 1 << 18;
+const GUC_WA_DUAL_QUEUE: u32 = 1 << 11;
 const GUC_WA_ENABLE_TSC_CHECK_ON_RC6: u32 = 1 << 22;
 const GUC_CTL_ENABLE_GUC_PXP_CTL: u32 = 1 << 1;
 const GUC_CTL_ENABLE_SLPC: u32 = 1 << 2;
 const GUC_CTL_DISABLE_SCHEDULER: u32 = 1 << 14;
 const GUC_ADS_ADDR_SHIFT: u32 = 1;
+const GUC_ADS_ADDR_MASK: u32 = 0x000f_ffff << GUC_ADS_ADDR_SHIFT;
 const SOFT_SCRATCH_BASE: u32 = 0xc180;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +60,17 @@ pub struct GraphicsIp {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GucWaInfo {
+    pub graphics_ip: GraphicsIp,
+    pub media_ip: GraphicsIp,
+    pub pre_parser_wa: bool,
+    pub is_wa_14014475959: bool,
+    pub is_dg2: bool,
+    pub is_dg2_g11: bool,
+    pub ccs_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GucOptions {
     pub log_level: u8,
     pub log: LogConfig,
@@ -62,11 +78,10 @@ pub struct GucOptions {
     pub slpc: bool,
     pub pxp_enabled: bool,
     pub ads_ggtt_address: u32,
-    pub graphics_ip: GraphicsIp,
+    pub workarounds: GucWaInfo,
     pub firmware_version: (u8, u8, u8),
     pub device_id: u16,
     pub revision: u8,
-    pub pre_parser_wa: bool,
 }
 
 /// upstream: intel_guc.c guc_ctl_debug_flags()
@@ -124,21 +139,17 @@ pub fn guc_ctl_ads_flags(ads_ggtt_address: u32) -> Result<u32, Error> {
         return Err(Error::Refused);
     }
     let pages = ads_ggtt_address >> 12;
-    if pages > 0x0007_ffff {
+    if pages > GUC_ADS_ADDR_MASK >> GUC_ADS_ADDR_SHIFT {
         return Err(Error::Refused);
     }
     Ok(pages << GUC_ADS_ADDR_SHIFT)
 }
 
 /// upstream: intel_guc.c guc_ctl_wa_flags()
-pub fn guc_ctl_wa_flags(
-    graphics_ip: GraphicsIp,
-    firmware_version: (u8, u8, u8),
-    pre_parser_wa: bool,
-) -> u32 {
+pub fn guc_ctl_wa_flags(wa: GucWaInfo, firmware_version: (u8, u8, u8)) -> u32 {
     let mut flags = 0;
-    if graphics_ip.major >= 11
-        && graphics_ip
+    if wa.graphics_ip.major >= 11
+        && wa.graphics_ip
             < (GraphicsIp {
                 major: 12,
                 minor: 55,
@@ -146,8 +157,35 @@ pub fn guc_ctl_wa_flags(
     {
         flags |= GUC_WA_POLLCS;
     }
-    if pre_parser_wa {
+    if wa.is_wa_14014475959 || wa.is_dg2 {
+        flags |= GUC_WA_HOLD_CCS_SWITCHOUT;
+    }
+    if (GraphicsIp {
+        major: 12,
+        minor: 70,
+    } <= wa.graphics_ip)
+        && wa.graphics_ip
+            < (GraphicsIp {
+                major: 12,
+                minor: 75,
+            })
+    {
+        flags |= GUC_WA_RCS_CCS_SWITCHOUT;
+    }
+    if wa.is_dg2
+        || (wa.ccs_present
+            && GraphicsIp {
+                major: 12,
+                minor: 70,
+            } <= wa.graphics_ip)
+    {
+        flags |= GUC_WA_DUAL_QUEUE;
+    }
+    if wa.pre_parser_wa {
         flags |= GUC_WA_PRE_PARSER;
+    }
+    if wa.is_dg2_g11 {
+        flags |= GUC_WA_CONTEXT_ISOLATION;
     }
     if firmware_version >= (70, 7, 0) {
         flags |= GUC_WA_ENABLE_TSC_CHECK_ON_RC6;
@@ -167,11 +205,7 @@ pub fn guc_init_params(options: GucOptions) -> Result<[u32; GUC_CTL_MAX_DWORDS],
     }
     let mut params = [0; GUC_CTL_MAX_DWORDS];
     params[GUC_CTL_LOG_PARAMS] = guc_ctl_log_params_flags(options.log)?;
-    params[GUC_CTL_WA] = guc_ctl_wa_flags(
-        options.graphics_ip,
-        options.firmware_version,
-        options.pre_parser_wa,
-    );
+    params[GUC_CTL_WA] = guc_ctl_wa_flags(options.workarounds, options.firmware_version);
     params[GUC_CTL_FEATURE] =
         guc_ctl_feature_flags(options.submission, options.slpc, options.pxp_enabled);
     params[GUC_CTL_DEBUG] = guc_ctl_debug_flags(options.log_level);
@@ -182,13 +216,31 @@ pub fn guc_init_params(options: GucOptions) -> Result<[u32; GUC_CTL_MAX_DWORDS],
 
 /// upstream: intel_guc.c intel_guc_write_params()
 pub fn write_params(io: &impl GtIo, params: &[u32; GUC_CTL_MAX_DWORDS]) -> Result<(), Error> {
-    io.write(SOFT_SCRATCH_BASE, 0)?;
+    write_params_with_base(io, SOFT_SCRATCH_BASE, params)
+}
+
+/// upstream: intel_guc.c intel_guc_write_params() selected GT scratch bank.
+pub fn write_params_with_regs(
+    io: &impl GtIo,
+    regs: crate::guc_fw::GucSendRegs,
+    params: &[u32; GUC_CTL_MAX_DWORDS],
+) -> Result<(), Error> {
+    write_params_with_base(io, regs.scratch_base, params)
+}
+
+pub fn write_params_with_base(
+    io: &impl GtIo,
+    scratch_base: u32,
+    params: &[u32; GUC_CTL_MAX_DWORDS],
+) -> Result<(), Error> {
+    io.write(scratch_base, 0)?;
     for (index, value) in params.iter().copied().enumerate() {
-        io.write(SOFT_SCRATCH_BASE + (index as u32 + 1) * 4, value)?;
+        io.write(scratch_base + (index as u32 + 1) * 4, value)?;
     }
     Ok(())
 }
 
+/// upstream: intel_guc.c Gen12 platform/default GuC options in guc_init_params().
 pub fn gen12_options(
     platform: Platform,
     device_id: u16,
@@ -198,20 +250,30 @@ pub fn gen12_options(
     log: LogConfig,
 ) -> GucOptions {
     GucOptions {
-        log_level: 1,
+        log_level: crate::guc_log::default_log_level(false, false, -1),
         log,
         submission: matches!(platform, Platform::AlderLakeP | Platform::AlderLakeN),
         slpc: false,
         pxp_enabled: false,
         ads_ggtt_address,
-        graphics_ip: GraphicsIp {
-            major: 12,
-            minor: 0,
+        workarounds: GucWaInfo {
+            graphics_ip: GraphicsIp {
+                major: 12,
+                minor: 0,
+            },
+            media_ip: GraphicsIp {
+                major: 12,
+                minor: 0,
+            },
+            pre_parser_wa: true,
+            is_wa_14014475959: false,
+            is_dg2: false,
+            is_dg2_g11: false,
+            ccs_present: false,
         },
         firmware_version,
         device_id,
         revision,
-        pre_parser_wa: true,
     }
 }
 
@@ -289,6 +351,11 @@ mod tests {
             io.0.borrow()[GUC_CTL_MAX_DWORDS],
             (SOFT_SCRATCH_BASE + 56, params[13])
         );
+
+        let media = Io(RefCell::new(Vec::new()));
+        write_params_with_regs(&media, crate::guc_fw::MEDIA_GUC_SEND_REGS, &params).unwrap();
+        assert_eq!(media.0.borrow()[0], (0x190310, 0));
+        assert_eq!(media.0.borrow()[1], (0x190314, params[0]));
     }
 
     #[test]
@@ -298,5 +365,55 @@ mod tests {
         assert_eq!(guc_init_params(invalid), Err(Error::Refused));
         assert_eq!(guc_ctl_ads_flags(0), Err(Error::Refused));
         assert_eq!(guc_ctl_ads_flags(1), Err(Error::Refused));
+        assert_eq!(guc_ctl_ads_flags(0xffff_f000), Ok(0x001f_fffe));
+    }
+
+    #[test]
+    fn workarounds_include_the_four_gen12_gated_control_bits() {
+        let gfx_1270 = GraphicsIp {
+            major: 12,
+            minor: 70,
+        };
+        let flags = guc_ctl_wa_flags(
+            GucWaInfo {
+                graphics_ip: gfx_1270,
+                media_ip: GraphicsIp {
+                    major: 12,
+                    minor: 0,
+                },
+                pre_parser_wa: false,
+                is_wa_14014475959: false,
+                is_dg2: false,
+                is_dg2_g11: false,
+                ccs_present: true,
+            },
+            (70, 6, 0),
+        );
+        assert_eq!(
+            flags & (GUC_WA_RCS_CCS_SWITCHOUT | GUC_WA_DUAL_QUEUE),
+            GUC_WA_RCS_CCS_SWITCHOUT | GUC_WA_DUAL_QUEUE
+        );
+        assert_eq!(flags & GUC_WA_HOLD_CCS_SWITCHOUT, 0);
+        let flags = guc_ctl_wa_flags(
+            GucWaInfo {
+                is_wa_14014475959: true,
+                is_dg2_g11: true,
+                ..GucWaInfo {
+                    graphics_ip: gfx_1270,
+                    media_ip: GraphicsIp {
+                        major: 12,
+                        minor: 0,
+                    },
+                    pre_parser_wa: false,
+                    is_wa_14014475959: false,
+                    is_dg2: false,
+                    is_dg2_g11: false,
+                    ccs_present: false,
+                }
+            },
+            (70, 6, 0),
+        );
+        assert_ne!(flags & GUC_WA_HOLD_CCS_SWITCHOUT, 0);
+        assert_ne!(flags & GUC_WA_CONTEXT_ISOLATION, 0);
     }
 }

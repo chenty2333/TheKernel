@@ -28,6 +28,8 @@ const HUC_LOAD_SUCCESSFUL: u32 = 1 << 0;
 const GEN11_GUC_SEND_BASE: u32 = 0x190240;
 const GEN11_GUC_HOST_INTERRUPT: u32 = 0x1901f0;
 const GEN11_GUC_SEND_COUNT: usize = 4;
+const MEDIA_GUC_HOST_INTERRUPT: u32 = 0x190304;
+const MEDIA_GUC_SEND_BASE: u32 = 0x190310;
 const GUC_SEND_TRIGGER: u32 = 1;
 const HXG_ORIGIN_GUC: u32 = 1 << 31;
 const HXG_TYPE_MASK: u32 = 7 << 28;
@@ -40,17 +42,40 @@ const ACTION_HOST2GUC_SELF_CFG: u32 = 0x0508;
 const UOS_RSA_SCRATCH: u32 = 0xc200;
 const UOS_RSA_SCRATCH_COUNT: usize = 64;
 
-// upstream: intel_guc.c guc_send_reg()
-fn send_reg_offset(index: usize) -> Result<u32, Error> {
-    if index >= GEN11_GUC_SEND_COUNT {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GucSendRegs {
+    pub scratch_base: u32,
+    pub host_interrupt: u32,
+    pub count: usize,
+}
+
+pub const GT_GUC_SEND_REGS: GucSendRegs = GucSendRegs {
+    scratch_base: GEN11_GUC_SEND_BASE,
+    host_interrupt: GEN11_GUC_HOST_INTERRUPT,
+    count: GEN11_GUC_SEND_COUNT,
+};
+
+pub const MEDIA_GUC_SEND_REGS: GucSendRegs = GucSendRegs {
+    scratch_base: MEDIA_GUC_SEND_BASE,
+    host_interrupt: MEDIA_GUC_HOST_INTERRUPT,
+    count: GEN11_GUC_SEND_COUNT,
+};
+
+// upstream: intel_guc.c guc_send_reg().
+fn send_reg_offset(regs: GucSendRegs, index: usize) -> Result<u32, Error> {
+    if index >= regs.count {
         return Err(Error::Refused);
     }
-    Ok(GEN11_GUC_SEND_BASE + index as u32 * 4)
+    Ok(regs.scratch_base + index as u32 * 4)
 }
 
 // upstream: intel_guc.c intel_guc_notify()
 pub fn notify(io: &impl GtIo) -> Result<(), Error> {
-    io.write(GEN11_GUC_HOST_INTERRUPT, GUC_SEND_TRIGGER)
+    notify_with_regs(io, GT_GUC_SEND_REGS)
+}
+
+pub fn notify_with_regs(io: &impl GtIo, regs: GucSendRegs) -> Result<(), Error> {
+    io.write(regs.host_interrupt, GUC_SEND_TRIGGER)
 }
 
 /// Caller must keep the firmware bytes and their GGTT binding alive until this
@@ -265,10 +290,21 @@ pub fn wait_huc_auth(io: &impl GtIo) -> Result<u32, Error> {
 pub fn send_mmio(
     io: &impl GtIo,
     request: &[u32],
+    response_buf: Option<&mut [u32]>,
+) -> Result<u32, Error> {
+    send_mmio_with_regs(io, GT_GUC_SEND_REGS, request, response_buf)
+}
+
+/// upstream: intel_guc.c intel_guc_send_mmio() with GT-specific scratch and
+/// host-interrupt register selection (`GEN11_SOFT_SCRATCH` vs `MEDIA_*`).
+pub fn send_mmio_with_regs(
+    io: &impl GtIo,
+    regs: GucSendRegs,
+    request: &[u32],
     mut response_buf: Option<&mut [u32]>,
 ) -> Result<u32, Error> {
     if request.is_empty()
-        || request.len() > GEN11_GUC_SEND_COUNT
+        || request.len() > regs.count
         || request[0] & HXG_ORIGIN_GUC != 0
         || request[0] & HXG_TYPE_MASK != 0
     {
@@ -276,13 +312,13 @@ pub fn send_mmio(
     }
     loop {
         for (index, word) in request.iter().copied().enumerate() {
-            io.write(send_reg_offset(index)?, word)?;
+            io.write(send_reg_offset(regs, index)?, word)?;
         }
-        let _posted = io.read(send_reg_offset(request.len() - 1)?)?;
-        notify(io)?;
+        let _posted = io.read(send_reg_offset(regs, request.len() - 1)?)?;
+        notify_with_regs(io, regs)?;
         let mut response = crate::wait(
             io,
-            GEN11_GUC_SEND_BASE,
+            regs.scratch_base,
             HXG_ORIGIN_GUC,
             HXG_ORIGIN_GUC,
             10_000,
@@ -290,24 +326,24 @@ pub fn send_mmio(
         let busy_start = io.now_us();
         while response & HXG_TYPE_MASK == HXG_TYPE_NO_RESPONSE_BUSY {
             if io.now_us().saturating_sub(busy_start) >= 1_000_000 {
-                return Err(Error::Timeout(GEN11_GUC_SEND_BASE));
+                return Err(Error::Timeout(regs.scratch_base));
             }
             io.delay_us(1);
-            response = io.read(GEN11_GUC_SEND_BASE)?;
+            response = io.read(regs.scratch_base)?;
             if response & HXG_ORIGIN_GUC == 0 {
-                return Err(Error::Unavailable(GEN11_GUC_SEND_BASE));
+                return Err(Error::Unavailable(regs.scratch_base));
             }
         }
         match response & HXG_TYPE_MASK {
             HXG_TYPE_RESPONSE_SUCCESS => {
                 if let Some(response_buf) = response_buf.as_deref_mut() {
-                    let count = response_buf.len().min(GEN11_GUC_SEND_COUNT);
+                    let count = response_buf.len().min(regs.count);
                     if count == 0 {
                         return Err(Error::Refused);
                     }
                     response_buf[0] = response;
                     for (index, word) in response_buf.iter_mut().enumerate().take(count).skip(1) {
-                        *word = io.read(GEN11_GUC_SEND_BASE + index as u32 * 4)?;
+                        *word = io.read(send_reg_offset(regs, index)?)?;
                     }
                     return Ok(count as u32);
                 }
@@ -315,7 +351,7 @@ pub fn send_mmio(
             }
             HXG_TYPE_RESPONSE_FAILURE => return Err(Error::Refused),
             HXG_TYPE_NO_RESPONSE_RETRY => continue,
-            _ => return Err(Error::Unavailable(GEN11_GUC_SEND_BASE)),
+            _ => return Err(Error::Unavailable(regs.scratch_base)),
         }
     }
 }
@@ -323,11 +359,29 @@ pub fn send_mmio(
 // upstream: intel_guc.c intel_guc_auth_huc()
 /// Ask the running GuC to authenticate HuC firmware's RSA data in GGTT.
 pub fn authenticate_huc(io: &impl GtIo, rsa_offset: u32) -> Result<u32, Error> {
-    send_mmio(io, &[ACTION_AUTHENTICATE_HUC, rsa_offset], None)
+    authenticate_huc_with_regs(io, GT_GUC_SEND_REGS, rsa_offset)
+}
+
+pub fn authenticate_huc_with_regs(
+    io: &impl GtIo,
+    regs: GucSendRegs,
+    rsa_offset: u32,
+) -> Result<u32, Error> {
+    send_mmio_with_regs(io, regs, &[ACTION_AUTHENTICATE_HUC, rsa_offset], None)
 }
 
 // upstream: intel_guc.c __guc_action_self_cfg()
 pub fn self_config(io: &impl GtIo, key: u16, len: u16, value: u64) -> Result<(), Error> {
+    self_config_with_regs(io, GT_GUC_SEND_REGS, key, len, value)
+}
+
+pub fn self_config_with_regs(
+    io: &impl GtIo,
+    regs: GucSendRegs,
+    key: u16,
+    len: u16,
+    value: u64,
+) -> Result<(), Error> {
     if !(1..=2).contains(&len) || (len == 1 && value >> 32 != 0) {
         return Err(Error::Refused);
     }
@@ -337,9 +391,9 @@ pub fn self_config(io: &impl GtIo, key: u16, len: u16, value: u64) -> Result<(),
         value as u32,
         (value >> 32) as u32,
     ];
-    let response = send_mmio(io, &request, None)?;
+    let response = send_mmio_with_regs(io, regs, &request, None)?;
     if response > 1 {
-        return Err(Error::Unavailable(GEN11_GUC_SEND_BASE));
+        return Err(Error::Unavailable(regs.scratch_base));
     }
     if response == 0 {
         return Err(Error::Refused);
@@ -349,12 +403,30 @@ pub fn self_config(io: &impl GtIo, key: u16, len: u16, value: u64) -> Result<(),
 
 // upstream: intel_guc.c intel_guc_self_cfg32()
 pub fn self_config32(io: &impl GtIo, key: u16, value: u32) -> Result<(), Error> {
-    self_config(io, key, 1, u64::from(value))
+    self_config32_with_regs(io, GT_GUC_SEND_REGS, key, value)
 }
 
 // upstream: intel_guc.c intel_guc_self_cfg64()
 pub fn self_config64(io: &impl GtIo, key: u16, value: u64) -> Result<(), Error> {
-    self_config(io, key, 2, value)
+    self_config64_with_regs(io, GT_GUC_SEND_REGS, key, value)
+}
+
+pub fn self_config32_with_regs(
+    io: &impl GtIo,
+    regs: GucSendRegs,
+    key: u16,
+    value: u32,
+) -> Result<(), Error> {
+    self_config_with_regs(io, regs, key, 1, u64::from(value))
+}
+
+pub fn self_config64_with_regs(
+    io: &impl GtIo,
+    regs: GucSendRegs,
+    key: u16,
+    value: u64,
+) -> Result<(), Error> {
+    self_config_with_regs(io, regs, key, 2, value)
 }
 
 // upstream: intel_guc_fw.c guc_prepare_xfer()
@@ -595,21 +667,30 @@ mod tests {
     }
     impl GtIo for MmioIo<'_> {
         fn read(&self, offset: u32) -> Result<u32, Error> {
-            if offset == GEN11_GUC_SEND_BASE {
+            let send_base = if offset == GEN11_GUC_SEND_BASE {
+                Some(GEN11_GUC_SEND_BASE)
+            } else if offset == MEDIA_GUC_SEND_BASE {
+                Some(MEDIA_GUC_SEND_BASE)
+            } else {
+                None
+            };
+            if let Some(_base) = send_base {
                 let notification = self.notifications.get().saturating_sub(1);
                 let responses = self.responses[notification.min(self.responses.len() - 1)];
                 let index = self.response_index.get();
                 self.response_index.set(index.saturating_add(1));
                 return Ok(responses[index.min(responses.len() - 1)]);
             }
-            if (GEN11_GUC_SEND_BASE + 4..GEN11_GUC_SEND_BASE + 16).contains(&offset) {
+            if (GEN11_GUC_SEND_BASE + 4..GEN11_GUC_SEND_BASE + 16).contains(&offset)
+                || (MEDIA_GUC_SEND_BASE + 4..MEDIA_GUC_SEND_BASE + 16).contains(&offset)
+            {
                 return Ok(0);
             }
             Err(Error::Unavailable(offset))
         }
         fn write(&self, offset: u32, value: u32) -> Result<(), Error> {
             self.writes.borrow_mut().push((offset, value));
-            if offset == GEN11_GUC_HOST_INTERRUPT {
+            if offset == GEN11_GUC_HOST_INTERRUPT || offset == MEDIA_GUC_HOST_INTERRUPT {
                 self.notifications.set(self.notifications.get() + 1);
                 self.response_index.set(0);
             }
@@ -816,9 +897,15 @@ mod tests {
 
     #[test]
     fn gen11_mmio_send_handles_busy_retry_success_and_failure() {
-        assert_eq!(send_reg_offset(0), Ok(GEN11_GUC_SEND_BASE));
-        assert_eq!(send_reg_offset(3), Ok(GEN11_GUC_SEND_BASE + 12));
-        assert_eq!(send_reg_offset(4), Err(Error::Refused));
+        assert_eq!(
+            send_reg_offset(GT_GUC_SEND_REGS, 0),
+            Ok(GEN11_GUC_SEND_BASE)
+        );
+        assert_eq!(
+            send_reg_offset(GT_GUC_SEND_REGS, 3),
+            Ok(GEN11_GUC_SEND_BASE + 12)
+        );
+        assert_eq!(send_reg_offset(GT_GUC_SEND_REGS, 4), Err(Error::Refused));
         let busy_response = HXG_ORIGIN_GUC | HXG_TYPE_NO_RESPONSE_BUSY;
         let success = HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_SUCCESS | 0x1234;
         let busy_values = [busy_response, busy_response, success];
@@ -836,6 +923,25 @@ mod tests {
         assert_eq!(
             busy.writes.borrow()[2],
             (GEN11_GUC_HOST_INTERRUPT, GUC_SEND_TRIGGER)
+        );
+
+        let media_values = [success];
+        let media_responses = [&media_values[..]];
+        let media = MmioIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            responses: &media_responses,
+            notifications: core::cell::Cell::new(0),
+            response_index: core::cell::Cell::new(0),
+            time: core::cell::Cell::new(0),
+        };
+        assert_eq!(
+            send_mmio_with_regs(&media, MEDIA_GUC_SEND_REGS, &[0x4000, 0x1234], None),
+            Ok(0x1234)
+        );
+        assert_eq!(media.writes.borrow()[0], (MEDIA_GUC_SEND_BASE, 0x4000));
+        assert_eq!(
+            media.writes.borrow()[2],
+            (MEDIA_GUC_HOST_INTERRUPT, GUC_SEND_TRIGGER)
         );
 
         let retry_values = [HXG_ORIGIN_GUC | HXG_TYPE_NO_RESPONSE_RETRY];
