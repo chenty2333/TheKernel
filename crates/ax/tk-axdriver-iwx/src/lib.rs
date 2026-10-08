@@ -15,6 +15,7 @@ mod firmware_bundle;
 mod interrupts;
 mod registers;
 mod rings;
+mod rx;
 
 pub use command::{
     CMD_ASYNC, CMD_FAILED_MASK, CMD_SEND_DURING_RFKILL, CMD_WANT_RESPONSE, CommandError,
@@ -50,3 +51,4 @@ pub use rings::{
     RingError, RxCompletion, RxRing, TxRing, TxSegment, allocate_rx_ring, allocate_tx_ring,
     tx_byte_count_entry,
 };
+pub use rx::{RxMetadataError, noise_dbm, signal_strength_dbm};
