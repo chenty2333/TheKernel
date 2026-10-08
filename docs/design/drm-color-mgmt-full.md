@@ -11,3 +11,7 @@ The module is declared and compiles in `tk-kernel`; the current KMS atomic
 property registry and Intel hardware commit path have not yet been replaced by
 these translated helpers. `cargo check -p tk-kernel --tests --features 'intel-hda nvme watchdog-itco bpf'`
 passes. The bare-metal kernel test binary was not executed on the host.
+
+Separately, the current KMS property table exposes its implemented immutable
+`GAMMA_LUT_SIZE=256`, matching `GETCRTC.gamma_size`; degamma/CTM blob properties
+and Intel hardware color programming are still not active.
