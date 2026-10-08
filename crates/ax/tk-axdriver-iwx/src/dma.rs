@@ -187,6 +187,23 @@ pub fn initialize_firmware_sections<A: DmaAllocator>(
     allocator: &mut A,
     firmware: &FirmwareImage,
 ) -> Result<FirmwareDmaImages<A::Region>, DmaError> {
+    initialize_firmware_sections_for_kind(allocator, firmware, SectionType::Regular)
+}
+
+/// Allocate Init ucode sections for the INIT_MVM bootstrap image.
+// upstream: if_iwx.c iwx_init_fw_sec()
+pub fn initialize_init_firmware_sections<A: DmaAllocator>(
+    allocator: &mut A,
+    firmware: &FirmwareImage,
+) -> Result<FirmwareDmaImages<A::Region>, DmaError> {
+    initialize_firmware_sections_for_kind(allocator, firmware, SectionType::Init)
+}
+
+fn initialize_firmware_sections_for_kind<A: DmaAllocator>(
+    allocator: &mut A,
+    firmware: &FirmwareImage,
+    section_type: SectionType,
+) -> Result<FirmwareDmaImages<A::Region>, DmaError> {
     let mut sections: Vec<&FirmwareSection> = Vec::new();
     sections
         .try_reserve(firmware.sections.len())
@@ -195,9 +212,10 @@ pub fn initialize_firmware_sections<A: DmaAllocator>(
         firmware
             .sections
             .iter()
-            .filter(|section| section.kind == SectionType::Regular),
+            .filter(|section| section.kind == section_type),
     );
-    let (lmac_count, umac_count, paging_count) = firmware.section_counts_by_layout();
+    let (lmac_count, umac_count, paging_count) =
+        firmware.section_counts_by_layout_for(section_type);
     let umac_start = lmac_count.saturating_add(1);
     let paging_start = lmac_count.saturating_add(umac_count).saturating_add(2);
     if umac_start > sections.len()
@@ -316,6 +334,7 @@ mod tests {
     }
 
     const TLV_SEC_RT: u32 = 19;
+    const TLV_SEC_INIT: u32 = 20;
 
     fn section(offset: u32, bytes: &[u8]) -> Vec<u8> {
         let mut value = offset.to_le_bytes().to_vec();
@@ -349,6 +368,35 @@ mod tests {
         images.free_paging();
         assert!(images.paging_addresses.is_empty());
         assert_eq!(images.lmac.len(), 1);
+    }
+
+    #[test]
+    fn init_firmware_allocator_selects_only_init_ucode_sections() {
+        let regular = section(0x1000, &[0xaa]);
+        let init = section(0x2000, &[0xbb, 0xcc]);
+        let separator = section(0xffff_cccc, &[]);
+        let paging_separator = section(0xaaaa_bbbb, &[]);
+        let firmware = FirmwareImage::parse(&test_image(&[
+            (TLV_SEC_RT, &regular),
+            (TLV_SEC_RT, &separator),
+            (TLV_SEC_RT, &regular),
+            (TLV_SEC_RT, &paging_separator),
+            (TLV_SEC_RT, &regular),
+            (TLV_SEC_INIT, &init),
+            (TLV_SEC_INIT, &separator),
+            (TLV_SEC_INIT, &init),
+            (TLV_SEC_INIT, &paging_separator),
+        ]))
+        .unwrap();
+        let mut allocator = TestAllocator(Cell::new(0x400000));
+
+        let regular_images = initialize_firmware_sections(&mut allocator, &firmware).unwrap();
+        assert_eq!(regular_images.lmac[0].bytes, [0xaa]);
+        let init_images = initialize_init_firmware_sections(&mut allocator, &firmware).unwrap();
+        assert_eq!(init_images.lmac_addresses, [0x403000]);
+        assert_eq!(init_images.lmac[0].bytes, [0xbb, 0xcc]);
+        assert_eq!(init_images.umac.len(), 1);
+        assert!(init_images.paging.is_empty());
     }
 
     #[test]

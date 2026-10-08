@@ -361,22 +361,21 @@ impl FirmwareImage {
     /// Count LMAC/UMAC/paging sections using their firmware separator markers.
     // upstream: if_iwx.c iwx_get_num_sections()
     pub fn section_counts_by_layout(&self) -> (usize, usize, usize) {
+        self.section_counts_by_layout_for(SectionType::Regular)
+    }
+
+    /// Count the source separator layout for one ucode type (regular or init).
+    pub fn section_counts_by_layout_for(&self, kind: SectionType) -> (usize, usize, usize) {
         let lmac = count_sections(
-            self.sections
-                .iter()
-                .filter(|section| section.kind == SectionType::Regular),
+            self.sections.iter().filter(|section| section.kind == kind),
             0,
         );
         let umac = count_sections(
-            self.sections
-                .iter()
-                .filter(|section| section.kind == SectionType::Regular),
+            self.sections.iter().filter(|section| section.kind == kind),
             lmac + 1,
         );
         let paging = count_sections(
-            self.sections
-                .iter()
-                .filter(|section| section.kind == SectionType::Regular),
+            self.sections.iter().filter(|section| section.kind == kind),
             lmac + umac + 2,
         );
         (lmac, umac, paging)

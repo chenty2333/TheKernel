@@ -17,6 +17,7 @@ mod command;
 mod config;
 mod context;
 mod control;
+mod controller;
 mod diagnostics;
 mod dma;
 mod firmware;
@@ -107,6 +108,7 @@ pub use control::{
     IoctlAction, IoctlError, IoctlKind, NetworkIoctlResult, WatchdogAction, WatchdogOutcome,
     media_change, process_ioctl, watchdog_tick,
 };
+pub use controller::{ControllerError, IwxController};
 pub use diagnostics::{
     BZ_ERROR_TABLE_MIN, DriverDebugStatus, ERROR_ELEMENT_SIZE_BYTES, ERROR_START_OFFSET_BYTES,
     ErrorLogError, FW_SYSASSERT_CPU_MASK, LEGACY_ERROR_TABLE_MIN, LMAC_ERROR_WORDS, TxRingDebug,
@@ -116,8 +118,8 @@ pub use diagnostics::{
 pub use dma::{
     DebugDestinationError, DebugRegisterAccess, DebugRegisterTransaction, DmaAllocator, DmaError,
     DmaRegion, FirmwareDmaImages, LtrRegisterAccess, MonitorBuffer, PnvmDmaImage, allocate_monitor,
-    allocate_monitor_block, apply_debug_destination, initialize_firmware_sections, ltr_long_value,
-    set_ltr, setup_pnvm,
+    allocate_monitor_block, apply_debug_destination, initialize_firmware_sections,
+    initialize_init_firmware_sections, ltr_long_value, set_ltr, setup_pnvm,
 };
 pub use firmware::{
     FirmwareError, FirmwareImage, FirmwareSection, PnvmImage, SectionType, firmware_version_string,

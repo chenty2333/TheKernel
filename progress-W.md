@@ -44,3 +44,4 @@
 - Rate-set lookup, legacy rate lookup and CCK/OFDM ACK masks with mandatory lower rates are translated (`de44cbaf`).
 - Scan probe descriptors and raw 512-byte frame data now have an exact packed-wire serializer (`8f69492b`).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
+- `IwxController` now owns CSR, attach DMA/rings, command slots, and firmware bootstrap/context start; Init and regular TLVs allocate separate section layouts (`controller.rs`, `dma.rs`; 162 crate tests pass, global and n305 lint pass).
