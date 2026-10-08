@@ -55,7 +55,6 @@ fn ccmp_packet_number(iv: &[u8]) -> Result<u64, HardwareDecryptError> {
 }
 
 /// Validate TKIP ExtIV and extract its 48-bit TSC in source octet order.
-// upstream: ieee80211_crypto_tkip.c ieee80211_tkip_get_tsc()
 fn tkip_packet_number(iv: &[u8]) -> Result<u64, HardwareDecryptError> {
     if iv.len() < TKIP_HEADER_LEN {
         return Err(HardwareDecryptError::MissingIv);

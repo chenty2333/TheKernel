@@ -556,3 +556,6 @@ The OpenBSD software CCMP translation in `tk-net80211/src/crypto_ccmp.rs`
 retains its ISC grant in `tk-net80211/LICENSES/OpenBSD-ISC.txt`; AES-128 block
 operations use the crates.io `aes` 0.8.4 dependency (MIT OR Apache-2.0), already
 used by the kernel. No AES implementation source was copied into this crate.
+The OpenBSD BIP, WEP, and station TKIP translations in `tk-net80211` use the
+same retained `OpenBSD-ISC.txt` grant; the AP-only TKIP callbacks are omitted
+because this driver port is station-only.
