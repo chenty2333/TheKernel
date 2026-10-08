@@ -313,7 +313,7 @@ rm -f "$STAGE/sbin/init"
 # line in the transcript always says which image was booted.
 INIT_DEFINES=""
 case "$TOOLCHAIN" in
-    none|inspect|containers|acpica) ;;
+    none|inspect|containers|acpica|wireless) ;;
     tcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1" ;;
     nested) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1 -DTHEKERNEL_TOOL_PAYLOAD_NESTED=1" ;;
     # `glibc` deliberately does not include the tcc case: it is a staging

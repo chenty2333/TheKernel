@@ -230,3 +230,8 @@ init-net. Its administrative up/down callback starts/stops regular uCode and
 its firmware/NVM-derived MAC is retained. Until management/RX and association
 state are wired to `tk-net80211`, the adapter explicitly refuses TX and does
 not claim RX availability rather than fabricating packet traffic.
+
+
+## Guest user-space payload
+
+The build-wireless-payload.sh script stages signed Alpine v3.24 x86_64 APKs for iw 6.17-r0 (ISC), wpa_supplicant 2.11-r4 (BSD-3-Clause), and wireless-regdb 2025.10.07-r0 (ISC), plus their pinned dynamic-library closure. SHA-256 pins are in config/guest-wireless-apk-pins.tsv; the Alpine bootstrap apk verify authenticates each APK signature before extraction. The payload contains regulatory.db and its detached signature under /lib/firmware. Build it with scripts/build-guest-tools.sh --payload wireless --output DIR, then pass that tree via THEKERNEL_ROOTFS_TOOLS_DIR=DIR and THEKERNEL_TOOLCHAIN=wireless to the rootfs builder.
