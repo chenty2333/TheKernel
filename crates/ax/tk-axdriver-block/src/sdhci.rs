@@ -300,6 +300,31 @@ pub enum SdhciError {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SdhciResponse(pub [u32; 4]);
 
+/// Capacity and partition metadata decoded from the 512-byte eMMC EXT_CSD.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MmcExtCsd {
+    pub sectors: u32,
+    pub card_type: u8,
+    pub partition_config: u8,
+    pub partition_support: u8,
+    pub boot_sectors: u32,
+    pub rpmb_sectors: u32,
+    pub erase_group_sectors: u32,
+}
+
+// upstream: mmc.c mmc_read_ext_csd() decoding
+pub fn parse_ext_csd(bytes: &[u8; 512]) -> MmcExtCsd {
+    MmcExtCsd {
+        sectors: u32::from_le_bytes([bytes[212], bytes[213], bytes[214], bytes[215]]),
+        card_type: bytes[196],
+        partition_config: bytes[179],
+        partition_support: bytes[160],
+        boot_sectors: u32::from(bytes[226]) * 256,
+        rpmb_sectors: u32::from(bytes[168]) * 256,
+        erase_group_sectors: u32::from(bytes[224]) * 1024,
+    }
+}
+
 /// One bounded, polling SDHCI host slot. The platform supplies MMIO access;
 /// command and PIO sequencing follows the generic FreeBSD SDHCI engine.
 pub struct SdhciHost<I: SdhciIo> {
@@ -460,6 +485,21 @@ impl<I: SdhciIo> SdhciHost<I> {
             self.io.delay_us(10);
         }
         Err(SdhciError::Timeout)
+    }
+
+    // upstream: mmc.c mmc_wait_for_app_cmd()
+    fn application_command(
+        &mut self,
+        rca: u16,
+        index: u8,
+        argument: u32,
+        flags: u16,
+    ) -> Result<SdhciResponse, SdhciError> {
+        let prefix = self.command(SD_CMD_APP, u32::from(rca) << 16, SD_R1, None, 0)?;
+        if prefix.0[0] & (1 << 5) == 0 {
+            return Err(SdhciError::Controller(prefix.0[0]));
+        }
+        self.command(index, argument, flags, None, 0)
     }
 
     /// Issue one command and optional PIO data transfer. Multi-block requests
@@ -648,6 +688,7 @@ pub struct SdhciDisk<I: SdhciIo> {
     sectors: u64,
     high_capacity: bool,
     erase_group_sectors: u32,
+    ext_csd: Option<MmcExtCsd>,
     read_only: bool,
 }
 
@@ -657,14 +698,13 @@ impl<I: SdhciIo> SdhciDisk<I> {
     pub fn attach(mut host: SdhciHost<I>) -> Result<Self, SdhciError> {
         host.initialize()?;
         host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
-        let version2 = host.command(8, 0x1aa, SD_R1, None, 0).is_ok();
+        let version2 = host
+            .command(8, 0x1aa, SD_R1, None, 0)
+            .is_ok_and(|response| response.0[0] & 0xfff == 0x1aa);
         let mut sd_ocr = None;
         for _ in 0..100 {
-            if host.command(SD_CMD_APP, 0, SD_R1, None, 0).is_err() {
-                break;
-            }
             let argument = SD_OCR_VOLTAGE | if version2 { SD_OCR_CCS } else { 0 };
-            match host.command(SD_ACMD_OP_COND, argument, SD_R3, None, 0) {
+            match host.application_command(0, SD_ACMD_OP_COND, argument, SD_R3) {
                 Ok(response) if response.0[0] & SD_OCR_READY != 0 => {
                     sd_ocr = Some(response.0[0]);
                     break;
@@ -725,18 +765,19 @@ impl<I: SdhciIo> SdhciDisk<I> {
         } else {
             response_bits(csd, 39, 7).saturating_add(1)
         };
-        let mut ext_csd = [0u8; 512];
+        let mut ext_csd_bytes = [0u8; 512];
+        let mut ext_csd = None;
         if mmc && high_capacity {
-            host.command(8, 0, SD_R1 | SD_DATA, Some(&mut ext_csd), 512)?;
-            let ext_sectors =
-                u32::from_le_bytes([ext_csd[212], ext_csd[213], ext_csd[214], ext_csd[215]]);
+            host.command(8, 0, SD_R1 | SD_DATA, Some(&mut ext_csd_bytes), 512)?;
+            let parsed = parse_ext_csd(&ext_csd_bytes);
+            let ext_sectors = parsed.sectors;
             if ext_sectors != 0 {
                 sectors = u64::from(ext_sectors);
             }
-            if ext_csd[224] != 0 {
-                // EXT_CSD[224] is the erase-group multiplier in 512 KiB units.
-                erase_group_sectors = u32::from(ext_csd[224]) * 1024;
+            if parsed.erase_group_sectors != 0 {
+                erase_group_sectors = parsed.erase_group_sectors;
             }
+            ext_csd = Some(parsed);
         }
         if sectors == 0 {
             return Err(SdhciError::InvalidTransfer);
@@ -747,7 +788,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         if mmc && high_capacity {
             // EXT_CSD[185] (HS_TIMING) value 1 selects legacy MMC high speed.
             // Only use it when the card advertises a 26/52 MHz timing mode.
-            let card_type = ext_csd[196];
+            let card_type = ext_csd.map_or(0, |csd| csd.card_type);
             if card_type & 0x03 != 0 {
                 let arg = (3 << 24) | (185 << 16) | (1 << 8);
                 host.command(MMC_CMD_SWITCH, arg, SD_R1B, None, 0)?;
@@ -761,11 +802,10 @@ impl<I: SdhciIo> SdhciDisk<I> {
             }
             // PARTITION_CONFIG is intentionally retained for future boot/RPMB
             // child devices; the current registry exposes only user area.
-            let _partition_config = ext_csd[179];
-            let _partition_support = ext_csd[160];
+            let _partition_config = ext_csd.map_or(0, |csd| csd.partition_config);
+            let _partition_support = ext_csd.map_or(0, |csd| csd.partition_support);
         } else {
-            host.command(SD_CMD_APP, u32::from(rca) << 16, SD_R1, None, 0)?;
-            host.command(SD_ACMD_SET_WIDTH, 2, SD_R1, None, 0)?;
+            host.application_command(rca, SD_ACMD_SET_WIDTH, 2, SD_R1)?;
             host.set_bus_width(4);
             let mut switch_status = [0u8; 64];
             host.command(
@@ -798,12 +838,17 @@ impl<I: SdhciIo> SdhciDisk<I> {
             sectors,
             high_capacity,
             erase_group_sectors: erase_group_sectors.max(1),
+            ext_csd,
             read_only: false,
         })
     }
 
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
+    }
+
+    pub const fn ext_csd(&self) -> Option<MmcExtCsd> {
+        self.ext_csd
     }
 
     // upstream: mmcsd.c mmcsd_rw() card-address conversion
@@ -1150,6 +1195,30 @@ mod tests {
     }
 
     #[test]
+    fn ext_csd_decodes_capacity_partition_and_erase_metadata() {
+        let mut bytes = [0u8; 512];
+        bytes[212..216].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        bytes[196] = 0x13;
+        bytes[179] = 0x48;
+        bytes[160] = 3;
+        bytes[226] = 4;
+        bytes[168] = 2;
+        bytes[224] = 7;
+        assert_eq!(
+            parse_ext_csd(&bytes),
+            MmcExtCsd {
+                sectors: 0x1234_5678,
+                card_type: 0x13,
+                partition_config: 0x48,
+                partition_support: 3,
+                boot_sectors: 1024,
+                rpmb_sectors: 512,
+                erase_group_sectors: 7168,
+            }
+        );
+    }
+
+    #[test]
     fn host_reset_clock_and_command_response_are_bounded() {
         let mut io = MockIo::default();
         io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
@@ -1211,6 +1280,7 @@ mod tests {
             sectors: 16,
             high_capacity: true,
             erase_group_sectors: 1,
+            ext_csd: None,
             read_only: true,
         };
         assert!(crate::BlockDriverOps::is_read_only(&disk));
