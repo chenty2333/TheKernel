@@ -43,10 +43,11 @@ pub use ba_rx::{
 pub use ba_tx::{
     ADD_BA_AMSDU, ADD_BA_MAX_WINDOW, ADD_BA_POLICY, ADD_BA_REQUEST_INTERVAL_MAX,
     ADD_BA_RESPONSE_TIMEOUT_MICROS, ADD_BA_STATUS_UNSPECIFIED, ADD_BA_TID_SHIFT,
-    ADD_BA_WINDOW_SHIFT, AddbaTxOutcome, AddbaTxPolicy, DELBA_REASON_SETUP_REQUIRED,
-    DELBA_REASON_TIMEOUT, DelbaRequestEffects, RxBaTimeoutEffects, TX_BA_AGREED, TX_BA_INIT,
-    TX_BA_REQUESTED, TxBaAgreement, TxBaTimeoutEffects, request_delba, rx_ba_timeout,
-    start_addba_request, tx_ba_timeout,
+    ADD_BA_WINDOW_SHIFT, AddbaTxOutcome, AddbaTxPolicy, BA_TID_COUNT, DELBA_REASON_AUTH_LEAVE,
+    DELBA_REASON_SETUP_REQUIRED, DELBA_REASON_TIMEOUT, DelbaRequestEffects, RxBaTimeoutEffects,
+    StopAmpduTidEffect, TX_BA_AGREED, TX_BA_INIT, TX_BA_REQUESTED, TxBaAgreement,
+    TxBaTimeoutEffects, request_delba, rx_ba_timeout, start_addba_request, stop_ampdu_tx,
+    tx_ba_timeout,
 };
 pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{
@@ -138,8 +139,8 @@ pub use proto::{
     FIX_RATE_NEGOTIATE, FIX_RATE_SORT, FLAG_SHORT_PREAMBLE, FLAG_SHORT_SLOT, FLAG_USE_PROTECTION,
     FixRateConfig, LocalPhyConfig, ManagementWatchdogEffects, NegotiatedPhy, OpenAuthEffects,
     OpenAuthState, PeerPhyConfig, ProtocolState, auth_open_station, beacon_miss_threshold,
-    fix_rate, he_negotiate, ht_negotiate, management_watchdog_tick, newstate, reset_erp,
-    set_short_slot, try_another_bss, vht_negotiate,
+    fix_rate, he_negotiate, ht_negotiate, management_watchdog_tick, mark_supplicant_key_failure,
+    newstate, reset_erp, set_short_slot, try_another_bss, vht_negotiate,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,

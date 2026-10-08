@@ -16,6 +16,28 @@ pub const CAP_SHORT_SLOT: u32 = 0x0000_0080;
 pub const BEACON_MISS_THRESHOLD: u32 = 30;
 pub const IEEE80211_DUR_TU: u32 = 1024;
 
+/// Mark failed userspace key negotiation on the BSS peer and its cache copy.
+// upstream: ieee80211_proto.c ieee80211_check_wpa_supplicant_failure()
+pub fn mark_supplicant_key_failure(
+    station_mode: bool,
+    ibss_mode: bool,
+    ptk_negotiating: bool,
+    is_bss_node: bool,
+    node: &mut crate::AccessPoint,
+    cached_bss: Option<&mut crate::AccessPoint>,
+) -> bool {
+    if !(station_mode || ibss_mode) || !ptk_negotiating {
+        return false;
+    }
+    node.association_failures |= crate::ASSOCFAIL_WPA_KEY;
+    if is_bss_node {
+        if let Some(cached_bss) = cached_bss {
+            cached_bss.association_failures |= node.association_failures;
+        }
+    }
+    true
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ErpState {
     pub use_protection: bool,
@@ -1017,5 +1039,41 @@ mod tests {
             management_watchdog_tick(1, ProtocolState::Run, true, true).count_peer_failure,
             false
         );
+    }
+
+    #[test]
+    fn supplicant_key_failure_marks_bss_and_cache_only_during_ptk_negotiation() {
+        let mut node = crate::AccessPoint::default();
+        let mut cached = crate::AccessPoint::default();
+        assert!(!mark_supplicant_key_failure(
+            true,
+            false,
+            false,
+            true,
+            &mut node,
+            Some(&mut cached),
+        ));
+        assert!(mark_supplicant_key_failure(
+            true,
+            false,
+            true,
+            true,
+            &mut node,
+            Some(&mut cached),
+        ));
+        assert_ne!(node.association_failures & crate::ASSOCFAIL_WPA_KEY, 0);
+        assert_eq!(cached.association_failures, node.association_failures);
+
+        let mut non_bss = crate::AccessPoint::default();
+        assert!(mark_supplicant_key_failure(
+            true,
+            false,
+            true,
+            false,
+            &mut non_bss,
+            Some(&mut cached),
+        ));
+        assert_eq!(cached.association_failures, node.association_failures);
+        assert_eq!(non_bss.association_failures, crate::ASSOCFAIL_WPA_KEY);
     }
 }

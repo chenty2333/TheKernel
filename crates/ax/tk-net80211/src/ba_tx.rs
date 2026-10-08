@@ -18,6 +18,8 @@ pub const ADD_BA_STATUS_UNSPECIFIED: u16 = 1;
 pub const ADD_BA_REQUEST_INTERVAL_MAX: u8 = 30;
 pub const DELBA_REASON_SETUP_REQUIRED: u16 = 38;
 pub const DELBA_REASON_TIMEOUT: u16 = 39;
+pub const DELBA_REASON_AUTH_LEAVE: u16 = 3;
+pub const BA_TID_COUNT: usize = 16;
 pub const ERR_BUSY: i32 = 16;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -102,6 +104,44 @@ pub fn tx_ba_timeout(tx: &mut TxBaAgreement, rx: &mut crate::BaAgreement) -> TxB
 pub struct RxBaTimeoutEffects {
     pub rx_timeout_statistic: bool,
     pub delba: DelbaRequestEffects,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopAmpduTidEffect {
+    pub tid: u8,
+    pub delba_reason: Option<u16>,
+    pub driver_stop: bool,
+}
+
+/// Stop all agreed transmit agreements, preserving firmware-offload state where required.
+// upstream: ieee80211_proto.c ieee80211_stop_ampdu_tx()
+pub fn stop_ampdu_tx(
+    agreements: &mut [TxBaAgreement; BA_TID_COUNT],
+    addba_offload: bool,
+    management_reason: i32,
+) -> alloc::vec::Vec<StopAmpduTidEffect> {
+    let mut effects = alloc::vec::Vec::new();
+    for (tid, agreement) in agreements.iter_mut().enumerate() {
+        if agreement.state != TX_BA_AGREED {
+            continue;
+        }
+        if addba_offload {
+            effects.push(StopAmpduTidEffect {
+                tid: tid as u8,
+                delba_reason: None,
+                driver_stop: true,
+            });
+            continue;
+        }
+        let reason = (management_reason != -1).then_some(DELBA_REASON_AUTH_LEAVE);
+        *agreement = TxBaAgreement::default();
+        effects.push(StopAmpduTidEffect {
+            tid: tid as u8,
+            delba_reason: reason,
+            driver_stop: true,
+        });
+    }
+    effects
 }
 
 /// Apply the receive BA inactivity timeout callback.
@@ -334,5 +374,34 @@ mod tests {
         assert!(receive.rx_timeout_statistic);
         assert!(receive.delba.stop_receive);
         assert_eq!(rx, crate::BaAgreement::default());
+    }
+
+    #[test]
+    fn stop_ampdu_tx_preserves_offloaded_agreements_but_clears_software_state() {
+        let mut agreements = [TxBaAgreement::default(); BA_TID_COUNT];
+        agreements[2].state = TX_BA_AGREED;
+        agreements[5].state = TX_BA_AGREED;
+        let effects = stop_ampdu_tx(&mut agreements, true, 0);
+        assert_eq!(
+            effects,
+            [
+                StopAmpduTidEffect {
+                    tid: 2,
+                    delba_reason: None,
+                    driver_stop: true,
+                },
+                StopAmpduTidEffect {
+                    tid: 5,
+                    delba_reason: None,
+                    driver_stop: true,
+                }
+            ]
+        );
+        assert_eq!(agreements[2].state, TX_BA_AGREED);
+
+        let effects = stop_ampdu_tx(&mut agreements, false, 0);
+        assert_eq!(effects.len(), 2);
+        assert!(effects.iter().all(|effect| effect.delba_reason.is_some()));
+        assert_eq!(agreements[2], TxBaAgreement::default());
     }
 }

@@ -112,6 +112,11 @@ management-send effects.
 Tx/Rx inactivity callbacks preserve source retry counters, statistics and
 setup-required/timeout DELBA reasons, including the bounded 30-second request
 backoff counter.
+Station leave also traverses all 16 Tx TIDs and preserves the source offload
+rule: firmware-owned agreements get a stop callback without host-state reset;
+software agreements are cleared and optionally transmit DELBA.
+Supplicant PTK-negotiation failures now persist the WPA-key association failure
+bit on the current BSS and its independent scan-cache copy.
 The transmit AMPDU admission predicate additionally requires HT, local TX
 support, the active BSS peer in station mode, and RSN protection.
 Management frame helpers also encode Capability Information, DS channel and
