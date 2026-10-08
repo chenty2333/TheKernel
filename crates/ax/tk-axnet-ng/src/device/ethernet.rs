@@ -673,6 +673,30 @@ impl Device for EthernetDevice {
             .map_err(Self::map_dev_error)
     }
 
+    fn authenticate_wireless(
+        &mut self,
+        request: &WirelessAuthenticateRequest,
+    ) -> AxResult<WirelessSmeFrame> {
+        self.inner
+            .authenticate_wireless(request)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn associate_wireless(
+        &mut self,
+        request: &WirelessAssociateRequest,
+    ) -> AxResult<WirelessSmeFrame> {
+        self.inner
+            .associate_wireless(request)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn disconnect_wireless_sme(&mut self, reason: u16, disassociate: bool) -> AxResult {
+        self.inner
+            .disconnect_wireless_sme(reason, disassociate)
+            .map_err(Self::map_dev_error)
+    }
+
     fn disconnect_wireless(&mut self, reason: u16) -> AxResult {
         self.inner
             .disconnect_wireless(reason)

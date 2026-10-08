@@ -2,8 +2,9 @@ use alloc::{string::String, vec::Vec};
 use core::task::Waker;
 
 use axdriver::prelude::{
-    WirelessBssInfo, WirelessConnectRequest, WirelessDisconnectEvent, WirelessKeyConfig, WirelessKeyInfo,
-    WirelessKeyOperation, WirelessScanEvent, WirelessScanRequest, WirelessStationInfo,
+    WirelessAssociateRequest, WirelessAuthenticateRequest, WirelessBssInfo, WirelessConnectRequest,
+    WirelessDisconnectEvent, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation,
+    WirelessScanEvent, WirelessScanRequest, WirelessSmeFrame, WirelessStationInfo,
 };
 use axerrno::{AxError, AxResult};
 use axpoll::{PollRegistrationError, PollSet, RegisterError, RegistrationToken, UpdateError};
@@ -255,6 +256,24 @@ pub trait Device: Send + Sync {
     }
 
     fn connect_wireless(&mut self, _request: &WirelessConnectRequest) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn authenticate_wireless(
+        &mut self,
+        _request: &WirelessAuthenticateRequest,
+    ) -> AxResult<WirelessSmeFrame> {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn associate_wireless(
+        &mut self,
+        _request: &WirelessAssociateRequest,
+    ) -> AxResult<WirelessSmeFrame> {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn disconnect_wireless_sme(&mut self, _reason: u16, _disassociate: bool) -> AxResult {
         Err(AxError::OperationNotSupported)
     }
 

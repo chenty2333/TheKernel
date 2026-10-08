@@ -1163,3 +1163,4 @@ matches at both thresholds; fenced lines and Rust-code matches are unchanged.
 `tests/ci/test_linux_excerpt_baseline.py` carries the corresponding counters;
 there is no new Linux source quotation or change to the seven genuine comment
 lines and eight code matches inventoried for this subtree.
+- wpa_supplicant 2.11 `src/drivers/driver_nl80211.c` commit `5460547` (BSD): authenticated attribute and command/event behavior was checked for the userspace-SME SAE `AUTHENTICATE` (`AUTH_DATA`/`SAE_DATA`), separate `ASSOCIATE`, and MLME frame events; no wpa_supplicant implementation code was copied. UAPI numbers remain from Linux `include/uapi/linux/nl80211.h` v7.2.3 (ISC) in `kernel/src/file/netlink/nl80211.rs`.

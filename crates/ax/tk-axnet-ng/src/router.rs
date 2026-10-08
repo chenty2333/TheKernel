@@ -1066,6 +1066,49 @@ impl Router {
         self.devices[slot].connect_wireless(request)
     }
 
+    pub(crate) fn authenticate_wireless(
+        &mut self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessAuthenticateRequest,
+    ) -> AxResult<axdriver::prelude::WirelessSmeFrame> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.links[slot].up {
+            return Err(AxError::BadState);
+        }
+        self.devices[slot].authenticate_wireless(request)
+    }
+
+    pub(crate) fn associate_wireless(
+        &mut self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessAssociateRequest,
+    ) -> AxResult<axdriver::prelude::WirelessSmeFrame> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.links[slot].up {
+            return Err(AxError::BadState);
+        }
+        self.devices[slot].associate_wireless(request)
+    }
+
+    pub(crate) fn disconnect_wireless_sme(
+        &mut self,
+        ifindex: u32,
+        reason: u16,
+        disassociate: bool,
+    ) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].disconnect_wireless_sme(reason, disassociate)
+    }
+
     pub(crate) fn disconnect_wireless(&mut self, ifindex: u32, reason: u16) -> AxResult {
         let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
         if !self.devices[slot].is_wireless() {

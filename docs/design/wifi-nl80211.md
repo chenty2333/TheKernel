@@ -82,16 +82,30 @@ command-file attempt used `/usr/bin/iw` (the APK stages it in `/usr/sbin`) and
 did not invoke either utility; the corrected acceptance run is the one that
 counts.
 
-### WPA3-SAE boundary
+### Userspace-SME authentication and SAE
 
-SAE is not admitted or advertised. The pinned wpa_supplicant 2.11 nl80211
-backend starts SAE through a separate `NL80211_CMD_AUTHENTICATE` request with
-`NL80211_AUTHTYPE_SAE` and `NL80211_ATTR_SAE_DATA`, then submits a separate
-`NL80211_CMD_ASSOCIATE` request with the RSN IE. The current station adapter
-only implements `CONNECT` and owns its Open-System / WPA2-PSK exchange; it has
-no AUTHENTICATE/ASSOCIATE request and response path, no SAE frame exchange or
-anti-clogging-token retry state, and no nl80211 SAE external-auth event loop.
-Accepting the SAE AKM bit alone would therefore falsely report support and
-leave the authentication state machine unusable. SAE remains rejected until
-that separate MLME path can be implemented end-to-end. The source audit used
-`driver_nl80211.c` at wpa_supplicant 2.11 commit `5460547`.
+The nl80211 family implements the separate station-SME `AUTHENTICATE`,
+`ASSOCIATE`, `DEAUTHENTICATE`, and `DISASSOCIATE` commands in addition to the
+existing `CONNECT` path. The iwx adapter sends the userspace-provided
+Authentication transaction/status and SAE fields in the 802.11 auth body and
+returns the received auth/assoc management frame in the matching `mlme`
+command event; it does not calculate SAE password elements, commit/confirm
+cryptography, anti-clogging tokens, PMK, or PTK. `GET_WIPHY` advertises
+`NL80211_FEATURE_SAE`, supported AKMs PSK/SAE, and these SME commands. It does
+not advertise `NL80211_EXT_FEATURE_SAE_OFFLOAD`: SAE computation is in
+wpa_supplicant, not firmware. The extended-feature bitmap separately includes
+`NL80211_EXT_FEATURE_MFP_OPTIONAL`; the userspace-SME SAE capability is the
+base `NL80211_FEATURE_SAE` flag, not an offload extended feature.
+
+The association admission path requires CCMP and validates RSN AKM/cipher
+selectors. SAE requires both MFPC and MFPR, BIP-CMAC-128, and
+`NL80211_MFP_REQUIRED`; the resulting station state uses the existing CCMP
+pairwise and IGTK key install paths for userspace-derived PTK/GTK/IGTK.
+WPA2-PSK can use the same split SME commands. The original `CONNECT` path
+remains for the supplicant's kernel-SME WPA2 flow. The implementation was
+checked against wpa_supplicant 2.11 `driver_nl80211.c` commit `5460547`:
+`AUTH_DATA` aliases `SAE_DATA`, carries transaction sequence/status followed
+by auth data, and the userspace SME sends association IE, suite selectors,
+MFP-required and control-port attributes separately. This is an attribute
+and behavior comparison only; no wpa_supplicant implementation code was
+copied.

@@ -63,9 +63,10 @@ pub use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use spin::Once;
 
 pub use axdriver::prelude::{
-    WirelessBssInfo, WirelessConnectRequest, WirelessDisconnectEvent, WirelessHtCapabilities,
-    WirelessPhyCapabilities, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation, WirelessScanEvent,
-    WirelessScanRequest, WirelessStationInfo, WirelessVhtCapabilities,
+    WirelessAssociateRequest, WirelessAuthenticateRequest, WirelessBssInfo, WirelessConnectRequest,
+    WirelessDisconnectEvent, WirelessHtCapabilities, WirelessKeyConfig, WirelessKeyInfo,
+    WirelessKeyOperation, WirelessPhyCapabilities, WirelessScanEvent, WirelessScanRequest,
+    WirelessSmeFrame, WirelessStationInfo, WirelessVhtCapabilities,
 };
 
 static WIRELESS_SCAN_EVENT_CALLBACK: Once<fn(u32, WirelessScanEvent)> = Once::new();
@@ -367,6 +368,27 @@ pub fn abort_wireless_scan(ifindex: u32) -> AxResult {
 /// Begin a station connection through the named wireless netdev.
 pub fn connect_wireless(ifindex: u32, request: &WirelessConnectRequest) -> AxResult {
     default_stack().connect_wireless(ifindex, request)
+}
+
+/// Run one userspace-SME authentication exchange.
+pub fn authenticate_wireless(
+    ifindex: u32,
+    request: &WirelessAuthenticateRequest,
+) -> AxResult<WirelessSmeFrame> {
+    default_stack().authenticate_wireless(ifindex, request)
+}
+
+/// Run one userspace-SME association exchange.
+pub fn associate_wireless(
+    ifindex: u32,
+    request: &WirelessAssociateRequest,
+) -> AxResult<WirelessSmeFrame> {
+    default_stack().associate_wireless(ifindex, request)
+}
+
+/// Disconnect through nl80211's userspace-SME deauth/disassoc command.
+pub fn disconnect_wireless_sme(ifindex: u32, reason: u16, disassociate: bool) -> AxResult {
+    default_stack().disconnect_wireless_sme(ifindex, reason, disassociate)
 }
 
 /// Disconnect a station peer through the named wireless netdev.

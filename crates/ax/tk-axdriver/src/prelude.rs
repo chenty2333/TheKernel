@@ -27,10 +27,11 @@ pub use {
 pub use {
     crate::structs::AxNetDevice,
     axdriver_net::{
-        NetBufPtr, NetDriverOps, WirelessBssInfo, WirelessConnectRequest, WirelessFrequency,
+        NetBufPtr, NetDriverOps, WirelessAssociateRequest, WirelessAuthenticateRequest,
+        WirelessBssInfo, WirelessConnectRequest, WirelessDisconnectEvent, WirelessFrequency,
         WirelessHtCapabilities, WirelessKeyConfig, WirelessKeyInfo, WirelessKeyOperation,
-        WirelessDisconnectEvent, WirelessPhyCapabilities, WirelessScanEvent, WirelessScanRequest, WirelessStationInfo,
-        WirelessVhtCapabilities,
+        WirelessPhyCapabilities, WirelessScanEvent, WirelessScanRequest, WirelessSmeFrame,
+        WirelessStationInfo, WirelessVhtCapabilities,
     },
 };
 #[cfg(feature = "vsock")]

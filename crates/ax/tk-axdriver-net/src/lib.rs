@@ -88,6 +88,39 @@ pub struct WirelessConnectRequest {
     pub information_elements: alloc::vec::Vec<u8>,
 }
 
+/// A userspace-SME Authentication command, including the UAPI body tail.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessAuthenticateRequest {
+    pub bssid: Option<[u8; 6]>,
+    pub frequency_mhz: Option<u32>,
+    pub ssid: alloc::vec::Vec<u8>,
+    pub authentication_type: u32,
+    /// Starts at the Authentication transaction sequence number (UAPI AUTH_DATA).
+    pub authentication_data: alloc::vec::Vec<u8>,
+    pub information_elements: alloc::vec::Vec<u8>,
+}
+
+/// A userspace-SME Association command; `information_elements` are transmitted verbatim.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessAssociateRequest {
+    pub bssid: Option<[u8; 6]>,
+    pub frequency_mhz: Option<u32>,
+    pub ssid: alloc::vec::Vec<u8>,
+    pub information_elements: alloc::vec::Vec<u8>,
+    pub pairwise_ciphers: alloc::vec::Vec<u32>,
+    pub group_cipher: Option<u32>,
+    pub akm_suites: alloc::vec::Vec<u32>,
+    pub use_mfp: u32,
+    pub control_port: bool,
+}
+
+/// An 802.11 management response returned by a synchronous SME command.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessSmeFrame {
+    pub bssid: [u8; 6],
+    pub frame: alloc::vec::Vec<u8>,
+}
+
 /// The peer status fields consumed by nl80211 GET_STATION.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WirelessStationInfo {
@@ -209,6 +242,27 @@ pub trait NetDriverOps: BaseDriverOps {
 
     /// Begin or replace a station connection from an nl80211 request.
     fn connect_wireless(&mut self, _request: &WirelessConnectRequest) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Run one userspace-SME authentication exchange and return the received frame.
+    fn authenticate_wireless(
+        &mut self,
+        _request: &WirelessAuthenticateRequest,
+    ) -> DevResult<WirelessSmeFrame> {
+        Err(DevError::Unsupported)
+    }
+
+    /// Run one userspace-SME association exchange and return the received frame.
+    fn associate_wireless(
+        &mut self,
+        _request: &WirelessAssociateRequest,
+    ) -> DevResult<WirelessSmeFrame> {
+        Err(DevError::Unsupported)
+    }
+
+    /// Disconnect through the userspace-SME DEAUTHENTICATE/DISASSOCIATE path.
+    fn disconnect_wireless_sme(&mut self, _reason: u16, _disassociate: bool) -> DevResult {
         Err(DevError::Unsupported)
     }
 

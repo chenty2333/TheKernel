@@ -19,6 +19,10 @@ const FAMILY_MAX_ATTRIBUTE: u32 = 366;
 pub(super) const CMD_GET_WIPHY: u8 = 1;
 const CMD_NEW_WIPHY: u8 = 3;
 pub(super) const CMD_GET_INTERFACE: u8 = 5;
+const CMD_AUTHENTICATE: u8 = 37;
+const CMD_ASSOCIATE: u8 = 38;
+const CMD_DEAUTHENTICATE: u8 = 39;
+const CMD_DISASSOCIATE: u8 = 40;
 const CMD_NEW_INTERFACE: u8 = 7;
 const CMD_GET_SCAN: u8 = 32;
 const CMD_TRIGGER_SCAN: u8 = 33;
@@ -59,6 +63,7 @@ const ATTR_PMKID: u16 = 85;
 const ATTR_STATUS_CODE: u16 = 72;
 const ATTR_WIPHY_FREQ: u16 = 38;
 const ATTR_CONNECT_IE: u16 = 42;
+const ATTR_FRAME: u16 = 51;
 const ATTR_USE_MFP: u16 = 66;
 const ATTR_CONTROL_PORT: u16 = 68;
 const ATTR_CONTROL_PORT_ETHERTYPE: u16 = 102;
@@ -67,6 +72,7 @@ const ATTR_MAC_HINT: u16 = 200;
 const ATTR_WIPHY_FREQ_HINT: u16 = 201;
 const ATTR_AUTH_TYPE: u16 = 53;
 const ATTR_REASON_CODE: u16 = 54;
+const ATTR_PREV_BSSID: u16 = 79;
 const ATTR_SSID: u16 = 52;
 const ATTR_CIPHER_SUITES_PAIRWISE: u16 = 73;
 const ATTR_CIPHER_SUITE_GROUP: u16 = 74;
@@ -84,6 +90,14 @@ const ATTR_SUPPORTED_COMMANDS: u16 = 50;
 const ATTR_CIPHER_SUITES: u16 = 57;
 const ATTR_MAX_NUM_PMKIDS: u16 = 86;
 const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
+const ATTR_FEATURE_FLAGS: u16 = 143;
+const ATTR_LOCAL_STATE_CHANGE: u16 = 95;
+const ATTR_DISABLE_HT: u16 = 147;
+const ATTR_HT_CAPABILITY_MASK: u16 = 148;
+const ATTR_BG_SCAN_PERIOD: u16 = 152;
+const ATTR_VHT_CAPABILITY_MASK: u16 = 176;
+const NL80211_FEATURE_SAE: u32 = 1 << 5;
+const ATTR_AUTH_DATA: u16 = 156;
 const ATTR_EXT_FEATURES: u16 = 217;
 const NL80211_EXT_FEATURE_MFP_OPTIONAL: usize = 21;
 const ATTR_REG_ALPHA2: u16 = 33;
@@ -178,6 +192,34 @@ fn scan_event_message(ifindex: u32, event: axnet::WirelessScanEvent) -> Vec<u8> 
         reserved: 0,
     });
     push_attr(&mut payload, ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    let request = NlMsgHdr {
+        nlmsg_len: (size_of::<NlMsgHdr>() + payload.len()) as u32,
+        nlmsg_type: FAMILY_ID,
+        nlmsg_flags: 0,
+        nlmsg_seq: 0,
+        nlmsg_pid: 0,
+    };
+    nl80211_message(&request, 0, FAMILY_ID, payload, false)
+}
+
+fn publish_sme_frame_event(command: u8, ifindex: u32, frame: &[u8]) {
+    super::queue_nl80211_multicast(
+        sme_frame_event_message(command, ifindex, frame),
+        NL80211_MLME_GROUP_MASK,
+    );
+}
+
+fn sme_frame_event_message(command: u8, ifindex: u32, frame: &[u8]) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: command,
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr(&mut payload, ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    push_attr(&mut payload, ATTR_FRAME, frame);
+    if frame.len() >= 24 {
+        push_attr(&mut payload, ATTR_MAC, &frame[16..22]);
+    }
     let request = NlMsgHdr {
         nlmsg_len: (size_of::<NlMsgHdr>() + payload.len()) as u32,
         nlmsg_type: FAMILY_ID,
@@ -323,6 +365,53 @@ pub(super) fn handle(
             return Err(AxError::NotFound);
         }
         axnet::abort_wireless_scan(ifindex)?;
+        return Ok(());
+    }
+    if request.cmd == CMD_AUTHENTICATE {
+        if dump {
+            return Err(AxError::InvalidInput);
+        }
+        let (ifindex, auth) = parse_authenticate_request(attributes)?;
+        if !interfaces
+            .iter()
+            .any(|interface| interface.ifindex == ifindex)
+        {
+            return Err(AxError::NotFound);
+        }
+        let response = axnet::authenticate_wireless(ifindex, &auth)?;
+        publish_sme_frame_event(CMD_AUTHENTICATE, ifindex, &response.frame);
+        return Ok(());
+    }
+    if request.cmd == CMD_ASSOCIATE {
+        if dump {
+            return Err(AxError::InvalidInput);
+        }
+        let (ifindex, association) = parse_associate_request(attributes)?;
+        if !interfaces
+            .iter()
+            .any(|interface| interface.ifindex == ifindex)
+        {
+            return Err(AxError::NotFound);
+        }
+        let response = axnet::associate_wireless(ifindex, &association)?;
+        publish_sme_frame_event(CMD_ASSOCIATE, ifindex, &response.frame);
+        return Ok(());
+    }
+    if request.cmd == CMD_DEAUTHENTICATE || request.cmd == CMD_DISASSOCIATE {
+        if dump {
+            return Err(AxError::InvalidInput);
+        }
+        let (ifindex, bssid, reason) = parse_sme_disconnect_request(attributes)?;
+        if !interfaces
+            .iter()
+            .any(|interface| interface.ifindex == ifindex)
+        {
+            return Err(AxError::NotFound);
+        }
+        if axnet::wireless_station_info(ifindex)?.bssid != bssid {
+            return Err(AxError::NotFound);
+        }
+        axnet::disconnect_wireless_sme(ifindex, reason, request.cmd == CMD_DISASSOCIATE)?;
         return Ok(());
     }
     if request.cmd == CMD_CONNECT {
@@ -562,6 +651,239 @@ fn parse_scan_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessScanRe
     ))
 }
 
+fn parse_u32_set(value: &[u8]) -> AxResult<Vec<u32>> {
+    if value.len() == 4 {
+        return Ok(alloc::vec![u32::from_ne_bytes(value.try_into().unwrap())]);
+    }
+    let mut values = Vec::new();
+    for_each_rtattr(value, |_, bytes| {
+        if bytes.len() != 4 {
+            return Err(AxError::InvalidInput);
+        }
+        let item = u32::from_ne_bytes(bytes.try_into().unwrap());
+        if values.contains(&item) {
+            return Err(AxError::InvalidInput);
+        }
+        values.push(item);
+        Ok(())
+    })?;
+    Ok(values)
+}
+
+fn parse_authenticate_request(
+    attributes: &[u8],
+) -> AxResult<(u32, axnet::WirelessAuthenticateRequest)> {
+    const AUTH_OPEN: u32 = 0;
+    const AUTH_SAE: u32 = 4;
+    let mut ifindex = None;
+    let mut bssid = None;
+    let mut frequency = None;
+    let mut ssid = None;
+    let mut auth_type = None;
+    let mut auth_data = None;
+    let mut ies = None;
+    for_each_rtattr(attributes, |kind, value| match kind {
+        ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
+            ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_MAC if bssid.is_none() && value.len() == 6 => {
+            bssid = Some(value.try_into().unwrap());
+            Ok(())
+        }
+        ATTR_WIPHY_FREQ if frequency.is_none() && value.len() == 4 => {
+            frequency = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_SSID if ssid.is_none() && value.len() <= 32 => {
+            ssid = Some(value.to_vec());
+            Ok(())
+        }
+        ATTR_AUTH_TYPE if auth_type.is_none() && value.len() == 4 => {
+            auth_type = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_AUTH_DATA if auth_data.is_none() && value.len() <= 4096 => {
+            auth_data = Some(value.to_vec());
+            Ok(())
+        }
+        // This adapter has no local-authentication-only state transition. Do
+        // not silently turn this flag into an over-the-air authentication.
+        ATTR_LOCAL_STATE_CHANGE if value.is_empty() => Err(AxError::OperationNotSupported),
+        ATTR_CONNECT_IE if ies.is_none() && value.len() <= 4096 => {
+            ies = Some(value.to_vec());
+            Ok(())
+        }
+        ATTR_IFINDEX
+        | ATTR_MAC
+        | ATTR_WIPHY_FREQ
+        | ATTR_SSID
+        | ATTR_AUTH_TYPE
+        | ATTR_AUTH_DATA
+        | ATTR_CONNECT_IE
+        | ATTR_LOCAL_STATE_CHANGE => Err(AxError::InvalidInput),
+        _ => Err(AxError::OperationNotSupported),
+    })?;
+    let auth_type = auth_type.ok_or(AxError::InvalidInput)?;
+    if !matches!(auth_type, AUTH_OPEN | AUTH_SAE) {
+        return Err(AxError::OperationNotSupported);
+    }
+    let auth_data = auth_data.unwrap_or_default();
+    if auth_type == AUTH_SAE && auth_data.len() < 4 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok((
+        ifindex.ok_or(AxError::InvalidInput)?,
+        axnet::WirelessAuthenticateRequest {
+            bssid,
+            frequency_mhz: frequency,
+            ssid: ssid.unwrap_or_default(),
+            authentication_type: auth_type,
+            authentication_data: auth_data,
+            information_elements: ies.unwrap_or_default(),
+        },
+    ))
+}
+
+fn parse_associate_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessAssociateRequest)> {
+    let mut ifindex = None;
+    let mut bssid = None;
+    let mut frequency = None;
+    let mut ssid = None;
+    let mut ies = None;
+    let mut pairwise = Vec::new();
+    let mut pairwise_seen = false;
+    let mut group_cipher = None;
+    let mut akms = Vec::new();
+    let mut akms_seen = false;
+    let mut use_mfp = None;
+    let mut control_port = false;
+    for_each_rtattr(attributes, |kind, value| match kind {
+        ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
+            ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_MAC if bssid.is_none() && value.len() == 6 => {
+            bssid = Some(value.try_into().unwrap());
+            Ok(())
+        }
+        ATTR_WIPHY_FREQ if frequency.is_none() && value.len() == 4 => {
+            frequency = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_SSID if ssid.is_none() && value.len() <= 32 => {
+            ssid = Some(value.to_vec());
+            Ok(())
+        }
+        ATTR_CONNECT_IE if ies.is_none() && !value.is_empty() && value.len() <= 4096 => {
+            ies = Some(value.to_vec());
+            Ok(())
+        }
+        ATTR_CIPHER_SUITES_PAIRWISE if !pairwise_seen => {
+            pairwise_seen = true;
+            pairwise = parse_u32_set(value)?;
+            if pairwise.len() > 8 {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(())
+        }
+        ATTR_CIPHER_SUITE_GROUP if group_cipher.is_none() && value.len() == 4 => {
+            group_cipher = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_AKM_SUITES if !akms_seen => {
+            akms_seen = true;
+            akms = parse_u32_set(value)?;
+            if akms.len() > 8 {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(())
+        }
+        ATTR_USE_MFP if use_mfp.is_none() && value.len() == 4 => {
+            let mode = u32::from_ne_bytes(value.try_into().unwrap());
+            if mode > 1 {
+                return Err(AxError::OperationNotSupported);
+            }
+            use_mfp = Some(mode);
+            Ok(())
+        }
+        ATTR_CONTROL_PORT if !control_port && value.is_empty() => {
+            control_port = true;
+            Ok(())
+        }
+        ATTR_PREV_BSSID if value.len() == 6 => Ok(()),
+        ATTR_BG_SCAN_PERIOD if value.len() == 2 => Ok(()),
+        ATTR_DISABLE_HT if value.is_empty() => Ok(()),
+        ATTR_HT_CAPABILITY_MASK if value.len() == 26 => Ok(()),
+        ATTR_VHT_CAPABILITY_MASK if value.len() == 12 => Ok(()),
+        ATTR_IFINDEX
+        | ATTR_MAC
+        | ATTR_WIPHY_FREQ
+        | ATTR_SSID
+        | ATTR_CONNECT_IE
+        | ATTR_CIPHER_SUITES_PAIRWISE
+        | ATTR_CIPHER_SUITE_GROUP
+        | ATTR_AKM_SUITES
+        | ATTR_USE_MFP
+        | ATTR_CONTROL_PORT
+        | ATTR_PREV_BSSID
+        | ATTR_BG_SCAN_PERIOD
+        | ATTR_DISABLE_HT
+        | ATTR_HT_CAPABILITY_MASK
+        | ATTR_VHT_CAPABILITY_MASK => Err(AxError::InvalidInput),
+        _ => Err(AxError::OperationNotSupported),
+    })?;
+    let ssid = ssid.ok_or(AxError::InvalidInput)?;
+    if ssid.is_empty()
+        || !pairwise.contains(&0x000f_ac04)
+        || group_cipher.is_none()
+        || akms.is_empty()
+    {
+        return Err(AxError::OperationNotSupported);
+    }
+    Ok((
+        ifindex.ok_or(AxError::InvalidInput)?,
+        axnet::WirelessAssociateRequest {
+            bssid,
+            frequency_mhz: frequency,
+            ssid,
+            information_elements: ies.ok_or(AxError::InvalidInput)?,
+            pairwise_ciphers: pairwise,
+            group_cipher,
+            akm_suites: akms,
+            use_mfp: use_mfp.unwrap_or(0),
+            control_port,
+        },
+    ))
+}
+
+fn parse_sme_disconnect_request(attributes: &[u8]) -> AxResult<(u32, [u8; 6], u16)> {
+    let mut ifindex = None;
+    let mut bssid = None;
+    let mut reason = None;
+    for_each_rtattr(attributes, |kind, value| match kind {
+        ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
+            ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_MAC if bssid.is_none() && value.len() == 6 => {
+            bssid = Some(value.try_into().unwrap());
+            Ok(())
+        }
+        ATTR_REASON_CODE if reason.is_none() && value.len() == 2 => {
+            reason = Some(u16::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_IFINDEX | ATTR_MAC | ATTR_REASON_CODE => Err(AxError::InvalidInput),
+        _ => Err(AxError::OperationNotSupported),
+    })?;
+    Ok((
+        ifindex.ok_or(AxError::InvalidInput)?,
+        bssid.ok_or(AxError::InvalidInput)?,
+        reason.ok_or(AxError::InvalidInput)?,
+    ))
+}
+
 fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessConnectRequest)> {
     let mut ifindex = None;
     let mut ssid = None;
@@ -611,27 +933,19 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
         }
         ATTR_CIPHER_SUITES_PAIRWISE if !pairwise_present => {
             pairwise_present = true;
-            for_each_rtattr(value, |_, suite| {
-                if suite.len() != 4
-                    || pairwise_ciphers.contains(&u32::from_ne_bytes(suite.try_into().unwrap()))
-                {
-                    return Err(AxError::InvalidInput);
-                }
-                pairwise_ciphers.push(u32::from_ne_bytes(suite.try_into().unwrap()));
-                Ok(())
-            })
+            pairwise_ciphers = parse_u32_set(value)?;
+            if pairwise_ciphers.len() > 8 {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(())
         }
         ATTR_AKM_SUITES if !akm_present => {
             akm_present = true;
-            for_each_rtattr(value, |_, suite| {
-                if suite.len() != 4
-                    || akm_suites.contains(&u32::from_ne_bytes(suite.try_into().unwrap()))
-                {
-                    return Err(AxError::InvalidInput);
-                }
-                akm_suites.push(u32::from_ne_bytes(suite.try_into().unwrap()));
-                Ok(())
-            })
+            akm_suites = parse_u32_set(value)?;
+            if akm_suites.len() > 8 {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(())
         }
         ATTR_CONNECT_IE if information_elements.is_none() && value.len() <= 4096 => {
             information_elements = Some(value.to_vec());
@@ -1060,6 +1374,15 @@ fn wiphy_message(
     ciphers.extend_from_slice(&0x000fac04u32.to_ne_bytes());
     ciphers.extend_from_slice(&0x000fac06u32.to_ne_bytes());
     push_attr(&mut payload, ATTR_CIPHER_SUITES, &ciphers);
+    let mut akm_suites = Vec::new();
+    akm_suites.extend_from_slice(&0x000f_ac02u32.to_ne_bytes());
+    akm_suites.extend_from_slice(&0x000f_ac08u32.to_ne_bytes());
+    push_attr(&mut payload, ATTR_AKM_SUITES, &akm_suites);
+    push_attr(
+        &mut payload,
+        ATTR_FEATURE_FLAGS,
+        &NL80211_FEATURE_SAE.to_ne_bytes(),
+    );
     let mut extended_features = [0u8; NL80211_EXT_FEATURE_MFP_OPTIONAL / 8 + 1];
     extended_features[NL80211_EXT_FEATURE_MFP_OPTIONAL / 8] |=
         1 << (NL80211_EXT_FEATURE_MFP_OPTIONAL % 8);
@@ -1073,6 +1396,10 @@ fn wiphy_message(
         CMD_ABORT_SCAN,
         CMD_GET_SCAN,
         CMD_GET_REG,
+        CMD_AUTHENTICATE,
+        CMD_ASSOCIATE,
+        CMD_DEAUTHENTICATE,
+        CMD_DISASSOCIATE,
         CMD_CONNECT,
         CMD_DISCONNECT,
         CMD_GET_STATION,
@@ -1212,6 +1539,10 @@ mod tests {
     fn uapi_command_and_attribute_ids_match_the_header() {
         assert_eq!(CMD_GET_WIPHY, 1);
         assert_eq!(CMD_GET_INTERFACE, 5);
+        assert_eq!(CMD_AUTHENTICATE, 37);
+        assert_eq!(CMD_ASSOCIATE, 38);
+        assert_eq!(CMD_DEAUTHENTICATE, 39);
+        assert_eq!(CMD_DISASSOCIATE, 40);
         assert_eq!(CMD_GET_SCAN, 32);
         assert_eq!(CMD_TRIGGER_SCAN, 33);
         assert_eq!(CMD_NEW_SCAN_RESULTS, 34);
@@ -1230,7 +1561,11 @@ mod tests {
         assert_eq!(CMD_DEL_PMKSA, 53);
         assert_eq!(CMD_FLUSH_PMKSA, 54);
         assert_eq!(ATTR_WIPHY_FREQ, 38);
+        assert_eq!(ATTR_FRAME, 51);
         assert_eq!(ATTR_STATUS_CODE, 72);
+        assert_eq!(ATTR_FEATURE_FLAGS, 143);
+        assert_eq!(ATTR_AUTH_DATA, 156);
+        assert_eq!(NL80211_FEATURE_SAE, 1 << 5);
         assert_eq!(ATTR_REQ_IE, 77);
         assert_eq!(ATTR_RESP_IE, 78);
         assert_eq!(ATTR_PMKID, 85);
@@ -1516,8 +1851,10 @@ mod tests {
         );
         let mut max_ssids = None;
         let mut cipher_suites = Vec::new();
+        let mut akm_suites = Vec::new();
         let mut mfp_optional = false;
         let mut max_pmkids = None;
+        let mut feature_flags = None;
         let mut commands = Vec::new();
         for_each_rtattr(attrs, |kind, value| {
             if kind == ATTR_MAX_NUM_SCAN_SSIDS {
@@ -1529,12 +1866,18 @@ mod tests {
                 for cipher in value.chunks_exact(4) {
                     cipher_suites.push(u32::from_ne_bytes(cipher.try_into().unwrap()));
                 }
+            } else if kind == ATTR_AKM_SUITES {
+                for suite in value.chunks_exact(4) {
+                    akm_suites.push(u32::from_ne_bytes(suite.try_into().unwrap()));
+                }
             } else if kind == ATTR_MAX_NUM_PMKIDS {
                 max_pmkids = Some(u32::from_ne_bytes(value.try_into().unwrap()));
             } else if kind == ATTR_EXT_FEATURES {
                 mfp_optional = value
                     .get(NL80211_EXT_FEATURE_MFP_OPTIONAL / 8)
                     .is_some_and(|byte| byte & (1 << (NL80211_EXT_FEATURE_MFP_OPTIONAL % 8)) != 0);
+            } else if kind == ATTR_FEATURE_FLAGS {
+                feature_flags = Some(u32::from_ne_bytes(value.try_into().unwrap()));
             } else if kind == ATTR_SUPPORTED_COMMANDS {
                 for_each_rtattr(value, |_, command| {
                     commands.push(u32::from_ne_bytes(command.try_into().unwrap()));
@@ -1546,9 +1889,16 @@ mod tests {
         .unwrap();
         assert_eq!(max_ssids, Some(1));
         assert_eq!(cipher_suites, [0x000fac04, 0x000fac06]);
+        assert_eq!(akm_suites, [0x000fac02, 0x000fac08]);
         assert!(mfp_optional);
         assert_eq!(max_pmkids, Some(0));
-        assert_eq!(commands, [1, 5, 33, 114, 32, 31, 46, 48, 17, 9, 10, 11, 12]);
+        assert_eq!(feature_flags, Some(NL80211_FEATURE_SAE));
+        assert_eq!(
+            commands,
+            [
+                1, 5, 33, 114, 32, 31, 37, 38, 39, 40, 46, 48, 17, 9, 10, 11, 12
+            ]
+        );
     }
 
     #[test]
@@ -1585,6 +1935,90 @@ mod tests {
 
         push_attr(&mut attrs, ATTR_IFINDEX, &10u32.to_ne_bytes());
         assert_eq!(parse_scan_request(&attrs), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn userspace_sme_auth_assoc_and_disconnect_parse_uapi_attributes() {
+        let mut auth = Vec::new();
+        push_attr(&mut auth, ATTR_IFINDEX, &8u32.to_ne_bytes());
+        push_attr(&mut auth, ATTR_MAC, &[2, 1, 2, 3, 4, 5]);
+        push_attr(&mut auth, ATTR_WIPHY_FREQ, &2412u32.to_ne_bytes());
+        push_attr(&mut auth, ATTR_SSID, b"sae");
+        push_attr(&mut auth, ATTR_AUTH_TYPE, &4u32.to_ne_bytes());
+        push_attr(&mut auth, ATTR_AUTH_DATA, &[1, 0, 0, 0, 0xaa, 0xbb]);
+        push_attr(&mut auth, ATTR_CONNECT_IE, &[221, 2, 1, 2]);
+        let (ifindex, request) = parse_authenticate_request(&auth).unwrap();
+        assert_eq!(ifindex, 8);
+        assert_eq!(request.authentication_type, 4);
+        assert_eq!(request.authentication_data, [1, 0, 0, 0, 0xaa, 0xbb]);
+        assert_eq!(request.information_elements, [221, 2, 1, 2]);
+
+        let mut local_auth = Vec::new();
+        push_attr(&mut local_auth, ATTR_IFINDEX, &8u32.to_ne_bytes());
+        push_attr(&mut local_auth, ATTR_AUTH_TYPE, &4u32.to_ne_bytes());
+        push_attr(&mut local_auth, ATTR_LOCAL_STATE_CHANGE, &[]);
+        assert_eq!(
+            parse_authenticate_request(&local_auth),
+            Err(AxError::OperationNotSupported)
+        );
+
+        let suite = 0x000fac04u32.to_ne_bytes();
+        let akm = 0x000fac08u32.to_ne_bytes();
+        let mut assoc = Vec::new();
+        push_attr(&mut assoc, ATTR_IFINDEX, &8u32.to_ne_bytes());
+        push_attr(&mut assoc, ATTR_MAC, &[2, 1, 2, 3, 4, 5]);
+        push_attr(&mut assoc, ATTR_WIPHY_FREQ, &2412u32.to_ne_bytes());
+        push_attr(&mut assoc, ATTR_SSID, b"sae");
+        push_attr(&mut assoc, ATTR_CONNECT_IE, &[48, 2, 1, 0]);
+        push_attr(&mut assoc, ATTR_CIPHER_SUITES_PAIRWISE, &suite);
+        push_attr(&mut assoc, ATTR_CIPHER_SUITE_GROUP, &suite);
+        push_attr(&mut assoc, ATTR_AKM_SUITES, &akm);
+        push_attr(&mut assoc, ATTR_USE_MFP, &1u32.to_ne_bytes());
+        push_attr(&mut assoc, ATTR_CONTROL_PORT, &[]);
+        let (ifindex, request) = parse_associate_request(&assoc).unwrap();
+        assert_eq!(ifindex, 8);
+        assert_eq!(request.akm_suites, [0x000fac08]);
+        assert_eq!(request.use_mfp, 1);
+        assert!(request.control_port);
+
+        let mut disconnect = Vec::new();
+        push_attr(&mut disconnect, ATTR_IFINDEX, &8u32.to_ne_bytes());
+        push_attr(&mut disconnect, ATTR_MAC, &[2, 1, 2, 3, 4, 5]);
+        push_attr(&mut disconnect, ATTR_REASON_CODE, &3u16.to_ne_bytes());
+        assert_eq!(
+            parse_sme_disconnect_request(&disconnect),
+            Ok((8, [2, 1, 2, 3, 4, 5], 3))
+        );
+        push_attr(&mut disconnect, ATTR_REASON_CODE, &4u16.to_ne_bytes());
+        assert_eq!(
+            parse_sme_disconnect_request(&disconnect),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn sme_frame_event_encodes_frame_and_wiphy_advertises_sae_feature() {
+        let frame = [
+            0xb0, 0, 0, 0, 2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 3,
+            0, 1, 0, 0, 0,
+        ];
+        let message = sme_frame_event_message(CMD_AUTHENTICATE, 8, &frame);
+        let generic = size_of::<NlMsgHdr>();
+        assert_eq!(
+            read_unaligned::<NlMsgHdr>(&message).unwrap().nlmsg_type,
+            FAMILY_ID
+        );
+        assert_eq!(message[generic], CMD_AUTHENTICATE);
+        let attrs = &message[generic + size_of::<GenlMsgHdr>()..];
+        let mut seen_frame = None;
+        for_each_rtattr(attrs, |kind, value| {
+            if kind == ATTR_FRAME {
+                seen_frame = Some(value.to_vec());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen_frame.as_deref(), Some(frame.as_slice()));
     }
 
     #[test]

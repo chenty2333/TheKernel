@@ -1443,6 +1443,43 @@ impl NetStack {
         Ok(())
     }
 
+    /// Run one userspace-SME authentication exchange.
+    pub fn authenticate_wireless(
+        &self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessAuthenticateRequest,
+    ) -> AxResult<axdriver::prelude::WirelessSmeFrame> {
+        self.service
+            .lock()
+            .router
+            .authenticate_wireless(ifindex, request)
+    }
+
+    /// Run one userspace-SME association exchange.
+    pub fn associate_wireless(
+        &self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessAssociateRequest,
+    ) -> AxResult<axdriver::prelude::WirelessSmeFrame> {
+        self.service
+            .lock()
+            .router
+            .associate_wireless(ifindex, request)
+    }
+
+    /// Disconnect through the userspace-SME DEAUTHENTICATE/DISASSOCIATE path.
+    pub fn disconnect_wireless_sme(
+        &self,
+        ifindex: u32,
+        reason: u16,
+        disassociate: bool,
+    ) -> AxResult {
+        self.service
+            .lock()
+            .router
+            .disconnect_wireless_sme(ifindex, reason, disassociate)
+    }
+
     /// Disconnect a station peer through the selected wireless driver.
     pub fn disconnect_wireless(&self, ifindex: u32, reason: u16) -> AxResult {
         self.service
