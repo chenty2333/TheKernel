@@ -906,6 +906,36 @@ pub fn append_wme_parameter_ie(output: &mut Vec<u8>, mode: crate::PhyMode) -> Re
     append_ie(output, ELEMID_VENDOR, &body)
 }
 
+/// Build the 802.11 compressed Block-Ack request control frame.
+// upstream: ieee80211_output.c ieee80211_get_compressed_bar()
+pub fn build_compressed_bar(
+    peer_address: [u8; 6],
+    local_address: [u8; 6],
+    tid: u8,
+    starting_sequence: u16,
+) -> Option<Vec<u8>> {
+    if tid > 15 || starting_sequence > 0x0fff {
+        return None;
+    }
+    const BAR_FC0: u8 = 0x04 | 0x80;
+    const BAR_FRAME_BYTES: usize = 20;
+    const BA_COMPRESSED: u16 = 0x0004;
+    const BA_TID_INFO_SHIFT: u32 = 12;
+    const SEQUENCE_SHIFT: u32 = 4;
+
+    let mut frame = alloc::vec![0; BAR_FRAME_BYTES];
+    frame[0] = BAR_FC0;
+    frame[1] = 0; // no DS
+    frame[2..4].copy_from_slice(&0u16.to_le_bytes());
+    frame[4..10].copy_from_slice(&peer_address);
+    frame[10..16].copy_from_slice(&local_address);
+    let control = BA_COMPRESSED | (u16::from(tid) << BA_TID_INFO_SHIFT);
+    frame[16..18].copy_from_slice(&control.to_le_bytes());
+    let sequence = starting_sequence << SEQUENCE_SHIFT;
+    frame[18..20].copy_from_slice(&sequence.to_le_bytes());
+    Some(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,5 +1396,18 @@ mod tests {
                 bitmap: 0
             }
         );
+    }
+
+    #[test]
+    fn compressed_bar_encodes_peer_tid_and_sequence_control() {
+        let frame = build_compressed_bar([1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1], 7, 0xabc).unwrap();
+        assert_eq!(frame.len(), 20);
+        assert_eq!(&frame[..2], &[0x84, 0]);
+        assert_eq!(&frame[4..10], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&frame[10..16], &[6, 5, 4, 3, 2, 1]);
+        assert_eq!(u16::from_le_bytes([frame[16], frame[17]]), 0x7004);
+        assert_eq!(u16::from_le_bytes([frame[18], frame[19]]), 0xabc0);
+        assert!(build_compressed_bar([0; 6], [0; 6], 16, 0).is_none());
+        assert!(build_compressed_bar([0; 6], [0; 6], 0, 0x1000).is_none());
     }
 }

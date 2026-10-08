@@ -150,7 +150,7 @@ pub use output::{
     append_extended_rates_ie, append_he_caps_ie, append_ht_caps_ie, append_ht_operation_ie,
     append_qos_capability_ie, append_rsn_ie, append_ssid_ie, append_supported_rates_ie,
     append_vht_caps_ie, append_wme_info_ie, append_wme_parameter_ie, append_wpa_ie,
-    build_action_body, build_addba_request_body, build_addba_response_body,
+    build_action_body, build_addba_request_body, build_addba_response_body, build_compressed_bar,
     build_assoc_request_body, build_auth_body, build_deauth_body, build_delba_body,
     build_disassoc_body, build_probe_request_ies, build_rsn_body, build_sa_query_body,
     can_use_ampdu, classify_ethernet_frame, move_tx_ba_window, uapsd_qos_info,

@@ -338,3 +338,7 @@ legacy rates and HT/VHT/HE MCS values through typed `MediaSubtype` variants.
 The `ifattach`/`ifdetach`, `media_init`, `media_change`, and `media_status`
 functions are framework registration/ioctl wrappers and remain mapped to the
 kernel's wireless netdev/ioctl surface rather than copied from OpenBSD ifnet.
+
+Station compressed-BAR construction is also translated as a bounded control
+frame encoder; queue admission, node retention and `if_start` are caller-side
+effects mapped to iwx's management queue.
