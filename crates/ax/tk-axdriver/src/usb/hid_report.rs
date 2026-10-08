@@ -264,7 +264,30 @@ pub(crate) fn hid_item_resolution(location: HidLocation) -> i32 {
     }
     i32::try_from(numerator / denominator).unwrap_or(0)
 }
+
+// upstream: hid.c hid_get_byte() -- the bounded Rust parser returns an error
+// on truncation instead of silently synthesizing zero bytes at end-of-input.
+fn item_value(bytes: &[u8], offset: &mut usize, width: usize) -> DevResult<u32> {
+    let data = bytes
+        .get(*offset..offset.saturating_add(width))
+        .ok_or(DevError::InvalidParam)?;
+    *offset += width;
+    Ok(data
+        .iter()
+        .enumerate()
+        .fold(0, |value, (i, byte)| value | (u32::from(*byte) << (8 * i))))
+}
+
+// upstream: hid.c hid_clear_local().
+fn clear_local(usages: &mut Vec<Usage>, ranges: &mut Option<Usage>) {
+    usages.clear();
+    *ranges = None;
+}
+
 impl Report {
+    // upstream: hid.c hid_start_parse(), hid_get_item(), hid_end_parse(). The
+    // kernel stores a bounded decoded report rather than exposing a borrowed
+    // iterator, preserving the same global/local/collection state machine.
     pub(crate) fn parse(bytes: &[u8]) -> DevResult<Self> {
         if bytes.len() > 4096 {
             return Err(DevError::Unsupported);
@@ -306,14 +329,7 @@ impl Report {
                 3 => 4,
                 x => x as usize,
             };
-            let data = bytes
-                .get(offset..offset + width)
-                .ok_or(DevError::InvalidParam)?;
-            offset += width;
-            let value = data
-                .iter()
-                .enumerate()
-                .fold(0, |v, (i, b)| v | (u32::from(*b) << (8 * i)));
+            let value = item_value(bytes, &mut offset, width)?;
             let class = prefix >> 2 & 3;
             let tag = prefix >> 4;
             match (class, tag) {
@@ -607,8 +623,7 @@ impl Report {
                 _ => {}
             }
             if class == 0 {
-                usages.clear();
-                ranges = None;
+                clear_local(&mut usages, &mut ranges);
             }
         }
         if fields.is_empty()

@@ -78,11 +78,13 @@ The generic `hid.c` transport wrappers are now explicitly represented by the
 shared `hidbus` adapter for report get/set, read/write, idle and protocol
 operations; interrupt start/stop/poll map to evdev open/close and the input
 read-event pump. The I2C-HID report-register reader maps `hid_get_rdesc()`.
-Function markers now cover 21/32 `hid.c` entry points. Remaining parser-state
-helpers (`hid_clear_local`, `hid_switch_rid`, `hid_start_parse`,
-`hid_end_parse`, `hid_get_byte`, `hid_get_item`), quirk registration/dispatch,
-and generic `hid_ioctl` are not yet direct source translations; the shared
-bounded parser remains independently implemented.
+Function markers cover 24/32 `hid.c` entry points. `hid_clear_local` and
+`hid_get_byte` map to bounded local-state and item-reader helpers;
+`hid_start_parse`/`hid_get_item`/`hid_end_parse` map to the shared fully
+bounded descriptor-state parser, which decodes into a persistent report model
+instead of yielding borrowed FreeBSD iterator items. Remaining `hid_switch_rid`
+source bookkeeping is represented by independent per-report-ID bit cursors.
+Dynamic quirk registration/dispatch and generic `hid_ioctl` remain omitted.
 
 All eight `hmt.c` entry points now have a TheKernel mapping, including detach
 through the owning evdev driver's RAII teardown. That function coverage does
