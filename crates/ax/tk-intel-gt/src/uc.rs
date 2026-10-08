@@ -87,7 +87,7 @@ pub fn load(
         if kind == Kind::GuC
             && !guc_versions_valid(
                 css.version,
-                guc_css_info(blob.version, css).submission_version,
+                guc_css_info(css.version, css).submission_version,
             )
         {
             return Err(FirmwareError::VersionRange);
