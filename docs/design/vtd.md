@@ -200,3 +200,8 @@ At the QEMU GDB snapshot `FSTS=0`, `GSTS=0xc4000000`, and QI head/tail both
 `0x580`; these observations do not prove whether the missing RX completion is
 DMA, an interrupt, or network-stack behavior. Translation remains opt-in and
 must not be enabled by default until block and network acceptance both pass.
+An additional bounded guest diagnostic showed the VirtIO-net route's vector 54
+(ACPI GSI 22) increment from absent to 1 across the ping attempt. Thus the
+route delivered at least one interrupt during the attempt, but the available
+counters do not identify whether it was TX completion or RX; the missing reply
+remains unresolved.
