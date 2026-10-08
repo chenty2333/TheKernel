@@ -473,6 +473,42 @@ impl<I: SdhciIo> SdhciHost<I> {
         data: Option<&mut [u8]>,
         block_size: usize,
     ) -> Result<SdhciResponse, SdhciError> {
+        let read = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE);
+        let retries = if data.is_none() || read { 3 } else { 1 };
+        let mut data = data;
+        let mut last_error = SdhciError::Timeout;
+        for attempt in 0..retries {
+            match self.command_once(
+                index,
+                argument,
+                command_flags,
+                data.as_deref_mut(),
+                block_size,
+            ) {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    last_error = error;
+                    // Reads and response-only commands are idempotent. Never
+                    // replay a potentially accepted write command.
+                    let _ = self.reset(SDHCI_RESET_CMD as u8 | SDHCI_RESET_DATA as u8);
+                    self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
+                    if attempt + 1 < retries {
+                        self.io.delay_us(1_000);
+                    }
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    fn command_once(
+        &mut self,
+        index: u8,
+        argument: u32,
+        command_flags: u16,
+        data: Option<&mut [u8]>,
+        block_size: usize,
+    ) -> Result<SdhciResponse, SdhciError> {
         if self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_CARD_PRESENT == 0 {
             return Err(SdhciError::NoCard);
         }
@@ -995,6 +1031,8 @@ mod tests {
         block_count: u16,
         transfer_mode: u16,
         data_blocks: u16,
+        command_attempts: u8,
+        failed_command_attempts: u8,
     }
 
     impl Default for MockIo {
@@ -1006,6 +1044,8 @@ mod tests {
                 block_count: 0,
                 transfer_mode: 0,
                 data_blocks: 0,
+                command_attempts: 0,
+                failed_command_attempts: 0,
             }
         }
     }
@@ -1045,10 +1085,16 @@ mod tests {
         fn write16(&mut self, offset: usize, value: u16) {
             if offset == SDHCI_COMMAND_FLAGS as usize {
                 self.command = value;
+                self.command_attempts += 1;
                 if value & (SDHCI_CMD_DATA as u16) != 0 {
                     self.data_blocks = self.block_count;
                 }
-                self.registers[SDHCI_INT_STATUS as usize / 4] = SDHCI_INT_RESPONSE;
+                if self.failed_command_attempts != 0 {
+                    self.failed_command_attempts -= 1;
+                    self.registers[SDHCI_INT_STATUS as usize / 4] = 0;
+                } else {
+                    self.registers[SDHCI_INT_STATUS as usize / 4] = SDHCI_INT_RESPONSE;
+                }
                 return;
             }
             if offset == SDHCI_BLOCK_COUNT as usize {
@@ -1144,6 +1190,16 @@ mod tests {
             (SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI | SDHCI_TRNS_READ) as u16
         );
         assert_eq!(host.io_mut().data_blocks, 0);
+    }
+
+    #[test]
+    fn idempotent_command_retries_after_controller_reset() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        io.failed_command_attempts = 1;
+        let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        host.command(SD_CMD_SEND_STATUS, 0, SD_R1, None, 0).unwrap();
+        assert_eq!(host.io_mut().command_attempts, 2);
     }
 
     #[test]
