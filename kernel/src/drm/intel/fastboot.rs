@@ -1593,7 +1593,10 @@ pub(super) fn init(
             return Err(Error::InvalidHeader);
         }
         let afc_startup = vbt.afc_startup_override()?;
-        let definitions = vbt.parse_general_definitions()?;
+        let definitions = vbt.parse_general_definitions(
+            13,
+            intel_display::dmc::DmcPlatform::AlderLakeN,
+        )?;
         let route = definitions
             .encoder(if port == TcPort::Tc1 {
                 Port::Tc1

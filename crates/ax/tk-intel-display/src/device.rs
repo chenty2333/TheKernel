@@ -73,6 +73,7 @@ pub enum Port {
     C,
     D,
     E,
+    F,
     Tc1,
     Tc2,
     Tc3,

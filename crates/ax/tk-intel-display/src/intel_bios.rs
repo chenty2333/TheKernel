@@ -5,7 +5,7 @@
 // Copyright © 2025 Intel Corporation (intel_dsi_vbt_defs.h).
 // Author: Eric Anholt <eric@anholt.net>. Full grants: ../LICENSE-MIT.
 use alloc::{vec, vec::Vec};
-use crate::{Error, bytes, device::Port, le16, le32};
+use crate::{Error, bytes, device::Port, dmc::DmcPlatform, le16, le32};
 
 /// Read a BDB block's payload size from its three-byte block header.
 // upstream: intel_bios.c _get_blocksize()
@@ -299,11 +299,12 @@ impl<'a> Vbt<'a> {
         &self,
         panel_type: u8,
         display_version: u8,
+        platform: DmcPlatform,
     ) -> Result<Option<MipiConfig>, Error> {
         if panel_type >= 16 {
             return Err(Error::InvalidBlock);
         }
-        let definitions = self.parse_general_definitions()?;
+        let definitions = self.parse_general_definitions(display_version, platform)?;
         let Some(port) = definitions.is_dsi_present(display_version) else {
             return Ok(None);
         };
@@ -364,12 +365,13 @@ impl<'a> Vbt<'a> {
         &self,
         panel_type: u16,
         display_version: u8,
+        platform: DmcPlatform,
     ) -> Result<Option<MipiSequences<'a>>, Error> {
         if panel_type >= 16 {
             return Err(Error::InvalidBlock);
         }
         if self
-            .parse_mipi_config(panel_type as u8, display_version)?
+            .parse_mipi_config(panel_type as u8, display_version, platform)?
             .is_none()
         {
             return Ok(None);
@@ -456,11 +458,12 @@ impl<'a> Vbt<'a> {
         definitions: &GeneralDefinitions<'_>,
         port: Port,
         display_version: u8,
+        platform: DmcPlatform,
         dsc_max_bpc: u8,
     ) -> Result<Option<DscConfig>, Error> {
         for child in definitions.children() {
             if !child.supports_dsi()
-                || dsi_dvo_port_to_port(child.dvo_port, display_version) != Some(port)
+                || intel_bios_encoder_port(child.dvo_port, display_version, platform) != Some(port)
             {
                 continue;
             }
@@ -606,7 +609,11 @@ impl<'a> Vbt<'a> {
     }
     /// Parse BDB general definitions and child-device records.
     // upstream: intel_bios.c parse_general_definitions()
-    pub fn parse_general_definitions(&self) -> Result<GeneralDefinitions<'a>, Error> {
+    pub fn parse_general_definitions(
+        &self,
+        display_version: u8,
+        platform: DmcPlatform,
+    ) -> Result<GeneralDefinitions<'a>, Error> {
         let data = self.find_raw_section(2)?.ok_or(Error::InvalidBlock)?;
         bytes(data, 0, 5)?;
         let child_size = usize::from(data[4]);
@@ -625,6 +632,8 @@ impl<'a> Vbt<'a> {
             record_size_expected: child_device_expected_size(self.version)
                 .is_some_and(|expected| child_size == expected),
             version: self.version,
+            display_version,
+            platform,
             children: &data[5..children_end],
         })
     }
@@ -1482,6 +1491,7 @@ pub fn init_vbt_missing_defaults(
             Port::C => 2,
             Port::D => 3,
             Port::E => 12,
+            Port::F => 14,
             _ => continue,
         };
         let mut device_type = 0;
@@ -1505,6 +1515,8 @@ pub fn init_vbt_missing_defaults(
 
 pub struct IntelBios<'a> {
     pub vbt: Option<Vbt<'a>>,
+    pub platform: DmcPlatform,
+    pub display_version: u8,
     pub defaults: VbtDefaults,
     pub general_features: GeneralFeatures,
     pub definitions: Option<GeneralDefinitions<'a>>,
@@ -1595,9 +1607,12 @@ impl<'a> IntelBios<'a> {
             .unwrap_or(power);
         let edp = vbt.parse_edp(panel_type).ok().flatten();
         let psr = vbt.parse_psr(panel_type, display_version).ok().flatten();
-        let mipi = vbt.parse_mipi_config(panel_type, display_version).ok().flatten();
+        let mipi = vbt
+            .parse_mipi_config(panel_type, display_version, self.platform)
+            .ok()
+            .flatten();
         let mipi_sequences = vbt
-            .parse_mipi_sequence(u16::from(panel_type), display_version)
+            .parse_mipi_sequence(u16::from(panel_type), display_version, self.platform)
             .ok()
             .flatten();
         PanelVbtData {
@@ -1625,6 +1640,7 @@ impl<'a> IntelBios<'a> {
 pub fn intel_bios_init<'a>(
     vbt_bytes: Option<&'a [u8]>,
     display_version: u8,
+    platform: DmcPlatform,
     has_pch_split: bool,
     has_ddi: bool,
     ports: &[Port],
@@ -1650,7 +1666,9 @@ pub fn intel_bios_init<'a>(
                 general_features = features;
             }
         }
-        definitions = vbt.parse_general_definitions().ok();
+        definitions = vbt
+            .parse_general_definitions(display_version, platform)
+            .ok();
         driver_features = vbt.parse_driver_features(display_version).ok().flatten();
         if let Some(definitions) = &definitions {
             for child in definitions.children() {
@@ -1668,6 +1686,8 @@ pub fn intel_bios_init<'a>(
     }
     IntelBios {
         vbt,
+        platform,
+        display_version,
         defaults,
         general_features,
         definitions,
@@ -1985,6 +2005,8 @@ pub struct GeneralDefinitions<'a> {
     pub record_size: usize,
     pub record_size_expected: bool,
     version: u16,
+    display_version: u8,
+    platform: DmcPlatform,
     children: &'a [u8],
 }
 impl<'a> GeneralDefinitions<'a> {
@@ -2006,7 +2028,11 @@ impl<'a> GeneralDefinitions<'a> {
                     device_type,
                     addin_offset: u16::from_le_bytes([record[14], record[15]]),
                     dvo_port: byte(16),
-                    port: intel_bios_encoder_port(byte(16), 13),
+                    port: intel_bios_encoder_port(
+                        byte(16),
+                        self.display_version,
+                        self.platform,
+                    ),
                     i2c_pin: byte(17),
                     target_addr: byte(18),
                     ddc_pin: byte(19),
@@ -2077,7 +2103,9 @@ impl<'a> GeneralDefinitions<'a> {
     pub fn is_dsi_present(&self, display_version: u8) -> Option<Port> {
         self.children()
             .filter(|child| child.supports_dsi())
-            .find_map(|child| intel_bios_encoder_port(child.dvo_port, display_version))
+            .find_map(|child| {
+                intel_bios_encoder_port(child.dvo_port, display_version, self.platform)
+            })
     }
     /// Report whether an integrated TV device is present in the VBT.
     // upstream: intel_bios.c intel_bios_is_tv_present()
@@ -2116,7 +2144,10 @@ impl<'a> GeneralDefinitions<'a> {
     // upstream: intel_bios.c intel_bios_is_port_present()
     pub fn is_port_present(&self, port: Port) -> bool {
         self.children()
-            .any(|child| dvo_port_to_port(child.dvo_port) == Some(port))
+            .any(|child| {
+                dvo_port_to_port(child.dvo_port, self.display_version, self.platform)
+                    == Some(port)
+            })
     }
     /// Whether more than one DP child is assigned the same AUX selector.
     // upstream: intel_bios.c intel_bios_dp_has_shared_aux_ch()
@@ -2313,25 +2344,39 @@ pub enum AuxChannel {
 pub const fn map_aux_ch(aux_channel: u8, platform: crate::dmc::DmcPlatform) -> AuxChannel {
     match platform {
         crate::dmc::DmcPlatform::AlderLakeS => match aux_channel {
-            0x10 => AuxChannel::A,
-            0x40 => AuxChannel::B,
-            0x50 => AuxChannel::C,
-            0x60 => AuxChannel::D,
-            0x70 => AuxChannel::E,
+            0x40 => AuxChannel::A,
+            0x10 => AuxChannel::D,
+            0x20 => AuxChannel::E,
+            0x30 => AuxChannel::F,
+            0x50 => AuxChannel::G,
             _ => AuxChannel::None,
         },
         crate::dmc::DmcPlatform::RocketLake => match aux_channel {
-            0x10 => AuxChannel::A,
-            0x20 => AuxChannel::B,
-            0x40 => AuxChannel::C,
-            0x50 => AuxChannel::D,
+            0x40 => AuxChannel::A,
+            0x10 => AuxChannel::B,
+            0x20 => AuxChannel::D,
+            0x30 => AuxChannel::E,
             _ => AuxChannel::None,
         },
-        _ => match aux_channel {
-            0x10 => AuxChannel::A,
-            0x20 => AuxChannel::B,
-            0x30 => AuxChannel::C,
-            0x40 => AuxChannel::D,
+        crate::dmc::DmcPlatform::AlderLakeP | crate::dmc::DmcPlatform::AlderLakeN => {
+            match aux_channel {
+                0x40 => AuxChannel::A,
+                0x10 => AuxChannel::B,
+                0x20 => AuxChannel::C,
+                0x60 => AuxChannel::D,
+                0x70 => AuxChannel::E,
+                0x80 => AuxChannel::F,
+                0x90 => AuxChannel::G,
+                0x30 => AuxChannel::H,
+                0x50 => AuxChannel::I,
+                _ => AuxChannel::None,
+            }
+        }
+        crate::dmc::DmcPlatform::TigerLake => match aux_channel {
+            0x40 => AuxChannel::A,
+            0x10 => AuxChannel::B,
+            0x20 => AuxChannel::C,
+            0x30 => AuxChannel::D,
             0x50 => AuxChannel::E,
             0x60 => AuxChannel::F,
             0x70 => AuxChannel::G,
@@ -2411,20 +2456,52 @@ pub fn sanitize_dedicated_external(child: &mut ChildDevice<'_>) {
     child.dynamic_port_over_tc = false;
 }
 
-/// Display 13 XELPD mapping, not the old pre-display-13 port-letter mapping.
+/// Map the DVO port-letter table selected for a display version/platform.
 // upstream: intel_bios.c dvo_port_to_port()
-pub const fn dvo_port_to_port(dvo: u8) -> Option<Port> {
-    match dvo {
-        0 | 10 => Some(Port::A),
-        1 | 7 => Some(Port::B),
-        2 | 8 => Some(Port::C),
-        3 | 9 => Some(Port::D),
-        12 | 11 => Some(Port::E),
-        14 | 13 => Some(Port::Tc1),
-        16 | 15 => Some(Port::Tc2),
-        18 | 17 => Some(Port::Tc3),
-        20 | 19 => Some(Port::Tc4),
-        _ => None,
+pub const fn dvo_port_to_port(
+    dvo: u8,
+    display_version: u8,
+    platform: DmcPlatform,
+) -> Option<Port> {
+    if display_version >= 13 {
+        return match dvo {
+            0 | 10 => Some(Port::A),
+            1 | 7 => Some(Port::B),
+            2 | 8 => Some(Port::C),
+            3 | 9 => Some(Port::D),
+            12 | 11 => Some(Port::E),
+            14 | 13 => Some(Port::Tc1),
+            16 | 15 => Some(Port::Tc2),
+            18 | 17 => Some(Port::Tc3),
+            20 | 19 => Some(Port::Tc4),
+            _ => None,
+        };
+    }
+    match platform {
+        DmcPlatform::RocketLake => match dvo {
+            0 | 10 => Some(Port::A),
+            1 | 7 => Some(Port::B),
+            2 | 8 => Some(Port::Tc1),
+            3 | 9 => Some(Port::Tc2),
+            _ => None,
+        },
+        DmcPlatform::AlderLakeS => match dvo {
+            0 | 10 => Some(Port::A),
+            1 | 7 => Some(Port::Tc1),
+            2 | 8 => Some(Port::Tc2),
+            3 | 9 => Some(Port::Tc3),
+            12 | 11 => Some(Port::Tc4),
+            _ => None,
+        },
+        _ => match dvo {
+            0 | 10 => Some(Port::A),
+            1 | 7 => Some(Port::B),
+            2 | 8 => Some(Port::C),
+            3 | 9 => Some(Port::D),
+            12 | 11 => Some(Port::E),
+            14 | 13 => Some(Port::F),
+            _ => None,
+        },
     }
 }
 
@@ -2452,8 +2529,12 @@ pub const fn dsi_dvo_port_to_port(dvo: u8, display_version: u8) -> Option<Port> 
 
 /// Map a child's DVO field, including the display-11+ DSI fallback.
 // upstream: intel_bios.c intel_bios_encoder_port()
-pub const fn intel_bios_encoder_port(dvo: u8, display_version: u8) -> Option<Port> {
-    match dvo_port_to_port(dvo) {
+pub const fn intel_bios_encoder_port(
+    dvo: u8,
+    display_version: u8,
+    platform: DmcPlatform,
+) -> Option<Port> {
+    match dvo_port_to_port(dvo, display_version, platform) {
         Some(port) => Some(port),
         None if display_version >= 11 => dsi_dvo_port_to_port(dvo, display_version),
         None => None,
@@ -2502,6 +2583,7 @@ const fn port_index(port: Port) -> u8 {
         Port::C => 2,
         Port::D => 3,
         Port::E => 4,
+        Port::F => 5,
         Port::Tc1 => 5,
         Port::Tc2 => 6,
         Port::Tc3 => 7,
@@ -2599,7 +2681,7 @@ mod tests {
     fn legacy_hdmi_on_tc1_is_not_combo_or_usb_type_c() {
         let data = table(&tc_hdmi(), 39);
         let vbt = Vbt::parse(&data).unwrap();
-        let defs = vbt.parse_general_definitions().unwrap();
+        let defs = vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).unwrap();
         let tc = defs.encoder(Port::Tc1).unwrap();
         assert_eq!(tc.gmbus_pin(), Some(9));
         assert!(tc.supports_hdmi());
@@ -2730,7 +2812,7 @@ mod tests {
         let data = append_section(table(&child, 39), 52, &mipi);
         let parsed = Vbt::parse(&data)
             .unwrap()
-            .parse_mipi_config(0, 13)
+            .parse_mipi_config(0, 13, DmcPlatform::AlderLakeN)
             .unwrap()
             .unwrap();
         assert_eq!(parsed.panel_id, 1);
@@ -2756,7 +2838,7 @@ mod tests {
         data = append_mipi_sequence_v3(data, &sequence_block);
         let parsed = Vbt::parse(&data)
             .unwrap()
-            .parse_mipi_sequence(0, 13)
+            .parse_mipi_sequence(0, 13, DmcPlatform::AlderLakeN)
             .unwrap()
             .unwrap();
         assert_eq!(parsed.version, 3);
@@ -2776,7 +2858,7 @@ mod tests {
         let mut data = table(&child, 39);
         data[64..66].copy_from_slice(&218u16.to_le_bytes());
         let vbt = Vbt::parse(&data).unwrap();
-        let defs = vbt.parse_general_definitions().unwrap();
+        let defs = vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).unwrap();
         let route = defs.encoder(Port::B).unwrap();
         assert!(route.supports_dp_dual_mode());
         assert_eq!(route.dp_boost_level(vbt.version), 3);
@@ -2793,7 +2875,7 @@ mod tests {
         let tv_data = table(&tv, 39);
         let tv_vbt = Vbt::parse(&tv_data).unwrap();
         let features = GeneralFeatures { int_tv_support: true, ..GeneralFeatures::default() };
-        assert!(tv_vbt.parse_general_definitions().unwrap().is_tv_present(features));
+        assert!(tv_vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).unwrap().is_tv_present(features));
     }
     #[test]
     fn dsc_parameter_selector_and_platform_aux_maps_match_i915_tables() {
@@ -2816,7 +2898,7 @@ mod tests {
         let data = append_section(append_section(table(&child, 39), 56, &dsc), 12, &[0; 19]);
         let vbt = Vbt::parse(&data).unwrap();
         let child = vbt
-            .parse_general_definitions()
+            .parse_general_definitions(13, DmcPlatform::AlderLakeN)
             .unwrap()
             .children()
             .next()
@@ -2833,9 +2915,12 @@ mod tests {
         assert_eq!(filled.rc_model_size, 98_304);
         assert_eq!(filled.line_buf_depth, 17);
         assert_eq!(filled.slices_per_line, 4);
-        assert_eq!(map_aux_ch(0x60, crate::dmc::DmcPlatform::AlderLakeP), AuxChannel::F);
-        assert_eq!(map_aux_ch(0x40, crate::dmc::DmcPlatform::AlderLakeS), AuxChannel::B);
-        assert_eq!(map_aux_ch(0x40, crate::dmc::DmcPlatform::RocketLake), AuxChannel::C);
+        assert_eq!(map_aux_ch(0x30, crate::dmc::DmcPlatform::AlderLakeP), AuxChannel::H);
+        assert_eq!(map_aux_ch(0x60, crate::dmc::DmcPlatform::AlderLakeP), AuxChannel::D);
+        assert_eq!(map_aux_ch(0x40, crate::dmc::DmcPlatform::AlderLakeS), AuxChannel::A);
+        assert_eq!(map_aux_ch(0x10, crate::dmc::DmcPlatform::AlderLakeS), AuxChannel::D);
+        assert_eq!(map_aux_ch(0x20, crate::dmc::DmcPlatform::RocketLake), AuxChannel::D);
+        assert_eq!(map_aux_ch(0x40, crate::dmc::DmcPlatform::RocketLake), AuxChannel::A);
         assert_eq!(map_aux_ch(0x90, crate::dmc::DmcPlatform::TigerLake), AuxChannel::I);
     }
     #[test]
@@ -2978,6 +3063,7 @@ mod tests {
         let init = intel_bios_init(
             None,
             13,
+            DmcPlatform::AlderLakeN,
             false,
             true,
             &[Port::A, Port::B, Port::Tc1, Port::Tc2],
@@ -2992,7 +3078,7 @@ mod tests {
         assert!(init.fallback_children[0].device_type & (1 << 12) != 0);
         assert!(init.fallback_children[1].device_type & (1 << 4) != 0);
 
-        let invalid = intel_bios_init(Some(b"not a vbt"), 13, true, true, &[Port::A]);
+        let invalid = intel_bios_init(Some(b"not a vbt"), 13, DmcPlatform::AlderLakeN, true, true, &[Port::A]);
         assert!(invalid.vbt.is_none());
         assert_eq!(invalid.fallback_children.len(), 1);
     }
@@ -3041,7 +3127,7 @@ mod tests {
         assert!(
             Vbt::parse(&data)
                 .unwrap()
-                .parse_general_definitions()
+                .parse_general_definitions(13, DmcPlatform::AlderLakeN)
                 .is_err()
         );
         let mut data = table(&tc_hdmi(), 39);
@@ -3050,7 +3136,7 @@ mod tests {
         data[24..26].copy_from_slice(&(n as u16).to_le_bytes());
         data[68..70].copy_from_slice(&((n - 48) as u16).to_le_bytes());
         let vbt = Vbt::parse(&data).unwrap();
-        assert!(vbt.parse_general_definitions().is_ok());
+        assert!(vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).is_ok());
         assert_eq!(vbt.find_raw_section(250).unwrap(), None);
     }
     #[test]
@@ -3058,13 +3144,13 @@ mod tests {
         assert!(
             Vbt::parse(&table(&tc_hdmi(), 0))
                 .unwrap()
-                .parse_general_definitions()
+                .parse_general_definitions(13, DmcPlatform::AlderLakeN)
                 .is_err()
         );
         let partial_data = table(&tc_hdmi()[..38], 39);
         let partial = Vbt::parse(&partial_data)
             .unwrap()
-            .parse_general_definitions()
+            .parse_general_definitions(13, DmcPlatform::AlderLakeN)
             .unwrap();
         assert_eq!(partial.children().count(), 0);
         let mut both = tc_hdmi().to_vec();
@@ -3072,7 +3158,7 @@ mod tests {
         let data = table(&both, 39);
         let vbt = Vbt::parse(&data).unwrap();
         assert_eq!(
-            vbt.parse_general_definitions()
+            vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN)
                 .unwrap()
                 .encoder(Port::Tc1)
                 .unwrap()
@@ -3084,7 +3170,7 @@ mod tests {
     fn absent_tail_is_zero_extended_but_reported_unexpected() {
         let data = table(&tc_hdmi()[..33], 33);
         let vbt = Vbt::parse(&data).unwrap();
-        let defs = vbt.parse_general_definitions().unwrap();
+        let defs = vbt.parse_general_definitions(13, DmcPlatform::AlderLakeN).unwrap();
         assert!(!defs.record_size_expected);
         assert_eq!(defs.children().count(), 1);
         assert!(!defs.children().next().unwrap().usb_type_c);
@@ -3098,7 +3184,7 @@ mod tests {
         data[64..66].copy_from_slice(&264u16.to_le_bytes());
         let vbt = Vbt::parse(&data).unwrap();
         let tc = vbt
-            .parse_general_definitions()
+            .parse_general_definitions(13, DmcPlatform::AlderLakeN)
             .unwrap()
             .encoder(Port::Tc1)
             .unwrap();
@@ -3107,7 +3193,7 @@ mod tests {
         data[64..66].copy_from_slice(&263u16.to_le_bytes());
         let vbt = Vbt::parse(&data).unwrap();
         let tc = vbt
-            .parse_general_definitions()
+            .parse_general_definitions(13, DmcPlatform::AlderLakeN)
             .unwrap()
             .encoder(Port::Tc1)
             .unwrap();
@@ -3146,11 +3232,11 @@ mod tests {
             (20, 19, Port::Tc4),
         ];
         for (hdmi, dp, port) in pairs {
-            assert_eq!(dvo_port_to_port(hdmi), Some(port));
-            assert_eq!(dvo_port_to_port(dp), Some(port));
+            assert_eq!(dvo_port_to_port(hdmi, 13, DmcPlatform::AlderLakeN), Some(port));
+            assert_eq!(dvo_port_to_port(dp, 13, DmcPlatform::AlderLakeN), Some(port));
         }
         for n in [4, 5, 6, 21, 255] {
-            assert_eq!(dvo_port_to_port(n), None);
+            assert_eq!(dvo_port_to_port(n, 13, DmcPlatform::AlderLakeN), None);
         }
         for pin in [0, 7, 8, 9, 255] {
             assert_eq!(map_ddc_pin(pin), None);

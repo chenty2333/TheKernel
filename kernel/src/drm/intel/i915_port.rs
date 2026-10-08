@@ -151,7 +151,10 @@ mod tests {
         let bytes = std::fs::read(debug.join("i915_vbt")).unwrap();
         let vbt = Vbt::parse(&bytes).unwrap();
         let route = vbt
-            .parse_general_definitions()
+            .parse_general_definitions(
+                13,
+                intel_display::dmc::DmcPlatform::AlderLakeN,
+            )
             .unwrap()
             .encoder(Port::Tc1)
             .unwrap();

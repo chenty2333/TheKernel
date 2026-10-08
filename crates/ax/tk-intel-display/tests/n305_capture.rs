@@ -6,6 +6,7 @@ use std::{fs, path::PathBuf};
 use tk_intel_display::{
     intel_bios::Vbt,
     device::Port,
+    dmc::DmcPlatform,
     opregion::{OpRegion, SIZE},
 };
 
@@ -21,7 +22,9 @@ fn captured_vbt_identifies_both_legacy_tc_hdmi_ports() {
     assert_eq!(vbt.version, 249);
     assert_eq!(vbt.data().len(), 8701);
     assert!(vbt.checksum_valid());
-    let defs = vbt.parse_general_definitions().unwrap();
+    let defs = vbt
+        .parse_general_definitions(13, DmcPlatform::AlderLakeN)
+        .unwrap();
     assert_eq!(defs.record_size, 39);
     assert!(defs.record_size_expected);
     assert_eq!(defs.children().count(), 3);
