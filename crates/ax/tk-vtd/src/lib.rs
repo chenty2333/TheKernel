@@ -12,9 +12,10 @@ extern crate std;
 
 use alloc::vec::Vec;
 
-pub mod reg;
+pub mod dmar;
 pub mod iova;
 pub mod pgtbl;
+pub mod reg;
 
 const DMAR_HEADER_SIZE: usize = 48;
 const DRHD: u16 = 0;
@@ -369,22 +370,26 @@ mod tests {
             function: 0,
         };
         assert!(select_unit(&table, requester).is_some());
-        assert!(select_unit(
-            &table,
-            PciRequester {
-                device: 3,
-                ..requester
-            }
-        )
-        .is_none());
-        assert!(select_unit(
-            &table,
-            PciRequester {
-                segment: 1,
-                ..requester
-            }
-        )
-        .is_none());
+        assert!(
+            select_unit(
+                &table,
+                PciRequester {
+                    device: 3,
+                    ..requester
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            select_unit(
+                &table,
+                PciRequester {
+                    segment: 1,
+                    ..requester
+                }
+            )
+            .is_none()
+        );
     }
     struct Fake;
     impl Backend for Fake {

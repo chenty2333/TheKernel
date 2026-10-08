@@ -539,3 +539,7 @@ The VT-d Intel register definitions translated from FreeBSD
 BSD-2-Clause grant and Konstantin Belousov's sponsorship attribution in the
 Rust module header. The full grant is retained in
 `crates/ax/tk-vtd/LICENSES/BSD-2-Clause.txt`.
+The VT-d DMAR data-model translation from FreeBSD
+`sys/x86/iommu/intel_dmar.h` likewise retains The FreeBSD Foundation's
+2013-2015 BSD-2-Clause grant and Konstantin Belousov attribution in
+`crates/ax/tk-vtd/src/dmar.rs`, under the same retained license file.
