@@ -102,6 +102,13 @@ const EECD_AUTO_RD: u32 = 0x200;
 const PEIND_PCIE_PARITY_FATAL: u32 = 4;
 const PCIEERRSTS_FATAL_MASK: u32 = 0x78;
 const LANPERRSTS_RETX_BUF: u32 = 0x200;
+const PBECCSTS: u32 = 0x0245c;
+const PCIEECCSTS: u32 = 0x05bac;
+const PBECCSTS_ECC_ENABLE: u32 = 1;
+const PBECCSTS_CORR_ERR: u32 = 4;
+const PCIEECCSTS_CORR_MASK: u32 = 0x30;
+const PCIEECCSTS_TX_WR_DATA: u32 = 0x10;
+const PCIEECCSTS_RETRY_BUF: u32 = 0x20;
 const MNGPARSTS: u32 = 0x08f24;
 const ICR: u32 = 0x01500;
 const IMS: u32 = 0x01508;
@@ -138,6 +145,18 @@ const FATAL_RESET_REQUESTED: u32 = 3;
 const MAX_JUMBO_MTU: u32 = 9234;
 const ETHER_HDR_LEN: u32 = 14;
 const ETHER_CRC_LEN: u32 = 4;
+const LEDCTL: u32 = 0x00e00;
+const LED1_MODE_MASK: u32 = 0x0000_0f00;
+const LED1_MODE_SHIFT: u32 = 8;
+const LED1_BLINK: u32 = 0x0000_8000;
+const LED_MODE_ON: u32 = 0;
+const AUTONEG_ADV_DEFAULT: u16 = 0x002f;
+const ADVERTISE_10_HALF: u16 = 1;
+const ADVERTISE_10_FULL: u16 = 2;
+const ADVERTISE_100_HALF: u16 = 4;
+const ADVERTISE_100_FULL: u16 = 8;
+const ADVERTISE_1000_FULL: u16 = 0x20;
+const ADVERTISE_2500_FULL: u16 = 0x80;
 const PCI_COMMAND: u16 = 0x04;
 const PCI_VENDOR: u16 = 0;
 const PCI_DEVICE: u16 = 0x02;
@@ -148,6 +167,66 @@ const PCI_BUSMASTER_ENABLE: u32 = 0x4;
 const L1SS_CONTROL1: u16 = 0x08;
 const CTRL_EXT: u32 = 0x00018;
 const CTRL_EXT_DRV_LOAD: u32 = 0x1000_0000;
+const CRCERRS: u32 = 0x04000;
+const RXERRC: u32 = 0x0400c;
+const MPC: u32 = 0x04010;
+const SCC: u32 = 0x04014;
+const ECOL: u32 = 0x04018;
+const MCC: u32 = 0x0401c;
+const LATECOL: u32 = 0x04020;
+const COLC: u32 = 0x04028;
+const RERC: u32 = 0x0402c;
+const DC: u32 = 0x04030;
+const RLEC: u32 = 0x04040;
+const XONRXC: u32 = 0x04048;
+const XONTXC: u32 = 0x0404c;
+const XOFFRXC: u32 = 0x04050;
+const XOFFTXC: u32 = 0x04054;
+const FCRUC: u32 = 0x04058;
+const PRC64: u32 = 0x0405c;
+const PRC127: u32 = 0x04060;
+const PRC255: u32 = 0x04064;
+const PRC511: u32 = 0x04068;
+const PRC1023: u32 = 0x0406c;
+const PRC1522: u32 = 0x04070;
+const TLPIC: u32 = 0x04148;
+const RLPIC: u32 = 0x0414c;
+const GPRC: u32 = 0x04074;
+const BPRC: u32 = 0x04078;
+const MPRC: u32 = 0x0407c;
+const GPTC: u32 = 0x04080;
+const GORCL: u32 = 0x04088;
+const GORCH: u32 = 0x0408c;
+const GOTCL: u32 = 0x04090;
+const GOTCH: u32 = 0x04094;
+const RNBC: u32 = 0x040a0;
+const RUC: u32 = 0x040a4;
+const RFC: u32 = 0x040a8;
+const ROC: u32 = 0x040ac;
+const RJC: u32 = 0x040b0;
+const MGTPRC: u32 = 0x040b4;
+const MGTPDC: u32 = 0x040b8;
+const MGTPTC: u32 = 0x040bc;
+const TORL: u32 = 0x040c0;
+const TORH: u32 = 0x040c4;
+const TOTL: u32 = 0x040c8;
+const TOTH: u32 = 0x040cc;
+const TPR: u32 = 0x040d0;
+const TPT: u32 = 0x040d4;
+const PTC64: u32 = 0x040d8;
+const PTC127: u32 = 0x040dc;
+const PTC255: u32 = 0x040e0;
+const PTC511: u32 = 0x040e4;
+const PTC1023: u32 = 0x040e8;
+const PTC1522: u32 = 0x040ec;
+const MPTC: u32 = 0x040f0;
+const BPTC: u32 = 0x040f4;
+const IAC: u32 = 0x04100;
+const RXDMTC: u32 = 0x04120;
+const ALGNERRC: u32 = 0x04004;
+const TNCRS: u32 = 0x04034;
+const HTDPMC: u32 = 0x0403c;
+const TSCTC: u32 = 0x040f8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MainError {
@@ -318,6 +397,56 @@ pub struct IfStats {
     pub ecol: u64,
     pub latecol: u64,
     pub dropped_pkts: u64,
+    pub scc: u64,
+    pub mcc: u64,
+    pub dc: u64,
+    pub rerc: u64,
+    pub rlec: u64,
+    pub xonrxc: u64,
+    pub xontxc: u64,
+    pub xoffrxc: u64,
+    pub xofftxc: u64,
+    pub fcruc: u64,
+    pub prc64: u64,
+    pub prc127: u64,
+    pub prc255: u64,
+    pub prc511: u64,
+    pub prc1023: u64,
+    pub prc1522: u64,
+    pub tlpic: u64,
+    pub rlpic: u64,
+    pub gprc: u64,
+    pub bprc: u64,
+    pub mprc: u64,
+    pub gptc: u64,
+    pub gorc: u64,
+    pub gotc: u64,
+    pub rnbc: u64,
+    pub rjc: u64,
+    pub mgprc: u64,
+    pub mgpdc: u64,
+    pub mgptc: u64,
+    pub tor: u64,
+    pub tot: u64,
+    pub tpr: u64,
+    pub tpt: u64,
+    pub ptc64: u64,
+    pub ptc127: u64,
+    pub ptc255: u64,
+    pub ptc511: u64,
+    pub ptc1023: u64,
+    pub ptc1522: u64,
+    pub mptc: u64,
+    pub bptc: u64,
+    pub iac: u64,
+    pub rxdmtc: u64,
+    pub tncrs: u64,
+    pub htdpmc: u64,
+    pub tsctc: u64,
+    pub xoff_pause_observed: bool,
+    pub corrected_error_dma_count: u64,
+    pub corrected_error_pcie_tx_data_count: u64,
+    pub corrected_error_pcie_retry_count: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IfCounter {
@@ -325,6 +454,27 @@ pub enum IfCounter {
     InputErrors,
     OutputErrors,
     Other(u8),
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LedState {
+    pub active: bool,
+    pub default: u32,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaSubtype {
+    Auto,
+    Speed2500,
+    Speed1000,
+    Speed100,
+    Speed10,
+    Other,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaStatus {
+    pub valid: bool,
+    pub active: bool,
+    pub speed_mbps: u16,
+    pub full_duplex: bool,
 }
 pub trait IfCounterIo {
     fn default_counter(&mut self, counter: IfCounter) -> u64;
@@ -1211,6 +1361,82 @@ pub fn igc_if_mtu_set(mtu: u32) -> Result<u32, MainError> {
     Ok(mtu + ETHER_HDR_LEN + ETHER_CRC_LEN)
 }
 
+// upstream: if_igc.c igc_if_media_status()
+pub fn igc_if_media_status<I: IgcMainIo>(
+    io: &mut I,
+    link_active: bool,
+    speed: u16,
+    duplex: u16,
+) -> MediaStatus {
+    io.admin_status_deferred();
+    MediaStatus {
+        valid: true,
+        active: link_active,
+        speed_mbps: if link_active { speed } else { 0 },
+        full_duplex: link_active && duplex == 2,
+    }
+}
+
+// upstream: if_igc.c igc_if_media_change()
+pub fn igc_if_media_change(
+    ethernet: bool,
+    subtype: MediaSubtype,
+    full_duplex: bool,
+    phy: &mut super::phy::PhyState,
+    mac_autoneg: &mut bool,
+) -> Result<(), MainError> {
+    if !ethernet {
+        return Err(MainError::Bounds);
+    }
+    *mac_autoneg = true;
+    phy.autoneg_advertised = match subtype {
+        MediaSubtype::Auto => AUTONEG_ADV_DEFAULT,
+        MediaSubtype::Speed2500 => ADVERTISE_2500_FULL,
+        MediaSubtype::Speed1000 => ADVERTISE_1000_FULL,
+        MediaSubtype::Speed100 => {
+            if full_duplex {
+                ADVERTISE_100_FULL
+            } else {
+                ADVERTISE_100_HALF
+            }
+        }
+        MediaSubtype::Speed10 => {
+            if full_duplex {
+                ADVERTISE_10_FULL
+            } else {
+                ADVERTISE_10_HALF
+            }
+        }
+        MediaSubtype::Other => phy.autoneg_advertised,
+    };
+    Ok(())
+}
+
+// upstream: if_igc.c igc_if_led_func()
+pub fn igc_if_led_func<I: IgcMainIo>(io: &mut I, led: &mut LedState, on: bool) {
+    if on {
+        if !led.active {
+            led.default = io.read(LEDCTL);
+            led.active = true
+        }
+        let mut value = led.default;
+        value &= !(LED1_MODE_MASK | LED1_BLINK);
+        value |= LED_MODE_ON << LED1_MODE_SHIFT;
+        io.write(LEDCTL, value)
+    } else {
+        igc_led_restore(io, led)
+    }
+}
+
+// upstream: if_igc.c igc_led_restore()
+pub fn igc_led_restore<I: IgcMainIo>(io: &mut I, led: &mut LedState) {
+    if !led.active {
+        return;
+    }
+    io.write(LEDCTL, led.default);
+    led.active = false
+}
+
 // upstream: if_igc.c igc_if_update_admin_status()
 pub fn igc_if_update_admin_status<I: IgcAdminIo>(
     io: &mut I,
@@ -1328,6 +1554,111 @@ pub fn igc_if_get_counter<I: IfCounterIo>(io: &mut I, stats: &IfStats, counter: 
         IfCounter::OutputErrors => io.default_counter(counter) + stats.ecol + stats.latecol,
         other => io.default_counter(other),
     }
+}
+
+// upstream: if_igc.c igc_update_ecc_stats()
+pub fn igc_update_ecc_stats<I: IgcMainIo>(io: &mut I, stats: &mut IfStats) {
+    let pbecc = io.read(PBECCSTS);
+    if pbecc & PBECCSTS_CORR_ERR != 0 {
+        stats.corrected_error_dma_count += 1;
+        io.write(PBECCSTS, pbecc & (PBECCSTS_ECC_ENABLE | PBECCSTS_CORR_ERR))
+    }
+    let pcie = io.read(PCIEECCSTS) & PCIEECCSTS_CORR_MASK;
+    if pcie & PCIEECCSTS_TX_WR_DATA != 0 {
+        stats.corrected_error_pcie_tx_data_count += 1
+    }
+    if pcie & PCIEECCSTS_RETRY_BUF != 0 {
+        stats.corrected_error_pcie_retry_count += 1
+    }
+    if pcie != 0 {
+        io.write(PCIEECCSTS, pcie)
+    }
+}
+
+// upstream: if_igc.c igc_update_stats_counters()
+pub fn igc_update_stats_counters<I: IgcMainIo>(io: &mut I, stats: &mut IfStats) {
+    let prev_xoffrxc = stats.xoffrxc;
+    macro_rules! add {
+        ($field:ident, $reg:ident) => {
+            stats.$field = stats.$field.wrapping_add(u64::from(io.read($reg)));
+        };
+    }
+    add!(crcerrs, CRCERRS);
+    add!(rxerrc, RXERRC);
+    add!(mpc, MPC);
+    add!(scc, SCC);
+    add!(ecol, ECOL);
+    add!(mcc, MCC);
+    add!(latecol, LATECOL);
+    add!(colc, COLC);
+    add!(rerc, RERC);
+    add!(dc, DC);
+    add!(rlec, RLEC);
+    add!(xonrxc, XONRXC);
+    add!(xontxc, XONTXC);
+    add!(xoffrxc, XOFFRXC);
+    if stats.xoffrxc != prev_xoffrxc {
+        stats.xoff_pause_observed = true
+    }
+    add!(xofftxc, XOFFTXC);
+    add!(fcruc, FCRUC);
+    add!(prc64, PRC64);
+    add!(prc127, PRC127);
+    add!(prc255, PRC255);
+    add!(prc511, PRC511);
+    add!(prc1023, PRC1023);
+    add!(prc1522, PRC1522);
+    add!(tlpic, TLPIC);
+    add!(rlpic, RLPIC);
+    add!(gprc, GPRC);
+    add!(bprc, BPRC);
+    add!(mprc, MPRC);
+    add!(gptc, GPTC);
+    let gorcl = io.read(GORCL);
+    let gorch = io.read(GORCH);
+    stats.gorc = stats
+        .gorc
+        .wrapping_add(u64::from(gorcl) + (u64::from(gorch) << 32));
+    let gotcl = io.read(GOTCL);
+    let gotch = io.read(GOTCH);
+    stats.gotc = stats
+        .gotc
+        .wrapping_add(u64::from(gotcl) + (u64::from(gotch) << 32));
+    add!(rnbc, RNBC);
+    add!(ruc, RUC);
+    add!(rfc, RFC);
+    add!(roc, ROC);
+    add!(rjc, RJC);
+    add!(mgprc, MGTPRC);
+    add!(mgpdc, MGTPDC);
+    add!(mgptc, MGTPTC);
+    let torl = io.read(TORL);
+    let torh = io.read(TORH);
+    stats.tor = stats
+        .tor
+        .wrapping_add(u64::from(torl) + (u64::from(torh) << 32));
+    let totl = io.read(TOTL);
+    let toth = io.read(TOTH);
+    stats.tot = stats
+        .tot
+        .wrapping_add(u64::from(totl) + (u64::from(toth) << 32));
+    add!(tpr, TPR);
+    add!(tpt, TPT);
+    add!(ptc64, PTC64);
+    add!(ptc127, PTC127);
+    add!(ptc255, PTC255);
+    add!(ptc511, PTC511);
+    add!(ptc1023, PTC1023);
+    add!(ptc1522, PTC1522);
+    add!(mptc, MPTC);
+    add!(bptc, BPTC);
+    add!(iac, IAC);
+    add!(rxdmtc, RXDMTC);
+    add!(algnerrc, ALGNERRC);
+    add!(tncrs, TNCRS);
+    add!(htdpmc, HTDPMC);
+    add!(tsctc, TSCTC);
+    igc_update_ecc_stats(io, stats)
 }
 // upstream: if_igc.c igc_set_num_queues()
 pub const fn igc_set_num_queues() -> usize {
@@ -1925,6 +2256,7 @@ mod tests {
             mpc: 8,
             ecol: 9,
             latecol: 10,
+            ..IfStats::default()
         };
         assert_eq!(
             igc_if_get_counter(&mut io, &stats, IfCounter::InputErrors),
@@ -1937,5 +2269,71 @@ mod tests {
         assert_eq!(igc_if_get_counter(&mut io, &stats, IfCounter::Other(0)), 5);
         assert_eq!(igc_set_num_queues(), 4);
         assert!(igc_setup_msix().is_ok());
+    }
+
+    #[test]
+    fn media_and_led_callbacks_update_state_without_losing_oem_led_config() {
+        let mut io = Fake::default();
+        io.set(LEDCTL, 0xa5a5_5a5a);
+        let mut led = LedState::default();
+        igc_if_led_func(&mut io, &mut led, true);
+        assert!(led.active);
+        assert_eq!(io.get(LEDCTL) & LED1_MODE_MASK, 0);
+        assert_eq!(io.get(LEDCTL) & LED1_BLINK, 0);
+        igc_led_restore(&mut io, &mut led);
+        assert!(!led.active);
+        assert_eq!(io.get(LEDCTL), 0xa5a5_5a5a);
+        let mut phy = super::super::phy::PhyState::default();
+        let mut autoneg = false;
+        igc_if_media_change(true, MediaSubtype::Speed100, false, &mut phy, &mut autoneg).unwrap();
+        assert!(autoneg);
+        assert_eq!(phy.autoneg_advertised, ADVERTISE_100_HALF);
+        assert!(
+            igc_if_media_change(false, MediaSubtype::Auto, true, &mut phy, &mut autoneg).is_err()
+        );
+        assert_eq!(
+            igc_if_media_status(&mut io, true, 2500, 2),
+            MediaStatus {
+                valid: true,
+                active: true,
+                speed_mbps: 2500,
+                full_duplex: true
+            }
+        );
+        assert_eq!(
+            igc_if_media_status(&mut io, false, 0, 0),
+            MediaStatus {
+                valid: true,
+                active: false,
+                speed_mbps: 0,
+                full_duplex: false
+            }
+        );
+    }
+
+    #[test]
+    fn stat_reads_preserve_64bit_low_before_high_and_ecc_clear_masks() {
+        let mut io = Fake::default();
+        io.set(XOFFRXC, 1);
+        io.set(GORCL, 0x1234);
+        io.set(GORCH, 2);
+        io.set(GOTCL, 0x5678);
+        io.set(GOTCH, 3);
+        io.set(PBECCSTS, PBECCSTS_ECC_ENABLE | PBECCSTS_CORR_ERR);
+        io.set(PCIEECCSTS, PCIEECCSTS_CORR_MASK);
+        let mut stats = IfStats::default();
+        igc_update_stats_counters(&mut io, &mut stats);
+        assert_eq!(stats.xoffrxc, 1);
+        assert!(stats.xoff_pause_observed);
+        assert_eq!(stats.gorc, (2u64 << 32) | 0x1234);
+        assert_eq!(stats.gotc, (3u64 << 32) | 0x5678);
+        assert_eq!(stats.corrected_error_dma_count, 1);
+        assert_eq!(stats.corrected_error_pcie_tx_data_count, 1);
+        assert_eq!(stats.corrected_error_pcie_retry_count, 1);
+        assert!(
+            io.writes
+                .contains(&(PBECCSTS, PBECCSTS_ECC_ENABLE | PBECCSTS_CORR_ERR))
+        );
+        assert!(io.writes.contains(&(PCIEECCSTS, PCIEECCSTS_CORR_MASK)));
     }
 }

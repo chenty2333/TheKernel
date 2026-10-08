@@ -359,3 +359,5 @@ The `if_igc.c` lifecycle adapter now represents interface init/stop, suspend/shu
 The IGC interface translation now covers the interrupt mask/route and fatal-error state machine paths from `if_igc.c`: legacy and MSI-X causes, ICR fatal capture, deferred admin state, IVAR routing, queue enable and interrupt rate initialization. The PCI/iflib registration/resource allocation and the product bridge are still unfinished.
 
 The next `if_igc.c` batch adds PCI config-space identity capture, L1.2 erratum disable policy, bus-master admission, firmware `DRV_LOAD` ownership, counter exposure policy and the empty MSI-X setup routine. PCI register/interrupt allocation remains a platform boundary rather than a FreeBSD bus resource copy.
+
+The statistics path now mirrors the source counter-read order, including low-dword then high-dword for read-clear 64-bit octet counters, xoff pause observation, and ECC W1C masks. Statistics values are still surfaced through the TheKernel adapter rather than FreeBSD sysctl registration.
