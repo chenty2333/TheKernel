@@ -37,5 +37,5 @@
 - Beacon-filter defaults/disable payloads and enable/disable/beacon-abort state transitions are translated (`03415339`).
 - `iwx_add_sta_cmd()` now builds source ADD_STA station-type, address, HT/VHT, MIMO, aggregation-density, maximum aggregate-size, and U-APSD fields (`c85c910a`).
 - REMOVE_STA and ordered station removal/queue disable/BA teardown state cleanup are translated (`94f16612`).
-- UMAC scan channel-fill functions v1-v4 and v5 now apply valid channel caps, band layouts, PSD and iteration defaults (pending commit).
+- UMAC scan channel-fill functions v1-v4 and v5 now apply valid channel caps, band layouts, PSD and iteration defaults (`27b8e9ab`).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
