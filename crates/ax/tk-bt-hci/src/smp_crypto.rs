@@ -24,7 +24,7 @@ pub fn aes_cmac(key: &Key, message: &[u8]) -> Key {
     let k1 = double_block(zero);
     let k2 = double_block(k1);
     let blocks = message.len().div_ceil(16).max(1);
-    let complete = !message.is_empty() && message.len() % 16 == 0;
+    let complete = !message.is_empty() && message.len().is_multiple_of(16);
     let mut last = [0u8; 16];
     let tail = &message[(blocks - 1) * 16..];
     last[..tail.len()].copy_from_slice(tail);
@@ -35,8 +35,9 @@ pub fn aes_cmac(key: &Key, message: &[u8]) -> Key {
         xor_block(&mut last, &k2);
     }
     let mut state = [0u8; 16];
-    for chunk in message[..(blocks - 1) * 16].chunks_exact(16) {
-        xor_block(&mut state, chunk.try_into().expect("CMAC block"));
+    let (chunks, _) = message[..(blocks - 1) * 16].as_chunks::<16>();
+    for chunk in chunks {
+        xor_block(&mut state, chunk);
         aes128(key, &mut state);
     }
     xor_block(&mut state, &last);
@@ -82,8 +83,8 @@ pub fn c1(k: &Key, r: &Key, p1: &Key, p2: &Key) -> Key {
 /// LE legacy short-term key function; `r1` and `r2` are the low 64 bits.
 pub fn s1(tk: &Key, r1: &[u8; 8], r2: &[u8; 8]) -> Key {
     let mut input = [0u8; 16];
-    input[..8].copy_from_slice(r2);
-    input[8..].copy_from_slice(r1);
+    input[..8].copy_from_slice(r1);
+    input[8..].copy_from_slice(r2);
     e(tk, &input)
 }
 
@@ -220,5 +221,27 @@ mod tests {
         let (bx, by) = p256_public(&b).unwrap();
         assert_eq!(p256_ecdh(&a, &bx, &by), p256_ecdh(&b, &ax, &ay));
         assert!(p256_ecdh(&a, &[0; 32], &[0; 32]).is_none());
+    }
+
+    #[test]
+    fn legacy_c1_and_s1_core_vectors() {
+        let key = [0; 16];
+        let r = hex("5783d52156ad6f0e6388274ec6702ee0");
+        let p1 = hex("05000800000302070710000001010001");
+        let p2 = hex("00000000a1a2a3a4a5a6b1b2b3b4b5b6");
+        assert_eq!(
+            c1(&key, &r, &p1, &p2),
+            hex("1e1e3fef878988ead2a74dc5bef13b86")
+        );
+        let r1 = hex::<16>("000f0e0d0c0b0a091122334455667788");
+        let r2 = hex::<16>("010203040506070899aabbccddeeff00");
+        assert_eq!(
+            s1(
+                &key,
+                r1[8..].try_into().unwrap(),
+                r2[8..].try_into().unwrap()
+            ),
+            hex("9a1fe1f0e8b0f49b5b4216ae796da062")
+        );
     }
 }

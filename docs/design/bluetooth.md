@@ -58,8 +58,11 @@ address `ah`, and P-256 public-key/ECDH helpers. Crypto arrays use the most-
 significant-octet-first order from Core Vol 3 Part H Appendix D; SMP wire fields
 are little-endian and require explicit conversion at their caller. RFC 4493 and
 Core Appendix D vectors cover CMAC, f4-f6, g2, and ah; P-256 ECDH has symmetry
-and invalid-point checks. The cryptographic building blocks are not yet an SMP
-transaction engine: LE `PAIR_DEVICE`, ACL/CID 6 dispatch, Pairing Feature /
-Confirm / Random / Public Key / DHKey Check exchange, encryption transition,
-key distribution and mgmt `NEW_LONG_TERM_KEY`/`NEW_IRK` remain unimplemented.
-No LE pairing success or key-generation claim is made.
+and invalid-point checks. A bounded central-side Just Works state machine now performs the Pairing Feature
+exchange, Legacy Confirm/Random/STK or Secure Connections Public Key/Confirm/
+Random/DHKey Check and returns an encryption key action. MITM/OOB requests fail
+closed. It has no live ACL/CID 6 dispatch yet and does not drive HCI encryption,
+post-encryption key distribution, bond persistence, mgmt `PAIR_DEVICE` completion,
+or `NEW_LONG_TERM_KEY`/`NEW_IRK` events. Passkey/Numeric Comparison UI and
+peripheral-role pairing are also unsupported. Thus this is tested protocol core,
+not end-to-end LE pairing; no hardware pairing success is claimed.
