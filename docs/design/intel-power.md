@@ -217,6 +217,13 @@ The ICL voltage thresholds are 0 through 312 MHz, 1 through 556.8 MHz, and 2
 above that, as in `icl_calc_voltage_level()`; the ADL-N voltage association is
 source-derived but not confirmed by a public PRM.
 
+The same adapter also reads the two GEN9 display-memory-latency dwords used by
+the source watermark setup. The opcode is fixed; the 0/1 slot selector is sent
+in the PCode data register, matching `skl_read_wm_latency()`'s call contract.
+An adapter-model regression test records both request data values; `cargo
+check --tests` compiles it, while host execution is blocked by bare-metal
+per-CPU `R_X86_64_32S` relocations.
+
 This does not wire runtime `clk::transition()` into atomic modeset: that path
 still needs PREPARE/post-voltage calls, modeset-lock ordering, vblank/audio/PSR
 quiescing and GMBUS/AUX locking. `cdclk::transition` remains unused by a kernel
