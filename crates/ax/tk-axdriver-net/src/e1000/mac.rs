@@ -69,6 +69,156 @@ pub enum FlowControlMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum E1000MediaType {
+    Copper,
+    Fiber,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LedModes {
+    pub default: u32,
+    pub mode1: u32,
+    pub mode2: u32,
+}
+
+/// upstream: e1000_mac.c e1000_valid_led_default_generic()
+pub const fn valid_led_default_generic(mut data: u16) -> u16 {
+    if data == 0 || data == u16::MAX {
+        data = (0x8u16 << 12) | (0x9u16 << 8) | (0x1u16 << 4) | 0x1;
+    }
+    data
+}
+
+/// upstream: e1000_mac.c e1000_id_led_init_generic()
+pub fn id_led_init_generic(data: u16, ledctl: u32) -> LedModes {
+    let data = valid_led_default_generic(data);
+    let mut mode1 = ledctl;
+    let mut mode2 = ledctl;
+    for led in 0..4u32 {
+        let shift = led * 8;
+        let config = (data >> (led * 4)) & 0x0f;
+        match config {
+            4..=6 => {
+                mode1 &= !(0xff << shift);
+                mode1 |= E1000_LEDCTL_MODE_LED_ON << shift;
+            }
+            7..=9 => {
+                mode1 &= !(0xff << shift);
+                mode1 |= E1000_LEDCTL_MODE_LED_OFF << shift;
+            }
+            _ => {}
+        }
+        match config {
+            2 | 5 | 8 => {
+                mode2 &= !(0xff << shift);
+                mode2 |= E1000_LEDCTL_MODE_LED_ON << shift;
+            }
+            3 | 6 | 9 => {
+                mode2 &= !(0xff << shift);
+                mode2 |= E1000_LEDCTL_MODE_LED_OFF << shift;
+            }
+            _ => {}
+        }
+    }
+    LedModes {
+        default: ledctl,
+        mode1,
+        mode2,
+    }
+}
+
+/// upstream: e1000_mac.c e1000_setup_led_generic()
+pub fn setup_led_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    media: E1000MediaType,
+    mut modes: LedModes,
+    setup_is_generic: bool,
+) -> DevResult<LedModes> {
+    if !setup_is_generic {
+        return Err(DevError::InvalidParam);
+    }
+    match media {
+        E1000MediaType::Fiber => {
+            let ledctl = io.read_register(E1000_LEDCTL)?;
+            modes.default = ledctl;
+            let mut value = ledctl
+                & !(E1000_LEDCTL_LED0_IVRT | E1000_LEDCTL_LED0_BLINK | E1000_LEDCTL_LED0_MODE_MASK);
+            value |= E1000_LEDCTL_MODE_LED_OFF << E1000_LEDCTL_LED0_MODE_SHIFT;
+            io.write_register(E1000_LEDCTL, value)?;
+        }
+        E1000MediaType::Copper => io.write_register(E1000_LEDCTL, modes.mode1)?,
+        E1000MediaType::Other => {}
+    }
+    Ok(modes)
+}
+
+/// upstream: e1000_mac.c e1000_cleanup_led_generic()
+pub fn cleanup_led_generic<I: E1000RegisterIo>(io: &mut I, modes: LedModes) -> DevResult {
+    io.write_register(E1000_LEDCTL, modes.default)
+}
+
+/// upstream: e1000_mac.c e1000_blink_led_generic()
+pub fn blink_led_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    media: E1000MediaType,
+    modes: LedModes,
+) -> DevResult {
+    let blink = if media == E1000MediaType::Fiber {
+        E1000_LEDCTL_LED0_BLINK | (E1000_LEDCTL_MODE_LED_ON << E1000_LEDCTL_LED0_MODE_SHIFT)
+    } else {
+        let mut value = modes.mode2;
+        for shift in (0..32).step_by(8) {
+            let mode = (modes.mode2 >> shift) & E1000_LEDCTL_LED0_MODE_MASK;
+            let default = modes.default >> shift;
+            if (default & E1000_LEDCTL_LED0_IVRT == 0 && mode == E1000_LEDCTL_MODE_LED_ON)
+                || (default & E1000_LEDCTL_LED0_IVRT != 0 && mode == E1000_LEDCTL_MODE_LED_OFF)
+            {
+                value &= !(E1000_LEDCTL_LED0_MODE_MASK << shift);
+                value |= (E1000_LEDCTL_LED0_BLINK | E1000_LEDCTL_MODE_LED_ON) << shift;
+            }
+        }
+        value
+    };
+    io.write_register(E1000_LEDCTL, blink)
+}
+
+/// upstream: e1000_mac.c e1000_led_on_generic()
+pub fn led_on_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    media: E1000MediaType,
+    modes: LedModes,
+) -> DevResult {
+    match media {
+        E1000MediaType::Fiber => {
+            let mut ctrl = io.read_register(E1000_CTRL)?;
+            ctrl &= !E1000_CTRL_SWDPIN0;
+            ctrl |= E1000_CTRL_SWDPIO0;
+            io.write_register(E1000_CTRL, ctrl)
+        }
+        E1000MediaType::Copper => io.write_register(E1000_LEDCTL, modes.mode2),
+        E1000MediaType::Other => Ok(()),
+    }
+}
+
+/// upstream: e1000_mac.c e1000_led_off_generic()
+pub fn led_off_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    media: E1000MediaType,
+    modes: LedModes,
+) -> DevResult {
+    match media {
+        E1000MediaType::Fiber => {
+            let mut ctrl = io.read_register(E1000_CTRL)?;
+            ctrl |= E1000_CTRL_SWDPIN0 | E1000_CTRL_SWDPIO0;
+            io.write_register(E1000_CTRL, ctrl)
+        }
+        E1000MediaType::Copper => io.write_register(E1000_LEDCTL, modes.mode1),
+        E1000MediaType::Other => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlowControl {
     pub mode: FlowControlMode,
     pub low_water: u32,
@@ -717,6 +867,32 @@ mod tests {
                 .1,
             0
         );
+    }
+
+    #[test]
+    fn generic_led_nvm_defaults_and_modes_match_source_fields() {
+        assert_eq!(valid_led_default_generic(0), 0x8911);
+        assert_eq!(valid_led_default_generic(u16::MAX), 0x8911);
+        let modes = id_led_init_generic(0x0055, 0);
+        assert_eq!(modes.mode1 & 0xff, E1000_LEDCTL_MODE_LED_ON);
+        assert_eq!(modes.mode2 & 0xff, E1000_LEDCTL_MODE_LED_ON);
+        let mut io = Registers::default();
+        setup_led_generic(&mut io, E1000MediaType::Copper, modes, true).unwrap();
+        assert_eq!(io.writes.last(), Some(&(E1000_LEDCTL, modes.mode1)));
+        blink_led_generic(&mut io, E1000MediaType::Fiber, modes).unwrap();
+        assert_eq!(
+            io.writes.last(),
+            Some(&(
+                E1000_LEDCTL,
+                E1000_LEDCTL_LED0_BLINK | E1000_LEDCTL_MODE_LED_ON
+            ))
+        );
+        led_on_generic(&mut io, E1000MediaType::Copper, modes).unwrap();
+        assert_eq!(io.writes.last(), Some(&(E1000_LEDCTL, modes.mode2)));
+        cleanup_led_generic(&mut io, modes).unwrap();
+        assert_eq!(io.writes.last(), Some(&(E1000_LEDCTL, modes.default)));
+        led_off_generic(&mut io, E1000MediaType::Other, modes).unwrap();
+        assert_eq!(io.writes.len(), 4);
     }
 
     #[test]
