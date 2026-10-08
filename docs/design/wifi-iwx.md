@@ -125,4 +125,7 @@ sequence by polling and servicing the source interrupt/RX rings, reads the
 strap/OTP MAC and NVM_GET_INFO response, then masks device interrupts and stops
 the NIC as OpenBSD's preinit path does. PCI INTx is disabled while this
 synchronous polling adapter is used. The normal runtime ucode/PNVM sequence,
-installed interrupt worker, and wlan0 publication remain incomplete.
+including regular ucode, PNVM doorbell completion, and post-ALIVE setup, is
+exposed in source order on the controller but is not yet called by an if-up
+hook. The installed runtime interrupt worker and wlan0 publication remain
+incomplete.

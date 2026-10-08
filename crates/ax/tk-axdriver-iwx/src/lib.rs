@@ -109,7 +109,8 @@ pub use control::{
     media_change, process_ioctl, watchdog_tick,
 };
 pub use controller::{
-    ControllerError, IwxController, PnvmLoadError, RxServiceError, SyncCommandError,
+    ControllerError, ControllerUcodeStartError, IwxController, PnvmLoadError, RxServiceError,
+    SyncCommandError,
 };
 pub use diagnostics::{
     BZ_ERROR_TABLE_MIN, DriverDebugStatus, ERROR_ELEMENT_SIZE_BYTES, ERROR_START_OFFSET_BYTES,

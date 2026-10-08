@@ -51,6 +51,13 @@ pub enum PnvmLoadError<E> {
     NotCompleted,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ControllerUcodeStartError<F, P> {
+    Firmware(ControllerError<F>),
+    Pnvm(PnvmLoadError<P>),
+    PostAlive(crate::IctError),
+}
+
 /// Owned state shared by firmware commands, interrupt dispatch, and network datapath.
 pub struct IwxController<B: CsrAccess, A: DmaAllocator> {
     pub registers: IwxRegisters<B>,
@@ -445,6 +452,37 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         }
     }
 
+    /// Read/start regular uCode, load PNVM on Gen3, then perform post-ALIVE setup.
+    // upstream: if_iwx.c iwx_load_ucode_wait_alive()
+    pub fn load_ucode_wait_alive<F, P>(
+        &mut self,
+        firmware: &FirmwareImage,
+        external_pnvm: Option<&[u8]>,
+        sku_id: [u32; 3],
+        mac_type: u16,
+        rf_type: u16,
+        imr_enabled: bool,
+        wait_alive: impl FnMut(&mut Self, u64) -> Result<bool, F>,
+        wait_pnvm: impl FnMut(&mut Self, u64) -> Result<bool, P>,
+    ) -> Result<(), ControllerUcodeStartError<F, P>> {
+        self.boot_firmware(firmware, false, imr_enabled, wait_alive)
+            .map_err(ControllerUcodeStartError::Firmware)?;
+        if self.family >= DeviceFamily::Ax210 {
+            self.load_pnvm(
+                firmware,
+                external_pnvm,
+                sku_id,
+                mac_type,
+                rf_type,
+                wait_pnvm,
+            )
+            .map_err(ControllerUcodeStartError::Pnvm)?;
+        }
+        self.post_alive(firmware)
+            .map_err(ControllerUcodeStartError::PostAlive)?;
+        Ok(())
+    }
+
     /// Configure the ICT and firmware-versioned TX rate format after ALIVE.
     // upstream: if_iwx.c iwx_post_alive()
     pub fn post_alive(
@@ -466,7 +504,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
-    use core::cell::Cell;
+    use core::cell::{Cell, RefCell};
 
     use super::*;
     use crate::{DmaRegion, IoBarrier, firmware::test_image};
@@ -625,5 +663,52 @@ mod tests {
             .unwrap();
         assert!(waited);
         assert!(controller.pnvm_dma.is_none());
+    }
+
+    #[test]
+    fn regular_ucode_start_keeps_alive_pnvm_post_alive_order_by_family() {
+        let section = |offset: u32, payload: &[u8]| {
+            let mut bytes = offset.to_le_bytes().to_vec();
+            bytes.extend_from_slice(payload);
+            bytes
+        };
+        let lmac = section(0x1000, &[1]);
+        let separator = section(0xffff_cccc, &[]);
+        let umac = section(0x2000, &[2]);
+        let paging_separator = section(0xaaaa_bbbb, &[]);
+        let paging = section(0x3000, &[3]);
+        let firmware = FirmwareImage::parse(&test_image(&[
+            (19, &lmac),
+            (19, &separator),
+            (19, &umac),
+            (19, &paging_separator),
+            (19, &paging),
+        ]))
+        .unwrap();
+        let allocator = Allocator(Cell::new(0x400000));
+        let mut controller =
+            IwxController::attach(Bus::default(), allocator, DeviceFamily::Family22000, 0, 1)
+                .unwrap();
+        let order = RefCell::new(alloc::vec::Vec::new());
+        controller
+            .load_ucode_wait_alive(
+                &firmware,
+                None,
+                [0; 3],
+                0,
+                0,
+                false,
+                |_, timeout| {
+                    assert_eq!(timeout, crate::FIRMWARE_ALIVE_TIMEOUT_NS);
+                    order.borrow_mut().push(1);
+                    Ok::<_, ()>(true)
+                },
+                |_, _| {
+                    order.borrow_mut().push(2);
+                    Ok::<_, ()>(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(order.into_inner(), [1]);
     }
 }
