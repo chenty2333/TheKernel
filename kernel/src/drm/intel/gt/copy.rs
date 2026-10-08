@@ -2161,6 +2161,7 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
                 }
             }
             fence(Ordering::SeqCst);
+            consume_gen12_csb(memory)?;
             return Ok(());
         }
         if io.read(base + 0x0b8)? != 0 {
@@ -2172,6 +2173,30 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
         io.delay_us(10);
     }
     Err(Error::Timeout(base + 0x550))
+}
+
+/// Poll the Gen12 HWS context-status buffer after the job's scratch breadcrumb
+/// completes. Every submit resets the pointer to slot 11; process the bounded
+/// circular buffer before the subsequent engine reset retires this context.
+fn consume_gen12_csb(memory: &Memory) -> Result<(), Error> {
+    let mut pointer = [0; 4];
+    let mut bytes = [0; intel_gt::execlists::GEN12_CSB_ENTRIES * 8];
+    memory.status.flush();
+    memory.status.read(0x2f * 4, &mut pointer)?;
+    memory.status.read(0x10 * 4, &mut bytes)?;
+    let mut entries = [0; intel_gt::execlists::GEN12_CSB_ENTRIES];
+    for (index, chunk) in bytes.chunks_exact(8).enumerate() {
+        entries[index] = u64::from_le_bytes(chunk.try_into().map_err(|_| Error::Refused)?);
+    }
+    let progress = intel_gt::execlists::process_gen12_csb(
+        (intel_gt::execlists::GEN12_CSB_ENTRIES - 1) as u8,
+        u32::from_le_bytes(pointer),
+        &entries,
+    )?;
+    if progress.consumed == 0 || progress.promoted == 0 {
+        return Err(Error::Refused);
+    }
+    Ok(())
 }
 
 // Outer error means quiescence was not established: caller MUST retain all

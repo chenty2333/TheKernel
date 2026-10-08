@@ -49,7 +49,7 @@ As of 2026-10-09, source-order Rust transcripts with per-function markers exist 
 
 The compiled Gen12 `tk-intel-gt::execlists::{write_desc,execlists_submit_ports}` slice now replaces the private caller's hand-written ELSQ port writes. It keeps the source reverse-port order, writes both ports even when one is empty, and explicitly loads the queue. This remains only the hardware-facing queue-write portion; request queues, CSB completion, preemption/time-slicing, and the default GuC-submission engine path are still absent.
 
-The same module now has source-derived Gen12 CSB status decoding (`__gen12_csb_parse()` / `gen12_csb_parse()`) with explicit refusal for upstream-impossible states. Its tested pure parser is not yet fed by the hardware CSB status buffer or an interrupt/tasklet consumer.
+The same module now has source-derived Gen12 CSB status decoding (`__gen12_csb_parse()` / `gen12_csb_parse()`) with explicit refusal for upstream-impossible states. The private synchronous BCS/RCS caller drains the 12-entry HWS CSB after its scratch breadcrumb and before reset. This is a narrow polling validation, not the upstream IRQ/tasklet state machine: it does not promote software requests, complete timeline fences, or implement preemption/timeslicing.
 
 The CT receive bridge now treats a valid non-event G2H HXG as a pending fence response rather than an unknown submission event, and publishes the consumed receive head for the waiter. Only scheduling-mode and deregistration events are dispatched today; IRQ/tasklet/workqueue integration and execution completion callers remain outstanding.
 

@@ -7,6 +7,7 @@ use crate::{Error, GtIo};
 
 pub const EL_CTRL_LOAD: u32 = 1;
 pub const GEN12_NUM_PORTS: usize = 2;
+pub const GEN12_CSB_ENTRIES: usize = 12;
 const GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE: u32 = 1;
 const GEN12_CSB_SW_CTX_ID_MASK: u32 = 0x03ff_8000;
 const GEN12_IDLE_CTX_ID: u32 = 0x7ff;
@@ -43,6 +44,44 @@ pub fn gen12_csb_parse(csb: u64) -> Result<bool, Error> {
         lower & GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE != 0,
         (upper & 0xf) as u8,
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CsbProgress {
+    pub head: u8,
+    pub consumed: u8,
+    pub promoted: u8,
+}
+
+/// Drain the Gen11/12-sized status ring up to its hardware write pointer.
+/// `entries` is the 12-element `I915_HWS_CSB_BUF0_INDEX` array.
+/// The full upstream `process_csb()` scheduler state machine is not implemented here.
+pub fn process_gen12_csb(
+    head: u8,
+    write_pointer: u32,
+    entries: &[u64; GEN12_CSB_ENTRIES],
+) -> Result<CsbProgress, Error> {
+    if usize::from(head) >= GEN12_CSB_ENTRIES {
+        return Err(Error::Refused);
+    }
+    let tail = (write_pointer & 0xf) as u8;
+    if usize::from(tail) >= GEN12_CSB_ENTRIES {
+        return Err(Error::Refused);
+    }
+    let mut result = CsbProgress {
+        head,
+        consumed: 0,
+        promoted: 0,
+    };
+    while result.head != tail {
+        result.head = ((usize::from(result.head) + 1) % GEN12_CSB_ENTRIES) as u8;
+        let promote = gen12_csb_parse(entries[usize::from(result.head)])?;
+        result.consumed += 1;
+        if promote {
+            result.promoted += 1;
+        }
+    }
+    Ok(result)
 }
 
 /// Write one descriptor into an Execlists submit queue port.
@@ -165,5 +204,23 @@ mod tests {
             gen12_csb_parse(valid_context | (1u64 << 32)),
             Err(Error::Refused)
         );
+    }
+
+    #[test]
+    fn gen12_process_csb_wraps_from_last_entry_to_zero() {
+        let mut entries = [0; GEN12_CSB_ENTRIES];
+        entries[0] = (u64::from(GEN12_IDLE_CTX_ID) << 47) | (3u64 << 15);
+        entries[1] = (3u64 << 47) | (3u64 << 15);
+        let progress = process_gen12_csb(11, 1, &entries).unwrap();
+        assert_eq!(
+            progress,
+            CsbProgress {
+                head: 1,
+                consumed: 2,
+                promoted: 1
+            }
+        );
+        assert_eq!(process_gen12_csb(11, 11, &entries).unwrap().consumed, 0);
+        assert_eq!(process_gen12_csb(11, 12, &entries), Err(Error::Refused));
     }
 }
