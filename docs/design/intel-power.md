@@ -420,3 +420,40 @@ device the target has.
 | `regs::a_combo_phys_registers_are_at_the_documented_sub_block_offsets` | §5.1's correction, recomputed from the rule |
 | `regs::the_writable_registers_are_exactly_the_ones_the_bring_up_programs` | a frozen write set |
 | `regs::every_bring_up_register_is_inside_a_window_that_needs_no_forcewake` | the band and window invariants |
+
+## 8. Remaining task-2 power gaps (2026-10-08)
+
+The following i915 paths are still not translated or are deliberately rejected;
+the earlier description of power-domain helpers does not imply these are
+complete:
+
+* **Power-well lifecycle:** the generic domain/well reference counters, the
+  synchronous get/put path and the ADL-N Pipe-A/PW_A core path exist. The full
+  platform power-map consumer is not wired into all connector, AUX, pipe, PLL,
+  and TC state transitions. Async puts are only modeled in the reusable
+  domain core; the kernel workqueue/runtime-PM cancellation and flush lifecycle
+  is not connected. Thus no claim is made that disabling a modeset returns all
+  wells or reproduces every i915 delayed-put edge.
+* **IRQ-coupled wells:** descriptors carry `irq_pipe_mask`, and the translated
+  HSW well helper calls `post_enable`/`pre_disable`. The N305 MSI owner only
+  provisions Pipe-A vblank at installation; its well callbacks still refuse a
+  live IRQ-coupled power transition rather than silently leaving a pipe IRQ
+  source enabled across a well edge. Per-pipe IRQ block reset/mask/ack and
+  parent-MSI synchronization for every mapped well remain unported.
+* **DC-state runtime:** the DC field mask/write retry and allowed/target
+  sanitizers are translated. Boot initialization writes DC-off. `gen9_set_dc_state`
+  exposes the PSR notification and DC6 allowed-count hooks; the boot observer
+  intentionally does nothing because i915's DC6 count update is a no-op before
+  display version 14, and PSR work is not ported. No runtime DC5/DC6/DC9
+  target transition or DMC handshake is wired. A DC-off-well transition helper
+  exists in the display crate, but the kernel has not provided the DMC-backed
+  DC-off well implementation needed to use it.
+* **DMC:** platform selection, parsing, fixups, rootfs-ready request and the
+  guarded MMIO upload path exist in the opt-in N305 boot path. The source's
+  complete platform enable/disable lifecycle, event policy and coordination
+  with active DC states/PSR are not fully connected; unsupported transitions
+  remain refused.
+
+These are implementation gaps, not hardware-validation claims. The next
+workstream may use the translated boot sequence, but must not infer full
+modeset power lifecycle from its Pipe-A bring-up success.
