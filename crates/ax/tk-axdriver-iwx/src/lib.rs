@@ -33,6 +33,7 @@ mod rx_event;
 mod rx_packet;
 mod scan;
 mod tx;
+mod tx_completion;
 
 pub use alive::{
     ALIVE_STATUS_OK, ALIVE_V4_BYTES, ALIVE_V5_BYTES, ALIVE_V6_BYTES, AliveError, AliveInfo,
@@ -144,3 +145,9 @@ pub use scan::{
     scan_abort_command,
 };
 pub use tx::{EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame};
+pub use tx_completion::{
+    COMPRESSED_BA_HEADER_BYTES, COMPRESSED_BA_RATID_BYTES, COMPRESSED_BA_TFD_BYTES,
+    CompressedBaNotification, CompressedBaTfd, TX_RESPONSE_HEADER_BYTES, TX_STATUS_DIRECT_DONE,
+    TX_STATUS_MASK, TX_STATUS_SUCCESS, TxCompletionError, TxStatusNotification,
+    parse_compressed_ba, parse_tx_status,
+};
