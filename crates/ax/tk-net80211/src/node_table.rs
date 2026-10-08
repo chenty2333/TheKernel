@@ -69,15 +69,38 @@ pub struct NodeCopyEffects {
     pub reinitialize_hostap_power_save_queue: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeCleanupEffects {
+    pub delete_block_ack_state: bool,
+    pub release_rx_reorder_buffers: bool,
+    pub purge_hostap_saved_queue: bool,
+    pub retire_unreference_callback: bool,
+}
+
+/// Clear station node-owned information and report timer/queue cleanup.
+// upstream: ieee80211_node.c ieee80211_node_cleanup()
+pub fn cleanup_node_state(node: &mut NodeRecord, hostap: bool) -> NodeCleanupEffects {
+    node.saved_rsn_ie.clear();
+    node.saved_wpa_ie.clear();
+    NodeCleanupEffects {
+        delete_block_ack_state: true,
+        release_rx_reorder_buffers: true,
+        purge_hostap_saved_queue: hostap,
+        retire_unreference_callback: true,
+    }
+}
+
 /// Replace a node's owned station record and request source timeout reset.
 // upstream: ieee80211_node.c ieee80211_node_copy()
 pub fn copy_node_state(destination: &mut NodeRecord, source: &NodeRecord) -> NodeCopyEffects {
-    *destination = source.clone();
+    let replacement = source.clone();
+    let cleanup = cleanup_node_state(destination, false);
+    *destination = replacement;
     NodeCopyEffects {
         reset_node_timeouts: true,
-        delete_block_ack_state: true,
-        release_rx_reorder_buffers: true,
-        retire_unreference_callback: true,
+        delete_block_ack_state: cleanup.delete_block_ack_state,
+        release_rx_reorder_buffers: cleanup.release_rx_reorder_buffers,
+        retire_unreference_callback: cleanup.retire_unreference_callback,
         reinitialize_hostap_power_save_queue: false,
     }
 }
@@ -420,6 +443,24 @@ mod tests {
         );
         source.saved_rsn_ie[2] = 8;
         assert_eq!(destination.saved_rsn_ie, [48, 1, 7]);
+    }
+
+    #[test]
+    fn node_cleanup_retires_crypto_state_ba_buffers_and_only_hostap_queue() {
+        let mut node = allocate_node_storage();
+        node.saved_rsn_ie = alloc::vec![48, 1, 7];
+        node.saved_wpa_ie = alloc::vec![221, 1, 0];
+        assert_eq!(
+            cleanup_node_state(&mut node, false),
+            NodeCleanupEffects {
+                delete_block_ack_state: true,
+                release_rx_reorder_buffers: true,
+                purge_hostap_saved_queue: false,
+                retire_unreference_callback: true,
+            }
+        );
+        assert!(node.saved_rsn_ie.is_empty() && node.saved_wpa_ie.is_empty());
+        assert!(cleanup_node_state(&mut node, true).purge_hostap_saved_queue);
     }
 
     #[test]

@@ -128,10 +128,10 @@ pub use node_rates::{
     node_abg_mode, node_is_11g, setup_rates,
 };
 pub use node_table::{
-    INACT_SCAN, INVALID_SEQUENCE, NODE_CACHE_SIZE, NodeAllocError, NodeCopyEffects, NodeLifecycle,
-    NodeRecord, NodeTable, alloc_node, allocation_available, clean_inactive_nodes, copy_node_state,
-    duplicate_bss_node, find_node, find_node_mut, find_station_rx_node, find_station_tx_node,
-    free_all_nodes, free_node,
+    INACT_SCAN, INVALID_SEQUENCE, NODE_CACHE_SIZE, NodeAllocError, NodeCleanupEffects,
+    NodeCopyEffects, NodeLifecycle, NodeRecord, NodeTable, alloc_node, allocation_available,
+    clean_inactive_nodes, cleanup_node_state, copy_node_state, duplicate_bss_node, find_node,
+    find_node_mut, find_station_rx_node, find_station_tx_node, free_all_nodes, free_node,
     needs_station_rx_node, raise_scan_node_inactivity, setup_node,
 };
 pub use output::{

@@ -366,3 +366,7 @@ Background roam TX-drain and BSS-switch callbacks now produce explicit
 send-deauth/switch/restart-scan plans, including cleanup when the current or
 selected station node disappeared; command submission and callback lifetime
 remain driver-owned.
+
+Node cleanup now clears owned security-IE storage and returns BA/reorder and
+unreference-callback retirement effects; only an explicit HostAP caller asks
+to purge the saved power-save queue.
