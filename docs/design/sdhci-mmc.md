@@ -21,8 +21,8 @@ Product builds include SDHCI by default. The N305 Intel eMMC (`8086:54c4`) is
 read-only by default; `mmc.allow_write=1` is required to permit writes, and the
 block driver itself enforces the write restriction. The PCI binding maps the
 FreeBSD `sdhci_devices[]` IDs and their quirk bits, but does not yet implement
-all behavior attached to those quirks, interrupt handling, full card-removal
-lifecycle, automatic SD four-bit/high-speed selection, ADMA2, automatic 1.8V
+all behavior attached to those quirks, interrupt-driven completion, full card-removal
+lifecycle, automatic SD four-bit/high-speed selection, 64-bit ADMA2, automatic 1.8V
 negotiation/tuning, UHS/HS200/HS400, and the full
 upstream function set. Removable SD defaults to the safe 1-bit/25 MHz mode;
 the SD CMD6/ACMD6 helpers are present, but automatic SD bus-width/high-speed
@@ -34,9 +34,10 @@ The QEMU PCI SDHCI model (`1b36:0007`) additionally uses a local
 single-block-only mode after observed CMD18 timeouts; this local behavior is
 separate from FreeBSD's PCI quirk table. The generic write-protect callback
 follows FreeBSD's active-low PRESENT_STATE interpretation.
-Capability-gated SDMA uses a 512 KiB, 32-bit DMA bounce
-region; broken/unsupported DMA falls back to PIO. If a timeout leaves DMA
-quiescence uncertain, the region is quarantined rather than freed. User-area and any advertised boot0/boot1 areas are
+Capability-gated 32-bit ADMA2 uses descriptors in the prefix of a 512 KiB DMA
+bounce region and falls back to SDMA or PIO; capability-gated SDMA uses the
+same region. If a timeout leaves DMA quiescence uncertain, the region is
+quarantined rather than freed. User-area and any advertised boot0/boot1 areas are
 published as separate views;
 boot area writes follow the same default-read-only policy for Intel eMMC. RPMB
 metadata is decoded but its authenticated key/frame protocol is not exposed as a
@@ -61,8 +62,8 @@ remains unverified. The QEMU SD-card path does not exercise N305 eMMC.
 The generic host also applies the translated response-shift, card-presence,
 reset-order, timeout-control, and per-controller quirk behavior where its PIO
 path has a direct equivalent. The exact PCI ID/quirk table is in
-`tk-axdriver::sdhci`; unsupported DMA-specific quirk actions remain inert because
-this path does not use SDMA/ADMA.
+`tk-axdriver::sdhci`; remaining DMA-specific quirk actions that lack a safe
+equivalent in the bounded polling path are explicitly not mapped.
 
 Removable-card write-protect is sampled through the generic host callback, and
 MMC R1 status errors are returned as controller errors instead of being treated

@@ -116,6 +116,12 @@ pub const SDHCI_CTRL_ADMA2: u32 = 0x10;
 pub const SDHCI_CTRL_ADMA264: u32 = 0x18;
 pub const SDHCI_CTRL_DMA_MASK: u32 = 0x18;
 pub const SDHCI_CTRL_8BITBUS: u32 = 0x20;
+const SDHCI_ADMA2_DESC_VALID: u16 = 0x0001;
+const SDHCI_ADMA2_DESC_END: u16 = 0x0002;
+const SDHCI_ADMA2_DESC_TRANSFER: u16 = 0x0020;
+const SDHCI_ADMA2_DESC_BYTES: usize = 8;
+const SDHCI_ADMA2_TABLE_BYTES: usize = 4096;
+const SDHCI_ADMA2_PAYLOAD_OFFSET: usize = SDHCI_ADMA2_TABLE_BYTES;
 pub const SDHCI_CTRL_CARD_DET: u32 = 0x40;
 pub const SDHCI_CTRL_FORCE_CARD: u32 = 0x80;
 pub const SDHCI_POWER_CONTROL: u32 = 0x29;
@@ -1184,7 +1190,22 @@ impl<I: SdhciIo> SdhciHost<I> {
             return Err(SdhciError::Timeout);
         }
         let data_len = data.as_ref().map_or(0, |buffer| buffer.len());
-        let use_sdma = transfer.is_some()
+        let use_adma2 = transfer.is_some()
+            && self.version >= SDHCI_SPEC_200 as u8
+            && self.quirks & SDHCI_QUIRK_BROKEN_DMA == 0
+            && self.capabilities & SDHCI_CAN_DO_ADMA2 != 0
+            && self.dma.as_ref().is_some_and(|dma| {
+                dma.len >= SDHCI_ADMA2_PAYLOAD_OFFSET
+                    && data_len <= dma.len - SDHCI_ADMA2_PAYLOAD_OFFSET
+                    && dma.bus <= u64::from(u32::MAX)
+                    && dma
+                        .bus
+                        .checked_add(SDHCI_ADMA2_PAYLOAD_OFFSET as u64)
+                        .and_then(|address| address.checked_add(data_len as u64))
+                        .is_some_and(|end| end <= u64::from(u32::MAX) + 1)
+            });
+        let use_sdma = !use_adma2
+            && transfer.is_some()
             && self.version >= SDHCI_SPEC_200 as u8
             && self.quirks & SDHCI_QUIRK_BROKEN_DMA == 0
             && (self.capabilities & SDHCI_CAN_DO_DMA != 0
@@ -1201,36 +1222,61 @@ impl<I: SdhciIo> SdhciHost<I> {
             index,
             8 | SD_ACMD_SEND_SCR | SD_ACMD_SD_STATUS | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE
         ) || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
-        if use_sdma {
-            let dma = self
-                .dma
-                .as_ref()
-                .expect("SDMA predicate checked allocation");
+        if use_sdma || use_adma2 {
+            let dma = self.dma.as_ref().expect("DMA predicate checked allocation");
+            let payload = if use_adma2 {
+                // SAFETY: the descriptor table occupies the allocation prefix;
+                // the payload region begins at a disjoint page boundary.
+                unsafe { dma.cpu.as_ptr().add(SDHCI_ADMA2_PAYLOAD_OFFSET) }
+            } else {
+                dma.cpu.as_ptr()
+            };
             if !read_transfer {
                 if let Some(buffer) = data.as_ref() {
                     // SAFETY: the caller buffer and DMA bounce are disjoint
-                    // owned regions, and `data_len <= dma.len` was checked.
+                    // owned regions, and the selected path bounds-checks data_len.
                     unsafe {
-                        core::ptr::copy_nonoverlapping(buffer.as_ptr(), dma.cpu.as_ptr(), data_len);
+                        core::ptr::copy_nonoverlapping(buffer.as_ptr(), payload, data_len);
                     }
                 }
             }
-            self.io.write32(SDHCI_DMA_ADDRESS as usize, dma.bus as u32);
+            if use_adma2 {
+                // SAFETY: the coherent allocation is at least one page and
+                // encode_adma2_descriptors bounds the table within its prefix.
+                let table = unsafe {
+                    core::slice::from_raw_parts_mut(dma.cpu.as_ptr(), SDHCI_ADMA2_TABLE_BYTES)
+                };
+                let payload_bus = dma
+                    .bus
+                    .checked_add(SDHCI_ADMA2_PAYLOAD_OFFSET as u64)
+                    .and_then(|address| u32::try_from(address).ok())
+                    .ok_or(SdhciError::InvalidTransfer)?;
+                encode_adma2_descriptors(table, payload_bus, data_len)
+                    .ok_or(SdhciError::InvalidTransfer)?;
+                self.io
+                    .write32(SDHCI_ADMA_ADDRESS_LO as usize, dma.bus as u32);
+            } else {
+                self.io.write32(SDHCI_DMA_ADDRESS as usize, dma.bus as u32);
+            }
             let mut host_control = self.io.read8(SDHCI_HOST_CONTROL as usize);
             host_control &= !(SDHCI_CTRL_DMA_MASK as u8);
-            host_control |= SDHCI_CTRL_SDMA as u8;
+            host_control |= if use_adma2 {
+                SDHCI_CTRL_ADMA2 as u8
+            } else {
+                SDHCI_CTRL_SDMA as u8
+            };
             self.io.write8(SDHCI_HOST_CONTROL as usize, host_control);
             fence(Ordering::Release);
             self.dma_inflight = true;
         }
         self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
         if let (Some(mut mode), Some(_buffer)) = (transfer, data.as_ref()) {
-            let boundary = if use_sdma {
+            let boundary = if use_sdma || use_adma2 {
                 SDHCI_BLKSZ_SDMA_BNDRY_512K
             } else {
                 SDHCI_BLKSZ_SDMA_BNDRY_4K
             };
-            if use_sdma {
+            if use_sdma || use_adma2 {
                 mode |= SDHCI_TRNS_DMA as u16;
             }
             self.io.write16(
@@ -1265,18 +1311,25 @@ impl<I: SdhciIo> SdhciHost<I> {
             response.0[0] = self.io.read32(SDHCI_RESPONSE as usize);
         }
         if let Some(buffer) = data {
-            if use_sdma {
-                self.wait_dma_data_end(data_len)?;
+            if use_sdma || use_adma2 {
+                if use_sdma {
+                    self.wait_dma_data_end(data_len)?;
+                } else {
+                    self.wait_status(SDHCI_INT_DATA_END)?;
+                    self.dma_inflight = false;
+                }
                 fence(Ordering::Acquire);
                 if read_transfer {
                     let dma = self.dma.as_ref().expect("SDMA region remains owned");
+                    let payload = if use_adma2 {
+                        // SAFETY: the ADMA2 payload starts after the descriptor table.
+                        unsafe { dma.cpu.as_ptr().add(SDHCI_ADMA2_PAYLOAD_OFFSET) }
+                    } else {
+                        dma.cpu.as_ptr()
+                    };
                     // SAFETY: DATA_END retires device DMA before the copy.
                     unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            dma.cpu.as_ptr(),
-                            buffer.as_mut_ptr(),
-                            data_len,
-                        );
+                        core::ptr::copy_nonoverlapping(payload, buffer.as_mut_ptr(), data_len);
                     }
                 }
             } else {
@@ -1368,6 +1421,35 @@ fn calculate_clock_divider(base_hz: u32, target_hz: u32, version: u8) -> (u32, u
         divisor = divisor.min(SDHCI_200_MAX_DIVIDER);
         (divisor, divisor >> 1)
     }
+}
+
+// upstream: sdhci.c sdhci_start_data() ADMA2 transfer descriptors
+fn encode_adma2_descriptors(table: &mut [u8], bus_address: u32, data_len: usize) -> Option<usize> {
+    if data_len == 0 {
+        return None;
+    }
+    let descriptor_count = data_len.checked_add(65_535)? / 65_536;
+    let descriptor_bytes = descriptor_count.checked_mul(SDHCI_ADMA2_DESC_BYTES)?;
+    if descriptor_bytes > table.len() {
+        return None;
+    }
+    table[..descriptor_bytes].fill(0);
+    let mut offset = 0usize;
+    for index in 0..descriptor_count {
+        let chunk = (data_len - offset).min(65_536);
+        let chunk_address = bus_address.checked_add(u32::try_from(offset).ok()?)?;
+        chunk_address.checked_add(u32::try_from(chunk - 1).ok()?)?;
+        let entry = &mut table[index * SDHCI_ADMA2_DESC_BYTES..][..SDHCI_ADMA2_DESC_BYTES];
+        let mut attributes = SDHCI_ADMA2_DESC_VALID | SDHCI_ADMA2_DESC_TRANSFER;
+        if index + 1 == descriptor_count {
+            attributes |= SDHCI_ADMA2_DESC_END;
+        }
+        entry[..2].copy_from_slice(&attributes.to_le_bytes());
+        entry[2..4].copy_from_slice(&(chunk as u16).to_le_bytes());
+        entry[4..8].copy_from_slice(&chunk_address.to_le_bytes());
+        offset += chunk;
+    }
+    Some(descriptor_count)
 }
 
 const SD_CMD_GO_IDLE: u8 = 0;
@@ -2210,6 +2292,23 @@ mod tests {
     }
 
     #[test]
+    fn adma2_descriptors_split_long_transfer_and_mark_only_last_end() {
+        let mut table = [0xa5; 32];
+        let count = encode_adma2_descriptors(&mut table, 0x1000, 65_536 + 512).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(u16::from_le_bytes([table[0], table[1]]), 0x0021);
+        assert_eq!(u16::from_le_bytes([table[2], table[3]]), 0);
+        assert_eq!(u32::from_le_bytes(table[4..8].try_into().unwrap()), 0x1000);
+        assert_eq!(u16::from_le_bytes([table[8], table[9]]), 0x0023);
+        assert_eq!(u16::from_le_bytes([table[10], table[11]]), 512);
+        assert_eq!(
+            u32::from_le_bytes(table[12..16].try_into().unwrap()),
+            0x11000
+        );
+        assert!(encode_adma2_descriptors(&mut table[..8], 0x1000, 65_537).is_none());
+    }
+
+    #[test]
     fn clock_divider_matches_spec_2_power_of_two_and_spec_3_even_steps() {
         assert_eq!(calculate_clock_divider(50_000_000, 400_000, 1), (128, 64));
         assert_eq!(calculate_clock_divider(50_000_000, 400_000, 2), (126, 63));
@@ -2535,6 +2634,40 @@ mod tests {
         assert_ne!(host.io_mut().transfer_mode & SDHCI_TRNS_DMA as u16, 0);
         assert_eq!(host.io_mut().dma_address, 0x1000);
         assert_eq!(&bounce[..512], &input);
+    }
+
+    #[test]
+    fn adma2_write_uses_table_prefix_and_separate_payload_bounce() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        let mut bounce = alloc::boxed::Box::new([0u8; 8192]);
+        let cpu = NonNull::new(bounce.as_mut_ptr()).unwrap();
+        // SAFETY: the boxed test buffer remains stable while the host owns it.
+        let dma = unsafe { SdhciDmaRegion::from_raw_parts(cpu, 0x1000, 8192, 0, None) };
+        let caps = (50 << SDHCI_CLOCK_BASE_SHIFT) | SDHCI_CAN_DO_DMA | SDHCI_CAN_DO_ADMA2;
+        let mut host = SdhciHost::new(io, caps, 0, 3).with_dma_region(dma);
+        let mut input = [0x5a; 512];
+        host.command(
+            SD_CMD_WRITE_SINGLE,
+            1,
+            SD_R1 | SD_DATA,
+            Some(&mut input),
+            512,
+        )
+        .unwrap();
+        assert_eq!(
+            host.io_mut().transfer_mode & SDHCI_TRNS_DMA as u16,
+            SDHCI_TRNS_DMA as u16
+        );
+        assert_eq!(
+            host.io_mut().read8(SDHCI_HOST_CONTROL as usize) & SDHCI_CTRL_DMA_MASK as u8,
+            SDHCI_CTRL_ADMA2 as u8
+        );
+        assert_eq!(host.io_mut().read32(SDHCI_ADMA_ADDRESS_LO as usize), 0x1000);
+        assert_eq!(u16::from_le_bytes([bounce[0], bounce[1]]), 0x0023);
+        assert_eq!(u16::from_le_bytes([bounce[2], bounce[3]]), 512);
+        assert_eq!(u32::from_le_bytes(bounce[4..8].try_into().unwrap()), 0x2000);
+        assert_eq!(&bounce[SDHCI_ADMA2_PAYLOAD_OFFSET..][..512], &input);
     }
 
     #[test]
