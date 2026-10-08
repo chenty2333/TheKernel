@@ -562,7 +562,7 @@ pub struct CaptureLogState {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CaptureLogStats {
-    pub flush: u64,
+    pub flush: u32,
     pub overflow: u32,
     pub sampled_overflow: u32,
 }
@@ -586,7 +586,7 @@ pub fn process_capture_log(
     reset_in_progress: bool,
 ) -> CaptureLogResult {
     let flush_count = state.flush_to_file;
-    stats.flush = stats.flush.saturating_add(u64::from(flush_count));
+    stats.flush = stats.flush.wrapping_add(flush_count);
     let full_count = state.buffer_full_count;
     let previous = stats.sampled_overflow;
     let overflow = full_count != previous;

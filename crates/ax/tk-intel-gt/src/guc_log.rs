@@ -307,6 +307,72 @@ pub fn copy_debug_logs_for_relay(
     })
 }
 
+/// Drain the GuC capture region using its own log-state snapshot and preserve
+/// the source acknowledgment order: publish read_ptr, then clear flush_to_file.
+/// upstream: intel_guc_capture.c __guc_capture_process_output().
+pub fn process_capture_log(
+    shared: &mut [u8],
+    layout: GucLogLayout,
+    stats: &mut LogStats,
+    reset_in_progress: bool,
+) -> Result<crate::guc_capture::CaptureLogResult, Error> {
+    let total_size = usize::try_from(layout.buffer_bytes).map_err(|_| Error::Refused)?;
+    if shared.len() < total_size {
+        return Err(Error::Refused);
+    }
+    let state_offset = LOG_STATE_SIZE * 2;
+    let read_ptr =
+        usize::try_from(read_u32(shared, state_offset + 8)?).map_err(|_| Error::Refused)?;
+    let sampled_write_ptr =
+        usize::try_from(read_u32(shared, state_offset + 20)?).map_err(|_| Error::Refused)?;
+    let flags = read_u32(shared, state_offset + 28)?;
+    let flush_to_file = flags & 1;
+    let full_count = (flags >> 1) & 0xf;
+    let capture_offset = usize::try_from(intel_guc_get_log_buffer_offset(
+        layout,
+        LogBufferType::Capture,
+    ))
+    .map_err(|_| Error::Refused)?;
+    let capture_size = usize::try_from(intel_guc_get_log_buffer_size(
+        layout,
+        LogBufferType::Capture,
+    ))
+    .map_err(|_| Error::Refused)?;
+    let capture_end = capture_offset
+        .checked_add(capture_size)
+        .ok_or(Error::Refused)?;
+    let data = shared
+        .get(capture_offset..capture_end)
+        .ok_or(Error::Refused)?;
+    let mut state = crate::guc_capture::CaptureLogState {
+        read_ptr,
+        sampled_write_ptr,
+        buffer_full_count: full_count,
+        flush_to_file,
+    };
+    let mut capture_stats = crate::guc_capture::CaptureLogStats {
+        sampled_overflow: stats.sampled_overflow,
+        overflow: stats.overflow,
+        flush: stats.flush,
+    };
+    let result = crate::guc_capture::process_capture_log(
+        data,
+        &mut state,
+        &mut capture_stats,
+        reset_in_progress,
+    );
+    stats.sampled_overflow = capture_stats.sampled_overflow;
+    stats.overflow = capture_stats.overflow;
+    stats.flush = capture_stats.flush;
+    write_u32(
+        shared,
+        state_offset + 8,
+        u32::try_from(state.read_ptr).map_err(|_| Error::Refused)?,
+    )?;
+    write_u32(shared, state_offset + 28, flags & !1)?;
+    Ok(result)
+}
+
 fn section(bytes: u32, max_count: u32, alloc_flag: u32) -> Result<SectionSize, Error> {
     let (units, flags) = if bytes % SIZE_1M == 0 {
         (SIZE_1M, alloc_flag)
@@ -526,6 +592,30 @@ mod tests {
             .unwrap();
         assert_eq!(controller.level(), 3);
         assert_eq!(sent, [[ACTION_UK_LOG_ENABLE_LOGGING, 0x111]]);
+    }
+
+    #[test]
+    fn capture_log_drain_uses_capture_state_and_acknowledges_after_parse() {
+        let mut layout = tiny_layout();
+        layout.capture.bytes = 8;
+        layout.buffer_bytes = PAGE_SIZE + layout.debug.bytes + layout.crash.bytes + 8;
+        let mut shared = alloc::vec![0; layout.buffer_bytes as usize];
+        let state_offset = LOG_STATE_SIZE * 2;
+        write_u32(&mut shared, state_offset + 8, 0).unwrap();
+        write_u32(&mut shared, state_offset + 20, 8).unwrap();
+        write_u32(&mut shared, state_offset + 28, 1).unwrap();
+        let capture_offset =
+            intel_guc_get_log_buffer_offset(layout, LogBufferType::Capture) as usize;
+        write_u32(&mut shared, capture_offset, 0).unwrap();
+        write_u32(&mut shared, capture_offset + 4, 0).unwrap();
+        let mut stats = LogStats::default();
+        let result = process_capture_log(&mut shared, layout, &mut stats, false).unwrap();
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.parse_error, None);
+        assert_eq!(result.flush_count, 1);
+        assert_eq!(stats.flush, 1);
+        assert_eq!(read_u32(&shared, state_offset + 8), Ok(8));
+        assert_eq!(read_u32(&shared, state_offset + 28), Ok(0));
     }
 
     #[test]
