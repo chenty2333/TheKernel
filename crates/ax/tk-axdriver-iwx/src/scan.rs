@@ -334,8 +334,7 @@ pub fn fill_umac_scan_channels_v5(
     result
 }
 
-/// Build the complete SCAN_REQ_UMAC v14/v17 command and its fixed arrays.
-// upstream: if_iwx.c iwx_umac_scan_v14() / iwx_umac_scan_v17()
+/// Build one fixed-array SCAN_REQ_UMAC wire command.
 pub fn build_umac_scan_request(
     config: UmacScanConfig<'_>,
 ) -> Result<EncodedCommand, UmacScanError> {
@@ -440,18 +439,35 @@ pub fn build_umac_scan_request(
         .map_err(UmacScanError::Command)
 }
 
+/// Build the OpenBSD v14 scan request layout.
+// upstream: if_iwx.c iwx_umac_scan_v14()
+pub fn umac_scan_v14_command(
+    mut config: UmacScanConfig<'_>,
+) -> Result<EncodedCommand, UmacScanError> {
+    config.version = UmacScanVersion::V14;
+    build_umac_scan_request(config)
+}
+
+/// Build the OpenBSD v17 scan request layout.
+// upstream: if_iwx.c iwx_umac_scan_v17()
+pub fn umac_scan_v17_command(
+    mut config: UmacScanConfig<'_>,
+) -> Result<EncodedCommand, UmacScanError> {
+    config.version = UmacScanVersion::V17;
+    build_umac_scan_request(config)
+}
+
 /// Select firmware scan request version 17, falling back to the v14 layout.
 // upstream: if_iwx.c iwx_initiate_scan()
 pub fn initiate_scan_command(
-    mut config: UmacScanConfig<'_>,
+    config: UmacScanConfig<'_>,
     command_version: u8,
 ) -> Result<EncodedCommand, UmacScanError> {
-    config.version = if command_version == 17 {
-        UmacScanVersion::V17
+    if command_version == 17 {
+        umac_scan_v17_command(config)
     } else {
-        UmacScanVersion::V14
-    };
-    build_umac_scan_request(config)
+        umac_scan_v14_command(config)
+    }
 }
 
 fn write_v1_v4_channels(payload: &mut [u8], offset: usize, channels: &[ScanChannelConfig]) {

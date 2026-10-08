@@ -286,7 +286,7 @@ pub use scan::{
     fill_umac_scan_channels, fill_umac_scan_channels_v5, initiate_scan_command,
     reduced_scan_config_command, scan_abort_command, scan_umac_dwell_v10, scan_umac_dwell_v11,
     scan_umac_fill_ch_p_v6, scan_umac_fill_ch_p_v7, scan_umac_fill_general_p_v10,
-    scan_umac_fill_general_p_v11, scan_umac_flags_v2,
+    scan_umac_fill_general_p_v11, scan_umac_flags_v2, umac_scan_v14_command, umac_scan_v17_command,
 };
 pub use scan_probe::{
     DS_PARAMETER_IE, EXTENDED_RATES_IE, HT_CAPABILITIES_IE, PROBE_REQUEST_BYTES,
