@@ -98,6 +98,13 @@ The output-side user-priority map and non-AP ACM downgrade loop are also
 translated; AP mode preserves the requested AC without downgrade.
 Ethernet classification maps VLAN PCP or IPv4/IPv6 DSCP into source EDCA
 classes and applies the source per-window video/voice TXOP fallback policy.
+Management action body builders encode source ADDBA request/response, DELBA
+and SA Query response layouts; the transmit BA bitmap/window advances to the
+requested 12-bit sequence while retaining the source zero-bitmap stop rule.
+Station action dispatch returns no frame for AP-only SA Query requests or
+unsupported action categories, matching the `IEEE80211_STA_ONLY` build.
+The transmit AMPDU admission predicate additionally requires HT, local TX
+support, the active BSS peer in station mode, and RSN protection.
 Management frame helpers also encode Capability Information, DS channel and
 ERP NonERP/protection/Barker fields from station/AP mode, channel and local
 preamble state.

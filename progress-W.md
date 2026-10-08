@@ -114,3 +114,6 @@
 - `ieee80211_node.c` begin_scan now returns full source station effects and active/passive stats; driver/channel scheduling remains a caller effect; input 35/48, ieee80211.c 16/25, node.c 50/110.
 - `ieee80211_output.c` `ieee80211_up_to_ac()` now maps all eight user priorities and downgrades ACM ACs for non-AP stations; `output.c` marker coverage advances from 24/50 to 25/50.
 - `ieee80211_output.c` `ieee80211_classify_limit()` and `ieee80211_classify()` now enforce source VI/VO TXOP budgets and map VLAN PCP or IPv4/IPv6 DSCP to user priority; coverage advances from 25/50 to 27/50.
+- `ieee80211_output.c` `ieee80211_can_use_ampdu()` now gates aggregation on HT, local capability, station BSS ownership, and RSN; output coverage advances to 28/50.
+- `ieee80211_output.c` BlockAck/SA-Query station action-body encoders and Tx BA window advancement translated; output coverage advances to 33/50 functions.
+- `ieee80211_output.c` station-supported BlockAck/SA Query response action dispatcher translated; output coverage advances to 34/50 functions.

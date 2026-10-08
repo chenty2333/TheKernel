@@ -57,10 +57,166 @@ pub const RSN_OUI: [u8; 3] = [0x00, 0x0f, 0xac];
 pub const WPA_OUI: [u8; 3] = [0x00, 0x50, 0xf2];
 pub const RATE_SIZE: usize = 8;
 pub const SSID_MAX_LEN: usize = 32;
+pub const ACTION_CATEGORY_BLOCK_ACK: u8 = 3;
+pub const ACTION_CATEGORY_SA_QUERY: u8 = 8;
+pub const ACTION_ADDBA_REQUEST: u8 = 0;
+pub const ACTION_ADDBA_RESPONSE: u8 = 1;
+pub const ACTION_DELBA: u8 = 2;
+pub const ACTION_SA_QUERY_REQUEST: u8 = 0;
+pub const ACTION_SA_QUERY_RESPONSE: u8 = 1;
 const AC_BE: u8 = 0;
 const AC_BK: u8 = 1;
 const AC_VI: u8 = 2;
 const AC_VO: u8 = 3;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AmpduPolicy {
+    pub node_flags: u32,
+    pub local_capabilities: u32,
+    pub station_mode: bool,
+    pub is_bss_node: bool,
+    pub rsn_enabled: bool,
+    pub node_rsn_protocols: u32,
+}
+
+/// Gate A-MPDU on HT, local TX support, station BSS ownership, and WPA2.
+// upstream: ieee80211_output.c ieee80211_can_use_ampdu()
+pub const fn can_use_ampdu(policy: AmpduPolicy) -> bool {
+    policy.node_flags & crate::NODE_HT != 0
+        && policy.local_capabilities & crate::NET_CAP_TX_AMPDU != 0
+        && (!policy.station_mode || policy.is_bss_node)
+        && policy.rsn_enabled
+        && policy.node_rsn_protocols & crate::PROTO_RSN != 0
+}
+
+/// Encode an ADDBA request action body; `timeout_tu` is already in 802.11 TU.
+// upstream: ieee80211_output.c ieee80211_get_addba_req()
+pub fn build_addba_request_body(
+    token: u8,
+    parameters: u16,
+    timeout_tu: u16,
+    window_start: u16,
+) -> [u8; 9] {
+    let mut body = [0; 9];
+    body[0] = ACTION_CATEGORY_BLOCK_ACK;
+    body[1] = ACTION_ADDBA_REQUEST;
+    body[2] = token;
+    body[3..5].copy_from_slice(&parameters.to_le_bytes());
+    body[5..7].copy_from_slice(&timeout_tu.to_le_bytes());
+    body[7..9].copy_from_slice(&((window_start << 4).to_le_bytes()));
+    body
+}
+
+/// Encode an ADDBA response action body using the source failure parameters.
+// upstream: ieee80211_output.c ieee80211_get_addba_resp()
+pub fn build_addba_response_body(
+    tid: u8,
+    token: u8,
+    status: u16,
+    parameters: u16,
+    timeout_tu: u16,
+) -> [u8; 9] {
+    let params = if status == 0 {
+        parameters
+    } else {
+        (tid as u16) << 2
+    };
+    let timeout = if status == 0 { timeout_tu } else { 0 };
+    let mut body = [0; 9];
+    body[0] = ACTION_CATEGORY_BLOCK_ACK;
+    body[1] = ACTION_ADDBA_RESPONSE;
+    body[2] = token;
+    body[3..5].copy_from_slice(&status.to_le_bytes());
+    body[5..7].copy_from_slice(&params.to_le_bytes());
+    body[7..9].copy_from_slice(&timeout.to_le_bytes());
+    body
+}
+
+/// Encode a DELBA action body from the source TID/direction/reason fields.
+// upstream: ieee80211_output.c ieee80211_get_delba()
+pub fn build_delba_body(tid: u8, initiator: bool, reason: u16) -> [u8; 6] {
+    let params = ((tid as u16) << 12) | if initiator { 1 << 11 } else { 0 };
+    let mut body = [0; 6];
+    body[0] = ACTION_CATEGORY_BLOCK_ACK;
+    body[1] = ACTION_DELBA;
+    body[2..4].copy_from_slice(&params.to_le_bytes());
+    body[4..6].copy_from_slice(&reason.to_le_bytes());
+    body
+}
+
+/// Encode a four-byte SA Query action body with its transaction identifier.
+// upstream: ieee80211_output.c ieee80211_get_sa_query()
+pub fn build_sa_query_body(action: u8, transaction_id: u16) -> [u8; 4] {
+    let mut body = [0; 4];
+    body[0] = ACTION_CATEGORY_SA_QUERY;
+    body[1] = action;
+    body[2..4].copy_from_slice(&transaction_id.to_le_bytes());
+    body
+}
+
+/// Transmit BlockAck window state consumed by the source BAR advancement helper.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxBaWindow {
+    pub start: u16,
+    pub end: u16,
+    pub size: u16,
+    pub bitmap: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActionBodyFields {
+    pub tid: u8,
+    pub token: u8,
+    pub status: u16,
+    pub parameters: u16,
+    pub timeout_tu: u16,
+    pub window_start: u16,
+    pub initiator: bool,
+    pub reason: u16,
+    pub transaction_id: u16,
+}
+
+/// Dispatch the station BlockAck/SA-Query action builders supported by this port.
+// upstream: ieee80211_output.c ieee80211_get_action()
+pub fn build_action_body(category: u8, action: u8, fields: ActionBodyFields) -> Option<Vec<u8>> {
+    let body = match (category, action) {
+        (ACTION_CATEGORY_BLOCK_ACK, ACTION_ADDBA_REQUEST) => build_addba_request_body(
+            fields.token,
+            fields.parameters,
+            fields.timeout_tu,
+            fields.window_start,
+        )
+        .to_vec(),
+        (ACTION_CATEGORY_BLOCK_ACK, ACTION_ADDBA_RESPONSE) => build_addba_response_body(
+            fields.tid,
+            fields.token,
+            fields.status,
+            fields.parameters,
+            fields.timeout_tu,
+        )
+        .to_vec(),
+        (ACTION_CATEGORY_BLOCK_ACK, ACTION_DELBA) => {
+            build_delba_body(fields.tid, fields.initiator, fields.reason).to_vec()
+        }
+        (ACTION_CATEGORY_SA_QUERY, ACTION_SA_QUERY_RESPONSE) => {
+            build_sa_query_body(action, fields.transaction_id).to_vec()
+        }
+        _ => return None,
+    };
+    Some(body)
+}
+
+/// Move an outstanding Tx BA window to the specified 12-bit starting sequence.
+// upstream: ieee80211_output.c ieee80211_output_ba_move_window()
+pub fn move_tx_ba_window(window: &mut TxBaWindow, ssn: u16) {
+    let mut sequence = window.start;
+    while (sequence.wrapping_sub(ssn) & 0x0fff) > 2048 && window.bitmap != 0 {
+        sequence = (sequence + 1) % 0x0fff;
+        window.bitmap >>= 1;
+    }
+    window.start = ssn & 0x0fff;
+    window.end = window.start.wrapping_add(window.size).wrapping_sub(1) & 0x0fff;
+}
 
 /// Map 802.1D user priority to EDCA AC, downgrading ACM categories for STA mode.
 // upstream: ieee80211_output.c ieee80211_up_to_ac()
@@ -1117,6 +1273,98 @@ mod tests {
         assert_eq!(
             classify_ethernet_frame(&mut limiter, &ipv4, None, 100_000),
             5
+        );
+    }
+
+    #[test]
+    fn ampdu_requires_ht_tx_capability_station_bss_and_rsn() {
+        let base = AmpduPolicy {
+            node_flags: crate::NODE_HT,
+            local_capabilities: crate::NET_CAP_TX_AMPDU,
+            station_mode: true,
+            is_bss_node: true,
+            rsn_enabled: true,
+            node_rsn_protocols: crate::PROTO_RSN,
+        };
+        assert!(can_use_ampdu(base));
+        for changed in [
+            AmpduPolicy {
+                node_flags: 0,
+                ..base
+            },
+            AmpduPolicy {
+                local_capabilities: 0,
+                ..base
+            },
+            AmpduPolicy {
+                is_bss_node: false,
+                ..base
+            },
+            AmpduPolicy {
+                rsn_enabled: false,
+                ..base
+            },
+            AmpduPolicy {
+                node_rsn_protocols: 0,
+                ..base
+            },
+        ] {
+            assert!(!can_use_ampdu(changed));
+        }
+        assert!(can_use_ampdu(AmpduPolicy {
+            station_mode: false,
+            is_bss_node: false,
+            ..base
+        }));
+    }
+
+    #[test]
+    fn block_ack_and_sa_query_action_bodies_match_wire_fields() {
+        assert_eq!(
+            build_addba_request_body(7, 0x1234, 0x5678, 0x09ab),
+            [3, 0, 7, 0x34, 0x12, 0x78, 0x56, 0xb0, 0x9a]
+        );
+        assert_eq!(
+            build_addba_response_body(5, 8, 0, 0x2211, 0x4433),
+            [3, 1, 8, 0, 0, 0x11, 0x22, 0x33, 0x44]
+        );
+        assert_eq!(
+            build_addba_response_body(5, 8, 37, 0xffff, 99),
+            [3, 1, 8, 37, 0, 0x14, 0, 0, 0]
+        );
+        assert_eq!(build_delba_body(3, true, 39), [3, 2, 0, 0x38, 39, 0]);
+        assert_eq!(
+            build_sa_query_body(ACTION_SA_QUERY_RESPONSE, 0x1234),
+            [8, 1, 0x34, 0x12]
+        );
+        assert_eq!(
+            build_action_body(
+                ACTION_CATEGORY_SA_QUERY,
+                ACTION_SA_QUERY_RESPONSE,
+                ActionBodyFields {
+                    transaction_id: 0x1234,
+                    ..Default::default()
+                },
+            ),
+            Some(vec![8, 1, 0x34, 0x12])
+        );
+        assert_eq!(build_action_body(99, 0, ActionBodyFields::default()), None);
+
+        let mut window = TxBaWindow {
+            start: 4094,
+            end: 1,
+            size: 4,
+            bitmap: 0b11,
+        };
+        move_tx_ba_window(&mut window, 1);
+        assert_eq!(
+            window,
+            TxBaWindow {
+                start: 1,
+                end: 4,
+                size: 4,
+                bitmap: 0
+            }
         );
     }
 }
