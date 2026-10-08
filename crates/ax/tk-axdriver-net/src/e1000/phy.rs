@@ -91,6 +91,22 @@ const I347AT4_PAGE_SELECT: u32 = 0x16;
 const I347AT4_PCDC_CABLE_LENGTH_UNIT: u16 = 0x0400;
 const M88E1112_VCT_DSP_DISTANCE: u32 = 0x1a;
 const GS40G_PAGE_SHIFT: u32 = 16;
+const GS40G_PAGE_SELECT: u32 = 0x16;
+const GS40G_OFFSET_MASK: u32 = 0xffff;
+const MPHY_DIS_ACCESS: u32 = 0x8000_0000;
+const MPHY_ENA_ACCESS: u32 = 0x4000_0000;
+const MPHY_BUSY: u32 = 0x0001_0000;
+const MPHY_ADDRESS_FNC_OVERRIDE: u32 = 0x2000_0000;
+const MPHY_ADDRESS_MASK: u32 = 0x0000_ffff;
+const BM_CS_STATUS: u8 = 17;
+const BM_CS_STATUS_LINK_UP: u16 = 0x0400;
+const BM_CS_STATUS_RESOLVED: u16 = 0x0800;
+const BM_CS_STATUS_SPEED_MASK: u16 = 0xc000;
+const BM_CS_STATUS_SPEED_1000: u16 = 0x8000;
+const PHY_CONTROL_LB: u16 = 0x4000;
+const HV_MUX_DATA_CTRL: u32 = (776 << IGP_PAGE_SHIFT) | 16;
+const HV_MUX_DATA_CTRL_GEN_TO_MAC: u16 = 0x0400;
+const HV_MUX_DATA_CTRL_FORCE_SPEED: u16 = 0x0004;
 const IGP01E1000_PHY_PORT_STATUS: u32 = 0x11;
 const IGP01E1000_PHY_PCS_INIT_REG: u32 = 0x00b4;
 const IGP01E1000_PSSR_SPEED_MASK: u16 = 0xc000;
@@ -1703,6 +1719,187 @@ where
     Ok(())
 }
 
+/// upstream: e1000_phy.c e1000_link_stall_workaround_hv()
+pub fn link_stall_workaround_hv<I: E1000PhyMdicOps>(io: &mut I, phy_is_82578: bool) -> DevResult {
+    if !phy_is_82578 {
+        return Ok(());
+    }
+    if io.read_mdic(u32::from(PHY_CONTROL))? & PHY_CONTROL_LB != 0 {
+        return Ok(());
+    }
+    let status = io.read_mdic(u32::from(BM_CS_STATUS))?;
+    if status & (BM_CS_STATUS_LINK_UP | BM_CS_STATUS_RESOLVED | BM_CS_STATUS_SPEED_MASK)
+        != (BM_CS_STATUS_LINK_UP | BM_CS_STATUS_RESOLVED | BM_CS_STATUS_SPEED_1000)
+    {
+        return Ok(());
+    }
+    io.delay_us(200_000);
+    io.write_mdic(
+        HV_MUX_DATA_CTRL,
+        HV_MUX_DATA_CTRL_GEN_TO_MAC | HV_MUX_DATA_CTRL_FORCE_SPEED,
+    )?;
+    io.write_mdic(HV_MUX_DATA_CTRL, HV_MUX_DATA_CTRL_GEN_TO_MAC)
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_gs40g()
+pub fn write_phy_reg_gs40g<I: E1000PhyMdicOps>(io: &mut I, offset: u32, data: u16) -> DevResult {
+    let page = (offset >> GS40G_PAGE_SHIFT) as u16;
+    let register = offset & GS40G_OFFSET_MASK;
+    io.acquire()?;
+    let result = (|| {
+        io.write_mdic(GS40G_PAGE_SELECT, page)?;
+        io.write_mdic(register, data)
+    })();
+    io.release();
+    result
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_gs40g()
+pub fn read_phy_reg_gs40g<I: E1000PhyMdicOps>(io: &mut I, offset: u32) -> DevResult<u16> {
+    let page = (offset >> GS40G_PAGE_SHIFT) as u16;
+    let register = offset & GS40G_OFFSET_MASK;
+    io.acquire()?;
+    let result = (|| {
+        io.write_mdic(GS40G_PAGE_SELECT, page)?;
+        io.read_mdic(register)
+    })();
+    io.release();
+    result
+}
+
+/// upstream: e1000_phy.c e1000_is_mphy_ready()
+pub fn is_mphy_ready<I: E1000RegisterIo>(io: &mut I) -> bool {
+    for _ in 0..2 {
+        if io
+            .read_register(E1000_MPHY_ADDR_CTRL)
+            .map(|value| value & MPHY_BUSY == 0)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        io.delay_us(20);
+    }
+    false
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_mphy()
+pub fn read_phy_reg_mphy<I: E1000RegisterIo>(io: &mut I, address: u32) -> DevResult<u32> {
+    if !is_mphy_ready(io) {
+        return Err(DevError::Io);
+    }
+    let _ = io.read_register(E1000_MPHY_ADDR_CTRL)?;
+    let mut control = io.read_register(E1000_MPHY_ADDR_CTRL)?;
+    let locked = control & MPHY_DIS_ACCESS != 0;
+    if locked {
+        if !is_mphy_ready(io) {
+            return Err(DevError::Io);
+        }
+        control |= MPHY_ENA_ACCESS;
+        io.write_register(E1000_MPHY_ADDR_CTRL, control)?;
+    }
+    if !is_mphy_ready(io) {
+        return Err(DevError::Io);
+    }
+    control =
+        (control & !MPHY_ADDRESS_MASK & !MPHY_ADDRESS_FNC_OVERRIDE) | (address & MPHY_ADDRESS_MASK);
+    io.write_register(E1000_MPHY_ADDR_CTRL, control)?;
+    if !is_mphy_ready(io) {
+        return Err(DevError::Io);
+    }
+    let data = io.read_register(E1000_MPHY_DATA)?;
+    if locked {
+        if !is_mphy_ready(io) {
+            return Err(DevError::Io);
+        }
+        io.write_register(E1000_MPHY_ADDR_CTRL, MPHY_DIS_ACCESS)?;
+    }
+    Ok(data)
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_mphy()
+pub fn write_phy_reg_mphy<I: E1000RegisterIo>(
+    io: &mut I,
+    address: u32,
+    data: u32,
+    line_override: bool,
+) -> DevResult {
+    if !is_mphy_ready(io) {
+        return Err(DevError::Io);
+    }
+    let mut control = io.read_register(E1000_MPHY_ADDR_CTRL)?;
+    let locked = control & MPHY_DIS_ACCESS != 0;
+    if locked {
+        if !is_mphy_ready(io) {
+            return Err(DevError::Io);
+        }
+        control |= MPHY_ENA_ACCESS;
+        io.write_register(E1000_MPHY_ADDR_CTRL, control)?;
+    }
+    if !is_mphy_ready(io) {
+        return Err(DevError::Io);
+    }
+    if line_override {
+        control |= MPHY_ADDRESS_FNC_OVERRIDE;
+    } else {
+        control &= !MPHY_ADDRESS_FNC_OVERRIDE;
+    }
+    control = (control & !MPHY_ADDRESS_MASK) | (address & MPHY_ADDRESS_MASK);
+    io.write_register(E1000_MPHY_ADDR_CTRL, control)?;
+    if !is_mphy_ready(io) {
+        return Err(DevError::Io);
+    }
+    io.write_register(E1000_MPHY_DATA, data)?;
+    if locked {
+        if !is_mphy_ready(io) {
+            return Err(DevError::Io);
+        }
+        io.write_register(E1000_MPHY_ADDR_CTRL, MPHY_DIS_ACCESS)?;
+    }
+    Ok(())
+}
+
+/// upstream: e1000_phy.c __e1000_access_xmdio_reg()
+pub fn access_xmdio_reg<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    address: u16,
+    device_address: u8,
+    data: Option<u16>,
+) -> DevResult<Option<u16>> {
+    io.write_phy_register(E1000_MMDAC as u8, u16::from(device_address))?;
+    io.write_phy_register(E1000_MMDAAD as u8, address)?;
+    io.write_phy_register(
+        E1000_MMDAC as u8,
+        E1000_MMDAC_FUNC_DATA as u16 | u16::from(device_address),
+    )?;
+    let result = if let Some(data) = data {
+        io.write_phy_register(E1000_MMDAAD as u8, data)
+            .map(|_| None)
+    } else {
+        io.read_phy_register(E1000_MMDAAD as u8).map(Some)
+    }?;
+    io.write_phy_register(E1000_MMDAC as u8, 0)?;
+    Ok(result)
+}
+
+/// upstream: e1000_phy.c e1000_read_xmdio_reg()
+pub fn read_xmdio_reg<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    address: u16,
+    device_address: u8,
+) -> DevResult<u16> {
+    access_xmdio_reg(io, address, device_address, None)?.ok_or(DevError::Io)
+}
+
+/// upstream: e1000_phy.c e1000_write_xmdio_reg()
+pub fn write_xmdio_reg<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    address: u16,
+    device_address: u8,
+    data: u16,
+) -> DevResult {
+    access_xmdio_reg(io, address, device_address, Some(data)).map(|_| ())
+}
+
 /// upstream: e1000_phy.c e1000_phy_force_speed_duplex_setup()
 pub fn phy_force_speed_duplex_setup<I: E1000RegisterIo>(
     io: &mut I,
@@ -2238,6 +2435,7 @@ mod tests {
         phy_writes: alloc::vec::Vec<(u8, u16)>,
         delay: usize,
         mdic_data: u16,
+        mdic_read_queue: alloc::vec::Vec<u16>,
         mdic_error: bool,
         i2c_data: u16,
         i2c_error: bool,
@@ -2325,6 +2523,9 @@ mod tests {
     impl E1000PhyMdicOps for Io {
         fn read_mdic(&mut self, offset: u32) -> DevResult<u16> {
             self.mdic_reads.push(offset);
+            if !self.mdic_read_queue.is_empty() {
+                return Ok(self.mdic_read_queue.remove(0));
+            }
             if self.use_phy_ids {
                 let (id1, id2) = self.phy_ids[self.phy_address as usize];
                 return match offset {
@@ -3038,6 +3239,112 @@ mod tests {
         assert_eq!(io.mdic_writes[0], (I82578_ADDR_REG, 3));
         assert_eq!(io.mdic_writes[1], (I82578_ADDR_REG + 1, 0x7eff));
         assert_eq!(io.mdic_writes[2], (0, MII_CR_POWER_DOWN));
+    }
+
+    #[test]
+    fn generic_hv_link_stall_and_gs40g_page_access_preserve_sequences() {
+        let mut io = Io {
+            mdic_read_queue: alloc::vec::Vec::from([
+                0,
+                BM_CS_STATUS_LINK_UP | BM_CS_STATUS_RESOLVED | BM_CS_STATUS_SPEED_1000,
+            ]),
+            ..Io::default()
+        };
+        link_stall_workaround_hv(&mut io, true).unwrap();
+        assert_eq!(io.delay, 200_000);
+        assert_eq!(
+            io.mdic_writes,
+            [
+                (
+                    HV_MUX_DATA_CTRL,
+                    HV_MUX_DATA_CTRL_GEN_TO_MAC | HV_MUX_DATA_CTRL_FORCE_SPEED
+                ),
+                (HV_MUX_DATA_CTRL, HV_MUX_DATA_CTRL_GEN_TO_MAC),
+            ]
+        );
+        let mut not_hv = Io::default();
+        link_stall_workaround_hv(&mut not_hv, false).unwrap();
+        assert!(not_hv.mdic_reads.is_empty());
+
+        let mut gs40g = Io {
+            mdic_data: 0x5aa5,
+            ..Io::default()
+        };
+        assert_eq!(
+            read_phy_reg_gs40g(&mut gs40g, (7 << GS40G_PAGE_SHIFT) | 0x15).unwrap(),
+            0x5aa5
+        );
+        assert_eq!(gs40g.mdic_writes, [(GS40G_PAGE_SELECT, 7)]);
+        write_phy_reg_gs40g(&mut gs40g, (2 << GS40G_PAGE_SHIFT) | 3, 0x1234).unwrap();
+        assert_eq!(
+            gs40g.mdic_writes[1..],
+            [(GS40G_PAGE_SELECT, 2), (3, 0x1234)]
+        );
+        assert_eq!((gs40g.locks, gs40g.unlocks), (2, 2));
+    }
+
+    #[test]
+    fn generic_mphy_access_waits_checks_busy_and_restores_disabled_access() {
+        let mut io = Io {
+            registers: [
+                (E1000_MPHY_ADDR_CTRL, MPHY_DIS_ACCESS),
+                (E1000_MPHY_DATA, 0x1234_5678),
+            ],
+            ..Io::default()
+        };
+        assert!(is_mphy_ready(&mut io));
+        assert_eq!(read_phy_reg_mphy(&mut io, 0x2345).unwrap(), 0x1234_5678);
+        assert_eq!(
+            io.writes[0],
+            (E1000_MPHY_ADDR_CTRL, MPHY_DIS_ACCESS | MPHY_ENA_ACCESS)
+        );
+        assert_eq!(io.writes[1].0, E1000_MPHY_ADDR_CTRL);
+        assert_eq!(
+            io.writes.last(),
+            Some(&(E1000_MPHY_ADDR_CTRL, MPHY_DIS_ACCESS))
+        );
+        write_phy_reg_mphy(&mut io, 0x3456, 0xdead_beef, true).unwrap();
+        assert_eq!(
+            io.writes
+                .iter()
+                .rev()
+                .find(|(reg, _)| *reg == E1000_MPHY_DATA),
+            Some(&(E1000_MPHY_DATA, 0xdead_beef))
+        );
+        let mut busy = Io {
+            registers: [(E1000_MPHY_ADDR_CTRL, MPHY_BUSY), (0, 0)],
+            ..Io::default()
+        };
+        assert!(!is_mphy_ready(&mut busy));
+        assert!(read_phy_reg_mphy(&mut busy, 0).is_err());
+    }
+
+    #[test]
+    fn generic_xmdio_access_sequences_address_data_and_recalibration() {
+        let mut io = Io::default();
+        io.phy[E1000_MMDAAD as usize] = 0xbeef;
+        assert_eq!(read_xmdio_reg(&mut io, 0x1234, 7).unwrap(), 0xbeef);
+        assert_eq!(
+            io.phy_writes,
+            [
+                (E1000_MMDAC as u8, 7),
+                (E1000_MMDAAD as u8, 0x1234),
+                (E1000_MMDAC as u8, E1000_MMDAC_FUNC_DATA as u16 | 7),
+                (E1000_MMDAC as u8, 0),
+            ]
+        );
+        io.phy_writes.clear();
+        write_xmdio_reg(&mut io, 0x5678, 3, 0xabcd).unwrap();
+        assert_eq!(
+            io.phy_writes,
+            [
+                (E1000_MMDAC as u8, 3),
+                (E1000_MMDAAD as u8, 0x5678),
+                (E1000_MMDAC as u8, E1000_MMDAC_FUNC_DATA as u16 | 3),
+                (E1000_MMDAAD as u8, 0xabcd),
+                (E1000_MMDAC as u8, 0),
+            ]
+        );
     }
 
     #[test]

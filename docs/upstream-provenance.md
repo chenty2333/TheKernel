@@ -1051,3 +1051,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - Intel/FreeBSD `e1000_phy.c` coverage update: 76 of 98 functions are now translated, including BM wakeup enable/disable and indexed wakeup register transfers. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
 
 - Intel/FreeBSD `e1000_phy.c` coverage update: 89 of 98 functions are now translated, adding HV page/debug-port access, 82577 forced-speed and cable diagnostics, and 82577 PHY-info extraction. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+- Intel/FreeBSD `e1000_phy.c` completion update: all 98 of 98 C function definitions have `upstream:` Rust counterparts in `crates/ax/tk-axdriver-net/src/e1000/phy.rs`; BM/HV special accesses are routed through explicit register and wakeup adapters. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
