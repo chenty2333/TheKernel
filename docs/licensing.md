@@ -751,3 +751,9 @@ modeset-verification functions in Linux 7.2.3 `intel_modeset_verify.c` (MIT,
 `tk-intel-display/src/intel_modeset_setup_full.rs` translates all 25
 modeset-setup functions in Linux 7.2.3 `intel_modeset_setup.c` (MIT, © 2022
 Intel); its SPDX tag and crate `LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_display_modeset_full.rs` translates 223 of 273
+mode/modeset functions in Linux 7.2.3 `intel_display.c` (MIT, © 2006-2007
+Intel); the target-inapplicable generations and framework/debug boundaries
+are named in `docs/design/intel-display-modeset-full.md`. Its SPDX tag and
+crate `LICENSE-MIT` preserve the grant.

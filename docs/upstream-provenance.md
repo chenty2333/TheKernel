@@ -1250,3 +1250,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `crates/ax/tk-intel-display/src/intel_modeset_verify_full.rs` translates all 7 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_modeset_verify.c` (MIT, Copyright © 2022 Intel Corporation); DRM object traversal, state readout and diagnostics remain hooks. `LICENSE-MIT`.
 
 `crates/ax/tk-intel-display/src/intel_modeset_setup_full.rs` translates all 25 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_modeset_setup.c` (MIT, Copyright © 2022 Intel Corporation); DRM state/object enumeration and diagnostics remain hooks. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_display_modeset_full.rs` translates 223 of 273 ctags function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_display.c` (MIT, Copyright © 2006-2007 Intel Corporation); 50 target-generation-excluded or DRM/GEM/debug boundary functions are enumerated with reasons in `docs/design/intel-display-modeset-full.md`. `LICENSE-MIT`.
