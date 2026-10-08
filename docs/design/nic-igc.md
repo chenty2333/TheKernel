@@ -1,8 +1,28 @@
 # Intel i225/i226 (`igc`) Ethernet driver
 
-Status: implemented on `feat/nic-igc`.  **It has never run on the machine it
-was written for.**  This document says what is known, what is assumed, what is
-measured, and what is unverified — and the last list is the long one.
+> **Status update (2026-10-09):** The sections below are a historical account
+> of the initial hand-written probe/ring implementation and are not a current
+> inventory. The driver now includes BSD-licensed FreeBSD translations for
+> `igc_api.c`, `igc_base.c`, `igc_i225.c`, `igc_mac.c`, `igc_nvm.c`,
+> `igc_phy.c`, `igc_txrx.c`, and the implemented `if_igc.c` helpers. The live
+> PCI path installs the I225 operation tables and runs translated NVM/PHY
+> parameter setup, MAC reset/address/RAR initialization, copper autonegotiation,
+> link polling, queue setup, and TX/RX descriptor handling through `IgcNic`.
+> The source-marker audit currently records 74/91 `if_igc.c` ctags functions;
+> the remaining functions are FreeBSD iflib/newbus/sysctl registration or
+> debug-only hooks, with each omission reason in the task progress log. The
+> generic APIs do not expose iflib MSI-X queue allocation, sysctl nodes, dynamic
+> PCI detach, or RX metadata/fragment delivery, so those are not claimed as
+> translated behavior. N305 `net-n305` builds IGC by default. The N305 product
+> build and IGC host tests pass; QEMU has no IGC model.
+
+The original text below predates that translation and uses “this driver” to
+refer to the previous implementation. Where it conflicts with the status
+update, the update is authoritative.
+
+Historical status: implemented on `feat/nic-igc`.  **It has never run on the
+machine it was written for.**  The original report below records what was
+known, assumed, measured, and unverified at that point.
 
 The target is the Acer mini-PC described in [`n305-bringup.md`](n305-bringup.md):
 an Intel i3-N305 (Alder Lake-N) with no operating system installed and no serial

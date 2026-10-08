@@ -52,29 +52,24 @@
 //!   one queue and disables RX checksum offload, so it does not program the
 //!   RSS registers; RX writeback metadata is parsed but not exported through
 //!   the current `NetDriverOps` interface.
-//! * **The multicast table array and the unicast/multicast hash tables**
-//!   (`IGC_MTA`, `IGC_UTA`).  Linux zeroes 128 dwords of each in
-//!   `igc_init_hw_base`.  This driver does not: they hold whatever reset left
-//!   in them.  The consequence is in the design note's list of what is not
-//!   implemented.
-//! * **The receive address filter beyond entry 0** (`IGC_RAL(1..15)`,
-//!   `IGC_RAH(1..15)`).  `igc_init_rx_addrs` writes entry 0 and clears the
-//!   other fifteen; this driver writes none of them and relies on the
-//!   hardware's NVM auto-read having enabled entry 0.
+//! * **The unicast table and multicast filtering policy** (`IGC_UTA`, `IGC_MTA`).
+//!   The translated shared initializer clears all 128 MTA dwords, while the
+//!   single-queue `NetDriverOps` path has no multicast-address callback and
+//!   leaves UTA filtering unconfigured.
+//! * **The receive address filter range** (`IGC_RAL(n)`, `IGC_RAH(n)`).  The
+//!   sixteen source-defined RAL/RAH pairs are resolved by `at_offset`; the
+//!   translated `igc_init_rx_addrs_generic` installs entry 0 and clears the
+//!   remaining entries.
 //! * **Flow control** (`IGC_FCT`, `IGC_FCAH`, `IGC_FCAL`, `IGC_FCTTV`,
-//!   `IGC_FCRTL`, `IGC_FCRTH`, `IGC_FCRTV`).  `igc_setup_link` initialises
-//!   them and `igc_config_fc_after_link_up` reconciles them with what the PHY
-//!   negotiated.  This driver programs none of them and does not set
-//!   `CTRL.RFCE`/`CTRL.TFCE`, so pause frames the PHY may negotiate are not
-//!   honoured -- a stated limitation, not an oversight.
+//!   `IGC_FCRTL`, `IGC_FCRTH`, `IGC_FCRTV`).  The translated shared link setup
+//!   initializes them and reconciles pause with the PHY negotiation.
 //! * **Interrupt programming** (`IGC_EIMS`, `IGC_EIMC`, `IGC_IVAR0`,
 //!   `IGC_EITR`, `IGC_GPIE`).  This driver polls.  It masks every interrupt
 //!   source once, during reset, and never enables one, so it declares only
 //!   `IGC_IMC` (write) and `IGC_ICR` (read-to-clear).
-//! * **The NVM/flash access path** (`IGC_EERD`, `IGC_EEWR`, `IGC_SRWR`) and
-//!   the flash-update registers.  This driver reads the MAC address out of the
-//!   receive-address registers after reset, which is what `igc_read_mac_addr`
-//!   does, and never talks to the NVM directly.
+//! * **NVM writes and flash-update registers** (`IGC_EEWR`, `IGC_SRWR`,
+//!   `IGC_FLSWCTL`, `IGC_FLSWDATA`, `IGC_FLSWCNT`).  The live adapter uses the
+//!   translated I225 EERD read path and does not update EEPROM or flash.
 //! * **Timestamps, TSN, LEDs, power management and PTM** (`IGC_SYSTIML`,
 //!   `IGC_TQAVCTRL`, `IGC_LEDCTL`, `IGC_I225_PHPM`, `IGC_PTM_*`).  Named by
 //!   the vendor driver; not needed to move a frame.
@@ -104,16 +99,16 @@ use core::sync::atomic::{Ordering, compiler_fence};
 ///
 /// The window is not the BAR: it is the part of the BAR this driver maps, and
 /// every access is checked against it.  It is sized to contain every register
-/// the driver names -- the highest is `IGC_SW_FW_SYNC` at `0x05b5c` -- with
+/// the driver names -- the highest is `IGC_EEWR` at `0x12018` -- with
 /// room to spare, and the probe refuses to run at all when the
 /// firmware-assigned BAR is smaller than this.
 ///
 /// The BAR's true size is not a fact any source available here establishes:
 /// FreeBSD's `if_igc` allocates BAR0 but does not state a fixed size. A window
-/// of 64 KiB
-/// is a chosen bound, not a measured one, and the probe reports the BAR size
-/// beside it.
-pub const WINDOW_BYTES: usize = 0x1_0000;
+/// of `0x13000` bytes covers the highest named register with an aligned tail;
+/// it is a chosen bound, not a measured BAR size, and the probe reports the
+/// BAR size beside it.
+pub const WINDOW_BYTES: usize = 0x1_3000;
 
 /// Which block of the device a register belongs to.
 ///
@@ -267,7 +262,15 @@ impl Register {
         purpose: &'static str,
         source: &'static str,
     ) -> Self {
-        Self::declare(name, offset, Access::ReadOnly, group, meaning, purpose, source)
+        Self::declare(
+            name,
+            offset,
+            Access::ReadOnly,
+            group,
+            meaning,
+            purpose,
+            source,
+        )
     }
 
     /// Declare a register this kernel reads and writes.
@@ -279,7 +282,15 @@ impl Register {
         purpose: &'static str,
         source: &'static str,
     ) -> Self {
-        Self::declare(name, offset, Access::ReadWrite, group, meaning, purpose, source)
+        Self::declare(
+            name,
+            offset,
+            Access::ReadWrite,
+            group,
+            meaning,
+            purpose,
+            source,
+        )
     }
 
     /// Declare a register this kernel writes and never reads.
@@ -411,268 +422,365 @@ impl Register {
 /// documentation lists what is deliberately absent and why.
 pub const NAMED: &[Register] = &[
     Register::read_write(
-            "IGC_CTRL",
-            0x00000,
-            Group::Identity,
-            Meaning::DeviceControl,
-            "global reset (CTRL.RST), the link-up request (CTRL.SLU), speed and duplex forcing, and \
-             the GIO master disable the reset sequence asserts first",
-            "igc_regs.h:8 (IGC_CTRL, \"Device Control - RW\")",
-            ),
+        "IGC_CTRL",
+        0x00000,
+        Group::Identity,
+        Meaning::DeviceControl,
+        "global reset (CTRL.RST), the link-up request (CTRL.SLU), speed and duplex forcing, and \
+         the GIO master disable the reset sequence asserts first",
+        "igc_regs.h:8 (IGC_CTRL, \"Device Control - RW\")",
+    ),
     Register::read_only(
-            "IGC_STATUS",
-            0x00008,
-            Group::Identity,
-            Meaning::DeviceStatus,
-            "link state, negotiated speed and duplex, the LAN function number, and the GIO master \
-             enable bit the reset sequence polls clear",
-            "igc_regs.h:9 (IGC_STATUS, \"Device Status - RO\")",
-            ),
-    Register::read_only(
-            "IGC_EECD",
-            0x00010,
-            Group::Identity,
-            Meaning::NvmControl,
-            "the NVM auto-read-done bit that says the receive-address registers hold the address the \
-             NVM was programmed with",
-            "igc_regs.h:10 (IGC_EECD, \"EEPROM/Flash Control - RW\"); read by igc_mac.c:650 \
-             igc_get_auto_rd_done",
-            ),
+        "IGC_STATUS",
+        0x00008,
+        Group::Identity,
+        Meaning::DeviceStatus,
+        "link state, negotiated speed and duplex, the LAN function number, and the GIO master \
+         enable bit the reset sequence polls clear",
+        "igc_regs.h:9 (IGC_STATUS, \"Device Status - RO\")",
+    ),
     Register::read_write(
-            "IGC_MDIC",
-            0x00020,
-            Group::Phy,
-            Meaning::None,
-            "the command and result register for every access to the integrated PHY's registers, \
-             including the link-status poll",
-            "igc_regs.h:12 (IGC_MDIC, \"MDI Control - RW\"); used by igc_phy.c:544 \
-             igc_read_phy_reg_mdic and igc_phy.c:600 igc_write_phy_reg_mdic",
-            ),
+        "IGC_EECD",
+        0x00010,
+        Group::Identity,
+        Meaning::NvmControl,
+        "the NVM auto-read-done bit that says the receive-address registers hold the address the \
+         NVM was programmed with",
+        "igc_regs.h:10 (IGC_EECD, \"EEPROM/Flash Control - RW\"); read by igc_mac.c:650 \
+         igc_get_auto_rd_done",
+    ),
     Register::read_write(
-            "IGC_RCTL",
-            0x00100,
-            Group::Receive,
-            Meaning::None,
-            "receive enable, broadcast accept, CRC strip and the long-packet bit",
-            "igc_regs.h:98 (IGC_RCTL, \"Rx Control - RW\"); programmed by igc_main.c:835 \
-             igc_setup_rctl",
-            ),
+        "IGC_MDIC",
+        0x00020,
+        Group::Phy,
+        Meaning::None,
+        "the command and result register for every access to the integrated PHY's registers, \
+         including the link-status poll",
+        "igc_regs.h:12 (IGC_MDIC, \"MDI Control - RW\"); used by igc_phy.c:544 \
+         igc_read_phy_reg_mdic and igc_phy.c:600 igc_write_phy_reg_mdic",
+    ),
     Register::read_write(
-            "IGC_TCTL",
-            0x00400,
-            Group::Transmit,
-            Meaning::None,
-            "transmit enable, pad-short-packets and retransmit-on-late-collision",
-            "igc_regs.h:119 (IGC_TCTL, \"Tx Control - RW\"); programmed by igc_main.c:882 \
-             igc_setup_tctl",
-            ),
+        "IGC_FCAL",
+        0x00028,
+        Group::Transmit,
+        Meaning::None,
+        "flow-control pause destination address low dword",
+        "FreeBSD igc_regs.h:20 (IGC_FCAL); written by igc_mac.c igc_setup_link_generic",
+    ),
     Register::read_write(
-            "IGC_I225_PHPM",
-            0x00e14,
-            Group::Phy,
-            Meaning::None,
-            "I225 PHY power-management and reset-completion status",
-            "FreeBSD igc_regs.h:40 (IGC_I225_PHPM); used by igc_phy.c reset/LPLU paths",
-            ),
+        "IGC_FCAH",
+        0x0002c,
+        Group::Transmit,
+        Meaning::None,
+        "flow-control pause destination address high dword",
+        "FreeBSD igc_regs.h:21 (IGC_FCAH); written by igc_mac.c igc_setup_link_generic",
+    ),
+    Register::read_write(
+        "IGC_FCT",
+        0x00030,
+        Group::Transmit,
+        Meaning::None,
+        "flow-control pause frame type",
+        "FreeBSD igc_regs.h:26 (IGC_FCT); written by igc_mac.c igc_setup_link_generic",
+    ),
+    Register::read_write(
+        "IGC_RCTL",
+        0x00100,
+        Group::Receive,
+        Meaning::None,
+        "receive enable, broadcast accept, CRC strip and the long-packet bit",
+        "igc_regs.h:98 (IGC_RCTL, \"Rx Control - RW\"); programmed by igc_main.c:835 \
+         igc_setup_rctl",
+    ),
+    Register::read_write(
+        "IGC_FCTTV",
+        0x00170,
+        Group::Transmit,
+        Meaning::None,
+        "flow-control pause transmit timer value",
+        "FreeBSD igc_regs.h:35 (IGC_FCTTV); written by igc_mac.c igc_setup_link_generic",
+    ),
+    Register::read_write(
+        "IGC_LTRC",
+        0x001a0,
+        Group::Identity,
+        Meaning::None,
+        "latency-tolerance reporting control",
+        "FreeBSD igc_regs.h:398 (IGC_LTRC); written by igc_i225.c igc_set_ltr_i225",
+    ),
+    Register::read_write(
+        "IGC_TCTL",
+        0x00400,
+        Group::Transmit,
+        Meaning::None,
+        "transmit enable, pad-short-packets and retransmit-on-late-collision",
+        "igc_regs.h:119 (IGC_TCTL, \"Tx Control - RW\"); programmed by igc_main.c:882 \
+         igc_setup_tctl",
+    ),
+    Register::read_write(
+        "IGC_I225_PHPM",
+        0x00e14,
+        Group::Phy,
+        Meaning::None,
+        "I225 PHY power-management and reset-completion status",
+        "FreeBSD igc_regs.h:40 (IGC_I225_PHPM); used by igc_phy.c reset/LPLU paths",
+    ),
+    Register::read_write(
+        "IGC_EEE_SU",
+        0x00e34,
+        Group::Phy,
+        Meaning::None,
+        "energy-efficient Ethernet setup timing",
+        "FreeBSD igc_regs.h:400 (IGC_EEE_SU); read by igc_i225.c igc_set_ltr_i225",
+    ),
     Register::read_to_clear(
-            "IGC_ICR",
-            0x01500,
-            Group::Interrupt,
-            "clear pending interrupt causes during reset; reading it is the clear",
-            "igc_regs.h:51 (IGC_ICR, \"Intr Cause Read - RC/W1C\"); read by igc_base.c:56 \
-             igc_reset_hw_base",
-            ),
+        "IGC_ICR",
+        0x01500,
+        Group::Interrupt,
+        "clear pending interrupt causes during reset; reading it is the clear",
+        "igc_regs.h:51 (IGC_ICR, \"Intr Cause Read - RC/W1C\"); read by igc_base.c:56 \
+         igc_reset_hw_base",
+    ),
     Register::write_only(
-            "IGC_IMC",
-            0x0150c,
-            Group::Interrupt,
-            "mask every interrupt source during reset; this driver never unmasks one",
-            "igc_regs.h:54 (IGC_IMC, \"Intr Mask Clear - WO\"); written by igc_base.c:32 \
-             igc_reset_hw_base",
-            ),
+        "IGC_IMC",
+        0x0150c,
+        Group::Interrupt,
+        "mask every interrupt source during reset; this driver never unmasks one",
+        "igc_regs.h:54 (IGC_IMC, \"Intr Mask Clear - WO\"); written by igc_base.c:32 \
+         igc_reset_hw_base",
+    ),
     Register::read_write(
-            "IGC_RXPBS",
-            0x02404,
-            Group::Identity,
-            Meaning::None,
-            "the receive packet buffer split; the vendor driver programs the part's documented \
-             default at probe",
-            "igc_regs.h:20 (IGC_RXPBS, \"Rx Packet Buffer Size - RW\"); written by igc_main.c:7097 \
-             with I225_RXPBSIZE_DEFAULT (igc_defines.h:399)",
-            ),
+        "IGC_FCRTL",
+        0x02160,
+        Group::Transmit,
+        Meaning::None,
+        "flow-control receive low watermark",
+        "FreeBSD igc_regs.h:68 (IGC_FCRTL); written by igc_mac.c igc_set_fc_watermarks_generic",
+    ),
     Register::read_write(
-            "IGC_RDBAL(0)",
-            0x02800,
-            Group::Receive,
-            Meaning::None,
-            "the low 32 bits of the receive descriptor ring's bus address",
-            "FreeBSD igc_regs.h:100 (IGC_RDBAL(_n)); written by if_igc.c igc_initialize_receive_unit",
-            ),
+        "IGC_FCRTH",
+        0x02168,
+        Group::Transmit,
+        Meaning::None,
+        "flow-control receive high watermark",
+        "FreeBSD igc_regs.h:69 (IGC_FCRTH); written by igc_mac.c igc_set_fc_watermarks_generic",
+    ),
     Register::read_write(
-            "IGC_RDBAH(0)",
-            0x02804,
-            Group::Receive,
-            Meaning::None,
-            "the high 32 bits of the receive descriptor ring's bus address",
-            "FreeBSD igc_regs.h:102 (IGC_RDBAH(_n)); written by if_igc.c igc_initialize_receive_unit",
-            ),
+        "IGC_RXPBS",
+        0x02404,
+        Group::Identity,
+        Meaning::None,
+        "the receive packet buffer split; the vendor driver programs the part's documented \
+         default at probe",
+        "igc_regs.h:20 (IGC_RXPBS, \"Rx Packet Buffer Size - RW\"); written by igc_main.c:7097 \
+         with I225_RXPBSIZE_DEFAULT (igc_defines.h:399)",
+    ),
     Register::read_write(
-            "IGC_RDLEN(0)",
-            0x02808,
-            Group::Receive,
-            Meaning::None,
-            "the length of the receive descriptor ring in bytes",
-            "FreeBSD igc_regs.h:104 (IGC_RDLEN(_n)); written by if_igc.c igc_initialize_receive_unit",
-            ),
+        "IGC_RDBAL(0)",
+        0x02800,
+        Group::Receive,
+        Meaning::None,
+        "the low 32 bits of the receive descriptor ring's bus address",
+        "FreeBSD igc_regs.h:100 (IGC_RDBAL(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
     Register::read_write(
-            "IGC_SRRCTL(0)",
-            0x0280c,
-            Group::Receive,
-            Meaning::None,
-            "the split-receive control for queue 0: buffer size and descriptor type",
-            "FreeBSD igc_regs.h:106 (IGC_SRRCTL(_n)); programmed by if_igc.c igc_initialize_receive_unit",
-            ),
+        "IGC_RDBAH(0)",
+        0x02804,
+        Group::Receive,
+        Meaning::None,
+        "the high 32 bits of the receive descriptor ring's bus address",
+        "FreeBSD igc_regs.h:102 (IGC_RDBAH(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
     Register::read_write(
-            "IGC_RDH(0)",
-            0x02810,
-            Group::Receive,
-            Meaning::None,
-            "the receive descriptor head; software resets it to zero when it configures the ring",
-            "FreeBSD igc_regs.h:108 (IGC_RDH(_n)); written by if_igc.c igc_initialize_receive_unit",
-            ),
+        "IGC_RDLEN(0)",
+        0x02808,
+        Group::Receive,
+        Meaning::None,
+        "the length of the receive descriptor ring in bytes",
+        "FreeBSD igc_regs.h:104 (IGC_RDLEN(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
     Register::read_write(
-            "IGC_RDT(0)",
-            0x02818,
-            Group::Receive,
-            Meaning::None,
-            "the receive descriptor tail: the boundary between descriptors the hardware owns and \
-             descriptors the driver owns",
-            "FreeBSD igc_regs.h:110 (IGC_RDT(_n)); written by if_igc.c igc_initialize_receive_unit",
-            ),
+        "IGC_SRRCTL(0)",
+        0x0280c,
+        Group::Receive,
+        Meaning::None,
+        "the split-receive control for queue 0: buffer size and descriptor type",
+        "FreeBSD igc_regs.h:106 (IGC_SRRCTL(_n)); programmed by if_igc.c \
+         igc_initialize_receive_unit",
+    ),
     Register::read_write(
-            "IGC_RXDCTL(0)",
-            0x02828,
-            Group::Receive,
-            Meaning::None,
-            "the receive queue's prefetch and write-back thresholds and its queue-enable bit",
-            "FreeBSD igc_regs.h:112 (IGC_RXDCTL(_n)); written by if_igc.c igc_initialize_receive_unit",
-            ),
+        "IGC_RDH(0)",
+        0x02810,
+        Group::Receive,
+        Meaning::None,
+        "the receive descriptor head; software resets it to zero when it configures the ring",
+        "FreeBSD igc_regs.h:108 (IGC_RDH(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
     Register::read_write(
-            "IGC_TXPBS",
-            0x03404,
-            Group::Identity,
-            Meaning::None,
-            "the transmit packet buffer split; the vendor driver programs the part's documented \
-             default at probe",
-            "igc_regs.h:21 (IGC_TXPBS, \"Tx Packet Buffer Size - RW\"); written by igc_main.c:7098 \
-             with I225_TXPBSIZE_DEFAULT (igc_defines.h:400)",
-            ),
+        "IGC_RDT(0)",
+        0x02818,
+        Group::Receive,
+        Meaning::None,
+        "the receive descriptor tail: the boundary between descriptors the hardware owns and \
+         descriptors the driver owns",
+        "FreeBSD igc_regs.h:110 (IGC_RDT(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
     Register::read_write(
-            "IGC_TDBAL(0)",
-            0x03800,
-            Group::Transmit,
-            Meaning::None,
-            "the low 32 bits of the transmit descriptor ring's bus address",
-            "FreeBSD igc_regs.h:116 (IGC_TDBAL(_n)); written by if_igc.c igc_initialize_transmit_unit",
-            ),
+        "IGC_RXDCTL(0)",
+        0x02828,
+        Group::Receive,
+        Meaning::None,
+        "the receive queue's prefetch and write-back thresholds and its queue-enable bit",
+        "FreeBSD igc_regs.h:112 (IGC_RXDCTL(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
     Register::read_write(
-            "IGC_TDBAH(0)",
-            0x03804,
-            Group::Transmit,
-            Meaning::None,
-            "the high 32 bits of the transmit descriptor ring's bus address",
-            "FreeBSD igc_regs.h:118 (IGC_TDBAH(_n)); written by if_igc.c igc_initialize_transmit_unit",
-            ),
+        "IGC_TXPBS",
+        0x03404,
+        Group::Identity,
+        Meaning::None,
+        "the transmit packet buffer split; the vendor driver programs the part's documented \
+         default at probe",
+        "igc_regs.h:21 (IGC_TXPBS, \"Tx Packet Buffer Size - RW\"); written by igc_main.c:7098 \
+         with I225_TXPBSIZE_DEFAULT (igc_defines.h:400)",
+    ),
     Register::read_write(
-            "IGC_TDLEN(0)",
-            0x03808,
-            Group::Transmit,
-            Meaning::None,
-            "the length of the transmit descriptor ring in bytes",
-            "FreeBSD igc_regs.h:120 (IGC_TDLEN(_n)); written by if_igc.c igc_initialize_transmit_unit",
-            ),
+        "IGC_TDBAL(0)",
+        0x03800,
+        Group::Transmit,
+        Meaning::None,
+        "the low 32 bits of the transmit descriptor ring's bus address",
+        "FreeBSD igc_regs.h:116 (IGC_TDBAL(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
     Register::read_write(
-            "IGC_TDH(0)",
-            0x03810,
-            Group::Transmit,
-            Meaning::None,
-            "the transmit descriptor head; software resets it to zero when it configures the ring",
-            "FreeBSD igc_regs.h:122 (IGC_TDH(_n)); written by if_igc.c igc_initialize_transmit_unit",
-            ),
+        "IGC_TDBAH(0)",
+        0x03804,
+        Group::Transmit,
+        Meaning::None,
+        "the high 32 bits of the transmit descriptor ring's bus address",
+        "FreeBSD igc_regs.h:118 (IGC_TDBAH(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
     Register::read_write(
-            "IGC_TDT(0)",
-            0x03818,
-            Group::Transmit,
-            Meaning::None,
-            "the transmit descriptor tail: writing it is what tells the hardware a frame is ready",
-            "FreeBSD igc_regs.h:124 (IGC_TDT(_n)); written by if_igc.c igc_initialize_transmit_unit",
-            ),
+        "IGC_TDLEN(0)",
+        0x03808,
+        Group::Transmit,
+        Meaning::None,
+        "the length of the transmit descriptor ring in bytes",
+        "FreeBSD igc_regs.h:120 (IGC_TDLEN(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
     Register::read_write(
-            "IGC_TXDCTL(0)",
-            0x03828,
-            Group::Transmit,
-            Meaning::None,
-            "the transmit queue's prefetch and write-back thresholds and its queue-enable bit",
-            "FreeBSD igc_regs.h:126 (IGC_TXDCTL(_n)); written by if_igc.c igc_initialize_transmit_unit",
-            ),
+        "IGC_TDH(0)",
+        0x03810,
+        Group::Transmit,
+        Meaning::None,
+        "the transmit descriptor head; software resets it to zero when it configures the ring",
+        "FreeBSD igc_regs.h:122 (IGC_TDH(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
     Register::read_write(
-            "IGC_RXCSUM",
-            0x05000,
-            Group::Receive,
-            Meaning::None,
-            "the receive checksum offload control word; the single-queue path disables offload",
-            "FreeBSD igc_regs.h:226 (IGC_RXCSUM); programmed by if_igc.c igc_initialize_receive_unit",
-            ),
+        "IGC_TDT(0)",
+        0x03818,
+        Group::Transmit,
+        Meaning::None,
+        "the transmit descriptor tail: writing it is what tells the hardware a frame is ready",
+        "FreeBSD igc_regs.h:124 (IGC_TDT(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
     Register::read_write(
-            "IGC_RLPML",
-            0x05004,
-            Group::Receive,
-            Meaning::None,
-            "the longest frame the receive path will accept; the vendor driver sets it to the jumbo \
-             bound, and this driver sets it to the size of the buffers it gives the hardware",
-            "igc_regs.h:109 (IGC_RLPML, \"Rx Long Packet Max Length\"); written by igc_main.c:4013 \
-             igc_set_rx_mode, and cleared by igc_base.c igc_rx_fifo_flush_base",
-            ),
-    Register::read_only(
-            "IGC_RAL(0)",
-            0x05400,
-            Group::Identity,
-            Meaning::ReceiveAddressLow,
-            "bytes 0..3 of the station address, little-endian, as the NVM auto-read left them",
-            "igc_regs.h:114 (IGC_RAL(_n)); read by igc_nvm.c:140 igc_read_mac_addr",
-            ),
-    Register::read_only(
-            "IGC_RAH(0)",
-            0x05404,
-            Group::Identity,
-            Meaning::ReceiveAddressHigh,
-            "bytes 4..5 of the station address and the RAH.AV bit that says the filter entry is armed",
-            "igc_regs.h:115 (IGC_RAH(_n)); read by igc_nvm.c:139 igc_read_mac_addr",
-            ),
+        "IGC_TXDCTL(0)",
+        0x03828,
+        Group::Transmit,
+        Meaning::None,
+        "the transmit queue's prefetch and write-back thresholds and its queue-enable bit",
+        "FreeBSD igc_regs.h:126 (IGC_TXDCTL(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
     Register::read_write(
-            "IGC_MANC",
-            0x05820,
-            Group::Identity,
-            Meaning::None,
-            "management control; MANC.BLK_PHY_RST_ON_IDE gates PHY reset",
-            "FreeBSD igc_regs.h:193 (IGC_MANC); read by igc_phy.c igc_check_reset_block_generic",
-            ),
+        "IGC_RXCSUM",
+        0x05000,
+        Group::Receive,
+        Meaning::None,
+        "the receive checksum offload control word; the single-queue path disables offload",
+        "FreeBSD igc_regs.h:226 (IGC_RXCSUM); programmed by if_igc.c igc_initialize_receive_unit",
+    ),
     Register::read_write(
-            "IGC_SWSM",
-            0x05b50,
-            Group::Nvm,
-            Meaning::None,
-            "software semaphore used for I225 PHY/NVM shared-resource ownership",
-            "FreeBSD igc_regs.h:223 (IGC_SWSM); used by igc_i225.c igc_get_hw_semaphore_i225",
-            ),
+        "IGC_RLPML",
+        0x05004,
+        Group::Receive,
+        Meaning::None,
+        "the longest frame the receive path will accept; the vendor driver sets it to the jumbo \
+         bound, and this driver sets it to the size of the buffers it gives the hardware",
+        "igc_regs.h:109 (IGC_RLPML, \"Rx Long Packet Max Length\"); written by igc_main.c:4013 \
+         igc_set_rx_mode, and cleared by igc_base.c igc_rx_fifo_flush_base",
+    ),
     Register::read_write(
-            "IGC_SW_FW_SYNC",
-            0x05b5c,
-            Group::Nvm,
-            Meaning::None,
-            "software/firmware resource synchronization semaphore",
-            "FreeBSD igc_regs.h:224 (IGC_SW_FW_SYNC); used by igc_i225.c acquire/release helpers",
-            ),
+        "IGC_RAL(0)",
+        0x05400,
+        Group::Identity,
+        Meaning::ReceiveAddressLow,
+        "bytes 0..3 of the station address, little-endian, as the NVM auto-read left them",
+        "igc_regs.h:114 (IGC_RAL(_n)); read by igc_nvm.c:140 igc_read_mac_addr",
+    ),
+    Register::read_write(
+        "IGC_RAH(0)",
+        0x05404,
+        Group::Identity,
+        Meaning::ReceiveAddressHigh,
+        "bytes 4..5 of the station address and the RAH.AV bit that says the filter entry is armed",
+        "igc_regs.h:115 (IGC_RAH(_n)); read by igc_nvm.c:139 igc_read_mac_addr",
+    ),
+    Register::read_write(
+        "IGC_MANC",
+        0x05820,
+        Group::Identity,
+        Meaning::None,
+        "management control; MANC.BLK_PHY_RST_ON_IDE gates PHY reset",
+        "FreeBSD igc_regs.h:193 (IGC_MANC); read by igc_phy.c igc_check_reset_block_generic",
+    ),
+    Register::read_write(
+        "IGC_SWSM",
+        0x05b50,
+        Group::Nvm,
+        Meaning::None,
+        "software semaphore used for I225 PHY/NVM shared-resource ownership",
+        "FreeBSD igc_regs.h:223 (IGC_SWSM); used by igc_i225.c igc_get_hw_semaphore_i225",
+    ),
+    Register::read_write(
+        "IGC_SW_FW_SYNC",
+        0x05b5c,
+        Group::Nvm,
+        Meaning::None,
+        "software/firmware resource synchronization semaphore",
+        "FreeBSD igc_regs.h:224 (IGC_SW_FW_SYNC); used by igc_i225.c acquire/release helpers",
+    ),
+    Register::read_write(
+        "IGC_LTRMINV",
+        0x05bb0,
+        Group::Identity,
+        Meaning::None,
+        "latency-tolerance minimum value",
+        "FreeBSD igc_regs.h:411 (IGC_LTRMINV); written by igc_i225.c igc_set_ltr_i225",
+    ),
+    Register::read_write(
+        "IGC_LTRMAXV",
+        0x05bb4,
+        Group::Identity,
+        Meaning::None,
+        "latency-tolerance maximum value",
+        "FreeBSD igc_regs.h:412 (IGC_LTRMAXV); written by igc_i225.c igc_set_ltr_i225",
+    ),
+    Register::read_write(
+        "IGC_EERD",
+        0x12014,
+        Group::Nvm,
+        Meaning::None,
+        "NVM EEPROM-mode read request and result",
+        "FreeBSD igc_regs.h:15 (IGC_EERD); used by igc_nvm.c igc_read_nvm_eerd",
+    ),
+    Register::read_write(
+        "IGC_EEWR",
+        0x12018,
+        Group::Nvm,
+        Meaning::None,
+        "NVM EEPROM-mode write request and result",
+        "FreeBSD igc_regs.h:16 (IGC_EEWR); used by igc_nvm.c NVM polling",
+    ),
 ];
 
 /// The registers the identify-only probe reads, in report order.
@@ -764,6 +872,51 @@ pub fn named(name: &str) -> Option<Register> {
 /// This exists for tests and for the report's own bookkeeping; driver code
 /// refers to registers by name, never by offset.
 pub fn at_offset(offset: u32) -> Option<Register> {
+    if (0x05200..=0x053fc).contains(&offset) && offset & 3 == 0 {
+        return Some(Register::read_write(
+            "IGC_MTA(n)",
+            offset,
+            Group::Receive,
+            Meaning::None,
+            "multicast table array dword cleared by shared MAC initialization",
+            "FreeBSD igc_regs.h:132 (IGC_MTA(_n)); written by igc_base.c igc_init_hw_base",
+        ));
+    }
+    const COUNTERS: [u32; 40] = [
+        0x04000, 0x0400c, 0x04010, 0x04014, 0x04018, 0x0401c, 0x04020, 0x04028, 0x0402c, 0x04030,
+        0x04040, 0x04048, 0x0404c, 0x04050, 0x04054, 0x04058, 0x04074, 0x04078, 0x0407c, 0x04080,
+        0x04088, 0x0408c, 0x04090, 0x04094, 0x040a0, 0x040a4, 0x040a8, 0x040ac, 0x040b0, 0x040c0,
+        0x040c4, 0x040c8, 0x040cc, 0x040d0, 0x040d4, 0x040f0, 0x040f4, 0x04148, 0x0414c, 0x04120,
+    ];
+    if COUNTERS.contains(&offset) {
+        return Some(Register::read_to_clear(
+            "IGC_STAT",
+            offset,
+            Group::Identity,
+            "clear the source's clear-on-read statistic counter during MAC initialization",
+            "FreeBSD igc_mac.c igc_clear_hw_cntrs_base_generic",
+        ));
+    }
+    if (0x05400..=0x05478).contains(&offset) && offset & 7 == 0 {
+        return Some(Register::read_write(
+            "IGC_RAL(n)",
+            offset,
+            Group::Identity,
+            Meaning::ReceiveAddressLow,
+            "low dword of one of the sixteen receive-address filter entries",
+            "FreeBSD igc_regs.h:114 (IGC_RAL(_n)); written by igc_mac.c igc_rar_set_generic",
+        ));
+    }
+    if (0x05404..=0x0547c).contains(&offset) && offset & 7 == 4 {
+        return Some(Register::read_write(
+            "IGC_RAH(n)",
+            offset,
+            Group::Identity,
+            Meaning::ReceiveAddressHigh,
+            "high dword of one of the sixteen receive-address filter entries",
+            "FreeBSD igc_regs.h:115 (IGC_RAH(_n)); written by igc_mac.c igc_rar_set_generic",
+        ));
+    }
     NAMED
         .iter()
         .copied()

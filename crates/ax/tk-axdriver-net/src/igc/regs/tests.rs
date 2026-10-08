@@ -35,7 +35,7 @@ fn every_named_register_is_inside_the_mapped_window() {
             register.name()
         );
     }
-    assert_eq!(NAMED_SPAN, 0x05b60, "the highest named register end");
+    assert_eq!(NAMED_SPAN, 0x1201c, "the highest named register end");
 }
 
 #[test]
@@ -147,13 +147,21 @@ fn the_table_names_exactly_the_registers_the_three_phases_need() {
     let expected: &[(&str, u32, Access)] = &[
         ("IGC_CTRL", 0x00000, Access::ReadWrite),
         ("IGC_STATUS", 0x00008, Access::ReadOnly),
-        ("IGC_EECD", 0x00010, Access::ReadOnly),
+        ("IGC_EECD", 0x00010, Access::ReadWrite),
         ("IGC_MDIC", 0x00020, Access::ReadWrite),
+        ("IGC_FCAL", 0x00028, Access::ReadWrite),
+        ("IGC_FCAH", 0x0002c, Access::ReadWrite),
+        ("IGC_FCT", 0x00030, Access::ReadWrite),
         ("IGC_RCTL", 0x00100, Access::ReadWrite),
+        ("IGC_FCTTV", 0x00170, Access::ReadWrite),
+        ("IGC_LTRC", 0x001a0, Access::ReadWrite),
         ("IGC_TCTL", 0x00400, Access::ReadWrite),
         ("IGC_I225_PHPM", 0x00e14, Access::ReadWrite),
+        ("IGC_EEE_SU", 0x00e34, Access::ReadWrite),
         ("IGC_ICR", 0x01500, Access::ReadToClear),
         ("IGC_IMC", 0x0150c, Access::WriteOnly),
+        ("IGC_FCRTL", 0x02160, Access::ReadWrite),
+        ("IGC_FCRTH", 0x02168, Access::ReadWrite),
         ("IGC_RXPBS", 0x02404, Access::ReadWrite),
         ("IGC_RDBAL(0)", 0x02800, Access::ReadWrite),
         ("IGC_RDBAH(0)", 0x02804, Access::ReadWrite),
@@ -171,11 +179,15 @@ fn the_table_names_exactly_the_registers_the_three_phases_need() {
         ("IGC_TXDCTL(0)", 0x03828, Access::ReadWrite),
         ("IGC_RXCSUM", 0x05000, Access::ReadWrite),
         ("IGC_RLPML", 0x05004, Access::ReadWrite),
-        ("IGC_RAL(0)", 0x05400, Access::ReadOnly),
-        ("IGC_RAH(0)", 0x05404, Access::ReadOnly),
+        ("IGC_RAL(0)", 0x05400, Access::ReadWrite),
+        ("IGC_RAH(0)", 0x05404, Access::ReadWrite),
         ("IGC_MANC", 0x05820, Access::ReadWrite),
         ("IGC_SWSM", 0x05b50, Access::ReadWrite),
         ("IGC_SW_FW_SYNC", 0x05b5c, Access::ReadWrite),
+        ("IGC_LTRMINV", 0x05bb0, Access::ReadWrite),
+        ("IGC_LTRMAXV", 0x05bb4, Access::ReadWrite),
+        ("IGC_EERD", 0x12014, Access::ReadWrite),
+        ("IGC_EEWR", 0x12018, Access::ReadWrite),
     ];
     assert_eq!(expected.len(), NAMED.len(), "{NAMED:#?}");
     for (name, offset, access) in expected {
@@ -608,7 +620,11 @@ fn writes_are_allowed_exactly_where_the_table_says_they_are() {
     scratch.words[0x00008 / 4] = 0x1234_5678;
     assert!(!window.write(named("IGC_STATUS").unwrap(), 0xffff_ffff));
     assert_eq!(window.read(named("IGC_STATUS").unwrap()), Some(0x1234_5678));
-    assert!(!window.write(named("IGC_RAH(0)").unwrap(), 0xffff_ffff));
+    // RAL/RAH are writable in the FreeBSD source register map for the
+    // translated alternate-MAC/RAR helper, while the probe's IDENTIFY view
+    // remains separately read-only.
+    assert!(window.write(named("IGC_RAH(0)").unwrap(), 0xffff_ffff));
+    assert_eq!(window.read(named("IGC_RAH(0)").unwrap()), Some(0xffff_ffff));
     // As does a register outside the window, even a writable one: the
     // window is the second of the two rules the table enforces.
     let short = unsafe { RegisterWindow::from_mapped(scratch.words.as_mut_ptr() as usize, 0x400) };
@@ -648,4 +664,33 @@ fn a_register_is_named_by_its_linux_spelling() {
         "the table is the only way from an offset back to a register"
     );
     assert!(at_offset(0x0281c).is_none());
+}
+
+#[test]
+fn every_freebsd_receive_address_filter_slot_is_mapped_and_bounded() {
+    use super::at_offset;
+
+    for index in 0..16u32 {
+        let low = at_offset(0x05400 + index * 8).expect("RAL entry is source-declared");
+        let high = at_offset(0x05404 + index * 8).expect("RAH entry is source-declared");
+        assert!(low.is_readable() && low.is_writable());
+        assert!(high.is_readable() && high.is_writable());
+    }
+    assert!(at_offset(0x05480).is_none());
+}
+
+#[test]
+fn shared_mac_initialization_registers_are_mapped_with_read_side_effects() {
+    use super::at_offset;
+
+    for index in 0..128u32 {
+        let mta = at_offset(0x05200 + index * 4).expect("MTA array dword is source-declared");
+        assert!(mta.is_readable() && mta.is_writable());
+    }
+    for offset in [0x04000, 0x04088, 0x04120, 0x0414c] {
+        let counter = at_offset(offset).expect("clear-on-read counter is source-declared");
+        assert!(counter.is_readable());
+        assert!(counter.read_has_side_effect());
+        assert!(!counter.is_writable());
+    }
 }
