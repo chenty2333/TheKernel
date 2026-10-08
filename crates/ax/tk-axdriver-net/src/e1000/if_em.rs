@@ -4570,6 +4570,82 @@ pub fn em_enable_wakeup<I: E1000RegisterIo, O: EmEnableWakeOps>(
     result
 }
 
+pub trait EmSuspendOps: EmEnableWakeOps {
+    fn stop_vf_retries(&mut self);
+    fn release_manageability(&mut self) -> DevResult;
+    fn release_hardware_control(&mut self) -> DevResult;
+}
+
+/// upstream: if_em.c em_if_suspend()
+pub fn em_if_suspend<I: E1000RegisterIo, O: EmSuspendOps>(
+    io: &mut I,
+    ops: &mut O,
+    config: EmEnableWakeConfig,
+) -> DevResult {
+    if config.vf {
+        ops.stop_vf_retries();
+    }
+    let wake = em_enable_wakeup(io, ops, config);
+    let _ = ops.release_manageability();
+    let _ = ops.release_hardware_control();
+    wake
+}
+
+/// upstream: if_em.c em_if_shutdown()
+pub fn em_if_shutdown<I: E1000RegisterIo, O: EmSuspendOps>(
+    io: &mut I,
+    ops: &mut O,
+    config: EmEnableWakeConfig,
+) {
+    let _ = em_if_suspend(io, ops, config);
+}
+
+pub trait EmResumeOps: EmPhyWakeOps {
+    fn resume_workarounds_pchlan(&mut self) -> DevResult;
+    fn phy_hardware_reset(&mut self) -> DevResult;
+    fn clear_pme(&mut self);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmResumeConfig {
+    pub mac: E1000MacType,
+    pub vf: bool,
+    pub wol_phy_armed: bool,
+    pub wol_phy_wakeup: bool,
+}
+
+/// upstream: if_em.c em_if_resume()
+pub fn em_if_resume<I: E1000RegisterIo, O: EmResumeOps>(
+    io: &mut I,
+    ops: &mut O,
+    config: EmResumeConfig,
+    wol_phy_armed: &mut bool,
+) -> DevResult {
+    if config.mac >= E1000MacType::Pch2Lan && config.mac < E1000MacType::I82575 {
+        let _ = ops.resume_workarounds_pchlan();
+    }
+    if config.wol_phy_armed {
+        let _ = ops.phy_hardware_reset();
+        let mut status = 0;
+        if em_disable_phy_wakeup(ops, wol_phy_armed, Some(&mut status)).is_err() {
+            log::warn!("e1000: unable to clear PHY wake state on resume");
+        } else if status != 0 {
+            log::info!("e1000: PHY wake status {status:#06x}");
+        }
+    }
+    if !config.vf && config.mac >= E1000MacType::I82544 {
+        let wake_status = io.read_register(E1000_WUS)?;
+        if !config.wol_phy_wakeup && wake_status != 0 {
+            log::info!("e1000: MAC wake status {wake_status:#010x}");
+        }
+        io.write_register(E1000_WUFC, 0)?;
+        io.write_register(E1000_WUC, 0)?;
+        io.write_register(E1000_WUS, u32::MAX)?;
+    }
+    ops.clear_pme();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeMap;
@@ -4795,6 +4871,9 @@ mod tests {
         saved_on_disable: Vec<u16>,
         acquired: usize,
         released: usize,
+        resume_pch: usize,
+        phy_resets: usize,
+        pme_clears: usize,
     }
 
     #[derive(Default)]
@@ -5010,6 +5089,32 @@ mod tests {
         fn disable_pci_busmaster(&mut self) -> DevResult {
             self.busmaster_disables += 1;
             Ok(())
+        }
+    }
+    impl EmSuspendOps for EnableWakeMock {
+        fn stop_vf_retries(&mut self) {
+            self.actions.push("vf_stop");
+        }
+        fn release_manageability(&mut self) -> DevResult {
+            self.actions.push("release_manage");
+            Ok(())
+        }
+        fn release_hardware_control(&mut self) -> DevResult {
+            self.actions.push("release_control");
+            Ok(())
+        }
+    }
+    impl EmResumeOps for PhyWakeMock {
+        fn resume_workarounds_pchlan(&mut self) -> DevResult {
+            self.resume_pch += 1;
+            Ok(())
+        }
+        fn phy_hardware_reset(&mut self) -> DevResult {
+            self.phy_resets += 1;
+            Ok(())
+        }
+        fn clear_pme(&mut self) {
+            self.pme_clears += 1;
         }
     }
     impl EmSleepPowerOps for SleepMock {
@@ -5241,6 +5346,64 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn suspend_shutdown_and_resume_keep_power_cleanup_order() {
+        let mut io = RegisterMock::default();
+        let mut ops = EnableWakeMock::default();
+        let config = EmEnableWakeConfig {
+            mac: E1000MacType::I82540,
+            vf: true,
+            has_pme_d3_hot: true,
+            wol_capabilities: 0,
+            wol_enabled: 0,
+            management_enabled: false,
+            wol_phy_wakeup: false,
+            wol_phy_armed: false,
+            suspend_link_powered_down: false,
+            media: EmMediaType::Copper,
+            phy_igp3: false,
+            multicast_count: 0,
+            mc_filter_type: 0,
+            mac_address: [0; 6],
+        };
+        em_if_suspend(&mut io, &mut ops, config).unwrap();
+        assert_eq!(
+            ops.actions,
+            ["vf_stop", "release_manage", "release_control"]
+        );
+        ops.actions.clear();
+        em_if_shutdown(&mut io, &mut ops, config);
+        assert_eq!(
+            ops.actions,
+            ["vf_stop", "release_manage", "release_control"]
+        );
+
+        let mut phy = PhyWakeMock {
+            enabled_state: BM_WUC_ENABLE_BIT | BM_WUC_HOST_WU_BIT,
+            ..PhyWakeMock::default()
+        };
+        phy.regs.insert((BM_WUC_PAGE, BM_WUS), 0x0040);
+        let mut io = RegisterMock::default();
+        io.0.insert(E1000_WUS, 0x55);
+        let mut armed = true;
+        em_if_resume(
+            &mut io,
+            &mut phy,
+            EmResumeConfig {
+                mac: E1000MacType::PchLpt,
+                vf: false,
+                wol_phy_armed: true,
+                wol_phy_wakeup: true,
+            },
+            &mut armed,
+        )
+        .unwrap();
+        assert!(!armed);
+        assert_eq!((phy.resume_pch, phy.phy_resets, phy.pme_clears), (1, 1, 1));
+        assert_eq!(io.0[&E1000_WUFC], 0);
+        assert_eq!(io.0[&E1000_WUS], u32::MAX);
     }
 
     #[test]
