@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{CMD_ASYNC, CMD_WANT_RESPONSE, CommandError, EncodedCommand, HostCommand};
+use crate::{CMD_WANT_RESPONSE, CommandError, EncodedCommand, HostCommand};
 
 pub const BT_CONFIG_COMMAND: u8 = 0x9b;
 pub const BT_COEX_WIFI: u32 = 3;

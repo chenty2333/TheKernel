@@ -123,9 +123,6 @@ fn is_command_response(id: u32) -> bool {
             | 0x01d2
             | MCAST_FILTER
             | DATA_PATH_DQA
-            | DATA_PATH_QCFG
-            | DATA_PATH_BAID
-            | DATA_PATH_SECURITY
             | DATA_PATH_TLC
             | DATA_PATH_RLC
             | DATA_PATH_NO_DATA
@@ -144,11 +141,9 @@ fn is_command_response(id: u32) -> bool {
             | CHANNEL_SWITCH
             | SESSION_PROTECTION_NOTIF
             | UAPSD_MISBEHAVING
-            | MCC_CHUB_UPDATE
             | TIME_EVENT_NOTIFICATION
             | MISSED_BEACONS
             | MFUART_LOAD
-            | STATISTICS
             | DTS_MEASUREMENT
             | DEBUG_LOG
             | BT_PROFILE

@@ -6,14 +6,14 @@
 use alloc::vec::Vec;
 use core::{
     ptr::NonNull,
-    sync::atomic::{Ordering, fence},
+    sync::atomic::{AtomicBool, Ordering, fence},
 };
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_iwx::{
-    AX211_DEVICE_ID, AttachAllocationError, DeviceFamily, DmaAllocator, DmaError, DmaRegion,
-    INTEL_VENDOR_ID, IwxAttachResources, RuntimeConfig, allocate_attach_resources, lookup_config,
-    matches_pci_device,
+    AX211_DEVICE_ID, AttachAllocationError, DeviceConfig, DeviceFamily, DmaAllocator, DmaError,
+    DmaRegion, FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IwxAttachResources,
+    RuntimeConfig, allocate_attach_resources, lookup_config, matches_pci_device,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -23,7 +23,7 @@ use crate::drivers::BusProbeResult;
 
 const CSR_HW_REV: usize = 0x028;
 const CSR_HW_RF_ID: usize = 0x09c;
-const CSR_HW_RFID_TYPE_MASK: u32 = 0x0fff_000;
+const CSR_HW_RFID_TYPE_MASK: u32 = 0x00ff_f000;
 const CSR_HW_RFID_TYPE_SHIFT: u32 = 12;
 const RF_TYPE_GF: u16 = 0x10d;
 const SPECIAL_BZ_DEVICE: u16 = 0x7740;
@@ -120,8 +120,25 @@ impl DmaAllocator for PlatformDmaAllocator {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Bdf(u8, u8, u8);
 
-static ATTACHED_DMA: Mutex<Vec<(Bdf, IwxAttachResources<PlatformDmaRegion>)>> =
-    Mutex::new(Vec::new());
+struct AttachedDevice {
+    bdf: Bdf,
+    family: DeviceFamily,
+    config: DeviceConfig,
+    bar_base: usize,
+    bar_size: usize,
+    resources: IwxAttachResources<PlatformDmaRegion>,
+    firmware: Option<Result<FirmwareBundle, FirmwareRequestError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirmwareRequestError {
+    UcodeMissing,
+    UcodeInvalid(FirmwareError),
+    PnvmMissing,
+}
+
+static ATTACHED_DMA: Mutex<Vec<AttachedDevice>> = Mutex::new(Vec::new());
+static ROOTFS_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 fn pci_match_decision(vendor_id: u16, device_id: u16, rf_id: Option<u32>) -> bool {
     if !matches_pci_device(vendor_id, device_id) {
@@ -151,10 +168,13 @@ fn device_family(device_id: u16) -> Option<DeviceFamily> {
 fn allocate_resources(
     bdf: DeviceFunction,
     family: DeviceFamily,
+    config: DeviceConfig,
+    bar_base: usize,
+    bar_size: usize,
 ) -> Result<(), AttachAllocationError> {
     let key = Bdf(bdf.bus, bdf.device, bdf.function);
     let mut attached = ATTACHED_DMA.lock();
-    if attached.iter().any(|(existing, _)| *existing == key) {
+    if attached.iter().any(|entry| entry.bdf == key) {
         return Ok(());
     }
     let resources = allocate_attach_resources(&mut PlatformDmaAllocator, family)?;
@@ -164,8 +184,86 @@ fn allocate_resources(
             DmaError::AllocationFailed,
         )
     })?;
-    attached.push((key, resources));
+    attached.push(AttachedDevice {
+        bdf: key,
+        family,
+        config,
+        bar_base,
+        bar_size,
+        resources,
+        firmware: None,
+    });
     Ok(())
+}
+
+fn register_rootfs_firmware_callback() {
+    if axdriver_base::firmware::rootfs_ready() {
+        stage_rootfs_firmware();
+        return;
+    }
+    if ROOTFS_CALLBACK_REGISTERED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if !axdriver_base::firmware::on_rootfs_ready(stage_rootfs_firmware) {
+        ROOTFS_CALLBACK_REGISTERED.store(false, Ordering::Release);
+        warn!("iwx: rootfs-ready callback table is full; firmware was not registered");
+    }
+}
+
+fn stage_rootfs_firmware() {
+    const UC_MAX: usize = 4 * 1024 * 1024;
+    const PNVM_MAX: usize = 2 * 1024 * 1024;
+    let pending: Vec<(Bdf, DeviceConfig)> = {
+        let devices = ATTACHED_DMA.lock();
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(devices.len()).is_err() {
+            warn!("iwx: could not allocate rootfs firmware staging list");
+            return;
+        }
+        pending.extend(
+            devices
+                .iter()
+                .filter(|device| device.firmware.is_none())
+                .map(|device| (device.bdf, device.config)),
+        );
+        pending
+    };
+    for (bdf, config) in pending {
+        let firmware = config.firmware();
+        let result = match axdriver_base::firmware::request(firmware.firmware, UC_MAX) {
+            None => Err(FirmwareRequestError::UcodeMissing),
+            Some(bytes) => match FirmwareImage::parse(&bytes) {
+                Err(error) => Err(FirmwareRequestError::UcodeInvalid(error)),
+                Ok(image) => {
+                    let pnvm = if image.pnvm.is_some() || firmware.pnvm.is_none() {
+                        Ok(None)
+                    } else {
+                        axdriver_base::firmware::request(firmware.pnvm.unwrap(), PNVM_MAX)
+                            .map(Some)
+                            .ok_or(FirmwareRequestError::PnvmMissing)
+                    };
+                    pnvm.map(|pnvm_file| FirmwareBundle { image, pnvm_file })
+                }
+            },
+        };
+        let mut devices = ATTACHED_DMA.lock();
+        if let Some(device) = devices.iter_mut().find(|device| device.bdf == bdf) {
+            match &result {
+                Ok(bundle) => info!(
+                    "iwx: {bdf:?}: staged firmware version {:?} ({:?}); BAR0 {:#x}+{:#x}, {} TX \
+                     queues and {} RX buffers retained",
+                    bundle.image.api,
+                    device.family,
+                    device.bar_base,
+                    device.bar_size,
+                    device.resources.tx_queues.len(),
+                    device.resources.rx_queue.buffers.len(),
+                ),
+                Err(error) => warn!("iwx: {bdf:?}: firmware staging failed: {error:?}"),
+            }
+            device.firmware = Some(result);
+        }
+    }
 }
 
 /// Apply `iwx_match()` to one PCI function, including the BZ/GF runtime RF check.
@@ -251,10 +349,12 @@ pub(crate) fn probe(
                 subsystem,
             );
             if let Some(family) = device_family(info.device_id) {
-                if let Err(error) = allocate_resources(bdf, family) {
+                if let Err(error) = allocate_resources(bdf, family, selected, base, bar.1 as usize)
+                {
                     warn!("iwx: {bdf}: attach DMA allocation failed: {error:?}");
                     return BusProbeResult::Claimed;
                 }
+                register_rootfs_firmware_callback();
             }
         }
         None => warn!("iwx: {bdf}: matched PCI function has no runtime iwx config"),

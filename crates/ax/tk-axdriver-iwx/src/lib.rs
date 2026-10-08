@@ -32,6 +32,7 @@ mod nic;
 mod notif;
 mod nvm;
 mod phy;
+mod pm;
 mod power;
 mod queue;
 mod rate;
@@ -51,6 +52,7 @@ mod statistics;
 mod task;
 mod tx;
 mod tx_completion;
+mod tx_start;
 
 pub use alive::{
     ALIVE_STATUS_OK, ALIVE_V4_BYTES, ALIVE_V5_BYTES, ALIVE_V6_BYTES, AliveError, AliveInfo,
@@ -183,6 +185,10 @@ pub use phy::{
     RLC_CONFIG_COMMAND, RLC_CONFIG_VERSION, phy_context_command, rlc_config_command,
     update_phy_context,
 };
+pub use pm::{
+    Activation, ActivationAction, InitTaskAction, InitTaskState, ResumeAction, WakeAction,
+    WakeError, activation_actions, resume_device, run_init_task, wakeup_device,
+};
 pub use power::{
     BEACON_FILTER_COMMAND, BEACON_FILTER_CONFIG_BYTES, BeaconFilterError, BeaconFilterState,
     MAC_PM_POWER_TABLE_COMMAND, POWER_ADVANCE_PM_ENABLE, POWER_KEEP_ALIVE_PERIOD_SEC,
@@ -264,8 +270,9 @@ pub use startup::{
     parse_mcc_update_response, soc_configuration_command, temperature_threshold_command,
 };
 pub use state::{
-    AssociationState, AssociationStep, AuthError, AuthRequest, RunRequest, authenticate,
-    deauthenticate, run_association, stop_association,
+    AssociationState, AssociationStep, AuthError, AuthRequest, DeferredTask, RunRequest,
+    StateAction, StateMachine, TransitionOutcome, WifiState, authenticate, deauthenticate,
+    queue_state_change, run_association, run_state_task, stop_association,
 };
 pub use station::{
     ADD_STA_COMMAND, FlushedQueue, REMOVE_STA_COMMAND, STA_FLAG_AGG_DENSITY_MASK,
@@ -291,4 +298,8 @@ pub use tx_completion::{
     CompressedBaNotification, CompressedBaTfd, TX_RESPONSE_HEADER_BYTES, TX_STATUS_DIRECT_DONE,
     TX_STATUS_MASK, TX_STATUS_SUCCESS, TxCompletionError, TxStatusNotification,
     parse_compressed_ba, parse_tx_status,
+};
+pub use tx_start::{
+    ETHERNET_HEADER_BYTES, MFP_LEAVE_TIMEOUT_NS, MfpLeaveAction, MfpLeaveResult, TxStartReport,
+    TxStartState, mfp_leave, start_transmit,
 };

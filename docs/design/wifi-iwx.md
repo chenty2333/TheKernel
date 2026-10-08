@@ -101,6 +101,13 @@ Critical-temperature handling, matching time-event completion, UAPSD disable,
 session-protection completion, and station-only channel-switch recovery now
 have explicit state-policy updates.
 
+The netif TX scheduler keeps management traffic eligible outside RUN, blocks
+data on queue-full/flush/management-only state, preserves encapsulation and
+node-release error paths, and retains the 500ms MFP leave wait.
+
+Queued init recovery, generation checks, suspend/resume, and wakeup paths now
+preserve source lock/unlock and interface-state policy.
+
 The static PCI probe chain now uses OpenBSD's complete iwx product list and
 its BZ/Wi-Fi-6E RF filter, then applies the runtime subsystem/MAC/RF table.
 Matched functions are claimed, but the full hardware-to-wlan0 attach adapter is

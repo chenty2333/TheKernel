@@ -8,8 +8,8 @@
 use alloc::vec::Vec;
 
 use crate::{
-    DeviceFamily, DmaAllocator, DmaError, DmaRegion, IctError, InterruptCauseTable, RingError,
-    RxRing, TxRing, allocate_rx_ring, allocate_tx_ring_for_family,
+    DeviceFamily, DmaAllocator, DmaError, DmaRegion, InterruptCauseTable, RingError, RxRing,
+    TxRing, allocate_rx_ring, allocate_tx_ring_for_family,
 };
 
 pub const PCI_TX_QUEUE_COUNT: usize = 10;
