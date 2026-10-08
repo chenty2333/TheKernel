@@ -31,13 +31,14 @@
 //!
 //! # Where the facts come from
 //!
-//! Linux v6.12 `drivers/net/ethernet/intel/igc/` (tag `v6.12`, commit
-//! `adc218676eef25575469234709c2d87185ca223a`): `igc_regs.h` for offsets,
-//! `igc_defines.h` for bit values and field masks, `igc_base.h` for the
-//! descriptor-control bits, `igc.h` for the ring thresholds, and `igc_main.c`
-//! / `igc_base.c` / `igc_mac.c` / `igc_phy.c` / `igc_nvm.c` for the sequences
-//! that read and write them.  Facts only; no code is copied.  The vendor id
-//! lives in [`super::ids`].
+//! This named table began as register facts from Linux v6.12
+//! `drivers/net/ethernet/intel/igc/` (tag `v6.12`, commit
+//! `adc218676eef25575469234709c2d87185ca223a`). The live FreeBSD IGC queue
+//! path uses a different register window for queue 0; queue offsets in this
+//! table now follow FreeBSD `sys/dev/igc/igc_regs.h` at commit
+//! `c2b7fe4a9e94a0edba9dd2772874928b565c4f9e`, and the queue initialization
+//! sequence is translated from `if_igc.c`. Facts only; no C code is copied
+//! into this register map. The vendor id lives in [`super::ids`].
 //!
 //! # What is deliberately not in the table
 //!
@@ -46,11 +47,11 @@
 //! register is missing should find the answer here rather than assume an
 //! oversight:
 //!
-//! * **RSS** (`IGC_MRQC`, `IGC_RETA`, `IGC_RSSRK`, `IGC_RXCSUM`).  Linux's
-//!   `igc_setup_mrqc` programs all of them, for many queues and a random hash
-//!   key.  This driver uses one queue and does not hash, so it programs none
-//!   of them, and the RX descriptor's RSS and checksum words are carried
-//!   through as raw values rather than interpreted.
+//! * **RSS and checksum offload** (`IGC_MRQC`, `IGC_RETA`, `IGC_RSSRK`).
+//!   `if_igc.c` supports many queues and a random RSS key. This driver uses
+//!   one queue and disables RX checksum offload, so it does not program the
+//!   RSS registers; RX writeback metadata is parsed but not exported through
+//!   the current `NetDriverOps` interface.
 //! * **The multicast table array and the unicast/multicast hash tables**
 //!   (`IGC_MTA`, `IGC_UTA`).  Linux zeroes 128 dwords of each in
 //!   `igc_init_hw_base`.  This driver does not: they hold whatever reset left
@@ -103,15 +104,13 @@ use core::sync::atomic::{Ordering, compiler_fence};
 ///
 /// The window is not the BAR: it is the part of the BAR this driver maps, and
 /// every access is checked against it.  It is sized to contain every register
-/// the driver names -- the highest is `IGC_TXDCTL(0)` at `0x0e028` -- with
+/// the driver names -- the highest is `IGC_RAH(0)` at `0x05404` -- with
 /// room to spare, and the probe refuses to run at all when the
 /// firmware-assigned BAR is smaller than this.
 ///
 /// The BAR's true size is not a fact any source available here establishes:
-/// Linux's `igc` maps `pci_resource_len(pdev, 0)` (`igc_main.c:6991-6992`) and
-/// never states a size, and the register offsets it names reach `0x12594`
-/// (`IGC_PTM_TDELAY`, `igc_regs.h:287`), so the only lower bound this project
-/// can derive is "bigger than the registers someone uses".  A window of 64 KiB
+/// FreeBSD's `if_igc` allocates BAR0 but does not state a fixed size. A window
+/// of 64 KiB
 /// is a chosen bound, not a measured one, and the probe reports the BAR size
 /// beside it.
 pub const WINDOW_BYTES: usize = 0x1_0000;
@@ -408,7 +407,6 @@ impl Register {
 /// descriptor ring, plus the identify registers the probe reads.  The module
 /// documentation lists what is deliberately absent and why.
 pub const NAMED: &[Register] = &[
-    // -- identity ---------------------------------------------------------
     Register::read_write(
         "IGC_CTRL",
         0x00000,
@@ -492,6 +490,63 @@ pub const NAMED: &[Register] = &[
          with I225_RXPBSIZE_DEFAULT (igc_defines.h:399)",
     ),
     Register::read_write(
+        "IGC_RDBAL(0)",
+        0x02800,
+        Group::Receive,
+        Meaning::None,
+        "the low 32 bits of the receive descriptor ring's bus address",
+        "FreeBSD igc_regs.h:100 (IGC_RDBAL(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
+    Register::read_write(
+        "IGC_RDBAH(0)",
+        0x02804,
+        Group::Receive,
+        Meaning::None,
+        "the high 32 bits of the receive descriptor ring's bus address",
+        "FreeBSD igc_regs.h:102 (IGC_RDBAH(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
+    Register::read_write(
+        "IGC_RDLEN(0)",
+        0x02808,
+        Group::Receive,
+        Meaning::None,
+        "the length of the receive descriptor ring in bytes",
+        "FreeBSD igc_regs.h:104 (IGC_RDLEN(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
+    Register::read_write(
+        "IGC_SRRCTL(0)",
+        0x0280c,
+        Group::Receive,
+        Meaning::None,
+        "the split-receive control for queue 0: buffer size and descriptor type",
+        "FreeBSD igc_regs.h:106 (IGC_SRRCTL(_n)); programmed by if_igc.c igc_initialize_receive_unit",
+    ),
+    Register::read_write(
+        "IGC_RDH(0)",
+        0x02810,
+        Group::Receive,
+        Meaning::None,
+        "the receive descriptor head; software resets it to zero when it configures the ring",
+        "FreeBSD igc_regs.h:108 (IGC_RDH(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
+    Register::read_write(
+        "IGC_RDT(0)",
+        0x02818,
+        Group::Receive,
+        Meaning::None,
+        "the receive descriptor tail: the boundary between descriptors the hardware owns and \
+         descriptors the driver owns",
+        "FreeBSD igc_regs.h:110 (IGC_RDT(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
+    Register::read_write(
+        "IGC_RXDCTL(0)",
+        0x02828,
+        Group::Receive,
+        Meaning::None,
+        "the receive queue's prefetch and write-back thresholds and its queue-enable bit",
+        "FreeBSD igc_regs.h:112 (IGC_RXDCTL(_n)); written by if_igc.c igc_initialize_receive_unit",
+    ),
+    Register::read_write(
         "IGC_TXPBS",
         0x03404,
         Group::Identity,
@@ -500,6 +555,62 @@ pub const NAMED: &[Register] = &[
          default at probe",
         "igc_regs.h:21 (IGC_TXPBS, \"Tx Packet Buffer Size - RW\"); written by igc_main.c:7098 \
          with I225_TXPBSIZE_DEFAULT (igc_defines.h:400)",
+    ),
+    Register::read_write(
+        "IGC_TDBAL(0)",
+        0x03800,
+        Group::Transmit,
+        Meaning::None,
+        "the low 32 bits of the transmit descriptor ring's bus address",
+        "FreeBSD igc_regs.h:116 (IGC_TDBAL(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
+    Register::read_write(
+        "IGC_TDBAH(0)",
+        0x03804,
+        Group::Transmit,
+        Meaning::None,
+        "the high 32 bits of the transmit descriptor ring's bus address",
+        "FreeBSD igc_regs.h:118 (IGC_TDBAH(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
+    Register::read_write(
+        "IGC_TDLEN(0)",
+        0x03808,
+        Group::Transmit,
+        Meaning::None,
+        "the length of the transmit descriptor ring in bytes",
+        "FreeBSD igc_regs.h:120 (IGC_TDLEN(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
+    Register::read_write(
+        "IGC_TDH(0)",
+        0x03810,
+        Group::Transmit,
+        Meaning::None,
+        "the transmit descriptor head; software resets it to zero when it configures the ring",
+        "FreeBSD igc_regs.h:122 (IGC_TDH(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
+    Register::read_write(
+        "IGC_TDT(0)",
+        0x03818,
+        Group::Transmit,
+        Meaning::None,
+        "the transmit descriptor tail: writing it is what tells the hardware a frame is ready",
+        "FreeBSD igc_regs.h:124 (IGC_TDT(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
+    Register::read_write(
+        "IGC_TXDCTL(0)",
+        0x03828,
+        Group::Transmit,
+        Meaning::None,
+        "the transmit queue's prefetch and write-back thresholds and its queue-enable bit",
+        "FreeBSD igc_regs.h:126 (IGC_TXDCTL(_n)); written by if_igc.c igc_initialize_transmit_unit",
+    ),
+    Register::read_write(
+        "IGC_RXCSUM",
+        0x05000,
+        Group::Receive,
+        Meaning::None,
+        "the receive checksum offload control word; the single-queue path disables offload",
+        "igc_regs.h:109 (IGC_RXCSUM); programmed by if_igc.c igc_initialize_receive_unit",
     ),
     Register::read_write(
         "IGC_RLPML",
@@ -526,113 +637,6 @@ pub const NAMED: &[Register] = &[
         Meaning::ReceiveAddressHigh,
         "bytes 4..5 of the station address and the RAH.AV bit that says the filter entry is armed",
         "igc_regs.h:115 (IGC_RAH(_n)); read by igc_nvm.c:139 igc_read_mac_addr",
-    ),
-    // -- receive ----------------------------------------------------------
-    Register::read_write(
-        "IGC_RDBAL(0)",
-        0x0c000,
-        Group::Receive,
-        Meaning::None,
-        "the low 32 bits of the receive descriptor ring's bus address",
-        "igc_regs.h:101 (IGC_RDBAL(_n)); written by igc_main.c:625 igc_configure_rx_ring",
-    ),
-    Register::read_write(
-        "IGC_RDBAH(0)",
-        0x0c004,
-        Group::Receive,
-        Meaning::None,
-        "the high 32 bits of the receive descriptor ring's bus address",
-        "igc_regs.h:102 (IGC_RDBAH(_n)); written by igc_main.c:625 igc_configure_rx_ring",
-    ),
-    Register::read_write(
-        "IGC_RDLEN(0)",
-        0x0c008,
-        Group::Receive,
-        Meaning::None,
-        "the length of the receive descriptor ring in bytes",
-        "igc_regs.h:103 (IGC_RDLEN(_n)); written by igc_main.c:625 igc_configure_rx_ring",
-    ),
-    Register::read_write(
-        "IGC_SRRCTL(0)",
-        0x0c00c,
-        Group::Receive,
-        Meaning::None,
-        "the split-receive control for queue 0: buffer size and descriptor type",
-        "igc_regs.h:99 (IGC_SRRCTL(_n)); programmed by igc_main.c:625 igc_configure_rx_ring",
-    ),
-    Register::read_write(
-        "IGC_RDH(0)",
-        0x0c010,
-        Group::Receive,
-        Meaning::None,
-        "the receive descriptor head; software resets it to zero when it configures the ring",
-        "igc_regs.h:104 (IGC_RDH(_n)); written by igc_main.c:625 igc_configure_rx_ring",
-    ),
-    Register::read_write(
-        "IGC_RDT(0)",
-        0x0c018,
-        Group::Receive,
-        Meaning::None,
-        "the receive descriptor tail: the boundary between descriptors the hardware owns and \
-         descriptors the driver owns",
-        "igc_regs.h:105 (IGC_RDT(_n)); written by igc_main.c:2229 igc_alloc_rx_buffers",
-    ),
-    Register::read_write(
-        "IGC_RXDCTL(0)",
-        0x0c028,
-        Group::Receive,
-        Meaning::None,
-        "the receive queue's prefetch and write-back thresholds and its queue-enable bit",
-        "igc_regs.h:106 (IGC_RXDCTL(_n)); written by igc_main.c:625 igc_configure_rx_ring",
-    ),
-    // -- transmit ---------------------------------------------------------
-    Register::read_write(
-        "IGC_TDBAL(0)",
-        0x0e000,
-        Group::Transmit,
-        Meaning::None,
-        "the low 32 bits of the transmit descriptor ring's bus address",
-        "igc_regs.h:121 (IGC_TDBAL(_n)); written by igc_main.c:728 igc_configure_tx_ring",
-    ),
-    Register::read_write(
-        "IGC_TDBAH(0)",
-        0x0e004,
-        Group::Transmit,
-        Meaning::None,
-        "the high 32 bits of the transmit descriptor ring's bus address",
-        "igc_regs.h:122 (IGC_TDBAH(_n)); written by igc_main.c:728 igc_configure_tx_ring",
-    ),
-    Register::read_write(
-        "IGC_TDLEN(0)",
-        0x0e008,
-        Group::Transmit,
-        Meaning::None,
-        "the length of the transmit descriptor ring in bytes",
-        "igc_regs.h:123 (IGC_TDLEN(_n)); written by igc_main.c:728 igc_configure_tx_ring",
-    ),
-    Register::read_write(
-        "IGC_TDH(0)",
-        0x0e010,
-        Group::Transmit,
-        Meaning::None,
-        "the transmit descriptor head; software resets it to zero when it configures the ring",
-        "igc_regs.h:124 (IGC_TDH(_n)); written by igc_main.c:728 igc_configure_tx_ring",
-    ),
-    Register::read_write(
-        "IGC_TDT(0)",
-        0x0e018,
-        Group::Transmit,
-        Meaning::None,
-        "the transmit descriptor tail: writing it is what tells the hardware a frame is ready",
-        "igc_regs.h:125 (IGC_TDT(_n)); written by igc_main.c:1316 igc_tx_map",
-    ),
-    Register::read_write(
-        "IGC_TXDCTL(0)",
-        0x0e028,
-        Group::Transmit,
-        Meaning::None,
-        "the transmit queue's prefetch and write-back thresholds and its queue-enable bit",
-        "igc_regs.h:126 (IGC_TXDCTL(_n)); written by igc_main.c:728 igc_configure_tx_ring",
     ),
 ];
 

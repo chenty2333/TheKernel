@@ -35,7 +35,7 @@ fn every_named_register_is_inside_the_mapped_window() {
             register.name()
         );
     }
-    assert_eq!(NAMED_SPAN, 0x0e02c, "the highest named register end");
+    assert_eq!(NAMED_SPAN, 0x05408, "the highest named register end");
 }
 
 #[test]
@@ -156,21 +156,22 @@ fn the_table_names_exactly_the_registers_the_three_phases_need() {
         ("IGC_RXPBS", 0x02404, Access::ReadWrite),
         ("IGC_TXPBS", 0x03404, Access::ReadWrite),
         ("IGC_RLPML", 0x05004, Access::ReadWrite),
+        ("IGC_RXCSUM", 0x05000, Access::ReadWrite),
         ("IGC_RAL(0)", 0x05400, Access::ReadOnly),
         ("IGC_RAH(0)", 0x05404, Access::ReadOnly),
-        ("IGC_RDBAL(0)", 0x0c000, Access::ReadWrite),
-        ("IGC_RDBAH(0)", 0x0c004, Access::ReadWrite),
-        ("IGC_RDLEN(0)", 0x0c008, Access::ReadWrite),
-        ("IGC_SRRCTL(0)", 0x0c00c, Access::ReadWrite),
-        ("IGC_RDH(0)", 0x0c010, Access::ReadWrite),
-        ("IGC_RDT(0)", 0x0c018, Access::ReadWrite),
-        ("IGC_RXDCTL(0)", 0x0c028, Access::ReadWrite),
-        ("IGC_TDBAL(0)", 0x0e000, Access::ReadWrite),
-        ("IGC_TDBAH(0)", 0x0e004, Access::ReadWrite),
-        ("IGC_TDLEN(0)", 0x0e008, Access::ReadWrite),
-        ("IGC_TDH(0)", 0x0e010, Access::ReadWrite),
-        ("IGC_TDT(0)", 0x0e018, Access::ReadWrite),
-        ("IGC_TXDCTL(0)", 0x0e028, Access::ReadWrite),
+        ("IGC_RDBAL(0)", 0x02800, Access::ReadWrite),
+        ("IGC_RDBAH(0)", 0x02804, Access::ReadWrite),
+        ("IGC_RDLEN(0)", 0x02808, Access::ReadWrite),
+        ("IGC_SRRCTL(0)", 0x0280c, Access::ReadWrite),
+        ("IGC_RDH(0)", 0x02810, Access::ReadWrite),
+        ("IGC_RDT(0)", 0x02818, Access::ReadWrite),
+        ("IGC_RXDCTL(0)", 0x02828, Access::ReadWrite),
+        ("IGC_TDBAL(0)", 0x03800, Access::ReadWrite),
+        ("IGC_TDBAH(0)", 0x03804, Access::ReadWrite),
+        ("IGC_TDLEN(0)", 0x03808, Access::ReadWrite),
+        ("IGC_TDH(0)", 0x03810, Access::ReadWrite),
+        ("IGC_TDT(0)", 0x03818, Access::ReadWrite),
+        ("IGC_TXDCTL(0)", 0x03828, Access::ReadWrite),
     ];
     assert_eq!(expected.len(), NAMED.len(), "{NAMED:#?}");
     for (name, offset, access) in expected {
@@ -638,9 +639,9 @@ fn a_register_is_named_by_its_linux_spelling() {
     assert!(named("IGC_RETA(0)").is_none());
     assert!(named("igc_status").is_none(), "names are exact");
     assert_eq!(
-        at_offset(0x0c018).unwrap().name(),
+        at_offset(0x02818).unwrap().name(),
         "IGC_RDT(0)",
         "the table is the only way from an offset back to a register"
     );
-    assert!(at_offset(0x0c01c).is_none());
+    assert!(at_offset(0x0281c).is_none());
 }

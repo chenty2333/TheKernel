@@ -1,9 +1,9 @@
 //! The NIC: two descriptor rings, and the `NetDriverOps` implementation.
 //!
 //! This is the phase that makes the device usable by the network stack.  It
-//! configures one transmit and one receive ring the way
-//! `igc_configure_tx_ring` / `igc_configure_rx_ring` / `igc_configure` do
-//! (`igc_main.c:625`, `:728`, `:4020`), fills the receive ring, and implements
+//! configures one transmit and one receive ring through the translated
+//! FreeBSD `igc_initialize_transmit_unit` / `igc_initialize_receive_unit`
+//! from `if_igc.c`, fills the receive ring, and implements
 //! the buffer handover the stack expects: the stack asks for a transmit buffer,
 //! writes a frame into it, hands it back, and later hands receive buffers back
 //! for the hardware to use again.
@@ -51,30 +51,72 @@ use super::{
     bringup::StationAddress,
     desc::{
         BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES,
-        RX_HEADER_BYTES, RxRing, TxRing,
+        RxRing, TxRing,
     },
+    if_igc::{IgcMainIo, IgcRssIo, MainError, RingDma, UnitConfig},
     txrx::{
         RxRingState, TxChecksum, TxIpType, TxPacketInfo, TxProtocol, TxRingState, TxRxError,
         TxRxIo, TxSegment, igc_isc_rxd_available, igc_isc_rxd_pkt_get, igc_isc_rxd_refill,
         igc_isc_rxd_available_from, igc_isc_txd_encap,
     },
-    regs::{
-        self, QueueControl, ReceiveControl, RingBase, RingLength, SplitReceiveControl,
-        TransmitControl,
-    },
+    regs::{self, QueueControl, RingLength},
+    if_igc::{igc_initialize_receive_unit, igc_initialize_transmit_unit},
+    mac::FlowMode,
 };
 use crate::{EthernetAddress, NetBufPtr, NetDriverOps};
 
 /// The device name the interface reports.
 pub const DEVICE_NAME: &str = "igc";
 
-/// The receive buffer size in bytes.
-///
-/// It is used in two places and in two different units, which is worth naming
-/// once: `IGC_RLPML` takes a byte count, and `SRRCTL`'s packet-size field
-/// takes kilobytes (`igc_base.h:97-99`), which
-/// `SplitReceiveControl::one_buffer` divides down to.
-const RX_PACKET_BYTES: u32 = RX_BUFFER_BYTES as u32;
+/// The register adapter used by the translated `if_igc.c` queue initializer.
+struct IgcUnitIo<'a, H: IgcHal> {
+    bus: &'a mut WindowBus<H>,
+    failed: bool,
+}
+
+impl<H: IgcHal> IgcMainIo for IgcUnitIo<'_, H> {
+    fn read(&mut self, offset: u32) -> u32 {
+        match regs::at_offset(offset).and_then(|register| self.bus.read(register)) {
+            Some(value) => value,
+            None => {
+                self.failed = true;
+                0
+            }
+        }
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        if !regs::at_offset(offset).is_some_and(|register| self.bus.write(register, value)) {
+            self.failed = true;
+        }
+    }
+
+    fn admin_status_deferred(&mut self) {
+        self.failed = true;
+    }
+
+    fn update_mc(&mut self, _addresses: &[u8], _count: u32) -> Result<(), MainError> {
+        Err(MainError::Io)
+    }
+
+    fn write_vfta(&mut self, _index: u32, _value: u32) {
+        self.failed = true;
+    }
+}
+
+impl<H: IgcHal> IgcRssIo for IgcUnitIo<'_, H> {
+    fn rss_bucket(&mut self, _bucket: usize, _queue_count: usize) -> usize {
+        0
+    }
+
+    fn rss_key(&mut self) -> [u32; 10] {
+        [0; 10]
+    }
+
+    fn rss_hash_config(&mut self) -> u32 {
+        0
+    }
+}
 
 /// The translated packet parser only needs notification hooks for metadata
 /// callbacks; this interface cannot export those values, and the descriptor
@@ -211,7 +253,7 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
         if QS < 2 || !QS.is_power_of_two() {
             return Err(DevError::InvalidParam);
         }
-        let Some(ring_length) = RingLength::new(QS, DESCRIPTOR_BYTES) else {
+        let Some(_ring_length) = RingLength::new(QS, DESCRIPTOR_BYTES) else {
             return Err(DevError::InvalidParam);
         };
 
@@ -267,12 +309,41 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
         nic.rx_memory.zero();
         // Fill the receive ring before anything can arrive, and hand it over.
         nic.fill_receive_ring();
-        // Establish the owner before any fallible register write, and prepare
-        // the descriptors before enabling the queues. Errors now use the same
-        // DMA stop discipline as ordinary teardown.
-        enable_mac(&mut nic.bus)?;
-        configure_transmit(&mut nic.bus, tx_base, ring_length)?;
-        configure_receive(&mut nic.bus, rx_base, ring_length)?;
+        // The source-derived queue initializer consumes the same ring
+        // geometry but programs the descriptor controls and checksums in the
+        // upstream order. The single-queue network API intentionally leaves
+        // RSS and checksum offload disabled.
+        let config = UnitConfig {
+            tx_rings: vec![RingDma {
+                bus_address: tx_base,
+                descriptors: QS,
+            }],
+            rx_rings: vec![RingDma {
+                bus_address: rx_base,
+                descriptors: QS,
+            }],
+            max_frame_size: 1518,
+            mtu: 1500,
+            rx_buffer_size: RX_BUFFER_BYTES as u32,
+            vlan_trunk: false,
+            disable_crc_stripping: false,
+            rx_checksum: false,
+            flow_mode: FlowMode::None,
+            multicast_filter_type: 0,
+            low_water: 0,
+            high_water: 0,
+            send_xon: true,
+        };
+        let mut io = IgcUnitIo {
+            bus: &mut nic.bus,
+            failed: false,
+        };
+        igc_initialize_transmit_unit(&mut io, &config).map_err(|_| DevError::BadState)?;
+        igc_initialize_receive_unit(&mut io, &config).map_err(|_| DevError::BadState)?;
+        if io.failed {
+            return Err(DevError::BadState);
+        }
+        drop(io);
         nic.write_receive_tail();
         Ok(nic)
     }
@@ -689,21 +760,6 @@ fn named(name: &str) -> regs::Register {
     regs::named(name).unwrap_or_else(|| panic!("{name} is not in the register table"))
 }
 
-/// Write a register, or fail.
-fn write<B: IgcBus>(bus: &mut B, name: &str, value: u32) -> DevResult {
-    let register = named(name);
-    if bus.write(register, value) {
-        Ok(())
-    } else {
-        Err(DevError::BadState)
-    }
-}
-
-/// Read a register, or fail.
-fn read<B: IgcBus>(bus: &mut B, name: &str) -> DevResult<u32> {
-    bus.read(named(name)).ok_or(DevError::BadState)
-}
-
 /// Allocate one DMA region and remember it for the teardown path.
 ///
 /// The region is allocated in whole pages, because that is the primitive the
@@ -732,71 +788,6 @@ fn allocate<H: IgcHal>(size: usize, align: usize) -> DevResult<Allocation<H>> {
         pages,
         _hal: PhantomData,
     })
-}
-
-/// Program the receive and transmit control registers
-/// (`igc_setup_rctl` and `igc_setup_tctl`, `igc_main.c:835`, `:882`), and the
-/// long-packet bound.
-fn enable_mac<H: IgcHal>(bus: &mut WindowBus<H>) -> DevResult {
-    write(bus, "IGC_RCTL", ReceiveControl::setup_value().raw())?;
-    // The long-packet bound is the size of the buffers this driver gives the
-    // hardware, not the vendor driver's jumbo bound
-    // (`MAX_JUMBO_FRAME_SIZE`, `igc_defines.h:147`): a receive limit larger
-    // than the buffer a frame is written into is a limit this driver cannot
-    // honour.
-    write(bus, "IGC_RLPML", RX_PACKET_BYTES)?;
-    let current = read(bus, "IGC_TCTL")?;
-    write(bus, "IGC_TCTL", TransmitControl::setup_value(current).raw())?;
-    Ok(())
-}
-
-/// Program the transmit ring, the way `igc_configure_tx_ring` does
-/// (`igc_main.c:728-758`).
-fn configure_transmit<H: IgcHal>(
-    bus: &mut WindowBus<H>,
-    descriptors: u64,
-    length: RingLength,
-) -> DevResult {
-    write(bus, "IGC_TXDCTL(0)", QueueControl::disabled().raw())?;
-    write(bus, "IGC_TDLEN(0)", length.bytes())?;
-    let base = RingBase::new(descriptors);
-    write(bus, "IGC_TDBAL(0)", base.low())?;
-    write(bus, "IGC_TDBAH(0)", base.high())?;
-    write(bus, "IGC_TDH(0)", 0)?;
-    write(bus, "IGC_TDT(0)", 0)?;
-    write(
-        bus,
-        "IGC_TXDCTL(0)",
-        QueueControl::transmit_defaults().with_queue_enable().raw(),
-    )?;
-    Ok(())
-}
-
-/// Program the receive ring, the way `igc_configure_rx_ring` does
-/// (`igc_main.c:625-702`).
-fn configure_receive<H: IgcHal>(
-    bus: &mut WindowBus<H>,
-    descriptors: u64,
-    length: RingLength,
-) -> DevResult {
-    write(bus, "IGC_RXDCTL(0)", QueueControl::disabled().raw())?;
-    let base = RingBase::new(descriptors);
-    write(bus, "IGC_RDBAL(0)", base.low())?;
-    write(bus, "IGC_RDBAH(0)", base.high())?;
-    write(bus, "IGC_RDLEN(0)", length.bytes())?;
-    write(bus, "IGC_RDH(0)", 0)?;
-    write(bus, "IGC_RDT(0)", 0)?;
-    write(
-        bus,
-        "IGC_SRRCTL(0)",
-        SplitReceiveControl::one_buffer(RX_PACKET_BYTES, RX_HEADER_BYTES as u32).raw(),
-    )?;
-    write(
-        bus,
-        "IGC_RXDCTL(0)",
-        QueueControl::receive_defaults().with_queue_enable().raw(),
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -947,21 +938,23 @@ mod tests {
         );
         assert_eq!(
             harness.register("IGC_TXDCTL(0)"),
-            QueueControl::transmit_defaults().with_queue_enable().raw(),
+            0x0200_0108,
+            "FreeBSD igc_initialize_transmit_unit sets only PTHRESH/HTHRESH and enable",
         );
         assert_eq!(
             harness.register("IGC_RXDCTL(0)"),
             QueueControl::receive_defaults().with_queue_enable().raw(),
         );
-        // The receive control value, and the long-packet bound the driver
-        // chose: its own buffer size, not the vendor's jumbo bound.
-        assert_eq!(harness.register("IGC_RCTL"), 0x0400_8022);
-        assert_eq!(harness.register("IGC_RLPML"), RX_BUFFER_BYTES as u32);
+        // The source initializes ordinary MTU receive control and does not
+        // write RLPML until jumbo MTU is requested.
+        assert_eq!(harness.register("IGC_RCTL"), 0x0400_8002);
+        assert_eq!(harness.register("IGC_RLPML"), 0, "source writes RLPML only for jumbo MTU");
+        assert_eq!(harness.register("IGC_RXCSUM"), 0, "single queue disables checksum offload");
         assert_eq!(harness.register("IGC_TCTL"), 0x0100_00fa);
         assert_eq!(
             harness.register("IGC_SRRCTL(0)"),
-            (4 << 8) | 2 | (1 << 25),
-            "BSIZEHDR(256) | BSIZEPKT(2 KiB) | DESCTYPE_ADV_ONEBUF",
+            2 | (1 << 25),
+            "BSIZEPKT(2 KiB) | DESCTYPE_ADV_ONEBUF",
         );
         // The tail: one short of the ring, which is what hands the filled
         // descriptors to the hardware.
