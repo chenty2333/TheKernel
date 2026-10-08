@@ -406,6 +406,69 @@ pub struct MmcCsd {
     pub write_to_read_factor: u32,
 }
 
+/// SD Configuration Register fields supported by the current SCR structure.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MmcScr {
+    pub structure: u8,
+    pub sda_version: u8,
+    pub bus_widths: u8,
+}
+
+/// SD Status register fields used by card diagnostics and erase policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MmcSdStatus {
+    pub bus_width: u8,
+    pub secured_mode: bool,
+    pub card_type: u16,
+    pub protected_area: u16,
+    pub speed_class: u8,
+    pub performance_move: u8,
+    pub allocation_unit_size: u8,
+    pub erase_size: u16,
+    pub erase_timeout: u8,
+    pub erase_offset: u8,
+}
+
+// upstream: mmc.c mmc_get_bits() for SCR and SD Status payloads
+fn data_bits(data: &[u8], start: u32, width: u32) -> u32 {
+    let mut result = 0u32;
+    for bit in 0..width {
+        let position = start + bit;
+        let byte = data.len() - 1 - (position / 8) as usize;
+        result |= u32::from((data[byte] >> (position % 8)) & 1) << bit;
+    }
+    result
+}
+
+// upstream: mmc.c mmc_app_decode_scr()
+pub fn decode_scr(data: &[u8; 8]) -> Option<MmcScr> {
+    let structure = data_bits(data, 60, 4) as u8;
+    if structure != 0 {
+        return None;
+    }
+    Some(MmcScr {
+        structure,
+        sda_version: data_bits(data, 56, 4) as u8,
+        bus_widths: data_bits(data, 48, 4) as u8,
+    })
+}
+
+// upstream: mmc.c mmc_app_decode_sd_status()
+pub fn decode_sd_status(data: &[u8; 64]) -> MmcSdStatus {
+    MmcSdStatus {
+        bus_width: data_bits(data, 510, 2) as u8,
+        secured_mode: data_bits(data, 509, 1) != 0,
+        card_type: data_bits(data, 480, 16) as u16,
+        protected_area: data_bits(data, 448, 12) as u16,
+        speed_class: data_bits(data, 440, 8) as u8,
+        performance_move: data_bits(data, 432, 8) as u8,
+        allocation_unit_size: data_bits(data, 428, 4) as u8,
+        erase_size: data_bits(data, 408, 16) as u16,
+        erase_timeout: data_bits(data, 402, 6) as u8,
+        erase_offset: data_bits(data, 400, 2) as u8,
+    }
+}
+
 const MMC_EXP: [u32; 8] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 const MMC_MANT: [u32; 16] = [
     0, 10, 12, 13, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80,
@@ -2236,6 +2299,46 @@ mod tests {
         assert_eq!(csd.capacity_bytes, (0x12345 + 1) * 512 * 1024);
         assert_eq!(csd.erase_block_sectors, 1);
         assert_eq!(csd.transfer_rate_hz, MMC_EXP[1] * 10_000 * MMC_MANT[12]);
+    }
+
+    #[test]
+    fn scr_and_sd_status_decoders_use_upstream_bit_numbering() {
+        let mut scr = [0u8; 8];
+        for (start, width, value) in [(60, 4, 0), (56, 4, 2), (48, 4, 5)] {
+            for bit in 0..width {
+                if value & (1 << bit) != 0 {
+                    let position = start + bit;
+                    scr[7 - position / 8] |= 1 << (position % 8);
+                }
+            }
+        }
+        assert_eq!(
+            decode_scr(&scr),
+            Some(MmcScr {
+                structure: 0,
+                sda_version: 2,
+                bus_widths: 5,
+            })
+        );
+        let mut status = [0u8; 64];
+        for (start, width, value) in [
+            (510, 2, 2),
+            (509, 1, 1),
+            (480, 16, 0x1234),
+            (408, 16, 0x5678),
+        ] {
+            for bit in 0..width {
+                if value & (1 << bit) != 0 {
+                    let position = start + bit;
+                    status[63 - position / 8] |= 1 << (position % 8);
+                }
+            }
+        }
+        let decoded = decode_sd_status(&status);
+        assert_eq!(decoded.bus_width, 2);
+        assert!(decoded.secured_mode);
+        assert_eq!(decoded.card_type, 0x1234);
+        assert_eq!(decoded.erase_size, 0x5678);
     }
 
     #[test]
