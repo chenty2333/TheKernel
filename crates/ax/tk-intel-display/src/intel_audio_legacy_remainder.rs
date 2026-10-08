@@ -496,6 +496,7 @@ pub fn audio_config_hdmi_pixel_clock(
         i = 1;
     }
     io.debug("Configuring HDMI audio pixel clock", crtc_clock);
+    io.debug("HDMI audio pixel clock config", CLOCKS[i].1);
     CLOCKS[i].1
 }
 
@@ -701,6 +702,22 @@ pub fn ibx_audio_codec_enable(
 mod tests {
     use super::*;
 
+    struct QuietIo;
+    impl LegacyAudioIo for QuietIo {
+        fn read32(&mut self, _register: u32) -> u32 {
+            0
+        }
+        fn write32(&mut self, _register: u32, _value: u32) {}
+        fn wait_next_vblank(&mut self, _pipe: usize) {}
+        fn eld_size(&mut self, eld: &[u8; ELD_BYTES]) -> usize {
+            eld.len()
+        }
+        fn mutex_lock(&mut self) {}
+        fn mutex_unlock(&mut self) {}
+        fn debug(&mut self, _message: &'static str, _value: u32) {}
+        fn warn(&mut self, _message: &'static str, _value: u32) {}
+    }
+
     #[test]
     fn hdmi_audio_ncts_uses_matching_deep_color_table() {
         let mut crtc = AudioCrtcState {
@@ -715,5 +732,37 @@ mod tests {
         crtc.pipe_bpp = 36;
         crtc.port_clock = TMDS_445_5M;
         assert_eq!(audio_config_hdmi_get_n(&crtc, 48_000), 5120);
+    }
+
+    #[test]
+    fn hdmi_pixel_clock_and_legacy_pipe_maps_follow_source_tables() {
+        let mut io = QuietIo;
+        assert_eq!(audio_config_hdmi_pixel_clock(&mut io, 13, 148_500), 9 << 16);
+        assert_eq!(audio_config_hdmi_pixel_clock(&mut io, 11, 297_000), 1 << 16);
+        assert_eq!(
+            ibx_audio_regs_init(
+                AudioPlatform {
+                    valleyview: true,
+                    ..AudioPlatform::default()
+                },
+                1,
+            )
+            .unwrap()
+            .hdmiw_hdmiedid,
+            VLV_DISPLAY_BASE + 0x62150
+        );
+        assert_eq!(
+            ibx_audio_regs_init(
+                AudioPlatform {
+                    pch_ibx: true,
+                    ..AudioPlatform::default()
+                },
+                0,
+            )
+            .unwrap()
+            .aud_config,
+            0xe2000
+        );
+        assert!(ibx_audio_regs_init(AudioPlatform::default(), 2).is_none());
     }
 }
