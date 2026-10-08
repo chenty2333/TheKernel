@@ -41,6 +41,6 @@
 - `iwx_fill_probe_req()` now creates bounded 802.11 probe header, SSID placeholder, rates/extended-rates, DS, VHT and shared HT IE segments (`dce823d5`).
 - UMAC scan v14/v17 requests now assemble general/dwell policy, fixed channel arrays, probe segments, direct SSID and async/background semantics (`20c30787`).
 - Reduced SCAN_CFG v5+ setup now checks the advertised firmware API and legacy broadcast station-ID compatibility (`d8c96c37`).
-- Rate-set lookup, legacy rate lookup and CCK/OFDM ACK masks with mandatory lower rates are translated (pending commit).
+- Rate-set lookup, legacy rate lookup and CCK/OFDM ACK masks with mandatory lower rates are translated (`de44cbaf`).
 - Scan probe descriptors and raw 512-byte frame data now have an exact packed-wire serializer (`8f69492b`).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
