@@ -12,8 +12,9 @@ The portable module maps DRM AUX, MMIO, power references, PPS, CPU-latency QoS,
 interrupt waits, and diagnostics to `DpAuxIo`. `kernel/src/drm/intel/dp_aux.rs`
 implements a typed A/B register and `PowerState` adapter, with bounded
 poll-based completion for the current N305 path. The native `connect` phase
-now probes the 16-byte DPCD base-capability block after a live GMBUS/HPD A/B
-result and records either revision or failure. That DPCD snapshot is
+now probes the 16-byte DPCD base-capability block through the
+`intel_dp_full::DpAuxIo` adapter after a live GMBUS/HPD A/B result and records
+either revision or failure. That DPCD snapshot is
 diagnostic/admission input only: DP bandwidth selection and link training are
 not yet called by the modeset. The adapter is external-DP only: PPS/eDP methods
 are placeholders, CPU-latency QoS has no x86 platform interface, and source

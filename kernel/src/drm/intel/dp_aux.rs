@@ -254,6 +254,81 @@ impl<R: Registers> DpAuxIo for DpAuxKernel<'_, R> {
     }
 }
 
+impl<R: Registers> intel_display::intel_dp_full::DpAuxIo for DpAuxKernel<'_, R> {
+    fn read(
+        &mut self,
+        address: u32,
+        bytes: &mut [u8],
+    ) -> Result<usize, intel_display::intel_dp_full::DpError> {
+        use intel_display::{
+            dp_aux::{AUX_NATIVE_READ, intel_dp_aux_transfer},
+            intel_dp_full::DpError,
+        };
+
+        let mut state = self.state(if self.channel == AuxChannel::A {
+            "DDI A"
+        } else {
+            "DDI B"
+        });
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let length = (bytes.len() - offset).min(16);
+            let reply = intel_dp_aux_transfer(
+                self,
+                &mut state,
+                AUX_NATIVE_READ,
+                address.saturating_add(offset as u32),
+                None,
+                &mut bytes[offset..offset + length],
+            );
+            if reply.reply != 0 || reply.bytes != length as i32 {
+                return Err(DpError::Io);
+            }
+            offset += length;
+        }
+        Ok(offset)
+    }
+
+    fn write(
+        &mut self,
+        address: u32,
+        bytes: &[u8],
+    ) -> Result<usize, intel_display::intel_dp_full::DpError> {
+        use intel_display::{
+            dp_aux::{AUX_NATIVE_WRITE, intel_dp_aux_transfer},
+            intel_dp_full::DpError,
+        };
+
+        let mut state = self.state(if self.channel == AuxChannel::A {
+            "DDI A"
+        } else {
+            "DDI B"
+        });
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let length = (bytes.len() - offset).min(16);
+            let mut reply_data = [0u8; 2];
+            let reply = intel_dp_aux_transfer(
+                self,
+                &mut state,
+                AUX_NATIVE_WRITE,
+                address.saturating_add(offset as u32),
+                Some(&bytes[offset..offset + length]),
+                &mut reply_data,
+            );
+            if reply.reply != 0 || reply.bytes != length as i32 {
+                return Err(DpError::Io);
+            }
+            offset += length;
+        }
+        Ok(offset)
+    }
+
+    fn delay_ms(&mut self, milliseconds: u32) {
+        self.sleep_ms(milliseconds);
+    }
+}
+
 pub(crate) const fn aux_platform() -> AuxPlatform {
     AuxPlatform {
         display_version: 13,
@@ -277,43 +352,14 @@ pub(crate) fn read_dpcd(
     address: u32,
     length: usize,
 ) -> Result<Vec<u8>, AuxError> {
-    use intel_display::dp_aux::{AUX_NATIVE_READ, intel_dp_aux_transfer};
+    use intel_display::intel_dp_full::DpAuxIo as SourceDpAuxIo;
 
     if length > 256 {
         return Err(AuxError::TooBig);
     }
     let mut io = DpAuxKernel::new(registers, channel, connected)?;
-    let name = if channel == AuxChannel::A {
-        "DDI A"
-    } else {
-        "DDI B"
-    };
-    let mut state = io.state(name);
     let mut data = alloc::vec![0; length];
-    let mut offset = 0;
-    while offset < length {
-        let chunk = (length - offset).min(16);
-        let mut reply_data = [0u8; 16];
-        let reply = intel_dp_aux_transfer(
-            &mut io,
-            &mut state,
-            AUX_NATIVE_READ,
-            address.saturating_add(offset as u32),
-            None,
-            &mut reply_data[..chunk],
-        );
-        if reply.reply != 0 || reply.bytes != chunk as i32 {
-            return Err(match reply.bytes {
-                -7 => AuxError::TooBig,
-                -16 => AuxError::Busy,
-                -110 => AuxError::Timeout,
-                n if n < 0 => AuxError::Io,
-                _ => AuxError::Invalid,
-            });
-        }
-        data[offset..offset + chunk].copy_from_slice(&reply_data[..chunk]);
-        offset += chunk;
-    }
+    SourceDpAuxIo::read(&mut io, address, &mut data).map_err(|_| AuxError::Io)?;
     Ok(data)
 }
 
