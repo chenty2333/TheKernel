@@ -1043,6 +1043,14 @@ impl Router {
         self.devices[slot].trigger_wireless_scan(request)
     }
 
+    pub(crate) fn abort_wireless_scan(&mut self, ifindex: u32) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].abort_wireless_scan()
+    }
+
     pub(crate) fn wireless_scan_results(
         &self,
         ifindex: u32,

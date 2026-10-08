@@ -330,6 +330,11 @@ pub fn trigger_wireless_scan(
     default_stack().trigger_wireless_scan(ifindex, request)
 }
 
+/// Abort the selected wireless interface's active foreground scan.
+pub fn abort_wireless_scan(ifindex: u32) -> AxResult {
+    default_stack().abort_wireless_scan(ifindex)
+}
+
 /// Return BSS observations collected by the wireless driver's RX path.
 pub fn wireless_scan_results(ifindex: u32) -> AxResult<alloc::vec::Vec<WirelessBssInfo>> {
     default_stack().wireless_scan_results(ifindex)

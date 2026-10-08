@@ -1422,6 +1422,13 @@ impl NetStack {
         Ok(())
     }
 
+    /// Abort a foreground scan through the selected wireless driver.
+    pub fn abort_wireless_scan(&self, ifindex: u32) -> AxResult {
+        self.service.lock().router.abort_wireless_scan(ifindex)?;
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
     /// Snapshot scan records retained from firmware RX beacon/probe notifications.
     pub fn wireless_scan_results(
         &self,

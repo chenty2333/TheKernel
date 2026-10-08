@@ -127,6 +127,11 @@ pub trait NetDriverOps: BaseDriverOps {
         Err(DevError::Unsupported)
     }
 
+    /// Abort a currently active foreground scan if the driver supports it.
+    fn abort_wireless_scan(&mut self) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
     /// Snapshot BSSes parsed from received firmware RX notifications.
     fn wireless_scan_results(&self) -> alloc::vec::Vec<WirelessBssInfo> {
         alloc::vec::Vec::new()

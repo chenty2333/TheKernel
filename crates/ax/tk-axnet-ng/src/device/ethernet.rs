@@ -661,6 +661,12 @@ impl Device for EthernetDevice {
             .map_err(Self::map_dev_error)
     }
 
+    fn abort_wireless_scan(&mut self) -> AxResult {
+        self.inner
+            .abort_wireless_scan()
+            .map_err(Self::map_dev_error)
+    }
+
     fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {
         self.inner.wireless_scan_results()
     }

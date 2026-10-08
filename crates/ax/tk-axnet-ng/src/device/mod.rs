@@ -247,6 +247,10 @@ pub trait Device: Send + Sync {
         Err(AxError::OperationNotSupported)
     }
 
+    fn abort_wireless_scan(&mut self) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
     fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {
         Vec::new()
     }

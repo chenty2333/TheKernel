@@ -23,6 +23,8 @@ const CMD_NEW_INTERFACE: u8 = 7;
 const CMD_GET_SCAN: u8 = 32;
 const CMD_TRIGGER_SCAN: u8 = 33;
 const CMD_NEW_SCAN_RESULTS: u8 = 34;
+const CMD_SCAN_ABORTED: u8 = 35;
+const CMD_ABORT_SCAN: u8 = 114;
 const CMD_GET_REG: u8 = 31;
 const ATTR_WIPHY: u16 = 1;
 const ATTR_WIPHY_NAME: u16 = 2;
@@ -56,9 +58,7 @@ const BSS_ATTR_BEACON_INTERVAL: u16 = 4;
 const BSS_ATTR_CAPABILITY: u16 = 5;
 const BSS_ATTR_INFORMATION_ELEMENTS: u16 = 6;
 const BSS_ATTR_SIGNAL_MBM: u16 = 7;
-const BSS_ATTR_STATUS: u16 = 8;
 const BSS_ATTR_SEEN_MS_AGO: u16 = 10;
-const BSS_STATUS_SEEN: u32 = 1;
 const BITRATE_ATTR_RATE: u16 = 1;
 const BITRATE_ATTR_2GHZ_SHORTPREAMBLE: u16 = 2;
 const IFTYPE_STATION: u32 = 2;
@@ -130,7 +130,12 @@ pub(super) fn handle(
     }
     if !matches!(
         request.cmd,
-        CMD_GET_WIPHY | CMD_GET_INTERFACE | CMD_GET_SCAN | CMD_TRIGGER_SCAN | CMD_GET_REG
+        CMD_GET_WIPHY
+            | CMD_GET_INTERFACE
+            | CMD_GET_SCAN
+            | CMD_TRIGGER_SCAN
+            | CMD_ABORT_SCAN
+            | CMD_GET_REG
     ) {
         return Err(AxError::OperationNotSupported);
     }
@@ -151,6 +156,21 @@ pub(super) fn handle(
             return Err(AxError::NotFound);
         }
         axnet::trigger_wireless_scan(ifindex, &scan)?;
+        return Ok(());
+    }
+    if request.cmd == CMD_ABORT_SCAN {
+        if dump {
+            return Err(AxError::InvalidInput);
+        }
+        let selectors = parse_selectors(attributes)?;
+        let ifindex = selectors.ifindex.ok_or(AxError::InvalidInput)?;
+        if !interfaces
+            .iter()
+            .any(|interface| interface.ifindex == ifindex)
+        {
+            return Err(AxError::NotFound);
+        }
+        axnet::abort_wireless_scan(ifindex)?;
         return Ok(());
     }
     let selectors = parse_selectors(attributes)?;
@@ -316,11 +336,6 @@ fn scan_bss_message(
         BSS_ATTR_SIGNAL_MBM,
         &bss.signal_mbm.to_ne_bytes(),
     );
-    push_attr(
-        &mut attributes,
-        BSS_ATTR_STATUS,
-        &BSS_STATUS_SEEN.to_ne_bytes(),
-    );
     push_attr(&mut attributes, BSS_ATTR_SEEN_MS_AGO, &0u32.to_ne_bytes());
     push_attr(&mut payload, ATTR_BSS | NLA_F_NESTED, &attributes);
     nl80211_message(request, port_id, FAMILY_ID, payload, true)
@@ -418,9 +433,16 @@ fn wiphy_message(
     );
     push_attr(&mut payload, ATTR_MAX_NUM_SCAN_SSIDS, &[1]);
     let mut supported_commands = Vec::new();
-    for (index, command) in [CMD_GET_WIPHY, CMD_GET_INTERFACE, CMD_GET_SCAN, CMD_GET_REG]
-        .into_iter()
-        .enumerate()
+    for (index, command) in [
+        CMD_GET_WIPHY,
+        CMD_GET_INTERFACE,
+        CMD_TRIGGER_SCAN,
+        CMD_ABORT_SCAN,
+        CMD_GET_SCAN,
+        CMD_GET_REG,
+    ]
+    .into_iter()
+    .enumerate()
     {
         push_attr(
             &mut supported_commands,
@@ -553,6 +575,8 @@ mod tests {
         assert_eq!(CMD_GET_SCAN, 32);
         assert_eq!(CMD_TRIGGER_SCAN, 33);
         assert_eq!(CMD_NEW_SCAN_RESULTS, 34);
+        assert_eq!(CMD_SCAN_ABORTED, 35);
+        assert_eq!(CMD_ABORT_SCAN, 114);
         assert_eq!(CMD_GET_REG, 31);
         assert_eq!(ATTR_REG_ALPHA2, 33);
         assert_eq!(ATTR_IFINDEX, 3);
@@ -848,7 +872,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(max_ssids, Some(1));
-        assert_eq!(commands, [1, 5, 32, 31]);
+        assert_eq!(commands, [1, 5, 33, 114, 32, 31]);
     }
 
     #[test]

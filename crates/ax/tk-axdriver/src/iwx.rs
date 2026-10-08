@@ -373,6 +373,10 @@ impl NetDriverOps for IwxNetDevice {
         trigger_scan(self.bdf, request).map_err(|_| DevError::Io)
     }
 
+    fn abort_wireless_scan(&mut self) -> DevResult {
+        abort_scan(self.bdf).map_err(|_| DevError::Io)
+    }
+
     fn wireless_scan_results(&self) -> Vec<axdriver_net::WirelessBssInfo> {
         let mut devices = ATTACHED_DMA.lock();
         let Some(device) = devices.iter_mut().find(|device| device.bdf == self.bdf) else {
@@ -679,6 +683,40 @@ fn pump_scan_events(device: &mut AttachedDevice) -> Result<(), ()> {
             Ok::<_, Infallible>(true)
         })
         .map_err(|_| ())?;
+    Ok(())
+}
+
+fn abort_scan(bdf: Bdf) -> Result<(), RuntimeStartError> {
+    let mut devices = ATTACHED_DMA.lock();
+    let device = devices
+        .iter_mut()
+        .find(|device| device.bdf == bdf)
+        .ok_or(RuntimeStartError::DeviceNotFound)?;
+    if !device.runtime_started {
+        return Err(RuntimeStartError::FirmwareNotReady);
+    }
+    if device.scan_cache.is_none() || device.scan_complete {
+        return Ok(());
+    }
+    let command =
+        axdriver_iwx::scan_abort_command(0, 0).map_err(|_| RuntimeStartError::Firmware)?;
+    let family = device.profile.family;
+    let (controller, cache, phy, complete) = (
+        &mut device.controller,
+        device
+            .scan_cache
+            .as_mut()
+            .ok_or(RuntimeStartError::Firmware)?,
+        &mut device.scan_phy,
+        &mut device.scan_complete,
+    );
+    controller
+        .send_encoded_command_wait(&command, None, |packet, _| {
+            observe_scan_packet(family, cache, phy, complete, packet);
+            Ok::<_, Infallible>(true)
+        })
+        .map_err(|_| RuntimeStartError::Firmware)?;
+    *complete = true;
     Ok(())
 }
 
