@@ -816,6 +816,7 @@ impl<I: AhciIo> AhciDisk<I> {
         debug_assert_eq!(offset, pending.bytes);
     }
 
+    // upstream: ahci.c ahci_timeout() + ahci_end_transaction()
     fn reap_async(&mut self) -> bool {
         let AsyncState::InFlight(mut pending) = self.async_state else {
             return false;
@@ -857,9 +858,7 @@ impl<I: AhciIo> AhciDisk<I> {
             self.async_state = AsyncState::InFlight(pending);
             return false;
         }
-        self.timeout_command();
-        let quiesced =
-            self.controller.ahci_stop_fr(&self.port) && self.controller.ahci_stop(&mut self.port);
+        let quiesced = self.timeout_command();
         self.async_state = AsyncState::Complete(BlockCompletion {
             handle: pending.handle,
             owner: pending.owner,
@@ -1737,7 +1736,7 @@ mod tests {
 
     struct FakeIo {
         registers: [u32; 128],
-        writes: [(usize, u32); 32],
+        writes: [(usize, u32); 128],
         write_count: usize,
         auto_complete: bool,
     }
@@ -1746,7 +1745,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 registers: [0; 128],
-                writes: [(0, 0); 32],
+                writes: [(0, 0); 128],
                 write_count: 0,
                 auto_complete: false,
             }
@@ -1909,6 +1908,34 @@ mod tests {
             disk.controller.io_mut().registers[(AHCI_OFFSET + AHCI_P_CI) / 4] = 0;
             assert!(disk.wait_async_all(&[handle]).is_ok());
             assert!(matches!(disk.async_state, AsyncState::Idle));
+        });
+    }
+
+    #[test]
+    fn async_timeout_completes_with_device_error_when_dma_stop_is_proven() {
+        with_fake_disk(|disk, _| {
+            let mut output = [0u8; 512];
+            let segment = crate::BlockSegment::from_read_buf(&mut output);
+            let mut requests = [BlockQueueRequest {
+                op: BlockAsyncOp::Read,
+                block_id: 3,
+                segments: &[segment],
+                handle: None,
+            }];
+            assert_eq!(disk.submit_async_batch(&mut requests).unwrap().submitted, 1);
+            let mut completed = false;
+            for _ in 0..=COMMAND_TIMEOUT_POLLS {
+                if disk.reap_async() {
+                    completed = true;
+                    break;
+                }
+            }
+            assert!(completed);
+            let AsyncState::Complete(completion) = disk.async_state else {
+                panic!("timeout completion was not published");
+            };
+            assert_eq!(completion.handle, requests[0].handle.unwrap());
+            assert_eq!(completion.status, BlockCompletionStatus::DeviceError(0xff));
         });
     }
 }
