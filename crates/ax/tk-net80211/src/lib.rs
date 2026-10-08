@@ -11,6 +11,7 @@ mod auth_rx;
 mod beacon;
 mod channel;
 mod decrypt;
+mod disconnect_rx;
 mod frame;
 mod input;
 mod node;
@@ -40,6 +41,10 @@ pub use channel::{
 pub use decrypt::{
     HardwareDecryptError, HardwareDecryptResult, HardwareReplayState,
     postprocess_hardware_decryption,
+};
+pub use disconnect_rx::{
+    DisconnectKind, DisconnectPolicy, DisconnectRxError, DisconnectRxResult, RxOperatingMode,
+    receive_deauthentication, receive_disassociation,
 };
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
 pub use input::{

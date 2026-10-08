@@ -149,3 +149,7 @@ The station association response handler validates mode/state and subtype,
 updates the BSS association ID and negotiated rates, applies EDCA/WMM/U-APSD
 state, negotiates HT/VHT/HE from local and peer capability state, and returns
 RUN/protection/slot/RSN-port effects for the driver/SME to apply.
+
+Deauthentication and disassociation receive paths decode the fixed reason
+field and translate station background-scan/stay-authentication exceptions and
+hostap peer-removal decisions into explicit protocol effects.

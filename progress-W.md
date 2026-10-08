@@ -69,3 +69,4 @@
 - `ieee80211_input.c` beacon/probe-response receive path translated as `receive_beacon()` with per-node beacon/PHY state; `tk-net80211` checks/tests pass (69 tests); input.c coverage advances from 11/48 to 12/48 functions.
 - `ieee80211_input.c` Open System authentication response parser translated and wired to the station auth state helper; `tk-net80211` check/tests pass (72 tests); input.c coverage advances to 13/48 functions.
 - `ieee80211_input.c` station association/reassociation response path translated through the BSS node and protocol capability helpers; `tk-net80211` check/tests pass (75 tests); input.c coverage advances to 14/48 functions.
+- `ieee80211_input.c` deauthentication and disassociation receive functions translated with station/bgscan/stay-auth and hostap peer-leave effects; check/tests pass (79 tests); input.c coverage advances to 16/48 functions.
