@@ -639,3 +639,7 @@ maximum-lane-count dispatch from `intel_tc.c` (MIT, Copyright © 2019 Intel);
 The HSW HDMI DIP write path in `tk-intel-display/src/hdmi.rs` follows
 `intel_hdmi.c::intel_write_infoframe()` and `hsw_write_infoframe()` (MIT,
 Copyright 2006 Dave Airlie and © 2006-2009 Intel); `LICENSE-MIT` is included.
+
+`tk-intel-display/src/hdmi.rs` additionally includes GCP phase selection and the
+HSW GCP/AVI/SPD/vendor/DRM set-infoframes sequence from `intel_hdmi.c` (MIT,
+Copyright 2006 Dave Airlie and © 2006-2009 Intel).

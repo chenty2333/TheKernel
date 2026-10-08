@@ -1192,3 +1192,5 @@ N305 A/B output path; the sequence follows `_icl_ddi_enable_clock()` and
 `crates/ax/tk-intel-display/src/tc.rs` additionally translates the TC mode-name/query, HPD-glitch routing, DP lane-count decoding, and mode/version dispatch helpers from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_tc.c` (MIT, Copyright © 2019 Intel); `LICENSE-MIT`.
 
 `crates/ax/tk-intel-display/src/hdmi.rs` now also translates `intel_write_infoframe()`'s byte-3 ECC-hole packing and `hsw_write_infoframe()`'s transcoder DIP write order from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_hdmi.c` (MIT, Copyright 2006 Dave Airlie and © 2006-2009 Intel); `LICENSE-MIT`.
+
+The same `hdmi.rs` translation now includes the HSW deep-color GCP phase predicate/state builder, GCP payload write and HSW AVI/SPD/vendor/DRM infoframe enable sequence from Linux 7.2.3 `intel_hdmi.c` (MIT, Copyright 2006 Dave Airlie and © 2006-2009 Intel); `LICENSE-MIT`.

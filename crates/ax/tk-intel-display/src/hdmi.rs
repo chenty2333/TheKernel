@@ -9,7 +9,7 @@
 // MIT permission text: ../LICENSE-MIT. HDMI packet writes are typed and caller-owned.
 use crate::{
     Error,
-    display::{Pipe, ReadoutIo},
+    display::{Pipe, ReadoutIo, Timings},
     hdmi_packet::{Infoframe, hdmi_infoframe_unpack},
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +100,128 @@ pub fn hsw_read_infoframe(
     }
     Ok(RawInfoframe { raw, kind })
 }
+const GCP_COLOR_INDICATION: u32 = 1 << 2;
+const GCP_DEFAULT_PHASE_ENABLE: u32 = 1 << 1;
+const HSW_INFOFRAME_ENABLE_MASK: u32 =
+    (1 << 20) | (1 << 12) | (1 << 16) | (1 << 8) | (1 << 4) | 1 | (1 << 28) | (1 << 23);
+
+/// Calculate whether HDMI deep-color packing can keep pixel phase zero.
+// upstream: intel_hdmi.c gcp_default_phase_possible()
+pub fn gcp_default_phase_possible(pipe_bpp: u8, mode: &Timings) -> bool {
+    let pixels_per_group = match pipe_bpp {
+        30 => 4,
+        36 => 2,
+        48 => 1,
+        _ => return false,
+    };
+    mode.hdisplay % pixels_per_group == 0
+        && mode.htotal % pixels_per_group == 0
+        && mode.hblank_start % pixels_per_group == 0
+        && mode.hblank_end % pixels_per_group == 0
+        && mode.hsync_start % pixels_per_group == 0
+        && mode.hsync_end % pixels_per_group == 0
+        && (!mode.interlaced || (mode.htotal / 2) % pixels_per_group == 0)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GcpState {
+    pub enabled: bool,
+    pub value: u32,
+}
+
+/// Compute the source GCP color indication and default-phase fields.
+// upstream: intel_hdmi.c intel_hdmi_compute_gcp_infoframe()
+pub fn intel_hdmi_compute_gcp_infoframe(
+    g4x: bool,
+    has_infoframe: bool,
+    pipe_bpp: u8,
+    mode: &Timings,
+    mut state: GcpState,
+) -> GcpState {
+    if g4x || !has_infoframe {
+        return state;
+    }
+    state.enabled = true;
+    if pipe_bpp > 24 {
+        state.value |= GCP_COLOR_INDICATION;
+    }
+    if gcp_default_phase_possible(pipe_bpp, mode) {
+        state.value |= GCP_DEFAULT_PHASE_ENABLE;
+    }
+    state
+}
+
+/// Program/read the HSW GCP payload register selected by `cpu_transcoder`.
+// upstream: intel_hdmi.c intel_hdmi_set_gcp_infoframe()
+pub fn intel_hdmi_set_gcp_infoframe(
+    io: &impl ReadoutIo,
+    pipe: Pipe,
+    state: GcpState,
+) -> Result<bool, Error> {
+    if !state.enabled {
+        return Ok(false);
+    }
+    if !io.pipe_powered(pipe) {
+        return Err(Error::Refused);
+    }
+    io.write32(pipe.transcoder_register(0x60210), state.value)?;
+    Ok(true)
+}
+
+/// HSW frame set used by `hsw_set_infoframes()` in source ordering.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HswInfoframeSet {
+    pub enabled: bool,
+    pub gcp: Option<u32>,
+    pub avi: Option<[u8; 32]>,
+    pub spd: Option<[u8; 32]>,
+    pub vendor: Option<[u8; 32]>,
+    pub drm: Option<[u8; 32]>,
+}
+
+/// Select HSW DIP packets, write GCP, then AVI/SPD/vendor/DRM in i915 order.
+// upstream: intel_hdmi.c hsw_set_infoframes()
+pub fn hsw_set_infoframes(
+    io: &impl ReadoutIo,
+    pipe: Pipe,
+    frames: HswInfoframeSet,
+) -> Result<(), Error> {
+    if !io.pipe_powered(pipe) {
+        return Err(Error::Refused);
+    }
+    let ctl = pipe.transcoder_register(0x60200);
+    let mut value = io.read32(ctl)? & !HSW_INFOFRAME_ENABLE_MASK;
+    if !frames.enabled {
+        io.write32(ctl, value)?;
+        let _ = io.read32(ctl)?;
+        return Ok(());
+    }
+    if let Some(gcp) = frames.gcp {
+        let _ = intel_hdmi_set_gcp_infoframe(
+            io,
+            pipe,
+            GcpState {
+                enabled: true,
+                value: gcp,
+            },
+        )?;
+        value |= 1 << 16;
+    }
+    io.write32(ctl, value)?;
+    let _ = io.read32(ctl)?;
+    for (kind, packet) in [
+        (FrameType::Avi, frames.avi),
+        (FrameType::Spd, frames.spd),
+        (FrameType::Vendor, frames.vendor),
+        (FrameType::Drm, frames.drm),
+    ] {
+        if let Some(raw) = packet {
+            hsw_write_infoframe(io, pipe, kind, &raw)?;
+        }
+    }
+    Ok(())
+}
+
 /// Pack the generic infoframe bytes into the HSW DIP buffer's ECC hole layout.
 /// `hdmi_infoframe_pack_only()` supplies the checksum/header packet; this
 /// reproduces `intel_write_infoframe()`'s memmove and zero byte at DW0 byte 3.
@@ -215,6 +337,76 @@ mod write_tests {
         fn pipe_powered(&self, _pipe: Pipe) -> bool {
             self.powered
         }
+    }
+
+    fn mode() -> Timings {
+        Timings {
+            hdisplay: 1920,
+            htotal: 2200,
+            hblank_start: 1920,
+            hblank_end: 280,
+            hsync_start: 2008,
+            hsync_end: 2052,
+            vdisplay: 1080,
+            vtotal: 1125,
+            vblank_start: 1080,
+            vblank_end: 45,
+            vsync_start: 1084,
+            vsync_end: 1089,
+            set_context_latency: 0,
+            interlaced: false,
+        }
+    }
+
+    #[test]
+    fn gcp_default_phase_obeys_every_horizontal_boundary_and_bpp_case() {
+        assert!(gcp_default_phase_possible(30, &mode()));
+        assert!(gcp_default_phase_possible(36, &mode()));
+        assert!(!gcp_default_phase_possible(24, &mode()));
+        let mut interlaced = mode();
+        interlaced.interlaced = true;
+        interlaced.htotal = 2204;
+        assert!(!gcp_default_phase_possible(30, &interlaced));
+        assert_eq!(
+            intel_hdmi_compute_gcp_infoframe(false, true, 30, &mode(), GcpState::default()),
+            GcpState {
+                enabled: true,
+                value: GCP_COLOR_INDICATION | GCP_DEFAULT_PHASE_ENABLE
+            },
+        );
+        assert_eq!(
+            intel_hdmi_compute_gcp_infoframe(true, true, 30, &mode(), GcpState::default()),
+            GcpState::default()
+        );
+    }
+
+    #[test]
+    fn hsw_set_infoframes_clears_then_enables_packets_in_order() {
+        let mock = Mock {
+            powered: true,
+            ..Mock::default()
+        };
+        let pipe = Pipe::A;
+        let avi = infoframe_packet_to_dip_data(&[0x82, 2, 13, 1, 2, 3]).unwrap();
+        let spd = infoframe_packet_to_dip_data(&[0x83, 1, 25, 4, 5, 6]).unwrap();
+        hsw_set_infoframes(
+            &mock,
+            pipe,
+            HswInfoframeSet {
+                enabled: true,
+                gcp: Some(7),
+                avi: Some(avi),
+                spd: Some(spd),
+                ..HswInfoframeSet::default()
+            },
+        )
+        .unwrap();
+        let writes = mock.writes.borrow();
+        assert_eq!(writes[0], (pipe.transcoder_register(0x60210), 7));
+        assert_eq!(writes[1].0, pipe.transcoder_register(0x60200));
+        assert_eq!(writes[3].0, pipe.transcoder_register(0x60220));
+        assert_eq!(writes[13].0, pipe.transcoder_register(0x602a0));
+        assert_eq!(writes.last().unwrap().0, pipe.transcoder_register(0x60200));
     }
 
     #[test]
