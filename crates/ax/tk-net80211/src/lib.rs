@@ -7,6 +7,7 @@
 extern crate alloc;
 
 mod channel;
+mod decrypt;
 mod frame;
 mod input;
 mod node;
@@ -29,6 +30,10 @@ pub use channel::{
     NET_CHAN_X_160MHZ, NET_CHAN_X_HE, NET_FLAG_QOS, NetChannel, channel_ref_to_ieee,
     configure_ampdu_tx, find_rate, ieee_to_mhz, initialize_channels, mhz_to_ieee, next_scan_mode,
     select_mode,
+};
+pub use decrypt::{
+    HardwareDecryptError, HardwareDecryptResult, HardwareReplayState,
+    postprocess_hardware_decryption,
 };
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
 pub use input::{

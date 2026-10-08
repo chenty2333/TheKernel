@@ -543,3 +543,5 @@ Clause WLAN libraries remain the selected source for later EAPOL/RSN/MLME
 reuse.
 The OpenBSD HT rate adaptation and regulatory-domain translations in
 `tk-net80211` retain their ISC-style source grants in `LICENSES/OpenBSD-ISC.txt`.
+The OpenBSD CCMP/TKIP PN/TSC extraction helpers retain their custom ISC-style
+grant and Damien Bergamini attribution in `tk-net80211/LICENSES/OpenBSD-ISC.txt`.

@@ -128,3 +128,7 @@ re-select the same BSSID.
 The station protocol state planner now emits ordered scan/auth/association/run
 actions, cleanup and BA-stop events, keeps RUN on the open-auth retry path, and
 defers link-up while RSN authorization remains pending.
+Hardware-decrypted CCMP/TKIP frames now update per-TID receive sequence counters
+after firmware/driver reorder, allow equal PN only for the explicit same-PN
+reorder case, clear Protected and remove the retained IV before Ethernet
+conversion. Frames whose IV was already stripped trust hardware replay status.
