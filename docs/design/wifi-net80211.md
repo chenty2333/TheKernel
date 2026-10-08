@@ -180,3 +180,7 @@ FromDS/BSSID/simplex filters and RX privacy checks. Hardware reorder and
 hardware/software decryption remain caller-owned stages. A-MSDU payloads are
 split into individually validated Ethernet frames, including the station DA
 check and SNAP conversion.
+
+A-MSDU output is represented as a batch of Ethernet frames rather than one
+mis-decapsulated packet; the validated subframes preserve exact DA/SA/type
+and reject truncation, invalid station destinations and malformed padding.
