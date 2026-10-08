@@ -9,6 +9,7 @@ extern crate alloc;
 mod channel;
 mod frame;
 mod ra;
+mod rates;
 mod regdomain;
 mod rsn;
 mod rssadapt;
@@ -25,6 +26,11 @@ pub use ra::{
     next_lower_intra_rate, next_mcs, next_rateset, node_init, probe_clear, probe_done,
     probe_next_rate, probe_next_rateset, probe_valid, trigger_next_rateset, use_ht_sgi,
     valid_rates, valid_tx_mcs,
+};
+pub use rates::{
+    PhyMode, RATE_BASIC as LEGACY_RATE_BASIC, RATE_MAX_SIZE, RATE_VALUE as LEGACY_RATE_VALUE,
+    RateSet, STANDARD_RATES_11A, STANDARD_RATES_11B, STANDARD_RATES_11G, max_basic_rate,
+    min_basic_rate, plcp_to_rate, rate_to_plcp, set_basic_rates,
 };
 pub use regdomain::{
     CHANNELS_5GHZ_MAX, CHANNELS_5GHZ_MIN, COUNTRY_NAMES, CountryName, DMN_DEBUG, DMN_DEFAULT,
