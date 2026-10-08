@@ -197,8 +197,8 @@ pub use mac::{
 };
 pub use mac_context::{
     ACTION_ADD as MAC_ACTION_ADD, ACTION_MODIFY as MAC_ACTION_MODIFY,
-    ACTION_REMOVE as MAC_ACTION_REMOVE, EdcaParameters, HtProtection,
-    MAC_CONF_GROUP, MAC_CONFIG_COMMAND, MAC_CONTEXT_COMMAND, MacContextConfig, MacContextError,
+    ACTION_REMOVE as MAC_ACTION_REMOVE, EdcaParameters, HtProtection, MAC_CONF_GROUP,
+    MAC_CONFIG_COMMAND, MAC_CONTEXT_COMMAND, MacContextConfig, MacContextError,
     MacContextUpdateError, OperationMode, mac_context_command, mld_mac_context_command,
     update_mac_context,
 };
@@ -238,14 +238,14 @@ pub use pm::{
 };
 pub use power::{
     BEACON_FILTER_COMMAND, BEACON_FILTER_CONFIG_BYTES, BeaconFilterError, BeaconFilterState,
-    MAC_PM_POWER_TABLE_COMMAND, POWER_ADVANCE_PM_ENABLE, POWER_KEEP_ALIVE_PERIOD_SEC,
-    POWER_MANAGEMENT_ENABLE, POWER_SAVE_ENABLE, POWER_SKIP_DTIM, POWER_TABLE_COMMAND,
-    POWER_UAPSD_MISBEHAVING_ENABLE, PowerApplyError, PowerCommands, PowerConfig, PowerError,
-    UAPSD_RX_DATA_TIMEOUT, UAPSD_TX_DATA_TIMEOUT, WMM_AC_BE, WMM_AC_BK, WMM_AC_MASK, WMM_AC_VI,
-    WMM_AC_VO, WMM_SP_2, WMM_SP_4, WMM_SP_6, WMM_SP_ALL, WMM_SP_MASK, apply_power_commands,
-    beacon_filter_command, build_power_commands, disable_beacon_filter, enable_beacon_filter,
-    set_beacon_filter, uapsd_ac_flags, uapsd_ac_mask, uapsd_qndp_tid, uapsd_service_period,
-    update_beacon_abort,
+    DEFAULT_STATION_POWER_LEVEL, MAC_PM_POWER_TABLE_COMMAND, POWER_ADVANCE_PM_ENABLE,
+    POWER_KEEP_ALIVE_PERIOD_SEC, POWER_MANAGEMENT_ENABLE, POWER_SAVE_ENABLE, POWER_SKIP_DTIM,
+    POWER_TABLE_COMMAND, POWER_UAPSD_MISBEHAVING_ENABLE, PowerApplyError, PowerCommands,
+    PowerConfig, PowerError, UAPSD_RX_DATA_TIMEOUT, UAPSD_TX_DATA_TIMEOUT, WMM_AC_BE, WMM_AC_BK,
+    WMM_AC_MASK, WMM_AC_VI, WMM_AC_VO, WMM_SP_2, WMM_SP_4, WMM_SP_6, WMM_SP_ALL, WMM_SP_MASK,
+    apply_power_commands, beacon_filter_command, build_power_commands,
+    default_station_power_config, disable_beacon_filter, enable_beacon_filter, set_beacon_filter,
+    uapsd_ac_flags, uapsd_ac_mask, uapsd_qndp_tid, uapsd_service_period, update_beacon_abort,
 };
 pub use preinit::{PreinitPlan, preinit_plan};
 pub use queue::{

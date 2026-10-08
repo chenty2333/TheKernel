@@ -272,3 +272,15 @@ incomplete.
 ## Guest user-space payload
 
 The build-wireless-payload.sh script stages signed Alpine v3.24 x86_64 APKs for iw 6.17-r0 (ISC), wpa_supplicant 2.11-r4 (BSD-3-Clause), and wireless-regdb 2025.10.07-r0 (ISC), plus their pinned dynamic-library closure. SHA-256 pins are in config/guest-wireless-apk-pins.tsv; the Alpine bootstrap apk verify authenticates each APK signature before extraction. The payload contains regulatory.db and its detached signature under /lib/firmware. Build it with scripts/build-guest-tools.sh --payload wireless --output DIR, then pass that tree via THEKERNEL_ROOTFS_TOOLS_DIR=DIR and THEKERNEL_TOOLCHAIN=wireless to the rootfs builder.
+
+### Station power management
+
+When an association reaches RUN, iwx now sends the source device and MAC power
+commands at station power level 3 by default, using the observed beacon
+interval. U-APSD stays disabled unless per-peer WMM negotiation supplies its
+AC mask/service period; DTIM skipping remains zero, matching the source
+`iwx_set_pslevel(sc, 0, 3, ...)` default call. No `iwx_update_quotas()` function
+exists in the pinned OpenBSD 7.x or FreeBSD iwx source snapshots available to
+this port: they only classify/ACK the time-quota command ID. The driver is
+single-station and does not fabricate a time-slicing quota command absent a
+source policy or a second active PHY context.

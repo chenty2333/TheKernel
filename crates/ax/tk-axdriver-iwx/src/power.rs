@@ -81,6 +81,9 @@ pub const fn uapsd_service_period(max_service_period: u8) -> u8 {
     }
 }
 
+/// Station power management follows OpenBSD's PMGTON level 3 by default.
+pub const DEFAULT_STATION_POWER_LEVEL: u8 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PowerConfig {
     pub monitor_mode: bool,
@@ -96,6 +99,28 @@ pub struct PowerConfig {
     pub uapsd_acm: [bool; 4],
     pub uapsd_max_service_period: u8,
     pub asynchronous: bool,
+}
+
+/// Default-enabled station power-save policy; U-APSD remains negotiated per peer.
+pub const fn default_station_power_config(
+    mac_id_color: u32,
+    beacon_interval_tu: u16,
+) -> PowerConfig {
+    PowerConfig {
+        monitor_mode: false,
+        dtim_skip: 0,
+        level: DEFAULT_STATION_POWER_LEVEL,
+        mac_active: true,
+        mac_id_color,
+        dtim_period: 1,
+        beacon_interval_tu,
+        uapsd_node: false,
+        uapsd_supported: false,
+        uapsd_access_categories: 0,
+        uapsd_acm: [false; 4],
+        uapsd_max_service_period: 0,
+        asynchronous: true,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +308,24 @@ mod tests {
         assert_eq!(uapsd_service_period(WMM_SP_4), 4);
         assert_eq!(uapsd_service_period(WMM_SP_6), 6);
         assert_eq!(uapsd_service_period(WMM_SP_ALL), 128);
+    }
+
+    #[test]
+    fn default_station_policy_enables_device_and_mac_power_save() {
+        let config = default_station_power_config(0x1234, 100);
+        assert_eq!(config.level, DEFAULT_STATION_POWER_LEVEL);
+        assert!(config.mac_active && config.asynchronous);
+        let commands = build_power_commands(config, 0, 0).unwrap().unwrap();
+        let device = &commands.device.bytes[8..];
+        assert_eq!(
+            u16::from_le_bytes(device[..2].try_into().unwrap()),
+            POWER_SAVE_ENABLE
+        );
+        let mac = &commands.mac.unwrap().bytes[8..];
+        assert_eq!(
+            u16::from_le_bytes(mac[4..6].try_into().unwrap()),
+            POWER_SAVE_ENABLE | POWER_MANAGEMENT_ENABLE
+        );
     }
 
     #[test]

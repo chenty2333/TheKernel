@@ -470,6 +470,7 @@ struct AttachedDevice {
     scan_event: Option<WirelessScanEvent>,
     association: axdriver_iwx::AssociationState,
     session_protection: axdriver_iwx::SessionProtectionState,
+    beacon_filter: axdriver_iwx::BeaconFilterState,
     security_keys: IwxSecurityKeys,
     station: Option<StationConnection>,
     disconnect_event: Option<WirelessDisconnectEvent>,
@@ -1048,6 +1049,7 @@ fn allocate_resources(
         scan_event: None,
         association: axdriver_iwx::AssociationState::default(),
         session_protection: axdriver_iwx::SessionProtectionState::default(),
+        beacon_filter: axdriver_iwx::BeaconFilterState::default(),
         security_keys: IwxSecurityKeys::default(),
         station: None,
         disconnect_event: None,
@@ -1677,9 +1679,7 @@ fn send_firmware_management_key(
         .image
         .enabled_capabilities
         .get(IWX_UCODE_TLV_CAPA_MULTI_QUEUE_RX_SUPPORT / 32)
-        .is_some_and(|word| {
-            word & (1 << (IWX_UCODE_TLV_CAPA_MULTI_QUEUE_RX_SUPPORT % 32)) != 0
-        });
+        .is_some_and(|word| word & (1 << (IWX_UCODE_TLV_CAPA_MULTI_QUEUE_RX_SUPPORT % 32)) != 0);
     let version = bundle.image.lookup_command_version(
         axdriver_iwx::DATA_PATH_GROUP,
         axdriver_iwx::SEC_KEY_COMMAND as u8,
@@ -2008,6 +2008,38 @@ fn connect_station(
             queue_version,
         )
         .map_err(|_| RuntimeStartError::Transmission)?;
+    let power = axdriver_iwx::build_power_commands(
+        axdriver_iwx::default_station_power_config(0, bss.beacon_interval),
+        0,
+        0,
+    )
+    .map_err(|_| RuntimeStartError::Firmware)?;
+    if let Some(power) = power.as_ref() {
+        device
+            .controller
+            .send_encoded_command(&power.device, None)
+            .map_err(|_| RuntimeStartError::Firmware)?;
+        if let Some(mac_power) = &power.mac {
+            device
+                .controller
+                .send_encoded_command(mac_power, None)
+                .map_err(|_| RuntimeStartError::Firmware)?;
+        }
+        axdriver_iwx::update_beacon_abort(
+            &mut device.beacon_filter,
+            power.beacon_abort_enabled,
+            0,
+            0,
+            |command| {
+                device
+                    .controller
+                    .send_encoded_command(command, None)
+                    .map(|_| ())
+                    .map_err(|_| RuntimeStartError::Firmware)
+            },
+        )
+        .map_err(|_| RuntimeStartError::Firmware)?;
+    }
     device.station = Some(StationConnection {
         bss: bss.clone(),
         bssid: bss.bssid,
