@@ -1837,45 +1837,17 @@ fn bring_up_inner(
     // Source `skl_wm_init` obtains the display-12/13 latency table from PCode
     // before plane watermark computation. Preserve the source's level
     // adjustment and sanitization instead of using a made-up latency profile.
-    let mut wm_latencies = [0u32; skl_watermark_full::WM_LEVELS];
-    let wm_display = WatermarkDisplayCaps {
-        display_ver: 13,
-        display_ver_fixed: 13,
-        alderlake_p: true,
-        sagv: true,
-        sagv_wm: true,
-        has_hw_sagv_wm: true,
-        ..WatermarkDisplayCaps::default()
-    };
-    let wm_num_levels = skl_watermark_full::skl_setup_wm_latency(
-        &PcodeWmLatency {
-            regs,
-            timer: &pcode_timer,
-        },
-        &wm_display,
-        &mut wm_latencies,
-    )
-    .map_err(|error| {
+    let wm = read_source_watermark_config(regs, &pcode_timer).map_err(|error| {
         unwind(
             regs,
             we_requested,
             "the PCode watermark-latency read",
-            PowerError::Pcode(format!("watermark latency mailbox returned errno {error}")),
+            PowerError::Pcode(error),
         )
     })?;
-    let sagv_block_time_us = match super::pcode::read_sagv_block_time_us(regs, &pcode_timer) {
-        Ok(value) if value <= u16::MAX as u32 => value,
-        Ok(value) => {
-            axlog::warn!("intel-gpu: PCode SAGV block time {value}us exceeds i915's 16-bit limit");
-            0
-        }
-        Err(error) => {
-            // `intel_sagv_block_time()` logs but falls back to zero on this
-            // command's failure; watermark policy keeps the same behavior.
-            axlog::debug!("intel-gpu: could not read PCode SAGV block time: {error:?}");
-            0
-        }
-    };
+    let wm_latencies = wm.latencies;
+    let wm_num_levels = wm.num_levels;
+    let sagv_block_time_us = wm.sagv_block_time_us;
 
     // Phase 1.6.
     let workarounds = apply_workarounds(regs)
