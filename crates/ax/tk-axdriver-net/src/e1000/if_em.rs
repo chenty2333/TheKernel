@@ -4646,6 +4646,130 @@ pub fn em_if_resume<I: E1000RegisterIo, O: EmResumeOps>(
     Ok(())
 }
 
+/// upstream: if_em.c igb_sysctl_dmac()
+pub fn igb_sysctl_dmac(value: i32) -> DevResult<u32> {
+    match value {
+        0 => Ok(0),
+        1 => Ok(1000),
+        250 | 500 | 1000 | 2000 | 3000 | 4000 | 5000 | 6000 | 7000 | 8000 | 9000 | 10000 => {
+            Ok(value as u32)
+        }
+        _ => Err(DevError::InvalidParam),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmEeeSettings {
+    pub ich8_disabled: bool,
+    pub igb_disabled: bool,
+}
+
+/// upstream: if_em.c em_sysctl_eee()
+pub fn em_sysctl_eee(
+    mac: E1000MacType,
+    settings: &mut EmEeeSettings,
+    new_value: Option<i32>,
+    interface_up: bool,
+) -> bool {
+    if let Some(value) = new_value {
+        if mac < E1000MacType::I82575 {
+            settings.ich8_disabled = value != 0;
+        } else {
+            settings.igb_disabled = value != 0;
+        }
+        interface_up
+    } else {
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmIntDelayUpdate {
+    pub usecs: i32,
+    pub register: u32,
+    pub txd_cmd: u32,
+}
+
+/// upstream: if_em.c em_sysctl_int_delay()
+pub fn em_sysctl_int_delay(
+    offset: u32,
+    current_register: u32,
+    current_txd_cmd: u32,
+    usecs: i32,
+) -> DevResult<EmIntDelayUpdate> {
+    let max_usecs = (1024 * 65535 + 500) / 1000;
+    if !(0..=max_usecs).contains(&usecs) {
+        return Err(DevError::InvalidParam);
+    }
+    let ticks = (1000 * usecs + 512) / 1024;
+    let mut register = (current_register & !0xffff) | (ticks as u32 & 0xffff);
+    let mut txd_cmd = current_txd_cmd;
+    if offset == E1000_TIDV {
+        if ticks == 0 {
+            txd_cmd &= !E1000_TXD_CMD_IDE;
+            register = register.wrapping_add(1);
+        } else {
+            txd_cmd |= E1000_TXD_CMD_IDE;
+        }
+    }
+    Ok(EmIntDelayUpdate {
+        usecs,
+        register,
+        txd_cmd,
+    })
+}
+
+/// upstream: if_em.c em_sysctl_tso_tcp_flags_mask()
+pub fn em_sysctl_tso_tcp_flags_mask<I: E1000RegisterIo>(
+    io: &mut I,
+    selector: u8,
+    new_mask: Option<i32>,
+) -> DevResult<u16> {
+    let (register, shift) = match selector {
+        0 => (E1000_DTXTCPFLGL, 0),
+        1 => (E1000_DTXTCPFLGL, 16),
+        2 => (E1000_DTXTCPFLGH, 0),
+        _ => return Err(DevError::InvalidParam),
+    };
+    let old = io.read_register(register)?;
+    let old_mask = ((old >> shift) & 0xfff) as u16;
+    let Some(mask) = new_mask else {
+        return Ok(old_mask);
+    };
+    if !(0..=0xfff).contains(&mask) {
+        return Err(DevError::InvalidParam);
+    }
+    let value = (old & !(0xfff << shift)) | ((mask as u32) << shift);
+    io.write_register(register, value)?;
+    Ok(mask as u16)
+}
+
+/// upstream: if_em.c em_sysctl_tx_ring_handler()
+pub fn em_sysctl_tx_ring_handler<I: E1000RegisterIo>(
+    io: &mut I,
+    queue: u32,
+    head: bool,
+) -> DevResult<u32> {
+    io.read_register(if head {
+        tx_desc_head(queue)
+    } else {
+        tx_desc_tail(queue)
+    })
+}
+
+/// upstream: if_em.c em_sysctl_rx_ring_handler()
+pub fn em_sysctl_rx_ring_handler<I: E1000RegisterIo>(
+    io: &mut I,
+    queue: u32,
+    head: bool,
+) -> DevResult<u32> {
+    io.read_register(if head {
+        rx_desc_head(queue)
+    } else {
+        rx_desc_tail(queue)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeMap;
@@ -5831,5 +5955,50 @@ mod tests {
         assert_eq!(failed.log.last(), Some(&"init_failed"));
         assert_eq!(failed.init_failures, 1);
         assert!(!failed.log.contains(&"busmaster"));
+    }
+
+    #[test]
+    fn dmac_eee_delay_tso_mask_and_ring_sysctls_preserve_values() {
+        for valid in [
+            0, 1, 250, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,
+        ] {
+            assert!(igb_sysctl_dmac(valid).is_ok());
+        }
+        assert_eq!(igb_sysctl_dmac(1).unwrap(), 1000);
+        assert!(igb_sysctl_dmac(750).is_err());
+
+        let mut eee = EmEeeSettings::default();
+        assert!(em_sysctl_eee(E1000MacType::PchLpt, &mut eee, Some(1), true));
+        assert!(eee.ich8_disabled);
+        assert!(!eee.igb_disabled);
+        assert!(!em_sysctl_eee(E1000MacType::I350, &mut eee, Some(1), false));
+        assert!(eee.igb_disabled);
+        assert!(!em_sysctl_eee(E1000MacType::I350, &mut eee, None, true));
+
+        let delay = em_sysctl_int_delay(E1000_RDTR, 0xabcd_0000, 0, 100).unwrap();
+        assert_eq!(delay.register, 0xabcd_0062);
+        let zero_txd = em_sysctl_int_delay(E1000_TIDV, 0, E1000_TXD_CMD_IDE, 0).unwrap();
+        assert_eq!(zero_txd.register, 1);
+        assert_eq!(zero_txd.txd_cmd & E1000_TXD_CMD_IDE, 0);
+        assert!(em_sysctl_int_delay(E1000_RDTR, 0, 0, -1).is_err());
+
+        let mut io = RegisterMock::default();
+        io.0.insert(E1000_DTXTCPFLGL, 0xa5a5_1234);
+        assert_eq!(
+            em_sysctl_tso_tcp_flags_mask(&mut io, 1, None).unwrap(),
+            0x5a5
+        );
+        em_sysctl_tso_tcp_flags_mask(&mut io, 1, Some(0xabc)).unwrap();
+        assert_eq!(
+            io.0[&E1000_DTXTCPFLGL],
+            (0xa5a5_1234 & !(0xfff << 16)) | (0xabc << 16)
+        );
+        assert!(em_sysctl_tso_tcp_flags_mask(&mut io, 3, Some(1)).is_err());
+        assert!(em_sysctl_tso_tcp_flags_mask(&mut io, 0, Some(0x1000)).is_err());
+
+        io.0.insert(tx_desc_head(1), 4);
+        io.0.insert(rx_desc_tail(2), 9);
+        assert_eq!(em_sysctl_tx_ring_handler(&mut io, 1, true).unwrap(), 4);
+        assert_eq!(em_sysctl_rx_ring_handler(&mut io, 2, false).unwrap(), 9);
     }
 }
