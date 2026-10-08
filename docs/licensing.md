@@ -527,3 +527,8 @@ libgallium from the existing same-version source/CLC/toolchain, retaining the
 Mesa/Buildroot package license obligations already registered above. No Mesa
 binary is committed. The dedicated flavor and loader check are original
 project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
+
+`src/dmc.rs` additionally translates only the display-12/13 firmware path and
+size selection from MIT `intel_dmc.c::dmc_firmware_default()` (2014 Intel).
+It adds no firmware binary or loader; distributing DMC images requires a
+separate linux-firmware license/notice review before rootfs packaging.

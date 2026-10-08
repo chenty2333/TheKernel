@@ -11,6 +11,7 @@ pub mod cdclk;
 pub mod color;
 pub mod ddi;
 pub mod device;
+pub mod dmc;
 pub mod display;
 pub mod dkl_phy;
 pub mod dpll_mgr;

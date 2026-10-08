@@ -219,3 +219,8 @@ intel_ddi.c::tgl_dkl_phy_set_signal_levels/intel_ddi_level, HDMI DKL table
 from intel_ddi_buf_trans.c and known Wa_16011342517 selection. Copyright
 ©2012/2020/2023 Intel, full grant in LICENSE-MIT. Runtime uses verified VBT5
 before buffer enable; complete PHY before-image remains the rollback source.
+
+DMC firmware selection: src/dmc.rs translates the display-12/13 portion of
+intel_dmc.c::dmc_firmware_default() and its firmware-size constants. Copyright
+©2014 Intel Corporation; full grant in LICENSE-MIT. This selects paths/caps
+only; no DMC image, parser, loader, or rootfs packaging is included yet.

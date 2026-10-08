@@ -977,3 +977,8 @@ shims. The scanner measures kernel/src as (86,42,20,130,8,0,0) at >=40 and
 (159,52,26,299,14,0,0) at >=25. The merged baseline uses these measured totals;
 individual-branch historical counts above are not additive. Other scopes
 retain the latest Intel inventory, with no scanner exemptions.
+
+`crates/ax/tk-intel-display/src/dmc.rs` translates the display-12/13 path and
+size selection from Linux v7.2.3 `drivers/gpu/drm/i915/display/intel_dmc.c`
+`dmc_firmware_default()` (MIT, Copyright © 2014 Intel). No DMC firmware bytes,
+firmware parser, loader, or rootfs payload were added.
