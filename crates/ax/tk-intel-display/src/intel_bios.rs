@@ -34,7 +34,12 @@ pub fn find_raw_section(
             return Ok(None);
         }
         if current_id == section_id {
-            return Ok(Some(&bdb[index..end]));
+            let mipi_header = usize::from(current_id == 53 && bdb[index] >= 3) * 5;
+            let data_end = end.checked_add(mipi_header).ok_or(Error::Truncated)?;
+            if data_end > total {
+                return Ok(None);
+            }
+            return Ok(Some(&bdb[index..data_end]));
         }
         index = end;
     }
@@ -344,6 +349,39 @@ impl<'a> Vbt<'a> {
             psr2_tp2_tp3_wakeup_us,
         }))
     }
+    /// Resolve the BDB LFP pointers, synthesizing the modern missing block.
+    pub fn parse_lfp_data_pointers(&self) -> Result<Option<LfpDataPointers>, Error> {
+        let mut pointers = if let Some(raw) = self.find_raw_section(41)? {
+            parse_lfp_data_ptrs(raw)
+        } else if let Some(generated) = generate_lfp_data_ptrs(self)? {
+            generated
+        } else {
+            return Ok(None);
+        };
+        let data_offset = raw_block_offset(self.bdb, self.header_size, 42)?;
+        if data_offset == 0 {
+            return Ok(None);
+        }
+        let Some(data) = self.find_raw_section(42)? else {
+            return Ok(None);
+        };
+        if !fixup_lfp_data_ptrs(data_offset, data, &mut pointers) {
+            return Ok(None);
+        }
+        Ok(Some(pointers))
+    }
+    /// Minimum BDB LFP data payload implied by validated pointer tables.
+    // upstream: intel_bios.c lfp_data_min_size()
+    pub fn lfp_data_min_size(&self) -> Result<usize, Error> {
+        let Some(pointers) = self.parse_lfp_data_pointers()? else {
+            return Ok(0);
+        };
+        let mut size = 16 * (46 + 18 + 12);
+        if pointers.panel_name.table_size != 0 {
+            size = size.max(pointers.panel_name.offset + 310);
+        }
+        Ok(size)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -380,6 +418,347 @@ pub struct PsrConfig {
     pub tp1_wakeup_us: u32,
     pub tp2_tp3_wakeup_us: u32,
     pub psr2_tp2_tp3_wakeup_us: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LfpDataPointer {
+    pub offset: usize,
+    pub table_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LfpDataEntryPointers {
+    pub fp_timing: LfpDataPointer,
+    pub dvo_timing: LfpDataPointer,
+    pub panel_pnp_id: LfpDataPointer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LfpDataPointers {
+    pub num_entries: u8,
+    pub entries: [LfpDataEntryPointers; 16],
+    pub panel_name: LfpDataPointer,
+}
+
+/// Read a panel's DVO EDID detailed timing from block 42.
+// upstream: intel_bios.c get_lfp_dvo_timing()
+pub fn get_lfp_dvo_timing<'a>(
+    data: &'a [u8],
+    pointers: &LfpDataPointers,
+    panel_type: u8,
+) -> Option<&'a [u8]> {
+    let pointer = pointers.entries.get(usize::from(panel_type))?.dvo_timing;
+    data.get(pointer.offset..pointer.offset.checked_add(pointer.table_size)?)
+}
+
+/// Read a panel's fixed-panel timing record from block 42.
+// upstream: intel_bios.c get_lfp_fp_timing()
+pub fn get_lfp_fp_timing<'a>(
+    data: &'a [u8],
+    pointers: &LfpDataPointers,
+    panel_type: u8,
+) -> Option<&'a [u8]> {
+    let pointer = pointers.entries.get(usize::from(panel_type))?.fp_timing;
+    data.get(pointer.offset..pointer.offset.checked_add(pointer.table_size)?)
+}
+
+/// Read a panel's PnP ID record from block 42.
+// upstream: intel_bios.c get_lfp_pnp_id()
+pub fn get_lfp_pnp_id<'a>(
+    data: &'a [u8],
+    pointers: &LfpDataPointers,
+    panel_type: u8,
+) -> Option<&'a [u8]> {
+    let pointer = pointers.entries.get(usize::from(panel_type))?.panel_pnp_id;
+    data.get(pointer.offset..pointer.offset.checked_add(pointer.table_size)?)
+}
+
+/// Return the optional panel-name and additional LFP data tail.
+// upstream: intel_bios.c get_lfp_data_tail()
+pub fn get_lfp_data_tail<'a>(
+    data: &'a [u8],
+    pointers: &LfpDataPointers,
+) -> Option<&'a [u8]> {
+    if pointers.panel_name.table_size == 0 {
+        return None;
+    }
+    data.get(pointers.panel_name.offset..)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DvoTiming {
+    pub hdisplay: u16,
+    pub hsync_start: u16,
+    pub hsync_end: u16,
+    pub htotal: u16,
+    pub vdisplay: u16,
+    pub vsync_start: u16,
+    pub vsync_end: u16,
+    pub vtotal: u16,
+    pub clock_khz: u32,
+    pub width_mm: u16,
+    pub height_mm: u16,
+    pub hsync_positive: bool,
+    pub vsync_positive: bool,
+}
+
+/// Convert an EDID detailed timing from the LFP data table to mode timings.
+// upstream: intel_bios.c fill_detail_timing_data()
+pub fn fill_detail_timing_data(data: &[u8]) -> Result<DvoTiming, Error> {
+    bytes(data, 0, 18)?;
+    let hdisplay = u16::from(data[2]) | (u16::from(data[4] & 0xf0) << 4);
+    let hblank = u16::from(data[3]) | (u16::from(data[4] & 0x0f) << 8);
+    let vdisplay = u16::from(data[5]) | (u16::from(data[7] & 0xf0) << 4);
+    let vblank = u16::from(data[6]) | (u16::from(data[7] & 0x0f) << 8);
+    let hsync_offset = u16::from(data[8]) | (u16::from(data[11] >> 6) << 8);
+    let hsync_pulse = u16::from(data[9]) | (u16::from((data[11] >> 4) & 3) << 8);
+    let vsync_offset = u16::from(data[10] & 0x0f) | (u16::from((data[11] >> 2) & 3) << 4);
+    let vsync_pulse = u16::from(data[10] >> 4) | (u16::from(data[11] & 3) << 4);
+    let htotal = hdisplay + hblank;
+    let vtotal = vdisplay + vblank;
+    let hsync_start = hdisplay + hsync_offset;
+    let hsync_end = hsync_start.saturating_add(hsync_pulse).min(htotal);
+    let vsync_start = vdisplay + vsync_offset;
+    let vsync_end = vsync_start.saturating_add(vsync_pulse).min(vtotal);
+    Ok(DvoTiming {
+        hdisplay,
+        hsync_start,
+        hsync_end,
+        htotal,
+        vdisplay,
+        vsync_start,
+        vsync_end,
+        vtotal,
+        clock_khz: u32::from(le16(data, 0)?) * 10,
+        width_mm: u16::from(data[12]) | (u16::from(data[14] & 0xf0) << 4),
+        height_mm: u16::from(data[13]) | (u16::from(data[14] & 0x0f) << 8),
+        hsync_positive: data[17] & (1 << 6) != 0,
+        vsync_positive: data[17] & (1 << 5) != 0,
+    })
+}
+
+/// Translate the packed BDB block 41 pointer structure.
+fn parse_lfp_data_ptrs(raw: &[u8]) -> LfpDataPointers {
+    let pointer = |offset: usize| LfpDataPointer {
+        offset: usize::from(u16_zero_padded(raw, offset)),
+        table_size: raw.get(offset + 2).copied().unwrap_or(0) as usize,
+    };
+    let mut entries = [LfpDataEntryPointers::default(); 16];
+    for (index, entry) in entries.iter_mut().enumerate() {
+        let base = 1 + index * 9;
+        *entry = LfpDataEntryPointers {
+            fp_timing: pointer(base),
+            dvo_timing: pointer(base + 3),
+            panel_pnp_id: pointer(base + 6),
+        };
+    }
+    LfpDataPointers {
+        num_entries: raw.first().copied().unwrap_or(0),
+        entries,
+        panel_name: pointer(145),
+    }
+}
+
+/// Relocate BDB-relative pointers and validate the resulting panel tables.
+// upstream: intel_bios.c fixup_lfp_data_ptrs()
+fn fixup_lfp_data_ptrs(
+    data_offset: usize,
+    data: &[u8],
+    pointers: &mut LfpDataPointers,
+) -> bool {
+    for entry in &mut pointers.entries {
+        let Some(offset) = entry.fp_timing.offset.checked_sub(data_offset) else {
+            return false;
+        };
+        entry.fp_timing.offset = offset;
+        let Some(offset) = entry.dvo_timing.offset.checked_sub(data_offset) else {
+            return false;
+        };
+        entry.dvo_timing.offset = offset;
+        let Some(offset) = entry.panel_pnp_id.offset.checked_sub(data_offset) else {
+            return false;
+        };
+        entry.panel_pnp_id.offset = offset;
+    }
+    if pointers.panel_name.table_size != 0 {
+        let Some(offset) = pointers.panel_name.offset.checked_sub(data_offset) else {
+            return false;
+        };
+        pointers.panel_name.offset = offset;
+    }
+    validate_lfp_data_ptrs(data, pointers)
+}
+
+/// Validate pointer dimensions, uniform spacing, bounds and FP terminators.
+// upstream: intel_bios.c validate_lfp_data_ptrs()
+fn validate_lfp_data_ptrs(data: &[u8], pointers: &LfpDataPointers) -> bool {
+    let data_block_size = data.len();
+    if data_block_size == 0 || pointers.num_entries != 3 {
+        return false;
+    }
+    let fp_timing_size = pointers.entries[0].fp_timing.table_size;
+    let dvo_timing_size = pointers.entries[0].dvo_timing.table_size;
+    let pnp_size = pointers.entries[0].panel_pnp_id.table_size;
+    let panel_name_size = pointers.panel_name.table_size;
+    if fp_timing_size < 32 || dvo_timing_size != 18 || pnp_size != 12 {
+        return false;
+    }
+    if panel_name_size != 0 && panel_name_size != 13 {
+        return false;
+    }
+    let Some(lfp_data_size) = pointers.entries[1]
+        .fp_timing
+        .offset
+        .checked_sub(pointers.entries[0].fp_timing.offset)
+    else {
+        return false;
+    };
+    if lfp_data_size.saturating_mul(16) > data_block_size {
+        return false;
+    }
+    for index in 1..16 {
+        let current = pointers.entries[index];
+        let previous = pointers.entries[index - 1];
+        if current.fp_timing.table_size != fp_timing_size
+            || current.dvo_timing.table_size != dvo_timing_size
+            || current.panel_pnp_id.table_size != pnp_size
+            || current.fp_timing.offset.checked_sub(previous.fp_timing.offset)
+                != Some(lfp_data_size)
+            || current.dvo_timing.offset.checked_sub(previous.dvo_timing.offset)
+                != Some(lfp_data_size)
+            || current.panel_pnp_id.offset.checked_sub(previous.panel_pnp_id.offset)
+                != Some(lfp_data_size)
+        {
+            return false;
+        }
+    }
+    let fp_timing_size = if fp_timing_size + 6 + dvo_timing_size + pnp_size == lfp_data_size {
+        fp_timing_size + 6
+    } else {
+        fp_timing_size
+    };
+    if fp_timing_size + dvo_timing_size + pnp_size != lfp_data_size {
+        return false;
+    }
+    let first = pointers.entries[0];
+    if first.fp_timing.offset.checked_add(fp_timing_size) != Some(first.dvo_timing.offset)
+        || first.dvo_timing.offset.checked_add(dvo_timing_size)
+            != Some(first.panel_pnp_id.offset)
+        || first.panel_pnp_id.offset.checked_add(pnp_size) != Some(lfp_data_size)
+    {
+        return false;
+    }
+    for entry in pointers.entries {
+        if entry.fp_timing.offset.saturating_add(fp_timing_size) > data_block_size
+            || entry.dvo_timing.offset.saturating_add(dvo_timing_size) > data_block_size
+            || entry.panel_pnp_id.offset.saturating_add(pnp_size) > data_block_size
+        {
+            return false;
+        }
+    }
+    if pointers
+        .panel_name
+        .offset
+        .saturating_add(16 * panel_name_size)
+        > data_block_size
+    {
+        return false;
+    }
+    for entry in pointers.entries {
+        let Some(end) = entry.fp_timing.offset.checked_add(fp_timing_size) else {
+            return false;
+        };
+        let terminator = u16_zero_padded(data, end - 2);
+        if terminator != 0xffff {
+            return false;
+        }
+    }
+    true
+}
+
+/// Match i915's make_lfp_data_ptr() tail-first offset construction.
+// upstream: intel_bios.c make_lfp_data_ptr()
+fn make_lfp_data_ptr(table_size: usize, total_size: usize) -> (LfpDataPointer, usize) {
+    if total_size < table_size {
+        (LfpDataPointer::default(), total_size)
+    } else {
+        (
+            LfpDataPointer {
+                offset: total_size - table_size,
+                table_size,
+            },
+            total_size - table_size,
+        )
+    }
+}
+
+/// Advance one entry while preserving the preceding pointer's table size.
+// upstream: intel_bios.c next_lfp_data_ptr()
+fn next_lfp_data_ptr(previous: LfpDataPointer, size: usize) -> LfpDataPointer {
+    LfpDataPointer {
+        offset: previous.offset + size,
+        table_size: previous.table_size,
+    }
+}
+
+/// Synthesize block 41 for a modern VBT that omits its LFP data pointers.
+// upstream: intel_bios.c generate_lfp_data_ptrs()
+fn generate_lfp_data_ptrs(vbt: &Vbt<'_>) -> Result<Option<LfpDataPointers>, Error> {
+    if vbt.version < 155 {
+        return Ok(None);
+    }
+    let Some(data) = vbt.find_raw_section(42)? else {
+        return Ok(None);
+    };
+    let fp_timing_size = 38;
+    let dvo_timing_size = 18;
+    let pnp_size = 12;
+    let stride = fp_timing_size + dvo_timing_size + pnp_size;
+    if stride * 16 > data.len() {
+        return Ok(None);
+    }
+    let mut first = LfpDataEntryPointers::default();
+    let (panel_pnp_id, size) = make_lfp_data_ptr(pnp_size, stride);
+    first.panel_pnp_id = panel_pnp_id;
+    let (dvo_timing, size) = make_lfp_data_ptr(dvo_timing_size, size);
+    first.dvo_timing = dvo_timing;
+    let (fp_timing, size) = make_lfp_data_ptr(fp_timing_size, size);
+    first.fp_timing = fp_timing;
+    if size != 0 {
+        return Ok(None);
+    }
+    let mut entries = [LfpDataEntryPointers::default(); 16];
+    entries[0] = first;
+    for index in 1..16 {
+        let previous = entries[index - 1];
+        entries[index] = LfpDataEntryPointers {
+            fp_timing: next_lfp_data_ptr(previous.fp_timing, stride),
+            dvo_timing: next_lfp_data_ptr(previous.dvo_timing, stride),
+            panel_pnp_id: next_lfp_data_ptr(previous.panel_pnp_id, stride),
+        };
+    }
+    let panel_name_size = 13;
+    let mut pointers = LfpDataPointers {
+        num_entries: 3,
+        entries,
+        panel_name: LfpDataPointer::default(),
+    };
+    if 16 * (stride + panel_name_size) <= data.len() {
+        pointers.panel_name = LfpDataPointer {
+            offset: stride * 16,
+            table_size: panel_name_size,
+        };
+    }
+    let offset = raw_block_offset(vbt.bdb, vbt.header_size, 42)?;
+    for entry in &mut pointers.entries {
+        entry.fp_timing.offset += offset;
+        entry.dvo_timing.offset += offset;
+        entry.panel_pnp_id.offset += offset;
+    }
+    if pointers.panel_name.table_size != 0 {
+        pointers.panel_name.offset += offset;
+    }
+    Ok(Some(pointers))
 }
 
 const fn psr_wakeup_time(code: u8, psr2: bool) -> u32 {
@@ -533,7 +912,7 @@ impl<'a> GeneralDefinitions<'a> {
                     use_vbt_vswing: self.version >= 218 && byte(23) & 32 != 0,
                     lspcon: self.version >= 192 && byte(23) & 4 != 0,
                     dp_max_lane_count: if self.version >= 244 {
-                        (byte(23) >> 6) + 1
+                        byte(23) >> 6
                     } else {
                         0
                     },
@@ -617,10 +996,6 @@ impl ChildDevice<'_> {
     pub const fn supports_dsi(self) -> bool {
         self.device_type & (1 << 10) != 0
     }
-    // upstream: intel_bios_encoder_is_lspcon()
-    pub const fn is_lspcon(self) -> bool {
-        self.lspcon
-    }
     pub const fn gmbus_pin(self) -> Option<u8> {
         map_ddc_pin(self.ddc_pin)
     }
@@ -639,7 +1014,7 @@ impl ChildDevice<'_> {
         if vbt_version < 244 {
             0
         } else {
-            self.dp_max_lane_count
+            self.dp_max_lane_count + 1
         }
     }
     // upstream: intel_bios.c intel_bios_encoder_reject_edp_rate()
@@ -883,6 +1258,60 @@ mod tests {
         assert_eq!(parsed.psr2_tp2_tp3_wakeup_us, 50);
     }
     #[test]
+    fn lfp_pointer_generation_uses_upstream_stride_and_validates_terminators() {
+        let stride = 38 + 18 + 12;
+        let mut data_block = vec![0u8; stride * 16];
+        for panel in 0..16 {
+            let term = panel * stride + 36;
+            data_block[term..term + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        }
+        let data = append_section(table(&tc_hdmi(), 39), 42, &data_block);
+        let vbt = Vbt::parse(&data).unwrap();
+        let generated = vbt.parse_lfp_data_pointers().unwrap().unwrap();
+        assert_eq!(generated.num_entries, 3);
+        assert_eq!(generated.entries[0].fp_timing.offset, 0);
+        assert_eq!(generated.entries[0].dvo_timing.offset, 38);
+        assert_eq!(generated.entries[0].panel_pnp_id.offset, 56);
+        assert_eq!(generated.entries[15].fp_timing.offset, stride * 15);
+        assert_eq!(generated.panel_name.table_size, 0);
+        assert_eq!(vbt.lfp_data_min_size().unwrap(), 1216);
+
+        let mut bad = data_block;
+        bad[36..38].fill(0);
+        let bad_data = append_section(table(&tc_hdmi(), 39), 42, &bad);
+        assert!(Vbt::parse(&bad_data)
+            .unwrap()
+            .parse_lfp_data_pointers()
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    fn lfp_dvo_detail_timing_unpacks_and_clamps_edid_dtd_fields() {
+        let mut dtd = [0u8; 18];
+        dtd[0..2].copy_from_slice(&14_850u16.to_le_bytes());
+        dtd[2] = 0x80;
+        dtd[3] = 0x18;
+        dtd[4] = 0x71;
+        dtd[5] = 0x38;
+        dtd[6] = 45;
+        dtd[7] = 0x40;
+        dtd[8] = 88;
+        dtd[9] = 44;
+        dtd[10] = 0x54;
+        dtd[12] = 0x12;
+        dtd[13] = 0x34;
+        dtd[14] = 0x56;
+        dtd[17] = 0x60;
+        let timing = fill_detail_timing_data(&dtd).unwrap();
+        assert_eq!((timing.hdisplay, timing.htotal), (1920, 2200));
+        assert_eq!((timing.vdisplay, timing.vtotal), (1080, 1125));
+        assert_eq!((timing.hsync_start, timing.hsync_end), (2008, 2052));
+        assert_eq!((timing.vsync_start, timing.vsync_end), (1084, 1089));
+        assert_eq!(timing.clock_khz, 148_500);
+        assert_eq!((timing.width_mm, timing.height_mm), (0x512, 0x634));
+        assert!(timing.hsync_positive && timing.vsync_positive);
+    }
+    #[test]
     fn every_truncation_and_bad_extent_fails_without_panic() {
         let data = table(&tc_hdmi(), 39);
         for end in 0..data.len() {
@@ -979,12 +1408,12 @@ mod tests {
         let mut data = table(&tc_hdmi(), 39);
         data[70] = 53;
         data[73] = 3;
-        let size = (data.len() - 73) as u32;
+        let size = (data.len() - 78) as u32;
         data[74..78].copy_from_slice(&size.to_le_bytes());
         let vbt = Vbt::parse(&data).unwrap();
         assert_eq!(
             vbt.find_raw_section(53).unwrap().unwrap().len(),
-            size as usize
+            size as usize + 5
         );
         data[74..78].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(

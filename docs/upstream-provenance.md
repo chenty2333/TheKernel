@@ -578,8 +578,9 @@ copyright and `LICENSE-MIT`. Current source-to-Rust mapping:
   and revision/stepping lookup; PCI ID facts from `include/drm/intel/pciids.h`.
 - `intel_bios.c` / `intel_vbt_defs.h` → `src/intel_bios.rs`: VBT/BDB extent and
   raw-block lookup, general features/definitions, child records, XELPD DVO,
-  HDMI/DP caps, eDP settings, and PSR timing. More `intel_bios.c` functions
-  remain to translate; no GPL source was used.
+  HDMI/DP caps, eDP and PSR settings, LFP pointer validation/generation, and
+  LFP detailed timings. More `intel_bios.c` functions remain to translate; no
+  GPL source was used.
 - `intel_opregion.c` → `src/opregion.rs`: header/ASLE layout facts, external
   RVDA address/size and mailbox VBT lookup only. No ASLE/ACPI/SWSCI writes.
 
