@@ -1,6 +1,6 @@
 //! Device driver prelude that includes some traits and types.
 
-pub use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
+pub use axdriver_base::{firmware, BaseDriverOps, DevError, DevResult, DeviceType};
 #[cfg(feature = "block")]
 pub use {
     crate::structs::AxBlockDevice,

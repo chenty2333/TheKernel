@@ -850,6 +850,12 @@ fn init_tls() {
 /// Rootfs-only runtime firmware loader. Small fixed cap; no arbitrary DMA image.
 #[cfg(all(feature = "fs-ng", feature = "net-ng"))]
 fn read_network_firmware(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    read_rootfs_firmware(path, 64 * 1024)
+}
+
+/// Shared driver firmware reader installed into `axdriver::prelude::firmware`.
+#[cfg(all(feature = "fs-ng", feature = "axdriver"))]
+fn read_rootfs_firmware(path: &str, max_len: usize) -> Option<alloc::vec::Vec<u8>> {
     let context = axfs_ng::ROOT_FS_CONTEXT.get()?;
     let file = axfs_ng::OpenOptions::new().read(true).open(context, axfs_ng::FsPath::new(path.as_bytes())).ok()?.into_file().ok()?;
     let mut bytes = alloc::vec::Vec::new();
@@ -857,13 +863,13 @@ fn read_network_firmware(path: &str) -> Option<alloc::vec::Vec<u8>> {
     loop {
         let length = file.read_slice(&mut chunk).ok()?;
         if length == 0 { return Some(bytes); }
-        if bytes.len().checked_add(length)? > 64 * 1024 { return None; }
+        if bytes.len().checked_add(length)? > max_len { return None; }
         bytes.try_reserve(length).ok()?;
         bytes.extend_from_slice(&chunk[..length]);
     }
 }
 
-#[cfg(all(feature = "fs-ng", feature = "net-ng"))]
+#[cfg(all(feature = "fs-ng", feature = "axdriver"))]
 extern crate alloc;
 
 
@@ -890,6 +896,11 @@ fn init_device_subsystems() {
         early_screen_milestone("filesystems");
         #[cfg(feature = "fs-ng")]
         axfs_ng::init_filesystems(all_devices.block);
+        #[cfg(feature = "fs-ng")]
+        {
+            axdriver::prelude::firmware::set_reader(read_rootfs_firmware);
+            axdriver::prelude::firmware::run_rootfs_ready();
+        }
         #[cfg(all(feature = "fs-ng", feature = "net-ng"))]
         for device in all_devices.net.iter_mut() {
             #[allow(unused_imports)]

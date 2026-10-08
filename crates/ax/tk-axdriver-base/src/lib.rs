@@ -15,6 +15,8 @@
 
 #![no_std]
 
+pub mod firmware;
+
 /// All supported device types.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DeviceType {
