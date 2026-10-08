@@ -16,10 +16,11 @@ use axdriver_iwx::{
     AX211_DEVICE_ID, AttachAllocationError, AttachProfile, CsrAccess, DmaAllocator, DmaError,
     DmaRegion, FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IoBarrier,
     IwxController, NvmInfo, PreinitPlan, RuntimeConfig, attach_profile, matches_pci_device,
-    preinit_plan,
+    preinit_plan, setup_ht_rate_capabilities, setup_vht_rate_capabilities,
 };
 use axdriver_net::{
     EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps, WirelessFrequency,
+    WirelessHtCapabilities, WirelessPhyCapabilities, WirelessVhtCapabilities,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -315,6 +316,27 @@ impl NetDriverOps for IwxNetDevice {
             .collect()
     }
 
+    fn wireless_phy_capabilities(&self) -> WirelessPhyCapabilities {
+        let devices = ATTACHED_DMA.lock();
+        let Some(device) = devices.iter().find(|device| device.bdf == self.bdf) else {
+            return WirelessPhyCapabilities::default();
+        };
+        let Some(preinit) = device.preinit.as_ref() else {
+            return WirelessPhyCapabilities::default();
+        };
+        match preinit {
+            PreinitPlan::Initialize {
+                ht_rates,
+                vht_rates,
+                ..
+            } => WirelessPhyCapabilities {
+                ht: ht_rates.map(encode_ht_capabilities),
+                vht: vht_rates.map(encode_vht_capabilities),
+            },
+            PreinitPlan::RefreshAddress(_) => WirelessPhyCapabilities::default(),
+        }
+    }
+
     fn set_link_up(&mut self, up: bool) -> DevResult {
         let bdf = DeviceFunction {
             bus: self.bdf.0,
@@ -403,6 +425,43 @@ impl NetDriverOps for IwxNetDevice {
 
     fn rx_poll_interval_micros(&self) -> Option<u64> {
         Some(10_000)
+    }
+}
+
+fn encode_ht_capabilities(rates: axdriver_iwx::HtRateCapabilities) -> WirelessHtCapabilities {
+    let mut capability = 0x0020 | 0x0040 | 0x0002 | (3 << 2);
+    capability |= u16::from(rates.rx_stbc_streams) << 8;
+    if rates.tx_stbc {
+        capability |= 0x0080;
+    }
+    let mut mcs_set = rates.supported_mcs;
+    if rates.tx_mcs_set_defined {
+        mcs_set[12] = 1;
+    }
+    WirelessHtCapabilities {
+        capability,
+        ampdu_parameters: (5 << 2) | 3,
+        mcs_set,
+    }
+}
+
+fn encode_vht_capabilities(rates: axdriver_iwx::VhtRateCapabilities) -> WirelessVhtCapabilities {
+    let mut capability = (7u32 << 23) | (1 << 2) | 0x20 | 0x40;
+    capability |= u32::from(rates.rx_stbc_streams) << 8;
+    if rates.rx_antenna_pattern {
+        capability |= 0x1000_0000;
+    }
+    if rates.tx_stbc {
+        capability |= 0x80;
+    } else if rates.tx_antenna_pattern {
+        capability |= 0x2000_0000;
+    }
+    let mut mcs_set = [0u8; 8];
+    mcs_set[..2].copy_from_slice(&rates.rx_mcs_map.to_le_bytes());
+    mcs_set[4..6].copy_from_slice(&rates.tx_mcs_map.to_le_bytes());
+    WirelessVhtCapabilities {
+        capability,
+        mcs_set,
     }
 }
 
@@ -1206,5 +1265,62 @@ mod tests {
         packet.packet_mut().fill(0x5a);
         assert_eq!(packet.packet(), &[0x5a; 32]);
         device.recycle_rx_buffer(packet).unwrap();
+    }
+
+    #[test]
+    fn source_ht_vht_capabilities_follow_nvm_mimo_and_sku_flags() {
+        let nvm = NvmInfo {
+            hardware_address: [2, 0, 0, 0, 0, 1],
+            nvm_version: 0,
+            board_type: 0,
+            hardware_address_count: 1,
+            empty_otp: false,
+            band_24ghz: true,
+            band_52ghz: true,
+            supports_11n: true,
+            supports_11ac: true,
+            supports_11ax: true,
+            mimo_disabled: false,
+            valid_tx_antennas: 0x03,
+            valid_rx_antennas: 0x03,
+            lar_enabled: false,
+            channel_profiles: Vec::new(),
+        };
+        let ht = encode_ht_capabilities(setup_ht_rate_capabilities(
+            nvm.valid_tx_antennas,
+            nvm.valid_rx_antennas,
+            true,
+        ));
+        assert_eq!(ht.capability, 0x01ee);
+        assert_eq!(&ht.mcs_set[..2], &[0xff, 0xff]);
+        assert_eq!(ht.mcs_set[12], 1);
+        assert_eq!(ht.ampdu_parameters, 0x17);
+
+        let vht = encode_vht_capabilities(setup_vht_rate_capabilities(
+            nvm.valid_tx_antennas,
+            nvm.valid_rx_antennas,
+            true,
+        ));
+        assert_eq!(vht.capability, 0x0380_01e4);
+        assert_eq!(&vht.mcs_set[..2], &[0xfa, 0xff]);
+        assert_eq!(&vht.mcs_set[4..6], &[0xfa, 0xff]);
+
+        let mut single_stream = nvm.clone();
+        single_stream.mimo_disabled = true;
+        let ht = encode_ht_capabilities(setup_ht_rate_capabilities(
+            single_stream.valid_tx_antennas,
+            single_stream.valid_rx_antennas,
+            false,
+        ));
+        assert_eq!(&ht.mcs_set[..2], &[0xff, 0]);
+        let vht = encode_vht_capabilities(setup_vht_rate_capabilities(
+            single_stream.valid_tx_antennas,
+            single_stream.valid_rx_antennas,
+            false,
+        ));
+        assert_eq!(&vht.mcs_set[..2], &[0xfe, 0xff]);
+
+        let no_phy = WirelessPhyCapabilities::default();
+        assert!(no_phy.vht.is_none());
     }
 }

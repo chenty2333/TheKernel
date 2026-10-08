@@ -40,6 +40,30 @@ pub struct WirelessFrequency {
     pub no_ir: bool,
 }
 
+/// IEEE 802.11 HT capability bytes advertised by an 802.11 radio.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WirelessHtCapabilities {
+    pub capability: u16,
+    pub ampdu_parameters: u8,
+    /// The UAPI 16-byte HT MCS information block.
+    pub mcs_set: [u8; 16],
+}
+
+/// IEEE 802.11 VHT capability and MCS-map bytes for a radio.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WirelessVhtCapabilities {
+    pub capability: u32,
+    /// RX map/highest rate followed by TX map/highest rate (8 bytes).
+    pub mcs_set: [u8; 8],
+}
+
+/// Negotiated local PHY capabilities exported to generic wireless users.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WirelessPhyCapabilities {
+    pub ht: Option<WirelessHtCapabilities>,
+    pub vht: Option<WirelessVhtCapabilities>,
+}
+
 /// Operations that require a network device (NIC) driver to implement.
 pub trait NetDriverOps: BaseDriverOps {
     /// Preferred init-net interface name, when the driver owns a named link.
@@ -71,6 +95,11 @@ pub trait NetDriverOps: BaseDriverOps {
     /// Frequencies validated by the device NVM/regulatory admission path.
     fn wireless_frequencies(&self) -> alloc::vec::Vec<WirelessFrequency> {
         alloc::vec::Vec::new()
+    }
+
+    /// HT/VHT capabilities admitted by the radio's NVM and local antenna policy.
+    fn wireless_phy_capabilities(&self) -> WirelessPhyCapabilities {
+        WirelessPhyCapabilities::default()
     }
 
     /// Change administrative radio state before the interface state is published.

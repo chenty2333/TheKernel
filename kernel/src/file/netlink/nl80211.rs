@@ -34,6 +34,12 @@ const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
 const ATTR_REG_ALPHA2: u16 = 33;
 const BAND_ATTR_FREQS: u16 = 1;
 const BAND_ATTR_RATES: u16 = 2;
+const BAND_ATTR_HT_MCS_SET: u16 = 3;
+const BAND_ATTR_HT_CAPA: u16 = 4;
+const BAND_ATTR_HT_AMPDU_FACTOR: u16 = 5;
+const BAND_ATTR_HT_AMPDU_DENSITY: u16 = 6;
+const BAND_ATTR_VHT_MCS_SET: u16 = 7;
+const BAND_ATTR_VHT_CAPA: u16 = 8;
 const FREQ_ATTR_FREQ: u16 = 1;
 const FREQ_ATTR_NO_IR: u16 = 3;
 const BITRATE_ATTR_RATE: u16 = 1;
@@ -305,6 +311,34 @@ fn wiphy_message(
                 &frequencies,
             );
             append_supported_rates(&mut attributes, is_2ghz);
+            if let Some(ht) = interface.phy_capabilities.ht {
+                push_attr(&mut attributes, BAND_ATTR_HT_MCS_SET, &ht.mcs_set);
+                push_attr(
+                    &mut attributes,
+                    BAND_ATTR_HT_CAPA,
+                    &ht.capability.to_ne_bytes(),
+                );
+                push_attr(
+                    &mut attributes,
+                    BAND_ATTR_HT_AMPDU_FACTOR,
+                    &[ht.ampdu_parameters & 0x03],
+                );
+                push_attr(
+                    &mut attributes,
+                    BAND_ATTR_HT_AMPDU_DENSITY,
+                    &[(ht.ampdu_parameters >> 2) & 0x07],
+                );
+            }
+            if !is_2ghz {
+                if let Some(vht) = interface.phy_capabilities.vht {
+                    push_attr(&mut attributes, BAND_ATTR_VHT_MCS_SET, &vht.mcs_set);
+                    push_attr(
+                        &mut attributes,
+                        BAND_ATTR_VHT_CAPA,
+                        &vht.capability.to_ne_bytes(),
+                    );
+                }
+            }
             push_attr(&mut bands, band_id | NLA_F_NESTED, &attributes);
         }
     }
@@ -498,6 +532,17 @@ mod tests {
                     no_ir: true,
                 },
             ],
+            phy_capabilities: axnet::WirelessPhyCapabilities {
+                ht: Some(axnet::WirelessHtCapabilities {
+                    capability: 0x016e,
+                    ampdu_parameters: 0x17,
+                    mcs_set: [0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+                }),
+                vht: Some(axnet::WirelessVhtCapabilities {
+                    capability: 0x0380_01e4,
+                    mcs_set: [0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0],
+                }),
+            },
             soft_blocked: false,
             hard_blocked: false,
         };
@@ -541,9 +586,16 @@ mod tests {
         let attrs = &message[generic + size_of::<GenlMsgHdr>()..];
         let mut frequencies = Vec::new();
         let mut band_rates = Vec::new();
+        let mut band_capabilities = Vec::new();
         for_each_rtattr(attrs, |kind, value| {
             if kind == ATTR_WIPHY_BANDS {
                 for_each_rtattr(value, |band, band_attributes| {
+                    let mut ht_capability = None;
+                    let mut ht_mcs = None;
+                    let mut ampdu_factor = None;
+                    let mut ampdu_density = None;
+                    let mut vht_capability = None;
+                    let mut vht_mcs = None;
                     for_each_rtattr(band_attributes, |band_kind, band_value| {
                         if band_kind == BAND_ATTR_FREQS {
                             for_each_rtattr(band_value, |_, frequency_attributes| {
@@ -574,9 +626,33 @@ mod tests {
                                 })
                             })?;
                             band_rates.push((band, rates));
+                        } else if band_kind == BAND_ATTR_HT_CAPA {
+                            ht_capability =
+                                Some(u16::from_ne_bytes(band_value.try_into().unwrap()));
+                        } else if band_kind == BAND_ATTR_HT_MCS_SET {
+                            ht_mcs = Some(band_value.to_vec());
+                        } else if band_kind == BAND_ATTR_HT_AMPDU_FACTOR {
+                            ampdu_factor = Some(band_value[0]);
+                        } else if band_kind == BAND_ATTR_HT_AMPDU_DENSITY {
+                            ampdu_density = Some(band_value[0]);
+                        } else if band_kind == BAND_ATTR_VHT_CAPA {
+                            vht_capability =
+                                Some(u32::from_ne_bytes(band_value.try_into().unwrap()));
+                        } else if band_kind == BAND_ATTR_VHT_MCS_SET {
+                            vht_mcs = Some(band_value.to_vec());
                         }
                         Ok(())
-                    })
+                    })?;
+                    band_capabilities.push((
+                        band,
+                        ht_capability,
+                        ht_mcs,
+                        ampdu_factor,
+                        ampdu_density,
+                        vht_capability,
+                        vht_mcs,
+                    ));
+                    Ok(())
                 })?;
             }
             Ok(())
@@ -586,9 +662,24 @@ mod tests {
         assert_eq!(
             band_rates,
             [
-                (0, vec![10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540]),
+                (
+                    0,
+                    vec![10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540]
+                ),
                 (1, vec![60, 90, 120, 180, 240, 360, 480, 540]),
             ]
+        );
+        assert_eq!(band_capabilities[0].0, 0);
+        assert_eq!(band_capabilities[0].1, Some(0x016e));
+        assert_eq!(band_capabilities[0].2.as_ref().unwrap().len(), 16);
+        assert_eq!(band_capabilities[0].3, Some(3));
+        assert_eq!(band_capabilities[0].4, Some(5));
+        assert_eq!(band_capabilities[0].5, None);
+        assert_eq!(band_capabilities[1].0, 1);
+        assert_eq!(band_capabilities[1].5, Some(0x0380_01e4));
+        assert_eq!(
+            band_capabilities[1].6.as_ref().unwrap(),
+            &[0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]
         );
     }
 

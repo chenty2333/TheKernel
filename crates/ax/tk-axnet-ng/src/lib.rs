@@ -62,6 +62,10 @@ use smoltcp::wire::{EthernetAddress, Ipv4Cidr, Ipv6Cidr};
 pub use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use spin::Once;
 
+pub use axdriver::prelude::{
+    WirelessHtCapabilities, WirelessPhyCapabilities, WirelessVhtCapabilities,
+};
+
 use self::{
     consts::{GATEWAY, IP, IP_PREFIX},
     device::{EthernetDevice, LoopbackDevice},
@@ -104,6 +108,7 @@ pub struct WirelessInterfaceInfo {
     pub rfkill_index: u32,
     pub mac_address: [u8; 6],
     pub frequencies: alloc::vec::Vec<WirelessFrequencyInfo>,
+    pub phy_capabilities: WirelessPhyCapabilities,
     pub soft_blocked: bool,
     pub hard_blocked: bool,
 }
@@ -252,6 +257,7 @@ pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
             no_ir: frequency.no_ir,
         })
         .collect();
+    let phy_capabilities = dev.wireless_phy_capabilities();
     let stack = default_stack();
     let interface = Box::new(EthernetDevice::new(
         name.to_owned(),
@@ -285,6 +291,7 @@ pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
         rfkill_index: phy_index,
         mac_address,
         frequencies,
+        phy_capabilities,
         soft_blocked,
         hard_blocked,
     });
