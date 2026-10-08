@@ -42,12 +42,33 @@ const HPM_HIPM_GEN_CFG: u32 = 0x00a0_3458;
 const HPM_CFG_CR_PG_EN: u32 = 1;
 const HPM_CFG_CR_SLP_EN: u32 = 1 << 1;
 const HPM_CFG_CR_FORCE_ACTIVE: u32 = 1 << 10;
+const HPM_DEBUG: u32 = 0x00a0_3440;
+const HPM_PERSISTENCE_BIT: u32 = 1 << 12;
+const PREG_PRPH_WPROT_22000: u32 = 0x00a0_4d00;
+const PREG_WFPM_ACCESS: u32 = 1 << 12;
 
 /// A power-sequence operation failed before the device could be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApmError {
     Timeout,
+    PersistenceProtected,
     Register(RegisterError),
+}
+
+/// Clear the 22000 persistence bit unless hardware write protection is set.
+// upstream: if_iwx.c iwx_clear_persistence_bit()
+pub fn clear_persistence_bit<B: CsrAccess>(
+    registers: &mut IwxRegisters<B>,
+) -> Result<(), ApmError> {
+    let hpm = registers.read_prph_unlocked(HPM_DEBUG);
+    if hpm != 0xa5a5_a5a0 && hpm & HPM_PERSISTENCE_BIT != 0 {
+        let write_protect = registers.read_prph_unlocked(PREG_PRPH_WPROT_22000);
+        if write_protect & PREG_WFPM_ACCESS != 0 {
+            return Err(ApmError::PersistenceProtected);
+        }
+        registers.write_prph_unlocked(HPM_DEBUG, hpm & !HPM_PERSISTENCE_BIT);
+    }
+    Ok(())
 }
 
 impl From<RegisterError> for ApmError {
@@ -176,6 +197,9 @@ pub fn start_hardware<B: CsrAccess>(
     integrated_22000: bool,
 ) -> Result<bool, ApmError> {
     prepare_card_hw(registers)?;
+    if registers.family() == DeviceFamily::Family22000 {
+        clear_persistence_bit(registers)?;
+    }
     software_reset(registers);
     if registers.family() == DeviceFamily::Family22000 && integrated_22000 {
         registers.set_csr_bits(CSR_GP_CNTRL, GP_INIT_DONE);
@@ -199,20 +223,41 @@ mod tests {
     use super::*;
     use crate::IoBarrier;
 
+    const HBUS_PRPH_RADDR: u32 = 0x448;
+    const HBUS_PRPH_RDAT: u32 = 0x450;
+    const HBUS_PRPH_WADDR: u32 = 0x444;
+    const HBUS_PRPH_WDAT: u32 = 0x44c;
+
     #[derive(Default)]
     struct Bus {
         regs: BTreeMap<u32, u32>,
+        prph: BTreeMap<u32, u32>,
         writes: Vec<(u32, u32)>,
         delays: u64,
+        prph_read_address: u32,
+        prph_write_address: u32,
     }
 
     impl CsrAccess for Bus {
         fn read32(&mut self, offset: u32) -> u32 {
-            *self.regs.get(&offset).unwrap_or(&0)
+            if offset == HBUS_PRPH_RDAT {
+                *self.prph.get(&self.prph_read_address).unwrap_or(&0)
+            } else {
+                *self.regs.get(&offset).unwrap_or(&0)
+            }
         }
         fn write32(&mut self, offset: u32, value: u32) {
             self.writes.push((offset, value));
-            self.regs.insert(offset, value);
+            match offset {
+                HBUS_PRPH_RADDR => self.prph_read_address = value & 0x00ff_ffff,
+                HBUS_PRPH_WADDR => self.prph_write_address = value & 0x00ff_ffff,
+                HBUS_PRPH_WDAT => {
+                    self.prph.insert(self.prph_write_address, value);
+                }
+                _ => {
+                    self.regs.insert(offset, value);
+                }
+            }
         }
         fn write8(&mut self, offset: u32, value: u8) {
             self.writes.push((offset, u32::from(value)));
@@ -265,5 +310,36 @@ mod tests {
         let bus = regs.into_inner();
         assert!(bus.writes.contains(&(CSR_RESET, RESET_SW)));
         assert!(bus.delays >= 5_000);
+    }
+
+    #[test]
+    fn persistence_clear_honors_write_protect_and_preserves_sentinel() {
+        let hpm_addr = HPM_DEBUG & 0x000f_ffff;
+        let wprot_addr = PREG_PRPH_WPROT_22000 & 0x000f_ffff;
+        let mut bus = Bus::default();
+        bus.prph.insert(hpm_addr, 0x1234 | HPM_PERSISTENCE_BIT);
+        let mut regs = IwxRegisters::new(bus, DeviceFamily::Family22000, 0);
+        clear_persistence_bit(&mut regs).unwrap();
+        let bus = regs.into_inner();
+        assert_eq!(bus.prph[&hpm_addr], 0x234);
+
+        let mut bus = Bus::default();
+        bus.prph.insert(hpm_addr, 0x1234 | HPM_PERSISTENCE_BIT);
+        bus.prph.insert(wprot_addr, PREG_WFPM_ACCESS);
+        let mut regs = IwxRegisters::new(bus, DeviceFamily::Family22000, 0);
+        assert_eq!(
+            clear_persistence_bit(&mut regs),
+            Err(ApmError::PersistenceProtected)
+        );
+        assert_eq!(
+            regs.into_inner().prph[&hpm_addr],
+            0x1234 | HPM_PERSISTENCE_BIT
+        );
+
+        let mut bus = Bus::default();
+        bus.prph.insert(hpm_addr, 0xa5a5_a5a0);
+        let mut regs = IwxRegisters::new(bus, DeviceFamily::Family22000, 0);
+        clear_persistence_bit(&mut regs).unwrap();
+        assert_eq!(regs.into_inner().prph[&hpm_addr], 0xa5a5_a5a0);
     }
 }
