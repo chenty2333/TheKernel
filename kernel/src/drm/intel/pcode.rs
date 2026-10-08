@@ -9,11 +9,14 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use intel_display::intel_pcode_full::{self, IntelPcodeBackend, PcodeLogEvent};
 use kernel_guard::NoPreempt;
 use spin::{Mutex, MutexGuard};
 
-use super::{gmbus::PollTimer, regs::{self, Registers}};
-use intel_display::intel_pcode_full::{self, IntelPcodeBackend, PcodeLogEvent};
+use super::{
+    gmbus::PollTimer,
+    regs::{self, Registers},
+};
 
 static PCODE_SB_LOCK: Mutex<()> = Mutex::new(());
 static WARNED_LONG_TIMEOUT: AtomicBool = AtomicBool::new(false);
@@ -182,8 +185,14 @@ impl<R: Registers, T: PollTimer> IntelPcodeBackend for RegisterPcode<'_, R, T> {
             PcodeLogEvent::ReadFailure { mailbox, error } => {
                 axlog::warn!("intel-pcode: read mailbox {mailbox:#x} failed: {error}");
             }
-            PcodeLogEvent::WriteFailure { mailbox, value, error } => {
-                axlog::warn!("intel-pcode: write {value:#x} to mailbox {mailbox:#x} failed: {error}");
+            PcodeLogEvent::WriteFailure {
+                mailbox,
+                value,
+                error,
+            } => {
+                axlog::warn!(
+                    "intel-pcode: write {value:#x} to mailbox {mailbox:#x} failed: {error}"
+                );
             }
             PcodeLogEvent::RetryWithPreemptionDisabled => {
                 axlog::debug!("intel-pcode: retrying request with preemption disabled");
@@ -199,7 +208,9 @@ impl<R: Registers, T: PollTimer> IntelPcodeBackend for RegisterPcode<'_, R, T> {
 
     fn warn_on_once_timeout_base(&mut self, timeout_base_ms: i32) {
         if !WARNED_LONG_TIMEOUT.swap(true, Ordering::AcqRel) {
-            self.log(PcodeLogEvent::TimeoutBaseExceedsExpected(timeout_base_ms as u32));
+            self.log(PcodeLogEvent::TimeoutBaseExceedsExpected(
+                timeout_base_ms as u32,
+            ));
         }
     }
 
@@ -239,7 +250,9 @@ impl<R: Registers, T: PollTimer> IntelPcodeBackend for RegisterPcode<'_, R, T> {
         F: FnMut(&mut Self) -> bool,
     {
         let start = self.timer.now_micros();
-        let budget = u64::try_from(timeout_ms.max(0)).unwrap_or(0).saturating_mul(1_000);
+        let budget = u64::try_from(timeout_ms.max(0))
+            .unwrap_or(0)
+            .saturating_mul(1_000);
         loop {
             if condition(self) {
                 return 0;
@@ -299,4 +312,41 @@ pub(crate) fn commit_cdclk_voltage<R: Registers, T: PollTimer>(
         1,
     );
     io.result(status)
+}
+
+/// Read one source-defined GEN9 display memory-latency dword. `skl_wm_latency`
+/// consumes indices zero and one for the eight watermark latency slots.
+pub(crate) fn read_wm_latency<R: Registers, T: PollTimer>(
+    regs: &R,
+    timer: &T,
+    index: u32,
+) -> Result<u32, PcodeError> {
+    if index > 1 {
+        return Err(PcodeError::MailboxStatus(-intel_pcode_full::EINVAL));
+    }
+    let mailbox = intel_pcode_full::GEN9_PCODE_READ_MEM_LATENCY
+        | ((index << 8) & intel_pcode_full::GEN6_PCODE_MB_PARAM1);
+    let mut value = 0u32;
+    let mut io = RegisterPcode::new(regs, timer, 12, false);
+    let status = intel_pcode_full::snb_pcode_read(&mut io, mailbox, &mut value, None);
+    io.result(status)?;
+    Ok(value)
+}
+
+/// Read the display-12/13 PCode SAGV block time. i915 treats an unavailable
+/// value as zero for watermark calculations and logs the failure at its caller.
+pub(crate) fn read_sagv_block_time_us<R: Registers, T: PollTimer>(
+    regs: &R,
+    timer: &T,
+) -> Result<u32, PcodeError> {
+    let mut value = 0u32;
+    let mut io = RegisterPcode::new(regs, timer, 12, false);
+    let status = intel_pcode_full::snb_pcode_read(
+        &mut io,
+        intel_pcode_full::GEN12_PCODE_READ_SAGV_BLOCK_TIME_US,
+        &mut value,
+        None,
+    );
+    io.result(status)?;
+    Ok(value)
 }

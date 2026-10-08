@@ -268,6 +268,13 @@ struct PowerPin {
     before: [u32; 3],
     masks: [u32; 3],
 }
+
+fn source_watermark_config() -> Option<super::pipe::WatermarkConfig> {
+    super::POWER
+        .lock()
+        .as_ref()
+        .map(super::power::PowerState::watermark_config)
+}
 impl PowerPin {
     fn acquire(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
         // i915 XELPD power map: PW1, PW2 and PWA; DDI_IO and legacy AUX.
@@ -1373,6 +1380,10 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             let old_mode = state.current_mode;
             let old_surface = before;
             let old_pitch = old_firmware.plane.pitch;
+            let Some(watermark) = source_watermark_config() else {
+                complete.signal_error();
+                return Err(DrmError::DeviceLost);
+            };
             let mut display_writes_started = false;
             let transition = super::tc_modeset::program(
                 &self.registers,
@@ -1381,6 +1392,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                 &target.timing,
                 s.pitch,
                 surface,
+                Some(watermark),
                 &target_pll,
                 self.afc_startup,
                 &avi_words,
@@ -1459,6 +1471,7 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             &old_mode.timing,
                             old_pitch,
                             old_surface,
+                            Some(watermark),
                             &old_firmware.pll.state,
                             self.afc_startup,
                             &old_avi,
@@ -2560,6 +2573,7 @@ mod tests {
             &probe_target.timing,
             probe_pitch,
             probe_surface,
+            None,
             &probe_pll,
             None,
             &probe_avi,

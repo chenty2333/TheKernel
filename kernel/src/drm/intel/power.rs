@@ -81,6 +81,7 @@ use intel_display::{
     power_map::{
         PowerDomain, PowerWellGroup, PowerWellInstance, WellControl, WellOps, power_wells,
     },
+    skl_watermark_full::{self, DisplayCaps as WatermarkDisplayCaps, WmLatencyIo},
 };
 
 use super::{
@@ -698,6 +699,9 @@ pub(crate) struct PowerState {
     pub(crate) pcode_cdclk_prepared: bool,
     /// Voltage level accepted by PCODE after a newly programmed CDCLK.
     pub(crate) pcode_voltage_level: Option<u8>,
+    pub(crate) wm_latencies: [u32; skl_watermark_full::WM_LEVELS],
+    pub(crate) wm_num_levels: usize,
+    pub(crate) sagv_block_time_us: u32,
     pub(crate) raw_clock: clk::RawClockState,
     pub(crate) dbuf: DbufState,
     pub(crate) workarounds: WorkaroundState,
@@ -706,6 +710,15 @@ pub(crate) struct PowerState {
 impl PowerState {
     fn power_map(&self) -> &'static [PowerWellGroup] {
         power_wells(self.platform)
+    }
+
+    pub(crate) fn watermark_config(&self) -> super::pipe::WatermarkConfig {
+        super::pipe::WatermarkConfig {
+            display_ver: 13,
+            latencies: self.wm_latencies,
+            num_levels: self.wm_num_levels,
+            sagv_block_time_us: self.sagv_block_time_us,
+        }
     }
 
     /// Acquire one source-mapped domain and its dependent power wells.
@@ -856,6 +869,12 @@ impl PowerState {
             self.pcode_voltage_level
                 .map_or_else(|| String::from("unchanged"), |level| format!("{level}")),
         ));
+        line(format!(
+            "i915 WM latency levels ({}): {:?} us",
+            self.wm_num_levels,
+            &self.wm_latencies[..self.wm_num_levels.min(self.wm_latencies.len())],
+        ));
+        line(format!("SAGV block time: {} us", self.sagv_block_time_us));
         line(self.raw_clock.describe());
         line(self.dbuf.describe());
         line(self.workarounds.describe());
@@ -1045,6 +1064,26 @@ fn requesters(regs: &impl Registers, well: Well) -> Result<Requesters, PowerErro
             .is_some_and(|value| value & mask != 0),
         debug: read(regs, well.request_registers.debug)? & mask != 0,
     })
+}
+
+/// PCode-only part of translated i915 WM-latency initialization. ADL-N is
+/// display-13, so the display-14+ MTL latency register path is not admitted.
+struct PcodeWmLatency<'a, R, T> {
+    regs: &'a R,
+    timer: &'a T,
+}
+
+impl<R: Registers, T: super::gmbus::PollTimer> WmLatencyIo for PcodeWmLatency<'_, R, T> {
+    fn read_mtl_latency_reg(&self, _index: usize) -> u32 {
+        unreachable!("display-13 uses the source SKL PCode latency path")
+    }
+
+    fn read_skl_latency_pcode(&self, index: u32) -> Result<u32, i32> {
+        super::pcode::read_wm_latency(self.regs, self.timer, index).map_err(|error| match error {
+            super::pcode::PcodeError::MailboxStatus(status) => status,
+            _ => -5, // EIO: mailbox register/backend unavailable.
+        })
+    }
 }
 
 struct HswPowerWellAdapter<'a, R: Registers> {
@@ -1713,19 +1752,15 @@ fn bring_up_inner(
         } else {
             2
         };
-        super::pcode::commit_cdclk_voltage(
-            regs,
-            &pcode_timer,
-            programmed.entry.cdclk_khz,
-        )
-        .map_err(|error| {
-            unwind(
-                regs,
-                we_requested,
-                "the PCode CDCLK voltage update",
-                PowerError::Pcode(format!("{error:?}")),
-            )
-        })?;
+        super::pcode::commit_cdclk_voltage(regs, &pcode_timer, programmed.entry.cdclk_khz)
+            .map_err(|error| {
+                unwind(
+                    regs,
+                    we_requested,
+                    "the PCode CDCLK voltage update",
+                    PowerError::Pcode(format!("{error:?}")),
+                )
+            })?;
         Some(level)
     } else {
         None
@@ -1742,6 +1777,49 @@ fn bring_up_inner(
     // Phase 1.5.
     let dbuf =
         enable_dbuf(regs).map_err(|error| unwind(regs, we_requested, "the DBUF step", error))?;
+
+    // Source `skl_wm_init` obtains the display-12/13 latency table from PCode
+    // before plane watermark computation. Preserve the source's level
+    // adjustment and sanitization instead of using a made-up latency profile.
+    let mut wm_latencies = [0u32; skl_watermark_full::WM_LEVELS];
+    let wm_display = WatermarkDisplayCaps {
+        display_ver: 13,
+        display_ver_fixed: 13,
+        alderlake_p: true,
+        sagv: true,
+        sagv_wm: true,
+        has_hw_sagv_wm: true,
+        ..WatermarkDisplayCaps::default()
+    };
+    let wm_num_levels = skl_watermark_full::skl_setup_wm_latency(
+        &PcodeWmLatency {
+            regs,
+            timer: &pcode_timer,
+        },
+        &wm_display,
+        &mut wm_latencies,
+    )
+    .map_err(|error| {
+        unwind(
+            regs,
+            we_requested,
+            "the PCode watermark-latency read",
+            PowerError::Pcode(format!("watermark latency mailbox returned errno {error}")),
+        )
+    })?;
+    let sagv_block_time_us = match super::pcode::read_sagv_block_time_us(regs, &pcode_timer) {
+        Ok(value) if value <= u16::MAX as u32 => value,
+        Ok(value) => {
+            axlog::warn!("intel-gpu: PCode SAGV block time {value}us exceeds i915's 16-bit limit");
+            0
+        }
+        Err(error) => {
+            // `intel_sagv_block_time()` logs but falls back to zero on this
+            // command's failure; watermark policy keeps the same behavior.
+            axlog::debug!("intel-gpu: could not read PCode SAGV block time: {error:?}");
+            0
+        }
+    };
 
     // Phase 1.6.
     let workarounds = apply_workarounds(regs)
@@ -1811,6 +1889,9 @@ fn bring_up_inner(
         cdclk,
         pcode_cdclk_prepared,
         pcode_voltage_level,
+        wm_latencies,
+        wm_num_levels,
+        sagv_block_time_us,
         raw_clock,
         dbuf,
         workarounds,

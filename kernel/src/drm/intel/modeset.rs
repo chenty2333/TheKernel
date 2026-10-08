@@ -62,6 +62,11 @@
 use alloc::{format, string::String, vec, vec::Vec};
 use core::cmp::Ordering;
 
+use intel_display::intel_display_modeset_full::{
+    self as i915_modeset, DisplayCaps as I915DisplayCaps, DisplayMode as I915DisplayMode,
+    ModeStatus as I915ModeStatus, Timing as I915Timing,
+};
+
 use super::{
     clk::{self, ClockError},
     fb::{self, FbError},
@@ -78,10 +83,6 @@ use super::{
         Register, Registers,
         ddi::{DDI_BUF_CTL_A, DDI_BUF_CTL_B},
     },
-};
-use intel_display::intel_display_modeset_full::{
-    self as i915_modeset, DisplayCaps as I915DisplayCaps, DisplayMode as I915DisplayMode,
-    ModeStatus as I915ModeStatus, Timing as I915Timing,
 };
 use crate::drm::modes::{
     Edid, FallbackReason, Mode, ModeFlags, ModeList, ModePlan, SelectionReason, collect_modes,
@@ -1305,6 +1306,8 @@ pub(crate) struct ModeRequest<'a> {
     /// it, so the honest value is [`LinkRate::NoSourcedEncoding`] until a
     /// working dump settles it (§13.4).
     pub(crate) link_rate: LinkRate,
+    /// i915 WM latency state captured from PCode before modesetting.
+    pub(crate) watermark: Option<pipe::WatermarkConfig>,
 }
 
 impl<'a> ModeRequest<'a> {
@@ -1329,6 +1332,7 @@ impl<'a> ModeRequest<'a> {
             encoding,
             swing: None,
             link_rate: LinkRate::NoSourcedEncoding,
+            watermark: None,
         }
     }
 
@@ -1347,6 +1351,11 @@ impl<'a> ModeRequest<'a> {
     /// `DDI_BUF_CTL.PHY_LINK_RATE`.
     pub(crate) const fn with_link_rate(mut self, link_rate: LinkRate) -> Self {
         self.link_rate = link_rate;
+        self
+    }
+
+    pub(crate) const fn with_watermark(mut self, watermark: pipe::WatermarkConfig) -> Self {
+        self.watermark = Some(watermark);
         self
     }
 }
@@ -1444,6 +1453,8 @@ pub(crate) enum ModesetError {
     NoCdclk { cdclk_khz: u32, detail: String },
     /// The DDI has no `DDI_BUF_CTL` in the register table.
     UnsupportedPort { ddi: Ddi },
+    /// The active kernel path has no PCode-derived watermark profile.
+    WatermarkUnavailable,
     /// The visible console dimensions must equal the programmed mode.
     SurfaceGeometry {
         surface: (u32, u32),
@@ -1468,9 +1479,9 @@ impl ModesetError {
     pub(crate) fn describe(&self) -> String {
         match self {
             ModesetError::Refused(refusal) => refusal.describe(),
-            ModesetError::IntelModeStatus(status) => format!(
-                "i915 display-13 mode validation rejected the selected timing: {status:?}"
-            ),
+            ModesetError::IntelModeStatus(status) => {
+                format!("i915 display-13 mode validation rejected the selected timing: {status:?}")
+            }
             ModesetError::Clock(error) => {
                 format!(
                     "the CDCLK registers could not be read: {}",
@@ -1488,6 +1499,9 @@ impl ModesetError {
                  DDI_BUF_CTL for A and B, and reference section 8.8 defers the Type-C/DKL path \
                  entirely",
                 ddi.name()
+            ),
+            ModesetError::WatermarkUnavailable => String::from(
+                "source-derived watermark latency state is missing; the display plane is not armed",
             ),
             ModesetError::SurfaceGeometry { surface, mode } => format!(
                 "framebuffer {}x{} does not match scanout {}x{}",
@@ -1650,14 +1664,34 @@ pub(crate) fn set_mode<R: Registers, T: PollTimer>(
 
     // Compute the whole program before the first write, so that a computation
     // that cannot succeed costs no register writes at all.
-    let pipe_program = pipe::compute(
-        request.pipe,
-        &mode,
-        pipe::PlaneSurface {
-            ggtt_address: request.surface.ggtt_address(),
-            stride_bytes: request.surface.stride(),
-        },
-    )
+    let pipe_program = match request.watermark {
+        Some(watermark) => pipe::compute_with_watermarks(
+            request.pipe,
+            &mode,
+            pipe::PlaneSurface {
+                ggtt_address: request.surface.ggtt_address(),
+                stride_bytes: request.surface.stride(),
+            },
+            watermark,
+        ),
+        None => {
+            #[cfg(test)]
+            {
+                pipe::compute(
+                    request.pipe,
+                    &mode,
+                    pipe::PlaneSurface {
+                        ggtt_address: request.surface.ggtt_address(),
+                        stride_bytes: request.surface.stride(),
+                    },
+                )
+            }
+            #[cfg(not(test))]
+            {
+                return Err(ModesetError::WatermarkUnavailable);
+            }
+        }
+    }
     .map_err(ModesetError::Pipe)?;
 
     let platform_ref_khz =

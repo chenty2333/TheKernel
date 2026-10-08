@@ -10,7 +10,8 @@
 // Copyright © 2020 Intel Corporation (skl_universal_plane.c).
 // MIT permission text: crates/ax/tk-intel-display/LICENSE-MIT.
 // ADL-P/N display13 legacy TC1/TC2 HDMI only; no Type-C cold exit/ownership
-// acquisition, DP, DSI, combo PHY, CDCLK/PCODE or unsupported workaround path.
+// acquisition, DP, DSI, combo PHY, runtime CDCLK/PCode transition or other
+// unsupported workaround path. Initial CDCLK/PCode setup is in power.rs.
 
 //! Restricted live TC HDMI modeset sequence. Admission and complete before-
 //! image recovery are owned by `fastboot`; this file only performs a forward
@@ -381,9 +382,9 @@ pub(super) fn avi_words_preserve(frame: RawInfoframe) -> Result<[u32; 8], String
 
 /// Program one validated progressive RGB/XRGB timing on an already-active,
 /// already-owned legacy TC port. No cold transition or new PHY ownership is
-/// attempted. Watermark/DDB/DBUF words are intentionally retained from the
-/// stable firmware image; the caller must prove those reservations cover the
-/// target before entering this routine.
+/// attempted. The DDB allocation and DBUF slice programming remain the
+/// source's whole-buffer first-light-up policy, but primary-plane watermarks
+/// are calculated from the PCode-derived latency table for the target mode.
 pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     r: &R,
     timer: &T,
@@ -391,6 +392,7 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     mode: &Mode,
     pitch: u32,
     surface: u32,
+    watermark: Option<pipe::WatermarkConfig>,
     pll: &DklPllState,
     afc_startup: Option<u8>,
     avi: &[u32; 8],
@@ -428,14 +430,25 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     }
     let control_offset = ddi_buf_ctl(port)?;
     let buffer = read(r, control_offset)?;
-    let pipe_program = pipe::compute(
-        pipe::Pipe::A,
-        mode,
-        pipe::PlaneSurface {
-            ggtt_address: u64::from(surface),
-            stride_bytes: pitch,
-        },
-    )
+    let plane_surface = pipe::PlaneSurface {
+        ggtt_address: u64::from(surface),
+        stride_bytes: pitch,
+    };
+    let pipe_program = match watermark {
+        Some(watermark) => {
+            pipe::compute_with_watermarks(pipe::Pipe::A, mode, plane_surface, watermark)
+        }
+        None => {
+            #[cfg(test)]
+            {
+                pipe::compute(pipe::Pipe::A, mode, plane_surface)
+            }
+            #[cfg(not(test))]
+            {
+                return Err(String::from("PCode-derived watermark state absent"));
+            }
+        }
+    }
     .map_err(|e| format!("TC pipe plan refused: {}", e.describe()))?;
     // Preflight every direct RW input needed by this pass before the first
     // destructive write. Power, link, WM/DDB and ownership proof are performed
@@ -447,9 +460,9 @@ pub(super) fn program<R: Registers + Send + Sync, T: PollTimer>(
     let _old_clock = read(r, 0x46140)?;
     let _old_pipeconf = read(r, p::PIPECONF_A.offset())?;
     // Pipe shadow values are all calculated and all heap space is reserved
-    // before the first MMIO write. DDB/WM values are intentionally omitted:
-    // their captured firmware allocation is held stable and preflighted by the
-    // caller against this exact target before entering this function.
+    // before the first MMIO write. The DDB allocation remains the one-pipe
+    // whole-buffer first-light-up policy; its source-derived WM values above
+    // were calculated for this exact target before entering this function.
     let all_shadow = pipe_program.writes(pipe_misc, arb);
     let mut shadow = Vec::new();
     shadow

@@ -69,7 +69,7 @@ arm is a step of its own.
 | — | output depth and arbiter slots | `program` | `PIPE_MISC(A)` `0x70030` (read-modify-write of `[7:5]`, `[4:2]`, `[8]`), `PIPE_ARB_CTL(A)` `0x70028` (`USE_PROG_SLOTS[13]`, read-modify-write) |
 | 3.4 | timings | `compute` → `program` | `TRANS_SET_CONTEXT_LATENCY(A)` `0x6007C`, `TRANS_HTOTAL/HBLANK/HSYNC/VTOTAL/VBLANK/VSYNC(A)` `0x60000`+`0x00`..`0x14`, `PIPESRC(A)` `0x6001C` |
 | 4.1 | DDB | `compute` → `program` | `PLANE_BUF_CFG(A,1)` `0x7027C` |
-| 4.2 | watermarks | `compute` → `program` | `PLANE_WM(A,1,0..5)` `0x70240 + level*4`, `PLANE_WM_TRANS(A,1)` `0x70268`, `PLANE_WM_SAGV` `0x70258`, `PLANE_WM_SAGV_TRANS` `0x7025C` |
+| 4.2 | watermarks | `compute_with_watermarks` → `program` | `PLANE_WM(A,1,0..5)` source-calculated, `PLANE_WM_TRANS(A,1)` `0x70268`, SAGV pair `0x70258`/`0x7025C` |
 | 4.3 | plane, `noarm` | `compute` → `program` | `PLANE_STRIDE(A,1)` `0x70188`, `PLANE_POS` `0x7018C`, `PLANE_SIZE` `0x70190` |
 | 4.3 | plane, shadow `arm` half | `compute` → `program` | `PLANE_OFFSET` `0x701A4`, `PLANE_COLOR_CTL` `0x701CC` |
 | — | **the pipe starts** | `output::program` (another workstream) | `TRANSCONF(A)` `0x70008`, `TRANS_CLK_SEL`, `TRANS_DDI_FUNC_CTL`, `DDI_BUF_CTL` |
@@ -155,11 +155,10 @@ Four ordering details worth stating:
 | `TRANS_VSYNC(A)` | `0x0440_043b` = (1089−1) << 16 \| (1084−1) | `timing.rs`, §6.1 |
 | `PIPESRC(A)` | `0x077f_0437` = (1920−1) << 16 \| (1080−1) | `timing.rs`, §6.1 |
 | `PLANE_BUF_CFG(A,1)` | `0x0fff_0000` = ((4096−1) << 16) \| 0 | §11 step 4.1, §7.2 |
-| `PLANE_WM(A,1,0)` | `0x8007_cfff` = `EN` \| `BLOCKS(4095)` \| `LINES(31)` | §11 step 4.2, §7.3, capped — see §4 |
-| `PLANE_WM(A,1,1..5)` | `0` (disabled, written rather than left alone) | §7.3 |
-| `PLANE_WM_TRANS(A,1)` | `0` (disabled: no transition watermark fits this level 0) | §4.5 |
-| `PLANE_WM_SAGV(A,1)` | `0x8007_cfff`, level 0's value | §4.4 |
-| `PLANE_WM_SAGV_TRANS(A,1)` | `0x8007_cfff`, level 0's value | §4.4 |
+| `PLANE_WM(A,1,0..5)` | source-calculated per mode and PCode latency | translated `skl_build_plane_wm_single`, DDB fit check — see §4.2 |
+| `PLANE_WM_TRANS(A,1)` | source transition value after DDB fit check | `skl_compute_transition_wm` / `skl_check_wm_level` — see §4.5 |
+| `PLANE_WM_SAGV(A,1)` | source SAGV watermark from latency and SAGV block-time data | §4.4 |
+| `PLANE_WM_SAGV_TRANS(A,1)` | source SAGV transition watermark | §4.4 |
 | `PIPE_ARB_CTL(A)` | `1 << 13` = `USE_PROG_SLOTS` | §4.7 |
 | `PLANE_STRIDE(A,1)` | `120` = 7680 bytes / 64 | `[I915]`, see §4 |
 | `PLANE_POS(A,1)` | `0` | §11 step 4.3; one full-screen plane |
@@ -278,96 +277,41 @@ from the same symbols.
 **Still unverified:** that a real Gen12 plane scans out correctly with 120 in
 the field.  The evidence is a vendor-driver source reading, not a measurement.
 
-### 4.2 The generous level-0 watermark cannot name the whole allocation
+### 4.2 The active watermark path now uses the source latency calculation
 
-§11 step 4.2 and §7.3 both say level 0's `BLOCKS` should be the plane's whole
-DDB allocation, and §7.2 makes that allocation 4096 blocks.  `PLANE_WM_BLOCKS`
-is `[11:0]` (§7.3; `skl_universal_plane_regs.h:325`), whose largest value is
-4095.  The instruction is not expressible in the register it names.
+The DDB reservation remains one pipe-A primary plane owning the whole 4096-block
+DBUF for this first-light-up path. Active modesets no longer write the old
+fixed/generous level: `power::bring_up` reads i915's eight PCode memory-latency
+bytes, `skl_setup_wm_latency` selects six levels for display-13
+`HAS_HW_SAGV_WM`, and `pipe::WatermarkProgram::from_i915` calls the translated
+`skl_build_plane_wm_single`, transition, SAGV, and DDB-fit helpers. The source
+algorithm rejects levels whose `min_ddb_alloc` does not fit the whole-buffer
+DDB and the register encoder preserves the 12-bit block/13-bit line fields.
+The old generous profile is now compiled only for tests.
 
-This module writes **4095**, and the reason is stronger than "the field is
-narrow": `[I915]`'s watermark computation rejects a level whose block count
-reaches the DDB allocation — "Bspec says: value >= plane ddb allocation ->
-invalid, hence the +1 here" (`display/skl_watermark.c:1992-1993`) — so 4095 is
-both the largest legal field value and the largest value the vendor driver
-would consider valid for a 4096-block allocation.  It is one block short of the
-instruction and exactly at the vendor driver's ceiling.
+### 4.3 `PLANE_WM_LINES` limit is generation-selected
 
-Recorded as an `[INF]`-grade resolution: the reference's intent ("do not
-under-allocate") is met, the literal number is not.
+The active calculation calls translated `skl_wm_max_lines`: 31 below display
+13 and 255 from display 13 on. N305 is display version 13, so the source
+algorithm may use the larger bound rather than the old fixture's conservative
+31. The field itself remains 13 bits wide.
 
-### 4.3 `PLANE_WM_LINES`' maximum: 31 or 255
+### 4.4 Six plane levels and the SAGV pair are distinct
 
-§7.3 says the maximum is 31, "a hardware limit the PRM states explicitly", and
-warns that the field is 13 bits wide so the hardware will accept larger values.
-`[I915]`'s `skl_wm_max_lines` returns 31 only below display version 13 and
-**255 from 13 on** (`display/skl_watermark.c:1858-1864`), and ADL-N reports
-display version 13 (`display/intel_display_device.c:1051`, `XE_LPD_FEATURES`'s
-`ip.ver = 13`).
+`skl_setup_wm_latency` returns six plane levels when `HAS_HW_SAGV_WM` holds;
+for integrated display 13 it does, and `0x70258`/`0x7025c` remain the separate
+`PLANE_WM_SAGV`/`PLANE_WM_SAGV_TRANS` registers. Active code reads both latency
+and the PCode SAGV block time (`0x23`) and computes the pair with the translated
+SAGV watermark algorithm instead of copying level 0. It does not currently
+change SAGV's global enable/control state, which remains the firmware state.
 
-The generous level writes 31, which is legal under either reading, so nothing
-in this workstream turns on the disagreement.  It matters for the real
-watermark algorithm of §7.4, which would reject levels it need not reject if it
-used the smaller bound.  Not resolved here; noted for whoever implements §7.4.
+### 4.5 `PLANE_WM_TRANS` is source-computed and DDB-checked
 
-### 4.4 `PLANE_WM`'s level 6 and level 7 do not exist — they are the SAGV pair
-
-**The defect the review found, and the one with the worst failure mode.**
-§5.4 and §7.3 give the level formula `PLANE_WM(pipe, plane, level) = 0x70240 +
-level*4`, and §7.4 step 1 has PCode return latency levels 0-3 and 4-7, so the
-first version of this module iterated to eight and wrote a *disabled* level over
-the formula's last two results.  The formula is right and the inference from it
-is wrong:
-
-* `0x70240 + 6*4 = 0x70258` is `_PLANE_WM_SAGV_1_A`
-  (`skl_universal_plane_regs.h:327-333`);
-* `0x70240 + 7*4 = 0x7025c` is `_PLANE_WM_SAGV_TRANS_1_A` (`:335-341`).
-
-Two different registers, same field layout, different meaning.  Zeroing them
-does not "disable levels 7 and 8": it disables the SAGV watermarks, and a
-watermark whose `PLANE_WM_EN` is clear is a plane that reads nothing (§11 step
-4.2, §7.1) — a black screen with correct timings, which is precisely the failure
-this module's ordering exists to prevent.
-
-`[I915]` programs **six** levels on this platform, not eight:
-`skl_setup_wm_latency` sets `num_levels = 6` when `HAS_HW_SAGV_WM`
-(`display/skl_watermark.c:3378-3383`), and `HAS_HW_SAGV_WM` is
-`DISPLAY_VER >= 13 && !IS_DGFX` (`display/intel_display_device.h:141`) — ADL-N
-is display version 13 and integrated, so it is six.  The level set here is 0..5
-and the two offsets have constants of their own.
-
-**The SAGV pair is programmed with level 0's generous value, not zero and not
-disabled.**  `[I915]` programs them under `HAS_HW_SAGV_WM`
-(`display/skl_universal_plane.c:743-748`) with the SAGV latency's own
-watermarks.  This kernel never writes SAGV's control, so it cannot know which
-set the hardware is using; the only value that is correct either way is the
-generous one.  A SAGV watermark that is too generous underruns later and says so
-in `PIPESTAT` (phase 6.4); one that is disabled shows nothing and says nothing.
-
-### 4.5 `PLANE_WM_TRANS` has an offset, and the sequence writes it disabled
-
-§5.6's `noarm` order names `PLANE_WM_TRANS` next to `PLANE_WM(0..n)` and no
-section gives it an offset, so the first version of this module left it out and
-said so.  The offset is in the same header the module already cites:
-`_PLANE_WM_TRANS_1_A = 0x70268` (`skl_universal_plane_regs.h:343-349`), and
-`[I915]` writes it immediately after the levels
-(`display/skl_universal_plane.c:735-749`).
-
-**It is written disabled, and that is `[I915]`'s value here rather than a
-fallback.**  `skl_compute_transition_wm` computes the transition watermark from
-level 0 as `wm0.blocks - 1 + trans_offset + 1` with `trans_offset = 14` on this
-generation (`display/skl_watermark.c:2041-2100`), and then `skl_check_wm_level`
-zeroes the whole level when its `min_ddb_alloc` is larger than the plane's DDB
-allocation (`:1437-1441`).  With level 0 at the largest legal 4095 blocks inside
-a 4096-block allocation those numbers are 4109 blocks and a `min_ddb_alloc` of
-4110 — past the allocation and past `PLANE_WM_BLOCKS`' twelve-bit field — so the
-register `[I915]` would write for this exact configuration is zero.  Writing
-level 0's value there instead would be a value the vendor driver's own algorithm
-rejects.
-
-This is a transition watermark, not a level: `EN = 0` on it is what
-`skl_check_wm_level` itself writes, and what `[I915]` leaves when IPC is
-disabled (`skl_watermark.c:3238-3241`), not §7.1's "reads nothing".
+The active path invokes translated `skl_compute_transition_wm` and then
+`skl_check_wm_level` against the whole-buffer allocation. It writes the encoded
+source result, which may be disabled if the minimum DDB requirement does not
+fit; it no longer hardcodes a disabled value or infers a value from level 0.
+The `0x70268` offset and write order remain as before.
 
 ### 4.6 `TRANS_VBLANK`'s low half is not `vdisplay − 1` on this display version
 
@@ -492,14 +436,12 @@ Everything, on hardware.  Specifically:
 * **Whether a pre-enable `PLANE_SURF` would latch later is not known.**  §2's
   arm step exists so that nothing here depends on the answer (§4.6's ordering
   note has the citations and the honest limit).
-* **No underrun has been observed.**  Nothing here establishes that 4095 blocks
-  and 31 lines are enough for a 1080p60 plane on this machine's memory system.
-  §7.3 predicts the opposite: the generous level "over-allocates and may
-  under-run on a busy memory system".
-* **The SAGV pair's generous value is a choice, not a measurement.**  This
-  kernel cannot read SAGV's state, so "level 0's value is correct whether or not
-  SAGV is active" is an argument from §7.1's failure mode, not from a
-  measurement of what the hardware does at each memory frequency (§4.4).
+* **No underrun has been observed.** The active watermark values now come from
+  PCode latency and the display-13 source calculation, but no hardware run has
+  proved the resulting levels adequate on this memory system.
+* **SAGV enable state is still not owned by this bring-up.** The SAGV pair is now
+  calculated with PCode block time, but no translated SAGV control handshake
+  enables/disables the memory policy or proves its active state (§4.4).
 * **The line rate the phase-6.1 check reports has never been compared with a
   real PLL.**  On the mock the samples are a counter; on hardware the number is
   the check on §12.3's "only way to verify your PLL arithmetic against reality
@@ -521,9 +463,10 @@ Everything, on hardware.  Specifically:
   watermark register, needed by the real algorithm, with no offset stated for
   pipes C and D.  Not written; it is the first register to add when §7.4 is
   implemented.
-* `SAGV`'s block time (PCode command `0x23`) and the memory latency of §7.4
-  step 1 (PCode command `0x06`): not read.  The generous watermark is what
-  stands in for them, and §7.4's `[INF]` says so.
+* The PCode SAGV block time (`0x23`) and memory latency table (`0x06`) are now
+  read and fed into the source watermark calculation; failures of the optional
+  SAGV block-time read follow i915 and use zero, while a missing latency table
+  aborts display bring-up.
 * The DRAM-latency level-0 adjustment for 16 Gb DIMMs, which §7.5 leaves open
   for LPDDR5.  Not addressed; it would appear as marginal underruns.
 * **`PIPESTAT` bit 31's semantics are ambiguous in the reference itself.**  §5.2
@@ -541,9 +484,8 @@ Everything, on hardware.  Specifically:
 * `TRANS_SET_CONTEXT_LATENCY`'s value and DRM's `crtc_vblank_start`: the
   register is `[I915]`'s and the difference is this kernel's own mode type's,
   not DRM's assignment, which is not in the cached tree (§4.6).
-* `PLANE_WM_SAGV`'s and `PLANE_WM_SAGV_TRANS`' correct values under SAGV: the
-  generous level-0 value is written because this kernel cannot read SAGV's state
-  (§4.4), not because the number was computed for a memory frequency.
+* Whether SAGV is enabled remains firmware-owned; the source-calculated SAGV
+  watermark pair is programmed, but this path does not change SAGV control.
 
 ## 8. A gap that belongs to the surface, not to this module
 
@@ -589,7 +531,7 @@ interesting ones assert properties rather than return values:
 | `computing_the_write_list_writes_nothing` | the whole list is computed before the first write, the capacity reserved is the count, and `program` performs exactly it |
 | `the_plane_is_armed_only_after_the_watermark_enable_bit` | `PLANE_WM_EN` is set in the write that precedes the commit |
 | `a_refused_watermark_write_leaves_the_plane_unarmed` | a refused write stops the sequence and no `PLANE_SURF` is ever written |
-| `the_watermark_offsets_above_level_five_are_not_written_as_levels` | `0x70258`/`0x7025c` carry the SAGV pair with `EN` set, and `PLANE_WM_TRANS` is written disabled (§4.4, §4.5) |
+| `the_watermark_offsets_above_level_five_are_not_written_as_levels` | test-only generous fixture distinguishes `0x70258`/`0x7025c` SAGV registers from plane levels; active source algorithm values are covered by `source_primary_plane_tests` |
 | `the_timing_registers_are_exactly_what_timing_produced` | the written values are `timing.rs`'s, checked against VIC 16's published totals and the cleared `VBLANK_START` |
 | `the_plane_size_is_the_source_size_with_its_halves_swapped` | `PLANE_SIZE` decodes to (1080, 1920), `PIPESRC` to (1920, 1080) |
 | `the_stride_is_written_in_sixty_four_byte_units` | 7680 bytes → 120 |

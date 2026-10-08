@@ -511,6 +511,11 @@ fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<
             fb::Format::Xrgb8888,
         )
         .map_err(|e| e.describe())?;
+        let watermark = POWER
+            .lock()
+            .as_ref()
+            .map(power::PowerState::watermark_config)
+            .ok_or_else(|| String::from("PCode-derived watermark state absent"))?;
         let mut request = modeset::ModeRequest::new(
             connector.ddi,
             pipe::Pipe::A,
@@ -519,6 +524,7 @@ fn modeset_at_boot(regs: &impl Registers, gtt: &gtt::Gtt, pll_id: u8) -> Result<
             &surface,
             pll::PllFieldEncoding::Named,
         );
+        request = request.with_watermark(watermark);
         request.pll_id = pll_id;
         request.swing = swing::read_firmware_swing(regs, connector.ddi).ok();
         request.link_rate = output::LinkRate::NoSourcedEncoding;

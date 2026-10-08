@@ -1,7 +1,8 @@
 //! Reference section 11 phases 3.4 and 4: the pipe's timings, its share of the
 //! display buffer, its watermarks, and its primary plane.
 //!
-//! [`compute`] turns a [`Mode`] plus a [`PlaneSurface`] into a [`PipeProgram`],
+//! [`compute_with_watermarks`] turns a [`Mode`], [`PlaneSurface`] and the
+//! PCode-derived latency config into a [`PipeProgram`],
 //! which is every register value the pipe half of a modeset needs; [`program`]
 //! writes the shadow half of that program in one order, [`arm`] writes the two
 //! registers that latch it after the pipe is running, and [`prove`] performs the
@@ -13,9 +14,8 @@
 //! —    PIPE_ARB_CTL(A)  USE_PROG_SLOTS                     Wa_22012358565:adl-p
 //! 3.4  the timing registers                                    from timing.rs
 //! 4.1  PLANE_BUF_CFG(A,1) = 0x0fff0000                         the whole DDB
-//! 4.2  PLANE_WM(A,1,0..5)  level 0 generous, 1..5 disabled     section 7.3
-//!      PLANE_WM_TRANS disabled, PLANE_WM_SAGV and
-//!      PLANE_WM_SAGV_TRANS at level 0's value                  [I915]
+//! 4.2  PLANE_WM(A,1,0..7)  latency-derived levels              skl_watermark.c
+//!      PLANE_WM_TRANS and both SAGV watermarks                  skl_watermark.c
 //! 4.3  PLANE_STRIDE, PLANE_POS, PLANE_SIZE, PLANE_OFFSET,
 //!      PLANE_COLOR_CTL                            shadow, latched by the arm
 //! 5.6  the output workstream writes TRANSCONF and the pipe starts
@@ -109,24 +109,6 @@
 //! module therefore divides, and refuses a stride that is not a multiple of 64
 //! rather than truncating it.  7680 / 64 = 120, which fits.
 //!
-//! **The generous level-0 watermark cannot name the whole allocation.**
-//! Section 11 step 4.2 and section 7.3 both say level 0's `BLOCKS` should be
-//! the plane's whole DDB allocation, and section 7.2 makes that allocation 4096
-//! blocks -- but `PLANE_WM_BLOCKS` is `[11:0]` (section 7.3;
-//! `skl_universal_plane_regs.h:325`), whose largest value is 4095.  This module
-//! writes 4095, which is also the largest value `[I915]` itself considers
-//! valid: its watermark computation turns "value >= plane ddb allocation" into
-//! a rejected level with the comment "Bspec says: value >= plane ddb allocation
-//! -> invalid, hence the +1 here" (`display/skl_watermark.c:1992-1993`).  So
-//! 4095 is one block short of the instruction and the largest legal value at
-//! the same time.  See `docs/design/intel-pipe.md`.
-//!
-//! One further source disagreement is recorded in the design document rather
-//! than resolved here: `PLANE_WM_LINES`' maximum (31 in section 7.3, 255 in
-//! `[I915]`'s `skl_wm_max_lines` for display version 13, which ADL-N is).  The
-//! generous level's 31 is legal under both readings, so nothing here turns on
-//! it.
-//!
 //! # What is deliberately not here
 //!
 //! * **The PLL, the DDI and the pipe's own enable.**  `TRANS_CLK_SEL`,
@@ -146,11 +128,11 @@
 //!   this module obtains neither.  It checks what section 11 phase 3.2
 //!   requires of them (4 KiB alignment for the address, a multiple of 64 for
 //!   the stride) and refuses the rest.
-//! * **The full watermark algorithm.**  Section 7.4 needs memory latency from
-//!   the PCode mailbox, `WM_LINETIME`, and a per-level calculation this module
-//!   does not implement.  Level 0 is section 7.3's generous version; levels 1-5
-//!   are written *disabled* rather than left alone, because section 7.3's third
-//!   option is "never: leave the watermark registers at their reset values".
+//! * **Multi-pipe DBUF allocation and atomic watermark transitions.**  This
+//!   first-light-up path gives pipe A the whole DBUF and computes the active
+//!   primary-plane's levels, transition and SAGV values from the source PCode
+//!   latency tables. It does not yet partition DBUF or recompute a multi-pipe,
+//!   cursor, scaler, or async-flip atomic state.
 //! * **`PLANE_KEYVAL`, `PLANE_KEYMSK`, `PLANE_KEYMAX`, `PLANE_AUX_DIST` and
 //!   `PLANE_AUX_OFFSET`.**  Section 5.6 names all five and gives none of them
 //!   an offset, so none is in the register table and none is invented here.
@@ -298,14 +280,9 @@ pub(crate) const PLANE_WM_IGNORE_LINES: u32 = 1 << 30;
 /// `PLANE_WM_LINES[26:14]`'s shift.  Reference section 7.3.
 pub(crate) const PLANE_WM_LINES_SHIFT: u32 = 14;
 
-/// The largest `PLANE_WM_LINES` section 7.3 allows: "a hardware limit the PRM
-/// states explicitly".
-///
-/// `[I915]`'s `skl_wm_max_lines` returns 31 only below display version 13 and
-/// 255 from 13 on (`display/skl_watermark.c:1858-1864`), and ADL-N reports
-/// display version 13 (`display/intel_display_device.c:1051`).  The generous
-/// level is written with 31, which is legal under either reading; the
-/// disagreement is recorded in `docs/design/intel-pipe.md`.
+/// The old test-only generous profile's line count; active display-12/13
+/// programming uses `skl_wm_max_lines()` from the translated source module.
+#[cfg(test)]
 pub(crate) const PLANE_WM_LINES_MAX: u32 = 31;
 
 /// `PLANE_WM_BLOCKS`'s largest value, `[11:0]`.  Reference section 7.3.
@@ -314,10 +291,8 @@ pub(crate) const PLANE_WM_BLOCKS_MAX: u32 = 0xfff;
 /// `PLANE_WM_LINES`'s field width, `[26:14]`: thirteen bits, so the largest
 /// value the register can hold is `0x1fff`.
 ///
-/// Section 7.3 says the field is 13 bits wide and that the hardware honours
-/// only 31 of them, which is the gap [`PLANE_WM_LINES_MAX`] exists for.  This
-/// constant is the field's width, not the hardware's limit, and it is what
-/// [`WatermarkLevel::generous`]'s compile-time check holds the limit against.
+/// Section 7.3 says the field is 13 bits wide; the source algorithm applies
+/// the per-display-version hardware limit before values reach this encoder.
 pub(crate) const PLANE_WM_LINES_MASK_MAX: u32 = 0x1fff;
 
 /// `PIPE_ARB_USE_PROG_SLOTS`, bit 13 of `PIPE_ARB_CTL`.
@@ -848,9 +823,8 @@ impl DdbAllocation {
 /// written as themselves -- not as a count minus one, unlike the timing
 /// registers and `PLANE_BUF_CFG`'s end index.
 ///
-/// `ignore_lines` is part of the field layout and is always false here:
-/// section 7.3's generous level does not use it, and nothing else in this
-/// bring-up programs a watermark level.
+/// `ignore_lines` and all numeric fields are copied from the source-generated
+/// `skl_watermark_full::WmLevel` before register encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WatermarkLevel {
     enabled: bool,
@@ -870,22 +844,8 @@ impl WatermarkLevel {
         }
     }
 
-    /// Section 7.3's generous level: `PLANE_WM_EN` set, `blocks` blocks and
-    /// [`PLANE_WM_LINES_MAX`] scanlines.
-    ///
-    /// `lines` is not a parameter, and that is the fix rather than an
-    /// oversight.  The first version of this file had an `enabled(blocks,
-    /// lines)` returning `Option`, with an `unwrap_or_else` fallback to
-    /// [`Self::disabled`] in the one caller: the `None` arm could not be
-    /// reached while [`PLANE_WM_LINES_MAX`] is what it is, and had it ever
-    /// been reached it would have written `PLANE_WM_EN = 0` over level 0 --
-    /// section 7.1's plane that reads nothing, silently, on the machine whose
-    /// only console is that plane.  Taking the line count from the constant
-    /// makes a level above the hardware maximum *unrepresentable* rather than
-    /// refused, and removes the fallback with it.
-    ///
-    /// The block count is masked to `PLANE_WM_BLOCKS[11:0]`, so a count that
-    /// does not fit the field cannot bleed into the line field.
+    /// Test fixture only. Active values use the full source calculation.
+    #[cfg(test)]
     pub(crate) const fn generous(blocks: u32) -> Self {
         Self {
             enabled: true,
@@ -928,62 +888,13 @@ impl WatermarkLevel {
     }
 }
 
-/// `PLANE_WM_LINES_MAX` fits the field it is written into.
-///
-/// A compile-time check, not a runtime one: [`PLANE_WM_LINES_MAX`] is 31,
-/// which section 7.3's hardware limit makes true by hand, and
-/// `PLANE_WM_LINES_MASK_MAX` is the thirteen-bit field's largest value.  If
-/// either constant is ever edited apart, this is a build failure rather than a
-/// line count the hardware silently truncates.
+/// Check the test-only generous profile against the field encoding.
+#[cfg(test)]
 const _: () = assert!(PLANE_WM_LINES_MAX <= PLANE_WM_LINES_MASK_MAX);
 
-/// Every watermark value one plane has, which is more than its levels.
-///
-/// This bring-up programs section 7.3's first option for the levels: "**Simplest
-/// that can work:** program level 0 only, with generous values (`BLOCKS` = the
-/// plane's whole DDB allocation, `LINES` = 31), `EN = 1`; disable levels 1..n."
-/// Every level is written, including the disabled ones, because section 7.3's
-/// third option is "Never: leave the watermark registers at their reset
-/// values" -- and section 7.1 says those reset values are the ones that do not
-/// work.
-///
-/// Three more registers belong to the plane's watermarks and are not levels:
-/// `PLANE_WM_TRANS`, and the SAGV pair `PLANE_WM_SAGV` and
-/// `PLANE_WM_SAGV_TRANS`.  The first version of this module wrote the eight
-/// registers the reference's `0x70240 + level*4` formula names and no others,
-/// which left the SAGV pair at their reset values and, for the two offsets the
-/// formula only *looks* like levels at, wrote a disabled watermark over them.
-///
-/// * **The SAGV pair gets level 0's value**, not zero.  This kernel never
-///   writes `SAGV`'s control, so it cannot know whether the hardware is using
-///   these registers; `[I915]` programs them on this platform because
-///   `HAS_HW_SAGV_WM` is true there (`display/skl_universal_plane.c:743-748`,
-///   `display/skl_watermark.c:3378-3383`).  A watermark with `PLANE_WM_EN`
-///   clear is a plane that reads nothing, so the only safe value for a register
-///   the pipe may be reading is the generous one level 0 already uses: a plane
-///   whose SAGV watermark is *too generous* underruns later and says so in
-///   `PIPESTAT`, and one whose SAGV watermark is disabled shows nothing and
-///   says nothing.
-/// * **`PLANE_WM_TRANS` is written disabled**, and that is `[I915]`'s value
-///   here rather than a fallback.  `[I915]` computes the transition watermark
-///   from level 0 as `wm0.blocks - 1 + trans_offset + 1`, with `trans_offset`
-///   14 on this generation, and then `skl_check_wm_level` clears it when its
-///   `min_ddb_alloc` is larger than the plane's DDB allocation
-///   (`display/skl_watermark.c:2041-2100`, `:1437-1441`).  With level 0 at the
-///   largest legal 4095 blocks inside a 4096-block allocation, the value is
-///   4109 blocks -- past the allocation and past `PLANE_WM_BLOCKS`' twelve-bit
-///   field -- so the register `[I915]` would write here is zero.  It is a
-///   transition watermark, not a level: `EN = 0` on it is what
-///   `skl_check_wm_level` itself writes, and what `[I915]` leaves on a machine
-///   with IPC disabled (`:3238-3241`), not the "reads nothing" state section
-///   7.1 describes.
-///
-/// **What the generous version costs**, which section 7.3 also says: it
-/// "over-allocates and may under-run on a busy memory system".  It does not
-/// implement the memory-latency calculation of section 7.4, so the level-0
-/// number is not a bound on anything -- it is the largest legal value, which
-/// makes an underrun less likely and hides a marginal one behind a bigger
-/// margin than the hardware needs.
+/// Every watermark value one plane has: levels, transition, and SAGV entries.
+/// Active values use the translated PCode latency and `skl_build_plane_wm_single()`
+/// calculation below; generous values are test-only register-ordering fixtures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WatermarkProgram {
     levels: [WatermarkLevel; PLANE_WM_LEVELS],
@@ -992,14 +903,100 @@ pub(crate) struct WatermarkProgram {
     sagv_transition: WatermarkLevel,
 }
 
+/// Source-derived inputs needed for the primary-plane WM calculation. The
+/// values are read during power initialization, before this program can write
+/// the plane's double-buffered state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WatermarkConfig {
+    pub(crate) display_ver: u8,
+    pub(crate) latencies: [u32; intel_display::skl_watermark_full::WM_LEVELS],
+    pub(crate) num_levels: usize,
+    pub(crate) sagv_block_time_us: u32,
+}
+
 impl WatermarkProgram {
-    /// Section 7.3's generous level 0 over a DDB allocation, every other level
-    /// disabled, and the three non-level watermark registers as described on
-    /// the type.
-    ///
-    /// The block count is the allocation, capped at [`PLANE_WM_BLOCKS_MAX`] --
-    /// see the module documentation for why the cap is not optional and why
-    /// 4095 is the value `[I915]` would also consider the largest valid one.
+    /// Build the single visible XRGB8888 primary-plane watermarks with the
+    /// translated `skl_build_plane_wm_single()` path, then apply i915's DDB
+    /// minimum-allocation checks before packing the register program.
+    fn from_i915(
+        ddb: DdbAllocation,
+        mode: &Mode,
+        config: WatermarkConfig,
+    ) -> Result<Self, PipeError> {
+        use intel_display::skl_watermark_full as wm;
+
+        let display = wm::DisplayCaps {
+            display_ver: config.display_ver,
+            display_ver_fixed: config.display_ver,
+            alderlake_p: config.display_ver == 13,
+            sagv: true,
+            sagv_wm: true,
+            has_hw_sagv_wm: true,
+            ..wm::DisplayCaps::default()
+        };
+        let input = wm::PlaneWmInput {
+            width: u32::from(mode.hdisplay),
+            cpp: 4,
+            pixel_rate: mode.clock_khz,
+            pipe_htotal: u32::from(mode.htotal),
+            num_format_planes: 1,
+            visible: true,
+            ..wm::PlaneWmInput::default()
+        };
+        let mut source = wm::PlaneWm::default();
+        wm::skl_build_plane_wm_single(
+            &display,
+            &input,
+            0,
+            0,
+            config.num_levels.min(wm::WM_LEVELS),
+            &config.latencies,
+            false,
+            false,
+            config.sagv_block_time_us,
+            &mut source,
+        )
+        .map_err(PipeError::Watermark)?;
+
+        let source_ddb = wm::DdbEntry {
+            start: u16::try_from(ddb.start).map_err(|_| PipeError::Watermark(-22))?,
+            end: u16::try_from(ddb.end).map_err(|_| PipeError::Watermark(-22))?,
+        };
+        for level in &mut source.levels {
+            wm::skl_check_wm_level(level, source_ddb);
+        }
+        wm::skl_check_wm_level(&mut source.trans_wm, source_ddb);
+        wm::skl_check_wm_level(&mut source.sagv_wm0, source_ddb);
+        wm::skl_check_wm_level(&mut source.sagv_trans_wm, source_ddb);
+
+        let convert = |level: wm::WmLevel| -> Result<WatermarkLevel, PipeError> {
+            if level.blocks > PLANE_WM_BLOCKS_MAX || level.lines > PLANE_WM_LINES_MASK_MAX {
+                return Err(PipeError::Watermark(-22));
+            }
+            Ok(WatermarkLevel {
+                enabled: level.enable,
+                ignore_lines: level.ignore_lines,
+                blocks: level.blocks,
+                lines: level.lines,
+            })
+        };
+        let mut levels = [WatermarkLevel::disabled(); PLANE_WM_LEVELS];
+        for (target, source) in levels.iter_mut().zip(source.levels) {
+            *target = convert(source)?;
+        }
+        Ok(Self {
+            levels,
+            transition: convert(source.trans_wm)?,
+            sagv: convert(source.sagv_wm0)?,
+            sagv_transition: convert(source.sagv_trans_wm)?,
+        })
+    }
+}
+
+impl WatermarkProgram {
+    /// Test fixture for section 7.3's initial generous first-light-up profile.
+    /// Production modesets require `from_i915()` and PCode-derived latencies.
+    #[cfg(test)]
     pub(crate) fn generous(ddb: DdbAllocation) -> Self {
         let blocks = ddb.blocks().min(PLANE_WM_BLOCKS_MAX);
         let level_zero = WatermarkLevel::generous(blocks);
@@ -1018,22 +1015,22 @@ impl WatermarkProgram {
         &self.levels
     }
 
-    /// Level 0's register value, for a log line or an error message.
+    #[cfg(test)]
     pub(crate) const fn level_zero_value(&self) -> u32 {
         self.levels[0].register_value()
     }
 
-    /// `PLANE_WM_TRANS`'s value: disabled, for the reason on the type.
+    /// `PLANE_WM_TRANS` source-calculated register value.
     pub(crate) const fn transition_value(&self) -> u32 {
         self.transition.register_value()
     }
 
-    /// `PLANE_WM_SAGV`'s value: level 0's, for the reason on the type.
+    /// `PLANE_WM_SAGV` source-calculated register value.
     pub(crate) const fn sagv_value(&self) -> u32 {
         self.sagv.register_value()
     }
 
-    /// `PLANE_WM_SAGV_TRANS`'s value: level 0's, for the reason on the type.
+    /// `PLANE_WM_SAGV_TRANS` source-calculated register value.
     pub(crate) const fn sagv_transition_value(&self) -> u32 {
         self.sagv_transition.register_value()
     }
@@ -1350,18 +1347,19 @@ impl PipeProgram {
             self.ddb.blocks(),
             self.ddb.register_value(),
         ));
+        for (level, watermark) in self.watermark.levels().iter().enumerate() {
+            out.push_str(&format!(
+                "intel-pipe: pipe {} WM{}: {:#010x} (enable {}, blocks {}, lines {})\n",
+                self.pipe,
+                level,
+                watermark.register_value(),
+                u8::from(watermark.is_enabled()),
+                watermark.blocks(),
+                watermark.lines(),
+            ));
+        }
         out.push_str(&format!(
-            "intel-pipe: pipe {} watermark level 0: {:#010x} (blocks {}, lines {}), levels 1..{} \
-             disabled\n",
-            self.pipe,
-            self.watermark.level_zero_value(),
-            self.watermark.levels()[0].blocks(),
-            self.watermark.levels()[0].lines(),
-            PLANE_WM_LEVELS - 1,
-        ));
-        out.push_str(&format!(
-            "intel-pipe: pipe {} watermarks SAGV {:#010x} (level 0's value), SAGV_TRANS {:#010x}, \
-             TRANS {:#010x} (disabled: no transition watermark fits a whole-DBUF level 0)\n",
+            "intel-pipe: pipe {} WM SAGV {:#010x}, SAGV_TRANS {:#010x}, TRANS {:#010x}\n",
             self.pipe,
             self.watermark.sagv_value(),
             self.watermark.sagv_transition_value(),
@@ -1422,14 +1420,38 @@ impl PipeProgram {
 /// at least that many pixels.  Whether the allocation is that large is the
 /// allocator's guarantee, not this module's: a stride and an address cannot say
 /// how many bytes follow the address.
+#[cfg(test)]
 pub(crate) fn compute(
     pipe: Pipe,
     mode: &Mode,
     surface: PlaneSurface,
 ) -> Result<PipeProgram, PipeError> {
-    let timings = timing::timing_registers(mode)?;
     let ddb = DdbAllocation::WHOLE_BUFFER;
     let watermark = WatermarkProgram::generous(ddb);
+    compute_with_program(pipe, mode, surface, ddb, watermark)
+}
+
+/// Compute the active pipe program using i915's latency-derived watermark
+/// policy, not the test-only first-light-up generous profile.
+pub(crate) fn compute_with_watermarks(
+    pipe: Pipe,
+    mode: &Mode,
+    surface: PlaneSurface,
+    config: WatermarkConfig,
+) -> Result<PipeProgram, PipeError> {
+    let ddb = DdbAllocation::WHOLE_BUFFER;
+    let watermark = WatermarkProgram::from_i915(ddb, mode, config)?;
+    compute_with_program(pipe, mode, surface, ddb, watermark)
+}
+
+fn compute_with_program(
+    pipe: Pipe,
+    mode: &Mode,
+    surface: PlaneSurface,
+    ddb: DdbAllocation,
+    watermark: WatermarkProgram,
+) -> Result<PipeProgram, PipeError> {
+    let timings = timing::timing_registers(mode)?;
     let plane = PlaneProgram {
         stride: PlaneProgram::stride_field(surface.stride_bytes)?,
         stride_bytes: surface.stride_bytes,
@@ -1483,6 +1505,8 @@ pub(crate) enum PipeError {
     /// `timing.rs` refused the mode.  It refuses an interlaced timing and a
     /// malformed one; both are deliberate and neither is worked around here.
     Timing(timing::TimingError),
+    /// Source-derived latency watermarks could not be calculated for this DDB.
+    Watermark(i32),
     /// The surface stride was zero.
     StrideZero,
     /// The stride is not a multiple of [`PLANE_STRIDE_UNIT_BYTES`], which
@@ -1520,6 +1544,10 @@ impl PipeError {
             Self::Timing(error) => format!(
                 "the mode could not be turned into timing registers: {error}.  Reference sections \
                  6.1 and 11 phase 3.4; this module does not compute a timing of its own"
+            ),
+            Self::Watermark(errno) => format!(
+                "i915 primary-plane watermark calculation failed with errno {errno}; the plane is \
+                 not armed"
             ),
             Self::StrideZero => String::from(
                 "the surface stride is zero, which describes no scanline at all.  Reference \

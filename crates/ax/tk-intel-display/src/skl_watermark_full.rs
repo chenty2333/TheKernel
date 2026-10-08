@@ -3076,3 +3076,64 @@ pub fn skl_watermark_max_latency(
     }
     0
 }
+
+#[cfg(test)]
+mod source_primary_plane_tests {
+    use super::*;
+
+    struct PcodeLatency;
+    impl WmLatencyIo for PcodeLatency {
+        fn read_mtl_latency_reg(&self, _: usize) -> u32 {
+            unreachable!("display-13 uses PCode latency reads")
+        }
+
+        fn read_skl_latency_pcode(&self, index: u32) -> Result<u32, i32> {
+            match index {
+                0 => Ok(0x0806_0402),
+                1 => Ok(0x1412_100e),
+                _ => Err(-22),
+            }
+        }
+    }
+
+    #[test]
+    fn display13_primary_wm_uses_source_latency_levels_and_sagv_fields() {
+        let display = DisplayCaps {
+            display_ver: 13,
+            display_ver_fixed: 13,
+            alderlake_p: true,
+            sagv: true,
+            sagv_wm: true,
+            has_hw_sagv_wm: true,
+            ..DisplayCaps::default()
+        };
+        assert_eq!(skl_wm_max_lines(&display), 255);
+
+        let input = PlaneWmInput {
+            width: 1920,
+            cpp: 4,
+            pixel_rate: 148_500,
+            pipe_htotal: 2200,
+            num_format_planes: 1,
+            visible: true,
+            ..PlaneWmInput::default()
+        };
+        let mut latencies = [0u32; WM_LEVELS];
+        let num_levels = skl_setup_wm_latency(&PcodeLatency, &display, &mut latencies).unwrap();
+        assert_eq!(num_levels, 6);
+        assert_eq!(&latencies[..6], &[2, 4, 6, 8, 14, 16]);
+
+        let mut wm = PlaneWm::default();
+        skl_build_plane_wm_single(
+            &display, &input, 0, 0, num_levels, &latencies, false, false, 30, &mut wm,
+        )
+        .unwrap();
+
+        assert!(wm.levels[0].enable);
+        assert!(wm.levels[0].blocks > 0);
+        assert!(wm.levels[0].lines > 0);
+        assert!(wm.levels.iter().all(|level| level.lines <= 255));
+        assert!(wm.sagv_wm0.enable);
+        assert!(wm.levels[0].min_ddb_alloc <= 4096);
+    }
+}
