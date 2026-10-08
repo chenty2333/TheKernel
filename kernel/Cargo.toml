@@ -203,3 +203,6 @@ path = "../crates/ax/tk-acpica"
 
 [dependencies.tk-i2c]
 path = "../crates/ax/tk-i2c"
+
+[dependencies.tk-vtd]
+path = "../crates/ax/tk-vtd"

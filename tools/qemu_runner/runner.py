@@ -219,6 +219,7 @@ class RunConfig:
     direct_kernel: bool = False
     input_path: Path | None = None
     cpu_pm: bool = False
+    kernel_irqchip_split: bool = False
 
 
 def _initrd_from_extra_args(extra_args: tuple[str, ...]) -> Path | None:
@@ -647,6 +648,7 @@ def run(
             qmp_socket=qmp_socket,
             diagnostic_log_path=diagnostic_log_path,
             cpu_pm=config.cpu_pm,
+            kernel_irqchip_split=config.kernel_irqchip_split,
             extra_args=_initrd_args_with_path(config.extra_args, qemu_initrd) + (("-S",) if pinning else ()),
         )
         if qemu_executable is not None:

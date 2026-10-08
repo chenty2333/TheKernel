@@ -7,3 +7,6 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+crate_interface = "0.1"

@@ -3258,6 +3258,7 @@ dependencies = [
  "tk-i2c",
  "tk-i2c-hid",
  "tk-ratelimit",
+ "tk-vtd",
 ]
 
 [[package]]
@@ -3776,6 +3777,7 @@ dependencies = [
  "tk-ratelimit",
  "tk-readiness-adapter",
  "tk-scope-local",
+ "tk-vtd",
  "uluru",
  "weak-map",
  "x86",
@@ -4068,6 +4070,9 @@ dependencies = [
 [[package]]
 name = "tk-vtd"
 version = "0.1.0"
+dependencies = [
+ "crate_interface 0.1.4",
+]
 
 [[package]]
 name = "tock-registers"

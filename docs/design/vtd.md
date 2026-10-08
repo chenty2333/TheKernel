@@ -1,11 +1,7 @@
-# Intel VT-d starting point
+# Intel VT-d / DMAR
 
-`tk-vtd` parses the ACPI DMAR fixed header and DRHD/RMRR records, validates
-structure lengths and alignment, selects direct endpoint scopes before an
-include-all unit, and defines an explicit DMA map/unmap contract. Disabled
-IOMMU operation is identity; enabled operation delegates to a backend and
-never silently falls back to identity when mapping fails. There is not yet a
-hardware backend, page-table/context-root/QI/fault/interruption machinery or
-boot integration, so the product does not enable VT-d through this crate yet.
-virtio/NVMe continue using their existing DMA interfaces and are not claimed
-to be translated through VT-d.
+`tk-vtd` parses ACPI DMAR DRHD/RMRR entries and requester scopes, selects the matching remapping unit, provides a bounded first-fit IOVA allocator, and implements four-level Intel second-level page tables. The x86 ACPICA boot hook runs before PCI probing: if no DMAR table exists, DMA remains identity-mapped; if DMAR is present, every unit must expose supported 4-level paging, 2 MiB pages, and queued invalidation or PCI DMA is refused. It installs root/context tables, a shared second-level tree with 2 MiB identity mappings for legacy drivers/RMRRs, enables QI and translation, and polls QI head/fault status with bounds.
+
+The new DMA facade maps page-rounded physical ranges into a disjoint IOVA window and invalidates each unit before returning the device address. VirtIO's DMA allocation/share/map/unmap seam and NVMe's coherent allocation seam use this facade; neither places a CPU physical address in a new descriptor when DMAR is active. Legacy drivers continue to address the identity portion.
+
+Current limitation: all PCI requester contexts share one second-level domain and one IOVA allocator; this supplies translated addresses but is not per-device isolation. Interrupt-remapping tables/MSI remapping and fault-event interrupt delivery are not enabled yet; faults are polled and cause fail-closed map/probe behavior. QEMU acceptance is the split-irqchip `intel-iommu,intremap=on` boot with the root filesystem on VirtIO block and the default VirtIO network device.

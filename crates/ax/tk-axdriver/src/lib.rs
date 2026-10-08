@@ -557,6 +557,11 @@ impl AllDevices {
                 }
             });
 
+            #[cfg(feature = "vtd")]
+            if !tk_vtd::platform_pci_dma_allowed() {
+                error!("pci: DMA admission unavailable after ACPI VT-d initialization; refusing PCI probe");
+                return;
+            }
             self.probe_bus_devices();
             #[cfg(feature = "i2c-hid")]
             for device in crate::i2c_hid::probe_devices() {

@@ -100,6 +100,7 @@ def build_qemu_command(
     diagnostic_log_path: Path | None = None,
     extra_args: tuple[str, ...] = (),
     cpu_pm: bool = False,
+    kernel_irqchip_split: bool = False,
 ) -> tuple[str, ...]:
     """Build the deterministic architecture-specific QEMU topology."""
 
@@ -125,16 +126,19 @@ def build_qemu_command(
         raise CommandError(f"unsupported input backend: {input_backend}")
     if cpu_pm and accel != "kvm":
         raise CommandError("cpu-pm passthrough requires --accel kvm")
+    if kernel_irqchip_split and arch != "x86_64":
+        raise CommandError("split kernel irqchip is supported only on x86_64")
     _validate_extra_args(extra_args)
     if usb_boot and (arch != "x86_64" or usb_disk is None or rootfs is not None or direct_kernel):
         raise CommandError("USB boot requires x86 UEFI, USB disk, and no other root drive")
     qemu_argv = [qemu_binary or "qemu-system-x86_64"]
     if arch == "x86_64":
+        machine = Q35_MACHINE + (",kernel-irqchip=split" if kernel_irqchip_split else "")
         if direct_kernel:
             command = [
                 *qemu_argv,
                 "-machine",
-                Q35_MACHINE,
+                machine,
                 "-kernel",
                 str(kernel),
                 "-m",
@@ -156,7 +160,7 @@ def build_qemu_command(
             command = [
                 *qemu_argv,
                 "-machine",
-                Q35_MACHINE,
+                machine,
                 "-drive",
                 f"if=pflash,format=raw,readonly=on,aio=threads,file={_escaped_path(ovmf_code)}",
                 "-drive",

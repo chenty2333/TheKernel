@@ -12,6 +12,9 @@ extern crate std;
 
 use alloc::vec::Vec;
 
+pub mod iova;
+pub mod pgtbl;
+
 const DMAR_HEADER_SIZE: usize = 48;
 const DRHD: u16 = 0;
 const RMRR: u16 = 1;
@@ -24,6 +27,27 @@ pub enum Error {
     NoDomain,
     MapFailed,
     InvalidRange,
+}
+
+#[crate_interface::def_interface]
+pub trait PlatformDma {
+    fn pci_dma_allowed() -> bool;
+    fn map(physical: u64, length: usize) -> Result<u64, Error>;
+    fn unmap(device_address: u64, length: usize) -> Result<(), Error>;
+}
+
+pub fn platform_pci_dma_allowed() -> bool {
+    crate_interface::call_interface!(PlatformDma::pci_dma_allowed)
+}
+
+/// Map a physical buffer through the installed platform DMA domain.
+pub fn platform_map(physical: u64, length: usize) -> Result<u64, Error> {
+    crate_interface::call_interface!(PlatformDma::map, physical, length)
+}
+
+/// Retire a platform DMA mapping after the device has stopped accessing it.
+pub fn platform_unmap(device_address: u64, length: usize) -> Result<(), Error> {
+    crate_interface::call_interface!(PlatformDma::unmap, device_address, length)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,7 +99,6 @@ fn le64(b: &[u8], n: usize) -> Result<u64, Error> {
 impl DmarTable {
     /// Parse ACPI DMAR's fixed header and remapping-structure list. Unknown
     /// structure types are skipped only after validating their length.
-    // upstream: intel_drv.c dmar_parse_one_devscope()
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < DMAR_HEADER_SIZE || bytes.get(..4) != Some(b"DMAR") {
             return Err(Error::InvalidTable);
@@ -189,7 +212,7 @@ pub struct PciRequester {
 
 /// Select the most specific segment-matching DRHD. An include-all unit is
 /// fallback only; an explicit endpoint/bridge scope wins over it.
-// upstream: intel_drv.c dmar_find_unit()
+// upstream: intel_drv.c dmar_find_by_scope()
 pub fn select_unit(table: &DmarTable, requester: PciRequester) -> Option<&Unit> {
     let fallback = table
         .units
@@ -252,7 +275,6 @@ impl<B: Backend> Dma<B> {
     pub const fn new(backend: B, enabled: bool) -> Self {
         Self { backend, enabled }
     }
-    // upstream: intel_drv.c iommu_map_buf()
     pub fn map(
         &mut self,
         requester: PciRequester,
@@ -278,7 +300,6 @@ impl<B: Backend> Dma<B> {
             direction,
         })
     }
-    // upstream: intel_drv.c iommu_unmap_buf()
     pub fn unmap(&mut self, requester: PciRequester, mapping: Mapping) -> Result<(), Error> {
         if mapping.length == 0 {
             return Err(Error::InvalidRange);
@@ -316,6 +337,14 @@ mod tests {
         r[8..16].copy_from_slice(&base.to_le_bytes());
         r
     }
+    fn endpoint_drhd(base: u64, bus: u8, device: u8, function: u8) -> Vec<u8> {
+        let mut record = drhd(base);
+        record[2..4].copy_from_slice(&24u16.to_le_bytes());
+        // DMAR device scope: type/length/reserved/enumeration/start-bus,
+        // then one PCI path element (device,function).
+        record.extend_from_slice(&[1, 8, 0, 0, 0, bus, device, function]);
+        record
+    }
     #[test]
     fn parses_dmar_remapping_unit() {
         let t = DmarTable::parse(&dmar(&drhd(0xfed9_0000))).unwrap();
@@ -328,6 +357,33 @@ mod tests {
         let mut r = drhd(0xfed9_0000);
         r[2..4].copy_from_slice(&3u16.to_le_bytes());
         assert_eq!(DmarTable::parse(&dmar(&r)), Err(Error::InvalidStructure));
+    }
+    #[test]
+    fn parses_endpoint_scope_and_selects_only_its_segment_requester() {
+        let table = DmarTable::parse(&dmar(&endpoint_drhd(0xfed9_0000, 0, 2, 0))).unwrap();
+        let requester = PciRequester {
+            segment: 0,
+            bus: 0,
+            device: 2,
+            function: 0,
+        };
+        assert!(select_unit(&table, requester).is_some());
+        assert!(select_unit(
+            &table,
+            PciRequester {
+                device: 3,
+                ..requester
+            }
+        )
+        .is_none());
+        assert!(select_unit(
+            &table,
+            PciRequester {
+                segment: 1,
+                ..requester
+            }
+        )
+        .is_none());
     }
     struct Fake;
     impl Backend for Fake {

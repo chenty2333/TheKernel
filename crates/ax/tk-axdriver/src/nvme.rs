@@ -22,12 +22,25 @@ unsafe impl Hal for PlatformHal {
         let virtual_address = global_allocator()
             .alloc_pages(pages, 4096, UsageKind::Dma)
             .ok()?;
-        Some((
-            axhal::mem::virt_to_phys(virtual_address.into()).as_usize() as u64,
-            NonNull::new(virtual_address as *mut u8)?,
-        ))
+        let physical = axhal::mem::virt_to_phys(virtual_address.into()).as_usize() as u64;
+        let length = pages.checked_mul(4096)?;
+        let device_address = match tk_vtd::platform_map(physical, length) {
+            Ok(address) => address,
+            Err(_) => {
+                global_allocator().dealloc_pages(virtual_address, pages, UsageKind::Dma);
+                return None;
+            }
+        };
+        Some((device_address, NonNull::new(virtual_address as *mut u8)?))
     }
-    unsafe fn release(_address: u64, pointer: NonNull<u8>, pages: usize) {
+    unsafe fn release(address: u64, pointer: NonNull<u8>, pages: usize) {
+        if tk_vtd::platform_unmap(address, pages.saturating_mul(4096)).is_err() {
+            log::error!(
+                "nvme: failed to retire DMA mapping {address:#x}+{:#x}",
+                pages.saturating_mul(4096)
+            );
+            return;
+        }
         global_allocator().dealloc_pages(pointer.as_ptr() as usize, pages, UsageKind::Dma);
     }
 }

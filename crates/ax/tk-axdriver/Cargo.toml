@@ -51,9 +51,10 @@ bus-pci = [
     "dep:axsync",
     "dep:lazyinit",
 ]
-default = ["bus-pci", "i2c"]
+default = ["bus-pci", "i2c", "vtd"]
 i2c = ["bus-pci", "dep:tk-i2c", "dep:spin", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq"]
 i2c-hid = ["i2c", "input", "dep:tk-i2c-hid"]
+vtd = ["dep:tk-vtd"]
 display = ["dep:axdriver_display"]
 dyn = [
     "dep:axerrno",
@@ -348,4 +349,8 @@ optional = true
 
 [dependencies.tk-i2c-hid]
 path = "../tk-i2c-hid"
+optional = true
+
+[dependencies.tk-vtd]
+path = "../tk-vtd"
 optional = true

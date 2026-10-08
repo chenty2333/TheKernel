@@ -276,7 +276,12 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
                     return (0, NonNull::dangling());
                 };
             let paddr = virt_to_phys(vaddr.into()).as_usize();
-            (paddr, vaddr)
+            let length = pages.saturating_mul(0x1000);
+            let Ok(device_address) = tk_vtd::platform_map(paddr as u64, length) else {
+                global_allocator().dealloc_pages(vaddr, pages, UsageKind::Dma);
+                return (0, NonNull::dangling());
+            };
+            (device_address as usize, vaddr)
         };
 
         unsafe {
@@ -286,7 +291,10 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         (paddr, ptr)
     }
 
-    unsafe fn dma_dealloc(_paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
+    unsafe fn dma_dealloc(paddr: PhysAddr, vaddr: NonNull<u8>, pages: usize) -> i32 {
+        if tk_vtd::platform_unmap(paddr as u64, pages.saturating_mul(0x1000)).is_err() {
+            return -1;
+        }
         global_allocator().dealloc_pages(vaddr.as_ptr() as usize, pages, UsageKind::Dma);
         0
     }
@@ -299,13 +307,24 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
         if paddr == 0 || len == 0 || paddr.checked_add(len).is_none() {
             return Err(VirtIoError::DmaError);
         }
-        // q35 currently exposes coherent identity DMA. Keep this explicit in
-        // the mapping API so an IOMMU-capable HAL can return a distinct device
-        // address without changing the block descriptor path.
-        Ok(DmaMapping::identity(paddr, len))
+        let device =
+            tk_vtd::platform_map(paddr as u64, len).map_err(|_| VirtIoError::DmaError)? as usize;
+        Ok(DmaMapping {
+            source: paddr,
+            device,
+            len,
+        })
     }
 
-    unsafe fn unmap_physical(_mapping: DmaMapping, _direction: BufferDirection) {}
+    unsafe fn unmap_physical(mapping: DmaMapping, _direction: BufferDirection) {
+        if tk_vtd::platform_unmap(mapping.device as u64, mapping.len).is_err() {
+            panic!(
+                "virtio: failed to invalidate DMA mapping {:#x}+{:#x}; backing memory remains \
+                 owned",
+                mapping.device, mapping.len
+            );
+        }
+    }
 
     #[inline]
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, _size: usize) -> NonNull<u8> {
@@ -316,11 +335,17 @@ unsafe impl VirtIoHal for VirtIoHalImpl {
     unsafe fn share(buffer: NonNull<[u8]>, direction: BufferDirection) -> PhysAddr {
         let _ = direction;
         let vaddr = buffer.as_ptr() as *mut u8 as usize;
-        virt_to_phys(vaddr.into()).into()
+        let physical = virt_to_phys(vaddr.into()).as_usize();
+        let length = unsafe { buffer.as_ref().len() };
+        tk_vtd::platform_map(physical as u64, length).map_or(0, |address| address as usize)
     }
 
     #[inline]
     unsafe fn unshare(paddr: PhysAddr, buffer: NonNull<[u8]>, direction: BufferDirection) {
-        let _ = (paddr, buffer, direction);
+        let _ = direction;
+        let length = unsafe { buffer.as_ref().len() };
+        if tk_vtd::platform_unmap(paddr as u64, length).is_err() {
+            panic!("virtio: failed to retire shared DMA mapping {paddr:#x}+{length:#x}");
+        }
     }
 }

@@ -578,6 +578,7 @@ class RunSpec:
     audio_backend: str | None = None
     kernel_cmdline: str | None = None
     qemu_extra_args: tuple[str, ...] = ()
+    kernel_irqchip_split: bool = False
     powerdown_after_marker: str | None = None
     cpu_pm: bool = False
 
@@ -708,6 +709,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
                 ("-gdb", f"unix:{run_dir / 'gdb.sock'},server=on,wait=off",
                  "-action", "reboot=shutdown,shutdown=pause,panic=pause") if spec.gdb else ()) + spec.qemu_extra_args,
             qmp=qmp,
+            kernel_irqchip_split=spec.kernel_irqchip_split,
         ),
     )
     print(f"qemu-runner exit={result.returncode} log={result.log_path} "
@@ -903,7 +905,13 @@ def run_cmd(args: argparse.Namespace) -> int:
             kernel_cmdline=getattr(args, "kernel_cmdline", None),
             powerdown_after_marker=getattr(args,"powerdown_after_marker",None),
             qmp_timeout_secs=args.timeout,
-            qemu_extra_args=(("-action", "reboot=reset", "-watchdog-action", "reset") if getattr(args,"allow_reboot",False) else ()),
+            qemu_extra_args=(
+                (("-action", "reboot=reset", "-watchdog-action", "reset")
+                 if getattr(args, "allow_reboot", False) else ())
+                + (("-device", "intel-iommu,intremap=on")
+                   if getattr(args, "vtd_q35", False) else ())
+            ),
+            kernel_irqchip_split=getattr(args, "vtd_q35", False),
             input_after_marker=input_after_marker,
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
@@ -922,9 +930,11 @@ def run_cmd(args: argparse.Namespace) -> int:
 def system_test_cmd(args: argparse.Namespace) -> int:
     artifacts = artifacts_for(args, "system")
     run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
+    vtd_q35 = getattr(args, "vtd_q35", False)
+    rootfs_transport = "drive" if vtd_q35 else "module"
     if not args.no_build:
         build_rootfs(artifacts)
-        build_kernel(artifacts)
+        build_kernel(artifacts, rootfs_transport=rootfs_transport)
     return run_product(
         artifacts,
         RunSpec(
@@ -950,6 +960,9 @@ def system_test_cmd(args: argparse.Namespace) -> int:
             reject_ktap_skips=not args.allow_skip,
             rootfs_transport="module",
             run_cpus=run_cpus,
+            qemu_extra_args=(("-device", "intel-iommu,intremap=on")
+                             if vtd_q35 else ()),
+            kernel_irqchip_split=vtd_q35,
         ),
     )
 
@@ -1132,7 +1145,8 @@ def _run_fbcon_boot(args: argparse.Namespace, artifacts: Artifacts, directory: P
             stop_after_marker=FBCON_MARKER,
             commands=None,
             extra_block=None,
-            rootfs_transport="module",
+            rootfs=artifacts.rootfs if vtd_q35 else None,
+            rootfs_transport=rootfs_transport,
             run_cpus=run_cpus,
             # This suite stops at the first KTAP line and then reads pixels.  A
             # kernel that died before painting would otherwise surface as a
@@ -1612,6 +1626,11 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--timeout", type=positive_timeout, default=300.0)
     parser.add_argument("--workdir")
     parser.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
+    parser.add_argument(
+        "--vtd-q35",
+        action="store_true",
+        help="run the QEMU VT-d acceptance topology: q35 split irqchip and intel-iommu,intremap=on",
+    )
     parser.add_argument("--gdb", action="store_true",
                         help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")
     parser.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
@@ -2246,6 +2265,11 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--cpu-pm", action="store_true", help="KVM guest: pass HLT/MWAIT power management through")
     test.add_argument("--allow-skip", action="store_true")
     test.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
+    test.add_argument(
+        "--vtd-q35",
+        action="store_true",
+        help="run the QEMU VT-d acceptance topology: q35 split irqchip and intel-iommu,intremap=on",
+    )
     test.add_argument("--gdb", action="store_true",
                       help="graphics smoke: serve workdir/gdb.sock and pause on guest shutdown/reboot/panic")
     test.add_argument("--linux-kernel", help="already built Linux 7.2.3 oracle bzImage for ABI differential")
