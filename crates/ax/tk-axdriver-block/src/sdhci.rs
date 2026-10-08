@@ -268,6 +268,11 @@ pub const SDHCI_RETUNE_MODES_SHIFT: u32 = 14;
 pub const SDHCI_CLOCK_MULT_MASK: u32 = 0x00FF0000;
 pub const SDHCI_CLOCK_MULT_SHIFT: u32 = 16;
 pub const SDHCI_CAN_MMC_HS400: u32 = 0x80000000;
+const MMC_CARD_TYPE_HS26: u8 = 1 << 0;
+const MMC_CARD_TYPE_HS52: u8 = 1 << 1;
+const MMC_CARD_TYPE_DDR52_180: u8 = 1 << 2;
+const MMC_CARD_TYPE_HS200_180: u8 = 1 << 4;
+const MMC_CARD_TYPE_HS400_180: u8 = 1 << 6;
 pub const SDHCI_MAX_CURRENT: u32 = 0x48;
 pub const SDHCI_FORCE_AUTO_EVENT: u32 = 0x50;
 pub const SDHCI_FORCE_INTR_EVENT: u32 = 0x52;
@@ -1074,8 +1079,10 @@ impl<I: SdhciIo> SdhciHost<I> {
             || !matches!(bus_width, 1 | 4 | 8)
             || (opcode == 19 && self.capabilities2 & (SDHCI_CAN_SDR50 | SDHCI_CAN_SDR104) == 0)
             || (opcode == 21
-                && self.capabilities2 & SDHCI_CAN_MMC_HS400 == 0
-                && self.quirks & SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400 == 0)
+                && self.capabilities2 & (SDHCI_CAN_SDR104 | SDHCI_CAN_MMC_HS400) == 0
+                && self.quirks
+                    & (SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400 | SDHCI_QUIRK_MMC_HS400_IF_CAN_SDR104)
+                    == 0)
         {
             return Err(SdhciError::UnsupportedClock);
         }
@@ -1487,16 +1494,42 @@ impl<I: SdhciIo> SdhciHost<I> {
 
     // upstream: mmc.c mmc_set_timing() MMC-card path
     fn set_mmc_timing(&mut self, timing: MmcBusTiming, target_hz: u32) -> Result<(), SdhciError> {
+        let hs400_supported = self.capabilities2 & SDHCI_CAN_MMC_HS400 != 0
+            || self.quirks & SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400 != 0
+            || (self.quirks & SDHCI_QUIRK_MMC_HS400_IF_CAN_SDR104 != 0
+                && self.capabilities2 & SDHCI_CAN_SDR104 != 0);
         let hs_timing = match timing {
             MmcBusTiming::Normal => 0,
             MmcBusTiming::HighSpeed if self.capabilities & SDHCI_CAN_DO_HISPD != 0 => 1,
+            MmcBusTiming::MmcDdr52 if self.capabilities & SDHCI_CAN_DO_HISPD != 0 => 1,
+            MmcBusTiming::MmcHs200
+                if self.capabilities2 & SDHCI_CAN_SDR104 != 0 || hs400_supported =>
+            {
+                2
+            }
+            MmcBusTiming::MmcHs400 if hs400_supported => 3,
             MmcBusTiming::HighSpeed => return Err(SdhciError::UnsupportedClock),
-            // HS200/HS400 require VCCQ switching, width sequencing and
-            // tuning; do not advertise or enter them through the legacy path.
             _ => return Err(SdhciError::UnsupportedClock),
         };
         self.mmc_switch(185, hs_timing)?;
-        self.set_high_speed(target_hz)
+        let host_timing = match timing {
+            MmcBusTiming::MmcDdr52 => SDHCI_CTRL2_UHS_DDR50,
+            MmcBusTiming::MmcHs200 => SDHCI_CTRL2_UHS_SDR104,
+            MmcBusTiming::MmcHs400 => SDHCI_CTRL2_MMC_HS400,
+            _ => {
+                return self.set_high_speed(target_hz);
+            }
+        };
+        if self.version < SDHCI_SPEC_300 as u8
+            || (timing == MmcBusTiming::MmcHs400 && !hs400_supported)
+        {
+            return Err(SdhciError::UnsupportedClock);
+        }
+        self.set_clock(0)?;
+        let mut control = self.io.read16(SDHCI_HOST_CONTROL2 as usize);
+        control = (control & !(SDHCI_CTRL2_UHS_MASK as u16)) | host_timing as u16;
+        self.io.write16(SDHCI_HOST_CONTROL2 as usize, control);
+        self.set_clock(target_hz)
     }
 
     // upstream: mmc.c mmc_set_power_class() EXT_CSD switch
@@ -2226,6 +2259,60 @@ fn mmc_set_card_bus_width<I: SdhciIo>(
     Ok(())
 }
 
+// upstream: mmc.c mmc_set_card_bus_width() DDR/HS200/HS400 EXT_CSD values
+fn mmc_set_card_bus_width_timing<I: SdhciIo>(
+    host: &mut SdhciHost<I>,
+    _rca: u16,
+    width: u8,
+    timing: MmcBusTiming,
+) -> Result<(), SdhciError> {
+    let value = mmc_bus_width_ext_csd_value(width, timing).ok_or(SdhciError::InvalidTransfer)?;
+    host.mmc_switch(183, value)?;
+    host.set_bus_width(width);
+    Ok(())
+}
+
+fn mmc_bus_width_ext_csd_value(width: u8, timing: MmcBusTiming) -> Option<u8> {
+    Some(match (width, timing) {
+        (1, MmcBusTiming::Normal | MmcBusTiming::HighSpeed | MmcBusTiming::MmcHs200) => 0,
+        (4, MmcBusTiming::Normal | MmcBusTiming::HighSpeed | MmcBusTiming::MmcHs200) => 1,
+        (8, MmcBusTiming::Normal | MmcBusTiming::HighSpeed | MmcBusTiming::MmcHs200) => 2,
+        (4, MmcBusTiming::MmcDdr52 | MmcBusTiming::MmcHs400) => 5,
+        (8, MmcBusTiming::MmcDdr52 | MmcBusTiming::MmcHs400) => 6,
+        _ => return None,
+    })
+}
+
+// upstream: mmc.c mmc_switch_to_hs400()
+fn switch_mmc_to_hs400<I: SdhciIo>(
+    host: &mut SdhciHost<I>,
+    rca: u16,
+    width: u8,
+    clock_hz: u32,
+) -> Result<(), SdhciError> {
+    if width != 8 {
+        return Err(SdhciError::InvalidTransfer);
+    }
+    host.set_clock(52_000_000.min(host.base_clock_hz))?;
+    host.set_mmc_timing(MmcBusTiming::HighSpeed, 52_000_000.min(host.base_clock_hz))?;
+    mmc_set_card_bus_width_timing(host, rca, width, MmcBusTiming::MmcDdr52)?;
+    host.set_mmc_timing(MmcBusTiming::MmcHs400, clock_hz)?;
+    Ok(())
+}
+
+// upstream: mmc.c mmc_switch_to_hs200()
+fn switch_mmc_to_hs200<I: SdhciIo>(
+    host: &mut SdhciHost<I>,
+    rca: u16,
+    width: u8,
+    clock_hz: u32,
+) -> Result<(), SdhciError> {
+    mmc_set_card_bus_width_timing(host, rca, width, MmcBusTiming::HighSpeed)?;
+    host.set_mmc_timing(MmcBusTiming::MmcHs200, clock_hz)?;
+    host.execute_tuning(21, width)?;
+    Ok(())
+}
+
 // MMC bus-test data patterns from the upstream mmc_test_bus_width() routine.
 fn mmc_bus_test_patterns(width: u8) -> Option<([u8; 8], [u8; 8], usize)> {
     match width {
@@ -2408,23 +2495,64 @@ impl<I: SdhciIo> SdhciDisk<I> {
         }
         if mmc && high_capacity {
             let bus_width = mmc_test_bus_width(&mut host, rca);
-            // Only use the MMC high-speed timing supported by this host path;
-            // HS200/HS400 need the full VCCQ/width/tuning transition sequence.
-            let card_type = ext_csd.map_or(0, |csd| csd.card_type);
-            if card_type & 0x03 != 0 {
-                let target = if card_type & 0x02 != 0 {
+            let ext = ext_csd.expect("EXT_CSD was read for high-capacity MMC");
+            let card_type = ext.card_type;
+            let has_180 = host.capabilities & SDHCI_CAN_VDD_180 != 0;
+            let hs200 = has_180
+                && host.version >= SDHCI_SPEC_300 as u8
+                && host.capabilities2 & SDHCI_CAN_SDR104 != 0
+                && bus_width >= 4
+                && card_type & MMC_CARD_TYPE_HS200_180 != 0;
+            let hs400 = has_180
+                && host.version >= SDHCI_SPEC_300 as u8
+                && (host.capabilities2 & SDHCI_CAN_MMC_HS400 != 0
+                    || (host.quirks & SDHCI_QUIRK_MMC_HS400_IF_CAN_SDR104 != 0
+                        && host.capabilities2 & SDHCI_CAN_SDR104 != 0))
+                && bus_width == 8
+                && card_type & (MMC_CARD_TYPE_HS400_180 | MMC_CARD_TYPE_HS200_180)
+                    == (MMC_CARD_TYPE_HS400_180 | MMC_CARD_TYPE_HS200_180);
+            let ddr52 = has_180
+                && host.version >= SDHCI_SPEC_300 as u8
+                && host.capabilities2 & SDHCI_CAN_DDR50 != 0
+                && bus_width >= 4
+                && card_type & MMC_CARD_TYPE_DDR52_180 != 0;
+            let timing = if hs400 {
+                host.switch_vccq(MmcVccq::V180)?;
+                let hs200_clock = 200_000_000.min(host.base_clock_hz);
+                switch_mmc_to_hs200(&mut host, rca, bus_width, hs200_clock)?;
+                let target = hs200_clock.min(200_000_000);
+                switch_mmc_to_hs400(&mut host, rca, bus_width, target)?;
+                (MmcBusTiming::MmcHs400, target)
+            } else if hs200 {
+                host.switch_vccq(MmcVccq::V180)?;
+                let target = 200_000_000.min(host.base_clock_hz);
+                switch_mmc_to_hs200(&mut host, rca, bus_width, target)?;
+                (MmcBusTiming::MmcHs200, target)
+            } else if ddr52 {
+                host.switch_vccq(MmcVccq::V180)?;
+                mmc_set_card_bus_width_timing(&mut host, rca, bus_width, MmcBusTiming::MmcDdr52)?;
+                let target = 52_000_000.min(host.base_clock_hz);
+                host.set_mmc_timing(MmcBusTiming::MmcDdr52, target)?;
+                (MmcBusTiming::MmcDdr52, target)
+            } else if card_type & (MMC_CARD_TYPE_HS26 | MMC_CARD_TYPE_HS52) != 0 {
+                let target = if card_type & MMC_CARD_TYPE_HS52 != 0 {
                     52_000_000
                 } else {
                     26_000_000
-                };
-                let target = target.min(host.base_clock_hz);
+                }
+                .min(host.base_clock_hz);
                 host.set_mmc_timing(MmcBusTiming::HighSpeed, target)?;
+                (MmcBusTiming::HighSpeed, target)
+            } else {
+                (MmcBusTiming::Normal, 0)
+            };
+            if timing.0 != MmcBusTiming::Normal {
                 host.set_mmc_power_class(
                     csd_info.spec_version,
-                    ext_csd.expect("EXT_CSD was read for high-capacity MMC"),
-                    target,
+                    ext,
+                    timing.1,
                     bus_width,
-                    MmcBusTiming::HighSpeed,
+                    timing.0,
                 )?;
             }
             // PARTITION_CONFIG is intentionally retained for future boot/RPMB
@@ -3307,6 +3435,23 @@ mod tests {
         assert_eq!(select_mmc_vccq(false, false), MmcVccq::V330);
         assert_eq!(select_mmc_vccq(false, true), MmcVccq::V180);
         assert_eq!(select_mmc_vccq(true, true), MmcVccq::V120);
+    }
+
+    #[test]
+    fn mmc_bus_width_ext_csd_values_match_sdr_and_ddr_modes() {
+        assert_eq!(
+            mmc_bus_width_ext_csd_value(8, MmcBusTiming::MmcHs200),
+            Some(2)
+        );
+        assert_eq!(
+            mmc_bus_width_ext_csd_value(4, MmcBusTiming::MmcDdr52),
+            Some(5)
+        );
+        assert_eq!(
+            mmc_bus_width_ext_csd_value(8, MmcBusTiming::MmcHs400),
+            Some(6)
+        );
+        assert_eq!(mmc_bus_width_ext_csd_value(1, MmcBusTiming::MmcHs400), None);
     }
 
     #[test]

@@ -21,15 +21,14 @@ Product builds include SDHCI by default. The N305 Intel eMMC (`8086:54c4`) is
 read-only by default; `mmc.allow_write=1` is required to permit writes, and the
 block driver itself enforces the write restriction. The PCI binding maps the
 FreeBSD `sdhci_devices[]` IDs and their quirk bits, but does not yet implement
-all behavior attached to those quirks, interrupt-driven completion, full card-removal
-lifecycle, automatic SD four-bit/high-speed selection, 64-bit ADMA2, automatic 1.8V
-negotiation/tuning, UHS/HS200/HS400, and the full
-upstream function set. Removable SD defaults to the safe 1-bit/25 MHz mode;
-the SD CMD6/ACMD6 helpers are present, but automatic SD bus-width/high-speed
-switching remains off because QEMU's emulated card times out those requests.
-Generic signal-voltage and tuning entry points are translated, but are not
-entered automatically until end-to-end voltage-switch/tuning support is wired
-into card capability negotiation.
+all behavior attached to those quirks, full card-removal lifecycle, 64-bit
+ADMA2, automatic SD UHS/1.8V negotiation, periodic retune scheduling, and the
+full upstream function set. Removable SD negotiates SCR-supported four-bit mode
+and legacy CMD6 high-speed; UHS remains disabled until CMD11 signaling, voltage
+rollback, and tuning are connected to capability negotiation. The eMMC path
+capability-gates 1.8V DDR52, HS200 (with CMD21 tuning), and HS400 on both
+EXT_CSD card bits and host support. Unsupported 1.2V modes are rejected because
+the generic host has no 1.2V switch operation.
 The QEMU PCI SDHCI model (`1b36:0007`) additionally uses a local
 single-block-only mode after observed CMD18 timeouts; this local behavior is
 separate from FreeBSD's PCI quirk table. The generic write-protect callback
@@ -89,9 +88,10 @@ the QEMU acceptance card completed guest format/RW in 4-bit mode at 26 MHz.
 For EXT_CSD revision 6+ devices with a nonzero cache size, attach enables the
 eMMC cache and tracks successful writes; `flush()` issues EXT_CSD FLUSH_CACHE
 and clears the dirty state only after command completion. The FreeBSD power-
-class selection fields are decoded and applied for the implemented legacy
-high-speed path. HS200/HS400 remain gated off until 1.2/1.8 V, retuning, and the
-complete timing transition paths are connected.
+class selection fields are decoded and applied for the selected timing and bus
+width. The HS200/HS400 path uses 1.8V only and fails attach if the host/card
+transition or initial tuning fails; recovery after a failed voltage/timing
+transition is not available.
 
 On 2026-10-09, the inspect payload gained `sfdisk` and e2fsprogs; a blank 64 MiB
 QEMU SD card passed guest GPT creation, `BLKRRPART`, guest `mkfs.ext4`, mount,
