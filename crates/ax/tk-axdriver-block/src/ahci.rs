@@ -1,5 +1,6 @@
 //! AHCI driver.
 
+pub mod ata;
 pub mod controller;
 pub mod regs;
 
