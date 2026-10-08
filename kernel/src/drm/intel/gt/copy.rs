@@ -275,6 +275,25 @@ pub(super) fn isolation_classes() -> u32 {
 fn captured_classes(copy: bool, render: bool) -> u32 {
     (u32::from(copy) << 1) | u32::from(render)
 }
+
+#[cfg(target_os = "none")]
+fn default_lrc_image(engine_class: u8) -> Result<Option<Vec<u8>>, Error> {
+    let (slot, bytes) = match engine_class {
+        0 => (1, 14 * PAGE), // RCS engine state excludes the two WA pages.
+        3 => (0, 2 * PAGE),  // BCS engine state excludes the two WA pages.
+        _ => return Ok(None),
+    };
+    let defaults = DEFAULTS.lock();
+    let Some(default) = defaults[slot].as_ref() else {
+        return Ok(None);
+    };
+    let mut image = Vec::new();
+    image.try_reserve_exact(bytes).map_err(|_| Error::Refused)?;
+    image.resize(bytes, 0);
+    default.read(0, &mut image)?;
+    Ok(Some(image))
+}
+
 pub(crate) struct SavedContext {
     ram: Arc<Ram>,
     valid: AtomicBool,
@@ -1644,6 +1663,21 @@ fn n305_guc_ads_input(
             engine_context_sizes.push((class, total));
         }
     }
+    let render_default = default_lrc_image(0)?;
+    let copy_default = default_lrc_image(3)?;
+    let default_states = [
+        intel_gt::guc_ads::EngineDefaultState {
+            engine_class: 0,
+            default_state: render_default.as_deref(),
+        },
+        intel_gt::guc_ads::EngineDefaultState {
+            engine_class: 3,
+            default_state: copy_default.as_deref(),
+        },
+    ];
+    let golden_contexts =
+        intel_gt::guc_ads::guc_init_golden_contexts(&enabled_masks, &default_states)
+            .map_err(|_| Error::Refused)?;
     let mut generic_gt_sysinfo = [0; intel_gt::guc_ads::GUC_GENERIC_GT_SYSINFO_MAX];
     // `Topology::read()` has verified the sole Gen12.0 slice-enable register
     // value (bit 0 only), so use the actual slice count rather than DSS count.
@@ -1666,7 +1700,7 @@ fn n305_guc_ads_input(
         engines,
         regsets: Vec::new(),
         engine_context_sizes,
-        golden_contexts: Vec::new(),
+        golden_contexts,
         capture_lists: Vec::new(),
         private_data_size: css.private_data_bytes,
     })
