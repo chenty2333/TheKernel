@@ -58,6 +58,12 @@ const ATTR_PMKID: u16 = 85;
 const ATTR_STATUS_CODE: u16 = 72;
 const ATTR_WIPHY_FREQ: u16 = 38;
 const ATTR_CONNECT_IE: u16 = 42;
+const ATTR_USE_MFP: u16 = 66;
+const ATTR_CONTROL_PORT: u16 = 68;
+const ATTR_CONTROL_PORT_ETHERTYPE: u16 = 102;
+const ATTR_CONTROL_PORT_NO_ENCRYPT: u16 = 103;
+const ATTR_MAC_HINT: u16 = 200;
+const ATTR_WIPHY_FREQ_HINT: u16 = 201;
 const ATTR_AUTH_TYPE: u16 = 53;
 const ATTR_REASON_CODE: u16 = 54;
 const ATTR_SSID: u16 = 52;
@@ -549,6 +555,7 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
     let mut ifindex = None;
     let mut ssid = None;
     let mut bssid = None;
+    let mut frequency_mhz = None;
     let mut authentication_type = None;
     let mut wpa_versions = None;
     let mut pairwise_ciphers = Vec::new();
@@ -557,6 +564,10 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
     let mut akm_suites = Vec::new();
     let mut akm_present = false;
     let mut information_elements = None;
+    let mut control_port = false;
+    let mut control_port_ethertype = None;
+    let mut control_port_no_encrypt = false;
+    let mut use_mfp_seen = false;
     for_each_rtattr(attributes, |kind, value| match kind {
         ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
             ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
@@ -568,6 +579,10 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
         }
         ATTR_MAC if bssid.is_none() && value.len() == 6 => {
             bssid = Some(value.try_into().unwrap());
+            Ok(())
+        }
+        ATTR_WIPHY_FREQ if frequency_mhz.is_none() && value.len() == 4 => {
+            frequency_mhz = Some(u32::from_ne_bytes(value.try_into().unwrap()));
             Ok(())
         }
         ATTR_AUTH_TYPE if authentication_type.is_none() && value.len() == 4 => {
@@ -610,6 +625,28 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
             information_elements = Some(value.to_vec());
             Ok(())
         }
+        ATTR_CONTROL_PORT if !control_port && value.is_empty() => {
+            control_port = true;
+            Ok(())
+        }
+        ATTR_CONTROL_PORT_ETHERTYPE if control_port_ethertype.is_none() && value.len() == 2 => {
+            control_port_ethertype = Some(u16::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_CONTROL_PORT_NO_ENCRYPT if !control_port_no_encrypt && value.is_empty() => {
+            control_port_no_encrypt = true;
+            Ok(())
+        }
+        ATTR_USE_MFP if !use_mfp_seen && value.len() == 4 => {
+            use_mfp_seen = true;
+            let use_mfp = u32::from_ne_bytes(value.try_into().unwrap());
+            if use_mfp != 0 {
+                return Err(AxError::OperationNotSupported);
+            }
+            Ok(())
+        }
+        ATTR_MAC_HINT if value.len() == 6 => Ok(()),
+        ATTR_WIPHY_FREQ_HINT if value.len() == 4 => Ok(()),
         ATTR_IFINDEX
         | ATTR_SSID
         | ATTR_MAC
@@ -624,11 +661,18 @@ fn parse_connect_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessCon
     if pairwise_ciphers.len() > 8 || akm_suites.len() > 8 {
         return Err(AxError::InvalidInput);
     }
+    if control_port_ethertype.is_some_and(|ethertype| ethertype != 0x888e)
+        || (control_port_ethertype.is_some() && !control_port)
+        || (control_port_no_encrypt && !control_port)
+    {
+        return Err(AxError::OperationNotSupported);
+    }
     Ok((
         ifindex.ok_or(AxError::InvalidInput)?,
         axnet::WirelessConnectRequest {
             ssid: ssid.ok_or(AxError::InvalidInput)?,
             bssid,
+            frequency_mhz,
             authentication_type: authentication_type.unwrap_or(0),
             wpa_versions: wpa_versions.unwrap_or(0),
             pairwise_ciphers,
@@ -1519,8 +1563,12 @@ mod tests {
         push_attr(&mut attrs, ATTR_IFINDEX, &12u32.to_ne_bytes());
         push_attr(&mut attrs, ATTR_SSID, b"secure");
         push_attr(&mut attrs, ATTR_MAC, &[2, 1, 2, 3, 4, 5]);
+        push_attr(&mut attrs, ATTR_WIPHY_FREQ, &5180u32.to_ne_bytes());
         push_attr(&mut attrs, ATTR_AUTH_TYPE, &0u32.to_ne_bytes());
         push_attr(&mut attrs, ATTR_WPA_VERSIONS, &2u32.to_ne_bytes());
+        push_attr(&mut attrs, ATTR_USE_MFP, &0u32.to_ne_bytes());
+        push_attr(&mut attrs, ATTR_MAC_HINT, &[2, 1, 2, 3, 4, 5]);
+        push_attr(&mut attrs, ATTR_WIPHY_FREQ_HINT, &5180u32.to_ne_bytes());
         push_attr(
             &mut attrs,
             ATTR_CIPHER_SUITES_PAIRWISE | NLA_F_NESTED,
@@ -1533,16 +1581,33 @@ mod tests {
         );
         push_attr(&mut attrs, ATTR_AKM_SUITES | NLA_F_NESTED, &akms);
         push_attr(&mut attrs, ATTR_CONNECT_IE, &[48, 2, 1, 0]);
+        push_attr(&mut attrs, ATTR_CONTROL_PORT, &[]);
+        push_attr(
+            &mut attrs,
+            ATTR_CONTROL_PORT_ETHERTYPE,
+            &0x888eu16.to_ne_bytes(),
+        );
+        push_attr(&mut attrs, ATTR_CONTROL_PORT_NO_ENCRYPT, &[]);
         let (ifindex, connect) = parse_connect_request(&attrs).unwrap();
         assert_eq!(ifindex, 12);
         assert_eq!(connect.ssid, b"secure");
         assert_eq!(connect.bssid, Some([2, 1, 2, 3, 4, 5]));
+        assert_eq!(connect.frequency_mhz, Some(5180));
         assert_eq!(connect.authentication_type, 0);
         assert_eq!(connect.wpa_versions, 2);
         assert_eq!(connect.pairwise_ciphers, [0x000fac04, 0x000fac02]);
         assert_eq!(connect.group_cipher, Some(0x000fac04));
         assert_eq!(connect.akm_suites, [0x000fac02]);
         assert_eq!(connect.information_elements, [48, 2, 1, 0]);
+
+        let mut mfp_required = Vec::new();
+        push_attr(&mut mfp_required, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut mfp_required, ATTR_SSID, b"secure");
+        push_attr(&mut mfp_required, ATTR_USE_MFP, &2u32.to_ne_bytes());
+        assert_eq!(
+            parse_connect_request(&mfp_required),
+            Err(AxError::OperationNotSupported)
+        );
 
         let mut disconnect = Vec::new();
         push_attr(&mut disconnect, ATTR_IFINDEX, &12u32.to_ne_bytes());

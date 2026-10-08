@@ -77,6 +77,7 @@ pub struct WirelessScanRequest {
 pub struct WirelessConnectRequest {
     pub ssid: alloc::vec::Vec<u8>,
     pub bssid: Option<[u8; 6]>,
+    pub frequency_mhz: Option<u32>,
     pub authentication_type: u32,
     pub wpa_versions: u32,
     pub pairwise_ciphers: alloc::vec::Vec<u32>,

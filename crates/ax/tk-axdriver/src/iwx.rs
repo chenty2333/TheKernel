@@ -1337,6 +1337,9 @@ fn connect_station(
         .and_then(|cache| {
             cache.results().iter().find(|bss| {
                 request.bssid.is_none_or(|address| address == bss.bssid)
+                    && request
+                        .frequency_mhz
+                        .is_none_or(|frequency| frequency == bss.frequency_mhz)
                     && bss_ssid(&bss.information_elements) == Some(request.ssid.as_slice())
                     && if security_enabled {
                         bss.capability & 0x0010 != 0

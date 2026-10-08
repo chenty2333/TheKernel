@@ -59,6 +59,12 @@ GET_KEY/DEL_KEY install software CCMP keys and GET_KEY returns the packet
 sequence without disclosing key bytes. SET_PMKSA/DEL_PMKSA/FLUSH_PMKSA validate
 standard peer/PMKID attributes but do not cache key material in the kernel;
 the supplicant owns PMKSA state and supplies any selected PMKID in CONNECT IEs.
+CONNECT also accepts the nl80211 frequency selector and the wpa_supplicant
+control-port tuple for EAPOL (0x888e); EAPOL remains unencrypted on the
+Ethernet-compatible station port. BSSID/frequency hints are treated only as
+hints, while a requested frequency is matched against the cached BSS. MFP
+requests other than disabled are rejected because management protection is not
+implemented.
 Successful CONNECT and DISCONNECT
 queue their standard command events on the `mlme` group; CONNECT carries the
 association request/response IEs retained by the driver. GET_STATION encodes
