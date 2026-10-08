@@ -32,6 +32,18 @@ const NVM_ID_LED_SETTINGS: u16 = 0x0004;
 const NVM_INIT_CONTROL2_REG: u16 = 0x000f;
 const NVM_WORD0F_PAUSE_MASK: u16 = 0x3000;
 const NVM_WORD0F_ASM_DIR: u16 = 0x2000;
+const FLOW_CONTROL_ADDRESS_LOW: u32 = 0x00c2_8001;
+const FLOW_CONTROL_ADDRESS_HIGH: u32 = 0x0000_0100;
+const FLOW_CONTROL_TYPE: u32 = 0x8808;
+const FIBER_LINK_UP_LIMIT: usize = 50;
+const PHY_STATUS: u8 = 0x01;
+const PHY_AUTONEG_ADV: u8 = 0x04;
+const PHY_LP_ABILITY: u8 = 0x05;
+const MII_SR_AUTONEG_COMPLETE: u16 = 0x0020;
+const NWAY_AR_PAUSE: u16 = 0x0400;
+const NWAY_AR_ASM_DIR: u16 = 0x0800;
+const NWAY_LPAR_PAUSE: u16 = 0x0400;
+const NWAY_LPAR_ASM_DIR: u16 = 0x0800;
 const NVM_COMPAT: u16 = 0x0003;
 const NVM_ALT_MAC_ADDR_PTR: u16 = 0x0037;
 const AUTO_READ_DONE_TIMEOUT_MS: usize = 10;
@@ -91,6 +103,7 @@ pub enum FlowControlMode {
 pub enum E1000MediaType {
     Copper,
     Fiber,
+    InternalSerdes,
     Other,
 }
 
@@ -103,6 +116,10 @@ pub struct LedModes {
 
 pub trait E1000NvmReader {
     fn read_word(&mut self, offset: u16) -> DevResult<u16>;
+}
+
+pub trait E1000PhyRegisterIo: E1000RegisterIo {
+    fn read_phy_register(&mut self, register: u8) -> DevResult<u16>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,6 +325,268 @@ pub struct AdaptiveIfs {
     pub tx_packet_delta: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct E1000LinkState {
+    pub txcw: u32,
+    pub autoneg_failed: bool,
+    pub serdes_has_link: bool,
+}
+
+/// upstream: e1000_mac.c e1000_setup_link_generic()
+pub fn setup_link_generic<I, N, F>(
+    io: &mut I,
+    nvm: &mut N,
+    flow: &mut FlowControl,
+    requested_default: bool,
+    i350: bool,
+    lan_function: u8,
+    reset_blocked: bool,
+    mut setup_physical_interface: F,
+) -> DevResult
+where
+    I: E1000RegisterIo,
+    N: E1000NvmReader,
+    F: FnMut() -> DevResult,
+{
+    if reset_blocked {
+        return Ok(());
+    }
+    if requested_default {
+        flow.mode = set_default_fc_generic(nvm, i350, lan_function)?;
+    }
+    setup_physical_interface()?;
+    io.write_register(E1000_FCT, FLOW_CONTROL_TYPE)?;
+    io.write_register(E1000_FCAH, FLOW_CONTROL_ADDRESS_HIGH)?;
+    io.write_register(E1000_FCAL, FLOW_CONTROL_ADDRESS_LOW)?;
+    io.write_register(E1000_FCTTV, flow.pause_time)?;
+    set_fc_watermarks_generic(io, *flow)
+}
+
+/// upstream: e1000_mac.c e1000_poll_fiber_serdes_link_generic()
+pub fn poll_fiber_serdes_link_generic<I, F>(
+    io: &mut I,
+    state: &mut E1000LinkState,
+    mut check_for_link: F,
+) -> DevResult
+where
+    I: E1000RegisterIo,
+    F: FnMut() -> DevResult,
+{
+    for _ in 0..FIBER_LINK_UP_LIMIT {
+        io.delay_us(10_000);
+        if io.read_register(E1000_STATUS)? & E1000_STATUS_LU != 0 {
+            state.autoneg_failed = false;
+            return Ok(());
+        }
+    }
+    state.autoneg_failed = true;
+    check_for_link()?;
+    state.autoneg_failed = false;
+    Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_setup_fiber_serdes_link_generic()
+pub fn setup_fiber_serdes_link_generic<I, F>(
+    io: &mut I,
+    media: E1000MediaType,
+    flow_mode: FlowControlMode,
+    state: &mut E1000LinkState,
+    mut check_for_link: F,
+) -> DevResult
+where
+    I: E1000RegisterIo,
+    F: FnMut() -> DevResult,
+{
+    let ctrl = io.read_register(E1000_CTRL)? & !E1000_CTRL_LRST;
+    config_collision_dist_generic(io)?;
+    state.txcw = commit_fc_settings_generic(io, flow_mode)?;
+    io.write_register(E1000_CTRL, ctrl)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    io.delay_us(1000);
+    if media == E1000MediaType::InternalSerdes
+        || (io.read_register(E1000_CTRL)? & E1000_CTRL_SWDPIN1 != 0)
+    {
+        poll_fiber_serdes_link_generic(io, state, &mut check_for_link)?;
+    }
+    Ok(())
+}
+
+fn resolve_pause(local: u16, partner: u16, requested: FlowControlMode) -> FlowControlMode {
+    if local & NWAY_AR_PAUSE != 0 && partner & NWAY_LPAR_PAUSE != 0 {
+        if requested == FlowControlMode::Full {
+            FlowControlMode::Full
+        } else {
+            FlowControlMode::RxPause
+        }
+    } else if local & NWAY_AR_PAUSE == 0
+        && local & NWAY_AR_ASM_DIR != 0
+        && partner & NWAY_LPAR_PAUSE != 0
+        && partner & NWAY_LPAR_ASM_DIR != 0
+    {
+        FlowControlMode::TxPause
+    } else if local & NWAY_AR_PAUSE != 0
+        && local & NWAY_AR_ASM_DIR != 0
+        && partner & NWAY_LPAR_PAUSE == 0
+        && partner & NWAY_LPAR_ASM_DIR != 0
+    {
+        FlowControlMode::RxPause
+    } else {
+        FlowControlMode::None
+    }
+}
+
+/// upstream: e1000_mac.c e1000_config_fc_after_link_up_generic()
+pub fn config_fc_after_link_up_generic<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    flow: &mut FlowControl,
+    requested: FlowControlMode,
+    media: E1000MediaType,
+    autoneg: bool,
+    autoneg_failed: bool,
+) -> DevResult {
+    if (autoneg_failed
+        && matches!(
+            media,
+            E1000MediaType::Fiber | E1000MediaType::InternalSerdes
+        ))
+        || (!autoneg_failed && media == E1000MediaType::Copper)
+    {
+        force_mac_fc_generic(io, flow.mode)?;
+    }
+    if media == E1000MediaType::Copper && autoneg {
+        let _ = io.read_phy_register(PHY_STATUS)?;
+        let status = io.read_phy_register(PHY_STATUS)?;
+        if status & MII_SR_AUTONEG_COMPLETE == 0 {
+            return Ok(());
+        }
+        let local = io.read_phy_register(PHY_AUTONEG_ADV)?;
+        let partner = io.read_phy_register(PHY_LP_ABILITY)?;
+        flow.mode = resolve_pause(local, partner, requested);
+        let (_, duplex) = get_speed_and_duplex_copper_generic(io)?;
+        if duplex == 1 {
+            flow.mode = FlowControlMode::None;
+        }
+        force_mac_fc_generic(io, flow.mode)?;
+    }
+    if media == E1000MediaType::InternalSerdes && autoneg {
+        let pcs_status = io.read_register(E1000_PCS_LSTAT)?;
+        if pcs_status & E1000_PCS_LSTS_AN_COMPLETE == 0 {
+            return Ok(());
+        }
+        let local = io.read_register(E1000_PCS_ANADV)? as u16;
+        let partner = io.read_register(E1000_PCS_LPAB)? as u16;
+        flow.mode = resolve_pause(local, partner, requested);
+        let pcs_control = io.read_register(E1000_PCS_LCTL)? | E1000_PCS_LCTL_FORCE_FCTRL;
+        io.write_register(E1000_PCS_LCTL, pcs_control)?;
+        force_mac_fc_generic(io, flow.mode)?;
+    }
+    Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_check_for_copper_link_generic()
+pub fn check_for_copper_link_generic<I, H, D, C>(
+    io: &mut I,
+    get_link_status: &mut bool,
+    autoneg: bool,
+    mut phy_has_link: H,
+    mut check_downshift: D,
+    mut configure_flow_control: C,
+) -> DevResult
+where
+    I: E1000RegisterIo,
+    H: FnMut() -> DevResult<bool>,
+    D: FnMut() -> DevResult,
+    C: FnMut() -> DevResult,
+{
+    if !*get_link_status {
+        return Ok(());
+    }
+    if !phy_has_link()? {
+        return Ok(());
+    }
+    *get_link_status = false;
+    let _ = check_downshift();
+    if !autoneg {
+        return Err(DevError::InvalidParam);
+    }
+    config_collision_dist_generic(io)?;
+    configure_flow_control()
+}
+
+/// upstream: e1000_mac.c e1000_check_for_fiber_link_generic()
+pub fn check_for_fiber_link_generic<I, F>(
+    io: &mut I,
+    state: &mut E1000LinkState,
+    mut configure_flow_control: F,
+) -> DevResult
+where
+    I: E1000RegisterIo,
+    F: FnMut() -> DevResult,
+{
+    let mut ctrl = io.read_register(E1000_CTRL)?;
+    let status = io.read_register(E1000_STATUS)?;
+    let rxcw = io.read_register(E1000_RXCW)?;
+    if ctrl & E1000_CTRL_SWDPIN1 != 0 && status & E1000_STATUS_LU == 0 && rxcw & E1000_RXCW_C == 0 {
+        if !state.autoneg_failed {
+            state.autoneg_failed = true;
+            return Ok(());
+        }
+        io.write_register(E1000_TXCW, state.txcw & !E1000_TXCW_ANE)?;
+        ctrl = io.read_register(E1000_CTRL)? | E1000_CTRL_SLU | E1000_CTRL_FD;
+        io.write_register(E1000_CTRL, ctrl)?;
+        configure_flow_control()?;
+    } else if ctrl & E1000_CTRL_SLU != 0 && rxcw & E1000_RXCW_C != 0 {
+        io.write_register(E1000_TXCW, state.txcw)?;
+        io.write_register(E1000_CTRL, ctrl & !E1000_CTRL_SLU)?;
+        state.serdes_has_link = true;
+    }
+    Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_check_for_serdes_link_generic()
+pub fn check_for_serdes_link_generic<I, F>(
+    io: &mut I,
+    state: &mut E1000LinkState,
+    mut configure_flow_control: F,
+) -> DevResult
+where
+    I: E1000RegisterIo,
+    F: FnMut() -> DevResult,
+{
+    let mut ctrl = io.read_register(E1000_CTRL)?;
+    let mut status = io.read_register(E1000_STATUS)?;
+    let mut rxcw = io.read_register(E1000_RXCW)?;
+    if status & E1000_STATUS_LU == 0 && rxcw & E1000_RXCW_C == 0 {
+        if !state.autoneg_failed {
+            state.autoneg_failed = true;
+            return Ok(());
+        }
+        io.write_register(E1000_TXCW, state.txcw & !E1000_TXCW_ANE)?;
+        ctrl = io.read_register(E1000_CTRL)? | E1000_CTRL_SLU | E1000_CTRL_FD;
+        io.write_register(E1000_CTRL, ctrl)?;
+        configure_flow_control()?;
+    } else if ctrl & E1000_CTRL_SLU != 0 && rxcw & E1000_RXCW_C != 0 {
+        io.write_register(E1000_TXCW, state.txcw)?;
+        io.write_register(E1000_CTRL, ctrl & !E1000_CTRL_SLU)?;
+        state.serdes_has_link = true;
+    } else if io.read_register(E1000_TXCW)? & E1000_TXCW_ANE == 0 {
+        io.delay_us(10);
+        rxcw = io.read_register(E1000_RXCW)?;
+        state.serdes_has_link = rxcw & E1000_RXCW_SYNCH != 0 && rxcw & E1000_RXCW_IV == 0;
+    }
+    if io.read_register(E1000_TXCW)? & E1000_TXCW_ANE != 0 {
+        status = io.read_register(E1000_STATUS)?;
+        if status & E1000_STATUS_LU != 0 {
+            io.delay_us(10);
+            rxcw = io.read_register(E1000_RXCW)?;
+            state.serdes_has_link = rxcw & E1000_RXCW_SYNCH != 0 && rxcw & E1000_RXCW_IV == 0;
+        } else {
+            state.serdes_has_link = false;
+        }
+    }
+    Ok(())
+}
+
 /// upstream: e1000_mac.c e1000_reset_adaptive_generic()
 pub fn reset_adaptive_generic<I: E1000RegisterIo>(
     io: &mut I,
@@ -456,7 +735,6 @@ pub fn clear_hw_cntrs_base_generic<I: E1000RegisterIo>(io: &mut I) -> DevResult 
     Ok(())
 }
 
-/// upstream: e1000_mac.c e1000_valid_led_default_generic()
 /// upstream: e1000_mac.c e1000_id_led_init_generic()
 pub fn id_led_init_generic<N: E1000NvmReader>(nvm: &mut N, ledctl: u32) -> DevResult<LedModes> {
     let data = valid_led_default_generic(nvm)?;
@@ -515,7 +793,7 @@ pub fn setup_led_generic<I: E1000RegisterIo>(
             io.write_register(E1000_LEDCTL, value)?;
         }
         E1000MediaType::Copper => io.write_register(E1000_LEDCTL, modes.mode1)?,
-        E1000MediaType::Other => {}
+        E1000MediaType::InternalSerdes | E1000MediaType::Other => {}
     }
     Ok(modes)
 }
@@ -564,7 +842,7 @@ pub fn led_on_generic<I: E1000RegisterIo>(
             io.write_register(E1000_CTRL, ctrl)
         }
         E1000MediaType::Copper => io.write_register(E1000_LEDCTL, modes.mode2),
-        E1000MediaType::Other => Ok(()),
+        E1000MediaType::InternalSerdes | E1000MediaType::Other => Ok(()),
     }
 }
 
@@ -581,7 +859,7 @@ pub fn led_off_generic<I: E1000RegisterIo>(
             io.write_register(E1000_CTRL, ctrl)
         }
         E1000MediaType::Copper => io.write_register(E1000_LEDCTL, modes.mode1),
-        E1000MediaType::Other => Ok(()),
+        E1000MediaType::InternalSerdes | E1000MediaType::Other => Ok(()),
     }
 }
 
@@ -1000,6 +1278,7 @@ pub fn update_mc_addr_list_generic<I: E1000RegisterIo>(
     addresses: &[[u8; ETHER_ADDR_LEN]],
     mta_reg_count: usize,
     filter_type: u8,
+    verify_i21x: bool,
 ) -> DevResult {
     if mta_reg_count == 0 || mta_reg_count > MTA_REG_COUNT || !mta_reg_count.is_power_of_two() {
         return Err(DevError::InvalidParam);
@@ -1016,6 +1295,9 @@ pub fn update_mc_addr_list_generic<I: E1000RegisterIo>(
         io.write_register(register, shadow[index])?;
     }
     let _ = io.read_register(E1000_STATUS)?;
+    if verify_i21x {
+        i21x_check_mta(io, &shadow[..mta_reg_count])?;
+    }
     Ok(())
 }
 
@@ -1030,6 +1312,7 @@ mod tests {
         eecd: u32,
         delays: usize,
         ready_register: Option<u32>,
+        phy: [u16; 8],
     }
     impl E1000RegisterIo for Registers {
         fn read_register(&mut self, register: u32) -> DevResult<u32> {
@@ -1057,6 +1340,14 @@ mod tests {
             self.delays += 1;
         }
         fn invalid_tail_write(&mut self, _: &'static str) {}
+    }
+    impl E1000PhyRegisterIo for Registers {
+        fn read_phy_register(&mut self, register: u8) -> DevResult<u16> {
+            self.phy
+                .get(register as usize)
+                .copied()
+                .ok_or(DevError::InvalidParam)
+        }
     }
 
     struct Pci {
@@ -1245,6 +1536,163 @@ mod tests {
     }
 
     #[test]
+    fn generic_link_setup_initializes_flow_control_registers_and_fallback() {
+        let mut io = Registers::default();
+        let mut nvm = Nvm {
+            word: NVM_WORD0F_ASM_DIR,
+            last_offset: None,
+        };
+        let mut flow = FlowControl {
+            mode: FlowControlMode::None,
+            low_water: 0x100,
+            high_water: 0x200,
+            pause_time: 0x400,
+            send_xon: false,
+        };
+        let mut called = false;
+        setup_link_generic(&mut io, &mut nvm, &mut flow, true, false, 0, false, || {
+            called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(called);
+        assert_eq!(flow.mode, FlowControlMode::TxPause);
+        assert!(io.writes.contains(&(E1000_FCT, FLOW_CONTROL_TYPE)));
+        assert!(io.writes.contains(&(E1000_FCAH, FLOW_CONTROL_ADDRESS_HIGH)));
+        assert!(io.writes.contains(&(E1000_FCAL, FLOW_CONTROL_ADDRESS_LOW)));
+        assert!(io.writes.contains(&(E1000_FCTTV, 0x400)));
+        assert_eq!(io.writes.last(), Some(&(E1000_FCRTH, 0x200)));
+
+        let writes = io.writes.len();
+        setup_link_generic(
+            &mut io,
+            &mut nvm,
+            &mut flow,
+            false,
+            false,
+            0,
+            true,
+            || panic!(),
+        )
+        .unwrap();
+        assert_eq!(io.writes.len(), writes);
+    }
+
+    #[test]
+    fn generic_fiber_link_poll_has_source_timeout_and_recovery_callback() {
+        let mut io = Registers::default();
+        let mut state = E1000LinkState::default();
+        let mut fallback = false;
+        poll_fiber_serdes_link_generic(&mut io, &mut state, || {
+            fallback = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(fallback);
+        assert!(!state.autoneg_failed);
+        assert_eq!(io.delays, FIBER_LINK_UP_LIMIT);
+        let mut ready = Registers {
+            status: E1000_STATUS_LU,
+            ..Registers::default()
+        };
+        poll_fiber_serdes_link_generic(&mut ready, &mut state, || panic!()).unwrap();
+        assert_eq!(ready.delays, 1);
+    }
+
+    #[test]
+    fn generic_flow_control_link_resolution_and_copper_link_gate() {
+        let mut io = Registers {
+            status: E1000_STATUS_FD,
+            phy: [
+                0,
+                MII_SR_AUTONEG_COMPLETE,
+                0,
+                0,
+                NWAY_AR_PAUSE,
+                NWAY_LPAR_PAUSE,
+                0,
+                0,
+            ],
+            ..Registers::default()
+        };
+        let mut flow = FlowControl {
+            mode: FlowControlMode::Full,
+            low_water: 0,
+            high_water: 0,
+            pause_time: 0,
+            send_xon: false,
+        };
+        config_fc_after_link_up_generic(
+            &mut io,
+            &mut flow,
+            FlowControlMode::Full,
+            E1000MediaType::Copper,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(flow.mode, FlowControlMode::Full);
+        assert_eq!(
+            io.writes.last(),
+            Some(&(E1000_CTRL, E1000_CTRL_TFCE | E1000_CTRL_RFCE))
+        );
+
+        let mut flag = true;
+        let mut downshift = false;
+        check_for_copper_link_generic(
+            &mut io,
+            &mut flag,
+            true,
+            || Ok(true),
+            || {
+                downshift = true;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(!flag);
+        assert!(downshift);
+        let mut forced = true;
+        assert!(
+            check_for_copper_link_generic(
+                &mut io,
+                &mut forced,
+                false,
+                || Ok(true),
+                || Ok(()),
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert!(!forced);
+    }
+
+    #[test]
+    fn generic_fiber_and_serdes_force_and_restore_autoneg() {
+        let mut io = Registers {
+            status: E1000_STATUS_LU,
+            ..Registers::default()
+        };
+        let mut state = E1000LinkState {
+            txcw: E1000_TXCW_ANE | E1000_TXCW_FD,
+            ..E1000LinkState::default()
+        };
+        check_for_fiber_link_generic(&mut io, &mut state, || Ok(())).unwrap();
+        assert!(!state.autoneg_failed);
+        let mut first = Registers {
+            status: E1000_STATUS_LU,
+            ..Registers::default()
+        };
+        let mut state = E1000LinkState {
+            txcw: E1000_TXCW_ANE,
+            ..E1000LinkState::default()
+        };
+        check_for_serdes_link_generic(&mut first, &mut state, || Ok(())).unwrap();
+        assert!(!state.serdes_has_link);
+    }
+
+    #[test]
     fn generic_mac_operation_defaults_and_receive_address_setup() {
         let ops = init_mac_ops_generic();
         assert_eq!(ops.set_lan_id, E1000MacCallback::SetLanIdMultiPortPcie);
@@ -1404,7 +1852,7 @@ mod tests {
         write_vfta_generic(&mut io, 127, 0x1234).unwrap();
         assert_eq!(io.writes, [(E1000_VFTA + 127 * 4, 0x1234)]);
         assert!(write_vfta_generic(&mut io, 128, 1).is_err());
-        update_mc_addr_list_generic(&mut io, &[[1, 0, 0, 0, 0, 1]], 128, 0).unwrap();
+        update_mc_addr_list_generic(&mut io, &[[1, 0, 0, 0, 0, 1]], 128, 0, false).unwrap();
         assert_eq!(io.writes.len(), 129);
         assert_eq!(io.writes[1], (E1000_MTA + 127 * 4, 0));
     }
