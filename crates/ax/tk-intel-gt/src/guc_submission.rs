@@ -446,6 +446,13 @@ impl GucSubmission {
         self.ids.allocate_single().map(ContextIdLease::Single)
     }
 
+    /// True while this GuC context is registered and must retain its LRC VMA.
+    pub fn contains_context(&self, context_id: u32) -> bool {
+        self.contexts
+            .iter()
+            .any(|context| context.info.context_idx == context_id)
+    }
+
     pub fn allocate_multi_ids(&mut self, child_count: usize) -> Result<ContextIdLease, Error> {
         self.ids
             .allocate_multi(child_count)
@@ -1685,6 +1692,7 @@ mod tests {
         submission
             .register_v70(&mut pair, info, policy, lease, &[], &[])
             .unwrap();
+        assert!(submission.contains_context(context_id));
         assert_eq!(submission.context_count(), 1);
         let (fences, count) = submission
             .submit_request(&mut pair, context_id, false)
@@ -1728,6 +1736,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(submission.context_count(), 0);
+        assert!(!submission.contains_context(context_id));
         assert_eq!(submission.allocate_single_id().unwrap(), lease);
     }
 

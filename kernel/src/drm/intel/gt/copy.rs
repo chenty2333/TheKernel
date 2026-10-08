@@ -1149,6 +1149,32 @@ impl CtDmaMemory {
         result.map_err(|_| Error::Refused)
     }
 
+    pub(super) fn deregister_guc_context(
+        &mut self,
+        bus: &impl GtIo,
+        context_id: u32,
+    ) -> Result<u16, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let old_tail = self.pair.send.descriptor.tail;
+        let result = self
+            .submission
+            .deregister_context(&mut self.pair, context_id);
+        if self.pair.send.descriptor.tail != old_tail {
+            self.publish_ctb(bus).map_err(|_| Error::Quarantined)?;
+        }
+        result.map_err(|_| Error::Refused)
+    }
+
+    pub(super) fn guc_context_registered(&self, context_id: u32) -> bool {
+        self.submission.contains_context(context_id)
+    }
+
     /// Receive one CTB message after a GuC G2H interrupt/poll notification and
     /// dispatch submission completion events before publishing the new head.
     /// IRQ/tasklet registration remains owned by the GT event integration.
@@ -1942,9 +1968,10 @@ impl Memory {
             switch.release(&self.gtt)?;
         }
         for binding in self.bindings.iter().rev() {
-            // SAFETY: only reached after successful source selected-engine stop/reset,
-            // pending-MI-wake/ready/GDRST/cancel checks; no other engine sees
-            // this private context, ring, status or PPGTT. RAM stays pinned.
+            // SAFETY: only reached after either source selected-engine
+            // stop/reset (ELSQ) or GuC context-deregister completion; no engine
+            // can still fetch these per-job context/ring/status pages. RAM is
+            // retained by its owner throughout the submission proof.
             unsafe { self.gtt.release_binding(binding) }.map_err(|_| Error::Quarantined)?;
         }
         self.bindings.clear();
@@ -2297,6 +2324,182 @@ fn execute_and_quiesce(io: &impl GtIo, memory: &Memory) -> Result<Result<(), Err
     }))
 }
 
+/// Register one synchronous user context with the booted Gen12 GuC, submit its
+/// LRC, and wait for the matching deregistration event before releasing the
+/// per-job GGTT mappings. The persistent SavedContext owns the LRC backing;
+/// the transient Memory remains pinned until GuC confirms deregistration.
+#[cfg(target_os = "none")]
+fn execute_guc_context(
+    bus: &super::Bus,
+    ads: Option<&AdsDmaMemory>,
+    ct_memory: Option<&mut CtDmaMemory>,
+    memory: &Memory,
+) -> Result<(), Error> {
+    if let Some(saved) = &memory.saved {
+        saved.valid.store(false, Ordering::Release);
+    }
+    let class = if memory.render { 0 } else { 1 }; // Linux render / copy class.
+    let guc_class = intel_gt::guc_submission::engine_class_to_guc_class(class)?;
+    let engine = ads
+        .ok_or(Error::Refused)?
+        .input
+        .engines
+        .iter()
+        .find(|engine| engine.guc_class == guc_class && engine.instance == 0)
+        .ok_or(Error::Refused)?;
+    let engine_submit_mask = 1u32
+        .checked_shl(u32::from(engine.logical_index))
+        .ok_or(Error::Refused)?;
+    let ct = ct_memory.ok_or(Error::Refused)?;
+    if !ct.enabled {
+        return Err(Error::Refused);
+    }
+    let lease = ct
+        .submission
+        .allocate_single_id()
+        .map_err(|_| Error::Refused)?;
+    let context_id = match lease {
+        intel_gt::guc_submission::ContextIdLease::Single(id) => id,
+        intel_gt::guc_submission::ContextIdLease::Multi(_) => return Err(Error::Refused),
+    };
+    let info = intel_gt::guc_submission::context_registration_info(
+        context_id,
+        class,
+        engine_submit_mask,
+        memory.descriptor,
+        Some(intel_gt::guc_submission::GUC_CLIENT_PRIORITY_NORMAL),
+        None,
+        None,
+    )
+    .map_err(|_| Error::Refused)?;
+    let policy = intel_gt::guc_submission::ContextPolicy {
+        context_id,
+        priority: u32::from(intel_gt::guc_submission::GUC_CLIENT_PRIORITY_NORMAL),
+        execution_quantum_us: 1_000,
+        preemption_timeout_us: if memory.render { 7_500_000 } else { 640_000 },
+        slpc_frequency_request: 0,
+        preempt_to_idle: false,
+    };
+    ct.register_guc_context_v70(bus, info, policy, lease, &[], &[])?;
+    ct.submit_guc_context_request(bus, context_id, false)?;
+
+    let start = bus.now_us();
+    let mut scratch = [0; 4];
+    loop {
+        ct.receive_guc_submission_event(bus)?;
+        memory.context.flush();
+        memory
+            .context
+            .read(intel_gt::lrc::SCRATCH as usize, &mut scratch)?;
+        if u32::from_le_bytes(scratch) == 1 {
+            break;
+        }
+        if bus.read(if memory.render { 0x20b8 } else { 0x220b8 })? != 0 {
+            return Err(Error::Quarantined);
+        }
+        if bus.now_us().saturating_sub(start) > 500_000 {
+            return Err(Error::Timeout(if memory.render { 0x2550 } else { 0x22550 }));
+        }
+        bus.delay_us(10);
+    }
+
+    let mode_start = bus.now_us();
+    while ct
+        .submission
+        .context_state(context_id)
+        .is_none_or(|state| state.pending_enable())
+    {
+        ct.receive_guc_submission_event(bus)?;
+        if bus.now_us().saturating_sub(mode_start) > 500_000 {
+            return Err(Error::Timeout(if memory.render { 0x2550 } else { 0x22550 }));
+        }
+        bus.delay_us(50);
+    }
+
+    // Drain mode-change completions before retiring the context. Do not let a
+    // pending G2H event or an uncertain fence release transient GGTT memory.
+    let mut drained = false;
+    for _ in 0..16 {
+        if !ct.receive_guc_submission_event(bus)? {
+            drained = true;
+            break;
+        }
+    }
+    if !drained && !ct.receive_guc_submission_event(bus)? {
+        drained = true;
+    }
+    if !drained {
+        return Err(Error::Quarantined);
+    }
+    if !ct.guc_context_registered(context_id) {
+        return Err(Error::Quarantined);
+    }
+    ct.deregister_guc_context(bus, context_id)?;
+    let deregister_start = bus.now_us();
+    while ct.guc_context_registered(context_id) {
+        ct.receive_guc_submission_event(bus)?;
+        if bus.now_us().saturating_sub(deregister_start) > intel_gt::guc_ct::CTB_DEADLOCK_TIMEOUT_US
+        {
+            return Err(Error::Timeout(0x22550));
+        }
+        bus.delay_us(50);
+    }
+    if let Some(saved) = &memory.saved {
+        saved.valid.store(true, Ordering::Release);
+    }
+    Ok(())
+}
+
+/// ELSQ is only the boot/selftest submission path before GuC startup. Once MIA
+/// leaves reset, require the registered GuC CT route instead of writing ELSQ
+/// behind firmware's scheduler.
+#[cfg(target_os = "none")]
+fn execute_user_context(
+    bus: &super::Bus,
+    ads: Option<&AdsDmaMemory>,
+    ct_memory: Option<&mut CtDmaMemory>,
+    memory: &Memory,
+    guc_submission: bool,
+) -> Result<Result<(), Error>, Error> {
+    if guc_submission {
+        execute_guc_context(bus, ads, ct_memory, memory).map(Ok)
+    } else {
+        execute_and_quiesce(bus, memory)
+    }
+}
+
+/// Prepare shared engine state only while GuC is still in MIA reset. Once the
+/// firmware owns submission, require the CT scheduler path and avoid direct
+/// engine resets, ELSQ-era workarounds, and MOCS programming behind the GuC.
+#[cfg(target_os = "none")]
+fn prepare_user_engine(owner: &mut super::Owner, render: bool) -> Result<bool, Error> {
+    owner.bus.assert_media_idle()?;
+    if owner.bus.read(0xc000)? & 1 == 0 {
+        if owner.ct_memory.as_ref().is_none_or(|ct| !ct.enabled) {
+            return Err(Error::Refused);
+        }
+        return Ok(true);
+    }
+    if owner.ct_memory.as_ref().is_some_and(|ct| ct.enabled) {
+        // Firmware reset invalidates the registered CT/ADS submission state;
+        // do not fall back to ELSQ behind stale GuC registrations.
+        return Err(Error::Quarantined);
+    }
+    if render {
+        intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
+    } else {
+        intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
+    }
+    owner.bus.prepare_shared()?;
+    if render {
+        intel_gt::rcs::prepare(&owner.bus)?;
+    } else {
+        bcs::apply_nonpriv(&owner.bus, false)?;
+    }
+    intel_gt::cache::prepare(&owner.bus)?;
+    Ok(false)
+}
+
 #[cfg(target_os = "none")]
 pub(super) fn run(owner: &mut super::Owner, bdf: pci::Bdf) -> Result<(), Error> {
     super::super::dma::require_direct(bdf).map_err(|_| Error::Refused)?;
@@ -2420,15 +2623,20 @@ pub(super) fn render_objects(
         return Err(Error::Quarantined);
     }
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
-    if owner.bus.read(intel_gt::uncore::GT_ACK)? & 1 == 0
-        || owner.bus.read(intel_gt::uncore::RENDER_ACK)? & 1 == 0
-        || owner.bus.read(0xc000)? & 1 == 0
+    let guc_submission = prepare_user_engine(owner, true)?;
+    if guc_submission {
+        // The Gen12 RCS context WA currently gathers dynamic DSS/MCR register
+        // state from MMIO. Do not write RCS work behind GuC until those values
+        // are part of the registered engine/ADS inputs.
+        return Err(Error::Refused);
+    }
+    if !guc_submission
+        && (owner.bus.read(0x480c)? != 0
+            || owner.bus.read(0x400c)? != 5
+            || owner.bus.read(0xb024)? >> 16 != 0x10)
     {
         return Err(Error::Refused);
     }
-    intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
-    owner.bus.prepare_shared()?;
-    intel_gt::rcs::prepare(&owner.bus)?;
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let operation = bcs::Copy {
         source: 0x11000,
@@ -2462,10 +2670,18 @@ pub(super) fn render_objects(
         &owner.bus,
     )?;
     memory.render_ring(&owner.bus)?;
-    let result = execute_and_quiesce(&owner.bus, memory)?;
+    let result = execute_user_context(
+        &owner.bus,
+        owner.ads_memory.as_ref(),
+        owner.ct_memory.as_mut(),
+        memory,
+        guc_submission,
+    )?;
     memory.release()?;
     owner.memory = None;
-    owner.bus.prepare_shared()?;
+    if !guc_submission {
+        owner.bus.prepare_shared()?;
+    }
     result
 }
 
@@ -2484,19 +2700,10 @@ pub(super) fn user_objects(
     }
     job.validate()?;
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
-    owner.bus.assert_media_idle()?;
-    if job.render {
-        intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
-    } else {
-        intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
+    let guc_submission = prepare_user_engine(owner, job.render)?;
+    if guc_submission && job.render {
+        return Err(Error::Refused);
     }
-    owner.bus.prepare_shared()?;
-    if job.render {
-        intel_gt::rcs::prepare(&owner.bus)?;
-    } else {
-        bcs::apply_nonpriv(&owner.bus, false)?;
-    }
-    intel_gt::cache::prepare(&owner.bus)?;
     if saved.render != job.render {
         return Err(Error::Refused);
     }
@@ -2525,10 +2732,18 @@ pub(super) fn user_objects(
     if memory.render {
         memory.render_ring(&owner.bus)?;
     }
-    let result = execute_and_quiesce(&owner.bus, memory)?;
+    let result = execute_user_context(
+        &owner.bus,
+        owner.ads_memory.as_ref(),
+        owner.ct_memory.as_mut(),
+        memory,
+        guc_submission,
+    )?;
     memory.release()?;
     owner.memory = None;
-    owner.bus.prepare_shared()?;
+    if !guc_submission {
+        owner.bus.prepare_shared()?;
+    }
     result
 }
 
@@ -2552,20 +2767,14 @@ pub(super) fn objects(
     if Arc::ptr_eq(&source, &destination) {
         return Err(Error::Refused);
     }
-    if owner.bus.read(intel_gt::uncore::GT_ACK)? & 1 == 0
-        || owner.bus.read(intel_gt::uncore::RENDER_ACK)? & 1 == 0
-        || owner.bus.read(0xc000)? & 1 == 0
-        || owner.bus.read(0x480c)? != 0
-        || owner.bus.read(0x400c)? != 5
-        || owner.bus.read(0xb024)? >> 16 != 0x10
+    let guc_submission = prepare_user_engine(owner, false)?;
+    if !guc_submission
+        && (owner.bus.read(0x480c)? != 0
+            || owner.bus.read(0x400c)? != 5
+            || owner.bus.read(0xb024)? >> 16 != 0x10)
     {
         return Err(Error::Refused);
     }
-    owner.bus.assert_media_idle()?;
-    // Last job and bootstrap must already be quiescent; bounded reset also
-    // establishes a fresh engine state before loading another private context.
-    intel_gt::reset::stop_and_reset_bcs(&owner.bus)?;
-    bcs::apply_nonpriv(&owner.bus, false)?;
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
     let mut memory = Memory::from_objects(gtt, source, destination, operation)?;
     memory.tables = vm.tables.clone();
@@ -2587,9 +2796,18 @@ pub(super) fn objects(
         memory.tables.physical[0],
         &owner.bus,
     )?;
-    let outcome = execute_and_quiesce(&owner.bus, memory)?;
+    let outcome = execute_user_context(
+        &owner.bus,
+        owner.ads_memory.as_ref(),
+        owner.ct_memory.as_mut(),
+        memory,
+        guc_submission,
+    )?;
     memory.release()?;
     owner.memory = None;
+    if !guc_submission {
+        owner.bus.prepare_shared()?;
+    }
     outcome
 }
 
