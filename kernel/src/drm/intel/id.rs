@@ -163,6 +163,7 @@ pub(crate) enum DisplayStepping {
     /// The letter is the metal layer and the digit the revision within it, the
     /// convention every Intel part uses.
     A0,
+    A2,
     A1,
     B0,
     B1,
@@ -181,6 +182,7 @@ impl DisplayStepping {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::A0 => "A0",
+            Self::A2 => "A2",
             Self::A1 => "A1",
             Self::B0 => "B0",
             Self::B1 => "B1",
@@ -246,7 +248,7 @@ pub(crate) struct DisplayDevice {
 impl DisplayDevice {
     /// The stepping this device is at the given PCI revision.
     pub(crate) fn stepping(&self, revision: u8) -> DisplayStepping {
-        // The MIT port is the single ADL-P/N revision-map authority. Keep an
+        // The MIT port is the single display-12/13 revision-map authority. Keep an
         // inexact upstream next/future result diagnostic-only, not a known WA
         // stepping for native programming.
         if let Ok(device) =
@@ -257,6 +259,7 @@ impl DisplayDevice {
             }
             return match device.step {
                 intel_display::device::Step::A0 => DisplayStepping::A0,
+                intel_display::device::Step::A2 => DisplayStepping::A2,
                 intel_display::device::Step::B0 => DisplayStepping::B0,
                 intel_display::device::Step::C0 => DisplayStepping::C0,
                 intel_display::device::Step::D0 => DisplayStepping::D0,

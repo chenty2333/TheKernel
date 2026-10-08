@@ -5,7 +5,8 @@ is bundled; external capture tests read user-supplied files without modifying th
 
 src/device.rs:
   drivers/gpu/drm/i915/display/intel_display_device.c:
-  adl_p_steppings, adl_p_adl_n_steppings, get_pre_gmdid_step, xe_lpd_display
+  find_platform_desc/get_pre_gmdid_step display-12/13 TGL/RKL/ADL-S/ADL-P/ADL-N
+  PCI identities, stepping maps, port masks and DMC platform selection
   Copyright © 2023 Intel Corporation.
   include/drm/intel/pciids.h (PCI identity facts): Copyright 2013 Intel Corporation.
 src/intel_bios.rs:
@@ -47,9 +48,11 @@ src/opregion.rs:
   Copyright 2008 Intel Corporation <hong.liu@intel.com>
   Copyright 2008 Red Hat <mjg@redhat.com>
 
-Only display 13 ADL-P/N semantic paths are included. Safety divergences are
-explicitly documented in each file and README.md. Original TheKernel adapter
-and tests are MIT (Copyright 2026 TheKernel contributors).
+This crate includes display-12/13 source data and selected hardware paths;
+each module entry below bounds what is translated. The kernel's native PCI
+binding and modeset orchestration remain N305-specific. Safety divergences are
+documented in each file and README.md. Original TheKernel adapter and tests are
+MIT (Copyright 2026 TheKernel contributors).
 
 src/display.rs:
   drivers/gpu/drm/i915/display/intel_display.c:
@@ -257,15 +260,23 @@ instance metadata from intel_display_power_map.c. Copyright ©2022 Intel
 Corporation; full grant in LICENSE-MIT. Kernel MMIO/refcount integration is
 separate and remains in progress.
 
+Power domains: src/power_domains.rs translates the synchronous domain get/put,
+is_enabled/get_if_enabled, domain names, per-domain map sync and two-batch async
+put queue from intel_display_power.c (MIT, Copyright ©2022 Intel). Kernel work-
+queue/runtime-PM ownership and full-platform lifecycle are not yet integrated.
+
 Haswell power-well handshake: src/power_well.rs translates
 intel_display_power_well.c::pw_idx_to_pg(), hsw_power_well_requesters(),
 gen9_wait_for_power_well_fuses(), hsw_wait_for_power_well_enable/disable(),
 hsw_power_well_enable/disable(), and hsw_power_well_enabled() (MIT, Copyright
 ©2022 Intel). The kernel's typed register adapter uses this path for PW_1 and
 the current DDI-IO power requests; interrupt-dependent well variants remain.
+The same file also translates HSW BIOS-to-driver sync and TGL/ICL TC-cold PCODE
+retry primitives; TC well mapping and the parent-PCODE kernel backend remain.
 
 DC state fields: src/dc_state.rs translates intel_display_power_well.c
 gen9_dc_mask(), gen9_write_dc_state(), and the MMIO field portion of
-gen9_set_dc_state(). Copyright ©2022 Intel Corporation; full grant in
-LICENSE-MIT. The kernel uses this for initial DC-state disable and records
-the source retry outcome; DMC target-state and refcount lifecycle remain.
+gen9_set_dc_state(), plus allowed/target state policy and DC6 observer edges
+from intel_display_power.c. Copyright ©2022 Intel Corporation; full grant in
+LICENSE-MIT. The kernel uses the setter for initial disable; runtime PSR/DMC
+observers and DC5/6/9 transitions remain.

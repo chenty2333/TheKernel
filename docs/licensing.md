@@ -617,3 +617,9 @@ runtime-PM reference ownership remain caller responsibilities.
 `icl_tc_cold_exit()` (three EAGAIN retries, 1 ms completion delay) from
 `intel_display_power_well.c` (MIT, Copyright © 2022 Intel). PCODE transport
 integration remains in the kernel adapter.
+
+The MIT `intel_display_device.c` translation in `tk-intel-display/src/device.rs`
+now recognizes display-12/13 TGL, RKL, ADL-S, ADL-P and ADL-N PCI IDs, their
+pre-GMD_ID stepping maps, DMC platform, version and default port tables
+(Copyright © 2023 Intel; ID values from MIT-licensed `pciids.h`, Copyright
+© 2013 Intel).

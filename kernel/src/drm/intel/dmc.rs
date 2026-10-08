@@ -86,22 +86,19 @@ pub(super) fn request_for_device(device: &'static super::id::DisplayDevice, revi
     else {
         return;
     };
-    let (step, substep) = if device.exact_step {
-        let step = match device.step {
-            intel_display::device::Step::A0 => b'A',
-            intel_display::device::Step::B0 => b'B',
-            intel_display::device::Step::C0 => b'C',
-            intel_display::device::Step::D0 => b'D',
-            intel_display::device::Step::Future => b'*',
-        };
-        (step, b'0')
-    } else {
+    let (step, substep) = if !device.exact_step {
         (b'*', b'*')
+    } else {
+        match device.step {
+            intel_display::device::Step::A0 => (b'A', b'0'),
+            intel_display::device::Step::A2 => (b'A', b'2'),
+            intel_display::device::Step::B0 => (b'B', b'0'),
+            intel_display::device::Step::C0 => (b'C', b'0'),
+            intel_display::device::Step::D0 => (b'D', b'0'),
+            intel_display::device::Step::Future => (b'*', b'*'),
+        }
     };
-    let platform = match device.platform {
-        intel_display::device::Platform::AlderLakeP => DmcPlatform::AlderLakeP,
-        intel_display::device::Platform::AlderLakeN => DmcPlatform::AlderLakeN,
-    };
+    let platform = device.dmc_platform();
     *PLATFORM.lock() = Some(platform);
     *STEPPING.lock() = Some((step, substep));
     if !firmware::on_rootfs_ready(load_after_rootfs) {

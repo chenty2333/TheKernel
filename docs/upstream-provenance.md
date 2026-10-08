@@ -1087,3 +1087,9 @@ The surrounding kernel workqueue/runtime-PM adapter is not yet connected.
 exit PCODE retry/timing helpers from `intel_display_power_well.c` (MIT,
 Copyright © 2022 Intel); it returns source-shaped reports so the kernel can
 map firmware transport and diagnostics. The TGL map callback is not yet wired.
+
+The `intel_display_device.c` port in `tk-intel-display/src/device.rs` now also
+maps TGL, RKL, ADL-S, ADL-P and ADL-N IDs to display version, DMC platform,
+default ports and the source's pre-GMD_ID stepping tables. PCI ID values follow
+`include/drm/intel/pciids.h` (MIT, Copyright © 2013 Intel). This pure classifier
+does not expand the kernel's current N305-only native PCI binding/modeset path.

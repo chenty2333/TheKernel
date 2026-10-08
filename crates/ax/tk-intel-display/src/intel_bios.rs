@@ -3343,6 +3343,8 @@ const fn port_index(port: Port) -> u8 {
         Port::Tc2 => 6,
         Port::Tc3 => 7,
         Port::Tc4 => 8,
+        Port::Tc5 => 9,
+        Port::Tc6 => 10,
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4102,6 +4104,8 @@ mod tests {
     }
     #[test]
     fn all_xelpd_port_pairs_and_invalid_ddc_are_explicit() {
+        assert_eq!(port_index(Port::Tc5), 9);
+        assert_eq!(port_index(Port::Tc6), 10);
         let pairs = [
             (0, 10, Port::A),
             (1, 7, Port::B),
