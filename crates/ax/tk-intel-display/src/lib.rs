@@ -5,7 +5,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-pub mod bios;
+pub mod intel_bios;
 pub mod audio;
 pub mod cdclk;
 pub mod color;

@@ -576,9 +576,10 @@ copyright and `LICENSE-MIT`. Current source-to-Rust mapping:
 
 - `intel_display_device.c` → `src/device.rs`: ADL-P/N default display identity
   and revision/stepping lookup; PCI ID facts from `include/drm/intel/pciids.h`.
-- `intel_bios.c` / `intel_vbt_defs.h` → `src/bios.rs`: VBT/BDB extent validation,
-  section iteration (including MIPI v3 size), general-definition child parsing,
-  XELPD DVO mapping, ADL-P DDC mapping and HDMI/DP/USB-TC flags/caps.
+- `intel_bios.c` / `intel_vbt_defs.h` → `src/intel_bios.rs`: VBT/BDB extent and
+  raw-block lookup, general features/definitions, child records, XELPD DVO,
+  HDMI/DP caps, eDP settings, and PSR timing. More `intel_bios.c` functions
+  remain to translate; no GPL source was used.
 - `intel_opregion.c` → `src/opregion.rs`: header/ASLE layout facts, external
   RVDA address/size and mailbox VBT lookup only. No ASLE/ACPI/SWSCI writes.
 

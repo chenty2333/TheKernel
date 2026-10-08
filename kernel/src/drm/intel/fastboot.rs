@@ -1599,7 +1599,7 @@ pub(super) fn init(
                 Port::Tc1
             } else {
                 Port::Tc2
-            })?
+            })
             .ok_or(Error::Refused)?;
         if !route.supports_hdmi()
             || route.usb_type_c
