@@ -116,8 +116,26 @@ mod tests {
 
     #[test]
     fn no_160_and_unrelated_rf_or_mac_do_not_match() {
-        assert_eq!(lookup_config(RuntimeConfig { no_160: true, ..AX211 }), None);
-        assert_eq!(lookup_config(RuntimeConfig { rf_type: 0, ..AX211 }), None);
-        assert_eq!(lookup_config(RuntimeConfig { mac_type: 0, ..AX211 }), None);
+        assert_eq!(
+            lookup_config(RuntimeConfig {
+                no_160: true,
+                ..AX211
+            }),
+            None
+        );
+        assert_eq!(
+            lookup_config(RuntimeConfig {
+                rf_type: 0,
+                ..AX211
+            }),
+            None
+        );
+        assert_eq!(
+            lookup_config(RuntimeConfig {
+                mac_type: 0,
+                ..AX211
+            }),
+            None
+        );
     }
 }
