@@ -24,9 +24,9 @@ use crate::{
         I915GemWwCtx as i915_gem_ww_ctx, I915Priolist as i915_priolist,
         I915Request as i915_request, I915SchedEngine as i915_sched_engine,
         I915SwFence as i915_sw_fence, I915Vma as i915_vma, IntelContext as intel_context,
-        IntelContextOps, IrqWork as irq_work, Kref as kref, TaskletStruct as tasklet_struct,
-        WaitQueueEntry as wait_queue_entry, WaitQueueHead as wait_queue_head,
-        intel_context_bind_parent_child,
+        IntelContextOps, IntelTimeline, IrqWork as irq_work, Kref as kref,
+        TaskletStruct as tasklet_struct, WaitQueueEntry as wait_queue_entry,
+        WaitQueueHead as wait_queue_head, intel_context_bind_parent_child,
     },
     intel_engine_cs_upstream::{
         ALL_ENGINES, AtomicT as atomic_t, COMPUTE_CLASS, DelayedWork as delayed_work,
@@ -3890,6 +3890,7 @@ fn guc_retire_inflight_request_prio(rq: &mut i915_request) {
 
 // upstream: intel_guc_submission.c sanitize_hwsp()
 fn sanitize_hwsp(engine: &mut intel_engine_cs) {
+    let mut tl: *mut IntelTimeline = core::ptr::null_mut();
     list_for_each_entry!(tl, &engine.status_page.timelines, engine_link, {
         intel_timeline_reset_seqno(tl);
     });
@@ -3985,6 +3986,7 @@ fn guc_init_submission(guc: &mut intel_guc) -> i32 {
     // Register contexts pinned before GuC submission was enabled. After reset,
     // also rebuild the data shared with GuC; kernel LRCs need separate handling.
     for_each_engine!(engine, id, gt, {
+        let mut ce: *mut intel_context = core::ptr::null_mut();
         list_for_each_entry!(ce, &engine.pinned_contexts_list, pinned_contexts_link, {
             let ret = guc_kernel_context_pin(guc, ce);
             if ret != 0 {
