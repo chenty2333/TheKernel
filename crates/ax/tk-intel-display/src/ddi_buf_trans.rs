@@ -354,8 +354,6 @@ const TGL_HOBL_TABLE: DdiBufferTransTable = table(
 
 /// Choose the same transition table family as i915 for display-12/13 ports.
 /// The two EDP override booleans come from VBT/panel policy, as in the caller.
-// upstream: intel_ddi_buf_trans.c intel_ddi_buf_trans_get()/intel_ddi_buf_trans_init()
-// upstream: intel_ddi_buf_trans.c intel_ddi_buf_trans_get()
 pub fn intel_ddi_buf_trans_get(
     request: DdiBufferTransRequest,
 ) -> Result<DdiBufferTransTable, Error> {
