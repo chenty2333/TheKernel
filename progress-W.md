@@ -15,4 +15,6 @@
 - NVM and channel setup: `if_iwx.c iwx_init_channel_map()` now applies the upstream 2.4/5GHz channel tables and NVM profile/HT/VHT/bandwidth flags, with 6GHz truncation matching current net80211 behavior.
 - Command transport: host-command queue reserve/response ownership, TFD submit, and HBUS write-pointer publication now share a single send operation that produces an ACK ticket.
 - RX event switch: core receive/ALIVE/init/scan/PNVM/TX/BA events and source-known direct command replies now route into command response storage/ACK state.
+- Firmware notification decoding: ALIVE v4-v7 layout/status/SKU extraction committed with the current scan/event slice.
+- Scan lifecycle: abort UMAC command and foreground/background scan flag/state ordering translated; full scan request builders remain.
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

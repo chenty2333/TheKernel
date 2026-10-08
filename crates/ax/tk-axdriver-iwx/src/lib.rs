@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+mod alive;
 mod apm;
 mod bringup;
 mod channel;
@@ -32,6 +33,10 @@ mod rx_packet;
 mod scan;
 mod tx;
 
+pub use alive::{
+    ALIVE_STATUS_OK, ALIVE_V4_BYTES, ALIVE_V5_BYTES, ALIVE_V6_BYTES, AliveError, AliveInfo,
+    parse_alive,
+};
 pub use apm::{
     ApmError, apm_init, apm_stop, clear_persistence_bit, force_power_gating, prepare_card_hw,
     set_hw_ready, software_reset, start_hardware,
