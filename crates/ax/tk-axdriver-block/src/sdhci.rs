@@ -1018,6 +1018,22 @@ impl<I: SdhciIo> SdhciHost<I> {
         Ok(())
     }
 
+    // upstream: sdhci.c sdhci_generic_suspend()
+    pub fn suspend(&mut self) -> Result<(), SdhciError> {
+        self.io.write32(SDHCI_SIGNAL_ENABLE as usize, 0);
+        if self.version >= SDHCI_SPEC_300 as u8 {
+            let control2 = self.io.read16(SDHCI_HOST_CONTROL2 as usize)
+                & !(SDHCI_CTRL2_EXEC_TUNING as u16);
+            self.io.write16(SDHCI_HOST_CONTROL2 as usize, control2);
+        }
+        self.reset(SDHCI_RESET_ALL as u8)
+    }
+
+    // upstream: sdhci.c sdhci_generic_resume()
+    pub fn resume(&mut self) -> Result<(), SdhciError> {
+        self.initialize()
+    }
+
     // upstream: sdhci.c sdhci_generic_intr() status sampling, adapted to polling
     fn interrupt_status(&mut self) -> u32 {
         let status = self.io.read32(SDHCI_INT_STATUS as usize);
@@ -2531,6 +2547,20 @@ mod tests {
             host.io.read8(SDHCI_HOST_CONTROL as usize) & SDHCI_CTRL_4BITBUS as u8,
             0
         );
+    }
+
+    #[test]
+    fn power_cycle_suspend_and_resume_restore_initial_clocking() {
+        let mut host = SdhciHost::new(MockIo::default(), 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        host.power_up().unwrap();
+        assert!(host.clock_hz() <= 400_000);
+        host.suspend().unwrap();
+        assert_eq!(host.io.read32(SDHCI_SIGNAL_ENABLE as usize), 0);
+        host.resume().unwrap();
+        assert!(host.clock_hz() <= 400_000);
+        host.power_down().unwrap();
+        assert_eq!(host.clock_hz(), 0);
+        assert_eq!(host.io.read8(SDHCI_POWER_CONTROL as usize), 0);
     }
 
     #[test]
