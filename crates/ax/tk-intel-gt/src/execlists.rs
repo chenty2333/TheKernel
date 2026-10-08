@@ -7,6 +7,43 @@ use crate::{Error, GtIo};
 
 pub const EL_CTRL_LOAD: u32 = 1;
 pub const GEN12_NUM_PORTS: usize = 2;
+const GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE: u32 = 1;
+const GEN12_CSB_SW_CTX_ID_MASK: u32 = 0x03ff_8000;
+const GEN12_IDLE_CTX_ID: u32 = 0x7ff;
+
+/// Parse a Gen12 context-status entry and report whether a context completed.
+/// upstream: intel_execlists_submission.c __gen12_csb_parse()
+fn __gen12_csb_parse(
+    context_to_valid: bool,
+    context_away_valid: bool,
+    switched_to_new_queue: bool,
+    switch_detail: u8,
+) -> Result<bool, Error> {
+    if !context_away_valid || switched_to_new_queue {
+        // Upstream uses GEM_BUG_ON for these impossible hardware states.
+        if !context_to_valid {
+            return Err(Error::Refused);
+        }
+        return Ok(true);
+    }
+    if switch_detail != 0 {
+        return Err(Error::Refused);
+    }
+    Ok(false)
+}
+
+/// Parse the Gen12 (TGL/RKL/ADL) CSB entry format.
+/// upstream: intel_execlists_submission.c gen12_csb_parse()
+pub fn gen12_csb_parse(csb: u64) -> Result<bool, Error> {
+    let lower = csb as u32;
+    let upper = (csb >> 32) as u32;
+    __gen12_csb_parse(
+        (lower & GEN12_CSB_SW_CTX_ID_MASK) >> 15 != GEN12_IDLE_CTX_ID,
+        (upper & GEN12_CSB_SW_CTX_ID_MASK) >> 15 != GEN12_IDLE_CTX_ID,
+        lower & GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE != 0,
+        (upper & 0xf) as u8,
+    )
+}
 
 /// Write one descriptor into an Execlists submit queue port.
 /// upstream: intel_execlists_submission.c write_desc()
@@ -101,6 +138,32 @@ mod tests {
                 (0x2511, 0x1122_3344),
                 (0x2550, EL_CTRL_LOAD),
             ]
+        );
+    }
+
+    #[test]
+    fn gen12_csb_parser_recognizes_completion_and_rejects_impossible_entries() {
+        let valid_context = 7u64 << 15;
+        let idle_context = u64::from(GEN12_IDLE_CTX_ID) << 15;
+        assert_eq!(
+            gen12_csb_parse(valid_context | (idle_context << 32)),
+            Ok(true)
+        );
+        assert_eq!(
+            gen12_csb_parse(valid_context | (valid_context << 32)),
+            Ok(false)
+        );
+        assert_eq!(
+            gen12_csb_parse(valid_context | u64::from(GEN12_CTX_STATUS_SWITCHED_TO_NEW_QUEUE)),
+            Ok(true)
+        );
+        assert_eq!(
+            gen12_csb_parse(idle_context | (idle_context << 32)),
+            Err(Error::Refused)
+        );
+        assert_eq!(
+            gen12_csb_parse(valid_context | (1u64 << 32)),
+            Err(Error::Refused)
         );
     }
 }
