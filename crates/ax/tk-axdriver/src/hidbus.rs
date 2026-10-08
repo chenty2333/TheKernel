@@ -68,6 +68,7 @@ pub(super) fn is_collection(report: &Report, page: u32, usage: u32, tlc_index: u
 }
 
 // upstream: hidbus.c hidbus_get_report()
+// upstream: hid.c hid_get_report()
 pub(super) fn get_report<T: Transport>(
     device: &mut Device<T>,
     report_type: u8,
@@ -78,6 +79,7 @@ pub(super) fn get_report<T: Transport>(
 }
 
 // upstream: hidbus.c hidbus_set_report()
+// upstream: hid.c hid_set_report()
 pub(super) fn set_report<T: Transport>(
     device: &mut Device<T>,
     report_type: u8,
@@ -88,16 +90,19 @@ pub(super) fn set_report<T: Transport>(
 }
 
 // upstream: hidbus.c hidbus_read()
+// upstream: hid.c hid_read()
 pub(super) fn read<T: Transport>(device: &mut Device<T>, out: &mut [u8]) -> Result<usize, Error> {
     device.read_input(out)
 }
 
 // upstream: hidbus.c hidbus_write()
+// upstream: hid.c hid_write()
 pub(super) fn write<T: Transport>(device: &mut Device<T>, report: &[u8]) -> Result<(), Error> {
     device.write_output(report)
 }
 
 // upstream: hidbus.c hidbus_set_idle()
+// upstream: hid.c hid_set_idle()
 pub(super) fn set_idle<T: Transport>(
     device: &mut Device<T>,
     duration: u16,
@@ -107,6 +112,7 @@ pub(super) fn set_idle<T: Transport>(
 }
 
 // upstream: hidbus.c hidbus_set_protocol()
+// upstream: hid.c hid_set_protocol()
 pub(super) fn set_protocol<T: Transport>(
     device: &mut Device<T>,
     protocol: u16,

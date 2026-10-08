@@ -242,6 +242,7 @@ impl<T: Transport> Device<T> {
 
     /// Fetch the HID report descriptor from the descriptor's report register.
     // upstream: iichid.c iichid_cmd_get_report_desc()
+    // upstream: hid.c hid_get_rdesc()
     pub fn report_descriptor(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         let length = usize::from(self.descriptor.report_descriptor_length);
         if length == 0 || out.len() < length {

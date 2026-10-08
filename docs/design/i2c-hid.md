@@ -73,3 +73,13 @@ selected report ID rather than the descriptor-wide maximum; this avoids mixing
 lengths when several feature Report IDs coexist.
 
 2026-10-09 follow-up: `kernel/src/acpi/pchgpio.rs` now contains the OpenBSD ISC provider tables and pad/interrupt logic, and ACPI enumerates HID-matched controllers from assigned `_CRS` memory and IRQ resources. The axhal/ x86 platform now exposes a fail-closed directly routable GSI installation path (only one IOAPIC at GSI base zero, no colliding MADT overrides, non-legacy IRQs); GPIO providers on unsupported topologies are not registered. I2C-HID requests each pin from its `GpioInt` resources, shares an atomic pending bit across those pins, and its ordinary read path services `GET_INPUT` outside hard IRQ context. Adaptive 80/10 Hz sampling remains as fallback. IRQ request setup is currently enabled only while the input device is open. S3 lifecycle wiring, affinity/shared-GSI arbitration beyond the supported direct route, and N305 physical validation remain open.
+
+The generic `hid.c` transport wrappers are now explicitly represented by the
+shared `hidbus` adapter for report get/set, read/write, idle and protocol
+operations; interrupt start/stop/poll map to evdev open/close and the input
+read-event pump. The I2C-HID report-register reader maps `hid_get_rdesc()`.
+Function markers now cover 21/32 `hid.c` entry points. Remaining parser-state
+helpers (`hid_clear_local`, `hid_switch_rid`, `hid_start_parse`,
+`hid_end_parse`, `hid_get_byte`, `hid_get_item`), quirk registration/dispatch,
+and generic `hid_ioctl` are not yet direct source translations; the shared
+bounded parser remains independently implemented.
