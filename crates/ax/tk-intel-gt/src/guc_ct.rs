@@ -7,8 +7,14 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence as atomic_fence};
 
+use crate::{Error, GtIo};
+
 pub const CTB_DESC_SIZE: usize = 2048;
+pub const CTB_SEND_DESC_OFFSET: usize = 0;
+pub const CTB_RECV_DESC_OFFSET: usize = CTB_DESC_SIZE;
+pub const CTB_SEND_BUFFER_OFFSET: usize = 2 * CTB_DESC_SIZE;
 pub const CTB_H2G_BUFFER_SIZE: usize = 4096;
+pub const CTB_RECV_BUFFER_OFFSET: usize = CTB_SEND_BUFFER_OFFSET + CTB_H2G_BUFFER_SIZE;
 pub const CTB_G2H_BUFFER_SIZE: usize = 4 * CTB_H2G_BUFFER_SIZE;
 pub const G2H_ROOM_BUFFER_SIZE: usize = CTB_G2H_BUFFER_SIZE / 4;
 pub const CTB_BLOB_SIZE: usize = 2 * CTB_DESC_SIZE + CTB_H2G_BUFFER_SIZE + CTB_G2H_BUFFER_SIZE;
@@ -102,6 +108,15 @@ pub const MAX_MMIO_MSG_LEN: usize = 4;
 pub const GUC_MAX_MMIO_MSG_LEN: usize = MAX_MMIO_MSG_LEN;
 pub const CT_SEND_NB: u32 = 1 << 31;
 pub const CT_SEND_G2H_DW_MASK: u32 = 0xff;
+pub const ACTION_HOST2GUC_CONTROL_CTB: u32 = 0x4509;
+pub const CTB_CONTROL_DISABLE: u32 = 0;
+pub const CTB_CONTROL_ENABLE: u32 = 1;
+pub const KLV_SELF_CFG_H2G_CTB_ADDR: u16 = 0x0902;
+pub const KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR: u16 = 0x0903;
+pub const KLV_SELF_CFG_H2G_CTB_SIZE: u16 = 0x0904;
+pub const KLV_SELF_CFG_G2H_CTB_ADDR: u16 = 0x0905;
+pub const KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR: u16 = 0x0906;
+pub const KLV_SELF_CFG_G2H_CTB_SIZE: u16 = 0x0907;
 
 /// The shared descriptor is 16 dwords; only the first three are writable.
 #[repr(C)]
@@ -132,6 +147,94 @@ pub enum CtError {
     Broken(u32),
     Incomplete,
     UnexpectedResponse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CtbAddresses {
+    pub send_descriptor: u32,
+    pub send_buffer: u32,
+    pub receive_descriptor: u32,
+    pub receive_buffer: u32,
+}
+
+/// upstream: intel_guc_ct.c intel_guc_ct_init() single-blob layout.
+pub fn ctb_addresses(base: u32) -> Result<CtbAddresses, CtError> {
+    if base == 0 || base & 0xfff != 0 {
+        return Err(CtError::InvalidSize);
+    }
+    let address = |offset: usize| {
+        base.checked_add(u32::try_from(offset).map_err(|_| CtError::InvalidSize)?)
+            .ok_or(CtError::InvalidSize)
+    };
+    Ok(CtbAddresses {
+        send_descriptor: address(CTB_SEND_DESC_OFFSET)?,
+        receive_descriptor: address(CTB_RECV_DESC_OFFSET)?,
+        send_buffer: address(CTB_SEND_BUFFER_OFFSET)?,
+        receive_buffer: address(CTB_RECV_BUFFER_OFFSET)?,
+    })
+}
+
+/// upstream: intel_guc_ct.c ct_register_buffer().
+pub fn register_buffer(
+    io: &impl GtIo,
+    send: bool,
+    descriptor: u32,
+    buffer: u32,
+    size_bytes: u32,
+) -> Result<(), Error> {
+    if descriptor == 0 || buffer == 0 || size_bytes == 0 || size_bytes % 4096 != 0 {
+        return Err(Error::Refused);
+    }
+    let (desc_key, buffer_key, size_key) = if send {
+        (
+            KLV_SELF_CFG_H2G_CTB_DESCRIPTOR_ADDR,
+            KLV_SELF_CFG_H2G_CTB_ADDR,
+            KLV_SELF_CFG_H2G_CTB_SIZE,
+        )
+    } else {
+        (
+            KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR,
+            KLV_SELF_CFG_G2H_CTB_ADDR,
+            KLV_SELF_CFG_G2H_CTB_SIZE,
+        )
+    };
+    crate::guc_fw::self_config64(io, desc_key, u64::from(descriptor))?;
+    crate::guc_fw::self_config64(io, buffer_key, u64::from(buffer))?;
+    crate::guc_fw::self_config32(io, size_key, size_bytes)
+}
+
+/// upstream: intel_guc_ct.c guc_action_control_ctb()/ct_control_enable().
+pub fn control_buffer_transport(io: &impl GtIo, enable: bool) -> Result<(), Error> {
+    let control = if enable {
+        CTB_CONTROL_ENABLE
+    } else {
+        CTB_CONTROL_DISABLE
+    };
+    let result = crate::guc_fw::send_mmio(io, &[ACTION_HOST2GUC_CONTROL_CTB, control], None)?;
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Error::Unavailable(ACTION_HOST2GUC_CONTROL_CTB))
+    }
+}
+
+/// upstream: intel_guc_ct.c intel_guc_ct_enable(). G2H is registered first.
+pub fn enable_buffer_transport(io: &impl GtIo, addresses: CtbAddresses) -> Result<(), Error> {
+    register_buffer(
+        io,
+        false,
+        addresses.receive_descriptor,
+        addresses.receive_buffer,
+        CTB_G2H_BUFFER_SIZE as u32,
+    )?;
+    register_buffer(
+        io,
+        true,
+        addresses.send_descriptor,
+        addresses.send_buffer,
+        CTB_H2G_BUFFER_SIZE as u32,
+    )?;
+    control_buffer_transport(io, true)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -546,14 +649,53 @@ pub const fn max_queue_time_ms() -> u32 {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use core::cell::{Cell, RefCell};
 
     use super::*;
+
+    struct MmioIo {
+        writes: RefCell<Vec<(u32, u32)>>,
+        notifications: Cell<usize>,
+        response_data: u32,
+    }
+    impl GtIo for MmioIo {
+        fn read(&self, offset: u32) -> Result<u32, Error> {
+            if offset == 0x190240 {
+                Ok(HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_SUCCESS | self.response_data)
+            } else if (0x190244..0x190250).contains(&offset) {
+                Ok(0)
+            } else {
+                Err(Error::Unavailable(offset))
+            }
+        }
+        fn write(&self, offset: u32, value: u32) -> Result<(), Error> {
+            self.writes.borrow_mut().push((offset, value));
+            if offset == 0x1901f0 {
+                self.notifications.set(self.notifications.get() + 1);
+            }
+            Ok(())
+        }
+        fn now_us(&self) -> u64 {
+            0
+        }
+        fn delay_us(&self, _micros: u32) {}
+    }
 
     #[test]
     fn ctb_abi_struct_layout_and_blob_sizes_match_upstream() {
         assert_eq!(core::mem::size_of::<CtbDescriptor>(), 64);
         assert_eq!(CTB_DESC_SIZE, 2048);
         assert_eq!(CTB_BLOB_SIZE, 24 * 1024);
+        assert_eq!(
+            ctb_addresses(0x10_0000).unwrap(),
+            CtbAddresses {
+                send_descriptor: 0x10_0000,
+                receive_descriptor: 0x10_0800,
+                send_buffer: 0x10_1000,
+                receive_buffer: 0x10_2000,
+            }
+        );
+        assert_eq!(ctb_addresses(0x10_0001), Err(CtError::InvalidSize));
         assert_eq!(max_queue_time_ms(), 2000);
         assert_eq!(ctb_message_header(0x1234, 2), (0x1234 << 16) | 2);
         assert_eq!(hxg_request_header(0x1234, false), 0x1234);
@@ -561,6 +703,47 @@ mod tests {
             hxg_request_header(0x1234, true),
             HXG_TYPE_FAST_REQUEST | 0x1234
         );
+    }
+
+    #[test]
+    fn ctb_registration_uses_receive_descriptor_buffer_size_order() {
+        let io = MmioIo {
+            writes: RefCell::new(Vec::new()),
+            notifications: Cell::new(0),
+            response_data: 1,
+        };
+        assert_eq!(
+            register_buffer(&io, false, 0x10_0800, 0x10_2000, CTB_G2H_BUFFER_SIZE as u32),
+            Ok(())
+        );
+        let writes = io.writes.borrow();
+        assert_eq!(writes[0], (0x190240, 0x0508));
+        assert_eq!(writes[1], (0x190244, (0x0906 << 16) | 2));
+        assert_eq!(writes[2], (0x190248, 0x10_0800));
+        assert_eq!(writes[3], (0x19024c, 0));
+        assert_eq!(writes[5], (0x190240, 0x0508));
+        assert_eq!(writes[6], (0x190244, (0x0905 << 16) | 2));
+        assert_eq!(writes[10], (0x190240, 0x0508));
+        assert_eq!(writes[11], (0x190244, (0x0907 << 16) | 1));
+        assert_eq!(writes[12], (0x190248, CTB_G2H_BUFFER_SIZE as u32));
+        assert_eq!(io.notifications.get(), 3);
+    }
+
+    #[test]
+    fn ctb_enable_and_disable_use_the_mmio_control_action() {
+        let io = MmioIo {
+            writes: RefCell::new(Vec::new()),
+            notifications: Cell::new(0),
+            response_data: 0,
+        };
+        assert_eq!(control_buffer_transport(&io, true), Ok(()));
+        assert_eq!(
+            io.writes.borrow()[0],
+            (0x190240, ACTION_HOST2GUC_CONTROL_CTB)
+        );
+        assert_eq!(io.writes.borrow()[1], (0x190244, CTB_CONTROL_ENABLE));
+        assert_eq!(control_buffer_transport(&io, false), Ok(()));
+        assert_eq!(io.writes.borrow()[4], (0x190244, CTB_CONTROL_DISABLE));
     }
 
     #[test]

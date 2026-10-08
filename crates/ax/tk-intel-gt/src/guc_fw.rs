@@ -36,6 +36,7 @@ const HXG_TYPE_NO_RESPONSE_BUSY: u32 = 3 << 28;
 const HXG_TYPE_NO_RESPONSE_RETRY: u32 = 5 << 28;
 const HXG_TYPE_RESPONSE_FAILURE: u32 = 6 << 28;
 const ACTION_AUTHENTICATE_HUC: u32 = 0x4000;
+const ACTION_HOST2GUC_SELF_CFG: u32 = 0x0508;
 const UOS_RSA_SCRATCH: u32 = 0xc200;
 const UOS_RSA_SCRATCH_COUNT: usize = 64;
 
@@ -323,6 +324,37 @@ pub fn send_mmio(
 /// Ask the running GuC to authenticate HuC firmware's RSA data in GGTT.
 pub fn authenticate_huc(io: &impl GtIo, rsa_offset: u32) -> Result<u32, Error> {
     send_mmio(io, &[ACTION_AUTHENTICATE_HUC, rsa_offset], None)
+}
+
+// upstream: intel_guc.c __guc_action_self_cfg()
+pub fn self_config(io: &impl GtIo, key: u16, len: u16, value: u64) -> Result<(), Error> {
+    if !(1..=2).contains(&len) || (len == 1 && value >> 32 != 0) {
+        return Err(Error::Refused);
+    }
+    let request = [
+        ACTION_HOST2GUC_SELF_CFG,
+        (u32::from(key) << 16) | u32::from(len),
+        value as u32,
+        (value >> 32) as u32,
+    ];
+    let response = send_mmio(io, &request, None)?;
+    if response > 1 {
+        return Err(Error::Unavailable(GEN11_GUC_SEND_BASE));
+    }
+    if response == 0 {
+        return Err(Error::Refused);
+    }
+    Ok(())
+}
+
+// upstream: intel_guc.c intel_guc_self_cfg32()
+pub fn self_config32(io: &impl GtIo, key: u16, value: u32) -> Result<(), Error> {
+    self_config(io, key, 1, u64::from(value))
+}
+
+// upstream: intel_guc.c intel_guc_self_cfg64()
+pub fn self_config64(io: &impl GtIo, key: u16, value: u64) -> Result<(), Error> {
+    self_config(io, key, 2, value)
 }
 
 // upstream: intel_guc_fw.c guc_prepare_xfer()
@@ -850,6 +882,31 @@ mod tests {
                 (GEN11_GUC_SEND_BASE + 4, 0x1234_0000)
             ]
         );
+    }
+
+    #[test]
+    fn guc_self_config_encodes_klv_key_length_and_both_value_words() {
+        let response = [HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_SUCCESS | 1];
+        let responses = [&response[..]];
+        let io = MmioIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            responses: &responses,
+            notifications: core::cell::Cell::new(0),
+            response_index: core::cell::Cell::new(0),
+            time: core::cell::Cell::new(0),
+        };
+        assert_eq!(self_config64(&io, 0x0903, 0x1234_5678_9abc_def0), Ok(()));
+        assert_eq!(
+            &io.writes.borrow()[..4],
+            &[
+                (GEN11_GUC_SEND_BASE, ACTION_HOST2GUC_SELF_CFG),
+                (GEN11_GUC_SEND_BASE + 4, (0x0903 << 16) | 2),
+                (GEN11_GUC_SEND_BASE + 8, 0x9abc_def0),
+                (GEN11_GUC_SEND_BASE + 12, 0x1234_5678),
+            ]
+        );
+        assert_eq!(self_config32(&io, 0x0904, 4096), Ok(()));
+        assert_eq!(self_config(&io, 0x0904, 1, 1u64 << 32), Err(Error::Refused));
     }
 
     #[test]
