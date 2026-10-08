@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright © 2026 TheKernel contributors.
-// Linux v7.2.3 drivers/gpu/drm/i915/i915_drv.h prefix layout.
-//
-// This describes only the known prefix through `__runtime`; it is deliberately
-// not presented as the complete `drm_i915_private`. Offsets after `__runtime`
-// depend on large configuration-sensitive records and are not asserted here.
+// Linux v7.2.3 drivers/gpu/drm/i915/i915_drv.h configuration-specific overlay.
+// Directly accessed members use the x86_64 wt-dev C layout probe; untouched
+// configuration-sensitive regions remain opaque byte ranges.
 
 use core::{
-    ffi::{c_char, c_void},
+    ffi::{c_char, c_ulong, c_void},
     mem::{align_of, offset_of, size_of},
 };
 
@@ -80,7 +78,11 @@ pub struct DrmI915Private {
     pub runtime: IntelRuntimeInfo,
     _before_unordered_wq: [u8; 852],
     pub unordered_wq: *mut c_void,
-    _before_gpu_error: [u8; 568],
+    _before_gem_quirks: [u8; 8],
+    pub gem_quirks: c_ulong,
+    _before_edram_size: [u8; 544],
+    pub edram_size_mb: u32,
+    _align_gpu_error: [u8; 4],
     pub gpu_error: I915GpuError,
     pub suspend_count: u32,
     pub vlv_s0ix_state: *mut c_void,
@@ -128,6 +130,9 @@ const _: [(); 8] = [(); align_of::<DrmDevicePrefix>()];
 
 const _: [(); 80] = [(); size_of::<I915Params>()];
 const _: [(); 8] = [(); align_of::<I915Params>()];
+const _: [(); 2560] = [(); offset_of!(DrmI915Private, gem_quirks)];
+const _: [(); 3112] = [(); offset_of!(DrmI915Private, edram_size_mb)];
+const _: [(); 3120] = [(); offset_of!(DrmI915Private, gpu_error)];
 const _: [(); 4] = [(); offset_of!(I915Params, enable_guc)];
 const _: [(); 8] = [(); offset_of!(I915Params, guc_log_level)];
 const _: [(); 16] = [(); offset_of!(I915Params, guc_firmware_path)];

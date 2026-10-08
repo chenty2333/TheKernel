@@ -188,6 +188,25 @@ pub unsafe fn intel_gt_clock_interval_to_ns(gt: *const IntelGt, count: u64) -> u
     ((count as u128 * 1_000_000_000u128) / frequency as u128) as u64
 }
 
+/// `to_i915()` from i915_drv.h; `drm` is the first member of the private
+/// object in the target layout.
+#[inline]
+pub unsafe fn to_i915(dev: *mut c_void) -> *mut DrmI915Private {
+    assert!(!dev.is_null());
+    dev.cast()
+}
+
+/// `i915_gem_get_pat_index()` from i915_gem.c.
+pub unsafe fn i915_gem_get_pat_index(i915: *const DrmI915Private, level: u32) -> u32 {
+    assert!(!i915.is_null());
+    if level >= 4 {
+        return 0;
+    }
+    let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
+    assert!(!info.is_null());
+    unsafe { (*info).cachelevel_to_pat[level as usize] }
+}
+
 /// N305/Gen12.55 MCR locking path from intel_gt_mcr.c. The later hardware
 /// semaphore/forcewake path is deliberately refused until an owned uncore
 /// MMIO backend is available; a spinlock alone is not equivalent there.
@@ -369,6 +388,24 @@ pub struct IntelRuntimeInfo {
     _tail: [u8; 3],
 }
 
+/// `intel_device_info` layout from the wt-dev Linux 7.2.3 compile oracle.
+/// `is_dgfx` is bit 2 in the first byte of `DEV_INFO_FOR_EACH_FLAG`.
+#[repr(C)]
+pub struct IntelDeviceInfoOverlay {
+    _prefix: [u8; 24],
+    pub memory_regions: u32,
+    pub flags: [u8; 5],
+    _pad: [u8; 3],
+    pub runtime: IntelRuntimeInfo,
+    pub cachelevel_to_pat: [u32; 4],
+    pub max_pat_index: u32,
+}
+const _: [(); 96] = [(); size_of::<IntelDeviceInfoOverlay>()];
+const _: [(); 24] = [(); offset_of!(IntelDeviceInfoOverlay, memory_regions)];
+const _: [(); 28] = [(); offset_of!(IntelDeviceInfoOverlay, flags)];
+const _: [(); 72] = [(); offset_of!(IntelDeviceInfoOverlay, cachelevel_to_pat)];
+const _: [(); 88] = [(); offset_of!(IntelDeviceInfoOverlay, max_pat_index)];
+
 /// Prefix overlay for `drm_i915_private.__runtime`. Offset and runtime size
 /// were obtained from the source kernel's x86_64 v7.2.3 compile configuration.
 #[repr(C)]
@@ -500,6 +537,38 @@ const INTEL_ALDERLAKE_P: u32 = 35;
 const INTEL_DG2: u32 = 36;
 const INTEL_METEORLAKE: u32 = 37;
 
+/// `HAS_LLC(i915)` from i915_drv.h; has_llc is the 19th source flag bit.
+#[allow(non_snake_case)]
+pub unsafe fn HAS_LLC<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = (*(i915.as_i915_private().cast::<DrmI915Private>())).info;
+    !info.is_null() && ((*info.cast::<IntelDeviceInfoOverlay>()).flags[2] & (1 << 2)) != 0
+}
+
+/// `HAS_SNOOP(i915)` from i915_drv.h; has_snoop is source flag bit 32.
+#[allow(non_snake_case)]
+pub unsafe fn HAS_SNOOP<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = (*(i915.as_i915_private().cast::<DrmI915Private>())).info;
+    !info.is_null() && ((*info.cast::<IntelDeviceInfoOverlay>()).flags[4] & 1) != 0
+}
+
+/// `HAS_LMEM(i915)` from i915_drv.h, using INTEL_REGION_LMEM_0 (bit 1).
+#[allow(non_snake_case)]
+pub unsafe fn HAS_LMEM<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = (*(i915.as_i915_private().cast::<DrmI915Private>())).info;
+    !info.is_null() && ((*info.cast::<IntelDeviceInfoOverlay>()).memory_regions & (1 << 1)) != 0
+}
+
+/// `HAS_WT(i915)` from i915_drv.h; WT capability is the measured eDRAM size.
+#[allow(non_snake_case)]
+pub unsafe fn HAS_WT<P: I915PrivatePtr>(i915: P) -> bool {
+    (*(i915.as_i915_private().cast::<DrmI915Private>())).edram_size_mb != 0
+}
+
+/// `to_gt(i915)` from gt/intel_gt.h: GT0 is the primary GT in this ABI.
+pub unsafe fn to_gt<P: I915PrivatePtr>(i915: P) -> *mut IntelGt {
+    (*(i915.as_i915_private().cast::<DrmI915Private>())).gt[0]
+}
+
 #[allow(non_snake_case)]
 pub unsafe fn IS_PLATFORM<P: I915PrivatePtr>(i915: P, platform: u32) -> bool {
     let runtime = &*runtime_info(i915);
@@ -563,6 +632,23 @@ pub unsafe fn IS_DG2_G10<P: I915PrivatePtr>(i915: P) -> bool {
 #[allow(non_snake_case)]
 pub unsafe fn IS_DG2_G11<P: I915PrivatePtr>(i915: P) -> bool {
     IS_SUBPLATFORM(i915, INTEL_DG2, 1)
+}
+
+/// `IS_DGFX()` from i915_drv.h, reading the asserted `is_dgfx` bit from the
+/// source `intel_device_info` object.
+#[allow(non_snake_case)]
+pub unsafe fn IS_DGFX<P: I915PrivatePtr>(i915: P) -> bool {
+    let i915 = i915.as_i915_private().cast::<DrmI915Private>();
+    assert!(!i915.is_null());
+    let info = unsafe { (*i915).info.cast::<IntelDeviceInfoOverlay>() };
+    assert!(!info.is_null());
+    unsafe { (*info).flags[0] & (1 << 2) != 0 }
+}
+
+/// `HAS_128_BYTE_Y_TILING()` from i915_drv.h.
+#[allow(non_snake_case)]
+pub unsafe fn HAS_128_BYTE_Y_TILING<P: I915PrivatePtr>(i915: P) -> bool {
+    !IS_I915G(i915) && !IS_I915GM(i915)
 }
 
 #[allow(non_snake_case)]

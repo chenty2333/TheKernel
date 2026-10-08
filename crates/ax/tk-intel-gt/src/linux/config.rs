@@ -108,6 +108,13 @@ pub const I915_MADV_WILLNEED: u32 = 0;
 pub const I915_GTT_VIEW_NORMAL: i32 = 0;
 // `arch/x86/include/asm/cpufeatures.h`: CPUID feature word 0, bit 19.
 pub const X86_FEATURE_CLFLUSH: u32 = 19;
+
+/// `i915_gem_tile_height()` from gem/i915_gem_object.h.
+#[inline]
+pub fn i915_gem_tile_height(tiling: u32) -> u32 {
+    assert_ne!(tiling, 0, "GEM_BUG_ON: linear objects have no tile height");
+    if tiling == 2 { 32 } else { 8 }
+}
 pub const EIO: i32 = 5;
 pub const ENOENT: i32 = 2;
 pub const ENXIO: i32 = 6;

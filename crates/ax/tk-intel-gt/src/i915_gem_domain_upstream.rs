@@ -31,8 +31,8 @@ const I915_GEM_GPU_DOMAINS: u32 = I915_GEM_DOMAIN_RENDER
     | I915_GEM_DOMAIN_COMMAND
     | I915_GEM_DOMAIN_INSTRUCTION
     | I915_GEM_DOMAIN_VERTEX;
-const I915_BO_CACHE_COHERENT_FOR_READ: u8 = 1 << 0;
-const I915_BO_CACHE_COHERENT_FOR_WRITE: u8 = 1 << 1;
+const I915_BO_CACHE_COHERENT_FOR_READ: u32 = 1 << 0;
+const I915_BO_CACHE_COHERENT_FOR_WRITE: u32 = 1 << 1;
 const I915_CLFLUSH_FORCE: u32 = 1 << 0;
 const I915_CLFLUSH_SYNC: u32 = 1 << 1;
 const I915_WAIT_INTERRUPTIBLE: u32 = 1 << 0;
@@ -108,7 +108,7 @@ unsafe fn gpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool {
 pub unsafe fn i915_gem_cpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bool {
     let i915 = to_i915((*obj).base.dev);
 
-    if (*obj).cache_dirty != 0 {
+    if unsafe { i915_gem_object_cache_dirty(obj) } {
         return false;
     }
 
@@ -116,7 +116,7 @@ pub unsafe fn i915_gem_cpu_write_needs_clflush(obj: *mut DrmI915GemObject) -> bo
         return false;
     }
 
-    if ((*obj).cache_coherent & I915_BO_CACHE_COHERENT_FOR_WRITE) == 0 {
+    if (unsafe { i915_gem_object_cache_coherent(obj) } & I915_BO_CACHE_COHERENT_FOR_WRITE) == 0 {
         return true;
     }
 
@@ -151,7 +151,7 @@ unsafe fn flush_write_domain(obj: *mut DrmI915GemObject, flush_domains: u32) {
 
         I915_GEM_DOMAIN_RENDER => {
             if gpu_write_needs_clflush(obj) {
-                (*obj).cache_dirty = 1;
+                i915_gem_object_set_cache_dirty(obj, true);
             }
         }
 
@@ -166,7 +166,7 @@ unsafe fn __i915_gem_object_flush_for_display(obj: *mut DrmI915GemObject) {
     // We manually flush the CPU domain so that we can override and
     // force the flush for the display, and perform it asyncrhonously.
     flush_write_domain(obj, !I915_GEM_DOMAIN_CPU);
-    if (*obj).cache_dirty != 0 {
+    if unsafe { i915_gem_object_cache_dirty(obj) } {
         i915_gem_clflush_object(obj, I915_CLFLUSH_FORCE);
     }
     (*obj).write_domain = 0;
@@ -353,7 +353,7 @@ pub unsafe fn i915_gem_object_set_cache_level(
 
     // Always invalidate stale cachelines
     i915_gem_object_set_cache_coherency(obj, cache_level as u32);
-    (*obj).cache_dirty = 1;
+    i915_gem_object_set_cache_dirty(obj, true);
 
     // The cache-level will be applied when each vma is rebound.
     i915_gem_object_unbind(
@@ -387,7 +387,7 @@ pub unsafe fn i915_gem_get_caching_ioctl(
 
     // This ioctl should be disabled for the objects with pat_index
     // set by user space.
-    if (*obj).pat_set_by_user != 0 {
+    if i915_gem_object_pat_set_by_user(obj) {
         err = -EOPNOTSUPP;
         rcu_read_unlock();
         return err;
@@ -457,7 +457,7 @@ pub unsafe fn i915_gem_set_caching_ioctl(
 
     // This ioctl should be disabled for the objects with pat_index
     // set by user space.
-    if (*obj).pat_set_by_user != 0 {
+    if i915_gem_object_pat_set_by_user(obj) {
         ret = -EOPNOTSUPP;
     } else if i915_gem_object_is_proxy(obj) {
         // The caching mode of proxy object is handled by its generator, and
@@ -752,7 +752,7 @@ pub unsafe fn i915_gem_object_prepare_read(
         return ret;
     }
 
-    if (*obj).cache_coherent & I915_BO_CACHE_COHERENT_FOR_READ != 0
+    if unsafe { i915_gem_object_cache_coherent(obj) } & I915_BO_CACHE_COHERENT_FOR_READ != 0
         || !static_cpu_has(X86_FEATURE_CLFLUSH)
     {
         ret = i915_gem_object_set_to_cpu_domain(obj, false);
@@ -769,7 +769,9 @@ pub unsafe fn i915_gem_object_prepare_read(
     // read domain and manually flush cachelines (if required). This
     // optimizes for the case when the gpu will dirty the data
     // anyway again before the next pread happens.
-    if (*obj).cache_dirty == 0 && (*obj).read_domains as u32 & I915_GEM_DOMAIN_CPU == 0 {
+    if !unsafe { i915_gem_object_cache_dirty(obj) }
+        && (*obj).read_domains as u32 & I915_GEM_DOMAIN_CPU == 0
+    {
         *needs_clflush = CLFLUSH_BEFORE;
     }
 
@@ -803,7 +805,7 @@ pub unsafe fn i915_gem_object_prepare_write(
         return ret;
     }
 
-    if (*obj).cache_coherent & I915_BO_CACHE_COHERENT_FOR_WRITE != 0
+    if unsafe { i915_gem_object_cache_coherent(obj) } & I915_BO_CACHE_COHERENT_FOR_WRITE != 0
         || !static_cpu_has(X86_FEATURE_CLFLUSH)
     {
         ret = i915_gem_object_set_to_cpu_domain(obj, true);
@@ -818,7 +820,7 @@ pub unsafe fn i915_gem_object_prepare_write(
         // gtt write domain and manually flush cachelines (as required).
         // This optimizes for the case when the gpu will use the data
         // right away and we therefore have to clflush anyway.
-        if (*obj).cache_dirty == 0 {
+        if !unsafe { i915_gem_object_cache_dirty(obj) } {
             *needs_clflush |= CLFLUSH_AFTER;
 
             // Same trick applies to invalidate partially written

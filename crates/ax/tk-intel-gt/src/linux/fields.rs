@@ -13,11 +13,86 @@ use core::{
 };
 
 use crate::{
-    intel_context_upstream::{IrqWork, Kref},
+    intel_context_upstream::{DrmI915GemObject, IrqWork, Kref},
     intel_engine_cs_upstream::{
         AtomicT, IntelEngineCs, IntelEngineMask, ListHead, LlistHead, Spinlock,
     },
 };
+
+// Accessors for the packed bitfields at the exact source offsets in
+// `DrmI915GemObjectPrefix`. They preserve adjacent PAT/coherency bits when
+// updating `cache_dirty`, unlike treating the source bitfield as a byte.
+#[inline]
+pub unsafe fn i915_gem_object_cache_dirty(obj: *const DrmI915GemObject) -> bool {
+    assert!(!obj.is_null());
+    unsafe { (*obj).prefix.cache_bits & (1 << 9) != 0 }
+}
+
+#[inline]
+pub unsafe fn i915_gem_object_set_cache_dirty(obj: *mut DrmI915GemObject, dirty: bool) {
+    assert!(!obj.is_null());
+    let bits = unsafe { &mut (*obj).prefix.cache_bits };
+    if dirty {
+        *bits |= 1 << 9;
+    } else {
+        *bits &= !(1 << 9);
+    }
+}
+
+#[inline]
+pub unsafe fn i915_gem_object_cache_coherent(obj: *const DrmI915GemObject) -> u32 {
+    assert!(!obj.is_null());
+    ((unsafe { (*obj).prefix.cache_bits } >> 7) & 0x3) as u32
+}
+
+#[inline]
+pub unsafe fn i915_gem_object_is_dpt(obj: *const DrmI915GemObject) -> bool {
+    assert!(!obj.is_null());
+    unsafe { (*obj).prefix.cache_bits & (1 << 10) != 0 }
+}
+
+#[inline]
+pub unsafe fn i915_gem_object_pat_set_by_user(obj: *const DrmI915GemObject) -> bool {
+    assert!(!obj.is_null());
+    unsafe { (*obj).prefix.cache_bits & (1 << 6) != 0 }
+}
+
+/// `i915_gem_object_is_framebuffer()` from gem/i915_gem_object.h.
+pub unsafe fn i915_gem_object_is_framebuffer(obj: *const DrmI915GemObject) -> bool {
+    assert!(!obj.is_null());
+    let frontbuffer =
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*obj).prefix.frontbuffer)) };
+    !frontbuffer.is_null() || unsafe { i915_gem_object_is_dpt(obj) }
+}
+
+/// `i915_gem_object_get_tiling()` and `get_stride()` from gem/i915_gem_object.h.
+pub unsafe fn i915_gem_object_get_tiling(obj: *const DrmI915GemObject) -> u32 {
+    assert!(!obj.is_null());
+    unsafe { (*obj).prefix.tiling_and_stride & 0x7f }
+}
+
+pub unsafe fn i915_gem_object_get_stride(obj: *const DrmI915GemObject) -> u32 {
+    assert!(!obj.is_null());
+    unsafe { (*obj).prefix.tiling_and_stride & !0x7f }
+}
+
+#[inline]
+pub unsafe fn i915_gem_object_is_tiled(obj: *const DrmI915GemObject) -> bool {
+    unsafe { i915_gem_object_get_tiling(obj) != 0 }
+}
+
+/// Source `i915_gem_object_has_cache_level()` fast check. A user-specified PAT
+/// index deliberately bypasses cache-level comparison; otherwise compare the
+/// asserted per-device cachelevel-to-PAT table.
+pub unsafe fn i915_gem_object_has_cache_level(obj: *const DrmI915GemObject, level: u32) -> bool {
+    assert!(!obj.is_null());
+    if unsafe { i915_gem_object_pat_set_by_user(obj) } {
+        return true;
+    }
+    let i915 = unsafe { crate::linux::i915::to_i915((*obj).prefix.base.dev) };
+    let pat_index = unsafe { (*obj).prefix.cache_bits & 0x3f };
+    pat_index == unsafe { crate::linux::i915::i915_gem_get_pat_index(i915, level) }
+}
 
 /// Opaque forward declaration of `struct i915_gpu_coredump`.
 #[repr(C)]
