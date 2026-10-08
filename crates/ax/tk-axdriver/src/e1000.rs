@@ -12,7 +12,7 @@ use core::{ptr::NonNull, time::Duration};
 use axalloc::{UsageKind, global_allocator};
 use axdriver_net::{
     NetDriverOps,
-    e1000::{E1000Hal, E1000Nic},
+    e1000::{E1000Hal, E1000Nic, osdep::{E1000PciConfig, read_pci_cfg, write_pci_cfg}},
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::virt_to_phys;
@@ -30,6 +30,37 @@ const MIN_BAR_BYTES: usize = 0x6000;
 const RING_SIZE: usize = 128;
 
 pub struct PlatformHal;
+
+struct E1000PciConfigAdapter<'a> {
+    root: &'a mut PciRoot,
+    bdf: DeviceFunction,
+}
+
+impl E1000PciConfig for E1000PciConfigAdapter<'_> {
+    fn read_config_u16(&mut self, register: u32) -> Option<u16> {
+        let offset = u8::try_from(register).ok()?;
+        if offset & 1 != 0 {
+            return None;
+        }
+        let dword_offset = offset & !3;
+        let dword = self.root.read_config_dword(self.bdf, dword_offset)?;
+        Some((dword >> (u32::from(offset & 2) * 8)) as u16)
+    }
+
+    fn write_config_u16(&mut self, register: u32, value: u16) -> bool {
+        let Ok(offset) = u8::try_from(register) else {
+            return false;
+        };
+        self.root.write_config_u16(self.bdf, offset, value)
+    }
+
+    fn find_capability(&mut self, capability_id: u8) -> Option<u32> {
+        self.root
+            .capabilities(self.bdf)
+            .find(|capability| capability.id == capability_id)
+            .map(|capability| u32::from(capability.offset))
+    }
+}
 
 impl E1000Hal for PlatformHal {
     fn dma_alloc(pages: usize) -> Option<(u64, NonNull<u8>)> {
@@ -114,16 +145,21 @@ pub(crate) fn probe(
             return BusProbeResult::Claimed;
         }
     };
-    let Some(command) = root.read_config_dword(bdf, PCI_COMMAND) else {
-        return BusProbeResult::Claimed;
-    };
-    if !root.write_config_u16(
-        bdf,
-        PCI_COMMAND,
-        command as u16 | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER,
-    ) {
-        warn!("e1000: {bdf} could not enable memory/bus-master PCI command bits");
-        return BusProbeResult::Claimed;
+    {
+        let mut pci = E1000PciConfigAdapter { root, bdf };
+        let Ok(command) = read_pci_cfg(&mut pci, u32::from(PCI_COMMAND)) else {
+            return BusProbeResult::Claimed;
+        };
+        if write_pci_cfg(
+            &mut pci,
+            u32::from(PCI_COMMAND),
+            command | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER,
+        )
+        .is_err()
+        {
+            warn!("e1000: {bdf} could not enable memory/bus-master PCI command bits");
+            return BusProbeResult::Claimed;
+        }
     }
     let Ok(mapped) = axklib::mem::iomap((address as usize).into(), size) else {
         warn!("e1000: {bdf} BAR0 mapping failed");
