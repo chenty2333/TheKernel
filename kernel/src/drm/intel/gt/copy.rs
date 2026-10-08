@@ -542,7 +542,9 @@ fn upload_uc_one(
             .map(|_| ())
             .map_err(|error| match error {
                 intel_gt::guc_fw::LoadError::Io(error) => error,
-                intel_gt::guc_fw::LoadError::Firmware(_) => Error::Refused,
+                intel_gt::guc_fw::LoadError::Firmware { status, failure } => {
+                    failure.into_error(status)
+                }
                 intel_gt::guc_fw::LoadError::Timeout { .. } => Error::Timeout(0xc000),
             }),
     };
@@ -595,6 +597,7 @@ pub(super) fn upload_uc_firmware(
     }
     let (huc_memory, rsa_offset) = upload_huc_for_auth(owner, huc)?;
     if let Err(error) = upload_uc_one(owner, guc) {
+        let _ = huc.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
         if let Err(memory) = huc_memory.release() {
             owner.uc_memory = Some(memory);
             return Err(Error::Quarantined);
@@ -605,8 +608,16 @@ pub(super) fn upload_uc_firmware(
         .and_then(|_| intel_gt::guc_fw::wait_huc_auth(&owner.bus).map(|_| ()))
         .map_err(|_| Error::Quarantined);
     if let Err(error) = authentication {
+        let _ = huc.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
         owner.uc_memory = Some(huc_memory);
         return Err(error);
+    }
+    if huc
+        .change_status(intel_gt::uc::FirmwareStatus::Running)
+        .is_err()
+    {
+        owner.uc_memory = Some(huc_memory);
+        return Err(Error::Quarantined);
     }
     if let Err(memory) = huc_memory.release() {
         owner.uc_memory = Some(memory);

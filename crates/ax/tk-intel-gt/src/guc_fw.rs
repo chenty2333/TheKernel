@@ -163,18 +163,42 @@ pub fn guc_upload(
     if image.kind != crate::uc::Kind::GuC {
         return Err(LoadError::Io(Error::Refused));
     }
-    for write in gen12_prepare_xfer() {
-        io.write(write.offset, write.value).map_err(LoadError::Io)?;
+    image
+        .change_status(crate::uc::FirmwareStatus::Loadable)
+        .map_err(|_| LoadError::Io(Error::Refused))?;
+    let result = (|| {
+        for write in gen12_prepare_xfer() {
+            io.write(write.offset, write.value).map_err(LoadError::Io)?;
+        }
+        guc_xfer_rsa(io, source_ggtt, image).map_err(LoadError::Io)?;
+        let code_bytes = image
+            .css
+            .header_bytes
+            .checked_add(image.css.microcode_bytes)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(LoadError::Io(Error::Refused))?;
+        firmware_dma_xfer(io, source_ggtt, 0x2000, code_bytes, UOS_MOVE).map_err(LoadError::Io)?;
+        image
+            .change_status(crate::uc::FirmwareStatus::Transferred)
+            .map_err(|_| LoadError::Io(Error::Refused))?;
+        wait_ucode(io)
+    })();
+    match result {
+        Ok(status) => {
+            if image
+                .change_status(crate::uc::FirmwareStatus::Running)
+                .is_err()
+            {
+                let _ = image.change_status(crate::uc::FirmwareStatus::LoadFail);
+                return Err(LoadError::Io(Error::Refused));
+            }
+            Ok(status)
+        }
+        Err(error) => {
+            let _ = image.change_status(crate::uc::FirmwareStatus::LoadFail);
+            Err(error)
+        }
     }
-    guc_xfer_rsa(io, source_ggtt, image).map_err(LoadError::Io)?;
-    let code_bytes = image
-        .css
-        .header_bytes
-        .checked_add(image.css.microcode_bytes)
-        .and_then(|v| u32::try_from(v).ok())
-        .ok_or(LoadError::Io(Error::Refused))?;
-    firmware_dma_xfer(io, source_ggtt, 0x2000, code_bytes, UOS_MOVE).map_err(LoadError::Io)?;
-    wait_ucode(io)
 }
 
 // upstream: intel_huc_fw.c intel_huc_fw_upload()
@@ -188,13 +212,27 @@ pub fn huc_upload(
     if loaded_by_gsc || image.kind != crate::uc::Kind::HuC {
         return Err(Error::Refused);
     }
-    let code_bytes = image
-        .css
-        .header_bytes
-        .checked_add(image.css.microcode_bytes)
-        .and_then(|v| u32::try_from(v).ok())
-        .ok_or(Error::Refused)?;
-    firmware_dma_xfer(io, source_ggtt, 0, code_bytes, HUC_UKERNEL)
+    image
+        .change_status(crate::uc::FirmwareStatus::Loadable)
+        .map_err(|_| Error::Refused)?;
+    let result = (|| {
+        let code_bytes = image
+            .css
+            .header_bytes
+            .checked_add(image.css.microcode_bytes)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(Error::Refused)?;
+        firmware_dma_xfer(io, source_ggtt, 0, code_bytes, HUC_UKERNEL)
+    })();
+    match result {
+        Ok(()) => image
+            .change_status(crate::uc::FirmwareStatus::Transferred)
+            .map_err(|_| Error::Refused),
+        Err(error) => {
+            let _ = image.change_status(crate::uc::FirmwareStatus::LoadFail);
+            Err(error)
+        }
+    }
 }
 
 // upstream: intel_huc.c intel_huc_is_authenticated()
@@ -323,9 +361,54 @@ pub fn load_done(status: u32) -> Option<bool> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadFailure {
+    MissingKey,
+    SignatureRejected,
+    ProductionKeyRejected,
+    FirmwareException,
+    InvalidMmioSaveRestore,
+    InvalidWorkaroundKlv,
+    HardwareConfigTimeout,
+    Other,
+}
+
+impl LoadFailure {
+    pub fn into_error(self, status: u32) -> Error {
+        match self {
+            Self::HardwareConfigTimeout => Error::Timeout(0xc000),
+            Self::FirmwareException | Self::Other => Error::Unavailable(status),
+            Self::MissingKey
+            | Self::SignatureRejected
+            | Self::ProductionKeyRejected
+            | Self::InvalidMmioSaveRestore
+            | Self::InvalidWorkaroundKlv => Error::Refused,
+        }
+    }
+}
+
+// upstream: intel_guc_fw.c guc_wait_ucode()
+pub fn load_failure(status: u32) -> LoadFailure {
+    let bootrom = (status >> 1) & 0x7f;
+    let ukernel = (status >> 8) & 0xff;
+    match bootrom {
+        0x13 => return LoadFailure::MissingKey,
+        0x50 => return LoadFailure::SignatureRejected,
+        0x2b => return LoadFailure::ProductionKeyRejected,
+        _ => {}
+    }
+    match ukernel {
+        0x70 => LoadFailure::FirmwareException,
+        0x74 => LoadFailure::InvalidMmioSaveRestore,
+        0x75 => LoadFailure::InvalidWorkaroundKlv,
+        0x05 => LoadFailure::HardwareConfigTimeout,
+        _ => LoadFailure::Other,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoadError {
     Io(Error),
-    Firmware(u32),
+    Firmware { status: u32, failure: LoadFailure },
     Timeout { status: u32, attempts: u8 },
 }
 
@@ -342,7 +425,12 @@ fn wait_ucode_with(io: &impl GtIo, wait_us: u64, attempts: u8) -> Result<u32, Lo
             status = io.read(0xc000).map_err(LoadError::Io)?; // GUC_STATUS
             match load_done(status) {
                 Some(true) => return Ok(status),
-                Some(false) => return Err(LoadError::Firmware(status)),
+                Some(false) => {
+                    return Err(LoadError::Firmware {
+                        status,
+                        failure: load_failure(status),
+                    });
+                }
                 None => {}
             }
             if io.now_us().saturating_sub(start) >= wait_us {
@@ -399,6 +487,22 @@ mod tests {
     }
 
     #[test]
+    fn guc_load_failure_diagnostics_match_bootrom_and_ukernel_errors() {
+        for (status, failure) in [
+            (0x13 << 1, LoadFailure::MissingKey),
+            (0x50 << 1, LoadFailure::SignatureRejected),
+            (0x2b << 1, LoadFailure::ProductionKeyRejected),
+            (0x70 << 8, LoadFailure::FirmwareException),
+            (0x74 << 8, LoadFailure::InvalidMmioSaveRestore),
+            (0x75 << 8, LoadFailure::InvalidWorkaroundKlv),
+            (0x05 << 8, LoadFailure::HardwareConfigTimeout),
+            (0x73 << 8, LoadFailure::Other),
+        ] {
+            assert_eq!(load_failure(status), failure);
+        }
+    }
+
+    #[test]
     fn gen12_guc_transfer_order_and_flags_match_upstream() {
         let writes = gen12_prepare_xfer();
         assert_eq!(writes[0].offset, 0xc064);
@@ -423,7 +527,10 @@ mod tests {
         };
         assert_eq!(
             wait_ucode_with(&failed, 2, 3),
-            Err(LoadError::Firmware(0x02 << 8))
+            Err(LoadError::Firmware {
+                status: 0x02 << 8,
+                failure: LoadFailure::Other,
+            })
         );
 
         let pending = ScriptedIo {
@@ -585,6 +692,7 @@ mod tests {
             css,
             old_version: false,
             bytes,
+            status: core::sync::atomic::AtomicU8::new(crate::uc::FirmwareStatus::Available as u8),
         }
     }
 
@@ -607,6 +715,7 @@ mod tests {
             fail_start: false,
         };
         assert_eq!(guc_upload(&io, 0x10_0000, &image), Ok(0xf0 << 8));
+        assert_eq!(image.status(), crate::uc::FirmwareStatus::Running);
         let writes = io.writes.borrow();
         assert_eq!(writes[0], (0xc064, 0x8607));
         assert_eq!(writes[1], (0x13816c, 1));
@@ -646,6 +755,7 @@ mod tests {
         assert_eq!(huc_upload(&io, 0x2000, &image, true), Err(Error::Refused));
         assert!(io.writes.borrow().is_empty());
         huc_upload(&io, 0x2000, &image, false).unwrap();
+        assert_eq!(image.status(), crate::uc::FirmwareStatus::Transferred);
         assert_eq!(io.writes.borrow()[2], (DMA_ADDR_1_LOW, 0));
         assert_eq!(
             io.writes.borrow()[5],

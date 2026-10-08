@@ -2,15 +2,16 @@
 // Linux 7.2.3 drivers/gpu/drm/i915/gt/uc/intel_uc_fw.c:
 // GuC/HuC platform firmware selection for TGL/RKL/ADL-S/ADL-P.
 // Copyright © 2016-2019 Intel Corporation.
+// Firmware load phases from drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h.
+// Copyright © 2014-2019 Intel Corporation.
 // Gen12 PCI-ID mapping from include/drm/intel/pciids.h.
 // Copyright 2013 Intel Corporation.
 // Full MIT grant: ../LICENSE-MIT.
-//! Intel Gen12 GuC/HuC firmware filename/version table.
-//!
-//! This is only the platform selection data from `intel_uc_fw.c`; it does not
-//! parse or upload the firmware and does not claim that a uC is running.
+//! Intel Gen12 GuC/HuC firmware fetch metadata and load phase tracking.
+//! Hardware transfers are performed by `guc_fw` through the GT owner.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Platform {
@@ -26,6 +27,58 @@ pub enum Platform {
 pub enum Kind {
     GuC,
     HuC,
+}
+
+/// i915 `intel_uc_fw_status` phase names for firmware fetch/init/upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FirmwareStatus {
+    NotSupported = 0,
+    Uninitialized,
+    Disabled,
+    Selected,
+    Missing,
+    Error,
+    Available,
+    InitFail,
+    Loadable,
+    LoadFail,
+    Transferred,
+    Running,
+}
+
+impl FirmwareStatus {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::NotSupported,
+            1 => Self::Uninitialized,
+            2 => Self::Disabled,
+            3 => Self::Selected,
+            4 => Self::Missing,
+            5 => Self::Error,
+            6 => Self::Available,
+            7 => Self::InitFail,
+            8 => Self::Loadable,
+            9 => Self::LoadFail,
+            10 => Self::Transferred,
+            11 => Self::Running,
+            _ => Self::Error,
+        }
+    }
+
+    fn permits(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Available, Self::Loadable | Self::InitFail)
+                | (Self::Loadable, Self::LoadFail | Self::Transferred)
+                | (
+                    Self::Transferred,
+                    Self::LoadFail | Self::Loadable | Self::Running
+                )
+                | (Self::Running, Self::Loadable)
+                | (Self::LoadFail, Self::Loadable)
+        )
+    }
 }
 
 pub const ENABLE_GUC_SUBMISSION: u32 = 1 << 0;
@@ -71,6 +124,34 @@ pub struct FirmwareImage {
     pub css: CssInfo,
     pub old_version: bool,
     pub bytes: Vec<u8>,
+    pub(crate) status: AtomicU8,
+}
+
+impl FirmwareImage {
+    pub fn status(&self) -> FirmwareStatus {
+        FirmwareStatus::from_raw(self.status.load(Ordering::Acquire))
+    }
+
+    /// Move through the same fetch/init/upload status phases as i915. The
+    /// upload owner decides when a reset has made a RUNNING image loadable.
+    pub fn change_status(&self, next: FirmwareStatus) -> Result<(), FirmwareStatus> {
+        let mut current = self.status.load(Ordering::Acquire);
+        loop {
+            let state = FirmwareStatus::from_raw(current);
+            if !state.permits(next) {
+                return Err(state);
+            }
+            match self.status.compare_exchange_weak(
+                current,
+                next as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
 }
 
 // upstream: intel_uc_fw.c intel_uc_fw_fetch()
@@ -106,6 +187,7 @@ pub fn load(
             css,
             old_version,
             bytes,
+            status: AtomicU8::new(FirmwareStatus::Available as u8),
         });
     }
     Err(FirmwareError::Missing)
@@ -396,6 +478,16 @@ mod tests {
         assert_eq!(platform_from_device_id(0x1234), None);
     }
 
+    #[test]
+    fn firmware_status_follows_fetch_init_upload_and_reset_phases() {
+        assert!(FirmwareStatus::Available.permits(FirmwareStatus::Loadable));
+        assert!(FirmwareStatus::Loadable.permits(FirmwareStatus::Transferred));
+        assert!(FirmwareStatus::Transferred.permits(FirmwareStatus::Running));
+        assert!(FirmwareStatus::Running.permits(FirmwareStatus::Loadable));
+        assert!(!FirmwareStatus::Available.permits(FirmwareStatus::Running));
+        assert!(!FirmwareStatus::Disabled.permits(FirmwareStatus::Loadable));
+    }
+
     fn css_image(header_dwords: u32, image_dwords: u32) -> std::vec::Vec<u8> {
         let mut image = std::vec![0; image_dwords as usize * 4 + 16];
         for (offset, value) in [
@@ -460,6 +552,7 @@ mod tests {
         assert_eq!(requested[1], "i915/tgl_guc_70.1.1.bin");
         assert_eq!(loaded.blob.path, "i915/tgl_guc_70.1.1.bin");
         assert!(loaded.old_version);
+        assert_eq!(loaded.status(), FirmwareStatus::Available);
         assert_eq!(loaded.bytes, image);
         assert_eq!(loaded.css.version, (70, 1, 1));
     }

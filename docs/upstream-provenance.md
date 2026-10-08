@@ -1004,3 +1004,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.c::guc_send_reg` and `intel_guc_notify`, four-dword GuC send-register indexing and H2G notification write (MIT, Copyright © 2014-2019 Intel Corporation).
 
 `crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `include/drm/intel/pciids.h` TGL/RKL/ADL-S/ADL-P/ADL-N device-ID tables (MIT, Copyright 2013 Intel Corporation), translated to a runtime `Platform` selector.
+`crates/ax/tk-intel-gt/src/uc.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_uc_fw.h::intel_uc_fw_status`, the uC firmware phase enum and fetch/init/upload state transitions (MIT, Copyright © 2014-2019 Intel Corporation); unavailable and invalid fetches remain typed loader errors.
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc_fw.c::guc_wait_ucode`, BootROM/GuC failure classification and source error mapping for key, signature, exception, save/restore, KLV, and HWCONFIG failures (MIT, Copyright © 2014-2019 Intel Corporation).
