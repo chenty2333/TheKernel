@@ -397,6 +397,7 @@ pub(crate) struct HciReceiveInfo {
     pub(crate) length: usize,
     pub(crate) timestamp_nanos: u64,
     pub(crate) cmsg_mask: u8,
+    pub(crate) pass_credentials: bool,
 }
 
 struct MgmtSubscriber {
@@ -450,8 +451,7 @@ impl HciSocket {
         }
     }
 
-    /// Retain the HCI capture and SOL_SOCKET toggles used by monitor clients.
-    /// SCM_TIMESTAMP/SCM_CREDENTIALS ancillary delivery is not implemented yet.
+    /// Retain HCI capture and SOL_SOCKET toggles used by monitor clients.
     pub(crate) fn set_hci_option(&self, option: u32, value: i32) -> AxResult<()> {
         if !matches!(value, 0 | 1) {
             return Err(AxError::InvalidInput);
@@ -498,6 +498,7 @@ impl HciSocket {
                 length: packet.len(),
                 timestamp_nanos: crate::time::wall_time_nanos(),
                 cmsg_mask: 0,
+                pass_credentials: self.get_hci_option(HCI_OPT_PASS_CREDENTIALS)? != 0,
             });
         }
         #[cfg(feature = "input")]
@@ -507,6 +508,7 @@ impl HciSocket {
                 .receive_channel_packet(channel, out, self.nonblocking.load(Ordering::Acquire))
                 .map_err(map_transport_error)?;
             let options = self.socket_options.lock();
+            let pass_credentials = options.pass_credentials != 0;
             let cmsg_mask = if matches!(channel, 0 | 1) {
                 (u8::from(options.data_direction != 0) * HCI_CMSG_DIR as u8)
                     | (u8::from(options.timestamps != 0) * HCI_CMSG_TSTAMP as u8)
@@ -517,6 +519,7 @@ impl HciSocket {
                 length,
                 timestamp_nanos,
                 cmsg_mask,
+                pass_credentials,
             });
         }
         Err(LinuxError::ENODEV.into())

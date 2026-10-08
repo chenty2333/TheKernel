@@ -42,8 +42,9 @@ the signed `bluez-btmon` and `bluez-deprecated` packages, pinning `btmon` and
 the `SOL_HCI` data-direction/timestamp controls and the `SOL_SOCKET`
 timestamp/pass-credentials toggles required for `btmon` startup. Ancillary HCI receive metadata now emits `HCI_CMSG_DIR` (incoming direction) and
 `HCI_CMSG_TSTAMP` (microsecond timeval) when enabled; timestamp capture comes from
-the receive/pump path. `SCM_CREDENTIALS` payload delivery remains unsupported. This
-evidence is strictly the no-controller path: in QEMU, `hciconfig` enumerates no adapters,
+the receive/pump path. With `SO_PASSCRED`, `SCM_CREDENTIALS` now carries kernel
+credentials `(pid, uid, gid) = (0, 0, 0)` and sets `MSG_CTRUNC` if the ancillary
+space cannot fit it. This evidence is strictly the no-controller path: in QEMU, `hciconfig` enumerates no adapters,
 `hciconfig hci0` gets `ENODEV`, and `btmon -i 0` starts waiting until the test
 stops it. The existing BlueZ daemon, `btmgmt info`, and `bluetoothctl list`
 no-controller checks also pass. No active-controller/monitor-frame behavior is

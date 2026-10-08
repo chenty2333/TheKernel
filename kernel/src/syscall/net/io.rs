@@ -1907,6 +1907,13 @@ fn recv_impl(
                     control_truncated = true;
                 }
             }
+            // HCI packets and management events are kernel-originated. Linux
+            // reports the kernel credentials when SO_PASSCRED is enabled.
+            if info.pass_credentials && !builder.push_credentials(0, 0, 0) {
+                control_truncated = true;
+            }
+        } else if info.pass_credentials {
+            control_truncated = true;
         }
         return Ok(ReceiveOutcome {
             returned_len: copied as isize,
