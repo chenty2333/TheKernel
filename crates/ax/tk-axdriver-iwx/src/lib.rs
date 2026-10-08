@@ -95,8 +95,8 @@ pub use command::{
     submit_command, wait_for_command,
 };
 pub use config::{
-    AX211_DEVICE_ID, DeviceConfig, FirmwareConfig, INTEL_VENDOR_ID, RuntimeConfig, lookup_config,
-    matches_pci_device,
+    AX211_DEVICE_ID, AttachProfile, AttachProfileError, DeviceConfig, FirmwareConfig,
+    INTEL_VENDOR_ID, RuntimeConfig, attach_profile, lookup_config, matches_pci_device,
 };
 pub use context::{
     ContextError, ContextQueueAddresses, GEN2_CONTEXT_BYTES, GEN3_CONTEXT_BYTES,

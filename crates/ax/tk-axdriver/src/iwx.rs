@@ -11,9 +11,9 @@ use core::{
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_iwx::{
-    AX211_DEVICE_ID, AttachAllocationError, DeviceConfig, DeviceFamily, DmaAllocator, DmaError,
-    DmaRegion, FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IwxAttachResources,
-    RuntimeConfig, allocate_attach_resources, lookup_config, matches_pci_device,
+    AX211_DEVICE_ID, AttachAllocationError, AttachProfile, DmaAllocator, DmaError, DmaRegion,
+    FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IwxAttachResources,
+    RuntimeConfig, allocate_attach_resources, attach_profile, matches_pci_device,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -122,8 +122,7 @@ struct Bdf(u8, u8, u8);
 
 struct AttachedDevice {
     bdf: Bdf,
-    family: DeviceFamily,
-    config: DeviceConfig,
+    profile: AttachProfile,
     bar_base: usize,
     bar_size: usize,
     resources: IwxAttachResources<PlatformDmaRegion>,
@@ -152,23 +151,9 @@ fn pci_match_decision(vendor_id: u16, device_id: u16, rf_id: Option<u32>) -> boo
     })
 }
 
-fn device_family(device_id: u16) -> Option<DeviceFamily> {
-    match device_id {
-        0x2723 | 0x02f0 | 0xa0f0 | 0x34f0 | 0x06f0 | 0x43f0 | 0x3df0 | 0x4df0 => {
-            Some(DeviceFamily::Family22000)
-        }
-        0x2725 | 0x2726 | 0x51f0 | 0x7a70 | 0x51f1 | 0x7af0 | 0x7e40 | 0x54f0 | 0x7f70 => {
-            Some(DeviceFamily::Ax210)
-        }
-        0x7740 => Some(DeviceFamily::Bz),
-        _ => None,
-    }
-}
-
 fn allocate_resources(
     bdf: DeviceFunction,
-    family: DeviceFamily,
-    config: DeviceConfig,
+    profile: AttachProfile,
     bar_base: usize,
     bar_size: usize,
 ) -> Result<(), AttachAllocationError> {
@@ -177,7 +162,7 @@ fn allocate_resources(
     if attached.iter().any(|entry| entry.bdf == key) {
         return Ok(());
     }
-    let resources = allocate_attach_resources(&mut PlatformDmaAllocator, family)?;
+    let resources = allocate_attach_resources(&mut PlatformDmaAllocator, profile.family)?;
     attached.try_reserve(1).map_err(|_| {
         AttachAllocationError::Allocation(
             axdriver_iwx::AttachAllocationStage::ContextInfo,
@@ -186,8 +171,7 @@ fn allocate_resources(
     })?;
     attached.push(AttachedDevice {
         bdf: key,
-        family,
-        config,
+        profile,
         bar_base,
         bar_size,
         resources,
@@ -213,7 +197,7 @@ fn register_rootfs_firmware_callback() {
 fn stage_rootfs_firmware() {
     const UC_MAX: usize = 4 * 1024 * 1024;
     const PNVM_MAX: usize = 2 * 1024 * 1024;
-    let pending: Vec<(Bdf, DeviceConfig)> = {
+    let pending: Vec<(Bdf, AttachProfile)> = {
         let devices = ATTACHED_DMA.lock();
         let mut pending = Vec::new();
         if pending.try_reserve_exact(devices.len()).is_err() {
@@ -224,12 +208,12 @@ fn stage_rootfs_firmware() {
             devices
                 .iter()
                 .filter(|device| device.firmware.is_none())
-                .map(|device| (device.bdf, device.config)),
+                .map(|device| (device.bdf, device.profile)),
         );
         pending
     };
-    for (bdf, config) in pending {
-        let firmware = config.firmware();
+    for (bdf, profile) in pending {
+        let firmware = profile.firmware;
         let result = match axdriver_base::firmware::request(firmware.firmware, UC_MAX) {
             None => Err(FirmwareRequestError::UcodeMissing),
             Some(bytes) => match FirmwareImage::parse(&bytes) {
@@ -253,7 +237,7 @@ fn stage_rootfs_firmware() {
                     "iwx: {bdf:?}: staged firmware version {:?} ({:?}); BAR0 {:#x}+{:#x}, {} TX \
                      queues and {} RX buffers retained",
                     bundle.image.api,
-                    device.family,
+                    device.profile.family,
                     device.bar_base,
                     device.bar_size,
                     device.resources.tx_queues.len(),
@@ -339,25 +323,25 @@ pub(crate) fn probe(
         ((rf_id >> 28) & 1) as u8,
         ((rf_id >> 29) & 1) as u8,
     );
-    match lookup_config(config) {
-        Some(selected) => {
+    match attach_profile(config) {
+        Ok(profile) => {
             info!(
-                "iwx: {bdf}: PCI {:#06x}:{:#06x} matched {selected:?} (subsystem {:#06x}:{:#06x})",
+                "iwx: {bdf}: PCI {:#06x}:{:#06x} matched {:?} (subsystem {:#06x}:{:#06x})",
                 info.vendor_id,
                 info.device_id,
+                profile.config,
                 root.endpoint_subsystem_ids(bdf).0,
                 subsystem,
             );
-            if let Some(family) = device_family(info.device_id) {
-                if let Err(error) = allocate_resources(bdf, family, selected, base, bar.1 as usize)
-                {
-                    warn!("iwx: {bdf}: attach DMA allocation failed: {error:?}");
-                    return BusProbeResult::Claimed;
-                }
-                register_rootfs_firmware_callback();
+            if let Err(error) = allocate_resources(bdf, profile, base, bar.1 as usize) {
+                warn!("iwx: {bdf}: attach DMA allocation failed: {error:?}");
+                return BusProbeResult::Claimed;
             }
+            register_rootfs_firmware_callback();
         }
-        None => warn!("iwx: {bdf}: matched PCI function has no runtime iwx config"),
+        Err(error) => {
+            warn!("iwx: {bdf}: matched PCI function has no usable runtime profile: {error:?}")
+        }
     }
     debug_assert_eq!(info.vendor_id, INTEL_VENDOR_ID);
     if info.device_id == AX211_DEVICE_ID {

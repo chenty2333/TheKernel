@@ -246,6 +246,102 @@ pub struct RuntimeConfig {
     pub jacket: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachProfileError {
+    UnknownProduct(u16),
+    UnsupportedRevision,
+    MissingRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachProfile {
+    pub config: DeviceConfig,
+    pub firmware: FirmwareConfig,
+    pub family: crate::DeviceFamily,
+    pub integrated: bool,
+    pub ltr_delay: u8,
+    pub low_latency_xtal: bool,
+    pub xtal_latency: u32,
+    pub tx_with_siso_diversity: bool,
+    pub uhb_supported: bool,
+    pub imr_enabled: bool,
+    pub mac_addr_from_csr: u32,
+    pub umac_prph_offset: u32,
+    pub max_tfd_queue_size: usize,
+}
+
+/// Initialize per-product hardware defaults, then apply the reverse-row runtime config override.
+// upstream: if_iwx.c iwx_attach() / iwx_find_device_cfg()
+pub fn attach_profile(runtime: RuntimeConfig) -> Result<AttachProfile, AttachProfileError> {
+    let (family, integrated, ltr_delay, low_latency, latency, imr) = match runtime.device {
+        0x2723 => (crate::DeviceFamily::Family22000, false, 0, false, 0, false),
+        0x02f0 | 0x06f0 if runtime.mac_type != 0x354 => {
+            return Err(AttachProfileError::UnsupportedRevision);
+        }
+        0x02f0 | 0x06f0 => (crate::DeviceFamily::Family22000, true, 1, false, 500, false),
+        0xa0f0 => (crate::DeviceFamily::Family22000, true, 1, false, 500, false),
+        0x34f0 | 0x3df0 | 0x4df0 => (
+            crate::DeviceFamily::Family22000,
+            true,
+            3,
+            false,
+            1820,
+            false,
+        ),
+        0x43f0 => (
+            crate::DeviceFamily::Family22000,
+            true,
+            2,
+            true,
+            12000,
+            false,
+        ),
+        0x2725 | 0x2726 | 0x51f0 | 0x51f1 | 0x7e40 | 0x54f0 => {
+            (crate::DeviceFamily::Ax210, false, 0, false, 0, false)
+        }
+        0x7a70 | 0x7f70 => (crate::DeviceFamily::Ax210, true, 2, true, 12000, true),
+        0x7af0 => (crate::DeviceFamily::Ax210, true, 0, false, 0, false),
+        0x7740 => (crate::DeviceFamily::Bz, true, 2, true, 12000, false),
+        other => return Err(AttachProfileError::UnknownProduct(other)),
+    };
+    let config = lookup_config(runtime).ok_or(AttachProfileError::MissingRuntimeConfig)?;
+    let firmware = config.firmware();
+    let mut profile = AttachProfile {
+        config,
+        firmware,
+        family,
+        integrated,
+        ltr_delay,
+        low_latency_xtal: low_latency,
+        xtal_latency: latency,
+        tx_with_siso_diversity: false,
+        uhb_supported: firmware.uhb_supported,
+        imr_enabled: imr,
+        mac_addr_from_csr: if family >= crate::DeviceFamily::Bz {
+            0x30
+        } else {
+            0x380
+        },
+        umac_prph_offset: if family >= crate::DeviceFamily::Ax210 {
+            0x300000
+        } else {
+            0
+        },
+        max_tfd_queue_size: if family >= crate::DeviceFamily::Ax210 {
+            crate::rings::GEN3_MAX_TFD_QUEUE_SIZE
+        } else {
+            crate::rings::TX_RING_COUNT
+        },
+    };
+    profile.tx_with_siso_diversity = firmware.tx_with_siso_diversity;
+    profile.uhb_supported = firmware.uhb_supported;
+    if firmware.xtal_latency != 0 {
+        profile.xtal_latency = firmware.xtal_latency;
+        profile.low_latency_xtal = firmware.low_latency_xtal;
+    }
+    Ok(profile)
+}
+
 impl RuntimeConfig {
     /// Derive subsystem fields and silicon facts exactly as `iwx_find_device_cfg()` does.
     // upstream: if_iwx.c iwx_find_device_cfg()
@@ -1601,6 +1697,25 @@ mod tests {
         assert_eq!(fw.firmware, "/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode");
         assert_eq!(fw.pnvm, Some("/lib/firmware/iwlwifi-so-a0-gf-a0.pnvm"));
         assert!(fw.uhb_supported);
+    }
+    #[test]
+    fn attach_profile_combines_product_defaults_with_runtime_firmware_config() {
+        let profile = attach_profile(AX211).unwrap();
+        assert_eq!(profile.config, DeviceConfig::SoGfAx211);
+        assert_eq!(profile.family, crate::DeviceFamily::Ax210);
+        assert!(!profile.integrated);
+        assert_eq!(profile.mac_addr_from_csr, 0x380);
+        assert_eq!(profile.umac_prph_offset, 0x300000);
+        assert_eq!(profile.max_tfd_queue_size, crate::GEN3_MAX_TFD_QUEUE_SIZE);
+        assert!(profile.uhb_supported);
+        assert_eq!(
+            profile.firmware.firmware,
+            "/lib/firmware/iwlwifi-so-a0-gf-a0-89.ucode"
+        );
+        assert_eq!(
+            attach_profile(RuntimeConfig::from_hardware(0xffff, 0, 0, 0, 0, 0, 0)),
+            Err(AttachProfileError::UnknownProduct(0xffff))
+        );
     }
     #[test]
     fn exact_killer_1691_1692_1671_1672_rows_win_in_reverse_order() {

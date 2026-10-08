@@ -112,6 +112,9 @@ The static PCI probe chain now uses OpenBSD's complete iwx product list and
 its BZ/Wi-Fi-6E RF filter, then applies the runtime subsystem/MAC/RF table.
 Matched functions are claimed, but the full hardware-to-wlan0 attach adapter is
 still being completed.
+Product attach profiles now retain family, integrated/LTR/XTAL defaults,
+CSR-address selection, UMAC peripheral offset, and queue modulus before the
+runtime device-table overrides.
 
 The core attach allocator now creates Gen2/Gen3 context info, Gen3 peripheral
 scratch/info, the 4 KiB-aligned ICT, ten TX queues, and the 512-buffer RX ring
