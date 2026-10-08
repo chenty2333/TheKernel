@@ -24,6 +24,8 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 `guc_ct.rs` 已提供同步 TLB 完成和 FIFO deferred-event dispatch adapter（分别对应上游 receive-context 路径与 incoming-request worker），以及可注入调度器的 nonblocking send busy-loop；GuC 事件业务 handler 以及 kernel 侧 G2H interrupt/tasklet/workqueue 调用链仍未接入。
 
+`guc_capture.rs` 是 `intel_guc_capture.c` 的首个数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，保留原始 metadata/order，并跳过未知 capture type。静态 Gen12 register lists、ADS wire-up、preallocated capture-node cache、engine/core-dump matching/printing 及 CT event caller 尚未实现。
+
 ## 移植边界
 
 不翻译 Linux DRM 框架、debugfs/sysfs 管理面、非 Gen12 平台路径及任务未列出的显示功能。GSC、LMEM-only/独显路径以及需要尚不存在的内核内存/用户页能力部分，先核对 Gen12 ADL 集显调用路径；不能安全映射的功能记录为未移植，不以占位成功掩盖。上游代码按函数保留控制流和错误顺序，翻译文件顶部登记来源/完整版权行，每个翻译函数用 `// upstream: <文件> <函数>()` 标注；MIT 全文及来源登记遵守 `COMMON.md`。

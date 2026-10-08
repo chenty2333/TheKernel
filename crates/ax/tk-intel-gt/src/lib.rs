@@ -10,6 +10,7 @@ extern crate std;
 pub mod bcs;
 pub mod cache;
 pub mod guc_ads;
+pub mod guc_capture;
 pub mod guc_config;
 pub mod guc_ct;
 pub mod guc_fw;
