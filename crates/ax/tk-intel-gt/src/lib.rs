@@ -25,6 +25,7 @@ pub mod rcs_page;
 pub mod reset;
 pub mod uc;
 pub mod uncore;
+pub mod wopcm;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Unavailable(u32),

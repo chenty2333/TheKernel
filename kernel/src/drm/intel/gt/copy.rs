@@ -912,6 +912,26 @@ pub(super) fn upload_uc_firmware(
     if !owner.bus.awake.load(Ordering::Acquire) {
         return Err(Error::Refused);
     }
+    let guc_upload_size = guc
+        .css
+        .header_bytes
+        .checked_add(guc.css.microcode_bytes)
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or(Error::Refused)?;
+    let huc_upload_size = huc
+        .css
+        .header_bytes
+        .checked_add(huc.css.microcode_bytes)
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or(Error::Refused)?;
+    intel_gt::wopcm::initialize_gen12(
+        &owner.bus,
+        guc_upload_size,
+        huc_upload_size,
+        true,
+        false,
+    )
+    .map_err(|_| Error::Quarantined)?;
     let (huc_memory, rsa_offset) = upload_huc_for_auth(owner, huc)?;
     if let Err(error) = upload_uc_one(owner, guc) {
         let _ = huc.change_status(intel_gt::uc::FirmwareStatus::LoadFail);

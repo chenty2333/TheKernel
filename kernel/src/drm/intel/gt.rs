@@ -108,6 +108,9 @@ impl Bus {
         if [0xc064, 0x13816c].contains(&r) {
             return write && self.awake.load(Ordering::Acquire);
         }
+        if [0xc050, 0xc340].contains(&r) {
+            return self.awake.load(Ordering::Acquire);
+        }
         if (0x190240..=0x19024c).contains(&r) {
             return self.awake.load(Ordering::Acquire);
         }
@@ -710,6 +713,29 @@ mod tests {
         bus.assert_media_idle().unwrap();
         words[0x1c0030 / 4] = 8;
         assert_eq!(bus.assert_media_idle(), Err(Error::Refused));
+    }
+
+    #[test]
+    fn wopcm_registers_are_only_accessible_while_the_gt_is_awake() {
+        let mut words = vec![0u32; 0x200000 / 4];
+        // SAFETY: aligned private stable model memory, not a hardware BAR.
+        let window =
+            unsafe { RegisterWindow::from_mapped(words.as_mut_ptr() as usize, words.len() * 4) };
+        let bus = Bus {
+            window,
+            awake: AtomicBool::new(false),
+            render_awake: AtomicBool::new(false),
+            rcs_owned: AtomicBool::new(false),
+            media_present: AtomicU8::new(0),
+            media_awake: AtomicU8::new(0),
+        };
+        assert_eq!(bus.read(0xc050), Err(Error::Unavailable(0xc050)));
+        assert_eq!(bus.write(0xc340, 0), Err(Error::Refused));
+        bus.awake.store(true, Ordering::Release);
+        bus.write(0xc050, 0x200000).unwrap();
+        bus.write(0xc340, 0x10002).unwrap();
+        assert_eq!(bus.read(0xc050), Ok(0x200000));
+        assert_eq!(bus.read(0xc340), Ok(0x10002));
     }
     #[test]
     fn native_gt_window_requires_owned_wake_and_rejects_display_or_global_reset() {
