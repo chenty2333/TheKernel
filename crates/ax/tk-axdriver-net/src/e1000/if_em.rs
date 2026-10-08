@@ -1972,6 +1972,117 @@ pub struct EmRxUnitConfig {
     pub iov: bool,
     pub flow_mode: EmFlowMode,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmVectorQueue {
+    pub queue: u32,
+    pub vector: u16,
+    pub eims: u32,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmVectorMasks {
+    pub queue: u32,
+    pub link: u32,
+}
+
+/// Media selection requested by the interface-control layer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmMediaRequest {
+    Auto,
+    Fiber1000 { lx: bool },
+    Copper1000,
+    Copper100 { full_duplex: bool },
+    Copper10 { full_duplex: bool },
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmMediaConfig {
+    pub autoneg: bool,
+    pub autoneg_advertised: u32,
+    pub forced_speed_duplex: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmMediaType {
+    Copper,
+    Fiber,
+    InternalSerdes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmMediaStatus {
+    pub valid: bool,
+    pub active: bool,
+    pub subtype: Option<EmMediaRequest>,
+}
+
+/// upstream: if_em.c em_if_media_change()
+pub fn em_if_media_change(request: EmMediaRequest, config: &mut EmMediaConfig) -> DevResult {
+    match request {
+        EmMediaRequest::Auto => {
+            config.autoneg = true;
+            config.autoneg_advertised = 0x2f;
+        }
+        EmMediaRequest::Fiber1000 { .. } | EmMediaRequest::Copper1000 => {
+            config.autoneg = true;
+            config.autoneg_advertised = 1 << 5;
+        }
+        EmMediaRequest::Copper100 { full_duplex } => {
+            config.autoneg = false;
+            config.autoneg_advertised = 0;
+            config.forced_speed_duplex = if full_duplex { 0x0008 } else { 0x0004 };
+        }
+        EmMediaRequest::Copper10 { full_duplex } => {
+            config.autoneg = false;
+            config.autoneg_advertised = 0;
+            config.forced_speed_duplex = if full_duplex { 0x0002 } else { 0x0001 };
+        }
+        // FreeBSD logs the unrecognized subtype but returns success without
+        // changing the selected mode.
+        EmMediaRequest::Unsupported => return Ok(()),
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_if_media_status()
+pub fn em_if_media_status(
+    media: EmMediaType,
+    mac: E1000MacType,
+    link_up: bool,
+    speed_mbps: u16,
+    full_duplex: bool,
+) -> EmMediaStatus {
+    let mut status = EmMediaStatus {
+        valid: true,
+        active: false,
+        subtype: None,
+    };
+    if !link_up {
+        return status;
+    }
+    status.active = true;
+    status.subtype = Some(match media {
+        EmMediaType::Fiber | EmMediaType::InternalSerdes => EmMediaRequest::Fiber1000 {
+            lx: mac == E1000MacType::I82545,
+        },
+        EmMediaType::Copper => match speed_mbps {
+            10 => EmMediaRequest::Copper10 { full_duplex },
+            100 => EmMediaRequest::Copper100 { full_duplex },
+            1000 => EmMediaRequest::Copper1000,
+            _ => return status,
+        },
+    });
+    status
+}
+
+/// upstream: if_em.c em_set_flowcntl()
+pub fn em_set_flowcntl(mode: u8) -> DevResult<u8> {
+    match mode {
+        0..=3 => Ok(mode),
+        _ => Err(DevError::InvalidParam),
+    }
+}
+
 pub trait EmRxUnitOps {
     fn initialize_rss(&mut self) -> DevResult;
     fn initialize_advanced_rx_rings(&mut self, drop: bool) -> DevResult;
@@ -3173,6 +3284,110 @@ pub fn igb_initialize_interrupt_rate<I: E1000RegisterIo>(
     Ok(())
 }
 
+/// upstream: if_em.c igb_configure_queues()
+pub fn igb_configure_queues<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    vf: bool,
+    rx: &mut [EmVectorQueue],
+    tx: &[EmVectorQueue],
+    link_vector: u16,
+) -> DevResult<EmVectorMasks> {
+    let mut masks = EmVectorMasks::default();
+    if !vf && mac != E1000MacType::I82575 {
+        io.write_register(
+            E1000_GPIE,
+            E1000_GPIE_MSIX_MODE | E1000_GPIE_EIAME | E1000_GPIE_PBA | E1000_GPIE_NSICR,
+        )?;
+    }
+    if matches!(
+        mac,
+        E1000MacType::I82580
+            | E1000MacType::I350
+            | E1000MacType::I354
+            | E1000MacType::I210
+            | E1000MacType::I211
+            | E1000MacType::VfAdapt
+            | E1000MacType::VfAdaptI350
+    ) {
+        for q in rx.iter_mut() {
+            let index = q.queue >> 1;
+            let reg = E1000_IVAR0 + index * 4;
+            let mut ivar = io.read_register(reg)?;
+            if q.queue & 1 != 0 {
+                ivar = (ivar & 0xff00_ffff) | ((u32::from(q.vector) | E1000_IVAR_VALID) << 16);
+            } else {
+                ivar = (ivar & 0xffff_ff00) | u32::from(q.vector) | E1000_IVAR_VALID;
+            }
+            io.write_register(reg, ivar)?;
+            masks.queue |= q.eims;
+        }
+        for q in tx {
+            let index = q.queue >> 1;
+            let reg = E1000_IVAR0 + index * 4;
+            let mut ivar = io.read_register(reg)?;
+            if q.queue & 1 != 0 {
+                ivar = (ivar & 0x00ff_ffff) | ((u32::from(q.vector) | E1000_IVAR_VALID) << 24);
+            } else {
+                ivar = (ivar & 0xffff_00ff) | ((u32::from(q.vector) | E1000_IVAR_VALID) << 8);
+            }
+            io.write_register(reg, ivar)?;
+            masks.queue |= q.eims;
+        }
+        let ivar = if vf {
+            u32::from(link_vector) | E1000_IVAR_VALID
+        } else {
+            (u32::from(link_vector) | E1000_IVAR_VALID) << 8
+        };
+        masks.link = 1u32 << link_vector;
+        io.write_register(E1000_IVAR_MISC, ivar)?;
+    } else if mac == E1000MacType::I82576 {
+        for q in rx.iter_mut() {
+            let index = q.queue & 7;
+            let reg = E1000_IVAR0 + index * 4;
+            let mut ivar = io.read_register(reg)?;
+            if q.queue < 8 {
+                ivar = (ivar & 0xffff_ff00) | u32::from(q.vector) | E1000_IVAR_VALID;
+            } else {
+                ivar = (ivar & 0xff00_ffff) | ((u32::from(q.vector) | E1000_IVAR_VALID) << 16);
+            }
+            io.write_register(reg, ivar)?;
+            masks.queue |= q.eims;
+        }
+        for q in tx {
+            let index = q.queue & 7;
+            let reg = E1000_IVAR0 + index * 4;
+            let mut ivar = io.read_register(reg)?;
+            if q.queue < 8 {
+                ivar = (ivar & 0xffff_00ff) | ((u32::from(q.vector) | E1000_IVAR_VALID) << 8);
+            } else {
+                ivar = (ivar & 0x00ff_ffff) | ((u32::from(q.vector) | E1000_IVAR_VALID) << 24);
+            }
+            io.write_register(reg, ivar)?;
+            masks.queue |= q.eims;
+        }
+        masks.link = 1u32 << link_vector;
+        io.write_register(
+            E1000_IVAR_MISC,
+            (u32::from(link_vector) | E1000_IVAR_VALID) << 8,
+        )?;
+    } else if mac == E1000MacType::I82575 {
+        let ctrl = io.read_register(E1000_CTRL_EXT)?
+            | E1000_CTRL_EXT_PBA_CLR
+            | E1000_CTRL_EXT_EIAME
+            | E1000_CTRL_EXT_IRCA;
+        io.write_register(E1000_CTRL_EXT, ctrl)?;
+        for (i, q) in rx.iter_mut().enumerate() {
+            q.eims = (E1000_EICR_RX_QUEUE0 << i) | (E1000_EICR_TX_QUEUE0 << i);
+            io.write_register(0x01600 + i as u32 * 4, q.eims)?;
+            masks.queue |= q.eims;
+        }
+        io.write_register(0x01600 + u32::from(link_vector) * 4, 0x8000_0000)?;
+        masks.link |= 0x8000_0000;
+    }
+    Ok(masks)
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeMap;
@@ -3305,5 +3520,27 @@ mod tests {
         assert!(!em_is_valid_ether_addr([1, 0, 0, 0, 0, 1]));
         assert!(em_if_mtu_set(E1000MacType::I82542, 1500, false).is_ok());
         assert!(em_if_mtu_set(E1000MacType::I82542, 1501, false).is_err());
+    }
+
+    #[test]
+    fn media_policy_matches_em_speed_duplex_and_link_state() {
+        let mut cfg = EmMediaConfig {
+            autoneg: false,
+            autoneg_advertised: 0,
+            forced_speed_duplex: 0,
+        };
+        em_if_media_change(EmMediaRequest::Copper100 { full_duplex: true }, &mut cfg).unwrap();
+        assert_eq!(cfg.forced_speed_duplex, 0x8);
+        em_if_media_change(EmMediaRequest::Copper10 { full_duplex: false }, &mut cfg).unwrap();
+        assert_eq!(cfg.forced_speed_duplex, 0x1);
+        em_if_media_change(EmMediaRequest::Auto, &mut cfg).unwrap();
+        assert!(cfg.autoneg);
+        assert_eq!(cfg.autoneg_advertised, 0x2f);
+        let down = em_if_media_status(EmMediaType::Copper, E1000MacType::I82540, false, 1000, true);
+        assert!(down.valid && !down.active);
+        let fiber = em_if_media_status(EmMediaType::Fiber, E1000MacType::I82545, true, 0, true);
+        assert_eq!(fiber.subtype, Some(EmMediaRequest::Fiber1000 { lx: true }));
+        assert_eq!(em_set_flowcntl(3).unwrap(), 3);
+        assert!(em_set_flowcntl(4).is_err());
     }
 }
