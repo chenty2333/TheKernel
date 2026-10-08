@@ -45,6 +45,7 @@ mod rx_buffer;
 mod rx_crypto;
 mod rx_duplicate;
 mod rx_event;
+mod rx_frame;
 mod rx_mpdu;
 mod rx_packet;
 mod scan;
@@ -269,6 +270,7 @@ pub use rx_event::{
     DriverFirmwareEvent, EventPolicyAction, EventPolicyError, FirmwareEvent, FirmwarePolicyState,
     apply_event_policy, decode_driver_event, decode_firmware_event, process_command_response,
 };
+pub use rx_frame::{IWX_MIN_DBM, RxFrameInfo, RxFrameMetadataConfig, deliver_rx_frame};
 pub use rx_mpdu::{
     ProcessedRxMpdu, RX_MPDU_STATUS_DUPLICATE, RxMpdu, RxMpduError, RxMpduMetadata, RxMpduOutcome,
     RxMpduProcessError, normalize_rx_frame, parse_rx_mpdu, process_rx_mpdu,

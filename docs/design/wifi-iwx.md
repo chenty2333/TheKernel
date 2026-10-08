@@ -117,6 +117,11 @@ The TX BA completion callback chooses the source `fls(qenablemsk)` queue when
 no per-TID queue is assigned, only enables it once, and computes the 12-bit
 sequence window before accepting the BA session.
 
+The RX-frame handoff now normalizes the source RSSI scale, validates/falls
+back the channel index, and carries timestamp/rate/preamble/decrypt metadata
+with the 802.11 frame. As in OpenBSD, CCMP IV handling remains the protocol
+input layer's responsibility; radiotap/BPF is optional framework capture.
+
 TX queues now track occupied descriptor slots through the source consumer SSN,
 reclaim descriptor/byte-count state, retain owned payload DMA buffers until
 completion, retire host-command queue occupancy on CMD_DONE, and expose the
