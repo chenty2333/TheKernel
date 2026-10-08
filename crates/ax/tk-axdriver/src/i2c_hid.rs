@@ -151,7 +151,7 @@ pub struct I2cInput {
     info: crate::hidbus::DeviceInfo,
     location: String,
     gpio_pending: Arc<AtomicBool>,
-    gpio_interrupt: Option<u64>,
+    gpio_interrupts: Vec<u64>,
 }
 
 impl I2cInput {
@@ -327,19 +327,33 @@ impl I2cInput {
             descriptor,
         );
         let gpio_pending = Arc::new(AtomicBool::new(false));
-        let gpio_interrupt = child.gpio_interrupts.iter().find_map(|resource| {
-            let pin = *resource.pins.first()?;
-            crate_interface::call_interface!(
-                crate::i2c::AcpiGpioSupport::request_interrupt,
-                resource.controller_path.as_str(),
-                pin,
-                resource.edge_triggered,
-                resource.polarity,
-                1,
-                gpio_pending.clone()
-            )
-        });
-        if !child.gpio_interrupts.is_empty() && gpio_interrupt.is_none() {
+        let pin_count = child
+            .gpio_interrupts
+            .iter()
+            .try_fold(0usize, |count, resource| {
+                count.checked_add(resource.pins.len())
+            })
+            .ok_or(DevError::InvalidParam)?;
+        let mut gpio_interrupts = Vec::new();
+        gpio_interrupts
+            .try_reserve_exact(pin_count)
+            .map_err(|_| DevError::NoMemory)?;
+        for resource in &child.gpio_interrupts {
+            for pin in &resource.pins {
+                if let Some(handle) = crate_interface::call_interface!(
+                    crate::i2c::AcpiGpioSupport::request_interrupt,
+                    resource.controller_path.as_str(),
+                    *pin,
+                    resource.edge_triggered,
+                    resource.polarity,
+                    1,
+                    gpio_pending.clone()
+                ) {
+                    gpio_interrupts.push(handle);
+                }
+            }
+        }
+        if !child.gpio_interrupts.is_empty() && gpio_interrupts.is_empty() {
             warn!(
                 "i2c-hid: {} GPIO interrupt request unavailable; retaining adaptive polling",
                 child.path
@@ -364,7 +378,7 @@ impl I2cInput {
             info,
             location: format!("i2c-{bus}/{}", child.slave_address),
             gpio_pending,
-            gpio_interrupt,
+            gpio_interrupts,
         })
     }
 
@@ -508,10 +522,10 @@ impl InputDriverOps for I2cInput {
         if !state.opened && !state.suspended {
             state.device.set_power(Power::On).map_err(map_hid_error)?;
             state.opened = true;
-            if let Some(handle) = self.gpio_interrupt {
+            for handle in &self.gpio_interrupts {
                 let _ = crate_interface::call_interface!(
                     crate::i2c::AcpiGpioSupport::set_interrupt_enabled,
-                    handle,
+                    *handle,
                     true
                 );
             }
@@ -525,10 +539,10 @@ impl InputDriverOps for I2cInput {
     fn close_input(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
         if state.opened && !state.suspended {
-            if let Some(handle) = self.gpio_interrupt {
+            for handle in &self.gpio_interrupts {
                 let _ = crate_interface::call_interface!(
                     crate::i2c::AcpiGpioSupport::set_interrupt_enabled,
-                    handle,
+                    *handle,
                     false
                 );
             }
@@ -667,10 +681,10 @@ impl I2cInput {
     pub fn suspend(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
         state.suspended = true;
-        if let Some(handle) = self.gpio_interrupt {
+        for handle in &self.gpio_interrupts {
             let _ = crate_interface::call_interface!(
                 crate::i2c::AcpiGpioSupport::set_interrupt_enabled,
-                handle,
+                *handle,
                 false
             );
         }
@@ -687,13 +701,6 @@ impl I2cInput {
         let state = self.state.get_mut();
         state.suspended = false;
         if state.opened {
-            if let Some(handle) = self.gpio_interrupt {
-                let _ = crate_interface::call_interface!(
-                    crate::i2c::AcpiGpioSupport::set_interrupt_enabled,
-                    handle,
-                    true
-                );
-            }
             let device = &mut state.device;
             if let Err(error) = device.set_power(Power::On) {
                 warn!("i2c-hid: resume power transition failed: {error:?}");
@@ -705,6 +712,15 @@ impl I2cInput {
                         warn!("i2c-hid: reset acknowledgement timeout on resume");
                     }
                     Err(error) => warn!("i2c-hid: reset failed on resume: {error:?}"),
+                }
+            }
+            if !state.suspended {
+                for handle in &self.gpio_interrupts {
+                    let _ = crate_interface::call_interface!(
+                        crate::i2c::AcpiGpioSupport::set_interrupt_enabled,
+                        *handle,
+                        true
+                    );
                 }
             }
         }
@@ -719,7 +735,7 @@ impl Drop for I2cInput {
         if state.opened && !state.suspended {
             let _ = state.device.set_power(Power::Off);
         }
-        if let Some(handle) = self.gpio_interrupt.take() {
+        for handle in self.gpio_interrupts.drain(..) {
             crate_interface::call_interface!(
                 crate::i2c::AcpiGpioSupport::release_interrupt,
                 handle
