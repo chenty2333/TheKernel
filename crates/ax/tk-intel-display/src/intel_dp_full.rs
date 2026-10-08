@@ -6681,6 +6681,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn max_dprx_lane_count_ignores_non_lane_capability_bits() {
+        let mut caps = DpSinkCaps::default();
+        caps.dpcd = alloc::vec![0; 16];
+        caps.dpcd[2] = 4 | 0x80 | 0x20;
+        assert_eq!(max_dprx_lane_count(&caps), 4);
+        caps.dpcd[2] = 0x03;
+        assert_eq!(max_dprx_lane_count(&caps), 3);
+    }
+
+    #[test]
     fn source_rate_selection_distinguishes_platform_and_edp() {
         assert_eq!(
             intel_dp_source_max_rate(
