@@ -2254,6 +2254,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         partitions
     }
 
+    // upstream: mmcsd.c mmcsd_switch_part()
     fn select_partition(&mut self, access: u8) -> Result<(), SdhciError> {
         if access == self.active_partition {
             return Ok(());

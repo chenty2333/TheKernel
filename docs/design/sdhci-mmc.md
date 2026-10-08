@@ -75,3 +75,10 @@ EXT_CSD BUS_WIDTH/HS_TIMING through the MMC SWITCH command, and switches eMMC
 boot/user views under a per-controller lock. R1B operations wait for DAT busy to
 clear. RPMB remains intentionally unavailable as a raw block device because its
 write protocol requires authenticated frames and key policy.
+
+For EXT_CSD revision 6+ devices with a nonzero cache size, attach enables the
+eMMC cache and tracks successful writes; `flush()` issues EXT_CSD FLUSH_CACHE
+and clears the dirty state only after command completion. The FreeBSD power-
+class selection fields are decoded and applied for the implemented legacy
+high-speed path. HS200/HS400 remain gated off until 1.2/1.8 V, retuning, and the
+complete timing transition paths are connected.
