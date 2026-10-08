@@ -361,3 +361,5 @@ The IGC interface translation now covers the interrupt mask/route and fatal-erro
 The next `if_igc.c` batch adds PCI config-space identity capture, L1.2 erratum disable policy, bus-master admission, firmware `DRV_LOAD` ownership, counter exposure policy and the empty MSI-X setup routine. PCI register/interrupt allocation remains a platform boundary rather than a FreeBSD bus resource copy.
 
 The statistics path now mirrors the source counter-read order, including low-dword then high-dword for read-clear 64-bit octet counters, xoff pause observation, and ECC W1C masks. Statistics values are still surfaced through the TheKernel adapter rather than FreeBSD sysctl registration.
+
+The IGC attach adapter now sequences PCI/resource setup, shared-code initialization, reset, NVM checksum retry, address validation, firmware/wakeup setup, post-attach reset/stat/link setup, and detach cleanup. The concrete adapter and live probe/NetDriver registration still need to replace the older hand-authored `IgcNic` path.

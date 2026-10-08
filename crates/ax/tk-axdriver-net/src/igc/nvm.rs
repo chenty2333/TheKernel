@@ -79,6 +79,10 @@ pub trait IgcNvmIo {
 pub struct FirmwareVersion {
     pub eep_major: u8,
     pub eep_minor: u8,
+    pub eep_build: u16,
+    pub invm_major: u8,
+    pub invm_minor: u8,
+    pub invm_img_type: u8,
     pub or_valid: bool,
     pub or_major: u16,
     pub or_build: u16,

@@ -6,7 +6,7 @@
 //! Copyright (c) 2016 Nicole Graziano <nicole@nextbsd.org>.
 //! Copyright (c) 2021-2024 Rubicon Communications, LLC (Netgate).
 
-use alloc::vec::Vec;
+use alloc::{format, string::String, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::{
@@ -145,6 +145,23 @@ const FATAL_RESET_REQUESTED: u32 = 3;
 const MAX_JUMBO_MTU: u32 = 9234;
 const ETHER_HDR_LEN: u32 = 14;
 const ETHER_CRC_LEN: u32 = 4;
+const DMACR: u32 = 0x02508;
+const DMCTXTH: u32 = 0x03550;
+const DMCTLX: u32 = 0x02514;
+const DMCRTRH: u32 = 0x05dd0;
+const FCRTC: u32 = 0x02170;
+const PCIEMISC: u32 = 0x05bb8;
+const FCRTC_RTH_COAL_MASK: u32 = 0x0003_fff0;
+const FCRTC_RTH_COAL_SHIFT: u32 = 4;
+const DMACR_DMACTHR_MASK: u32 = 0x00ff_0000;
+const DMACR_DMACTHR_SHIFT: u32 = 16;
+const DMACR_DMAC_LX_MASK: u32 = 0x3000_0000;
+const DMACR_DMAC_EN: u32 = 0x8000_0000;
+const DMCTLX_DCFLUSH_DIS: u32 = 0x8000_0000;
+const PCIEMISC_LX_DECISION: u32 = 0x80;
+const TXPBSIZE: u32 = 20408;
+const STATUS_2P5_SKU: u32 = 0x1000;
+const STATUS_2P5_SKU_OVER: u32 = 0x2000;
 const LEDCTL: u32 = 0x00e00;
 const LED1_MODE_MASK: u32 = 0x0000_0f00;
 const LED1_MODE_SHIFT: u32 = 8;
@@ -157,6 +174,13 @@ const ADVERTISE_100_HALF: u16 = 4;
 const ADVERTISE_100_FULL: u16 = 8;
 const ADVERTISE_1000_FULL: u16 = 0x20;
 const ADVERTISE_2500_FULL: u16 = 0x80;
+const WUS_WAKE: u32 = 0x05800;
+const WUS_EXT_WAKE: u32 = 0x05804;
+const WUFC_MAG: u32 = 2;
+const WUFC_EX: u32 = 4;
+const WUFC_MC: u32 = 8;
+const WUC_PME_EN: u32 = 2;
+const CTRL_ADVD3WUC: u32 = 0x0010_0000;
 const PCI_COMMAND: u16 = 0x04;
 const PCI_VENDOR: u16 = 0;
 const PCI_DEVICE: u16 = 0x02;
@@ -475,6 +499,89 @@ pub struct MediaStatus {
     pub active: bool,
     pub speed_mbps: u16,
     pub full_duplex: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WakeFilters {
+    pub magic: bool,
+    pub unicast: bool,
+    pub multicast: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WakeCapabilities {
+    pub wol: bool,
+    pub enabled: WakeFilters,
+}
+pub trait IgcWakeupIo: IgcMainIo {
+    fn pme_d3_hot_supported(&mut self) -> bool;
+    fn enabled_wake_filters(&self) -> WakeFilters;
+    fn set_wake_capabilities(&mut self, caps: WakeCapabilities);
+    fn management_passthrough(&mut self) -> bool;
+    fn multicast_addresses(&mut self) -> Vec<u8>;
+    fn update_multicast(&mut self, addresses: &[u8], count: u32) -> Result<(), MainError>;
+    fn current_mac_address(&self) -> [u8; 6];
+    fn set_mac_address(&mut self, address: [u8; 6]);
+    fn rar_set(&mut self, address: [u8; 6], index: u32) -> Result<(), MainError>;
+    fn power_up_phy(&mut self);
+    fn power_down_phy(&mut self);
+    fn suspend_link_powered_down(&self) -> bool;
+    fn set_suspend_link_powered_down(&mut self, value: bool);
+    fn enable_pme(&mut self);
+    fn clear_pme(&mut self);
+    fn disable_pcie_master(&mut self) -> Result<(), MainError>;
+    fn disable_busmaster(&mut self) -> Result<(), MainError>;
+    fn log_wakeup_error(&mut self);
+    fn log_pcie_disable_error(&mut self);
+    fn log_busmaster_disable_error(&mut self);
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachPlan {
+    pub max_queues: usize,
+    pub tx_descriptor_count: usize,
+    pub rx_descriptor_count: usize,
+    pub descriptor_bytes: usize,
+    pub tx_queue_bytes: usize,
+    pub rx_queue_bytes: usize,
+    pub max_scatter: usize,
+    pub max_tso_size: usize,
+    pub max_tso_segment_size: usize,
+    pub msix_bar: u16,
+    pub max_frame_size: u32,
+    pub flow_mode: super::mac::FlowMode,
+    pub mac_autoneg: bool,
+    pub autoneg_advertised: u16,
+    pub autoneg_wait: bool,
+    pub mtu: u32,
+    pub eee_disable: bool,
+}
+pub trait IgcAttachIo {
+    fn sysctl_register(&mut self);
+    fn identify_hardware(&mut self) -> Result<(), MainError>;
+    fn disable_broken_l1_2(&mut self);
+    fn configure_driver_context(&mut self, plan: &AttachPlan);
+    fn msix_bar(&mut self) -> u16;
+    fn read_config(&mut self, offset: u16, width: u8) -> u32;
+    fn allocate_pci_resources(&mut self) -> Result<(), MainError>;
+    fn shared_code_init(&mut self) -> Result<(), MainError>;
+    fn setup_msix(&mut self);
+    fn get_bus_info(&mut self);
+    fn allocate_multicast_buffer(&mut self) -> bool;
+    fn check_reset_block(&mut self) -> bool;
+    fn reset_hardware(&mut self) -> Result<(), MainError>;
+    fn validate_nvm_checksum(&mut self) -> Result<(), MainError>;
+    fn read_mac_address(&mut self) -> Result<[u8; 6], MainError>;
+    fn read_firmware_version(&mut self);
+    fn configure_wakeup(&mut self);
+    fn set_mac_address(&mut self, address: [u8; 6]);
+    fn release_hw_control(&mut self);
+    fn free_multicast_buffer(&mut self);
+    fn free_pci_resources(&mut self);
+    fn setup_interface(&mut self) -> Result<(), MainError>;
+    fn reset(&mut self) -> Result<(), MainError>;
+    fn update_stats_counters(&mut self);
+    fn mark_link_status_stale(&mut self);
+    fn update_admin_status(&mut self);
+    fn add_hw_stats(&mut self);
+    fn reset_phy(&mut self);
 }
 pub trait IfCounterIo {
     fn default_counter(&mut self, counter: IfCounter) -> u64;
@@ -971,6 +1078,50 @@ pub fn igc_initialize_receive_unit<I: IgcMainIo + IgcRssIo>(
     Ok(())
 }
 
+// upstream: if_igc.c igc_init_dmac()
+pub fn igc_init_dmac<I: IgcMainIo>(io: &mut I, dmac: u32, pba: u32, max_frame_size: u32) {
+    if dmac == 0 {
+        io.write(DMACR, !DMACR_DMAC_EN);
+        return;
+    }
+    io.write(DMCTXTH, 0);
+    let mut hwm = 64 * pba - max_frame_size / 16;
+    if hwm < 64 * (pba - 6) {
+        hwm = 64 * (pba - 6)
+    }
+    let mut reg = io.read(FCRTC);
+    reg &= !FCRTC_RTH_COAL_MASK;
+    reg |= (hwm << FCRTC_RTH_COAL_SHIFT) & FCRTC_RTH_COAL_MASK;
+    io.write(FCRTC, reg);
+    let mut threshold = pba - max_frame_size / 512;
+    if threshold < pba - 10 {
+        threshold = pba - 10
+    }
+    reg = io.read(DMACR);
+    reg &= !DMACR_DMACTHR_MASK;
+    reg |= (threshold << DMACR_DMACTHR_SHIFT) & DMACR_DMACTHR_MASK;
+    reg |= DMACR_DMAC_EN | DMACR_DMAC_LX_MASK;
+    let status = io.read(STATUS);
+    if status & STATUS_2P5_SKU != 0 && status & STATUS_2P5_SKU_OVER == 0 {
+        reg |= (dmac * 5) >> 6
+    } else {
+        reg |= dmac >> 5
+    }
+    io.write(DMACR, reg);
+    io.write(DMCRTRH, 0);
+    reg = io.read(DMCTLX) | DMCTLX_DCFLUSH_DIS;
+    let status = io.read(STATUS);
+    reg |= if status & STATUS_2P5_SKU != 0 && status & STATUS_2P5_SKU_OVER == 0 {
+        0xa
+    } else {
+        4
+    };
+    io.write(DMCTLX, reg);
+    io.write(DMCTXTH, (TXPBSIZE - 2 * max_frame_size) >> 6);
+    reg = io.read(PCIEMISC) & !PCIEMISC_LX_DECISION;
+    io.write(PCIEMISC, reg)
+}
+
 // upstream: if_igc.c igc_aim_rx_delta()
 pub fn igc_aim_rx_delta(c: &mut AimCounters) -> (u32, u32) {
     let snapshot = c.snapshot.load(Ordering::Acquire);
@@ -1437,6 +1588,252 @@ pub fn igc_led_restore<I: IgcMainIo>(io: &mut I, led: &mut LedState) {
     led.active = false
 }
 
+// upstream: if_igc.c igc_configure_wakeup()
+pub fn igc_configure_wakeup<I: IgcWakeupIo>(io: &mut I) -> WakeCapabilities {
+    let wol = io.pme_d3_hot_supported();
+    let caps = WakeCapabilities {
+        wol,
+        enabled: WakeFilters {
+            magic: wol,
+            unicast: false,
+            multicast: false,
+        },
+    };
+    io.set_wake_capabilities(caps);
+    caps
+}
+
+// upstream: if_igc.c igc_enable_wakeup()
+pub fn igc_enable_wakeup<I: IgcWakeupIo>(
+    io: &mut I,
+    mac_state: &mut MacState,
+) -> Result<(), MainError> {
+    if !io.pme_d3_hot_supported() {
+        return Ok(());
+    }
+    let requested = io.enabled_wake_filters();
+    let manage = io.management_passthrough();
+    let mut wufc = 0;
+    if requested.magic {
+        wufc |= WUFC_MAG
+    }
+    if requested.unicast {
+        wufc |= WUFC_EX
+    }
+    if requested.multicast {
+        wufc |= WUFC_MC;
+        let addresses = io.multicast_addresses();
+        let count = (addresses.len() / 6).min(MAX_MULTICAST);
+        if count < MAX_MULTICAST {
+            let _ = io.update_multicast(&addresses[..count * 6], count as u32);
+        }
+    }
+    io.write(WUFC, 0);
+    io.write(WUFC_EXT, 0);
+    io.write(WUC, 0);
+    io.write(WUS_WAKE, u32::MAX);
+    io.write(WUS_EXT_WAKE, u32::MAX);
+    let mut error = None;
+    if wufc == 0 {
+        if manage {
+            if io.suspend_link_powered_down() {
+                igc_power_up_wakeup_link(io)
+            }
+            io.enable_pme()
+        } else {
+            io.power_down_phy();
+            io.set_suspend_link_powered_down(true);
+            io.clear_pme()
+        }
+    } else {
+        let address = io.current_mac_address();
+        io.set_mac_address(address);
+        mac_state.address = address;
+        if io.rar_set(address, 0).is_err() {
+            io.log_wakeup_error();
+            error = Some(MainError::Io)
+        }
+        if error.is_none() {
+            let mut rctl = io.read(RCTL);
+            rctl &= !(RCTL_UPE | RCTL_MPE | (3 << RCTL_MO_SHIFT));
+            rctl |= RCTL_EN | RCTL_BAM | (u32::from(mac_state.mc_filter_type) << RCTL_MO_SHIFT);
+            if wufc & WUFC_MC != 0 {
+                rctl |= RCTL_MPE
+            }
+            io.write(RCTL, rctl);
+            let ctrl = io.read(CTRL) | CTRL_ADVD3WUC;
+            io.write(CTRL, ctrl);
+            igc_power_up_wakeup_link(io);
+            io.write(WUC, WUC_PME_EN);
+            io.write(WUFC, wufc)
+        }
+        if error.is_none() {
+            io.enable_pme()
+        } else {
+            io.write(WUFC, 0);
+            io.write(WUFC_EXT, 0);
+            io.write(WUC, 0);
+            io.clear_pme()
+        }
+    }
+    if io.disable_pcie_master().is_err() {
+        io.log_pcie_disable_error()
+    }
+    if io.disable_busmaster().is_err() {
+        io.log_busmaster_disable_error()
+    }
+    error.map_or(Ok(()), Err)
+}
+
+// upstream: if_igc.c igc_power_up_wakeup_link()
+pub fn igc_power_up_wakeup_link<I: IgcWakeupIo>(io: &mut I) {
+    io.power_up_phy();
+    io.set_suspend_link_powered_down(false)
+}
+
+// upstream: if_igc.c igc_fw_version()
+pub fn igc_fw_version<I: super::nvm::IgcNvmIo>(io: &mut I) -> super::nvm::FirmwareVersion {
+    super::nvm::igc_get_fw_version(io)
+}
+
+// upstream: if_igc.c igc_sbuf_fw_version()
+pub fn igc_sbuf_fw_version(version: &super::nvm::FirmwareVersion) -> String {
+    let mut out = String::new();
+    let mut push = |s: String| {
+        if !out.is_empty() {
+            out.push(' ')
+        }
+        out.push_str(&s)
+    };
+    if version.eep_major != 0 || version.eep_minor != 0 || version.eep_build != 0 {
+        push(format!(
+            "EEPROM V{}.{}-{}",
+            version.eep_major, version.eep_minor, version.eep_build
+        ))
+    }
+    if version.invm_major != 0 || version.invm_minor != 0 || version.invm_img_type != 0 {
+        push(format!(
+            "NVM V{}.{} imgtype{}",
+            version.invm_major, version.invm_minor, version.invm_img_type
+        ))
+    }
+    if version.or_valid {
+        push(format!(
+            "Option ROM V{}-b{}-p{}",
+            version.or_major, version.or_build, version.or_patch
+        ))
+    }
+    if version.etrack_id != 0 {
+        push(format!("eTrack {:#010x}", version.etrack_id))
+    }
+    out
+}
+
+// upstream: if_igc.c igc_print_fw_version()
+pub fn igc_print_fw_version(version: &super::nvm::FirmwareVersion) -> Option<String> {
+    let text = igc_sbuf_fw_version(version);
+    if text.is_empty() { None } else { Some(text) }
+}
+
+// upstream: if_igc.c igc_if_attach_pre()
+pub fn igc_if_attach_pre<I: IgcAttachIo>(
+    io: &mut I,
+    tx_descriptors: usize,
+    rx_descriptors: usize,
+    eee_disable: bool,
+) -> Result<AttachPlan, MainError> {
+    io.sysctl_register();
+    io.identify_hardware()?;
+    io.disable_broken_l1_2();
+    let mut plan = AttachPlan {
+        max_queues: igc_set_num_queues(),
+        tx_descriptor_count: tx_descriptors,
+        rx_descriptor_count: rx_descriptors,
+        descriptor_bytes: 16,
+        tx_queue_bytes: ((tx_descriptors * 16 + 127) / 128) * 128,
+        rx_queue_bytes: ((rx_descriptors * 16 + 127) / 128) * 128,
+        max_scatter: 40,
+        max_tso_size: 65_535,
+        max_tso_segment_size: 4096,
+        msix_bar: io.msix_bar(),
+        max_frame_size: 1500 + ETHER_HDR_LEN + ETHER_CRC_LEN,
+        flow_mode: super::mac::FlowMode::Full,
+        mac_autoneg: true,
+        autoneg_advertised: AUTONEG_ADV_DEFAULT,
+        autoneg_wait: false,
+        mtu: 1500,
+        eee_disable,
+    };
+    if io.read_config(plan.msix_bar, 4) == 0 {
+        plan.msix_bar = plan.msix_bar.wrapping_add(4)
+    }
+    io.configure_driver_context(&plan);
+    io.allocate_pci_resources()?;
+    if io.shared_code_init().is_err() {
+        io.free_pci_resources();
+        io.free_multicast_buffer();
+        return Err(MainError::Io);
+    }
+    io.setup_msix();
+    io.get_bus_info();
+    if !io.allocate_multicast_buffer() {
+        io.release_hw_control();
+        io.free_pci_resources();
+        io.free_multicast_buffer();
+        return Err(MainError::Io);
+    }
+    let _ = io.check_reset_block();
+    if io.reset_hardware().is_err() {
+        io.release_hw_control();
+        io.free_pci_resources();
+        io.free_multicast_buffer();
+        return Err(MainError::Io);
+    }
+    if io.validate_nvm_checksum().is_err() && io.validate_nvm_checksum().is_err() {
+        io.release_hw_control();
+        io.free_pci_resources();
+        io.free_multicast_buffer();
+        return Err(MainError::Io);
+    }
+    let mac = match io.read_mac_address() {
+        Ok(v) => v,
+        Err(e) => {
+            io.release_hw_control();
+            io.free_pci_resources();
+            io.free_multicast_buffer();
+            return Err(e);
+        }
+    };
+    if !igc_is_valid_ether_addr(&mac) {
+        io.release_hw_control();
+        io.free_pci_resources();
+        io.free_multicast_buffer();
+        return Err(MainError::Io);
+    }
+    io.read_firmware_version();
+    io.configure_wakeup();
+    io.set_mac_address(mac);
+    Ok(plan)
+}
+
+// upstream: if_igc.c igc_if_attach_post()
+pub fn igc_if_attach_post<I: IgcAttachIo>(io: &mut I) -> Result<(), MainError> {
+    io.setup_interface()?;
+    io.reset()?;
+    io.update_stats_counters();
+    io.mark_link_status_stale();
+    io.update_admin_status();
+    io.add_hw_stats();
+    Ok(())
+}
+
+// upstream: if_igc.c igc_if_detach()
+pub fn igc_if_detach<I: IgcAttachIo>(io: &mut I) {
+    io.reset_phy();
+    io.release_hw_control();
+    io.free_pci_resources()
+}
+
 // upstream: if_igc.c igc_if_update_admin_status()
 pub fn igc_if_update_admin_status<I: IgcAdminIo>(
     io: &mut I,
@@ -1676,7 +2073,7 @@ pub fn igc_is_valid_ether_addr(address: &[u8; 6]) -> bool {
 #[cfg(test)]
 mod tests {
 
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
 
     use super::*;
     #[derive(Default)]
@@ -1696,6 +2093,123 @@ mod tests {
         unknown_media: bool,
         get_link_status: bool,
         config: Vec<(u16, u8, u32)>,
+        pme_supported: bool,
+        wake_filters: WakeFilters,
+        wake_caps: Option<WakeCapabilities>,
+        manage_passthrough: bool,
+        mac_address: [u8; 6],
+        rar_failure: bool,
+        pme_enabled: bool,
+    }
+    #[derive(Default)]
+    struct AttachFake {
+        events: Vec<&'static str>,
+        plan: Option<AttachPlan>,
+        checksum_calls: u8,
+        mac: [u8; 6],
+    }
+    impl IgcAttachIo for AttachFake {
+        fn sysctl_register(&mut self) {
+            self.events.push("sysctl")
+        }
+        fn identify_hardware(&mut self) -> Result<(), MainError> {
+            self.events.push("identify");
+            Ok(())
+        }
+        fn disable_broken_l1_2(&mut self) {
+            self.events.push("l1.2")
+        }
+        fn configure_driver_context(&mut self, p: &AttachPlan) {
+            self.events.push("context");
+            self.plan = Some(p.clone())
+        }
+        fn msix_bar(&mut self) -> u16 {
+            0x1c
+        }
+        fn read_config(&mut self, _: u16, _: u8) -> u32 {
+            0
+        }
+        fn allocate_pci_resources(&mut self) -> Result<(), MainError> {
+            self.events.push("pci");
+            Ok(())
+        }
+        fn shared_code_init(&mut self) -> Result<(), MainError> {
+            self.events.push("shared");
+            Ok(())
+        }
+        fn setup_msix(&mut self) {
+            self.events.push("msix")
+        }
+        fn get_bus_info(&mut self) {
+            self.events.push("bus")
+        }
+        fn allocate_multicast_buffer(&mut self) -> bool {
+            self.events.push("mta");
+            true
+        }
+        fn check_reset_block(&mut self) -> bool {
+            self.events.push("reset-block");
+            false
+        }
+        fn reset_hardware(&mut self) -> Result<(), MainError> {
+            self.events.push("reset");
+            Ok(())
+        }
+        fn validate_nvm_checksum(&mut self) -> Result<(), MainError> {
+            self.checksum_calls += 1;
+            self.events.push("checksum");
+            if self.checksum_calls == 1 {
+                Err(MainError::Io)
+            } else {
+                Ok(())
+            }
+        }
+        fn read_mac_address(&mut self) -> Result<[u8; 6], MainError> {
+            self.events.push("mac-read");
+            Ok([2, 1, 2, 3, 4, 5])
+        }
+        fn read_firmware_version(&mut self) {
+            self.events.push("firmware")
+        }
+        fn configure_wakeup(&mut self) {
+            self.events.push("wakeup")
+        }
+        fn set_mac_address(&mut self, a: [u8; 6]) {
+            self.mac = a;
+            self.events.push("set-mac")
+        }
+        fn release_hw_control(&mut self) {
+            self.events.push("release")
+        }
+        fn free_multicast_buffer(&mut self) {
+            self.events.push("free-mta")
+        }
+        fn free_pci_resources(&mut self) {
+            self.events.push("free-pci")
+        }
+        fn setup_interface(&mut self) -> Result<(), MainError> {
+            self.events.push("interface");
+            Ok(())
+        }
+        fn reset(&mut self) -> Result<(), MainError> {
+            self.events.push("post-reset");
+            Ok(())
+        }
+        fn update_stats_counters(&mut self) {
+            self.events.push("stats")
+        }
+        fn mark_link_status_stale(&mut self) {
+            self.events.push("stale")
+        }
+        fn update_admin_status(&mut self) {
+            self.events.push("admin")
+        }
+        fn add_hw_stats(&mut self) {
+            self.events.push("hwstats")
+        }
+        fn reset_phy(&mut self) {
+            self.events.push("phy-reset")
+        }
     }
     impl Fake {
         fn get(&self, r: u32) -> u32 {
@@ -1906,6 +2420,77 @@ mod tests {
     impl IfCounterIo for Fake {
         fn default_counter(&mut self, _: IfCounter) -> u64 {
             5
+        }
+    }
+    impl IgcWakeupIo for Fake {
+        fn pme_d3_hot_supported(&mut self) -> bool {
+            self.pme_supported
+        }
+        fn enabled_wake_filters(&self) -> WakeFilters {
+            self.wake_filters
+        }
+        fn set_wake_capabilities(&mut self, c: WakeCapabilities) {
+            self.wake_caps = Some(c)
+        }
+        fn management_passthrough(&mut self) -> bool {
+            self.manage_passthrough
+        }
+        fn multicast_addresses(&mut self) -> Vec<u8> {
+            vec![2, 3, 4, 5, 6, 7]
+        }
+        fn update_multicast(&mut self, _: &[u8], _: u32) -> Result<(), MainError> {
+            self.events.push("multicast");
+            Ok(())
+        }
+        fn current_mac_address(&self) -> [u8; 6] {
+            self.mac_address
+        }
+        fn set_mac_address(&mut self, a: [u8; 6]) {
+            self.mac_address = a
+        }
+        fn rar_set(&mut self, _: [u8; 6], _: u32) -> Result<(), MainError> {
+            if self.rar_failure {
+                Err(MainError::Io)
+            } else {
+                Ok(())
+            }
+        }
+        fn power_up_phy(&mut self) {
+            self.events.push("power-up-phy")
+        }
+        fn power_down_phy(&mut self) {
+            self.events.push("power-down-phy")
+        }
+        fn suspend_link_powered_down(&self) -> bool {
+            self.suspended
+        }
+        fn set_suspend_link_powered_down(&mut self, v: bool) {
+            self.suspended = v
+        }
+        fn enable_pme(&mut self) {
+            self.pme_enabled = true;
+            self.events.push("pme-on")
+        }
+        fn clear_pme(&mut self) {
+            self.pme_enabled = false;
+            self.events.push("pme-off")
+        }
+        fn disable_pcie_master(&mut self) -> Result<(), MainError> {
+            self.events.push("disable-master");
+            Ok(())
+        }
+        fn disable_busmaster(&mut self) -> Result<(), MainError> {
+            self.events.push("disable-busmaster");
+            Ok(())
+        }
+        fn log_wakeup_error(&mut self) {
+            self.events.push("wakeup-error")
+        }
+        fn log_pcie_disable_error(&mut self) {
+            self.events.push("pcie-error")
+        }
+        fn log_busmaster_disable_error(&mut self) {
+            self.events.push("busmaster-error")
         }
     }
     #[test]
@@ -2335,5 +2920,125 @@ mod tests {
                 .contains(&(PBECCSTS, PBECCSTS_ECC_ENABLE | PBECCSTS_CORR_ERR))
         );
         assert!(io.writes.contains(&(PCIEECCSTS, PCIEECCSTS_CORR_MASK)));
+    }
+
+    #[test]
+    fn dmac_register_programming_uses_pba_watermark_and_sku_watchdog() {
+        let mut io = Fake::default();
+        io.set(STATUS, STATUS_2P5_SKU);
+        io.set(PCIEMISC, PCIEMISC_LX_DECISION);
+        igc_init_dmac(&mut io, 80, 34, 1518);
+        assert_eq!(io.get(DMCTXTH), (TXPBSIZE - 2 * 1518) >> 6);
+        assert_eq!(
+            io.get(FCRTC) & FCRTC_RTH_COAL_MASK,
+            ((64 * 34 - 1518 / 16) << FCRTC_RTH_COAL_SHIFT) & FCRTC_RTH_COAL_MASK
+        );
+        assert_eq!(
+            io.get(DMACR) & DMACR_DMACTHR_MASK,
+            32 << DMACR_DMACTHR_SHIFT
+        );
+        assert_eq!(io.get(DMACR) & 0x3fff, 6);
+        assert_eq!(io.get(DMCTLX) & 0xf, 0xa);
+        assert_eq!(io.get(PCIEMISC) & PCIEMISC_LX_DECISION, 0);
+        igc_init_dmac(&mut io, 0, 34, 1518);
+        assert_eq!(io.get(DMACR), !DMACR_DMAC_EN);
+    }
+
+    #[test]
+    fn wol_capability_filters_and_pme_order_follow_suspend_policy() {
+        let mut io = Fake {
+            pme_supported: true,
+            suspended: true,
+            manage_passthrough: true,
+            wake_filters: WakeFilters::default(),
+            mac_address: [2, 1, 2, 3, 4, 5],
+            ..Fake::default()
+        };
+        let caps = igc_configure_wakeup(&mut io);
+        assert!(caps.wol && caps.enabled.magic);
+        let mut mac = MacState::default();
+        igc_enable_wakeup(&mut io, &mut mac).unwrap();
+        assert!(io.pme_enabled);
+        assert!(!io.suspended);
+        assert!(io.events.contains(&"power-up-phy"));
+        assert!(io.events.contains(&"disable-busmaster"));
+        io.events.clear();
+        io.pme_enabled = false;
+        io.suspended = false;
+        io.manage_passthrough = false;
+        igc_enable_wakeup(&mut io, &mut mac).unwrap();
+        assert!(!io.pme_enabled);
+        assert!(io.suspended);
+        assert!(io.events.contains(&"power-down-phy"));
+        io.events.clear();
+        io.wake_filters = WakeFilters {
+            magic: true,
+            unicast: true,
+            multicast: true,
+        };
+        io.suspended = true;
+        igc_enable_wakeup(&mut io, &mut mac).unwrap();
+        assert!(io.pme_enabled);
+        assert_ne!(io.get(WUFC) & (WUFC_MAG | WUFC_EX | WUFC_MC), 0);
+        assert_ne!(io.get(RCTL) & RCTL_MPE, 0);
+        assert!(!io.suspended);
+        assert!(io.events.contains(&"multicast"));
+    }
+    #[test]
+    fn firmware_version_text_uses_source_labels_and_order() {
+        let fw = super::super::nvm::FirmwareVersion {
+            eep_major: 1,
+            eep_minor: 2,
+            eep_build: 3,
+            or_valid: true,
+            or_major: 4,
+            or_build: 5,
+            or_patch: 6,
+            etrack_id: 0x1234_5678,
+            ..super::super::nvm::FirmwareVersion::default()
+        };
+        assert_eq!(
+            igc_sbuf_fw_version(&fw),
+            "EEPROM V1.2-3 Option ROM V4-b5-p6 eTrack 0x12345678"
+        );
+        assert_eq!(
+            igc_print_fw_version(&super::super::nvm::FirmwareVersion::default()),
+            None
+        )
+    }
+
+    #[test]
+    fn attach_pre_keeps_hardware_init_order_and_retries_nvm_checksum_once() {
+        let mut io = AttachFake::default();
+        let plan = igc_if_attach_pre(&mut io, 256, 512, false).unwrap();
+        assert_eq!(plan.max_queues, 4);
+        assert_eq!(plan.tx_queue_bytes, 4096);
+        assert_eq!(plan.rx_queue_bytes, 8192);
+        assert_eq!(plan.max_frame_size, 1518);
+        assert_eq!(plan.msix_bar, 0x20);
+        assert_eq!(io.checksum_calls, 2);
+        assert_eq!(io.mac, [2, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            io.events,
+            [
+                "sysctl",
+                "identify",
+                "l1.2",
+                "context",
+                "pci",
+                "shared",
+                "msix",
+                "bus",
+                "mta",
+                "reset-block",
+                "reset",
+                "checksum",
+                "checksum",
+                "mac-read",
+                "firmware",
+                "wakeup",
+                "set-mac"
+            ]
+        );
     }
 }
