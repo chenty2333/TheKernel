@@ -402,7 +402,81 @@ pub fn intel_ring_emit(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
+
+    struct Backend {
+        words: Vec<u32>,
+    }
+    impl RingBackend for Backend {
+        fn ggtt_pin_bias(&mut self, _: &RingVma) -> u32 {
+            0
+        }
+        fn ggtt_pin(&mut self, _: &mut RingVma, _: VmaFlags) -> Result<(), RingError> {
+            Ok(())
+        }
+        fn map_iomap(&mut self, _: &RingVma) -> Result<(), RingError> {
+            Ok(())
+        }
+        fn coherent_map(&mut self, _: &RingVma) -> Result<(), RingError> {
+            Ok(())
+        }
+        fn fill_ring_words(
+            &mut self,
+            _: &RingVma,
+            byte_offset: usize,
+            dwords: usize,
+            value: u32,
+        ) -> Result<(), RingError> {
+            let start = byte_offset / 4;
+            self.words
+                .get_mut(start..start + dwords)
+                .ok_or(RingError::Invalid)?
+                .fill(value);
+            Ok(())
+        }
+        fn write_ring_words(
+            &mut self,
+            _: &RingVma,
+            byte_offset: usize,
+            words: &[u32],
+        ) -> Result<(), RingError> {
+            let start = byte_offset / 4;
+            self.words
+                .get_mut(start..start + words.len())
+                .ok_or(RingError::Invalid)?
+                .copy_from_slice(words);
+            Ok(())
+        }
+        fn unmap_iomap(&mut self, _: &RingVma) {}
+        fn unmap_object(&mut self, _: &RingVma) {}
+        fn make_unshrinkable(&mut self, _: &RingVma) {}
+        fn make_purgeable(&mut self, _: &RingVma) {}
+        fn unset_ggtt_write(&mut self, _: &RingVma) {}
+        fn vma_unpin(&mut self, _: &mut RingVma) {}
+        fn ggtt_has_aperture_without_llc(&self) -> bool {
+            false
+        }
+        fn create_lmem(&mut self, _: usize) -> Result<RingVma, RingError> {
+            Err(RingError::NoMemory)
+        }
+        fn create_stolen(&mut self, _: usize) -> Result<RingVma, RingError> {
+            Err(RingError::NoMemory)
+        }
+        fn create_internal(&mut self, _: usize) -> Result<RingVma, RingError> {
+            Err(RingError::NoMemory)
+        }
+        fn set_readonly(&mut self, _: &mut RingVma) {}
+        fn vma_instance(&mut self, vma: RingVma) -> Result<RingVma, RingError> {
+            Ok(vma)
+        }
+        fn vma_put(&mut self, _: RingVma) {}
+        fn request_wait_interruptible_max(&mut self, _: TimelineRequest) -> Result<(), RingError> {
+            Ok(())
+        }
+        fn request_retire_upto(&mut self, _: TimelineRequest) {}
+    }
 
     #[test]
     fn ring_space_reserves_cacheline_and_wraps() {
@@ -437,5 +511,48 @@ mod tests {
         intel_ring_reset(&mut ring, 4097);
         assert_eq!((ring.head, ring.tail, ring.emit), (1, 1, 1));
         assert_eq!(ring.space, ring_space(1, 1, 4096));
+    }
+
+    #[test]
+    fn begin_and_emit_write_through_the_backend_mapping() {
+        let mut ring = Ring {
+            id: 9,
+            vma: RingVma {
+                id: 9,
+                size: 4096,
+                stolen: false,
+                map_and_fenceable: false,
+                has_llc: true,
+                has_aperture: false,
+                has_read_only: false,
+                i830_or_i845g: false,
+            },
+            head: 0,
+            tail: 0,
+            emit: 0,
+            size: 4096,
+            effective_size: 4096,
+            space: 4096 - CACHELINE_BYTES,
+            wrap: 20,
+            pin_count: AtomicUsize::new(1),
+        };
+        let request = Request {
+            ring_id: 9,
+            reserved_space: 0,
+        };
+        let mut backend = Backend {
+            words: vec![0; 1024],
+        };
+        let span =
+            intel_ring_begin(&mut ring, &request, &Timeline::default(), 2, &mut backend).unwrap();
+        assert_eq!(
+            span,
+            RingSpan {
+                byte_offset: 0,
+                dwords: 2
+            }
+        );
+        intel_ring_emit(&ring, span, &[0xdead_beef, 0x1234_5678], &mut backend).unwrap();
+        assert_eq!(&backend.words[..2], &[0xdead_beef, 0x1234_5678]);
     }
 }
