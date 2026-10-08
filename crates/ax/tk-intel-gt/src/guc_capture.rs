@@ -114,6 +114,85 @@ pub struct CaptureRegister {
     pub mask: u32,
 }
 
+#[derive(Clone, Copy)]
+pub struct CaptureRegisterList<'a> {
+    pub owner: u32,
+    pub list_type: u32,
+    pub engine: u32,
+    pub registers: &'a [CaptureRegister],
+}
+
+/// Find a static list; global lists match regardless of the requested engine
+/// class, mirroring the source's `type == GLOBAL` special case.
+/// upstream: intel_guc_capture.c guc_capture_get_one_list().
+pub fn get_one_list<'a>(
+    lists: &'a [CaptureRegisterList<'a>],
+    owner: u32,
+    list_type: u32,
+    engine: u32,
+) -> Option<&'a CaptureRegisterList<'a>> {
+    lists.iter().find(|entry| {
+        entry.owner == owner
+            && entry.list_type == list_type
+            && (entry.engine == engine || entry.list_type == u32::from(CAPTURE_TYPE_GLOBAL))
+    })
+}
+
+/// Count the base plus topology-expanded (steered) register lists.
+/// upstream: intel_guc_capture.c guc_cap_list_num_regs().
+pub fn capture_list_register_count(
+    base: Option<&CaptureRegisterList<'_>>,
+    extended: Option<&CaptureRegisterList<'_>>,
+) -> Result<usize, CaptureError> {
+    base.map_or(Ok(0), |entry| Ok(entry.registers.len()))
+        .and_then(|count| {
+            count
+                .checked_add(extended.map_or(0, |entry| entry.registers.len()))
+                .ok_or(CaptureError::InvalidBuffer)
+        })
+}
+
+/// Compute the page-aligned size returned by `intel_guc_capture_getlistsize`.
+/// upstream: intel_guc_capture.c guc_capture_getlistsize().
+pub fn capture_list_size(register_count: usize) -> Result<usize, CaptureError> {
+    if register_count == 0 || register_count > u16::MAX as usize {
+        return Err(CaptureError::InvalidBuffer);
+    }
+    let dwords = 1usize
+        .checked_add(
+            register_count
+                .checked_mul(CAPTURE_LIST_ENTRY_DWORDS)
+                .ok_or(CaptureError::InvalidBuffer)?,
+        )
+        .ok_or(CaptureError::InvalidBuffer)?;
+    let data_size = dwords.checked_mul(4).ok_or(CaptureError::InvalidBuffer)?;
+    data_size
+        .checked_add(PAGE_SIZE - 1)
+        .map(|size| size & !(PAGE_SIZE - 1))
+        .ok_or(CaptureError::InvalidBuffer)
+}
+
+/// Initialize a GuC ADS list from its base and steered-register extensions.
+/// upstream: intel_guc_capture.c guc_capture_list_init().
+pub fn build_ads_capture_list_from_groups(
+    base: &CaptureRegisterList<'_>,
+    extended: Option<&CaptureRegisterList<'_>>,
+) -> Result<Vec<u8>, CaptureError> {
+    let count = capture_list_register_count(Some(base), extended)?;
+    if count == 0 || count > u16::MAX as usize {
+        return Err(CaptureError::InvalidBuffer);
+    }
+    let mut registers = Vec::new();
+    registers
+        .try_reserve_exact(count)
+        .map_err(|_| CaptureError::InvalidBuffer)?;
+    registers.extend_from_slice(base.registers);
+    if let Some(extended) = extended {
+        registers.extend_from_slice(extended.registers);
+    }
+    build_ads_capture_list(&registers)
+}
+
 /// Build the page-sized `guc_debug_capture_list` image consumed by ADS.
 /// upstream: intel_guc_capture.c guc_capture_getlistsize()/guc_capture_list_init().
 pub fn build_ads_capture_list(registers: &[CaptureRegister]) -> Result<Vec<u8>, CaptureError> {
@@ -304,6 +383,58 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(bytes[16..20].try_into().unwrap()), 0xff);
         assert!(bytes[20..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn capture_lists_select_global_and_append_topology_extensions() {
+        let global_regs = [CaptureRegister {
+            offset: 0x10,
+            value: 0,
+            flags: 0,
+            mask: 0,
+        }];
+        let class_regs = [CaptureRegister {
+            offset: 0x20,
+            value: 0,
+            flags: 0,
+            mask: 0,
+        }];
+        let ext_regs = [CaptureRegister {
+            offset: 0x30,
+            value: 0,
+            flags: 2,
+            mask: 0,
+        }];
+        let lists = [
+            CaptureRegisterList {
+                owner: 0,
+                list_type: u32::from(CAPTURE_TYPE_GLOBAL),
+                engine: 0,
+                registers: &global_regs,
+            },
+            CaptureRegisterList {
+                owner: 0,
+                list_type: u32::from(CAPTURE_TYPE_ENGINE_CLASS),
+                engine: 2,
+                registers: &class_regs,
+            },
+        ];
+        let extensions = [CaptureRegisterList {
+            owner: 0,
+            list_type: u32::from(CAPTURE_TYPE_ENGINE_CLASS),
+            engine: 2,
+            registers: &ext_regs,
+        }];
+        let global = get_one_list(&lists, 0, 0, 4).unwrap();
+        assert_eq!(global.registers.len(), 1);
+        let class = get_one_list(&lists, 0, 1, 2).unwrap();
+        let extension = get_one_list(&extensions, 0, 1, 2);
+        assert_eq!(capture_list_register_count(Some(class), extension), Ok(2));
+        assert_eq!(capture_list_size(2), Ok(PAGE_SIZE));
+        let bytes = build_ads_capture_list_from_groups(class, extension).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0x20);
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 0x30);
     }
 
     #[test]
