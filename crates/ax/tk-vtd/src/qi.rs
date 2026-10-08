@@ -52,6 +52,12 @@ pub trait QiIo: RegisterIo {
     fn qi_queue_physical(&self) -> u64;
     fn qi_wait_sequence_physical(&self) -> u64;
     fn qi_interrupt_entry_count(&self) -> u32;
+    /// Whether a wait-descriptor may request a completion interrupt.
+    /// Implementations without an installed interrupt route still use the
+    /// memory-write completion word and poll it synchronously.
+    fn qi_interrupt_enabled(&self) -> bool {
+        true
+    }
     /// Stores the two adjacent volatile 64-bit descriptor words at byte offset.
     fn qi_store_descriptor(&mut self, byte_offset: u32, low: u64, high: u64);
     fn qi_hardware_sequence(&mut self) -> u64;
@@ -223,7 +229,8 @@ fn emit_wait_sequence<I: QiIo>(
     };
     if emit_wait {
         dmar_qi_ensure(io, queue, 1)?;
-        dmar_qi_emit_wait_descr(io, queue, sequence, true, true, false)?;
+        let interrupt = io.qi_interrupt_enabled();
+        dmar_qi_emit_wait_descr(io, queue, sequence, interrupt, true, false)?;
     }
     Ok(())
 }

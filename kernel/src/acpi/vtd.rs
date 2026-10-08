@@ -16,7 +16,13 @@ use tk_vtd::{
     idpgtbl::{dmar_map_buf_locked, dmar_unmap_buf_locked},
     iova::IovaAllocator,
     pgtbl::{PAGE_SIZE, PageMemory, SecondLevel},
-    reg::{ContextEntry, DMAR_CTX2_AW_4LVL, DMAR_PTE_R, DMAR_PTE_W, RootEntry},
+    qi::{self, QiIo, QiQueue},
+    reg::{
+        ContextEntry, DMAR_CAP_MGAW, DMAR_CAP_RWBF, DMAR_CAP_SAGAW, DMAR_CAP_SAGAW_4LVL,
+        DMAR_CAP_SPS, DMAR_CAP_SPS_2M, DMAR_CTX2_AW_4LVL, DMAR_ECAP_QI, DMAR_IECTL_IM,
+        DMAR_IECTL_REG, DMAR_PTE_R, DMAR_PTE_W, RootEntry,
+    },
+    utils::{self, RegisterIo},
 };
 
 const MODE_UNKNOWN: u8 = 0;
@@ -28,31 +34,15 @@ const CAP: usize = 0x08;
 const ECAP: usize = 0x10;
 const GCMD: usize = 0x18;
 const GSTS: usize = 0x1c;
-const RTADDR: usize = 0x20;
-const IQH: usize = 0x80;
-const IQT: usize = 0x88;
-const IQA: usize = 0x90;
-const CCMD: usize = 0x28;
 const FSTS: usize = 0x34;
-const GCMD_TE: u32 = 1 << 31;
-const GCMD_SRTP: u32 = 1 << 30;
-const GCMD_QIE: u32 = 1 << 26;
-const GCMD_IRE: u32 = 1 << 25;
 const GSTS_TES: u32 = 1 << 31;
-const GSTS_RTPS: u32 = 1 << 30;
 const GSTS_QIES: u32 = 1 << 26;
 const GSTS_IRES: u32 = 1 << 25;
-const ECAP_QI: u64 = 1 << 1;
-const CAP_SAGAW_4LVL: u64 = 1 << 10;
-const CAP_SPS_2M: u64 = 1 << 34;
-const CAP_MGAW_MASK: u64 = 0x3f << 16;
 const FSTS_PPF: u32 = 1 << 1;
 const FSTS_PFO: u32 = 1;
-const QI_PAGES: usize = 4;
-const QI_BYTES: usize = QI_PAGES * PAGE_SIZE as usize;
-const QI_SIZE_MASK: u32 = 0x7fff0;
-const QI_CONTEXT_GLOBAL: u64 = 0x1 | (0x1 << 4);
-const QI_IOTLB_GLOBAL: u64 = 0x2 | (0x1 << 4) | (1 << 6) | (1 << 7);
+const QI_ORDER: u32 = 2;
+const QI_BYTES: usize = (1 << QI_ORDER) * PAGE_SIZE as usize;
+const QI_PAGES: usize = (1 << QI_ORDER) + 1;
 const IDENTITY_PAGE_SIZE: u64 = 1 << 21;
 const IOVA_END: u64 = 1 << 36;
 
@@ -121,7 +111,9 @@ unsafe impl PageMemory for KernelPageMemory {
 struct Unit {
     mmio: usize,
     qi: DmaBlock,
-    qi_tail: u32,
+    queue: QiQueue,
+    gcmd: u32,
+    root_physical: u64,
 }
 // SAFETY: MMIO mappings are stable for boot and mutable queue state is accessed
 // only under MANAGER's lock.
@@ -145,48 +137,6 @@ fn write64(unit: &Unit, offset: usize, value: u64) {
 }
 
 impl Unit {
-    fn wait_status(&self, mask: u32, set: bool) -> Result<(), Error> {
-        let deadline = axhal::time::monotonic_time_nanos() + 100_000_000;
-        loop {
-            let value = read32(self, GSTS) & mask != 0;
-            if value == set {
-                return Ok(());
-            }
-            if axhal::time::monotonic_time_nanos() >= deadline {
-                return Err(Error::MapFailed);
-            }
-            core::hint::spin_loop();
-        }
-    }
-
-    fn qi_submit(&mut self, first: u64, second: u64) -> Result<(), Error> {
-        let next = (self.qi_tail + 16) % QI_BYTES as u32;
-        // SAFETY: queue is a dedicated, page-aligned coherent allocation and tail is in-range.
-        unsafe {
-            let slot = self
-                .qi
-                .virtual_address
-                .as_ptr()
-                .add(self.qi_tail as usize)
-                .cast::<u64>();
-            slot.write_volatile(first);
-            slot.add(1).write_volatile(second);
-        }
-        core::sync::atomic::fence(Ordering::Release);
-        write32(self, IQT, next);
-        let deadline = axhal::time::monotonic_time_nanos() + 100_000_000;
-        loop {
-            if read32(self, IQH) & QI_SIZE_MASK == next {
-                self.qi_tail = next;
-                return self.check_faults();
-            }
-            if axhal::time::monotonic_time_nanos() >= deadline {
-                return Err(Error::MapFailed);
-            }
-            core::hint::spin_loop();
-        }
-    }
-
     fn check_faults(&self) -> Result<(), Error> {
         let status = read32(self, FSTS);
         if status & (FSTS_PPF | FSTS_PFO) == 0 {
@@ -214,71 +164,276 @@ impl Unit {
     }
 
     fn invalidate_all(&mut self) -> Result<(), Error> {
-        self.qi_submit(QI_CONTEXT_GLOBAL, 0)?;
-        self.qi_submit(QI_IOTLB_GLOBAL, 0)
+        let mut io = UnitQiIo {
+            mmio: self.mmio,
+            qi_physical: self.qi.physical,
+            qi_virtual: self.qi.virtual_address,
+            gcmd: &mut self.gcmd,
+        };
+        qi::dmar_qi_invalidate_ctx_glob_locked(&mut io, &mut self.queue)?;
+        qi::dmar_qi_invalidate_iotlb_glob_locked(&mut io, &mut self.queue)?;
+        self.check_faults()
     }
 
-    fn invalidate_registers(&self, extended: u64) -> Result<(), Error> {
-        // Register-based global invalidation clears firmware-retained context
-        // and IOTLB state before queued invalidation is enabled.
-        write64(self, CCMD, (1 << 63) | (1 << 61)); // ICC | global context
-        let deadline = axhal::time::monotonic_time_nanos() + 100_000_000;
-        loop {
-            if read32(self, CCMD + 4) & (1 << 31) == 0 {
-                break;
-            }
-            if axhal::time::monotonic_time_nanos() >= deadline {
-                return Err(Error::MapFailed);
-            }
-            core::hint::spin_loop();
-        }
-        let iotlb = (((extended >> 8) & 0x3ff) as usize)
-            .checked_mul(16)
-            .and_then(|offset| offset.checked_add(8))
-            .ok_or(Error::InvalidRange)?;
-        if iotlb + 8 > MMIO_BYTES {
-            return Err(Error::InvalidRange);
-        }
-        write64(self, iotlb, (1 << 63) | (1 << 60) | (1 << 49) | (1 << 48));
-        let deadline = axhal::time::monotonic_time_nanos() + 100_000_000;
-        loop {
-            if read64(self, iotlb) & (1 << 63) == 0 {
-                return Ok(());
-            }
-            if axhal::time::monotonic_time_nanos() >= deadline {
-                return Err(Error::MapFailed);
-            }
-            core::hint::spin_loop();
-        }
-    }
-
-    fn enable(&mut self, root_physical: u64, queue_size: usize) -> Result<(), Error> {
+    fn enable(&mut self, root_physical: u64) -> Result<(), Error> {
         let capability = read64(self, CAP);
         let extended = read64(self, ECAP);
-        if extended & ECAP_QI == 0
-            || capability & CAP_SAGAW_4LVL == 0
-            || capability & CAP_SPS_2M == 0
-            || (capability & CAP_MGAW_MASK) >> 16 < 39
+        if extended & DMAR_ECAP_QI == 0
+            || DMAR_CAP_SAGAW(capability) & DMAR_CAP_SAGAW_4LVL == 0
+            || DMAR_CAP_SPS(capability) & DMAR_CAP_SPS_2M == 0
+            || DMAR_CAP_MGAW(capability) < 39
         {
             return Err(Error::MapFailed);
         }
+        self.gcmd = read32(self, GCMD);
         let status = read32(self, GSTS);
-        if status & (GSTS_TES | GSTS_QIES | GSTS_IRES) != 0 {
-            write32(self, GCMD, 0);
-            self.wait_status(GSTS_TES | GSTS_QIES | GSTS_IRES, false)?;
+        if status & GSTS_IRES != 0 {
+            utils::dmar_disable_ir(self)?;
         }
-        write64(self, RTADDR, root_physical);
-        write32(self, GCMD, GCMD_SRTP);
-        self.wait_status(GSTS_RTPS, true)?;
-        self.invalidate_registers(extended)?;
-        write32(self, IQT, 0);
-        write64(self, IQA, self.qi.physical | (queue_size as u64));
-        write32(self, GCMD, GCMD_QIE);
-        self.wait_status(GSTS_QIES, true)?;
+        if status & GSTS_QIES != 0 {
+            let mut io = UnitQiIo {
+                mmio: self.mmio,
+                qi_physical: self.qi.physical,
+                qi_virtual: self.qi.virtual_address,
+                gcmd: &mut self.gcmd,
+            };
+            qi::dmar_disable_qi(&mut io)?;
+        }
+        if status & GSTS_TES != 0 {
+            utils::dmar_disable_translation(self)?;
+        }
+        self.root_physical = root_physical;
+        utils::dmar_load_root_entry_ptr(self)?;
+        // Clear state retained by firmware while queued invalidation is off.
+        utils::dmar_inv_ctx_glob(self)?;
+        utils::dmar_inv_iotlb_glob(self)?;
+        if capability & DMAR_CAP_RWBF != 0 {
+            let _ = utils::dmar_flush_write_bufs(self);
+        }
+        self.queue = {
+            let mut io = UnitQiIo {
+                mmio: self.mmio,
+                qi_physical: self.qi.physical,
+                qi_virtual: self.qi.virtual_address,
+                gcmd: &mut self.gcmd,
+            };
+            qi::dmar_init_qi(&mut io, QI_ORDER, QI_ORDER)?.ok_or(Error::Unsupported)?
+        };
         self.invalidate_all()?;
-        write32(self, GCMD, GCMD_QIE | GCMD_TE);
-        self.wait_status(GSTS_TES, true)?;
+        utils::dmar_enable_translation(self)?;
         self.check_faults()
+    }
+}
+
+impl RegisterIo for Unit {
+    fn read32(&mut self, offset: u64) -> u32 {
+        usize::try_from(offset)
+            .ok()
+            .map_or(0, |offset| read32(self, offset))
+    }
+    fn write32(&mut self, offset: u64, value: u32) {
+        if let Ok(offset) = usize::try_from(offset) {
+            write32(self, offset, value);
+        }
+    }
+    fn read64(&mut self, offset: u64) -> u64 {
+        usize::try_from(offset)
+            .ok()
+            .map_or(0, |offset| read64(self, offset))
+    }
+    fn write64(&mut self, offset: u64, value: u64) {
+        if let Ok(offset) = usize::try_from(offset) {
+            write64(self, offset, value);
+        }
+    }
+    fn hw_cap(&self) -> u64 {
+        read64(self, CAP)
+    }
+    fn hw_ecap(&self) -> u64 {
+        read64(self, ECAP)
+    }
+    fn hw_gcmd(&self) -> u32 {
+        self.gcmd
+    }
+    fn set_hw_gcmd(&mut self, value: u32) {
+        self.gcmd = value;
+    }
+    fn qi_enabled(&self) -> bool {
+        self.queue.enabled
+    }
+    fn root_table_physical(&self) -> u64 {
+        self.root_physical
+    }
+    fn interrupt_table_physical(&self) -> u64 {
+        0
+    }
+    fn interrupt_entry_count(&self) -> u32 {
+        0
+    }
+    fn x2apic_mode(&self) -> bool {
+        true
+    }
+    fn now_ns(&mut self) -> u64 {
+        axhal::time::monotonic_time_nanos()
+    }
+}
+
+struct UnitQiIo<'a> {
+    mmio: usize,
+    qi_physical: u64,
+    qi_virtual: NonNull<u8>,
+    gcmd: &'a mut u32,
+}
+
+impl RegisterIo for UnitQiIo<'_> {
+    fn read32(&mut self, offset: u64) -> u32 {
+        usize::try_from(offset).ok().map_or(0, |offset| {
+            // SAFETY: offsets are the known VT-d QI registers within the mapped MMIO page.
+            unsafe { ((self.mmio + offset) as *const u32).read_volatile() }
+        })
+    }
+    fn write32(&mut self, offset: u64, value: u32) {
+        if let Ok(offset) = usize::try_from(offset) {
+            // SAFETY: offsets are the known VT-d QI registers within the mapped MMIO page.
+            unsafe { ((self.mmio + offset) as *mut u32).write_volatile(value) }
+        }
+    }
+    fn read64(&mut self, offset: u64) -> u64 {
+        usize::try_from(offset).ok().map_or(0, |offset| {
+            // SAFETY: offsets are naturally aligned VT-d registers in the mapped MMIO page.
+            unsafe { ((self.mmio + offset) as *const u64).read_volatile() }
+        })
+    }
+    fn write64(&mut self, offset: u64, value: u64) {
+        if let Ok(offset) = usize::try_from(offset) {
+            // SAFETY: offsets are naturally aligned VT-d registers in the mapped MMIO page.
+            unsafe { ((self.mmio + offset) as *mut u64).write_volatile(value) }
+        }
+    }
+    fn hw_cap(&self) -> u64 {
+        self.read64_const(CAP)
+    }
+    fn hw_ecap(&self) -> u64 {
+        self.read64_const(ECAP)
+    }
+    fn hw_gcmd(&self) -> u32 {
+        *self.gcmd
+    }
+    fn set_hw_gcmd(&mut self, value: u32) {
+        *self.gcmd = value;
+    }
+    fn qi_enabled(&self) -> bool {
+        true
+    }
+    fn root_table_physical(&self) -> u64 {
+        0
+    }
+    fn interrupt_table_physical(&self) -> u64 {
+        0
+    }
+    fn interrupt_entry_count(&self) -> u32 {
+        0
+    }
+    fn x2apic_mode(&self) -> bool {
+        true
+    }
+    fn now_ns(&mut self) -> u64 {
+        axhal::time::monotonic_time_nanos()
+    }
+}
+
+impl UnitQiIo<'_> {
+    fn read64_const(&self, offset: usize) -> u64 {
+        // SAFETY: offsets are naturally aligned capability registers in the mapped MMIO page.
+        unsafe { ((self.mmio + offset) as *const u64).read_volatile() }
+    }
+}
+
+impl QiIo for UnitQiIo<'_> {
+    fn qi_queue_physical(&self) -> u64 {
+        self.qi_physical
+    }
+    fn qi_wait_sequence_physical(&self) -> u64 {
+        self.qi_physical + QI_BYTES as u64
+    }
+    fn qi_interrupt_entry_count(&self) -> u32 {
+        0
+    }
+    fn qi_interrupt_enabled(&self) -> bool {
+        false
+    }
+    fn qi_store_descriptor(&mut self, byte_offset: u32, low: u64, high: u64) {
+        if byte_offset as usize + 16 > QI_BYTES {
+            return;
+        }
+        // SAFETY: queue has a dedicated 16 KiB aligned ring and descriptors are 16 bytes.
+        unsafe {
+            let slot = self
+                .qi_virtual
+                .as_ptr()
+                .add(byte_offset as usize)
+                .cast::<u64>();
+            slot.write_volatile(low);
+            slot.add(1).write_volatile(high);
+        }
+    }
+    fn qi_hardware_sequence(&mut self) -> u64 {
+        // SAFETY: the final page is reserved for the writeback sequence word.
+        let sequence = unsafe {
+            self.qi_virtual
+                .as_ptr()
+                .add(QI_BYTES)
+                .cast::<u64>()
+                .read_volatile()
+        };
+        core::sync::atomic::fence(Ordering::Acquire);
+        sequence
+    }
+    fn qi_advance_waiter_count(&mut self, _delta: i32) {}
+    fn qi_is_cold(&self) -> bool {
+        false
+    }
+    fn qi_wait_for_progress(&mut self, _nowait: bool) {
+        core::hint::spin_loop();
+    }
+    fn qi_drain_tlb_flushes(&mut self) {}
+    fn qi_enqueue_completion_task(&mut self) {}
+    fn qi_wake_sequence_waiters(&mut self) {}
+    fn qi_common_init(&mut self, queue_bytes: u32, descriptor_bytes: u32) -> Result<(), Error> {
+        if queue_bytes as usize != QI_BYTES || descriptor_bytes != 16 {
+            return Err(Error::InvalidRange);
+        }
+        Ok(())
+    }
+    fn qi_common_fini(&mut self) {}
+    fn qi_enable_interrupt(&mut self) {
+        // Without an APIC-vector handler, use the completion writeback and keep
+        // the interrupt source masked.
+        let value = self.read32(DMAR_IECTL_REG) | DMAR_IECTL_IM as u32;
+        self.write32(DMAR_IECTL_REG, value);
+    }
+    fn qi_disable_interrupt(&mut self) {
+        let value = self.read32(DMAR_IECTL_REG) | DMAR_IECTL_IM as u32;
+        self.write32(DMAR_IECTL_REG, value);
+    }
+    fn qi_queue_supported_by_tunable(&self) -> bool {
+        true
+    }
+    fn qi_set_enabled(&mut self, _enabled: bool) {}
+    fn qi_set_queue_bytes(&mut self, _bytes: u32) {}
+    fn qi_release_queue(&mut self) {}
+    fn qi_referenced_irte_count(&self) -> u32 {
+        0
+    }
+    fn qi_clear_wait_completion(&mut self) {
+        // SAFETY: the final page is reserved for the writeback sequence word.
+        unsafe {
+            self.qi_virtual
+                .as_ptr()
+                .add(QI_BYTES)
+                .cast::<u64>()
+                .write_volatile(0)
+        }
     }
 }
 
@@ -403,6 +558,7 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
         return Ok(());
     }
     MODE.store(MODE_FAILED, Ordering::Release);
+    info!("vtd: intel_iommu=on; parsing ACPI DMAR");
     let Some(dmar) = table(engine)? else {
         MODE.store(MODE_IDENTITY, Ordering::Release);
         info!("vtd: no DMAR table; admitting identity DMA");
@@ -411,6 +567,11 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     if dmar.units.is_empty() {
         return Err(Error::InvalidStructure);
     }
+    info!(
+        "vtd: parsed DMAR units={} rmrr={}",
+        dmar.units.len(),
+        dmar.reserved_regions.len()
+    );
     let mut page_table = SecondLevel::new(KernelPageMemory { pages: Vec::new() })?;
     let mut maximum = 0u64;
     for &(base, size) in phys_ram_ranges() {
@@ -486,9 +647,11 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
         let mut unit = Unit {
             mmio: base,
             qi,
-            qi_tail: 0,
+            queue: QiQueue::new(QI_BYTES as u32)?,
+            gcmd: 0,
+            root_physical: 0,
         };
-        unit.enable(root.physical, 2)?;
+        unit.enable(root.physical)?;
         units.push(unit);
     }
     let manager = Manager {
