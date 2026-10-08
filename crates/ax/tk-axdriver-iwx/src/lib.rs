@@ -17,6 +17,7 @@ mod firmware_bundle;
 mod init_cmd;
 mod interrupts;
 mod nic;
+mod queue;
 mod rate;
 mod registers;
 mod rings;
@@ -67,6 +68,11 @@ pub use interrupts::{
     start_firmware,
 };
 pub use nic::{configure_nic, initialize_nic, initialize_rx};
+pub use queue::{
+    DATA_PATH_GROUP as TX_DATA_PATH_GROUP, DEFAULT_QUEUE_SIZE, DQA_QUEUE_ADD, DQA_QUEUE_REMOVE,
+    QueueConfig, QueueError, SCD_QUEUE_CONFIG_CMD, TX_QUEUE_CFG_ENABLE_QUEUE, dqa_queue_command,
+    legacy_queue_command, queue_cb_size, scheduler_queue_command, validate_enable_response,
+};
 pub use rate::{
     MCS_TO_RATE_INDEX, RATES, Rate, TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY, TxRateError,
     TxRateInput, TxRateSelection, fw_rate_index_cck, fw_rate_index_ofdm, rate_value_to_index,
