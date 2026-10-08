@@ -430,6 +430,89 @@ pub(super) struct UcDmaMemory {
 }
 
 #[cfg(target_os = "none")]
+impl UcDmaMemory {
+    fn release(self) -> Result<(), Self> {
+        // SAFETY: callers use this only after the GuC has either completed
+        // HuC authentication or explicitly rejected the action.
+        if unsafe { self._gtt.release_binding(&self._binding) }.is_err() {
+            Err(self)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "none")]
+fn upload_huc_for_auth(
+    owner: &mut super::Owner,
+    image: &intel_gt::uc::FirmwareImage,
+) -> Result<(UcDmaMemory, u32), Error> {
+    if image.kind != intel_gt::uc::Kind::HuC
+        || image.bytes.is_empty()
+        || image.bytes.len() > 2 * 1024 * 1024
+    {
+        return Err(Error::Refused);
+    }
+    let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+    let pages = image
+        .bytes
+        .len()
+        .checked_add(PAGE - 1)
+        .ok_or(Error::Refused)?
+        / PAGE;
+    let ram = Ram::allocate(pages)?;
+    ram.write(0, &image.bytes)?;
+    ram.flush();
+    let binding = gtt
+        .bind_pages(&ram.physical)
+        .map_err(|_| Error::Quarantined)?;
+    let rsa_offset = image
+        .css
+        .header_bytes
+        .checked_add(image.css.microcode_bytes)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .and_then(|offset| u32::try_from(binding.address).ok()?.checked_add(offset));
+    let Some(rsa_offset) = rsa_offset else {
+        // SAFETY: no firmware transfer has started, so the binding is idle.
+        if unsafe { gtt.release_binding(&binding) }.is_err() {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(Error::Refused);
+    };
+    if let Err(error) = intel_gt::guc_fw::huc_upload(&owner.bus, binding.address, image, false) {
+        let release_failed = if error == Error::Quarantined {
+            true
+        } else {
+            // SAFETY: non-quarantine errors mean the DMA transfer was never
+            // started or was observed complete before returning.
+            unsafe { gtt.release_binding(&binding) }.is_err()
+        };
+        if release_failed {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(error);
+    }
+    Ok((
+        UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        },
+        rsa_offset,
+    ))
+}
+
+#[cfg(target_os = "none")]
 fn upload_uc_one(
     owner: &mut super::Owner,
     image: &intel_gt::uc::FirmwareImage,
@@ -492,8 +575,8 @@ fn upload_uc_one(
     Ok(())
 }
 
-/// Upload HuC first, then GuC as in intel_uc_init_hw(). The current ADL-N
-/// default loads/authenticates HuC but does not enable GuC submission queues.
+/// Upload HuC first, then GuC, and request HuC authentication as in
+/// intel_uc_init_hw(). ADL-N does not enable GuC submission queues here.
 #[cfg(target_os = "none")]
 pub(super) fn upload_uc_firmware(
     owner: &mut super::Owner,
@@ -507,8 +590,26 @@ pub(super) fn upload_uc_firmware(
     if !owner.bus.awake.load(Ordering::Acquire) {
         return Err(Error::Refused);
     }
-    upload_uc_one(owner, huc)?;
-    upload_uc_one(owner, guc)
+    let (huc_memory, rsa_offset) = upload_huc_for_auth(owner, huc)?;
+    if let Err(error) = upload_uc_one(owner, guc) {
+        if let Err(memory) = huc_memory.release() {
+            owner.uc_memory = Some(memory);
+            return Err(Error::Quarantined);
+        }
+        return Err(error);
+    }
+    let authentication = intel_gt::guc_fw::authenticate_huc(&owner.bus, rsa_offset)
+        .and_then(|_| intel_gt::guc_fw::wait_huc_auth(&owner.bus).map(|_| ()))
+        .map_err(|_| Error::Quarantined);
+    if let Err(error) = authentication {
+        owner.uc_memory = Some(huc_memory);
+        return Err(error);
+    }
+    if let Err(memory) = huc_memory.release() {
+        owner.uc_memory = Some(memory);
+        return Err(Error::Quarantined);
+    }
+    Ok(())
 }
 
 impl Memory {
