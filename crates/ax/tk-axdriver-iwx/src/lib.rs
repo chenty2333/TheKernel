@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod alive;
 mod apm;
+mod ba;
 mod bringup;
 mod channel;
 mod command;
@@ -40,6 +41,11 @@ pub use alive::{
 pub use apm::{
     ApmError, apm_init, apm_stop, clear_persistence_bit, force_power_gating, prepare_card_hw,
     set_hw_ready, software_reset, start_hardware,
+};
+pub use ba::{
+    BaError, BaTimeoutAction, BarFrameRelease, INVALID_BAID, MAX_RX_BA_SESSIONS,
+    RX_REORDER_TIMEOUT_MQ_USEC, ReorderBuffer, RxBaSession, RxBaTable, STATION_ID,
+    baid_config_command, baid_config_response, station_ba_command, station_ba_response,
 };
 pub use bringup::{
     FIRMWARE_ALIVE_TIMEOUT_NS, FW_COMMAND_VERSION_UNKNOWN, FirmwareLoadError, InitFirmwareError,

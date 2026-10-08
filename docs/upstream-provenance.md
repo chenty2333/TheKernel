@@ -1013,3 +1013,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): ALIVE v4-v7 size checks, firmware-good status, debug-table pointers and SKU extraction translated in `tk-axdriver-iwx/src/alive.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): generation-specific RX DMA disable and bounded RFH idle polling translated in `tk-axdriver-iwx/src/nic.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): TX queue enable/disable command completion and qenable/TID state transitions translated in `tk-axdriver-iwx/src/queue.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): RX BA reorder-session state, BAID/ADD_STA payloads, status extraction, timeout decisions, and BAR-release validation translated in `tk-axdriver-iwx/src/ba.rs`.
