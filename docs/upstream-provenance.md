@@ -1047,3 +1047,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - Intel/FreeBSD `e1000_phy.c` coverage update: 68 of 98 functions are now translated, including M88/IGP/IFE PHY-info extraction with link-speed and receiver state. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
 
 - Intel/FreeBSD `e1000_phy.c` coverage update: 73 of 98 functions are now translated, including BM page-address mapping and locked paged BM read/write operations, with wakeup-page access adapted through callbacks. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+- Intel/FreeBSD `e1000_phy.c` coverage update: 76 of 98 functions are now translated, including BM wakeup enable/disable and indexed wakeup register transfers. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.

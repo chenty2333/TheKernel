@@ -156,6 +156,13 @@ const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
 const BM_WUC_PAGE: u32 = 800;
 const BM_PHY_PAGE_SELECT: u32 = 22;
 const IGP_PAGE_SHIFT: u32 = 5;
+const BM_PORT_CTRL_PAGE: u32 = 769;
+const BM_WUC_ENABLE_REG: u32 = 17;
+const BM_WUC_ENABLE_BIT: u16 = 1 << 2;
+const BM_WUC_ME_WU_BIT: u16 = 1 << 3;
+const BM_WUC_HOST_WU_BIT: u16 = 1 << 4;
+const BM_WUC_ADDRESS_OPCODE: u32 = 0x11;
+const BM_WUC_DATA_OPCODE: u32 = 0x12;
 const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
 const KMRNCTRLSTA_OFFSET_SHIFT: u32 = 16;
 const KMRNCTRLSTA_REN: u32 = 0x0020_0000;
@@ -892,6 +899,51 @@ where
     W: FnMut(&mut I, u32, u16) -> DevResult,
 {
     write_phy_reg_bm_internal(io, offset, data, true, write_wakeup)
+}
+
+/// upstream: e1000_phy.c e1000_enable_phy_wakeup_reg_access_bm()
+pub fn enable_phy_wakeup_reg_access_bm<I: E1000PhyMdicOps>(io: &mut I) -> DevResult<u16> {
+    io.set_phy_address(1);
+    set_page_igp(io, (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16)?;
+    let original = io.read_mdic(BM_WUC_ENABLE_REG)?;
+    let enabled = (original | BM_WUC_ENABLE_BIT) & !(BM_WUC_ME_WU_BIT | BM_WUC_HOST_WU_BIT);
+    io.write_mdic(BM_WUC_ENABLE_REG, enabled)?;
+    set_page_igp(io, (BM_WUC_PAGE << IGP_PAGE_SHIFT) as u16)?;
+    Ok(original)
+}
+
+/// upstream: e1000_phy.c e1000_disable_phy_wakeup_reg_access_bm()
+pub fn disable_phy_wakeup_reg_access_bm<I: E1000PhyMdicOps>(
+    io: &mut I,
+    original: u16,
+) -> DevResult {
+    set_page_igp(io, (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16)?;
+    io.write_mdic(BM_WUC_ENABLE_REG, original)
+}
+
+/// upstream: e1000_phy.c e1000_access_phy_wakeup_reg_bm()
+pub fn access_phy_wakeup_reg_bm<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: Option<u16>,
+    page_set: bool,
+) -> DevResult<Option<u16>> {
+    let original = if !page_set {
+        Some(enable_phy_wakeup_reg_access_bm(io)?)
+    } else {
+        None
+    };
+    io.write_mdic(BM_WUC_ADDRESS_OPCODE, (offset & MAX_PHY_REG_ADDRESS) as u16)?;
+    let result = if let Some(data) = data {
+        io.write_mdic(BM_WUC_DATA_OPCODE, data).map(|_| None)
+    } else {
+        io.read_mdic(BM_WUC_DATA_OPCODE).map(Some)
+    };
+    let result = result?;
+    if let Some(original) = original {
+        disable_phy_wakeup_reg_access_bm(io, original)?;
+    }
+    Ok(result)
 }
 
 /// upstream: e1000_phy.c e1000_get_cfg_done_generic()
@@ -2587,6 +2639,50 @@ mod tests {
                 Ok(())
             })
             .is_ok()
+        );
+
+        let mut wake = Io {
+            mdic_data: BM_WUC_ME_WU_BIT | BM_WUC_HOST_WU_BIT,
+            ..Io::default()
+        };
+        let original = enable_phy_wakeup_reg_access_bm(&mut wake).unwrap();
+        assert_eq!(original, BM_WUC_ME_WU_BIT | BM_WUC_HOST_WU_BIT);
+        assert_eq!(
+            wake.mdic_writes[0],
+            (
+                IGP01E1000_PHY_PAGE_SELECT,
+                (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16
+            )
+        );
+        assert_eq!(wake.mdic_writes[1], (BM_WUC_ENABLE_REG, BM_WUC_ENABLE_BIT));
+        assert_eq!(
+            wake.mdic_writes[2],
+            (
+                IGP01E1000_PHY_PAGE_SELECT,
+                (BM_WUC_PAGE << IGP_PAGE_SHIFT) as u16
+            )
+        );
+        disable_phy_wakeup_reg_access_bm(&mut wake, original).unwrap();
+        assert_eq!(
+            wake.mdic_writes.last(),
+            Some(&(BM_WUC_ENABLE_REG, original))
+        );
+
+        let mut access = Io {
+            mdic_data: 0x5a5a,
+            ..Io::default()
+        };
+        assert_eq!(
+            access_phy_wakeup_reg_bm(&mut access, wuc, None, false).unwrap(),
+            Some(0x5a5a)
+        );
+        assert_eq!(access.mdic_writes[3], (BM_WUC_ADDRESS_OPCODE, 1));
+        assert_eq!(
+            access.mdic_writes[4],
+            (
+                IGP01E1000_PHY_PAGE_SELECT,
+                (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT) as u16
+            )
         );
     }
 
