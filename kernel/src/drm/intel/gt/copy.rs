@@ -448,6 +448,7 @@ pub(super) struct CtDmaMemory {
     _ram: Ram,
     _binding: Binding,
     pair: intel_gt::guc_ct::CtbPair,
+    submission: intel_gt::guc_submission::GucSubmission,
     blob: Vec<u8>,
     enabled: bool,
 }
@@ -469,6 +470,10 @@ impl CtDmaMemory {
             return Err(Error::Quarantined);
         }
         let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+        let submission = intel_gt::guc_submission::GucSubmission::new(
+            intel_gt::guc_submission::GUC_MAX_CONTEXT_ID,
+        )
+        .map_err(|_| Error::Refused)?;
         let pages = intel_gt::guc_ct::CTB_BLOB_SIZE
             .checked_add(PAGE - 1)
             .ok_or(Error::Refused)?
@@ -486,6 +491,7 @@ impl CtDmaMemory {
             _ram: ram,
             _binding: binding,
             pair,
+            submission,
             blob,
             enabled: false,
         };
@@ -561,6 +567,122 @@ impl CtDmaMemory {
         }
         let flags = intel_gt::guc_ct::CT_SEND_NB | u32::from(action.expected_response_dwords);
         self.send_nonblocking(bus, &action.words[..len], flags)
+    }
+
+    fn publish_ctb(&mut self, bus: &impl GtIo) -> Result<(), Error> {
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        intel_gt::guc_fw::notify(bus)
+    }
+
+    /// GuC v70 context registration bridge. The context/LRC image and GGTT
+    /// descriptor inputs remain owned by the caller; uncertain shared-memory
+    /// publication retains the CT owner and must quarantine the GT.
+    pub(super) fn register_guc_context_v70(
+        &mut self,
+        bus: &impl GtIo,
+        info: intel_gt::guc_submission::GuCContextRegistrationInfo,
+        policy: intel_gt::guc_submission::ContextPolicy,
+        lease: intel_gt::guc_submission::ContextIdLease,
+        child_lrcas: &[u64],
+        child_ids: &[u32],
+    ) -> Result<u16, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let old_tail = self.pair.send.descriptor.tail;
+        let result = self.submission.register_v70(
+            &mut self.pair,
+            info,
+            policy,
+            lease,
+            child_lrcas,
+            child_ids,
+        );
+        if self.pair.send.descriptor.tail != old_tail {
+            self.publish_ctb(bus).map_err(|_| Error::Quarantined)?;
+        }
+        result.map_err(|_| Error::Refused)
+    }
+
+    pub(super) fn submit_guc_context_request(
+        &mut self,
+        bus: &impl GtIo,
+        context_id: u32,
+        is_parent: bool,
+    ) -> Result<([u16; 2], usize), Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let old_tail = self.pair.send.descriptor.tail;
+        let result = self
+            .submission
+            .submit_request(&mut self.pair, context_id, is_parent);
+        if self.pair.send.descriptor.tail != old_tail {
+            self.publish_ctb(bus).map_err(|_| Error::Quarantined)?;
+        }
+        result.map_err(|_| Error::Refused)
+    }
+
+    /// Receive one CTB message after a GuC G2H interrupt/poll notification and
+    /// dispatch submission completion events before publishing the new head.
+    /// IRQ/tasklet registration remains owned by the GT event integration.
+    pub(super) fn receive_guc_submission_event(
+        &mut self,
+        bus: &impl GtIo,
+    ) -> Result<bool, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let words = match self
+            .pair
+            .receive
+            .read_message()
+            .map_err(|_| Error::Quarantined)?
+        {
+            Some(words) => words,
+            None => return Ok(false),
+        };
+        let event = self
+            .pair
+            .handle_incoming_message(&words)
+            .map_err(|_| Error::Quarantined)?;
+        let old_send_tail = self.pair.send.descriptor.tail;
+        let dispatch = match event {
+            Some(event)
+                if matches!(
+                    event.action,
+                    intel_gt::guc_ct::ACTION_SCHED_CONTEXT_MODE_DONE
+                        | intel_gt::guc_ct::ACTION_DEREGISTER_CONTEXT_DONE
+                ) => self.submission.handle_event(&mut self.pair, event),
+            Some(event) => Err(intel_gt::guc_ct::CtError::InvalidMessage),
+            None => Err(intel_gt::guc_ct::CtError::InvalidMessage),
+        };
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        if self.pair.send.descriptor.tail != old_send_tail {
+            intel_gt::guc_fw::notify(bus)?;
+        }
+        dispatch.map_err(|_| Error::Quarantined)?;
+        Ok(true)
     }
 }
 

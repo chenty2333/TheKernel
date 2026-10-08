@@ -35,6 +35,7 @@ pub const ACTION_REGISTER_CONTEXT_MULTI_LRC: u32 = 0x4601;
 pub const CONTEXT_ENABLE: u32 = 1;
 pub const CONTEXT_DISABLE: u32 = 0;
 pub const G2H_LEN_DW_SCHED_CONTEXT_MODE_SET: u8 = 2;
+pub const G2H_LEN_DW_DEREGISTER_CONTEXT: u8 = 1;
 pub const CONTEXT_POLICY_KLV_EXECUTION_QUANTUM: u16 = 0x2001;
 pub const CONTEXT_POLICY_KLV_PREEMPTION_TIMEOUT: u16 = 0x2002;
 pub const CONTEXT_POLICY_KLV_SCHEDULING_PRIORITY: u16 = 0x2003;
@@ -408,6 +409,271 @@ impl SchedAction {
 pub struct SchedPlan {
     pub actions: [SchedAction; 2],
     pub count: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextIdLease {
+    Single(u32),
+    Multi(ContextIdRange),
+}
+
+struct SubmittedContext {
+    info: GuCContextRegistrationInfo,
+    policy: ContextPolicy,
+    state: ContextSchedState,
+    lease: ContextIdLease,
+    registration_action: Vec<u32>,
+}
+
+/// Stateful GuC submission facade over CTB. The GT owner supplies the live
+/// shared blob synchronization and MMIO notification around these operations.
+pub struct GucSubmission {
+    ids: ContextIdPool,
+    contexts: Vec<SubmittedContext>,
+}
+
+impl GucSubmission {
+    /// upstream: intel_guc_submission.c intel_guc_submission_init().
+    pub fn new(total_ids: usize) -> Result<Self, Error> {
+        Ok(Self {
+            ids: ContextIdPool::new(total_ids)?,
+            contexts: Vec::new(),
+        })
+    }
+
+    pub fn allocate_single_id(&mut self) -> Result<ContextIdLease, Error> {
+        self.ids.allocate_single().map(ContextIdLease::Single)
+    }
+
+    pub fn allocate_multi_ids(&mut self, child_count: usize) -> Result<ContextIdLease, Error> {
+        self.ids
+            .allocate_multi(child_count)
+            .map(ContextIdLease::Multi)
+    }
+
+    pub fn release_unregistered_lease(&mut self, lease: ContextIdLease) -> Result<(), Error> {
+        match lease {
+            ContextIdLease::Single(id) => self.ids.release_single(id),
+            ContextIdLease::Multi(range) => self.ids.release_multi(range),
+        }
+    }
+
+    /// upstream: intel_guc_submission.c register_context_v70() and
+    /// guc_context_policy_init_v70(). Context is retained even if the policy
+    /// update fails, mirroring the upstream registered-but-policy-required state.
+    pub fn register_v70(
+        &mut self,
+        pair: &mut crate::guc_ct::CtbPair,
+        info: GuCContextRegistrationInfo,
+        policy: ContextPolicy,
+        lease: ContextIdLease,
+        child_lrcas: &[u64],
+        child_ids: &[u32],
+    ) -> Result<u16, crate::guc_ct::CtError> {
+        let lease_matches = match lease {
+            ContextIdLease::Single(id) => id == info.context_idx && child_lrcas.is_empty(),
+            ContextIdLease::Multi(range) => {
+                range.base == info.context_idx
+                    && range.count as usize == child_lrcas.len() + 1
+                    && child_lrcas.len() == child_ids.len()
+            }
+        };
+        if policy.context_id != info.context_idx
+            || !lease_matches
+            || self
+                .contexts
+                .iter()
+                .any(|context| context.info.context_idx == info.context_idx)
+        {
+            return Err(crate::guc_ct::CtError::InvalidMessage);
+        }
+        self.contexts
+            .try_reserve(1)
+            .map_err(|_| crate::guc_ct::CtError::NoRoom)?;
+        let action = if child_lrcas.is_empty() {
+            register_context_action(info).to_vec()
+        } else {
+            register_multi_context_action_v70(info, child_lrcas, child_ids)
+                .map_err(|_| crate::guc_ct::CtError::InvalidMessage)?
+        };
+        let fence = pair.send_nonblocking(&action, crate::guc_ct::CT_SEND_NB)?;
+        let mut state = ContextSchedState::default();
+        state.set_registered();
+        let context = SubmittedContext {
+            info,
+            policy,
+            state,
+            lease,
+            registration_action: action,
+        };
+        self.contexts.push(context);
+        let context_index = self
+            .contexts
+            .len()
+            .checked_sub(1)
+            .ok_or(crate::guc_ct::CtError::InvalidMessage)?;
+        let context = self
+            .contexts
+            .get_mut(context_index)
+            .ok_or(crate::guc_ct::CtError::InvalidMessage)?;
+        let policy_action = match context_policy_action(policy) {
+            Ok(action) => action,
+            Err(_) => {
+                context.state.set_policy_required();
+                return Err(crate::guc_ct::CtError::InvalidMessage);
+            }
+        };
+        if let Err(error) = pair.send_nonblocking(&policy_action, crate::guc_ct::CT_SEND_NB) {
+            context.state.set_policy_required();
+            return Err(error);
+        }
+        Ok(fence)
+    }
+
+    /// upstream: intel_guc_submission.c __guc_add_request().
+    pub fn submit_request(
+        &mut self,
+        pair: &mut crate::guc_ct::CtbPair,
+        context_id: u32,
+        is_parent: bool,
+    ) -> Result<([u16; 2], usize), crate::guc_ct::CtError> {
+        let context = self
+            .contexts
+            .iter_mut()
+            .find(|context| context.info.context_idx == context_id)
+            .ok_or(crate::guc_ct::CtError::UnexpectedResponse)?;
+        if context.state.policy_required() {
+            let action = context_policy_action(context.policy)
+                .map_err(|_| crate::guc_ct::CtError::InvalidMessage)?;
+            pair.send_nonblocking(&action, crate::guc_ct::CT_SEND_NB)?;
+            context.state.clear_policy_required();
+        }
+        let plan = context
+            .state
+            .prepare_request(context_id, is_parent)
+            .map_err(|_| crate::guc_ct::CtError::InvalidMessage)?;
+        let mut fences = [0; 2];
+        for index in 0..usize::from(plan.count) {
+            let action = plan.actions[index];
+            let len = usize::from(action.len);
+            let flags = crate::guc_ct::CT_SEND_NB | u32::from(action.expected_response_dwords);
+            match pair.send_nonblocking(&action.words[..len], flags) {
+                Ok(fence) => fences[index] = fence,
+                Err(error) => {
+                    context.state.request_send_result(plan, index != 0);
+                    return Err(error);
+                }
+            }
+            if index == 0 {
+                context.state.request_send_result(plan, true);
+            }
+        }
+        Ok((fences, usize::from(plan.count)))
+    }
+
+    /// upstream: intel_guc_submission.c deregister_context() with G2H reply.
+    pub fn deregister_context(
+        &mut self,
+        pair: &mut crate::guc_ct::CtbPair,
+        context_id: u32,
+    ) -> Result<u16, crate::guc_ct::CtError> {
+        let context = self
+            .contexts
+            .iter_mut()
+            .find(|context| context.info.context_idx == context_id)
+            .ok_or(crate::guc_ct::CtError::UnexpectedResponse)?;
+        context.state.set_destroyed();
+        let action = deregister_context_action(context_id)
+            .map_err(|_| crate::guc_ct::CtError::InvalidMessage)?;
+        pair.send_nonblocking(
+            &action,
+            crate::guc_ct::CT_SEND_NB | u32::from(G2H_LEN_DW_DEREGISTER_CONTEXT),
+        )
+    }
+
+    /// Prepare the corresponding context's reused ID for the deregister G2H
+    /// path to register the new owner after the old owner has drained.
+    pub fn wait_for_deregister_to_register(&mut self, context_id: u32) -> Result<(), Error> {
+        let context = self
+            .contexts
+            .iter_mut()
+            .find(|context| context.info.context_idx == context_id)
+            .ok_or(Error::Refused)?;
+        context.state.set_wait_for_deregister_to_register();
+        Ok(())
+    }
+
+    /// upstream: intel_guc_submission.c G2H scheduling/deregister event
+    /// processors. Event credits are released by `CtbPair` before this call.
+    pub fn handle_event(
+        &mut self,
+        pair: &mut crate::guc_ct::CtbPair,
+        event: crate::guc_ct::CtbEvent<'_>,
+    ) -> Result<(), crate::guc_ct::CtError> {
+        let context_id = *event
+            .payload
+            .first()
+            .ok_or(crate::guc_ct::CtError::InvalidMessage)?;
+        let index = self
+            .contexts
+            .iter()
+            .position(|context| context.info.context_idx == context_id)
+            .ok_or(crate::guc_ct::CtError::UnexpectedResponse)?;
+        match event.action {
+            crate::guc_ct::ACTION_SCHED_CONTEXT_MODE_DONE => {
+                let context = &mut self.contexts[index];
+                sched_mode_done_message(&mut context.state, event.payload)
+                    .map_err(|_| crate::guc_ct::CtError::InvalidMessage)?;
+            }
+            crate::guc_ct::ACTION_DEREGISTER_CONTEXT_DONE => {
+                let completion =
+                    deregister_done_message(&mut self.contexts[index].state, event.payload)
+                        .map_err(|_| crate::guc_ct::CtError::InvalidMessage)?;
+                match completion {
+                    DeregisterCompletion::ReRegister => {
+                        let context = &mut self.contexts[index];
+                        pair.send_nonblocking(
+                            &context.registration_action,
+                            crate::guc_ct::CT_SEND_NB,
+                        )?;
+                        context.state.set_registered();
+                        let policy_action = context_policy_action(context.policy)
+                            .map_err(|_| crate::guc_ct::CtError::InvalidMessage)?;
+                        if pair
+                            .send_nonblocking(&policy_action, crate::guc_ct::CT_SEND_NB)
+                            .is_err()
+                        {
+                            context.state.set_policy_required();
+                        } else {
+                            context.state.clear_policy_required();
+                        }
+                    }
+                    DeregisterCompletion::Destroy => {
+                        let context = self.contexts.remove(index);
+                        match context.lease {
+                            ContextIdLease::Single(id) => self.ids.release_single(id),
+                            ContextIdLease::Multi(range) => self.ids.release_multi(range),
+                        }
+                        .map_err(|_| crate::guc_ct::CtError::InvalidMessage)?;
+                    }
+                    DeregisterCompletion::Noop => {}
+                }
+            }
+            _ => return Err(crate::guc_ct::CtError::InvalidMessage),
+        }
+        Ok(())
+    }
+
+    pub fn context_state(&self, context_id: u32) -> Option<ContextSchedState> {
+        self.contexts
+            .iter()
+            .find(|context| context.info.context_idx == context_id)
+            .map(|context| context.state)
+    }
+
+    pub fn context_count(&self) -> usize {
+        self.contexts.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1136,6 +1402,73 @@ mod tests {
         assert_eq!(multi[2], 7);
         assert_eq!(multi[10], 2);
         assert_eq!(&multi[13..], &[0x60_0000, 0]);
+    }
+
+    #[test]
+    fn guc_submission_state_registers_submits_handles_g2h_and_releases_ids() {
+        let mut submission = GucSubmission::new(512).unwrap();
+        let lease = submission.allocate_single_id().unwrap();
+        let ContextIdLease::Single(context_id) = lease else {
+            panic!("single ID expected")
+        };
+        let info =
+            context_registration_info(context_id, 0, 1, 0x40_0000, None, None, None).unwrap();
+        let policy = ContextPolicy {
+            context_id,
+            priority: GUC_CLIENT_PRIORITY_KMD_NORMAL.into(),
+            execution_quantum_us: 20_000,
+            preemption_timeout_us: 5_000,
+            slpc_frequency_request: 0,
+            preempt_to_idle: false,
+        };
+        let mut pair = crate::guc_ct::CtbPair::new().unwrap();
+        submission
+            .register_v70(&mut pair, info, policy, lease, &[], &[])
+            .unwrap();
+        assert_eq!(submission.context_count(), 1);
+        let (fences, count) = submission
+            .submit_request(&mut pair, context_id, false)
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_ne!(fences[0], 0);
+        assert!(submission.context_state(context_id).unwrap().enabled());
+        pair.release_response_space(4).unwrap();
+        submission
+            .handle_event(
+                &mut pair,
+                crate::guc_ct::CtbEvent {
+                    action: crate::guc_ct::ACTION_SCHED_CONTEXT_MODE_DONE,
+                    data0: 0,
+                    payload: &[context_id, 0],
+                    released_response_credit: 4,
+                    process_immediately: false,
+                },
+            )
+            .unwrap();
+        assert!(
+            !submission
+                .context_state(context_id)
+                .unwrap()
+                .pending_enable()
+        );
+        submission
+            .deregister_context(&mut pair, context_id)
+            .unwrap();
+        pair.release_response_space(3).unwrap();
+        submission
+            .handle_event(
+                &mut pair,
+                crate::guc_ct::CtbEvent {
+                    action: crate::guc_ct::ACTION_DEREGISTER_CONTEXT_DONE,
+                    data0: 0,
+                    payload: &[context_id],
+                    released_response_credit: 3,
+                    process_immediately: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(submission.context_count(), 0);
+        assert_eq!(submission.allocate_single_id().unwrap(), lease);
     }
 
     #[test]

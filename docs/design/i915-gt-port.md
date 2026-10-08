@@ -20,7 +20,7 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 ### GuC submission 切片
 
-`guc_submission.rs` 已补入上游 v69 context/process descriptors、v70 scheduling WQ descriptors、context registration/policy/action 编码、multi/single context ID partition、request scheduling state transitions、sched-state 位/blocked 引用计数，以及 multi-LRC WQ item/no-op wrap 编码。当前既有 N305 RCS/BCS 提交器仍未改为 GuC backend；还缺 engine/context lifetime、CT client callsites、G2H/tasklet 工作流、preemption/time-slice scheduler 与 reset integration。这是 ABI/队列子集，不可据此宣称 GuC 默认提交可工作。
+`guc_submission.rs` 已补入上游 v69 context/process descriptors、v70 scheduling WQ descriptors、context registration/policy/action 编码、multi/single context ID partition、request scheduling state transitions、sched-state 位/blocked 引用计数，以及 multi-LRC WQ item/no-op wrap 编码。`CtDmaMemory` 保留了 GuC submission state，并有 CTB register/request/event 发布 helper，但既有 N305 RCS/BCS submitter 尚未调用它；还缺真实 engine/context/RCS backend life-cycle、tasklet/IRQ callsites、preemption/time-slice scheduler 与 reset integration。这是 ABI/queue 切片，不可据此宣称 GuC 默认提交可工作。
 
 ## 移植边界
 
