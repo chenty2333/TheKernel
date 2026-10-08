@@ -987,3 +987,10 @@ retain the latest Intel inventory, with no scanner exemptions.
 size selection from Linux v7.2.3 `drivers/gpu/drm/i915/display/intel_dmc.c`
 `dmc_firmware_default()` (MIT, Copyright © 2014 Intel). No DMC firmware bytes,
 firmware parser, loader, or rootfs payload were added.
+
+The same file now also translates the display-12/13 main/pipe package parser
+from `intel_dmc.c` `parse_dmc_fw()`, `parse_dmc_fw_header()`, and
+`fw_info_matches_stepping()` (MIT, Copyright © 2014 Intel). The kernel adapter
+selects by PCI revision after the rootfs-ready callback and retains the parsed
+program records; event-handler fixups and DMC MMIO programming remain pending.
+This supersedes the earlier statement above that no firmware parser was added.

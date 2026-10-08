@@ -311,8 +311,8 @@ pub(crate) fn bring_up_at_boot() {
         axlog::info!("intel-gpu: no mapped display; no writes");
         return;
     }
-    if let Some(device) = identified_device() {
-        dmc::request_for_device(device);
+    if let Some((device, revision)) = identified_device_and_revision() {
+        dmc::request_for_device(device, revision);
     }
     if axhal::boot::command_line_value("intel.modeset") != Some("1") {
         axlog::warn!(
@@ -978,13 +978,15 @@ pub(crate) fn report_text() -> String {
 }
 
 /// Whether the boot probe found a display device it could identify.
-pub(crate) fn identified_device() -> Option<&'static id::DisplayDevice> {
+pub(crate) fn identified_device_and_revision() -> Option<(&'static id::DisplayDevice, u8)> {
     let report = REPORT.lock();
     let report = report.as_ref()?;
-    report
-        .displays
-        .iter()
-        .find_map(|found| found.identity.device())
+    report.displays.iter().find_map(|found| {
+        found
+            .identity
+            .device()
+            .map(|device| (device, found.info.revision))
+    })
 }
 
 /// Run the probe against the platform's PCI bus.

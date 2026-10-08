@@ -538,4 +538,9 @@ rootfs request retains the bytes for later parser/load work; no parser/MMIO
 loader is wired yet. The Intel binary grant permits
 unmodified binary redistribution with its conditions/disclaimer and forbids
 reverse engineering/decompilation/disassembly; input preparation must respect
-that restriction.
+that restriction. The display DMC parser translates the published Linux
+v7.2.3 `intel_dmc.c` parser (MIT, Copyright © 2014 Intel), not a reverse
+engineering of the firmware binary. It parses CSS/package metadata and v1/v3
+DMC headers without altering, decompiling, or disassembling the image. Event
+fixups and MMIO programming remain incomplete. This updates the earlier
+statement above: package parsing is now implemented; the MMIO loader is not.

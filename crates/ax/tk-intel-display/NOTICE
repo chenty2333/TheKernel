@@ -244,8 +244,9 @@ from intel_ddi_buf_trans.c and known Wa_16011342517 selection. Copyright
 ©2012/2020/2023 Intel, full grant in LICENSE-MIT. Runtime uses verified VBT5
 before buffer enable; complete PHY before-image remains the rollback source.
 
-DMC firmware selection: src/dmc.rs translates the display-12/13 portion of
-intel_dmc.c::dmc_firmware_default() and its firmware-size constants. Copyright
-©2014 Intel Corporation; full grant in LICENSE-MIT. This selects paths/caps
-only. Rootfs binary inputs are external and carry Intel's separate
-LICENSE.i915; no DMC image or parser/loader is included in the crate.
+DMC firmware selection and parsing: src/dmc.rs translates the display-12/13
+portion of intel_dmc.c::dmc_firmware_default(), parse_dmc_fw(),
+parse_dmc_fw_header(), and fw_info_matches_stepping(). Copyright ©2014 Intel
+Corporation; full grant in LICENSE-MIT. Rootfs binary inputs are external and
+carry Intel's separate LICENSE.i915; this crate contains no DMC image or MMIO
+programming.
