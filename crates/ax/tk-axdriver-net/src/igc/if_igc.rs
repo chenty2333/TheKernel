@@ -7,7 +7,7 @@
 //! Copyright (c) 2021-2024 Rubicon Communications, LLC (Netgate).
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::mac::MacState;
 
@@ -83,6 +83,25 @@ const RSSRK: u32 = 0x05c80;
 const MRQC_ENABLE_RSS_4Q: u32 = 2;
 const FC_PAUSE_TIME: u16 = 0x0680;
 const PBA_34K: u32 = 0x22;
+const WUS: u32 = 0x05800;
+const WUS_EXT: u32 = 0x05804;
+const WUFC: u32 = 0x05808;
+const WUFC_EXT: u32 = 0x0580c;
+const WUC: u32 = 0x05810;
+const PCIEERRSTS: u32 = 0x05ba8;
+const PEIND: u32 = 0x01084;
+const LANPERRSTS: u32 = 0x05f58;
+const STATUS: u32 = 0x8;
+const EECD: u32 = 0x10;
+const CTRL_DEV_RST: u32 = 0x2000_0000;
+const STATUS_RST_DONE: u32 = 0x0020_0000;
+const EECD_AUTO_RD: u32 = 0x200;
+const PEIND_PCIE_PARITY_FATAL: u32 = 4;
+const PCIEERRSTS_FATAL_MASK: u32 = 0x78;
+const LANPERRSTS_RETX_BUF: u32 = 0x200;
+const MAX_JUMBO_MTU: u32 = 9234;
+const ETHER_HDR_LEN: u32 = 14;
+const ETHER_CRC_LEN: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MainError {
@@ -174,6 +193,108 @@ pub trait IgcRssIo: IgcMainIo {
     fn rss_bucket(&mut self, bucket: usize, queue_count: usize) -> usize;
     fn rss_key(&mut self) -> [u32; 10];
     fn rss_hash_config(&mut self) -> u32;
+}
+pub trait IgcLifecycleIo: IgcMainIo {
+    fn restore_led_for_stop(&mut self);
+    fn prepare_fatal_error_reset(&mut self);
+    fn stop_reset_hw(&mut self) -> Result<(), MainError>;
+    fn finish_stop_fatal_error_reset(&mut self);
+    fn enable_wakeup(&mut self) -> Result<(), MainError>;
+    fn release_hw_control(&mut self);
+    fn disable_broken_l1_2(&mut self);
+    fn log_wakeup_status(&mut self, wus: u32, wus_ext: u32);
+    fn clear_pme(&mut self);
+    fn log_reset_failure(&mut self);
+    fn log_wakeup_failure(&mut self);
+}
+pub trait IgcIfInitIo: IgcMainIo {
+    fn enable_pci_busmaster(&mut self) -> Result<(), MainError>;
+    fn suspend_link_powered_down(&self) -> bool;
+    fn power_up_wakeup_link(&mut self);
+    fn reset_adapter(&mut self) -> Result<(), MainError>;
+    fn update_admin_status(&mut self);
+    fn init_failed(&mut self);
+    fn log_busmaster_failure(&mut self);
+    fn set_mac_address(&mut self, address: [u8; 6]);
+}
+pub trait IgcAdminIo: IgcMainIo {
+    fn fatal_error_admin(&mut self) -> bool;
+    fn is_copper(&self) -> bool;
+    fn is_unknown_media(&self) -> bool;
+    fn get_link_status(&self) -> bool;
+    fn check_for_link(&mut self);
+    fn get_speed_duplex(&mut self) -> (u16, u16);
+    fn set_link_state(&mut self, up: bool, speed_mbps: u16);
+    fn set_link_fields(&mut self, active: bool, speed: u16, duplex: u16);
+    fn apply_i225_ipg_workaround(&mut self);
+    fn update_stats_counters(&mut self);
+}
+#[derive(Debug, Default)]
+pub struct FatalErrorState {
+    pub state: AtomicU32,
+    pub peind: u32,
+    pub pcie_error: u32,
+    pub lan_error: u32,
+    pub mng_error: u32,
+}
+pub trait IgcFatalIo: IgcMainIo {
+    fn delay_ms(&mut self, ms: u32);
+    fn disable_pcie_master(&mut self) -> Result<(), MainError>;
+    fn log_parity_reset_timeout(&mut self);
+    fn log_master_disable_failure(&mut self);
+}
+
+// upstream: if_igc.c igc_prepare_fatal_error_reset()
+pub fn igc_prepare_fatal_error_reset<I: IgcFatalIo>(io: &mut I, fatal: &FatalErrorState) {
+    if fatal.state.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut pcie_error = fatal.pcie_error | (io.read(PCIEERRSTS) & PCIEERRSTS_FATAL_MASK);
+    if fatal.peind & PEIND_PCIE_PARITY_FATAL == 0 && pcie_error == 0 {
+        return;
+    }
+    let ctrl = io.read(CTRL);
+    io.write(CTRL, ctrl | CTRL_DEV_RST);
+    io.delay_ms(3);
+    let mut reset_done = false;
+    for _ in 0..10 {
+        if io.read(EECD) & EECD_AUTO_RD != 0 && io.read(STATUS) & STATUS_RST_DONE != 0 {
+            reset_done = true;
+            break;
+        }
+        io.delay_ms(1)
+    }
+    if !reset_done {
+        io.log_parity_reset_timeout()
+    }
+    if io.disable_pcie_master().is_err() {
+        io.log_master_disable_failure()
+    }
+    pcie_error |= io.read(PCIEERRSTS) & PCIEERRSTS_FATAL_MASK;
+    if pcie_error != 0 {
+        io.write(PCIEERRSTS, pcie_error)
+    }
+}
+
+// upstream: if_igc.c igc_finish_fatal_error_reset()
+pub fn igc_finish_fatal_error_reset<I: IgcMainIo>(io: &mut I, fatal: &mut FatalErrorState) {
+    if fatal.state.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let pcie_error = fatal.pcie_error | (io.read(PCIEERRSTS) & PCIEERRSTS_FATAL_MASK);
+    if pcie_error != 0 {
+        io.write(PCIEERRSTS, pcie_error)
+    }
+    let lan_error = fatal.lan_error | (io.read(LANPERRSTS) & LANPERRSTS_RETX_BUF);
+    if lan_error != 0 {
+        io.write(LANPERRSTS, lan_error)
+    }
+    let _ = io.read(PEIND);
+    fatal.peind = 0;
+    fatal.pcie_error = 0;
+    fatal.lan_error = 0;
+    fatal.mng_error = 0;
+    fatal.state.store(0, Ordering::Release)
 }
 
 // upstream: if_igc.c igc_reset()
@@ -674,6 +795,124 @@ pub fn igc_setup_vlan_hw_support<I: IgcMainIo>(
     }
     igc_if_vlan_filter_enable(io)
 }
+
+// upstream: if_igc.c igc_if_init()
+pub fn igc_if_init<I: IgcIfInitIo>(
+    io: &mut I,
+    mac: &mut MacState,
+    user_mac: [u8; 6],
+    tx_queues: &mut [super::txrx::TxRingState],
+) {
+    if io.enable_pci_busmaster().is_err() {
+        io.log_busmaster_failure();
+        io.init_failed();
+        return;
+    }
+    if io.suspend_link_powered_down() {
+        io.power_up_wakeup_link()
+    }
+    mac.address = user_mac;
+    io.set_mac_address(user_mac);
+    if io.reset_adapter().is_err() {
+        io.init_failed();
+        return;
+    }
+    io.update_admin_status();
+    for tx in tx_queues {
+        tx.rs_cidx = tx.rs_pidx
+    }
+}
+
+// upstream: if_igc.c igc_if_stop()
+pub fn igc_if_stop<I: IgcLifecycleIo>(io: &mut I) -> Result<(), MainError> {
+    io.restore_led_for_stop();
+    io.prepare_fatal_error_reset();
+    if io.stop_reset_hw().is_err() {
+        io.log_reset_failure();
+        return Err(MainError::Io);
+    }
+    io.finish_stop_fatal_error_reset();
+    io.write(WUC, 0);
+    Ok(())
+}
+
+// upstream: if_igc.c igc_if_suspend()
+pub fn igc_if_suspend<I: IgcLifecycleIo>(io: &mut I) -> Result<(), MainError> {
+    let result = io.enable_wakeup();
+    io.release_hw_control();
+    result
+}
+
+// upstream: if_igc.c igc_if_shutdown()
+pub fn igc_if_shutdown<I: IgcLifecycleIo>(io: &mut I) {
+    if io.enable_wakeup().is_err() {
+        io.log_wakeup_failure()
+    }
+    io.release_hw_control()
+}
+
+// upstream: if_igc.c igc_if_resume()
+pub fn igc_if_resume<I: IgcLifecycleIo>(io: &mut I) {
+    io.disable_broken_l1_2();
+    let wus = io.read(WUS);
+    let wus_ext = io.read(WUS_EXT);
+    if wus != 0 || wus_ext != 0 {
+        io.log_wakeup_status(wus, wus_ext)
+    }
+    io.write(WUFC, 0);
+    io.write(WUFC_EXT, 0);
+    io.write(WUC, 0);
+    io.write(WUS, u32::MAX);
+    io.write(WUS_EXT, u32::MAX);
+    io.clear_pme()
+}
+
+// upstream: if_igc.c igc_if_mtu_set()
+pub fn igc_if_mtu_set(mtu: u32) -> Result<u32, MainError> {
+    if mtu > MAX_JUMBO_MTU - ETHER_HDR_LEN - ETHER_CRC_LEN {
+        return Err(MainError::Bounds);
+    }
+    Ok(mtu + ETHER_HDR_LEN + ETHER_CRC_LEN)
+}
+
+// upstream: if_igc.c igc_if_update_admin_status()
+pub fn igc_if_update_admin_status<I: IgcAdminIo>(
+    io: &mut I,
+    link_active: &mut bool,
+    link_speed: &mut u16,
+    link_duplex: &mut u16,
+) {
+    if io.fatal_error_admin() {
+        return;
+    }
+    let mut link_check = false;
+    if io.is_copper() {
+        if io.get_link_status() {
+            io.check_for_link();
+            link_check = !io.get_link_status()
+        } else {
+            link_check = true
+        }
+    } else if io.is_unknown_media() {
+        io.check_for_link();
+        link_check = !io.get_link_status()
+    }
+    if link_check && !*link_active {
+        let (speed, duplex) = io.get_speed_duplex();
+        *link_speed = speed;
+        *link_duplex = duplex;
+        *link_active = true;
+        io.set_link_state(true, speed)
+    } else if !link_check && *link_active {
+        *link_speed = 0;
+        *link_duplex = 0;
+        *link_active = false;
+        io.set_link_fields(false, 0, 0);
+        io.set_link_state(false, 0)
+    }
+    io.apply_i225_ipg_workaround();
+    io.update_stats_counters();
+}
 // upstream: if_igc.c igc_is_valid_ether_addr()
 pub fn igc_is_valid_ether_addr(address: &[u8; 6]) -> bool {
     address[0] & 1 == 0 && address.iter().any(|b| *b != 0)
@@ -692,6 +931,15 @@ mod tests {
         mta: Vec<(Vec<u8>, u32)>,
         vfta: Vec<(u32, u32)>,
         admin: usize,
+        events: Vec<&'static str>,
+        suspended: bool,
+        fatal_admin: bool,
+        link_active: bool,
+        link_speed: u16,
+        link_duplex: u16,
+        copper: bool,
+        unknown_media: bool,
+        get_link_status: bool,
     }
     impl Fake {
         fn get(&self, r: u32) -> u32 {
@@ -749,6 +997,120 @@ mod tests {
         fn get_phy_info(&mut self) {}
         fn check_for_link(&mut self) {}
         fn log_reset_error(&mut self, _: &'static str) {}
+    }
+    impl IgcIfInitIo for Fake {
+        fn enable_pci_busmaster(&mut self) -> Result<(), MainError> {
+            self.events.push("busmaster");
+            Ok(())
+        }
+        fn suspend_link_powered_down(&self) -> bool {
+            self.suspended
+        }
+        fn power_up_wakeup_link(&mut self) {
+            self.events.push("power-up")
+        }
+        fn reset_adapter(&mut self) -> Result<(), MainError> {
+            self.events.push("reset");
+            Ok(())
+        }
+        fn update_admin_status(&mut self) {
+            self.events.push("admin")
+        }
+        fn init_failed(&mut self) {
+            self.events.push("failed")
+        }
+        fn log_busmaster_failure(&mut self) {
+            self.events.push("busmaster-failed")
+        }
+        fn set_mac_address(&mut self, _: [u8; 6]) {
+            self.events.push("mac")
+        }
+    }
+    impl IgcLifecycleIo for Fake {
+        fn restore_led_for_stop(&mut self) {
+            self.events.push("led")
+        }
+        fn prepare_fatal_error_reset(&mut self) {
+            self.events.push("prepare")
+        }
+        fn stop_reset_hw(&mut self) -> Result<(), MainError> {
+            self.events.push("stop-reset");
+            Ok(())
+        }
+        fn finish_stop_fatal_error_reset(&mut self) {
+            self.events.push("finish")
+        }
+        fn enable_wakeup(&mut self) -> Result<(), MainError> {
+            self.events.push("wakeup");
+            Ok(())
+        }
+        fn release_hw_control(&mut self) {
+            self.events.push("release")
+        }
+        fn disable_broken_l1_2(&mut self) {
+            self.events.push("l1.2")
+        }
+        fn log_wakeup_status(&mut self, _: u32, _: u32) {
+            self.events.push("wus")
+        }
+        fn clear_pme(&mut self) {
+            self.events.push("pme")
+        }
+        fn log_reset_failure(&mut self) {
+            self.events.push("reset-failed")
+        }
+        fn log_wakeup_failure(&mut self) {
+            self.events.push("wakeup-failed")
+        }
+    }
+    impl IgcAdminIo for Fake {
+        fn fatal_error_admin(&mut self) -> bool {
+            self.fatal_admin
+        }
+        fn is_copper(&self) -> bool {
+            self.copper
+        }
+        fn is_unknown_media(&self) -> bool {
+            self.unknown_media
+        }
+        fn get_link_status(&self) -> bool {
+            self.get_link_status
+        }
+        fn check_for_link(&mut self) {
+            self.get_link_status = false
+        }
+        fn get_speed_duplex(&mut self) -> (u16, u16) {
+            (2500, 2)
+        }
+        fn set_link_state(&mut self, up: bool, speed: u16) {
+            self.events.push(if up { "link-up" } else { "link-down" });
+            self.link_active = up;
+            self.link_speed = speed
+        }
+        fn set_link_fields(&mut self, active: bool, speed: u16, duplex: u16) {
+            self.link_active = active;
+            self.link_speed = speed;
+            self.link_duplex = duplex
+        }
+        fn apply_i225_ipg_workaround(&mut self) {
+            self.events.push("ipg")
+        }
+        fn update_stats_counters(&mut self) {
+            self.events.push("stats")
+        }
+    }
+    impl IgcFatalIo for Fake {
+        fn delay_ms(&mut self, _: u32) {}
+        fn disable_pcie_master(&mut self) -> Result<(), MainError> {
+            self.events.push("master-off");
+            Ok(())
+        }
+        fn log_parity_reset_timeout(&mut self) {
+            self.events.push("parity-timeout")
+        }
+        fn log_master_disable_failure(&mut self) {
+            self.events.push("master-fail")
+        }
     }
     #[test]
     fn aim_snapshot_delta_ring_rate_and_idle_admin_follow_source() {
@@ -863,5 +1225,68 @@ mod tests {
         assert_eq!(io.get(RETA + 4), 0x0302_0100);
         assert_eq!(io.get(RSSRK + 36), 0x1234);
         assert_eq!(io.get(MRQC), MRQC_ENABLE_RSS_4Q | 0x01f7_0000);
+    }
+
+    #[test]
+    fn lifecycle_init_stop_resume_and_link_transitions_keep_source_order() {
+        let mut io = Fake {
+            suspended: true,
+            copper: true,
+            get_link_status: true,
+            ..Fake::default()
+        };
+        let mut mac = MacState::default();
+        let mut tx = vec![super::super::txrx::TxRingState::new(8)];
+        tx[0].rs_pidx = 3;
+        tx[0].rs_cidx = 0;
+        igc_if_init(&mut io, &mut mac, [2, 1, 2, 3, 4, 5], &mut tx);
+        assert_eq!(
+            &io.events[..],
+            &["busmaster", "power-up", "mac", "reset", "admin"]
+        );
+        assert_eq!(tx[0].rs_cidx, 3);
+        io.events.clear();
+        igc_if_stop(&mut io).unwrap();
+        assert_eq!(&io.events[..], &["led", "prepare", "stop-reset", "finish"]);
+        assert_eq!(io.get(WUC), 0);
+        io.events.clear();
+        io.set(WUS, 1);
+        io.set(WUS_EXT, 2);
+        igc_if_resume(&mut io);
+        assert_eq!(&io.events[..], &["l1.2", "wus", "pme"]);
+        assert_eq!(io.get(WUS), u32::MAX);
+        assert_eq!(io.get(WUFC), 0);
+        io.events.clear();
+        let (mut active, mut speed, mut duplex) = (false, 0, 0);
+        igc_if_update_admin_status(&mut io, &mut active, &mut speed, &mut duplex);
+        assert!(active);
+        assert_eq!((speed, duplex), (2500, 2));
+        assert_eq!(io.events, ["link-up", "ipg", "stats"]);
+        assert_eq!(igc_if_mtu_set(1500), Ok(1518));
+        assert_eq!(igc_if_mtu_set(9216), Ok(9234));
+        assert_eq!(igc_if_mtu_set(9217), Err(MainError::Bounds));
+    }
+
+    #[test]
+    fn fatal_error_recovery_resets_before_busmaster_and_clears_latched_faults() {
+        let mut io = Fake::default();
+        io.set(EECD, EECD_AUTO_RD);
+        io.set(STATUS, STATUS_RST_DONE);
+        io.set(PCIEERRSTS, PCIEERRSTS_FATAL_MASK);
+        io.set(LANPERRSTS, LANPERRSTS_RETX_BUF);
+        let mut fault = FatalErrorState {
+            state: AtomicU32::new(1),
+            peind: PEIND_PCIE_PARITY_FATAL,
+            pcie_error: 0,
+            lan_error: 0,
+            mng_error: 4,
+        };
+        igc_prepare_fatal_error_reset(&mut io, &fault);
+        assert!(io.get(CTRL) & CTRL_DEV_RST != 0);
+        assert!(io.events.contains(&"master-off"));
+        igc_finish_fatal_error_reset(&mut io, &mut fault);
+        assert_eq!(fault.state.load(Ordering::Acquire), 0);
+        assert_eq!(fault.peind, 0);
+        assert_eq!(io.get(PEIND), 0);
     }
 }
