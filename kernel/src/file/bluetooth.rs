@@ -1452,7 +1452,6 @@ fn complete_smp_bond(index: u16, handle: u16, adapter: &UsbAdapter) {
     };
     let Some(negotiated) = negotiated else { return };
     let bond = negotiated.bonding;
-    let identity = identity;
     let key_address = identity.map_or(address, |(_, address)| address);
     let key_address_type = identity.map_or(address_type, |(kind, _)| kind);
     if let Some((identity_type, identity_address)) = identity {
