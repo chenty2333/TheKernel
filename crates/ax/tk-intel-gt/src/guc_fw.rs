@@ -186,7 +186,11 @@ pub fn wait_huc_auth(io: &impl GtIo) -> Result<u32, Error> {
 // upstream: intel_guc.c intel_guc_send_mmio()
 /// Gen11+ four-dword MMIO transport. The caller serializes the send path and
 /// owns forcewake.
-pub fn send_mmio(io: &impl GtIo, request: &[u32]) -> Result<u32, Error> {
+pub fn send_mmio(
+    io: &impl GtIo,
+    request: &[u32],
+    mut response_buf: Option<&mut [u32]>,
+) -> Result<u32, Error> {
     if request.is_empty()
         || request.len() > GEN11_GUC_SEND_COUNT
         || request[0] & HXG_ORIGIN_GUC != 0
@@ -219,7 +223,20 @@ pub fn send_mmio(io: &impl GtIo, request: &[u32]) -> Result<u32, Error> {
             }
         }
         match response & HXG_TYPE_MASK {
-            HXG_TYPE_RESPONSE_SUCCESS => return Ok(response & 0x0fff_ffff),
+            HXG_TYPE_RESPONSE_SUCCESS => {
+                if let Some(response_buf) = response_buf.as_deref_mut() {
+                    let count = response_buf.len().min(GEN11_GUC_SEND_COUNT);
+                    if count == 0 {
+                        return Err(Error::Refused);
+                    }
+                    response_buf[0] = response;
+                    for (index, word) in response_buf.iter_mut().enumerate().take(count).skip(1) {
+                        *word = io.read(GEN11_GUC_SEND_BASE + index as u32 * 4)?;
+                    }
+                    return Ok(count as u32);
+                }
+                return Ok(response & 0x0fff_ffff);
+            }
             HXG_TYPE_RESPONSE_FAILURE => return Err(Error::Refused),
             HXG_TYPE_NO_RESPONSE_RETRY => continue,
             _ => return Err(Error::Unavailable(GEN11_GUC_SEND_BASE)),
@@ -230,7 +247,7 @@ pub fn send_mmio(io: &impl GtIo, request: &[u32]) -> Result<u32, Error> {
 // upstream: intel_guc.c intel_guc_auth_huc()
 /// Ask the running GuC to authenticate HuC firmware's RSA data in GGTT.
 pub fn authenticate_huc(io: &impl GtIo, rsa_offset: u32) -> Result<u32, Error> {
-    send_mmio(io, &[ACTION_AUTHENTICATE_HUC, rsa_offset])
+    send_mmio(io, &[ACTION_AUTHENTICATE_HUC, rsa_offset], None)
 }
 
 // upstream: intel_guc_fw.c guc_prepare_xfer()
@@ -409,7 +426,7 @@ mod tests {
                 self.response_index.set(index.saturating_add(1));
                 return Ok(responses[index.min(responses.len() - 1)]);
             }
-            if offset == GEN11_GUC_SEND_BASE + 4 {
+            if (GEN11_GUC_SEND_BASE + 4..GEN11_GUC_SEND_BASE + 16).contains(&offset) {
                 return Ok(0);
             }
             Err(Error::Unavailable(offset))
@@ -615,7 +632,7 @@ mod tests {
             response_index: core::cell::Cell::new(0),
             time: core::cell::Cell::new(0),
         };
-        assert_eq!(send_mmio(&busy, &[0x4000, 0x1234]), Ok(0x1234));
+        assert_eq!(send_mmio(&busy, &[0x4000, 0x1234], None), Ok(0x1234));
         assert_eq!(busy.notifications.get(), 1);
         assert_eq!(busy.writes.borrow()[0], (GEN11_GUC_SEND_BASE, 0x4000));
         assert_eq!(
@@ -633,7 +650,7 @@ mod tests {
             response_index: core::cell::Cell::new(0),
             time: core::cell::Cell::new(0),
         };
-        assert_eq!(send_mmio(&retry, &[0x4000, 0x1234]), Ok(0x1234));
+        assert_eq!(send_mmio(&retry, &[0x4000, 0x1234], None), Ok(0x1234));
         assert_eq!(retry.notifications.get(), 2);
 
         let failure_values = [HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_FAILURE];
@@ -645,7 +662,7 @@ mod tests {
             response_index: core::cell::Cell::new(0),
             time: core::cell::Cell::new(0),
         };
-        assert_eq!(send_mmio(&failure, &[0x4000]), Err(Error::Refused));
+        assert_eq!(send_mmio(&failure, &[0x4000], None), Err(Error::Refused));
     }
 
     #[test]
@@ -667,5 +684,23 @@ mod tests {
                 (GEN11_GUC_SEND_BASE + 4, 0x1234_0000)
             ]
         );
+    }
+
+    #[test]
+    fn mmio_send_copies_only_the_available_response_registers() {
+        let response = [HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_SUCCESS | 0x55];
+        let responses = [&response[..]];
+        let io = MmioIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            responses: &responses,
+            notifications: core::cell::Cell::new(0),
+            response_index: core::cell::Cell::new(0),
+            time: core::cell::Cell::new(0),
+        };
+        let mut copied = [u32::MAX; 6];
+        assert_eq!(send_mmio(&io, &[0x4000], Some(&mut copied)), Ok(4));
+        assert_eq!(copied[0], response[0]);
+        assert_eq!(&copied[1..4], &[0, 0, 0]);
+        assert_eq!(copied[4..], [u32::MAX; 2]);
     }
 }
