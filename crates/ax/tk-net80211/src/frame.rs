@@ -30,6 +30,7 @@ pub enum DecapError {
     ProtectedFrame,
     NoDistributionSystem,
     InvalidSnap,
+    InvalidAmsdu,
 }
 
 const FC_TYPE_MASK: u8 = 0x0c;
@@ -109,6 +110,79 @@ pub fn decap_data(frame: &[u8]) -> Result<EthernetFrame, DecapError> {
         ether_type,
         payload: body.to_vec(),
     })
+}
+
+// upstream: ieee80211_input.c ieee80211_amsdu_decap_validate()
+fn amsdu_destination_valid(destination: MacAddress, station_address: MacAddress) -> bool {
+    const FORBIDDEN_DA: [u8; 6] = [0xaa, 0xaa, 0x03, 0, 0, 0];
+    destination != FORBIDDEN_DA && destination == station_address
+}
+
+/// Validate and decapsulate every subframe in an 802.11 A-MSDU payload.
+// upstream: ieee80211_input.c ieee80211_amsdu_decap()
+pub fn decap_amsdu(
+    payload: &[u8],
+    station_address: MacAddress,
+) -> Result<Vec<EthernetFrame>, DecapError> {
+    const ETHERNET_HEADER_LEN: usize = 14;
+    const LLC_SNAP_LEN: usize = 8;
+    const LLC_SNAP: [u8; 6] = [0xaa, 0xaa, 0x03, 0, 0, 0];
+    let mut frames = Vec::new();
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let remaining = payload.get(offset..).ok_or(DecapError::InvalidAmsdu)?;
+        if remaining.len() < ETHERNET_HEADER_LEN {
+            return Err(DecapError::InvalidAmsdu);
+        }
+        let destination: MacAddress = remaining[..6]
+            .try_into()
+            .map_err(|_| DecapError::InvalidAmsdu)?;
+        let source: MacAddress = remaining[6..12]
+            .try_into()
+            .map_err(|_| DecapError::InvalidAmsdu)?;
+        let msdu_len = usize::from(u16::from_be_bytes([remaining[12], remaining[13]]));
+        if msdu_len < LLC_SNAP_LEN || msdu_len > remaining.len() - ETHERNET_HEADER_LEN {
+            return Err(DecapError::InvalidAmsdu);
+        }
+        if !amsdu_destination_valid(destination, station_address) {
+            return Err(DecapError::InvalidAmsdu);
+        }
+        let msdu = &remaining[ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + msdu_len];
+        let (ether_type, body) = if msdu.starts_with(&LLC_SNAP) {
+            if msdu.len() < LLC_SNAP_LEN {
+                return Err(DecapError::InvalidAmsdu);
+            }
+            (
+                u16::from_be_bytes([msdu[6], msdu[7]]),
+                &msdu[LLC_SNAP_LEN..],
+            )
+        } else {
+            (msdu_len as u16, msdu)
+        };
+        frames.push(EthernetFrame {
+            destination,
+            source,
+            ether_type,
+            payload: body.to_vec(),
+        });
+        let unpadded = ETHERNET_HEADER_LEN
+            .checked_add(msdu_len)
+            .ok_or(DecapError::InvalidAmsdu)?;
+        if unpadded == remaining.len() {
+            offset = payload.len();
+        } else {
+            let padded = unpadded.checked_add(3).ok_or(DecapError::InvalidAmsdu)? & !3;
+            if padded > remaining.len() {
+                return Err(DecapError::InvalidAmsdu);
+            }
+            offset = offset.checked_add(padded).ok_or(DecapError::InvalidAmsdu)?;
+        }
+    }
+    if frames.is_empty() {
+        Err(DecapError::InvalidAmsdu)
+    } else {
+        Ok(frames)
+    }
 }
 
 /// Encapsulate an Ethernet frame for an associated station (ToDS).
@@ -222,6 +296,49 @@ mod tests {
             assert_eq!(result.ether_type, 0x0806);
             assert_eq!(result.payload, [42]);
         }
+    }
+
+    #[test]
+    fn amsdu_decap_validates_all_subframes_and_removes_padding() {
+        let station = [2, 0, 0, 0, 0, 2];
+        let source = [2, 0, 0, 0, 0, 3];
+        let mut aggregate = Vec::new();
+        for (ether_type, payload) in [(0x0800u16, &[1, 2, 3][..]), (0x888eu16, &[4, 5][..])] {
+            let mut msdu = LLC_SNAP.to_vec();
+            msdu.extend_from_slice(&ether_type.to_be_bytes());
+            msdu.extend_from_slice(payload);
+            aggregate.extend_from_slice(&station);
+            aggregate.extend_from_slice(&source);
+            aggregate.extend_from_slice(&(msdu.len() as u16).to_be_bytes());
+            aggregate.extend_from_slice(&msdu);
+            if ether_type != 0x888e {
+                aggregate.resize((aggregate.len() + 3) & !3, 0);
+            }
+        }
+        assert_eq!(
+            decap_amsdu(&aggregate, station).unwrap(),
+            vec![
+                EthernetFrame {
+                    destination: station,
+                    source,
+                    ether_type: 0x0800,
+                    payload: vec![1, 2, 3],
+                },
+                EthernetFrame {
+                    destination: station,
+                    source,
+                    ether_type: 0x888e,
+                    payload: vec![4, 5],
+                }
+            ]
+        );
+        let mut forged = aggregate.clone();
+        forged[0] ^= 2;
+        assert_eq!(decap_amsdu(&forged, station), Err(DecapError::InvalidAmsdu));
+        assert_eq!(
+            decap_amsdu(&aggregate[..10], station),
+            Err(DecapError::InvalidAmsdu)
+        );
     }
 
     #[test]

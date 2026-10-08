@@ -27,6 +27,7 @@ mod rates;
 mod regdomain;
 mod rsn;
 mod rssadapt;
+mod rx_path;
 mod sa_query;
 mod scan;
 
@@ -55,7 +56,7 @@ pub use disconnect_rx::{
     DisconnectKind, DisconnectPolicy, DisconnectRxError, DisconnectRxResult, RxOperatingMode,
     receive_deauthentication, receive_disassociation,
 };
-pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
+pub use frame::{DecapError, EthernetFrame, MacAddress, decap_amsdu, decap_data, encap_station};
 pub use input::{
     EdcaAcParams, EdcaError, EdcaState, EdcaUpdate, HeaderError, has_address4, has_ht_control,
     has_qos_control, has_sequence_control, header_length, parse_edca_body, parse_edca_ie,
@@ -146,6 +147,7 @@ pub use rssadapt::{
     RSSADAPT_BUCKETS, RssAdapt, RssDescriptor, choose_rate, input_rssi, lower_rate, raise_rate,
     update_stats,
 };
+pub use rx_path::{RxDataPolicy, RxDataResult, RxDropReason, receive_station_data};
 pub use sa_query::{
     SaQueryError, SaQueryOutcome, SaQueryState, receive_sa_query_request, receive_sa_query_response,
 };

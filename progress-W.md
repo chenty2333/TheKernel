@@ -75,3 +75,4 @@
 - `ieee80211_input.c` BA/SA Query action dispatcher translated and linked to typed receive handlers; check/tests pass (86 tests); input.c coverage advances to 27/48 functions.
 - `ieee80211_input.c` management receive subtype switch translated with typed station/hostap management kinds; check/tests pass (89 tests); input.c coverage advances to 28/48 functions.
 - `ieee80211_input.c` `ieee80211_bar_tid()` agreement/PBAC checks and sequence-window effect translated; check/tests pass (90 tests); input.c coverage advances to 29/48 functions.
+- `ieee80211_input.c` station `inputm()` receive pipeline and A-MSDU validate/deaggregate paths translated and connected to Ethernet decapsulation; check/tests pass (95 tests); input.c coverage advances to 32/48 functions.

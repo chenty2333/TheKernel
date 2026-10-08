@@ -173,3 +173,10 @@ control; unsupported subtype values remain visible to the caller.
 Per-TID BAR handling checks active agreements, preserves PBAC's no-window-move
 rule and reports required DELBA, inactivity timeout refresh and forward window
 movement for the owning RX reorder engine.
+
+The station receive pipeline now preserves OpenBSD's BA-before-fragment/duplicate
+ordering, 12-bit sequence handling, retry/same-sequence drops, RSSI updates,
+FromDS/BSSID/simplex filters and RX privacy checks. Hardware reorder and
+hardware/software decryption remain caller-owned stages. A-MSDU payloads are
+split into individually validated Ethernet frames, including the station DA
+check and SNAP conversion.
