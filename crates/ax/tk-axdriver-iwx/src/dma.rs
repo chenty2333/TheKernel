@@ -27,12 +27,25 @@ pub trait DmaRegion {
     fn device_address(&self) -> u64;
     fn capacity(&self) -> usize;
     fn write(&mut self, bytes: &[u8]) -> Result<(), DmaError>;
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), DmaError> {
+        if offset == 0 && bytes.len() == self.capacity() { self.write(bytes) } else { Err(DmaError::RegionTooSmall) }
+    }
+    fn read_at(&self, _offset: usize, _bytes: &mut [u8]) -> Result<(), DmaError> {
+        Err(DmaError::RegionTooSmall)
+    }
 }
 
 /// Platform allocator used to stage the firmware sections in device-visible memory.
 pub trait DmaAllocator {
     type Region: DmaRegion;
     fn allocate(&mut self, size: usize) -> Result<Self::Region, DmaError>;
+    fn allocate_aligned(&mut self, size: usize, alignment: usize) -> Result<Self::Region, DmaError> {
+        let region = self.allocate(size)?;
+        if alignment > 1 && region.device_address() % alignment as u64 != 0 {
+            return Err(DmaError::RegionTooSmall);
+        }
+        Ok(region)
+    }
 }
 
 /// LMAC/UMAC context images and separately-lived paging sections.
@@ -70,7 +83,7 @@ fn allocate_section<A: DmaAllocator>(
     allocator: &mut A,
     section: &FirmwareSection,
 ) -> Result<A::Region, DmaError> {
-    let mut region = allocator.allocate(section.bytes.len())?;
+    let mut region = allocator.allocate_aligned(section.bytes.len(), 1)?;
     if region.capacity() < section.bytes.len() {
         return Err(DmaError::RegionTooSmall);
     }
@@ -181,6 +194,16 @@ mod tests {
         }
         fn write(&mut self, bytes: &[u8]) -> Result<(), DmaError> {
             self.bytes.copy_from_slice(bytes);
+            Ok(())
+        }
+        fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), DmaError> {
+            let dst = self.bytes.get_mut(offset..offset + bytes.len()).ok_or(DmaError::RegionTooSmall)?;
+            dst.copy_from_slice(bytes);
+            Ok(())
+        }
+        fn read_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DmaError> {
+            let src = self.bytes.get(offset..offset + bytes.len()).ok_or(DmaError::RegionTooSmall)?;
+            bytes.copy_from_slice(src);
             Ok(())
         }
     }
