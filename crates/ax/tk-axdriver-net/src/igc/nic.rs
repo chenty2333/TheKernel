@@ -48,6 +48,7 @@ use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 
 use super::{
     DMA_PAGE_BYTES, IgcBus, IgcHal, WindowBus,
+    api::IgcHardware,
     bringup::StationAddress,
     desc::{
         BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES,
@@ -198,6 +199,8 @@ impl<H: IgcHal> Drop for Allocation<H> {
 /// The Intel i225/i226 NIC, with `QS` descriptors in each ring.
 pub struct IgcNic<H: IgcHal, const QS: usize> {
     bus: WindowBus<H>,
+    /// FreeBSD shared-code operation tables installed for this PCI device.
+    shared: IgcHardware,
     mac: [u8; 6],
     tx_memory: DescriptorMemory,
     tx_ring: TxRing,
@@ -247,7 +250,11 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
     /// The caller has already reset the part and read its station address; the
     /// address is passed in so that this function cannot be reached without
     /// one.
-    pub fn init(bus: WindowBus<H>, station: &StationAddress) -> DevResult<Self> {
+    pub fn init(
+        bus: WindowBus<H>,
+        station: &StationAddress,
+        shared: IgcHardware,
+    ) -> DevResult<Self> {
         // One descriptor is always left unused, so a ring of one descriptor
         // could never hand anything over.
         if QS < 2 || !QS.is_power_of_two() {
@@ -287,6 +294,7 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
 
         let mut nic = Self {
             bus,
+            shared,
             mac: station.bytes,
             tx_memory,
             tx_ring: TxRing::new(QS),
@@ -351,6 +359,11 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
     /// The station address the hardware reported.
     pub const fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    /// The source-selected FreeBSD MAC/NVM/PHY callbacks for this part.
+    pub const fn shared_hardware(&self) -> &IgcHardware {
+        &self.shared
     }
 
     /// The counters since this device was taken over.
@@ -796,8 +809,13 @@ mod tests {
 
     use super::*;
     use crate::igc::{
+        api::{
+            IgcApiBackend, IgcApiCallback, IgcApiRequest, IgcApiValue, IgcHardware,
+            igc_setup_init_funcs,
+        },
         desc::RX_BUFFER_BYTES,
         fake::{FakeBus, FakeHal},
+        i225::{init_mac_params_i225, init_nvm_params_i225},
         regs::{self as regs, RegisterWindow, WINDOW_BYTES, bits},
     };
 
@@ -816,6 +834,27 @@ mod tests {
             high: 0x8000_u32 | u32::from(MAC[4]) | (u32::from(MAC[5]) << 8),
             address_valid: true,
         }
+    }
+
+    struct NoInitCallbacks;
+
+    impl IgcApiBackend for NoInitCallbacks {
+        fn invoke(
+            &mut self,
+            _callback: IgcApiCallback,
+            _request: IgcApiRequest,
+        ) -> DevResult<IgcApiValue> {
+            Err(DevError::Unsupported)
+        }
+    }
+
+    fn source_hardware() -> IgcHardware {
+        let mut hw = IgcHardware::new(0x15f3, true);
+        let mut callbacks = NoInitCallbacks;
+        igc_setup_init_funcs(&mut hw, &mut callbacks, false).expect("I225 callback tables");
+        init_mac_params_i225(&mut hw);
+        init_nvm_params_i225(&mut hw, 0, false);
+        hw
     }
 
     /// The device's aperture, the driver, and the plumbing a test needs to
@@ -846,7 +885,8 @@ mod tests {
                     WINDOW_BYTES,
                 ))
             };
-            let nic = IgcNic::<FakeHal, QS>::init(bus, &station()).expect("the rings come up");
+            let nic = IgcNic::<FakeHal, QS>::init(bus, &station(), source_hardware())
+                .expect("the rings come up");
             Self { aperture, nic }
         }
 
@@ -1287,6 +1327,16 @@ mod tests {
         assert_eq!(harness.nic.device_name(), DEVICE_NAME);
         assert_eq!(harness.nic.device_type(), DeviceType::Net);
         assert_eq!(harness.nic.mac_address().0, MAC);
+        assert_eq!(
+            harness.nic.shared_hardware().mac_type,
+            Some(super::super::api::IgcMacType::I225)
+        );
+        assert_eq!(harness.nic.shared_hardware().mac_info.rar_entry_count, 16);
+        assert_eq!(harness.nic.shared_hardware().nvm_info.word_size, 64);
+        assert_eq!(
+            harness.nic.shared_hardware().nvm_info.nvm_type,
+            super::super::api::IgcNvmType::Invm
+        );
         assert_eq!(harness.nic.rx_queue_size(), QS);
         assert_eq!(harness.nic.tx_queue_size(), QS);
         // The device is ready to transmit and has nothing to receive.
@@ -1310,7 +1360,8 @@ mod tests {
                     WINDOW_BYTES,
                 ))
             };
-            let nic = IgcNic::<FakeHal, QS>::init(bus, &station()).expect("the rings come up");
+            let nic = IgcNic::<FakeHal, QS>::init(bus, &station(), source_hardware())
+                .expect("the rings come up");
             assert_eq!(FakeHal::live_allocations(), 4);
             drop(nic);
         }
@@ -1338,7 +1389,7 @@ mod tests {
             ))
         };
         assert!(matches!(
-            IgcNic::<FakeHal, 1>::init(bus, &station()),
+            IgcNic::<FakeHal, 1>::init(bus, &station(), source_hardware()),
             Err(DevError::InvalidParam)
         ));
         assert_eq!(FakeHal::live_allocations(), 0, "nothing was leaked");
@@ -1373,7 +1424,7 @@ mod tests {
                 ))
             };
             assert!(matches!(
-                IgcNic::<FailAfter<N>, QS>::init(bus, &station()),
+                IgcNic::<FailAfter<N>, QS>::init(bus, &station(), source_hardware()),
                 Err(DevError::NoMemory)
             ));
             assert_eq!(

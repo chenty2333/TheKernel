@@ -29,11 +29,14 @@ use core::{
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_net::igc::{
-    self, DMA_PAGE_BYTES, IgcHal, IgcNic, PhysAddr, WindowBus,
+    self, DMA_PAGE_BYTES, IgcBus, IgcHal, IgcNic, PhysAddr, WindowBus,
     api::{IgcApiBackend, IgcApiRequest, IgcApiValue, IgcHardware, igc_setup_init_funcs},
     ids::{self, INTEL_VENDOR},
+    i225::{
+        IgcI225Io, igc_get_flash_presence_i225, init_mac_params_i225, init_nvm_params_i225,
+    },
     probe::{BarFacts, Candidate, ConfigFacts, MsixFacts},
-    regs::{RegisterWindow, WINDOW_BYTES},
+    regs::{self, RegisterWindow, WINDOW_BYTES},
 };
 use axhal::mem::{phys_to_virt, virt_to_phys};
 use log::*;
@@ -52,6 +55,60 @@ impl IgcApiBackend for ApiTableOnlyBackend {
     ) -> axdriver_base::DevResult<IgcApiValue> {
         Err(axdriver_base::DevError::Unsupported)
     }
+}
+
+const STATUS: u32 = 0x00008;
+
+/// Register/timing boundary used by the translated I225 NVM type detection
+/// during attach. Other EEPROM/PHY callbacks remain fail-closed until the full
+/// shared-code adapter is connected.
+struct I225RegisterIo<'a, H: IgcHal> {
+    bus: &'a mut WindowBus<H>,
+    clear_semaphore_once: bool,
+}
+
+impl<H: IgcHal> IgcI225Io for I225RegisterIo<'_, H> {
+    fn read(&mut self, offset: u32) -> u32 {
+        regs::at_offset(offset)
+            .and_then(|register| self.bus.read(register))
+            .unwrap_or(0)
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        if let Some(register) = regs::at_offset(offset) {
+            let _ = self.bus.write(register, value);
+        }
+    }
+
+    fn write_flush(&mut self) {
+        let _ = self.read(STATUS);
+    }
+
+    fn delay_us(&mut self, us: u32) {
+        axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(us)));
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        axhal::time::busy_wait(core::time::Duration::from_millis(u64::from(ms)));
+    }
+
+    fn delay_ms_irq(&mut self, ms: u32) {
+        self.delay_ms(ms);
+    }
+
+    fn nvm_word_size(&self) -> u32 {
+        0
+    }
+
+    fn clear_semaphore_once(&mut self) -> bool {
+        self.clear_semaphore_once
+    }
+
+    fn set_clear_semaphore_once(&mut self, value: bool) {
+        self.clear_semaphore_once = value;
+    }
+
+    fn put_hw_semaphore_generic(&mut self) {}
 }
 
 /// The queue size both rings are built with: the vendor driver's default of
@@ -249,10 +306,9 @@ fn probe(
     }
 
     // Install the FreeBSD shared-code operation tables for the identified
-    // I225 before bringing up the existing platform bus adapter. Initialization
-    // is deliberately deferred here: the callback backend is still being
-    // wired to the translated MAC/NVM/PHY modules, so claiming it is complete
-    // would be incorrect.
+    // I225, then run translated MAC and NVM parameter initialization against
+    // live PCI/MMIO facts. PHY reset/ID callback execution remains deferred
+    // until the full callback backend is connected.
     let mut api_backend = ApiTableOnlyBackend;
     if let Err(error) = igc_setup_init_funcs(&mut shared, &mut api_backend, false) {
         warn!("igc: {bdf}: translated shared operation setup failed: {error:?}");
@@ -266,6 +322,18 @@ fn probe(
         warn!("igc: {bdf}: translated I225 operation tables are incomplete");
         return Some(None);
     }
+    init_mac_params_i225(&mut shared);
+    let eecd = bus
+        .read(regs::named("IGC_EECD").expect("EECD is in the named register map"))
+        .unwrap_or(0);
+    let flash_present = {
+        let mut io = I225RegisterIo {
+            bus: &mut bus,
+            clear_semaphore_once: false,
+        };
+        igc_get_flash_presence_i225(&mut io)
+    };
+    init_nvm_params_i225(&mut shared, eecd, flash_present);
 
     // Phase 2: bring the link up.  No packets yet, and the report says so.
     let up = match igc::bringup::bring_up(&mut bus) {
@@ -278,7 +346,7 @@ fn probe(
     info!("{}", up.render(&bdf));
 
     // Phase 3: take the device over.
-    let nic = match IgcNic::<IgcHalImpl, QUEUE_SIZE>::init(bus, &up.station) {
+    let nic = match IgcNic::<IgcHalImpl, QUEUE_SIZE>::init(bus, &up.station, shared) {
         Ok(nic) => nic,
         Err(error) => {
             warn!(
