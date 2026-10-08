@@ -150,6 +150,23 @@ fn cta_block(vics: &[u8]) -> Vec<u8> {
     block
 }
 
+/// A CTA block that adds the HDMI VSDB's 5 MHz TMDS limit alongside VIC 16.
+fn cta_block_with_hdmi_tmds_limit(max_tmds_5mhz: u8) -> Vec<u8> {
+    let mut block = vec![0u8; 128];
+    block[0] = 0x02;
+    block[1] = 0x03;
+    block[2] = 14; // 7-byte HDMI vendor block + 2-byte video data block
+    block[4] = 0x67;
+    block[5..12].copy_from_slice(&[0x03, 0x0c, 0x00, 0x00, 0x00, 0x00, max_tmds_5mhz]);
+    block[12] = 0x41;
+    block[13] = 16;
+    block[127] = block[..127]
+        .iter()
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte))
+        .wrapping_neg();
+    block
+}
+
 /// A base block and its extensions, concatenated.
 fn assemble_edid(base: Vec<u8>, extensions: &[Vec<u8>]) -> Vec<u8> {
     let mut bytes = base;
@@ -166,6 +183,22 @@ const CDCLK_KHZ: u32 = 172_800;
 // ---------------------------------------------------------------------------
 // Which mode
 // ---------------------------------------------------------------------------
+
+#[test]
+fn preflight_rejects_source_hdmi_modes_over_the_sink_tmds_limit() {
+    let _guard = scheduler_test_context();
+    let base = base_block(Some(&mode_1080p60()), 1);
+    let edid = assemble_edid(base, &[cta_block_with_hdmi_tmds_limit(20)]); // 100 MHz
+    let plan = plan_modeset(&edid, &Constraints::unlimited());
+    assert_eq!(plan.selection.mode.clock_khz, 148_500);
+    assert!(matches!(
+        preflight_mode_at_cdclk(&plan, &edid, 400_000),
+        Err(ModesetError::HdmiClockPolicy {
+            clock_khz: 148_500,
+            sink_limit_khz: Some(100_000),
+        })
+    ));
+}
 
 #[test]
 fn the_mode_layers_own_choice_stands_when_the_sink_prefers_it() {

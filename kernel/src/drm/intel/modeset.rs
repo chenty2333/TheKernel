@@ -1472,6 +1472,11 @@ pub(crate) enum ModesetError {
     Arm(PipeError),
     /// The display-12/13 i915 timing admission rejected this mode.
     IntelModeStatus(I915ModeStatus),
+    /// The source HDMI RGB/8-bpc/no-scrambling clock policy rejected it.
+    HdmiClockPolicy {
+        clock_khz: u32,
+        sink_limit_khz: Option<u32>,
+    },
 }
 
 impl ModesetError {
@@ -1482,6 +1487,13 @@ impl ModesetError {
             ModesetError::IntelModeStatus(status) => {
                 format!("i915 display-13 mode validation rejected the selected timing: {status:?}")
             }
+            ModesetError::HdmiClockPolicy {
+                clock_khz,
+                sink_limit_khz,
+            } => format!(
+                "the translated HDMI RGB/8-bpc/no-scrambling policy rejected {clock_khz} kHz \
+                 (sink TMDS limit {sink_limit_khz:?}, source limit 300000 kHz)"
+            ),
             ModesetError::Clock(error) => {
                 format!(
                     "the CDCLK registers could not be read: {}",
@@ -1566,6 +1578,25 @@ pub(crate) fn preflight_mode_at_cdclk(
         Ok(mode) => mode,
         Err(refusal) => return Err(ModesetError::Refused(refusal)),
     };
+
+    // Apply the source's RGB/8-bpc HDMI TMDS policy during mode admission, not
+    // only as a last-moment output-program check. This path drives a combo PHY;
+    // use a parsed CTA VSDB limit when present, leaving absent fields unknown.
+    let sink_tmds_limit = Edid::parse_lossy(edid)
+        .ok()
+        .and_then(|sink| sink.max_tmds_clock_khz());
+    if super::tc_modeset::source_hdmi_tmds_clock_with_limit(
+        &mode,
+        sink_tmds_limit,
+        intel_display::intel_hdmi_full::HdmiPortClass::Combo,
+    )
+    .is_none()
+    {
+        return Err(ModesetError::HdmiClockPolicy {
+            clock_khz: mode.clock_khz,
+            sink_limit_khz: sink_tmds_limit,
+        });
+    }
 
     let i915_caps = I915DisplayCaps {
         display_version: 13,

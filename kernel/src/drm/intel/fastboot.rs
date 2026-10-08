@@ -168,7 +168,12 @@ fn native_modes(
         crate::drm::intel::modeset::is_reference_timing(mode)
             && mode.clock_khz == 148_500
             && cta_vic(mode) == Some(16)
-            && super::tc_modeset::source_hdmi_tmds_clock_with_limit(mode, sink_tmds_limit).is_some()
+            && super::tc_modeset::source_hdmi_tmds_clock_with_limit(
+                mode,
+                sink_tmds_limit,
+                intel_display::intel_hdmi_full::HdmiPortClass::TypeC,
+            )
+            .is_some()
     }) {
         let target = NativeMode {
             timing: target,

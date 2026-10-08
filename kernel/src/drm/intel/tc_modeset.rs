@@ -392,15 +392,20 @@ fn source_hdmi_tmds_clock(mode: &Mode, edid_bytes: &[u8]) -> Option<u32> {
     let sink_limit_khz = crate::drm::modes::Edid::parse_lossy(edid_bytes)
         .ok()
         .and_then(|edid| edid.max_tmds_clock_khz());
-    source_hdmi_tmds_clock_with_limit(mode, sink_limit_khz)
+    source_hdmi_tmds_clock_with_limit(
+        mode,
+        sink_limit_khz,
+        intel_display::intel_hdmi_full::HdmiPortClass::TypeC,
+    )
 }
 
 pub(super) fn source_hdmi_tmds_clock_with_limit(
     mode: &Mode,
     sink_limit_khz: Option<u32>,
+    port_class: intel_display::intel_hdmi_full::HdmiPortClass,
 ) -> Option<u32> {
     use intel_display::intel_hdmi_full::{
-        ClockLimits, HdmiMode, HdmiPortClass, OutputFormat, PortPlatform, SinkCapabilities,
+        ClockLimits, HdmiMode, OutputFormat, PortPlatform, SinkCapabilities,
         intel_hdmi_compute_clock,
     };
 
@@ -430,7 +435,7 @@ pub(super) fn source_hdmi_tmds_clock_with_limit(
     };
     let limits = ClockLimits {
         platform: PortPlatform::Display(13),
-        port: HdmiPortClass::TypeC,
+        port: port_class,
         source_limit_khz: 300_000,
         dp_dual_mode_limit_khz: None,
         sink_limit_khz: sink_limit_khz.and_then(|clock| i32::try_from(clock).ok()),
@@ -695,24 +700,51 @@ mod tests {
     #[test]
     fn active_tc_hdmi_uses_source_tmds_policy() {
         assert_eq!(
-            source_hdmi_tmds_clock_with_limit(&mode(148_500), None),
+            source_hdmi_tmds_clock_with_limit(
+                &mode(148_500),
+                None,
+                intel_display::intel_hdmi_full::HdmiPortClass::TypeC,
+            ),
             Some(148_500)
         );
         assert_eq!(
-            source_hdmi_tmds_clock_with_limit(&mode(300_000), None),
+            source_hdmi_tmds_clock_with_limit(
+                &mode(300_000),
+                None,
+                intel_display::intel_hdmi_full::HdmiPortClass::TypeC,
+            ),
             Some(300_000)
         );
         assert_eq!(
-            source_hdmi_tmds_clock_with_limit(&mode(300_001), None),
+            source_hdmi_tmds_clock_with_limit(
+                &mode(300_001),
+                None,
+                intel_display::intel_hdmi_full::HdmiPortClass::TypeC,
+            ),
             None
         );
-        assert_eq!(source_hdmi_tmds_clock_with_limit(&mode(24_999), None), None);
         assert_eq!(
-            source_hdmi_tmds_clock_with_limit(&mode(148_500), Some(100_000)),
+            source_hdmi_tmds_clock_with_limit(
+                &mode(24_999),
+                None,
+                intel_display::intel_hdmi_full::HdmiPortClass::TypeC,
+            ),
             None
         );
         assert_eq!(
-            source_hdmi_tmds_clock_with_limit(&mode(148_500), Some(200_000)),
+            source_hdmi_tmds_clock_with_limit(
+                &mode(148_500),
+                Some(100_000),
+                intel_display::intel_hdmi_full::HdmiPortClass::TypeC,
+            ),
+            None
+        );
+        assert_eq!(
+            source_hdmi_tmds_clock_with_limit(
+                &mode(148_500),
+                Some(200_000),
+                intel_display::intel_hdmi_full::HdmiPortClass::TypeC,
+            ),
             Some(148_500)
         );
     }
