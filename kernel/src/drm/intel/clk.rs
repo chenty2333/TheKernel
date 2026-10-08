@@ -41,11 +41,11 @@
 //!   `docs/design/intel-power.md` rather than hidden.  It is only reached when
 //!   the firmware left no usable CDCLK, which on a machine whose firmware drove
 //!   the screen should not happen.
-//! * **CDCLK crawl.**  `XE_LPD` has `has_cdclk_crawl`, and `adlp_cdclk_pll_crawl`
-//!   retunes a *running* PLL without disabling it.  It is not reachable here:
-//!   `bxt_de_pll_readout` reports a VCO of zero unless the PLL is enabled *and*
-//!   locked, so every state that reaches the programming path is one i915 also
-//!   treats as a disable/enable (`[I915]` `display/intel_cdclk.c:2069-2135`).
+//! * **CDCLK crawl.** The boot-only [`bring_up`] path does not need it, but the
+//!   runtime [`transition`] adapter now translates the ratio/request/ack sequence
+//!   for platforms admitted with `has_crawl`. It reports warning-only timeouts
+//!   as i915 does. Its caller must still supply atomic modeset, PCode and
+//!   peripheral-lock ordering; no modeset call site currently invokes it.
 //! * **The voltage-level table.**  `[GAP]` — §4.6 and §13.1 item 6: the table
 //!   is Gen12-specific and was not verified against a PRM.  Since no PCode
 //!   write happens, no voltage level is computed.
@@ -609,6 +609,148 @@ pub(crate) fn program(
     })
 }
 
+/// Runtime CDCLK transition outcome, retaining i915's warning-only poll results.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CdclkTransitionReport {
+    pub(crate) method: intel_display::cdclk::CdclkTransition,
+    pub(crate) unlock_timed_out: bool,
+    pub(crate) lock_timed_out: bool,
+    pub(crate) crawl_ack_timed_out: bool,
+    pub(crate) after: CdclkObservation,
+}
+
+/// Change a display-12/13 CDCLK using `_bxt_set_cdclk()`'s PLL/crawl sequence.
+///
+/// PCode pre/post notifications, audio/PSR pause, GMBUS/AUX locks and vblank
+/// synchronization remain responsibilities of the atomic modeset caller.
+// upstream: intel_cdclk.c _bxt_set_cdclk()/adlp_cdclk_pll_crawl()/icl_cdclk_pll_update()
+pub(crate) fn transition<R: Registers>(
+    regs: &R,
+    old: CdclkObservation,
+    target: CdclkEntry,
+    pipe: Option<u8>,
+    has_crawl: bool,
+) -> Result<CdclkTransitionReport, ClockError> {
+    if target.ratio > 0xff
+        || target.reference_khz != old.reference.khz()
+        || pipe.is_some_and(|p| p > 3)
+    {
+        return Err(ClockError::TableRow {
+            reference_khz: target.reference_khz,
+            cdclk_khz: target.cdclk_khz,
+            ratio: target.ratio,
+        });
+    }
+    let divider = cd2x_divider(target.vco_khz(), target.cdclk_khz).ok_or(ClockError::TableRow {
+        reference_khz: target.reference_khz,
+        cdclk_khz: target.cdclk_khz,
+        ratio: target.ratio,
+    })?;
+    let old_config = intel_display::cdclk::CdclkConfig {
+        cdclk_khz: old.cdclk_khz,
+        vco_khz: old.vco_khz,
+        refclk_khz: old.reference.khz(),
+        waveform: 0,
+    };
+    let new_config = intel_display::cdclk::CdclkConfig {
+        cdclk_khz: target.cdclk_khz,
+        vco_khz: target.vco_khz(),
+        refclk_khz: target.reference_khz,
+        waveform: 0,
+    };
+    let method = intel_display::cdclk::transition(
+        intel_display::cdclk::CdclkTransitionCaps {
+            display_version: 13,
+            has_crawl,
+            has_squash: false,
+        },
+        652_800,
+        old_config,
+        new_config,
+    );
+    if method == intel_display::cdclk::CdclkTransition::Unchanged {
+        return Ok(CdclkTransitionReport {
+            method,
+            unlock_timed_out: false,
+            lock_timed_out: false,
+            crawl_ack_timed_out: false,
+            after: observe(regs)?,
+        });
+    }
+
+    let mut unlock_timed_out = false;
+    let mut lock_timed_out = false;
+    let mut crawl_ack_timed_out = false;
+    match method {
+        intel_display::cdclk::CdclkTransition::Crawl => {
+            let value = target.ratio | PLL_ENABLE;
+            write(regs, regs::CDCLK_PLL_ENABLE, value)?;
+            write(regs, regs::CDCLK_PLL_ENABLE, value | PLL_FREQ_REQ)?;
+            crawl_ack_timed_out = !poll(
+                regs,
+                regs::CDCLK_PLL_ENABLE,
+                PLL_LOCK | PLL_FREQ_REQ_ACK,
+                PLL_LOCK | PLL_FREQ_REQ_ACK,
+                PLL_LOCK_TIMEOUT_US,
+            )?;
+            write(regs, regs::CDCLK_PLL_ENABLE, value)?;
+        }
+        intel_display::cdclk::CdclkTransition::FullPll
+            if old.vco_khz != 0 && old.vco_khz != target.vco_khz() =>
+        {
+            write(regs, regs::CDCLK_PLL_ENABLE, old.pll_register & !PLL_ENABLE)?;
+            unlock_timed_out = !poll(
+                regs,
+                regs::CDCLK_PLL_ENABLE,
+                PLL_LOCK,
+                0,
+                PLL_LOCK_TIMEOUT_US,
+            )?;
+            write(regs, regs::CDCLK_PLL_ENABLE, target.ratio)?;
+            write(regs, regs::CDCLK_PLL_ENABLE, target.ratio | PLL_ENABLE)?;
+            lock_timed_out = !poll(
+                regs,
+                regs::CDCLK_PLL_ENABLE,
+                PLL_LOCK,
+                PLL_LOCK,
+                PLL_LOCK_TIMEOUT_US,
+            )?;
+        }
+        intel_display::cdclk::CdclkTransition::FullPll if old.vco_khz == 0 => {
+            write(regs, regs::CDCLK_PLL_ENABLE, target.ratio)?;
+            write(regs, regs::CDCLK_PLL_ENABLE, target.ratio | PLL_ENABLE)?;
+            lock_timed_out = !poll(
+                regs,
+                regs::CDCLK_PLL_ENABLE,
+                PLL_LOCK,
+                PLL_LOCK,
+                PLL_LOCK_TIMEOUT_US,
+            )?;
+        }
+        _ => {}
+    }
+
+    let pipe_field = pipe.map_or(CD2X_PIPE_NONE, cd2x_pipe);
+    let ctl = cdclk_ctl_value(target, divider, pipe_field);
+    write(regs, regs::CDCLK_CTL, ctl)?;
+    let readback = read(regs, regs::CDCLK_CTL)?;
+    let fields = CDCLK_CTL_DIV_SEL_MASK | CDCLK_CTL_PIPE_MASK | CDCLK_CTL_DECIMAL_MASK;
+    if readback & fields != ctl & fields {
+        return Err(ClockError::ReadbackMismatch {
+            register: regs::CDCLK_CTL.name(),
+            wrote: ctl,
+            read: readback,
+        });
+    }
+    Ok(CdclkTransitionReport {
+        method,
+        unlock_timed_out,
+        lock_timed_out,
+        crawl_ack_timed_out,
+        after: observe(regs)?,
+    })
+}
+
 /// What [`program`] wrote.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CdclkProgrammed {
@@ -800,6 +942,10 @@ pub(crate) fn bring_up_raw_clock(
 pub(crate) const PLL_ENABLE: u32 = 1 << 31;
 /// `CDCLK_PLL_ENABLE[30]`.
 pub(crate) const PLL_LOCK: u32 = 1 << 30;
+/// `BXT_DE_PLL_FREQ_REQ` asks the running PLL to crawl to the new ratio.
+pub(crate) const PLL_FREQ_REQ: u32 = 1 << 23;
+/// `BXT_DE_PLL_FREQ_REQ_ACK` acknowledges the crawl request.
+pub(crate) const PLL_FREQ_REQ_ACK: u32 = 1 << 22;
 
 /// `CDCLK_CTL[23:22]`.
 pub(crate) const CDCLK_CTL_DIV_SEL_MASK: u32 = 0b11 << 22;
@@ -1421,6 +1567,93 @@ mod tests {
         assert!(observation.usable());
         assert_eq!(observation.cdclk_khz, 172_800);
         assert_eq!(observation.reference, ReferenceClock::Mhz19_2);
+    }
+
+    #[test]
+    fn runtime_crawl_uses_the_frequency_request_ack_and_pipe_sync_fields() {
+        let regs = MockRegisters::new();
+        regs.set(regs::SKL_DSSM, 1 << 29);
+        regs.set(regs::CDCLK_PLL_ENABLE, 20 | PLL_ENABLE | PLL_LOCK);
+        let old_entry = entry_for(ReferenceClock::Mhz19_2, 192_000, 20).unwrap();
+        regs.set(
+            regs::CDCLK_CTL,
+            cdclk_ctl_value(old_entry, Cd2xDivider::Div1, CD2X_PIPE_NONE),
+        );
+        regs.derive(regs::CDCLK_PLL_ENABLE, |written| {
+            let mut result = if written & PLL_ENABLE != 0 {
+                written | PLL_LOCK
+            } else {
+                written & !PLL_LOCK
+            };
+            if written & PLL_FREQ_REQ != 0 {
+                result |= PLL_FREQ_REQ_ACK;
+            } else {
+                result &= !PLL_FREQ_REQ_ACK;
+            }
+            result
+        });
+
+        let old = observe(&regs).unwrap();
+        let target = entry_for(ReferenceClock::Mhz19_2, 307_200, 32).unwrap();
+        let report = transition(&regs, old, target, Some(0), true).unwrap();
+        assert_eq!(report.method, intel_display::cdclk::CdclkTransition::Crawl);
+        assert!(!report.crawl_ack_timed_out);
+        assert_eq!(report.after.cdclk_khz, 307_200);
+        assert_eq!(report.after.pipe_field, 0);
+        assert_eq!(
+            regs.writes(),
+            alloc::vec![
+                ("CDCLK_PLL_ENABLE", 32 | PLL_ENABLE),
+                ("CDCLK_PLL_ENABLE", 32 | PLL_ENABLE | PLL_FREQ_REQ),
+                ("CDCLK_PLL_ENABLE", 32 | PLL_ENABLE),
+                (
+                    "CDCLK_CTL",
+                    cdclk_ctl_value(target, Cd2xDivider::Div1, cd2x_pipe(0))
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_full_pll_change_disables_before_loading_new_ratio() {
+        let regs = MockRegisters::new();
+        regs.set(regs::SKL_DSSM, 1 << 29);
+        regs.set(regs::CDCLK_PLL_ENABLE, 27 | PLL_ENABLE | PLL_LOCK);
+        let old_entry = entry_for(ReferenceClock::Mhz19_2, 172_800, 27).unwrap();
+        regs.set(
+            regs::CDCLK_CTL,
+            cdclk_ctl_value(old_entry, Cd2xDivider::Div1_5, CD2X_PIPE_NONE),
+        );
+        regs.derive(regs::CDCLK_PLL_ENABLE, |written| {
+            if written & PLL_ENABLE == 0 {
+                written & !PLL_LOCK
+            } else {
+                written | PLL_LOCK
+            }
+        });
+
+        let old = observe(&regs).unwrap();
+        let target = entry_for(ReferenceClock::Mhz19_2, 192_000, 20).unwrap();
+        let report = transition(&regs, old, target, None, false).unwrap();
+        assert_eq!(
+            report.method,
+            intel_display::cdclk::CdclkTransition::FullPll
+        );
+        assert!(!report.unlock_timed_out);
+        assert!(!report.lock_timed_out);
+        assert_eq!(report.after.cdclk_khz, 192_000);
+        assert_eq!(
+            regs.writes(),
+            alloc::vec![
+                ("CDCLK_PLL_ENABLE", 27 | PLL_LOCK),
+                ("CDCLK_PLL_ENABLE", 20),
+                ("CDCLK_PLL_ENABLE", 20 | PLL_ENABLE),
+                (
+                    "CDCLK_CTL",
+                    cdclk_ctl_value(target, Cd2xDivider::Div1, CD2X_PIPE_NONE)
+                ),
+            ]
+        );
     }
 
     #[test]

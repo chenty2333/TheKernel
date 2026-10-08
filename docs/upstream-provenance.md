@@ -1106,6 +1106,11 @@ and crawl/squash midpoint calculation from Linux 7.2.3
 Intel); see `docs/design/intel-cdclk.md` for the translated functions and
 remaining runtime adapter work.
 
+`kernel/src/drm/intel/clk.rs::transition()` adds the display-12/13 runtime
+CDCLK ratio/enable/lock and PLL crawl/request/ack MMIO steps from the same
+`intel_cdclk.c` source. It is not yet called by an atomic modeset path; PCode,
+audio/PSR and AUX/GMBUS lock ordering remain caller-side gaps.
+
 `tk-intel-display/src/dpll_mgr.rs` adds ICL/TGL combo PLL parameter search,
 fixed DP/TBT tables, CFGCR state encode/decode, and the 38.4-MHz fraction
 workaround from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c`

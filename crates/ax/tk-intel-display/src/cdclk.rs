@@ -135,6 +135,7 @@ pub struct CdclkTransitionCaps {
 /// A CDCLK update that can be made without disabling the complete PLL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CdclkTransition {
+    Unchanged,
     FullPll,
     Crawl,
     Squash,
@@ -260,7 +261,9 @@ pub fn transition(
     old: CdclkConfig,
     new: CdclkConfig,
 ) -> CdclkTransition {
-    if let Some(midpoint) = crawl_and_squash_midpoint(caps, max_cdclk_khz, old, new) {
+    if !clock_changed(old, new) {
+        CdclkTransition::Unchanged
+    } else if let Some(midpoint) = crawl_and_squash_midpoint(caps, max_cdclk_khz, old, new) {
         CdclkTransition::CrawlAndSquash(midpoint)
     } else if can_crawl(caps, old, new) {
         CdclkTransition::Crawl
@@ -348,6 +351,7 @@ mod tests {
             transition(divider_caps, 800000, a, divider),
             CdclkTransition::Cd2xDivider
         );
+        assert_eq!(transition(caps, 800000, a, a), CdclkTransition::Unchanged);
     }
 
     #[test]

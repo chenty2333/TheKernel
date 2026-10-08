@@ -12,12 +12,15 @@ Copyright © 2006-2017 Intel). The full MIT text is in
 `CdclkConfig` carries the actual frequency, PLL VCO/reference and squash
 waveform. `transition()` follows `_bxt_set_cdclk()`'s selection order: use a
 crawl+squash midpoint where available, otherwise crawl, squash, update only
-CD2X, or require a full PLL update. This is a pure planning layer and has unit
-coverage; the kernel has not yet connected it to modeset commits.
+CD2X, or require a full PLL update. The kernel `clk::transition()` adapter now
+executes the Gen12 ratio/enable/lock or crawl/request/ack sequence and writes
+`CDCLK_CTL`, retaining i915's warning-only PLL poll outcomes. Host unit tests
+cover the pure plan and compile-check covers the kernel adapter; its modeset
+call site is not yet connected.
 
-Still unported from the upstream file are runtime MMIO sequencing and locking,
-PCODE pre/post notifications, audio/PSR/GMBUS/AUX coordination, atomic CDCLK
+Still unported from the upstream file are caller-side PCode pre/post
+notifications, audio/PSR/GMBUS/AUX locking and coordination, atomic CDCLK
 state calculation, per-plane/bandwidth/watermark minima, maximum-frequency
-readout, and debugfs. The existing kernel `clk.rs` remains the N305 boot-time
-CDCLK/RAWCLK path; this change does not claim runtime clock switching is
-enabled.
+readout, and debugfs. The existing `bring_up()` remains the N305 boot-time
+CDCLK/RAWCLK entry point; runtime transition code is present but not invoked by
+a modeset caller yet.
