@@ -9,8 +9,8 @@ use std::{sync::Mutex, thread};
 
 use super::{DeviceStatus, DeviceType, Transport};
 use crate::{
-    queue::{fake_read_write_queue, Descriptor},
     PhysAddr, Result,
+    queue::{Descriptor, fake_read_write_queue},
 };
 
 /// A fake implementation of [`Transport`] for unit tests.
@@ -35,6 +35,10 @@ impl<C> Transport for FakeTransport<C> {
 
     fn read_device_features(&mut self) -> u64 {
         self.device_features
+    }
+
+    fn common_features(&self) -> u64 {
+        self.device_features & ((1 << 32) | (1 << 33))
     }
 
     fn write_driver_features(&mut self, driver_features: u64) {

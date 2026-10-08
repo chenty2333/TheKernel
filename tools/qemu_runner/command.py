@@ -101,6 +101,7 @@ def build_qemu_command(
     extra_args: tuple[str, ...] = (),
     cpu_pm: bool = False,
     kernel_irqchip_split: bool = False,
+    virtio_modern_only: bool = False,
 ) -> tuple[str, ...]:
     """Build the deterministic architecture-specific QEMU topology."""
 
@@ -269,6 +270,12 @@ def build_qemu_command(
             for index, option in enumerate(command[:-1]):
                 if option == "-device" and command[index + 1].startswith("virtio-"):
                     command[index + 1] += ",disable-legacy=on,iommu_platform=on"
+        elif virtio_modern_only:
+            # Isolate the modern VirtIO path without adding an IOMMU device or
+            # changing the platform DMA addresses returned by an identity HAL.
+            for index, option in enumerate(command[:-1]):
+                if option == "-device" and command[index + 1].startswith("virtio-"):
+                    command[index + 1] += ",disable-legacy=on"
         return tuple(command)
 
     raise CommandError(f"unsupported architecture: {arch}")

@@ -579,6 +579,7 @@ class RunSpec:
     kernel_cmdline: str | None = None
     qemu_extra_args: tuple[str, ...] = ()
     kernel_irqchip_split: bool = False
+    virtio_modern_only: bool = False
     powerdown_after_marker: str | None = None
     cpu_pm: bool = False
 
@@ -710,6 +711,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
                  "-action", "reboot=shutdown,shutdown=pause,panic=pause") if spec.gdb else ()) + spec.qemu_extra_args,
             qmp=qmp,
             kernel_irqchip_split=spec.kernel_irqchip_split,
+            virtio_modern_only=spec.virtio_modern_only,
         ),
     )
     print(f"qemu-runner exit={result.returncode} log={result.log_path} "
@@ -912,6 +914,7 @@ def run_cmd(args: argparse.Namespace) -> int:
                    if getattr(args, "vtd_q35", False) else ())
             ),
             kernel_irqchip_split=getattr(args, "vtd_q35", False),
+            virtio_modern_only=getattr(args, "virtio_modern_only", False),
             input_after_marker=input_after_marker,
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
@@ -1630,6 +1633,11 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
         "--vtd-q35",
         action="store_true",
         help="run the QEMU VT-d acceptance topology: q35 split irqchip and intel-iommu,intremap=on",
+    )
+    parser.add_argument(
+        "--virtio-modern-only",
+        action="store_true",
+        help="use modern-only VirtIO PCI devices without adding an IOMMU device",
     )
     parser.add_argument("--gdb", action="store_true",
                         help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")

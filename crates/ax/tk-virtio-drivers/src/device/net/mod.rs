@@ -16,6 +16,7 @@ use crate::volatile::ReadOnly;
 
 const MAX_BUFFER_LEN: usize = 65535;
 const MIN_BUFFER_LEN: usize = 1526;
+const LEGACY_NET_HDR_SIZE: usize = 10;
 const NET_HDR_SIZE: usize = core::mem::size_of::<VirtioNetHdr>();
 
 bitflags! {
@@ -121,7 +122,9 @@ pub struct VirtioNetHdr {
     gso_size: u16,
     csum_start: u16,
     csum_offset: u16,
-    // num_buffers: u16, // only available when the feature MRG_RXBUF is negotiated.
+    // Modern (VERSION_1) devices use the 12-byte header including num_buffers.
+    // For legacy transports the wire header remains the first 10 bytes.
+    num_buffers: u16,
     // payload starts from here
 }
 

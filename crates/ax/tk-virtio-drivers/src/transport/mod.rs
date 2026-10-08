@@ -27,6 +27,13 @@ pub trait Transport {
     /// Reads device features.
     fn read_device_features(&mut self) -> u64;
 
+    /// Common feature bits enabled by this transport mode. Transitional PCI
+    /// devices keep their legacy feature set; modern-only PCI and MMIO v2
+    /// transports may opt into VERSION_1 and platform DMA addresses.
+    fn common_features(&self) -> u64 {
+        0
+    }
+
     /// Writes device features.
     fn write_driver_features(&mut self, driver_features: u64);
 
@@ -91,15 +98,15 @@ pub trait Transport {
         let device_feature_bits = self.read_device_features();
         let device_features = F::from_bits_truncate(device_feature_bits);
         debug!("Device features: {:?}", device_features);
-        // This transport and HAL support modern VirtIO and platform DMA
-        // addresses (which may be IOVAs rather than guest physical addresses).
-        // Accept VERSION_1 and ACCESS_PLATFORM whenever the device offers them,
-        // even when a device-specific feature type does not name these common
-        // bits. In identity mode the HAL returns identity addresses.
+        // Only negotiate common bits enabled by this transport mode. This
+        // keeps transitional devices on the established feature set while
+        // allowing modern-only devices to use platform DMA addresses (which
+        // may be IOVAs rather than guest physical addresses). In identity mode
+        // the HAL returns identity addresses.
         const VERSION_1: u64 = 1 << 32;
         const ACCESS_PLATFORM: u64 = 1 << 33;
-        let negotiated_bits =
-            device_feature_bits & (supported_features.bits() | VERSION_1 | ACCESS_PLATFORM);
+        let common_features = self.common_features() & (VERSION_1 | ACCESS_PLATFORM);
+        let negotiated_bits = device_feature_bits & (supported_features.bits() | common_features);
         let negotiated_features = F::from_bits_truncate(negotiated_bits);
         self.write_driver_features(negotiated_bits);
 
@@ -226,30 +233,30 @@ bitflags! {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum DeviceType {
-    Invalid = 0,
-    Network = 1,
-    Block = 2,
-    Console = 3,
-    EntropySource = 4,
+    Invalid          = 0,
+    Network          = 1,
+    Block            = 2,
+    Console          = 3,
+    EntropySource    = 4,
     MemoryBallooning = 5,
-    IoMemory = 6,
-    Rpmsg = 7,
-    ScsiHost = 8,
-    _9P = 9,
-    Mac80211 = 10,
-    RprocSerial = 11,
-    VirtioCAIF = 12,
-    MemoryBalloon = 13,
-    GPU = 16,
-    Timer = 17,
-    Input = 18,
-    Socket = 19,
-    Crypto = 20,
+    IoMemory         = 6,
+    Rpmsg            = 7,
+    ScsiHost         = 8,
+    _9P              = 9,
+    Mac80211         = 10,
+    RprocSerial      = 11,
+    VirtioCAIF       = 12,
+    MemoryBalloon    = 13,
+    GPU              = 16,
+    Timer            = 17,
+    Input            = 18,
+    Socket           = 19,
+    Crypto           = 20,
     SignalDistributionModule = 21,
-    Pstore = 22,
-    IOMMU = 23,
-    Memory = 24,
-    Sound = 25,
+    Pstore           = 22,
+    IOMMU            = 23,
+    Memory           = 24,
+    Sound            = 25,
 }
 
 impl From<u32> for DeviceType {

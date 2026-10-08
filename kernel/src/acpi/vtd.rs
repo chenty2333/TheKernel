@@ -548,17 +548,17 @@ fn allocate_table_page() -> Result<DmaBlock, Error> {
     allocate_dma(1)
 }
 
-/// Discover DMAR before PCI probing; translation requires explicit opt-in.
+/// Discover DMAR before PCI probing; translate by default when a supported DMAR exists.
 pub(super) fn init(engine: &Engine) -> Result<(), Error> {
-    // Keep the firmware-compatible identity path as the default until QEMU
-    // and native DMA acceptance cover translated mappings end to end.
-    if axhal::boot::command_line_value("intel_iommu") != Some("on") {
+    // Preserve an explicit escape hatch for platforms that need firmware-style
+    // identity DMA. Supported DMAR units otherwise enable translation.
+    if axhal::boot::command_line_value("intel_iommu") == Some("off") {
         MODE.store(MODE_IDENTITY, Ordering::Release);
-        info!("vtd: translation disabled by default; use intel_iommu=on to opt in");
+        info!("vtd: translation disabled by intel_iommu=off");
         return Ok(());
     }
     MODE.store(MODE_FAILED, Ordering::Release);
-    info!("vtd: intel_iommu=on; parsing ACPI DMAR");
+    info!("vtd: parsing ACPI DMAR for default translation");
     let Some(dmar) = table(engine)? else {
         MODE.store(MODE_IDENTITY, Ordering::Release);
         info!("vtd: no DMAR table; admitting identity DMA");

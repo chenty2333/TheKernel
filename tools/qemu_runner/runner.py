@@ -220,6 +220,7 @@ class RunConfig:
     input_path: Path | None = None
     cpu_pm: bool = False
     kernel_irqchip_split: bool = False
+    virtio_modern_only: bool = False
 
 
 def _initrd_from_extra_args(extra_args: tuple[str, ...]) -> Path | None:
@@ -649,6 +650,7 @@ def run(
             diagnostic_log_path=diagnostic_log_path,
             cpu_pm=config.cpu_pm,
             kernel_irqchip_split=config.kernel_irqchip_split,
+            virtio_modern_only=config.virtio_modern_only,
             extra_args=_initrd_args_with_path(config.extra_args, qemu_initrd) + (("-S",) if pinning else ()),
         )
         if qemu_executable is not None:

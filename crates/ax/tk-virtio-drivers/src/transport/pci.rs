@@ -104,6 +104,7 @@ pub fn virtio_device_type(device_function_info: &DeviceFunctionInfo) -> Option<D
 #[derive(Debug)]
 pub struct PciTransport {
     device_type: DeviceType,
+    device_id: u16,
     /// The bus, device and function identifier for the VirtIO device.
     device_function: DeviceFunction,
     /// The common configuration structure within some BAR.
@@ -298,6 +299,7 @@ impl PciTransport {
 
         Ok(Self {
             device_type,
+            device_id,
             device_function,
             common_cfg,
             notify_region,
@@ -405,6 +407,14 @@ impl Transport for PciTransport {
             volwrite!(self.common_cfg, device_feature_select, 1);
             device_features_bits |= (volread!(self.common_cfg, device_feature) as u64) << 32;
             device_features_bits
+        }
+    }
+
+    fn common_features(&self) -> u64 {
+        if self.device_id >= PCI_DEVICE_ID_OFFSET {
+            (1 << 32) | (1 << 33)
+        } else {
+            0
         }
     }
 
@@ -847,6 +857,7 @@ mod tests {
         let mut isr = Volatile::new(3u8);
         let mut transport = PciTransport {
             device_type: DeviceType::Block,
+            device_id: TRANSITIONAL_BLOCK,
             device_function: DeviceFunction {
                 bus: 0,
                 device: 6,
