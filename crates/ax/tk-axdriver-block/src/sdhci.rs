@@ -450,9 +450,9 @@ pub fn timing_to_data_rate(timing: MmcBusTiming, normal_hz: u32, high_speed_hz: 
         MmcBusTiming::UhsDdr50 | MmcBusTiming::MmcDdr52 => 52_000_000,
         MmcBusTiming::UhsSdr50 => 100_000_000,
         MmcBusTiming::UhsSdr104 => 208_000_000,
-        MmcBusTiming::MmcHs200
-        | MmcBusTiming::MmcHs400
-        | MmcBusTiming::MmcHs400EnhancedStrobe => 200_000_000,
+        MmcBusTiming::MmcHs200 | MmcBusTiming::MmcHs400 | MmcBusTiming::MmcHs400EnhancedStrobe => {
+            200_000_000
+        }
     }
 }
 
@@ -898,10 +898,9 @@ impl<I: SdhciIo> SdhciHost<I> {
                 log::warn!("sdhci: host reset failed: {error:?}");
             })?;
         }
-        self.power_up()
-            .inspect_err(|error| {
-                log::warn!("sdhci: initial 400kHz clock failed: {error:?}");
-            })?;
+        self.power_up().inspect_err(|error| {
+            log::warn!("sdhci: initial 400kHz clock failed: {error:?}");
+        })?;
         // Use the largest host timeout exponent unless a future platform
         // integration provides the per-card timeout derived from CSD/EXT_CSD.
         let timeout = if self.quirks
@@ -1070,8 +1069,8 @@ impl<I: SdhciIo> SdhciHost<I> {
     pub fn suspend(&mut self) -> Result<(), SdhciError> {
         self.io.write32(SDHCI_SIGNAL_ENABLE as usize, 0);
         if self.version >= SDHCI_SPEC_300 as u8 {
-            let control2 = self.io.read16(SDHCI_HOST_CONTROL2 as usize)
-                & !(SDHCI_CTRL2_EXEC_TUNING as u16);
+            let control2 =
+                self.io.read16(SDHCI_HOST_CONTROL2 as usize) & !(SDHCI_CTRL2_EXEC_TUNING as u16);
             self.io.write16(SDHCI_HOST_CONTROL2 as usize, control2);
         }
         self.reset(SDHCI_RESET_ALL as u8)
@@ -1765,7 +1764,7 @@ fn mmc_send_relative_addr<I: SdhciIo>(
     mmc: bool,
 ) -> Result<u16, SdhciError> {
     if mmc {
-        host.command(SD_CMD_SEND_RELATIVE_ADDR, 1 << 16, SD_R1, None, 0)?;
+        mmc_set_relative_addr(host, 1)?;
         Ok(1)
     } else {
         Ok((host
@@ -1773,6 +1772,18 @@ fn mmc_send_relative_addr<I: SdhciIo>(
             .0[0]
             >> 16) as u16)
     }
+}
+
+// upstream: mmc.c mmc_set_relative_addr()
+fn mmc_set_relative_addr<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> Result<(), SdhciError> {
+    host.command(
+        SD_CMD_SEND_RELATIVE_ADDR,
+        u32::from(rca) << 16,
+        SD_R1,
+        None,
+        0,
+    )?;
+    Ok(())
 }
 
 // upstream: mmc.c mmc_send_csd()
@@ -2655,10 +2666,19 @@ mod tests {
 
     #[test]
     fn mmc_timing_rate_and_name_match_upstream_mapping() {
-        assert_eq!(timing_to_data_rate(MmcBusTiming::Normal, 25_000_000, 52_000_000), 25_000_000);
-        assert_eq!(timing_to_data_rate(MmcBusTiming::MmcHs400, 1, 2), 200_000_000);
+        assert_eq!(
+            timing_to_data_rate(MmcBusTiming::Normal, 25_000_000, 52_000_000),
+            25_000_000
+        );
+        assert_eq!(
+            timing_to_data_rate(MmcBusTiming::MmcHs400, 1, 2),
+            200_000_000
+        );
         assert_eq!(timing_name(MmcBusTiming::UhsDdr50), "dual data rate");
-        assert_eq!(timing_name(MmcBusTiming::MmcHs400EnhancedStrobe), "HS400 with enhanced strobe");
+        assert_eq!(
+            timing_name(MmcBusTiming::MmcHs400EnhancedStrobe),
+            "HS400 with enhanced strobe"
+        );
     }
 
     #[test]
