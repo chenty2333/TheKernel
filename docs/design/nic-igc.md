@@ -347,3 +347,5 @@ The remaining `igc_i225.c` entrypoints are translated as well: reset preserves t
 `igc_mac.c` now has 29/29 source functions in `src/igc/mac.rs`. `IgcMacIo` carries the register, NVM, PHY and timing calls; translated logic retains the source's RAR write flushes, reversed MTA writes, flow-control resolution table, I225 2.5G decoding, semaphore retries, auto-read and PCI-master bounds. This adapter is not yet the old `IgcNic` probe path.
 
 `igc_phy.c` now has 26/26 source functions in `src/igc/phy.rs`, covering generic operation table defaults, MDIC transactions, 10/100/1G/2.5G advertisements and pause resolution, PHY reset/link polling, LPLU, GPY MMD and XMDIO access. They remain adapter-backed and are not yet the live probe/packet path.
+
+`igc_txrx.c` has its 11 operational ctags callbacks translated in `src/igc/txrx.rs`; each source callback has a marker. `igc_dump_rs` is the only omitted definition and only prints descriptor/RS state for debugging, so its one-line omission rationale is recorded in `progress-S.md`.

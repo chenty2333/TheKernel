@@ -60,6 +60,7 @@ pub mod base;
 pub mod nvm;
 pub mod mac;
 pub mod phy;
+pub mod txrx;
 pub mod bringup;
 pub mod desc;
 pub mod i225;
