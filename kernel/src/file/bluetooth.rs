@@ -53,15 +53,19 @@ fn map_transport_error(error: axdriver::BluetoothError) -> AxError {
 
 #[cfg(feature = "input")]
 fn usb_adapter(index: u16) -> Option<UsbAdapter> {
-    let devices = axdriver::bluetooth_devices();
+    axdriver::bluetooth_devices()
+        .into_iter()
+        .find(|adapter| adapter.lock().index() == index)
+}
+
+#[cfg(feature = "input")]
+fn monitor_adapter(index: u16) -> Option<UsbAdapter> {
     if index == HCI_DEV_NONE {
         // A globally bound monitor socket observes the first controller; the
         // target platform has one CNVi HCI interface.
-        devices.into_iter().next()
+        axdriver::bluetooth_devices().into_iter().next()
     } else {
-        devices
-            .into_iter()
-            .find(|adapter| adapter.lock().index() == index)
+        usb_adapter(index)
     }
 }
 
@@ -206,7 +210,7 @@ impl HciSocket {
         }
         let adapter = if address.channel == HCI_CHANNEL_MONITOR {
             #[cfg(feature = "input")]
-            let adapter = usb_adapter(address.device);
+            let adapter = monitor_adapter(address.device);
             #[cfg(not(feature = "input"))]
             let adapter: Option<UsbAdapter> = None;
             #[cfg(feature = "input")]
