@@ -899,8 +899,8 @@ pub fn build_capture_output_nodes(
     Ok(output)
 }
 
-struct PooledCaptureNode {
-    output: CaptureOutputNode,
+pub struct PooledCaptureNode {
+    pub output: CaptureOutputNode,
     register_buffers: [Vec<CaptureRegister>; 3],
 }
 
@@ -1106,15 +1106,19 @@ impl CaptureNodeCache {
         engine_guc_id: u32,
         context_guc_id: u32,
         context_lrca: u32,
-    ) -> Option<CaptureOutputNode> {
+    ) -> Option<PooledCaptureNode> {
         let index = self.output.iter().position(|node| {
             is_matching_engine(&node.output, engine_guc_id, context_guc_id, context_lrca)
         })?;
-        let mut pooled = self.output.remove(index);
-        let output = pooled.output.clone();
-        pooled.reset();
-        self.free.push(pooled);
-        Some(output)
+        Some(self.output.remove(index))
+    }
+
+    /// Return a coredump-attached node to the cache after its output is no
+    /// longer needed, preserving its preallocated register arrays.
+    /// upstream: intel_guc_capture.c intel_guc_capture_free_node().
+    pub fn recycle_node(&mut self, mut node: PooledCaptureNode) {
+        node.reset();
+        self.free.push(node);
     }
 
     pub fn free_len(&self) -> usize {
@@ -1476,15 +1480,16 @@ mod tests {
         let matched = cache
             .take_matching_node(0 | (1 << GUC_ENGINE_INSTANCE_SHIFT), 1, 0x2001)
             .unwrap();
-        assert_eq!(matched.guc_id, 1);
+        assert_eq!(matched.output.guc_id, 1);
         assert_eq!(
-            matched.lists[usize::from(CAPTURE_TYPE_ENGINE_INSTANCE)]
+            matched.output.lists[usize::from(CAPTURE_TYPE_ENGINE_INSTANCE)]
                 .as_ref()
                 .unwrap()
                 .registers
                 .len(),
             2
         );
+        cache.recycle_node(matched);
         assert_eq!(cache.free_len(), 2);
         assert_eq!(cache.output_len(), 1);
     }
