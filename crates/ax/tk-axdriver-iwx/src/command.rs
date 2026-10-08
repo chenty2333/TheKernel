@@ -9,7 +9,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{DmaError, DmaRegion, RingError, TxRing, TxSegment};
+use crate::{CsrAccess, DmaError, DmaRegion, RingError, TxRing, TxSegment};
 
 pub const CMD_ASYNC: u32 = 1 << 0;
 pub const CMD_WANT_RESPONSE: u32 = 1 << 1;
@@ -32,6 +32,7 @@ pub enum CommandError {
     SlotBusy,
     WrongQueue,
     NoResponseSlot,
+    QueueIdOverflow,
     Ring(RingError),
     Dma(DmaError),
 }
@@ -327,12 +328,83 @@ impl CommandSlots {
         })
     }
 
+    /// Cancel an unpublished command reservation after local DMA setup failed.
+    pub fn cancel(&mut self, index: usize, generation: u32) -> Result<(), CommandError> {
+        let slot = self
+            .slots
+            .get_mut(index)
+            .ok_or(CommandError::InvalidIndex)?;
+        if slot.active && slot.generation == generation {
+            if self.queued == 0 {
+                return Err(CommandError::InvalidResponse);
+            }
+            self.queued -= 1;
+            *slot = CommandSlot::empty();
+        }
+        Ok(())
+    }
+
     /// Drop every response slot after hardware reset changes the generation.
     pub fn reset(&mut self, generation: u32) {
         self.generation = generation;
         self.queued = 0;
         for slot in &mut self.slots {
             *slot = CommandSlot::empty();
+        }
+    }
+}
+
+const HBUS_TARG_WRPTR: u32 = 0x460;
+
+/// Identity and completion lifetime of one published command-ring descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandTicket {
+    pub index: usize,
+    pub generation: u32,
+    pub wire_id: u32,
+    pub asynchronous: bool,
+}
+
+/// Reserve response storage, write TFD, then kick the command queue pointer.
+// upstream: if_iwx.c iwx_send_cmd() enqueue/publish order
+pub fn send_host_command<B, R>(
+    registers: &mut crate::IwxRegisters<B>,
+    ring: &mut TxRing<R>,
+    slots: &mut CommandSlots,
+    generation: u32,
+    command: &HostCommand<'_>,
+    external: Option<&mut R>,
+) -> Result<CommandTicket, CommandError>
+where
+    B: CsrAccess,
+    R: DmaRegion,
+{
+    let queue = u8::try_from(ring.queue_id).map_err(|_| CommandError::QueueIdOverflow)?;
+    let slot = ring.current;
+    let encoded = EncodedCommand::encode(command, slot as u8, queue)?;
+    slots.reserve(
+        slot,
+        generation,
+        command.flags,
+        command.response_capacity,
+        encoded.bytes.len() > INLINE_COMMAND_BYTES,
+    )?;
+    match submit_command(ring, &encoded, external) {
+        Ok(index) => {
+            registers.write_csr(
+                HBUS_TARG_WRPTR,
+                (u32::from(queue) << 16) | ring.current_hardware as u32,
+            );
+            Ok(CommandTicket {
+                index,
+                generation,
+                wire_id: encoded.wire_id,
+                asynchronous: command.flags & CMD_ASYNC != 0,
+            })
+        }
+        Err(error) => {
+            slots.cancel(slot, generation)?;
+            Err(error)
         }
     }
 }
@@ -375,7 +447,81 @@ pub const fn command_version(id: u32) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use core::cell::Cell;
+
     use super::*;
+    use crate::{DeviceFamily, DmaAllocator, IoBarrier, IwxRegisters};
+
+    struct TestRegion {
+        address: u64,
+        bytes: Vec<u8>,
+    }
+    impl DmaRegion for TestRegion {
+        fn device_address(&self) -> u64 {
+            self.address
+        }
+        fn capacity(&self) -> usize {
+            self.bytes.len()
+        }
+        fn write(&mut self, bytes: &[u8]) -> Result<(), DmaError> {
+            self.bytes.copy_from_slice(bytes);
+            Ok(())
+        }
+        fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), DmaError> {
+            self.bytes
+                .get_mut(offset..offset + bytes.len())
+                .ok_or(DmaError::RegionTooSmall)?
+                .copy_from_slice(bytes);
+            Ok(())
+        }
+        fn read_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DmaError> {
+            bytes.copy_from_slice(
+                self.bytes
+                    .get(offset..offset + bytes.len())
+                    .ok_or(DmaError::RegionTooSmall)?,
+            );
+            Ok(())
+        }
+    }
+    struct TestAllocator(Cell<u64>);
+    impl DmaAllocator for TestAllocator {
+        type Region = TestRegion;
+        fn allocate(&mut self, size: usize) -> Result<Self::Region, DmaError> {
+            self.allocate_aligned(size, 1)
+        }
+        fn allocate_aligned(
+            &mut self,
+            size: usize,
+            alignment: usize,
+        ) -> Result<Self::Region, DmaError> {
+            let mut address = self.0.get();
+            let rem = address as usize % alignment;
+            if rem != 0 {
+                address += (alignment - rem) as u64;
+            }
+            self.0.set(address + size as u64 + 0x1000);
+            Ok(TestRegion {
+                address,
+                bytes: vec![0; size],
+            })
+        }
+    }
+    #[derive(Default)]
+    struct TestBus(Vec<(u32, u32)>);
+    impl CsrAccess for TestBus {
+        fn read32(&mut self, _: u32) -> u32 {
+            0
+        }
+        fn write32(&mut self, offset: u32, value: u32) {
+            self.0.push((offset, value));
+        }
+        fn write8(&mut self, offset: u32, value: u8) {
+            self.0.push((offset, u32::from(value)));
+        }
+        fn barrier(&mut self, _: IoBarrier) {}
+        fn delay_us(&mut self, _: u32) {}
+    }
 
     #[test]
     fn command_slots_hold_bounded_responses_until_ack_and_release_payload() {
@@ -408,6 +554,37 @@ mod tests {
             slots.reserve(0, 1, 0, 0, false),
             Err(CommandError::InvalidResponse)
         );
+    }
+
+    #[test]
+    fn host_command_reserves_response_writes_tfd_and_kicks_command_queue() {
+        let mut allocator = TestAllocator(Cell::new(0x1000_0000));
+        let mut ring = crate::allocate_tx_ring(&mut allocator, 0).unwrap();
+        let mut slots = CommandSlots::new(0, 7);
+        let mut registers = IwxRegisters::new(TestBus::default(), DeviceFamily::Ax210, 0);
+        let payload = [0xaa, 0xbb];
+        let command = HostCommand {
+            id: 0x0005_0123,
+            flags: CMD_WANT_RESPONSE,
+            response_capacity: 24,
+            parts: &[&payload],
+        };
+        let ticket =
+            send_host_command(&mut registers, &mut ring, &mut slots, 7, &command, None).unwrap();
+        assert_eq!(ticket.index, 0);
+        assert_eq!(ticket.generation, 7);
+        assert_eq!(ring.current, 1);
+        assert_eq!(slots.queued(), 1);
+        let response = [1, 2, 3, 4];
+        slots
+            .receive_response(0, ticket.index, 7, &response, false)
+            .unwrap();
+        assert_eq!(slots.command_done(0, ticket.index, 7), Ok(true));
+        assert_eq!(
+            slots.take_completed(ticket.index, 7).unwrap().response,
+            Some(response.to_vec())
+        );
+        assert_eq!(registers.into_inner().0.last(), Some(&(HBUS_TARG_WRPTR, 1)));
     }
 
     #[test]

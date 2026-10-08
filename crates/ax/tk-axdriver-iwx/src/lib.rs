@@ -28,6 +28,7 @@ mod registers;
 mod rings;
 mod rx;
 mod rx_packet;
+mod scan;
 mod tx;
 
 pub use apm::{
@@ -45,8 +46,8 @@ pub use channel::{
 };
 pub use command::{
     CMD_ASYNC, CMD_FAILED_MASK, CMD_SEND_DURING_RFKILL, CMD_WANT_RESPONSE, CommandError,
-    CommandSlots, CompletedCommand, EncodedCommand, HostCommand, command_group_id, command_opcode,
-    command_version, submit_command,
+    CommandSlots, CommandTicket, CompletedCommand, EncodedCommand, HostCommand, command_group_id,
+    command_opcode, command_version, send_host_command, submit_command,
 };
 pub use config::{
     AX211_DEVICE_ID, DeviceConfig, FirmwareConfig, INTEL_VENDOR_ID, RuntimeConfig, lookup_config,
@@ -114,5 +115,10 @@ pub use rx::{RxMetadataError, noise_dbm, signal_strength_dbm};
 pub use rx_packet::{
     FH_FRAME_ALIGNMENT, FH_FRAME_INVALID, FH_FRAME_SIZE_MASK, NOTIFICATION_ORIGIN,
     RX_PACKET_HEADER_BYTES, RxPacket, RxPacketError, parse_rx_packet,
+};
+pub use scan::{
+    LONG_GROUP as IWX_LONG_GROUP, ScanError, ScanState, UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE,
+    UMAC_SCAN_REQ, abort_scan, begin_background_scan, begin_foreground_scan, end_scan,
+    scan_abort_command,
 };
 pub use tx::{EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame};
