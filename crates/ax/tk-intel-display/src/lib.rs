@@ -20,6 +20,7 @@ pub mod dmc;
 pub mod dp_aux;
 pub mod dpll;
 pub mod dpll_mgr;
+pub mod intel_dpll_mgr_full;
 pub mod hdmi;
 pub mod hdmi_packet;
 pub mod intel_bios;
