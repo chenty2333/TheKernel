@@ -591,7 +591,23 @@ fn upload_huc_for_auth(
         }
         return Err(Error::Refused);
     };
+    if image
+        .change_status(intel_gt::uc::FirmwareStatus::Loadable)
+        .is_err()
+    {
+        // SAFETY: HuC DMA has not started; the binding has no device consumer.
+        if unsafe { gtt.release_binding(&binding) }.is_err() {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(Error::Refused);
+    }
     if let Err(error) = intel_gt::guc_fw::huc_upload(&owner.bus, binding.address, image, false) {
+        let _ = image.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
         let release_failed = if error == Error::Quarantined {
             true
         } else {
@@ -608,6 +624,17 @@ fn upload_huc_for_auth(
             return Err(Error::Quarantined);
         }
         return Err(error);
+    }
+    if image
+        .change_status(intel_gt::uc::FirmwareStatus::Transferred)
+        .is_err()
+    {
+        owner.uc_memory = Some(UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        });
+        return Err(Error::Quarantined);
     }
     Ok((
         UcDmaMemory {
@@ -641,6 +668,21 @@ fn upload_uc_one(
     let binding = gtt
         .bind_pages(&ram.physical)
         .map_err(|_| Error::Quarantined)?;
+    if image
+        .change_status(intel_gt::uc::FirmwareStatus::Loadable)
+        .is_err()
+    {
+        // SAFETY: firmware DMA has not started; the binding has no device consumer.
+        if unsafe { gtt.release_binding(&binding) }.is_err() {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(Error::Refused);
+    }
     let transfer = match image.kind {
         intel_gt::uc::Kind::HuC => {
             intel_gt::guc_fw::huc_upload(&owner.bus, binding.address, image, false)
@@ -656,6 +698,7 @@ fn upload_uc_one(
             }),
     };
     if let Err(error) = transfer {
+        let _ = image.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
         let release_failed = if error == Error::Quarantined {
             true
         } else {
@@ -672,6 +715,29 @@ fn upload_uc_one(
             return Err(Error::Quarantined);
         }
         return Err(error);
+    }
+    if image
+        .change_status(intel_gt::uc::FirmwareStatus::Transferred)
+        .is_err()
+    {
+        owner.uc_memory = Some(UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        });
+        return Err(Error::Quarantined);
+    }
+    if image.kind == intel_gt::uc::Kind::GuC
+        && image
+            .change_status(intel_gt::uc::FirmwareStatus::Running)
+            .is_err()
+    {
+        owner.uc_memory = Some(UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        });
+        return Err(Error::Quarantined);
     }
     // SAFETY: GuC/HuC DMA completion has been observed before success returns.
     if unsafe { gtt.release_binding(&binding) }.is_err() {
