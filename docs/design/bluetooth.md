@@ -4,4 +4,27 @@ The `tk-bt-hci` crate provides checked HCI packet framing and channel ownership,
 
 The sources are FreeBSD `usr.sbin/bluetooth/iwmbtfw/iwmbt_fw.c`/`.h`/`main.c`, `iwmbt_hw.c`, and `sys/netgraph/bluetooth/drivers/ubt/ng_ubt.c` (BSD-2-Clause, 2026-10-08 snapshot). The translated firmware functions include `iwmbt_get_fwname`, `iwmbt_get_fwname_tlv`, `iwmbt_parse_tlv`, `iwmbt_is_supported`, `iwmbt_identify`, fixed/TLV version and boot-parameter queries, RSA/ECDSA header chunks, SFI command chunking/reset, manufacturer mode, patch BSEQ, DDC and event mask operations. Patch-stream expected events are checked by both event code and payload; command/event counters include those successful HCI transfers. HCI_USER ownership excludes RAW sockets while still allowing monitor observers; monitor framing preserves full 1028-byte ACL packets. A monitor bound with HCI_DEV_NONE attaches to the first available controller (the current target has one); multi-controller fan-out is not implemented. The rootfs-ready callback dispatches the identified 7260/8260/9260 family to the corresponding download path; no physical controller has validated those paths. To stage binary firmware into the guest image, set `THEKERNEL_INTEL_BT_FIRMWARE_DIR` to a linux-firmware `intel/` directory; `scripts/build-rootfs.sh` decompresses SFI/DDC/BSEQ files and carries `LICENSE.intel`. The userspace CLI/device enumeration and parts of main's recovery/status behavior remain unmapped. The HCI endpoint split maps control commands, interrupt events and bulk ACL to CrabUSB transfers. A per-adapter receive task now keeps event- and ACL-IN requests submitted concurrently, queues completed packets and wakes poll/epoll readiness; queue depth is bounded. Multiple raw readers still consume from the shared queue rather than receiving independent copies. `HCI_CHANNEL_CONTROL` is now bound through AF_BLUETOOTH and implements Linux management framing with READ_VERSION, READ_COMMANDS, READ_INDEX_LIST, READ_INFO and SET_POWERED responses; it queues command-complete records and reports readable readiness. Other management operations and controller/index/settings event fan-out are not implemented. `HCIGETDEVLIST` emits aligned `dev_opt`/HCI_UP flags and `HCIGETDEVINFO` queries the standard BD_ADDR/features/buffer-size commands and reports command/event/ACL packet+byte counters. Multi-controller monitor fan-out remains incomplete. `/sys/class/bluetooth/hciN` publishes address/name/type/bus/manufacturer/flags plus device ID, HCI feature bits, HCI version and revision; reset/uevent/link topology and further attributes remain unimplemented. Firmware blobs are not checked in.
 
-The USB binding uses endpoint zero for commands, interrupt IN for events and bulk IN/OUT for ACL, routed through CrabUSB; it has not been exercised with a physical controller. QEMU q35 without a Bluetooth device passed the guest smoke helper: monitor bind, empty `HCIGETDEVLIST`, `ENODEV` for `HCIDEVUP`/`HCIGETDEVINFO`, `/sys/class/bluetooth`, and HCI management READ_VERSION/READ_INDEX_LIST with poll-readable command completion. The `btmon`, `hciconfig`, and `bluetoothd` programs themselves are not present in this minimal rootfs, so BlueZ startup and active-controller behavior were not directly exercised. The socket/UAPI implementation is original and specification-based; GPL `net/bluetooth` implementation code was not copied.
+The USB binding uses endpoint zero for commands, interrupt IN for events and bulk IN/OUT for ACL, routed through CrabUSB; it has not been exercised with a physical controller. QEMU q35 without a Bluetooth device passed the guest smoke helper: monitor bind, empty `HCIGETDEVLIST`, `ENODEV` for `HCIDEVUP`/`HCIGETDEVINFO`, `/sys/class/bluetooth`, and HCI management READ_VERSION/READ_INDEX_LIST with poll-readable command completion. Alpine BlueZ command-line/runtime tools are now available in the optional `bluez` payload and a no-controller daemon smoke is recorded below; active-controller behavior remains unverified. The socket/UAPI implementation is original and specification-based; GPL `net/bluetooth` implementation code was not copied.
+
+The optional `--toolchain bluez` payload now stages signed Alpine v3.24 x86_64
+BlueZ 5.86-r2 (`bluetoothd`, `btmgmt`, `bluetoothctl`) and its pinned musl,
+D-Bus, GLib, readline, json-c, and eudev runtime closure. The APK signatures
+and checked-in SHA256 pins are verified during payload staging; the ordinary
+`none` image is unchanged. A QEMU q35/KVM no-controller run launched the
+system D-Bus daemon and `bluetoothd -n`; the daemon remained alive after
+initializing management, `btmgmt info` printed `Index list with 0 items`, and
+`bluetoothctl list` exited successfully with no controller entries. The
+repeatable guest case is `bluez-no-controller`; it proves userspace no-device
+startup only, not pairing, controller discovery, or live HCI operations.
+
+Management parsing now recognizes the requested SET_DISCOVERABLE,
+SET_CONNECTABLE, SET_BONDABLE, SET_SSP, SET_LE, LOAD_LINK_KEYS,
+LOAD_LONG_TERM_KEYS, and START_DISCOVERY packet sizes/parameters and returns
+Linux status `Invalid Index` when the requested controller is absent. When a
+controller exists these operations still return `Not Supported`; they are not
+advertised by READ_COMMANDS. READ_COMMANDS continues to list only the three
+implemented per-controller operations, and no management event fan-out is
+advertised. BlueZ startup needs only global version/command/index enumeration
+when the controller list is empty, which the Alpine daemon test directly
+verified. Per-controller settings/key/discovery state and Index Added/Removed,
+New Settings, and discovery/key event delivery remain open.

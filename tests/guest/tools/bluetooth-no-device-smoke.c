@@ -46,6 +46,34 @@ struct hci_dev_info {
 
 static int fail(const char *what) { perror(what); return 1; }
 
+static int mgmt_no_controller_command(int fd, uint16_t opcode,
+                                      const uint8_t *parameters, uint16_t length) {
+    uint8_t request[64] = {0};
+    uint8_t response[32] = {0};
+    if ((size_t)length + 6 > sizeof(request)) return 1;
+    request[0] = (uint8_t)opcode;
+    request[1] = (uint8_t)(opcode >> 8);
+    request[2] = 0;
+    request[3] = 0;
+    request[4] = (uint8_t)length;
+    request[5] = (uint8_t)(length >> 8);
+    if (length) memcpy(request + 6, parameters, length);
+    if (send(fd, request, (size_t)length + 6, 0) != (ssize_t)length + 6) {
+        return fail("mgmt command send");
+    }
+    ssize_t response_length = recv(fd, response, sizeof(response), 0);
+    if (response_length != 9 || response[0] != 1 || response[1] != 0 ||
+        response[2] != 0 || response[3] != 0 || response[4] != 3 ||
+        response[5] != 0 || response[6] != (uint8_t)opcode ||
+        response[7] != (uint8_t)(opcode >> 8) || response[8] != 0x11) {
+        fprintf(stderr, "mgmt opcode 0x%04x returned unexpected response length=%ld status=0x%02x\n",
+                opcode, (long)response_length,
+                response_length >= 9 ? response[8] : 0xff);
+        return 1;
+    }
+    return 0;
+}
+
 int main(void) {
     int fd = socket(AF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC, BTPROTO_HCI);
     if (fd < 0) return fail("socket(AF_BLUETOOTH)");
@@ -102,6 +130,22 @@ int main(void) {
     };
     if (response_len != sizeof(commands_reply) || memcmp(response, commands_reply, sizeof(commands_reply))) {
         fprintf(stderr, "mgmt READ_COMMANDS response length=%ld\n", (long)response_len); return 1;
+    }
+    const uint8_t enabled[] = { 1 };
+    const uint8_t discoverable[] = { 1, 0, 0 };
+    const uint8_t discovery_type[] = { 1 };
+    const uint8_t no_link_keys[] = { 0, 0, 0 };
+    const uint8_t no_ltk[] = { 0, 0 };
+    if (mgmt_no_controller_command(mgmt, 5, enabled, sizeof(enabled)) ||
+        mgmt_no_controller_command(mgmt, 6, discoverable, sizeof(discoverable)) ||
+        mgmt_no_controller_command(mgmt, 7, enabled, sizeof(enabled)) ||
+        mgmt_no_controller_command(mgmt, 9, enabled, sizeof(enabled)) ||
+        mgmt_no_controller_command(mgmt, 11, enabled, sizeof(enabled)) ||
+        mgmt_no_controller_command(mgmt, 13, enabled, sizeof(enabled)) ||
+        mgmt_no_controller_command(mgmt, 18, no_link_keys, sizeof(no_link_keys)) ||
+        mgmt_no_controller_command(mgmt, 19, no_ltk, sizeof(no_ltk)) ||
+        mgmt_no_controller_command(mgmt, 0x23, discovery_type, sizeof(discovery_type))) {
+        return 1;
     }
     close(mgmt);
     close(fd);

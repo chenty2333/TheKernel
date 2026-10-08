@@ -197,6 +197,34 @@ mod tests {
         assert_eq!(commands.len(), 9 + 4 + 2 * 3);
         assert_eq!(&commands[13..19], &[3, 0, 4, 0, 5, 0]);
     }
+
+    #[test]
+    fn management_recognizes_bluez_startup_ops_and_returns_no_device_status() {
+        let requests: &[&[u8]] = &[
+            &[6, 0, 0, 0, 3, 0, 0, 0, 0],  // SET_DISCOVERABLE
+            &[7, 0, 0, 0, 1, 0, 1],        // SET_CONNECTABLE
+            &[9, 0, 0, 0, 1, 0, 1],        // SET_BONDABLE
+            &[11, 0, 0, 0, 1, 0, 1],       // SET_SSP
+            &[13, 0, 0, 0, 1, 0, 1],       // SET_LE
+            &[18, 0, 0, 0, 3, 0, 0, 0, 0], // LOAD_LINK_KEYS, empty set
+            &[19, 0, 0, 0, 2, 0, 0, 0],    // LOAD_LONG_TERM_KEYS, empty set
+            &[0x23, 0, 0, 0, 1, 0, 1],     // START_DISCOVERY, BR/EDR
+        ];
+        for request in requests {
+            let response = management_response(request).unwrap();
+            assert_eq!(
+                response[8],
+                0x11,
+                "opcode={:#06x}",
+                u16::from_le_bytes([request[0], request[1]])
+            );
+        }
+
+        let invalid_connectable = management_response(&[7, 0, 0, 0, 1, 0, 2]).unwrap();
+        assert_eq!(invalid_connectable[8], 0x0d);
+        let invalid_discovery = management_response(&[0x23, 0, 0, 0, 1, 0, 0]).unwrap();
+        assert_eq!(invalid_discovery[8], 0x0d);
+    }
 }
 
 pub struct HciSocket {
@@ -618,7 +646,16 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const READ_INDEX_LIST: u16 = 3;
     const READ_INFO: u16 = 4;
     const SET_POWERED: u16 = 5;
+    const SET_DISCOVERABLE: u16 = 6;
+    const SET_CONNECTABLE: u16 = 7;
+    const SET_BONDABLE: u16 = 9;
+    const SET_SSP: u16 = 11;
+    const SET_LE: u16 = 13;
+    const LOAD_LINK_KEYS: u16 = 18;
+    const LOAD_LONG_TERM_KEYS: u16 = 19;
+    const START_DISCOVERY: u16 = 0x23;
     const UNKNOWN_COMMAND: u8 = 1;
+    const NOT_SUPPORTED: u8 = 0x0c;
     const INVALID_PARAMS: u8 = 0x0d;
     const INVALID_INDEX: u8 = 0x11;
     if request.len() < 6 {
@@ -704,9 +741,38 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 status = INVALID_INDEX;
             }
         }
+        SET_DISCOVERABLE if parameters.len() == 3 && parameters[0] <= 1 => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        SET_CONNECTABLE | SET_BONDABLE | SET_SSP | SET_LE
+            if parameters.len() == 1 && parameters[0] <= 1 =>
+        {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        LOAD_LINK_KEYS if valid_load_link_keys(parameters) => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        LOAD_LONG_TERM_KEYS if valid_load_long_term_keys(parameters) => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        START_DISCOVERY if parameters.len() == 1 && matches!(parameters[0], 1 | 6) => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
         _ if matches!(
             opcode,
-            READ_VERSION | READ_COMMANDS | READ_INDEX_LIST | READ_INFO | SET_POWERED
+            READ_VERSION
+                | READ_COMMANDS
+                | READ_INDEX_LIST
+                | READ_INFO
+                | SET_POWERED
+                | SET_DISCOVERABLE
+                | SET_CONNECTABLE
+                | SET_BONDABLE
+                | SET_SSP
+                | SET_LE
+                | LOAD_LINK_KEYS
+                | LOAD_LONG_TERM_KEYS
+                | START_DISCOVERY
         ) =>
         {
             status = INVALID_PARAMS;
@@ -727,4 +793,36 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     response.push(status);
     response.extend_from_slice(&data);
     Ok(response)
+}
+
+fn management_controller_status(index: u16, invalid_index: u8, unsupported: u8) -> u8 {
+    #[cfg(feature = "input")]
+    {
+        if usb_adapter(index).is_some() {
+            unsupported
+        } else {
+            invalid_index
+        }
+    }
+    #[cfg(not(feature = "input"))]
+    {
+        let _ = (index, unsupported);
+        invalid_index
+    }
+}
+
+fn valid_load_link_keys(parameters: &[u8]) -> bool {
+    if parameters.len() < 3 || parameters[0] > 1 {
+        return false;
+    }
+    let count = usize::from(u16::from_le_bytes([parameters[1], parameters[2]]));
+    count.checked_mul(25).and_then(|size| size.checked_add(3)) == Some(parameters.len())
+}
+
+fn valid_load_long_term_keys(parameters: &[u8]) -> bool {
+    if parameters.len() < 2 {
+        return false;
+    }
+    let count = usize::from(u16::from_le_bytes([parameters[0], parameters[1]]));
+    count.checked_mul(36).and_then(|size| size.checked_add(2)) == Some(parameters.len())
 }

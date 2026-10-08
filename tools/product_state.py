@@ -312,6 +312,8 @@ ROOTFS_INPUT_FILES = (
     "scripts/build-glibc-payload.sh",
     "scripts/build-gcc-payload.sh",
     "scripts/build-inspect-payload.sh",
+    "scripts/build-bluez-payload.sh",
+    "config/guest-bluez-apk-pins.tsv",
     "config/inspect-apks.lock",
     "scripts/build-containers-payload.sh",
     "scripts/install-container-filecaps.py",
@@ -326,6 +328,7 @@ ROOTFS_INPUT_FILES = (
     "scripts/create-rootfs-image.sh",
     "tools/nested/alpine/build-initramfs.sh",
     "tests/guest/shell-init.sh",
+    "tests/guest/bluetooth-bluez-smoke.sh",
     "tests/guest/system-init.c",
 )
 ROOTFS_INPUT_GLOBS = (
@@ -360,6 +363,7 @@ TOOL_PAYLOADS += ("containers", "debug")
 ROOTFS_INPUT_FILES += ("scripts/build-debug-payload.sh", "config/guest-debug-apk-pins.tsv")
 ROOTFS_INPUT_GLOBS += ("tests/guest/debugger/*",)
 TOOL_PAYLOADS += ("acpica",)
+TOOL_PAYLOADS += ("bluez",)
 
 
 def selected_tool_payload(requested: str | None = None) -> str:
@@ -398,7 +402,8 @@ def rootfs_image_bytes(payload: str) -> int:
     # class; 160 MiB would leave under 30 MiB free, which is not enough room for
     # a compile's intermediate files.
     size_mb = {"none": 160, "tcc": 160, "nested": 224, "glibc": 160,
-               "gcc": 224, "inspect": 160, "containers": 384, "debug": 224, "acpica": 160}[payload]
+               "gcc": 224, "inspect": 160, "containers": 384, "debug": 224,
+               "acpica": 160, "bluez": 160}[payload]
     # Intel firmware is decompressed into the offline rootfs.  The Fedora
     # linux-firmware package contains many families, so reserve the same
     # 224-MiB class as the compiler payload when it is explicitly selected.
