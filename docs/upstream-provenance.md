@@ -1037,3 +1037,8 @@ platform integration.
 © 2022 Intel), and `power_map.rs` now exposes the full source domain enum,
 including display-core, eDP/DSI transcoder, DDI lane A/F, port-other, GMBUS,
 and GT-IRQ identifiers.
+
+`dc_state.rs` includes a tracked `gen9_set_dc_state()` request path from
+`intel_display_power_well.c` (MIT, Copyright © 2022 Intel). Its observer maps
+the source's PSR and DMC DC6-count side effects; boot-time disable uses the
+helper during initialization with those side effects intentionally suppressed.

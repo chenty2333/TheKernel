@@ -1018,13 +1018,24 @@ impl<R: Registers> intel_display::power_well::HswPowerWellIo for HswPowerWellAda
 /// rewrites. A persistent mismatch is recorded in `state_stuck` rather than
 /// converted into a new fatal policy.
 pub(crate) fn disable_dc_states<R: Registers>(regs: &R) -> Result<DcStateObservation, PowerError> {
+    struct BootDcStateObserver;
+    impl intel_display::dc_state::DcStateObserver for BootDcStateObserver {
+        fn notify_psr_dc5_dc6(&mut self) {}
+        fn update_dc6_allowed_count(&mut self, _: bool) {}
+    }
+
     let adapter = HswPowerWellAdapter { regs };
-    let state = intel_display::dc_state::gen9_set_dc_state_field(
+    let mut tracked_dc_state = DC_STATE_DISABLE;
+    let state = intel_display::dc_state::gen9_set_dc_state(
         &adapter,
         regs::DC_STATE_EN.offset(),
         13,
         false,
         DC_STATE_DISABLE,
+        true,
+        DC_STATE_DISABLE,
+        &mut tracked_dc_state,
+        &mut BootDcStateObserver,
     )
     .map_err(|error| match error {
         intel_display::Error::Unavailable(offset) => PowerError::Unreadable {

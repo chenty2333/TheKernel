@@ -571,3 +571,9 @@ The MIT `intel_display_power_domain_str()` diagnostic name mapping and full
 power-domain identifier set from `intel_display_power.c` are translated in
 `tk-intel-display/src/power_domains.rs` and `power_map.rs` (Copyright © 2022
 Intel).
+
+The tracked `gen9_set_dc_state()` helper in `tk-intel-display/src/dc_state.rs`
+translates the MIT request-mask clamp, PSR/DC6 observer boundaries, owned-field
+update, retry/readback, and stored state from `intel_display_power_well.c`
+(Copyright © 2022 Intel). The kernel uses it for the boot-time disable path;
+its no-op observer is only for initialization, before PSR/DMC policy exists.

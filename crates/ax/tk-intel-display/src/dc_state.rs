@@ -143,6 +143,57 @@ pub struct DcStateWrite {
     pub stable_reads: u8,
 }
 
+/// i915 side effects surrounding a DC-state request.
+pub trait DcStateObserver {
+    fn notify_psr_dc5_dc6(&mut self);
+    fn update_dc6_allowed_count(&mut self, allowed: bool);
+}
+
+/// Apply one i915 DC-state request, including software tracking and DC6 policy.
+// upstream: intel_display_power_well.c gen9_set_dc_state()
+pub fn gen9_set_dc_state(
+    io: &impl RegisterIo,
+    register: u32,
+    display_version: u8,
+    legacy_dc9: bool,
+    allowed_dc_mask: u32,
+    initializing: bool,
+    state: u32,
+    tracked_dc_state: &mut u32,
+    observer: &mut impl DcStateObserver,
+) -> Result<DcStateWrite, Error> {
+    let state = state & allowed_dc_mask;
+    if !initializing {
+        observer.notify_psr_dc5_dc6();
+    }
+
+    let before = io.read32(register)?;
+    let mask = gen9_dc_mask(display_version, legacy_dc9);
+    let old_dc_state = *tracked_dc_state;
+    let enable_dc6 = state & DC_STATE_EN_UPTO_DC6 != 0;
+    let dc6_was_enabled = old_dc_state & DC_STATE_EN_UPTO_DC6 != 0;
+    if !dc6_was_enabled && enable_dc6 {
+        observer.update_dc6_allowed_count(true);
+    }
+
+    let mut report = match gen9_write_dc_state(io, register, (before & !mask) | state) {
+        Ok(report) => report,
+        Err(error) => {
+            if !dc6_was_enabled && enable_dc6 {
+                observer.update_dc6_allowed_count(false);
+            }
+            return Err(error);
+        }
+    };
+    report.before = Some(before);
+    *tracked_dc_state = report.readback & mask;
+
+    if !enable_dc6 && dc6_was_enabled {
+        observer.update_dc6_allowed_count(false);
+    }
+    Ok(report)
+}
+
 /// Return the register bits software controls for a platform family.
 // upstream: intel_display_power_well.c gen9_dc_mask()
 pub const fn gen9_dc_mask(display_version: u8, legacy_dc9: bool) -> u32 {
@@ -277,6 +328,56 @@ mod tests {
         assert_eq!(result.readback, 0x55);
         assert_eq!(io.writes.borrow().len(), 101);
         assert_eq!(io.reads.get(), 100);
+    }
+
+    #[test]
+    fn set_dc_state_tracks_dc6_edges_and_keeps_unowned_bits() {
+        #[derive(Default)]
+        struct Observer(Vec<&'static str>);
+        impl DcStateObserver for Observer {
+            fn notify_psr_dc5_dc6(&mut self) {
+                self.0.push("psr");
+            }
+            fn update_dc6_allowed_count(&mut self, allowed: bool) {
+                self.0.push(if allowed { "dc6+" } else { "dc6-" });
+            }
+        }
+
+        let mask = gen9_dc_mask(13, false);
+        let initial = 0x4000_0040;
+        let io = Fake::new(initial);
+        let mut observer = Observer::default();
+        let mut tracked = DC_STATE_DISABLE;
+        let report = gen9_set_dc_state(
+            &io,
+            4,
+            13,
+            false,
+            DC_STATE_EN_UPTO_DC6,
+            false,
+            DC_STATE_EN_UPTO_DC6,
+            &mut tracked,
+            &mut observer,
+        )
+        .unwrap();
+        assert_eq!(report.readback, (initial & !mask) | DC_STATE_EN_UPTO_DC6);
+        assert_eq!(tracked, DC_STATE_EN_UPTO_DC6);
+        assert_eq!(observer.0, ["psr", "dc6+"]);
+
+        gen9_set_dc_state(
+            &io,
+            4,
+            13,
+            false,
+            DC_STATE_DISABLE,
+            true,
+            DC_STATE_DISABLE,
+            &mut tracked,
+            &mut observer,
+        )
+        .unwrap();
+        assert_eq!(tracked, DC_STATE_DISABLE);
+        assert_eq!(observer.0, ["psr", "dc6+", "dc6-"]);
     }
 
     #[test]
