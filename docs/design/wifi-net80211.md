@@ -165,3 +165,7 @@ a matching response; the management timer remains a caller-managed effect.
 The action dispatcher recognizes BA ADDBA/DELBA and SA Query request/response
 subtypes and returns typed dispatch tags for the translated receive handlers;
 unsupported action categories remain explicit ignored events.
+
+Management subtype dispatch now selects typed beacon/probe, authentication,
+association, disconnect, action and hostap-request receive paths from frame
+control; unsupported subtype values remain visible to the caller.

@@ -15,6 +15,7 @@ mod decrypt;
 mod disconnect_rx;
 mod frame;
 mod input;
+mod mgmt_rx;
 mod node;
 mod node_caps;
 mod node_rates;
@@ -60,6 +61,7 @@ pub use input::{
     has_qos_control, has_sequence_control, header_length, parse_edca_body, parse_edca_ie,
     parse_wmm_params, parse_wmm_qos_info, qos_control,
 };
+pub use mgmt_rx::{ManagementRxError, ManagementRxKind, receive_management_kind};
 pub use node::{
     AKM_8021X, AKM_PSK, AKM_SHA256_8021X, AKM_SHA256_PSK, ASSOCFAIL_BASIC_RATE, ASSOCFAIL_BSSID,
     ASSOCFAIL_CHAN, ASSOCFAIL_CSA, ASSOCFAIL_ESSID, ASSOCFAIL_IBSS, ASSOCFAIL_PRIVACY,
