@@ -5,7 +5,11 @@
 //! Copyright (c) 2008 Alexander Motin <mav@FreeBSD.org>.
 //! SPDX-License-Identifier: BSD-2-Clause
 
-use core::{ptr, ptr::NonNull};
+use core::{
+    ptr,
+    ptr::NonNull,
+    sync::atomic::{Ordering, fence},
+};
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_base::BaseDriverOps;
@@ -219,8 +223,11 @@ impl SdhciWindow {
                 .checked_add(core::mem::size_of::<T>())
                 .is_some_and(|end| end <= self.size)
         );
+        fence(Ordering::SeqCst);
         // SAFETY: `base` is a mapped PCI BAR and register widths/alignment follow SDHCI.
-        unsafe { ptr::read_volatile(self.base.as_ptr().add(offset).cast::<T>()) }
+        let value = unsafe { ptr::read_volatile(self.base.as_ptr().add(offset).cast::<T>()) };
+        fence(Ordering::SeqCst);
+        value
     }
 
     fn write<T: Copy>(&mut self, offset: usize, value: T) {
@@ -229,8 +236,10 @@ impl SdhciWindow {
                 .checked_add(core::mem::size_of::<T>())
                 .is_some_and(|end| end <= self.size)
         );
+        fence(Ordering::SeqCst);
         // SAFETY: `base` is a mapped PCI BAR and register widths/alignment follow SDHCI.
-        unsafe { ptr::write_volatile(self.base.as_ptr().add(offset).cast::<T>(), value) }
+        unsafe { ptr::write_volatile(self.base.as_ptr().add(offset).cast::<T>(), value) };
+        fence(Ordering::SeqCst);
     }
 }
 

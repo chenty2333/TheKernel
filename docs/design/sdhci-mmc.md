@@ -46,3 +46,9 @@ Removable-card write-protect is sampled through the generic host callback, and
 MMC R1 status errors are returned as controller errors instead of being treated
 as an endless busy state. The same read-only status is carried into the user
 area and boot partition block views.
+
+The MMC layer chooses a four- or eight-bit bus from host capability, applies
+EXT_CSD BUS_WIDTH/HS_TIMING through the MMC SWITCH command, and switches eMMC
+boot/user views under a per-controller lock. R1B operations wait for DAT busy to
+clear. RPMB remains intentionally unavailable as a raw block device because its
+write protocol requires authenticated frames and key policy.

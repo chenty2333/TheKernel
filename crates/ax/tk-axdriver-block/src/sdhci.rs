@@ -645,6 +645,13 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.command(index, argument, flags, None, 0)
     }
 
+    // upstream: mmc.c mmc_switch()
+    fn mmc_switch(&mut self, index: u8, value: u8) -> Result<(), SdhciError> {
+        let argument = (3 << 24) | (u32::from(index) << 16) | (u32::from(value) << 8);
+        self.command(MMC_CMD_SWITCH, argument, SD_R1B, None, 0)?;
+        self.wait_busy()
+    }
+
     /// Issue one command and optional PIO data transfer. Multi-block requests
     /// are bounded by the 16-bit SDHCI block-count register.
     // upstream: sdhci.c sdhci_generic_request()
@@ -1046,13 +1053,18 @@ impl<I: SdhciIo> SdhciDisk<I> {
             host.command(SD_CMD_SET_BLOCKLEN, 512, SD_R1, None, 0)?;
         }
         if mmc && high_capacity {
+            let bus_width = if host.capabilities & SDHCI_CAN_DO_8BITBUS != 0 {
+                8
+            } else {
+                4
+            };
+            host.mmc_switch(183, if bus_width == 8 { 2 } else { 1 })?;
+            host.set_bus_width(bus_width);
             // EXT_CSD[185] (HS_TIMING) value 1 selects legacy MMC high speed.
             // Only use it when the card advertises a 26/52 MHz timing mode.
             let card_type = ext_csd.map_or(0, |csd| csd.card_type);
             if card_type & 0x03 != 0 {
-                let arg = (3 << 24) | (185 << 16) | (1 << 8);
-                host.command(MMC_CMD_SWITCH, arg, SD_R1B, None, 0)?;
-                host.wait_busy()?;
+                host.mmc_switch(185, 1)?;
                 let target = if card_type & 0x02 != 0 {
                     52_000_000
                 } else {
@@ -1163,10 +1175,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             return Err(SdhciError::InvalidTransfer);
         }
         let config = (metadata.partition_config & !0x07) | access;
-        let argument = (3 << 24) | (179 << 16) | (u32::from(config) << 8);
-        self.host
-            .command(MMC_CMD_SWITCH, argument, SD_R1B, None, 0)?;
-        self.host.wait_busy()?;
+        self.host.mmc_switch(179, config)?;
         self.active_partition = access;
         Ok(())
     }
@@ -1488,8 +1497,16 @@ fn map_sdhci_error(error: SdhciError) -> crate::DevError {
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::{BaseDriverOps, BlockDriverOps};
+
+    static DMA_RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn record_dma_release(_: NonNull<u8>, _: usize) {
+        DMA_RELEASES.fetch_add(1, Ordering::Relaxed);
+    }
 
     struct MockIo {
         registers: [u32; 64],
@@ -1747,6 +1764,35 @@ mod tests {
         assert_ne!(host.io_mut().transfer_mode & SDHCI_TRNS_DMA as u16, 0);
         assert_eq!(host.io_mut().dma_address, 0x1000);
         assert_eq!(&bounce[..512], &input);
+    }
+
+    #[test]
+    fn uncertain_sdma_timeout_quarantines_allocation() {
+        DMA_RELEASES.store(0, Ordering::Relaxed);
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        io.failed_command_attempts = 1;
+        let mut bounce = alloc::boxed::Box::new([0u8; 1024]);
+        let cpu = NonNull::new(bounce.as_mut_ptr()).unwrap();
+        // SAFETY: the test owns this stable allocation through the host call.
+        let dma = unsafe {
+            SdhciDmaRegion::from_raw_parts(cpu, 0x1000, 1024, 1, Some(record_dma_release))
+        };
+        let mut host = SdhciHost::new(io, (50 << SDHCI_CLOCK_BASE_SHIFT) | SDHCI_CAN_DO_DMA, 0, 3)
+            .with_dma_region(dma);
+        let mut input = [0x5a; 512];
+        assert_eq!(
+            host.command(
+                SD_CMD_WRITE_SINGLE,
+                1,
+                SD_R1 | SD_DATA,
+                Some(&mut input),
+                512,
+            ),
+            Err(SdhciError::Timeout)
+        );
+        drop(host);
+        assert_eq!(DMA_RELEASES.load(Ordering::Relaxed), 0);
     }
 
     #[test]
