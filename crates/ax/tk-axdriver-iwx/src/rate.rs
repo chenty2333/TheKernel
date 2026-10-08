@@ -126,6 +126,236 @@ pub const MCS_TO_RATE_INDEX: [usize; 16] =
 pub const TX_FLAG_COMMAND_RATE: u16 = 1 << 0;
 pub const TX_FLAG_HIGH_PRIORITY: u16 = 1 << 2;
 
+pub const TLC_CONFIG_GROUP: u8 = 0x05;
+pub const TLC_CONFIG_COMMAND: u8 = 0x0f;
+pub const TLC_MODE_NON_HT: u8 = 0;
+pub const TLC_MODE_HT: u8 = 1;
+pub const TLC_MODE_VHT: u8 = 2;
+pub const TLC_WIDTH_20: u8 = 0;
+pub const TLC_WIDTH_40: u8 = 1;
+pub const TLC_WIDTH_80: u8 = 2;
+pub const TLC_WIDTH_160: u8 = 3;
+pub const TLC_CHAIN_A: u8 = 1;
+pub const TLC_CHAIN_B: u8 = 2;
+pub const TLC_FLAG_STBC: u16 = 1;
+pub const TLC_SGI_20: u8 = 1 << TLC_WIDTH_20;
+pub const TLC_SGI_40: u8 = 1 << TLC_WIDTH_40;
+pub const TLC_SGI_80: u8 = 1 << TLC_WIDTH_80;
+pub const TLC_SGI_160: u8 = 1 << TLC_WIDTH_160;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlRateConfig<'a> {
+    pub station_id: u8,
+    pub legacy_rates: &'a [u8],
+    pub ht: bool,
+    pub vht: bool,
+    pub peer_ht_rx_mcs: u16,
+    pub local_ht_mcs: u16,
+    pub peer_vht_rx_mcs: u16,
+    pub secondary_channel_offset: u8,
+    pub vht_channel_width: u8,
+    pub mimo_enabled: bool,
+    pub tx_antenna_count: u8,
+    pub peer_ht_rx_stbc: bool,
+    pub peer_vht_rx_stbc: bool,
+    pub ht_sgi20: bool,
+    pub ht_sgi40: bool,
+    pub vht_sgi80: bool,
+    pub vht_sgi160: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlRateConfigError {
+    InvalidLegacyRate(u8),
+    InvalidVhtMcs(TxRateError),
+    UnsupportedVersion(u8),
+    Command(crate::CommandError),
+}
+impl From<crate::CommandError> for TlRateConfigError {
+    fn from(error: crate::CommandError) -> Self {
+        Self::Command(error)
+    }
+}
+
+fn tlc_rate_configuration(
+    config: TlRateConfig<'_>,
+    version: u8,
+    slot: u8,
+) -> Result<crate::EncodedCommand, TlRateConfigError> {
+    if version != 3 && version != 4 {
+        return Err(TlRateConfigError::UnsupportedVersion(version));
+    }
+    let mut bytes = alloc::vec![0u8; if version == 3 { 28 } else { 28 }];
+    bytes[0] = config.station_id;
+    let mut non_ht_rates = 0u16;
+    for rate in config.legacy_rates {
+        let idx =
+            rateset_11g_index(rate & 0x7f).ok_or(TlRateConfigError::InvalidLegacyRate(*rate))?;
+        non_ht_rates |= 1 << idx;
+    }
+    let mode = if config.vht {
+        TLC_MODE_VHT
+    } else if config.ht {
+        TLC_MODE_HT
+    } else {
+        TLC_MODE_NON_HT
+    };
+    bytes[5] = mode;
+    let max_width = if config.vht && config.vht_channel_width == 2 {
+        TLC_WIDTH_160
+    } else if config.vht && config.vht_channel_width == 1 {
+        TLC_WIDTH_80
+    } else if config.ht && matches!(config.secondary_channel_offset, 1 | 3) {
+        TLC_WIDTH_40
+    } else {
+        TLC_WIDTH_20
+    };
+    bytes[4] = max_width;
+    bytes[6] = if config.ht && config.mimo_enabled {
+        TLC_CHAIN_A | TLC_CHAIN_B
+    } else {
+        TLC_CHAIN_A
+    };
+    if version == 3 {
+        bytes[8..10].copy_from_slice(
+            &(if config.tx_antenna_count > 1
+                && ((config.vht && config.peer_vht_rx_stbc)
+                    || (config.ht && config.peer_ht_rx_stbc))
+            {
+                TLC_FLAG_STBC
+            } else {
+                0
+            })
+            .to_le_bytes(),
+        );
+        bytes[10..12].copy_from_slice(&non_ht_rates.to_le_bytes());
+    } else {
+        bytes[7] = sgi_bitmap(config);
+        bytes[8..10].copy_from_slice(
+            &(if config.tx_antenna_count > 1
+                && ((config.vht && config.peer_vht_rx_stbc)
+                    || (config.ht && config.peer_ht_rx_stbc))
+            {
+                TLC_FLAG_STBC
+            } else {
+                0
+            })
+            .to_le_bytes(),
+        );
+        bytes[10..12].copy_from_slice(&non_ht_rates.to_le_bytes());
+    }
+    if config.vht {
+        for nss in 1..=if config.mimo_enabled { 2 } else { 1 } {
+            let bitmap = rateset_vht_bitmap(
+                config.peer_vht_rx_mcs,
+                nss,
+                config.secondary_channel_offset == 1 || config.secondary_channel_offset == 3,
+            )
+            .map_err(TlRateConfigError::InvalidVhtMcs)?;
+            let nss_slot = usize::from(nss - 1);
+            put_tlc_u16(
+                &mut bytes,
+                12 + (nss_slot * if version == 3 { 2 } else { 3 }) * 2,
+                bitmap,
+            );
+            if version == 3 && config.vht_channel_width == 2 {
+                put_tlc_u16(&mut bytes, 12 + (nss_slot * 2 + 1) * 2, bitmap);
+            } else if version == 4 && config.vht_channel_width == 2 {
+                put_tlc_u16(&mut bytes, 12 + (nss_slot * 3 + 1) * 2, bitmap);
+            }
+        }
+    } else if config.ht {
+        put_tlc_u16(
+            &mut bytes,
+            12,
+            rateset_ht_bitmap(config.peer_ht_rx_mcs, config.local_ht_mcs, HtRateSet::Siso),
+        );
+        if config.mimo_enabled {
+            put_tlc_u16(
+                &mut bytes,
+                16,
+                rateset_ht_bitmap(config.peer_ht_rx_mcs, config.local_ht_mcs, HtRateSet::Mimo2),
+            );
+        }
+    }
+    let max_mpdu = if config.vht {
+        3895u16
+    } else if config.ht {
+        3839
+    } else {
+        2316
+    };
+    if version == 3 {
+        bytes[20..22].copy_from_slice(&max_mpdu.to_le_bytes());
+        bytes[22] = sgi_bitmap(config);
+    } else {
+        bytes[24..26].copy_from_slice(&max_mpdu.to_le_bytes());
+    }
+    let command = crate::HostCommand {
+        id: (u32::from(TLC_CONFIG_GROUP) << 8) | u32::from(TLC_CONFIG_COMMAND),
+        flags: crate::CMD_ASYNC,
+        response_capacity: 0,
+        parts: &[&bytes],
+    };
+    Ok(crate::EncodedCommand::encode(&command, slot, 0)?)
+}
+
+/// Build the source API-v3 TLC rate configuration command.
+// upstream: if_iwx.c iwx_rs_init_v3()
+pub fn tlc_rate_command_v3(
+    config: TlRateConfig<'_>,
+    slot: u8,
+) -> Result<crate::EncodedCommand, TlRateConfigError> {
+    tlc_rate_configuration(config, 3, slot)
+}
+
+/// Build the source API-v4 TLC rate configuration command.
+// upstream: if_iwx.c iwx_rs_init_v4()
+pub fn tlc_rate_command_v4(
+    config: TlRateConfig<'_>,
+    slot: u8,
+) -> Result<crate::EncodedCommand, TlRateConfigError> {
+    tlc_rate_configuration(config, 4, slot)
+}
+
+/// Select TLC configuration layout version 4 when explicitly advertised, else v3.
+// upstream: if_iwx.c iwx_rs_init()
+pub fn init_rate_command(
+    config: TlRateConfig<'_>,
+    command_version: u8,
+    slot: u8,
+) -> Result<crate::EncodedCommand, TlRateConfigError> {
+    if command_version == 4 {
+        tlc_rate_command_v4(config, slot)
+    } else {
+        tlc_rate_command_v3(config, slot)
+    }
+}
+
+fn sgi_bitmap(config: TlRateConfig<'_>) -> u8 {
+    (if config.ht && config.ht_sgi20 {
+        TLC_SGI_20
+    } else {
+        0
+    }) | (if config.ht && config.ht_sgi40 {
+        TLC_SGI_40
+    } else {
+        0
+    }) | (if config.vht && config.vht_sgi80 {
+        TLC_SGI_80
+    } else {
+        0
+    }) | (if config.vht && config.vht_channel_width == 2 && config.vht_sgi160 {
+        TLC_SGI_160
+    } else {
+        0
+    })
+}
+
+fn put_tlc_u16(bytes: &mut [u8], at: usize, value: u16) {
+    bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+
 /// Convert a legacy 11a rate value (in 500-kbit/s units) to firmware index.
 // upstream: if_iwx.c iwx_fw_rateidx_ofdm()
 pub fn fw_rate_index_ofdm(rate: u8) -> u32 {
@@ -395,6 +625,56 @@ mod tests {
         assert_eq!(cck, (1 << 0) | (1 << 2));
         assert_eq!(ofdm, (1 << 0) | (1 << 2) | (1 << 5) | (1 << 11));
         assert_eq!(ack_rate_masks(&peer_rates, false).0, 0);
+    }
+
+    #[test]
+    fn tlc_v3_v4_commands_encode_width_mcs_and_rate_update_version() {
+        let config = TlRateConfig {
+            station_id: 0,
+            legacy_rates: &[2, 12, 24],
+            ht: true,
+            vht: true,
+            peer_ht_rx_mcs: 0x01ff,
+            local_ht_mcs: 0x00ff,
+            peer_vht_rx_mcs: 0xfffa,
+            secondary_channel_offset: 1,
+            vht_channel_width: 2,
+            mimo_enabled: true,
+            tx_antenna_count: 2,
+            peer_ht_rx_stbc: true,
+            peer_vht_rx_stbc: false,
+            ht_sgi20: true,
+            ht_sgi40: true,
+            vht_sgi80: true,
+            vht_sgi160: true,
+        };
+        let v3 = tlc_rate_command_v3(config, 1).unwrap();
+        assert_eq!(v3.flags, crate::CMD_ASYNC);
+        assert_eq!(v3.bytes.len(), 8 + 28);
+        let p3 = &v3.bytes[8..];
+        assert_eq!(p3[4], TLC_WIDTH_160);
+        assert_eq!(p3[5], TLC_MODE_VHT);
+        assert_eq!(
+            u16::from_le_bytes(p3[8..10].try_into().unwrap()),
+            TLC_FLAG_STBC
+        );
+        assert_eq!(
+            u16::from_le_bytes(p3[10..12].try_into().unwrap()),
+            (1 << 0) | (1 << 4) | (1 << 6)
+        );
+        assert_eq!(u16::from_le_bytes(p3[12..14].try_into().unwrap()), 0x03ff);
+        assert_eq!(u16::from_le_bytes(p3[14..16].try_into().unwrap()), 0x03ff);
+        assert_eq!(u16::from_le_bytes(p3[16..18].try_into().unwrap()), 0x03ff);
+        assert_eq!(u16::from_le_bytes(p3[20..22].try_into().unwrap()), 3895);
+        assert_eq!(p3[22], TLC_SGI_20 | TLC_SGI_40 | TLC_SGI_80 | TLC_SGI_160);
+
+        let v4 = tlc_rate_command_v4(config, 1).unwrap();
+        assert_eq!(v4.bytes.len(), 8 + 28);
+        let p4 = &v4.bytes[8..];
+        assert_eq!(p4[7], TLC_SGI_20 | TLC_SGI_40 | TLC_SGI_80 | TLC_SGI_160);
+        assert_eq!(u16::from_le_bytes(p4[18..20].try_into().unwrap()), 0x03ff);
+        assert_eq!(u16::from_le_bytes(p4[24..26].try_into().unwrap()), 3895);
+        assert_eq!(init_rate_command(config, 99, 1).unwrap().bytes, v3.bytes);
     }
 
     #[test]

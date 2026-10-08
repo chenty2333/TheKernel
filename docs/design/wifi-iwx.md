@@ -44,3 +44,8 @@ no-op path.
 `iwx_initiate_scan()` selects the v17 UMAC request only when firmware
 advertises version 17; otherwise it uses the v14 structure, preserving the
 driver's fallback policy.
+
+The station TLC rate command now serializes v3/v4 wire layouts separately,
+including legacy basic-rate indexing, HT/VHT MCS maps, width, antenna chains,
+STBC and short-guard-interval capabilities. The surrounding 802.11 peer
+capability discovery remains a net80211 input.
