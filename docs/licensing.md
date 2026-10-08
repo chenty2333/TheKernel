@@ -643,3 +643,8 @@ Copyright 2006 Dave Airlie and © 2006-2009 Intel); `LICENSE-MIT` is included.
 `tk-intel-display/src/hdmi.rs` additionally includes GCP phase selection and the
 HSW GCP/AVI/SPD/vendor/DRM set-infoframes sequence from `intel_hdmi.c` (MIT,
 Copyright 2006 Dave Airlie and © 2006-2009 Intel).
+
+`kernel/src/drm/intel/combo_phy_full.rs` contains the source-shaped display-12/13
+combo PHY init, verification, uninit and lane-power functions from
+`intel_combo_phy.c` (MIT, Copyright © 2018 Intel). The grant is covered by the
+included `LICENSE-MIT`.

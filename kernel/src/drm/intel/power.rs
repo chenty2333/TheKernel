@@ -85,6 +85,9 @@ use intel_display::{
 
 use super::{
     clk,
+    combo_phy_full::{
+        self, ComboPhyDisplay, ComboPhyInstance, ComboPhyPlatform, DiagnosticLevel, VbtPortPresence,
+    },
     phy::{self, PhyState},
     regs::{self, Register, Registers},
 };
@@ -1598,7 +1601,52 @@ fn bring_up_inner(
     // PW_1, which is the order `icl_display_core_init` uses.
     let phys = match preserved {
         Some(phys) => phys,
-        None => phy::init_all(regs)?,
+        None => {
+            // Source-order combo PHY initialization. The `phy::init_all`
+            // verification pass below retains the existing boot report, while
+            // the source-function translation owns the init/uninit decisions.
+            let instances: Vec<_> = regs::COMBO_PHYS
+                .iter()
+                .copied()
+                .map(|registers| ComboPhyInstance {
+                    phy: registers.port.as_bytes().first().copied().unwrap_or(b'A') - b'A',
+                    registers,
+                })
+                .collect();
+            let display = ComboPhyDisplay {
+                platform: ComboPhyPlatform {
+                    display_version: 13,
+                    ..ComboPhyPlatform::default()
+                },
+                vbt_ports: VbtPortPresence::default(),
+                phys: &instances,
+            };
+            let mut diagnostics = Vec::new();
+            combo_phy_full::intel_combo_phy_init(regs, &display, &mut diagnostics).map_err(
+                |error| match error {
+                    combo_phy_full::ComboPhyIoError::Read(register) => PowerError::Unreadable {
+                        register: register.name(),
+                    },
+                    combo_phy_full::ComboPhyIoError::Write(register) => PowerError::WriteRefused {
+                        register: register.name(),
+                    },
+                },
+            )?;
+            for diagnostic in diagnostics {
+                match diagnostic.level {
+                    DiagnosticLevel::Debug => {
+                        axlog::debug!("intel-combo-phy: {}", diagnostic.message)
+                    }
+                    DiagnosticLevel::Warning | DiagnosticLevel::MissingCase => {
+                        axlog::warn!("intel-combo-phy: {}", diagnostic.message)
+                    }
+                    DiagnosticLevel::Error => {
+                        axlog::error!("intel-combo-phy: {}", diagnostic.message)
+                    }
+                }
+            }
+            phy::init_all(regs)?
+        }
     };
 
     // Phase 1.3.

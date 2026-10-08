@@ -21,7 +21,8 @@ there.
 |---|---|
 | `kernel/src/drm/intel/power.rs` | `bring_up`, the well handshake, DC states, DBUF slices, the platform workarounds, and the bring-up log |
 | `kernel/src/drm/intel/clk.rs` | `SKL_DSSM` reference decode, the ADL-N CDCLK ratio table, the CD2X divider and decimal arithmetic, the CDCLK PLL, `PCH_RAWCLK_FREQ` |
-| `kernel/src/drm/intel/phy.rs` | combo PHY initialisation, the process/voltage reference table, the verification pass |
+| `kernel/src/drm/intel/combo_phy_full.rs` | source-shaped `intel_combo_phy.c` initialization/uninitialization, VBT mux policy and lane power-up |
+| `kernel/src/drm/intel/phy.rs` | N305 process/voltage report and post-init verification readout |
 | `kernel/src/drm/intel/regs.rs` | the registers themselves, the `Registers` trait, the bounded poll, and the host mock |
 
 `power::bring_up` is the single entry point.  It is **not wired into the boot
@@ -41,7 +42,7 @@ names the function that performs it and the register it touches.
 |---|---|---|---|
 | 0.3 | fuse and strap readback | `power::read_fuses` | `SKL_DFSM` `0x51000`, `SFUSE_STRAP` `0xC2014`, `SKL_DSSM` `0x51004`, `SKL_FUSE_STATUS` `0x42000` |
 | 1.1 | DC states off | `power::disable_dc_states` | `DC_STATE_EN` `0x45504` |
-| 1.2 | combo PHY init, PHY A first | `phy::init_all` | PHY A `0x162000`, PHY B `0x06C000`, `ICL_PHY_MISC` `0x64C00`/`0x64C04` |
+| 1.2 | combo PHY init, PHY A first | `combo_phy_full::intel_combo_phy_init`, then `phy::init_all` verification/report | PHY A `0x162000`, PHY B `0x06C000`, `ICL_PHY_MISC` `0x64C00`/`0x64C04` |
 | 1.3 | `PW_1` | `power::enable_well(PW_1)` | `GEN8_CHICKEN_DCPR_1` `0x46430`, `HSW_PWR_WELL_CTL2` `0x45404`, `SKL_FUSE_STATUS` |
 | 1.2b | PHY `COMP_INIT` re-read | `power::bring_up` | `PORT_COMP_DW0(A/B)` |
 | 1.4 | CDCLK | `clk::bring_up` | `SKL_DSSM`, `CDCLK_PLL_ENABLE` `0x46070`, `CDCLK_CTL` `0x46000` |

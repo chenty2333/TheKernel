@@ -83,7 +83,9 @@
 
 mod audio;
 mod clk;
+mod combo_phy_full;
 mod connect;
+mod ddi;
 pub(crate) mod debugfs;
 mod dma;
 mod dmc;
@@ -102,7 +104,6 @@ mod i915_port;
 mod id;
 mod irq;
 mod modeset;
-mod ddi;
 mod output;
 mod pattern;
 mod pci;

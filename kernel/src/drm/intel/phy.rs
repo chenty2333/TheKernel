@@ -239,7 +239,8 @@ pub(crate) struct PhyState {
     pub(crate) procmon: &'static ProcmonRow,
     /// Whether this PHY is the compensation source for the others.
     pub(crate) comp_source: bool,
-    /// Whether the PHY was already initialised and was therefore left alone.
+    /// Whether the PHY was already initialised at the entry to this report pass
+    /// (by firmware or by the preceding translated core-init sequence).
     pub(crate) already_initialised: bool,
     /// The verification checks when the PHY claimed to be initialised, or the
     /// single `COMP_INIT` check when it did not.  Empty only if the PHY was not
@@ -279,7 +280,7 @@ impl PhyState {
             },
         );
         if self.already_initialised {
-            text.push_str("; already initialised by firmware, left alone");
+            text.push_str("; already initialised before this report pass, left alone");
         } else {
             text.push_str(&format!("; initialised ({} register writes)", self.writes));
         }
