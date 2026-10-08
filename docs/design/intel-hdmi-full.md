@@ -11,13 +11,14 @@ narrow traits. Omitted definitions are `intel_hdmi_add_properties`,
 `intel_infoframe_init`, which are generic DRM connector/property/modes or
 registration wrappers. The full MIT grant is preserved in the module and
 `LICENSE-MIT`. The module is exported and compiles with the crate. The native
-ADL-N TC modeset now calls the translated `intel_hdmi_compute_clock()` before
-its first destructive write, using the implemented RGB/8-bpc/no-scrambling
-limits to reject rates outside 25–300 MHz and the lowest nonzero HDMI VSDB
-TMDS limit from CTA EDID. Missing max-clock fields remain unknown rather than
-being inferred. The same helper now hides the optional 1080p60 KMS mode when
-the sink's advertised TMDS limit is too low; the active firmware mode remains
-published so boot state is not silently changed. This is a narrow admission
-hook, not a complete HDMI backend: the infoframe,
+The generic combo-DDI mode preflight and the ADL-N TC modeset call the
+translated `intel_hdmi_compute_clock()` before any destructive output write,
+using the implemented RGB/8-bpc/no-scrambling limits to reject rates outside
+25–300 MHz and the lowest nonzero HDMI VSDB TMDS limit from CTA EDID. Missing
+max-clock fields remain unknown rather than being inferred. The same helper
+now hides the optional 1080p60 KMS mode when the sink's advertised TMDS limit
+is too low; the active firmware mode remains published so boot state is not
+silently changed. This is a narrow admission hook, not a complete HDMI backend:
+the infoframe,
 SCDC, HDCP, FRL, connector, and DSC pipelines are still not live in the kernel
 path.
