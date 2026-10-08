@@ -33,6 +33,7 @@ pub const ACTION_REGISTER_CONTEXT: u32 = 0x4502;
 pub const ACTION_DEREGISTER_CONTEXT: u32 = 0x4503;
 pub const CONTEXT_ENABLE: u32 = 1;
 pub const CONTEXT_DISABLE: u32 = 0;
+pub const G2H_LEN_DW_SCHED_CONTEXT_MODE_SET: u8 = 2;
 pub const CONTEXT_POLICY_KLV_EXECUTION_QUANTUM: u16 = 0x2001;
 pub const CONTEXT_POLICY_KLV_PREEMPTION_TIMEOUT: u16 = 0x2002;
 pub const CONTEXT_POLICY_KLV_SCHEDULING_PRIORITY: u16 = 0x2003;
@@ -323,6 +324,100 @@ impl ContextSchedState {
         }
         self.0 -= SCHED_STATE_BLOCKED;
         Ok(self.blocked())
+    }
+
+    /// upstream: intel_guc_submission.c __guc_add_request() scheduling choice.
+    pub fn prepare_request(
+        &mut self,
+        context_id: u32,
+        is_parent: bool,
+    ) -> Result<SchedPlan, Error> {
+        if context_id == GUC_INVALID_CONTEXT_ID {
+            return Err(Error::Refused);
+        }
+        let mut plan = SchedPlan::default();
+        if self.blocked() != 0 && !is_parent {
+            return Ok(plan);
+        }
+        let already_enabled = self.enabled() || self.blocked() != 0;
+        if already_enabled {
+            plan.push(SchedAction::new(
+                [ACTION_SCHED_CONTEXT, context_id, 0],
+                2,
+                0,
+            ))?;
+        } else {
+            self.set_pending_enable();
+            plan.push(SchedAction::new(
+                [ACTION_SCHED_CONTEXT_MODE_SET, context_id, CONTEXT_ENABLE],
+                3,
+                G2H_LEN_DW_SCHED_CONTEXT_MODE_SET,
+            ))?;
+            if is_parent {
+                plan.push(SchedAction::new(
+                    [ACTION_SCHED_CONTEXT, context_id, 0],
+                    2,
+                    0,
+                ))?;
+            }
+        }
+        Ok(plan)
+    }
+
+    /// upstream: intel_guc_submission.c __guc_add_request() send completion.
+    pub fn request_send_result(&mut self, plan: SchedPlan, first_action_succeeded: bool) {
+        if plan.count != 0 && plan.actions[0].words[0] == ACTION_SCHED_CONTEXT_MODE_SET {
+            if first_action_succeeded {
+                self.set_enabled();
+            } else {
+                self.clear_pending_enable();
+            }
+        }
+    }
+
+    /// upstream: intel_guc_submission.c sched-context-mode completion event.
+    pub fn sched_mode_done(&mut self, enabled: bool) {
+        if enabled {
+            self.clear_pending_enable();
+        } else {
+            self.clear_pending_disable();
+            self.clear_enabled();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SchedAction {
+    pub words: [u32; 3],
+    pub len: u8,
+    pub expected_response_dwords: u8,
+}
+
+impl SchedAction {
+    const fn new(words: [u32; 3], len: u8, expected_response_dwords: u8) -> Self {
+        Self {
+            words,
+            len,
+            expected_response_dwords,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SchedPlan {
+    pub actions: [SchedAction; 2],
+    pub count: u8,
+}
+
+impl SchedPlan {
+    fn push(&mut self, action: SchedAction) -> Result<(), Error> {
+        let slot = self
+            .actions
+            .get_mut(usize::from(self.count))
+            .ok_or(Error::Refused)?;
+        *slot = action;
+        self.count += 1;
+        Ok(())
     }
 }
 
@@ -811,6 +906,42 @@ mod tests {
             (u32::from(CONTEXT_POLICY_KLV_PREEMPT_TO_IDLE) << 16) | 1
         );
         assert_eq!(words[words.len() - 1], 1);
+    }
+
+    #[test]
+    fn request_path_enables_then_schedules_context_and_respects_blocking() {
+        let mut state = ContextSchedState::default();
+        let plan = state.prepare_request(9, false).unwrap();
+        assert_eq!(plan.count, 1);
+        assert_eq!(
+            plan.actions[0].words,
+            [ACTION_SCHED_CONTEXT_MODE_SET, 9, CONTEXT_ENABLE]
+        );
+        assert_eq!(
+            plan.actions[0].expected_response_dwords,
+            G2H_LEN_DW_SCHED_CONTEXT_MODE_SET
+        );
+        assert!(state.pending_enable());
+        state.request_send_result(plan, true);
+        assert!(state.enabled());
+        assert!(state.pending_enable());
+        state.sched_mode_done(true);
+        assert!(!state.pending_enable());
+
+        state.increment_blocked().unwrap();
+        assert_eq!(state.prepare_request(9, false).unwrap().count, 0);
+        let parent = state.prepare_request(9, true).unwrap();
+        assert_eq!(parent.count, 1);
+        assert_eq!(parent.actions[0].words[0], ACTION_SCHED_CONTEXT);
+
+        let mut new_parent_state = ContextSchedState::default();
+        let new_parent = new_parent_state.prepare_request(10, true).unwrap();
+        assert_eq!(new_parent.count, 2);
+        assert_eq!(
+            new_parent.actions[0].words[0],
+            ACTION_SCHED_CONTEXT_MODE_SET
+        );
+        assert_eq!(new_parent.actions[1].words, [ACTION_SCHED_CONTEXT, 10, 0]);
     }
 
     #[test]
