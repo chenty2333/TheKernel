@@ -27,6 +27,7 @@ const MGMT_SETTING_BONDABLE: u32 = 1 << 4;
 const MGMT_SETTING_SSP: u32 = 1 << 6;
 const MGMT_SETTING_LE: u32 = 1 << 9;
 const MGMT_SETTING_BREDR: u32 = 1 << 7;
+const MGMT_SETTING_PRIVACY: u32 = 1 << 13;
 static FIRMWARE_CALLBACK_REGISTERED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -44,6 +45,8 @@ pub struct UsbBluetoothHci {
     recently_disconnected: VecDeque<(u16, [u8; 6], u8)>,
     pending_pairing: Vec<([u8; 6], u8, u8)>,
     io_capability: u8,
+    privacy_enabled: bool,
+    local_irk: [u8; 16],
     management_events: VecDeque<Vec<u8>>,
     receive_readiness: Arc<PollSet<32>>,
 }
@@ -226,6 +229,8 @@ impl UsbBluetoothHci {
             recently_disconnected: VecDeque::new(),
             pending_pairing: Vec::new(),
             io_capability: 3,
+            privacy_enabled: false,
+            local_irk: [0; 16],
             management_events: VecDeque::new(),
             receive_readiness: Arc::new(PollSet::new()),
         })
@@ -314,7 +319,57 @@ impl UsbBluetoothHci {
         if self.family_hint != tk_bt_hci::DeviceFamily::Unknown {
             self.management_settings |= MGMT_SETTING_BREDR | MGMT_SETTING_LE;
         }
+        if self.privacy_enabled {
+            self.sync_resolving_list()?;
+        }
         Ok(())
+    }
+    pub fn management_set_privacy(
+        &mut self,
+        enabled: bool,
+        local_irk: [u8; 16],
+    ) -> Result<u32, Error> {
+        let previous_enabled = self.privacy_enabled;
+        let previous_irk = self.local_irk;
+        self.privacy_enabled = enabled;
+        self.local_irk = local_irk;
+        if self.adapter.is_up() {
+            if let Err(error) = self.sync_resolving_list() {
+                self.privacy_enabled = previous_enabled;
+                self.local_irk = previous_irk;
+                return Err(error);
+            }
+        }
+        if enabled {
+            self.management_settings |= MGMT_SETTING_PRIVACY;
+        } else {
+            self.management_settings &= !MGMT_SETTING_PRIVACY;
+        }
+        Ok(self.management_settings)
+    }
+    fn sync_resolving_list(&mut self) -> Result<(), Error> {
+        if !self.adapter.is_up() {
+            return Err(Error::NotUp);
+        }
+        if !self.privacy_enabled {
+            return self.command_complete(0x202d, &[0]);
+        }
+        self.command_complete(0x2029, &[])?; // LE Clear Resolving List
+        for index in 0..self.irks.len() {
+            let record = self.irks[index];
+            let address_type = match record[6] {
+                1 => 0, // Public identity address
+                2 => 1, // Random identity address
+                _ => continue,
+            };
+            let mut parameters = [0u8; 39];
+            parameters[0] = address_type;
+            parameters[1..7].copy_from_slice(&record[..6]);
+            parameters[7..23].copy_from_slice(&record[7..23]);
+            parameters[23..39].copy_from_slice(&self.local_irk);
+            self.command_complete(0x2027, &parameters)?; // LE Add Device To Resolving List
+        }
+        self.command_complete(0x202d, &[1]) // LE Set Address Resolution Enable
     }
     pub fn management_settings(&self) -> u32 {
         self.management_settings
@@ -376,6 +431,9 @@ impl UsbBluetoothHci {
                 }
             }
             _ => return Err(Error::Unsupported),
+        }
+        if opcode == 0x0030 && self.adapter.is_up() && self.privacy_enabled {
+            self.sync_resolving_list()?;
         }
         Ok(())
     }

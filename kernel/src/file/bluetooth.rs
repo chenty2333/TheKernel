@@ -215,15 +215,15 @@ mod tests {
     #[test]
     fn management_commands_advertise_only_supported_operations() {
         let commands = management_response(&[2, 0, 0xff, 0xff, 0, 0]).unwrap();
-        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 21);
+        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 22);
         assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 9);
-        assert_eq!(commands.len(), 9 + 4 + 2 * 30);
+        assert_eq!(commands.len(), 9 + 4 + 2 * 31);
         assert_eq!(
-            &commands[13..73],
+            &commands[13..75],
             &[
                 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 18, 0, 19, 0, 20, 0, 22, 0, 23,
-                0, 24, 0, 25, 0, 28, 0, 29, 0, 35, 0, 36, 0, 42, 0, 48, 0, 6, 0, 9, 0, 0x0b, 0,
-                0x0c, 0, 0x0e, 0, 0x0f, 0, 0x11, 0, 0x12, 0, 0x13, 0,
+                0, 24, 0, 25, 0, 28, 0, 29, 0, 35, 0, 36, 0, 42, 0, 47, 0, 48, 0, 6, 0, 9, 0, 0x0b,
+                0, 0x0c, 0, 0x0e, 0, 0x0f, 0, 0x11, 0, 0x12, 0, 0x13, 0,
             ]
         );
     }
@@ -344,6 +344,11 @@ mod tests {
         pin_reply[4] = 24;
         pin_reply[13] = 1;
         assert_eq!(management_response(&pin_reply).unwrap()[8], 0x11);
+        let mut privacy = [0u8; 23];
+        privacy[0] = 0x2f;
+        privacy[4] = 17;
+        privacy[6] = 1;
+        assert_eq!(management_response(&privacy).unwrap()[8], 0x11);
 
         let invalid_connectable = management_response(&[7, 0, 0, 0, 1, 0, 2]).unwrap();
         assert_eq!(invalid_connectable[8], 0x0d);
@@ -1054,6 +1059,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const PAIR_DEVICE: u16 = 0x19;
     const DISCONNECT: u16 = 0x14;
     const SET_BREDR: u16 = 0x2a;
+    const SET_PRIVACY: u16 = 0x2f;
     const START_DISCOVERY: u16 = 0x23;
     const STOP_DISCOVERY: u16 = 0x24;
     const UNKNOWN_COMMAND: u8 = 1;
@@ -1061,7 +1067,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const INVALID_PARAMS: u8 = 0x0d;
     const INVALID_INDEX: u8 = 0x11;
     const SUPPORTED_SETTINGS: u32 =
-        (1 << 0) | (1 << 1) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 9);
+        (1 << 0) | (1 << 1) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 9) | (1 << 13);
     if request.len() < 6 {
         return Err(AxError::InvalidInput);
     }
@@ -1101,6 +1107,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 START_DISCOVERY,
                 STOP_DISCOVERY,
                 SET_BREDR,
+                SET_PRIVACY,
                 LOAD_IRKS,
             ];
             let events = [6u16, 0x09, 0x0b, 0x0c, 0x0e, 0x0f, 0x11, 0x12, 0x13];
@@ -1173,6 +1180,9 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
         SET_IO_CAPABILITY if parameters.len() == 1 && parameters[0] <= 4 => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
+        SET_PRIVACY if parameters.len() == 17 && parameters[0] <= 1 => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
         SET_CONNECTABLE | SET_BONDABLE | SET_SSP | SET_LE | SET_BREDR
             if parameters.len() == 1 && parameters[0] <= 1 =>
         {
@@ -1224,6 +1234,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 | SET_LE
                 | SET_IO_CAPABILITY
                 | SET_BREDR
+                | SET_PRIVACY
                 | LOAD_LINK_KEYS
                 | LOAD_LONG_TERM_KEYS
                 | LOAD_IRKS
@@ -1276,6 +1287,7 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
     const PAIR_DEVICE: u16 = 0x19;
     const DISCONNECT: u16 = 0x14;
     const SET_BREDR: u16 = 0x2a;
+    const SET_PRIVACY: u16 = 0x2f;
     const START_DISCOVERY: u16 = 0x23;
     const STOP_DISCOVERY: u16 = 0x24;
     const MGMT_SETTING_CONNECTABLE: u32 = 1 << 1;
@@ -1382,6 +1394,40 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
             management_command_complete(index, opcode, status, &[])?,
             None,
         )));
+    }
+    if opcode == SET_PRIVACY && parameters.len() == 17 && parameters[0] <= 1 {
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let mut local_irk = [0; 16];
+        local_irk.copy_from_slice(&parameters[1..17]);
+        let (status, settings) = {
+            let mut adapter = adapter.lock();
+            let previous = adapter.management_settings();
+            match adapter.management_set_privacy(parameters[0] != 0, local_irk) {
+                Ok(settings) => (0, Some((previous, settings))),
+                Err(axdriver::BluetoothError::NotUp) => (0x0f, None),
+                Err(axdriver::BluetoothError::Unsupported) => (NOT_SUPPORTED, None),
+                Err(axdriver::BluetoothError::NoDevice) => (INVALID_INDEX, None),
+                Err(_) => (FAILED, None),
+            }
+        };
+        let mut data = Vec::new();
+        if let Some((_, settings)) = settings {
+            data.extend_from_slice(&settings.to_le_bytes());
+        }
+        let response = management_command_complete(index, opcode, status, &data)?;
+        let event = if status == 0 {
+            settings_event(
+                index,
+                settings
+                    .filter(|(previous, current)| previous != current)
+                    .map(|(_, current)| current),
+            )?
+        } else {
+            None
+        };
+        return Ok(Some((response, event)));
     }
     if opcode == USER_CONFIRM_REPLY || opcode == USER_CONFIRM_NEG_REPLY {
         if parameters.len() != 7 || parameters[6] > 2 {
