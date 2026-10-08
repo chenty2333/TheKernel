@@ -5,6 +5,7 @@ pub mod chip82540;
 pub mod chip82541;
 pub mod chip82542;
 pub mod chip82543;
+pub mod chip82571;
 pub mod mac;
 pub mod manage;
 pub mod nic;
