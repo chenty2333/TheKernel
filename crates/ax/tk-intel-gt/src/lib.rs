@@ -18,6 +18,7 @@ pub mod guc_log;
 pub mod guc_submission;
 pub mod huc;
 pub mod info;
+pub mod intel_ring;
 pub mod lrc;
 pub mod ppgtt;
 pub mod rcs;
