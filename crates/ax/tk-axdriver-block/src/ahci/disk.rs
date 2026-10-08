@@ -31,8 +31,8 @@ use super::{
 use crate::{
     BlockAsyncOp, BlockCapabilities, BlockCompletion, BlockCompletionDrain,
     BlockCompletionNotifier, BlockCompletionOwner, BlockCompletionStatus, BlockDriverOps,
-    BlockPhysicalSegment, BlockPhysicalSgOutcome, BlockQueueCaps, BlockQueueRequest, BlockRange,
-    BlockRequestHandle, BlockSegmentDirection, BlockSubmitReport,
+    BlockPhysicalRequest, BlockPhysicalSegment, BlockPhysicalSgOutcome, BlockQueueCaps,
+    BlockQueueRequest, BlockRange, BlockRequestHandle, BlockSegmentDirection, BlockSubmitReport,
 };
 
 const COMMAND_LIST_BYTES: usize = 32 * AHCI_MAX_SLOTS;
@@ -693,6 +693,10 @@ impl<I: AhciIo> AhciDisk<I> {
             return Err(AhciDiskError::RequestPending);
         }
         self.publish_command(ncq);
+        self.execute_published(ncq)
+    }
+
+    fn execute_published(&mut self, ncq: bool) -> Result<(), AhciDiskError> {
         for _ in 0..COMMAND_TIMEOUT_POLLS {
             let observed = self.controller.io_mut().interrupt_generation();
             if let Some(result) = self.sample_command(ncq) {
@@ -1012,6 +1016,87 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         segments: &[BlockPhysicalSegment],
     ) -> DevResult<BlockPhysicalSgOutcome> {
         self.transfer_physical_sg(block_id, segments, true)
+    }
+
+    // upstream: ahci.c ahci_begin_transaction() physical descriptor publication
+    unsafe fn submit_physical_batch(
+        &mut self,
+        requests: &mut [BlockPhysicalRequest<'_>],
+    ) -> DevResult<BlockSubmitReport> {
+        if requests.is_empty() {
+            return Ok(BlockSubmitReport::default());
+        }
+        if !matches!(self.async_state, AsyncState::Idle) {
+            return Ok(BlockSubmitReport {
+                submitted: 0,
+                bytes: 0,
+                queue_full: true,
+            });
+        }
+        self.ensure_connected().map_err(map_error)?;
+        let request = &mut requests[0];
+        if request.op == BlockAsyncOp::Flush
+            || request.segments.is_empty()
+            || request.segments.len() > crate::MAX_PHYSICAL_COALESCED_SG
+        {
+            return Err(DevError::InvalidParam);
+        }
+        let bytes = request
+            .segments
+            .iter()
+            .try_fold(0usize, |sum, segment| sum.checked_add(segment.len))
+            .ok_or(DevError::InvalidParam)?;
+        if bytes == 0 || !bytes.is_multiple_of(self.geometry.block_size) {
+            return Err(DevError::InvalidParam);
+        }
+        let blocks = (bytes / self.geometry.block_size) as u64;
+        if request
+            .block_id
+            .checked_add(blocks)
+            .is_none_or(|end| end > self.geometry.blocks)
+        {
+            return Err(DevError::InvalidParam);
+        }
+        let sectors = u16::try_from(blocks).map_err(|_| DevError::InvalidParam)?;
+        let write = request.op == BlockAsyncOp::Write;
+        let ata = self.data_request(request.block_id, sectors, write);
+        let ncq = match self.build_physical_sg_command(ata, request.segments) {
+            Ok(ncq) => ncq,
+            Err(AhciDiskError::UnsupportedAddressWidth) => {
+                return Err(DevError::Unsupported);
+            }
+            Err(error) => return Err(map_error(error)),
+        };
+        let raw = self.next_async_handle.max(1);
+        self.next_async_handle = raw.wrapping_add(1).max(1);
+        let handle = BlockRequestHandle { raw };
+        let cookie = raw;
+        request.handle = Some(handle);
+        request.cookie = Some(cookie);
+        // Physical requests complete in this bounded one-slot transaction; the
+        // typed completion still returns through the common owner/cookie route.
+        self.publish_command(ncq);
+        let result = self.execute_published(ncq);
+        let (status, completed_bytes) = match result {
+            Ok(()) => (BlockCompletionStatus::Success, bytes as u32),
+            Err(AhciDiskError::DmaMayStillBeActive) => (BlockCompletionStatus::Quarantined, 0),
+            Err(AhciDiskError::DeviceError(status)) => {
+                (BlockCompletionStatus::DeviceError(status as u8), 0)
+            }
+            Err(_) => (BlockCompletionStatus::DeviceError(0xff), 0),
+        };
+        self.async_state = AsyncState::Complete(BlockCompletion {
+            handle,
+            owner: BlockCompletionOwner::Physical,
+            cookie,
+            status,
+            bytes: completed_bytes,
+        });
+        Ok(BlockSubmitReport {
+            submitted: 1,
+            bytes,
+            queue_full: requests.len() > 1,
+        })
     }
 
     fn async_queue_caps(&self) -> Option<BlockQueueCaps> {
@@ -1561,6 +1646,52 @@ mod tests {
     }
 
     #[test]
+    fn physical_batch_returns_typed_completion_after_prd_submission() {
+        with_fake_disk(|disk, _| {
+            disk.controller.io_mut().auto_complete = true;
+            let segments = [
+                BlockPhysicalSegment {
+                    paddr: 0x8000,
+                    len: 512,
+                },
+                BlockPhysicalSegment {
+                    paddr: 0x9000,
+                    len: 512,
+                },
+            ];
+            let mut requests = [BlockPhysicalRequest {
+                block_id: 2,
+                op: BlockAsyncOp::Read,
+                segments: &segments,
+                handle: None,
+                cookie: None,
+            }];
+            // SAFETY: the test's fixed physical addresses are used only by the
+            // auto-completing fake HBA and are never dereferenced.
+            let report = unsafe { disk.submit_physical_batch(&mut requests).unwrap() };
+            assert_eq!(report.submitted, 1);
+            assert_eq!(report.bytes, 1024);
+            assert!(requests[0].handle.is_some());
+            assert_eq!(
+                requests[0].cookie,
+                requests[0].handle.map(|handle| handle.raw)
+            );
+            let mut completion = [BlockCompletion {
+                handle: BlockRequestHandle::default(),
+                owner: BlockCompletionOwner::Ordinary,
+                cookie: 0,
+                status: BlockCompletionStatus::Success,
+                bytes: 0,
+            }];
+            let drain = disk.drain_async_completions(&mut completion).unwrap();
+            assert_eq!(drain.completed, 1);
+            assert_eq!(completion[0].owner, BlockCompletionOwner::Physical);
+            assert_eq!(completion[0].status, BlockCompletionStatus::Success);
+            assert_eq!(completion[0].bytes, 1024);
+        });
+    }
+
+    #[test]
     fn identify_digest_changes_with_serial_model_or_capacity() {
         let first = [0u8; 512];
         let mut second = first;
@@ -1606,6 +1737,7 @@ mod tests {
         registers: [u32; 128],
         writes: [(usize, u32); 32],
         write_count: usize,
+        auto_complete: bool,
     }
 
     impl Default for FakeIo {
@@ -1614,6 +1746,7 @@ mod tests {
                 registers: [0; 128],
                 writes: [(0, 0); 32],
                 write_count: 0,
+                auto_complete: false,
             }
         }
     }
@@ -1629,6 +1762,8 @@ mod tests {
             if offset == AHCI_OFFSET + super::super::regs::AHCI_P_IS
                 || offset == AHCI_OFFSET + super::super::regs::AHCI_P_SERR
             {
+                self.registers[offset / 4] = 0;
+            } else if offset == AHCI_OFFSET + AHCI_P_CI && self.auto_complete {
                 self.registers[offset / 4] = 0;
             } else {
                 self.registers[offset / 4] = value;
