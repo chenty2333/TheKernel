@@ -1099,7 +1099,9 @@ impl<I: SdhciIo> SdhciHost<I> {
 
     // upstream: sdhci.c sdhci_generic_set_uhs_timing() (legacy high-speed subset)
     fn set_high_speed(&mut self, clock_hz: u32) -> Result<(), SdhciError> {
-        if self.quirks & SDHCI_QUIRK_BROKEN_TIMINGS != 0 {
+        if self.quirks & SDHCI_QUIRK_BROKEN_TIMINGS != 0
+            || self.capabilities & SDHCI_CAN_DO_HISPD == 0
+        {
             return Err(SdhciError::UnsupportedClock);
         }
         let mut control = self.io.read8(SDHCI_HOST_CONTROL as usize);
@@ -1438,7 +1440,8 @@ impl<I: SdhciIo> SdhciHost<I> {
     fn set_mmc_timing(&mut self, timing: MmcBusTiming, target_hz: u32) -> Result<(), SdhciError> {
         let hs_timing = match timing {
             MmcBusTiming::Normal => 0,
-            MmcBusTiming::HighSpeed => 1,
+            MmcBusTiming::HighSpeed if self.capabilities & SDHCI_CAN_DO_HISPD != 0 => 1,
+            MmcBusTiming::HighSpeed => return Err(SdhciError::UnsupportedClock),
             // HS200/HS400 require VCCQ switching, width sequencing and
             // tuning; do not advertise or enter them through the legacy path.
             _ => return Err(SdhciError::UnsupportedClock),
@@ -3105,6 +3108,11 @@ mod tests {
             host.set_mmc_timing(MmcBusTiming::MmcHs200, 200_000_000),
             Err(SdhciError::UnsupportedClock)
         );
+        assert_eq!(
+            host.set_mmc_timing(MmcBusTiming::HighSpeed, 52_000_000),
+            Err(SdhciError::UnsupportedClock)
+        );
+        assert_eq!(host.io_mut().command_attempts, 0);
         assert_eq!(
             host.switch_vccq(MmcVccq::V120),
             Err(SdhciError::UnsupportedClock)
