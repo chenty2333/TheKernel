@@ -33,6 +33,7 @@ const HXG_TYPE_RESPONSE_SUCCESS: u32 = 7 << 28;
 const HXG_TYPE_NO_RESPONSE_BUSY: u32 = 3 << 28;
 const HXG_TYPE_NO_RESPONSE_RETRY: u32 = 5 << 28;
 const HXG_TYPE_RESPONSE_FAILURE: u32 = 6 << 28;
+const ACTION_AUTHENTICATE_HUC: u32 = 0x4000;
 const UOS_RSA_SCRATCH: u32 = 0xc200;
 const UOS_RSA_SCRATCH_COUNT: usize = 64;
 
@@ -222,6 +223,12 @@ pub fn send_mmio(io: &impl GtIo, request: &[u32]) -> Result<u32, Error> {
             _ => return Err(Error::Unavailable(GEN11_GUC_SEND_BASE)),
         }
     }
+}
+
+// upstream: intel_guc.c intel_guc_auth_huc()
+/// Ask the running GuC to authenticate HuC firmware's RSA data in GGTT.
+pub fn authenticate_huc(io: &impl GtIo, rsa_offset: u32) -> Result<u32, Error> {
+    send_mmio(io, &[ACTION_AUTHENTICATE_HUC, rsa_offset])
 }
 
 // upstream: intel_guc_fw.c guc_prepare_xfer()
@@ -637,5 +644,26 @@ mod tests {
             time: core::cell::Cell::new(0),
         };
         assert_eq!(send_mmio(&failure, &[0x4000]), Err(Error::Refused));
+    }
+
+    #[test]
+    fn huc_authentication_sends_upstream_action_and_rsa_offset() {
+        let response = [HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_SUCCESS | 0x55];
+        let responses = [&response[..]];
+        let io = MmioIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            responses: &responses,
+            notifications: core::cell::Cell::new(0),
+            response_index: core::cell::Cell::new(0),
+            time: core::cell::Cell::new(0),
+        };
+        assert_eq!(authenticate_huc(&io, 0x1234_0000), Ok(0x55));
+        assert_eq!(
+            io.writes.borrow()[..2],
+            [
+                (GEN11_GUC_SEND_BASE, 0x4000),
+                (GEN11_GUC_SEND_BASE + 4, 0x1234_0000)
+            ]
+        );
     }
 }
