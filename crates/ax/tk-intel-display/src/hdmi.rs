@@ -10,7 +10,7 @@
 use crate::{
     Error,
     display::{Pipe, ReadoutIo, Timings},
-    hdmi_packet::{Infoframe, hdmi_infoframe_unpack},
+    hdmi_packet::{Drm, Infoframe, Spd, hdmi_infoframe_unpack},
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameType {
@@ -100,6 +100,44 @@ pub fn hsw_read_infoframe(
     }
     Ok(RawInfoframe { raw, kind })
 }
+/// Build Intel's SPD packet after the caller has admitted HDMI infoframes.
+// upstream: intel_hdmi.c intel_hdmi_compute_spd_infoframe()
+pub fn intel_hdmi_compute_spd_infoframe(
+    has_infoframe: bool,
+    discrete_graphics: bool,
+) -> Option<Spd> {
+    if !has_infoframe {
+        return None;
+    }
+    let mut vendor = [0; 8];
+    vendor[..5].copy_from_slice(b"Intel");
+    let product_text = if discrete_graphics {
+        b"Discrete gfx".as_slice()
+    } else {
+        b"Integrated gfx".as_slice()
+    };
+    let mut product = [0; 16];
+    product[..product_text.len()].copy_from_slice(product_text);
+    Some(Spd {
+        vendor,
+        product,
+        sdi: 9,
+    }) // HDMI_SPD_SDI_PC
+}
+
+/// Preserve the source's version/infoframe/HDR-metadata gates for DRM packets.
+// upstream: intel_hdmi.c intel_hdmi_compute_drm_infoframe()
+pub fn intel_hdmi_compute_drm_infoframe(
+    display_version: u8,
+    has_infoframe: bool,
+    metadata: Option<Drm>,
+) -> Option<Drm> {
+    if display_version < 10 || !has_infoframe {
+        return None;
+    }
+    metadata
+}
+
 const GCP_COLOR_INDICATION: u32 = 1 << 2;
 const GCP_DEFAULT_PHASE_ENABLE: u32 = 1 << 1;
 const HSW_INFOFRAME_ENABLE_MASK: u32 =
@@ -382,6 +420,38 @@ mod write_tests {
             set_context_latency: 0,
             interlaced: false,
         }
+    }
+
+    #[test]
+    fn spd_and_drm_compute_keep_source_enable_gates_and_defaults() {
+        assert_eq!(intel_hdmi_compute_spd_infoframe(false, false), None);
+        let spd = intel_hdmi_compute_spd_infoframe(true, false).unwrap();
+        assert_eq!(&spd.vendor[..5], b"Intel");
+        assert_eq!(&spd.product[..14], b"Integrated gfx");
+        assert_eq!(spd.sdi, 9);
+        let metadata = Drm {
+            eotf: 2,
+            metadata_type: 0,
+            display_primaries: [[1, 2]; 3],
+            white_point: [3, 4],
+            max_display_mastering_luminance: 5,
+            min_display_mastering_luminance: 6,
+            max_cll: 7,
+            max_fall: 8,
+        };
+        assert_eq!(
+            intel_hdmi_compute_drm_infoframe(9, true, Some(metadata)),
+            None
+        );
+        assert_eq!(
+            intel_hdmi_compute_drm_infoframe(13, false, Some(metadata)),
+            None
+        );
+        assert_eq!(
+            intel_hdmi_compute_drm_infoframe(13, true, Some(metadata)),
+            Some(metadata)
+        );
+        assert_eq!(intel_hdmi_compute_drm_infoframe(13, true, None), None);
     }
 
     #[test]

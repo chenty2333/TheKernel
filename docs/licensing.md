@@ -648,3 +648,7 @@ Copyright 2006 Dave Airlie and © 2006-2009 Intel).
 combo PHY init, verification, uninit and lane-power functions from
 `intel_combo_phy.c` (MIT, Copyright © 2018 Intel). The grant is covered by the
 included `LICENSE-MIT`.
+
+HDMI SPD defaults and DRM metadata gates in `tk-intel-display/src/hdmi.rs` follow
+`intel_hdmi_compute_spd_infoframe()` and `intel_hdmi_compute_drm_infoframe()`
+(MIT, © 2006-2009 Intel).

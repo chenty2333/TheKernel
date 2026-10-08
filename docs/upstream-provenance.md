@@ -1196,3 +1196,5 @@ N305 A/B output path; the sequence follows `_icl_ddi_enable_clock()` and
 The same `hdmi.rs` translation now includes the HSW deep-color GCP phase predicate/state builder, GCP payload write and HSW AVI/SPD/vendor/DRM infoframe enable sequence from Linux 7.2.3 `intel_hdmi.c` (MIT, Copyright 2006 Dave Airlie and © 2006-2009 Intel); `LICENSE-MIT`.
 
 `kernel/src/drm/intel/combo_phy_full.rs` translates all 14 functions in Linux v7.2.3 `drivers/gpu/drm/i915/display/intel_combo_phy.c` (MIT, Copyright © 2018 Intel Corporation); `LICENSE-MIT`.
+
+The HSW HDMI module also translates Intel's SPD infoframe defaults and DRM metadata/version gates from `intel_hdmi.c::intel_hdmi_compute_spd_infoframe()` and `intel_hdmi_compute_drm_infoframe()` (MIT, © 2006-2009 Intel).
