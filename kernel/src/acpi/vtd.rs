@@ -451,6 +451,8 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
             core::slice::from_raw_parts_mut(root.virtual_address.as_ptr().cast::<RootEntry>(), 256)
         };
         dmar_ensure_ctx_page(root_entries, bus as u8, context.physical)?;
+        // SAFETY: `context` owns a page-aligned 4 KiB allocation, enough for
+        // 256 hardware ContextEntry values; Manager retains it while active.
         let context_entries = unsafe {
             core::slice::from_raw_parts_mut(
                 context.virtual_address.as_ptr().cast::<ContextEntry>(),

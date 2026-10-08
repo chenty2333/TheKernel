@@ -2,7 +2,8 @@
 //!
 //! Translated from FreeBSD `sys/x86/iommu/intel_intrmap.c` (BSD-2-Clause;
 //! FreeBSD source snapshot 2026-10-08). Copyright (c) 2015 The FreeBSD
-//! Foundation; developed by Konstantin Belousov under Foundation sponsorship.
+//! Foundation. This software was developed by Konstantin Belousov
+//! <kib@FreeBSD.org> under sponsorship from the FreeBSD Foundation.
 //! `device_t`, VMEM, interrupt-controller reprogramming and QI/MMIO are passed
 //! through native resolver/IO adapters rather than importing FreeBSD frameworks.
 
