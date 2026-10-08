@@ -41,3 +41,8 @@ reset-order, timeout-control, and per-controller quirk behavior where its PIO
 path has a direct equivalent. The exact PCI ID/quirk table is in
 `tk-axdriver::sdhci`; unsupported DMA-specific quirk actions remain inert because
 this path does not use SDMA/ADMA.
+
+Removable-card write-protect is sampled through the generic host callback, and
+MMC R1 status errors are returned as controller errors instead of being treated
+as an endless busy state. The same read-only status is carried into the user
+area and boot partition block views.

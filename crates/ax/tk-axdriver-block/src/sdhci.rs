@@ -439,6 +439,11 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.clock_hz
     }
 
+    // upstream: sdhci.c sdhci_generic_get_ro()
+    pub fn card_write_protected(&mut self) -> bool {
+        self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_WRITE_PROTECT != 0
+    }
+
     // upstream: sdhci.c sdhci_set_bus_width()
     fn set_bus_width(&mut self, width: u8) {
         let mut control = self.io.read8(SDHCI_HOST_CONTROL as usize);
@@ -933,6 +938,7 @@ const SD_DATA: u16 = SDHCI_CMD_DATA as u16;
 const SD_OCR_READY: u32 = 1 << 31;
 const SD_OCR_CCS: u32 = 1 << 30;
 const SD_OCR_VOLTAGE: u32 = 0x00ff_8000;
+const MMC_R1_STATUS_ERRORS: u32 = 0xfff9_8000;
 
 /// SD card block device initialized through the generic SDHCI command path.
 pub struct SdhciDisk<I: SdhciIo> {
@@ -1086,6 +1092,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             let target = host.base_clock_hz.min(25_000_000);
             host.set_clock(target)?;
         }
+        let write_protected = host.card_write_protected();
         Ok(Self {
             host,
             rca,
@@ -1094,12 +1101,16 @@ impl<I: SdhciIo> SdhciDisk<I> {
             erase_group_sectors: erase_group_sectors.max(1),
             ext_csd,
             active_partition: 0,
-            read_only: false,
+            read_only: write_protected,
         })
     }
 
     pub fn set_read_only(&mut self, read_only: bool) {
-        self.read_only = read_only;
+        self.read_only |= read_only;
+    }
+
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub const fn ext_csd(&self) -> Option<MmcExtCsd> {
@@ -1112,7 +1123,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         read_only: bool,
         disk_index: usize,
     ) -> alloc::vec::Vec<SdhciPartitionDisk<I>> {
-        self.read_only = read_only;
+        self.read_only |= read_only;
         let metadata = self.ext_csd;
         let shared = Arc::new(Mutex::new(self));
         let mut partitions = alloc::vec![SdhciPartitionDisk {
@@ -1183,6 +1194,9 @@ impl<I: SdhciIo> SdhciDisk<I> {
                     0,
                 )?
                 .0[0];
+            if status & MMC_R1_STATUS_ERRORS != 0 {
+                return Err(SdhciError::Controller(status & MMC_R1_STATUS_ERRORS));
+            }
             if status & (1 << 8) != 0 && status & (0xf << 9) == 4 << 9 {
                 return Ok(());
             }
@@ -1655,6 +1669,14 @@ mod tests {
     }
 
     #[test]
+    fn write_protect_pin_is_reported_by_generic_ro_callback() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT | SDHCI_WRITE_PROTECT;
+        let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        assert!(host.card_write_protected());
+    }
+
+    #[test]
     fn dont_shift_response_quirk_preserves_raw_r2_register_words() {
         let mut io = MockIo::default();
         io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
@@ -1786,5 +1808,24 @@ mod tests {
         assert_eq!(areas[2].device_name(), "mmcblk0boot1");
         assert_eq!(areas[1].num_blocks(), 4096);
         assert!(areas.iter().all(crate::BlockDriverOps::is_read_only));
+    }
+
+    #[test]
+    fn mmc_status_error_is_reported_instead_of_being_retried_as_not_ready() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        io.registers[SDHCI_RESPONSE as usize / 4] = 1 << 22;
+        let host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        let mut disk = SdhciDisk {
+            host,
+            rca: 1,
+            sectors: 10,
+            high_capacity: true,
+            erase_group_sectors: 1,
+            ext_csd: None,
+            active_partition: 0,
+            read_only: false,
+        };
+        assert_eq!(disk.wait_ready(), Err(SdhciError::Controller(1 << 22)));
     }
 }

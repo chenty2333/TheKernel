@@ -309,6 +309,7 @@ fn probe_slot(
             return alloc::vec::Vec::new();
         }
     };
+    let read_only = read_only || disk.is_read_only();
     let partitions = disk.into_partition_devices(read_only, disk_index);
     info!(
         "sdhci: {bdf} BAR{bar_index} {:04x}:{:04x} published {} MMC block areas \
