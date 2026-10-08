@@ -727,3 +727,7 @@ crate `LICENSE-MIT` preserve the license.
 `tk-intel-display/src/intel_vblank_full.rs` translates the 30 vblank/scanout
 functions in Linux 7.2.3 `intel_vblank.c` (MIT, © 2022-2023 Intel); the file
 SPDX identifier and crate `LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_crtc_full.rs` translates all 39 CRTC functions in
+Linux 7.2.3 `intel_crtc.c` (MIT, © 2020 Intel); its SPDX tag and crate
+`LICENSE-MIT` preserve the grant.

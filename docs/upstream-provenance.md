@@ -1238,3 +1238,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `crates/ax/tk-intel-display/src/intel_cursor_full.rs` translates all 39 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_cursor.c` (MIT, Copyright © 2020 Intel Corporation); DRM/FB/vblank/atomic/MMIO operations are trait boundaries. `LICENSE-MIT`.
 
 `crates/ax/tk-intel-display/src/intel_vblank_full.rs` translates all 30 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_vblank.c` (MIT, Copyright © 2022-2023 Intel Corporation); both I915/Xe vblank-section alternatives are represented. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_crtc_full.rs` translates all 39 ctags function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_crtc.c` (MIT, Copyright © 2020 Intel Corporation); DRM/atomic/vblank/QoS operations use explicit hooks. `LICENSE-MIT`.
