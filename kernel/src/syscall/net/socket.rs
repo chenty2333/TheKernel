@@ -30,7 +30,7 @@ use super::{
 use crate::{
     file::{
         AcceptedSocketSecurityRef, AfAlgSocket, BareAcceptedSocketSecurityRef, FileDescription,
-        FileHandle, FileLike, NetlinkSocket, PacketSocket, PendingSocketSecurityRef,
+        FileHandle, FileLike, HciSocket, NetlinkSocket, PacketSocket, PendingSocketSecurityRef,
         PinnedSocketDescription, PreparedSocketAddress, Socket, SocketBackendKind, XdpSocket,
         af_alg, af_xdp, close_file_like, packet_socket::packet_error,
         permission::VfsSecurityContext, reserve_fd,
@@ -602,6 +602,14 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
     }
 
+    if domain == crate::file::bluetooth::AF_BLUETOOTH {
+        // AF_BLUETOOTH
+        HciSocket::validate_socket_type(ty, proto)?;
+        let socket = prepare_new_socket_like(HciSocket::new(), nonblocking)?;
+        dispatch_socket_post_create(actor, &socket, spec)?;
+        return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
+    }
+
     if domain == af_xdp::AF_XDP {
         if !ns_capable(actor, snapshot.net_namespace().owner_user_ns(), CAP_NET_RAW) {
             return Err(AxError::OperationNotPermitted);
@@ -856,6 +864,21 @@ pub fn sys_bind(
                 .xdp()?
                 .endpoint()
                 .bind(address.ifindex, address.queue_id, address.flags)?;
+        }
+        SocketBackendKind::Bluetooth => {
+            let address = pinned.bluetooth()?.read_from_user(
+                &capability,
+                addr.address().as_usize() as *const sockaddr,
+                addrlen as usize,
+            )?;
+            let prepared = PreparedSocketAddress::Unspecified;
+            dispatch_socket(&SocketSecurityContext::bind(
+                actor,
+                &socket_ref,
+                &prepared,
+                addrlen as usize,
+            ))?;
+            pinned.bluetooth()?.bind(address)?;
         }
         SocketBackendKind::Network => {
             let socket = pinned.network()?;

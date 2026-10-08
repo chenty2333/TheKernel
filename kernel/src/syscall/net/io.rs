@@ -677,7 +677,10 @@ fn check_receive_oob(socket: &PinnedSocketDescription, flags: u32) -> AxResult<(
         // AF_ALG has no receive operation at all — `crypto/af_alg.c:488` binds
         // `.recvmsg = sock_no_recvmsg` — so its refusal is not a `MSG_OOB`
         // answer and belongs to whichever stage owns that operation.
-        SocketBackendKind::Packet | SocketBackendKind::Xdp | SocketBackendKind::AfAlg => Ok(()),
+        SocketBackendKind::Packet
+        | SocketBackendKind::Xdp
+        | SocketBackendKind::AfAlg
+        | SocketBackendKind::Bluetooth => Ok(()),
     }
 }
 
@@ -1283,6 +1286,9 @@ fn send_impl(
         socket.xdp()?.endpoint().kick_tx()?;
         return Ok(0);
     }
+    if backend == SocketBackendKind::Bluetooth {
+        return Err(LinuxError::ENODEV.into());
+    }
     if backend != SocketBackendKind::Network {
         return Err(AxError::NotASocket);
     }
@@ -1865,6 +1871,9 @@ fn recv_impl(
 
     if socket.backend()? == SocketBackendKind::Xdp {
         return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    if socket.backend()? == SocketBackendKind::Bluetooth {
+        return Err(LinuxError::ENODEV.into());
     }
     if socket.backend()? != SocketBackendKind::Network {
         return Err(AxError::NotASocket);

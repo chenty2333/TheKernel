@@ -194,7 +194,10 @@ fn class_dir(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     // Device-registry publication supplies the complete graphics class
     // object.  A static empty fb0 directory would shadow that object and
     // prevent udev from reading its dev/uevent attributes.
-    let classes = super::block_inventory::class_root(fs.clone())
+    let mut bluetooth = DirMapping::new();
+    bluetooth.add("bluetooth", empty_dir(fs.clone()));
+    let classes = bluetooth
+        .chain(super::block_inventory::class_root(fs.clone()))
         .chain(super::net_sysfs::class_root(fs.clone()))
         .chain(super::acpi_thermal::class_root(fs.clone()));
     #[cfg(any(feature = "pmu", feature = "hwp-uclamp"))]
@@ -567,7 +570,7 @@ mod tests {
         let filesystem = new_sysfs();
         let root = Mountpoint::new_root(&filesystem);
         let context = FsContext::new(root.root_location());
-        for path in [b"/class/block".as_slice(), b"/class/net", b"/class/thermal"] {
+        for path in [b"/class/block".as_slice(), b"/class/net", b"/class/thermal", b"/class/bluetooth"] {
             assert!(context.resolve(FsPath::new(path)).is_ok(), "{path:?}");
         }
         #[cfg(any(feature = "pmu", feature = "hwp-uclamp"))]

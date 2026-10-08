@@ -9,6 +9,7 @@ use axnet::{
 use super::{
     af_alg::AfAlgSocket,
     af_xdp::XdpSocket,
+    bluetooth::HciSocket,
     desc::{FileDescription, FileHandle, OfdIoStatus},
     fd_table::get_file_description,
     fs::File,
@@ -62,6 +63,7 @@ pub(crate) enum SocketBackendKind {
     Packet,
     AfAlg,
     Xdp,
+    Bluetooth,
 }
 
 /// Validated, kernel-owned socket address passed to policy. The original byte
@@ -359,6 +361,9 @@ impl PinnedSocketDescription {
         if description.inner.downcast_ref::<XdpSocket>().is_some() {
             return Ok(SocketBackendKind::Xdp);
         }
+        if description.inner.downcast_ref::<HciSocket>().is_some() {
+            return Ok(SocketBackendKind::Bluetooth);
+        }
         if description
             .inner
             .downcast_ref::<File>()
@@ -427,6 +432,16 @@ impl PinnedSocketDescription {
             .ok_or(AxError::BadState)
     }
 
+    pub(crate) fn bluetooth(&self) -> AxResult<&HciSocket> {
+        if self.backend()? != SocketBackendKind::Bluetooth {
+            return Err(AxError::NotASocket);
+        }
+        self.description
+            .inner
+            .downcast_ref::<HciSocket>()
+            .ok_or(AxError::BadState)
+    }
+
     pub(crate) fn security_ref(&self) -> AxResult<SocketSecurityRef<'_>> {
         let backend = self.backend()?;
         let net_namespace = match backend {
@@ -435,6 +450,7 @@ impl PinnedSocketDescription {
             SocketBackendKind::Packet => Some(self.packet()?.net_namespace()),
             SocketBackendKind::AfAlg => None,
             SocketBackendKind::Xdp => Some(self.xdp()?.net_namespace()),
+            SocketBackendKind::Bluetooth => None,
         };
         Ok(SocketSecurityRef {
             description: &self.description,
