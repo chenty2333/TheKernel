@@ -26,6 +26,12 @@ for source in "$source_dir/tests/guest/graphics/"*.c; do
             cflags=-I$STAGING_DIR/usr/include/libdrm
             libraries="-lgbm -lEGL -lGLESv2"
             ;;
+        intel-vulkan-smoke)
+            libraries="-lvulkan"
+            ;;
+        intel-va-driver-load)
+            libraries="-ldl"
+            ;;
         drm-uapi-oracle|intel-bcs-smoke)
             cflags=-I$STAGING_DIR/usr/include/libdrm
             ;;

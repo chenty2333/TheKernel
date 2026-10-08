@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+marker=THEKERNEL_N305_ANV_NO_DEVICE_OK
+client=/usr/local/bin/intel-vulkan-smoke
+log=/run/intel-vulkan-smoke.log
+icd=/usr/share/vulkan/icd.d/intel_icd.x86_64.json
+
+[ -x "$client" ] || { echo "$marker state=FAIL reason=client" >&2; exit 1; }
+[ -x /usr/bin/vulkaninfo ] || { echo "$marker state=FAIL reason=vulkaninfo" >&2; exit 1; }
+[ -r "$icd" ] || { echo "$marker state=FAIL reason=intel_icd" >&2; exit 1; }
+grep -Fq 'libvulkan_intel.so' "$icd" || { echo "$marker state=FAIL reason=anv_icd" >&2; exit 1; }
+
+status=0
+VK_DRIVER_FILES="$icd" LD_DEBUG=libs "$client" >"$log" 2>&1 || status=$?
+[ "$status" -eq 0 ] || { cat "$log" >&2; echo "$marker state=FAIL reason=enumeration" >&2; exit 1; }
+grep -Fq "$marker" "$log" || { cat "$log" >&2; echo "$marker state=FAIL reason=no_device_oracle" >&2; exit 1; }
+grep -Fq 'libvulkan_intel.so' "$log" || { cat "$log" >&2; echo "$marker state=FAIL reason=anv_not_loaded" >&2; exit 1; }
+
+# Include the requested diagnostic utility. The C oracle above distinguishes a
+# valid zero-device result from an unrelated loader/driver failure.
+vulkaninfo_status=0
+VK_DRIVER_FILES="$icd" vulkaninfo --summary >/run/vulkaninfo-intel.log 2>&1 || vulkaninfo_status=$?
+if [ "$vulkaninfo_status" -ne 0 ] &&
+   ! grep -Eq 'ERROR_INCOMPATIBLE_DRIVER|no physical device|No GPU|failed to find GPUs' /run/vulkaninfo-intel.log; then
+    cat /run/vulkaninfo-intel.log >&2
+    echo "$marker state=FAIL reason=vulkaninfo_unexpected" >&2
+    exit 1
+fi
+echo "$marker state=PASS layer=anv_loader physical_devices=0 vulkaninfo_status=$vulkaninfo_status"

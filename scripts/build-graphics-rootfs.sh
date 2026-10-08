@@ -154,9 +154,15 @@ flavor_br2_contract() {
             printf '%s\n' \
                 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' \
                 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' \
+                'BR2_PACKAGE_MESA3D_LLVM=y' \
+                'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_INTEL=y' \
+                'BR2_PACKAGE_INTEL_MEDIADRIVER=y' \
+                'BR2_PACKAGE_LIBVA_UTILS=y' \
                 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' \
                 'BR2_PACKAGE_VULKAN_LOADER=y' \
                 'BR2_PACKAGE_VULKAN_TOOLS=y' \
+                'BR2_PACKAGE_LINUX_FIRMWARE=y' \
+                'BR2_PACKAGE_LINUX_FIRMWARE_I915=y' \
                 'BR2_PACKAGE_PIGLIT=y' \
                 'BR2_PACKAGE_XORG7=y' \
                 'BR2_PACKAGE_LIBEPOXY=y' \
@@ -264,12 +270,18 @@ validate_n305_iris_checked_in() {
         "$REPO_ROOT/config/graphics/build-guest-tools.sh" \
         "$REPO_ROOT/tests/guest/graphics/intel-mesa-smoke.c" \
         "$script" \
+        "$REPO_ROOT/tests/guest/graphics/intel-vulkan-smoke.c" \
+        "$REPO_ROOT/tests/guest/graphics/intel-va-driver-load.c" \
+        "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/init.d/S91n305-vulkan-smoke" \
+        "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/init.d/S92n305-va-smoke" \
         "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/thekernel-graphics-flavor" \
         "$REPO_ROOT/config/graphics/overlay/common/etc/weston/weston-headless.ini"; do
         [ -r "$path" ] || { printf 'missing N305 iris graphics input: %s\n' "$path" >&2; return 1; }
     done
     [ -x "$REPO_ROOT/config/graphics/build-guest-tools.sh" ]
     [ -x "$script" ]
+    [ -x "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/init.d/S91n305-vulkan-smoke" ]
+    [ -x "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/init.d/S92n305-va-smoke" ]
     [ -L "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/weston/weston.ini" ]
     [ "$(readlink "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/weston/weston.ini")" = weston-headless.ini ]
     grep -qx n305-iris-smoke "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/thekernel-graphics-flavor"
@@ -282,11 +294,20 @@ validate_n305_iris_checked_in() {
     grep -qx 'BR2_PACKAGE_MESA3D=y' "$fragment"
     grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$fragment"
     grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_MESA3D_LLVM=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_INTEL=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_INTEL_MEDIADRIVER=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_LIBVA_UTILS=y' "$fragment"
     grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_EGL=y' "$fragment"
     grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_ES=y' "$fragment"
     grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$fragment"
     grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$fragment"
     grep -qx 'BR2_PACKAGE_VULKAN_TOOLS=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_LINUX_FIRMWARE=y' "$fragment"
+    grep -qx 'BR2_PACKAGE_LINUX_FIRMWARE_I915=y' "$fragment"
+    grep -Fq 'VK_DRIVER_FILES="$icd"' "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/init.d/S91n305-vulkan-smoke"
+    grep -Fq 'LIBVA_DRIVER_NAME=iHD' "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/init.d/S92n305-va-smoke"
+    grep -Fq 'THEKERNEL_N305_IHD_MODULE_LOADED' "$REPO_ROOT/tests/guest/graphics/intel-va-driver-load.c"
     grep -qx 'BR2_PACKAGE_PIGLIT=y' "$fragment"
     grep -Fq 'readlink -f /usr/lib/libgallium-26.1.2.so' "$script"
     grep -Fq '/usr/lib64/libgallium-26.1.2.so' "$script"
@@ -296,6 +317,8 @@ validate_n305_iris_checked_in() {
         "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
     grep -Fq "n305-iris-smoke" "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
     sh -n "$script"
+    sh -n "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/init.d/S91n305-vulkan-smoke"
+    sh -n "$REPO_ROOT/config/graphics/overlay/n305-iris-smoke/etc/init.d/S92n305-va-smoke"
 }
 
 validate_n305_iris_build_output() {
@@ -309,9 +332,22 @@ validate_n305_iris_build_output() {
     grep -qx 'BR2_PACKAGE_WESTON_HEADLESS=y' "$resolved"
     grep -qx 'BR2_PACKAGE_MESA3D=y' "$resolved"
     grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_MESA3D_LLVM=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_INTEL=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_INTEL_MEDIADRIVER=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_LIBVA_UTILS=y' "$resolved"
+    grep -qx 'BR2_PACKAGE_LINUX_FIRMWARE_I915=y' "$resolved"
     grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_EGL=y' "$resolved"
     grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_ES=y' "$resolved"
     [ -x "$target/usr/local/bin/intel-mesa-smoke" ]
+    [ -x "$target/usr/local/bin/intel-vulkan-smoke" ]
+    [ -x "$target/usr/local/bin/intel-va-driver-load" ]
+    [ -x "$target/usr/bin/vulkaninfo" ]
+    [ -x "$target/usr/bin/vainfo" ]
+    [ -r "$target/usr/lib/dri/iHD_drv_video.so" ]
+    [ -r "$target/usr/share/vulkan/icd.d/intel_icd.x86_64.json" ]
+    [ -r "$target/lib/firmware/i915/tgl_guc_70.bin" ]
+    [ -r "$target/lib/firmware/i915/tgl_huc.bin" ]
     [ -f "$target$gallium" ]
     grep -aFq 'iris_driver_descriptor' "$target$gallium" || {
         printf '%s\n' 'final target libgallium does not contain Mesa iris' >&2
@@ -669,6 +705,8 @@ validate_build_output() {
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
             flavor_br2_contract "$flavor" | require_br2_contract "$resolved"
             [ -x "$target/etc/init.d/S90n305-iris-smoke" ]
+            [ -x "$target/etc/init.d/S91n305-vulkan-smoke" ]
+            [ -x "$target/etc/init.d/S92n305-va-smoke" ]
             [ -x "$target/etc/init.d/S90q35-weston-smoke" ]
             [ -x "$target/usr/local/bin/q35-wayland-color-client" ]
             [ -x "$target/usr/local/bin/q35-wayland-vulkan-client" ]

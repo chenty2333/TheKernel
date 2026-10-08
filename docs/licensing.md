@@ -527,3 +527,14 @@ libgallium from the existing same-version source/CLC/toolchain, retaining the
 Mesa/Buildroot package license obligations already registered above. No Mesa
 binary is committed. The dedicated flavor and loader check are original
 project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
+
+The `n305-iris-smoke` Buildroot flavor now enables Mesa's Intel Vulkan driver
+(anv), Intel media-driver (iHD), libva-utils/vainfo and the linux-firmware i915
+selection. The firmware binaries remain externally sourced by the pinned
+Buildroot linux-firmware package; they are not committed here. Their upstream
+`LICENSE.i915` grants binary redistribution subject to retaining Intel's
+copyright/disclaimer, no endorsement, and no reverse engineering or
+
+decompilation. Intel media-driver/Mesa/libva package licenses and source notice
+files remain Buildroot-managed; the guest smoke checks only loader resolution
+and the expected no-GPU result, not hardware decode/render.
