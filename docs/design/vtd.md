@@ -142,3 +142,48 @@ accepts page-array, physical-extent, and virtual-buffer loads; the latter uses a
 caller-provided page-table extractor to replace FreeBSD `pmap_extract`. This
 raises direct busdma source coverage to 6/34 functions; tags, memory alloc/free,
 wait/callback and KMSAN routines remain TheKernel framework seams.
+
+Follow-up acceptance on 2026-10-09 still failed with `intel_iommu=on`. The
+firmware-framebuffer profile without VirtIO-GPU advanced through filesystem,
+VirtIO-net and secondary-CPU startup, then stopped after `Initialize alarm...`
+before the shell marker; the matching no-VT-d control completed disk/network/
+ping and powered off. This narrows the stopping point versus earlier boot logs,
+but does not prove whether the cause is DMA translation, a device interrupt, or
+an unrelated startup interaction. The required translated acceptance did not
+pass; identity-by-default stays mandatory. No additional acceptance retry is
+claimed.
+
+Coverage accounting for the final source-file pass: `busdma_iommu.c` is 6/34;
+the 28 omitted entry points are native busdma tag/identity/requester/context
+wrappers (`iommu_bus_dma_is_dev_disabled`, `iommu_get_requester`,
+`iommu_instantiate_ctx`, `iommu_get_dev_ctx`, `iommu_get_dma_tag`,
+`bus_dma_iommu_set_buswide`, `iommu_is_buswide_ctx`, `iommu_set_buswide_ctx`,
+`iommu_bus_dma_tag_create`, `iommu_bus_dma_tag_destroy`,
+`iommu_bus_dma_tag_set_domain`, `iommu_bus_dma_id_mapped`,
+`bus_dma_iommu_load_ident`), FreeBSD map-object and coherent-memory allocation
+(`iommu_bus_dmamap_create/destroy`, `iommu_bus_dmamem_alloc/free`), delayed
+callback/taskqueue ownership (`iommu_bus_dmamap_waitok`,
+`iommu_bus_dmamap_complete`, `iommu_bus_task_dmamap`,
+`iommu_bus_schedule_dmamap`, `iommu_init_busdma`, `iommu_fini_busdma`,
+`iommu_domain_init/fini`, `iommu_domain_unload_task`), and KMSAN/sync hooks
+(`iommu_bus_dmamap_sync`, `iommu_bus_dmamap_load_kmsan`). They depend on the
+FreeBSD busdma, VM, taskqueue, or KMSAN frameworks rather than on the IOVA
+load/unload algorithm. `iommu_utils.c` is 8/44: four page-table radix helpers,
+the requester DMA-constraint setup, and three queued-invalidation sequence
+helpers are translated. Its 36 omitted entry points are: VM-object/sf_buf page
+mapping (`iommu_pgalloc`, `iommu_pgfree`, `iommu_map_pgtbl`,
+`iommu_unmap_pgtbl`); x86 IOMMU vtable/no-IOMMU dispatch and device/context
+lookup (`get_x86_iommu`, `set_x86_iommu`, all six `x86_no_iommu_*` routines,
+`iommu_domain_free_entry`, `iommu_domain_unload_entry`,
+`iommu_domain_unload`, `iommu_get_ctx`, `iommu_free_ctx_locked`,
+`iommu_find`, `iommu_unit_pre_instantiate_ctx`); QI interrupt/taskqueue and
+deferred-drain wrappers (`iommu_qi_common_init`, `iommu_qi_common_fini`,
+`iommu_qi_drain_tlb_flush`, `iommu_qi_invalidate_locked`,
+`iommu_qi_invalidate_sync`), whose descriptor/wait mechanics use `qi.rs` but
+whose FreeBSD task/interrupt lifecycle is not portable; MSI/IOAPIC interrupt
+resource adapters (`iommu_alloc_irq`, `iommu_alloc_msi_intr`,
+`iommu_map_msi_intr`, `iommu_unmap_msi_intr`, `iommu_map_ioapic_intr`,
+`iommu_unmap_ioapic_intr`, `iommu_release_intr`); and presentation/debug
+callbacks (`iommu_device_set_iommu_prop`, four `iommu_db_*` DDB commands).
+Page allocation, PCI discovery, APIC/IOAPIC routing, and debug registration
+remain platform-owned framework responsibilities.
