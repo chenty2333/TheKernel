@@ -7,5 +7,7 @@
 extern crate alloc;
 
 mod frame;
+mod rsn;
 
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
+pub use rsn::{Akm, Cipher, RsnParams, RsnStatus, parse_akm, parse_cipher, parse_rsn, parse_wpa};
