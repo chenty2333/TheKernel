@@ -119,6 +119,13 @@ struct RxDescriptor {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct AdvancedRxDescriptor {
+    address: u64,
+    lower: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct TxDescriptor {
     address: u64,
     length: u16,
@@ -130,6 +137,7 @@ struct TxDescriptor {
 }
 
 const _: () = assert!(size_of::<RxDescriptor>() == 16);
+const _: () = assert!(size_of::<AdvancedRxDescriptor>() == 16);
 const _: () = assert!(size_of::<TxDescriptor>() == 16);
 
 /// One e1000-compatible 8254x/e1000e/igb controller with single descriptor queues.
@@ -165,7 +173,7 @@ unsafe impl<H: E1000Hal, const QS: usize> Sync for E1000Nic<H, QS> {}
 
 impl<H: E1000Hal, const QS: usize> E1000Nic<H, QS> {
     /// Adapt the FreeBSD attach order to TheKernel's MMIO, DMA and netdev interfaces.
-    // upstream: if_em.c em_attach_pre()
+    // Adapt the FreeBSD device lifecycle to TheKernel's MMIO, DMA and netdev APIs.
     pub fn new(
         mmio: NonNull<u8>,
         mmio_size: usize,
@@ -213,6 +221,29 @@ impl<H: E1000Hal, const QS: usize> E1000Nic<H, QS> {
             tx_tail: 0,
             _hal: PhantomData,
         };
+        if advanced_queues {
+            let link_mode = nic.read(E1000_CTRL_EXT)? & E1000_CTRL_EXT_LINK_MODE_MASK;
+            if matches!(
+                link_mode,
+                E1000_CTRL_EXT_LINK_MODE_GMII | E1000_CTRL_EXT_LINK_MODE_SGMII
+            ) {
+                let mut autoneg = super::phy::AutonegConfig {
+                    advertised: 0x2f,
+                    mask: 0x2f,
+                    flow_control: super::mac::FlowControlMode::Full,
+                };
+                let mut link_status_pending = false;
+                if let Err(error) = super::phy::copper_link_autoneg(
+                    &mut nic,
+                    &mut autoneg,
+                    false,
+                    false,
+                    &mut link_status_pending,
+                ) {
+                    log::warn!("e1000: igb copper autonegotiation setup failed: {error:?}");
+                }
+            }
+        }
         for slot in 0..QS {
             let address = nic.rx_pool.bus(slot).ok_or(DevError::BadState)?;
             nic.write_rx_descriptor(slot, address)?;
@@ -221,11 +252,16 @@ impl<H: E1000Hal, const QS: usize> E1000Nic<H, QS> {
         nic.initialize_transmit_unit()?;
         nic.initialize_receive_unit()?;
         // Keep the interface available if no cable is attached; link can come up later.
+        let mut link_status = 0;
         for _ in 0..LINK_POLLS {
-            if nic.read(E1000_STATUS)? & E1000_STATUS_LU != 0 {
+            link_status = nic.read(E1000_STATUS)?;
+            if link_status & E1000_STATUS_LU != 0 {
                 break;
             }
             H::delay_us(10);
+        }
+        if link_status & E1000_STATUS_LU == 0 {
+            log::warn!("e1000: link not up after bounded poll, STATUS={link_status:#010x}");
         }
         Ok(nic)
     }
@@ -272,22 +308,57 @@ impl<H: E1000Hal, const QS: usize> E1000Nic<H, QS> {
         })
     }
 
+    fn rx_completion(&self, index: usize) -> DevResult<(u16, u8, u8)> {
+        if index >= QS {
+            return Err(DevError::InvalidParam);
+        }
+        if self.advanced_queues {
+            // Advanced writeback stores status/error in the upper dword and
+            // packet length in its low word.
+            let descriptor = unsafe {
+                ptr::read_volatile(
+                    self.rx_desc
+                        .cpu
+                        .as_ptr()
+                        .cast::<AdvancedRxDescriptor>()
+                        .add(index),
+                )
+            };
+            let status_error = descriptor.lower as u32;
+            let length = (descriptor.lower >> 32) as u16;
+            Ok((length, status_error as u8, (status_error >> 24) as u8))
+        } else {
+            let descriptor = self.rx_descriptor(index)?;
+            Ok((descriptor.length, descriptor.status, descriptor.errors))
+        }
+    }
+
     // upstream: em_txrx.c em_isc_rxd_refill() descriptor initialization
     fn write_rx_descriptor(&mut self, index: usize, address: u64) -> DevResult {
         if index >= QS {
             return Err(DevError::InvalidParam);
         }
-        let descriptor = RxDescriptor {
-            address,
-            ..RxDescriptor::default()
-        };
         // SAFETY: descriptor memory is owned, aligned and this slot is not in use by the NIC.
         unsafe {
-            ptr::write_volatile(
-                self.rx_desc.cpu.as_ptr().cast::<RxDescriptor>().add(index),
-                descriptor,
-            )
-        };
+            if self.advanced_queues {
+                ptr::write_volatile(
+                    self.rx_desc
+                        .cpu
+                        .as_ptr()
+                        .cast::<AdvancedRxDescriptor>()
+                        .add(index),
+                    AdvancedRxDescriptor { address, lower: 0 },
+                );
+            } else {
+                ptr::write_volatile(
+                    self.rx_desc.cpu.as_ptr().cast::<RxDescriptor>().add(index),
+                    RxDescriptor {
+                        address,
+                        ..RxDescriptor::default()
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -320,26 +391,54 @@ impl<H: E1000Hal, const QS: usize> E1000Nic<H, QS> {
     // upstream: if_em.c em_initialize_transmit_unit()
     fn initialize_transmit_unit(&mut self) -> DevResult {
         let tx_bus = self.tx_desc.bus;
+        if self.advanced_queues {
+            let control = self.read(tx_desc_control(0))? & !E1000_TXDCTL_QUEUE_ENABLE;
+            self.write(tx_desc_control(0), control)?;
+            let _flush = self.read(E1000_STATUS)?;
+        }
         self.write(tx_desc_base_low(0), tx_bus as u32)?;
         self.write(tx_desc_base_high(0), (tx_bus >> 32) as u32)?;
         self.write(tx_desc_length(0), (QS * size_of::<TxDescriptor>()) as u32)?;
         self.write(tx_desc_head(0), 0)?;
         self.write(tx_desc_tail(0), 0)?;
-        self.write(E1000_TIPG, 0x0060_200a)?;
-        self.write(
-            E1000_TCTL,
-            E1000_TCTL_EN | E1000_TCTL_PSP | 0x0000_0f00 | 0x003f_0000,
-        )
+        if !self.advanced_queues {
+            self.write(E1000_TIPG, 0x0060_200a)?;
+        }
+        let mut tctl = self.read(E1000_TCTL)?;
+        tctl &= !E1000_TCTL_CT;
+        tctl |= E1000_TCTL_EN
+            | E1000_TCTL_PSP
+            | E1000_TCTL_RTLC
+            | (E1000_COLLISION_THRESHOLD << E1000_CT_SHIFT);
+        if self.advanced_queues {
+            let txdctl = 8 | (1 << 8) | E1000_TXDCTL_QUEUE_ENABLE;
+            self.write(tx_desc_control(0), txdctl)?;
+        }
+        self.write(E1000_TCTL, tctl)?;
+        Ok(())
     }
 
     // upstream: if_em.c em_initialize_receive_unit()
     fn initialize_receive_unit(&mut self) -> DevResult {
         let rx_bus = self.rx_desc.bus;
+        if self.advanced_queues {
+            let control = self.read(rx_desc_control(0))? & !E1000_RXDCTL_QUEUE_ENABLE;
+            self.write(rx_desc_control(0), control)?;
+            let _flush = self.read(E1000_STATUS)?;
+        }
         self.write(rx_desc_base_low(0), rx_bus as u32)?;
         self.write(rx_desc_base_high(0), (rx_bus >> 32) as u32)?;
         self.write(rx_desc_length(0), (QS * size_of::<RxDescriptor>()) as u32)?;
         self.write(rx_desc_head(0), 0)?;
         self.write(rx_desc_tail(0), (QS - 1) as u32)?;
+        if self.advanced_queues {
+            let split = ((RX_BUFFER_BYTES as u32 + ((1 << E1000_SRRCTL_BSIZEPKT_SHIFT) - 1))
+                >> E1000_SRRCTL_BSIZEPKT_SHIFT)
+                | E1000_SRRCTL_DESCTYPE_ADV_ONEBUF;
+            self.write(rx_split_control(0), split)?;
+            let rxdctl = 8 | (8 << 8) | (4 << 16) | E1000_RXDCTL_QUEUE_ENABLE;
+            self.write(rx_desc_control(0), rxdctl)?;
+        }
         self.write(
             E1000_RCTL,
             E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_SECRC,
@@ -525,8 +624,8 @@ impl<H: E1000Hal, const QS: usize> NetDriverOps for E1000Nic<H, QS> {
         next != self.tx_head && !self.tx_free.is_empty()
     }
     fn can_receive(&self) -> bool {
-        self.rx_descriptor(self.rx_head)
-            .is_ok_and(|desc| desc.status & E1000_RXD_STAT_DD as u8 != 0)
+        self.rx_completion(self.rx_head)
+            .is_ok_and(|(_, status, _)| status & E1000_RXD_STAT_DD as u8 != 0)
     }
     fn rx_queue_size(&self) -> usize {
         QS
@@ -568,24 +667,24 @@ impl<H: E1000Hal, const QS: usize> NetDriverOps for E1000Nic<H, QS> {
     }
     // upstream: em_txrx.c em_isc_rxd_pkt_get() single-fragment path
     fn receive(&mut self) -> DevResult<NetBufPtr> {
-        let descriptor = self.rx_descriptor(self.rx_head)?;
-        if descriptor.status & E1000_RXD_STAT_DD as u8 == 0 {
+        let (length, status, errors) = self.rx_completion(self.rx_head)?;
+        if status & E1000_RXD_STAT_DD as u8 == 0 {
             return Err(DevError::Again);
         }
         let index = self.rx_head;
         self.rx_head = (self.rx_head + 1) % QS;
         let slot = self.rx_owner[index];
-        if descriptor.errors != 0
-            || descriptor.status & E1000_RXD_STAT_EOP as u8 == 0
-            || descriptor.length == 0
-            || descriptor.length as usize > MAX_FRAME_BYTES
+        if errors != 0
+            || status & E1000_RXD_STAT_EOP as u8 == 0
+            || length == 0
+            || length as usize > MAX_FRAME_BYTES
         {
             self.rx_free.push(slot);
             self.fill_rx()?;
             return Err(DevError::Io);
         }
         self.rx_in_flight[slot] = true;
-        Self::buffer_for(&self.rx_pool, slot, descriptor.length as usize)
+        Self::buffer_for(&self.rx_pool, slot, length as usize)
     }
     fn alloc_tx_buffer(&mut self, size: usize) -> DevResult<NetBufPtr> {
         if size == 0 || size > MAX_FRAME_BYTES {
@@ -613,6 +712,16 @@ impl<H: E1000Hal, const QS: usize> E1000RegisterIo for E1000Nic<H, QS> {
 
     fn invalid_tail_write(&mut self, direction: &'static str) {
         log::error!("e1000: invalid {direction} tail write; queue disabled");
+    }
+}
+
+impl<H: E1000Hal, const QS: usize> super::mac::E1000PhyRegisterIo for E1000Nic<H, QS> {
+    fn read_phy_register(&mut self, register: u8) -> DevResult<u16> {
+        super::phy::read_phy_reg_mdic(self, 1, 3, false, u32::from(register))
+    }
+
+    fn write_phy_register(&mut self, register: u8, value: u16) -> DevResult {
+        super::phy::write_phy_reg_mdic(self, 1, 3, false, u32::from(register), value)
     }
 }
 

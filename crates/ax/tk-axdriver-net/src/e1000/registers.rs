@@ -947,6 +947,14 @@ pub const E1000_TXDCTL_GRAN: u32 = 0x01000000;
 pub const E1000_TXDCTL_FULL_TX_DESC_WB: u32 = 0x01010000;
 pub const E1000_TXDCTL_MAX_TX_DESC_PREFETCH: u32 = 0x0100001F;
 pub const E1000_TXDCTL_COUNT_DESC: u32 = 0x00400000;
+// upstream: e1000_82575.h E1000_TXDCTL_QUEUE_ENABLE()
+pub const E1000_TXDCTL_QUEUE_ENABLE: u32 = 0x02000000;
+// upstream: e1000_82575.h E1000_RXDCTL_QUEUE_ENABLE()
+pub const E1000_RXDCTL_QUEUE_ENABLE: u32 = 0x02000000;
+// upstream: e1000_82575.h E1000_SRRCTL_DESCTYPE_ADV_ONEBUF()
+pub const E1000_SRRCTL_DESCTYPE_ADV_ONEBUF: u32 = 0x02000000;
+// upstream: e1000_82575.h E1000_SRRCTL_BSIZEPKT_SHIFT
+pub const E1000_SRRCTL_BSIZEPKT_SHIFT: u32 = 10;
 pub const E1000_VLAN_FILTER_TBL_SIZE: u32 = 128;
 pub const E1000_RAR_ENTRIES: u32 = 15;
 pub const E1000_RAH_AV: u32 = 0x80000000;
@@ -1273,6 +1281,11 @@ pub const fn rx_desc_tail(queue: u32) -> u32 {
 // upstream: e1000_regs.h E1000_RXDCTL()
 pub const fn rx_desc_control(queue: u32) -> u32 {
     queue_reg(queue, 0x02828, 0x0c028)
+}
+/// Receive split-control register offset for advanced descriptor queues.
+// upstream: e1000_regs.h E1000_SRRCTL()
+pub const fn rx_split_control(queue: u32) -> u32 {
+    queue_reg(queue, 0x0280c, 0x0c00c)
 }
 /// Transmit descriptor ring base low register offset.
 // upstream: e1000_regs.h E1000_TDBAL()
