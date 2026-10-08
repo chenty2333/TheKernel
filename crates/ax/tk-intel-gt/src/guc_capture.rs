@@ -20,6 +20,10 @@ pub const CAPTURE_GROUP_HEADER_BYTES: usize = 2 * 4;
 pub const CAPTURE_OVERBUFFER_MULTIPLIER: usize = 3;
 pub const CAPTURE_PREALLOC_NODE_COUNT: usize = 3 * 16 * 32;
 pub const CAPTURE_PREALLOC_DEFAULT_REGISTERS: usize = 64;
+pub const GUC_ENGINE_CLASS_MASK: u32 = 0x7;
+pub const GUC_ENGINE_INSTANCE_SHIFT: u32 = 3;
+pub const GUC_ENGINE_INSTANCE_MASK: u32 = 0xf << GUC_ENGINE_INSTANCE_SHIFT;
+pub const CTX_GTT_ADDRESS_MASK: u32 = 0xffff_f000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureError {
@@ -264,6 +268,65 @@ pub struct CaptureOutputNode {
     pub guc_id: u32,
     pub lrca: u32,
     pub lists: [Option<CaptureList>; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CapturedEngineState {
+    pub ipehr: u32,
+    pub instdone: u32,
+}
+
+/// Match a parsed node to a context and engine using the GuC encoded class /
+/// instance, context id, and page-aligned LRCA comparison.
+/// upstream: intel_guc_capture.c intel_guc_capture_is_matching_engine().
+pub fn is_matching_engine(
+    node: &CaptureOutputNode,
+    engine_guc_id: u32,
+    context_guc_id: u32,
+    context_lrca: u32,
+) -> bool {
+    let engine_class = (engine_guc_id & GUC_ENGINE_CLASS_MASK) as u8;
+    let engine_instance =
+        ((engine_guc_id & GUC_ENGINE_INSTANCE_MASK) >> GUC_ENGINE_INSTANCE_SHIFT) as u8;
+    node.engine_class == engine_class
+        && node.engine_instance == engine_instance
+        && node.guc_id == context_guc_id
+        && (node.lrca & CTX_GTT_ADDRESS_MASK) == (context_lrca & CTX_GTT_ADDRESS_MASK)
+}
+
+/// Remove and return the first matching output node, corresponding to the
+/// coredump attach operation. Nonmatching nodes preserve their order.
+/// upstream: intel_guc_capture.c intel_guc_capture_get_matching_node().
+pub fn take_matching_node(
+    nodes: &mut Vec<CaptureOutputNode>,
+    engine_guc_id: u32,
+    context_guc_id: u32,
+    context_lrca: u32,
+) -> Option<CaptureOutputNode> {
+    let index = nodes
+        .iter()
+        .position(|node| is_matching_engine(node, engine_guc_id, context_guc_id, context_lrca))?;
+    Some(nodes.remove(index))
+}
+
+/// Extract the two engine error-code registers from a matched node.
+/// upstream: intel_guc_capture.c guc_capture_find_ecode().
+pub fn find_engine_error_state(
+    node: &CaptureOutputNode,
+    ipehr_offset: u32,
+    instdone_offset: u32,
+) -> CapturedEngineState {
+    let mut state = CapturedEngineState::default();
+    if let Some(instance) = node.lists[usize::from(CAPTURE_TYPE_ENGINE_INSTANCE)].as_ref() {
+        for register in &instance.registers {
+            if register.offset == ipehr_offset {
+                state.ipehr = register.value;
+            } else if register.offset == instdone_offset {
+                state.instdone = register.value;
+            }
+        }
+    }
+    state
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -677,6 +740,50 @@ mod tests {
                 available: minimum - 1
             }
         );
+    }
+
+    #[test]
+    fn capture_node_matches_guc_id_and_page_aligned_lrca_then_extracts_error_regs() {
+        let mut node = CaptureOutputNode::empty(false);
+        node.engine_class = 2;
+        node.engine_instance = 3;
+        node.guc_id = 0x1234;
+        node.lrca = 0x4567_8000;
+        node.lists[usize::from(CAPTURE_TYPE_ENGINE_INSTANCE)] = Some(CaptureList {
+            vfid: 0,
+            capture_type: CAPTURE_TYPE_ENGINE_INSTANCE,
+            engine_class: 2,
+            engine_instance: 3,
+            lrca: node.lrca,
+            guc_id: node.guc_id,
+            registers: vec![
+                CaptureRegister {
+                    offset: 0x2068,
+                    value: 0xaa,
+                    flags: 0,
+                    mask: 0,
+                },
+                CaptureRegister {
+                    offset: 0x206c,
+                    value: 0xbb,
+                    flags: 0,
+                    mask: 0,
+                },
+            ],
+        });
+        let engine_id = 2 | (3 << GUC_ENGINE_INSTANCE_SHIFT);
+        assert!(is_matching_engine(&node, engine_id, 0x1234, 0x4567_8fff));
+        assert!(!is_matching_engine(&node, engine_id, 0x1235, node.lrca));
+        assert_eq!(
+            find_engine_error_state(&node, 0x2068, 0x206c),
+            CapturedEngineState {
+                ipehr: 0xaa,
+                instdone: 0xbb
+            }
+        );
+        let mut nodes = vec![node];
+        assert!(take_matching_node(&mut nodes, engine_id, 0x1234, 0x4567_8001).is_some());
+        assert!(nodes.is_empty());
     }
 
     #[test]
