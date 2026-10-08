@@ -22,6 +22,139 @@ const CTRL_SLU: u32 = 0x40;
 const CTRL_FRCSPD: u32 = 0x800;
 const CTRL_FRCDPX: u32 = 0x1000;
 const PHPM_GO_LINKD: u32 = 0x0000_0001;
+const SRWR: u32 = 0x12018;
+const EERD_EEWR_MAX_COUNT: usize = 512;
+const NVM_RW_ADDR_SHIFT: u32 = 2;
+const NVM_RW_REG_DATA: u32 = 16;
+const NVM_RW_REG_DONE: u32 = 2;
+const NVM_RW_REG_START: u32 = 1;
+const NVM_CHECKSUM_REG: u16 = 0x003f;
+const NVM_SUM: u16 = 0xbaba;
+
+pub trait IgcI225NvmIo: IgcI225Io {
+    fn read_nvm_eerd(&mut self, offset: u16, data: &mut [u16]) -> Result<(), I225NvmError>;
+    fn validate_nvm_checksum_generic(&mut self) -> Result<(), I225NvmError>;
+    fn update_flash_i225(&mut self) -> Result<(), I225NvmError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum I225NvmError {
+    Bounds,
+    Sync,
+    Timeout,
+    Hardware,
+}
+
+// upstream: igc_i225.c igc_read_nvm_srrd_i225()
+pub fn igc_read_nvm_srrd_i225<I: IgcI225NvmIo>(
+    io: &mut I,
+    offset: u16,
+    data: &mut [u16],
+    words: u16,
+) -> Result<(), I225NvmError> {
+    if usize::from(words) > data.len() {
+        return Err(I225NvmError::Bounds);
+    }
+    let mut i = 0usize;
+    while i < usize::from(words) {
+        let count = (usize::from(words) - i).min(EERD_EEWR_MAX_COUNT);
+        if igc_acquire_nvm_i225(io).is_err() {
+            return Err(I225NvmError::Sync);
+        }
+        let result = io.read_nvm_eerd(offset.wrapping_add(i as u16), &mut data[i..i + count]);
+        igc_release_nvm_i225(io);
+        result?;
+        i += count;
+    }
+    Ok(())
+}
+
+// upstream: igc_i225.c __igc_write_nvm_srwr()
+pub fn __igc_write_nvm_srwr<I: IgcI225Io>(
+    io: &mut I,
+    offset: u16,
+    words: &[u16],
+) -> Result<(), I225NvmError> {
+    let nvm_size = io.nvm_word_size();
+    if u32::from(offset) >= nvm_size
+        || words.len() as u32 > nvm_size - u32::from(offset)
+        || words.is_empty()
+    {
+        return Err(I225NvmError::Bounds);
+    }
+    for (i, data) in words.iter().enumerate() {
+        let eewr = ((u32::from(offset) + i as u32) << NVM_RW_ADDR_SHIFT)
+            | (u32::from(*data) << NVM_RW_REG_DATA)
+            | NVM_RW_REG_START;
+        io.write(SRWR, eewr);
+        let mut done = false;
+        for _ in 0..100_000 {
+            if io.read(SRWR) & NVM_RW_REG_DONE != 0 {
+                done = true;
+                break;
+            }
+            io.delay_us(5);
+        }
+        if !done {
+            return Err(I225NvmError::Timeout);
+        }
+    }
+    Ok(())
+}
+
+// upstream: igc_i225.c igc_write_nvm_srwr_i225()
+pub fn igc_write_nvm_srwr_i225<I: IgcI225NvmIo>(
+    io: &mut I,
+    offset: u16,
+    words: &[u16],
+) -> Result<(), I225NvmError> {
+    let mut i = 0usize;
+    while i < words.len() {
+        let count = (words.len() - i).min(EERD_EEWR_MAX_COUNT);
+        if igc_acquire_nvm_i225(io).is_err() {
+            return Err(I225NvmError::Sync);
+        }
+        let result = __igc_write_nvm_srwr(io, offset.wrapping_add(i as u16), &words[i..i + count]);
+        igc_release_nvm_i225(io);
+        result?;
+        i += count;
+    }
+    Ok(())
+}
+
+// upstream: igc_i225.c igc_validate_nvm_checksum_i225()
+pub fn igc_validate_nvm_checksum_i225<I: IgcI225NvmIo>(io: &mut I) -> Result<(), I225NvmError> {
+    if igc_acquire_nvm_i225(io).is_err() {
+        return Err(I225NvmError::Sync);
+    }
+    let result = io.validate_nvm_checksum_generic();
+    igc_release_nvm_i225(io);
+    result
+}
+
+// upstream: igc_i225.c igc_update_nvm_checksum_i225()
+pub fn igc_update_nvm_checksum_i225<I: IgcI225NvmIo>(io: &mut I) -> Result<(), I225NvmError> {
+    let mut nvm_data = [0u16; 1];
+    io.read_nvm_eerd(0, &mut nvm_data)?;
+    if igc_acquire_nvm_i225(io).is_err() {
+        return Err(I225NvmError::Sync);
+    }
+    let mut checksum = 0u16;
+    for i in 0..NVM_CHECKSUM_REG {
+        if let Err(error) = io.read_nvm_eerd(i, &mut nvm_data) {
+            igc_release_nvm_i225(io);
+            return Err(error);
+        }
+        checksum = checksum.wrapping_add(nvm_data[0]);
+    }
+    checksum = NVM_SUM.wrapping_sub(checksum);
+    if let Err(error) = __igc_write_nvm_srwr(io, NVM_CHECKSUM_REG, &[checksum]) {
+        igc_release_nvm_i225(io);
+        return Err(error);
+    }
+    igc_release_nvm_i225(io);
+    io.update_flash_i225()
+}
 
 pub trait IgcI225Io {
     fn read(&mut self, reg: u32) -> u32;
@@ -309,6 +442,8 @@ mod tests {
         clear_once: bool,
         delays: Vec<u32>,
         puts: usize,
+        nvm: Vec<u16>,
+        flash_updates: usize,
     }
     impl SemIo {
         fn read_reg(&self, reg: u32) -> u32 {
@@ -328,7 +463,7 @@ mod tests {
     }
     impl IgcI225Io for SemIo {
         fn read(&mut self, r: u32) -> u32 {
-            self.read_reg(r)
+            self.read_reg(r) | if r == SRWR { NVM_RW_REG_DONE } else { 0 }
         }
         fn write(&mut self, r: u32, v: u32) {
             self.write_reg(r, v)
@@ -353,6 +488,23 @@ mod tests {
             self.write_reg(SWSM, 0)
         }
     }
+    impl IgcI225NvmIo for SemIo {
+        fn read_nvm_eerd(&mut self, offset: u16, data: &mut [u16]) -> Result<(), I225NvmError> {
+            let start = usize::from(offset);
+            let Some(source) = self.nvm.get(start..start + data.len()) else {
+                return Err(I225NvmError::Bounds);
+            };
+            data.copy_from_slice(source);
+            Ok(())
+        }
+        fn validate_nvm_checksum_generic(&mut self) -> Result<(), I225NvmError> {
+            Ok(())
+        }
+        fn update_flash_i225(&mut self) -> Result<(), I225NvmError> {
+            self.flash_updates += 1;
+            Ok(())
+        }
+    }
     #[test]
     fn swfw_access_sets_software_bit_and_release_clears_only_requested_bit() {
         let mut io = SemIo {
@@ -364,5 +516,28 @@ mod tests {
         igc_release_nvm_i225(&mut io);
         assert_eq!(io.read_reg(SW_FW_SYNC), 0);
         assert_eq!(io.puts, 2);
+    }
+
+    #[test]
+    fn shadow_nvm_operations_chunk_and_checksum_then_commit_flash() {
+        let mut io = SemIo {
+            word_size: 1024,
+            nvm: (0..1024).map(|i| i as u16).collect(),
+            ..SemIo::default()
+        };
+        let mut out = alloc::vec![0; 513];
+        igc_read_nvm_srrd_i225(&mut io, 100, &mut out, 513).unwrap();
+        assert_eq!(out[0], 100);
+        assert_eq!(out[512], 612);
+        igc_write_nvm_srwr_i225(&mut io, 4, &[0xabcd, 0x1234]).unwrap();
+        assert_eq!((io.read_reg(SRWR) >> NVM_RW_ADDR_SHIFT) & 0x3fff, 5);
+        igc_update_nvm_checksum_i225(&mut io).unwrap();
+        assert_eq!(io.flash_updates, 1);
+        let checksum = NVM_SUM.wrapping_sub(
+            (0..NVM_CHECKSUM_REG)
+                .map(|n| n as u16)
+                .fold(0u16, u16::wrapping_add),
+        );
+        assert_eq!((io.read_reg(SRWR) >> NVM_RW_REG_DATA) as u16, checksum);
     }
 }
