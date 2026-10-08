@@ -2843,6 +2843,161 @@ pub fn em_disable_phy_wakeup<P: EmPhyWakeOps>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmIfInitConfig {
+    pub mac: E1000MacType,
+    pub media: EmMediaType,
+    pub vf: bool,
+    pub suspend_link_powered_down: bool,
+    pub vf_queues_sanitized: bool,
+    pub vf_mailbox_ready: bool,
+    pub has_manage: bool,
+    pub has_amt: bool,
+    pub msix: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmIfInitState {
+    pub vf_reset_pending: bool,
+    pub link: EmLinkState,
+    pub tx_rs_cursor: usize,
+    pub tx_processed_cursor: usize,
+    pub rx_mbuf_size: usize,
+}
+
+pub trait EmIfInitOps {
+    fn prepare_vf_retries(&mut self) -> DevResult;
+    fn power_up_wakeup_link(&mut self) -> DevResult;
+    fn station_address(&mut self) -> DevResult<[u8; 6]>;
+    fn set_station_address(&mut self, address: [u8; 6]);
+    fn set_primary_rar(&mut self, address: [u8; 6]) -> DevResult;
+    fn set_82571_laa_state(&mut self, enabled: bool) -> DevResult;
+    fn set_last_rar(&mut self, address: [u8; 6]) -> DevResult;
+    fn reset_iov_before_init(&mut self) -> DevResult;
+    fn reset_vf(&mut self) -> DevResult;
+    fn rebase_vf_stats(&mut self) -> DevResult;
+    fn reset_pf(&mut self) -> DevResult;
+    fn fence_busmaster(&mut self) -> DevResult;
+    fn init_failed(&mut self);
+    fn retry_vf_queues(&mut self);
+    fn retry_vf_mailbox(&mut self);
+    fn enable_busmaster(&mut self) -> DevResult;
+    fn reconcile_vf_mac(&mut self, address: [u8; 6]) -> DevResult;
+    fn update_admin_status(&mut self, vf: bool) -> DevResult;
+    fn initialize_tx_credits(&mut self) -> DevResult<(usize, usize)>;
+    fn write_vet(&mut self) -> DevResult;
+    fn flush_rx_fifo(&mut self) -> DevResult;
+    fn init_manageability(&mut self) -> DevResult;
+    fn initialize_tx_unit(&mut self, vf: bool) -> DevResult;
+    fn restore_address_lists(&mut self) -> DevResult;
+    fn rx_mbuf_size(&mut self) -> usize;
+    fn initialize_rx_unit(&mut self, vf: bool) -> DevResult;
+    fn setup_vlan(&mut self) -> DevResult;
+    fn restore_promisc(&mut self) -> DevResult;
+    fn initialize_iov(&mut self) -> DevResult;
+    fn clear_hardware_counters(&mut self) -> DevResult;
+    fn configure_82574_interrupts(&mut self) -> DevResult;
+    fn configure_msix_queues(&mut self) -> DevResult;
+    fn initialize_interrupt_rate(&mut self) -> DevResult;
+    fn get_hardware_control(&mut self) -> DevResult;
+    fn set_eee(&mut self) -> DevResult;
+    fn configure_memory_error_paths(&mut self) -> DevResult;
+    fn drain_reset_cause_and_finish(&mut self) -> DevResult<bool>;
+}
+
+/// upstream: if_em.c em_if_init()
+pub fn em_if_init<O: EmIfInitOps>(
+    ops: &mut O,
+    config: EmIfInitConfig,
+    state: &mut EmIfInitState,
+) -> DevResult {
+    if config.vf {
+        ops.prepare_vf_retries()?;
+        state.vf_reset_pending = true;
+    }
+    if config.suspend_link_powered_down {
+        let _ = ops.power_up_wakeup_link();
+    }
+    let address = ops.station_address()?;
+    ops.set_station_address(address);
+    if !config.vf {
+        ops.set_primary_rar(address)?;
+        if config.mac == E1000MacType::I82571 {
+            ops.set_82571_laa_state(true)?;
+            ops.set_last_rar(address)?;
+        }
+    }
+    ops.reset_iov_before_init()?;
+    if config.vf {
+        let _ = ops.reset_vf();
+        ops.rebase_vf_stats()?;
+    } else if ops.reset_pf().is_err() {
+        ops.fence_busmaster()?;
+        ops.init_failed();
+        return Ok(());
+    }
+    if config.vf && !config.vf_queues_sanitized {
+        ops.fence_busmaster()?;
+        ops.retry_vf_queues();
+        return Ok(());
+    }
+    if config.vf && !config.vf_mailbox_ready {
+        ops.retry_vf_mailbox();
+        return Ok(());
+    }
+    if ops.enable_busmaster().is_err() {
+        ops.init_failed();
+        return Ok(());
+    }
+    if config.vf {
+        ops.reconcile_vf_mac(address)?;
+    }
+    if matches!(
+        state.link,
+        EmLinkState::DownResetPending | EmLinkState::UpResetPending
+    ) {
+        state.link = EmLinkState::Down;
+    }
+    ops.update_admin_status(config.vf)?;
+    (state.tx_rs_cursor, state.tx_processed_cursor) = ops.initialize_tx_credits()?;
+    if !config.vf {
+        ops.write_vet()?;
+    }
+    if config.mac >= E1000MacType::I82575 && !config.vf {
+        ops.flush_rx_fifo()?;
+    }
+    ops.init_manageability()?;
+    ops.initialize_tx_unit(config.vf)?;
+    ops.restore_address_lists()?;
+    state.rx_mbuf_size = ops.rx_mbuf_size();
+    ops.initialize_rx_unit(config.vf)?;
+    ops.setup_vlan()?;
+    ops.restore_promisc()?;
+    ops.initialize_iov()?;
+    ops.clear_hardware_counters()?;
+    if config.mac == E1000MacType::I82574 {
+        ops.configure_82574_interrupts()?;
+    } else if config.msix {
+        ops.configure_msix_queues()?;
+    }
+    if config.mac >= E1000MacType::I82575 {
+        ops.initialize_interrupt_rate()?;
+    }
+    if config.has_manage && config.has_amt {
+        ops.get_hardware_control()?;
+    }
+    if config.mac >= E1000MacType::I82575 && config.media == EmMediaType::Copper {
+        ops.set_eee()?;
+    }
+    ops.configure_memory_error_paths()?;
+    if config.vf {
+        state.vf_reset_pending = false;
+    } else if ops.drain_reset_cause_and_finish()? {
+        ops.init_failed();
+    }
+    Ok(())
+}
+
 pub trait EmRxUnitOps {
     fn initialize_rss(&mut self) -> DevResult;
     fn initialize_advanced_rx_rings(&mut self, drop: bool) -> DevResult;
@@ -4539,6 +4694,112 @@ mod tests {
         acquired: usize,
         released: usize,
     }
+
+    #[derive(Default)]
+    struct IfInitMock {
+        log: Vec<&'static str>,
+        fail_reset: bool,
+        init_failures: usize,
+    }
+    macro_rules! init_ok {
+        ($name:ident, $label:literal) => {
+            fn $name(&mut self) -> DevResult {
+                self.log.push($label);
+                Ok(())
+            }
+        };
+    }
+    impl EmIfInitOps for IfInitMock {
+        init_ok!(prepare_vf_retries, "vf_retry_prepare");
+        init_ok!(power_up_wakeup_link, "power_up");
+        fn station_address(&mut self) -> DevResult<[u8; 6]> {
+            self.log.push("get_mac");
+            Ok([2, 1, 2, 3, 4, 5])
+        }
+        fn set_station_address(&mut self, _address: [u8; 6]) {
+            self.log.push("set_mac");
+        }
+        fn set_primary_rar(&mut self, _address: [u8; 6]) -> DevResult {
+            self.log.push("rar0");
+            Ok(())
+        }
+        fn set_82571_laa_state(&mut self, _enabled: bool) -> DevResult {
+            self.log.push("laa");
+            Ok(())
+        }
+        fn set_last_rar(&mut self, _address: [u8; 6]) -> DevResult {
+            self.log.push("rar_last");
+            Ok(())
+        }
+        init_ok!(reset_iov_before_init, "iov_reset");
+        fn reset_vf(&mut self) -> DevResult {
+            self.log.push("vf_reset");
+            Ok(())
+        }
+        init_ok!(rebase_vf_stats, "vf_stats");
+        fn reset_pf(&mut self) -> DevResult {
+            self.log.push("pf_reset");
+            if self.fail_reset {
+                Err(DevError::Io)
+            } else {
+                Ok(())
+            }
+        }
+        init_ok!(fence_busmaster, "fence");
+        fn init_failed(&mut self) {
+            self.log.push("init_failed");
+            self.init_failures += 1;
+        }
+        fn retry_vf_queues(&mut self) {
+            self.log.push("retry_queues");
+        }
+        fn retry_vf_mailbox(&mut self) {
+            self.log.push("retry_mailbox");
+        }
+        init_ok!(enable_busmaster, "busmaster");
+        fn reconcile_vf_mac(&mut self, _address: [u8; 6]) -> DevResult {
+            self.log.push("reconcile");
+            Ok(())
+        }
+        fn update_admin_status(&mut self, vf: bool) -> DevResult {
+            self.log.push(if vf { "admin_vf" } else { "admin_pf" });
+            Ok(())
+        }
+        fn initialize_tx_credits(&mut self) -> DevResult<(usize, usize)> {
+            self.log.push("txcredits");
+            Ok((7, 6))
+        }
+        init_ok!(write_vet, "vet");
+        init_ok!(flush_rx_fifo, "rx_fifo");
+        init_ok!(init_manageability, "manage");
+        fn initialize_tx_unit(&mut self, vf: bool) -> DevResult {
+            self.log.push(if vf { "tx_vf" } else { "tx_pf" });
+            Ok(())
+        }
+        init_ok!(restore_address_lists, "address_lists");
+        fn rx_mbuf_size(&mut self) -> usize {
+            self.log.push("mbuf_size");
+            2048
+        }
+        fn initialize_rx_unit(&mut self, vf: bool) -> DevResult {
+            self.log.push(if vf { "rx_vf" } else { "rx_pf" });
+            Ok(())
+        }
+        init_ok!(setup_vlan, "vlan");
+        init_ok!(restore_promisc, "promisc");
+        init_ok!(initialize_iov, "iov_init");
+        init_ok!(clear_hardware_counters, "counters");
+        init_ok!(configure_82574_interrupts, "82574_vectors");
+        init_ok!(configure_msix_queues, "msix_queues");
+        init_ok!(initialize_interrupt_rate, "itr");
+        init_ok!(get_hardware_control, "hw_control");
+        init_ok!(set_eee, "eee");
+        init_ok!(configure_memory_error_paths, "ecc");
+        fn drain_reset_cause_and_finish(&mut self) -> DevResult<bool> {
+            self.log.push("finish_reset");
+            Ok(false)
+        }
+    }
     impl super::super::chipich8::Ich8PhyRegOps for PhyWakeMock {
         fn read_reg(&mut self, reg: u16) -> DevResult<u16> {
             Ok(self.regs.get(&(0, reg)).copied().unwrap_or(0))
@@ -5155,5 +5416,77 @@ mod tests {
             Some(&(0x34 & !BM_WUC_HOST_WU_BIT))
         );
         assert_eq!((phy.acquired, phy.released), (2, 2));
+    }
+
+    #[test]
+    fn if_init_preserves_device_reset_and_ring_setup_order() {
+        let mut ops = IfInitMock::default();
+        let mut state = EmIfInitState {
+            link: EmLinkState::UpResetPending,
+            ..EmIfInitState::default()
+        };
+        em_if_init(
+            &mut ops,
+            EmIfInitConfig {
+                mac: E1000MacType::I82574,
+                media: EmMediaType::Fiber,
+                vf: false,
+                suspend_link_powered_down: true,
+                vf_queues_sanitized: true,
+                vf_mailbox_ready: true,
+                has_manage: true,
+                has_amt: true,
+                msix: true,
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(state.link, EmLinkState::Down);
+        assert_eq!(
+            (
+                state.tx_rs_cursor,
+                state.tx_processed_cursor,
+                state.rx_mbuf_size
+            ),
+            (7, 6, 2048)
+        );
+        assert_eq!(ops.log.first(), Some(&"power_up"));
+        assert_eq!(ops.log.iter().position(|s| *s == "pf_reset"), Some(5));
+        assert!(
+            ops.log.iter().position(|s| *s == "busmaster").unwrap()
+                < ops.log.iter().position(|s| *s == "admin_pf").unwrap()
+        );
+        assert!(
+            ops.log.iter().position(|s| *s == "tx_pf").unwrap()
+                < ops.log.iter().position(|s| *s == "rx_pf").unwrap()
+        );
+        assert_eq!(ops.log.last(), Some(&"finish_reset"));
+        assert!(!ops.log.contains(&"msix_queues"));
+        assert!(ops.log.contains(&"82574_vectors"));
+
+        let mut failed = IfInitMock {
+            fail_reset: true,
+            ..IfInitMock::default()
+        };
+        let mut state = EmIfInitState::default();
+        em_if_init(
+            &mut failed,
+            EmIfInitConfig {
+                mac: E1000MacType::I82540,
+                media: EmMediaType::Copper,
+                vf: false,
+                suspend_link_powered_down: false,
+                vf_queues_sanitized: true,
+                vf_mailbox_ready: true,
+                has_manage: false,
+                has_amt: false,
+                msix: false,
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(failed.log.last(), Some(&"init_failed"));
+        assert_eq!(failed.init_failures, 1);
+        assert!(!failed.log.contains(&"busmaster"));
     }
 }
