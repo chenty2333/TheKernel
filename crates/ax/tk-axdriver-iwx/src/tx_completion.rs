@@ -15,6 +15,7 @@ pub const TX_STATUS_MASK: u16 = 0xff;
 pub const COMPRESSED_BA_HEADER_BYTES: usize = 32;
 pub const COMPRESSED_BA_RATID_BYTES: usize = 4;
 pub const COMPRESSED_BA_TFD_BYTES: usize = 8;
+pub const TX_RING_LOW_MARK: usize = 192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxCompletionError {
@@ -30,6 +31,86 @@ pub struct TxStatusNotification {
     pub status: u16,
     pub failed: bool,
     pub scd_ssn: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxCompletionOutcome {
+    pub aggregate: bool,
+    pub failed: bool,
+    pub completed_slots: Vec<usize>,
+    pub restart_output: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxCompletionProcessError {
+    InvalidQueue,
+    Parse(TxCompletionError),
+    Ring(crate::RingError),
+}
+
+/// Complete TX responses, reclaim per-slot DMA owners, and clear queue pressure.
+// upstream: if_iwx.c iwx_rx_tx_cmd()
+pub fn complete_tx_response<R: crate::DmaRegion>(
+    ring: &mut crate::TxRing<R>,
+    queues: &mut crate::TxQueueState,
+    queue_id: u16,
+    first_aggregate_queue: u16,
+    payload: &[u8],
+    output_active: bool,
+    mut packet_done: impl FnMut(usize, Option<R>),
+) -> Result<TxCompletionOutcome, TxCompletionProcessError> {
+    let qid = usize::from(queue_id);
+    if qid >= 32 || ring.queue_id != queue_id {
+        return Err(TxCompletionProcessError::InvalidQueue);
+    }
+    let status = parse_tx_status(
+        payload,
+        queue_id,
+        first_aggregate_queue,
+        ring.max_tfd_queue_size,
+    )
+    .map_err(TxCompletionProcessError::Parse)?;
+    if status.frame_count > 1 {
+        return Ok(TxCompletionOutcome {
+            aggregate: true,
+            failed: false,
+            completed_slots: Vec::new(),
+            restart_output: false,
+        });
+    }
+    let hardware_index = status.scd_ssn.unwrap_or(ring.tail_hardware as u32) as usize;
+    let mut completed_slots = ring
+        .advance_to(hardware_index)
+        .map_err(TxCompletionProcessError::Ring)?;
+    for index in &completed_slots {
+        let payload = ring
+            .take_payload_buffer(*index)
+            .map_err(TxCompletionProcessError::Ring)?;
+        packet_done(*index, payload);
+    }
+    let restart_output = clear_oactive(ring, queues, qid, output_active);
+    Ok(TxCompletionOutcome {
+        aggregate: false,
+        failed: status.failed,
+        completed_slots: core::mem::take(&mut completed_slots),
+        restart_output,
+    })
+}
+
+/// Clear queue pressure below the source low-water mark and wake output.
+// upstream: if_iwx.c iwx_clear_oactive()
+fn clear_oactive<R: crate::DmaRegion>(
+    ring: &crate::TxRing<R>,
+    queues: &mut crate::TxQueueState,
+    queue_id: usize,
+    output_active: bool,
+) -> bool {
+    if ring.queued < TX_RING_LOW_MARK {
+        queues.full_mask &= !(1 << queue_id);
+        output_active && queues.full_mask == 0
+    } else {
+        false
+    }
 }
 
 /// Validate a TX response and extract its status/queue consumer SSN.
@@ -161,7 +242,59 @@ const fn le_u32(bytes: &[u8], offset: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use core::cell::Cell;
+
     use super::*;
+
+    struct TestRegion {
+        address: u64,
+        bytes: Vec<u8>,
+    }
+    impl crate::DmaRegion for TestRegion {
+        fn device_address(&self) -> u64 {
+            self.address
+        }
+        fn capacity(&self) -> usize {
+            self.bytes.len()
+        }
+        fn write(&mut self, bytes: &[u8]) -> Result<(), crate::DmaError> {
+            self.write_at(0, bytes)
+        }
+        fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), crate::DmaError> {
+            let end = offset
+                .checked_add(bytes.len())
+                .ok_or(crate::DmaError::RegionTooSmall)?;
+            self.bytes
+                .get_mut(offset..end)
+                .ok_or(crate::DmaError::RegionTooSmall)?
+                .copy_from_slice(bytes);
+            Ok(())
+        }
+        fn read_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), crate::DmaError> {
+            let end = offset
+                .checked_add(bytes.len())
+                .ok_or(crate::DmaError::RegionTooSmall)?;
+            bytes.copy_from_slice(
+                self.bytes
+                    .get(offset..end)
+                    .ok_or(crate::DmaError::RegionTooSmall)?,
+            );
+            Ok(())
+        }
+    }
+    struct TestAllocator(Cell<u64>);
+    impl crate::DmaAllocator for TestAllocator {
+        type Region = TestRegion;
+        fn allocate(&mut self, size: usize) -> Result<TestRegion, crate::DmaError> {
+            let address = self.0.get().next_multiple_of(4096);
+            self.0.set(address + size as u64);
+            Ok(TestRegion {
+                address,
+                bytes: vec![0; size],
+            })
+        }
+    }
 
     #[test]
     fn tx_response_checks_queue_kind_and_extracts_nonaggregate_ssn() {
@@ -213,5 +346,46 @@ mod tests {
             parse_compressed_ba(&payload[..payload.len() - 1]),
             Err(TxCompletionError::InvalidLength)
         );
+    }
+
+    #[test]
+    fn tx_response_advances_ring_releases_packet_and_clears_oactive() {
+        let mut allocator = TestAllocator(Cell::new(0x1000));
+        let mut ring = crate::allocate_tx_ring(&mut allocator, 2).unwrap();
+        ring.submit(
+            &[crate::TxSegment {
+                address: 0x8000,
+                length: 64,
+            }],
+            64,
+        )
+        .unwrap();
+        let mut queues = crate::TxQueueState {
+            full_mask: 1 << 2,
+            ..crate::TxQueueState::default()
+        };
+        let mut payload = [0; TX_RESPONSE_HEADER_BYTES + TX_STATUS_BYTES + 4];
+        payload[0] = 1;
+        payload[40..42].copy_from_slice(&TX_STATUS_SUCCESS.to_le_bytes());
+        payload[44..48].copy_from_slice(&1u32.to_le_bytes());
+        let mut retired = Vec::new();
+        let outcome = complete_tx_response(
+            &mut ring,
+            &mut queues,
+            2,
+            2,
+            &payload,
+            true,
+            |idx, owner| {
+                assert!(owner.is_none());
+                retired.push(idx);
+            },
+        )
+        .unwrap();
+        assert_eq!(retired, [0]);
+        assert_eq!(outcome.completed_slots, [0]);
+        assert!(outcome.restart_output);
+        assert_eq!(queues.full_mask, 0);
+        assert_eq!(ring.queued, 0);
     }
 }

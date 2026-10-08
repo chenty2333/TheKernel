@@ -140,11 +140,47 @@ pub fn submit_tx_frame<B: crate::CsrAccess, R: crate::DmaRegion>(
     frame: &TxFrame<'_>,
 ) -> Result<usize, TxError> {
     let encoded = encode_tx_frame(family, frame)?;
+    ring.commands.write_at(
+        ring.current * crate::rings::TX_COMMAND_BYTES,
+        &encoded.command,
+    )?;
+    let segments = tx_segments(ring, frame, &encoded)?;
+    Ok(ring.submit_and_kick(registers, &segments, encoded.byte_count)?)
+}
+
+/// Submit a packet while keeping its DMA storage owned until hardware completion.
+// upstream: if_iwx.c iwx_tx()
+pub fn submit_tx_frame_owned<B: crate::CsrAccess, R: crate::DmaRegion>(
+    registers: &mut crate::IwxRegisters<B>,
+    ring: &mut TxRing<R>,
+    family: DeviceFamily,
+    frame: &TxFrame<'_>,
+    payload: R,
+) -> Result<usize, TxError> {
+    let encoded = encode_tx_frame(family, frame)?;
     let command_address = ring.command_address(ring.current)?;
     ring.commands.write_at(
         ring.current * crate::rings::TX_COMMAND_BYTES,
         &encoded.command,
     )?;
+    let segments = tx_segments_at(frame, &encoded, command_address)?;
+    Ok(ring.submit_owned_and_kick(registers, &segments, encoded.byte_count, payload)?)
+}
+
+fn tx_segments<R: crate::DmaRegion>(
+    ring: &TxRing<R>,
+    frame: &TxFrame<'_>,
+    encoded: &EncodedTxFrame,
+) -> Result<Vec<TxSegment>, TxError> {
+    let command_address = ring.command_address(ring.current)?;
+    tx_segments_at(frame, encoded, command_address)
+}
+
+fn tx_segments_at(
+    frame: &TxFrame<'_>,
+    encoded: &EncodedTxFrame,
+    command_address: u64,
+) -> Result<Vec<TxSegment>, TxError> {
     let first_bytes = encoded.command.len().min(crate::command::FIRST_TB_BYTES);
     let mut segments = Vec::new();
     segments
@@ -166,7 +202,7 @@ pub fn submit_tx_frame<B: crate::CsrAccess, R: crate::DmaRegion>(
         });
     }
     segments.extend_from_slice(frame.payload_segments);
-    Ok(ring.submit_and_kick(registers, &segments, encoded.byte_count)?)
+    Ok(segments)
 }
 
 #[cfg(test)]

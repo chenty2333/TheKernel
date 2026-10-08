@@ -193,6 +193,8 @@ pub struct TxRing<R: DmaRegion> {
     pub tail: usize,
     pub tail_hardware: usize,
     pub queued: usize,
+    inflight: [bool; TX_RING_COUNT],
+    payload_buffers: Vec<Option<R>>,
 }
 
 impl<R: DmaRegion> TxRing<R> {
@@ -225,6 +227,45 @@ impl<R: DmaRegion> TxRing<R> {
     ) -> Result<usize, RingError> {
         let index = self.submit(segments, byte_count)?;
         registers.kick_tx_queue(self.queue_id, self.current_hardware);
+        Ok(index)
+    }
+
+    /// Submit one frame while retaining its DMA buffer until TX completion.
+    // upstream: if_iwx.c iwx_tx()
+    pub fn submit_owned_and_kick<B: crate::CsrAccess>(
+        &mut self,
+        registers: &mut crate::IwxRegisters<B>,
+        segments: &[TxSegment],
+        byte_count: u16,
+        payload: R,
+    ) -> Result<usize, RingError> {
+        let index = self.submit_owned(segments, byte_count, payload)?;
+        registers.kick_tx_queue(self.queue_id, self.current_hardware);
+        Ok(index)
+    }
+
+    /// Submit one frame and transfer its payload DMA ownership to this ring.
+    // upstream: if_iwx.c iwx_tx()
+    pub fn submit_owned(
+        &mut self,
+        segments: &[TxSegment],
+        byte_count: u16,
+        payload: R,
+    ) -> Result<usize, RingError> {
+        let start = payload.device_address();
+        let end = start
+            .checked_add(payload.capacity() as u64)
+            .ok_or(RingError::InvalidIndex)?;
+        let references_payload = segments.iter().any(|segment| {
+            let segment_end = segment.address.checked_add(u64::from(segment.length));
+            segment.address >= start && segment_end.is_some_and(|segment_end| segment_end <= end)
+        });
+        if !references_payload {
+            return Err(RingError::InvalidIndex);
+        }
+        let index = self.current;
+        self.submit(segments, byte_count)?;
+        self.payload_buffers[index] = Some(payload);
         Ok(index)
     }
 
@@ -277,6 +318,7 @@ impl<R: DmaRegion> TxRing<R> {
         self.current = (self.current + 1) % TX_RING_COUNT;
         self.current_hardware = (self.current_hardware + 1) % self.max_tfd_queue_size;
         self.queued += 1;
+        self.inflight[index] = true;
         Ok(index)
     }
 
@@ -291,14 +333,39 @@ impl<R: DmaRegion> TxRing<R> {
             completed
                 .try_reserve(1)
                 .map_err(|_| RingError::Dma(DmaError::AllocationFailed))?;
-            completed.push(self.tail);
+            if self.inflight[self.tail] {
+                completed.push(self.tail);
+                self.clear_descriptor(self.tail)?;
+                self.inflight[self.tail] = false;
+                self.queued = self.queued.saturating_sub(1);
+            }
             self.tail = (self.tail + 1) % TX_RING_COUNT;
             self.tail_hardware = (self.tail_hardware + 1) % self.max_tfd_queue_size;
-            if self.queued > 0 {
-                self.queued -= 1;
-            }
         }
         Ok(completed)
+    }
+
+    /// Retire a host-command TFD on its per-slot firmware acknowledgement.
+    // upstream: if_iwx.c iwx_cmd_done()
+    pub fn command_done(&mut self, index: usize) -> Result<bool, RingError> {
+        if index >= TX_RING_COUNT {
+            return Err(RingError::InvalidIndex);
+        }
+        if !self.inflight[index] {
+            return Ok(false);
+        }
+        self.inflight[index] = false;
+        self.queued = self.queued.saturating_sub(1);
+        Ok(true)
+    }
+
+    /// Return a completed packet's DMA ownership to the driver callback.
+    // upstream: if_iwx.c iwx_txd_done()
+    pub fn take_payload_buffer(&mut self, index: usize) -> Result<Option<R>, RingError> {
+        self.payload_buffers
+            .get_mut(index)
+            .map(Option::take)
+            .ok_or(RingError::InvalidIndex)
     }
 
     /// Keep the bidirectional first TB and clear all other descriptor slots.
@@ -330,6 +397,10 @@ impl<R: DmaRegion> TxRing<R> {
         self.tail = 0;
         self.tail_hardware = 0;
         self.queued = 0;
+        self.inflight.fill(false);
+        for buffer in &mut self.payload_buffers {
+            buffer.take();
+        }
         zero_region(&mut self.descriptors)?;
         zero_region(&mut self.byte_counts)?;
         Ok(())
@@ -360,6 +431,11 @@ pub fn allocate_tx_ring_for<A: DmaAllocator>(
         TX_RING_COUNT * TX_COMMAND_BYTES,
         TX_COMMAND_ALIGNMENT,
     )?;
+    let mut payload_buffers = Vec::new();
+    payload_buffers
+        .try_reserve_exact(TX_RING_COUNT)
+        .map_err(|_| RingError::Dma(DmaError::AllocationFailed))?;
+    payload_buffers.resize_with(TX_RING_COUNT, || None);
     Ok(TxRing {
         descriptors,
         byte_counts,
@@ -371,6 +447,8 @@ pub fn allocate_tx_ring_for<A: DmaAllocator>(
         tail: 0,
         tail_hardware: 0,
         queued: 0,
+        inflight: [false; TX_RING_COUNT],
+        payload_buffers,
     })
 }
 
@@ -587,5 +665,59 @@ mod tests {
         ring.tail_hardware = GEN3_MAX_TFD_QUEUE_SIZE - 1;
         assert_eq!(ring.advance_to(0).unwrap(), [0]);
         assert_eq!(ring.tail_hardware, 0);
+    }
+
+    #[test]
+    fn tx_completion_retires_only_live_slots_and_command_ack_reclaims_queue() {
+        let mut alloc = Alloc(Cell::new(0x1000));
+        let mut ring = allocate_tx_ring(&mut alloc, 0).unwrap();
+        let command_index = ring
+            .submit_without_byte_count(&[TxSegment {
+                address: 0x4000,
+                length: 16,
+            }])
+            .unwrap();
+        assert_eq!(ring.command_done(command_index).unwrap(), true);
+        assert_eq!(ring.queued, 0);
+        assert_eq!(ring.command_done(command_index).unwrap(), false);
+
+        ring.submit(
+            &[TxSegment {
+                address: 0x5000,
+                length: 64,
+            }],
+            64,
+        )
+        .unwrap();
+        assert_eq!(ring.advance_to(2).unwrap(), [1]);
+        assert_eq!(ring.queued, 0);
+    }
+
+    #[test]
+    fn tx_ring_holds_payload_dma_until_iwx_txd_done_takes_ownership() {
+        let mut alloc = Alloc(Cell::new(0x1000));
+        let mut ring = allocate_tx_ring(&mut alloc, 2).unwrap();
+        let payload = alloc.allocate(128).unwrap();
+        let address = payload.device_address();
+        assert_eq!(
+            ring.submit_owned(
+                &[TxSegment {
+                    address,
+                    length: 64,
+                }],
+                64,
+                payload,
+            ),
+            Ok(0)
+        );
+        assert_eq!(ring.advance_to(1).unwrap(), [0]);
+        assert_eq!(
+            ring.take_payload_buffer(0)
+                .unwrap()
+                .unwrap()
+                .device_address(),
+            address
+        );
+        assert!(ring.take_payload_buffer(0).unwrap().is_none());
     }
 }

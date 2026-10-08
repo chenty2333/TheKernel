@@ -82,6 +82,7 @@ pub struct IwxController<B: CsrAccess, A: DmaAllocator> {
     pub pcie_features: crate::ApmPcieFeatures,
     pub generation: u32,
     pub hardware_rfkill: bool,
+    pub tx_errors: u64,
 }
 
 impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
@@ -115,6 +116,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             },
             generation,
             hardware_rfkill: false,
+            tx_errors: 0,
         })
     }
 
@@ -249,12 +251,14 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
 
             let generation = self.generation;
             let family = self.family;
-            let (rx_queue, allocator, command_slots) = (
+            let (rx_queue, allocator, command_slots, tx_queues) = (
                 &mut self.resources.rx_queue,
                 &mut self.allocator,
                 &mut self.command_slots,
+                &mut self.resources.tx_queues,
             );
             let command_slots = RefCell::new(command_slots);
+            let tx_queues = RefCell::new(tx_queues);
             crate::process_rx_buffer(
                 &buffer,
                 family >= DeviceFamily::Ax210,
@@ -287,7 +291,17 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
                         .borrow_mut()
                         .command_done(queue, usize::from(index), generation)
                         .map_err(RxServiceError::Command)
-                        .map(|_| ())
+                        .and_then(|_| {
+                            if usize::from(queue) == crate::DQA_CMD_QUEUE as usize {
+                                tx_queues
+                                    .borrow_mut()
+                                    .get_mut(usize::from(crate::DQA_CMD_QUEUE))
+                                    .ok_or(RxServiceError::Ring(crate::RingError::InvalidIndex))?
+                                    .command_done(usize::from(index))
+                                    .map_err(RxServiceError::Ring)?;
+                            }
+                            Ok(())
+                        })
                 },
             )
             .map_err(|error| match error {
@@ -532,6 +546,34 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             now_usec,
             frame,
         )
+    }
+
+    /// Dispatch one TX response, release completed DMA owners and update pressure.
+    // upstream: if_iwx.c iwx_rx_tx_cmd()
+    pub fn process_tx_response(
+        &mut self,
+        queue_id: u16,
+        first_aggregate_queue: u16,
+        payload: &[u8],
+        output_active: bool,
+        mut packet_done: impl FnMut(usize, Option<A::Region>),
+    ) -> Result<crate::TxCompletionOutcome, crate::TxCompletionProcessError> {
+        let Some(ring) = self.resources.tx_queues.get_mut(usize::from(queue_id)) else {
+            return Err(crate::TxCompletionProcessError::InvalidQueue);
+        };
+        let outcome = crate::complete_tx_response(
+            ring,
+            &mut self.tx_queue_state,
+            queue_id,
+            first_aggregate_queue,
+            payload,
+            output_active,
+            |index, payload| packet_done(index, payload),
+        )?;
+        if outcome.failed {
+            self.tx_errors = self.tx_errors.saturating_add(1);
+        }
+        Ok(outcome)
     }
 
     /// Publish Init/regular firmware context and wait for the matching ALIVE event.
@@ -896,6 +938,7 @@ mod tests {
         assert!(completed.response.is_none());
         assert!(completed.external_payload_released);
         assert_eq!(controller.command_slots.queued(), 0);
+        assert_eq!(controller.resources.tx_queues[0].queued, 0);
     }
 
     #[test]

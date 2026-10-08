@@ -113,6 +113,11 @@ Block-ack callbacks now retain RX-start/RX-stop/TX-start TID masks, enforce the
 source BAID/TID/window and DQA gates, and dispatch deferred requests in the
 OpenBSD RX-then-TX task order. The future net80211 adapter supplies the actual
 per-peer BA state and task-enqueue callback.
+
+TX queues now track occupied descriptor slots through the source consumer SSN,
+reclaim descriptor/byte-count state, retain owned payload DMA buffers until
+completion, retire host-command queue occupancy on CMD_DONE, and expose the
+source oactive low-water restart decision to the network adapter.
 The firmware-event classifier covers the remaining UAPSD, thermal, MCC,
 session-protection, channel-switch, statistics, RLC/TLC, and ignorable command
 branches so the platform dispatcher can apply side effects without losing ACKs.

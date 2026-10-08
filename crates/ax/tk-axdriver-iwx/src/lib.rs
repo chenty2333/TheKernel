@@ -340,11 +340,14 @@ pub use statistics::{
     system_statistics_end_notification, wait_system_statistics_clear,
 };
 pub use task::{TaskReferences, add_task, delete_task, release_task_reference};
-pub use tx::{EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame};
+pub use tx::{
+    EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame, submit_tx_frame_owned,
+};
 pub use tx_completion::{
     COMPRESSED_BA_HEADER_BYTES, COMPRESSED_BA_RATID_BYTES, COMPRESSED_BA_TFD_BYTES,
-    CompressedBaNotification, CompressedBaTfd, TX_RESPONSE_HEADER_BYTES, TX_STATUS_DIRECT_DONE,
-    TX_STATUS_MASK, TX_STATUS_SUCCESS, TxCompletionError, TxStatusNotification,
+    CompressedBaNotification, CompressedBaTfd, TX_RESPONSE_HEADER_BYTES, TX_RING_LOW_MARK,
+    TX_STATUS_DIRECT_DONE, TX_STATUS_MASK, TX_STATUS_SUCCESS, TxCompletionError,
+    TxCompletionOutcome, TxCompletionProcessError, TxStatusNotification, complete_tx_response,
     parse_compressed_ba, parse_tx_status,
 };
 pub use tx_start::{
