@@ -65,3 +65,13 @@ builds one root entry/context page per bus before unit initialization. The Rust
 PY
 rustfmt --edition 2024 crates/ax/tk-vtd/src/driver.rs crates/ax/tk-vtd/src/lib.rs kernel/src/acpi/vtd.rs
 git diff --check && export THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets/wt-platform CARGO_BUILD_JOBS=3; cargo test -p tk-vtd --lib >/home/ava/.cache/thekernel-targets/wt-platform-vtd-driver-test.log && cargo check -p tk-kernel --features 'input nvme intel-hda watchdog-itco pmu perf-sampling bpf hwp-uclamp' --target x86_64-unknown-none >/home/ava/.cache/thekernel-targets/wt-platform-vtd-driver-check.log && git add crates/ax/tk-vtd/src/driver.rs crates/ax/tk-vtd/src/lib.rs kernel/src/acpi/vtd.rs docs/upstream-provenance.md docs/licensing.md docs/design/vtd.md && git commit -m 'vtd: translate FreeBSD Intel DMAR driver routing' && git status --short
+The generic FreeBSD `iommu_gas.c` allocator is ported to `tk-vtd/src/gas.rs`
+(31/33 functions; only two DDB GAS views omitted). Its address-ordered first-fit
+now preserves page guard gaps, boundary/alignment and low/high bounds, fixed
+RMRR overlap handling, partial unmap clipping and deferred entry lifetime.
+`IovaAllocator` delegates to this GAS facade and returns guarded IOVAs. The
+source's augmented intrusive RB tree is represented by a sorted vector scan;
+this is behaviorally bounded by domain entries but has O(n) scans rather than
+RB-tree logarithmic lookup. A product lint attempt after the previous five-commit
+batch stopped on seven existing undocumented-unsafe errors under
+`crates/ax/tk-axallocator/{slab,tlsf}.rs`; no unrelated allocator edits were made.

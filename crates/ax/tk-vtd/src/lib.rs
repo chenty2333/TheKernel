@@ -16,6 +16,7 @@ pub mod context;
 pub mod dmar;
 pub mod driver;
 pub mod fault;
+pub mod gas;
 pub mod idpgtbl;
 pub mod iova;
 pub mod pgtbl;
