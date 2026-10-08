@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 pub mod dmar;
 pub mod iova;
 pub mod pgtbl;
+pub mod utils;
 pub mod reg;
 
 const DMAR_HEADER_SIZE: usize = 48;
@@ -29,6 +30,8 @@ pub enum Error {
     NoDomain,
     MapFailed,
     InvalidRange,
+    Timeout,
+    Unsupported,
 }
 
 #[crate_interface::def_interface]

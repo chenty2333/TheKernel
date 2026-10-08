@@ -5,3 +5,16 @@
 The new DMA facade maps page-rounded physical ranges into a disjoint IOVA window and invalidates each unit before returning the device address. VirtIO's DMA allocation/share/map/unmap seam and NVMe's coherent allocation seam use this facade; neither places a CPU physical address in a new descriptor when DMAR is active. Legacy drivers continue to address the identity portion.
 
 Current limitation: all PCI requester contexts share one second-level domain and one IOVA allocator; this supplies translated addresses but is not per-device isolation. Interrupt-remapping tables/MSI remapping and fault-event interrupt delivery are not enabled yet; faults are polled and cause fail-closed map/probe behavior. Translation-mode QEMU acceptance is **not achieved**: with split-irqchip `intel-iommu,intremap=on` and a VirtIO-block rootfs, the guest reached ACPI/VT-d initialization completion (including QI and translation enable) but then stalled before the shell acceptance marker and timed out. A diagnostic identity-DMA run with second-level contexts retained passed the block/network command sequence, narrowing the unresolved issue to translated DMA use, but not identifying the exact defect. FreeBSD's QI enable path preserves its software `hw_gcmd` bits and waits for GSTS.QIES (`intel_qi.c`); its context path flushes modified context entries before enabling translation (`intel_ctx.c`). The corresponding ordering is not yet proven equivalent here. Do not enable translation by default or treat the identity-mode run as translated-DMA acceptance. See the upstream reference implementations: [intel_qi.c](https://github.com/freebsd/freebsd-src/blob/main/sys/x86/iommu/intel_qi.c), [intel_ctx.c](https://github.com/freebsd/freebsd-src/blob/main/sys/x86/iommu/intel_ctx.c), [intel_drv.c](https://github.com/freebsd/freebsd-src/blob/main/sys/x86/iommu/intel_drv.c).
+
+
+## Source-file translation progress (2026-10-09)
+
+The initial constants/model work is now supplemented by Rust translations of
+FreeBSD `intel_reg.h` (240/240 non-guard definitions, 3/3 entry structures),
+`intel_dmar.h` (3/3 persistent DMAR structures with FreeBSD resource/lock/task
+handles mapped to TheKernel ownership), and `intel_utils.c` (25/26 functions;
+only the sysctl callback is omitted). `tk-vtd/src/utils.rs` models GCMD/GSTS
+status waits and global register invalidation separately from QI; unit tests
+exercise register ordering using fake MMIO. These helpers are not yet substituted
+into `kernel/src/acpi/vtd.rs`, and no claim is made that the DMA hang is fixed.
+Translation remains opt-in pending end-to-end translated QEMU acceptance.

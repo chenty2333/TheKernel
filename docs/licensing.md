@@ -543,3 +543,6 @@ The VT-d DMAR data-model translation from FreeBSD
 `sys/x86/iommu/intel_dmar.h` likewise retains The FreeBSD Foundation's
 2013-2015 BSD-2-Clause grant and Konstantin Belousov attribution in
 `crates/ax/tk-vtd/src/dmar.rs`, under the same retained license file.
+The VT-d utility translation from FreeBSD `sys/x86/iommu/intel_utils.c`
+retains the 2013 FreeBSD Foundation BSD-2-Clause grant and Konstantin
+Belousov attribution in the Rust source module, covered by the crate license.
