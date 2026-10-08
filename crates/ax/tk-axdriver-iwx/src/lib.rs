@@ -10,6 +10,7 @@ mod alive;
 mod apm;
 mod attach;
 mod ba;
+mod background_scan;
 mod beacon;
 mod binding;
 mod bringup;
@@ -34,6 +35,7 @@ mod mac;
 mod mac_context;
 mod mld;
 mod nic;
+mod node;
 mod notif;
 mod nvm;
 mod phy;
@@ -85,6 +87,10 @@ pub use ba::{
     STATION_ID, TxBaPeerState, TxBaStartError, TxBaStartOutcome, ampdu_rx_start, ampdu_rx_stop,
     ampdu_tx_start, baid_config_command, baid_config_response, run_ba_task, sta_tx_agg_start,
     station_ba_command, station_ba_response,
+};
+pub use background_scan::{
+    BGSCAN_FIRST_AGG_TX_QUEUE, BGSCAN_MAX_TIDS, BGSCAN_STATION_ID, BgscanAction, BgscanState,
+    BgscanTaskFailure, BgscanTaskOutcome, replace_bgscan_unref_argument, run_bgscan_done_task,
 };
 pub use beacon::{BeaconMissAction, BeaconMissError, BeaconMissState, missed_beacon_action};
 pub use binding::{
@@ -206,6 +212,7 @@ pub use mld::{
     mld_modify_link_fill, mld_remove_station, mld_station_config_command,
 };
 pub use nic::{configure_nic, disable_rx_dma, initialize_nic, initialize_rx};
+pub use node::{IwxPeerNode, allocate_peer_node};
 pub use notif::{
     HBUS_TARG_WRPTR, HBUS_WRPTR_RX_Q0, NotificationRingError, RFH_Q0_FRBDCB_WIDX_TRG,
     RxNotificationBatch, drain_rx_notifications,

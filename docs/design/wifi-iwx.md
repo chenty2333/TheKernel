@@ -141,6 +141,12 @@ NVM-derived channel map, HT/VHT rate/STBC capabilities, 5-GHz rate availability,
 and the already-attached address-refresh fast path for later interface
 publication.
 
+Driver peer allocation now starts from a zeroed private extension and its
+duplicate window. Background-scan completion flushes station TX, disables
+active aggregation queues, removes the source-selected RSN keys, then transfers
+the deferred BSS-switch argument; failed flush/queue teardown frees it and
+schedules reinitialization unless shutdown is underway.
+
 TX queues now track occupied descriptor slots through the source consumer SSN,
 reclaim descriptor/byte-count state, retain owned payload DMA buffers until
 completion, retire host-command queue occupancy on CMD_DONE, and expose the
