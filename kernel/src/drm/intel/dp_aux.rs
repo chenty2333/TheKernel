@@ -136,6 +136,23 @@ impl<'a, R: Registers> DpAuxKernel<'a, R> {
                 .push(String::from("AUX power state disappeared"));
         }
     }
+
+    fn transfer(
+        &mut self,
+        request: u8,
+        address: u32,
+        payload: Option<&[u8]>,
+        receive: &mut [u8],
+    ) -> intel_display::dp_aux::AuxReply {
+        let mut state = self.state(if self.channel == AuxChannel::A {
+            "DDI A"
+        } else {
+            "DDI B"
+        });
+        intel_display::dp_aux::intel_dp_aux_transfer(
+            self, &mut state, request, address, payload, receive,
+        )
+    }
 }
 
 impl<R: Registers> DpAuxIo for DpAuxKernel<'_, R> {
@@ -260,29 +277,42 @@ impl<R: Registers> intel_display::intel_dp_full::DpAuxIo for DpAuxKernel<'_, R> 
         address: u32,
         bytes: &mut [u8],
     ) -> Result<usize, intel_display::intel_dp_full::DpError> {
-        use intel_display::{
-            dp_aux::{AUX_NATIVE_READ, intel_dp_aux_transfer},
-            intel_dp_full::DpError,
-        };
-
-        let mut state = self.state(if self.channel == AuxChannel::A {
-            "DDI A"
-        } else {
-            "DDI B"
-        });
+        use intel_display::{dp_aux::AUX_NATIVE_READ, intel_dp_full::DpError};
         let mut offset = 0;
         while offset < bytes.len() {
             let length = (bytes.len() - offset).min(16);
-            let reply = intel_dp_aux_transfer(
-                self,
-                &mut state,
-                AUX_NATIVE_READ,
-                address.saturating_add(offset as u32),
-                None,
-                &mut bytes[offset..offset + length],
-            );
-            if reply.reply != 0 || reply.bytes != length as i32 {
-                return Err(DpError::Io);
+            let mut first_error = None;
+            let mut transferred = false;
+            for _ in 0..32 {
+                let reply = self.transfer(
+                    AUX_NATIVE_READ,
+                    address.saturating_add(offset as u32),
+                    None,
+                    &mut bytes[offset..offset + length],
+                );
+                let error = if reply.bytes < 0 {
+                    reply.bytes
+                } else if reply.reply & 0x03 != 0 {
+                    -5
+                } else if reply.bytes != length as i32 {
+                    -71
+                } else {
+                    0
+                };
+                if error == 0 {
+                    transferred = true;
+                    break;
+                }
+                first_error.get_or_insert(error);
+                if error != -110 {
+                    self.sleep_us_range(500, 600);
+                }
+            }
+            if !transferred {
+                return Err(match first_error.unwrap_or(-5) {
+                    -7 | -22 => DpError::Invalid,
+                    _ => DpError::Io,
+                });
             }
             offset += length;
         }
@@ -294,30 +324,43 @@ impl<R: Registers> intel_display::intel_dp_full::DpAuxIo for DpAuxKernel<'_, R> 
         address: u32,
         bytes: &[u8],
     ) -> Result<usize, intel_display::intel_dp_full::DpError> {
-        use intel_display::{
-            dp_aux::{AUX_NATIVE_WRITE, intel_dp_aux_transfer},
-            intel_dp_full::DpError,
-        };
-
-        let mut state = self.state(if self.channel == AuxChannel::A {
-            "DDI A"
-        } else {
-            "DDI B"
-        });
+        use intel_display::{dp_aux::AUX_NATIVE_WRITE, intel_dp_full::DpError};
         let mut offset = 0;
         while offset < bytes.len() {
             let length = (bytes.len() - offset).min(16);
-            let mut reply_data = [0u8; 2];
-            let reply = intel_dp_aux_transfer(
-                self,
-                &mut state,
-                AUX_NATIVE_WRITE,
-                address.saturating_add(offset as u32),
-                Some(&bytes[offset..offset + length]),
-                &mut reply_data,
-            );
-            if reply.reply != 0 || reply.bytes != length as i32 {
-                return Err(DpError::Io);
+            let mut first_error = None;
+            let mut transferred = false;
+            for _ in 0..32 {
+                let mut reply_data = [0u8; 2];
+                let reply = self.transfer(
+                    AUX_NATIVE_WRITE,
+                    address.saturating_add(offset as u32),
+                    Some(&bytes[offset..offset + length]),
+                    &mut reply_data,
+                );
+                let error = if reply.bytes < 0 {
+                    reply.bytes
+                } else if reply.reply & 0x03 != 0 {
+                    -5
+                } else if reply.bytes != length as i32 {
+                    -71
+                } else {
+                    0
+                };
+                if error == 0 {
+                    transferred = true;
+                    break;
+                }
+                first_error.get_or_insert(error);
+                if error != -110 {
+                    self.sleep_us_range(500, 600);
+                }
+            }
+            if !transferred {
+                return Err(match first_error.unwrap_or(-5) {
+                    -7 | -22 => DpError::Invalid,
+                    _ => DpError::Io,
+                });
             }
             offset += length;
         }
