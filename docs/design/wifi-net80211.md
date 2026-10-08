@@ -228,3 +228,11 @@ OpenBSD `ieee80211_reset_scan()` is represented by `reset_scan_channels()`:
 it copies the active-channel bitmap back to the pending bitmap, and when the
 BSS channel is ANY it positions the channel cursor one entry before the first
 slot so the next-channel walk wraps to channel zero.
+
+The station-mode end-of-scan planner represents active-scan cleanup, inactive
+node cleanup, no-candidate reset/scan-count behavior, background-scan AP
+retention/backoff, roam management-only queue gating, and driver-flush callback
+selection as explicit effects. BSS/ESS choice is delegated to the existing
+translated node selectors; hostap and IBSS end-scan paths are omitted because
+iwx does not support those operation modes. iwx still needs to consume these
+effects in its runtime scan/roam driver task.

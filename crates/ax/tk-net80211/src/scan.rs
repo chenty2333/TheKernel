@@ -110,6 +110,97 @@ pub fn reset_scan_channels(
     Ok(())
 }
 
+pub const BGSCAN_FAIL_MAX: u16 = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndScanPolicy {
+    pub background_scan: bool,
+    pub scan_count: u32,
+    pub next_mode_is_auto: bool,
+    pub scan_all_bands: bool,
+    pub background_failures: u16,
+    pub selected_bssid: Option<[u8; 6]>,
+    pub current_bssid: Option<[u8; 6]>,
+    pub selected_rssi_acceptable: bool,
+    pub roam_argument_allocated: bool,
+    pub driver_flush_callback: bool,
+    pub current_bss_referenced: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EndScanEffects {
+    pub clear_active_scan: bool,
+    pub clean_inactive_nodes: bool,
+    pub reset_scan: bool,
+    pub increment_scan_count: bool,
+    pub clear_background_scan: bool,
+    pub background_failures: u16,
+    pub restore_current_mode: bool,
+    pub join_bssid: Option<[u8; 6]>,
+    pub set_tx_management_only: bool,
+    pub flush_tx_before_roam: bool,
+    pub invoke_background_done: bool,
+    pub retain_roam_argument_until_tx_drain: bool,
+}
+
+/// Finish the station-mode end-of-scan selection and expose driver/network effects.
+// upstream: ieee80211_node.c ieee80211_end_scan()
+pub fn end_station_scan(
+    policy: EndScanPolicy,
+    select_bss: impl FnOnce() -> (Option<[u8; 6]>, Option<[u8; 6]>),
+) -> EndScanEffects {
+    let (selected_bssid, current_bssid) = select_bss();
+    let mut effects = EndScanEffects {
+        clear_active_scan: policy.scan_count != 0,
+        clean_inactive_nodes: true,
+        background_failures: policy.background_failures,
+        ..EndScanEffects::default()
+    };
+    if !policy.background_scan {
+        if let Some(bssid) = selected_bssid {
+            effects.join_bssid = Some(bssid);
+        } else {
+            effects.reset_scan = true;
+            effects.increment_scan_count = policy.next_mode_is_auto || policy.scan_all_bands;
+        }
+        return effects;
+    }
+
+    if selected_bssid.is_none() || current_bssid.is_none() {
+        effects.clear_background_scan = true;
+        effects.reset_scan = true;
+        effects.increment_scan_count = policy.next_mode_is_auto || policy.scan_all_bands;
+        return effects;
+    }
+    if selected_bssid == current_bssid || !policy.selected_rssi_acceptable {
+        if effects.background_failures < BGSCAN_FAIL_MAX {
+            effects.background_failures = if effects.background_failures == 0 {
+                1
+            } else {
+                effects
+                    .background_failures
+                    .saturating_mul(2)
+                    .min(BGSCAN_FAIL_MAX)
+            };
+        }
+        effects.clear_background_scan = true;
+        effects.restore_current_mode = true;
+        return effects;
+    }
+    if !policy.roam_argument_allocated {
+        effects.clear_background_scan = true;
+        return effects;
+    }
+    effects.background_failures = 0;
+    effects.set_tx_management_only = true;
+    effects.flush_tx_before_roam = policy.driver_flush_callback;
+    effects.invoke_background_done = policy.driver_flush_callback;
+    effects.retain_roam_argument_until_tx_drain =
+        !policy.driver_flush_callback && policy.current_bss_referenced;
+    effects.join_bssid = Some(selected_bssid.expect("checked selected BSS"));
+    effects
+}
+
 /// Pick and clear the next pending channel, wrapping once and skipping passive channels in active mode.
 // upstream: ieee80211_node.c ieee80211_next_scan()
 pub fn next_scan_channel(
@@ -261,5 +352,79 @@ mod tests {
             next_scan_channel(&channels, &mut pending, active.len() - 1, false),
             Ok(ScanStep::NextChannel(0))
         );
+    }
+
+    #[test]
+    fn station_end_scan_handles_restart_same_ap_backoff_and_roam_flush() {
+        let none = end_station_scan(
+            EndScanPolicy {
+                background_scan: false,
+                scan_count: 1,
+                next_mode_is_auto: true,
+                scan_all_bands: false,
+                background_failures: 0,
+                selected_bssid: None,
+                current_bssid: None,
+                selected_rssi_acceptable: false,
+                roam_argument_allocated: false,
+                driver_flush_callback: false,
+                current_bss_referenced: false,
+            },
+            || (None, None),
+        );
+        assert!(none.clear_active_scan);
+        assert!(none.clean_inactive_nodes);
+        assert!(none.reset_scan && none.increment_scan_count);
+
+        let bssid = [2, 0, 0, 0, 0, 1];
+        let keep = end_station_scan(
+            EndScanPolicy {
+                background_scan: true,
+                background_failures: 1,
+                selected_rssi_acceptable: true,
+                ..EndScanPolicy {
+                    background_scan: false,
+                    scan_count: 0,
+                    next_mode_is_auto: false,
+                    scan_all_bands: false,
+                    background_failures: 0,
+                    selected_bssid: None,
+                    current_bssid: None,
+                    selected_rssi_acceptable: false,
+                    roam_argument_allocated: false,
+                    driver_flush_callback: false,
+                    current_bss_referenced: false,
+                }
+            },
+            || (Some(bssid), Some(bssid)),
+        );
+        assert!(keep.clear_background_scan && keep.restore_current_mode);
+        assert_eq!(keep.background_failures, 2);
+
+        let roam = end_station_scan(
+            EndScanPolicy {
+                background_scan: true,
+                selected_rssi_acceptable: true,
+                roam_argument_allocated: true,
+                driver_flush_callback: true,
+                ..EndScanPolicy {
+                    background_scan: false,
+                    scan_count: 0,
+                    next_mode_is_auto: false,
+                    scan_all_bands: false,
+                    background_failures: 4,
+                    selected_bssid: None,
+                    current_bssid: None,
+                    selected_rssi_acceptable: false,
+                    roam_argument_allocated: false,
+                    driver_flush_callback: false,
+                    current_bss_referenced: false,
+                }
+            },
+            || (Some([2, 0, 0, 0, 0, 2]), Some(bssid)),
+        );
+        assert!(roam.set_tx_management_only && roam.flush_tx_before_roam);
+        assert!(roam.invoke_background_done);
+        assert_eq!(roam.background_failures, 0);
     }
 }

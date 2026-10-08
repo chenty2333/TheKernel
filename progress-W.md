@@ -97,3 +97,4 @@
 - `ieee80211.c` background scan start/timeout helpers are now translated as a driver callback plan with source state/re-entry/timer/RSN-port gates and scan-node/cache effects; ieee80211.c marker coverage advances from 13/25 to 15/25; net80211 tests increased to 98.
 - `ieee80211.c` management watchdog countdown/rearm and station AUTH/ASSOC timeout effects now map to a typed transition plan; source-function marker coverage advances from 15/25 to 16/25.
 - `ieee80211_node.c` `ieee80211_reset_scan()` now restores the active channel mask and preserves ANY-channel wrap-to-first selection; node.c marker coverage advances from 39/110 to 40/110.
+- `ieee80211_node.c` station `ieee80211_end_scan()` now plans no-candidate rescan, active/inactive cleanup, background AP retention/backoff and TX-drained roam effects; BSS selectors stay reusable callbacks and iwx task integration remains open. node.c marker coverage advances from 40/110 to 41/110.
