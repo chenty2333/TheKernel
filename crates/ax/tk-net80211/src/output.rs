@@ -936,6 +936,73 @@ pub fn build_compressed_bar(
     Some(frame)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ManagementTxSequence {
+    next: u16,
+}
+
+impl ManagementTxSequence {
+    pub const fn new(next: u16) -> Self {
+        Self {
+            next: next & 0x0fff,
+        }
+    }
+
+    pub const fn next(&self) -> u16 {
+        self.next
+    }
+
+    /// Construct the station management MAC header and append its body.
+    // upstream: ieee80211_output.c ieee80211_mgmt_output()
+    pub fn frame(
+        &mut self,
+        frame_subtype: u8,
+        receiver: [u8; 6],
+        transmitter: [u8; 6],
+        bssid: [u8; 6],
+        body: &[u8],
+        mfp_node: bool,
+        multicast_or_txmgmtprot: bool,
+    ) -> Result<Vec<u8>, ManagementFrameError> {
+        const FC0_TYPE_MGT: u8 = 0;
+        const FC0_SUBTYPE_MASK: u8 = 0xf0;
+        const FC1_PROTECTED: u8 = 0x40;
+        const SUBTYPE_DISASSOC: u8 = 0xa0;
+        const SUBTYPE_DEAUTH: u8 = 0xc0;
+        const SUBTYPE_ACTION: u8 = 0xd0;
+        const HEADER_BYTES: usize = 24;
+        if frame_subtype & !FC0_SUBTYPE_MASK != FC0_TYPE_MGT {
+            return Err(ManagementFrameError::InvalidSubtype);
+        }
+        let protected = mfp_node
+            && matches!(
+                frame_subtype,
+                SUBTYPE_DISASSOC | SUBTYPE_DEAUTH | SUBTYPE_ACTION
+            )
+            && multicast_or_txmgmtprot;
+        let mut frame = Vec::new();
+        frame
+            .try_reserve_exact(HEADER_BYTES.saturating_add(body.len()))
+            .map_err(|_| ManagementFrameError::AllocationFailed)?;
+        frame.resize(HEADER_BYTES, 0);
+        frame[0] = FC0_TYPE_MGT | frame_subtype;
+        frame[1] = if protected { FC1_PROTECTED } else { 0 };
+        frame[4..10].copy_from_slice(&receiver);
+        frame[10..16].copy_from_slice(&transmitter);
+        frame[16..22].copy_from_slice(&bssid);
+        frame[22..24].copy_from_slice(&(self.next << 4).to_le_bytes());
+        frame.extend_from_slice(body);
+        self.next = self.next.wrapping_add(1) & 0x0fff;
+        Ok(frame)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagementFrameError {
+    InvalidSubtype,
+    AllocationFailed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1409,5 +1476,39 @@ mod tests {
         assert_eq!(u16::from_le_bytes([frame[18], frame[19]]), 0xabc0);
         assert!(build_compressed_bar([0; 6], [0; 6], 16, 0).is_none());
         assert!(build_compressed_bar([0; 6], [0; 6], 0, 0x1000).is_none());
+    }
+
+    #[test]
+    fn station_management_header_sequences_and_protects_mfp_frames() {
+        let mut sequence = ManagementTxSequence::new(4095);
+        let frame = sequence
+            .frame(
+                0xc0,
+                [2, 1, 1, 1, 1, 1],
+                [2, 2, 2, 2, 2, 2],
+                [2, 3, 3, 3, 3, 3],
+                &[7, 0],
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(frame[0], 0xc0);
+        assert_eq!(frame[1], 0x40);
+        assert_eq!(u16::from_le_bytes([frame[22], frame[23]]), 0xfff0);
+        assert_eq!(&frame[24..], &[7, 0]);
+        assert_eq!(sequence.next(), 0);
+        let probe = sequence
+            .frame(
+                0x40,
+                [0xff; 6],
+                [2, 2, 2, 2, 2, 2],
+                [0xff; 6],
+                &[],
+                true,
+                true,
+            )
+            .unwrap();
+        assert_eq!(probe[1] & 0x40, 0);
+        assert_eq!(ManagementTxSequence::new(0).next(), 0);
     }
 }

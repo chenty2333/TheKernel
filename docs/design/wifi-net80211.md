@@ -345,6 +345,11 @@ Station compressed-BAR construction is also translated as a bounded control
 frame encoder; queue admission, node retention and `if_start` are caller-side
 effects mapped to iwx's management queue.
 
+The station `mgmt_output` header builder now emits receiver/transmitter/BSSID,
+12-bit per-node sequence control, and Protected-bit policy for MFP action,
+deauth and disassoc frames. The caller still owns node reference transfer and
+the actual iwx management queue submission.
+
 Duplicate station RX nodes now inherit only the source BSS BSSID and channel
 after bounded cache allocation; the kernel owns their lifetimes instead of
 OpenBSD node reference callbacks.

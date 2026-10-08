@@ -1146,3 +1146,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 and `ieee80211.h` rev 1.137 (BSD-3-Clause): compressed Block-Ack request frame serialization translated in `tk-net80211/src/output.rs`.
 - OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): duplicate RX node allocation with BSS BSSID/channel inheritance translated in `tk-net80211/src/node_table.rs`.
 - OpenBSD `sys/net80211/ieee80211_node.c` rev 1.217 (BSD-3-Clause): station-only RX-node admission and BSS/monitor peer lookup translated in `tk-net80211/src/node_table.rs`.
+- OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 (BSD-3-Clause): management-frame 802.11 header, sequence and MFP protection logic translated in `tk-net80211/src/output.rs`.
