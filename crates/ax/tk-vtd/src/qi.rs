@@ -183,6 +183,7 @@ pub fn dmar_qi_emit_wait_descr<I: QiIo>(
     dmar_qi_emit(io, queue, low, high)
 }
 
+// upstream: iommu_utils.c iommu_qi_seq_processed()
 fn sequence_processed<I: QiIo>(io: &mut I, queue: &QiQueue, sequence: GenerationSequence) -> bool {
     let hardware = io.qi_hardware_sequence();
     sequence.generation < queue.wait_generation
@@ -190,6 +191,7 @@ fn sequence_processed<I: QiIo>(io: &mut I, queue: &QiQueue, sequence: Generation
             && u64::from(sequence.sequence) <= hardware)
 }
 
+// upstream: iommu_utils.c iommu_qi_emit_wait_seq()
 fn emit_wait_sequence<I: QiIo>(
     io: &mut I,
     queue: &mut QiQueue,
@@ -261,6 +263,7 @@ pub fn dmar_qi_invalidate_emit<I: QiIo>(
     emit_wait_sequence(io, queue, sequence, emit_wait)
 }
 
+// upstream: iommu_utils.c iommu_qi_wait_for_seq()
 fn wait_for_sequence<I: QiIo>(
     io: &mut I,
     queue: &mut QiQueue,

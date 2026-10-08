@@ -20,6 +20,7 @@ pub mod fault;
 pub mod gas;
 pub mod idpgtbl;
 pub mod intrmap;
+pub mod iommu_utils;
 pub mod iova;
 pub mod pgtbl;
 pub mod qi;

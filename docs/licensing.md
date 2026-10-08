@@ -580,3 +580,7 @@ FreeBSD `sys/x86/iommu/intel_intrmap.c` interrupt-entry logic is represented in
 `crates/ax/tk-vtd/src/intrmap.rs` under its 2015 FreeBSD Foundation
 BSD-2-Clause grant and Konstantin Belousov attribution, covered by the crate's
 retained `LICENSES/BSD-2-Clause.txt`.
+FreeBSD `sys/x86/iommu/iommu_utils.c` helpers are represented in
+`crates/ax/tk-vtd/src/iommu_utils.rs` and the shared QI helpers in `qi.rs`,
+retaining the 2013/2014/2024 FreeBSD Foundation BSD-2-Clause attribution under
+the crate's `LICENSES/BSD-2-Clause.txt` grant.

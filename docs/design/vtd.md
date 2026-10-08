@@ -101,3 +101,12 @@ sequence. VMEM, `device_t` source lookup, `intr_reprogram()` and physical IRTE
 allocation are adapters. TheKernel's current ACPI/VT-d startup does not install
 this IR table adapter into the APIC/IOAPIC vector path; therefore these routes
 are unit-tested code, not enabled interrupt remapping.
+
+The generic FreeBSD `iommu_utils.c` shared routines now have an explicit
+`tk-vtd/src/iommu_utils.rs` mapping (8/44 functions): four radix page-table
+geometry helpers, the domain-derived bus-DMA constraints, and three queued-
+invalidation generation/wait routines (the latter reuse the port in `qi.rs`).
+The remaining routines are FreeBSD VM/sf_buf and bus topology wrappers, x86
+IOMMU vtable dispatch, IRQ/MSI resource management, sysctl registration, and
+DDB output; page storage, DMA clients, QI, and interrupt routes map to existing
+TheKernel-owned seams instead of importing those frameworks.
