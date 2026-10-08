@@ -249,3 +249,17 @@ BSSID/ESS association-failure history is retained, rates are fixed, RSN suites
 are intersected, and the station transitions to AUTH with the correct
 background-roam or AUTH-retry trigger. This is a caller-facing state plan;
 firmware association/key command execution remains a driver integration step.
+
+Station leave-VHT and leave-HE helpers clear the cached node capability maps
+and feature flags using the same reset functions used by the translated node
+parser. Hardware PHY reconfiguration remains a caller effect.
+
+The current untranslated net80211 function sets are not complete: remaining
+`ieee80211_node.c` code includes AP/IBSS peer lifecycle, tree/refcount,
+inactivity timers and ioctl/autoconf integration; remaining `ieee80211_output.c`
+code includes AP beacon/response, power-save, hostap and ifqueue/BPF wrappers;
+remaining `ieee80211_proto.c` includes AP/IBSS and key-rekey/timer paths. The
+software CCMP/TKIP/WEP and BIP engines are not ported; the iwx design relies on
+firmware key/cipher offload for data frames and MFP support still needs the
+hardware key/control bridge. The explicit PAE files remain with wpa_supplicant.
+See the function-count snapshot in progress-W.md for per-file marker totals.

@@ -420,6 +420,18 @@ pub fn join_station_bss(
     })
 }
 
+/// Clear cached VHT capability state when a station leaves a VHT network.
+// upstream: ieee80211_node.c ieee80211_node_leave_vht()
+pub fn leave_vht_network(node: &mut crate::NodeRecord) {
+    crate::clear_vht_caps(&mut node.vht_caps);
+}
+
+/// Clear cached HE capability state when a station leaves an HE network.
+// upstream: ieee80211_node.c ieee80211_node_leave_he()
+pub fn leave_he_network(node: &mut crate::NodeRecord) {
+    crate::clear_he_caps(&mut node.he_caps);
+}
+
 /// Prefer RSN/SHA-256/CCMP while intersecting local and peer capabilities.
 // upstream: ieee80211_node.c ieee80211_choose_rsnparams()
 pub fn choose_rsn_params(
@@ -890,6 +902,22 @@ mod tests {
                     crate::proto::ManagementAction::Authentication { sequence: 1 }
                 ))
         );
+    }
+
+    #[test]
+    fn station_leave_clears_vht_and_he_capability_state() {
+        let mut table = crate::NodeTable::default();
+        let node = &mut table.bss_node;
+        node.vht_caps.caps = u32::MAX;
+        node.vht_caps.flags = crate::NODE_VHT | crate::NODE_VHTCAP;
+        node.he_caps.mac_caps = [0xff; crate::HE_MAC_CAPS_LEN];
+        node.he_caps.flags = crate::NODE_HE | crate::NODE_HECAP;
+        leave_vht_network(node);
+        leave_he_network(node);
+        assert_eq!(node.vht_caps.caps, 0);
+        assert_eq!(node.vht_caps.flags, 0);
+        assert_eq!(node.he_caps.mac_caps, [0; crate::HE_MAC_CAPS_LEN]);
+        assert_eq!(node.he_caps.flags, 0);
     }
 
     #[test]
