@@ -710,3 +710,7 @@ grant and copyright are preserved in the module and `LICENSE-MIT`.
 `tk-intel-display/src/skl_scaler_full.rs` translates the 43 scaler functions in
 Linux 7.2.3 `skl_scaler.c` (MIT, © 2020 Intel); the full MIT grant is preserved
 in the source header and crate `LICENSE-MIT`.
+
+`tk-intel-display/src/skl_watermark_full.rs` translates all 140 watermark/DBUF
+functions in Linux 7.2.3 `skl_watermark.c` (MIT, © 2022 Intel); the MIT grant
+is covered by the file SPDX identifier and crate `LICENSE-MIT`.
