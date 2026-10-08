@@ -861,14 +861,13 @@ fn pll_poll<R: Registers>(
         .ok_or(PllRuntimeError::Unreadable(register.name()))
 }
 
-/// Power and enable one combo PLL, preserving the i915 CFGCR and readback order.
-// upstream: intel_dpll_mgr.c combo_pll_enable()/icl_pll_power_enable()/icl_pll_enable()
-pub(crate) fn enable_combo_pll<R: Registers>(
+fn enable_cfg_pll<R: Registers>(
     regs: &R,
-    id: ComboPllId,
+    enable: Register,
+    cfgcr0: Register,
+    cfgcr1: Register,
     state: PllRegisters,
 ) -> Result<PllRuntimeReport, PllRuntimeError> {
-    let (enable, cfgcr0, cfgcr1) = combo_pll_registers(id);
     let mut value = pll_read(regs, enable)?;
     pll_write(regs, enable, value | PLL_POWER_ENABLE)?;
     let power_state_timed_out = !pll_poll(
@@ -893,13 +892,36 @@ pub(crate) fn enable_combo_pll<R: Registers>(
     })
 }
 
-/// Disable one combo PLL: disable/lock-clear first, then power-off/state-clear.
-// upstream: intel_dpll_mgr.c combo_pll_disable()/icl_pll_disable()
-pub(crate) fn disable_combo_pll<R: Registers>(
+/// Power and enable one combo PLL, preserving the i915 CFGCR and readback order.
+// upstream: intel_dpll_mgr.c combo_pll_enable()/icl_pll_power_enable()/icl_pll_enable()
+pub(crate) fn enable_combo_pll<R: Registers>(
     regs: &R,
     id: ComboPllId,
+    state: PllRegisters,
 ) -> Result<PllRuntimeReport, PllRuntimeError> {
-    let (enable, ..) = combo_pll_registers(id);
+    let (enable, cfgcr0, cfgcr1) = combo_pll_registers(id);
+    enable_cfg_pll(regs, enable, cfgcr0, cfgcr1, state)
+}
+
+/// Power and enable the fixed ICL/TGL TBT PLL using its CFGCR pair.
+// upstream: intel_dpll_mgr.c icl_tbt_pll_enable()
+pub(crate) fn enable_tbt_pll<R: Registers>(
+    regs: &R,
+    state: PllRegisters,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    enable_cfg_pll(
+        regs,
+        regs::dpll::TBT_PLL_ENABLE,
+        regs::dpll::TBT_PLL_CFGCR0,
+        regs::dpll::TBT_PLL_CFGCR1,
+        state,
+    )
+}
+
+fn disable_pll<R: Registers>(
+    regs: &R,
+    enable: Register,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
     let mut value = pll_read(regs, enable)?;
     pll_write(regs, enable, value & !PLL_ENABLE)?;
     let lock_timed_out = !pll_poll(regs, enable, PLL_LOCK, 0, PLL_LOCK_TIMEOUT_US)?;
@@ -911,6 +933,22 @@ pub(crate) fn disable_combo_pll<R: Registers>(
         power_state_timed_out,
         lock_timed_out,
     })
+}
+
+/// Disable one combo PLL: disable/lock-clear first, then power-off/state-clear.
+// upstream: intel_dpll_mgr.c combo_pll_disable()/icl_pll_disable()
+pub(crate) fn disable_combo_pll<R: Registers>(
+    regs: &R,
+    id: ComboPllId,
+) -> Result<PllRuntimeReport, PllRuntimeError> {
+    let (enable, ..) = combo_pll_registers(id);
+    disable_pll(regs, enable)
+}
+
+/// Disable the fixed ICL/TGL TBT PLL after its transcoder route is off.
+// upstream: intel_dpll_mgr.c icl_tbt_pll_disable()
+pub(crate) fn disable_tbt_pll<R: Registers>(regs: &R) -> Result<PllRuntimeReport, PllRuntimeError> {
+    disable_pll(regs, regs::dpll::TBT_PLL_ENABLE)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

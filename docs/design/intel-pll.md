@@ -550,7 +550,10 @@ display-12/13 `intel_dpll.c` state ownership are still not translated or wired.
 `kernel/src/drm/intel/pll.rs` now adds the combo DPLL0/1 power-state, CFGCR,
 enable/lock and disable/power-off sequences from `combo_pll_enable()` and
 `combo_pll_disable()`. Their timeout outcomes match i915's warn-and-continue
-policy; no modeset call site invokes them yet. `tk-intel-display/src/dpll.rs` additionally
+policy. It also adds the TBT PLL's CFGCR0/1 register declarations and
+power/enable/disable sequence from `icl_tbt_pll_enable()`/
+`icl_tbt_pll_disable()`. These adapters are still not called by modeset.
+`tk-intel-display/src/dpll.rs` additionally
 translates the generic CRTC dispatch guards, stale-state clear, and ±1 kHz
 clock-match helper from Linux 7.2.3 `intel_dpll.c` (MIT, Copyright © 2020
 Intel). Those functions have no kernel atomic-state call site yet.

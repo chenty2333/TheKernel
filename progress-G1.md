@@ -14,3 +14,4 @@
 3f. Combo DPLL0/1 power sequence | 部分完成 | ff632686 | kernel adapter 接上 i915 power-state→CFGCR→enable/lock 与 disable/power-off 顺序；`cargo check -p tk-kernel --tests` 通过，单元测试只 compile-check 未运行。尚未连 modeset call site。
 3h. DKL DP/HDMI PLL calculations | 部分完成 | pending | 翻译 DKL `icl_mg_pll_find_divisors` 的 DP 精确 8.1GHz 和 HDMI DCO-window 分支；6 个 targeted tests 通过。
 3i. DKL TC PLL runtime adapter | 部分完成 | f5141ee1 | kernel 动态寄存器 adapter 接入 TGL/ADL-P/N TC1/2 enable/disable、HIP selector serialization 和 power/lock polling；map tests compile-check，`cargo check -p tk-kernel --tests` 通过；等待 modeset call site 与真实 power refs。
+3j. TBT PLL power sequence | 部分完成 | pending | 增加 TBT CFGCR0/1+enable register entries，复用 i915 PLL power/lock/power-off 顺序；`cargo check -p tk-kernel --tests` 通过，测试 compile-check。

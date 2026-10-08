@@ -87,6 +87,48 @@ fn tc_dkl_pll_adapter_limits_enable_register_map_to_known_tc1_tc2_offsets() {
     assert!(dkl_dynamic_register(0x1010a0, true).is_some());
 }
 
+#[test]
+fn tbt_pll_uses_tbt_cfgcr_enable_and_power_registers() {
+    let regs = crate::drm::intel::regs::mock::MockRegisters::new();
+    regs.derive(regs::dpll::TBT_PLL_ENABLE, |written| {
+        let mut value = written;
+        if written & PLL_POWER_ENABLE != 0 {
+            value |= PLL_POWER_STATE;
+        } else {
+            value &= !PLL_POWER_STATE;
+        }
+        if written & PLL_ENABLE != 0 {
+            value |= PLL_LOCK;
+        } else {
+            value &= !PLL_LOCK;
+        }
+        value
+    });
+    let config = PllRegisters {
+        cfgcr0: 0x43_4000,
+        cfgcr1: 0x101,
+    };
+    assert_eq!(enable_tbt_pll(&regs, config).unwrap().lock_timed_out, false);
+    assert_eq!(disable_tbt_pll(&regs).unwrap().power_state_timed_out, false);
+    assert_eq!(
+        regs.writes(),
+        alloc::vec![
+            ("TBT_PLL_ENABLE", PLL_POWER_ENABLE),
+            ("TBT_PLL_CFGCR0", config.cfgcr0),
+            ("TBT_PLL_CFGCR1", config.cfgcr1),
+            (
+                "TBT_PLL_ENABLE",
+                PLL_POWER_ENABLE | PLL_POWER_STATE | PLL_ENABLE
+            ),
+            (
+                "TBT_PLL_ENABLE",
+                PLL_POWER_ENABLE | PLL_POWER_STATE | PLL_LOCK
+            ),
+            ("TBT_PLL_ENABLE", PLL_POWER_STATE),
+        ]
+    );
+}
+
 /// The reference frequency the ADL-N PLL strips use most often, and the one
 /// the worked example in the reference document uses.
 const REF_24: u32 = 24_000;

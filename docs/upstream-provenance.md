@@ -1139,6 +1139,13 @@ lock and power-off sequence from Linux 7.2.3
 Intel). The adapter retains i915's warning-only timeout outcome and is not yet
 called by atomic modeset.
 
+`kernel/src/drm/intel/pll.rs::enable_tbt_pll()` and `disable_tbt_pll()`
+translate `icl_tbt_pll_enable()`/`icl_tbt_pll_disable()` power-state, TBT
+CFGCR0/1 posting read, PLL-enable/lock and power-off flow from the same MIT
+`intel_dpll_mgr.c` source. `TBT_PLL_{ENABLE,CFGCR0,CFGCR1}` register entries
+follow `intel_display_regs.h` (MIT, Copyright © 2006-2018 Intel). The native
+modeset does not call these functions yet.
+
 `kernel/src/drm/intel/pll.rs::enable_tc_dkl_pll()` and
 `disable_tc_dkl_pll()` connect the DKL PHY writer to a checked dynamic-register
 backend and perform the TC PLL power/lock sequence. The selector is serialized
