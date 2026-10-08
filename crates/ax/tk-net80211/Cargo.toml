@@ -5,6 +5,7 @@ edition = "2024"
 license = "BSD-3-Clause"
 
 [dependencies]
+aes = { version = "0.8.4", default-features = false }
 
 [package.metadata.thekernel]
 layer = "platform"

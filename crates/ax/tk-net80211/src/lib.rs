@@ -12,6 +12,7 @@ mod ba_rx;
 mod ba_tx;
 mod beacon;
 mod channel;
+mod crypto_ccmp;
 mod decrypt;
 mod disconnect_rx;
 mod frame;
@@ -58,6 +59,7 @@ pub use channel::{
     configure_ampdu_tx, find_rate, ieee_to_mhz, initialize_channels, mhz_to_ieee, next_scan_mode,
     select_mode,
 };
+pub use crypto_ccmp::{CcmpError, CcmpKey, decrypt_ccmp, encrypt_ccmp};
 pub use decrypt::{
     HardwareDecryptError, HardwareDecryptResult, HardwareReplayState,
     postprocess_hardware_decryption,

@@ -39,7 +39,6 @@ pub struct HardwareDecryptResult {
 }
 
 /// Validate CCMP ExtIV and extract the 48-bit PN in source octet order.
-// upstream: ieee80211_crypto_ccmp.c ieee80211_ccmp_get_pn()
 fn ccmp_packet_number(iv: &[u8]) -> Result<u64, HardwareDecryptError> {
     if iv.len() < CCMP_HEADER_LEN {
         return Err(HardwareDecryptError::MissingIv);

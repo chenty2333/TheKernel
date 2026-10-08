@@ -551,3 +551,8 @@ by `kernel/src/file/netlink/nl80211.rs` derive from Linux
 `include/uapi/linux/nl80211.h` (ISC-style permission grant); copyright lines and
 the complete grant are retained in `kernel/LICENSES/ISC.txt`. GPL cfg80211,
 mac80211 and Linux generic-netlink implementation code were not copied.
+
+The OpenBSD software CCMP translation in `tk-net80211/src/crypto_ccmp.rs`
+retains its ISC grant in `tk-net80211/LICENSES/OpenBSD-ISC.txt`; AES-128 block
+operations use the crates.io `aes` 0.8.4 dependency (MIT OR Apache-2.0), already
+used by the kernel. No AES implementation source was copied into this crate.
