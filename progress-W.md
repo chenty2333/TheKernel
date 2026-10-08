@@ -25,4 +25,5 @@
 - RX BA session management now translates reorder-window initialization/clear, BAID and ADD_STA command layouts/status checks, session timeout decisions, and BAR release validation ( `7ae4fc26` ).
 - `iwx_nvm_get()` now wraps its RF-kill-capable response command and v3/v4 parsing in one request adapter (`728a6f94`).
 - Init-MVM NVM gating commands now serialize INIT_EXTENDED_CFG and NVM_ACCESS_COMPLETE with their source groups and payloads (`b77afb92`).
+- `iwx_config_ltr()` payload is now capability-gated; `iwx_rx_rx_phy_cmd()`'s cached PHY report is decoded field-by-field (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

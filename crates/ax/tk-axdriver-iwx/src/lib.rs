@@ -85,9 +85,10 @@ pub use firmware_bundle::{
     FirmwareBundle, FirmwareRequestError, request_on_rootfs_ready, take_staged,
 };
 pub use init_cmd::{
-    DATA_PATH_GROUP, DQA_ENABLE_CMD, INIT_EXTENDED_CFG_CMD, INIT_NVM, NVM_ACCESS_COMPLETE_CMD,
-    PHY_CONFIGURATION_CMD, REGULATORY_AND_NVM_GROUP as INIT_NVM_GROUP, SYSTEM_GROUP,
-    TX_ANT_CONFIGURATION_CMD, dqa_enable_command, init_extended_config_command,
+    DATA_PATH_GROUP, DQA_ENABLE_CMD, INIT_EXTENDED_CFG_CMD, INIT_NVM, LTR_CFG_FEATURE_ENABLE,
+    LTR_CONFIG_COMMAND, LTR_VALID_STATES, NVM_ACCESS_COMPLETE_CMD, PHY_CONFIGURATION_CMD,
+    REGULATORY_AND_NVM_GROUP as INIT_NVM_GROUP, SYSTEM_GROUP, TX_ANT_CONFIGURATION_CMD,
+    dqa_enable_command, init_extended_config_command, ltr_config_command,
     nvm_access_complete_command, phy_configuration_command, tx_antenna_command,
 };
 pub use interrupts::{
@@ -128,7 +129,10 @@ pub use rings::{
     GEN3_MAX_TFD_QUEUE_SIZE, RingError, RxCompletion, RxRing, TxRing, TxSegment, allocate_rx_ring,
     allocate_tx_ring, allocate_tx_ring_for, allocate_tx_ring_for_family, tx_byte_count_entry,
 };
-pub use rx::{RxMetadataError, noise_dbm, signal_strength_dbm};
+pub use rx::{
+    RX_PHY_INFO_BYTES, RxMetadataError, RxPhyInfo, noise_dbm, parse_rx_phy_info,
+    signal_strength_dbm,
+};
 pub use rx_event::{FirmwareEvent, decode_firmware_event, process_command_response};
 pub use rx_packet::{
     FH_FRAME_ALIGNMENT, FH_FRAME_INVALID, FH_FRAME_SIZE_MASK, NOTIFICATION_ORIGIN,

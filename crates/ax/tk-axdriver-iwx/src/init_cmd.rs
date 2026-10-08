@@ -15,6 +15,9 @@ pub const INIT_EXTENDED_CFG_CMD: u8 = 0x03;
 pub const NVM_ACCESS_COMPLETE_CMD: u8 = 0x00;
 pub const INIT_NVM: u32 = 1 << 1;
 pub const SYSTEM_GROUP: u8 = 0x02;
+pub const LTR_CONFIG_COMMAND: u32 = 0xee;
+pub const LTR_CFG_FEATURE_ENABLE: u32 = 1;
+pub const LTR_VALID_STATES: usize = 4;
 pub const REGULATORY_AND_NVM_GROUP: u8 = 0x0c;
 
 /// Serialize and frame the valid TX antenna mask.
@@ -99,6 +102,27 @@ pub fn nvm_access_complete_command(slot: u8, queue: u8) -> Result<EncodedCommand
     EncodedCommand::encode(&command, slot, queue)
 }
 
+/// Configure LTR firmware support; the caller gates this on device capability.
+// upstream: if_iwx.c iwx_config_ltr()
+pub fn ltr_config_command(
+    feature_enabled: bool,
+    slot: u8,
+    queue: u8,
+) -> Result<Option<EncodedCommand>, CommandError> {
+    if !feature_enabled {
+        return Ok(None);
+    }
+    let mut payload = [0u8; (4 + LTR_VALID_STATES) * 4];
+    payload[..4].copy_from_slice(&LTR_CFG_FEATURE_ENABLE.to_le_bytes());
+    let command = HostCommand {
+        id: LTR_CONFIG_COMMAND,
+        flags: 0,
+        response_capacity: 0,
+        parts: &[&payload],
+    };
+    Ok(Some(EncodedCommand::encode(&command, slot, queue)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +166,14 @@ mod tests {
         let complete = nvm_access_complete_command(2, 0).unwrap();
         assert_eq!(command_group_id(complete.wire_id), REGULATORY_AND_NVM_GROUP);
         assert_eq!(complete.bytes[8..], [0; 4]);
+    }
+
+    #[test]
+    fn ltr_configuration_is_capability_gated_and_zero_fills_reserved_values() {
+        assert_eq!(ltr_config_command(false, 0, 0).unwrap(), None);
+        let command = ltr_config_command(true, 2, 0).unwrap().unwrap();
+        assert_eq!(command.bytes.len(), 8 + (4 + LTR_VALID_STATES) * 4);
+        assert_eq!(&command.bytes[8..12], &LTR_CFG_FEATURE_ENABLE.to_le_bytes());
+        assert!(command.bytes[12..].iter().all(|byte| *byte == 0));
     }
 }
