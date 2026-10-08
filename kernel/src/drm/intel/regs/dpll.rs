@@ -172,9 +172,10 @@ pub(crate) const ICL_DPCLKA_CFGCR0: Register =
 //   PLL is configured without either -- which matches `icl_dpll_write`, where
 //   the `DIV0` write is behind `vbt.override_afc_startup`
 //   (`intel_dpll_mgr.c:3784-3789`).
-// - TBT PLL (`0x46020`) and TC PLL 1-4 (`PORTTC1/2_PLL_ENABLE`,
-//   `0x46038`/`0x46040`): section 6.3 says to ignore the DKL/Type-C PLLs and
-//   section 8.8 defers the whole Type-C path.
+// - TC PLL 1-4 (`PORTTC1/2_PLL_ENABLE`, `0x46038`/`0x46040`): the chapter's
+//   first-boot route defers DKL/Type-C. The runtime DKL adapter declares only
+//   the source-confirmed TC1/TC2 controls in `pll.rs` rather than guessing
+//   offsets for additional ADL-P/N TC PLLs.
 // - `TRANS_CLK_SEL(tran)` (`0x46140 + tran*4`): section 6.3 routing step 2 and
 //   section 11 phase 5.4 need it, but it is a transcoder register and belongs
 //   to the transcoder/timing group rather than this port-PLL and CDCLK group.
