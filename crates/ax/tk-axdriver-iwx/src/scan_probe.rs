@@ -5,6 +5,8 @@
 //! <info@genua.de>; Copyright (c) 2014 Fixup Software Ltd.; Copyright (c)
 //! 2017, 2019, 2020 Stefan Sperling <stsp@openbsd.org>.
 
+use alloc::vec::Vec;
+
 pub const PROBE_REQUEST_BYTES: usize = 512;
 pub const PROBE_REQUEST_WIRE_BYTES: usize = 20 + PROBE_REQUEST_BYTES;
 pub const SUPPORTED_RATES_IE: u8 = 1;
@@ -69,7 +71,10 @@ pub fn build_scan_probe_request(
     request.bytes[2..4].fill(0); // duration is hardware-filled.
     request.bytes[22..24].fill(0); // sequence is hardware-filled.
     let mut cursor = 24;
-    write_ie(&mut request.bytes, &mut cursor, 0, &[])?; // firmware injects SSID.
+    let mut ssid_ie = Vec::new();
+    tk_net80211::append_ssid_ie(&mut ssid_ie, &[])
+        .map_err(|_| ProbeRequestError::BufferTooSmall)?;
+    append_bytes(&mut request.bytes, &mut cursor, &ssid_ie)?; // firmware injects SSID.
     request.mac_header = ProbeSegment {
         offset: 0,
         length: cursor as u16,
@@ -126,15 +131,20 @@ fn append_rates(
     cursor: &mut usize,
     rates: &[u8],
 ) -> Result<(), ProbeRequestError> {
-    if rates.len() > u8::MAX as usize {
+    if rates.len() > tk_net80211::RATE_MAX_SIZE {
         return Err(ProbeRequestError::RatesTooLong);
     }
-    let base = rates.len().min(STANDARD_RATE_IE_LIMIT);
-    write_ie(buffer, cursor, SUPPORTED_RATES_IE, &rates[..base])?;
-    if rates.len() > base {
-        write_ie(buffer, cursor, EXTENDED_RATES_IE, &rates[base..])?;
+    let mut rate_set = tk_net80211::RateSet::default();
+    rate_set.count = rates.len();
+    rate_set.rates[..rates.len()].copy_from_slice(rates);
+    let mut ies = Vec::new();
+    tk_net80211::append_supported_rates_ie(&mut ies, &rate_set)
+        .map_err(|_| ProbeRequestError::RatesTooLong)?;
+    if rates.len() > STANDARD_RATE_IE_LIMIT {
+        tk_net80211::append_extended_rates_ie(&mut ies, &rate_set)
+            .map_err(|_| ProbeRequestError::RatesTooLong)?;
     }
-    Ok(())
+    append_bytes(buffer, cursor, &ies)
 }
 
 fn validate_ie(bytes: &[u8], expected_id: u8) -> Result<(), ProbeRequestError> {

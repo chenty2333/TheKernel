@@ -3306,6 +3306,7 @@ dependencies = [
  "spin 0.10.1",
  "tk-axdriver-base",
  "tk-axdriver-net",
+ "tk-net80211",
 ]
 
 [[package]]
