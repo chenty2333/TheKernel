@@ -72,6 +72,18 @@ pub fn batch(copy: Copy) -> Result<[u32; 14], Error> {
 /// explicit GGTT breadcrumb, IRQ (masked by adapter), ARB-enable and WA tail.
 /// Single-context polling deliberately has no scheduler/preempt semaphores.
 pub fn ring(out: &mut [u32], batch: u64, context: u32, seqno: u32) -> Result<usize, Error> {
+    ring_engine(out, batch, context, seqno, 1, 0)
+}
+/// Build the Gen12 XCS flush/batch/breadcrumb sequence for BCS, VCS or VECS.
+/// Engine classes use the i915 UAPI order (copy=1, video=2, VE=3).
+pub fn ring_engine(
+    out: &mut [u32],
+    batch: u64,
+    context: u32,
+    seqno: u32,
+    engine_class: u8,
+    engine_instance: u8,
+) -> Result<usize, Error> {
     if out.len() < 32
         || batch >= 1 << 48
         || !batch.is_multiple_of(8)
@@ -79,18 +91,30 @@ pub fn ring(out: &mut [u32], batch: u64, context: u32, seqno: u32) -> Result<usi
         || !context.is_multiple_of(4096)
         || context.checked_add(4 * 4096).is_none()
         || seqno == 0
+        || !matches!(
+            (engine_class, engine_instance),
+            (1, 0) | (2, 0) | (2, 2) | (3, 0)
+        )
     {
         return Err(Error::Refused);
     }
+    let aux_inv = match (engine_class, engine_instance) {
+        (1, 0) => 0x4248, // GEN12_BCS0_AUX_INV
+        (2, 0) => 0x4218, // GEN12_VD0_AUX_INV
+        (2, 2) => 0x4298, // GEN12_VD2_AUX_INV
+        (3, 0) => 0x4238, // GEN12_VE0_AUX_INV
+        _ => return Err(Error::Refused),
+    };
+    let mut flush = mi(0x26, 2) | (1 << 21) | (1 << 14) | (1 << 18);
+    if engine_class == 1 {
+        flush |= 1 << 16; // MI_FLUSH_DW_CCS, copy engine only.
+    } else if engine_class == 2 {
+        flush |= 1 << 7; // MI_INVALIDATE_BSD, video-decode engine only.
+    }
     out[..32].fill(0);
     out[0] = mi(5, 0) | (1 << 8) | 1; // preparser_disable(true)
-    out[1..5].copy_from_slice(&[
-        mi(0x26, 2) | (1 << 21) | (1 << 14) | (1 << 18) | (1 << 16),
-        lrc::SCRATCH,
-        0,
-        0,
-    ]);
-    out[5..13].copy_from_slice(&lrc::aux_invalidate());
+    out[1..5].copy_from_slice(&[flush, lrc::SCRATCH, 0, 0]);
+    out[5..13].copy_from_slice(&lrc::aux_invalidate_at(aux_inv));
     out[13] = mi(5, 0) | (1 << 8);
     out[14..18].copy_from_slice(&[
         mi(8, 0),
@@ -229,4 +253,37 @@ pub fn apply_nonpriv(io: &impl GtIo, render: bool) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gen12_xcs_flush_selects_video_invalidation_and_engine_aux_register() {
+        for (class, instance, aux, bsd, ccs) in [
+            (1, 0, 0x4248, false, true),
+            (2, 0, 0x4218, true, false),
+            (2, 2, 0x4298, true, false),
+            (3, 0, 0x4238, false, false),
+        ] {
+            let mut words = [0; 32];
+            assert_eq!(
+                ring_engine(&mut words, 0x30000, 0x100000, 1, class, instance),
+                Ok(30)
+            );
+            assert_eq!(words[6], aux);
+            assert_eq!(words[1] & (1 << 7) != 0, bsd);
+            assert_eq!(words[1] & (1 << 16) != 0, ccs);
+        }
+    }
+
+    #[test]
+    fn gen12_xcs_flush_rejects_fused_or_unsupported_engine_instance() {
+        let mut words = [0; 32];
+        assert_eq!(
+            ring_engine(&mut words, 0x30000, 0x100000, 1, 2, 1),
+            Err(Error::Refused)
+        );
+    }
 }

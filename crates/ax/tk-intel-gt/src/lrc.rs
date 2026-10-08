@@ -5,7 +5,7 @@
 // Copyright © 2014 Intel Corporation.
 // intel_lrc_reg.h: Copyright © 2014-2018 Intel Corporation.
 // gen8_engine_cs.c/.h: AUX invalidation command layout, Copyright © 2014 Intel.
-// Full MIT grant: ../LICENSE-MIT. Gen12.0 BCS only, no GuC/RCS/DG2 paths.
+// Full MIT grant: ../LICENSE-MIT. Gen12.0 XCS path, no RCS/DG2 paths.
 use crate::{Error, ppgtt};
 pub const WORDS: usize = 1024;
 pub const CONTEXT_PAGES: usize = 4; // 2-page BCS image plus source two WA pages.
@@ -27,8 +27,35 @@ pub fn restore_context(
     tail: u32,
     pml4: u64,
 ) -> Result<u64, Error> {
+    restore_engine_context(
+        regs, indirect, per_ctx, context, ring, tail, pml4, 0x22000, 1, 0,
+    )
+}
+pub fn restore_engine_context(
+    regs: &mut [u32; WORDS],
+    indirect: &mut [u32; WORDS],
+    per_ctx: &mut [u32; WORDS],
+    context: u32,
+    ring: u32,
+    tail: u32,
+    pml4: u64,
+    mmio_base: u32,
+    engine_class: u8,
+    engine_instance: u8,
+) -> Result<u64, Error> {
     let mut fresh = [0; 1024];
-    let descriptor = build(&mut fresh, indirect, per_ctx, context, ring, tail, pml4)?;
+    let descriptor = build_engine(
+        &mut fresh,
+        indirect,
+        per_ctx,
+        context,
+        ring,
+        tail,
+        pml4,
+        mmio_base,
+        engine_class,
+        engine_instance,
+    )?;
     // Selected lrc_update_regs/init_ppgtt_regs/WA-pointer updates. Never
     // rebuild the GPU-generated restore instruction stream or opaque values.
     for index in [5usize, 7, 9, 11, 19, 21, 23, 49, 51] {
@@ -47,6 +74,22 @@ pub fn build(
     tail: u32,
     pml4: u64,
 ) -> Result<u64, Error> {
+    build_engine(
+        regs, indirect, per_ctx, context, ring, tail, pml4, 0x22000, 1, 0,
+    )
+}
+pub fn build_engine(
+    regs: &mut [u32; WORDS],
+    indirect: &mut [u32; WORDS],
+    per_ctx: &mut [u32; WORDS],
+    context: u32,
+    ring: u32,
+    tail: u32,
+    pml4: u64,
+    mmio_base: u32,
+    engine_class: u8,
+    engine_instance: u8,
+) -> Result<u64, Error> {
     ppgtt::physical(pml4)?;
     if context == 0
         || !context.is_multiple_of(4096)
@@ -55,9 +98,21 @@ pub fn build(
         || !ring.is_multiple_of(4096)
         || tail >= 4096
         || !tail.is_multiple_of(8)
+        || !(1..=3).contains(&engine_class)
+        || !matches!(
+            (engine_class, engine_instance),
+            (1, 0) | (2, 0) | (2, 2) | (3, 0)
+        )
     {
         return Err(Error::Refused);
     }
+    let aux_inv = match (engine_class, engine_instance) {
+        (1, 0) => 0x4248, // GEN12_BCS0_AUX_INV
+        (2, 0) => 0x4218, // GEN12_VD0_AUX_INV
+        (2, 2) => 0x4298, // GEN12_VD2_AUX_INV
+        (3, 0) => 0x4238, // GEN12_VE0_AUX_INV
+        _ => return Err(Error::Refused),
+    };
     regs.fill(0);
     indirect.fill(0);
     per_ctx.fill(0);
@@ -69,7 +124,7 @@ pub fn build(
     .into_iter()
     .enumerate()
     {
-        regs[2 + n * 2] = 0x22000 + offset;
+        regs[2 + n * 2] = mmio_base + offset;
     }
     regs[33] = lri(9) | (1 << 12) | (1 << 19);
     for (n, offset) in [
@@ -78,7 +133,7 @@ pub fn build(
     .into_iter()
     .enumerate()
     {
-        regs[34 + n * 2] = 0x22000 + offset;
+        regs[34 + n * 2] = mmio_base + offset;
     }
     regs[52] = mi(0xa, 0) | 1;
     regs[3] = 0x00090009; // inhibit sync switch + first-restore inhibit, masked.
@@ -109,12 +164,13 @@ pub fn build(
         context + 4096 + 0x75 * 4,
         0,
     ]);
-    // Gen12 BCS AUX table invalidation and register-poll semaphore.
-    indirect[14..22].copy_from_slice(&aux_invalidate());
+    // Gen12 XCS AUX table invalidation and register-poll semaphore. The
+    // register is engine-instance-specific per gen12_get_aux_inv_reg().
+    indirect[14..22].copy_from_slice(&aux_invalidate_at(aux_inv));
     // Source pads to64B; 22 dwords =>128B. No manual END for INDIRECT_CTX.
     regs[21] = (context + 2 * 4096) | 2;
     regs[23] = 0xd << 6;
-    // Empty N305 PER_CTX_BB; fast-color/DG2 WA does not apply to this copy path.
+    // Empty N305 PER_CTX_BB; fast-color/DG2 WA does not apply to this path.
     per_ctx[0] = mi(0xa, 0);
     regs[19] = (context + 3 * 4096) | 5;
     // setup_predicate_disable_wa is source-unconditional for Gen12 images;
@@ -133,18 +189,83 @@ pub fn build(
         1,
         mi(0xa, 0),
     ]);
-    // Descriptor: SW context1, BCS class1/instance0, 64b privileged force-restore.
-    Ok(u64::from(context | 0x10d) | (1u64 << 37) | (1u64 << 61))
+    // Descriptor: SW context1, selected XCS class/instance, 64b force-restore.
+    Ok(u64::from(context | 0x10d)
+        | (1u64 << 37)
+        | (u64::from(engine_instance) << 48)
+        | (u64::from(engine_class) << 61))
 }
 pub fn aux_invalidate() -> [u32; 8] {
+    aux_invalidate_at(0x4248)
+}
+pub fn aux_invalidate_at(register: u32) -> [u32; 8] {
     [
         lri(1) | (1 << 17),
-        0x4248,
+        register,
         1,
         mi(0x1c, 3) | (1 << 16) | (1 << 15) | (4 << 12),
         0,
-        0x4248,
+        register,
         0,
         0,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gen12_xcs_lrc_offsets_descriptor_and_aux_register_follow_engine() {
+        for (class, instance, base, aux) in [
+            (1, 0, 0x22000, 0x4248),
+            (2, 0, 0x1c0000, 0x4218),
+            (2, 2, 0x1d0000, 0x4298),
+            (3, 0, 0x1c8000, 0x4238),
+        ] {
+            let mut regs = [0; WORDS];
+            let mut indirect = [0; WORDS];
+            let mut per_ctx = [0; WORDS];
+            let descriptor = build_engine(
+                &mut regs,
+                &mut indirect,
+                &mut per_ctx,
+                0x100000,
+                0x104000,
+                120,
+                0x8000,
+                base,
+                class,
+                instance,
+            )
+            .unwrap();
+            assert_eq!(regs[2], base + 0x244);
+            assert_eq!(regs[34], base + 0x3a8);
+            assert_eq!(indirect[15], aux);
+            assert_eq!((descriptor >> 61) as u8, class);
+            assert_eq!(((descriptor >> 48) & 0x3f) as u8, instance);
+        }
+    }
+
+    #[test]
+    fn gen12_xcs_lrc_rejects_unsupported_engine_instance() {
+        let mut regs = [0; WORDS];
+        let mut indirect = [0; WORDS];
+        let mut per_ctx = [0; WORDS];
+        assert_eq!(
+            build_engine(
+                &mut regs,
+                &mut indirect,
+                &mut per_ctx,
+                0x100000,
+                0x104000,
+                120,
+                0x8000,
+                0x1e0000,
+                2,
+                3,
+            ),
+            Err(Error::Refused)
+        );
+    }
 }
