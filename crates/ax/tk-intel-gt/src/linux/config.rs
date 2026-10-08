@@ -101,6 +101,13 @@ pub const EPROTO: i32 = 71;
 pub const EOVERFLOW: i32 = 75;
 pub const ETIME: i32 = 62;
 pub const ETIMEDOUT: i32 = 110;
+pub const EOPNOTSUPP: i32 = 95;
+
+// i915 UAPI / VMA-view values from Linux v7.2.3.
+pub const I915_MADV_WILLNEED: u32 = 0;
+pub const I915_GTT_VIEW_NORMAL: i32 = 0;
+// `arch/x86/include/asm/cpufeatures.h`: CPUID feature word 0, bit 19.
+pub const X86_FEATURE_CLFLUSH: u32 = 19;
 pub const EIO: i32 = 5;
 pub const ENOENT: i32 = 2;
 pub const ENXIO: i32 = 6;
