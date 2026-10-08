@@ -527,3 +527,6 @@ libgallium from the existing same-version source/CLC/toolchain, retaining the
 Mesa/Buildroot package license obligations already registered above. No Mesa
 binary is committed. The dedicated flavor and loader check are original
 project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
+
+The AHCI register/header translation retains the FreeBSD BSD-2-Clause grant and
+attribution; see `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-AHCI.txt`.

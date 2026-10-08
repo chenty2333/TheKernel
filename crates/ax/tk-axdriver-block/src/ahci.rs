@@ -1,5 +1,7 @@
 //! AHCI driver.
 
+pub mod regs;
+
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 use simple_ahci::AhciDriver as SimpleAhciDriver;
 pub use simple_ahci::Hal as AhciHal;
