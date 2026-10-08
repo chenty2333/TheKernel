@@ -33,6 +33,7 @@ pub const FORMAT_XRGB8888: u32 = 0x3432_5258;
 pub const FORMAT_ARGB8888: u32 = 0x3432_5241;
 pub const IN_FORMATS_PRIMARY_BLOB_ID: u32 = 2;
 pub const IN_FORMATS_CURSOR_BLOB_ID: u32 = 3;
+pub const CRTC_GAMMA_LUT_SIZE: u32 = 22;
 
 #[derive(Clone, Copy)]
 pub struct Property {
@@ -45,7 +46,7 @@ pub struct Property {
 
 const ATOMIC_RANGE: u32 = uapi::DRM_MODE_PROP_RANGE | uapi::DRM_MODE_PROP_ATOMIC;
 const ATOMIC_OBJECT: u32 = uapi::DRM_MODE_PROP_OBJECT | uapi::DRM_MODE_PROP_ATOMIC;
-pub const PROPERTIES: [Property; 21] = [
+pub const PROPERTIES: [Property; 22] = [
     Property {
         id: CONNECTOR_CRTC_ID,
         name: "CRTC_ID",
@@ -195,6 +196,13 @@ pub const PROPERTIES: [Property; 21] = [
         min: 0,
         max: u32::MAX as u64,
     },
+    Property {
+        id: CRTC_GAMMA_LUT_SIZE,
+        name: "GAMMA_LUT_SIZE",
+        flags: uapi::DRM_MODE_PROP_RANGE | uapi::DRM_MODE_PROP_IMMUTABLE,
+        min: 256,
+        max: 256,
+    },
 ];
 
 pub fn get(id: u32) -> Option<&'static Property> {
@@ -207,6 +215,7 @@ pub fn object_properties(object_type: u32) -> &'static [u32] {
             CRTC_ACTIVE,
             CRTC_MODE_ID,
             CRTC_GAMMA_LUT,
+            CRTC_GAMMA_LUT_SIZE,
             CRTC_OUT_FENCE_PTR,
         ],
         uapi::DRM_MODE_OBJECT_PLANE => &[
@@ -267,7 +276,8 @@ pub(crate) fn linear_in_formats_blob(formats: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FORMAT_ARGB8888, FORMAT_XRGB8888, PLANE_IN_FORMATS, linear_in_formats_blob,
+        CRTC_GAMMA_LUT_SIZE, FORMAT_ARGB8888, FORMAT_XRGB8888, PLANE_IN_FORMATS,
+        linear_in_formats_blob,
     };
     use crate::drm::uapi;
 
@@ -298,5 +308,14 @@ mod tests {
         assert_ne!(property.flags & uapi::DRM_MODE_PROP_BLOB, 0);
         assert_ne!(property.flags & uapi::DRM_MODE_PROP_IMMUTABLE, 0);
         assert!(super::object_properties(uapi::DRM_MODE_OBJECT_PLANE).contains(&PLANE_IN_FORMATS));
+    }
+
+    #[test]
+    fn gamma_lut_size_is_immutable_and_matches_getcrtc_size() {
+        let property = super::get(CRTC_GAMMA_LUT_SIZE).unwrap();
+        assert_ne!(property.flags & uapi::DRM_MODE_PROP_RANGE, 0);
+        assert_ne!(property.flags & uapi::DRM_MODE_PROP_IMMUTABLE, 0);
+        assert_eq!((property.min, property.max), (256, 256));
+        assert!(super::object_properties(uapi::DRM_MODE_OBJECT_CRTC).contains(&CRTC_GAMMA_LUT_SIZE));
     }
 }

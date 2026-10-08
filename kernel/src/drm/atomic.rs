@@ -114,6 +114,7 @@ pub fn value_with_resources(
 ) -> Option<u64> {
     match property {
         property::CONNECTOR_EDID => Some(resources.connector.edid_blob as u64),
+        property::CRTC_GAMMA_LUT_SIZE => Some(256),
         _ => value(state, property),
     }
 }
