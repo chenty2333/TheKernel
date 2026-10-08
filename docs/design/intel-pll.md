@@ -543,16 +543,19 @@ gain. Six DKL tests pass, including 162/540-MHz DP and 1080p60 HDMI.
 
 The fixed DP/TBT tables, source candidate ordering, DCO window and midpoint,
 38.4→19.2 reference division, Gen11/12 CFGCR selector, and display-12
-38.4-MHz fraction workaround have host tests. This is not yet the full manager:
-atomic modeset integration, active-port mux updates, MG PHY DP/TBT register
-writes, clock routing/reference-clock updates, readout/sanitization, and full
-display-12/13 `intel_dpll.c` state ownership are still not translated or wired.
+38.4-MHz fraction workaround have host tests. Manager source translation is
+complete, but atomic modeset integration, active-port mux updates, MG PHY
+DP/TBT register writes, clock routing/reference-clock updates, sanitization,
+and full display-12/13 `intel_dpll.c` state ownership remain incomplete.
 `kernel/src/drm/intel/pll.rs` now adds the combo DPLL0/1 power-state, CFGCR,
 enable/lock and disable/power-off sequences from `combo_pll_enable()` and
 `combo_pll_disable()`. Their timeout outcomes match i915's warn-and-continue
 policy. It also adds the TBT PLL's CFGCR0/1 register declarations and
 power/enable/disable sequence from `icl_tbt_pll_enable()`/
-`icl_tbt_pll_disable()`. These adapters are still not called by modeset.
+`icl_tbt_pll_disable()`. The combo/TBT enable adapters are still not called by
+modeset; the generic manager's selected TC1/TC2 read-only `get_hw_state`
+dispatcher is called by fastboot admission and around the restricted TC
+transaction.
 `tk-intel-display/src/dpll.rs` additionally translates the generic CRTC
 dispatch guards, stale-state clear, ±1 kHz clock-match helper, platform hook
 selection, and HSW+ DSI/PCH adjusted-dotclock path from Linux 7.2.3
@@ -564,10 +567,12 @@ The kernel adapter also exposes DKL/MG TC PLL enable/disable. It serializes the
 shared HIP selector, bounds raw MMIO to the fixed DKL apertures, routes only
 known TC1/TC2 enable offsets for TGL and ADL-P/N, and composes the previously
 translated `dkl_pll_write()` sequence with power/lock polling. Its API requires
-the caller to hold the corresponding display/PHY power references; no current
-modeset call site invokes it. The adapter has compile-checked map tests but its
-kernel-host unit binary is not run due the known bare-metal relocation linker
-failure.
+the caller to hold the corresponding display/PHY power references; the current
+modeset still uses the restricted direct DKL transaction for writes. Selected-
+port generic readout has a pin-backed backend; peer-port/all-PLL readout and
+manager enable/disable remain unconnected. The adapter has compile-checked map
+tests but its kernel-host unit binary is not run due the known bare-metal
+relocation linker failure.
 
 The same module additionally carries the display-12/13 candidate-mask and
 shared-resource policy from `icl_get_combo_phy_dpll()`,
@@ -575,7 +580,8 @@ shared-resource policy from `icl_get_combo_phy_dpll()`,
 `intel_find_dpll()`/reference/unreference edge. `SharedDpllPool` is a small
 host-testable owner for the shared-state comparison and pipe references. It is
 not yet installed as the kernel's atomic-state DPLL manager; current kernel
-fastboot continues to use its pre-existing single output PLL flow.
+fastboot still uses its pre-existing single output PLL flow for modeset writes,
+with selected TC DKL readout routed through the translated manager.
 
 `icl_dpll_descriptors()` adds the i915 per-platform DPLL inventories in source
 order for TGL, RKL, DG1, ADL-S, ADL-P/N and EHL/JSL. The shared numeric IDs are
