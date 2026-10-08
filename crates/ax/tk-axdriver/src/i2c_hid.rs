@@ -338,6 +338,15 @@ impl I2cInput {
             .map_err(map_hid_error)
     }
 
+    // upstream: iichid.c iichid_ioctl(I2CRDWR)
+    pub fn ioctl_rdwr(&mut self, messages: &mut [IicMessage<'_>]) -> DevResult<()> {
+        let transport = self.state.get_mut().device.transport_mut();
+        crate::i2c::transfer(transport.bus, messages).map_err(|error| match error {
+            IicError::NoAck | IicError::BusBusy | IicError::Timeout => DevError::Again,
+            _ => DevError::Io,
+        })
+    }
+
     /// ACPI hardware ID and FreeBSD-compatible quirk bitmap from hidbus probe.
     pub fn hardware_id(&self) -> &str {
         &self.info.hardware_id
@@ -552,7 +561,9 @@ impl I2cInput {
         let state = self.state.get_mut();
         state.suspended = true;
         if state.opened {
-            state.device.set_power(Power::Off).map_err(map_hid_error)?;
+            if let Err(error) = state.device.set_power(Power::Off) {
+                warn!("i2c-hid: suspend power transition failed: {error:?}");
+            }
         }
         Ok(())
     }
@@ -563,11 +574,17 @@ impl I2cInput {
         state.suspended = false;
         if state.opened {
             let device = &mut state.device;
-            device.set_power(Power::On).map_err(map_hid_error)?;
-            device.delay_ms(1);
-            match device.reset(tk_i2c_hid::RESET_TIMEOUT_SECONDS) {
-                Ok(()) | Err(HidError::ResetTimeout) => {}
-                Err(error) => return Err(map_hid_error(error)),
+            if let Err(error) = device.set_power(Power::On) {
+                warn!("i2c-hid: resume power transition failed: {error:?}");
+            } else {
+                device.delay_ms(1);
+                match device.reset(tk_i2c_hid::RESET_TIMEOUT_SECONDS) {
+                    Ok(()) => {}
+                    Err(HidError::ResetTimeout) => {
+                        warn!("i2c-hid: reset acknowledgement timeout on resume");
+                    }
+                    Err(error) => warn!("i2c-hid: reset failed on resume: {error:?}"),
+                }
             }
         }
         Ok(())

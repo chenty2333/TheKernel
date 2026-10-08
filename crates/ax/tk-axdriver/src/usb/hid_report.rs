@@ -897,10 +897,7 @@ impl Report {
                     let Some(&physical_slot) = assigned_slots.get(slot) else {
                         continue;
                     };
-                    if physical_slot < 0
-                        || !contact_tips[slot]
-                        || !contact_confidence[slot]
-                    {
+                    if physical_slot < 0 || !contact_tips[slot] || !contact_confidence[slot] {
                         continue;
                     }
                     let physical_slot = usize::from(physical_slot as u16);

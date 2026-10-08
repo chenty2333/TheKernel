@@ -171,6 +171,9 @@ impl<T: Transport> Device<T> {
     pub fn transport_address(&self) -> Address {
         self.transport.address()
     }
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
     pub fn delay_ms(&mut self, milliseconds: u32) {
         self.transport.delay_ms(milliseconds);
     }
