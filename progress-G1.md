@@ -5,4 +5,5 @@
 2d. HSW power-well handshake | 部分完成 | 7f818a7e | 移植并接入请求者、fuse、enable/disable 和 state 查询；仅 PW_1/DDI-IO 当前路径可用，IRQ 耦合 well/其余 i915 电源管理仍待移植。
 2e. Gen12 DC-state field write | 部分完成 | abc51731 | 移植 `gen9_dc_mask`/`gen9_write_dc_state` 并用于启动时禁用 DC state；DMC-controlled DC5/6/9 进入/退出尚未接通。
 2. VBT / route mapping | 部分完成 | 43f7ec6d,54de259d | 将 child-device DVO/DSI 端口解析及 AUX 映射改为按 display version 与平台选择 i915 表，补齐 display-12 CRT 端口别名；尚未完成整个 intel_bios.c、电源 map 和 DMC MMIO。
-2. 电源生命周期差距盘点 | 文档化 | pending | 明确列出异步 put、完整 modeset 域接线、IRQ-coupled well callbacks 和 DC5/6/9/DMC runtime 的未完成边界；转入时钟项前不再扩展该项实现。
+2. 电源生命周期差距盘点 | 文档化 | dbfbe824 | 明确列出异步 put、完整 modeset 域接线、IRQ-coupled well callbacks 和 DC5/6/9/DMC runtime 的未完成边界；转入时钟项前不再扩展该项实现。
+3. CDCLK transition planning | 部分完成 | 71c1eb18 | 在 `tk-intel-display::cdclk` 翻译 crawl/squash/CD2X 分类和 midpoint 算法；4 个 cdclk 单测通过。MMIO/PCODE/atomic modeset 接线和 DPLL 文件继续进行中。
