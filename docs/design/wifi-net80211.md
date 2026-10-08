@@ -101,3 +101,5 @@ The station association-request body builder now applies source channel/mode
 predicates, fixed reassociation BSSID and listen interval, then emits the
 ordered SSID/rates/security/QoS/HT/VHT/HE elements. It is ready for the later
 nl80211 connect adapter; four-way key exchange remains userspace-owned.
+Open-system authentication and deauth/disassociation reason bodies now use the
+source field order and little-endian encodings.

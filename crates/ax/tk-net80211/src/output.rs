@@ -37,6 +37,7 @@ pub const CAPINFO_SHORT_SLOTTIME: u16 = 0x0400;
 pub const ERP_NON_ERP_PRESENT: u8 = 0x01;
 pub const ERP_USE_PROTECTION: u8 = 0x02;
 pub const ERP_BARKER_MODE: u8 = 0x04;
+pub const AUTH_ALG_OPEN: u16 = 0;
 pub const CIPHER_USE_GROUP: u32 = 0x01;
 pub const CIPHER_WEP40: u32 = 0x02;
 pub const CIPHER_TKIP: u32 = 0x04;
@@ -243,6 +244,28 @@ pub fn build_assoc_request_body(config: &AssocRequestConfig<'_>) -> Result<Vec<u
         )?;
     }
     Ok(output)
+}
+
+/// Build the open-system Authentication response body.
+// upstream: ieee80211_output.c ieee80211_get_auth()
+pub fn build_auth_body(sequence: u16, status: u16) -> [u8; 6] {
+    let mut body = [0; 6];
+    body[..2].copy_from_slice(&AUTH_ALG_OPEN.to_le_bytes());
+    body[2..4].copy_from_slice(&sequence.to_le_bytes());
+    body[4..].copy_from_slice(&status.to_le_bytes());
+    body
+}
+
+/// Build a Deauthentication reason-code body.
+// upstream: ieee80211_output.c ieee80211_get_deauth()
+pub fn build_deauth_body(reason: u16) -> [u8; 2] {
+    reason.to_le_bytes()
+}
+
+/// Build a Disassociation reason-code body.
+// upstream: ieee80211_output.c ieee80211_get_disassoc()
+pub fn build_disassoc_body(reason: u16) -> [u8; 2] {
+    reason.to_le_bytes()
 }
 
 /// Append an SSID information element, including the zero-length hidden SSID form.
@@ -599,6 +622,13 @@ mod tests {
             append_supported_rates_ie(&mut ies, &invalid),
             Err(IeError::InvalidRateSet)
         );
+    }
+
+    #[test]
+    fn open_auth_deauth_and_disassoc_bodies_are_little_endian() {
+        assert_eq!(build_auth_body(2, 17), [0, 0, 2, 0, 17, 0]);
+        assert_eq!(build_deauth_body(0x1234), [0x34, 0x12]);
+        assert_eq!(build_disassoc_body(0x5678), [0x78, 0x56]);
     }
 
     #[test]

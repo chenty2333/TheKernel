@@ -68,7 +68,7 @@ pub use node_table::{
 };
 pub use output::{
     AKM_8021X as IE_AKM_8021X, AKM_PSK as IE_AKM_PSK, AKM_SHA256_8021X as IE_AKM_SHA256_8021X,
-    AKM_SHA256_PSK as IE_AKM_SHA256_PSK, CAPINFO_ESS as OUTPUT_CAPINFO_ESS,
+    AKM_SHA256_PSK as IE_AKM_SHA256_PSK, AUTH_ALG_OPEN, CAPINFO_ESS as OUTPUT_CAPINFO_ESS,
     CAPINFO_IBSS as OUTPUT_CAPINFO_IBSS, CAPINFO_PRIVACY as OUTPUT_CAPINFO_PRIVACY,
     CAPINFO_SHORT_PREAMBLE, CAPINFO_SHORT_SLOTTIME, CIPHER_BIP as IE_CIPHER_BIP,
     CIPHER_CCMP as IE_CIPHER_CCMP, CIPHER_TKIP as IE_CIPHER_TKIP, CIPHER_USE_GROUP, CIPHER_WEP40,
@@ -81,7 +81,8 @@ pub use output::{
     append_erp_ie, append_extended_rates_ie, append_he_caps_ie, append_ht_caps_ie,
     append_ht_operation_ie, append_qos_capability_ie, append_rsn_ie, append_ssid_ie,
     append_supported_rates_ie, append_vht_caps_ie, append_wme_info_ie, append_wme_parameter_ie,
-    append_wpa_ie, build_assoc_request_body, build_rsn_body, uapsd_qos_info,
+    append_wpa_ie, build_assoc_request_body, build_auth_body, build_deauth_body,
+    build_disassoc_body, build_rsn_body, uapsd_qos_info,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
