@@ -17,6 +17,7 @@ mod rate;
 mod registers;
 mod rings;
 mod rx;
+mod tx;
 
 pub use command::{
     CMD_ASYNC, CMD_FAILED_MASK, CMD_SEND_DURING_RFKILL, CMD_WANT_RESPONSE, CommandError,
@@ -59,3 +60,4 @@ pub use rings::{
     tx_byte_count_entry,
 };
 pub use rx::{RxMetadataError, noise_dbm, signal_strength_dbm};
+pub use tx::{EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame};
