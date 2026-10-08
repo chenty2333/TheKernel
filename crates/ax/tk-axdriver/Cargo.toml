@@ -110,6 +110,9 @@ usb-xhci = [
     "dep:ax-sync",
     "dep:ax-crate-interface",
     "dep:kernel_guard",
+    "dep:axtask",
+    "axtask/multitask",
+    "dep:axpoll",
 ]
 virtio = [
     "dep:axdriver_virtio",
@@ -154,6 +157,12 @@ path = "src/lib.rs"
 [dependencies.axalloc]
 package = "tk-axalloc"
 path = "../tk-axalloc"
+version = "0.1.0"
+optional = true
+
+[dependencies.axpoll]
+package = "tk-axpoll"
+path = "../tk-axpoll"
 version = "0.1.0"
 optional = true
 

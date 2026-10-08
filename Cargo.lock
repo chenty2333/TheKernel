@@ -3253,6 +3253,7 @@ dependencies = [
  "tk-axdriver-vsock",
  "tk-axdriver-watchdog",
  "tk-axhal",
+ "tk-axpoll",
  "tk-axsync",
  "tk-axtask",
  "tk-bt-hci",

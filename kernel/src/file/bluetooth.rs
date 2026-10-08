@@ -1,7 +1,7 @@
 //! Linux AF_BLUETOOTH HCI socket shell for device discovery and monitor setup.
 //! Protocol framing follows the Bluetooth Core and Linux UAPI; no GPL net stack
 //! implementation is copied here.
-use alloc::{borrow::Cow, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, collections::VecDeque, sync::Arc, vec::Vec};
 use core::{
     sync::atomic::{AtomicBool, Ordering},
     task::Context,
@@ -9,7 +9,7 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollSet, Pollable};
 use bytemuck::{Pod, Zeroable};
 use linux_raw_sys::net::{SOCK_RAW, sockaddr};
 use spin::Mutex as SpinMutex;
@@ -25,6 +25,7 @@ const HCIGETDEVLIST: u32 = 0x8004_48d2;
 const HCIGETDEVINFO: u32 = 0x8004_48d3;
 const HCI_DEV_NONE: u16 = 0xffff;
 const HCI_CHANNEL_MONITOR: u16 = 2;
+const HCI_CHANNEL_CONTROL: u16 = 3;
 const MAX_HCI_PACKET: usize = 65_536;
 const HCI_UP: u32 = 1 << 0;
 
@@ -169,12 +170,41 @@ mod tests {
         );
         assert_eq!(encode_dev_req(0x1234, true), [0x34, 0x12, 0, 0, 1, 0, 0, 0]);
     }
+
+    #[test]
+    fn management_read_version_and_empty_index_list_match_wire_abi() {
+        let version = management_response(&[1, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(&version[..9], &[1, 0, 0xff, 0xff, 6, 0, 1, 0, 0]);
+        assert_eq!(&version[9..], &[1, 0, 0]);
+
+        let indices = management_response(&[3, 0, 0xff, 0xff, 0, 0]).unwrap();
+        assert_eq!(&indices[..9], &[1, 0, 0xff, 0xff, 5, 0, 3, 0, 0]);
+        assert_eq!(&indices[9..], &[0, 0]);
+    }
+
+    #[test]
+    fn management_read_info_returns_invalid_index_without_device() {
+        let info = management_response(&[4, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(&info[..9], &[1, 0, 0, 0, 3, 0, 4, 0, 0x11]);
+        assert_eq!(info.len(), 9);
+    }
+
+    #[test]
+    fn management_commands_advertise_only_implemented_operations() {
+        let commands = management_response(&[2, 0, 0xff, 0xff, 0, 0]).unwrap();
+        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 5);
+        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 2);
+        assert_eq!(commands.len(), 9 + 4 + 2 * (5 + 2));
+        assert_eq!(&commands[13..23], &[1, 0, 2, 0, 3, 0, 4, 0, 5, 0]);
+    }
 }
 
 pub struct HciSocket {
     inode: PseudoInode,
     nonblocking: AtomicBool,
     binding: SpinMutex<Option<BoundChannel>>,
+    control_rx: SpinMutex<VecDeque<Vec<u8>>>,
+    control_readiness: Arc<PollSet<32>>,
 }
 
 impl HciSocket {
@@ -183,6 +213,8 @@ impl HciSocket {
             inode: PseudoInode::socket(),
             nonblocking: AtomicBool::new(false),
             binding: SpinMutex::new(None),
+            control_rx: SpinMutex::new(VecDeque::new()),
+            control_readiness: Arc::new(PollSet::new()),
         }
     }
 
@@ -202,14 +234,22 @@ impl HciSocket {
         }
         // HCI monitor is global and remains bindable without an adapter. The
         // HCI_DEV_NONE spelling is accepted as on Linux; raw/user need a device.
-        if !matches!(address.channel, 0 | 1 | HCI_CHANNEL_MONITOR) {
+        if !matches!(
+            address.channel,
+            0 | 1 | HCI_CHANNEL_MONITOR | HCI_CHANNEL_CONTROL
+        ) {
             return Err(LinuxError::EPROTONOSUPPORT.into());
         }
         let mut current = self.binding.lock();
         if current.is_some() {
             return Err(LinuxError::EINVAL.into());
         }
-        let adapter = if address.channel == HCI_CHANNEL_MONITOR {
+        let adapter = if address.channel == HCI_CHANNEL_CONTROL {
+            if address.device != HCI_DEV_NONE {
+                return Err(AxError::InvalidInput);
+            }
+            None
+        } else if address.channel == HCI_CHANNEL_MONITOR {
             #[cfg(feature = "input")]
             let adapter = monitor_adapter(address.device);
             #[cfg(not(feature = "input"))]
@@ -342,19 +382,65 @@ impl HciSocket {
 
 impl Pollable for HciSocket {
     fn poll(&self) -> IoEvents {
-        IoEvents::WRITABLE
+        let binding = self.binding.lock();
+        let Some(binding) = binding.as_ref() else {
+            return IoEvents::WRITABLE;
+        };
+        let mut events = IoEvents::WRITABLE;
+        if binding.channel == HCI_CHANNEL_CONTROL {
+            if !self.control_rx.lock().is_empty() {
+                events |= IoEvents::READABLE;
+            }
+            return events;
+        }
+        #[cfg(feature = "input")]
+        if let Some(adapter) = &binding.adapter
+            && adapter.lock().receive_ready(binding.channel)
+        {
+            events |= IoEvents::READABLE;
+        }
+        events
     }
     fn register<'a>(
         &'a self,
-        _context: &mut Context<'_>,
-        _events: IoEvents,
+        context: &mut Context<'_>,
+        events: IoEvents,
     ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        if !events.intersects(IoEvents::READABLE) {
+            return axpoll::PollRegistration::empty();
+        }
+        let binding = self.binding.lock();
+        let Some(binding) = binding.as_ref() else {
+            return axpoll::PollRegistration::empty();
+        };
+        if binding.channel == HCI_CHANNEL_CONTROL {
+            return PollRegistration::single(&self.control_readiness, context.waker());
+        }
+        #[cfg(feature = "input")]
+        if let Some(adapter) = &binding.adapter {
+            let readiness = adapter.lock().receive_readiness();
+            return PollRegistration::single_owned(readiness, context.waker());
+        }
         axpoll::PollRegistration::empty()
     }
 }
 
 impl FileLike for HciSocket {
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        let channel = self
+            .binding
+            .lock()
+            .as_ref()
+            .map(|binding| binding.channel)
+            .ok_or(LinuxError::ENODEV)?;
+        if channel == HCI_CHANNEL_CONTROL {
+            let packet = self
+                .control_rx
+                .lock()
+                .pop_front()
+                .ok_or(LinuxError::EAGAIN)?;
+            return dst.write(&packet);
+        }
         let binding = self.binding.lock();
         let binding = binding.as_ref().ok_or(LinuxError::ENODEV)?;
         #[cfg(feature = "input")]
@@ -386,6 +472,15 @@ impl FileLike for HciSocket {
         })
     }
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
+        let channel = self
+            .binding
+            .lock()
+            .as_ref()
+            .map(|binding| binding.channel)
+            .ok_or(LinuxError::ENODEV)?;
+        if channel == HCI_CHANNEL_CONTROL {
+            return self.write_management_command(src);
+        }
         let binding = self.binding.lock();
         let binding = binding.as_ref().ok_or(LinuxError::ENODEV)?;
         #[cfg(feature = "input")]
@@ -488,4 +583,147 @@ impl Default for HciSocket {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl HciSocket {
+    fn write_management_command(&self, src: &mut IoSrc) -> AxResult<usize> {
+        let length = src.remaining().min(MAX_HCI_PACKET);
+        if length < 6 {
+            return Err(AxError::InvalidInput);
+        }
+        let mut packet = Vec::new();
+        packet
+            .try_reserve_exact(length)
+            .map_err(|_| AxError::NoMemory)?;
+        packet.resize(length, 0);
+        let read = src.read(&mut packet)?;
+        packet.truncate(read);
+        let response = management_response(&packet)?;
+        let mut queue = self.control_rx.lock();
+        if queue.len() >= 64 {
+            return Err(LinuxError::ENOBUFS.into());
+        }
+        queue.push_back(response);
+        drop(queue);
+        self.control_readiness.wake();
+        Ok(read)
+    }
+}
+
+fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
+    const MGMT_INDEX_NONE: u16 = 0xffff;
+    const CMD_COMPLETE: u16 = 1;
+    const READ_VERSION: u16 = 1;
+    const READ_COMMANDS: u16 = 2;
+    const READ_INDEX_LIST: u16 = 3;
+    const READ_INFO: u16 = 4;
+    const SET_POWERED: u16 = 5;
+    const UNKNOWN_COMMAND: u8 = 1;
+    const INVALID_PARAMS: u8 = 0x0d;
+    const INVALID_INDEX: u8 = 0x11;
+    if request.len() < 6 {
+        return Err(AxError::InvalidInput);
+    }
+    let opcode = u16::from_le_bytes([request[0], request[1]]);
+    let index = u16::from_le_bytes([request[2], request[3]]);
+    let parameter_len = usize::from(u16::from_le_bytes([request[4], request[5]]));
+    if request.len() != 6 + parameter_len {
+        return Err(AxError::InvalidInput);
+    }
+    let parameters = &request[6..];
+    let mut status = 0u8;
+    let mut data = Vec::new();
+    match opcode {
+        READ_VERSION if parameters.is_empty() => data.extend_from_slice(&[1, 0, 0]),
+        READ_COMMANDS if parameters.is_empty() => {
+            let commands = [
+                READ_VERSION,
+                READ_COMMANDS,
+                READ_INDEX_LIST,
+                READ_INFO,
+                SET_POWERED,
+            ];
+            let events = [CMD_COMPLETE, 2];
+            data.extend_from_slice(&(commands.len() as u16).to_le_bytes());
+            data.extend_from_slice(&(events.len() as u16).to_le_bytes());
+            for item in commands.into_iter().chain(events) {
+                data.extend_from_slice(&item.to_le_bytes());
+            }
+        }
+        READ_INDEX_LIST if parameters.is_empty() => {
+            #[cfg(feature = "input")]
+            let devices = axdriver::bluetooth_devices();
+            #[cfg(not(feature = "input"))]
+            let devices: Vec<()> = Vec::new();
+            data.extend_from_slice(&(devices.len() as u16).to_le_bytes());
+            #[cfg(feature = "input")]
+            for adapter in devices {
+                data.extend_from_slice(&adapter.lock().index().to_le_bytes());
+            }
+        }
+        READ_INFO if parameters.is_empty() => {
+            #[cfg(feature = "input")]
+            let adapter = axdriver::bluetooth_devices()
+                .into_iter()
+                .find(|adapter| adapter.lock().index() == index);
+            #[cfg(feature = "input")]
+            if let Some(adapter) = adapter {
+                let adapter = adapter.lock();
+                let address = adapter.address();
+                // mgmt_rp_read_info, with only currently observed controller
+                // properties populated. Unimplemented capabilities stay clear.
+                data.extend_from_slice(&address);
+                data.extend_from_slice(&[0; 11]);
+                data.extend_from_slice(&[0; 3 + 249 + 11]);
+            } else {
+                status = INVALID_INDEX;
+            }
+            #[cfg(not(feature = "input"))]
+            {
+                let _ = index;
+                status = INVALID_INDEX;
+            }
+        }
+        SET_POWERED if parameters.len() == 1 && parameters[0] <= 1 => {
+            #[cfg(feature = "input")]
+            {
+                let adapter = axdriver::bluetooth_devices()
+                    .into_iter()
+                    .find(|adapter| adapter.lock().index() == index);
+                if let Some(adapter) = adapter {
+                    if adapter.lock().set_device_up(parameters[0] != 0).is_err() {
+                        status = 3;
+                    }
+                } else {
+                    status = INVALID_INDEX;
+                }
+            }
+            #[cfg(not(feature = "input"))]
+            {
+                status = INVALID_INDEX;
+            }
+        }
+        _ if matches!(
+            opcode,
+            READ_VERSION | READ_COMMANDS | READ_INDEX_LIST | READ_INFO | SET_POWERED
+        ) =>
+        {
+            status = INVALID_PARAMS;
+        }
+        _ => status = UNKNOWN_COMMAND,
+    }
+    if status != 0 {
+        data.clear();
+    }
+    let mut response = Vec::new();
+    response
+        .try_reserve_exact(9 + data.len())
+        .map_err(|_| AxError::NoMemory)?;
+    response.extend_from_slice(&CMD_COMPLETE.to_le_bytes());
+    response.extend_from_slice(&index.to_le_bytes());
+    response.extend_from_slice(&(3 + data.len() as u16).to_le_bytes());
+    response.extend_from_slice(&opcode.to_le_bytes());
+    response.push(status);
+    response.extend_from_slice(&data);
+    Ok(response)
 }

@@ -5,6 +5,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use axdriver_base::{DevError, DevResult};
+use axpoll::PollSet;
 use crab_usb::{
     device::{Device, InterfaceSession},
     usb_if::{
@@ -27,6 +28,7 @@ pub struct UsbBluetoothHci {
     family_hint: tk_bt_hci::DeviceFamily,
     address: [u8; 6],
     capabilities: tk_bt_hci::HciCapabilities,
+    receive_readiness: Arc<PollSet<32>>,
 }
 
 struct Transport {
@@ -198,6 +200,7 @@ impl UsbBluetoothHci {
             family_hint,
             address: [0; 6],
             capabilities: tk_bt_hci::HciCapabilities::default(),
+            receive_readiness: Arc::new(PollSet::new()),
         })
     }
     pub fn index(&self) -> u16 {
@@ -211,6 +214,19 @@ impl UsbBluetoothHci {
     }
     pub fn capabilities(&self) -> tk_bt_hci::HciCapabilities {
         self.capabilities
+    }
+    pub fn receive_readiness(&self) -> Arc<PollSet<32>> {
+        self.receive_readiness.clone()
+    }
+    pub fn receive_ready(&self, channel: u16) -> bool {
+        if channel == 2 {
+            self.adapter.monitor_ready()
+        } else {
+            self.adapter.receive_ready()
+        }
+    }
+    pub fn pump_receive(&mut self) -> Result<bool, Error> {
+        self.adapter.pump_receive()
     }
     pub fn statistics(&self) -> tk_bt_hci::Statistics {
         self.adapter.statistics()
@@ -626,7 +642,23 @@ pub(super) fn register(device: UsbBluetoothHci) {
     DEVICES
         .call_once(|| Mutex::new(Vec::new()))
         .lock()
-        .push(device);
+        .push(device.clone());
+    let readiness = device.lock().receive_readiness();
+    let receive_device = device.clone();
+    if let Err(error) = axtask::spawn(move || {
+        loop {
+            match receive_device.lock().pump_receive() {
+                Ok(true) => {
+                    readiness.wake();
+                }
+                Ok(false) | Err(_) => {
+                    let _ = axtask::sleep(core::time::Duration::from_millis(2));
+                }
+            }
+        }
+    }) {
+        warn!("USB Bluetooth receive worker could not start: {error:?}");
+    }
     if intel && axdriver_base::firmware::rootfs_ready() {
         load_firmware_after_rootfs();
     } else if intel && !FIRMWARE_CALLBACK_REGISTERED.load(core::sync::atomic::Ordering::Acquire) {

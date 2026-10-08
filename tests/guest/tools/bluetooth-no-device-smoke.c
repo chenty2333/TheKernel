@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -13,6 +14,7 @@
 #define BTPROTO_HCI 1
 #define HCI_DEV_NONE 0xffff
 #define HCI_CHANNEL_MONITOR 2
+#define HCI_CHANNEL_CONTROL 3
 #define HCIDEVUP _IOW('H', 201, int)
 #define HCIDEVDOWN _IOW('H', 202, int)
 #define HCIGETDEVLIST _IOR('H', 210, int)
@@ -69,6 +71,29 @@ int main(void) {
     }
     struct stat st;
     if (stat("/sys/class/bluetooth", &st) != 0 || !S_ISDIR(st.st_mode)) return fail("/sys/class/bluetooth");
+
+    int mgmt = socket(AF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC, BTPROTO_HCI);
+    if (mgmt < 0) return fail("socket(HCI control)");
+    struct sockaddr_hci control = { AF_BLUETOOTH, HCI_DEV_NONE, HCI_CHANNEL_CONTROL };
+    if (bind(mgmt, (struct sockaddr *)&control, sizeof(control)) != 0) return fail("bind(HCI control)");
+    const uint8_t read_version[] = { 1, 0, 0xff, 0xff, 0, 0 };
+    if (send(mgmt, read_version, sizeof(read_version), 0) != sizeof(read_version)) return fail("mgmt READ_VERSION send");
+    struct pollfd ready = { .fd = mgmt, .events = POLLIN };
+    if (poll(&ready, 1, 1000) != 1 || !(ready.revents & POLLIN)) return fail("mgmt READ_VERSION poll");
+    uint8_t response[64];
+    ssize_t response_len = recv(mgmt, response, sizeof(response), 0);
+    const uint8_t version_reply[] = { 1, 0, 0xff, 0xff, 6, 0, 1, 0, 0, 1, 0, 0 };
+    if (response_len != sizeof(version_reply) || memcmp(response, version_reply, sizeof(version_reply))) {
+        fprintf(stderr, "mgmt READ_VERSION response length=%ld\n", (long)response_len); return 1;
+    }
+    const uint8_t read_indices[] = { 3, 0, 0xff, 0xff, 0, 0 };
+    if (send(mgmt, read_indices, sizeof(read_indices), 0) != sizeof(read_indices)) return fail("mgmt READ_INDEX_LIST send");
+    response_len = recv(mgmt, response, sizeof(response), 0);
+    const uint8_t indices_reply[] = { 1, 0, 0xff, 0xff, 5, 0, 3, 0, 0, 0, 0 };
+    if (response_len != sizeof(indices_reply) || memcmp(response, indices_reply, sizeof(indices_reply))) {
+        fprintf(stderr, "mgmt READ_INDEX_LIST response length=%ld\n", (long)response_len); return 1;
+    }
+    close(mgmt);
     close(fd);
     puts("BLUETOOTH_NO_DEVICE_ACCEPTANCE_DONE");
     return 0;

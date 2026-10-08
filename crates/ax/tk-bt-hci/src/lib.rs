@@ -168,6 +168,7 @@ pub struct Adapter<T> {
     raw_users: u16,
     monitor_users: u16,
     monitor: VecDeque<Vec<u8>>,
+    incoming: VecDeque<(PacketType, Vec<u8>)>,
     stats: Statistics,
 }
 
@@ -181,6 +182,7 @@ impl<T: UsbTransport> Adapter<T> {
             raw_users: 0,
             monitor_users: 0,
             monitor: VecDeque::new(),
+            incoming: VecDeque::new(),
             stats: Statistics::default(),
         }
     }
@@ -280,7 +282,7 @@ impl<T: UsbTransport> Adapter<T> {
                     self.stats.err_tx = self.stats.err_tx.saturating_add(1);
                     return Err(error);
                 }
-                self.queue_monitor(2, bytes);
+                self.queue_monitor(5, bytes);
                 self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
                 self.stats.byte_tx = self.stats.byte_tx.saturating_add(bytes.len() as u32);
                 Ok(())
@@ -349,6 +351,9 @@ impl<T: UsbTransport> Adapter<T> {
     pub fn monitor_ready(&self) -> bool {
         !self.monitor.is_empty()
     }
+    pub fn receive_ready(&self) -> bool {
+        !self.incoming.is_empty()
+    }
     pub fn read_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         match self.transport.read_interrupt_event(out) {
             Ok(length) => Ok(length),
@@ -374,6 +379,14 @@ impl<T: UsbTransport> Adapter<T> {
         out: &mut [u8],
         nonblocking: bool,
     ) -> Result<(PacketType, usize), Error> {
+        if let Some((kind, bytes)) = self.incoming.pop_front() {
+            if bytes.len() > out.len() {
+                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                return Err(Error::InvalidLength);
+            }
+            out[..bytes.len()].copy_from_slice(&bytes);
+            return Ok((kind, bytes.len()));
+        }
         let Some((kind, length)) = self.transport.read_packet(out, nonblocking)? else {
             return Err(Error::Again);
         };
@@ -400,6 +413,41 @@ impl<T: UsbTransport> Adapter<T> {
         }
         self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
         Ok((kind, length))
+    }
+
+    /// Pump one already-submitted USB receive completion into the shared
+    /// adapter queue. The host task may call this independently of socket
+    /// reads, making event/ACL readiness observable to poll and epoll.
+    pub fn pump_receive(&mut self) -> Result<bool, Error> {
+        if !self.up {
+            return Ok(false);
+        }
+        let mut bytes = [0u8; 1028];
+        let Some((kind, length)) = self.transport.read_packet(&mut bytes, true)? else {
+            return Ok(false);
+        };
+        if length > bytes.len() || Packet::parse(kind, &bytes[..length]).is_err() {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(Error::InvalidLength);
+        }
+        match kind {
+            PacketType::Event => {
+                self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+                self.queue_monitor(3, &bytes[..length]);
+            }
+            PacketType::Acl => {
+                self.stats.acl_rx = self.stats.acl_rx.saturating_add(1);
+                self.queue_monitor(5, &bytes[..length]);
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+        if self.incoming.len() >= 64 {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Ok(false);
+        }
+        self.incoming.push_back((kind, Vec::from(&bytes[..length])));
+        Ok(true)
     }
     // upstream: iwmbt_hw.c iwmbt_hci_command()
     /// Send an HCI command and read its matching Command Complete event. This
@@ -988,6 +1036,28 @@ mod tests {
         assert_eq!(u16::from_le_bytes([monitor[2], monitor[3]]), 3);
         assert_eq!(&monitor[6..], &[1, 0, 2, 0, 0xaa, 0xbb]);
         assert_eq!(adapter.statistics().acl_rx, 1);
+    }
+
+    #[test]
+    fn background_receive_pump_publishes_packet_readiness() {
+        let mut adapter = Adapter::new(
+            RxFake {
+                packet: Some((PacketType::Event, vec![0x0e, 0])),
+            },
+            4,
+        );
+        adapter.open(Channel::Raw).unwrap();
+        adapter.set_up(true).unwrap();
+        assert!(!adapter.receive_ready());
+        assert_eq!(adapter.pump_receive(), Ok(true));
+        assert!(adapter.receive_ready());
+        let mut bytes = [0u8; 8];
+        assert_eq!(
+            adapter.receive_packet(&mut bytes, true),
+            Ok((PacketType::Event, 2))
+        );
+        assert_eq!(&bytes[..2], &[0x0e, 0]);
+        assert!(!adapter.receive_ready());
     }
     #[test]
     fn empty_controller_reports_no_device() {
