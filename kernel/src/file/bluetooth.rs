@@ -234,16 +234,19 @@ mod tests {
     #[test]
     fn management_recognizes_bluez_startup_ops_and_returns_no_device_status() {
         let requests: &[&[u8]] = &[
-            &[6, 0, 0, 0, 3, 0, 0, 0, 0],  // SET_DISCOVERABLE
-            &[7, 0, 0, 0, 1, 0, 1],        // SET_CONNECTABLE
-            &[9, 0, 0, 0, 1, 0, 1],        // SET_BONDABLE
-            &[11, 0, 0, 0, 1, 0, 1],       // SET_SSP
-            &[13, 0, 0, 0, 1, 0, 1],       // SET_LE
-            &[18, 0, 0, 0, 3, 0, 0, 0, 0], // LOAD_LINK_KEYS, empty set
-            &[19, 0, 0, 0, 2, 0, 0, 0],    // LOAD_LONG_TERM_KEYS, empty set
-            &[0x23, 0, 0, 0, 1, 0, 1],     // START_DISCOVERY, BR/EDR
-            &[0x24, 0, 0, 0, 1, 0, 1],     // STOP_DISCOVERY, BR/EDR
-            &[0x24, 0, 0, 0, 1, 0, 1],     // STOP_DISCOVERY, BR/EDR
+            &[6, 0, 0, 0, 3, 0, 0, 0, 0],                   // SET_DISCOVERABLE
+            &[7, 0, 0, 0, 1, 0, 1],                         // SET_CONNECTABLE
+            &[9, 0, 0, 0, 1, 0, 1],                         // SET_BONDABLE
+            &[11, 0, 0, 0, 1, 0, 1],                        // SET_SSP
+            &[13, 0, 0, 0, 1, 0, 1],                        // SET_LE
+            &[18, 0, 0, 0, 3, 0, 0, 0, 0],                  // LOAD_LINK_KEYS, empty set
+            &[19, 0, 0, 0, 2, 0, 0, 0],                     // LOAD_LONG_TERM_KEYS, empty set
+            &[0x30, 0, 0, 0, 2, 0, 0, 0],                   // LOAD_IRKS, empty set
+            &[0x19, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 3], // PAIR_DEVICE
+            &[0x14, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0],    // DISCONNECT
+            &[0x23, 0, 0, 0, 1, 0, 1],                      // START_DISCOVERY, BR/EDR
+            &[0x24, 0, 0, 0, 1, 0, 1],                      // STOP_DISCOVERY, BR/EDR
+            &[0x24, 0, 0, 0, 1, 0, 1],                      // STOP_DISCOVERY, BR/EDR
         ];
         for request in requests {
             let response = management_response(request).unwrap();
@@ -734,6 +737,9 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const SET_LE: u16 = 13;
     const LOAD_LINK_KEYS: u16 = 18;
     const LOAD_LONG_TERM_KEYS: u16 = 19;
+    const DISCONNECT: u16 = 0x14;
+    const PAIR_DEVICE: u16 = 0x19;
+    const LOAD_IRKS: u16 = 0x30;
     const START_DISCOVERY: u16 = 0x23;
     const STOP_DISCOVERY: u16 = 0x24;
     const UNKNOWN_COMMAND: u8 = 1;
@@ -849,6 +855,15 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
         LOAD_LONG_TERM_KEYS if valid_load_long_term_keys(parameters) => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
+        LOAD_IRKS if valid_load_irks(parameters) => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        PAIR_DEVICE if parameters.len() == 8 && parameters[6] <= 4 && parameters[7] <= 4 => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
+        DISCONNECT if parameters.len() == 7 && parameters[6] <= 4 => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
         START_DISCOVERY if parameters.len() == 1 && matches!(parameters[0], 1 | 6) => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
@@ -869,6 +884,9 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 | SET_LE
                 | LOAD_LINK_KEYS
                 | LOAD_LONG_TERM_KEYS
+                | LOAD_IRKS
+                | PAIR_DEVICE
+                | DISCONNECT
                 | START_DISCOVERY
                 | STOP_DISCOVERY
         ) =>
@@ -1132,4 +1150,18 @@ fn valid_load_long_term_keys(parameters: &[u8]) -> bool {
     }
     let count = usize::from(u16::from_le_bytes([parameters[0], parameters[1]]));
     count.checked_mul(36).and_then(|size| size.checked_add(2)) == Some(parameters.len())
+}
+
+fn valid_load_irks(parameters: &[u8]) -> bool {
+    if parameters.len() < 2 {
+        return false;
+    }
+    let count = usize::from(u16::from_le_bytes([parameters[0], parameters[1]]));
+    let Some(expected) = count.checked_mul(23).and_then(|bytes| bytes.checked_add(2)) else {
+        return false;
+    };
+    if parameters.len() != expected {
+        return false;
+    }
+    parameters[2..].chunks_exact(23).all(|irk| irk[6] <= 4)
 }

@@ -137,6 +137,8 @@ int main(void) {
     const uint8_t discovery_type[] = { 1 };
     const uint8_t no_link_keys[] = { 0, 0, 0 };
     const uint8_t no_ltk[] = { 0, 0 };
+    const uint8_t no_irks[] = { 0, 0 };
+    const uint8_t peer[] = { 0, 0, 0, 0, 0, 0, 0, 3 };
     if (mgmt_no_controller_command(mgmt, 5, enabled, sizeof(enabled)) ||
         mgmt_no_controller_command(mgmt, 6, discoverable, sizeof(discoverable)) ||
         mgmt_no_controller_command(mgmt, 7, enabled, sizeof(enabled)) ||
@@ -145,6 +147,9 @@ int main(void) {
         mgmt_no_controller_command(mgmt, 13, enabled, sizeof(enabled)) ||
         mgmt_no_controller_command(mgmt, 18, no_link_keys, sizeof(no_link_keys)) ||
         mgmt_no_controller_command(mgmt, 19, no_ltk, sizeof(no_ltk)) ||
+        mgmt_no_controller_command(mgmt, 0x30, no_irks, sizeof(no_irks)) ||
+        mgmt_no_controller_command(mgmt, 0x19, peer, sizeof(peer)) ||
+        mgmt_no_controller_command(mgmt, 0x14, peer, 7) ||
         mgmt_no_controller_command(mgmt, 0x23, discovery_type, sizeof(discovery_type)) ||
         mgmt_no_controller_command(mgmt, 0x24, discovery_type, sizeof(discovery_type))) {
         return 1;

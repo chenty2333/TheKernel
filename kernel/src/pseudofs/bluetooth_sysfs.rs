@@ -4,8 +4,8 @@ use alloc::{borrow::Cow, format, string::String, sync::Arc, vec::Vec};
 use axfs_ng_vfs::{FsName, FsNameBuf, VfsError, VfsResult};
 
 use super::{
-    ChildNames, DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs,
-    try_boxed_names,
+    ChildNames, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
+    SimpleFileOperation, SimpleFs, try_boxed_names,
 };
 
 struct BluetoothClass {
@@ -135,6 +135,20 @@ impl SimpleDirOps for BluetoothClass {
                         .into(),
                     )
                 }),
+            );
+            let reset = adapter.clone();
+            files.add(
+                "reset",
+                SimpleFile::new_regular(
+                    self.fs.clone(),
+                    RwFile::new_root_writable(move |operation| match operation {
+                        SimpleFileOperation::Read => Ok::<_, VfsError>(None),
+                        SimpleFileOperation::Write(_) => {
+                            reset.lock().management_reset().map_err(|_| VfsError::Io)?;
+                            Ok(Some(Vec::<u8>::new()))
+                        }
+                    }),
+                ),
             );
             Ok(SimpleDir::new_maker(self.fs.clone(), Arc::new(files)).into())
         }

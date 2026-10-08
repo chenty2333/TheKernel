@@ -288,6 +288,34 @@ impl UsbBluetoothHci {
     pub fn management_settings(&self) -> u32 {
         self.management_settings
     }
+    pub fn management_reset(&mut self) -> Result<(), Error> {
+        if !self.adapter.is_up() {
+            return Err(Error::NotUp);
+        }
+        self.command_complete(0x0c03, &[])?;
+        self.management_settings = MGMT_SETTING_POWERED;
+        if self.family_hint != tk_bt_hci::DeviceFamily::Unknown {
+            self.adapter.intel_set_event_mask()?;
+        }
+        if let Ok(capabilities) = self.adapter.read_capabilities() {
+            self.address = capabilities.address;
+            self.capabilities = capabilities;
+        }
+        let mut event = [0u8; 16];
+        if self
+            .command_complete_raw(0x0c19, &[], &mut event)
+            .is_ok_and(|length| length >= 7 && event[5] == 0)
+        {
+            if event[6] & 0x02 != 0 {
+                self.management_settings |= MGMT_SETTING_CONNECTABLE;
+            }
+            if event[6] & 0x01 != 0 {
+                self.management_settings |= MGMT_SETTING_CONNECTABLE | MGMT_SETTING_DISCOVERABLE;
+            }
+        }
+        self.discovery_type = 0;
+        Ok(())
+    }
     pub fn management_discovery(&mut self, discovery_type: u8, start: bool) -> Result<bool, Error> {
         if !self.adapter.is_up() {
             return Err(Error::NotUp);
