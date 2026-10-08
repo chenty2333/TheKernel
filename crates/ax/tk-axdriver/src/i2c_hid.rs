@@ -223,6 +223,34 @@ impl I2cInput {
                     info.slots = u16::try_from(max_contacts).unwrap_or(32).min(32);
                 }
             }
+            // upstream: hmt_attach() fetches HUD_BUTTON_TYPE unless it shares
+            // the Contact Count Maximum report; value zero means integrated
+            // clickpad, and a failed/absent report falls back to ordinary pad.
+            if let Some(location) =
+                parser.locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x59, 0)
+                && parser
+                    .locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x55, 0)
+                    .is_none_or(|contacts| contacts.report_id != location.report_id)
+            {
+                let length =
+                    parser.report_size(crate::hid_report::ReportKind::Feature, location.report_id);
+                let mut feature = Vec::new();
+                feature
+                    .try_reserve_exact(length)
+                    .map_err(|_| DevError::NoMemory)?;
+                feature.resize(length, 0);
+                if device
+                    .get_report(3, location.report_id, &mut feature)
+                    .is_ok_and(|actual| {
+                        actual.saturating_mul(8)
+                            >= usize::from(location.bit_offset) + usize::from(location.size)
+                    })
+                {
+                    info.set_button_type(crate::hid_report::get_hid_data(
+                        &feature, location, false,
+                    ));
+                }
+            }
             if let Err(error) = info.set_input_mode(&mut device, &parser, 3) {
                 warn!("i2c-hid: failed to select multitouch input mode: {error:?}");
             }
@@ -476,7 +504,7 @@ impl InputDriverOps for I2cInput {
             .is_some_and(|hmt| hmt.kind == crate::hmt::Type::Touchpad)
         {
             if let Some(byte) = out.first_mut() {
-                *byte = 1;
+                *byte = 1 | (u8::from(state.hmt.is_some_and(|hmt| hmt.clickpad)) << 2);
             }
             return Ok(true);
         }

@@ -17,6 +17,9 @@ pub(super) enum Type {
 pub(super) struct MultiTouch {
     pub kind: Type,
     pub slots: u16,
+    /// Upstream `hmt_attach()` sets INPUT_PROP_BUTTONPAD when the feature
+    /// report identifies an integrated click surface.
+    pub clickpad: bool,
 }
 
 impl MultiTouch {
@@ -50,7 +53,18 @@ impl MultiTouch {
         } else {
             default_slots
         };
-        Some(Self { kind, slots })
+        Some(Self {
+            kind,
+            slots,
+            clickpad: false,
+        })
+    }
+
+    // upstream: hmt_attach() button-type feature report handling
+    pub(super) fn set_button_type(&mut self, value: Option<i32>) {
+        if let Some(value) = value {
+            self.clickpad = value == 0;
+        }
     }
 
     // upstream: hmt.c hmt_set_input_mode() / hconf.c hconf_set_feature_control()
@@ -125,9 +139,14 @@ mod tests {
         descriptor.extend_from_slice(&finger);
         descriptor.push(0xc0);
         let mut report = Report::parse(&descriptor).unwrap();
-        let hmt = MultiTouch::probe(&report).unwrap();
+        let mut hmt = MultiTouch::probe(&report).unwrap();
         assert_eq!(hmt.kind, Type::Touchpad);
         assert_eq!(hmt.slots, 31);
+        assert!(!hmt.clickpad);
+        hmt.set_button_type(Some(0));
+        assert!(hmt.clickpad);
+        hmt.set_button_type(Some(1));
+        assert!(!hmt.clickpad);
         assert!(report.has_code(3, 0x2f)); // ABS_MT_SLOT
         let mut events = VecDeque::new();
         assert!(report.decode(&[1, 7, 50, 60, 10, 20, 0, 8, 70, 80, 0, 0], &mut events));
