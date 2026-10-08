@@ -12,7 +12,10 @@
 
 use alloc::vec::Vec;
 
-use crate::{FirmwareImage, FirmwareSection, SectionType};
+use crate::{FirmwareImage, FirmwareSection, PnvmImage, SectionType};
+
+const PNVM_MAX_SEGMENTS: usize = 64;
+const PNVM_INFO_BYTES: usize = PNVM_MAX_SEGMENTS * 8;
 
 /// DMA allocation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +67,82 @@ pub struct FirmwareDmaImages<R: DmaRegion> {
     pub lmac_addresses: Vec<u64>,
     pub umac_addresses: Vec<u64>,
     pub paging_addresses: Vec<u64>,
+}
+
+/// Device-visible PNVM storage, retaining all regions referenced by firmware.
+pub struct PnvmDmaImage<R: DmaRegion> {
+    /// Address written into Gen3 context-info's PNVM base field.
+    pub base_address: u64,
+    pub total_size: usize,
+    /// Present for fragmented PNVM; contains the 64 little-endian image addresses.
+    pub info: Option<R>,
+    /// Present for a legacy contiguous PNVM image.
+    pub contiguous: Option<R>,
+    /// Payload segments for fragmented PNVM, held alive until firmware consumes them.
+    pub segments: Vec<R>,
+}
+
+/// Assemble PNVM payload as one contiguous region or Gen3's address-array layout.
+// upstream: if_iwx.c iwx_pnvm_setup_fragmented() and iwx_pnvm_setup()
+pub fn setup_pnvm<A: DmaAllocator>(
+    allocator: &mut A,
+    pnvm: &PnvmImage,
+    fragmented: bool,
+) -> Result<PnvmDmaImage<A::Region>, DmaError> {
+    let total_size = pnvm.segments.iter().try_fold(0usize, |sum, segment| {
+        sum.checked_add(segment.len())
+            .ok_or(DmaError::RegionTooSmall)
+    })?;
+    if total_size == 0 || total_size != pnvm.total_size {
+        return Err(DmaError::RegionTooSmall);
+    }
+    if !fragmented {
+        let mut image = allocator.allocate(total_size)?;
+        if image.capacity() < total_size {
+            return Err(DmaError::RegionTooSmall);
+        }
+        let mut offset = 0usize;
+        for segment in &pnvm.segments {
+            image.write_at(offset, segment)?;
+            offset += segment.len();
+        }
+        let base_address = image.device_address();
+        return Ok(PnvmDmaImage {
+            base_address,
+            total_size,
+            info: None,
+            contiguous: Some(image),
+            segments: Vec::new(),
+        });
+    }
+    if pnvm.segments.len() > PNVM_MAX_SEGMENTS {
+        return Err(DmaError::RegionTooSmall);
+    }
+    let mut info = allocator.allocate(PNVM_INFO_BYTES)?;
+    if info.capacity() < PNVM_INFO_BYTES {
+        return Err(DmaError::RegionTooSmall);
+    }
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(pnvm.segments.len())
+        .map_err(|_| DmaError::AllocationFailed)?;
+    for (index, bytes) in pnvm.segments.iter().enumerate() {
+        let mut region = allocator.allocate(bytes.len())?;
+        if region.capacity() < bytes.len() {
+            return Err(DmaError::RegionTooSmall);
+        }
+        region.write(bytes)?;
+        info.write_at(index * 8, &region.device_address().to_le_bytes())?;
+        segments.push(region);
+    }
+    let base_address = info.device_address();
+    Ok(PnvmDmaImage {
+        base_address,
+        total_size,
+        info: Some(info),
+        contiguous: None,
+        segments,
+    })
 }
 
 impl<R: DmaRegion> FirmwareDmaImages<R> {
@@ -270,6 +349,35 @@ mod tests {
         images.free_paging();
         assert!(images.paging_addresses.is_empty());
         assert_eq!(images.lmac.len(), 1);
+    }
+
+    #[test]
+    fn assembles_contiguous_and_fragmented_pnvm_layouts() {
+        let pnvm = PnvmImage {
+            version: 7,
+            total_size: 5,
+            segments: vec![vec![1, 2], vec![3, 4, 5]],
+        };
+        let mut allocator = TestAllocator(Cell::new(0x200000));
+        let contiguous = setup_pnvm(&mut allocator, &pnvm, false).unwrap();
+        assert_eq!(contiguous.base_address, 0x200000);
+        assert_eq!(contiguous.total_size, 5);
+        assert_eq!(
+            contiguous.contiguous.as_ref().unwrap().bytes,
+            [1, 2, 3, 4, 5]
+        );
+
+        let fragmented = setup_pnvm(&mut allocator, &pnvm, true).unwrap();
+        assert_eq!(fragmented.base_address, 0x201000);
+        assert_eq!(fragmented.total_size, 5);
+        let info = &fragmented.info.as_ref().unwrap().bytes;
+        assert_eq!(u64::from_le_bytes(info[0..8].try_into().unwrap()), 0x202000);
+        assert_eq!(
+            u64::from_le_bytes(info[8..16].try_into().unwrap()),
+            0x203000
+        );
+        assert_eq!(fragmented.segments[0].bytes, [1, 2]);
+        assert_eq!(fragmented.segments[1].bytes, [3, 4, 5]);
     }
 
     struct FallbackAllocator {

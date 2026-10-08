@@ -97,6 +97,24 @@ pub fn build_gen3_prph_scratch(
     Ok(bytes)
 }
 
+/// Point Gen3 peripheral scratch at the assembled PNVM DMA image.
+// upstream: if_iwx.c iwx_ctxt_info_gen3_set_pnvm()
+pub fn set_gen3_pnvm(
+    scratch: &mut [u8],
+    pnvm: &crate::PnvmDmaImage<impl crate::DmaRegion>,
+) -> Result<(), ContextError> {
+    if scratch.len() < PRPH_SCRATCH_SIZE {
+        return Err(ContextError::InvalidAddressArray);
+    }
+    put_u64(scratch, 16, pnvm.base_address)?;
+    put_u32(
+        scratch,
+        24,
+        u32::try_from(pnvm.total_size).map_err(|_| ContextError::InvalidAddressArray)?,
+    )?;
+    Ok(())
+}
+
 /// Build the Gen3 IPC context-info object.
 // upstream: if_iwx.c iwx_ctxt_info_gen3_init()
 pub fn build_gen3_context(
@@ -261,6 +279,21 @@ mod tests {
         assert_eq!(&scratch[636..644], &0x1000u64.to_le_bytes());
         assert_eq!(&scratch[124..132], &0x2000u64.to_le_bytes());
         assert_eq!(&scratch[1148..1156], &0x3000u64.to_le_bytes());
+
+        let pnvm = crate::PnvmDmaImage {
+            base_address: 0xa000,
+            total_size: 0x1234,
+            info: None,
+            contiguous: Some(Region {
+                address: 0xa000,
+                bytes: vec![0; 0x1234],
+            }),
+            segments: vec![],
+        };
+        let mut scratch = scratch;
+        set_gen3_pnvm(&mut scratch, &pnvm).unwrap();
+        assert_eq!(&scratch[16..24], &0xa000u64.to_le_bytes());
+        assert_eq!(&scratch[24..28], &0x1234u32.to_le_bytes());
 
         let context = build_gen3_context(
             ContextQueueAddresses {

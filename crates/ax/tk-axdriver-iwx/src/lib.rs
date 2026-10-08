@@ -30,13 +30,13 @@ pub use config::{
 };
 pub use context::{
     ContextError, ContextQueueAddresses, build_gen2_context, build_gen3_context,
-    build_gen3_prph_scratch,
+    build_gen3_prph_scratch, set_gen3_pnvm,
 };
 pub use dma::{
     DebugDestinationError, DebugRegisterAccess, DebugRegisterTransaction, DmaAllocator, DmaError,
-    DmaRegion, FirmwareDmaImages, LtrRegisterAccess, MonitorBuffer, allocate_monitor,
+    DmaRegion, FirmwareDmaImages, LtrRegisterAccess, MonitorBuffer, PnvmDmaImage, allocate_monitor,
     allocate_monitor_block, apply_debug_destination, initialize_firmware_sections, ltr_long_value,
-    set_ltr,
+    set_ltr, setup_pnvm,
 };
 pub use firmware::{
     FirmwareError, FirmwareImage, FirmwareSection, PnvmImage, SectionType, firmware_version_string,
