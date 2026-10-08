@@ -251,6 +251,112 @@ pub struct CaptureGroup {
     pub lists: Vec<CaptureList>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureOutputNode {
+    pub is_partial: bool,
+    pub engine_class: u8,
+    pub engine_instance: u8,
+    pub guc_id: u32,
+    pub lrca: u32,
+    pub lists: [Option<CaptureList>; 3],
+}
+
+impl CaptureOutputNode {
+    fn empty(is_partial: bool) -> Self {
+        Self {
+            is_partial,
+            engine_class: 0,
+            engine_instance: 0,
+            guc_id: 0,
+            lrca: 0,
+            lists: [None, None, None],
+        }
+    }
+
+    fn clone_lists(&self, keep_global: bool, keep_class: bool) -> Self {
+        let mut node = Self::empty(self.is_partial);
+        if keep_global {
+            node.lists[usize::from(CAPTURE_TYPE_GLOBAL)] =
+                self.lists[usize::from(CAPTURE_TYPE_GLOBAL)].clone();
+        }
+        if keep_class {
+            node.lists[usize::from(CAPTURE_TYPE_ENGINE_CLASS)] =
+                self.lists[usize::from(CAPTURE_TYPE_ENGINE_CLASS)].clone();
+            node.engine_class = self.engine_class;
+        }
+        node
+    }
+}
+
+/// Split dependent-engine capture lists into engine nodes, cloning common
+/// global/class state in the same cases as the upstream parsed-output list.
+/// `max_mmio_per_node` mirrors the preallocated node capacity and clips larger
+/// lists rather than allocating unbounded output from firmware data.
+/// upstream: intel_guc_capture.c guc_capture_extract_reglists().
+pub fn build_capture_output_nodes(
+    group: &CaptureGroup,
+    max_mmio_per_node: usize,
+) -> Result<Vec<CaptureOutputNode>, CaptureError> {
+    let mut output = Vec::new();
+    let mut current: Option<CaptureOutputNode> = None;
+    for input in &group.lists {
+        let list_type = input.capture_type;
+        if list_type >= CAPTURE_TYPE_MAX {
+            continue;
+        }
+        let next_node = current.as_ref().and_then(|node| {
+            let boundary = match list_type {
+                CAPTURE_TYPE_GLOBAL => Some((false, false)),
+                CAPTURE_TYPE_ENGINE_CLASS
+                    if node.lists[usize::from(CAPTURE_TYPE_ENGINE_CLASS)].is_some() =>
+                {
+                    Some((true, false))
+                }
+                CAPTURE_TYPE_ENGINE_INSTANCE
+                    if node.lists[usize::from(CAPTURE_TYPE_ENGINE_INSTANCE)].is_some() =>
+                {
+                    Some((true, true))
+                }
+                _ => None,
+            };
+            boundary.map(|(keep_global, keep_class)| node.clone_lists(keep_global, keep_class))
+        });
+        if let Some(next_node) = next_node {
+            output
+                .try_reserve(1)
+                .map_err(|_| CaptureError::InvalidBuffer)?;
+            output.push(current.take().ok_or(CaptureError::InvalidBuffer)?);
+            current = Some(next_node);
+        }
+        if current.is_none() {
+            current = Some(CaptureOutputNode::empty(
+                group.group_type == CAPTURE_GROUP_PARTIAL,
+            ));
+        }
+        let node = current.as_mut().ok_or(CaptureError::InvalidBuffer)?;
+        let mut list = input.clone();
+        list.registers.truncate(max_mmio_per_node);
+        match list_type {
+            CAPTURE_TYPE_ENGINE_CLASS => node.engine_class = input.engine_class,
+            CAPTURE_TYPE_ENGINE_INSTANCE => {
+                node.engine_class = input.engine_class;
+                node.engine_instance = input.engine_instance;
+                node.lrca = input.lrca;
+                node.guc_id = input.guc_id;
+            }
+            _ => {}
+        }
+        node.lists[usize::from(list_type)] = Some(list);
+    }
+    if let Some(node) = current {
+        output
+            .try_reserve(1)
+            .map_err(|_| CaptureError::InvalidBuffer)?;
+        output.push(node);
+    }
+    Ok(output)
+}
+
 /// Decode a GuC capture group. Captures remain separate, preserving their
 /// original order and metadata for the engine-reset/core-dump consumer.
 /// upstream: intel_guc_capture.c guc_capture_extract_reglists().
@@ -318,6 +424,8 @@ pub fn extract_group(buffer: &mut CaptureBuffer<'_>) -> Result<CaptureGroup, Cap
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     fn words_to_bytes(words: &[u32]) -> Vec<u8> {
@@ -435,6 +543,43 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0x20);
         assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 0x30);
+    }
+
+    #[test]
+    fn dependent_capture_nodes_clone_global_and_class_registers() {
+        let regs = vec![CaptureRegister {
+            offset: 1,
+            value: 0,
+            flags: 0,
+            mask: 0,
+        }];
+        let make = |capture_type, engine_instance| CaptureList {
+            vfid: 0,
+            capture_type,
+            engine_class: 0,
+            engine_instance,
+            lrca: u32::from(engine_instance),
+            guc_id: u32::from(engine_instance),
+            registers: regs.clone(),
+        };
+        let group = CaptureGroup {
+            vfid: 0,
+            group_type: CAPTURE_GROUP_FULL,
+            lists: vec![
+                make(CAPTURE_TYPE_GLOBAL, 0),
+                make(CAPTURE_TYPE_ENGINE_CLASS, 0),
+                make(CAPTURE_TYPE_ENGINE_INSTANCE, 0),
+                make(CAPTURE_TYPE_ENGINE_INSTANCE, 1),
+            ],
+        };
+        let nodes = build_capture_output_nodes(&group, 1).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes[0].lists[usize::from(CAPTURE_TYPE_GLOBAL)].is_some());
+        assert!(nodes[0].lists[usize::from(CAPTURE_TYPE_ENGINE_CLASS)].is_some());
+        assert_eq!(nodes[0].guc_id, 0);
+        assert!(nodes[1].lists[usize::from(CAPTURE_TYPE_GLOBAL)].is_some());
+        assert!(nodes[1].lists[usize::from(CAPTURE_TYPE_ENGINE_CLASS)].is_some());
+        assert_eq!(nodes[1].guc_id, 1);
     }
 
     #[test]
