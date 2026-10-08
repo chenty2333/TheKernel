@@ -1465,6 +1465,45 @@ impl<I: SdhciIo> SdhciHost<I> {
             index,
             8 | SD_ACMD_SEND_SCR | SD_ACMD_SD_STATUS | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE
         ) || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
+        self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
+        if let (Some(mode), Some(buffer)) = (transfer, data.as_ref()) {
+            self.start_data(
+                buffer,
+                block_size,
+                blocks,
+                mode,
+                read_transfer,
+                use_sdma,
+                use_adma2,
+            )?;
+        }
+        self.start_command(index, argument, command_flags);
+        let response = self.finish_command(command_flags)?;
+        if let Some(buffer) = data {
+            self.finish_data(
+                buffer,
+                block_size,
+                data_len,
+                read_transfer,
+                use_sdma,
+                use_adma2,
+            )?;
+        }
+        Ok(response)
+    }
+
+    // upstream: sdhci.c sdhci_start_data()
+    fn start_data(
+        &mut self,
+        buffer: &[u8],
+        block_size: usize,
+        blocks: u16,
+        mut mode: u16,
+        read_transfer: bool,
+        use_sdma: bool,
+        use_adma2: bool,
+    ) -> Result<(), SdhciError> {
+        let data_len = buffer.len();
         if use_sdma || use_adma2 {
             let dma = self.dma.as_ref().expect("DMA predicate checked allocation");
             let payload = if use_adma2 {
@@ -1475,13 +1514,9 @@ impl<I: SdhciIo> SdhciHost<I> {
                 dma.cpu.as_ptr()
             };
             if !read_transfer {
-                if let Some(buffer) = data.as_ref() {
-                    // SAFETY: the caller buffer and DMA bounce are disjoint
-                    // owned regions, and the selected path bounds-checks data_len.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(buffer.as_ptr(), payload, data_len);
-                    }
-                }
+                // SAFETY: the caller buffer and DMA bounce are disjoint owned
+                // regions, and the path predicate bounds-checks data_len.
+                unsafe { core::ptr::copy_nonoverlapping(buffer.as_ptr(), payload, data_len) };
             }
             if use_adma2 {
                 // SAFETY: the coherent allocation is at least one page and
@@ -1511,37 +1546,20 @@ impl<I: SdhciIo> SdhciHost<I> {
             self.io.write8(SDHCI_HOST_CONTROL as usize, host_control);
             fence(Ordering::Release);
             self.dma_inflight = true;
+            mode |= SDHCI_TRNS_DMA as u16;
         }
-        self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
-        if let (Some(mut mode), Some(_buffer)) = (transfer, data.as_ref()) {
-            let boundary = if use_sdma || use_adma2 {
-                SDHCI_BLKSZ_SDMA_BNDRY_512K
-            } else {
-                SDHCI_BLKSZ_SDMA_BNDRY_4K
-            };
-            if use_sdma || use_adma2 {
-                mode |= SDHCI_TRNS_DMA as u16;
-            }
-            self.io.write16(
-                SDHCI_BLOCK_SIZE as usize,
-                make_block_size(boundary, block_size as u32) as u16,
-            );
-            self.io.write16(SDHCI_BLOCK_COUNT as usize, blocks);
-            self.io.write16(SDHCI_TRANSFER_MODE as usize, mode);
-        }
-        self.start_command(index, argument, command_flags);
-        let response = self.finish_command(command_flags)?;
-        if let Some(buffer) = data {
-            self.finish_data(
-                buffer,
-                block_size,
-                data_len,
-                read_transfer,
-                use_sdma,
-                use_adma2,
-            )?;
-        }
-        Ok(response)
+        let boundary = if use_sdma || use_adma2 {
+            SDHCI_BLKSZ_SDMA_BNDRY_512K
+        } else {
+            SDHCI_BLKSZ_SDMA_BNDRY_4K
+        };
+        self.io.write16(
+            SDHCI_BLOCK_SIZE as usize,
+            make_block_size(boundary, block_size as u32) as u16,
+        );
+        self.io.write16(SDHCI_BLOCK_COUNT as usize, blocks);
+        self.io.write16(SDHCI_TRANSFER_MODE as usize, mode);
+        Ok(())
     }
 
     // upstream: sdhci.c sdhci_finish_data()
