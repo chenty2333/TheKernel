@@ -6,7 +6,7 @@
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use crate::Error;
+use crate::{Error, guc_ads::GUC_MAX_ENGINE_CLASSES};
 
 pub const PARENT_SCRATCH_SIZE: usize = 4096;
 pub const CACHELINE_BYTES: usize = 64;
@@ -1273,6 +1273,50 @@ pub struct ParentScratchInfo {
     pub is_v70: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextResetEvent {
+    pub context_id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EngineFailureEvent {
+    pub guc_class: u8,
+    pub instance: u8,
+    pub reason: u32,
+    pub instance_mask: u32,
+}
+
+/// upstream: intel_guc_submission.c intel_guc_context_reset_process_msg().
+pub fn parse_context_reset_event(payload: &[u32]) -> Result<ContextResetEvent, Error> {
+    if payload.len() != 1 || payload[0] == GUC_INVALID_CONTEXT_ID {
+        return Err(Error::Refused);
+    }
+    Ok(ContextResetEvent {
+        context_id: payload[0],
+    })
+}
+
+/// upstream: intel_guc_submission.c intel_guc_engine_failure_process_msg().
+pub fn parse_engine_failure_event(
+    payload: &[u32],
+    enabled_engine_masks: &[u32; GUC_MAX_ENGINE_CLASSES],
+) -> Result<EngineFailureEvent, Error> {
+    if payload.len() != 3 || payload[0] >= GUC_MAX_ENGINE_CLASSES as u32 || payload[1] >= 32 {
+        return Err(Error::Refused);
+    }
+    let guc_class = payload[0] as usize;
+    let instance = payload[1] as u8;
+    if enabled_engine_masks[guc_class] & (1 << instance) == 0 {
+        return Err(Error::Refused);
+    }
+    Ok(EngineFailureEvent {
+        guc_class: guc_class as u8,
+        instance,
+        reason: payload[2],
+        instance_mask: 1 << instance,
+    })
+}
+
 /// upstream: intel_guc_submission.c parent_scratch layout,
 /// __get_parent_scratch(), and prepare_context_registration_info_v69/v70().
 pub fn build_parent_scratch(
@@ -1564,6 +1608,30 @@ mod tests {
         assert_eq!(
             work_queue_offset(2).unwrap(),
             (2 * PARENT_SCRATCH_SIZE + WQ_OFFSET) as u32
+        );
+    }
+
+    #[test]
+    fn g2h_context_reset_and_engine_failure_payloads_validate_fused_instances() {
+        assert_eq!(
+            parse_context_reset_event(&[9]),
+            Ok(ContextResetEvent { context_id: 9 })
+        );
+        assert_eq!(parse_context_reset_event(&[]), Err(Error::Refused));
+        let mut masks = [0; GUC_MAX_ENGINE_CLASSES];
+        masks[3] = 0b101;
+        assert_eq!(
+            parse_engine_failure_event(&[3, 2, 0x55], &masks),
+            Ok(EngineFailureEvent {
+                guc_class: 3,
+                instance: 2,
+                reason: 0x55,
+                instance_mask: 0b100,
+            })
+        );
+        assert_eq!(
+            parse_engine_failure_event(&[3, 1, 0], &masks),
+            Err(Error::Refused)
         );
     }
 
