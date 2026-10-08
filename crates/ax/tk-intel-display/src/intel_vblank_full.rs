@@ -638,6 +638,38 @@ pub fn intel_crtc_vblank_length(state: &CrtcState) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FramePixel(u64);
+    impl VblankIo for FramePixel {
+        fn read64_frame_pixel(&mut self, _pipe: u8) -> u64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn frame_pixel_counter_advances_at_hsync_adjusted_vblank_start() {
+        let vblank = VblankCrtc {
+            hwmode: Mode {
+                htotal: 2200,
+                hsync_start: 2008,
+                vdisplay: 1080,
+                vblank_start: 1080,
+                ..Mode::default()
+            },
+            max_vblank_count: 0x00ff_ffff,
+        };
+        let boundary = 1080 * 2200 - (2200 - 2008);
+        let mut before = FramePixel(10 << 24 | (boundary - 1) as u64);
+        let mut at = FramePixel(10 << 24 | boundary as u64);
+        let display = Display {
+            display_ver: 13,
+            ddi: true,
+            ..Display::default()
+        };
+        assert_eq!(i915_get_vblank_counter(&mut before, display, 0, vblank), 10);
+        assert_eq!(i915_get_vblank_counter(&mut at, display, 0, vblank), 11);
+    }
+
     #[test]
     fn interlace_mode_helpers_and_vblank_offset_follow_source() {
         let mode = Mode {
