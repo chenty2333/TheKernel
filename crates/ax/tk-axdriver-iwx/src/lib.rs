@@ -183,7 +183,8 @@ pub use scan::{
     ScanConfigError, ScanError, ScanState, UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ,
     UmacScanConfig, UmacScanError, UmacScanVersion, abort_scan, begin_background_scan,
     begin_foreground_scan, build_umac_scan_request, end_scan, fill_umac_scan_channels,
-    fill_umac_scan_channels_v5, reduced_scan_config_command, scan_abort_command,
+    fill_umac_scan_channels_v5, initiate_scan_command, reduced_scan_config_command,
+    scan_abort_command,
 };
 pub use scan_probe::{
     DS_PARAMETER_IE, EXTENDED_RATES_IE, HT_CAPABILITIES_IE, PROBE_REQUEST_BYTES,

@@ -40,3 +40,7 @@ Statistics clearing follows the firmware command-version table: unknown
 version 1 sends asynchronous `SYSTEM_STATISTICS_CMD` and waits for
 `SYSTEM_STATISTICS_END_NOTIF`, and unknown newer versions follow the source's
 no-op path.
+
+`iwx_initiate_scan()` selects the v17 UMAC request only when firmware
+advertises version 17; otherwise it uses the v14 structure, preserving the
+driver's fallback policy.

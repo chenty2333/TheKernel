@@ -315,6 +315,20 @@ pub fn build_umac_scan_request(
         .map_err(UmacScanError::Command)
 }
 
+/// Select firmware scan request version 17, falling back to the v14 layout.
+// upstream: if_iwx.c iwx_initiate_scan()
+pub fn initiate_scan_command(
+    mut config: UmacScanConfig<'_>,
+    command_version: u8,
+) -> Result<EncodedCommand, UmacScanError> {
+    config.version = if command_version == 17 {
+        UmacScanVersion::V17
+    } else {
+        UmacScanVersion::V14
+    };
+    build_umac_scan_request(config)
+}
+
 fn write_v1_v4_channels(payload: &mut [u8], offset: usize, channels: &[ScanChannelConfig]) {
     for (index, channel) in channels.iter().enumerate() {
         let at = offset + index * 8;
@@ -600,6 +614,26 @@ mod tests {
         let v17 =
             build_umac_scan_request(full_scan_config(UmacScanVersion::V17, &channels, &[], true))
                 .unwrap();
+        assert_eq!(
+            initiate_scan_command(
+                full_scan_config(UmacScanVersion::V14, &channels, &[], true),
+                17,
+            )
+            .unwrap()
+            .bytes,
+            v17.bytes
+        );
+        assert_eq!(
+            initiate_scan_command(
+                full_scan_config(UmacScanVersion::V17, &channels, &[], true),
+                18,
+            )
+            .unwrap()
+            .bytes,
+            build_umac_scan_request(full_scan_config(UmacScanVersion::V14, &channels, &[], true))
+                .unwrap()
+                .bytes
+        );
         assert_eq!(v17.flags, CMD_ASYNC);
         assert_eq!(
             u16::from_le_bytes(v17.bytes[16..18].try_into().unwrap()),
