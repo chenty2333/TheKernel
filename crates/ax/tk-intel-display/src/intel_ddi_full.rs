@@ -291,8 +291,8 @@ pub trait DdiIo {
     fn power_is_enabled(&mut self, _domain: u32) -> bool { true }
     fn enable_power_if_enabled(&mut self, _domain: u32) -> Option<u64> { None }
     fn disable_power(&mut self, _domain: u32, _cookie: u64) {}
-    fn aux_write(&mut self, _port: Port, _address: u32, _bytes: &[u8]) -> Result<usize, i32> { Ok(0) }
-    fn aux_read(&mut self, _port: Port, _address: u32, _bytes: &mut [u8]) -> Result<usize, i32> { Ok(0) }
+    fn aux_write(&mut self, _port: Port, _address: u32, _bytes: &[u8]) -> Result<i32, i32> { Ok(0) }
+    fn aux_read(&mut self, _port: Port, _address: u32, _bytes: &mut [u8]) -> Result<i32, i32> { Ok(0) }
     fn external(&mut self, _operation: ExternalOperation, _value: u32) -> u32 { 0 }
     fn encoder_clock_enable(&mut self, encoder: &DdiEncoder, state: &CrtcState) {
         self.external(ExternalOperation::Dpll, ((encoder.port.index() as u32) << 24) | state.pll_id as u32 | (1 << 31));
