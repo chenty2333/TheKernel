@@ -176,6 +176,15 @@ pub trait DisplayAdapter: Send + Sync {
     fn cursor_formats(&self) -> &'static [u32] {
         &[super::property::FORMAT_ARGB8888]
     }
+    /// CRTC LUT property sizes exposed to userspace. Display adapters with a
+    /// generation-specific degamma table must override the generic 256-entry
+    /// default instead of advertising a size their hardware cannot consume.
+    fn gamma_lut_size(&self) -> u32 {
+        256
+    }
+    fn degamma_lut_size(&self) -> u32 {
+        256
+    }
     fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
         None
     }
@@ -448,6 +457,8 @@ impl DrmDevice {
             modes.push(fixed);
         }
         let connected = adapter.connector_connected();
+        let gamma_lut_size = adapter.gamma_lut_size();
+        let degamma_lut_size = adapter.degamma_lut_size();
         let edid = adapter
             .connector_edid()
             .unwrap_or_else(|| default_edid(preferred_mode));
@@ -517,19 +528,21 @@ impl DrmDevice {
                     primary_plane_id,
                     cursor_plane_id,
                     preferred_mode,
+                    gamma_lut_size,
+                    degamma_lut_size,
                     modes: if connected { modes.clone() } else { Vec::new() },
                 },
                 framebuffers: BTreeMap::new(),
                 next_framebuffer: 1,
                 vblank: 0,
                 hardware_vblank: None,
-                gamma_lut: (0..256)
+                gamma_lut: (0..gamma_lut_size)
                     .flat_map(|index| {
                         let value = (index * 257) as u16;
                         [value, value, value]
                     })
                     .collect(),
-                degamma_lut: (0..256)
+                degamma_lut: (0..degamma_lut_size)
                     .flat_map(|index| {
                         let value = (index * 257) as u16;
                         [value, value, value]
@@ -553,6 +566,8 @@ impl DrmDevice {
                     primary_plane_id,
                     cursor_plane_id,
                     preferred_mode,
+                    gamma_lut_size,
+                    degamma_lut_size,
                     modes: if connected { modes.clone() } else { Vec::new() },
                 }),
                 atomic_owner: None,
@@ -571,6 +586,8 @@ impl DrmDevice {
                     primary_plane_id,
                     cursor_plane_id,
                     preferred_mode,
+                    gamma_lut_size,
+                    degamma_lut_size,
                     modes: if connected { modes } else { Vec::new() },
                 }),
                 atomic_generation: 0,
@@ -2039,6 +2056,51 @@ mod tests {
         fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
             Ok(Fence::new(true))
         }
+    }
+
+    struct Display13ColorAdapter;
+    impl DisplayAdapter for Display13ColorAdapter {
+        fn create_dumb(
+            &self,
+            _: DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
+        ) -> DrmResult<Arc<dyn GemBacking>> {
+            Err(DrmError::Unsupported)
+        }
+        fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
+            Ok(Fence::new(true))
+        }
+        fn degamma_lut_size(&self) -> u32 {
+            131
+        }
+    }
+
+    #[test]
+    fn color_lut_property_sizes_follow_adapter_generation() {
+        let device = DrmDevice::new(Arc::new(Display13ColorAdapter), 11, 12, 13, 14);
+        let state = device.state.lock();
+        assert_eq!(state.resources.gamma_lut_size, 256);
+        assert_eq!(state.resources.degamma_lut_size, 131);
+        assert_eq!(state.gamma_lut.len(), 256 * 3);
+        assert_eq!(state.degamma_lut.len(), 131 * 3);
+        assert_eq!(
+            super::super::atomic::value_with_resources(
+                &state.resources,
+                &state.atomic,
+                super::super::property::CRTC_GAMMA_LUT_SIZE,
+            ),
+            Some(256)
+        );
+        assert_eq!(
+            super::super::atomic::value_with_resources(
+                &state.resources,
+                &state.atomic,
+                super::super::property::CRTC_DEGAMMA_LUT_SIZE,
+            ),
+            Some(131)
+        );
     }
 
     #[test]

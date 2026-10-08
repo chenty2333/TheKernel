@@ -988,6 +988,12 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
         // opaque linear XR24 primary-plane path.
         &[intel_display::universal_plane::XRGB8888]
     }
+    fn gamma_lut_size(&self) -> u32 {
+        256
+    }
+    fn degamma_lut_size(&self) -> u32 {
+        intel_display::intel_color_full::glk_degamma_lut_size(13) as u32
+    }
     fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
         Some(self.pci)
     }

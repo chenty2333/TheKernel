@@ -118,8 +118,8 @@ pub fn value_with_resources(
 ) -> Option<u64> {
     match property {
         property::CONNECTOR_EDID => Some(resources.connector.edid_blob as u64),
-        property::CRTC_GAMMA_LUT_SIZE => Some(256),
-        property::CRTC_DEGAMMA_LUT_SIZE => Some(256),
+        property::CRTC_GAMMA_LUT_SIZE => Some(u64::from(resources.gamma_lut_size)),
+        property::CRTC_DEGAMMA_LUT_SIZE => Some(u64::from(resources.degamma_lut_size)),
         _ => value(state, property),
     }
 }
@@ -231,11 +231,19 @@ fn propose_with_mode(
             }
             property::CRTC_GAMMA_LUT => {
                 next.gamma_lut_blob = c.value as u32;
-                validate_gamma_lut_blob(&device, next.gamma_lut_blob)?;
+                validate_gamma_lut_blob(
+                    &device,
+                    next.gamma_lut_blob,
+                    device.resources.gamma_lut_size,
+                )?;
             }
             property::CRTC_DEGAMMA_LUT => {
                 next.degamma_lut_blob = c.value as u32;
-                validate_gamma_lut_blob(&device, next.degamma_lut_blob)?;
+                validate_gamma_lut_blob(
+                    &device,
+                    next.degamma_lut_blob,
+                    device.resources.degamma_lut_size,
+                )?;
             }
             property::CRTC_CTM => {
                 next.ctm_blob = c.value as u32;
@@ -496,13 +504,16 @@ fn matches_object(r: &super::kms::KmsResources, object: u32, prop: u32) -> bool 
     }
 }
 
-fn validate_gamma_lut_blob(device: &super::device::DeviceState, blob: u32) -> DrmResult<()> {
+fn validate_gamma_lut_blob(
+    device: &super::device::DeviceState,
+    blob: u32,
+    entries: u32,
+) -> DrmResult<()> {
     if blob == 0 {
         return Ok(());
     }
     let blob = device.property_blobs.get(&blob).ok_or(DrmError::NotFound)?;
-    let entries = device.gamma_lut.len() / 3;
-    if blob.destroyed || blob.bytes.len() != entries * 8 {
+    if blob.destroyed || blob.bytes.len() != entries as usize * 8 {
         return Err(DrmError::Invalid);
     }
     if blob
