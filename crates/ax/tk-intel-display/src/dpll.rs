@@ -104,6 +104,21 @@ pub fn hsw_crtc_compute_clock(
     Ok(())
 }
 
+/// The HSW-family DPLL reservation dispatch, including the pre-display-11 DSI
+/// exception. On display 12/13 the `reserve` callback resolves to the shared
+/// ICL manager through the clock hook selected above.
+// upstream: intel_dpll.c hsw_crtc_get_dpll()
+pub fn hsw_crtc_get_dpll(
+    display_version: u8,
+    output_dsi: bool,
+    reserve: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if display_version < 11 && output_dsi {
+        return Ok(());
+    }
+    reserve()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +175,28 @@ mod tests {
         })
         .unwrap();
         assert_eq!(old_dsi_calls, 0);
+    }
+
+    #[test]
+    fn hsw_get_dpll_preserves_only_the_pre_display11_dsi_skip() {
+        let mut calls = 0;
+        hsw_crtc_get_dpll(10, true, || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 0);
+        hsw_crtc_get_dpll(12, true, || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        hsw_crtc_get_dpll(10, false, || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
     }
 
     #[test]
