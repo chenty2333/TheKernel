@@ -42,6 +42,26 @@ const PHY_STATUS: u8 = 0x01;
 const PHY_AUTO_NEG_LIMIT: usize = 45;
 const MII_SR_LINK_STATUS: u16 = 0x0004;
 const MII_SR_AUTONEG_COMPLETE: u16 = 0x0020;
+const M88E1000_PHY_SPEC_STATUS: u8 = 0x11;
+const M88E1000_PSSR_REV_POLARITY: u16 = 0x0002;
+const M88E1000_PSSR_DOWNSHIFT: u16 = 0x0020;
+const M88E1000_PSSR_CABLE_LENGTH: u16 = 0x0380;
+const M88E1000_PSSR_CABLE_LENGTH_SHIFT: u32 = 7;
+const IGP01E1000_PHY_LINK_HEALTH: u8 = 0x13;
+const IGP01E1000_PLHR_SS_DOWNGRADE: u16 = 0x8000;
+const CABLE_LENGTH_UNDEFINED: u16 = 0xff;
+const IGP01E1000_PHY_PORT_STATUS: u32 = 0x11;
+const IGP01E1000_PHY_PCS_INIT_REG: u32 = 0x00b4;
+const IGP01E1000_PSSR_SPEED_MASK: u16 = 0xc000;
+const IGP01E1000_PSSR_SPEED_1000MBPS: u16 = 0xc000;
+const IGP01E1000_PHY_POLARITY_MASK: u16 = 0x0078;
+const IGP01E1000_PSSR_POLARITY_REVERSED: u16 = 0x0002;
+const IFE_PHY_EXTENDED_STATUS_CONTROL: u8 = 0x10;
+const IFE_PHY_SPECIAL_CONTROL: u8 = 0x11;
+const IFE_PESC_POLARITY_REVERSED: u16 = 0x0100;
+const IFE_PSC_FORCE_POLARITY: u16 = 0x0020;
+const I82577_PHY_STATUS_2: u8 = 26;
+const I82577_PHY_STATUS2_REV_POLARITY: u16 = 0x0400;
 const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
 const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
@@ -397,6 +417,7 @@ pub fn phy_init_script_igp3<I: E1000PhyMdicOps>(io: &mut I) -> DevResult {
 pub enum E1000PhyType {
     Unknown,
     M88,
+    Igp,
     Igp2,
     Gg82563,
     Igp3,
@@ -408,6 +429,135 @@ pub enum E1000PhyType {
     I217,
     I82580,
     I210,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CablePolarity {
+    Normal,
+    Reversed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PhyDiagnostics {
+    pub cable_polarity: Option<CablePolarity>,
+    pub speed_downgraded: bool,
+    pub min_cable_length: u16,
+    pub max_cable_length: u16,
+    pub cable_length: u16,
+}
+
+/// upstream: e1000_phy.c e1000_check_downshift_generic()
+pub fn check_downshift_generic<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    phy_type: E1000PhyType,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult {
+    let (register, mask) = match phy_type {
+        E1000PhyType::I210
+        | E1000PhyType::M88
+        | E1000PhyType::Gg82563
+        | E1000PhyType::Bm
+        | E1000PhyType::I82578 => (u32::from(M88E1000_PHY_SPEC_STATUS), M88E1000_PSSR_DOWNSHIFT),
+        E1000PhyType::Igp | E1000PhyType::Igp2 | E1000PhyType::Igp3 => (
+            u32::from(IGP01E1000_PHY_LINK_HEALTH),
+            IGP01E1000_PLHR_SS_DOWNGRADE,
+        ),
+        _ => {
+            diagnostics.speed_downgraded = false;
+            return Ok(());
+        }
+    };
+    diagnostics.speed_downgraded = io.read_phy_register(register as u8)? & mask != 0;
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_check_polarity_m88()
+pub fn check_polarity_m88<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult {
+    let data = io.read_phy_register(M88E1000_PHY_SPEC_STATUS)?;
+    diagnostics.cable_polarity = Some(if data & M88E1000_PSSR_REV_POLARITY != 0 {
+        CablePolarity::Reversed
+    } else {
+        CablePolarity::Normal
+    });
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_check_polarity_igp()
+pub fn check_polarity_igp<F>(mut read_phy: F, diagnostics: &mut PhyDiagnostics) -> DevResult
+where
+    F: FnMut(u32) -> DevResult<u16>,
+{
+    let status = read_phy(IGP01E1000_PHY_PORT_STATUS)?;
+    let (register, mask) = if status & IGP01E1000_PSSR_SPEED_MASK == IGP01E1000_PSSR_SPEED_1000MBPS
+    {
+        (IGP01E1000_PHY_PCS_INIT_REG, IGP01E1000_PHY_POLARITY_MASK)
+    } else {
+        (
+            IGP01E1000_PHY_PORT_STATUS,
+            IGP01E1000_PSSR_POLARITY_REVERSED,
+        )
+    };
+    diagnostics.cable_polarity = Some(if read_phy(register)? & mask != 0 {
+        CablePolarity::Reversed
+    } else {
+        CablePolarity::Normal
+    });
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_check_polarity_ife()
+pub fn check_polarity_ife<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    polarity_correction: bool,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult {
+    let (register, mask) = if polarity_correction {
+        (IFE_PHY_EXTENDED_STATUS_CONTROL, IFE_PESC_POLARITY_REVERSED)
+    } else {
+        (IFE_PHY_SPECIAL_CONTROL, IFE_PSC_FORCE_POLARITY)
+    };
+    diagnostics.cable_polarity = Some(if io.read_phy_register(register)? & mask != 0 {
+        CablePolarity::Reversed
+    } else {
+        CablePolarity::Normal
+    });
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_check_polarity_82577()
+pub fn check_polarity_82577<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult {
+    diagnostics.cable_polarity = Some(
+        if io.read_phy_register(I82577_PHY_STATUS_2)? & I82577_PHY_STATUS2_REV_POLARITY != 0 {
+            CablePolarity::Reversed
+        } else {
+            CablePolarity::Normal
+        },
+    );
+    Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_get_cable_length_m88()
+pub fn get_cable_length_m88<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    diagnostics: &mut PhyDiagnostics,
+) -> DevResult {
+    const TABLE: [u16; 7] = [0, 50, 80, 110, 140, 140, CABLE_LENGTH_UNDEFINED];
+    let status = io.read_phy_register(M88E1000_PHY_SPEC_STATUS)?;
+    let index =
+        ((status & M88E1000_PSSR_CABLE_LENGTH) >> M88E1000_PSSR_CABLE_LENGTH_SHIFT) as usize;
+    if index >= TABLE.len() - 1 {
+        return Err(DevError::Io);
+    }
+    diagnostics.min_cable_length = TABLE[index];
+    diagnostics.max_cable_length = TABLE[index + 1];
+    diagnostics.cable_length = (diagnostics.min_cable_length + diagnostics.max_cable_length) / 2;
+    Ok(())
 }
 
 /// upstream: e1000_phy.c e1000_get_phy_type_from_id()
@@ -858,7 +1008,7 @@ mod tests {
     struct Io {
         registers: [(u32, u32); 2],
         writes: alloc::vec::Vec<(u32, u32)>,
-        phy: [u16; 16],
+        phy: [u16; 32],
         phy_writes: alloc::vec::Vec<(u8, u16)>,
         delay: usize,
         mdic_data: u16,
@@ -1200,5 +1350,54 @@ mod tests {
         let mut delay = Io::default();
         get_cfg_done_generic(&mut delay).unwrap();
         assert_eq!(delay.delay, 10_000);
+    }
+
+    #[test]
+    fn generic_cable_polarity_downshift_and_length_decode() {
+        let mut io = Io::default();
+        io.phy[M88E1000_PHY_SPEC_STATUS as usize] = M88E1000_PSSR_REV_POLARITY
+            | M88E1000_PSSR_DOWNSHIFT
+            | (3 << M88E1000_PSSR_CABLE_LENGTH_SHIFT);
+        let mut diagnostics = PhyDiagnostics::default();
+        check_polarity_m88(&mut io, &mut diagnostics).unwrap();
+        assert_eq!(diagnostics.cable_polarity, Some(CablePolarity::Reversed));
+        check_downshift_generic(&mut io, E1000PhyType::M88, &mut diagnostics).unwrap();
+        assert!(diagnostics.speed_downgraded);
+        get_cable_length_m88(&mut io, &mut diagnostics).unwrap();
+        assert_eq!(
+            (
+                diagnostics.min_cable_length,
+                diagnostics.max_cable_length,
+                diagnostics.cable_length
+            ),
+            (110, 140, 125)
+        );
+        check_downshift_generic(&mut io, E1000PhyType::Unknown, &mut diagnostics).unwrap();
+        assert!(!diagnostics.speed_downgraded);
+
+        io.phy[IGP01E1000_PHY_LINK_HEALTH as usize] = IGP01E1000_PLHR_SS_DOWNGRADE;
+        check_downshift_generic(&mut io, E1000PhyType::Igp2, &mut diagnostics).unwrap();
+        assert!(diagnostics.speed_downgraded);
+
+        let mut diagnostics = PhyDiagnostics::default();
+        check_polarity_igp(
+            |register| {
+                Ok(if register == IGP01E1000_PHY_PORT_STATUS {
+                    IGP01E1000_PSSR_SPEED_1000MBPS
+                } else {
+                    IGP01E1000_PHY_POLARITY_MASK
+                })
+            },
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(diagnostics.cable_polarity, Some(CablePolarity::Reversed));
+        let mut io = Io::default();
+        io.phy[IFE_PHY_EXTENDED_STATUS_CONTROL as usize] = IFE_PESC_POLARITY_REVERSED;
+        check_polarity_ife(&mut io, true, &mut diagnostics).unwrap();
+        assert_eq!(diagnostics.cable_polarity, Some(CablePolarity::Reversed));
+        io.phy[I82577_PHY_STATUS_2 as usize] = I82577_PHY_STATUS2_REV_POLARITY;
+        check_polarity_82577(&mut io, &mut diagnostics).unwrap();
+        assert_eq!(diagnostics.cable_polarity, Some(CablePolarity::Reversed));
     }
 }
