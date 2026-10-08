@@ -839,4 +839,34 @@ mod tests {
             &[0x0e, 0xfc, 5, 1, 2, 3, 4, 0x55]
         );
     }
+
+    #[test]
+    fn intel_ecdsa_css_header_is_transferred_at_rsa_offset() {
+        let mut firmware = std::vec![0u8; 964];
+        firmware[644] = 0x06;
+        firmware[652..656].copy_from_slice(&0x0002_0000u32.to_le_bytes());
+        let transport = FirmwareFake {
+            events: VecDeque::from([std::vec![0xff, 1, 6]]),
+            bulk: Vec::new(),
+        };
+        let mut adapter = Adapter::new(transport, 0);
+        adapter.set_up(true).unwrap();
+        assert_eq!(adapter.intel_init_firmware(&firmware, 0x17, 1), Ok(0));
+        assert_eq!(adapter.transport.bulk.len(), 3);
+        assert_eq!(&adapter.transport.bulk[0][..4], &[0x09, 0xfc, 129, 0]);
+    }
+
+    #[test]
+    fn intel_boot_params_decode_packed_revision_and_limits() {
+        let mut bytes = [0u8; 23];
+        bytes[4..6].copy_from_slice(&0x1234u16.to_le_bytes());
+        bytes[21] = 7;
+        let params = BootParams::parse(&bytes).unwrap();
+        assert_eq!(params.dev_revid, 0x1234);
+        assert_eq!(params.limited_cce, 7);
+        assert_eq!(
+            BootParams::parse(&bytes[..22]),
+            Err(FirmwareError::InvalidVersionEvent)
+        );
+    }
 }
