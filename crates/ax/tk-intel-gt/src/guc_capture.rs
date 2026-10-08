@@ -125,6 +125,64 @@ pub struct CaptureRegister {
     pub mask: u32,
 }
 
+const GEN12_GLOBAL_REGS: [u32; 9] = [
+    0xa188, // FORCEWAKE_MT
+    0x40a0, // ERROR_GEN6
+    0x40b0, // DONE_REG
+    0x4024, // HSW_GTT_CACHE_EN
+    0xceb8, // GEN12_FAULT_TLB_DATA0
+    0xcebc, // GEN12_FAULT_TLB_DATA1
+    0x43f4, // GEN12_AUX_ERR_DBG
+    0xcf68, // GEN12_GAM_DONE
+    0xcec4, // GEN12_RING_FAULT_REG
+];
+const GEN12_ENGINE_INSTANCE_REGS: [u32; 33] = [
+    0x50, 0xb8, 0x78, 0x60, 0xb0, 0x64, 0x68, 0x70, 0x140, 0x168, 0x110, 0x180, 0x74, 0x5c, 0xc0,
+    0x6c, 0x94, 0x38, 0x34, 0x30, 0x3c, 0x9c, 0x244, 0x80, 0x29c, 0x270, 0x274, 0x278, 0x27c,
+    0x280, 0x284, 0x288, 0x28c,
+];
+const GEN12_RENDER_CLASS_REGS: [u32; 3] = [0x7100, 0x7104, 0x7108];
+const GEN12_VIDEO_ENHANCE_CLASS_REGS: [u32; 4] = [0x1cc000, 0x1cd000, 0x1ce000, 0x1cf000];
+
+/// Return the static Xe_LP/Gen12 register list selected by the source table.
+/// Engine-instance entries are relative to the engine MMIO base.
+/// upstream: intel_guc_capture.c xe_lp_lists and xe_lp_*_regs.
+pub fn gen12_static_registers(
+    owner: u32,
+    list_type: u32,
+    guc_class: u32,
+    engine_base: u32,
+) -> Option<Vec<CaptureRegister>> {
+    if owner != 0 {
+        return None;
+    }
+    let offsets: &[u32] = match list_type {
+        0 => &GEN12_GLOBAL_REGS,
+        1 if guc_class == 0 => &GEN12_RENDER_CLASS_REGS,
+        1 if guc_class == 2 => &GEN12_VIDEO_ENHANCE_CLASS_REGS,
+        1 if matches!(guc_class, 1 | 3 | 4) => &[],
+        2 if guc_class <= 4 => &GEN12_ENGINE_INSTANCE_REGS,
+        2 => return None,
+        _ => return None,
+    };
+    let mut registers = Vec::new();
+    registers.try_reserve_exact(offsets.len()).ok()?;
+    for offset in offsets {
+        let offset = if list_type == 2 {
+            engine_base.checked_add(*offset)?
+        } else {
+            *offset
+        };
+        registers.push(CaptureRegister {
+            offset,
+            value: 0,
+            flags: 0,
+            mask: 0,
+        });
+    }
+    Some(registers)
+}
+
 #[derive(Clone, Copy)]
 pub struct CaptureRegisterList<'a> {
     pub owner: u32,
@@ -727,6 +785,22 @@ mod tests {
             regs[3].flags,
             (3 << CAPTURE_STEERING_GROUP_SHIFT) | (4 << CAPTURE_STEERING_INSTANCE_SHIFT)
         );
+    }
+
+    #[test]
+    fn gen12_static_capture_lists_match_xe_lp_class_tables() {
+        let global = gen12_static_registers(0, 0, 4, 0).unwrap();
+        assert_eq!(global.len(), 9);
+        assert_eq!(global[0].offset, 0xa188);
+        assert_eq!(global[4].offset, 0xceb8);
+        assert_eq!(gen12_static_registers(0, 1, 0, 0).unwrap().len(), 3);
+        assert_eq!(gen12_static_registers(0, 1, 2, 0).unwrap().len(), 4);
+        assert!(gen12_static_registers(0, 1, 1, 0).unwrap().is_empty());
+        let instance = gen12_static_registers(0, 2, 3, 0x2000).unwrap();
+        assert_eq!(instance.len(), 33);
+        assert_eq!(instance[0].offset, 0x2050);
+        assert_eq!(instance[32].offset, 0x228c);
+        assert!(gen12_static_registers(1, 0, 0, 0).is_none());
     }
 
     #[test]
