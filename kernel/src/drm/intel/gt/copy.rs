@@ -2105,13 +2105,15 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
     io.write(base + 0x3a0, 0xffff0000 | (11 << 8) | 11)?;
     io.read(base + 0x3a0)?;
     fence(Ordering::SeqCst);
-    // Gen12 ELSQ writes port1 then port0, low then high, then explicit load.
+    // Submit the complete Gen12 port vector (including a zeroed unused port)
+    // before loading the ELSQ, as `execlists_submit_ports()` requires.
     let second = memory.switch.as_ref().map_or(0, |s| s.descriptor);
-    io.write(base + 0x518, second as u32)?;
-    io.write(base + 0x51c, (second >> 32) as u32)?;
-    io.write(base + 0x510, memory.descriptor as u32)?;
-    io.write(base + 0x514, (memory.descriptor >> 32) as u32)?;
-    io.write(base + 0x550, 1)?;
+    intel_gt::execlists::execlists_submit_ports(
+        io,
+        base + 0x510,
+        base + 0x550,
+        [memory.descriptor, second],
+    )?;
     let start = io.now_us();
     let mut value = [0u8; 4];
     for _ in 0..100_000 {

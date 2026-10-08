@@ -16,6 +16,7 @@ pub mod guc_ct;
 pub mod guc_fw;
 pub mod guc_log;
 pub mod guc_submission;
+pub mod execlists;
 pub mod huc;
 pub mod info;
 pub mod intel_ring;
