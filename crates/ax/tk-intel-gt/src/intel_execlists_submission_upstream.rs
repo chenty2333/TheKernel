@@ -113,8 +113,7 @@ use core::{
 // submission ordering.
 use crate::linux_list::*;
 use crate::{
-    intel_context_upstream::*,
-    intel_engine_cs_upstream::*,
+    for_each_signaler, for_each_waiter, intel_context_upstream::*, intel_engine_cs_upstream::*,
     linux_config::*,
 };
 
@@ -312,7 +311,7 @@ unsafe fn assert_priority_queue(prev: *const I915Request, next: *const I915Reque
 
 // upstream: intel_execlists_submission.c __unwind_incomplete_requests()
 unsafe fn __unwind_incomplete_requests(engine: *mut IntelEngineCs) -> *mut I915Request {
-    let mut rq: *mut I915Request;
+    let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut rn: *mut I915Request;
     let mut active: *mut I915Request = core::ptr::null_mut();
     let mut pl: *mut ListHead;
@@ -320,31 +319,38 @@ unsafe fn __unwind_incomplete_requests(engine: *mut IntelEngineCs) -> *mut I915R
 
     lockdep_assert_held!(&(*(*engine).sched_engine).lock);
 
-    list_for_each_entry_safe_reverse!(rq, rn, &(*(*engine).sched_engine).requests, sched.link, {
-        if __i915_request_is_complete(rq) {
-            list_del_init(&mut (*rq).sched.link);
-            continue;
+    list_for_each_entry_safe_reverse!(
+        rq,
+        rn,
+        I915Request,
+        &(*(*engine).sched_engine).requests,
+        sched.link,
+        {
+            if __i915_request_is_complete(rq) {
+                list_del_init(&mut (*rq).sched.link);
+                continue;
+            }
+
+            __i915_request_unsubmit(rq);
+
+            GEM_BUG_ON!(rq_prio(rq) == I915_PRIORITY_INVALID);
+            if rq_prio(rq) != prio {
+                prio = rq_prio(rq);
+                pl = i915_sched_lookup_priolist((*engine).sched_engine, prio);
+            }
+            GEM_BUG_ON!(i915_sched_engine_is_empty((*engine).sched_engine));
+
+            list_move(&mut (*rq).sched.link, pl);
+            set_bit(I915_FENCE_FLAG_PQUEUE, &mut (*rq).fence.flags);
+
+            // Check in case rollback wraps farther than [size / 2].
+            if intel_ring_direction((*rq).ring, (*rq).tail, (*(*rq).ring).tail + 8) > 0 {
+                (*(*rq).context).lrc.desc |= CTX_DESC_FORCE_RESTORE;
+            }
+
+            active = rq;
         }
-
-        __i915_request_unsubmit(rq);
-
-        GEM_BUG_ON!(rq_prio(rq) == I915_PRIORITY_INVALID);
-        if rq_prio(rq) != prio {
-            prio = rq_prio(rq);
-            pl = i915_sched_lookup_priolist((*engine).sched_engine, prio);
-        }
-        GEM_BUG_ON!(i915_sched_engine_is_empty((*engine).sched_engine));
-
-        list_move(&mut (*rq).sched.link, pl);
-        set_bit(I915_FENCE_FLAG_PQUEUE, &mut (*rq).fence.flags);
-
-        // Check in case rollback wraps farther than [size / 2].
-        if intel_ring_direction((*rq).ring, (*rq).tail, (*(*rq).ring).tail + 8) > 0 {
-            (*(*rq).context).lrc.desc |= CTX_DESC_FORCE_RESTORE;
-        }
-
-        active = rq;
-    });
+    );
 
     active
 }
@@ -1468,7 +1474,7 @@ unsafe fn cancel_port_requests(
         (*execlists).inflight.len() as i32,
     );
 
-    smp_wmb(); /* Complete the seqlock for execlists_active(). */
+    smp_wmb!(); /* Complete the seqlock for execlists_active(). */
     WRITE_ONCE!((*execlists).active, (*execlists).inflight.as_mut_ptr());
 
     // With all outstanding process_csb() cancelled, stop their timers.
@@ -1651,7 +1657,7 @@ unsafe fn process_csb(
 
             // Point active at the new ELSP before overwriting it.
             WRITE_ONCE!(execlists.active, execlists.pending.as_mut_ptr());
-            smp_wmb(); /* Notify execlists_active(). */
+            smp_wmb!(); /* Notify execlists_active(). */
 
             // Cancel old inflight and prepare for the context switch.
             trace_ports(execlists, c"preempted".as_ptr(), old);
@@ -1668,7 +1674,7 @@ unsafe fn process_csb(
                 execlists.pending.as_mut_ptr(),
                 execlists_num_ports(execlists) as i32,
             );
-            smp_wmb(); /* Complete the seqlock. */
+            smp_wmb!(); /* Complete the seqlock. */
             WRITE_ONCE!(execlists.active, execlists.inflight.as_mut_ptr());
 
             // XXX Magic delay for tgl.
@@ -1941,7 +1947,7 @@ struct ExeclistsCapture {
 }
 
 // upstream: intel_execlists_submission.c execlists_capture_work()
-unsafe fn execlists_capture_work(work: *mut WorkStruct) {
+unsafe extern "C" fn execlists_capture_work(work: *mut WorkStruct) {
     let cap = container_of!(work, ExeclistsCapture, work);
     let gfp = __GFP_KSWAPD_RECLAIM | __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
     let engine = (*cap).rq.as_ref().unwrap_unchecked().engine;
@@ -2091,7 +2097,7 @@ unsafe fn execlists_capture(engine: *mut IntelEngineCs) {
         return;
     }
 
-    INIT_WORK(&mut (*cap).work, execlists_capture_work);
+    INIT_WORK_C(&mut (*cap).work, execlists_capture_work);
     queue_work((*i915).unordered_wq, &mut (*cap).work);
 }
 
@@ -2233,13 +2239,13 @@ unsafe fn __execlists_kick(execlists: *mut IntelEngineExeclists) {
 }
 
 // upstream: intel_execlists_submission.c execlists_timeslice()
-unsafe fn execlists_timeslice(timer: *mut TimerList) {
+unsafe extern "C" fn execlists_timeslice(timer: *mut TimerList) {
     let el = container_of!(timer, IntelEngineExeclists, timer);
     __execlists_kick(el);
 }
 
 // upstream: intel_execlists_submission.c execlists_preempt()
-unsafe fn execlists_preempt(timer: *mut TimerList) {
+unsafe extern "C" fn execlists_preempt(timer: *mut TimerList) {
     let el = container_of!(timer, IntelEngineExeclists, preempt);
     __execlists_kick(el);
 }
@@ -2406,7 +2412,7 @@ static execlists_context_ops: IntelContextOps = IntelContextOps {
     reset: lrc_reset,
     destroy: lrc_destroy,
     create_parallel: execlists_create_parallel,
-    create_virtual: execlists_create_virtual,
+    create_virtual: Some(execlists_create_virtual),
 };
 
 // upstream: intel_execlists_submission.c emit_pdps()
@@ -2605,12 +2611,12 @@ unsafe fn enable_execlists(engine: *mut IntelEngineCs) {
     intel_engine_set_hwsp_writemask(engine, !0u32); /* HWSTAM. */
 
     if GRAPHICS_VER((*engine).i915) >= 11 {
-        mode = REG_MASKED_FIELD_ENABLE(GEN11_GFX_DISABLE_LEGACY_MODE);
+        mode = REG_MASKED_FIELD_ENABLE!(GEN11_GFX_DISABLE_LEGACY_MODE);
     } else {
-        mode = REG_MASKED_FIELD_ENABLE(GFX_RUN_LIST_ENABLE);
+        mode = REG_MASKED_FIELD_ENABLE!(GFX_RUN_LIST_ENABLE);
     }
     ENGINE_WRITE_FW!(engine, RING_MODE_GEN7, mode);
-    ENGINE_WRITE_FW!(engine, RING_MI_MODE, REG_MASKED_FIELD_DISABLE(STOP_RING));
+    ENGINE_WRITE_FW!(engine, RING_MI_MODE, REG_MASKED_FIELD_DISABLE!(STOP_RING));
     ENGINE_WRITE_FW!(
         engine,
         RING_HWS_PGA,
@@ -2783,7 +2789,7 @@ unsafe fn execlists_reset_cancel(engine: *mut IntelEngineCs) {
 
     // Mark executing requests skipped.
     list_for_each_entry!(rq, &mut (*sched_engine).requests, sched.link, {
-        i915_request_put(i915_request_mark_eio(rq));
+        i915_request_put(i915_request_mark_eio(unsafe { &mut *rq }));
     });
     intel_engine_signal_breadcrumbs(engine);
 
@@ -2795,7 +2801,7 @@ unsafe fn execlists_reset_cancel(engine: *mut IntelEngineCs) {
         }
         let p = to_priolist(rb);
         priolist_for_each_request_consume!(rq, rn, p, {
-            if i915_request_mark_eio(rq) {
+            if i915_request_mark_eio(unsafe { &mut *rq }) {
                 __i915_request_submit(rq);
                 i915_request_put(rq);
             }
@@ -2806,7 +2812,7 @@ unsafe fn execlists_reset_cancel(engine: *mut IntelEngineCs) {
 
     // Held requests flush to timeline on release.
     list_for_each_entry!(rq, &mut (*sched_engine).hold, sched.link, {
-        i915_request_put(i915_request_mark_eio(rq));
+        i915_request_put(i915_request_mark_eio(unsafe { &mut *rq }));
     });
 
     // Cancel virtual engines attached to this physical engine.
@@ -2822,7 +2828,7 @@ unsafe fn execlists_reset_cancel(engine: *mut IntelEngineCs) {
         spin_lock(&mut (*(*ve).base.sched_engine).lock);
         rq = fetch_and_zero(&mut (*ve).request);
         if !rq.is_null() {
-            if i915_request_mark_eio(rq) {
+            if i915_request_mark_eio(unsafe { &mut *rq }) {
                 (*rq).engine = engine;
                 __i915_request_submit(rq);
                 i915_request_put(rq);
@@ -3261,7 +3267,7 @@ unsafe fn rcu_virtual_context_destroy(wrk: *mut WorkStruct) {
 
 // upstream: intel_execlists_submission.c virtual_context_destroy()
 unsafe fn virtual_context_destroy(kref: *mut Kref) {
-    let ve = container_of!(kref, VirtualEngine, context.ref_);
+    let ve = container_of!(kref, VirtualEngine, context.r#ref);
 
     GEM_BUG_ON!(!list_empty(&(*ve).context.signals));
 
@@ -3351,7 +3357,7 @@ static virtual_context_ops: IntelContextOps = IntelContextOps {
     enter: virtual_context_enter,
     exit: virtual_context_exit,
     destroy: virtual_context_destroy,
-    get_sibling: virtual_get_sibling,
+    get_sibling: Some(virtual_get_sibling),
 };
 
 // upstream: intel_execlists_submission.c virtual_submission_mask()
@@ -3531,9 +3537,9 @@ unsafe fn execlists_create_virtual(
     (*ve).base.id = -1;
 
     (*ve).base.class = OTHER_CLASS;
-    (*ve).base.uabi_class = I915_ENGINE_CLASS_INVALID;
-    (*ve).base.instance = I915_ENGINE_CLASS_INVALID_VIRTUAL;
-    (*ve).base.uabi_instance = I915_ENGINE_CLASS_INVALID_VIRTUAL;
+    (*ve).base.uabi_class = I915_ENGINE_CLASS_INVALID as u16;
+    (*ve).base.instance = I915_ENGINE_CLASS_INVALID_VIRTUAL as u8;
+    (*ve).base.uabi_instance = I915_ENGINE_CLASS_INVALID_VIRTUAL as u16;
 
     // Semaphore submission policy depends on global engine saturation. Since
     // virtual engines span physical engines, precomputing one engine's state
@@ -3658,7 +3664,7 @@ unsafe fn intel_execlists_show_requests(
 ) {
     let execlists = &(*engine).execlists;
     let sched_engine = (*engine).sched_engine;
-    let mut rq: *mut I915Request;
+    let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut last: *mut I915Request;
     let mut flags: c_ulong = 0;
     let mut count: u32;

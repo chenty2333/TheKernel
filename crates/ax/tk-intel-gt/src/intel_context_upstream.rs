@@ -10,6 +10,7 @@
 use core::{
     ffi::{c_ulong, c_void},
     mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
 };
 
 use crate::{
@@ -48,10 +49,42 @@ pub struct RcuHead {
     pub func: Option<unsafe extern "C" fn(*mut RcuHead)>,
 }
 
-#[repr(C, align(8))]
-pub struct DmaFence {
-    _opaque: [u8; 64],
+#[repr(C)]
+pub union DmaFenceLock {
+    pub extern_lock: *mut Spinlock,
+    pub inline_lock: Spinlock,
 }
+
+#[repr(C)]
+pub union DmaFenceTimestamp {
+    pub cb_list: ListHead,
+    pub timestamp: i64,
+    pub rcu: RcuHead,
+}
+
+#[repr(C)]
+pub struct DmaFence {
+    pub lock: DmaFenceLock,
+    pub ops: *const c_void,
+    pub timestamp_union: DmaFenceTimestamp,
+    pub context: u64,
+    pub seqno: u64,
+    pub flags: c_ulong,
+    pub refcount: Kref,
+    pub error: i32,
+}
+
+impl core::ops::Deref for DmaFence {
+    type Target = DmaFenceTimestamp;
+
+    fn deref(&self) -> &Self::Target {
+        &self.timestamp_union
+    }
+}
+
+const _: [(); 64] = [(); core::mem::size_of::<DmaFence>()];
+const _: [(); 48] = [(); core::mem::offset_of!(DmaFence, flags)];
+const _: [(); 56] = [(); core::mem::offset_of!(DmaFence, refcount)];
 
 #[repr(C)]
 pub struct DmaFenceCb {
@@ -165,12 +198,27 @@ pub union I915RequestSubmitUnion {
 
 #[repr(C, align(8))]
 pub struct IrqWork {
-    _opaque: [u8; 32],
+    pub node: IrqWorkNode,
+    pub func: Option<unsafe extern "C" fn(*mut IrqWork)>,
+    pub irqwait: *mut c_void,
+}
+
+#[repr(C)]
+pub struct IrqWorkNode {
+    pub next: *mut IrqWorkNode,
+    pub flags: AtomicT,
+    pub src: u16,
+    pub dst: u16,
 }
 
 #[repr(C, align(8))]
 pub struct I915SchedNode {
-    _opaque: [u8; 64],
+    pub signalers_list: ListHead,
+    pub waiters_list: ListHead,
+    pub link: ListHead,
+    pub attr: I915SchedAttr,
+    pub flags: u32,
+    pub semaphores: u32,
 }
 
 #[repr(C, align(8))]
@@ -185,7 +233,10 @@ pub struct Hrtimer {
 
 #[repr(C, align(8))]
 pub struct WaitQueueEntry {
-    _opaque: [u8; 40],
+    pub flags: u32,
+    pub private: *mut c_void,
+    pub func: Option<unsafe extern "C" fn(*mut WaitQueueEntry, u32, i32, *mut c_void) -> i32>,
+    pub entry: ListHead,
 }
 
 #[repr(C)]
@@ -220,7 +271,7 @@ pub struct TaskletStruct {
 
 #[repr(C)]
 pub struct I915SchedEngine {
-    pub ref_: Kref,
+    pub r#ref: Kref,
     pub lock: Spinlock,
     pub requests: ListHead,
     pub hold: ListHead,
@@ -497,10 +548,17 @@ const _: [(); 320] = [(); core::mem::offset_of!(IntelTimeline, engine_link)];
 const _: [(); 336] = [(); core::mem::offset_of!(IntelTimeline, kref)];
 const _: [(); 344] = [(); core::mem::offset_of!(IntelTimeline, rcu)];
 const _: [(); 48] = [(); core::mem::size_of::<I915Priolist>()];
+const _: [(); 64] = [(); core::mem::size_of::<I915SchedNode>()];
+const _: [(); 32] = [(); core::mem::offset_of!(I915SchedNode, link)];
+const _: [(); 48] = [(); core::mem::offset_of!(I915SchedNode, attr)];
 const _: [(); 0] = [(); core::mem::offset_of!(I915Priolist, requests)];
 const _: [(); 16] = [(); core::mem::offset_of!(I915Priolist, node)];
 const _: [(); 40] = [(); core::mem::offset_of!(I915Priolist, priority)];
 const _: [(); 40] = [(); core::mem::size_of::<TaskletStruct>()];
+const _: [(); 40] = [(); core::mem::size_of::<WaitQueueEntry>()];
+const _: [(); 24] = [(); core::mem::offset_of!(WaitQueueEntry, entry)];
+const _: [(); 32] = [(); core::mem::size_of::<IrqWork>()];
+const _: [(); 16] = [(); core::mem::offset_of!(IrqWork, func)];
 const _: [(); 8] = [(); core::mem::align_of::<TaskletStruct>()];
 const _: [(); 16] = [(); core::mem::offset_of!(TaskletStruct, count)];
 const _: [(); 20] = [(); core::mem::offset_of!(TaskletStruct, use_callback)];
@@ -570,6 +628,27 @@ pub union IntelContextLrc {
     pub regs: IntelContextLrcRegs,
 }
 
+// C exposes the 32-bit LRC address/context-id pair through an anonymous
+// struct member of the same union. These integer-only views are valid for all
+// bit patterns and retain the source union's 8-byte size/alignment.
+impl Deref for IntelContextLrc {
+    type Target = IntelContextLrcRegs;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: every u32 bit pattern is valid and both views overlay the
+        // same two dwords in the upstream C union.
+        unsafe { &self.regs }
+    }
+}
+
+impl DerefMut for IntelContextLrc {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: same integer-only union view as Deref above; caller owns
+        // the mutable context record.
+        unsafe { &mut self.regs }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IntelContextLrcRegs {
@@ -592,7 +671,7 @@ pub struct IntelContextGucState {
 #[repr(C)]
 pub struct IntelContextGucId {
     pub id: u16,
-    pub ref_: AtomicT,
+    pub r#ref: AtomicT,
     pub link: ListHead,
 }
 
@@ -626,7 +705,7 @@ pub struct IntelContextParallel {
 
 #[repr(C)]
 pub struct IntelContext {
-    pub ref_: IntelContextRef,
+    pub r#ref: IntelContextRef,
     pub engine: *mut IntelEngineCs,
     pub inflight: *mut IntelEngineCs,
     pub vm: *mut I915AddressSpace,
@@ -719,7 +798,7 @@ unsafe fn intel_context_alloc() -> *mut IntelContext {
 
 // upstream: intel_context.c rcu_context_free()
 unsafe extern "C" fn rcu_context_free(rcu: *mut RcuHead) {
-    let ce = container_of!(rcu, IntelContext, ref_);
+    let ce = container_of!(rcu, IntelContext, r#ref);
 
     trace_intel_context_free(ce);
     if intel_context_has_own_state(ce) {
@@ -731,7 +810,7 @@ unsafe extern "C" fn rcu_context_free(rcu: *mut RcuHead) {
 // upstream: intel_context.c intel_context_free()
 pub unsafe fn intel_context_free(ce: *mut IntelContext) {
     call_rcu(
-        (&mut (*ce).ref_.rcu as *mut ManuallyDrop<RcuHead>).cast::<RcuHead>(),
+        (&mut (*ce).r#ref.rcu as *mut ManuallyDrop<RcuHead>).cast::<RcuHead>(),
         rcu_context_free,
     );
 }
@@ -770,7 +849,7 @@ pub unsafe fn intel_context_alloc_state(ce: *mut IntelContext) -> i32 {
             set_bit(CONTEXT_ALLOC_BIT, &mut (*ce).flags);
 
             rcu_read_lock();
-            ctx = rcu_dereference((*ce).gem_context);
+            ctx = rcu_dereference!((*ce).gem_context);
             if !ctx.is_null() && !kref_get_unless_zero(&mut (*ctx).refcount) {
                 ctx = core::ptr::null_mut();
             }
@@ -1085,7 +1164,7 @@ pub unsafe fn intel_context_init(ce: *mut IntelContext, engine: *mut IntelEngine
     GEM_BUG_ON!((*engine).cops.is_null());
     GEM_BUG_ON!((*(*engine).gt).vm.is_null());
 
-    kref_init((&mut (*ce).ref_.refcount as *mut ManuallyDrop<Kref>).cast::<Kref>());
+    kref_init((&mut (*ce).r#ref.refcount as *mut ManuallyDrop<Kref>).cast::<Kref>());
 
     (*ce).engine = engine;
     (*ce).ops = (*engine).cops.cast::<IntelContextOps>();
@@ -1251,7 +1330,7 @@ pub unsafe fn intel_context_create_request(ce: *mut IntelContext) -> *mut I915Re
 // upstream: intel_context.c intel_context_get_active_request()
 pub unsafe fn intel_context_get_active_request(ce: *mut IntelContext) -> *mut I915Request {
     let parent = intel_context_to_parent(ce);
-    let mut rq: *mut I915Request;
+    let mut rq: *mut I915Request = core::ptr::null_mut();
     let mut active: *mut I915Request = core::ptr::null_mut();
     let mut flags = 0;
 

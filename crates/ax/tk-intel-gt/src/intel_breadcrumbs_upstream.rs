@@ -10,7 +10,7 @@
 use core::ffi::c_ulong;
 
 use crate::{
-    intel_context_upstream::*, intel_engine_cs_upstream::*, linux_list::*,
+    intel_context_upstream::*, intel_engine_cs_upstream::*, linux_config::*, linux_list::*,
 };
 
 // Bindings supplied by the later integration layer: IntelBreadcrumbs,
@@ -318,7 +318,7 @@ unsafe fn intel_breadcrumbs_create(irq_engine: *mut IntelEngineCs) -> *mut Intel
 }
 
 // upstream: intel_breadcrumbs.c intel_breadcrumbs_reset()
-unsafe fn intel_breadcrumbs_reset(b: *mut IntelBreadcrumbs) {
+pub unsafe fn intel_breadcrumbs_reset(b: *mut IntelBreadcrumbs) {
     let mut flags: c_ulong = 0;
 
     if (*b).irq_engine.is_null() {
@@ -515,8 +515,8 @@ unsafe fn intel_context_remove_breadcrumbs(ce: *mut IntelContext, b: *mut IntelB
 
 // upstream: intel_breadcrumbs.c print_signals()
 unsafe fn print_signals(b: *mut IntelBreadcrumbs, p: *mut DrmPrinter) {
-    let mut ce: *mut IntelContext;
-    let mut rq: *mut I915Request;
+    let mut ce: *mut IntelContext = core::ptr::null_mut();
+    let mut rq: *mut I915Request = core::ptr::null_mut();
 
     drm_printf!(p, "Signals:\n");
 

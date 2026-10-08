@@ -107,7 +107,6 @@ macro_rules! opaque_c_layout {
 
 opaque_c_layout!(IntelUc, 2976, 8);
 opaque_c_layout!(IntelGsc, 48, 8);
-opaque_c_layout!(IntelReset, 88, 8);
 opaque_c_layout!(IntelRc6, 104, 8);
 opaque_c_layout!(IntelRps, 280, 8);
 opaque_c_layout!(IntelGtBufferPool, 160, 8);
@@ -116,6 +115,16 @@ opaque_c_layout!(Kobject, 64, 8);
 opaque_c_layout!(I915PerfGt, 40, 8);
 opaque_c_layout!(Mutex, 24, 8);
 opaque_c_layout!(IntelWopcm, 12, 4);
+
+/// `intel_reset.flags` is the first field in the 7.2.3 C layout; the
+/// configuration-dependent mutex/waitqueue/SRCU tail remains opaque.
+#[repr(C)]
+pub struct IntelReset {
+    pub flags: c_ulong,
+    _opaque_tail: [u8; 80],
+}
+const _: [(); 88] = [(); size_of::<IntelReset>()];
+const _: [(); 0] = [(); offset_of!(IntelReset, flags)];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -153,8 +162,8 @@ pub struct HlistHead {
 #[derive(Clone, Copy)]
 pub struct RbNode {
     pub parent_color: usize,
-    pub left: *mut RbNode,
     pub right: *mut RbNode,
+    pub left: *mut RbNode,
 }
 
 #[repr(C)]
@@ -388,16 +397,16 @@ pub struct IntelEnginePmu {
 pub struct IntelEngineExeclists {
     pub timer: TimerList,
     pub preempt: TimerList,
-    pub preempt_target: *const c_void,
+    pub preempt_target: *const I915Request,
     pub ccid: u32,
     pub yield_ccid: u32,
     pub error_interrupt: u32,
     pub reset_ccid: u32,
     pub submit_reg: *mut u32,
     pub ctrl_reg: *mut u32,
-    pub active: *const *mut c_void,
-    pub inflight: [*mut c_void; 3],
-    pub pending: [*mut c_void; 3],
+    pub active: *const *mut I915Request,
+    pub inflight: [*mut I915Request; 3],
+    pub pending: [*mut I915Request; 3],
     pub port_mask: u32,
     pub r#virtual: RbRootCached,
     pub csb_write: *mut u32,
@@ -418,7 +427,7 @@ pub struct IntelWakeref {
     pub count: AtomicT,
     pub mutex: Mutex,
     pub wakeref: *mut c_void,
-    pub i915: *mut c_void,
+    pub i915: *mut DrmI915Private,
     pub ops: *const IntelWakerefOps,
     pub work: DelayedWork,
 }
@@ -460,7 +469,7 @@ pub union IntelEngineUabi {
 
 #[repr(C)]
 pub struct IntelEngineCs {
-    pub i915: *mut c_void,
+    pub i915: *mut DrmI915Private,
     pub gt: *mut IntelGt,
     pub uncore: *mut IntelUncore,
     pub name: [c_char; 8],
@@ -627,7 +636,7 @@ pub struct IntelGtSteering {
 
 #[repr(C)]
 pub struct IntelGt {
-    pub i915: *mut c_void,
+    pub i915: *mut DrmI915Private,
     pub name: *const c_char,
     pub type_: i32,
     pub uncore: *mut IntelUncore,
@@ -1157,7 +1166,7 @@ unsafe fn __engine_mmio_base(i915: *mut DrmI915Private, bases: *const EngineMmio
 // upstream: intel_engine_cs.c __sprint_engine_name()
 unsafe fn __sprint_engine_name(engine: *mut IntelEngineCs) {
     GEM_WARN_ON!(
-        snprintf(
+        snprintf!(
             (*engine).name.as_mut_ptr(),
             size_of_val(&(*engine).name),
             "%s'%u",
@@ -1635,8 +1644,6 @@ unsafe fn populate_logical_ids(
     map: *const u8,
     num_instances: u8,
 ) {
-    let mut i;
-    let mut j;
     let mut current_logical_id = 0u8;
 
     for j in 0..num_instances {
@@ -1956,7 +1963,7 @@ unsafe fn intel_engine_init_tlb_invalidation(engine: *mut IntelEngineCs) -> i32 
             || (*engine).class == COMPUTE_CLASS
             || (*engine).class == OTHER_CLASS)
     {
-        (*engine).tlb_inv.request = REG_MASKED_FIELD_ENABLE(val);
+        (*engine).tlb_inv.request = REG_MASKED_FIELD_ENABLE!(val);
     } else {
         (*engine).tlb_inv.request = val;
     }
@@ -2312,13 +2319,13 @@ unsafe fn __intel_engine_stop_cs(
     let mode = RING_MI_MODE((*engine).mmio_base);
     let mut err: i32;
 
-    intel_uncore_write_fw(uncore, mode, REG_MASKED_FIELD_ENABLE(STOP_RING));
+    intel_uncore_write_fw(uncore, mode, REG_MASKED_FIELD_ENABLE!(STOP_RING));
 
     if intel_engine_reset_needs_wa_22011802037((*engine).gt) {
         intel_uncore_write_fw(
             uncore,
             RING_MODE_GEN7((*engine).mmio_base),
-            REG_MASKED_FIELD_ENABLE(GEN12_GFX_PREFETCH_DISABLE),
+            REG_MASKED_FIELD_ENABLE!(GEN12_GFX_PREFETCH_DISABLE),
         );
     }
 
@@ -2366,7 +2373,7 @@ pub unsafe fn intel_engine_stop_cs(engine: *mut IntelEngineCs) -> i32 {
 // upstream: intel_engine_cs.c intel_engine_cancel_stop_cs()
 pub unsafe fn intel_engine_cancel_stop_cs(engine: *mut IntelEngineCs) {
     ENGINE_TRACE!(engine, "\n");
-    ENGINE_WRITE_FW!(engine, RING_MI_MODE, REG_MASKED_FIELD_DISABLE(STOP_RING));
+    ENGINE_WRITE_FW!(engine, RING_MI_MODE, REG_MASKED_FIELD_DISABLE!(STOP_RING));
 }
 
 // upstream: intel_engine_cs.c __cs_pending_mi_force_wakes()
@@ -2637,7 +2644,7 @@ unsafe fn get_timeline(rq: *mut I915Request) -> *mut IntelTimeline {
     let mut tl: *mut IntelTimeline;
 
     rcu_read_lock();
-    tl = rcu_dereference((*rq).timeline);
+    tl = rcu_dereference!((*rq).timeline);
     if !kref_get_unless_zero(&mut (*tl).kref) {
         tl = core::ptr::null_mut();
     }
@@ -2653,7 +2660,7 @@ unsafe fn print_ring(buf: *mut c_char, sz: i32, rq: *mut I915Request) -> i32 {
     if !i915_request_signaled(rq) {
         let tl = get_timeline(rq);
 
-        len = scnprintf(
+        len = scnprintf!(
             buf,
             sz as usize,
             "ring:{start:%08x, hwsp:%08x, seqno:%08x, runtime:%llums}, ",
@@ -2893,7 +2900,7 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
             let mut hdr = [0 as c_char; 160];
             let mut len: i32;
 
-            len = scnprintf(
+            len = scnprintf!(
                 hdr.as_mut_ptr(),
                 size_of_val(&hdr),
                 "\t\tActive[%d]:  ccid:%08x%s%s, ",
@@ -2915,7 +2922,7 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
                 (size_of_val(&hdr) as i32) - len,
                 rq,
             );
-            scnprintf(
+            scnprintf!(
                 hdr.as_mut_ptr().add(len as usize),
                 (size_of_val(&hdr) as i32) - len,
                 "rq: ",
@@ -2932,7 +2939,7 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
             let mut hdr = [0 as c_char; 160];
             let mut len: i32;
 
-            len = scnprintf(
+            len = scnprintf!(
                 hdr.as_mut_ptr(),
                 size_of_val(&hdr),
                 "\t\tPending[%d]: ccid:%08x%s%s, ",
@@ -2954,7 +2961,7 @@ unsafe fn intel_engine_print_registers(engine: *mut IntelEngineCs, m: *mut DrmPr
                 (size_of_val(&hdr) as i32) - len,
                 rq,
             );
-            scnprintf(
+            scnprintf!(
                 hdr.as_mut_ptr().add(len as usize),
                 (size_of_val(&hdr) as i32) - len,
                 "rq: ",
@@ -3359,6 +3366,6 @@ pub unsafe fn xehp_enable_ccs_engines(engine: *mut IntelEngineCs) {
     intel_uncore_write(
         (*engine).uncore,
         GEN12_RCU_MODE,
-        REG_MASKED_FIELD_ENABLE(GEN12_RCU_MODE_CCS_ENABLE),
+        REG_MASKED_FIELD_ENABLE!(GEN12_RCU_MODE_CCS_ENABLE),
     );
 }

@@ -10,12 +10,11 @@ use core::{ffi::c_void, mem::size_of};
 
 use crate::{
     intel_context_upstream::*,
-    intel_engine_cs_upstream::*,
+    intel_engine_cs_upstream::{I915WaContextBatch as I915WaCtxBb, *},
     intel_ring::{CACHELINE_BYTES, PAGE_SIZE},
     linux_config::*,
     linux_list::*,
 };
-use crate::intel_engine_cs_upstream::I915WaContextBatch as I915WaCtxBb;
 
 // upstream: intel_lrc.c set_offsets()
 unsafe fn set_offsets(
@@ -1007,17 +1006,17 @@ unsafe fn init_common_regs(
     engine: *const IntelEngineCs,
     inhibit: bool,
 ) {
-    let mut ctl = REG_MASKED_FIELD_ENABLE(CTX_CTRL_INHIBIT_SYN_CTX_SWITCH);
-    ctl |= REG_MASKED_FIELD_DISABLE(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT);
+    let mut ctl = REG_MASKED_FIELD_ENABLE!(CTX_CTRL_INHIBIT_SYN_CTX_SWITCH);
+    ctl |= REG_MASKED_FIELD_DISABLE!(CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT);
     if inhibit {
         ctl |= CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT;
     }
     if graphics_ver((*engine).i915) < 11 {
-        ctl |= REG_MASKED_FIELD_DISABLE(CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT | CTX_CTRL_RS_CTX_ENABLE);
+        ctl |= REG_MASKED_FIELD_DISABLE!(CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT | CTX_CTRL_RS_CTX_ENABLE);
     }
     // Wa_14019159160 - Case 2.
     if ctx_needs_runalone(ce) {
-        ctl |= REG_MASKED_FIELD_ENABLE(GEN12_CTX_CTRL_RUNALONE_MODE);
+        ctl |= REG_MASKED_FIELD_ENABLE!(GEN12_CTX_CTRL_RUNALONE_MODE);
     }
     *regs.add(CTX_CONTEXT_CONTROL) = ctl;
 
@@ -1099,12 +1098,16 @@ unsafe fn __lrc_init_regs(
 }
 
 // upstream: intel_lrc.c lrc_init_regs()
-unsafe fn lrc_init_regs(ce: *const IntelContext, engine: *const IntelEngineCs, inhibit: bool) {
+pub(crate) unsafe fn lrc_init_regs(
+    ce: *const IntelContext,
+    engine: *const IntelEngineCs,
+    inhibit: bool,
+) {
     __lrc_init_regs((*ce).lrc_reg_state, ce, engine, inhibit);
 }
 
 // upstream: intel_lrc.c lrc_reset_regs()
-unsafe fn lrc_reset_regs(ce: *const IntelContext, engine: *const IntelEngineCs) {
+pub(crate) unsafe fn lrc_reset_regs(ce: *const IntelContext, engine: *const IntelEngineCs) {
     __reset_stop_ring((*ce).lrc_reg_state, engine);
 }
 
@@ -1130,7 +1133,7 @@ unsafe fn check_redzone(mut vaddr: *const c_void, engine: *const IntelEngineCs) 
         .add((*engine).context_size as usize)
         .cast::<c_void>();
     if !memchr_inv(vaddr, CONTEXT_REDZONE as i32, I915_GTT_PAGE_SIZE).is_null() {
-        drm_err_once(
+        drm_err_once!(
             &(*(*engine).i915).drm,
             "%s context redzone overwritten!\n",
             (*engine).name,
@@ -1154,7 +1157,11 @@ unsafe fn context_wabb(ce: *const IntelContext, per_ctx: bool) -> *mut u32 {
 }
 
 // upstream: intel_lrc.c lrc_init_state()
-unsafe fn lrc_init_state(ce: *mut IntelContext, engine: *mut IntelEngineCs, state: *mut c_void) {
+pub(crate) unsafe fn lrc_init_state(
+    ce: *mut IntelContext,
+    engine: *mut IntelEngineCs,
+    state: *mut c_void,
+) {
     let mut inhibit = true;
     set_redzone(state, engine);
 
@@ -1270,7 +1277,7 @@ unsafe fn pinned_timeline(ce: *mut IntelContext, engine: *mut IntelEngineCs) -> 
 }
 
 // upstream: intel_lrc.c lrc_alloc()
-unsafe fn lrc_alloc(ce: *mut IntelContext, engine: *mut IntelEngineCs) -> i32 {
+pub(crate) unsafe fn lrc_alloc(ce: *mut IntelContext, engine: *mut IntelEngineCs) -> i32 {
     GEM_BUG_ON!(!(*ce).state.is_null());
     if !intel_context_has_own_state(ce) {
         (*ce).default_state = (*engine).default_state;
@@ -1312,7 +1319,7 @@ unsafe fn lrc_alloc(ce: *mut IntelContext, engine: *mut IntelEngineCs) -> i32 {
 }
 
 // upstream: intel_lrc.c lrc_reset()
-unsafe fn lrc_reset(ce: *mut IntelContext) {
+pub(crate) unsafe fn lrc_reset(ce: *mut IntelContext) {
     GEM_BUG_ON!(!intel_context_is_pinned(ce));
     intel_ring_reset((*ce).ring, (*(*ce).ring).emit);
     // Scrub away the garbage.
@@ -1321,7 +1328,7 @@ unsafe fn lrc_reset(ce: *mut IntelContext) {
 }
 
 // upstream: intel_lrc.c lrc_pre_pin()
-unsafe fn lrc_pre_pin(
+pub(crate) unsafe fn lrc_pre_pin(
     ce: *mut IntelContext,
     _engine: *mut IntelEngineCs,
     _ww: *mut I915GemWwCtx,
@@ -1338,7 +1345,11 @@ unsafe fn lrc_pre_pin(
 }
 
 // upstream: intel_lrc.c lrc_pin()
-unsafe fn lrc_pin(ce: *mut IntelContext, engine: *mut IntelEngineCs, vaddr: *mut c_void) -> i32 {
+pub(crate) unsafe fn lrc_pin(
+    ce: *mut IntelContext,
+    engine: *mut IntelEngineCs,
+    vaddr: *mut c_void,
+) -> i32 {
     (*ce).lrc_reg_state = vaddr.cast::<u8>().add(LRC_STATE_OFFSET).cast::<u32>();
     if !__test_and_set_bit(CONTEXT_INIT_BIT, &mut (*ce).flags) {
         lrc_init_state(ce, engine, vaddr);
@@ -1348,7 +1359,7 @@ unsafe fn lrc_pin(ce: *mut IntelContext, engine: *mut IntelEngineCs, vaddr: *mut
 }
 
 // upstream: intel_lrc.c lrc_unpin()
-unsafe fn lrc_unpin(ce: *mut IntelContext) {
+pub(crate) unsafe fn lrc_unpin(ce: *mut IntelContext) {
     if unlikely(!(*ce).parallel.last_rq.is_null()) {
         i915_request_put((*ce).parallel.last_rq);
         (*ce).parallel.last_rq = core::ptr::null_mut();
@@ -1364,12 +1375,12 @@ unsafe fn lrc_unpin(ce: *mut IntelContext) {
 }
 
 // upstream: intel_lrc.c lrc_post_unpin()
-unsafe fn lrc_post_unpin(ce: *mut IntelContext) {
+pub(crate) unsafe fn lrc_post_unpin(ce: *mut IntelContext) {
     i915_gem_object_unpin_map((*(*ce).state).obj);
 }
 
 // upstream: intel_lrc.c lrc_fini()
-unsafe fn lrc_fini(ce: *mut IntelContext) {
+pub(crate) unsafe fn lrc_fini(ce: *mut IntelContext) {
     if (*ce).state.is_null() {
         return;
     }
@@ -1395,7 +1406,7 @@ unsafe fn gen12_emit_timestamp_wa(ce: *const IntelContext, mut cs: *mut u32) -> 
     cs = cs.add(1);
     *cs = i915_ggtt_offset((*ce).state)
         + LRC_STATE_OFFSET as u32
-        + CTX_TIMESTAMP * size_of::<u32>() as u32;
+        + CTX_TIMESTAMP as u32 * size_of::<u32>() as u32;
     cs = cs.add(1);
     *cs = 0;
     cs = cs.add(1);
@@ -1469,7 +1480,7 @@ unsafe fn gen12_invalidate_state_cache(mut cs: *mut u32) -> *mut u32 {
     cs = cs.add(1);
     *cs = i915_mmio_reg_offset(GEN12_CS_DEBUG_MODE2);
     cs = cs.add(1);
-    *cs = REG_MASKED_FIELD_ENABLE(INSTRUCTION_STATE_CACHE_INVALIDATE);
+    *cs = REG_MASKED_FIELD_ENABLE!(INSTRUCTION_STATE_CACHE_INVALIDATE);
     cs = cs.add(1);
     cs
 }
@@ -1614,7 +1625,11 @@ unsafe fn lrc_descriptor(ce: *const IntelContext) -> u32 {
 }
 
 // upstream: intel_lrc.c lrc_update_regs()
-unsafe fn lrc_update_regs(ce: *const IntelContext, engine: *const IntelEngineCs, head: u32) -> u32 {
+pub(crate) unsafe fn lrc_update_regs(
+    ce: *const IntelContext,
+    engine: *const IntelEngineCs,
+    head: u32,
+) -> u32 {
     let ring = (*ce).ring;
     let regs = (*ce).lrc_reg_state;
     GEM_BUG_ON!(!intel_ring_offset_valid(ring, head));
@@ -1646,12 +1661,16 @@ unsafe fn lrc_update_regs(ce: *const IntelContext, engine: *const IntelEngineCs,
 }
 
 // upstream: intel_lrc.c lrc_update_offsets()
-unsafe fn lrc_update_offsets(ce: *mut IntelContext, engine: *const IntelEngineCs) {
+pub(crate) unsafe fn lrc_update_offsets(ce: *mut IntelContext, engine: *const IntelEngineCs) {
     set_offsets((*ce).lrc_reg_state, reg_offsets(engine), engine, false);
 }
 
 // upstream: intel_lrc.c lrc_check_regs()
-unsafe fn lrc_check_regs(ce: *const IntelContext, engine: *const IntelEngineCs, when: *const i8) {
+pub(crate) unsafe fn lrc_check_regs(
+    ce: *const IntelContext,
+    engine: *const IntelEngineCs,
+    when: *const i8,
+) {
     let ring = (*ce).ring;
     let regs = (*ce).lrc_reg_state;
     let mut valid = true;
@@ -1795,17 +1814,17 @@ unsafe fn gen9_init_indirectctx_bb(engine: *mut IntelEngineCs, mut batch: *mut u
         // WaDisableGatherAtSetShaderCommonSlice:skl,bxt,kbl,glk.
         Lri {
             reg: COMMON_SLICE_CHICKEN2,
-            value: REG_MASKED_FIELD_DISABLE(GEN9_DISABLE_GATHER_AT_SET_SHADER_COMMON_SLICE),
+            value: REG_MASKED_FIELD_DISABLE!(GEN9_DISABLE_GATHER_AT_SET_SHADER_COMMON_SLICE),
         },
         // BSpec: 11391.
         Lri {
             reg: FF_SLICE_CHICKEN,
-            value: REG_MASKED_FIELD_ENABLE(FF_SLICE_CHICKEN_CL_PROVOKING_VERTEX_FIX),
+            value: REG_MASKED_FIELD_ENABLE!(FF_SLICE_CHICKEN_CL_PROVOKING_VERTEX_FIX),
         },
         // BSpec: 11299.
         Lri {
             reg: _3D_CHICKEN3,
-            value: REG_MASKED_FIELD_ENABLE(_3D_CHICKEN_SF_PROVOKING_VERTEX_FIX),
+            value: REG_MASKED_FIELD_ENABLE!(_3D_CHICKEN_SF_PROVOKING_VERTEX_FIX),
         },
     ];
 
@@ -1868,14 +1887,14 @@ unsafe fn lrc_create_wa_ctx(engine: *mut IntelEngineCs) -> i32 {
 }
 
 // upstream: intel_lrc.c lrc_fini_wa_ctx()
-unsafe fn lrc_fini_wa_ctx(engine: *mut IntelEngineCs) {
+pub(crate) unsafe fn lrc_fini_wa_ctx(engine: *mut IntelEngineCs) {
     i915_vma_unpin_and_release(&mut (*engine).wa_ctx.vma, 0);
 }
 
 type WaBbFunc = unsafe fn(*mut IntelEngineCs, *mut u32) -> *mut u32;
 
 // upstream: intel_lrc.c lrc_init_wa_ctx()
-unsafe fn lrc_init_wa_ctx(engine: *mut IntelEngineCs) {
+pub(crate) unsafe fn lrc_init_wa_ctx(engine: *mut IntelEngineCs) {
     let wa_ctx = &mut (*engine).wa_ctx;
     let wa_bb = [
         &mut wa_ctx.indirect_ctx as *mut I915WaCtxBb,
@@ -1987,7 +2006,7 @@ unsafe fn lrc_get_runtime(ce: *const IntelContext) -> u32 {
 }
 
 // upstream: intel_lrc.c lrc_update_runtime()
-unsafe fn lrc_update_runtime(ce: *mut IntelContext) {
+pub(crate) unsafe fn lrc_update_runtime(ce: *mut IntelContext) {
     let stats = &mut (*ce).stats;
     let old = stats.runtime.last;
     stats.runtime.last = lrc_get_runtime(ce);

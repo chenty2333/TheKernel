@@ -12,8 +12,8 @@ use core::{
 };
 
 use crate::{
-    intel_context_upstream::*, intel_engine_cs_upstream::*, intel_ring::PAGE_SIZE,
-    linux_config::*, linux_list::*,
+    intel_context_upstream::*, intel_engine_cs_upstream::*, intel_ring::PAGE_SIZE, linux_config::*,
+    linux_list::*,
 };
 
 // Bindings supplied by the later integration layer: IntelTimeline/IntelGt and

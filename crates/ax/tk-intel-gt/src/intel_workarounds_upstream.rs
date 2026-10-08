@@ -163,7 +163,7 @@ unsafe fn wa_init_finish(wal: *mut I915WaList) {
     if (*wal).count == 0 {
         return;
     }
-    gt_dbg(
+    gt_dbg!(
         (*wal).gt,
         "Initialized {} {} workarounds on {}\n",
         (*wal).wa_count,
@@ -303,19 +303,19 @@ unsafe fn wa_mcr_write_clr(wal: *mut I915WaList, reg: I915McrReg, clr: u32) {
 }
 // upstream: intel_workarounds.c wa_masked_en()
 unsafe fn wa_masked_en(wal: *mut I915WaList, reg: I915Reg, val: u32) {
-    wa_add(wal, reg, 0, REG_MASKED_FIELD_ENABLE(val), val, true);
+    wa_add(wal, reg, 0, REG_MASKED_FIELD_ENABLE!(val), val, true);
 }
 // upstream: intel_workarounds.c wa_mcr_masked_en()
 unsafe fn wa_mcr_masked_en(wal: *mut I915WaList, reg: I915McrReg, val: u32) {
-    wa_mcr_add(wal, reg, 0, REG_MASKED_FIELD_ENABLE(val), val, true);
+    wa_mcr_add(wal, reg, 0, REG_MASKED_FIELD_ENABLE!(val), val, true);
 }
 // upstream: intel_workarounds.c wa_masked_dis()
 unsafe fn wa_masked_dis(wal: *mut I915WaList, reg: I915Reg, val: u32) {
-    wa_add(wal, reg, 0, REG_MASKED_FIELD_DISABLE(val), val, true);
+    wa_add(wal, reg, 0, REG_MASKED_FIELD_DISABLE!(val), val, true);
 }
 // upstream: intel_workarounds.c wa_mcr_masked_dis()
 unsafe fn wa_mcr_masked_dis(wal: *mut I915WaList, reg: I915McrReg, val: u32) {
-    wa_mcr_add(wal, reg, 0, REG_MASKED_FIELD_DISABLE(val), val, true);
+    wa_mcr_add(wal, reg, 0, REG_MASKED_FIELD_DISABLE!(val), val, true);
 }
 // upstream: intel_workarounds.c wa_masked_field_set()
 unsafe fn wa_masked_field_set(wal: *mut I915WaList, reg: I915Reg, mask: u32, val: u32) {
@@ -517,7 +517,7 @@ unsafe fn icl_ctx_workarounds_init(engine: *mut IntelEngineCs, wal: *mut I915WaL
         wal,
         GEN10_CACHE_MODE_SS,
         0,
-        REG_MASKED_FIELD_ENABLE(FLOAT_BLEND_OPTIMIZATION_ENABLE),
+        REG_MASKED_FIELD_ENABLE!(FLOAT_BLEND_OPTIMIZATION_ENABLE),
         0,
         true,
     );
@@ -819,7 +819,7 @@ unsafe fn hsw_gt_workarounds_init(_gt: *mut IntelGt, wal: *mut I915WaList) {
         wal,
         HSW_ROW_CHICKEN3,
         0,
-        REG_MASKED_FIELD_ENABLE(HSW_ROW_CHICKEN3_L3_GLOBAL_ATOMICS_DISABLE),
+        REG_MASKED_FIELD_ENABLE!(HSW_ROW_CHICKEN3_L3_GLOBAL_ATOMICS_DISABLE),
         0,
         true,
     );
@@ -836,7 +836,7 @@ unsafe fn gen9_wa_init_mcr(i915: *mut DrmI915Private, wal: *mut I915WaList) {
     let subslice = ffs(subslices) - 1;
     let mcr = GEN8_MCR_SLICE(slice) | GEN8_MCR_SUBSLICE(subslice);
     let mcr_mask = GEN8_MCR_SLICE_MASK | GEN8_MCR_SUBSLICE_MASK;
-    drm_dbg(
+    drm_dbg!(
         i915,
         "MCR slice:{}/subslice:{} = {:x}\n",
         slice,
@@ -1171,7 +1171,7 @@ unsafe fn wa_verify(
     from: *const i8,
 ) -> bool {
     if ((cur ^ (*wa).set) & (*wa).read) != 0 {
-        gt_err(
+        gt_err!(
             gt,
             "{} workaround lost on {}! (reg[{:x}]=0x{:x}, relevant bits were 0x{:x} vs expected \
              0x{:x})\n",
@@ -1533,7 +1533,7 @@ unsafe fn rcs_engine_wa_init(engine: *mut IntelEngineCs, wal: *mut I915WaList) {
             wal,
             XEHP_HDC_CHICKEN0,
             0,
-            REG_MASKED_FIELD_ENABLE(DIS_ATOMIC_CHAINING_TYPED_WRITES),
+            REG_MASKED_FIELD_ENABLE!(DIS_ATOMIC_CHAINING_TYPED_WRITES),
             0,
             true,
         );
@@ -1724,7 +1724,7 @@ unsafe fn rcs_engine_wa_init(engine: *mut IntelEngineCs, wal: *mut I915WaList) {
             wal,
             RING_MI_MODE(RENDER_RING_BASE),
             0,
-            REG_MASKED_FIELD_ENABLE(VS_TIMER_DISPATCH),
+            REG_MASKED_FIELD_ENABLE!(VS_TIMER_DISPATCH),
             if IS_I965G(i915) { 0 } else { VS_TIMER_DISPATCH },
             true,
         );
@@ -1734,7 +1734,7 @@ unsafe fn rcs_engine_wa_init(engine: *mut IntelEngineCs, wal: *mut I915WaList) {
             wal,
             ECOSKPD(RENDER_RING_BASE),
             0,
-            REG_MASKED_FIELD_ENABLE(ECO_CONSTANT_BUFFER_SR_DISABLE),
+            REG_MASKED_FIELD_ENABLE!(ECO_CONSTANT_BUFFER_SR_DISABLE),
             0,
             true,
         );
@@ -1843,7 +1843,7 @@ unsafe fn general_render_compute_wa_init(engine: *mut IntelEngineCs, wal: *mut I
             wal,
             GEN10_CACHE_MODE_SS,
             0,
-            REG_MASKED_FIELD_ENABLE(ENABLE_PREFETCH_INTO_IC),
+            REG_MASKED_FIELD_ENABLE!(ENABLE_PREFETCH_INTO_IC),
             0,
             true,
         );

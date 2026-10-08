@@ -871,7 +871,10 @@ pub const fn null_capture_header() -> [u8; 4 * 4] {
 /// CT payload acknowledging the capture region flush.
 /// upstream: intel_guc_capture.c __guc_capture_flushlog_complete().
 pub const fn capture_flush_complete_action() -> [u32; 2] {
-    [ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE, GUC_CAPTURE_LOG_BUFFER]
+    [
+        ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE,
+        GUC_CAPTURE_LOG_BUFFER,
+    ]
 }
 
 /// Compute the worst-case minimum output size, counting the global list for
