@@ -24,6 +24,50 @@ const GUC_LOG_CAPTURE_ALLOC_UNITS: u32 = 1 << 2;
 pub const GUC_LOG_LEVEL_DISABLED: u8 = 0;
 pub const GUC_LOG_LEVEL_NON_VERBOSE: u8 = 1;
 pub const GUC_LOG_LEVEL_MAX: u8 = 5;
+pub const ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE: u32 = 0x30;
+pub const ACTION_UK_LOG_ENABLE_LOGGING: u32 = 0x40;
+pub const ACTION_FORCE_LOG_BUFFER_FLUSH: u32 = 0x302;
+pub const GUC_DEBUG_LOG_BUFFER: u32 = 0;
+pub const GUC_LOG_CONTROL_LOGGING_ENABLED: u32 = 1;
+pub const GUC_LOG_CONTROL_VERBOSITY_SHIFT: u32 = 4;
+pub const GUC_LOG_CONTROL_DEFAULT_LOGGING: u32 = 1 << 8;
+pub const GUC_LOG_VERBOSITY_MAX: u8 = 3;
+
+/// Build the enable-logging action payload for a GuC log level.
+/// upstream: intel_guc_log.c guc_action_control_log()/intel_guc_log_set_level().
+pub fn control_log_action(level: u32) -> Result<[u32; 2], Error> {
+    if level > u32::from(GUC_LOG_LEVEL_MAX) {
+        return Err(Error::Refused);
+    }
+    let verbosity = if level > u32::from(GUC_LOG_LEVEL_NON_VERBOSE) {
+        level - 2
+    } else {
+        0
+    };
+    if verbosity > u32::from(GUC_LOG_VERBOSITY_MAX) {
+        return Err(Error::Refused);
+    }
+    let mut control = verbosity << GUC_LOG_CONTROL_VERBOSITY_SHIFT;
+    if level > u32::from(GUC_LOG_LEVEL_NON_VERBOSE) {
+        control |= GUC_LOG_CONTROL_LOGGING_ENABLED;
+    }
+    if level > u32::from(GUC_LOG_LEVEL_DISABLED) {
+        control |= GUC_LOG_CONTROL_DEFAULT_LOGGING;
+    }
+    Ok([ACTION_UK_LOG_ENABLE_LOGGING, control])
+}
+
+/// CT action sent after the host has consumed a flush-to-file notification.
+/// upstream: intel_guc_log.c guc_action_flush_log_complete().
+pub const fn flush_log_complete_action() -> [u32; 2] {
+    [ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE, GUC_DEBUG_LOG_BUFFER]
+}
+
+/// CT action requesting GuC to flush its current debug log buffer.
+/// upstream: intel_guc_log.c guc_action_flush_log().
+pub const fn force_log_flush_action() -> [u32; 2] {
+    [ACTION_FORCE_LOG_BUFFER_FLUSH, 0]
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SectionSize {
@@ -390,6 +434,37 @@ mod tests {
             },
             buffer_bytes: PAGE_SIZE + 16 + 8 + 4,
         }
+    }
+
+    #[test]
+    fn log_control_payload_and_flush_actions_match_guc_abi() {
+        assert_eq!(control_log_action(0), Ok([ACTION_UK_LOG_ENABLE_LOGGING, 0]));
+        assert_eq!(
+            control_log_action(1),
+            Ok([
+                ACTION_UK_LOG_ENABLE_LOGGING,
+                GUC_LOG_CONTROL_DEFAULT_LOGGING
+            ])
+        );
+        assert_eq!(
+            control_log_action(2),
+            Ok([
+                ACTION_UK_LOG_ENABLE_LOGGING,
+                GUC_LOG_CONTROL_LOGGING_ENABLED | GUC_LOG_CONTROL_DEFAULT_LOGGING
+            ])
+        );
+        assert_eq!(
+            control_log_action(5),
+            Ok([
+                ACTION_UK_LOG_ENABLE_LOGGING,
+                GUC_LOG_CONTROL_LOGGING_ENABLED
+                    | GUC_LOG_CONTROL_DEFAULT_LOGGING
+                    | (3 << GUC_LOG_CONTROL_VERBOSITY_SHIFT)
+            ])
+        );
+        assert_eq!(control_log_action(6), Err(Error::Refused));
+        assert_eq!(flush_log_complete_action(), [0x30, 0]);
+        assert_eq!(force_log_flush_action(), [0x302, 0]);
     }
 
     #[test]

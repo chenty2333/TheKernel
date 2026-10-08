@@ -26,6 +26,8 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 `guc_capture.rs` 是 `intel_guc_capture.c` 的数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，快照 log state 并按 overflow/invalid offset 选择全环重读，保留原始 metadata/order、跳过未知 capture type，依赖引擎 reset group 将 lists 切分为节点并克隆 shared global/class data，按 GuC ID、context ID 和页对齐 LRCA 匹配/移除节点并提取 IPEHR/INSTDONE，含 Xe_LP 静态寄存器 offset/name 表、按拓扑展开 steered registers、选择 base/ext register lists，构造 page-aligned ADS list、3x overbuffer size assessment 和可独立调用的 coredump text formatter。ADS owner wire-up、真正 preallocated capture-node cache、formatter 与 coredump 的对接及 CT event caller 尚未实现。
 
+`guc_log.rs` 已有 log sizing、overflow/read-pointer/relay snapshot 之外，补齐 control-log、force-flush 与 flush-complete 的 GuC action payload；log DMA/relay 工作线程以及 CT action callers 仍未接入。
+
 ## 移植边界
 
 不翻译 Linux DRM 框架、debugfs/sysfs 管理面、非 Gen12 平台路径及任务未列出的显示功能。GSC、LMEM-only/独显路径以及需要尚不存在的内核内存/用户页能力部分，先核对 Gen12 ADL 集显调用路径；不能安全映射的功能记录为未移植，不以占位成功掩盖。上游代码按函数保留控制流和错误顺序，翻译文件顶部登记来源/完整版权行，每个翻译函数用 `// upstream: <文件> <函数>()` 标注；MIT 全文及来源登记遵守 `COMMON.md`。
