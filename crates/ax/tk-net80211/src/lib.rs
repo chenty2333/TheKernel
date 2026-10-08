@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod channel;
 mod frame;
+mod input;
 mod node;
 mod node_caps;
 mod node_rates;
@@ -27,6 +28,10 @@ pub use channel::{
     select_mode,
 };
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
+pub use input::{
+    HeaderError, has_address4, has_ht_control, has_qos_control, has_sequence_control,
+    header_length, qos_control,
+};
 pub use node::{
     AKM_8021X, AKM_PSK, AKM_SHA256_8021X, AKM_SHA256_PSK, ASSOCFAIL_BASIC_RATE, ASSOCFAIL_BSSID,
     ASSOCFAIL_CHAN, ASSOCFAIL_CSA, ASSOCFAIL_ESSID, ASSOCFAIL_IBSS, ASSOCFAIL_PRIVACY,

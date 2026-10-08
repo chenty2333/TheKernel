@@ -69,3 +69,6 @@ fallback.
 Scan primitives begin active scans outside hostap mode and select channels in
 source array order with wraparound, leaving passive-only channels pending until
 passive scan and clearing only the channel actually submitted to scan.
+Input header parsing now accounts for address-4, QoS and HTC fields, rejects
+unsupported control-frame header-length queries, validates truncation, and
+extracts QoS control in little-endian order.
