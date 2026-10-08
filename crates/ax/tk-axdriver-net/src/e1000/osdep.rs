@@ -23,6 +23,10 @@ pub trait E1000RegisterIo {
     fn write_register(&mut self, register: u32, value: u32) -> DevResult;
     fn delay_us(&mut self, micros: u32);
     fn invalid_tail_write(&mut self, direction: &'static str);
+    /// IO-mapped write path used by early 8254x reset workarounds.
+    fn write_register_io(&mut self, register: u32, value: u32) -> DevResult {
+        self.write_register(register, value)
+    }
 }
 
 /// Width-correct PCI configuration access for the shared Intel helpers.
