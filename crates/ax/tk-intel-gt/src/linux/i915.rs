@@ -276,25 +276,6 @@ pub unsafe fn intel_ring_offset(request: *const I915Request, addr: *const c_void
     unsafe { intel_ring_wrap(ring, offset) }
 }
 
-/// `intel_uc_uses_guc_submission()` from gt/uc/intel_uc.h. The input must be
-/// the embedded `IntelGt.uc`; its containing GT is recovered by the exact C
-/// member offset, then the GuC firmware state/selection is read from its ABI
-/// overlay.
-pub unsafe fn intel_uc_uses_guc_submission(
-    uc: *const crate::intel_engine_cs_upstream::IntelUc,
-) -> bool {
-    assert!(!uc.is_null());
-    let gt = unsafe {
-        uc.cast::<u8>()
-            .sub(offset_of!(IntelGt, uc))
-            .cast::<IntelGt>()
-    };
-    let guc = unsafe { gt_to_guc(gt.cast_mut()) };
-    let fw_status = unsafe { (*guc).fw.status };
-    assert_ne!(fw_status, 3, "GEM_BUG_ON: GuC firmware status is SELECTED");
-    fw_status >= 6 && unsafe { (*guc).submission_selected }
-}
-
 /// `engine_class_to_guc_class()` from gt/uc/intel_guc_fwif.h.
 pub fn engine_class_to_guc_class(class: u8) -> u8 {
     crate::guc_submission::engine_class_to_guc_class(class)
@@ -550,6 +531,14 @@ const INTEL_ALDERLAKE_S: u32 = 34;
 const INTEL_ALDERLAKE_P: u32 = 35;
 const INTEL_DG2: u32 = 36;
 const INTEL_METEORLAKE: u32 = 37;
+
+/// Source semantics of `HAS_EXECLISTS(i915)`/`HAS_LOGICAL_RING_CONTEXTS`: the
+/// device-info bit is flag index 19 (byte 2, bit 3) in Linux v7.2.3.
+#[allow(non_snake_case)]
+pub unsafe fn HAS_EXECLISTS<P: I915PrivatePtr>(i915: P) -> bool {
+    let info = (*(i915.as_i915_private().cast::<DrmI915Private>())).info;
+    !info.is_null() && ((*info.cast::<IntelDeviceInfoOverlay>()).flags[2] & (1 << 3)) != 0
+}
 
 /// `HAS_LLC(i915)` from i915_drv.h; has_llc is the 19th source flag bit.
 #[allow(non_snake_case)]

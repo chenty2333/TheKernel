@@ -9,8 +9,8 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{
-    intel_context_upstream::IrqWork, intel_engine_cs_upstream::IntelEngineCs,
-    linux::fields::IntelBreadcrumbs,
+    intel_breadcrumbs_types_upstream::IntelBreadcrumbs, intel_context_upstream::IrqWork,
+    intel_engine_cs_upstream::IntelEngineCs,
 };
 
 pub const IRQ_WORK_PENDING: u32 = 0x01;

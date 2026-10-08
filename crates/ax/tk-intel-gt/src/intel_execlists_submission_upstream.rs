@@ -113,15 +113,16 @@ use core::{
 // submission ordering.
 use crate::linux_list::*;
 use crate::{
-    for_each_signaler, for_each_waiter, intel_context_upstream::*, intel_engine_cs_upstream::*,
+    for_each_signaler, for_each_waiter, i915_request_types_upstream::*,
+    i915_scheduler_types_upstream::*, intel_context_types_upstream::*, intel_context_upstream::*,
+    intel_engine_cs_upstream::*, intel_engine_types_upstream::IntelEngineCs,
+    intel_gt_types_upstream::IntelGt, intel_timeline_types_upstream::IntelTimeline,
     linux_config::*,
 };
 
-// Binding points supplied by the surrounding kernel integration: IntelEngineCs,
-// IntelContext, I915Request, IntelTimeline, IntelEngineExeclists, IntelSchedEngine,
-// IntelPriolist, VirtualEngine, IntelEngineStats, ExecListCapture, Linux lists,
-// rbtrees, RCU, atomics, timers, workqueues, MMIO, trace hooks, scheduler and
-// request/fence helpers, allocation helpers, error codes, and BUG/WARN macros.
+// The context, request, scheduler, engine, GT and timeline owner-header records
+// are imported above. Remaining Linux list/rbtree/RCU/atomic/timer/workqueue,
+// MMIO, scheduler/fence, allocation, trace and BUG/WARN APIs remain bindings.
 
 const RING_EXECLIST_QFULL: u32 = 1 << 0x2;
 const RING_EXECLIST1_VALID: u32 = 1 << 0x3;
@@ -3136,7 +3137,7 @@ unsafe fn rcs_submission_override(engine: *mut IntelEngineCs) {
 }
 
 // upstream: intel_execlists_submission.c intel_execlists_submission_setup()
-unsafe fn intel_execlists_submission_setup(engine: *mut IntelEngineCs) -> i32 {
+pub(crate) unsafe fn intel_execlists_submission_setup(engine: *mut IntelEngineCs) -> i32 {
     let execlists = &mut (*engine).execlists;
     let i915 = (*engine).i915;
     let uncore = (*engine).uncore;
@@ -3656,7 +3657,7 @@ unsafe fn execlists_create_virtual(
 }
 
 // upstream: intel_execlists_submission.c intel_execlists_show_requests()
-unsafe fn intel_execlists_show_requests(
+pub(crate) unsafe fn intel_execlists_show_requests(
     engine: *mut IntelEngineCs,
     m: *mut DrmPrinter,
     show_request: unsafe fn(*mut DrmPrinter, *const I915Request, *const c_char, i32),
@@ -3746,7 +3747,7 @@ unsafe fn intel_execlists_show_requests(
 }
 
 // upstream: intel_execlists_submission.c intel_execlists_dump_active_requests()
-unsafe fn intel_execlists_dump_active_requests(
+pub(crate) unsafe fn intel_execlists_dump_active_requests(
     engine: *mut IntelEngineCs,
     hung_rq: *mut I915Request,
     m: *mut DrmPrinter,

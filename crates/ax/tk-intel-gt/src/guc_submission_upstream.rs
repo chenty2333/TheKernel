@@ -19,176 +19,54 @@ use crate::{
         GuCSchedWqDesc as guc_sched_wq_desc, GuCWorkQueueItem as guc_wq_item, MAX_ENGINE_INSTANCE,
         PARENT_SCRATCH_SIZE,
     },
+    i915_request_types_upstream::{
+        DrmI915GemObject as drm_i915_gem_object, I915Request as i915_request,
+    },
+    i915_scheduler_types_upstream::I915SchedEngine as i915_sched_engine,
+    intel_breadcrumbs_types_upstream::intel_breadcrumbs,
+    intel_context_types_upstream::{
+        COPS_RUNTIME_CYCLES, I915SwFence as i915_sw_fence, IntelContext as intel_context,
+        IntelContextOps, IrqWork as irq_work, *,
+    },
     intel_context_upstream::{
-        COPS_RUNTIME_CYCLES, DrmI915GemObject as drm_i915_gem_object,
-        I915GemWwCtx as i915_gem_ww_ctx, I915Priolist as i915_priolist,
-        I915Request as i915_request, I915SchedEngine as i915_sched_engine,
-        I915SwFence as i915_sw_fence, I915Vma as i915_vma, IntelContext as intel_context,
-        IntelContextOps, IntelTimeline, IrqWork as irq_work, Kref as kref,
+        I915GemWwCtx as i915_gem_ww_ctx, I915Vma as i915_vma, Kref as kref,
         TaskletStruct as tasklet_struct, WaitQueueEntry as wait_queue_entry,
         WaitQueueHead as wait_queue_head, intel_context_bind_parent_child,
     },
     intel_engine_cs_upstream::{
         ALL_ENGINES, AtomicT as atomic_t, COMPUTE_CLASS, DelayedWork as delayed_work,
-        I915_NUM_ENGINES, IntelEngineCs as intel_engine_cs, IntelEngineId as intel_engine_id_t,
-        IntelEngineMask as intel_engine_mask_t, IntelGt as intel_gt, IntelUc as intel_uc,
-        ListHead as list_head, LlistHead as llist_head, LlistNode as llist_node, Mutex as mutex,
-        RENDER_CLASS, RbNode as rb_node, Spinlock as spinlock_t, VIRTUAL_ENGINES,
-        WorkStruct as work_struct,
+        I915_NUM_ENGINES, ListHead as list_head, LlistHead as llist_head, LlistNode as llist_node,
+        Mutex as mutex, RbNode as rb_node, Spinlock as spinlock_t, WorkStruct as work_struct,
     },
-    intel_workarounds_upstream::I915Reg as i915_reg_t,
+    intel_engine_types_upstream::{
+        IntelEngineCs as intel_engine_cs, IntelEngineId as intel_engine_id_t,
+        IntelEngineMask as intel_engine_mask_t, RENDER_CLASS, VIRTUAL_ENGINES,
+    },
+    intel_gt_types_upstream::IntelGt as intel_gt,
+    intel_guc_ct_types_upstream::{
+        IntelGucCt, IntelGucCtBuffer, IntelGucCtBuffers, IntelGucCtRequests,
+    },
+    intel_guc_log_types_upstream::IntelGucLog as IntelGucLogLayout,
+    intel_guc_slpc_types_upstream::IntelGucSlpc as IntelGucSlpcLayout,
+    intel_guc_submission_types_upstream::intel_guc_submission_is_supported,
+    intel_guc_types_upstream::{
+        IntelGuc, IntelGucInterrupts, IntelGucSendRegs, IntelGucSubmissionState, IntelGucTimestamp,
+        IntelGucTlbWait as intel_guc_tlb_wait,
+    },
+    intel_timeline_types_upstream::IntelTimeline,
+    intel_uc_fw_types_upstream::{IntelUcFw as IntelUcFwLayout, IntelUcFwVersion as IntelUcFwVer},
+    intel_uc_types_upstream::{IntelUc as intel_uc, intel_uc_uses_guc_submission},
+    intel_workarounds_types_upstream::I915RegT as i915_reg_t,
+    linux::{
+        idr::{Ida, ida_alloc_range, ida_free, ida_init},
+        iosys_map::IosysMap,
+        xarray::{XArray, xa_init_flags},
+    },
     linux_config::*,
 };
 
 #[allow(non_camel_case_types)]
 type ktime_t = i64;
-
-#[repr(C, align(8))]
-#[derive(Clone, Copy)]
-pub(crate) struct IntelUcFwLayout {
-    _type: i32,
-    pub status: i32,
-    _opaque: [u8; 408],
-}
-const _: [(); 416] = [(); size_of::<IntelUcFwLayout>()];
-const _: [(); 0] = [(); offset_of!(IntelUcFwLayout, _type)];
-const _: [(); 4] = [(); offset_of!(IntelUcFwLayout, status)];
-
-#[repr(C, align(8))]
-#[derive(Clone, Copy)]
-struct IntelGucLogLayout {
-    _opaque: [u8; 224],
-}
-
-#[repr(C, align(8))]
-#[derive(Clone, Copy)]
-struct IntelGucSlpcLayout {
-    _opaque: [u8; 120],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct XArray {
-    xa_lock: spinlock_t,
-    xa_flags: u32,
-    xa_head: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Ida {
-    xa: XArray,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-union IosysMapAddr {
-    vaddr_iomem: *mut c_void,
-    vaddr: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IosysMap {
-    addr: IosysMapAddr,
-    is_iomem: bool,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IntelUcFwVer {
-    major: u32,
-    minor: u32,
-    patch: u32,
-    build: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IntelGucCtBuffer {
-    lock: spinlock_t,
-    desc: *mut c_void,
-    cmds: *mut u32,
-    size: u32,
-    resv_space: u32,
-    tail: u32,
-    head: u32,
-    space: atomic_t,
-    broken: bool,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IntelGucCtBuffers {
-    send: IntelGucCtBuffer,
-    recv: IntelGucCtBuffer,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IntelGucCtRequests {
-    last_fence: u16,
-    lock: spinlock_t,
-    pending: list_head,
-    incoming: list_head,
-    worker: work_struct,
-}
-
-#[repr(C)]
-struct IntelGucCt {
-    vma: *mut i915_vma,
-    enabled: bool,
-    ctbs: IntelGucCtBuffers,
-    receive_tasklet: tasklet_struct,
-    wq: wait_queue_head,
-    requests: IntelGucCtRequests,
-    stall_time: ktime_t,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IntelGucInterrupts {
-    enabled: bool,
-    reset: Option<unsafe fn(*mut IntelGuc)>,
-    enable: Option<unsafe fn(*mut IntelGuc)>,
-    disable: Option<unsafe fn(*mut IntelGuc)>,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IntelGucSubmissionState {
-    lock: spinlock_t,
-    guc_ids: Ida,
-    num_guc_ids: i32,
-    guc_ids_bitmap: *mut c_ulong,
-    guc_id_list: list_head,
-    guc_ids_in_use: u32,
-    destroyed_contexts: list_head,
-    destroyed_worker: work_struct,
-    reset_fail_worker: work_struct,
-    reset_fail_mask: u32,
-    sched_disable_delay_ms: u32,
-    sched_disable_gucid_threshold: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IntelGucTimestamp {
-    lock: spinlock_t,
-    gt_stamp: u64,
-    ping_delay: c_ulong,
-    work: delayed_work,
-    shift: u32,
-    last_stat_jiffies: c_ulong,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IntelGucSendRegs {
-    base: u32,
-    count: u32,
-    fw_domains: i32,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -258,69 +136,16 @@ struct parent_scratch {
     wq: [u32; 512],
 }
 
-#[repr(C, align(8))]
-#[derive(Clone, Copy, Default)]
-struct IntelGucTlbWaitQueue {
-    _opaque: [u8; 24],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct intel_guc_tlb_wait {
-    wq: IntelGucTlbWaitQueue,
-    busy: bool,
-}
-
-#[repr(C)]
-pub struct IntelGuc {
-    pub fw: IntelUcFwLayout,
-    log: IntelGucLogLayout,
-    ct: IntelGucCt,
-    slpc: IntelGucSlpcLayout,
-    capture: *mut c_void,
-    dbgfs_node: *mut c_void,
-    sched_engine: *mut i915_sched_engine,
-    stalled_request: *mut i915_request,
-    submission_stall_reason: i32,
-    irq_lock: spinlock_t,
-    msg_enabled_mask: u32,
-    outstanding_submission_g2h: atomic_t,
-    tlb_lookup: XArray,
-    serial_slot: u32,
-    next_seqno: u32,
-    interrupts: IntelGucInterrupts,
-    submission_state: IntelGucSubmissionState,
-    submission_supported: bool,
-    pub submission_selected: bool,
-    submission_initialized: bool,
-    submission_version: IntelUcFwVer,
-    rc_supported: bool,
-    rc_selected: bool,
-    ads_vma: *mut i915_vma,
-    ads_map: IosysMap,
-    ads_regset_size: u32,
-    ads_regset_count: [u32; I915_NUM_ENGINES],
-    ads_regset: *mut c_void,
-    ads_golden_ctxt_size: u32,
-    ads_waklv_size: u32,
-    ads_capture_size: u32,
-    lrc_desc_pool_v69: *mut i915_vma,
-    lrc_desc_pool_vaddr_v69: *mut u8,
-    context_lookup: XArray,
-    params: [u32; 14],
-    send_regs: IntelGucSendRegs,
-    notify_reg: i915_reg_t,
-    mmio_msg: u32,
-    send_mutex: mutex,
-    timestamp: IntelGucTimestamp,
-    dead_guc_worker: work_struct,
-    last_dead_guc_jiffies: c_ulong,
-}
-
 #[allow(non_camel_case_types)]
 type intel_guc = IntelGuc;
 #[allow(non_camel_case_types)]
 type intel_guc_ct = IntelGucCt;
+#[allow(non_camel_case_types)]
+type intel_guc_ct_buffer = IntelGucCtBuffer;
+#[allow(non_camel_case_types)]
+type intel_guc_ct_buffers = IntelGucCtBuffers;
+#[allow(non_camel_case_types)]
+type intel_guc_ct_requests = IntelGucCtRequests;
 
 const INTEL_UC_FIRMWARE_RUNNING: i32 = 10;
 
@@ -387,12 +212,6 @@ type iosys_map = IosysMap;
 #[allow(non_camel_case_types)]
 type intel_uc_fw_ver = IntelUcFwVer;
 #[allow(non_camel_case_types)]
-type intel_guc_ct_buffer = IntelGucCtBuffer;
-#[allow(non_camel_case_types)]
-type intel_guc_ct_buffers = IntelGucCtBuffers;
-#[allow(non_camel_case_types)]
-type intel_guc_ct_requests = IntelGucCtRequests;
-#[allow(non_camel_case_types)]
 type intel_guc_interrupts = IntelGucInterrupts;
 #[allow(non_camel_case_types)]
 type intel_guc_submission_state = IntelGucSubmissionState;
@@ -430,7 +249,6 @@ const _: () = {
     assert!(size_of::<IosysMap>() == 16);
     assert!(size_of::<IntelGucCtBuffer>() == 48);
     assert!(size_of::<IntelGucCt>() == 256);
-    assert!(size_of::<IntelGucSubmissionState>() == 160);
     assert!(size_of::<IntelGucTimestamp>() == 128);
     assert!(size_of::<intel_guc_tlb_wait>() == 32);
     assert!(size_of::<GuCUpdateContextPolicy>() == 48);
@@ -440,7 +258,6 @@ const _: () = {
     assert!(size_of::<sync_semaphore>() == CACHELINE_BYTES);
     assert!(size_of::<parent_scratch>() == PARENT_SCRATCH_SIZE);
     assert!(offset_of!(parent_scratch, wq) == PARENT_SCRATCH_SIZE / 2);
-    assert!(offset_of!(IntelGuc, submission_state) == 1120);
     assert!(offset_of!(IntelGuc, ads_vma) == 1304);
     assert!(offset_of!(IntelGuc, params) == 1496);
     assert!(offset_of!(IntelGuc, timestamp) == 1600);
@@ -931,7 +748,7 @@ fn intel_guc_wait_for_pending_msg(
 
 // upstream: intel_guc_submission.c intel_guc_wait_for_idle()
 fn intel_guc_wait_for_idle(guc: &intel_guc, timeout: i64) -> i32 {
-    if !intel_uc_uses_guc_submission(&guc_to_gt(guc).uc) {
+    if !unsafe { intel_uc_uses_guc_submission(core::ptr::addr_of_mut!(guc_to_gt(guc).uc)) } {
         return 0;
     }
     intel_guc_wait_for_pending_msg(guc, &guc.outstanding_submission_g2h, true, timeout)
@@ -4266,7 +4083,7 @@ fn __guc_submission_supported(guc: &intel_guc) -> bool {
 // upstream: intel_guc_submission.c __guc_submission_selected()
 fn __guc_submission_selected(guc: &intel_guc) -> bool {
     let i915 = guc_to_i915(guc);
-    if !intel_guc_submission_is_supported(guc) {
+    if !unsafe { intel_guc_submission_is_supported(guc) } {
         return false;
     }
     i915.params.enable_guc & ENABLE_GUC_SUBMISSION != 0

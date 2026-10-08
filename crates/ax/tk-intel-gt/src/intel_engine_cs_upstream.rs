@@ -2,9 +2,10 @@
 // Copyright © 2016 Intel Corporation.
 //
 // Source-faithful Rust transcription of Linux 7.2.3
-// drivers/gpu/drm/i915/gt/intel_engine_cs.c. The IntelEngineCs/IntelGt records
-// below preserve the corresponding source-header layouts; the surrounding GEM,
-// MMIO and kernel-framework services remain external binding points. Preserve
+// drivers/gpu/drm/i915/gt/intel_engine_cs.c. Header-owned `IntelEngineCs` and
+// `IntelGt` records are imported from their separate source-order type bindings;
+// surrounding GEM, MMIO and kernel-framework services remain external binding
+// points. Preserve
 // source ordering, control flow, register accesses, timeout values and error
 // ordering when integrating those services.
 
@@ -17,70 +18,66 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
+// Engine IDs/classes/masks are owned by `intel_engine_types.h`.
+pub use crate::intel_engine_types_upstream::{
+    _BCS, _CCS, _VCS, _VECS, ALL_ENGINES, BCS0, BCS1, BCS2, BCS3, BCS4, BCS5, BCS6, BCS7, BCS8,
+    CCS0, CCS1, CCS2, CCS3, COMPUTE_CLASS, COPY_ENGINE_CLASS, GSC0, I915_NUM_ENGINES,
+    INVALID_ENGINE, IntelEngineId, IntelEngineMask, MAX_ENGINE_CLASS, MAX_ENGINE_INSTANCE,
+    OTHER_CLASS, RCS0, RENDER_CLASS, VCS0, VCS1, VCS2, VCS3, VCS4, VCS5, VCS6, VCS7, VECS0, VECS1,
+    VECS2, VECS3, VIDEO_DECODE_CLASS, VIDEO_ENHANCEMENT_CLASS, VIRTUAL_ENGINES,
+};
 use crate::{
+    i915_gem_object_upstream::i915_gem_object_set_cache_coherency,
+    i915_request_types_upstream::*,
+    i915_scheduler_types_upstream::*,
+    intel_breadcrumbs_types_upstream::IntelBreadcrumbs,
+    intel_breadcrumbs_upstream::intel_engine_print_breadcrumbs,
+    intel_context_types_upstream::*,
     intel_context_upstream::*,
-    intel_workarounds_upstream::{I915WaList, IntelUncore},
+    intel_execlists_submission_upstream::{
+        intel_execlists_dump_active_requests, intel_execlists_show_requests,
+        intel_execlists_submission_setup,
+    },
+    intel_guc_submission_types_upstream::{
+        intel_guc_dump_active_requests, intel_guc_submission_is_wanted, intel_guc_submission_setup,
+    },
+    intel_ring::intel_ring_update_space,
+    intel_sseu_types_upstream::{
+        SseuDevInfo, intel_slicemask_from_xehp_dssmask, intel_sseu_from_device_info,
+    },
+    intel_timeline_types_upstream::IntelTimeline,
+    intel_uc_types_upstream::{intel_uc_uses_guc_submission, intel_uc_wants_gsc_uc},
+    intel_uncore_types_upstream::{
+        __intel_wait_for_register_fw, IntelUncore, intel_uncore_posting_read_fw,
+        intel_uncore_prune_engine_fw_domains, intel_uncore_read, intel_uncore_write,
+        intel_uncore_write_fw,
+    },
+    intel_workarounds_types_upstream::I915WaList,
+    intel_workarounds_upstream::{
+        intel_engine_apply_whitelist, intel_engine_apply_workarounds, intel_engine_init_ctx_wa,
+        intel_engine_init_whitelist, intel_engine_init_workarounds,
+    },
+    linux::i915::HAS_EXECLISTS,
     linux_config::*,
     linux_heap::kmem_cache_free,
     linux_list::*,
 };
-
-// Engine classes and dense internal engine IDs from intel_engine_types.h.
-pub const RENDER_CLASS: u8 = 0;
-pub const VIDEO_DECODE_CLASS: u8 = 1;
-pub const VIDEO_ENHANCEMENT_CLASS: u8 = 2;
-pub const COPY_ENGINE_CLASS: u8 = 3;
-pub const OTHER_CLASS: u8 = 4;
-pub const COMPUTE_CLASS: u8 = 5;
-pub const MAX_ENGINE_CLASS: u8 = 5;
-pub const MAX_ENGINE_INSTANCE: u8 = 8;
-pub type IntelEngineId = i32;
-pub const RCS0: IntelEngineId = 0;
-pub const BCS0: IntelEngineId = 1;
-pub const BCS1: IntelEngineId = 2;
-pub const BCS2: IntelEngineId = 3;
-pub const BCS3: IntelEngineId = 4;
-pub const BCS4: IntelEngineId = 5;
-pub const BCS5: IntelEngineId = 6;
-pub const BCS6: IntelEngineId = 7;
-pub const BCS7: IntelEngineId = 8;
-pub const BCS8: IntelEngineId = 9;
-pub const VCS0: IntelEngineId = 10;
-pub const VCS1: IntelEngineId = 11;
-pub const VCS2: IntelEngineId = 12;
-pub const VCS3: IntelEngineId = 13;
-pub const VCS4: IntelEngineId = 14;
-pub const VCS5: IntelEngineId = 15;
-pub const VCS6: IntelEngineId = 16;
-pub const VCS7: IntelEngineId = 17;
-pub const VECS0: IntelEngineId = 18;
-pub const VECS1: IntelEngineId = 19;
-pub const VECS2: IntelEngineId = 20;
-pub const VECS3: IntelEngineId = 21;
-pub const CCS0: IntelEngineId = 22;
-pub const CCS1: IntelEngineId = 23;
-pub const CCS2: IntelEngineId = 24;
-pub const CCS3: IntelEngineId = 25;
-pub const GSC0: IntelEngineId = 26;
-pub const INVALID_ENGINE: IntelEngineId = -1;
-pub const I915_NUM_ENGINES: usize = 27;
-// `intel_engine_mask_t` is a u32 in intel_engine_types.h. The virtual-engine
-// sentinel occupies the highest bit, independently of the dense engine IDs.
-pub type IntelEngineMask = u32;
-pub const ALL_ENGINES: IntelEngineMask = u32::MAX;
-pub const VIRTUAL_ENGINES: IntelEngineMask = 1 << (u32::BITS - 1);
-pub const fn _BCS(instance: IntelEngineId) -> IntelEngineId {
-    BCS0 + instance
-}
-pub const fn _VCS(instance: IntelEngineId) -> IntelEngineId {
-    VCS0 + instance
-}
-pub const fn _VECS(instance: IntelEngineId) -> IntelEngineId {
-    VECS0 + instance
-}
-pub const fn _CCS(instance: IntelEngineId) -> IntelEngineId {
-    CCS0 + instance
-}
+pub use crate::{
+    intel_engine_api_upstream::*,
+    intel_engine_regs_upstream::*,
+    intel_engine_types_upstream::{
+        I915CtxWorkarounds, IntelEngineCs, IntelEngineExeclists, IntelEngineHeartbeat,
+        IntelEngineLegacy, IntelEngineProps, IntelEngineResetOps, IntelEngineStats,
+        IntelEngineTlbInv, IntelEngineTlbInvReg, IntelEngineUabi, IntelHwStatusPage,
+        intel_engine_supports_stats,
+    },
+    intel_gt_types_upstream::{
+        GtDefaults as IntelGtDefaults, IntelGt, IntelGtCcs, IntelGtInfo, IntelGtMocs,
+        IntelGtRequests, IntelGtStats, IntelGtSteering, IntelGtTimelines, IntelGtTlb,
+        IntelGtWatchdog,
+    },
+    intel_wakeref_types_upstream::{IntelWakeref, IntelWakerefOps},
+};
 
 // Layout bindings for the source structures in Linux v7.2.3
 // drivers/gpu/drm/i915/gt/intel_engine_types.h and intel_gt_types.h.
@@ -106,26 +103,9 @@ macro_rules! opaque_c_layout {
     };
 }
 
-opaque_c_layout!(IntelUc, 2976, 8);
-opaque_c_layout!(IntelGsc, 48, 8);
-opaque_c_layout!(IntelRc6, 104, 8);
-opaque_c_layout!(IntelRps, 280, 8);
-opaque_c_layout!(IntelGtBufferPool, 160, 8);
-opaque_c_layout!(IntelMigrate, 8, 8);
 opaque_c_layout!(Kobject, 64, 8);
 opaque_c_layout!(I915PerfGt, 40, 8);
 opaque_c_layout!(Mutex, 24, 8);
-opaque_c_layout!(IntelWopcm, 12, 4);
-
-/// `intel_reset.flags` is the first field in the 7.2.3 C layout; the
-/// configuration-dependent mutex/waitqueue/SRCU tail remains opaque.
-#[repr(C)]
-pub struct IntelReset {
-    pub flags: c_ulong,
-    _opaque_tail: [u8; 80],
-}
-const _: [(); 88] = [(); size_of::<IntelReset>()];
-const _: [(); 0] = [(); offset_of!(IntelReset, flags)];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -235,481 +215,6 @@ pub struct AtomicNotifierHead {
     pub head: *mut c_void,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelSseu {
-    pub slice_mask: u8,
-    pub subslice_mask: u8,
-    pub min_eus_per_subslice: u8,
-    pub max_eus_per_subslice: u8,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union IntelSseuSsMask {
-    pub hsw: [u8; 3],
-    pub xehp: [c_ulong; 1],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union IntelSseuEuMask {
-    pub hsw: [[u16; 8]; 3],
-    pub xehp: [u16; 64],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SseuDevInfo {
-    pub slice_mask: u8,
-    pub subslice_mask: IntelSseuSsMask,
-    pub geometry_subslice_mask: IntelSseuSsMask,
-    pub compute_subslice_mask: IntelSseuSsMask,
-    pub eu_mask: IntelSseuEuMask,
-    pub eu_total: u16,
-    pub eu_per_subslice: u8,
-    pub min_eu_in_pool: u8,
-    pub subslice_7eu: [u8; 3],
-    pub power_gating: u8,
-    pub max_slices: u8,
-    pub max_subslices: u8,
-    pub max_eus_per_subslice: u8,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelHwconfig {
-    pub size: u32,
-    pub data: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtInfo {
-    pub id: u32,
-    pub engine_mask: u32,
-    pub l3bank_mask: u32,
-    pub num_engines: u8,
-    pub sfc_mask: u8,
-    pub vdbox_sfc_access: u8,
-    pub sseu: SseuDevInfo,
-    pub mslice_mask: c_ulong,
-    pub hwconfig: IntelHwconfig,
-}
-
-// This is empty in intel_llc_types.h for the v7.2.3 source configuration.
-#[repr(C)]
-pub struct IntelLlc {}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineTlbInvReg {
-    pub reg: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union IntelEngineTlbInvRegister {
-    pub reg: IntelEngineTlbInvReg,
-    pub mcr_reg: IntelEngineTlbInvReg,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineTlbInv {
-    pub mcr: bool,
-    pub reg: IntelEngineTlbInvRegister,
-    pub request: u32,
-    pub done: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelHwStatusPage {
-    pub timelines: ListHead,
-    pub vma: *mut c_void,
-    pub addr: *mut u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct I915WaContextBatch {
-    pub offset: u32,
-    pub size: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct I915CtxWorkarounds {
-    pub indirect_ctx: I915WaContextBatch,
-    pub per_ctx: I915WaContextBatch,
-    pub vma: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineExeclistsStats {
-    pub active: u32,
-    pub lock: Seqcount,
-    pub total: i64,
-    pub start: i64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineGucStats {
-    pub running: bool,
-    pub prev_total: u32,
-    pub total_gt_clks: u64,
-    pub start_gt_clk: u64,
-    pub total: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union IntelEngineStatsData {
-    pub execlists: IntelEngineExeclistsStats,
-    pub guc: IntelEngineGucStats,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineStats {
-    pub data: IntelEngineStatsData,
-    pub rps: i64,
-}
-const _: [(); 32] = [(); size_of::<IntelEngineStatsData>()];
-const _: [(); 40] = [(); size_of::<IntelEngineStats>()];
-const _: [(); 32] = [(); offset_of!(IntelEngineStats, rps)];
-
-// The upstream struct has an anonymous union, so C exposes `stats.guc` and
-// `stats.execlists` directly. Keep the union at the asserted C offset and
-// provide the same named-member lookup to source-order Rust callers.
-impl Deref for IntelEngineStats {
-    type Target = IntelEngineStatsData;
-
-    fn deref(&self) -> &Self::Target {
-        &self.data
-    }
-}
-
-impl DerefMut for IntelEngineStats {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.data
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEnginePmuSample {
-    pub cur: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEnginePmu {
-    pub enable: u32,
-    pub enable_count: [u32; 3],
-    pub sample: [IntelEnginePmuSample; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineExeclists {
-    pub timer: TimerList,
-    pub preempt: TimerList,
-    pub preempt_target: *const I915Request,
-    pub ccid: u32,
-    pub yield_ccid: u32,
-    pub error_interrupt: u32,
-    pub reset_ccid: u32,
-    pub submit_reg: *mut u32,
-    pub ctrl_reg: *mut u32,
-    pub active: *const *mut I915Request,
-    pub inflight: [*mut I915Request; 3],
-    pub pending: [*mut I915Request; 3],
-    pub port_mask: u32,
-    pub r#virtual: RbRootCached,
-    pub csb_write: *mut u32,
-    pub csb_status: *mut u64,
-    pub csb_size: u8,
-    pub csb_head: u8,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelWakerefOps {
-    pub get: Option<unsafe extern "C" fn(*mut IntelWakeref) -> i32>,
-    pub put: Option<unsafe extern "C" fn(*mut IntelWakeref) -> i32>,
-}
-
-#[repr(C)]
-pub struct IntelWakeref {
-    pub count: AtomicT,
-    pub mutex: Mutex,
-    pub wakeref: *mut c_void,
-    pub i915: *mut DrmI915Private,
-    pub ops: *const IntelWakerefOps,
-    pub work: DelayedWork,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineProps {
-    pub heartbeat_interval_ms: c_ulong,
-    pub max_busywait_duration_ns: c_ulong,
-    pub preempt_timeout_ms: c_ulong,
-    pub stop_timeout_ms: c_ulong,
-    pub timeslice_duration_ms: c_ulong,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineHeartbeat {
-    pub work: DelayedWork,
-    pub systole: *mut c_void,
-    pub blocked: c_ulong,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineResetOps {
-    pub prepare: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub rewind: Option<unsafe extern "C" fn(*mut IntelEngineCs, bool)>,
-    pub cancel: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub finish: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union IntelEngineUabi {
-    pub llist: LlistNode,
-    pub list: ListHead,
-    pub rb: RbNode,
-}
-
-#[repr(C)]
-pub struct IntelEngineCs {
-    pub i915: *mut DrmI915Private,
-    pub gt: *mut IntelGt,
-    pub uncore: *mut IntelUncore,
-    pub name: [c_char; 8],
-    pub id: i32,
-    pub legacy_idx: i32,
-    pub guc_id: u32,
-    pub mask: u32,
-    pub reset_domain: u32,
-    pub logical_mask: u32,
-    pub class: u8,
-    pub instance: u8,
-    pub uabi_class: u16,
-    pub uabi_instance: u16,
-    pub uabi_capabilities: u32,
-    pub context_size: u32,
-    pub mmio_base: u32,
-    pub tlb_inv: IntelEngineTlbInv,
-    pub fw_domain: i32,
-    pub fw_active: u32,
-    pub context_tag: c_ulong,
-    pub uabi: IntelEngineUabi,
-    pub sseu: IntelSseu,
-    pub sched_engine: *mut I915SchedEngine,
-    pub request_pool: *mut c_void,
-    pub hung_ce: *mut c_void,
-    pub barrier_tasks: LlistHead,
-    pub kernel_context: *mut c_void,
-    pub bind_context: *mut c_void,
-    pub bind_context_ready: bool,
-    pub pinned_contexts_list: ListHead,
-    pub saturated: u32,
-    pub heartbeat: IntelEngineHeartbeat,
-    pub serial: c_ulong,
-    pub wakeref_serial: c_ulong,
-    pub wakeref_track: *mut c_void,
-    pub wakeref: IntelWakeref,
-    pub default_state: *mut c_void,
-    pub legacy: IntelEngineLegacy,
-    pub latency: c_ulong,
-    pub breadcrumbs: *mut IntelBreadcrumbs,
-    pub pmu: IntelEnginePmu,
-    pub status_page: IntelHwStatusPage,
-    pub wa_ctx: I915CtxWorkarounds,
-    pub ctx_wa_list: I915WaList,
-    pub wa_list: I915WaList,
-    pub whitelist: I915WaList,
-    pub irq_keep_mask: u32,
-    pub irq_enable_mask: u32,
-    pub irq_enable: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub irq_disable: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub irq_handler: Option<unsafe extern "C" fn(*mut IntelEngineCs, u16)>,
-    pub sanitize: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub resume: Option<unsafe extern "C" fn(*mut IntelEngineCs) -> i32>,
-    pub reset: IntelEngineResetOps,
-    pub park: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub unpark: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub bump_serial: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub set_default_submission: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub cops: *const c_void,
-    pub request_alloc: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
-    pub emit_flush: Option<unsafe extern "C" fn(*mut c_void, u32) -> i32>,
-    pub emit_bb_start: Option<unsafe extern "C" fn(*mut c_void, u64, u32, u32) -> i32>,
-    pub emit_init_breadcrumb: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
-    pub emit_fini_breadcrumb: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> *mut u32>,
-    pub emit_fini_breadcrumb_dw: u32,
-    pub submit_request: Option<unsafe extern "C" fn(*mut c_void)>,
-    pub release: Option<unsafe extern "C" fn(*mut IntelEngineCs)>,
-    pub add_active_request: Option<unsafe extern "C" fn(*mut c_void)>,
-    pub remove_active_request: Option<unsafe extern "C" fn(*mut c_void)>,
-    pub busyness: Option<unsafe extern "C" fn(*mut IntelEngineCs, *mut i64) -> i64>,
-    pub execlists: IntelEngineExeclists,
-    pub retire: *mut c_void,
-    pub retire_work: WorkStruct,
-    pub context_status_notifier: AtomicNotifierHead,
-    pub flags: u32,
-    pub cmd_hash: [HlistHead; 512],
-    pub reg_tables: *const c_void,
-    pub reg_table_count: i32,
-    pub get_cmd_length_mask: Option<unsafe extern "C" fn(u32) -> u32>,
-    pub stats: IntelEngineStats,
-    pub props: IntelEngineProps,
-    pub defaults: IntelEngineProps,
-    pub oa_group: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelEngineLegacy {
-    pub ring: *mut c_void,
-    pub timeline: *mut c_void,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtTlb {
-    pub invalidate_lock: Mutex,
-    pub seqno: SeqcountMutex,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtTimelines {
-    pub lock: Spinlock,
-    pub active_list: ListHead,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtRequests {
-    pub retire_work: DelayedWork,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtWatchdog {
-    pub list: LlistHead,
-    pub work: WorkStruct,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtStats {
-    pub active: bool,
-    pub lock: SeqcountMutex,
-    pub total: i64,
-    pub start: i64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtCcs {
-    pub cslices: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtMocs {
-    pub uc_index: u8,
-    pub wb_index: u8,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtDefaults {
-    pub min_freq: u32,
-    pub max_freq: u32,
-    pub rps_up_threshold: u8,
-    pub rps_down_threshold: u8,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelMmioRange {
-    pub start: u32,
-    pub end: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelGtSteering {
-    pub groupid: u8,
-    pub instanceid: u8,
-}
-
-#[repr(C)]
-pub struct IntelGt {
-    pub i915: *mut DrmI915Private,
-    pub name: *const c_char,
-    pub type_: i32,
-    pub uncore: *mut IntelUncore,
-    pub ggtt: *mut c_void,
-    pub uc: IntelUc,
-    pub gsc: IntelGsc,
-    pub wopcm: IntelWopcm,
-    pub tlb: IntelGtTlb,
-    pub wa_list: I915WaList,
-    pub timelines: IntelGtTimelines,
-    pub requests: IntelGtRequests,
-    pub watchdog: IntelGtWatchdog,
-    pub wakeref: IntelWakeref,
-    pub user_wakeref: AtomicT,
-    pub closed_vma: ListHead,
-    pub closed_lock: Spinlock,
-    pub last_init_time: i64,
-    pub reset: IntelReset,
-    pub awake: *mut c_void,
-    pub clock_frequency: u32,
-    pub clock_period_ns: u32,
-    pub llc: IntelLlc,
-    pub rc6: IntelRc6,
-    pub rps: IntelRps,
-    pub irq_lock: *mut Spinlock,
-    pub gt_imr: u32,
-    pub pm_ier: u32,
-    pub pm_imr: u32,
-    pub pm_guc_events: u32,
-    pub stats: IntelGtStats,
-    pub engine: [*mut IntelEngineCs; 27],
-    pub engine_class: [[*mut IntelEngineCs; 9]; 6],
-    pub submission_method: i32,
-    pub ccs: IntelGtCcs,
-    pub vm: *mut c_void,
-    pub buffer_pool: IntelGtBufferPool,
-    pub scratch: *mut c_void,
-    pub migrate: IntelMigrate,
-    pub steering_table: [*const IntelMmioRange; 7],
-    pub default_steering: IntelGtSteering,
-    pub mcr_lock: Spinlock,
-    pub phys_addr: u64,
-    pub info: IntelGtInfo,
-    pub mocs: IntelGtMocs,
-    pub sysfs_gt: Kobject,
-    pub defaults: IntelGtDefaults,
-    pub sysfs_defaults: *mut Kobject,
-    pub wedge: WorkStruct,
-    pub perf: I915PerfGt,
-    pub ggtt_link: ListHead,
-}
-
 // Guard the two source-derived top-level bindings against accidental layout
 // drift for the configured x86_64 Linux v7.2.3 structures.
 const _: [(); 5496] = [(); size_of::<IntelEngineCs>()];
@@ -750,6 +255,14 @@ const GEN9_LR_CONTEXT_RENDER_SIZE: u32 = 22 * PAGE_SIZE;
 const GEN11_LR_CONTEXT_RENDER_SIZE: u32 = 14 * PAGE_SIZE;
 const GEN8_LR_CONTEXT_OTHER_SIZE: u32 = 2 * PAGE_SIZE;
 const MAX_MMIO_BASES: usize = 3;
+// C stores this enum's values in the header's u8 engine-info class field;
+// these aliases preserve the cast required at the Rust ABI boundary.
+const RENDER_CLASS_U8: u8 = RENDER_CLASS as u8;
+const VIDEO_DECODE_CLASS_U8: u8 = VIDEO_DECODE_CLASS as u8;
+const VIDEO_ENHANCEMENT_CLASS_U8: u8 = VIDEO_ENHANCEMENT_CLASS as u8;
+const COPY_ENGINE_CLASS_U8: u8 = COPY_ENGINE_CLASS as u8;
+const OTHER_CLASS_U8: u8 = OTHER_CLASS as u8;
+const COMPUTE_CLASS_U8: u8 = COMPUTE_CLASS as u8;
 
 #[derive(Clone, Copy)]
 struct EngineMmioBase {
@@ -771,7 +284,7 @@ const EMPTY_ENGINE_MMIO_BASE: EngineMmioBase = EngineMmioBase {
 
 static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
     EngineInfo {
-        class: RENDER_CLASS,
+        class: RENDER_CLASS as u8,
         instance: 0,
         mmio_bases: [
             EngineMmioBase {
@@ -783,7 +296,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COPY_ENGINE_CLASS,
+        class: COPY_ENGINE_CLASS as u8,
         instance: 0,
         mmio_bases: [
             EngineMmioBase {
@@ -795,7 +308,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COPY_ENGINE_CLASS,
+        class: COPY_ENGINE_CLASS as u8,
         instance: 1,
         mmio_bases: [
             EngineMmioBase {
@@ -807,7 +320,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COPY_ENGINE_CLASS,
+        class: COPY_ENGINE_CLASS as u8,
         instance: 2,
         mmio_bases: [
             EngineMmioBase {
@@ -819,7 +332,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COPY_ENGINE_CLASS,
+        class: COPY_ENGINE_CLASS as u8,
         instance: 3,
         mmio_bases: [
             EngineMmioBase {
@@ -831,7 +344,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COPY_ENGINE_CLASS,
+        class: COPY_ENGINE_CLASS as u8,
         instance: 4,
         mmio_bases: [
             EngineMmioBase {
@@ -843,7 +356,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COPY_ENGINE_CLASS,
+        class: COPY_ENGINE_CLASS as u8,
         instance: 5,
         mmio_bases: [
             EngineMmioBase {
@@ -855,7 +368,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COPY_ENGINE_CLASS,
+        class: COPY_ENGINE_CLASS as u8,
         instance: 6,
         mmio_bases: [
             EngineMmioBase {
@@ -867,7 +380,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COPY_ENGINE_CLASS,
+        class: COPY_ENGINE_CLASS as u8,
         instance: 7,
         mmio_bases: [
             EngineMmioBase {
@@ -879,7 +392,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COPY_ENGINE_CLASS,
+        class: COPY_ENGINE_CLASS as u8,
         instance: 8,
         mmio_bases: [
             EngineMmioBase {
@@ -891,7 +404,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_DECODE_CLASS,
+        class: VIDEO_DECODE_CLASS as u8,
         instance: 0,
         mmio_bases: [
             EngineMmioBase {
@@ -909,7 +422,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_DECODE_CLASS,
+        class: VIDEO_DECODE_CLASS as u8,
         instance: 1,
         mmio_bases: [
             EngineMmioBase {
@@ -924,7 +437,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_DECODE_CLASS,
+        class: VIDEO_DECODE_CLASS as u8,
         instance: 2,
         mmio_bases: [
             EngineMmioBase {
@@ -936,7 +449,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_DECODE_CLASS,
+        class: VIDEO_DECODE_CLASS as u8,
         instance: 3,
         mmio_bases: [
             EngineMmioBase {
@@ -948,7 +461,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_DECODE_CLASS,
+        class: VIDEO_DECODE_CLASS as u8,
         instance: 4,
         mmio_bases: [
             EngineMmioBase {
@@ -960,7 +473,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_DECODE_CLASS,
+        class: VIDEO_DECODE_CLASS as u8,
         instance: 5,
         mmio_bases: [
             EngineMmioBase {
@@ -972,7 +485,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_DECODE_CLASS,
+        class: VIDEO_DECODE_CLASS as u8,
         instance: 6,
         mmio_bases: [
             EngineMmioBase {
@@ -984,7 +497,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_DECODE_CLASS,
+        class: VIDEO_DECODE_CLASS as u8,
         instance: 7,
         mmio_bases: [
             EngineMmioBase {
@@ -996,7 +509,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_ENHANCEMENT_CLASS,
+        class: VIDEO_ENHANCEMENT_CLASS as u8,
         instance: 0,
         mmio_bases: [
             EngineMmioBase {
@@ -1011,7 +524,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_ENHANCEMENT_CLASS,
+        class: VIDEO_ENHANCEMENT_CLASS as u8,
         instance: 1,
         mmio_bases: [
             EngineMmioBase {
@@ -1023,7 +536,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_ENHANCEMENT_CLASS,
+        class: VIDEO_ENHANCEMENT_CLASS as u8,
         instance: 2,
         mmio_bases: [
             EngineMmioBase {
@@ -1035,7 +548,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: VIDEO_ENHANCEMENT_CLASS,
+        class: VIDEO_ENHANCEMENT_CLASS as u8,
         instance: 3,
         mmio_bases: [
             EngineMmioBase {
@@ -1047,7 +560,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COMPUTE_CLASS,
+        class: COMPUTE_CLASS as u8,
         instance: 0,
         mmio_bases: [
             EngineMmioBase {
@@ -1059,7 +572,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COMPUTE_CLASS,
+        class: COMPUTE_CLASS as u8,
         instance: 1,
         mmio_bases: [
             EngineMmioBase {
@@ -1071,7 +584,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COMPUTE_CLASS,
+        class: COMPUTE_CLASS as u8,
         instance: 2,
         mmio_bases: [
             EngineMmioBase {
@@ -1083,7 +596,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: COMPUTE_CLASS,
+        class: COMPUTE_CLASS as u8,
         instance: 3,
         mmio_bases: [
             EngineMmioBase {
@@ -1095,7 +608,7 @@ static INTEL_ENGINES: [EngineInfo; I915_NUM_ENGINES] = [
         ],
     },
     EngineInfo {
-        class: OTHER_CLASS,
+        class: OTHER_CLASS as u8,
         instance: OTHER_GSC_INSTANCE,
         mmio_bases: [
             EngineMmioBase {
@@ -1116,7 +629,7 @@ pub unsafe fn intel_engine_context_size(gt: *mut IntelGt, class: u8) -> u32 {
     BUILD_BUG_ON!(I915_GTT_PAGE_SIZE != PAGE_SIZE);
 
     match class {
-        COMPUTE_CLASS | RENDER_CLASS => match GRAPHICS_VER((*gt).i915) {
+        COMPUTE_CLASS_U8 | RENDER_CLASS_U8 => match GRAPHICS_VER((*gt).i915) {
             12 | 11 => GEN11_LR_CONTEXT_RENDER_SIZE,
             9 => GEN9_LR_CONTEXT_RENDER_SIZE,
             8 => GEN8_LR_CONTEXT_RENDER_SIZE,
@@ -1149,7 +662,10 @@ pub unsafe fn intel_engine_context_size(gt: *mut IntelGt, class: u8) -> u32 {
                 DEFAULT_LR_CONTEXT_RENDER_SIZE
             }
         },
-        VIDEO_DECODE_CLASS | VIDEO_ENHANCEMENT_CLASS | COPY_ENGINE_CLASS | OTHER_CLASS => {
+        VIDEO_DECODE_CLASS_U8
+        | VIDEO_ENHANCEMENT_CLASS_U8
+        | COPY_ENGINE_CLASS_U8
+        | OTHER_CLASS_U8 => {
             if GRAPHICS_VER((*gt).i915) < 8 {
                 0
             } else {
@@ -1199,7 +715,7 @@ unsafe fn __sprint_engine_name(engine: *mut IntelEngineCs) {
 
 // upstream: intel_engine_cs.c intel_engine_set_hwsp_writemask()
 pub unsafe fn intel_engine_set_hwsp_writemask(engine: *mut IntelEngineCs, mask: u32) {
-    if GRAPHICS_VER((*engine).i915) < 6 && (*engine).class != RENDER_CLASS {
+    if GRAPHICS_VER((*engine).i915) < 6 && (*engine).class as i32 != RENDER_CLASS {
         return;
     }
 
@@ -1319,13 +835,13 @@ unsafe fn intel_engine_setup(gt: *mut IntelGt, id: IntelEngineId, logical_instan
     (*engine).logical_mask = BIT!(logical_instance);
     __sprint_engine_name(engine);
 
-    if ((*engine).class == COMPUTE_CLASS || (*engine).class == RENDER_CLASS)
+    if ((*engine).class as i32 == COMPUTE_CLASS || (*engine).class as i32 == RENDER_CLASS)
         && __ffs(CCS_MASK((*engine).gt) | RCS_MASK((*engine).gt)) == (*engine).instance
     {
         (*engine).flags |= I915_ENGINE_FIRST_RENDER_COMPUTE;
     }
 
-    if (*engine).class == RENDER_CLASS || (*engine).class == COMPUTE_CLASS {
+    if (*engine).class as i32 == RENDER_CLASS || (*engine).class as i32 == COMPUTE_CLASS {
         (*engine).flags |= I915_ENGINE_HAS_RCS_REG_STATE;
         (*engine).flags |= I915_ENGINE_HAS_EU_PRIORITY;
     }
@@ -1431,7 +947,7 @@ pub unsafe fn intel_clamp_timeslice_duration_ms(engine: *mut IntelEngineCs, mut 
 unsafe fn __setup_engine_capabilities(engine: *mut IntelEngineCs) {
     let i915 = (*engine).i915;
 
-    if (*engine).class == VIDEO_DECODE_CLASS {
+    if (*engine).class as i32 == VIDEO_DECODE_CLASS {
         if GRAPHICS_VER(i915) >= 11 || (GRAPHICS_VER(i915) >= 9 && (*engine).instance == 0) {
             (*engine).uabi_capabilities |= I915_VIDEO_CLASS_CAPABILITY_HEVC;
         }
@@ -1442,7 +958,7 @@ unsafe fn __setup_engine_capabilities(engine: *mut IntelEngineCs) {
         {
             (*engine).uabi_capabilities |= I915_VIDEO_AND_ENHANCE_CLASS_CAPABILITY_SFC;
         }
-    } else if (*engine).class == VIDEO_ENHANCEMENT_CLASS {
+    } else if (*engine).class as i32 == VIDEO_ENHANCEMENT_CLASS {
         if GRAPHICS_VER(i915) >= 9
             && ((*(*engine).gt).info.sfc_mask & BIT!((*engine).instance)) != 0
         {
@@ -1684,7 +1200,7 @@ unsafe fn populate_logical_ids(
 
 // upstream: intel_engine_cs.c setup_logical_ids()
 unsafe fn setup_logical_ids(gt: *mut IntelGt, logical_ids: *mut u8, class: u8) {
-    if MEDIA_VER((*gt).i915) >= 11 && class == VIDEO_DECODE_CLASS {
+    if MEDIA_VER((*gt).i915) >= 11 && class as i32 == VIDEO_DECODE_CLASS {
         let map: [u8; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
         populate_logical_ids(gt, logical_ids, class, map.as_ptr(), ARRAY_SIZE(map));
     } else {
@@ -1924,32 +1440,32 @@ unsafe fn intel_engine_init_tlb_invalidation(engine: *mut IntelEngineCs) -> i32 
 
     match table {
         TlbInvRegTable::Gen8 => match class {
-            RENDER_CLASS => reg.reg.reg = GEN8_RTCR,
-            VIDEO_DECODE_CLASS => reg.reg.reg = GEN8_M1TCR,
-            VIDEO_ENHANCEMENT_CLASS => reg.reg.reg = GEN8_VTCR,
-            COPY_ENGINE_CLASS => reg.reg.reg = GEN8_BTCR,
+            RENDER_CLASS_U8 => reg.reg.reg = GEN8_RTCR,
+            VIDEO_DECODE_CLASS_U8 => reg.reg.reg = GEN8_M1TCR,
+            VIDEO_ENHANCEMENT_CLASS_U8 => reg.reg.reg = GEN8_VTCR,
+            COPY_ENGINE_CLASS_U8 => reg.reg.reg = GEN8_BTCR,
             _ => (),
         },
         TlbInvRegTable::Gen12 => match class {
-            RENDER_CLASS => reg.reg.reg = GEN12_GFX_TLB_INV_CR,
-            VIDEO_DECODE_CLASS => reg.reg.reg = GEN12_VD_TLB_INV_CR,
-            VIDEO_ENHANCEMENT_CLASS => reg.reg.reg = GEN12_VE_TLB_INV_CR,
-            COPY_ENGINE_CLASS => reg.reg.reg = GEN12_BLT_TLB_INV_CR,
-            COMPUTE_CLASS => reg.reg.reg = GEN12_COMPCTX_TLB_INV_CR,
+            RENDER_CLASS_U8 => reg.reg.reg = GEN12_GFX_TLB_INV_CR,
+            VIDEO_DECODE_CLASS_U8 => reg.reg.reg = GEN12_VD_TLB_INV_CR,
+            VIDEO_ENHANCEMENT_CLASS_U8 => reg.reg.reg = GEN12_VE_TLB_INV_CR,
+            COPY_ENGINE_CLASS_U8 => reg.reg.reg = GEN12_BLT_TLB_INV_CR,
+            COMPUTE_CLASS_U8 => reg.reg.reg = GEN12_COMPCTX_TLB_INV_CR,
             _ => (),
         },
         TlbInvRegTable::Xehp => match class {
-            RENDER_CLASS => reg.mcr_reg.reg = XEHP_GFX_TLB_INV_CR,
-            VIDEO_DECODE_CLASS => reg.mcr_reg.reg = XEHP_VD_TLB_INV_CR,
-            VIDEO_ENHANCEMENT_CLASS => reg.mcr_reg.reg = XEHP_VE_TLB_INV_CR,
-            COPY_ENGINE_CLASS => reg.mcr_reg.reg = XEHP_BLT_TLB_INV_CR,
-            COMPUTE_CLASS => reg.mcr_reg.reg = XEHP_COMPCTX_TLB_INV_CR,
+            RENDER_CLASS_U8 => reg.mcr_reg.reg = XEHP_GFX_TLB_INV_CR,
+            VIDEO_DECODE_CLASS_U8 => reg.mcr_reg.reg = XEHP_VD_TLB_INV_CR,
+            VIDEO_ENHANCEMENT_CLASS_U8 => reg.mcr_reg.reg = XEHP_VE_TLB_INV_CR,
+            COPY_ENGINE_CLASS_U8 => reg.mcr_reg.reg = XEHP_BLT_TLB_INV_CR,
+            COMPUTE_CLASS_U8 => reg.mcr_reg.reg = XEHP_COMPCTX_TLB_INV_CR,
             _ => (),
         },
         TlbInvRegTable::Xelpmp => match class {
-            VIDEO_DECODE_CLASS => reg.reg.reg = GEN12_VD_TLB_INV_CR,
-            VIDEO_ENHANCEMENT_CLASS => reg.reg.reg = GEN12_VE_TLB_INV_CR,
-            OTHER_CLASS => reg.reg.reg = XELPMP_GSC_TLB_INV_CR,
+            VIDEO_DECODE_CLASS_U8 => reg.reg.reg = GEN12_VD_TLB_INV_CR,
+            VIDEO_ENHANCEMENT_CLASS_U8 => reg.reg.reg = GEN12_VE_TLB_INV_CR,
+            OTHER_CLASS_U8 => reg.reg.reg = XELPMP_GSC_TLB_INV_CR,
             _ => (),
         },
         TlbInvRegTable::None => (),
@@ -1962,10 +1478,10 @@ unsafe fn intel_engine_init_tlb_invalidation(engine: *mut IntelEngineCs) -> i32 
         return -ERANGE;
     }
 
-    if table == TlbInvRegTable::Xelpmp && class == OTHER_CLASS {
+    if table == TlbInvRegTable::Xelpmp && class as i32 == OTHER_CLASS {
         GEM_WARN_ON!(instance != OTHER_GSC_INSTANCE);
         val = 1;
-    } else if table == TlbInvRegTable::Gen8 && class == VIDEO_DECODE_CLASS && instance == 1 {
+    } else if table == TlbInvRegTable::Gen8 && class as i32 == VIDEO_DECODE_CLASS && instance == 1 {
         reg.reg.reg = GEN8_M2TCR;
         val = 0;
     } else {
@@ -1979,10 +1495,10 @@ unsafe fn intel_engine_init_tlb_invalidation(engine: *mut IntelEngineCs) -> i32 
     (*engine).tlb_inv.done = val;
 
     if GRAPHICS_VER(i915) >= 12
-        && ((*engine).class == VIDEO_DECODE_CLASS
-            || (*engine).class == VIDEO_ENHANCEMENT_CLASS
-            || (*engine).class == COMPUTE_CLASS
-            || (*engine).class == OTHER_CLASS)
+        && ((*engine).class as i32 == VIDEO_DECODE_CLASS
+            || (*engine).class as i32 == VIDEO_ENHANCEMENT_CLASS
+            || (*engine).class as i32 == COMPUTE_CLASS
+            || (*engine).class as i32 == OTHER_CLASS)
     {
         (*engine).tlb_inv.request = REG_MASKED_FIELD_ENABLE!(val);
     } else {
@@ -2219,10 +1735,10 @@ pub unsafe fn intel_engines_init(gt: *mut IntelGt) -> i32 {
     let mut id: IntelEngineId;
     let mut err: i32;
 
-    if intel_uc_uses_guc_submission(&mut (*gt).uc) {
+    if unsafe { intel_uc_uses_guc_submission(core::ptr::addr_of_mut!((*gt).uc)) } {
         (*gt).submission_method = INTEL_SUBMISSION_GUC;
         setup = intel_guc_submission_setup;
-    } else if HAS_EXECLISTS((*gt).i915) {
+    } else if unsafe { HAS_EXECLISTS((*gt).i915) } {
         (*gt).submission_method = INTEL_SUBMISSION_ELSP;
         setup = intel_execlists_submission_setup;
     } else {
@@ -2655,7 +2171,7 @@ pub unsafe fn intel_engine_can_store_dword(engine: *mut IntelEngineCs) -> bool {
         2 => false,
         3 => !(IS_I915G((*engine).i915) || IS_I915GM((*engine).i915)),
         4 => !IS_I965G((*engine).i915),
-        6 => (*engine).class != VIDEO_DECODE_CLASS,
+        6 => (*engine).class as i32 != VIDEO_DECODE_CLASS,
         _ => true,
     }
 }
@@ -3189,7 +2705,7 @@ unsafe fn engine_dump_active_requests(engine: *mut IntelEngineCs, m: *mut DrmPri
         drm_printf!(m, "\t\tGot hung ce but no hung rq!\n");
     }
 
-    if intel_uc_uses_guc_submission(&mut (*(*engine).gt).uc) {
+    if unsafe { intel_uc_uses_guc_submission(core::ptr::addr_of_mut!((*(*engine).gt).uc)) } {
         intel_guc_dump_active_requests(engine, hung_rq, m);
     } else {
         intel_execlists_dump_active_requests(engine, hung_rq, m);
@@ -3311,7 +2827,9 @@ unsafe fn engine_execlist_find_hung_request(engine: *mut IntelEngineCs) -> *mut 
     let mut request: *mut I915Request;
     let mut active: *mut I915Request = core::ptr::null_mut();
 
-    GEM_BUG_ON!(intel_uc_uses_guc_submission(&mut (*(*engine).gt).uc));
+    GEM_BUG_ON!(unsafe {
+        intel_uc_uses_guc_submission(core::ptr::addr_of_mut!((*(*engine).gt).uc))
+    });
 
     lockdep_assert_held(&mut (*(*engine).sched_engine).lock);
 
@@ -3366,7 +2884,7 @@ pub unsafe fn intel_engine_get_hung_entity(
         return;
     }
 
-    if intel_uc_uses_guc_submission(&mut (*(*engine).gt).uc) {
+    if unsafe { intel_uc_uses_guc_submission(core::ptr::addr_of_mut!((*(*engine).gt).uc)) } {
         return;
     }
 

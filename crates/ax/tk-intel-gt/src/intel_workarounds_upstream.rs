@@ -5,82 +5,31 @@
 // bounded to the translated Gen12+ subset; upstream MMIO/GT operations are
 // binding points and must not be replaced by no-op compatibility shims.
 
+// Header-owned types come from intel_workarounds_types_upstream; the C source
+// provides these construction helpers only.
+pub use crate::intel_workarounds_types_upstream::{
+    I915McrRegT as I915McrReg, I915RegT as I915Reg, I915Wa, I915WaList, I915WaReg,
+};
 use crate::{
     intel_context_upstream::{I915GemWwCtx, I915Request, I915Vma, IntelContext},
-    intel_engine_cs_upstream::{
-        COMPUTE_CLASS, COPY_ENGINE_CLASS, IntelEngineCs, IntelGt, RENDER_CLASS, Spinlock,
-        VIDEO_DECODE_CLASS,
+    intel_engine_types_upstream::{
+        COMPUTE_CLASS, COPY_ENGINE_CLASS, IntelEngineCs, RENDER_CLASS, VIDEO_DECODE_CLASS,
     },
+    intel_gt_types_upstream::{IntelGt, IntelMmioRange as I915MmioRange},
+    intel_uncore_types_upstream::*,
     linux_config::*,
     linux_list::*,
 };
 
-// Prefix fields from intel_uncore.h through the lock used by this translation.
-// The rest of intel_uncore is not accessed here; its true object remains owned
-// by the kernel Uncore implementation.
-#[repr(C)]
-pub struct IntelUncore {
-    regs: *mut core::ffi::c_void,
-    i915: *mut core::ffi::c_void,
-    gt: *mut IntelGt,
-    rpm: *mut core::ffi::c_void,
-    lock: Spinlock,
-}
-
-type ForcewakeDomains = i32;
-
-// Exact layouts from i915_reg_defs.h and intel_workarounds_types.h.  The
-// register union is represented explicitly because C exposes it anonymously.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct I915Reg {
-    pub reg: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct I915McrReg {
-    pub reg: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union I915WaReg {
-    pub reg: I915Reg,
-    pub mcr_reg: I915McrReg,
-}
-
-impl Default for I915WaReg {
-    fn default() -> Self {
-        Self {
-            reg: I915Reg::default(),
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct I915Wa {
-    pub reg: I915WaReg,
-    pub clr: u32,
-    pub set: u32,
-    pub read: u32,
-    pub flags: u32,
-}
-
 impl I915Wa {
-    fn masked_reg(&self) -> bool {
-        self.flags & 1 != 0
-    }
-    fn is_mcr(&self) -> bool {
-        self.flags & 2 != 0
-    }
     unsafe fn reg(&self) -> I915Reg {
-        self.reg.reg
+        unsafe { self.reg.reg }
     }
+
     unsafe fn mcr_reg(&self) -> I915McrReg {
-        self.reg.mcr_reg
+        unsafe { self.reg.mcr_reg }
     }
+
     fn normal(reg: I915Reg, clr: u32, set: u32, read: u32, masked: bool) -> Self {
         Self {
             reg: I915WaReg { reg },
@@ -90,6 +39,7 @@ impl I915Wa {
             flags: masked as u32,
         }
     }
+
     fn multicast(reg: I915McrReg, clr: u32, set: u32, read: u32, masked: bool) -> Self {
         Self {
             reg: I915WaReg { mcr_reg: reg },
@@ -100,33 +50,6 @@ impl I915Wa {
         }
     }
 }
-
-#[repr(C)]
-pub struct I915WaList {
-    pub gt: *mut IntelGt,
-    pub name: *const i8,
-    pub engine_name: *const i8,
-    pub list: *mut I915Wa,
-    pub count: u32,
-    pub wa_count: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct I915MmioRange {
-    start: u32,
-    end: u32,
-}
-
-const _: () = {
-    assert!(core::mem::offset_of!(IntelUncore, lock) == 32);
-    assert!(core::mem::size_of::<I915Reg>() == 4);
-    assert!(core::mem::size_of::<I915McrReg>() == 4);
-    assert!(core::mem::size_of::<I915Wa>() == 20);
-    assert!(core::mem::offset_of!(I915Wa, clr) == 4);
-    assert!(core::mem::offset_of!(I915Wa, flags) == 16);
-    assert!(core::mem::size_of::<I915WaList>() == 40);
-};
 
 // The source file is 3,131 lines and contains legacy platform paths outside
 // this transcription's current coverage. Gen12 and later context/GT paths,
@@ -709,7 +632,7 @@ unsafe fn __intel_engine_init_ctx_wa(
     wa_init_finish(wal);
 }
 // upstream: intel_workarounds.c intel_engine_init_ctx_wa()
-unsafe fn intel_engine_init_ctx_wa(engine: *mut IntelEngineCs) {
+pub(crate) unsafe fn intel_engine_init_ctx_wa(engine: *mut IntelEngineCs) {
     __intel_engine_init_ctx_wa(engine, &mut (*engine).ctx_wa_list, c"context".as_ptr());
 }
 
@@ -1434,7 +1357,7 @@ unsafe fn xelpg_whitelist_build(engine: *mut IntelEngineCs) {
     dg2_whitelist_build(engine);
 }
 // upstream: intel_workarounds.c intel_engine_init_whitelist()
-unsafe fn intel_engine_init_whitelist(engine: *mut IntelEngineCs) {
+pub(crate) unsafe fn intel_engine_init_whitelist(engine: *mut IntelEngineCs) {
     let i915 = (*engine).i915;
     let w = &mut (*engine).whitelist;
     wa_init_start(w, (*engine).gt, c"whitelist".as_ptr(), (*engine).name);
@@ -1465,7 +1388,7 @@ unsafe fn intel_engine_init_whitelist(engine: *mut IntelEngineCs) {
     wa_init_finish(w);
 }
 // upstream: intel_workarounds.c intel_engine_apply_whitelist()
-unsafe fn intel_engine_apply_whitelist(engine: *mut IntelEngineCs) {
+pub(crate) unsafe fn intel_engine_apply_whitelist(engine: *mut IntelEngineCs) {
     let wal = &(*engine).whitelist;
     if wal.count == 0 {
         return;
@@ -1868,14 +1791,14 @@ unsafe fn engine_init_workarounds(engine: *mut IntelEngineCs, wal: *mut I915WaLi
     }
 }
 // upstream: intel_workarounds.c intel_engine_init_workarounds()
-unsafe fn intel_engine_init_workarounds(engine: *mut IntelEngineCs) {
+pub(crate) unsafe fn intel_engine_init_workarounds(engine: *mut IntelEngineCs) {
     let wal = &mut (*engine).wa_list;
     wa_init_start(wal, (*engine).gt, c"engine".as_ptr(), (*engine).name);
     engine_init_workarounds(engine, wal);
     wa_init_finish(wal);
 }
 // upstream: intel_workarounds.c intel_engine_apply_workarounds()
-unsafe fn intel_engine_apply_workarounds(engine: *mut IntelEngineCs) {
+pub(crate) unsafe fn intel_engine_apply_workarounds(engine: *mut IntelEngineCs) {
     wa_list_apply(&(*engine).wa_list);
 }
 

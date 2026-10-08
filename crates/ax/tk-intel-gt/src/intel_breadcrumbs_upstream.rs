@@ -10,13 +10,15 @@
 use core::ffi::c_ulong;
 
 use crate::{
-    intel_context_upstream::*, intel_engine_cs_upstream::*, linux_config::*, linux_list::*,
+    i915_request_types_upstream::*, intel_breadcrumbs_types_upstream::IntelBreadcrumbs,
+    intel_context_types_upstream::*, intel_context_upstream::*, intel_engine_cs_upstream::*,
+    intel_engine_types_upstream::IntelEngineCs, intel_gt_types_upstream::IntelGt,
+    intel_timeline_types_upstream::IntelTimeline, linux_config::*, linux_list::*,
 };
 
-// Bindings supplied by the later integration layer: IntelBreadcrumbs,
-// IntelEngineCs, IntelContext, I915Request, IntelTimeline, DmaFence, KtimeT,
-// LlistNode, IrqWork, Kref, DrmPrinter, Linux list/RCU/bit/locking helpers,
-// power-management helpers, allocation helpers, trace hooks, and BUG macros.
+// Header-owned breadcrumb, engine, context, request and timeline records are
+// imported above. Remaining Linux GEM/RCU/locking/PM services, allocation,
+// trace hooks and BUG helpers are explicit integration boundaries.
 
 // upstream: intel_breadcrumbs.c irq_enable()
 unsafe fn irq_enable(b: *mut IntelBreadcrumbs) -> bool {
@@ -348,7 +350,7 @@ unsafe fn __intel_breadcrumbs_park(b: *mut IntelBreadcrumbs) {
 
 // upstream: intel_breadcrumbs.c intel_breadcrumbs_free()
 unsafe fn intel_breadcrumbs_free(kref: *mut Kref) {
-    let b = container_of!(kref, IntelBreadcrumbs, ref_);
+    let b = container_of!(kref, IntelBreadcrumbs, r#ref);
 
     irq_work_sync(&mut (*b).irq_work);
     GEM_BUG_ON!(!list_empty(&(*b).signalers));
@@ -554,7 +556,10 @@ unsafe fn print_signals(b: *mut IntelBreadcrumbs, p: *mut DrmPrinter) {
 }
 
 // upstream: intel_breadcrumbs.c intel_engine_print_breadcrumbs()
-unsafe fn intel_engine_print_breadcrumbs(engine: *mut IntelEngineCs, p: *mut DrmPrinter) {
+pub(crate) unsafe fn intel_engine_print_breadcrumbs(
+    engine: *mut IntelEngineCs,
+    p: *mut DrmPrinter,
+) {
     let b: *mut IntelBreadcrumbs;
 
     b = (*engine).breadcrumbs;

@@ -9,9 +9,15 @@
 use core::{ffi::c_void, mem::size_of};
 
 use crate::{
+    i915_request_types_upstream::*,
+    i915_scheduler_types_upstream::*,
+    intel_context_types_upstream::*,
     intel_context_upstream::*,
     intel_engine_cs_upstream::{I915WaContextBatch as I915WaCtxBb, *},
+    intel_engine_types_upstream::IntelEngineCs,
+    intel_gt_types_upstream::IntelGt,
     intel_ring::{CACHELINE_BYTES, PAGE_SIZE},
+    intel_timeline_types_upstream::IntelTimeline,
     linux_config::*,
     linux_list::*,
 };

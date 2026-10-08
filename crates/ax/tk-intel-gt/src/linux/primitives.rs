@@ -231,6 +231,14 @@ pub fn ktime_get() -> i64 {
     axhal::time::monotonic_time_nanos() as i64
 }
 
+/// Linux `ktime_get_raw_fast_ns()` binding. The configured TheKernel time
+/// source is a hardware-backed monotonic counter with no wall-clock/NTP
+/// adjustment, matching the raw monotonic domain required by i915's LRC stats.
+#[inline]
+pub fn ktime_get_raw_fast_ns() -> u64 {
+    axhal::time::monotonic_time_nanos()
+}
+
 /// `ARRAY_SIZE(array)` for fixed C-layout Rust arrays.
 #[allow(non_snake_case)]
 #[inline]

@@ -20,11 +20,13 @@ use crate::{
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct XArrayHeader {
-    xa_lock: Spinlock,
-    xa_flags: u32,
+pub struct XArray {
+    pub(crate) xa_lock: Spinlock,
+    pub(crate) xa_flags: u32,
     xa_head: *mut XaEntries,
 }
+
+type XArrayHeader = XArray;
 
 #[derive(Default)]
 struct XaEntries {

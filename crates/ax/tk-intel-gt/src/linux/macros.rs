@@ -332,3 +332,22 @@ macro_rules! INIT_RADIX_TREE {
         __root.rnode = core::ptr::null_mut();
     }};
 }
+
+// `mutex_release()` / `mutex_acquire()` are disabled inline helpers when the
+// source kernel is built without CONFIG_LOCKDEP. The disabled expansion does
+// not evaluate (or type-check) its lockdep_map arguments.
+macro_rules! mutex_release {
+    ($($argument:tt)*) => {{
+        if crate::linux_config::CONFIG_LOCKDEP {
+            panic!("CONFIG_LOCKDEP mutex release backend is not configured");
+        }
+    }};
+}
+
+macro_rules! mutex_acquire {
+    ($($argument:tt)*) => {{
+        if crate::linux_config::CONFIG_LOCKDEP {
+            panic!("CONFIG_LOCKDEP mutex acquire backend is not configured");
+        }
+    }};
+}

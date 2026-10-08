@@ -13,12 +13,26 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
-pub use crate::intel_timeline_types_upstream::{I915Syncmap, IntelTimeline};
+pub use crate::i915_vma_resource_types_upstream::{I915PageSizes, I915VmaResource};
 use crate::{
-    intel_engine_cs_upstream::{
-        AtomicT, DelayedWork, IntelEngineCs, IntelGt, IntelSseu, ListHead, LlistHead, LlistNode,
-        Mutex, RbNode, RbRoot, RbRootCached, Spinlock, WorkStruct,
+    i915_gem_context_types_upstream::I915GemContext,
+    i915_request_types_upstream::*,
+    i915_scheduler_types_upstream::{
+        I915Dependency, I915Priolist, I915SchedAttr, I915SchedEngine, I915SchedNode, TaskletStruct,
     },
+    intel_context_types_upstream::*,
+    intel_timeline_types_upstream::{I915Syncmap, IntelTimeline},
+};
+pub type IntelWakerefHandle = crate::intel_context_types_upstream::IntelWakerefT;
+pub type RefTracker = IntelRefTracker;
+use crate::{
+    guc_submission::GUC_INVALID_CONTEXT_ID,
+    intel_engine_cs_upstream::{
+        AtomicT, DelayedWork, IntelSseu, ListHead, LlistHead, LlistNode, Mutex, RbNode, RbRoot,
+        RbRootCached, Spinlock, WorkStruct,
+    },
+    intel_engine_types_upstream::IntelEngineCs,
+    intel_gt_types_upstream::IntelGt,
     linux::gem_memory::IntelMemoryRegion,
     linux_config::*,
     linux_heap::{
@@ -59,9 +73,9 @@ pub union DmaFenceLock {
 
 #[repr(C)]
 pub union DmaFenceTimestamp {
-    pub cb_list: ListHead,
+    pub cb_list: ManuallyDrop<ListHead>,
     pub timestamp: i64,
-    pub rcu: RcuHead,
+    pub rcu: ManuallyDrop<RcuHead>,
 }
 
 #[repr(C)]
@@ -95,11 +109,6 @@ pub struct DmaFenceCb {
 }
 
 #[repr(C)]
-pub struct ActiveNode {
-    _opaque: [u8; 0],
-}
-
-#[repr(C)]
 pub struct WaitQueueHead {
     pub lock: Spinlock,
     pub head: ListHead,
@@ -109,54 +118,6 @@ pub struct WaitQueueHead {
 pub struct I915ActiveFence {
     pub fence: *mut DmaFence,
     pub cb: DmaFenceCb,
-}
-
-#[repr(C)]
-pub struct I915Active {
-    pub count: AtomicT,
-    pub mutex: Mutex,
-    pub tree_lock: Spinlock,
-    pub cache: *mut ActiveNode,
-    pub tree: RbRoot,
-    pub excl: I915ActiveFence,
-    pub flags: c_ulong,
-    pub active: Option<unsafe fn(*mut I915Active) -> i32>,
-    pub retire: Option<unsafe fn(*mut I915Active)>,
-    pub work: WorkStruct,
-    pub preallocated_barriers: LlistHead,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub enum I915SwFenceNotify {
-    FenceComplete = 0,
-    FenceFree     = 1,
-}
-
-#[repr(C)]
-pub struct I915SwFence {
-    pub wait: WaitQueueHead,
-    pub fn_: Option<unsafe fn(*mut I915SwFence, I915SwFenceNotify) -> i32>,
-    pub pending: AtomicT,
-    pub error: i32,
-}
-
-#[repr(C)]
-pub struct EwmaRuntime {
-    pub internal: c_ulong,
-}
-
-#[repr(C)]
-pub struct IntelContextRuntimeStats {
-    pub avg: EwmaRuntime,
-    pub total: u64,
-    pub last: u32,
-}
-
-#[repr(C)]
-pub struct IntelContextStats {
-    pub active: u64,
-    pub runtime: IntelContextRuntimeStats,
 }
 
 #[repr(C)]
@@ -204,20 +165,6 @@ const _: [(); 488] = [(); core::mem::offset_of!(I915AddressSpace, bound_list)];
 const _: [(); 520] = [(); core::mem::offset_of!(I915AddressSpace, vm_flags)];
 
 #[repr(C)]
-pub struct I915GemContext {
-    pub i915: *mut c_void,
-    pub file_priv: *mut c_void,
-    _before_handles_vma: [u8; 248],
-    pub handles_vma: XArray,
-    pub lut_mutex: Mutex,
-    _tail: [u8; 48],
-}
-const _: [(); 352] = [(); core::mem::size_of::<I915GemContext>()];
-const _: [(); 8] = [(); core::mem::offset_of!(I915GemContext, file_priv)];
-const _: [(); 264] = [(); core::mem::offset_of!(I915GemContext, handles_vma)];
-const _: [(); 280] = [(); core::mem::offset_of!(I915GemContext, lut_mutex)];
-
-#[repr(C)]
 pub struct XArray {
     pub xa_lock: Spinlock,
     pub xa_flags: u32,
@@ -246,17 +193,6 @@ pub struct I915GttView {
 const _: [(); 56] = [(); core::mem::size_of::<I915GttView>()];
 const _: [(); 0] = [(); core::mem::offset_of!(I915GttView, r#type)];
 
-#[repr(C)]
-pub struct I915PageSizes {
-    pub phys: u32,
-    pub sg: u32,
-}
-
-#[repr(C, align(8))]
-pub union I915RequestSubmitUnion {
-    pub _opaque: [u64; 5],
-}
-
 #[repr(C, align(8))]
 pub struct IrqWork {
     pub node: IrqWorkNode,
@@ -273,21 +209,6 @@ pub struct IrqWorkNode {
 }
 
 #[repr(C, align(8))]
-pub struct I915SchedNode {
-    pub signalers_list: ListHead,
-    pub waiters_list: ListHead,
-    pub link: ListHead,
-    pub attr: I915SchedAttr,
-    pub flags: u32,
-    pub semaphores: u32,
-}
-
-#[repr(C, align(8))]
-pub struct I915Dependency {
-    _opaque: [u8; 72],
-}
-
-#[repr(C, align(8))]
 pub struct Hrtimer {
     _opaque: [u8; 80],
 }
@@ -298,56 +219,6 @@ pub struct WaitQueueEntry {
     pub private: *mut c_void,
     pub func: Option<unsafe extern "C" fn(*mut WaitQueueEntry, u32, i32, *mut c_void) -> i32>,
     pub entry: ListHead,
-}
-
-#[repr(C)]
-pub struct I915RequestWatchdog {
-    pub link: LlistNode,
-    pub timer: Hrtimer,
-}
-
-#[repr(C)]
-pub struct I915Priolist {
-    pub requests: ListHead,
-    pub node: RbNode,
-    pub priority: i32,
-}
-
-#[repr(C)]
-pub struct I915SchedAttr {
-    pub priority: i32,
-}
-
-#[repr(C)]
-pub struct TaskletStruct {
-    pub next: *mut TaskletStruct,
-    pub state: c_ulong,
-    pub count: AtomicT,
-    pub use_callback: bool,
-    // Same 8-byte anonymous-union slot as tasklet_struct.func; registered
-    // i915 submission paths select and access the callback arm.
-    pub callback: Option<unsafe fn(*mut TaskletStruct)>,
-    pub data: c_ulong,
-}
-
-#[repr(C)]
-pub struct I915SchedEngine {
-    pub r#ref: Kref,
-    pub lock: Spinlock,
-    pub requests: ListHead,
-    pub hold: ListHead,
-    pub tasklet: TaskletStruct,
-    pub default_priolist: I915Priolist,
-    pub queue_priority_hint: i32,
-    pub queue: RbRootCached,
-    pub no_priolist: bool,
-    pub private_data: *mut c_void,
-    pub destroy: Option<unsafe fn(*mut Kref)>,
-    pub disabled: Option<unsafe fn(*mut I915SchedEngine) -> bool>,
-    pub kick_backend: Option<unsafe fn(*const I915Request, i32)>,
-    pub bump_inflight_request_prio: Option<unsafe fn(*mut I915Request, i32)>,
-    pub retire_inflight_request_prio: Option<unsafe fn(*mut I915Request)>,
-    pub schedule: Option<unsafe fn(*mut I915Request, *const I915SchedAttr)>,
 }
 
 #[repr(C)]
@@ -389,55 +260,6 @@ pub struct DrmVmaOffsetNode {
     _opaque: [u8; 192],
 }
 const _: [(); 192] = [(); core::mem::size_of::<DrmVmaOffsetNode>()];
-#[repr(C)]
-pub struct I915VmaResource {
-    _opaque: [u8; 0],
-}
-#[repr(C)]
-pub struct I915CaptureList {
-    _opaque: [u8; 0],
-}
-
-// CONFIG_DRM_I915_CAPTURE_ERROR is enabled in the source kernel build used
-// for these layouts, so capture_list is present in I915Request.
-#[repr(C)]
-pub struct I915Request {
-    pub fence: DmaFence,
-    pub lock: Spinlock,
-    pub i915: *mut c_void,
-    pub engine: *mut IntelEngineCs,
-    pub context: *mut IntelContext,
-    pub ring: *mut IntelRing,
-    pub timeline: *mut IntelTimeline,
-    pub signal_link: ListHead,
-    pub signal_node: LlistNode,
-    pub rcustate: c_ulong,
-    pub cookie: PinCookie,
-    pub submit: I915SwFence,
-    pub submit_union: I915RequestSubmitUnion,
-    pub execute_cb: LlistHead,
-    pub semaphore: I915SwFence,
-    pub submit_work: IrqWork,
-    pub sched: I915SchedNode,
-    pub dep: I915Dependency,
-    pub execution_mask: u32,
-    pub hwsp_seqno: *const u32,
-    pub head: u32,
-    pub infix: u32,
-    pub postfix: u32,
-    pub tail: u32,
-    pub wa_tail: u32,
-    pub reserved_space: u32,
-    pub batch_res: *mut I915VmaResource,
-    pub capture_list: *mut I915CaptureList,
-    pub emitted_jiffies: c_ulong,
-    pub link: ListHead,
-    pub watchdog: I915RequestWatchdog,
-    pub guc_fence_link: ListHead,
-    pub guc_prio: u8,
-    pub hucq: WaitQueueEntry,
-}
-
 #[repr(C)]
 pub struct I915Vma {
     pub node: DrmMmNode,
@@ -582,18 +404,17 @@ const _: [(); 248] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, resv)];
 const _: [(); 336] = [(); core::mem::offset_of!(DrmGemObjectBaseLayout, funcs)];
 const _: [(); 32] = [(); core::mem::size_of::<I915GemObjectVmaLayout>()];
 const _: [(); 16] = [(); core::mem::size_of::<I915GemObjectMmoLayout>()];
-const _: [(); 688] = [(); core::mem::size_of::<DrmI915GemObjectPrefix>()];
-const _: [(); 480] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, ops)];
-const _: [(); 488] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, vma)];
-const _: [(); 520] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, lut_list)];
-const _: [(); 608] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, userfault_count)];
-const _: [(); 632] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, mmo)];
-const _: [(); 648] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, flags)];
-const _: [(); 660] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, cache_bits)];
-const _: [(); 662] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, read_domains)];
-const _: [(); 664] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, write_domain)];
-const _: [(); 672] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, frontbuffer)];
-const _: [(); 680] = [(); core::mem::offset_of!(DrmI915GemObjectPrefix, tiling_and_stride)];
+const _: [(); 480] = [(); core::mem::offset_of!(DrmI915GemObject, ops)];
+const _: [(); 488] = [(); core::mem::offset_of!(DrmI915GemObject, vma)];
+const _: [(); 520] = [(); core::mem::offset_of!(DrmI915GemObject, lut_list)];
+const _: [(); 608] = [(); core::mem::offset_of!(DrmI915GemObject, userfault_count)];
+const _: [(); 632] = [(); core::mem::offset_of!(DrmI915GemObject, mmo)];
+const _: [(); 648] = [(); core::mem::offset_of!(DrmI915GemObject, flags)];
+const _: [(); 660] = [(); core::mem::offset_of!(DrmI915GemObject, cache_bits)];
+const _: [(); 662] = [(); core::mem::offset_of!(DrmI915GemObject, read_domains)];
+const _: [(); 664] = [(); core::mem::offset_of!(DrmI915GemObject, write_domain)];
+const _: [(); 672] = [(); core::mem::offset_of!(DrmI915GemObject, frontbuffer)];
+const _: [(); 680] = [(); core::mem::offset_of!(DrmI915GemObject, tiling_and_stride)];
 
 #[repr(C, align(8))]
 pub struct DrmI915GemObject {
@@ -660,8 +481,6 @@ const _: [(); 168] = [(); core::mem::size_of::<DrmMmNode>()];
 const _: [(); 8] = [(); core::mem::align_of::<DrmMmNode>()];
 const _: [(); 56] = [(); core::mem::size_of::<I915GttView>()];
 const _: [(); 8] = [(); core::mem::align_of::<I915GttView>()];
-const _: [(); 8] = [(); core::mem::size_of::<I915PageSizes>()];
-const _: [(); 4] = [(); core::mem::align_of::<I915PageSizes>()];
 const _: [(); 584] = [(); core::mem::size_of::<I915Vma>()];
 const _: [(); 8] = [(); core::mem::align_of::<I915Vma>()];
 const _: [(); 168] = [(); core::mem::offset_of!(I915Vma, vm)];
@@ -677,19 +496,6 @@ const _: [(); 8] = [(); core::mem::offset_of!(IntelRing, vma)];
 const _: [(); 24] = [(); core::mem::offset_of!(IntelRing, pin_count)];
 const _: [(); 28] = [(); core::mem::offset_of!(IntelRing, head)];
 const _: [(); 52] = [(); core::mem::offset_of!(IntelRing, effective_size)];
-const _: [(); 40] = [(); core::mem::size_of::<I915RequestSubmitUnion>()];
-const _: [(); 672] = [(); core::mem::size_of::<I915Request>()];
-const _: [(); 8] = [(); core::mem::align_of::<I915Request>()];
-const _: [(); 88] = [(); core::mem::offset_of!(I915Request, context)];
-const _: [(); 144] = [(); core::mem::offset_of!(I915Request, submit)];
-const _: [(); 184] = [(); core::mem::offset_of!(I915Request, submit_union)];
-const _: [(); 304] = [(); core::mem::offset_of!(I915Request, sched)];
-const _: [(); 368] = [(); core::mem::offset_of!(I915Request, dep)];
-const _: [(); 440] = [(); core::mem::offset_of!(I915Request, execution_mask)];
-const _: [(); 480] = [(); core::mem::offset_of!(I915Request, batch_res)];
-const _: [(); 488] = [(); core::mem::offset_of!(I915Request, capture_list)];
-const _: [(); 520] = [(); core::mem::offset_of!(I915Request, watchdog)];
-const _: [(); 632] = [(); core::mem::offset_of!(I915Request, hucq)];
 const _: [(); 240] = [(); core::mem::size_of::<I915GemObjectMm>()];
 const _: [(); 8] = [(); core::mem::align_of::<I915GemObjectMm>()];
 const _: [(); 224] = [(); core::mem::offset_of!(I915GemObjectMm, madv_dirty)];
@@ -698,248 +504,6 @@ const _: [(); 688] = [(); core::mem::offset_of!(DrmI915GemObject, mm)];
 const _: [(); 912] = [(); core::mem::offset_of!(DrmI915GemObject, mm)
     + core::mem::offset_of!(I915GemObjectMm, madv_dirty)];
 const _: [(); 32] = [(); core::mem::size_of::<I915ActiveFence>()];
-const _: [(); 48] = [(); core::mem::size_of::<I915Priolist>()];
-const _: [(); 64] = [(); core::mem::size_of::<I915SchedNode>()];
-const _: [(); 32] = [(); core::mem::offset_of!(I915SchedNode, link)];
-const _: [(); 48] = [(); core::mem::offset_of!(I915SchedNode, attr)];
-const _: [(); 0] = [(); core::mem::offset_of!(I915Priolist, requests)];
-const _: [(); 16] = [(); core::mem::offset_of!(I915Priolist, node)];
-const _: [(); 40] = [(); core::mem::offset_of!(I915Priolist, priority)];
-const _: [(); 40] = [(); core::mem::size_of::<TaskletStruct>()];
-const _: [(); 40] = [(); core::mem::size_of::<WaitQueueEntry>()];
-const _: [(); 24] = [(); core::mem::offset_of!(WaitQueueEntry, entry)];
-const _: [(); 32] = [(); core::mem::size_of::<IrqWork>()];
-const _: [(); 16] = [(); core::mem::offset_of!(IrqWork, func)];
-const _: [(); 8] = [(); core::mem::align_of::<TaskletStruct>()];
-const _: [(); 16] = [(); core::mem::offset_of!(TaskletStruct, count)];
-const _: [(); 20] = [(); core::mem::offset_of!(TaskletStruct, use_callback)];
-const _: [(); 24] = [(); core::mem::offset_of!(TaskletStruct, callback)];
-const _: [(); 32] = [(); core::mem::offset_of!(TaskletStruct, data)];
-const _: [(); 216] = [(); core::mem::size_of::<I915SchedEngine>()];
-const _: [(); 8] = [(); core::mem::align_of::<I915SchedEngine>()];
-const _: [(); 4] = [(); core::mem::offset_of!(I915SchedEngine, lock)];
-const _: [(); 8] = [(); core::mem::offset_of!(I915SchedEngine, requests)];
-const _: [(); 24] = [(); core::mem::offset_of!(I915SchedEngine, hold)];
-const _: [(); 40] = [(); core::mem::offset_of!(I915SchedEngine, tasklet)];
-const _: [(); 80] = [(); core::mem::offset_of!(I915SchedEngine, default_priolist)];
-const _: [(); 128] = [(); core::mem::offset_of!(I915SchedEngine, queue_priority_hint)];
-const _: [(); 136] = [(); core::mem::offset_of!(I915SchedEngine, queue)];
-const _: [(); 160] = [(); core::mem::offset_of!(I915SchedEngine, private_data)];
-const _: [(); 168] = [(); core::mem::offset_of!(I915SchedEngine, destroy)];
-const _: [(); 176] = [(); core::mem::offset_of!(I915SchedEngine, disabled)];
-const _: [(); 184] = [(); core::mem::offset_of!(I915SchedEngine, kick_backend)];
-const _: [(); 192] = [(); core::mem::offset_of!(I915SchedEngine, bump_inflight_request_prio)];
-const _: [(); 200] = [(); core::mem::offset_of!(I915SchedEngine, retire_inflight_request_prio)];
-const _: [(); 208] = [(); core::mem::offset_of!(I915SchedEngine, schedule)];
-
-#[repr(C)]
-pub struct RefTracker {
-    _opaque: [u8; 0],
-}
-
-pub type IntelWakerefHandle = *mut RefTracker;
-
-#[repr(C)]
-pub struct IntelContextOps {
-    pub flags: c_ulong,
-    pub alloc: Option<unsafe fn(*mut IntelContext) -> i32>,
-    pub revoke: Option<unsafe fn(*mut IntelContext, *mut I915Request, u32)>,
-    pub close: Option<unsafe fn(*mut IntelContext)>,
-    pub pre_pin: Option<unsafe fn(*mut IntelContext, *mut I915GemWwCtx, *mut *mut c_void) -> i32>,
-    pub pin: Option<unsafe fn(*mut IntelContext, *mut c_void) -> i32>,
-    pub unpin: Option<unsafe fn(*mut IntelContext)>,
-    pub post_unpin: Option<unsafe fn(*mut IntelContext)>,
-    pub cancel_request: Option<unsafe fn(*mut IntelContext, *mut I915Request)>,
-    pub enter: Option<unsafe fn(*mut IntelContext)>,
-    pub exit: Option<unsafe fn(*mut IntelContext)>,
-    pub sched_disable: Option<unsafe fn(*mut IntelContext)>,
-    pub update_stats: Option<unsafe fn(*mut IntelContext)>,
-    pub reset: Option<unsafe fn(*mut IntelContext)>,
-    pub destroy: Option<unsafe fn(*mut Kref)>,
-    pub create_virtual:
-        Option<unsafe fn(*mut *mut IntelEngineCs, u32, c_ulong) -> *mut IntelContext>,
-    pub create_parallel: Option<unsafe fn(*mut *mut IntelEngineCs, u32, u32) -> *mut IntelContext>,
-    pub get_sibling: Option<unsafe fn(*mut IntelEngineCs, u32) -> *mut IntelEngineCs>,
-}
-
-#[repr(C)]
-pub union IntelContextRef {
-    pub refcount: ManuallyDrop<Kref>,
-    pub rcu: ManuallyDrop<RcuHead>,
-}
-
-#[repr(C)]
-pub struct IntelContextWatchdog {
-    pub timeout_us: u64,
-}
-
-#[repr(C)]
-pub union IntelContextLrc {
-    pub desc: u64,
-    pub regs: IntelContextLrcRegs,
-}
-
-// C exposes the 32-bit LRC address/context-id pair through an anonymous
-// struct member of the same union. These integer-only views are valid for all
-// bit patterns and retain the source union's 8-byte size/alignment.
-impl Deref for IntelContextLrc {
-    type Target = IntelContextLrcRegs;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: every u32 bit pattern is valid and both views overlay the
-        // same two dwords in the upstream C union.
-        unsafe { &self.regs }
-    }
-}
-
-impl DerefMut for IntelContextLrc {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: same integer-only union view as Deref above; caller owns
-        // the mutable context record.
-        unsafe { &mut self.regs }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IntelContextLrcRegs {
-    pub lrca: u32,
-    pub ccid: u32,
-}
-
-#[repr(C)]
-pub struct IntelContextGucState {
-    pub lock: Spinlock,
-    pub sched_state: u32,
-    pub fences: ListHead,
-    pub blocked: I915SwFence,
-    pub requests: ListHead,
-    pub prio: u8,
-    pub prio_count: [u32; 4],
-    pub sched_disable_delay_work: DelayedWork,
-}
-
-#[repr(C)]
-pub struct IntelContextGucId {
-    pub id: u16,
-    pub r#ref: AtomicT,
-    pub link: ListHead,
-}
-
-#[repr(C)]
-pub union IntelContextParallelChildLink {
-    pub child_list: ManuallyDrop<ListHead>,
-    pub child_link: ManuallyDrop<ListHead>,
-}
-
-#[repr(C)]
-pub struct IntelContextParallelGuc {
-    pub wqi_head: u16,
-    pub wqi_tail: u16,
-    pub wq_head: *mut u32,
-    pub wq_tail: *mut u32,
-    pub wq_status: *mut u32,
-    pub parent_page: u8,
-}
-
-#[repr(C)]
-pub struct IntelContextParallel {
-    pub children: IntelContextParallelChildLink,
-    pub parent: *mut IntelContext,
-    pub last_rq: *mut I915Request,
-    pub fence_context: u64,
-    pub seqno: u32,
-    pub number_children: u8,
-    pub child_index: u8,
-    pub guc: IntelContextParallelGuc,
-}
-
-#[repr(C)]
-pub struct IntelContext {
-    pub r#ref: IntelContextRef,
-    pub engine: *mut IntelEngineCs,
-    pub inflight: *mut IntelEngineCs,
-    pub vm: *mut I915AddressSpace,
-    pub gem_context: *mut I915GemContext,
-    pub default_state: *mut c_void,
-    pub signal_link: ListHead,
-    pub signals: ListHead,
-    pub signal_lock: Spinlock,
-    pub state: *mut I915Vma,
-    pub ring_size: u32,
-    pub ring: *mut IntelRing,
-    pub timeline: *mut IntelTimeline,
-    pub wakeref: IntelWakerefHandle,
-    pub flags: c_ulong,
-    pub watchdog: IntelContextWatchdog,
-    pub lrc_reg_state: *mut u32,
-    pub lrc: IntelContextLrc,
-    pub tag: u32,
-    pub stats: IntelContextStats,
-    pub active_count: u32,
-    pub pin_count: AtomicT,
-    pub pin_mutex: Mutex,
-    pub active: I915Active,
-    pub ops: *const IntelContextOps,
-    pub sseu: IntelSseu,
-    pub pinned_contexts_link: ListHead,
-    pub wa_bb_page: u8,
-    pub guc_state: IntelContextGucState,
-    pub guc_id: IntelContextGucId,
-    pub destroyed_link: ListHead,
-    pub parallel: IntelContextParallel,
-}
-
-// C layout checks for the configured Linux 7.2.3 x86_64 build. Key offsets
-// include the anonymous unions and the nested GuC/parallel records that the
-// source functions address directly.
-const _: [(); 16] = [(); core::mem::size_of::<IntelContextRef>()];
-const _: [(); 152] = [(); core::mem::size_of::<I915Active>()];
-const _: [(); 40] = [(); core::mem::size_of::<I915SwFence>()];
-const _: [(); 192] = [(); core::mem::size_of::<IntelContextGucState>()];
-const _: [(); 88] = [(); core::mem::size_of::<IntelContextParallel>()];
-const _: [(); 752] = [(); core::mem::size_of::<IntelContext>()];
-const _: [(); 16] = [(); core::mem::offset_of!(IntelContext, engine)];
-const _: [(); 72] = [(); core::mem::offset_of!(IntelContext, signals)];
-const _: [(); 96] = [(); core::mem::offset_of!(IntelContext, state)];
-const _: [(); 176] = [(); core::mem::offset_of!(IntelContext, stats)];
-const _: [(); 216] = [(); core::mem::offset_of!(IntelContext, pin_mutex)];
-const _: [(); 240] = [(); core::mem::offset_of!(IntelContext, active)];
-const _: [(); 392] = [(); core::mem::offset_of!(IntelContext, ops)];
-const _: [(); 432] = [(); core::mem::offset_of!(IntelContext, guc_state)];
-const _: [(); 624] = [(); core::mem::offset_of!(IntelContext, guc_id)];
-const _: [(); 648] = [(); core::mem::offset_of!(IntelContext, destroyed_link)];
-const _: [(); 664] = [(); core::mem::offset_of!(IntelContext, parallel)];
-const _: [(); 24] = [(); core::mem::offset_of!(IntelContextGucState, blocked)];
-const _: [(); 104] = [(); core::mem::offset_of!(IntelContextGucState, sched_disable_delay_work)];
-const _: [(); 16] = [(); core::mem::offset_of!(IntelContextParallel, parent)];
-const _: [(); 48] = [(); core::mem::offset_of!(IntelContextParallel, guc)];
-
-pub const COPS_HAS_INFLIGHT_BIT: usize = 0;
-pub const COPS_HAS_INFLIGHT: c_ulong = 1 << COPS_HAS_INFLIGHT_BIT;
-pub const COPS_RUNTIME_CYCLES_BIT: usize = 1;
-pub const COPS_RUNTIME_CYCLES: c_ulong = 1 << COPS_RUNTIME_CYCLES_BIT;
-
-pub const CONTEXT_BARRIER_BIT: usize = 0;
-pub const CONTEXT_ALLOC_BIT: usize = 1;
-pub const CONTEXT_INIT_BIT: usize = 2;
-pub const CONTEXT_VALID_BIT: usize = 3;
-pub const CONTEXT_CLOSED_BIT: usize = 4;
-pub const CONTEXT_USE_SEMAPHORES: usize = 5;
-pub const CONTEXT_BANNED: usize = 6;
-pub const CONTEXT_FORCE_SINGLE_SUBMISSION: usize = 7;
-pub const CONTEXT_NOPREEMPT: usize = 8;
-pub const CONTEXT_LRCA_DIRTY: usize = 9;
-pub const CONTEXT_GUC_INIT: usize = 10;
-pub const CONTEXT_PERMA_PIN: usize = 11;
-pub const CONTEXT_IS_PARKING: usize = 12;
-pub const CONTEXT_EXITING: usize = 13;
-pub const CONTEXT_LOW_LATENCY: usize = 14;
-pub const CONTEXT_OWN_STATE: usize = 15;
-
-pub const GUC_INVALID_CONTEXT_ID: u16 = u16::MAX;
-pub const GUC_CLIENT_PRIORITY_NUM: usize = 4;
-
 static mut SLAB_CE: *mut KmCache = core::ptr::null_mut();
 
 // upstream: intel_context.c intel_context_alloc()
@@ -992,7 +556,9 @@ pub unsafe fn intel_context_alloc_state(ce: *mut IntelContext) -> i32 {
                 return -EIO;
             }
 
-            let err = ((*(*ce).ops).alloc)(ce);
+            let err = ((*(*ce).ops)
+                .alloc
+                .expect("source context ops allocator must be installed"))(ce);
             if unlikely(err != 0) {
                 return err;
             }
@@ -1001,7 +567,7 @@ pub unsafe fn intel_context_alloc_state(ce: *mut IntelContext) -> i32 {
 
             rcu_read_lock();
             ctx = rcu_dereference!((*ce).gem_context);
-            if !ctx.is_null() && !kref_get_unless_zero(&mut (*ctx).refcount) {
+            if !ctx.is_null() && !kref_get_unless_zero(&mut (*ctx).r#ref) {
                 ctx = core::ptr::null_mut();
             }
             rcu_read_unlock();
@@ -1321,7 +887,7 @@ pub unsafe fn intel_context_init(ce: *mut IntelContext, engine: *mut IntelEngine
     (*ce).ops = (*engine).cops.cast::<IntelContextOps>();
     (*ce).sseu = (*engine).sseu;
     (*ce).ring = core::ptr::null_mut();
-    (*ce).ring_size = SZ_4K;
+    (*ce).ring_size = SZ_4K as u32;
 
     ewma_runtime_init(&mut (*ce).stats.runtime.avg);
 
@@ -1466,8 +1032,8 @@ pub unsafe fn intel_context_create_request(ce: *mut IntelContext) -> *mut I915Re
     // timeline->mutex is logically inner but used as outer; retain the
     // selftest lockdep workaround and its exact order.
     lockdep_unpin_lock(&mut (*(*ce).timeline).mutex, (*rq).cookie);
-    mutex_release(&mut (*(*ce).timeline).mutex.dep_map, _RET_IP_);
-    mutex_acquire(
+    mutex_release!(&mut (*(*ce).timeline).mutex.dep_map, _RET_IP_);
+    mutex_acquire!(
         &mut (*(*ce).timeline).mutex.dep_map,
         SINGLE_DEPTH_NESTING,
         0,
@@ -1536,7 +1102,7 @@ pub unsafe fn intel_context_get_total_runtime_ns(ce: *mut IntelContext) -> u64 {
 
     let mut total = (*ce).stats.runtime.total;
     if (*(*ce).ops).flags & COPS_RUNTIME_CYCLES != 0 {
-        total *= (*(*(*ce).engine).gt).clock_period_ns;
+        total *= (*(*(*ce).engine).gt).clock_period_ns as u64;
     }
 
     let mut active = READ_ONCE!((*ce).stats.active);
@@ -1552,7 +1118,7 @@ pub unsafe fn intel_context_get_avg_runtime_ns(ce: *mut IntelContext) -> u64 {
     let mut avg = ewma_runtime_read(&(*ce).stats.runtime.avg);
 
     if (*(*ce).ops).flags & COPS_RUNTIME_CYCLES != 0 {
-        avg *= (*(*(*ce).engine).gt).clock_period_ns;
+        avg *= (*(*(*ce).engine).gt).clock_period_ns as u64;
     }
 
     avg
@@ -1579,7 +1145,7 @@ pub unsafe fn intel_context_revoke(ce: *mut IntelContext) -> bool {
         revoke(
             ce,
             core::ptr::null_mut(),
-            (*(*ce).engine).props.preempt_timeout_ms,
+            (*(*ce).engine).props.preempt_timeout_ms as u32,
         );
     }
 

@@ -12,6 +12,9 @@ use core::{
     ptr::NonNull,
 };
 
+// The LinuxKPI field prelude re-exports the canonical i915 header record; do
+// not keep a second, subtly different breadcrumb layout here.
+pub use crate::intel_breadcrumbs_types_upstream::{IntelBreadcrumbs, intel_breadcrumbs};
 use crate::{
     intel_context_upstream::{DrmI915GemObject, IrqWork, Kref},
     intel_engine_cs_upstream::{
@@ -114,38 +117,6 @@ pub type Ktime = KtimeT;
 /// `intel_engine_mask_t` from `gt/intel_engine_types.h`.
 pub type IntelEngineMaskT = IntelEngineMask;
 
-/// `struct intel_breadcrumbs` from `gt/intel_breadcrumbs_types.h`.
-///
-/// The target configuration has 64-bit pointers, `CONFIG_PREEMPT_RT=n`, and
-/// lockdep/debug spinlock fields disabled. `irq_armed` is represented with a
-/// nullable-pointer niche so its `Option` state occupies the same single
-/// pointer word as upstream `intel_wakeref_t`.
-#[repr(C)]
-pub struct IntelBreadcrumbs {
-    pub ref_: Kref,
-    pub active: AtomicT,
-
-    pub signalers_lock: Spinlock,
-    pub signalers: ListHead,
-    pub signaled_requests: LlistHead,
-    pub signaler_active: AtomicT,
-
-    pub irq_lock: Spinlock,
-    pub irq_work: IrqWork,
-    pub irq_enabled: u32,
-    pub irq_armed: IntelWakerefT,
-
-    pub engine_mask: IntelEngineMaskT,
-    pub irq_engine: *mut IntelEngineCs,
-    pub irq_enable: Option<unsafe fn(*mut Self) -> bool>,
-    pub irq_disable: Option<unsafe fn(*mut Self)>,
-}
-
-/// Linux source code spells the struct tag `intel_breadcrumbs`; several
-/// translated C sites retain that tag spelling.
-#[allow(non_camel_case_types)]
-pub type intel_breadcrumbs = IntelBreadcrumbs;
-
 /// `struct intel_instdone` from `gt/intel_engine_types.h`; the bounds follow
 /// `GEN_MAX_GSLICES == 16` and `I915_MAX_SUBSLICES == 8` in `gt/intel_sseu.h`.
 #[repr(C)]
@@ -158,22 +129,12 @@ pub struct IntelInstdone {
     pub geom_svg: [[u32; 8]; 16],
 }
 
-/// Values of `enum i915_request_state` from `i915_request.h`.
-#[repr(i32)]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum I915RequestState {
-    Unknown  = 0,
-    Complete = 1,
-    Pending  = 2,
-    Queued   = 3,
-    Active   = 4,
-}
-
-pub const I915_REQUEST_UNKNOWN: I915RequestState = I915RequestState::Unknown;
-pub const I915_REQUEST_COMPLETE: I915RequestState = I915RequestState::Complete;
-pub const I915_REQUEST_PENDING: I915RequestState = I915RequestState::Pending;
-pub const I915_REQUEST_QUEUED: I915RequestState = I915RequestState::Queued;
-pub const I915_REQUEST_ACTIVE: I915RequestState = I915RequestState::Active;
+// The i915 request state enum and exported values are owned by the Linux 7.2.3
+// `i915_request.h` binding; do not maintain a duplicate enum here.
+pub use crate::i915_request_types_upstream::{
+    I915_REQUEST_ACTIVE, I915_REQUEST_COMPLETE, I915_REQUEST_PENDING, I915_REQUEST_QUEUED,
+    I915_REQUEST_UNKNOWN, I915RequestState,
+};
 
 /// `struct lock_class_key` with `CONFIG_LOCKDEP=n` in the task's Linux config.
 /// Linux declares this as an empty C extension struct in that configuration;
@@ -223,23 +184,6 @@ const _: [(); 8] = [(); size_of::<DrmPrinterLine>()];
 /// passes/tests this opaque pointer and does not access its private fields.
 #[repr(C)]
 pub struct IntelEngineCaptureVma {}
-
-const _: [(); 128] = [(); size_of::<IntelBreadcrumbs>()];
-const _: [(); 8] = [(); align_of::<IntelBreadcrumbs>()];
-const _: [(); 0] = [(); offset_of!(IntelBreadcrumbs, ref_)];
-const _: [(); 4] = [(); offset_of!(IntelBreadcrumbs, active)];
-const _: [(); 8] = [(); offset_of!(IntelBreadcrumbs, signalers_lock)];
-const _: [(); 16] = [(); offset_of!(IntelBreadcrumbs, signalers)];
-const _: [(); 32] = [(); offset_of!(IntelBreadcrumbs, signaled_requests)];
-const _: [(); 40] = [(); offset_of!(IntelBreadcrumbs, signaler_active)];
-const _: [(); 44] = [(); offset_of!(IntelBreadcrumbs, irq_lock)];
-const _: [(); 48] = [(); offset_of!(IntelBreadcrumbs, irq_work)];
-const _: [(); 80] = [(); offset_of!(IntelBreadcrumbs, irq_enabled)];
-const _: [(); 88] = [(); offset_of!(IntelBreadcrumbs, irq_armed)];
-const _: [(); 96] = [(); offset_of!(IntelBreadcrumbs, engine_mask)];
-const _: [(); 104] = [(); offset_of!(IntelBreadcrumbs, irq_engine)];
-const _: [(); 112] = [(); offset_of!(IntelBreadcrumbs, irq_enable)];
-const _: [(); 120] = [(); offset_of!(IntelBreadcrumbs, irq_disable)];
 
 const _: [(); 1552] = [(); size_of::<IntelInstdone>()];
 const _: [(); 16] = [(); offset_of!(IntelInstdone, sampler)];

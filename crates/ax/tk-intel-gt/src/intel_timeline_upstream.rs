@@ -12,12 +12,15 @@ use core::{
 };
 
 use crate::{
-    intel_context_upstream::*, intel_engine_cs_upstream::*, intel_ring::PAGE_SIZE,
-    intel_timeline_types_upstream::IntelTimeline, linux_config::*, linux_list::*,
+    intel_context_upstream::*, intel_engine_cs_upstream::*,
+    intel_engine_types_upstream::IntelEngineCs, intel_gt_types_upstream::IntelGt,
+    intel_ring::PAGE_SIZE, intel_timeline_types_upstream::IntelTimeline, linux_config::*,
+    linux_list::*,
 };
 
-// Bindings supplied by the later integration layer: IntelTimeline/IntelGt and
-// i915/GEM types, constants, Linux helper functions, and trace/BUG macros.
+// The `intel_timeline_types_upstream`/`intel_gt_types_upstream` bindings own
+// these records; unresolved i915/GEM services, Linux helper APIs, and
+// trace/BUG macros remain explicit integration boundaries.
 
 const TIMELINE_SEQNO_BYTES: usize = 8;
 
