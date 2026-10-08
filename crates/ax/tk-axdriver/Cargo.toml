@@ -41,6 +41,8 @@ ahci = [
     "dep:axhal",
     "dep:axconfig",
 ]
+# Native FreeBSD AHCI translation plus the PCI frontend.
+ahci-pci = ["ahci", "bus-pci", "dep:axalloc", "dep:axklib"]
 block = ["dep:axdriver_block"]
 bus-mmio = []
 bus-pci = [
@@ -51,7 +53,7 @@ bus-pci = [
     "dep:axsync",
     "dep:lazyinit",
 ]
-default = ["bus-pci"]
+default = ["bus-pci", "ahci-pci"]
 display = ["dep:axdriver_display"]
 dyn = [
     "dep:axerrno",

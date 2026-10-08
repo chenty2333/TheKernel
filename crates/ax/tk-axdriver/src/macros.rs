@@ -55,6 +55,11 @@ macro_rules! for_each_drivers {
             type $drv_type = crate::nvme::NvmeDriver;
             $code
         }
+        #[cfg(feature = "ahci-pci")]
+        {
+            type $drv_type = crate::drivers::AhciDriver;
+            $code
+        }
         #[cfg(feature = "virtio-rng")]
         {
             type $drv_type = virtio::VirtIoEntropyDriver;

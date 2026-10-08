@@ -17,7 +17,11 @@ is present, but NCQ queue admission and TRIM submission are not yet enabled.
 A command timeout poisons the disk; the persistent workspace is retained until
 port shutdown proves DMA stopped, and is leaked if shutdown cannot prove it.
 
-The FreeBSD bus/resource manager, task queues/interrupt fanout, CAM CCB/SCSI
-translation, hotplug event handling, multi-slot transaction recovery, and
-PCI binding are still outstanding. The current controller logic is tested with
-synthetic MMIO only; QEMU device acceptance awaits the PCI/frontend integration.
+The initial PCI binding lives in `tk-axdriver/src/ahci.rs`: it matches PCI
+class/subclass/prog-if, enables memory and bus mastering, maps ABAR (BAR5),
+resets the HBA, and publishes the first identified ATA disk. AHCI is selected
+by the `tk-axdriver` default feature. Remaining porting work includes the full
+FreeBSD PCI ID/quirk table, every port/device publication, MSI/MSI-X routing,
+CAM CCB/SCSI translation, hotplug, multi-slot scheduling/recovery, and NCQ/TRIM
+submission. The PCI path has only been compiled so far; QEMU disk read/write
+acceptance still remains.

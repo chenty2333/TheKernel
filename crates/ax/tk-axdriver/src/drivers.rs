@@ -165,3 +165,17 @@ cfg_if::cfg_if! {
         }
     }
 }
+
+#[cfg(feature = "ahci-pci")]
+pub struct AhciDriver;
+#[cfg(feature = "ahci-pci")]
+impl DriverProbe for AhciDriver {
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut axdriver_pci::PciRoot,
+        bdf: axdriver_pci::DeviceFunction,
+        info: &axdriver_pci::DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        crate::ahci::probe(root, bdf, info)
+    }
+}

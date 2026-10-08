@@ -14,6 +14,8 @@ pub enum StaticBlockDevice {
     Partition(alloc::boxed::Box<crate::partition::PartitionBlock>),
     #[cfg(feature = "nvme")]
     Nvme(alloc::boxed::Box<crate::nvme::NvmeDevice>),
+    #[cfg(feature = "ahci-pci")]
+    Ahci(alloc::boxed::Box<dyn axdriver_block::BlockDriverOps>),
     #[cfg(feature = "usb-xhci")]
     Usb(crate::usb::UsbBlock),
     /// The immutable root filesystem module supplied by the bootloader.
@@ -43,6 +45,8 @@ impl BaseDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.device_name(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.device_name(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.device_name(),
             Self::BootModule(device) => device.device_name(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.device_name(),
@@ -56,6 +60,8 @@ impl BaseDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.device_type(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.device_type(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.device_type(),
             Self::BootModule(device) => device.device_type(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.device_type(),
@@ -69,6 +75,8 @@ impl BaseDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.irq_num(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.irq_num(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.irq_num(),
             Self::BootModule(device) => device.irq_num(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.irq_num(),
@@ -85,6 +93,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.num_blocks(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.num_blocks(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.num_blocks(),
             Self::BootModule(device) => device.num_blocks(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.num_blocks(),
@@ -97,6 +107,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.block_size(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.block_size(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.block_size(),
             Self::BootModule(device) => device.block_size(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.block_size(),
@@ -109,6 +121,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.block_geometry(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.block_geometry(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.block_geometry(),
             Self::BootModule(device) => device.block_geometry(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.block_geometry(),
@@ -121,6 +135,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.block_capabilities(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.block_capabilities(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.block_capabilities(),
             Self::BootModule(device) => device.block_capabilities(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.block_capabilities(),
@@ -133,6 +149,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.read_block(block_id, buf),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.read_block(block_id, buf),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.read_block(block_id, buf),
             Self::BootModule(device) => device.read_block(block_id, buf),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.read_block(block_id, buf),
@@ -145,6 +163,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.read_block_vectored(block_id, bufs),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.read_block_vectored(block_id, bufs),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.read_block_vectored(block_id, bufs),
             Self::BootModule(device) => device.read_block_vectored(block_id, bufs),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.read_block_vectored(block_id, bufs),
@@ -157,6 +177,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.write_block(block_id, buf),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.write_block(block_id, buf),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.write_block(block_id, buf),
             Self::BootModule(device) => device.write_block(block_id, buf),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.write_block(block_id, buf),
@@ -169,6 +191,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.write_block_vectored(block_id, bufs),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.write_block_vectored(block_id, bufs),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.write_block_vectored(block_id, bufs),
             Self::BootModule(device) => device.write_block_vectored(block_id, bufs),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.write_block_vectored(block_id, bufs),
@@ -185,6 +209,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => unsafe { device.read_block_physical_sg(block_id, segments) },
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => unsafe { device.read_block_physical_sg(block_id, segments) },
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => unsafe { device.read_block_physical_sg(block_id, segments) },
             Self::BootModule(device) => unsafe {
                 device.read_block_physical_sg(block_id, segments)
             },
@@ -200,9 +226,13 @@ impl BlockDriverOps for StaticBlockDevice {
         match self {
             Self::Existing(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
             #[cfg(feature = "shared-block")]
-            Self::Partition(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
+            Self::Partition(device) => unsafe {
+                device.write_block_physical_sg(block_id, segments)
+            },
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
             Self::BootModule(device) => unsafe {
                 device.write_block_physical_sg(block_id, segments)
             },
@@ -217,6 +247,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.flush(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.flush(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.flush(),
             Self::BootModule(device) => device.flush(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.flush(),
@@ -229,6 +261,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.write_block_fua(block_id, buf),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.write_block_fua(block_id, buf),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.write_block_fua(block_id, buf),
             Self::BootModule(device) => device.write_block_fua(block_id, buf),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.write_block_fua(block_id, buf),
@@ -241,6 +275,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.fence(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.fence(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.fence(),
             Self::BootModule(device) => device.fence(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.fence(),
@@ -253,6 +289,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.discard_blocks(range),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.discard_blocks(range),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.discard_blocks(range),
             Self::BootModule(device) => device.discard_blocks(range),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.discard_blocks(range),
@@ -265,6 +303,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.write_zeroes(range),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.write_zeroes(range),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.write_zeroes(range),
             Self::BootModule(device) => device.write_zeroes(range),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.write_zeroes(range),
@@ -277,6 +317,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.async_queue_caps(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.async_queue_caps(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.async_queue_caps(),
             Self::BootModule(device) => device.async_queue_caps(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.async_queue_caps(),
@@ -292,6 +334,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.submit_async_batch(requests),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.submit_async_batch(requests),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.submit_async_batch(requests),
             Self::BootModule(device) => device.submit_async_batch(requests),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.submit_async_batch(requests),
@@ -307,6 +351,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.submit_sync_batch(requests),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.submit_sync_batch(requests),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.submit_sync_batch(requests),
             Self::BootModule(device) => device.submit_sync_batch(requests),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.submit_sync_batch(requests),
@@ -322,6 +368,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => unsafe { device.submit_physical_batch(requests) },
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => unsafe { device.submit_physical_batch(requests) },
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => unsafe { device.submit_physical_batch(requests) },
             Self::BootModule(device) => unsafe { device.submit_physical_batch(requests) },
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => unsafe { device.submit_physical_batch(requests) },
@@ -337,6 +385,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.drain_async_completions(output),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.drain_async_completions(output),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.drain_async_completions(output),
             Self::BootModule(device) => device.drain_async_completions(output),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.drain_async_completions(output),
@@ -352,6 +402,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.wait_any_physical_completion(output),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.wait_any_physical_completion(output),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.wait_any_physical_completion(output),
             Self::BootModule(device) => device.wait_any_physical_completion(output),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.wait_any_physical_completion(output),
@@ -368,6 +420,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.install_completion_notifier(notifier, context),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.install_completion_notifier(notifier, context),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.install_completion_notifier(notifier, context),
             Self::BootModule(device) => device.install_completion_notifier(notifier, context),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.install_completion_notifier(notifier, context),
@@ -380,6 +434,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.reset_device(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.reset_device(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.reset_device(),
             Self::BootModule(device) => device.reset_device(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.reset_device(),
@@ -392,6 +448,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.poll_async_complete(budget),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.poll_async_complete(budget),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.poll_async_complete(budget),
             Self::BootModule(device) => device.poll_async_complete(budget),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.poll_async_complete(budget),
@@ -404,6 +462,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.wait_async_all(handles),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.wait_async_all(handles),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.wait_async_all(handles),
             Self::BootModule(device) => device.wait_async_all(handles),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.wait_async_all(handles),
@@ -416,6 +476,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.enable_irq(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.enable_irq(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.enable_irq(),
             Self::BootModule(device) => device.enable_irq(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.enable_irq(),
@@ -428,6 +490,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.disable_irq(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.disable_irq(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.disable_irq(),
             Self::BootModule(device) => device.disable_irq(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.disable_irq(),
@@ -440,6 +504,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.is_irq_enabled(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.is_irq_enabled(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.is_irq_enabled(),
             Self::BootModule(device) => device.is_irq_enabled(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.is_irq_enabled(),
@@ -452,6 +518,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.handle_irq(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.handle_irq(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.handle_irq(),
             Self::BootModule(device) => device.handle_irq(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.handle_irq(),
@@ -464,6 +532,8 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Partition(device) => device.fence_async(),
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => device.fence_async(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.fence_async(),
             Self::BootModule(device) => device.fence_async(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.fence_async(),

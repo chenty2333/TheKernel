@@ -290,10 +290,8 @@ impl<I: AhciIo> AhciDisk<I> {
             unsafe { ManuallyDrop::drop(&mut self.workspace) };
             self.workspace_live = false;
         } else {
-            // The attached object is about to be discarded. Intentionally
-            // retain its workspace because a misbehaving HBA may still DMA.
-            let workspace = unsafe { ptr::read(&self.workspace) };
-            core::mem::forget(workspace);
+            // The workspace is a `ManuallyDrop` field, so returning from
+            // attach will retain its allocations while the HBA may still DMA.
             self.workspace_live = false;
         }
         error
@@ -419,9 +417,8 @@ impl<I: AhciIo> Drop for AhciDisk<I> {
             self.workspace_live = false;
         } else {
             // The device may retain access to every address in the workspace.
-            // Leaking these allocations is safer than recycling DMA memory.
-            let workspace = unsafe { ptr::read(&self.workspace) };
-            core::mem::forget(workspace);
+            // The `ManuallyDrop` field intentionally leaks it rather than
+            // recycling DMA memory.
             self.workspace_live = false;
         }
     }

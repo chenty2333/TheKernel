@@ -307,8 +307,6 @@ pub const AHCI_MAX_IRQS: usize = 16;
 pub const AHCI_PRD_IPC: u32 = 1 << 31;
 pub const AHCI_PRD_MAX: usize = 4 * 1024 * 1024;
 
-/// FreeBSD's AHCI controller quirk bits (`AHCI_Q_*`).
-
 /// FreeBSD controller/channel ivar flags and unit sentinels.
 pub const AHCI_REMAPPED_UNIT: u32 = 1 << 31;
 pub const AHCI_EM_UNIT: u32 = 1 << 30;

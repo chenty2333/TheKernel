@@ -666,3 +666,6 @@ pub mod itco;
 
 #[cfg(feature = "usb-dbc")]
 pub mod dbc;
+
+#[cfg(feature = "ahci-pci")]
+mod ahci;
