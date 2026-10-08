@@ -601,16 +601,21 @@ impl Report {
     pub(crate) fn max_length(&self) -> usize {
         usize::from(*self.bits.iter().max().unwrap_or(&0)).div_ceil(8)
     }
+    // upstream: hid.c hid_report_size()
     pub(crate) fn report_size(&self, kind: ReportKind, id: u8) -> usize {
         usize::from(self.report_sizes[kind as usize][usize::from(id)]).div_ceil(8)
     }
+    // upstream: hid.c hid_report_size_max()
     pub(crate) fn report_size_max(&self, kind: ReportKind) -> (u8, usize) {
-        self.report_sizes[kind as usize]
+        let sizes = &self.report_sizes[kind as usize];
+        let report_id = sizes
             .iter()
             .enumerate()
-            .max_by_key(|(_, bits)| *bits)
-            .map(|(id, bits)| (id as u8, usize::from(*bits).div_ceil(8)))
-            .unwrap_or((0, 0))
+            .skip(1)
+            .find(|(_, bits)| **bits != 0)
+            .map_or(0, |(id, _)| id as u8);
+        let max_bits = sizes.iter().copied().max().unwrap_or(0);
+        (report_id, usize::from(max_bits).div_ceil(8))
     }
     // upstream: hid.c hid_locate() / hidbus.c hidbus_locate()
     pub(crate) fn locate_usage(
@@ -1375,6 +1380,20 @@ mod tests {
         let mut ev = VecDeque::new();
         assert!(p.decode(&[2], &mut ev));
         assert_eq!(triples(&ev), [(1, 0x100, 1), (0, 0, 0)]);
+    }
+
+    #[test]
+    fn report_size_max_returns_first_nonzero_id_and_largest_size() {
+        let descriptor = [
+            0x85, 1, // Report ID 1
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 1, 0x75, 8, 0x95, 1, 0x81, 2, 0x85,
+            2, // Report ID 2
+            0x05, 1, 0x09, 0x31, 0x15, 0, 0x25, 1, 0x75, 8, 0x95, 2, 0x81, 2,
+        ];
+        let report = Report::parse(&descriptor).unwrap();
+        assert_eq!(report.report_size(ReportKind::Input, 1), 2);
+        assert_eq!(report.report_size(ReportKind::Input, 2), 3);
+        assert_eq!(report.report_size_max(ReportKind::Input), (1, 3));
     }
 
     #[test]
