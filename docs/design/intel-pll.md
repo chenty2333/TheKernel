@@ -534,11 +534,18 @@ Intel). The register encodings follow `intel_display_regs.h` (MIT, Copyright
 © 2006-2018 Intel), and the full license is already in the crate's
 `LICENSE-MIT`.
 
+The DKL Type-C calculation now accepts `MgPllOutput::{DisplayPort,Hdmi}` and
+translates `icl_mg_pll_find_divisors()`/`icl_calc_mg_pll_state()` for the DKL
+branch. DP forces the 8.1-GHz DCO; HDMI uses the `[7992,10000] MHz` DCO
+window. Both retain the source loop order and calculate `CORECLKCTL1`,
+`HSCLKCTL`, fractional feedback divider, IREF trim, TDC target and feed-forward
+gain. Six DKL tests pass, including 162/540-MHz DP and 1080p60 HDMI.
+
 The fixed DP/TBT tables, source candidate ordering, DCO window and midpoint,
 38.4→19.2 reference division, Gen11/12 CFGCR selector, and display-12
 38.4-MHz fraction workaround have host tests. This is not yet the full manager:
 atomic modeset integration, active-port mux updates, MG PHY DP/TBT register
-writes, clock routing/reference-clock updates, readout/sanitization, and full
+writes, DKL PLL enable/lock/disable wrapper, clock routing/reference-clock updates, readout/sanitization, and full
 display-12/13 `intel_dpll.c` state ownership are still not translated or wired.
 `kernel/src/drm/intel/pll.rs` now adds the combo DPLL0/1 power-state, CFGCR,
 enable/lock and disable/power-off sequences from `combo_pll_enable()` and

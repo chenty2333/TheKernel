@@ -12,3 +12,4 @@
 3d. Generic CRTC DPLL dispatch | 部分完成 | 95b990c8 | 翻译 DPLL `compute_clock/get_dpll` guards、stale state clear、±1 kHz clock comparison；3 tests pass，暂未接进 kernel atomic path。
 3e. Runtime CDCLK MMIO transition | 部分完成 | pending | kernel `clk::transition` 接入 i915 full-PLL disable/enable 与 TGL crawl request/ack、CDCLK_CTL 写入；crate cdclk tests 4/4、kernel `cargo check --tests` 成功。Atomic/PCode/peripheral-lock call site 仍未连接。
 3f. Combo DPLL0/1 power sequence | 部分完成 | ff632686 | kernel adapter 接上 i915 power-state→CFGCR→enable/lock 与 disable/power-off 顺序；`cargo check -p tk-kernel --tests` 通过，单元测试只 compile-check 未运行。尚未连 modeset call site。
+3h. DKL DP/HDMI PLL calculations | 部分完成 | pending | 翻译 DKL `icl_mg_pll_find_divisors` 的 DP 精确 8.1GHz 和 HDMI DCO-window 分支；6 个 targeted tests 通过。

@@ -1138,3 +1138,10 @@ lock and power-off sequence from Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
 Intel). The adapter retains i915's warning-only timeout outcome and is not yet
 called by atomic modeset.
+
+`tk-intel-display/src/dpll_mgr.rs` extends the DKL MG PLL calculation to
+source-shaped DisplayPort 8.1-GHz DCO and HDMI `[7992,10000]`-MHz window
+selection, preserving `icl_mg_pll_find_divisors()` search priority and
+`icl_calc_mg_pll_state()` fixed-point state generation. Source is Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006-2016
+Intel); targeted tests cover 162/540-MHz DP and 1080p60 HDMI.

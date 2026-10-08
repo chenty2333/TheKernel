@@ -5,7 +5,7 @@
 // icl_calc_dp_combo_pll, icl_calc_tbt_pll, icl_calc_dpll_state,
 // icl_ddi_combo_pll_get_freq, icl_tc_port_to_pll_id, icl_update_active_dpll,
 // icl_get_combo_phy_dpll, intel_find_dpll/reference/unreference,
-// dkl_pll_write (ADL-P/N HDMI no-SSC branch).
+// dkl_pll_write (ADL-P/N DKL no-SSC branch).
 // Copyright © 2006-2016 Intel Corporation.
 // intel_{mg,dkl}_phy_regs.h: selected DKL/clock register fields.
 // Copyright © 2022 Intel Corporation. MIT permission text: ../LICENSE-MIT.
@@ -30,11 +30,20 @@ pub struct DklPllState {
     pub bias: u32,
     pub tdc_coldst_bias: u32,
 }
-/// HDMI port_clock is TMDS, not always the mode pixel clock: deep color/YUV420
-/// must be handled by HDMI compute_config before passing it here. No writes.
-pub fn icl_calc_mg_pll_state(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MgPllOutput {
+    DisplayPort,
+    Hdmi,
+}
+
+/// Calculate the ADL-P/N DKL Type-C PLL state for DP symbol rate or HDMI TMDS
+/// character rate. HDMI `clock_khz` is not always the pixel clock: color depth
+/// and YUV420 are handled by HDMI compute_config before reaching this helper.
+// upstream: intel_dpll_mgr.c icl_calc_mg_pll_state()
+pub fn icl_calc_mg_pll_state_for_output(
     clock_khz: u32,
     refclk_khz: u32,
+    output: MgPllOutput,
     afc_startup: Option<u8>,
 ) -> Result<DklPllState, Error> {
     // These bounds avoid C's signed intermediate overflow on untrusted input.
@@ -47,7 +56,8 @@ pub fn icl_calc_mg_pll_state(
         38400 => (2, 28),
         _ => return Err(Error::Refused),
     };
-    let (dco_khz, hsclkctl) = icl_mg_pll_find_divisors(clock_khz)?;
+    let (dco_khz, hsclkctl, coreclkctl1) =
+        icl_mg_pll_find_divisors(clock_khz, output, false, true)?;
     let m1div = 2;
     let m2div_int = dco_khz / (refclk_khz * m1div);
     if m2div_int > 255 {
@@ -69,7 +79,7 @@ pub fn icl_calc_mg_pll_state(
     Ok(DklPllState {
         dco_khz,
         refclkin_ctl: 1 << 8,
-        coreclkctl1: 5 << 8,
+        coreclkctl1,
         hsclkctl,
         div0,
         div1: (iref_trim << 16) | tdc_targetcnt,
@@ -78,21 +88,55 @@ pub fn icl_calc_mg_pll_state(
         tdc_coldst_bias: feedfwgain,
     })
 }
-fn icl_mg_pll_find_divisors(clock_khz: u32) -> Result<(u32, u32), Error> {
-    // Preserve upstream search priority, not the numerically closest DCO.
+
+/// Preserve the source's HS divisor and DS divisor loop ordering, and choose
+/// the exact DCO target for DP versus the wider HDMI window.
+// upstream: intel_dpll_mgr.c icl_mg_pll_find_divisors()
+fn icl_mg_pll_find_divisors(
+    clock_khz: u32,
+    output: MgPllOutput,
+    use_ssc: bool,
+    is_dkl: bool,
+) -> Result<(u32, u32, u32), Error> {
+    let (dco_min, dco_max) = match output {
+        MgPllOutput::DisplayPort => (8_100_000, 8_100_000),
+        MgPllOutput::Hdmi if use_ssc => (8_000_000, 10_000_000),
+        MgPllOutput::Hdmi => (7_992_000, 10_000_000),
+    };
     for (div1, hsdiv) in [(7, 3), (5, 2), (3, 1), (2, 0)] {
         for div2 in (1..=10).rev() {
             let dco = div1 * div2 * clock_khz * 5;
-            if !(7992000..=10000000).contains(&dco) {
+            if !(dco_min..=dco_max).contains(&dco) {
                 continue;
             }
-            let tlinedrv = u32::from(div2 >= 2);
-            let hsclkctl = (tlinedrv << 14) | (1 << 16) | (hsdiv << 12) | (div2 << 8);
-            return Ok((dco, hsclkctl));
+            let is_dp = output == MgPllOutput::DisplayPort;
+            let a_divratio = if div2 >= 2 {
+                if is_dp { 10 } else { 5 }
+            } else {
+                5
+            };
+            let tlinedrv = if div2 >= 2 {
+                if is_dkl { 1 } else { 2 }
+            } else {
+                0
+            };
+            let inputsel = u32::from(!is_dp);
+            let hsclkctl = (tlinedrv << 14) | (inputsel << 16) | (hsdiv << 12) | (div2 << 8);
+            return Ok((dco, hsclkctl, a_divratio << 8));
         }
     }
     Err(Error::Refused)
 }
+
+/// HDMI convenience wrapper for existing call sites.
+pub fn icl_calc_mg_pll_state(
+    clock_khz: u32,
+    refclk_khz: u32,
+    afc_startup: Option<u8>,
+) -> Result<DklPllState, Error> {
+    icl_calc_mg_pll_state_for_output(clock_khz, refclk_khz, MgPllOutput::Hdmi, afc_startup)
+}
+// upstream: intel_dpll_mgr.c icl_ddi_mg_pll_get_freq()
 pub fn icl_ddi_mg_pll_get_freq(state: &DklPllState, refclk_khz: u32) -> Result<u32, Error> {
     if ![19200, 24000, 38400].contains(&refclk_khz) {
         return Err(Error::Refused);
@@ -123,6 +167,7 @@ pub fn icl_ddi_mg_pll_get_freq(state: &DklPllState, refclk_khz: u32) -> Result<u
 /// disabled and its TC port/core power references are held. The field masks
 /// and unconditional RMW stores match i915; the caller owns enable/lock
 /// polling and the before-image transaction.
+// upstream: intel_dpll_mgr.c dkl_pll_write()
 pub fn dkl_pll_write(
     io: &impl DklIo,
     port: TcPort,
@@ -317,6 +362,25 @@ mod tests {
             let s = icl_calc_mg_pll_state(148500, refclk, None).unwrap();
             assert_eq!(icl_ddi_mg_pll_get_freq(&s, refclk), Ok(148500));
         }
+    }
+
+    #[test]
+    fn dkl_displayport_uses_exact_8100_mhz_dco_and_dp_source_fields() {
+        let state =
+            icl_calc_mg_pll_state_for_output(540_000, 19_200, MgPllOutput::DisplayPort, None)
+                .unwrap();
+        assert_eq!(state.dco_khz, 8_100_000);
+        assert_eq!(state.coreclkctl1, 5 << 8);
+        assert_eq!(state.hsclkctl, (1 << 12) | (1 << 8));
+        assert_eq!(icl_ddi_mg_pll_get_freq(&state, 19_200), Ok(540_000));
+
+        let state =
+            icl_calc_mg_pll_state_for_output(162_000, 38_400, MgPllOutput::DisplayPort, None)
+                .unwrap();
+        assert_eq!(state.dco_khz, 8_100_000);
+        assert_eq!(state.coreclkctl1, 10 << 8);
+        assert_eq!(state.hsclkctl, (1 << 14) | (2 << 12) | (2 << 8));
+        assert_eq!(icl_ddi_mg_pll_get_freq(&state, 38_400), Ok(162_000));
     }
     #[test]
     fn invalid_inputs_fail_before_divide_and_afc_does_not_change_freq() {
