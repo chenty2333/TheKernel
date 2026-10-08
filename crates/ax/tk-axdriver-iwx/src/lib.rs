@@ -85,8 +85,10 @@ pub use firmware_bundle::{
     FirmwareBundle, FirmwareRequestError, request_on_rootfs_ready, take_staged,
 };
 pub use init_cmd::{
-    DATA_PATH_GROUP, DQA_ENABLE_CMD, PHY_CONFIGURATION_CMD, TX_ANT_CONFIGURATION_CMD,
-    dqa_enable_command, phy_configuration_command, tx_antenna_command,
+    DATA_PATH_GROUP, DQA_ENABLE_CMD, INIT_EXTENDED_CFG_CMD, INIT_NVM, NVM_ACCESS_COMPLETE_CMD,
+    PHY_CONFIGURATION_CMD, REGULATORY_AND_NVM_GROUP as INIT_NVM_GROUP, SYSTEM_GROUP,
+    TX_ANT_CONFIGURATION_CMD, dqa_enable_command, init_extended_config_command,
+    nvm_access_complete_command, phy_configuration_command, tx_antenna_command,
 };
 pub use interrupts::{
     InterruptMasks, configure_msix_hardware, disable_interrupts, enable_firmware_load_interrupts,

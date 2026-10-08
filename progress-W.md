@@ -24,4 +24,5 @@
 - `iwx_enable_txq()`/`iwx_disable_txq()` now include response-requesting commands, response validation, and queue-mask/TID lifecycle adapters (`80431bbb`).
 - RX BA session management now translates reorder-window initialization/clear, BAID and ADD_STA command layouts/status checks, session timeout decisions, and BAR release validation ( `7ae4fc26` ).
 - `iwx_nvm_get()` now wraps its RF-kill-capable response command and v3/v4 parsing in one request adapter (`728a6f94`).
+- Init-MVM NVM gating commands now serialize INIT_EXTENDED_CFG and NVM_ACCESS_COMPLETE with their source groups and payloads (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
