@@ -1082,3 +1082,8 @@ state bits, rather than state alone (`intel_display_power_well.c`).
 `intel_display_power.c`: current/next masks, non-final immediate puts, pending
 get reuse, max next delay, worker batch completion, and synchronous flush.
 The surrounding kernel workqueue/runtime-PM adapter is not yet connected.
+
+`power_well.rs` translates the TGL Type-C cold-block request and ICL TC cold
+exit PCODE retry/timing helpers from `intel_display_power_well.c` (MIT,
+Copyright © 2022 Intel); it returns source-shaped reports so the kernel can
+map firmware transport and diagnostics. The TGL map callback is not yet wired.

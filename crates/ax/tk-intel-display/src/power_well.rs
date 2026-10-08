@@ -82,6 +82,80 @@ pub trait HswPowerWellIo: RegisterIo {
     fn pre_disable(&self, irq_pipe_mask: u8) -> Result<(), Error>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PcodeError {
+    Again,
+    Failure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PcodeReport {
+    pub attempts: u8,
+    pub succeeded: bool,
+}
+
+/// Parent-PCODE calls and delays for Type-C cold-state transitions.
+pub trait TcColdPcodeIo {
+    fn read(&mut self, mailbox: u8, data_low: u32) -> Result<(u32, u32), PcodeError>;
+    fn write(&mut self, mailbox: u8, data_low: u32) -> Result<(), PcodeError>;
+    fn delay_ms(&mut self, milliseconds: u8);
+}
+
+/// Request TGL Type-C cold block/unblock; hardware errors are warning reports in i915.
+// upstream: intel_display_power_well.c tgl_tc_cold_request()
+pub fn tgl_tc_cold_request(io: &mut impl TcColdPcodeIo, block: bool) -> PcodeReport {
+    const PCODE_TCCOLD: u8 = 0x26;
+    const EXIT_FAILED: u32 = 1 << 0;
+    let request = if block { 0 } else { 1 };
+    for attempt in 1..=3 {
+        match io.read(PCODE_TCCOLD, request) {
+            Ok((low, _high)) if !block || low & EXIT_FAILED == 0 => {
+                return PcodeReport {
+                    attempts: attempt,
+                    succeeded: true,
+                };
+            }
+            Ok(_) | Err(PcodeError::Again | PcodeError::Failure) => {
+                if attempt < 3 {
+                    io.delay_ms(1);
+                }
+            }
+        }
+    }
+    PcodeReport {
+        attempts: 3,
+        succeeded: false,
+    }
+}
+
+/// Exit ICL Type-C cold state, retrying `-EAGAIN` three times and waiting 1 ms on success.
+// upstream: intel_display_power_well.c icl_tc_cold_exit()
+pub fn icl_tc_cold_exit(io: &mut impl TcColdPcodeIo) -> PcodeReport {
+    const PCODE_EXIT_TCCOLD: u8 = 0x12;
+    for attempt in 1..=3 {
+        match io.write(PCODE_EXIT_TCCOLD, 0) {
+            Ok(()) => {
+                io.delay_ms(1);
+                return PcodeReport {
+                    attempts: attempt,
+                    succeeded: true,
+                };
+            }
+            Err(PcodeError::Again) if attempt < 3 => io.delay_ms(1),
+            Err(PcodeError::Again | PcodeError::Failure) => {
+                return PcodeReport {
+                    attempts: attempt,
+                    succeeded: false,
+                };
+            }
+        }
+    }
+    PcodeReport {
+        attempts: 3,
+        succeeded: false,
+    }
+}
+
 const fn request_mask(index: u8) -> u32 {
     2 << (index as u32 * 2)
 }
@@ -328,6 +402,38 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PcodeFake {
+        reads: Vec<Result<(u32, u32), PcodeError>>,
+        read_calls: Vec<(u8, u32)>,
+        writes: Vec<Result<(), PcodeError>>,
+        write_calls: Vec<(u8, u32)>,
+        delays: Vec<u8>,
+    }
+
+    impl TcColdPcodeIo for PcodeFake {
+        fn read(&mut self, mailbox: u8, data_low: u32) -> Result<(u32, u32), PcodeError> {
+            self.read_calls.push((mailbox, data_low));
+            let result = if self.reads.is_empty() {
+                Err(PcodeError::Failure)
+            } else {
+                self.reads.remove(0)
+            };
+            result
+        }
+        fn write(&mut self, mailbox: u8, data_low: u32) -> Result<(), PcodeError> {
+            self.write_calls.push((mailbox, data_low));
+            if self.writes.is_empty() {
+                Err(PcodeError::Failure)
+            } else {
+                self.writes.remove(0)
+            }
+        }
+        fn delay_ms(&mut self, milliseconds: u8) {
+            self.delays.push(milliseconds);
+        }
+    }
+
     #[test]
     fn adlp_pw1_applies_wa_then_fuse_request_and_state_handshakes() {
         let io = Fake::default();
@@ -429,5 +535,57 @@ mod tests {
         assert!(hsw_power_well_enabled(&io, spec, true).unwrap());
         io.set(2, request_mask(0) | state_mask(0));
         assert!(hsw_power_well_enabled(&io, spec, false).unwrap());
+    }
+
+    #[test]
+    fn tgl_tc_cold_request_retries_failed_exit_and_keeps_unblock_semantics() {
+        let mut io = PcodeFake {
+            reads: alloc::vec![
+                Err(PcodeError::Again),
+                Ok((1, 0)), // block request sees EXIT_FAILED and retries
+                Ok((0, 0)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            tgl_tc_cold_request(&mut io, true),
+            PcodeReport {
+                attempts: 3,
+                succeeded: true
+            }
+        );
+        assert_eq!(io.read_calls, [(0x26, 0), (0x26, 0), (0x26, 0)]);
+        assert_eq!(io.delays, [1, 1]);
+
+        let mut io = PcodeFake {
+            reads: alloc::vec![Ok((1, 0))],
+            ..Default::default()
+        };
+        assert!(tgl_tc_cold_request(&mut io, false).succeeded);
+        assert_eq!(io.read_calls, [(0x26, 1)]);
+    }
+
+    #[test]
+    fn icl_tc_cold_exit_only_delays_after_success_or_retryable_busy() {
+        let mut io = PcodeFake {
+            writes: alloc::vec![Err(PcodeError::Again), Err(PcodeError::Again), Ok(()),],
+            ..Default::default()
+        };
+        assert_eq!(
+            icl_tc_cold_exit(&mut io),
+            PcodeReport {
+                attempts: 3,
+                succeeded: true
+            }
+        );
+        assert_eq!(io.write_calls, [(0x12, 0), (0x12, 0), (0x12, 0)]);
+        assert_eq!(io.delays, [1, 1, 1]);
+
+        let mut io = PcodeFake {
+            writes: alloc::vec![Err(PcodeError::Failure)],
+            ..Default::default()
+        };
+        assert!(!icl_tc_cold_exit(&mut io).succeeded);
+        assert!(io.delays.is_empty());
     }
 }

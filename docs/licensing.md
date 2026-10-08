@@ -611,3 +611,9 @@ Copyright © 2022 Intel).
 queue, pending-get reference reuse, batch requeue delay, and flush operation
 from `intel_display_power.c` (MIT, Copyright © 2022 Intel). Scheduling and
 runtime-PM reference ownership remain caller responsibilities.
+
+`tk-intel-display/src/power_well.rs` translates TGL `tgl_tc_cold_request()`
+(three PCODE reads with 1 ms retry delay and block-failed handling) and ICL
+`icl_tc_cold_exit()` (three EAGAIN retries, 1 ms completion delay) from
+`intel_display_power_well.c` (MIT, Copyright © 2022 Intel). PCODE transport
+integration remains in the kernel adapter.
