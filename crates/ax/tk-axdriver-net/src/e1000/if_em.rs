@@ -2206,6 +2206,168 @@ pub fn em_update_stats_counters<I: E1000RegisterIo>(
     Ok(())
 }
 
+/// upstream: if_em.c igb_disable_dmac()
+pub fn igb_disable_dmac<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    let reg = io.read_register(E1000_DMACR)?;
+    io.write_register(
+        E1000_DMACR,
+        (reg & !E1000_DMACR_DMAC_EN) | E1000_DMACR_DMAC_LX_MASK,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IgbDmacConfig {
+    pub mac: E1000MacType,
+    pub enabled: bool,
+    pub iov: bool,
+    pub dmac: u32,
+    pub pba_kb: u32,
+    pub max_frame_size: u16,
+    pub status: u32,
+}
+
+/// upstream: if_em.c igb_init_dmac()
+pub fn igb_init_dmac<I: E1000RegisterIo>(io: &mut I, config: IgbDmacConfig) -> DevResult {
+    if config.mac == E1000MacType::I211 {
+        return Ok(());
+    }
+    if config.iov {
+        if config.mac > E1000MacType::I82580 {
+            igb_disable_dmac(io)?;
+        }
+        return Ok(());
+    }
+    if config.mac > E1000MacType::I82580 {
+        if !config.enabled {
+            igb_disable_dmac(io)?;
+            return Ok(());
+        }
+        io.write_register(E1000_DMCTXTH, 0)?;
+        let mut high = 64 * config.pba_kb - u32::from(config.max_frame_size) / 16;
+        if high < 64 * config.pba_kb.saturating_sub(6) {
+            high = 64 * config.pba_kb.saturating_sub(6);
+        }
+        let reg = io.read_register(E1000_FCRTC)? & !E1000_FCRTC_RTH_COAL_MASK;
+        io.write_register(
+            E1000_FCRTC,
+            reg | ((high << E1000_FCRTC_RTH_COAL_SHIFT) & E1000_FCRTC_RTH_COAL_MASK),
+        )?;
+        let mut threshold = config.pba_kb - u32::from(config.max_frame_size) / 512;
+        if threshold < config.pba_kb.saturating_sub(10) {
+            threshold = config.pba_kb.saturating_sub(10);
+        }
+        let mut dmacr = io.read_register(E1000_DMACR)?
+            & !(E1000_DMACR_DMACWT_MASK
+                | E1000_DMACR_DMACTHR_MASK
+                | E1000_DMACR_DMAC_LX_MASK
+                | E1000_DMACR_DMAC_EN
+                | E1000_DMACR_DC_LPBKW_EN
+                | E1000_DMACR_DC_BMC2OSW_EN);
+        dmacr |= ((threshold << E1000_DMACR_DMACTHR_SHIFT) & E1000_DMACR_DMACTHR_MASK)
+            | E1000_DMACR_DMAC_EN
+            | E1000_DMACR_DMAC_LX_MASK;
+        let watchdog = if config.mac == E1000MacType::I354
+            && config.status & E1000_STATUS_2P5_SKU != 0
+            && config.status & E1000_STATUS_2P5_SKU_OVER == 0
+        {
+            (config.dmac * 5) >> 6
+        } else {
+            config.dmac >> 5
+        };
+        dmacr |= watchdog & E1000_DMACR_DMACWT_MASK;
+        if matches!(config.mac, E1000MacType::I350 | E1000MacType::I354) {
+            dmacr |= E1000_DMACR_DC_LPBKW_EN;
+        }
+        if config.mac == E1000MacType::I354 {
+            dmacr |= E1000_DMACR_DC_BMC2OSW_EN;
+        }
+        io.write_register(E1000_DMACR, dmacr)?;
+        io.write_register(E1000_DMCRTRH, 0)?;
+        let mut ctlx = io.read_register(E1000_DMCTLX)? & !E1000_DMCTLX_TTLX_MASK;
+        if config.mac == E1000MacType::I350 {
+            ctlx |= 0x8000_0000;
+        }
+        let ticks = if config.mac == E1000MacType::I210 {
+            0x20
+        } else if config.mac == E1000MacType::I354
+            && config.status & E1000_STATUS_2P5_SKU != 0
+            && config.status & E1000_STATUS_2P5_SKU_OVER == 0
+        {
+            0xa
+        } else {
+            4
+        };
+        io.write_register(E1000_DMCTLX, ctlx | ticks)?;
+        io.write_register(
+            E1000_DMCTXTH,
+            (20408 - 2 * u32::from(config.max_frame_size)) >> 6,
+        )?;
+        let misc = io.read_register(E1000_PCIEMISC)?;
+        io.write_register(E1000_PCIEMISC, misc | E1000_PCIEMISC_LX_DECISION)?;
+    } else if config.mac == E1000MacType::I82580 {
+        let misc = io.read_register(E1000_PCIEMISC)?;
+        io.write_register(E1000_PCIEMISC, misc & !E1000_PCIEMISC_LX_DECISION)?;
+        io.write_register(E1000_DMACR, 0)?;
+    }
+    Ok(())
+}
+
+pub trait LemSmartSpeedOps {
+    fn read_phy(&mut self, register: u16) -> DevResult<u16>;
+    fn write_phy(&mut self, register: u16, value: u16) -> DevResult;
+    fn copper_link_autoneg(&mut self) -> bool;
+}
+/// upstream: if_em.c lem_smartspeed()
+pub fn lem_smartspeed<P: LemSmartSpeedOps>(
+    phy: &mut P,
+    link_up: bool,
+    igp_phy: bool,
+    autoneg: bool,
+    advertise_gigabit: bool,
+    smartspeed: &mut u8,
+) -> DevResult {
+    if link_up || !igp_phy || !autoneg || !advertise_gigabit {
+        return Ok(());
+    }
+    if *smartspeed == 0 {
+        let status = phy.read_phy(0x0a)?;
+        if status & 0x8000 == 0 {
+            return Ok(());
+        }
+        let status = phy.read_phy(0x0a)?;
+        if status & 0x8000 != 0 {
+            let mut control = phy.read_phy(0x09)?;
+            if control & 0x1000 != 0 {
+                control &= !0x1000;
+                phy.write_phy(0x09, control)?;
+                *smartspeed += 1;
+                if !phy.copper_link_autoneg() {
+                    let mut phy_control = phy.read_phy(0)?;
+                    phy_control |= 0x1200;
+                    phy.write_phy(0, phy_control)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+    if *smartspeed == 3 {
+        let mut control = phy.read_phy(0x09)?;
+        control |= 0x1000;
+        phy.write_phy(0x09, control)?;
+        if !phy.copper_link_autoneg() {
+            let mut phy_control = phy.read_phy(0)?;
+            phy_control |= 0x1200;
+            phy.write_phy(0, phy_control)?;
+        }
+    }
+    if *smartspeed == 15 {
+        *smartspeed = 0
+    } else {
+        *smartspeed += 1;
+    }
+    Ok(())
+}
+
 fn read_vf_stat_registers<I: E1000RegisterIo>(io: &mut I, vf_82576: bool) -> DevResult<[u32; 9]> {
     let mut values = [0u32; 9];
     for (i, reg) in [
