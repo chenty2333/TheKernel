@@ -12,6 +12,7 @@ mod context;
 mod dma;
 mod firmware;
 mod firmware_bundle;
+mod init_cmd;
 mod interrupts;
 mod rate;
 mod registers;
@@ -44,6 +45,10 @@ pub use firmware::{
 };
 pub use firmware_bundle::{
     FirmwareBundle, FirmwareRequestError, request_on_rootfs_ready, take_staged,
+};
+pub use init_cmd::{
+    DATA_PATH_GROUP, DQA_ENABLE_CMD, PHY_CONFIGURATION_CMD, TX_ANT_CONFIGURATION_CMD,
+    dqa_enable_command, phy_configuration_command, tx_antenna_command,
 };
 pub use interrupts::{
     InterruptMasks, disable_interrupts, enable_firmware_load_interrupts, enable_interrupts,

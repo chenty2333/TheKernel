@@ -994,6 +994,7 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): command-group compatibility, wide command headers, split payload TFDs, response storage and bounds, command ACK lifetime/generation handling, and command-ring publication translated in `tk-axdriver-iwx/src/command.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): interrupt disable/ack and mask transitions, RF-kill state, and ordered NIC/firmware-load startup transitions translated in `tk-axdriver-iwx/src/interrupts.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): contiguous PNVM image copying and Gen3 fragmented PNVM address-array staging translated in `tk-axdriver-iwx/src/dma.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): TX antenna, PHY calibration, and DQA enable command payloads translated in `tk-axdriver-iwx/src/init_cmd.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): generation-specific MPDU antenna-energy offsets and beacon-silence noise averaging translated in `tk-axdriver-iwx/src/rx.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): source-ordered legacy/HT rate table, MCS/rate index conversions, and generation-specific management/multicast TX rate flags translated in `tk-axdriver-iwx/src/rate.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): packed Gen2/Gen3 TX command serialization, header-pad offload and payload TFD submission translated in `tk-axdriver-iwx/src/tx.rs`.
