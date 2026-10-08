@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod apm;
 mod bringup;
+mod channel;
 mod command;
 mod config;
 mod context;
@@ -36,6 +37,11 @@ pub use apm::{
 pub use bringup::{
     FIRMWARE_ALIVE_TIMEOUT_NS, FirmwareLoadError, InitFirmwareError, InitFirmwareState,
     UcodeStartError, load_firmware, load_ucode_wait_alive, run_init_mvm,
+};
+pub use channel::{
+    CHAN_2GHZ, CHAN_40MHZ, CHAN_A, CHAN_CCK, CHAN_DYN, CHAN_HT, CHAN_OFDM, CHAN_PASSIVE, CHAN_VHT,
+    CHANNELS_2GHZ, CHANNELS_5GHZ, CHANNELS_24_5GHZ, CHANX_80MHZ, CHANX_160MHZ, ChannelInfo,
+    init_channel_map,
 };
 pub use command::{
     CMD_ASYNC, CMD_FAILED_MASK, CMD_SEND_DURING_RFKILL, CMD_WANT_RESPONSE, CommandError,

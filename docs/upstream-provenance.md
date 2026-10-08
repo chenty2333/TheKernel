@@ -1005,5 +1005,6 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): FH RX packet validity, length bounds, command header/group decoding, narrow compatibility and 64-byte packet alignment translated in `tk-axdriver-iwx/src/rx_packet.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): CSR/OTP station-address byte ordering, validity predicates and strap-to-OTP fallback translated in `tk-axdriver-iwx/src/mac.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): NVM_GET_INFO request flags, v3/v4 response layouts, SKU/antenna/LAR data and channel profiles translated in `tk-axdriver-iwx/src/nvm.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): 2.4/5 GHz channel mapping, band/SKU filtering, passive/HT/VHT flags and bandwidth extensions translated in `tk-axdriver-iwx/src/channel.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): aligned ICT allocation/drain/swizzle and legacy/MSI-X interrupt cause read/ack/re-enable plans translated in `tk-axdriver-iwx/src/intr.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): RX notification cursor drain, buffer completion delivery and 8-entry-aligned RFH/BZ write-pointer acknowledgement translated in `tk-axdriver-iwx/src/notif.rs`.

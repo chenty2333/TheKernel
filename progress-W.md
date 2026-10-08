@@ -1,6 +1,6 @@
 # W progress
 
-- Device match/config and firmware API89 mapping: complete, commits `30271f67` through `2c3513b1`; Linux-firmware rootfs bundle script remains pending (W-1 partial).
+- Device match/config and firmware API89 mapping: complete (`30271f67` through `2c3513b1`); W-1 rootfs packaging script and licensing path fixed in `cdf6c51b`.
 - Firmware parser / PCI-ID table review W-2..W-18: fixed and committed as `fb4dbdbb`.
 - `if_iwx.c` driver foundation: context image layout and CSR/PRPH access committed (`060919d9`); monitor/debug/LTR support committed (`acc88536`); AX210 RX/TX rings, host-command TFD serialization, CSR/MSI-X interrupt-mask phases committed (`3e9d987e`), `tk-axdriver-iwx` tests 38/38 pass.
 - RX metadata and command lifetimes: signal/noise processing committed (`b1cf7ef7`); bounded command response storage, ACK completion and generation reset committed (`5bd1bb53`); source-order legacy/HT rate selection committed (`dfe2819f`); Gen2/Gen3 frame TX command/TFD serialization now implemented.
@@ -9,7 +9,8 @@
 - Firmware start path: init command payloads (`fec20b0d`), APM/persistence/MSI-X setup (`bf466bea`, `3a04a94b`, `ae19f8f1`), ALIVE/Init MVM sequencing (`f351c60e`), and NIC config/RX startup functions just added.
 - NIC queues: generation-specific scheduler command bytes, command queue selection, ring-size code and response validation implemented.
 - RX receive parsing: FH packet validation, command/group decoding, narrow-command compatibility, and 64-byte advancement implemented (`rx_packet.rs`).
-- Additional NVM setup: 802.11 rate and response parser work remains after driver completion; CSR/OTP address selection and NVM v3/v4 payload parsing are implemented in the next driver segment.
+- Additional NVM setup: CSR/OTP address selection and NVM v3/v4 payload parsing committed in `52d84f95`.
 - Interrupt core: ICT allocation/reset/drain, cause swizzle, legacy/MSI-X cause work planning, register acknowledgement and mask/vector restoration implemented.
 - RX data path: ring completion drain, producer cursor update and RFH/BZ aligned receive pointer acknowledgment implemented.
+- NVM and channel setup: `if_iwx.c iwx_init_channel_map()` now applies the upstream 2.4/5GHz channel tables and NVM profile/HT/VHT/bandwidth flags, with 6GHz truncation matching current net80211 behavior.
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
