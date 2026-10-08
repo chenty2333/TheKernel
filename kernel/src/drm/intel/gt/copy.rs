@@ -707,6 +707,29 @@ pub(super) fn handle_guc_capture_notification(
     Ok(result)
 }
 
+/// Workqueue-side debug-log relay snapshot and GuC flush acknowledgment.
+/// upstream: intel_guc_log.c copy_debug_logs_work()/guc_log_copy_debuglogs_for_relay().
+pub(super) fn process_guc_debug_log_flush(
+    owner: &mut super::Owner,
+    stats: &mut [intel_gt::guc_log::LogStats; 3],
+) -> Result<intel_gt::guc_log::LogSnapshot, Error> {
+    if owner.lost || !owner.bus.awake.load(Ordering::Acquire) {
+        return Err(Error::Refused);
+    }
+    let snapshot = owner
+        .log_memory
+        .as_mut()
+        .ok_or(Error::Refused)?
+        .drain_debug_logs(stats)?;
+    owner
+        .ct_memory
+        .as_mut()
+        .ok_or(Error::Quarantined)?
+        .send_debug_flush_complete(&owner.bus)
+        .map_err(|_| Error::Quarantined)?;
+    Ok(snapshot)
+}
+
 #[cfg(target_os = "none")]
 pub(super) fn take_guc_capture_node(
     owner: &mut super::Owner,
@@ -972,6 +995,11 @@ impl CtDmaMemory {
     /// Acknowledge completed capture-buffer file flush through CTB.
     pub(super) fn send_capture_flush_complete(&mut self, bus: &impl GtIo) -> Result<u16, Error> {
         let action = intel_gt::guc_capture::capture_flush_complete_action();
+        self.send_nonblocking(bus, &action, intel_gt::guc_ct::CT_SEND_NB)
+    }
+
+    pub(super) fn send_debug_flush_complete(&mut self, bus: &impl GtIo) -> Result<u16, Error> {
+        let action = intel_gt::guc_log::flush_log_complete_action();
         self.send_nonblocking(bus, &action, intel_gt::guc_ct::CT_SEND_NB)
     }
 
