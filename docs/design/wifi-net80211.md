@@ -399,9 +399,22 @@ translated:
   `ieee80211_pmksa_find`, and `ieee80211_crypto_clear_groupkeys` are EAPOL/PMKSA
   supplicant/authenticator state; wpa_supplicant owns the four-way handshake
   and PMKSA, while nl80211 installs only the selected CCMP traffic keys.
-- `ieee80211_pae_input.c` and `ieee80211_pae_output.c`: every PAE state/key
-  handler is userspace wpa_supplicant's standard nl80211/EAPOL path. Fuchsia's
-  PAE crates depend on FIDL/std/Fuchsia crypto and are not no_std drop-ins.
+- `ieee80211_pae_input.c`: `ieee80211_eapol_key_input`,
+  `ieee80211_must_update_group_key`, `ieee80211_recv_4way_msg1`,
+  `ieee80211_recv_4way_msg2`, `ieee80211_recv_4way_msg2or4`,
+  `ieee80211_recv_4way_msg3`, `ieee80211_recv_4way_msg4`,
+  `ieee80211_recv_eapol_key_req`, `ieee80211_recv_group_msg2`,
+  `ieee80211_recv_rsn_group_msg1`, and `ieee80211_recv_wpa_group_msg1` are
+  the PAE/EAPOL key state machine and stay with wpa_supplicant.
+- `ieee80211_pae_output.c`: `ieee80211_add_gtk_kde`,
+  `ieee80211_add_igtk_kde`, `ieee80211_add_pmkid_kde`,
+  `ieee80211_eapol_timeout`, `ieee80211_get_eapol_key`,
+  `ieee80211_send_4way_msg1`, `ieee80211_send_4way_msg2`,
+  `ieee80211_send_4way_msg3`, `ieee80211_send_4way_msg4`,
+  `ieee80211_send_eapol_key`, `ieee80211_send_eapol_key_req`,
+  `ieee80211_send_group_msg1`, and `ieee80211_send_group_msg2` are also
+  supplicant PAE/KDE and EAPOL timer/output handlers. Fuchsia's PAE crates
+  depend on FIDL/std/Fuchsia crypto and are not no_std drop-ins.
 - `ieee80211_crypto_tkip.c`: `ieee80211_michael_mic_failure_timeout` and
   `ieee80211_tkip_deauth` are hostap peer-countermeasure/timer callbacks;
   the iwx STA path currently admits WPA2-CCMP only.
