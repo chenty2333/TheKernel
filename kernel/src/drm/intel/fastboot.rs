@@ -1665,6 +1665,13 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             let restored =
                                 capture(&self.registers, &self.power, self.port, self.afc_startup)
                                     .map_err(|e| format!("TC rollback readback failed: {e:?}"))?;
+                            let manager_pll_on = translated_tc_dpll_enabled(self)?;
+                            if manager_pll_on != (restored.pll.enable != 0) {
+                                return Err(String::from(
+                                    "firmware and translated TC DPLL enable readouts disagree \
+                                     after rollback",
+                                ));
+                            }
                             if !same_mode_state(
                                 &restored,
                                 &self.baseline,
