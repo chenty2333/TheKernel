@@ -200,3 +200,6 @@ layer = "integration"
 
 [dependencies.tk-acpica]
 path = "../crates/ax/tk-acpica"
+
+[dependencies.tk-i2c]
+path = "../crates/ax/tk-i2c"

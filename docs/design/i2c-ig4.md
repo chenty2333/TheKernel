@@ -1,12 +1,13 @@
 # Intel LPSS I2C / DesignWare controller
 
-The controller core is a no-std register engine based on FreeBSD
+`tk-i2c` contains a function-level translation of FreeBSD
 `sys/dev/ichiic/ig4_iic.c`, `ig4_reg.h`, `ig4_var.h`, `ig4_pci.c`, and
-`ig4_acpi.c`. It exposes the standard/faster-speed settings, combined
-read/write transactions, bounded FIFO polling, transmit-abort handling,
-ACPI `I2cSerialBusV2` child addresses, and the N305 `8086:54e8` / `8086:54ea`
-IDs. The PCI/ACPI resource attachment, device model registration, I2C-dev
-character-device ioctls and `/dev/i2c-N` publication remain untranslated: the
-platform resource and devfs lifecycle interfaces required to do these safely
-are not yet exposed to this crate. Consequently this commit provides a
-controller core, not yet a product-bound I2C driver.
+`ig4_acpi.c`: controller transfer/error/timeout/suspend/resume paths, all 140
+PCI device-table rows, ACPI matching/resource hooks, and LPSS private-register
+handling. The PCI walker binds the Intel LPSS IDs by default, maps BAR0, and
+registers the controller; the ACPICA resource parser decodes I2cSerialBusV2
+child addresses/speeds and the controller ACPI companion provider associates
+them with the PCI function. Devfs publishes `/dev/i2c-N` with the Linux i2c-dev
+ioctls, bounded I2C_RDWR, and SMBus byte/word/I2C-block operations. The x86 adapter requires MSI for attach and retains
+bounded polling when the caller cannot block. The translated interrupt path
+masks and wakes the transfer waiter before it clears controller status.

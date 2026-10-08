@@ -51,7 +51,8 @@ bus-pci = [
     "dep:axsync",
     "dep:lazyinit",
 ]
-default = ["bus-pci"]
+default = ["bus-pci", "i2c"]
+i2c = ["bus-pci", "dep:tk-i2c", "dep:spin", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq"]
 display = ["dep:axdriver_display"]
 dyn = [
     "dep:axerrno",
@@ -338,4 +339,8 @@ optional = true
 [dependencies.axdriver_dbc]
 package = "tk-axdriver-dbc"
 path = "../tk-axdriver-dbc"
+optional = true
+
+[dependencies.tk-i2c]
+path = "../tk-i2c"
 optional = true

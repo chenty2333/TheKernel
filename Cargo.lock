@@ -3255,6 +3255,7 @@ dependencies = [
  "tk-axhal",
  "tk-axsync",
  "tk-axtask",
+ "tk-i2c",
  "tk-ratelimit",
 ]
 
@@ -3736,6 +3737,7 @@ dependencies = [
  "tk-axsync",
  "tk-axtask",
  "tk-axtlb",
+ "tk-i2c",
  "tk-intel-display",
  "tk-intel-gt",
  "tk-kernel-elf-parser",

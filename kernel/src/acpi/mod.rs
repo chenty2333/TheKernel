@@ -165,3 +165,6 @@ mod tests {
         assert_eq!(super::select_native(Some("")), Err(()));
     }
 }
+
+// I2C PCI companions and I2cSerialBusV2 child enumeration for tk-axdriver.
+pub(crate) mod i2c;

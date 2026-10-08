@@ -1,0 +1,130 @@
+//! ACPICA resource provider for default-enabled I2C controllers.
+use alloc::{format, string::String, vec::Vec};
+
+use axdriver::i2c::{AcpiI2cChild, AcpiI2cSupport};
+use tk_acpica::{Engine, Node, Value};
+
+fn engine_child_devices(engine: &Engine, nodes: &[Node], controller: &str) -> Vec<AcpiI2cChild> {
+    let mut children = Vec::new();
+    for node in nodes.iter().filter(|node| node.kind == 6) {
+        let hid = match engine.hardware_id(&node.path) {
+            Ok(hid) if matches!(hid.as_str(), "PNP0C50" | "ACPI0C50") => hid,
+            _ => continue,
+        };
+        let resources = match engine.resources(&node.path, false) {
+            Ok(resources) => resources,
+            Err(status) => {
+                warn!("acpica: I2C HID {} _CRS failed {status:#x}", node.path);
+                continue;
+            }
+        };
+        let buses = match tk_acpica::resources::parse_i2c_serial_buses(&resources) {
+            Ok(buses) => buses,
+            Err(status) => {
+                warn!("acpica: I2C HID {} _CRS malformed {status:#x}", node.path);
+                continue;
+            }
+        };
+        for bus in buses {
+            let Ok(source) = core::str::from_utf8(&bus.resource_source) else {
+                warn!(
+                    "acpica: I2C HID {} has a non-UTF8 ResourceSource",
+                    node.path
+                );
+                continue;
+            };
+            if source != controller {
+                continue;
+            }
+            children.push(AcpiI2cChild {
+                path: node.path.clone(),
+                hid: hid.clone(),
+                slave_address: bus.slave_address,
+                ten_bit: bus.ten_bit,
+                speed_hz: bus.connection_speed_hz,
+            });
+        }
+    }
+    children
+}
+
+fn direct_pci_companion(
+    engine: &Engine,
+    nodes: &[Node],
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+) -> Option<String> {
+    for root in nodes.iter().filter(|node| node.kind == 6) {
+        if !matches!(
+            engine.hardware_id(&root.path).as_deref(),
+            Ok("PNP0A03" | "PNP0A08")
+        ) {
+            continue;
+        }
+        let root_segment = engine.integer(&format!("{}._SEG", root.path)).unwrap_or(0);
+        let root_bus = engine.integer(&format!("{}._BBN", root.path)).unwrap_or(0);
+        if root_segment != u64::from(segment) || root_bus != u64::from(bus) {
+            continue;
+        }
+        let prefix = format!("{}.", root.path);
+        for candidate in nodes.iter().filter(|node| node.kind == 6) {
+            let Some(tail) = candidate.path.strip_prefix(&prefix) else {
+                continue;
+            };
+            if tail.contains('.') {
+                continue;
+            }
+            let Ok(adr) = engine.integer(&format!("{}._ADR", candidate.path)) else {
+                continue;
+            };
+            if adr >> 16 == u64::from(device) && adr & 0xffff == u64::from(function) {
+                return Some(candidate.path.clone());
+            }
+        }
+    }
+    None
+}
+
+struct AcpiI2cServices;
+
+#[crate_interface::impl_interface]
+impl AcpiI2cSupport for AcpiI2cServices {
+    fn controller_path(segment: u16, bus: u8, device: u8, function: u8) -> Option<String> {
+        crate::acpi::with_engine(|engine| {
+            let nodes = engine.namespace().ok()?;
+            direct_pci_companion(engine, &nodes, segment, bus, device, function)
+        })
+        .flatten()
+    }
+    fn enumerate_children(controller_path: &str) -> Vec<AcpiI2cChild> {
+        crate::acpi::with_engine(|engine| {
+            let Ok(nodes) = engine.namespace() else {
+                return Vec::new();
+            };
+            engine_child_devices(engine, &nodes, controller_path)
+        })
+        .unwrap_or_default()
+    }
+    fn clock_params(controller_path: &str, method: &str) -> Option<[u64; 3]> {
+        crate::acpi::with_engine(|engine| {
+            let path = format!("{controller_path}.{method}");
+            let Value::Package(values) = engine.evaluate(&path, &[]).ok()? else {
+                return None;
+            };
+            if values.len() != 3 {
+                return None;
+            }
+            let mut params = [0; 3];
+            for (index, value) in values.iter().enumerate() {
+                let Value::Integer(value) = value else {
+                    return None;
+                };
+                params[index] = *value;
+            }
+            Some(params)
+        })
+        .flatten()
+    }
+}

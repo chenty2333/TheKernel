@@ -621,6 +621,10 @@ impl AllDevices {
             }
             match config_pci_device(root, bdf, &mut allocator) {
                 Ok(_) => {
+                    #[cfg(feature = "i2c")]
+                    if crate::i2c::probe(root, bdf, dev_info) {
+                        return;
+                    }
                     #[cfg(feature = "usb-xhci")]
                     if dev_info.class == 0x0c
                         && dev_info.subclass == 0x03

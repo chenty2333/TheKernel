@@ -95,6 +95,9 @@ mod usb;
 #[cfg(feature = "usb-xhci")]
 pub use usb::observations as usb_observations;
 
+#[cfg(feature = "i2c")]
+pub mod i2c;
+
 #[cfg(any(net_dev = "igc", net_dev = "n305-net"))]
 mod igc;
 #[cfg(any(net_dev = "rtl8125", net_dev = "n305-net"))]
