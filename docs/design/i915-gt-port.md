@@ -21,3 +21,7 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 ## 移植边界
 
 不翻译 Linux DRM 框架、debugfs/sysfs 管理面、非 Gen12 平台路径及任务未列出的显示功能。GSC、LMEM-only/独显路径以及需要尚不存在的内核内存/用户页能力部分，先核对 Gen12 ADL 集显调用路径；不能安全映射的功能记录为未移植，不以占位成功掩盖。上游代码按函数保留控制流和错误顺序，翻译文件顶部登记来源/完整版权行，每个翻译函数用 `// upstream: <文件> <函数>()` 标注；MIT 全文及来源登记遵守 `COMMON.md`。
+
+## 已接入的 uC 传输切片
+
+`crates/ax/tk-intel-gt/src/uc.rs` 已包含 TGL/RKL/ADL-S/P/N 固件候选表、CSS 大小校验、固件版本检查、ADL-S/N 默认 HuC-only policy 与 GuC submission ABI 版本规则。N305 GT 在 owner 初始化后注册 rootfs-ready 回调，从 `/lib/firmware/i915/...` 取回固件；在 MIA 确认处于 reset 时，将 HuC 先于 GuC 暂存到固定物理页/GGTT，并按 `intel_uc_fw.c` DMA 顺序上传、按 `intel_guc_fw.c` 写 RSA scratch 和轮询 READY。只有确认 DMA 完成后才解绑映射；无法确认时保留页与绑定并 quarantine owner。当前只支持 CSS RSA 为固定 256 字节的 Gen12 MMIO 路径；较大的 GGTT RSA VMA、GuC/HuC 初始化其余函数、HuC authentication/CT/调度，以及 resume/re-upload 仍未移植，因此这不等同于媒体解码或 GuC submission 已可用。

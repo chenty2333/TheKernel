@@ -7,10 +7,9 @@ use alloc::{format, string::String};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering, compiler_fence};
 
 use axsync::Mutex;
-use intel_gt::{Error, GtIo};
-
 #[cfg(target_os = "none")]
 use intel_gt::uc::{self, FirmwareImage, Kind, Platform};
+use intel_gt::{Error, GtIo};
 
 #[cfg(target_os = "none")]
 use super::pci;
@@ -105,6 +104,15 @@ impl Bus {
         if (0x24d0..0x2500).contains(&r) {
             return self.rcs_owned.load(Ordering::Acquire)
                 && self.render_awake.load(Ordering::Acquire);
+        }
+        if [0xc064, 0x13816c].contains(&r) {
+            return write && self.awake.load(Ordering::Acquire);
+        }
+        if (0xc200..=0xc2fc).contains(&r) {
+            return write && self.awake.load(Ordering::Acquire);
+        }
+        if (0xc300..=0xc314).contains(&r) {
+            return self.awake.load(Ordering::Acquire) && (write || r == 0xc314);
         }
         if self.rcs_owned.load(Ordering::Acquire) && self.render_awake.load(Ordering::Acquire) {
             if matches!(r, 0x2030 | 0x2034 | 0x8000) {
@@ -202,6 +210,8 @@ struct Owner {
     render_ready: bool,
     // Published before an ELSQ load; retained through any ambiguous reset/DMA.
     memory: Option<copy::Memory>,
+    // Firmware source mapping retained if DMA completion cannot be proven.
+    uc_memory: Option<copy::UcDmaMemory>,
 }
 pub(super) mod copy;
 static READY: AtomicBool = AtomicBool::new(false);
@@ -211,7 +221,6 @@ pub(super) fn registered() -> bool {
 static OWNER: Mutex<Option<Owner>> = Mutex::new(None);
 
 #[cfg(target_os = "none")]
-#[derive(Default)]
 struct UcFirmware {
     guc: Option<FirmwareImage>,
     huc: Option<FirmwareImage>,
@@ -252,7 +261,8 @@ fn load_uc_firmware() {
         Ok(image) => {
             let css = uc::guc_css_info(image.css.version, image.css);
             axlog::info!(
-                "intel-gt: GuC firmware {} selected, CSS {:?}, submission {:?}, private data {} bytes, image {} bytes",
+                "intel-gt: GuC firmware {} selected, CSS {:?}, submission {:?}, private data {} \
+                 bytes, image {} bytes",
                 image.blob.path,
                 image.css.version,
                 css.submission_version,
@@ -275,6 +285,33 @@ fn load_uc_firmware() {
         }
         Err(error) => axlog::warn!("intel-gt: HuC firmware unavailable: {error:?}"),
     }
+    if let (Some(guc), Some(huc)) = (state.guc.as_ref(), state.huc.as_ref()) {
+        let mut owner = OWNER.lock();
+        let Some(owner) = owner.as_mut().filter(|owner| !owner.lost) else {
+            axlog::warn!("intel-gt: firmware validated but GT owner is unavailable");
+            return;
+        };
+        let guc_status = match owner.bus.read(0xc000) {
+            Ok(status) => status,
+            Err(error) => {
+                axlog::warn!("intel-gt: GuC status unavailable before upload: {error:?}");
+                return;
+            }
+        };
+        if guc_status & 1 == 0 {
+            axlog::warn!("intel-gt: GuC is not confirmed in reset; refuse uC DMA upload");
+            return;
+        }
+        match copy::upload_uc_firmware(owner, guc, huc) {
+            Ok(()) => axlog::info!("intel-gt: HuC then GuC firmware DMA uploads completed"),
+            Err(error) => {
+                if error == Error::Quarantined {
+                    owner.lost = true;
+                }
+                axlog::warn!("intel-gt: uC DMA upload failed: {error:?}");
+            }
+        }
+    }
 }
 
 /// Task-context coordination only, not proof of firmware interrupt masks.
@@ -289,7 +326,7 @@ pub(super) fn display_irq_owner_idle() -> bool {
     };
     owner
         .as_ref()
-        .is_none_or(|owner| !owner.lost && owner.memory.is_none())
+        .is_none_or(|owner| !owner.lost && owner.memory.is_none() && owner.uc_memory.is_none())
 }
 
 /// Capability probes use only a successfully bootstrapped, still-live owner.
@@ -352,8 +389,12 @@ pub(super) fn init_at_boot() {
         let (bdf, window) = windows[0];
         initialize(bdf, window)
     };
+    let initialized = result.is_ok();
     let text = result.unwrap_or_else(|s| s);
     axlog::info!("{text}");
+    if initialized && !axdriver::prelude::firmware::on_rootfs_ready(load_uc_firmware) {
+        axlog::warn!("intel-gt: rootfs firmware callback table is full; GuC/HuC left unloaded");
+    }
     if let Some((bdf, _)) = windows.first() {
         super::GT_REPORT.lock().push((*bdf, text));
     }
@@ -376,11 +417,6 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             "GT requires exact N305 Gen12/media A0; no writes",
         ));
     }
-    if !axdriver::prelude::firmware::on_rootfs_ready(load_uc_firmware) {
-        return Err(String::from(
-            "GT rootfs firmware callback table is full; no GuC/HuC firmware access",
-        ));
-    }
     let bus = Bus {
         window,
         awake: AtomicBool::new(false),
@@ -396,6 +432,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             lost: true,
             render_ready: false,
             memory: None,
+            uc_memory: None,
         });
         return Err(format!(
             "GT forcewake failed: {error:?}; terminal owner, no submission"
@@ -418,6 +455,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 lost: false,
                 render_ready: false,
                 memory: None,
+                uc_memory: None,
             };
             let copied = copy::run(&mut device, bdf).and_then(|()| {
                 if axhal::boot::command_line_value("intel.rcs") == Some("1") {
@@ -462,6 +500,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 lost: true,
                 render_ready: false,
                 memory: None,
+                uc_memory: None,
             });
             Err(format!(
                 "intel-gt: initialization failed {error:?}; wake-release-verified={released}; no \

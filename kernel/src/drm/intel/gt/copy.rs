@@ -420,6 +420,97 @@ pub(super) struct Memory {
     saved: Option<Arc<SavedContext>>,
     switch: Option<Box<SwitchAway>>,
 }
+
+/// A firmware GGTT source retained until its DMA completion has been proven.
+#[cfg(target_os = "none")]
+pub(super) struct UcDmaMemory {
+    _gtt: Arc<Gtt>,
+    _ram: Ram,
+    _binding: Binding,
+}
+
+#[cfg(target_os = "none")]
+fn upload_uc_one(
+    owner: &mut super::Owner,
+    image: &intel_gt::uc::FirmwareImage,
+) -> Result<(), Error> {
+    if image.bytes.is_empty() || image.bytes.len() > 2 * 1024 * 1024 {
+        return Err(Error::Refused);
+    }
+    let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+    let pages = image
+        .bytes
+        .len()
+        .checked_add(PAGE - 1)
+        .ok_or(Error::Refused)?
+        / PAGE;
+    let ram = Ram::allocate(pages)?;
+    ram.write(0, &image.bytes)?;
+    ram.flush();
+    let binding = gtt
+        .bind_pages(&ram.physical)
+        .map_err(|_| Error::Quarantined)?;
+    let transfer = match image.kind {
+        intel_gt::uc::Kind::HuC => {
+            intel_gt::guc_fw::huc_upload(&owner.bus, binding.address, image, false)
+        }
+        intel_gt::uc::Kind::GuC => intel_gt::guc_fw::guc_upload(&owner.bus, binding.address, image)
+            .map(|_| ())
+            .map_err(|error| match error {
+                intel_gt::guc_fw::LoadError::Io(error) => error,
+                intel_gt::guc_fw::LoadError::Firmware(_) => Error::Refused,
+                intel_gt::guc_fw::LoadError::Timeout { .. } => Error::Timeout(0xc000),
+            }),
+    };
+    if let Err(error) = transfer {
+        let release_failed = if error == Error::Quarantined {
+            true
+        } else {
+            // SAFETY: non-quarantine errors are returned only after DMA is
+            // either not started or its completion was observed.
+            unsafe { gtt.release_binding(&binding) }.is_err()
+        };
+        if release_failed {
+            owner.uc_memory = Some(UcDmaMemory {
+                _gtt: gtt,
+                _ram: ram,
+                _binding: binding,
+            });
+            return Err(Error::Quarantined);
+        }
+        return Err(error);
+    }
+    // SAFETY: GuC/HuC DMA completion has been observed before success returns.
+    if unsafe { gtt.release_binding(&binding) }.is_err() {
+        owner.uc_memory = Some(UcDmaMemory {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+        });
+        return Err(Error::Quarantined);
+    }
+    Ok(())
+}
+
+/// Upload HuC first, then GuC as in intel_uc_init_hw(). The current ADL-N
+/// default loads/authenticates HuC but does not enable GuC submission queues.
+#[cfg(target_os = "none")]
+pub(super) fn upload_uc_firmware(
+    owner: &mut super::Owner,
+    guc: &intel_gt::uc::FirmwareImage,
+    huc: &intel_gt::uc::FirmwareImage,
+) -> Result<(), Error> {
+    if owner.lost || owner.memory.is_some() || owner.uc_memory.is_some() {
+        return Err(Error::Quarantined);
+    }
+    super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
+    if !owner.bus.awake.load(Ordering::Acquire) {
+        return Err(Error::Refused);
+    }
+    upload_uc_one(owner, huc)?;
+    upload_uc_one(owner, guc)
+}
+
 impl Memory {
     fn allocate(gtt: Arc<Gtt>) -> Result<Self, Error> {
         let mut bindings = Vec::new();

@@ -74,9 +74,11 @@ fn firmware_dma_xfer_with_timeout(
 }
 
 // upstream: intel_guc_fw.c guc_xfer_rsa_mmio()
+// The ADL-N MMIO path is the fixed 256-byte key; larger signatures require
+// the upstream GGTT-pinned RSA VMA path and are refused until implemented.
 fn rsa_words(image: &FirmwareImage) -> Result<[u32; UOS_RSA_SCRATCH_COUNT], Error> {
     const RSA_BYTES: usize = UOS_RSA_SCRATCH_COUNT * 4;
-    if image.css.rsa_bytes < RSA_BYTES {
+    if image.css.rsa_bytes != RSA_BYTES {
         return Err(Error::Refused);
     }
     let start = image
