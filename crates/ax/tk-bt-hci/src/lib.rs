@@ -183,6 +183,7 @@ pub struct Adapter<T> {
     monitor: VecDeque<Vec<u8>>,
     incoming: VecDeque<IncomingPacket>,
     observed_events: VecDeque<Vec<u8>>,
+    observed_acls: VecDeque<Vec<u8>>,
     stats: Statistics,
 }
 
@@ -204,6 +205,7 @@ impl<T: UsbTransport> Adapter<T> {
             monitor: VecDeque::new(),
             incoming: VecDeque::new(),
             observed_events: VecDeque::new(),
+            observed_acls: VecDeque::new(),
             stats: Statistics::default(),
         }
     }
@@ -483,6 +485,10 @@ impl<T: UsbTransport> Adapter<T> {
             PacketType::Acl => {
                 self.stats.acl_rx = self.stats.acl_rx.saturating_add(1);
                 self.queue_monitor(5, &bytes[..length]);
+                if self.observed_acls.len() == 64 {
+                    self.observed_acls.pop_front();
+                }
+                self.observed_acls.push_back(Vec::from(&bytes[..length]));
             }
             _ => return Err(Error::Unsupported),
         }
@@ -503,6 +509,11 @@ impl<T: UsbTransport> Adapter<T> {
     /// the event from raw/user HCI sockets.
     pub fn pop_observed_event(&mut self) -> Option<Vec<u8>> {
         self.observed_events.pop_front()
+    }
+    /// Pop an ACL packet observed by the asynchronous receive pump. The packet
+    /// remains queued independently for the bound raw/user socket consumer.
+    pub fn pop_observed_acl(&mut self) -> Option<Vec<u8>> {
+        self.observed_acls.pop_front()
     }
     // upstream: iwmbt_hw.c iwmbt_hci_command()
     /// Send an HCI command and read its matching Command Complete event. This
@@ -1214,6 +1225,27 @@ mod tests {
         assert_eq!(u16::from_le_bytes([monitor[2], monitor[3]]), 3);
         assert_eq!(&monitor[6..], &[1, 0, 2, 0, 0xaa, 0xbb]);
         assert_eq!(adapter.statistics().acl_rx, 1);
+    }
+
+    #[test]
+    fn background_acl_observer_tap_preserves_packet_for_socket_reader() {
+        let packet = vec![1, 0, 2, 0, 0xaa, 0xbb];
+        let mut adapter = Adapter::new(
+            RxFake {
+                packet: Some((PacketType::Acl, packet.clone())),
+            },
+            3,
+        );
+        adapter.open(Channel::Raw).unwrap();
+        adapter.set_up(true).unwrap();
+        assert_eq!(adapter.pump_receive(), Ok(true));
+        assert_eq!(adapter.pop_observed_acl(), Some(packet.clone()));
+        let mut output = [0u8; 8];
+        assert_eq!(
+            adapter.receive_packet(&mut output, true),
+            Ok((PacketType::Acl, 6))
+        );
+        assert_eq!(&output[..6], &packet);
     }
 
     #[test]

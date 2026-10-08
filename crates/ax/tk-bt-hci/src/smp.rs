@@ -13,6 +13,28 @@ pub const PAIRING_RESPONSE: u8 = 0x02;
 pub const PAIRING_FAILED: u8 = 0x05;
 pub const PAIRING_PUBLIC_KEY: u8 = 0x0c;
 
+/// Frame one complete SMP PDU in an HCI ACL packet and its L2CAP header.
+pub fn build_acl_packet(handle: u16, pdu: &[u8]) -> Result<Vec<u8>, crate::Error> {
+    if handle > 0x0fff || pdu.is_empty() || pdu.len() > u16::MAX as usize - 4 {
+        return Err(crate::Error::InvalidLength);
+    }
+    let l2cap_length = u16::try_from(pdu.len()).map_err(|_| crate::Error::InvalidLength)?;
+    let acl_length = l2cap_length
+        .checked_add(4)
+        .ok_or(crate::Error::InvalidLength)?;
+    let mut packet = Vec::new();
+    packet
+        .try_reserve_exact(4 + usize::from(acl_length))
+        .map_err(|_| crate::Error::NoMemory)?;
+    packet.extend_from_slice(&(handle | 0x2000).to_le_bytes()); // PB=first non-flushable
+    packet.extend_from_slice(&acl_length.to_le_bytes());
+    packet.extend_from_slice(&l2cap_length.to_le_bytes());
+    packet.extend_from_slice(&SMP_CID.to_le_bytes());
+    packet.extend_from_slice(pdu);
+    crate::Packet::parse(crate::PacketType::Acl, &packet)?;
+    Ok(packet)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PairingFeatures {
     pub io_capability: u8,
@@ -30,6 +52,8 @@ impl PairingFeatures {
         }
         if pdu[1] > 4
             || pdu[2] > 1
+            || pdu[3] & !0x3f != 0
+            || pdu[3] & 0x03 > 1
             || !(7..=16).contains(&pdu[4])
             || pdu[5] & !0x07 != 0
             || pdu[6] & !0x07 != 0
@@ -51,6 +75,8 @@ impl PairingFeatures {
             || self.io_capability > 4
             || self.max_key_size < 7
             || self.max_key_size > 16
+            || self.auth_req & !0x3f != 0
+            || self.auth_req & 0x03 > 1
             || self.initiator_key_distribution & !0x07 != 0
             || self.responder_key_distribution & !0x07 != 0
         {
@@ -71,6 +97,11 @@ impl PairingFeatures {
     /// and MITM-required associations fail closed rather than silently falling
     /// back to unauthenticated Just Works.
     pub fn negotiate_just_works(self, peer: Self) -> Result<Negotiated, PairingError> {
+        if peer.initiator_key_distribution & !self.initiator_key_distribution != 0
+            || peer.responder_key_distribution & !self.responder_key_distribution != 0
+        {
+            return Err(PairingError::InvalidFeatures);
+        }
         if self.oob_data || peer.oob_data || self.auth_req & 0x04 != 0 || peer.auth_req & 0x04 != 0
         {
             return Err(PairingError::AuthenticationUnsupported);
@@ -78,11 +109,12 @@ impl PairingFeatures {
         let secure_connections = self.auth_req & 0x08 != 0 && peer.auth_req & 0x08 != 0;
         Ok(Negotiated {
             secure_connections,
+            bonding: self.auth_req & 0x03 != 0 && peer.auth_req & 0x03 != 0,
             key_size: self.max_key_size.min(peer.max_key_size),
             initiator_key_distribution: self.initiator_key_distribution
-                & peer.responder_key_distribution,
-            responder_key_distribution: self.responder_key_distribution
                 & peer.initiator_key_distribution,
+            responder_key_distribution: self.responder_key_distribution
+                & peer.responder_key_distribution,
         })
     }
 }
@@ -90,6 +122,7 @@ impl PairingFeatures {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Negotiated {
     pub secure_connections: bool,
+    pub bonding: bool,
     pub key_size: u8,
     pub initiator_key_distribution: u8,
     pub responder_key_distribution: u8,
@@ -104,6 +137,7 @@ pub enum PairingError {
     ConfirmFailed,
     InvalidPublicKey,
     DhKeyCheckFailed,
+    PeerFailed,
 }
 
 /// An LE central's bounded SMP exchange state. `address` values use Core
@@ -141,6 +175,7 @@ enum Phase {
     AwaitRandom,
     AwaitDhKeyCheck,
     AwaitEncryption,
+    DistributingKeys,
     Complete,
     Failed,
 }
@@ -198,6 +233,27 @@ impl Initiator {
         self.negotiated
     }
 
+    pub fn long_term_key(&self) -> Option<[u8; 16]> {
+        self.ltk
+    }
+
+    /// Move to phase 3 only after a successful controller encryption event.
+    pub fn encryption_complete(&mut self, success: bool) -> Result<(), PairingError> {
+        if self.phase != Phase::AwaitEncryption {
+            return Err(PairingError::InvalidState);
+        }
+        if !success {
+            self.phase = Phase::Failed;
+            return Err(PairingError::InvalidState);
+        }
+        self.phase = Phase::DistributingKeys;
+        Ok(())
+    }
+
+    pub fn distributing_keys(&self) -> bool {
+        self.phase == Phase::DistributingKeys
+    }
+
     pub fn handle(&mut self, pdu: &[u8]) -> Action {
         match self.handle_inner(pdu) {
             Ok(actions) => actions,
@@ -210,8 +266,11 @@ impl Initiator {
 
     fn handle_inner(&mut self, pdu: &[u8]) -> Result<Action, PairingError> {
         if pdu.first() == Some(&PAIRING_FAILED) {
+            if pdu.len() != 2 {
+                return Err(PairingError::InvalidPdu);
+            }
             self.phase = Phase::Failed;
-            return Err(PairingError::InvalidState);
+            return Err(PairingError::PeerFailed);
         }
         match self.phase {
             Phase::AwaitResponse => {
@@ -377,6 +436,7 @@ impl Initiator {
                 Ok(Action::StartEncryption(ltk))
             }
             Phase::AwaitEncryption => Err(PairingError::InvalidState),
+            Phase::DistributingKeys => Err(PairingError::InvalidState),
             Phase::Complete | Phase::Failed => Err(PairingError::InvalidState),
             _ => Err(PairingError::InvalidState),
         }
@@ -459,6 +519,7 @@ mod tests {
             local.negotiate_just_works(peer),
             Ok(Negotiated {
                 secure_connections: true,
+                bonding: true,
                 key_size: 12,
                 initiator_key_distribution: 3,
                 responder_key_distribution: 3,
@@ -472,6 +533,41 @@ mod tests {
             local.negotiate_just_works(features(0x05, 16)),
             Err(PairingError::AuthenticationUnsupported)
         );
+        let mut peer_with_extra_distribution = features(0x09, 16);
+        peer_with_extra_distribution.initiator_key_distribution = 4;
+        assert_eq!(
+            local.negotiate_just_works(peer_with_extra_distribution),
+            Err(PairingError::InvalidFeatures)
+        );
+    }
+
+    #[test]
+    fn smp_pdu_is_framed_as_one_checked_l2cap_acl_packet() {
+        assert_eq!(
+            build_acl_packet(0x0123, &[PAIRING_REQUEST, 3, 0, 9, 16, 3, 3]).unwrap(),
+            [
+                0x23,
+                0x21,
+                11,
+                0,
+                7,
+                0,
+                6,
+                0,
+                PAIRING_REQUEST,
+                3,
+                0,
+                9,
+                16,
+                3,
+                3
+            ]
+        );
+        assert_eq!(
+            build_acl_packet(0x1000, &[1]),
+            Err(crate::Error::InvalidLength)
+        );
+        assert_eq!(build_acl_packet(1, &[]), Err(crate::Error::InvalidLength));
     }
 
     #[test]
@@ -618,5 +714,7 @@ mod tests {
             session.handle(&pdu_with_key(0x0d, &peer_check)),
             Action::StartEncryption(ltk)
         );
+        assert!(session.encryption_complete(true).is_ok());
+        assert!(session.distributing_keys());
     }
 }

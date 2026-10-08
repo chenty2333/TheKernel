@@ -100,6 +100,7 @@ pub use usb::observations as usb_observations;
 pub use usb::{UsbBluetoothHci, bluetooth_devices};
 #[cfg(feature = "usb-xhci")]
 pub use tk_bt_hci::{Channel as BluetoothChannel, Error as BluetoothError, PacketType as BluetoothPacketType};
+pub use tk_bt_hci::smp as bluetooth_smp;
 
 #[cfg(feature = "input")]
 #[path = "usb/hid_report.rs"]

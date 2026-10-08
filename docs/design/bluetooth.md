@@ -28,11 +28,11 @@ Empty LOAD_LINK_KEYS/LOAD_LONG_TERM_KEYS/LOAD_IRKS batches are accepted as no-op
 NEW_SETTINGS and DISCOVERING are fanned out to currently bound control
 sockets, but raw HCI event to mgmt event translation remains incomplete.
 
-2026-10-09 management follow-up: valid nonempty LOAD_LINK_KEYS, LOAD_LONG_TERM_KEYS and LOAD_IRKS records are validated and retained in the controller's host-side key cache; PAIR_DEVICE issues a BR/EDR or LE connection command and DISCONNECT issues HCI Disconnect for a tracked handle. SET_BREDR (mgmt opcode 0x002a) controls the advertised host state and gates BR/EDR inquiry; it does not switch a physical radio mode in hardware. Raw HCI event fan-out now translates inquiry/LE advertising reports to DEVICE_FOUND, classic/LE connect/disconnect state to DEVICE_CONNECTED/DISCONNECTED, HCI authentication failures to AUTH_FAILED, and classic HCI Link Key Notification to NEW_LINK_KEY. The HCI transport's async event tap preserves events for raw sockets while management subscribers receive corresponding notifications. NEW_LONG_TERM_KEY generation still needs an SMP pairing engine: controller LE LTK request events do not contain newly generated key material, so that event is not advertised. Pairing currently initiates a connection only; SMP, PIN/IO-capability exchanges and completion remain incomplete. Loaded link keys and LTKs answer matching HCI Link Key Request and LE Long Term Key Request events from a volatile host cache; there is no durable key store, IRKs are retained but not yet programmed into a controller resolving list, and physical-controller acceptance remains incomplete. Disconnect-reason fidelity is limited to mapped HCI reason codes. No-device BlueZ/QEMU acceptance covers only management framing and invalid-index responses.
+2026-10-09 management follow-up: valid nonempty LOAD_LINK_KEYS, LOAD_LONG_TERM_KEYS and LOAD_IRKS records are validated and retained in the controller's host-side key cache; PAIR_DEVICE issues a BR/EDR or LE connection command and DISCONNECT issues HCI Disconnect for a tracked handle. SET_BREDR (mgmt opcode 0x002a) controls the advertised host state and gates BR/EDR inquiry; it does not switch a physical radio mode in hardware. Raw HCI event fan-out now translates inquiry/LE advertising reports to DEVICE_FOUND, classic/LE connect/disconnect state to DEVICE_CONNECTED/DISCONNECTED, HCI authentication failures to AUTH_FAILED, and classic HCI Link Key Notification to NEW_LINK_KEY. The HCI transport's async event tap preserves events for raw sockets while management subscribers receive corresponding notifications. At this implementation stage, SMP was not integrated. Loaded link keys and LTKs answer matching HCI requests from a volatile host cache; disconnect-reason fidelity is limited to mapped HCI reason codes. No-device BlueZ/QEMU acceptance covers only management framing and invalid-index responses; the later LE SMP section below supersedes the pairing status.
 
 The HCI event tap also handles LE Connection Complete and Inquiry Result with RSSI when those events reach the receive worker; event parameters use the BlueZ management `mgmt_addr_info` / RSSI / flags / EIR framing. These conversion paths have source-level validation but remain unverified on physical Bluetooth hardware.
 
-Current controller-backed mgmt status (supersedes the earlier implementation snapshot above): `SET_BREDR`, SET_IO_CAPABILITY, PIN_CODE_REPLY/NEG_REPLY, USER_CONFIRM_REPLY/NEG_REPLY and the management PIN/numeric-confirmation events are routed to HCI. Classic BR/EDR PAIR_DEVICE now starts connection/authentication and answers HCI IO Capability Request; LE PAIR_DEVICE starts a connection but still lacks SMP. Loaded link keys and LTKs answer their matching HCI key-request events from the volatile cache. The no-controller command/event table advertises 22 commands and 9 events; no-device QEMU smoke validates this table and error responses. Physical HCI behavior is unverified.
+Controller-backed mgmt status before LE SMP integration: `SET_BREDR`, SET_IO_CAPABILITY, PIN_CODE_REPLY/NEG_REPLY, USER_CONFIRM_REPLY/NEG_REPLY and the management PIN/numeric-confirmation events are routed to HCI. Classic BR/EDR PAIR_DEVICE starts connection/authentication and answers HCI IO Capability Request. Loaded link keys and LTKs answer matching HCI requests from the volatile cache. The no-controller QEMU smoke validates the framing and error responses; physical HCI behavior remains unverified. The current command/event table and LE pairing state are recorded below.
 
 `SET_PRIVACY` retains the local IRK; when privacy is enabled and the controller is up, the driver clears/repopulates the standard LE resolving list from loaded public/random IRKs and enables controller address resolution. `LOAD_IRKS` refreshes that list only while privacy is enabled. This is controller-backed HCI programming, but privacy-mode acceptance still needs a physical Intel controller.
 
@@ -66,3 +66,25 @@ post-encryption key distribution, bond persistence, mgmt `PAIR_DEVICE` completio
 or `NEW_LONG_TERM_KEY`/`NEW_IRK` events. Passkey/Numeric Comparison UI and
 peripheral-role pairing are also unsupported. Thus this is tested protocol core,
 not end-to-end LE pairing; no hardware pairing success is claimed.
+
+2026-10-09 LE pairing integration follow-up: `PAIR_DEVICE` for LE now installs a
+central-side SMP Just Works session on successful LE connection, sends the
+Pairing Request on ACL/L2CAP CID 0x0006, observes ACL independently of raw HCI
+socket delivery, validates phase-2 Legacy or Secure Connections traffic, starts
+HCI encryption, and runs phase-3 key distribution. The locally distributed IRK is retained and reused
+(or uses the mgmt-configured local IRK); it caches generated/received LTKs and
+IRKs in the controller's host key tables, updates the resolving list
+when privacy is active, and emits the BlueZ `NEW_LONG_TERM_KEY`/`NEW_IRK` events
+only after phase-3 transfer completes. The READ_COMMANDS event list now includes
+both key events (22 commands, 11 events). Software checks cover HCI ACL observer,
+crypto test vectors and bounded SMP exchange state tests; product-feature kernel
+check passes. This is not yet a hardware acceptance: no physical controller was
+available. ACL continuation-fragment reassembly, peripheral-role pairing,
+Numeric Comparison UI, Passkey/OOB association models, pairing timeout/cancel,
+remote RPA-to-identity connection matching, and crash-safe persistence remain
+open; invalid/unavailable flows fail without reporting a successful bond.
+
+The latest no-controller QEMU smoke (Q35/KVM, VT-d/intremap) passed after the
+management event table update: 22 commands/11 events, empty index list,
+no-device ioctl errors, `hciconfig` empty enumeration and BlueZ's no-controller
+startup path. This does not exercise ACL SMP against a peer.
