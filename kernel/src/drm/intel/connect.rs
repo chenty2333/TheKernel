@@ -74,6 +74,25 @@ use crate::drm::modes::{ModePlan, Narration};
 /// silent failure here.
 const CANDIDATES: [(Pin, Well); 2] = [(Pin::DdiA, power::AUX_A), (Pin::DdiB, power::AUX_B)];
 
+/// Link ceilings from the standard receiver-capability bytes. This is an
+/// observation only; it does not claim that this connector's source PHY or
+/// current HDMI modeset path can train DisplayPort.
+fn dpcd_link_ceiling(caps: &[u8; 16]) -> Option<(u32, u8)> {
+    let rate = match caps[1] {
+        0x00 => 0,
+        0x01 => 1_000_000, // UHBR10
+        0x02 => 2_000_000, // UHBR20
+        0x04 => 1_350_000, // UHBR13.5
+        code => u32::from(code) * 27_000,
+    };
+    let lanes = caps[2] & 0x1f;
+    if rate == 0 || !matches!(lanes, 1 | 2 | 4) {
+        None
+    } else {
+        Some((rate, lanes))
+    }
+}
+
 /// The one value the modeset takes: a pin a monitor answered on, and everything
 /// the bring-up learned about it.
 ///
@@ -133,6 +152,11 @@ impl Connector {
         );
         if let Some(caps) = self.dpcd_caps {
             text.push_str(&format!("; DPCD revision {:#04x}", caps[0]));
+            if let Some((rate, lanes)) = dpcd_link_ceiling(&caps) {
+                text.push_str(&format!(" (max link {rate} kHz x {lanes} lanes)"));
+            } else {
+                text.push_str(" (invalid link ceiling)");
+            }
         } else if let Some(error) = self.dpcd_error {
             text.push_str(&format!("; DPCD AUX read {error:?}"));
         }

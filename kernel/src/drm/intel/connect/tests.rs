@@ -29,6 +29,20 @@ use crate::{
     test_support::scheduler_test_context,
 };
 
+#[test]
+fn dpcd_base_capability_report_decodes_receiver_link_ceiling() {
+    let mut caps = [0u8; 16];
+    caps[0] = 0x14;
+    caps[1] = 0x1e;
+    caps[2] = 4 | 1 << 7;
+    assert_eq!(dpcd_link_ceiling(&caps), Some((810_000, 4)));
+
+    caps[1] = 0x01;
+    assert_eq!(dpcd_link_ceiling(&caps), Some((1_000_000, 4)));
+    caps[2] = 3;
+    assert_eq!(dpcd_link_ceiling(&caps), None);
+}
+
 /// A `Bdf` for a display function, for the report lines.
 fn bdf() -> Bdf {
     Bdf::new(0, 2, 0)
