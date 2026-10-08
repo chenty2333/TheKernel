@@ -192,8 +192,14 @@ pub trait DisplayAdapter: Send + Sync {
     fn present(&self, scanout: Scanout) -> DrmResult<Arc<Fence>>;
     /// Hardware adapters reject unsupported state before the core admits a
     /// commit. A fixed firmware link cannot silently claim DPMS/color changes.
-    fn validate_atomic_state(&self, active: bool, dpms_on: bool, gamma_lut: bool) -> DrmResult<()> {
-        let _ = (active, dpms_on, gamma_lut);
+    fn validate_atomic_state(
+        &self,
+        active: bool,
+        dpms_on: bool,
+        gamma_lut: bool,
+        color_pipeline_changed: bool,
+    ) -> DrmResult<()> {
+        let _ = (active, dpms_on, gamma_lut, color_pipeline_changed);
         Ok(())
     }
     /// Native adapters report a hardware frame counter. `None` retains the

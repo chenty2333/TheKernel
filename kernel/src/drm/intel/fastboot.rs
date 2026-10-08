@@ -1107,8 +1107,14 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             Err(_) => crate::drm::device::wait_vblank_timer(delay),
         }
     }
-    fn validate_atomic_state(&self, active: bool, dpms_on: bool, gamma_lut: bool) -> DrmResult<()> {
-        if active && dpms_on && !gamma_lut {
+    fn validate_atomic_state(
+        &self,
+        active: bool,
+        dpms_on: bool,
+        gamma_lut: bool,
+        color_pipeline_changed: bool,
+    ) -> DrmResult<()> {
+        if active && dpms_on && !gamma_lut && !color_pipeline_changed {
             Ok(())
         } else {
             Err(DrmError::Unsupported)
@@ -3079,16 +3085,21 @@ mod tests {
         assert_eq!(dev.metrics().pending_vblank_events, 0);
         assert!(file.dequeue_event().is_none());
         assert_eq!(
-            a.validate_atomic_state(false, true, false),
+            a.validate_atomic_state(false, true, false, false),
             Err(DrmError::Unsupported)
         );
         assert_eq!(
-            a.validate_atomic_state(true, false, false),
+            a.validate_atomic_state(true, false, false, false),
             Err(DrmError::Unsupported)
         );
         assert_eq!(
-            a.validate_atomic_state(true, true, true),
+            a.validate_atomic_state(true, true, true, false),
             Err(DrmError::Unsupported)
+        );
+        assert_eq!(
+            a.validate_atomic_state(true, true, false, true),
+            Err(DrmError::Unsupported),
+            "degamma/CTM changes are not programmed by the native backend"
         );
     }
     #[test]

@@ -582,10 +582,14 @@ impl DrmFile {
         active: bool,
         dpms_on: bool,
         gamma_lut: bool,
+        color_pipeline_changed: bool,
     ) -> DrmResult<()> {
-        self.device
-            .adapter
-            .validate_atomic_state(active, dpms_on, gamma_lut)
+        self.device.adapter.validate_atomic_state(
+            active,
+            dpms_on,
+            gamma_lut,
+            color_pipeline_changed,
+        )
     }
     pub(crate) fn fixed_mode(&self) -> Option<Mode> {
         self.device.fixed_mode

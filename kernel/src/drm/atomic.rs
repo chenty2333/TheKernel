@@ -329,7 +329,15 @@ fn propose_with_mode(
     {
         return Err(DrmError::Invalid);
     }
-    file.validate_adapter_state(next.active, next.dpms == DPMS_ON, next.gamma_lut_blob != 0)?;
+    let color_pipeline_changed = next.gamma_lut_blob != base.gamma_lut_blob
+        || next.degamma_lut_blob != base.degamma_lut_blob
+        || next.ctm_blob != base.ctm_blob;
+    file.validate_adapter_state(
+        next.active,
+        next.dpms == DPMS_ON,
+        next.gamma_lut_blob != 0,
+        color_pipeline_changed,
+    )?;
     let fb = if next.active {
         if !r.connector.connected {
             return Err(DrmError::NotFound);
