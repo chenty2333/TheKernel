@@ -1,7 +1,10 @@
 use alloc::{string::String, vec::Vec};
 use core::task::Waker;
 
-use axdriver::prelude::{WirelessBssInfo, WirelessScanEvent, WirelessScanRequest};
+use axdriver::prelude::{
+    WirelessBssInfo, WirelessConnectRequest, WirelessScanEvent, WirelessScanRequest,
+    WirelessStationInfo,
+};
 use axerrno::{AxError, AxResult};
 use axpoll::{PollRegistrationError, PollSet, RegisterError, RegistrationToken, UpdateError};
 use axsync::spin::SpinNoIrq;
@@ -249,6 +252,18 @@ pub trait Device: Send + Sync {
 
     fn abort_wireless_scan(&mut self) -> AxResult {
         Err(AxError::OperationNotSupported)
+    }
+
+    fn connect_wireless(&mut self, _request: &WirelessConnectRequest) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn disconnect_wireless(&mut self, _reason: u16) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn wireless_station_info(&self) -> Option<WirelessStationInfo> {
+        None
     }
 
     fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {

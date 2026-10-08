@@ -1429,6 +1429,38 @@ impl NetStack {
         Ok(())
     }
 
+    /// Start a station connection through the selected wireless driver.
+    pub fn connect_wireless(
+        &self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessConnectRequest,
+    ) -> AxResult {
+        self.service
+            .lock()
+            .router
+            .connect_wireless(ifindex, request)?;
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
+    /// Disconnect a station peer through the selected wireless driver.
+    pub fn disconnect_wireless(&self, ifindex: u32, reason: u16) -> AxResult {
+        self.service
+            .lock()
+            .router
+            .disconnect_wireless(ifindex, reason)?;
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
+    /// Return the current station peer for nl80211 GET_STATION.
+    pub fn wireless_station_info(
+        &self,
+        ifindex: u32,
+    ) -> AxResult<axdriver::prelude::WirelessStationInfo> {
+        self.service.lock().router.wireless_station_info(ifindex)
+    }
+
     /// Snapshot scan records retained from firmware RX beacon/probe notifications.
     pub fn wireless_scan_results(
         &self,

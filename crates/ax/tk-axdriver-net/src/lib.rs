@@ -71,6 +71,29 @@ pub struct WirelessScanRequest {
     pub frequencies_mhz: alloc::vec::Vec<u32>,
 }
 
+/// One userspace-requested station connection (the 4-way handshake remains in
+/// the userspace supplicant).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessConnectRequest {
+    pub ssid: alloc::vec::Vec<u8>,
+    pub bssid: Option<[u8; 6]>,
+    pub authentication_type: u32,
+    pub wpa_versions: u32,
+    pub pairwise_ciphers: alloc::vec::Vec<u32>,
+    pub group_cipher: Option<u32>,
+    pub akm_suites: alloc::vec::Vec<u32>,
+    pub information_elements: alloc::vec::Vec<u8>,
+}
+
+/// The peer status fields consumed by nl80211 GET_STATION.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WirelessStationInfo {
+    pub bssid: [u8; 6],
+    pub frequency_mhz: u32,
+    pub signal_mbm: i32,
+    pub association_id: u16,
+}
+
 /// One station-mode BSS observation returned by an actual RX beacon/probe frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WirelessBssInfo {
@@ -137,6 +160,21 @@ pub trait NetDriverOps: BaseDriverOps {
     /// Abort a currently active foreground scan if the driver supports it.
     fn abort_wireless_scan(&mut self) -> DevResult {
         Err(DevError::Unsupported)
+    }
+
+    /// Begin or replace a station connection from an nl80211 request.
+    fn connect_wireless(&mut self, _request: &WirelessConnectRequest) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Disconnect the current station peer using the requested reason.
+    fn disconnect_wireless(&mut self, _reason: u16) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Return the currently associated peer for GET_STATION.
+    fn wireless_station_info(&self) -> Option<WirelessStationInfo> {
+        None
     }
 
     /// Snapshot BSSes parsed from received firmware RX notifications.

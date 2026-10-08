@@ -196,7 +196,8 @@ pub use mac::{
     select_csr_mac_address,
 };
 pub use mac_context::{
-    ACTION_ADD as MAC_ACTION_ADD, ACTION_REMOVE as MAC_ACTION_REMOVE, EdcaParameters, HtProtection,
+    ACTION_ADD as MAC_ACTION_ADD, ACTION_MODIFY as MAC_ACTION_MODIFY,
+    ACTION_REMOVE as MAC_ACTION_REMOVE, EdcaParameters, HtProtection,
     MAC_CONF_GROUP, MAC_CONFIG_COMMAND, MAC_CONTEXT_COMMAND, MacContextConfig, MacContextError,
     MacContextUpdateError, OperationMode, mac_context_command, mld_mac_context_command,
     update_mac_context,
@@ -358,7 +359,7 @@ pub use station::{
     tx_path_flush_command, validate_station_add_status,
 };
 pub use statistics::{
-    SYSTEM_GROUP as STATISTICS_SYSTEM_GROUP, SYSTEM_STATISTICS_COMMAND,
+    STATISTICS_COMMAND, SYSTEM_GROUP as STATISTICS_SYSTEM_GROUP, SYSTEM_STATISTICS_COMMAND,
     SYSTEM_STATISTICS_END_NOTIFICATION, SystemStatisticsWait, begin_system_statistics_clear,
     legacy_statistics_clear_command, statistics_clear_command, system_statistics_clear_command,
     system_statistics_end_notification, wait_system_statistics_clear,

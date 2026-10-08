@@ -3256,6 +3256,7 @@ dependencies = [
  "tk-axhal",
  "tk-axsync",
  "tk-axtask",
+ "tk-net80211",
  "tk-ratelimit",
 ]
 

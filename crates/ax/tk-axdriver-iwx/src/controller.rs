@@ -211,6 +211,26 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         )
     }
 
+    /// Submit an encoded command without waiting for its asynchronous event.
+    pub fn send_encoded_command(
+        &mut self,
+        command: &crate::EncodedCommand,
+        external: Option<&mut A::Region>,
+    ) -> Result<crate::CommandTicket, crate::CommandError> {
+        let payload = command
+            .bytes
+            .get(crate::HOST_COMMAND_HEADER_BYTES..)
+            .ok_or(crate::CommandError::InvalidResponse)?;
+        let parts = [payload];
+        let host = HostCommand {
+            id: command.original_id,
+            flags: command.flags,
+            response_capacity: command.response_capacity,
+            parts: &parts,
+        };
+        self.send_command(&host, external)
+    }
+
     /// Build and submit a single-payload PDU through the active TX command ring.
     // upstream: if_iwx.c iwx_send_cmd_pdu()
     pub fn send_command_pdu(

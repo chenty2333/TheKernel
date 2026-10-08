@@ -667,6 +667,22 @@ impl Device for EthernetDevice {
             .map_err(Self::map_dev_error)
     }
 
+    fn connect_wireless(&mut self, request: &WirelessConnectRequest) -> AxResult {
+        self.inner
+            .connect_wireless(request)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn disconnect_wireless(&mut self, reason: u16) -> AxResult {
+        self.inner
+            .disconnect_wireless(reason)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn wireless_station_info(&self) -> Option<WirelessStationInfo> {
+        self.inner.wireless_station_info()
+    }
+
     fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {
         self.inner.wireless_scan_results()
     }

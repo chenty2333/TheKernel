@@ -3,7 +3,7 @@
 //! The target hardware path is continued in `tk-axdriver-iwx`; this module
 //! wires the upstream PCI match decision into TheKernel's PCI driver walk.
 
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 use core::{
     convert::Infallible,
     ptr::NonNull,
@@ -38,6 +38,7 @@ const IWX_SCAN_RATES_2GHZ: [u8; 12] = [
     0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c,
 ];
 const IWX_SCAN_RATES_5GHZ: [u8; 8] = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
+const IWX_STATION_DATA_QUEUE: u8 = axdriver_iwx::DQA_CMD_QUEUE + 2;
 
 struct PlatformDmaRegion {
     cpu: NonNull<u8>,
@@ -201,9 +202,25 @@ struct AttachedDevice {
     scan_phy: Option<axdriver_iwx::RxPhyInfo>,
     scan_complete: bool,
     scan_event: Option<WirelessScanEvent>,
+    association: axdriver_iwx::AssociationState,
+    session_protection: axdriver_iwx::SessionProtectionState,
+    station: Option<StationConnection>,
     runtime_started: bool,
     interface_up: bool,
     soft_blocked: bool,
+}
+
+struct StationConnection {
+    ssid: Vec<u8>,
+    bss: axdriver_net::WirelessBssInfo,
+    bssid: [u8; 6],
+    frequency_mhz: u32,
+    signal_mbm: i32,
+    association_id: u16,
+    tx_sequence: tk_net80211::ManagementTxSequence,
+    data_sequence: u16,
+    rx_ethernet: VecDeque<Vec<u8>>,
+    nodes: tk_net80211::NodeTable,
 }
 
 #[derive(Debug)]
@@ -239,6 +256,8 @@ pub enum RuntimeStartError {
     ManagementQueue,
     SoftBlocked,
     Transmission,
+    InvalidRequest,
+    UnsupportedSecurity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +398,32 @@ impl NetDriverOps for IwxNetDevice {
         abort_scan(self.bdf).map_err(|_| DevError::Io)
     }
 
+    fn connect_wireless(&mut self, request: &axdriver_net::WirelessConnectRequest) -> DevResult {
+        connect_station(self.bdf, request).map_err(|error| match error {
+            RuntimeStartError::FirmwareNotReady | RuntimeStartError::SoftBlocked => {
+                DevError::BadState
+            }
+            RuntimeStartError::Transmission | RuntimeStartError::Firmware => DevError::Io,
+            RuntimeStartError::InvalidRequest => DevError::InvalidParam,
+            RuntimeStartError::UnsupportedSecurity => DevError::Unsupported,
+            _ => DevError::Unsupported,
+        })
+    }
+
+    fn wireless_station_info(&self) -> Option<axdriver_net::WirelessStationInfo> {
+        ATTACHED_DMA
+            .lock()
+            .iter()
+            .find(|device| device.bdf == self.bdf)
+            .and_then(|device| device.station.as_ref())
+            .map(|station| axdriver_net::WirelessStationInfo {
+                bssid: station.bssid,
+                frequency_mhz: station.frequency_mhz,
+                signal_mbm: station.signal_mbm,
+                association_id: station.association_id,
+            })
+    }
+
     fn wireless_scan_results(&self) -> Vec<axdriver_net::WirelessBssInfo> {
         let mut devices = ATTACHED_DMA.lock();
         let Some(device) = devices.iter_mut().find(|device| device.bdf == self.bdf) else {
@@ -412,9 +457,16 @@ impl NetDriverOps for IwxNetDevice {
     }
 
     fn can_transmit(&self) -> bool {
-        // Management and data queues are not exposed until a net80211 peer
-        // and its firmware queue have both been installed.
-        false
+        ATTACHED_DMA
+            .lock()
+            .iter()
+            .find(|device| device.bdf == self.bdf)
+            .is_some_and(|device| {
+                device.interface_up
+                    && device.runtime_started
+                    && !device.soft_blocked
+                    && device.station.is_some()
+            })
     }
 
     fn can_receive(&self) -> bool {
@@ -422,11 +474,8 @@ impl NetDriverOps for IwxNetDevice {
             .lock()
             .iter()
             .find(|device| device.bdf == self.bdf)
-            .is_some_and(|device| {
-                device.runtime_started
-                    && ((device.scan_cache.is_some() && !device.scan_complete)
-                        || device.scan_event.is_some())
-            })
+            .and_then(|device| device.station.as_ref())
+            .is_some_and(|station| !station.rx_ethernet.is_empty())
     }
 
     fn rx_queue_size(&self) -> usize {
@@ -444,24 +493,67 @@ impl NetDriverOps for IwxNetDevice {
     }
 
     fn recycle_tx_buffers(&mut self) -> DevResult {
+        let mut devices = ATTACHED_DMA.lock();
+        if let Some(device) = devices.iter_mut().find(|device| device.bdf == self.bdf) {
+            pump_tx_completions(device).map_err(|_| DevError::Io)?;
+        }
         Ok(())
     }
 
     fn transmit(&mut self, tx_buf: NetBufPtr) -> DevResult {
-        // This early admission boundary deliberately refuses data until the
-        // net80211 association/key state machine is connected to firmware.
-        drop(unsafe { NetBuf::from_buf_ptr(tx_buf) });
-        Err(DevError::Unsupported)
+        let tx_buf = unsafe { NetBuf::from_buf_ptr(tx_buf) };
+        let ethernet = tx_buf.packet_with_header();
+        let mut devices = ATTACHED_DMA.lock();
+        let device = devices
+            .iter_mut()
+            .find(|device| device.bdf == self.bdf)
+            .ok_or(DevError::BadState)?;
+        let station = device.station.as_mut().ok_or(DevError::BadState)?;
+        if device.soft_blocked || !device.interface_up || !device.runtime_started {
+            return Err(DevError::BadState);
+        }
+        let frame =
+            tk_net80211::encap_station(ethernet, station.bssid, station.data_sequence, false)
+                .map_err(|_| DevError::InvalidParam)?;
+        station.data_sequence = station.data_sequence.wrapping_add(1) & 0x0fff;
+        device
+            .controller
+            .submit_data_frame(
+                IWX_STATION_DATA_QUEUE,
+                axdriver_iwx::STA_ID_LINK,
+                &frame[..24],
+                &frame[24..],
+                0,
+                0,
+                false,
+            )
+            .map_err(|_| DevError::ResourceBusy)?;
+        drop(tx_buf);
+        Ok(())
     }
 
     fn receive(&mut self) -> DevResult<NetBufPtr> {
         let mut devices = ATTACHED_DMA.lock();
-        if let Some(device) = devices.iter_mut().find(|device| device.bdf == self.bdf)
-            && device.runtime_started
-            && device.scan_cache.is_some()
-            && !device.scan_complete
-        {
-            let _ = pump_scan_events(device);
+        if let Some(device) = devices.iter_mut().find(|device| device.bdf == self.bdf) {
+            if device.runtime_started {
+                if device.scan_cache.is_some() && !device.scan_complete {
+                    let _ = pump_scan_events(device);
+                }
+                let _ = pump_station_rx(device);
+            }
+            if let Some(frame) = device
+                .station
+                .as_mut()
+                .and_then(|station| station.rx_ethernet.pop_front())
+            {
+                let mut buffer = self.buffers.alloc_boxed().ok_or(DevError::NoMemory)?;
+                if frame.len() > buffer.capacity() {
+                    return Err(DevError::InvalidParam);
+                }
+                buffer.set_packet_len(frame.len());
+                buffer.packet_mut().copy_from_slice(&frame);
+                return Ok(buffer.into_buf_ptr());
+            }
         }
         Err(DevError::Again)
     }
@@ -597,10 +689,742 @@ fn allocate_resources(
         scan_phy: None,
         scan_complete: false,
         scan_event: None,
+        association: axdriver_iwx::AssociationState::default(),
+        session_protection: axdriver_iwx::SessionProtectionState::default(),
+        station: None,
         runtime_started: false,
         interface_up: false,
         soft_blocked: false,
     });
+    Ok(())
+}
+
+fn send_context_command(
+    controller: &mut IwxController<MmioCsrAccess, PlatformDmaAllocator>,
+    command: &axdriver_iwx::EncodedCommand,
+) -> Result<Option<Vec<u8>>, RuntimeStartError> {
+    controller
+        .send_encoded_command_wait(command, None, |_, _| Ok::<_, Infallible>(true))
+        .map(|completed| completed.response)
+        .map_err(|_| RuntimeStartError::Firmware)
+}
+
+fn clear_station_statistics(
+    controller: &mut IwxController<MmioCsrAccess, PlatformDmaAllocator>,
+    command_version: u8,
+) -> Result<(), RuntimeStartError> {
+    let Some(command) =
+        axdriver_iwx::statistics_clear_command(u32::from(command_version), 64, 0, 0)
+            .map_err(|_| RuntimeStartError::Firmware)?
+    else {
+        return Ok(());
+    };
+    if command.flags & axdriver_iwx::CMD_ASYNC == 0 {
+        send_context_command(controller, &command)?;
+        return Ok(());
+    }
+    controller
+        .send_encoded_command(&command, None)
+        .map_err(|_| RuntimeStartError::Firmware)?;
+    let notification = (u32::from(axdriver_iwx::STATISTICS_SYSTEM_GROUP) << 8)
+        | u32::from(axdriver_iwx::SYSTEM_STATISTICS_END_NOTIFICATION);
+    for _ in 0..1_000 {
+        let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+            &mut controller.registers,
+            &controller.interrupt_masks,
+            Some(&mut controller.resources.ict),
+        )
+        .map_err(|_| RuntimeStartError::Firmware)?;
+        let mut complete = false;
+        controller
+            .process_rx_notifications(|packet, _| {
+                complete |= packet.is_notification() && packet.command_id() == notification;
+                Ok::<_, Infallible>(true)
+            })
+            .map_err(|_| RuntimeStartError::Firmware)?;
+        if complete {
+            return Ok(());
+        }
+        controller.registers.delay_us(1_000);
+    }
+    Err(RuntimeStartError::Firmware)
+}
+
+fn station_mac_context(
+    profile: AttachProfile,
+    local_address: [u8; 6],
+    bss: &axdriver_net::WirelessBssInfo,
+    rates: &[u8],
+    associated: bool,
+    association_id: u16,
+) -> axdriver_iwx::MacContextConfig {
+    let is_24ghz = bss.frequency_mhz < 3000;
+    let (cck_rates, ofdm_rates) = axdriver_iwx::ack_rate_masks(rates, is_24ghz);
+    let capability = bss.capability;
+    axdriver_iwx::MacContextConfig {
+        action: axdriver_iwx::MAC_ACTION_ADD,
+        id_and_color: 0,
+        operation_mode: axdriver_iwx::OperationMode::Station,
+        local_address,
+        bssid: bss.bssid,
+        cck_rates,
+        ofdm_rates,
+        short_preamble: capability & 0x0020 != 0,
+        short_slot: capability & 0x0400 != 0,
+        edca: [
+            axdriver_iwx::EdcaParameters {
+                ecw_min: 4,
+                ecw_max: 10,
+                aifsn: 3,
+                txop_limit: 0,
+            },
+            axdriver_iwx::EdcaParameters {
+                ecw_min: 4,
+                ecw_max: 10,
+                aifsn: 7,
+                txop_limit: 0,
+            },
+            axdriver_iwx::EdcaParameters {
+                ecw_min: 3,
+                ecw_max: 4,
+                aifsn: 2,
+                txop_limit: 94,
+            },
+            axdriver_iwx::EdcaParameters {
+                ecw_min: 2,
+                ecw_max: 3,
+                aifsn: 2,
+                txop_limit: 47,
+            },
+        ],
+        firmware_family_bz: profile.family >= axdriver_iwx::DeviceFamily::Bz,
+        qos: false,
+        ht: false,
+        ht_protection: axdriver_iwx::HtProtection::None,
+        channel_sco: 0,
+        use_protection: false,
+        associated,
+        assoc_id: association_id,
+        beacon_interval: bss.beacon_interval,
+        dtim_count: 0,
+        dtim_period: 0,
+        receive_timestamp: 0,
+        beacon_timestamp: bss.timestamp,
+    }
+}
+
+/// Install the source `iwx_auth()` contexts and its reverse-order rollback.
+fn authenticate_station_contexts(
+    device: &mut AttachedDevice,
+    bss: &axdriver_net::WirelessBssInfo,
+    rates: &[u8],
+) -> Result<(), RuntimeStartError> {
+    let nvm = device
+        .nvm
+        .as_ref()
+        .ok_or(RuntimeStartError::FirmwareNotReady)?;
+    let bundle = match device.firmware.as_ref() {
+        Some(Ok(bundle)) => bundle,
+        _ => return Err(RuntimeStartError::FirmwareNotReady),
+    };
+    let channel_info = axdriver_iwx::init_channel_map(nvm, device.profile.uhb_supported)
+        .into_iter()
+        .find(|channel| u32::from(channel.frequency_mhz) == bss.frequency_mhz)
+        .ok_or(RuntimeStartError::Firmware)?;
+    let is_24ghz = bss.frequency_mhz < 3000;
+    let antennas = nvm.valid_rx_antennas.count_ones().clamp(1, 2) as u8;
+    let valid_rx_antennas = nvm.valid_rx_antennas;
+    let local_address = nvm.hardware_address;
+    let cdb_supported = device.runtime.cdb != 0;
+    let rlc_version = bundle.image.lookup_command_version(
+        axdriver_iwx::DATA_PATH_GROUP,
+        axdriver_iwx::RLC_CONFIG_COMMAND,
+    );
+    let phy_command_version = bundle
+        .image
+        .lookup_command_version(0, axdriver_iwx::PHY_CONTEXT_COMMAND as u8);
+    let queue_command_version = bundle.image.lookup_command_version(
+        axdriver_iwx::DATA_PATH_GROUP,
+        axdriver_iwx::SCD_QUEUE_CONFIG_CMD,
+    );
+    let statistics_command_version = bundle
+        .image
+        .lookup_command_version(0, axdriver_iwx::STATISTICS_COMMAND);
+    let channel = axdriver_iwx::PhyContextConfig {
+        id_and_color: 0,
+        action: axdriver_iwx::PHY_CONTEXT_ACTION_ADD,
+        channel: channel_info.channel,
+        is_24ghz,
+        cdb_supported,
+        ultra_high_band_channels: false,
+        channel_40mhz: false,
+        sco: 0,
+        vht_width: 0,
+        primary_channel_index: i16::from(channel_info.channel),
+        center_channel_index: i16::from(channel_info.channel),
+        static_chains: antennas,
+        dynamic_chains: antennas,
+        valid_rx_antennas,
+        rlc_command_version: rlc_version,
+        command_version: phy_command_version,
+    };
+    let mac = station_mac_context(device.profile, local_address, bss, rates, false, 0);
+    let station = axdriver_iwx::StationAddConfig {
+        use_mld_api: false,
+        monitor_mode: false,
+        update: false,
+        mac_id_color: 0,
+        address: bss.bssid,
+        mimo_enabled: false,
+        ht: false,
+        vht: false,
+        ht_stream2: false,
+        ht_stream3: false,
+        vht_stream2: false,
+        channel_allows_40mhz: false,
+        peer_supports_ht40: false,
+        channel_allows_80mhz: false,
+        peer_supports_vht80: false,
+        channel_allows_160mhz: false,
+        peer_supports_vht160: false,
+        ht_ampdu_exponent: 0,
+        vht_ampdu_exponent: 0,
+        ampdu_density: 0,
+        uapsd_node: false,
+        uapsd_supported: false,
+        uapsd_access_categories: 0,
+        uapsd_max_service_period: 0,
+    };
+    let request = axdriver_iwx::AuthRequest {
+        generation: device.association.generation.wrapping_add(1),
+        monitor_mode: false,
+        beacon_interval_tu: bss.beacon_interval,
+        rlc_api_v2: rlc_version == axdriver_iwx::RLC_CONFIG_VERSION,
+    };
+    let (controller, state, session) = (
+        &mut device.controller,
+        &mut device.association,
+        &mut device.session_protection,
+    );
+    let mut mac_active = false;
+    axdriver_iwx::authenticate(state, request, |step| {
+        match step {
+            axdriver_iwx::AssociationStep::AddPhy | axdriver_iwx::AssociationStep::RemovePhy => {
+                let mut config = channel;
+                config.action = if step == axdriver_iwx::AssociationStep::AddPhy {
+                    axdriver_iwx::PHY_CONTEXT_ACTION_ADD
+                } else {
+                    axdriver_iwx::PHY_CONTEXT_ACTION_REMOVE
+                };
+                let command = axdriver_iwx::phy_context_command(config, 0, 0)
+                    .map_err(|_| RuntimeStartError::Firmware)?;
+                send_context_command(controller, &command)?;
+            }
+            axdriver_iwx::AssociationStep::ConfigureRlc => {
+                let command =
+                    axdriver_iwx::rlc_config_command(0, valid_rx_antennas, antennas, antennas, 0)
+                        .map_err(|_| RuntimeStartError::Firmware)?;
+                send_context_command(controller, &command)?;
+            }
+            axdriver_iwx::AssociationStep::AddMac | axdriver_iwx::AssociationStep::RemoveMac => {
+                let add = step == axdriver_iwx::AssociationStep::AddMac;
+                let mut config = mac;
+                config.action = if add {
+                    axdriver_iwx::MAC_ACTION_ADD
+                } else {
+                    axdriver_iwx::MAC_ACTION_REMOVE
+                };
+                let command = axdriver_iwx::mac_context_command(&config, mac_active, 0, 0)
+                    .map_err(|_| RuntimeStartError::Firmware)?;
+                send_context_command(controller, &command)?;
+                mac_active = add;
+            }
+            axdriver_iwx::AssociationStep::AddBinding
+            | axdriver_iwx::AssociationStep::RemoveBinding => {
+                let add = step == axdriver_iwx::AssociationStep::AddBinding;
+                let command = axdriver_iwx::binding_command(
+                    false,
+                    if add {
+                        axdriver_iwx::CONTEXT_ACTION_ADD
+                    } else {
+                        axdriver_iwx::CONTEXT_ACTION_REMOVE
+                    },
+                    0,
+                    0,
+                    is_24ghz,
+                    cdb_supported,
+                    0,
+                    0,
+                )
+                .map_err(|_| RuntimeStartError::Firmware)?;
+                if let Some(command) = command {
+                    let response = send_context_command(controller, &command)?
+                        .ok_or(RuntimeStartError::Firmware)?;
+                    if axdriver_iwx::command_response_status(&response, false)
+                        .map_err(|_| RuntimeStartError::Firmware)?
+                        != 0
+                    {
+                        return Err(RuntimeStartError::Firmware);
+                    }
+                }
+            }
+            axdriver_iwx::AssociationStep::AddStation => {
+                let command = axdriver_iwx::station_add_command(station, 0, 0)
+                    .map_err(|_| RuntimeStartError::Firmware)?
+                    .ok_or(RuntimeStartError::Firmware)?;
+                let response = send_context_command(controller, &command)?
+                    .ok_or(RuntimeStartError::Firmware)?;
+                axdriver_iwx::validate_station_add_status(&response)
+                    .map_err(|_| RuntimeStartError::Firmware)?;
+            }
+            axdriver_iwx::AssociationStep::RemoveStation => {
+                let command = axdriver_iwx::remove_station_command(false, 0, 0)
+                    .map_err(|_| RuntimeStartError::Firmware)?;
+                send_context_command(controller, &command)?;
+            }
+            axdriver_iwx::AssociationStep::EnableManagementQueue => {
+                controller
+                    .enable_management_queue(queue_command_version)
+                    .map_err(|_| RuntimeStartError::ManagementQueue)?;
+            }
+            axdriver_iwx::AssociationStep::DisableManagementQueue => {
+                controller
+                    .disable_management_queue(queue_command_version)
+                    .map_err(|_| RuntimeStartError::ManagementQueue)?;
+            }
+            axdriver_iwx::AssociationStep::ClearStatistics => {
+                clear_station_statistics(controller, statistics_command_version)?;
+            }
+            axdriver_iwx::AssociationStep::ProtectSession { duration_tu } => {
+                axdriver_iwx::schedule_session_protection(session, 0, duration_tu, 0, |command| {
+                    send_context_command(controller, command).map(|_| ())
+                })
+                .map_err(|_| RuntimeStartError::Firmware)?;
+            }
+            _ => return Err(RuntimeStartError::Firmware),
+        }
+        Ok::<_, RuntimeStartError>(())
+    })
+    .map_err(|_| RuntimeStartError::Firmware)?;
+    Ok(())
+}
+
+fn bss_ssid(information_elements: &[u8]) -> Option<&[u8]> {
+    let mut elements = information_elements;
+    while elements.len() >= 2 {
+        let length = usize::from(elements[1]);
+        let end = 2usize.checked_add(length)?;
+        let element = elements.get(..end)?;
+        if element[0] == 0 {
+            return Some(&element[2..]);
+        }
+        elements = &elements[end..];
+    }
+    None
+}
+
+fn is_open_station_request(request: &axdriver_net::WirelessConnectRequest) -> bool {
+    !request.ssid.is_empty()
+        && request.ssid.len() <= 32
+        && request.authentication_type == 0
+        && request.wpa_versions == 0
+        && request.pairwise_ciphers.is_empty()
+        && request.group_cipher.is_none()
+        && request.akm_suites.is_empty()
+        && request.information_elements.is_empty()
+}
+
+fn station_management_response(
+    device: &mut AttachedDevice,
+    bssid: [u8; 6],
+    subtype: u8,
+) -> Result<Vec<u8>, RuntimeStartError> {
+    for _ in 0..500 {
+        let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+            &mut device.controller.registers,
+            &device.controller.interrupt_masks,
+            Some(&mut device.controller.resources.ict),
+        )
+        .map_err(|_| RuntimeStartError::Transmission)?;
+        let mut rx_payloads = Vec::new();
+        device
+            .controller
+            .process_rx_notifications(|packet, _| {
+                if let axdriver_iwx::FirmwareEvent::RxMpdu(payload) =
+                    axdriver_iwx::decode_firmware_event(packet)
+                    && rx_payloads.try_reserve(1).is_ok()
+                {
+                    rx_payloads.push(payload.to_vec());
+                }
+                Ok::<_, Infallible>(true)
+            })
+            .map_err(|_| RuntimeStartError::Transmission)?;
+        for payload in rx_payloads {
+            if let Ok(axdriver_iwx::RxMpduOutcome::Deliver(received)) =
+                device.controller.process_rx_mpdu(
+                    &payload,
+                    false,
+                    axdriver_iwx::HardwareDecryptPolicy {
+                        receive_protected: false,
+                        pairwise_ccmp: false,
+                        group_ccmp: false,
+                    },
+                )
+                && received.frame.len() >= 24
+                && received.frame[0] & 0x0c == 0
+                && received.frame[0] & 0xf0 == subtype
+                && received.frame[16..22] == bssid
+            {
+                return Ok(received.frame);
+            }
+        }
+        device.controller.registers.delay_us(1_000);
+    }
+    Err(RuntimeStartError::Transmission)
+}
+
+/// Connect to a cached open BSS through Open System auth and station association.
+/// WPA/RSN requests remain rejected until key installation and the userspace EAPOL
+/// data path can both be committed transactionally.
+fn connect_station(
+    bdf: Bdf,
+    request: &axdriver_net::WirelessConnectRequest,
+) -> Result<(), RuntimeStartError> {
+    let mut devices = ATTACHED_DMA.lock();
+    let device = devices
+        .iter_mut()
+        .find(|device| device.bdf == bdf)
+        .ok_or(RuntimeStartError::DeviceNotFound)?;
+    if !device.interface_up || !device.runtime_started || device.soft_blocked {
+        return Err(RuntimeStartError::FirmwareNotReady);
+    }
+    if device.station.is_some() {
+        return Err(RuntimeStartError::AlreadyStarted);
+    }
+    if request.ssid.is_empty()
+        || request.ssid.len() > 32
+        || request.authentication_type != 0
+    {
+        return Err(RuntimeStartError::InvalidRequest);
+    }
+    if !is_open_station_request(request) {
+        return Err(RuntimeStartError::UnsupportedSecurity);
+    }
+    let bss = device
+        .scan_cache
+        .as_ref()
+        .and_then(|cache| {
+            cache.results().iter().find(|bss| {
+                request.bssid.is_none_or(|address| address == bss.bssid)
+                    && bss_ssid(&bss.information_elements) == Some(request.ssid.as_slice())
+                    && bss.capability & 0x0010 == 0
+            })
+        })
+        .cloned()
+        .ok_or(RuntimeStartError::FirmwareNotReady)?;
+    let rates = if bss.frequency_mhz < 3000 {
+        tk_net80211::STANDARD_RATES_11G
+    } else {
+        tk_net80211::STANDARD_RATES_11A
+    };
+    authenticate_station_contexts(device, &bss, &rates.rates[..rates.count])?;
+
+    let local_address = device
+        .nvm
+        .as_ref()
+        .ok_or(RuntimeStartError::FirmwareNotReady)?
+        .hardware_address;
+    let mut tx_sequence = tk_net80211::ManagementTxSequence::new(0);
+    let auth_body = tk_net80211::build_auth_body(1, 0);
+    let auth_frame = tx_sequence
+        .frame(
+            0xb0,
+            bss.bssid,
+            local_address,
+            bss.bssid,
+            &auth_body,
+            false,
+            false,
+        )
+        .map_err(|_| RuntimeStartError::Transmission)?;
+    send_station_management_frame_locked(device, &auth_frame, |_| {})?;
+    let auth_response = station_management_response(device, bss.bssid, 0xb0)?;
+    let mut auth_state = tk_net80211::OpenAuthState {
+        authentication_state: true,
+        rsn_enabled: false,
+        is_bss_node: true,
+        sequence: 0,
+        status: 0,
+        auth_subtype: 0,
+        node_failures: 0,
+        bad_auth_count: 0,
+        auth_fail_count: 0,
+    };
+    let auth = tk_net80211::receive_auth_response(&auth_response, &mut auth_state)
+        .map_err(|_| RuntimeStartError::Transmission)?;
+    if auth.sequence != 2 || auth.status != 0 {
+        return Err(RuntimeStartError::Firmware);
+    }
+
+    let request_body = tk_net80211::build_assoc_request_body(&tk_net80211::AssocRequestConfig {
+        ssid: &request.ssid,
+        rates: &rates,
+        listen_interval: 10,
+        reassociation_bssid: None,
+        channel_is_2ghz: bss.frequency_mhz < 3000,
+        channel_is_5ghz: (3000..=5925).contains(&bss.frequency_mhz),
+        channel_is_ac: false,
+        channel_is_he: false,
+        ht_enabled: false,
+        vht_enabled: false,
+        he_enabled: false,
+        he_mode_supported: false,
+        privacy_wep: false,
+        rsn_enabled: false,
+        peer_rsn_protocols: 0,
+        short_preamble: bss.capability & 0x0020 != 0,
+        short_slot: bss.capability & 0x0400 != 0,
+        peer_qos: false,
+        qos_info: 0,
+        rsn: None,
+        ht_caps: None,
+        vht_caps: None,
+        he_caps: None,
+    })
+    .map_err(|_| RuntimeStartError::Firmware)?;
+    let assoc_frame = tx_sequence
+        .frame(
+            0x00,
+            bss.bssid,
+            local_address,
+            bss.bssid,
+            &request_body,
+            false,
+            false,
+        )
+        .map_err(|_| RuntimeStartError::Transmission)?;
+    send_station_management_frame_locked(device, &assoc_frame, |_| {})?;
+    let assoc_response = station_management_response(device, bss.bssid, 0x10)?;
+    let mut nodes = tk_net80211::NodeTable::default();
+    let local_phy = tk_net80211::LocalPhyConfig {
+        modecaps: 0,
+        ht_enabled: false,
+        vht_enabled: false,
+        he_enabled: false,
+        channel_is_2ghz: bss.frequency_mhz < 3000,
+        channel_is_5ghz: (3000..=5925).contains(&bss.frequency_mhz),
+        channel_supports_ac: false,
+        channel_supports_he: false,
+        station_mode: true,
+        wep_enabled: false,
+        rsn_enabled: false,
+        ht_caps: tk_net80211::HtCapabilities::default(),
+        supported_ht_mcs: [0; 10],
+        vht_caps: tk_net80211::VhtCapabilities::default(),
+        he_caps: tk_net80211::HeCapabilities::default(),
+    };
+    let assoc = tk_net80211::receive_assoc_response(
+        &mut nodes,
+        &assoc_response,
+        &tk_net80211::AssocRxPolicy {
+            station_mode: true,
+            state: tk_net80211::ProtocolState::Assoc,
+            reassociation: false,
+            local_rates: &rates,
+            fixed_rate: None,
+            local_phy,
+            local_channel_160_allowed: false,
+            pairwise_ciphers: 0,
+            rsn_enabled: false,
+            wep_enabled: false,
+            local_qos_enabled: false,
+            local_uapsd_enabled: false,
+            local_uapsd_access_categories: 0,
+            local_uapsd_max_service_period: 0,
+        },
+    )
+    .map_err(|_| RuntimeStartError::Transmission)?;
+    if assoc.status != 0 {
+        return Err(RuntimeStartError::Firmware);
+    }
+    let mut mac = station_mac_context(
+        device.profile,
+        local_address,
+        &bss,
+        &rates.rates[..rates.count],
+        true,
+        assoc.association_id & 0x3fff,
+    );
+    mac.action = axdriver_iwx::MAC_ACTION_MODIFY;
+    let bundle = match device.firmware.as_ref() {
+        Some(Ok(bundle)) => bundle,
+        _ => return Err(RuntimeStartError::FirmwareNotReady),
+    };
+    let version = bundle
+        .image
+        .lookup_command_version(0, axdriver_iwx::MAC_CONTEXT_COMMAND as u8);
+    let command = axdriver_iwx::mac_context_command(&mac, true, version, 0)
+        .map_err(|_| RuntimeStartError::Firmware)?;
+    send_context_command(&mut device.controller, &command)?;
+    let ring = device
+        .controller
+        .resources
+        .tx_queues
+        .get(usize::from(IWX_STATION_DATA_QUEUE))
+        .ok_or(RuntimeStartError::Transmission)?;
+    let queue_version = bundle.image.lookup_command_version(
+        axdriver_iwx::DATA_PATH_GROUP,
+        axdriver_iwx::SCD_QUEUE_CONFIG_CMD,
+    );
+    device
+        .controller
+        .enable_tx_queue(
+            axdriver_iwx::QueueConfig {
+                station_id: axdriver_iwx::STA_ID_LINK,
+                queue_id: IWX_STATION_DATA_QUEUE,
+                tid: 0,
+                ring_size: axdriver_iwx::DEFAULT_QUEUE_SIZE,
+                byte_count_address: ring.byte_counts.device_address(),
+                tfd_address: ring.descriptors.device_address(),
+            },
+            queue_version,
+        )
+        .map_err(|_| RuntimeStartError::Transmission)?;
+    device.station = Some(StationConnection {
+        ssid: request.ssid.clone(),
+        bss: bss.clone(),
+        bssid: bss.bssid,
+        frequency_mhz: bss.frequency_mhz,
+        signal_mbm: bss.signal_mbm,
+        association_id: assoc.association_id & 0x3fff,
+        tx_sequence,
+        data_sequence: 0,
+        rx_ethernet: VecDeque::new(),
+        nodes,
+    });
+    Ok(())
+}
+
+fn pump_tx_completions(device: &mut AttachedDevice) -> Result<(), RuntimeStartError> {
+    let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+        &mut device.controller.registers,
+        &device.controller.interrupt_masks,
+        Some(&mut device.controller.resources.ict),
+    )
+    .map_err(|_| RuntimeStartError::Transmission)?;
+    let mut responses = Vec::new();
+    device
+        .controller
+        .process_rx_notifications(|packet, _| {
+            if matches!(
+                axdriver_iwx::decode_firmware_event(packet),
+                axdriver_iwx::FirmwareEvent::TxStatus(_)
+            ) && responses.try_reserve(1).is_ok()
+            {
+                responses.push(packet.payload.to_vec());
+            }
+            Ok::<_, Infallible>(true)
+        })
+        .map_err(|_| RuntimeStartError::Transmission)?;
+    for response in responses {
+        let _ = device
+            .controller
+            .process_tx_response(
+                u16::from(IWX_STATION_DATA_QUEUE),
+                u16::from(axdriver_iwx::BGSCAN_FIRST_AGG_TX_QUEUE),
+                &response,
+                false,
+                |_, dma| drop(dma),
+            )
+            .map_err(|_| RuntimeStartError::Transmission)?;
+    }
+    Ok(())
+}
+
+fn pump_station_rx(device: &mut AttachedDevice) -> Result<(), RuntimeStartError> {
+    let family = device.profile.family;
+    let mut payloads = Vec::new();
+    let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+        &mut device.controller.registers,
+        &device.controller.interrupt_masks,
+        Some(&mut device.controller.resources.ict),
+    )
+    .map_err(|_| RuntimeStartError::Transmission)?;
+    device
+        .controller
+        .process_rx_notifications(|packet, _| {
+            if let axdriver_iwx::FirmwareEvent::RxPhy(bytes) =
+                axdriver_iwx::decode_firmware_event(packet)
+            {
+                device.scan_phy = axdriver_iwx::parse_rx_phy_info(bytes).ok();
+            } else if let axdriver_iwx::FirmwareEvent::RxMpdu(bytes) =
+                axdriver_iwx::decode_firmware_event(packet)
+                && payloads.try_reserve(1).is_ok()
+            {
+                payloads.push(bytes.to_vec());
+            }
+            Ok::<_, Infallible>(true)
+        })
+        .map_err(|_| RuntimeStartError::Transmission)?;
+    for payload in payloads {
+        let rssi = axdriver_iwx::signal_strength_dbm(family, &payload)
+            .unwrap_or(-127)
+            .clamp(-127, 0) as i8;
+        let received = match device.controller.process_rx_mpdu(
+            &payload,
+            false,
+            axdriver_iwx::HardwareDecryptPolicy {
+                receive_protected: false,
+                pairwise_ccmp: false,
+                group_ccmp: false,
+            },
+        ) {
+            Ok(axdriver_iwx::RxMpduOutcome::Deliver(frame)) => frame,
+            _ => continue,
+        };
+        let Some(station) = device.station.as_mut() else {
+            continue;
+        };
+        let result = tk_net80211::receive_station_data(
+            &mut station.nodes,
+            &received.frame,
+            (i16::from(rssi) + 100).clamp(0, 100) as u8,
+            u64::from(received.metadata.device_timestamp),
+            0,
+            tk_net80211::RxDataPolicy {
+                state: tk_net80211::ProtocolState::Run,
+                monitor_mode: false,
+                current_bssid: station.bssid,
+                interface_address: device
+                    .nvm
+                    .as_ref()
+                    .map_or([0; 6], |nvm| nvm.hardware_address),
+                simplex: false,
+                wep_enabled: false,
+                rsn_rx_protected: false,
+                peer_ht: false,
+                ampdu_done: received.metadata.reorder_data != 0,
+                hardware_decrypted: false,
+                same_sequence: received.same_sequence,
+                rx_ba_states: [0; 16],
+            },
+        );
+        if let tk_net80211::RxDataResult::Ethernet { frames, .. } = result {
+            for frame in frames {
+                let mut ethernet = Vec::new();
+                if ethernet.try_reserve(14 + frame.payload.len()).is_err() {
+                    continue;
+                }
+                ethernet.extend_from_slice(&frame.destination);
+                ethernet.extend_from_slice(&frame.source);
+                ethernet.extend_from_slice(&frame.ether_type.to_be_bytes());
+                ethernet.extend_from_slice(&frame.payload);
+                if station.rx_ethernet.len() < 128 {
+                    station.rx_ethernet.push_back(ethernet);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -958,10 +1782,6 @@ fn start_regular_firmware(
             RuntimeStartError::Nic
         })?;
     let alive_version = bundle.image.lookup_notification_version(0, 1);
-    let command_version = bundle.image.lookup_command_version(
-        axdriver_iwx::DATA_PATH_GROUP,
-        axdriver_iwx::SCD_QUEUE_CONFIG_CMD,
-    );
     controller
         .load_ucode_wait_alive(
             &bundle.image,
@@ -1056,12 +1876,6 @@ fn start_regular_firmware(
                 RuntimeStartError::Firmware
             })?;
     }
-    controller
-        .enable_management_queue(command_version)
-        .map_err(|error| {
-            warn!("iwx: runtime management queue enable failed: {error:?}");
-            RuntimeStartError::ManagementQueue
-        })?;
     Ok(())
 }
 
@@ -1113,6 +1927,30 @@ pub fn send_station_management_frame(
     bdf: DeviceFunction,
     frame: &[u8],
 ) -> Result<(), RuntimeStartError> {
+    send_station_management_frame_with_rx(bdf, frame, |_| {})
+}
+
+/// Management transmit variant which hands concurrent RX notifications to
+/// the station state-machine waiter while retaining the TX completion gate.
+pub fn send_station_management_frame_with_rx(
+    bdf: DeviceFunction,
+    frame: &[u8],
+    receive: impl FnMut(&axdriver_iwx::RxPacket<'_>),
+) -> Result<(), RuntimeStartError> {
+    let key = Bdf(bdf.bus, bdf.device, bdf.function);
+    let mut devices = ATTACHED_DMA.lock();
+    let device = devices
+        .iter_mut()
+        .find(|device| device.bdf == key)
+        .ok_or(RuntimeStartError::DeviceNotFound)?;
+    send_station_management_frame_locked(device, frame, receive)
+}
+
+fn send_station_management_frame_locked(
+    device: &mut AttachedDevice,
+    frame: &[u8],
+    mut receive: impl FnMut(&axdriver_iwx::RxPacket<'_>),
+) -> Result<(), RuntimeStartError> {
     const IEEE80211_HEADER_BYTES: usize = 24;
     const MANAGEMENT_QUEUE: u8 = axdriver_iwx::DQA_CMD_QUEUE + 1;
     const MANAGEMENT_TIMEOUT_US: u32 = 500_000;
@@ -1121,12 +1959,6 @@ pub fn send_station_management_frame(
         // Protected management frame rather than transmit it in cleartext.
         return Err(RuntimeStartError::Transmission);
     }
-    let key = Bdf(bdf.bus, bdf.device, bdf.function);
-    let mut devices = ATTACHED_DMA.lock();
-    let device = devices
-        .iter_mut()
-        .find(|device| device.bdf == key)
-        .ok_or(RuntimeStartError::DeviceNotFound)?;
     if !device.runtime_started || device.soft_blocked {
         return Err(RuntimeStartError::FirmwareNotReady);
     }
@@ -1157,9 +1989,12 @@ pub fn send_station_management_frame(
                 if matches!(
                     axdriver_iwx::decode_firmware_event(packet),
                     axdriver_iwx::FirmwareEvent::TxStatus(_)
-                ) && responses.try_reserve(1).is_ok()
-                {
-                    responses.push(packet.payload.to_vec());
+                ) {
+                    if responses.try_reserve(1).is_ok() {
+                        responses.push(packet.payload.to_vec());
+                    }
+                } else {
+                    receive(packet);
                 }
                 Ok::<_, Infallible>(true)
             })
@@ -1612,6 +2447,24 @@ mod tests {
         packet.packet_mut().fill(0x5a);
         assert_eq!(packet.packet(), &[0x5a; 32]);
         device.recycle_rx_buffer(packet).unwrap();
+    }
+
+    #[test]
+    fn station_join_admission_requires_open_system_and_exact_ssid_element() {
+        let mut request = axdriver_net::WirelessConnectRequest {
+            ssid: b"open".to_vec(),
+            ..Default::default()
+        };
+        assert!(is_open_station_request(&request));
+        request.wpa_versions = 2;
+        assert!(!is_open_station_request(&request));
+
+        assert_eq!(
+            bss_ssid(&[0, 4, b'o', b'p', b'e', b'n', 1, 1, 2]),
+            Some(&b"open"[..])
+        );
+        assert_eq!(bss_ssid(&[1, 1]), None);
+        assert_eq!(bss_ssid(&[0, 3, b'o']), None);
     }
 
     #[test]

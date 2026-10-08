@@ -1051,6 +1051,42 @@ impl Router {
         self.devices[slot].abort_wireless_scan()
     }
 
+    pub(crate) fn connect_wireless(
+        &mut self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessConnectRequest,
+    ) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.links[slot].up {
+            return Err(AxError::BadState);
+        }
+        self.devices[slot].connect_wireless(request)
+    }
+
+    pub(crate) fn disconnect_wireless(&mut self, ifindex: u32, reason: u16) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot].disconnect_wireless(reason)
+    }
+
+    pub(crate) fn wireless_station_info(
+        &self,
+        ifindex: u32,
+    ) -> AxResult<axdriver::prelude::WirelessStationInfo> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        self.devices[slot]
+            .wireless_station_info()
+            .ok_or(AxError::NoSuchDevice)
+    }
+
     pub(crate) fn wireless_scan_results(
         &self,
         ifindex: u32,

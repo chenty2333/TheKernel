@@ -13,6 +13,7 @@ pub const MAC_CONTEXT_COMMAND: u8 = 0x28;
 pub const MAC_CONFIG_COMMAND: u8 = 0x08;
 pub const MAC_CONF_GROUP: u8 = 0x03;
 pub const ACTION_ADD: u32 = 1;
+pub const ACTION_MODIFY: u32 = 2;
 pub const ACTION_REMOVE: u32 = 3;
 pub const MAC_TYPE_LISTENER: u32 = 2;
 pub const MAC_TYPE_BSS_STA: u32 = 5;
@@ -99,7 +100,7 @@ pub enum HtProtection {
 /// Construct the common MAC-context wire fields and station timing payload.
 // upstream: if_iwx.c iwx_mac_ctxt_cmd_common()
 fn legacy_context_payload(config: &MacContextConfig) -> Result<Vec<u8>, MacContextError> {
-    if config.action != ACTION_ADD && config.action != ACTION_REMOVE {
+    if !matches!(config.action, ACTION_ADD | ACTION_MODIFY | ACTION_REMOVE) {
         return Err(MacContextError::InvalidAction);
     }
     let mut payload = alloc::vec![0; LEGACY_COMMON_BYTES + LEGACY_STA_BYTES];
@@ -229,8 +230,11 @@ pub fn mac_context_command(
     if config.action == ACTION_ADD && active {
         return Err(MacContextError::AlreadyActive);
     }
-    if config.action == ACTION_REMOVE && !active {
+    if matches!(config.action, ACTION_MODIFY | ACTION_REMOVE) && !active {
         return Err(MacContextError::NotActive);
+    }
+    if !matches!(config.action, ACTION_ADD | ACTION_MODIFY | ACTION_REMOVE) {
+        return Err(MacContextError::InvalidAction);
     }
     let payload = legacy_context_payload(config)?;
     let command = HostCommand {
@@ -249,7 +253,7 @@ pub fn mld_mac_context_command(
     slot: u8,
     queue: u8,
 ) -> Result<EncodedCommand, MacContextError> {
-    if config.action != ACTION_ADD && config.action != ACTION_REMOVE {
+    if !matches!(config.action, ACTION_ADD | ACTION_MODIFY | ACTION_REMOVE) {
         return Err(MacContextError::InvalidAction);
     }
     let mut payload = alloc::vec![0; 52];
@@ -305,10 +309,10 @@ pub fn update_mac_context<E>(
                 MacContextError::AlreadyActive,
             ));
         }
-        ACTION_REMOVE if !*active => {
+        ACTION_MODIFY | ACTION_REMOVE if !*active => {
             return Err(MacContextUpdateError::Context(MacContextError::NotActive));
         }
-        ACTION_ADD | ACTION_REMOVE => {}
+        ACTION_ADD | ACTION_MODIFY | ACTION_REMOVE => {}
         _ => {
             return Err(MacContextUpdateError::Context(
                 MacContextError::InvalidAction,
@@ -316,7 +320,9 @@ pub fn update_mac_context<E>(
         }
     }
     send(command).map_err(MacContextUpdateError::Send)?;
-    *active = action == ACTION_ADD;
+    if action != ACTION_MODIFY {
+        *active = action == ACTION_ADD;
+    }
     Ok(())
 }
 
@@ -404,5 +410,16 @@ mod tests {
         );
         assert!(active);
         assert!(update_mac_context(&mut active, ACTION_ADD, |_| Ok::<_, ()>(()), &mld).is_err());
+        let modify_config = config(ACTION_MODIFY);
+        let modify = mac_context_command(&modify_config, true, 1, 0).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(modify.bytes[12..16].try_into().unwrap()),
+            ACTION_MODIFY
+        );
+        assert_eq!(
+            update_mac_context(&mut active, ACTION_MODIFY, |_| Ok::<_, ()>(()), &modify),
+            Ok(())
+        );
+        assert!(active);
     }
 }

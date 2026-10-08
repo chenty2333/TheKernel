@@ -63,8 +63,8 @@ pub use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use spin::Once;
 
 pub use axdriver::prelude::{
-    WirelessBssInfo, WirelessHtCapabilities, WirelessPhyCapabilities, WirelessScanRequest,
-    WirelessScanEvent, WirelessVhtCapabilities,
+    WirelessBssInfo, WirelessConnectRequest, WirelessHtCapabilities, WirelessPhyCapabilities,
+    WirelessScanEvent, WirelessScanRequest, WirelessStationInfo, WirelessVhtCapabilities,
 };
 
 static WIRELESS_SCAN_EVENT_CALLBACK: Once<fn(u32, WirelessScanEvent)> = Once::new();
@@ -346,6 +346,21 @@ pub fn trigger_wireless_scan(
 /// Abort the selected wireless interface's active foreground scan.
 pub fn abort_wireless_scan(ifindex: u32) -> AxResult {
     default_stack().abort_wireless_scan(ifindex)
+}
+
+/// Begin a station connection through the named wireless netdev.
+pub fn connect_wireless(ifindex: u32, request: &WirelessConnectRequest) -> AxResult {
+    default_stack().connect_wireless(ifindex, request)
+}
+
+/// Disconnect a station peer through the named wireless netdev.
+pub fn disconnect_wireless(ifindex: u32, reason: u16) -> AxResult {
+    default_stack().disconnect_wireless(ifindex, reason)
+}
+
+/// Read the current station peer through the named wireless netdev.
+pub fn wireless_station_info(ifindex: u32) -> AxResult<WirelessStationInfo> {
+    default_stack().wireless_station_info(ifindex)
 }
 
 /// Return BSS observations collected by the wireless driver's RX path.

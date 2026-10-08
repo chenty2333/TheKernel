@@ -200,15 +200,19 @@ clears held NIC access, stops/resets the APM, restores RF-kill routing, and
 re-prepares the card after NVM read. PCIe Link Control and Device Control 2
 populate the APM L0s/LTR state used by later power policy. The PCI adapter now
 exports `start_runtime(DeviceFunction)` to start regular ucode, PNVM doorbell
-completion, post-ALIVE and the management queue when a future netdev requests
-if-up. The actual if-up caller, MSI-X/IRQ worker, TX/RX packet bridge and wlan0
-publication remain incomplete.
+completion and post-ALIVE when the WLAN netdev requests if-up. The management
+queue is deferred until station-context authentication as in `iwx_auth()`.
+The if-up caller, foreground firmware scan poll, and an Open-System station
+join path (auth, association response, firmware MAC update, data queue) are
+wired. Open, unprotected Ethernet frames are encapsulated/de-encapsulated via
+net80211 and the driver's bounded RX poll; WPA/RSN key installation and EAPOL
+data protection remain unsupported. There is no MSI-X/IRQ worker yet.
 
 The init-net handoff now accepts an explicitly named wireless `NetDriverOps`
 as a second Ethernet-compatible link after rootfs-ready firmware staging. It
 registers link metadata separately from the primary `eth0`; the PCI driver
-must still provide the actual RX/TX and link-up implementation before a WLAN
-adapter is usable.
+publishes `wlan0`, starts regular uCode on if-up, scans, and provides open
+station data transfer when an association is active.
 The init-net wireless registry now backs `/sys/class/net/<wlan>/wireless`,
 `/sys/class/ieee80211/phyN/{index,macaddress}`, and a Linux-layout `/dev/rfkill`
 read stream that reports one WLAN ADD record per published radio (using a
@@ -230,12 +234,15 @@ ordinary Ethernet devices preserve their existing UP default. The controller's
 raw-MPDU DMA submit primitive is available to the future net80211 transmitter.
 The PCI probe now returns the named `wlan0` Ethernet-compatible driver into
 init-net. Its administrative up/down callback starts/stops regular uCode and
-its firmware/NVM-derived MAC is retained. The adapter now submits source-built
+its firmware/NVM-derived MAC is retained. The adapter submits source-built
 management MPDUs on the dedicated queue and polls their TX responses before
 releasing DMA storage; protected management remains rejected until key offload
-is connected. Its RX worker is enabled for foreground scans only, where it
-drains beacon and scan-completion notifications. It still refuses ordinary
-Ethernet data TX/RX until the association/data/key state is integrated.
+is connected. Open-System joins use the cached scan BSS and source net80211
+authentication/association frames, then activate a station queue. Ethernet
+data TX is encapsulated on that queue; RX notifications pass through iwx
+descriptor/duplicate handling and the net80211 station receive path before
+being queued to axnet. WPA/RSN joins, hardware/software key setup, protected
+data, disconnect teardown and asynchronous MLME events are still incomplete.
 
 
 ## Guest user-space payload
