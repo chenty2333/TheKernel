@@ -589,3 +589,8 @@ qualified to Alder Lake-P/N and PG1, matching `intel_display_power_well.c`
 The Intel display adapter now uses the source-specific HSW, ICL AUX and ICL DDI
 BIOS/driver/KVMR/debug request-register groups (the ICL groups omit KVMR) for
 power-well readback and handoff (MIT, Copyright © 2022 Intel).
+
+The kernel power-well adapter carries each map descriptor's `irq_pipe_mask` to
+`HswWellSpec`; when its parent IRQ is live, untranslated per-pipe IRQ changes
+are refused rather than silently bypassed (mapping metadata from MIT
+`intel_display_power_map.c`, Copyright © 2022 Intel).

@@ -1058,3 +1058,8 @@ request register (`intel_display_power_well.c`, MIT, Copyright © 2022 Intel).
 The HSW wait helper documents the upstream `fixed_enable_delay` branch as
 DG2-only (600–1200 us); DG2 is not in the display-12/13 platform maps, while
 its descriptor flag remains faithfully represented.
+
+The kernel maps `PowerWellInstance::irq_pipe_mask` into the HSW power-well
+sequence. While the parent IRQ is offline the upstream hooks are no-ops; while
+it is live the unsupported pipe transition fails closed instead of replacing
+the descriptor mask with zero.

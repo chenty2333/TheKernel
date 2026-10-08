@@ -217,6 +217,7 @@ pub(crate) struct Well {
     pub(crate) request_registers: WellRequestRegisters,
     /// The well index within that register.
     pub(crate) index: u32,
+    pub(crate) irq_pipe_mask: u8,
     /// The power gate whose fuse bit is polled after the state bit, or `None`
     /// for a well with no fuses.  `[I915]` computes it as
     /// `idx - ICL_PW_CTL_IDX_PW_1 + SKL_PG1`, i.e. `idx + 1` in this table.
@@ -267,6 +268,7 @@ pub(crate) const PW_1: Well = Well {
     register: regs::HSW_PWR_WELL_CTL2,
     request_registers: HSW_REQUESTS,
     index: 0,
+    irq_pipe_mask: 0,
     pg: Some(SKL_PG1),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -282,6 +284,7 @@ pub(crate) const PW_2: Well = Well {
     register: regs::HSW_PWR_WELL_CTL2,
     request_registers: HSW_REQUESTS,
     index: 1,
+    irq_pipe_mask: 0,
     pg: Some(2),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -297,6 +300,7 @@ pub(crate) const PW_A: Well = Well {
     register: regs::HSW_PWR_WELL_CTL2,
     request_registers: HSW_REQUESTS,
     index: 5,
+    irq_pipe_mask: 0,
     pg: Some(6),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -306,6 +310,7 @@ pub(crate) const PW_B: Well = Well {
     register: regs::HSW_PWR_WELL_CTL2,
     request_registers: HSW_REQUESTS,
     index: 6,
+    irq_pipe_mask: 0,
     pg: Some(7),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -315,6 +320,7 @@ pub(crate) const PW_C: Well = Well {
     register: regs::HSW_PWR_WELL_CTL2,
     request_registers: HSW_REQUESTS,
     index: 7,
+    irq_pipe_mask: 0,
     pg: Some(8),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -324,6 +330,7 @@ pub(crate) const PW_D: Well = Well {
     register: regs::HSW_PWR_WELL_CTL2,
     request_registers: HSW_REQUESTS,
     index: 8,
+    irq_pipe_mask: 0,
     pg: Some(9),
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -339,6 +346,7 @@ pub(crate) const DDI_IO_A: Well = Well {
     register: regs::ICL_PWR_WELL_CTL_DDI2,
     request_registers: DDI_REQUESTS,
     index: 0,
+    irq_pipe_mask: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -349,6 +357,7 @@ pub(crate) const DDI_IO_B: Well = Well {
     register: regs::ICL_PWR_WELL_CTL_DDI2,
     request_registers: DDI_REQUESTS,
     index: 1,
+    irq_pipe_mask: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -364,6 +373,7 @@ pub(crate) const AUX_A: Well = Well {
     register: regs::ICL_PWR_WELL_CTL_AUX2,
     request_registers: AUX_REQUESTS,
     index: 0,
+    irq_pipe_mask: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -374,6 +384,7 @@ pub(crate) const AUX_B: Well = Well {
     register: regs::ICL_PWR_WELL_CTL_AUX2,
     request_registers: AUX_REQUESTS,
     index: 1,
+    irq_pipe_mask: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
@@ -1021,17 +1032,23 @@ impl<R: Registers> intel_display::power_well::HswPowerWellIo for HswPowerWellAda
     }
 
     fn post_enable(&self, irq_pipe_mask: u8) -> Result<(), intel_display::Error> {
-        if irq_pipe_mask == 0 {
+        if irq_pipe_mask == 0 || !super::irq::online() {
             Ok(())
         } else {
+            // The source resets/initializes every pipe's DE IRQ block here.
+            // This owner currently supports Pipe A only at install time; do
+            // not silently skip a live IRQ transition.
             Err(intel_display::Error::Refused)
         }
     }
 
     fn pre_disable(&self, irq_pipe_mask: u8) -> Result<(), intel_display::Error> {
-        if irq_pipe_mask == 0 {
+        if irq_pipe_mask == 0 || !super::irq::online() {
             Ok(())
         } else {
+            // The i915 path masks/acks the pipe source and synchronizes the
+            // parent IRQ before the well drops. Keep this fail-closed until
+            // the per-well IRQ teardown path is translated.
             Err(intel_display::Error::Refused)
         }
     }
@@ -1119,7 +1136,7 @@ pub(crate) fn enable_well<R: Registers>(
         has_fuses: well.pg.is_some(),
         alderlake_pw1_wa: matches!(platform, DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN)
             && well.pg == Some(SKL_PG1),
-        irq_pipe_mask: 0,
+        irq_pipe_mask: well.irq_pipe_mask,
     };
     let enable =
         intel_display::power_well::hsw_power_well_enable(&adapter, spec).map_err(|error| {
@@ -1188,7 +1205,7 @@ pub(crate) fn disable_well<R: Registers>(
         has_fuses: well.pg.is_some(),
         alderlake_pw1_wa: matches!(platform, DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN)
             && well.pg == Some(SKL_PG1),
-        irq_pipe_mask: 0,
+        irq_pipe_mask: well.irq_pipe_mask,
     };
     intel_display::power_well::hsw_power_well_disable(&adapter, spec)
         .map(|_| ())
@@ -1205,7 +1222,7 @@ pub(crate) fn disable_well<R: Registers>(
 }
 
 fn mapped_hsw_well(instance: PowerWellInstance) -> Option<Well> {
-    match instance.control? {
+    let mut well = match instance.control? {
         WellControl::IclPw1 => Some(PW_1),
         WellControl::IclPw2 => Some(PW_2),
         WellControl::XelpdPwA => Some(PW_A),
@@ -1213,7 +1230,9 @@ fn mapped_hsw_well(instance: PowerWellInstance) -> Option<Well> {
         WellControl::XelpdPwC => Some(PW_C),
         WellControl::XelpdPwD => Some(PW_D),
         _ => None,
-    }
+    }?;
+    well.irq_pipe_mask = instance.irq_pipe_mask;
+    Some(well)
 }
 
 struct MappedPowerWellIo<'a, R> {
@@ -2046,6 +2065,15 @@ mod tests {
         assert_eq!(AUX_A.request_registers.kvmr, None);
         assert_eq!(DDI_IO_A.request_mask(), 0x2);
         assert_eq!(AUX_B.state_mask(), 0x4);
+        let adlp = power_wells(DmcPlatform::AlderLakeN);
+        let pw_a = adlp
+            .iter()
+            .flat_map(|group| group.instances.iter())
+            .find(|instance| instance.name == "PW_A")
+            .copied()
+            .unwrap();
+        assert_eq!(pw_a.irq_pipe_mask, 1 << 0);
+        assert_eq!(mapped_hsw_well(pw_a).unwrap().irq_pipe_mask, 1 << 0);
     }
 
     #[test]
