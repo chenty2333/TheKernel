@@ -280,6 +280,88 @@ pub struct CaptureRegisterList<'a> {
     pub registers: &'a [CaptureRegister],
 }
 
+const CAPTURE_ADS_CACHE_ENTRIES: usize = 2 * 3 * 16;
+
+/// Cached page-aligned ADS register lists and the four-dword null list.
+/// upstream: intel_guc_capture.c intel_guc_capture_getlistsize(),
+/// intel_guc_capture_getlist(), and intel_guc_capture_getnullheader().
+pub struct CaptureAdsCache {
+    entries: Vec<Option<Result<Vec<u8>, CaptureError>>>,
+    null_header: [u8; 16],
+}
+
+impl CaptureAdsCache {
+    pub fn new() -> Result<Self, CaptureError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(CAPTURE_ADS_CACHE_ENTRIES)
+            .map_err(|_| CaptureError::InvalidBuffer)?;
+        entries.resize_with(CAPTURE_ADS_CACHE_ENTRIES, || None);
+        Ok(Self {
+            entries,
+            null_header: null_capture_header(),
+        })
+    }
+
+    fn index(owner: u32, list_type: u32, engine: u32) -> Result<usize, CaptureError> {
+        if owner >= 2 || list_type >= 3 || engine >= 16 {
+            return Err(CaptureError::InvalidBuffer);
+        }
+        Ok(owner as usize * 3 * 16 + list_type as usize * 16 + engine as usize)
+    }
+
+    /// Cache one static+extended list, including negative lookup results.
+    pub fn get_list(
+        &mut self,
+        lists: &[CaptureRegisterList<'_>],
+        extended: &[CaptureRegisterList<'_>],
+        owner: u32,
+        list_type: u32,
+        engine: u32,
+    ) -> Result<&[u8], CaptureError> {
+        let index = Self::index(owner, list_type, engine)?;
+        if self.entries[index].is_none() {
+            let base = get_one_list(lists, owner, list_type, engine);
+            let ext = get_one_list(extended, owner, list_type, engine);
+            let result = base
+                .ok_or(CaptureError::Empty)
+                .and_then(|base| build_ads_capture_list_from_groups(base, ext));
+            self.entries[index] = Some(result);
+        }
+        match self.entries[index]
+            .as_ref()
+            .ok_or(CaptureError::InvalidBuffer)?
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => Err(*error),
+        }
+    }
+
+    /// upstream: intel_guc_capture_getlistsize() cached size result.
+    pub fn get_list_size(
+        &mut self,
+        lists: &[CaptureRegisterList<'_>],
+        extended: &[CaptureRegisterList<'_>],
+        owner: u32,
+        list_type: u32,
+        engine: u32,
+    ) -> Result<usize, CaptureError> {
+        self.get_list(lists, extended, owner, list_type, engine)
+            .map(<[u8]>::len)
+    }
+
+    pub const fn null_header(&self) -> &[u8; 16] {
+        &self.null_header
+    }
+
+    /// upstream: intel_guc_capture_free_ads_cache().
+    pub fn clear(&mut self) {
+        for entry in &mut self.entries {
+            *entry = None;
+        }
+    }
+}
+
 /// Expand render-class MCR capture registers for each discovered slice /
 /// subslice pair. The addresses are supplied from the platform register table.
 /// upstream: intel_guc_capture.c guc_capture_alloc_steered_lists().
@@ -1373,6 +1455,42 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0x20);
         assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 0x30);
+    }
+
+    #[test]
+    fn ads_capture_cache_reuses_lists_and_caches_empty_results() {
+        let registers = [CaptureRegister {
+            offset: 0x100,
+            value: 0,
+            flags: 0,
+            mask: 0,
+        }];
+        let lists = [CaptureRegisterList {
+            owner: 0,
+            list_type: u32::from(CAPTURE_TYPE_ENGINE_CLASS),
+            engine: 2,
+            registers: &registers,
+        }];
+        let mut cache = CaptureAdsCache::new().unwrap();
+        assert_eq!(cache.null_header(), &[0; 16]);
+        assert_eq!(cache.get_list_size(&lists, &[], 0, 1, 2), Ok(PAGE_SIZE));
+        assert_eq!(
+            cache.get_list(&lists, &[], 0, 1, 2).unwrap()[4..8],
+            0x100u32.to_le_bytes()
+        );
+        assert_eq!(
+            cache.get_list(&lists, &[], 0, 1, 1),
+            Err(CaptureError::Empty)
+        );
+        assert_eq!(
+            cache.get_list(&lists, &[], 0, 1, 1),
+            Err(CaptureError::Empty)
+        );
+        cache.clear();
+        assert_eq!(
+            cache.get_list(&lists, &[], 0, 1, 2).unwrap().len(),
+            PAGE_SIZE
+        );
     }
 
     #[test]
