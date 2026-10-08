@@ -332,3 +332,9 @@ The `ieee80211_begin_scan()` plan now also returns the station-only BSS cleanup,
 scan-node inactivity aging, AUTO/current mode reset, scan-count reset and
 next-channel dispatch effects. The caller composes it with the node-cache age
 and channel cursor helpers; hostap still begins passively.
+
+The four scalar ifmedia conversion functions from `ieee80211.c` now map
+legacy rates and HT/VHT/HE MCS values through typed `MediaSubtype` variants.
+The `ifattach`/`ifdetach`, `media_init`, `media_change`, and `media_status`
+functions are framework registration/ioctl wrappers and remain mapped to the
+kernel's wireless netdev/ioctl surface rather than copied from OpenBSD ifnet.

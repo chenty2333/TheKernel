@@ -1142,3 +1142,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/net80211/ieee80211_proto.c` rev 1.176 (BSD-3-Clause): `ieee80211_check_wpa_supplicant_failure()` station/IBSS PTK-negotiation failure propagation to the cached BSS node translated in `tk-net80211/src/proto.rs`.
 - OpenBSD `sys/net80211/ieee80211_proto.c` rev 1.176 and `ieee80211_node.h` rev 1.64 (BSD-3-Clause): station `ieee80211_keyrun()` run/RSN guard and external supplicant PTKSTART handoff translated in `tk-net80211/src/proto.rs`.
 - OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 and `ieee80211_var.h` rev 1.143 (BSD-3-Clause): HT/local AMPDU/station-BSS/RSN eligibility check translated in `tk-net80211/src/output.rs`.
+- OpenBSD `sys/net80211/ieee80211.c` rev 1.92 (BSD-3-Clause): station media subtype, legacy rate, and MCS conversions translated to typed enums in `tk-net80211/src/media.rs`.

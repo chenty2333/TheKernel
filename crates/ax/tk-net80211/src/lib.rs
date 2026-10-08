@@ -22,6 +22,7 @@ mod disconnect_rx;
 mod frame;
 mod input;
 mod mgmt_rx;
+mod media;
 mod node;
 mod node_caps;
 mod node_rates;
@@ -90,6 +91,10 @@ pub use input::{
     save_information_element, setup_uapsd,
 };
 pub use mgmt_rx::{ManagementRxError, ManagementRxKind, receive_management_kind};
+pub use media::{
+    MediaConversionError, MediaSubtype, media_to_mcs, media_to_rate, mcs_to_media,
+    rate_to_media,
+};
 pub use node::{
     AKM_8021X, AKM_PSK, AKM_SHA256_8021X, AKM_SHA256_PSK, ASSOCFAIL_BASIC_RATE, ASSOCFAIL_BSSID,
     ASSOCFAIL_CHAN, ASSOCFAIL_CSA, ASSOCFAIL_ESSID, ASSOCFAIL_IBSS, ASSOCFAIL_PRIVACY,
