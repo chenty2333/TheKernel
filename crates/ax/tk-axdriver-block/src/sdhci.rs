@@ -440,6 +440,42 @@ pub enum MmcBusTiming {
     MmcHs400EnhancedStrobe,
 }
 
+pub const MMC_CAP_HSPEED: u32 = 1 << 2;
+pub const MMC_CAP_UHS_SDR12: u32 = 1 << 6;
+pub const MMC_CAP_UHS_SDR25: u32 = 1 << 7;
+pub const MMC_CAP_UHS_SDR50: u32 = 1 << 8;
+pub const MMC_CAP_UHS_SDR104: u32 = 1 << 9;
+pub const MMC_CAP_UHS_DDR50: u32 = 1 << 10;
+pub const MMC_CAP_MMC_DDR52_120: u32 = 1 << 11;
+pub const MMC_CAP_MMC_DDR52_180: u32 = 1 << 12;
+pub const MMC_CAP_MMC_HS200_120: u32 = 1 << 13;
+pub const MMC_CAP_MMC_HS200_180: u32 = 1 << 14;
+pub const MMC_CAP_MMC_HS400_120: u32 = 1 << 15;
+pub const MMC_CAP_MMC_HS400_180: u32 = 1 << 16;
+pub const MMC_CAP_MMC_ENH_STROBE: u32 = 1 << 17;
+
+// upstream: mmc.c mmc_host_timing()
+pub fn host_supports_timing(host_caps: u32, timing: MmcBusTiming) -> bool {
+    let any = |mask: u32| host_caps & mask != 0;
+    let all = |mask: u32| host_caps & mask == mask;
+    match timing {
+        MmcBusTiming::Normal => true,
+        MmcBusTiming::HighSpeed => any(MMC_CAP_HSPEED),
+        MmcBusTiming::UhsSdr12 => any(MMC_CAP_UHS_SDR12),
+        MmcBusTiming::UhsSdr25 => any(MMC_CAP_UHS_SDR25),
+        MmcBusTiming::UhsDdr50 => any(MMC_CAP_UHS_DDR50),
+        MmcBusTiming::UhsSdr50 => any(MMC_CAP_UHS_SDR50),
+        MmcBusTiming::UhsSdr104 => any(MMC_CAP_UHS_SDR104),
+        MmcBusTiming::MmcDdr52 => any(MMC_CAP_MMC_DDR52_120 | MMC_CAP_MMC_DDR52_180),
+        MmcBusTiming::MmcHs200 => any(MMC_CAP_MMC_HS200_120 | MMC_CAP_MMC_HS200_180),
+        MmcBusTiming::MmcHs400 => any(MMC_CAP_MMC_HS400_120 | MMC_CAP_MMC_HS400_180),
+        MmcBusTiming::MmcHs400EnhancedStrobe => {
+            all(MMC_CAP_MMC_HS400_120 | MMC_CAP_MMC_ENH_STROBE)
+                || all(MMC_CAP_MMC_HS400_180 | MMC_CAP_MMC_ENH_STROBE)
+        }
+    }
+}
+
 // upstream: mmc.c mmc_timing_to_dtr()
 pub fn timing_to_data_rate(timing: MmcBusTiming, normal_hz: u32, high_speed_hz: u32) -> u32 {
     match timing {
@@ -1496,32 +1532,53 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.start_command(index, argument, command_flags);
         let response = self.finish_command(command_flags)?;
         if let Some(buffer) = data {
-            if use_sdma || use_adma2 {
-                if use_sdma {
-                    self.wait_dma_data_end(data_len)?;
-                } else {
-                    self.wait_status(SDHCI_INT_DATA_END)?;
-                    self.dma_inflight = false;
-                }
-                fence(Ordering::Acquire);
-                if read_transfer {
-                    let dma = self.dma.as_ref().expect("SDMA region remains owned");
-                    let payload = if use_adma2 {
-                        // SAFETY: the ADMA2 payload starts after the descriptor table.
-                        unsafe { dma.cpu.as_ptr().add(SDHCI_ADMA2_PAYLOAD_OFFSET) }
-                    } else {
-                        dma.cpu.as_ptr()
-                    };
-                    // SAFETY: DATA_END retires device DMA before the copy.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(payload, buffer.as_mut_ptr(), data_len);
-                    }
-                }
-            } else {
-                self.transfer_pio(buffer, block_size, read_transfer)?;
-            }
+            self.finish_data(
+                buffer,
+                block_size,
+                data_len,
+                read_transfer,
+                use_sdma,
+                use_adma2,
+            )?;
         }
         Ok(response)
+    }
+
+    // upstream: sdhci.c sdhci_finish_data()
+    fn finish_data(
+        &mut self,
+        buffer: &mut [u8],
+        block_size: usize,
+        data_len: usize,
+        read_transfer: bool,
+        use_sdma: bool,
+        use_adma2: bool,
+    ) -> Result<(), SdhciError> {
+        if use_sdma || use_adma2 {
+            if use_sdma {
+                self.wait_dma_data_end(data_len)?;
+            } else {
+                self.wait_status(SDHCI_INT_DATA_END)?;
+                self.dma_inflight = false;
+            }
+            fence(Ordering::Acquire);
+            if read_transfer {
+                let dma = self.dma.as_ref().expect("DMA region remains owned");
+                let payload = if use_adma2 {
+                    // SAFETY: the ADMA2 payload starts after the descriptor table.
+                    unsafe { dma.cpu.as_ptr().add(SDHCI_ADMA2_PAYLOAD_OFFSET) }
+                } else {
+                    dma.cpu.as_ptr()
+                };
+                // SAFETY: DATA_END retires device DMA before the copy.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(payload, buffer.as_mut_ptr(), data_len);
+                }
+            }
+            Ok(())
+        } else {
+            self.transfer_pio(buffer, block_size, read_transfer)
+        }
     }
 
     // upstream: sdhci.c SDHCI_INT_DMA_END transfer-boundary handling
