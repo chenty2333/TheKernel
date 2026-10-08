@@ -541,3 +541,6 @@ see `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-MMC.txt`.
 
 The SDHCI PCI binding retains FreeBSD BSD-2-Clause attribution in
 `crates/ax/tk-axdriver/LICENSES/BSD-2-Clause-FreeBSD-SDHCI-PCI.txt`.
+
+The Intel e1000 shared register definitions retain the BSD-3-Clause grant at
+`crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
