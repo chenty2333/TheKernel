@@ -52,6 +52,7 @@ static int idle(void) {
     }
     if(!cpus) return 1;
     usleep(300000);
+    int mwait_cpus=0,mwait_idle=0,hlt_cpus=0,hlt_idle=0;
     for(int cpu=0;cpu<cpus;cpu++) {
         unsigned long long usage[2]={0},time[2]={0};
         for(int state=0;state<counts[cpu];state++) {
@@ -63,9 +64,12 @@ static int idle(void) {
             time[state!=0]+=after-before[cpu][state][1];
         }
         printf("CPU_IDLE cpu=%d mwait_enabled=%d supported=%d hlt_usage=%llu mwait_usage=%llu hlt_time_us=%llu mwait_time_us=%llu\n",cpu,enabled,supported[cpu],usage[0],usage[1],time[0],time[1]);
-        if(enabled&&supported[cpu]) { if(!usage[1]||!time[1]) return 1; }
-        else if(usage[1]||!usage[0]||!time[0]) return 1;
+        /* A CPU may stay busy for the whole window under TCG, so require
+           entries per policy class across CPUs, not on every CPU. */
+        if(enabled&&supported[cpu]) { mwait_cpus++; if(usage[1]&&time[1]) mwait_idle++; }
+        else { if(usage[1]) return 1; hlt_cpus++; if(usage[0]&&time[0]) hlt_idle++; }
     }
+    if((mwait_cpus&&!mwait_idle)||(hlt_cpus&&!hlt_idle)) return 1;
     snprintf(path,sizeof(path),ROOT "/cpu0/cpuidle/state0/disable");
     int fd=open(path,O_WRONLY); if(fd<0) return 1;
     errno=0; int result=write(fd,"2\n",2); close(fd); if(result!=-1||errno!=EINVAL) return 1;
