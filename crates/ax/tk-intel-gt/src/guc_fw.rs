@@ -23,6 +23,16 @@ const HUC_UKERNEL: u32 = 1 << 9;
 const DMA_ADDRESS_SPACE_WOPCM: u32 = 7 << 16;
 const HUC_STATUS2: u32 = 0xd3b0;
 const HUC_FW_VERIFIED: u32 = 1 << 7;
+const GEN11_GUC_SEND_BASE: u32 = 0x190240;
+const GEN11_GUC_HOST_INTERRUPT: u32 = 0x1901f0;
+const GEN11_GUC_SEND_COUNT: usize = 4;
+const GUC_SEND_TRIGGER: u32 = 1;
+const HXG_ORIGIN_GUC: u32 = 1 << 31;
+const HXG_TYPE_MASK: u32 = 7 << 28;
+const HXG_TYPE_RESPONSE_SUCCESS: u32 = 7 << 28;
+const HXG_TYPE_NO_RESPONSE_BUSY: u32 = 3 << 28;
+const HXG_TYPE_NO_RESPONSE_RETRY: u32 = 5 << 28;
+const HXG_TYPE_RESPONSE_FAILURE: u32 = 6 << 28;
 const UOS_RSA_SCRATCH: u32 = 0xc200;
 const UOS_RSA_SCRATCH_COUNT: usize = 64;
 
@@ -168,6 +178,50 @@ pub fn wait_huc_auth(io: &impl GtIo) -> Result<u32, Error> {
         }
     }
     Err(Error::Timeout(HUC_STATUS2))
+}
+
+// upstream: intel_guc.c intel_guc_send_mmio()
+/// Gen11+ four-dword MMIO transport. The caller serializes the send path and
+/// owns forcewake.
+pub fn send_mmio(io: &impl GtIo, request: &[u32]) -> Result<u32, Error> {
+    if request.is_empty()
+        || request.len() > GEN11_GUC_SEND_COUNT
+        || request[0] & HXG_ORIGIN_GUC != 0
+        || request[0] & HXG_TYPE_MASK != 0
+    {
+        return Err(Error::Refused);
+    }
+    loop {
+        for (index, word) in request.iter().copied().enumerate() {
+            io.write(GEN11_GUC_SEND_BASE + index as u32 * 4, word)?;
+        }
+        let _posted = io.read(GEN11_GUC_SEND_BASE + (request.len() as u32 - 1) * 4)?;
+        io.write(GEN11_GUC_HOST_INTERRUPT, GUC_SEND_TRIGGER)?;
+        let mut response = crate::wait(
+            io,
+            GEN11_GUC_SEND_BASE,
+            HXG_ORIGIN_GUC,
+            HXG_ORIGIN_GUC,
+            10_000,
+        )?;
+        let busy_start = io.now_us();
+        while response & HXG_TYPE_MASK == HXG_TYPE_NO_RESPONSE_BUSY {
+            if io.now_us().saturating_sub(busy_start) >= 1_000_000 {
+                return Err(Error::Timeout(GEN11_GUC_SEND_BASE));
+            }
+            io.delay_us(1);
+            response = io.read(GEN11_GUC_SEND_BASE)?;
+            if response & HXG_ORIGIN_GUC == 0 {
+                return Err(Error::Unavailable(GEN11_GUC_SEND_BASE));
+            }
+        }
+        match response & HXG_TYPE_MASK {
+            HXG_TYPE_RESPONSE_SUCCESS => return Ok(response & 0x0fff_ffff),
+            HXG_TYPE_RESPONSE_FAILURE => return Err(Error::Refused),
+            HXG_TYPE_NO_RESPONSE_RETRY => continue,
+            _ => return Err(Error::Unavailable(GEN11_GUC_SEND_BASE)),
+        }
+    }
 }
 
 // upstream: intel_guc_fw.c guc_prepare_xfer()
@@ -328,6 +382,44 @@ mod tests {
         time: core::cell::Cell<u64>,
         stuck: bool,
         fail_start: bool,
+    }
+
+    struct MmioIo<'a> {
+        writes: core::cell::RefCell<std::vec::Vec<(u32, u32)>>,
+        responses: &'a [&'a [u32]],
+        notifications: core::cell::Cell<usize>,
+        response_index: core::cell::Cell<usize>,
+        time: core::cell::Cell<u64>,
+    }
+    impl GtIo for MmioIo<'_> {
+        fn read(&self, offset: u32) -> Result<u32, Error> {
+            if offset == GEN11_GUC_SEND_BASE {
+                let notification = self.notifications.get().saturating_sub(1);
+                let responses = self.responses[notification.min(self.responses.len() - 1)];
+                let index = self.response_index.get();
+                self.response_index.set(index.saturating_add(1));
+                return Ok(responses[index.min(responses.len() - 1)]);
+            }
+            if offset == GEN11_GUC_SEND_BASE + 4 {
+                return Ok(0);
+            }
+            Err(Error::Unavailable(offset))
+        }
+        fn write(&self, offset: u32, value: u32) -> Result<(), Error> {
+            self.writes.borrow_mut().push((offset, value));
+            if offset == GEN11_GUC_HOST_INTERRUPT {
+                self.notifications.set(self.notifications.get() + 1);
+                self.response_index.set(0);
+            }
+            Ok(())
+        }
+        fn now_us(&self) -> u64 {
+            self.time.get()
+        }
+        fn delay_us(&self, micros: u32) {
+            self.time
+                .set(self.time.get().saturating_add(u64::from(micros)));
+        }
     }
     impl GtIo for DmaIo {
         fn read(&self, offset: u32) -> Result<u32, Error> {
@@ -499,5 +591,51 @@ mod tests {
             fail_start: false,
         };
         assert_eq!(wait_huc_auth(&io), Ok(HUC_FW_VERIFIED));
+    }
+
+    #[test]
+    fn gen11_mmio_send_handles_busy_retry_success_and_failure() {
+        let busy_response = HXG_ORIGIN_GUC | HXG_TYPE_NO_RESPONSE_BUSY;
+        let success = HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_SUCCESS | 0x1234;
+        let busy_values = [busy_response, busy_response, success];
+        let busy_responses = [&busy_values[..]];
+        let busy = MmioIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            responses: &busy_responses,
+            notifications: core::cell::Cell::new(0),
+            response_index: core::cell::Cell::new(0),
+            time: core::cell::Cell::new(0),
+        };
+        assert_eq!(send_mmio(&busy, &[0x4000, 0x1234]), Ok(0x1234));
+        assert_eq!(busy.notifications.get(), 1);
+        assert_eq!(busy.writes.borrow()[0], (GEN11_GUC_SEND_BASE, 0x4000));
+        assert_eq!(
+            busy.writes.borrow()[2],
+            (GEN11_GUC_HOST_INTERRUPT, GUC_SEND_TRIGGER)
+        );
+
+        let retry_values = [HXG_ORIGIN_GUC | HXG_TYPE_NO_RESPONSE_RETRY];
+        let retry_success = [success];
+        let retry_responses = [&retry_values[..], &retry_success[..]];
+        let retry = MmioIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            responses: &retry_responses,
+            notifications: core::cell::Cell::new(0),
+            response_index: core::cell::Cell::new(0),
+            time: core::cell::Cell::new(0),
+        };
+        assert_eq!(send_mmio(&retry, &[0x4000, 0x1234]), Ok(0x1234));
+        assert_eq!(retry.notifications.get(), 2);
+
+        let failure_values = [HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_FAILURE];
+        let failure_responses = [&failure_values[..]];
+        let failure = MmioIo {
+            writes: core::cell::RefCell::new(std::vec::Vec::new()),
+            responses: &failure_responses,
+            notifications: core::cell::Cell::new(0),
+            response_index: core::cell::Cell::new(0),
+            time: core::cell::Cell::new(0),
+        };
+        assert_eq!(send_mmio(&failure, &[0x4000]), Err(Error::Refused));
     }
 }
