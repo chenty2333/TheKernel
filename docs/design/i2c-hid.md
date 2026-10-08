@@ -36,3 +36,7 @@ now resolves a collection within one TLC. HMT probing scans top-level collection
 and pins Contact ID/Tip/X/Y and feature controls to the selected touch
 collection rather than assuming a single collection or using report-global
 feature locations.
+
+Feature-report reads for Contact Count Maximum now size the transfer from the
+selected report ID rather than the descriptor-wide maximum; this avoids mixing
+lengths when several feature Report IDs coexist.

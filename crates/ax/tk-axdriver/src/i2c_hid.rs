@@ -226,11 +226,13 @@ impl I2cInput {
             let mut contact_feature_id = None;
             let mut contact_feature: Option<(Vec<u8>, usize)> = None;
             if let Some(location) = location {
+                let feature_length =
+                    parser.report_size(crate::hid_report::ReportKind::Feature, location.report_id);
                 let mut feature = Vec::new();
                 feature
-                    .try_reserve_exact(report_info.feature.bytes)
+                    .try_reserve_exact(feature_length)
                     .map_err(|_| DevError::NoMemory)?;
-                feature.resize(report_info.feature.bytes, 0);
+                feature.resize(feature_length, 0);
                 let actual = device.get_report(3, location.report_id, &mut feature).ok();
                 if actual.is_some_and(|actual| {
                     actual.saturating_mul(8)
