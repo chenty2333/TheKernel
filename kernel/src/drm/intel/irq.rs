@@ -22,7 +22,7 @@
 //! ported: the N305 adapter owns one MSI, admits only the display master source,
 //! and fails closed rather than servicing unrelated GT/PCU sources.
 
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 use core::{
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering, compiler_fence},
     time::Duration,
@@ -529,6 +529,101 @@ trait IrqIo {
     fn write(&self, offset: u32, value: u32) -> bool;
 }
 
+/// Adapts the translated Gen11 hotplug pin decoder to the IRQ owner's exact
+/// read-only control-register view. Its callback only publishes the two
+/// admitted TC pins; task-context connector work remains deferred.
+struct Gen11HotplugIo<'a, I> {
+    io: &'a I,
+    events: &'a Events,
+    failed: bool,
+}
+
+impl<I: IrqIo> intel_display::intel_hotplug_irq_full::HotplugIrqIo for Gen11HotplugIo<'_, I> {
+    fn read(&mut self, reg: intel_display::intel_hotplug_irq_full::IrqRegister) -> u32 {
+        if reg != intel_display::intel_hotplug_irq_full::IrqRegister::Gen11TcHotplugControl {
+            self.failed = true;
+            return u32::MAX;
+        }
+        match self.io.read(GEN11_TC_HOTPLUG_CTL) {
+            Some(value) => value,
+            None => {
+                self.failed = true;
+                u32::MAX
+            }
+        }
+    }
+
+    fn write(&mut self, _reg: intel_display::intel_hotplug_irq_full::IrqRegister, _value: u32) {
+        self.failed = true;
+    }
+
+    fn rmw(
+        &mut self,
+        reg: intel_display::intel_hotplug_irq_full::IrqRegister,
+        clear: u32,
+        set: u32,
+    ) -> u32 {
+        let value = self.read(reg);
+        (value & !clear) | set
+    }
+
+    fn posting_read(&mut self, _reg: intel_display::intel_hotplug_irq_full::IrqRegister) {}
+    fn lock(&mut self, _lock: intel_display::intel_hotplug_irq_full::IrqLock) {}
+    fn unlock(&mut self, _lock: intel_display::intel_hotplug_irq_full::IrqLock) {}
+    fn assert_lock_held(&mut self, _lock: intel_display::intel_hotplug_irq_full::IrqLock) {}
+    fn warn(&mut self, _message: &'static str, _value: u32) {}
+    fn warn_once(&mut self, _message: &'static str, _value: u32) {}
+    fn log(&mut self, _event: intel_display::intel_hotplug_irq_full::IrqLog) {}
+
+    fn hpd_irq_handler(&mut self, pin_mask: u32, _long_mask: u32) {
+        use intel_display::intel_hotplug_irq_full::{HPD_PORT_TC1, HPD_PORT_TC2};
+        let mut pending = 0;
+        if pin_mask & (1 << HPD_PORT_TC1) != 0 {
+            pending |= 1;
+        }
+        if pin_mask & (1 << HPD_PORT_TC2) != 0 {
+            pending |= 2;
+        }
+        self.events.hpd.fetch_or(pending, Ordering::Release);
+    }
+
+    fn dp_aux_irq_handler(&mut self) {}
+    fn gmbus_irq_handler(&mut self) {}
+    fn update_interrupts(
+        &mut self,
+        _block: intel_display::intel_hotplug_irq_full::InterruptBlock,
+        _mask: u32,
+        _enabled: u32,
+    ) {
+    }
+    fn hpd_init_early(&mut self) {}
+    fn xelpdp_pica_aux_mask(&self) -> u32 {
+        0
+    }
+}
+
+fn dispatch_gen11_tc_hotplug(io: &impl IrqIo, events: &Events, trigger: u32) -> bool {
+    use intel_display::intel_hotplug_irq_full::{
+        IntelHotplugIrq, Platform, intel_hpd_gen11_pin_map,
+    };
+
+    let mut source = IntelHotplugIrq::new(
+        Platform {
+            display_ver: 13,
+            ..Platform::default()
+        },
+        Vec::new(),
+    );
+    source.hpd = Some(intel_hpd_gen11_pin_map());
+    let mut adapter = Gen11HotplugIo {
+        io,
+        events,
+        failed: false,
+    };
+    source.gen11_hpd_irq_handler(&mut adapter, trigger);
+    !adapter.failed
+}
+
 struct VolatileIo {
     base: usize,
 }
@@ -617,7 +712,9 @@ fn dispatch(io: &impl IrqIo, events: &Events) -> bool {
         if allowed == 0 || owned == 0 || status & !allowed != 0 || !io.write(DE_HPD_IIR, owned) {
             return fault();
         }
-        events.hpd.fetch_or(owned >> 16, Ordering::Release);
+        if !dispatch_gen11_tc_hotplug(io, events, owned) {
+            return fault();
+        }
         handled = true;
     }
     if display_sources & DISPLAY_PCH != 0 {
@@ -661,6 +758,7 @@ mod tests {
         let mut values = BTreeMap::new();
         values.insert(GFX_MSTR_IRQ, 0);
         values.insert(GEN11_DISPLAY_INT_CTL, 0);
+        values.insert(GEN11_TC_HOTPLUG_CTL, 0);
         for register in GT_CLASS_ENABLES {
             values.insert(register, 0);
         }
@@ -695,6 +793,21 @@ mod tests {
             }
         }
         assert!(!source_image_idle(|_| None));
+    }
+
+    #[test]
+    fn gen11_hotplug_decode_uses_translated_pin_map_and_long_pulse_state() {
+        let io = Model {
+            words: Mutex::new(BTreeMap::from([(GEN11_TC_HOTPLUG_CTL, 2)])),
+            ..Default::default()
+        };
+        let events = Events::new();
+        assert!(dispatch_gen11_tc_hotplug(&io, &events, 1 << 16));
+        assert_eq!(events.hpd.load(Ordering::Acquire), 1);
+        assert!(
+            io.writes.lock().is_empty(),
+            "IRQ decode must only read the HPD control register"
+        );
     }
 
     #[derive(Default)]
