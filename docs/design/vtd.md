@@ -48,3 +48,8 @@ W1C behavior, record draining and deferred reporting. Locks, taskqueues and
 requester/device formatting are native `FaultIo` callbacks. The kernel's
 current runtime path still uses its existing polled fault checks rather than
 registering this new interrupt/task adapter.
+
+FreeBSD `intel_quirks.c` is mapped at 7/7 functions in `tk-vtd/src/quirks.rs`,
+including the 5400/5500 northbridge revisions and E5 MAMV cap. The Rust matcher
+accepts native PCI northbridge and CPUID leaf-1 facts; the driver initialization
+order still needs to call pre-use/post-ident hooks.

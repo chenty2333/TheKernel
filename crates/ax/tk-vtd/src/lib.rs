@@ -19,6 +19,7 @@ pub mod idpgtbl;
 pub mod iova;
 pub mod pgtbl;
 pub mod qi;
+pub mod quirks;
 pub mod reg;
 pub mod utils;
 
