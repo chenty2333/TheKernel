@@ -24,6 +24,8 @@ pub const GUC_ENGINE_CLASS_MASK: u32 = 0x7;
 pub const GUC_ENGINE_INSTANCE_SHIFT: u32 = 3;
 pub const GUC_ENGINE_INSTANCE_MASK: u32 = 0xf << GUC_ENGINE_INSTANCE_SHIFT;
 pub const CTX_GTT_ADDRESS_MASK: u32 = 0xffff_f000;
+pub const CAPTURE_STEERING_GROUP_SHIFT: u32 = 12;
+pub const CAPTURE_STEERING_INSTANCE_SHIFT: u32 = 20;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureError {
@@ -129,6 +131,46 @@ pub struct CaptureRegisterList<'a> {
     pub list_type: u32,
     pub engine: u32,
     pub registers: &'a [CaptureRegister],
+}
+
+/// Expand render-class MCR capture registers for each discovered slice /
+/// subslice pair. The addresses are supplied from the platform register table.
+/// upstream: intel_guc_capture.c guc_capture_alloc_steered_lists().
+pub fn expand_steered_registers(
+    steering: &[(u8, u8)],
+    gen8_register_offsets: &[u32; 2],
+    xehpg_register_offset: Option<u32>,
+) -> Result<Vec<CaptureRegister>, CaptureError> {
+    let per_steering = 2usize + usize::from(xehpg_register_offset.is_some());
+    let capacity = steering
+        .len()
+        .checked_mul(per_steering)
+        .ok_or(CaptureError::InvalidBuffer)?;
+    let mut registers = Vec::new();
+    registers
+        .try_reserve_exact(capacity)
+        .map_err(|_| CaptureError::InvalidBuffer)?;
+    for (slice, subslice) in steering {
+        let flags = (u32::from(*slice) << CAPTURE_STEERING_GROUP_SHIFT)
+            | (u32::from(*subslice) << CAPTURE_STEERING_INSTANCE_SHIFT);
+        for offset in gen8_register_offsets {
+            registers.push(CaptureRegister {
+                offset: *offset,
+                value: 0,
+                flags,
+                mask: 0,
+            });
+        }
+        if let Some(offset) = xehpg_register_offset {
+            registers.push(CaptureRegister {
+                offset,
+                value: 0,
+                flags,
+                mask: 0,
+            });
+        }
+    }
+    Ok(registers)
 }
 
 /// Find a static list; global lists match regardless of the requested engine
@@ -668,6 +710,23 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0x20);
         assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 0x30);
+    }
+
+    #[test]
+    fn capture_steered_registers_expand_per_slice_and_subslice() {
+        let regs =
+            expand_steered_registers(&[(1, 2), (3, 4)], &[0x100, 0x104], Some(0x108)).unwrap();
+        assert_eq!(regs.len(), 6);
+        assert_eq!(regs[0].offset, 0x100);
+        assert_eq!(regs[2].offset, 0x108);
+        assert_eq!(
+            regs[0].flags,
+            (1 << CAPTURE_STEERING_GROUP_SHIFT) | (2 << CAPTURE_STEERING_INSTANCE_SHIFT)
+        );
+        assert_eq!(
+            regs[3].flags,
+            (3 << CAPTURE_STEERING_GROUP_SHIFT) | (4 << CAPTURE_STEERING_INSTANCE_SHIFT)
+        );
     }
 
     #[test]
