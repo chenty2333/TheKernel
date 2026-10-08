@@ -88,7 +88,7 @@ pub use output::{
 pub use proto::{
     CAP_SHORT_PREAMBLE, CAP_SHORT_SLOT, ErpState, FIX_RATE_DELETE, FIX_RATE_FIXED,
     FIX_RATE_NEGOTIATE, FIX_RATE_SORT, FLAG_SHORT_PREAMBLE, FLAG_SHORT_SLOT, FLAG_USE_PROTECTION,
-    FixRateConfig, fix_rate, reset_erp, set_short_slot,
+    FixRateConfig, beacon_miss_threshold, fix_rate, reset_erp, set_short_slot,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,

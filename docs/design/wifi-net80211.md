@@ -112,3 +112,6 @@ failure sentinel for unsupported mandatory AP rates or mismatched fixed rates.
 The proto layer now computes 11g protection reset and short-slot/preamble
 selection from PHY mode, band, AP mode and local capability bits; a transition
 helper reports when the driver-facing short-slot state changes.
+The beacon-miss timer scales its watchdog threshold by the negotiated beacon
+interval, preserves the previous value for a zero interval, and never sets a
+threshold below one missed beacon.

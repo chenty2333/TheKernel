@@ -12,6 +12,8 @@ pub const FLAG_SHORT_PREAMBLE: u32 = 0x0004_0000;
 pub const FLAG_SHORT_SLOT: u32 = 0x0002_0000;
 pub const CAP_SHORT_PREAMBLE: u32 = 0x0000_0100;
 pub const CAP_SHORT_SLOT: u32 = 0x0000_0080;
+pub const BEACON_MISS_THRESHOLD: u32 = 30;
+pub const IEEE80211_DUR_TU: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ErpState {
@@ -134,12 +136,33 @@ pub fn reset_erp(
     }
 }
 
+/// Scale missed-beacon threshold to the peer interval with at least one miss permitted.
+// upstream: ieee80211_proto.c ieee80211_set_beacon_miss_threshold()
+pub fn beacon_miss_threshold(beacon_interval_tu: u16, current_threshold: u32) -> u32 {
+    let interval = u32::from(beacon_interval_tu);
+    if interval == 0 {
+        return current_threshold;
+    }
+    let timeout = (BEACON_MISS_THRESHOLD * interval)
+        .min(BEACON_MISS_THRESHOLD * (IEEE80211_DUR_TU / 10))
+        .max(2 * interval);
+    timeout / interval
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn local() -> RateSet {
         RateSet::new(&[0x82, 0x84, 11, 22, 0x8c, 18, 24, 36])
+    }
+
+    #[test]
+    fn beacon_miss_threshold_tracks_interval_and_keeps_zero_interval() {
+        assert_eq!(beacon_miss_threshold(100, 7), 30);
+        assert_eq!(beacon_miss_threshold(200, 7), 15);
+        assert_eq!(beacon_miss_threshold(0, 7), 7);
+        assert_eq!(beacon_miss_threshold(1, 7), 30);
     }
 
     #[test]
