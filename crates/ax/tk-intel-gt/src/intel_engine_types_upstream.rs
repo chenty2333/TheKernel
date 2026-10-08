@@ -14,14 +14,16 @@ use core::ffi::{c_char, c_ulong};
 use crate::{
     i915_request_types_upstream::I915Request,
     i915_scheduler_types_upstream::I915SchedEngine,
+    i915_vma_types_upstream::I915Vma,
     intel_breadcrumbs_types_upstream::IntelBreadcrumbs,
     intel_context_types_upstream::{File, IntelContext, IntelContextOps, IntelWakerefT},
-    intel_context_upstream::{I915Vma, IntelRing, IntelTimeline},
+    intel_context_upstream::IntelTimeline,
     intel_engine_cs_upstream::{
         AtomicNotifierHead, AtomicT, DelayedWork, HlistHead, IntelWakeref, ListHead, LlistHead,
         LlistNode, RbNode, RbRootCached, Seqcount, TimerList, WorkStruct,
     },
     intel_gt_types_upstream::IntelGt,
+    intel_ring_types_upstream::IntelRing,
     intel_sseu_types_upstream::IntelSseu,
     intel_uncore_types_upstream::IntelUncore,
     intel_workarounds_types_upstream::{

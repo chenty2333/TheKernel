@@ -224,6 +224,9 @@ pub mod intel_reset_types_upstream;
 pub mod intel_ring;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_ring_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_rps_types_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]

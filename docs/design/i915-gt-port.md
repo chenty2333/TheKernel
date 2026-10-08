@@ -82,3 +82,7 @@ The canonical owner-header split now includes the source-order `intel_gt.h` API 
 ### VMA owner integration progress (2026-10-09)
 
 Added and registered the MIT `i915_vma_types.h` layout/constants and `i915_vma.h` API binding, and removed the duplicate context-source `I915Vma` record so that the older translation re-exports the canonical owner. GEM/context/GuC callsites now import the VMA API owner for available helpers. The opt-in build remains incomplete at 1,935 errors; default crate tests (110 unit + 6 enabled integration) and package formatting check pass. DRM MM/GTT-view/fence framework members and VMA lifecycle APIs remain incomplete.
+
+### Ring owner and execution-layout integration (2026-10-09)
+
+Translated the MIT `intel_ring_types.h` layout and made ring users consume its canonical type; added a layout-only LinuxKPI `rcu_work` record needed by execlists' embedded callback state, without implementing the framework workqueue. Execlists now imports available engine, uncore, LRC, VMA and breadcrumb APIs directly from their owners. The `upstream-gt` check remains blocked at 1,921 errors, chiefly missing full ring submit/emission and scheduler source/API paths. Default tests and package formatting pass.

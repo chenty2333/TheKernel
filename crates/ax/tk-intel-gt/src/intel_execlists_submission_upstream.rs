@@ -113,10 +113,27 @@ use core::{
 // submission ordering.
 use crate::linux_list::*;
 use crate::{
-    for_each_signaler, for_each_waiter, i915_request_types_upstream::*,
-    i915_scheduler_types_upstream::*, intel_context_types_upstream::*, intel_context_upstream::*,
-    intel_engine_cs_upstream::*, intel_engine_types_upstream::IntelEngineCs,
-    intel_gt_types_upstream::IntelGt, intel_timeline_types_upstream::IntelTimeline,
+    for_each_signaler, for_each_waiter,
+    i915_request_types_upstream::*,
+    i915_scheduler_types_upstream::*,
+    i915_vma_api_upstream::i915_vma_is_pinned,
+    intel_breadcrumbs_upstream::intel_context_remove_breadcrumbs,
+    intel_context_types_upstream::*,
+    intel_context_upstream::*,
+    intel_engine_cs_upstream::*,
+    intel_engine_types_upstream::{
+        IntelEngineCs, intel_engine_has_preemption, intel_engine_has_relative_mmio,
+        intel_engine_has_semaphores, intel_engine_has_timeslices,
+    },
+    intel_gt_types_upstream::IntelGt,
+    intel_lrc_types_upstream::{lrc_runtime_start, lrc_runtime_stop},
+    intel_lrc_upstream::lrc_destroy,
+    intel_timeline_types_upstream::IntelTimeline,
+    intel_uncore_types_upstream::{
+        assert_forcewakes_active, intel_uncore_forcewake_for_reg, intel_uncore_forcewake_get,
+        intel_uncore_forcewake_put, intel_uncore_read64, intel_uncore_regs,
+    },
+    linux::rcu_work::RcuWork,
     linux_config::*,
 };
 

@@ -494,7 +494,10 @@ unsafe fn i915_request_cancel_breadcrumb(rq: *mut I915Request) {
 }
 
 // upstream: intel_breadcrumbs.c intel_context_remove_breadcrumbs()
-unsafe fn intel_context_remove_breadcrumbs(ce: *mut IntelContext, b: *mut IntelBreadcrumbs) {
+pub(crate) unsafe fn intel_context_remove_breadcrumbs(
+    ce: *mut IntelContext,
+    b: *mut IntelBreadcrumbs,
+) {
     let mut rq: *mut I915Request;
     let mut rn: *mut I915Request;
     let mut release = false;

@@ -12,8 +12,12 @@ use core::{
 };
 
 use crate::{
-    intel_context_upstream::{I915Request, I915Vma, IntelContext, IntelRing, IntelTimeline},
+    i915_request_types_upstream::I915Request,
+    i915_vma_types_upstream::I915Vma,
+    intel_context_types_upstream::IntelContext,
     intel_engine_cs_upstream::{I915_NUM_ENGINES, IntelEngineCs, IntelEngineExeclists, IntelGt},
+    intel_ring_types_upstream::IntelRing,
+    intel_timeline_types_upstream::IntelTimeline,
     intel_workarounds_upstream::{I915McrReg, I915Reg, I915WaList},
     linux_i915_private::DrmI915Private,
 };

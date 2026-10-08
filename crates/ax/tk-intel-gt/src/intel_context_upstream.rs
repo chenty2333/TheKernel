@@ -27,6 +27,7 @@ use crate::{
 pub use crate::{
     i915_vma_resource_types_upstream::{I915PageSizes, I915VmaResource},
     i915_vma_types_upstream::I915Vma,
+    intel_ring_types_upstream::IntelRing,
 };
 pub type IntelWakerefHandle = crate::intel_context_types_upstream::IntelWakerefT;
 pub type RefTracker = IntelRefTracker;
@@ -265,34 +266,6 @@ pub struct DrmVmaOffsetNode {
     _opaque: [u8; 192],
 }
 const _: [(); 192] = [(); core::mem::size_of::<DrmVmaOffsetNode>()];
-
-#[repr(C)]
-pub struct IntelRing {
-    pub ref_: Kref,
-    pub vma: *mut I915Vma,
-    pub vaddr: *mut c_void,
-    pub pin_count: AtomicT,
-    pub head: u32,
-    pub tail: u32,
-    pub emit: u32,
-    pub space: u32,
-    pub size: u32,
-    pub wrap: u32,
-    pub effective_size: u32,
-}
-
-// drm_i915_gem_object.mm layout from gem/i915_gem_object_types.h. The page
-// iterators include the source sg/xarray/mutex storage used by these paths.
-#[repr(C, align(8))]
-pub struct I915GemObjectPageIter {
-    pub sg_pos: *mut SgEntry,
-    pub sg_idx: u32,
-    _pad_sg_idx: [u8; 4],
-    pub radix: RadixTreeRoot,
-    pub lock: Mutex,
-}
-const _: [(); 56] = [(); core::mem::size_of::<I915GemObjectPageIter>()];
-const _: [(); 32] = [(); core::mem::offset_of!(I915GemObjectPageIter, lock)];
 
 #[repr(C)]
 pub struct RadixTreeRoot {

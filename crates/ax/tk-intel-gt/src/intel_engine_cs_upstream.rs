@@ -30,6 +30,7 @@ use crate::{
     i915_gem_object_upstream::i915_gem_object_set_cache_coherency,
     i915_request_types_upstream::*,
     i915_scheduler_types_upstream::*,
+    i915_vma_api_upstream::*,
     intel_breadcrumbs_types_upstream::IntelBreadcrumbs,
     intel_breadcrumbs_upstream::intel_engine_print_breadcrumbs,
     intel_context_types_upstream::*,

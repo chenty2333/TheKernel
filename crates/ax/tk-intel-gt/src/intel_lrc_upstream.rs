@@ -14,7 +14,7 @@ use crate::{
     intel_context_types_upstream::*,
     intel_context_upstream::*,
     intel_engine_cs_upstream::*,
-    intel_engine_types_upstream::{I915WaCtxBb, IntelEngineCs},
+    intel_engine_types_upstream::{I915WaCtxBb, IntelEngineCs, intel_engine_has_relative_mmio},
     intel_gt_types_upstream::IntelGt,
     intel_ring::{CACHELINE_BYTES, PAGE_SIZE},
     intel_timeline_types_upstream::IntelTimeline,
@@ -1395,7 +1395,7 @@ pub(crate) unsafe fn lrc_fini(ce: *mut IntelContext) {
 }
 
 // upstream: intel_lrc.c lrc_destroy()
-unsafe fn lrc_destroy(kref: *mut Kref) {
+pub(crate) unsafe fn lrc_destroy(kref: *mut Kref) {
     let ce = container_of!(kref, IntelContext, ref_);
     GEM_BUG_ON!(!i915_active_is_idle(&mut (*ce).active));
     GEM_BUG_ON!(intel_context_is_pinned(ce));

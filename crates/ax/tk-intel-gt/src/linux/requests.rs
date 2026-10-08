@@ -11,7 +11,9 @@ use core::{
 };
 
 use crate::{
-    intel_context_upstream::{DmaFence, I915Active, I915GemWwCtx, I915Request, IntelRing},
+    i915_request_types_upstream::I915Request,
+    intel_context_upstream::{DmaFence, I915Active, I915GemWwCtx},
+    intel_ring_types_upstream::IntelRing,
     linux::{
         contexts::IntelContextPtr,
         memory::{atomic_add_unless, atomic_inc, atomic_read, kref_get_unless_zero},

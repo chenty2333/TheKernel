@@ -29,3 +29,7 @@ pub(crate) mod rcu;
 pub(crate) mod registers;
 pub(crate) mod requests;
 pub(crate) mod srcu;
+
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
+pub mod rcu_work;

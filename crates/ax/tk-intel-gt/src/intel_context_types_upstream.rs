@@ -20,14 +20,16 @@ use core::{
 };
 
 use crate::{
+    i915_vma_types_upstream::I915Vma,
     intel_context_upstream::{
-        I915ActiveFence, I915AddressSpace, I915GemContext, I915GemWwCtx, I915Request, I915Vma,
-        IntelRing, Kref, RcuHead, WaitQueueHead,
+        I915ActiveFence, I915AddressSpace, I915GemContext, I915GemWwCtx, I915Request, Kref,
+        RcuHead, WaitQueueHead,
     },
     intel_engine_cs_upstream::{
         AtomicT, DelayedWork, IntelEngineCs, ListHead, LlistHead, Mutex, RbRoot, Spinlock,
         WorkStruct,
     },
+    intel_ring_types_upstream::IntelRing,
     intel_sseu_types_upstream::IntelSseu,
     intel_timeline_types_upstream::IntelTimeline,
 };

@@ -17,12 +17,13 @@ use crate::{
     i915_scheduler_types_upstream::{I915Dependency, I915SchedNode},
     intel_context_types_upstream::{I915SwFence, IntelContext},
     intel_context_upstream::{
-        DmaFence, DmaFenceCb, Hrtimer, I915Vma, I915VmaResource, IntelRing, IntelTimeline, IrqWork,
-        PinCookie, WaitQueueEntry,
+        DmaFence, DmaFenceCb, Hrtimer, I915Vma, I915VmaResource, IntelTimeline, IrqWork, PinCookie,
+        WaitQueueEntry,
     },
     intel_engine_cs_upstream::{
         IntelEngineCs, IntelEngineMask, ListHead, LlistHead, LlistNode, Spinlock,
     },
+    intel_ring_types_upstream::IntelRing,
     linux_i915_private::DrmI915Private,
 };
 
