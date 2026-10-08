@@ -231,6 +231,8 @@ struct Owner {
     uc_memory: Option<copy::UcDmaMemory>,
     // ADS GGTT VMA retained once its address has been published to GuC.
     ads_memory: Option<copy::AdsDmaMemory>,
+    // GuC log state/data VMA retained while GuC can write or read it.
+    log_memory: Option<copy::LogDmaMemory>,
     // GuC CTB buffers/descriptor VMA retained while GuC may reference it.
     ct_memory: Option<copy::CtDmaMemory>,
 }
@@ -494,6 +496,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             memory: None,
             uc_memory: None,
             ads_memory: None,
+            log_memory: None,
             ct_memory: None,
         });
         return Err(format!(
@@ -520,6 +523,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 memory: None,
                 uc_memory: None,
                 ads_memory: None,
+                log_memory: None,
                 ct_memory: None,
             };
             let copied = copy::run(&mut device, bdf).and_then(|()| {
@@ -570,6 +574,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 memory: None,
                 uc_memory: None,
                 ads_memory: None,
+                log_memory: None,
                 ct_memory: None,
             });
             Err(format!(
@@ -742,7 +747,8 @@ mod tests {
         bus.write(0xc340, 0x10002).unwrap();
         assert_eq!(bus.read(0xc050), Ok(0x200000));
         assert_eq!(bus.read(0xc340), Ok(0x10002));
-        bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN).unwrap();
+        bus.write(0x941c, intel_gt::reset::GUC_RESET_DOMAIN)
+            .unwrap();
         assert_eq!(words[0x941c / 4], intel_gt::reset::GUC_RESET_DOMAIN);
     }
     #[test]

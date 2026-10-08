@@ -465,6 +465,113 @@ pub(super) struct AdsDmaMemory {
 }
 
 #[cfg(target_os = "none")]
+pub(super) struct LogDmaMemory {
+    _gtt: Arc<Gtt>,
+    _ram: Ram,
+    binding: Binding,
+    layout: intel_gt::guc_log::GucLogLayout,
+    config: intel_gt::guc_config::LogConfig,
+    registered: bool,
+}
+
+#[cfg(target_os = "none")]
+impl LogDmaMemory {
+    fn release(self) -> Result<(), Self> {
+        if self.registered {
+            return Err(self);
+        }
+        // SAFETY: GuC has not been configured with this address, or its reset
+        // completed before registration was cleared.
+        if unsafe { self._gtt.release_binding(&self.binding) }.is_err() {
+            Err(self)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Allocate a zeroed GuC logging state/data VMA and derive GUC_CTL layout
+    /// fields from upstream section sizing.
+    /// upstream: intel_guc_log.c intel_guc_log_create()/guc_log_init_sizes().
+    pub(super) fn initialize(
+        owner: &mut super::Owner,
+        debug_guc: bool,
+        debug_gem: bool,
+    ) -> Result<(), Error> {
+        if owner.lost || owner.log_memory.is_some() {
+            return Err(Error::Quarantined);
+        }
+        let layout = intel_gt::guc_log::guc_log_init_sizes(debug_guc, debug_gem)
+            .map_err(|_| Error::Refused)?;
+        let size = usize::try_from(layout.buffer_bytes).map_err(|_| Error::Refused)?;
+        let pages = size.checked_add(PAGE - 1).ok_or(Error::Refused)? / PAGE;
+        let mut zeroes = Vec::new();
+        zeroes.try_reserve_exact(size).map_err(|_| Error::Refused)?;
+        zeroes.resize(size, 0);
+        let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+        let ram = Ram::allocate(pages)?;
+        let binding = gtt
+            .bind_pages(&ram.physical)
+            .map_err(|_| Error::Quarantined)?;
+        let base = match u32::try_from(binding.address) {
+            Ok(base) if base != 0 && base.is_multiple_of(PAGE as u32) => base,
+            _ => {
+                let memory = Self {
+                    _gtt: gtt,
+                    _ram: ram,
+                    binding,
+                    layout,
+                    config: layout.control_config(0),
+                    registered: false,
+                };
+                if let Err(memory) = memory.release() {
+                    owner.log_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        let config = layout.control_config(base);
+        if let Err(error) = ram.write(0, &zeroes) {
+            let memory = Self {
+                _gtt: gtt,
+                _ram: ram,
+                binding,
+                layout,
+                config,
+                registered: false,
+            };
+            if let Err(memory) = memory.release() {
+                owner.log_memory = Some(memory);
+                return Err(Error::Quarantined);
+            }
+            return Err(error);
+        }
+        ram.flush();
+        owner.log_memory = Some(Self {
+            _gtt: gtt,
+            _ram: ram,
+            binding,
+            layout,
+            config,
+            registered: false,
+        });
+        Ok(())
+    }
+
+    pub(super) fn config(&self) -> intel_gt::guc_config::LogConfig {
+        self.config
+    }
+
+    pub(super) fn layout(&self) -> intel_gt::guc_log::GucLogLayout {
+        self.layout
+    }
+
+    pub(super) fn mark_registered(&mut self) {
+        self.registered = true;
+    }
+}
+
+#[cfg(target_os = "none")]
 impl AdsDmaMemory {
     fn release(self) -> Result<(), Self> {
         if self.registered {
@@ -772,10 +879,7 @@ impl CtDmaMemory {
     /// Receive one CTB message after a GuC G2H interrupt/poll notification and
     /// dispatch submission completion events before publishing the new head.
     /// IRQ/tasklet registration remains owned by the GT event integration.
-    pub(super) fn receive_guc_submission_event(
-        &mut self,
-        bus: &impl GtIo,
-    ) -> Result<bool, Error> {
+    pub(super) fn receive_guc_submission_event(&mut self, bus: &impl GtIo) -> Result<bool, Error> {
         if !self.enabled {
             return Err(Error::Refused);
         }
@@ -806,7 +910,10 @@ impl CtDmaMemory {
                     event.action,
                     intel_gt::guc_ct::ACTION_SCHED_CONTEXT_MODE_DONE
                         | intel_gt::guc_ct::ACTION_DEREGISTER_CONTEXT_DONE
-                ) => self.submission.handle_event(&mut self.pair, event),
+                ) =>
+            {
+                self.submission.handle_event(&mut self.pair, event)
+            }
             Some(event) => Err(intel_gt::guc_ct::CtError::InvalidMessage),
             None => Err(intel_gt::guc_ct::CtError::InvalidMessage),
         };
@@ -1058,14 +1165,8 @@ pub(super) fn upload_uc_firmware(
         .checked_add(huc.css.microcode_bytes)
         .and_then(|size| u32::try_from(size).ok())
         .ok_or(Error::Refused)?;
-    intel_gt::wopcm::initialize_gen12(
-        &owner.bus,
-        guc_upload_size,
-        huc_upload_size,
-        true,
-        false,
-    )
-    .map_err(|_| Error::Quarantined)?;
+    intel_gt::wopcm::initialize_gen12(&owner.bus, guc_upload_size, huc_upload_size, true, false)
+        .map_err(|_| Error::Quarantined)?;
     intel_gt::reset::reset_guc(&owner.bus, (12, 0)).map_err(|_| Error::Quarantined)?;
     let (huc_memory, rsa_offset) = upload_huc_for_auth(owner, huc)?;
     if let Err(error) = upload_uc_one(owner, guc) {
