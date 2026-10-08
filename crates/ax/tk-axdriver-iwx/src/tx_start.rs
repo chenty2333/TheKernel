@@ -26,6 +26,12 @@ pub struct TxStartReport {
     pub stopped_on_queue_full: bool,
 }
 
+/// Signal an MFP leave waiter only for a running RUN-state protected node.
+// upstream: if_iwx.c iwx_mfp_leave_done()
+pub const fn mfp_leave_done(interface_running: bool, run_state: bool, node_mfp: bool) -> bool {
+    interface_running && run_state && node_mfp
+}
+
 /// Drain management frames first, then eligible data frames, retaining iwx_start() stop rules.
 // upstream: if_iwx.c iwx_start()
 pub fn start_transmit<M, N>(
@@ -220,5 +226,9 @@ mod tests {
         assert!(steps.contains(&MfpLeaveAction::WaitForTransmit {
             timeout_ns: MFP_LEAVE_TIMEOUT_NS
         }));
+        assert!(mfp_leave_done(true, true, true));
+        assert!(!mfp_leave_done(false, true, true));
+        assert!(!mfp_leave_done(true, false, true));
+        assert!(!mfp_leave_done(true, true, false));
     }
 }

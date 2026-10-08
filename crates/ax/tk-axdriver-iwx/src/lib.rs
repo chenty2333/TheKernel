@@ -10,6 +10,7 @@ mod alive;
 mod apm;
 mod attach;
 mod ba;
+mod beacon;
 mod binding;
 mod bringup;
 mod channel;
@@ -39,6 +40,7 @@ mod power;
 mod queue;
 mod rate;
 mod registers;
+mod regulatory;
 mod rings;
 mod rx;
 mod rx_buffer;
@@ -81,6 +83,7 @@ pub use ba::{
     ampdu_tx_start, baid_config_command, baid_config_response, run_ba_task, sta_tx_agg_start,
     station_ba_command, station_ba_response,
 };
+pub use beacon::{BeaconMissAction, BeaconMissError, BeaconMissState, missed_beacon_action};
 pub use binding::{
     BINDING_CONTEXT_COMMAND, BindingError, BindingState, BindingUpdateError, CONTEXT_ACTION_ADD,
     CONTEXT_ACTION_REMOVE, INVALID_CONTEXT_ID, LMAC_5_GHZ, LMAC_24_GHZ, MAX_MACS_IN_BINDING,
@@ -248,6 +251,7 @@ pub use rate::{
     tlc_rate_command_v4, valid_antenna_masks, valid_rx_antenna_mask, valid_tx_antenna_mask,
 };
 pub use registers::{CsrAccess, DeviceFamily, IoBarrier, IwxRegisters, RegisterError};
+pub use regulatory::{MccUpdate, MccUpdateError, decode_mcc_update};
 pub use rings::{
     GEN3_MAX_TFD_QUEUE_SIZE, RingError, RxCompletion, RxRing, TxRing, TxSegment, allocate_rx_ring,
     allocate_tx_ring, allocate_tx_ring_for, allocate_tx_ring_for_family, tx_byte_count_entry,
@@ -355,5 +359,5 @@ pub use tx_completion::{
 };
 pub use tx_start::{
     ETHERNET_HEADER_BYTES, MFP_LEAVE_TIMEOUT_NS, MfpLeaveAction, MfpLeaveResult, TxStartReport,
-    TxStartState, mfp_leave, start_transmit,
+    TxStartState, mfp_leave, mfp_leave_done, start_transmit,
 };

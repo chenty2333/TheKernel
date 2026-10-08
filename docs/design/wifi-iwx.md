@@ -122,6 +122,12 @@ back the channel index, and carries timestamp/rate/preamble/decrypt metadata
 with the 802.11 frame. As in OpenBSD, CCMP IV handling remains the protocol
 input layer's responsibility; radiotap/BPF is optional framework capture.
 
+Beacon-loss notifications now request a directed probe only for a running
+station in RUN after the configured miss threshold and with no management
+timer active. CHUB MCC updates preserve the firmware's two-byte country hint
+and source ID for the regulatory adapter, while MFP leave completion only
+signals the waiter for a running, RUN-state MFP node.
+
 TX queues now track occupied descriptor slots through the source consumer SSN,
 reclaim descriptor/byte-count state, retain owned payload DMA buffers until
 completion, retire host-command queue occupancy on CMD_DONE, and expose the
