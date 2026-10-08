@@ -397,8 +397,14 @@ def rootfs_image_bytes(payload: str) -> int:
     # used, so it reuses the nested payload's 224 MiB rather than adding a size
     # class; 160 MiB would leave under 30 MiB free, which is not enough room for
     # a compile's intermediate files.
-    return {"none": 160, "tcc": 160, "nested": 224, "glibc": 160,
-            "gcc": 224, "inspect": 160, "containers": 384, "debug": 224, "acpica": 160}[payload] * 1024 * 1024
+    size_mb = {"none": 160, "tcc": 160, "nested": 224, "glibc": 160,
+               "gcc": 224, "inspect": 160, "containers": 384, "debug": 224, "acpica": 160}[payload]
+    # Intel firmware is decompressed into the offline rootfs.  The Fedora
+    # linux-firmware package contains many families, so reserve the same
+    # 224-MiB class as the compiler payload when it is explicitly selected.
+    if os.environ.get("THEKERNEL_INTEL_BT_FIRMWARE_DIR"):
+        size_mb = max(size_mb, 224)
+    return size_mb * 1024 * 1024
 
 
 

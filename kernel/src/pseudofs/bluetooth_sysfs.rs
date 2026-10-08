@@ -4,7 +4,7 @@ use alloc::{borrow::Cow, format, string::String, sync::Arc, vec::Vec};
 use axfs_ng_vfs::{FsName, FsNameBuf, VfsError, VfsResult};
 
 use super::{
-    ChildNames, DirMaker, DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs,
+    ChildNames, DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs,
     try_boxed_names,
 };
 
