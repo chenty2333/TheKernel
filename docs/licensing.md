@@ -706,3 +706,7 @@ grant and copyright are preserved in the source file and `LICENSE-MIT`.
 Linux 7.2.3 `intel_hdmi.c` (MIT, Dave Airlie 2006 and Intel 2006–2009). Six
 DRM connector/property/modes wrappers are framework-only and omitted; the full
 grant and copyright are preserved in the module and `LICENSE-MIT`.
+
+`tk-intel-display/src/skl_scaler_full.rs` translates the 43 scaler functions in
+Linux 7.2.3 `skl_scaler.c` (MIT, © 2020 Intel); the full MIT grant is preserved
+in the source header and crate `LICENSE-MIT`.

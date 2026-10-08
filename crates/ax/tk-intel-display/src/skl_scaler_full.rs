@@ -987,4 +987,27 @@ mod tests {
             (8192, 8192)
         );
     }
+
+    #[test]
+    fn gen12_scaler_registers_modes_and_casf_fields_match_source_header() {
+        assert_eq!(ps_ctrl_reg(0, 0), 0x68180);
+        assert_eq!(ps_ctrl_reg(1, 0), 0x68980);
+        assert_eq!(ps_ctrl_reg(1, 1), 0x68a80);
+        assert_eq!(ps_vphase(1, 0), 0x68988);
+        assert_eq!(ps_hphase(1, 0), 0x68994);
+        assert_eq!(ps_win_pos(0, 0), 0x68170);
+        assert_eq!(ps_win_sz(0, 0), 0x68174);
+        assert_eq!(ps_coef_index_set(0, 0, 0), 0x68198);
+        assert_eq!(ps_binding_plane(2), 3 << 25);
+        assert_eq!(PS_SCALER_MODE_PLANAR, 1 << 29);
+        assert_eq!(PS_FILTER_PROGRAMMED, 1 << 23);
+        assert_eq!(
+            casf_sharpness_ctl(Casf {
+                enable: true,
+                strength: 0x45,
+                win_size: 2
+            }),
+            (1 << 31) | (0x45 << 8) | 2
+        );
+    }
 }

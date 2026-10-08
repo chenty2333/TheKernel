@@ -1228,3 +1228,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `crates/ax/tk-intel-display/src/intel_ddi_full.rs` translates all 208 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_ddi.c` (MIT, Copyright © 2012 Intel Corporation); DRM object registration and cross-subsystem access are represented by `DdiIo` boundaries. `LICENSE-MIT`.
 
 `crates/ax/tk-intel-display/src/intel_hdmi_full.rs` translates 114 of 120 function definitions in Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_hdmi.c` (MIT, Copyright 2006 Dave Airlie and © 2006-2009 Intel); six generic DRM connector/property/modes wrappers are omitted. `LICENSE-MIT`.
+
+`crates/ax/tk-intel-display/src/skl_scaler_full.rs` translates all 43 function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/skl_scaler.c` (MIT, Copyright © 2020 Intel Corporation); DRM atomic state, CASF and DSB/MMIO are explicit hooks. `LICENSE-MIT`.
