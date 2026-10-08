@@ -39,6 +39,7 @@ mod rx_packet;
 mod scan;
 mod scan_probe;
 mod spectrum;
+mod startup;
 mod state;
 mod station;
 mod statistics;
@@ -220,6 +221,15 @@ pub use spectrum::{
     SF_LONG_DELAY_ON, SF_SCENARIO_COUNT, SF_TIMEOUT_TYPE_COUNT, SF_UNINIT, SF_WATERMARK_LEGACY,
     SF_WATERMARK_MIMO2, SF_WATERMARK_SCAN, SF_WATERMARK_SISO, SpectrumError, fill_spectrum_payload,
     spectrum_config_command,
+};
+pub use startup::{
+    BT_COEX_WIFI, BT_CONFIG_COMMAND, InitHardwareAction, InitHardwareConfig, InitHardwareOutcome,
+    MCC_COMMAND_BYTES, MCC_SOURCE_GET_CURRENT, MCC_SOURCE_OLD_FW, MCC_UPDATE_COMMAND,
+    MCC_UPDATE_RESPONSE_MAX_VERSION, MCC_V4_HEADER_BYTES, MccUpdateResponse, PHY_OPS_GROUP,
+    SOC_CONFIGURATION_COMMAND, SOC_FLAG_DISCRETE, SOC_FLAG_LOW_LATENCY, SOC_LTR_DELAY_MASK,
+    SYSTEM_GROUP as STARTUP_SYSTEM_GROUP, SocConfig, StartupError, TEMP_REPORT_COMMAND_BYTES,
+    TEMP_REPORTING_THRESHOLDS_COMMAND, bt_init_command, initialize_hardware, mcc_update_command,
+    parse_mcc_update_response, soc_configuration_command, temperature_threshold_command,
 };
 pub use state::{
     AssociationState, AssociationStep, AuthError, AuthRequest, RunRequest, authenticate,

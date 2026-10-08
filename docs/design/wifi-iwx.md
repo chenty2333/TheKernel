@@ -73,3 +73,7 @@ Deferred iwx state transitions now preserve RUN task cancellation, SCAN-to-SCAN
 behavior, shutdown short-circuiting, AUTH/DEAUTH/RUN/RUN_STOP action order, and
 task-reference ownership. Smart-FIFO state commands serialize the source's
 watermarks and timeout matrices and are omitted when firmware reports offload.
+
+Init-time BT/SOC/DQA, MCC update/response validation, temperature-threshold,
+LTR-tolerant hardware setup ordering, and NIC-lock release branches are also
+represented in the driver crate.
