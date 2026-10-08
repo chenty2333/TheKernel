@@ -18,8 +18,10 @@ read-only by default; `mmc.allow_write=1` is required to permit writes, and the
 block driver itself enforces the write restriction. The PCI binding maps the
 FreeBSD `sdhci_devices[]` IDs and their quirk bits, but does not yet implement
 all behavior attached to those quirks, interrupt handling, full card-removal
-lifecycle, SDMA/ADMA2, 1.8V switching, tuning, UHS/HS200/HS400, and the full
-upstream function set. User-area and any advertised boot0/boot1 areas are
+lifecycle, ADMA2, 1.8V switching, tuning, UHS/HS200/HS400, and the full
+upstream function set. Capability-gated SDMA uses a 512 KiB, 32-bit DMA bounce
+region; broken/unsupported DMA falls back to PIO. If a timeout leaves DMA
+quiescence uncertain, the region is quarantined rather than freed. User-area and any advertised boot0/boot1 areas are
 published as separate views;
 boot area writes follow the same default-read-only policy for Intel eMMC. RPMB
 metadata is decoded but its authenticated key/frame protocol is not exposed as a

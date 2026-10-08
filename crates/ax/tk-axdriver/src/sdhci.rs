@@ -7,22 +7,27 @@
 
 use core::{ptr, ptr::NonNull};
 
+use axalloc::{UsageKind, global_allocator};
 use axdriver_base::BaseDriverOps;
 use axdriver_block::sdhci::{
     SDHCI_CAPABILITIES, SDHCI_CAPABILITIES2, SDHCI_HOST_VERSION, SDHCI_SPEC_VER_MASK, SdhciDisk,
-    SdhciHost, SdhciIo,
+    SdhciDmaRegion, SdhciHost, SdhciIo,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
+use axhal::mem::virt_to_phys;
 use log::{info, warn};
 
 const PCI_COMMAND: u8 = 0x04;
 const PCI_COMMAND_MEMORY: u16 = 0x0002;
+const PCI_COMMAND_MASTER: u16 = 0x0004;
 const PCI_CLASS_SYSTEM_PERIPHERAL: u8 = 0x08;
 const PCI_SUBCLASS_SD_HOST: u8 = 0x05;
 const PCI_SLOT_INFO: u8 = 0x40;
 const SDHCI_BAR_MIN_BYTES: usize = 0x100;
 const INTEL_EMMC_VID: u16 = 0x8086;
 const INTEL_EMMC_DID: u16 = 0x54c4;
+const SDMA_BUFFER_BYTES: usize = 512 * 1024;
+const SDMA_BUFFER_PAGES: usize = SDMA_BUFFER_BYTES / 4096;
 
 #[derive(Clone, Copy)]
 struct SdhciPciId {
@@ -162,6 +167,43 @@ fn decode_slot_info(slot_info: u8) -> (usize, u8) {
     )
 }
 
+fn allocate_sdma_buffer() -> Option<SdhciDmaRegion> {
+    let virtual_address = global_allocator()
+        .alloc_pages(SDMA_BUFFER_PAGES, SDMA_BUFFER_BYTES, UsageKind::Dma)
+        .ok()?;
+    if virtual_address == 0 {
+        global_allocator().dealloc_pages(virtual_address, SDMA_BUFFER_PAGES, UsageKind::Dma);
+        return None;
+    }
+    let Some(cpu) = NonNull::new(virtual_address as *mut u8) else {
+        global_allocator().dealloc_pages(virtual_address, SDMA_BUFFER_PAGES, UsageKind::Dma);
+        return None;
+    };
+    let bus = virt_to_phys(virtual_address.into()).as_usize() as u64;
+    if bus & (SDMA_BUFFER_BYTES as u64 - 1) != 0
+        || bus + SDMA_BUFFER_BYTES as u64 > u64::from(u32::MAX) + 1
+    {
+        global_allocator().dealloc_pages(virtual_address, SDMA_BUFFER_PAGES, UsageKind::Dma);
+        return None;
+    }
+    // SAFETY: pages are exclusively owned, coherent DMA memory.
+    unsafe { ptr::write_bytes(cpu.as_ptr(), 0, SDMA_BUFFER_BYTES) };
+    // SAFETY: host owns the exact DMA allocation and releases it after teardown.
+    Some(unsafe {
+        SdhciDmaRegion::from_raw_parts(
+            cpu,
+            bus,
+            SDMA_BUFFER_BYTES,
+            SDMA_BUFFER_PAGES,
+            Some(free_sdma_buffer),
+        )
+    })
+}
+
+unsafe fn free_sdma_buffer(cpu: NonNull<u8>, pages: usize) {
+    global_allocator().dealloc_pages(cpu.as_ptr() as usize, pages, UsageKind::Dma);
+}
+
 struct SdhciWindow {
     base: NonNull<u8>,
     size: usize,
@@ -250,6 +292,16 @@ fn probe_slot(
     let capabilities2 = io.read32(SDHCI_CAPABILITIES2 as usize);
     let version = (io.read16(SDHCI_HOST_VERSION as usize) & SDHCI_SPEC_VER_MASK as u16) as u8;
     let host = SdhciHost::new_with_quirks(io, capabilities, capabilities2, version, quirks);
+    let dma_advertised = capabilities & axdriver_block::sdhci::SDHCI_CAN_DO_DMA != 0
+        || quirks & axdriver_block::sdhci::SDHCI_QUIRK_FORCE_DMA != 0;
+    let host = if dma_advertised && quirks & axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_DMA == 0 {
+        match allocate_sdma_buffer() {
+            Some(region) => host.with_dma_region(region),
+            None => host,
+        }
+    } else {
+        host
+    };
     let disk = match SdhciDisk::attach(host) {
         Ok(disk) => disk,
         Err(error) => {
@@ -318,7 +370,11 @@ pub(crate) fn probe(
     let Some(command) = root.read_config_dword(bdf, PCI_COMMAND) else {
         return BusProbeResult::Claimed;
     };
-    if !root.write_config_u16(bdf, PCI_COMMAND, command as u16 | PCI_COMMAND_MEMORY) {
+    if !root.write_config_u16(
+        bdf,
+        PCI_COMMAND,
+        command as u16 | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER,
+    ) {
         warn!("sdhci: {bdf} could not enable memory decoding");
         return BusProbeResult::Claimed;
     }
