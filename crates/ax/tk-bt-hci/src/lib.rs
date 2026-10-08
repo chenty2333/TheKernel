@@ -582,11 +582,39 @@ pub fn no_device_ioctl(command: u32) -> Result<IoctlOutcome, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, vec::Vec};
+
     use super::*;
     struct Fake {
         stopped: bool,
         commands: usize,
         acl: usize,
+    }
+
+    struct FirmwareFake {
+        events: VecDeque<Vec<u8>>,
+        bulk: Vec<Vec<u8>>,
+    }
+    impl UsbTransport for FirmwareFake {
+        fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn bulk_acl_out(&mut self, packet: &[u8]) -> Result<(), Error> {
+            self.bulk.push(packet.to_vec());
+            Ok(())
+        }
+        fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+            let event = self.events.pop_front().ok_or(Error::NoDevice)?;
+            if event.len() > out.len() {
+                return Err(Error::InvalidLength);
+            }
+            out[..event.len()].copy_from_slice(&event);
+            Ok(event.len())
+        }
+        fn read_bulk_acl(&mut self, _: &mut [u8]) -> Result<usize, Error> {
+            Ok(0)
+        }
+        fn stop(&mut self) {}
     }
     impl UsbTransport for Fake {
         fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
@@ -772,6 +800,29 @@ mod tests {
         assert_eq!(
             parse_version_event(&[0; 15]),
             Err(FirmwareError::InvalidVersionEvent)
+        );
+    }
+
+    #[test]
+    fn intel_rsa_firmware_header_and_aligned_command_chunks_are_transferred() {
+        let mut firmware = std::vec![0u8; 644];
+        firmware[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        firmware.extend_from_slice(&[0x0e, 0xfc, 5, 1, 2, 3, 4, 0x55]);
+        let transport = FirmwareFake {
+            events: VecDeque::from([std::vec![0xff, 1, 6]]),
+            bulk: Vec::new(),
+        };
+        let mut adapter = Adapter::new(transport, 0);
+        adapter.set_up(true).unwrap();
+        assert_eq!(
+            adapter.intel_init_firmware(&firmware, 0x12, 0),
+            Ok(0x0403_0201)
+        );
+        assert_eq!(adapter.transport.bulk.len(), 6);
+        assert_eq!(&adapter.transport.bulk[5][..4], &[0x09, 0xfc, 9, 1]);
+        assert_eq!(
+            &adapter.transport.bulk[5][4..],
+            &[0x0e, 0xfc, 5, 1, 2, 3, 4, 0x55]
         );
     }
 }

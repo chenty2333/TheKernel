@@ -343,6 +343,8 @@ ROOTFS_INPUT_ENV = (
     "THEKERNEL_MUSL_LINUX_ARCH_INCLUDE",
     "THEKERNEL_ROOTFS_OWNER_MODE",
     "THEKERNEL_TOOLCHAIN",
+    "THEKERNEL_INTEL_BT_FIRMWARE_DIR",
+    "THEKERNEL_INTEL_BT_FIRMWARE_LICENSE",
 )
 
 # The optional guest tool payload selected by --toolchain.  `none` keeps the
@@ -492,5 +494,26 @@ def rootfs_fingerprint() -> str:
             path = Path(firmware_dir) / name
             if not path.is_file():
                 raise ProductError(f"missing firmware input: {path}")
+            digest.update(path.read_bytes())
+    intel_dir = os.environ.get("THEKERNEL_INTEL_BT_FIRMWARE_DIR", "")
+    intel_license = os.environ.get(
+        "THEKERNEL_INTEL_BT_FIRMWARE_LICENSE", "/usr/share/licenses/linux-firmware/LICENSE.intel"
+    )
+    digest.update(f"intel-bt-firmware={intel_dir};license={intel_license}".encode())
+    if intel_dir:
+        source = Path(intel_dir)
+        if not source.is_dir():
+            raise ProductError(f"Intel Bluetooth firmware directory does not exist: {source}")
+        license_path = Path(intel_license)
+        if not license_path.is_file():
+            raise ProductError(f"missing Intel Bluetooth firmware license: {license_path}")
+        digest.update(license_path.read_bytes())
+        files = set()
+        for pattern in ("ibt-*.sfi", "ibt-*.sfi.xz", "ibt-*.ddc", "ibt-*.ddc.xz"):
+            files.update(source.glob(pattern))
+        if not files:
+            raise ProductError(f"no Intel ibt SFI/DDC files found in {source}")
+        for path in sorted(files):
+            digest.update(path.name.encode())
             digest.update(path.read_bytes())
     return digest.hexdigest()
