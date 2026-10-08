@@ -28,3 +28,7 @@ channel-array index/ANY sentinel mapping, using safe indexes in place of
 Legacy rate handling now includes the source 11a/11b/11g rate sets, per-mode
 basic-rate marking, negotiated minimum/maximum basic rates, and the inverse
 PLCP SIGNAL mappings for CCK/OFDM. The PHY mode is explicit at the crate API.
+Channel state also exposes the OpenBSD mode-capability scan, current-mode
+fallback, active-channel selection, first-usable IBSS channel choice and the
+AMPDU/QoS capability gate. The adapter receives an active mask and chosen
+channel so the later wireless interface layer can issue scan-reset/ERP updates.

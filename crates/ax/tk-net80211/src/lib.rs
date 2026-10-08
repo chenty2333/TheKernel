@@ -15,7 +15,11 @@ mod rsn;
 mod rssadapt;
 
 pub use channel::{
-    CHAN_2GHZ, CHAN_5GHZ, ChannelRef, channel_ref_to_ieee, ieee_to_mhz, mhz_to_ieee,
+    CHAN_2GHZ, CHAN_5GHZ, ChannelRef, ModeSelection, NET_CAP_QOS, NET_CAP_TX_AMPDU, NET_CHAN_2GHZ,
+    NET_CHAN_5GHZ, NET_CHAN_40MHZ, NET_CHAN_A, NET_CHAN_B, NET_CHAN_CCK, NET_CHAN_DYN, NET_CHAN_HT,
+    NET_CHAN_OFDM, NET_CHAN_PASSIVE, NET_CHAN_PURE_G, NET_CHAN_VHT, NET_CHAN_X_80MHZ,
+    NET_CHAN_X_160MHZ, NET_CHAN_X_HE, NET_FLAG_QOS, NetChannel, channel_ref_to_ieee,
+    configure_ampdu_tx, ieee_to_mhz, initialize_channels, mhz_to_ieee, select_mode,
 };
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
 pub use ra::{
