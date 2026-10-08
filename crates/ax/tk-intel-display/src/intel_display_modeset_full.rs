@@ -3739,7 +3739,7 @@ pub fn skl_commit_modeset_enables<O: ModesetOps>(
 }
 
 impl PipeTransition {
-    fn old_ddb(&self) -> DdbEntry { self.old.ddb }
+    fn old_ddb(&self) -> DdbEntry { self.old.old_ddb }
 }
 // Atomic commit tail and ioctl-facing glue.
 
