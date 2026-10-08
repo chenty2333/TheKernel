@@ -30,11 +30,19 @@ use core::{
 use axalloc::{UsageKind, global_allocator};
 use axdriver_net::igc::{
     self, DMA_PAGE_BYTES, IgcBus, IgcHal, IgcNic, PhysAddr, WindowBus,
-    api::{IgcApiBackend, IgcApiRequest, IgcApiValue, IgcHardware, igc_setup_init_funcs},
+    api::{
+        IgcApiBackend, IgcApiCallback, IgcApiRequest, IgcApiValue, IgcHardware,
+        igc_setup_init_funcs,
+    },
+    base::SWFW_PHY0_SM,
     ids::{self, INTEL_VENDOR},
     i225::{
-        IgcI225Io, igc_get_flash_presence_i225, init_mac_params_i225, init_nvm_params_i225,
+        IgcI225Io, igc_acquire_swfw_sync_i225, igc_get_flash_presence_i225,
+        igc_release_swfw_sync_i225, init_mac_params_i225, init_nvm_params_i225,
+        init_phy_params_i225,
     },
+    mac::FlowMode,
+    phy::{self, IgcPhyIo, PhyError, PhyState},
     probe::{BarFacts, Candidate, ConfigFacts, MsixFacts},
     regs::{self, RegisterWindow, WINDOW_BYTES},
 };
@@ -65,6 +73,8 @@ const STATUS: u32 = 0x00008;
 struct I225RegisterIo<'a, H: IgcHal> {
     bus: &'a mut WindowBus<H>,
     clear_semaphore_once: bool,
+    nvm_word_size: u32,
+    phy: PhyState,
 }
 
 impl<H: IgcHal> IgcI225Io for I225RegisterIo<'_, H> {
@@ -81,7 +91,7 @@ impl<H: IgcHal> IgcI225Io for I225RegisterIo<'_, H> {
     }
 
     fn write_flush(&mut self) {
-        let _ = self.read(STATUS);
+        let _ = <Self as IgcI225Io>::read(self, STATUS);
     }
 
     fn delay_us(&mut self, us: u32) {
@@ -93,11 +103,11 @@ impl<H: IgcHal> IgcI225Io for I225RegisterIo<'_, H> {
     }
 
     fn delay_ms_irq(&mut self, ms: u32) {
-        self.delay_ms(ms);
+        <Self as IgcI225Io>::delay_ms(self, ms);
     }
 
     fn nvm_word_size(&self) -> u32 {
-        0
+        self.nvm_word_size
     }
 
     fn clear_semaphore_once(&mut self) -> bool {
@@ -108,7 +118,112 @@ impl<H: IgcHal> IgcI225Io for I225RegisterIo<'_, H> {
         self.clear_semaphore_once = value;
     }
 
-    fn put_hw_semaphore_generic(&mut self) {}
+    fn put_hw_semaphore_generic(&mut self) {
+        const SWSM: u32 = 0x05b50;
+        const SWSM_SWESMBI: u32 = 0x2;
+        let swsm = <Self as IgcI225Io>::read(self, SWSM);
+        <Self as IgcI225Io>::write(self, SWSM, swsm & !SWSM_SWESMBI);
+    }
+}
+
+impl<H: IgcHal> IgcPhyIo for I225RegisterIo<'_, H> {
+    fn read(&mut self, offset: u32) -> u32 {
+        <Self as IgcI225Io>::read(self, offset)
+    }
+
+    fn write(&mut self, offset: u32, value: u32) {
+        <Self as IgcI225Io>::write(self, offset, value)
+    }
+
+    fn flush(&mut self) {
+        <Self as IgcI225Io>::write_flush(self)
+    }
+
+    fn read_phy(&mut self, offset: u32) -> Result<u16, PhyError> {
+        let phy = self.phy.clone();
+        phy::igc_read_phy_reg_mdic(self, &phy, offset)
+    }
+
+    fn write_phy(&mut self, offset: u32, value: u16) -> Result<(), PhyError> {
+        let phy = self.phy.clone();
+        phy::igc_write_phy_reg_mdic(self, &phy, offset, value)
+    }
+
+    fn has_read_phy_callback(&self) -> bool {
+        true
+    }
+
+    fn acquire_phy(&mut self) -> Result<(), PhyError> {
+        igc_acquire_swfw_sync_i225(self, SWFW_PHY0_SM).map_err(|_| PhyError::Sync)
+    }
+
+    fn release_phy(&mut self) {
+        igc_release_swfw_sync_i225(self, SWFW_PHY0_SM);
+    }
+
+    fn delay_us(&mut self, us: u32) {
+        <Self as IgcI225Io>::delay_us(self, us)
+    }
+
+    fn delay_us_irq(&mut self, us: u32) {
+        <Self as IgcI225Io>::delay_us(self, us)
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        <Self as IgcI225Io>::delay_ms(self, ms)
+    }
+
+    fn mac_autoneg(&self) -> bool {
+        true
+    }
+
+    fn flow_mode(&self) -> FlowMode {
+        FlowMode::Full
+    }
+
+    fn set_flow_mode(&mut self, _mode: FlowMode) {}
+
+    fn check_phy_reset_block(&mut self) -> Result<(), PhyError> {
+        phy::igc_check_reset_block_generic(self)
+    }
+
+    fn configure_collision_distance(&mut self) {}
+
+    fn configure_flow_control(&mut self) -> Result<(), PhyError> {
+        Ok(())
+    }
+
+    fn link_status(&mut self) -> Result<bool, PhyError> {
+        Ok(false)
+    }
+
+    fn force_speed_duplex(&mut self) -> Result<(), PhyError> {
+        Ok(())
+    }
+}
+
+impl<H: IgcHal> IgcApiBackend for I225RegisterIo<'_, H> {
+    fn invoke(
+        &mut self,
+        callback: IgcApiCallback,
+        request: IgcApiRequest,
+    ) -> axdriver_base::DevResult<IgcApiValue> {
+        match (callback, request) {
+            (IgcApiCallback::PhyResetI225, IgcApiRequest::None) => {
+                let phy = self.phy.clone();
+                phy::igc_phy_hw_reset_generic(self, &phy)
+                    .map_err(|_| axdriver_base::DevError::Io)?;
+                Ok(IgcApiValue::Unit)
+            }
+            (IgcApiCallback::GetPhyIdGeneric, IgcApiRequest::None) => {
+                let mut phy = self.phy.clone();
+                phy::igc_get_phy_id(self, &mut phy, true)
+                    .map_err(|_| axdriver_base::DevError::Io)?;
+                Ok(IgcApiValue::U32(phy.id))
+            }
+            _ => Err(axdriver_base::DevError::Unsupported),
+        }
+    }
 }
 
 /// The queue size both rings are built with: the vendor driver's default of
@@ -330,10 +445,23 @@ fn probe(
         let mut io = I225RegisterIo {
             bus: &mut bus,
             clear_semaphore_once: false,
+            nvm_word_size: 0,
+            phy: PhyState::default(),
         };
         igc_get_flash_presence_i225(&mut io)
     };
     init_nvm_params_i225(&mut shared, eecd, flash_present);
+    let mut phy_io = I225RegisterIo {
+        bus: &mut bus,
+        clear_semaphore_once: shared.mac_info.clear_semaphore_once,
+        nvm_word_size: shared.nvm_info.word_size,
+        phy: PhyState::default(),
+    };
+    if let Err(error) = init_phy_params_i225(&mut shared, &mut phy_io) {
+        warn!("igc: {bdf}: translated I225 PHY reset/identity failed: {error:?}");
+        return Some(None);
+    }
+    drop(phy_io);
 
     // Phase 2: bring the link up.  No packets yet, and the report says so.
     let up = match igc::bringup::bring_up(&mut bus) {

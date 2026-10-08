@@ -35,7 +35,7 @@ fn every_named_register_is_inside_the_mapped_window() {
             register.name()
         );
     }
-    assert_eq!(NAMED_SPAN, 0x05408, "the highest named register end");
+    assert_eq!(NAMED_SPAN, 0x05b60, "the highest named register end");
 }
 
 #[test]
@@ -151,14 +151,10 @@ fn the_table_names_exactly_the_registers_the_three_phases_need() {
         ("IGC_MDIC", 0x00020, Access::ReadWrite),
         ("IGC_RCTL", 0x00100, Access::ReadWrite),
         ("IGC_TCTL", 0x00400, Access::ReadWrite),
+        ("IGC_I225_PHPM", 0x00e14, Access::ReadWrite),
         ("IGC_ICR", 0x01500, Access::ReadToClear),
         ("IGC_IMC", 0x0150c, Access::WriteOnly),
         ("IGC_RXPBS", 0x02404, Access::ReadWrite),
-        ("IGC_TXPBS", 0x03404, Access::ReadWrite),
-        ("IGC_RLPML", 0x05004, Access::ReadWrite),
-        ("IGC_RXCSUM", 0x05000, Access::ReadWrite),
-        ("IGC_RAL(0)", 0x05400, Access::ReadOnly),
-        ("IGC_RAH(0)", 0x05404, Access::ReadOnly),
         ("IGC_RDBAL(0)", 0x02800, Access::ReadWrite),
         ("IGC_RDBAH(0)", 0x02804, Access::ReadWrite),
         ("IGC_RDLEN(0)", 0x02808, Access::ReadWrite),
@@ -166,12 +162,20 @@ fn the_table_names_exactly_the_registers_the_three_phases_need() {
         ("IGC_RDH(0)", 0x02810, Access::ReadWrite),
         ("IGC_RDT(0)", 0x02818, Access::ReadWrite),
         ("IGC_RXDCTL(0)", 0x02828, Access::ReadWrite),
+        ("IGC_TXPBS", 0x03404, Access::ReadWrite),
         ("IGC_TDBAL(0)", 0x03800, Access::ReadWrite),
         ("IGC_TDBAH(0)", 0x03804, Access::ReadWrite),
         ("IGC_TDLEN(0)", 0x03808, Access::ReadWrite),
         ("IGC_TDH(0)", 0x03810, Access::ReadWrite),
         ("IGC_TDT(0)", 0x03818, Access::ReadWrite),
         ("IGC_TXDCTL(0)", 0x03828, Access::ReadWrite),
+        ("IGC_RXCSUM", 0x05000, Access::ReadWrite),
+        ("IGC_RLPML", 0x05004, Access::ReadWrite),
+        ("IGC_RAL(0)", 0x05400, Access::ReadOnly),
+        ("IGC_RAH(0)", 0x05404, Access::ReadOnly),
+        ("IGC_MANC", 0x05820, Access::ReadWrite),
+        ("IGC_SWSM", 0x05b50, Access::ReadWrite),
+        ("IGC_SW_FW_SYNC", 0x05b5c, Access::ReadWrite),
     ];
     assert_eq!(expected.len(), NAMED.len(), "{NAMED:#?}");
     for (name, offset, access) in expected {
