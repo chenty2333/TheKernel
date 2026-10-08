@@ -9,6 +9,7 @@ extern crate alloc;
 extern crate std;
 pub mod bcs;
 pub mod cache;
+pub mod guc_config;
 pub mod guc_fw;
 pub mod info;
 pub mod lrc;
