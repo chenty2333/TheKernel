@@ -65,8 +65,9 @@ pub(crate) fn account_backing_write(_bytes: usize) {}
 
 mod block_inventory;
 pub use block_inventory::{
-    add_block_device, block_inventory, remove_block_device, rescan_gpt_partitions,
-    BlockInventoryEntry, PartitionRescanError,
+    add_block_device, block_inventory, install_block_device_change_hook, remove_block_device,
+    rescan_gpt_partitions, BlockDeviceChangeAction, BlockDeviceChangeHook, BlockInventoryEntry,
+    PartitionRescanError,
 };
 
 mod fs;

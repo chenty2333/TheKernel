@@ -13,9 +13,9 @@ and minor assignments are derived from the Linux disk spelling for AHCI,
 SDHCI/MMC, and NVMe names. Old open nodes compare a shared queue identity on
 every operation and fail after remove or same-name replacement.
 
-AHCI/SDHCI hardware workers do not yet call the registry APIs for slot/card
-insertion or removal; registry changes are not yet bridged into the kernel
-`DeviceRegistry` add/remove uevent publisher; PCI MSI/MSI-X and INTx completion
-paths are not yet wired into these controllers. Guest-side GPT creation,
-`BLKRRPART`, ext4 formatting, mount, and read/write are now exercised by AHCI
-and SDHCI QEMU smoke runs.
+Registry add/remove/rescan changes now bridge into the kernel `DeviceRegistry`
+and its add/remove uevent publisher. AHCI/SDHCI hardware workers do not yet call
+the registry APIs for slot/card insertion or removal, and PCI MSI/MSI-X and INTx
+completion paths are not yet wired into these controllers. Guest-side GPT
+creation, `BLKRRPART`, ext4 formatting, mount, and read/write are exercised by
+AHCI and SDHCI QEMU smoke runs.

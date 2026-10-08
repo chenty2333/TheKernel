@@ -4,12 +4,91 @@ use alloc::{borrow::Cow, format, string::String, sync::Arc, vec::Vec};
 use core::fmt::Write;
 
 use axfs_ng_vfs::{DeviceId, FsName, FsNameBuf, NodeType, VfsError, VfsResult};
+use axsync::Mutex;
+use lazy_static::lazy_static;
 
 use super::{
     ChildNames, DirMapping, NodeOpsMux, SimpleDir, SimpleDirOps, SimpleFile, SimpleFs,
+    device_registry::{
+        DeviceHandle, DeviceIdentity, DeviceRegistration, MAX_DEVICES, global_device_registry,
+    },
     try_boxed_names,
 };
 use crate::mounts;
+
+lazy_static! {
+    static ref BLOCK_DEVICE_HANDLES: Mutex<Vec<(String, DeviceHandle<'static, MAX_DEVICES>)>> =
+        Mutex::new(Vec::new());
+}
+
+fn publish_block_uevent_device(entry: &axfs::BlockInventoryEntry) -> VfsResult<()> {
+    let mut handles = BLOCK_DEVICE_HANDLES.lock();
+    if handles.iter().any(|(name, _)| name == &entry.name) {
+        return Ok(());
+    }
+    handles.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+    let id = device_id(&entry.name).ok_or(VfsError::InvalidInput)?;
+    let mut identity = DeviceIdentity::new("block".into(), "block".into(), entry.name.clone(), id)?;
+    if let Some(partition) = &entry.partition {
+        identity = identity.child_of("block".into(), partition.parent.clone())?;
+    }
+    let registration = DeviceRegistration::try_new(
+        identity.clone(),
+        if entry.partition.is_some() {
+            "partition"
+        } else {
+            "disk"
+        }
+        .into(),
+        Vec::new(),
+        None,
+    )?;
+    let handle = global_device_registry()
+        .reserve(identity)?
+        .publish(registration)?;
+    handles.push((entry.name.clone(), handle));
+    Ok(())
+}
+
+fn remove_block_uevent_device(name: &str) -> VfsResult<()> {
+    let handle = {
+        let mut handles = BLOCK_DEVICE_HANDLES.lock();
+        let index = handles
+            .iter()
+            .position(|(entry_name, _)| entry_name == name)
+            .ok_or(VfsError::NotFound)?;
+        handles.remove(index).1
+    };
+    handle.remove()
+}
+
+fn block_device_change(action: axfs::BlockDeviceChangeAction, entry: axfs::BlockInventoryEntry) {
+    let result = match action {
+        axfs::BlockDeviceChangeAction::Added => publish_block_uevent_device(&entry),
+        axfs::BlockDeviceChangeAction::Removed => remove_block_uevent_device(&entry.name),
+    };
+    if let Err(error) = result {
+        warn!(
+            "block uevent registry {} {} failed: {error:?}",
+            if action == axfs::BlockDeviceChangeAction::Added {
+                "add"
+            } else {
+                "remove"
+            },
+            entry.name
+        );
+    }
+}
+
+pub(super) fn install_uevent_bridge() {
+    if !axfs::install_block_device_change_hook(block_device_change) {
+        warn!("block uevent hook is already owned by another provider");
+        return;
+    }
+    for entry in axfs::block_inventory() {
+        block_device_change(axfs::BlockDeviceChangeAction::Added, entry);
+    }
+}
 
 pub(crate) fn device_id(name: &str) -> Option<DeviceId> {
     if name == axfs::ROOT_BLOCK_DEVICE_NAME {

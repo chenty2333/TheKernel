@@ -1,6 +1,6 @@
 //! Read-only inventory of the registered root, whole disks and validated GPT views.
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axdriver::prelude::{BaseDriverOps, BlockDriverOps, DevError};
 
@@ -24,6 +24,36 @@ pub enum PartitionRescanError {
     Invalid,
     Io,
     NoMemory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockDeviceChangeAction {
+    Added,
+    Removed,
+}
+
+/// Bounded callback invoked after the block topology lock is released.
+pub type BlockDeviceChangeHook = fn(BlockDeviceChangeAction, BlockInventoryEntry);
+static BLOCK_DEVICE_CHANGE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Installs the single kernel uevent bridge after its dynamic device registry
+/// is ready. Reinstalling the same callback is idempotent.
+pub fn install_block_device_change_hook(hook: BlockDeviceChangeHook) -> bool {
+    let address = hook as usize;
+    match BLOCK_DEVICE_CHANGE_HOOK.compare_exchange(0, address, Ordering::AcqRel, Ordering::Acquire)
+    {
+        Ok(_) => true,
+        Err(existing) => existing == address,
+    }
+}
+
+fn notify_change(action: BlockDeviceChangeAction, entry: BlockInventoryEntry) {
+    let address = BLOCK_DEVICE_CHANGE_HOOK.load(Ordering::Acquire);
+    if address != 0 {
+        // SAFETY: the hook is a `fn` pointer installed once with this signature.
+        let hook = unsafe { core::mem::transmute::<usize, BlockDeviceChangeHook>(address) };
+        hook(action, entry);
+    }
 }
 
 fn snapshot(entry: &RegisteredBlockDevice) -> BlockInventoryEntry {
@@ -124,6 +154,35 @@ pub fn rescan_gpt_partitions(name: &str) -> Result<usize, PartitionRescanError> 
             return Err(PartitionRescanError::Busy);
         }
     }
+    let mut removed = Vec::new();
+    let old_partitions = devices
+        .iter()
+        .filter(|entry| {
+            entry
+                .partition
+                .as_ref()
+                .is_some_and(|part| part.parent == name)
+        })
+        .count();
+    removed
+        .try_reserve_exact(old_partitions)
+        .map_err(|_| PartitionRescanError::NoMemory)?;
+    removed.extend(
+        devices
+            .iter()
+            .filter(|entry| {
+                entry
+                    .partition
+                    .as_ref()
+                    .is_some_and(|part| part.parent == name)
+            })
+            .map(snapshot),
+    );
+    let mut added = Vec::new();
+    added
+        .try_reserve_exact(replacement.len())
+        .map_err(|_| PartitionRescanError::NoMemory)?;
+    added.extend(replacement.iter().map(snapshot));
     devices
         .try_reserve(replacement.len())
         .map_err(|_| PartitionRescanError::NoMemory)?;
@@ -135,14 +194,19 @@ pub fn rescan_gpt_partitions(name: &str) -> Result<usize, PartitionRescanError> 
     });
     let count = replacement.len();
     devices.extend(replacement);
+    drop(devices);
+    for entry in removed {
+        notify_change(BlockDeviceChangeAction::Removed, entry);
+    }
+    for entry in added {
+        notify_change(BlockDeviceChangeAction::Added, entry);
+    }
     Ok(count)
 }
 
 /// Publish one block disk discovered after filesystem initialization. The
 /// initial disk and its accepted GPT children are installed atomically.
-pub fn add_block_device(
-    raw: axdriver::AxBlockDevice,
-) -> Result<String, PartitionRescanError> {
+pub fn add_block_device(raw: axdriver::AxBlockDevice) -> Result<String, PartitionRescanError> {
     if axdriver::block_device_partition(&raw).is_some() {
         return Err(PartitionRescanError::Invalid);
     }
@@ -202,7 +266,16 @@ pub fn add_block_device(
     devices
         .try_reserve(replacement.len())
         .map_err(|_| PartitionRescanError::NoMemory)?;
+    let mut added = Vec::new();
+    added
+        .try_reserve_exact(replacement.len())
+        .map_err(|_| PartitionRescanError::NoMemory)?;
+    added.extend(replacement.iter().map(snapshot));
     devices.extend(replacement);
+    drop(devices);
+    for entry in added {
+        notify_change(BlockDeviceChangeAction::Added, entry);
+    }
     Ok(name)
 }
 
@@ -240,6 +313,40 @@ pub fn remove_block_device(name: &str) -> Result<(), PartitionRescanError> {
     }) {
         return Err(PartitionRescanError::Busy);
     }
+    let removal_count = if is_partition {
+        1
+    } else {
+        devices
+            .iter()
+            .filter(|entry| {
+                entry.name == name
+                    || entry
+                        .partition
+                        .as_ref()
+                        .is_some_and(|part| part.parent == name)
+            })
+            .count()
+    };
+    let mut removed = Vec::new();
+    removed
+        .try_reserve_exact(removal_count)
+        .map_err(|_| PartitionRescanError::NoMemory)?;
+    removed.extend(
+        devices
+            .iter()
+            .filter(|entry| {
+                if is_partition {
+                    entry.name == name
+                } else {
+                    entry.name == name
+                        || entry
+                            .partition
+                            .as_ref()
+                            .is_some_and(|part| part.parent == name)
+                }
+            })
+            .map(snapshot),
+    );
     if is_partition {
         devices.retain(|entry| entry.name != name);
     } else {
@@ -250,6 +357,10 @@ pub fn remove_block_device(name: &str) -> Result<(), PartitionRescanError> {
                     .as_ref()
                     .is_some_and(|part| part.parent == name)
         });
+    }
+    drop(devices);
+    for entry in removed {
+        notify_change(BlockDeviceChangeAction::Removed, entry);
     }
     Ok(())
 }
