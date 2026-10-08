@@ -8,8 +8,12 @@ extern crate alloc;
 
 mod config;
 mod firmware;
+mod firmware_bundle;
 
 pub use config::{DeviceConfig, FirmwareConfig, RuntimeConfig, lookup_config};
 pub use firmware::{
     FirmwareError, FirmwareImage, FirmwareSection, PnvmImage, SectionType, select_pnvm,
+};
+pub use firmware_bundle::{
+    FirmwareBundle, FirmwareRequestError, request_on_rootfs_ready, take_staged,
 };
