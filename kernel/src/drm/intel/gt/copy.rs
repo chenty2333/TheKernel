@@ -6,7 +6,7 @@
 //! BCS/RCS selftests and standard nonprivileged soft-pinned jobs. Software
 //! preparation uses existing SharedPages/GGTT; DMA ownership precedes ELSQ load.
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
 use intel_gt::{Error, GtIo, bcs, lrc, ppgtt};
 
@@ -90,6 +90,15 @@ impl Ram {
             data.extend_from_slice(&word.to_le_bytes());
         }
         self.write(page * PAGE, &data)
+    }
+    fn dwords_at(&self, offset: usize, words: &[u32]) -> Result<(), Error> {
+        let bytes = words.len().checked_mul(4).ok_or(Error::Refused)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(bytes).map_err(|_| Error::Refused)?;
+        for word in words {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        self.write(offset, &data)
     }
     fn table(&self, page: usize, words: &[u64; 512]) -> Result<(), Error> {
         let mut data = Vec::new();
@@ -375,11 +384,11 @@ impl SwitchAway {
             intel_gt::rcs::context_wa(io, &mut words[22..36])?;
             words[36..].copy_from_slice(&normal);
             words[37] |= 1 << 27;
-            self.ring.dwords(0, &words)?;
+            write_ring_commands(&self.ring, &words)?;
         } else {
             let count = bcs::ring(&mut regs, 0x30000, context, 1)?;
             regs[15..18].fill(0); // only MI_BATCH_BUFFER_START and its two address words.
-            self.ring.dwords(0, &regs[..count])?;
+            write_ring_commands(&self.ring, &regs[..count])?;
         }
         self.context.flush();
         self.ring.flush();
@@ -1817,7 +1826,7 @@ impl Memory {
         if self.idle {
             regs[15..18].fill(0);
         }
-        self.ring.dwords(0, &regs[..count])?;
+        write_ring_commands(&self.ring, &regs[..count])?;
         if self.selftest {
             let mut data = Vec::new();
             data.try_reserve_exact(6 * PAGE)
@@ -1873,7 +1882,7 @@ impl Memory {
         if self.idle {
             words[36 + 23..36 + 26].fill(0);
         }
-        self.ring.dwords(0, &words)?;
+        write_ring_commands(&self.ring, &words)?;
         self.ring.flush();
         Ok(())
     }
@@ -1922,6 +1931,150 @@ fn zero_words<T: Default + Clone>(count: usize) -> Result<Vec<T>, Error> {
 }
 fn pattern(index: usize) -> u8 {
     (index as u8).wrapping_mul(29) ^ ((index >> 8) as u8) ^ 0x73
+}
+
+/// Use the source-faithful ring reservation path for the private, already
+/// GGTT-bound BCS/RCS command page. The backend writes directly to `Ram`;
+/// `RingSpan` never points at a detached CPU copy.
+fn write_ring_commands(ram: &Ram, words: &[u32]) -> Result<(), Error> {
+    if words.is_empty() || words.len() & 1 != 0 {
+        return Err(Error::Refused);
+    }
+    let id = *ram.physical.first().ok_or(Error::Refused)?;
+    let ring = &mut intel_gt::intel_ring::Ring {
+        id,
+        vma: intel_gt::intel_ring::RingVma {
+            id,
+            size: PAGE,
+            stolen: false,
+            map_and_fenceable: false,
+            has_llc: true,
+            has_aperture: false,
+            has_read_only: false,
+            i830_or_i845g: false,
+        },
+        head: 0,
+        tail: 0,
+        emit: 0,
+        size: PAGE,
+        effective_size: PAGE,
+        space: PAGE - intel_gt::intel_ring::CACHELINE_BYTES,
+        wrap: 20,
+        // The caller retains the GGTT binding through the subsequent engine
+        // execution and retirement/reset boundary.
+        pin_count: AtomicUsize::new(1),
+    };
+    let request = intel_gt::intel_ring::Request {
+        ring_id: id,
+        reserved_space: 0,
+    };
+    let span = intel_gt::intel_ring::intel_ring_begin(
+        ring,
+        &request,
+        &intel_gt::intel_ring::Timeline::default(),
+        words.len(),
+        &mut RamRingBackend { ram },
+    )
+    .map_err(|_| Error::Refused)?;
+    intel_gt::intel_ring::intel_ring_emit(ring, span, words, &mut RamRingBackend { ram })
+        .map_err(|_| Error::Refused)
+}
+
+struct RamRingBackend<'a> {
+    ram: &'a Ram,
+}
+
+impl intel_gt::intel_ring::RingBackend for RamRingBackend<'_> {
+    fn ggtt_pin_bias(&mut self, _: &intel_gt::intel_ring::RingVma) -> u32 {
+        0
+    }
+    fn ggtt_pin(
+        &mut self,
+        _: &mut intel_gt::intel_ring::RingVma,
+        _: intel_gt::intel_ring::VmaFlags,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn map_iomap(
+        &mut self,
+        _: &intel_gt::intel_ring::RingVma,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn coherent_map(
+        &mut self,
+        _: &intel_gt::intel_ring::RingVma,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn fill_ring_words(
+        &mut self,
+        _: &intel_gt::intel_ring::RingVma,
+        byte_offset: usize,
+        dwords: usize,
+        value: u32,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(dwords)
+            .map_err(|_| intel_gt::intel_ring::RingError::NoMemory)?;
+        words.resize(dwords, value);
+        self.ram
+            .dwords_at(byte_offset, &words)
+            .map_err(|_| intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn write_ring_words(
+        &mut self,
+        _: &intel_gt::intel_ring::RingVma,
+        byte_offset: usize,
+        words: &[u32],
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        self.ram
+            .dwords_at(byte_offset, words)
+            .map_err(|_| intel_gt::intel_ring::RingError::Invalid)
+    }
+    fn unmap_iomap(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn unmap_object(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn make_unshrinkable(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn make_purgeable(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn unset_ggtt_write(&mut self, _: &intel_gt::intel_ring::RingVma) {}
+    fn vma_unpin(&mut self, _: &mut intel_gt::intel_ring::RingVma) {}
+    fn ggtt_has_aperture_without_llc(&self) -> bool {
+        false
+    }
+    fn create_lmem(
+        &mut self,
+        _: usize,
+    ) -> Result<intel_gt::intel_ring::RingVma, intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::NoMemory)
+    }
+    fn create_stolen(
+        &mut self,
+        _: usize,
+    ) -> Result<intel_gt::intel_ring::RingVma, intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::NoMemory)
+    }
+    fn create_internal(
+        &mut self,
+        _: usize,
+    ) -> Result<intel_gt::intel_ring::RingVma, intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::NoMemory)
+    }
+    fn set_readonly(&mut self, _: &mut intel_gt::intel_ring::RingVma) {}
+    fn vma_instance(
+        &mut self,
+        vma: intel_gt::intel_ring::RingVma,
+    ) -> Result<intel_gt::intel_ring::RingVma, intel_gt::intel_ring::RingError> {
+        Ok(vma)
+    }
+    fn vma_put(&mut self, _: intel_gt::intel_ring::RingVma) {}
+    fn request_wait_interruptible_max(
+        &mut self,
+        _: intel_gt::intel_ring::TimelineRequest,
+    ) -> Result<(), intel_gt::intel_ring::RingError> {
+        Err(intel_gt::intel_ring::RingError::NoSpace)
+    }
+    fn request_retire_upto(&mut self, _: intel_gt::intel_ring::TimelineRequest) {}
 }
 
 fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
