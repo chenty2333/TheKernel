@@ -236,3 +236,16 @@ selection as explicit effects. BSS/ESS choice is delegated to the existing
 translated node selectors; hostap and IBSS end-scan paths are omitted because
 iwx does not support those operation modes. iwx still needs to consume these
 effects in its runtime scan/roam driver task.
+
+Station BSS join now copies the selected scan node into the BSS record, carries
+association-failure history only when the selected BSSID or desired ESS
+matches, runs the translated rate and RSN selectors, and returns the PHY mode
+and AUTH/DEAUTH-triggered state transition plan. Timeout cancellation and
+firmware/node callbacks remain caller effects.
+
+The BSS join path composes already-translated node rate/RSN policy and
+newstate() effects: a selected scan node becomes the BSS record, matching
+BSSID/ESS association-failure history is retained, rates are fixed, RSN suites
+are intersected, and the station transitions to AUTH with the correct
+background-roam or AUTH-retry trigger. This is a caller-facing state plan;
+firmware association/key command execution remains a driver integration step.

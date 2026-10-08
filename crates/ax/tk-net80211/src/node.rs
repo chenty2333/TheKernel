@@ -1,6 +1,7 @@
 //! ESS lookup, candidate validation and AP scoring from OpenBSD net80211.
 //!
-//! Translated from `sys/net80211/ieee80211_node.c` rev 1.217 and
+//! Translated from `sys/net80211/ieee80211_node.c` rev 1.217,
+//! `ieee80211.c` rev 1.92, `ieee80211_proto.c` rev 1.176 and
 //! `ieee80211_node.h` rev 1.64 (BSD-3-Clause). Copyright (c) 2001 Atsushi
 //! Onoe, (c) 2002, 2003 Sam Leffler, Errno Consulting, and (c) 2008 Damien
 //! Bergamini.
@@ -303,6 +304,120 @@ pub fn switch_ess(
     } else {
         Some(selected)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StationBssJoinError {
+    MissingCandidate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StationBssJoinPolicy<'a> {
+    pub old_state: crate::ProtocolState,
+    pub background_scan: bool,
+    pub rsn_enabled: bool,
+    pub wep_enabled: bool,
+    pub desired_ssid: &'a [u8],
+    pub fixed_mode: Option<crate::PhyMode>,
+    pub channel_flags: u16,
+    pub selected_node_flags: u32,
+    pub local_rates: &'a crate::RateSet,
+    pub fixed_rate: Option<usize>,
+    pub local_rsn: LocalRsnPolicy,
+    pub cached_pmkid: Option<[u8; 16]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StationBssJoinPlan {
+    pub bssid: [u8; 6],
+    pub mode: crate::PhyMode,
+    pub association_failures: u32,
+    pub rate_status: u8,
+    pub rsn_choice: Option<RsnChoice>,
+    pub background_scan_canceled: bool,
+    pub transition: crate::proto::StateTransitionPlan,
+}
+
+/// Copy a selected station BSS, retain applicable failure history, negotiate
+/// rates/security, then plan the AUTH transition chosen by node_join_bss.
+// upstream: ieee80211_node.c ieee80211_node_join_bss()
+pub fn join_station_bss(
+    table: &mut crate::NodeTable,
+    bssid: [u8; 6],
+    policy: StationBssJoinPolicy<'_>,
+) -> Result<StationBssJoinPlan, StationBssJoinError> {
+    let mut selected = crate::find_node(table, &bssid)
+        .cloned()
+        .ok_or(StationBssJoinError::MissingCandidate)?;
+    let current = table.bss_node.clone();
+    let desired_matches =
+        !policy.desired_ssid.is_empty() && policy.desired_ssid == selected.access_point.ssid();
+    if current.access_point.bssid == bssid || desired_matches {
+        selected.access_point.association_failures |= current.access_point.association_failures;
+    }
+    selected.lifecycle = crate::NodeLifecycle::Bss;
+    let rate_status = crate::fix_rate(
+        &mut selected.access_point.rates,
+        crate::FixRateConfig {
+            supported_rates: policy.local_rates,
+            fixed_rate: policy.fixed_rate,
+            hostap_mode: false,
+        },
+        crate::FIX_RATE_SORT | crate::FIX_RATE_NEGOTIATE | crate::FIX_RATE_DELETE,
+    );
+    let rsn_choice = if policy.rsn_enabled {
+        let choice = choose_rsn_params(
+            selected.access_point.rsn_protocols,
+            selected.access_point.rsn_akms,
+            selected.access_point.rsn_ciphers,
+            selected.access_point.rsn_capabilities,
+            policy.local_rsn,
+            policy.cached_pmkid,
+        );
+        if choice.protocol != 0 {
+            selected.access_point.rsn_protocols = choice.protocol;
+            selected.access_point.rsn_akms = choice.akm;
+            selected.access_point.rsn_ciphers = choice.cipher;
+        }
+        Some(choice)
+    } else {
+        if policy.wep_enabled {
+            selected.access_point.group_cipher = crate::CIPHER_USE_GROUP;
+        }
+        None
+    };
+    let association_failures = selected.access_point.association_failures;
+    let mode = crate::node_abg_mode(
+        policy.fixed_mode,
+        selected.access_point.is_5ghz,
+        policy.channel_flags,
+        policy.selected_node_flags,
+    );
+    table.bss_node = selected;
+    let trigger = if policy.background_scan && policy.old_state == crate::ProtocolState::Run {
+        crate::proto::StateTrigger::Deauth
+    } else if policy.old_state == crate::ProtocolState::Auth {
+        crate::proto::StateTrigger::Auth
+    } else {
+        crate::proto::StateTrigger::None
+    };
+    let transition = crate::newstate(
+        policy.old_state,
+        crate::ProtocolState::Auth,
+        trigger,
+        policy.rsn_enabled,
+        false,
+        false,
+    );
+    Ok(StationBssJoinPlan {
+        bssid,
+        mode,
+        association_failures,
+        rate_status,
+        rsn_choice,
+        background_scan_canceled: true,
+        transition,
+    })
 }
 
 /// Prefer RSN/SHA-256/CCMP while intersecting local and peer capabilities.
@@ -722,6 +837,58 @@ mod tests {
         assert_ne!(
             match_bss(&policy, &mut candidate, &mut current, |_| 0) & ASSOCFAIL_WPA_PROTO,
             0
+        );
+    }
+
+    #[test]
+    fn station_join_copies_selected_node_preserves_failure_and_starts_auth() {
+        let mut table = crate::NodeTable::default();
+        let bssid = [2, 0, 0, 0, 0, 9];
+        crate::alloc_node(&mut table, bssid).unwrap();
+        let candidate = crate::find_node_mut(&mut table, &bssid).unwrap();
+        candidate.access_point = ap(b"home", true, 80);
+        candidate.access_point.bssid = bssid;
+        candidate.access_point.rates = crate::RateSet::new(&[0x8c, 0x98]);
+        candidate.access_point.rsn_protocols = PROTO_RSN;
+        candidate.access_point.rsn_akms = AKM_PSK;
+        candidate.access_point.rsn_ciphers = CIPHER_CCMP;
+        candidate.access_point.group_cipher = CIPHER_CCMP;
+        table.bss_node.access_point.association_failures = ASSOCFAIL_WPA_KEY;
+
+        let local_rates = crate::RateSet::new(&[0x8c, 0x98]);
+        let policy = StationBssJoinPolicy {
+            old_state: crate::ProtocolState::Scan,
+            background_scan: false,
+            rsn_enabled: true,
+            wep_enabled: false,
+            desired_ssid: b"home",
+            fixed_mode: None,
+            channel_flags: 0,
+            selected_node_flags: 0,
+            local_rates: &local_rates,
+            fixed_rate: None,
+            local_rsn: LocalRsnPolicy {
+                protocols: PROTO_RSN,
+                akms: AKM_PSK,
+                ciphers: CIPHER_CCMP,
+                flags: 0,
+                capabilities: 0,
+            },
+            cached_pmkid: None,
+        };
+        let plan = join_station_bss(&mut table, bssid, policy).unwrap();
+        assert_eq!(plan.bssid, bssid);
+        assert_eq!(plan.association_failures, ASSOCFAIL_WPA_KEY);
+        assert_eq!(table.bss_node.lifecycle, crate::NodeLifecycle::Bss);
+        assert_eq!(table.bss_node.access_point.rsn_protocols, PROTO_RSN);
+        assert!(plan.background_scan_canceled);
+        assert_eq!(plan.transition.effective_state, crate::ProtocolState::Auth);
+        assert!(
+            plan.transition
+                .effects
+                .contains(&crate::proto::StateEffect::SendManagement(
+                    crate::proto::ManagementAction::Authentication { sequence: 1 }
+                ))
         );
     }
 
