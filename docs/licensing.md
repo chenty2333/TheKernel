@@ -766,3 +766,8 @@ license text remains in the source and `kernel/LICENSES/LicenseRef-Intel-Color-M
 Linux 7.2.3 `drm_atomic_uapi.c` (MIT; Red Hat, Intel, and Linux Foundation
 copyrights); its full license text remains in the source and
 `kernel/LICENSES/LicenseRef-DRM-Atomic-UAPI-MIT`.
+
+`kernel/src/drm/plane_uapi_full.rs` translates 38 plane helper functions
+from Linux 7.2.3 `drm_plane.c` (MIT-style grant, © 2016 Intel); its full
+license text remains in the source and
+`kernel/LICENSES/LicenseRef-Intel-Drm-Plane-MIT`.
