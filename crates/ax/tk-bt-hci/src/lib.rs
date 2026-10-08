@@ -487,6 +487,61 @@ impl<T: UsbTransport> Adapter<T> {
         self.transport.end_command_transaction();
         result
     }
+    /// Send an HCI command that completes asynchronously with Command Status
+    /// (for example Inquiry) and preserve all unrelated events for sockets.
+    pub fn command_status(&mut self, command: &[u8], event: &mut [u8]) -> Result<usize, Error> {
+        let parsed = Packet::parse(PacketType::Command, command)?;
+        if !self.up {
+            return Err(Error::NotUp);
+        }
+        let opcode = u16::from_le_bytes([parsed.payload[0], parsed.payload[1]]);
+        self.transport.begin_command_transaction()?;
+        let result = self.command_status_transaction(command, opcode, event);
+        self.transport.end_command_transaction();
+        result
+    }
+    fn command_status_transaction(
+        &mut self,
+        command: &[u8],
+        opcode: u16,
+        event: &mut [u8],
+    ) -> Result<usize, Error> {
+        if let Err(error) = self.transport.control_command(command) {
+            self.stats.err_tx = self.stats.err_tx.saturating_add(1);
+            return Err(error);
+        }
+        self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
+        self.stats.byte_tx = self.stats.byte_tx.saturating_add(command.len() as u32);
+        self.queue_monitor(2, command);
+        for _ in 0..64 {
+            let length = match self.transport.read_interrupt_event(event) {
+                Ok(length) => length,
+                Err(error) => {
+                    self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                    return Err(error);
+                }
+            };
+            if length > event.len() {
+                return Err(Error::InvalidLength);
+            }
+            let parsed = Packet::parse(PacketType::Event, &event[..length])?;
+            self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+            self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+            self.queue_monitor(3, &event[..length]);
+            if parsed.payload[0] == 0x0f && length >= 6 {
+                let completed = u16::from_le_bytes([event[4], event[5]]);
+                if completed == opcode {
+                    return if event[2] == 0 {
+                        Ok(length)
+                    } else {
+                        Err(Error::Unsupported)
+                    };
+                }
+            }
+            self.queue_incoming_event(&event[..length])?;
+        }
+        Err(Error::Again)
+    }
     fn command_complete_transaction(
         &mut self,
         command: &[u8],
@@ -1325,6 +1380,22 @@ mod tests {
         );
         let fake = adapter.into_transport();
         assert_eq!((fake.begun, fake.ended), (1, 1));
+    }
+
+    #[test]
+    fn inquiry_command_status_matches_opcode() {
+        let fake = CommandFake {
+            events: VecDeque::from([vec![0x0f, 4, 0, 1, 0x01, 0x04]]),
+            begun: 0,
+            ended: 0,
+        };
+        let mut adapter = Adapter::new(fake, 0);
+        adapter.set_up(true).unwrap();
+        let mut event = [0; 16];
+        assert_eq!(
+            adapter.command_status(&[0x01, 0x04, 5, 0x33, 0x8b, 0x9e, 8, 0], &mut event),
+            Ok(6)
+        );
     }
     #[test]
     fn hci_capabilities_are_decoded_from_standard_command_replies() {

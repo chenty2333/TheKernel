@@ -35,6 +35,7 @@ pub struct UsbBluetoothHci {
     address: [u8; 6],
     capabilities: tk_bt_hci::HciCapabilities,
     management_settings: u32,
+    discovery_type: u8,
     receive_readiness: Arc<PollSet<32>>,
 }
 
@@ -208,6 +209,7 @@ impl UsbBluetoothHci {
             address: [0; 6],
             capabilities: tk_bt_hci::HciCapabilities::default(),
             management_settings: 0,
+            discovery_type: 0,
             receive_readiness: Arc::new(PollSet::new()),
         })
     }
@@ -247,6 +249,7 @@ impl UsbBluetoothHci {
         if !up {
             self.management_settings &=
                 !(MGMT_SETTING_POWERED | MGMT_SETTING_CONNECTABLE | MGMT_SETTING_DISCOVERABLE);
+            self.discovery_type = 0;
             return Ok(());
         }
         let initialization = (|| {
@@ -284,6 +287,42 @@ impl UsbBluetoothHci {
     }
     pub fn management_settings(&self) -> u32 {
         self.management_settings
+    }
+    pub fn management_discovery(&mut self, discovery_type: u8, start: bool) -> Result<bool, Error> {
+        if !self.adapter.is_up() {
+            return Err(Error::NotUp);
+        }
+        if !matches!(discovery_type, 1 | 6) {
+            return Err(Error::Unsupported);
+        }
+        if start {
+            if self.discovery_type != 0 {
+                return if self.discovery_type == discovery_type {
+                    Ok(false)
+                } else {
+                    Err(Error::Busy)
+                };
+            }
+            if discovery_type == 1 {
+                let command = [0x01, 0x04, 5, 0x33, 0x8b, 0x9e, 8, 0];
+                self.command_status(&command)?;
+            } else {
+                self.command_complete(0x200b, &[1, 0x10, 0, 0x10, 0, 0, 0])?;
+                self.command_complete(0x200c, &[1, 0])?;
+            }
+            self.discovery_type = discovery_type;
+        } else {
+            if self.discovery_type != discovery_type {
+                return Err(Error::Unsupported);
+            }
+            if discovery_type == 1 {
+                self.command_complete(0x0402, &[])?;
+            } else {
+                self.command_complete(0x200c, &[0, 0])?;
+            }
+            self.discovery_type = 0;
+        }
+        Ok(true)
     }
     /// Apply mgmt settings that map to a single acknowledged HCI operation.
     /// Host-only Bondable state is maintained here; scan flags, SSP, and LE
@@ -380,6 +419,14 @@ impl UsbBluetoothHci {
             self.receive_readiness.wake();
         }
         result
+    }
+    fn command_status(&mut self, command: &[u8]) -> Result<(), Error> {
+        let mut event = [0u8; 260];
+        self.adapter.command_status(command, &mut event)?;
+        if self.adapter.receive_ready() {
+            self.receive_readiness.wake();
+        }
+        Ok(())
     }
     pub fn open(&mut self, channel: tk_bt_hci::Channel) -> Result<(), Error> {
         self.adapter.open(channel)

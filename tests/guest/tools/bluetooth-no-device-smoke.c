@@ -125,8 +125,9 @@ int main(void) {
     if (send(mgmt, read_commands, sizeof(read_commands), 0) != sizeof(read_commands)) return fail("mgmt READ_COMMANDS send");
     response_len = recv(mgmt, response, sizeof(response), 0);
     const uint8_t commands_reply[] = {
-        1, 0, 0xff, 0xff, 25, 0, 2, 0, 0, 8, 0, 1, 0,
-        3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 6, 0,
+        1, 0, 0xff, 0xff, 31, 0, 2, 0, 0, 10, 0, 2, 0,
+        3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0,
+        0x23, 0, 0x24, 0, 6, 0, 0x13, 0,
     };
     if (response_len != sizeof(commands_reply) || memcmp(response, commands_reply, sizeof(commands_reply))) {
         fprintf(stderr, "mgmt READ_COMMANDS response length=%ld\n", (long)response_len); return 1;
@@ -144,7 +145,8 @@ int main(void) {
         mgmt_no_controller_command(mgmt, 13, enabled, sizeof(enabled)) ||
         mgmt_no_controller_command(mgmt, 18, no_link_keys, sizeof(no_link_keys)) ||
         mgmt_no_controller_command(mgmt, 19, no_ltk, sizeof(no_ltk)) ||
-        mgmt_no_controller_command(mgmt, 0x23, discovery_type, sizeof(discovery_type))) {
+        mgmt_no_controller_command(mgmt, 0x23, discovery_type, sizeof(discovery_type)) ||
+        mgmt_no_controller_command(mgmt, 0x24, discovery_type, sizeof(discovery_type))) {
         return 1;
     }
     close(mgmt);

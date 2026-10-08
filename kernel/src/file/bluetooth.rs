@@ -192,12 +192,14 @@ mod tests {
     #[test]
     fn management_commands_advertise_only_supported_operations() {
         let commands = management_response(&[2, 0, 0xff, 0xff, 0, 0]).unwrap();
-        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 8);
-        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 1);
-        assert_eq!(commands.len(), 9 + 4 + 2 * 9);
+        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 10);
+        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 2);
+        assert_eq!(commands.len(), 9 + 4 + 2 * 12);
         assert_eq!(
-            &commands[13..31],
-            &[3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 6, 0]
+            &commands[13..37],
+            &[
+                3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 0x23, 0, 0x24, 0, 6, 0, 0x13, 0,
+            ]
         );
     }
 
@@ -218,6 +220,8 @@ mod tests {
             &[18, 0, 0, 0, 3, 0, 0, 0, 0], // LOAD_LINK_KEYS, empty set
             &[19, 0, 0, 0, 2, 0, 0, 0],    // LOAD_LONG_TERM_KEYS, empty set
             &[0x23, 0, 0, 0, 1, 0, 1],     // START_DISCOVERY, BR/EDR
+            &[0x24, 0, 0, 0, 1, 0, 1],     // STOP_DISCOVERY, BR/EDR
+            &[0x24, 0, 0, 0, 1, 0, 1],     // STOP_DISCOVERY, BR/EDR
         ];
         for request in requests {
             let response = management_response(request).unwrap();
@@ -667,6 +671,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const LOAD_LINK_KEYS: u16 = 18;
     const LOAD_LONG_TERM_KEYS: u16 = 19;
     const START_DISCOVERY: u16 = 0x23;
+    const STOP_DISCOVERY: u16 = 0x24;
     const UNKNOWN_COMMAND: u8 = 1;
     const NOT_SUPPORTED: u8 = 0x0c;
     const INVALID_PARAMS: u8 = 0x0d;
@@ -699,8 +704,10 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 SET_BONDABLE,
                 SET_SSP,
                 SET_LE,
+                START_DISCOVERY,
+                STOP_DISCOVERY,
             ];
-            let events = [6u16]; // NEW_SETTINGS
+            let events = [6u16, 0x13]; // NEW_SETTINGS, DISCOVERING
             data.extend_from_slice(&(commands.len() as u16).to_le_bytes());
             data.extend_from_slice(&(events.len() as u16).to_le_bytes());
             for item in commands.into_iter().chain(events) {
@@ -781,6 +788,9 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
         START_DISCOVERY if parameters.len() == 1 && matches!(parameters[0], 1 | 6) => {
             status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
         }
+        STOP_DISCOVERY if parameters.len() == 1 && matches!(parameters[0], 1 | 6) => {
+            status = management_controller_status(index, INVALID_INDEX, NOT_SUPPORTED);
+        }
         _ if matches!(
             opcode,
             READ_VERSION
@@ -796,6 +806,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 | LOAD_LINK_KEYS
                 | LOAD_LONG_TERM_KEYS
                 | START_DISCOVERY
+                | STOP_DISCOVERY
         ) =>
         {
             status = INVALID_PARAMS;
@@ -826,6 +837,8 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
     const SET_BONDABLE: u16 = 9;
     const SET_SSP: u16 = 11;
     const SET_LE: u16 = 13;
+    const START_DISCOVERY: u16 = 0x23;
+    const STOP_DISCOVERY: u16 = 0x24;
     const MGMT_SETTING_CONNECTABLE: u32 = 1 << 1;
     const MGMT_SETTING_DISCOVERABLE: u32 = 1 << 2;
     const MGMT_SETTING_BONDABLE: u32 = 1 << 3;
@@ -845,6 +858,34 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
         return Err(AxError::InvalidInput);
     }
     let parameters = &request[6..];
+    if opcode == START_DISCOVERY || opcode == STOP_DISCOVERY {
+        if parameters.len() != 1 || !matches!(parameters[0], 1 | 6) {
+            return Ok(None);
+        }
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let start = opcode == START_DISCOVERY;
+        let discovery_type = parameters[0];
+        let result = adapter.lock().management_discovery(discovery_type, start);
+        let (status, data, event) = match result {
+            Ok(changed) => (
+                0,
+                alloc::vec![discovery_type],
+                changed.then_some((discovery_type, u8::from(start))),
+            ),
+            Err(axdriver::BluetoothError::NoDevice) => (INVALID_INDEX, Vec::new(), None),
+            Err(axdriver::BluetoothError::Unsupported) => (NOT_SUPPORTED, Vec::new(), None),
+            Err(_) => (FAILED, Vec::new(), None),
+        };
+        let response = management_command_complete(index, opcode, status, &data)?;
+        let event = if let Some((kind, discovering)) = event {
+            Some(discovering_event(index, kind, discovering)?)
+        } else {
+            None
+        };
+        return Ok(Some((response, event)));
+    }
     if opcode == SET_POWERED {
         if parameters.len() != 1 || parameters[0] > 1 {
             return Ok(None);
@@ -974,6 +1015,22 @@ fn settings_event(index: u16, settings: Option<u32>) -> AxResult<Option<Vec<u8>>
     event.extend_from_slice(&4u16.to_le_bytes());
     event.extend_from_slice(&settings.to_le_bytes());
     Ok(Some(event))
+}
+
+#[cfg(feature = "input")]
+fn discovering_event(index: u16, discovery_type: u8, discovering: u8) -> AxResult<Vec<u8>> {
+    let mut event = Vec::new();
+    event.try_reserve_exact(8).map_err(|_| AxError::NoMemory)?;
+    event.extend_from_slice(&0x13u16.to_le_bytes());
+    event.extend_from_slice(&index.to_le_bytes());
+    event.extend_from_slice(&2u16.to_le_bytes());
+    event.extend_from_slice(&[discovery_type, discovering]);
+    Ok(event)
+}
+
+#[cfg(not(feature = "input"))]
+fn discovering_event(_index: u16, _discovery_type: u8, _discovering: u8) -> AxResult<Vec<u8>> {
+    Ok(Vec::new())
 }
 
 #[cfg(not(feature = "input"))]
