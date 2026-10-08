@@ -12,13 +12,18 @@ The header and early HBA routines are now represented by `AhciController` and
 `PortState`. `AhciDisk` owns an aligned command list/FIS/command table and a
 persistent DMA bounce buffer; it submits IDENTIFY DEVICE and LBA48 READ/WRITE
 DMA EXT through slot zero, accepts bounded pinned physical SG requests as
-multiple PRDs without payload copies, and routes both physical and
-bounce-buffer requests through one split-phase typed completion handle. There
-is one in-flight slot/tag at a time; callers retain pinned SG pages until
-physical completion. It checks task-file errors and implements
+multiple PRDs without payload copies, and routes bounce-buffer requests through
+one split-phase typed completion handle. Direct pinned physical-SG NCQ batches
+reserve slot zero for recovery and can publish multiple tag-matched slots in
+one CI write; each completion retains the original handle/cookie and block
+owner. Callers retain pinned SG pages until physical completion. A port-wide
+error/reset fails all still-in-flight batch members (the READ LOG EXT tag is
+retained when available); it does not yet reproduce CAM's fine-grained
+requeue of non-victim requests. It checks task-file errors and implements
 `BlockDriverOps` sync/async read-write, flush, and DSM/TRIM discard. FPDMA is
-used serially with tag zero when both HBA and IDENTIFY advertise NCQ; concurrent
-NCQ queue admission and multi-victim slot recovery remain untranslated.
+used with tag zero for synchronous and bounce-buffer operations when both HBA
+and IDENTIFY advertise NCQ; direct physical batch operations use concurrent
+per-slot FPDMA tags up to the IDENTIFY queue depth.
 A command timeout poisons the disk; the persistent workspace is retained until
 port shutdown proves DMA stopped, and is leaked if shutdown cannot prove it.
 

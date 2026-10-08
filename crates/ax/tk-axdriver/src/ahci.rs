@@ -219,7 +219,7 @@ unsafe fn free_dma(cpu: NonNull<u8>, pages: usize) {
 fn allocate_workspace() -> Option<PortWorkspace> {
     let command_list = alloc_dma(1)?;
     let received_fis = alloc_dma(1)?;
-    let command_table = alloc_dma(1)?;
+    let command_table = alloc_dma(axdriver_block::ahci::regs::AHCI_MAX_SLOTS)?;
     let bounce = alloc_dma(BOUNCE_PAGES)?;
     PortWorkspace::new(command_list, received_fis, command_table, bounce).ok()
 }

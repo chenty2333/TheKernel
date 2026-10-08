@@ -38,6 +38,7 @@ use crate::{
 const COMMAND_LIST_BYTES: usize = 32 * AHCI_MAX_SLOTS;
 const RECEIVED_FIS_BYTES: usize = 256;
 const COMMAND_TABLE_HEADER_BYTES: usize = 128;
+const COMMAND_TABLE_SLOT_BYTES: usize = 4096;
 const PRD_BYTES: usize = 16;
 const COMMAND_TIMEOUT_POLLS: usize = 50_000;
 const READ_LOG_TIMEOUT_POLLS: usize = 10_000;
@@ -118,6 +119,7 @@ pub struct PortWorkspace {
     command_list: DmaRegion,
     received_fis: DmaRegion,
     command_table: DmaRegion,
+    command_table_slots: usize,
     bounce: DmaRegion,
 }
 
@@ -135,7 +137,7 @@ impl PortWorkspace {
             || received_fis.len < RECEIVED_FIS_BYTES
             || received_fis.bus as usize & 0xff != 0
             || received_fis.cpu.as_ptr() as usize & 0xff != 0
-            || command_table.len < COMMAND_TABLE_HEADER_BYTES + PRD_BYTES
+            || command_table.len < COMMAND_TABLE_SLOT_BYTES
             || command_table.bus as usize & 0x7f != 0
             || command_table.cpu.as_ptr() as usize & 0x7f != 0
             || bounce.len < 512
@@ -153,10 +155,13 @@ impl PortWorkspace {
             ptr::write_bytes(command_table.cpu.as_ptr(), 0, command_table.len);
             ptr::write_bytes(bounce.cpu.as_ptr(), 0, bounce.len);
         }
+        let command_table_slots =
+            (command_table.len / COMMAND_TABLE_SLOT_BYTES).min(AHCI_MAX_SLOTS);
         Ok(Self {
             command_list,
             received_fis,
             command_table,
+            command_table_slots,
             bounce,
         })
     }
@@ -220,6 +225,27 @@ struct PendingAsync {
     polls: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PendingPhysical {
+    handle: BlockRequestHandle,
+    cookie: u64,
+    bytes: usize,
+    polls: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PhysicalSlot {
+    pending: Option<PendingPhysical>,
+    completion: Option<BlockCompletion>,
+}
+
+impl PhysicalSlot {
+    const EMPTY: Self = Self {
+        pending: None,
+        completion: None,
+    };
+}
+
 // Fixed-size segment metadata keeps async completion allocation-free; this
 // intentionally stores one bounded request alongside the small terminal
 // completion record.
@@ -241,13 +267,45 @@ pub struct AhciDisk<I: AhciIo> {
     name: String,
     ncq: bool,
     poisoned: bool,
+    ncq_error_tag: Option<u8>,
     workspace_live: bool,
     async_state: AsyncState,
+    physical_slots: [PhysicalSlot; AHCI_MAX_SLOTS],
     next_async_handle: u64,
     irq_enabled: bool,
 }
 
 impl<I: AhciIo> AhciDisk<I> {
+    fn has_physical_work(&self) -> bool {
+        self.physical_slots
+            .iter()
+            .any(|slot| slot.pending.is_some() || slot.completion.is_some())
+    }
+
+    fn physical_slots_mask(&self) -> u32 {
+        self.physical_slots
+            .iter()
+            .enumerate()
+            .fold(0u32, |mask, (slot, state)| {
+                if state.pending.is_some() || state.completion.is_some() {
+                    mask | (1u32 << slot)
+                } else {
+                    mask
+                }
+            })
+    }
+
+    fn physical_slot_range(&self) -> core::ops::Range<usize> {
+        if self.ncq {
+            let end = (1 + usize::from(self.geometry.ncq_queue_depth))
+                .min(self.workspace().command_table_slots)
+                .min(AHCI_MAX_SLOTS);
+            1..end
+        } else {
+            0..self.workspace().command_table_slots.min(1)
+        }
+    }
+
     /// Initializes one SATA port and identifies an ATA disk.
     ///
     /// Workspace allocations are retained by the returned driver. On a failed
@@ -329,8 +387,10 @@ impl<I: AhciIo> AhciDisk<I> {
             name: String::from("ahci"),
             ncq: false,
             poisoned: false,
+            ncq_error_tag: None,
             workspace_live: true,
             async_state: AsyncState::Idle,
+            physical_slots: [PhysicalSlot::EMPTY; AHCI_MAX_SLOTS],
             next_async_handle: 1,
             irq_enabled,
         };
@@ -514,10 +574,14 @@ impl<I: AhciIo> AhciDisk<I> {
     // upstream: ahci.c ahci_dmasetprd() and ahci_dmasetupc_cb()
     fn build_physical_sg_command(
         &mut self,
+        slot: usize,
         request: AtaRequest,
         segments: &[BlockPhysicalSegment],
     ) -> Result<bool, AhciDiskError> {
-        if segments.is_empty() || segments.len() > crate::MAX_PHYSICAL_COALESCED_SG {
+        if slot >= self.workspace().command_table_slots
+            || segments.is_empty()
+            || segments.len() > crate::MAX_PHYSICAL_COALESCED_SG
+        {
             return Err(AhciDiskError::InvalidRequest);
         }
         let (fis, attributes) =
@@ -552,29 +616,27 @@ impl<I: AhciIo> AhciDisk<I> {
         {
             return Err(AhciDiskError::InvalidRequest);
         }
-        let table = &self.workspace().command_table;
-        let table_capacity = table.len.saturating_sub(COMMAND_TABLE_HEADER_BYTES) / PRD_BYTES;
+        let table_capacity =
+            COMMAND_TABLE_SLOT_BYTES.saturating_sub(COMMAND_TABLE_HEADER_BYTES) / PRD_BYTES;
         if prd_count == 0 || prd_count > table_capacity {
             return Err(AhciDiskError::InvalidRequest);
         }
+        let table_offset = slot * COMMAND_TABLE_SLOT_BYTES;
         let ws = self.workspace_mut();
         // SAFETY: the command table/list are aligned owned DMA memory and the
         // PRDT capacity and caller-pinned ranges were validated above.
         unsafe {
-            ptr::write_bytes(ws.command_table.cpu.as_ptr(), 0, ws.command_table.len);
-            ptr::copy_nonoverlapping(fis.as_ptr(), ws.command_table.cpu.as_ptr(), fis.len());
+            let table = ws.command_table.cpu.as_ptr().add(table_offset);
+            ptr::write_bytes(table, 0, COMMAND_TABLE_SLOT_BYTES);
+            ptr::copy_nonoverlapping(fis.as_ptr(), table, fis.len());
             let mut prd_index = 0usize;
             for segment in segments {
                 let mut address = segment.paddr;
                 let mut remaining = segment.len;
                 while remaining != 0 {
                     let len = remaining.min(AHCI_PRD_MAX);
-                    let prd = ws
-                        .command_table
-                        .cpu
-                        .as_ptr()
-                        .add(COMMAND_TABLE_HEADER_BYTES + prd_index * PRD_BYTES)
-                        as *mut u32;
+                    let prd =
+                        table.add(COMMAND_TABLE_HEADER_BYTES + prd_index * PRD_BYTES) as *mut u32;
                     ptr::write_unaligned(prd.add(0), address as u32);
                     ptr::write_unaligned(prd.add(1), (address as u64 >> 32) as u32);
                     ptr::write_unaligned(prd.add(2), 0);
@@ -589,7 +651,7 @@ impl<I: AhciIo> AhciDisk<I> {
                     prd_index += 1;
                 }
             }
-            let header = ws.command_list.cpu.as_ptr();
+            let header = ws.command_list.cpu.as_ptr().add(slot * 32);
             ptr::write_unaligned(
                 header as *mut u16,
                 5 | if attributes.device_reads_buffer {
@@ -600,7 +662,10 @@ impl<I: AhciIo> AhciDisk<I> {
             );
             ptr::write_unaligned(header.add(2) as *mut u16, prd_count as u16);
             ptr::write_unaligned(header.add(4) as *mut u32, 0);
-            ptr::write_unaligned(header.add(8) as *mut u64, ws.command_table.bus);
+            ptr::write_unaligned(
+                header.add(8) as *mut u64,
+                ws.command_table.bus + table_offset as u64,
+            );
         }
         let base = self.port.register_base();
         self.controller.io_mut().write32(base + AHCI_P_IS, u32::MAX);
@@ -611,21 +676,32 @@ impl<I: AhciIo> AhciDisk<I> {
     }
 
     fn publish_command(&mut self, ncq: bool) {
-        // Publish coherent command/bounce writes before handing slot zero to
-        // the HBA. The x86 platform's DMA pages are cache coherent.
+        self.publish_slot_mask(1, ncq);
+    }
+
+    fn publish_slot_mask(&mut self, mask: u32, ncq: bool) {
+        // Publish coherent command writes before handing these slots to the
+        // HBA. The x86 platform's DMA pages are cache coherent.
         fence(Ordering::Release);
         let base = self.port.register_base();
         if ncq {
-            self.controller.io_mut().write32(base + AHCI_P_SACT, 1);
+            self.controller.io_mut().write32(base + AHCI_P_SACT, mask);
         }
-        self.controller.io_mut().write32(base + AHCI_P_CI, 1);
+        self.controller.io_mut().write32(base + AHCI_P_CI, mask);
     }
 
     // upstream: ahci.c ahci_ch_intr_main()
     fn sample_command(&mut self, ncq: bool) -> Option<Result<(), AhciDiskError>> {
+        self.sample_slot(0, ncq)
+    }
+
+    fn sample_slot(&mut self, slot: usize, ncq: bool) -> Option<Result<(), AhciDiskError>> {
+        let Some(slot_bit) = 1u32.checked_shl(slot as u32) else {
+            return Some(Err(AhciDiskError::InvalidRequest));
+        };
         let base = self.port.register_base();
-        let command_active = self.controller.io_mut().read32(base + AHCI_P_CI) & 1 != 0;
-        let ncq_active = ncq && self.controller.io_mut().read32(base + AHCI_P_SACT) & 1 != 0;
+        let command_active = self.controller.io_mut().read32(base + AHCI_P_CI) & slot_bit != 0;
+        let ncq_active = ncq && self.controller.io_mut().read32(base + AHCI_P_SACT) & slot_bit != 0;
         if command_active || ncq_active {
             return None;
         }
@@ -683,7 +759,7 @@ impl<I: AhciIo> AhciDisk<I> {
     /// FreeBSD `ahci_execute_transaction()`'s serialized completion path.
     // upstream: ahci.c ahci_execute_transaction()
     fn execute(&mut self, request: AtaRequest, data_len: usize) -> Result<(), AhciDiskError> {
-        if !matches!(self.async_state, AsyncState::Idle) {
+        if !matches!(self.async_state, AsyncState::Idle) || self.has_physical_work() {
             return Err(AhciDiskError::RequestPending);
         }
         let ncq = self.build_command(request, data_len)?;
@@ -691,7 +767,7 @@ impl<I: AhciIo> AhciDisk<I> {
     }
 
     fn execute_built(&mut self, ncq: bool) -> Result<(), AhciDiskError> {
-        if !matches!(self.async_state, AsyncState::Idle) {
+        if !matches!(self.async_state, AsyncState::Idle) || self.has_physical_work() {
             return Err(AhciDiskError::RequestPending);
         }
         self.publish_command(ncq);
@@ -737,7 +813,9 @@ impl<I: AhciIo> AhciDisk<I> {
     // upstream: ahci.c ahci_end_transaction() + ahci_issue_recovery()
     fn recover_command_error(&mut self, ncq: bool) -> bool {
         if ncq {
-            let _ = self.read_ncq_error_log();
+            self.ncq_error_tag = self.read_ncq_error_log();
+        } else {
+            self.ncq_error_tag = None;
         }
         let _ = self.controller.ahci_stop_fr(&self.port);
         if !self.controller.ahci_stop(&mut self.port) {
@@ -746,12 +824,12 @@ impl<I: AhciIo> AhciDisk<I> {
         self.recover_port()
     }
 
-    fn read_ncq_error_log(&mut self) -> bool {
+    fn read_ncq_error_log(&mut self) -> Option<u8> {
         if self.poisoned {
-            return false;
+            return None;
         }
         let Ok(ncq) = self.build_command(AtaRequest::ReadLogExt { pmp_port: 0 }, 512) else {
-            return false;
+            return None;
         };
         debug_assert!(!ncq);
         self.publish_command(false);
@@ -759,19 +837,17 @@ impl<I: AhciIo> AhciDisk<I> {
             let observed = self.controller.io_mut().interrupt_generation();
             if let Some(result) = self.sample_command(false) {
                 if result.is_err() {
-                    return false;
+                    return None;
                 }
                 let log = self.workspace().bounce.cpu.as_ptr();
                 // SAFETY: READ LOG EXT completed and DMA is quiescent.
                 let status = unsafe { ptr::read_volatile(log) };
-                let tag = status & 0x1f;
-                let nq = status & 0x80 != 0;
-                return !nq && tag == 0;
+                return ncq_error_log_tag(status);
             }
             self.wait_for_progress(observed);
         }
         self.timeout_command();
-        false
+        None
     }
 
     fn copy_segments_to_bounce(&mut self, segments: &[AsyncSegment], len: usize) {
@@ -818,8 +894,75 @@ impl<I: AhciIo> AhciDisk<I> {
 
     // upstream: ahci.c ahci_timeout() + ahci_end_transaction()
     fn reap_async(&mut self) -> bool {
+        let mut any_physical_completion = false;
+        let mut physical_error = None;
+        let mut physical_timeout = false;
+        for slot in 0..AHCI_MAX_SLOTS {
+            let Some(mut pending) = self.physical_slots[slot].pending else {
+                continue;
+            };
+            if let Some(result) = self.sample_slot(slot, self.ncq) {
+                match result {
+                    Ok(()) => {
+                        self.physical_slots[slot].pending = None;
+                        self.physical_slots[slot].completion = Some(BlockCompletion {
+                            handle: pending.handle,
+                            owner: BlockCompletionOwner::Physical,
+                            cookie: pending.cookie,
+                            status: BlockCompletionStatus::Success,
+                            bytes: pending.bytes as u32,
+                        });
+                        any_physical_completion = true;
+                    }
+                    Err(AhciDiskError::DeviceError(status)) => {
+                        physical_error = Some(status as u8);
+                        break;
+                    }
+                    Err(_) => {
+                        physical_error = Some(0xff);
+                        break;
+                    }
+                }
+                continue;
+            }
+            pending.polls += 1;
+            if pending.polls < COMMAND_TIMEOUT_POLLS {
+                self.physical_slots[slot].pending = Some(pending);
+            } else {
+                physical_timeout = true;
+                break;
+            }
+        }
+        if let Some(status) = physical_error {
+            let recovered = self.recover_command_error(self.ncq);
+            if !recovered {
+                self.poisoned = true;
+            }
+            self.finish_physical_after_port_reset(
+                if recovered {
+                    BlockCompletionStatus::DeviceError(status)
+                } else {
+                    BlockCompletionStatus::Quarantined
+                },
+                if recovered { self.ncq_error_tag } else { None },
+            );
+            return true;
+        }
+        if physical_timeout {
+            let stopped = self.timeout_command();
+            self.finish_physical_after_port_reset(
+                if stopped {
+                    BlockCompletionStatus::DeviceError(0xff)
+                } else {
+                    BlockCompletionStatus::Quarantined
+                },
+                None,
+            );
+            return true;
+        }
+
         let AsyncState::InFlight(mut pending) = self.async_state else {
-            return false;
+            return any_physical_completion;
         };
         if let Some(result) = self.sample_command(self.ncq && pending.op != BlockAsyncOp::Flush) {
             let status = match result {
@@ -871,6 +1014,30 @@ impl<I: AhciIo> AhciDisk<I> {
             bytes: 0,
         });
         true
+    }
+
+    fn finish_physical_after_port_reset(
+        &mut self,
+        status: BlockCompletionStatus,
+        failed_tag: Option<u8>,
+    ) {
+        for (slot_index, slot) in self.physical_slots.iter_mut().enumerate() {
+            if let Some(pending) = slot.pending.take() {
+                slot.completion = Some(BlockCompletion {
+                    handle: pending.handle,
+                    owner: BlockCompletionOwner::Physical,
+                    cookie: pending.cookie,
+                    status: if failed_tag.is_some_and(|tag| tag != slot_index as u8)
+                        && matches!(status, BlockCompletionStatus::DeviceError(_))
+                    {
+                        BlockCompletionStatus::DeviceError(0xff)
+                    } else {
+                        status
+                    },
+                    bytes: 0,
+                });
+            }
+        }
     }
 
     fn transfer_read(
@@ -1029,7 +1196,34 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         if requests.is_empty() {
             return Ok(BlockSubmitReport::default());
         }
+        if requests.len() > crate::MAX_PHYSICAL_BATCH_REQUESTS {
+            return Err(DevError::InvalidParam);
+        }
+        if !matches!(self.async_state, AsyncState::Idle) || self.has_physical_work() {
+            return Ok(BlockSubmitReport {
+                submitted: 0,
+                bytes: 0,
+                queue_full: true,
+            });
+        }
+        let range = self.physical_slot_range();
+        let mut occupied = self.physical_slots_mask();
+        let base = self.port.register_base();
+        occupied |= self.controller.io_mut().read32(base + AHCI_P_CI);
+        occupied |= self.controller.io_mut().read32(base + AHCI_P_SACT);
         if !matches!(self.async_state, AsyncState::Idle) {
+            occupied |= 1;
+        }
+        let mut free_slots = [usize::MAX; AHCI_MAX_SLOTS];
+        let mut slot_count = 0usize;
+        for slot in range {
+            if occupied & (1u32 << slot) == 0 {
+                free_slots[slot_count] = slot;
+                slot_count += 1;
+            }
+        }
+        let submitted = requests.len().min(slot_count);
+        if submitted == 0 {
             return Ok(BlockSubmitReport {
                 submitted: 0,
                 bytes: 0,
@@ -1037,70 +1231,94 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
             });
         }
         self.ensure_connected().map_err(map_error)?;
-        let request = &mut requests[0];
-        if request.op == BlockAsyncOp::Flush
-            || request.segments.is_empty()
-            || request.segments.len() > crate::MAX_PHYSICAL_COALESCED_SG
-        {
-            return Err(DevError::InvalidParam);
-        }
-        let bytes = request
-            .segments
-            .iter()
-            .try_fold(0usize, |sum, segment| sum.checked_add(segment.len))
-            .ok_or(DevError::InvalidParam)?;
-        if bytes == 0 || !bytes.is_multiple_of(self.geometry.block_size) {
-            return Err(DevError::InvalidParam);
-        }
-        let blocks = (bytes / self.geometry.block_size) as u64;
-        if request
-            .block_id
-            .checked_add(blocks)
-            .is_none_or(|end| end > self.geometry.blocks)
-        {
-            return Err(DevError::InvalidParam);
-        }
-        let sectors = u16::try_from(blocks).map_err(|_| DevError::InvalidParam)?;
-        let write = request.op == BlockAsyncOp::Write;
-        let ata = self.data_request(request.block_id, sectors, write);
-        let ncq = match self.build_physical_sg_command(ata, request.segments) {
-            Ok(ncq) => ncq,
-            Err(AhciDiskError::UnsupportedAddressWidth) => {
-                return Err(DevError::Unsupported);
+        let mut bytes_submitted = 0usize;
+        let mut mask = 0u32;
+        let mut pending = [None; AHCI_MAX_SLOTS];
+        let mut prepared_ids = [None; crate::MAX_PHYSICAL_BATCH_REQUESTS];
+        for (index, request) in requests.iter_mut().take(submitted).enumerate() {
+            if request.op == BlockAsyncOp::Flush
+                || request.segments.is_empty()
+                || request.segments.len() > crate::MAX_PHYSICAL_COALESCED_SG
+            {
+                return Err(DevError::InvalidParam);
             }
-            Err(error) => return Err(map_error(error)),
-        };
-        let raw = self.next_async_handle.max(1);
-        self.next_async_handle = raw.wrapping_add(1).max(1);
-        let handle = BlockRequestHandle { raw };
-        let cookie = raw;
-        request.handle = Some(handle);
-        request.cookie = Some(cookie);
-        let pending = PendingAsync {
-            handle,
-            owner: BlockCompletionOwner::Physical,
-            cookie,
-            op: request.op,
-            bytes,
-            segments: [AsyncSegment::EMPTY; MAX_ASYNC_SEGMENTS],
-            segment_count: 0,
-            polls: 0,
-        };
-        // Publish the pinned physical request owner before ringing CI; the
-        // caller must retain every physical segment until this handle completes.
-        self.async_state = AsyncState::InFlight(pending);
-        self.publish_command(ncq);
+            let bytes = request
+                .segments
+                .iter()
+                .try_fold(0usize, |sum, segment| sum.checked_add(segment.len))
+                .ok_or(DevError::InvalidParam)?;
+            if bytes == 0 || !bytes.is_multiple_of(self.geometry.block_size) {
+                return Err(DevError::InvalidParam);
+            }
+            let blocks = (bytes / self.geometry.block_size) as u64;
+            if request
+                .block_id
+                .checked_add(blocks)
+                .is_none_or(|end| end > self.geometry.blocks)
+            {
+                return Err(DevError::InvalidParam);
+            }
+            let sectors = u16::try_from(blocks).map_err(|_| DevError::InvalidParam)?;
+            let slot = free_slots[index];
+            let ata = self.data_request_tagged(
+                request.block_id,
+                sectors,
+                request.op == BlockAsyncOp::Write,
+                slot as u8,
+            );
+            let ncq = match self.build_physical_sg_command(slot, ata, request.segments) {
+                Ok(ncq) => ncq,
+                Err(AhciDiskError::UnsupportedAddressWidth) => {
+                    return Err(DevError::Unsupported);
+                }
+                Err(error) => return Err(map_error(error)),
+            };
+            debug_assert_eq!(ncq, self.ncq);
+            let raw = self.next_async_handle.max(1);
+            self.next_async_handle = raw.wrapping_add(1).max(1);
+            let handle = BlockRequestHandle { raw };
+            let cookie = raw;
+            prepared_ids[index] = Some((handle, cookie));
+            pending[slot] = Some(PendingPhysical {
+                handle,
+                cookie,
+                bytes,
+                polls: 0,
+            });
+            mask |= 1u32 << slot;
+            bytes_submitted = bytes_submitted
+                .checked_add(bytes)
+                .ok_or(DevError::InvalidParam)?;
+        }
+        for slot in 0..AHCI_MAX_SLOTS {
+            if let Some(pending) = pending[slot] {
+                self.physical_slots[slot] = PhysicalSlot {
+                    pending: Some(pending),
+                    completion: None,
+                };
+            }
+        }
+        for (request, ids) in requests.iter_mut().take(submitted).zip(prepared_ids) {
+            if let Some((handle, cookie)) = ids {
+                request.handle = Some(handle);
+                request.cookie = Some(cookie);
+            }
+        }
+        // Publish every handle/cookie and slot owner before one CI doorbell.
+        self.publish_slot_mask(mask, self.ncq);
         Ok(BlockSubmitReport {
-            submitted: 1,
-            bytes,
-            queue_full: requests.len() > 1,
+            submitted,
+            bytes: bytes_submitted,
+            queue_full: submitted < requests.len(),
         })
     }
 
     fn async_queue_caps(&self) -> Option<BlockQueueCaps> {
+        let slots = self.physical_slot_range().count().max(1);
         (!self.poisoned).then_some(BlockQueueCaps {
-            max_requests: 1,
-            max_descriptors: 1,
+            max_requests: slots,
+            max_descriptors: slots
+                * ((COMMAND_TABLE_SLOT_BYTES - COMMAND_TABLE_HEADER_BYTES) / PRD_BYTES),
             supports_indirect: false,
             supports_event_idx: false,
             default_depth: 1,
@@ -1115,7 +1333,7 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         if requests.is_empty() {
             return Ok(BlockSubmitReport::default());
         }
-        if !matches!(self.async_state, AsyncState::Idle) {
+        if !matches!(self.async_state, AsyncState::Idle) || self.has_physical_work() {
             return Ok(BlockSubmitReport {
                 submitted: 0,
                 bytes: 0,
@@ -1222,16 +1440,29 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
             return Ok(BlockCompletionDrain::default());
         }
         self.reap_async();
+        let mut completed = 0usize;
         if let AsyncState::Complete(completion) = self.async_state {
-            output[0] = completion;
+            output[completed] = completion;
+            completed += 1;
             self.async_state = AsyncState::Idle;
-            Ok(BlockCompletionDrain {
-                completed: 1,
-                continuation: false,
-            })
-        } else {
-            Ok(BlockCompletionDrain::default())
         }
+        for slot in &mut self.physical_slots {
+            if completed == output.len() {
+                break;
+            }
+            if let Some(completion) = slot.completion.take() {
+                output[completed] = completion;
+                completed += 1;
+            }
+        }
+        let continuation = self
+            .physical_slots
+            .iter()
+            .any(|slot| slot.completion.is_some());
+        Ok(BlockCompletionDrain {
+            completed,
+            continuation,
+        })
     }
 
     fn poll_async_complete(&mut self, budget: usize) -> DevResult<usize> {
@@ -1239,12 +1470,20 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
             return Ok(0);
         }
         self.reap_async();
+        let mut completed = 0usize;
         if matches!(self.async_state, AsyncState::Complete(_)) {
             self.async_state = AsyncState::Idle;
-            Ok(1)
-        } else {
-            Ok(0)
+            completed += 1;
         }
+        for slot in &mut self.physical_slots {
+            if completed == budget {
+                break;
+            }
+            if slot.completion.take().is_some() {
+                completed += 1;
+            }
+        }
+        Ok(completed)
     }
 
     fn install_completion_notifier(
@@ -1305,6 +1544,26 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         let mut failed = false;
         for handle in handles {
             loop {
+                if let Some(slot) = self
+                    .physical_slots
+                    .iter_mut()
+                    .find(|slot| slot.completion.is_some_and(|c| c.handle == *handle))
+                {
+                    let completion = slot.completion.take().expect("completion was matched");
+                    failed |= completion.status != BlockCompletionStatus::Success;
+                    break;
+                }
+                if self
+                    .physical_slots
+                    .iter()
+                    .any(|slot| slot.pending.is_some_and(|p| p.handle == *handle))
+                {
+                    let observed = self.controller.io_mut().interrupt_generation();
+                    if !self.reap_async() {
+                        self.wait_for_progress(observed);
+                    }
+                    continue;
+                }
                 match self.async_state {
                     AsyncState::InFlight(pending) if pending.handle == *handle => {
                         let observed = self.controller.io_mut().interrupt_generation();
@@ -1391,12 +1650,16 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
 
 impl<I: AhciIo> AhciDisk<I> {
     fn data_request(&self, lba: u64, sectors: u16, write: bool) -> AtaRequest {
+        self.data_request_tagged(lba, sectors, write, 0)
+    }
+
+    fn data_request_tagged(&self, lba: u64, sectors: u16, write: bool, tag: u8) -> AtaRequest {
         if self.ncq {
             AtaRequest::Fpdma {
                 lba,
                 sectors,
                 write,
-                tag: 0,
+                tag,
                 pmp_port: 0,
             }
         } else {
@@ -1510,7 +1773,7 @@ impl<I: AhciIo> AhciDisk<I> {
         segments: &[BlockPhysicalSegment],
         write: bool,
     ) -> DevResult<BlockPhysicalSgOutcome> {
-        if !matches!(self.async_state, AsyncState::Idle) {
+        if !matches!(self.async_state, AsyncState::Idle) || self.has_physical_work() {
             return Ok(BlockPhysicalSgOutcome::NotSubmitted);
         }
         let mut bytes = 0usize;
@@ -1535,7 +1798,7 @@ impl<I: AhciIo> AhciDisk<I> {
         };
         self.ensure_connected().map_err(map_error)?;
         let request = self.data_request(block_id, sectors, write);
-        let ncq = match self.build_physical_sg_command(request, segments) {
+        let ncq = match self.build_physical_sg_command(0, request, segments) {
             Ok(ncq) => ncq,
             Err(AhciDiskError::UnsupportedAddressWidth) => {
                 return Ok(BlockPhysicalSgOutcome::NotSubmitted);
@@ -1561,6 +1824,15 @@ fn map_error(error: AhciDiskError) -> DevError {
         AhciDiskError::RequestPending => DevError::ResourceBusy,
         AhciDiskError::NoDevice => DevError::Io,
         _ => DevError::BadState,
+    }
+}
+
+// upstream: ahci.c ahci_process_read_log() NQ bit and failing NCQ tag
+const fn ncq_error_log_tag(status: u8) -> Option<u8> {
+    if status & 0x80 == 0 {
+        Some(status & 0x1f)
+    } else {
+        None
     }
 }
 
@@ -1613,7 +1885,11 @@ mod tests {
                 },
             ];
             let request = disk.data_request(4, 2, false);
-            assert!(!disk.build_physical_sg_command(request, &segments).unwrap());
+            assert!(
+                !disk
+                    .build_physical_sg_command(0, request, &segments)
+                    .unwrap()
+            );
             let ws = disk.workspace();
             // SAFETY: the descriptor list was just initialized in the live
             // test-owned DMA page and is read using aligned AHCI dword fields.
@@ -1676,7 +1952,7 @@ mod tests {
                 requests[0].cookie,
                 requests[0].handle.map(|handle| handle.raw)
             );
-            assert!(matches!(disk.async_state, AsyncState::InFlight(_)));
+            assert!(disk.physical_slots[0].pending.is_some());
             let mut completion = [BlockCompletion {
                 handle: BlockRequestHandle::default(),
                 owner: BlockCompletionOwner::Ordinary,
@@ -1689,6 +1965,84 @@ mod tests {
             assert_eq!(completion[0].owner, BlockCompletionOwner::Physical);
             assert_eq!(completion[0].status, BlockCompletionStatus::Success);
             assert_eq!(completion[0].bytes, 1024);
+        });
+    }
+
+    #[test]
+    fn ncq_error_log_tag_obeys_nq_flag_and_tag_mask() {
+        assert_eq!(ncq_error_log_tag(0x65), Some(5));
+        assert_eq!(ncq_error_log_tag(0x85), None);
+    }
+
+    #[test]
+    fn ncq_physical_batch_publishes_distinct_slots_and_drains_all_completions() {
+        with_fake_disk(|disk, _| {
+            disk.ncq = true;
+            disk.geometry.ncq = true;
+            disk.geometry.ncq_queue_depth = 4;
+            disk.controller.io_mut().auto_complete = true;
+            assert_eq!(
+                BlockDriverOps::async_queue_caps(disk).unwrap().max_requests,
+                4
+            );
+            let first_segments = [BlockPhysicalSegment {
+                paddr: 0x8000,
+                len: 512,
+            }];
+            let second_segments = [BlockPhysicalSegment {
+                paddr: 0x9000,
+                len: 512,
+            }];
+            let mut requests = [
+                BlockPhysicalRequest {
+                    block_id: 2,
+                    op: BlockAsyncOp::Read,
+                    segments: &first_segments,
+                    handle: None,
+                    cookie: None,
+                },
+                BlockPhysicalRequest {
+                    block_id: 9,
+                    op: BlockAsyncOp::Write,
+                    segments: &second_segments,
+                    handle: None,
+                    cookie: None,
+                },
+            ];
+            // SAFETY: both ranges are only recorded by the fake HBA.
+            let report = unsafe { disk.submit_physical_batch(&mut requests).unwrap() };
+            assert_eq!(report.submitted, 2);
+            assert_eq!(report.bytes, 1024);
+            assert_eq!(requests[0].handle, Some(BlockRequestHandle { raw: 1 }));
+            assert_eq!(requests[1].handle, Some(BlockRequestHandle { raw: 2 }));
+            let command_list = disk.workspace().command_list.cpu.as_ptr();
+            // SAFETY: the test owns the 1 KiB-aligned command list and slots
+            // one and two were populated by the submission above.
+            unsafe {
+                assert_eq!(
+                    ptr::read_unaligned(command_list.add(32 + 8) as *const u64),
+                    0x4000
+                );
+                assert_eq!(
+                    ptr::read_unaligned(command_list.add(64 + 8) as *const u64),
+                    0x5000
+                );
+            }
+            let mut completions = [BlockCompletion {
+                handle: BlockRequestHandle::default(),
+                owner: BlockCompletionOwner::Ordinary,
+                cookie: 0,
+                status: BlockCompletionStatus::DeviceError(0),
+                bytes: 0,
+            }; 2];
+            let drain = disk.drain_async_completions(&mut completions).unwrap();
+            assert_eq!(drain.completed, 2);
+            assert!(!drain.continuation);
+            assert!(completions.iter().all(|c| {
+                c.owner == BlockCompletionOwner::Physical
+                    && c.status == BlockCompletionStatus::Success
+                    && c.bytes == 512
+            }));
         });
     }
 
@@ -1766,6 +2120,7 @@ mod tests {
                 self.registers[offset / 4] = 0;
             } else if offset == AHCI_OFFSET + AHCI_P_CI && self.auto_complete {
                 self.registers[offset / 4] = 0;
+                self.registers[(AHCI_OFFSET + AHCI_P_SACT) / 4] = 0;
             } else {
                 self.registers[offset / 4] = value;
             }
@@ -1775,13 +2130,9 @@ mod tests {
     }
 
     fn with_fake_disk(f: impl FnOnce(&mut AhciDisk<FakeIo>, *mut u8)) {
-        let mut pages = [
-            Page([0; 4096]),
-            Page([0; 4096]),
-            Page([0; 4096]),
-            Page([0; 4096]),
-        ];
-        // SAFETY: these four aligned pages remain live in this stack frame
+        let mut pages = [Page([0; 4096]), Page([0; 4096]), Page([0; 4096])];
+        let mut table_pages: [Page; AHCI_MAX_SLOTS] = core::array::from_fn(|_| Page([0; 4096]));
+        // SAFETY: these aligned DMA regions remain live in this stack frame
         // until the closure and disk teardown finish.
         let command_list = unsafe {
             DmaRegion::borrowed(NonNull::new(pages[0].0.as_mut_ptr()).unwrap(), 0x1000, 4096)
@@ -1790,9 +2141,13 @@ mod tests {
             DmaRegion::borrowed(NonNull::new(pages[1].0.as_mut_ptr()).unwrap(), 0x2000, 4096)
         };
         let command_table = unsafe {
-            DmaRegion::borrowed(NonNull::new(pages[2].0.as_mut_ptr()).unwrap(), 0x3000, 4096)
+            DmaRegion::borrowed(
+                NonNull::new(table_pages[0].0.as_mut_ptr()).unwrap(),
+                0x3000,
+                COMMAND_TABLE_SLOT_BYTES * AHCI_MAX_SLOTS,
+            )
         };
-        let bounce_ptr = pages[3].0.as_mut_ptr();
+        let bounce_ptr = pages[2].0.as_mut_ptr();
         let bounce =
             unsafe { DmaRegion::borrowed(NonNull::new(bounce_ptr).unwrap(), 0x4000, 4096) };
         let workspace =
@@ -1828,8 +2183,10 @@ mod tests {
             name: String::from("sda"),
             ncq: false,
             poisoned: false,
+            ncq_error_tag: None,
             workspace_live: true,
             async_state: AsyncState::Idle,
+            physical_slots: [PhysicalSlot::EMPTY; AHCI_MAX_SLOTS],
             next_async_handle: 1,
             irq_enabled: false,
         };
