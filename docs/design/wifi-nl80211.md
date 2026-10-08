@@ -81,3 +81,17 @@ both returned empty output, then the guest reached the test marker. The first
 command-file attempt used `/usr/bin/iw` (the APK stages it in `/usr/sbin`) and
 did not invoke either utility; the corrected acceptance run is the one that
 counts.
+
+### WPA3-SAE boundary
+
+SAE is not admitted or advertised. The pinned wpa_supplicant 2.11 nl80211
+backend starts SAE through a separate `NL80211_CMD_AUTHENTICATE` request with
+`NL80211_AUTHTYPE_SAE` and `NL80211_ATTR_SAE_DATA`, then submits a separate
+`NL80211_CMD_ASSOCIATE` request with the RSN IE. The current station adapter
+only implements `CONNECT` and owns its Open-System / WPA2-PSK exchange; it has
+no AUTHENTICATE/ASSOCIATE request and response path, no SAE frame exchange or
+anti-clogging-token retry state, and no nl80211 SAE external-auth event loop.
+Accepting the SAE AKM bit alone would therefore falsely report support and
+leave the authentication state machine unusable. SAE remains rejected until
+that separate MLME path can be implemented end-to-end. The source audit used
+`driver_nl80211.c` at wpa_supplicant 2.11 commit `5460547`.
