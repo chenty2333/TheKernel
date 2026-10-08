@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use crate::{
     CsrAccess, DmaAllocator, DmaError, DmaRegion, InterruptMasks, IwxRegisters, disable_interrupts,
-    enable_interrupts,
+    enable_interrupts, restore_interrupts,
 };
 
 pub const ICT_SIZE_BYTES: usize = 4096;
@@ -18,7 +18,6 @@ pub const ICT_ENTRY_COUNT: usize = ICT_SIZE_BYTES / 4;
 pub const ICT_ADDRESS_SHIFT: u32 = 12;
 
 const CSR_INT: u32 = 0x008;
-const CSR_INT_MASK: u32 = 0x00c;
 const CSR_FH_INT_STATUS: u32 = 0x010;
 const CSR_DRAM_INT_TBL: u32 = 0x0a0;
 const CSR_DRAM_INT_TBL_ENABLE: u32 = 1 << 31;
@@ -316,7 +315,7 @@ pub fn service_legacy_interrupt<B: CsrAccess, R: DmaRegion>(
     let use_ict = ict.is_some();
     let (host_status, flow_status) = if let Some(ict) = ict {
         let Some(causes) = ict.drain()? else {
-            registers.write_csr(CSR_INT_MASK, masks.interrupt_mask);
+            restore_interrupts(registers, masks);
             return Ok(None);
         };
         (causes, 0)
@@ -342,7 +341,7 @@ pub fn service_legacy_interrupt<B: CsrAccess, R: DmaRegion>(
         registers.write_csr8(CSR_INT_PERIODIC_REG, CSR_INT_PERIODIC_ENABLED);
     }
     if work.restore_interrupts {
-        registers.write_csr(CSR_INT_MASK, masks.interrupt_mask);
+        restore_interrupts(registers, masks);
     }
     Ok(Some(work))
 }
@@ -442,7 +441,7 @@ mod tests {
         assert_eq!(ict.current, 0);
         let writes = registers.into_inner().0;
         assert!(writes.contains(&(CSR_INT, u32::MAX)));
-        assert_eq!(writes.last().unwrap().0, CSR_INT_MASK);
+        assert_eq!(writes.last().unwrap().0, 0x00c);
     }
 
     #[test]

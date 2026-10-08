@@ -13,9 +13,11 @@ pub const SCD_QUEUE_CONFIG_CMD: u8 = 0x17;
 pub const DATA_PATH_GROUP: u8 = 0x05;
 pub const DQA_QUEUE_ADD: u32 = 0;
 pub const DQA_QUEUE_REMOVE: u32 = 1;
+pub const DQA_CMD_QUEUE: u8 = 0;
+pub const MGMT_TID: u8 = 15;
 pub const TX_QUEUE_CFG_ENABLE_QUEUE: u16 = 1;
 pub const DEFAULT_QUEUE_SIZE: usize = 256;
-const CMD_VERSION_UNKNOWN: u8 = 99;
+pub const CMD_VERSION_UNKNOWN: u8 = 99;
 const COMMAND_QUEUE_ID: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

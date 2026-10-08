@@ -72,6 +72,7 @@ pub struct IwxController<B: CsrAccess, A: DmaAllocator> {
     pub family: DeviceFamily,
     pub interrupt_masks: InterruptMasks,
     pub command_slots: crate::CommandSlots,
+    pub tx_queue_state: crate::TxQueueState,
     pub pnvm_dma: Option<PnvmDmaImage<A::Region>>,
     pub rx_replay_windows: [crate::CcmpReplayWindow; 9],
     pub rx_duplicates: RxDuplicateState,
@@ -101,6 +102,7 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             family,
             interrupt_masks: InterruptMasks::default(),
             command_slots: crate::CommandSlots::new(0, generation),
+            tx_queue_state: crate::TxQueueState::default(),
             pnvm_dma: None,
             rx_replay_windows: [crate::CcmpReplayWindow::new(); 9],
             rx_duplicates: RxDuplicateState::new(),
@@ -386,6 +388,98 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             crate::command_response_status(completed.response.as_deref().unwrap_or(&[]), false)
                 .map_err(SyncCommandError::Command)?;
         Ok((completed, status))
+    }
+
+    /// Enable the dedicated non-QoS management queue after DQA command queue zero.
+    // upstream: if_iwx.c iwx_enable_mgmt_queue()
+    pub fn enable_management_queue(
+        &mut self,
+        command_version: u8,
+    ) -> Result<(), crate::TxQueueError<SyncCommandError<core::convert::Infallible>>> {
+        let queue_id = (crate::DQA_CMD_QUEUE + 1) as usize;
+        let (config, write_pointer) =
+            {
+                let ring = self.resources.tx_queues.get_mut(queue_id).ok_or(
+                    crate::TxQueueError::Queue(crate::QueueError::InvalidQueueId),
+                )?;
+                ring.reset()
+                    .map_err(|error| crate::TxQueueError::Queue(crate::QueueError::Ring(error)))?;
+                (
+                    crate::QueueConfig {
+                        station_id: crate::STATION_ID,
+                        queue_id: queue_id as u8,
+                        tid: crate::MGMT_TID,
+                        ring_size: crate::DEFAULT_QUEUE_SIZE,
+                        byte_count_address: ring.byte_counts.device_address(),
+                        tfd_address: ring.descriptors.device_address(),
+                    },
+                    ring.current_hardware as u16,
+                )
+            };
+        let command = crate::scheduler_queue_command(command_version, config, true, 0)
+            .map_err(|error| crate::TxQueueError::Queue(error))?;
+        let response = self
+            .send_encoded_command_wait(&command, None, |_, _| {
+                Ok::<_, core::convert::Infallible>(true)
+            })
+            .map_err(crate::TxQueueError::Send)?
+            .response
+            .ok_or(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidResponse,
+            ))?;
+        crate::validate_enable_response(&response, queue_id as u8, write_pointer)
+            .map_err(|error| crate::TxQueueError::Queue(error))?;
+        self.tx_queue_state.enabled_mask |= 1 << queue_id;
+        self.tx_queue_state.tid[queue_id] = crate::MGMT_TID;
+        Ok(())
+    }
+
+    /// Remove the management queue only when legacy firmware requires explicit removal.
+    // upstream: if_iwx.c iwx_disable_mgmt_queue()
+    pub fn disable_management_queue(
+        &mut self,
+        command_version: u8,
+    ) -> Result<bool, crate::TxQueueError<SyncCommandError<core::convert::Infallible>>> {
+        if command_version == 0 || command_version == crate::QUEUE_CMD_VERSION_UNKNOWN {
+            return Ok(false);
+        }
+        let queue_id = (crate::DQA_CMD_QUEUE + 1) as usize;
+        let ring = self
+            .resources
+            .tx_queues
+            .get(queue_id)
+            .ok_or(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidQueueId,
+            ))?;
+        let config = crate::QueueConfig {
+            station_id: crate::STATION_ID,
+            queue_id: queue_id as u8,
+            tid: crate::MGMT_TID,
+            ring_size: crate::DEFAULT_QUEUE_SIZE,
+            byte_count_address: ring.byte_counts.device_address(),
+            tfd_address: ring.descriptors.device_address(),
+        };
+        let command = crate::scheduler_queue_command(command_version, config, false, 0)
+            .map_err(crate::TxQueueError::Queue)?;
+        let response = self
+            .send_encoded_command_wait(&command, None, |_, _| {
+                Ok::<_, core::convert::Infallible>(true)
+            })
+            .map_err(crate::TxQueueError::Send)?
+            .response
+            .ok_or(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidResponse,
+            ))?;
+        if response.len() < 8 {
+            return Err(crate::TxQueueError::Queue(
+                crate::QueueError::InvalidResponse,
+            ));
+        }
+        self.tx_queue_state.enabled_mask &= !(1 << queue_id);
+        self.resources.tx_queues[queue_id]
+            .reset()
+            .map_err(|error| crate::TxQueueError::Queue(crate::QueueError::Ring(error)))?;
+        Ok(true)
     }
 
     /// Decode an RX_MPDU descriptor and apply the source decrypt/replay/duplicate gates.
@@ -801,6 +895,39 @@ mod tests {
         assert!(completed.response.is_none());
         assert!(completed.external_payload_released);
         assert_eq!(controller.command_slots.queued(), 0);
+    }
+
+    #[test]
+    fn management_queue_uses_non_qos_tid_and_checks_firmware_assignment() {
+        let allocator = Allocator(Cell::new(0x250000));
+        let mut controller =
+            IwxController::attach(Bus::default(), allocator, DeviceFamily::Ax210, 0x300000, 10)
+                .unwrap();
+        controller
+            .resources
+            .rx_queue
+            .status
+            .write_at(0, &[1, 0])
+            .unwrap();
+        controller
+            .resources
+            .rx_queue
+            .used_descriptors
+            .write_at(4, &[0, 0])
+            .unwrap();
+        let mut packet = alloc::vec![0; 16];
+        packet[..4].copy_from_slice(&12u32.to_le_bytes());
+        packet[4..8].copy_from_slice(&[0x17, 5, 0, 0]);
+        packet[8..10].copy_from_slice(&1u16.to_le_bytes());
+        packet[12..14].copy_from_slice(&0u16.to_le_bytes());
+        controller.resources.rx_queue.buffers[0]
+            .write_at(0, &packet)
+            .unwrap();
+
+        controller.enable_management_queue(0).unwrap();
+        assert_ne!(controller.tx_queue_state.enabled_mask & (1 << 1), 0);
+        assert_eq!(controller.tx_queue_state.tid[1], crate::MGMT_TID);
+        assert_eq!(controller.resources.tx_queues[1].queued, 0);
     }
 
     #[test]

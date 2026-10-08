@@ -48,6 +48,7 @@ mod rx_mpdu;
 mod rx_packet;
 mod scan;
 mod scan_probe;
+mod session;
 mod spectrum;
 mod startup;
 mod state;
@@ -144,7 +145,7 @@ pub use init_cmd::{
 pub use interrupts::{
     InterruptMasks, configure_msix_hardware, disable_interrupts, enable_firmware_load_interrupts,
     enable_interrupts, enable_rfkill_interrupts, hardware_rfkill, initialize_msix_hardware,
-    start_firmware,
+    restore_interrupts, start_firmware,
 };
 pub use intr::{
     ICT_ADDRESS_SHIFT, ICT_ENTRY_COUNT, ICT_SIZE_BYTES, IctError, InterruptCauseTable,
@@ -207,14 +208,16 @@ pub use power::{
     POWER_UAPSD_MISBEHAVING_ENABLE, PowerApplyError, PowerCommands, PowerConfig, PowerError,
     UAPSD_RX_DATA_TIMEOUT, UAPSD_TX_DATA_TIMEOUT, WMM_AC_BE, WMM_AC_BK, WMM_AC_MASK, WMM_AC_VI,
     WMM_AC_VO, WMM_SP_2, WMM_SP_4, WMM_SP_6, WMM_SP_ALL, WMM_SP_MASK, apply_power_commands,
-    beacon_filter_command, build_power_commands, set_beacon_filter, uapsd_ac_flags, uapsd_ac_mask,
-    uapsd_qndp_tid, uapsd_service_period, update_beacon_abort,
+    beacon_filter_command, build_power_commands, disable_beacon_filter, enable_beacon_filter,
+    set_beacon_filter, uapsd_ac_flags, uapsd_ac_mask, uapsd_qndp_tid, uapsd_service_period,
+    update_beacon_abort,
 };
 pub use queue::{
-    DATA_PATH_GROUP as TX_DATA_PATH_GROUP, DEFAULT_QUEUE_SIZE, DQA_QUEUE_ADD, DQA_QUEUE_REMOVE,
-    QueueConfig, QueueError, SCD_QUEUE_CONFIG_CMD, TX_QUEUE_CFG_ENABLE_QUEUE, TxQueueError,
-    TxQueueState, disable_tx_queue, dqa_queue_command, enable_tx_queue, legacy_queue_command,
-    queue_cb_size, scheduler_queue_command, validate_enable_response,
+    CMD_VERSION_UNKNOWN as QUEUE_CMD_VERSION_UNKNOWN, DATA_PATH_GROUP as TX_DATA_PATH_GROUP,
+    DEFAULT_QUEUE_SIZE, DQA_CMD_QUEUE, DQA_QUEUE_ADD, DQA_QUEUE_REMOVE, MGMT_TID, QueueConfig,
+    QueueError, SCD_QUEUE_CONFIG_CMD, TX_QUEUE_CFG_ENABLE_QUEUE, TxQueueError, TxQueueState,
+    disable_tx_queue, dqa_queue_command, enable_tx_queue, legacy_queue_command, queue_cb_size,
+    scheduler_queue_command, validate_enable_response,
 };
 pub use rate::{
     HtRateCapabilities, HtRateSet, MCS_TO_RATE_INDEX, PeerTxRateState, RATES, Rate, TLC_CHAIN_A,
@@ -276,6 +279,12 @@ pub use scan_probe::{
     PROBE_REQUEST_WIRE_BYTES, ProbeRequestConfig, ProbeRequestError, ProbeSegment,
     SUPPORTED_RATES_IE, ScanProbeRequest, VHT_CAPABILITIES_IE, build_scan_probe_request,
     encode_scan_probe_request,
+};
+pub use session::{
+    MAC_CONF_GROUP as SESSION_MAC_CONF_GROUP, SESSION_PROTECT_ACTION_ADD,
+    SESSION_PROTECT_ACTION_REMOVE, SESSION_PROTECT_ASSOC, SESSION_PROTECTION_COMMAND,
+    SESSION_PROTECTION_PAYLOAD_BYTES, SessionProtectionError, SessionProtectionState,
+    schedule_session_protection, unprotect_session,
 };
 pub use spectrum::{
     SF_CONFIG_BYTES, SF_CONFIG_COMMAND, SF_FULL_ON, SF_INIT_OFF, SF_LONG_DELAY_AGING,

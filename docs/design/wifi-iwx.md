@@ -103,6 +103,9 @@ through the not-yet-published net80211/netdev adapter.
 Firmware/NVM antenna masks now produce the driver's source HT/VHT MCS and STBC
 capabilities, and standard/UHB PHY_CONTEXT_CMD v3/v4 layouts have separate
 builders selected by the source dispatcher.
+Controller helpers now cover the non-QoS management queue's qid/TID lifecycle,
+the PDU/status command wrappers, association session-protection add/remove,
+and the legacy interrupt-mask restore path.
 The firmware-event classifier covers the remaining UAPSD, thermal, MCC,
 session-protection, channel-switch, statistics, RLC/TLC, and ignorable command
 branches so the platform dispatcher can apply side effects without losing ACKs.

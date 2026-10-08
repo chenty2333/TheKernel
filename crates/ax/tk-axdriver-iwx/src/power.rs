@@ -441,7 +441,6 @@ pub fn beacon_filter_command(
 }
 
 /// Enable/disable filtering, recording state only after successful send.
-// upstream: if_iwx.c iwx_enable_beacon_filter() / iwx_disable_beacon_filter()
 pub fn set_beacon_filter<E>(
     state: &mut BeaconFilterState,
     enabled: bool,
@@ -454,6 +453,28 @@ pub fn set_beacon_filter<E>(
     send(&command).map_err(BeaconFilterError::Send)?;
     state.filter_enabled = enabled;
     Ok(())
+}
+
+/// Enable beacon filtering after RUN configuration.
+// upstream: if_iwx.c iwx_enable_beacon_filter()
+pub fn enable_beacon_filter<E>(
+    state: &mut BeaconFilterState,
+    slot: u8,
+    queue: u8,
+    send: impl FnMut(&EncodedCommand) -> Result<(), E>,
+) -> Result<(), BeaconFilterError<E>> {
+    set_beacon_filter(state, true, slot, queue, send)
+}
+
+/// Disable beacon filtering, preserving the prior state when command send fails.
+// upstream: if_iwx.c iwx_disable_beacon_filter()
+pub fn disable_beacon_filter<E>(
+    state: &mut BeaconFilterState,
+    slot: u8,
+    queue: u8,
+    send: impl FnMut(&EncodedCommand) -> Result<(), E>,
+) -> Result<(), BeaconFilterError<E>> {
+    set_beacon_filter(state, false, slot, queue, send)
 }
 
 /// Toggle beacon abort only when filtering is active; record the flag before

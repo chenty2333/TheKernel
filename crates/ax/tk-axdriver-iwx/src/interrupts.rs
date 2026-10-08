@@ -145,6 +145,12 @@ pub fn disable_interrupts<B: CsrAccess>(registers: &mut IwxRegisters<B>, masks: 
     }
 }
 
+/// Restore the legacy host interrupt mask after an acknowledged cause.
+// upstream: if_iwx.c iwx_restore_interrupts()
+pub fn restore_interrupts<B: CsrAccess>(registers: &mut IwxRegisters<B>, masks: &InterruptMasks) {
+    registers.write_csr(CSR_INT_MASK, masks.interrupt_mask);
+}
+
 /// Clear stale status, stop pending work, initialize the NIC, and arm ALIVE.
 // upstream: if_iwx.c iwx_start_fw()
 pub fn start_firmware<B: CsrAccess, E>(
