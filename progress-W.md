@@ -39,4 +39,5 @@
 - REMOVE_STA and ordered station removal/queue disable/BA teardown state cleanup are translated (`94f16612`).
 - UMAC scan channel-fill functions v1-v4 and v5 now apply valid channel caps, band layouts, PSD and iteration defaults (`27b8e9ab`).
 - `iwx_fill_probe_req()` now creates bounded 802.11 probe header, SSID placeholder, rates/extended-rates, DS, VHT and shared HT IE segments (`dce823d5`).
+- UMAC scan v14/v17 requests now assemble general/dwell policy, fixed channel arrays, probe segments, direct SSID and async/background semantics (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

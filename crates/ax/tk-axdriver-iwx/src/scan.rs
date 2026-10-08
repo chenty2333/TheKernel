@@ -7,7 +7,10 @@
 
 use alloc::vec::Vec;
 
-use crate::{CHAN_2GHZ, ChannelInfo, CommandError, EncodedCommand, HostCommand};
+use crate::{
+    CHAN_2GHZ, CMD_ASYNC, ChannelInfo, CommandError, EncodedCommand, HostCommand,
+    ProbeRequestConfig, ProbeRequestError, build_scan_probe_request, encode_scan_probe_request,
+};
 
 pub const LONG_GROUP: u8 = 1;
 pub const UMAC_SCAN_REQ: u8 = 0x0d;
@@ -17,6 +20,41 @@ pub const SCAN_BAND_5GHZ: u8 = 0;
 pub const SCAN_BAND_24GHZ: u8 = 1;
 pub const SCAN_BAND_FLAG_SHIFT: u32 = 30;
 pub const SCAN_PASSIVE_MAX_PSD: u8 = 0x80;
+pub const SCAN_PRIORITY_EXT_6: u32 = 6;
+pub const SCAN_ENABLE_CHANNEL_ORDER: u8 = 1 << 5;
+pub const SCAN_GEN_PASS_ALL: u16 = 1 << 1;
+pub const SCAN_GEN_NOTIFY_ITER_COMPLETE: u16 = 1 << 2;
+pub const SCAN_GEN_ADAPTIVE_DWELL: u16 = 1 << 7;
+pub const SCAN_GEN_FORCE_PASSIVE: u16 = 1 << 11;
+pub const SCAN_MAX_CHANNELS: usize = 67;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UmacScanVersion {
+    V14,
+    V17,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UmacScanConfig<'a> {
+    pub version: UmacScanVersion,
+    pub background: bool,
+    pub channels: &'a [ChannelInfo],
+    pub firmware_channel_limit: usize,
+    pub extended_channel_version: bool,
+    pub channel_flags: u32,
+    pub probe: ProbeRequestConfig<'a>,
+    pub desired_ssid: &'a [u8],
+    pub slot: u8,
+    pub command_queue: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UmacScanError {
+    TooManySsids,
+    AllocationFailed,
+    Probe(ProbeRequestError),
+    Command(CommandError),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanChannelConfig {
@@ -112,6 +150,162 @@ pub fn fill_umac_scan_channels_v5(
         });
     }
     result
+}
+
+/// Build the complete SCAN_REQ_UMAC v14/v17 command and its fixed arrays.
+// upstream: if_iwx.c iwx_umac_scan_v14() / iwx_umac_scan_v17()
+pub fn build_umac_scan_request(
+    config: UmacScanConfig<'_>,
+) -> Result<EncodedCommand, UmacScanError> {
+    if config.desired_ssid.len() > 32 {
+        return Err(UmacScanError::TooManySsids);
+    }
+    let channels = match config.version {
+        UmacScanVersion::V14 => fill_umac_scan_channels(
+            config.channels,
+            SCAN_MAX_CHANNELS,
+            config.firmware_channel_limit,
+            config.extended_channel_version,
+            config.channel_flags | u32::from(!config.desired_ssid.is_empty()),
+        )
+        .len(),
+        UmacScanVersion::V17 => fill_umac_scan_channels_v5(
+            config.channels,
+            SCAN_MAX_CHANNELS,
+            config.firmware_channel_limit,
+            config.channel_flags | u32::from(!config.desired_ssid.is_empty()),
+        )
+        .len(),
+    };
+    let valid_count = config
+        .channels
+        .iter()
+        .filter(|channel| channel.flags != 0)
+        .count()
+        .min(SCAN_MAX_CHANNELS)
+        .min(config.firmware_channel_limit);
+    if channels != valid_count {
+        return Err(UmacScanError::AllocationFailed);
+    }
+    let expected_size = 8 + 36 + 540 + 12 + 1344;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(expected_size)
+        .map_err(|_| UmacScanError::AllocationFailed)?;
+    payload.resize(expected_size, 0);
+    put_u32(&mut payload, 0, 0); // scan UID
+    put_u32(&mut payload, 4, SCAN_PRIORITY_EXT_6);
+    let general = 8;
+    let force_passive = config.desired_ssid.is_empty();
+    let gen_flags = SCAN_GEN_PASS_ALL
+        | SCAN_GEN_NOTIFY_ITER_COMPLETE
+        | SCAN_GEN_ADAPTIVE_DWELL
+        | if force_passive {
+            SCAN_GEN_FORCE_PASSIVE
+        } else {
+            0
+        };
+    put_u16(&mut payload, general, gen_flags);
+    payload[general + 4] = 10;
+    payload[general + 5] = 10;
+    payload[general + 6] = 2;
+    payload[general + 7] = 8;
+    payload[general + 8] = 10;
+    put_u16(
+        &mut payload,
+        general + 10,
+        if config.background { 100 } else { 300 },
+    );
+    let max_out_of_time = if config.background { 120u32 } else { 0 };
+    for lmac in 0..2 {
+        put_u32(&mut payload, general + 12 + lmac * 4, max_out_of_time);
+        put_u32(&mut payload, general + 20 + lmac * 4, max_out_of_time);
+        payload[general + 32 + lmac] = 110;
+    }
+    put_u32(&mut payload, general + 28, SCAN_PRIORITY_EXT_6);
+    let channel_params = general + 36;
+    payload[channel_params] = SCAN_ENABLE_CHANNEL_ORDER;
+    payload[channel_params + 1] = channels as u8;
+    payload[channel_params + 2] = 10;
+    payload[channel_params + 3] = 2;
+    match config.version {
+        UmacScanVersion::V14 => {
+            let channel_configs = fill_umac_scan_channels(
+                config.channels,
+                SCAN_MAX_CHANNELS,
+                config.firmware_channel_limit,
+                config.extended_channel_version,
+                config.channel_flags | u32::from(!config.desired_ssid.is_empty()),
+            );
+            write_v1_v4_channels(&mut payload, channel_params + 4, &channel_configs);
+        }
+        UmacScanVersion::V17 => {
+            let channel_configs = fill_umac_scan_channels_v5(
+                config.channels,
+                SCAN_MAX_CHANNELS,
+                config.firmware_channel_limit,
+                config.channel_flags | u32::from(!config.desired_ssid.is_empty()),
+            );
+            write_v5_channels(&mut payload, channel_params + 4, &channel_configs);
+        }
+    }
+    let periodic = channel_params + 540;
+    payload[periodic + 2] = 1; // first schedule: one iteration.
+    let probe_params = periodic + 12;
+    let probe = build_scan_probe_request(config.probe).map_err(UmacScanError::Probe)?;
+    let encoded_probe = encode_scan_probe_request(&probe);
+    payload[probe_params..probe_params + encoded_probe.len()].copy_from_slice(&encoded_probe);
+    if !config.desired_ssid.is_empty() {
+        let direct_ssid = probe_params + encoded_probe.len() + 4;
+        payload[direct_ssid] = 0;
+        payload[direct_ssid + 1] = config.desired_ssid.len() as u8;
+        payload[direct_ssid + 2..direct_ssid + 2 + config.desired_ssid.len()]
+            .copy_from_slice(config.desired_ssid);
+    }
+    let command = HostCommand {
+        id: (u32::from(LONG_GROUP) << 8) | u32::from(UMAC_SCAN_REQ),
+        flags: if config.background { CMD_ASYNC } else { 0 },
+        response_capacity: 0,
+        parts: &[&payload],
+    };
+    EncodedCommand::encode(&command, config.slot, config.command_queue)
+        .map_err(UmacScanError::Command)
+}
+
+fn write_v1_v4_channels(payload: &mut [u8], offset: usize, channels: &[ScanChannelConfig]) {
+    for (index, channel) in channels.iter().enumerate() {
+        let at = offset + index * 8;
+        put_u32(payload, at, channel.flags);
+        if let Some(band) = channel.band {
+            payload[at + 4] = channel.channel_num;
+            payload[at + 5] = band;
+            payload[at + 6] = channel.iter_count;
+            payload[at + 7] = channel.iter_interval as u8;
+        } else {
+            payload[at + 4] = channel.channel_num;
+            payload[at + 5] = channel.iter_count;
+            payload[at + 6..at + 8].copy_from_slice(&channel.iter_interval.to_le_bytes());
+        }
+    }
+}
+
+fn write_v5_channels(payload: &mut [u8], offset: usize, channels: &[ScanChannelConfigV5]) {
+    for (index, channel) in channels.iter().enumerate() {
+        let at = offset + index * 8;
+        put_u32(payload, at, channel.flags);
+        payload[at + 4] = channel.channel_num;
+        payload[at + 5] = channel.psd_20;
+        payload[at + 6] = channel.iter_count;
+        payload[at + 7] = channel.iter_interval;
+    }
+}
+
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 /// Current driver flags and net80211 state that `iwx_scan()` mutates.
@@ -221,7 +415,7 @@ mod tests {
     use core::cell::RefCell;
 
     use super::*;
-    use crate::CHAN_A;
+    use crate::{CHAN_A, PROBE_REQUEST_WIRE_BYTES};
 
     #[test]
     fn scan_abort_command_has_source_wide_id_and_zero_payload() {
@@ -285,6 +479,97 @@ mod tests {
                 iter_count: 1,
                 iter_interval: 0
             }]
+        );
+    }
+
+    fn full_scan_config<'a>(
+        version: UmacScanVersion,
+        channels: &'a [ChannelInfo],
+        ssid: &'a [u8],
+        background: bool,
+    ) -> UmacScanConfig<'a> {
+        UmacScanConfig {
+            version,
+            background,
+            channels,
+            firmware_channel_limit: 64,
+            extended_channel_version: true,
+            channel_flags: 0,
+            probe: ProbeRequestConfig {
+                station_address: [0, 1, 2, 3, 4, 5],
+                rates_2ghz: &[2, 4, 11, 22],
+                rates_5ghz: &[12, 24, 48],
+                supports_5ghz: true,
+                include_ds_parameter: true,
+                vht_capabilities_ie: None,
+                ht_capabilities_ie: None,
+            },
+            desired_ssid: ssid,
+            slot: 2,
+            command_queue: 0,
+        }
+    }
+
+    #[test]
+    fn umac_scan_v14_and_v17_build_fixed_request_arrays_and_async_flags() {
+        let channels = [
+            ChannelInfo {
+                channel: 1,
+                frequency_mhz: 2412,
+                flags: CHAN_2GHZ,
+                extended_flags: 0,
+            },
+            ChannelInfo {
+                channel: 36,
+                frequency_mhz: 5180,
+                flags: CHAN_A,
+                extended_flags: 0,
+            },
+        ];
+        let ssid = b"hidden";
+        let v14 = build_umac_scan_request(full_scan_config(
+            UmacScanVersion::V14,
+            &channels,
+            ssid,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            v14.wire_id,
+            (u32::from(LONG_GROUP) << 8) | u32::from(UMAC_SCAN_REQ)
+        );
+        assert_eq!(v14.flags, 0);
+        assert_eq!(v14.bytes.len(), 8 + 8 + 36 + 540 + 12 + 1344);
+        assert_eq!(
+            u16::from_le_bytes(v14.bytes[16..18].try_into().unwrap()),
+            SCAN_GEN_PASS_ALL | SCAN_GEN_NOTIFY_ITER_COMPLETE | SCAN_GEN_ADAPTIVE_DWELL
+        );
+        assert_eq!(v14.bytes[8 + 45], 2);
+        assert_eq!(v14.bytes[8 + 48 + 4], 1);
+        assert_eq!(v14.bytes[8 + 48 + 5], SCAN_BAND_24GHZ);
+        let probe_params = 8 + 8 + 36 + 540 + 12;
+        let direct_ssid = probe_params + PROBE_REQUEST_WIRE_BYTES + 4;
+        assert_eq!(
+            &v14.bytes[direct_ssid..direct_ssid + 8],
+            &[0, 6, b'h', b'i', b'd', b'd', b'e', b'n']
+        );
+
+        let v17 =
+            build_umac_scan_request(full_scan_config(UmacScanVersion::V17, &channels, &[], true))
+                .unwrap();
+        assert_eq!(v17.flags, CMD_ASYNC);
+        assert_eq!(
+            u16::from_le_bytes(v17.bytes[16..18].try_into().unwrap()),
+            SCAN_GEN_PASS_ALL
+                | SCAN_GEN_NOTIFY_ITER_COMPLETE
+                | SCAN_GEN_ADAPTIVE_DWELL
+                | SCAN_GEN_FORCE_PASSIVE
+        );
+        assert_eq!(v17.bytes[8 + 48 + 5], SCAN_PASSIVE_MAX_PSD);
+        assert_ne!(
+            u32::from_le_bytes(v17.bytes[8 + 48..8 + 52].try_into().unwrap())
+                & (1 << SCAN_BAND_FLAG_SHIFT),
+            0
         );
     }
 

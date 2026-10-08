@@ -168,15 +168,19 @@ pub use rx_packet::{
 };
 pub use scan::{
     LONG_GROUP as IWX_LONG_GROUP, SCAN_BAND_5GHZ, SCAN_BAND_24GHZ, SCAN_BAND_FLAG_SHIFT,
-    SCAN_PASSIVE_MAX_PSD, ScanChannelConfig, ScanChannelConfigV5, ScanError, ScanState,
-    UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ, abort_scan, begin_background_scan,
-    begin_foreground_scan, end_scan, fill_umac_scan_channels, fill_umac_scan_channels_v5,
+    SCAN_ENABLE_CHANNEL_ORDER, SCAN_GEN_ADAPTIVE_DWELL, SCAN_GEN_FORCE_PASSIVE,
+    SCAN_GEN_NOTIFY_ITER_COMPLETE, SCAN_GEN_PASS_ALL, SCAN_MAX_CHANNELS, SCAN_PASSIVE_MAX_PSD,
+    SCAN_PRIORITY_EXT_6, ScanChannelConfig, ScanChannelConfigV5, ScanError, ScanState,
+    UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ, UmacScanConfig, UmacScanError,
+    UmacScanVersion, abort_scan, begin_background_scan, begin_foreground_scan,
+    build_umac_scan_request, end_scan, fill_umac_scan_channels, fill_umac_scan_channels_v5,
     scan_abort_command,
 };
 pub use scan_probe::{
     DS_PARAMETER_IE, EXTENDED_RATES_IE, HT_CAPABILITIES_IE, PROBE_REQUEST_BYTES,
-    ProbeRequestConfig, ProbeRequestError, ProbeSegment, SUPPORTED_RATES_IE, ScanProbeRequest,
-    VHT_CAPABILITIES_IE, build_scan_probe_request,
+    PROBE_REQUEST_WIRE_BYTES, ProbeRequestConfig, ProbeRequestError, ProbeSegment,
+    SUPPORTED_RATES_IE, ScanProbeRequest, VHT_CAPABILITIES_IE, build_scan_probe_request,
+    encode_scan_probe_request,
 };
 pub use station::{
     ADD_STA_COMMAND, FlushedQueue, REMOVE_STA_COMMAND, STA_FLAG_AGG_DENSITY_MASK,
