@@ -182,7 +182,7 @@ pub(crate) fn probe(
     let nic = match E1000Nic::<PlatformHal, RING_SIZE>::new(
         mmio,
         size,
-        false,
+        mac_type.igb_advanced_queues(),
         matches!(mac_type, E1000MacType::Pch2Lan),
     ) {
         Ok(nic) => nic,

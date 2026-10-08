@@ -2317,6 +2317,187 @@ pub fn em_fw_version_locked<A: super::nvm::E1000NvmAccess>(
     version
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EmLinkState {
+    #[default]
+    Down,
+    DownResetPending,
+    Up,
+    UpResetPending,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmAdminStatus {
+    pub link: EmLinkState,
+    pub speed_mbps: u16,
+    pub full_duplex: bool,
+    pub smartspeed: u8,
+    pub phy_hang_count: u8,
+    pub device_reset_detected: bool,
+    pub device_reset_pending: bool,
+    pub promisc_pending: bool,
+    pub stats_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmAdminConfig {
+    pub mac: E1000MacType,
+    pub media: EmMediaType,
+    pub get_link_status: bool,
+    pub serdes_has_link: bool,
+    pub media_changed: bool,
+    pub i210_phy_id_match: bool,
+}
+
+pub trait EmAdminOps {
+    fn handle_fatal_error(&mut self) -> DevResult<bool>;
+    fn handle_promisc_and_vfs(&mut self, promisc_pending: bool) -> DevResult;
+    fn check_link(&mut self, media: EmMediaType) -> DevResult<bool>;
+    fn configure_link_up(&mut self) -> DevResult;
+    fn delay_pch_spt_link_check(&mut self);
+    fn delay_i210_phy_update(&mut self);
+    fn get_speed_duplex(&mut self) -> DevResult<(u16, bool)>;
+    fn read_thermal_status(&mut self) -> DevResult<(u32, u32)>;
+    fn request_reset(&mut self);
+    fn defer_admin(&mut self);
+    fn publish_link(&mut self, up: bool, speed_mbps: u16);
+    fn automask_tso(&mut self) -> bool;
+    fn ping_all_vfs(&mut self);
+    fn update_stats(&mut self) -> DevResult;
+    fn check_82574_phy_hang(&mut self) -> DevResult<bool>;
+    fn restore_82571_laa(&mut self) -> DevResult;
+    fn has_82571_laa(&mut self) -> bool;
+    fn run_smartspeed(&mut self) -> DevResult;
+}
+
+/// upstream: if_em.c em_if_update_admin_status()
+pub fn em_if_update_admin_status<O: EmAdminOps>(
+    ops: &mut O,
+    state: &mut EmAdminStatus,
+    config: &mut EmAdminConfig,
+) -> DevResult {
+    if ops.handle_fatal_error()? {
+        return Ok(());
+    }
+    if state.device_reset_detected {
+        if state.link == EmLinkState::Up {
+            ops.publish_link(false, 0);
+        }
+        state.speed_mbps = 0;
+        state.full_duplex = false;
+        state.link = EmLinkState::DownResetPending;
+        state.device_reset_detected = false;
+        state.device_reset_pending = true;
+        ops.request_reset();
+        ops.defer_admin();
+        return Ok(());
+    }
+    if state.device_reset_pending {
+        return Ok(());
+    }
+
+    let promisc_pending = core::mem::take(&mut state.promisc_pending);
+    ops.handle_promisc_and_vfs(promisc_pending)?;
+    if config.media == EmMediaType::Copper
+        && config.get_link_status
+        && config.mac == E1000MacType::PchSpt
+    {
+        ops.delay_pch_spt_link_check();
+    }
+    let link_check = match config.media {
+        EmMediaType::Copper if !config.get_link_status => true,
+        EmMediaType::Copper | EmMediaType::Fiber | EmMediaType::InternalSerdes => {
+            ops.check_link(config.media)?
+        }
+    };
+    let link_check = if config.media == EmMediaType::InternalSerdes {
+        config.serdes_has_link
+    } else {
+        link_check
+    };
+    let (thstat, ctrl) = if config.mac == E1000MacType::I350 {
+        ops.read_thermal_status()?
+    } else {
+        (0, 0)
+    };
+    if link_check
+        && matches!(
+            state.link,
+            EmLinkState::Down | EmLinkState::DownResetPending
+        )
+    {
+        let reset_pending = state.link == EmLinkState::DownResetPending;
+        (state.speed_mbps, state.full_duplex) = ops.get_speed_duplex()?;
+        state.link = EmLinkState::Up;
+        if config.media == EmMediaType::Copper && config.get_link_status {
+            ops.configure_link_up()?;
+        }
+        state.smartspeed = 0;
+        // I350 thermal throttling status is sampled alongside link-up.
+        let _thermal_downshift = config.mac == E1000MacType::I350
+            && ctrl & 0x00c0_0000 == 0x0040_0000
+            && thstat & 0x0000_0001 != 0;
+        if matches!(config.mac, E1000MacType::I210 | E1000MacType::I211) && config.i210_phy_id_match
+        {
+            ops.delay_i210_phy_update();
+        }
+        let mut reset_requested = false;
+        if config.media_changed && config.mac >= E1000MacType::I82575 {
+            config.media_changed = false;
+            reset_requested = true;
+            ops.request_reset();
+            ops.defer_admin();
+        }
+        if config.mac < E1000MacType::I82575 {
+            reset_requested |= ops.automask_tso();
+        }
+        if reset_pending || reset_requested {
+            state.link = EmLinkState::UpResetPending;
+        } else {
+            ops.publish_link(true, state.speed_mbps);
+        }
+        ops.ping_all_vfs();
+    } else if !link_check && matches!(state.link, EmLinkState::Up | EmLinkState::UpResetPending) {
+        let was_published = state.link == EmLinkState::Up;
+        let reset_pending = state.link == EmLinkState::UpResetPending;
+        state.speed_mbps = 0;
+        state.full_duplex = false;
+        state.link = if reset_pending {
+            EmLinkState::DownResetPending
+        } else {
+            EmLinkState::Down
+        };
+        if was_published {
+            ops.publish_link(false, 0);
+        }
+        ops.ping_all_vfs();
+    }
+    if state.stats_pending {
+        state.stats_pending = false;
+        ops.update_stats()?;
+        if config.mac == E1000MacType::I82574 {
+            if ops.check_82574_phy_hang()? {
+                state.phy_hang_count = state.phy_hang_count.saturating_add(1);
+            } else {
+                state.phy_hang_count = 0;
+            }
+            if state.phy_hang_count > 1 {
+                state.phy_hang_count = 0;
+                ops.request_reset();
+                ops.defer_admin();
+                return Ok(());
+            }
+        }
+    }
+    if config.mac == E1000MacType::I82571 && ops.has_82571_laa() {
+        ops.restore_82571_laa()?;
+    }
+    if config.mac < E1000MacType::I82571 {
+        ops.run_smartspeed()?;
+    }
+    Ok(())
+}
+
 pub trait EmRxUnitOps {
     fn initialize_rss(&mut self) -> DevResult;
     fn initialize_advanced_rx_rings(&mut self, drop: bool) -> DevResult;
@@ -3743,6 +3924,72 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct AdminMock {
+        link_up: bool,
+        fatal: bool,
+        phy_hang: bool,
+        publications: Vec<(bool, u16)>,
+        resets: usize,
+        defers: usize,
+        stats: usize,
+        configured: usize,
+        smartspeed: usize,
+    }
+    impl EmAdminOps for AdminMock {
+        fn handle_fatal_error(&mut self) -> DevResult<bool> {
+            Ok(self.fatal)
+        }
+        fn handle_promisc_and_vfs(&mut self, _promisc_pending: bool) -> DevResult {
+            Ok(())
+        }
+        fn delay_pch_spt_link_check(&mut self) {}
+        fn check_link(&mut self, _media: EmMediaType) -> DevResult<bool> {
+            Ok(self.link_up)
+        }
+        fn configure_link_up(&mut self) -> DevResult {
+            self.configured += 1;
+            Ok(())
+        }
+        fn delay_i210_phy_update(&mut self) {}
+        fn get_speed_duplex(&mut self) -> DevResult<(u16, bool)> {
+            Ok((1000, true))
+        }
+        fn read_thermal_status(&mut self) -> DevResult<(u32, u32)> {
+            Ok((0, 0))
+        }
+        fn request_reset(&mut self) {
+            self.resets += 1;
+        }
+        fn defer_admin(&mut self) {
+            self.defers += 1;
+        }
+        fn publish_link(&mut self, up: bool, speed_mbps: u16) {
+            self.publications.push((up, speed_mbps));
+        }
+        fn automask_tso(&mut self) -> bool {
+            false
+        }
+        fn ping_all_vfs(&mut self) {}
+        fn update_stats(&mut self) -> DevResult {
+            self.stats += 1;
+            Ok(())
+        }
+        fn check_82574_phy_hang(&mut self) -> DevResult<bool> {
+            Ok(self.phy_hang)
+        }
+        fn restore_82571_laa(&mut self) -> DevResult {
+            Ok(())
+        }
+        fn has_82571_laa(&mut self) -> bool {
+            false
+        }
+        fn run_smartspeed(&mut self) -> DevResult {
+            self.smartspeed += 1;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
     struct FirmwareNvmMock(BTreeMap<u16, u16>);
     impl super::super::nvm::E1000NvmAccess for FirmwareNvmMock {
         fn read_nvm_words(&mut self, offset: u16, words: u16) -> DevResult<alloc::vec::Vec<u16>> {
@@ -4017,5 +4264,36 @@ mod tests {
             (version.eep_major, version.eep_minor, version.eep_build),
             (1, 0x23, 4)
         );
+    }
+
+    #[test]
+    fn admin_status_publishes_transitions_and_gates_reset() {
+        let mut ops = AdminMock {
+            link_up: true,
+            ..AdminMock::default()
+        };
+        let mut state = EmAdminStatus {
+            stats_pending: true,
+            ..EmAdminStatus::default()
+        };
+        let mut config = EmAdminConfig {
+            mac: E1000MacType::I82540,
+            media: EmMediaType::Copper,
+            get_link_status: true,
+            serdes_has_link: false,
+            media_changed: false,
+            i210_phy_id_match: false,
+        };
+        em_if_update_admin_status(&mut ops, &mut state, &mut config).unwrap();
+        assert_eq!(state.link, EmLinkState::Up);
+        assert_eq!(state.speed_mbps, 1000);
+        assert_eq!(ops.publications, [(true, 1000)]);
+        assert_eq!((ops.configured, ops.stats, ops.smartspeed), (1, 1, 1));
+
+        state.device_reset_detected = true;
+        em_if_update_admin_status(&mut ops, &mut state, &mut config).unwrap();
+        assert_eq!(state.link, EmLinkState::DownResetPending);
+        assert_eq!((ops.resets, ops.defers), (1, 1));
+        assert_eq!(ops.publications.last(), Some(&(false, 0)));
     }
 }
