@@ -681,3 +681,7 @@ crate's `LICENSE-MIT` file.
 `tk-intel-display/src/intel_dp_link_training_full.rs` translates the applicable
 DisplayPort link-training protocol functions in `intel_dp_link_training.c` (MIT,
 Copyright © 2008-2015 Intel). Its grant is included in `LICENSE-MIT`.
+
+`tk-intel-display/src/intel_gmbus_full.rs` translates 30 protocol and GPIO
+functions from `intel_gmbus.c` (MIT, © 2006 Dave Airlie and © 2006-2008,
+2010 Intel). The full grant is preserved in the module header and `LICENSE-MIT`.
