@@ -44,7 +44,7 @@ SCAN_BASELINE: dict[tuple[str, int], tuple[int, ...]] = {
     # `crates/ax` at 25 is 4 `nullfs.rs` lines plus 14 smoltcp RFC bit-ruler rows
     # that Linux headers reprint from the same IETF figures: read the `crates/ax`
     # section of `docs/upstream-provenance.md` before counting these as text.
-    ("crates/ax", 25): (18, 15, 4, 129, 118, 0, 0),
+    ("crates/ax", 25): (18, 15, 4, 130, 119, 0, 0),
 }
 
 # Cites the auditor reaches per scope, which is how many ranges sit next to their

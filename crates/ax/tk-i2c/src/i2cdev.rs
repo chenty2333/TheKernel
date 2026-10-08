@@ -1,6 +1,8 @@
 //! Linux i2c-dev ioctl ABI values and x86_64 wire layouts.
 //! The ioctl numbers/layouts follow Linux's stable I2C UAPI; controller
 //! behavior is implemented by the translated FreeBSD ig4 iicbus backend.
+//! UAPI reference: Linux `include/uapi/linux/i2c.h` (GPL-2.0-or-later WITH
+//! Linux-syscall-note); no Linux i2c-dev implementation body is copied.
 
 pub const I2C_RETRIES: u32 = 0x0701;
 pub const I2C_TIMEOUT: u32 = 0x0702;

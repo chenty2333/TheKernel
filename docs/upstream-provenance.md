@@ -940,7 +940,7 @@ this does not itself open general Mesa batches or establish GPU execution.
   target block/line/minimum-DDB demand is no worse; the same-profile method2
   argument covers SAGV equal latencies. Actual latency is not guessed/read.
   Conventional WM oracle shims add5 code matches at25 and2 at40; current
-  crates/ax totals25=(18,15,4,129,118,0,0),40=(0,0,0,95,88,0,0).
+  crates/ax totals25=(18,15,4,130,119,0,0),40=(0,0,0,95,88,0,0).
   Combined Intel display+GT inventory101/80, with no scanner exemptions.
 
 - Powered TC HDMI signal programming: tc.rs ports Linux7.2.3 MIT
@@ -1008,3 +1008,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 | Bluetooth Core standard Read BD_ADDR, Read Local Supported Features, Read Buffer Size commands | Bluetooth Core specification | `crates/ax/tk-bt-hci/src/lib.rs`, `crates/ax/tk-axdriver/src/usb/bluetooth.rs`, `kernel/src/file/bluetooth.rs` | On HCI device up, caches controller address, feature bitmap, and ACL/SCO buffer limits for HCIGETDEVINFO; failure leaves the last/default cache unchanged. |
 | FreeBSD `sys/dev/bluetooth/iwmbtfw/iwmbt_hw.c` `iwmbt_patch_fwfile()` expected events | BSD-2-Clause | `crates/ax/tk-bt-hci/src/lib.rs` | Validates both HCI event code and expected payload, bounds returned transfer length, and accounts successful command/event transfers in device statistics. |
 | Bluetooth HCI monitor packet framing | Bluetooth Core and Linux HCI monitor UAPI semantics | `crates/ax/tk-bt-hci/src/lib.rs`, `crates/ax/tk-axdriver/src/usb/bluetooth.rs`, `kernel/src/file/bluetooth.rs` | Variable monitor records now retain a complete maximum-size 1028-byte ACL frame rather than truncating to the former 266-byte capture buffer. |
+| Linux `include/uapi/linux/i2c.h` (`GPL-2.0-or-later WITH Linux-syscall-note`) SMBus capability bits | Linux I2C UAPI only; no `drivers/i2c` or hwmon implementation copied | `crates/ax/tk-i2c/src/i2cdev.rs` | `/dev/i2c-N` functionality mask uses the defined SMBus read-word capability; one normalized code-line scan match is an incidental match to the same bitwise term used by Linux drivers. |
