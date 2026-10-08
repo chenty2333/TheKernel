@@ -324,6 +324,10 @@ pub trait SdhciIo: Send + Sync {
         false
     }
 
+    fn interrupt_signal_usable(&self) -> bool {
+        true
+    }
+
     fn interrupt_generation(&self) -> Option<u64> {
         None
     }
@@ -2431,6 +2435,9 @@ impl<I: SdhciIo> SdhciDisk<I> {
         if host.clock_hz == 0 {
             let target = host.base_clock_hz.min(25_000_000);
             host.set_clock(target)?;
+        }
+        if host.io.has_interrupt() && host.io.interrupt_signal_usable() {
+            let _ = host.set_interrupts_enabled(true);
         }
         let cid = if mmc {
             decode_mmc_cid(raw_cid, ext_csd.is_some())

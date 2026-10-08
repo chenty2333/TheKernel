@@ -33,9 +33,8 @@ shared INTx. Each endpoint acknowledges its device status before publishing a
 monotonic generation and invoking registered nonblocking completion notifiers.
 The block driver's `enable_irq`/`disable_irq` operations control the device
 source; status polling remains bounded fallback. SDHCI keeps signal generation
-disabled during card enumeration and synchronous command polling because the
-QEMU SDHCI INTx path loses command status when enabled during initialization;
-clients may opt in after initialization. QEMU verification observed AHCI MSI
-and SDHCI firmware-routed INTx admission, and guest partition/mkfs/read/write
-passed with polling fallback. Physical-device interrupt delivery is not
-verified.
+disabled during enumeration, then enables it when the endpoint is usable; the
+QEMU 1b36:0007 device is explicitly marked signal-broken because its INTx path
+loses command status. QEMU observed AHCI MSI and SDHCI firmware-routed INTx
+admission, and guest partition/mkfs/read/write passed with the QEMU polling
+fallback. Physical-device interrupt delivery is not verified.

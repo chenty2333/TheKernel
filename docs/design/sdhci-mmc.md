@@ -98,6 +98,7 @@ QEMU SD card passed guest GPT creation, `BLKRRPART`, guest `mkfs.ext4`, mount,
 write/read, unmount, and `SDHCI_PARTITION_MKFS_RW_OK`. A controller worker now
 retries empty slots and re-runs card enumeration after card insertion; the
 shared media worker withdraws absent cards and partitions. Physical card-swap
-acceptance remains unverified. Enabling SDHCI INTx signaling on QEMU 1b36:0007
-lost CMD17 completions, so signaling remains disabled by default and command
-completion uses bounded status polling.
+acceptance remains unverified. SDHCI enables routed signaling after card
+enumeration when the PCI adapter considers the route usable. The QEMU 1b36:0007
+model is marked signal-broken because enabling INTx loses CMD17 completions;
+that device retains bounded status polling as fallback.

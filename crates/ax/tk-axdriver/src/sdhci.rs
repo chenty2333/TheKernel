@@ -172,8 +172,9 @@ fn quirks_for_device(vendor_id: u16, device_id: u16) -> u32 {
     if vendor_id == QEMU_SDHCI_VID && device_id == QEMU_SDHCI_DID {
         // QEMU 1b36:0007 advertises DMA but CMD17 fails to reach the card with
         // the current SDMA path. Keep this known virtual model on PIO so the
-        // storage acceptance remains deterministic; physical controllers use
-        // SDMA when they advertise it and have no broken-DMA quirk.
+        // storage acceptance remains deterministic. This virtual function's
+        // INTx handler can consume SDHCI status before CMD17 polling observes
+        // it; signal masking is tracked by the PCI window adapter.
         upstream | axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_DMA
     } else {
         upstream
@@ -234,6 +235,10 @@ fn dma_supported(capabilities: u32, quirks: u32) -> bool {
         || quirks & axdriver_block::sdhci::SDHCI_QUIRK_FORCE_DMA != 0
 }
 
+fn irq_signal_usable(vendor_id: u16, device_id: u16) -> bool {
+    !(vendor_id == QEMU_SDHCI_VID && device_id == QEMU_SDHCI_DID)
+}
+
 unsafe fn free_sdma_buffer(cpu: NonNull<u8>, pages: usize) {
     global_allocator().dealloc_pages(cpu.as_ptr() as usize, pages, UsageKind::Dma);
 }
@@ -269,6 +274,7 @@ struct SdhciWindow {
     size: usize,
     irq: Option<PciBlockInterrupt>,
     irq_context: Option<&'static SdhciIrqContext>,
+    irq_signal_usable: bool,
 }
 
 struct SdhciHotplugSlot {
@@ -358,6 +364,10 @@ impl SdhciIo for SdhciWindow {
         self.irq.is_some()
     }
 
+    fn interrupt_signal_usable(&self) -> bool {
+        self.irq_signal_usable
+    }
+
     fn interrupt_generation(&self) -> Option<u64> {
         self.irq.as_ref().map(PciBlockInterrupt::generation)
     }
@@ -437,6 +447,7 @@ fn probe_slot(
         size,
         irq: None,
         irq_context: Some(irq_context),
+        irq_signal_usable: irq_signal_usable(info.vendor_id, info.device_id),
     };
     // Keep a firmware-left signal mask from asserting a PCI line before the
     // acknowledgment endpoint is installed.
@@ -724,6 +735,8 @@ mod tests {
         assert_eq!(decode_slot_info(0x25), (3, 5));
         assert_eq!(decode_slot_info(u8::MAX), (1, 0));
         assert_eq!(decode_slot_info(0x0f), (1, 0));
+        assert!(!irq_signal_usable(QEMU_SDHCI_VID, QEMU_SDHCI_DID));
+        assert!(irq_signal_usable(0x8086, 0x54c4));
     }
 
     #[test]
