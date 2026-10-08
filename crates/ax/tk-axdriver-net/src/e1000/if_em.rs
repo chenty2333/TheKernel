@@ -4,9 +4,15 @@
 //! Copyright (c) 2001-2024, Intel Corporation; copyright (c) 2016 Nicole
 //! Graziano; copyright (c) 2024 Kevin Bowling.
 
+use alloc::collections::BTreeMap;
+
 use axdriver_base::{DevError, DevResult};
 
-use super::{api::E1000MacType, osdep::E1000RegisterIo, registers::*};
+use super::{
+    api::{self, E1000MacType},
+    osdep::{E1000PciConfig, E1000RegisterIo},
+    registers::*,
+};
 
 const ITR_RATE_DIVIDEND: u64 = 1_000_000_000;
 const ITR_RATE_MULTIPLIER: u64 = 256;
@@ -40,6 +46,11 @@ pub struct EmErrorStats {
     pub uncorrected_pcie: u64,
     pub corrected_lan_mng_fifo: u64,
 }
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EmHardwareStats {
+    pub counters: BTreeMap<u32, u64>,
+    pub pause_frames: bool,
+}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TsoAutoMask {
     pub capability_enabled: bool,
@@ -67,6 +78,94 @@ pub enum EmInterruptType {
     Msi,
     Msix,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmHardwareIdentity {
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub revision_id: u8,
+    pub subsystem_vendor_id: u16,
+    pub subsystem_device_id: u16,
+    pub mac: E1000MacType,
+    pub is_vf: bool,
+}
+pub trait EmPciBusmaster {
+    fn command(&mut self) -> DevResult<u16>;
+    fn enable_busmaster(&mut self) -> DevResult;
+    fn disable_busmaster(&mut self) -> DevResult;
+    fn wait_pending_transactions(&mut self, timeout_ms: u32) -> bool;
+    fn max_completion_timeout_us(&mut self) -> u32;
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmIrqDisposition {
+    Stray,
+    Handled,
+    ScheduleThread,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmIrqActions {
+    pub disposition: Option<EmIrqDisposition>,
+    pub link_admin: bool,
+    pub fatal_error_captured: bool,
+    pub overrun: bool,
+    pub interrupt_disabled: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmIrqConfig {
+    pub mac: E1000MacType,
+    pub vf: bool,
+    pub reset_state: EmDeviceResetState,
+    pub icr_asserted: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EmDeviceResetState {
+    #[default]
+    None,
+    Detected,
+    Requested,
+    Prepared,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmDeviceReset {
+    pub state: EmDeviceResetState,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EmFatalState {
+    #[default]
+    None,
+    Capturing,
+    Detected,
+    ResetRequested,
+    ResetPrepared,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmFatalError {
+    pub state: EmFatalState,
+    pub icr: u32,
+    pub peind: u32,
+    pub pcie: u32,
+    pub pcie_ecc: u32,
+    pub lan: u32,
+    pub dma_tx: u32,
+    pub dma_rx: u32,
+    pub dma_host: u32,
+    pub pbeccsts: u32,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmFatalStats {
+    pub reset_count: u64,
+    pub unknown_count: u64,
+    pub lan_count: u64,
+    pub management_count: u64,
+    pub pcie_count: u64,
+    pub dma_count: u64,
+}
+pub trait EmFatalAdminOps {
+    fn request_reset(&mut self);
+    fn reenable_interrupts(&mut self, mask: u32);
+}
+pub trait EmFatalResetOps {
+    fn disable_pcie_master(&mut self) -> DevResult;
+}
 
 /// upstream: if_em.c em_set_num_queues()
 pub const fn em_set_num_queues(mac: E1000MacType) -> u8 {
@@ -76,6 +175,74 @@ pub const fn em_set_num_queues(mac: E1000MacType) -> u8 {
         E1000MacType::I82574 | E1000MacType::I211 => 2,
         _ => 1,
     }
+}
+
+/// upstream: if_em.c em_identify_hardware()
+pub fn em_identify_hardware<P: E1000PciConfig>(
+    pci: &mut P,
+    is_vf: bool,
+) -> DevResult<EmHardwareIdentity> {
+    let command = pci.read_config_u16(0x04).ok_or(DevError::Io)?;
+    let vendor = pci.read_config_u16(0x00).ok_or(DevError::Io)?;
+    let device = pci.read_config_u16(0x02).ok_or(DevError::Io)?;
+    let revision = pci.read_config_u16(0x08).ok_or(DevError::Io)? as u8;
+    let sub_vendor = pci.read_config_u16(0x2c).ok_or(DevError::Io)?;
+    let sub_device = pci.read_config_u16(0x2e).ok_or(DevError::Io)?;
+    let mac = api::set_mac_type(device).map_err(|_| DevError::Unsupported)?;
+    let detected_vf = matches!(mac, E1000MacType::VfAdapt | E1000MacType::VfAdaptI350);
+    if detected_vf != is_vf {
+        return Err(DevError::InvalidParam);
+    }
+    let _saved_command = command;
+    Ok(EmHardwareIdentity {
+        vendor_id: vendor,
+        device_id: device,
+        revision_id: revision,
+        subsystem_vendor_id: sub_vendor,
+        subsystem_device_id: sub_device,
+        mac,
+        is_vf,
+    })
+}
+
+/// upstream: if_em.c em_enable_pci_busmaster()
+pub fn em_enable_pci_busmaster<P: EmPciBusmaster>(pci: &mut P) -> DevResult {
+    let mut command = pci.command()?;
+    if command == u16::MAX {
+        return Err(DevError::Io);
+    }
+    if command & 0x0004 != 0 {
+        return Ok(());
+    }
+    let enable_result = pci.enable_busmaster();
+    command = pci.command()?;
+    if command == u16::MAX {
+        return Err(DevError::Io);
+    }
+    if command & 0x0004 == 0 {
+        return enable_result.and(Err(DevError::Io));
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_fence_pci_busmaster()
+pub fn em_fence_pci_busmaster<P: EmPciBusmaster>(pci: &mut P) -> DevResult {
+    let result = pci.disable_busmaster();
+    let command = pci.command()?;
+    if command != u16::MAX && command & 0x0004 != 0 {
+        return Err(DevError::ResourceBusy);
+    }
+    let timeout_ms = (pci.max_completion_timeout_us() / 1000).max(10);
+    if command != u16::MAX && !pci.wait_pending_transactions(timeout_ms) {
+        let after = pci.command()?;
+        if after != u16::MAX {
+            return Err(DevError::ResourceBusy);
+        }
+    }
+    if result.is_err() && command == u16::MAX {
+        return Ok(());
+    }
+    Ok(())
 }
 
 fn aim_delta(snapshot: u64, bytes_last: &mut u32, packets_last: &mut u32) -> (u32, u32) {
@@ -651,9 +818,1477 @@ pub fn em_update_i350_i354_ecc_stats<I: E1000RegisterIo>(
     Ok(())
 }
 
+/// upstream: if_em.c em_handle_fatal_error_intr()
+pub fn em_handle_fatal_error_intr<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    _device_id: u16,
+    icr: u32,
+    error: &mut EmFatalError,
+) -> DevResult<bool> {
+    let error_mask = em_memory_error_intr_mask(mac);
+    if error_mask == 0 || icr & error_mask == 0 {
+        return Ok(false);
+    }
+    io.write_register(E1000_IMC, error_mask)?;
+    if error.state != EmFatalState::None {
+        return Ok(false);
+    }
+    error.state = EmFatalState::Capturing;
+    error.icr = icr & error_mask;
+    if em_has_pch_ecc(mac) {
+        error.pbeccsts = io.read_register(E1000_PBECCSTS)?;
+    } else if em_has_82575_memory_errors(mac) {
+        error.pbeccsts = io.read_register(E1000_PBECCSTS_82575)?;
+        error.dma_rx = io.read_register(E1000_RDHESTS_82575)?;
+        error.dma_tx = io.read_register(E1000_TDHESTS_82575)?;
+    } else if em_has_82576_memory_errors(mac) {
+        error.peind = io.read_register(E1000_PEIND)?;
+    } else {
+        let mut peind = io.read_register(E1000_PEIND)? & E1000_PEIND_FATAL_MASK;
+        let pcie = io.read_register(E1000_PCIEERRSTS)? & em_pcie_fatal_error_mask(mac);
+        let mut host = 0;
+        if em_has_82580_memory_errors(mac) {
+            peind &= E1000_PEIND_MNG_PARITY_FATAL;
+            error.dma_tx = io.read_register(E1000_DTPARS_82580)?;
+            error.dma_rx = io.read_register(E1000_DRPARS_82580)?;
+            host = io.read_register(E1000_DDPARS_82580)?;
+            error.lan = io.read_register(E1000_LANPERRSTS)? & E1000_LANPERRSTS_82580_ERROR_MASK;
+        } else if em_has_i350_i354_memory_errors(mac) {
+            error.dma_tx = io.read_register(E1000_DTPARS)? & E1000_DTPARS_FATAL_MASK;
+            error.dma_rx = io.read_register(E1000_DRPARS)? & E1000_DRPARS_FATAL_MASK;
+            error.lan = io.read_register(E1000_LANPERRSTS)? & E1000_LANPERRSTS_I350_I354_FATAL_MASK;
+        } else {
+            error.lan = io.read_register(E1000_LANPERRSTS)? & E1000_LANPERRSTS_RETX_BUF;
+        }
+        if pcie != 0 {
+            peind |= E1000_PEIND_PCIE_PARITY_FATAL;
+        }
+        if error.lan != 0 {
+            peind |= E1000_PEIND_LANPORT_PARITY_FATAL;
+        }
+        if error.dma_tx != 0 || error.dma_rx != 0 || host != 0 {
+            peind |= E1000_PEIND_DMA_PARITY_FATAL;
+        }
+        error.peind = peind;
+        error.pcie = pcie;
+        error.dma_host = host;
+    }
+    error.state = EmFatalState::Detected;
+    Ok(true)
+}
+
+/// upstream: if_em.c igb_device_reset_intr_mask()
+pub fn igb_device_reset_intr_mask(mac: E1000MacType) -> u32 {
+    if mac >= E1000MacType::I82580 {
+        E1000_ICR_DRSTA
+    } else {
+        0
+    }
+}
+/// upstream: if_em.c igb_device_reset_pending()
+pub fn igb_device_reset_pending(mac: E1000MacType, state: EmDeviceResetState, vf: bool) -> bool {
+    !vf && igb_device_reset_intr_mask(mac) != 0 && state != EmDeviceResetState::None
+}
+/// upstream: if_em.c igb_handle_device_reset()
+pub fn igb_handle_device_reset(
+    mac: E1000MacType,
+    vf: bool,
+    icr: u32,
+    reset: &mut EmDeviceReset,
+) -> bool {
+    if vf || igb_device_reset_intr_mask(mac) == 0 || icr & E1000_ICR_DRSTA == 0 {
+        return false;
+    }
+    let old = reset.state;
+    reset.state = EmDeviceResetState::Detected;
+    old != EmDeviceResetState::Detected
+}
+
+/// upstream: if_em.c igb_prepare_device_reset()
+pub fn igb_prepare_device_reset<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    reset: &mut EmDeviceReset,
+    timeout_ms: usize,
+) -> DevResult {
+    if !matches!(
+        reset.state,
+        EmDeviceResetState::Detected | EmDeviceResetState::Requested
+    ) && mac >= E1000MacType::I82580
+    {
+        let gcr = io.read_register(E1000_GCR)?;
+        if gcr & 0x8000_0000 != 0 {
+            reset.state = EmDeviceResetState::Detected
+        } else {
+            let status = io.read_register(E1000_STATUS)?;
+            if status & 0x0010_0000 != 0 {
+                reset.state = EmDeviceResetState::Detected
+            }
+        }
+    }
+    if !matches!(
+        reset.state,
+        EmDeviceResetState::Detected | EmDeviceResetState::Requested
+    ) {
+        return Ok(());
+    }
+    if mac >= E1000MacType::I82580 {
+        let mut complete = false;
+        for _ in 0..timeout_ms {
+            if io.read_register(E1000_GCR)? & 0x8000_0000 == 0 {
+                complete = true;
+                break;
+            }
+            io.delay_us(1000)
+        }
+        if complete {
+            io.write_register(E1000_STATUS, 0x0010_0000)?;
+            if mac >= E1000MacType::I350 {
+                for _ in 0..timeout_ms {
+                    let eecd = io.read_register(E1000_EECD)?;
+                    let status = io.read_register(E1000_STATUS)?;
+                    if eecd & E1000_EECD_AUTO_RD != 0 && status & E1000_STATUS_RST_DONE != 0 {
+                        break;
+                    }
+                    io.delay_us(1000)
+                }
+            }
+        }
+    }
+    reset.state = EmDeviceResetState::Prepared;
+    Ok(())
+}
+
+pub trait EmPciStatus {
+    fn vendor_id(&mut self) -> DevResult<u16>;
+}
+/// upstream: if_em.c igb_finish_device_reset()
+pub fn igb_finish_device_reset<I: E1000RegisterIo, P: EmPciStatus>(
+    io: &mut I,
+    pci: &mut P,
+    mac: E1000MacType,
+    reset: &mut EmDeviceReset,
+    icr: u32,
+) -> DevResult<bool> {
+    let mut again = icr != u32::MAX && icr & E1000_ICR_DRSTA != 0;
+    if mac >= E1000MacType::I82580 {
+        let gcr = io.read_register(E1000_GCR)?;
+        if gcr != u32::MAX && gcr & 0x8000_0000 != 0 {
+            again = true
+        }
+        let status = io.read_register(E1000_STATUS)?;
+        if status == u32::MAX && reset.state != EmDeviceResetState::None {
+            if pci.vendor_id()? == 0xffff {
+                reset.state = EmDeviceResetState::Detected;
+                return Ok(true);
+            }
+            again = true
+        } else if status != u32::MAX && status & 0x0010_0000 != 0 {
+            again = true
+        }
+    }
+    if matches!(
+        reset.state,
+        EmDeviceResetState::Detected | EmDeviceResetState::Requested
+    ) {
+        again = true
+    }
+    if !again {
+        if reset.state == EmDeviceResetState::Prepared {
+            reset.state = EmDeviceResetState::None
+        }
+        return Ok(false);
+    }
+    let was_detected = reset.state == EmDeviceResetState::Detected;
+    reset.state = EmDeviceResetState::Detected;
+    Ok(!was_detected)
+}
+
+/// upstream: if_em.c em_handle_fatal_error_admin()
+pub fn em_handle_fatal_error_admin<I: E1000RegisterIo, O: EmFatalAdminOps>(
+    io: &mut I,
+    ops: &mut O,
+    mac: E1000MacType,
+    error: &mut EmFatalError,
+    stats: &mut EmErrorStats,
+    counts: &mut EmFatalStats,
+) -> DevResult<bool> {
+    if error.state != EmFatalState::Detected {
+        return Ok(error.state != EmFatalState::None);
+    }
+    error.state = EmFatalState::ResetRequested;
+    if em_has_pch_ecc(mac) {
+        em_update_pch_ecc_stats(stats, error.pbeccsts);
+    } else if em_has_82575_memory_errors(mac) {
+        em_update_82575_ecc_stats(stats, error.pbeccsts, error.dma_rx, error.dma_tx);
+    } else if em_has_82576_memory_errors(mac) {
+        em_update_82576_ecc_stats(io, stats, true)?;
+        let reset = (error.icr & 0x0040_0000) != 0
+            || (error.peind & (E1000_PEIND_82576_FATAL_MASK | E1000_PEIND_82576_MEMORY_HANG)) != 0;
+        if !reset {
+            error.state = EmFatalState::None;
+            error.icr = 0;
+            error.peind = 0;
+            ops.reenable_interrupts(0x00c0_0000);
+            return Ok(true);
+        }
+        if error.peind & (E1000_PEIND_82576_FATAL_MASK | E1000_PEIND_82576_MEMORY_HANG) == 0 {
+            counts.unknown_count += 1;
+        }
+    } else {
+        let mut peind = error.peind;
+        if em_has_82580_memory_errors(mac) {
+            let pcieecc = io.read_register(E1000_PCIEECCSTS)? & E1000_PCIEECCSTS_82580_ERROR_MASK;
+            error.pcie_ecc |= pcieecc;
+            if pcieecc != 0 {
+                peind |= E1000_PEIND_PCIE_PARITY_FATAL;
+                error.peind = peind;
+            }
+            let _ = em_update_82580_ecc_stats(
+                stats,
+                io.read_register(E1000_RPBECCSTS)?,
+                io.read_register(E1000_TPBECCSTS)?,
+                pcieecc,
+            );
+        } else if em_has_i350_i354_memory_errors(mac) {
+            em_update_i350_i354_ecc_stats(io, stats, mac)?;
+        }
+        if peind & E1000_PEIND_LANPORT_PARITY_FATAL != 0 {
+            counts.lan_count += 1;
+        }
+        if peind & E1000_PEIND_MNG_PARITY_FATAL != 0 {
+            counts.management_count += 1;
+        }
+        if peind & E1000_PEIND_PCIE_PARITY_FATAL != 0 {
+            counts.pcie_count += 1;
+        }
+        if peind & E1000_PEIND_DMA_PARITY_FATAL != 0 {
+            counts.dma_count += 1;
+        }
+        if peind == 0 {
+            counts.unknown_count += 1;
+        }
+        let mut reset =
+            (peind & (E1000_PEIND_PCIE_PARITY_FATAL | E1000_PEIND_DMA_PARITY_FATAL)) != 0;
+        if peind == 0 {
+            reset = true;
+        }
+        if peind & E1000_PEIND_LANPORT_PARITY_FATAL != 0
+            && (!em_has_i350_i354_memory_errors(mac)
+                || error.lan == 0
+                || (error.lan & E1000_LANPERRSTS_I350_I354_RESET_MASK) != 0)
+        {
+            reset = true;
+        }
+        if !reset {
+            if em_has_i350_i354_memory_errors(mac) && error.lan != 0 {
+                io.write_register(
+                    E1000_LANPERRSTS,
+                    error.lan & E1000_LANPERRSTS_I350_I354_NO_RESET_MASK,
+                )?;
+            }
+            error.peind = 0;
+            error.pcie = 0;
+            error.pcie_ecc = 0;
+            error.lan = 0;
+            error.dma_tx = 0;
+            error.dma_rx = 0;
+            error.dma_host = 0;
+            error.state = EmFatalState::None;
+            ops.reenable_interrupts(0x0040_0000);
+            return Ok(true);
+        }
+    }
+    counts.reset_count += 1;
+    ops.request_reset();
+    Ok(true)
+}
+
+/// upstream: if_em.c em_prepare_fatal_error_reset()
+pub fn em_prepare_fatal_error_reset<I: E1000RegisterIo, O: EmFatalResetOps>(
+    io: &mut I,
+    ops: &mut O,
+    mac: E1000MacType,
+    error: &mut EmFatalError,
+    timeout_ms: usize,
+) -> DevResult {
+    if !em_has_peind_memory_errors(mac) || error.state != EmFatalState::ResetRequested {
+        return Ok(());
+    }
+    let pcie = error.pcie | (io.read_register(E1000_PCIEERRSTS)? & em_pcie_fatal_error_mask(mac));
+    let pcie_parity = error.peind & E1000_PEIND_PCIE_PARITY_FATAL != 0;
+    if !em_has_82580_memory_errors(mac) && !pcie_parity && pcie == 0 {
+        return Ok(());
+    }
+    let ctrl = io.read_register(E1000_CTRL)?;
+    io.write_register(E1000_CTRL, ctrl | E1000_CTRL_RST)?;
+    io.delay_us(3000);
+    let mut complete = false;
+    for _ in 0..timeout_ms {
+        if io.read_register(E1000_EECD)? & E1000_EECD_AUTO_RD != 0
+            && (em_has_82580_memory_errors(mac)
+                || io.read_register(E1000_STATUS)? & E1000_STATUS_RST_DONE != 0)
+        {
+            complete = true;
+            break;
+        }
+        io.delay_us(1000)
+    }
+    let _ = complete;
+    let _ = ops.disable_pcie_master();
+    let mut pcie = pcie | io.read_register(E1000_PCIEERRSTS)? & em_pcie_fatal_error_mask(mac);
+    if pcie != 0 {
+        io.write_register(E1000_PCIEERRSTS, pcie)?;
+    }
+    if em_has_82580_memory_errors(mac) {
+        pcie = error.pcie_ecc
+            | (io.read_register(E1000_PCIEECCSTS)? & E1000_PCIEECCSTS_82580_ERROR_MASK);
+        if pcie != 0 {
+            io.write_register(E1000_PCIEECCSTS, pcie)?;
+        }
+    }
+    error.state = EmFatalState::ResetPrepared;
+    Ok(())
+}
+
+/// upstream: if_em.c em_intr()
+pub fn em_intr<I: E1000RegisterIo>(
+    io: &mut I,
+    config: EmIrqConfig,
+    device_reset: &mut EmDeviceReset,
+    fatal: &mut EmFatalError,
+    device_id: u16,
+) -> DevResult<EmIrqActions> {
+    let cause = io.read_register(E1000_ICR)?;
+    if cause == u32::MAX || cause == 0 {
+        return Ok(EmIrqActions {
+            disposition: Some(EmIrqDisposition::Stray),
+            ..EmIrqActions::default()
+        });
+    }
+    if config.mac >= E1000MacType::I82571 && cause & 0x8000_0000 == 0 {
+        return Ok(EmIrqActions {
+            disposition: Some(EmIrqDisposition::Stray),
+            ..EmIrqActions::default()
+        });
+    }
+    if igb_handle_device_reset(config.mac, config.vf, cause, device_reset) {
+        return Ok(EmIrqActions {
+            disposition: Some(EmIrqDisposition::Handled),
+            ..EmIrqActions::default()
+        });
+    }
+    if igb_device_reset_pending(config.mac, device_reset.state, config.vf) {
+        return Ok(EmIrqActions {
+            disposition: Some(EmIrqDisposition::Handled),
+            ..EmIrqActions::default()
+        });
+    }
+    let disable = config.vf || config.mac < E1000MacType::I82575;
+    if disable {
+        io.write_register(E1000_IMC, u32::MAX)?;
+    }
+    let link = cause & (0x0000_0008 | 0x0000_0004) != 0;
+    let fatal_error_captured = em_handle_fatal_error_intr(io, config.mac, device_id, cause, fatal)?;
+    Ok(EmIrqActions {
+        disposition: Some(EmIrqDisposition::ScheduleThread),
+        link_admin: link,
+        fatal_error_captured,
+        overrun: cause & 0x40 != 0,
+        interrupt_disabled: disable,
+    })
+}
+
+/// upstream: if_em.c em_handle_link()
+pub fn em_handle_link(get_link_status: &mut bool) {
+    *get_link_status = true;
+}
+
+/// upstream: if_em.c em_if_rx_queue_intr_enable()
+pub fn em_if_rx_queue_intr_enable<I: E1000RegisterIo>(io: &mut I, eims: u32) -> DevResult {
+    io.write_register(E1000_IMS, eims)
+}
+/// upstream: if_em.c em_if_tx_queue_intr_enable()
+pub fn em_if_tx_queue_intr_enable<I: E1000RegisterIo>(io: &mut I, eims: u32) -> DevResult {
+    io.write_register(E1000_IMS, eims)
+}
+/// upstream: if_em.c igb_if_rx_queue_intr_enable()
+pub fn igb_if_rx_queue_intr_enable<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    state: EmDeviceResetState,
+    vf: bool,
+    eims: u32,
+) -> DevResult {
+    if igb_device_reset_pending(mac, state, vf) {
+        return Ok(());
+    }
+    io.write_register(E1000_EIMS, eims)
+}
+/// upstream: if_em.c igb_if_tx_queue_intr_enable()
+pub fn igb_if_tx_queue_intr_enable<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    state: EmDeviceResetState,
+    vf: bool,
+    eims: u32,
+) -> DevResult {
+    igb_if_rx_queue_intr_enable(io, mac, state, vf, eims)
+}
+
+/// upstream: if_em.c em_msix_que()
+pub fn em_msix_que<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    state: EmDeviceResetState,
+    vf: bool,
+    config: AimConfig,
+    vector: u16,
+    queue_itr: &mut u32,
+    rx_delta: (u32, u32),
+    tx_deltas: &[(u16, u32, u32)],
+) -> DevResult<EmIrqDisposition> {
+    if igb_device_reset_pending(mac, state, vf) {
+        return Ok(EmIrqDisposition::Handled);
+    }
+    let _ = em_newitr(io, config, vector, queue_itr, rx_delta, tx_deltas)?;
+    Ok(EmIrqDisposition::ScheduleThread)
+}
+
+/// upstream: if_em.c em_msix_link()
+pub fn em_msix_link<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    vf: bool,
+    reset: &mut EmDeviceReset,
+    fatal: &mut EmFatalError,
+    device_id: u16,
+    link_mask: u32,
+    ims_mask: u32,
+) -> DevResult<EmIrqActions> {
+    if vf {
+        io.write_register(E1000_EIMS, link_mask)?;
+        return Ok(EmIrqActions {
+            disposition: Some(EmIrqDisposition::Handled),
+            link_admin: true,
+            ..EmIrqActions::default()
+        });
+    }
+    let cause = io.read_register(E1000_ICR)?;
+    if igb_device_reset_pending(mac, reset.state, false) {
+        return Ok(EmIrqActions {
+            disposition: Some(EmIrqDisposition::Handled),
+            ..EmIrqActions::default()
+        });
+    }
+    if cause != u32::MAX && igb_handle_device_reset(mac, false, cause, reset) {
+        return Ok(EmIrqActions {
+            disposition: Some(EmIrqDisposition::Handled),
+            ..EmIrqActions::default()
+        });
+    }
+    let fatal = if cause == u32::MAX {
+        false
+    } else {
+        em_handle_fatal_error_intr(io, mac, device_id, cause, fatal)?
+    };
+    if mac >= E1000MacType::I82575 {
+        io.write_register(E1000_IMS, ims_mask)?;
+        io.write_register(E1000_EIMS, link_mask)?;
+    } else if mac == E1000MacType::I82574 {
+        io.write_register(E1000_IMS, ims_mask)?;
+        if cause != 0 && cause != u32::MAX {
+            io.write_register(E1000_ICS, ims_mask)?;
+        }
+    } else {
+        io.write_register(E1000_IMS, ims_mask)?;
+    }
+    Ok(EmIrqActions {
+        disposition: Some(EmIrqDisposition::Handled),
+        link_admin: cause != u32::MAX && cause & (0x8 | 0x4) != 0,
+        fatal_error_captured: fatal,
+        overrun: cause != u32::MAX && cause & 0x40 != 0,
+        interrupt_disabled: false,
+    })
+}
+
+/// upstream: if_em.c em_if_intr_enable()
+pub fn em_if_intr_enable<I: E1000RegisterIo>(
+    io: &mut I,
+    msix: bool,
+    queue_mask: u32,
+    fatal_mask: u32,
+) -> DevResult {
+    if msix {
+        io.write_register(0x000dc, queue_mask)?;
+    }
+    io.write_register(
+        E1000_IMS,
+        0x0000009d | fatal_mask | if msix { queue_mask } else { 0 },
+    )?;
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
+/// upstream: if_em.c em_if_intr_disable()
+pub fn em_if_intr_disable<I: E1000RegisterIo>(io: &mut I, msix: bool) -> DevResult {
+    if msix {
+        io.write_register(0x000dc, 0)?;
+    }
+    io.write_register(E1000_IMC, u32::MAX)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
+
+/// upstream: if_em.c em_initialize_rss_mapping()
+pub fn em_initialize_rss_mapping<I: E1000RegisterIo>(
+    io: &mut I,
+    rss_key: &[u8; 40],
+    rx_queues: u16,
+) -> DevResult {
+    if rx_queues == 0 {
+        return Err(DevError::InvalidParam);
+    }
+    for index in 0..10 {
+        let offset = index * 4;
+        let word = u32::from_le_bytes([
+            rss_key[offset],
+            rss_key[offset + 1],
+            rss_key[offset + 2],
+            rss_key[offset + 3],
+        ]);
+        io.write_register(0x05c80 + index as u32 * 4, word)?;
+    }
+    let mut reta = 0u32;
+    for index in 0..4 {
+        let queue = (index % u32::from(rx_queues)) << 7;
+        reta |= queue << (index * 8);
+    }
+    for index in 0..32 {
+        io.write_register(0x05c00 + index * 4, reta)?;
+    }
+    io.write_register(
+        E1000_MRQC,
+        E1000_MRQC_RSS_ENABLE_2Q
+            | E1000_MRQC_RSS_FIELD_IPV4_TCP
+            | E1000_MRQC_RSS_FIELD_IPV4
+            | E1000_MRQC_RSS_FIELD_IPV6_TCP_EX
+            | E1000_MRQC_RSS_FIELD_IPV6_EX
+            | E1000_MRQC_RSS_FIELD_IPV6,
+    )
+}
+
+/// upstream: if_em.c em_integrated_jumbo_rx()
+pub const fn em_integrated_jumbo_rx(mac: E1000MacType) -> bool {
+    matches!(
+        mac,
+        E1000MacType::Ich9Lan
+            | E1000MacType::Ich10Lan
+            | E1000MacType::PchLan
+            | E1000MacType::Pch2Lan
+            | E1000MacType::PchLpt
+            | E1000MacType::PchSpt
+            | E1000MacType::PchCnp
+            | E1000MacType::PchTgp
+            | E1000MacType::PchAdp
+            | E1000MacType::PchMtp
+            | E1000MacType::PchPtp
+            | E1000MacType::PchNvp
+    )
+}
+
+/// upstream: if_em.c em_legacy_txdctl()
+pub const fn em_legacy_txdctl(mac: E1000MacType) -> u32 {
+    let mut value = 31 | (1 << 8) | (1 << 16) | E1000_TXDCTL_GRAN;
+    match mac {
+        E1000MacType::I82571
+        | E1000MacType::I82572
+        | E1000MacType::I82573
+        | E1000MacType::I82574
+        | E1000MacType::I82583
+        | E1000MacType::I80003Es2lan => value |= E1000_TXDCTL_COUNT_DESC,
+        E1000MacType::Ich8Lan
+        | E1000MacType::Ich9Lan
+        | E1000MacType::Ich10Lan
+        | E1000MacType::PchLan
+        | E1000MacType::Pch2Lan
+        | E1000MacType::PchLpt
+        | E1000MacType::PchSpt
+        | E1000MacType::PchCnp
+        | E1000MacType::PchTgp
+        | E1000MacType::PchAdp
+        | E1000MacType::PchMtp
+        | E1000MacType::PchPtp
+        | E1000MacType::PchNvp => value |= 1 << 22,
+        E1000MacType::I82542 | E1000MacType::I82543 | E1000MacType::I82544 => value = 0,
+        _ => {}
+    }
+    value
+}
+
+/// upstream: if_em.c igb_txdctl()
+pub const fn igb_txdctl(mac: E1000MacType) -> u32 {
+    let pthresh = if matches!(mac, E1000MacType::I354) {
+        20
+    } else {
+        8
+    };
+    pthresh | (1 << 8) | E1000_TXDCTL_QUEUE_ENABLE
+}
+
+pub trait EmStopOps {
+    fn stop_vf_retry(&mut self);
+    fn flush_descriptor_rings(&mut self) -> DevResult;
+    fn prepare_iov_reset(&mut self);
+    fn prepare_fatal_reset(&mut self) -> DevResult;
+    fn reset_mac(&mut self) -> DevResult;
+    fn sanitize_vf_queues(&mut self) -> bool;
+    fn fence_busmaster(&mut self) -> DevResult;
+    fn led_off_cleanup(&mut self);
+    fn link_down(&mut self);
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmStopContext {
+    pub mac: E1000MacType,
+    pub vf: bool,
+    pub vf_mailbox_ready: bool,
+    pub interface_up: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VfStopState {
+    pub queues_sanitized: bool,
+    pub mailbox_ready: bool,
+    pub link_speed: u16,
+    pub link_duplex: u16,
+    pub link_up: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmTxRingConfig {
+    pub queue: u32,
+    pub dma_base: u64,
+    pub descriptor_count: u32,
+    pub descriptor_size: u32,
+    pub itr_vector: u16,
+    pub csum_flags: u32,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EmFlowMode {
+    RxPause,
+    TxPause,
+    Full,
+    #[default]
+    None,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmFlowState {
+    pub high_water: u32,
+    pub low_water: u32,
+    pub pause_time: u16,
+    pub refresh_time: u16,
+    pub send_xon: bool,
+    pub pba_kb: u32,
+    pub mode: EmFlowMode,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmResetConfig {
+    pub mac: E1000MacType,
+    pub max_frame_size: u32,
+    pub mtu: u32,
+    pub flow_mode: EmFlowMode,
+    pub media_reset: bool,
+    pub smart_power_down: bool,
+}
+pub trait EmResetOps {
+    fn get_hw_control(&mut self) -> DevResult;
+    fn disable_smart_power_down(&mut self) -> DevResult;
+    fn adjust_rxpbs_82580(&mut self, value: u32) -> u32;
+    fn configure_flow_control(&mut self, flow: EmFlowState) -> DevResult;
+    fn flush_descriptor_rings(&mut self) -> DevResult;
+    fn prepare_fatal_error_reset(&mut self) -> DevResult;
+    fn reset_hw(&mut self) -> DevResult;
+    fn disable_aspm(&mut self) -> DevResult;
+    fn setup_init_functions(&mut self) -> DevResult;
+    fn init_hw(&mut self) -> DevResult;
+    fn configure_82576_memory_errors(&mut self) -> DevResult;
+    fn finish_fatal_error_reset(&mut self) -> DevResult;
+    fn init_dmac(&mut self, pba: u32) -> DevResult;
+    fn get_phy_info(&mut self) -> DevResult;
+    fn check_for_link(&mut self) -> DevResult;
+}
+
+fn em_reset_pba<I: E1000RegisterIo, O: EmResetOps>(
+    io: &mut I,
+    ops: &mut O,
+    config: EmResetConfig,
+) -> DevResult<(u32, EmFlowState)> {
+    let mac = config.mac;
+    let frame = config.max_frame_size;
+    let mut pba = match mac {
+        E1000MacType::I82547 | E1000MacType::I82547Rev2 => {
+            if frame > 8192 {
+                22
+            } else {
+                30
+            }
+        }
+        E1000MacType::I82571 | E1000MacType::I82572 | E1000MacType::I80003Es2lan => 32,
+        E1000MacType::I82573 => 12,
+        E1000MacType::I82574 | E1000MacType::I82583 => {
+            if frame > 8192 {
+                22
+            } else {
+                32
+            }
+        }
+        E1000MacType::Ich8Lan => 8,
+        E1000MacType::Ich9Lan | E1000MacType::Ich10Lan => {
+            if frame > 4096 {
+                14
+            } else {
+                10
+            }
+        }
+        E1000MacType::PchLan
+        | E1000MacType::Pch2Lan
+        | E1000MacType::PchLpt
+        | E1000MacType::PchSpt
+        | E1000MacType::PchCnp
+        | E1000MacType::PchTgp
+        | E1000MacType::PchAdp
+        | E1000MacType::PchMtp
+        | E1000MacType::PchPtp
+        | E1000MacType::PchNvp => 26,
+        E1000MacType::I82575 => 32,
+        E1000MacType::I82576 => io.read_register(E1000_RXPBS)? & 0xffff,
+        E1000MacType::I82580 | E1000MacType::I350 | E1000MacType::I354 => {
+            ops.adjust_rxpbs_82580(io.read_register(E1000_RXPBS)?)
+        }
+        E1000MacType::I210 | E1000MacType::I211 => 34,
+        _ => {
+            if frame > 8192 {
+                40
+            } else {
+                48
+            }
+        }
+    };
+    if mac == E1000MacType::I82575 && config.mtu > 1500 {
+        let current = io.read_register(E1000_PBA)?;
+        let tx_space = current >> 16;
+        let mut rx_space = current & 0xffff;
+        let min_tx = (((frame + 12) * 2 + 1023) & !1023) / 1024;
+        let min_rx = ((frame + 1023) & !1023) / 1024;
+        if tx_space < min_tx && min_tx - tx_space < rx_space {
+            rx_space -= min_tx - tx_space;
+            if rx_space < min_rx {
+                rx_space = min_rx;
+            }
+        }
+        pba = rx_space;
+        io.write_register(E1000_PBA, pba)?;
+    }
+    if mac < E1000MacType::I82575 {
+        io.write_register(E1000_PBA, pba)?;
+    }
+    let mut flow = EmFlowState {
+        pba_kb: pba,
+        high_water: (pba & 0xffff) * 1024 - ((frame + 1023) & !1023),
+        low_water: (pba & 0xffff) * 1024 - ((frame + 1023) & !1023) - 1500,
+        pause_time: if mac == E1000MacType::I80003Es2lan {
+            0xffff
+        } else {
+            0x0680
+        },
+        refresh_time: 0,
+        send_xon: true,
+        mode: config.flow_mode,
+    };
+    if mac == E1000MacType::PchLan {
+        flow.mode = match config.flow_mode {
+            EmFlowMode::Full => EmFlowMode::RxPause,
+            EmFlowMode::TxPause => EmFlowMode::None,
+            mode => mode,
+        };
+        flow.pause_time = 0xffff;
+        if config.mtu > 1500 {
+            flow.high_water = 0x3500;
+            flow.low_water = 0x1500
+        } else {
+            flow.high_water = 0x5000;
+            flow.low_water = 0x3000
+        }
+        flow.refresh_time = 0x1000;
+    } else if matches!(
+        mac,
+        E1000MacType::Pch2Lan
+            | E1000MacType::PchLpt
+            | E1000MacType::PchSpt
+            | E1000MacType::PchCnp
+            | E1000MacType::PchTgp
+            | E1000MacType::PchAdp
+            | E1000MacType::PchMtp
+            | E1000MacType::PchPtp
+            | E1000MacType::PchNvp
+    ) {
+        flow.high_water = 0x5c20;
+        flow.low_water = 0x5048;
+        flow.pause_time = 0xffff;
+        flow.refresh_time = 0xffff;
+        pba = if config.mtu > 1500 { 12 } else { 26 };
+        flow.pba_kb = pba;
+        io.write_register(E1000_PBA, pba)?;
+    } else if matches!(mac, E1000MacType::I82575 | E1000MacType::I82576) {
+        flow.low_water = flow.high_water - 8;
+    } else if matches!(
+        mac,
+        E1000MacType::I82580
+            | E1000MacType::I350
+            | E1000MacType::I354
+            | E1000MacType::I210
+            | E1000MacType::I211
+    ) {
+        flow.low_water = flow.high_water - 16;
+    } else if matches!(mac, E1000MacType::Ich9Lan | E1000MacType::Ich10Lan) && config.mtu > 1500 {
+        flow.high_water = 0x2800;
+        flow.low_water = flow.high_water - 8;
+    } else if mac == E1000MacType::I80003Es2lan {
+        flow.pause_time = 0xffff;
+    }
+    Ok((pba, flow))
+}
+
+/// upstream: if_em.c em_reset()
+pub fn em_reset<I: E1000RegisterIo, O: EmResetOps>(
+    io: &mut I,
+    ops: &mut O,
+    config: EmResetConfig,
+) -> DevResult<u32> {
+    ops.get_hw_control()?;
+    if !config.smart_power_down && matches!(config.mac, E1000MacType::I82571 | E1000MacType::I82572)
+    {
+        ops.disable_smart_power_down()?;
+    }
+    let (pba, flow) = em_reset_pba(io, ops, config)?;
+    ops.configure_flow_control(flow)?;
+    if config.mac >= E1000MacType::PchSpt && config.mac < E1000MacType::I82575 {
+        ops.flush_descriptor_rings()?;
+    }
+    ops.prepare_fatal_error_reset()?;
+    ops.reset_hw()?;
+    if config.mac >= E1000MacType::I82575 {
+        io.write_register(E1000_WUC, 0)?;
+    } else {
+        io.write_register(E1000_WUFC, 0)?;
+        ops.disable_aspm()?;
+    }
+    if config.media_reset {
+        ops.setup_init_functions()?;
+    }
+    ops.init_hw()?;
+    ops.configure_82576_memory_errors()?;
+    ops.finish_fatal_error_reset()?;
+    if config.mac >= E1000MacType::I82575 {
+        ops.init_dmac(pba)?;
+    }
+    io.write_register(E1000_VET, 0x8100)?;
+    ops.get_phy_info()?;
+    ops.check_for_link()?;
+    Ok(pba)
+}
+
+/// upstream: if_em.c em_initialize_transmit_rings()
+pub fn em_initialize_transmit_rings<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    rings: &mut [EmTxRingConfig],
+) -> DevResult {
+    for ring in rings.iter_mut() {
+        ring.csum_flags = 0;
+        if mac >= E1000MacType::I82575 {
+            let control = tx_desc_control(ring.queue);
+            let value = io.read_register(control)?;
+            io.write_register(control, value & !0x0200_0000)?;
+            let _ = io.read_register(E1000_STATUS)?;
+        }
+        io.write_register(
+            tx_desc_length(ring.queue),
+            ring.descriptor_count * ring.descriptor_size,
+        )?;
+        io.write_register(tx_desc_base_high(ring.queue), (ring.dma_base >> 32) as u32)?;
+        io.write_register(tx_desc_base_low(ring.queue), ring.dma_base as u32)?;
+        io.write_register(tx_desc_tail(ring.queue), 0)?;
+        io.write_register(tx_desc_head(ring.queue), 0)?;
+        let control = if mac < E1000MacType::I82575 {
+            em_legacy_txdctl(mac)
+        } else {
+            igb_txdctl(mac)
+        };
+        io.write_register(tx_desc_control(ring.queue), control)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmTxUnitConfig {
+    pub mac: E1000MacType,
+    pub fiber_or_serdes: bool,
+    pub tx_delay: u32,
+    pub tx_abs_delay: u32,
+    pub queue_count: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmRxRingConfig {
+    pub queue: u32,
+    pub dma_base: u64,
+    pub descriptor_count: u32,
+    pub descriptor_size: u32,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmRxUnitConfig {
+    pub mac: E1000MacType,
+    pub mtu: u32,
+    pub max_frame_size: u32,
+    pub rx_queues: u16,
+    pub mbuf_size: u32,
+    pub max_interrupt_rate: u32,
+    pub rx_delay: u32,
+    pub rx_abs_delay: u32,
+    pub mc_filter_type: u8,
+    pub rx_checksum: bool,
+    pub ipv6_checksum: bool,
+    pub disable_crc_stripping: bool,
+    pub iov: bool,
+    pub flow_mode: EmFlowMode,
+}
+pub trait EmRxUnitOps {
+    fn initialize_rss(&mut self) -> DevResult;
+    fn initialize_advanced_rx_rings(&mut self, drop: bool) -> DevResult;
+    fn jumbo_workaround(&mut self, enable: bool) -> DevResult;
+}
+
+/// upstream: if_em.c em_initialize_transmit_unit()
+pub fn em_initialize_transmit_unit<I: E1000RegisterIo>(
+    io: &mut I,
+    config: EmTxUnitConfig,
+    rings: &mut [EmTxRingConfig],
+    txd_command: &mut u32,
+) -> DevResult {
+    em_initialize_transmit_rings(io, config.mac, rings)?;
+    let tipg = if config.mac == E1000MacType::I80003Es2lan {
+        8 | (7 << 20)
+    } else if config.mac == E1000MacType::I82542 {
+        10 | (2 << 10) | (10 << 20)
+    } else {
+        (if config.fiber_or_serdes { 9 } else { 8 }) | (8 << 10) | (6 << 20)
+    };
+    if config.mac < E1000MacType::I82575 {
+        io.write_register(E1000_TIPG, tipg)?;
+        io.write_register(E1000_TIDV, config.tx_delay)?;
+        if config.tx_delay > 0 {
+            *txd_command |= E1000_TXD_CMD_IDE;
+        }
+    }
+    if config.mac >= E1000MacType::I82540 && config.mac < E1000MacType::I82575 {
+        io.write_register(E1000_TADV, config.tx_abs_delay)?;
+    }
+    if matches!(config.mac, E1000MacType::I82571 | E1000MacType::I82572) {
+        let tarc = io.read_register(0x03840)?;
+        io.write_register(0x03840, tarc | (1 << 21))?;
+    } else if config.mac == E1000MacType::I80003Es2lan {
+        for register in [0x03840, 0x03940] {
+            let tarc = io.read_register(register)?;
+            io.write_register(register, tarc | 1)?;
+        }
+    } else if config.mac == E1000MacType::I82574 {
+        let mut tarc = io.read_register(0x03840)? | (1 << 26);
+        if config.queue_count > 1 {
+            tarc |= (1 << 7) | (1 << 23) | (1 << 24) | (1 << 25);
+            io.write_register(0x03840, tarc)?;
+            io.write_register(0x03940, tarc)?;
+        } else {
+            io.write_register(0x03840, tarc)?;
+        }
+    }
+    let mut tctl = io.read_register(E1000_TCTL)? & !E1000_TCTL_CT;
+    tctl |= E1000_TCTL_PSP
+        | E1000_TCTL_RTLC
+        | E1000_TCTL_EN
+        | (E1000_COLLISION_THRESHOLD << E1000_CT_SHIFT);
+    if config.mac >= E1000MacType::I82571 && config.mac < E1000MacType::I82575 {
+        tctl |= E1000_TCTL_MULR;
+    }
+    io.write_register(E1000_TCTL, tctl)?;
+    if config.mac == E1000MacType::PchSpt {
+        let iosf = io.read_register(E1000_IOSFPC)?;
+        io.write_register(E1000_IOSFPC, iosf | E1000_RCTL_RDMTS_HEX)?;
+        let tarc = io.read_register(0x03840)?;
+        io.write_register(0x03840, (tarc & !0x3000_0000) | 0x2000_0000)?;
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_if_stop()
+pub fn em_if_stop<I: E1000RegisterIo, O: EmStopOps>(
+    io: &mut I,
+    ops: &mut O,
+    context: EmStopContext,
+    state: &mut VfStopState,
+) -> DevResult {
+    if context.vf {
+        ops.stop_vf_retry();
+    }
+    if context.mac >= E1000MacType::PchSpt && context.mac < E1000MacType::I82575 {
+        ops.flush_descriptor_rings()?;
+    }
+    ops.prepare_iov_reset();
+    let do_reset = !context.vf || (context.vf_mailbox_ready && !context.interface_up);
+    if do_reset {
+        ops.prepare_fatal_reset()?;
+        if ops.reset_mac().is_err() && !context.vf {
+            let _ = ops.fence_busmaster();
+            return Err(DevError::Io);
+        }
+    }
+    if context.vf {
+        state.queues_sanitized = ops.sanitize_vf_queues();
+        state.mailbox_ready = false;
+        if !state.queues_sanitized {
+            ops.fence_busmaster()?;
+        }
+    }
+    if context.mac >= E1000MacType::I82544 && !context.vf {
+        io.write_register(E1000_WUFC, 0)?;
+    }
+    if context.vf {
+        state.link_speed = 0;
+        state.link_duplex = 0;
+        if state.link_up {
+            state.link_up = false;
+            ops.link_down();
+        }
+    } else {
+        ops.led_off_cleanup();
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_update_stats_counters()
+pub fn em_update_stats_counters<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    copper_or_link: bool,
+    vf: bool,
+    stats: &mut EmHardwareStats,
+    ecc: &mut EmErrorStats,
+    device_id: u16,
+    mut update_vf: impl FnMut() -> DevResult,
+) -> DevResult {
+    if vf {
+        return update_vf();
+    }
+    let prior_xoff = *stats.counters.get(&E1000_XOFFRXC).unwrap_or(&0);
+    if copper_or_link {
+        for reg in [E1000_SYMERRS, E1000_SEC] {
+            let value = io.read_register(reg)?;
+            *stats.counters.entry(reg).or_default() += u64::from(value);
+        }
+    }
+    let counters = [
+        E1000_CRCERRS,
+        E1000_MPC,
+        E1000_SCC,
+        E1000_ECOL,
+        E1000_MCC,
+        E1000_LATECOL,
+        E1000_COLC,
+        E1000_DC,
+        E1000_RLEC,
+        E1000_XONRXC,
+        E1000_XONTXC,
+        E1000_XOFFRXC,
+        E1000_XOFFTXC,
+        E1000_FCRUC,
+        E1000_PRC64,
+        E1000_PRC127,
+        E1000_PRC255,
+        E1000_PRC511,
+        E1000_PRC1023,
+        E1000_PRC1522,
+        E1000_GPRC,
+        E1000_BPRC,
+        E1000_MPRC,
+        E1000_GPTC,
+        E1000_RNBC,
+        E1000_RUC,
+        E1000_RFC,
+        E1000_ROC,
+        E1000_RJC,
+        E1000_MGTPRC,
+        E1000_MGTPDC,
+        E1000_MGTPTC,
+        E1000_TPR,
+        E1000_TPT,
+        E1000_IAC,
+        E1000_ICRXPTC,
+        E1000_ICRXATC,
+        E1000_ICTXPTC,
+        E1000_ICTXATC,
+        E1000_ICTXQEC,
+        E1000_ICTXQMTC,
+        E1000_ICRXDMTC,
+        E1000_ICRXOC,
+    ];
+    for reg in counters {
+        let value = io.read_register(reg)?;
+        *stats.counters.entry(reg).or_default() += u64::from(value);
+    }
+    if stats.counters.get(&E1000_XOFFRXC).copied().unwrap_or(0) != prior_xoff {
+        stats.pause_frames = true;
+    }
+    let gorc = u64::from(io.read_register(E1000_GORCL)?)
+        | (u64::from(io.read_register(E1000_GORCH)?) << 32);
+    *stats.counters.entry(E1000_GORCL).or_default() += gorc;
+    let gotc = u64::from(io.read_register(E1000_GOTCL)?)
+        | (u64::from(io.read_register(E1000_GOTCH)?) << 32);
+    *stats.counters.entry(E1000_GOTCL).or_default() += gotc;
+    *stats.counters.entry(E1000_TORH).or_default() += u64::from(io.read_register(E1000_TORH)?);
+    *stats.counters.entry(E1000_TOTH).or_default() += u64::from(io.read_register(E1000_TOTH)?);
+    if mac >= E1000MacType::I82543 {
+        for reg in [
+            E1000_ALGNERRC,
+            E1000_RXERRC,
+            E1000_TNCRS,
+            E1000_CEXTERR,
+            E1000_TSCTC,
+            E1000_TSCTFC,
+        ] {
+            let value = io.read_register(reg)?;
+            *stats.counters.entry(reg).or_default() += u64::from(value);
+        }
+    }
+    if em_has_82571_ecc_stats(mac) {
+        em_update_82571_ecc_stats(io, ecc)?;
+    } else if em_has_pch_ecc(mac) {
+        em_update_pch_ecc_stats(ecc, io.read_register(E1000_PBECCSTS)?);
+    } else if em_has_82575_memory_errors(mac) {
+        em_update_82575_ecc_stats(
+            ecc,
+            io.read_register(E1000_PBECCSTS_82575)?,
+            io.read_register(E1000_RDHESTS_82575)?,
+            io.read_register(E1000_TDHESTS_82575)?,
+        );
+    } else if em_has_82576_memory_errors(mac) {
+        em_update_82576_ecc_stats(io, ecc, em_82576_has_ipsec(device_id))?;
+    } else if em_has_82580_memory_errors(mac) {
+        let _ = em_update_82580_ecc_stats(
+            ecc,
+            io.read_register(E1000_RPBECCSTS)?,
+            io.read_register(E1000_TPBECCSTS)?,
+            io.read_register(E1000_PCIEECCSTS)?,
+        );
+    } else if em_has_i350_i354_memory_errors(mac) {
+        em_update_i350_i354_ecc_stats(io, ecc, mac)?;
+    } else if em_has_i210_memory_errors(mac) {
+        em_update_i210_ecc_stats(io, ecc)?;
+    }
+    Ok(())
+}
+
+/// upstream: if_em.c em_get_hw_control()
+pub fn em_get_hw_control<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    is_vf: bool,
+) -> DevResult {
+    if is_vf {
+        return Ok(());
+    }
+    if mac == E1000MacType::I82573 {
+        let swsm = io.read_register(E1000_SWSM)?;
+        io.write_register(E1000_SWSM, swsm | E1000_SWSM_DRV_LOAD)
+    } else {
+        let ctrl = io.read_register(E1000_CTRL_EXT)?;
+        io.write_register(E1000_CTRL_EXT, ctrl | E1000_CTRL_EXT_DRV_LOAD)
+    }
+}
+
+/// upstream: if_em.c em_release_hw_control()
+pub fn em_release_hw_control<I: E1000RegisterIo>(
+    io: &mut I,
+    mac: E1000MacType,
+    has_manage: bool,
+) -> DevResult {
+    if !has_manage {
+        return Ok(());
+    }
+    if mac == E1000MacType::I82573 {
+        let swsm = io.read_register(E1000_SWSM)?;
+        io.write_register(E1000_SWSM, swsm & !E1000_SWSM_DRV_LOAD)
+    } else {
+        let ctrl = io.read_register(E1000_CTRL_EXT)?;
+        io.write_register(E1000_CTRL_EXT, ctrl & !E1000_CTRL_EXT_DRV_LOAD)
+    }
+}
+
+/// upstream: if_em.c em_init_manageability()
+pub fn em_init_manageability<I: E1000RegisterIo>(io: &mut I, has_manage: bool) -> DevResult {
+    if !has_manage {
+        return Ok(());
+    }
+    let manc2h = io.read_register(E1000_MANC2H)?;
+    let manc = io.read_register(E1000_MANC)?;
+    io.write_register(
+        E1000_MANC2H,
+        manc2h | E1000_MANC2H_PORT_623 | E1000_MANC2H_PORT_664,
+    )?;
+    io.write_register(
+        E1000_MANC,
+        (manc & !E1000_MANC_ARP_EN) | E1000_MANC_EN_MNG2HOST,
+    )
+}
+
+/// upstream: if_em.c em_release_manageability()
+pub fn em_release_manageability<I: E1000RegisterIo>(io: &mut I, has_manage: bool) -> DevResult {
+    if !has_manage {
+        return Ok(());
+    }
+    let manc = io.read_register(E1000_MANC)?;
+    io.write_register(
+        E1000_MANC,
+        (manc | E1000_MANC_ARP_EN) & !E1000_MANC_EN_MNG2HOST,
+    )
+}
+
+/// upstream: if_em.c em_disable_aspm()
+pub fn em_disable_aspm<P: E1000PciConfig>(pci: &mut P, mac: E1000MacType) -> DevResult {
+    if !matches!(
+        mac,
+        E1000MacType::I82573 | E1000MacType::I82574 | E1000MacType::I82583
+    ) {
+        return Ok(());
+    }
+    let base = match pci.find_capability(0x10) {
+        Some(value) => value,
+        None => return Ok(()),
+    };
+    let cap = pci.read_config_u16(base + 0x0c).ok_or(DevError::Io)?;
+    if cap & 0x0c00 == 0 {
+        return Ok(());
+    }
+    let link = pci.read_config_u16(base + 0x10).ok_or(DevError::Io)?;
+    pci.write_config_u16(base + 0x10, link & !0x0003)
+        .then_some(())
+        .ok_or(DevError::Io)
+}
+
+/// upstream: if_em.c em_initialize_receive_unit()
+pub fn em_initialize_receive_unit<I: E1000RegisterIo, O: EmRxUnitOps>(
+    io: &mut I,
+    ops: &mut O,
+    config: EmRxUnitConfig,
+    rings: &[EmRxRingConfig],
+) -> DevResult {
+    let mut rctl = io.read_register(E1000_RCTL)?;
+    if !matches!(config.mac, E1000MacType::I82574 | E1000MacType::I82583) {
+        io.write_register(E1000_RCTL, rctl & !E1000_RCTL_EN)?;
+    }
+    rctl &= !(3 << E1000_RCTL_MO_SHIFT);
+    rctl |= E1000_RCTL_EN
+        | E1000_RCTL_BAM
+        | E1000_RCTL_LBM_NO
+        | E1000_RCTL_RDMTS_HALF
+        | (u32::from(config.mc_filter_type) << E1000_RCTL_MO_SHIFT);
+    rctl &= !E1000_RCTL_SBP;
+    if config.iov || config.mtu > 1500 {
+        rctl |= E1000_RCTL_LPE
+    } else {
+        rctl &= !E1000_RCTL_LPE;
+    }
+    if !config.disable_crc_stripping {
+        rctl |= E1000_RCTL_SECRC;
+    }
+    if config.mac < E1000MacType::I82575 {
+        if config.mac >= E1000MacType::I82540 {
+            io.write_register(E1000_RADV, config.rx_abs_delay)?;
+            io.write_register(
+                E1000_ITR,
+                (ITR_RATE_DIVIDEND / (u64::from(config.max_interrupt_rate) * ITR_RATE_MULTIPLIER))
+                    as u32,
+            )?;
+        }
+        let rdtr = if config.mac == E1000MacType::I82573 {
+            0x20
+        } else {
+            config.rx_delay
+        };
+        io.write_register(E1000_RDTR, rdtr)?;
+    }
+    if config.mac >= E1000MacType::I82540 {
+        let mut rfctl = io.read_register(E1000_RFCTL)? | E1000_RFCTL_EXTEN;
+        if config.mac == E1000MacType::I82574 {
+            for q in 0..4 {
+                io.write_register(
+                    0x000e8 + q * 4,
+                    (ITR_RATE_DIVIDEND
+                        / (u64::from(config.max_interrupt_rate) * ITR_RATE_MULTIPLIER))
+                        as u32,
+                )?;
+            }
+            rfctl |= E1000_RFCTL_ACK_DIS;
+        }
+        io.write_register(E1000_RFCTL, rfctl)?;
+    }
+    let mut rxcsum = io.read_register(E1000_RXCSUM)?;
+    if config.rx_checksum {
+        rxcsum |= E1000_RXCSUM_TUOFL | E1000_RXCSUM_IPOFL;
+        if config.mac > E1000MacType::I82575 {
+            rxcsum |= E1000_RXCSUM_CRCOFL;
+        } else if config.mac < E1000MacType::I82540 && config.ipv6_checksum {
+            rxcsum |= E1000_RXCSUM_IPV6OFL;
+        }
+    } else {
+        rxcsum &= !(E1000_RXCSUM_IPOFL | E1000_RXCSUM_TUOFL);
+        if config.mac > E1000MacType::I82575 {
+            rxcsum &= !E1000_RXCSUM_CRCOFL;
+        } else if config.mac < E1000MacType::I82540 {
+            rxcsum &= !E1000_RXCSUM_IPV6OFL;
+        }
+    }
+    if config.rx_queues > 1 {
+        rxcsum |= E1000_RXCSUM_PCSD;
+        ops.initialize_rss()?;
+    }
+    io.write_register(E1000_RXCSUM, rxcsum)?;
+    if config.mac < E1000MacType::I82575 {
+        for ring in rings.iter().take(usize::from(config.rx_queues)) {
+            io.write_register(
+                rx_desc_length(ring.queue),
+                ring.descriptor_count * ring.descriptor_size,
+            )?;
+            io.write_register(rx_desc_base_high(ring.queue), (ring.dma_base >> 32) as u32)?;
+            io.write_register(rx_desc_base_low(ring.queue), ring.dma_base as u32)?;
+            io.write_register(rx_desc_head(ring.queue), 0)?;
+            io.write_register(rx_desc_tail(ring.queue), 0)?;
+        }
+    }
+    if em_integrated_jumbo_rx(config.mac) && config.mtu > 1500 {
+        let mut value = io.read_register(rx_desc_control(0))?;
+        value = (value & !0x00003f3f) | 3 | (1 << 8);
+        io.write_register(rx_desc_control(0), value)?;
+    } else if config.mac == E1000MacType::I82574 {
+        for queue in 0..config.rx_queues {
+            let reg = rx_desc_control(u32::from(queue));
+            let value = io.read_register(reg)?;
+            io.write_register(
+                reg,
+                (value & !0x003f_3f3f) | 32 | (4 << 8) | (4 << 16) | 0x0100_0000,
+            )?;
+        }
+    } else if config.mac >= E1000MacType::I82575 {
+        if config.iov {
+            io.write_register(E1000_RLPML, 0x2600)?;
+        } else if config.mtu > 1500 {
+            io.write_register(E1000_RLPML, config.max_frame_size)?;
+        }
+        let drop = config.iov
+            || (config.rx_queues > 1
+                && matches!(config.flow_mode, EmFlowMode::None | EmFlowMode::RxPause));
+        ops.initialize_advanced_rx_rings(drop)?;
+    } else if config.mac >= E1000MacType::Pch2Lan {
+        ops.jumbo_workaround(config.mtu > 1500)?;
+    }
+    rctl &= !E1000_RCTL_VFE;
+    if config.mac < E1000MacType::I82575 {
+        if config.mbuf_size > 2048 && config.mbuf_size <= 4096 {
+            rctl |= E1000_RCTL_SZ_4096 | E1000_RCTL_BSEX;
+        } else if config.mbuf_size > 4096 && config.mbuf_size <= 8192 {
+            rctl |= E1000_RCTL_SZ_8192 | E1000_RCTL_BSEX;
+        } else if config.mbuf_size > 8192 {
+            rctl |= E1000_RCTL_SZ_16384 | E1000_RCTL_BSEX;
+        } else {
+            rctl |= E1000_RCTL_SZ_2048;
+            rctl &= !E1000_RCTL_BSEX;
+        }
+    } else {
+        rctl |= E1000_RCTL_SZ_2048;
+    }
+    rctl &= !0x0000_0c00;
+    io.write_register(E1000_RCTL, rctl)
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::collections::BTreeMap;
+
     use super::*;
+
+    #[derive(Default)]
+    struct RegisterMock(BTreeMap<u32, u32>);
+    impl E1000RegisterIo for RegisterMock {
+        fn read_register(&mut self, register: u32) -> DevResult<u32> {
+            Ok(*self.0.get(&register).unwrap_or(&0))
+        }
+        fn write_register(&mut self, register: u32, value: u32) -> DevResult {
+            self.0.insert(register, value);
+            Ok(())
+        }
+        fn delay_us(&mut self, _micros: u32) {}
+        fn invalid_tail_write(&mut self, _direction: &'static str) {}
+    }
+    #[derive(Default)]
+    struct PciMock(BTreeMap<u32, u16>);
+    impl E1000PciConfig for PciMock {
+        fn read_config_u16(&mut self, register: u32) -> Option<u16> {
+            self.0.get(&register).copied()
+        }
+        fn write_config_u16(&mut self, register: u32, value: u16) -> bool {
+            self.0.insert(register, value);
+            true
+        }
+        fn find_capability(&mut self, id: u8) -> Option<u32> {
+            (id == 0x10).then_some(0x40)
+        }
+    }
+
+    #[test]
+    fn pci_identification_and_firmware_ownership_registers_follow_source() {
+        let mut pci = PciMock::default();
+        for (reg, value) in [
+            (0, 0x8086),
+            (2, 0x100e),
+            (4, 0),
+            (8, 1),
+            (0x2c, 0x8086),
+            (0x2e, 1),
+        ] {
+            pci.0.insert(reg, value);
+        }
+        let identity = em_identify_hardware(&mut pci, false).unwrap();
+        assert_eq!(identity.mac, E1000MacType::I82540);
+        assert_eq!(identity.vendor_id, 0x8086);
+        let mut io = RegisterMock::default();
+        em_get_hw_control(&mut io, E1000MacType::I82573, false).unwrap();
+        assert_eq!(io.0[&E1000_SWSM] & E1000_SWSM_DRV_LOAD, E1000_SWSM_DRV_LOAD);
+        em_release_hw_control(&mut io, E1000MacType::I82573, true).unwrap();
+        assert_eq!(io.0[&E1000_SWSM] & E1000_SWSM_DRV_LOAD, 0);
+    }
+
+    #[test]
+    fn management_host_setup_preserves_unrelated_bits() {
+        let mut io = RegisterMock::default();
+        io.0.insert(E1000_MANC, E1000_MANC_ARP_EN | 0x100);
+        io.0.insert(E1000_MANC2H, 0x80);
+        em_init_manageability(&mut io, true).unwrap();
+        assert_eq!(
+            io.0[&E1000_MANC] & (E1000_MANC_ARP_EN | E1000_MANC_EN_MNG2HOST),
+            E1000_MANC_EN_MNG2HOST
+        );
+        assert_eq!(io.0[&E1000_MANC2H], 0xe0);
+        em_release_manageability(&mut io, true).unwrap();
+        assert_ne!(io.0[&E1000_MANC] & E1000_MANC_ARP_EN, 0);
+        assert_eq!(io.0[&E1000_MANC] & E1000_MANC_EN_MNG2HOST, 0);
+    }
     #[test]
     fn queue_limits_and_aim_deltas_match_generation_policy() {
         assert_eq!(em_set_num_queues(E1000MacType::I82576), 8);
