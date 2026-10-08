@@ -977,3 +977,4 @@ shims. The scanner measures kernel/src as (86,42,20,130,8,0,0) at >=40 and
 (159,52,26,299,14,0,0) at >=25. The merged baseline uses these measured totals;
 individual-branch historical counts above are not additive. Other scopes
 retain the latest Intel inventory, with no scanner exemptions.
+| FreeBSD `sys/dev/ichiic/ig4_iic.c`, `ig4_pci.c`, `ig4_acpi.c`, `ig4_reg.h`, `ig4_var.h` | `crates/ax/tk-i2c/src/lib.rs` | FreeBSD 2026-10-08 snapshot | BSD-3-Clause (`ig4_iic.c`, `ig4_pci.c`, `ig4_reg.h`, `ig4_var.h`); BSD-2-Clause (`ig4_acpi.c`) | Copyright (c) 2014 The DragonFly Project; Copyright (c) 2016 Oleksandr Tymoshenko <gonzo@FreeBSD.org> | Controller registers, bounded transfer core, ACPI bus address type, and PCI IDs translated; platform bus attachment and i2c-dev ABI remain outstanding. |
