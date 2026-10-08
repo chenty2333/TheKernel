@@ -8,7 +8,7 @@
 //! Copyright (c) 2014 Fixup Software Ltd.
 //! Copyright (c) 2017, 2019, 2020 Stefan Sperling <stsp@openbsd.org>
 
-use alloc::vec::Vec;
+use alloc::{format, vec::Vec};
 
 const TLV_MAGIC: u32 = 0x0a4c_5749;
 const AX210_UCODE_API: u32 = 89;
@@ -50,6 +50,9 @@ const FW_CIPHER_SCHEME_SIZE: usize = 13;
 const FW_ADDR_CACHE_CONTROL: u32 = 0xc000_0000;
 const TLV_IML: u32 = 52;
 const TLV_PAN_FLAG: u32 = 1;
+const FW_CMD_VER_UNKNOWN: u8 = 99;
+const CPU1_CPU2_SEPARATOR: u32 = 0xffff_cccc;
+const PAGING_SEPARATOR: u32 = 0xaaaa_bbbb;
 
 /// Firmware microcode section type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,19 +203,7 @@ impl FirmwareImage {
                 TLV_SEC_RT_USNIFFER => {
                     store_section(&mut image, SectionType::RegularUsniffer, data)?
                 }
-                TLV_CSCHEME => {
-                    let count = *data.first().ok_or(FirmwareError::InvalidImage)? as usize;
-                    let minimum = 1usize
-                        .checked_add(
-                            count
-                                .checked_mul(FW_CIPHER_SCHEME_SIZE)
-                                .ok_or(FirmwareError::InvalidImage)?,
-                        )
-                        .ok_or(FirmwareError::InvalidImage)?;
-                    if data.len() < minimum {
-                        return Err(FirmwareError::InvalidImage);
-                    }
-                }
+                TLV_CSCHEME => validate_cipher_schemes(data)?,
                 TLV_NUM_OF_CPU => {
                     let cpus = read_tlv_u32(data)?;
                     if data.len() != 4 || !(1..=2).contains(&cpus) {
@@ -348,6 +339,95 @@ impl FirmwareImage {
         }
         Ok(image)
     }
+
+    /// Lookup a command version by firmware group and command ID.
+    // upstream: if_iwx.c iwx_lookup_cmd_ver()
+    pub fn lookup_command_version(&self, group: u8, command: u8) -> u8 {
+        self.command_versions
+            .iter()
+            .find(|entry| entry[1] == group && entry[0] == command)
+            .map_or(FW_CMD_VER_UNKNOWN, |entry| entry[2])
+    }
+
+    /// Lookup a notification version by firmware group and command ID.
+    // upstream: if_iwx.c iwx_lookup_notif_ver()
+    pub fn lookup_notification_version(&self, group: u8, command: u8) -> u8 {
+        self.command_versions
+            .iter()
+            .find(|entry| entry[1] == group && entry[0] == command)
+            .map_or(FW_CMD_VER_UNKNOWN, |entry| entry[3])
+    }
+
+    /// Count LMAC/UMAC/paging sections using their firmware separator markers.
+    // upstream: if_iwx.c iwx_get_num_sections()
+    pub fn section_counts_by_layout(&self) -> (usize, usize, usize) {
+        let lmac = count_sections(
+            self.sections
+                .iter()
+                .filter(|section| section.kind == SectionType::Regular),
+            0,
+        );
+        let umac = count_sections(
+            self.sections
+                .iter()
+                .filter(|section| section.kind == SectionType::Regular),
+            lmac + 1,
+        );
+        let paging = count_sections(
+            self.sections
+                .iter()
+                .filter(|section| section.kind == SectionType::Regular),
+            lmac + umac + 2,
+        );
+        (lmac, umac, paging)
+    }
+}
+
+/// OpenBSD reports the supported stream of HT MCS 8 through MCS 15 as MIMO2.
+// upstream: if_iwx.c iwx_is_mimo_ht_plcp()
+pub const fn is_mimo_ht_plcp(ht_plcp: u8) -> bool {
+    matches!(ht_plcp, 0x8..=0xf)
+}
+
+/// Format the firmware version as OpenBSD does, including its API-dependent minor radix.
+// upstream: if_iwx.c iwx_fw_version_str()
+pub fn firmware_version_string(major: u32, minor: u32, api: u32) -> alloc::string::String {
+    if major >= 35 {
+        format!("{major}.{minor:08x}.{api}")
+    } else {
+        format!("{major}.{minor}.{api}")
+    }
+}
+
+// upstream: if_iwx.c iwx_store_cscheme()
+fn validate_cipher_schemes(data: &[u8]) -> Result<(), FirmwareError> {
+    let Some(&count) = data.first() else {
+        return Err(FirmwareError::InvalidImage);
+    };
+    let needed = 1usize
+        .checked_add(
+            (count as usize)
+                .checked_mul(FW_CIPHER_SCHEME_SIZE)
+                .ok_or(FirmwareError::InvalidImage)?,
+        )
+        .ok_or(FirmwareError::InvalidImage)?;
+    if data.len() < needed {
+        return Err(FirmwareError::InvalidImage);
+    }
+    Ok(())
+}
+
+fn count_sections<'a>(sections: impl Iterator<Item = &'a FirmwareSection>, start: usize) -> usize {
+    let mut count = 0;
+    for (index, section) in sections.enumerate().skip(start) {
+        let _ = index;
+        if section.device_offset == CPU1_CPU2_SEPARATOR || section.device_offset == PAGING_SEPARATOR
+        {
+            break;
+        }
+        count += 1;
+    }
+    count
 }
 
 /// Select the PNVM subsection matching the device SKU and runtime MAC/RF type.
@@ -525,7 +605,7 @@ fn set_bitmap<const N: usize>(bitmap: &mut [u32; N], data: &[u8]) -> Result<(), 
 
 /// Build a valid minimal TLV image for parser unit tests.
 #[cfg(test)]
-fn test_image(tlvs: &[(u32, &[u8])]) -> Vec<u8> {
+pub(crate) fn test_image(tlvs: &[(u32, &[u8])]) -> Vec<u8> {
     let mut bytes = vec![0; HEADER_LEN];
     bytes[4..8].copy_from_slice(&TLV_MAGIC.to_le_bytes());
     bytes[72..76].copy_from_slice(&((1 << 24) | (2 << 16) | (AX210_UCODE_API << 8)).to_le_bytes());
@@ -543,6 +623,44 @@ fn test_image(tlvs: &[(u32, &[u8])]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn looks_up_command_and_notification_versions_and_unknown_default() {
+        let commands = [[0x44, 3, 7, 9]];
+        let image = FirmwareImage {
+            command_versions: commands.to_vec(),
+            ..FirmwareImage::parse(&test_image(&[])).unwrap()
+        };
+        assert_eq!(image.lookup_command_version(3, 0x44), 7);
+        assert_eq!(image.lookup_notification_version(3, 0x44), 9);
+        assert_eq!(image.lookup_command_version(0, 0), 99);
+    }
+
+    #[test]
+    fn detects_mimo_ht_rates_and_formats_api_dependent_version_minor() {
+        assert!(!is_mimo_ht_plcp(7));
+        assert!(is_mimo_ht_plcp(8));
+        assert!(is_mimo_ht_plcp(15));
+        assert!(!is_mimo_ht_plcp(16));
+        assert_eq!(firmware_version_string(34, 13, 89), "34.13.89");
+        assert_eq!(firmware_version_string(35, 13, 89), "35.0000000d.89");
+    }
+
+    #[test]
+    fn splits_firmware_sections_at_lmac_umac_and_paging_separators() {
+        let ordinary = 0x1000u32.to_le_bytes();
+        let image = FirmwareImage::parse(&test_image(&[
+            (TLV_SEC_RT, &ordinary),
+            (TLV_SEC_RT, &ordinary),
+            (TLV_SEC_RT, &CPU1_CPU2_SEPARATOR.to_le_bytes()),
+            (TLV_SEC_RT, &ordinary),
+            (TLV_SEC_RT, &PAGING_SEPARATOR.to_le_bytes()),
+            (TLV_SEC_RT, &ordinary),
+            (TLV_SEC_RT, &ordinary),
+        ]))
+        .unwrap();
+        assert_eq!(image.section_counts_by_layout(), (2, 1, 2));
+    }
 
     #[test]
     fn parses_ax211_image_sections_and_pnvm() {
