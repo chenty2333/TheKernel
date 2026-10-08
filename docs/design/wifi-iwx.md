@@ -115,6 +115,11 @@ Critical-temperature handling, matching time-event completion, UAPSD disable,
 session-protection completion, and station-only channel-switch recovery now
 have explicit state-policy updates.
 
+The MLD station/link command path now encodes the packed LINK_CONFIG_CMD and
+STA_CONFIG_CMD v1/v2 variants, source EDCA/protection/rate fields, and the
+ordered add/modify/configure and remove/deactivate/delete operations. The
+platform still supplies the station/node state consumed by these builders.
+
 The netif TX scheduler keeps management traffic eligible outside RUN, blocks
 data on queue-full/flush/management-only state, preserves encapsulation and
 node-release error paths, and retains the 500ms MFP leave wait.

@@ -29,6 +29,7 @@ mod keys;
 mod lifecycle;
 mod mac;
 mod mac_context;
+mod mld;
 mod nic;
 mod notif;
 mod nvm;
@@ -178,6 +179,16 @@ pub use mac_context::{
     MacContextUpdateError, OperationMode, mac_context_command, mld_mac_context_command,
     update_mac_context,
 };
+pub use mld::{
+    INVALID_PHY_ID, LINK_ACTION_ADD, LINK_ACTION_MODIFY, LINK_ACTION_REMOVE, LINK_CONFIG_BYTES,
+    LINK_CONFIG_COMMAND, LINK_MODIFY_ACTIVE, LINK_MODIFY_BEACON_TIMING,
+    LINK_MODIFY_PROTECTION_FLAGS, LINK_MODIFY_QOS_PARAMS, LINK_MODIFY_RATES_INFO, LINK_PROTECT_FAT,
+    LINK_PROTECT_HT, LINK_PROTECT_TGG, MAC_QOS_TGN, MAC_QOS_UPDATE_EDCA, MLD_MAC_CONF_GROUP,
+    MLD_REMOVE_STATION_ID, MldEdcaAc, MldHtProtection, MldLinkConfig, MldStationConfig,
+    MldStationError, MldStationStep, STA_CONFIG_COMMAND, STA_CONFIG_V1_BYTES, STA_CONFIG_V2_BYTES,
+    STA_MIMO, STA_REMOVE_COMMAND, STA_STATION_GENERAL, STA_STATION_LINK, mld_add_station,
+    mld_modify_link_fill, mld_remove_station, mld_station_config_command,
+};
 pub use nic::{configure_nic, disable_rx_dma, initialize_nic, initialize_rx};
 pub use notif::{
     HBUS_TARG_WRPTR, HBUS_WRPTR_RX_Q0, NotificationRingError, RFH_Q0_FRBDCB_WIDX_TRG,
@@ -264,16 +275,16 @@ pub use rx_packet::{
     RX_PACKET_HEADER_BYTES, RxPacket, RxPacketError, parse_rx_packet,
 };
 pub use scan::{
-    LONG_GROUP as IWX_LONG_GROUP, REDUCED_SCAN_CONFIG_API, SCAN_BAND_5GHZ, SCAN_BAND_24GHZ,
-    SCAN_BAND_FLAG_SHIFT, SCAN_CONFIG_COMMAND, SCAN_ENABLE_CHANNEL_ORDER, SCAN_GEN_ADAPTIVE_DWELL,
+    LONG_GROUP as IWX_LONG_GROUP, REDUCED_SCAN_CONFIG_API, SCAN_ACTIVE_DWELL, SCAN_BAND_5GHZ,
+    SCAN_BAND_24GHZ, SCAN_BAND_FLAG_SHIFT, SCAN_CONFIG_COMMAND, SCAN_ENABLE_CHANNEL_ORDER,
+    SCAN_FRAGMENTED_LMAC_1, SCAN_FRAGMENTED_LMAC_2, SCAN_GEN_ADAPTIVE_DWELL,
     SCAN_GEN_FORCE_PASSIVE, SCAN_GEN_NOTIFY_ITER_COMPLETE, SCAN_GEN_PASS_ALL, SCAN_MAX_CHANNELS,
-    SCAN_PASSIVE_MAX_PSD, SCAN_PRIORITY_EXT_6, SCAN_ACTIVE_DWELL, SCAN_PASSIVE_DWELL,
-    SCAN_FRAGMENTED_LMAC_1, SCAN_FRAGMENTED_LMAC_2, ScanChannelConfig, ScanChannelConfigV5,
-    ScanConfigError, ScanError, ScanState, UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ,
-    UmacScanConfig, UmacScanError, UmacScanVersion, abort_scan, begin_background_scan,
-    begin_foreground_scan, build_umac_scan_request, end_scan, fill_umac_scan_channels,
-    fill_umac_scan_channels_v5, initiate_scan_command, reduced_scan_config_command,
-    scan_abort_command, scan_umac_dwell_v10, scan_umac_dwell_v11,
+    SCAN_PASSIVE_DWELL, SCAN_PASSIVE_MAX_PSD, SCAN_PRIORITY_EXT_6, ScanChannelConfig,
+    ScanChannelConfigV5, ScanConfigError, ScanError, ScanState, UMAC_SCAN_ABORT,
+    UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ, UmacScanConfig, UmacScanError, UmacScanVersion, abort_scan,
+    begin_background_scan, begin_foreground_scan, build_umac_scan_request, end_scan,
+    fill_umac_scan_channels, fill_umac_scan_channels_v5, initiate_scan_command,
+    reduced_scan_config_command, scan_abort_command, scan_umac_dwell_v10, scan_umac_dwell_v11,
     scan_umac_fill_ch_p_v6, scan_umac_fill_ch_p_v7, scan_umac_fill_general_p_v10,
     scan_umac_fill_general_p_v11, scan_umac_flags_v2,
 };
