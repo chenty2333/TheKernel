@@ -94,6 +94,8 @@ mod virtio;
 mod usb;
 #[cfg(feature = "usb-xhci")]
 pub use usb::observations as usb_observations;
+#[cfg(feature = "usb-xhci")]
+pub use usb::{take_bluetooth_devices, UsbBluetoothHci};
 
 #[cfg(feature = "input")]
 #[path = "usb/hid_report.rs"]

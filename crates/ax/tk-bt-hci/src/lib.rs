@@ -213,6 +213,12 @@ impl<T: UsbTransport> Adapter<T> {
     pub fn pop_monitor(&mut self) -> Option<[u8; 260]> {
         self.monitor.pop_front()
     }
+    pub fn read_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        self.transport.read_interrupt_event(out)
+    }
+    pub fn read_acl(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        self.transport.read_bulk_acl(out)
+    }
     pub fn into_transport(self) -> T {
         self.transport
     }

@@ -354,3 +354,6 @@ optional = true
 [dependencies.tk-vtd]
 path = "../tk-vtd"
 optional = true
+
+[dependencies.tk-bt-hci]
+path = "../tk-bt-hci"

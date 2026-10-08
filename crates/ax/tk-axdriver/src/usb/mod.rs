@@ -1,4 +1,5 @@
 //! PCI xHCI host integration. Class drivers use the existing block/evdev APIs.
+mod bluetooth;
 mod dma;
 mod hid;
 pub mod observations;
@@ -16,6 +17,7 @@ use core::{
 };
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult};
+pub use bluetooth::{UsbBluetoothHci, take_devices as take_bluetooth_devices};
 use crab_usb::{
     DmaCoherency, EventHandler, USBHost,
     device::{Device, InterfaceSession},
@@ -169,7 +171,8 @@ fn class_control(
 /// Called only after the existing PCI enumerator has mapped/enabled BAR0.
 fn supported_interface(interface: &InterfaceDescriptor) -> bool {
     interface.alternate_setting == 0
-        && (interface.class == 3
+        && ((interface.class == 0xe0 && interface.subclass == 1 && interface.protocol == 1)
+            || interface.class == 3
             || (interface.class == 8 && interface.subclass == 6 && interface.protocol == 0x50))
 }
 
@@ -254,7 +257,7 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
             .flat_map(|group| &group.alt_settings)
             .filter(|i| supported_interface(i))
         {
-            let result: DevResult<crate::AxDeviceEnum> = (|| {
+            let result: DevResult<Option<crate::AxDeviceEnum>> = (|| {
                 let mut guard = device.lock();
                 let session = host
                     .wait(guard.claim_interface(interface.interface_number, 0))?
@@ -269,21 +272,42 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
                     )?;
                 }
                 drop(guard);
+                if interface.class == 0xe0 {
+                    static NEXT_BT_INDEX: core::sync::atomic::AtomicU16 =
+                        core::sync::atomic::AtomicU16::new(0);
+                    let bluetooth = bluetooth::UsbBluetoothHci::new(
+                        host.clone(),
+                        device.clone(),
+                        session,
+                        interface,
+                        NEXT_BT_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                    )?;
+                    bluetooth::register(bluetooth);
+                    info!(
+                        "USB Bluetooth HCI interface {} registered",
+                        interface.interface_number
+                    );
+                    return Ok(None);
+                }
                 if interface.class == 3 {
                     let input = UsbInput::new(host.clone(), device.clone(), session, interface)?;
                     #[cfg(not(feature = "dyn"))]
-                    return Ok(crate::AxDeviceEnum::Input(crate::AxInputDevice::Usb(input)));
+                    return Ok(Some(crate::AxDeviceEnum::Input(crate::AxInputDevice::Usb(
+                        input,
+                    ))));
                     #[cfg(feature = "dyn")]
-                    return Ok(crate::AxDeviceEnum::Input(Box::new(input)));
+                    return Ok(Some(crate::AxDeviceEnum::Input(Box::new(input))));
                 }
                 let block = UsbBlock::new(host.clone(), device.clone(), session, interface)?;
                 #[cfg(not(feature = "dyn"))]
-                return Ok(crate::AxDeviceEnum::Block(crate::AxBlockDevice::Usb(block)));
+                return Ok(Some(crate::AxDeviceEnum::Block(crate::AxBlockDevice::Usb(
+                    block,
+                ))));
                 #[cfg(feature = "dyn")]
-                return Ok(crate::AxDeviceEnum::Block(Box::new(block)));
+                return Ok(Some(crate::AxDeviceEnum::Block(Box::new(block))));
             })();
             match result {
-                Ok(device) => {
+                Ok(Some(device)) => {
                     info!(
                         "USB registered {} interface {}",
                         device.device_name(),
@@ -291,6 +315,7 @@ pub(crate) fn probe(mmio: NonNull<u8>) -> DevResult<Vec<crate::AxDeviceEnum>> {
                     );
                     devices.push(device);
                 }
+                Ok(None) => {}
                 Err(error) => warn!(
                     "USB {:04x}:{:04x} interface {} failed: {error:?}",
                     info.vendor_id(),
