@@ -1025,3 +1025,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - Intel/FreeBSD `e1000_phy.c` coverage update: 50 of 98 functions are now translated, including four-channel IGP2 AGC cable-length averaging from the upstream table. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
 
 - Intel/FreeBSD `e1000_phy.c` coverage update: 51 of 98 functions are now translated, including I210 and M88 Gen2 cable-length/page handling. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+- Intel/FreeBSD `e1000_phy.c` coverage update: 52 of 98 functions are now translated, including generic forced speed/duplex register configuration. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.

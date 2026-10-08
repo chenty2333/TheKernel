@@ -7,7 +7,7 @@
 use axdriver_base::{DevError, DevResult};
 
 use super::{
-    mac::{E1000PhyRegisterIo, FlowControlMode},
+    mac::{E1000PhyRegisterIo, FlowControlMode, config_collision_dist_generic},
     osdep::E1000RegisterIo,
     registers::*,
 };
@@ -36,6 +36,11 @@ const MII_1000T_CTRL: u8 = 0x09;
 const PHY_CONTROL: u8 = 0x00;
 const MII_CR_AUTO_NEG_EN: u16 = 0x1000;
 const MII_CR_RESTART_AUTO_NEG: u16 = 0x0200;
+const MII_CR_FULL_DUPLEX: u16 = 0x0100;
+const MII_CR_SPEED_1000: u16 = 0x0040;
+const MII_CR_SPEED_100: u16 = 0x2000;
+const ALL_HALF_DUPLEX: u16 = ADVERTISE_10_HALF | ADVERTISE_100_HALF;
+const ALL_100_SPEED: u16 = ADVERTISE_100_HALF | ADVERTISE_100_FULL;
 const CR_1000T_MS_ENABLE: u16 = 0x1000;
 const CR_1000T_MS_VALUE: u16 = 0x0800;
 const PHY_STATUS: u8 = 0x01;
@@ -672,6 +677,39 @@ where
         _ => return Err(DevError::Unsupported),
     }
     Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_phy_force_speed_duplex_setup()
+pub fn phy_force_speed_duplex_setup<I: E1000RegisterIo>(
+    io: &mut I,
+    flow_control: &mut FlowControlMode,
+    forced_speed_duplex: u16,
+    mut phy_control: u16,
+) -> DevResult<u16> {
+    *flow_control = FlowControlMode::None;
+    let mut control = io.read_register(E1000_CTRL)?;
+    control |= E1000_CTRL_FRCSPD | E1000_CTRL_FRCDPX;
+    control &= !E1000_CTRL_SPD_SEL;
+    control &= !E1000_CTRL_ASDE;
+    phy_control &= !MII_CR_AUTO_NEG_EN;
+    if forced_speed_duplex & ALL_HALF_DUPLEX != 0 {
+        control &= !E1000_CTRL_FD;
+        phy_control &= !MII_CR_FULL_DUPLEX;
+    } else {
+        control |= E1000_CTRL_FD;
+        phy_control |= MII_CR_FULL_DUPLEX;
+    }
+    if forced_speed_duplex & ALL_100_SPEED != 0 {
+        control |= E1000_CTRL_SPD_100;
+        phy_control |= MII_CR_SPEED_100;
+        phy_control &= !MII_CR_SPEED_1000;
+    } else {
+        control &= !(E1000_CTRL_SPD_1000 | E1000_CTRL_SPD_100);
+        phy_control &= !(MII_CR_SPEED_1000 | MII_CR_SPEED_100);
+    }
+    config_collision_dist_generic(io)?;
+    io.write_register(E1000_CTRL, control)?;
+    Ok(phy_control)
 }
 
 /// upstream: e1000_phy.c e1000_get_phy_type_from_id()
@@ -1615,5 +1653,27 @@ mod tests {
         .unwrap();
         assert_eq!(diagnostics.cable_length, 125);
         assert_eq!(writes, [(I347AT4_PAGE_SELECT, 5), (I347AT4_PAGE_SELECT, 4)]);
+    }
+
+    #[test]
+    fn generic_force_speed_duplex_updates_mac_phy_and_disables_flow_control() {
+        let mut io = Io::default();
+        let mut flow = FlowControlMode::Full;
+        let phy = phy_force_speed_duplex_setup(
+            &mut io,
+            &mut flow,
+            ADVERTISE_100_FULL,
+            MII_CR_AUTO_NEG_EN | MII_CR_SPEED_1000,
+        )
+        .unwrap();
+        assert_eq!(flow, FlowControlMode::None);
+        assert_eq!(phy, MII_CR_FULL_DUPLEX | MII_CR_SPEED_100);
+        assert_eq!(
+            io.writes.last(),
+            Some(&(
+                E1000_CTRL,
+                E1000_CTRL_FRCSPD | E1000_CTRL_FRCDPX | E1000_CTRL_FD | E1000_CTRL_SPD_100
+            ))
+        );
     }
 }
