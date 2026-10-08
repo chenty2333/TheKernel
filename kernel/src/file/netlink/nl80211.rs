@@ -25,6 +25,7 @@ const CMD_TRIGGER_SCAN: u8 = 33;
 const CMD_NEW_SCAN_RESULTS: u8 = 34;
 const CMD_SCAN_ABORTED: u8 = 35;
 const CMD_ABORT_SCAN: u8 = 114;
+const NL80211_SCAN_GROUP_MASK: u32 = 1 << 1;
 const CMD_GET_REG: u8 = 31;
 const ATTR_WIPHY: u16 = 1;
 const ATTR_WIPHY_NAME: u16 = 2;
@@ -81,6 +82,7 @@ const MULTICAST_GROUPS: [&str; 7] = [
 ];
 
 pub(super) fn family_message(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
+    axnet::register_wireless_scan_event_callback(publish_wireless_scan_event);
     let mut payload = payload_with(&GenlMsgHdr {
         cmd: CTRL_CMD_NEWFAMILY,
         version: 2,
@@ -112,6 +114,31 @@ pub(super) fn family_message(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
     }
     push_attr(&mut payload, CTRL_ATTR_MCAST_GROUPS | NLA_F_NESTED, &groups);
     wiremsg::netlink_message(request, port_id, GENL_ID_CTRL, payload)
+}
+
+fn publish_wireless_scan_event(ifindex: u32, event: axnet::WirelessScanEvent) {
+    let message = scan_event_message(ifindex, event);
+    super::queue_nl80211_multicast(message, NL80211_SCAN_GROUP_MASK);
+}
+
+fn scan_event_message(ifindex: u32, event: axnet::WirelessScanEvent) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: match event {
+            axnet::WirelessScanEvent::Results => CMD_NEW_SCAN_RESULTS,
+            axnet::WirelessScanEvent::Aborted => CMD_SCAN_ABORTED,
+        },
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr(&mut payload, ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    let request = NlMsgHdr {
+        nlmsg_len: (size_of::<NlMsgHdr>() + payload.len()) as u32,
+        nlmsg_type: FAMILY_ID,
+        nlmsg_flags: 0,
+        nlmsg_seq: 0,
+        nlmsg_pid: 0,
+    };
+    nl80211_message(&request, 0, FAMILY_ID, payload, false)
 }
 
 /// Handle the wiphy/interface dump operations used by `iw dev` and `iw phy`.
@@ -960,5 +987,33 @@ mod tests {
             decoded[6],
             (BSS_ATTR_SIGNAL_MBM, (-4200i32).to_ne_bytes().to_vec())
         );
+    }
+
+    #[test]
+    fn scan_completion_multicast_event_uses_scan_group_commands_and_ifindex() {
+        for (event, command) in [
+            (axnet::WirelessScanEvent::Results, CMD_NEW_SCAN_RESULTS),
+            (axnet::WirelessScanEvent::Aborted, CMD_SCAN_ABORTED),
+        ] {
+            let message = scan_event_message(17, event);
+            let header = read_unaligned::<NlMsgHdr>(&message).unwrap();
+            assert_eq!(header.nlmsg_type, FAMILY_ID);
+            assert_eq!(header.nlmsg_seq, 0);
+            let generic = read_unaligned::<GenlMsgHdr>(&message[size_of::<NlMsgHdr>()..]).unwrap();
+            assert_eq!(generic.cmd, command);
+            let mut ifindex = None;
+            for_each_rtattr(
+                &message[size_of::<NlMsgHdr>() + size_of::<GenlMsgHdr>()..],
+                |kind, value| {
+                    if kind == ATTR_IFINDEX {
+                        ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(ifindex, Some(17));
+        }
+        assert_eq!(NL80211_SCAN_GROUP_MASK, 2);
     }
 }

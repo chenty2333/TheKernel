@@ -20,7 +20,7 @@ use axdriver_iwx::{
 };
 use axdriver_net::{
     EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps, WirelessFrequency,
-    WirelessHtCapabilities, WirelessPhyCapabilities, WirelessVhtCapabilities,
+    WirelessHtCapabilities, WirelessPhyCapabilities, WirelessScanEvent, WirelessVhtCapabilities,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
@@ -200,6 +200,7 @@ struct AttachedDevice {
     scan_cache: Option<axdriver_iwx::ScanCache>,
     scan_phy: Option<axdriver_iwx::RxPhyInfo>,
     scan_complete: bool,
+    scan_event: Option<WirelessScanEvent>,
     runtime_started: bool,
     interface_up: bool,
     soft_blocked: bool,
@@ -391,6 +392,14 @@ impl NetDriverOps for IwxNetDevice {
             .map_or_else(Vec::new, |cache| cache.results().to_vec())
     }
 
+    fn take_wireless_scan_event(&mut self) -> Option<WirelessScanEvent> {
+        ATTACHED_DMA
+            .lock()
+            .iter_mut()
+            .find(|device| device.bdf == self.bdf)
+            .and_then(|device| device.scan_event.take())
+    }
+
     fn mac_address(&self) -> EthernetAddress {
         let address = ATTACHED_DMA
             .lock()
@@ -413,7 +422,9 @@ impl NetDriverOps for IwxNetDevice {
             .iter()
             .find(|device| device.bdf == self.bdf)
             .is_some_and(|device| {
-                device.runtime_started && device.scan_cache.is_some() && !device.scan_complete
+                device.runtime_started
+                    && ((device.scan_cache.is_some() && !device.scan_complete)
+                        || device.scan_event.is_some())
             })
     }
 
@@ -584,6 +595,7 @@ fn allocate_resources(
         scan_cache: None,
         scan_phy: None,
         scan_complete: false,
+        scan_event: None,
         runtime_started: false,
         interface_up: false,
         soft_blocked: false,
@@ -658,16 +670,18 @@ fn trigger_scan(
     device.scan_cache = Some(axdriver_iwx::ScanCache::new(channels, 0, 0, false));
     device.scan_phy = None;
     device.scan_complete = false;
+    device.scan_event = None;
     let family = device.profile.family;
-    let (controller, cache, phy, complete) = (
+    let (controller, cache, phy, complete, event) = (
         &mut device.controller,
         device.scan_cache.as_mut().unwrap(),
         &mut device.scan_phy,
         &mut device.scan_complete,
+        &mut device.scan_event,
     );
     controller
         .send_encoded_command_wait_allocated(&command, |packet, _| {
-            observe_scan_packet(family, cache, phy, complete, packet);
+            observe_scan_packet(family, cache, phy, complete, event, packet);
             Ok::<_, Infallible>(true)
         })
         .map_err(|_| RuntimeStartError::Firmware)?;
@@ -676,11 +690,12 @@ fn trigger_scan(
 
 fn pump_scan_events(device: &mut AttachedDevice) -> Result<(), ()> {
     let family = device.profile.family;
-    let (controller, cache, phy, complete) = (
+    let (controller, cache, phy, complete, event) = (
         &mut device.controller,
         device.scan_cache.as_mut().ok_or(())?,
         &mut device.scan_phy,
         &mut device.scan_complete,
+        &mut device.scan_event,
     );
     let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
         &mut controller.registers,
@@ -690,7 +705,7 @@ fn pump_scan_events(device: &mut AttachedDevice) -> Result<(), ()> {
     .map_err(|_| ())?;
     controller
         .process_rx_notifications(|packet, _| {
-            observe_scan_packet(family, cache, phy, complete, packet);
+            observe_scan_packet(family, cache, phy, complete, event, packet);
             Ok::<_, Infallible>(true)
         })
         .map_err(|_| ())?;
@@ -712,7 +727,7 @@ fn abort_scan(bdf: Bdf) -> Result<(), RuntimeStartError> {
     let command =
         axdriver_iwx::scan_abort_command(0, 0).map_err(|_| RuntimeStartError::Firmware)?;
     let family = device.profile.family;
-    let (controller, cache, phy, complete) = (
+    let (controller, cache, phy, complete, event) = (
         &mut device.controller,
         device
             .scan_cache
@@ -720,14 +735,16 @@ fn abort_scan(bdf: Bdf) -> Result<(), RuntimeStartError> {
             .ok_or(RuntimeStartError::Firmware)?,
         &mut device.scan_phy,
         &mut device.scan_complete,
+        &mut device.scan_event,
     );
     controller
         .send_encoded_command_wait(&command, None, |packet, _| {
-            observe_scan_packet(family, cache, phy, complete, packet);
+            observe_scan_packet(family, cache, phy, complete, event, packet);
             Ok::<_, Infallible>(true)
         })
         .map_err(|_| RuntimeStartError::Firmware)?;
     *complete = true;
+    *event = Some(WirelessScanEvent::Aborted);
     Ok(())
 }
 
@@ -736,6 +753,7 @@ fn observe_scan_packet(
     cache: &mut axdriver_iwx::ScanCache,
     phy: &mut Option<axdriver_iwx::RxPhyInfo>,
     complete: &mut bool,
+    scan_event: &mut Option<WirelessScanEvent>,
     packet: &axdriver_iwx::RxPacket<'_>,
 ) {
     match axdriver_iwx::decode_firmware_event(packet) {
@@ -755,7 +773,12 @@ fn observe_scan_packet(
                 .clamp(-127, 0) as i8;
             cache.observe(&frame, phy.channel as u8, rssi, phy.timestamp);
         }
-        axdriver_iwx::FirmwareEvent::ScanComplete(_) => *complete = true,
+        axdriver_iwx::FirmwareEvent::ScanComplete(_) => {
+            if !*complete {
+                *scan_event = Some(WirelessScanEvent::Results);
+            }
+            *complete = true;
+        }
         _ => {}
     }
 }

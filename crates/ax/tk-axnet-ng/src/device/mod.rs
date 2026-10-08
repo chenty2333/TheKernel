@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 use core::task::Waker;
 
-use axdriver::prelude::{WirelessBssInfo, WirelessScanRequest};
+use axdriver::prelude::{WirelessBssInfo, WirelessScanEvent, WirelessScanRequest};
 use axerrno::{AxError, AxResult};
 use axpoll::{PollRegistrationError, PollSet, RegisterError, RegistrationToken, UpdateError};
 use axsync::spin::SpinNoIrq;
@@ -253,6 +253,10 @@ pub trait Device: Send + Sync {
 
     fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {
         Vec::new()
+    }
+
+    fn take_wireless_scan_event(&mut self) -> Option<WirelessScanEvent> {
+        None
     }
 
     fn hardware_address(&self) -> Option<[u8; 6]> {

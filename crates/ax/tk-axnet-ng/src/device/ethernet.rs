@@ -671,6 +671,10 @@ impl Device for EthernetDevice {
         self.inner.wireless_scan_results()
     }
 
+    fn take_wireless_scan_event(&mut self) -> Option<WirelessScanEvent> {
+        self.inner.take_wireless_scan_event()
+    }
+
     fn has_rx_backlog(&self) -> bool {
         !self.quarantined && self.inner.can_receive()
     }
@@ -729,7 +733,11 @@ impl Device for EthernetDevice {
         if self.quarantined {
             return RxStep::Idle;
         }
-        let rx_buf = match self.inner.receive() {
+        let rx = self.inner.receive();
+        if let Some(event) = self.inner.take_wireless_scan_event() {
+            crate::publish_wireless_scan_event(context.interface_index(), event);
+        }
+        let rx_buf = match rx {
             Ok(buf) => buf,
             Err(err) => {
                 if !matches!(err, DevError::Again) {

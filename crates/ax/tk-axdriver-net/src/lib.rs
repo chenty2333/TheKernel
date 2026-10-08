@@ -84,6 +84,13 @@ pub struct WirelessBssInfo {
     pub is_probe_response: bool,
 }
 
+/// A completed station scan notification for the nl80211 scan multicast group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WirelessScanEvent {
+    Results,
+    Aborted,
+}
+
 /// Operations that require a network device (NIC) driver to implement.
 pub trait NetDriverOps: BaseDriverOps {
     /// Preferred init-net interface name, when the driver owns a named link.
@@ -135,6 +142,11 @@ pub trait NetDriverOps: BaseDriverOps {
     /// Snapshot BSSes parsed from received firmware RX notifications.
     fn wireless_scan_results(&self) -> alloc::vec::Vec<WirelessBssInfo> {
         alloc::vec::Vec::new()
+    }
+
+    /// Take one completion event after firmware scan notification processing.
+    fn take_wireless_scan_event(&mut self) -> Option<WirelessScanEvent> {
+        None
     }
 
     /// Change administrative radio state before the interface state is published.

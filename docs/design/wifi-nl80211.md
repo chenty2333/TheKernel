@@ -46,10 +46,10 @@ polling worker drains firmware notifications and feeds that cache. The result
 records carry nested BSSID, frequency, TSF, capability, IEs, signal, and age
 attributes.
 ABORT_SCAN sends the source UMAC abort command when a foreground scan is active.
-The cache pump currently runs while waiting for the command ACK and while a
-scan dump is queried. A multicast NEW_SCAN_RESULTS/SCAN_ABORTED producer and
-notification-driven wakeup are not yet connected, so this scan path is not yet
-sufficient for wpa_supplicant's event-driven completion loop. GET_REG returns
+The cache pump runs while waiting for the command ACK, from the bounded axnet
+RX poll, and while a scan dump is queried. Firmware completion/abort emits
+NEW_SCAN_RESULTS/SCAN_ABORTED on the nl80211 `scan` multicast group. Events are
+deferred out of the RX service lock before listener delivery. GET_REG returns
 the global world alpha2 value; regulatory rule tables and per-phy domains are
 not yet emitted. Connection/authentication, key, station and regulatory rule
 operations remain incomplete. The required no-radio QEMU acceptance is

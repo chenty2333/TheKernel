@@ -64,8 +64,21 @@ use spin::Once;
 
 pub use axdriver::prelude::{
     WirelessBssInfo, WirelessHtCapabilities, WirelessPhyCapabilities, WirelessScanRequest,
-    WirelessVhtCapabilities,
+    WirelessScanEvent, WirelessVhtCapabilities,
 };
+
+static WIRELESS_SCAN_EVENT_CALLBACK: Once<fn(u32, WirelessScanEvent)> = Once::new();
+
+/// Register the kernel nl80211 recipient for completed firmware scans.
+pub fn register_wireless_scan_event_callback(callback: fn(u32, WirelessScanEvent)) {
+    let _ = WIRELESS_SCAN_EVENT_CALLBACK.call_once(|| callback);
+}
+
+pub(crate) fn publish_wireless_scan_event(ifindex: u32, event: WirelessScanEvent) {
+    if let Some(callback) = WIRELESS_SCAN_EVENT_CALLBACK.get() {
+        callback(ifindex, event);
+    }
+}
 
 use self::{
     consts::{GATEWAY, IP, IP_PREFIX},

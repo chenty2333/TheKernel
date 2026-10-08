@@ -692,6 +692,108 @@ const KERNEL_UEVENT_CREDENTIALS: NetlinkCredentials = NetlinkCredentials {
 
 static KOBJECT_UEVENT_SOCKETS: Lazy<Mutex<Vec<Weak<NetlinkSocket>>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
+static GENERIC_NETLINK_SOCKETS: Lazy<Mutex<Vec<Weak<NetlinkSocket>>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+static PENDING_GENERIC_MULTICAST: Lazy<Mutex<VecDeque<PendingGenericMulticast>>> =
+    Lazy::new(|| Mutex::new(VecDeque::new()));
+
+struct PendingGenericMulticast {
+    data: Vec<u8>,
+    group_mask: u32,
+}
+
+/// Defer a generic-netlink multicast from an RX-service callback.  The netdev
+/// poller holds axnet's service lock, so it must not take listener socket
+/// locks while another nl80211 request may hold those locks and be entering
+/// the service layer.
+pub(crate) fn queue_nl80211_multicast(data: Vec<u8>, group_mask: u32) {
+    {
+        let mut pending = PENDING_GENERIC_MULTICAST.lock();
+        if pending.try_reserve(1).is_err() {
+            return;
+        }
+        if pending.len() == 64 {
+            pending.pop_front();
+        }
+        pending.push_back(PendingGenericMulticast { data, group_mask });
+    }
+    let mut sockets = GENERIC_NETLINK_SOCKETS.lock();
+    sockets.retain(|weak| weak.strong_count() != 0);
+    for weak in sockets.iter() {
+        if let Some(socket) = weak.upgrade() {
+            socket.poll_rx.wake();
+        }
+    }
+}
+
+fn flush_pending_generic_multicast() {
+    let mut events = Vec::new();
+    {
+        let mut pending = PENDING_GENERIC_MULTICAST.lock();
+        if events.try_reserve_exact(pending.len()).is_err() {
+            return;
+        }
+        events.extend(pending.drain(..));
+    }
+    if events.is_empty() {
+        return;
+    }
+    let listeners = {
+        let mut sockets = GENERIC_NETLINK_SOCKETS.lock();
+        sockets.retain(|weak| weak.strong_count() != 0);
+        let mut listeners = Vec::new();
+        if listeners.try_reserve_exact(sockets.len()).is_err() {
+            return;
+        }
+        listeners.extend(sockets.iter().filter_map(Weak::upgrade));
+        listeners
+    };
+    for event in events {
+        for listener in &listeners {
+            let state = listener.state.lock();
+            if state.groups & u64::from(event.group_mask) == 0 {
+                continue;
+            }
+            let receive_limit = usize::try_from(state.sock.rcvbuf).unwrap_or(0);
+            let suppress_enobufs = state.option_flags & (1 << NETLINK_NO_ENOBUFS) != 0;
+            let mut queue = listener.queue.lock();
+            if admit_netlink_queue(
+                queue.datagrams.len(),
+                queue.bytes,
+                event.data.len(),
+                NETLINK_QUEUE_LIMIT,
+                receive_limit,
+            ) == NetlinkQueueAdmission::Drop
+            {
+                if !suppress_enobufs {
+                    listener.overrun.store(true, Ordering::Release);
+                }
+                drop(queue);
+                listener.poll_rx.wake();
+                continue;
+            }
+            let mut data = Vec::new();
+            if data.try_reserve_exact(event.data.len()).is_err() {
+                if !suppress_enobufs {
+                    listener.overrun.store(true, Ordering::Release);
+                }
+                drop(queue);
+                listener.poll_rx.wake();
+                continue;
+            }
+            data.extend_from_slice(&event.data);
+            queue.bytes += data.len();
+            queue.datagrams.push_back(NetlinkDatagram {
+                data,
+                source_port_id: 0,
+                source_groups: event.group_mask,
+                credentials: None,
+            });
+            drop(queue);
+            listener.poll_rx.wake();
+        }
+    }
+}
 /// User-to-user transport registrations.  Linux's `NETLINK_USERSOCK` protocol
 /// has no kernel message handler at all: `netlink_unicast` resolves the
 /// destination through `nl_table[NETLINK_USERSOCK].hash` and delivers the
@@ -818,6 +920,11 @@ impl NetlinkSocket {
         .map_err(|_| AxError::NoMemory)?;
         if protocol == NETLINK_KOBJECT_UEVENT {
             let mut sockets = KOBJECT_UEVENT_SOCKETS.lock();
+            sockets.retain(|socket| socket.strong_count() != 0);
+            sockets.push(Arc::downgrade(&socket));
+        }
+        if protocol == NETLINK_GENERIC {
+            let mut sockets = GENERIC_NETLINK_SOCKETS.lock();
             sockets.retain(|socket| socket.strong_count() != 0);
             sockets.push(Arc::downgrade(&socket));
         }
@@ -1559,6 +1666,9 @@ impl NetlinkSocket {
         nonblocking: bool,
         nowait: bool,
     ) -> AxResult<NetlinkReceived> {
+        if self.protocol == NETLINK_GENERIC {
+            flush_pending_generic_multicast();
+        }
         // `skb_recv_datagram()` asks `sock_rcvtimeo(sk, flags & MSG_DONTWAIT)`
         // (`net/core/datagram.c:294-295`), so an explicit non-blocking flag
         // replaces the configured timeout with zero, and a zero timeout leaves
@@ -3498,6 +3608,15 @@ impl Drop for NetlinkSocket {
                 sockets.shrink_to(retained.max(16));
             }
         }
+        if self.protocol == NETLINK_GENERIC {
+            let mut sockets = GENERIC_NETLINK_SOCKETS.lock();
+            let this = core::ptr::from_ref(self);
+            sockets.retain(|weak| weak.as_ptr() != this && weak.strong_count() != 0);
+            let retained = sockets.len();
+            if sockets.capacity() > retained.saturating_mul(2).max(16) {
+                sockets.shrink_to(retained.max(16));
+            }
+        }
         if self.protocol == NETLINK_USERSOCK {
             let mut sockets = USERSOCK_SOCKETS.lock();
             let this = core::ptr::from_ref(self);
@@ -3791,6 +3910,27 @@ mod tests {
         assert!(weak.upgrade().is_some());
         drop(socket);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn generic_multicast_is_deferred_and_delivered_only_to_subscribed_scan_group() {
+        let _context = crate::test_support::scheduler_test_context();
+        PENDING_GENERIC_MULTICAST.lock().clear();
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let subscribed = NetlinkSocket::try_new(NETLINK_GENERIC, SOCK_RAW, net_ns.clone()).unwrap();
+        let unsubscribed = NetlinkSocket::try_new(NETLINK_GENERIC, SOCK_RAW, net_ns).unwrap();
+        subscribed.state.lock().groups = 1 << 1;
+
+        queue_nl80211_multicast(vec![1, 2, 3], 1 << 1);
+        assert!(subscribed.queue.lock().datagrams.is_empty());
+        flush_pending_generic_multicast();
+
+        let received = subscribed.queue.lock();
+        assert_eq!(received.datagrams.len(), 1);
+        assert_eq!(received.datagrams[0].data, [1, 2, 3]);
+        assert_eq!(received.datagrams[0].source_groups, 1 << 1);
+        assert!(unsubscribed.queue.lock().datagrams.is_empty());
     }
 
     #[test]
