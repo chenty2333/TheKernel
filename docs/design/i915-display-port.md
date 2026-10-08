@@ -37,3 +37,8 @@ Linux DRM common code is reviewed file-by-file under the same gate. Framework be
 ## Boundaries / non-goals
 
 This map does not include GT/GEM (`gt/`, `gtt/`, `gem_*.rs`, `gt_probe.rs`, owned by G2), legacy display generations, DSI/CRT/VGA, or generic Linux device frameworks. New support should preserve established TheKernel PCI/MMIO, DMA, interrupt, firmware, framebuffer and DRM abstractions. Additions to shared manifests, DRM generic files, and provenance/licensing registries are append-only.
+
+Power-well translation also includes the BIOS-to-driver request handoff and
+requester-order reads. The display-power subsystem remains partial: DDI/AUX,
+IRQ-coupled well transitions, async puts, and full KMS reference lifetimes have
+not yet been connected.

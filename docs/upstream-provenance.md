@@ -1042,3 +1042,8 @@ and GT-IRQ identifiers.
 `intel_display_power_well.c` (MIT, Copyright © 2022 Intel). Its observer maps
 the source's PSR and DMC DC6-count side effects; boot-time disable uses the
 helper during initialization with those side effects intentionally suppressed.
+
+`power_well.rs` translates `hsw_power_well_sync_hw()` from
+`intel_display_power_well.c` (MIT, Copyright © 2022 Intel), transferring a BIOS
+request to the driver before clearing BIOS ownership; requester reads follow
+BIOS, driver, KVMR, then debug order.

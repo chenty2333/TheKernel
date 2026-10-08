@@ -108,16 +108,40 @@ pub fn hsw_power_well_requesters(
     index: u8,
 ) -> Result<Requesters, Error> {
     let mask = request_mask(index);
+    let bios = io.read32(registers.bios)? & mask != 0;
+    let driver = io.read32(registers.driver)? & mask != 0;
     let kvmr = match registers.kvmr {
         Some(register) => io.read32(register)? & mask != 0,
         None => false,
     };
+    let debug = io.read32(registers.debug)? & mask != 0;
     Ok(Requesters {
-        bios: io.read32(registers.bios)? & mask != 0,
-        driver: io.read32(registers.driver)? & mask != 0,
+        bios,
+        driver,
         kvmr,
-        debug: io.read32(registers.debug)? & mask != 0,
+        debug,
     })
+}
+
+/// Transfer a BIOS-owned request to the driver without dropping the well.
+// upstream: intel_display_power_well.c hsw_power_well_sync_hw()
+pub fn hsw_power_well_sync_hw(
+    io: &impl HswPowerWellIo,
+    registers: HswWellRegisters,
+    index: u8,
+) -> Result<bool, Error> {
+    let mask = request_mask(index);
+    let bios = io.read32(registers.bios)?;
+    if bios & mask == 0 {
+        return Ok(false);
+    }
+
+    let driver = io.read32(registers.driver)?;
+    if driver & mask == 0 {
+        io.write32(registers.driver, driver | mask)?;
+    }
+    io.write32(registers.bios, bios & !mask)?;
+    Ok(true)
 }
 
 // upstream: intel_display_power_well.c gen9_wait_for_power_well_fuses()
@@ -224,6 +248,7 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         registers: RefCell<Vec<(u32, u32)>>,
+        reads: RefCell<Vec<u32>>,
         writes: RefCell<Vec<(u32, u32)>>,
         waits: RefCell<Vec<(u32, u32, u16, bool)>>,
     }
@@ -253,6 +278,7 @@ mod tests {
 
     impl RegisterIo for Fake {
         fn read32(&self, offset: u32) -> Result<u32, Error> {
+            self.reads.borrow_mut().push(offset);
             Ok(self.value(offset))
         }
 
@@ -334,6 +360,42 @@ mod tests {
                 (2, state_mask(0), 1, true),
                 (4, pg_mask(1), 1, true),
             ]
+        );
+    }
+
+    #[test]
+    fn requester_reads_follow_bios_driver_kvmr_debug_order() {
+        let io = Fake::default();
+        let registers = HswWellRegisters {
+            bios: 10,
+            driver: 11,
+            kvmr: Some(12),
+            debug: 13,
+            fuse_status: 14,
+            gen8_chicken_dcpr1: 15,
+        };
+        hsw_power_well_requesters(&io, registers, 0).unwrap();
+        assert_eq!(io.reads.borrow().as_slice(), &[10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn sync_transfers_only_a_bios_request_to_driver_then_clears_bios() {
+        let io = Fake::default();
+        let registers = HswWellRegisters {
+            bios: 10,
+            driver: 11,
+            kvmr: None,
+            debug: 13,
+            fuse_status: 14,
+            gen8_chicken_dcpr1: 15,
+        };
+        io.set(10, request_mask(0) | 0x80);
+        io.set(11, 0x40);
+        assert!(hsw_power_well_sync_hw(&io, registers, 0).unwrap());
+        assert_eq!(io.reads.borrow().as_slice(), &[10, 11]);
+        assert_eq!(
+            io.writes.borrow().as_slice(),
+            &[(11, 0x40 | request_mask(0)), (10, 0x80)]
         );
     }
 }

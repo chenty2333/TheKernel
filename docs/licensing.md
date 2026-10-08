@@ -577,3 +577,7 @@ translates the MIT request-mask clamp, PSR/DC6 observer boundaries, owned-field
 update, retry/readback, and stored state from `intel_display_power_well.c`
 (Copyright © 2022 Intel). The kernel uses it for the boot-time disable path;
 its no-op observer is only for initialization, before PSR/DMC policy exists.
+
+`tk-intel-display/src/power_well.rs` also translates the BIOS-to-driver request
+handoff in `hsw_power_well_sync_hw()` (MIT, Copyright © 2022 Intel). The
+requester observations preserve the upstream BIOS, driver, KVMR, debug order.
