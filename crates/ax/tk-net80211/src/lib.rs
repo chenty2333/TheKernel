@@ -12,6 +12,7 @@ mod input;
 mod node;
 mod node_caps;
 mod node_rates;
+mod node_table;
 mod output;
 mod ra;
 mod rates;
@@ -60,6 +61,10 @@ pub use node_caps::{
 pub use node_rates::{
     CHAN_DYN as NODE_CHAN_DYN, CHAN_OFDM as NODE_CHAN_OFDM, NODE_ERP, PeerRateState, RateIeError,
     node_abg_mode, node_is_11g, setup_rates,
+};
+pub use node_table::{
+    INVALID_SEQUENCE, NODE_CACHE_SIZE, NodeAllocError, NodeLifecycle, NodeRecord, NodeTable,
+    alloc_node, allocation_available, find_node, free_all_nodes, free_node, setup_node,
 };
 pub use output::{
     ELEMID_RATES, ELEMID_SSID, ELEMID_XRATES, IeError, append_extended_rates_ie, append_ssid_ie,

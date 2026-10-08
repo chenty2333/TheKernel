@@ -78,3 +78,7 @@ Both standard EDCA and vendor WMM element offsets are checked before decoding.
 Output helpers now encode hidden/visible SSID and the first-eight/extended
 legacy rate IE split with explicit length bounds, ready for scan and association
 request frame assembly.
+The scan-node cache is a bounded 512-entry MAC-keyed table with explicit node
+lifecycle and source-invalid sequence sentinels. Borrowed Rust lookups replace
+manual `ni_refcnt` management; the current BSS record remains separate from
+cached scan entries.
