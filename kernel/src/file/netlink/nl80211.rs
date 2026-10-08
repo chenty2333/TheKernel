@@ -1782,7 +1782,7 @@ mod tests {
         );
         let nested = attrs
             .iter()
-            .find(|(kind, _)| *kind == (ATTR_STA_INFO | NLA_F_NESTED))
+            .find(|(kind, _)| *kind == ATTR_STA_INFO)
             .unwrap();
         let mut signal = None;
         for_each_rtattr(&nested.1, |kind, value| {
