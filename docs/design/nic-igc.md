@@ -331,3 +331,5 @@ ends up binding a part it does not understand.
   `125c`, `125d`, `15f2`, `15f3`, `3101`, `3102`, `5502`, `5503`.
 * QEMU 10.2.2 `qemu-system-x86_64 -device help`, for the absence of an
   i225/i226 model.
+
+The IGC shared API now has the FreeBSD `igc_api.c` dispatch surface and I225 callback-table selection translated in `src/igc/api.rs` and `src/igc/i225.rs`. The backend trait is the boundary for the corresponding register/NVM/PHY implementations; this table selection is not yet connected to the legacy `IgcNic` probe/bring-up path. Subsequent IGC work will replace that handwritten path with these translated operations.

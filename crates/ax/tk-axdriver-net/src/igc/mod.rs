@@ -55,8 +55,10 @@
 //! does and does not establish.  Every value this driver ever read from a real
 //! i225 has, so far, been read zero times.
 
+pub mod api;
 pub mod bringup;
 pub mod desc;
+pub mod i225;
 pub mod ids;
 pub mod nic;
 pub mod probe;
@@ -69,12 +71,12 @@ use core::{marker::PhantomData, ptr::NonNull, time::Duration};
 
 pub use self::{
     bringup::{BringUp, BringUpError, LinkOutcome, StationAddress},
-    nic::IgcNic,
     desc::{
         BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES,
         ReceivedFrame, RingError, RxRing, TxRing,
     },
     ids::{DeviceId, Family, INTEL_VENDOR, identify},
+    nic::IgcNic,
     probe::{ConfigFacts, ProbeReport, Verdict},
     regs::{
         Access, DeviceControl, DeviceStatus, Meaning, NvmControl, ReceiveAddressHigh, Register,
