@@ -26,3 +26,11 @@ inputs and are not committed.
 
 The `wpa_supplicant` nl80211 command/event set and remaining full driver and
 net80211 implementation are still part of the later task items.
+
+## MAC context commands
+
+`tk-axdriver-iwx::mac_context` now builds the legacy packed `MAC_CONTEXT_CMD`
+and MLD `MAC_CONFIG_CMD`, including station timing, EDCA FIFO placement,
+monitor filters, rates, protection flags, and add/remove active-state checks.
+The builders emit firmware payload bytes; caller-owned command transport still
+handles queue reservation, doorbell publication, and response dispatch.

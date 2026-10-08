@@ -22,6 +22,7 @@ mod init_cmd;
 mod interrupts;
 mod intr;
 mod mac;
+mod mac_context;
 mod nic;
 mod notif;
 mod nvm;
@@ -115,6 +116,12 @@ pub use intr::{
     service_legacy_interrupt, service_msix_interrupt,
 };
 pub use mac::{MacAddress, flip_hardware_address, is_valid_mac_address, select_csr_mac_address};
+pub use mac_context::{
+    ACTION_ADD as MAC_ACTION_ADD, ACTION_REMOVE as MAC_ACTION_REMOVE, EdcaParameters, HtProtection,
+    MAC_CONF_GROUP, MAC_CONFIG_COMMAND, MAC_CONTEXT_COMMAND, MacContextConfig, MacContextError,
+    MacContextUpdateError, OperationMode, mac_context_command, mld_mac_context_command,
+    update_mac_context,
+};
 pub use nic::{configure_nic, disable_rx_dma, initialize_nic, initialize_rx};
 pub use notif::{
     HBUS_TARG_WRPTR, HBUS_WRPTR_RX_Q0, NotificationRingError, RFH_Q0_FRBDCB_WIDX_TRG,
