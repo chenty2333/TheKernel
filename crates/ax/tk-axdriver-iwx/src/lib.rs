@@ -20,6 +20,7 @@ mod context;
 mod context_task;
 mod control;
 mod controller;
+mod crf;
 mod diagnostics;
 mod dma;
 mod firmware;
@@ -130,6 +131,7 @@ pub use controller::{
     ControllerError, ControllerUcodeStartError, IwxController, PnvmLoadError, RxServiceError,
     StopDeviceError, SyncCommandError,
 };
+pub use crf::{CrfIdentity, read_crf_identity};
 pub use diagnostics::{
     BZ_ERROR_TABLE_MIN, DriverDebugStatus, ERROR_ELEMENT_SIZE_BYTES, ERROR_START_OFFSET_BYTES,
     ErrorLogError, FW_SYSASSERT_CPU_MASK, LEGACY_ERROR_TABLE_MIN, LMAC_ERROR_WORDS, TxRingDebug,

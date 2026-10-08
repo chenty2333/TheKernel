@@ -133,6 +133,9 @@ outside a pending state transition. Deferred MAC work modifies the context,
 unprotects the session, then drops its task reference; PHY work reinitializes
 rates before narrowing and after widening the channel context.
 
+CRF/CNV PRPH identity reads enable the WFPM auxiliary MAC owner and apply the
+BZ/BZ-W stepping exceptions, including BZ-U's A-to-B promotion.
+
 TX queues now track occupied descriptor slots through the source consumer SSN,
 reclaim descriptor/byte-count state, retain owned payload DMA buffers until
 completion, retire host-command queue occupancy on CMD_DONE, and expose the
