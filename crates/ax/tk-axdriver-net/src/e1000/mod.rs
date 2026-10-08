@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod mac;
+pub mod manage;
 pub mod nic;
 pub mod nvm;
 pub mod osdep;
