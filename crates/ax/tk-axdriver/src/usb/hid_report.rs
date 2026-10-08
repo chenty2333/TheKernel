@@ -40,6 +40,7 @@ struct Field {
     unit: u32,
     unit_exponent: i32,
     app: Usage,
+    tlc_index: u8,
     relative: bool,
     kind: Kind,
     previous: Option<i32>,
@@ -50,6 +51,7 @@ pub(crate) struct Report {
     bits: [u16; 256],
     report_sizes: [[u16; 256]; 3],
     locations: Vec<ReportLocation>,
+    tlc_usages: Vec<Usage>,
     ids: bool,
     // Report-ID ownership prevents a Consumer release from lifting keys held
     // by a separate keyboard report. Maximum retained owners is 1024.
@@ -71,6 +73,7 @@ pub(crate) enum ReportKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HidLocation {
     pub report_id: u8,
+    pub tlc_index: u8,
     pub bit_offset: u16,
     pub size: u8,
     pub flags: u8,
@@ -84,12 +87,14 @@ pub(crate) struct HidLocation {
 struct ReportLocation {
     kind: ReportKind,
     usage: Usage,
+    tlc_index: u8,
     location: HidLocation,
 }
 fn record_location(
     locations: &mut Vec<ReportLocation>,
     kind: ReportKind,
     report_id: u8,
+    tlc_index: u8,
     usage: Usage,
     bit_offset: u32,
     size: u32,
@@ -108,8 +113,10 @@ fn record_location(
     locations.push(ReportLocation {
         kind,
         usage,
+        tlc_index,
         location: HidLocation {
             report_id,
+            tlc_index,
             bit_offset: bit_offset as u16,
             size: size.min(32) as u8,
             flags,
@@ -268,6 +275,9 @@ impl Report {
         let mut fields = reserved(MAX_FIELDS)?;
         let mut collections = reserved(16)?;
         let mut collection_slots = reserved(16)?;
+        let mut top_level_index = 0usize;
+        let mut current_tlc_index = 0u8;
+        let mut tlc_usages = reserved(16)?;
         let mut current_slot = None;
         let mut next_slot = 0u8;
         let mut app = Usage::default();
@@ -375,6 +385,10 @@ impl Report {
                     if collections.len() == 16 {
                         return Err(DevError::Unsupported);
                     }
+                    if collections.is_empty() {
+                        current_tlc_index =
+                            u8::try_from(top_level_index).map_err(|_| DevError::Unsupported)?;
+                    }
                     collections.push(app);
                     collection_slots.push(current_slot);
                     if matches!(value, 0 | 2)
@@ -390,12 +404,21 @@ impl Report {
                     }
                     if value == 1 {
                         app = usages.first().copied().unwrap_or_default();
+                        if collections.len() == 1 {
+                            tlc_usages.try_reserve(1).map_err(|_| DevError::NoMemory)?;
+                            tlc_usages.push(app);
+                        }
                         pointer |= app.page == 0x0d && matches!(app.code, 4 | 5);
                     }
                 }
                 (0, 12) => {
                     app = collections.pop().ok_or(DevError::InvalidParam)?;
                     current_slot = collection_slots.pop().ok_or(DevError::InvalidParam)?;
+                    if collections.is_empty() {
+                        top_level_index = top_level_index
+                            .checked_add(1)
+                            .ok_or(DevError::Unsupported)?;
+                    }
                 }
                 (0, 8) => {
                     if g.size == 0 || g.count == 0 || g.min > g.max {
@@ -422,6 +445,7 @@ impl Report {
                                     &mut locations,
                                     ReportKind::Input,
                                     g.id,
+                                    current_tlc_index,
                                     *usage,
                                     u32::from(*at),
                                     g.size,
@@ -449,6 +473,7 @@ impl Report {
                                 unit: g.unit,
                                 unit_exponent: g.unit_exponent,
                                 app,
+                                tlc_index: current_tlc_index,
                                 relative: value & 4 != 0,
                                 kind: Kind::Array(choices),
                                 previous: None,
@@ -465,6 +490,7 @@ impl Report {
                                     &mut locations,
                                     ReportKind::Input,
                                     g.id,
+                                    current_tlc_index,
                                     usage,
                                     u32::from(*at) + index * g.size,
                                     g.size,
@@ -506,6 +532,7 @@ impl Report {
                                         unit: g.unit,
                                         unit_exponent: g.unit_exponent,
                                         app,
+                                        tlc_index: current_tlc_index,
                                         relative: value & 4 != 0,
                                         kind: Kind::Variable(mapped),
                                         previous: None,
@@ -552,6 +579,7 @@ impl Report {
                             &mut locations,
                             kind,
                             report_id,
+                            current_tlc_index,
                             usage,
                             bit_start + index * g.size,
                             g.size,
@@ -587,6 +615,7 @@ impl Report {
             bits,
             report_sizes,
             locations,
+            tlc_usages,
             ids,
             keys: reserved(1024)?,
             mt_tracking_ids: [-1; 32],
@@ -631,6 +660,25 @@ impl Report {
             .nth(index)
             .map(|item| item.location)
     }
+    pub(crate) fn locate_usage_in_collection(
+        &self,
+        kind: ReportKind,
+        page: u32,
+        code: u32,
+        tlc_index: u8,
+        index: usize,
+    ) -> Option<HidLocation> {
+        self.locations
+            .iter()
+            .filter(|item| {
+                item.kind == kind
+                    && item.tlc_index == tlc_index
+                    && item.usage.page == page
+                    && item.usage.code == code
+            })
+            .nth(index)
+            .map(|item| item.location)
+    }
     // upstream: hid.c hid_is_collection(), hid_is_mouse(), hid_is_keyboard()
     pub(crate) fn has_collection_usage(&self, page: u32, code: u32) -> bool {
         self.fields
@@ -648,7 +696,8 @@ impl Report {
             .fields
             .iter()
             .filter(|field| {
-                field.id == location.report_id
+                field.tlc_index == location.tlc_index
+                    && field.id == location.report_id
                     && matches!(field.kind, Kind::Variable(Mapping::MtContactId))
             })
             .filter_map(|field| field.slot)
@@ -692,16 +741,24 @@ impl Report {
     pub(crate) fn is_keyboard(&self) -> bool {
         self.has_collection_usage(1, 6)
     }
-    pub(crate) fn is_touchpad(&self) -> bool {
-        self.has_collection_usage(0x0d, 0x05)
+    pub(crate) fn top_level_collection_count(&self) -> u8 {
+        self.tlc_usages.len().min(usize::from(u8::MAX)) as u8
     }
-    pub(crate) fn is_touchscreen(&self) -> bool {
-        self.has_collection_usage(0x0d, 0x04)
+    pub(crate) fn is_touchpad_in_collection(&self, tlc_index: u8) -> bool {
+        self.tlc_usages
+            .get(usize::from(tlc_index))
+            .is_some_and(|usage| usage.page == 0x0d && usage.code == 0x05)
     }
-    pub(crate) fn has_mt_tip_switch(&self) -> bool {
-        self.fields
-            .iter()
-            .any(|field| matches!(&field.kind, Kind::Variable(Mapping::MtTipSwitch)))
+    pub(crate) fn is_touchscreen_in_collection(&self, tlc_index: u8) -> bool {
+        self.tlc_usages
+            .get(usize::from(tlc_index))
+            .is_some_and(|usage| usage.page == 0x0d && usage.code == 0x04)
+    }
+    pub(crate) fn has_mt_tip_switch_in_collection(&self, tlc_index: u8) -> bool {
+        self.fields.iter().any(|field| {
+            field.tlc_index == tlc_index
+                && matches!(&field.kind, Kind::Variable(Mapping::MtTipSwitch))
+        })
     }
     fn each_code(&self, mut visit: impl FnMut(u16, u16)) {
         let mut mapped = |m| match m {
@@ -746,6 +803,44 @@ impl Report {
     pub(crate) fn has_code(&self, ty: u16, code: u16) -> bool {
         let mut found = false;
         self.each_code(|t, c| found |= t == ty && c == code);
+        found
+    }
+    pub(crate) fn has_code_in_collection(&self, tlc_index: u8, ty: u16, code: u16) -> bool {
+        let mut found = false;
+        let mut has_slot = false;
+        let mut mapped = |mapping| match mapping {
+            Mapping::Key(mapped_code) => found |= ty == 1 && code == mapped_code,
+            Mapping::Axis(mapped_type, mapped_code) => {
+                found |= ty == mapped_type && code == mapped_code
+            }
+            Mapping::Wheel(mapped_code) => {
+                found |= ty == 2
+                    && (code == mapped_code || code == if mapped_code == 8 { 11 } else { 12 });
+            }
+            Mapping::Hat => found |= ty == 3 && matches!(code, 16 | 17),
+            Mapping::MtContactId => found |= ty == 3 && code == 0x39,
+            Mapping::MtTipSwitch | Mapping::MtConfidence => {}
+            Mapping::MtWidth => found |= ty == 3 && matches!(code, 0x30 | 0x34),
+            Mapping::MtHeight => found |= ty == 3 && matches!(code, 0x31 | 0x34),
+        };
+        for field in self
+            .fields
+            .iter()
+            .filter(|field| field.tlc_index == tlc_index)
+        {
+            has_slot |= field.slot.is_some();
+            match &field.kind {
+                Kind::Variable(mapping) => mapped(*mapping),
+                Kind::Array(usages) => {
+                    for &usage in usages {
+                        if let Some(Mapping::Key(key)) = mapping(usage, field.app, field.relative) {
+                            mapped(Mapping::Key(key));
+                        }
+                    }
+                }
+            }
+        }
+        found |= has_slot && ty == 3 && code == 0x2f;
         found
     }
     pub(crate) fn event_bits(&self, ty: u16, out: &mut [u8]) -> bool {
@@ -804,6 +899,7 @@ impl Report {
             .map(|field| {
                 hid_item_resolution(HidLocation {
                     report_id: field.id,
+                    tlc_index: field.tlc_index,
                     bit_offset: field.bit,
                     size: field.size,
                     flags: 0,
@@ -1397,6 +1493,36 @@ mod tests {
     }
 
     #[test]
+    fn usage_locations_are_scoped_to_their_top_level_collection() {
+        let descriptor = [
+            0x05, 1, 0x09, 2, 0xa1, 1, // TLC 0: Mouse
+            0x85, 1, 0x09, 0x30, 0x15, 0, 0x25, 127, 0x75, 8, 0x95, 1, 0x81, 2, 0xc0, 0x05, 1,
+            0x09, 5, 0xa1, 1, // TLC 1: Game Pad
+            0x85, 2, 0x09, 0x30, 0x15, 0, 0x25, 127, 0x75, 8, 0x95, 1, 0x81, 2, 0xc0,
+        ];
+        let report = Report::parse(&descriptor).unwrap();
+        assert_eq!(
+            report
+                .locate_usage_in_collection(ReportKind::Input, 1, 0x30, 0, 0)
+                .unwrap()
+                .report_id,
+            1
+        );
+        assert_eq!(
+            report
+                .locate_usage_in_collection(ReportKind::Input, 1, 0x30, 1, 0)
+                .unwrap()
+                .report_id,
+            2
+        );
+        assert!(
+            report
+                .locate_usage_in_collection(ReportKind::Input, 1, 0x30, 2, 0)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn locates_feature_usage_and_reads_writes_bounded_report_bits() {
         let descriptor = [
             0x05, 0x0d, 0x09, 0x55, 0x15, 0, 0x25, 10, 0x85, 1, 0x75, 8, 0x95, 1, 0xb1, 2, 0x05, 1,
@@ -1422,6 +1548,7 @@ mod tests {
     fn hid_item_resolution_matches_hid_unit_scale() {
         let mut location = HidLocation {
             report_id: 0,
+            tlc_index: 0,
             bit_offset: 0,
             size: 8,
             flags: 0,

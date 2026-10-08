@@ -7,7 +7,7 @@ use alloc::{string::String, vec::Vec};
 use axdriver_base::{DevError, DevResult};
 use axdriver_input::InputDeviceId;
 
-use crate::hid_report::{Report, ReportKind};
+use crate::hid_report::{HidLocation, Report, ReportKind};
 
 pub(super) const QUIRK_NOWRITE: u32 = 1 << 0;
 
@@ -47,6 +47,18 @@ pub(super) fn attach_report_descriptor(bytes: &[u8]) -> DevResult<(Report, Repor
         feature: size(ReportKind::Feature),
     };
     Ok((report, info))
+}
+
+// upstream: hidbus.c hidbus_locate()
+pub(super) fn locate(
+    report: &Report,
+    kind: ReportKind,
+    page: u32,
+    usage: u32,
+    tlc_index: u8,
+    usage_index: usize,
+) -> Option<HidLocation> {
+    report.locate_usage_in_collection(kind, page, usage, tlc_index, usage_index)
 }
 
 impl DeviceInfo {

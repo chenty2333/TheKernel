@@ -18,3 +18,10 @@ The report-size helper mapping now covers the FreeBSD `hid_report_size()` and
 `hidbus_get_rdesc()` and its `hid_get_report_descr()` implementation. Other HID
 parser code remains a bounded TheKernel-owned grammar/decoder rather than a
 source-copy of FreeBSD's parser state machine.
+
+The HID report model now retains each usage's top-level-collection index.
+`hidbus_locate()` is adapted as a collection-scoped parser lookup, and `hmt`
+selects its Touchpad/Touchscreen TLC before resolving Contact Count Maximum,
+Button Type and Input Mode features. The Contact Count decoder is likewise
+scoped to that TLC, avoiding feature/report-ID collisions in composite HID
+interfaces.

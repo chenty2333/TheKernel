@@ -204,13 +204,25 @@ impl I2cInput {
         }
         let mut hmt = crate::hmt::MultiTouch::probe(&parser);
         if let Some(info) = &mut hmt {
-            if let Some(location) =
-                parser.locate_usage(crate::hid_report::ReportKind::Input, 0x0d, 0x54, 0)
-            {
+            let tlc_index = info.tlc_index;
+            if let Some(location) = crate::hidbus::locate(
+                &parser,
+                crate::hid_report::ReportKind::Input,
+                0x0d,
+                0x54,
+                tlc_index,
+                0,
+            ) {
                 parser.configure_mt_contact_count(location);
             }
-            let location =
-                parser.locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x55, 0);
+            let location = crate::hidbus::locate(
+                &parser,
+                crate::hid_report::ReportKind::Feature,
+                0x0d,
+                0x55,
+                tlc_index,
+                0,
+            );
             let mut contact_feature_id = None;
             let mut contact_feature: Option<(Vec<u8>, usize)> = None;
             if let Some(location) = location {
@@ -237,9 +249,14 @@ impl I2cInput {
             // upstream: hmt_attach() fetches HUD_BUTTON_TYPE unless it shares
             // the Contact Count Maximum report; value zero means integrated
             // clickpad, and a failed/absent report falls back to ordinary pad.
-            if let Some(location) =
-                parser.locate_usage(crate::hid_report::ReportKind::Feature, 0x0d, 0x59, 0)
-            {
+            if let Some(location) = crate::hidbus::locate(
+                &parser,
+                crate::hid_report::ReportKind::Feature,
+                0x0d,
+                0x59,
+                tlc_index,
+                0,
+            ) {
                 let same_report = contact_feature_id == Some(location.report_id);
                 if same_report {
                     if let Some((feature, actual)) = &contact_feature
