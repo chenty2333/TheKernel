@@ -931,7 +931,7 @@ fn init_filesystems_with_root_mode(
             extra_device_name(index)
         );
         let read_only = axdriver::block_device_is_read_only(&dev);
-        let name = if dev.device_name().starts_with("nvme") || dev.device_name().starts_with("sd") {
+        let name = if dev.device_name().starts_with("nvme") || dev.device_name().starts_with("sd") || dev.device_name().starts_with("mmcblk") {
             String::from(dev.device_name())
         } else { extra_device_name(index) };
         let removable = axdriver::block_device_removable(&dev);

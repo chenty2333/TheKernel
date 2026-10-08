@@ -180,3 +180,17 @@ impl DriverProbe for AhciDriver {
         crate::ahci::probe(root, bdf, info)
     }
 }
+
+#[cfg(feature = "sdhci-pci")]
+pub struct SdhciDriver;
+#[cfg(feature = "sdhci-pci")]
+impl DriverProbe for SdhciDriver {
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut axdriver_pci::PciRoot,
+        bdf: axdriver_pci::DeviceFunction,
+        info: &axdriver_pci::DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        crate::sdhci::probe(root, bdf, info)
+    }
+}

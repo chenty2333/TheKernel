@@ -80,6 +80,7 @@ def build_qemu_command(
     extra_block: Drive | None = None,
     nvme_disk: Drive | None = None,
     ahci_disk: Drive | None = None,
+    sdhci_disk: Drive | None = None,
     usb_disk: Drive | None = None,
     usb_boot: bool = False,
     input_backend: str = "virtio",
@@ -257,6 +258,12 @@ def build_qemu_command(
                 "-device", "ich9-ahci,id=ahci",
                 "-drive", drive_options(ahci_disk.path, "ahci-disk", mode=ahci_disk.mode),
                 "-device", "ide-hd,drive=ahci-disk,bus=ahci.0",
+            ])
+        if sdhci_disk is not None:
+            command.extend([
+                "-device", "sdhci-pci,id=sdhci",
+                "-drive", drive_options(sdhci_disk.path, "sd-card-drive", mode=sdhci_disk.mode),
+                "-device", "sd-card,drive=sd-card-drive",
             ])
         if extra_block is not None:
             _append_pci_drive(command, extra_block, "extra")

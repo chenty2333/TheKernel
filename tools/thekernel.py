@@ -274,6 +274,7 @@ def kernel_features(artifacts: Artifacts) -> str:
     features = [PRODUCT_FEATURE]
     features.append("nvme")
     features.append("ahci")
+    features.append("sdhci")
     features.append("intel-hda")
     features.append("watchdog-itco")
     if variant.usb_dbc:
@@ -550,6 +551,7 @@ class RunSpec:
     run_cpus: int
     nvme_disk: Path | None = None
     ahci_disk: Path | None = None
+    sdhci_disk: Path | None = None
     usb_disk: Path | None = None
     usb_boot: bool = False
     input_backend: str = "virtio"
@@ -681,6 +683,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             extra_block=spec.extra_block.expanduser().resolve() if spec.extra_block else None,
             nvme_disk=spec.nvme_disk.expanduser().resolve() if spec.nvme_disk else None,
             ahci_disk=spec.ahci_disk.expanduser().resolve() if spec.ahci_disk else None,
+            sdhci_disk=spec.sdhci_disk.expanduser().resolve() if spec.sdhci_disk else None,
             usb_disk=spec.usb_disk.expanduser().resolve() if spec.usb_disk else None,
             usb_boot=spec.usb_boot,
             usb_disk_mode=("snapshot" if spec.usb_boot else "rw"),
@@ -913,6 +916,7 @@ def run_cmd(args: argparse.Namespace) -> int:
             extra_block=Path(args.extra_block) if args.extra_block else None,
             nvme_disk=Path(args.nvme_disk) if args.nvme_disk else None,
             ahci_disk=Path(args.ahci_disk) if getattr(args, "ahci_disk", None) else None,
+            sdhci_disk=Path(args.sdhci_disk) if getattr(args, "sdhci_disk", None) else None,
             usb_disk=Path(args.usb_disk) if args.usb_disk else None,
             usb_boot=getattr(args,"usb_boot",False),
             input_backend=args.input_backend,
@@ -1641,6 +1645,7 @@ def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool
     parser.add_argument("--extra-block")
     parser.add_argument("--nvme-disk", help="attach a disposable image as NVMe; guest writes remain disabled by default")
     parser.add_argument("--ahci-disk", help="attach a disposable image to QEMU ich9-ahci as ide-hd")
+    parser.add_argument("--sdhci-disk", help="attach a disposable image to QEMU sdhci-pci as sd-card")
     parser.add_argument("--usb-boot", action="store_true", help="boot solely from --usb-disk (ESP and rootfs on USB); no SATA or VirtIO root")
     parser.add_argument("--usb-disk", help="attach an existing writable image as USB mass storage")
     parser.add_argument("--input-backend", choices=("virtio", "usb"), default="virtio",

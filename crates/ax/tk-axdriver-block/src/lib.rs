@@ -393,6 +393,11 @@ pub trait BlockDriverOps: BaseDriverOps {
         }
     }
 
+    /// True when device policy forbids writes regardless of userspace BLKROSET.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// Reads blocked data from the given block.
     ///
     /// The size of the buffer may exceed the block size, in which case multiple

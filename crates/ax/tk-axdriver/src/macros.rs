@@ -60,6 +60,11 @@ macro_rules! for_each_drivers {
             type $drv_type = crate::drivers::AhciDriver;
             $code
         }
+        #[cfg(feature = "sdhci-pci")]
+        {
+            type $drv_type = crate::drivers::SdhciDriver;
+            $code
+        }
         #[cfg(feature = "virtio-rng")]
         {
             type $drv_type = virtio::VirtIoEntropyDriver;

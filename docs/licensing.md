@@ -538,3 +538,6 @@ The SDHCI hardware register and quirk constants are translated from FreeBSD
 
 The FreeBSD SD/MMC protocol and block path retain BSD-2-Clause attribution;
 see `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-MMC.txt`.
+
+The SDHCI PCI binding retains FreeBSD BSD-2-Clause attribution in
+`crates/ax/tk-axdriver/LICENSES/BSD-2-Clause-FreeBSD-SDHCI-PCI.txt`.

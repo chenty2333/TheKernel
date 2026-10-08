@@ -324,6 +324,20 @@ class AhciTopologyTests(unittest.TestCase):
         self.assertNotIn("readonly=on", drive)
 
 
+class SdhciTopologyTests(unittest.TestCase):
+    def test_sdhci_drive_uses_pci_host_and_sd_card(self):
+        command = build_qemu_command(
+            arch="x86_64", kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"), direct_kernel=True,
+            sdhci_disk=Drive(Path("sd-card.img"), "rw"),
+        )
+        self.assertIn("sdhci-pci,id=sdhci", command)
+        self.assertIn("sd-card,drive=sd-card-drive", command)
+        drive = next(value for value in command if value.startswith("file=") and "id=sd-card-drive" in value)
+        self.assertIn("sd-card.img", drive)
+        self.assertNotIn("readonly=on", drive)
+
+
 class HdaTopologyTests(unittest.TestCase):
     def test_hda_wav_is_distinct_from_virtio_sound(self):
         command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),

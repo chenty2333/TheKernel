@@ -495,17 +495,27 @@ impl<I: SdhciIo> SdhciHost<I> {
         );
         let mut response = SdhciResponse::default();
         self.wait_status(SDHCI_INT_RESPONSE)?;
-        for (n, word) in response.0.iter_mut().enumerate() {
-            *word = self.io.read32(SDHCI_RESPONSE as usize + n * 4);
+        if command_flags & SDHCI_CMD_RESP_MASK as u16 == SDHCI_CMD_RESP_LONG as u16 {
+            // R2 response words are stored in reverse register order and the
+            // controller strips the wire CRC byte. Reconstruct the standard
+            // 128-bit response layout expected by mmc_get_bits().
+            let mut extra = 0u32;
+            for n in 0..4 {
+                let value = self.io.read32(SDHCI_RESPONSE as usize + n * 4);
+                response.0[3 - n] = (value << 8) | extra;
+                extra = value >> 24;
+            }
+        } else {
+            response.0[0] = self.io.read32(SDHCI_RESPONSE as usize);
         }
         if let Some(buffer) = data {
+            self.wait_status(if matches!(index, 8 | 17 | 18) {
+                SDHCI_INT_DATA_AVAIL
+            } else {
+                SDHCI_INT_SPACE_AVAIL
+            })?;
             let mut offset = 0usize;
             while offset < buffer.len() {
-                self.wait_status(if matches!(index, 8 | 17 | 18) {
-                    SDHCI_INT_DATA_AVAIL
-                } else {
-                    SDHCI_INT_SPACE_AVAIL
-                })?;
                 let end = (offset + 4).min(buffer.len());
                 if matches!(index, 8 | 17 | 18) {
                     let word = self.io.read32(SDHCI_BUFFER as usize).to_le_bytes();
@@ -554,6 +564,7 @@ pub struct SdhciDisk<I: SdhciIo> {
     rca: u16,
     sectors: u64,
     high_capacity: bool,
+    read_only: bool,
 }
 
 impl<I: SdhciIo> SdhciDisk<I> {
@@ -651,7 +662,12 @@ impl<I: SdhciIo> SdhciDisk<I> {
             rca,
             sectors,
             high_capacity,
+            read_only: false,
         })
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     // upstream: mmcsd.c mmcsd_rw() card-address conversion
@@ -742,6 +758,9 @@ impl<I: SdhciIo> crate::BlockDriverOps for SdhciDisk<I> {
     }
     // upstream: mmcsd.c mmcsd_rw() write path
     fn write_block(&mut self, block: u64, input: &[u8]) -> crate::DevResult {
+        if self.read_only {
+            return Err(crate::DevError::Unsupported);
+        }
         if !input.len().is_multiple_of(512)
             || block
                 .checked_add((input.len() / 512) as u64)
@@ -760,6 +779,10 @@ impl<I: SdhciIo> crate::BlockDriverOps for SdhciDisk<I> {
     fn flush(&mut self) -> crate::DevResult {
         self.wait_ready().map_err(map_sdhci_error)
     }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
 }
 
 // upstream: mmc.c mmc_get_bits()
@@ -767,10 +790,10 @@ fn response_bits(response: SdhciResponse, lsb: u32, width: u32) -> u32 {
     if width == 0 || width > 32 || lsb >= 128 || lsb + width > 128 {
         return 0;
     }
-    let raw = u128::from(response.0[0])
-        | (u128::from(response.0[1]) << 32)
-        | (u128::from(response.0[2]) << 64)
-        | (u128::from(response.0[3]) << 96);
+    let raw = u128::from(response.0[3])
+        | (u128::from(response.0[2]) << 32)
+        | (u128::from(response.0[1]) << 64)
+        | (u128::from(response.0[0]) << 96);
     ((raw >> lsb) & ((1u128 << width) - 1)) as u32
 }
 
@@ -870,7 +893,7 @@ mod tests {
 
     #[test]
     fn response_bit_ranges_use_the_specified_lsb_numbering() {
-        let response = SdhciResponse([0x89ab_cdef, 0x0123_4567, 0, 0]);
+        let response = SdhciResponse([0, 0, 0x0123_4567, 0x89ab_cdef]);
         assert_eq!(response_bits(response, 0, 32), 0x89ab_cdef);
         assert_eq!(response_bits(response, 32, 32), 0x0123_4567);
         assert_eq!(response_bits(response, 28, 8), 0x78);
@@ -894,5 +917,23 @@ mod tests {
             (8 << 8) | SDHCI_CMD_RESP_SHORT as u16
         );
         assert_eq!(host.io_mut().argument, 0x1aa);
+    }
+
+    #[test]
+    fn read_only_card_rejects_write_before_issuing_a_command() {
+        let host = SdhciHost::new(MockIo::default(), 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        let mut disk = SdhciDisk {
+            host,
+            rca: 1,
+            sectors: 16,
+            high_capacity: true,
+            read_only: true,
+        };
+        assert!(crate::BlockDriverOps::is_read_only(&disk));
+        assert!(matches!(
+            crate::BlockDriverOps::write_block(&mut disk, 0, &[0x55; 512]),
+            Err(crate::DevError::Unsupported)
+        ));
+        assert_eq!(disk.host.io_mut().command, 0);
     }
 }
