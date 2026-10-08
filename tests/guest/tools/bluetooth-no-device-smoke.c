@@ -125,8 +125,8 @@ int main(void) {
     if (send(mgmt, read_commands, sizeof(read_commands), 0) != sizeof(read_commands)) return fail("mgmt READ_COMMANDS send");
     response_len = recv(mgmt, response, sizeof(response), 0);
     const uint8_t commands_reply[] = {
-        1, 0, 0xff, 0xff, 13, 0, 2, 0, 0, 3, 0, 0, 0,
-        3, 0, 4, 0, 5, 0,
+        1, 0, 0xff, 0xff, 25, 0, 2, 0, 0, 8, 0, 1, 0,
+        3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 6, 0,
     };
     if (response_len != sizeof(commands_reply) || memcmp(response, commands_reply, sizeof(commands_reply))) {
         fprintf(stderr, "mgmt READ_COMMANDS response length=%ld\n", (long)response_len); return 1;

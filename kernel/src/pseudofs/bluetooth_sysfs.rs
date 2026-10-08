@@ -78,10 +78,14 @@ impl SimpleDirOps for BluetoothClass {
                 "bus",
                 SimpleFile::new_regular(self.fs.clone(), || Ok::<String, VfsError>("USB\n".into())),
             );
+            let manufacturer = adapter.clone();
             files.add(
                 "manufacturer",
-                SimpleFile::new_regular(self.fs.clone(), || {
-                    Ok::<String, VfsError>("Intel\n".into())
+                SimpleFile::new_regular(self.fs.clone(), move || {
+                    Ok(format!(
+                        "{}\n",
+                        manufacturer.lock().capabilities().manufacturer
+                    ))
                 }),
             );
             let feature_device = adapter.clone();

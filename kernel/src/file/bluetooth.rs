@@ -190,12 +190,21 @@ mod tests {
     }
 
     #[test]
-    fn management_commands_advertise_only_implemented_operations() {
+    fn management_commands_advertise_only_supported_operations() {
         let commands = management_response(&[2, 0, 0xff, 0xff, 0, 0]).unwrap();
-        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 3);
-        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 0);
-        assert_eq!(commands.len(), 9 + 4 + 2 * 3);
-        assert_eq!(&commands[13..19], &[3, 0, 4, 0, 5, 0]);
+        assert_eq!(u16::from_le_bytes([commands[9], commands[10]]), 8);
+        assert_eq!(u16::from_le_bytes([commands[11], commands[12]]), 1);
+        assert_eq!(commands.len(), 9 + 4 + 2 * 9);
+        assert_eq!(
+            &commands[13..31],
+            &[3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 9, 0, 11, 0, 13, 0, 6, 0]
+        );
+    }
+
+    #[test]
+    fn management_command_complete_encodes_status_and_settings_payload() {
+        let response = management_command_complete(4, 7, 0, &0x212u32.to_le_bytes()).unwrap();
+        assert_eq!(&response, &[1, 0, 4, 0, 7, 0, 7, 0, 0, 0x12, 0x02, 0, 0]);
     }
 
     #[test]
@@ -626,12 +635,16 @@ impl HciSocket {
         packet.resize(length, 0);
         let read = src.read(&mut packet)?;
         packet.truncate(read);
-        let response = management_response(&packet)?;
+        let (response, setting_event) = management_controller_command(&packet)?
+            .unwrap_or((management_response(&packet)?, None));
         let mut queue = self.control_rx.lock();
-        if queue.len() >= 64 {
+        if queue.len() + 1 + usize::from(setting_event.is_some()) > 64 {
             return Err(LinuxError::ENOBUFS.into());
         }
         queue.push_back(response);
+        if let Some(event) = setting_event {
+            queue.push_back(event);
+        }
         drop(queue);
         self.control_readiness.wake();
         Ok(read)
@@ -658,6 +671,7 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const NOT_SUPPORTED: u8 = 0x0c;
     const INVALID_PARAMS: u8 = 0x0d;
     const INVALID_INDEX: u8 = 0x11;
+    const SUPPORTED_SETTINGS: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 9);
     if request.len() < 6 {
         return Err(AxError::InvalidInput);
     }
@@ -676,8 +690,17 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
             // Linux excludes READ_VERSION/READ_COMMANDS from the advertised
             // per-controller command table. Keep this list truthful: only
             // operations implemented by this HCI socket are exposed.
-            let commands = [READ_INDEX_LIST, READ_INFO, SET_POWERED];
-            let events: [u16; 0] = [];
+            let commands = [
+                READ_INDEX_LIST,
+                READ_INFO,
+                SET_POWERED,
+                SET_DISCOVERABLE,
+                SET_CONNECTABLE,
+                SET_BONDABLE,
+                SET_SSP,
+                SET_LE,
+            ];
+            let events = [6u16]; // NEW_SETTINGS
             data.extend_from_slice(&(commands.len() as u16).to_le_bytes());
             data.extend_from_slice(&(events.len() as u16).to_le_bytes());
             for item in commands.into_iter().chain(events) {
@@ -710,8 +733,8 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
                 data.extend_from_slice(&address);
                 data.push(capabilities.hci_version);
                 data.extend_from_slice(&capabilities.manufacturer.to_le_bytes());
-                data.extend_from_slice(&1u32.to_le_bytes()); // powered is controllable
-                data.extend_from_slice(&(u32::from(adapter.is_up())).to_le_bytes());
+                data.extend_from_slice(&SUPPORTED_SETTINGS.to_le_bytes());
+                data.extend_from_slice(&adapter.management_settings().to_le_bytes());
                 data.extend_from_slice(&[0; 3 + 249 + 11]);
             } else {
                 status = INVALID_INDEX;
@@ -793,6 +816,169 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     response.push(status);
     response.extend_from_slice(&data);
     Ok(response)
+}
+
+#[cfg(feature = "input")]
+fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Option<Vec<u8>>)>> {
+    const SET_POWERED: u16 = 5;
+    const SET_DISCOVERABLE: u16 = 6;
+    const SET_CONNECTABLE: u16 = 7;
+    const SET_BONDABLE: u16 = 9;
+    const SET_SSP: u16 = 11;
+    const SET_LE: u16 = 13;
+    const MGMT_SETTING_CONNECTABLE: u32 = 1 << 1;
+    const MGMT_SETTING_DISCOVERABLE: u32 = 1 << 2;
+    const MGMT_SETTING_BONDABLE: u32 = 1 << 3;
+    const MGMT_SETTING_SSP: u32 = 1 << 4;
+    const MGMT_SETTING_LE: u32 = 1 << 9;
+    const INVALID_INDEX: u8 = 0x11;
+    const NOT_SUPPORTED: u8 = 0x0c;
+    const FAILED: u8 = 0x03;
+
+    if request.len() < 6 {
+        return Err(AxError::InvalidInput);
+    }
+    let opcode = u16::from_le_bytes([request[0], request[1]]);
+    let index = u16::from_le_bytes([request[2], request[3]]);
+    let length = usize::from(u16::from_le_bytes([request[4], request[5]]));
+    if request.len() != 6 + length {
+        return Err(AxError::InvalidInput);
+    }
+    let parameters = &request[6..];
+    if opcode == SET_POWERED {
+        if parameters.len() != 1 || parameters[0] > 1 {
+            return Ok(None);
+        }
+        let Some(adapter) = usb_adapter(index) else {
+            return Ok(None);
+        };
+        let (status, settings) = {
+            let mut adapter = adapter.lock();
+            let previous = adapter.management_settings();
+            match adapter.set_device_up(parameters[0] != 0) {
+                Ok(()) => (0, Some((previous, adapter.management_settings()))),
+                Err(axdriver::BluetoothError::Unsupported) => (NOT_SUPPORTED, None),
+                Err(axdriver::BluetoothError::NoDevice) => (INVALID_INDEX, None),
+                Err(_) => (FAILED, None),
+            }
+        };
+        let mut data = Vec::new();
+        if let Some((_, current)) = settings {
+            data.extend_from_slice(&current.to_le_bytes());
+        }
+        let response = management_command_complete(index, opcode, status, &data)?;
+        let event = if status == 0 {
+            settings_event(
+                index,
+                settings
+                    .filter(|(previous, current)| previous != current)
+                    .map(|(_, current)| current),
+            )?
+        } else {
+            None
+        };
+        return Ok(Some((response, event)));
+    }
+    let (setting, enabled) = match opcode {
+        SET_DISCOVERABLE
+            if parameters.len() == 3 && parameters[0] <= 1 && parameters[1..] == [0, 0] =>
+        {
+            (MGMT_SETTING_DISCOVERABLE, parameters[0] != 0)
+        }
+        SET_CONNECTABLE | SET_BONDABLE | SET_SSP | SET_LE
+            if parameters.len() == 1 && parameters[0] <= 1 =>
+        {
+            let setting = match opcode {
+                SET_CONNECTABLE => MGMT_SETTING_CONNECTABLE,
+                SET_BONDABLE => MGMT_SETTING_BONDABLE,
+                SET_SSP => MGMT_SETTING_SSP,
+                SET_LE => MGMT_SETTING_LE,
+                _ => unreachable!(),
+            };
+            (setting, parameters[0] != 0)
+        }
+        _ => return Ok(None),
+    };
+    let adapter = usb_adapter(index);
+    let Some(adapter) = adapter else {
+        return Ok(None);
+    };
+    let (status, settings) = {
+        let mut adapter = adapter.lock();
+        let previous = adapter.management_settings();
+        match adapter.set_management_setting(setting, enabled) {
+            Ok(settings) => (0, Some((previous, settings))),
+            Err(axdriver::BluetoothError::Unsupported) => (NOT_SUPPORTED, None),
+            Err(axdriver::BluetoothError::NotUp) => (FAILED, None),
+            Err(axdriver::BluetoothError::NoDevice) => (INVALID_INDEX, None),
+            Err(_) => (FAILED, None),
+        }
+    };
+    let mut data = Vec::new();
+    if let Some((_, settings)) = settings {
+        data.extend_from_slice(&settings.to_le_bytes());
+    }
+    let response = management_command_complete(index, opcode, status, &data)?;
+    let event = if status == 0 {
+        settings_event(
+            index,
+            settings
+                .filter(|(previous, current)| previous != current)
+                .map(|(_, current)| current),
+        )?
+    } else {
+        None
+    };
+    Ok(Some((response, event)))
+}
+
+#[cfg(not(feature = "input"))]
+fn management_controller_command(_request: &[u8]) -> AxResult<Option<(Vec<u8>, Option<Vec<u8>>)>> {
+    Ok(None)
+}
+
+fn management_command_complete(
+    index: u16,
+    opcode: u16,
+    status: u8,
+    data: &[u8],
+) -> AxResult<Vec<u8>> {
+    let length = 3usize
+        .checked_add(data.len())
+        .ok_or(AxError::InvalidInput)?;
+    if length > u16::MAX as usize {
+        return Err(AxError::InvalidInput);
+    }
+    let mut response = Vec::new();
+    response
+        .try_reserve_exact(6 + length)
+        .map_err(|_| AxError::NoMemory)?;
+    response.extend_from_slice(&1u16.to_le_bytes());
+    response.extend_from_slice(&index.to_le_bytes());
+    response.extend_from_slice(&(length as u16).to_le_bytes());
+    response.extend_from_slice(&opcode.to_le_bytes());
+    response.push(status);
+    response.extend_from_slice(data);
+    Ok(response)
+}
+
+#[cfg(feature = "input")]
+fn settings_event(index: u16, settings: Option<u32>) -> AxResult<Option<Vec<u8>>> {
+    let Some(settings) = settings else {
+        return Ok(None);
+    };
+    let mut event = Vec::new();
+    event.try_reserve_exact(10).map_err(|_| AxError::NoMemory)?;
+    event.extend_from_slice(&6u16.to_le_bytes());
+    event.extend_from_slice(&index.to_le_bytes());
+    event.extend_from_slice(&4u16.to_le_bytes());
+    event.extend_from_slice(&settings.to_le_bytes());
+    Ok(Some(event))
+}
+
+#[cfg(not(feature = "input"))]
+fn settings_event(_index: u16, _settings: Option<u32>) -> AxResult<Option<Vec<u8>>> {
+    Ok(None)
 }
 
 fn management_controller_status(index: u16, invalid_index: u8, unsupported: u8) -> u8 {

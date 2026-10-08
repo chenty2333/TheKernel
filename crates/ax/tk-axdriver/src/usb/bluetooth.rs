@@ -20,6 +20,12 @@ use tk_bt_hci::{Adapter, Error, UsbTransport};
 use super::*;
 
 const MAX_INTEL_FIRMWARE: usize = 16 * 1024 * 1024;
+const MGMT_SETTING_POWERED: u32 = 1 << 0;
+const MGMT_SETTING_CONNECTABLE: u32 = 1 << 1;
+const MGMT_SETTING_DISCOVERABLE: u32 = 1 << 2;
+const MGMT_SETTING_BONDABLE: u32 = 1 << 3;
+const MGMT_SETTING_SSP: u32 = 1 << 4;
+const MGMT_SETTING_LE: u32 = 1 << 9;
 static FIRMWARE_CALLBACK_REGISTERED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -28,6 +34,7 @@ pub struct UsbBluetoothHci {
     family_hint: tk_bt_hci::DeviceFamily,
     address: [u8; 6],
     capabilities: tk_bt_hci::HciCapabilities,
+    management_settings: u32,
     receive_readiness: Arc<PollSet<32>>,
 }
 
@@ -200,6 +207,7 @@ impl UsbBluetoothHci {
             family_hint,
             address: [0; 6],
             capabilities: tk_bt_hci::HciCapabilities::default(),
+            management_settings: 0,
             receive_readiness: Arc::new(PollSet::new()),
         })
     }
@@ -236,7 +244,12 @@ impl UsbBluetoothHci {
     }
     pub fn set_device_up(&mut self, up: bool) -> Result<(), Error> {
         self.adapter.set_up(up)?;
-        if up {
+        if !up {
+            self.management_settings &=
+                !(MGMT_SETTING_POWERED | MGMT_SETTING_CONNECTABLE | MGMT_SETTING_DISCOVERABLE);
+            return Ok(());
+        }
+        let initialization = (|| {
             if self.family_hint != tk_bt_hci::DeviceFamily::Unknown {
                 self.adapter.intel_set_event_mask()?;
             }
@@ -244,8 +257,129 @@ impl UsbBluetoothHci {
                 self.address = capabilities.address;
                 self.capabilities = capabilities;
             }
+            let mut event = [0u8; 16];
+            if self
+                .command_complete_raw(0x0c19, &[], &mut event)
+                .is_ok_and(|length| length >= 7 && event[5] == 0)
+            {
+                self.management_settings &= !(MGMT_SETTING_CONNECTABLE | MGMT_SETTING_DISCOVERABLE);
+                if event[6] & 0x02 != 0 {
+                    self.management_settings |= MGMT_SETTING_CONNECTABLE;
+                }
+                if event[6] & 0x01 != 0 {
+                    self.management_settings |=
+                        MGMT_SETTING_CONNECTABLE | MGMT_SETTING_DISCOVERABLE;
+                }
+            }
+            Ok::<(), Error>(())
+        })();
+        if let Err(error) = initialization {
+            let _ = self.adapter.set_up(false);
+            self.management_settings &=
+                !(MGMT_SETTING_POWERED | MGMT_SETTING_CONNECTABLE | MGMT_SETTING_DISCOVERABLE);
+            return Err(error);
+        }
+        self.management_settings |= MGMT_SETTING_POWERED;
+        Ok(())
+    }
+    pub fn management_settings(&self) -> u32 {
+        self.management_settings
+    }
+    /// Apply mgmt settings that map to a single acknowledged HCI operation.
+    /// Host-only Bondable state is maintained here; scan flags, SSP, and LE
+    /// are not published until the matching HCI Command Complete succeeds.
+    pub fn set_management_setting(&mut self, setting: u32, enabled: bool) -> Result<u32, Error> {
+        if !self.adapter.is_up() {
+            return Err(Error::NotUp);
+        }
+        let mut next = self.management_settings;
+        match setting {
+            MGMT_SETTING_CONNECTABLE | MGMT_SETTING_DISCOVERABLE => {
+                let scan = if setting == MGMT_SETTING_CONNECTABLE {
+                    if enabled {
+                        next |= MGMT_SETTING_CONNECTABLE;
+                    } else {
+                        next &= !(MGMT_SETTING_CONNECTABLE | MGMT_SETTING_DISCOVERABLE);
+                    }
+                    if next & MGMT_SETTING_DISCOVERABLE != 0 {
+                        0x03
+                    } else if next & MGMT_SETTING_CONNECTABLE != 0 {
+                        0x02
+                    } else {
+                        0
+                    }
+                } else {
+                    if enabled {
+                        next |= MGMT_SETTING_DISCOVERABLE | MGMT_SETTING_CONNECTABLE;
+                    } else {
+                        next &= !MGMT_SETTING_DISCOVERABLE;
+                    }
+                    if next & MGMT_SETTING_DISCOVERABLE != 0 {
+                        0x03
+                    } else if next & MGMT_SETTING_CONNECTABLE != 0 {
+                        0x02
+                    } else {
+                        0
+                    }
+                };
+                self.command_complete(0x0c1a, &[scan])?;
+            }
+            MGMT_SETTING_SSP => {
+                self.command_complete(0x0c56, &[u8::from(enabled)])?;
+                if enabled {
+                    next |= setting
+                } else {
+                    next &= !setting
+                }
+            }
+            MGMT_SETTING_LE => {
+                self.command_complete(0x0c6d, &[u8::from(enabled), 0])?;
+                if enabled {
+                    next |= setting
+                } else {
+                    next &= !setting
+                }
+            }
+            MGMT_SETTING_BONDABLE => {
+                if enabled {
+                    next |= setting
+                } else {
+                    next &= !setting
+                }
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        self.management_settings = next;
+        Ok(next)
+    }
+    fn command_complete(&mut self, opcode: u16, parameters: &[u8]) -> Result<(), Error> {
+        let mut event = [0u8; 260];
+        let length = self.command_complete_raw(opcode, parameters, &mut event)?;
+        if length < 6 || event[5] != 0 {
+            return Err(Error::Unsupported);
         }
         Ok(())
+    }
+    fn command_complete_raw(
+        &mut self,
+        opcode: u16,
+        parameters: &[u8],
+        event: &mut [u8],
+    ) -> Result<usize, Error> {
+        if parameters.len() > u8::MAX as usize {
+            return Err(Error::InvalidLength);
+        }
+        let mut command = [0u8; 258];
+        command[..2].copy_from_slice(&opcode.to_le_bytes());
+        command[2] = parameters.len() as u8;
+        command[3..3 + parameters.len()].copy_from_slice(parameters);
+        let result = self
+            .adapter
+            .command_complete(&command[..3 + parameters.len()], event);
+        if self.adapter.receive_ready() {
+            self.receive_readiness.wake();
+        }
+        result
     }
     pub fn open(&mut self, channel: tk_bt_hci::Channel) -> Result<(), Error> {
         self.adapter.open(channel)
@@ -558,6 +692,50 @@ impl UsbTransport for Transport {
         }
         Ok(())
     }
+    fn begin_command_transaction(&mut self) -> Result<(), Error> {
+        // A persistent event-IN request may already own the endpoint. Reap
+        // it first; otherwise cancel and wait for the exact request token
+        // before issuing the synchronous command-complete read.
+        self.reclaim_event()?;
+        if let Some(id) = self.event_request.take() {
+            if self.event.cancel(id).is_err() {
+                if let Some(completion) = self.host.reclaim(&self.event, id).map_err(|_| {
+                    self.host.halt();
+                    Error::NoDevice
+                })? {
+                    if completion.status != TransferStatus::Completed {
+                        return Err(Error::NoDevice);
+                    }
+                    self.event_ready = Some(completion.actual_length);
+                } else {
+                    self.host.halt();
+                    return Err(Error::NoDevice);
+                }
+            } else {
+                loop {
+                    if self.host.pump().is_err() {
+                        self.host.halt();
+                        return Err(Error::NoDevice);
+                    }
+                    if let Some(completion) = self.host.reclaim(&self.event, id).map_err(|_| {
+                        self.host.halt();
+                        Error::NoDevice
+                    })? {
+                        if completion.status != TransferStatus::Completed {
+                            return Err(Error::NoDevice);
+                        }
+                        self.event_ready = Some(completion.actual_length);
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        Ok(())
+    }
+    fn end_command_transaction(&mut self) {
+        let _ = self.submit_event();
+    }
     // upstream: ng_ubt.c ubt_bulk_write_callback()
     fn bulk_acl_out(&mut self, packet: &[u8]) -> Result<(), Error> {
         self.host
@@ -567,6 +745,13 @@ impl UsbTransport for Transport {
     }
     // upstream: ng_ubt.c ubt_intr_read_callback()
     fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        if let Some(length) = self.event_ready.take() {
+            if length > out.len() {
+                return Err(Error::Truncated);
+            }
+            out[..length].copy_from_slice(&self.event_buffer[..length]);
+            return Ok(length);
+        }
         self.host
             .transfer(&self.event, TransferRequest::interrupt_in(out))
             .map_err(|_| Error::NoDevice)

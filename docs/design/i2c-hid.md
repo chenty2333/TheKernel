@@ -26,6 +26,19 @@ or generic shared-GSI request/teardown interfaces exists in the current target,
 so adding a guessed pin-to-IRQ mapping would be unsafe. Existing adaptive
 polling remains the fallback until those framework seams are implemented.
 
+2026-10-09 N305 Intel GPIO follow-up: the current machine's ACPI inventory is
+Lenovo 21VG rather than N305 and has no `INT34C8` node, so it cannot provide
+board-specific register/resource evidence. Intel's public GPIO configuration
+guidance provides select pad-lock examples, but not the complete Alder Lake-N
+community/pad table or interrupt routing required to map an ACPI pin safely.
+Intel identifies those register details as Alder Lake-N EDS Volume 2 (RDC
+645550), access-controlled in its documentation center; the public GPIO docs
+are at <https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/technical-documentation/gpio-configuration-best-practices.html>.
+No register writes/provider were added without that exact N305 layout and the
+missing shared-GSI API. The next safe implementation boundary remains the
+provider registry, ACPI memory/interrupt-resource mapping, community/pad table
+from Intel's public or user-provided N305 EDS, and deferred I2C read worker.
+
 The shared parser's per-report size helper follows `hid_report_size()` and the
 maximum-size helper follows `hid_report_size_max()`: it selects the largest
 report size while retaining the first nonzero Report ID as FreeBSD does. A

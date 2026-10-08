@@ -108,6 +108,13 @@ pub trait UsbTransport {
     fn bulk_acl_out(&mut self, packet: &[u8]) -> Result<(), Error>;
     fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error>;
     fn read_bulk_acl(&mut self, out: &mut [u8]) -> Result<usize, Error>;
+    /// Temporarily claim the HCI event endpoint for a synchronous command
+    /// transaction. Drivers with a persistent asynchronous event read must
+    /// quiesce that request here and restore it in `end_command_transaction`.
+    fn begin_command_transaction(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_command_transaction(&mut self) {}
     /// Nonblocking, multiplexed receive of HCI events and ACL packets. The
     /// transport may retain endpoint requests between calls.
     fn read_packet(
@@ -475,6 +482,17 @@ impl<T: UsbTransport> Adapter<T> {
             return Err(Error::NotUp);
         }
         let opcode = u16::from_le_bytes([parsed.payload[0], parsed.payload[1]]);
+        self.transport.begin_command_transaction()?;
+        let result = self.command_complete_transaction(command, opcode, event);
+        self.transport.end_command_transaction();
+        result
+    }
+    fn command_complete_transaction(
+        &mut self,
+        command: &[u8],
+        opcode: u16,
+        event: &mut [u8],
+    ) -> Result<usize, Error> {
         if let Err(error) = self.transport.control_command(command) {
             self.stats.err_tx = self.stats.err_tx.saturating_add(1);
             return Err(error);
@@ -482,38 +500,56 @@ impl<T: UsbTransport> Adapter<T> {
         self.stats.cmd_tx = self.stats.cmd_tx.saturating_add(1);
         self.stats.byte_tx = self.stats.byte_tx.saturating_add(command.len() as u32);
         self.queue_monitor(2, command);
-        let length = match self.transport.read_interrupt_event(event) {
-            Ok(length) => length,
-            Err(error) => {
+        for _ in 0..64 {
+            let length = match self.transport.read_interrupt_event(event) {
+                Ok(length) => length,
+                Err(error) => {
+                    self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                    return Err(error);
+                }
+            };
+            if length > event.len() {
                 self.stats.err_rx = self.stats.err_rx.saturating_add(1);
-                return Err(error);
+                return Err(Error::InvalidLength);
             }
-        };
-        if length > event.len() {
-            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
-            return Err(Error::InvalidLength);
-        }
-        let received = match Packet::parse(PacketType::Event, &event[..length]) {
-            Ok(received) => received,
-            Err(error) => {
-                self.stats.err_rx = self.stats.err_rx.saturating_add(1);
-                return Err(error);
+            let received = match Packet::parse(PacketType::Event, &event[..length]) {
+                Ok(received) => received,
+                Err(error) => {
+                    self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+                    return Err(error);
+                }
+            };
+            self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+            self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+            self.queue_monitor(3, &event[..length]);
+            if received.payload[0] == 0xff {
+                if opcode >= 0xfc00 {
+                    return Ok(length);
+                }
+                self.queue_incoming_event(&event[..length])?;
+                continue;
             }
-        };
-        self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
-        self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
-        self.queue_monitor(3, &event[..length]);
-        if received.payload[0] == 0xff {
+            if received.payload[0] != 0x0e || length < 5 {
+                self.queue_incoming_event(&event[..length])?;
+                continue;
+            }
+            let completed = u16::from_le_bytes([received.payload[3], received.payload[4]]);
+            if completed != opcode {
+                self.queue_incoming_event(&event[..length])?;
+                continue;
+            }
             return Ok(length);
         }
-        if received.payload[0] != 0x0e || length < 5 {
-            return Err(Error::InvalidLength);
+        Err(Error::Again)
+    }
+    fn queue_incoming_event(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.incoming.len() >= 64 {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(Error::Busy);
         }
-        let completed = u16::from_le_bytes([received.payload[3], received.payload[4]]);
-        if completed != opcode {
-            return Err(Error::Unsupported);
-        }
-        Ok(length)
+        self.incoming
+            .push_back((PacketType::Event, Vec::from(bytes)));
+        Ok(())
     }
     /// Query the Intel firmware version using vendor command 0xfc05.
     // upstream: iwmbt_hw.c iwmbt_get_version()
@@ -858,6 +894,11 @@ mod tests {
     struct RxFake {
         packet: Option<(PacketType, Vec<u8>)>,
     }
+    struct CommandFake {
+        events: VecDeque<Vec<u8>>,
+        begun: usize,
+        ended: usize,
+    }
     impl UsbTransport for RxFake {
         fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
             Ok(())
@@ -884,6 +925,33 @@ mod tests {
             }
             out[..packet.len()].copy_from_slice(&packet);
             Ok(Some((kind, packet.len())))
+        }
+        fn stop(&mut self) {}
+    }
+    impl UsbTransport for CommandFake {
+        fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn bulk_acl_out(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+            let event = self.events.pop_front().ok_or(Error::NoDevice)?;
+            if event.len() > out.len() {
+                return Err(Error::InvalidLength);
+            }
+            out[..event.len()].copy_from_slice(&event);
+            Ok(event.len())
+        }
+        fn read_bulk_acl(&mut self, _: &mut [u8]) -> Result<usize, Error> {
+            Err(Error::Unsupported)
+        }
+        fn begin_command_transaction(&mut self) -> Result<(), Error> {
+            self.begun += 1;
+            Ok(())
+        }
+        fn end_command_transaction(&mut self) {
+            self.ended += 1;
         }
         fn stop(&mut self) {}
     }
@@ -1232,6 +1300,31 @@ mod tests {
         let mut event = [0; 16];
         assert_eq!(adapter.command_complete(&[1, 0x10, 0], &mut event), Ok(6));
         assert_eq!(&event[..6], &[0x0e, 4, 1, 1, 0x10, 0]);
+    }
+
+    #[test]
+    fn hci_command_transaction_preserves_unrelated_events_and_rearms() {
+        let fake = CommandFake {
+            events: VecDeque::from([
+                vec![0x0e, 4, 1, 0x02, 0x10, 0],
+                vec![0x0e, 4, 1, 0x01, 0x10, 0],
+            ]),
+            begun: 0,
+            ended: 0,
+        };
+        let mut adapter = Adapter::new(fake, 0);
+        adapter.set_up(true).unwrap();
+        let mut event = [0; 16];
+        assert_eq!(
+            adapter.command_complete(&[0x01, 0x10, 0], &mut event),
+            Ok(6)
+        );
+        assert_eq!(
+            adapter.receive_packet(&mut event, true),
+            Ok((PacketType::Event, 6))
+        );
+        let fake = adapter.into_transport();
+        assert_eq!((fake.begun, fake.ended), (1, 1));
     }
     #[test]
     fn hci_capabilities_are_decoded_from_standard_command_replies() {
