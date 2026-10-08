@@ -1034,3 +1034,33 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): UMAC scan request v14/v17 serialization, dwell/channel parameters, direct SSID and background async mode translated in `tk-axdriver-iwx/src/scan.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): reduced SCAN_CFG API gate, antenna masks and broadcast station compatibility field translated in `tk-axdriver-iwx/src/scan.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): rate-set index conversion and mandatory-rate CCK/OFDM ACK masks translated in `tk-axdriver-iwx/src/rate.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): PCI attach DMA context, PRPH scratch, ICT, TX queue and RX ring allocation ordering translated in `tk-axdriver-iwx/src/attach.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxvar.h` (ISC): background-scan roam completion, queue flush, RSN key teardown and BSS-switch argument ownership translated in `tk-axdriver-iwx/src/background_scan.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): missed-beacon threshold and directed-probe decision translated in `tk-axdriver-iwx/src/beacon.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): deferred MAC/PHY update callbacks, shutdown guards, reference release and bandwidth-change rate-rescale order translated in `tk-axdriver-iwx/src/context_task.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): ioctl restart, watchdog timeout, media-change and TX scheduling decisions translated in `tk-axdriver-iwx/src/control.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): owned BAR/DMA/ring controller, RX notification and command wait, ALIVE/PNVM firmware sequencing translated in `tk-axdriver-iwx/src/controller.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230, `if_iwxreg.h`, and `if_iwxvar.h` (ISC): WFPM owner access, CRF/CNV PRPH identity and BZ stepping adjustment translated in `tk-axdriver-iwx/src/crf.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): LMAC/UMAC error-table word layouts, pointer validation and SYSASSERT decoding translated in `tk-axdriver-iwx/src/diagnostics.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): deferred key install/remove, MLD SEC_KEY and legacy station-key command payloads translated in `tk-axdriver-iwx/src/keys.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): interface init/stop reset order, task cancellation and multicast-filter selection translated in `tk-axdriver-iwx/src/lifecycle.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): legacy MAC_CONTEXT_CMD and MLD MAC-context wire layouts translated in `tk-axdriver-iwx/src/mac_context.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): MLD LINK_CONFIG_CMD/STA_CONFIG_CMD v1/v2 payloads and ordered peer add/remove translated in `tk-axdriver-iwx/src/mld.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxvar.h` (ISC): zero-initialized driver-private peer extension allocation translated in `tk-axdriver-iwx/src/node.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): suspend, resume, wakeup and low-power command policies translated in `tk-axdriver-iwx/src/pm.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): preinit channel, HT/VHT rate capability, 5-GHz band and MAC-address policy translated in `tk-axdriver-iwx/src/preinit.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): MCC CHUB country-code/source-field decoding translated in `tk-axdriver-iwx/src/regulatory.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): pre-AX multi-packet versus AX210 transfer-buffer ownership and RX ring recycling translated in `tk-axdriver-iwx/src/rx_buffer.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): hardware decrypt status, CCMP PN extraction and same-PN A-MSDU replay checks translated in `tk-axdriver-iwx/src/rx_crypto.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `sys/net80211/ieee80211.h` (ISC): retry duplicate filtering and A-MSDU pseudo-duplicate state translated in `tk-axdriver-iwx/src/rx_duplicate.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): final RX channel/RSSI/noise/rate/timestamp metadata and 802.11 input handoff translated in `tk-axdriver-iwx/src/rx_frame.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): RX_MPDU generation layouts, pad repair, A-MSDU flag fix, replay gate and duplicate dispatch translated in `tk-axdriver-iwx/src/rx_mpdu.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): association session-protection add/remove wire command and state translated in `tk-axdriver-iwx/src/session.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): smart-FIFO scenario, aging watermark and timeout tables translated in `tk-axdriver-iwx/src/spectrum.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): Init-MVM hardware commands, firmware configuration, MCC response and startup action order translated in `tk-axdriver-iwx/src/startup.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): AUTH/DEAUTH/RUN/RUN_STOP software state transitions, key-port gates and error rollback translated in `tk-axdriver-iwx/src/state.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): station add/remove, TX drain/flush, BA teardown and rate-config status commands translated in `tk-axdriver-iwx/src/station.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): statistics clear/response wait and notification state translated in `tk-axdriver-iwx/src/statistics.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): deferred task enqueue/delete reference accounting and shutdown waiter release translated in `tk-axdriver-iwx/src/task.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 (ISC): authenticated MFP leave, 500-ms node-unref wait and start-queue gating translated in `tk-axdriver-iwx/src/tx_start.rs`.
+- OpenBSD `sys/net80211/ieee80211_rssadapt.c` rev 1.11 and `ieee80211_rssadapt.h` rev 1.5 (BSD-3-Clause): packet-length buckets, RSSI thresholds, exponential averages, success decay, failure updates and legacy rate selection translated in `tk-net80211/src/rssadapt.rs`.

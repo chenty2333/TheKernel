@@ -43,7 +43,7 @@
 - Reduced SCAN_CFG v5+ setup now checks the advertised firmware API and legacy broadcast station-ID compatibility (`d8c96c37`).
 - Rate-set lookup, legacy rate lookup and CCK/OFDM ACK masks with mandatory lower rates are translated (`de44cbaf`).
 - Scan probe descriptors and raw 512-byte frame data now have an exact packed-wire serializer (`8f69492b`).
-- Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
+- W-19: the `if_iwx.c` driver body is covered 262/268 with the remaining autoconf/BPF hooks or Rust ownership mappings recorded; PCI probe/rootfs Init/NVM and regular-uCode runtime-start API are integrated (`ca1f3880`). Continue with net80211, keeping the netdev if-up caller for task 4.
 - `IwxController` now owns CSR, attach DMA/rings, command slots, and firmware bootstrap/context start; Init and regular TLVs allocate separate section layouts (`controller.rs`, `dma.rs`; 162 crate tests pass, global and n305 lint pass).
 - The owned controller now drains completion descriptors, copies/recycles RX buffers, routes direct command responses into command-slot wait state, and dispatches firmware/data packets (`process_rx_notifications`; 163 crate tests pass, lint pair run).
 - PCI probe now creates and retains the core IwxController over a bounds-checked volatile BAR0 `CsrAccess` adapter; rootfs callback still stages firmware, but does not yet execute it or publish wlan0 (`tk-axdriver/src/iwx.rs`).
@@ -65,3 +65,4 @@
 - W-22 audit: `send_host_command()` and both TX-ring submit paths call `IwxRegisters::kick_tx_queue()`, which writes `qid << 16 | cur_hw` to CSR `0x460`; new regression test checks data queue 7 publishes `0x0007_0001` (the existing command regression checks `0x0000_0001`).
 - Remaining `if_iwx.c` definitions and mapping reason: `iwx_attach_hook()` is the OpenBSD autoconf callback replaced by PCI probe/rootfs-ready registration; `iwx_free_resp()`, `iwx_free_rx_ring()`, `iwx_free_tx_ring()`, and `iwx_fw_info_free()` are represented by `Vec`/owned-`DmaRegion` drop; `iwx_radiotap_attach()` is optional NBPFILTER/BPF capture framework registration not present in TheKernel.
 - Init-uCode preinit now retains ALIVE SKU and follows the source ucode→Gen3 PNVM completion→post-ALIVE order before INIT_COMPLETE/NVM_GET_INFO; `cargo test -p tk-axdriver-iwx` passes 209 tests and `cargo test -p tk-axdriver --features n305-net` passes 13.
+- Task 3 resumed after W-19 completion: `tk-net80211/src/rssadapt.rs` translates OpenBSD `ieee80211_rssadapt.c` 5/5 functions; crate tests pass 8/8 including existing frame/RSN tests.

@@ -534,3 +534,9 @@ The optional AX211 rootfs payload stages only the linux-firmware
 to `/usr/share/licenses/linux-firmware/` next to the payload's license record.
 These firmware binaries are supplied by the caller via
 `THEKERNEL_IWX_FIRMWARE_DIR` and are not checked into this repository.
+
+The `tk-net80211` wireless protocol crate uses the OpenBSD net80211
+BSD-3-Clause grants for frame conversion, RSN/WPA parsing and RSSI rate
+adaptation, plus Fuchsia's BSD-3-Clause wlan libraries as the selected source
+for later EAPOL/RSN/MLME reuse. Original file copyright lines and the full
+BSD-3-Clause text are retained in the crate.
