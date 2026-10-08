@@ -117,6 +117,8 @@ rule: firmware-owned agreements get a stop callback without host-state reset;
 software agreements are cleared and optionally transmit DELBA.
 Supplicant PTK-negotiation failures now persist the WPA-key association failure
 bit on the current BSS and its independent scan-cache copy.
+Station keyrun requires RUN plus RSN and moves the handoff state to PTKSTART;
+the userspace wpa_supplicant owns the subsequent four-way handshake and keys.
 The transmit AMPDU admission predicate additionally requires HT, local TX
 support, the active BSS peer in station mode, and RSN protection.
 Management frame helpers also encode Capability Information, DS channel and

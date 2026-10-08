@@ -1133,4 +1133,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/net80211/ieee80211_proto.c` rev 1.176 and `ieee80211_node.h` rev 1.64 (BSD-3-Clause): transmit requested/agreed BlockAck timeout transitions, retry interval and receive inactivity timeout cleanup translated in `tk-net80211/src/ba_tx.rs`.
 - OpenBSD `sys/net80211/ieee80211_proto.c` rev 1.176 (BSD-3-Clause): `ieee80211_stop_ampdu_tx()` TID traversal and ADDBA-offload/DELBA teardown effects translated in `tk-net80211/src/ba_tx.rs`.
 - OpenBSD `sys/net80211/ieee80211_proto.c` rev 1.176 (BSD-3-Clause): `ieee80211_check_wpa_supplicant_failure()` station/IBSS PTK-negotiation failure propagation to the cached BSS node translated in `tk-net80211/src/proto.rs`.
+- OpenBSD `sys/net80211/ieee80211_proto.c` rev 1.176 and `ieee80211_node.h` rev 1.64 (BSD-3-Clause): station `ieee80211_keyrun()` run/RSN guard and external supplicant PTKSTART handoff translated in `tk-net80211/src/proto.rs`.
 - OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 and `ieee80211_var.h` rev 1.143 (BSD-3-Clause): HT/local AMPDU/station-BSS/RSN eligibility check translated in `tk-net80211/src/output.rs`.

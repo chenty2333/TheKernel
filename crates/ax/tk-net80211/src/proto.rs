@@ -76,6 +76,31 @@ pub enum ProtocolState {
     Run,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RsnSupplicantState {
+    Initialize,
+    PtkStart,
+    PtkNegotiating,
+    PtkDone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyRunError {
+    NetworkDown,
+}
+
+/// Enter the external supplicant's PTK-start state for an associated station.
+// upstream: ieee80211_proto.c ieee80211_keyrun()
+pub fn start_station_keyrun(
+    state: ProtocolState,
+    rsn_enabled: bool,
+) -> Result<RsnSupplicantState, KeyRunError> {
+    if state != ProtocolState::Run || !rsn_enabled {
+        return Err(KeyRunError::NetworkDown);
+    }
+    Ok(RsnSupplicantState::PtkStart)
+}
+
 /// Process one management-watchdog tick and preserve station auth/assoc timeout effects.
 // upstream: ieee80211.c ieee80211_watchdog()
 pub fn management_watchdog_tick(
@@ -1075,5 +1100,21 @@ mod tests {
         ));
         assert_eq!(cached.association_failures, node.association_failures);
         assert_eq!(non_bss.association_failures, crate::ASSOCFAIL_WPA_KEY);
+    }
+
+    #[test]
+    fn station_keyrun_requires_run_rsn_and_delegates_handshake_to_supplicant() {
+        assert_eq!(
+            start_station_keyrun(ProtocolState::Run, true),
+            Ok(RsnSupplicantState::PtkStart)
+        );
+        assert_eq!(
+            start_station_keyrun(ProtocolState::Assoc, true),
+            Err(KeyRunError::NetworkDown)
+        );
+        assert_eq!(
+            start_station_keyrun(ProtocolState::Run, false),
+            Err(KeyRunError::NetworkDown)
+        );
     }
 }

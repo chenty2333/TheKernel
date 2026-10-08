@@ -123,3 +123,4 @@
 - `ieee80211_proto.c` Tx/Rx BA timeout callbacks now update retry/stat state and route setup-required or timeout DELBA effects; proto coverage advances to 14/30 functions.
 - `ieee80211_proto.c` `ieee80211_stop_ampdu_tx()` now walks all 16 TIDs and returns source offload/DELBA teardown effects; proto coverage advances to 15/30.
 - `ieee80211_proto.c` supplicant PTK negotiation failure now records the WPA-key failure on BSS and cached node; proto coverage advances to 16/30.
+- `ieee80211_proto.c` station `ieee80211_keyrun()` now enforces RUN+RSN and hands PTKSTART to wpa_supplicant; proto coverage advances to 17/30.
