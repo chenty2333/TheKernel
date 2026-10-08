@@ -27,6 +27,14 @@ pub const CHAN_40MHZ: u32 = 1 << 7;
 pub const CHAN_VHT: u32 = 1 << 8;
 pub const CHANX_80MHZ: u32 = 1 << 0;
 pub const CHANX_160MHZ: u32 = 1 << 1;
+pub const VHT_CTRL_1_BELOW: u8 = 0;
+pub const VHT_CTRL_2_BELOW: u8 = 1;
+pub const VHT_CTRL_3_BELOW: u8 = 2;
+pub const VHT_CTRL_4_BELOW: u8 = 3;
+pub const VHT_CTRL_1_ABOVE: u8 = 4;
+pub const VHT_CTRL_2_ABOVE: u8 = 5;
+pub const VHT_CTRL_3_ABOVE: u8 = 6;
+pub const VHT_CTRL_4_ABOVE: u8 = 7;
 
 const CHANNELS_8000: [u8; CHANNELS_24_5GHZ] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80,
@@ -40,6 +48,22 @@ pub struct ChannelInfo {
     pub frequency_mhz: u16,
     pub flags: u32,
     pub extended_flags: u32,
+}
+
+/// Convert the primary/center channel-index delta to firmware's VHT control position.
+// upstream: if_iwx.c iwx_get_vht_ctrl_pos()
+pub const fn vht_control_position(primary_index: i16, center_index: i16) -> u8 {
+    match primary_index - center_index {
+        -14 => VHT_CTRL_4_BELOW,
+        -10 => VHT_CTRL_3_BELOW,
+        -6 => VHT_CTRL_2_BELOW,
+        -2 => VHT_CTRL_1_BELOW,
+        2 => VHT_CTRL_1_ABOVE,
+        6 => VHT_CTRL_2_ABOVE,
+        10 => VHT_CTRL_3_ABOVE,
+        14 => VHT_CTRL_4_ABOVE,
+        _ => VHT_CTRL_1_BELOW,
+    }
 }
 
 /// Generate the standard 2.4/5-GHz channel table from per-channel NVM flags.
@@ -182,5 +206,18 @@ mod tests {
     #[test]
     fn channel_map_truncates_six_ghz_for_net80211_abi() {
         assert_eq!(init_channel_map(&nvm(), true).len(), 51);
+    }
+
+    #[test]
+    fn vht_control_position_matches_all_supported_160mhz_subchannels() {
+        assert_eq!(vht_control_position(36, 50), VHT_CTRL_4_BELOW);
+        assert_eq!(vht_control_position(40, 50), VHT_CTRL_3_BELOW);
+        assert_eq!(vht_control_position(44, 50), VHT_CTRL_2_BELOW);
+        assert_eq!(vht_control_position(48, 50), VHT_CTRL_1_BELOW);
+        assert_eq!(vht_control_position(52, 50), VHT_CTRL_1_ABOVE);
+        assert_eq!(vht_control_position(56, 50), VHT_CTRL_2_ABOVE);
+        assert_eq!(vht_control_position(60, 50), VHT_CTRL_3_ABOVE);
+        assert_eq!(vht_control_position(64, 50), VHT_CTRL_4_ABOVE);
+        assert_eq!(vht_control_position(42, 50), VHT_CTRL_1_BELOW);
     }
 }

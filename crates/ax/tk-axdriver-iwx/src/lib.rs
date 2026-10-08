@@ -9,6 +9,7 @@ extern crate alloc;
 mod alive;
 mod apm;
 mod ba;
+mod binding;
 mod bringup;
 mod channel;
 mod command;
@@ -48,6 +49,11 @@ pub use ba::{
     RX_REORDER_TIMEOUT_MQ_USEC, ReorderBuffer, RxBaSession, RxBaTable, STATION_ID,
     baid_config_command, baid_config_response, station_ba_command, station_ba_response,
 };
+pub use binding::{
+    BINDING_CONTEXT_COMMAND, BindingError, BindingState, BindingUpdateError, CONTEXT_ACTION_ADD,
+    CONTEXT_ACTION_REMOVE, INVALID_CONTEXT_ID, LMAC_5_GHZ, LMAC_24_GHZ, MAX_MACS_IN_BINDING,
+    binding_command, update_binding,
+};
 pub use bringup::{
     FIRMWARE_ALIVE_TIMEOUT_NS, FW_COMMAND_VERSION_UNKNOWN, FirmwareLoadError, InitFirmwareError,
     InitFirmwareState, LONG_GROUP as FIRMWARE_LONG_GROUP, PostAliveState, TX_COMMAND_OPCODE,
@@ -57,7 +63,8 @@ pub use bringup::{
 pub use channel::{
     CHAN_2GHZ, CHAN_40MHZ, CHAN_A, CHAN_CCK, CHAN_DYN, CHAN_HT, CHAN_OFDM, CHAN_PASSIVE, CHAN_VHT,
     CHANNELS_2GHZ, CHANNELS_5GHZ, CHANNELS_24_5GHZ, CHANX_80MHZ, CHANX_160MHZ, ChannelInfo,
-    init_channel_map,
+    VHT_CTRL_1_ABOVE, VHT_CTRL_1_BELOW, VHT_CTRL_2_ABOVE, VHT_CTRL_2_BELOW, VHT_CTRL_3_ABOVE,
+    VHT_CTRL_3_BELOW, VHT_CTRL_4_ABOVE, VHT_CTRL_4_BELOW, init_channel_map, vht_control_position,
 };
 pub use command::{
     CMD_ASYNC, CMD_FAILED_MASK, CMD_SEND_DURING_RFKILL, CMD_WANT_RESPONSE, CommandError,

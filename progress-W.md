@@ -28,4 +28,5 @@
 - `iwx_config_ltr()` payload is now capability-gated; `iwx_rx_rx_phy_cmd()`'s cached PHY report is decoded field-by-field (`a10a9a42`).
 - `iwx_rx_addbuf()` buffer refill now replaces completed DMA storage and republishes the generation-specific RX descriptor (`c3e43870`).
 - TX response and compressed-BA notifications now validate bounded variable layouts and expose consumer indices/queue progress (`26b5ab14`).
+- Legacy binding context command/status state and the 20/40/80/160-MHz VHT control-position mapping are translated (pending commit).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
