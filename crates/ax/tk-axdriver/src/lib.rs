@@ -78,6 +78,12 @@ mod drivers;
 mod dummy;
 #[cfg(feature = "block-irq")]
 pub mod block_irq;
+#[cfg(feature = "block")]
+mod block_hotplug;
+#[cfg(feature = "block")]
+pub use block_hotplug::{
+    install_runtime_block_add_hook, publish_runtime_block_device, RuntimeBlockAddHook,
+};
 #[cfg(feature = "virtio-sound")]
 pub mod sound;
 mod structs;

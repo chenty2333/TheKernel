@@ -17,9 +17,10 @@ Registry add/remove/rescan changes bridge into the kernel `DeviceRegistry` and
 its add/remove uevent publisher. A kernel worker now polls only block devices
 whose driver returns an authoritative media-presence fact; absent SATA links
 and SD card detect withdraw the disk and children through that shared path,
-while mounted claims defer removal. Automatic publication for media inserted
-into an empty HBA/SDHCI slot and safe re-identification of replacement cards
-remain outstanding. PCI MSI/MSI-X/INTx completion routes are wired to AHCI and
+while mounted claims defer removal. AHCI and SDHCI controller workers retry
+empty ports/slots and route newly enumerated media through the runtime add hook;
+SD cards are re-enumerated before a replacement is published. PCI
+MSI/MSI-X/INTx completion routes are wired to AHCI and
 SDHCI; AHCI MSI is exercised in QEMU, while SDHCI signal generation remains
 disabled by default because QEMU's INTx route lost command status when enabled.
 Guest-side GPT creation, `BLKRRPART`, ext4 formatting, mount, and read/write

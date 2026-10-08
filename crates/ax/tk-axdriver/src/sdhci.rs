@@ -8,14 +8,14 @@
 use core::{
     ptr,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, Ordering, fence},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering, fence},
 };
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_base::BaseDriverOps;
 use axdriver_block::sdhci::{
     SDHCI_CAPABILITIES, SDHCI_CAPABILITIES2, SDHCI_HOST_VERSION, SDHCI_SPEC_VER_MASK, SdhciDisk,
-    SdhciDmaRegion, SdhciHost, SdhciIo,
+    SdhciDmaRegion, SdhciHost, SdhciIo, SdhciPartitionDisk,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::virt_to_phys;
@@ -36,6 +36,10 @@ const QEMU_SDHCI_VID: u16 = 0x1b36;
 const QEMU_SDHCI_DID: u16 = 0x0007;
 const SDMA_BUFFER_BYTES: usize = 512 * 1024;
 const SDMA_BUFFER_PAGES: usize = SDMA_BUFFER_BYTES / 4096;
+static SDHCI_HOTPLUG_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static SDHCI_HOTPLUG_SLOTS: spin::Mutex<alloc::vec::Vec<SdhciHotplugSlot>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+static NEXT_RUNTIME_MMC_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
 struct SdhciPciId {
@@ -259,11 +263,24 @@ fn ack_sdhci_interrupt(context: usize) -> bool {
     true
 }
 
+#[derive(Clone)]
 struct SdhciWindow {
     base: NonNull<u8>,
     size: usize,
     irq: Option<PciBlockInterrupt>,
     irq_context: Option<&'static SdhciIrqContext>,
+}
+
+struct SdhciHotplugSlot {
+    io: SdhciWindow,
+    capabilities: u32,
+    capabilities2: u32,
+    version: u8,
+    quirks: u32,
+    vendor_id: u16,
+    device_id: u16,
+    disk_index: usize,
+    present: bool,
 }
 
 unsafe impl Send for SdhciWindow {}
@@ -384,10 +401,14 @@ fn probe_slot(
     bdf: DeviceFunction,
     info: &DeviceFunctionInfo,
     bar_index: u8,
+    irq_index: usize,
     disk_index: usize,
     quirks: u32,
     read_only: bool,
-) -> alloc::vec::Vec<crate::AxDeviceEnum> {
+) -> (
+    alloc::vec::Vec<crate::AxDeviceEnum>,
+    Option<SdhciHotplugSlot>,
+) {
     let (address, size) = match root.bar_info(bdf, bar_index) {
         Ok(BarInfo::Memory { address, size, .. })
             if address != 0 && size as usize >= SDHCI_BAR_MIN_BYTES =>
@@ -396,15 +417,15 @@ fn probe_slot(
         }
         _ => {
             warn!("sdhci: {bdf} has no usable MMIO BAR{bar_index} for slot {disk_index}");
-            return alloc::vec::Vec::new();
+            return (alloc::vec::Vec::new(), None);
         }
     };
     let Ok(mapped) = axklib::mem::iomap((address as usize).into(), size) else {
         warn!("sdhci: {bdf} BAR{bar_index} mapping failed");
-        return alloc::vec::Vec::new();
+        return (alloc::vec::Vec::new(), None);
     };
     let Some(base) = NonNull::new(mapped.as_usize() as *mut u8) else {
-        return alloc::vec::Vec::new();
+        return (alloc::vec::Vec::new(), None);
     };
     let irq_context = alloc::boxed::Box::leak(alloc::boxed::Box::new(SdhciIrqContext {
         base: base.as_ptr() as usize,
@@ -423,7 +444,7 @@ fn probe_slot(
     let irq = PciBlockInterrupt::register_slot(
         root,
         bdf,
-        disk_index,
+        irq_index,
         irq_context as *const _ as usize,
         ack_sdhci_interrupt,
     );
@@ -437,6 +458,7 @@ fn probe_slot(
         warn!("sdhci: {bdf} slot {disk_index} no MSI-X/MSI/INTx route; retaining polling fallback");
     }
     io.irq = irq;
+    let hotplug_io = io.clone();
     let capabilities = io.read32(SDHCI_CAPABILITIES as usize);
     let capabilities2 = io.read32(SDHCI_CAPABILITIES2 as usize);
     let version = (io.read16(SDHCI_HOST_VERSION as usize) & SDHCI_SPEC_VER_MASK as u16) as u8;
@@ -461,7 +483,20 @@ fn probe_slot(
         Ok(disk) => disk,
         Err(error) => {
             warn!("sdhci: {bdf} slot {disk_index} card initialization failed: {error:?}");
-            return alloc::vec::Vec::new();
+            return (
+                alloc::vec::Vec::new(),
+                Some(SdhciHotplugSlot {
+                    io: hotplug_io,
+                    capabilities,
+                    capabilities2,
+                    version,
+                    quirks,
+                    vendor_id: info.vendor_id,
+                    device_id: info.device_id,
+                    disk_index,
+                    present: false,
+                }),
+            );
         }
     };
     disk.log_card();
@@ -510,7 +545,103 @@ fn probe_slot(
             )));
         }
     }
-    devices
+    (
+        devices,
+        Some(SdhciHotplugSlot {
+            io: hotplug_io,
+            capabilities,
+            capabilities2,
+            version,
+            quirks,
+            vendor_id: info.vendor_id,
+            device_id: info.device_id,
+            disk_index,
+            present: true,
+        }),
+    )
+}
+
+fn start_hotplug_worker() {
+    if SDHCI_HOTPLUG_WORKER_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Err(error) = axtask::spawn_raw(
+        sdhci_hotplug_worker,
+        "sdhci_hotplug".into(),
+        axconfig::TASK_STACK_SIZE,
+    ) {
+        SDHCI_HOTPLUG_WORKER_STARTED.store(false, Ordering::Release);
+        warn!("sdhci: card hotplug worker unavailable: {error:?}");
+    }
+}
+
+// upstream: sdhci.c sdhci_card_poll(), sdhci_card_task(), sdhci_handle_card_present(), sdhci_handle_card_present_locked()
+fn sdhci_hotplug_worker() {
+    loop {
+        {
+            let mut slots = SDHCI_HOTPLUG_SLOTS.lock();
+            for slot in slots.iter_mut() {
+                let mut host = SdhciHost::new_with_quirks(
+                    slot.io.clone(),
+                    slot.capabilities,
+                    slot.capabilities2,
+                    slot.version,
+                    slot.quirks,
+                );
+                if !host.media_present() {
+                    slot.present = false;
+                    continue;
+                }
+                if slot.present {
+                    continue;
+                }
+                if slot.vendor_id == QEMU_SDHCI_VID && slot.device_id == QEMU_SDHCI_DID {
+                    host = host.with_single_block_only();
+                }
+                if dma_supported(slot.capabilities, slot.quirks)
+                    && slot.quirks & axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_DMA == 0
+                    && let Some(region) = allocate_dma_buffer()
+                {
+                    host = host.with_dma_region(region);
+                }
+                let Ok(mut disk) = SdhciDisk::attach(host) else {
+                    continue;
+                };
+                disk.log_card();
+                let read_only = disk.is_read_only();
+                let areas = disk.into_partition_devices(read_only, slot.disk_index);
+                let user_name = alloc::format!("mmcblk{}", slot.disk_index);
+                let mut published_user = false;
+                for area in areas {
+                    let is_user = area.device_name() == user_name;
+                    let raw = wrap_sdhci_partition(area);
+                    if crate::publish_runtime_block_device(raw) {
+                        if is_user {
+                            published_user = true;
+                        }
+                    } else if is_user {
+                        break;
+                    }
+                }
+                if published_user {
+                    slot.present = true;
+                    info!("sdhci: card inserted, published /dev/{user_name}");
+                }
+            }
+        }
+        let _ = axtask::sleep(core::time::Duration::from_millis(500));
+    }
+}
+
+fn wrap_sdhci_partition(partition: SdhciPartitionDisk<SdhciWindow>) -> crate::AxBlockDevice {
+    #[cfg(feature = "dyn")]
+    {
+        alloc::boxed::Box::new(partition)
+    }
+    #[cfg(not(feature = "dyn"))]
+    {
+        crate::StaticBlockDevice::Sdhci(alloc::boxed::Box::new(partition))
+    }
 }
 
 /// FreeBSD `sdhci_pci_attach()` slot enumeration and resource adaptation.
@@ -544,14 +675,23 @@ pub(crate) fn probe(
         && info.device_id == INTEL_EMMC_DID
         && axhal::boot::command_line_value("mmc.allow_write") != Some("1");
     let mut devices = alloc::vec::Vec::new();
+    let mut hotplug_slots = alloc::vec::Vec::new();
     for slot in 0..slots {
         let bar = first_bar.saturating_add(slot as u8);
         if bar > 5 {
             warn!("sdhci: {bdf} slot {slot} maps outside PCI BAR0..5");
             continue;
         }
-        devices.extend(probe_slot(root, bdf, info, bar, slot, quirks, read_only));
+        let disk_index = NEXT_RUNTIME_MMC_INDEX.fetch_add(1, Ordering::Relaxed);
+        let (found, hotplug) =
+            probe_slot(root, bdf, info, bar, slot, disk_index, quirks, read_only);
+        devices.extend(found);
+        if let Some(hotplug) = hotplug {
+            hotplug_slots.push(hotplug);
+        }
     }
+    SDHCI_HOTPLUG_SLOTS.lock().extend(hotplug_slots);
+    start_hotplug_worker();
     if devices.is_empty() {
         BusProbeResult::Claimed
     } else {

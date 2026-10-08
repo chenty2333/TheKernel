@@ -71,6 +71,19 @@ pub use block_inventory::{
     PartitionRescanError,
 };
 
+fn publish_runtime_block_add(device: AxBlockDevice) -> bool {
+    match add_block_device(device) {
+        Ok(name) => {
+            info!("published runtime block device /dev/{name}");
+            true
+        }
+        Err(error) => {
+            warn!("runtime block device publication deferred: {error:?}");
+            false
+        }
+    }
+}
+
 mod fs;
 #[cfg(feature = "btrfs")]
 pub use fs::BtrfsFilesystem;
@@ -990,6 +1003,10 @@ fn init_filesystems_with_root_mode(
         index += 1;
     }
     EXTRA_BLOCK_DEVICES.call_once(|| Mutex::new(extras));
+    assert!(
+        axdriver::install_runtime_block_add_hook(publish_runtime_block_add),
+        "runtime block add hook already owned by a different registry"
+    );
 
     let root_device = open_block_device(ROOT_BLOCK_DEVICE_NAME)
         .expect("failed to claim root block device for filesystem mount");

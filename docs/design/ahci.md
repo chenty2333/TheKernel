@@ -30,11 +30,11 @@ ID/revision/name/quirk table is translated in `tk-axdriver/src/ahci/pci_ids.rs`;
 The PCI frontend now attempts MSI-X, MSI, then firmware-routed shared INTx, and
 AHCI completions acknowledge status before waking waiters. Remaining work
 includes enclosure management, Intel remapped NVMe, CAM CCB/SCSI translation,
-automatic block-device publication for media inserted into a port that was
-empty at boot, PCI-function removal events, multi-slot scheduling/recovery,
-and concurrent NCQ submission. An existing
-port returns I/O errors while absent and only resumes after IDENTIFY geometry
-and serial/model/capacity fingerprint match.
+PCI-function removal events, multi-slot scheduling/recovery, and concurrent
+NCQ submission. A controller worker retries ports that were empty or not ready
+at boot and publishes successfully identified media through the runtime block
+registry. An existing port returns I/O errors while absent and only resumes
+after IDENTIFY geometry and serial/model/capacity fingerprint match.
 
 The QEMU topology was extended to attach `ich9-ahci` plus an `ide-hd`, and
 AHCI is explicitly included in product builds. QEMU KVM enumerated a disposable
@@ -46,12 +46,12 @@ extended with pinned e2fsprogs/sfdisk and the block registry gained
 `BLKRRPART` plus live devfs/sysfs views. The repeatable
 `tests/guest/block-partition-mkfs-smoke.sh` passed with an empty 64 MiB AHCI
 image: guest-created GPT, guest `mkfs.ext4`, mount, read/write, unmount, and
-`AHCI_PARTITION_MKFS_RW_OK`. Device-originated hotplug publication, PCI removal,
+`AHCI_PARTITION_MKFS_RW_OK`. Controller hotplug insertion/removal was added, but
+physical media swap has not yet been exercised in QEMU; PCI-function removal
 and the untranslated FreeBSD functions listed above remain outstanding.
 
 `AHCI_Q_IOMMU_BUSWIDE` is retained in the translated PCI quirk table, but cannot
 be applied by this driver until the platform IOMMU provides a bus-wide DMA
 identity/domain API. PHY-change events on an existing disk force link reset and
-IDENTIFY fingerprint validation; automatic enumeration of a newly inserted disk
-on a port that was empty at boot remains blocked by the missing runtime block
-registry/device-node publication API.
+IDENTIFY fingerprint validation. A periodic controller worker also attaches and
+publishes media discovered on ports empty at boot through the runtime registry.

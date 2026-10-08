@@ -15,13 +15,16 @@ use alloc::string::String;
 use core::{
     ptr,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
 };
 
 #[cfg(feature = "shared-block")]
 use axdriver_base::BaseDriverOps;
 
 static NEXT_DISK_INDEX: AtomicUsize = AtomicUsize::new(0);
+static HOTPLUG_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+static HOTPLUG_PORTS: spin::Mutex<alloc::vec::Vec<HotplugPort>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_block::{
@@ -105,6 +108,16 @@ pub struct Window {
     size: usize,
     irq: Option<PciBlockInterrupt>,
     irq_context: Option<&'static AhciIrqContext>,
+}
+
+struct HotplugPort {
+    window: Window,
+    index: u8,
+    quirks: u32,
+    capabilities: u32,
+    capabilities2: u32,
+    present: bool,
+    name: Option<String>,
 }
 
 impl AhciIo for Window {
@@ -230,13 +243,21 @@ fn next_sd_name() -> String {
     name
 }
 
-fn publish_disk(mut disk: AhciDisk<Window>, devices: &mut alloc::vec::Vec<crate::AxDeviceEnum>) {
-    let name = next_sd_name();
-    disk.set_device_name(name.clone());
+fn wrap_disk(disk: AhciDisk<Window>) -> crate::AxBlockDevice {
     #[cfg(feature = "dyn")]
     let raw: crate::AxBlockDevice = alloc::boxed::Box::new(disk);
     #[cfg(not(feature = "dyn"))]
     let raw: crate::AxBlockDevice = crate::StaticBlockDevice::Ahci(alloc::boxed::Box::new(disk));
+    raw
+}
+
+fn publish_disk(
+    mut disk: AhciDisk<Window>,
+    devices: &mut alloc::vec::Vec<crate::AxDeviceEnum>,
+) -> String {
+    let name = next_sd_name();
+    disk.set_device_name(name.clone());
+    let raw = wrap_disk(disk);
 
     #[cfg(feature = "shared-block")]
     {
@@ -263,6 +284,76 @@ fn publish_disk(mut disk: AhciDisk<Window>, devices: &mut alloc::vec::Vec<crate:
         devices.push(crate::AxDeviceEnum::Block(raw));
         #[cfg(not(feature = "dyn"))]
         devices.push(crate::AxDeviceEnum::Block(raw));
+    }
+    name
+}
+
+fn start_hotplug_worker() {
+    if HOTPLUG_WORKER_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Err(error) = axtask::spawn_raw(
+        ahci_hotplug_worker,
+        "ahci_hotplug".into(),
+        axconfig::TASK_STACK_SIZE,
+    ) {
+        HOTPLUG_WORKER_STARTED.store(false, Ordering::Release);
+        warn!("ahci: hotplug worker unavailable: {error:?}");
+    }
+}
+
+// upstream: ahci.c ahci_phy_check_events() + ahci_cpd_check_events() + ahci_notify_events()
+fn ahci_hotplug_worker() {
+    loop {
+        {
+            let mut ports = HOTPLUG_PORTS.lock();
+            for port in ports.iter_mut() {
+                let register = AHCI_OFFSET + usize::from(port.index) * AHCI_STEP + AHCI_P_SSTS;
+                let online = port.window.read32(register) & ATA_SS_DET_MASK
+                    == axdriver_block::ahci::regs::ATA_SS_DET_PHY_ONLINE;
+                if !online {
+                    port.present = false;
+                    continue;
+                }
+                if port.present {
+                    continue;
+                }
+                let Some(workspace) = allocate_workspace() else {
+                    continue;
+                };
+                let mut state = PortState::new(port.index);
+                state.quirks = port.quirks;
+                if port.quirks & axdriver_block::ahci::regs::AHCI_Q_SATA1_UNIT0 != 0
+                    && port.index == 0
+                {
+                    state.user_revision[0] = 1;
+                }
+                if port.quirks & axdriver_block::ahci::regs::AHCI_Q_SATA2 != 0 {
+                    state.user_revision[0] = 2;
+                }
+                state.channel_capabilities = port.window.read32(
+                    AHCI_OFFSET
+                        + usize::from(port.index) * AHCI_STEP
+                        + axdriver_block::ahci::regs::AHCI_P_CMD,
+                );
+                let controller = AhciController::new(
+                    port.window.clone(),
+                    port.capabilities,
+                    port.capabilities2,
+                    port.quirks,
+                );
+                let Ok(mut disk) = AhciDisk::attach(controller, state, workspace) else {
+                    continue;
+                };
+                let name = port.name.get_or_insert_with(next_sd_name).clone();
+                disk.set_device_name(name.clone());
+                if crate::publish_runtime_block_device(wrap_disk(disk)) {
+                    port.present = true;
+                    info!("ahci: hotplug published /dev/{name} on port {}", port.index);
+                }
+            }
+        }
+        let _ = axtask::sleep(core::time::Duration::from_millis(500));
     }
 }
 
@@ -399,6 +490,7 @@ pub(crate) fn probe(
     );
 
     let mut devices = alloc::vec::Vec::new();
+    let mut hotplug_ports = alloc::vec::Vec::new();
     for index in 0..channel_count {
         if implemented_ports & (1 << index) == 0 {
             continue;
@@ -414,10 +506,28 @@ pub(crate) fn probe(
         controller.io_mut().write32(port_base + AHCI_P_IE, 0);
         let sstatus = controller.io_mut().read32(port_base + AHCI_P_SSTS);
         if sstatus & ATA_SS_DET_MASK == ATA_SS_DET_NO_DEVICE {
+            hotplug_ports.push(HotplugPort {
+                window: window.clone(),
+                index: index as u8,
+                quirks,
+                capabilities: controller.capabilities,
+                capabilities2: controller.capabilities2,
+                present: false,
+                name: None,
+            });
             continue;
         }
         let Some(workspace) = allocate_workspace() else {
             warn!("ahci: {bdf} port {index} DMA workspace allocation failed");
+            hotplug_ports.push(HotplugPort {
+                window: window.clone(),
+                index: index as u8,
+                quirks,
+                capabilities: controller.capabilities,
+                capabilities2: controller.capabilities2,
+                present: false,
+                name: None,
+            });
             continue;
         };
         let mut port = PortState::new(index as u8);
@@ -440,17 +550,37 @@ pub(crate) fn probe(
         match AhciDisk::attach(port_controller, port, workspace) {
             Ok(disk) => {
                 info!(
-                    "ahci: {bdf} port {index} block_size={} blocks={} polling",
+                    "ahci: {bdf} port {index} block_size={} blocks={}",
                     disk.block_size(),
                     disk.num_blocks()
                 );
-                publish_disk(disk, &mut devices);
+                let name = publish_disk(disk, &mut devices);
+                hotplug_ports.push(HotplugPort {
+                    window: window.clone(),
+                    index: index as u8,
+                    quirks,
+                    capabilities: controller.capabilities,
+                    capabilities2: controller.capabilities2,
+                    present: true,
+                    name: Some(name),
+                });
             }
             Err(error) => {
                 warn!("ahci: {bdf} port {index} disk initialization failed: {error:?}");
+                hotplug_ports.push(HotplugPort {
+                    window: window.clone(),
+                    index: index as u8,
+                    quirks,
+                    capabilities: controller.capabilities,
+                    capabilities2: controller.capabilities2,
+                    present: false,
+                    name: None,
+                });
             }
         }
     }
+    HOTPLUG_PORTS.lock().extend(hotplug_ports);
+    start_hotplug_worker();
     if devices.is_empty() {
         BusProbeResult::Claimed
     } else {

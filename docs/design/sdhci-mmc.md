@@ -90,7 +90,11 @@ class selection fields are decoded and applied for the implemented legacy
 high-speed path. HS200/HS400 remain gated off until 1.2/1.8 V, retuning, and the
 complete timing transition paths are connected.
 
-On 2026-10-09, after the MMC timing, cache, CMD23, and data-timeout updates, the
-single disposable KVM SDHCI/ext4 smoke was rerun successfully: mount, write/read,
-unmount, `SDHCI_EXT4_RW_OK`, runner exit 0. This still uses a host-prepared GPT/ext4
-image and does not verify guest-side partition creation/formatting.
+On 2026-10-09, the inspect payload gained `sfdisk` and e2fsprogs; a blank 64 MiB
+QEMU SD card passed guest GPT creation, `BLKRRPART`, guest `mkfs.ext4`, mount,
+write/read, unmount, and `SDHCI_PARTITION_MKFS_RW_OK`. A controller worker now
+retries empty slots and re-runs card enumeration after card insertion; the
+shared media worker withdraws absent cards and partitions. Physical card-swap
+acceptance remains unverified. Enabling SDHCI INTx signaling on QEMU 1b36:0007
+lost CMD17 completions, so signaling remains disabled by default and command
+completion uses bounded status polling.
