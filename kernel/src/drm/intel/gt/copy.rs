@@ -5,7 +5,7 @@
 // Full MIT grant and inventory: crates/ax/tk-intel-gt/LICENSE-MIT and NOTICE.
 //! BCS/RCS selftests and standard nonprivileged soft-pinned jobs. Software
 //! preparation uses existing SharedPages/GGTT; DMA ownership precedes ELSQ load.
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use intel_gt::{Error, GtIo, bcs, lrc, ppgtt};
@@ -507,8 +507,6 @@ impl LogDmaMemory {
         let mut zeroes = Vec::new();
         zeroes.try_reserve_exact(size).map_err(|_| Error::Refused)?;
         zeroes.resize(size, 0);
-        let capture_nodes =
-            intel_gt::guc_capture::CaptureNodeCache::new_upstream().map_err(|_| Error::Refused)?;
         let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
         let ram = Ram::allocate(pages)?;
         let binding = gtt
@@ -557,7 +555,6 @@ impl LogDmaMemory {
             config,
             registered: false,
         });
-        owner.capture_nodes = Some(capture_nodes);
         Ok(())
     }
 
@@ -977,6 +974,77 @@ impl CtDmaMemory {
         Ok(fence)
     }
 
+    /// Exercise enabled CTB with an H2G control action and wait for its HXG
+    /// response before reporting the startup transport ready. This does not
+    /// replace the later IRQ/tasklet/workqueue event path.
+    /// upstream: intel_guc_ct.c ct_send()/ct_handle_response().
+    pub(super) fn verify_ctb_roundtrip(&mut self, bus: &impl GtIo) -> Result<(), Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let action = [
+            intel_gt::guc_ct::ACTION_HOST2GUC_CONTROL_CTB,
+            intel_gt::guc_ct::CTB_CONTROL_ENABLE,
+        ];
+        let ram = &self._ram;
+        let blob = &mut self.blob;
+        let completion = self
+            .pair
+            .send_request_with_retry(bus, &action, 0, |pair, fence, short, long| {
+                if fence.is_some() {
+                    pair.sync_to_blob(blob)
+                        .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                    ram.write(0, blob)
+                        .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                    ram.flush();
+                    intel_gt::guc_fw::notify(bus)
+                        .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                }
+                let start = bus.now_us();
+                let timeout = short.saturating_add(long);
+                loop {
+                    ram.read(0, blob)
+                        .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                    pair.sync_from_blob(blob)?;
+                    let old_send_tail = pair.send.descriptor.tail;
+                    if let Some(words) = pair.receive.read_message()? {
+                        if pair.handle_incoming_message(&words)?.is_some() {
+                            return Err(intel_gt::guc_ct::CtError::InvalidMessage);
+                        }
+                        pair.sync_to_blob(blob)?;
+                        ram.write(0, blob)
+                            .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                        ram.flush();
+                        if pair.send.descriptor.tail != old_send_tail {
+                            intel_gt::guc_fw::notify(bus)
+                                .map_err(|_| intel_gt::guc_ct::CtError::InvalidMessage)?;
+                        }
+                        return Ok(());
+                    }
+                    if bus.now_us().saturating_sub(start) > timeout {
+                        return Err(intel_gt::guc_ct::CtError::Timeout);
+                    }
+                    bus.delay_us(50);
+                }
+            })
+            .map_err(|_| Error::Quarantined)?;
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        intel_gt::guc_fw::notify(bus).map_err(|_| Error::Quarantined)?;
+        match completion {
+            intel_gt::guc_ct::CtCompletion::Success { .. } => Ok(()),
+            intel_gt::guc_ct::CtCompletion::Failure { .. }
+            | intel_gt::guc_ct::CtCompletion::Retry { .. } => Err(Error::Quarantined),
+        }
+    }
+
     /// Map one GuC scheduling H2G action to CTB. `expected_response_dwords`
     /// reserves the matching G2H credit before notifying GuC.
     pub(super) fn send_scheduling_action(
@@ -1361,6 +1429,34 @@ pub(super) fn upload_uc_firmware(
     intel_gt::wopcm::initialize_gen12(&owner.bus, guc_upload_size, huc_upload_size, true, false)
         .map_err(|_| Error::Quarantined)?;
     intel_gt::reset::reset_guc(&owner.bus, (12, 0)).map_err(|_| Error::Quarantined)?;
+    // The loader must publish pinned ADS/log addresses before the GuC image is
+    // DMA'd, because the firmware consumes these GUC_CTL scratch values at
+    // boot. This first runtime profile is exact N305/ADL-N only; it is derived
+    // from the validated PCI identity, GT topology, media fuses and GuC CSS.
+    if owner.platform == intel_gt::uc::Platform::AlderLakeN {
+        let input = n305_guc_ads_input(owner, guc)?;
+        AdsDmaMemory::initialize(owner, input)?;
+        LogDmaMemory::initialize(owner, false, false)?;
+        let ads_address = owner
+            .ads_memory
+            .as_ref()
+            .ok_or(Error::Quarantined)?
+            .ggtt_address()?;
+        let log = owner
+            .log_memory
+            .as_ref()
+            .ok_or(Error::Quarantined)?
+            .config();
+        let options = intel_gt::guc_config::gen12_options(
+            owner.platform,
+            0x46d0,
+            0,
+            guc.css.version,
+            ads_address,
+            log,
+        );
+        write_guc_init_params(owner, options)?;
+    }
     let (huc_memory, rsa_offset) = upload_huc_for_auth(owner, huc)?;
     if let Err(error) = upload_uc_one(owner, guc) {
         let _ = huc.change_status(intel_gt::uc::FirmwareStatus::LoadFail);
@@ -1392,8 +1488,111 @@ pub(super) fn upload_uc_firmware(
     if intel_gt::uc::default_enable_mask(owner.platform) & intel_gt::uc::ENABLE_GUC_SUBMISSION != 0
     {
         CtDmaMemory::initialize(owner)?;
+        owner
+            .ct_memory
+            .as_mut()
+            .ok_or(Error::Quarantined)?
+            .verify_ctb_roundtrip(&owner.bus)
+            .map_err(|_| Error::Quarantined)?;
     }
     Ok(())
+}
+
+/// Construct only the GuC boot-time ADS inventory for the exact supported
+/// Alder Lake-N device.  The engine list follows `adl_p_info`'s platform mask
+/// and is pruned with the Gen11+ media-enable fuse; GT topology and doorbell
+/// count are read from hardware.  Dynamic MMIO regsets/default LRC images are
+/// intentionally left empty here; those are task-3 runtime initialization,
+/// not fabricated values for the firmware loader.
+/// upstream: intel_guc_ads.c __guc_ads_init()/fill_engine_enable_masks().
+#[cfg(target_os = "none")]
+fn n305_guc_ads_input(
+    owner: &super::Owner,
+    guc: &intel_gt::uc::FirmwareImage,
+) -> Result<intel_gt::guc_ads::AdsBuildInput, Error> {
+    use intel_gt::guc_ads::{AdsBuildInput, AdsRuntimeInfo, EngineMapEntry};
+
+    if owner.platform != intel_gt::uc::Platform::AlderLakeN {
+        return Err(Error::Refused);
+    }
+    let topology = intel_gt::info::Topology::read(&owner.bus)?;
+    let media_fuse = !owner.bus.read(0x9140)?;
+    let vdbox_mask = media_fuse & 0xff;
+    let vebox_mask = (media_fuse >> 16) & 0xf;
+    let doorbell_count = ((owner.bus.read(0xd08)? >> 16) & 0xff) + 1;
+
+    let mut engines = vec![
+        EngineMapEntry {
+            guc_class: 0,
+            instance: 0,
+            logical_index: 0,
+        },
+        EngineMapEntry {
+            guc_class: 3,
+            instance: 0,
+            logical_index: 0,
+        },
+    ]; // RCS0 + BCS0
+    let mut sfc_mask = 0u32;
+    for instance in [0u8, 2] {
+        if vdbox_mask & (1 << instance) != 0 {
+            engines.push(EngineMapEntry {
+                guc_class: 1,
+                instance,
+                logical_index: instance,
+            });
+            // On Gen12, each enabled even physical VDBOX is attached to SFC.
+            sfc_mask |= 1 << instance;
+        }
+    }
+    if vebox_mask & 1 != 0 {
+        engines.push(EngineMapEntry {
+            guc_class: 2,
+            instance: 0,
+            logical_index: 0,
+        });
+    }
+    let enabled_masks = intel_gt::guc_ads::fill_engine_enable_masks(&engines)?;
+    let render_context = 14 * PAGE;
+    let other_context = 2 * PAGE;
+    let skip = intel_gt::guc_ads::lrc_skip_size(12, 0);
+    let mut engine_context_sizes = Vec::new();
+    for class in 0u8..=3 {
+        if enabled_masks[usize::from(class)] != 0 {
+            let total = if class == 0 {
+                render_context
+            } else {
+                other_context
+            };
+            engine_context_sizes.push((class, total.checked_sub(skip).ok_or(Error::Refused)?));
+        }
+    }
+    let mut generic_gt_sysinfo = [0; intel_gt::guc_ads::GUC_GENERIC_GT_SYSINFO_MAX];
+    // `Topology::read()` has verified the sole Gen12.0 slice-enable register
+    // value (bit 0 only), so use the actual slice count rather than DSS count.
+    generic_gt_sysinfo[0] = 1;
+    generic_gt_sysinfo[1] = sfc_mask;
+    generic_gt_sysinfo[2] = doorbell_count;
+    let css = intel_gt::uc::guc_css_info(guc.css.version, guc.css);
+    Ok(AdsBuildInput {
+        base_ggtt: PAGE as u32,
+        reset_parameter: 2,
+        runtime: AdsRuntimeInfo {
+            generic_gt_sysinfo,
+            graphics_ip_major: 12,
+            graphics_ip_minor: 0,
+            media_ip_major: 12,
+            media_ip_minor: 0,
+            firmware_version: guc.css.version,
+            dgfx: false,
+        },
+        engines,
+        regsets: Vec::new(),
+        engine_context_sizes,
+        golden_contexts: Vec::new(),
+        capture_lists: Vec::new(),
+        private_data_size: css.private_data_bytes,
+    })
 }
 
 impl Memory {
