@@ -48,6 +48,7 @@ pub struct UsbBluetoothHci {
     privacy_enabled: bool,
     local_irk: [u8; 16],
     management_events: VecDeque<Vec<u8>>,
+    observed_to_raw: VecDeque<Vec<u8>>,
     receive_readiness: Arc<PollSet<32>>,
 }
 
@@ -232,6 +233,7 @@ impl UsbBluetoothHci {
             privacy_enabled: false,
             local_irk: [0; 16],
             management_events: VecDeque::new(),
+            observed_to_raw: VecDeque::new(),
             receive_readiness: Arc::new(PollSet::new()),
         })
     }
@@ -259,14 +261,21 @@ impl UsbBluetoothHci {
     }
     pub fn pump_receive(&mut self) -> Result<bool, Error> {
         let received = self.adapter.pump_receive()?;
+        self.drain_observed_hci_events();
+        Ok(received)
+    }
+    fn drain_observed_hci_events(&mut self) {
         while let Some(event) = self.adapter.pop_observed_event() {
             self.observe_hci_event(&event);
+            if self.observed_to_raw.len() == 64 {
+                self.observed_to_raw.pop_front();
+            }
+            self.observed_to_raw.push_back(event.clone());
             if self.management_events.len() == 64 {
                 self.management_events.pop_front();
             }
             self.management_events.push_back(event);
         }
-        Ok(received)
     }
     pub fn pop_management_event(&mut self) -> Option<Vec<u8>> {
         self.management_events.pop_front()
@@ -835,6 +844,7 @@ impl UsbBluetoothHci {
         out: &mut [u8],
         nonblocking: bool,
     ) -> Result<usize, Error> {
+        self.drain_observed_hci_events();
         if channel == 2 {
             if let Some(frame) = self.adapter.pop_monitor() {
                 if frame.len() > out.len() {
@@ -849,7 +859,20 @@ impl UsbBluetoothHci {
         }
         let (kind, length) = self.adapter.receive_packet(&mut out[1..], nonblocking)?;
         if kind == tk_bt_hci::PacketType::Event {
-            self.observe_hci_event(&out[1..1 + length]);
+            let event = &out[1..1 + length];
+            if self
+                .observed_to_raw
+                .front()
+                .is_some_and(|seen| seen.as_slice() == event)
+            {
+                self.observed_to_raw.pop_front();
+            } else {
+                self.observe_hci_event(event);
+                if self.management_events.len() == 64 {
+                    self.management_events.pop_front();
+                }
+                self.management_events.push_back(Vec::from(event));
+            }
         }
         if channel == 2 {
             let frame = self.adapter.pop_monitor().ok_or(Error::Again)?;

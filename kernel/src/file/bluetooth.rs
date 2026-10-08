@@ -14,7 +14,7 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axio::{IoBuf, Read, Write};
-use axpoll::{IoEvents, PollRegistration, PollSet, Pollable};
+use axpoll::{IoEvents, PollRegistration, PollSet, Pollable, PreparedPollRegistration};
 use bytemuck::{Pod, Zeroable};
 use linux_raw_sys::net::{SOCK_RAW, sockaddr};
 use spin::Mutex as SpinMutex;
@@ -581,6 +581,10 @@ impl HciSocket {
 
 impl Pollable for HciSocket {
     fn poll(&self) -> IoEvents {
+        let bound_channel = self.binding.lock().as_ref().map(|binding| binding.channel);
+        if bound_channel == Some(HCI_CHANNEL_CONTROL) {
+            drain_bluetooth_management_events();
+        }
         let binding = self.binding.lock();
         let Some(binding) = binding.as_ref() else {
             return IoEvents::WRITABLE;
@@ -613,6 +617,17 @@ impl Pollable for HciSocket {
             return axpoll::PollRegistration::empty();
         };
         if binding.channel == HCI_CHANNEL_CONTROL {
+            #[cfg(feature = "input")]
+            {
+                let adapters = axdriver::bluetooth_devices();
+                let mut prepared = PreparedPollRegistration::try_new(adapters.len() + 1)?;
+                prepared.arm(&self.control.readiness, context.waker())?;
+                for adapter in adapters {
+                    prepared.arm_owned(adapter.lock().receive_readiness(), context.waker())?;
+                }
+                return prepared.commit();
+            }
+            #[cfg(not(feature = "input"))]
             return PollRegistration::single(&self.control.readiness, context.waker());
         }
         #[cfg(feature = "input")]
@@ -660,9 +675,6 @@ impl FileLike for HciSocket {
                     self.nonblocking.load(Ordering::Acquire),
                 )
                 .map_err(map_transport_error)?;
-            if binding.channel == 0 && length >= 3 && packet[0] == 4 {
-                fanout_hci_management_events(adapter.index(), &packet[1..length]);
-            }
             return dst.write(&packet[..length]);
         }
         let _ = binding;

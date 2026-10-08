@@ -617,6 +617,10 @@ impl<T: UsbTransport> Adapter<T> {
         }
         self.incoming
             .push_back((PacketType::Event, Vec::from(bytes)));
+        if self.observed_events.len() == 64 {
+            self.observed_events.pop_front();
+        }
+        self.observed_events.push_back(Vec::from(bytes));
         Ok(())
     }
     /// Query the Intel firmware version using vendor command 0xfc05.
@@ -1386,6 +1390,10 @@ mod tests {
         assert_eq!(
             adapter.command_complete(&[0x01, 0x10, 0], &mut event),
             Ok(6)
+        );
+        assert_eq!(
+            adapter.pop_observed_event(),
+            Some(vec![0x0e, 4, 1, 0x02, 0x10, 0])
         );
         assert_eq!(
             adapter.receive_packet(&mut event, true),
