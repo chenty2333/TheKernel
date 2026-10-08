@@ -15,7 +15,9 @@ ADL-N TC modeset now calls the translated `intel_hdmi_compute_clock()` before
 its first destructive write, using the implemented RGB/8-bpc/no-scrambling
 limits to reject rates outside 25–300 MHz and the lowest nonzero HDMI VSDB
 TMDS limit from CTA EDID. Missing max-clock fields remain unknown rather than
-being inferred. This is a narrow admission hook, not a complete HDMI backend:
-the infoframe,
+being inferred. The same helper now hides the optional 1080p60 KMS mode when
+the sink's advertised TMDS limit is too low; the active firmware mode remains
+published so boot state is not silently changed. This is a narrow admission
+hook, not a complete HDMI backend: the infoframe,
 SCDC, HDCP, FRL, connector, and DSC pipelines are still not live in the kernel
 path.
