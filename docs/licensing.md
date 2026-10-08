@@ -677,3 +677,7 @@ HDMI sink/cloned detection, YCbCr420 state and scrambling-support predicates in
 `tk-intel-display/src/dp_aux.rs` translates the 35 source functions in
 `intel_dp_aux.c` (MIT, Copyright © 2020-2021 Intel). The full grant is in the
 crate's `LICENSE-MIT` file.
+
+`tk-intel-display/src/intel_dp_link_training_full.rs` translates the applicable
+DisplayPort link-training protocol functions in `intel_dp_link_training.c` (MIT,
+Copyright © 2008-2015 Intel). Its grant is included in `LICENSE-MIT`.
