@@ -1263,28 +1263,30 @@ fn station_management_response(
     device: &mut AttachedDevice,
     bssid: [u8; 6],
     subtype: u8,
+    mut rx_payloads: Vec<Vec<u8>>,
 ) -> Result<Vec<u8>, RuntimeStartError> {
     for _ in 0..500 {
-        let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
-            &mut device.controller.registers,
-            &device.controller.interrupt_masks,
-            Some(&mut device.controller.resources.ict),
-        )
-        .map_err(|_| RuntimeStartError::Transmission)?;
-        let mut rx_payloads = Vec::new();
-        device
-            .controller
-            .process_rx_notifications(|packet, _| {
-                if let axdriver_iwx::FirmwareEvent::RxMpdu(payload) =
-                    axdriver_iwx::decode_firmware_event(packet)
-                    && rx_payloads.try_reserve(1).is_ok()
-                {
-                    rx_payloads.push(payload.to_vec());
-                }
-                Ok::<_, Infallible>(true)
-            })
+        if rx_payloads.is_empty() {
+            let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+                &mut device.controller.registers,
+                &device.controller.interrupt_masks,
+                Some(&mut device.controller.resources.ict),
+            )
             .map_err(|_| RuntimeStartError::Transmission)?;
-        for payload in rx_payloads {
+            device
+                .controller
+                .process_rx_notifications(|packet, _| {
+                    if let axdriver_iwx::FirmwareEvent::RxMpdu(payload) =
+                        axdriver_iwx::decode_firmware_event(packet)
+                        && rx_payloads.try_reserve(1).is_ok()
+                    {
+                        rx_payloads.push(payload.to_vec());
+                    }
+                    Ok::<_, Infallible>(true)
+                })
+                .map_err(|_| RuntimeStartError::Transmission)?;
+        }
+        for payload in rx_payloads.drain(..) {
             if let Ok(axdriver_iwx::RxMpduOutcome::Deliver(received)) =
                 device.controller.process_rx_mpdu(
                     &payload,
@@ -1375,8 +1377,16 @@ fn connect_station(
             false,
         )
         .map_err(|_| RuntimeStartError::Transmission)?;
-    send_station_management_frame_locked(device, &auth_frame, |_| {})?;
-    let auth_response = station_management_response(device, bss.bssid, 0xb0)?;
+    let mut early_auth_responses = Vec::new();
+    send_station_management_frame_locked(device, &auth_frame, |packet| {
+        if let axdriver_iwx::FirmwareEvent::RxMpdu(payload) =
+            axdriver_iwx::decode_firmware_event(packet)
+            && early_auth_responses.try_reserve(1).is_ok()
+        {
+            early_auth_responses.push(payload.to_vec());
+        }
+    })?;
+    let auth_response = station_management_response(device, bss.bssid, 0xb0, early_auth_responses)?;
     let mut auth_state = tk_net80211::OpenAuthState {
         authentication_state: true,
         rsn_enabled: security_enabled,
@@ -1436,8 +1446,17 @@ fn connect_station(
             false,
         )
         .map_err(|_| RuntimeStartError::Transmission)?;
-    send_station_management_frame_locked(device, &assoc_frame, |_| {})?;
-    let assoc_response = station_management_response(device, bss.bssid, 0x10)?;
+    let mut early_assoc_responses = Vec::new();
+    send_station_management_frame_locked(device, &assoc_frame, |packet| {
+        if let axdriver_iwx::FirmwareEvent::RxMpdu(payload) =
+            axdriver_iwx::decode_firmware_event(packet)
+            && early_assoc_responses.try_reserve(1).is_ok()
+        {
+            early_assoc_responses.push(payload.to_vec());
+        }
+    })?;
+    let assoc_response =
+        station_management_response(device, bss.bssid, 0x10, early_assoc_responses)?;
     let response_ies = assoc_response.get(30..).unwrap_or_default().to_vec();
     let mut nodes = tk_net80211::NodeTable::default();
     let local_phy = tk_net80211::LocalPhyConfig {
