@@ -4,6 +4,8 @@ use alloc::{format, string::String, vec::Vec};
 use axdriver::i2c::{AcpiI2cChild, AcpiI2cSupport};
 use tk_acpica::{Engine, Node, Value};
 
+// upstream: iichid.c acpi_is_iichid()
+// upstream: iichid.c iichid_get_config_reg()
 fn engine_child_devices(engine: &Engine, nodes: &[Node], controller: &str) -> Vec<AcpiI2cChild> {
     let mut children = Vec::new();
     const I2C_HID_DSM_UUID: [u8; 16] = [

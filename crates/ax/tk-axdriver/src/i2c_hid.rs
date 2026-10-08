@@ -153,6 +153,7 @@ pub struct I2cInput {
 
 impl I2cInput {
     // upstream: iichid.c iichid_probe() and iichid_attach()
+    // upstream: iichid.c iichid_get_rdesc()
     fn attach(bus: usize, child: crate::i2c::AcpiI2cChild) -> DevResult<Self> {
         let address = if child.ten_bit {
             Address::ten_bit(child.slave_address)
@@ -465,6 +466,7 @@ impl BaseDriverOps for I2cInput {
 }
 
 impl InputDriverOps for I2cInput {
+    // upstream: iichid.c iichid_intr_start()
     // upstream: hmt.c hmt_ev_open() / iichid.c iichid_set_power_state()
     fn open_input(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
@@ -475,6 +477,7 @@ impl InputDriverOps for I2cInput {
         Ok(())
     }
 
+    // upstream: iichid.c iichid_intr_stop()
     // upstream: hmt.c hmt_ev_close() / iichid.c iichid_set_power_state()
     fn close_input(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
@@ -552,6 +555,7 @@ impl InputDriverOps for I2cInput {
             res: resolution,
         }))
     }
+    // upstream: iichid.c iichid_intr_poll()
     // upstream: iichid.c iichid_intr() and hmt.c hmt_intr()
     fn read_event(&mut self) -> DevResult<Event> {
         let state = self.state.get_mut();
