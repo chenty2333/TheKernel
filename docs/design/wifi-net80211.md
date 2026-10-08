@@ -103,3 +103,6 @@ ordered SSID/rates/security/QoS/HT/VHT/HE elements. It is ready for the later
 nl80211 connect adapter; four-way key exchange remains userspace-owned.
 Open-system authentication and deauth/disassociation reason bodies now use the
 source field order and little-endian encodings.
+A reusable Probe Request IE builder now selects WMM+HT, 5-GHz VHT and
+HE-extension elements using the same channel/PHY predicates as OpenBSD; iwx's
+firmware-specific probe serializer reuses its individual IE encoders.

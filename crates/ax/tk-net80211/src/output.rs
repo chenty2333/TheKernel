@@ -119,6 +119,23 @@ pub struct AssocRequestConfig<'a> {
     pub he_caps: Option<&'a HeCapabilities>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeRequestConfig<'a> {
+    pub ssid: &'a [u8],
+    pub rates: &'a RateSet,
+    pub qos_info: u8,
+    pub channel_is_5ghz: bool,
+    pub channel_is_ac: bool,
+    pub channel_is_he: bool,
+    pub ht_enabled: bool,
+    pub vht_enabled: bool,
+    pub he_enabled: bool,
+    pub he_mode_supported: bool,
+    pub ht_caps: Option<&'a HtCapabilities>,
+    pub vht_caps: Option<&'a VhtCapabilities>,
+    pub he_caps: Option<&'a HeCapabilities>,
+}
+
 fn append_ie(output: &mut Vec<u8>, id: u8, payload: &[u8]) -> Result<(), IeError> {
     if payload.len() > u8::MAX as usize {
         return Err(IeError::InvalidRateSet);
@@ -238,6 +255,37 @@ pub fn build_assoc_request_body(config: &AssocRequestConfig<'_>) -> Result<Vec<u
     let add_he =
         config.ht_enabled && config.he_enabled && config.he_mode_supported && config.channel_is_he;
     if add_he {
+        append_he_caps_ie(
+            &mut output,
+            config.he_caps.ok_or(IeError::MissingCapabilityData)?,
+        )?;
+    }
+    Ok(output)
+}
+
+/// Build the Probe Request IE sequence selected by the current channel and phy flags.
+// upstream: ieee80211_output.c ieee80211_get_probe_req()
+pub fn build_probe_request_ies(config: &ProbeRequestConfig<'_>) -> Result<Vec<u8>, IeError> {
+    let mut output = Vec::new();
+    append_ssid_ie(&mut output, config.ssid)?;
+    append_supported_rates_ie(&mut output, config.rates)?;
+    if config.rates.count > RATE_SIZE {
+        append_extended_rates_ie(&mut output, config.rates)?;
+    }
+    if config.ht_enabled {
+        append_ht_caps_ie(
+            &mut output,
+            config.ht_caps.ok_or(IeError::MissingCapabilityData)?,
+        )?;
+        append_wme_info_ie(&mut output, config.qos_info)?;
+    }
+    if config.vht_enabled && config.channel_is_5ghz && config.channel_is_ac {
+        append_vht_caps_ie(
+            &mut output,
+            config.vht_caps.ok_or(IeError::MissingCapabilityData)?,
+        )?;
+    }
+    if config.ht_enabled && config.he_enabled && config.he_mode_supported && config.channel_is_he {
         append_he_caps_ie(
             &mut output,
             config.he_caps.ok_or(IeError::MissingCapabilityData)?,
@@ -621,6 +669,49 @@ mod tests {
         assert_eq!(
             append_supported_rates_ie(&mut ies, &invalid),
             Err(IeError::InvalidRateSet)
+        );
+    }
+
+    #[test]
+    fn probe_request_selects_wmm_ht_vht_he_ies_for_channel_capabilities() {
+        let rates = RateSet::new(&[2, 4, 11, 22, 12, 18, 24, 36, 48]);
+        let ht = HtCapabilities::default();
+        let vht = VhtCapabilities::default();
+        let he = HeCapabilities::default();
+        let config = ProbeRequestConfig {
+            ssid: b"scan",
+            rates: &rates,
+            qos_info: 0x23,
+            channel_is_5ghz: true,
+            channel_is_ac: true,
+            channel_is_he: true,
+            ht_enabled: true,
+            vht_enabled: true,
+            he_enabled: true,
+            he_mode_supported: true,
+            ht_caps: Some(&ht),
+            vht_caps: Some(&vht),
+            he_caps: Some(&he),
+        };
+        let ies = build_probe_request_ies(&config).unwrap();
+        let mut ids = Vec::new();
+        let mut cursor = 0;
+        while cursor < ies.len() {
+            let len = usize::from(ies[cursor + 1]);
+            ids.push(ies[cursor]);
+            cursor += 2 + len;
+        }
+        assert_eq!(
+            ids,
+            [
+                ELEMID_SSID,
+                ELEMID_RATES,
+                ELEMID_XRATES,
+                ELEMID_HT_CAPS,
+                ELEMID_VENDOR,
+                ELEMID_VHT_CAPS,
+                ELEMID_EXTENSION
+            ]
         );
     }
 

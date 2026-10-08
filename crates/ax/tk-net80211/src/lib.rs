@@ -75,14 +75,14 @@ pub use output::{
     CIPHER_WEP104, ELEMID_DS_PARAMS, ELEMID_EDCA_PARAMS, ELEMID_ERP, ELEMID_EXT_HE_CAPS,
     ELEMID_EXTENSION, ELEMID_HT_CAPS, ELEMID_HT_OPERATION, ELEMID_QOS_CAPABILITY, ELEMID_RATES,
     ELEMID_RSN, ELEMID_SSID, ELEMID_VENDOR, ELEMID_VHT_CAPS, ELEMID_XRATES, ERP_BARKER_MODE,
-    ERP_NON_ERP_PRESENT, ERP_USE_PROTECTION, IeError, OutputOpMode, RSN_OUI,
+    ERP_NON_ERP_PRESENT, ERP_USE_PROTECTION, IeError, OutputOpMode, ProbeRequestConfig, RSN_OUI,
     RSNCAP_GTKSA_RCNT_MASK, RSNCAP_MFPC, RSNCAP_MFPR, RSNCAP_PBAC, RSNCAP_PTKSA_RCNT_MASK,
     RsnIePolicy, WPA_OUI, append_capability_info, append_ds_params_ie, append_edca_params_ie,
     append_erp_ie, append_extended_rates_ie, append_he_caps_ie, append_ht_caps_ie,
     append_ht_operation_ie, append_qos_capability_ie, append_rsn_ie, append_ssid_ie,
     append_supported_rates_ie, append_vht_caps_ie, append_wme_info_ie, append_wme_parameter_ie,
     append_wpa_ie, build_assoc_request_body, build_auth_body, build_deauth_body,
-    build_disassoc_body, build_rsn_body, uapsd_qos_info,
+    build_disassoc_body, build_probe_request_ies, build_rsn_body, uapsd_qos_info,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
