@@ -457,6 +457,95 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_WRITE_PROTECT == 0
     }
 
+    // upstream: sdhci.c sdhci_generic_switch_vccq()
+    pub fn switch_signal_voltage_18v(&mut self) -> Result<(), SdhciError> {
+        if self.version < SDHCI_SPEC_300 as u8 || self.capabilities & SDHCI_CAN_VDD_180 == 0 {
+            return Err(SdhciError::UnsupportedClock);
+        }
+        let clock = self.io.read16(SDHCI_CLOCK_CONTROL as usize);
+        self.io.write16(
+            SDHCI_CLOCK_CONTROL as usize,
+            clock & !(SDHCI_CLOCK_CARD_EN as u16),
+        );
+        for _ in 0..self.timeout_polls {
+            if self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_STATE_DAT_MASK == 0 {
+                break;
+            }
+            self.io.delay_us(10);
+        }
+        if self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_STATE_DAT_MASK != 0 {
+            self.io.write16(
+                SDHCI_CLOCK_CONTROL as usize,
+                clock | SDHCI_CLOCK_CARD_EN as u16,
+            );
+            return Err(SdhciError::Timeout);
+        }
+        let control2 = self.io.read16(SDHCI_HOST_CONTROL2 as usize);
+        self.io.write16(
+            SDHCI_HOST_CONTROL2 as usize,
+            control2 | SDHCI_CTRL2_S18_ENABLE as u16,
+        );
+        self.io.delay_us(5_000);
+        if self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_STATE_DAT_MASK
+            != SDHCI_STATE_DAT_MASK
+        {
+            self.io.write16(
+                SDHCI_HOST_CONTROL2 as usize,
+                control2 & !(SDHCI_CTRL2_S18_ENABLE as u16),
+            );
+            self.io.write16(
+                SDHCI_CLOCK_CONTROL as usize,
+                clock | SDHCI_CLOCK_CARD_EN as u16,
+            );
+            return Err(SdhciError::Timeout);
+        }
+        self.io.write16(
+            SDHCI_CLOCK_CONTROL as usize,
+            clock | SDHCI_CLOCK_CARD_EN as u16,
+        );
+        Ok(())
+    }
+
+    // upstream: sdhci.c sdhci_generic_tune()/sdhci_exec_tuning()
+    pub fn execute_tuning(&mut self, opcode: u8, bus_width: u8) -> Result<(), SdhciError> {
+        if self.version < SDHCI_SPEC_300 as u8
+            || !matches!(opcode, 19 | 21)
+            || !matches!(bus_width, 1 | 4 | 8)
+            || (opcode == 19 && self.capabilities2 & (SDHCI_CAN_SDR50 | SDHCI_CAN_SDR104) == 0)
+            || (opcode == 21
+                && self.capabilities2 & SDHCI_CAN_MMC_HS400 == 0
+                && self.quirks & SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400 == 0)
+        {
+            return Err(SdhciError::UnsupportedClock);
+        }
+        let length = if opcode == 21 && bus_width == 8 {
+            128
+        } else {
+            64
+        };
+        let mut control =
+            self.io.read16(SDHCI_HOST_CONTROL2 as usize) | SDHCI_CTRL2_EXEC_TUNING as u16;
+        self.io.write16(SDHCI_HOST_CONTROL2 as usize, control);
+        for _ in 0..40 {
+            let mut tuning_block = [0u8; 128];
+            self.command(
+                opcode,
+                0,
+                SD_R1 | SD_DATA,
+                Some(&mut tuning_block[..length]),
+                length,
+            )?;
+            control = self.io.read16(SDHCI_HOST_CONTROL2 as usize);
+            if control & SDHCI_CTRL2_EXEC_TUNING as u16 == 0 {
+                if control & SDHCI_CTRL2_SAMPLING_CLOCK as u16 != 0 {
+                    return Ok(());
+                }
+                return Err(SdhciError::Controller(u32::from(control)));
+            }
+        }
+        Err(SdhciError::Timeout)
+    }
+
     // upstream: sdhci.c sdhci_set_bus_width()
     fn set_bus_width(&mut self, width: u8) {
         let mut control = self.io.read8(SDHCI_HOST_CONTROL as usize);
@@ -684,7 +773,7 @@ impl<I: SdhciIo> SdhciHost<I> {
         block_size: usize,
     ) -> Result<SdhciResponse, SdhciError> {
         let read = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
-            || (index == SD_CMD_SWITCH_FUNC && data.is_some());
+            || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
         let retries = if data.is_none() || read { 3 } else { 1 };
         let mut data = data;
         let mut last_error = SdhciError::Timeout;
@@ -759,7 +848,7 @@ impl<I: SdhciIo> SdhciHost<I> {
             }
             if command_flags & SDHCI_CMD_DATA as u16 != 0
                 && (matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
-                    || index == SD_CMD_SWITCH_FUNC)
+                    || matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21))
             {
                 mode |= SDHCI_TRNS_READ as u16;
             }
@@ -797,7 +886,7 @@ impl<I: SdhciIo> SdhciHost<I> {
                         .is_some_and(|end| end <= u64::from(u32::MAX) + 1)
             });
         let read_transfer = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
-            || (index == SD_CMD_SWITCH_FUNC && data.is_some());
+            || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
         if use_sdma {
             let dma = self
                 .dma
@@ -1664,6 +1753,20 @@ mod tests {
         assert_eq!(calculate_clock_divider(50_000_000, 400_000, 1), (128, 64));
         assert_eq!(calculate_clock_divider(50_000_000, 400_000, 2), (126, 63));
         assert_eq!(calculate_clock_divider(50_000_000, 50_000_000, 3), (1, 0));
+    }
+
+    #[test]
+    fn voltage_and_tuning_refuse_unadvertised_host_modes() {
+        let host = SdhciHost::new(MockIo::default(), 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        let mut host = host;
+        assert_eq!(
+            host.switch_signal_voltage_18v(),
+            Err(SdhciError::UnsupportedClock)
+        );
+        assert_eq!(
+            host.execute_tuning(19, 4),
+            Err(SdhciError::UnsupportedClock)
+        );
     }
 
     #[test]

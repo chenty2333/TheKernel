@@ -18,11 +18,14 @@ read-only by default; `mmc.allow_write=1` is required to permit writes, and the
 block driver itself enforces the write restriction. The PCI binding maps the
 FreeBSD `sdhci_devices[]` IDs and their quirk bits, but does not yet implement
 all behavior attached to those quirks, interrupt handling, full card-removal
-lifecycle, automatic SD four-bit/high-speed selection, ADMA2, 1.8V switching,
-tuning, UHS/HS200/HS400, and the full
+lifecycle, automatic SD four-bit/high-speed selection, ADMA2, automatic 1.8V
+negotiation/tuning, UHS/HS200/HS400, and the full
 upstream function set. Removable SD defaults to the safe 1-bit/25 MHz mode;
 the SD CMD6/ACMD6 helpers are present, but automatic SD bus-width/high-speed
 switching remains off because QEMU's emulated card times out those requests.
+Generic signal-voltage and tuning entry points are translated, but are not
+entered automatically until end-to-end voltage-switch/tuning support is wired
+into card capability negotiation.
 The QEMU PCI SDHCI model (`1b36:0007`) additionally uses a local
 single-block-only mode after observed CMD18 timeouts; this local behavior is
 separate from FreeBSD's PCI quirk table. The generic write-protect callback
