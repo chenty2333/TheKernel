@@ -112,8 +112,17 @@ pub const X86_FEATURE_CLFLUSH: u32 = 19;
 /// `i915_gem_tile_height()` from gem/i915_gem_object.h.
 #[inline]
 pub fn i915_gem_tile_height(tiling: u32) -> u32 {
-    assert_ne!(tiling, 0, "GEM_BUG_ON: linear objects have no tile height");
     if tiling == 2 { 32 } else { 8 }
+}
+
+#[cfg(test)]
+mod gem_value_tests {
+    #[test]
+    fn tile_height_matches_i915_gem_object_header() {
+        assert_eq!(super::i915_gem_tile_height(0), 8);
+        assert_eq!(super::i915_gem_tile_height(1), 8);
+        assert_eq!(super::i915_gem_tile_height(2), 32);
+    }
 }
 pub const EIO: i32 = 5;
 pub const ENOENT: i32 = 2;
