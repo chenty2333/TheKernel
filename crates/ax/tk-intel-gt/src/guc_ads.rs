@@ -222,8 +222,6 @@ pub struct EngineRegsetInput<'a> {
 pub struct GoldenContext {
     pub guc_class: u8,
     pub image: Vec<u8>,
-    /// The engine-state subrange starts after the common HWSP and LRC header.
-    pub engine_state_offset: usize,
 }
 
 /// One GuC capture-list image. `capture_class` is the GuC capture bucket,
@@ -270,6 +268,18 @@ pub const fn guc_ads_regset_size(bytes: usize) -> usize {
 /// upstream: intel_guc_ads.c guc_ads_golden_ctxt_size().
 pub fn guc_ads_golden_context_size(bytes: usize) -> Result<usize, Error> {
     page_align(bytes)
+}
+
+/// Size preceding the engine-state region in the common Gen12 LRC image.
+/// upstream: intel_guc_ads.c LRC_SKIP_SIZE()/LR_HW_CONTEXT_SZ().
+pub const fn lrc_skip_size(graphics_ip_major: u8, graphics_ip_minor: u8) -> usize {
+    let hw_context_dwords =
+        if graphics_ip_major > 12 || (graphics_ip_major == 12 && graphics_ip_minor >= 55) {
+            96
+        } else {
+            80
+        };
+    PAGE_SIZE + hw_context_dwords * size_of::<u32>()
 }
 
 /// upstream: intel_guc_ads.c guc_ads_waklv_size().
@@ -704,6 +714,7 @@ fn prepare_golden_contexts(
     engine_context_sizes: &[(u8, usize)],
     enabled_masks: &[u32; GUC_MAX_ENGINE_CLASSES],
     contexts: &[GoldenContext],
+    engine_state_offset: usize,
 ) -> Result<(), Error> {
     let mut cursor = layout.golden_context_offset;
     for (class, enabled_mask) in enabled_masks.iter().copied().enumerate() {
@@ -735,7 +746,7 @@ fn prepare_golden_contexts(
             .iter()
             .find(|context| context.guc_class == guc_class)
         {
-            if context.image.len() != *real_size || context.engine_state_offset > *real_size {
+            if context.image.len() != *real_size || engine_state_offset > *real_size {
                 return Err(Error::Refused);
             }
             let image_end = cursor
@@ -754,8 +765,7 @@ fn prepare_golden_contexts(
             write_u32(
                 bytes,
                 offset_of!(AdsFixed, ads.engine_state_size) + class * 4,
-                u32::try_from(*real_size - context.engine_state_offset)
-                    .map_err(|_| Error::Refused)?,
+                u32::try_from(*real_size - engine_state_offset).map_err(|_| Error::Refused)?,
             )?;
         }
         cursor = end;
@@ -1042,6 +1052,10 @@ pub fn build_ads(input: &AdsBuildInput) -> Result<(AdsLayout, Vec<u8>), Error> {
         &input.engine_context_sizes,
         &enabled_masks,
         &input.golden_contexts,
+        lrc_skip_size(
+            input.runtime.graphics_ip_major,
+            input.runtime.graphics_ip_minor,
+        ),
     )?;
     prepare_capture_lists(&mut bytes, input.base_ggtt, layout, &input.capture_lists)?;
     prepare_workaround_klvs(&mut bytes, input.base_ggtt, layout, &klv_ids)?;
@@ -1212,6 +1226,14 @@ mod tests {
     }
 
     #[test]
+    fn lrc_skip_size_uses_12_55_context_header_size_gate() {
+        assert_eq!(lrc_skip_size(12, 0), PAGE_SIZE + 80 * 4);
+        assert_eq!(lrc_skip_size(12, 54), PAGE_SIZE + 80 * 4);
+        assert_eq!(lrc_skip_size(12, 55), PAGE_SIZE + 96 * 4);
+        assert_eq!(lrc_skip_size(13, 0), PAGE_SIZE + 96 * 4);
+    }
+
+    #[test]
     fn ads_policies_and_engine_maps_match_guc_abi_fields() {
         let policy_disabled = guc_policies_init(1);
         let policy_enabled = guc_policies_init(2);
@@ -1320,11 +1342,10 @@ mod tests {
                     },
                 ],
             }],
-            engine_context_sizes: vec![(0, 32)],
+            engine_context_sizes: vec![(0, 8192)],
             golden_contexts: vec![GoldenContext {
                 guc_class: 0,
-                image: vec![0xaa; 32],
-                engine_state_offset: 8,
+                image: vec![0xaa; 8192],
             }],
             capture_lists: vec![],
             private_data_size: 32,
@@ -1350,7 +1371,7 @@ mod tests {
         );
         assert_eq!(
             dword(&bytes, offset_of!(AdsFixed, ads.engine_state_size)),
-            24
+            8192 - lrc_skip_size(12, 0) as u32
         );
         assert_eq!(dword(&bytes, layout.workaround_klv_offset), 0);
         assert_eq!(
