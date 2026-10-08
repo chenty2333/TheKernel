@@ -101,6 +101,63 @@ pub fn hsw_read_infoframe(
     }
     Ok(RawInfoframe { raw, kind })
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HdmiBpcRequest {
+    pub pipe_bpp: u8,
+    pub pixel_clock_khz: u32,
+    pub display_version: u8,
+    pub has_gmch: bool,
+    pub format: HdmiOutputFormat,
+    pub respect_downstream_limits: bool,
+    pub source_limit_khz: u32,
+    pub dp_dual_mode_limit_khz: Option<u32>,
+    pub sink_limit_khz: Option<u32>,
+    pub has_hdmi_sink: bool,
+    pub sink: HdmiSinkBpc,
+    pub combo_phy: bool,
+    pub tc_phy: bool,
+    pub y420_hblank_width: u32,
+}
+
+/// Try deep color from the pipe target down to the HDMI 8-bpc floor.
+// upstream: intel_hdmi.c intel_hdmi_compute_bpc()
+pub fn intel_hdmi_compute_bpc(request: HdmiBpcRequest) -> Option<u8> {
+    let mut bpc = (request.pipe_bpp / 3).max(8);
+    if !request.respect_downstream_limits {
+        bpc = 8;
+    }
+    let limit = hdmi_port_clock_limit(
+        request.source_limit_khz,
+        request.respect_downstream_limits,
+        request.dp_dual_mode_limit_khz,
+        request.sink_limit_khz,
+        request.has_hdmi_sink,
+    );
+    while bpc >= 8 {
+        let tmds = intel_hdmi_tmds_clock(request.pixel_clock_khz, bpc, request.format);
+        let source_ok =
+            intel_hdmi_source_bpc_possible(request.display_version, request.has_gmch, bpc);
+        let sink_ok = intel_hdmi_sink_bpc_possible(request.sink, bpc, request.format);
+        let wa_ok = !(request.format == HdmiOutputFormat::Ycbcr420
+            && bpc == 10
+            && request.display_version == 11
+            && request.y420_hblank_width % 8 == 2);
+        if source_ok
+            && sink_ok
+            && wa_ok
+            && hdmi_port_clock_valid(tmds, limit, request.combo_phy, request.tc_phy)
+                == HdmiModeStatus::Ok
+        {
+            return Some(bpc);
+        }
+        if bpc < 10 {
+            break;
+        }
+        bpc -= 2;
+    }
+    None
+}
+
 /// Source BPC ceilings selected by the display version and the ADL-S 600-MHz SKU.
 // upstream: intel_hdmi.c intel_hdmi_source_max_tmds_clock()
 pub fn intel_hdmi_source_max_tmds_clock(
@@ -134,6 +191,59 @@ pub fn intel_hdmi_tmds_clock(pixel_clock_khz: u32, bpc: u8, format: HdmiOutputFo
         pixel_clock_khz
     };
     (clock * u32::from(bpc) + 4) / 8
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HdmiModeStatus {
+    Ok,
+    ClockLow,
+    ClockHigh,
+    ClockRange,
+}
+
+/// Apply source, dual-mode-adapter, and sink TMDS limits in i915 order.
+// upstream: intel_hdmi.c hdmi_port_clock_limit()
+pub fn hdmi_port_clock_limit(
+    source_limit: u32,
+    respect_downstream_limits: bool,
+    dp_dual_mode_limit: Option<u32>,
+    sink_limit: Option<u32>,
+    has_hdmi_sink: bool,
+) -> u32 {
+    if !respect_downstream_limits {
+        return source_limit;
+    }
+    let mut limit = source_limit;
+    if let Some(value) = dp_dual_mode_limit.filter(|value| *value != 0) {
+        limit = limit.min(value);
+    }
+    if let Some(value) = sink_limit.filter(|value| *value != 0) {
+        limit = limit.min(value);
+    } else if !has_hdmi_sink {
+        limit = limit.min(165_000);
+    }
+    limit
+}
+
+/// Validate the display-12/13 clock floor/cap and combo/TC PLL hole.
+// upstream: intel_hdmi.c hdmi_port_clock_valid()
+pub fn hdmi_port_clock_valid(
+    clock_khz: u32,
+    limit_khz: u32,
+    is_combo_phy: bool,
+    is_tc_phy: bool,
+) -> HdmiModeStatus {
+    if clock_khz < 25_000 {
+        HdmiModeStatus::ClockLow
+    } else if clock_khz > limit_khz {
+        HdmiModeStatus::ClockHigh
+    } else if (is_combo_phy && clock_khz > 500_000 && clock_khz < 533_200)
+        || (is_tc_phy && clock_khz > 500_000 && clock_khz < 532_800)
+    {
+        HdmiModeStatus::ClockRange
+    } else {
+        HdmiModeStatus::Ok
+    }
 }
 
 /// Whether the source hardware can generate this HDMI component depth.
@@ -537,6 +647,53 @@ mod write_tests {
             set_context_latency: 0,
             interlaced: false,
         }
+    }
+
+    #[test]
+    fn hdmi_bpc_fallback_and_display12_pll_holes_follow_source_order() {
+        let sink = HdmiSinkBpc {
+            has_hdmi_sink: true,
+            y420_dc_modes: 0,
+            rgb444_dc_modes: (1 << 4) | (1 << 5),
+        };
+        let request = HdmiBpcRequest {
+            pipe_bpp: 36,
+            pixel_clock_khz: 148_500,
+            display_version: 13,
+            has_gmch: false,
+            format: HdmiOutputFormat::Rgb,
+            respect_downstream_limits: true,
+            source_limit_khz: 600_000,
+            dp_dual_mode_limit_khz: None,
+            sink_limit_khz: None,
+            has_hdmi_sink: true,
+            sink,
+            combo_phy: true,
+            tc_phy: false,
+            y420_hblank_width: 280,
+        };
+        assert_eq!(intel_hdmi_compute_bpc(request), Some(12));
+        let constrained = HdmiBpcRequest {
+            pixel_clock_khz: 500_000,
+            ..request
+        };
+        assert_eq!(intel_hdmi_compute_bpc(constrained), Some(8));
+        assert_eq!(
+            hdmi_port_clock_valid(25_000, 600_000, true, false),
+            HdmiModeStatus::Ok
+        );
+        assert_eq!(
+            hdmi_port_clock_valid(533_199, 600_000, true, false),
+            HdmiModeStatus::ClockRange
+        );
+        assert_eq!(
+            hdmi_port_clock_valid(532_800, 600_000, false, true),
+            HdmiModeStatus::Ok
+        );
+        assert_eq!(
+            hdmi_port_clock_limit(600_000, true, None, None, false),
+            165_000
+        );
     }
 
     #[test]

@@ -664,3 +664,6 @@ MIT grant is in `LICENSE-MIT`.
 
 `tk-intel-display/src/hdmi.rs` also includes HDMI TMDS rate calculation and
 source/sink BPC gating from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+`hdmi.rs` also contains source/sink/downstream TMDS clock and BPC selection
+helpers from `intel_hdmi.c` (MIT, © 2006-2009 Intel).

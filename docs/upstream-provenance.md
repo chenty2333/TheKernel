@@ -1204,3 +1204,5 @@ The HSW HDMI module also translates Intel's SPD infoframe defaults and DRM metad
 `crates/ax/tk-intel-display/src/tc_state_machine.rs` translates 95 of the 96 display-12/13-applicable functions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_tc.c` (MIT, Copyright © 2019 Intel); `to_tc_port` is represented by the typed `TcPortState` input, and MTL/XELPDP display-14+ functions are out of scope. `LICENSE-MIT`.
 
 The same module translates display-12/13 TMDS source limits and clock formula plus source/sink BPC predicates from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
+
+The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_clock_valid()`, and `intel_hdmi_compute_bpc()` display-12/13 TMDS/BPC selection branches from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
