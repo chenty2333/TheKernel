@@ -15,6 +15,118 @@ use crate::{
     dkl_phy::{DklIo, TcPort, with_preserved_selector},
 };
 
+/// i915 Type-C port state, independent of the TCSS/MG PHY transport.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TcPortMode {
+    Disconnected,
+    TbtAlt,
+    DpAlt,
+    Legacy,
+}
+
+/// Stable source spelling used by TC diagnostics.
+// upstream: intel_tc.c tc_port_mode_name()
+pub const fn tc_port_mode_name(mode: TcPortMode) -> &'static str {
+    match mode {
+        TcPortMode::Disconnected => "disconnected",
+        TcPortMode::TbtAlt => "tbt-alt",
+        TcPortMode::DpAlt => "dp-alt",
+        TcPortMode::Legacy => "legacy",
+    }
+}
+
+/// Whether an encoder whose platform reports it as TC is in the requested mode.
+// upstream: intel_tc.c intel_tc_port_in_mode()
+pub const fn intel_tc_port_in_mode(
+    is_type_c: bool,
+    current: TcPortMode,
+    requested: TcPortMode,
+) -> bool {
+    is_type_c && current as u8 == requested as u8
+}
+
+/// Test the TBT alternate mode.
+// upstream: intel_tc.c intel_tc_port_in_tbt_alt_mode()
+pub const fn intel_tc_port_in_tbt_alt_mode(is_type_c: bool, mode: TcPortMode) -> bool {
+    intel_tc_port_in_mode(is_type_c, mode, TcPortMode::TbtAlt)
+}
+
+/// Test the DisplayPort alternate mode.
+// upstream: intel_tc.c intel_tc_port_in_dp_alt_mode()
+pub const fn intel_tc_port_in_dp_alt_mode(is_type_c: bool, mode: TcPortMode) -> bool {
+    intel_tc_port_in_mode(is_type_c, mode, TcPortMode::DpAlt)
+}
+
+/// Test legacy routing mode.
+// upstream: intel_tc.c intel_tc_port_in_legacy_mode()
+pub const fn intel_tc_port_in_legacy_mode(is_type_c: bool, mode: TcPortMode) -> bool {
+    intel_tc_port_in_mode(is_type_c, mode, TcPortMode::Legacy)
+}
+
+/// TC ports outside legacy routing use the TC-specific HPD glitch handler.
+// upstream: intel_tc.c intel_tc_port_handles_hpd_glitches()
+pub const fn intel_tc_port_handles_hpd_glitches(is_type_c: bool, legacy_port: bool) -> bool {
+    is_type_c && !legacy_port
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TcPinAssignment {
+    None,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    Unknown(u8),
+}
+
+/// Translate the FIA DP lane mask to the maximum source lane count.
+// upstream: intel_tc.c icl_get_max_lane_count()
+pub const fn icl_get_max_lane_count(lane_mask: u8) -> u8 {
+    match lane_mask {
+        0x1 | 0x2 | 0x4 | 0x8 => 1,
+        0x3 | 0xc => 2,
+        0xf => 4,
+        _ => 1, // MISSING_CASE then fallthrough to the source's one-lane cases
+    }
+}
+
+/// Translate the newer pin-assignment table to a maximum lane count.
+// upstream: intel_tc.c mtl_get_max_lane_count()
+pub const fn mtl_get_max_lane_count(pin: TcPinAssignment) -> u8 {
+    match pin {
+        TcPinAssignment::None => 0,
+        TcPinAssignment::C | TcPinAssignment::E => 4,
+        TcPinAssignment::D | TcPinAssignment::Unknown(_) => 2,
+        TcPinAssignment::A | TcPinAssignment::B | TcPinAssignment::F => 2,
+    }
+}
+
+/// Display-version/mode dispatch used after reading the port's lane topology.
+// upstream: intel_tc.c get_max_lane_count()
+pub const fn get_max_lane_count(
+    mode: TcPortMode,
+    display_version: u8,
+    lane_mask: u8,
+    pin: TcPinAssignment,
+) -> u8 {
+    if !matches!(mode, TcPortMode::DpAlt) {
+        4
+    } else if display_version >= 14 {
+        mtl_get_max_lane_count(pin)
+    } else {
+        icl_get_max_lane_count(lane_mask)
+    }
+}
+
+/// The public connector query returns four lanes on a non-Type-C encoder.
+// upstream: intel_tc.c intel_tc_port_max_lane_count()
+pub const fn intel_tc_port_max_lane_count(is_type_c: bool, lane_count: u8) -> u8 {
+    if is_type_c { lane_count } else { 4 }
+}
+
 /// Backend pins already-enabled DISPLAY_CORE and PORT_DDI_LANES_TC(n), as
 /// well as the legacy AUX domain preventing TC cold, throughout these accesses.
 /// None of those domains may be implicitly woken for firmware discovery.
@@ -526,6 +638,37 @@ mod signal_level_tests {
 
     fn expected_rmw(old: u32, clear: u32, set: u32) -> u32 {
         (old & !clear) | set
+    }
+
+    #[test]
+    fn source_tc_mode_hpd_and_lane_count_helpers_match_i915() {
+        assert_eq!(tc_port_mode_name(TcPortMode::TbtAlt), "tbt-alt");
+        assert!(intel_tc_port_in_mode(
+            true,
+            TcPortMode::DpAlt,
+            TcPortMode::DpAlt
+        ));
+        assert!(!intel_tc_port_in_mode(
+            false,
+            TcPortMode::DpAlt,
+            TcPortMode::DpAlt
+        ));
+        assert!(intel_tc_port_in_tbt_alt_mode(true, TcPortMode::TbtAlt));
+        assert!(intel_tc_port_in_dp_alt_mode(true, TcPortMode::DpAlt));
+        assert!(intel_tc_port_in_legacy_mode(true, TcPortMode::Legacy));
+        assert!(intel_tc_port_handles_hpd_glitches(true, false));
+        assert!(!intel_tc_port_handles_hpd_glitches(true, true));
+        for (mask, lanes) in [(1, 1), (2, 1), (4, 1), (8, 1), (3, 2), (12, 2), (15, 4)] {
+            assert_eq!(icl_get_max_lane_count(mask), lanes);
+        }
+        assert_eq!(mtl_get_max_lane_count(TcPinAssignment::C), 4);
+        assert_eq!(mtl_get_max_lane_count(TcPinAssignment::D), 2);
+        assert_eq!(mtl_get_max_lane_count(TcPinAssignment::None), 0);
+        assert_eq!(
+            get_max_lane_count(TcPortMode::Legacy, 13, 1, TcPinAssignment::D),
+            4
+        );
+        assert_eq!(intel_tc_port_max_lane_count(false, 1), 4);
     }
 
     #[test]

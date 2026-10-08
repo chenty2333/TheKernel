@@ -631,3 +631,7 @@ Copyright © 2020 Intel). `LICENSE-MIT` is included in the crate.
 `kernel/src/drm/intel/phy.rs::combo_phy_power_up_lane_mask` translates the
 `intel_combo_phy_power_up_lanes()` lane-mask cases (MIT, Copyright © 2018 Intel).
 The matching `LICENSE-MIT` is included in the display crate.
+
+`tk-intel-display/src/tc.rs` contains TC mode-query/HPD-glitch helpers and ICL/MTL
+maximum-lane-count dispatch from `intel_tc.c` (MIT, Copyright © 2019 Intel);
+`LICENSE-MIT` is included in the crate.
