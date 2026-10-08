@@ -1,9 +1,7 @@
-# I2C HID transport core
+# I2C HID devices
 
-`tk-i2c-hid` models the 30-byte HID-over-I2C descriptor, ACPI `_DSM`
-descriptor-register result, command register RESET/SET_POWER writes and the
-two-byte input-report length framing from FreeBSD `iichid.c`. It is transport-
-agnostic and expects its adapter to serialize on `tk-i2c`'s bus. HID report
-decoding should reuse the existing USB HID parser and the kernel input layer;
-this crate does not yet attach to ACPI `PNP0C50` / `ACPI0C50`, publish an input
-device, or implement `hmt.c` multitouch slot tracking and `ABS_MT_*` events.
+The FreeBSD `sys/dev/iicbus/iichid.c` path is translated as a transport-independent HID-over-I2C protocol client (`tk-i2c-hid`) and a TheKernel adapter (`tk-axdriver/src/i2c_hid.rs`). ACPICA discovers `PNP0C50`/`ACPI0C50` children through `I2cSerialBusV2`, applies `_STA` presence semantics, evaluates the upstream `_DSM` UUID/function to obtain the HID descriptor register, then the adapter reads the 30-byte descriptor, resets/powers the device, and fetches the HID report descriptor. Reports use TheKernel's existing bounded HID parser and are registered with the normal input subsystem, so userspace sees evdev.
+
+The transport implements input-register reads, HID descriptor/report descriptor reads, RESET, SET_POWER, GET_REPORT, SET_REPORT, and output reports. The shared report parser now maps Digitizer contact IDs, positions, pressure, tip state, and per-Finger collections to evdev multitouch slot events (`ABS_MT_*`). This reuses existing parser and event-bit machinery instead of copying the FreeBSD `hid.c`/`hidbus.c` framework.
+
+Not translated: FreeBSD newbus/HID bus plumbing and its device-specific quirk tables; unsupported quirks remain unsupported rather than guessed. I2C HID event consumption is bounded polling from the input read path; GPIO interrupt resources, FreeBSD's adaptive sampling sysctl/callout controls, suspend-task lifecycle, and every specialized `hmt.c` device quirk are not yet wired. QEMU has no DesignWare I2C/HID device, so the source path is compile/unit-test validated only.

@@ -189,6 +189,7 @@ pub struct AcpiI2cChild {
     pub slave_address: u16,
     pub ten_bit: bool,
     pub speed_hz: u32,
+    pub hid_descriptor_register: Option<u16>,
 }
 
 #[crate_interface::def_interface]

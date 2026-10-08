@@ -2,8 +2,11 @@
 //!
 //! Translated from FreeBSD `sys/dev/iicbus/iichid.c` and informed by its
 //! BSD-2-Clause `sys/dev/hid/{hid.c,hidbus.c,hmt.c}` dispatch paths (FreeBSD
-//! snapshot 2026-10-08). Copyrights: Marc Priggemeyer; Vladimir Kondratyev;
-//! NetBSD Foundation, Inc.; and Lennart Augustsson. See `LICENSES/`.
+//! snapshot 2026-10-08). Copyright (c) 2018-2019 Marc Priggemeyer
+//! <marc.priggemeyer@gmail.com>; Copyright (c) 2019-2020 and 2014-2020
+//! Vladimir Kondratyev <wulf@FreeBSD.org>; Copyright (c) 1998 The NetBSD
+//! Foundation, Inc. The NetBSD-derived HID parser was contributed by Lennart
+//! Augustsson <lennart@augustsson.net>. See `LICENSES/BSD-2-Clause.txt`.
 #![no_std]
 
 #[cfg(test)]
@@ -19,12 +22,15 @@ pub const INPUT_SAMPLING_FAST_HZ: u8 = 80;
 pub const INPUT_SAMPLING_SLOW_HZ: u8 = 10;
 pub const INPUT_SAMPLING_HYSTERESIS: u8 = 16;
 pub const HID_DESC_ACPI: u16 = 0xffff;
+pub const MAX_REPORT_DESCRIPTOR_BYTES: usize = 4096;
+pub const MAX_REPORT_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     InvalidDescriptor,
     InvalidPacket,
     PacketTooLarge,
+    Unsupported,
     Bus(BusError),
 }
 
@@ -126,11 +132,8 @@ pub struct AcpiHidDescriptorAddress(pub u16);
 impl AcpiHidDescriptorAddress {
     // upstream: iichid.c iichid_probe()
     pub const fn from_dsm_integer(value: u64) -> Result<Self, Error> {
-        if value <= u16::MAX as u64 {
-            Ok(Self(value as u16))
-        } else {
-            Err(Error::InvalidDescriptor)
-        }
+        // FreeBSD masks the ACPICA integer to the 16-bit register field.
+        Ok(Self(value as u16))
     }
 }
 
@@ -140,6 +143,12 @@ pub trait Transport {
     fn address(&self) -> Address;
     fn write_register(&mut self, register: u16, bytes: &[u8]) -> Result<(), BusError>;
     fn read_register(&mut self, register: u16, bytes: &mut [u8]) -> Result<usize, BusError>;
+    /// The input-report endpoint is read directly; unlike descriptor and
+    /// command registers, the device returns the length-prefixed report at the
+    /// current input endpoint without a register-address write.
+    fn read_input(&mut self, bytes: &mut [u8]) -> Result<usize, BusError>;
+    fn read_report(&mut self, command: &[u8], bytes: &mut [u8]) -> Result<usize, BusError>;
+    fn write_report(&mut self, command: &[u8], bytes: &[u8]) -> Result<(), BusError>;
 }
 
 /// Minimal protocol operations. Report parsing and Linux input event creation
@@ -168,12 +177,10 @@ impl<T: Transport> Device<T> {
     // upstream: iichid.c iichid_reset()
     pub fn reset(&mut self, poll_limit: usize) -> Result<(), Error> {
         self.transport
-            .write_register(self.descriptor.command_register, &[Command::Reset as u8])?;
+            .write_register(self.descriptor.command_register, &[0, Command::Reset as u8])?;
         let mut status = [0u8; 2];
         for _ in 0..poll_limit {
-            let n = self
-                .transport
-                .read_register(self.descriptor.input_register, &mut status)?;
+            let n = self.transport.read_input(&mut status)?;
             if n >= 2 {
                 let length = u16::from_le_bytes(status);
                 if length == 0 {
@@ -188,7 +195,7 @@ impl<T: Transport> Device<T> {
     /// state, high byte is reserved and remains zero.
     // upstream: iichid.c iichid_set_power()
     pub fn set_power(&mut self, power: Power) -> Result<(), Error> {
-        let command = [Command::SetPower as u8, power as u8, 0];
+        let command = [power as u8, Command::SetPower as u8];
         self.transport
             .write_register(self.descriptor.command_register, &command)?;
         Ok(())
@@ -206,9 +213,7 @@ impl<T: Transport> Device<T> {
         if max > framed.len() {
             return Err(Error::PacketTooLarge);
         }
-        let n = self
-            .transport
-            .read_register(self.descriptor.input_register, &mut framed[..max])?;
+        let n = self.transport.read_input(&mut framed[..max])?;
         if n < 2 {
             return Err(Error::InvalidPacket);
         }
@@ -225,6 +230,152 @@ impl<T: Transport> Device<T> {
         }
         out[..payload].copy_from_slice(&framed[2..length]);
         Ok(payload)
+    }
+
+    /// Fetch the HID report descriptor from the descriptor's report register.
+    // upstream: iichid.c iichid_cmd_get_report_desc()
+    pub fn report_descriptor(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        let length = usize::from(self.descriptor.report_descriptor_length);
+        if length == 0 || length > MAX_REPORT_DESCRIPTOR_BYTES || out.len() < length {
+            return Err(Error::PacketTooLarge);
+        }
+        let n = self.transport.read_register(
+            self.descriptor.report_descriptor_register,
+            &mut out[..length],
+        )?;
+        if n != length {
+            return Err(Error::InvalidPacket);
+        }
+        Ok(n)
+    }
+
+    /// Retrieve the fixed HID-over-I2C descriptor before creating a Device.
+    // upstream: iichid.c iichid_cmd_get_hid_desc()
+    pub fn read_descriptor(
+        transport: &mut T,
+        address: AcpiHidDescriptorAddress,
+    ) -> Result<Descriptor, Error> {
+        let mut raw = [0u8; HID_DESCRIPTOR_BYTES];
+        let n = transport.read_register(address.0, &mut raw)?;
+        if n != raw.len() {
+            return Err(Error::InvalidDescriptor);
+        }
+        Descriptor::decode(&raw)
+    }
+
+    /// Send a HID output report through the Output Register (HID-I2C §6.2.3).
+    // upstream: iichid.c iichid_cmd_write()
+    pub fn write_output(&mut self, report: &[u8]) -> Result<(), Error> {
+        if self.descriptor.output_register == 0
+            || self.descriptor.max_output_length == 0
+            || report.len() < 2
+            || report.len() > MAX_REPORT_BYTES
+            || report
+                .len()
+                .checked_add(2)
+                .is_none_or(|n| n > usize::from(self.descriptor.max_output_length))
+        {
+            return Err(Error::PacketTooLarge);
+        }
+        let length = u16::try_from(report.len() + 2).map_err(|_| Error::PacketTooLarge)?;
+        let mut packet = [0u8; MAX_REPORT_BYTES + 2];
+        packet[..2].copy_from_slice(&length.to_le_bytes());
+        packet[2..2 + report.len()].copy_from_slice(report);
+        self.transport
+            .write_register(self.descriptor.output_register, &packet[..2 + report.len()])?;
+        Ok(())
+    }
+
+    /// GET_REPORT command and response transfer (HID-I2C §7.2.2.2).
+    // upstream: iichid.c iichid_cmd_get_report()
+    pub fn get_report(
+        &mut self,
+        report_type: u8,
+        report_id: u8,
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        if !(1..=3).contains(&report_type) || out.is_empty() || out.len() > MAX_REPORT_BYTES {
+            return Err(Error::PacketTooLarge);
+        }
+        let extended = report_id >= 15;
+        let mut command = [0u8; 7];
+        command[..2].copy_from_slice(&self.descriptor.command_register.to_le_bytes());
+        command[2] = (if extended { 15 } else { report_id }) | (report_type << 4);
+        command[3] = Command::GetReport as u8;
+        if extended {
+            command[4] = report_id;
+            command[5..7].copy_from_slice(&self.descriptor.data_register.to_le_bytes());
+        } else {
+            command[4..6].copy_from_slice(&self.descriptor.data_register.to_le_bytes());
+        }
+        let command_len = if extended { 7 } else { 6 };
+        let mut framed = [0u8; MAX_REPORT_BYTES + 2];
+        let n = self
+            .transport
+            .read_report(&command[..command_len], &mut framed[..out.len() + 2])?;
+        if n < 2 {
+            return Err(Error::InvalidPacket);
+        }
+        let length = usize::from(u16::from_le_bytes([framed[0], framed[1]]));
+        if length <= 2 || length > n || length > out.len() + 2 || length == usize::from(u16::MAX) {
+            return Err(Error::InvalidPacket);
+        }
+        let payload_len = length - 2;
+        let actual_id = if payload_len == 0 { 0 } else { framed[2] };
+        if report_id != 0 && actual_id != report_id {
+            return Err(Error::InvalidPacket);
+        }
+        out[..payload_len].copy_from_slice(&framed[2..length]);
+        Ok(payload_len)
+    }
+
+    /// SET_REPORT command followed by its report payload (HID-I2C §7.2.2.3).
+    // upstream: iichid.c iichid_cmd_set_report()
+    pub fn set_report(
+        &mut self,
+        report_type: u8,
+        report_id: u8,
+        report: &[u8],
+    ) -> Result<(), Error> {
+        if !(1..=3).contains(&report_type)
+            || report.len() < 2
+            || report.len() > MAX_REPORT_BYTES
+            || report
+                .len()
+                .checked_add(2)
+                .is_none_or(|n| n > usize::from(u16::MAX))
+        {
+            return Err(Error::PacketTooLarge);
+        }
+        let extended = report_id >= 15;
+        let report_length = u16::try_from(report.len() + 2).map_err(|_| Error::PacketTooLarge)?;
+        let mut command = [0u8; 9];
+        command[..2].copy_from_slice(&self.descriptor.command_register.to_le_bytes());
+        command[2] = (if extended { 15 } else { report_id }) | (report_type << 4);
+        command[3] = Command::SetReport as u8;
+        if extended {
+            command[4] = report_id;
+            command[5..7].copy_from_slice(&self.descriptor.data_register.to_le_bytes());
+            command[7..9].copy_from_slice(&report_length.to_le_bytes());
+        } else {
+            command[4..6].copy_from_slice(&self.descriptor.data_register.to_le_bytes());
+            command[6..8].copy_from_slice(&report_length.to_le_bytes());
+        }
+        self.transport
+            .write_report(&command[..if extended { 9 } else { 8 }], report)?;
+        Ok(())
+    }
+
+    /// FreeBSD returns ENOTSUPP for the unused idle/protocol controls.
+    // upstream: iichid.c iichid_set_idle()
+    pub fn set_idle(&mut self, _duration: u16, _report_id: u8) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+
+    /// FreeBSD returns ENOTSUPP; HID-over-I2C devices remain in report mode.
+    // upstream: iichid.c iichid_set_protocol()
+    pub fn set_protocol(&mut self, _protocol: u16) -> Result<(), Error> {
+        Err(Error::Unsupported)
     }
 }
 
@@ -249,6 +400,23 @@ mod tests {
             let n = b.len().min(self.read.len());
             b[..n].copy_from_slice(&self.read[..n]);
             Ok(n)
+        }
+        fn read_input(&mut self, b: &mut [u8]) -> Result<usize, BusError> {
+            let n = b.len().min(self.read.len());
+            b[..n].copy_from_slice(&self.read[..n]);
+            Ok(n)
+        }
+        fn read_report(&mut self, _: &[u8], b: &mut [u8]) -> Result<usize, BusError> {
+            let n = b.len().min(self.read.len());
+            b[..n].copy_from_slice(&self.read[..n]);
+            Ok(n)
+        }
+        fn write_report(&mut self, command: &[u8], bytes: &[u8]) -> Result<(), BusError> {
+            let mut payload = command.to_vec();
+            payload.extend_from_slice(bytes);
+            self.writes
+                .push((u16::from_le_bytes([command[0], command[1]]), payload));
+            Ok(())
         }
     }
     fn desc() -> Descriptor {
@@ -297,7 +465,10 @@ mod tests {
             AcpiHidDescriptorAddress::from_dsm_integer(0xabcd),
             Ok(AcpiHidDescriptorAddress(0xabcd))
         );
-        assert!(AcpiHidDescriptorAddress::from_dsm_integer(0x1_0000).is_err());
+        assert_eq!(
+            AcpiHidDescriptorAddress::from_dsm_integer(0x1_0000),
+            Ok(AcpiHidDescriptorAddress(0))
+        );
     }
     #[test]
     fn frames_input_reports_and_powers_up() {
@@ -314,7 +485,7 @@ mod tests {
         assert_eq!(&out[..3], &[9, 8, 7]);
         d.set_power(Power::On).unwrap();
         let fake = d.transport;
-        assert_eq!(fake.writes, vec![(0x23, vec![8, 0, 0])]);
+        assert_eq!(fake.writes, vec![(0x23, vec![0, 8])]);
         raw.clear();
     }
     #[test]
@@ -329,5 +500,83 @@ mod tests {
         );
         let mut out = [0; 1];
         assert_eq!(d.read_input(&mut out), Err(Error::PacketTooLarge));
+    }
+
+    #[test]
+    fn reset_uses_command_parameter_order_and_zero_length_ack() {
+        let mut device = Device::new(
+            Fake {
+                writes: Vec::new(),
+                read: vec![0, 0],
+            },
+            desc(),
+        );
+        assert_eq!(device.reset(1), Ok(()));
+        assert_eq!(device.transport.writes, vec![(0x23, vec![0, 1])]);
+    }
+
+    #[test]
+    fn report_descriptor_uses_declared_size_and_rejects_short_read() {
+        let mut device = Device::new(
+            Fake {
+                writes: Vec::new(),
+                read: vec![0x05; 100],
+            },
+            desc(),
+        );
+        let mut bytes = [0; 100];
+        assert_eq!(device.report_descriptor(&mut bytes), Ok(100));
+        assert_eq!(bytes, [0x05; 100]);
+        let mut short = Device::new(
+            Fake {
+                writes: Vec::new(),
+                read: vec![0x05; 8],
+            },
+            desc(),
+        );
+        assert_eq!(
+            short.report_descriptor(&mut bytes),
+            Err(Error::InvalidPacket)
+        );
+    }
+
+    #[test]
+    fn get_and_set_report_encode_short_and_extended_report_ids() {
+        let mut get = Device::new(
+            Fake {
+                writes: Vec::new(),
+                read: vec![4, 0, 1, 0xaa],
+            },
+            desc(),
+        );
+        let mut report = [0; 4];
+        assert_eq!(get.get_report(1, 1, &mut report), Ok(2));
+        assert_eq!(&report[..2], &[1, 0xaa]);
+
+        let mut set = Device::new(
+            Fake {
+                writes: Vec::new(),
+                read: Vec::new(),
+            },
+            desc(),
+        );
+        assert_eq!(set.set_report(3, 15, &[15, 0xaa]), Ok(()));
+        assert_eq!(
+            set.transport.writes,
+            vec![(0x23, vec![0x23, 0, 0x3f, 3, 15, 0x24, 0, 4, 0, 15, 0xaa])]
+        );
+    }
+
+    #[test]
+    fn idle_and_protocol_controls_match_upstream_not_supported_results() {
+        let mut device = Device::new(
+            Fake {
+                writes: Vec::new(),
+                read: Vec::new(),
+            },
+            desc(),
+        );
+        assert_eq!(device.set_idle(0, 0), Err(Error::Unsupported));
+        assert_eq!(device.set_protocol(1), Err(Error::Unsupported));
     }
 }

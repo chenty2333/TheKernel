@@ -203,3 +203,34 @@ ACPI_STATUS tk_acpi_setup_wake(const char *device,const char *block,UINT32 numbe
     if(ACPI_SUCCESS(status) && runtime)status=AcpiEnableGpe(gpe,number);
     return status;
 }
+/* Evaluate the HID-over-I2C _DSM integer query without coercing its UUID
+ * argument to an integer as the generic scalar-only bridge would do. */
+ACPI_STATUS tk_acpi_evaluate_dsm_integer(const char *path, const UINT8 *uuid,
+    UINT64 revision, UINT64 function, UINT64 *value) {
+    ACPI_OBJECT args[4];
+    ACPI_OBJECT_LIST list = {4, args};
+    ACPI_BUFFER result = {ACPI_ALLOCATE_BUFFER, NULL};
+    ACPI_OBJECT *result_object;
+    ACPI_STATUS status;
+    memset(args, 0, sizeof(args));
+    args[0].Type = ACPI_TYPE_BUFFER;
+    args[0].Buffer.Length = 16;
+    args[0].Buffer.Pointer = (UINT8 *)uuid;
+    args[1].Type = ACPI_TYPE_INTEGER;
+    args[1].Integer.Value = revision;
+    args[2].Type = ACPI_TYPE_INTEGER;
+    args[2].Integer.Value = function;
+    args[3].Type = ACPI_TYPE_PACKAGE;
+    args[3].Package.Count = 0;
+    args[3].Package.Elements = NULL;
+    status = AcpiEvaluateObject(NULL, (char *)path, &list, &result);
+    if (ACPI_SUCCESS(status)) {
+        result_object = (ACPI_OBJECT *)result.Pointer;
+        if (!result_object || result_object->Type != ACPI_TYPE_INTEGER)
+            status = AE_TYPE;
+        else
+            *value = result_object->Integer.Value;
+    }
+    if (result.Pointer) AcpiOsFree(result.Pointer);
+    return status;
+}

@@ -3256,6 +3256,7 @@ dependencies = [
  "tk-axsync",
  "tk-axtask",
  "tk-i2c",
+ "tk-i2c-hid",
  "tk-ratelimit",
 ]
 

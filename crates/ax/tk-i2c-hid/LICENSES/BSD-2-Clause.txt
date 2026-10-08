@@ -1,9 +1,13 @@
 BSD 2-Clause License
 
-Copyright (c) 2018-2020 Marc Priggemeyer and Vladimir Kondratyev
+Copyright (c) 2018-2019 Marc Priggemeyer <marc.priggemeyer@gmail.com>
+Copyright (c) 2019-2020 Vladimir Kondratyev <wulf@FreeBSD.org>
 Copyright (c) 1998 The NetBSD Foundation, Inc.
-Copyright (c) 2001 Lennart Augustsson
+Copyright (c) 2014-2020 Vladimir Kondratyev <wulf@FreeBSD.org>
 All rights reserved.
+
+This code is derived from software contributed to The NetBSD Foundation by
+Lennart Augustsson (lennart@augustsson.net) at Carlstedt Research & Technology.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

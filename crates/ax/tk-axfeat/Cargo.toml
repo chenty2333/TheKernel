@@ -72,6 +72,7 @@ input = [
     "paging",
     "axdriver/virtio-input",
     "axdriver/usb-xhci",
+    "axdriver/i2c-hid",
     "dep:axinput",
     "axruntime/input",
 ]

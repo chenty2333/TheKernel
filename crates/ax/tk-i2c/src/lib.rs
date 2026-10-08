@@ -18,7 +18,10 @@ pub mod ig4;
 pub mod pci;
 pub mod reg;
 
-pub use ig4::{Backend, Config, Hardware, Ig4, IicError, IicMessage, Version};
+pub use ig4::{
+    Backend, Config, Hardware, IIC_M_NOSTART, IIC_M_NOSTOP, IIC_M_RD, Ig4, IicError, IicMessage,
+    Version,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Address {

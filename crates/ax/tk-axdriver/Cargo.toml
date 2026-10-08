@@ -53,6 +53,7 @@ bus-pci = [
 ]
 default = ["bus-pci", "i2c"]
 i2c = ["bus-pci", "dep:tk-i2c", "dep:spin", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq"]
+i2c-hid = ["i2c", "input", "dep:tk-i2c-hid"]
 display = ["dep:axdriver_display"]
 dyn = [
     "dep:axerrno",
@@ -343,4 +344,8 @@ optional = true
 
 [dependencies.tk-i2c]
 path = "../tk-i2c"
+optional = true
+
+[dependencies.tk-i2c-hid]
+path = "../tk-i2c-hid"
 optional = true

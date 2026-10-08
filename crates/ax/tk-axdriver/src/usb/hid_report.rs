@@ -34,8 +34,9 @@ struct Field {
     relative: bool,
     kind: Kind,
     previous: Option<i32>,
+    slot: Option<u8>,
 }
-pub(super) struct Report {
+pub(crate) struct Report {
     fields: Vec<Field>,
     bits: [u16; 256],
     ids: bool,
@@ -85,7 +86,7 @@ fn emit(events: &mut VecDeque<Event>, ty: u16, code: u16, value: i32) {
     });
 }
 impl Report {
-    pub(super) fn parse(bytes: &[u8]) -> DevResult<Self> {
+    pub(crate) fn parse(bytes: &[u8]) -> DevResult<Self> {
         if bytes.len() > 4096 {
             return Err(DevError::Unsupported);
         }
@@ -95,6 +96,9 @@ impl Report {
         let mut ranges: Option<Usage> = None;
         let mut fields = reserved(MAX_FIELDS)?;
         let mut collections = reserved(16)?;
+        let mut collection_slots = reserved(16)?;
+        let mut current_slot = None;
+        let mut next_slot = 0u8;
         let mut app = Usage::default();
         let mut pointer = false;
         let mut bits = [0u16; 256];
@@ -182,11 +186,27 @@ impl Report {
                         return Err(DevError::Unsupported);
                     }
                     collections.push(app);
+                    collection_slots.push(current_slot);
+                    if matches!(value, 0 | 2)
+                        && usages
+                            .first()
+                            .is_some_and(|usage| usage.page == 0x0d && usage.code == 0x22)
+                    {
+                        if next_slot >= 32 {
+                            return Err(DevError::Unsupported);
+                        }
+                        current_slot = Some(next_slot);
+                        next_slot += 1;
+                    }
                     if value == 1 {
                         app = usages.first().copied().unwrap_or_default();
+                        pointer |= app.page == 0x0d && matches!(app.code, 4 | 5);
                     }
                 }
-                (0, 12) => app = collections.pop().ok_or(DevError::InvalidParam)?,
+                (0, 12) => {
+                    app = collections.pop().ok_or(DevError::InvalidParam)?;
+                    current_slot = collection_slots.pop().ok_or(DevError::InvalidParam)?;
+                }
                 (0, 8) => {
                     if g.size == 0 || g.count == 0 || g.min > g.max {
                         return Err(DevError::InvalidParam);
@@ -221,6 +241,7 @@ impl Report {
                                 relative: value & 4 != 0,
                                 kind: Kind::Array(choices),
                                 previous: None,
+                                slot: current_slot,
                             });
                         } else {
                             for index in 0..g.count {
@@ -244,8 +265,10 @@ impl Report {
                                         relative: value & 4 != 0,
                                         kind: Kind::Variable(mapped),
                                         previous: None,
+                                        slot: current_slot,
                                     });
-                                    pointer |= app.page == 1 && matches!(app.code, 1 | 2);
+                                    pointer |= (app.page == 1 && matches!(app.code, 1 | 2))
+                                        || (app.page == 0x0d && matches!(app.code, 4 | 5));
                                 }
                             }
                         }
@@ -262,6 +285,7 @@ impl Report {
         if fields.is_empty()
             || !saved.is_empty()
             || !collections.is_empty()
+            || !collection_slots.is_empty()
             || ranges.is_some()
             || (ids && bits[0] != 0)
         {
@@ -275,10 +299,10 @@ impl Report {
             pointer,
         })
     }
-    pub(super) fn max_length(&self) -> usize {
+    pub(crate) fn max_length(&self) -> usize {
         usize::from(*self.bits.iter().max().unwrap_or(&0)).div_ceil(8)
     }
-    pub(super) fn is_pointer(&self) -> bool {
+    pub(crate) fn is_pointer(&self) -> bool {
         self.pointer
     }
     fn each_code(&self, mut visit: impl FnMut(u16, u16)) {
@@ -295,6 +319,9 @@ impl Report {
             }
         };
         for f in &self.fields {
+            if f.slot.is_some() {
+                mapped(Mapping::Axis(3, 0x2f)); // ABS_MT_SLOT
+            }
             match &f.kind {
                 Kind::Variable(m) => mapped(*m),
                 Kind::Array(usages) => {
@@ -307,12 +334,12 @@ impl Report {
             }
         }
     }
-    pub(super) fn has_code(&self, ty: u16, code: u16) -> bool {
+    pub(crate) fn has_code(&self, ty: u16, code: u16) -> bool {
         let mut found = false;
         self.each_code(|t, c| found |= t == ty && c == code);
         found
     }
-    pub(super) fn event_bits(&self, ty: u16, out: &mut [u8]) -> bool {
+    pub(crate) fn event_bits(&self, ty: u16, out: &mut [u8]) -> bool {
         out.fill(0);
         let mut any = false;
         let mut set = |code: u16| {
@@ -332,7 +359,10 @@ impl Report {
         }
         any
     }
-    pub(super) fn absolute_range(&self, code: u8) -> Option<(i32, i32)> {
+    pub(crate) fn absolute_range(&self, code: u8) -> Option<(i32, i32)> {
+        if code == 0x2f && self.fields.iter().any(|field| field.slot.is_some()) {
+            return Some((0, 31));
+        }
         let mut range: Option<(i32, i32)> = None;
         for f in &self.fields {
             let r = match f.kind {
@@ -346,7 +376,7 @@ impl Report {
         }
         range
     }
-    pub(super) fn decode(&mut self, report: &[u8], events: &mut VecDeque<Event>) -> bool {
+    pub(crate) fn decode(&mut self, report: &[u8], events: &mut VecDeque<Event>) -> bool {
         let id = if self.ids {
             let Some(&id) = report.first() else {
                 return false;
@@ -428,6 +458,9 @@ impl Report {
                 continue;
             };
             let raw = extract(report, usize::from(f.bit), f.size, f.min < 0);
+            if let Some(slot) = f.slot {
+                emit(events, 3, 0x2f, i32::from(slot));
+            }
             match mapped {
                 Mapping::Axis(ty, code) => {
                     let value = raw.clamp(f.min, f.max);
@@ -486,9 +519,9 @@ impl Report {
 mod tests {
     use super::*;
     const KEYBOARD: &[u8] = &[
-        0x05, 1, 0x09, 6, 0xa1, 1, 0x05, 7, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8,
-        0x81, 2, 0x75, 8, 0x95, 1, 0x81, 1, 0x19, 0, 0x29, 0x65, 0x15, 0, 0x25, 0x65, 0x75, 8,
-        0x95, 6, 0x81, 0, 0xc0,
+        0x05, 1, 0x09, 6, 0xa1, 1, 0x05, 7, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0, 0x25, 1, 0x75, 1,
+        0x95, 8, 0x81, 2, 0x75, 8, 0x95, 1, 0x81, 1, 0x19, 0, 0x29, 0x65, 0x15, 0, 0x25, 0x65,
+        0x75, 8, 0x95, 6, 0x81, 0, 0xc0,
     ];
     fn triples(events: &VecDeque<Event>) -> Vec<(u16, u16, i32)> {
         events
@@ -657,6 +690,33 @@ mod tests {
         assert!(p.has_code(2, 11));
         assert!(p.decode(&[255], &mut ev));
         assert_eq!(triples(&ev), [(2, 8, -1), (2, 11, -120), (0, 0, 0)]);
+    }
+    #[test]
+    fn digitizer_finger_collection_emits_multitouch_slot_and_tracking_id() {
+        let finger = [
+            0x09, 0x22, 0xa1, 2, // Finger logical collection
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0xc0,
+        ];
+        let mut descriptor = alloc::vec![0x05, 0x0d, 0x09, 0x05, 0xa1, 1];
+        descriptor.extend_from_slice(&finger);
+        descriptor.extend_from_slice(&finger);
+        descriptor.push(0xc0);
+        let mut report = Report::parse(&descriptor).unwrap();
+        assert!(report.is_pointer());
+        assert_eq!(report.absolute_range(0x2f), Some((0, 31)));
+        let mut events = VecDeque::new();
+        assert!(report.decode(&[7, 8], &mut events));
+        assert_eq!(
+            triples(&events),
+            [
+                (3, 0x2f, 0),
+                (3, 0x39, 7),
+                (3, 0x2f, 1),
+                (3, 0x39, 8),
+                (0, 0, 0)
+            ]
+        );
     }
     #[test]
     fn malformed_and_random_descriptors_are_bounded() {

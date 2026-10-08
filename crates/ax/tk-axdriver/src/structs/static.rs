@@ -200,7 +200,9 @@ impl BlockDriverOps for StaticBlockDevice {
         match self {
             Self::Existing(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
             #[cfg(feature = "shared-block")]
-            Self::Partition(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
+            Self::Partition(device) => unsafe {
+                device.write_block_physical_sg(block_id, segments)
+            },
             #[cfg(feature = "nvme")]
             Self::Nvme(device) => unsafe { device.write_block_physical_sg(block_id, segments) },
             Self::BootModule(device) => unsafe {
@@ -480,6 +482,8 @@ pub enum AxInputDevice {
     Existing(RegisteredStaticInputDevice),
     #[cfg(feature = "usb-xhci")]
     Usb(crate::usb::UsbInput),
+    #[cfg(feature = "i2c-hid")]
+    I2c(crate::i2c_hid::I2cInput),
 }
 
 #[cfg(feature = "input")]
@@ -489,6 +493,8 @@ impl axdriver_base::BaseDriverOps for AxInputDevice {
             Self::Existing(device) => device.device_name(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.device_name(),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.device_name(),
         }
     }
     fn device_type(&self) -> axdriver_base::DeviceType {
@@ -499,6 +505,8 @@ impl axdriver_base::BaseDriverOps for AxInputDevice {
             Self::Existing(device) => device.irq_num(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.irq_num(),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.irq_num(),
         }
     }
 }
@@ -510,6 +518,8 @@ impl axdriver_input::InputDriverOps for AxInputDevice {
             Self::Existing(device) => device.device_id(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.device_id(),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.device_id(),
         }
     }
     fn physical_location(&self) -> &str {
@@ -517,6 +527,8 @@ impl axdriver_input::InputDriverOps for AxInputDevice {
             Self::Existing(device) => device.physical_location(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.physical_location(),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.physical_location(),
         }
     }
     fn unique_id(&self) -> &str {
@@ -524,6 +536,8 @@ impl axdriver_input::InputDriverOps for AxInputDevice {
             Self::Existing(device) => device.unique_id(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.unique_id(),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.unique_id(),
         }
     }
     fn get_event_bits(
@@ -535,6 +549,8 @@ impl axdriver_input::InputDriverOps for AxInputDevice {
             Self::Existing(device) => device.get_event_bits(ty, out),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.get_event_bits(ty, out),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.get_event_bits(ty, out),
         }
     }
     fn get_property_bits(&mut self, out: &mut [u8]) -> axdriver_base::DevResult<bool> {
@@ -542,6 +558,8 @@ impl axdriver_input::InputDriverOps for AxInputDevice {
             Self::Existing(device) => device.get_property_bits(out),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.get_property_bits(out),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.get_property_bits(out),
         }
     }
     fn get_abs_info(
@@ -552,6 +570,8 @@ impl axdriver_input::InputDriverOps for AxInputDevice {
             Self::Existing(device) => device.get_abs_info(axis),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.get_abs_info(axis),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.get_abs_info(axis),
         }
     }
     fn read_event(&mut self) -> axdriver_base::DevResult<axdriver_input::Event> {
@@ -559,6 +579,8 @@ impl axdriver_input::InputDriverOps for AxInputDevice {
             Self::Existing(device) => device.read_event(),
             #[cfg(feature = "usb-xhci")]
             Self::Usb(device) => device.read_event(),
+            #[cfg(feature = "i2c-hid")]
+            Self::I2c(device) => device.read_event(),
         }
     }
 }

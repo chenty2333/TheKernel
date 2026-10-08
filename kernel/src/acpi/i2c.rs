@@ -6,10 +6,32 @@ use tk_acpica::{Engine, Node, Value};
 
 fn engine_child_devices(engine: &Engine, nodes: &[Node], controller: &str) -> Vec<AcpiI2cChild> {
     let mut children = Vec::new();
+    const I2C_HID_DSM_UUID: [u8; 16] = [
+        0xf7, 0xf6, 0xdf, 0x3c, 0x67, 0x42, 0x55, 0x45, 0xad, 0x05, 0xb3, 0x0a, 0x3d, 0x89, 0x38,
+        0xde,
+    ];
     for node in nodes.iter().filter(|node| node.kind == 6) {
+        if engine
+            .integer(&format!("{}._STA", node.path))
+            .is_ok_and(|status| status & 1 == 0)
+        {
+            continue;
+        }
         let hid = match engine.hardware_id(&node.path) {
             Ok(hid) if matches!(hid.as_str(), "PNP0C50" | "ACPI0C50") => hid,
             _ => continue,
+        };
+        let dsm_path = format!("{}._DSM", node.path);
+        let Some(descriptor_register) = engine
+            .evaluate_dsm_integer(&dsm_path, &I2C_HID_DSM_UUID, 1, 1)
+            .ok()
+            .map(|value| value as u16)
+        else {
+            warn!(
+                "acpica: I2C HID {} _DSM descriptor address unavailable",
+                node.path
+            );
+            continue;
         };
         let resources = match engine.resources(&node.path, false) {
             Ok(resources) => resources,
@@ -42,6 +64,7 @@ fn engine_child_devices(engine: &Engine, nodes: &[Node], controller: &str) -> Ve
                 slave_address: bus.slave_address,
                 ten_bit: bus.ten_bit,
                 speed_hz: bus.connection_speed_hz,
+                hid_descriptor_register: Some(descriptor_register),
             });
         }
     }
