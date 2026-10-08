@@ -2161,7 +2161,7 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
                 }
             }
             fence(Ordering::SeqCst);
-            consume_gen12_csb(memory)?;
+            consume_gen12_csb(memory, io)?;
             return Ok(());
         }
         if io.read(base + 0x0b8)? != 0 {
@@ -2178,25 +2178,91 @@ fn submit(io: &impl GtIo, memory: &Memory) -> Result<(), Error> {
 /// Poll the Gen12 HWS context-status buffer after the job's scratch breadcrumb
 /// completes. Every submit resets the pointer to slot 11; process the bounded
 /// circular buffer before the subsequent engine reset retires this context.
-fn consume_gen12_csb(memory: &Memory) -> Result<(), Error> {
+fn consume_gen12_csb(memory: &Memory, io: &impl GtIo) -> Result<(), Error> {
     let mut pointer = [0; 4];
-    let mut bytes = [0; intel_gt::execlists::GEN12_CSB_ENTRIES * 8];
     memory.status.flush();
     memory.status.read(0x2f * 4, &mut pointer)?;
-    memory.status.read(0x10 * 4, &mut bytes)?;
+    let write_pointer = u32::from_le_bytes(pointer);
+    let tail = (write_pointer & 0xf) as usize;
+    if tail >= intel_gt::execlists::GEN12_CSB_ENTRIES {
+        return Err(Error::Refused);
+    }
     let mut entries = [0; intel_gt::execlists::GEN12_CSB_ENTRIES];
-    for (index, chunk) in bytes.chunks_exact(8).enumerate() {
-        entries[index] = u64::from_le_bytes(chunk.try_into().map_err(|_| Error::Refused)?);
+    let mut head = intel_gt::execlists::GEN12_CSB_ENTRIES - 1;
+    let engine_base = if memory.render { 0x2000 } else { 0x22000 };
+    while head != tail {
+        head = (head + 1) % intel_gt::execlists::GEN12_CSB_ENTRIES;
+        entries[head] = csb_read(memory, io, engine_base, head)?;
     }
     let progress = intel_gt::execlists::process_gen12_csb(
         (intel_gt::execlists::GEN12_CSB_ENTRIES - 1) as u8,
-        u32::from_le_bytes(pointer),
+        write_pointer,
         &entries,
     )?;
     if progress.consumed == 0 || progress.promoted == 0 {
         return Err(Error::Refused);
     }
     Ok(())
+}
+
+/// `wa_csb_read()` — on TGL the HWSP store can be stale even after the write
+/// pointer advanced. Wait for the slot to leave its sentinel, then use the
+/// source MMIO status-buffer mirror as the last-resort value.
+/// upstream: intel_execlists_submission.c wa_csb_read()
+fn wa_csb_read(
+    memory: &Memory,
+    io: &impl GtIo,
+    engine_base: u32,
+    status_index: usize,
+) -> Result<u64, Error> {
+    let offset = 0x10 * 4 + status_index * 8;
+    let start = io.now_us();
+    loop {
+        let mut bytes = [0; 8];
+        memory.status.read(offset, &mut bytes)?;
+        let entry = u64::from_le_bytes(bytes);
+        if entry != u64::MAX {
+            return Ok(entry);
+        }
+        if io.now_us().saturating_sub(start) >= 10 {
+            break;
+        }
+        io.delay_us(1);
+    }
+
+    let register = if status_index < 6 {
+        engine_base
+            .checked_add(0x370 + (status_index as u32) * 8)
+            .ok_or(Error::Refused)?
+    } else {
+        engine_base
+            .checked_add(0x3c0 + ((status_index - 6) as u32) * 8)
+            .ok_or(Error::Refused)?
+    };
+    let low = io.read(register)?;
+    let high = io.read(register.checked_add(4).ok_or(Error::Refused)?)?;
+    Ok(u64::from(low) | (u64::from(high) << 32))
+}
+
+/// Read a CSB entry, fall back through the TGL write-order workaround, and
+/// poison the consumed HWSP slot so a later wrap cannot reuse stale data.
+/// upstream: intel_execlists_submission.c csb_read()
+fn csb_read(
+    memory: &Memory,
+    io: &impl GtIo,
+    engine_base: u32,
+    status_index: usize,
+) -> Result<u64, Error> {
+    let offset = 0x10 * 4 + status_index * 8;
+    let mut bytes = [0; 8];
+    memory.status.read(offset, &mut bytes)?;
+    let mut entry = u64::from_le_bytes(bytes);
+    if entry == u64::MAX {
+        entry = wa_csb_read(memory, io, engine_base, status_index)?;
+    }
+    memory.status.write(offset, &u64::MAX.to_le_bytes())?;
+    fence(Ordering::SeqCst);
+    Ok(entry)
 }
 
 // Outer error means quiescence was not established: caller MUST retain all

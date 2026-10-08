@@ -51,6 +51,8 @@ The compiled Gen12 `tk-intel-gt::execlists::{write_desc,execlists_submit_ports}`
 
 The same module now has source-derived Gen12 CSB status decoding (`__gen12_csb_parse()` / `gen12_csb_parse()`) with explicit refusal for upstream-impossible states. The private synchronous BCS/RCS caller drains the 12-entry HWS CSB after its scratch breadcrumb and before reset. This is a narrow polling validation, not the upstream IRQ/tasklet state machine: it does not promote software requests, complete timeline fences, or implement preemption/timeslicing.
 
+CSB reads also preserve TGL HSDES#22011248461/22011327657 handling: poll the HWS slot for up to 10us, fall back to the engine's MMIO status-buffer mirror if it remains `U64_MAX`, then poison the consumed slot. `gt.rs` restricts those mirror reads to the two aligned read-only CSB ranges for the owned BCS/RCS engine.
+
 The CT receive bridge now treats a valid non-event G2H HXG as a pending fence response rather than an unknown submission event, and publishes the consumed receive head for the waiter. Only scheduling-mode and deregistration events are dispatched today; IRQ/tasklet/workqueue integration and execution completion callers remain outstanding.
 
 `CtDmaMemory::finish_guc_submission_response()` consumes such a response by fence after its caller has waited, returns the reserved G2H credit, and republishes the shared descriptor. It is an owner adapter only; no production GuC engine caller invokes this sequence yet.

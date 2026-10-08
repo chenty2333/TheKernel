@@ -101,6 +101,13 @@ impl Bus {
         if (0x224d0..0x22500).contains(&r) {
             return self.awake.load(Ordering::Acquire);
         }
+        if ((0x2370..0x23a0).contains(&r) || (0x23c0..0x23f0).contains(&r)) && !write {
+            return self.rcs_owned.load(Ordering::Acquire)
+                && self.render_awake.load(Ordering::Acquire);
+        }
+        if ((0x22370..0x223a0).contains(&r) || (0x223c0..0x223f0).contains(&r)) && !write {
+            return self.awake.load(Ordering::Acquire);
+        }
         if (0x24d0..0x2500).contains(&r) {
             return self.rcs_owned.load(Ordering::Acquire)
                 && self.render_awake.load(Ordering::Acquire);
