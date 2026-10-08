@@ -107,3 +107,4 @@
 - Registered WIPHY output now groups NVM-admitted AX211 2.4/5 GHz channels into UAPI bands and carries passive-only channels as NL80211_FREQUENCY_ATTR_NO_IR; kernel test-code/product checks exercise the nested layout. Full rate/HT/VHT/HE/cipher capabilities remain open.
 - `ieee80211_node.c` `ieee80211_node_leave_ht()` now clears HT capability flags and returns BA/reorder owner cleanup effects; node.c marker coverage advances from 45/110 to 46/110.
 - `ieee80211_node.c` `ieee80211_node_leave_11g()` now reports short-slot/protection/preamble changes when the final incompatible peer leaves; node.c marker coverage advances from 46/110 to 47/110.
+- `ieee80211_node.c` `ieee80211_node_raise_inact()` and `ieee80211_clean_inactive_nodes()` now age and collect unreferenced station scan nodes; node.c marker coverage advances from 47/110 to 49/110.

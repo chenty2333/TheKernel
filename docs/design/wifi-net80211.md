@@ -277,3 +277,8 @@ The 11g station-leave helper returns short-slot, ERP-protection and short
 preamble changes only when the departed peer was the final incompatible
 station; IBSS retains long slot time. The driver applies the returned PHY
 reconfiguration effects.
+
+Station scan nodes now carry the OpenBSD inactivity age, increment only while
+unreferenced, cap at INACT_SCAN, and are removed at the caller's selected age
+only when no node references remain. The hardware/refcount owner supplies the
+reference predicate to the cache collector.

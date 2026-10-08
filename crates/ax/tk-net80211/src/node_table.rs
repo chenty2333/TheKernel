@@ -12,6 +12,7 @@ use crate::AccessPoint;
 pub const NODE_CACHE_SIZE: usize = 512;
 pub const INVALID_SEQUENCE: u16 = 0xffff;
 pub const TID_COUNT: usize = 16;
+pub const INACT_SCAN: u8 = 10;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NodeLifecycle {
@@ -29,6 +30,7 @@ pub struct NodeRecord {
     /// Last advertised complete WPA vendor IE retained for association policy.
     pub saved_wpa_ie: alloc::vec::Vec<u8>,
     pub association_id: u16,
+    pub inactivity: u8,
     pub ht_caps: crate::HtCapabilities,
     pub ht_operation: crate::HtOperation,
     pub vht_caps: crate::VhtCapabilities,
@@ -74,6 +76,7 @@ impl Default for NodeTable {
                 saved_rsn_ie: alloc::vec::Vec::new(),
                 saved_wpa_ie: alloc::vec::Vec::new(),
                 association_id: 0,
+                inactivity: 0,
                 ht_caps: crate::HtCapabilities::default(),
                 ht_operation: crate::HtOperation::default(),
                 vht_caps: crate::VhtCapabilities::default(),
@@ -118,6 +121,7 @@ pub fn setup_node(node: &mut NodeRecord, mac_address: [u8; 6]) {
     node.access_point.ssid_len = 0;
     node.access_point.association_failures = 0;
     node.association_id = 0;
+    node.inactivity = 0;
     node.rx_sequence = INVALID_SEQUENCE;
     node.qos_rx_sequences = [INVALID_SEQUENCE; TID_COUNT];
     node.lifecycle = NodeLifecycle::Cache;
@@ -129,6 +133,7 @@ fn setup_empty_node() -> NodeRecord {
         saved_rsn_ie: alloc::vec::Vec::new(),
         saved_wpa_ie: alloc::vec::Vec::new(),
         association_id: 0,
+        inactivity: 0,
         ht_caps: crate::HtCapabilities::default(),
         ht_operation: crate::HtOperation::default(),
         vht_caps: crate::VhtCapabilities::default(),
@@ -210,6 +215,32 @@ impl NodeTable {
     pub fn iter(&self) -> impl Iterator<Item = (&[u8; 6], &NodeRecord)> {
         self.nodes.iter()
     }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&[u8; 6], &mut NodeRecord)> {
+        self.nodes.iter_mut()
+    }
+}
+
+/// Increase the station-scan inactivity age only when no packet owner holds a reference.
+// upstream: ieee80211_node.c ieee80211_node_raise_inact()
+pub fn raise_scan_node_inactivity(node: &mut NodeRecord, referenced: bool) {
+    if !referenced && node.inactivity < INACT_SCAN {
+        node.inactivity += 1;
+    }
+}
+
+/// Remove unreferenced node-cache entries that have reached the selected inactivity age.
+// upstream: ieee80211_node.c ieee80211_clean_inactive_nodes()
+pub fn clean_inactive_nodes(
+    table: &mut NodeTable,
+    inactivity_limit: u8,
+    mut referenced: impl FnMut(&[u8; 6]) -> bool,
+) -> usize {
+    let before = table.nodes.len();
+    table
+        .nodes
+        .retain(|mac, node| referenced(mac) || node.inactivity < inactivity_limit);
+    before - table.nodes.len()
 }
 
 #[cfg(test)]
@@ -256,5 +287,30 @@ mod tests {
         free_all_nodes(&mut table, true);
         assert!(table.is_empty());
         assert_eq!(table.bss_node.lifecycle, NodeLifecycle::Bss);
+    }
+
+    #[test]
+    fn station_scan_ages_unreferenced_nodes_and_cleans_only_expired_entries() {
+        let mut table = NodeTable::default();
+        let expired = [0, 0, 0, 0, 0, 1];
+        let referenced = [0, 0, 0, 0, 0, 2];
+        let young = [0, 0, 0, 0, 0, 3];
+        alloc_node(&mut table, expired).unwrap().inactivity = INACT_SCAN;
+        alloc_node(&mut table, referenced).unwrap().inactivity = INACT_SCAN;
+        alloc_node(&mut table, young).unwrap().inactivity = INACT_SCAN - 2;
+        let node = find_node_mut(&mut table, &young).unwrap();
+        raise_scan_node_inactivity(node, false);
+        assert_eq!(node.inactivity, INACT_SCAN - 1);
+        raise_scan_node_inactivity(node, true);
+        assert_eq!(node.inactivity, INACT_SCAN - 1);
+        let node = find_node_mut(&mut table, &referenced).unwrap();
+        raise_scan_node_inactivity(node, true);
+        assert_eq!(node.inactivity, INACT_SCAN);
+
+        let removed = clean_inactive_nodes(&mut table, INACT_SCAN, |mac| *mac == referenced);
+        assert_eq!(removed, 1);
+        assert!(find_node(&table, &expired).is_none());
+        assert!(find_node(&table, &referenced).is_some());
+        assert!(find_node(&table, &young).is_some());
     }
 }
