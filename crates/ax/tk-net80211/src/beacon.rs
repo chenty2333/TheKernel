@@ -385,9 +385,16 @@ pub fn receive_beacon(
             });
         node.qos = edca_ok || wmm_ok;
     }
-    node.uapsd = policy.local_uapsd_enabled
-        && node.qos
-        && wmm_qos_info.is_some_and(|info| info & WMM_AP_UAPSD != 0);
+    let uapsd = crate::setup_uapsd(
+        wmm_qos_info.is_some_and(|info| info & WMM_AP_UAPSD != 0),
+        policy.local_uapsd_enabled,
+        node.qos,
+        policy.local_uapsd_access_categories,
+        policy.local_uapsd_max_service_period,
+    );
+    node.uapsd = uapsd.enabled;
+    node.uapsd_access_categories = uapsd.access_categories;
+    node.uapsd_max_service_period = uapsd.max_service_period;
     node.access_point.bssid = bssid;
     if policy.state_scanning && node.access_point.is_5ghz {
         if rx.is_probe_response || old_rssi == 0 || old_rssi < rx.rssi {
@@ -535,9 +542,11 @@ mod tests {
         let local_rates = RateSet::default();
         let mut policy = policy(&[1], &local_rates);
         policy.state_running = true;
+        let mut frame = beacon_frame(FC0_SUBTYPE_BEACON);
+        frame.extend_from_slice(&[EID_RSN, 2, 1, 0]);
         let update = receive_beacon(
             &mut table,
-            &beacon_frame(FC0_SUBTYPE_BEACON),
+            &frame,
             BeaconRxInfo {
                 receive_channel: Some(1),
                 rssi: 42,
@@ -559,6 +568,7 @@ mod tests {
         assert_eq!(node.receive_timestamp, 99);
         assert_eq!(node.beacon_interval, 100);
         assert_eq!(node.access_point.rates.count, 2);
+        assert_eq!(node.saved_rsn_ie, [EID_RSN, 2, 1, 0]);
     }
 
     #[test]

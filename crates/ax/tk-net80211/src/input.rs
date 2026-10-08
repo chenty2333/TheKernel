@@ -50,6 +50,33 @@ pub enum SaveIeError {
     Allocation,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UapsdState {
+    pub enabled: bool,
+    pub access_categories: u8,
+    pub max_service_period: u8,
+}
+
+/// Apply local U-APSD policy only when both the peer and the QoS node support it.
+// upstream: ieee80211_input.c ieee80211_setup_uapsd()
+pub fn setup_uapsd(
+    peer_uapsd: bool,
+    local_enabled: bool,
+    node_qos: bool,
+    access_categories: u8,
+    max_service_period: u8,
+) -> UapsdState {
+    if peer_uapsd && local_enabled && node_qos {
+        UapsdState {
+            enabled: true,
+            access_categories,
+            max_service_period,
+        }
+    } else {
+        UapsdState::default()
+    }
+}
+
 /// Copy an information element, resizing the owned slot only when its length changes.
 // upstream: ieee80211_input.c ieee80211_save_ie()
 pub fn save_information_element(
@@ -291,5 +318,21 @@ mod tests {
             Err(SaveIeError::Truncated)
         );
         assert_eq!(saved, [48, 2, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn uapsd_requires_peer_local_and_node_qos_and_clears_stale_fields() {
+        assert_eq!(
+            setup_uapsd(true, true, true, 0x5a, 3),
+            UapsdState {
+                enabled: true,
+                access_categories: 0x5a,
+                max_service_period: 3,
+            }
+        );
+        assert_eq!(
+            setup_uapsd(true, true, false, 0x5a, 3),
+            UapsdState::default()
+        );
     }
 }

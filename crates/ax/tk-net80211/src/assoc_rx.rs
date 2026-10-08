@@ -59,6 +59,8 @@ pub struct AssocRxPolicy<'a> {
     pub wep_enabled: bool,
     pub local_qos_enabled: bool,
     pub local_uapsd_enabled: bool,
+    pub local_uapsd_access_categories: u8,
+    pub local_uapsd_max_service_period: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,9 +250,16 @@ pub fn receive_assoc_response(
         node.qos
     };
     node.qos = qos;
-    node.uapsd = policy.local_uapsd_enabled
-        && qos
-        && wmm_qos_info.is_some_and(|info| info & WMM_AP_UAPSD != 0);
+    let uapsd = crate::setup_uapsd(
+        wmm_qos_info.is_some_and(|info| info & WMM_AP_UAPSD != 0),
+        policy.local_uapsd_enabled,
+        qos,
+        policy.local_uapsd_access_categories,
+        policy.local_uapsd_max_service_period,
+    );
+    node.uapsd = uapsd.enabled;
+    node.uapsd_access_categories = uapsd.access_categories;
+    node.uapsd_max_service_period = uapsd.max_service_period;
 
     if let Some(htcaps) = ies.htcaps {
         let _ = setup_ht_caps(&mut node.ht_caps, &htcaps[2..]);
@@ -380,6 +389,8 @@ mod tests {
             wep_enabled: false,
             local_qos_enabled: false,
             local_uapsd_enabled: false,
+            local_uapsd_access_categories: 0,
+            local_uapsd_max_service_period: 0,
         }
     }
 

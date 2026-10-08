@@ -189,3 +189,25 @@ Beacon nodes retain complete advertised RSN and WPA information elements using
 the input.c save-IE replacement semantics (copy the encoded element and resize
 only when its declared byte length changes); malformed/truncated element
 spans are rejected by the Rust boundary before the cached copy is modified.
+
+## Translation boundaries checked against the reference files
+
+The Fuchsia ieee80211 Rust library was evaluated as a direct dependency. Its
+GN target depends on FIDL-generated WLAN types, `std`, `anyhow`, `zerocopy`, and
+other Fuchsia build targets; the RSN target additionally depends on Zircon,
+Fuchsia synchronization, and Fuchsia/BoringSSL crypto targets. Those crates are
+not drop-in `no_std` Cargo dependencies for this kernel. The translated station
+frame and RSN paths therefore stay in `tk-net80211`; no Fuchsia source files
+are copied. The RSN four-way handshake remains with the standard userspace
+wpa_supplicant path, while iwx firmware handles hardware key installation and
+packet crypto offload.
+
+For OpenBSD `ieee80211_input.c`, station-used beacon/auth/association,
+management, disconnect, action/BA, security-IE, and inputm paths are ported.
+The remaining source functions are intentionally mapped/excluded: `defrag`
+and its timeout are under upstream `#ifdef notyet`; software BA window
+buffering/gap timers are replaced by iwx's RX BAID/NSSN firmware reorder path;
+`enqueue_data` is the ifnet/mbuf delivery wrapper mapped to Ethernet frames and
+axnet; probe-request/association-request/PS-Poll handlers are AP-only (OpenBSD
+iwx defaults to station and rejects hostap mode). Exact function coverage is
+recorded in progress-W.md.
