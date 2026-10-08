@@ -37,10 +37,57 @@ pub struct OpenAuthState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolState {
+    Init,
     Scan,
     Auth,
     Assoc,
     Run,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StateTrigger {
+    #[default]
+    None,
+    Auth,
+    Deauth,
+    DriverDown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagementAction {
+    Authentication { sequence: u16 },
+    Association,
+    Reassociation,
+    ProbeRequest,
+    Disassociation { reason: u16 },
+    Deauthentication { reason: u16 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateEffect {
+    LinkDown,
+    ClearTransmitMgmtOnly,
+    StopAmpdu,
+    DeleteBlockAck,
+    SendManagement(ManagementAction),
+    ResetBssForProbe,
+    CleanupNodeAndQueueState,
+    ResetRsnState,
+    ClearGroupKeys,
+    BeginScan,
+    MarkCurrentBssFailed,
+    CheckSupplicantFailure,
+    ResetBeaconMissThreshold,
+    ClearManagementTimer,
+    StartOutput,
+    LinkUp,
+    InvalidTransition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateTransitionPlan {
+    pub effective_state: ProtocolState,
+    pub effects: alloc::vec::Vec<StateEffect>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +298,136 @@ pub fn try_another_bss(
         selected_index,
         phy_mode: *current_mode,
     })
+}
+
+/// Plan the station-mode side effects of a net80211 state transition.
+// upstream: ieee80211_proto.c ieee80211_newstate()
+pub fn newstate(
+    old_state: ProtocolState,
+    requested_state: ProtocolState,
+    trigger: StateTrigger,
+    rsn_enabled: bool,
+    active_scan: bool,
+    monitor_mode: bool,
+) -> StateTransitionPlan {
+    use ManagementAction as Mgmt;
+    use ProtocolState as State;
+    use StateEffect as Effect;
+    let mut plan = StateTransitionPlan {
+        effective_state: requested_state,
+        effects: alloc::vec![Effect::LinkDown, Effect::ClearTransmitMgmtOnly],
+    };
+    match requested_state {
+        State::Init => {
+            if old_state == State::Run && trigger != StateTrigger::DriverDown {
+                plan.effects.push(Effect::StopAmpdu);
+                plan.effects.push(Effect::DeleteBlockAck);
+                plan.effects
+                    .push(Effect::SendManagement(Mgmt::Disassociation { reason: 8 }));
+            }
+            if matches!(old_state, State::Run | State::Assoc) && trigger != StateTrigger::DriverDown
+            {
+                plan.effects
+                    .push(Effect::SendManagement(Mgmt::Deauthentication { reason: 3 }));
+            }
+            if matches!(
+                old_state,
+                State::Run | State::Assoc | State::Auth | State::Scan
+            ) {
+                plan.effects.push(Effect::CleanupNodeAndQueueState);
+            }
+            plan.effects.push(Effect::ResetRsnState);
+            if rsn_enabled {
+                plan.effects.push(Effect::ClearGroupKeys);
+            }
+        }
+        State::Scan => {
+            plan.effects.push(Effect::ResetBssForProbe);
+            plan.effects.push(Effect::ResetRsnState);
+            if rsn_enabled {
+                plan.effects.push(Effect::ClearGroupKeys);
+            }
+            match old_state {
+                State::Init => plan.effects.push(Effect::BeginScan),
+                State::Scan => {
+                    if active_scan {
+                        plan.effects
+                            .push(Effect::SendManagement(Mgmt::ProbeRequest));
+                    }
+                }
+                State::Run => {
+                    plan.effects.push(Effect::StopAmpdu);
+                    plan.effects.push(Effect::CleanupNodeAndQueueState);
+                    plan.effects.push(Effect::BeginScan);
+                }
+                State::Auth | State::Assoc => {
+                    plan.effects.push(Effect::MarkCurrentBssFailed);
+                    plan.effects.push(Effect::BeginScan);
+                }
+            }
+        }
+        State::Auth => {
+            if old_state == State::Run {
+                plan.effects.push(Effect::CheckSupplicantFailure);
+            }
+            plan.effects.push(Effect::ResetRsnState);
+            if rsn_enabled {
+                plan.effects.push(Effect::ClearGroupKeys);
+            }
+            match old_state {
+                State::Init => plan.effects.push(Effect::InvalidTransition),
+                State::Scan => plan
+                    .effects
+                    .push(Effect::SendManagement(Mgmt::Authentication { sequence: 1 })),
+                State::Auth | State::Assoc => {
+                    if trigger == StateTrigger::Auth {
+                        plan.effects
+                            .push(Effect::SendManagement(Mgmt::Authentication { sequence: 1 }));
+                    }
+                }
+                State::Run => {
+                    plan.effects.push(Effect::StopAmpdu);
+                    plan.effects.push(Effect::DeleteBlockAck);
+                    match trigger {
+                        StateTrigger::Auth => {
+                            plan.effects
+                                .push(Effect::SendManagement(Mgmt::Authentication { sequence: 2 }));
+                            plan.effective_state = State::Run;
+                        }
+                        StateTrigger::Deauth => plan
+                            .effects
+                            .push(Effect::SendManagement(Mgmt::Authentication { sequence: 1 })),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        State::Assoc => match old_state {
+            State::Auth => plan.effects.push(Effect::SendManagement(Mgmt::Association)),
+            State::Run => {
+                plan.effects.push(Effect::StopAmpdu);
+                plan.effects.push(Effect::DeleteBlockAck);
+                plan.effects
+                    .push(Effect::SendManagement(Mgmt::Reassociation));
+            }
+            State::Init | State::Scan | State::Assoc => {
+                plan.effects.push(Effect::InvalidTransition)
+            }
+        },
+        State::Run => match old_state {
+            State::Init if monitor_mode => {}
+            State::Init | State::Auth | State::Run => plan.effects.push(Effect::InvalidTransition),
+            State::Scan | State::Assoc => {
+                if !rsn_enabled {
+                    plan.effects.push(Effect::LinkUp);
+                }
+                plan.effects.push(Effect::ClearManagementTimer);
+                plan.effects.push(Effect::ResetBeaconMissThreshold);
+                plan.effects.push(Effect::StartOutput);
+            }
+        },
+    }
+    plan
 }
 
 pub const FIX_RATE_SORT: u32 = 0x01;
@@ -476,6 +653,89 @@ mod tests {
             },
         };
         (local, peer)
+    }
+
+    #[test]
+    fn station_state_machine_emits_ordered_management_and_cleanup_effects() {
+        let scan = newstate(
+            ProtocolState::Init,
+            ProtocolState::Scan,
+            StateTrigger::None,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            scan.effects,
+            [
+                StateEffect::LinkDown,
+                StateEffect::ClearTransmitMgmtOnly,
+                StateEffect::ResetBssForProbe,
+                StateEffect::ResetRsnState,
+                StateEffect::ClearGroupKeys,
+                StateEffect::BeginScan
+            ]
+        );
+        let auth = newstate(
+            ProtocolState::Scan,
+            ProtocolState::Auth,
+            StateTrigger::None,
+            false,
+            false,
+            false,
+        );
+        assert!(auth.effects.contains(&StateEffect::SendManagement(
+            ManagementAction::Authentication { sequence: 1 }
+        )));
+        let retry = newstate(
+            ProtocolState::Run,
+            ProtocolState::Auth,
+            StateTrigger::Auth,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(retry.effective_state, ProtocolState::Run);
+        assert!(retry.effects.contains(&StateEffect::SendManagement(
+            ManagementAction::Authentication { sequence: 2 }
+        )));
+        let assoc = newstate(
+            ProtocolState::Auth,
+            ProtocolState::Assoc,
+            StateTrigger::None,
+            true,
+            false,
+            false,
+        );
+        assert!(
+            assoc
+                .effects
+                .contains(&StateEffect::SendManagement(ManagementAction::Association))
+        );
+        let run = newstate(
+            ProtocolState::Assoc,
+            ProtocolState::Run,
+            StateTrigger::None,
+            true,
+            false,
+            false,
+        );
+        assert!(!run.effects.contains(&StateEffect::LinkUp));
+        assert!(run.effects.contains(&StateEffect::ResetBeaconMissThreshold));
+        let down = newstate(
+            ProtocolState::Run,
+            ProtocolState::Init,
+            StateTrigger::DriverDown,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            !down
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, StateEffect::SendManagement(_)))
+        );
     }
 
     #[test]

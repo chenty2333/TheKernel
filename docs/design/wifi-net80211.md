@@ -125,3 +125,6 @@ recording negotiated PHY state.
 Failed authentication can age the current AP, reset the scan mode to AUTO for
 all-band selection, choose a different compatible candidate and refuse to
 re-select the same BSSID.
+The station protocol state planner now emits ordered scan/auth/association/run
+actions, cleanup and BA-stop events, keeps RUN on the open-auth retry path, and
+defers link-up while RSN authorization remains pending.
