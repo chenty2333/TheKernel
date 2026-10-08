@@ -44,6 +44,35 @@ pub enum EdcaError {
     InvalidInformationElement,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveIeError {
+    Truncated,
+    Allocation,
+}
+
+/// Copy an information element, resizing the owned slot only when its length changes.
+// upstream: ieee80211_input.c ieee80211_save_ie()
+pub fn save_information_element(
+    saved: &mut alloc::vec::Vec<u8>,
+    frame: &[u8],
+) -> Result<(), SaveIeError> {
+    let length = frame
+        .get(1)
+        .copied()
+        .map(usize::from)
+        .and_then(|payload| payload.checked_add(2))
+        .filter(|&length| length <= frame.len())
+        .ok_or(SaveIeError::Truncated)?;
+    if saved.len() != length {
+        saved
+            .try_reserve(length.saturating_sub(saved.len()))
+            .map_err(|_| SaveIeError::Allocation)?;
+        saved.resize(length, 0);
+    }
+    saved.copy_from_slice(&frame[..length]);
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EdcaUpdate {
     pub changed: bool,
@@ -248,5 +277,19 @@ mod tests {
         wmm[10] = 0x1f;
         assert!(parse_wmm_params(&mut state, &wmm, false).unwrap().changed);
         assert_eq!(state.access_categories[0].admission_control_mandatory, true);
+    }
+
+    #[test]
+    fn saved_ie_reuses_same_length_and_resizes_on_change() {
+        let mut saved = alloc::vec![48, 1, 0xaa];
+        save_information_element(&mut saved, &[48, 1, 0xbb, 0xcc]).unwrap();
+        assert_eq!(saved, [48, 1, 0xbb]);
+        save_information_element(&mut saved, &[48, 2, 0x11, 0x22]).unwrap();
+        assert_eq!(saved, [48, 2, 0x11, 0x22]);
+        assert_eq!(
+            save_information_element(&mut saved, &[48, 3]),
+            Err(SaveIeError::Truncated)
+        );
+        assert_eq!(saved, [48, 2, 0x11, 0x22]);
     }
 }

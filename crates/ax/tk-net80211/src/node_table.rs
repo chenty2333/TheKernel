@@ -24,6 +24,10 @@ pub enum NodeLifecycle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeRecord {
     pub access_point: AccessPoint,
+    /// Last advertised complete RSN IE retained for association policy.
+    pub saved_rsn_ie: alloc::vec::Vec<u8>,
+    /// Last advertised complete WPA vendor IE retained for association policy.
+    pub saved_wpa_ie: alloc::vec::Vec<u8>,
     pub association_id: u16,
     pub ht_caps: crate::HtCapabilities,
     pub ht_operation: crate::HtOperation,
@@ -65,6 +69,8 @@ impl Default for NodeTable {
             nodes: BTreeMap::new(),
             bss_node: NodeRecord {
                 access_point: AccessPoint::default(),
+                saved_rsn_ie: alloc::vec::Vec::new(),
+                saved_wpa_ie: alloc::vec::Vec::new(),
                 association_id: 0,
                 ht_caps: crate::HtCapabilities::default(),
                 ht_operation: crate::HtOperation::default(),
@@ -116,6 +122,8 @@ pub fn setup_node(node: &mut NodeRecord, mac_address: [u8; 6]) {
 fn setup_empty_node() -> NodeRecord {
     NodeRecord {
         access_point: AccessPoint::default(),
+        saved_rsn_ie: alloc::vec::Vec::new(),
+        saved_wpa_ie: alloc::vec::Vec::new(),
         association_id: 0,
         ht_caps: crate::HtCapabilities::default(),
         ht_operation: crate::HtOperation::default(),

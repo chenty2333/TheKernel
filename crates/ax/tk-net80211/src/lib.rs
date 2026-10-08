@@ -58,9 +58,9 @@ pub use disconnect_rx::{
 };
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_amsdu, decap_data, encap_station};
 pub use input::{
-    EdcaAcParams, EdcaError, EdcaState, EdcaUpdate, HeaderError, has_address4, has_ht_control,
-    has_qos_control, has_sequence_control, header_length, parse_edca_body, parse_edca_ie,
-    parse_wmm_params, parse_wmm_qos_info, qos_control,
+    EdcaAcParams, EdcaError, EdcaState, EdcaUpdate, HeaderError, SaveIeError, has_address4,
+    has_ht_control, has_qos_control, has_sequence_control, header_length, parse_edca_body,
+    parse_edca_ie, parse_wmm_params, parse_wmm_qos_info, qos_control, save_information_element,
 };
 pub use mgmt_rx::{ManagementRxError, ManagementRxKind, receive_management_kind};
 pub use node::{

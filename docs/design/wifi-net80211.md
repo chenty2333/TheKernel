@@ -184,3 +184,8 @@ check and SNAP conversion.
 A-MSDU output is represented as a batch of Ethernet frames rather than one
 mis-decapsulated packet; the validated subframes preserve exact DA/SA/type
 and reject truncation, invalid station destinations and malformed padding.
+
+Beacon nodes retain complete advertised RSN and WPA information elements using
+the input.c save-IE replacement semantics (copy the encoded element and resize
+only when its declared byte length changes); malformed/truncated element
+spans are rejected by the Rust boundary before the cached copy is modified.

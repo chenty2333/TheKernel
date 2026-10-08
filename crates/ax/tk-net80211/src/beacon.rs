@@ -54,6 +54,7 @@ pub enum BeaconError {
     ChannelMismatch,
     NodeAllocation(NodeAllocError),
     RateIe(RateIeError),
+    SavedIe(crate::SaveIeError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +285,14 @@ pub fn receive_beacon(
     let node = find_node_mut(table, &source).expect("allocated scan node");
     let old_rssi = node.access_point.rssi;
     let old_erp = node.erp;
+    if let Some(ie) = ies.rsn {
+        crate::save_information_element(&mut node.saved_rsn_ie, ie)
+            .map_err(BeaconError::SavedIe)?;
+    }
+    if let Some(ie) = ies.wpa {
+        crate::save_information_element(&mut node.saved_wpa_ie, ie)
+            .map_err(BeaconError::SavedIe)?;
+    }
     node.access_point.channel = channel;
     node.access_point.is_2ghz = channel <= 14;
     node.access_point.is_5ghz = channel > 14;
