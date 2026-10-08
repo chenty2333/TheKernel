@@ -304,6 +304,7 @@ pub const AHCI_MAX_SLOTS: usize = 32;
 /// Number of interrupt vectors handled by the upstream controller driver.
 pub const AHCI_MAX_IRQS: usize = 16;
 /// Maximum bytes in one AHCI PRD entry.
+pub const AHCI_PRD_IPC: u32 = 1 << 31;
 pub const AHCI_PRD_MAX: usize = 4 * 1024 * 1024;
 
 /// FreeBSD's AHCI controller quirk bits (`AHCI_Q_*`).

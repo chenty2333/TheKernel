@@ -979,3 +979,5 @@ individual-branch historical counts above are not additive. Other scopes
 retain the latest Intel inventory, with no scanner exemptions.
 
 - FreeBSD `sys/dev/ahci/ahci.h` at `c2b7fe4a9e94a0edba9dd2772874928b565c4f9e` (BSD-2-Clause): AHCI register encodings, PRD/command descriptor layouts, slot/error enums, and controller/channel state are translated in `crates/ax/tk-axdriver-block/src/ahci/regs.rs`; FreeBSD bus/CAM framework types are not copied. Full license: `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-AHCI.txt`.
+
+- FreeBSD `sys/dev/ahci/ahci.c` at `c2b7fe4a9e94a0edba9dd2772874928b565c4f9e` (BSD-2-Clause): `ahci_ch_detval`, `ahci_ctlr_setup`, `ahci_ctlr_reset`, `ahci_attach` capability discovery, channel start/stop/FIS receive, SATA connect/PHY reset, ATA `ahci_setup_fis`, and the single-slot `ahci_execute_transaction` command path are translated/adapted in `crates/ax/tk-axdriver-block/src/ahci/{controller,ata,disk}.rs`; CAM and FreeBSD bus frameworks are not copied. Full license: `crates/ax/tk-axdriver-block/LICENSES/BSD-2-Clause-FreeBSD-AHCI.txt`.

@@ -8,7 +8,7 @@
 use super::regs::*;
 
 /// Minimal platform boundary for an AHCI register aperture.
-pub trait AhciIo {
+pub trait AhciIo: Send + Sync {
     /// Read one little-endian 32-bit AHCI register.
     fn read32(&mut self, offset: usize) -> u32;
     /// Write one little-endian 32-bit AHCI register.
@@ -428,7 +428,7 @@ impl PortState {
         }
     }
 
-    const fn register_base(&self) -> usize {
+    pub(crate) const fn register_base(&self) -> usize {
         AHCI_OFFSET + self.index as usize * AHCI_STEP
     }
 }
