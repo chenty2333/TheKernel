@@ -432,6 +432,22 @@ pub fn leave_he_network(node: &mut crate::NodeRecord) {
     crate::clear_he_caps(&mut node.he_caps);
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HtLeaveEffects {
+    pub delete_block_ack_state: bool,
+    pub release_rx_reorder_buffers: bool,
+}
+
+/// Clear HT capabilities while asking the RX reorder owner to retire BA state.
+// upstream: ieee80211_node.c ieee80211_node_leave_ht()
+pub fn leave_ht_network(node: &mut crate::NodeRecord) -> HtLeaveEffects {
+    crate::clear_ht_caps(&mut node.ht_caps);
+    HtLeaveEffects {
+        delete_block_ack_state: true,
+        release_rx_reorder_buffers: true,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RsnLeaveEffects {
     pub initialize_rsn_state: bool,
@@ -955,6 +971,18 @@ mod tests {
         assert_eq!(node.vht_caps.flags, 0);
         assert_eq!(node.he_caps.mac_caps, [0; crate::HE_MAC_CAPS_LEN]);
         assert_eq!(node.he_caps.flags, 0);
+    }
+
+    #[test]
+    fn station_leave_ht_clears_caps_and_releases_driver_owned_ba_buffers() {
+        let mut table = crate::NodeTable::default();
+        table.bss_node.ht_caps.caps = u16::MAX;
+        table.bss_node.ht_caps.flags = crate::NODE_HT | crate::NODE_HTCAP;
+        let effects = leave_ht_network(&mut table.bss_node);
+        assert_eq!(table.bss_node.ht_caps.caps, 0);
+        assert_eq!(table.bss_node.ht_caps.flags, 0);
+        assert!(effects.delete_block_ack_state);
+        assert!(effects.release_rx_reorder_buffers);
     }
 
     #[test]

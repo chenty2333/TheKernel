@@ -268,3 +268,7 @@ RSN-node leave cleanup is represented as explicit effects: initialize state,
 clear PMK/rekey/protection/authorized-port flags, cancel EAPOL/SA Query timers,
 delete the pairwise key, and complete rekey only when the departing peer was
 rekeying and no other rekey peers remain. The driver owns timer/key application.
+
+HT-node leave now clears the cached HT capability state and returns explicit
+BlockAck teardown/RX-reorder-buffer release effects; the RX queue/storage owner
+performs the actual hardware reorder cleanup.
