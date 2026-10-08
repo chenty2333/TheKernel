@@ -167,14 +167,14 @@ pub use rx_packet::{
     RX_PACKET_HEADER_BYTES, RxPacket, RxPacketError, parse_rx_packet,
 };
 pub use scan::{
-    LONG_GROUP as IWX_LONG_GROUP, SCAN_BAND_5GHZ, SCAN_BAND_24GHZ, SCAN_BAND_FLAG_SHIFT,
-    SCAN_ENABLE_CHANNEL_ORDER, SCAN_GEN_ADAPTIVE_DWELL, SCAN_GEN_FORCE_PASSIVE,
-    SCAN_GEN_NOTIFY_ITER_COMPLETE, SCAN_GEN_PASS_ALL, SCAN_MAX_CHANNELS, SCAN_PASSIVE_MAX_PSD,
-    SCAN_PRIORITY_EXT_6, ScanChannelConfig, ScanChannelConfigV5, ScanError, ScanState,
-    UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ, UmacScanConfig, UmacScanError,
-    UmacScanVersion, abort_scan, begin_background_scan, begin_foreground_scan,
-    build_umac_scan_request, end_scan, fill_umac_scan_channels, fill_umac_scan_channels_v5,
-    scan_abort_command,
+    LONG_GROUP as IWX_LONG_GROUP, REDUCED_SCAN_CONFIG_API, SCAN_BAND_5GHZ, SCAN_BAND_24GHZ,
+    SCAN_BAND_FLAG_SHIFT, SCAN_CONFIG_COMMAND, SCAN_ENABLE_CHANNEL_ORDER, SCAN_GEN_ADAPTIVE_DWELL,
+    SCAN_GEN_FORCE_PASSIVE, SCAN_GEN_NOTIFY_ITER_COMPLETE, SCAN_GEN_PASS_ALL, SCAN_MAX_CHANNELS,
+    SCAN_PASSIVE_MAX_PSD, SCAN_PRIORITY_EXT_6, ScanChannelConfig, ScanChannelConfigV5,
+    ScanConfigError, ScanError, ScanState, UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ,
+    UmacScanConfig, UmacScanError, UmacScanVersion, abort_scan, begin_background_scan,
+    begin_foreground_scan, build_umac_scan_request, end_scan, fill_umac_scan_channels,
+    fill_umac_scan_channels_v5, reduced_scan_config_command, scan_abort_command,
 };
 pub use scan_probe::{
     DS_PARAMETER_IE, EXTENDED_RATES_IE, HT_CAPABILITIES_IE, PROBE_REQUEST_BYTES,

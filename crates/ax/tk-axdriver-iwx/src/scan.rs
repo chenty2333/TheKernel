@@ -16,6 +16,8 @@ pub const LONG_GROUP: u8 = 1;
 pub const UMAC_SCAN_REQ: u8 = 0x0d;
 pub const UMAC_SCAN_ABORT: u8 = 0x0e;
 pub const UMAC_SCAN_COMPLETE: u8 = 0x0f;
+pub const SCAN_CONFIG_COMMAND: u8 = 0x0c;
+pub const REDUCED_SCAN_CONFIG_API: u8 = 56;
 pub const SCAN_BAND_5GHZ: u8 = 0;
 pub const SCAN_BAND_24GHZ: u8 = 1;
 pub const SCAN_BAND_FLAG_SHIFT: u32 = 30;
@@ -54,6 +56,47 @@ pub enum UmacScanError {
     AllocationFailed,
     Probe(ProbeRequestError),
     Command(CommandError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanConfigError {
+    Unsupported,
+    Command(CommandError),
+}
+
+impl From<CommandError> for ScanConfigError {
+    fn from(error: CommandError) -> Self {
+        Self::Command(error)
+    }
+}
+
+/// Build the reduced scan configuration command and select its deprecated
+/// broadcast station ID by command-version policy.
+// upstream: if_iwx.c iwx_config_umac_scan_reduced()
+pub fn reduced_scan_config_command(
+    api_supported: bool,
+    command_version: u8,
+    valid_tx_antennas: u8,
+    valid_rx_antennas: u8,
+    slot: u8,
+    queue: u8,
+) -> Result<EncodedCommand, ScanConfigError> {
+    if !api_supported {
+        return Err(ScanConfigError::Unsupported);
+    }
+    let mut payload = [0u8; 12];
+    if command_version == 99 || command_version < 5 {
+        payload[2] = 0xff;
+    }
+    payload[4..8].copy_from_slice(&u32::from(valid_tx_antennas).to_le_bytes());
+    payload[8..12].copy_from_slice(&u32::from(valid_rx_antennas).to_le_bytes());
+    let command = HostCommand {
+        id: (u32::from(LONG_GROUP) << 8) | u32::from(SCAN_CONFIG_COMMAND),
+        flags: 0,
+        response_capacity: 0,
+        parts: &[&payload],
+    };
+    Ok(EncodedCommand::encode(&command, slot, queue)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,6 +614,21 @@ mod tests {
                 & (1 << SCAN_BAND_FLAG_SHIFT),
             0
         );
+    }
+
+    #[test]
+    fn reduced_scan_config_checks_capability_and_legacy_broadcast_station_id() {
+        assert_eq!(
+            reduced_scan_config_command(false, 6, 3, 1, 0, 0),
+            Err(ScanConfigError::Unsupported)
+        );
+        let legacy = reduced_scan_config_command(true, 4, 3, 1, 2, 0).unwrap();
+        assert_eq!(legacy.bytes.len(), 20);
+        assert_eq!(legacy.bytes[10], 0xff);
+        assert_eq!(&legacy.bytes[12..16], &3u32.to_le_bytes());
+        assert_eq!(&legacy.bytes[16..20], &1u32.to_le_bytes());
+        let modern = reduced_scan_config_command(true, 5, 3, 1, 2, 0).unwrap();
+        assert_eq!(modern.bytes[10], 0);
     }
 
     #[test]
