@@ -11,12 +11,14 @@ use core::{
 };
 
 use axalloc::{UsageKind, global_allocator};
+use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 use axdriver_iwx::{
     AX211_DEVICE_ID, AttachAllocationError, AttachProfile, CsrAccess, DmaAllocator, DmaError,
     DmaRegion, FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IoBarrier,
     IwxController, NvmInfo, PreinitPlan, RuntimeConfig, attach_profile, matches_pci_device,
     preinit_plan,
 };
+use axdriver_net::{EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps};
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::{phys_to_virt, virt_to_phys};
 use spin::Mutex;
@@ -233,6 +235,129 @@ enum FirmwareRequestError {
 
 static ATTACHED_DMA: Mutex<Vec<AttachedDevice>> = Mutex::new(Vec::new());
 static ROOTFS_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// The Ethernet-compatible interface owner; controller DMA and firmware are
+/// retained in `ATTACHED_DMA` until PCI teardown exists.
+struct IwxNetDevice {
+    bdf: Bdf,
+    buffers: alloc::sync::Arc<NetBufPool>,
+}
+
+impl IwxNetDevice {
+    fn try_new(bdf: DeviceFunction) -> DevResult<Self> {
+        let buffers = NetBufPool::new(128, 4096)?;
+        Ok(Self {
+            bdf: Bdf(bdf.bus, bdf.device, bdf.function),
+            buffers,
+        })
+    }
+}
+
+impl BaseDriverOps for IwxNetDevice {
+    fn device_name(&self) -> &str {
+        "Intel iwx Wi-Fi"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Net
+    }
+}
+
+impl NetDriverOps for IwxNetDevice {
+    fn interface_name(&self) -> Option<&'static str> {
+        Some("wlan0")
+    }
+
+    fn is_wireless(&self) -> bool {
+        true
+    }
+
+    fn rfkill_hard_blocked(&self) -> bool {
+        ATTACHED_DMA
+            .lock()
+            .iter()
+            .find(|device| device.bdf == self.bdf)
+            .is_none_or(|device| device.controller.hardware_rfkill)
+    }
+
+    fn set_link_up(&mut self, up: bool) -> DevResult {
+        let bdf = DeviceFunction {
+            bus: self.bdf.0,
+            device: self.bdf.1,
+            function: self.bdf.2,
+        };
+        if up {
+            start_runtime(bdf).map_err(|_| DevError::BadState)
+        } else {
+            stop_runtime(bdf).map_err(|_| DevError::Io)
+        }
+    }
+
+    fn mac_address(&self) -> EthernetAddress {
+        let address = ATTACHED_DMA
+            .lock()
+            .iter()
+            .find(|device| device.bdf == self.bdf)
+            .and_then(|device| device.nvm.as_ref())
+            .map_or([0; 6], |nvm| nvm.hardware_address);
+        EthernetAddress(address)
+    }
+
+    fn can_transmit(&self) -> bool {
+        // Management and data queues are not exposed until a net80211 peer
+        // and its firmware queue have both been installed.
+        false
+    }
+
+    fn can_receive(&self) -> bool {
+        // Until the RX notification and net80211 conversion worker is
+        // attached, polling must not claim pending packets that cannot be
+        // retired into the Ethernet receive queue.
+        false
+    }
+
+    fn rx_queue_size(&self) -> usize {
+        128
+    }
+
+    fn tx_queue_size(&self) -> usize {
+        128
+    }
+
+    fn recycle_rx_buffer(&mut self, rx_buf: NetBufPtr) -> DevResult {
+        // SAFETY: receive() returns a pointer produced by this device's pool.
+        drop(unsafe { NetBuf::from_buf_ptr(rx_buf) });
+        Ok(())
+    }
+
+    fn recycle_tx_buffers(&mut self) -> DevResult {
+        Ok(())
+    }
+
+    fn transmit(&mut self, tx_buf: NetBufPtr) -> DevResult {
+        // This early admission boundary deliberately refuses data until the
+        // net80211 association/key state machine is connected to firmware.
+        drop(unsafe { NetBuf::from_buf_ptr(tx_buf) });
+        Err(DevError::Unsupported)
+    }
+
+    fn receive(&mut self) -> DevResult<NetBufPtr> {
+        Err(DevError::Again)
+    }
+
+    fn alloc_tx_buffer(&mut self, size: usize) -> DevResult<NetBufPtr> {
+        if size == 0 || size > self.buffers.buffer_len() {
+            return Err(DevError::InvalidParam);
+        }
+        let mut buffer = self.buffers.alloc_boxed().ok_or(DevError::NoMemory)?;
+        buffer.set_packet_len(size);
+        Ok(buffer.into_buf_ptr())
+    }
+
+    fn rx_poll_interval_micros(&self) -> Option<u64> {
+        Some(10_000)
+    }
+}
 
 fn pci_match_decision(vendor_id: u16, device_id: u16, rf_id: Option<u32>) -> bool {
     if !matches_pci_device(vendor_id, device_id) {
@@ -606,6 +731,25 @@ pub fn start_runtime(bdf: DeviceFunction) -> Result<(), RuntimeStartError> {
     }
 }
 
+/// Stop regular uCode when the wireless interface is administratively lowered.
+pub fn stop_runtime(bdf: DeviceFunction) -> Result<(), RuntimeStartError> {
+    let key = Bdf(bdf.bus, bdf.device, bdf.function);
+    let mut devices = ATTACHED_DMA.lock();
+    let device = devices
+        .iter_mut()
+        .find(|device| device.bdf == key)
+        .ok_or(RuntimeStartError::DeviceNotFound)?;
+    if !device.runtime_started {
+        return Ok(());
+    }
+    device
+        .controller
+        .stop_device()
+        .map_err(|_| RuntimeStartError::Hardware)?;
+    device.runtime_started = false;
+    Ok(())
+}
+
 fn log_bootstrap_error(bdf: Bdf, error: FirmwareBootstrapError) {
     use axdriver_iwx::{ControllerError, ControllerUcodeStartError, PnvmLoadError};
 
@@ -841,6 +985,7 @@ pub(crate) fn probe(
         ((rf_id >> 28) & 1) as u8,
         ((rf_id >> 29) & 1) as u8,
     );
+    let mut publish_device = false;
     match attach_profile(config) {
         Ok(profile) => {
             info!(
@@ -878,6 +1023,7 @@ pub(crate) fn probe(
                 return BusProbeResult::Claimed;
             }
             register_rootfs_firmware_callback();
+            publish_device = true;
         }
         Err(error) => {
             warn!("iwx: {bdf}: matched PCI function has no usable runtime profile: {error:?}")
@@ -887,14 +1033,30 @@ pub(crate) fn probe(
     if info.device_id == AX211_DEVICE_ID {
         info!("iwx: {bdf}: AX211 PCI discovery complete; firmware runtime attach follows");
     }
-    // The upstream match has claimed this PCI function. Full interface
-    // publication is performed by the iwx network/net80211 adapter.
+    if publish_device {
+        return match IwxNetDevice::try_new(bdf) {
+            #[cfg(any(feature = "dyn", net_dev = "n305-net"))]
+            Ok(device) => BusProbeResult::Device(crate::AxDeviceEnum::from_net(device)),
+            #[cfg(not(any(feature = "dyn", net_dev = "n305-net")))]
+            Ok(_device) => {
+                warn!("iwx: {bdf}: this static device set cannot represent the wlan0 link type");
+                BusProbeResult::Claimed
+            }
+            Err(error) => {
+                warn!("iwx: {bdf}: could not allocate wlan0 buffers: {error:?}");
+                BusProbeResult::Claimed
+            }
+        };
+    }
+    // Keep a matched but unusable function claimed so another driver cannot
+    // take ownership after this probe has touched its BAR/configuration.
     BusProbeResult::Claimed
 }
 
 #[cfg(test)]
 mod tests {
     use axdriver_iwx::INTEL_VENDOR_ID;
+    use axdriver_net::NetDriverOps;
 
     use super::*;
 
@@ -918,5 +1080,23 @@ mod tests {
             SPECIAL_BZ_DEVICE,
             Some(u32::from(RF_TYPE_GF) << 12)
         ));
+    }
+
+    #[test]
+    fn published_wireless_netdev_uses_named_ethernet_compatible_contract() {
+        let mut device = IwxNetDevice::try_new(DeviceFunction {
+            bus: 0,
+            device: 1,
+            function: 0,
+        })
+        .unwrap();
+        assert_eq!(device.interface_name(), Some("wlan0"));
+        assert!(device.is_wireless());
+        assert!(!device.can_transmit());
+        assert!(!device.can_receive());
+        let mut packet = device.alloc_tx_buffer(32).unwrap();
+        packet.packet_mut().fill(0x5a);
+        assert_eq!(packet.packet(), &[0x5a; 32]);
+        device.recycle_rx_buffer(packet).unwrap();
     }
 }

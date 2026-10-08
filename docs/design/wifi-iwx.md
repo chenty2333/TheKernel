@@ -225,3 +225,8 @@ controller only on an administrative transition from DOWN to UP (and requests
 stop on the reverse transition). Wireless links begin administratively DOWN;
 ordinary Ethernet devices preserve their existing UP default. The controller's
 raw-MPDU DMA submit primitive is available to the future net80211 transmitter.
+The PCI probe now returns the named `wlan0` Ethernet-compatible driver into
+init-net. Its administrative up/down callback starts/stops regular uCode and
+its firmware/NVM-derived MAC is retained. Until management/RX and association
+state are wired to `tk-net80211`, the adapter explicitly refuses TX and does
+not claim RX availability rather than fabricating packet traffic.
