@@ -109,6 +109,9 @@ timeout, and the optional driver-offload completion/refusal branch.
 Local DELBA request handling clears the selected Tx or Rx agreement and emits
 direction-specific firmware-stop, timer-cancel, reorder-retirement and optional
 management-send effects.
+Tx/Rx inactivity callbacks preserve source retry counters, statistics and
+setup-required/timeout DELBA reasons, including the bounded 30-second request
+backoff counter.
 The transmit AMPDU admission predicate additionally requires HT, local TX
 support, the active BSS peer in station mode, and RSN protection.
 Management frame helpers also encode Capability Information, DS channel and

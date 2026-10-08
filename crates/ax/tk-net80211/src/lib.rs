@@ -41,10 +41,12 @@ pub use ba_rx::{
     receive_delba, refuse_addba_request, refuse_addba_response,
 };
 pub use ba_tx::{
-    ADD_BA_AMSDU, ADD_BA_MAX_WINDOW, ADD_BA_POLICY, ADD_BA_RESPONSE_TIMEOUT_MICROS,
-    ADD_BA_STATUS_UNSPECIFIED, ADD_BA_TID_SHIFT, ADD_BA_WINDOW_SHIFT, AddbaTxOutcome,
-    AddbaTxPolicy, DelbaRequestEffects, TX_BA_AGREED, TX_BA_INIT, TX_BA_REQUESTED, TxBaAgreement,
-    request_delba, start_addba_request,
+    ADD_BA_AMSDU, ADD_BA_MAX_WINDOW, ADD_BA_POLICY, ADD_BA_REQUEST_INTERVAL_MAX,
+    ADD_BA_RESPONSE_TIMEOUT_MICROS, ADD_BA_STATUS_UNSPECIFIED, ADD_BA_TID_SHIFT,
+    ADD_BA_WINDOW_SHIFT, AddbaTxOutcome, AddbaTxPolicy, DELBA_REASON_SETUP_REQUIRED,
+    DELBA_REASON_TIMEOUT, DelbaRequestEffects, RxBaTimeoutEffects, TX_BA_AGREED, TX_BA_INIT,
+    TX_BA_REQUESTED, TxBaAgreement, TxBaTimeoutEffects, request_delba, rx_ba_timeout,
+    start_addba_request, tx_ba_timeout,
 };
 pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{

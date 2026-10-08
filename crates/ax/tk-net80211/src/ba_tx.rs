@@ -15,6 +15,9 @@ pub const ADD_BA_WINDOW_SHIFT: u8 = 6;
 pub const ADD_BA_MAX_WINDOW: u16 = 64;
 pub const ADD_BA_RESPONSE_TIMEOUT_MICROS: u64 = 1_000_000;
 pub const ADD_BA_STATUS_UNSPECIFIED: u16 = 1;
+pub const ADD_BA_REQUEST_INTERVAL_MAX: u8 = 30;
+pub const DELBA_REASON_SETUP_REQUIRED: u16 = 38;
+pub const DELBA_REASON_TIMEOUT: u16 = 39;
 pub const ERR_BUSY: i32 = 16;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -54,6 +57,60 @@ pub struct DelbaRequestEffects {
     pub cancel_inactivity_timeout: bool,
     pub cancel_gap_timeout: bool,
     pub retire_reorder_buffers: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxBaTimeoutEffects {
+    pub tx_timeout_statistic: bool,
+    pub retry_interval_incremented: bool,
+    pub delba_reason: Option<u16>,
+    pub delba: DelbaRequestEffects,
+}
+
+/// Apply the transmit BA timeout callback for a request or established agreement.
+// upstream: ieee80211_proto.c ieee80211_tx_ba_timeout()
+pub fn tx_ba_timeout(tx: &mut TxBaAgreement, rx: &mut crate::BaAgreement) -> TxBaTimeoutEffects {
+    if tx.state == TX_BA_REQUESTED {
+        tx.state = TX_BA_INIT;
+        let retry_interval_incremented = tx.request_interval < ADD_BA_REQUEST_INTERVAL_MAX;
+        if retry_interval_incremented {
+            tx.request_interval += 1;
+        }
+        return TxBaTimeoutEffects {
+            retry_interval_incremented,
+            delba_reason: Some(DELBA_REASON_SETUP_REQUIRED),
+            delba: DelbaRequestEffects {
+                transmit_delba: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+    }
+    if tx.state == TX_BA_AGREED {
+        let delba = request_delba(tx, rx, DELBA_REASON_TIMEOUT, true);
+        return TxBaTimeoutEffects {
+            tx_timeout_statistic: true,
+            delba_reason: Some(DELBA_REASON_TIMEOUT),
+            delba,
+            ..Default::default()
+        };
+    }
+    TxBaTimeoutEffects::default()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RxBaTimeoutEffects {
+    pub rx_timeout_statistic: bool,
+    pub delba: DelbaRequestEffects,
+}
+
+/// Apply the receive BA inactivity timeout callback.
+// upstream: ieee80211_proto.c ieee80211_rx_ba_timeout()
+pub fn rx_ba_timeout(tx: &mut TxBaAgreement, rx: &mut crate::BaAgreement) -> RxBaTimeoutEffects {
+    RxBaTimeoutEffects {
+        rx_timeout_statistic: true,
+        delba: request_delba(tx, rx, DELBA_REASON_TIMEOUT, false),
+    }
 }
 
 /// Apply local originator/recipient agreement teardown and return driver effects.
@@ -248,6 +305,34 @@ mod tests {
                 ..Default::default()
             }
         );
+        assert_eq!(rx, crate::BaAgreement::default());
+    }
+
+    #[test]
+    fn ba_timeout_callbacks_follow_requested_agreed_and_receive_paths() {
+        let mut tx = TxBaAgreement {
+            state: TX_BA_REQUESTED,
+            request_interval: ADD_BA_REQUEST_INTERVAL_MAX - 1,
+            ..Default::default()
+        };
+        let mut rx = crate::BaAgreement::default();
+        let requested = tx_ba_timeout(&mut tx, &mut rx);
+        assert_eq!(tx.state, TX_BA_INIT);
+        assert_eq!(tx.request_interval, ADD_BA_REQUEST_INTERVAL_MAX);
+        assert!(requested.retry_interval_incremented);
+        assert_eq!(requested.delba_reason, Some(DELBA_REASON_SETUP_REQUIRED));
+        assert!(!requested.delba.stop_transmit);
+
+        tx.state = TX_BA_AGREED;
+        let agreed = tx_ba_timeout(&mut tx, &mut rx);
+        assert!(agreed.tx_timeout_statistic);
+        assert_eq!(agreed.delba_reason, Some(DELBA_REASON_TIMEOUT));
+        assert_eq!(tx, TxBaAgreement::default());
+
+        rx.state = crate::ba_rx::BA_STATE_AGREED;
+        let receive = rx_ba_timeout(&mut tx, &mut rx);
+        assert!(receive.rx_timeout_statistic);
+        assert!(receive.delba.stop_receive);
         assert_eq!(rx, crate::BaAgreement::default());
     }
 }
