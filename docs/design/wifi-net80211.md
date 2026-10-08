@@ -35,3 +35,7 @@ channel so the later wireless interface layer can issue scan-reset/ERP updates.
 The layer also translates rate lookup and the background-scan mode cycle (AUTO
 when a fixed media mode or all-band scanning applies; otherwise skip HT/VHT/HE
 superset channel sets).
+Node/ESS helpers now validate candidate SSID/security, preserve association
+failure reasons, apply OpenBSD's RSSI and crypto scoring, select saved-network
+scan results (including fixed BSSID/SSID versus auto-join), and filter HT/VHT
+40/80 MHz channel centers against the upstream regulatory operating-class sets.

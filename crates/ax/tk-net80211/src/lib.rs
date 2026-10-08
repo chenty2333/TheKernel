@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod channel;
 mod frame;
+mod node;
 mod ra;
 mod rates;
 mod regdomain;
@@ -23,6 +24,14 @@ pub use channel::{
     select_mode,
 };
 pub use frame::{DecapError, EthernetFrame, MacAddress, decap_data, encap_station};
+pub use node::{
+    ASSOCFAIL_ESSID, ASSOCFAIL_PRIVACY, ASSOCFAIL_WPA_PROTO, AccessPoint, ESS_PSK, ESS_RSN_ON,
+    ESS_WEP_ON, EssSelection, FLAG_AUTO_JOIN, HTOP0_SCO_MASK, HTOP0_SCO_SCA, HTOP0_SCO_SCB,
+    HTOP0_SCO_SCN, HTOP0_SCO_SHIFT, NetworkProfile, PRIVACY, PROTO_RSN, PROTO_WPA, ess_adjust_rssi,
+    ess_calculate_score, ess_is_better, get_ess, match_ess, switch_ess,
+    valid_40mhz_center_frequency, valid_40mhz_secondary_above, valid_40mhz_secondary_below,
+    valid_80mhz_center_frequency,
+};
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
     RA_NOT_PROBING, RA_PROBING_DOWN, RA_PROBING_INTER, RA_PROBING_UP, RaNode, add_stats_ht,
