@@ -35,6 +35,8 @@ pub enum CommandError {
     QueueIdOverflow,
     FailedResponse,
     InvalidStatusResponse,
+    GenerationChanged,
+    Timeout,
     Ring(RingError),
     Dma(DmaError),
 }
@@ -352,6 +354,23 @@ impl CommandSlots {
             *slot = CommandSlot::empty();
         }
     }
+
+    /// Release a timed-out waiter's reply buffer without retiring the device
+    /// descriptor or its external payload before the ACK arrives.
+    pub fn abandon_wait_response(
+        &mut self,
+        index: usize,
+        generation: u32,
+    ) -> Result<(), CommandError> {
+        let slot = self
+            .slots
+            .get_mut(index)
+            .ok_or(CommandError::InvalidIndex)?;
+        if slot.active && slot.generation == generation {
+            slot.response = None;
+        }
+        Ok(())
+    }
 }
 
 /// Identity and completion lifetime of one published command-ring descriptor.
@@ -361,6 +380,40 @@ pub struct CommandTicket {
     pub generation: u32,
     pub wire_id: u32,
     pub asynchronous: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WaitCommandError<E> {
+    Command(CommandError),
+    Wait(E),
+    Timeout,
+}
+
+/// Wait for ACK/response with the upstream one-second timeout and generation check.
+// upstream: if_iwx.c iwx_send_cmd()
+pub fn wait_for_command<E>(
+    slots: &mut CommandSlots,
+    ticket: CommandTicket,
+    current_generation: impl Fn() -> u32,
+    mut wait_timeout: impl FnMut(usize, u64) -> Result<bool, E>,
+) -> Result<CompletedCommand, WaitCommandError<E>> {
+    if ticket.asynchronous {
+        return Err(WaitCommandError::Command(CommandError::InvalidResponse));
+    }
+    if !wait_timeout(ticket.index, 1_000_000_000).map_err(WaitCommandError::Wait)? {
+        if current_generation() == ticket.generation {
+            slots
+                .abandon_wait_response(ticket.index, ticket.generation)
+                .map_err(WaitCommandError::Command)?;
+        }
+        return Err(WaitCommandError::Timeout);
+    }
+    if current_generation() != ticket.generation {
+        return Err(WaitCommandError::Command(CommandError::GenerationChanged));
+    }
+    slots
+        .take_completed(ticket.index, ticket.generation)
+        .map_err(WaitCommandError::Command)
 }
 
 /// Reserve response storage, write TFD, then kick the command queue pointer.
@@ -561,6 +614,50 @@ mod tests {
             slots.reserve(0, 1, 0, 0, false),
             Err(CommandError::InvalidResponse)
         );
+    }
+
+    #[test]
+    fn command_wait_checks_generation_timeout_and_defers_dma_release_until_ack() {
+        let mut slots = CommandSlots::new(0, 3);
+        slots.reserve(1, 3, CMD_WANT_RESPONSE, 16, true).unwrap();
+        slots
+            .receive_response(0, 1, 3, &[1, 2, 3, 4], false)
+            .unwrap();
+        slots.command_done(0, 1, 3).unwrap();
+        let ticket = CommandTicket {
+            index: 1,
+            generation: 3,
+            wire_id: 0x102,
+            asynchronous: false,
+        };
+        let complete = wait_for_command(
+            &mut slots,
+            ticket,
+            || 3,
+            |index, timeout| {
+                assert_eq!(index, 1);
+                assert_eq!(timeout, 1_000_000_000);
+                Ok::<_, ()>(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(complete.response, Some(vec![1, 2, 3, 4]));
+        assert!(complete.external_payload_released);
+
+        slots.reserve(2, 3, CMD_WANT_RESPONSE, 16, true).unwrap();
+        let timeout_ticket = CommandTicket {
+            index: 2,
+            generation: 3,
+            wire_id: 0,
+            asynchronous: false,
+        };
+        assert_eq!(
+            wait_for_command(&mut slots, timeout_ticket, || 3, |_, _| Ok::<_, ()>(false)),
+            Err(WaitCommandError::Timeout)
+        );
+        assert_eq!(slots.queued(), 1);
+        slots.command_done(0, 2, 3).unwrap();
+        assert!(slots.take_completed(2, 3).unwrap().response.is_none());
     }
 
     #[test]
