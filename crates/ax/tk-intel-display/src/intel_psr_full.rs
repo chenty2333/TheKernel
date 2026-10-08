@@ -1042,7 +1042,7 @@ pub fn hsw_psr_setup_aux<I: PsrIo>(device: &PsrDevice, io: &mut I) {
         (0x8u8 << 4) | ((0x0600u32 >> 16) as u8 & 0x0f),
         (0x0600u16 >> 8) as u8,
         0x0600u16 as u8,
-        1 - 1,
+        0u8,
         1, // DP_SET_POWER_D0
     ];
     for (index, chunk) in aux_message.chunks(4).enumerate() {
