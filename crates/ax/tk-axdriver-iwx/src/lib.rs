@@ -7,6 +7,7 @@
 extern crate alloc;
 
 mod apm;
+mod bringup;
 mod command;
 mod config;
 mod context;
@@ -24,6 +25,10 @@ mod tx;
 pub use apm::{
     ApmError, apm_init, apm_stop, clear_persistence_bit, force_power_gating, prepare_card_hw,
     set_hw_ready, software_reset, start_hardware,
+};
+pub use bringup::{
+    FIRMWARE_ALIVE_TIMEOUT_NS, FirmwareLoadError, InitFirmwareError, InitFirmwareState,
+    UcodeStartError, load_firmware, load_ucode_wait_alive, run_init_mvm,
 };
 pub use command::{
     CMD_ASYNC, CMD_FAILED_MASK, CMD_SEND_DURING_RFKILL, CMD_WANT_RESPONSE, CommandError,
