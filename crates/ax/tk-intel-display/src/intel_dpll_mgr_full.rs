@@ -2441,6 +2441,10 @@ fn readout_dpll_hw_state<H: IntelDpllHooks>(
 ) {
     let mut hw_state = IntelDpllHwState::default();
     display.dplls[pll_index].on = intel_dpll_get_hw_state(hooks, display, pll_index, &mut hw_state);
+    // Upstream passes `&pll->state.hw_state` directly to the hardware-state
+    // callback. Retaining this decoded image is also required by
+    // `intel_find_dpll()` when a later atomic state compares PLL candidates.
+    display.dplls[pll_index].state.hw_state = hw_state;
     let info = display.dplls[pll_index].info;
     if display.dplls[pll_index].on {
         if let Some(domain) = info.and_then(|item| item.power_domain) {
@@ -2669,4 +2673,127 @@ pub fn intel_dpll_verify_disabled<H: IntelDpllHooks>(
 
 fn div_round_up_u64(dividend: u64, divisor: u64) -> u64 {
     if divisor == 0 { 0 } else { dividend / divisor + u64::from(dividend % divisor != 0) }
+}
+
+#[cfg(test)]
+mod readout_tests {
+    use super::*;
+
+    struct ReadoutHooks {
+        dkl: crate::dpll_mgr::DklPllState,
+    }
+
+    impl IntelDpllHooks for ReadoutHooks {
+        fn read32(&mut self, register: DpllRegister) -> u32 {
+            match register {
+                DpllRegister::AdlpTcEnable(TcPort::Tc1) => 1 << 31,
+                _ => 0,
+            }
+        }
+        fn write32(&mut self, _register: DpllRegister, _value: u32) {}
+        fn posting_read32(&mut self, _register: DpllRegister) {}
+        fn read_dkl(&mut self, _port: TcPort, offset: u16) -> u32 {
+            match offset {
+                0x212c => self.dkl.refclkin_ctl,
+                0x20d4 => self.dkl.hsclkctl,
+                0x20d8 => self.dkl.coreclkctl1,
+                0x2200 => self.dkl.div0,
+                0x2204 => self.dkl.div1,
+                0x2210 => self.dkl.ssc,
+                0x2214 => self.dkl.bias,
+                0x2218 => self.dkl.tdc_coldst_bias,
+                _ => 0,
+            }
+        }
+        fn write_dkl(&mut self, _port: TcPort, _offset: u16, _value: u32) {}
+        fn posting_read_dkl(&mut self, _port: TcPort, _offset: u16) {}
+        fn wait_for_set(&mut self, _register: DpllRegister, _mask: u32, _timeout_ms: u32) -> bool {
+            false
+        }
+        fn wait_for_clear(&mut self, _register: DpllRegister, _mask: u32, _timeout_ms: u32) -> bool {
+            false
+        }
+        fn power_get(&mut self, _display_id: usize, _domain: PowerDomain) -> u64 {
+            1
+        }
+        fn power_get_if_enabled(
+            &mut self,
+            _display_id: usize,
+            _domain: PowerDomain,
+        ) -> Option<u64> {
+            Some(1)
+        }
+        fn power_put(&mut self, _display_id: usize, _domain: PowerDomain, _cookie: u64) {}
+        fn dpll_mutex_init(&mut self, _display_id: usize) {}
+        fn dpll_mutex_lock(&mut self, _display_id: usize) {}
+        fn dpll_mutex_unlock(&mut self, _display_id: usize) {}
+        fn connection_mutex_is_locked(&mut self, _display_id: usize) -> bool {
+            true
+        }
+        fn drm_debug(&mut self, _display_id: usize, _message: &str) {}
+        fn drm_error(&mut self, _display_id: usize, _message: &str) {}
+        fn drm_warn(&mut self, _display_id: usize, _message: &str) {}
+        fn drm_warn_on(&mut self, _display_id: usize, condition: bool, _message: &str) -> bool {
+            condition
+        }
+        fn display_state_warn(
+            &mut self,
+            _display_id: usize,
+            condition: bool,
+            _message: &str,
+        ) -> bool {
+            condition
+        }
+        fn missing_case(&mut self, _display_id: usize, _value: u32) {}
+        fn hti_dpll_mask(&mut self, _display_id: usize) -> u32 {
+            0
+        }
+        fn is_adlp_step_a0_to_b0(&mut self, _display_id: usize) -> bool {
+            false
+        }
+        fn intel_cx0pll_verify_plls(&mut self, _display_id: usize) {}
+        fn intel_lt_phy_verify_plls(&mut self, _display_id: usize) {}
+        fn intel_cx0_pll_power_save_wa(&mut self, _display_id: usize) {}
+        fn log_hw_state(&mut self, _display_id: usize, _title: &str, _state: &IntelDpllHwState) {}
+    }
+
+    #[test]
+    fn readout_keeps_observed_dkl_state_for_future_atomic_matching() {
+        let dkl = crate::dpll_mgr::icl_calc_mg_pll_state_for_output(
+            148_500,
+            24_000,
+            crate::dpll_mgr::MgPllOutput::Hdmi,
+            None,
+        )
+        .unwrap();
+        let mut display = IntelDpllDisplay::default();
+        display.display_ver = 13;
+        display.platform.alderlake_p = true;
+        display.ref_clks.nssc = 24_000;
+        display.num_dpll = 5;
+        display.dplls[3].index = 3;
+        display.dplls[3].info = Some(ADLP_DPLLS[3]);
+        display.crtc_states[0] = CrtcState {
+            id: 0,
+            name: "Pipe A",
+            pipe: 0,
+            joined_pipe_mask: 1,
+            hw_active: true,
+            intel_dpll: Some(3),
+            port_clock: 148_500,
+            output: OutputType::Hdmi,
+            port: Port::Tc(TcPort::Tc1),
+            ..CrtcState::default()
+        };
+        let mut hooks = ReadoutHooks { dkl };
+
+        readout_dpll_hw_state(&mut hooks, &mut display, 3);
+
+        assert!(display.dplls[3].on);
+        assert_eq!(display.dplls[3].state.pipe_mask, 1);
+        assert_eq!(display.dplls[3].active_mask, 1);
+        assert_eq!(display.dplls[3].state.hw_state.icl.mg_refclkin_ctl, dkl.refclkin_ctl);
+        assert_eq!(display.dplls[3].state.hw_state.icl.mg_pll_div0, dkl.div0);
+        assert_eq!(display.dplls[3].state.hw_state.icl.mg_pll_div1, dkl.div1);
+    }
 }
