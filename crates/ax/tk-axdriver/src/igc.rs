@@ -32,7 +32,7 @@ use axdriver_net::igc::{
     self, DMA_PAGE_BYTES, IgcBus, IgcHal, IgcNic, PhysAddr, WindowBus,
     api::{
         IgcApiBackend, IgcApiCallback, IgcApiRequest, IgcApiValue, IgcHardware,
-        igc_setup_init_funcs,
+        igc_read_mac_addr, igc_setup_init_funcs,
     },
     base::SWFW_PHY0_SM,
     ids::{self, INTEL_VENDOR},
@@ -137,6 +137,7 @@ struct I225RegisterIo<'a, H: IgcHal> {
     bus: &'a mut WindowBus<H>,
     clear_semaphore_once: bool,
     nvm_word_size: u32,
+    nvm_kind: axdriver_net::igc::nvm::NvmKind,
     phy: PhyState,
 }
 
@@ -265,6 +266,67 @@ impl<H: IgcHal> IgcPhyIo for I225RegisterIo<'_, H> {
     }
 }
 
+impl<H: IgcHal> axdriver_net::igc::nvm::IgcNvmIo for I225RegisterIo<'_, H> {
+    fn read_reg(&mut self, offset: u32) -> u32 {
+        <Self as IgcI225Io>::read(self, offset)
+    }
+
+    fn write_reg(&mut self, offset: u32, value: u32) {
+        <Self as IgcI225Io>::write(self, offset, value)
+    }
+
+    fn write_flush(&mut self) {
+        <Self as IgcI225Io>::write_flush(self)
+    }
+
+    fn delay_us(&mut self, us: u32) {
+        <Self as IgcI225Io>::delay_us(self, us)
+    }
+
+    fn delay_ms(&mut self, ms: u32) {
+        <Self as IgcI225Io>::delay_ms(self, ms)
+    }
+
+    fn nvm_info(&self) -> axdriver_net::igc::nvm::NvmInfo {
+        axdriver_net::igc::nvm::NvmInfo {
+            kind: self.nvm_kind,
+            word_size: self.nvm_word_size,
+            opcode_bits: 8,
+            delay_usec: 1,
+            page_size: 8,
+            address_bits: 8,
+        }
+    }
+
+    fn acquire_nvm(&mut self) -> Result<(), axdriver_net::igc::nvm::NvmError> {
+        Err(axdriver_net::igc::nvm::NvmError::Sync)
+    }
+
+    fn release_nvm(&mut self) {}
+
+    fn read_nvm(
+        &mut self,
+        _offset: u16,
+        _words: u16,
+        _data: &mut [u16],
+    ) -> Result<(), axdriver_net::igc::nvm::NvmError> {
+        Err(axdriver_net::igc::nvm::NvmError::Io)
+    }
+
+    fn write_nvm(
+        &mut self,
+        _offset: u16,
+        _words: u16,
+        _data: &[u16],
+    ) -> Result<(), axdriver_net::igc::nvm::NvmError> {
+        Err(axdriver_net::igc::nvm::NvmError::Io)
+    }
+
+    fn mac_type_i225(&self) -> bool {
+        true
+    }
+}
+
 impl<H: IgcHal> IgcApiBackend for I225RegisterIo<'_, H> {
     fn invoke(
         &mut self,
@@ -272,6 +334,9 @@ impl<H: IgcHal> IgcApiBackend for I225RegisterIo<'_, H> {
         request: IgcApiRequest,
     ) -> axdriver_base::DevResult<IgcApiValue> {
         match (callback, request) {
+            (IgcApiCallback::ReadMacAddrGeneric, IgcApiRequest::None) => Ok(IgcApiValue::Bytes(
+                axdriver_net::igc::nvm::igc_read_mac_addr_generic(self).to_vec(),
+            )),
             (IgcApiCallback::PhyResetI225, IgcApiRequest::None) => {
                 let phy = self.phy.clone();
                 phy::igc_phy_hw_reset_generic(self, &phy)
@@ -519,6 +584,7 @@ fn probe(
             bus: &mut bus,
             clear_semaphore_once: false,
             nvm_word_size: 0,
+            nvm_kind: axdriver_net::igc::nvm::NvmKind::Other,
             phy: PhyState::default(),
         };
         igc_get_flash_presence_i225(&mut io)
@@ -528,6 +594,15 @@ fn probe(
         bus: &mut bus,
         clear_semaphore_once: shared.mac_info.clear_semaphore_once,
         nvm_word_size: shared.nvm_info.word_size,
+        nvm_kind: match shared.nvm_info.nvm_type {
+            axdriver_net::igc::api::IgcNvmType::EepromSpi => {
+                axdriver_net::igc::nvm::NvmKind::Spi
+            }
+            axdriver_net::igc::api::IgcNvmType::FlashHardware
+            | axdriver_net::igc::api::IgcNvmType::Invm => {
+                axdriver_net::igc::nvm::NvmKind::Other
+            }
+        },
         phy: PhyState::default(),
     };
     if let Err(error) = init_phy_params_i225(&mut shared, &mut phy_io) {
@@ -545,6 +620,36 @@ fn probe(
         }
     };
     info!("{}", up.render(&bdf));
+
+    let mut mac_io = I225RegisterIo {
+        bus: &mut bus,
+        clear_semaphore_once: shared.mac_info.clear_semaphore_once,
+        nvm_word_size: shared.nvm_info.word_size,
+        nvm_kind: match shared.nvm_info.nvm_type {
+            axdriver_net::igc::api::IgcNvmType::EepromSpi => {
+                axdriver_net::igc::nvm::NvmKind::Spi
+            }
+            axdriver_net::igc::api::IgcNvmType::FlashHardware
+            | axdriver_net::igc::api::IgcNvmType::Invm => {
+                axdriver_net::igc::nvm::NvmKind::Other
+            }
+        },
+        phy: PhyState::default(),
+    };
+    let source_mac = match igc_read_mac_addr(&mut mac_io) {
+        Ok(address) => address,
+        Err(error) => {
+            warn!("igc: {bdf}: translated shared MAC read failed: {error:?}");
+            return Some(None);
+        }
+    };
+    if source_mac != up.station.bytes {
+        warn!(
+            "igc: {bdf}: translated shared MAC read disagrees with the bring-up station address"
+        );
+        return Some(None);
+    }
+    drop(mac_io);
 
     // Phase 3: take the device over.
     let nic = match IgcNic::<IgcHalImpl, QUEUE_SIZE>::init(bus, &up.station, shared) {
