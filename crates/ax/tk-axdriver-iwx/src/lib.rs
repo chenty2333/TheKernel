@@ -22,6 +22,7 @@ mod rate;
 mod registers;
 mod rings;
 mod rx;
+mod rx_packet;
 mod tx;
 
 pub use apm::{
@@ -84,4 +85,8 @@ pub use rings::{
     tx_byte_count_entry,
 };
 pub use rx::{RxMetadataError, noise_dbm, signal_strength_dbm};
+pub use rx_packet::{
+    FH_FRAME_ALIGNMENT, FH_FRAME_INVALID, FH_FRAME_SIZE_MASK, NOTIFICATION_ORIGIN,
+    RX_PACKET_HEADER_BYTES, RxPacket, RxPacketError, parse_rx_packet,
+};
 pub use tx::{EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame};

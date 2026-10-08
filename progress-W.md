@@ -8,4 +8,5 @@
 - APM/NIC readiness and interrupt topology: 10-tries preparation, hardware-ready handshake, software reset, APM init/stop, AX power gating, and single-vector MSI-X routing/snapshot implemented; see `bf466bea` and current segment.
 - Firmware start path: init command payloads (`fec20b0d`), APM/persistence/MSI-X setup (`bf466bea`, `3a04a94b`, `ae19f8f1`), ALIVE/Init MVM sequencing (`f351c60e`), and NIC config/RX startup functions just added.
 - NIC queues: generation-specific scheduler command bytes, command queue selection, ring-size code and response validation implemented.
+- RX receive parsing: FH packet validation, command/group decoding, narrow-command compatibility, and 64-byte advancement implemented (`rx_packet.rs`).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.
