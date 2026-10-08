@@ -15,6 +15,11 @@ pub const CAPTURE_LIST_HEADER_DWORDS: usize = 1;
 pub const CAPTURE_LIST_ENTRY_DWORDS: usize = 4;
 pub const CAPTURE_REGISTER_VALUE_PLACEHOLDER: u32 = 0xdead_f00d;
 pub const PAGE_SIZE: usize = 4096;
+pub const CAPTURE_OUTPUT_HEADER_BYTES: usize = 5 * 4;
+pub const CAPTURE_GROUP_HEADER_BYTES: usize = 2 * 4;
+pub const CAPTURE_OVERBUFFER_MULTIPLIER: usize = 3;
+pub const CAPTURE_PREALLOC_NODE_COUNT: usize = 3 * 16 * 32;
+pub const CAPTURE_PREALLOC_DEFAULT_REGISTERS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureError {
@@ -259,6 +264,63 @@ pub struct CaptureOutputNode {
     pub guc_id: u32,
     pub lrca: u32,
     pub lists: [Option<CaptureList>; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureBufferAssessment {
+    Adequate,
+    LowSpareCapacity { minimum: usize, preferred: usize },
+    TooSmall { minimum: usize, available: usize },
+}
+
+/// Return the cached 16-byte null ADS-list header used for absent lists.
+/// upstream: intel_guc_capture.c intel_guc_capture_getnullheader().
+pub const fn null_capture_header() -> [u8; 4 * 4] {
+    [0; 4 * 4]
+}
+
+/// Compute the worst-case minimum output size, counting the global list for
+/// every engine instance just as GuC emits independent capture groups.
+/// upstream: intel_guc_capture.c guc_capture_output_min_size_est().
+pub fn capture_output_min_size(
+    engines: &[u8],
+    mut list_size: impl FnMut(u8, u8) -> Option<usize>,
+) -> Result<usize, CaptureError> {
+    let mut minimum = 0usize;
+    for engine_class in engines {
+        minimum = minimum
+            .checked_add(CAPTURE_GROUP_HEADER_BYTES)
+            .and_then(|size| size.checked_add(3usize.checked_mul(CAPTURE_OUTPUT_HEADER_BYTES)?))
+            .ok_or(CaptureError::InvalidBuffer)?;
+        for list_type in [
+            CAPTURE_TYPE_GLOBAL,
+            CAPTURE_TYPE_ENGINE_CLASS,
+            CAPTURE_TYPE_ENGINE_INSTANCE,
+        ] {
+            if let Some(size) = list_size(list_type, *engine_class) {
+                minimum = minimum
+                    .checked_add(size)
+                    .ok_or(CaptureError::InvalidBuffer)?;
+            }
+        }
+    }
+    Ok(minimum)
+}
+
+/// Compare the configured log capture region with the minimum and 3x spare
+/// capacity thresholds used by the upstream diagnostic.
+/// upstream: intel_guc_capture.c check_guc_capture_size().
+pub fn assess_capture_buffer(minimum: usize, available: usize) -> CaptureBufferAssessment {
+    if minimum > available {
+        CaptureBufferAssessment::TooSmall { minimum, available }
+    } else {
+        let preferred = minimum.saturating_mul(CAPTURE_OVERBUFFER_MULTIPLIER);
+        if preferred > available {
+            CaptureBufferAssessment::LowSpareCapacity { minimum, preferred }
+        } else {
+            CaptureBufferAssessment::Adequate
+        }
+    }
 }
 
 impl CaptureOutputNode {
@@ -580,6 +642,41 @@ mod tests {
         assert!(nodes[1].lists[usize::from(CAPTURE_TYPE_GLOBAL)].is_some());
         assert!(nodes[1].lists[usize::from(CAPTURE_TYPE_ENGINE_CLASS)].is_some());
         assert_eq!(nodes[1].guc_id, 1);
+    }
+
+    #[test]
+    fn capture_buffer_minimum_and_spare_size_follow_upstream_estimate() {
+        assert_eq!(null_capture_header(), [0; 16]);
+        let minimum = capture_output_min_size(&[0, 1], |list_type, _class| {
+            Some(match list_type {
+                CAPTURE_TYPE_GLOBAL => 4,
+                CAPTURE_TYPE_ENGINE_CLASS => 8,
+                _ => 12,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            minimum,
+            2 * (CAPTURE_GROUP_HEADER_BYTES + 3 * CAPTURE_OUTPUT_HEADER_BYTES + 24)
+        );
+        assert_eq!(
+            assess_capture_buffer(minimum, minimum * CAPTURE_OVERBUFFER_MULTIPLIER),
+            CaptureBufferAssessment::Adequate
+        );
+        assert_eq!(
+            assess_capture_buffer(minimum, minimum * 3 - 1),
+            CaptureBufferAssessment::LowSpareCapacity {
+                minimum,
+                preferred: minimum * 3
+            }
+        );
+        assert_eq!(
+            assess_capture_buffer(minimum, minimum - 1),
+            CaptureBufferAssessment::TooSmall {
+                minimum,
+                available: minimum - 1
+            }
+        );
     }
 
     #[test]
