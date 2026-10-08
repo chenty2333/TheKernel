@@ -197,6 +197,53 @@ pub const fn get_max_lane_count(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TcPhyFamily {
+    Icl,
+    TigerLake,
+    AlderLakeP,
+}
+
+/// ICL reserves TC cold except for legacy mode's AUX domain.
+// upstream: intel_tc.c icl_tc_phy_cold_off_domain()
+pub const fn icl_tc_phy_cold_off_domain(legacy_port: bool, aux: PowerDomain) -> PowerDomain {
+    if legacy_port {
+        aux
+    } else {
+        PowerDomain::TcColdOff
+    }
+}
+
+/// TGL always reserves the TC-cold power domain.
+// upstream: intel_tc.c tgl_tc_phy_cold_off_domain()
+pub const fn tgl_tc_phy_cold_off_domain() -> PowerDomain {
+    PowerDomain::TcColdOff
+}
+
+/// ADL-P uses the legacy AUX block except for TBT alternate mode.
+// upstream: intel_tc.c adlp_tc_phy_cold_off_domain()
+pub const fn adlp_tc_phy_cold_off_domain(mode: TcPortMode, aux: PowerDomain) -> PowerDomain {
+    if matches!(mode, TcPortMode::TbtAlt) {
+        PowerDomain::TcColdOff
+    } else {
+        aux
+    }
+}
+
+/// Platform dispatch for the three source cold-off domain policies above.
+pub const fn tc_phy_cold_off_domain(
+    family: TcPhyFamily,
+    mode: TcPortMode,
+    legacy_port: bool,
+    aux: PowerDomain,
+) -> PowerDomain {
+    match family {
+        TcPhyFamily::Icl => icl_tc_phy_cold_off_domain(legacy_port, aux),
+        TcPhyFamily::TigerLake => tgl_tc_phy_cold_off_domain(),
+        TcPhyFamily::AlderLakeP => adlp_tc_phy_cold_off_domain(mode, aux),
+    }
+}
+
 /// Derive the TC lane power domain from TC1's base domain.
 // upstream: intel_tc.c tc_port_power_domain()
 pub const fn tc_port_power_domain(port: TcPort) -> PowerDomain {
@@ -870,6 +917,42 @@ mod signal_level_tests {
     #[test]
     fn source_tc_mode_hpd_and_lane_count_helpers_match_i915() {
         assert_eq!(tc_port_mode_name(TcPortMode::TbtAlt), "tbt-alt");
+        assert_eq!(
+            tc_phy_cold_off_domain(
+                TcPhyFamily::Icl,
+                TcPortMode::Legacy,
+                true,
+                PowerDomain::AuxUsbc1
+            ),
+            PowerDomain::AuxUsbc1
+        );
+        assert_eq!(
+            tc_phy_cold_off_domain(
+                TcPhyFamily::TigerLake,
+                TcPortMode::Legacy,
+                true,
+                PowerDomain::AuxUsbc1
+            ),
+            PowerDomain::TcColdOff
+        );
+        assert_eq!(
+            tc_phy_cold_off_domain(
+                TcPhyFamily::AlderLakeP,
+                TcPortMode::DpAlt,
+                false,
+                PowerDomain::AuxUsbc1
+            ),
+            PowerDomain::AuxUsbc1
+        );
+        assert_eq!(
+            tc_phy_cold_off_domain(
+                TcPhyFamily::AlderLakeP,
+                TcPortMode::TbtAlt,
+                false,
+                PowerDomain::AuxUsbc1
+            ),
+            PowerDomain::TcColdOff
+        );
         assert_eq!(
             tc_phy_load_fia_params(3, true),
             FiaParams {
