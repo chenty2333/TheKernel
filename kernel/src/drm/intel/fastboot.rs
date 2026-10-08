@@ -23,7 +23,7 @@ use spin::Mutex;
 use super::{
     gmbus::PollTimer,
     gtt::{Binding, Gtt},
-    regs::{Meaning, Register, Registers, pipe as p},
+    regs::{self, Meaning, Register, Registers, pipe as p},
 };
 use crate::{
     drm::{
@@ -32,6 +32,12 @@ use crate::{
     },
     mm::{SharedFixedView, SharedPages},
 };
+
+// Compile the adjacent DPLL adapter in the host test build without adding a
+// production callsite or requiring the owner module to wire it yet.
+#[cfg(test)]
+#[path = "shared_dpll.rs"]
+mod shared_dpll_adapter_compile_check;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeMode {
@@ -263,14 +269,15 @@ impl<R: Registers> TcIo for PinnedIo<'_, R> {
     }
 }
 #[derive(Clone, Copy)]
-struct PowerPin {
+pub(super) struct PowerPin {
+    port: TcPort,
     offsets: [u32; 3],
     before: [u32; 3],
     masks: [u32; 3],
 }
 
 impl PowerPin {
-    fn acquire(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
+    pub(super) fn acquire(r: &impl Registers, port: TcPort) -> Result<Self, Error> {
         // i915 XELPD power map: PW1, PW2 and PWA; DDI_IO and legacy AUX.
         // AUX is the ADL-P legacy TC-cold blocker. No cold-exit/enable sequence
         // is attempted: every required well must already be live before writes.
@@ -291,6 +298,7 @@ impl PowerPin {
             }
         }
         let pin = Self {
+            port,
             offsets,
             before,
             masks,
@@ -325,6 +333,44 @@ impl PowerPin {
             }
         }
         Ok(())
+    }
+
+    /// Revalidate the long-lived fastboot lease before a shared-DPLL adapter
+    /// uses its read-only logical power references. This never requests or
+    /// releases a well: it proves the source-map-backed pin is still held,
+    /// DC states remain disabled, and the oscillator still matches the
+    /// firmware-captured DPLL reference clock.
+    pub(super) fn verify_dpll_context(
+        &self,
+        r: &impl Registers,
+        port: TcPort,
+        reference_khz: u32,
+    ) -> Result<(), Error> {
+        if self.port != port || port.index() > 1 {
+            return Err(Error::Refused);
+        }
+        self.held(r)?;
+        if read(r, 0x45504)? & super::power::DC_STATE_MASK != 0 {
+            return Err(Error::Refused);
+        }
+        let reference = match r
+            .read(regs::SKL_DSSM)
+            .ok_or(Error::Unavailable(regs::SKL_DSSM.offset()))?
+            >> 29
+        {
+            0 => 24_000,
+            1 => 19_200,
+            2 => 38_400,
+            _ => return Err(Error::Refused),
+        };
+        if reference != reference_khz {
+            return Err(Error::Refused);
+        }
+        Ok(())
+    }
+
+    pub(super) const fn port(&self) -> TcPort {
+        self.port
     }
     fn restore(&self, r: &impl Registers) -> Result<(), Error> {
         for i in (0..3).rev() {
@@ -2576,6 +2622,26 @@ mod tests {
         r.set(0x45444, 0);
         assert!(PowerPin::acquire(&r, TcPort::Tc1).is_err());
         assert!(r.inner.lock().log.is_empty());
+    }
+
+    #[test]
+    fn dpll_pin_context_is_read_only_and_rechecks_clock_dc_state_and_route() {
+        let r = Model::new();
+        let pin = PowerPin::acquire(&r, TcPort::Tc1).unwrap();
+        let writes = r.inner.lock().writes;
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc1, 24_000).is_ok());
+        assert_eq!(r.inner.lock().writes, writes, "verification is read-only");
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc2, 24_000).is_err());
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc1, 19_200).is_err());
+
+        r.set(0x45504, 1 << 30);
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc1, 24_000).is_err());
+        r.set(0x45504, 0);
+
+        let pin_req = 2 << 2;
+        let current = read(&r, 0x45404).unwrap();
+        r.set(0x45404, current & !pin_req);
+        assert!(pin.verify_dpll_context(&r, TcPort::Tc1, 24_000).is_err());
     }
     #[test]
     fn ownership_checks_exact_boot_aperture_stolen_pte_and_allocator_exclusion() {
