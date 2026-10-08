@@ -108,7 +108,7 @@ pub use control::{
     IoctlAction, IoctlError, IoctlKind, NetworkIoctlResult, WatchdogAction, WatchdogOutcome,
     media_change, process_ioctl, watchdog_tick,
 };
-pub use controller::{ControllerError, IwxController, RxServiceError};
+pub use controller::{ControllerError, IwxController, RxServiceError, SyncCommandError};
 pub use diagnostics::{
     BZ_ERROR_TABLE_MIN, DriverDebugStatus, ERROR_ELEMENT_SIZE_BYTES, ERROR_START_OFFSET_BYTES,
     ErrorLogError, FW_SYSASSERT_CPU_MASK, LEGACY_ERROR_TABLE_MIN, LMAC_ERROR_WORDS, TxRingDebug,

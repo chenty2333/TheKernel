@@ -9,8 +9,8 @@ use crate::{
     ApmError, AttachAllocationError, CsrAccess, DeviceFamily, DmaAllocator, DmaError, DmaRegion,
     FirmwareDmaImages, FirmwareImage, HostCommand, InterruptMasks, IwxAttachResources,
     IwxRegisters, RegisterError, allocate_attach_resources, initialize_firmware_sections,
-    initialize_init_firmware_sections, load_firmware, post_alive as configure_post_alive,
-    send_host_command, start_gen2_context, start_gen3_context,
+    initialize_init_firmware_sections, post_alive as configure_post_alive, send_host_command,
+    start_gen2_context, start_gen3_context,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +32,13 @@ pub enum RxServiceError<E> {
     Command(crate::CommandError),
     Dispatch(E),
     AllocationFailed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SyncCommandError<E> {
+    Command(crate::CommandError),
+    Receive(RxServiceError<E>),
+    Timeout,
 }
 
 /// Owned state shared by firmware commands, interrupt dispatch, and network datapath.
@@ -188,6 +195,51 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         Ok(completion_count)
     }
 
+    /// Submit a response-bearing command and pump RX notifications until its ACK or timeout.
+    // upstream: if_iwx.c iwx_send_cmd() synchronous response wait
+    pub fn send_command_wait<E>(
+        &mut self,
+        command: &HostCommand<'_>,
+        external: Option<&mut A::Region>,
+        mut dispatch: impl FnMut(&crate::RxPacket<'_>, crate::RxMbufPlan) -> Result<bool, E>,
+    ) -> Result<crate::CompletedCommand, SyncCommandError<E>> {
+        let ticket = self
+            .send_command(command, external)
+            .map_err(SyncCommandError::Command)?;
+        if ticket.asynchronous {
+            return Err(SyncCommandError::Command(
+                crate::CommandError::InvalidResponse,
+            ));
+        }
+        let mut elapsed = 0u64;
+        while elapsed < 1_000_000_000 {
+            self.process_rx_notifications(|packet, plan| dispatch(packet, plan))
+                .map_err(SyncCommandError::Receive)?;
+            if self
+                .command_slots
+                .is_acknowledged(ticket.index, ticket.generation)
+            {
+                if self.generation != ticket.generation {
+                    return Err(SyncCommandError::Command(
+                        crate::CommandError::GenerationChanged,
+                    ));
+                }
+                return self
+                    .command_slots
+                    .take_completed(ticket.index, ticket.generation)
+                    .map_err(SyncCommandError::Command);
+            }
+            self.registers.delay_us(1000);
+            elapsed += 1_000_000;
+        }
+        if self.generation == ticket.generation {
+            self.command_slots
+                .abandon_wait_response(ticket.index, ticket.generation)
+                .map_err(SyncCommandError::Command)?;
+        }
+        Err(SyncCommandError::Timeout)
+    }
+
     /// Publish Init/regular firmware context and wait for the matching ALIVE event.
     // upstream: if_iwx.c iwx_load_firmware()
     pub fn boot_firmware<E>(
@@ -195,9 +247,8 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         firmware: &FirmwareImage,
         init_ucode: bool,
         imr_enabled: bool,
-        mut wait_for_alive: impl FnMut(u64) -> Result<bool, E>,
+        mut wait_for_alive: impl FnMut(&mut Self, u64) -> Result<bool, E>,
     ) -> Result<(), ControllerError<E>> {
-        crate::enable_firmware_load_interrupts(&mut self.registers, &mut self.interrupt_masks);
         let mut images = if init_ucode {
             initialize_init_firmware_sections(&mut self.allocator, firmware)
         } else {
@@ -223,6 +274,27 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         } else {
             None
         };
+        crate::enable_firmware_load_interrupts(&mut self.registers, &mut self.interrupt_masks);
+        self.publish_firmware_context(&mut images, init, imr_enabled)?;
+        let alive = wait_for_alive(self, crate::FIRMWARE_ALIVE_TIMEOUT_NS);
+        if !matches!(alive, Ok(true)) {
+            images.free_paging();
+        }
+        iml_dma.take();
+        images.free_firmware_sections();
+        match alive {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ControllerError::FirmwareNotAlive),
+            Err(error) => Err(ControllerError::Wait(error)),
+        }
+    }
+
+    fn publish_firmware_context<E>(
+        &mut self,
+        images: &mut FirmwareDmaImages<A::Region>,
+        iml: Option<(u64, u32)>,
+        imr_enabled: bool,
+    ) -> Result<(), ControllerError<E>> {
         let family = self.family;
         let queues = crate::ContextQueueAddresses {
             free_rbd: self.resources.rx_queue.free_descriptors.device_address(),
@@ -230,71 +302,51 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             rx_status: self.resources.rx_queue.status.device_address(),
             command_queue: self.resources.tx_queues[0].descriptors.device_address(),
         };
-        let context_info = &mut self.resources.context_info;
-        let mut prph_scratch = self.resources.prph_scratch.as_mut();
+        let scratch_region = self.resources.prph_scratch.as_mut();
         let prph_info = self.resources.prph_info.as_ref();
-        let mut initialize_context =
-            |family: DeviceFamily, images: &mut FirmwareDmaImages<A::Region>| {
-                if family >= DeviceFamily::Ax210 {
-                    let scratch =
-                        crate::build_gen3_prph_scratch(0, queues.free_rbd, images, imr_enabled)
-                            .map_err(ControllerError::Context)?;
-                    let scratch_region = prph_scratch
-                        .as_deref_mut()
-                        .ok_or(ControllerError::Dma(DmaError::RegionTooSmall))?;
-                    scratch_region
-                        .write_at(0, &scratch)
-                        .map_err(ControllerError::Dma)?;
-                    let info_region =
-                        prph_info.ok_or(ControllerError::Dma(DmaError::RegionTooSmall))?;
-                    let context = crate::build_gen3_context(
-                        queues,
-                        info_region.device_address(),
-                        scratch_region.device_address(),
-                        scratch.len(),
-                    )
-                    .map_err(ControllerError::Context)?;
-                    context_info
-                        .write_at(0, &context)
-                        .map_err(ControllerError::Dma)?;
-                    let (iml_address, iml_size) =
-                        init.ok_or(ControllerError::Dma(DmaError::RegionTooSmall))?;
-                    start_gen3_context(
-                        &mut self.registers,
-                        context_info.device_address(),
-                        iml_address,
-                        iml_size,
-                    )
-                    .map_err(ControllerError::Register)?;
-                } else {
-                    let context = crate::build_gen2_context(0, queues, images)
-                        .map_err(ControllerError::Context)?;
-                    context_info
-                        .write_at(0, &context)
-                        .map_err(ControllerError::Dma)?;
-                    start_gen2_context(&mut self.registers, context_info.device_address())
-                        .map_err(ControllerError::Register)?;
-                }
-                Ok::<(), ControllerError<E>>(())
-            };
-        let alive = load_firmware::<A, ControllerError<E>>(
-            family,
-            &mut images,
-            &mut iml_dma,
-            |family, images| (&mut initialize_context)(family, images),
-            |timeout| wait_for_alive(timeout).map_err(ControllerError::Wait),
-        );
-        match alive {
-            Ok(()) => Ok(()),
-            Err(crate::FirmwareLoadError::Context(error)) => Err(error),
-            Err(crate::FirmwareLoadError::Wait(ControllerError::Wait(error))) => {
-                Err(ControllerError::Wait(error))
-            }
-            Err(crate::FirmwareLoadError::Wait(error)) => Err(error),
-            Err(crate::FirmwareLoadError::FirmwareNotAlive) => {
-                Err(ControllerError::FirmwareNotAlive)
-            }
+        if family >= DeviceFamily::Ax210 {
+            let scratch = crate::build_gen3_prph_scratch(0, queues.free_rbd, images, imr_enabled)
+                .map_err(ControllerError::Context)?;
+            let scratch_region =
+                scratch_region.ok_or(ControllerError::Dma(DmaError::RegionTooSmall))?;
+            scratch_region
+                .write_at(0, &scratch)
+                .map_err(ControllerError::Dma)?;
+            let info_region = prph_info.ok_or(ControllerError::Dma(DmaError::RegionTooSmall))?;
+            let context = crate::build_gen3_context(
+                queues,
+                info_region.device_address(),
+                scratch_region.device_address(),
+                scratch.len(),
+            )
+            .map_err(ControllerError::Context)?;
+            self.resources
+                .context_info
+                .write_at(0, &context)
+                .map_err(ControllerError::Dma)?;
+            let (iml_address, iml_size) =
+                iml.ok_or(ControllerError::Dma(DmaError::RegionTooSmall))?;
+            start_gen3_context(
+                &mut self.registers,
+                self.resources.context_info.device_address(),
+                iml_address,
+                iml_size,
+            )
+            .map_err(ControllerError::Register)?;
+        } else {
+            let context =
+                crate::build_gen2_context(0, queues, images).map_err(ControllerError::Context)?;
+            self.resources
+                .context_info
+                .write_at(0, &context)
+                .map_err(ControllerError::Dma)?;
+            start_gen2_context(
+                &mut self.registers,
+                self.resources.context_info.device_address(),
+            )
+            .map_err(ControllerError::Register)?;
         }
+        Ok(())
     }
 
     /// Configure the ICT and firmware-versioned TX rate format after ALIVE.
@@ -421,5 +473,42 @@ mod tests {
         assert_eq!(completed, 1);
         assert_eq!(seen, 1);
         assert!(!controller.registers.into_inner().writes.is_empty());
+    }
+
+    #[test]
+    fn synchronous_command_pumps_rx_until_descriptor_acknowledgement() {
+        let allocator = Allocator(Cell::new(0x200000));
+        let mut controller =
+            IwxController::attach(Bus::default(), allocator, DeviceFamily::Ax210, 0x300000, 9)
+                .unwrap();
+        controller
+            .resources
+            .rx_queue
+            .status
+            .write_at(0, &[1, 0])
+            .unwrap();
+        controller
+            .resources
+            .rx_queue
+            .used_descriptors
+            .write_at(4, &[0, 0])
+            .unwrap();
+        controller.resources.rx_queue.buffers[0]
+            .write_at(0, &[4, 0, 0, 0, 0x44, 0, 0, 0])
+            .unwrap();
+        let empty: [&[u8]; 0] = [];
+        let command = HostCommand {
+            id: 0x44,
+            flags: 0,
+            response_capacity: 0,
+            parts: &empty,
+        };
+
+        let completed = controller
+            .send_command_wait(&command, None, |_, _| Ok::<_, ()>(true))
+            .unwrap();
+        assert!(completed.response.is_none());
+        assert!(completed.external_payload_released);
+        assert_eq!(controller.command_slots.queued(), 0);
     }
 }

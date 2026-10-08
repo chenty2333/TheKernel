@@ -203,6 +203,13 @@ impl CommandSlots {
         self.queued
     }
 
+    /// Whether the descriptor ACK has reached the synchronous wait slot.
+    pub fn is_acknowledged(&self, index: usize, generation: u32) -> bool {
+        self.slots
+            .get(index)
+            .is_some_and(|slot| slot.active && slot.generation == generation && slot.acknowledged)
+    }
+
     /// Reserve the response buffer before publishing the TX descriptor.
     // upstream: if_iwx.c iwx_send_cmd()
     pub fn reserve(
