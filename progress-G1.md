@@ -19,3 +19,4 @@
 3l. Intel DPLL CRTC hook selection | 部分完成 | 9761878d | 翻译 `intel_dpll_init_clock_hook` 和 HSW `hsw_crtc_compute_clock` (display 12/13→HSW shared manager)；5 dpll tests pass.
 4. DDI transcoder/buffer helpers | 部分完成 | f1082fd6 | 从 `intel_ddi.c` 批量翻译 TBT/MG selector、DP buffer link/stagger、idle/active wait和display12/13 FUNC_CTL builder；5 ddi tests pass.
 4a. Combo DDI clock mux integration | 部分完成 | dc98de75 | 平台DPCLKA计划支持ICL/TGL/RKL/ADLS/ADLP/N/DG1并由kernel locked adapter在`output::program`里分两次RMW应用；kernel tests compile-check。
+4b. DDI buffer-translation tables | 部分完成 | pending | 翻译 i915 ICL HDMI/eDP、TGL/RKL/ADLS/ADLP combo 与 DKL DP/HDMI 表和平台 selector，ADL-N HDMI 默认 entry 6 已接入 modeset；`tk-intel-display` 97/97 tests、kernel test compile-check 和两项 lint 通过。完整 `intel_ddi_buf_trans.c` 仍待按函数覆盖。

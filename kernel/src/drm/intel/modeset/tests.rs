@@ -1019,10 +1019,14 @@ fn test_swing() -> SwingProgram {
     SwingProgram {
         level: 2,
         dw2: [0x0C; 4],
+        dw2_mask: u32::MAX,
         dw4: [0x30, 0x31, 0x31, 0x31],
+        dw4_mask: u32::MAX,
         dw5_training_disabled: 0x0000_0000,
+        dw5_mask: u32::MAX,
         dw5_training_enabled: 0x0002_0000,
         dw7: [0x0071; 4],
+        dw7_mask: u32::MAX,
         source: "test fixture, not sourced from the reference",
     }
 }

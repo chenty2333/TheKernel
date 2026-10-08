@@ -85,19 +85,12 @@
 //!
 //! # What this module cannot source, and what it does about it
 //!
-//! **The HDMI buffer-translation values are a real `[GAP]`.**  §8.5 selects
-//! `icl_combo_phy_trans_hdmi` for an HDMI port and then says in as many words:
-//! "`[GAP]` I did not extract its values"; §13.1 item 12 repeats it.  Those
-//! numbers are the voltage swing and pre-emphasis the PHY drives, and they are
-//! board-tuned -- §8.5's own note records that the DG1 PRM's table and i915's
-//! ADL-P table disagree for the same nominal levels.  There is no honest way to
-//! invent them, so [`OutputRequest::swing`] is a caller-supplied
-//! [`SwingProgram`] and a request without one fails at
-//! [`OutputProgram::plan`] with [`OutputError::MissingBufferTranslation`],
-//! naming the table and the section.  §13.4 says where the numbers come from:
-//! dump the registers of a *working* configuration and reuse them.  The
-//! `source` field of [`SwingProgram`] is there so the log says which dump they
-//! came from.
+//! The port's buffer-translation table is selected from the platform's i915
+//! table set (`intel_ddi_buf_trans_get`); an optional firmware dump can override
+//! the selected values. The ADL-N HDMI default is entry 6 of
+//! `icl_combo_phy_trans_hdmi`. This is a source-faithful platform table, not a
+//! claim that every connector's board-level signal integrity has been measured;
+//! hardware validation remains necessary.
 //!
 //! **`DDI_BUF_CTL.PHY_LINK_RATE` has no HDMI encoding in the reference.**
 //! §8.6 step 13 puts the field in the enable write and then gives a table of
@@ -400,14 +393,9 @@ impl PortType {
     /// The i915 buffer-translation table this port type selects, when the
     /// reference names one.
     ///
-    /// §8.5's "Which table" table: HDMI is `icl_combo_phy_trans_hdmi`.  DVI has
-    /// no row, so this returns `None` -- which is a fact about the reference,
-    /// not about the hardware, and is why the caller supplies the values.
+    /// DVI and HDMI TMDS use the same combo-PHY translation table in i915.
     const fn buffer_translation_table(self) -> Option<&'static str> {
-        match self {
-            Self::Hdmi => Some("icl_combo_phy_trans_hdmi"),
-            Self::Dvi => None,
-        }
+        Some("icl_combo_phy_trans_hdmi")
     }
 }
 
@@ -542,12 +530,15 @@ pub(crate) struct SwingProgram {
     /// (`[I915]` `display/intel_ddi.c:1148-1157`); the group instance is a
     /// different address and this sequence does not write it.
     pub(crate) dw2: [u32; 4],
+    pub(crate) dw2_mask: u32,
     /// `PORT_TX_DW4`, one value per lane, written in lane order 0 to 3.  §8.5
     /// step 2: the loadgen select differs per lane, so the group register must
     /// not be used.
     pub(crate) dw4: [u32; 4],
+    pub(crate) dw4_mask: u32,
     /// `PORT_TX_DW5` with TX training disabled, which is step 4's state.
     pub(crate) dw5_training_disabled: u32,
+    pub(crate) dw5_mask: u32,
     /// `PORT_TX_DW5` with the scaling mode set and TX training enabled, which
     /// is step 6's state and the write that triggers the update.
     pub(crate) dw5_training_enabled: u32,
@@ -555,10 +546,82 @@ pub(crate) struct SwingProgram {
     /// writes the lane instances here too
     /// (`[I915]` `display/intel_ddi.c:1171-1178`).
     pub(crate) dw7: [u32; 4],
-    /// Where these numbers came from.  Free text, printed in the log; §8.5's
-    /// values are a `[GAP]`, so a reader has to be able to see what was used
-    /// instead.
+    pub(crate) dw7_mask: u32,
+    /// Where these numbers came from. Printed in the plan log.
     pub(crate) source: &'static str,
+}
+
+/// Build the ADL-N combo-PHY default from i915's platform-selected table.
+/// The values are written through masks, preserving the unrelated bits in each
+/// PHY dword exactly as the i915 RMW sequence does.
+fn combo_default_swing(
+    port_type: PortType,
+    port_clock_khz: u32,
+) -> Result<SwingProgram, OutputError> {
+    use intel_display::ddi_buf_trans::{
+        BufferOutput, BufferPhy, DdiBufferTransEntry, DdiBufferTransRequest,
+        intel_ddi_buf_trans_get,
+    };
+    let output = match port_type {
+        PortType::Hdmi => BufferOutput::Hdmi,
+        PortType::Dvi => BufferOutput::Dvi,
+    };
+    let table = intel_ddi_buf_trans_get(DdiBufferTransRequest {
+        platform: intel_display::device::Platform::AlderLakeN,
+        phy: BufferPhy::Combo,
+        output,
+        port_clock_khz,
+        use_edp_low_vswing: false,
+        use_edp_hobl: false,
+    })
+    .map_err(|_| OutputError::MissingBufferTranslation {
+        port_type,
+        table: port_type.buffer_translation_table(),
+    })?;
+    let level = table
+        .hdmi_default_entry
+        .ok_or(OutputError::MissingBufferTranslation {
+            port_type,
+            table: Some(table.name),
+        })?;
+    let Some(DdiBufferTransEntry::Combo {
+        dw2_swing_sel,
+        dw7_n_scalar,
+        dw4_cursor_coeff,
+        dw4_post_cursor_2,
+        dw4_post_cursor_1,
+    }) = table.entries.get(usize::from(level)).copied()
+    else {
+        return Err(OutputError::MissingBufferTranslation {
+            port_type,
+            table: Some(table.name),
+        });
+    };
+    let dw2_mask = (1 << 15) | (0b111 << 11) | 0xff;
+    let dw4_mask = (1 << 31) | (0b11_1111 << 12) | (0b11_1111 << 6) | 0b11_1111;
+    let dw5_mask =
+        (1 << 31) | (1 << 30) | (1 << 29) | (1 << 26) | (1 << 25) | (0b111 << 18) | (0b111 << 3);
+    let dw2_value =
+        (u32::from(dw2_swing_sel >> 3) << 15) | (u32::from(dw2_swing_sel & 7) << 11) | 0x98;
+    let dw4_value = (u32::from(dw4_post_cursor_1) << 12)
+        | (u32::from(dw4_post_cursor_2) << 6)
+        | u32::from(dw4_cursor_coeff);
+    let dw7_value = u32::from(dw7_n_scalar) << 24;
+    let dw7_mask = 0x7f00_0000;
+    let dw5_value = (2 << 18) | (6 << 3) | (1 << 29);
+    Ok(SwingProgram {
+        level,
+        dw2: [dw2_value; 4],
+        dw2_mask,
+        dw4: [dw4_value; 4],
+        dw4_mask,
+        dw5_training_disabled: dw5_value,
+        dw5_mask,
+        dw5_training_enabled: dw5_value | (1 << 31),
+        dw7: [dw7_value; 4],
+        dw7_mask,
+        source: table.name,
+    })
 }
 
 /// Everything phase 5 needs told.
@@ -581,20 +644,16 @@ pub(crate) struct OutputRequest {
     /// Which `CFGCR1` field encoding to write.  No default: see the module
     /// documentation.
     pub(crate) encoding: PllFieldEncoding,
-    /// The voltage-swing values, or `None` to be refused with the `[GAP]`
-    /// named.  See [`SwingProgram`].
+    /// Optional explicit voltage-swing override. When absent, the platform
+    /// DDI buffer-translation table supplies the default level.
     pub(crate) swing: Option<SwingProgram>,
     /// `DDI_BUF_CTL.PHY_LINK_RATE`.  See [`LinkRate`].
     pub(crate) link_rate: LinkRate,
 }
 
 impl OutputRequest {
-    /// The first-light-up request: HDMI, four lanes, no swing values yet.
-    ///
-    /// `swing` starts as `None`, so this request does **not** program until
-    /// [`Self::with_swing`] supplies values: that is the §8.5 `[GAP]` doing its
-    /// job rather than a missing default.  `encoding` has no default either,
-    /// and [`PllFieldEncoding::Named`] is the one §6.3's worked example uses.
+    /// The first-light-up request: HDMI, four lanes. The platform table
+    /// supplies its default buffer-translation level unless overridden.
     pub(crate) const fn hdmi(ddi: Ddi, mode: Mode, encoding: PllFieldEncoding) -> Self {
         Self {
             pll_id: ddi.index() as u8,
@@ -650,6 +709,8 @@ struct PortRegisters {
     /// must not be used for this register.  The sequence reads these through
     /// [`TxLaneRegisters`], beside the other two per-lane dwords.
     tx_dw4: [Register; 4],
+    /// `PORT_TX_DW5` lane 0, the source read for both group writes.
+    tx_dw5_lane0: Register,
     /// `PORT_TX_DW5` (group): the training-enable and scaling-mode register,
     /// and the instance both batch writes go to
     /// (`[I915]` `display/intel_ddi.c:1146`, `:1221`, `:1229`).
@@ -686,6 +747,7 @@ const fn port_registers(phy: ComboPhy) -> PortRegisters {
                 port::PORT_TX_DW4_LN2_A,
                 port::PORT_TX_DW4_LN3_A,
             ],
+            tx_dw5_lane0: port::PORT_TX_DW5_LN0_A,
             tx_dw5: port::PORT_TX_DW5_GRP_A,
             tx_dw7: port::PORT_TX_DW7_GRP_A,
             ddi_buf_ctl: ddi::DDI_BUF_CTL_A,
@@ -703,6 +765,7 @@ const fn port_registers(phy: ComboPhy) -> PortRegisters {
                 port::PORT_TX_DW4_LN2_B,
                 port::PORT_TX_DW4_LN3_B,
             ],
+            tx_dw5_lane0: port::PORT_TX_DW5_LN0_B,
             tx_dw5: port::PORT_TX_DW5_GRP_B,
             tx_dw7: port::PORT_TX_DW7_GRP_B,
             ddi_buf_ctl: ddi::DDI_BUF_CTL_B,
@@ -874,7 +937,7 @@ pub(crate) struct OutputProgram {
     pub(crate) pll_registers: PllRegisters,
     /// The DDI-IO power well §8.6 step 5 enables.
     pub(crate) ddi_io_well: Well,
-    /// The voltage-swing values (never `None`: a plan without them is refused).
+    /// The selected voltage-swing values and per-field write masks.
     pub(crate) swing: SwingProgram,
     /// The `PHY_LINK_RATE` field and its provenance.
     pub(crate) link_rate: LinkRate,
@@ -935,14 +998,12 @@ impl OutputProgram {
             });
         }
 
-        // The one `[GAP]` this step cannot work around: §8.5's HDMI
-        // translation values were never extracted, so there is nothing to
-        // write.  A caller that has them (from a dump, §13.4) supplies them.
-        let Some(swing) = request.swing else {
-            return Err(OutputError::MissingBufferTranslation {
-                port_type: request.port_type,
-                table: request.port_type.buffer_translation_table(),
-            });
+        // The table selector follows intel_ddi_buf_trans_get() for the
+        // supported ADL-N combo-PHY HDMI/DVI route. Explicit firmware dumps
+        // remain an override for board-specific validation/replay.
+        let swing = match request.swing {
+            Some(swing) => swing,
+            None => combo_default_swing(request.port_type, request.mode.clock_khz)?,
         };
         if u32::from(swing.level) > BUF_TRANS_SELECT_MAX {
             return Err(OutputError::SwingLevelOutOfRange { level: swing.level });
@@ -1096,13 +1157,8 @@ impl OutputProgram {
             self.swing.level,
             self.swing.source,
             match self.port_type.buffer_translation_table() {
-                Some(table) => format!(
-                    "i915's table is `{table}`; the reference does not carry its values -- \
-                     section 8.5 [GAP]"
-                ),
-                None => String::from(
-                    "section 8.5 names no translation table for DVI and carries no values"
-                ),
+                Some(table) => format!("platform buffer-translation table `{table}`"),
+                None => String::from("unsupported output selection"),
             },
             self.swing.dw2,
             self.swing.dw4,
@@ -1354,17 +1410,37 @@ pub(crate) fn program(
     // write is step 6's training-enable, which is what commits the settings.
     let lanes = tx_lane_registers(phy);
     rmw(regs, registers.cl_dw5, 0, CL_DW5_SUS_CLOCK_CONFIG_MASK)?;
-    write(regs, registers.tx_dw5, plan.swing.dw5_training_disabled)?;
+    write_group_from_lane0(
+        regs,
+        registers.tx_dw5_lane0,
+        registers.tx_dw5,
+        plan.swing.dw5_mask,
+        plan.swing.dw5_training_disabled,
+    )?;
     for (register, value) in lanes.dw2.iter().zip(plan.swing.dw2) {
-        write(regs, *register, value)?;
+        rmw(regs, *register, plan.swing.dw2_mask, value)?;
     }
-    for (register, value) in lanes.dw4.iter().zip(plan.swing.dw4) {
-        write(regs, *register, value)?;
+    for (lane, (register, value)) in lanes.dw4.iter().zip(plan.swing.dw4).enumerate() {
+        let loadgen = if plan.pixel_clock_khz <= 600_000
+            && ((plan.width == PortWidth::Four && lane >= 1)
+                || (plan.width != PortWidth::Four && (lane == 1 || lane == 2)))
+        {
+            1 << 31
+        } else {
+            0
+        };
+        rmw(regs, *register, plan.swing.dw4_mask, value | loadgen)?;
     }
     for (register, value) in lanes.dw7.iter().zip(plan.swing.dw7) {
-        write(regs, *register, value)?;
+        rmw(regs, *register, plan.swing.dw7_mask, value)?;
     }
-    write(regs, registers.tx_dw5, plan.swing.dw5_training_enabled)?;
+    write_group_from_lane0(
+        regs,
+        registers.tx_dw5_lane0,
+        registers.tx_dw5,
+        plan.swing.dw5_mask,
+        plan.swing.dw5_training_enabled,
+    )?;
 
     // §8.6 step 7 -- power the lanes.  A read-modify-write so that whatever
     // else `PORT_CL_DW10` holds survives; the field is `[7:4]` (§8.2).
@@ -1612,14 +1688,8 @@ impl OutputError {
                 phy.dpll_index(),
             ),
             Self::MissingBufferTranslation { port_type, table } => format!(
-                "the {} buffer-translation values are not in the reference document, so this \
-                 sequence has nothing to write into the PHY's TX registers.  Section 8.5 selects \
-                 {} and then says \"[GAP] I did not extract its values\"; section 13.1 item 12 \
-                 repeats it.  These are the voltage-swing and pre-emphasis numbers, and they are \
-                 board-tuned -- section 8.5 records two PRMs disagreeing about them for the same \
-                 nominal level -- so they have to come from a register dump of a working \
-                 configuration (section 13.4) through OutputRequest::with_swing.  Nothing was \
-                 written",
+                "no buffer-translation table is available for {} on this platform (table {:?}); \
+                 nothing was written",
                 port_type.name(),
                 match table {
                     Some(table) => format!("`{table}`"),
@@ -1744,6 +1814,19 @@ fn rmw(
     let current = read(regs, register)?;
     write(regs, register, (current & !clear) | set)?;
     Ok(current)
+}
+
+/// Match i915's PORT_TX_DW5 sequence: read lane 0, then write the group
+/// instance with only the named fields changed.
+fn write_group_from_lane0(
+    regs: &impl Registers,
+    source: Register,
+    group: Register,
+    clear: u32,
+    set: u32,
+) -> Result<(), OutputError> {
+    let current = read(regs, source)?;
+    write(regs, group, (current & !clear) | set)
 }
 
 /// Poll a register until `mask` reads `value`, or the budget runs out.

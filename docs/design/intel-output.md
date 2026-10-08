@@ -333,7 +333,7 @@ screen the mode was supposed to light up.
 |---|---|
 | `UnsupportedDdi` | C or D: not a combo-PHY port (§8.1), Type-C/DKL deferred (§8.8). Refused before any write. |
 | `PllConfigRegisterMissing` | A PHY whose PLL `CFGCR0`/`CFGCR1` offsets are not in the table. Nothing raises it today: both combo PHYs have theirs. |
-| `MissingBufferTranslation` | §8.5's HDMI values are a `[GAP]`. Supply them, do not guess. |
+| `MissingBufferTranslation` | The selected platform/output combination has no source table or valid default entry. |
 | `HdmiScramblingNotImplemented` | The pixel clock is at or above the scrambling threshold; the sink-side SCDC enable does not exist here. |
 | `Pll(PllError)` | `pll.rs` refused the mode, the reference or the encoding. |
 | `PllPowerNeverCameUp` | `POWER_STATE` never set: the divider write would be dropped by an unpowered block. |
@@ -352,14 +352,11 @@ reader to check the mapping and the PLL, in that order, before the arithmetic.
 This is the list the task asked for: each item is a value that is *not* in the reference document,
 what was done instead, and what would close it.
 
-1. **The HDMI buffer-translation values.** §8.5 selects `icl_combo_phy_trans_hdmi` and then says in
-   as many words *"`[GAP]` I did not extract its values"*; §13.1 item 12 repeats it. They are the
-   voltage-swing and pre-emphasis numbers, and §8.5's own note records that the DG1 PRM and i915's
-   ADL-P table disagree about them for the same nominal level, so they are board-tuned rather than
-   derivable. **What was done:** `SwingProgram` is a caller field, and a request without one is
-   refused with `MissingBufferTranslation` before any write. **What closes it:** a register dump of
-   a working configuration (§13.4) — the same route §6.3 route 1 recommends for the dividers. The
-   tests use invented values whose `source` string says so, and they exercise the write order only.
+1. **The HDMI buffer-translation values.** §8.5 selects `icl_combo_phy_trans_hdmi` but does not
+   reproduce its values. The source-faithful default now comes from the display-12/13 i915 table
+   module `ddi_buf_trans.rs` (ADL-N uses the ICL HDMI table, level 6); `OutputRequest::with_swing`
+   remains an explicit override for validated firmware-register capture/replay. Table fidelity is
+   software-tested; connector-level signal margin still requires target hardware validation.
 2. **The `DW5` `TX Training Enable` and `Scaling Mode Sel` bit positions.** §8.5 names both fields
    and gives neither position, so the two `PORT_TX_DW5` states are caller-supplied dwords
    (`dw5_training_disabled`, `dw5_training_enabled`) rather than a value plus a bit computed from an

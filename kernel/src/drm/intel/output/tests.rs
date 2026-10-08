@@ -48,10 +48,9 @@ const STRAP_38_4: u32 = 38_400;
 
 /// Buffer-translation values that are *not* sourced from anything.
 ///
-/// The reference does not contain the HDMI table (§8.5 `[GAP]`, §13.1 item 12),
-/// which is why `swing` is a caller field at all.  These numbers exist to give
-/// the sequence something to write so that its order can be asserted; the
-/// `source` string says so, and the log carries it.
+/// A full-dword fixture used to test firmware-dump override/replay semantics.
+/// Distinct per-lane values let the tests distinguish lane writes from group
+/// writes; the values are not a hardware profile.
 ///
 /// `dw2` and `dw7` differ lane by lane on purpose.  The sequence writes them to
 /// four different addresses, and a test whose four values were equal could not
@@ -60,10 +59,14 @@ fn test_swing() -> SwingProgram {
     SwingProgram {
         level: 2,
         dw2: [0x0C, 0x1C, 0x2C, 0x3C],
+        dw2_mask: u32::MAX,
         dw4: [0x30, 0x31, 0x31, 0x31],
+        dw4_mask: u32::MAX,
         dw5_training_disabled: 0x0000_0000,
+        dw5_mask: u32::MAX,
         dw5_training_enabled: 0x0002_0000,
         dw7: [0x71, 0x72, 0x73, 0x74],
+        dw7_mask: u32::MAX,
         source: "test fixture, not sourced from the reference",
     }
 }
@@ -1334,29 +1337,23 @@ fn a_phy_without_its_pll_config_offsets_would_still_be_refused_by_name() {
     }
 }
 
-/// §8.5's HDMI translation values are a `[GAP]`, and the honest implementation
-/// is the one that says so before it writes anything.
+/// The ADL-N HDMI default is selected from the platform table before writes.
 #[test]
-fn the_hdmi_translation_values_are_a_named_gap_and_nothing_is_written() {
+fn hdmi_default_uses_adln_combo_translation_entry_six() {
     let regs = ready_mock();
-    let request = OutputRequest::hdmi(Ddi::A, target_mode(), PllFieldEncoding::Named);
-    let error = OutputProgram::plan(&request, STRAP_38_4).expect_err("no values to write");
-    match error {
-        OutputError::MissingBufferTranslation { port_type, table } => {
-            assert_eq!(port_type, PortType::Hdmi);
-            assert_eq!(table, Some("icl_combo_phy_trans_hdmi"));
-        }
-        other => panic!("wrong error: {other:?}"),
-    }
-    let text = error.describe();
-    for needle in ["[GAP]", "13.1 item 12", "icl_combo_phy_trans_hdmi", "13.4"] {
-        assert!(text.contains(needle), "{needle:?} missing from: {text}");
-    }
+    let plan = OutputProgram::plan(
+        &OutputRequest::hdmi(Ddi::A, target_mode(), PllFieldEncoding::Named),
+        STRAP_38_4,
+    )
+    .expect("ADL-N has an HDMI translation table");
+    assert_eq!(plan.swing.level, 6);
+    assert_eq!(plan.swing.source, "icl_combo_phy_trans_hdmi");
+    assert_eq!(plan.swing.dw2_mask, (1 << 15) | (0b111 << 11) | 0xff);
+    assert_eq!(plan.swing.dw4_mask & (1 << 31), 1 << 31);
+    assert_eq!(plan.swing.dw7[0] >> 24, 0x7f);
     assert!(regs.writes().is_empty());
 }
 
-/// A pixel clock at or above the HDMI scrambling threshold is refused rather
-/// than programmed half-way: the sink-side SCDC enable does not exist here.
 #[test]
 fn a_mode_that_needs_hdmi_scrambling_is_refused() {
     let mut mode = target_mode();
@@ -1806,18 +1803,6 @@ fn dvi_differs_from_hdmi_only_in_the_mode_select_and_has_no_named_table() {
     assert_eq!(dvi_plan.trans_clk_sel, hdmi_plan.trans_clk_sel);
     assert_eq!(dvi_plan.transconf, hdmi_plan.transconf);
 
-    dvi.swing = None;
-    let error = OutputProgram::plan(&dvi, STRAP_38_4).unwrap_err();
-    match error {
-        OutputError::MissingBufferTranslation { port_type, table } => {
-            assert_eq!(port_type, PortType::Dvi);
-            assert_eq!(table, None);
-        }
-        other => panic!("wrong error: {other:?}"),
-    }
-    assert!(
-        error
-            .describe()
-            .contains("names one for HDMI and none for DVI")
-    );
+    assert_eq!(dvi_plan.swing.source, "icl_combo_phy_trans_hdmi");
+    assert_eq!(dvi_plan.swing.level, 6);
 }

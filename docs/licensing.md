@@ -623,3 +623,7 @@ now recognizes display-12/13 TGL, RKL, ADL-S, ADL-P and ADL-N PCI IDs, their
 pre-GMD_ID stepping maps, DMC platform, version and default port tables
 (Copyright © 2023 Intel; ID values from MIT-licensed `pciids.h`, Copyright
 © 2013 Intel).
+
+`tk-intel-display/src/ddi_buf_trans.rs` translates display 12/13 DDI buffer-translation
+entry data and platform table selection from `intel_ddi_buf_trans.c` (MIT,
+Copyright © 2020 Intel). `LICENSE-MIT` is included in the crate.

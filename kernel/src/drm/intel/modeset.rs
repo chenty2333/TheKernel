@@ -1294,7 +1294,7 @@ pub(crate) struct ModeRequest<'a> {
     /// guess between the two conventions the sources disagree about.
     pub(crate) encoding: PllFieldEncoding,
     /// §8.5's voltage-swing values, or `None` when nobody has them, which
-    /// makes the sequence refuse with `output`'s `MissingBufferTranslation`
+    /// uses the platform table when `None`
     /// naming the table and §13.1 item 12.
     pub(crate) swing: Option<SwingProgram>,
     /// `DDI_BUF_CTL.PHY_LINK_RATE`.  §8.6 gives no sourced HDMI encoding for

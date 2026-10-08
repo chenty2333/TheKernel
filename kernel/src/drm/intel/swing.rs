@@ -604,10 +604,14 @@ pub(crate) fn read_firmware_swing<R: Registers>(
     Ok(SwingProgram {
         level,
         dw2,
+        dw2_mask: u32::MAX,
         dw4,
+        dw4_mask: u32::MAX,
         dw5_training_disabled: dw5 & !TX_TRAINING_EN,
+        dw5_mask: u32::MAX,
         dw5_training_enabled: dw5,
         dw7,
+        dw7_mask: u32::MAX,
         source: read_back_source(ddi, level),
     })
 }
