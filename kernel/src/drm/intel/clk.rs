@@ -32,23 +32,22 @@
 //!
 //! ## What is not here
 //!
-//! * **The PCode "prepare for change" handshake.**  `[I915]` `bxt_set_cdclk`
-//!   begins with `skl_pcode_request(SKL_PCODE_CDCLK_CONTROL,
-//!   SKL_CDCLK_PREPARE_FOR_CHANGE, ...)` and ends by writing the voltage level.
-//!   This kernel has no PCode mailbox, so neither is done.  The programming
-//!   path below is deliberately the shorter one §11 phase 1.4 gives for a
-//!   machine with no pipe running, and the omission is reported in
-//!   `docs/design/intel-power.md` rather than hidden.  It is only reached when
-//!   the firmware left no usable CDCLK, which on a machine whose firmware drove
-//!   the screen should not happen.
+//! * **PCode around initial CDCLK programming.**  The power bring-up caller now
+//!   uses the translated mailbox backend to send i915's PREPARE request before
+//!   `bring_up` programs a missing/unusable PLL, then writes the ICL/ADL-N
+//!   voltage level after readback. The runtime [`transition`] function is still
+//!   not invoked by atomic modeset and therefore does not yet receive those
+//!   notifications or own audio/PSR, GMBUS/AUX and vblank ordering.
 //! * **CDCLK crawl.** The boot-only [`bring_up`] path does not need it, but the
 //!   runtime [`transition`] adapter now translates the ratio/request/ack sequence
 //!   for platforms admitted with `has_crawl`. It reports warning-only timeouts
 //!   as i915 does. Its caller must still supply atomic modeset, PCode and
 //!   peripheral-lock ordering; no modeset call site currently invokes it.
-//! * **The voltage-level table.**  `[GAP]` — §4.6 and §13.1 item 6: the table
-//!   is Gen12-specific and was not verified against a PRM.  Since no PCode
-//!   write happens, no voltage level is computed.
+//! * **The voltage-level table.**  Initial setup uses i915's ICL thresholds
+//!   (0 through 312 MHz, 1 through 556.8 MHz, otherwise 2). The source is
+//!   `icl_calc_voltage_level`; the ADL-N row-to-voltage association has not
+//!   been confirmed against a public PRM, so only a source-derived table is
+//!   encoded. Runtime transitions still need this adapter.
 
 use alloc::{format, string::String};
 

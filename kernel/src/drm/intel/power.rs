@@ -694,6 +694,10 @@ pub(crate) struct PowerState {
     /// Refcounted pipe-A domain and its map-backed wells.
     pub(crate) power_domains: PowerDomainState,
     pub(crate) cdclk: clk::CdclkState,
+    /// PCODE acknowledged PREPARE when initial CDCLK state required a change.
+    pub(crate) pcode_cdclk_prepared: bool,
+    /// Voltage level accepted by PCODE after a newly programmed CDCLK.
+    pub(crate) pcode_voltage_level: Option<u8>,
     pub(crate) raw_clock: clk::RawClockState,
     pub(crate) dbuf: DbufState,
     pub(crate) workarounds: WorkaroundState,
@@ -846,6 +850,12 @@ impl PowerState {
             ));
         }
         line(self.cdclk.describe());
+        line(format!(
+            "PCode CDCLK: prepare acknowledged {}, voltage level {}",
+            u8::from(self.pcode_cdclk_prepared),
+            self.pcode_voltage_level
+                .map_or_else(|| String::from("unchanged"), |level| format!("{level}")),
+        ));
         line(self.raw_clock.describe());
         line(self.dbuf.describe());
         line(self.workarounds.describe());
@@ -906,6 +916,7 @@ pub(crate) enum PowerError {
         unwound: bool,
     },
     Clock(clk::ClockError),
+    Pcode(String),
     PowerDomain(String),
     /// No DBUF slice came up at all.
     DbufNeverPowered {
@@ -967,6 +978,7 @@ impl PowerError {
                 },
             ),
             Self::Clock(error) => error.describe(),
+            Self::Pcode(error) => format!("PCode CDCLK handshake failed: {error}"),
             Self::PowerDomain(error) => format!("i915 power-domain reference failed: {error}"),
             Self::DbufNeverPowered { readback } => format!(
                 "no DBUF slice came up: the four slice registers read {readback:#010x?} after \
@@ -1665,6 +1677,26 @@ fn bring_up_inner(
     // Phases 1.4 and 1.4b.  The raw clock is a clock and belongs with CDCLK;
     // it must also be right before any south display function is enabled, which
     // is not this phase, so doing it here satisfies that with margin.
+    let pcode_timer = super::gmbus::MonotonicTimer;
+    let clock_before = clk::observe(regs).map_err(|error| {
+        unwind(
+            regs,
+            we_requested,
+            "the CDCLK readout",
+            PowerError::Clock(error),
+        )
+    })?;
+    let pcode_cdclk_prepared = !clock_before.usable();
+    if pcode_cdclk_prepared {
+        super::pcode::prepare_cdclk_change(regs, &pcode_timer).map_err(|error| {
+            unwind(
+                regs,
+                we_requested,
+                "the PCode CDCLK prepare request",
+                PowerError::Pcode(format!("{error:?}")),
+            )
+        })?;
+    }
     let cdclk = clk::bring_up(regs).map_err(|error| {
         unwind(
             regs,
@@ -1673,6 +1705,31 @@ fn bring_up_inner(
             PowerError::Clock(error),
         )
     })?;
+    let pcode_voltage_level = if let Some(programmed) = cdclk.programmed {
+        let level = if programmed.entry.cdclk_khz <= 312_000 {
+            0
+        } else if programmed.entry.cdclk_khz <= 556_800 {
+            1
+        } else {
+            2
+        };
+        super::pcode::commit_cdclk_voltage(
+            regs,
+            &pcode_timer,
+            programmed.entry.cdclk_khz,
+        )
+        .map_err(|error| {
+            unwind(
+                regs,
+                we_requested,
+                "the PCode CDCLK voltage update",
+                PowerError::Pcode(format!("{error:?}")),
+            )
+        })?;
+        Some(level)
+    } else {
+        None
+    };
     let raw_clock = clk::bring_up_raw_clock(regs, fuses.sfuse_strap).map_err(|error| {
         unwind(
             regs,
@@ -1752,6 +1809,8 @@ fn bring_up_inner(
         pw1,
         power_domains,
         cdclk,
+        pcode_cdclk_prepared,
+        pcode_voltage_level,
         raw_clock,
         dbuf,
         workarounds,

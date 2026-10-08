@@ -204,18 +204,24 @@ that suggestion as `[INF]`.  This driver takes the `[INF]`: an error that is
 masked is an error nobody sees.  The register is *read*, so the log says what
 state it was left in rather than implying the question was never asked.
 
-### 3.8 The PCode handshake is not implemented
+### 3.8 PCode is connected for initial CDCLK setup, not runtime transitions
 
-`[I915]` `bxt_set_cdclk` opens with
-`skl_pcode_request(SKL_PCODE_CDCLK_CONTROL, SKL_CDCLK_PREPARE_FOR_CHANGE, ...)`
-and closes by writing the voltage level.  This kernel has no PCode mailbox, so
-neither happens.  The programming path used instead is the short one §11 phase
-1.4 gives for a machine with no pipe running, and it is only reached when the
-firmware left no usable CDCLK — which on a machine whose firmware drove the
-screen should not happen.  Related: CDCLK *crawl* (`has_cdclk_crawl` is set for
-`XE_LPD`) is unreachable by construction, because `bxt_de_pll_readout` reports a
-VCO of zero unless the PLL is enabled *and* locked, so every state that reaches
-the programming path is one i915 also treats as a disable/enable.
+The full MIT PCode mailbox translation is in
+`crates/ax/tk-intel-display/src/intel_pcode_full.rs`, with the N305 register,
+serialization and polling adapter in `kernel/src/drm/intel/pcode.rs`. When
+`clk::observe()` finds no usable firmware CDCLK, phase 1.4 now sends i915's
+`SKL_PCODE_CDCLK_CONTROL / SKL_CDCLK_PREPARE_FOR_CHANGE` request before writing
+the PLL and writes the voltage level only after PLL readback succeeds. Either
+mailbox failure stops bring-up and unwinds the PW_1 request owned by that call.
+The ICL voltage thresholds are 0 through 312 MHz, 1 through 556.8 MHz, and 2
+above that, as in `icl_calc_voltage_level()`; the ADL-N voltage association is
+source-derived but not confirmed by a public PRM.
+
+This does not wire runtime `clk::transition()` into atomic modeset: that path
+still needs PREPARE/post-voltage calls, modeset-lock ordering, vblank/audio/PSR
+quiescing and GMBUS/AUX locking. `cdclk::transition` remains unused by a kernel
+caller. Initial firmware-CDCLK keep needs no PCode transaction. CDCLK *crawl*
+remains unconnected for the same runtime sequencing reason.
 
 ### 3.9 Two steps of `icl_display_core_init` are not ported
 
@@ -247,9 +253,9 @@ Each is marked in the code where it is used.
    and printed, and the flag is asserted in a test.
 4. **The ADL-N raw clock frequency** (§4.8, §13.1 item 5).  Bridged as §3.6
    above.
-5. **The ADL-N CDCLK voltage-level table** (§4.6, §13.1 item 6).  Bridged by
-   not computing one: no PCode write happens, so no voltage level is needed.
-   If a PCode mailbox is added, this is the missing piece.
+5. **The ADL-N CDCLK voltage-level table** (§4.6, §13.1 item 6).  Initial
+   programming uses source-derived ICL thresholds and reports the selected
+   level to PCode. The association remains unverified against a PRM.
 6. **Which DBUF slices a given SKU populates** (§4.7, §13.1 item 3).  Bridged by
    reading each slice's state before requesting it, enabling all four from
    `XE_LPD`'s slice mask, and treating a partial result as a report rather than

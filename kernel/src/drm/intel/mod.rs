@@ -109,6 +109,7 @@ mod modeset;
 mod output;
 mod pattern;
 mod pci;
+mod pcode;
 mod phy;
 mod pipe;
 mod pll;
