@@ -737,9 +737,9 @@ fn management_response(request: &[u8]) -> AxResult<Vec<u8>> {
     const SET_LE: u16 = 13;
     const LOAD_LINK_KEYS: u16 = 18;
     const LOAD_LONG_TERM_KEYS: u16 = 19;
+    const LOAD_IRKS: u16 = 0x30;
     const DISCONNECT: u16 = 0x14;
     const PAIR_DEVICE: u16 = 0x19;
-    const LOAD_IRKS: u16 = 0x30;
     const START_DISCOVERY: u16 = 0x23;
     const STOP_DISCOVERY: u16 = 0x24;
     const UNKNOWN_COMMAND: u8 = 1;
@@ -919,6 +919,9 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
     const SET_BONDABLE: u16 = 9;
     const SET_SSP: u16 = 11;
     const SET_LE: u16 = 13;
+    const LOAD_LINK_KEYS: u16 = 18;
+    const LOAD_LONG_TERM_KEYS: u16 = 19;
+    const LOAD_IRKS: u16 = 0x30;
     const START_DISCOVERY: u16 = 0x23;
     const STOP_DISCOVERY: u16 = 0x24;
     const MGMT_SETTING_CONNECTABLE: u32 = 1 << 1;
@@ -940,6 +943,24 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
         return Err(AxError::InvalidInput);
     }
     let parameters = &request[6..];
+    let empty_key_load = (opcode == LOAD_LINK_KEYS
+        && valid_load_link_keys(parameters)
+        && u16::from_le_bytes([parameters[1], parameters[2]]) == 0)
+        || (opcode == LOAD_LONG_TERM_KEYS
+            && valid_load_long_term_keys(parameters)
+            && u16::from_le_bytes([parameters[0], parameters[1]]) == 0)
+        || (opcode == LOAD_IRKS
+            && valid_load_irks(parameters)
+            && u16::from_le_bytes([parameters[0], parameters[1]]) == 0);
+    if empty_key_load {
+        if usb_adapter(index).is_none() {
+            return Ok(None);
+        }
+        return Ok(Some((
+            management_command_complete(index, opcode, 0, &[])?,
+            None,
+        )));
+    }
     if opcode == START_DISCOVERY || opcode == STOP_DISCOVERY {
         if parameters.len() != 1 || !matches!(parameters[0], 1 | 6) {
             return Ok(None);

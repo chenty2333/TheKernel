@@ -24,7 +24,6 @@ DISCOVERING are listed as implemented local events. Current-settings and local
 response framing are covered in source tests, but no physical controller has
 validated the command sequences. `SET_DISCOVERABLE` currently accepts only
 timeout zero; discovery supports BR/EDR Inquiry or LE scan independently.
-LOAD_LINK_KEYS, LOAD_LONG_TERM_KEYS, LOAD_IRKS, PAIR_DEVICE, DISCONNECT,
-BREDR setting and other requested operations remain unsupported. Device Found, Connected/Disconnected and key events are not implemented.
+Empty LOAD_LINK_KEYS/LOAD_LONG_TERM_KEYS/LOAD_IRKS batches are accepted as no-op loads; non-empty key storage remains unsupported. PAIR_DEVICE, DISCONNECT, BREDR setting and other requested operations remain unsupported. Device Found, Connected/Disconnected and key events are not implemented.
 NEW_SETTINGS and DISCOVERING are fanned out to currently bound control
 sockets, but raw HCI event to mgmt event translation remains incomplete.
