@@ -6,7 +6,7 @@ from FreeBSD `sys/dev/sdhci/sdhci.h` at
 includes bounded host reset/clock/command/PIO, SD and MMC OCR initialization,
 CSD and EXT_CSD capacity/partition metadata parsing, CID identity and mmcsd
 card-ID formatting, CMD55 APP_CMD validation,
-SCR and SD Status decoding,
+SCR and SD Status decoding and best-effort reads,
 idempotent-command retries with CMD/DAT reset,
 function-separated MMC CMD8/OCR/CID/RCA/CSD/select/status initialization helpers,
 single/multi-block CMD17/18/24/25 I/O,

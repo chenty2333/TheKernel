@@ -1018,6 +1018,22 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.command(index, argument, flags, None, 0)
     }
 
+    // upstream: mmc.c mmc_app_send_scr() and mmc_app_sd_status()
+    fn application_data_command(
+        &mut self,
+        rca: u16,
+        index: u8,
+        data: &mut [u8],
+    ) -> Result<(), SdhciError> {
+        let prefix = self.command(SD_CMD_APP, u32::from(rca) << 16, SD_R1, None, 0)?;
+        if prefix.0[0] & (1 << 5) == 0 {
+            return Err(SdhciError::Controller(prefix.0[0]));
+        }
+        let block_size = data.len();
+        self.command(index, 0, SD_R1 | SD_DATA, Some(data), block_size)?;
+        Ok(())
+    }
+
     // upstream: mmc.c mmc_switch()
     fn mmc_switch(&mut self, index: u8, value: u8) -> Result<(), SdhciError> {
         let argument = (3 << 24) | (u32::from(index) << 16) | (u32::from(value) << 8);
@@ -1061,8 +1077,10 @@ impl<I: SdhciIo> SdhciHost<I> {
         data: Option<&mut [u8]>,
         block_size: usize,
     ) -> Result<SdhciResponse, SdhciError> {
-        let read = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
-            || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
+        let read = matches!(
+            index,
+            8 | SD_ACMD_SEND_SCR | SD_ACMD_SD_STATUS | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE
+        ) || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
         let retries = if data.is_none() || read { 3 } else { 1 };
         let mut data = data;
         let mut last_error = SdhciError::Timeout;
@@ -1136,8 +1154,13 @@ impl<I: SdhciIo> SdhciHost<I> {
                 mode |= SDHCI_TRNS_MULTI as u16;
             }
             if command_flags & SDHCI_CMD_DATA as u16 != 0
-                && (matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
-                    || matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21))
+                && (matches!(
+                    index,
+                    8 | SD_ACMD_SEND_SCR
+                        | SD_ACMD_SD_STATUS
+                        | SD_CMD_READ_SINGLE
+                        | SD_CMD_READ_MULTIPLE
+                ) || matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21))
             {
                 mode |= SDHCI_TRNS_READ as u16;
             }
@@ -1174,8 +1197,10 @@ impl<I: SdhciIo> SdhciHost<I> {
                         .checked_add(data_len as u64)
                         .is_some_and(|end| end <= u64::from(u32::MAX) + 1)
             });
-        let read_transfer = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
-            || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
+        let read_transfer = matches!(
+            index,
+            8 | SD_ACMD_SEND_SCR | SD_ACMD_SD_STATUS | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE
+        ) || (matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21) && data.is_some());
         if use_sdma {
             let dma = self
                 .dma
@@ -1364,6 +1389,8 @@ const SD_CMD_ERASE: u8 = 38;
 const SD_CMD_WRITE_SINGLE: u8 = 24;
 const SD_CMD_WRITE_MULTIPLE: u8 = 25;
 const SD_CMD_APP: u8 = 55;
+pub const SD_ACMD_SEND_SCR: u8 = 51;
+pub const SD_ACMD_SD_STATUS: u8 = 13;
 const SD_ACMD_OP_COND: u8 = 41;
 const SD_ACMD_SET_BUS_WIDTH: u8 = 6;
 const RSP_NONE: u16 = SDHCI_CMD_RESP_NONE as u16;
@@ -1505,6 +1532,8 @@ pub struct SdhciDisk<I: SdhciIo> {
     rca: u16,
     cid: MmcCid,
     csd: MmcCsd,
+    scr: Option<MmcScr>,
+    sd_status: Option<MmcSdStatus>,
     sectors: u64,
     high_capacity: bool,
     erase_group_sectors: u32,
@@ -1526,6 +1555,21 @@ impl<I: SdhciIo> SdhciDisk<I> {
         let rca = mmc_send_relative_addr(&mut host, mmc)?;
         let csd = mmc_send_csd(&mut host, rca)?;
         mmc_select_card(&mut host, rca)?;
+        let (scr, sd_status) = if mmc {
+            (None, None)
+        } else {
+            let mut raw_scr = [0u8; 8];
+            let scr = host
+                .application_data_command(rca, SD_ACMD_SEND_SCR, &mut raw_scr)
+                .ok()
+                .and_then(|()| decode_scr(&raw_scr));
+            let mut raw_status = [0u8; 64];
+            let sd_status = host
+                .application_data_command(rca, SD_ACMD_SD_STATUS, &mut raw_status)
+                .ok()
+                .map(|()| decode_sd_status(&raw_status));
+            (scr, sd_status)
+        };
         let csd_info = decode_csd(csd, mmc).ok_or(SdhciError::InvalidTransfer)?;
         let mut sectors = csd_info.capacity_bytes / 512;
         let mut erase_group_sectors = csd_info.erase_block_sectors;
@@ -1588,6 +1632,8 @@ impl<I: SdhciIo> SdhciDisk<I> {
             rca,
             cid,
             csd: csd_info,
+            scr,
+            sd_status,
             sectors,
             high_capacity,
             erase_group_sectors: erase_group_sectors.max(1),
@@ -1615,6 +1661,14 @@ impl<I: SdhciIo> SdhciDisk<I> {
 
     pub const fn csd(&self) -> MmcCsd {
         self.csd
+    }
+
+    pub const fn scr(&self) -> Option<MmcScr> {
+        self.scr
+    }
+
+    pub const fn sd_status(&self) -> Option<MmcSdStatus> {
+        self.sd_status
     }
 
     // upstream: mmcsd.c mmcsd_attach() user/boot partition publication
@@ -2509,6 +2563,8 @@ mod tests {
             rca: 1,
             cid: MmcCid::default(),
             csd: MmcCsd::default(),
+            scr: None,
+            sd_status: None,
             sectors: 16,
             high_capacity: true,
             erase_group_sectors: 1,
@@ -2532,6 +2588,8 @@ mod tests {
             rca: 1,
             cid: MmcCid::default(),
             csd: MmcCsd::default(),
+            scr: None,
+            sd_status: None,
             sectors: 10_000,
             high_capacity: true,
             erase_group_sectors: 1,
@@ -2567,6 +2625,8 @@ mod tests {
             rca: 1,
             cid: MmcCid::default(),
             csd: MmcCsd::default(),
+            scr: None,
+            sd_status: None,
             sectors: 10,
             high_capacity: true,
             erase_group_sectors: 1,
