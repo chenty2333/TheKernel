@@ -10,8 +10,8 @@
 //!
 //! # What is deliberately not here
 //!
-//! * **No interrupts.**  This driver polls.  The bring-up phase masked every
-//!   interrupt source and nothing unmasks one, so [`NetDriverOps::can_receive`]
+//! * **No interrupts.**  This driver polls.  Translated attach masks interrupt
+//!   sources and no current interface unmasks them, so [`NetDriverOps::can_receive`]
 //!   and [`NetDriverOps::receive`] mean exactly what they say: a descriptor has
 //!   been written back, or it has not yet.
 //! * **No segmentation, no checksum offload, no VLAN insertion, no
@@ -22,8 +22,9 @@
 //!   driver does not adjust it.
 //! * **One queue in each direction**, which is what `NetDriverOps` describes.
 //!   The vendor driver runs one to four.
-//! * **No flow control, no receive-filter programming, no RSS.**  The design
-//!   note lists these with their consequences.
+//! * **No RSS or multicast address hashing.**  The translated shared setup
+//!   programs flow control and the RAR filter; the single-queue stack boundary
+//!   does not expose RSS steering or multicast-list updates.
 //!
 //! # The invariant that matters
 //!
@@ -49,20 +50,22 @@ use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 use super::{
     DMA_PAGE_BYTES, IgcBus, IgcHal, WindowBus,
     api::IgcHardware,
-    bringup::StationAddress,
     desc::{
-        BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES,
-        RxRing, TxRing,
+        BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES, RxRing,
+        TxRing,
     },
-    if_igc::{IgcMainIo, IgcRssIo, MainError, RingDma, UnitConfig},
+    if_igc::{
+        IgcMainIo, IgcRssIo, MainError, RingDma, UnitConfig, igc_initialize_receive_unit,
+        igc_initialize_transmit_unit,
+    },
+    mac::FlowMode,
+    regs::{self, DeviceControl, DeviceStatus, QueueControl, RingLength, bits},
+    station::StationAddress,
     txrx::{
         RxRingState, TxChecksum, TxIpType, TxPacketInfo, TxProtocol, TxRingState, TxRxError,
-        TxRxIo, TxSegment, igc_isc_rxd_available, igc_isc_rxd_pkt_get, igc_isc_rxd_refill,
-        igc_isc_rxd_available_from, igc_isc_txd_encap,
+        TxRxIo, TxSegment, igc_isc_rxd_available, igc_isc_rxd_available_from, igc_isc_rxd_pkt_get,
+        igc_isc_rxd_refill, igc_isc_txd_encap,
     },
-    regs::{self, QueueControl, RingLength},
-    if_igc::{igc_initialize_receive_unit, igc_initialize_transmit_unit},
-    mac::FlowMode,
 };
 use crate::{EthernetAddress, NetBufPtr, NetDriverOps};
 
@@ -164,8 +167,7 @@ impl Stats {
     pub fn describe(&self) -> alloc::string::String {
         alloc::format!(
             "tx {} frames/{} bytes, rx {} frames/{} bytes, recycled tx {} rx {}, dropped {} \
-             (foreign pointers {}, transmit ring full {}, register \
-             writes refused {})",
+             (foreign pointers {}, transmit ring full {}, register writes refused {})",
             self.transmitted,
             self.transmitted_bytes,
             self.received,
@@ -379,12 +381,9 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
         if self.rx_ring.outstanding() == 0 {
             return false;
         }
-        igc_isc_rxd_available_from(
-            QS,
-            self.rx_ring.next_to_clean(),
-            0,
-            |index| self.rx_memory.rx_status_error(index).unwrap_or(0),
-        ) != 0
+        igc_isc_rxd_available_from(QS, self.rx_ring.next_to_clean(), 0, |index| {
+            self.rx_memory.rx_status_error(index).unwrap_or(0)
+        }) != 0
     }
 
     /// Whether a frame can be handed to the hardware right now.
@@ -416,10 +415,7 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
             }
             let descriptor = self.rx_source_state.desc[index];
             let descriptor_address = u64::from(descriptor[0]) | (u64::from(descriptor[1]) << 32);
-            match self
-                .rx_ring
-                .fill(&mut self.rx_memory, descriptor_address)
-            {
+            match self.rx_ring.fill(&mut self.rx_memory, descriptor_address) {
                 Ok(index) => self.rx_owner[index] = slot,
                 Err(_) => {
                     self.rx_free.push(slot);
@@ -725,10 +721,7 @@ impl<H: IgcHal, const QS: usize> Drop for IgcNic<H, QS> {
             .write(named("IGC_TXDCTL(0)"), QueueControl::disabled().raw());
         // Posted queue-disable writes are not proof that outstanding DMA has
         // completed. Reuse the reset path's bounded PCIe-master handshake.
-        if matches!(
-            super::bringup::disable_pcie_master(&mut self.bus),
-            Ok(Some(_))
-        ) {
+        if stop_master_before_dma_free(&mut self.bus) {
             // SAFETY: the device reported that it can no longer access these
             // pages. This is the sole destruction of these four owners.
             unsafe { ManuallyDrop::drop(&mut self.allocations) };
@@ -736,6 +729,37 @@ impl<H: IgcHal, const QS: usize> Drop for IgcNic<H, QS> {
             log::warn!("igc: DMA stop was not confirmed; retaining ring and packet memory");
         }
     }
+}
+
+/// Teardown-only PCIe master handshake. The full adapter path uses the
+/// translated `igc_disable_pcie_master_generic`; this narrow bus-only form is
+/// needed because `Drop` cannot borrow the NVM/PHY side of `I225RegisterIo`.
+fn stop_master_before_dma_free<B: IgcBus>(bus: &mut B) -> bool {
+    let Some(control_register) = regs::named("IGC_CTRL") else {
+        return false;
+    };
+    let Some(status_register) = regs::named("IGC_STATUS") else {
+        return false;
+    };
+    let Some(control) = bus.read(control_register) else {
+        return false;
+    };
+    if !bus.write(
+        control_register,
+        DeviceControl::new(control).with_master_disabled().raw(),
+    ) {
+        return false;
+    }
+    for _ in 0..bits::MASTER_DISABLE_TIMEOUT {
+        let Some(status) = bus.read(status_register) else {
+            return false;
+        };
+        if !DeviceStatus::new(status).master_enabled() {
+            return true;
+        }
+        bus.delay_us(2_000);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -988,8 +1012,16 @@ mod tests {
         // The source initializes ordinary MTU receive control and does not
         // write RLPML until jumbo MTU is requested.
         assert_eq!(harness.register("IGC_RCTL"), 0x0400_8002);
-        assert_eq!(harness.register("IGC_RLPML"), 0, "source writes RLPML only for jumbo MTU");
-        assert_eq!(harness.register("IGC_RXCSUM"), 0, "single queue disables checksum offload");
+        assert_eq!(
+            harness.register("IGC_RLPML"),
+            0,
+            "source writes RLPML only for jumbo MTU"
+        );
+        assert_eq!(
+            harness.register("IGC_RXCSUM"),
+            0,
+            "single queue disables checksum offload"
+        );
         assert_eq!(harness.register("IGC_TCTL"), 0x0100_00fa);
         assert_eq!(
             harness.register("IGC_SRRCTL(0)"),
@@ -1014,7 +1046,10 @@ mod tests {
                 "descriptor {index}",
             );
             let shadow = harness.nic.rx_source_state.desc[index];
-            assert_eq!(u64::from(shadow[0]) | (u64::from(shadow[1]) << 32), expected);
+            assert_eq!(
+                u64::from(shadow[0]) | (u64::from(shadow[1]) << 32),
+                expected
+            );
             // The length field is clear, so a stale value cannot look like a
             // frame.
             assert_eq!(
@@ -1201,11 +1236,16 @@ mod tests {
         let slot = harness.nic.transmit_slot(&buffer).unwrap();
         let expected_address = harness.nic.tx_pool.bus_address(slot).unwrap();
         harness.nic.transmit(buffer).unwrap();
-        assert_eq!(harness.descriptor_address(tx_descriptors, 0), expected_address);
+        assert_eq!(
+            harness.descriptor_address(tx_descriptors, 0),
+            expected_address
+        );
         let command = harness.word(tx_descriptors, 2 * 4);
         assert_eq!(command & 0x0030_0000, 0x0030_0000); // advanced data type
-        assert_eq!(command & (0x0100_0000 | 0x0200_0000 | 0x0800_0000 | 0x2000_0000),
-            0x0100_0000 | 0x0200_0000 | 0x0800_0000 | 0x2000_0000);
+        assert_eq!(
+            command & (0x0100_0000 | 0x0200_0000 | 0x0800_0000 | 0x2000_0000),
+            0x0100_0000 | 0x0200_0000 | 0x0800_0000 | 0x2000_0000
+        );
         assert_eq!(command & 0xffff, 64);
         assert_eq!(harness.word(tx_descriptors, 3 * 4), 64 << 14);
     }
@@ -1300,11 +1340,7 @@ mod tests {
     #[test]
     fn source_reported_receive_error_is_reclaimed_without_delivery() {
         let mut harness = Harness::new();
-        harness.receive_frame(
-            0,
-            60,
-            bits::RXD_STAT_DD | bits::RXD_STAT_EOP | 0x8000_0000,
-        );
+        harness.receive_frame(0, 60, bits::RXD_STAT_DD | bits::RXD_STAT_EOP | 0x8000_0000);
         assert!(harness.nic.can_receive());
         assert!(matches!(harness.nic.receive(), Err(DevError::Again)));
         assert_eq!(harness.nic.stats().rx_dropped, 1);

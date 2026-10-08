@@ -1025,7 +1025,7 @@ fn probe(
         return Some(None);
     }
     let status = <I225RegisterIo<'_, IgcHalImpl> as IgcI225Io>::read(&mut mac_io, STATUS);
-    let station = axdriver_net::igc::bringup::StationAddress {
+    let station = axdriver_net::igc::StationAddress {
         bytes: source_mac,
         low: <I225RegisterIo<'_, IgcHalImpl> as IgcI225Io>::read(&mut mac_io, 0x05400),
         high: <I225RegisterIo<'_, IgcHalImpl> as IgcI225Io>::read(&mut mac_io, 0x05404),

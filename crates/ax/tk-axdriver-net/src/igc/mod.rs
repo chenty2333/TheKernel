@@ -31,19 +31,17 @@
 //!    accessor where the field encoding is non-trivial, and an access rule the
 //!    window enforces -- including the two registers whose *read* has a side
 //!    effect, which the identify-only phase's register list therefore excludes.
-//! 3. **Reset, station address and link.**  [`bringup`]: stop the MAC's DMA
-//!    engine, reset the part, wait for the NVM auto-read, read the station
-//!    address out of the receive-address registers, ask the PHY to
-//!    autonegotiate and wait for link, then report speed and duplex.  It sets
-//!    up no descriptor ring, so nothing can be sent or received yet, and it
-//!    writes no PHY register -- the advertisement the firmware left is the one
-//!    used, which is stated as a limitation rather than hidden.
+//! 3. **Shared hardware setup.**  [`api`], [`i225`], [`mac`], [`nvm`], and
+//!    [`phy`] carry the translated FreeBSD function tables and operations.
+//!    The platform binds those operations to bounded MMIO, PCI, NVM and MDIC
+//!    adapters before the NIC is published.
+//! 4. **Packet path.**  [`if_igc`] and [`txrx`] translate queue initialization,
+//!    descriptor setup, transmit completion, receive refill and packet
+//!    parsing. [`nic`] maps those operations to `NetDriverOps` and owned DMA.
 //!
-//! The phase that follows -- descriptor rings and the `NetDriverOps`
-//! implementation -- arrives as its own change, and the driver grows into the
-//! table the second phase declares.  Nothing below claims to be finished, and
-//! the module documentation of each later phase states what it does *not*
-//! establish.
+//! The former hand-written probe/link sequence is retained only as a host-test
+//! model (`cfg(test)`); it is not compiled into the product driver or called
+//! by the live probe.
 //!
 //! # What cannot be verified here
 //!
@@ -57,18 +55,20 @@
 
 pub mod api;
 pub mod base;
-pub mod nvm;
-pub mod mac;
-pub mod phy;
-pub mod txrx;
-pub mod if_igc;
-pub mod bringup;
+#[cfg(test)]
+pub(crate) mod bringup;
 pub mod desc;
 pub mod i225;
 pub mod ids;
+pub mod if_igc;
+pub mod mac;
 pub mod nic;
+pub mod nvm;
+pub mod phy;
 pub mod probe;
 pub mod regs;
+pub mod station;
+pub mod txrx;
 
 #[cfg(test)]
 pub(crate) mod fake;
@@ -76,7 +76,6 @@ pub(crate) mod fake;
 use core::{marker::PhantomData, ptr::NonNull, time::Duration};
 
 pub use self::{
-    bringup::{BringUp, BringUpError, LinkOutcome, StationAddress},
     desc::{
         BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES,
         ReceivedFrame, RingError, RxRing, TxRing,
@@ -88,6 +87,7 @@ pub use self::{
         Access, DeviceControl, DeviceStatus, Meaning, NvmControl, ReceiveAddressHigh, Register,
         RegisterWindow, Speed, WINDOW_BYTES, assemble_receive_address, named,
     },
+    station::StationAddress,
 };
 
 /// A physical address as the device sees it.
