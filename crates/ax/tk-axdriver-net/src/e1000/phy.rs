@@ -153,6 +153,9 @@ const IGP02E1000_PM_D3_LPLU: u16 = 0x0004;
 const PHY_FORCE_LIMIT: u32 = 20;
 const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
+const BM_WUC_PAGE: u32 = 800;
+const BM_PHY_PAGE_SELECT: u32 = 22;
+const IGP_PAGE_SHIFT: u32 = 5;
 const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
 const KMRNCTRLSTA_OFFSET_SHIFT: u32 = 16;
 const KMRNCTRLSTA_REN: u32 = 0x0020_0000;
@@ -767,6 +770,128 @@ pub trait E1000PhyMdicOps: E1000RegisterIo {
     fn acquire(&mut self) -> DevResult;
     fn release(&mut self);
     fn set_phy_address(&mut self, _address: u8) {}
+}
+
+/// upstream: e1000_phy.c e1000_get_phy_addr_for_bm_page()
+pub const fn get_phy_addr_for_bm_page(page: u32, register: u32) -> u8 {
+    if page >= 768 || (page == 0 && register == 25) || register == 31 {
+        1
+    } else {
+        2
+    }
+}
+
+fn read_phy_reg_bm_internal<I, W>(
+    io: &mut I,
+    offset: u32,
+    bm2: bool,
+    mut read_wakeup: W,
+) -> DevResult<u16>
+where
+    I: E1000PhyMdicOps,
+    W: FnMut(&mut I, u32) -> DevResult<u16>,
+{
+    io.acquire()?;
+    let result = (|| {
+        let page = offset >> IGP_PAGE_SHIFT;
+        if page == BM_WUC_PAGE {
+            return read_wakeup(io, offset);
+        }
+        let address = if bm2 {
+            1
+        } else {
+            get_phy_addr_for_bm_page(page, offset)
+        };
+        io.set_phy_address(address);
+        if offset > MAX_PHY_MULTI_PAGE_REG {
+            let (page_select, page_value) = if bm2 {
+                (BM_PHY_PAGE_SELECT, page as u16)
+            } else if address == 1 {
+                (IGP01E1000_PHY_PAGE_SELECT, (page << IGP_PAGE_SHIFT) as u16)
+            } else {
+                (BM_PHY_PAGE_SELECT, page as u16)
+            };
+            io.write_mdic(page_select, page_value)?;
+        }
+        io.read_mdic(offset & MAX_PHY_REG_ADDRESS)
+    })();
+    io.release();
+    result
+}
+
+fn write_phy_reg_bm_internal<I, W>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    bm2: bool,
+    mut write_wakeup: W,
+) -> DevResult
+where
+    I: E1000PhyMdicOps,
+    W: FnMut(&mut I, u32, u16) -> DevResult,
+{
+    io.acquire()?;
+    let result = (|| {
+        let page = offset >> IGP_PAGE_SHIFT;
+        if page == BM_WUC_PAGE {
+            return write_wakeup(io, offset, data);
+        }
+        let address = if bm2 {
+            1
+        } else {
+            get_phy_addr_for_bm_page(page, offset)
+        };
+        io.set_phy_address(address);
+        if offset > MAX_PHY_MULTI_PAGE_REG {
+            let (page_select, page_value) = if bm2 {
+                (BM_PHY_PAGE_SELECT, page as u16)
+            } else if address == 1 {
+                (IGP01E1000_PHY_PAGE_SELECT, (page << IGP_PAGE_SHIFT) as u16)
+            } else {
+                (BM_PHY_PAGE_SELECT, page as u16)
+            };
+            io.write_mdic(page_select, page_value)?;
+        }
+        io.write_mdic(offset & MAX_PHY_REG_ADDRESS, data)
+    })();
+    io.release();
+    result
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_bm()
+pub fn write_phy_reg_bm<I, W>(io: &mut I, offset: u32, data: u16, write_wakeup: W) -> DevResult
+where
+    I: E1000PhyMdicOps,
+    W: FnMut(&mut I, u32, u16) -> DevResult,
+{
+    write_phy_reg_bm_internal(io, offset, data, false, write_wakeup)
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_bm()
+pub fn read_phy_reg_bm<I, W>(io: &mut I, offset: u32, read_wakeup: W) -> DevResult<u16>
+where
+    I: E1000PhyMdicOps,
+    W: FnMut(&mut I, u32) -> DevResult<u16>,
+{
+    read_phy_reg_bm_internal(io, offset, false, read_wakeup)
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_bm2()
+pub fn read_phy_reg_bm2<I, W>(io: &mut I, offset: u32, read_wakeup: W) -> DevResult<u16>
+where
+    I: E1000PhyMdicOps,
+    W: FnMut(&mut I, u32) -> DevResult<u16>,
+{
+    read_phy_reg_bm_internal(io, offset, true, read_wakeup)
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_bm2()
+pub fn write_phy_reg_bm2<I, W>(io: &mut I, offset: u32, data: u16, write_wakeup: W) -> DevResult
+where
+    I: E1000PhyMdicOps,
+    W: FnMut(&mut I, u32, u16) -> DevResult,
+{
+    write_phy_reg_bm_internal(io, offset, data, true, write_wakeup)
 }
 
 /// upstream: e1000_phy.c e1000_get_cfg_done_generic()
@@ -2426,6 +2551,43 @@ mod tests {
         assert_eq!(diagnostics.cable_polarity, Some(CablePolarity::Reversed));
         assert!(diagnostics.is_mdix);
         assert_eq!(diagnostics.cable_length, CABLE_LENGTH_UNDEFINED);
+    }
+
+    #[test]
+    fn generic_bm_page_access_selects_phy_and_page_and_honors_wakeup_callback() {
+        assert_eq!(get_phy_addr_for_bm_page(768, 2), 1);
+        assert_eq!(get_phy_addr_for_bm_page(0, 25), 1);
+        assert_eq!(get_phy_addr_for_bm_page(3, 4), 2);
+        let mut io = Io {
+            mdic_data: 0xabcd,
+            ..Io::default()
+        };
+        assert_eq!(
+            read_phy_reg_bm(&mut io, (1 << IGP_PAGE_SHIFT) | 4, |_, _| Ok(0)).unwrap(),
+            0xabcd
+        );
+        assert_eq!(io.phy_address, 2);
+        assert_eq!(io.mdic_writes[0], (BM_PHY_PAGE_SELECT, 1));
+        assert_eq!(io.mdic_reads, [4]);
+        assert_eq!((io.locks, io.unlocks), (1, 1));
+
+        io.mdic_writes.clear();
+        write_phy_reg_bm2(&mut io, (2 << IGP_PAGE_SHIFT) | 6, 0x1234, |_, _, _| Ok(())).unwrap();
+        assert_eq!(io.phy_address, 1);
+        assert_eq!(io.mdic_writes, [(BM_PHY_PAGE_SELECT, 2), (6, 0x1234)]);
+        let wuc = (BM_WUC_PAGE << IGP_PAGE_SHIFT) | 0x01;
+        assert_eq!(
+            read_phy_reg_bm(&mut io, wuc, |_, offset| Ok(offset as u16)).unwrap(),
+            wuc as u16
+        );
+        assert!(
+            write_phy_reg_bm(&mut io, wuc, 0x55aa, |_, offset, data| {
+                assert_eq!(offset, wuc);
+                assert_eq!(data, 0x55aa);
+                Ok(())
+            })
+            .is_ok()
+        );
     }
 
     #[test]
