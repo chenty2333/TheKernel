@@ -7,7 +7,10 @@
 
 use alloc::vec::Vec;
 
-use crate::{HeCapabilities, HtCapabilities, HtOperation, RATE_MAX_SIZE, RateSet, VhtCapabilities};
+use crate::{
+    EdcaAcParams, HeCapabilities, HtCapabilities, HtOperation, RATE_MAX_SIZE, RateSet,
+    VhtCapabilities,
+};
 
 pub const ELEMID_SSID: u8 = 0;
 pub const ELEMID_RATES: u8 = 1;
@@ -19,6 +22,11 @@ pub const ELEMID_EXTENSION: u8 = 255;
 pub const ELEMID_EXT_HE_CAPS: u8 = 35;
 pub const ELEMID_RSN: u8 = 48;
 pub const ELEMID_VENDOR: u8 = 221;
+pub const ELEMID_EDCA_PARAMS: u8 = 12;
+pub const ELEMID_QOS_CAPABILITY: u8 = 46;
+pub const WMM_IE_STA_QOSINFO_AC_MASK: u8 = 0x0f;
+pub const WMM_IE_STA_QOSINFO_SP_MASK: u8 = 0x03;
+pub const WMM_IE_STA_QOSINFO_SP_SHIFT: u8 = 5;
 pub const CIPHER_USE_GROUP: u32 = 0x01;
 pub const CIPHER_WEP40: u32 = 0x02;
 pub const CIPHER_TKIP: u32 = 0x04;
@@ -270,6 +278,123 @@ pub fn append_wpa_ie(output: &mut Vec<u8>, policy: &RsnIePolicy) -> Result<(), I
     append_ie(output, ELEMID_VENDOR, &body)
 }
 
+const fn edca(aifsn: u8, ecw_min: u8, ecw_max: u8, txop_limit: u16) -> EdcaAcParams {
+    EdcaAcParams {
+        admission_control_mandatory: false,
+        aifsn,
+        ecw_min,
+        ecw_max,
+        txop_limit,
+    }
+}
+
+fn source_edca_table(mode: crate::PhyMode, access_point: bool) -> [EdcaAcParams; 4] {
+    use crate::PhyMode;
+    let (be, bk, vi, vo) = match (mode, access_point) {
+        (PhyMode::B, false) => (
+            edca(5, 10, 3, 0),
+            edca(5, 10, 7, 0),
+            edca(4, 5, 2, 188),
+            edca(3, 4, 2, 102),
+        ),
+        (PhyMode::B, true) => (
+            edca(4, 7, 3, 0),
+            edca(5, 10, 7, 0),
+            edca(3, 4, 1, 188),
+            edca(2, 3, 1, 102),
+        ),
+        (PhyMode::Auto, _) => (
+            edca(0, 0, 0, 0),
+            edca(0, 0, 0, 0),
+            edca(0, 0, 0, 0),
+            edca(0, 0, 0, 0),
+        ),
+        (_, false) => (
+            edca(4, 10, 3, 0),
+            edca(4, 10, 7, 0),
+            edca(3, 4, 2, 94),
+            edca(2, 3, 2, 47),
+        ),
+        (_, true) => (
+            edca(4, 6, 3, 0),
+            edca(4, 10, 7, 0),
+            edca(3, 4, 1, 94),
+            edca(2, 3, 1, 47),
+        ),
+    };
+    [be, bk, vi, vo]
+}
+
+/// Append the source EDCA Parameter Set element for the current PHY mode.
+// upstream: ieee80211_output.c ieee80211_add_edca_params()
+pub fn append_edca_params_ie(output: &mut Vec<u8>, mode: crate::PhyMode) -> Result<(), IeError> {
+    append_edca_element(
+        output,
+        ELEMID_EDCA_PARAMS,
+        [0, 0],
+        &source_edca_table(mode, false),
+    )
+}
+
+fn append_edca_element(
+    output: &mut Vec<u8>,
+    element_id: u8,
+    qos_reserved: [u8; 2],
+    table: &[EdcaAcParams; 4],
+) -> Result<(), IeError> {
+    let mut body = qos_reserved.to_vec();
+    append_edca_records(&mut body, table);
+    append_ie(output, element_id, &body)
+}
+
+fn append_edca_records(body: &mut Vec<u8>, table: &[EdcaAcParams; 4]) {
+    for (aci, ac) in table.iter().enumerate() {
+        body.push(
+            ((aci as u8) << 5)
+                | (u8::from(ac.admission_control_mandatory) << 4)
+                | (ac.aifsn & 0x0f),
+        );
+        body.push((ac.ecw_max << 4) | (ac.ecw_min & 0x0f));
+        body.extend_from_slice(&ac.txop_limit.to_le_bytes());
+    }
+}
+
+/// Compute the WMM STA QoS Info byte from user U-APSD settings.
+// upstream: ieee80211_output.c ieee80211_uapsd_qosinfo()
+pub fn uapsd_qos_info(enabled: bool, access_categories: u8, max_service_period: u8) -> u8 {
+    if !enabled {
+        return 0;
+    }
+    (access_categories & WMM_IE_STA_QOSINFO_AC_MASK)
+        | ((max_service_period & WMM_IE_STA_QOSINFO_SP_MASK) << WMM_IE_STA_QOSINFO_SP_SHIFT)
+}
+
+/// Append the one-byte QoS Capability information element.
+// upstream: ieee80211_output.c ieee80211_add_qos_capability()
+pub fn append_qos_capability_ie(output: &mut Vec<u8>, qos_info: u8) -> Result<(), IeError> {
+    append_ie(output, ELEMID_QOS_CAPABILITY, &[qos_info])
+}
+
+/// Append the seven-byte Wi-Fi Alliance WMM Information element.
+// upstream: ieee80211_output.c ieee80211_add_wme_info()
+pub fn append_wme_info_ie(output: &mut Vec<u8>, qos_info: u8) -> Result<(), IeError> {
+    append_ie(
+        output,
+        ELEMID_VENDOR,
+        &[WPA_OUI[0], WPA_OUI[1], WPA_OUI[2], 2, 0, 1, qos_info],
+    )
+}
+
+/// Append a Wi-Fi Alliance WMM Parameter element using the AP EDCA table.
+// upstream: ieee80211_output.c ieee80211_add_wme_param()
+pub fn append_wme_parameter_ie(output: &mut Vec<u8>, mode: crate::PhyMode) -> Result<(), IeError> {
+    let mut body = Vec::with_capacity(24);
+    body.extend_from_slice(&WPA_OUI);
+    body.extend_from_slice(&[2, 1, 1, 0, 0]);
+    append_edca_records(&mut body, &source_edca_table(mode, true));
+    append_ie(output, ELEMID_VENDOR, &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +435,29 @@ mod tests {
             append_supported_rates_ie(&mut ies, &invalid),
             Err(IeError::InvalidRateSet)
         );
+    }
+
+    #[test]
+    fn edca_qos_and_wmm_ie_wires_match_source_byte_order() {
+        let mut ies = Vec::new();
+        append_edca_params_ie(&mut ies, crate::PhyMode::A).unwrap();
+        assert_eq!(ies.len(), 20);
+        assert_eq!(&ies[..4], &[ELEMID_EDCA_PARAMS, 18, 0, 0]);
+        assert_eq!(&ies[4..8], &[4, 0x3a, 0, 0]);
+        let qos = uapsd_qos_info(true, 0x2b, 3);
+        assert_eq!(qos, 0x6b);
+        append_qos_capability_ie(&mut ies, qos).unwrap();
+        assert_eq!(&ies[20..23], &[ELEMID_QOS_CAPABILITY, 1, 0x6b]);
+        append_wme_info_ie(&mut ies, qos).unwrap();
+        assert_eq!(
+            &ies[23..32],
+            &[ELEMID_VENDOR, 7, 0, 0x50, 0xf2, 2, 0, 1, 0x6b]
+        );
+        append_wme_parameter_ie(&mut ies, crate::PhyMode::B).unwrap();
+        assert_eq!(&ies[32..34], &[ELEMID_VENDOR, 24]);
+        assert_eq!(&ies[34..42], &[0, 0x50, 0xf2, 2, 1, 1, 0, 0]);
+        assert_eq!(&ies[42..46], &[4, 0x37, 0, 0]);
+        assert_eq!(uapsd_qos_info(false, 0xf, 3), 0);
     }
 
     #[test]

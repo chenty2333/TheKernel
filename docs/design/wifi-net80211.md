@@ -91,3 +91,6 @@ field, while HE MCS/NSS maps follow advertised 160/80+80 width bits.
 RSN/WPA output IEs preserve source suite ordering, WPA-v1 restrictions, replay-
 counter bits, station PMF advertisement rules, optional PMKID and BIP group
 management cipher. Wire output round-trips through the crate's RSN parser.
+EDCA/WMM transmit elements now carry the source 11b versus OFDM AC tables,
+AC-order identifiers, congestion-window encodings, TXOP limits and station
+U-APSD AC/service-period bits.
