@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+mod assoc_rx;
 mod auth_rx;
 mod beacon;
 mod channel;
@@ -25,6 +26,7 @@ mod rsn;
 mod rssadapt;
 mod scan;
 
+pub use assoc_rx::{AssocRxError, AssocRxPolicy, AssocRxResult, receive_assoc_response};
 pub use auth_rx::{AuthRxError, AuthRxResult, receive_auth_response};
 pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{

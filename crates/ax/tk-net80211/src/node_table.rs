@@ -24,6 +24,7 @@ pub enum NodeLifecycle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeRecord {
     pub access_point: AccessPoint,
+    pub association_id: u16,
     pub ht_caps: crate::HtCapabilities,
     pub ht_operation: crate::HtOperation,
     pub vht_caps: crate::VhtCapabilities,
@@ -64,6 +65,7 @@ impl Default for NodeTable {
             nodes: BTreeMap::new(),
             bss_node: NodeRecord {
                 access_point: AccessPoint::default(),
+                association_id: 0,
                 ht_caps: crate::HtCapabilities::default(),
                 ht_operation: crate::HtOperation::default(),
                 vht_caps: crate::VhtCapabilities::default(),
@@ -105,6 +107,7 @@ pub fn setup_node(node: &mut NodeRecord, mac_address: [u8; 6]) {
     node.access_point.ssid = [0; 32];
     node.access_point.ssid_len = 0;
     node.access_point.association_failures = 0;
+    node.association_id = 0;
     node.rx_sequence = INVALID_SEQUENCE;
     node.qos_rx_sequences = [INVALID_SEQUENCE; TID_COUNT];
     node.lifecycle = NodeLifecycle::Cache;
@@ -113,6 +116,7 @@ pub fn setup_node(node: &mut NodeRecord, mac_address: [u8; 6]) {
 fn setup_empty_node() -> NodeRecord {
     NodeRecord {
         access_point: AccessPoint::default(),
+        association_id: 0,
         ht_caps: crate::HtCapabilities::default(),
         ht_operation: crate::HtOperation::default(),
         vht_caps: crate::VhtCapabilities::default(),

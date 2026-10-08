@@ -144,3 +144,8 @@ The station authentication receive adapter bounds-checks the management header
 and fixed algorithm/sequence/status fields, accepts only Open System
 authentication, and passes the parsed response into the translated station
 state handler; actual response transmission remains a caller effect.
+
+The station association response handler validates mode/state and subtype,
+updates the BSS association ID and negotiated rates, applies EDCA/WMM/U-APSD
+state, negotiates HT/VHT/HE from local and peer capability state, and returns
+RUN/protection/slot/RSN-port effects for the driver/SME to apply.

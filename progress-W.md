@@ -68,3 +68,4 @@
 - Task 3 resumed after W-19 completion: `tk-net80211/src/rssadapt.rs` translates OpenBSD `ieee80211_rssadapt.c` 5/5 functions; crate tests pass 8/8 including existing frame/RSN tests.
 - `ieee80211_input.c` beacon/probe-response receive path translated as `receive_beacon()` with per-node beacon/PHY state; `tk-net80211` checks/tests pass (69 tests); input.c coverage advances from 11/48 to 12/48 functions.
 - `ieee80211_input.c` Open System authentication response parser translated and wired to the station auth state helper; `tk-net80211` check/tests pass (72 tests); input.c coverage advances to 13/48 functions.
+- `ieee80211_input.c` station association/reassociation response path translated through the BSS node and protocol capability helpers; `tk-net80211` check/tests pass (75 tests); input.c coverage advances to 14/48 functions.
