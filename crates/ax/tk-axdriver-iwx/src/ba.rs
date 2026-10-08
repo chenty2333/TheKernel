@@ -13,6 +13,8 @@ pub const MAX_RX_BA_SESSIONS: usize = 16;
 pub const INVALID_BAID: u8 = 0x7f;
 pub const STATION_ID: u8 = 0;
 pub const RX_REORDER_TIMEOUT_MQ_USEC: u64 = 100_000;
+pub const MAX_TID_COUNT: usize = 16;
+pub const FIXED_TX_AGGREGATION_WINDOW: u16 = 64;
 const BAID_GROUP: u8 = 5;
 const BAID_CONFIG_COMMAND: u8 = 0x16;
 const ADD_STA_COMMAND: u8 = 0x18;
@@ -39,6 +41,142 @@ pub enum BaError {
     NoSession,
     TooManySessions,
     Command(CommandError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmpduRequestError {
+    NoSpace,
+    Busy,
+    Unsupported,
+    InvalidTid,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BaTaskRequests {
+    pub shutdown: bool,
+    pub rx_start_tid_mask: u16,
+    pub rx_stop_tid_mask: u16,
+    pub tx_start_tid_mask: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaTaskAction {
+    RxStart,
+    RxStop,
+    TxStart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmpduDisposition {
+    Pending,
+    Unchanged,
+}
+
+/// Queue an RX ADDBA operation for deferred net80211-task context.
+// upstream: if_iwx.c iwx_ampdu_rx_start()
+pub fn ampdu_rx_start(
+    requests: &mut BaTaskRequests,
+    active_sessions: usize,
+    tid: u8,
+    mut enqueue_task: impl FnMut(),
+) -> Result<AmpduDisposition, AmpduRequestError> {
+    if active_sessions >= MAX_RX_BA_SESSIONS || usize::from(tid) >= MAX_TID_COUNT {
+        return Err(AmpduRequestError::NoSpace);
+    }
+    let bit = 1u16 << tid;
+    if requests.rx_start_tid_mask & bit != 0 {
+        return Err(AmpduRequestError::Busy);
+    }
+    requests.rx_start_tid_mask |= bit;
+    enqueue_task();
+    Ok(AmpduDisposition::Pending)
+}
+
+/// Queue RX DELBA teardown unless the TID is invalid or already pending.
+// upstream: if_iwx.c iwx_ampdu_rx_stop()
+pub fn ampdu_rx_stop(
+    requests: &mut BaTaskRequests,
+    tid: u8,
+    mut enqueue_task: impl FnMut(),
+) -> AmpduDisposition {
+    if usize::from(tid) >= MAX_TID_COUNT {
+        return AmpduDisposition::Unchanged;
+    }
+    let bit = 1u16 << tid;
+    if requests.rx_stop_tid_mask & bit != 0 {
+        return AmpduDisposition::Unchanged;
+    }
+    requests.rx_stop_tid_mask |= bit;
+    enqueue_task();
+    AmpduDisposition::Pending
+}
+
+/// Queue TX ADDBA only for DQA firmware and the driver's fixed window size.
+// upstream: if_iwx.c iwx_ampdu_tx_start()
+pub fn ampdu_tx_start(
+    requests: &mut BaTaskRequests,
+    first_data_queue: u8,
+    dqa_command_queue: u8,
+    tid: u8,
+    window_size: u16,
+    aggregation_queue: u8,
+    mut enqueue_task: impl FnMut(),
+) -> Result<AmpduDisposition, AmpduRequestError> {
+    if first_data_queue != dqa_command_queue.wrapping_add(1) {
+        return Err(AmpduRequestError::Unsupported);
+    }
+    if usize::from(tid) >= MAX_TID_COUNT {
+        return Err(AmpduRequestError::InvalidTid);
+    }
+    if window_size != FIXED_TX_AGGREGATION_WINDOW {
+        return Err(AmpduRequestError::Unsupported);
+    }
+    if aggregation_queue != 0 {
+        return Err(AmpduRequestError::NoSpace);
+    }
+    let bit = 1u16 << tid;
+    if requests.tx_start_tid_mask & bit != 0 {
+        return Err(AmpduRequestError::Busy);
+    }
+    requests.tx_start_tid_mask |= bit;
+    enqueue_task();
+    Ok(AmpduDisposition::Pending)
+}
+
+/// Process the source RX-start/RX-stop per-TID queue, then TX-start queue.
+// upstream: if_iwx.c iwx_ba_task()
+pub fn run_ba_task(
+    requests: &mut BaTaskRequests,
+    mut apply: impl FnMut(BaTaskAction, u8),
+) -> usize {
+    let mut processed = 0;
+    for tid in 0..MAX_TID_COUNT {
+        if requests.shutdown {
+            break;
+        }
+        let bit = 1u16 << tid;
+        if requests.rx_start_tid_mask & bit != 0 {
+            apply(BaTaskAction::RxStart, tid as u8);
+            requests.rx_start_tid_mask &= !bit;
+            processed += 1;
+        } else if requests.rx_stop_tid_mask & bit != 0 {
+            apply(BaTaskAction::RxStop, tid as u8);
+            requests.rx_stop_tid_mask &= !bit;
+            processed += 1;
+        }
+    }
+    for tid in 0..MAX_TID_COUNT {
+        if requests.shutdown {
+            break;
+        }
+        let bit = 1u16 << tid;
+        if requests.tx_start_tid_mask & bit != 0 {
+            apply(BaTaskAction::TxStart, tid as u8);
+            requests.tx_start_tid_mask &= !bit;
+            processed += 1;
+        }
+    }
+    processed
 }
 
 impl From<CommandError> for BaError {
@@ -479,6 +617,68 @@ pub fn baid_config_response(response: &[u8]) -> Result<u8, BaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ampdu_callbacks_queue_source_tid_masks_and_task_order() {
+        let mut requests = BaTaskRequests::default();
+        let mut queued = 0;
+        assert_eq!(
+            ampdu_rx_start(&mut requests, 0, 3, || queued += 1),
+            Ok(AmpduDisposition::Pending)
+        );
+        assert_eq!(
+            ampdu_rx_start(&mut requests, 0, 3, || queued += 1),
+            Err(AmpduRequestError::Busy)
+        );
+        assert_eq!(
+            ampdu_rx_stop(&mut requests, 3, || queued += 1),
+            AmpduDisposition::Pending
+        );
+        assert_eq!(
+            ampdu_tx_start(&mut requests, 1, 0, 5, 64, 0, || queued += 1),
+            Ok(AmpduDisposition::Pending)
+        );
+        assert_eq!(queued, 3);
+        let mut actions = Vec::new();
+        assert_eq!(
+            run_ba_task(&mut requests, |action, tid| actions.push((action, tid))),
+            2
+        );
+        assert_eq!(
+            actions,
+            [(BaTaskAction::RxStart, 3), (BaTaskAction::TxStart, 5)]
+        );
+        assert_eq!(requests.rx_stop_tid_mask, 1 << 3);
+        assert_eq!(
+            run_ba_task(&mut requests, |action, tid| actions.push((action, tid))),
+            1
+        );
+        assert_eq!(actions.last(), Some(&(BaTaskAction::RxStop, 3)));
+    }
+
+    #[test]
+    fn ampdu_tx_gates_and_shutdown_leave_requests_pending() {
+        let mut requests = BaTaskRequests::default();
+        assert_eq!(
+            ampdu_tx_start(&mut requests, 0, 0, 0, 64, 0, || {}),
+            Err(AmpduRequestError::Unsupported)
+        );
+        assert_eq!(
+            ampdu_tx_start(&mut requests, 1, 0, 16, 64, 0, || {}),
+            Err(AmpduRequestError::InvalidTid)
+        );
+        assert_eq!(
+            ampdu_tx_start(&mut requests, 1, 0, 0, 32, 0, || {}),
+            Err(AmpduRequestError::Unsupported)
+        );
+        ampdu_rx_start(&mut requests, 0, 1, || {}).unwrap();
+        requests.shutdown = true;
+        assert_eq!(
+            run_ba_task(&mut requests, |_, _| panic!("shutdown must not dispatch")),
+            0
+        );
+        assert_eq!(requests.rx_start_tid_mask, 1 << 1);
+    }
 
     #[test]
     fn reorder_state_and_timeout_follow_iwx_lifecycle() {

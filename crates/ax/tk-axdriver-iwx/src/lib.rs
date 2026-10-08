@@ -73,9 +73,11 @@ pub use attach::{
     PCI_TX_QUEUE_COUNT, PRPH_INFO_BYTES, allocate_attach_resources,
 };
 pub use ba::{
-    BaError, BaTimeoutAction, BarFrameRelease, INVALID_BAID, MAX_RX_BA_SESSIONS,
+    AmpduDisposition, AmpduRequestError, BaError, BaTaskAction, BaTaskRequests, BaTimeoutAction,
+    BarFrameRelease, FIXED_TX_AGGREGATION_WINDOW, INVALID_BAID, MAX_RX_BA_SESSIONS, MAX_TID_COUNT,
     RX_REORDER_TIMEOUT_MQ_USEC, ReorderBuffer, RxBaSession, RxBaTable, RxReorderOutcome,
-    STATION_ID, baid_config_command, baid_config_response, station_ba_command, station_ba_response,
+    STATION_ID, ampdu_rx_start, ampdu_rx_stop, ampdu_tx_start, baid_config_command,
+    baid_config_response, run_ba_task, station_ba_command, station_ba_response,
 };
 pub use binding::{
     BINDING_CONTEXT_COMMAND, BindingError, BindingState, BindingUpdateError, CONTEXT_ACTION_ADD,

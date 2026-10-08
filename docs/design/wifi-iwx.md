@@ -108,6 +108,11 @@ builders selected by the source dispatcher.
 Controller helpers now cover the non-QoS management queue's qid/TID lifecycle,
 the PDU/status command wrappers, association session-protection add/remove,
 and the legacy interrupt-mask restore path.
+
+Block-ack callbacks now retain RX-start/RX-stop/TX-start TID masks, enforce the
+source BAID/TID/window and DQA gates, and dispatch deferred requests in the
+OpenBSD RX-then-TX task order. The future net80211 adapter supplies the actual
+per-peer BA state and task-enqueue callback.
 The firmware-event classifier covers the remaining UAPSD, thermal, MCC,
 session-protection, channel-switch, statistics, RLC/TLC, and ignorable command
 branches so the platform dispatcher can apply side effects without losing ACKs.
