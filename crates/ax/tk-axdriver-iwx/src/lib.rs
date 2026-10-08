@@ -6,13 +6,20 @@
 
 extern crate alloc;
 
+mod command;
 mod config;
 mod context;
 mod dma;
 mod firmware;
 mod firmware_bundle;
+mod interrupts;
 mod registers;
+mod rings;
 
+pub use command::{
+    CMD_ASYNC, CMD_FAILED_MASK, CMD_SEND_DURING_RFKILL, CMD_WANT_RESPONSE, CommandError,
+    EncodedCommand, HostCommand, command_group_id, command_opcode, command_version, submit_command,
+};
 pub use config::{
     AX211_DEVICE_ID, DeviceConfig, FirmwareConfig, INTEL_VENDOR_ID, RuntimeConfig, lookup_config,
     matches_pci_device,
@@ -34,4 +41,12 @@ pub use firmware::{
 pub use firmware_bundle::{
     FirmwareBundle, FirmwareRequestError, request_on_rootfs_ready, take_staged,
 };
+pub use interrupts::{
+    InterruptMasks, enable_firmware_load_interrupts, enable_interrupts, enable_rfkill_interrupts,
+    hardware_rfkill,
+};
 pub use registers::{CsrAccess, DeviceFamily, IoBarrier, IwxRegisters, RegisterError};
+pub use rings::{
+    RingError, RxCompletion, RxRing, TxRing, TxSegment, allocate_rx_ring, allocate_tx_ring,
+    tx_byte_count_entry,
+};

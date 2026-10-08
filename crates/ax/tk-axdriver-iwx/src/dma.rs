@@ -28,7 +28,11 @@ pub trait DmaRegion {
     fn capacity(&self) -> usize;
     fn write(&mut self, bytes: &[u8]) -> Result<(), DmaError>;
     fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), DmaError> {
-        if offset == 0 && bytes.len() == self.capacity() { self.write(bytes) } else { Err(DmaError::RegionTooSmall) }
+        if offset == 0 && bytes.len() == self.capacity() {
+            self.write(bytes)
+        } else {
+            Err(DmaError::RegionTooSmall)
+        }
     }
     fn read_at(&self, _offset: usize, _bytes: &mut [u8]) -> Result<(), DmaError> {
         Err(DmaError::RegionTooSmall)
@@ -39,7 +43,11 @@ pub trait DmaRegion {
 pub trait DmaAllocator {
     type Region: DmaRegion;
     fn allocate(&mut self, size: usize) -> Result<Self::Region, DmaError>;
-    fn allocate_aligned(&mut self, size: usize, alignment: usize) -> Result<Self::Region, DmaError> {
+    fn allocate_aligned(
+        &mut self,
+        size: usize,
+        alignment: usize,
+    ) -> Result<Self::Region, DmaError> {
         let region = self.allocate(size)?;
         if alignment > 1 && region.device_address() % alignment as u64 != 0 {
             return Err(DmaError::RegionTooSmall);
@@ -197,12 +205,18 @@ mod tests {
             Ok(())
         }
         fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), DmaError> {
-            let dst = self.bytes.get_mut(offset..offset + bytes.len()).ok_or(DmaError::RegionTooSmall)?;
+            let dst = self
+                .bytes
+                .get_mut(offset..offset + bytes.len())
+                .ok_or(DmaError::RegionTooSmall)?;
             dst.copy_from_slice(bytes);
             Ok(())
         }
         fn read_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DmaError> {
-            let src = self.bytes.get(offset..offset + bytes.len()).ok_or(DmaError::RegionTooSmall)?;
+            let src = self
+                .bytes
+                .get(offset..offset + bytes.len())
+                .ok_or(DmaError::RegionTooSmall)?;
             bytes.copy_from_slice(src);
             Ok(())
         }

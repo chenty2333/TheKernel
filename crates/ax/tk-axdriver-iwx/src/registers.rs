@@ -96,6 +96,16 @@ impl<B: CsrAccess> IwxRegisters<B> {
         self.bus.write32(offset, value)
     }
 
+    pub fn set_csr_bits(&mut self, offset: u32, bits: u32) {
+        let value = self.bus.read32(offset);
+        self.bus.write32(offset, value | bits);
+    }
+
+    pub fn clear_csr_bits(&mut self, offset: u32, bits: u32) {
+        let value = self.bus.read32(offset);
+        self.bus.write32(offset, value & !bits);
+    }
+
     /// The PRPH address width changes at AX210.
     // upstream: if_iwx.c iwx_prph_addr_mask()
     pub const fn prph_addr_mask(&self) -> u32 {
