@@ -2413,6 +2413,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
     }
 
     // upstream: mmcsd.c mmcsd_attach() user/boot partition publication
+    // upstream: mmcsd.c mmcsd_add_part() user and boot areas
     pub fn into_partition_devices(
         mut self,
         read_only: bool,
