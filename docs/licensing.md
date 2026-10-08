@@ -553,3 +553,7 @@ The page-table and IOTLB translation from FreeBSD
 `sys/x86/iommu/intel_idpgtbl.c` retains the 2013 FreeBSD Foundation
 BSD-2-Clause grant and Konstantin Belousov attribution in `tk-vtd` source;
 its full grant is already present in `crates/ax/tk-vtd/LICENSES/`.
+The VT-d root/context/domain translation from FreeBSD
+`sys/x86/iommu/intel_ctx.c` retains the 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution in `tk-vtd` Rust source, covered by
+the crate's retained BSD-2-Clause license.

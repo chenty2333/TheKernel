@@ -12,10 +12,11 @@ use kspin::SpinNoIrq;
 use tk_acpica::Engine;
 use tk_vtd::{
     DmarTable, Error,
+    context::{ctx_id_entry_init, dmar_ensure_ctx_page},
     idpgtbl::{dmar_map_buf_locked, dmar_unmap_buf_locked},
     iova::IovaAllocator,
     pgtbl::{PAGE_SIZE, PageMemory, SecondLevel},
-    reg::{DMAR_PTE_R, DMAR_PTE_W},
+    reg::{ContextEntry, DMAR_CTX2_AW_4LVL, DMAR_PTE_R, DMAR_PTE_W, RootEntry},
 };
 
 const MODE_UNKNOWN: u8 = 0;
@@ -291,6 +292,8 @@ struct Mapping {
 
 struct Manager {
     units: Vec<Unit>,
+    root_table: DmaBlock,
+    context_tables: Vec<DmaBlock>,
     page_table: SecondLevel<KernelPageMemory>,
     iovas: IovaAllocator,
     mappings: Vec<Mapping>,
@@ -435,30 +438,36 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     page_table.map_identity_2m(maximum)?;
 
     let root = allocate_table_page()?;
-    let context = allocate_table_page()?;
     let second_level_root = page_table.root_physical();
-    let root_entries = root.virtual_address.as_ptr().cast::<u64>();
-    for bus in 0..256usize {
-        // SAFETY: root table has 256 16-byte entries.
-        unsafe {
-            root_entries
-                .add(bus * 2)
-                .write_volatile(context.physical | 1)
+    let mut context_tables = Vec::new();
+    context_tables
+        .try_reserve_exact(256)
+        .map_err(|_| Error::OutOfMemory)?;
+    for bus in 0..256u16 {
+        let context = allocate_table_page()?;
+        // SAFETY: root/context allocations are one page with 256 16-byte
+        // hardware entries and remain owned by Manager while TE is active.
+        let root_entries = unsafe {
+            core::slice::from_raw_parts_mut(root.virtual_address.as_ptr().cast::<RootEntry>(), 256)
         };
-    }
-    let context_entries = context.virtual_address.as_ptr().cast::<u64>();
-    let context_low = second_level_root | 1; // present, TT=00 (second-level translation)
-    let context_high = 2 | (1 << 8); // 48-bit AW, domain ID 1
-    for requester in 0..256usize {
-        // SAFETY: context table has 256 16-byte entries and is zeroed.
-        unsafe {
-            context_entries
-                .add(requester * 2)
-                .write_volatile(context_low);
-            context_entries
-                .add(requester * 2 + 1)
-                .write_volatile(context_high);
-        }
+        dmar_ensure_ctx_page(root_entries, bus as u8, context.physical)?;
+        let context_entries = unsafe {
+            core::slice::from_raw_parts_mut(
+                context.virtual_address.as_ptr().cast::<ContextEntry>(),
+                256,
+            )
+        };
+        ctx_id_entry_init(
+            context_entries,
+            bus << 8,
+            1,
+            DMAR_CTX2_AW_4LVL as u8,
+            Some(second_level_root),
+            false,
+            false,
+            true,
+        )?;
+        context_tables.push(context);
     }
     core::sync::atomic::fence(Ordering::Release);
 
@@ -482,6 +491,8 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     }
     let manager = Manager {
         units,
+        root_table: root,
+        context_tables,
         page_table,
         iovas: IovaAllocator::new(
             maximum

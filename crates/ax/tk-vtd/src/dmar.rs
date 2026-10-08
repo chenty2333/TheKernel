@@ -36,7 +36,8 @@ pub struct DmarDomain {
     pub mgaw: i32,
     pub agaw: i32,
     pub page_level: i32,
-    pub context_address_width: i32,
+    /// `awlvl` encoding stored in the second context-entry word.
+    pub awlvl: i32,
     pub context_count: u32,
     pub refs: u32,
     pub unit_index: u32,
@@ -125,7 +126,7 @@ mod tests {
             mgaw: 48,
             agaw: 48,
             page_level: 4,
-            context_address_width: crate::reg::DMAR_CTX2_AW_4LVL as i32,
+            awlvl: crate::reg::DMAR_CTX2_AW_4LVL as i32,
             context_count: 1,
             refs: 2,
             unit_index: 0,

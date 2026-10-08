@@ -34,3 +34,10 @@ actual-granularity fallback. The current hardware page-table adapter supports
 four-level paging and 2 MiB identity leaves; subtable pages are retained until
 quiesced domain destruction instead of being reclaimed during unmap. Unit tests
 pass, but no translated-QEMU claim follows from this source-level port.
+
+FreeBSD `intel_ctx.c` is now represented at 24/24 function entry points by
+`tk-vtd/src/context.rs` plus its hardware entry models. The kernel's root table
+now has one root/context page per bus and each context page has the translated
+second-level domain entry layout. The current design still uses one shared
+second-level domain across all requesters; PCI discovery, RMRR/GAS allocation,
+per-device isolation and delayed unload taskqueue ownership are not integrated.

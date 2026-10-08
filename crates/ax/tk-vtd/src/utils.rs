@@ -81,7 +81,7 @@ pub fn domain_set_agaw(domain: &mut DmarDomain, hw_cap: u64, mgaw: i32) -> Resul
         .ok_or(Error::Unsupported)?;
     domain.agaw = i32::from(bits.agaw);
     domain.page_level = i32::from(bits.page_levels);
-    domain.context_address_width = bits.context_aw as i32;
+    domain.awlvl = bits.context_aw as i32;
     Ok(())
 }
 
