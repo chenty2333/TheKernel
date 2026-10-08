@@ -566,6 +566,49 @@ impl LogDmaMemory {
         self.layout
     }
 
+    fn read_shared_log(&self) -> Result<Vec<u8>, Error> {
+        let size = usize::try_from(self.layout.buffer_bytes).map_err(|_| Error::Refused)?;
+        let mut shared = Vec::new();
+        shared.try_reserve_exact(size).map_err(|_| Error::Refused)?;
+        shared.resize(size, 0);
+        self._ram.read(0, &mut shared)?;
+        Ok(shared)
+    }
+
+    /// Copy debug/crash rings, update their read state and leave capture data
+    /// for the state-capture event path.
+    /// upstream: intel_guc_log.c _guc_log_copy_debuglogs_for_relay().
+    pub(super) fn drain_debug_logs(
+        &mut self,
+        stats: &mut [intel_gt::guc_log::LogStats; 3],
+    ) -> Result<intel_gt::guc_log::LogSnapshot, Error> {
+        let mut shared = self.read_shared_log()?;
+        let snapshot =
+            intel_gt::guc_log::copy_debug_logs_for_relay(&mut shared, self.layout, stats)?;
+        self._ram.write(0, &shared)?;
+        self._ram.flush();
+        Ok(snapshot)
+    }
+
+    /// Parse and acknowledge the capture-region state after a G2H capture
+    /// notification. The caller sends the corresponding flush-complete action.
+    pub(super) fn drain_capture_log(
+        &mut self,
+        stats: &mut intel_gt::guc_log::LogStats,
+        reset_in_progress: bool,
+    ) -> Result<intel_gt::guc_capture::CaptureLogResult, Error> {
+        let mut shared = self.read_shared_log()?;
+        let result = intel_gt::guc_log::process_capture_log(
+            &mut shared,
+            self.layout,
+            stats,
+            reset_in_progress,
+        )?;
+        self._ram.write(0, &shared)?;
+        self._ram.flush();
+        Ok(result)
+    }
+
     pub(super) fn mark_registered(&mut self) {
         self.registered = true;
     }
@@ -609,6 +652,37 @@ pub(super) fn write_guc_init_params(
         .ok_or(Error::Quarantined)?
         .mark_registered();
     Ok(params)
+}
+
+/// Handle a G2H state-capture notification: report NOSPACE, drain/ack the
+/// capture region, then send LOG_BUFFER_FILE_FLUSH_COMPLETE over CTB.
+/// upstream: intel_guc_submission.c intel_guc_error_capture_process_msg()
+/// + intel_guc_capture.c __guc_capture_process_output().
+pub(super) fn handle_guc_capture_notification(
+    owner: &mut super::Owner,
+    stats: &mut intel_gt::guc_log::LogStats,
+    reset_in_progress: bool,
+    status_word: u32,
+) -> Result<intel_gt::guc_capture::CaptureLogResult, Error> {
+    if owner.lost || !owner.bus.awake.load(Ordering::Acquire) {
+        return Err(Error::Refused);
+    }
+    let status = status_word & intel_gt::guc_capture::CAPTURE_EVENT_STATUS_MASK;
+    if status == intel_gt::guc_capture::CAPTURE_EVENT_STATUS_NOSPACE {
+        axlog::warn!("intel-gt: GuC capture buffer reported no space");
+    }
+    let result = owner
+        .log_memory
+        .as_mut()
+        .ok_or(Error::Refused)?
+        .drain_capture_log(stats, reset_in_progress)?;
+    owner
+        .ct_memory
+        .as_mut()
+        .ok_or(Error::Quarantined)?
+        .send_capture_flush_complete(&owner.bus)
+        .map_err(|_| Error::Quarantined)?;
+    Ok(result)
 }
 
 #[cfg(target_os = "none")]
@@ -848,6 +922,12 @@ impl CtDmaMemory {
         }
         let flags = intel_gt::guc_ct::CT_SEND_NB | u32::from(action.expected_response_dwords);
         self.send_nonblocking(bus, &action.words[..len], flags)
+    }
+
+    /// Acknowledge completed capture-buffer file flush through CTB.
+    pub(super) fn send_capture_flush_complete(&mut self, bus: &impl GtIo) -> Result<u16, Error> {
+        let action = intel_gt::guc_capture::capture_flush_complete_action();
+        self.send_nonblocking(bus, &action, intel_gt::guc_ct::CT_SEND_NB)
     }
 
     fn publish_ctb(&mut self, bus: &impl GtIo) -> Result<(), Error> {

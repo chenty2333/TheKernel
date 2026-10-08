@@ -27,6 +27,11 @@ pub const GUC_ENGINE_INSTANCE_MASK: u32 = 0xf << GUC_ENGINE_INSTANCE_SHIFT;
 pub const CTX_GTT_ADDRESS_MASK: u32 = 0xffff_f000;
 pub const CAPTURE_STEERING_GROUP_SHIFT: u32 = 12;
 pub const CAPTURE_STEERING_INSTANCE_SHIFT: u32 = 20;
+pub const ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE: u32 = 0x30;
+pub const GUC_CAPTURE_LOG_BUFFER: u32 = 2;
+pub const CAPTURE_EVENT_STATUS_MASK: u32 = 0xff;
+pub const CAPTURE_EVENT_STATUS_SUCCESS: u32 = 0;
+pub const CAPTURE_EVENT_STATUS_NOSPACE: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureError {
@@ -861,6 +866,12 @@ pub enum CaptureBufferAssessment {
 /// upstream: intel_guc_capture.c intel_guc_capture_getnullheader().
 pub const fn null_capture_header() -> [u8; 4 * 4] {
     [0; 4 * 4]
+}
+
+/// CT payload acknowledging the capture region flush.
+/// upstream: intel_guc_capture.c __guc_capture_flushlog_complete().
+pub const fn capture_flush_complete_action() -> [u32; 2] {
+    [ACTION_LOG_BUFFER_FILE_FLUSH_COMPLETE, GUC_CAPTURE_LOG_BUFFER]
 }
 
 /// Compute the worst-case minimum output size, counting the global list for
