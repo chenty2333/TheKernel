@@ -998,4 +998,6 @@ retain the latest Intel inventory, with no scanner exemptions.
 
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `intel_guc_fw.c::intel_guc_fw_upload`/`guc_xfer_rsa_mmio` and `intel_huc_fw.c::intel_huc_fw_upload`, Gen12.0 RSA scratch, WOPCM destination and HuC ukernel DMA paths (MIT, Copyright © 2014-2019 Intel Corporation); GGTT source residency/forcewake are explicit caller inputs.
 
-`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_huc.c::intel_huc_is_authenticated` and `intel_huc_wait_for_auth_complete`, `HUC_STATUS2` verified-bit poll (MIT, Copyright © 2014-2019 Intel Corporation); the GuC CT auth command remains unimplemented.
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_huc.c::intel_huc_is_authenticated` and `intel_huc_wait_for_auth_complete`, `HUC_STATUS2` verified-bit poll (MIT, Copyright © 2014-2019 Intel Corporation); GuC authentication is sent through the MMIO HXG transport, while GuC CT remains unimplemented.
+
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.c::intel_guc_send_mmio` and `intel_guc_auth_huc`, Gen11+ HXG busy/retry/failure handling and HuC-auth action transport (MIT, Copyright © 2014-2019 Intel Corporation); register ownership and forcewake remain with the caller.

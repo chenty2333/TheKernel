@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Linux 7.2.3 drivers/gpu/drm/i915/gt/uc/intel_guc_fw.c:
-// guc_load_done status decoding; register read is supplied by GtIo caller.
-// Copyright © 2014-2019 Intel Corporation. Full grant: LICENSE-MIT.
+// Linux 7.2.3 drivers/gpu/drm/i915/gt/uc/intel_guc_fw.c,
+// intel_guc.c, and intel_huc.c: Gen12 uC transfer/status and GuC MMIO
+// command functions; register reads are supplied by the GtIo caller.
+// Copyright © 2014-2019 Intel Corporation.
+// Copyright © 2016-2019 Intel Corporation. Full grant: LICENSE-MIT.
 
 use crate::{Error, GtIo, uc::FirmwareImage};
 
