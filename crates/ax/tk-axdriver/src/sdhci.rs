@@ -361,13 +361,14 @@ fn probe_slot(
     } else {
         host
     };
-    let disk = match SdhciDisk::attach(host) {
+    let mut disk = match SdhciDisk::attach(host) {
         Ok(disk) => disk,
         Err(error) => {
             warn!("sdhci: {bdf} slot {disk_index} card initialization failed: {error:?}");
             return alloc::vec::Vec::new();
         }
     };
+    disk.log_card();
     let read_only = read_only || disk.is_read_only();
     let partitions = disk.into_partition_devices(read_only, disk_index);
     info!(

@@ -2405,6 +2405,18 @@ impl<I: SdhciIo> SdhciDisk<I> {
         self.cid
     }
 
+    // upstream: mmc.c mmc_log_card()
+    pub fn log_card(&mut self) {
+        let (card_id, serial) = format_card_id(self.cid, self.ext_csd.is_some(), self.high_capacity);
+        let bus_width = self.host.bus_width();
+        log::info!(
+            "sdhci: card {card_id}; serial={serial}; capacity={} sectors; bus={} bit; clock={} Hz",
+            self.sectors,
+            bus_width,
+            self.host.clock_hz()
+        );
+    }
+
     pub const fn csd(&self) -> MmcCsd {
         self.csd
     }
