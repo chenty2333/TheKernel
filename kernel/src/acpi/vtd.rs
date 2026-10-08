@@ -1,5 +1,5 @@
-//! Default-enabled VT-d setup and a shared DMA domain. Legacy PCI drivers see
-//! explicit identity entries; virtio/NVMe use disjoint translated IOVAs.
+//! Opt-in VT-d setup and a shared DMA domain. Legacy PCI drivers see explicit
+//! identity entries; virtio/NVMe use disjoint translated IOVAs when TE is enabled.
 use alloc::vec::Vec;
 use core::{
     ptr::NonNull,

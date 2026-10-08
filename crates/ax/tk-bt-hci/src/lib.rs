@@ -212,10 +212,15 @@ impl<T: UsbTransport> Adapter<T> {
     }
     pub fn open(&mut self, channel: Channel) -> Result<(), Error> {
         match channel {
-            Channel::Raw => self.raw_users = self.raw_users.saturating_add(1),
+            Channel::Raw => {
+                if self.user_owner {
+                    return Err(Error::Busy);
+                }
+                self.raw_users = self.raw_users.saturating_add(1);
+            }
             Channel::Monitor => self.monitor_users = self.monitor_users.saturating_add(1),
             Channel::User => {
-                if self.user_owner {
+                if self.user_owner || self.raw_users != 0 {
                     return Err(Error::Busy);
                 }
                 self.user_owner = true;
@@ -837,6 +842,23 @@ mod tests {
         a.set_up(false).unwrap();
         assert!(a.transport.stopped);
         assert_eq!(a.transport.commands, 1);
+    }
+    #[test]
+    fn user_channel_excludes_raw_sockets_but_allows_monitoring() {
+        let mut adapter = Adapter::new(
+            Fake {
+                stopped: false,
+                commands: 0,
+                acl: 0,
+            },
+            0,
+        );
+        adapter.open(Channel::Raw).unwrap();
+        assert_eq!(adapter.open(Channel::User), Err(Error::Busy));
+        adapter.close(Channel::Raw);
+        adapter.open(Channel::User).unwrap();
+        assert_eq!(adapter.open(Channel::Raw), Err(Error::Busy));
+        assert_eq!(adapter.open(Channel::Monitor), Ok(()));
     }
     #[test]
     fn empty_controller_reports_no_device() {
