@@ -62,5 +62,9 @@ association request/response IEs retained by the driver. GET_STATION encodes
 the associated BSSID and signed signal value from the live driver record.
 Other station/authentication events and regulatory rule operations remain
 incomplete.
-The required no-radio QEMU acceptance is
-deferred until the task-5 command surface is complete; no fake radio is used.
+The required no-radio QEMU acceptance was run on q35-UEFI with the signed
+wireless payload and no fake radio: `/usr/sbin/iw dev` and `/usr/sbin/iw phy`
+both returned empty output, then the guest reached the test marker. The first
+command-file attempt used `/usr/bin/iw` (the APK stages it in `/usr/sbin`) and
+did not invoke either utility; the corrected acceptance run is the one that
+counts.

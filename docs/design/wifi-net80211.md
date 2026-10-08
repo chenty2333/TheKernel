@@ -309,6 +309,89 @@ CCMP keys from nl80211 and routes protected Ethernet frames through these
 helpers.
 See the function-count snapshot in progress-W.md for per-file marker totals.
 
+## Station-only omission register
+
+The per-file source scan is against OpenBSD's `sys/net80211` files and each
+function below has a specific station-iwx boundary; these are not claimed as
+translated:
+
+- `ieee80211.c`: `ieee80211_ifattach`, `ieee80211_ifdetach`, and the three
+  `ieee80211_media_*` functions are ifnet/ifmedia registration and ioctl
+  wrappers mapped to TheKernel's netdev and nl80211 paths.
+- `ieee80211_node.c`: `ieee80211_add_ess`, `ieee80211_del_ess`,
+  `ieee80211_deselect_ess`, `ieee80211_ess_clear_wep`,
+  `ieee80211_ess_clear_wpa`, `ieee80211_ess_setnwkeys`,
+  `ieee80211_ess_setwpaparms`, `ieee80211_set_ess`, `ieee80211_print_ess`,
+  `ieee80211_print_ess_list`, and `ieee80211_ess_cmp` belong to the OpenBSD
+  ifconfig saved-network profile table; wpa_supplicant supplies that policy
+  through CONNECT, while scanned BSS records remain in the station cache.
+  `ieee80211_create_ibss` and `ieee80211_ibss_merge` are IBSS-only.
+  `ieee80211_node_join`, `ieee80211_node_join_11g`,
+  `ieee80211_node_join_ht`, `ieee80211_node_join_rsn`,
+  `ieee80211_node_leave`, `ieee80211_node_leave_pwrsave`,
+  `ieee80211_count_longslotsta`, `ieee80211_count_nonerpsta`,
+  `ieee80211_count_pssta`, `ieee80211_count_rekeysta`, `ieee80211_set_tim`,
+  and `ieee80211_notify_dtim` are AP-side peer admission, TIM/DTIM, power-save,
+  or authenticator callbacks; the station iwx adapter has no AP role and its
+  association response path is separate. `ieee80211_needs_auth` is the AP
+  authenticator's 802.1X callback; station PAE/EAPOL belongs to
+  wpa_supplicant. `ieee80211_node_addba_request`, its AC/TID timer wrappers,
+  and `ieee80211_node_trigger_addba_req` use net80211 software callouts; iwx
+  uses firmware BA queues/reorder state instead. `ieee80211_ba_del` and
+  `ieee80211_node_tx_flushed` are BA/callout teardown wrappers mapped to
+  iwx's controller-owned BA tables and station queue flush/teardown.
+  `ieee80211_clean_cached`, `ieee80211_clean_nodes`,
+  `ieee80211_iterate_nodes`, `ieee80211_node_free`,
+  `ieee80211_node_free_unref_cb`, `ieee80211_node_cmp`, and
+  `ieee80211_node_attach`/`detach`/`lateattach` are RB-tree, refcount, timer,
+  or allocation wrappers represented by the bounded `NodeTable`, owned Rust
+  records, and driver lifetime. `ieee80211_inact_timeout` and
+  `ieee80211_node_cache_timeout` are periodic OpenBSD timeout registrations;
+  the iwx scan cache is aged by bounded service polling. `ieee80211_node_set_timeouts`
+  is a hostap/EAPOL/SA-Query/BA timer registration wrapper. `ieee80211_release_node`
+  is represented by Rust ownership/drop. `ieee80211_do_slow_print` is an
+  optional rate-limited diagnostic printer.
+- `ieee80211_input.c`: `ieee80211_defrag` and `ieee80211_defrag_timeout` are
+  upstream `#ifdef notyet`; `ieee80211_input_ba`, its gap/sequence/flush
+  helpers, and `ieee80211_ba_move_window` are software reorder queues replaced
+  by iwx's hardware BAID/NSSN reorder path. `ieee80211_enqueue_data` is the
+  ifnet mbuf enqueue wrapper mapped to the Ethernet-compatible axnet device.
+  `ieee80211_recv_assoc_req`, `ieee80211_recv_probe_req`, and
+  `ieee80211_recv_pspoll` are hostap-only.
+- `ieee80211_output.c`: `ieee80211_action_name` and `ieee80211_getmgmt` are
+  debug text / mbuf allocation wrappers; `ieee80211_output` is the ifqueue
+  entry mapped to axnet plus the station encap helper. `ieee80211_add_ibss_params`,
+  `ieee80211_add_tim`, `ieee80211_beacon_alloc`, `ieee80211_get_assoc_resp`,
+  `ieee80211_get_probe_resp`, and `ieee80211_pwrsave` are IBSS/hostap paths.
+  `ieee80211_add_tie` is an AP beacon-suppression IE. `ieee80211_get_rts`,
+  `ieee80211_get_cts_to_self`, and `ieee80211_tx_compressed_bar` wrap the
+  legacy if_start/mbuf control-frame callbacks; transmit admission/control is
+  owned by iwx firmware queues and the standalone BAR encoder.
+- `ieee80211_proto.c`: `ieee80211_proto_attach`/`detach` register ifnet
+  callbacks; `ieee80211_set_link_state` maps to axnet link state.
+  `ieee80211_auth_open_confirm` is under OpenBSD's station-only exclusion and
+  is AP-side confirmation. `ieee80211_setkeys`, `ieee80211_setkeysdone`,
+  `ieee80211_gtk_rekey_timeout`, `ieee80211_node_gtk_rekey`,
+  `ieee80211_sa_query_request`, and `ieee80211_sa_query_timeout` are AP
+  authenticator/rekey/timeout paths; EAPOL/SA-Query station protocol messages
+  are userspace-owned or represented by station request effects.
+  `ieee80211_dump_pkt` and `ieee80211_print_essid` are diagnostics.
+- `ieee80211_crypto.c`: `ieee80211_crypto_attach`/`detach` register cipher
+  methods replaced by the Rust crypto dispatcher. `ieee80211_derive_ptk`,
+  `ieee80211_derive_pmkid`, `ieee80211_pmkid_sha1`,
+  `ieee80211_pmkid_sha256`, `ieee80211_eapol_key_check_mic`,
+  `ieee80211_eapol_key_decrypt`, `ieee80211_eapol_key_encrypt`,
+  `ieee80211_eapol_key_mic`, `ieee80211_pmksa_add`,
+  `ieee80211_pmksa_find`, and `ieee80211_crypto_clear_groupkeys` are EAPOL/PMKSA
+  supplicant/authenticator state; wpa_supplicant owns the four-way handshake
+  and PMKSA, while nl80211 installs only the selected CCMP traffic keys.
+- `ieee80211_pae_input.c` and `ieee80211_pae_output.c`: every PAE state/key
+  handler is userspace wpa_supplicant's standard nl80211/EAPOL path. Fuchsia's
+  PAE crates depend on FIDL/std/Fuchsia crypto and are not no_std drop-ins.
+- `ieee80211_crypto_tkip.c`: `ieee80211_michael_mic_failure_timeout` and
+  `ieee80211_tkip_deauth` are hostap peer-countermeasure/timer callbacks;
+  the iwx STA path currently admits WPA2-CCMP only.
+
 RSN-node leave cleanup is represented as explicit effects: initialize state,
 clear PMK/rekey/protection/authorized-port flags, cancel EAPOL/SA Query timers,
 delete the pairwise key, and complete rekey only when the departing peer was
