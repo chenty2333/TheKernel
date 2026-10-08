@@ -94,3 +94,6 @@ diagnostics.
 The RX transfer-buffer walker now applies source framing/alignment, first-MPDU
 ring replacement, pre-AX210 copy-vs-transfer ownership, AX210 single-packet
 handling, command-response retirement, and notification ACK suppression.
+The firmware-event classifier covers the remaining UAPSD, thermal, MCC,
+session-protection, channel-switch, statistics, RLC/TLC, and ignorable command
+branches so the platform dispatcher can apply side effects without losing ACKs.

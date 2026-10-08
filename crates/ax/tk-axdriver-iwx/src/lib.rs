@@ -217,7 +217,10 @@ pub use rx_buffer::{
     RX_BUFFER_SIZE, RX_MPDU_COMMAND, RX_PACKET_MINIMUM_BYTES, RxBufferError, RxBufferReport,
     RxMbufPlan, process_rx_buffer, rx_buffer_packet_error,
 };
-pub use rx_event::{FirmwareEvent, decode_firmware_event, process_command_response};
+pub use rx_event::{
+    DriverFirmwareEvent, FirmwareEvent, decode_driver_event, decode_firmware_event,
+    process_command_response,
+};
 pub use rx_packet::{
     FH_FRAME_ALIGNMENT, FH_FRAME_INVALID, FH_FRAME_SIZE_MASK, NOTIFICATION_ORIGIN,
     RX_PACKET_HEADER_BYTES, RxPacket, RxPacketError, parse_rx_packet,
