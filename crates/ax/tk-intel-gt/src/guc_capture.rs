@@ -46,7 +46,7 @@ pub struct CaptureBuffer<'a> {
 
 impl<'a> CaptureBuffer<'a> {
     pub fn new(data: &'a [u8], rd: usize, wr: usize) -> Result<Self, CaptureError> {
-        if data.is_empty() || rd >= data.len() || wr >= data.len() {
+        if data.is_empty() || rd > data.len() || wr > data.len() {
             return Err(CaptureError::InvalidBuffer);
         }
         Ok(Self { data, rd, wr })
@@ -444,6 +444,90 @@ pub struct CaptureGroup {
     pub vfid: u8,
     pub group_type: u8,
     pub lists: Vec<CaptureList>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaptureLogState {
+    pub read_ptr: usize,
+    pub sampled_write_ptr: usize,
+    pub buffer_full_count: u32,
+    pub flush_to_file: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaptureLogStats {
+    pub flush: u64,
+    pub overflow: u32,
+    pub sampled_overflow: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct CaptureLogResult {
+    pub groups: Vec<CaptureGroup>,
+    pub parse_error: Option<CaptureError>,
+    pub overflow: bool,
+    pub flush_count: u32,
+}
+
+/// Snapshot and drain a GuC capture log region. Overflow or invalid offsets
+/// force a full-ring pass; the error-capture read pointer and flush flag are
+/// advanced/cleared even when parsing stopped, as in the firmware flush path.
+/// upstream: intel_guc_capture.c __guc_capture_process_output().
+pub fn process_capture_log(
+    data: &[u8],
+    state: &mut CaptureLogState,
+    stats: &mut CaptureLogStats,
+    reset_in_progress: bool,
+) -> CaptureLogResult {
+    let flush_count = state.flush_to_file;
+    stats.flush = stats.flush.saturating_add(u64::from(flush_count));
+    let full_count = state.buffer_full_count;
+    let previous = stats.sampled_overflow;
+    let overflow = full_count != previous;
+    if overflow {
+        stats.overflow = full_count;
+        stats.sampled_overflow = stats
+            .sampled_overflow
+            .wrapping_add(full_count.wrapping_sub(previous));
+        if full_count < previous {
+            // Firmware exposes buffer_full_cnt as a 4-bit counter.
+            stats.sampled_overflow = stats.sampled_overflow.wrapping_add(16);
+        }
+    }
+
+    let size = data.len();
+    let invalid = state.read_ptr > size || state.sampled_write_ptr > size;
+    let (read_ptr, write_ptr) = if overflow || invalid {
+        (0, size)
+    } else {
+        (state.read_ptr, state.sampled_write_ptr)
+    };
+    let mut groups = Vec::new();
+    let mut parse_error = None;
+    if !reset_in_progress {
+        match CaptureBuffer::new(data, read_ptr, write_ptr) {
+            Err(error) => parse_error = Some(error),
+            Ok(mut buffer) => {
+                while buffer.count() != 0 {
+                    match extract_group(&mut buffer) {
+                        Ok(group) => groups.push(group),
+                        Err(error) => {
+                            parse_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    state.read_ptr = write_ptr;
+    state.flush_to_file = 0;
+    CaptureLogResult {
+        groups,
+        parse_error,
+        overflow,
+        flush_count,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -927,6 +1011,40 @@ mod tests {
         assert_eq!(ring.read_dword(), Ok(10));
         assert_eq!(ring.read_dword(), Ok(11));
         assert_eq!(ring.count(), 0);
+    }
+
+    #[test]
+    fn capture_buffer_allows_end_offsets_and_processes_log_state() {
+        let mut data = words_to_bytes(&[0, 0]); // empty group header at end offset
+        let ring = CaptureBuffer::new(&data, data.len(), data.len()).unwrap();
+        assert_eq!(ring.count(), 0);
+
+        let mut state = CaptureLogState {
+            read_ptr: data.len(),
+            sampled_write_ptr: data.len(),
+            buffer_full_count: 0,
+            flush_to_file: 2,
+        };
+        let mut stats = CaptureLogStats::default();
+        let result = process_capture_log(&data, &mut state, &mut stats, false);
+        assert!(result.groups.is_empty());
+        assert_eq!(result.parse_error, None);
+        assert_eq!(result.flush_count, 2);
+        assert_eq!(stats.flush, 2);
+        assert_eq!(state.read_ptr, data.len());
+        assert_eq!(state.flush_to_file, 0);
+
+        // A fresh firmware overflow forces a full buffer parse and updates the
+        // sampled counter, including the 4-bit rollover rule.
+        state.read_ptr = 1;
+        state.sampled_write_ptr = 2;
+        state.buffer_full_count = 0;
+        stats.sampled_overflow = 15;
+        data.resize(16, 0);
+        let result = process_capture_log(&data, &mut state, &mut stats, true);
+        assert!(result.overflow);
+        assert_eq!(stats.sampled_overflow, 16);
+        assert_eq!(state.read_ptr, data.len());
     }
 
     #[test]
