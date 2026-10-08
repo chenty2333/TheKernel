@@ -855,6 +855,12 @@ impl SharedDpllPool {
     }
 }
 
+impl Default for SharedDpllPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 const fn dpll_id(value: u8) -> Result<IclDpllId, Error> {
     match value {
         0 => Ok(IclDpllId::Dpll0),

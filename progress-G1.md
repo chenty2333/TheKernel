@@ -8,4 +8,5 @@
 2. 电源生命周期差距盘点 | 文档化 | dbfbe824 | 明确列出异步 put、完整 modeset 域接线、IRQ-coupled well callbacks 和 DC5/6/9/DMC runtime 的未完成边界；转入时钟项前不再扩展该项实现。
 3. CDCLK transition planning | 部分完成 | 71c1eb18 | 在 `tk-intel-display::cdclk` 翻译 crawl/squash/CD2X 分类和 midpoint 算法；4 个 cdclk 单测通过。MMIO/PCODE/atomic modeset 接线和 DPLL 文件继续进行中。
 3b. DPLL manager arithmetic | 部分完成 | d4d650b2 | 翻译 ICL/TGL combo PLL divider search, DP/TBT table, CFGCR encode/decode; 3 targeted tests pass. Runtime MMIO and `intel_dpll.c` remain.
-3c. Shared DPLL reference policy | 部分完成 | pending | 翻译平台候选掩码、TC→MG PLL id、active port selection、state-matching reserve/refcount/release；新加 2 个 targeted tests。
+3c. Shared DPLL reference policy | 部分完成 | 12d36f98 | 翻译平台候选掩码、TC→MG PLL id、active port selection、state-matching reserve/refcount/release；2 tests pass.
+3d. Generic CRTC DPLL dispatch | 部分完成 | pending | 翻译 DPLL `compute_clock/get_dpll` guards、stale state clear、±1 kHz clock comparison；3 tests pass，暂未接进 kernel atomic path。

@@ -540,7 +540,10 @@ The fixed DP/TBT tables, source candidate ordering, DCO window and midpoint,
 atomic PLL allocation, active-port mux updates, MG PHY DP/TBT register writes,
 PLL enable/disable/lock sequencing, clock routing, reference-clock updates,
 readout/sanitization, and display-12/13 `intel_dpll.c` state ownership are
-still not translated or wired.
+still not translated or wired. `tk-intel-display/src/dpll.rs` additionally
+translates the generic CRTC dispatch guards, stale-state clear, and ±1 kHz
+clock-match helper from Linux 7.2.3 `intel_dpll.c` (MIT, Copyright © 2020
+Intel). Those functions have no kernel atomic-state call site yet.
 
 The same module additionally carries the display-12/13 candidate-mask and
 shared-resource policy from `icl_get_combo_phy_dpll()`,

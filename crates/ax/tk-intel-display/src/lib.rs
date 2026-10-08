@@ -9,13 +9,14 @@ extern crate alloc;
 
 pub mod audio;
 pub mod cdclk;
-pub mod dc_state;
 pub mod color;
+pub mod dc_state;
 pub mod ddi;
 pub mod device;
 pub mod display;
 pub mod dkl_phy;
 pub mod dmc;
+pub mod dpll;
 pub mod dpll_mgr;
 pub mod hdmi;
 pub mod hdmi_packet;

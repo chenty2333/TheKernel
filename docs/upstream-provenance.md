@@ -1120,3 +1120,9 @@ shareable hardware-state/pipe-mask allocator corresponding to
 `icl_get_combo_phy_dpll()`, `icl_tc_port_to_pll_id()`,
 `icl_update_active_dpll()` and `intel_find_dpll()` plus reference edges. It is
 not yet wired into the kernel's modeset atomic-state lifecycle.
+
+`tk-intel-display/src/dpll.rs` translates generic CRTC DPLL dispatch/state
+preparation and ±1 kHz clock comparison from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_dpll.c` (MIT, Copyright © 2020 Intel).
+The dispatcher is exposed as a pure helper and not yet wired to the kernel
+atomic modeset path.
