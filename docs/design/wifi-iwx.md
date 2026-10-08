@@ -86,3 +86,7 @@ pass all groups for the active BSSID.
 Per-TX-queue watchdog expiry, media-change restarts, and generation-guarded
 ioctl/ENETRESET power and interface handling are mapped to callbacks so the
 driver core can bind them to TheKernel's network and task APIs.
+
+Firmware LMAC/UMAC error-table word layouts, family-dependent pointer floors,
+SYSASSERT descriptions, and status-dump fields are parsed in source order for
+diagnostics.
