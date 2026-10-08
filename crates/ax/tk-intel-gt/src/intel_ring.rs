@@ -555,4 +555,52 @@ mod tests {
         intel_ring_emit(&ring, span, &[0xdead_beef, 0x1234_5678], &mut backend).unwrap();
         assert_eq!(&backend.words[..2], &[0xdead_beef, 0x1234_5678]);
     }
+
+    #[test]
+    fn begin_wraps_with_noops_then_reserves_from_offset_zero() {
+        let mut ring = Ring {
+            id: 11,
+            vma: RingVma {
+                id: 11,
+                size: 4096,
+                stolen: false,
+                map_and_fenceable: false,
+                has_llc: true,
+                has_aperture: false,
+                has_read_only: false,
+                i830_or_i845g: false,
+            },
+            head: 120,
+            tail: 0,
+            emit: 4072,
+            size: 4096,
+            effective_size: 4096,
+            space: 80,
+            wrap: 20,
+            pin_count: AtomicUsize::new(1),
+        };
+        let request = Request {
+            ring_id: 11,
+            reserved_space: 24,
+        };
+        let mut backend = Backend {
+            words: vec![0xa5a5_a5a5; 1024],
+        };
+        let span =
+            intel_ring_begin(&mut ring, &request, &Timeline::default(), 8, &mut backend).unwrap();
+        assert_eq!(
+            span,
+            RingSpan {
+                byte_offset: 0,
+                dwords: 8
+            }
+        );
+        assert!(
+            backend.words[1018..1024]
+                .iter()
+                .all(|word| *word == MI_NOOP)
+        );
+        assert_eq!(ring.emit, 32);
+        assert_eq!(ring.space, 24);
+    }
 }
