@@ -37,6 +37,7 @@ mod rate;
 mod registers;
 mod rings;
 mod rx;
+mod rx_buffer;
 mod rx_event;
 mod rx_packet;
 mod scan;
@@ -211,6 +212,10 @@ pub use rings::{
 pub use rx::{
     RX_PHY_INFO_BYTES, RxMetadataError, RxPhyInfo, noise_dbm, parse_rx_phy_info,
     signal_strength_dbm,
+};
+pub use rx_buffer::{
+    RX_BUFFER_SIZE, RX_MPDU_COMMAND, RX_PACKET_MINIMUM_BYTES, RxBufferError, RxBufferReport,
+    RxMbufPlan, process_rx_buffer, rx_buffer_packet_error,
 };
 pub use rx_event::{FirmwareEvent, decode_firmware_event, process_command_response};
 pub use rx_packet::{

@@ -90,3 +90,7 @@ driver core can bind them to TheKernel's network and task APIs.
 Firmware LMAC/UMAC error-table word layouts, family-dependent pointer floors,
 SYSASSERT descriptions, and status-dump fields are parsed in source order for
 diagnostics.
+
+The RX transfer-buffer walker now applies source framing/alignment, first-MPDU
+ring replacement, pre-AX210 copy-vs-transfer ownership, AX210 single-packet
+handling, command-response retirement, and notification ACK suppression.
