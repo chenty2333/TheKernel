@@ -23,6 +23,7 @@ const PCIE_LINK_SPEED_MASK: u16 = 0x000f;
 const PCIE_LINK_WIDTH_MASK: u16 = 0x03f0;
 const PCIE_LINK_WIDTH_SHIFT: u32 = 4;
 const AUTO_READ_DONE_TIMEOUT_MS: usize = 10;
+const SWFW_SYNC_TIMEOUT: usize = 200;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum E1000BusType {
@@ -253,6 +254,98 @@ pub fn get_auto_rd_done_generic<I: E1000RegisterIo>(io: &mut I) -> DevResult {
     Err(DevError::Io)
 }
 
+/// upstream: e1000_mac.c e1000_validate_mdi_setting_generic()
+pub fn validate_mdi_setting_generic(autoneg: bool, mdix: &mut u8) -> DevResult {
+    if !autoneg && (*mdix == 0 || *mdix == 3) {
+        *mdix = 1;
+        return Err(DevError::InvalidParam);
+    }
+    Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_validate_mdi_setting_crossover_generic()
+pub const fn validate_mdi_setting_crossover_generic() -> DevResult {
+    Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_write_8bit_ctrl_reg_generic()
+pub fn write_8bit_ctrl_reg_generic<I: E1000RegisterIo>(
+    io: &mut I,
+    register: u32,
+    offset: u32,
+    data: u8,
+) -> DevResult {
+    let value = u32::from(data) | (offset << E1000_GEN_CTL_ADDRESS_SHIFT);
+    io.write_register(register, value)?;
+    for _ in 0..E1000_GEN_POLL_TIMEOUT {
+        io.delay_us(5);
+        if io.read_register(register)? & E1000_GEN_CTL_READY != 0 {
+            return Ok(());
+        }
+    }
+    Err(DevError::Io)
+}
+
+/// upstream: e1000_mac.c e1000_get_hw_semaphore_generic()
+pub fn get_hw_semaphore_generic<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    for _ in 0..E1000_SWSM_TIMEOUT {
+        if io.read_register(E1000_SWSM)? & E1000_SWSM_SMBI == 0 {
+            break;
+        }
+        io.delay_us(50);
+    }
+    if io.read_register(E1000_SWSM)? & E1000_SWSM_SMBI != 0 {
+        return Err(DevError::ResourceBusy);
+    }
+
+    for _ in 0..E1000_SWSM_TIMEOUT {
+        let swsm = io.read_register(E1000_SWSM)?;
+        io.write_register(E1000_SWSM, swsm | E1000_SWSM_SWESMBI)?;
+        if io.read_register(E1000_SWSM)? & E1000_SWSM_SWESMBI != 0 {
+            return Ok(());
+        }
+        io.delay_us(50);
+    }
+    put_hw_semaphore(io)?;
+    Err(DevError::ResourceBusy)
+}
+
+/// upstream: e1000_mac.c e1000_put_hw_semaphore()
+pub fn put_hw_semaphore<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    let swsm = io.read_register(E1000_SWSM)?;
+    io.write_register(E1000_SWSM, swsm & !(E1000_SWSM_SMBI | E1000_SWSM_SWESMBI))
+}
+
+/// upstream: e1000_mac.c e1000_acquire_swfw_sync()
+pub fn acquire_swfw_sync<I: E1000RegisterIo>(io: &mut I, mask: u16) -> DevResult {
+    let sw_mask = u32::from(mask);
+    let fw_mask = sw_mask << 16;
+    for _ in 0..SWFW_SYNC_TIMEOUT {
+        get_hw_semaphore_generic(io)?;
+        let mut sync = io.read_register(E1000_SW_FW_SYNC)?;
+        if sync & (fw_mask | sw_mask) == 0 {
+            sync |= sw_mask;
+            io.write_register(E1000_SW_FW_SYNC, sync)?;
+            put_hw_semaphore(io)?;
+            return Ok(());
+        }
+        put_hw_semaphore(io)?;
+        io.delay_us(5000);
+    }
+    Err(DevError::ResourceBusy)
+}
+
+/// upstream: e1000_mac.c e1000_release_swfw_sync()
+pub fn release_swfw_sync<I: E1000RegisterIo>(io: &mut I, mask: u16) -> DevResult {
+    // The C implementation waits until the hardware semaphore is acquired.
+    // Preserve that synchronization order; the register access is bounded by
+    // the device's semaphore helper and can fail only on MMIO failure here.
+    get_hw_semaphore_generic(io)?;
+    let sync = io.read_register(E1000_SW_FW_SYNC)?;
+    io.write_register(E1000_SW_FW_SYNC, sync & !u32::from(mask))?;
+    put_hw_semaphore(io)
+}
+
 /// upstream: e1000_mac.c e1000_null_ops_generic()
 pub const fn null_ops_generic() -> i32 {
     0
@@ -412,16 +505,25 @@ mod tests {
         status: u32,
         eecd: u32,
         delays: usize,
+        ready_register: Option<u32>,
     }
     impl E1000RegisterIo for Registers {
         fn read_register(&mut self, register: u32) -> DevResult<u32> {
-            Ok(if register == E1000_STATUS {
-                self.status
-            } else if register == E1000_EECD {
-                self.eecd
-            } else {
-                0
-            })
+            if register == E1000_STATUS {
+                return Ok(self.status);
+            }
+            if register == E1000_EECD {
+                return Ok(self.eecd);
+            }
+            if self.ready_register == Some(register) {
+                return Ok(E1000_GEN_CTL_READY);
+            }
+            Ok(self
+                .writes
+                .iter()
+                .rev()
+                .find_map(|(written, value)| (*written == register).then_some(*value))
+                .unwrap_or(0))
         }
         fn write_register(&mut self, register: u32, value: u32) -> DevResult {
             self.writes.push((register, value));
@@ -575,6 +677,45 @@ mod tests {
         assert_eq!(
             commit_fc_settings_generic(&mut io, FlowControlMode::None).unwrap(),
             E1000_TXCW_ANE | E1000_TXCW_FD
+        );
+    }
+
+    #[test]
+    fn generic_phy_mdi_and_register_semaphore_paths_are_bounded() {
+        let mut mdi = 3;
+        assert!(validate_mdi_setting_generic(false, &mut mdi).is_err());
+        assert_eq!(mdi, 1);
+        assert!(validate_mdi_setting_crossover_generic().is_ok());
+
+        let mut io = Registers {
+            ready_register: Some(E1000_SCTL),
+            ..Registers::default()
+        };
+        write_8bit_ctrl_reg_generic(&mut io, E1000_SCTL, 0x12, 0x34).unwrap();
+        assert_eq!(io.writes[0], (E1000_SCTL, (0x12 << 8) | 0x34));
+        get_hw_semaphore_generic(&mut io).unwrap();
+        assert_ne!(io.writes.last().unwrap().1 & E1000_SWSM_SWESMBI, 0);
+        put_hw_semaphore(&mut io).unwrap();
+        assert_eq!(io.writes.last().unwrap().1 & E1000_SWSM_SWESMBI, 0);
+        acquire_swfw_sync(&mut io, 0x20).unwrap();
+        assert_eq!(
+            io.writes
+                .iter()
+                .rev()
+                .find(|(r, _)| *r == E1000_SW_FW_SYNC)
+                .unwrap()
+                .1,
+            0x20
+        );
+        release_swfw_sync(&mut io, 0x20).unwrap();
+        assert_eq!(
+            io.writes
+                .iter()
+                .rev()
+                .find(|(r, _)| *r == E1000_SW_FW_SYNC)
+                .unwrap()
+                .1,
+            0
         );
     }
 
