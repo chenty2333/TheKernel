@@ -42,6 +42,7 @@ struct BoundChannel {
 fn map_transport_error(error: axdriver::BluetoothError) -> AxError {
     match error {
         axdriver::BluetoothError::NoDevice => LinuxError::ENODEV.into(),
+        axdriver::BluetoothError::Again => LinuxError::EAGAIN.into(),
         axdriver::BluetoothError::Busy => LinuxError::EBUSY.into(),
         axdriver::BluetoothError::NotUp => LinuxError::ENETDOWN.into(),
         axdriver::BluetoothError::Truncated | axdriver::BluetoothError::InvalidLength => {
@@ -366,7 +367,11 @@ impl FileLike for HciSocket {
             packet.resize(capacity, 0);
             let length = adapter
                 .lock()
-                .receive_channel_event(binding.channel, &mut packet)
+                .receive_channel_packet(
+                    binding.channel,
+                    &mut packet,
+                    self.nonblocking.load(Ordering::Acquire),
+                )
                 .map_err(map_transport_error)?;
             return dst.write(&packet[..length]);
         }

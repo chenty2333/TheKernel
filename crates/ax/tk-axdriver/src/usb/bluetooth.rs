@@ -37,6 +37,103 @@ struct Transport {
     event: crab_usb::EndpointHandle,
     acl_in: crab_usb::EndpointHandle,
     acl_out: crab_usb::EndpointHandle,
+    // The buffers stay at stable addresses while their xHCI requests are
+    // outstanding; only a reclaimed completion permits CPU access.
+    event_buffer: [u8; 260],
+    acl_buffer: [u8; 1028],
+    event_request: Option<RequestId>,
+    acl_request: Option<RequestId>,
+    event_ready: Option<usize>,
+    acl_ready: Option<usize>,
+}
+
+impl Transport {
+    fn submit_event(&mut self) -> Result<(), Error> {
+        if self.event_request.is_none() && self.event_ready.is_none() {
+            let request = TransferRequest::interrupt_in(&mut self.event_buffer);
+            self.event_request = Some(
+                self.host
+                    .submit(&self.event, request)
+                    .map_err(|_| Error::NoDevice)?,
+            );
+        }
+        Ok(())
+    }
+
+    fn submit_acl(&mut self) -> Result<(), Error> {
+        if self.acl_request.is_none() && self.acl_ready.is_none() {
+            let request = TransferRequest::bulk_in(&mut self.acl_buffer);
+            self.acl_request = Some(
+                self.host
+                    .submit(&self.acl_in, request)
+                    .map_err(|_| Error::NoDevice)?,
+            );
+        }
+        Ok(())
+    }
+
+    fn reclaim_event(&mut self) -> Result<(), Error> {
+        let Some(id) = self.event_request else {
+            return Ok(());
+        };
+        if let Some(completion) = self
+            .host
+            .reclaim(&self.event, id)
+            .map_err(|_| Error::NoDevice)?
+        {
+            self.event_request = None;
+            if completion.status != TransferStatus::Completed {
+                return Err(Error::NoDevice);
+            }
+            self.event_ready = Some(completion.actual_length);
+        }
+        Ok(())
+    }
+
+    fn reclaim_acl(&mut self) -> Result<(), Error> {
+        let Some(id) = self.acl_request else {
+            return Ok(());
+        };
+        if let Some(completion) = self
+            .host
+            .reclaim(&self.acl_in, id)
+            .map_err(|_| Error::NoDevice)?
+        {
+            self.acl_request = None;
+            if completion.status != TransferStatus::Completed {
+                return Err(Error::NoDevice);
+            }
+            self.acl_ready = Some(completion.actual_length);
+        }
+        Ok(())
+    }
+
+    fn cancel_request(&mut self, endpoint: &crab_usb::EndpointHandle, id: RequestId) {
+        if self.host.reclaim(endpoint, id).ok().flatten().is_some() {
+            return;
+        }
+        if endpoint.cancel(id).is_err() {
+            if self.host.reclaim(endpoint, id).ok().flatten().is_some() {
+                return;
+            }
+            self.host.halt();
+            return;
+        }
+        loop {
+            if self.host.pump().is_err() {
+                self.host.halt();
+                return;
+            }
+            match self.host.reclaim(endpoint, id) {
+                Ok(Some(_)) => return,
+                Ok(None) => core::hint::spin_loop(),
+                Err(_) => {
+                    self.host.halt();
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn endpoint(
@@ -89,6 +186,12 @@ impl UsbBluetoothHci {
                     event,
                     acl_in,
                     acl_out,
+                    event_buffer: [0; 260],
+                    acl_buffer: [0; 1028],
+                    event_request: None,
+                    acl_request: None,
+                    event_ready: None,
+                    acl_ready: None,
                 },
                 index,
             ),
@@ -196,6 +299,43 @@ impl UsbBluetoothHci {
             }
         }
         out[0] = 4;
+        Ok(length + 1)
+    }
+    /// Receive a Linux raw HCI packet or monitor record, multiplexing the USB
+    /// event and ACL IN endpoints while keeping endpoint DMA buffers owned by
+    /// the transport until each request completes.
+    pub fn receive_channel_packet(
+        &mut self,
+        channel: u16,
+        out: &mut [u8],
+        nonblocking: bool,
+    ) -> Result<usize, Error> {
+        if channel == 2 {
+            if let Some(frame) = self.adapter.pop_monitor() {
+                if frame.len() > out.len() {
+                    return Err(Error::InvalidLength);
+                }
+                out[..frame.len()].copy_from_slice(&frame);
+                return Ok(frame.len());
+            }
+        }
+        if out.is_empty() {
+            return Err(Error::InvalidLength);
+        }
+        let (kind, length) = self.adapter.receive_packet(&mut out[1..], nonblocking)?;
+        if channel == 2 {
+            let frame = self.adapter.pop_monitor().ok_or(Error::Again)?;
+            if frame.len() > out.len() {
+                return Err(Error::InvalidLength);
+            }
+            out[..frame.len()].copy_from_slice(&frame);
+            return Ok(frame.len());
+        }
+        out[0] = match kind {
+            tk_bt_hci::PacketType::Event => 4,
+            tk_bt_hci::PacketType::Acl => 2,
+            _ => return Err(Error::Unsupported),
+        };
         Ok(length + 1)
     }
     pub fn submit(
@@ -421,7 +561,58 @@ impl UsbTransport for Transport {
             .transfer(&self.acl_in, TransferRequest::bulk_in(out))
             .map_err(|_| Error::NoDevice)
     }
-    fn stop(&mut self) {}
+    fn read_packet(
+        &mut self,
+        out: &mut [u8],
+        nonblocking: bool,
+    ) -> Result<Option<(tk_bt_hci::PacketType, usize)>, Error> {
+        if out.is_empty() {
+            return Err(Error::InvalidLength);
+        }
+        loop {
+            self.submit_event()?;
+            self.submit_acl()?;
+            self.host.pump().map_err(|_| Error::NoDevice)?;
+            self.reclaim_event()?;
+            self.reclaim_acl()?;
+            if let Some(length) = self.event_ready {
+                if length > out.len() {
+                    return Err(Error::InvalidLength);
+                }
+                if length != 0 {
+                    out[..length].copy_from_slice(&self.event_buffer[..length]);
+                    self.event_ready = None;
+                    return Ok(Some((tk_bt_hci::PacketType::Event, length)));
+                }
+                self.event_ready = None;
+            }
+            if let Some(length) = self.acl_ready {
+                if length > out.len() {
+                    return Err(Error::InvalidLength);
+                }
+                if length != 0 {
+                    out[..length].copy_from_slice(&self.acl_buffer[..length]);
+                    self.acl_ready = None;
+                    return Ok(Some((tk_bt_hci::PacketType::Acl, length)));
+                }
+                self.acl_ready = None;
+            }
+            if nonblocking {
+                return Ok(None);
+            }
+            core::hint::spin_loop();
+        }
+    }
+    fn stop(&mut self) {
+        if let Some(id) = self.event_request.take() {
+            self.cancel_request(&self.event.clone(), id);
+        }
+        if let Some(id) = self.acl_request.take() {
+            self.cancel_request(&self.acl_in.clone(), id);
+        }
+        self.event_ready = None;
+        self.acl_ready = None;
+    }
 }
 
 pub type RegisteredHci = Arc<Mutex<UsbBluetoothHci>>;

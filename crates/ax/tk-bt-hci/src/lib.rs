@@ -62,6 +62,7 @@ pub enum Error {
     NoDevice,
     Busy,
     NotUp,
+    Again,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +108,15 @@ pub trait UsbTransport {
     fn bulk_acl_out(&mut self, packet: &[u8]) -> Result<(), Error>;
     fn read_interrupt_event(&mut self, out: &mut [u8]) -> Result<usize, Error>;
     fn read_bulk_acl(&mut self, out: &mut [u8]) -> Result<usize, Error>;
+    /// Nonblocking, multiplexed receive of HCI events and ACL packets. The
+    /// transport may retain endpoint requests between calls.
+    fn read_packet(
+        &mut self,
+        _out: &mut [u8],
+        _nonblocking: bool,
+    ) -> Result<Option<(PacketType, usize)>, Error> {
+        Ok(None)
+    }
     fn stop(&mut self);
 }
 
@@ -356,6 +366,40 @@ impl<T: UsbTransport> Adapter<T> {
                 Err(error)
             }
         }
+    }
+    /// Receive a single event or ACL packet with Linux HCI packet type
+    /// framing left to the socket adapter. Monitor capture is updated here.
+    pub fn receive_packet(
+        &mut self,
+        out: &mut [u8],
+        nonblocking: bool,
+    ) -> Result<(PacketType, usize), Error> {
+        let Some((kind, length)) = self.transport.read_packet(out, nonblocking)? else {
+            return Err(Error::Again);
+        };
+        if length > out.len() {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(Error::InvalidLength);
+        }
+        let bytes = &out[..length];
+        let parsed = Packet::parse(kind, bytes);
+        if let Err(error) = parsed {
+            self.stats.err_rx = self.stats.err_rx.saturating_add(1);
+            return Err(error);
+        }
+        match kind {
+            PacketType::Event => {
+                self.stats.evt_rx = self.stats.evt_rx.saturating_add(1);
+                self.queue_monitor(3, bytes);
+            }
+            PacketType::Acl => {
+                self.stats.acl_rx = self.stats.acl_rx.saturating_add(1);
+                self.queue_monitor(5, bytes);
+            }
+            _ => return Err(Error::Unsupported),
+        }
+        self.stats.byte_rx = self.stats.byte_rx.saturating_add(length as u32);
+        Ok((kind, length))
     }
     // upstream: iwmbt_hw.c iwmbt_hci_command()
     /// Send an HCI command and read its matching Command Complete event. This
@@ -752,6 +796,38 @@ mod tests {
         events: VecDeque<Vec<u8>>,
         bulk: Vec<Vec<u8>>,
     }
+    struct RxFake {
+        packet: Option<(PacketType, Vec<u8>)>,
+    }
+    impl UsbTransport for RxFake {
+        fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn bulk_acl_out(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn read_interrupt_event(&mut self, _: &mut [u8]) -> Result<usize, Error> {
+            Err(Error::Unsupported)
+        }
+        fn read_bulk_acl(&mut self, _: &mut [u8]) -> Result<usize, Error> {
+            Err(Error::Unsupported)
+        }
+        fn read_packet(
+            &mut self,
+            out: &mut [u8],
+            _: bool,
+        ) -> Result<Option<(PacketType, usize)>, Error> {
+            let Some((kind, packet)) = self.packet.take() else {
+                return Ok(None);
+            };
+            if packet.len() > out.len() {
+                return Err(Error::InvalidLength);
+            }
+            out[..packet.len()].copy_from_slice(&packet);
+            Ok(Some((kind, packet.len())))
+        }
+        fn stop(&mut self) {}
+    }
     impl UsbTransport for FirmwareFake {
         fn control_command(&mut self, _: &[u8]) -> Result<(), Error> {
             Ok(())
@@ -891,6 +967,27 @@ mod tests {
         assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), 1028);
         assert_eq!(frame.len(), 1034);
         assert_eq!(frame[1033], 0xaa);
+    }
+    #[test]
+    fn received_acl_is_counted_and_captured_for_monitors() {
+        let mut adapter = Adapter::new(
+            RxFake {
+                packet: Some((PacketType::Acl, vec![1, 0, 2, 0, 0xaa, 0xbb])),
+            },
+            3,
+        );
+        adapter.open(Channel::Monitor).unwrap();
+        adapter.set_up(true).unwrap();
+        let mut packet = [0u8; 16];
+        assert_eq!(
+            adapter.receive_packet(&mut packet, true),
+            Ok((PacketType::Acl, 6))
+        );
+        let monitor = adapter.pop_monitor().unwrap();
+        assert_eq!(u16::from_le_bytes([monitor[0], monitor[1]]), 5);
+        assert_eq!(u16::from_le_bytes([monitor[2], monitor[3]]), 3);
+        assert_eq!(&monitor[6..], &[1, 0, 2, 0, 0xaa, 0xbb]);
+        assert_eq!(adapter.statistics().acl_rx, 1);
     }
     #[test]
     fn empty_controller_reports_no_device() {
