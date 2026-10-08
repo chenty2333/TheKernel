@@ -1676,6 +1676,7 @@ fn generate_lfp_data_ptrs(vbt: &Vbt<'_>) -> Result<Option<LfpDataPointers>, Erro
     Ok(Some(pointers))
 }
 
+// upstream: intel_bios.c parse_psr()
 const fn psr_wakeup_time(code: u16, psr2: bool) -> u32 {
     match code {
         0 => 500,
@@ -1686,6 +1687,7 @@ const fn psr_wakeup_time(code: u16, psr2: bool) -> u32 {
     }
 }
 
+// upstream: intel_bios.c parse_edp() lane selector
 const fn decode_edp_lanes(lanes: u8) -> Option<u8> {
     match lanes {
         0 => Some(1),
@@ -1715,6 +1717,7 @@ const fn decode_edp_vswing(value: u8) -> Option<u8> {
     }
 }
 
+// upstream: intel_bios.c parse_edp() link-rate selector
 const fn decode_edp_rate(rate: u8) -> u32 {
     match rate {
         0 => 162_000,
@@ -1883,6 +1886,68 @@ impl<'a> IntelBios<'a> {
             pnpid: vbt.and_then(|vbt| edid_product_id.and_then(|edid| vbt.pnpid_panel_type(edid))),
             use_fallback,
         })
+    }
+
+    /// Early panel init uses OpRegion/VBT only; an unresolved PnP sentinel is deferred.
+    // upstream: intel_bios.c intel_bios_init_panel_early()
+    pub fn intel_bios_init_panel_early(
+        &self,
+        opregion_panel_type: Option<u8>,
+        second_panel: bool,
+    ) -> Option<PanelVbtData> {
+        let panel_type = get_panel_type(PanelTypeCandidates {
+            opregion: opregion_panel_type,
+            vbt: self
+                .vbt
+                .as_ref()
+                .and_then(|vbt| vbt.vbt_panel_type(second_panel)),
+            pnpid: None,
+            use_fallback: false,
+        })?;
+        Some(self.init_panel(panel_type, self.display_version))
+    }
+
+    /// Late init preserves an already selected panel or resolves EDID PnP/fallback.
+    // upstream: intel_bios.c intel_bios_init_panel_late()
+    pub fn intel_bios_init_panel_late(
+        &self,
+        existing: Option<PanelVbtData>,
+        opregion_panel_type: Option<u8>,
+        edid_product_id: Option<PanelPnpId>,
+        second_panel: bool,
+        use_fallback: bool,
+    ) -> Option<PanelVbtData> {
+        existing.or_else(|| {
+            let panel_type = self.select_panel_type(
+                opregion_panel_type,
+                edid_product_id,
+                second_panel,
+                use_fallback,
+            )?;
+            Some(self.init_panel(panel_type, self.display_version))
+        })
+    }
+
+    /// Release panel-owned parsed buffers through ordinary Rust ownership.
+    // upstream: intel_bios.c intel_bios_fini_panel()
+    pub fn intel_bios_fini_panel(panel: PanelVbtData) {
+        drop(panel);
+    }
+
+    /// Visit children in BDB order, including entries with an unmapped port.
+    // upstream: intel_bios.c intel_bios_for_each_encoder()
+    pub fn intel_bios_for_each_encoder(&self, mut visit: impl FnMut(ChildDevice<'a>)) {
+        if let Some(definitions) = &self.definitions {
+            for child in definitions.children() {
+                visit(child);
+            }
+        }
+    }
+
+    /// Release BIOS-owned child, BDB and DSC data through Rust ownership.
+    // upstream: intel_bios.c intel_bios_driver_remove()
+    pub fn intel_bios_driver_remove(self) {
+        drop(self);
     }
 
     /// Parse per-panel information after the caller has selected panel_type.
@@ -3714,6 +3779,12 @@ mod tests {
         assert_eq!(init.fallback_children[1].port, Port::B);
         assert!(init.fallback_children[0].device_type & (1 << 12) != 0);
         assert!(init.fallback_children[1].device_type & (1 << 4) != 0);
+        assert!(init.intel_bios_init_panel_early(None, false).is_none());
+        let late = init
+            .intel_bios_init_panel_late(None, None, None, false, true)
+            .unwrap();
+        assert_eq!(late.panel_type, 0);
+        IntelBios::intel_bios_fini_panel(late);
 
         let invalid = intel_bios_init(
             Some(b"not a vbt"),
@@ -3928,6 +3999,28 @@ mod tests {
         );
         assert!(is_panel_type_valid_or_pnp(255));
         assert!(!is_panel_type_valid_or_pnp(16));
+    }
+
+    #[test]
+    fn validated_vbt_source_order_prefers_firmware_and_searches_rom_signature() {
+        let firmware = table(&tc_hdmi(), 39);
+        let mut opregion = table(&tc_hdmi(), 39);
+        opregion[64..66].copy_from_slice(&250u16.to_le_bytes());
+        let selected = intel_bios_get_vbt(
+            VbtCandidates {
+                firmware: Some(&firmware),
+                opregion: Some(&opregion),
+                spi_rom: None,
+                pci_rom: None,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(selected.version, 249);
+        let mut rom = vec![0x55; 32];
+        rom.extend_from_slice(&opregion);
+        assert_eq!(oprom_get_vbt(&rom).unwrap().version, 250);
+        assert!(firmware_get_vbt(Some(b"invalid")).is_none());
     }
 
     #[test]
