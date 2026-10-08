@@ -143,6 +143,59 @@ const GEN12_ENGINE_INSTANCE_REGS: [u32; 33] = [
 ];
 const GEN12_RENDER_CLASS_REGS: [u32; 3] = [0x7100, 0x7104, 0x7108];
 const GEN12_VIDEO_ENHANCE_CLASS_REGS: [u32; 4] = [0x1cc000, 0x1cd000, 0x1ce000, 0x1cf000];
+const GEN12_GLOBAL_REG_NAMES: [&str; 9] = [
+    "FORCEWAKE",
+    "ERROR_GEN6",
+    "DONE_REG",
+    "HSW_GTT_CACHE_EN",
+    "GEN12_FAULT_TLB_DATA0",
+    "GEN12_FAULT_TLB_DATA1",
+    "AUX_ERR_DBG",
+    "GAM_DONE",
+    "FAULT_REG",
+];
+const GEN12_ENGINE_INSTANCE_REG_NAMES: [&str; 33] = [
+    "RC PSMI",
+    "ESR",
+    "RING_DMA_FADD_LDW",
+    "RING_DMA_FADD_UDW",
+    "EIR",
+    "IPEIR",
+    "IPEHR",
+    "INSTPS",
+    "RING_BBADDR_LOW32",
+    "RING_BBADDR_UP32",
+    "BB_STATE",
+    "CCID",
+    "ACTHD_LDW",
+    "ACTHD_UDW",
+    "INSTPM",
+    "INSTDONE",
+    "RING_NOPID",
+    "START",
+    "HEAD",
+    "TAIL",
+    "CTL",
+    "MODE",
+    "RING_CONTEXT_CONTROL",
+    "HWS",
+    "GFX_MODE",
+    "PDP0_LDW",
+    "PDP0_UDW",
+    "PDP1_LDW",
+    "PDP1_UDW",
+    "PDP2_LDW",
+    "PDP2_UDW",
+    "PDP3_LDW",
+    "PDP3_UDW",
+];
+const GEN12_RENDER_CLASS_REG_NAMES: [&str; 3] = [
+    "GEN7_SC_INSTDONE",
+    "GEN12_SC_INSTDONE_EXTRA",
+    "GEN12_SC_INSTDONE_EXTRA2",
+];
+const GEN12_VIDEO_ENHANCE_CLASS_REG_NAMES: [&str; 4] =
+    ["SFC_DONE[0]", "SFC_DONE[1]", "SFC_DONE[2]", "SFC_DONE[3]"];
 
 /// Return the static Xe_LP/Gen12 register list selected by the source table.
 /// Engine-instance entries are relative to the engine MMIO base.
@@ -181,6 +234,38 @@ pub fn gen12_static_registers(
         });
     }
     Some(registers)
+}
+
+/// Resolve a register's source name for GuC error-state output.
+/// upstream: intel_guc_capture.c guc_capture_reg_to_str().
+pub fn gen12_register_name(
+    list_type: u32,
+    guc_class: u32,
+    engine_base: u32,
+    offset: u32,
+) -> Option<&'static str> {
+    let (offsets, names): (&[u32], &[&str]) = match list_type {
+        0 => (&GEN12_GLOBAL_REGS, &GEN12_GLOBAL_REG_NAMES),
+        1 if guc_class == 0 => (&GEN12_RENDER_CLASS_REGS, &GEN12_RENDER_CLASS_REG_NAMES),
+        1 if guc_class == 2 => (
+            &GEN12_VIDEO_ENHANCE_CLASS_REGS,
+            &GEN12_VIDEO_ENHANCE_CLASS_REG_NAMES,
+        ),
+        2 if guc_class <= 4 => (
+            &GEN12_ENGINE_INSTANCE_REGS,
+            &GEN12_ENGINE_INSTANCE_REG_NAMES,
+        ),
+        _ => return None,
+    };
+    let relative = if list_type == 2 {
+        offset.checked_sub(engine_base)?
+    } else {
+        offset
+    };
+    offsets
+        .iter()
+        .position(|candidate| *candidate == relative)
+        .and_then(|index| names.get(index).copied())
 }
 
 #[derive(Clone, Copy)]
@@ -801,6 +886,14 @@ mod tests {
         assert_eq!(instance[0].offset, 0x2050);
         assert_eq!(instance[32].offset, 0x228c);
         assert!(gen12_static_registers(1, 0, 0, 0).is_none());
+        assert_eq!(
+            gen12_register_name(0, 0, 0, 0xceb8),
+            Some("GEN12_FAULT_TLB_DATA0")
+        );
+        assert_eq!(gen12_register_name(1, 2, 0, 0x1ce000), Some("SFC_DONE[2]"));
+        assert_eq!(gen12_register_name(2, 3, 0x2000, 0x2068), Some("IPEHR"));
+        assert_eq!(gen12_register_name(2, 3, 0x2000, 0x2064), Some("IPEIR"));
+        assert_eq!(gen12_register_name(2, 3, 0x2000, 0x9999), None);
     }
 
     #[test]
