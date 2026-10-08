@@ -1912,6 +1912,7 @@ mod tests {
         fail_offset: Option<u32>,
         stall: bool,
         fail_surface: bool,
+        frame_pixel_pending: bool,
     }
     impl Model {
         fn new() -> Self {
@@ -1967,6 +1968,7 @@ mod tests {
                 (0x44304, 0),
                 (0x4438c, 0),
                 (0x70040, 0),
+                (0x70044, 0),
             ] {
                 words.insert(r, v);
             }
@@ -2055,6 +2057,7 @@ mod tests {
                     fail_offset: None,
                     stall: false,
                     fail_surface: false,
+                    frame_pixel_pending: false,
                 })),
             }
         }
@@ -2075,9 +2078,16 @@ mod tests {
                 return Some(*line);
             }
             if r == 0x70040 && s.frames {
+                let pending = core::mem::replace(&mut s.frame_pixel_pending, false);
                 let v = s.words.get_mut(&r)?;
-                *v = v.wrapping_add(1);
+                if !pending {
+                    *v = v.wrapping_add(1);
+                }
                 return Some(*v);
+            }
+            if r == 0x70044 && s.frames {
+                s.frame_pixel_pending = true;
+                return s.words.get(&r).copied();
             }
             if (0x168000..0x169000).contains(&r) {
                 let bank = s.words.get(&0x1010a0)? & 15;
