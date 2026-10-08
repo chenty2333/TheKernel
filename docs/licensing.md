@@ -761,3 +761,8 @@ crate `LICENSE-MIT` preserve the grant.
 `kernel/src/drm/color_mgmt_full.rs` translates 26 color-management functions
 from Linux 7.2.3 `drm_color_mgmt.c` (MIT-style grant, © 2016 Intel); its full
 license text remains in the source and `kernel/LICENSES/LicenseRef-Intel-Color-Mgmt-MIT`.
+
+`kernel/src/drm/atomic_uapi_full.rs` translates 30 atomic UAPI functions from
+Linux 7.2.3 `drm_atomic_uapi.c` (MIT; Red Hat, Intel, and Linux Foundation
+copyrights); its full license text remains in the source and
+`kernel/LICENSES/LicenseRef-DRM-Atomic-UAPI-MIT`.

@@ -1254,3 +1254,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `crates/ax/tk-intel-display/src/intel_display_modeset_full.rs` translates 223 of 273 ctags function definitions from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_display.c` (MIT, Copyright © 2006-2007 Intel Corporation); 50 target-generation-excluded or DRM/GEM/debug boundary functions are enumerated with reasons in `docs/design/intel-display-modeset-full.md`. `LICENSE-MIT`.
 
 `kernel/src/drm/color_mgmt_full.rs` translates all 26 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_color_mgmt.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in the Rust source and `kernel/LICENSES/LicenseRef-Intel-Color-Mgmt-MIT`.
+
+`kernel/src/drm/atomic_uapi_full.rs` translates all 30 ctags definitions from Linux 7.2.3 `drivers/gpu/drm/drm_atomic_uapi.c` (MIT; Copyright (C) 2014 Red Hat, 2014/2018 Intel, and (c) 2020 The Linux Foundation); the full grant is retained in the source and `kernel/LICENSES/LicenseRef-DRM-Atomic-UAPI-MIT`.
