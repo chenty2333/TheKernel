@@ -112,6 +112,13 @@ const I82578_EPSCR_DOWNSHIFT_COUNTER_MASK: u16 = 0x001c;
 const BME1000_PSCR_ENABLE_DOWNSHIFT: u16 = 0x0800;
 const BME1000_E_PHY_ID_R2: u32 = 0x0141_0cb1;
 const M88E1111_I_PHY_ID: u32 = 0x0141_0cc0;
+const I347AT4_E_PHY_ID: u32 = 0x0141_0dc0;
+const M88E1340M_E_PHY_ID: u32 = 0x0141_0df0;
+const M88E1112_E_PHY_ID: u32 = 0x0141_0c90;
+const I210_I_PHY_ID: u32 = 0x0141_0c00;
+const M88E1543_E_PHY_ID: u32 = 0x0141_0ea0;
+const M88E1512_E_PHY_ID: u32 = 0x0141_0dd0;
+const M88E1000_PHY_PAGE_SELECT: u8 = 0x1d;
 const I347AT4_PSCR_DOWNSHIFT_ENABLE: u16 = 0x0800;
 const I347AT4_PSCR_DOWNSHIFT_MASK: u16 = 0x7000;
 const I347AT4_PSCR_DOWNSHIFT_6X: u16 = 0x5000;
@@ -650,6 +657,63 @@ pub fn phy_force_speed_duplex_igp<I: E1000PhyRegisterIo>(
         let _ = phy_has_link_generic(io, PHY_FORCE_LIMIT, 100_000, true)?;
     }
     Ok(())
+}
+
+/// upstream: e1000_phy.c e1000_phy_force_speed_duplex_m88()
+pub fn phy_force_speed_duplex_m88<I, L, C>(
+    io: &mut I,
+    phy_type: E1000PhyType,
+    phy_id: u32,
+    forced_speed_duplex: u16,
+    wait_to_complete: bool,
+    flow_control: &mut FlowControlMode,
+    mut poll_link: L,
+    mut commit: C,
+) -> DevResult
+where
+    I: E1000PhyRegisterIo,
+    L: FnMut(u32, u32) -> DevResult<bool>,
+    C: FnMut() -> DevResult,
+{
+    if phy_type != E1000PhyType::I210 {
+        let control = io.read_phy_register(M88E1000_PHY_SPEC_CTRL)? & !M88E1000_PSCR_AUTO_X_MODE;
+        io.write_phy_register(M88E1000_PHY_SPEC_CTRL, control)?;
+    }
+    let phy_control = io.read_phy_register(PHY_CONTROL)?;
+    let phy_control =
+        phy_force_speed_duplex_setup(io, flow_control, forced_speed_duplex, phy_control)?;
+    io.write_phy_register(PHY_CONTROL, phy_control)?;
+    commit()?;
+    if wait_to_complete {
+        let link = poll_link(PHY_FORCE_LIMIT, 100_000)?;
+        if !link {
+            let reset_dsp = match phy_id {
+                I347AT4_E_PHY_ID | M88E1340M_E_PHY_ID | M88E1112_E_PHY_ID | M88E1543_E_PHY_ID
+                | M88E1512_E_PHY_ID | I210_I_PHY_ID => false,
+                _ => phy_type == E1000PhyType::M88,
+            };
+            if reset_dsp {
+                io.write_phy_register(M88E1000_PHY_PAGE_SELECT, 0x001d)?;
+                phy_reset_dsp_generic(io, true)?;
+            }
+        }
+        let _ = poll_link(PHY_FORCE_LIMIT, 100_000)?;
+    }
+    if phy_type != E1000PhyType::M88
+        || matches!(
+            phy_id,
+            I347AT4_E_PHY_ID
+                | M88E1340M_E_PHY_ID
+                | M88E1112_E_PHY_ID
+                | I210_I_PHY_ID
+                | M88E1543_E_PHY_ID
+                | M88E1512_E_PHY_ID
+        )
+    {
+        return Ok(());
+    }
+    let extended = io.read_phy_register(M88E1000_EXT_PHY_SPEC_CTRL)? | M88E1000_EPSCR_TX_CLK_25;
+    io.write_phy_register(M88E1000_EXT_PHY_SPEC_CTRL, extended)
 }
 
 pub trait E1000PhyMdicOps: E1000RegisterIo {
@@ -2019,6 +2083,42 @@ mod tests {
             0xffff & !IGP01E1000_PSCR_AUTO_MDIX & !IGP01E1000_PSCR_FORCE_MDI_MDIX
         );
         assert_eq!(io.delay, 1);
+    }
+
+    #[test]
+    fn generic_m88_force_speed_commits_resets_dsp_and_restores_tx_clock() {
+        let mut io = Io::default();
+        io.phy[PHY_CONTROL as usize] = MII_CR_AUTO_NEG_EN;
+        let mut flow = FlowControlMode::Full;
+        let mut polls = 0;
+        let mut commits = 0;
+        phy_force_speed_duplex_m88(
+            &mut io,
+            E1000PhyType::M88,
+            0x0141_0c30,
+            ADVERTISE_100_FULL,
+            true,
+            &mut flow,
+            |iterations, interval| {
+                assert_eq!((iterations, interval), (PHY_FORCE_LIMIT, 100_000));
+                polls += 1;
+                Ok(polls > 1)
+            },
+            || {
+                commits += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(polls, 2);
+        assert_eq!(commits, 1);
+        assert!(io.phy_writes.contains(&(M88E1000_PHY_PAGE_SELECT, 0x1d)));
+        assert!(io.phy_writes.contains(&(M88E1000_PHY_GEN_CONTROL, 0xc1)));
+        assert_eq!(
+            io.phy_writes.last().unwrap(),
+            &(M88E1000_EXT_PHY_SPEC_CTRL, M88E1000_EPSCR_TX_CLK_25)
+        );
+        assert_eq!(flow, FlowControlMode::None);
     }
 
     #[test]
