@@ -14,6 +14,40 @@ const VFTA_REG_COUNT: usize = 128;
 const RAL: u32 = 0x05400;
 const RAH: u32 = 0x05404;
 
+/// upstream: e1000_mac.c e1000_null_ops_generic()
+pub const fn null_ops_generic() -> i32 {
+    0
+}
+
+/// upstream: e1000_mac.c e1000_null_mac_generic()
+pub const fn null_mac_generic() {}
+
+/// upstream: e1000_mac.c e1000_null_link_info()
+pub const fn null_link_info() -> (i32, u16, u16) {
+    (0, 0, 0)
+}
+
+/// upstream: e1000_mac.c e1000_null_mng_mode()
+pub const fn null_mng_mode() -> bool {
+    false
+}
+
+/// upstream: e1000_mac.c e1000_null_update_mc()
+pub const fn null_update_mc() {}
+
+/// upstream: e1000_mac.c e1000_null_write_vfta()
+pub const fn null_write_vfta() {}
+
+/// upstream: e1000_mac.c e1000_null_rar_set()
+pub const fn null_rar_set() -> i32 {
+    0
+}
+
+/// upstream: e1000_mac.c e1000_null_set_obff_timer()
+pub const fn null_set_obff_timer() -> i32 {
+    0
+}
+
 fn array_register(base: u32, index: usize, count: usize, limit: u32) -> DevResult<u32> {
     if index >= count {
         return Err(DevError::InvalidParam);
@@ -157,6 +191,18 @@ mod tests {
             io.writes,
             [(RAL, 0x3322_1102), (RAH, E1000_RAH_AV | 0x5544)]
         );
+    }
+
+    #[test]
+    fn generic_null_ops_preserve_success_and_false_defaults() {
+        assert_eq!(null_ops_generic(), 0);
+        null_mac_generic();
+        assert_eq!(null_link_info(), (0, 0, 0));
+        assert!(!null_mng_mode());
+        null_update_mc();
+        null_write_vfta();
+        assert_eq!(null_rar_set(), 0);
+        assert_eq!(null_set_obff_timer(), 0);
     }
 
     #[test]
