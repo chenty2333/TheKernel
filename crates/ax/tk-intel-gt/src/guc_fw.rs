@@ -38,6 +38,7 @@ const HXG_TYPE_NO_RESPONSE_BUSY: u32 = 3 << 28;
 const HXG_TYPE_NO_RESPONSE_RETRY: u32 = 5 << 28;
 const HXG_TYPE_RESPONSE_FAILURE: u32 = 6 << 28;
 const ACTION_AUTHENTICATE_HUC: u32 = 0x4000;
+pub const ACTION_CLIENT_SOFT_RESET: u32 = 0x5507;
 const ACTION_HOST2GUC_SELF_CFG: u32 = 0x0508;
 const UOS_RSA_SCRATCH: u32 = 0xc200;
 const UOS_RSA_SCRATCH_COUNT: usize = 64;
@@ -77,6 +78,30 @@ pub fn notify(io: &impl GtIo) -> Result<(), Error> {
 pub fn notify_with_regs(io: &impl GtIo, regs: GucSendRegs) -> Result<(), Error> {
     io.write(regs.host_interrupt, GUC_SEND_TRIGGER)
 }
+
+/// Suspend the GuC after device-idle coordination: issue CLIENT_SOFT_RESET
+/// only when submission is active, ignore its response failure as upstream
+/// does, then reset the GuC domain to sanitize firmware state.
+/// upstream: intel_guc.c intel_guc_suspend().
+pub fn suspend_guc(
+    io: &impl GtIo,
+    ready: bool,
+    submission_used: bool,
+    graphics_ip: (u8, u8),
+    mut client_soft_reset: impl FnMut() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if !ready {
+        return Ok(());
+    }
+    if submission_used {
+        let _ = client_soft_reset();
+    }
+    crate::reset::reset_guc(io, graphics_ip)
+}
+
+/// GuC has no extra resume action after sanitize/reinitialization.
+/// upstream: intel_guc.c intel_guc_resume().
+pub const fn resume_guc() {}
 
 /// Caller must keep the firmware bytes and their GGTT binding alive until this
 /// returns success and hold GT forcewake. An uncertain completion quarantines
@@ -551,7 +576,8 @@ fn wait_ucode_with(io: &impl GtIo, wait_us: u64, attempts: u8) -> Result<u32, Lo
 
 #[cfg(test)]
 mod tests {
-    use core::cell::Cell;
+    use alloc::vec::Vec;
+    use core::cell::{Cell, RefCell};
 
     use super::*;
 
@@ -578,6 +604,26 @@ mod tests {
         fn delay_us(&self, micros: u32) {
             self.time
                 .set(self.time.get().saturating_add(u64::from(micros)));
+        }
+    }
+
+    struct ResetIo {
+        writes: RefCell<Vec<(u32, u32)>>,
+        delayed: Cell<u32>,
+    }
+    impl GtIo for ResetIo {
+        fn read(&self, _offset: u32) -> Result<u32, Error> {
+            Ok(0)
+        }
+        fn write(&self, offset: u32, value: u32) -> Result<(), Error> {
+            self.writes.borrow_mut().push((offset, value));
+            Ok(())
+        }
+        fn now_us(&self) -> u64 {
+            0
+        }
+        fn delay_us(&self, micros: u32) {
+            self.delayed.set(self.delayed.get() + micros);
         }
     }
 
@@ -613,6 +659,41 @@ mod tests {
         assert_eq!(writes[0].value, 0x8607);
         assert_eq!(writes[1].offset, 0x13816c);
         assert_eq!(writes[1].value, 1);
+    }
+
+    #[test]
+    fn suspend_guc_soft_resets_only_submission_and_always_sanitizes_ready_guc() {
+        let io = ResetIo {
+            writes: RefCell::new(Vec::new()),
+            delayed: Cell::new(0),
+        };
+        let mut soft_reset_count = 0;
+        suspend_guc(&io, false, true, (12, 0), || {
+            soft_reset_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(soft_reset_count, 0);
+        assert!(io.writes.borrow().is_empty());
+
+        suspend_guc(&io, true, false, (12, 0), || {
+            soft_reset_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(soft_reset_count, 0);
+        assert_eq!(io.writes.borrow().len(), 2);
+
+        suspend_guc(&io, true, true, (12, 70), || {
+            soft_reset_count += 1;
+            Err(Error::Refused)
+        })
+        .unwrap();
+        assert_eq!(soft_reset_count, 1);
+        assert_eq!(io.writes.borrow().len(), 3);
+        assert_eq!(io.delayed.get(), 100);
+        assert_eq!(ACTION_CLIENT_SOFT_RESET, 0x5507);
+        resume_guc();
     }
 
     #[test]
