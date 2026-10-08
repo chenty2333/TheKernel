@@ -21,7 +21,12 @@ src/intel_bios.rs:
   parse_edp, parse_psr, lfp_data_min_size, validate_lfp_data_ptrs,
   fixup_lfp_data_ptrs, make_lfp_data_ptr, next_lfp_data_ptr,
   generate_lfp_data_ptrs, get_lfp_dvo_timing, get_lfp_fp_timing,
-  get_lfp_pnp_id, get_lfp_data_tail, fill_detail_timing_data.
+  get_lfp_pnp_id, get_lfp_data_tail, fill_detail_timing_data,
+  dsi_dvo_port_to_port, intel_bios_encoder_port, intel_bios_is_dsi_present,
+  parse_dsi_backlight_ports, parse_mipi_config, find_panel_sequence_block,
+  parse_mipi_sequence, goto_next_sequence, goto_next_sequence_v3.
+  drivers/gpu/drm/i915/display/intel_dsi_vbt_defs.h:
+  MIPI configuration, PPS and sequence layouts. Copyright © 2025 Intel Corporation.
   Copyright © 2006 Intel Corporation.
   drivers/gpu/drm/i915/display/intel_vbt_defs.h: selected byte-layout fields
   Copyright © 2006-2016 Intel Corporation.
