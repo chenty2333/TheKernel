@@ -1295,7 +1295,9 @@ pub fn build_parent_scratch(
     } else {
         size_of::<GuCProcessDescV69>()
     };
-    let semaphore_count = usize::from(child_count) + 2; // go + one join per child + parent join
+    // Struct storage is fixed for the maximum sibling count, even when this
+    // particular parent has fewer children.
+    let semaphore_count = MAX_ENGINE_INSTANCE + 2; // go + join[MAX_ENGINE_INSTANCE + 1]
     let semaphore_end = descriptor_size
         .checked_add(
             semaphore_count
@@ -1335,6 +1337,46 @@ pub fn build_parent_scratch(
         },
         scratch,
     ))
+}
+
+/// upstream: intel_guc_submission.c guc_lrc_desc_pool_create_v69().
+pub fn lrc_desc_pool_size(context_count: usize) -> Result<usize, Error> {
+    if context_count == 0 || context_count > GUC_MAX_CONTEXT_ID {
+        return Err(Error::Refused);
+    }
+    let bytes = context_count
+        .checked_mul(size_of::<GuCLrcDescV69>())
+        .ok_or(Error::Refused)?;
+    bytes
+        .checked_add(PARENT_SCRATCH_SIZE - 1)
+        .map(|rounded| rounded & !(PARENT_SCRATCH_SIZE - 1))
+        .ok_or(Error::Refused)
+}
+
+/// upstream: intel_guc_submission.c __get_lrc_desc_v69().
+pub fn lrc_desc_ggtt_offset(pool_ggtt: u32, context_id: u32) -> Result<u32, Error> {
+    if context_id as usize >= GUC_MAX_CONTEXT_ID {
+        return Err(Error::Refused);
+    }
+    pool_ggtt
+        .checked_add(
+            context_id
+                .checked_mul(size_of::<GuCLrcDescV69>() as u32)
+                .ok_or(Error::Refused)?,
+        )
+        .ok_or(Error::Refused)
+}
+
+/// upstream: intel_guc_submission.c _reset_lrc_desc_v69().
+pub fn reset_lrc_desc_v69(pool: &mut [u8], context_id: u32) -> Result<(), Error> {
+    let offset = usize::try_from(context_id)
+        .map_err(|_| Error::Refused)?
+        .checked_mul(size_of::<GuCLrcDescV69>())
+        .ok_or(Error::Refused)?;
+    pool.get_mut(offset..offset + size_of::<GuCLrcDescV69>())
+        .ok_or(Error::Refused)?
+        .fill(0);
+    Ok(())
 }
 
 fn write_dword(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), Error> {
@@ -1522,6 +1564,29 @@ mod tests {
         assert_eq!(
             work_queue_offset(2).unwrap(),
             (2 * PARENT_SCRATCH_SIZE + WQ_OFFSET) as u32
+        );
+    }
+
+    #[test]
+    fn v69_lrc_descriptor_pool_uses_source_page_rounding_and_offsets() {
+        let size = lrc_desc_pool_size(GUC_MAX_CONTEXT_ID).unwrap();
+        assert_eq!(size, 8 * 1024 * 1024);
+        assert_eq!(lrc_desc_ggtt_offset(0x20_0000, 2), Ok(0x20_0100));
+        assert_eq!(
+            lrc_desc_ggtt_offset(0x20_0000, GUC_MAX_CONTEXT_ID as u32),
+            Err(Error::Refused)
+        );
+        let mut pool = alloc::vec![0xaa; 2 * size_of::<GuCLrcDescV69>()];
+        reset_lrc_desc_v69(&mut pool, 1).unwrap();
+        assert!(
+            pool[size_of::<GuCLrcDescV69>()..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert!(
+            pool[..size_of::<GuCLrcDescV69>()]
+                .iter()
+                .all(|byte| *byte == 0xaa)
         );
     }
 
