@@ -200,8 +200,8 @@ pub const PROPERTIES: [Property; 22] = [
         id: CRTC_GAMMA_LUT_SIZE,
         name: "GAMMA_LUT_SIZE",
         flags: uapi::DRM_MODE_PROP_RANGE | uapi::DRM_MODE_PROP_IMMUTABLE,
-        min: 256,
-        max: 256,
+        min: 0,
+        max: u32::MAX as u64,
     },
 ];
 
@@ -315,7 +315,7 @@ mod tests {
         let property = super::get(CRTC_GAMMA_LUT_SIZE).unwrap();
         assert_ne!(property.flags & uapi::DRM_MODE_PROP_RANGE, 0);
         assert_ne!(property.flags & uapi::DRM_MODE_PROP_IMMUTABLE, 0);
-        assert_eq!((property.min, property.max), (256, 256));
+        assert_eq!((property.min, property.max), (0, u32::MAX as u64));
         assert!(super::object_properties(uapi::DRM_MODE_OBJECT_CRTC).contains(&CRTC_GAMMA_LUT_SIZE));
     }
 }
