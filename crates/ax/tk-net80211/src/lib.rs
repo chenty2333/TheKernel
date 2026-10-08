@@ -14,6 +14,7 @@ mod beacon;
 mod channel;
 mod crypto_bip;
 mod crypto_ccmp;
+mod crypto_wep;
 mod decrypt;
 mod disconnect_rx;
 mod frame;
@@ -62,6 +63,7 @@ pub use channel::{
 };
 pub use crypto_bip::{BipError, BipKey, bip_decap, bip_encap};
 pub use crypto_ccmp::{CcmpError, CcmpKey, decrypt_ccmp, encrypt_ccmp};
+pub use crypto_wep::{WepError, WepKey, decrypt_wep, encrypt_wep};
 pub use decrypt::{
     HardwareDecryptError, HardwareDecryptResult, HardwareReplayState,
     postprocess_hardware_decryption,
