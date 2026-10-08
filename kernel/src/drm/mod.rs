@@ -19,6 +19,7 @@ mod kms;
 pub(crate) mod linear;
 pub mod modes;
 mod property;
+mod plane_uapi_full;
 mod render;
 mod syncobj;
 pub(crate) mod uapi;
