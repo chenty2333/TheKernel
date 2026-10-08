@@ -183,7 +183,7 @@ pub fn em_newitr<I: E1000RegisterIo>(
         *queue_itr = rate;
         io.write_register(0x01680 + u32::from(vector) * 4, rate)?;
     } else {
-        rate = (ITR_RATE_DIVIDEND as u64 * 1000 / (u64::from(rate) * ITR_RATE_MULTIPLIER)) as u32;
+        rate = (ITR_RATE_DIVIDEND * 1000 / (u64::from(rate) * ITR_RATE_MULTIPLIER)) as u32;
         if rate == *queue_itr {
             return Ok(false);
         }

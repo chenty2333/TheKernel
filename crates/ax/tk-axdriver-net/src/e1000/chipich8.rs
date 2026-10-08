@@ -1948,10 +1948,6 @@ pub trait Ich8WorkaroundOps {
     fn reconfigure_k1_for_init(&mut self) -> DevResult;
 }
 
-/// upstream: e1000_ich8lan.c e1000_toggle_lanphypc_pch_lpt()
-
-/// upstream: e1000_ich8lan.c e1000_reconfigure_k1_exit_timeout()
-
 /// upstream: e1000_ich8lan.c e1000_init_phy_workarounds_pchlan()
 pub fn init_phy_workarounds_pchlan<I: E1000RegisterIo, O: Ich8WorkaroundOps>(
     io: &mut I,
