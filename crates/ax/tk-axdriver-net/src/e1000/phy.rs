@@ -115,6 +115,11 @@ const M88E1111_I_PHY_ID: u32 = 0x0141_0cc0;
 const I347AT4_PSCR_DOWNSHIFT_ENABLE: u16 = 0x0800;
 const I347AT4_PSCR_DOWNSHIFT_MASK: u16 = 0x7000;
 const I347AT4_PSCR_DOWNSHIFT_6X: u16 = 0x5000;
+const IGP01E1000_PHY_PORT_CONFIG: u8 = 0x10;
+const IGP01E1000_PHY_PORT_CTRL: u8 = 0x12;
+const IGP01E1000_PSCR_AUTO_MDIX: u16 = 0x1000;
+const IGP01E1000_PSCR_FORCE_MDI_MDIX: u16 = 0x2000;
+const IGP01E1000_PSCFR_SMART_SPEED: u16 = 0x0080;
 const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
 const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
@@ -540,6 +545,88 @@ where
     io.write_phy_register(M88E1000_PHY_SPEC_CTRL, control)?;
     commit()?;
     set_master_slave_mode(io, master_slave)
+}
+
+/// upstream: e1000_phy.c e1000_copper_link_setup_igp()
+pub fn copper_link_setup_igp<I, R, L, D>(
+    io: &mut I,
+    phy_is_igp: bool,
+    mdix: u8,
+    autoneg: bool,
+    autoneg_advertised: u16,
+    set_d0_lplu_callback: bool,
+    mut reset_phy: R,
+    mut set_d3_lplu: L,
+    mut set_d0_lplu: D,
+) -> DevResult<Option<MasterSlaveMode>>
+where
+    I: E1000PhyRegisterIo,
+    R: FnMut() -> DevResult,
+    L: FnMut(bool) -> DevResult,
+    D: FnMut(bool) -> DevResult,
+{
+    reset_phy()?;
+    io.delay_us(100_000);
+    if phy_is_igp {
+        set_d3_lplu(false)?;
+    }
+    if set_d0_lplu_callback {
+        set_d0_lplu(false)?;
+    }
+    let mut control = io.read_phy_register(IGP01E1000_PHY_PORT_CTRL)?;
+    control &= !IGP01E1000_PSCR_AUTO_MDIX;
+    match mdix {
+        1 => control &= !IGP01E1000_PSCR_FORCE_MDI_MDIX,
+        2 => control |= IGP01E1000_PSCR_FORCE_MDI_MDIX,
+        _ => control |= IGP01E1000_PSCR_AUTO_MDIX,
+    }
+    io.write_phy_register(IGP01E1000_PHY_PORT_CTRL, control)?;
+    if !autoneg {
+        return Ok(None);
+    }
+    if autoneg_advertised == ADVERTISE_1000_FULL {
+        let port_config =
+            io.read_phy_register(IGP01E1000_PHY_PORT_CONFIG)? & !IGP01E1000_PSCFR_SMART_SPEED;
+        io.write_phy_register(IGP01E1000_PHY_PORT_CONFIG, port_config)?;
+        let control_1000 = io.read_phy_register(MII_1000T_CTRL)? & !CR_1000T_MS_ENABLE;
+        io.write_phy_register(MII_1000T_CTRL, control_1000)?;
+    }
+    set_master_slave_mode(io, MasterSlaveMode::Auto).map(Some)
+}
+
+/// upstream: e1000_phy.c e1000_setup_copper_link_generic()
+pub fn setup_copper_link_generic<I, F, C>(
+    io: &mut I,
+    autoneg: bool,
+    config: &mut AutonegConfig,
+    wait_to_complete: bool,
+    read_callback_installed: bool,
+    link_status_pending: &mut bool,
+    mut force_speed_duplex: F,
+    mut configure_flow_control: C,
+) -> DevResult<bool>
+where
+    I: E1000PhyRegisterIo,
+    F: FnMut() -> DevResult,
+    C: FnMut() -> DevResult,
+{
+    if autoneg {
+        copper_link_autoneg(
+            io,
+            config,
+            wait_to_complete,
+            read_callback_installed,
+            link_status_pending,
+        )?;
+    } else {
+        force_speed_duplex()?;
+    }
+    let link = phy_has_link_generic(io, 10, 10, read_callback_installed)?;
+    if link {
+        config_collision_dist_generic(io)?;
+        configure_flow_control()?;
+    }
+    Ok(link)
 }
 
 pub trait E1000PhyMdicOps: E1000RegisterIo {
@@ -2013,6 +2100,86 @@ mod tests {
         assert_eq!(
             io.phy_writes.last().unwrap(),
             &(MII_1000T_CTRL, CR_1000T_MS_ENABLE | CR_1000T_MS_VALUE)
+        );
+    }
+
+    #[test]
+    fn generic_igp_setup_resets_disables_lplu_and_configures_mdix() {
+        let mut io = Io::default();
+        io.phy[MII_1000T_CTRL as usize] = CR_1000T_MS_ENABLE | CR_1000T_MS_VALUE;
+        let events = core::cell::Cell::new(0u8);
+        let mode = copper_link_setup_igp(
+            &mut io,
+            true,
+            2,
+            true,
+            ADVERTISE_1000_FULL,
+            true,
+            || {
+                events.set(events.get() | 1);
+                Ok(())
+            },
+            |active| {
+                assert!(!active);
+                events.set(events.get() | 2);
+                Ok(())
+            },
+            |active| {
+                assert!(!active);
+                events.set(events.get() | 4);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(mode, Some(MasterSlaveMode::ForceMaster));
+        assert_eq!(events.get(), 7);
+        assert_eq!(io.delay, 100_000);
+        assert_eq!(io.phy_writes[0].0, IGP01E1000_PHY_PORT_CTRL);
+        assert_ne!(io.phy_writes[0].1 & IGP01E1000_PSCR_FORCE_MDI_MDIX, 0);
+        assert_eq!(io.phy_writes[1], (IGP01E1000_PHY_PORT_CONFIG, 0));
+        assert_eq!(io.phy_writes[2], (MII_1000T_CTRL, CR_1000T_MS_VALUE));
+        assert_eq!(io.phy_writes[3], (MII_1000T_CTRL, CR_1000T_MS_VALUE));
+    }
+
+    #[test]
+    fn generic_copper_link_setup_runs_autoneg_or_forced_path_then_checks_link() {
+        let mut io = Io::default();
+        io.phy[PHY_STATUS as usize] = MII_SR_LINK_STATUS;
+        let mut config = AutonegConfig {
+            advertised: ADVERTISE_10_FULL,
+            mask: ADVERTISE_10_FULL,
+            flow_control: FlowControlMode::Full,
+        };
+        let mut force_called = false;
+        let mut fc_called = false;
+        let mut link_status_pending = false;
+        assert!(
+            setup_copper_link_generic(
+                &mut io,
+                true,
+                &mut config,
+                true,
+                true,
+                &mut link_status_pending,
+                || {
+                    force_called = true;
+                    Ok(())
+                },
+                || {
+                    fc_called = true;
+                    Ok(())
+                },
+            )
+            .unwrap()
+        );
+        assert!(!force_called);
+        assert!(fc_called);
+        assert!(link_status_pending);
+        assert!(
+            io.phy_writes
+                .iter()
+                .any(|(register, value)| *register == PHY_CONTROL
+                    && value & MII_CR_RESTART_AUTO_NEG != 0)
         );
     }
 }

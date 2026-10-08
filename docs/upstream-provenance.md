@@ -1033,3 +1033,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - Intel/FreeBSD `e1000_phy.c` coverage update: 58 of 98 functions are now translated, including 82577 and M88 copper-link setup register sequences. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
 
 - Intel/FreeBSD `e1000_phy.c` coverage update: 59 of 98 functions are now translated, including M88 Gen2 downshift, commit, and master/slave setup. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
+
+- Intel/FreeBSD `e1000_phy.c` coverage update: 64 of 98 functions are now translated, including IGP copper setup and generic copper auto/forced link establishment. Full license: `crates/ax/tk-axdriver-net/LICENSES/BSD-3-Clause-Intel-E1000.txt`.
