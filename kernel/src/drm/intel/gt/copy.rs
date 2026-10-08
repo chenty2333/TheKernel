@@ -1682,42 +1682,57 @@ fn n305_guc_ads_input(
         intel_gt::guc_ads::guc_init_golden_contexts(&enabled_masks, &default_states)
             .map_err(|_| Error::Refused)?;
     // Translate Gen12.0 intel_guc_ads.c::guc_mmio_regset_init() for the
-    // supported BCS0. ADL-N is below Wa_16018031267's 12.55 IP range, so the
-    // source xcs_engine_wa_init() list is empty; engine_fake_wa_init() still
-    // contributes the uncached CMD_CCTL override (MOCS index 3).
-    let bcs_base = 0x22000;
-    let force_nonpriv_regs: Vec<u32> = (0..12).map(|slot| bcs_base + 0x4d0 + slot * 4).collect();
+    // BCS and enabled media engines. ADL-N is below Wa_16018031267's 12.55
+    // IP range, so xcs_engine_wa_init() adds no extra WA; engine_fake_wa_init()
+    // still contributes the uncached CMD_CCTL override (MOCS index 3).
+    let force_nonpriv_regs: Vec<u32> = (0..12).collect();
     let mocs_regs_gen12: Vec<u32> = (0..32).map(|index| 0xb020 + index * 4).collect();
     let eu_perf_regs = [0xe458, 0xe45c, 0xe558, 0xe55c, 0xe658, 0xe65c, 0xe758];
-    let bcs_regset = guc_mmio_regset_init(EngineRegsetInput {
-        ring_mode: bcs_base + 0x29c,
-        ring_hws_pga: bcs_base + 0x80,
-        ring_imr: bcs_base + 0xa8,
-        first_render_compute: false,
-        ccs_mask: 0,
-        rcu_mode: 0,
-        workarounds: &[RegsetWorkaround {
-            offset: bcs_base + 0xc4, // RING_CMD_CCTL
-            masked: true,
-            mask: 0x3fff,
-            steering_group: 0,
-            steering_instance: topology.dss.trailing_zeros() as u8,
-        }],
-        force_nonpriv_regs: &force_nonpriv_regs,
-        mocs_regs_gen12: &mocs_regs_gen12,
-        mocs_regs_gen12_55: &[],
-        graphics_ip: (12, 0),
-        eu_perf_regs: &eu_perf_regs,
-    })
-    .map_err(|_| Error::Refused)?;
-    let regsets = vec![EngineRegset {
-        engine: engines
+    let steering_instance = topology.dss.trailing_zeros() as u8;
+    let mut regsets = Vec::new();
+    regsets
+        .try_reserve_exact(engines.len().saturating_sub(1))
+        .map_err(|_| Error::Refused)?;
+    for engine in &engines {
+        let base = match (engine.guc_class, engine.instance) {
+            (1, 0) => 0x1c0000, // GEN11_BSD_RING_BASE, VCS0
+            (1, 2) => 0x1d0000, // GEN11_BSD3_RING_BASE, VCS2
+            (2, 0) => 0x1c8000, // GEN11_VEBOX_RING_BASE, VECS0
+            (3, 0) => 0x22000,  // BLT_RING_BASE, BCS0
+            // Render's Gen12 workaround lists are platform-specific and are
+            // not equivalent to the generic non-render engine setup below.
+            _ => continue,
+        };
+        let force_nonpriv_offsets: Vec<u32> = force_nonpriv_regs
             .iter()
-            .find(|engine| engine.guc_class == 3 && engine.instance == 0)
-            .cloned()
-            .ok_or(Error::Refused)?,
-        registers: bcs_regset,
-    }];
+            .map(|slot| base + 0x4d0 + slot * 4)
+            .collect();
+        let registers = guc_mmio_regset_init(EngineRegsetInput {
+            ring_mode: base + 0x29c,
+            ring_hws_pga: base + 0x80,
+            ring_imr: base + 0xa8,
+            first_render_compute: false,
+            ccs_mask: 0,
+            rcu_mode: 0,
+            workarounds: &[RegsetWorkaround {
+                offset: base + 0xc4, // RING_CMD_CCTL
+                masked: true,
+                mask: 0x3fff,
+                steering_group: 0,
+                steering_instance,
+            }],
+            force_nonpriv_regs: &force_nonpriv_offsets,
+            mocs_regs_gen12: &mocs_regs_gen12,
+            mocs_regs_gen12_55: &[],
+            graphics_ip: (12, 0),
+            eu_perf_regs: &eu_perf_regs,
+        })
+        .map_err(|_| Error::Refused)?;
+        regsets.push(EngineRegset {
+            engine: engine.clone(),
+            registers,
+        });
+    }
     let mut generic_gt_sysinfo = [0; intel_gt::guc_ads::GUC_GENERIC_GT_SYSINFO_MAX];
     // `Topology::read()` has verified the sole Gen12.0 slice-enable register
     // value (bit 0 only), so use the actual slice count rather than DSS count.
