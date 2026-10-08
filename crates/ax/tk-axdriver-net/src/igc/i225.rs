@@ -54,6 +54,39 @@ const I225_PHPM_DIS_2500: u32 = 0x0800;
 const I225_PHPM_DIS_100_D3: u32 = 0x0200;
 const I225_PHPM_DIS_1000_D3: u32 = 0x0008;
 const I225_PHPM_DIS_2500_D3: u32 = 0x1000;
+const IMC: u32 = 0x000d8;
+const RCTL: u32 = 0x00100;
+const TCTL: u32 = 0x00400;
+const ICR: u32 = 0x000c0;
+const CTRL_DEV_RST: u32 = 0x2000_0000;
+const TCTL_PSP: u32 = 0x8;
+const LTRC: u32 = 0x001a0;
+const EEE_SU: u32 = 0x00e34;
+const RXPBS: u32 = 0x02404;
+const DMACR: u32 = 0x02508;
+const LTRMINV: u32 = 0x05bb0;
+const LTRMAXV: u32 = 0x05bb4;
+const DMACR_DMAC_EN: u32 = 0x8000_0000;
+const DMACR_DMACTHR_MASK: u32 = 0x00ff_0000;
+const LTRC_EEEMS_EN: u32 = 0x20;
+const TW_SYSTEM_100_MASK: u32 = 0x0000_ff00;
+const TW_SYSTEM_100_SHIFT: u32 = 8;
+const TW_SYSTEM_1000_MASK: u32 = 0xff;
+const LTRV_MASK: u32 = 0x3ff;
+const LTR_SCALE_SHIFT: u32 = 10;
+const LTR_SCALE_1024: u32 = 2;
+const LTR_SCALE_32768: u32 = 3;
+const LTR_LSNP_REQ: u32 = 0x8000;
+const RX_BUFFER_SIZE_MASK: u32 = 0x3f;
+const IPCNFG: u32 = 0x00e38;
+const EEER: u32 = 0x00e30;
+const IPCNFG_EEE_2500: u32 = 0x10;
+const IPCNFG_EEE_1000: u32 = 0x8;
+const IPCNFG_EEE_100: u32 = 0x4;
+const EEER_TX_LPI_EN: u32 = 0x0001_0000;
+const EEER_RX_LPI_EN: u32 = 0x0002_0000;
+const EEER_LPI_FC: u32 = 0x0004_0000;
+const EEE_SU_LPI_CLK_STP: u32 = 0x0080_0000;
 
 pub trait IgcI225NvmIo: IgcI225Io {
     fn read_nvm_eerd(&mut self, offset: u16, data: &mut [u16]) -> Result<(), I225NvmError>;
@@ -300,10 +333,195 @@ pub fn igc_set_d3_lplu_state_i225<I: IgcI225Io>(io: &mut I, active: bool) {
     io.write(I225_PHPM, data);
 }
 
+pub trait IgcI225ResetIo: IgcI225Io {
+    fn disable_pcie_master_generic(&mut self) -> i32;
+    fn get_auto_rd_done_generic(&mut self) -> i32;
+    fn check_alt_mac_addr_generic(&mut self) -> i32;
+}
+
+// upstream: igc_i225.c igc_reset_hw_i225()
+pub fn igc_reset_hw_i225<I: IgcI225ResetIo>(io: &mut I) -> i32 {
+    let _ = io.disable_pcie_master_generic();
+    io.write(IMC, u32::MAX);
+    io.write(RCTL, 0);
+    io.write(TCTL, TCTL_PSP);
+    io.write_flush();
+    io.delay_ms(10);
+    let ctrl = io.read(CTRL);
+    io.write(CTRL, ctrl | CTRL_DEV_RST);
+    let _ = io.get_auto_rd_done_generic();
+    io.write(IMC, u32::MAX);
+    let _ = io.read(ICR);
+    io.check_alt_mac_addr_generic()
+}
+
+// upstream: igc_i225.c igc_init_hw_i225()
+pub fn igc_init_hw_i225<F: FnMut() -> i32>(mut base_init: F) -> i32 {
+    base_init()
+}
+
+pub trait IgcI225LinkIo: IgcI225Io {
+    fn get_link_status(&self) -> bool;
+    fn set_get_link_status(&mut self, value: bool);
+    fn phy_has_link(&mut self, iterations: u32, interval_ms: u32) -> Result<bool, i32>;
+    fn check_downshift(&mut self);
+    fn autoneg(&self) -> bool;
+    fn config_collision_dist(&mut self);
+    fn config_fc_after_link_up(&mut self) -> Result<(), i32>;
+    fn get_speed_duplex(&mut self) -> (u16, u16);
+    fn eee_disabled(&self) -> bool;
+    fn mtu(&self) -> u32;
+    fn debug(&mut self, _message: &'static str) {}
+}
+
+// upstream: igc_i225.c igc_set_ltr_i225()
+pub fn igc_set_ltr_i225<I: IgcI225LinkIo>(io: &mut I, link: bool) -> i32 {
+    if !link {
+        return 0;
+    }
+    let (speed, _duplex) = io.get_speed_duplex();
+    let mut tw_system = 0u32;
+    if speed != 10 && !io.eee_disabled() {
+        let ltrc = io.read(LTRC) | LTRC_EEEMS_EN;
+        io.write(LTRC, ltrc);
+        let eee_su = io.read(EEE_SU);
+        tw_system = if speed == 100 {
+            ((eee_su & TW_SYSTEM_100_MASK) >> TW_SYSTEM_100_SHIFT) * 500
+        } else {
+            (eee_su & TW_SYSTEM_1000_MASK) * 500
+        };
+    }
+    let mut size = (io.read(RXPBS) & RX_BUFFER_SIZE_MASK) as i32;
+    if io.read(DMACR) & DMACR_DMAC_EN != 0 {
+        size -= ((io.read(DMACR) & DMACR_DMACTHR_MASK) >> 16) as i32;
+        size *= 1024 * 8;
+    } else {
+        size *= 1024;
+        size -= io.mtu() as i32;
+        size *= 8;
+    }
+    if size < 0 {
+        io.debug("invalid effective Rx buffer size");
+        return -1;
+    }
+    let ltr_min = (1000 * size as u32) / u32::from(speed);
+    let ltr_max = ltr_min + tw_system;
+    let scale_min = if (ltr_min / 1024) < 1024 {
+        LTR_SCALE_1024
+    } else {
+        LTR_SCALE_32768
+    };
+    let scale_max = if (ltr_max / 1024) < 1024 {
+        LTR_SCALE_1024
+    } else {
+        LTR_SCALE_32768
+    };
+    let ltr_min = ltr_min
+        / if scale_min == LTR_SCALE_1024 {
+            1024
+        } else {
+            32768
+        };
+    let ltr_max = ltr_max
+        / if scale_max == LTR_SCALE_1024 {
+            1024
+        } else {
+            32768
+        };
+    let old_min = io.read(LTRMINV);
+    if ltr_min != old_min & LTRV_MASK {
+        io.write(
+            LTRMINV,
+            LTR_LSNP_REQ | ltr_min | (scale_min << LTR_SCALE_SHIFT),
+        );
+    }
+    let old_max = io.read(LTRMAXV);
+    if ltr_max != old_max & LTRV_MASK {
+        // FreeBSD uses scale_min for the MAX register too; retain that source behavior.
+        io.write(
+            LTRMAXV,
+            LTR_LSNP_REQ | ltr_max | (scale_min << LTR_SCALE_SHIFT),
+        );
+    }
+    0
+}
+
+// upstream: igc_i225.c igc_check_for_link_i225()
+pub fn igc_check_for_link_i225<I: IgcI225LinkIo>(io: &mut I) -> i32 {
+    let mut ret_val = 0;
+    let mut link = false;
+    if io.get_link_status() {
+        match io.phy_has_link(1, 0) {
+            Ok(found) => link = found,
+            Err(error) => ret_val = error,
+        }
+        if ret_val == 0 && link {
+            match io.phy_has_link(1, 0) {
+                Ok(found) => link = found,
+                Err(error) => ret_val = error,
+            }
+        }
+        if ret_val == 0 && link {
+            io.set_get_link_status(false);
+            io.check_downshift();
+            if io.autoneg() {
+                io.config_collision_dist();
+                if io.config_fc_after_link_up().is_err() {
+                    io.debug("error configuring flow control");
+                }
+            }
+        }
+    }
+    ret_val = igc_set_ltr_i225(io, link);
+    ret_val
+}
+
+// upstream: igc_i225.c igc_set_eee_i225()
+pub fn igc_set_eee_i225<I: IgcI225Io>(
+    io: &mut I,
+    is_i225: bool,
+    copper: bool,
+    eee_disable: bool,
+    adv2p5g: bool,
+    adv1g: bool,
+    adv100m: bool,
+) {
+    if !is_i225 || !copper {
+        return;
+    }
+    let mut ipcnfg = io.read(IPCNFG);
+    let mut eeer = io.read(EEER);
+    if !eee_disable {
+        let eee_su = io.read(EEE_SU);
+        for (enabled, mask) in [
+            (adv100m, IPCNFG_EEE_100),
+            (adv1g, IPCNFG_EEE_1000),
+            (adv2p5g, IPCNFG_EEE_2500),
+        ] {
+            if enabled {
+                ipcnfg |= mask;
+            } else {
+                ipcnfg &= !mask;
+            }
+        }
+        eeer |= EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC;
+        let _lpi_clock_stop = eee_su & EEE_SU_LPI_CLK_STP;
+    } else {
+        ipcnfg &= !(IPCNFG_EEE_2500 | IPCNFG_EEE_1000 | IPCNFG_EEE_100);
+        eeer &= !(EEER_TX_LPI_EN | EEER_RX_LPI_EN | EEER_LPI_FC);
+    }
+    io.write(IPCNFG, ipcnfg);
+    io.write(EEER, eeer);
+    let _ = io.read(IPCNFG);
+    let _ = io.read(EEER);
+}
+
 pub trait IgcI225Io {
     fn read(&mut self, reg: u32) -> u32;
     fn write(&mut self, reg: u32, value: u32);
+    fn write_flush(&mut self);
     fn delay_us(&mut self, us: u32);
+    fn delay_ms(&mut self, ms: u32);
     fn delay_ms_irq(&mut self, ms: u32);
     fn nvm_word_size(&self) -> u32;
     fn clear_semaphore_once(&mut self) -> bool;
@@ -421,7 +639,7 @@ pub fn igc_setup_copper_link_i225<I: IgcI225Io, F: FnMut(&mut I) -> i32>(
     generic_setup(io)
 }
 
-/// upstream: igc_i225.c igc_init_nvm_params_i225()
+// upstream: igc_i225.c igc_init_nvm_params_i225()
 pub fn init_nvm_params_i225(hw: &mut IgcHardware, eecd: u32, flash_present: bool) {
     let mut size = ((eecd & EECD_SIZE_EX_MASK) >> EECD_SIZE_EX_SHIFT) + NVM_WORD_SIZE_BASE_SHIFT;
     if size > 15 {
@@ -452,7 +670,7 @@ pub fn init_nvm_params_i225(hw: &mut IgcHardware, eecd: u32, flash_present: bool
     }
 }
 
-/// upstream: igc_i225.c igc_init_mac_params_i225()
+// upstream: igc_i225.c igc_init_mac_params_i225()
 pub fn init_mac_params_i225(hw: &mut IgcHardware) {
     super::api::init_generic_ops(hw);
     hw.mac_info.media_type = IgcMediaType::Copper;
@@ -470,7 +688,7 @@ pub fn init_mac_params_i225(hw: &mut IgcHardware) {
     hw.mac_ops.write_vfta = Some(IgcApiCallback::WriteVftaI225);
 }
 
-/// upstream: igc_i225.c igc_init_phy_params_i225()
+// upstream: igc_i225.c igc_init_phy_params_i225()
 pub fn init_phy_params_i225<B: super::api::IgcApiBackend>(
     hw: &mut IgcHardware,
     backend: &mut B,
@@ -588,6 +806,13 @@ mod tests {
         puts: usize,
         nvm: Vec<u16>,
         flash_updates: usize,
+        link_status: bool,
+        link_found: bool,
+        phy_checks: usize,
+        autoneg_enabled: bool,
+        speed: u16,
+        mtu_bytes: u32,
+        events: Vec<&'static str>,
     }
     impl SemIo {
         fn read_reg(&self, reg: u32) -> u32 {
@@ -619,8 +844,12 @@ mod tests {
         fn write(&mut self, r: u32, v: u32) {
             self.write_reg(r, v)
         }
+        fn write_flush(&mut self) {}
         fn delay_us(&mut self, v: u32) {
             self.delays.push(v)
+        }
+        fn delay_ms(&mut self, v: u32) {
+            self.delays.push(v * 1000)
         }
         fn delay_ms_irq(&mut self, v: u32) {
             self.delays.push(v * 1000)
@@ -657,6 +886,55 @@ mod tests {
         }
         fn poll_eerd_read_done(&mut self) -> Result<(), I225NvmError> {
             Ok(())
+        }
+    }
+    impl IgcI225ResetIo for SemIo {
+        fn disable_pcie_master_generic(&mut self) -> i32 {
+            self.events.push("disable-master");
+            1
+        }
+        fn get_auto_rd_done_generic(&mut self) -> i32 {
+            self.events.push("auto-read");
+            1
+        }
+        fn check_alt_mac_addr_generic(&mut self) -> i32 {
+            self.events.push("alt-mac");
+            7
+        }
+    }
+    impl IgcI225LinkIo for SemIo {
+        fn get_link_status(&self) -> bool {
+            self.link_status
+        }
+        fn set_get_link_status(&mut self, value: bool) {
+            self.link_status = value;
+            self.events.push("status");
+        }
+        fn phy_has_link(&mut self, _iterations: u32, _interval_ms: u32) -> Result<bool, i32> {
+            self.phy_checks += 1;
+            Ok(self.link_found)
+        }
+        fn check_downshift(&mut self) {
+            self.events.push("downshift");
+        }
+        fn autoneg(&self) -> bool {
+            self.autoneg_enabled
+        }
+        fn config_collision_dist(&mut self) {
+            self.events.push("collision");
+        }
+        fn config_fc_after_link_up(&mut self) -> Result<(), i32> {
+            self.events.push("flow-control");
+            Ok(())
+        }
+        fn get_speed_duplex(&mut self) -> (u16, u16) {
+            (self.speed, 1)
+        }
+        fn eee_disabled(&self) -> bool {
+            true
+        }
+        fn mtu(&self) -> u32 {
+            self.mtu_bytes
         }
     }
     #[test]
@@ -716,5 +994,36 @@ mod tests {
             io.read_reg(I225_PHPM),
             I225_PHPM_DIS_100_D3 | I225_PHPM_DIS_1000_D3 | I225_PHPM_DIS_2500_D3
         );
+    }
+
+    #[test]
+    fn reset_continues_after_nonfatal_master_and_auto_read_failures() {
+        let mut io = SemIo::default();
+        assert_eq!(igc_reset_hw_i225(&mut io), 7);
+        assert_eq!(io.events, ["disable-master", "auto-read", "alt-mac"]);
+        assert_eq!(io.read_reg(IMC), u32::MAX);
+        assert_eq!(io.read_reg(TCTL), TCTL_PSP);
+        assert!(io.read_reg(CTRL) & CTRL_DEV_RST != 0);
+    }
+
+    #[test]
+    fn link_check_repeats_phy_check_then_runs_link_up_operations() {
+        let mut io = SemIo {
+            link_status: true,
+            link_found: true,
+            autoneg_enabled: true,
+            speed: 1000,
+            mtu_bytes: 1500,
+            ..SemIo::default()
+        };
+        io.write_reg(RXPBS, 34);
+        assert_eq!(igc_check_for_link_i225(&mut io), 0);
+        assert_eq!(io.phy_checks, 2);
+        assert!(!io.link_status);
+        assert_eq!(
+            &io.events[..],
+            &["status", "downshift", "collision", "flow-control"]
+        );
+        assert_ne!(io.read_reg(LTRMINV), 0);
     }
 }

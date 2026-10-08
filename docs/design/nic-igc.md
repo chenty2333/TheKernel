@@ -339,3 +339,5 @@ The IGC shared API now has the FreeBSD `igc_api.c` dispatch surface and I225 cal
 The I225 NVM path now translates shadow-RAM reads/writes, semaphore-scoped bursts, `SRWR` completion polling, EEPROM checksum validation/update and flash commit callbacks. NVM access remains behind `IgcI225NvmIo`, which is the platform-facing adapter for the same I225 register/NVM algorithm.
 
 The I225 flash/NVM helper set now includes flash presence, burst bounds, command completion polling, flash-update completion and the source's firmware-vs-software flash-update branches, plus D0/D3 LPLU register masks. The source's unusual erase-result branch is retained and documented in code rather than normalized.
+
+The remaining `igc_i225.c` entrypoints are translated as well: reset preserves the nonfatal PCI-master/auto-read behavior; link checking keeps the duplicated PHY probe and link-up callback order; LTR retains source scaling and register write conditions; EEE and I225 `init_hw` route are represented. The 27 ctags function definitions now each have a source marker. These hardware operations still require the eventual product I/O adapter.
