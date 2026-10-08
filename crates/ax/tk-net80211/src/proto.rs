@@ -82,6 +82,12 @@ pub struct NegotiatedPhy {
     pub he: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlternativeBss {
+    pub selected_index: usize,
+    pub phy_mode: crate::PhyMode,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OpenAuthEffects {
     pub clear_protected_txrx: bool,
@@ -210,6 +216,41 @@ pub fn he_negotiate(local: &LocalPhyConfig, peer: &PeerPhyConfig, ht_negotiated:
         }
     }
     true
+}
+
+/// Mark the current AP failed and choose a different compatible BSS.
+// upstream: ieee80211_proto.c ieee80211_try_another_bss()
+pub fn try_another_bss(
+    candidates: &mut [crate::AccessPoint],
+    current_bssid: [u8; 6],
+    policy: &crate::BssMatchPolicy<'_>,
+    scan_all_bands: bool,
+    current_mode: &mut crate::PhyMode,
+    max_rssi: u8,
+    fix_rate: impl FnMut(&mut crate::RateSet) -> u8,
+) -> Option<AlternativeBss> {
+    if let Some(current) = candidates.iter_mut().find(|ap| ap.bssid == current_bssid) {
+        current.previous_failures = current.previous_failures.saturating_add(1);
+    }
+    if scan_all_bands {
+        *current_mode = crate::PhyMode::Auto;
+    }
+    let selection = crate::choose_bss(
+        policy,
+        candidates,
+        Some(current_bssid),
+        scan_all_bands,
+        max_rssi,
+        fix_rate,
+    );
+    let selected_index = selection.selected?;
+    if candidates[selected_index].bssid == current_bssid {
+        return None;
+    }
+    Some(AlternativeBss {
+        selected_index,
+        phy_mode: *current_mode,
+    })
 }
 
 pub const FIX_RATE_SORT: u32 = 0x01;
@@ -435,6 +476,75 @@ mod tests {
             },
         };
         (local, peer)
+    }
+
+    #[test]
+    fn try_another_bss_marks_current_failed_and_resets_all_band_mode() {
+        let mut current = crate::AccessPoint {
+            bssid: [1; 6],
+            ssid: [0; 32],
+            ssid_len: 4,
+            channel: 6,
+            is_2ghz: true,
+            capability_info: crate::CAPINFO_ESS,
+            rssi: 90,
+            ..Default::default()
+        };
+        current.ssid[..4].copy_from_slice(b"home");
+        let mut candidate = crate::AccessPoint {
+            bssid: [2; 6],
+            ssid: [0; 32],
+            ssid_len: 4,
+            channel: 36,
+            is_5ghz: true,
+            capability_info: crate::CAPINFO_ESS,
+            rssi: 60,
+            ..Default::default()
+        };
+        candidate.ssid[..4].copy_from_slice(b"home");
+        let mut candidates = [current, candidate];
+        let mut policy = crate::BssMatchPolicy {
+            active_channels: &[6, 36],
+            background_scan_active: false,
+            background_scan: false,
+            desired_channel: None,
+            ibss_mode: false,
+            privacy_enabled: false,
+            desired_ssid: b"home",
+            desired_bssid: None,
+            rsn_enabled: false,
+            psk_configured: false,
+            local_rsn_protocols: crate::PROTO_RSN,
+            local_rsn_akms: crate::AKM_PSK,
+            local_rsn_ciphers: crate::CIPHER_CCMP,
+            local_mfp_capable: false,
+            local_mfp_required: false,
+        };
+        let mut mode = crate::PhyMode::G;
+        let alternative = try_another_bss(
+            &mut candidates,
+            [1; 6],
+            &policy,
+            true,
+            &mut mode,
+            100,
+            |_| 0,
+        )
+        .unwrap();
+        assert_eq!(alternative.selected_index, 1);
+        assert_eq!(alternative.phy_mode, crate::PhyMode::Auto);
+        assert_eq!(candidates[0].previous_failures, 2); // current node is marked then skipped by chooser.
+        policy.active_channels = &[6];
+        let none = try_another_bss(
+            &mut candidates[..1],
+            [1; 6],
+            &policy,
+            false,
+            &mut mode,
+            100,
+            |_| 0,
+        );
+        assert!(none.is_none());
     }
 
     #[test]

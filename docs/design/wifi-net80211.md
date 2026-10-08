@@ -122,3 +122,6 @@ The actual user-visible EAPOL 4-way exchange remains with wpa_supplicant.
 HT/VHT/HE negotiation now validates mode/channel support, mandatory peer and
 local MCS maps, forbids WEP/TKIP for HT, and selects common SGI flags before
 recording negotiated PHY state.
+Failed authentication can age the current AP, reset the scan mode to AUTO for
+all-band selection, choose a different compatible candidate and refuse to
+re-select the same BSSID.
