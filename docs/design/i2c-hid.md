@@ -6,7 +6,25 @@ The transport implements input-register reads, HID descriptor/report descriptor 
 
 The shared report parser is reused for `hid.c` grammar and `hidbus` descriptor dispatch, including Input/Output/Feature report-size accounting, Report-ID overhead, usage locations, bounded signed/unsigned bitfield get/set, and unit-based resolution calculation. The `hidbus.rs` adapter owns ACPI/HID identity, descriptor access, report-size metadata, and report get/set/write calls; `hmt.rs` checks the required Contact ID, X/Y, Tip Switch, and Contact Count Maximum feature. For touchpads, `hmt_set_input_mode` locates Feature Input Mode and writes mode 3 plus shared Surface/Button switch defaults as hconf does. The adapter reads Contact Count Maximum and Button Type features when available, reuses a same-report Button Type value from the Contact Count Maximum read, caps slots at 32, and reports `INPUT_PROP_BUTTONPAD` when Button Type is zero. PTP integrated button 1 and external primary button 2 both map to `BTN_LEFT`, while button 3 starts at `BTN_RIGHT`. Contact IDs are mapped to persistent Type-B slots, tip/confidence state controls tracking IDs, width/height are scaled into touch-major/minor/orientation, and an empty poll releases all active contacts to avoid stuck touches. Contact Count batching defers SYN until the advertised serial/hybrid packet batch drains and limits each packet to its reported contact subset; non-touch report IDs continue through the shared generic parser. Contact Count/Confidence/Width/Height usages are not misadvertised as pressure, blob, or tracking axes outside finger collections. Finger collection X/Y, pressure, in-range, width/height, contact ID, and tip state are exposed as evdev `ABS_MT_*`/touch keys. The evdev pump drives the upstream `iichid_intr` read path and uses adaptive fast/slow (80/10 Hz) polling when no child GPIO interrupt delivery interface is available.
 
-Not translated: FreeBSD newbus/HID bus plumbing, raw kernel ioctl ABI, device-specific quirk tables, THQA certificate feature handling, and scan-time timestamp options; unsupported quirks remain unsupported rather than guessed. GPIO IRQ resources and IRQ-context I2C delivery are not available through the current ACPI/I2C input interfaces, so the evdev pump polls and the sampling rates are currently fixed to the upstream defaults (the sysctl runtime reconfiguration is not exposed). QEMU has no DesignWare I2C/HID device, so the source path is compile/unit-test validated only.
+Not translated: FreeBSD newbus/HID bus plumbing, raw kernel ioctl ABI, device-specific quirk tables, THQA certificate feature handling, and scan-time timestamp options; unsupported quirks remain unsupported rather than guessed. ACPI `GpioInt` descriptors are now bounds-checked and retain controller path, source index, pin table, trigger, polarity, sharing/wake flags, debounce and pin configuration on each I2C-HID child. They are not yet converted into a live interrupt: the evdev pump uses adaptive 80/10 Hz polling; runtime sysctl reconfiguration is not exposed. QEMU has no DesignWare I2C/HID device, so the source path is compile/unit-test validated only.
+
+The checked `GpioInt` decoder now preserves the controller namespace path,
+pin-table entries, trigger (edge/level), active polarity, pull configuration,
+debounce timeout, wake capability, sharing mode, and `ResourceSourceIndex`.
+The remaining integration boundary is: the
+ACPI namespace resolver must map that controller path to a registered GPIO
+provider before any pin is requested; a raw pin number is not a global IRQ.
+The GPIO provider API needs an owned `request_interrupt(controller, pins,
+trigger, polarity, debounce, wake, handler)` registration plus teardown/safe
+mask/unmask and an IRQ number/handle. The IRQ layer then needs shared GSI
+registration with trigger/polarity and affinity semantics. Finally, the I2C-HID
+handler must only acknowledge/mask and queue a bounded threaded/task-context
+read, because `GET_INPUT` I2C transfers are sleeping operations and cannot run
+in hard IRQ context; teardown must stop queued reads before releasing the
+controller and pin. None of the ACPI GPIO child binding, GPIO-provider registry,
+or generic shared-GSI request/teardown interfaces exists in the current target,
+so adding a guessed pin-to-IRQ mapping would be unsafe. Existing adaptive
+polling remains the fallback until those framework seams are implemented.
 
 The shared parser's per-report size helper follows `hid_report_size()` and the
 maximum-size helper follows `hid_report_size_max()`: it selects the largest

@@ -14,6 +14,148 @@ pub struct Resources {
     pub irqs: Vec<Irq>,
     pub io: Vec<(u16, u8)>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpioTrigger {
+    Level,
+    Edge,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpioPolarity {
+    ActiveHigh,
+    ActiveLow,
+    Both,
+}
+
+/// Checked ACPI GpioInt descriptor. This is resource metadata only; it is not
+/// an allocated GPIO pin or a routable kernel interrupt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpioInterrupt {
+    pub resource_source: Vec<u8>,
+    pub source_index: u8,
+    pub pins: Vec<u16>,
+    pub trigger: GpioTrigger,
+    pub polarity: GpioPolarity,
+    pub shared: bool,
+    pub wake_capable: bool,
+    pub debounce_timeout_us: u16,
+    pub pin_config: u8,
+}
+
+/// Decode ACPI GPIO interrupt descriptors while retaining the controller
+/// source and electrical/timing metadata needed by a future GPIO provider.
+pub fn parse_gpio_interrupts(bytes: &[u8]) -> Result<Vec<GpioInterrupt>, Status> {
+    let mut interrupts = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let tag = *bytes.get(at).ok_or(BAD_PARAMETER)?;
+        at += 1;
+        let (kind, length) = if tag & 0x80 != 0 {
+            let size = bytes.get(at..at + 2).ok_or(BAD_PARAMETER)?;
+            at += 2;
+            (
+                tag,
+                usize::from(u16::from_le_bytes(size.try_into().unwrap())),
+            )
+        } else {
+            (tag >> 3, usize::from(tag & 7))
+        };
+        let end = at.checked_add(length).ok_or(BAD_PARAMETER)?;
+        let item = bytes.get(at..end).ok_or(BAD_PARAMETER)?;
+        at = end;
+        if kind == 0x0f {
+            if length != 1 || at != bytes.len() {
+                return Err(BAD_PARAMETER);
+            }
+            if item[0] != 0 && bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0 {
+                return Err(BAD_PARAMETER);
+            }
+            return Ok(interrupts);
+        }
+        if kind != 0x8c {
+            continue;
+        }
+        if length < 20 || item[0] != 1 || item[1] != 0 {
+            return Err(BAD_PARAMETER);
+        }
+        let flags = u16::from_le_bytes(item[2..4].try_into().unwrap());
+        let int_flags = u16::from_le_bytes(item[4..6].try_into().unwrap());
+        let pin_config = item[6];
+        if pin_config > 3 || flags & !0x07 != 0 || int_flags & !0x0f != 0 {
+            return Err(BAD_PARAMETER);
+        }
+        let pin_table_offset = usize::from(u16::from_le_bytes(item[11..13].try_into().unwrap()));
+        let source_index = item[13];
+        let source_offset = usize::from(u16::from_le_bytes(item[14..16].try_into().unwrap()));
+        let vendor_offset = usize::from(u16::from_le_bytes(item[16..18].try_into().unwrap()));
+        let vendor_length = usize::from(u16::from_le_bytes(item[18..20].try_into().unwrap()));
+        let pin_start = pin_table_offset.checked_sub(3).ok_or(BAD_PARAMETER)?;
+        let source_start = source_offset.checked_sub(3).ok_or(BAD_PARAMETER)?;
+        if pin_start < 20 || source_start <= pin_start || source_start > item.len() {
+            return Err(BAD_PARAMETER);
+        }
+        let pin_bytes = source_start - pin_start;
+        if pin_bytes == 0 || pin_bytes % 2 != 0 {
+            return Err(BAD_PARAMETER);
+        }
+        let source_end = if vendor_offset == 0 {
+            item.len()
+        } else {
+            vendor_offset.checked_sub(3).ok_or(BAD_PARAMETER)?
+        };
+        if source_end <= source_start || source_end > item.len() {
+            return Err(BAD_PARAMETER);
+        }
+        if vendor_length != 0
+            && (vendor_offset == 0 || source_end.checked_add(vendor_length) != Some(item.len()))
+        {
+            return Err(BAD_PARAMETER);
+        }
+        let source = &item[source_start..source_end];
+        let nul = source
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(BAD_PARAMETER)?;
+        if nul == 0 || source[nul + 1..].iter().any(|byte| *byte != 0) {
+            return Err(BAD_PARAMETER);
+        }
+        let polarity = match (int_flags >> 1) & 3 {
+            0 => GpioPolarity::ActiveHigh,
+            1 => GpioPolarity::ActiveLow,
+            2 => GpioPolarity::Both,
+            _ => return Err(BAD_PARAMETER),
+        };
+        let mut resource_source = Vec::new();
+        resource_source
+            .try_reserve_exact(nul)
+            .map_err(|_| NO_MEMORY)?;
+        resource_source.extend_from_slice(&source[..nul]);
+        let mut pins = Vec::new();
+        for pin in item[pin_start..source_start].chunks_exact(2) {
+            push(&mut pins, u16::from_le_bytes(pin.try_into().unwrap()))?;
+        }
+        push(
+            &mut interrupts,
+            GpioInterrupt {
+                resource_source,
+                source_index,
+                pins,
+                trigger: if int_flags & 1 == 0 {
+                    GpioTrigger::Level
+                } else {
+                    GpioTrigger::Edge
+                },
+                polarity,
+                shared: flags & 2 != 0 || int_flags & 8 != 0,
+                wake_capable: flags & 4 != 0,
+                debounce_timeout_us: u16::from_le_bytes(item[9..11].try_into().unwrap()),
+                pin_config,
+            },
+        )?;
+    }
+    Err(BAD_PARAMETER)
+}
 fn push<T>(v: &mut Vec<T>, item: T) -> Result<(), Status> {
     v.try_reserve(1).map_err(|_| NO_MEMORY)?;
     v.push(item);
@@ -125,6 +267,8 @@ pub fn parse(bytes: &[u8]) -> Result<Resources, Status> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     #[test]
     fn ec_io_and_irq() {
@@ -149,6 +293,45 @@ mod tests {
         let r = parse(&[0x89, 6, 0, 0x0c, 1, 0x15, 0, 0, 0, 0x79, 0]).unwrap();
         assert_eq!(r.irqs[0].numbers, [21]);
         assert!(r.irqs[0].level && r.irqs[0].active_low && r.irqs[0].shared);
+    }
+
+    #[test]
+    fn gpio_int_preserves_controller_pin_and_interrupt_configuration() {
+        let source = b"\\_SB.GPI0\0";
+        let mut payload = vec![
+            1, 0, 6, 0, 0x0c, 0, 1, 0, 0, 0x20, 0, 23, 0, 2, 27, 0, 0, 0, 0, 0,
+        ];
+        payload.extend_from_slice(&4u16.to_le_bytes());
+        payload.extend_from_slice(&7u16.to_le_bytes());
+        payload.extend_from_slice(source);
+        let mut descriptor = vec![0x8c];
+        descriptor.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        descriptor.extend_from_slice(&payload);
+        descriptor.extend_from_slice(&[0x79, 0]);
+        let irq = parse_gpio_interrupts(&descriptor).unwrap().remove(0);
+        assert_eq!(irq.resource_source, b"\\_SB.GPI0");
+        assert_eq!(irq.source_index, 2);
+        assert_eq!(irq.pins, [4, 7]);
+        assert_eq!(irq.trigger, GpioTrigger::Level);
+        assert_eq!(irq.polarity, GpioPolarity::Both);
+        assert!(irq.shared && irq.wake_capable);
+        assert_eq!(irq.debounce_timeout_us, 0x20);
+        assert_eq!(irq.pin_config, 1);
+    }
+
+    #[test]
+    fn gpio_int_rejects_invalid_offsets_and_polarity() {
+        let mut payload = vec![1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 23, 0, 0, 25, 0, 0, 0, 0, 0];
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&[b'X', 0]);
+        let mut descriptor = vec![0x8c];
+        descriptor.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        descriptor.extend_from_slice(&payload);
+        descriptor.extend_from_slice(&[0x79, 0]);
+        assert!(parse_gpio_interrupts(&descriptor).is_err());
+        for end in 0..descriptor.len() {
+            assert!(parse_gpio_interrupts(&descriptor[..end]).is_err());
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 //! ACPICA resource provider for default-enabled I2C controllers.
-use alloc::{format, string::String, vec::Vec};
+use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
 
-use axdriver::i2c::{AcpiI2cChild, AcpiI2cSupport};
+use axdriver::i2c::{AcpiGpioPolarity, AcpiI2cChild, AcpiI2cGpioInterrupt, AcpiI2cSupport};
 use tk_acpica::{Engine, Node, Value};
 
 // upstream: iichid.c acpi_is_iichid()
@@ -55,6 +55,49 @@ fn engine_child_devices(engine: &Engine, nodes: &[Node], controller: &str) -> Ve
                 continue;
             }
         };
+        let gpio_interrupts = match tk_acpica::resources::parse_gpio_interrupts(&resources) {
+            Ok(resources) => resources
+                .into_iter()
+                .filter_map(|resource| {
+                    let controller_path = match core::str::from_utf8(&resource.resource_source) {
+                        Ok(path) => path.to_owned(),
+                        Err(_) => {
+                            warn!(
+                                "acpica: I2C HID {} has non-UTF8 GPIO ResourceSource",
+                                node.path
+                            );
+                            return None;
+                        }
+                    };
+                    Some(AcpiI2cGpioInterrupt {
+                        controller_path,
+                        source_index: resource.source_index,
+                        pins: resource.pins,
+                        edge_triggered: resource.trigger == tk_acpica::resources::GpioTrigger::Edge,
+                        polarity: match resource.polarity {
+                            tk_acpica::resources::GpioPolarity::ActiveHigh => {
+                                AcpiGpioPolarity::ActiveHigh
+                            }
+                            tk_acpica::resources::GpioPolarity::ActiveLow => {
+                                AcpiGpioPolarity::ActiveLow
+                            }
+                            tk_acpica::resources::GpioPolarity::Both => AcpiGpioPolarity::Both,
+                        },
+                        shared: resource.shared,
+                        wake_capable: resource.wake_capable,
+                        debounce_timeout_us: resource.debounce_timeout_us,
+                        pin_config: resource.pin_config,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(status) => {
+                warn!(
+                    "acpica: I2C HID {} GPIO resource decode failed {status:#x}",
+                    node.path
+                );
+                Vec::new()
+            }
+        };
         for bus in buses {
             let Ok(source) = core::str::from_utf8(&bus.resource_source) else {
                 warn!(
@@ -73,6 +116,7 @@ fn engine_child_devices(engine: &Engine, nodes: &[Node], controller: &str) -> Ve
                 ten_bit: bus.ten_bit,
                 speed_hz: bus.connection_speed_hz,
                 hid_descriptor_register: Some(descriptor_register),
+                gpio_interrupts: gpio_interrupts.clone(),
             });
         }
     }

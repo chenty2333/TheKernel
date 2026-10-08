@@ -156,6 +156,14 @@ impl I2cInput {
     // upstream: iichid.c iichid_attach()
     // upstream: iichid.c iichid_get_rdesc()
     fn attach(bus: usize, child: crate::i2c::AcpiI2cChild) -> DevResult<Self> {
+        if !child.gpio_interrupts.is_empty() {
+            warn!(
+                "i2c-hid: {} has {} parsed GpioInt resource(s); GPIO provider/IRQ request is \
+                 unavailable, retaining adaptive polling",
+                child.path,
+                child.gpio_interrupts.len()
+            );
+        }
         let address = if child.ten_bit {
             Address::ten_bit(child.slave_address)
         } else {

@@ -199,6 +199,29 @@ pub struct AcpiI2cChild {
     pub ten_bit: bool,
     pub speed_hz: u32,
     pub hid_descriptor_register: Option<u16>,
+    /// Parsed ACPI GPIO interrupt resources. These are retained for diagnostics
+    /// until the platform GPIO-provider/IRQ request interface is available.
+    pub gpio_interrupts: Vec<AcpiI2cGpioInterrupt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcpiI2cGpioInterrupt {
+    pub controller_path: String,
+    pub source_index: u8,
+    pub pins: Vec<u16>,
+    pub edge_triggered: bool,
+    pub polarity: AcpiGpioPolarity,
+    pub shared: bool,
+    pub wake_capable: bool,
+    pub debounce_timeout_us: u16,
+    pub pin_config: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcpiGpioPolarity {
+    ActiveHigh,
+    ActiveLow,
+    Both,
 }
 
 #[crate_interface::def_interface]
