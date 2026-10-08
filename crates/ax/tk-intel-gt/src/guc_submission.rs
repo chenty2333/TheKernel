@@ -864,7 +864,9 @@ pub fn context_registration_info(
     if context_id == GUC_INVALID_CONTEXT_ID
         || engine_submit_mask == 0
         || wq_descriptor.is_some() != wq_base.is_some()
-        || hwlrca & 0xfff != 0
+        || hwlrca == 0
+        || hwlrca & 1 == 0
+    // GEN8_CTX_VALID in the LRCA descriptor.
     {
         return Err(Error::Refused);
     }
@@ -956,7 +958,11 @@ pub fn guc_context_policy_init_v69(
 
 /// upstream: intel_guc_submission.c prepare_context_registration_info_v69().
 pub fn prepare_context_desc_v69(input: ContextDescV69Input) -> Result<GuCLrcDescV69, Error> {
-    if input.engine_submit_mask == 0 || input.hwlrca == 0 || input.priority > 3 {
+    if input.engine_submit_mask == 0
+        || input.hwlrca == 0
+        || input.hwlrca & 1 == 0
+        || input.priority > 3
+    {
         return Err(Error::Refused);
     }
     let mut descriptor = GuCLrcDescV69 {
@@ -1479,7 +1485,7 @@ mod tests {
             17,
             1,
             1,
-            0x1_2345_6000,
+            0x1_2345_610d,
             Some(2),
             Some(0x2_0000_3000),
             Some(0x3_0000_4000),
@@ -1494,7 +1500,7 @@ mod tests {
         let wq_size = info.wq_size;
         assert_eq!(flags, CONTEXT_REGISTRATION_FLAG_KMD);
         assert_eq!(engine_class, 3);
-        assert_eq!(hwlrca_lo, 0x2345_6000 | (1 << 9));
+        assert_eq!(hwlrca_lo, 0x2345_610d | (1 << 9));
         assert_eq!(hwlrca_hi, 1);
         assert_eq!(wq_desc_hi, 2);
         assert_eq!(wq_base_hi, 3);
@@ -1542,7 +1548,7 @@ mod tests {
         let descriptor = prepare_context_desc_v69(ContextDescV69Input {
             engine_class: 1,
             engine_submit_mask: 1,
-            hwlrca: 0x40_0000,
+            hwlrca: 0x40_010d,
             priority: 2,
             execution_quantum_ms: 20,
             preemption_timeout_ms: 5,
@@ -1570,7 +1576,7 @@ mod tests {
         );
 
         let info =
-            context_registration_info(7, 0, 1, 0x40_0000, None, Some(0x50_0000), Some(0x50_0800))
+            context_registration_info(7, 0, 1, 0x40_010d, None, Some(0x50_0000), Some(0x50_0800))
                 .unwrap();
         let multi = register_multi_context_action_v70(info, &[0x60_0000], &[8]).unwrap();
         assert_eq!(multi[0], ACTION_REGISTER_CONTEXT_MULTI_LRC);
@@ -1666,7 +1672,7 @@ mod tests {
             panic!("single ID expected")
         };
         let info =
-            context_registration_info(context_id, 0, 1, 0x40_0000, None, None, None).unwrap();
+            context_registration_info(context_id, 0, 1, 0x40_010d, None, None, None).unwrap();
         let policy = ContextPolicy {
             context_id,
             priority: GUC_CLIENT_PRIORITY_KMD_NORMAL.into(),
