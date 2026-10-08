@@ -2552,8 +2552,12 @@ impl<I: SdhciIo> SdhciDisk<I> {
             if sd_uhs_voltage {
                 let mut switch_status = [0u8; 64];
                 host.switch_sd_function(0, 0, 0x0f, &mut switch_status)?;
-                let (timing, function, clock_hz, needs_tuning) =
-                    choose_sd_uhs_timing(host.capabilities2, switch_status[13], host.base_clock_hz);
+                let (timing, function, clock_hz, needs_tuning) = choose_sd_uhs_timing(
+                    host.capabilities2,
+                    host.capabilities & SDHCI_CAN_DO_HISPD != 0,
+                    switch_status[13],
+                    host.base_clock_hz,
+                );
                 if function != 0 {
                     host.switch_sd_function(1, 0, function, &mut switch_status)?;
                     if !sd_switch_selected_function(&switch_status, function) {
@@ -2982,6 +2986,7 @@ fn sd_switch_supports_high_speed(status: &[u8; 64]) -> bool {
 // upstream: mmc.c mmc_discover_cards() UHS timing/capability selection
 fn choose_sd_uhs_timing(
     host_caps: u32,
+    host_high_speed: bool,
     card_group1: u8,
     base_clock_hz: u32,
 ) -> (MmcBusTiming, u8, u32, bool) {
@@ -3009,7 +3014,7 @@ fn choose_sd_uhs_timing(
             false,
         );
     }
-    if card_group1 & (1 << 1) != 0 {
+    if host_high_speed && card_group1 & (1 << 1) != 0 {
         return (
             MmcBusTiming::UhsSdr25,
             1,
@@ -4007,16 +4012,16 @@ mod tests {
 
     #[test]
     fn sd_uhs_mode_selection_requires_host_and_card_support() {
-        let sdr104 = choose_sd_uhs_timing(SDHCI_CAN_SDR104, (1 << 3) | (1 << 2), 100_000_000);
+        let sdr104 = choose_sd_uhs_timing(SDHCI_CAN_SDR104, true, (1 << 3) | (1 << 2), 100_000_000);
         assert_eq!(sdr104.0, MmcBusTiming::UhsSdr104);
         assert_eq!(sdr104.1, 3);
         assert_eq!(sdr104.2, 100_000_000);
         assert!(sdr104.3);
 
-        let ddr50 = choose_sd_uhs_timing(SDHCI_CAN_DDR50, 1 << 4, 50_000_000);
+        let ddr50 = choose_sd_uhs_timing(SDHCI_CAN_DDR50, false, 1 << 4, 50_000_000);
         assert_eq!(ddr50, (MmcBusTiming::UhsDdr50, 4, 50_000_000, false));
 
-        let safe = choose_sd_uhs_timing(SDHCI_CAN_SDR104, 0, 50_000_000);
+        let safe = choose_sd_uhs_timing(SDHCI_CAN_SDR104, true, 0, 50_000_000);
         assert_eq!(safe, (MmcBusTiming::UhsSdr12, 0, 25_000_000, false));
     }
 

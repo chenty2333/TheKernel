@@ -30,8 +30,7 @@ use axalloc::{UsageKind, global_allocator};
 use axdriver_block::{
     BlockDriverOps,
     ahci::{
-        AhciController, AhciDisk, AhciIo, AhciPmpTargetDisk, DmaRegion, PortState,
-        PortWorkspace,
+        AhciController, AhciDisk, AhciIo, AhciPmpTargetDisk, DmaRegion, PortState, PortWorkspace,
         regs::{
             AHCI_CAP_SPM, AHCI_MAX_PORTS, AHCI_OFFSET, AHCI_P_IE, AHCI_P_SIG, AHCI_P_SSTS,
             AHCI_STEP, ATA_SS_DET_MASK, ATA_SS_DET_NO_DEVICE,
