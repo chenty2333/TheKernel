@@ -35,10 +35,16 @@ by the `tk-axdriver` default feature. The complete 317-row FreeBSD PCI
 ID/revision/name/quirk table is translated in `tk-axdriver/src/ahci/pci_ids.rs`;
 `ahci_pci_attach` selects BAR0 for the ABAR0 quirk and BAR5 otherwise. Remaining
 The PCI frontend now attempts MSI-X, MSI, then firmware-routed shared INTx, and
-AHCI completions acknowledge status before waking waiters. Remaining work
-includes enclosure management, Intel remapped NVMe, CAM CCB/SCSI translation,
-PCI-function removal events, multi-slot scheduling/recovery, and concurrent
-NCQ submission. A controller worker retries ports that were empty or not ready
+AHCI completions acknowledge status before waking waiters. Concurrent direct
+physical-SG NCQ submission is implemented across the advertised slot depth, but
+an error/reset completes all outstanding batch members rather than requeueing
+only the READ LOG EXT victim. PMP target FIS selection is represented per disk,
+but automatic PMP signature discovery and publication of multiple target disks
+remain unavailable because port/workspace lifetime is still owned per disk,
+not by a shared controller-port registry. Remaining work also includes
+enclosure management, Intel remapped NVMe, CAM CCB/SCSI translation,
+PCI-function removal events, and power-management/newbus lifecycle. A controller
+worker retries ports that were empty or not ready
 at boot and publishes successfully identified media through the runtime block
 registry. An existing port returns I/O errors while absent and only resumes
 after IDENTIFY geometry and serial/model/capacity fingerprint match.

@@ -261,6 +261,7 @@ enum AsyncState {
 pub struct AhciDisk<I: AhciIo> {
     controller: AhciController<I>,
     port: PortState,
+    pmp_port: u8,
     workspace: ManuallyDrop<PortWorkspace>,
     geometry: AtaGeometry,
     identity_digest: u64,
@@ -313,10 +314,26 @@ impl<I: AhciIo> AhciDisk<I> {
     /// if stop cannot prove DMA quiescence they are deliberately leaked.
     // upstream: ahci.c ahci_ch_attach()
     pub fn attach(
+        controller: AhciController<I>,
+        port: PortState,
+        workspace: PortWorkspace,
+    ) -> Result<Self, AhciDiskError> {
+        Self::attach_pmp_port(controller, port, workspace, 0)
+    }
+
+    /// Constructs one target-selected command path. This does not enumerate or
+    /// share the port workspace with sibling target views; the PCI frontend
+    /// currently publishes only target zero until that port registry exists.
+    // upstream: ahci.c ahci_ch_attach() PMP target variant
+    pub fn attach_pmp_port(
         mut controller: AhciController<I>,
         mut port: PortState,
         workspace: PortWorkspace,
+        pmp_port: u8,
     ) -> Result<Self, AhciDiskError> {
+        if pmp_port >= 16 {
+            return Err(AhciDiskError::InvalidRequest);
+        }
         if controller.capabilities & AHCI_CAP_64BIT == 0
             && [
                 workspace.command_list.bus,
@@ -374,6 +391,7 @@ impl<I: AhciIo> AhciDisk<I> {
         let mut disk = Self {
             controller,
             port,
+            pmp_port,
             workspace: ManuallyDrop::new(workspace),
             geometry: AtaGeometry {
                 block_size: 512,
@@ -396,7 +414,7 @@ impl<I: AhciIo> AhciDisk<I> {
         };
         let mut identify = [0u8; 512];
         if disk
-            .execute(AtaRequest::Identify { pmp_port: 0 }, identify.len())
+            .execute(AtaRequest::Identify { pmp_port }, identify.len())
             .is_err()
         {
             return Err(disk.attach_failure(AhciDiskError::IdentifyFailed));
@@ -453,7 +471,12 @@ impl<I: AhciIo> AhciDisk<I> {
             return Err(AhciDiskError::NoDevice);
         }
         let mut identify = [0u8; 512];
-        self.execute(AtaRequest::Identify { pmp_port: 0 }, identify.len())?;
+        self.execute(
+            AtaRequest::Identify {
+                pmp_port: self.pmp_port,
+            },
+            identify.len(),
+        )?;
         // SAFETY: the identify transaction finished before copying from bounce.
         unsafe {
             ptr::copy_nonoverlapping(
@@ -828,7 +851,12 @@ impl<I: AhciIo> AhciDisk<I> {
         if self.poisoned {
             return None;
         }
-        let Ok(ncq) = self.build_command(AtaRequest::ReadLogExt { pmp_port: 0 }, 512) else {
+        let Ok(ncq) = self.build_command(
+            AtaRequest::ReadLogExt {
+                pmp_port: self.pmp_port,
+            },
+            512,
+        ) else {
             return None;
         };
         debug_assert!(!ncq);
@@ -1400,7 +1428,12 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
                 if bytes != 0 {
                     return Err(DevError::InvalidParam);
                 }
-                (AtaRequest::FlushCacheExt { pmp_port: 0 }, 0)
+                (
+                    AtaRequest::FlushCacheExt {
+                        pmp_port: self.pmp_port,
+                    },
+                    0,
+                )
             }
         };
         if request.op == BlockAsyncOp::Write {
@@ -1585,8 +1618,13 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
 
     fn flush(&mut self) -> DevResult {
         self.ensure_connected().map_err(map_error)?;
-        self.execute(AtaRequest::FlushCacheExt { pmp_port: 0 }, 0)
-            .map_err(map_error)
+        self.execute(
+            AtaRequest::FlushCacheExt {
+                pmp_port: self.pmp_port,
+            },
+            0,
+        )
+        .map_err(map_error)
     }
 
     fn block_capabilities(&self) -> BlockCapabilities {
@@ -1660,14 +1698,14 @@ impl<I: AhciIo> AhciDisk<I> {
                 sectors,
                 write,
                 tag,
-                pmp_port: 0,
+                pmp_port: self.pmp_port,
             }
         } else {
             AtaRequest::DmaExt {
                 lba,
                 sectors,
                 write,
-                pmp_port: 0,
+                pmp_port: self.pmp_port,
             }
         }
     }
@@ -2170,6 +2208,7 @@ mod tests {
                 0,
             ),
             port: PortState::new(0),
+            pmp_port: 0,
             workspace: ManuallyDrop::new(workspace),
             geometry: AtaGeometry {
                 block_size: 512,
