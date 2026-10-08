@@ -550,6 +550,52 @@ impl CtbPair {
         self.receive.release_response_space(dwords)
     }
 
+    /// Initial shared blob created by intel_guc_ct_init().
+    // upstream: intel_guc_ct.c intel_guc_ct_init()
+    pub fn initial_blob(&self) -> Vec<u8> {
+        let mut blob = alloc::vec![0; CTB_BLOB_SIZE];
+        encode_descriptor(&mut blob, CTB_SEND_DESC_OFFSET, &self.send.descriptor);
+        encode_descriptor(&mut blob, CTB_RECV_DESC_OFFSET, &self.receive.descriptor);
+        encode_commands(&mut blob, CTB_SEND_BUFFER_OFFSET, &self.send.commands);
+        encode_commands(&mut blob, CTB_RECV_BUFFER_OFFSET, &self.receive.commands);
+        blob
+    }
+
+    /// Import peer-owned descriptor fields and G2H command dwords before read.
+    pub fn sync_from_blob(&mut self, blob: &[u8]) -> Result<(), CtError> {
+        if blob.len() < CTB_BLOB_SIZE {
+            return Err(CtError::InvalidSize);
+        }
+        self.send.descriptor.head = read_dword(blob, CTB_SEND_DESC_OFFSET)?;
+        self.send.descriptor.tail = read_dword(blob, CTB_SEND_DESC_OFFSET + 4)?;
+        self.send.descriptor.status = read_dword(blob, CTB_SEND_DESC_OFFSET + 8)?;
+        if self.send.descriptor.tail != self.send.local_tail {
+            self.send.descriptor.status |= CTB_STATUS_MISMATCH;
+        }
+        self.send.update_peer(self.send.descriptor.head)?;
+
+        self.receive.descriptor.head = read_dword(blob, CTB_RECV_DESC_OFFSET)?;
+        self.receive.descriptor.tail = read_dword(blob, CTB_RECV_DESC_OFFSET + 4)?;
+        self.receive.descriptor.status = read_dword(blob, CTB_RECV_DESC_OFFSET + 8)?;
+        if self.receive.descriptor.head != self.receive.local_head {
+            self.receive.descriptor.status |= CTB_STATUS_MISMATCH;
+        }
+        self.receive.update_peer(self.receive.descriptor.tail)?;
+        decode_commands(blob, CTB_RECV_BUFFER_OFFSET, &mut self.receive.commands)?;
+        Ok(())
+    }
+
+    /// Publish host-owned H2G dwords and descriptor positions to the shared blob.
+    pub fn sync_to_blob(&self, blob: &mut [u8]) -> Result<(), CtError> {
+        if blob.len() < CTB_BLOB_SIZE {
+            return Err(CtError::InvalidSize);
+        }
+        write_dword(blob, CTB_SEND_DESC_OFFSET + 4, self.send.local_tail)?;
+        write_dword(blob, CTB_RECV_DESC_OFFSET, self.receive.local_head)?;
+        encode_commands(blob, CTB_SEND_BUFFER_OFFSET, &self.send.commands);
+        Ok(())
+    }
+
     /// upstream: intel_guc_ct.c ct_send() request registration and CT write.
     pub fn send_request(
         &mut self,
@@ -639,6 +685,45 @@ impl CtbPair {
             .release_response_space(CTB_MSG_MAX_LEN as u32)?;
         Ok(completion)
     }
+}
+
+fn read_dword(blob: &[u8], offset: usize) -> Result<u32, CtError> {
+    let bytes = blob
+        .get(offset..offset.checked_add(4).ok_or(CtError::InvalidSize)?)
+        .ok_or(CtError::InvalidSize)?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().map_err(|_| CtError::InvalidSize)?,
+    ))
+}
+
+fn write_dword(blob: &mut [u8], offset: usize, value: u32) -> Result<(), CtError> {
+    let bytes = blob
+        .get_mut(offset..offset.checked_add(4).ok_or(CtError::InvalidSize)?)
+        .ok_or(CtError::InvalidSize)?;
+    bytes.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn encode_descriptor(blob: &mut [u8], offset: usize, desc: &CtbDescriptor) {
+    let _ = write_dword(blob, offset, desc.head);
+    let _ = write_dword(blob, offset + 4, desc.tail);
+    let _ = write_dword(blob, offset + 8, desc.status);
+    for (index, value) in desc.reserved.iter().copied().enumerate() {
+        let _ = write_dword(blob, offset + 12 + index * 4, value);
+    }
+}
+
+fn encode_commands(blob: &mut [u8], offset: usize, commands: &[u32]) {
+    for (index, word) in commands.iter().copied().enumerate() {
+        let _ = write_dword(blob, offset + index * 4, word);
+    }
+}
+
+fn decode_commands(blob: &[u8], offset: usize, commands: &mut [u32]) -> Result<(), CtError> {
+    for (index, word) in commands.iter_mut().enumerate() {
+        *word = read_dword(blob, offset + index * 4)?;
+    }
+    Ok(())
 }
 
 /// upstream: intel_guc_ct.c intel_guc_ct_max_queue_time_jiffies().
@@ -777,6 +862,37 @@ mod tests {
             ])
         );
         assert_eq!(pair.receive.descriptor.head, 2);
+    }
+
+    #[test]
+    fn ctb_shared_blob_sync_uses_host_owned_and_peer_owned_descriptor_fields() {
+        let mut pair = CtbPair::new().unwrap();
+        let mut blob = pair.initial_blob();
+        pair.send_nonblocking(&[0x2202, 0x55], 0).unwrap();
+        pair.sync_to_blob(&mut blob).unwrap();
+        assert_eq!(read_dword(&blob, CTB_SEND_DESC_OFFSET + 4), Ok(3));
+        assert_eq!(
+            read_dword(&blob, CTB_SEND_BUFFER_OFFSET),
+            Ok(ctb_message_header(1, 2))
+        );
+
+        // Simulate GuC consuming H2G and posting one G2H response.
+        write_dword(&mut blob, CTB_SEND_DESC_OFFSET, 3).unwrap();
+        write_dword(&mut blob, CTB_RECV_DESC_OFFSET + 4, 3).unwrap();
+        write_dword(&mut blob, CTB_RECV_BUFFER_OFFSET, ctb_message_header(1, 2)).unwrap();
+        write_dword(
+            &mut blob,
+            CTB_RECV_BUFFER_OFFSET + 4,
+            HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_SUCCESS,
+        )
+        .unwrap();
+        write_dword(&mut blob, CTB_RECV_BUFFER_OFFSET + 8, 7).unwrap();
+        pair.sync_from_blob(&blob).unwrap();
+        assert!(pair.send.available_dwords() > 1000);
+        let response = pair.receive.read_message().unwrap().unwrap();
+        assert_eq!(response[2], 7);
+        pair.sync_to_blob(&mut blob).unwrap();
+        assert_eq!(read_dword(&blob, CTB_RECV_DESC_OFFSET), Ok(3));
     }
 
     #[test]

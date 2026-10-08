@@ -225,6 +225,8 @@ struct Owner {
     memory: Option<copy::Memory>,
     // Firmware source mapping retained if DMA completion cannot be proven.
     uc_memory: Option<copy::UcDmaMemory>,
+    // GuC CTB buffers/descriptor VMA retained while GuC may reference it.
+    ct_memory: Option<copy::CtDmaMemory>,
 }
 pub(super) mod copy;
 static READY: AtomicBool = AtomicBool::new(false);
@@ -343,7 +345,9 @@ fn load_uc_firmware() {
             return;
         }
         match copy::upload_uc_firmware(owner, guc, huc) {
-            Ok(()) => axlog::info!("intel-gt: HuC then GuC firmware DMA uploads completed"),
+            Ok(()) => {
+                axlog::info!("intel-gt: HuC/GuC firmware upload and authentication completed")
+            }
             Err(error) => {
                 if error == Error::Quarantined {
                     owner.lost = true;
@@ -364,9 +368,12 @@ pub(super) fn display_irq_owner_idle() -> bool {
     let Some(owner) = OWNER.try_lock() else {
         return false;
     };
-    owner
-        .as_ref()
-        .is_none_or(|owner| !owner.lost && owner.memory.is_none() && owner.uc_memory.is_none())
+    owner.as_ref().is_none_or(|owner| {
+        !owner.lost
+            && owner.memory.is_none()
+            && owner.uc_memory.is_none()
+            && owner.ct_memory.is_none()
+    })
 }
 
 /// Capability probes use only a successfully bootstrapped, still-live owner.
@@ -480,6 +487,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
             render_ready: false,
             memory: None,
             uc_memory: None,
+            ct_memory: None,
         });
         return Err(format!(
             "GT forcewake failed: {error:?}; terminal owner, no submission"
@@ -504,6 +512,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 render_ready: false,
                 memory: None,
                 uc_memory: None,
+                ct_memory: None,
             };
             let copied = copy::run(&mut device, bdf).and_then(|()| {
                 if axhal::boot::command_line_value("intel.rcs") == Some("1")
@@ -552,6 +561,7 @@ fn initialize(bdf: pci::Bdf, window: RegisterWindow) -> Result<String, String> {
                 render_ready: false,
                 memory: None,
                 uc_memory: None,
+                ct_memory: None,
             });
             Err(format!(
                 "intel-gt: initialization failed {error:?}; wake-release-verified={released}; no \

@@ -443,6 +443,113 @@ impl UcDmaMemory {
 }
 
 #[cfg(target_os = "none")]
+pub(super) struct CtDmaMemory {
+    _gtt: Arc<Gtt>,
+    _ram: Ram,
+    _binding: Binding,
+    pair: intel_gt::guc_ct::CtbPair,
+    blob: Vec<u8>,
+    enabled: bool,
+}
+
+#[cfg(target_os = "none")]
+impl CtDmaMemory {
+    fn release(self) -> Result<(), Self> {
+        // SAFETY: the CTB KLVs have not been registered with GuC yet.
+        if unsafe { self._gtt.release_binding(&self._binding) }.is_err() {
+            Err(self)
+        } else {
+            Ok(())
+        }
+    }
+
+    // upstream: intel_guc_ct.c intel_guc_ct_init()/intel_guc_ct_enable()
+    pub(super) fn initialize(owner: &mut super::Owner) -> Result<(), Error> {
+        if owner.ct_memory.is_some() {
+            return Err(Error::Quarantined);
+        }
+        let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
+        let pages = intel_gt::guc_ct::CTB_BLOB_SIZE
+            .checked_add(PAGE - 1)
+            .ok_or(Error::Refused)?
+            / PAGE;
+        let ram = Ram::allocate(pages)?;
+        let pair = intel_gt::guc_ct::CtbPair::new().map_err(|_| Error::Refused)?;
+        let blob = pair.initial_blob();
+        ram.write(0, &blob)?;
+        ram.flush();
+        let binding = gtt
+            .bind_pages(&ram.physical)
+            .map_err(|_| Error::Quarantined)?;
+        let memory = Self {
+            _gtt: gtt,
+            _ram: ram,
+            _binding: binding,
+            pair,
+            blob,
+            enabled: false,
+        };
+        let base = match u32::try_from(memory._binding.address) {
+            Ok(address) => address,
+            Err(_) => {
+                if let Err(memory) = memory.release() {
+                    owner.ct_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        let addresses = match intel_gt::guc_ct::ctb_addresses(base) {
+            Ok(addresses) => addresses,
+            Err(_) => {
+                if let Err(memory) = memory.release() {
+                    owner.ct_memory = Some(memory);
+                    return Err(Error::Quarantined);
+                }
+                return Err(Error::Refused);
+            }
+        };
+        owner.ct_memory = Some(memory);
+        let result = intel_gt::guc_ct::enable_buffer_transport(&owner.bus, addresses);
+        if result.is_err() {
+            // Self-config may have landed even when MMIO response handling
+            // failed; keep the whole blob resident and quarantine the owner.
+            return Err(Error::Quarantined);
+        }
+        if let Some(memory) = owner.ct_memory.as_mut() {
+            memory.enabled = true;
+        }
+        Ok(())
+    }
+
+    pub(super) fn send_nonblocking(
+        &mut self,
+        bus: &impl GtIo,
+        action: &[u32],
+        flags: u32,
+    ) -> Result<u16, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let fence = self
+            .pair
+            .send_nonblocking(action, flags)
+            .map_err(|_| Error::Refused)?;
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        intel_gt::guc_fw::notify(bus)?;
+        Ok(fence)
+    }
+}
+
+#[cfg(target_os = "none")]
 fn upload_huc_for_auth(
     owner: &mut super::Owner,
     image: &intel_gt::uc::FirmwareImage,
@@ -588,7 +695,11 @@ pub(super) fn upload_uc_firmware(
     guc: &intel_gt::uc::FirmwareImage,
     huc: &intel_gt::uc::FirmwareImage,
 ) -> Result<(), Error> {
-    if owner.lost || owner.memory.is_some() || owner.uc_memory.is_some() {
+    if owner.lost
+        || owner.memory.is_some()
+        || owner.uc_memory.is_some()
+        || owner.ct_memory.is_some()
+    {
         return Err(Error::Quarantined);
     }
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
@@ -622,6 +733,10 @@ pub(super) fn upload_uc_firmware(
     if let Err(memory) = huc_memory.release() {
         owner.uc_memory = Some(memory);
         return Err(Error::Quarantined);
+    }
+    if intel_gt::uc::default_enable_mask(owner.platform) & intel_gt::uc::ENABLE_GUC_SUBMISSION != 0
+    {
+        CtDmaMemory::initialize(owner)?;
     }
     Ok(())
 }
