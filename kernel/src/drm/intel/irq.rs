@@ -850,9 +850,11 @@ mod tests {
         words.insert(GFX_MSTR_IRQ, GEN11_MASTER_IRQ | GEN11_DISPLAY_IRQ);
         words.insert(
             GEN11_DISPLAY_INT_CTL,
-            DISPLAY_IRQ_ENABLE | DISPLAY_PIPE_A | DISPLAY_PCH,
+            DISPLAY_IRQ_ENABLE | DISPLAY_PIPE_A | DISPLAY_DE_HPD | DISPLAY_PCH,
         );
         words.insert(PIPE_A_IIR, PIPE_VBLANK);
+        words.insert(DE_HPD_IIR, 1 << 16);
+        words.insert(GEN11_TC_HOTPLUG_CTL, 2);
         words.insert(SDE_IIR, 1 << 24);
         let io = Model {
             words: Mutex::new(words),
@@ -867,6 +869,7 @@ mod tests {
         assert_eq!(events.hpd.load(Ordering::Acquire), 1);
         let writes = io.writes.lock().clone();
         assert!(writes.contains(&(PIPE_A_IIR, PIPE_VBLANK)));
+        assert!(writes.contains(&(DE_HPD_IIR, 1 << 16)));
         assert!(writes.contains(&(SDE_IIR, 1 << 24)));
         assert_eq!(writes.last(), Some(&(GFX_MSTR_IRQ, GEN11_MASTER_IRQ)));
     }
