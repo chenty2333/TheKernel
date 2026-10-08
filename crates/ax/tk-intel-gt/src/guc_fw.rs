@@ -39,6 +39,19 @@ const ACTION_AUTHENTICATE_HUC: u32 = 0x4000;
 const UOS_RSA_SCRATCH: u32 = 0xc200;
 const UOS_RSA_SCRATCH_COUNT: usize = 64;
 
+// upstream: intel_guc.c guc_send_reg()
+fn send_reg_offset(index: usize) -> Result<u32, Error> {
+    if index >= GEN11_GUC_SEND_COUNT {
+        return Err(Error::Refused);
+    }
+    Ok(GEN11_GUC_SEND_BASE + index as u32 * 4)
+}
+
+// upstream: intel_guc.c intel_guc_notify()
+pub fn notify(io: &impl GtIo) -> Result<(), Error> {
+    io.write(GEN11_GUC_HOST_INTERRUPT, GUC_SEND_TRIGGER)
+}
+
 // upstream: intel_uc_fw.c uc_fw_xfer()
 /// Caller must keep the firmware bytes and their GGTT binding alive until this
 /// returns success and hold GT forcewake. An uncertain completion quarantines
@@ -200,10 +213,10 @@ pub fn send_mmio(
     }
     loop {
         for (index, word) in request.iter().copied().enumerate() {
-            io.write(GEN11_GUC_SEND_BASE + index as u32 * 4, word)?;
+            io.write(send_reg_offset(index)?, word)?;
         }
-        let _posted = io.read(GEN11_GUC_SEND_BASE + (request.len() as u32 - 1) * 4)?;
-        io.write(GEN11_GUC_HOST_INTERRUPT, GUC_SEND_TRIGGER)?;
+        let _posted = io.read(send_reg_offset(request.len() - 1)?)?;
+        notify(io)?;
         let mut response = crate::wait(
             io,
             GEN11_GUC_SEND_BASE,
@@ -621,6 +634,9 @@ mod tests {
 
     #[test]
     fn gen11_mmio_send_handles_busy_retry_success_and_failure() {
+        assert_eq!(send_reg_offset(0), Ok(GEN11_GUC_SEND_BASE));
+        assert_eq!(send_reg_offset(3), Ok(GEN11_GUC_SEND_BASE + 12));
+        assert_eq!(send_reg_offset(4), Err(Error::Refused));
         let busy_response = HXG_ORIGIN_GUC | HXG_TYPE_NO_RESPONSE_BUSY;
         let success = HXG_ORIGIN_GUC | HXG_TYPE_RESPONSE_SUCCESS | 0x1234;
         let busy_values = [busy_response, busy_response, success];

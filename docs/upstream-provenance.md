@@ -1001,3 +1001,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_huc.c::intel_huc_is_authenticated` and `intel_huc_wait_for_auth_complete`, `HUC_STATUS2` verified-bit poll (MIT, Copyright © 2014-2019 Intel Corporation); GuC authentication is sent through the MMIO HXG transport, while GuC CT remains unimplemented.
 
 `crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.c::intel_guc_send_mmio` and `intel_guc_auth_huc`, Gen11+ HXG busy/retry/failure handling and HuC-auth action transport (MIT, Copyright © 2014-2019 Intel Corporation); register ownership and forcewake remain with the caller.
+`crates/ax/tk-intel-gt/src/guc_fw.rs`: Linux 7.2.3 `drivers/gpu/drm/i915/gt/uc/intel_guc.c::guc_send_reg` and `intel_guc_notify`, four-dword GuC send-register indexing and H2G notification write (MIT, Copyright © 2014-2019 Intel Corporation).
