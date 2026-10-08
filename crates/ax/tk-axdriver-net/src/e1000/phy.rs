@@ -33,6 +33,8 @@ const ADVERTISE_1000_HALF: u16 = 0x0010;
 const ADVERTISE_1000_FULL: u16 = 0x0020;
 const MII_AUTONEG_ADV: u8 = 0x04;
 const MII_1000T_CTRL: u8 = 0x09;
+const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
+const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
 const NWAY_AR_PAUSE: u16 = 0x0400;
 const NWAY_AR_ASM_DIR: u16 = 0x0800;
 const I2CCMD_TIMEOUT: u32 = E1000_I2CCMD_PHY_TIMEOUT;
@@ -291,6 +293,134 @@ pub struct AutonegConfig {
     pub flow_control: FlowControlMode,
 }
 
+pub trait E1000PhyMdicOps {
+    fn read_mdic(&mut self, offset: u32) -> DevResult<u16>;
+    fn write_mdic(&mut self, offset: u32, data: u16) -> DevResult;
+    fn acquire(&mut self) -> DevResult;
+    fn release(&mut self);
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_m88()
+pub fn read_phy_reg_m88<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    acquire_installed: bool,
+) -> DevResult<u16> {
+    if !acquire_installed {
+        return Ok(0);
+    }
+    io.acquire()?;
+    let result = io.read_mdic(offset & MAX_PHY_REG_ADDRESS);
+    io.release();
+    result
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_m88()
+pub fn write_phy_reg_m88<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    acquire_installed: bool,
+) -> DevResult {
+    if !acquire_installed {
+        return Ok(());
+    }
+    io.acquire()?;
+    let result = io.write_mdic(offset & MAX_PHY_REG_ADDRESS, data);
+    io.release();
+    result
+}
+
+/// upstream: e1000_phy.c e1000_set_page_igp()
+pub fn set_page_igp<I: E1000PhyMdicOps>(io: &mut I, page: u16) -> DevResult<u8> {
+    io.write_mdic(IGP01E1000_PHY_PAGE_SELECT, page)?;
+    Ok(1)
+}
+
+/// upstream: e1000_phy.c __e1000_read_phy_reg_igp()
+pub fn read_phy_reg_igp_internal<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    locked: bool,
+    acquire_installed: bool,
+) -> DevResult<u16> {
+    if !locked {
+        if !acquire_installed {
+            return Ok(0);
+        }
+        io.acquire()?;
+    }
+    let result = (|| {
+        if offset > MAX_PHY_MULTI_PAGE_REG {
+            io.write_mdic(IGP01E1000_PHY_PAGE_SELECT, offset as u16)?;
+        }
+        io.read_mdic(offset & MAX_PHY_REG_ADDRESS)
+    })();
+    if !locked {
+        io.release();
+    }
+    result
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_igp()
+pub fn read_phy_reg_igp<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    acquire_installed: bool,
+) -> DevResult<u16> {
+    read_phy_reg_igp_internal(io, offset, false, acquire_installed)
+}
+
+/// upstream: e1000_phy.c e1000_read_phy_reg_igp_locked()
+pub fn read_phy_reg_igp_locked<I: E1000PhyMdicOps>(io: &mut I, offset: u32) -> DevResult<u16> {
+    read_phy_reg_igp_internal(io, offset, true, true)
+}
+
+/// upstream: e1000_phy.c __e1000_write_phy_reg_igp()
+pub fn write_phy_reg_igp_internal<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    locked: bool,
+    acquire_installed: bool,
+) -> DevResult {
+    if !locked {
+        if !acquire_installed {
+            return Ok(());
+        }
+        io.acquire()?;
+    }
+    let result = (|| {
+        if offset > MAX_PHY_MULTI_PAGE_REG {
+            io.write_mdic(IGP01E1000_PHY_PAGE_SELECT, offset as u16)?;
+        }
+        io.write_mdic(offset & MAX_PHY_REG_ADDRESS, data)
+    })();
+    if !locked {
+        io.release();
+    }
+    result
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_igp()
+pub fn write_phy_reg_igp<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+    acquire_installed: bool,
+) -> DevResult {
+    write_phy_reg_igp_internal(io, offset, data, false, acquire_installed)
+}
+
+/// upstream: e1000_phy.c e1000_write_phy_reg_igp_locked()
+pub fn write_phy_reg_igp_locked<I: E1000PhyMdicOps>(
+    io: &mut I,
+    offset: u32,
+    data: u16,
+) -> DevResult {
+    write_phy_reg_igp_internal(io, offset, data, true, true)
+}
+
 /// upstream: e1000_phy.c e1000_phy_setup_autoneg()
 pub fn phy_setup_autoneg<I: E1000PhyRegisterIo>(
     io: &mut I,
@@ -440,6 +570,10 @@ mod tests {
         mdic_error: bool,
         i2c_data: u16,
         i2c_error: bool,
+        mdic_reads: alloc::vec::Vec<u32>,
+        mdic_writes: alloc::vec::Vec<(u32, u16)>,
+        locks: usize,
+        unlocks: usize,
     }
     impl E1000RegisterIo for Io {
         fn read_register(&mut self, register: u32) -> DevResult<u32> {
@@ -502,6 +636,23 @@ mod tests {
         fn write_phy_register(&mut self, register: u8, value: u16) -> DevResult {
             self.phy_writes.push((register, value));
             Ok(())
+        }
+    }
+    impl E1000PhyMdicOps for Io {
+        fn read_mdic(&mut self, offset: u32) -> DevResult<u16> {
+            self.mdic_reads.push(offset);
+            Ok(self.mdic_data)
+        }
+        fn write_mdic(&mut self, offset: u32, data: u16) -> DevResult {
+            self.mdic_writes.push((offset, data));
+            Ok(())
+        }
+        fn acquire(&mut self) -> DevResult {
+            self.locks += 1;
+            Ok(())
+        }
+        fn release(&mut self) {
+            self.unlocks += 1;
         }
     }
 
@@ -609,5 +760,36 @@ mod tests {
         assert!(read_sfp_data_byte(&mut io, 0x200).is_err());
         io.i2c_error = true;
         assert!(read_phy_reg_i2c(&mut io, 1, 1).is_err());
+    }
+
+    #[test]
+    fn generic_m88_and_igp_helpers_map_pages_and_release_locks() {
+        let mut io = Io {
+            mdic_data: 0x1234,
+            ..Io::default()
+        };
+        assert_eq!(read_phy_reg_m88(&mut io, 0x23, true).unwrap(), 0x1234);
+        assert_eq!(io.mdic_reads, [3]);
+        assert_eq!((io.locks, io.unlocks), (1, 1));
+        write_phy_reg_m88(&mut io, 0x24, 0xabcd, true).unwrap();
+        assert_eq!(io.mdic_writes, [(4, 0xabcd)]);
+
+        io.mdic_writes.clear();
+        assert_eq!(read_phy_reg_igp(&mut io, 0x21, true).unwrap(), 0x1234);
+        assert_eq!(io.mdic_writes, [(IGP01E1000_PHY_PAGE_SELECT, 0x21)]);
+        assert_eq!(io.mdic_reads.last(), Some(&1));
+        assert_eq!(set_page_igp(&mut io, 4).unwrap(), 1);
+        assert_eq!(
+            io.mdic_writes.last(),
+            Some(&(IGP01E1000_PHY_PAGE_SELECT, 4))
+        );
+        let before = io.locks;
+        write_phy_reg_igp_locked(&mut io, 0x22, 0x55aa).unwrap();
+        assert_eq!(io.locks, before);
+        assert_eq!(
+            io.mdic_writes[io.mdic_writes.len() - 2],
+            (IGP01E1000_PHY_PAGE_SELECT, 0x22)
+        );
+        assert_eq!(io.mdic_writes.last(), Some(&(2, 0x55aa)));
     }
 }
