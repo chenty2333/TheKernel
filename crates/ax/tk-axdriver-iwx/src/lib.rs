@@ -41,7 +41,10 @@ mod registers;
 mod rings;
 mod rx;
 mod rx_buffer;
+mod rx_crypto;
+mod rx_duplicate;
 mod rx_event;
+mod rx_mpdu;
 mod rx_packet;
 mod scan;
 mod scan_probe;
@@ -69,8 +72,8 @@ pub use attach::{
 };
 pub use ba::{
     BaError, BaTimeoutAction, BarFrameRelease, INVALID_BAID, MAX_RX_BA_SESSIONS,
-    RX_REORDER_TIMEOUT_MQ_USEC, ReorderBuffer, RxBaSession, RxBaTable, STATION_ID,
-    baid_config_command, baid_config_response, station_ba_command, station_ba_response,
+    RX_REORDER_TIMEOUT_MQ_USEC, ReorderBuffer, RxBaSession, RxBaTable, RxReorderOutcome,
+    STATION_ID, baid_config_command, baid_config_response, station_ba_command, station_ba_response,
 };
 pub use binding::{
     BINDING_CONTEXT_COMMAND, BindingError, BindingState, BindingUpdateError, CONTEXT_ACTION_ADD,
@@ -237,9 +240,19 @@ pub use rx_buffer::{
     RX_BUFFER_SIZE, RX_MPDU_COMMAND, RX_PACKET_MINIMUM_BYTES, RxBufferError, RxBufferReport,
     RxMbufPlan, process_rx_buffer, rx_buffer_packet_error,
 };
+pub use rx_crypto::{
+    CCMP_EXTENDED_IV, CcmpReplayError, CcmpReplayWindow, HardwareDecryptError,
+    HardwareDecryptPolicy, RX_MPDU_STATUS_CCM_ENCRYPTED, RX_MPDU_STATUS_DEC_DONE,
+    RX_MPDU_STATUS_ENCRYPTION_MASK, RX_MPDU_STATUS_MIC_OK, validate_hardware_decryption,
+};
+pub use rx_duplicate::{DuplicateError, DuplicateResult, RxDuplicateState};
 pub use rx_event::{
     DriverFirmwareEvent, EventPolicyAction, EventPolicyError, FirmwareEvent, FirmwarePolicyState,
     apply_event_policy, decode_driver_event, decode_firmware_event, process_command_response,
+};
+pub use rx_mpdu::{
+    ProcessedRxMpdu, RX_MPDU_STATUS_DUPLICATE, RxMpdu, RxMpduError, RxMpduMetadata, RxMpduOutcome,
+    RxMpduProcessError, normalize_rx_frame, parse_rx_mpdu, process_rx_mpdu,
 };
 pub use rx_packet::{
     FH_FRAME_ALIGNMENT, FH_FRAME_INVALID, FH_FRAME_SIZE_MASK, NOTIFICATION_ORIGIN,

@@ -20,6 +20,8 @@ const BAID_ADD: u32 = 0;
 const BAID_REMOVE: u32 = 2;
 const BAID_MAX: usize = 16;
 const BA_WINDOW_MAX: u16 = 64;
+const REORDER_SEQUENCE_MASK: u16 = 0x0fff;
+const REORDER_SEQUENCE_HALF: u16 = 0x0800;
 const ADD_STA_SUCCESS: u32 = 1;
 const ADD_STA_STATUS_MASK: u32 = 0xff;
 const ADD_STA_BAID_VALID: u32 = 0x8000;
@@ -98,6 +100,16 @@ pub struct RxBaSession<T> {
     pub reorder: ReorderBuffer<T>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct RxReorderOutcome<T> {
+    /// Frames released in source order, or the current frame on passthrough.
+    pub frames: Vec<T>,
+    /// False means the current frame bypassed reorder and `frames[0]` is current.
+    pub consumed: bool,
+    pub dropped: bool,
+    pub ampdu_done: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RxBaTable<T> {
     sessions: [Option<RxBaSession<T>>; MAX_RX_BA_SESSIONS],
@@ -125,6 +137,112 @@ impl<T> RxBaTable<T> {
 
     pub fn get(&self, baid: u8) -> Option<&RxBaSession<T>> {
         self.sessions.get(usize::from(baid))?.as_ref()
+    }
+
+    /// Buffer, release, bypass, or drop one validated firmware RX reorder entry.
+    // upstream: if_iwx.c iwx_rx_reorder() / iwx_release_frames()
+    pub fn reorder_mpdu(
+        &mut self,
+        baid: u8,
+        tid: u8,
+        sequence_number: u16,
+        nssn: u16,
+        amsdu: bool,
+        last_amsdu_subframe: bool,
+        old_sequence: bool,
+        duplicate: bool,
+        now_usec: u64,
+        frame: T,
+    ) -> Result<Option<RxReorderOutcome<T>>, BaError> {
+        let Some(session) = self
+            .sessions
+            .get_mut(usize::from(baid))
+            .and_then(Option::as_mut)
+        else {
+            return Ok(None);
+        };
+        if session.baid != baid || session.sta_id != STATION_ID || session.tid != tid {
+            return Ok(None);
+        }
+        if session.timeout_usec != 0 {
+            session.last_rx_usec = now_usec;
+        }
+        let reorder = &mut session.reorder;
+        if !reorder.valid {
+            if old_sequence {
+                return Ok(None);
+            }
+            reorder.valid = true;
+        }
+        if duplicate || old_sequence {
+            return Ok(Some(RxReorderOutcome {
+                frames: Vec::new(),
+                consumed: true,
+                dropped: true,
+                ampdu_done: true,
+            }));
+        }
+        let sequence_number = sequence_number & REORDER_SEQUENCE_MASK;
+        let nssn = nssn & REORDER_SEQUENCE_MASK;
+        if reorder.num_stored == 0 && seq_less_than(sequence_number, nssn) {
+            if !amsdu || last_amsdu_subframe {
+                reorder.head_sn = nssn;
+            }
+            let mut frames = Vec::new();
+            frames
+                .try_reserve_exact(1)
+                .map_err(|_| BaError::InvalidWindow)?;
+            frames.push(frame);
+            return Ok(Some(RxReorderOutcome {
+                frames,
+                consumed: false,
+                dropped: false,
+                ampdu_done: true,
+            }));
+        }
+        if reorder.num_stored == 0 && sequence_number == reorder.head_sn {
+            if !amsdu || last_amsdu_subframe {
+                reorder.head_sn = reorder.head_sn.wrapping_add(1) & REORDER_SEQUENCE_MASK;
+            }
+            let mut frames = Vec::new();
+            frames
+                .try_reserve_exact(1)
+                .map_err(|_| BaError::InvalidWindow)?;
+            frames.push(frame);
+            return Ok(Some(RxReorderOutcome {
+                frames,
+                consumed: false,
+                dropped: false,
+                ampdu_done: true,
+            }));
+        }
+        let index = usize::from(sequence_number % reorder.buf_size);
+        reorder.entries[index]
+            .try_reserve(1)
+            .map_err(|_| BaError::InvalidWindow)?;
+        reorder.entries[index].push(frame);
+        reorder.num_stored = reorder.num_stored.saturating_add(1);
+        let mut frames = Vec::new();
+        if !amsdu || last_amsdu_subframe {
+            while seq_less_than(reorder.head_sn, nssn) {
+                let slot = usize::from(reorder.head_sn % reorder.buf_size);
+                let released = core::mem::take(&mut reorder.entries[slot]);
+                frames
+                    .try_reserve(released.len())
+                    .map_err(|_| BaError::InvalidWindow)?;
+                reorder.num_stored = reorder
+                    .num_stored
+                    .saturating_sub(released.len().min(usize::from(u16::MAX)) as u16);
+                frames.extend(released);
+                reorder.head_sn = reorder.head_sn.wrapping_add(1) & REORDER_SEQUENCE_MASK;
+            }
+        }
+        Ok(Some(RxReorderOutcome {
+            frames,
+            consumed: true,
+            dropped: false,
+            ampdu_done: true,
+        }))
     }
 
     /// Start an accepted firmware BAID session, preserving its timer inputs.
@@ -221,6 +339,11 @@ impl<T> RxBaTable<T> {
             nssn: (ba_info & 0x0fff) as u16,
         })
     }
+}
+
+fn seq_less_than(left: u16, right: u16) -> bool {
+    let difference = left.wrapping_sub(right) & REORDER_SEQUENCE_MASK;
+    difference & REORDER_SEQUENCE_HALF != 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,6 +513,40 @@ mod tests {
         );
         payload[4] = 6;
         assert_eq!(table.parse_bar_release(&payload), None);
+    }
+
+    #[test]
+    fn reorder_mpdu_handles_wrap_gap_duplicates_and_amsdu_nssn() {
+        let mut table = RxBaTable::<u8>::default();
+        table.start(1, 3, 0x0ffe, 64, 20_000, 0).unwrap();
+        let buffered = table
+            .reorder_mpdu(1, 3, 0, 0x0fff, false, true, false, false, 1, 10)
+            .unwrap()
+            .unwrap();
+        assert!(buffered.consumed && buffered.frames.is_empty());
+        let released = table
+            .reorder_mpdu(1, 3, 0x0fff, 1, false, true, false, false, 2, 11)
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.frames, [11, 10]);
+        assert_eq!(table.get(1).unwrap().reorder.head_sn, 1);
+
+        let duplicate = table
+            .reorder_mpdu(1, 3, 1, 2, false, true, false, true, 3, 12)
+            .unwrap()
+            .unwrap();
+        assert!(duplicate.consumed && duplicate.dropped);
+        assert!(duplicate.ampdu_done);
+
+        let mut amsdu = RxBaTable::<u8>::default();
+        amsdu.start(2, 4, 0, 16, 0, 0).unwrap();
+        let first_subframe = amsdu
+            .reorder_mpdu(2, 4, 0, 1, true, false, false, false, 1, 20)
+            .unwrap()
+            .unwrap();
+        assert!(!first_subframe.consumed);
+        assert_eq!(first_subframe.frames, [20]);
+        assert_eq!(amsdu.get(2).unwrap().reorder.head_sn, 0);
     }
 
     #[test]

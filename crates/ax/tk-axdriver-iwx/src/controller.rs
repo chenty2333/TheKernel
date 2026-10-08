@@ -8,8 +8,8 @@
 use crate::{
     ApmError, AttachAllocationError, CsrAccess, DeviceFamily, DmaAllocator, DmaError, DmaRegion,
     FirmwareDmaImages, FirmwareImage, HostCommand, InterruptMasks, IwxAttachResources,
-    IwxRegisters, PnvmDmaImage, RegisterError, allocate_attach_resources,
-    initialize_firmware_sections, initialize_init_firmware_sections,
+    IwxRegisters, PnvmDmaImage, ProcessedRxMpdu, RegisterError, RxBaTable, RxDuplicateState,
+    allocate_attach_resources, initialize_firmware_sections, initialize_init_firmware_sections,
     post_alive as configure_post_alive, send_host_command, start_gen2_context, start_gen3_context,
 };
 
@@ -67,6 +67,9 @@ pub struct IwxController<B: CsrAccess, A: DmaAllocator> {
     pub interrupt_masks: InterruptMasks,
     pub command_slots: crate::CommandSlots,
     pub pnvm_dma: Option<PnvmDmaImage<A::Region>>,
+    pub rx_replay_windows: [crate::CcmpReplayWindow; 9],
+    pub rx_duplicates: RxDuplicateState,
+    pub rx_ba_sessions: RxBaTable<ProcessedRxMpdu>,
     pub generation: u32,
     pub hardware_rfkill: bool,
 }
@@ -90,6 +93,9 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             interrupt_masks: InterruptMasks::default(),
             command_slots: crate::CommandSlots::new(0, generation),
             pnvm_dma: None,
+            rx_replay_windows: [crate::CcmpReplayWindow::new(); 9],
+            rx_duplicates: RxDuplicateState::new(),
+            rx_ba_sessions: RxBaTable::default(),
             generation,
             hardware_rfkill: false,
         })
@@ -280,6 +286,57 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
             parts: &parts,
         };
         self.send_command_wait(&host, external, dispatch)
+    }
+
+    /// Decode an RX_MPDU descriptor and apply the source decrypt/replay/duplicate gates.
+    // upstream: if_iwx.c iwx_rx_mpdu_mq() / iwx_rx_hwdecrypt() / iwx_detect_duplicate()
+    pub fn process_rx_mpdu(
+        &mut self,
+        payload: &[u8],
+        monitor_mode: bool,
+        decrypt_policy: crate::HardwareDecryptPolicy,
+    ) -> Result<crate::RxMpduOutcome, crate::RxMpduProcessError> {
+        crate::process_rx_mpdu(
+            payload,
+            self.family,
+            monitor_mode,
+            decrypt_policy,
+            &mut self.rx_replay_windows,
+            &mut self.rx_duplicates,
+        )
+    }
+
+    /// Apply BAID/TID matching, duplicate/old-sequence decisions, buffering and NSSN release.
+    // upstream: if_iwx.c iwx_rx_reorder() / iwx_release_frames()
+    pub fn reorder_rx_mpdu(
+        &mut self,
+        frame: ProcessedRxMpdu,
+        now_usec: u64,
+    ) -> Result<Option<crate::RxReorderOutcome<ProcessedRxMpdu>>, crate::BaError> {
+        const REORDER_NSSN_MASK: u32 = 0x0000_0fff;
+        const REORDER_SN_MASK: u32 = 0x00ff_f000;
+        const REORDER_BAID_MASK: u32 = 0x7f00_0000;
+        const REORDER_OLD_SN: u32 = 1 << 31;
+        const REORDER_SN_SHIFT: u32 = 12;
+        const REORDER_BAID_SHIFT: u32 = 24;
+
+        let reorder = frame.metadata.reorder_data;
+        let baid = ((reorder & REORDER_BAID_MASK) >> REORDER_BAID_SHIFT) as u8;
+        if baid == crate::INVALID_BAID {
+            return Ok(None);
+        }
+        self.rx_ba_sessions.reorder_mpdu(
+            baid,
+            frame.tid_index,
+            ((reorder & REORDER_SN_MASK) >> REORDER_SN_SHIFT) as u16,
+            (reorder & REORDER_NSSN_MASK) as u16,
+            frame.metadata.is_amsdu(),
+            frame.metadata.last_amsdu_subframe(),
+            reorder & REORDER_OLD_SN != 0,
+            frame.metadata.status & crate::RX_MPDU_STATUS_DUPLICATE != 0,
+            now_usec,
+            frame,
+        )
     }
 
     /// Publish Init/regular firmware context and wait for the matching ALIVE event.
@@ -710,5 +767,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(order.into_inner(), [1]);
+    }
+
+    #[test]
+    fn controller_routes_parsed_mpdu_to_matching_rx_ba_session() {
+        let allocator = Allocator(Cell::new(0x500000));
+        let mut controller =
+            IwxController::attach(Bus::default(), allocator, DeviceFamily::Ax210, 0x300000, 13)
+                .unwrap();
+        controller
+            .rx_ba_sessions
+            .start(1, 3, 0, 64, 20_000, 0)
+            .unwrap();
+        let frame = crate::ProcessedRxMpdu {
+            metadata: crate::RxMpduMetadata {
+                descriptor_bytes: 68,
+                frame_bytes: 26,
+                status: 0,
+                reorder_data: (1 << 24) | 1,
+                phy_info: 0,
+                mac_flags2: 0,
+                amsdu_info: 0,
+                rate_n_flags: 0,
+                channel_index: 1,
+                energy_a: 0,
+                energy_b: 0,
+                device_timestamp: 0,
+            },
+            frame: alloc::vec![0; 26],
+            hardware_decrypted: false,
+            same_sequence: false,
+            tid_index: 3,
+        };
+        let result = controller.reorder_rx_mpdu(frame, 1).unwrap().unwrap();
+        assert!(!result.consumed);
+        assert_eq!(result.frames.len(), 1);
+        assert!(result.ampdu_done);
     }
 }

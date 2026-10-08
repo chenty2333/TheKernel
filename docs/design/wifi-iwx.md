@@ -94,6 +94,12 @@ diagnostics.
 The RX transfer-buffer walker now applies source framing/alignment, first-MPDU
 ring replacement, pre-AX210 copy-vs-transfer ownership, AX210 single-packet
 handling, command-response retirement, and notification ACK suppression.
+The RX_MPDU path now decodes Gen2/Gen3 descriptors, repairs the source
+post-header padding/A-MSDU-bit quirks, validates checksum/decryption flags,
+checks CCMP packet-number replay windows, tracks duplicate/A-MSDU subframes,
+and provides BAID/TID reorder-buffer release. The controller owns those replay,
+duplicate, and reorder states; the resulting 802.11 frame still needs delivery
+through the not-yet-published net80211/netdev adapter.
 The firmware-event classifier covers the remaining UAPSD, thermal, MCC,
 session-protection, channel-switch, statistics, RLC/TLC, and ignorable command
 branches so the platform dispatcher can apply side effects without losing ACKs.

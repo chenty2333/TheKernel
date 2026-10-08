@@ -54,3 +54,4 @@
 - Rootfs-ready firmware now runs the Init ucode ALIVE/INIT_COMPLETE sequence over the PCI-attached controller, parses strap/OTP MAC plus NVM_GET_INFO, disables INTx for polling, and stops the NIC after preinit; runtime ucode/PNVM and wlan0 remain open.
 - Controller `iwx_load_pnvm()` now selects embedded/external SKU-matched PNVM, stages fragmented Gen3 DMA, patches PRPH scratch, acquires the NIC lock for ISR6 doorbell, waits up to two seconds for completion, and retains DMA for device lifetime/retry.
 - Controller now exposes the source-ordered regular `iwx_load_ucode_wait_alive()` sequence (regular sections → ALIVE → PNVM completion for Gen3 → post-ALIVE); it still needs a netdev if-up caller and IRQ-backed runtime dispatcher.
+- RX_MPDU now has generation-specific descriptor decode, padding/A-MSDU repair, CCMP hardware-status/replay checks, duplicate tracking, and BAID/TID reorder/NSSN release; controller owns and routes these states for caller delivery.
