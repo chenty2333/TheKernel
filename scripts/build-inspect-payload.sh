@@ -122,6 +122,7 @@ for program in programs:
 shutil.copy2(lock, out/'opt/thekernel-tools/MANIFEST')
 shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/inspect-tools.sh', out/'opt/thekernel-tools/inspect-tools.sh')
 shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/block-gpt-tools.sh', out/'opt/thekernel-tools/block-gpt-tools.sh')
+shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/block-partition-mkfs-smoke.sh', out/'opt/thekernel-tools/partition-mkfs-smoke.sh')
 shutil.copy2(Path(os.environ["REPO_ROOT"])/'tests/guest/container-namespace.sh', out/'opt/thekernel-tools/container-namespace.sh')
 PY
 # OUTPUT is a dedicated regenerable tool staging tree, not a source directory.

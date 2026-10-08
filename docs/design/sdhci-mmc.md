@@ -57,11 +57,12 @@ mounted GPT/ext4, verified read/write, unmounted, and emitted
 QEMU KVM attached `sdhci-pci` plus a `sd-card`; TheKernel enumerated
 `/dev/mmcblk0` and its GPT partition, mounted ext4, read/wrote a file, unmounted,
 and emitted `SDHCI_EXT4_RW_OK`. The backing image contained the guest-written
-marker after clean shutdown. The repeatable guest operation is
-`tests/guest/sdhci-ext4-smoke.sh`. GPT and ext4 were prepared on the host for
-this run; the guest does not yet rescan partitions created after boot and the
-current BusyBox image has no `mkfs.ext4`, so guest-side partitioning/formatting
-remains unverified. The QEMU SD-card path does not exercise N305 eMMC.
+marker after clean shutdown. The host-prepared compatibility operation is
+`tests/guest/sdhci-ext4-smoke.sh`. On 2026-10-09 the guest-side partition/format
+script passed on an empty 64 MiB QEMU SD card: sfdisk-created GPT, `BLKRRPART`,
+guest `mkfs.ext4`, ext4 mount/read/write/unmount, and
+`SDHCI_PARTITION_MKFS_RW_OK`. The QEMU SD-card path does not exercise N305 eMMC
+or real card-removal interrupt handling.
 
 The generic host also applies the translated response-shift, card-presence,
 reset-order, timeout-control, and per-controller quirk behavior where its PIO

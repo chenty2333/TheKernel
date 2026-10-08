@@ -11,7 +11,7 @@ use super::{
 };
 use crate::mounts;
 
-pub(super) fn device_id(name: &str) -> Option<DeviceId> {
+pub(crate) fn device_id(name: &str) -> Option<DeviceId> {
     if name == axfs::ROOT_BLOCK_DEVICE_NAME {
         return Some(mounts::ROOT_BLOCK_DEVICE_ID);
     }

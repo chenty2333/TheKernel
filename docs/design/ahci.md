@@ -37,13 +37,14 @@ The QEMU topology was extended to attach `ich9-ahci` plus an `ide-hd`, and
 AHCI is explicitly included in product builds. QEMU KVM enumerated a disposable
 GPT SATA disk, published `/dev/sda` and `/dev/sda1`, mounted its ext4 filesystem,
 wrote/read a file, cleanly unmounted, and emitted `AHCI_EXT4_RW_OK`; the marker
-was present in the backing image after shutdown. The repeatable guest portion is
-`tests/guest/ahci-ext4-smoke.sh`. The GPT and ext4 filesystem were prepared on
-the host for this run: runtime partition-table rescan/new child publication is
-not implemented, and the guest BusyBox image does not include `mkfs.ext4`, so
-this does not satisfy the requested guest-side partitioning/formatting step.
-The ATA disk path does not yet implement all of FreeBSD `ahci.c`/`ahci_pci.c`;
-see the untranslated functions listed above.
+was present in the backing image after shutdown. The host-prepared filesystem
+smoke is `tests/guest/ahci-ext4-smoke.sh`. On 2026-10-09 the inspect payload was
+extended with pinned e2fsprogs/sfdisk and the block registry gained
+`BLKRRPART` plus live devfs/sysfs views. The repeatable
+`tests/guest/block-partition-mkfs-smoke.sh` passed with an empty 64 MiB AHCI
+image: guest-created GPT, guest `mkfs.ext4`, mount, read/write, unmount, and
+`AHCI_PARTITION_MKFS_RW_OK`. Device-originated hotplug publication, PCI removal,
+and the untranslated FreeBSD functions listed above remain outstanding.
 
 `AHCI_Q_IOMMU_BUSWIDE` is retained in the translated PCI quirk table, but cannot
 be applied by this driver until the platform IOMMU provides a bus-wide DMA
