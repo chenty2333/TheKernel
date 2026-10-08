@@ -456,6 +456,24 @@ pub enum MmcBusTiming {
     MmcHs400EnhancedStrobe,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MmcVccq {
+    V120,
+    V180,
+    V330,
+}
+
+// upstream: mmc.c mmc_set_vccq() voltage preference for one card timing
+pub const fn select_mmc_vccq(supports_120: bool, supports_180: bool) -> MmcVccq {
+    if supports_120 {
+        MmcVccq::V120
+    } else if supports_180 {
+        MmcVccq::V180
+    } else {
+        MmcVccq::V330
+    }
+}
+
 pub const MMC_CAP_HSPEED: u32 = 1 << 2;
 pub const MMC_CAP_UHS_SDR12: u32 = 1 << 6;
 pub const MMC_CAP_UHS_SDR25: u32 = 1 << 7;
@@ -995,6 +1013,17 @@ impl<I: SdhciIo> SdhciHost<I> {
             clock | SDHCI_CLOCK_CARD_EN as u16,
         );
         Ok(())
+    }
+
+    // upstream: mmc.c mmc_set_vccq() host bridge switch
+    pub fn switch_vccq(&mut self, voltage: MmcVccq) -> Result<(), SdhciError> {
+        match voltage {
+            MmcVccq::V120 => Err(SdhciError::UnsupportedClock),
+            MmcVccq::V180 => self.switch_signal_voltage_18v(),
+            // The host is initialized at 3.3 V; there is no separate 3.3 V
+            // signalling selector in the SDHCI Host Control 2 register.
+            MmcVccq::V330 => Ok(()),
+        }
     }
 
     // upstream: sdhci.c sdhci_generic_tune()
@@ -2981,6 +3010,10 @@ mod tests {
             Err(SdhciError::UnsupportedClock)
         );
         assert_eq!(
+            host.switch_vccq(MmcVccq::V120),
+            Err(SdhciError::UnsupportedClock)
+        );
+        assert_eq!(
             host.execute_tuning(19, 4),
             Err(SdhciError::UnsupportedClock)
         );
@@ -3029,6 +3062,9 @@ mod tests {
             timing_name(MmcBusTiming::MmcHs400EnhancedStrobe),
             "HS400 with enhanced strobe"
         );
+        assert_eq!(select_mmc_vccq(false, false), MmcVccq::V330);
+        assert_eq!(select_mmc_vccq(false, true), MmcVccq::V180);
+        assert_eq!(select_mmc_vccq(true, true), MmcVccq::V120);
     }
 
     #[test]
