@@ -26,10 +26,21 @@ the first identified ATA disk. AHCI is selected
 by the `tk-axdriver` default feature. The complete 317-row FreeBSD PCI
 ID/revision/name/quirk table is translated in `tk-axdriver/src/ahci/pci_ids.rs`;
 `ahci_pci_attach` selects BAR0 for the ABAR0 quirk and BAR5 otherwise. Remaining
-porting work includes every port/device publication, MSI/MSI-X routing,
-enclosure management, Intel remapped NVMe, CAM CCB/SCSI translation, hotplug,
-automatic block-device publication for media inserted into an empty port,
-PCI-function removal events, multi-slot scheduling/recovery, and concurrent
-NCQ submission. An existing port returns I/O errors while absent and only
-resumes after IDENTIFY geometry and serial/model/capacity fingerprint match. The PCI path has only been compiled so far; QEMU disk read/write
-acceptance still remains.
+porting work includes MSI/MSI-X routing, enclosure management, Intel remapped
+NVMe, CAM CCB/SCSI translation, automatic block-device publication for media
+inserted into a port that was empty at boot, PCI-function removal events,
+multi-slot scheduling/recovery, and concurrent NCQ submission. An existing
+port returns I/O errors while absent and only resumes after IDENTIFY geometry
+and serial/model/capacity fingerprint match.
+
+The QEMU topology was extended to attach `ich9-ahci` plus an `ide-hd`, and
+AHCI is explicitly included in product builds. QEMU KVM enumerated a disposable
+GPT SATA disk, published `/dev/sda` and `/dev/sda1`, mounted its ext4 filesystem,
+wrote/read a file, cleanly unmounted, and emitted `AHCI_EXT4_RW_OK`; the marker
+was present in the backing image after shutdown. The repeatable guest portion is
+`tests/guest/ahci-ext4-smoke.sh`. The GPT and ext4 filesystem were prepared on
+the host for this run: runtime partition-table rescan/new child publication is
+not implemented, and the guest BusyBox image does not include `mkfs.ext4`, so
+this does not satisfy the requested guest-side partitioning/formatting step.
+The ATA disk path does not yet implement all of FreeBSD `ahci.c`/`ahci_pci.c`;
+see the untranslated functions listed above.
