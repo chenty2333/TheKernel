@@ -348,6 +348,8 @@ validate_n305_iris_build_output() {
     [ -r "$target/usr/share/vulkan/icd.d/intel_icd.x86_64.json" ]
     [ -r "$target/lib/firmware/i915/tgl_guc_70.bin" ]
     [ -r "$target/lib/firmware/i915/tgl_huc.bin" ]
+    [ -r "$target/lib/firmware/i915/adlp_guc_70.bin" ]
+    [ -r "$target/usr/share/licenses/i915/LICENSE.i915" ]
     [ -f "$target$gallium" ]
     grep -aFq 'iris_driver_descriptor' "$target$gallium" || {
         printf '%s\n' 'final target libgallium does not contain Mesa iris' >&2

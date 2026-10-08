@@ -538,3 +538,9 @@ copyright/disclaimer, no endorsement, and no reverse engineering or
 decompilation. Intel media-driver/Mesa/libva package licenses and source notice
 files remain Buildroot-managed; the guest smoke checks only loader resolution
 and the expected no-GPU result, not hardware decode/render.
+
+The common graphics rootfs overlay carries the upstream Intel `LICENSE.i915`
+text under `/usr/share/licenses/i915/`; `scripts/build-graphics-rootfs.sh`
+checks that the ADL-P/N `adlp_guc_70.bin` candidate is present alongside the
+existing TGL GuC/HuC firmware. Firmware binaries remain Buildroot-sourced and
+are not checked into this repository.
