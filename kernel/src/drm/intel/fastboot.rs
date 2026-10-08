@@ -1828,6 +1828,58 @@ pub(super) fn init(
                         Error::Refused
                     })?;
             let first = capture(&window, &pin, port, afc_startup)?;
+            // Reuse the translated shared-DPLL manager's generic TC1/TC2
+            // hardware-state dispatcher as an independent read-only check of
+            // the firmware DKL PLL readout.  This is not yet the allocator or
+            // enable/disable owner: the existing TC transaction still owns
+            // its indivisible modeset/rollback sequence below.
+            let dpll_identity = super::shared_dpll::AdlNIdentity::verify(
+                info.vendor_id,
+                info.device_id,
+                info.revision,
+            )
+            .map_err(|error| {
+                axlog::warn!("intel-fastboot: shared DPLL identity refused: {error:?}");
+                Error::Refused
+            })?;
+            let mut shared_dpll = super::shared_dpll::SharedDpllState::new(dpll_identity, 0);
+            let mut dpll_power =
+                super::shared_dpll::PinnedDpllPower::new(&pin, dpll_identity, first.refclk)
+                    .map_err(|error| {
+                        axlog::warn!(
+                            "intel-fastboot: shared DPLL power context refused: {error:?}"
+                        );
+                        Error::Refused
+                    })?;
+            shared_dpll
+                .init(&window, &super::gmbus::MonotonicTimer, &mut dpll_power)
+                .map_err(|error| {
+                    axlog::warn!("intel-fastboot: shared DPLL manager init refused: {error:?}");
+                    Error::Refused
+                })?;
+            let dpll_index = 3 + port.index();
+            let (manager_pll_on, _) = shared_dpll
+                .get_hw_state(
+                    &window,
+                    &super::gmbus::MonotonicTimer,
+                    &mut dpll_power,
+                    dpll_index,
+                )
+                .map_err(|error| {
+                    axlog::warn!(
+                        "intel-fastboot: translated shared DPLL readout refused: {error:?}"
+                    );
+                    Error::Refused
+                })?;
+            if manager_pll_on != first.pll.enable {
+                axlog::warn!(
+                    "intel-fastboot: firmware and translated TC DPLL enable readouts disagree: \
+                     firmware={} manager={}",
+                    first.pll.enable,
+                    manager_pll_on
+                );
+                return Err(Error::Refused);
+            }
             if first.plane.pitch != (first.plane.width * 4).div_ceil(64) * 64 {
                 return Err(Error::Refused);
             }

@@ -3,10 +3,10 @@
 `crates/ax/tk-intel-display/src/intel_dpll_mgr_full.rs` and
 `intel_dpll_mgr_remainder.rs` together translate Linux 7.2.3
 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c` (MIT, Copyright © 2006–2016
-Intel). Ctags reports 175 functions: 83 are in the first module in exact
+Intel). Ctags reports 175 functions: the first module covers 83 in exact
 source order for display 12/13 and generic i9xx fallback, and the remainder
-module adds the other 92 functions in its exact source order. The combined
-coverage has one marker for every ctags function, with no omitted functions.
+module adds the other 92 in its exact source order. The combined coverage has
+one marker for every ctags function, with no omitted functions.
 `IntelDpllHooks` and the generation-specific remainder hook traits carry atomic
 DRM, platform selection, MMIO, power, and indexed PHY operations as explicit
 backend dependencies.
@@ -15,10 +15,14 @@ Both modules are exported and compiled by `cargo check -p tk-intel-display
 --lib`; the full crate suite previously passed 150 tests before the remainder
 module was added. The active N305 HDMI planner consumes the translated
 `icl_calc_wrpll()` and `icl_calc_dpll_state()` values. The kernel-side ADL-N
-shared-DPLL adapter now compiles, but current atomic modeset does not yet
-persist or call it; the fastboot TC power-state lifetime does not supply the
-required refcounted port domains. Type-C/MG PHY runtime paths and
-DP/Thunderbolt output call sites are also not connected. See
+shared-DPLL adapter now has both the original `PowerState` backend and a
+read-only fastboot-pin backend. Native fastboot initializes a temporary
+manager and calls the translated generic DKL `get_hw_state` for the selected
+TC1/TC2 PLL, refusing admission if it disagrees with the firmware PLL enable
+readout. This validates the dispatch on the live admission path but is not a
+persistent atomic-state manager: TC modesets still use the restricted
+transaction and direct DKL enable/disable sequence. Type-C/MG PHY runtime
+paths and DP/Thunderbolt output call sites are also not connected. See
 `intel-shared-dpll-kernel.md` for the required integration order and boundary.
 
 ## Added remainder grouped by generation
