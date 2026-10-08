@@ -214,6 +214,7 @@ pub(crate) struct Well {
     /// OR-s them, so the driver uses `HSW_PWR_WELL_CTL2` and leaves the BIOS,
     /// KVMR and debug registers alone.  Reference §4.2.
     pub(crate) register: Register,
+    pub(crate) request_registers: WellRequestRegisters,
     /// The well index within that register.
     pub(crate) index: u32,
     /// The power gate whose fuse bit is polled after the state bit, or `None`
@@ -222,6 +223,29 @@ pub(crate) struct Well {
     pub(crate) pg: Option<u8>,
     pub(crate) timeout_us: u32,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WellRequestRegisters {
+    pub(crate) bios: Register,
+    pub(crate) kvmr: Option<Register>,
+    pub(crate) debug: Register,
+}
+
+const HSW_REQUESTS: WellRequestRegisters = WellRequestRegisters {
+    bios: regs::HSW_PWR_WELL_CTL1,
+    kvmr: Some(regs::HSW_PWR_WELL_CTL3),
+    debug: regs::HSW_PWR_WELL_CTL4,
+};
+const AUX_REQUESTS: WellRequestRegisters = WellRequestRegisters {
+    bios: regs::ICL_PWR_WELL_CTL_AUX1,
+    kvmr: None,
+    debug: regs::ICL_PWR_WELL_CTL_AUX4,
+};
+const DDI_REQUESTS: WellRequestRegisters = WellRequestRegisters {
+    bios: regs::ICL_PWR_WELL_CTL_DDI1,
+    kvmr: None,
+    debug: regs::ICL_PWR_WELL_CTL_DDI4,
+};
 
 impl Well {
     pub(crate) const fn request_mask(self) -> u32 {
@@ -241,6 +265,7 @@ impl Well {
 pub(crate) const PW_1: Well = Well {
     name: "PW_1",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 0,
     pg: Some(SKL_PG1),
     timeout_us: WELL_STATE_TIMEOUT_US,
@@ -255,6 +280,7 @@ pub(crate) const PW_1: Well = Well {
 pub(crate) const PW_2: Well = Well {
     name: "PW_2",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 1,
     pg: Some(2),
     timeout_us: WELL_STATE_TIMEOUT_US,
@@ -269,6 +295,7 @@ pub(crate) const PW_2: Well = Well {
 pub(crate) const PW_A: Well = Well {
     name: "PW_A",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 5,
     pg: Some(6),
     timeout_us: WELL_STATE_TIMEOUT_US,
@@ -277,6 +304,7 @@ pub(crate) const PW_A: Well = Well {
 pub(crate) const PW_B: Well = Well {
     name: "PW_B",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 6,
     pg: Some(7),
     timeout_us: WELL_STATE_TIMEOUT_US,
@@ -285,6 +313,7 @@ pub(crate) const PW_B: Well = Well {
 pub(crate) const PW_C: Well = Well {
     name: "PW_C",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 7,
     pg: Some(8),
     timeout_us: WELL_STATE_TIMEOUT_US,
@@ -293,6 +322,7 @@ pub(crate) const PW_C: Well = Well {
 pub(crate) const PW_D: Well = Well {
     name: "PW_D",
     register: regs::HSW_PWR_WELL_CTL2,
+    request_registers: HSW_REQUESTS,
     index: 8,
     pg: Some(9),
     timeout_us: WELL_STATE_TIMEOUT_US,
@@ -307,6 +337,7 @@ pub(crate) const PW_D: Well = Well {
 pub(crate) const DDI_IO_A: Well = Well {
     name: "DDI_IO_A",
     register: regs::ICL_PWR_WELL_CTL_DDI2,
+    request_registers: DDI_REQUESTS,
     index: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
@@ -316,6 +347,7 @@ pub(crate) const DDI_IO_A: Well = Well {
 pub(crate) const DDI_IO_B: Well = Well {
     name: "DDI_IO_B",
     register: regs::ICL_PWR_WELL_CTL_DDI2,
+    request_registers: DDI_REQUESTS,
     index: 1,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
@@ -330,6 +362,7 @@ pub(crate) const DDI_IO_B: Well = Well {
 pub(crate) const AUX_A: Well = Well {
     name: "AUX_A",
     register: regs::ICL_PWR_WELL_CTL_AUX2,
+    request_registers: AUX_REQUESTS,
     index: 0,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
@@ -339,23 +372,11 @@ pub(crate) const AUX_A: Well = Well {
 pub(crate) const AUX_B: Well = Well {
     name: "AUX_B",
     register: regs::ICL_PWR_WELL_CTL_AUX2,
+    request_registers: AUX_REQUESTS,
     index: 1,
     pg: None,
     timeout_us: WELL_STATE_TIMEOUT_US,
 };
-
-/// The four request registers, in the order the diagnostic line prints them.
-///
-/// i915 reports which requester is holding a well on when a disable does not
-/// take, and §11 phase 1.3 tells a reader whose `STATE` never set to read all
-/// four and compare.  Doing it for every well means the number is in the log
-/// before anyone has to go looking.
-pub(crate) const REQUEST_REGISTERS: [Register; 4] = [
-    regs::HSW_PWR_WELL_CTL1,
-    regs::HSW_PWR_WELL_CTL2,
-    regs::HSW_PWR_WELL_CTL3,
-    regs::HSW_PWR_WELL_CTL4,
-];
 
 /// The DBUF slice registers, in the order this driver enables them.
 ///
@@ -920,10 +941,15 @@ pub(crate) fn read_fuses(regs: &impl Registers) -> Result<FuseState, PowerError>
 fn requesters(regs: &impl Registers, well: Well) -> Result<Requesters, PowerError> {
     let mask = well.request_mask();
     Ok(Requesters {
-        bios: read(regs, REQUEST_REGISTERS[0])? & mask != 0,
-        driver: read(regs, REQUEST_REGISTERS[1])? & mask != 0,
-        kvmr: read(regs, REQUEST_REGISTERS[2])? & mask != 0,
-        debug: read(regs, REQUEST_REGISTERS[3])? & mask != 0,
+        bios: read(regs, well.request_registers.bios)? & mask != 0,
+        driver: read(regs, well.register)? & mask != 0,
+        kvmr: well
+            .request_registers
+            .kvmr
+            .map(|register| read(regs, register))
+            .transpose()?
+            .is_some_and(|value| value & mask != 0),
+        debug: read(regs, well.request_registers.debug)? & mask != 0,
     })
 }
 
@@ -939,7 +965,11 @@ impl<R: Registers> HswPowerWellAdapter<'_, R> {
             regs::HSW_PWR_WELL_CTL3,
             regs::HSW_PWR_WELL_CTL4,
             regs::ICL_PWR_WELL_CTL_DDI2,
+            regs::ICL_PWR_WELL_CTL_DDI1,
+            regs::ICL_PWR_WELL_CTL_DDI4,
             regs::ICL_PWR_WELL_CTL_AUX2,
+            regs::ICL_PWR_WELL_CTL_AUX1,
+            regs::ICL_PWR_WELL_CTL_AUX4,
             regs::SKL_FUSE_STATUS,
             regs::GEN8_CHICKEN_DCPR_1,
             regs::DC_STATE_EN,
@@ -1076,10 +1106,10 @@ pub(crate) fn enable_well<R: Registers>(
     let spec = intel_display::power_well::HswWellSpec {
         name: well.name,
         registers: intel_display::power_well::HswWellRegisters {
-            bios: REQUEST_REGISTERS[0].offset(),
+            bios: well.request_registers.bios.offset(),
             driver: well.register.offset(),
-            kvmr: Some(REQUEST_REGISTERS[2].offset()),
-            debug: REQUEST_REGISTERS[3].offset(),
+            kvmr: well.request_registers.kvmr.map(Register::offset),
+            debug: well.request_registers.debug.offset(),
             fuse_status: regs::SKL_FUSE_STATUS.offset(),
             gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
         },
@@ -1145,10 +1175,10 @@ pub(crate) fn disable_well<R: Registers>(
     let spec = intel_display::power_well::HswWellSpec {
         name: well.name,
         registers: intel_display::power_well::HswWellRegisters {
-            bios: REQUEST_REGISTERS[0].offset(),
+            bios: well.request_registers.bios.offset(),
             driver: well.register.offset(),
-            kvmr: Some(REQUEST_REGISTERS[2].offset()),
-            debug: REQUEST_REGISTERS[3].offset(),
+            kvmr: well.request_registers.kvmr.map(Register::offset),
+            debug: well.request_registers.debug.offset(),
             fuse_status: regs::SKL_FUSE_STATUS.offset(),
             gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
         },
@@ -1999,6 +2029,21 @@ mod tests {
         // The DDI and AUX wells live in their own registers.
         assert_eq!(DDI_IO_A.register.name(), "ICL_PWR_WELL_CTL_DDI2");
         assert_eq!(AUX_A.register.name(), "ICL_PWR_WELL_CTL_AUX2");
+        assert_eq!(
+            DDI_IO_A.request_registers.bios.name(),
+            "ICL_PWR_WELL_CTL_DDI1"
+        );
+        assert_eq!(
+            DDI_IO_A.request_registers.debug.name(),
+            "ICL_PWR_WELL_CTL_DDI4"
+        );
+        assert_eq!(DDI_IO_A.request_registers.kvmr, None);
+        assert_eq!(AUX_A.request_registers.bios.name(), "ICL_PWR_WELL_CTL_AUX1");
+        assert_eq!(
+            AUX_A.request_registers.debug.name(),
+            "ICL_PWR_WELL_CTL_AUX4"
+        );
+        assert_eq!(AUX_A.request_registers.kvmr, None);
         assert_eq!(DDI_IO_A.request_mask(), 0x2);
         assert_eq!(AUX_B.state_mask(), 0x4);
     }

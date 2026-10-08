@@ -6,7 +6,7 @@ Source baseline: Linux `v7.2.3`, `drivers/gpu/drm/i915/display/`. Scope is displ
 
 | Work item | Linux source files | Existing Rust destination / integration |
 |---|---|---|
-| VBT and display power | `intel_bios.c`, `intel_display_power.c`, `intel_display_power_map.c`, `intel_display_power_well.c`, `intel_dmc.c` | `tk-intel-display::{intel_bios,opregion,device,dmc,power_map,power_domains,power_well,dc_state}`; `kernel/src/drm/intel/{power,dmc,regs}`; DMC package/event fixups and validated main/pipe MMIO upload, TGL/RKL/ADLS/XELPD tables, HSW PW/fuse handshake with ADL-P/N PG1 workaround gating, Pipe-A domain refcounts, source-compatible domain names, allowed/target DC policy, and tracked DC6 state setter are present; IRQ-coupled DDI/AUX well callbacks, full map-driven domain lifecycle, and DMC-controlled DC5/6/9 transitions remain |
+| VBT and display power | `intel_bios.c`, `intel_display_power.c`, `intel_display_power_map.c`, `intel_display_power_well.c`, `intel_dmc.c` | `tk-intel-display::{intel_bios,opregion,device,dmc,power_map,power_domains,power_well,dc_state}`; `kernel/src/drm/intel/{power,dmc,regs}`; DMC package/event fixups and validated main/pipe MMIO upload, TGL/RKL/ADLS/XELPD tables, HSW PW/fuse handshake with ADL-P/N PG1 workaround gating, Pipe-A domain refcounts, source-compatible domain names, per-HSW/DDI/AUX requester registers, allowed/target DC policy, and tracked DC6 state setter are present; AUX TC-cold/reset/health paths, IRQ-coupled well callbacks, full map-driven domain lifecycle, and DMC-controlled DC5/6/9 transitions remain |
 
 `intel_bios.rs` now ports the review corrections for VBT defaults/field widths,
 MIPI-v3 block sizing, LFP pointer fixup, panel-type/PnP selection, eDP/PSR

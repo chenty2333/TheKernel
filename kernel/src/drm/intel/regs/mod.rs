@@ -677,10 +677,23 @@ pub(crate) const HSW_PWR_WELL_CTL4: Register =
 pub(crate) const ICL_PWR_WELL_CTL_AUX2: Register =
     Register::read_write("ICL_PWR_WELL_CTL_AUX2", 0x4_5444, Meaning::PowerWell, None);
 
+/// BIOS-owned AUX well request; transferred to AUX2 by the HSW sync path.
+pub(crate) const ICL_PWR_WELL_CTL_AUX1: Register =
+    Register::read_write("ICL_PWR_WELL_CTL_AUX1", 0x4_5440, Meaning::PowerWell, None);
+/// Debug-owned AUX well request, read for shutdown diagnostics.
+pub(crate) const ICL_PWR_WELL_CTL_AUX4: Register =
+    Register::read_only("ICL_PWR_WELL_CTL_AUX4", 0x4_544C, Meaning::PowerWell, None);
+
 /// `ICL_PWR_WELL_CTL_DDI2`, the driver's DDI IO power well request register.
 /// Reference §4.2 and §11 phase 5; `[I915]` `i915_reg.h:3691`.
 pub(crate) const ICL_PWR_WELL_CTL_DDI2: Register =
     Register::read_write("ICL_PWR_WELL_CTL_DDI2", 0x4_5454, Meaning::PowerWell, None);
+/// BIOS-owned DDI well request; transferred to DDI2 by the HSW sync path.
+pub(crate) const ICL_PWR_WELL_CTL_DDI1: Register =
+    Register::read_write("ICL_PWR_WELL_CTL_DDI1", 0x4_5450, Meaning::PowerWell, None);
+/// Debug-owned DDI well request, read for shutdown diagnostics.
+pub(crate) const ICL_PWR_WELL_CTL_DDI4: Register =
+    Register::read_only("ICL_PWR_WELL_CTL_DDI4", 0x4_545C, Meaning::PowerWell, None);
 
 /// `DC_STATE_EN`, the display C-state request.
 ///
@@ -881,7 +894,11 @@ pub(crate) const POWER_AND_CLOCK_REGISTERS: &[Register] = &[
     HSW_PWR_WELL_CTL3,
     HSW_PWR_WELL_CTL4,
     ICL_PWR_WELL_CTL_AUX2,
+    ICL_PWR_WELL_CTL_AUX1,
+    ICL_PWR_WELL_CTL_AUX4,
     ICL_PWR_WELL_CTL_DDI2,
+    ICL_PWR_WELL_CTL_DDI1,
+    ICL_PWR_WELL_CTL_DDI4,
     DC_STATE_EN,
     DBUF_CTL_S0,
     DBUF_CTL_S1,
@@ -1412,7 +1429,9 @@ mod tests {
             vec![
                 "HSW_PWR_WELL_CTL2",
                 "ICL_PWR_WELL_CTL_AUX2",
+                "ICL_PWR_WELL_CTL_AUX1",
                 "ICL_PWR_WELL_CTL_DDI2",
+                "ICL_PWR_WELL_CTL_DDI1",
                 "DC_STATE_EN",
                 "DBUF_CTL_S0",
                 "DBUF_CTL_S1",
@@ -1521,7 +1540,11 @@ mod tests {
                 "COMP_DW10({name})"
             );
             assert_eq!(phy.tx_dw8.offset(), at(base, TX_GRP, 8), "TX_DW8({name})");
-            assert_eq!(phy.pcs_dw1.offset(), at(base, PCS_GRP, 1), "PCS_DW1({name})");
+            assert_eq!(
+                phy.pcs_dw1.offset(),
+                at(base, PCS_GRP, 1),
+                "PCS_DW1({name})"
+            );
             // The lane 0 registers are read and never written: the
             // initialisation takes its starting value from lane 0 and writes
             // the result to the group register, which is what `[I915]`
@@ -1685,7 +1708,10 @@ mod tests {
             .expect("the AUX power well register must be declared");
         assert_eq!(well.name(), "ICL_PWR_WELL_CTL_AUX2");
         assert_eq!(well.meaning(), Meaning::PowerWell);
-        assert!(well.is_writable(), "the power module programs this register");
+        assert!(
+            well.is_writable(),
+            "the power module programs this register"
+        );
         assert!(
             !BUS.iter().any(|register| register.offset() == 0x4_5444),
             "the bus table must not declare the power module's register"

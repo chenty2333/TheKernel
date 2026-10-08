@@ -585,3 +585,7 @@ requester observations preserve the upstream BIOS, driver, KVMR, debug order.
 The HSW PW_1 workaround gate in `kernel/src/drm/intel/power.rs` is platform-
 qualified to Alder Lake-P/N and PG1, matching `intel_display_power_well.c`
 (Copyright © 2022 Intel).
+
+The Intel display adapter now uses the source-specific HSW, ICL AUX and ICL DDI
+BIOS/driver/KVMR/debug request-register groups (the ICL groups omit KVMR) for
+power-well readback and handoff (MIT, Copyright © 2022 Intel).
