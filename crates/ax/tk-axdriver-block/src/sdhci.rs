@@ -1348,6 +1348,12 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.wait_busy()
     }
 
+    // upstream: mmcsd.c mmcsd_set_blockcount()
+    pub fn set_block_count(&mut self, count: u32, reliable: bool) -> Result<(), SdhciError> {
+        let argument = (count & 0x0000_ffff) | if reliable { 1 << 31 } else { 0 };
+        self.command(23, argument, SD_R1, None, 0).map(|_| ())
+    }
+
     // upstream: mmc.c mmc_sd_switch()
     pub fn switch_sd_function(
         &mut self,
@@ -3177,6 +3183,16 @@ mod tests {
         assert_eq!(mmcsd_error_message(6), "NO MEMORY");
         assert_eq!(mmcsd_error_message(-1), "Bad error code");
         assert_eq!(mmcsd_error_message(7), "Bad error code");
+    }
+
+    #[test]
+    fn mmcsd_block_count_masks_count_and_sets_reliable_write_bit() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        host.set_block_count(0x1_0002, true).unwrap();
+        assert_eq!(host.io_mut().command >> 8, 23);
+        assert_eq!(host.io_mut().argument, 0x8000_0002);
     }
 
     #[test]
