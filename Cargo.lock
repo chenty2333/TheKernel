@@ -4059,6 +4059,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tk-vtd"
+version = "0.1.0"
+
+[[package]]
 name = "tock-registers"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
