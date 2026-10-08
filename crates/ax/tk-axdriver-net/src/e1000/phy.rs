@@ -31,6 +31,15 @@ const ADVERTISE_100_HALF: u16 = 0x0004;
 const ADVERTISE_100_FULL: u16 = 0x0008;
 const ADVERTISE_1000_HALF: u16 = 0x0010;
 const ADVERTISE_1000_FULL: u16 = 0x0020;
+const ALL_SPEED_DUPLEX: u16 = ADVERTISE_10_HALF
+    | ADVERTISE_10_FULL
+    | ADVERTISE_100_HALF
+    | ADVERTISE_100_FULL
+    | ADVERTISE_1000_HALF
+    | ADVERTISE_1000_FULL;
+const ALL_NOT_GIG: u16 =
+    ADVERTISE_10_HALF | ADVERTISE_10_FULL | ADVERTISE_100_HALF | ADVERTISE_100_FULL;
+const ALL_10_SPEED: u16 = ADVERTISE_10_HALF | ADVERTISE_10_FULL;
 const MII_AUTONEG_ADV: u8 = 0x04;
 const MII_1000T_CTRL: u8 = 0x09;
 const PHY_CONTROL: u8 = 0x00;
@@ -127,9 +136,11 @@ const I347AT4_PSCR_DOWNSHIFT_MASK: u16 = 0x7000;
 const I347AT4_PSCR_DOWNSHIFT_6X: u16 = 0x5000;
 const IGP01E1000_PHY_PORT_CONFIG: u8 = 0x10;
 const IGP01E1000_PHY_PORT_CTRL: u8 = 0x12;
+const IGP02E1000_PHY_POWER_MGMT: u8 = 0x19;
 const IGP01E1000_PSCR_AUTO_MDIX: u16 = 0x1000;
 const IGP01E1000_PSCR_FORCE_MDI_MDIX: u16 = 0x2000;
 const IGP01E1000_PSCFR_SMART_SPEED: u16 = 0x0080;
+const IGP02E1000_PM_D3_LPLU: u16 = 0x0004;
 const PHY_FORCE_LIMIT: u32 = 20;
 const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
@@ -852,6 +863,50 @@ pub fn check_downshift_generic<I: E1000PhyRegisterIo>(
         }
     };
     diagnostics.speed_downgraded = io.read_phy_register(register as u8)? & mask != 0;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SmartSpeedMode {
+    Default,
+    On,
+    Off,
+}
+
+/// upstream: e1000_phy.c e1000_set_d3_lplu_state_generic()
+pub fn set_d3_lplu_state_generic<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    active: bool,
+    autoneg_advertised: u16,
+    smart_speed: SmartSpeedMode,
+    read_callback_installed: bool,
+) -> DevResult {
+    if !read_callback_installed {
+        return Ok(());
+    }
+    let mut power = io.read_phy_register(IGP02E1000_PHY_POWER_MGMT)?;
+    if !active {
+        power &= !IGP02E1000_PM_D3_LPLU;
+        io.write_phy_register(IGP02E1000_PHY_POWER_MGMT, power)?;
+        if matches!(smart_speed, SmartSpeedMode::On | SmartSpeedMode::Off) {
+            let mut config = io.read_phy_register(IGP01E1000_PHY_PORT_CONFIG)?;
+            if smart_speed == SmartSpeedMode::On {
+                config |= IGP01E1000_PSCFR_SMART_SPEED;
+            } else {
+                config &= !IGP01E1000_PSCFR_SMART_SPEED;
+            }
+            io.write_phy_register(IGP01E1000_PHY_PORT_CONFIG, config)?;
+        }
+    } else if matches!(
+        autoneg_advertised,
+        ALL_SPEED_DUPLEX | ALL_NOT_GIG | ALL_10_SPEED
+    ) {
+        power |= IGP02E1000_PM_D3_LPLU;
+        io.write_phy_register(IGP02E1000_PHY_POWER_MGMT, power)?;
+        let config =
+            io.read_phy_register(IGP01E1000_PHY_PORT_CONFIG)? & !IGP01E1000_PSCFR_SMART_SPEED;
+        io.write_phy_register(IGP01E1000_PHY_PORT_CONFIG, config)?;
+    }
     Ok(())
 }
 
@@ -1964,6 +2019,36 @@ mod tests {
         io.phy[I82577_PHY_STATUS_2 as usize] = I82577_PHY_STATUS2_REV_POLARITY;
         check_polarity_82577(&mut io, &mut diagnostics).unwrap();
         assert_eq!(diagnostics.cable_polarity, Some(CablePolarity::Reversed));
+    }
+
+    #[test]
+    fn generic_d3_lplu_and_smartspeed_states_are_mutually_exclusive() {
+        let mut io = Io::default();
+        io.phy[IGP02E1000_PHY_POWER_MGMT as usize] = 0x8000;
+        io.phy[IGP01E1000_PHY_PORT_CONFIG as usize] = IGP01E1000_PSCFR_SMART_SPEED;
+        set_d3_lplu_state_generic(&mut io, true, ALL_NOT_GIG, SmartSpeedMode::Default, true)
+            .unwrap();
+        assert_eq!(
+            io.phy_writes[0],
+            (IGP02E1000_PHY_POWER_MGMT, 0x8000 | IGP02E1000_PM_D3_LPLU)
+        );
+        assert_eq!(io.phy_writes[1], (IGP01E1000_PHY_PORT_CONFIG, 0));
+        let writes = io.phy_writes.len();
+        set_d3_lplu_state_generic(
+            &mut io,
+            true,
+            ADVERTISE_100_FULL,
+            SmartSpeedMode::Default,
+            true,
+        )
+        .unwrap();
+        assert_eq!(io.phy_writes.len(), writes);
+        set_d3_lplu_state_generic(&mut io, false, ADVERTISE_100_FULL, SmartSpeedMode::On, true)
+            .unwrap();
+        assert_eq!(
+            io.phy_writes.last(),
+            Some(&(IGP01E1000_PHY_PORT_CONFIG, IGP01E1000_PSCFR_SMART_SPEED))
+        );
     }
 
     #[test]
