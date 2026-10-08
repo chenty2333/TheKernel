@@ -31,6 +31,7 @@ pub const ACTION_SCHED_CONTEXT_MODE_SET: u32 = 0x1001;
 pub const ACTION_UPDATE_CONTEXT_POLICIES: u32 = 0x100b;
 pub const ACTION_REGISTER_CONTEXT: u32 = 0x4502;
 pub const ACTION_DEREGISTER_CONTEXT: u32 = 0x4503;
+pub const ACTION_REGISTER_CONTEXT_MULTI_LRC: u32 = 0x4601;
 pub const CONTEXT_ENABLE: u32 = 1;
 pub const CONTEXT_DISABLE: u32 = 0;
 pub const G2H_LEN_DW_SCHED_CONTEXT_MODE_SET: u8 = 2;
@@ -651,6 +652,145 @@ pub fn register_context_action(info: GuCContextRegistrationInfo) -> [u32; 12] {
     ]
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextDescV69Input {
+    pub engine_class: u8,
+    pub engine_submit_mask: u32,
+    pub hwlrca: u32,
+    pub priority: u32,
+    pub execution_quantum_ms: u32,
+    pub preemption_timeout_ms: u32,
+    pub preempt_to_idle: bool,
+    pub process_desc: u32,
+    pub wq_addr: u32,
+    pub wq_size: u32,
+}
+
+/// upstream: intel_guc_submission.c guc_context_policy_init_v69().
+pub fn guc_context_policy_init_v69(
+    descriptor: &mut GuCLrcDescV69,
+    execution_quantum_ms: u32,
+    preemption_timeout_ms: u32,
+    preempt_to_idle: bool,
+) -> Result<(), Error> {
+    descriptor.policy_flags = if preempt_to_idle {
+        CONTEXT_POLICY_FLAG_PREEMPT_TO_IDLE_V69
+    } else {
+        0
+    };
+    descriptor.execution_quantum = execution_quantum_ms
+        .checked_mul(1000)
+        .ok_or(Error::Refused)?;
+    descriptor.preemption_timeout = preemption_timeout_ms
+        .checked_mul(1000)
+        .ok_or(Error::Refused)?;
+    Ok(())
+}
+
+/// upstream: intel_guc_submission.c prepare_context_registration_info_v69().
+pub fn prepare_context_desc_v69(input: ContextDescV69Input) -> Result<GuCLrcDescV69, Error> {
+    if input.engine_submit_mask == 0 || input.hwlrca == 0 || input.priority > 3 {
+        return Err(Error::Refused);
+    }
+    let mut descriptor = GuCLrcDescV69 {
+        hw_context_desc: input.hwlrca,
+        engine_submit_mask: input.engine_submit_mask,
+        engine_class: engine_class_to_guc_class(input.engine_class)?,
+        priority: input.priority,
+        process_desc: input.process_desc,
+        wq_addr: input.wq_addr,
+        wq_size: input.wq_size,
+        context_flags: CONTEXT_REGISTRATION_FLAG_KMD,
+        ..Default::default()
+    };
+    guc_context_policy_init_v69(
+        &mut descriptor,
+        input.execution_quantum_ms,
+        input.preemption_timeout_ms,
+        input.preempt_to_idle,
+    )?;
+    Ok(descriptor)
+}
+
+/// upstream: intel_guc_submission.c __guc_action_register_context_v69().
+pub const fn register_context_action_v69(
+    context_id: u32,
+    descriptor_ggtt_offset: u32,
+) -> Result<[u32; 3], Error> {
+    if context_id == GUC_INVALID_CONTEXT_ID || descriptor_ggtt_offset == 0 {
+        Err(Error::Refused)
+    } else {
+        Ok([ACTION_REGISTER_CONTEXT, context_id, descriptor_ggtt_offset])
+    }
+}
+
+/// upstream: intel_guc_submission.c __guc_action_register_multi_lrc_v69().
+pub fn register_multi_context_action_v69(
+    context_id: u32,
+    descriptor_offsets: &[u32],
+) -> Result<Vec<u32>, Error> {
+    if context_id == GUC_INVALID_CONTEXT_ID
+        || descriptor_offsets.is_empty()
+        || descriptor_offsets.len() > 33
+        || descriptor_offsets.contains(&0)
+    {
+        return Err(Error::Refused);
+    }
+    let mut action = Vec::new();
+    action
+        .try_reserve_exact(3 + descriptor_offsets.len())
+        .map_err(|_| Error::Refused)?;
+    action.extend_from_slice(&[
+        ACTION_REGISTER_CONTEXT_MULTI_LRC,
+        context_id,
+        descriptor_offsets.len() as u32,
+    ]);
+    action.extend_from_slice(descriptor_offsets);
+    Ok(action)
+}
+
+/// upstream: intel_guc_submission.c __guc_action_register_multi_lrc_v70().
+pub fn register_multi_context_action_v70(
+    info: GuCContextRegistrationInfo,
+    child_lrcas: &[u64],
+    child_ids: &[u32],
+) -> Result<Vec<u32>, Error> {
+    if info.context_idx == GUC_INVALID_CONTEXT_ID
+        || child_lrcas.len() != child_ids.len()
+        || child_lrcas.len() > 32
+        || child_ids
+            .iter()
+            .enumerate()
+            .any(|(index, id)| *id != info.context_idx + index as u32 + 1)
+    {
+        return Err(Error::Refused);
+    }
+    let mut action = Vec::new();
+    action
+        .try_reserve_exact(13 + child_lrcas.len() * 2)
+        .map_err(|_| Error::Refused)?;
+    action.extend_from_slice(&[
+        ACTION_REGISTER_CONTEXT_MULTI_LRC,
+        info.flags,
+        info.context_idx,
+        info.engine_class,
+        info.engine_submit_mask,
+        info.wq_desc_lo,
+        info.wq_desc_hi,
+        info.wq_base_lo,
+        info.wq_base_hi,
+        info.wq_size,
+        child_lrcas.len() as u32 + 1,
+        info.hwlrca_lo,
+        info.hwlrca_hi,
+    ]);
+    for lrca in child_lrcas {
+        action.push(*lrca as u32);
+        action.push((*lrca >> 32) as u32);
+    }
+    Ok(action)
+}
+
 /// upstream: intel_guc_submission.c __guc_action_deregister_context().
 pub const fn deregister_context_action(context_id: u32) -> Result<[u32; 2], Error> {
     if context_id == GUC_INVALID_CONTEXT_ID {
@@ -953,6 +1093,49 @@ mod tests {
             (u32::from(CONTEXT_POLICY_KLV_PREEMPT_TO_IDLE) << 16) | 1
         );
         assert_eq!(words[words.len() - 1], 1);
+    }
+
+    #[test]
+    fn v69_context_descriptor_and_v69_v70_multi_registration_actions_match_abi() {
+        let descriptor = prepare_context_desc_v69(ContextDescV69Input {
+            engine_class: 1,
+            engine_submit_mask: 1,
+            hwlrca: 0x40_0000,
+            priority: 2,
+            execution_quantum_ms: 20,
+            preemption_timeout_ms: 5,
+            preempt_to_idle: true,
+            process_desc: 0x50_0000,
+            wq_addr: 0x50_0800,
+            wq_size: WQ_SIZE as u32,
+        })
+        .unwrap();
+        let descriptor_class = descriptor.engine_class;
+        let descriptor_quantum = descriptor.execution_quantum;
+        let descriptor_timeout = descriptor.preemption_timeout;
+        let descriptor_flags = descriptor.policy_flags;
+        assert_eq!(descriptor_class, 3);
+        assert_eq!(descriptor_quantum, 20_000);
+        assert_eq!(descriptor_timeout, 5_000);
+        assert_eq!(descriptor_flags, CONTEXT_POLICY_FLAG_PREEMPT_TO_IDLE_V69);
+        assert_eq!(
+            register_context_action_v69(7, 0x1000).unwrap(),
+            [ACTION_REGISTER_CONTEXT, 7, 0x1000]
+        );
+        assert_eq!(
+            register_multi_context_action_v69(7, &[0x1000, 0x1080]).unwrap(),
+            [ACTION_REGISTER_CONTEXT_MULTI_LRC, 7, 2, 0x1000, 0x1080]
+        );
+
+        let info =
+            context_registration_info(7, 0, 1, 0x40_0000, None, Some(0x50_0000), Some(0x50_0800))
+                .unwrap();
+        let multi = register_multi_context_action_v70(info, &[0x60_0000], &[8]).unwrap();
+        assert_eq!(multi[0], ACTION_REGISTER_CONTEXT_MULTI_LRC);
+        assert_eq!(multi[1], CONTEXT_REGISTRATION_FLAG_KMD);
+        assert_eq!(multi[2], 7);
+        assert_eq!(multi[10], 2);
+        assert_eq!(&multi[13..], &[0x60_0000, 0]);
     }
 
     #[test]
