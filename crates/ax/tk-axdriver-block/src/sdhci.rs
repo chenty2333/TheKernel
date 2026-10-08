@@ -675,7 +675,8 @@ impl<I: SdhciIo> SdhciHost<I> {
         data: Option<&mut [u8]>,
         block_size: usize,
     ) -> Result<SdhciResponse, SdhciError> {
-        let read = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE);
+        let read = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
+            || (index == SD_CMD_SWITCH_FUNC && data.is_some());
         let retries = if data.is_none() || read { 3 } else { 1 };
         let mut data = data;
         let mut last_error = SdhciError::Timeout;
@@ -749,7 +750,8 @@ impl<I: SdhciIo> SdhciHost<I> {
                 mode |= SDHCI_TRNS_MULTI as u16;
             }
             if command_flags & SDHCI_CMD_DATA as u16 != 0
-                && matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
+                && (matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
+                    || index == SD_CMD_SWITCH_FUNC)
             {
                 mode |= SDHCI_TRNS_READ as u16;
             }
@@ -786,7 +788,8 @@ impl<I: SdhciIo> SdhciHost<I> {
                         .checked_add(data_len as u64)
                         .is_some_and(|end| end <= u64::from(u32::MAX) + 1)
             });
-        let read_transfer = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE);
+        let read_transfer = matches!(index, 8 | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE)
+            || (index == SD_CMD_SWITCH_FUNC && data.is_some());
         if use_sdma {
             let dma = self
                 .dma
@@ -1757,6 +1760,23 @@ mod tests {
             (SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI | SDHCI_TRNS_READ) as u16
         );
         assert_eq!(host.io_mut().data_blocks, 0);
+    }
+
+    #[test]
+    fn sd_switch_function_data_is_transferred_from_card_to_host() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        let mut status = [0u8; 64];
+        host.command(
+            SD_CMD_SWITCH_FUNC,
+            0x00ff_fff1,
+            SD_R1 | SD_DATA,
+            Some(&mut status),
+            64,
+        )
+        .unwrap();
+        assert_ne!(host.io_mut().transfer_mode & SDHCI_TRNS_READ as u16, 0);
     }
 
     #[test]
