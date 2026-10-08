@@ -16,4 +16,4 @@
 3i. DKL TC PLL runtime adapter | 部分完成 | f5141ee1 | kernel 动态寄存器 adapter 接入 TGL/ADL-P/N TC1/2 enable/disable、HIP selector serialization 和 power/lock polling；map tests compile-check，`cargo check -p tk-kernel --tests` 通过；等待 modeset call site 与真实 power refs。
 3j. TBT PLL power sequence | 部分完成 | 2e7a4151 | 增加 TBT CFGCR0/1+enable register entries，复用 i915 PLL power/lock/power-off 顺序；`cargo check -p tk-kernel --tests` 通过，测试 compile-check。
 3k. DPLL platform inventories | 部分完成 | f78ba138 | 翻译 i915 TGL/RKL/DG1/ADL-S/ADL-P/N/EHL/JSL DPLL descriptor arrays and source ordering；6 targeted tests pass.
-3l. Intel DPLL CRTC hook selection | 部分完成 | pending | 翻译 `intel_dpll_init_clock_hook` 和 HSW `hsw_crtc_compute_clock` (display 12/13→HSW shared manager)；5 dpll tests pass.
+3l. Intel DPLL CRTC hook selection | 部分完成 | 9761878d | 翻译 `intel_dpll_init_clock_hook` 和 HSW `hsw_crtc_compute_clock` (display 12/13→HSW shared manager)；5 dpll tests pass.
