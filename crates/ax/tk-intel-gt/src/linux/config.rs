@@ -87,6 +87,8 @@ pub(crate) use crate::{
 // Linux 7.2.3 errno values and i915 GEM flags/enums used by the imported GT
 // sources. `I915_CACHE_LLC` is enum value 1; write-back map mode is 0.
 pub const PAGE_SIZE: usize = 4096;
+pub const PAGE_SHIFT: u32 = 12;
+pub type PgoffT = u64;
 pub const MAX_SCHEDULE_TIMEOUT: u64 = i64::MAX as u64 >> 1;
 pub const EAGAIN: i32 = 11;
 pub const EINTR: i32 = 4;
@@ -106,6 +108,37 @@ pub const EOPNOTSUPP: i32 = 95;
 // i915 UAPI / VMA-view values from Linux v7.2.3.
 pub const I915_MADV_WILLNEED: u32 = 0;
 pub const I915_GTT_VIEW_NORMAL: i32 = 0;
+pub const I915_MAX_CACHE_LEVEL: u32 = 4;
+pub const I915_BO_CACHE_COHERENT_FOR_READ: u32 = 1 << 0;
+pub const I915_BO_CACHE_COHERENT_FOR_WRITE: u32 = 1 << 1;
+pub const I915_BO_ALLOC_CONTIGUOUS: u32 = 1 << 0;
+pub const I915_BO_ALLOC_VOLATILE: u32 = 1 << 1;
+pub const I915_BO_ALLOC_CPU_CLEAR: u32 = 1 << 2;
+pub const I915_BO_ALLOC_USER: u32 = 1 << 3;
+pub const I915_BO_ALLOC_PM_VOLATILE: u32 = 1 << 4;
+pub const I915_BO_ALLOC_PM_EARLY: u32 = 1 << 5;
+pub const I915_BO_ALLOC_GPU_ONLY: u32 = 1 << 6;
+pub const I915_BO_ALLOC_CCS_AUX: u32 = 1 << 7;
+pub const I915_BO_ALLOC_NOTHP: u32 = 1 << 8;
+pub const I915_BO_PREALLOC: u32 = 1 << 9;
+pub const I915_BO_ALLOC_FLAGS: u32 = (1 << 10) - 1;
+pub const I915_BO_FLAG_STRUCT_PAGE: u32 = 1 << 0;
+pub const I915_BO_FLAG_IOMEM: u32 = 1 << 1;
+pub const INTEL_REGION_SMEM: i32 = 0;
+pub const INTEL_REGION_LMEM_0: i32 = 1;
+pub const INTEL_REGION_LMEM_1: i32 = 2;
+pub const INTEL_REGION_LMEM_2: i32 = 3;
+pub const INTEL_REGION_LMEM_3: i32 = 4;
+pub const INTEL_REGION_STOLEN_SMEM: i32 = 5;
+pub const INTEL_REGION_STOLEN_LMEM: i32 = 6;
+pub const INTEL_REGION_UNKNOWN: i32 = 7;
+pub const INTEL_MEMORY_SYSTEM: i32 = 0;
+pub const INTEL_MEMORY_LOCAL: i32 = 1;
+pub const INTEL_MEMORY_STOLEN_SYSTEM: i32 = 2;
+pub const INTEL_MEMORY_STOLEN_LOCAL: i32 = 3;
+pub const INTEL_MEMORY_MOCK: i32 = 4;
+pub type IntelRegionId = i32;
+pub type IntelMemoryType = i32;
 // `arch/x86/include/asm/cpufeatures.h`: CPUID feature word 0, bit 19.
 pub const X86_FEATURE_CLFLUSH: u32 = 19;
 

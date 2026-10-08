@@ -4,7 +4,20 @@
 
 #![allow(unsafe_code)]
 
-use crate::intel_engine_cs_upstream::{RbNode, RbRootCached};
+use crate::intel_engine_cs_upstream::{RbNode, RbRoot, RbRootCached};
+
+/// Linux `RB_ROOT` initializer for an empty red-black tree.
+#[allow(non_upper_case_globals)]
+pub const RB_ROOT: RbRoot = RbRoot {
+    node: core::ptr::null_mut(),
+};
+
+/// Linux `RB_EMPTY_ROOT` predicate.
+#[inline]
+#[allow(non_snake_case)]
+pub fn RB_EMPTY_ROOT(root: &RbRoot) -> bool {
+    root.node.is_null()
+}
 
 pub trait RbNodePointer {
     fn as_rb_node_ptr(self) -> *mut RbNode;
