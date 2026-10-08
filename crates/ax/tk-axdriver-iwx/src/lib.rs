@@ -16,6 +16,7 @@ mod firmware;
 mod firmware_bundle;
 mod init_cmd;
 mod interrupts;
+mod intr;
 mod mac;
 mod nic;
 mod nvm;
@@ -69,6 +70,11 @@ pub use interrupts::{
     InterruptMasks, configure_msix_hardware, disable_interrupts, enable_firmware_load_interrupts,
     enable_interrupts, enable_rfkill_interrupts, hardware_rfkill, initialize_msix_hardware,
     start_firmware,
+};
+pub use intr::{
+    ICT_ADDRESS_SHIFT, ICT_ENTRY_COUNT, ICT_SIZE_BYTES, IctError, InterruptCauseTable,
+    LegacyInterruptWork, MsixInterruptWork, plan_legacy_interrupt, plan_msix_interrupt, reset_ict,
+    service_legacy_interrupt, service_msix_interrupt,
 };
 pub use mac::{MacAddress, flip_hardware_address, is_valid_mac_address, select_csr_mac_address};
 pub use nic::{configure_nic, initialize_nic, initialize_rx};
