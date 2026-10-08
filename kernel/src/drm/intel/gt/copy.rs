@@ -236,10 +236,20 @@ pub(crate) struct UserJob {
     pub(crate) objects: Vec<UserObject>,
     pub(crate) batch: u64,
     pub(crate) render: bool,
+    pub(crate) engine_class: u8,
+    pub(crate) engine_instance: u8,
 }
 impl UserJob {
     pub(crate) fn validate(&self) -> Result<(), Error> {
-        if self.objects.is_empty() || self.objects.len() > 1024 || !self.batch.is_multiple_of(8) {
+        if self.objects.is_empty()
+            || self.objects.len() > 1024
+            || !self.batch.is_multiple_of(8)
+            || self.render != (self.engine_class == 0)
+            || !matches!(
+                (self.engine_class, self.engine_instance),
+                (0, 0) | (1, 0) | (2, 0) | (2, 2) | (3, 0)
+            )
+        {
             return Err(Error::Refused);
         }
         for (i, object) in self.objects.iter().enumerate() {
@@ -298,9 +308,25 @@ pub(crate) struct SavedContext {
     ram: Arc<Ram>,
     valid: AtomicBool,
     render: bool,
+    engine_class: u8,
+    engine_instance: u8,
 }
 impl SavedContext {
     pub(crate) fn new(file: &crate::drm::DrmFile, render: bool) -> axerrno::AxResult<Arc<Self>> {
+        Self::new_engine(file, u8::from(!render), 0)
+    }
+    pub(crate) fn new_engine(
+        file: &crate::drm::DrmFile,
+        engine_class: u8,
+        engine_instance: u8,
+    ) -> axerrno::AxResult<Arc<Self>> {
+        if !matches!(
+            (engine_class, engine_instance),
+            (0, 0) | (1, 0) | (2, 0) | (2, 2) | (3, 0)
+        ) {
+            return Err(axerrno::AxError::InvalidInput);
+        }
+        let render = engine_class == 0;
         let count = if render {
             intel_gt::rcs::CONTEXT_PAGES
         } else {
@@ -312,7 +338,12 @@ impl SavedContext {
         let ram = Arc::try_new(Ram::allocate(count).map_err(|_| axerrno::AxError::NoMemory)?)
             .map_err(|_| axerrno::AxError::NoMemory)?;
         ram.pages.retain_allocation_owner(charge)?;
-        let default = DEFAULTS.lock()[usize::from(render)].clone();
+        let default = match engine_class {
+            0 => DEFAULTS.lock()[1].clone(),
+            1 => DEFAULTS.lock()[0].clone(),
+            // These media engines do not yet have a retained boot default LRC.
+            _ => None,
+        };
         if let Some(default) = &default {
             let count = if render { 14 } else { 2 };
             let mut bytes = Vec::new();
@@ -336,8 +367,20 @@ impl SavedContext {
             ram,
             valid: AtomicBool::new(default.is_some()),
             render,
+            engine_class,
+            engine_instance,
         })
         .map_err(|_| axerrno::AxError::NoMemory)
+    }
+}
+fn engine_mmio_base(engine_class: u8, engine_instance: u8) -> Result<u32, Error> {
+    match (engine_class, engine_instance) {
+        (0, 0) => Ok(0x2000),
+        (1, 0) => Ok(0x22000),
+        (2, 0) => Ok(0x1c0000),
+        (2, 2) => Ok(0x1d0000),
+        (3, 0) => Ok(0x1c8000),
+        _ => Err(Error::Refused),
     }
 }
 struct SwitchAway {
@@ -345,9 +388,21 @@ struct SwitchAway {
     ring: Ram,
     bindings: Vec<Binding>,
     descriptor: u64,
+    engine_class: u8,
+    engine_instance: u8,
 }
 impl SwitchAway {
     fn new(render: bool) -> Result<Self, Error> {
+        Self::new_engine(u8::from(!render), 0)
+    }
+    fn new_engine(engine_class: u8, engine_instance: u8) -> Result<Self, Error> {
+        if !matches!(
+            (engine_class, engine_instance),
+            (0, 0) | (1, 0) | (2, 0) | (2, 2) | (3, 0)
+        ) {
+            return Err(Error::Refused);
+        }
+        let render = engine_class == 0;
         let mut bindings = Vec::new();
         bindings.try_reserve_exact(2).map_err(|_| Error::Refused)?;
         Ok(Self {
@@ -359,6 +414,8 @@ impl SwitchAway {
             ring: Ram::allocate(1)?,
             bindings,
             descriptor: 0,
+            engine_class,
+            engine_instance,
         })
     }
     fn build(&mut self, gtt: &Gtt, render: bool, root: u64, io: &impl GtIo) -> Result<(), Error> {
@@ -384,7 +441,18 @@ impl SwitchAway {
                 root,
             )?
         } else {
-            lrc::build(&mut regs, &mut indirect, &mut per, context, ring, 120, root)?
+            lrc::build_engine(
+                &mut regs,
+                &mut indirect,
+                &mut per,
+                context,
+                ring,
+                120,
+                root,
+                engine_mmio_base(self.engine_class, self.engine_instance)?,
+                self.engine_class,
+                self.engine_instance,
+            )?
         };
         // Source Gen11/12.0 descriptor SW context bits37..47. Port1 must be a
         // distinct context to force the port0 image save before its breadcrumb.
@@ -405,7 +473,14 @@ impl SwitchAway {
             words[37] |= 1 << 27;
             write_ring_commands(&self.ring, &words)?;
         } else {
-            let count = bcs::ring(&mut regs, 0x30000, context, 1)?;
+            let count = bcs::ring_engine(
+                &mut regs,
+                0x30000,
+                context,
+                1,
+                self.engine_class,
+                self.engine_instance,
+            )?;
             regs[15..18].fill(0); // only MI_BATCH_BUFFER_START and its two address words.
             write_ring_commands(&self.ring, &regs[..count])?;
         }
@@ -444,6 +519,8 @@ pub(super) struct Memory {
     operation: bcs::Copy,
     selftest: bool,
     render: bool,
+    engine_class: u8,
+    engine_instance: u8,
     idle: bool,
     saved: Option<Arc<SavedContext>>,
     switch: Option<Box<SwitchAway>>,
@@ -1826,6 +1903,8 @@ impl Memory {
             },
             selftest: true,
             render: false,
+            engine_class: 1,
+            engine_instance: 0,
             idle: false,
             saved: None,
             switch: None,
@@ -1984,9 +2063,31 @@ impl Memory {
             }
         } else {
             if restore {
-                lrc::restore_context(regs, indirect, per_ctx, ctx, ring, 120, p[0])?
+                lrc::restore_engine_context(
+                    regs,
+                    indirect,
+                    per_ctx,
+                    ctx,
+                    ring,
+                    120,
+                    p[0],
+                    engine_mmio_base(self.engine_class, self.engine_instance)?,
+                    self.engine_class,
+                    self.engine_instance,
+                )?
             } else {
-                lrc::build(regs, indirect, per_ctx, ctx, ring, 120, p[0])?
+                lrc::build_engine(
+                    regs,
+                    indirect,
+                    per_ctx,
+                    ctx,
+                    ring,
+                    120,
+                    p[0],
+                    engine_mmio_base(self.engine_class, self.engine_instance)?,
+                    self.engine_class,
+                    self.engine_instance,
+                )?
             }
         };
         self.context.write(0, &[0; 4096])?;
@@ -2003,7 +2104,14 @@ impl Memory {
                 self.batch.dwords(0, &batch)?;
             }
         }
-        let count = bcs::ring(regs, self.batch_address, ctx, 1)?;
+        let count = bcs::ring_engine(
+            regs,
+            self.batch_address,
+            ctx,
+            1,
+            self.engine_class,
+            self.engine_instance,
+        )?;
         if self.idle {
             regs[15..18].fill(0);
         }
@@ -2465,14 +2573,15 @@ fn execute_guc_context(
     if let Some(saved) = &memory.saved {
         saved.valid.store(false, Ordering::Release);
     }
-    let class = if memory.render { 0 } else { 1 }; // Linux render / copy class.
+    let class = memory.engine_class;
+    let base = engine_mmio_base(class, memory.engine_instance)?;
     let guc_class = intel_gt::guc_submission::engine_class_to_guc_class(class)?;
     let engine = ads
         .ok_or(Error::Refused)?
         .input
         .engines
         .iter()
-        .find(|engine| engine.guc_class == guc_class && engine.instance == 0)
+        .find(|engine| engine.guc_class == guc_class && engine.instance == memory.engine_instance)
         .ok_or(Error::Refused)?;
     let engine_submit_mask = 1u32
         .checked_shl(u32::from(engine.logical_index))
@@ -2521,11 +2630,11 @@ fn execute_guc_context(
         if u32::from_le_bytes(scratch) == 1 {
             break;
         }
-        if bus.read(if memory.render { 0x20b8 } else { 0x220b8 })? != 0 {
+        if bus.read(base + 0xb8)? != 0 {
             return Err(Error::Quarantined);
         }
         if bus.now_us().saturating_sub(start) > 500_000 {
-            return Err(Error::Timeout(if memory.render { 0x2550 } else { 0x22550 }));
+            return Err(Error::Timeout(base + 0x550));
         }
         bus.delay_us(10);
     }
@@ -2538,7 +2647,7 @@ fn execute_guc_context(
     {
         ct.receive_guc_submission_event(bus)?;
         if bus.now_us().saturating_sub(mode_start) > 500_000 {
-            return Err(Error::Timeout(if memory.render { 0x2550 } else { 0x22550 }));
+            return Err(Error::Timeout(base + 0x550));
         }
         bus.delay_us(50);
     }
@@ -2567,7 +2676,7 @@ fn execute_guc_context(
         ct.receive_guc_submission_event(bus)?;
         if bus.now_us().saturating_sub(deregister_start) > intel_gt::guc_ct::CTB_DEADLOCK_TIMEOUT_US
         {
-            return Err(Error::Timeout(0x22550));
+            return Err(Error::Timeout(base + 0x550));
         }
         bus.delay_us(50);
     }
@@ -2599,10 +2708,28 @@ fn execute_user_context(
 /// firmware owns submission, require the CT scheduler path and avoid direct
 /// engine resets, ELSQ-era workarounds, and MOCS programming behind the GuC.
 #[cfg(target_os = "none")]
-fn prepare_user_engine(owner: &mut super::Owner, render: bool) -> Result<bool, Error> {
+fn prepare_user_engine(
+    owner: &mut super::Owner,
+    engine_class: u8,
+    engine_instance: u8,
+) -> Result<bool, Error> {
+    let render = engine_class == 0;
+    let _ = engine_mmio_base(engine_class, engine_instance)?;
     owner.bus.assert_media_idle()?;
     if owner.bus.read(0xc000)? & 1 == 0 {
         if owner.ct_memory.as_ref().is_none_or(|ct| !ct.enabled) || owner.ads_memory.is_none() {
+            return Err(Error::Refused);
+        }
+        let guc_class = intel_gt::guc_submission::engine_class_to_guc_class(engine_class)?;
+        if !owner
+            .ads_memory
+            .as_ref()
+            .unwrap()
+            .input
+            .engines
+            .iter()
+            .any(|engine| engine.guc_class == guc_class && engine.instance == engine_instance)
+        {
             return Err(Error::Refused);
         }
         return Ok(true);
@@ -2611,6 +2738,11 @@ fn prepare_user_engine(owner: &mut super::Owner, render: bool) -> Result<bool, E
         // Firmware reset invalidates the registered CT/ADS submission state;
         // do not fall back to ELSQ behind stale GuC registrations.
         return Err(Error::Quarantined);
+    }
+    if engine_class >= 2 {
+        // The media engines have no direct-ELSQ fallback in this private
+        // caller; they require a live, matching GuC ADS/CT registration.
+        return Err(Error::Refused);
     }
     if render {
         intel_gt::reset::stop_and_reset_rcs(&owner.bus)?;
@@ -2750,7 +2882,7 @@ pub(super) fn render_objects(
         return Err(Error::Quarantined);
     }
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
-    let guc_submission = prepare_user_engine(owner, true)?;
+    let guc_submission = prepare_user_engine(owner, 0, 0)?;
     if !guc_submission
         && (owner.bus.read(0x480c)? != 0
             || owner.bus.read(0x400c)? != 5
@@ -2774,7 +2906,12 @@ pub(super) fn render_objects(
     memory.vm = Some(vm.clone());
     memory.context = Arc::new(Ram::allocate(intel_gt::rcs::CONTEXT_PAGES)?);
     memory.render = true;
+    memory.engine_class = 0;
+    memory.engine_instance = 0;
     if saved.render != memory.render {
+        return Err(Error::Refused);
+    }
+    if saved.engine_class != 0 || saved.engine_instance != 0 {
         return Err(Error::Refused);
     }
     memory.context = saved.ram.clone();
@@ -2821,8 +2958,11 @@ pub(super) fn user_objects(
     }
     job.validate()?;
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
-    let guc_submission = prepare_user_engine(owner, job.render)?;
-    if saved.render != job.render {
+    let guc_submission = prepare_user_engine(owner, job.engine_class, job.engine_instance)?;
+    if saved.render != job.render
+        || saved.engine_class != job.engine_class
+        || saved.engine_instance != job.engine_instance
+    {
         return Err(Error::Refused);
     }
     let gtt = super::super::shared_ggtt(owner.bdf).map_err(|_| Error::Refused)?;
@@ -2833,11 +2973,18 @@ pub(super) fn user_objects(
     memory.context = saved.ram.clone();
     memory.saved = Some(saved);
     memory.render = job.render;
+    memory.engine_class = job.engine_class;
+    memory.engine_instance = job.engine_instance;
     memory.selftest = false;
     memory.batch_address = sparse::normalize(job.batch)?;
     memory.user = Some(job);
-    memory.switch =
-        Some(Box::try_new(SwitchAway::new(memory.render)?).map_err(|_| Error::Refused)?);
+    memory.switch = Some(
+        Box::try_new(SwitchAway::new_engine(
+            memory.engine_class,
+            memory.engine_instance,
+        )?)
+        .map_err(|_| Error::Refused)?,
+    );
     owner.memory = Some(memory);
     let memory = owner.memory.as_mut().unwrap();
     memory.bind_and_build()?;
@@ -2885,7 +3032,7 @@ pub(super) fn objects(
     if Arc::ptr_eq(&source, &destination) {
         return Err(Error::Refused);
     }
-    let guc_submission = prepare_user_engine(owner, false)?;
+    let guc_submission = prepare_user_engine(owner, 1, 0)?;
     if !guc_submission
         && (owner.bus.read(0x480c)? != 0
             || owner.bus.read(0x400c)? != 5

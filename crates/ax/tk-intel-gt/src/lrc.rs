@@ -135,6 +135,8 @@ pub fn build_engine(
     {
         regs[34 + n * 2] = mmio_base + offset;
     }
+    // Gen12 ctx fake WA RING_CMD_CCTL final value uses N305 UC MOCS index 3.
+    regs[27] = 0x0000_0306;
     regs[52] = mi(0xa, 0) | 1;
     regs[3] = 0x00090009; // inhibit sync switch + first-restore inhibit, masked.
     regs[5] = 0;
@@ -241,6 +243,7 @@ mod tests {
             .unwrap();
             assert_eq!(regs[2], base + 0x244);
             assert_eq!(regs[34], base + 0x3a8);
+            assert_eq!(regs[27], 0x0000_0306);
             assert_eq!(indirect[15], aux);
             assert_eq!((descriptor >> 61) as u8, class);
             assert_eq!(((descriptor >> 48) & 0x3f) as u8, instance);

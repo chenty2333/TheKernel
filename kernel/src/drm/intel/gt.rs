@@ -682,7 +682,9 @@ pub(super) fn submit_user(
         let mut state = OWNER.lock();
         let owner = state.as_mut().ok_or(Error::Refused)?;
         let result = copy::user_objects(owner, job, vm, saved);
-        if result.is_err() {
+        // A preflight refusal (for example a fuse-disabled GuC engine) has
+        // not created transient GGTT state and must not quarantine the GT.
+        if result.is_err() && (owner.memory.is_some() || result != Err(Error::Refused)) {
             owner.lost = true;
         }
         result

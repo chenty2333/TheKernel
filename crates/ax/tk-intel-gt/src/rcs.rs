@@ -65,6 +65,7 @@ pub fn build_context(
     regs[22] = 0x21c8;
     regs[24] = 0x2180;
     regs[26] = 0x22b4;
+    regs[27] = 0x0000_0306; // Gen12 ctx fake WA final value, N305 UC MOCS index3.
     regs[33] = 0x11081011;
     regs[34] = 0x23a8;
     regs[36] = 0x228c;
