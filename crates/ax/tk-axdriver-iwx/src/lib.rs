@@ -34,6 +34,7 @@ mod rx;
 mod rx_event;
 mod rx_packet;
 mod scan;
+mod station;
 mod tx;
 mod tx_completion;
 
@@ -157,6 +158,12 @@ pub use scan::{
     LONG_GROUP as IWX_LONG_GROUP, ScanError, ScanState, UMAC_SCAN_ABORT, UMAC_SCAN_COMPLETE,
     UMAC_SCAN_REQ, abort_scan, begin_background_scan, begin_foreground_scan, end_scan,
     scan_abort_command,
+};
+pub use station::{
+    ADD_STA_COMMAND, FlushedQueue, STA_FLG_DRAIN_FLOW, STA_MODE_MODIFY, StationError,
+    TX_FLUSH_QUEUE_INFO_BYTES, TX_FLUSH_QUEUE_LIMIT, TX_FLUSH_RESPONSE_BYTES,
+    TX_PATH_FLUSH_COMMAND, TxFlushResponse, drain_station_command, flush_station,
+    parse_tx_flush_response, tx_path_flush_command,
 };
 pub use tx::{EncodedTxFrame, TxError, TxFrame, encode_tx_frame, submit_tx_frame};
 pub use tx_completion::{
