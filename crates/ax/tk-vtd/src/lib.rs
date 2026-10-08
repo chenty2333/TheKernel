@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 
 pub mod context;
 pub mod dmar;
+pub mod fault;
 pub mod idpgtbl;
 pub mod iova;
 pub mod pgtbl;

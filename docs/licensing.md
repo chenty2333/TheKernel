@@ -557,3 +557,6 @@ The VT-d root/context/domain translation from FreeBSD
 `sys/x86/iommu/intel_ctx.c` retains the 2013 FreeBSD Foundation BSD-2-Clause
 grant and Konstantin Belousov attribution in `tk-vtd` Rust source, covered by
 the crate's retained BSD-2-Clause license.
+The VT-d fault-ring and reporting translation from FreeBSD
+`sys/x86/iommu/intel_fault.c` retains the 2013 FreeBSD Foundation BSD-2-Clause
+grant and Konstantin Belousov attribution in `tk-vtd/src/fault.rs`.

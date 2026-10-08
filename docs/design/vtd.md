@@ -41,3 +41,10 @@ now has one root/context page per bus and each context page has the translated
 second-level domain entry layout. The current design still uses one shared
 second-level domain across all requesters; PCI discovery, RMRR/GAS allocation,
 per-device isolation and delayed unload taskqueue ownership are not integrated.
+
+FreeBSD `intel_fault.c` is translated at 9/9 function entries in
+`tk-vtd/src/fault.rs`, including bounded two-word circular logging, FSTS/FECTL
+W1C behavior, record draining and deferred reporting. Locks, taskqueues and
+requester/device formatting are native `FaultIo` callbacks. The kernel's
+current runtime path still uses its existing polled fault checks rather than
+registering this new interrupt/task adapter.
