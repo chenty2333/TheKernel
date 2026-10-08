@@ -71,6 +71,7 @@ struct SmpSession {
     peer_distribution: u8,
     local_distribution: u8,
     distribution_started: bool,
+    pending_confirmation: bool,
 }
 
 #[cfg(feature = "input")]
@@ -1032,7 +1033,12 @@ fn start_pending_le_smp(index: u16, handle: u16, peer: [u8; 6], hci_address_type
     let local = axdriver::bluetooth_smp::PairingFeatures {
         io_capability: pending.io_capability,
         oob_data: false,
-        auth_req: 0x09, // bonding + Secure Connections, Just Works
+        auth_req: 0x09
+            | if matches!(pending.io_capability, 1 | 4) {
+                0x04
+            } else {
+                0
+            },
         max_key_size: 16,
         initiator_key_distribution: 0x03, // encryption + identity
         responder_key_distribution: 0x03,
@@ -1080,6 +1086,7 @@ fn start_pending_le_smp(index: u16, handle: u16, peer: [u8; 6], hci_address_type
             peer_distribution: 0,
             local_distribution: 0,
             distribution_started: false,
+            pending_confirmation: false,
         });
     }
     if adapter
@@ -1148,6 +1155,28 @@ fn process_smp_acl(index: u16, adapter: &UsbAdapter, packet: &[u8]) {
                 SMP_SESSIONS
                     .lock()
                     .retain(|session| session.index != index || session.handle != handle);
+            }
+        }
+        axdriver::bluetooth_smp::Action::ConfirmNumeric(value) => {
+            let parameters = {
+                let mut sessions = SMP_SESSIONS.lock();
+                sessions
+                    .iter_mut()
+                    .find(|session| session.index == index && session.handle == handle)
+                    .map(|session| {
+                        session.pending_confirmation = true;
+                        let mut parameters = Vec::with_capacity(12);
+                        parameters.extend_from_slice(&session.address);
+                        parameters.push(session.address_type);
+                        parameters.push(1); // confirm_hint: user must accept
+                        parameters.extend_from_slice(&value.to_le_bytes());
+                        parameters
+                    })
+            };
+            if let Some(parameters) = parameters {
+                if let Ok(event) = mgmt_event_packet(0x000f, index, &parameters) {
+                    fanout_mgmt_event(event);
+                }
             }
         }
         axdriver::bluetooth_smp::Action::StartEncryption(key) => {
@@ -1222,6 +1251,7 @@ fn smp_failure_reason(error: axdriver::bluetooth_smp::PairingError) -> u8 {
         PairingError::ConfirmFailed => 0x04,
         PairingError::DhKeyCheckFailed | PairingError::InvalidPublicKey => 0x0b,
         PairingError::AuthenticationUnsupported => 0x03,
+        PairingError::UserRejected => 0x0c,
         PairingError::InvalidPdu | PairingError::InvalidFeatures => 0x0a,
         PairingError::PeerFailed | PairingError::InvalidState => 0x08,
     }
@@ -2185,6 +2215,57 @@ fn management_controller_command(request: &[u8]) -> AxResult<Option<(Vec<u8>, Op
         };
         let mut address = [0; 6];
         address.copy_from_slice(&parameters[..6]);
+        if parameters[6] != 0 {
+            let pairing = {
+                let mut sessions = SMP_SESSIONS.lock();
+                sessions
+                    .iter_mut()
+                    .find(|session| {
+                        session.index == index
+                            && session.address == address
+                            && session.address_type == parameters[6]
+                            && session.pending_confirmation
+                    })
+                    .map(|session| {
+                        session.pending_confirmation = false;
+                        (
+                            session.handle,
+                            session
+                                .initiator
+                                .user_confirmation(opcode == USER_CONFIRM_REPLY),
+                        )
+                    })
+            };
+            let status = match pairing {
+                Some((handle, axdriver::bluetooth_smp::Action::Send(pdu))) => {
+                    match adapter.lock().management_send_smp(handle, &pdu) {
+                        Ok(()) => 0,
+                        Err(_) => FAILED,
+                    }
+                }
+                Some((handle, axdriver::bluetooth_smp::Action::Failed(error))) => {
+                    let reason = smp_failure_reason(error);
+                    if error != axdriver::bluetooth_smp::PairingError::PeerFailed {
+                        let _ = adapter.lock().management_send_smp(handle, &[0x05, reason]);
+                    }
+                    SMP_SESSIONS
+                        .lock()
+                        .retain(|session| session.index != index || session.handle != handle);
+                    emit_smp_auth_failed(index, address, parameters[6], reason);
+                    0
+                }
+                _ => 0x02, // no pending LE confirmation
+            };
+            let data = if status == 0 {
+                parameters.to_vec()
+            } else {
+                Vec::new()
+            };
+            return Ok(Some((
+                management_command_complete(index, opcode, status, &data)?,
+                None,
+            )));
+        }
         let status = match adapter
             .lock()
             .management_user_confirmation(address, opcode == USER_CONFIRM_REPLY)

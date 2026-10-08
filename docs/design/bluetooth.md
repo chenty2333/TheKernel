@@ -58,31 +58,7 @@ address `ah`, and P-256 public-key/ECDH helpers. Crypto arrays use the most-
 significant-octet-first order from Core Vol 3 Part H Appendix D; SMP wire fields
 are little-endian and require explicit conversion at their caller. RFC 4493 and
 Core Appendix D vectors cover CMAC, f4-f6, g2, and ah; P-256 ECDH has symmetry
-and invalid-point checks. A bounded central-side Just Works state machine now performs the Pairing Feature
-exchange, Legacy Confirm/Random/STK or Secure Connections Public Key/Confirm/
-Random/DHKey Check and returns an encryption key action. MITM/OOB requests fail
-closed. It has no live ACL/CID 6 dispatch yet and does not drive HCI encryption,
-post-encryption key distribution, bond persistence, mgmt `PAIR_DEVICE` completion,
-or `NEW_LONG_TERM_KEY`/`NEW_IRK` events. Passkey/Numeric Comparison UI and
-peripheral-role pairing are also unsupported. Thus this is tested protocol core,
-not end-to-end LE pairing; no hardware pairing success is claimed.
-
-2026-10-09 LE pairing integration follow-up: `PAIR_DEVICE` for LE now installs a
-central-side SMP Just Works session on successful LE connection, sends the
-Pairing Request on ACL/L2CAP CID 0x0006, observes ACL independently of raw HCI
-socket delivery, validates phase-2 Legacy or Secure Connections traffic, starts
-HCI encryption, and runs phase-3 key distribution. The locally distributed IRK is retained and reused
-(or uses the mgmt-configured local IRK); it caches generated/received LTKs and
-IRKs in the controller's host key tables, updates the resolving list
-when privacy is active, and emits the BlueZ `NEW_LONG_TERM_KEY`/`NEW_IRK` events
-only after phase-3 transfer completes. The READ_COMMANDS event list now includes
-both key events (22 commands, 11 events). Software checks cover HCI ACL observer,
-crypto test vectors and bounded SMP exchange state tests; product-feature kernel
-check passes. This is not yet a hardware acceptance: no physical controller was
-available. ACL continuation-fragment reassembly, peripheral-role pairing,
-Numeric Comparison UI, Passkey/OOB association models, pairing timeout/cancel,
-remote RPA-to-identity connection matching, and crash-safe persistence remain
-open; invalid/unavailable flows fail without reporting a successful bond.
+and invalid-point checks. The SMP core is now a bounded central-side engine: it validates the Pairing Feature exchange, supports Legacy Just Works and Secure Connections Just Works / Numeric Comparison, validates public keys and confirmation/DHKey checks, and produces an encryption-key action. MITM requests are only accepted for Secure Connections Numeric Comparison when both IO capabilities can display/confirm; OOB and Passkey Entry fail closed. The HCI integration carries complete ACL/L2CAP CID 0x0006 SMP PDUs, starts encryption, distributes legacy LTK/EDIV/Rand and identity keys or Secure Connections identity keys, caches the generated/received LTK and IRK, updates the resolving list where enabled, and emits mgmt `NEW_LONG_TERM_KEY`/`NEW_IRK` after key distribution. BlueZ `USER_CONFIRM_REQUEST` and `USER_CONFIRM_REPLY/NEG_REPLY` route the Numeric Comparison decision into the SMP state machine. `READ_COMMANDS` advertises both key events (22 commands, 11 events). RFC/Core crypto vectors and state-machine tests pass, as do product feature checks. This is still not hardware acceptance: no physical controller was tested. ACL continuation-fragment reassembly, peripheral-role pairing, OOB and Passkey Entry, pairing timeout/cancel, remote RPA-to-identity connection matching, and crash-safe persistence remain open; unavailable/invalid cases fail without reporting a successful bond.
 
 The latest no-controller QEMU smoke (Q35/KVM, VT-d/intremap) passed after the
 management event table update: 22 commands/11 events, empty index list,
