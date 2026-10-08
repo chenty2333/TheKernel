@@ -646,6 +646,12 @@ pub fn intel_ddi_buf_trans_get(
     }
 }
 
+/// Whether the selected table is the eDP HOBL workaround table.
+// upstream: intel_ddi_buf_trans.c is_hobl_buf_trans()
+pub const fn is_hobl_buf_trans(table: DdiBufferTransTable) -> bool {
+    table.hobl
+}
+
 /// Source-shaped convenience for callers that only need the table's entries.
 // upstream: intel_ddi_buf_trans.c intel_get_buf_trans()
 pub fn intel_get_buf_trans(table: DdiBufferTransTable) -> &'static [DdiBufferTransEntry] {
@@ -717,7 +723,10 @@ mod tests {
             "adlp_combo_phy_trans_edp_up_to_hbr2"
         );
         edp_request.use_edp_hobl = true;
-        assert!(intel_ddi_buf_trans_get(edp_request).unwrap().hobl);
+        let hobl = intel_ddi_buf_trans_get(edp_request).unwrap();
+        assert!(hobl.hobl);
+        assert!(is_hobl_buf_trans(hobl));
+        assert!(!is_hobl_buf_trans(hdmi));
 
         let dkl = intel_ddi_buf_trans_get(request(
             Platform::AlderLakeN,
