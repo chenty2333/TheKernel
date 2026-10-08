@@ -1,0 +1,5 @@
+# i915 DP audio source translation
+
+`crates/ax/tk-intel-display/src/intel_audio_dp_full.rs` translates the Display-12/13 DP-audio and shared audio logic from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_audio.c` (MIT, Copyright © 2014 Intel Corporation). It preserves 35 of the source's 45 ctags function definitions in source order. The ten omissions are HDMI-only (`audio_config_hdmi_get_n`, `audio_config_hdmi_pixel_clock`, `hsw_hdmi_audio_config_update`), pre-Display-12 G4x (`g4x_audio_codec_disable`, `g4x_audio_codec_enable`, `g4x_audio_codec_get_config`, `g4x_eld_buffer_size`), and pre-Display-12 IBX (`ibx_audio_codec_disable`, `ibx_audio_codec_enable`, `ibx_audio_regs_init`) paths.
+
+DP audio configuration, ELD/codec handling and sequencing are represented in Rust. `IntelAudioDpHooks` is the boundary for audio-core, HDA, ELD storage, MMIO, vblank and DRM framework operations. The existing kernel audio/ELD session remains the active N305 path; this source module is not yet connected to that path.

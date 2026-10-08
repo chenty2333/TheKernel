@@ -1262,3 +1262,5 @@ The HDMI path additionally translates `hdmi_port_clock_limit()`, `hdmi_port_cloc
 `kernel/src/drm/connector_uapi_full.rs` translates all 87 ctags definitions plus the unrecognized `drm_get_tv_mode_from_name()` from Linux 7.2.3 `drivers/gpu/drm/drm_connector.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is retained in source and `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.
 
 `kernel/src/drm/mode_config_full.rs` translates all 14 ctags function definitions from Linux 7.2.3 `drivers/gpu/drm/drm_mode_config.c` (MIT-style grant, Copyright (c) 2016 Intel Corporation); the full grant is shared with `kernel/LICENSES/LicenseRef-Intel-Drm-Connector-MIT`.
+
+`crates/ax/tk-intel-display/src/intel_audio_dp_full.rs` translates 35/45 ctags functions from Linux 7.2.3 `intel_audio.c` (MIT, Copyright © 2014 Intel Corporation); ten HDMI-only or pre-Display-12 G4x/IBX functions are excluded. The source contains the full MIT grant and `LICENSES/Intel-i915-DP-Audio-MIT.txt` retains it.
