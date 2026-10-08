@@ -46,6 +46,47 @@ pub enum AddbaTxOutcome {
     SendRequest { timeout_micros: u64 },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DelbaRequestEffects {
+    pub transmit_delba: bool,
+    pub stop_transmit: bool,
+    pub stop_receive: bool,
+    pub cancel_inactivity_timeout: bool,
+    pub cancel_gap_timeout: bool,
+    pub retire_reorder_buffers: bool,
+}
+
+/// Apply local originator/recipient agreement teardown and return driver effects.
+// upstream: ieee80211_proto.c ieee80211_delba_request()
+pub fn request_delba(
+    tx: &mut TxBaAgreement,
+    rx: &mut crate::BaAgreement,
+    reason: u16,
+    originator: bool,
+) -> DelbaRequestEffects {
+    let mut effects = DelbaRequestEffects {
+        transmit_delba: reason != 0,
+        ..Default::default()
+    };
+    if originator {
+        effects.stop_transmit = true;
+        *tx = TxBaAgreement::default();
+    } else {
+        effects.stop_receive = true;
+        effects.cancel_inactivity_timeout = true;
+        effects.cancel_gap_timeout = true;
+        effects.retire_reorder_buffers = true;
+        rx.state = crate::ba_rx::BA_STATE_INIT;
+        rx.token = 0;
+        rx.window_start = 0;
+        rx.window_end = 0;
+        rx.window_size = 0;
+        rx.timeout_micros = 0;
+        rx.request_interval = 0;
+    }
+    effects
+}
+
 /// Initiate transmit BlockAck negotiation for one traffic identifier.
 // upstream: ieee80211_proto.c ieee80211_addba_request()
 pub fn start_addba_request(
@@ -168,5 +209,45 @@ mod tests {
             }
         );
         assert_eq!(ba.state, TX_BA_INIT);
+    }
+
+    #[test]
+    fn delba_request_sends_only_with_reason_and_clears_selected_direction() {
+        let mut tx = TxBaAgreement {
+            state: TX_BA_AGREED,
+            token: 2,
+            window_size: 64,
+            ..Default::default()
+        };
+        let mut rx = crate::BaAgreement {
+            state: crate::ba_rx::BA_STATE_AGREED,
+            token: 3,
+            timeout_micros: 1000,
+            ..Default::default()
+        };
+        let effects = request_delba(&mut tx, &mut rx, 39, true);
+        assert_eq!(
+            effects,
+            DelbaRequestEffects {
+                transmit_delba: true,
+                stop_transmit: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(tx, TxBaAgreement::default());
+        assert_eq!(rx.state, crate::ba_rx::BA_STATE_AGREED);
+
+        let effects = request_delba(&mut tx, &mut rx, 0, false);
+        assert_eq!(
+            effects,
+            DelbaRequestEffects {
+                stop_receive: true,
+                cancel_inactivity_timeout: true,
+                cancel_gap_timeout: true,
+                retire_reorder_buffers: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(rx, crate::BaAgreement::default());
     }
 }

@@ -1129,4 +1129,5 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 (BSD-3-Clause): ADDBA request/response, DELBA and SA Query action body encoders plus 12-bit Tx BA window advancement translated in `tk-net80211/src/output.rs`.
 - OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 (BSD-3-Clause): station-supported BlockAck and SA Query response action dispatch translated in `tk-net80211/src/output.rs`.
 - OpenBSD `sys/net80211/ieee80211_proto.c` rev 1.176 and `ieee80211.h` rev 1.137 (BSD-3-Clause): transmit ADDBA request state, dialog token/window/parameter setup, one-second response timer effect and driver offload result handling translated in `tk-net80211/src/ba_tx.rs`.
+- OpenBSD `sys/net80211/ieee80211_proto.c` rev 1.176 (BSD-3-Clause): transmit DELBA send/driver-stop effects, recipient timeout cancellation and reorder-buffer retirement translated in `tk-net80211/src/ba_tx.rs`.
 - OpenBSD `sys/net80211/ieee80211_output.c` rev 1.148 and `ieee80211_var.h` rev 1.143 (BSD-3-Clause): HT/local AMPDU/station-BSS/RSN eligibility check translated in `tk-net80211/src/output.rs`.

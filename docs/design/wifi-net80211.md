@@ -106,6 +106,9 @@ unsupported action categories, matching the `IEEE80211_STA_ONLY` build.
 Transmit BlockAck negotiation now plans the source INIT-to-REQUESTED
 transition, token and 64-frame window, immediate/delayed policy, response
 timeout, and the optional driver-offload completion/refusal branch.
+Local DELBA request handling clears the selected Tx or Rx agreement and emits
+direction-specific firmware-stop, timer-cancel, reorder-retirement and optional
+management-send effects.
 The transmit AMPDU admission predicate additionally requires HT, local TX
 support, the active BSS peer in station mode, and RSN protection.
 Management frame helpers also encode Capability Information, DS channel and

@@ -118,3 +118,4 @@
 - `ieee80211_output.c` BlockAck/SA-Query station action-body encoders and Tx BA window advancement translated; output coverage advances to 33/50 functions.
 - `ieee80211_output.c` station-supported BlockAck/SA Query response action dispatcher translated; output coverage advances to 34/50 functions.
 - `ieee80211_proto.c` `ieee80211_addba_request()` now plans per-TID Tx BA state/token/window and request/offload outcome; proto coverage advances to 11/30 functions.
+- `ieee80211_proto.c` `ieee80211_delba_request()` now clears the source Tx/Rx agreement and returns stop/timer/reorder/send effects; proto coverage advances to 12/30 functions.
