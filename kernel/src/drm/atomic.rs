@@ -35,6 +35,8 @@ pub struct State {
     pub crtc_h: u32,
     pub dpms: u32,
     pub gamma_lut_blob: u32,
+    pub degamma_lut_blob: u32,
+    pub ctm_blob: u32,
     pub damage_clips_blob: u32,
     pub cursor_fb: u32,
     pub cursor_crtc: u32,
@@ -72,6 +74,8 @@ pub fn value(state: &State, property: u32) -> Option<u64> {
         property::CRTC_ACTIVE => state.active as u64,
         property::CRTC_MODE_ID => state.mode_blob as u64,
         property::CRTC_GAMMA_LUT => state.gamma_lut_blob as u64,
+        property::CRTC_DEGAMMA_LUT => state.degamma_lut_blob as u64,
+        property::CRTC_CTM => state.ctm_blob as u64,
         property::CRTC_OUT_FENCE_PTR => 0,
         property::PLANE_FB_ID => state.fb as u64,
         property::PLANE_CRTC_ID => state.plane_crtc as u64,
@@ -115,6 +119,7 @@ pub fn value_with_resources(
     match property {
         property::CONNECTOR_EDID => Some(resources.connector.edid_blob as u64),
         property::CRTC_GAMMA_LUT_SIZE => Some(256),
+        property::CRTC_DEGAMMA_LUT_SIZE => Some(256),
         _ => value(state, property),
     }
 }
@@ -138,10 +143,12 @@ pub fn value_for_object(
     }
 }
 
-pub(crate) fn referenced_blobs(state: &State) -> [u32; 3] {
+pub(crate) fn referenced_blobs(state: &State) -> [u32; 5] {
     [
         state.mode_blob,
         state.gamma_lut_blob,
+        state.degamma_lut_blob,
+        state.ctm_blob,
         state.damage_clips_blob,
     ]
 }
@@ -219,6 +226,14 @@ fn propose_with_mode(
             property::CRTC_GAMMA_LUT => {
                 next.gamma_lut_blob = c.value as u32;
                 validate_gamma_lut_blob(&device, next.gamma_lut_blob)?;
+            }
+            property::CRTC_DEGAMMA_LUT => {
+                next.degamma_lut_blob = c.value as u32;
+                validate_gamma_lut_blob(&device, next.degamma_lut_blob)?;
+            }
+            property::CRTC_CTM => {
+                next.ctm_blob = c.value as u32;
+                validate_ctm_blob(&device, next.ctm_blob)?;
             }
             // Explicit fences are request-local.  Their fds/pointers must
             // never leak into a later atomic state, including TEST_ONLY.
@@ -460,6 +475,8 @@ fn matches_object(r: &super::kms::KmsResources, object: u32, prop: u32) -> bool 
         property::CRTC_ACTIVE
         | property::CRTC_MODE_ID
         | property::CRTC_GAMMA_LUT
+        | property::CRTC_DEGAMMA_LUT
+        | property::CRTC_CTM
         | property::CRTC_OUT_FENCE_PTR => object == r.crtc.id,
         _ => {
             object == r.primary_plane_id || (r.cursor_plane_id != 0 && object == r.cursor_plane_id)
@@ -510,6 +527,17 @@ fn validate_damage_blob(
         {
             return Err(DrmError::Invalid);
         }
+    }
+    Ok(())
+}
+
+fn validate_ctm_blob(device: &super::device::DeviceState, blob: u32) -> DrmResult<()> {
+    if blob == 0 {
+        return Ok(());
+    }
+    let blob = device.property_blobs.get(&blob).ok_or(DrmError::NotFound)?;
+    if blob.destroyed || blob.bytes.len() != 9 * core::mem::size_of::<u64>() {
+        return Err(DrmError::Invalid);
     }
     Ok(())
 }

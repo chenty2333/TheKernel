@@ -34,6 +34,9 @@ pub const FORMAT_ARGB8888: u32 = 0x3432_5241;
 pub const IN_FORMATS_PRIMARY_BLOB_ID: u32 = 2;
 pub const IN_FORMATS_CURSOR_BLOB_ID: u32 = 3;
 pub const CRTC_GAMMA_LUT_SIZE: u32 = 22;
+pub const CRTC_DEGAMMA_LUT: u32 = 23;
+pub const CRTC_DEGAMMA_LUT_SIZE: u32 = 24;
+pub const CRTC_CTM: u32 = 25;
 
 #[derive(Clone, Copy)]
 pub struct Property {
@@ -46,7 +49,7 @@ pub struct Property {
 
 const ATOMIC_RANGE: u32 = uapi::DRM_MODE_PROP_RANGE | uapi::DRM_MODE_PROP_ATOMIC;
 const ATOMIC_OBJECT: u32 = uapi::DRM_MODE_PROP_OBJECT | uapi::DRM_MODE_PROP_ATOMIC;
-pub const PROPERTIES: [Property; 22] = [
+pub const PROPERTIES: [Property; 25] = [
     Property {
         id: CONNECTOR_CRTC_ID,
         name: "CRTC_ID",
@@ -203,6 +206,27 @@ pub const PROPERTIES: [Property; 22] = [
         min: 0,
         max: u32::MAX as u64,
     },
+    Property {
+        id: CRTC_DEGAMMA_LUT,
+        name: "DEGAMMA_LUT",
+        flags: uapi::DRM_MODE_PROP_BLOB | uapi::DRM_MODE_PROP_ATOMIC,
+        min: 0,
+        max: u32::MAX as u64,
+    },
+    Property {
+        id: CRTC_DEGAMMA_LUT_SIZE,
+        name: "DEGAMMA_LUT_SIZE",
+        flags: uapi::DRM_MODE_PROP_RANGE | uapi::DRM_MODE_PROP_IMMUTABLE,
+        min: 0,
+        max: u32::MAX as u64,
+    },
+    Property {
+        id: CRTC_CTM,
+        name: "CTM",
+        flags: uapi::DRM_MODE_PROP_BLOB | uapi::DRM_MODE_PROP_ATOMIC,
+        min: 0,
+        max: u32::MAX as u64,
+    },
 ];
 
 pub fn get(id: u32) -> Option<&'static Property> {
@@ -216,6 +240,9 @@ pub fn object_properties(object_type: u32) -> &'static [u32] {
             CRTC_MODE_ID,
             CRTC_GAMMA_LUT,
             CRTC_GAMMA_LUT_SIZE,
+            CRTC_DEGAMMA_LUT,
+            CRTC_DEGAMMA_LUT_SIZE,
+            CRTC_CTM,
             CRTC_OUT_FENCE_PTR,
         ],
         uapi::DRM_MODE_OBJECT_PLANE => &[
@@ -317,5 +344,17 @@ mod tests {
         assert_ne!(property.flags & uapi::DRM_MODE_PROP_IMMUTABLE, 0);
         assert_eq!((property.min, property.max), (0, u32::MAX as u64));
         assert!(super::object_properties(uapi::DRM_MODE_OBJECT_CRTC).contains(&CRTC_GAMMA_LUT_SIZE));
+    }
+
+    #[test]
+    fn color_management_blobs_are_advertised_on_the_crtc() {
+        let crtc = super::object_properties(uapi::DRM_MODE_OBJECT_CRTC);
+        assert!(crtc.contains(&super::CRTC_GAMMA_LUT));
+        assert!(crtc.contains(&super::CRTC_DEGAMMA_LUT));
+        assert!(crtc.contains(&super::CRTC_DEGAMMA_LUT_SIZE));
+        assert!(crtc.contains(&super::CRTC_CTM));
+        for id in [super::CRTC_GAMMA_LUT, super::CRTC_DEGAMMA_LUT, super::CRTC_CTM] {
+            assert_ne!(super::get(id).unwrap().flags & uapi::DRM_MODE_PROP_BLOB, 0);
+        }
     }
 }

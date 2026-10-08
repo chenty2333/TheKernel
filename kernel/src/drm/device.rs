@@ -322,6 +322,9 @@ pub(crate) struct DeviceState {
     /// One software gamma LUT for the sole virtual CRTC, stored as RGB
     /// triplets in the legacy DRM 16-bit component representation.
     pub(crate) gamma_lut: Vec<u16>,
+    /// Atomic degamma LUT and S31.32 CTM retained with the CRTC properties.
+    pub(crate) degamma_lut: Vec<u16>,
+    pub(crate) ctm: [u64; 9],
     /// DRM property blobs are device objects, not per-file scratch records.
     /// `destroyed` only drops the creator's reference; queued and installed
     /// atomic state keeps the payload alive until it is no longer referenced.
@@ -513,6 +516,13 @@ impl DrmDevice {
                         [value, value, value]
                     })
                     .collect(),
+                degamma_lut: (0..256)
+                    .flat_map(|index| {
+                        let value = (index * 257) as u16;
+                        [value, value, value]
+                    })
+                    .collect(),
+                ctm: [1 << 32, 0, 0, 0, 1 << 32, 0, 0, 0, 1 << 32],
                 next_property_blob: if cursor_plane_id == 0 { 3 } else { 4 },
                 property_blobs,
                 atomic: super::atomic::initial(&KmsResources {
@@ -1206,6 +1216,14 @@ impl DrmDevice {
             apply_gamma_lut(&mut state, job.next.gamma_lut_blob)
                 .expect("validated gamma LUT blob changed before publish");
         }
+        if previous.degamma_lut_blob != job.next.degamma_lut_blob {
+            apply_degamma_lut(&mut state, job.next.degamma_lut_blob)
+                .expect("validated degamma LUT blob changed before publish");
+        }
+        if previous.ctm_blob != job.next.ctm_blob {
+            apply_ctm(&mut state, job.next.ctm_blob)
+                .expect("validated CTM blob changed before publish");
+        }
         state.rebuild_atomic_tail();
         state.resources.crtc.mode = job.next.mode;
         state.resources.crtc.framebuffer = job.next.active.then_some(job.next.fb);
@@ -1772,6 +1790,45 @@ fn apply_gamma_lut(state: &mut DeviceState, blob_id: u32) -> DrmResult<()> {
         destination[0] = u16::from_ne_bytes([source[0], source[1]]);
         destination[1] = u16::from_ne_bytes([source[2], source[3]]);
         destination[2] = u16::from_ne_bytes([source[4], source[5]]);
+    }
+    Ok(())
+}
+
+fn apply_degamma_lut(state: &mut DeviceState, blob_id: u32) -> DrmResult<()> {
+    if blob_id == 0 {
+        for (index, triplet) in state.degamma_lut.chunks_exact_mut(3).enumerate() {
+            let value = (index * 257) as u16;
+            triplet.copy_from_slice(&[value, value, value]);
+        }
+        return Ok(());
+    }
+    let blob = state.property_blobs.get(&blob_id).ok_or(DrmError::NotFound)?;
+    if blob.bytes.len() != state.degamma_lut.len() / 3 * 8 {
+        return Err(DrmError::Invalid);
+    }
+    for (destination, source) in state
+        .degamma_lut
+        .chunks_exact_mut(3)
+        .zip(blob.bytes.chunks_exact(8))
+    {
+        destination[0] = u16::from_ne_bytes([source[0], source[1]]);
+        destination[1] = u16::from_ne_bytes([source[2], source[3]]);
+        destination[2] = u16::from_ne_bytes([source[4], source[5]]);
+    }
+    Ok(())
+}
+
+fn apply_ctm(state: &mut DeviceState, blob_id: u32) -> DrmResult<()> {
+    if blob_id == 0 {
+        state.ctm = [1 << 32, 0, 0, 0, 1 << 32, 0, 0, 0, 1 << 32];
+        return Ok(());
+    }
+    let blob = state.property_blobs.get(&blob_id).ok_or(DrmError::NotFound)?;
+    if blob.bytes.len() != core::mem::size_of::<[u64; 9]>() {
+        return Err(DrmError::Invalid);
+    }
+    for (value, bytes) in state.ctm.iter_mut().zip(blob.bytes.chunks_exact(8)) {
+        *value = u64::from_ne_bytes(bytes.try_into().map_err(|_| DrmError::Invalid)?);
     }
     Ok(())
 }
