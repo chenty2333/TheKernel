@@ -217,6 +217,48 @@ pub const fn intel_tc_cold_requires_aux_pw(
     matches!((cold_off_domain, legacy_aux_domain), (a, b) if a as u16 == b as u16)
 }
 
+/// FIA number and within-FIA port index selected for one TC port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FiaParams {
+    pub fia_index: u8,
+    pub port_index: u8,
+}
+
+/// Load FIA topology according to the modular-FIA platform bit.
+// upstream: intel_tc.c tc_phy_load_fia_params()
+pub const fn tc_phy_load_fia_params(tc_port_index: u8, modular_fia: bool) -> FiaParams {
+    if modular_fia {
+        FiaParams {
+            fia_index: tc_port_index / 2,
+            port_index: tc_port_index % 2,
+        }
+    } else {
+        FiaParams {
+            fia_index: 0,
+            port_index: tc_port_index,
+        }
+    }
+}
+
+/// Correct a VBT legacy-port flag when the live status has one other mode.
+// upstream: intel_tc.c tc_port_fixup_legacy_flag()
+pub const fn tc_port_fixup_legacy_flag(legacy_port: bool, live_status_mask: u32) -> bool {
+    if live_status_mask.count_ones() != 1 {
+        legacy_port
+    } else {
+        let expected = if legacy_port {
+            1 << TcPortMode::Legacy as u8
+        } else {
+            (1 << TcPortMode::DpAlt as u8) | (1 << TcPortMode::TbtAlt as u8)
+        };
+        if live_status_mask & !expected == 0 {
+            legacy_port
+        } else {
+            !legacy_port
+        }
+    }
+}
+
 /// The public connector query returns four lanes on a non-Type-C encoder.
 // upstream: intel_tc.c intel_tc_port_max_lane_count()
 pub const fn intel_tc_port_max_lane_count(is_type_c: bool, lane_count: u8) -> u8 {
@@ -267,9 +309,13 @@ pub fn read_fia_state(io: &impl TcIo, port: TcPort) -> Result<FiaState, Error> {
         return Err(Error::Refused);
     }
     // ADL-P unconditionally initializes modular FIA, two ports per instance.
-    let instance = port.index() / 2;
-    let idx = port.index() % 2;
-    let base = if instance == 0 { 0x163000 } else { 0x16e000 };
+    let fia = tc_phy_load_fia_params(port.index() as u8, true);
+    let base = if fia.fia_index == 0 {
+        0x163000
+    } else {
+        0x16e000
+    };
+    let idx = u32::from(fia.port_index);
     // Do NOT use TCSS_DDI_STATUS_PIN_ASSIGNMENT_MASK: get_pin_assignment only
     // uses that field on display20+. Display13 still uses DFLEXPA1.
     let pin_raw = io.read32(base + 0x880)?;
@@ -739,6 +785,23 @@ mod signal_level_tests {
     #[test]
     fn source_tc_mode_hpd_and_lane_count_helpers_match_i915() {
         assert_eq!(tc_port_mode_name(TcPortMode::TbtAlt), "tbt-alt");
+        assert_eq!(
+            tc_phy_load_fia_params(3, true),
+            FiaParams {
+                fia_index: 1,
+                port_index: 1
+            }
+        );
+        assert_eq!(
+            tc_phy_load_fia_params(3, false),
+            FiaParams {
+                fia_index: 0,
+                port_index: 3
+            }
+        );
+        assert!(tc_port_fixup_legacy_flag(true, 1 << TcPortMode::DpAlt as u8) == false);
+        assert!(tc_port_fixup_legacy_flag(false, 1 << TcPortMode::Legacy as u8) == true);
+        assert!(!tc_port_fixup_legacy_flag(false, 0));
         assert_eq!(
             tc_port_power_domain(TcPort::Tc4),
             PowerDomain::PortDdiLanesTc4
