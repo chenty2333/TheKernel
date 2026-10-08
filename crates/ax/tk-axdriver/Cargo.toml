@@ -42,8 +42,9 @@ ahci = [
     "dep:axconfig",
 ]
 # Native FreeBSD AHCI translation plus the PCI frontend.
-ahci-pci = ["ahci", "bus-pci", "dep:axalloc", "dep:axklib"]
-sdhci-pci = ["block", "bus-pci", "dep:axklib", "dep:axalloc"]
+ahci-pci = ["ahci", "bus-pci", "dep:axalloc", "dep:axklib", "block-irq"]
+sdhci-pci = ["block", "bus-pci", "dep:axklib", "dep:axalloc", "block-irq"]
+block-irq = ["block", "bus-pci", "dep:axhal", "axhal/irq", "dep:axtask", "axtask/irq", "dep:spin"]
 block = ["dep:axdriver_block"]
 bus-mmio = []
 bus-pci = [

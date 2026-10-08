@@ -19,3 +19,17 @@ the registry APIs for slot/card insertion or removal, and PCI MSI/MSI-X and INTx
 completion paths are not yet wired into these controllers. Guest-side GPT
 creation, `BLKRRPART`, ext4 formatting, mount, and read/write are exercised by
 AHCI and SDHCI QEMU smoke runs.
+# PCI block completion interrupts
+
+The AHCI and SDHCI PCI frontends now admit one completion endpoint per PCI
+function/slot, preferring MSI-X, then one-message MSI, then firmware-routed
+shared INTx. Each endpoint acknowledges its device status before publishing a
+monotonic generation and invoking registered nonblocking completion notifiers.
+The block driver's `enable_irq`/`disable_irq` operations control the device
+source; status polling remains bounded fallback. SDHCI keeps signal generation
+disabled during card enumeration and synchronous command polling because the
+QEMU SDHCI INTx path loses command status when enabled during initialization;
+clients may opt in after initialization. QEMU verification observed AHCI MSI
+and SDHCI firmware-routed INTx admission, and guest partition/mkfs/read/write
+passed with polling fallback. Physical-device interrupt delivery is not
+verified.

@@ -8,7 +8,7 @@
 use core::{
     ptr,
     ptr::NonNull,
-    sync::atomic::{Ordering, fence},
+    sync::atomic::{AtomicU32, Ordering, fence},
 };
 
 use axalloc::{UsageKind, global_allocator};
@@ -20,6 +20,8 @@ use axdriver_block::sdhci::{
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::virt_to_phys;
 use log::{info, warn};
+
+use crate::block_irq::PciBlockInterrupt;
 
 const PCI_COMMAND: u8 = 0x04;
 const PCI_COMMAND_MEMORY: u16 = 0x0002;
@@ -232,9 +234,36 @@ unsafe fn free_sdma_buffer(cpu: NonNull<u8>, pages: usize) {
     global_allocator().dealloc_pages(cpu.as_ptr() as usize, pages, UsageKind::Dma);
 }
 
+struct SdhciIrqContext {
+    base: usize,
+    size: usize,
+    pending: AtomicU32,
+}
+
+fn ack_sdhci_interrupt(context: usize) -> bool {
+    // SAFETY: the PCI frontend leaks this immutable BAR/status context for the
+    // lifetime of the fixed PCI interrupt endpoint.
+    let context = unsafe { &*(context as *const SdhciIrqContext) };
+    let offset = axdriver_block::sdhci::SDHCI_INT_STATUS as usize;
+    if offset.checked_add(4).is_none_or(|end| end > context.size) {
+        return false;
+    }
+    // SAFETY: the status register is an aligned dword within the mapped BAR.
+    let status = unsafe { ((context.base + offset) as *const u32).read_volatile() };
+    if status == 0 || status == u32::MAX {
+        return false;
+    }
+    context.pending.fetch_or(status, Ordering::AcqRel);
+    // SAFETY: SDHCI_INT_STATUS is write-one-to-clear.
+    unsafe { ((context.base + offset) as *mut u32).write_volatile(status) };
+    true
+}
+
 struct SdhciWindow {
     base: NonNull<u8>,
     size: usize,
+    irq: Option<PciBlockInterrupt>,
+    irq_context: Option<&'static SdhciIrqContext>,
 }
 
 unsafe impl Send for SdhciWindow {}
@@ -278,7 +307,13 @@ impl SdhciIo for SdhciWindow {
     }
     // upstream: sdhci_pci.c sdhci_pci_read_4()
     fn read32(&mut self, offset: usize) -> u32 {
-        self.read(offset)
+        let mut value = self.read(offset);
+        if offset == axdriver_block::sdhci::SDHCI_INT_STATUS as usize {
+            if let Some(context) = self.irq_context {
+                value |= context.pending.swap(0, Ordering::AcqRel);
+            }
+        }
+        value
     }
     // upstream: sdhci_pci.c sdhci_pci_write_1()
     fn write8(&mut self, offset: usize, value: u8) {
@@ -290,11 +325,42 @@ impl SdhciIo for SdhciWindow {
     }
     // upstream: sdhci_pci.c sdhci_pci_write_4()
     fn write32(&mut self, offset: usize, value: u32) {
-        self.write(offset, value)
+        self.write(offset, value);
+        if offset == axdriver_block::sdhci::SDHCI_INT_STATUS as usize {
+            if let Some(context) = self.irq_context {
+                context.pending.fetch_and(!value, Ordering::AcqRel);
+            }
+        }
     }
     // upstream: mmc.c mmc_ms_delay()
     fn delay_us(&mut self, micros: u32) {
         axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(micros)));
+    }
+
+    fn has_interrupt(&self) -> bool {
+        self.irq.is_some()
+    }
+
+    fn interrupt_generation(&self) -> Option<u64> {
+        self.irq.as_ref().map(PciBlockInterrupt::generation)
+    }
+
+    fn wait_for_interrupt(&mut self, observed: u64, timeout_us: u64) {
+        if let Some(irq) = &self.irq {
+            let _ = irq.wait_for_generation(observed, timeout_us);
+        } else {
+            self.delay_us(timeout_us.min(u64::from(u32::MAX)) as u32);
+        }
+    }
+
+    fn install_completion_notifier(
+        &mut self,
+        notifier: Option<axdriver_block::BlockCompletionNotifier>,
+        context: usize,
+    ) -> bool {
+        self.irq
+            .as_ref()
+            .is_some_and(|irq| irq.install_completion_notifier(notifier, context))
     }
     // upstream: sdhci_pci.c sdhci_pci_read_multi_4()
     fn read_multi32(&mut self, offset: usize, values: &mut [u32]) {
@@ -340,7 +406,37 @@ fn probe_slot(
     let Some(base) = NonNull::new(mapped.as_usize() as *mut u8) else {
         return alloc::vec::Vec::new();
     };
-    let mut io = SdhciWindow { base, size };
+    let irq_context = alloc::boxed::Box::leak(alloc::boxed::Box::new(SdhciIrqContext {
+        base: base.as_ptr() as usize,
+        size,
+        pending: AtomicU32::new(0),
+    }));
+    let mut io = SdhciWindow {
+        base,
+        size,
+        irq: None,
+        irq_context: Some(irq_context),
+    };
+    // Keep a firmware-left signal mask from asserting a PCI line before the
+    // acknowledgment endpoint is installed.
+    io.write32(axdriver_block::sdhci::SDHCI_SIGNAL_ENABLE as usize, 0);
+    let irq = PciBlockInterrupt::register_slot(
+        root,
+        bdf,
+        disk_index,
+        irq_context as *const _ as usize,
+        ack_sdhci_interrupt,
+    );
+    if let Some(irq) = &irq {
+        info!(
+            "sdhci: {bdf} slot {disk_index} completion IRQ mode={:?} vector={:#x}",
+            irq.mode(),
+            irq.vector()
+        );
+    } else {
+        warn!("sdhci: {bdf} slot {disk_index} no MSI-X/MSI/INTx route; retaining polling fallback");
+    }
+    io.irq = irq;
     let capabilities = io.read32(SDHCI_CAPABILITIES as usize);
     let capabilities2 = io.read32(SDHCI_CAPABILITIES2 as usize);
     let version = (io.read16(SDHCI_HOST_VERSION as usize) & SDHCI_SPEC_VER_MASK as u16) as u8;

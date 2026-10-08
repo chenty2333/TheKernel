@@ -320,6 +320,27 @@ pub trait SdhciIo: Send + Sync {
     fn write32(&mut self, offset: usize, value: u32);
     fn delay_us(&mut self, micros: u32);
 
+    fn has_interrupt(&self) -> bool {
+        false
+    }
+
+    fn interrupt_generation(&self) -> Option<u64> {
+        None
+    }
+
+    fn wait_for_interrupt(&mut self, observed: u64, timeout_us: u64) {
+        let _ = observed;
+        self.delay_us(timeout_us.min(u64::from(u32::MAX)) as u32);
+    }
+
+    fn install_completion_notifier(
+        &mut self,
+        _notifier: Option<crate::BlockCompletionNotifier>,
+        _context: usize,
+    ) -> bool {
+        false
+    }
+
     fn read_multi32(&mut self, offset: usize, values: &mut [u32]) {
         for value in values {
             *value = self.read32(offset);
@@ -1140,20 +1161,35 @@ impl<I: SdhciIo> SdhciHost<I> {
     // upstream: sdhci.c sdhci_init() interrupt and status setup
     fn init_registers(&mut self) {
         self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
-        self.io.write32(
-            SDHCI_INT_ENABLE as usize,
-            SDHCI_INT_RESPONSE
-                | SDHCI_INT_DATA_END
-                | SDHCI_INT_SPACE_AVAIL
-                | SDHCI_INT_DATA_AVAIL
-                | SDHCI_INT_DMA_END
-                | SDHCI_INT_ERROR
-                | SDHCI_INT_CMD_ERROR_MASK
-                | SDHCI_INT_DATA_TIMEOUT
-                | SDHCI_INT_DATA_CRC
-                | SDHCI_INT_DATA_END_BIT,
-        );
+        let interrupt_mask = SDHCI_INT_RESPONSE
+            | SDHCI_INT_DATA_END
+            | SDHCI_INT_SPACE_AVAIL
+            | SDHCI_INT_DATA_AVAIL
+            | SDHCI_INT_DMA_END
+            | SDHCI_INT_ERROR
+            | SDHCI_INT_CMD_ERROR_MASK
+            | SDHCI_INT_DATA_TIMEOUT
+            | SDHCI_INT_DATA_CRC
+            | SDHCI_INT_DATA_END_BIT;
+        self.io.write32(SDHCI_INT_ENABLE as usize, interrupt_mask);
+        // Keep enumeration and synchronous command completions polling by
+        // default. Runtime clients opt into signaling through enable_irq().
         self.io.write32(SDHCI_SIGNAL_ENABLE as usize, 0);
+    }
+
+    /// Enables/disables controller signal generation while leaving status
+    /// reporting enabled for the bounded polling fallback.
+    pub fn set_interrupts_enabled(&mut self, enabled: bool) -> bool {
+        if enabled && !self.io.has_interrupt() {
+            return false;
+        }
+        let mask = if enabled {
+            self.io.read32(SDHCI_INT_ENABLE as usize)
+        } else {
+            0
+        };
+        self.io.write32(SDHCI_SIGNAL_ENABLE as usize, mask);
+        true
     }
 
     fn reset(&mut self, mask: u8) -> Result<(), SdhciError> {
@@ -1326,6 +1362,10 @@ impl<I: SdhciIo> SdhciHost<I> {
                 self.io.write32(SDHCI_INT_STATUS as usize, status & mask);
                 return Ok(status);
             }
+            // Command submission and card enumeration also run before a
+            // schedulable completion consumer exists. Keep this low-level
+            // status wait bounded and poll-driven; the same status IRQ is
+            // acknowledged/latches completion progress for runtime waiters.
             self.io.delay_us(10);
         }
         Err(SdhciError::Timeout)
@@ -2406,7 +2446,8 @@ impl<I: SdhciIo> SdhciDisk<I> {
 
     // upstream: mmc.c mmc_log_card()
     pub fn log_card(&mut self) {
-        let (card_id, serial) = format_card_id(self.cid, self.ext_csd.is_some(), self.high_capacity);
+        let (card_id, serial) =
+            format_card_id(self.cid, self.ext_csd.is_some(), self.high_capacity);
         let bus_width = self.host.bus_width();
         log::info!(
             "sdhci: card {card_id}; serial={serial}; capacity={} sectors; bus={} bit; clock={} Hz",
@@ -2589,6 +2630,42 @@ impl<I: SdhciIo> crate::BaseDriverOps for SdhciPartitionDisk<I> {
 }
 
 impl<I: SdhciIo> crate::BlockDriverOps for SdhciPartitionDisk<I> {
+    fn install_completion_notifier(
+        &mut self,
+        notifier: Option<crate::BlockCompletionNotifier>,
+        context: usize,
+    ) -> crate::DevResult {
+        if self
+            .shared
+            .lock()
+            .host
+            .io
+            .install_completion_notifier(notifier, context)
+        {
+            Ok(())
+        } else {
+            Err(crate::DevError::Unsupported)
+        }
+    }
+
+    fn enable_irq(&mut self) -> crate::DevResult {
+        if self.shared.lock().host.set_interrupts_enabled(true) {
+            Ok(())
+        } else {
+            Err(crate::DevError::Unsupported)
+        }
+    }
+
+    fn disable_irq(&mut self) -> crate::DevResult {
+        let _ = self.shared.lock().host.set_interrupts_enabled(false);
+        Ok(())
+    }
+
+    fn is_irq_enabled(&self) -> bool {
+        let mut disk = self.shared.lock();
+        disk.host.io.read32(SDHCI_SIGNAL_ENABLE as usize) != 0
+    }
+
     fn num_blocks(&self) -> u64 {
         self.sectors
     }

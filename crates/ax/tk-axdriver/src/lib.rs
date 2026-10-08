@@ -76,6 +76,8 @@ pub mod pci_resources;
 mod bus;
 mod drivers;
 mod dummy;
+#[cfg(feature = "block-irq")]
+pub mod block_irq;
 #[cfg(feature = "virtio-sound")]
 pub mod sound;
 mod structs;

@@ -21,15 +21,18 @@ use super::{
     ata::{AtaRequest, setup_register_fis},
     controller::{AhciController, AhciIo, PortState},
     regs::{
-        AHCI_CAP_64BIT, AHCI_CAP_SNCQ, AHCI_MAX_SLOTS, AHCI_P_CI, AHCI_P_CLB, AHCI_P_CLBU,
-        AHCI_P_FB, AHCI_P_FBU, AHCI_P_IS, AHCI_P_IX_TFE, AHCI_P_SACT, AHCI_P_SERR, AHCI_P_TFD,
-        AHCI_PRD_IPC, AHCI_PRD_MAX, ATA_S_ERROR,
+        AHCI_CAP_64BIT, AHCI_CAP_SNCQ, AHCI_GHC, AHCI_GHC_IE, AHCI_MAX_SLOTS, AHCI_P_CI,
+        AHCI_P_CLB, AHCI_P_CLBU, AHCI_P_FB, AHCI_P_FBU, AHCI_P_IE, AHCI_P_IS, AHCI_P_IX_CPD,
+        AHCI_P_IX_DHR, AHCI_P_IX_HBD, AHCI_P_IX_HBF, AHCI_P_IX_IF, AHCI_P_IX_OF, AHCI_P_IX_SDB,
+        AHCI_P_IX_TFE, AHCI_P_SACT, AHCI_P_SERR, AHCI_P_TFD, AHCI_PRD_IPC, AHCI_PRD_MAX,
+        ATA_S_ERROR,
     },
 };
 use crate::{
-    BlockAsyncOp, BlockCapabilities, BlockCompletion, BlockCompletionDrain, BlockCompletionOwner,
-    BlockCompletionStatus, BlockDriverOps, BlockQueueCaps, BlockQueueRequest, BlockRange,
-    BlockRequestHandle, BlockSegmentDirection, BlockSubmitReport,
+    BlockAsyncOp, BlockCapabilities, BlockCompletion, BlockCompletionDrain,
+    BlockCompletionNotifier, BlockCompletionOwner, BlockCompletionStatus, BlockDriverOps,
+    BlockQueueCaps, BlockQueueRequest, BlockRange, BlockRequestHandle, BlockSegmentDirection,
+    BlockSubmitReport,
 };
 
 const COMMAND_LIST_BYTES: usize = 32 * AHCI_MAX_SLOTS;
@@ -238,6 +241,7 @@ pub struct AhciDisk<I: AhciIo> {
     workspace_live: bool,
     async_state: AsyncState,
     next_async_handle: u64,
+    irq_enabled: bool,
 }
 
 impl<I: AhciIo> AhciDisk<I> {
@@ -283,6 +287,22 @@ impl<I: AhciIo> AhciDisk<I> {
             .write32(base + AHCI_P_FBU, (workspace.received_fis.bus >> 32) as u32);
         controller.ahci_start_fr(&port);
         controller.ahci_start(&mut port, false);
+        let irq_enabled = controller.io_mut().has_interrupt();
+        if irq_enabled {
+            controller.io_mut().write32(
+                base + AHCI_P_IE,
+                AHCI_P_IX_DHR
+                    | AHCI_P_IX_SDB
+                    | AHCI_P_IX_TFE
+                    | AHCI_P_IX_OF
+                    | AHCI_P_IX_IF
+                    | AHCI_P_IX_HBD
+                    | AHCI_P_IX_HBF
+                    | AHCI_P_IX_CPD,
+            );
+            let ghc = controller.io_mut().read32(AHCI_GHC);
+            controller.io_mut().write32(AHCI_GHC, ghc | AHCI_GHC_IE);
+        }
         if !controller.ahci_sata_phy_reset(&mut port) {
             let stopped = controller.ahci_stop_fr(&port) && controller.ahci_stop(&mut port);
             if !stopped {
@@ -309,6 +329,7 @@ impl<I: AhciIo> AhciDisk<I> {
             workspace_live: true,
             async_state: AsyncState::Idle,
             next_async_handle: 1,
+            irq_enabled,
         };
         let mut identify = [0u8; 512];
         if disk
@@ -354,7 +375,10 @@ impl<I: AhciIo> AhciDisk<I> {
             .controller
             .io_mut()
             .read32(base + super::regs::AHCI_P_SSTS);
-        let serr = self.controller.io_mut().read32(base + super::regs::AHCI_P_SERR);
+        let serr = self
+            .controller
+            .io_mut()
+            .read32(base + super::regs::AHCI_P_SERR);
         if status & super::regs::ATA_SS_DET_MASK == super::regs::ATA_SS_DET_PHY_ONLINE
             && status & super::regs::ATA_SS_SPD_MASK != super::regs::ATA_SS_SPD_NO_SPEED
             && status & super::regs::ATA_SS_IPM_MASK == super::regs::ATA_SS_IPM_ACTIVE
@@ -561,6 +585,7 @@ impl<I: AhciIo> AhciDisk<I> {
         let ncq = self.build_command(request, data_len)?;
         self.publish_command(ncq);
         for _ in 0..COMMAND_TIMEOUT_POLLS {
+            let observed = self.controller.io_mut().interrupt_generation();
             if let Some(result) = self.sample_command(ncq) {
                 if let Err(error @ AhciDiskError::DeviceError(_)) = result {
                     if !self.recover_command_error(ncq) {
@@ -570,10 +595,20 @@ impl<I: AhciIo> AhciDisk<I> {
                 }
                 return result;
             }
-            self.controller.io_mut().delay_us(POLL_DELAY_US);
+            self.wait_for_progress(observed);
         }
         let _ = self.timeout_command();
         Err(AhciDiskError::CommandTimeout)
+    }
+
+    fn wait_for_progress(&mut self, observed: Option<u64>) {
+        if let Some(observed) = observed {
+            self.controller
+                .io_mut()
+                .wait_for_interrupt(observed, u64::from(POLL_DELAY_US));
+        } else {
+            self.controller.io_mut().delay_us(POLL_DELAY_US);
+        }
     }
 
     /// FreeBSD keeps an NCQ error victim on hold while issuing READ LOG EXT,
@@ -602,6 +637,7 @@ impl<I: AhciIo> AhciDisk<I> {
         debug_assert!(!ncq);
         self.publish_command(false);
         for _ in 0..READ_LOG_TIMEOUT_POLLS {
+            let observed = self.controller.io_mut().interrupt_generation();
             if let Some(result) = self.sample_command(false) {
                 if result.is_err() {
                     return false;
@@ -613,7 +649,7 @@ impl<I: AhciIo> AhciDisk<I> {
                 let nq = status & 0x80 != 0;
                 return !nq && tag == 0;
             }
-            self.controller.io_mut().delay_us(POLL_DELAY_US);
+            self.wait_for_progress(observed);
         }
         self.timeout_command();
         false
@@ -761,6 +797,9 @@ impl<I: AhciIo> Drop for AhciDisk<I> {
         if !self.workspace_live {
             return;
         }
+        self.controller
+            .io_mut()
+            .write32(self.port.register_base() + AHCI_P_IE, 0);
         let fis_stopped = self.controller.ahci_stop_fr(&self.port);
         let command_stopped = self.controller.ahci_stop(&mut self.port);
         if fis_stopped && command_stopped {
@@ -982,14 +1021,69 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         }
     }
 
+    fn install_completion_notifier(
+        &mut self,
+        notifier: Option<BlockCompletionNotifier>,
+        context: usize,
+    ) -> DevResult {
+        if !self
+            .controller
+            .io_mut()
+            .install_completion_notifier(notifier, context)
+        {
+            return Err(DevError::Unsupported);
+        }
+        Ok(())
+    }
+
+    fn enable_irq(&mut self) -> DevResult {
+        if !self.controller.io_mut().has_interrupt() {
+            return Err(DevError::Unsupported);
+        }
+        let base = self.port.register_base();
+        self.controller.io_mut().write32(
+            base + AHCI_P_IE,
+            AHCI_P_IX_DHR
+                | AHCI_P_IX_SDB
+                | AHCI_P_IX_TFE
+                | AHCI_P_IX_OF
+                | AHCI_P_IX_IF
+                | AHCI_P_IX_HBD
+                | AHCI_P_IX_HBF
+                | AHCI_P_IX_CPD,
+        );
+        let ghc = self.controller.io_mut().read32(AHCI_GHC);
+        self.controller
+            .io_mut()
+            .write32(AHCI_GHC, ghc | AHCI_GHC_IE);
+        self.irq_enabled = true;
+        Ok(())
+    }
+
+    fn disable_irq(&mut self) -> DevResult {
+        let base = self.port.register_base();
+        self.controller.io_mut().write32(base + AHCI_P_IE, 0);
+        self.irq_enabled = false;
+        Ok(())
+    }
+
+    fn is_irq_enabled(&self) -> bool {
+        self.irq_enabled
+    }
+
+    fn handle_irq(&mut self) -> DevResult<usize> {
+        Ok(usize::from(self.reap_async()))
+    }
+
     fn wait_async_all(&mut self, handles: &[BlockRequestHandle]) -> DevResult {
         let mut failed = false;
         for handle in handles {
             loop {
                 match self.async_state {
                     AsyncState::InFlight(pending) if pending.handle == *handle => {
+                        let observed = self.controller.io_mut().interrupt_generation();
                         if !self.reap_async() {
-                            self.controller.io_mut().delay_us(POLL_DELAY_US);
+                            self.wait_for_progress(observed);
                         }
                     }
                     AsyncState::Complete(completion) if completion.handle == *handle => {
@@ -1365,6 +1459,7 @@ mod tests {
             workspace_live: true,
             async_state: AsyncState::Idle,
             next_async_handle: 1,
+            irq_enabled: false,
         };
         let mut disk = disk;
         f(&mut disk, bounce_ptr);

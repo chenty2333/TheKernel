@@ -15,6 +15,32 @@ pub trait AhciIo: Send + Sync {
     fn write32(&mut self, offset: usize, value: u32);
     /// Busy-wait for at least the supplied number of microseconds.
     fn delay_us(&mut self, micros: u32);
+
+    /// Whether the PCI binding admitted MSI-X, MSI, or routed INTx.
+    fn has_interrupt(&self) -> bool {
+        false
+    }
+
+    /// Current interrupt completion generation, when a message route exists.
+    fn interrupt_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// Wait for a bounded period for completion progress, or delay when no
+    /// task-context interrupt waiter is available.
+    fn wait_for_interrupt(&mut self, observed: u64, timeout_us: u64) {
+        let _ = observed;
+        self.delay_us(timeout_us.min(u64::from(u32::MAX)) as u32);
+    }
+
+    /// Install a bounded task-wake callback on the retained PCI endpoint.
+    fn install_completion_notifier(
+        &mut self,
+        _notifier: Option<crate::BlockCompletionNotifier>,
+        _context: usize,
+    ) -> bool {
+        false
+    }
 }
 
 /// Controller-wide state needed by the upstream setup/reset paths.

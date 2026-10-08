@@ -15,7 +15,7 @@ use alloc::string::String;
 use core::{
     ptr,
     ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 static NEXT_DISK_INDEX: AtomicUsize = AtomicUsize::new(0);
@@ -36,7 +36,7 @@ use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::virt_to_phys;
 use log::{info, warn};
 
-use crate::drivers::BusProbeResult;
+use crate::{block_irq::PciBlockInterrupt, drivers::BusProbeResult};
 
 const PCI_CLASS_STORAGE: u8 = 0x01;
 const PCI_SUBCLASS_SATA: u8 = 0x06;
@@ -54,10 +54,55 @@ const BOUNCE_PAGES: usize = 16;
 /// Driver state is concrete for static builds and type-erased by the block
 /// device enum after PCI probe.
 /// BAR-backed AHCI register window and platform delay implementation.
-#[derive(Clone, Copy)]
+struct AhciIrqContext {
+    base: usize,
+    size: usize,
+    port_status: [AtomicU32; AHCI_MAX_PORTS],
+}
+
+fn ack_ahci_interrupt(context: usize) -> bool {
+    // SAFETY: the frontend leaks the immutable BAR context for the endpoint's
+    // boot lifetime and stores only this pointer in its static IRQ slot.
+    let context = unsafe { &*(context as *const AhciIrqContext) };
+    let read = |offset: usize| {
+        if offset & 3 != 0 || offset.checked_add(4).is_none_or(|end| end > context.size) {
+            u32::MAX
+        } else {
+            // SAFETY: the mapped BAR bounds were checked and this is an aligned MMIO dword.
+            unsafe { ((context.base + offset) as *const u32).read_volatile() }
+        }
+    };
+    let write = |offset: usize, value: u32| {
+        if offset & 3 == 0 && offset.checked_add(4).is_some_and(|end| end <= context.size) {
+            // SAFETY: same validated BAR aperture; AHCI PxIS/IS are W1C status registers.
+            unsafe { ((context.base + offset) as *mut u32).write_volatile(value) };
+        }
+    };
+    let pending = read(axdriver_block::ahci::regs::AHCI_IS);
+    if pending == 0 || pending == u32::MAX {
+        return false;
+    }
+    for port in 0..AHCI_MAX_PORTS {
+        if pending & (1 << port) == 0 {
+            continue;
+        }
+        let base = AHCI_OFFSET + port * AHCI_STEP;
+        let status = read(base + axdriver_block::ahci::regs::AHCI_P_IS);
+        if status != 0 && status != u32::MAX {
+            context.port_status[port].fetch_or(status, Ordering::AcqRel);
+            write(base + axdriver_block::ahci::regs::AHCI_P_IS, status);
+        }
+    }
+    write(axdriver_block::ahci::regs::AHCI_IS, pending);
+    true
+}
+
+#[derive(Clone)]
 pub struct Window {
     base: usize,
     size: usize,
+    irq: Option<PciBlockInterrupt>,
+    irq_context: Option<&'static AhciIrqContext>,
 }
 
 impl AhciIo for Window {
@@ -67,7 +112,19 @@ impl AhciIo for Window {
         }
         // SAFETY: the PCI frontend mapped the complete memory BAR and checked
         // every register access against the assigned aperture.
-        unsafe { ((self.base + offset) as *const u32).read_volatile() }
+        let mut value = unsafe { ((self.base + offset) as *const u32).read_volatile() };
+        if let Some(context) = self.irq_context {
+            let relative = offset.checked_sub(AHCI_OFFSET);
+            if let Some(relative) = relative {
+                let port = relative / AHCI_STEP;
+                if port < AHCI_MAX_PORTS
+                    && relative % AHCI_STEP == axdriver_block::ahci::regs::AHCI_P_IS
+                {
+                    value |= context.port_status[port].swap(0, Ordering::AcqRel);
+                }
+            }
+        }
+        value
     }
 
     fn write32(&mut self, offset: usize, value: u32) {
@@ -76,10 +133,46 @@ impl AhciIo for Window {
         }
         // SAFETY: same bounded, aligned BAR aperture as `read32`.
         unsafe { ((self.base + offset) as *mut u32).write_volatile(value) };
+        if let Some(context) = self.irq_context {
+            if let Some(relative) = offset.checked_sub(AHCI_OFFSET) {
+                let port = relative / AHCI_STEP;
+                if port < AHCI_MAX_PORTS
+                    && relative % AHCI_STEP == axdriver_block::ahci::regs::AHCI_P_IS
+                {
+                    context.port_status[port].fetch_and(!value, Ordering::AcqRel);
+                }
+            }
+        }
     }
 
     fn delay_us(&mut self, micros: u32) {
         axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(micros)));
+    }
+
+    fn has_interrupt(&self) -> bool {
+        self.irq.is_some()
+    }
+
+    fn interrupt_generation(&self) -> Option<u64> {
+        self.irq.as_ref().map(PciBlockInterrupt::generation)
+    }
+
+    fn wait_for_interrupt(&mut self, observed: u64, timeout_us: u64) {
+        if let Some(irq) = &self.irq {
+            let _ = irq.wait_for_generation(observed, timeout_us);
+        } else {
+            self.delay_us(timeout_us.min(u64::from(u32::MAX)) as u32);
+        }
+    }
+
+    fn install_completion_notifier(
+        &mut self,
+        notifier: Option<axdriver_block::BlockCompletionNotifier>,
+        context: usize,
+    ) -> bool {
+        self.irq
+            .as_ref()
+            .is_some_and(|irq| irq.install_completion_notifier(notifier, context))
     }
 }
 
@@ -199,9 +292,8 @@ pub(crate) fn probe(
     let mut quirks = id_quirk.map_or(0, |entry| entry.quirks);
     let (subsystem_vendor, subsystem_device) = root.endpoint_subsystem_ids(bdf);
     if info.vendor_id == 0x197b
-        && id_quirk.is_some_and(|entry| {
-            entry.quirks & axdriver_block::ahci::regs::AHCI_Q_NOFORCE != 0
-        })
+        && id_quirk
+            .is_some_and(|entry| entry.quirks & axdriver_block::ahci::regs::AHCI_Q_NOFORCE != 0)
         && root
             .read_config_dword(bdf, 0xdc)
             .is_some_and(|value| ((value >> 24) as u8 & 0x40) == 0)
@@ -247,10 +339,48 @@ pub(crate) fn probe(
         return BusProbeResult::Claimed;
     };
     let base = mapped.as_usize();
-    let mut window = Window { base, size: bar.1 };
+    // Clear firmware-left interrupt masks before admitting a PCI IRQ route.
+    let ghc =
+        unsafe { ((base + axdriver_block::ahci::regs::AHCI_GHC) as *const u32).read_volatile() };
+    unsafe {
+        ((base + axdriver_block::ahci::regs::AHCI_GHC) as *mut u32)
+            .write_volatile(ghc & !axdriver_block::ahci::regs::AHCI_GHC_IE);
+        for port in 0..AHCI_MAX_PORTS {
+            let offset = AHCI_OFFSET + port * AHCI_STEP + AHCI_P_IE;
+            if offset.checked_add(4).is_some_and(|end| end <= bar.1) {
+                ((base + offset) as *mut u32).write_volatile(0);
+            }
+        }
+    }
+    let irq_context = alloc::boxed::Box::leak(alloc::boxed::Box::new(AhciIrqContext {
+        base,
+        size: bar.1,
+        port_status: [const { AtomicU32::new(0) }; AHCI_MAX_PORTS],
+    }));
+    let irq = PciBlockInterrupt::register(
+        root,
+        bdf,
+        irq_context as *const _ as usize,
+        ack_ahci_interrupt,
+    );
+    if let Some(irq) = &irq {
+        info!(
+            "ahci: {bdf} completion IRQ mode={:?} vector={:#x}",
+            irq.mode(),
+            irq.vector()
+        );
+    } else {
+        warn!("ahci: {bdf} no MSI-X/MSI/INTx route; retaining polling fallback");
+    }
+    let mut window = Window {
+        base,
+        size: bar.1,
+        irq,
+        irq_context: Some(irq_context),
+    };
     let caps = window.read32(axdriver_block::ahci::regs::AHCI_CAP);
     let caps2 = window.read32(axdriver_block::ahci::regs::AHCI_CAP2);
-    let mut controller = AhciController::new(window, caps, caps2, quirks);
+    let mut controller = AhciController::new(window.clone(), caps, caps2, quirks);
     if let Err(error) = controller.ahci_ctlr_reset() {
         warn!("ahci: {bdf} HBA reset failed: {error:?}");
         return BusProbeResult::Claimed;
@@ -272,7 +402,10 @@ pub(crate) fn probe(
             continue;
         }
         let port_base = AHCI_OFFSET + index * AHCI_STEP;
-        if port_base.checked_add(AHCI_STEP).is_none_or(|end| end > window.size) {
+        if port_base
+            .checked_add(AHCI_STEP)
+            .is_none_or(|end| end > window.size)
+        {
             warn!("ahci: {bdf} port {index} lies outside the mapped ABAR");
             continue;
         }
@@ -297,7 +430,7 @@ pub(crate) fn probe(
             .io_mut()
             .read32(port_base + axdriver_block::ahci::regs::AHCI_P_CMD);
         let port_controller = AhciController::new(
-            window,
+            window.clone(),
             controller.capabilities,
             controller.capabilities2,
             quirks,
