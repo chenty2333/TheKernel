@@ -829,6 +829,7 @@ impl Report {
         // synchronize after all contacts announced by the first packet have
         // been delivered; later packets carry a zero Contact Count.
         let mut next_contacts_remaining = self.mt_contacts_remaining;
+        let mut contacts_to_process = usize::MAX;
         let finish_contact_batch = if let Some(location) = self.mt_contact_count {
             if location.report_id == id {
                 let Some(count) = get_hid_data(report, location, false) else {
@@ -837,8 +838,8 @@ impl Report {
                 if count > 0 {
                     next_contacts_remaining = usize::try_from(count).unwrap_or(32).min(32);
                 }
-                let delivered = next_contacts_remaining.min(self.mt_contacts_per_report);
-                next_contacts_remaining -= delivered;
+                contacts_to_process = next_contacts_remaining.min(self.mt_contacts_per_report);
+                next_contacts_remaining -= contacts_to_process;
                 next_contacts_remaining == 0
             } else {
                 true
@@ -865,11 +866,21 @@ impl Report {
         let mut contact_confidence = [true; 256];
         let mut contact_widths = [0i32; 256];
         let mut contact_heights = [0i32; 256];
+        let mut assigned_slots = [-1i16; 256];
+        let descriptor_slots = self
+            .fields
+            .iter()
+            .filter(|field| field.id == id)
+            .filter_map(|field| field.slot)
+            .max()
+            .map_or(0, |slot| usize::from(slot) + 1)
+            .min(assigned_slots.len());
+        let slots_to_process = contacts_to_process.min(descriptor_slots);
         for f in self.fields.iter().filter(|f| f.id == id) {
             let Some(slot) = f.slot.map(usize::from) else {
                 continue;
             };
-            if slot >= contact_ids.len() {
+            if slot >= contact_ids.len() || slot >= slots_to_process {
                 continue;
             }
             let raw = extract(report, usize::from(f.bit), f.size, f.min < 0);
@@ -882,16 +893,7 @@ impl Report {
                 _ => {}
             }
         }
-        let mut assigned_slots = [-1i16; 256];
-        let descriptor_slots = self
-            .fields
-            .iter()
-            .filter(|field| field.id == id)
-            .filter_map(|field| field.slot)
-            .max()
-            .map_or(0, |slot| usize::from(slot) + 1)
-            .min(assigned_slots.len());
-        for descriptor_slot in 0..descriptor_slots {
+        for descriptor_slot in 0..slots_to_process {
             let active = contact_tips[descriptor_slot] && contact_confidence[descriptor_slot];
             let tracking_id = contact_ids[descriptor_slot];
             if active {
@@ -922,7 +924,7 @@ impl Report {
             }
         }
         let mut contact_geometry = [[0i32; 3]; 32];
-        for descriptor_slot in 0..descriptor_slots {
+        for descriptor_slot in 0..slots_to_process {
             let physical_slot = assigned_slots[descriptor_slot];
             if physical_slot < 0
                 || !contact_tips[descriptor_slot]
@@ -940,6 +942,11 @@ impl Report {
             ];
         }
         for f in self.fields.iter().filter(|f| f.id == id) {
+            if f.slot
+                .is_some_and(|slot| usize::from(slot) >= slots_to_process)
+            {
+                continue;
+            }
             match &f.kind {
                 Kind::Variable(Mapping::Key(code)) => {
                     let value = extract(report, usize::from(f.bit), f.size, f.min < 0);
@@ -998,6 +1005,11 @@ impl Report {
             self.keys.push((id, code));
         }
         for f in self.fields.iter_mut().filter(|f| f.id == id) {
+            if f.slot
+                .is_some_and(|slot| usize::from(slot) >= slots_to_process)
+            {
+                continue;
+            }
             let Kind::Variable(mapped) = f.kind else {
                 continue;
             };
@@ -1176,6 +1188,38 @@ mod tests {
         events.clear();
         assert!(parser.decode(&[1, 0, 1, 8, 70, 80], &mut events));
         assert!(triples(&events).contains(&(0, 0, 0)));
+    }
+    #[test]
+    fn hybrid_contact_batch_processes_only_the_remaining_subset() {
+        let descriptor = [
+            0x05, 0x0d, 0x09, 0x05, 0xa1, 1, // Touchpad
+            0x09, 0x54, 0x15, 0, 0x25, 10, 0x75, 8, 0x95, 1, 0x81, 2, // Contact Count
+            0x09, 0x22, 0xa1, 2, // Finger 1
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // Tip
+            0x75, 7, 0x95, 1, 0x81, 3, // Padding
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
+            0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
+            0xc0, 0x05, 0x0d, 0x09, 0x22, 0xa1, 2, // Finger 2
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, 0x75, 7, 0x95, 1, 0x81, 3,
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, 0x05, 1, 0x09, 0x30, 0x15, 0,
+            0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, 0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1,
+            0x81, 2, 0xc0, 0xc0,
+        ];
+        let mut parser = Report::parse(&descriptor).unwrap();
+        let location = parser
+            .locate_usage(ReportKind::Input, 0x0d, 0x54, 0)
+            .unwrap();
+        parser.configure_mt_contact_count(location);
+        let mut events = VecDeque::new();
+        assert!(parser.decode(&[3, 1, 7, 50, 60, 1, 8, 70, 80], &mut events));
+        assert!(!triples(&events).contains(&(0, 0, 0)));
+        events.clear();
+        assert!(parser.decode(&[0, 1, 9, 90, 95, 0, 8, 70, 80], &mut events));
+        let decoded = triples(&events);
+        assert!(decoded.contains(&(3, 0x35, 90)));
+        assert!(!decoded.contains(&(3, 0x35, 70)));
+        assert!(decoded.contains(&(0, 0, 0)));
     }
     fn pointer(absolute: bool, id: Option<u8>) -> Vec<u8> {
         let mut d = alloc::vec![0x05, 1, 0x09, 2, 0xa1, 1];
