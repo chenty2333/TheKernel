@@ -5,6 +5,10 @@
 //! Copyright (c) 2008 Alexander Motin <mav@FreeBSD.org>.
 //! SPDX-License-Identifier: BSD-2-Clause
 
+use alloc::sync::Arc;
+
+use spin::Mutex;
+
 /// Size of an SDMA bounce buffer for the specified controller boundary.
 // upstream: sdhci.h SDHCI_SDMA_BNDRY_TO_BBUFSZ()
 pub const fn sdma_bounce_buffer_size(boundary: u32) -> usize {
@@ -746,6 +750,7 @@ pub struct SdhciDisk<I: SdhciIo> {
     high_capacity: bool,
     erase_group_sectors: u32,
     ext_csd: Option<MmcExtCsd>,
+    active_partition: u8,
     read_only: bool,
 }
 
@@ -896,6 +901,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             high_capacity,
             erase_group_sectors: erase_group_sectors.max(1),
             ext_csd,
+            active_partition: 0,
             read_only: false,
         })
     }
@@ -906,6 +912,59 @@ impl<I: SdhciIo> SdhciDisk<I> {
 
     pub const fn ext_csd(&self) -> Option<MmcExtCsd> {
         self.ext_csd
+    }
+
+    // upstream: mmcsd.c mmcsd_attach() user/boot partition publication
+    pub fn into_partition_devices(
+        mut self,
+        read_only: bool,
+    ) -> alloc::vec::Vec<SdhciPartitionDisk<I>> {
+        self.read_only = read_only;
+        let metadata = self.ext_csd;
+        let shared = Arc::new(Mutex::new(self));
+        let mut partitions = alloc::vec![SdhciPartitionDisk {
+            shared: shared.clone(),
+            access: 0,
+            name: "mmcblk0",
+            sectors: metadata.map_or(shared.lock().sectors, |csd| u64::from(csd.sectors)),
+            read_only,
+        }];
+        if let Some(metadata) = metadata {
+            if metadata.boot_sectors != 0 {
+                partitions.push(SdhciPartitionDisk {
+                    shared: shared.clone(),
+                    access: 1,
+                    name: "mmcblk0boot0",
+                    sectors: u64::from(metadata.boot_sectors),
+                    read_only,
+                });
+                partitions.push(SdhciPartitionDisk {
+                    shared,
+                    access: 2,
+                    name: "mmcblk0boot1",
+                    sectors: u64::from(metadata.boot_sectors),
+                    read_only,
+                });
+            }
+        }
+        partitions
+    }
+
+    fn select_partition(&mut self, access: u8) -> Result<(), SdhciError> {
+        if access == self.active_partition {
+            return Ok(());
+        }
+        let metadata = self.ext_csd.ok_or(SdhciError::InvalidTransfer)?;
+        if access > 2 || (access != 0 && metadata.boot_sectors == 0) {
+            return Err(SdhciError::InvalidTransfer);
+        }
+        let config = (metadata.partition_config & !0x07) | access;
+        let argument = (3 << 24) | (179 << 16) | (u32::from(config) << 8);
+        self.host
+            .command(MMC_CMD_SWITCH, argument, SD_R1B, None, 0)?;
+        self.host.wait_busy()?;
+        self.active_partition = access;
+        Ok(())
     }
 
     // upstream: mmcsd.c mmcsd_rw() card-address conversion
@@ -981,6 +1040,104 @@ impl<I: SdhciIo> SdhciDisk<I> {
             self.wait_ready()?;
         }
         Ok(())
+    }
+}
+
+/// Serialized user-area or eMMC boot-area view over one SDHCI/MMC controller.
+pub struct SdhciPartitionDisk<I: SdhciIo> {
+    shared: Arc<Mutex<SdhciDisk<I>>>,
+    access: u8,
+    name: &'static str,
+    sectors: u64,
+    read_only: bool,
+}
+
+impl<I: SdhciIo> crate::BaseDriverOps for SdhciPartitionDisk<I> {
+    fn device_name(&self) -> &str {
+        self.name
+    }
+
+    fn device_type(&self) -> crate::DeviceType {
+        crate::DeviceType::Block
+    }
+}
+
+impl<I: SdhciIo> crate::BlockDriverOps for SdhciPartitionDisk<I> {
+    fn num_blocks(&self) -> u64 {
+        self.sectors
+    }
+
+    fn block_size(&self) -> usize {
+        512
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn read_block(&mut self, block: u64, output: &mut [u8]) -> crate::DevResult {
+        if !output.len().is_multiple_of(512)
+            || block
+                .checked_add((output.len() / 512) as u64)
+                .is_none_or(|end| end > self.sectors)
+        {
+            return Err(crate::DevError::InvalidParam);
+        }
+        let mut disk = self.shared.lock();
+        disk.select_partition(self.access)
+            .map_err(map_sdhci_error)?;
+        for (index, chunk) in output.chunks_mut(512 * 128).enumerate() {
+            disk.transfer(block + (index * 128) as u64, chunk, false)
+                .map_err(map_sdhci_error)?;
+        }
+        Ok(())
+    }
+
+    fn write_block(&mut self, block: u64, input: &[u8]) -> crate::DevResult {
+        if self.read_only {
+            return Err(crate::DevError::Unsupported);
+        }
+        if !input.len().is_multiple_of(512)
+            || block
+                .checked_add((input.len() / 512) as u64)
+                .is_none_or(|end| end > self.sectors)
+        {
+            return Err(crate::DevError::InvalidParam);
+        }
+        let mut disk = self.shared.lock();
+        disk.select_partition(self.access)
+            .map_err(map_sdhci_error)?;
+        for (index, chunk) in input.chunks(512 * 128).enumerate() {
+            let mut write_data = alloc::vec::Vec::from(chunk);
+            disk.transfer(block + (index * 128) as u64, &mut write_data, true)
+                .map_err(map_sdhci_error)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> crate::DevResult {
+        let mut disk = self.shared.lock();
+        disk.select_partition(self.access)
+            .map_err(map_sdhci_error)?;
+        disk.wait_ready().map_err(map_sdhci_error)
+    }
+
+    fn block_capabilities(&self) -> crate::BlockCapabilities {
+        crate::BlockCapabilities {
+            flush: true,
+            discard: self.access == 0,
+            ..crate::BlockCapabilities::default()
+        }
+    }
+
+    fn discard_blocks(&mut self, range: crate::BlockRange) -> crate::DevResult {
+        if self.access != 0 {
+            return Err(crate::DevError::Unsupported);
+        }
+        let mut disk = self.shared.lock();
+        disk.select_partition(self.access)
+            .map_err(map_sdhci_error)?;
+        crate::BlockDriverOps::discard_blocks(&mut *disk, range)
     }
 }
 
@@ -1125,6 +1282,7 @@ fn map_sdhci_error(error: SdhciError) -> crate::DevError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BaseDriverOps, BlockDriverOps};
 
     struct MockIo {
         registers: [u32; 64],
@@ -1338,6 +1496,7 @@ mod tests {
             high_capacity: true,
             erase_group_sectors: 1,
             ext_csd: None,
+            active_partition: 0,
             read_only: true,
         };
         assert!(crate::BlockDriverOps::is_read_only(&disk));
@@ -1346,5 +1505,35 @@ mod tests {
             Err(crate::DevError::Unsupported)
         ));
         assert_eq!(disk.host.io_mut().command, 0);
+    }
+
+    #[test]
+    fn emmc_boot_areas_are_published_as_separate_read_only_views() {
+        let host = SdhciHost::new(MockIo::default(), 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        let disk = SdhciDisk {
+            host,
+            rca: 1,
+            sectors: 10_000,
+            high_capacity: true,
+            erase_group_sectors: 1,
+            ext_csd: Some(MmcExtCsd {
+                sectors: 10_000,
+                card_type: 0,
+                partition_config: 0,
+                partition_support: 1,
+                boot_sectors: 4096,
+                rpmb_sectors: 2048,
+                erase_group_sectors: 1024,
+            }),
+            active_partition: 0,
+            read_only: false,
+        };
+        let areas = disk.into_partition_devices(true);
+        assert_eq!(areas.len(), 3);
+        assert_eq!(areas[0].device_name(), "mmcblk0");
+        assert_eq!(areas[1].device_name(), "mmcblk0boot0");
+        assert_eq!(areas[2].device_name(), "mmcblk0boot1");
+        assert_eq!(areas[1].num_blocks(), 4096);
+        assert!(areas.iter().all(crate::BlockDriverOps::is_read_only));
     }
 }

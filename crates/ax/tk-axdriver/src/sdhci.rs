@@ -8,12 +8,9 @@
 use core::{ptr, ptr::NonNull};
 
 use axdriver_base::BaseDriverOps;
-use axdriver_block::{
-    BlockDriverOps,
-    sdhci::{
-        SDHCI_CAPABILITIES, SDHCI_CAPABILITIES2, SDHCI_HOST_VERSION, SDHCI_SPEC_VER_MASK,
-        SdhciDisk, SdhciHost, SdhciIo,
-    },
+use axdriver_block::sdhci::{
+    SDHCI_CAPABILITIES, SDHCI_CAPABILITIES2, SDHCI_HOST_VERSION, SDHCI_SPEC_VER_MASK, SdhciDisk,
+    SdhciHost, SdhciIo,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use log::{info, warn};
@@ -254,7 +251,7 @@ pub(crate) fn probe(
     let version = (io.read16(SDHCI_HOST_VERSION as usize) & SDHCI_SPEC_VER_MASK as u16) as u8;
     let quirks = quirks_for_device(info.vendor_id, info.device_id);
     let host = SdhciHost::new_with_quirks(io, capabilities, capabilities2, version, quirks);
-    let mut disk = match SdhciDisk::attach(host) {
+    let disk = match SdhciDisk::attach(host) {
         Ok(disk) => disk,
         Err(error) => {
             warn!("sdhci: {bdf} card initialization failed: {error:?}");
@@ -264,45 +261,48 @@ pub(crate) fn probe(
     let read_only = info.vendor_id == INTEL_EMMC_VID
         && info.device_id == INTEL_EMMC_DID
         && axhal::boot::command_line_value("mmc.allow_write") != Some("1");
-    disk.set_read_only(read_only);
+    let partitions = disk.into_partition_devices(read_only);
     info!(
-        "sdhci: {bdf} {:04x}:{:04x} /dev/mmcblk0 blocks={} read_only={read_only}",
+        "sdhci: {bdf} {:04x}:{:04x} published {} MMC block areas read_only={read_only}",
         info.vendor_id,
         info.device_id,
-        disk.num_blocks()
+        partitions.len()
     );
 
     let mut devices = alloc::vec::Vec::new();
-    #[cfg(feature = "shared-block")]
-    {
-        let name = alloc::string::String::from(disk.device_name());
-        #[cfg(feature = "dyn")]
-        let parent = crate::SharedBlockDevice::new(disk);
-        #[cfg(not(feature = "dyn"))]
-        let parent = crate::SharedBlockDevice::new(crate::StaticBlockDevice::Sdhci(
-            alloc::boxed::Box::new(disk),
-        ));
-        #[cfg(feature = "dyn")]
-        devices.push(crate::AxDeviceEnum::from_block(parent.clone()));
-        #[cfg(not(feature = "dyn"))]
-        devices.push(crate::AxDeviceEnum::Block(crate::StaticBlockDevice::Sdhci(
-            alloc::boxed::Box::new(parent.clone()),
-        )));
-        match crate::discover_gpt_partitions(&parent, &name, read_only) {
-            Ok(partitions) => {
-                devices.extend(partitions.into_iter().map(crate::AxDeviceEnum::Block))
+    for partition in partitions {
+        let _name = alloc::string::String::from(partition.device_name());
+        let _user_area = _name == "mmcblk0";
+        #[cfg(feature = "shared-block")]
+        {
+            #[cfg(feature = "dyn")]
+            let parent = crate::SharedBlockDevice::new(partition);
+            #[cfg(not(feature = "dyn"))]
+            let parent = crate::SharedBlockDevice::new(crate::StaticBlockDevice::Sdhci(
+                alloc::boxed::Box::new(partition),
+            ));
+            #[cfg(feature = "dyn")]
+            devices.push(crate::AxDeviceEnum::from_block(parent.clone()));
+            #[cfg(not(feature = "dyn"))]
+            devices.push(crate::AxDeviceEnum::Block(crate::StaticBlockDevice::Sdhci(
+                alloc::boxed::Box::new(parent.clone()),
+            )));
+            if _user_area {
+                match crate::discover_gpt_partitions(&parent, &_name, read_only) {
+                    Ok(gpt) => devices.extend(gpt.into_iter().map(crate::AxDeviceEnum::Block)),
+                    Err(error) => log::debug!("sdhci: no accepted GPT on {_name}: {error:?}"),
+                }
             }
-            Err(error) => log::debug!("sdhci: no accepted GPT on {name}: {error:?}"),
         }
-    }
-    #[cfg(not(feature = "shared-block"))]
-    {
-        #[cfg(feature = "dyn")]
-        devices.push(crate::AxDeviceEnum::from_block(disk));
-        #[cfg(not(feature = "dyn"))]
-        devices.push(crate::AxDeviceEnum::Block(crate::StaticBlockDevice::Sdhci(
-            alloc::boxed::Box::new(disk),
-        )));
+        #[cfg(not(feature = "shared-block"))]
+        {
+            #[cfg(feature = "dyn")]
+            devices.push(crate::AxDeviceEnum::from_block(partition));
+            #[cfg(not(feature = "dyn"))]
+            devices.push(crate::AxDeviceEnum::Block(crate::StaticBlockDevice::Sdhci(
+                alloc::boxed::Box::new(partition),
+            )));
+        }
     }
     if devices.is_empty() {
         BusProbeResult::Claimed

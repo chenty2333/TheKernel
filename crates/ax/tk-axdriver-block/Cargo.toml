@@ -56,6 +56,11 @@ package = "tk-axdriver-base"
 path = "../tk-axdriver-base"
 version = "0.1.0"
 
+[dependencies.spin]
+version = "0.10"
+default-features = false
+features = ["mutex", "spin_mutex"]
+
 [dependencies.log]
 version = "0.4"
 

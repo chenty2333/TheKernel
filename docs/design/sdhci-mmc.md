@@ -20,8 +20,10 @@ FreeBSD `sdhci_devices[]` IDs and their quirk bits, but does not yet implement
 all behavior attached to those quirks, interrupt handling, full slot/card
 removal lifecycle, SDMA/ADMA2, 1.8V switching, tuning, UHS/HS200/HS400,
 boot/RPMB eMMC child devices, full quirk coverage, interrupt-driven completion,
-and the full upstream function set. Only the user-area eMMC is currently
-published; EXT_CSD partition metadata is read but not exposed as devices.
+and the full upstream function set. User-area and any advertised boot0/boot1 areas are published as separate views;
+boot area writes follow the same default-read-only policy for Intel eMMC. RPMB
+metadata is decoded but its authenticated key/frame protocol is not exposed as a
+generic block device, preventing unauthenticated writes.
 
 QEMU KVM attached `sdhci-pci` plus a `sd-card`; TheKernel enumerated
 `/dev/mmcblk0` and its GPT partition, mounted ext4, read/wrote a file, unmounted,

@@ -3244,6 +3244,7 @@ name = "tk-axdriver-block"
 version = "0.1.0"
 dependencies = [
  "log",
+ "spin 0.10.1",
  "tk-axdriver-base",
 ]
 
