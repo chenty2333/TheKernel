@@ -173,7 +173,7 @@ impl UsbBluetoothHci {
         if channel == 2 {
             if let Some(frame) = self.adapter.pop_monitor() {
                 let length = 6 + usize::from(u16::from_le_bytes([frame[4], frame[5]]));
-                if length > out.len() {
+                if length > out.len() || length > frame.len() {
                     return Err(Error::InvalidLength);
                 }
                 out[..length].copy_from_slice(&frame[..length]);
@@ -187,8 +187,10 @@ impl UsbBluetoothHci {
         self.adapter.receive_event(&out[1..1 + length])?;
         if channel == 2 {
             if let Some(frame) = self.adapter.pop_monitor() {
-                let length =
-                    (6 + usize::from(u16::from_le_bytes([frame[4], frame[5]]))).min(out.len());
+                let length = 6 + usize::from(u16::from_le_bytes([frame[4], frame[5]]));
+                if length > out.len() || length > frame.len() {
+                    return Err(Error::InvalidLength);
+                }
                 out[..length].copy_from_slice(&frame[..length]);
                 return Ok(length);
             }
@@ -214,7 +216,7 @@ impl UsbBluetoothHci {
         self.adapter.receive_acl(&out[..length])?;
         Ok(length)
     }
-    pub fn pop_monitor(&mut self) -> Option<[u8; 272]> {
+    pub fn pop_monitor(&mut self) -> Option<Vec<u8>> {
         self.adapter.pop_monitor()
     }
     pub fn monitor_ready(&self) -> bool {

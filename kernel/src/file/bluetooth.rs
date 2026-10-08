@@ -347,7 +347,12 @@ impl FileLike for HciSocket {
         let binding = binding.as_ref().ok_or(LinuxError::ENODEV)?;
         #[cfg(feature = "input")]
         if let Some(adapter) = &binding.adapter {
-            let mut packet = [0u8; 272];
+            let capacity = MAX_HCI_PACKET.checked_add(6).ok_or(AxError::InvalidInput)?;
+            let mut packet = Vec::new();
+            packet
+                .try_reserve_exact(capacity)
+                .map_err(|_| AxError::NoMemory)?;
+            packet.resize(capacity, 0);
             let length = adapter
                 .lock()
                 .receive_channel_event(binding.channel, &mut packet)

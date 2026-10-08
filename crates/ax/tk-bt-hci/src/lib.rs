@@ -10,7 +10,7 @@ extern crate alloc;
 extern crate std;
 
 mod iwmbt_fw;
-use alloc::collections::VecDeque;
+use alloc::{collections::VecDeque, vec::Vec};
 
 pub use iwmbt_fw::{
     BootParams, DeviceFamily, FirmwareError, PatchCommand, Version, VersionTlv, get_fwname,
@@ -157,7 +157,7 @@ pub struct Adapter<T> {
     user_owner: bool,
     raw_users: u16,
     monitor_users: u16,
-    monitor: VecDeque<[u8; 272]>,
+    monitor: VecDeque<Vec<u8>>,
     stats: Statistics,
 }
 
@@ -318,8 +318,12 @@ impl<T: UsbTransport> Adapter<T> {
         if self.monitor_users == 0 {
             return;
         }
-        let length = bytes.len().min(266);
-        let mut frame = [0u8; 272];
+        let length = bytes.len().min(1028);
+        let mut frame = Vec::new();
+        if frame.try_reserve_exact(6 + length).is_err() {
+            return;
+        }
+        frame.resize(6 + length, 0);
         frame[..2].copy_from_slice(&opcode.to_le_bytes());
         frame[2..4].copy_from_slice(&self.index.to_le_bytes());
         frame[4..6].copy_from_slice(&(length as u16).to_le_bytes());
@@ -329,7 +333,7 @@ impl<T: UsbTransport> Adapter<T> {
         }
         self.monitor.push_back(frame);
     }
-    pub fn pop_monitor(&mut self) -> Option<[u8; 272]> {
+    pub fn pop_monitor(&mut self) -> Option<Vec<u8>> {
         self.monitor.pop_front()
     }
     pub fn monitor_ready(&self) -> bool {
@@ -859,6 +863,34 @@ mod tests {
         adapter.open(Channel::User).unwrap();
         assert_eq!(adapter.open(Channel::Raw), Err(Error::Busy));
         assert_eq!(adapter.open(Channel::Monitor), Ok(()));
+    }
+    #[test]
+    fn monitor_preserves_maximum_sized_acl_frames() {
+        let mut adapter = Adapter::new(
+            Fake {
+                stopped: false,
+                commands: 0,
+                acl: 0,
+            },
+            7,
+        );
+        adapter.open(Channel::User).unwrap();
+        adapter.open(Channel::Monitor).unwrap();
+        adapter.set_up(true).unwrap();
+        let mut acl = vec![0u8; 1028];
+        acl[0] = 1;
+        acl[2] = 0;
+        acl[3] = 4;
+        acl[1027] = 0xaa;
+        adapter
+            .submit(Channel::User, PacketType::Acl, &acl)
+            .unwrap();
+        let frame = adapter.pop_monitor().unwrap();
+        assert_eq!(u16::from_le_bytes([frame[0], frame[1]]), 4);
+        assert_eq!(u16::from_le_bytes([frame[2], frame[3]]), 7);
+        assert_eq!(u16::from_le_bytes([frame[4], frame[5]]), 1028);
+        assert_eq!(frame.len(), 1034);
+        assert_eq!(frame[1033], 0xaa);
     }
     #[test]
     fn empty_controller_reports_no_device() {
