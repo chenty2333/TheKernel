@@ -536,18 +536,8 @@ impl DrmDevice {
                 next_framebuffer: 1,
                 vblank: 0,
                 hardware_vblank: None,
-                gamma_lut: (0..gamma_lut_size)
-                    .flat_map(|index| {
-                        let value = (index * 257) as u16;
-                        [value, value, value]
-                    })
-                    .collect(),
-                degamma_lut: (0..degamma_lut_size)
-                    .flat_map(|index| {
-                        let value = (index * 257) as u16;
-                        [value, value, value]
-                    })
-                    .collect(),
+                gamma_lut: identity_color_lut(gamma_lut_size),
+                degamma_lut: identity_color_lut(degamma_lut_size),
                 ctm: [1 << 32, 0, 0, 0, 1 << 32, 0, 0, 0, 1 << 32],
                 next_property_blob: if cursor_plane_id == 0 { 3 } else { 4 },
                 property_blobs,
@@ -1774,6 +1764,20 @@ fn default_edid(mode: Mode) -> Vec<u8> {
     edid
 }
 
+fn identity_color_lut(size: u32) -> Vec<u16> {
+    let denominator = u64::from(size.saturating_sub(1)).max(1);
+    (0..size)
+        .flat_map(|index| {
+            let value = if size <= 1 {
+                0
+            } else {
+                (u64::from(index) * u64::from(u16::MAX) / denominator) as u16
+            };
+            [value, value, value]
+        })
+        .collect()
+}
+
 fn replace_connector_edid(state: &mut DeviceState) -> DrmResult<()> {
     let edid = default_edid(state.resources.preferred_mode);
     replace_connector_edid_bytes(state, edid)
@@ -2085,6 +2089,7 @@ mod tests {
         assert_eq!(state.resources.degamma_lut_size, 131);
         assert_eq!(state.gamma_lut.len(), 256 * 3);
         assert_eq!(state.degamma_lut.len(), 131 * 3);
+        assert_eq!(state.degamma_lut.last(), Some(&u16::MAX));
         assert_eq!(
             super::super::atomic::value_with_resources(
                 &state.resources,
