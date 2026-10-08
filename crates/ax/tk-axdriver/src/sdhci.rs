@@ -267,26 +267,44 @@ impl SdhciWindow {
 }
 
 impl SdhciIo for SdhciWindow {
+    // upstream: sdhci_pci.c sdhci_pci_read_1()
     fn read8(&mut self, offset: usize) -> u8 {
         self.read(offset)
     }
+    // upstream: sdhci_pci.c sdhci_pci_read_2()
     fn read16(&mut self, offset: usize) -> u16 {
         self.read(offset)
     }
+    // upstream: sdhci_pci.c sdhci_pci_read_4()
     fn read32(&mut self, offset: usize) -> u32 {
         self.read(offset)
     }
+    // upstream: sdhci_pci.c sdhci_pci_write_1()
     fn write8(&mut self, offset: usize, value: u8) {
         self.write(offset, value)
     }
+    // upstream: sdhci_pci.c sdhci_pci_write_2()
     fn write16(&mut self, offset: usize, value: u16) {
         self.write(offset, value)
     }
+    // upstream: sdhci_pci.c sdhci_pci_write_4()
     fn write32(&mut self, offset: usize, value: u32) {
         self.write(offset, value)
     }
     fn delay_us(&mut self, micros: u32) {
         axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(micros)));
+    }
+    // upstream: sdhci_pci.c sdhci_pci_read_multi_4()
+    fn read_multi32(&mut self, offset: usize, values: &mut [u32]) {
+        for value in values {
+            *value = self.read32(offset);
+        }
+    }
+    // upstream: sdhci_pci.c sdhci_pci_write_multi_4()
+    fn write_multi32(&mut self, offset: usize, values: &[u32]) {
+        for value in values {
+            self.write32(offset, *value);
+        }
     }
 }
 
@@ -396,7 +414,7 @@ fn probe_slot(
 }
 
 /// FreeBSD `sdhci_pci_attach()` slot enumeration and resource adaptation.
-// upstream: sdhci_pci.c sdhci_pci_attach()
+// upstream: sdhci_pci.c sdhci_pci_probe() and sdhci_pci_attach()
 pub(crate) fn probe(
     root: &mut PciRoot,
     bdf: DeviceFunction,

@@ -305,6 +305,18 @@ pub trait SdhciIo: Send + Sync {
     fn write16(&mut self, offset: usize, value: u16);
     fn write32(&mut self, offset: usize, value: u32);
     fn delay_us(&mut self, micros: u32);
+
+    fn read_multi32(&mut self, offset: usize, values: &mut [u32]) {
+        for value in values {
+            *value = self.read32(offset);
+        }
+    }
+
+    fn write_multi32(&mut self, offset: usize, values: &[u32]) {
+        for value in values {
+            self.write32(offset, *value);
+        }
+    }
 }
 
 /// Error from a bounded SDHCI command or data transaction.
@@ -681,6 +693,15 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.capabilities2
     }
 
+    // upstream: sdhci.c sdhci_generic_min_freq()
+    pub const fn minimum_frequency_hz(&self) -> u32 {
+        if self.version >= SDHCI_SPEC_300 as u8 {
+            self.base_clock_hz / SDHCI_300_MAX_DIVIDER
+        } else {
+            self.base_clock_hz / SDHCI_200_MAX_DIVIDER
+        }
+    }
+
     pub const fn allows_multi_block(&self) -> bool {
         !self.single_block_only
     }
@@ -829,10 +850,10 @@ impl<I: SdhciIo> SdhciHost<I> {
                 log::warn!("sdhci: host reset failed: {error:?}");
             })?;
         }
-        self.set_power(MMC_OCR_330_340)?;
-        self.set_clock(400_000).inspect_err(|error| {
-            log::warn!("sdhci: initial 400kHz clock failed: {error:?}");
-        })?;
+        self.power_up()
+            .inspect_err(|error| {
+                log::warn!("sdhci: initial 400kHz clock failed: {error:?}");
+            })?;
         // Use the largest host timeout exponent unless a future platform
         // integration provides the per-card timeout derived from CSD/EXT_CSD.
         let timeout = if self.quirks
@@ -845,6 +866,12 @@ impl<I: SdhciIo> SdhciHost<I> {
         };
         self.io
             .write8(SDHCI_TIMEOUT_CONTROL as usize, timeout as u8);
+        self.init_registers();
+        Ok(())
+    }
+
+    // upstream: sdhci.c sdhci_init() interrupt and status setup
+    fn init_registers(&mut self) {
         self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
         self.io.write32(
             SDHCI_INT_ENABLE as usize,
@@ -860,7 +887,6 @@ impl<I: SdhciIo> SdhciHost<I> {
                 | SDHCI_INT_DATA_END_BIT,
         );
         self.io.write32(SDHCI_SIGNAL_ENABLE as usize, 0);
-        Ok(())
     }
 
     fn reset(&mut self, mask: u8) -> Result<(), SdhciError> {
@@ -888,7 +914,12 @@ impl<I: SdhciIo> SdhciHost<I> {
     }
 
     fn set_clock(&mut self, target_hz: u32) -> Result<(), SdhciError> {
-        if self.base_clock_hz == 0 || target_hz == 0 {
+        if target_hz == 0 {
+            self.io.write16(SDHCI_CLOCK_CONTROL as usize, 0);
+            self.clock_hz = 0;
+            return Ok(());
+        }
+        if self.base_clock_hz == 0 {
             return Err(SdhciError::UnsupportedClock);
         }
         self.io.write16(SDHCI_CLOCK_CONTROL as usize, 0);
@@ -925,10 +956,10 @@ impl<I: SdhciIo> SdhciHost<I> {
             self.power = 0;
             return Ok(());
         }
-        let voltage = match power {
-            MMC_OCR_LOW_VOLTAGE => SDHCI_POWER_180,
-            MMC_OCR_290_300 | MMC_OCR_300_310 => SDHCI_POWER_300,
-            MMC_OCR_320_330 | MMC_OCR_330_340 => SDHCI_POWER_330,
+        let voltage = match mmc_highest_voltage(power).and_then(|shift| 1u32.checked_shl(shift)) {
+            Some(MMC_OCR_LOW_VOLTAGE) => SDHCI_POWER_180,
+            Some(MMC_OCR_290_300 | MMC_OCR_300_310) => SDHCI_POWER_300,
+            Some(MMC_OCR_320_330 | MMC_OCR_330_340) => SDHCI_POWER_330,
             _ => return Err(SdhciError::UnsupportedClock),
         } as u8;
         self.power = power;
@@ -956,13 +987,57 @@ impl<I: SdhciIo> SdhciHost<I> {
         Ok(())
     }
 
+    // upstream: sdhci.c sdhci_generic_update_ios()
+    pub fn update_ios(
+        &mut self,
+        clock_hz: u32,
+        power_ocr: u32,
+        bus_width: u8,
+    ) -> Result<(), SdhciError> {
+        self.set_clock(clock_hz)?;
+        self.set_power(power_ocr)?;
+        self.set_bus_width(bus_width);
+        Ok(())
+    }
+
+    // upstream: mmc.c mmc_power_up()
+    pub fn power_up(&mut self) -> Result<(), SdhciError> {
+        self.set_clock(0)?;
+        self.set_power(MMC_OCR_330_340)?;
+        self.io.delay_us(1_000);
+        self.set_clock(400_000)?;
+        self.set_bus_width(1);
+        Ok(())
+    }
+
+    // upstream: mmc.c mmc_power_down()
+    pub fn power_down(&mut self) -> Result<(), SdhciError> {
+        self.set_clock(0)?;
+        self.set_power(0)?;
+        self.set_bus_width(1);
+        Ok(())
+    }
+
+    // upstream: sdhci.c sdhci_generic_intr() status sampling, adapted to polling
+    fn interrupt_status(&mut self) -> u32 {
+        let status = self.io.read32(SDHCI_INT_STATUS as usize);
+        if status == 0 || status == u32::MAX {
+            0
+        } else {
+            status
+        }
+    }
+
+    // upstream: sdhci.c sdhci_cmd_irq() error classification
     fn wait_status(&mut self, mask: u32) -> Result<u32, SdhciError> {
         for _ in 0..self.timeout_polls {
-            let status = self.io.read32(SDHCI_INT_STATUS as usize);
+            let status = self.interrupt_status();
             let errors = status & SDHCI_INT_ERROR_MASK;
             if errors != 0 {
                 self.io.write32(SDHCI_INT_STATUS as usize, status);
-                return Err(SdhciError::Controller(errors));
+                return Err(classify_command_interrupt(status)
+                    .or_else(|| classify_data_interrupt(status))
+                    .unwrap_or(SdhciError::Controller(errors)));
             }
             if status & mask != 0 {
                 self.io.write32(SDHCI_INT_STATUS as usize, status & mask);
@@ -1136,6 +1211,86 @@ impl<I: SdhciIo> SdhciHost<I> {
         Err(last_error)
     }
 
+    // upstream: sdhci.c sdhci_start_command()
+    fn start_command(&mut self, index: u8, argument: u32, flags: u16) {
+        self.io.write32(SDHCI_ARGUMENT as usize, argument);
+        self.io
+            .write16(SDHCI_COMMAND_FLAGS as usize, ((index as u16) << 8) | flags);
+    }
+
+    // upstream: sdhci.c sdhci_finish_command()
+    fn finish_command(&mut self, flags: u16) -> Result<SdhciResponse, SdhciError> {
+        self.wait_status(SDHCI_INT_RESPONSE)?;
+        let mut response = SdhciResponse::default();
+        if flags & SDHCI_CMD_RESP_MASK as u16 == SDHCI_CMD_RESP_LONG as u16 {
+            let mut extra = 0u32;
+            for index in 0..4 {
+                let value = self.io.read32(SDHCI_RESPONSE as usize + index * 4);
+                response.0[3 - index] = if self.quirks & SDHCI_QUIRK_DONT_SHIFT_RESPONSE != 0 {
+                    value
+                } else {
+                    (value << 8) | extra
+                };
+                extra = value >> 24;
+            }
+        } else {
+            response.0[0] = self.io.read32(SDHCI_RESPONSE as usize);
+        }
+        Ok(response)
+    }
+
+    // upstream: sdhci.c sdhci_read_block_pio()
+    fn read_block_pio(&mut self, block: &mut [u8]) {
+        for bytes in block.chunks_mut(512) {
+            let count = bytes.len().div_ceil(4);
+            let mut words = [0u32; 128];
+            self.io
+                .read_multi32(SDHCI_BUFFER as usize, &mut words[..count]);
+            for (chunk, word) in bytes.chunks_mut(4).zip(&words[..count]) {
+                let word = word.to_le_bytes();
+                chunk.copy_from_slice(&word[..chunk.len()]);
+            }
+        }
+    }
+
+    // upstream: sdhci.c sdhci_write_block_pio()
+    fn write_block_pio(&mut self, block: &[u8]) {
+        for bytes in block.chunks(512) {
+            let count = bytes.len().div_ceil(4);
+            let mut words = [0u32; 128];
+            for (word, chunk) in words[..count].iter_mut().zip(bytes.chunks(4)) {
+                let mut padded = [0u8; 4];
+                padded[..chunk.len()].copy_from_slice(chunk);
+                *word = u32::from_le_bytes(padded);
+            }
+            self.io
+                .write_multi32(SDHCI_BUFFER as usize, &words[..count]);
+        }
+    }
+
+    // upstream: sdhci.c sdhci_transfer_pio()
+    fn transfer_pio(
+        &mut self,
+        buffer: &mut [u8],
+        block_size: usize,
+        read_transfer: bool,
+    ) -> Result<(), SdhciError> {
+        for block in buffer.chunks_mut(block_size) {
+            self.wait_status(if read_transfer {
+                SDHCI_INT_DATA_AVAIL
+            } else {
+                SDHCI_INT_SPACE_AVAIL
+            })?;
+            if read_transfer {
+                self.read_block_pio(block);
+            } else {
+                self.write_block_pio(block);
+            }
+        }
+        self.wait_status(SDHCI_INT_DATA_END)?;
+        Ok(())
+    }
+
     fn command_once(
         &mut self,
         index: u8,
@@ -1155,22 +1310,11 @@ impl<I: SdhciIo> SdhciHost<I> {
                 return Err(SdhciError::InvalidTransfer);
             }
             let count = buffer.len() / block_size;
-            let mut mode = SDHCI_TRNS_BLK_CNT_EN as u16;
-            if count > 1 {
-                mode |= SDHCI_TRNS_MULTI as u16;
-            }
-            if command_flags & SDHCI_CMD_DATA as u16 != 0
-                && (matches!(
-                    index,
-                    8 | SD_ACMD_SEND_SCR
-                        | SD_ACMD_SD_STATUS
-                        | SD_CMD_READ_SINGLE
-                        | SD_CMD_READ_MULTIPLE
-                ) || matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21))
-            {
-                mode |= SDHCI_TRNS_READ as u16;
-            }
-            (Some(mode), count as u16)
+            let blocks = count as u16;
+            (
+                Some(transfer_mode_flags(index, command_flags, blocks, true)),
+                blocks,
+            )
         } else {
             (None, 0)
         };
@@ -1286,30 +1430,8 @@ impl<I: SdhciIo> SdhciHost<I> {
             self.io.write16(SDHCI_BLOCK_COUNT as usize, blocks);
             self.io.write16(SDHCI_TRANSFER_MODE as usize, mode);
         }
-        self.io.write32(SDHCI_ARGUMENT as usize, argument);
-        self.io.write16(
-            SDHCI_COMMAND_FLAGS as usize,
-            ((index as u16) << 8) | command_flags,
-        );
-        let mut response = SdhciResponse::default();
-        self.wait_status(SDHCI_INT_RESPONSE)?;
-        if command_flags & SDHCI_CMD_RESP_MASK as u16 == SDHCI_CMD_RESP_LONG as u16 {
-            // R2 response words are stored in reverse register order and the
-            // controller strips the wire CRC byte. Reconstruct the standard
-            // 128-bit response layout expected by mmc_get_bits().
-            let mut extra = 0u32;
-            for n in 0..4 {
-                let value = self.io.read32(SDHCI_RESPONSE as usize + n * 4);
-                response.0[3 - n] = if self.quirks & SDHCI_QUIRK_DONT_SHIFT_RESPONSE != 0 {
-                    value
-                } else {
-                    (value << 8) | extra
-                };
-                extra = value >> 24;
-            }
-        } else {
-            response.0[0] = self.io.read32(SDHCI_RESPONSE as usize);
-        }
+        self.start_command(index, argument, command_flags);
+        let response = self.finish_command(command_flags)?;
         if let Some(buffer) = data {
             if use_sdma || use_adma2 {
                 if use_sdma {
@@ -1333,29 +1455,7 @@ impl<I: SdhciIo> SdhciHost<I> {
                     }
                 }
             } else {
-                let mut offset = 0usize;
-                while offset < buffer.len() {
-                    self.wait_status(if read_transfer {
-                        SDHCI_INT_DATA_AVAIL
-                    } else {
-                        SDHCI_INT_SPACE_AVAIL
-                    })?;
-                    let block_end = (offset + block_size).min(buffer.len());
-                    while offset < block_end {
-                        let end = (offset + 4).min(block_end);
-                        if read_transfer {
-                            let word = self.io.read32(SDHCI_BUFFER as usize).to_le_bytes();
-                            buffer[offset..end].copy_from_slice(&word[..end - offset]);
-                        } else {
-                            let mut bytes = [0u8; 4];
-                            bytes[..end - offset].copy_from_slice(&buffer[offset..end]);
-                            self.io
-                                .write32(SDHCI_BUFFER as usize, u32::from_le_bytes(bytes));
-                        }
-                        offset = end;
-                    }
-                }
-                self.wait_status(SDHCI_INT_DATA_END)?;
+                self.transfer_pio(buffer, block_size, read_transfer)?;
             }
         }
         Ok(response)
@@ -1423,6 +1523,54 @@ fn calculate_clock_divider(base_hz: u32, target_hz: u32, version: u8) -> (u32, u
     }
 }
 
+// upstream: sdhci.c sdhci_cmd_irq()
+fn classify_command_interrupt(mask: u32) -> Option<SdhciError> {
+    if mask & SDHCI_INT_TIMEOUT != 0 {
+        Some(SdhciError::Timeout)
+    } else if mask & SDHCI_INT_CRC != 0 {
+        Some(SdhciError::Controller(mask & SDHCI_INT_CRC))
+    } else if mask & (SDHCI_INT_END_BIT | SDHCI_INT_INDEX) != 0 {
+        Some(SdhciError::Controller(
+            mask & (SDHCI_INT_END_BIT | SDHCI_INT_INDEX),
+        ))
+    } else {
+        None
+    }
+}
+
+// upstream: sdhci.c sdhci_data_irq()
+fn classify_data_interrupt(mask: u32) -> Option<SdhciError> {
+    if mask & SDHCI_INT_DATA_TIMEOUT != 0 {
+        Some(SdhciError::Timeout)
+    } else if mask & (SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT) != 0 {
+        Some(SdhciError::Controller(
+            mask & (SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT),
+        ))
+    } else {
+        None
+    }
+}
+
+// upstream: sdhci.c sdhci_set_transfer_mode() transfer flags
+fn transfer_mode_flags(index: u8, command_flags: u16, blocks: u16, has_data: bool) -> u16 {
+    if !has_data {
+        return 0;
+    }
+    let mut mode = SDHCI_TRNS_BLK_CNT_EN as u16;
+    if blocks > 1 {
+        mode |= SDHCI_TRNS_MULTI as u16;
+    }
+    if command_flags & SDHCI_CMD_DATA as u16 != 0
+        && (matches!(
+            index,
+            8 | SD_ACMD_SEND_SCR | SD_ACMD_SD_STATUS | SD_CMD_READ_SINGLE | SD_CMD_READ_MULTIPLE
+        ) || matches!(index, SD_CMD_SWITCH_FUNC | 19 | 21))
+    {
+        mode |= SDHCI_TRNS_READ as u16;
+    }
+    mode
+}
+
 // upstream: sdhci.c sdhci_start_data() ADMA2 transfer descriptors
 fn encode_adma2_descriptors(table: &mut [u8], bus_address: u32, data_len: usize) -> Option<usize> {
     if data_len == 0 {
@@ -1485,7 +1633,21 @@ const SD_DATA: u16 = SDHCI_CMD_DATA as u16;
 const SD_OCR_READY: u32 = 1 << 31;
 const SD_OCR_CCS: u32 = 1 << 30;
 const SD_OCR_VOLTAGE: u32 = 0x00ff_8000;
+const MMC_OCR_MIN_VOLTAGE_SHIFT: u32 = 7;
+const MMC_OCR_MAX_VOLTAGE_SHIFT: u32 = 23;
 const MMC_R1_STATUS_ERRORS: u32 = 0xfff9_8000;
+
+// upstream: mmc.c mmc_select_vdd()
+fn mmc_select_vdd(ocr: u32) -> u32 {
+    ocr & SD_OCR_VOLTAGE
+}
+
+// upstream: mmc.c mmc_highest_voltage()
+fn mmc_highest_voltage(ocr: u32) -> Option<u32> {
+    (MMC_OCR_MIN_VOLTAGE_SHIFT..=MMC_OCR_MAX_VOLTAGE_SHIFT)
+        .rev()
+        .find(|shift| ocr & (1 << shift) != 0)
+}
 
 // upstream: mmc.c mmc_send_if_cond()
 fn mmc_send_if_cond<I: SdhciIo>(host: &mut SdhciHost<I>) -> bool {
@@ -1513,8 +1675,9 @@ fn mmc_idle_cards<I: SdhciIo>(
     host: &mut SdhciHost<I>,
     version2: bool,
 ) -> Result<(bool, u32), SdhciError> {
+    let host_ocr = mmc_select_vdd(SD_OCR_VOLTAGE);
     for _ in 0..100 {
-        let argument = SD_OCR_VOLTAGE | if version2 { SD_OCR_CCS } else { 0 };
+        let argument = host_ocr | if version2 { SD_OCR_CCS } else { 0 };
         match mmc_send_app_op_cond(host, argument) {
             Ok(ocr) if ocr & SD_OCR_READY != 0 => return Ok((false, ocr)),
             Ok(_) => host.io.delay_us(10_000),
@@ -1523,7 +1686,7 @@ fn mmc_idle_cards<I: SdhciIo>(
     }
     host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
     for _ in 0..100 {
-        match mmc_send_op_cond(host, SD_OCR_VOLTAGE | SD_OCR_CCS) {
+        match mmc_send_op_cond(host, host_ocr | SD_OCR_CCS) {
             Ok(ocr) if ocr & SD_OCR_READY != 0 => return Ok((true, ocr)),
             Ok(_) => host.io.delay_us(10_000),
             Err(error) => return Err(error),
@@ -2292,6 +2455,35 @@ mod tests {
     }
 
     #[test]
+    fn command_data_irq_classification_and_transfer_flags_match_upstream() {
+        assert_eq!(
+            classify_command_interrupt(SDHCI_INT_TIMEOUT),
+            Some(SdhciError::Timeout)
+        );
+        assert_eq!(
+            classify_command_interrupt(SDHCI_INT_CRC),
+            Some(SdhciError::Controller(SDHCI_INT_CRC))
+        );
+        assert_eq!(
+            classify_data_interrupt(SDHCI_INT_DATA_TIMEOUT),
+            Some(SdhciError::Timeout)
+        );
+        assert_eq!(
+            classify_data_interrupt(SDHCI_INT_DATA_CRC),
+            Some(SdhciError::Controller(SDHCI_INT_DATA_CRC))
+        );
+        assert_eq!(
+            transfer_mode_flags(SD_CMD_READ_MULTIPLE, SD_DATA, 3, true),
+            (SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI | SDHCI_TRNS_READ) as u16
+        );
+        assert_eq!(
+            transfer_mode_flags(SD_CMD_WRITE_SINGLE, SD_DATA, 1, true),
+            SDHCI_TRNS_BLK_CNT_EN as u16
+        );
+        assert_eq!(transfer_mode_flags(0, SD_DATA, 0, false), 0);
+    }
+
+    #[test]
     fn adma2_descriptors_split_long_transfer_and_mark_only_last_end() {
         let mut table = [0xa5; 32];
         let count = encode_adma2_descriptors(&mut table, 0x1000, 65_536 + 512).unwrap();
@@ -2313,6 +2505,32 @@ mod tests {
         assert_eq!(calculate_clock_divider(50_000_000, 400_000, 1), (128, 64));
         assert_eq!(calculate_clock_divider(50_000_000, 400_000, 2), (126, 63));
         assert_eq!(calculate_clock_divider(50_000_000, 50_000_000, 3), (1, 0));
+        let old = SdhciHost::new(MockIo::default(), 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 1);
+        let v3 = SdhciHost::new(MockIo::default(), 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 2);
+        assert_eq!(
+            old.minimum_frequency_hz(),
+            50_000_000 / SDHCI_200_MAX_DIVIDER
+        );
+        assert_eq!(
+            v3.minimum_frequency_hz(),
+            50_000_000 / SDHCI_300_MAX_DIVIDER
+        );
+    }
+
+    #[test]
+    fn update_ios_applies_initial_clock_power_and_bus_width() {
+        let io = MockIo::default();
+        let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        host.update_ios(400_000, MMC_OCR_330_340, 4).unwrap();
+        assert!(host.clock_hz() <= 400_000);
+        assert_eq!(
+            host.io.read8(SDHCI_POWER_CONTROL as usize),
+            (SDHCI_POWER_330 | SDHCI_POWER_ON) as u8
+        );
+        assert_ne!(
+            host.io.read8(SDHCI_HOST_CONTROL as usize) & SDHCI_CTRL_4BITBUS as u8,
+            0
+        );
     }
 
     #[test]
@@ -2348,6 +2566,13 @@ mod tests {
         );
         host.set_power(0).unwrap();
         assert_eq!(host.io.read8(SDHCI_POWER_CONTROL as usize), 0);
+    }
+
+    #[test]
+    fn mmc_ocr_selection_masks_vdd_and_prefers_highest_available_voltage() {
+        assert_eq!(mmc_select_vdd(u32::MAX), SD_OCR_VOLTAGE);
+        assert_eq!(mmc_highest_voltage((1 << 20) | (1 << 21)), Some(21));
+        assert_eq!(mmc_highest_voltage(1 << 6), None);
     }
 
     #[test]
