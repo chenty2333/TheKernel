@@ -690,23 +690,58 @@ fn adlp_get_dkl_buf_trans(request: DdiBufferTransRequest) -> DdiBufferTransTable
     }
 }
 
-/// Select display-12/13 table data using the source platform callback routing.
-pub fn intel_ddi_buf_trans_get(
-    request: DdiBufferTransRequest,
-) -> Result<DdiBufferTransTable, Error> {
-    match (request.platform, request.phy) {
-        (Platform::TigerLake, BufferPhy::Combo) => Ok(tgl_get_combo_buf_trans(request)),
-        (Platform::TigerLake, BufferPhy::Dkl) => Ok(tgl_get_dkl_buf_trans(request)),
-        (Platform::RocketLake, BufferPhy::Combo) => Ok(rkl_get_combo_buf_trans(request)),
-        (Platform::AlderLakeS, BufferPhy::Combo) => Ok(adls_get_combo_buf_trans(request)),
+/// A source callback selected once from the platform and PHY family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DdiBufferTransSelector {
+    TigerLakeCombo,
+    TigerLakeDkl,
+    RocketLakeCombo,
+    AlderLakeSCombo,
+    AlderLakePCombo,
+    AlderLakePDkl,
+}
+
+/// Select the platform callback as `intel_ddi_buf_trans_init()` does.
+// upstream: intel_ddi_buf_trans.c intel_ddi_buf_trans_init()
+pub fn intel_ddi_buf_trans_init(
+    platform: Platform,
+    phy: BufferPhy,
+) -> Result<DdiBufferTransSelector, Error> {
+    match (platform, phy) {
+        (Platform::TigerLake, BufferPhy::Combo) => Ok(DdiBufferTransSelector::TigerLakeCombo),
+        (Platform::TigerLake, BufferPhy::Dkl) => Ok(DdiBufferTransSelector::TigerLakeDkl),
+        (Platform::RocketLake, BufferPhy::Combo) => Ok(DdiBufferTransSelector::RocketLakeCombo),
+        (Platform::AlderLakeS, BufferPhy::Combo) => Ok(DdiBufferTransSelector::AlderLakeSCombo),
         (Platform::AlderLakeP | Platform::AlderLakeN, BufferPhy::Combo) => {
-            Ok(adlp_get_combo_buf_trans(request))
+            Ok(DdiBufferTransSelector::AlderLakePCombo)
         }
         (Platform::AlderLakeP | Platform::AlderLakeN, BufferPhy::Dkl) => {
-            Ok(adlp_get_dkl_buf_trans(request))
+            Ok(DdiBufferTransSelector::AlderLakePDkl)
         }
         _ => Err(Error::Refused),
     }
+}
+
+impl DdiBufferTransSelector {
+    /// Invoke the selected platform getter for this mode and connector policy.
+    pub fn get(self, request: DdiBufferTransRequest) -> DdiBufferTransTable {
+        match self {
+            Self::TigerLakeCombo => tgl_get_combo_buf_trans(request),
+            Self::TigerLakeDkl => tgl_get_dkl_buf_trans(request),
+            Self::RocketLakeCombo => rkl_get_combo_buf_trans(request),
+            Self::AlderLakeSCombo => adls_get_combo_buf_trans(request),
+            Self::AlderLakePCombo => adlp_get_combo_buf_trans(request),
+            Self::AlderLakePDkl => adlp_get_dkl_buf_trans(request),
+        }
+    }
+}
+
+/// Select display-12/13 table data using the source platform callback routing.
+// upstream: intel_ddi_buf_trans.c intel_ddi_buf_trans_get()
+pub fn intel_ddi_buf_trans_get(
+    request: DdiBufferTransRequest,
+) -> Result<DdiBufferTransTable, Error> {
+    Ok(intel_ddi_buf_trans_init(request.platform, request.phy)?.get(request))
 }
 
 /// Whether the selected table is the eDP HOBL workaround table.
