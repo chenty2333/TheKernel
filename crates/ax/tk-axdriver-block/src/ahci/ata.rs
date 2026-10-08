@@ -20,6 +20,10 @@ pub const ATA_WRITE_DMA_EXT: u8 = 0x35;
 pub const ATA_READ_FPDMA_QUEUED: u8 = 0x60;
 /// ATA WRITE FPDMA QUEUED command.
 pub const ATA_WRITE_FPDMA_QUEUED: u8 = 0x61;
+/// ATA READ LOG EXT command.
+pub const ATA_READ_LOG_EXT: u8 = 0x2f;
+/// NCQ command error log page.
+pub const ATA_LOG_NCQ_ERROR: u8 = 0x10;
 /// ATA FLUSH CACHE EXT command.
 pub const ATA_FLUSH_CACHE_EXT: u8 = 0xea;
 /// ATA DATA SET MANAGEMENT command.
@@ -52,6 +56,8 @@ pub enum AtaRequest {
         tag: u8,
         pmp_port: u8,
     },
+    /// Read the ATA NCQ error log page (one sector to the DMA buffer).
+    ReadLogExt { pmp_port: u8 },
     /// Persist the device write cache.
     FlushCacheExt { pmp_port: u8 },
     /// Submit a DSM/TRIM parameter block of whole 512-byte sectors.
@@ -170,6 +176,21 @@ pub fn setup_register_fis(
                 sectors,
                 data_transfer: true,
                 tag: Some(tag),
+            }
+        }
+        AtaRequest::ReadLogExt { pmp_port } => {
+            set_target(&mut fis, pmp_port)?;
+            fis[15] = ATA_A_4BIT as u8;
+            fis[2] = ATA_READ_LOG_EXT;
+            fis[4] = ATA_LOG_NCQ_ERROR;
+            fis[7] |= 1 << 6;
+            fis[12] = 1;
+            CommandAttributes {
+                command: ATA_READ_LOG_EXT,
+                device_reads_buffer: false,
+                sectors: 1,
+                data_transfer: true,
+                tag: None,
             }
         }
         AtaRequest::FlushCacheExt { pmp_port } => {
@@ -300,6 +321,11 @@ mod tests {
                 .0[2],
             ATA_FLUSH_CACHE_EXT
         );
+        let read_log = setup_register_fis(AtaRequest::ReadLogExt { pmp_port: 0 })
+            .unwrap()
+            .0;
+        assert_eq!(&read_log[2..5], &[ATA_READ_LOG_EXT, 0, ATA_LOG_NCQ_ERROR]);
+        assert_eq!(read_log[12], 1);
         let (fis, attrs) = setup_register_fis(AtaRequest::DsmTrim {
             parameter_sectors: 1,
             pmp_port: 0,

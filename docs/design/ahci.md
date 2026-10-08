@@ -11,17 +11,23 @@ storage requests to TheKernel's block-device interfaces.
 The header and early HBA routines are now represented by `AhciController` and
 `PortState`. `AhciDisk` owns an aligned command list/FIS/command table and a
 persistent DMA bounce buffer; it submits IDENTIFY DEVICE and LBA48 READ/WRITE
-DMA EXT through slot zero, polls CI synchronously, checks task-file errors, and
-implements `BlockDriverOps` flush. ATA FPDMA and DSM/TRIM register-FIS encoding
-is present, but NCQ queue admission and TRIM submission are not yet enabled.
+DMA EXT through slot zero, supports one split-phase async request with a
+persistent bounce buffer, checks task-file errors, and implements
+`BlockDriverOps` sync/async read-write, flush, and DSM/TRIM discard. FPDMA is
+used serially with tag zero when both HBA and IDENTIFY advertise NCQ; concurrent
+NCQ queue admission and multi-victim slot recovery remain untranslated.
 A command timeout poisons the disk; the persistent workspace is retained until
 port shutdown proves DMA stopped, and is leaked if shutdown cannot prove it.
 
 The initial PCI binding lives in `tk-axdriver/src/ahci.rs`: it matches PCI
-class/subclass/prog-if, enables memory and bus mastering, maps ABAR (BAR5),
-resets the HBA, and publishes the first identified ATA disk. AHCI is selected
-by the `tk-axdriver` default feature. Remaining porting work includes the full
-FreeBSD PCI ID/quirk table, every port/device publication, MSI/MSI-X routing,
-CAM CCB/SCSI translation, hotplug, multi-slot scheduling/recovery, and NCQ/TRIM
-submission. The PCI path has only been compiled so far; QEMU disk read/write
+class/subclass/prog-if (and known RAID-class IDs), enables memory and bus
+mastering, maps ABAR (BAR5 or the ABAR0 quirk), resets the HBA, and publishes
+the first identified ATA disk. AHCI is selected
+by the `tk-axdriver` default feature. The complete 317-row FreeBSD PCI
+ID/revision/name/quirk table is translated in `tk-axdriver/src/ahci/pci_ids.rs`;
+`ahci_pci_attach` selects BAR0 for the ABAR0 quirk and BAR5 otherwise. Remaining
+porting work includes every port/device publication, MSI/MSI-X routing,
+enclosure management, Intel remapped NVMe, CAM CCB/SCSI translation, hotplug,
+publication of multiple disks per HBA, multi-slot scheduling/recovery, and
+concurrent NCQ submission. The PCI path has only been compiled so far; QEMU disk read/write
 acceptance still remains.

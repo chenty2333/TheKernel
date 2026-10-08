@@ -9,6 +9,8 @@
 //! MSI/MSI-X, enclosure management, Intel remapped NVMe, and vendor-specific
 //! quirk-table coverage are added in later AHCI stages.
 
+pub mod pci_ids;
+
 use core::{ptr, ptr::NonNull};
 
 use axalloc::{UsageKind, global_allocator};
@@ -30,6 +32,7 @@ use crate::drivers::BusProbeResult;
 
 const PCI_CLASS_STORAGE: u8 = 0x01;
 const PCI_SUBCLASS_SATA: u8 = 0x06;
+const PCI_SUBCLASS_RAID: u8 = 0x04;
 const PCI_PROGIF_AHCI: u8 = 0x01;
 const PCI_COMMAND: u8 = 0x04;
 const PCI_COMMAND_MEMORY: u16 = 1 << 1;
@@ -111,21 +114,37 @@ pub(crate) fn probe(
     bdf: DeviceFunction,
     info: &DeviceFunctionInfo,
 ) -> BusProbeResult {
-    if info.class != PCI_CLASS_STORAGE
-        || info.subclass != PCI_SUBCLASS_SATA
-        || info.prog_if != PCI_PROGIF_AHCI
-    {
+    if info.class != PCI_CLASS_STORAGE {
         return BusProbeResult::NotMatched;
     }
-
-    let bar = match root.bar_info(bdf, ABAR_BAR) {
+    let id_quirk = pci_ids::identify(info.vendor_id, info.device_id, info.revision);
+    let ahci_class = info.subclass == PCI_SUBCLASS_SATA && info.prog_if == PCI_PROGIF_AHCI;
+    // FreeBSD also admits known AHCI controllers that advertise RAID class.
+    if !ahci_class && !(info.subclass == PCI_SUBCLASS_RAID && id_quirk.is_some()) {
+        return BusProbeResult::NotMatched;
+    }
+    let mut quirks = id_quirk.map_or(0, |entry| entry.quirks);
+    let (subsystem_vendor, subsystem_device) = root.endpoint_subsystem_ids(bdf);
+    if info.vendor_id == 0x197b
+        && info.device_id == 0x2363
+        && subsystem_vendor == 0x1043
+        && subsystem_device == 0x81e4
+    {
+        quirks |= axdriver_block::ahci::regs::AHCI_Q_SATA1_UNIT0;
+    }
+    let bar_index = if quirks & axdriver_block::ahci::regs::AHCI_Q_ABAR0 != 0 {
+        0
+    } else {
+        ABAR_BAR
+    };
+    let bar = match root.bar_info(bdf, bar_index) {
         Ok(BarInfo::Memory { address, size, .. })
             if address != 0 && size >= ABAR_MIN_BYTES as u32 =>
         {
             (address, size as usize)
         }
         _ => {
-            warn!("ahci: {bdf} has no usable ABAR in BAR{ABAR_BAR}");
+            warn!("ahci: {bdf} has no usable ABAR in BAR{bar_index}");
             return BusProbeResult::Claimed;
         }
     };
@@ -148,7 +167,7 @@ pub(crate) fn probe(
     let mut window = Window { base, size: bar.1 };
     let caps = window.read32(axdriver_block::ahci::regs::AHCI_CAP);
     let caps2 = window.read32(axdriver_block::ahci::regs::AHCI_CAP2);
-    let mut controller = AhciController::new(window, caps, caps2, 0);
+    let mut controller = AhciController::new(window, caps, caps2, quirks);
     if let Err(error) = controller.ahci_ctlr_reset() {
         warn!("ahci: {bdf} HBA reset failed: {error:?}");
         return BusProbeResult::Claimed;
@@ -157,8 +176,11 @@ pub(crate) fn probe(
     let implemented_ports = controller.implemented_ports;
     let channel_count = usize::from(controller.num_channels).min(AHCI_MAX_PORTS);
     info!(
-        "ahci: {bdf} {:04x}:{:04x} ports={implemented_ports:#010x} channels={channel_count}",
-        info.vendor_id, info.device_id
+        "ahci: {bdf} {:04x}:{:04x} {} quirks={quirks:#x} ports={implemented_ports:#010x} \
+         channels={channel_count}",
+        info.vendor_id,
+        info.device_id,
+        id_quirk.map_or("generic AHCI", |entry| entry.name),
     );
 
     for index in 0..channel_count {
@@ -176,6 +198,10 @@ pub(crate) fn probe(
             return BusProbeResult::Claimed;
         };
         let mut port = PortState::new(index as u8);
+        port.quirks = quirks;
+        if quirks & axdriver_block::ahci::regs::AHCI_Q_SATA1_UNIT0 != 0 && index == 0 {
+            port.user_revision[0] = 1;
+        }
         port.channel_capabilities = controller
             .io_mut()
             .read32(port_base + axdriver_block::ahci::regs::AHCI_P_CMD);

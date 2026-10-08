@@ -9,6 +9,7 @@
 use core::{
     mem::ManuallyDrop,
     ptr::{self, NonNull},
+    sync::atomic::{Ordering, fence},
 };
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
@@ -17,11 +18,16 @@ use super::{
     ata::{AtaRequest, setup_register_fis},
     controller::{AhciController, AhciIo, PortState},
     regs::{
-        AHCI_CAP_64BIT, AHCI_MAX_SLOTS, AHCI_P_CI, AHCI_P_CLB, AHCI_P_CLBU, AHCI_P_FB, AHCI_P_FBU,
-        AHCI_P_IS, AHCI_P_IX_TFE, AHCI_P_SERR, AHCI_P_TFD, AHCI_PRD_IPC, AHCI_PRD_MAX, ATA_S_ERROR,
+        AHCI_CAP_64BIT, AHCI_CAP_SNCQ, AHCI_MAX_SLOTS, AHCI_P_CI, AHCI_P_CLB, AHCI_P_CLBU,
+        AHCI_P_FB, AHCI_P_FBU, AHCI_P_IS, AHCI_P_IX_TFE, AHCI_P_SACT, AHCI_P_SERR, AHCI_P_TFD,
+        AHCI_PRD_IPC, AHCI_PRD_MAX, ATA_S_ERROR,
     },
 };
-use crate::{BlockCapabilities, BlockDriverOps};
+use crate::{
+    BlockAsyncOp, BlockCapabilities, BlockCompletion, BlockCompletionDrain, BlockCompletionOwner,
+    BlockCompletionStatus, BlockDriverOps, BlockQueueCaps, BlockQueueRequest, BlockRange,
+    BlockRequestHandle, BlockSegmentDirection, BlockSubmitReport,
+};
 
 const COMMAND_LIST_BYTES: usize = 32 * AHCI_MAX_SLOTS;
 const RECEIVED_FIS_BYTES: usize = 256;
@@ -29,6 +35,7 @@ const COMMAND_TABLE_HEADER_BYTES: usize = 128;
 const PRD_BYTES: usize = 16;
 const COMMAND_TIMEOUT_POLLS: usize = 50_000;
 const POLL_DELAY_US: u32 = 100;
+const MAX_ASYNC_SEGMENTS: usize = 16;
 
 /// DMA owner for an AHCI memory region. Platform code supplies a coherent,
 /// physically addressable allocation and its release callback.
@@ -159,6 +166,9 @@ pub struct AtaGeometry {
     pub block_size: usize,
     pub blocks: u64,
     pub lba48: bool,
+    pub ncq: bool,
+    pub ncq_queue_depth: u8,
+    pub trim: bool,
 }
 
 /// AHCI disk attach/command failure.
@@ -171,9 +181,44 @@ pub enum AhciDiskError {
     IdentifyFailed,
     InvalidIdentifyData,
     CommandTimeout,
+    RequestPending,
     DeviceError(u32),
     OutOfRange,
     InvalidRequest,
+}
+
+#[derive(Clone, Copy)]
+struct AsyncSegment {
+    address: usize,
+    length: usize,
+}
+
+impl AsyncSegment {
+    const EMPTY: Self = Self {
+        address: 0,
+        length: 0,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct PendingAsync {
+    handle: BlockRequestHandle,
+    op: BlockAsyncOp,
+    bytes: usize,
+    segments: [AsyncSegment; MAX_ASYNC_SEGMENTS],
+    segment_count: usize,
+    polls: usize,
+}
+
+// Fixed-size segment metadata keeps async completion allocation-free; this
+// intentionally stores one bounded request alongside the small terminal
+// completion record.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Copy)]
+enum AsyncState {
+    Idle,
+    InFlight(PendingAsync),
+    Complete(BlockCompletion),
 }
 
 /// A single-port disk issuing serialized ATA commands through AHCI slot 0.
@@ -182,8 +227,11 @@ pub struct AhciDisk<I: AhciIo> {
     port: PortState,
     workspace: ManuallyDrop<PortWorkspace>,
     geometry: AtaGeometry,
+    ncq: bool,
     poisoned: bool,
     workspace_live: bool,
+    async_state: AsyncState,
+    next_async_handle: u64,
 }
 
 impl<I: AhciIo> AhciDisk<I> {
@@ -243,9 +291,15 @@ impl<I: AhciIo> AhciDisk<I> {
                 block_size: 512,
                 blocks: 0,
                 lba48: false,
+                ncq: false,
+                ncq_queue_depth: 0,
+                trim: false,
             },
+            ncq: false,
             poisoned: false,
             workspace_live: true,
+            async_state: AsyncState::Idle,
+            next_async_handle: 1,
         };
         let mut identify = [0u8; 512];
         if disk
@@ -256,7 +310,10 @@ impl<I: AhciIo> AhciDisk<I> {
         }
         match parse_identify(&identify) {
             Some(geometry) if disk.workspace().bounce.len >= geometry.block_size => {
-                disk.geometry = geometry
+                disk.ncq = geometry.ncq
+                    && controller_capabilities_for_ncq(disk.controller.capabilities)
+                    && disk.port.quirks & super::regs::AHCI_Q_NONCQ == 0;
+                disk.geometry = geometry;
             }
             Some(_) => return Err(disk.attach_failure(AhciDiskError::InvalidWorkspace)),
             None => return Err(disk.attach_failure(AhciDiskError::InvalidIdentifyData)),
@@ -297,9 +354,13 @@ impl<I: AhciIo> AhciDisk<I> {
         error
     }
 
-    /// Submit one ATA command through slot zero and synchronously poll CI.
-    // upstream: ahci.c ahci_execute_transaction()
-    fn execute(&mut self, request: AtaRequest, data_len: usize) -> Result<(), AhciDiskError> {
+    /// Translate one ATA request into slot-zero DMA descriptors before publication.
+    // upstream: ahci.c ahci_setup_fis() + ahci_dmasetprd()
+    fn build_command(
+        &mut self,
+        request: AtaRequest,
+        data_len: usize,
+    ) -> Result<bool, AhciDiskError> {
         if self.poisoned {
             return Err(AhciDiskError::CommandTimeout);
         }
@@ -309,8 +370,8 @@ impl<I: AhciIo> AhciDisk<I> {
             return Err(AhciDiskError::InvalidRequest);
         }
         let ws = self.workspace_mut();
-        // SAFETY: the command table and list are owned, aligned DMA regions of
-        // validated size; slot zero is the only in-flight request.
+        // SAFETY: the command table/list are owned, aligned DMA allocations;
+        // this driver admits one request at a time through slot zero.
         unsafe {
             ptr::write_bytes(ws.command_table.cpu.as_ptr(), 0, ws.command_table.len);
             ptr::copy_nonoverlapping(fis.as_ptr(), ws.command_table.cpu.as_ptr(), fis.len());
@@ -328,9 +389,9 @@ impl<I: AhciIo> AhciDisk<I> {
                     ((data_len - 1) as u32 & (AHCI_PRD_MAX as u32 - 1)) | AHCI_PRD_IPC,
                 );
             }
-            let header = ws.command_list.cpu.as_ptr() as *mut u8;
+            let header = ws.command_list.cpu.as_ptr();
             ptr::write_unaligned(
-                header.add(0) as *mut u16,
+                header as *mut u16,
                 5 | if attributes.device_reads_buffer {
                     1 << 6
                 } else {
@@ -349,22 +410,206 @@ impl<I: AhciIo> AhciDisk<I> {
         self.controller
             .io_mut()
             .write32(base + AHCI_P_SERR, u32::MAX);
+        Ok(attributes.tag.is_some())
+    }
+
+    fn publish_command(&mut self, ncq: bool) {
+        // Publish coherent command/bounce writes before handing slot zero to
+        // the HBA. The x86 platform's DMA pages are cache coherent.
+        fence(Ordering::Release);
+        let base = self.port.register_base();
+        if ncq {
+            self.controller.io_mut().write32(base + AHCI_P_SACT, 1);
+        }
         self.controller.io_mut().write32(base + AHCI_P_CI, 1);
+    }
+
+    fn sample_command(&mut self, ncq: bool) -> Option<Result<(), AhciDiskError>> {
+        let base = self.port.register_base();
+        let command_active = self.controller.io_mut().read32(base + AHCI_P_CI) & 1 != 0;
+        let ncq_active = ncq && self.controller.io_mut().read32(base + AHCI_P_SACT) & 1 != 0;
+        if command_active || ncq_active {
+            return None;
+        }
+        // The HBA clears CI/SACT only after completing DMA; order subsequent
+        // CPU reads of the persistent bounce buffer after that observation.
+        fence(Ordering::Acquire);
+        let status = self.controller.io_mut().read32(base + AHCI_P_TFD);
+        let interrupt = self.controller.io_mut().read32(base + AHCI_P_IS);
+        if status & ATA_S_ERROR != 0 || interrupt & AHCI_P_IX_TFE != 0 {
+            Some(Err(AhciDiskError::DeviceError(status)))
+        } else {
+            Some(Ok(()))
+        }
+    }
+
+    fn timeout_command(&mut self) -> bool {
+        self.poisoned = true;
+        let fis_stopped = self.controller.ahci_stop_fr(&self.port);
+        let command_stopped = self.controller.ahci_stop(&mut self.port);
+        fis_stopped && command_stopped
+    }
+
+    /// FreeBSD `ahci_execute_transaction()`'s serialized completion path.
+    // upstream: ahci.c ahci_execute_transaction()
+    fn execute(&mut self, request: AtaRequest, data_len: usize) -> Result<(), AhciDiskError> {
+        if !matches!(self.async_state, AsyncState::Idle) {
+            return Err(AhciDiskError::RequestPending);
+        }
+        let ncq = self.build_command(request, data_len)?;
+        self.publish_command(ncq);
         for _ in 0..COMMAND_TIMEOUT_POLLS {
-            if self.controller.io_mut().read32(base + AHCI_P_CI) & 1 == 0 {
-                let status = self.controller.io_mut().read32(base + AHCI_P_TFD);
-                let interrupt = self.controller.io_mut().read32(base + AHCI_P_IS);
-                if status & ATA_S_ERROR != 0 || interrupt & AHCI_P_IX_TFE != 0 {
-                    return Err(AhciDiskError::DeviceError(status));
+            if let Some(result) = self.sample_command(ncq) {
+                if let Err(error @ AhciDiskError::DeviceError(_)) = result {
+                    if !self.recover_command_error(ncq) {
+                        self.poisoned = true;
+                    }
+                    return Err(error);
                 }
-                return Ok(());
+                return result;
             }
             self.controller.io_mut().delay_us(POLL_DELAY_US);
         }
-        self.poisoned = true;
-        let _ = self.controller.ahci_stop_fr(&self.port);
-        let _ = self.controller.ahci_stop(&mut self.port);
+        let _ = self.timeout_command();
         Err(AhciDiskError::CommandTimeout)
+    }
+
+    /// FreeBSD keeps an NCQ error victim on hold while issuing READ LOG EXT,
+    /// then restarts the channel before releasing it. This driver has one slot,
+    /// so it reads the error log and reinitializes the engine before returning
+    /// the exact failed request; no unrelated queued victim exists.
+    // upstream: ahci.c ahci_process_read_log()
+    fn recover_command_error(&mut self, ncq: bool) -> bool {
+        if ncq && !self.read_ncq_error_log() {
+            return false;
+        }
+        if !self.controller.ahci_stop(&mut self.port) {
+            return false;
+        }
+        if !self.controller.ahci_clo(&self.port) {
+            return false;
+        }
+        self.controller.ahci_start(&mut self.port, false);
+        self.controller
+            .ahci_wait_ready(&self.port, 1_000, 0)
+            .is_ok()
+    }
+
+    fn read_ncq_error_log(&mut self) -> bool {
+        if self.poisoned {
+            return false;
+        }
+        let Ok(ncq) = self.build_command(AtaRequest::ReadLogExt { pmp_port: 0 }, 512) else {
+            return false;
+        };
+        debug_assert!(!ncq);
+        self.publish_command(false);
+        for _ in 0..COMMAND_TIMEOUT_POLLS {
+            if let Some(result) = self.sample_command(false) {
+                return result.is_ok();
+            }
+            self.controller.io_mut().delay_us(POLL_DELAY_US);
+        }
+        self.timeout_command();
+        false
+    }
+
+    fn copy_segments_to_bounce(&mut self, segments: &[AsyncSegment], len: usize) {
+        let mut offset = 0;
+        let bounce = self.workspace().bounce.cpu.as_ptr();
+        for segment in segments {
+            if segment.length == 0 {
+                continue;
+            }
+            // SAFETY: submission validates total length, source buffers are
+            // live for this call, and the DMA bounce range is owned by `self`.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    segment.address as *const u8,
+                    bounce.add(offset),
+                    segment.length,
+                );
+            }
+            offset += segment.length;
+        }
+        debug_assert_eq!(offset, len);
+    }
+
+    fn copy_bounce_to_segments(&mut self, pending: PendingAsync) {
+        let mut offset = 0;
+        let bounce = self.workspace().bounce.cpu.as_ptr();
+        for segment in pending.segments.iter().take(pending.segment_count) {
+            if segment.length == 0 {
+                continue;
+            }
+            // SAFETY: BlockDriverOps keeps each caller segment valid until its
+            // request handle completes; copying happens only after CI/SACT clear.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    bounce.add(offset),
+                    segment.address as *mut u8,
+                    segment.length,
+                );
+            }
+            offset += segment.length;
+        }
+        debug_assert_eq!(offset, pending.bytes);
+    }
+
+    fn reap_async(&mut self) -> bool {
+        let AsyncState::InFlight(mut pending) = self.async_state else {
+            return false;
+        };
+        if let Some(result) = self.sample_command(self.ncq && pending.op != BlockAsyncOp::Flush) {
+            let status = match result {
+                Ok(()) => {
+                    if pending.op == BlockAsyncOp::Read {
+                        self.copy_bounce_to_segments(pending);
+                    }
+                    BlockCompletionStatus::Success
+                }
+                Err(AhciDiskError::DeviceError(status)) => {
+                    let ncq = self.ncq && pending.op != BlockAsyncOp::Flush;
+                    if !self.recover_command_error(ncq) {
+                        self.poisoned = true;
+                    }
+                    BlockCompletionStatus::DeviceError(status as u8)
+                }
+                Err(_) => BlockCompletionStatus::DeviceError(0xff),
+            };
+            self.async_state = AsyncState::Complete(BlockCompletion {
+                handle: pending.handle,
+                owner: BlockCompletionOwner::Ordinary,
+                cookie: pending.handle.raw,
+                status,
+                bytes: if status == BlockCompletionStatus::Success {
+                    pending.bytes as u32
+                } else {
+                    0
+                },
+            });
+            return true;
+        }
+        pending.polls += 1;
+        if pending.polls < COMMAND_TIMEOUT_POLLS {
+            self.async_state = AsyncState::InFlight(pending);
+            return false;
+        }
+        self.timeout_command();
+        let quiesced =
+            self.controller.ahci_stop_fr(&self.port) && self.controller.ahci_stop(&mut self.port);
+        self.async_state = AsyncState::Complete(BlockCompletion {
+            handle: pending.handle,
+            owner: BlockCompletionOwner::Ordinary,
+            cookie: pending.handle.raw,
+            status: if quiesced {
+                BlockCompletionStatus::DeviceError(0xff)
+            } else {
+                BlockCompletionStatus::Quarantined
+            },
+            bytes: 0,
+        });
+        true
     }
 
     fn transfer_read(
@@ -449,7 +694,7 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         if buf.is_empty() {
             return Ok(());
         }
-        if buf.len() % self.geometry.block_size != 0 {
+        if !buf.len().is_multiple_of(self.geometry.block_size) {
             return Err(DevError::InvalidParam);
         }
         let blocks = (buf.len() / self.geometry.block_size) as u64;
@@ -471,12 +716,7 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
             }
             let sectors = u16::try_from(count / self.geometry.block_size)
                 .map_err(|_| DevError::InvalidParam)?;
-            let request = AtaRequest::DmaExt {
-                lba,
-                sectors,
-                write: true,
-                pmp_port: 0,
-            };
+            let request = self.data_request(lba, sectors, true);
             self.transfer_write(request, &buf[offset..offset + count])
                 .map_err(map_error)?;
             offset += count;
@@ -487,6 +727,174 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         Ok(())
     }
 
+    fn async_queue_caps(&self) -> Option<BlockQueueCaps> {
+        (!self.poisoned).then_some(BlockQueueCaps {
+            max_requests: 1,
+            max_descriptors: 1,
+            supports_indirect: false,
+            supports_event_idx: false,
+            default_depth: 1,
+        })
+    }
+
+    fn submit_async_batch(
+        &mut self,
+        requests: &mut [BlockQueueRequest<'_>],
+    ) -> DevResult<BlockSubmitReport> {
+        if requests.is_empty() {
+            return Ok(BlockSubmitReport::default());
+        }
+        if !matches!(self.async_state, AsyncState::Idle) {
+            return Ok(BlockSubmitReport {
+                submitted: 0,
+                bytes: 0,
+                queue_full: true,
+            });
+        }
+        let request = &mut requests[0];
+        if request.segments.len() > MAX_ASYNC_SEGMENTS {
+            return Err(DevError::InvalidParam);
+        }
+        let mut segments = [AsyncSegment::EMPTY; MAX_ASYNC_SEGMENTS];
+        let mut segment_count = 0;
+        let mut bytes = 0usize;
+        for segment in request.segments {
+            bytes = bytes
+                .checked_add(segment.len)
+                .ok_or(DevError::InvalidParam)?;
+            if segment.len != 0 {
+                if segment.addr == 0 {
+                    return Err(DevError::InvalidParam);
+                }
+                segments[segment_count] = AsyncSegment {
+                    address: segment.addr,
+                    length: segment.len,
+                };
+                segment_count += 1;
+            }
+        }
+        if bytes > self.workspace().bounce.len {
+            return Err(DevError::InvalidParam);
+        }
+        let (ata, data_len) = match request.op {
+            BlockAsyncOp::Read | BlockAsyncOp::Write => {
+                if bytes == 0 || !bytes.is_multiple_of(self.geometry.block_size) {
+                    return Err(DevError::InvalidParam);
+                }
+                let blocks = (bytes / self.geometry.block_size) as u64;
+                if request
+                    .block_id
+                    .checked_add(blocks)
+                    .is_none_or(|end| end > self.geometry.blocks)
+                {
+                    return Err(DevError::InvalidParam);
+                }
+                let direction = if request.op == BlockAsyncOp::Read {
+                    BlockSegmentDirection::DeviceToMemory
+                } else {
+                    BlockSegmentDirection::MemoryToDevice
+                };
+                if request
+                    .segments
+                    .iter()
+                    .any(|segment| segment.len != 0 && segment.direction != direction)
+                {
+                    return Err(DevError::InvalidParam);
+                }
+                let sectors = u16::try_from(blocks).map_err(|_| DevError::InvalidParam)?;
+                let ata =
+                    self.data_request(request.block_id, sectors, request.op == BlockAsyncOp::Write);
+                (ata, bytes)
+            }
+            BlockAsyncOp::Flush => {
+                if bytes != 0 {
+                    return Err(DevError::InvalidParam);
+                }
+                (AtaRequest::FlushCacheExt { pmp_port: 0 }, 0)
+            }
+        };
+        if request.op == BlockAsyncOp::Write {
+            self.copy_segments_to_bounce(&segments, bytes);
+        }
+        let ncq = self.build_command(ata, data_len).map_err(map_error)?;
+        let raw = self.next_async_handle.max(1);
+        self.next_async_handle = raw.wrapping_add(1).max(1);
+        let handle = BlockRequestHandle { raw };
+        let pending = PendingAsync {
+            handle,
+            op: request.op,
+            bytes,
+            segments,
+            segment_count,
+            polls: 0,
+        };
+        // Publish ownership before ringing CI so even an immediate completion
+        // has a valid higher-level request owner.
+        self.async_state = AsyncState::InFlight(pending);
+        self.publish_command(ncq);
+        request.handle = Some(handle);
+        Ok(BlockSubmitReport {
+            submitted: 1,
+            bytes,
+            queue_full: requests.len() > 1,
+        })
+    }
+
+    fn drain_async_completions(
+        &mut self,
+        output: &mut [BlockCompletion],
+    ) -> DevResult<BlockCompletionDrain> {
+        if output.is_empty() {
+            return Ok(BlockCompletionDrain::default());
+        }
+        self.reap_async();
+        if let AsyncState::Complete(completion) = self.async_state {
+            output[0] = completion;
+            self.async_state = AsyncState::Idle;
+            Ok(BlockCompletionDrain {
+                completed: 1,
+                continuation: false,
+            })
+        } else {
+            Ok(BlockCompletionDrain::default())
+        }
+    }
+
+    fn poll_async_complete(&mut self, budget: usize) -> DevResult<usize> {
+        if budget == 0 {
+            return Ok(0);
+        }
+        self.reap_async();
+        if matches!(self.async_state, AsyncState::Complete(_)) {
+            self.async_state = AsyncState::Idle;
+            Ok(1)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn wait_async_all(&mut self, handles: &[BlockRequestHandle]) -> DevResult {
+        let mut failed = false;
+        for handle in handles {
+            loop {
+                match self.async_state {
+                    AsyncState::InFlight(pending) if pending.handle == *handle => {
+                        if !self.reap_async() {
+                            self.controller.io_mut().delay_us(POLL_DELAY_US);
+                        }
+                    }
+                    AsyncState::Complete(completion) if completion.handle == *handle => {
+                        failed |= completion.status != BlockCompletionStatus::Success;
+                        self.async_state = AsyncState::Idle;
+                        break;
+                    }
+                    _ => return Err(DevError::InvalidParam),
+                }
+            }
+        }
+        if failed { Err(DevError::Io) } else { Ok(()) }
+    }
+
     fn flush(&mut self) -> DevResult {
         self.execute(AtaRequest::FlushCacheExt { pmp_port: 0 }, 0)
             .map_err(map_error)
@@ -495,17 +903,86 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
     fn block_capabilities(&self) -> BlockCapabilities {
         BlockCapabilities {
             flush: true,
+            discard: self.geometry.trim,
             ..BlockCapabilities::default()
         }
+    }
+
+    fn discard_blocks(&mut self, range: BlockRange) -> DevResult {
+        if !self.geometry.trim {
+            return Err(DevError::Unsupported);
+        }
+        if range
+            .start
+            .checked_add(range.blocks)
+            .is_none_or(|end| end > self.geometry.blocks)
+        {
+            return Err(DevError::InvalidParam);
+        }
+        let mut current_lba = range.start;
+        let mut remaining = range.blocks;
+        while remaining != 0 {
+            let mut payload = [0u8; 512];
+            let mut entries = 0usize;
+            while entries < 64 && remaining != 0 {
+                let sectors = remaining.min(u64::from(u16::MAX)) as u16;
+                let at = entries * 8;
+                let lba = current_lba.to_le_bytes();
+                payload[at..at + 6].copy_from_slice(&lba[..6]);
+                payload[at + 6..at + 8].copy_from_slice(&sectors.to_le_bytes());
+                current_lba = current_lba
+                    .checked_add(u64::from(sectors))
+                    .ok_or(DevError::InvalidParam)?;
+                remaining -= u64::from(sectors);
+                entries += 1;
+            }
+            // The device reads the DSM parameter list from the persistent DMA
+            // bounce buffer; its ownership outlives this synchronous command.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    self.workspace_mut().bounce.cpu.as_ptr(),
+                    payload.len(),
+                )
+            };
+            self.execute(
+                AtaRequest::DsmTrim {
+                    parameter_sectors: 1,
+                    pmp_port: 0,
+                },
+                payload.len(),
+            )
+            .map_err(map_error)?;
+        }
+        Ok(())
     }
 }
 
 impl<I: AhciIo> AhciDisk<I> {
+    fn data_request(&self, lba: u64, sectors: u16, write: bool) -> AtaRequest {
+        if self.ncq {
+            AtaRequest::Fpdma {
+                lba,
+                sectors,
+                write,
+                tag: 0,
+                pmp_port: 0,
+            }
+        } else {
+            AtaRequest::DmaExt {
+                lba,
+                sectors,
+                write,
+                pmp_port: 0,
+            }
+        }
+    }
+
     fn transfer_blocks(&mut self, block_id: u64, buf: &mut [u8], write: bool) -> DevResult {
         if buf.is_empty() {
             return Ok(());
         }
-        if buf.len() % self.geometry.block_size != 0 {
+        if !buf.len().is_multiple_of(self.geometry.block_size) {
             return Err(DevError::InvalidParam);
         }
         let blocks = (buf.len() / self.geometry.block_size) as u64;
@@ -523,12 +1000,7 @@ impl<I: AhciIo> AhciDisk<I> {
             let count = (buf.len() - offset).min(max_bytes);
             let sectors = u16::try_from(count / self.geometry.block_size)
                 .map_err(|_| DevError::InvalidParam)?;
-            let request = AtaRequest::DmaExt {
-                lba,
-                sectors,
-                write,
-                pmp_port: 0,
-            };
+            let request = self.data_request(lba, sectors, write);
             if write {
                 self.transfer_write(request, &buf[offset..offset + count])
                     .map_err(map_error)?;
@@ -543,7 +1015,11 @@ impl<I: AhciIo> AhciDisk<I> {
     }
 }
 
-/// Parses ATA IDENTIFY words into a supported LBA48 block geometry.
+const fn controller_capabilities_for_ncq(capabilities: u32) -> bool {
+    capabilities & AHCI_CAP_SNCQ != 0
+}
+
+/// Parses ATA IDENTIFY words into LBA48 geometry and advertised features.
 pub fn parse_identify(bytes: &[u8; 512]) -> Option<AtaGeometry> {
     let word = |index: usize| u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
     let lba48 = word(83) & (1 << 10) != 0;
@@ -566,10 +1042,16 @@ pub fn parse_identify(bytes: &[u8; 512]) -> Option<AtaGeometry> {
     if sector_size < 512 || !sector_size.is_power_of_two() {
         return None;
     }
+    let ncq = word(76) & (1 << 8) != 0;
+    let ncq_queue_depth = if ncq { (word(75) & 0x1f) as u8 + 1 } else { 0 };
+    let trim = word(169) & 1 != 0;
     Some(AtaGeometry {
         block_size: sector_size,
         blocks,
         lba48,
+        ncq,
+        ncq_queue_depth,
+        trim,
     })
 }
 
@@ -579,6 +1061,7 @@ fn map_error(error: AhciDiskError) -> DevError {
             DevError::InvalidParam
         }
         AhciDiskError::CommandTimeout | AhciDiskError::DeviceError(_) => DevError::Io,
+        AhciDiskError::RequestPending => DevError::ResourceBusy,
         AhciDiskError::NoDevice => DevError::Io,
         _ => DevError::BadState,
     }
@@ -586,7 +1069,10 @@ fn map_error(error: AhciDiskError) -> DevError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        super::regs::{AHCI_OFFSET, AHCI_P_CI},
+        *,
+    };
 
     #[repr(align(4096))]
     struct Page([u8; 4096]);
@@ -602,10 +1088,16 @@ mod tests {
         set_word(&mut bytes, 101, 0x1234);
         set_word(&mut bytes, 106, (1 << 14) | (1 << 12));
         set_word(&mut bytes, 117, 2048);
+        set_word(&mut bytes, 76, 1 << 8);
+        set_word(&mut bytes, 75, 7);
+        set_word(&mut bytes, 169, 1);
         let geometry = parse_identify(&bytes).unwrap();
         assert_eq!(geometry.block_size, 4096);
         assert_eq!(geometry.blocks, 0x1234_5678);
         assert!(geometry.lba48);
+        assert!(geometry.ncq);
+        assert_eq!(geometry.ncq_queue_depth, 8);
+        assert!(geometry.trim);
         set_word(&mut bytes, 83, 0);
         assert_eq!(parse_identify(&bytes), None);
     }
@@ -636,5 +1128,160 @@ mod tests {
             PortWorkspace::new(command_list, received_fis, command_table, short),
             Err(AhciDiskError::InvalidWorkspace)
         ));
+    }
+
+    struct FakeIo {
+        registers: [u32; 128],
+        writes: [(usize, u32); 32],
+        write_count: usize,
+    }
+
+    impl Default for FakeIo {
+        fn default() -> Self {
+            Self {
+                registers: [0; 128],
+                writes: [(0, 0); 32],
+                write_count: 0,
+            }
+        }
+    }
+
+    impl AhciIo for FakeIo {
+        fn read32(&mut self, offset: usize) -> u32 {
+            self.registers[offset / 4]
+        }
+
+        fn write32(&mut self, offset: usize, value: u32) {
+            self.writes[self.write_count] = (offset, value);
+            self.write_count += 1;
+            if offset == AHCI_OFFSET + super::super::regs::AHCI_P_IS
+                || offset == AHCI_OFFSET + super::super::regs::AHCI_P_SERR
+            {
+                self.registers[offset / 4] = 0;
+            } else {
+                self.registers[offset / 4] = value;
+            }
+        }
+
+        fn delay_us(&mut self, _micros: u32) {}
+    }
+
+    fn with_fake_disk(f: impl FnOnce(&mut AhciDisk<FakeIo>, *mut u8)) {
+        let mut pages = [
+            Page([0; 4096]),
+            Page([0; 4096]),
+            Page([0; 4096]),
+            Page([0; 4096]),
+        ];
+        // SAFETY: these four aligned pages remain live in this stack frame
+        // until the closure and disk teardown finish.
+        let command_list = unsafe {
+            DmaRegion::borrowed(NonNull::new(pages[0].0.as_mut_ptr()).unwrap(), 0x1000, 4096)
+        };
+        let received_fis = unsafe {
+            DmaRegion::borrowed(NonNull::new(pages[1].0.as_mut_ptr()).unwrap(), 0x2000, 4096)
+        };
+        let command_table = unsafe {
+            DmaRegion::borrowed(NonNull::new(pages[2].0.as_mut_ptr()).unwrap(), 0x3000, 4096)
+        };
+        let bounce_ptr = pages[3].0.as_mut_ptr();
+        let bounce =
+            unsafe { DmaRegion::borrowed(NonNull::new(bounce_ptr).unwrap(), 0x4000, 4096) };
+        let workspace =
+            PortWorkspace::new(command_list, received_fis, command_table, bounce).unwrap();
+        let disk = AhciDisk {
+            controller: AhciController::new(FakeIo::default(), AHCI_CAP_64BIT, 0, 0),
+            port: PortState::new(0),
+            workspace: ManuallyDrop::new(workspace),
+            geometry: AtaGeometry {
+                block_size: 512,
+                blocks: 128,
+                lba48: true,
+                ncq: false,
+                ncq_queue_depth: 0,
+                trim: false,
+            },
+            ncq: false,
+            poisoned: false,
+            workspace_live: true,
+            async_state: AsyncState::Idle,
+            next_async_handle: 1,
+        };
+        let mut disk = disk;
+        f(&mut disk, bounce_ptr);
+    }
+
+    #[test]
+    fn async_read_uses_owned_dma_until_completion_then_copies_to_caller() {
+        with_fake_disk(|disk, bounce| {
+            let mut output = [0u8; 512];
+            let segment = crate::BlockSegment::from_read_buf(&mut output);
+            let flush_segments = [];
+            let mut requests = [
+                BlockQueueRequest {
+                    op: BlockAsyncOp::Read,
+                    block_id: 3,
+                    segments: &[segment],
+                    handle: None,
+                },
+                BlockQueueRequest {
+                    op: BlockAsyncOp::Flush,
+                    block_id: 0,
+                    segments: &flush_segments,
+                    handle: None,
+                },
+            ];
+            let report = disk.submit_async_batch(&mut requests).unwrap();
+            assert_eq!(report.submitted, 1);
+            assert!(report.queue_full);
+            assert_eq!(requests[1].handle, None);
+            assert_eq!(requests[0].handle, Some(BlockRequestHandle { raw: 1 }));
+            assert_eq!(
+                disk.controller.io_mut().registers[(AHCI_OFFSET + AHCI_P_CI) / 4],
+                1
+            );
+            assert_eq!(output, [0; 512]);
+            // Simulate device DMA into the persistent bounce region and then
+            // the HBA clearing CI before task-context completion drain.
+            unsafe { ptr::write_bytes(bounce, 0x5a, 512) };
+            disk.controller.io_mut().registers[(AHCI_OFFSET + AHCI_P_CI) / 4] = 0;
+            let mut completions = [BlockCompletion {
+                handle: BlockRequestHandle::default(),
+                owner: BlockCompletionOwner::Ordinary,
+                cookie: 0,
+                status: BlockCompletionStatus::DeviceError(0),
+                bytes: 0,
+            }];
+            let drained = disk.drain_async_completions(&mut completions).unwrap();
+            assert_eq!(drained.completed, 1);
+            assert_eq!(completions[0].status, BlockCompletionStatus::Success);
+            assert_eq!(completions[0].bytes, 512);
+            assert_eq!(output, [0x5a; 512]);
+        });
+    }
+
+    #[test]
+    fn async_write_copies_before_publication_and_wait_retires_handle() {
+        with_fake_disk(|disk, bounce| {
+            let source = [0x37u8; 512];
+            let segment = crate::BlockSegment::from_write_buf(&source);
+            let mut requests = [BlockQueueRequest {
+                op: BlockAsyncOp::Write,
+                block_id: 5,
+                segments: &[segment],
+                handle: None,
+            }];
+            let report = disk.submit_async_batch(&mut requests).unwrap();
+            assert_eq!(report.submitted, 1);
+            assert_eq!(
+                disk.controller.io_mut().registers[(AHCI_OFFSET + AHCI_P_CI) / 4],
+                1
+            );
+            assert_eq!(unsafe { core::slice::from_raw_parts(bounce, 512) }, &source);
+            let handle = requests[0].handle.unwrap();
+            disk.controller.io_mut().registers[(AHCI_OFFSET + AHCI_P_CI) / 4] = 0;
+            assert!(disk.wait_async_all(&[handle]).is_ok());
+            assert!(matches!(disk.async_state, AsyncState::Idle));
+        });
     }
 }
