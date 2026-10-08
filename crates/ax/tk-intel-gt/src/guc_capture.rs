@@ -615,7 +615,7 @@ pub fn format_capture_node(
                 writeln!(
                     output,
                     "    i915-Eng-Class: {}",
-                    guc_class_to_engine_class(node.engine_class)
+                    crate::guc_ads::guc_class_to_engine_class(node.engine_class).unwrap_or(u8::MAX)
                 )
                 .map_err(|_| CaptureError::InvalidBuffer)?;
             }
@@ -678,19 +678,6 @@ pub fn format_capture_node(
         }
     }
     Ok(output)
-}
-
-/// upstream: intel_guc_fwif.h guc_class_to_engine_class().
-pub const fn guc_class_to_engine_class(guc_class: u8) -> u8 {
-    match guc_class {
-        0 => 0, // render
-        1 => 1, // video decode
-        2 => 2, // video enhancement
-        3 => 3, // blitter
-        4 => 5, // compute
-        5 => 4, // GSC/other
-        _ => u8::MAX,
-    }
 }
 
 /// Match a parsed node to a context and engine using the GuC encoded class /
