@@ -1082,7 +1082,7 @@ impl<I: SdhciIo> SdhciHost<I> {
         Err(SdhciError::Timeout)
     }
 
-    // upstream: sdhci.c sdhci_set_bus_width()
+    // Host Control bus-width bits changed by the generic IOS path.
     fn set_bus_width(&mut self, width: u8) {
         let mut control = self.io.read8(SDHCI_HOST_CONTROL as usize);
         control &= !(SDHCI_CTRL_4BITBUS | SDHCI_CTRL_8BITBUS) as u8;
@@ -1347,7 +1347,6 @@ impl<I: SdhciIo> SdhciHost<I> {
         Err(SdhciError::Timeout)
     }
 
-    // upstream: sdhci.c sdhci_card_present()
     // upstream: sdhci.c sdhci_generic_get_card_present()
     fn card_present(&mut self) -> bool {
         if self.quirks & SDHCI_QUIRK_ALL_SLOTS_NON_REMOVABLE != 0
@@ -1367,7 +1366,7 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_CARD_PRESENT != 0
     }
 
-    // upstream: mmc.c mmc_wait_for_app_cmd()
+    // CMD55 APP_CMD prefix and application command sequence.
     fn application_command(
         &mut self,
         rca: u16,
@@ -1399,7 +1398,7 @@ impl<I: SdhciIo> SdhciHost<I> {
         Ok(())
     }
 
-    // upstream: mmc.c mmc_switch()
+    // MMC CMD6 SWITCH command used by the upstream MMC routines.
     fn mmc_switch(&mut self, index: u8, value: u8) -> Result<(), SdhciError> {
         let argument = (3 << 24) | (u32::from(index) << 16) | (u32::from(value) << 8);
         self.command(MMC_CMD_SWITCH, argument, SD_R1B, None, 0)?;
@@ -2235,7 +2234,7 @@ fn mmc_test_bus_width<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> u8 {
     1
 }
 
-// upstream: mmc.c mmc_send_status()
+// MMC CMD13 status request used by the upstream card state routines.
 fn mmc_send_status<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> Result<u32, SdhciError> {
     host.command(SD_CMD_SEND_STATUS, u32::from(rca) << 16, SD_R1, None, 0)
         .map(|response| response.0[0])
@@ -2247,7 +2246,7 @@ fn mmc_set_blocklen<I: SdhciIo>(host: &mut SdhciHost<I>, length: u32) -> Result<
     Ok(())
 }
 
-// upstream: mmc.c mmc_decode_csd() capacity fields
+// CSD geometry helper used by the separate SD and MMC CSD decoders.
 /// SD card block device initialized through the generic SDHCI command path.
 pub struct SdhciDisk<I: SdhciIo> {
     host: SdhciHost<I>,
