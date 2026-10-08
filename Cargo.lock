@@ -3246,6 +3246,7 @@ dependencies = [
  "tk-axdriver-display",
  "tk-axdriver-hda",
  "tk-axdriver-input",
+ "tk-axdriver-iwx",
  "tk-axdriver-net",
  "tk-axdriver-nvme",
  "tk-axdriver-pci",

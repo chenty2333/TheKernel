@@ -165,3 +165,18 @@ cfg_if::cfg_if! {
         }
     }
 }
+
+// Appended PCI probe for Intel iwx. The full network/net80211 adapter follows.
+#[cfg(feature = "iwx")]
+pub struct IwxDriver;
+#[cfg(feature = "iwx")]
+impl DriverProbe for IwxDriver {
+    #[cfg(bus = "pci")]
+    fn probe_pci(
+        root: &mut axdriver_pci::PciRoot,
+        bdf: axdriver_pci::DeviceFunction,
+        info: &axdriver_pci::DeviceFunctionInfo,
+    ) -> BusProbeResult {
+        crate::iwx::probe(root, bdf, info)
+    }
+}

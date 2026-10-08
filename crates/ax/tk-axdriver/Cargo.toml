@@ -51,7 +51,7 @@ bus-pci = [
     "dep:axsync",
     "dep:lazyinit",
 ]
-default = ["bus-pci"]
+default = ["bus-pci", "iwx"]
 display = ["dep:axdriver_display"]
 dyn = [
     "dep:axerrno",
@@ -74,6 +74,7 @@ igc = [
     "dep:axalloc",
     "dep:axhal",
 ]
+iwx = ["net", "bus-pci", "dep:axdriver_iwx", "dep:axalloc", "dep:axhal"]
 ixgbe = [
     "net",
     "axdriver_net/ixgbe",
@@ -338,4 +339,9 @@ optional = true
 [dependencies.axdriver_dbc]
 package = "tk-axdriver-dbc"
 path = "../tk-axdriver-dbc"
+optional = true
+
+[dependencies.axdriver_iwx]
+package = "tk-axdriver-iwx"
+path = "../tk-axdriver-iwx"
 optional = true

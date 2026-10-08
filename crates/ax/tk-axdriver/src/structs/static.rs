@@ -1,5 +1,7 @@
 #[cfg(feature = "block")]
 use crate::{drivers::RegisteredStaticBlockDevice, prelude::*};
+#[cfg(feature = "net")]
+use crate::prelude::*;
 
 /// The unified static block-device type.
 ///

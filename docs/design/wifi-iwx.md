@@ -100,3 +100,8 @@ branches so the platform dispatcher can apply side effects without losing ACKs.
 Critical-temperature handling, matching time-event completion, UAPSD disable,
 session-protection completion, and station-only channel-switch recovery now
 have explicit state-policy updates.
+
+The static PCI probe chain now uses OpenBSD's complete iwx product list and
+its BZ/Wi-Fi-6E RF filter, then applies the runtime subsystem/MAC/RF table.
+Matched functions are claimed, but the full hardware-to-wlan0 attach adapter is
+still being completed.
