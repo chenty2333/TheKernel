@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 
 pub mod context;
 pub mod dmar;
+pub mod driver;
 pub mod fault;
 pub mod idpgtbl;
 pub mod iova;
@@ -37,6 +38,7 @@ pub enum Error {
     InvalidRange,
     Timeout,
     Unsupported,
+    NoDevice,
 }
 
 #[crate_interface::def_interface]
@@ -65,6 +67,7 @@ pub struct Unit {
     pub segment: u16,
     pub register_base: u64,
     pub include_all: bool,
+    pub proximity_domain: Option<u32>,
     pub scopes: Vec<OwnedScope>,
 }
 
@@ -76,11 +79,18 @@ pub struct OwnedScope {
     pub path: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReservedRegion {
     pub segment: u16,
     pub base: u64,
     pub end_inclusive: u64,
+    pub scopes: Vec<OwnedScope>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HardwareAffinity {
+    pub register_base: u64,
+    pub proximity_domain: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +99,7 @@ pub struct DmarTable {
     pub interrupt_remapping: bool,
     pub units: Vec<Unit>,
     pub reserved_regions: Vec<ReservedRegion>,
+    pub hardware_affinities: Vec<HardwareAffinity>,
 }
 
 fn le16(b: &[u8], n: usize) -> Result<u16, Error> {
@@ -128,15 +139,10 @@ impl DmarTable {
             interrupt_remapping: flags & 1 != 0,
             units: Vec::new(),
             reserved_regions: Vec::new(),
+            hardware_affinities: Vec::new(),
         };
-        let mut at = DMAR_HEADER_SIZE;
-        while at < bytes.len() {
-            let kind = le16(bytes, at)?;
-            let len = usize::from(le16(bytes, at + 2)?);
-            if len < 4 || at.checked_add(len).is_none_or(|end| end > bytes.len()) {
-                return Err(Error::InvalidStructure);
-            }
-            let record = &bytes[at..at + len];
+        crate::driver::dmar_iterate_tbl(bytes, |kind, _, record| {
+            let len = record.len();
             match kind {
                 DRHD => {
                     if len < 16 {
@@ -146,6 +152,7 @@ impl DmarTable {
                         segment: le16(record, 6)?,
                         register_base: le64(record, 8)?,
                         include_all: record[4] & 1 != 0,
+                        proximity_domain: None,
                         scopes: Vec::new(),
                     };
                     if unit.register_base == 0 || unit.register_base & 0xfff != 0 {
@@ -172,14 +179,35 @@ impl DmarTable {
                         segment: le16(record, 6)?,
                         base,
                         end_inclusive: end,
+                        scopes: Self::parse_scopes_owned(&record[24..])?,
+                    });
+                }
+                3 => {
+                    if len < 20 {
+                        return Err(Error::InvalidStructure);
+                    }
+                    table
+                        .hardware_affinities
+                        .try_reserve(1)
+                        .map_err(|_| Error::OutOfMemory)?;
+                    table.hardware_affinities.push(HardwareAffinity {
+                        register_base: le64(record, 8)?,
+                        proximity_domain: le32(record, 16)?,
                     });
                 }
                 _ => {}
             }
-            at += len;
-        }
+            Ok(true)
+        })?;
         if table.units.is_empty() {
             return Err(Error::InvalidStructure);
+        }
+        for unit in &mut table.units {
+            unit.proximity_domain = table
+                .hardware_affinities
+                .iter()
+                .find(|affinity| affinity.register_base == unit.register_base)
+                .map(|affinity| affinity.proximity_domain);
         }
         Ok(table)
     }
@@ -209,6 +237,12 @@ impl DmarTable {
             bytes = &bytes[len..];
         }
         Ok(())
+    }
+
+    fn parse_scopes_owned(bytes: &[u8]) -> Result<Vec<OwnedScope>, Error> {
+        let mut out = Vec::new();
+        Self::parse_scopes(bytes, &mut out)?;
+        Ok(out)
     }
 }
 

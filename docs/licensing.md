@@ -563,3 +563,6 @@ grant and Konstantin Belousov attribution in `tk-vtd/src/fault.rs`.
 The Intel VT-d northbridge/CPU quirk translation from FreeBSD
 `sys/x86/iommu/intel_quirks.c` retains its 2013/2015 BSD-2-Clause grant and
 Konstantin Belousov attribution in `tk-vtd/src/quirks.rs`.
+The DMAR driver/table/scope translation from FreeBSD
+`sys/x86/iommu/intel_drv.c` retains the 2013-2015 FreeBSD Foundation
+BSD-2-Clause grant and Konstantin Belousov attribution in the `tk-vtd` source.

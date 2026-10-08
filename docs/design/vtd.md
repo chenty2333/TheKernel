@@ -53,3 +53,15 @@ FreeBSD `intel_quirks.c` is mapped at 7/7 functions in `tk-vtd/src/quirks.rs`,
 including the 5400/5500 northbridge revisions and E5 MAMV cap. The Rust matcher
 accepts native PCI northbridge and CPUID leaf-1 facts; the driver initialization
 order still needs to call pre-use/post-ident hooks.
+
+FreeBSD `intel_drv.c` table/device orchestration is now represented at 35/40
+function entries. The five omitted functions are DDB-only diagnostic commands.
+The parser consumes ACPI DRHD/RMRR/RHSA structures through the iterator, retains
+RHSA proximity affinity and RMRR scope paths, and offers endpoint/bridge,
+include-all, HPET/IOAPIC, PCI path, and RMRR lookup adapters. Kernel startup now
+builds one root entry/context page per bus before unit initialization. The Rust
+`DriverState` layer is an adapter rather than a full dynamic PCI device driver.
+'''
+PY
+rustfmt --edition 2024 crates/ax/tk-vtd/src/driver.rs crates/ax/tk-vtd/src/lib.rs kernel/src/acpi/vtd.rs
+git diff --check && export THEKERNEL_STATE_DIR=/home/ava/.cache/thekernel-targets/wt-platform CARGO_BUILD_JOBS=3; cargo test -p tk-vtd --lib >/home/ava/.cache/thekernel-targets/wt-platform-vtd-driver-test.log && cargo check -p tk-kernel --features 'input nvme intel-hda watchdog-itco pmu perf-sampling bpf hwp-uclamp' --target x86_64-unknown-none >/home/ava/.cache/thekernel-targets/wt-platform-vtd-driver-check.log && git add crates/ax/tk-vtd/src/driver.rs crates/ax/tk-vtd/src/lib.rs kernel/src/acpi/vtd.rs docs/upstream-provenance.md docs/licensing.md docs/design/vtd.md && git commit -m 'vtd: translate FreeBSD Intel DMAR driver routing' && git status --short
