@@ -288,7 +288,8 @@ code includes AP beacon/response, power-save, hostap and ifqueue/BPF wrappers;
 remaining `ieee80211_proto.c` includes AP/IBSS and key-rekey/timer paths. The
 The software CCMP AES-CCM key setup, packet-number, encrypt and decrypt/MIC
 paths are translated in `crypto_ccmp.rs`; AES block operations use the RustCrypto
-`aes` crate. TKIP/WEP and BIP software engines remain unported. OpenBSD iwx
+`aes` crate. The software BIP IGTK/MMIE AES-CMAC encap/decap path is also
+translated in `crypto_bip.rs`. TKIP/WEP software engines remain unported. OpenBSD iwx
 hardware key offload covers CCMP/IGTK while its upstream driver falls back to
 net80211 software crypto for other data ciphers; that fallback is not yet wired
 to the Ethernet driver. The explicit PAE files remain with wpa_supplicant.
