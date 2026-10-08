@@ -977,7 +977,7 @@ const TGL_COLD_OFF: &[PowerWellInstance] = &[PowerWellInstance {
         PowerDomain::AuxTbt4,
         PowerDomain::AuxTbt5,
         PowerDomain::AuxTbt6,
-        PowerDomain::Init,
+        PowerDomain::TcColdOff,
     ]),
     control: None,
     id: Some(WellId::TglDispTcColdOff),
@@ -1373,7 +1373,12 @@ mod tests {
     #[test]
     fn tgl_has_tc_cold_off_and_display13_has_independent_pipe_wells() {
         let tgl = power_wells(DmcPlatform::TigerLake);
-        assert!(tgl.iter().any(|group| group.ops == WellOps::TcColdOff));
+        assert!(tgl.iter().any(|group| {
+            group.ops == WellOps::TcColdOff
+                && group.instances.iter().any(|well| {
+                    matches!(well.domains, DomainList::Set(domains) if domains.contains(&PowerDomain::TcColdOff))
+                })
+        }));
         assert!(
             tgl.iter()
                 .any(|group| group.instances.iter().any(|well| well.name == "PW_5"))
