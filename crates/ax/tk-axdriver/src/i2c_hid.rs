@@ -406,7 +406,7 @@ impl I2cInput {
         self.info.quirks
     }
 
-    // upstream: hidbus.c hidbus_get_report_info()
+    // upstream: hidbus.c hidbus_get_rdesc_info()
     pub fn report_descriptor_sizes(&self) -> [(u8, usize); 3] {
         [
             (
@@ -565,7 +565,7 @@ impl InputDriverOps for I2cInput {
         if let Some(event) = state.events.pop_front() {
             return Ok(event);
         }
-        // upstream: iichid_sampling_task() - adaptive 80/10 Hz sampling when
+        // upstream: iichid.c iichid_sampling_task() - adaptive 80/10 Hz sampling when
         // this platform cannot deliver a GPIO interrupt into the HID child.
         let now = axhal::time::monotonic_time_nanos();
         if now < state.next_sample_ns {
