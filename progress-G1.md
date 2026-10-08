@@ -17,4 +17,4 @@
 3j. TBT PLL power sequence | 部分完成 | 2e7a4151 | 增加 TBT CFGCR0/1+enable register entries，复用 i915 PLL power/lock/power-off 顺序；`cargo check -p tk-kernel --tests` 通过，测试 compile-check。
 3k. DPLL platform inventories | 部分完成 | f78ba138 | 翻译 i915 TGL/RKL/DG1/ADL-S/ADL-P/N/EHL/JSL DPLL descriptor arrays and source ordering；6 targeted tests pass.
 3l. Intel DPLL CRTC hook selection | 部分完成 | 9761878d | 翻译 `intel_dpll_init_clock_hook` 和 HSW `hsw_crtc_compute_clock` (display 12/13→HSW shared manager)；5 dpll tests pass.
-4. DDI transcoder/buffer helpers | 部分完成 | pending | 从 `intel_ddi.c` 批量翻译 TBT/MG selector、DP buffer link/stagger、idle/active wait和display12/13 FUNC_CTL builder；4 ddi tests pass. 完整DDI pre-enable/disable及kernel callsite尚未完成。
+4. DDI transcoder/buffer helpers | 部分完成 | f1082fd6 | 从 `intel_ddi.c` 批量翻译 TBT/MG selector、DP buffer link/stagger、idle/active wait和display12/13 FUNC_CTL builder；4 ddi tests pass. 完整DDI pre-enable/disable及kernel callsite尚未完成。
