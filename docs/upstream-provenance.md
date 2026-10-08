@@ -1099,3 +1099,9 @@ The kernel `PowerState` adapter exposes map-backed `get_domain()`,
 around the translated power-domain manager. Pipe-A boot sync/get and an AUX-A
 reference path exercise those APIs; connector/output call sites are not yet
 fully migrated.
+
+`tk-intel-display/src/cdclk.rs` adds source-shaped CDCLK transition predicates
+and crawl/squash midpoint calculation from Linux 7.2.3
+`drivers/gpu/drm/i915/display/intel_cdclk.c` (MIT, Copyright © 2006-2017
+Intel); see `docs/design/intel-cdclk.md` for the translated functions and
+remaining runtime adapter work.
