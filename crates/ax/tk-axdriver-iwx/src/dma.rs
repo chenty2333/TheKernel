@@ -82,39 +82,63 @@ pub struct PnvmDmaImage<R: DmaRegion> {
     pub segments: Vec<R>,
 }
 
-/// Assemble PNVM payload as one contiguous region or Gen3's address-array layout.
-// upstream: if_iwx.c iwx_pnvm_setup_fragmented() and iwx_pnvm_setup()
+/// Select contiguous or Gen3 fragmented PNVM setup according to firmware capability.
+// upstream: if_iwx.c iwx_pnvm_setup()
 pub fn setup_pnvm<A: DmaAllocator>(
     allocator: &mut A,
     pnvm: &PnvmImage,
     fragmented: bool,
 ) -> Result<PnvmDmaImage<A::Region>, DmaError> {
-    let total_size = pnvm.segments.iter().try_fold(0usize, |sum, segment| {
-        sum.checked_add(segment.len())
-            .ok_or(DmaError::RegionTooSmall)
-    })?;
+    if fragmented {
+        setup_pnvm_fragmented(allocator, pnvm)
+    } else {
+        setup_pnvm_contiguous(allocator, pnvm)
+    }
+}
+
+fn pnvm_total_size(pnvm: &PnvmImage) -> Result<usize, DmaError> {
+    let total_size = pnvm
+        .segments
+        .iter()
+        .try_fold(0usize, |sum, segment| sum.checked_add(segment.len()))
+        .ok_or(DmaError::RegionTooSmall)?;
     if total_size == 0 || total_size != pnvm.total_size {
         return Err(DmaError::RegionTooSmall);
     }
-    if !fragmented {
-        let mut image = allocator.allocate(total_size)?;
-        if image.capacity() < total_size {
-            return Err(DmaError::RegionTooSmall);
-        }
-        let mut offset = 0usize;
-        for segment in &pnvm.segments {
-            image.write_at(offset, segment)?;
-            offset += segment.len();
-        }
-        let base_address = image.device_address();
-        return Ok(PnvmDmaImage {
-            base_address,
-            total_size,
-            info: None,
-            contiguous: Some(image),
-            segments: Vec::new(),
-        });
+    Ok(total_size)
+}
+
+fn setup_pnvm_contiguous<A: DmaAllocator>(
+    allocator: &mut A,
+    pnvm: &PnvmImage,
+) -> Result<PnvmDmaImage<A::Region>, DmaError> {
+    let total_size = pnvm_total_size(pnvm)?;
+    let mut image = allocator.allocate(total_size)?;
+    if image.capacity() < total_size {
+        return Err(DmaError::RegionTooSmall);
     }
+    let mut offset = 0usize;
+    for segment in &pnvm.segments {
+        image.write_at(offset, segment)?;
+        offset += segment.len();
+    }
+    let base_address = image.device_address();
+    Ok(PnvmDmaImage {
+        base_address,
+        total_size,
+        info: None,
+        contiguous: Some(image),
+        segments: Vec::new(),
+    })
+}
+
+/// Allocate PNVM segment table and device-visible segment buffers.
+// upstream: if_iwx.c iwx_pnvm_setup_fragmented()
+pub fn setup_pnvm_fragmented<A: DmaAllocator>(
+    allocator: &mut A,
+    pnvm: &PnvmImage,
+) -> Result<PnvmDmaImage<A::Region>, DmaError> {
+    let total_size = pnvm_total_size(pnvm)?;
     if pnvm.segments.len() > PNVM_MAX_SEGMENTS {
         return Err(DmaError::RegionTooSmall);
     }
