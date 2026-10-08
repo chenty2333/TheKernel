@@ -997,7 +997,8 @@ impl<I: SdhciIo> SdhciHost<I> {
         Ok(())
     }
 
-    // upstream: sdhci.c sdhci_generic_tune()/sdhci_exec_tuning()
+    // upstream: sdhci.c sdhci_generic_tune()
+    // upstream: sdhci.c sdhci_exec_tuning()
     pub fn execute_tuning(&mut self, opcode: u8, bus_width: u8) -> Result<(), SdhciError> {
         if self.version < SDHCI_SPEC_300 as u8
             || !matches!(opcode, 19 | 21)
@@ -1052,7 +1053,7 @@ impl<I: SdhciIo> SdhciHost<I> {
         }
     }
 
-    // upstream: sdhci.c sdhci_set_uhs_timing() (legacy high-speed subset)
+    // upstream: sdhci.c sdhci_generic_set_uhs_timing() (legacy high-speed subset)
     fn set_high_speed(&mut self, clock_hz: u32) -> Result<(), SdhciError> {
         if self.quirks & SDHCI_QUIRK_BROKEN_TIMINGS != 0 {
             return Err(SdhciError::UnsupportedClock);
@@ -1284,7 +1285,6 @@ impl<I: SdhciIo> SdhciHost<I> {
         Err(SdhciError::Timeout)
     }
 
-    // upstream: sdhci.c sdhci_wait_for_busy()
     fn wait_busy(&mut self) -> Result<(), SdhciError> {
         for _ in 0..self.timeout_polls {
             if self.io.read32(SDHCI_PRESENT_STATE as usize) & (SDHCI_DAT_INHIBIT | SDHCI_DAT_ACTIVE)
@@ -1302,6 +1302,7 @@ impl<I: SdhciIo> SdhciHost<I> {
     }
 
     // upstream: sdhci.c sdhci_card_present()
+    // upstream: sdhci.c sdhci_generic_get_card_present()
     fn card_present(&mut self) -> bool {
         if self.quirks & SDHCI_QUIRK_ALL_SLOTS_NON_REMOVABLE != 0
             || self.capabilities & SDHCI_SLOTTYPE_MASK == SDHCI_SLOTTYPE_EMBEDDED
