@@ -22,6 +22,68 @@ pub struct ErpState {
     pub short_slot: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenAuthState {
+    pub authentication_state: bool,
+    pub rsn_enabled: bool,
+    pub is_bss_node: bool,
+    pub sequence: u16,
+    pub status: u16,
+    pub auth_subtype: u8,
+    pub node_failures: u32,
+    pub bad_auth_count: u32,
+    pub auth_fail_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtocolState {
+    Scan,
+    Auth,
+    Assoc,
+    Run,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenAuthEffects {
+    pub clear_protected_txrx: bool,
+    pub clear_mgmt_protection: bool,
+    pub invalidate_port: bool,
+    pub reset_replay_state: bool,
+    pub delete_pairwise_key: bool,
+    pub try_another_bss: bool,
+    pub new_state: Option<ProtocolState>,
+    pub new_state_reason: Option<u8>,
+}
+
+/// Apply the station branch of Open System authentication response processing.
+// upstream: ieee80211_proto.c ieee80211_auth_open()
+pub fn auth_open_station(state: &mut OpenAuthState) -> OpenAuthEffects {
+    if !state.authentication_state || state.sequence != 2 {
+        state.bad_auth_count += 1;
+        return OpenAuthEffects::default();
+    }
+    let mut effects = OpenAuthEffects::default();
+    if state.rsn_enabled {
+        effects.clear_protected_txrx = true;
+        effects.clear_mgmt_protection = true;
+        effects.invalidate_port = true;
+        effects.reset_replay_state = true;
+        effects.delete_pairwise_key = true;
+    }
+    if state.status != 0 {
+        if state.is_bss_node {
+            effects.try_another_bss = true;
+        } else {
+            state.node_failures += 1;
+        }
+        state.auth_fail_count += 1;
+        return effects;
+    }
+    effects.new_state = Some(ProtocolState::Assoc);
+    effects.new_state_reason = Some(state.auth_subtype);
+    effects
+}
+
 pub const FIX_RATE_SORT: u32 = 0x01;
 pub const FIX_RATE_FIXED: u32 = 0x02;
 pub const FIX_RATE_NEGOTIATE: u32 = 0x04;
@@ -155,6 +217,58 @@ mod tests {
 
     fn local() -> RateSet {
         RateSet::new(&[0x82, 0x84, 11, 22, 0x8c, 18, 24, 36])
+    }
+
+    #[test]
+    fn open_auth_station_validates_sequence_clears_rsn_and_selects_next_state() {
+        let mut state = OpenAuthState {
+            authentication_state: false,
+            rsn_enabled: true,
+            is_bss_node: true,
+            sequence: 1,
+            status: 0,
+            auth_subtype: 0xb0,
+            node_failures: 0,
+            bad_auth_count: 0,
+            auth_fail_count: 0,
+        };
+        assert_eq!(auth_open_station(&mut state), OpenAuthEffects::default());
+        assert_eq!(state.bad_auth_count, 1);
+        state.authentication_state = true;
+        state.sequence = 2;
+        let effects = auth_open_station(&mut state);
+        assert!(
+            effects.clear_protected_txrx
+                && effects.clear_mgmt_protection
+                && effects.invalidate_port
+                && effects.reset_replay_state
+                && effects.delete_pairwise_key
+        );
+        assert_eq!(effects.new_state, Some(ProtocolState::Assoc));
+        assert_eq!(effects.new_state_reason, Some(0xb0));
+    }
+
+    #[test]
+    fn failed_authentication_retries_bss_or_counts_peer_failure() {
+        let mut state = OpenAuthState {
+            authentication_state: true,
+            rsn_enabled: false,
+            is_bss_node: true,
+            sequence: 2,
+            status: 1,
+            auth_subtype: 0xb0,
+            node_failures: 0,
+            bad_auth_count: 0,
+            auth_fail_count: 0,
+        };
+        let effects = auth_open_station(&mut state);
+        assert!(effects.try_another_bss);
+        assert_eq!(state.auth_fail_count, 1);
+        state.is_bss_node = false;
+        let effects = auth_open_station(&mut state);
+        assert!(!effects.try_another_bss);
+        assert_eq!(state.node_failures, 1);
+        assert_eq!(state.auth_fail_count, 2);
     }
 
     #[test]

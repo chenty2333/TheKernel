@@ -115,3 +115,7 @@ helper reports when the driver-facing short-slot state changes.
 The beacon-miss timer scales its watchdog threshold by the negotiated beacon
 interval, preserves the previous value for a zero interval, and never sets a
 threshold below one missed beacon.
+The station Open System AUTH branch validates state and transaction sequence,
+clears RSN protection/port/replay state before applying status, counts failed
+peers or requests trying another BSS, and advances successful AUTH to ASSOC.
+The actual user-visible EAPOL 4-way exchange remains with wpa_supplicant.
