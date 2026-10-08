@@ -50,3 +50,5 @@ As of 2026-10-09, source-order Rust transcripts with per-function markers exist 
 The compiled Gen12 `tk-intel-gt::execlists::{write_desc,execlists_submit_ports}` slice now replaces the private caller's hand-written ELSQ port writes. It keeps the source reverse-port order, writes both ports even when one is empty, and explicitly loads the queue. This remains only the hardware-facing queue-write portion; request queues, CSB completion, preemption/time-slicing, and the default GuC-submission engine path are still absent.
 
 The CT receive bridge now treats a valid non-event G2H HXG as a pending fence response rather than an unknown submission event, and publishes the consumed receive head for the waiter. Only scheduling-mode and deregistration events are dispatched today; IRQ/tasklet/workqueue integration and execution completion callers remain outstanding.
+
+`CtDmaMemory::finish_guc_submission_response()` consumes such a response by fence after its caller has waited, returns the reserved G2H credit, and republishes the shared descriptor. It is an owner adapter only; no production GuC engine caller invokes this sequence yet.

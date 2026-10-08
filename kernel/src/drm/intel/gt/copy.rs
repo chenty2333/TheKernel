@@ -1204,6 +1204,31 @@ impl CtDmaMemory {
         dispatch.map_err(|_| Error::Quarantined)?;
         Ok(true)
     }
+
+    /// Consume a response previously received by the CT bridge and return its
+    /// reserved G2H credits after the caller has waited for the matching fence.
+    pub(super) fn finish_guc_submission_response(
+        &mut self,
+        fence: u16,
+    ) -> Result<intel_gt::guc_ct::CtCompletion, Error> {
+        if !self.enabled {
+            return Err(Error::Refused);
+        }
+        self._ram.read(0, &mut self.blob)?;
+        self.pair
+            .sync_from_blob(&self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        let completion = self
+            .pair
+            .finish_request(fence)
+            .map_err(|_| Error::Quarantined)?;
+        self.pair
+            .sync_to_blob(&mut self.blob)
+            .map_err(|_| Error::Quarantined)?;
+        self._ram.write(0, &self.blob)?;
+        self._ram.flush();
+        Ok(completion)
+    }
 }
 
 #[cfg(target_os = "none")]
