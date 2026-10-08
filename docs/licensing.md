@@ -530,5 +530,11 @@ project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
 
 `src/dmc.rs` additionally translates only the display-12/13 firmware path and
 size selection from MIT `intel_dmc.c::dmc_firmware_default()` (2014 Intel).
-It adds no firmware binary or loader; distributing DMC images requires a
-separate linux-firmware license/notice review before rootfs packaging.
+The rootfs builder accepts pre-decompressed firmware only through
+`THEKERNEL_I915_DMC_FIRMWARE_DIR`, requires the Intel `LICENSE.i915` notice,
+and stages that notice beside the five TGL/RKL/ADL-S/ADL-P DMC images. The
+binary blobs are external build inputs, never repository files; no runtime
+request/parser/MMIO loader is wired yet. The Intel binary grant permits
+unmodified binary redistribution with its conditions/disclaimer and forbids
+reverse engineering/decompilation/disassembly; input preparation must respect
+that restriction.

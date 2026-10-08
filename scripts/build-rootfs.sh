@@ -45,6 +45,7 @@ Environment overrides:
   THEKERNEL_ROOTFS_TOOLS_DIR  tree of guest tools to copy into the image
   THEKERNEL_ROOTFS_SIZE_MB    image size (default: 160)
   THEKERNEL_SOURCE_CACHE      Download cache
+  THEKERNEL_I915_DMC_FIRMWARE_DIR pre-decompressed display-12/13 DMC files
 EOF
 }
 
@@ -408,6 +409,29 @@ if [ -n "${THEKERNEL_RTL8168_FIRMWARE_DIR:-}" ]; then
     done
     install -d "$STAGE/lib/firmware/rtl_nic"
     install -m 0644 "$firmware_dir/rtl8168h-2.fw" "$firmware_dir/LICENSE.r8169" "$STAGE/lib/firmware/rtl_nic/"
+fi
+
+# DMC files are licensed binary firmware, not source inputs. The caller must
+# provide the full Intel notice and the uncompressed names requested by i915;
+# caps below come from intel_dmc.c for display versions 12/13.
+if [ -n "${THEKERNEL_I915_DMC_FIRMWARE_DIR:-}" ]; then
+    dmc_dir=$THEKERNEL_I915_DMC_FIRMWARE_DIR
+    for name in adlp_dmc.bin adlp_dmc_ver2_16.bin; do
+        [ -s "$dmc_dir/$name" ] || { printf 'missing DMC firmware input: %s/%s\n' "$dmc_dir" "$name" >&2; exit 1; }
+        [ "$(wc -c < "$dmc_dir/$name")" -le 131072 ] || { printf 'DMC firmware exceeds display-13 limit: %s\n' "$name" >&2; exit 1; }
+    done
+    for name in adls_dmc_ver2_01.bin rkl_dmc_ver2_03.bin tgl_dmc_ver2_12.bin; do
+        [ -s "$dmc_dir/$name" ] || { printf 'missing DMC firmware input: %s/%s\n' "$dmc_dir" "$name" >&2; exit 1; }
+        [ "$(wc -c < "$dmc_dir/$name")" -le 24576 ] || { printf 'DMC firmware exceeds display-12 limit: %s\n' "$name" >&2; exit 1; }
+    done
+    [ -s "$dmc_dir/LICENSE.i915" ] || { printf 'missing DMC firmware notice: %s/LICENSE.i915\n' "$dmc_dir" >&2; exit 1; }
+    install -d "$STAGE/lib/firmware/i915"
+    install -m 0644 "$dmc_dir/adlp_dmc.bin" \
+        "$dmc_dir/adlp_dmc_ver2_16.bin" \
+        "$dmc_dir/adls_dmc_ver2_01.bin" \
+        "$dmc_dir/rkl_dmc_ver2_03.bin" \
+        "$dmc_dir/tgl_dmc_ver2_12.bin" \
+        "$dmc_dir/LICENSE.i915" "$STAGE/lib/firmware/i915/"
 fi
 
 "$SCRIPT_DIR/create-rootfs-image.sh" \
