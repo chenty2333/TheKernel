@@ -54,8 +54,8 @@ use super::{
         RX_HEADER_BYTES, RingError, RxRing, TxRing,
     },
     txrx::{
-        TxChecksum, TxIpType, TxPacketInfo, TxProtocol, TxRingState, TxRxError, TxSegment,
-        igc_isc_txd_encap,
+        RxRingState, TxChecksum, TxIpType, TxPacketInfo, TxProtocol, TxRingState, TxRxError,
+        TxSegment, igc_isc_rxd_refill, igc_isc_txd_encap,
     },
     regs::{
         self, QueueControl, ReceiveControl, RingBase, RingLength, SplitReceiveControl,
@@ -166,6 +166,9 @@ pub struct IgcNic<H: IgcHal, const QS: usize> {
     tx_owner: Vec<usize>,
     rx_memory: DescriptorMemory,
     rx_ring: RxRing,
+    /// Shadow of the extended receive descriptors used by the translated
+    /// FreeBSD refill callback.
+    rx_source_state: RxRingState,
     rx_pool: BufferPool,
     rx_owner: Vec<usize>,
     rx_free: Vec<usize>,
@@ -241,6 +244,7 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
             tx_owner: vec![0; QS],
             rx_memory,
             rx_ring: RxRing::new(QS),
+            rx_source_state: RxRingState::new(QS),
             rx_pool,
             rx_owner: vec![0; QS],
             rx_free: (0..QS).rev().collect(),
@@ -307,7 +311,17 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
                 self.rx_free.push(slot);
                 break;
             };
-            match self.rx_ring.fill(&mut self.rx_memory, address) {
+            let index = self.rx_ring.tail();
+            if igc_isc_rxd_refill(&mut self.rx_source_state, index, &[address]).is_err() {
+                self.rx_free.push(slot);
+                break;
+            }
+            let descriptor = self.rx_source_state.desc[index];
+            let descriptor_address = u64::from(descriptor[0]) | (u64::from(descriptor[1]) << 32);
+            match self
+                .rx_ring
+                .fill(&mut self.rx_memory, descriptor_address)
+            {
                 Ok(index) => self.rx_owner[index] = slot,
                 Err(_) => {
                     self.rx_free.push(slot);
@@ -918,6 +932,8 @@ mod tests {
                 expected,
                 "descriptor {index}",
             );
+            let shadow = harness.nic.rx_source_state.desc[index];
+            assert_eq!(u64::from(shadow[0]) | (u64::from(shadow[1]) << 32), expected);
             // The length field is clear, so a stale value cannot look like a
             // frame.
             assert_eq!(
