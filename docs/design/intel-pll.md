@@ -541,3 +541,11 @@ atomic PLL allocation, active-port mux updates, MG PHY DP/TBT register writes,
 PLL enable/disable/lock sequencing, clock routing, reference-clock updates,
 readout/sanitization, and display-12/13 `intel_dpll.c` state ownership are
 still not translated or wired.
+
+The same module additionally carries the display-12/13 candidate-mask and
+shared-resource policy from `icl_get_combo_phy_dpll()`,
+`icl_tc_port_to_pll_id()`, `icl_update_active_dpll()`, and the generic
+`intel_find_dpll()`/reference/unreference edge. `SharedDpllPool` is a small
+host-testable owner for the shared-state comparison and pipe references. It is
+not yet installed as the kernel's atomic-state DPLL manager; current kernel
+fastboot continues to use its pre-existing single output PLL flow.

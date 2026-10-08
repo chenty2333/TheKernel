@@ -1113,3 +1113,10 @@ workaround from Linux 7.2.3 `drivers/gpu/drm/i915/display/intel_dpll_mgr.c`
 `display/intel_display_regs.h` (MIT, Copyright © 2006-2018 Intel). See
 `docs/design/intel-pll.md` §7. PLL resource allocation and MMIO manager
 lifecycle remain separate gaps.
+
+The same DPLL-manager translation also covers ICL/TGL combo-PHY candidate
+masks, TC-port/MG-PLL identity mapping, active-port DPLL selection and a
+shareable hardware-state/pipe-mask allocator corresponding to
+`icl_get_combo_phy_dpll()`, `icl_tc_port_to_pll_id()`,
+`icl_update_active_dpll()` and `intel_find_dpll()` plus reference edges. It is
+not yet wired into the kernel's modeset atomic-state lifecycle.

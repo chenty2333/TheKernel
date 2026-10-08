@@ -3,7 +3,9 @@
 // icl_mg_pll_find_divisors, icl_calc_mg_pll_state, icl_ddi_mg_pll_get_freq,
 // icl_wrpll_get_multipliers, icl_wrpll_params_populate, icl_calc_wrpll,
 // icl_calc_dp_combo_pll, icl_calc_tbt_pll, icl_calc_dpll_state,
-// icl_ddi_combo_pll_get_freq, dkl_pll_write (ADL-P/N HDMI no-SSC branch).
+// icl_ddi_combo_pll_get_freq, icl_tc_port_to_pll_id, icl_update_active_dpll,
+// icl_get_combo_phy_dpll, intel_find_dpll/reference/unreference,
+// dkl_pll_write (ADL-P/N HDMI no-SSC branch).
 // Copyright © 2006-2016 Intel Corporation.
 // intel_{mg,dkl}_phy_regs.h: selected DKL/clock register fields.
 // Copyright © 2022 Intel Corporation. MIT permission text: ../LICENSE-MIT.
@@ -686,9 +688,233 @@ pub fn icl_ddi_combo_pll_get_freq(
         .ok_or(Error::Refused)
 }
 
+/// Shared DPLL identities used by the ICL/TGL manager (`intel_dpll_mgr.h`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum IclDpllId {
+    Dpll0 = 0,
+    Dpll1 = 1,
+    Tbt   = 2,
+    Mg1   = 3,
+    Mg2   = 4,
+    Mg3   = 5,
+    Mg4   = 6,
+    Mg5   = 7,
+    Mg6   = 8,
+}
+
+/// The hardware image compared by the source's shared DPLL allocator.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IclDpllHwState {
+    pub cfgcr0: u32,
+    pub cfgcr1: u32,
+    pub div0: u32,
+    pub mg: [u32; 12],
+}
+
+/// Map TC1..TC6 to the corresponding dedicated MG PLL.
+// upstream: intel_dpll_mgr.c icl_tc_port_to_pll_id()
+pub const fn icl_tc_port_to_pll_id(tc_port: u8) -> Result<IclDpllId, Error> {
+    match tc_port {
+        0 => Ok(IclDpllId::Mg1),
+        1 => Ok(IclDpllId::Mg2),
+        2 => Ok(IclDpllId::Mg3),
+        3 => Ok(IclDpllId::Mg4),
+        4 => Ok(IclDpllId::Mg5),
+        5 => Ok(IclDpllId::Mg6),
+        _ => Err(Error::Refused),
+    }
+}
+
+/// The active port PLL is MG only for TC legacy/DP-alt modes; combo ports use
+/// the default DPLL, matching `icl_update_active_dpll()`.
+// upstream: intel_dpll_mgr.c icl_update_active_dpll()
+pub const fn icl_active_port_dpll_id(is_tc: bool, in_alt_or_legacy_mode: bool) -> u8 {
+    if is_tc && in_alt_or_legacy_mode { 1 } else { 0 }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IclDpllPlatform {
+    AlderLakeS,
+    Dg1,
+    RocketLake,
+    ElkhartLake,
+    JasperLake,
+    TigerLake,
+    AlderLakeP,
+    AlderLakeN,
+}
+
+/// Candidate bitmap from `icl_get_combo_phy_dpll()` minus HTI-owned PLLs.
+// upstream: intel_dpll_mgr.c icl_get_combo_phy_dpll()
+pub const fn icl_combo_dpll_mask(platform: IclDpllPlatform, port: u8, hti_mask: u32) -> u32 {
+    let available = match platform {
+        IclDpllPlatform::AlderLakeS => 0b1111,
+        IclDpllPlatform::Dg1 if port == 3 || port == 4 => 0b1100,
+        IclDpllPlatform::Dg1 => 0b0011,
+        IclDpllPlatform::RocketLake
+        | IclDpllPlatform::ElkhartLake
+        | IclDpllPlatform::JasperLake
+            if port != 0 =>
+        {
+            0b0111
+        }
+        _ => 0b0011,
+    };
+    available & !hti_mask
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SharedDpllSlot {
+    id: u8,
+    state: Option<IclDpllHwState>,
+    pipe_mask: u8,
+}
+impl SharedDpllSlot {
+    const EMPTY: Self = Self {
+        id: u8::MAX,
+        state: None,
+        pipe_mask: 0,
+    };
+}
+
+/// Source-shaped state owner for `intel_find_dpll()` and the reference/put pair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SharedDpllPool {
+    slots: [SharedDpllSlot; 9],
+}
+impl SharedDpllPool {
+    pub const fn new() -> Self {
+        Self {
+            slots: [SharedDpllSlot::EMPTY; 9],
+        }
+    }
+
+    /// Reuse identical state, otherwise take the first free DPLL in candidate order.
+    // upstream: intel_dpll_mgr.c intel_find_dpll()/intel_reference_dpll()
+    pub fn find_and_reference(
+        &mut self,
+        candidate_mask: u32,
+        state: IclDpllHwState,
+        pipe: u8,
+    ) -> Result<IclDpllId, Error> {
+        if pipe >= 8 || candidate_mask == 0 {
+            return Err(Error::Refused);
+        }
+        let bit = 1 << pipe;
+        if let Some(slot) = self.slots.iter_mut().find(|s| {
+            s.id != u8::MAX && candidate_mask & (1 << s.id) != 0 && s.state == Some(state)
+        }) {
+            slot.pipe_mask |= bit;
+            return dpll_id(slot.id);
+        }
+        let id = (0..9)
+            .find(|id| candidate_mask & (1 << id) != 0 && !self.slots.iter().any(|s| s.id == *id))
+            .ok_or(Error::Refused)?;
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|s| s.id == u8::MAX)
+            .ok_or(Error::Refused)?;
+        *slot = SharedDpllSlot {
+            id,
+            state: Some(state),
+            pipe_mask: bit,
+        };
+        dpll_id(id)
+    }
+
+    /// Remove a pipe reference; return true when the last reference powers the PLL down.
+    // upstream: intel_dpll_mgr.c intel_unreference_dpll()
+    pub fn unreference(&mut self, id: IclDpllId, pipe: u8) -> Result<bool, Error> {
+        if pipe >= 8 {
+            return Err(Error::Refused);
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|s| s.id == id as u8)
+            .ok_or(Error::Refused)?;
+        let bit = 1 << pipe;
+        if slot.pipe_mask & bit == 0 {
+            return Err(Error::Refused);
+        }
+        slot.pipe_mask &= !bit;
+        let last = slot.pipe_mask == 0;
+        if last {
+            *slot = SharedDpllSlot::EMPTY;
+        }
+        Ok(last)
+    }
+
+    pub fn active_pipe_mask(&self, id: IclDpllId) -> u8 {
+        self.slots
+            .iter()
+            .find(|s| s.id == id as u8)
+            .map_or(0, |s| s.pipe_mask)
+    }
+}
+
+const fn dpll_id(value: u8) -> Result<IclDpllId, Error> {
+    match value {
+        0 => Ok(IclDpllId::Dpll0),
+        1 => Ok(IclDpllId::Dpll1),
+        2 => Ok(IclDpllId::Tbt),
+        3 => Ok(IclDpllId::Mg1),
+        4 => Ok(IclDpllId::Mg2),
+        5 => Ok(IclDpllId::Mg3),
+        6 => Ok(IclDpllId::Mg4),
+        7 => Ok(IclDpllId::Mg5),
+        8 => Ok(IclDpllId::Mg6),
+        _ => Err(Error::Refused),
+    }
+}
+
 #[cfg(test)]
 mod combo_tests {
     use super::*;
+
+    #[test]
+    fn shared_manager_reuses_matching_pll_and_releases_after_last_pipe() {
+        let state = IclDpllHwState {
+            cfgcr0: 0x1234,
+            cfgcr1: 0x5678,
+            ..IclDpllHwState::default()
+        };
+        let mut pool = SharedDpllPool::new();
+        let first = pool.find_and_reference(0b11, state, 0).unwrap();
+        assert_eq!(first, IclDpllId::Dpll0);
+        assert_eq!(
+            pool.find_and_reference(0b11, state, 1),
+            Ok(IclDpllId::Dpll0)
+        );
+        assert_eq!(pool.active_pipe_mask(first), 0b11);
+        assert_eq!(pool.unreference(first, 0), Ok(false));
+        assert_eq!(pool.unreference(first, 1), Ok(true));
+        assert_eq!(pool.unreference(first, 1), Err(Error::Refused));
+    }
+
+    #[test]
+    fn source_combo_masks_and_tc_mg_ids_are_platform_specific() {
+        assert_eq!(
+            icl_combo_dpll_mask(IclDpllPlatform::TigerLake, 1, 0),
+            0b0011
+        );
+        assert_eq!(
+            icl_combo_dpll_mask(IclDpllPlatform::RocketLake, 1, 0),
+            0b0111
+        );
+        assert_eq!(icl_combo_dpll_mask(IclDpllPlatform::Dg1, 3, 0), 0b1100);
+        assert_eq!(
+            icl_combo_dpll_mask(IclDpllPlatform::AlderLakeS, 0, 0b0010),
+            0b1101
+        );
+        assert_eq!(icl_tc_port_to_pll_id(0), Ok(IclDpllId::Mg1));
+        assert_eq!(icl_tc_port_to_pll_id(5), Ok(IclDpllId::Mg6));
+        assert_eq!(icl_tc_port_to_pll_id(6), Err(Error::Refused));
+        assert_eq!(icl_active_port_dpll_id(true, true), 1);
+        assert_eq!(icl_active_port_dpll_id(false, true), 0);
+    }
 
     #[test]
     fn wrpll_search_matches_source_divider_order_and_dco_window() {
