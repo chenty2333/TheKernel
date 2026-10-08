@@ -99,6 +99,39 @@ const EECD_AUTO_RD: u32 = 0x200;
 const PEIND_PCIE_PARITY_FATAL: u32 = 4;
 const PCIEERRSTS_FATAL_MASK: u32 = 0x78;
 const LANPERRSTS_RETX_BUF: u32 = 0x200;
+const MNGPARSTS: u32 = 0x08f24;
+const ICR: u32 = 0x01500;
+const IMS: u32 = 0x01508;
+const IMC: u32 = 0x0150c;
+const EIMS: u32 = 0x01524;
+const EIMC: u32 = 0x01528;
+const EIAC: u32 = 0x0152c;
+const EIAM: u32 = 0x01530;
+const PEIND_LANPORT_PARITY_FATAL: u32 = 1;
+const PEIND_MNG_PARITY_FATAL: u32 = 2;
+const PEIND_DMA_PARITY_FATAL: u32 = 8;
+const PEIND_FATAL_MASK: u32 = 0xf;
+const MNGPARSTS_FATAL_MASK: u32 = 3;
+const ICR_LSC: u32 = 4;
+const ICR_RXSEQ: u32 = 8;
+const ICR_RXO: u32 = 0x40;
+const ICR_INT_ASSERTED: u32 = 0x8000_0000;
+const ICR_FER: u32 = 0x0040_0000;
+const IMS_LSC: u32 = ICR_LSC;
+const IMS_FER: u32 = ICR_FER;
+const IMS_ENABLE_MASK: u32 = 1 | 4 | 8 | 0x10 | 0x80;
+const GPIE: u32 = 0x01514;
+const IVAR0: u32 = 0x01700;
+const IVAR_MISC: u32 = 0x01740;
+const GPIE_MSIX_MODE: u32 = 0x0000_0010;
+const GPIE_EIAME: u32 = 0x4000_0000;
+const GPIE_PBA: u32 = 0x8000_0000;
+const GPIE_NSICR: u32 = 0x0000_0020;
+const IVAR_VALID: u32 = 0x80;
+const FATAL_NONE: u32 = 0;
+const FATAL_CAPTURING: u32 = 1;
+const FATAL_DETECTED: u32 = 2;
+const FATAL_RESET_REQUESTED: u32 = 3;
 const MAX_JUMBO_MTU: u32 = 9234;
 const ETHER_HDR_LEN: u32 = 14;
 const ETHER_CRC_LEN: u32 = 4;
@@ -135,6 +168,7 @@ pub struct AimRxQueue {
     pub counters: AimCounters,
     pub vector: u16,
     pub eitr_setting: u32,
+    pub interrupts: u64,
 }
 #[derive(Debug)]
 pub struct AimTxQueue {
@@ -236,12 +270,269 @@ pub struct FatalErrorState {
     pub pcie_error: u32,
     pub lan_error: u32,
     pub mng_error: u32,
+    pub lan_parity_count: u64,
+    pub mng_parity_count: u64,
+    pub pcie_parity_count: u64,
+    pub dma_parity_count: u64,
 }
 pub trait IgcFatalIo: IgcMainIo {
     fn delay_ms(&mut self, ms: u32);
     fn disable_pcie_master(&mut self) -> Result<(), MainError>;
     fn log_parity_reset_timeout(&mut self);
     fn log_master_disable_failure(&mut self);
+}
+pub trait IgcInterruptIo: IgcMainIo {
+    fn disable_interrupts(&mut self);
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterruptState {
+    pub msix: bool,
+    pub queue_mask: u32,
+    pub link_mask: u32,
+    pub link_interrupts: u64,
+    pub rx_overruns: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterruptResult {
+    Stray,
+    ScheduleThread,
+    Handled,
+}
+
+// upstream: if_igc.c igc_if_intr_enable()
+pub fn igc_if_intr_enable<I: IgcMainIo>(
+    io: &mut I,
+    state: &InterruptState,
+    fatal: &FatalErrorState,
+) {
+    let mut mask;
+    if state.msix {
+        mask = state.queue_mask | state.link_mask;
+        io.write(EIAC, mask);
+        io.write(EIAM, mask);
+        io.write(EIMS, mask);
+        mask = IMS_LSC
+    } else {
+        mask = IMS_ENABLE_MASK
+    }
+    if fatal.state.load(Ordering::Acquire) == FATAL_NONE {
+        mask |= IMS_FER
+    }
+    io.write(IMS, mask)
+}
+// upstream: if_igc.c igc_if_intr_disable()
+pub fn igc_if_intr_disable<I: IgcMainIo>(io: &mut I, msix: bool) {
+    if msix {
+        io.write(EIMC, u32::MAX);
+        io.write(EIAC, 0)
+    }
+    io.write(IMC, u32::MAX)
+}
+// upstream: if_igc.c igc_if_rx_queue_intr_enable()
+pub fn igc_if_rx_queue_intr_enable<I: IgcMainIo>(io: &mut I, eims: u32) {
+    io.write(EIMS, eims)
+}
+// upstream: if_igc.c igc_if_tx_queue_intr_enable()
+pub fn igc_if_tx_queue_intr_enable<I: IgcMainIo>(io: &mut I, eims: u32) {
+    io.write(EIMS, eims)
+}
+// upstream: if_igc.c igc_handle_link()
+pub fn igc_handle_link<I: IgcMainIo>(io: &mut I, mac: &mut MacState) {
+    mac.get_link_status = true;
+    io.admin_status_deferred()
+}
+
+// upstream: if_igc.c igc_handle_fatal_error_intr()
+pub fn igc_handle_fatal_error_intr<I: IgcMainIo>(
+    io: &mut I,
+    fatal: &mut FatalErrorState,
+    icr: u32,
+) {
+    if icr & ICR_FER == 0 {
+        return;
+    }
+    io.write(IMC, IMS_FER);
+    if fatal
+        .state
+        .compare_exchange(
+            FATAL_NONE,
+            FATAL_CAPTURING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let mut peind = io.read(PEIND) & PEIND_FATAL_MASK;
+    let pcie = io.read(PCIEERRSTS) & PCIEERRSTS_FATAL_MASK;
+    let lan = io.read(LANPERRSTS) & LANPERRSTS_RETX_BUF;
+    let mng = io.read(MNGPARSTS) & MNGPARSTS_FATAL_MASK;
+    if pcie != 0 {
+        peind |= PEIND_PCIE_PARITY_FATAL
+    }
+    if lan != 0 {
+        peind |= PEIND_LANPORT_PARITY_FATAL
+    }
+    fatal.peind = peind;
+    fatal.pcie_error = pcie;
+    fatal.lan_error = lan;
+    fatal.mng_error = mng;
+    fatal.state.store(FATAL_DETECTED, Ordering::Release);
+    io.admin_status_deferred()
+}
+// upstream: if_igc.c igc_handle_fatal_error_admin()
+pub fn igc_handle_fatal_error_admin(fatal: &mut FatalErrorState) -> bool {
+    if fatal
+        .state
+        .compare_exchange(
+            FATAL_DETECTED,
+            FATAL_RESET_REQUESTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return fatal.state.load(Ordering::Acquire) != FATAL_NONE;
+    }
+    if fatal.peind & PEIND_LANPORT_PARITY_FATAL != 0 {
+        fatal.lan_parity_count += 1
+    }
+    if fatal.peind & PEIND_MNG_PARITY_FATAL != 0 {
+        fatal.mng_parity_count += 1
+    }
+    if fatal.peind & PEIND_PCIE_PARITY_FATAL != 0 {
+        fatal.pcie_parity_count += 1
+    }
+    if fatal.peind & PEIND_DMA_PARITY_FATAL != 0 {
+        fatal.dma_parity_count += 1
+    }
+    true
+}
+// upstream: if_igc.c igc_intr()
+pub fn igc_intr<I: IgcInterruptIo>(
+    io: &mut I,
+    interrupts: &mut InterruptState,
+    mac: &mut MacState,
+    fatal: &mut FatalErrorState,
+    device: &AimDevice,
+    rx: &mut AimRxQueue,
+    tx: &mut [AimTxQueue],
+) -> InterruptResult {
+    let icr = io.read(ICR);
+    if icr == u32::MAX || icr == 0 || icr & ICR_INT_ASSERTED == 0 {
+        return InterruptResult::Stray;
+    }
+    io.disable_interrupts();
+    if icr & (ICR_RXSEQ | ICR_LSC) != 0 {
+        igc_handle_link(io, mac)
+    }
+    if icr & ICR_RXO != 0 {
+        interrupts.rx_overruns += 1
+    }
+    igc_handle_fatal_error_intr(io, fatal, icr);
+    igc_neweitr(io, device, rx, tx);
+    InterruptResult::ScheduleThread
+}
+// upstream: if_igc.c igc_msix_que()
+pub fn igc_msix_que<I: IgcMainIo>(
+    io: &mut I,
+    device: &AimDevice,
+    rx: &mut AimRxQueue,
+    tx: &mut [AimTxQueue],
+) -> InterruptResult {
+    rx.interrupts += 1;
+    igc_neweitr(io, device, rx, tx);
+    InterruptResult::ScheduleThread
+}
+// upstream: if_igc.c igc_msix_link()
+pub fn igc_msix_link<I: IgcMainIo>(
+    io: &mut I,
+    interrupts: &mut InterruptState,
+    mac: &mut MacState,
+    fatal: &mut FatalErrorState,
+) -> InterruptResult {
+    interrupts.link_interrupts += 1;
+    let icr = io.read(ICR);
+    if icr & ICR_RXO != 0 {
+        interrupts.rx_overruns += 1
+    }
+    if icr & (ICR_RXSEQ | ICR_LSC) != 0 {
+        igc_handle_link(io, mac)
+    }
+    igc_handle_fatal_error_intr(io, fatal, icr);
+    let mut mask = IMS_LSC;
+    if fatal.state.load(Ordering::Acquire) == FATAL_NONE {
+        mask |= IMS_FER
+    }
+    io.write(IMS, mask);
+    io.write(EIMS, interrupts.link_mask);
+    InterruptResult::Handled
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueInterrupt {
+    pub vector: u8,
+    pub eims: u32,
+}
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InterruptTopology {
+    pub rx: Vec<QueueInterrupt>,
+    pub tx: Vec<QueueInterrupt>,
+    pub link_vector: u8,
+    pub queue_mask: u32,
+    pub link_mask: u32,
+}
+// upstream: if_igc.c igc_configure_queues()
+pub fn igc_configure_queues<I: IgcMainIo>(io: &mut I, topology: &mut InterruptTopology) {
+    io.write(GPIE, GPIE_MSIX_MODE | GPIE_EIAME | GPIE_PBA | GPIE_NSICR);
+    for (index, q) in topology.rx.iter().enumerate() {
+        let reg = IVAR0 + ((index >> 1) as u32) * 4;
+        let mut ivar = io.read(reg);
+        if index & 1 != 0 {
+            ivar &= 0xff00_ffff;
+            ivar |= (u32::from(q.vector) | IVAR_VALID) << 16
+        } else {
+            ivar &= 0xffff_ff00;
+            ivar |= u32::from(q.vector) | IVAR_VALID
+        }
+        io.write(reg, ivar)
+    }
+    for (index, q) in topology.tx.iter().enumerate() {
+        let reg = IVAR0 + ((index >> 1) as u32) * 4;
+        let mut ivar = io.read(reg);
+        if index & 1 != 0 {
+            ivar &= 0x00ff_ffff;
+            ivar |= (u32::from(q.vector) | IVAR_VALID) << 24
+        } else {
+            ivar &= 0xffff_00ff;
+            ivar |= (u32::from(q.vector) | IVAR_VALID) << 8
+        }
+        io.write(reg, ivar);
+        topology.queue_mask |= q.eims
+    }
+    io.write(
+        IVAR_MISC,
+        (u32::from(topology.link_vector) | IVAR_VALID) << 8,
+    );
+    topology.link_mask = 1u32 << topology.link_vector;
+}
+// upstream: if_igc.c igc_initialize_interrupt_rate()
+pub fn igc_initialize_interrupt_rate<I: IgcMainIo>(
+    io: &mut I,
+    rx: &mut [AimRxQueue],
+    max_interrupt_rate: u32,
+) {
+    let rate = if max_interrupt_rate == 0 {
+        0
+    } else {
+        ((EITR_DIVIDEND / max_interrupt_rate) << EITR_SHIFT) & EITR_QVECTOR_MASK
+    };
+    let value = rate | EITR_CNT_IGNR;
+    for q in rx {
+        q.eitr_setting = value;
+        io.write(EITR_BASE + u32::from(q.vector) * 4, value)
+    }
 }
 
 // upstream: if_igc.c igc_prepare_fatal_error_reset()
@@ -1112,6 +1403,11 @@ mod tests {
             self.events.push("master-fail")
         }
     }
+    impl IgcInterruptIo for Fake {
+        fn disable_interrupts(&mut self) {
+            self.events.push("disable-interrupts")
+        }
+    }
     #[test]
     fn aim_snapshot_delta_ring_rate_and_idle_admin_follow_source() {
         let mut c = AimCounters::default();
@@ -1280,6 +1576,7 @@ mod tests {
             pcie_error: 0,
             lan_error: 0,
             mng_error: 4,
+            ..FatalErrorState::default()
         };
         igc_prepare_fatal_error_reset(&mut io, &fault);
         assert!(io.get(CTRL) & CTRL_DEV_RST != 0);
@@ -1288,5 +1585,135 @@ mod tests {
         assert_eq!(fault.state.load(Ordering::Acquire), 0);
         assert_eq!(fault.peind, 0);
         assert_eq!(io.get(PEIND), 0);
+    }
+
+    #[test]
+    fn interrupt_masking_and_legacy_msix_paths_follow_register_flow() {
+        let mut io = Fake::default();
+        let state = InterruptState {
+            msix: true,
+            queue_mask: 0x100,
+            link_mask: 0x20,
+            link_interrupts: 0,
+            rx_overruns: 0,
+        };
+        let fatal = FatalErrorState::default();
+        igc_if_intr_enable(&mut io, &state, &fatal);
+        assert_eq!(io.get(EIAC), 0x120);
+        assert_eq!(io.get(EIAM), 0x120);
+        assert_eq!(io.get(EIMS), 0x120);
+        assert_eq!(io.get(IMS), IMS_LSC | IMS_FER);
+        igc_if_intr_disable(&mut io, true);
+        assert_eq!(io.get(EIMC), u32::MAX);
+        assert_eq!(io.get(EIAC), 0);
+        assert_eq!(io.get(IMC), u32::MAX);
+        io.set(ICR, ICR_INT_ASSERTED | ICR_LSC);
+        let mut intr = InterruptState {
+            msix: true,
+            queue_mask: 0,
+            link_mask: 0x10,
+            link_interrupts: 0,
+            rx_overruns: 0,
+        };
+        let mut mac = MacState::default();
+        let mut fatal = FatalErrorState::default();
+        let device = AimDevice {
+            enabled: 0,
+            max_interrupt_rate: 8000,
+            link_speed_mbps: 1000,
+            max_frame_size: 1518,
+            packet_buffer_kb: 34,
+        };
+        let mut rx = AimRxQueue {
+            counters: AimCounters::default(),
+            vector: 0,
+            eitr_setting: 0,
+            interrupts: 0,
+        };
+        assert_eq!(
+            igc_intr(
+                &mut io,
+                &mut intr,
+                &mut mac,
+                &mut fatal,
+                &device,
+                &mut rx,
+                &mut []
+            ),
+            InterruptResult::ScheduleThread
+        );
+        assert!(mac.get_link_status);
+        assert!(io.events.contains(&"disable-interrupts"));
+        assert_eq!(
+            igc_msix_link(&mut io, &mut intr, &mut mac, &mut fatal),
+            InterruptResult::Handled
+        );
+        assert_eq!(io.get(EIMS), 0x10);
+    }
+
+    #[test]
+    fn fatal_interrupt_captures_status_before_admin_recovery() {
+        let mut io = Fake::default();
+        io.set(PEIND, PEIND_MNG_PARITY_FATAL);
+        io.set(PCIEERRSTS, PCIEERRSTS_FATAL_MASK);
+        io.set(LANPERRSTS, LANPERRSTS_RETX_BUF);
+        io.set(MNGPARSTS, MNGPARSTS_FATAL_MASK);
+        let mut fatal = FatalErrorState::default();
+        igc_handle_fatal_error_intr(&mut io, &mut fatal, ICR_FER);
+        assert_eq!(fatal.state.load(Ordering::Acquire), FATAL_DETECTED);
+        assert_eq!(
+            fatal.peind,
+            PEIND_MNG_PARITY_FATAL | PEIND_PCIE_PARITY_FATAL | PEIND_LANPORT_PARITY_FATAL
+        );
+        assert_eq!(io.admin, 1);
+        assert!(igc_handle_fatal_error_admin(&mut fatal));
+        assert_eq!(fatal.lan_parity_count, 1);
+        assert_eq!(fatal.mng_parity_count, 1);
+        assert_eq!(fatal.pcie_parity_count, 1);
+    }
+
+    #[test]
+    fn msix_queue_routes_pack_ivar_bytes_and_initial_rate() {
+        let mut io = Fake::default();
+        let mut topology = InterruptTopology {
+            rx: vec![
+                QueueInterrupt { vector: 1, eims: 1 },
+                QueueInterrupt { vector: 2, eims: 2 },
+            ],
+            tx: vec![
+                QueueInterrupt {
+                    vector: 3,
+                    eims: 0x100,
+                },
+                QueueInterrupt {
+                    vector: 4,
+                    eims: 0x200,
+                },
+            ],
+            link_vector: 5,
+            queue_mask: 0,
+            link_mask: 0,
+        };
+        igc_configure_queues(&mut io, &mut topology);
+        assert_eq!(
+            io.get(GPIE),
+            GPIE_MSIX_MODE | GPIE_EIAME | GPIE_PBA | GPIE_NSICR
+        );
+        assert_eq!(io.get(IVAR0), 0x8482_8381);
+        assert_eq!(io.get(IVAR0 + 4), 0);
+        assert_eq!(io.get(IVAR_MISC), (5 | IVAR_VALID) << 8);
+        assert_eq!(topology.queue_mask, 0x300);
+        assert_eq!(topology.link_mask, 1 << 5);
+        let mut queues = vec![AimRxQueue {
+            counters: AimCounters::default(),
+            vector: 2,
+            eitr_setting: 0,
+            interrupts: 0,
+        }];
+        igc_initialize_interrupt_rate(&mut io, &mut queues, 8000);
+        assert_eq!(
+            queues[0].eitr_setting,
+            (((1_000_000 / 8000) << 2) & EITR_QVECTOR_MASK) | EITR_CNT_IGNR
+        );
     }
 }
