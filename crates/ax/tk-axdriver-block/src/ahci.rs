@@ -1,5 +1,6 @@
 //! AHCI driver.
 
+pub mod controller;
 pub mod regs;
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
