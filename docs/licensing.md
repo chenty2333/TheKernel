@@ -606,3 +606,8 @@ translated in `tk-intel-display/src/dc_state.rs` (MIT, Copyright © 2022 Intel).
 `PowerDomainIo::well_is_enabled()` now delegates to the translated HSW predicate,
 which requires both the driver request and state bits on display 12/13 (MIT,
 Copyright © 2022 Intel).
+
+`PowerDomainState` also translates i915's two-batch delayed async-put domain
+queue, pending-get reference reuse, batch requeue delay, and flush operation
+from `intel_display_power.c` (MIT, Copyright © 2022 Intel). Scheduling and
+runtime-PM reference ownership remain caller responsibilities.

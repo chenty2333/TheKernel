@@ -1077,3 +1077,8 @@ the source default of disabling power wells.
 The kernel mapped power-domain enabled query calls translated
 `hsw_power_well_enabled()` and therefore tests both the driver request and
 state bits, rather than state alone (`intel_display_power_well.c`).
+
+`power_domains.rs` translates the asynchronous domain put path from
+`intel_display_power.c`: current/next masks, non-final immediate puts, pending
+get reuse, max next delay, worker batch completion, and synchronous flush.
+The surrounding kernel workqueue/runtime-PM adapter is not yet connected.

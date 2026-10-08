@@ -104,6 +104,18 @@ pub enum PowerDomainError {
     RefcountOverflow,
     Backend(Error),
     RollbackFailed { operation: Error, rollback: Error },
+    AsyncPutPending(PowerDomain),
+    AsyncPutAlreadyPending(PowerDomain),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsyncPutAction {
+    /// A new delayed work item must be armed with this delay.
+    Arm { delay_ms: u32 },
+    /// Existing work is already armed and will consume the queued domain.
+    ExistingWork,
+    /// No delayed work remains after completing or flushing a batch.
+    Idle,
 }
 
 /// Hardware backend corresponding to `intel_power_well_{get,put,is_enabled}`.
@@ -137,6 +149,9 @@ pub struct PowerDomainState {
     map_len: usize,
     domain_counts: Vec<(PowerDomain, u32)>,
     well_counts: Vec<u32>,
+    async_put_domains: [Vec<PowerDomain>; 2],
+    async_put_armed: Option<u32>,
+    async_put_next_delay_ms: u32,
 }
 
 fn flat_well_count(map: &[PowerWellGroup]) -> usize {
@@ -170,6 +185,9 @@ impl PowerDomainState {
             map_len: map.len(),
             domain_counts: Vec::new(),
             well_counts: alloc::vec![0; flat_well_count(map)],
+            async_put_domains: [Vec::new(), Vec::new()],
+            async_put_armed: None,
+            async_put_next_delay_ms: 0,
         }
     }
 
@@ -271,6 +289,9 @@ impl PowerDomainState {
         io: &mut impl PowerDomainIo,
     ) -> Result<(), PowerDomainError> {
         self.validate_map(map)?;
+        if self.take_async_put(domain) {
+            return Ok(());
+        }
         let domain_next = self
             .domain_use_count(domain)
             .checked_add(1)
@@ -331,6 +352,9 @@ impl PowerDomainState {
         io: &mut impl PowerDomainIo,
     ) -> Result<(), PowerDomainError> {
         self.validate_map(map)?;
+        if self.async_put_pending(domain) {
+            return Err(PowerDomainError::AsyncPutPending(domain));
+        }
         if self.domain_use_count(domain) == 0 {
             return Err(PowerDomainError::UnbalancedPut(domain));
         }
@@ -390,6 +414,113 @@ impl PowerDomainState {
         }
         self.get(map, domain, io)?;
         Ok(true)
+    }
+
+    fn async_put_pending(&self, domain: PowerDomain) -> bool {
+        self.async_put_domains
+            .iter()
+            .any(|pending| pending.contains(&domain))
+    }
+
+    fn take_async_put(&mut self, domain: PowerDomain) -> bool {
+        for pending in &mut self.async_put_domains {
+            if let Some(index) = pending.iter().position(|candidate| *candidate == domain) {
+                pending.swap_remove(index);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Queue a delayed final reference release, or drop a non-final reference now.
+    ///
+    /// A negative delay selects i915's 100 ms default. The caller owns the
+    /// runtime-PM reference and arms work when this returns `Arm`.
+    // upstream: intel_display_power.c __intel_display_power_put_async()
+    pub fn put_async(
+        &mut self,
+        map: &[PowerWellGroup],
+        domain: PowerDomain,
+        delay_ms: i32,
+        io: &mut impl PowerDomainIo,
+    ) -> Result<AsyncPutAction, PowerDomainError> {
+        self.validate_map(map)?;
+        let use_count = self.domain_use_count(domain);
+        if use_count == 0 {
+            return Err(PowerDomainError::UnbalancedPut(domain));
+        }
+        if use_count > 1 {
+            self.put(map, domain, io)?;
+            return Ok(AsyncPutAction::Idle);
+        }
+        if self.async_put_pending(domain) {
+            return Err(PowerDomainError::AsyncPutAlreadyPending(domain));
+        }
+
+        let delay_ms = if delay_ms >= 0 { delay_ms as u32 } else { 100 };
+        if self.async_put_armed.is_some() {
+            self.async_put_domains[1].push(domain);
+            self.async_put_next_delay_ms = self.async_put_next_delay_ms.max(delay_ms);
+            Ok(AsyncPutAction::ExistingWork)
+        } else {
+            self.async_put_domains[0].push(domain);
+            self.async_put_armed = Some(delay_ms);
+            Ok(AsyncPutAction::Arm { delay_ms })
+        }
+    }
+
+    /// Complete the current delayed batch and request a requeue if later puts arrived.
+    // upstream: intel_display_power.c intel_display_power_put_async_work()
+    pub fn process_async_put_work(
+        &mut self,
+        map: &[PowerWellGroup],
+        io: &mut impl PowerDomainIo,
+    ) -> Result<AsyncPutAction, PowerDomainError> {
+        self.validate_map(map)?;
+        if self.async_put_armed.take().is_none() {
+            return Ok(AsyncPutAction::Idle);
+        }
+        let current = core::mem::take(&mut self.async_put_domains[0]);
+        for (index, domain) in current.iter().copied().enumerate() {
+            if let Err(error) = self.put(map, domain, io) {
+                self.async_put_domains[0].extend_from_slice(&current[index..]);
+                self.async_put_armed = Some(0);
+                return Err(error);
+            }
+        }
+        if self.async_put_domains[1].is_empty() {
+            self.async_put_next_delay_ms = 0;
+            return Ok(AsyncPutAction::Idle);
+        }
+
+        self.async_put_domains[0] = core::mem::take(&mut self.async_put_domains[1]);
+        let delay_ms = core::mem::take(&mut self.async_put_next_delay_ms);
+        self.async_put_armed = Some(delay_ms);
+        Ok(AsyncPutAction::Arm { delay_ms })
+    }
+
+    /// Synchronously release both delayed batches, matching the source flush operation.
+    // upstream: intel_display_power.c intel_display_power_flush_work()
+    pub fn flush_async_puts(
+        &mut self,
+        map: &[PowerWellGroup],
+        io: &mut impl PowerDomainIo,
+    ) -> Result<usize, PowerDomainError> {
+        self.validate_map(map)?;
+        self.async_put_armed = None;
+        self.async_put_next_delay_ms = 0;
+        let mut pending = core::mem::take(&mut self.async_put_domains[0]);
+        pending.extend(core::mem::take(&mut self.async_put_domains[1]));
+        let mut released = 0;
+        for (index, domain) in pending.iter().copied().enumerate() {
+            if let Err(error) = self.put(map, domain, io) {
+                self.async_put_domains[0].extend_from_slice(&pending[index..]);
+                self.async_put_armed = Some(0);
+                return Err(error);
+            }
+            released += 1;
+        }
+        Ok(released)
     }
 }
 
@@ -487,5 +618,77 @@ mod tests {
         let mut io = FakePower::default();
         state.sync_domain(map, PowerDomain::PipeA, &mut io).unwrap();
         assert_eq!(io.synced, ["always-on", "PW_A"]);
+    }
+
+    #[test]
+    fn async_put_reuses_pending_reference_on_get_and_releases_after_work() {
+        let map = power_wells(DmcPlatform::AlderLakeN);
+        let mut state = PowerDomainState::new(map);
+        let mut io = FakePower::default();
+        state.get(map, PowerDomain::PipeA, &mut io).unwrap();
+        state.get(map, PowerDomain::PipeA, &mut io).unwrap();
+        assert_eq!(
+            state
+                .put_async(map, PowerDomain::PipeA, 20, &mut io)
+                .unwrap(),
+            AsyncPutAction::Idle
+        );
+        assert_eq!(state.domain_use_count(PowerDomain::PipeA), 1);
+        assert_eq!(
+            state
+                .put_async(map, PowerDomain::PipeA, -1, &mut io)
+                .unwrap(),
+            AsyncPutAction::Arm { delay_ms: 100 }
+        );
+        // Source `grab_async_put_ref()` cancels the delayed drop and reuses
+        // the existing count/well, rather than toggling hardware.
+        state.get(map, PowerDomain::PipeA, &mut io).unwrap();
+        assert_eq!(state.domain_use_count(PowerDomain::PipeA), 1);
+        assert_eq!(io.enabled.iter().filter(|name| **name == "PW_A").count(), 1);
+        assert_eq!(
+            state
+                .put_async(map, PowerDomain::PipeA, 0, &mut io)
+                .unwrap(),
+            AsyncPutAction::ExistingWork
+        );
+        assert_eq!(
+            state.process_async_put_work(map, &mut io).unwrap(),
+            AsyncPutAction::Arm { delay_ms: 0 }
+        );
+        assert_eq!(
+            state.process_async_put_work(map, &mut io).unwrap(),
+            AsyncPutAction::Idle
+        );
+        assert_eq!(state.domain_use_count(PowerDomain::PipeA), 0);
+        assert!(io.disabled.contains(&"PW_A"));
+    }
+
+    #[test]
+    fn async_put_uses_two_batches_and_maximum_requeue_delay() {
+        let map = power_wells(DmcPlatform::AlderLakeN);
+        let mut state = PowerDomainState::new(map);
+        let mut io = FakePower::default();
+        state.get(map, PowerDomain::PipeA, &mut io).unwrap();
+        state.get(map, PowerDomain::PipeB, &mut io).unwrap();
+        assert_eq!(
+            state
+                .put_async(map, PowerDomain::PipeA, 10, &mut io)
+                .unwrap(),
+            AsyncPutAction::Arm { delay_ms: 10 }
+        );
+        assert_eq!(
+            state
+                .put_async(map, PowerDomain::PipeB, 40, &mut io)
+                .unwrap(),
+            AsyncPutAction::ExistingWork
+        );
+        assert_eq!(
+            state.process_async_put_work(map, &mut io).unwrap(),
+            AsyncPutAction::Arm { delay_ms: 40 }
+        );
+        assert_eq!(state.domain_use_count(PowerDomain::PipeA), 0);
+        assert_eq!(state.domain_use_count(PowerDomain::PipeB), 1);
+        assert_eq!(state.flush_async_puts(map, &mut io).unwrap(), 1);
+        assert_eq!(state.domain_use_count(PowerDomain::PipeB), 0);
     }
 }
