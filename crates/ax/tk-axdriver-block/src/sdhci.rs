@@ -161,10 +161,18 @@ pub const SDHCI_INT_ADMAERR: u32 = 0x02000000;
 pub const SDHCI_INT_TUNEERR: u32 = 0x04000000;
 pub const SDHCI_INT_NORMAL_MASK: u32 = 0x00007FFF;
 pub const SDHCI_INT_ERROR_MASK: u32 = 0xFFFF8000;
-pub const SDHCI_INT_CMD_ERROR_MASK: u32 = SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX;
+pub const SDHCI_INT_CMD_ERROR_MASK: u32 =
+    SDHCI_INT_TIMEOUT | SDHCI_INT_CRC | SDHCI_INT_END_BIT | SDHCI_INT_INDEX;
 pub const SDHCI_INT_CMD_MASK: u32 = SDHCI_INT_RESPONSE | SDHCI_INT_CMD_ERROR_MASK;
-pub const SDHCI_INT_DATA_MASK: u32 = SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL | SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT;
-pub const SDHCI_DIVIDERS_MASK: u32 = (SDHCI_DIVIDER_MASK << SDHCI_DIVIDER_SHIFT) | (SDHCI_DIVIDER_HI_MASK << SDHCI_DIVIDER_HI_SHIFT);
+pub const SDHCI_INT_DATA_MASK: u32 = SDHCI_INT_DATA_END
+    | SDHCI_INT_DMA_END
+    | SDHCI_INT_DATA_AVAIL
+    | SDHCI_INT_SPACE_AVAIL
+    | SDHCI_INT_DATA_TIMEOUT
+    | SDHCI_INT_DATA_CRC
+    | SDHCI_INT_DATA_END_BIT;
+pub const SDHCI_DIVIDERS_MASK: u32 =
+    (SDHCI_DIVIDER_MASK << SDHCI_DIVIDER_SHIFT) | (SDHCI_DIVIDER_HI_MASK << SDHCI_DIVIDER_HI_SHIFT);
 pub const SDHCI_ACMD12_ERR: u32 = 0x3C;
 pub const SDHCI_HOST_CONTROL2: u32 = 0x3E;
 pub const SDHCI_CTRL2_PRESET_VALUE: u32 = 0x8000;
@@ -338,13 +346,24 @@ impl<I: SdhciIo> SdhciHost<I> {
     // upstream: sdhci.c sdhci_generic_reset()
     pub fn initialize(&mut self) -> Result<(), SdhciError> {
         self.reset(SDHCI_RESET_ALL as u8)?;
-        self.io.write8(SDHCI_POWER_CONTROL as usize, (SDHCI_POWER_330 | SDHCI_POWER_ON) as u8);
+        self.io.write8(
+            SDHCI_POWER_CONTROL as usize,
+            (SDHCI_POWER_330 | SDHCI_POWER_ON) as u8,
+        );
         self.set_clock(400_000)?;
         self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
-        self.io.write32(SDHCI_INT_ENABLE as usize, SDHCI_INT_RESPONSE
-            | SDHCI_INT_DATA_END | SDHCI_INT_SPACE_AVAIL | SDHCI_INT_DATA_AVAIL
-            | SDHCI_INT_ERROR | SDHCI_INT_CMD_ERROR_MASK | SDHCI_INT_DATA_TIMEOUT
-            | SDHCI_INT_DATA_CRC | SDHCI_INT_DATA_END_BIT);
+        self.io.write32(
+            SDHCI_INT_ENABLE as usize,
+            SDHCI_INT_RESPONSE
+                | SDHCI_INT_DATA_END
+                | SDHCI_INT_SPACE_AVAIL
+                | SDHCI_INT_DATA_AVAIL
+                | SDHCI_INT_ERROR
+                | SDHCI_INT_CMD_ERROR_MASK
+                | SDHCI_INT_DATA_TIMEOUT
+                | SDHCI_INT_DATA_CRC
+                | SDHCI_INT_DATA_END_BIT,
+        );
         self.io.write32(SDHCI_SIGNAL_ENABLE as usize, 0);
         Ok(())
     }
@@ -375,11 +394,16 @@ impl<I: SdhciIo> SdhciHost<I> {
         } else {
             ((divisor >> 1) & SDHCI_DIVIDER_MASK) << SDHCI_DIVIDER_SHIFT
         } as u16;
-        self.io.write16(SDHCI_CLOCK_CONTROL as usize, encoded | SDHCI_CLOCK_INT_EN as u16);
+        self.io.write16(
+            SDHCI_CLOCK_CONTROL as usize,
+            encoded | SDHCI_CLOCK_INT_EN as u16,
+        );
         for _ in 0..self.timeout_polls {
             if self.io.read16(SDHCI_CLOCK_CONTROL as usize) & SDHCI_CLOCK_INT_STABLE as u16 != 0 {
-                self.io.write16(SDHCI_CLOCK_CONTROL as usize,
-                    encoded | SDHCI_CLOCK_INT_EN as u16 | SDHCI_CLOCK_CARD_EN as u16);
+                self.io.write16(
+                    SDHCI_CLOCK_CONTROL as usize,
+                    encoded | SDHCI_CLOCK_INT_EN as u16 | SDHCI_CLOCK_CARD_EN as u16,
+                );
                 self.clock_hz = self.base_clock_hz / divisor;
                 return Ok(());
             }
@@ -420,21 +444,34 @@ impl<I: SdhciIo> SdhciHost<I> {
             return Err(SdhciError::NoCard);
         }
         let (transfer, blocks) = if let Some(buffer) = data.as_ref() {
-            if block_size == 0 || !buffer.len().is_multiple_of(block_size)
-                || buffer.len() / block_size > u16::MAX as usize {
+            if block_size == 0
+                || !buffer.len().is_multiple_of(block_size)
+                || buffer.len() / block_size > u16::MAX as usize
+            {
                 return Err(SdhciError::InvalidTransfer);
             }
             let count = buffer.len() / block_size;
             let mut mode = SDHCI_TRNS_BLK_CNT_EN as u16;
-            if count > 1 { mode |= SDHCI_TRNS_MULTI as u16; }
-            if command_flags & SDHCI_CMD_DATA as u16 != 0 && index == 17 || index == 18 {
+            if count > 1 {
+                mode |= SDHCI_TRNS_MULTI as u16;
+            }
+            if command_flags & SDHCI_CMD_DATA as u16 != 0 && matches!(index, 8 | 17 | 18) {
                 mode |= SDHCI_TRNS_READ as u16;
             }
             (Some(mode), count as u16)
-        } else { (None, 0) };
-        let inhibit = SDHCI_CMD_INHIBIT | if transfer.is_some() { SDHCI_DAT_INHIBIT } else { 0 };
+        } else {
+            (None, 0)
+        };
+        let inhibit = SDHCI_CMD_INHIBIT
+            | if transfer.is_some() {
+                SDHCI_DAT_INHIBIT
+            } else {
+                0
+            };
         for _ in 0..self.timeout_polls {
-            if self.io.read32(SDHCI_PRESENT_STATE as usize) & inhibit == 0 { break; }
+            if self.io.read32(SDHCI_PRESENT_STATE as usize) & inhibit == 0 {
+                break;
+            }
             self.io.delay_us(10);
         }
         if self.io.read32(SDHCI_PRESENT_STATE as usize) & inhibit != 0 {
@@ -442,15 +479,20 @@ impl<I: SdhciIo> SdhciHost<I> {
         }
         self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
         if let (Some(_), Some(buffer)) = (transfer, data.as_ref()) {
-            self.io.write16(SDHCI_BLOCK_SIZE as usize,
-                make_block_size(0, block_size as u32) as u16);
+            self.io.write16(
+                SDHCI_BLOCK_SIZE as usize,
+                make_block_size(0, block_size as u32) as u16,
+            );
             self.io.write16(SDHCI_BLOCK_COUNT as usize, blocks);
-            self.io.write16(SDHCI_TRANSFER_MODE as usize, transfer.unwrap());
+            self.io
+                .write16(SDHCI_TRANSFER_MODE as usize, transfer.unwrap());
             let _ = buffer;
         }
         self.io.write32(SDHCI_ARGUMENT as usize, argument);
-        self.io.write16(SDHCI_COMMAND_FLAGS as usize,
-            ((index as u16) << 8) | command_flags);
+        self.io.write16(
+            SDHCI_COMMAND_FLAGS as usize,
+            ((index as u16) << 8) | command_flags,
+        );
         let mut response = SdhciResponse::default();
         self.wait_status(SDHCI_INT_RESPONSE)?;
         for (n, word) in response.0.iter_mut().enumerate() {
@@ -459,23 +501,285 @@ impl<I: SdhciIo> SdhciHost<I> {
         if let Some(buffer) = data {
             let mut offset = 0usize;
             while offset < buffer.len() {
-                self.wait_status(if index == 17 || index == 18 {
+                self.wait_status(if matches!(index, 8 | 17 | 18) {
                     SDHCI_INT_DATA_AVAIL
-                } else { SDHCI_INT_SPACE_AVAIL })?;
+                } else {
+                    SDHCI_INT_SPACE_AVAIL
+                })?;
                 let end = (offset + 4).min(buffer.len());
-                if index == 17 || index == 18 {
+                if matches!(index, 8 | 17 | 18) {
                     let word = self.io.read32(SDHCI_BUFFER as usize).to_le_bytes();
                     buffer[offset..end].copy_from_slice(&word[..end - offset]);
                 } else {
                     let mut bytes = [0u8; 4];
                     bytes[..end - offset].copy_from_slice(&buffer[offset..end]);
-                    self.io.write32(SDHCI_BUFFER as usize, u32::from_le_bytes(bytes));
+                    self.io
+                        .write32(SDHCI_BUFFER as usize, u32::from_le_bytes(bytes));
                 }
                 offset = end;
             }
             self.wait_status(SDHCI_INT_DATA_END)?;
         }
         Ok(response)
+    }
+}
+
+const SD_CMD_GO_IDLE: u8 = 0;
+const MMC_CMD_SEND_OP_COND: u8 = 1;
+const SD_CMD_ALL_SEND_CID: u8 = 2;
+const SD_CMD_SEND_RELATIVE_ADDR: u8 = 3;
+const SD_CMD_SEND_CSD: u8 = 9;
+const SD_CMD_SELECT_CARD: u8 = 7;
+const SD_CMD_SEND_STATUS: u8 = 13;
+const SD_CMD_SET_BLOCKLEN: u8 = 16;
+const SD_CMD_READ_SINGLE: u8 = 17;
+const SD_CMD_WRITE_SINGLE: u8 = 24;
+const SD_CMD_APP: u8 = 55;
+const SD_ACMD_OP_COND: u8 = 41;
+const SD_ACMD_SET_WIDTH: u8 = 6;
+const RSP_NONE: u16 = SDHCI_CMD_RESP_NONE as u16;
+const SD_R1: u16 = SDHCI_CMD_RESP_SHORT as u16 | SDHCI_CMD_CRC as u16 | SDHCI_CMD_INDEX as u16;
+const SD_R1B: u16 =
+    SDHCI_CMD_RESP_SHORT_BUSY as u16 | SDHCI_CMD_CRC as u16 | SDHCI_CMD_INDEX as u16;
+const SD_R2: u16 = SDHCI_CMD_RESP_LONG as u16;
+const SD_R3: u16 = SDHCI_CMD_RESP_SHORT as u16;
+const SD_DATA: u16 = SDHCI_CMD_DATA as u16;
+const SD_OCR_READY: u32 = 1 << 31;
+const SD_OCR_CCS: u32 = 1 << 30;
+const SD_OCR_VOLTAGE: u32 = 0x00ff_8000;
+
+/// SD card block device initialized through the generic SDHCI command path.
+pub struct SdhciDisk<I: SdhciIo> {
+    host: SdhciHost<I>,
+    rca: u16,
+    sectors: u64,
+    high_capacity: bool,
+}
+
+impl<I: SdhciIo> SdhciDisk<I> {
+    /// Initializes an SD memory card and reads its CSD capacity.
+    // upstream: mmc.c mmc_idle_cards(), mmc_send_if_cond(), mmc_send_app_op_cond(), mmc_send_op_cond(), mmc_all_send_cid(), mmc_send_relative_addr(), mmc_send_csd(), mmc_select_card()
+    pub fn attach(mut host: SdhciHost<I>) -> Result<Self, SdhciError> {
+        host.initialize()?;
+        host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
+        let version2 = host.command(8, 0x1aa, SD_R1, None, 0).is_ok();
+        let mut sd_ocr = None;
+        for _ in 0..100 {
+            if host.command(SD_CMD_APP, 0, SD_R1, None, 0).is_err() {
+                break;
+            }
+            let argument = SD_OCR_VOLTAGE | if version2 { SD_OCR_CCS } else { 0 };
+            match host.command(SD_ACMD_OP_COND, argument, SD_R3, None, 0) {
+                Ok(response) if response.0[0] & SD_OCR_READY != 0 => {
+                    sd_ocr = Some(response.0[0]);
+                    break;
+                }
+                Ok(_) => host.io.delay_us(10_000),
+                Err(_) => break,
+            }
+        }
+        let (mmc, ocr) = if let Some(ocr) = sd_ocr {
+            (false, ocr)
+        } else {
+            host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
+            let mut mmc_ocr = None;
+            for _ in 0..100 {
+                match host.command(
+                    MMC_CMD_SEND_OP_COND,
+                    SD_OCR_VOLTAGE | SD_OCR_CCS,
+                    SD_R3,
+                    None,
+                    0,
+                ) {
+                    Ok(response) if response.0[0] & SD_OCR_READY != 0 => {
+                        mmc_ocr = Some(response.0[0]);
+                        break;
+                    }
+                    Ok(_) => host.io.delay_us(10_000),
+                    Err(error) => return Err(error),
+                }
+            }
+            (true, mmc_ocr.ok_or(SdhciError::Timeout)?)
+        };
+        host.command(SD_CMD_ALL_SEND_CID, 0, SD_R2, None, 0)?;
+        let high_capacity = ocr & SD_OCR_CCS != 0;
+        let rca = if mmc {
+            host.command(SD_CMD_SEND_RELATIVE_ADDR, 1 << 16, SD_R1, None, 0)?;
+            1
+        } else {
+            (host
+                .command(SD_CMD_SEND_RELATIVE_ADDR, 0, SD_R1, None, 0)?
+                .0[0]
+                >> 16) as u16
+        };
+        let csd = host.command(SD_CMD_SEND_CSD, u32::from(rca) << 16, SD_R2, None, 0)?;
+        host.command(SD_CMD_SELECT_CARD, u32::from(rca) << 16, SD_R1B, None, 0)?;
+        let mut sectors = if high_capacity {
+            (u64::from(response_bits(csd, 48, 22)) + 1) * 1024
+        } else {
+            let read_len = response_bits(csd, 80, 4);
+            let c_size = u64::from(response_bits(csd, 62, 12));
+            let c_mult = response_bits(csd, 47, 3);
+            ((c_size + 1)
+                .checked_shl(c_mult + 2 + read_len)
+                .ok_or(SdhciError::InvalidTransfer)?)
+                / 512
+        };
+        if mmc && high_capacity {
+            let mut ext_csd = [0u8; 512];
+            host.command(8, 0, SD_R1 | SD_DATA, Some(&mut ext_csd), 512)?;
+            let ext_sectors =
+                u32::from_le_bytes([ext_csd[212], ext_csd[213], ext_csd[214], ext_csd[215]]);
+            if ext_sectors != 0 {
+                sectors = u64::from(ext_sectors);
+            }
+        }
+        if sectors == 0 {
+            return Err(SdhciError::InvalidTransfer);
+        }
+        if !high_capacity {
+            host.command(SD_CMD_SET_BLOCKLEN, 512, SD_R1, None, 0)?;
+        }
+        if !mmc {
+            host.command(SD_CMD_APP, u32::from(rca) << 16, SD_R1, None, 0)?;
+            host.command(SD_ACMD_SET_WIDTH, 0, SD_R1, None, 0)?;
+        }
+        let target = host.base_clock_hz.min(25_000_000);
+        host.set_clock(target)?;
+        Ok(Self {
+            host,
+            rca,
+            sectors,
+            high_capacity,
+        })
+    }
+
+    // upstream: mmcsd.c mmcsd_rw() card-address conversion
+    fn card_address(&self, lba: u64) -> Result<u32, SdhciError> {
+        let address = if self.high_capacity {
+            lba
+        } else {
+            lba.checked_mul(512).ok_or(SdhciError::InvalidTransfer)?
+        };
+        u32::try_from(address).map_err(|_| SdhciError::InvalidTransfer)
+    }
+
+    // upstream: mmc.c mmc_wait_for_command() ready-for-data polling
+    fn wait_ready(&mut self) -> Result<(), SdhciError> {
+        for _ in 0..1000 {
+            let status = self
+                .host
+                .command(
+                    SD_CMD_SEND_STATUS,
+                    u32::from(self.rca) << 16,
+                    SD_R1,
+                    None,
+                    0,
+                )?
+                .0[0];
+            if status & (1 << 8) != 0 && status & (0xf << 9) == 4 << 9 {
+                return Ok(());
+            }
+            self.host.io.delay_us(1000);
+        }
+        Err(SdhciError::Timeout)
+    }
+
+    // upstream: mmcsd.c mmcsd_rw() single-block transaction
+    fn transfer(&mut self, lba: u64, data: &mut [u8], write: bool) -> Result<(), SdhciError> {
+        if data.len() != 512 || lba >= self.sectors {
+            return Err(SdhciError::InvalidTransfer);
+        }
+        let command = if write {
+            SD_CMD_WRITE_SINGLE
+        } else {
+            SD_CMD_READ_SINGLE
+        };
+        self.host.command(
+            command,
+            self.card_address(lba)?,
+            SD_R1 | SD_DATA,
+            Some(data),
+            512,
+        )?;
+        if write {
+            self.wait_ready()?;
+        }
+        Ok(())
+    }
+}
+
+impl<I: SdhciIo> crate::BaseDriverOps for SdhciDisk<I> {
+    fn device_name(&self) -> &str {
+        "mmcblk0"
+    }
+    fn device_type(&self) -> crate::DeviceType {
+        crate::DeviceType::Block
+    }
+}
+
+impl<I: SdhciIo> crate::BlockDriverOps for SdhciDisk<I> {
+    fn num_blocks(&self) -> u64 {
+        self.sectors
+    }
+    fn block_size(&self) -> usize {
+        512
+    }
+    // upstream: mmcsd.c mmcsd_rw() read path
+    fn read_block(&mut self, block: u64, output: &mut [u8]) -> crate::DevResult {
+        if !output.len().is_multiple_of(512)
+            || block
+                .checked_add((output.len() / 512) as u64)
+                .is_none_or(|end| end > self.sectors)
+        {
+            return Err(crate::DevError::InvalidParam);
+        }
+        for (index, sector) in output.chunks_exact_mut(512).enumerate() {
+            self.transfer(block + index as u64, sector, false)
+                .map_err(map_sdhci_error)?;
+        }
+        Ok(())
+    }
+    // upstream: mmcsd.c mmcsd_rw() write path
+    fn write_block(&mut self, block: u64, input: &[u8]) -> crate::DevResult {
+        if !input.len().is_multiple_of(512)
+            || block
+                .checked_add((input.len() / 512) as u64)
+                .is_none_or(|end| end > self.sectors)
+        {
+            return Err(crate::DevError::InvalidParam);
+        }
+        for (index, chunk) in input.chunks_exact(512).enumerate() {
+            let mut sector = [0u8; 512];
+            sector.copy_from_slice(chunk);
+            self.transfer(block + index as u64, &mut sector, true)
+                .map_err(map_sdhci_error)?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> crate::DevResult {
+        self.wait_ready().map_err(map_sdhci_error)
+    }
+}
+
+// upstream: mmc.c mmc_get_bits()
+fn response_bits(response: SdhciResponse, lsb: u32, width: u32) -> u32 {
+    if width == 0 || width > 32 || lsb >= 128 || lsb + width > 128 {
+        return 0;
+    }
+    let raw = u128::from(response.0[0])
+        | (u128::from(response.0[1]) << 32)
+        | (u128::from(response.0[2]) << 64)
+        | (u128::from(response.0[3]) << 96);
+    ((raw >> lsb) & ((1u128 << width) - 1)) as u32
+}
+
+fn map_sdhci_error(error: SdhciError) -> crate::DevError {
+    match error {
+        SdhciError::NoCard => crate::DevError::Io,
+        SdhciError::InvalidTransfer => crate::DevError::InvalidParam,
+        SdhciError::Timeout | SdhciError::Controller(_) => crate::DevError::Io,
+        SdhciError::UnsupportedClock => crate::DevError::Unsupported,
     }
 }
 
@@ -491,7 +795,11 @@ mod tests {
 
     impl Default for MockIo {
         fn default() -> Self {
-            Self { registers: [0; 64], command: 0, argument: 0 }
+            Self {
+                registers: [0; 64],
+                command: 0,
+                argument: 0,
+            }
         }
     }
 
@@ -561,6 +869,14 @@ mod tests {
     }
 
     #[test]
+    fn response_bit_ranges_use_the_specified_lsb_numbering() {
+        let response = SdhciResponse([0x89ab_cdef, 0x0123_4567, 0, 0]);
+        assert_eq!(response_bits(response, 0, 32), 0x89ab_cdef);
+        assert_eq!(response_bits(response, 32, 32), 0x0123_4567);
+        assert_eq!(response_bits(response, 28, 8), 0x78);
+    }
+
+    #[test]
     fn host_reset_clock_and_command_response_are_bounded() {
         let mut io = MockIo::default();
         io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
@@ -569,9 +885,14 @@ mod tests {
         let mut host = SdhciHost::new(io, caps, 0, SDHCI_SPEC_300 as u8);
         host.initialize().unwrap();
         assert!(host.clock_hz() <= 400_000);
-        let response = host.command(8, 0x1aa, SDHCI_CMD_RESP_SHORT as u16, None, 0).unwrap();
+        let response = host
+            .command(8, 0x1aa, SDHCI_CMD_RESP_SHORT as u16, None, 0)
+            .unwrap();
         assert_eq!(response.0[0], 0x1234_5678);
-        assert_eq!(host.io_mut().command, (8 << 8) | SDHCI_CMD_RESP_SHORT as u16);
+        assert_eq!(
+            host.io_mut().command,
+            (8 << 8) | SDHCI_CMD_RESP_SHORT as u16
+        );
         assert_eq!(host.io_mut().argument, 0x1aa);
     }
 }
