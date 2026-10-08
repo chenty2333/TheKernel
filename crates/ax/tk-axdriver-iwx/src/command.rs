@@ -73,7 +73,7 @@ pub struct EncodedCommand {
 impl EncodedCommand {
     /// Format the command header, concatenate payload parts, and apply the
     /// group-0-to-LONG_GROUP compatibility conversion.
-    // upstream: if_iwx.c iwx_send_cmd() payload and wide-header preparation
+    // upstream: if_iwx.c iwx_send_cmd()
     pub fn encode(command: &HostCommand<'_>, slot: u8, queue: u8) -> Result<Self, CommandError> {
         if command.parts.len() > MAX_HOST_COMMAND_PARTS {
             return Err(CommandError::TooManyParts);
@@ -202,7 +202,7 @@ impl CommandSlots {
     }
 
     /// Reserve the response buffer before publishing the TX descriptor.
-    // upstream: if_iwx.c iwx_send_cmd() response-buffer allocation
+    // upstream: if_iwx.c iwx_send_cmd()
     pub fn reserve(
         &mut self,
         index: usize,
@@ -251,7 +251,7 @@ impl CommandSlots {
     }
 
     /// Store a matched command notification, rejecting failed or oversized replies.
-    // upstream: if_iwx.c RX command-response cases in iwx_notif_intr()
+    // upstream: if_iwx.c iwx_rx_pkt()
     pub fn receive_response(
         &mut self,
         queue_id: u8,
@@ -296,15 +296,13 @@ impl CommandSlots {
             .slots
             .get_mut(index)
             .ok_or(CommandError::InvalidIndex)?;
-        if !slot.active || slot.generation != generation {
-            return Ok(false);
+        if slot.active && slot.generation == generation {
+            slot.acknowledged = true;
+            slot.external_payload_released = true;
         }
-        if self.queued == 0 {
-            return Err(CommandError::InvalidResponse);
+        if self.queued > 0 {
+            self.queued -= 1;
         }
-        self.queued -= 1;
-        slot.acknowledged = true;
-        slot.external_payload_released = true;
         Ok(true)
     }
 
@@ -356,8 +354,6 @@ impl CommandSlots {
     }
 }
 
-const HBUS_TARG_WRPTR: u32 = 0x460;
-
 /// Identity and completion lifetime of one published command-ring descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandTicket {
@@ -368,7 +364,7 @@ pub struct CommandTicket {
 }
 
 /// Reserve response storage, write TFD, then kick the command queue pointer.
-// upstream: if_iwx.c iwx_send_cmd() enqueue/publish order
+// upstream: if_iwx.c iwx_send_cmd()
 pub fn send_host_command<B, R>(
     registers: &mut crate::IwxRegisters<B>,
     ring: &mut TxRing<R>,
@@ -393,10 +389,7 @@ where
     )?;
     match submit_command(ring, &encoded, external) {
         Ok(index) => {
-            registers.write_csr(
-                HBUS_TARG_WRPTR,
-                (u32::from(queue) << 16) | ring.current_hardware as u32,
-            );
+            registers.kick_tx_queue(ring.queue_id, ring.current_hardware);
             Ok(CommandTicket {
                 index,
                 generation,
@@ -425,7 +418,7 @@ pub fn command_response_status(response: &[u8], failed: bool) -> Result<u32, Com
 
 /// Submit a prepared command on the queue and copy its wire bytes into either
 /// the inline command array or the caller-provided external DMA buffer.
-// upstream: if_iwx.c iwx_send_cmd() descriptor write, sync and queue kick preparation
+// upstream: if_iwx.c iwx_send_cmd()
 pub fn submit_command<R: DmaRegion>(
     ring: &mut TxRing<R>,
     command: &EncodedCommand,
@@ -563,7 +556,7 @@ mod tests {
         slots.receive_response(7, 0, 1, &[9], false).unwrap();
         slots.reset(2);
         assert_eq!(slots.queued(), 0);
-        assert_eq!(slots.command_done(7, 0, 1), Ok(false));
+        assert_eq!(slots.command_done(7, 0, 1), Ok(true));
         assert_eq!(
             slots.reserve(0, 1, 0, 0, false),
             Err(CommandError::InvalidResponse)
@@ -598,7 +591,7 @@ mod tests {
             slots.take_completed(ticket.index, 7).unwrap().response,
             Some(response.to_vec())
         );
-        assert_eq!(registers.into_inner().0.last(), Some(&(HBUS_TARG_WRPTR, 1)));
+        assert_eq!(registers.into_inner().0.last(), Some(&(0x460, 1)));
     }
 
     #[test]

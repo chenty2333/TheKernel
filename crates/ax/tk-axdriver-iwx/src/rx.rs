@@ -19,7 +19,7 @@ pub fn signal_strength_dbm(
     descriptor: &[u8],
 ) -> Result<i16, RxMetadataError> {
     let energy_offset = if family >= DeviceFamily::Ax210 {
-        20 // RX_MPDU_RES_START_API_S_VER_3 descriptor v3
+        20 // absolute offset from iwx_rx_mpdu_desc start (v3)
     } else {
         12 // RX_MPDU_RES_START_API_S_VER_1 descriptor v1
     };

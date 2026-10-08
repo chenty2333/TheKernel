@@ -49,7 +49,7 @@ fn load_ax211_firmware() {
     *STAGED.lock() = Some(result);
 }
 
-// upstream: if_iwx.c iwx_read_firmware() and iwx_load_pnvm() file request paths
+// upstream: if_iwx.c iwx_read_firmware()
 fn load_bundle(
     mut request: impl FnMut(&str, usize) -> Option<Vec<u8>>,
     sku_id: Option<[u32; 3]>,
@@ -59,7 +59,7 @@ fn load_bundle(
         request(config.firmware, FW_MAX_BYTES).ok_or(FirmwareRequestError::FirmwareMissing)?;
     let image = FirmwareImage::parse(&bytes).map_err(FirmwareRequestError::FirmwareInvalid)?;
     let pnvm_file = if sku_id == Some([0; 3]) {
-        // upstream: iwx_load_pnvm() returns immediately for an all-zero SKU.
+        // upstream: if_iwx.c iwx_load_pnvm()
         None
     } else {
         match (image.pnvm.is_some(), config.pnvm) {

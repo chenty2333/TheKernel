@@ -19,4 +19,5 @@
 - Scan lifecycle: abort UMAC command and foreground/background scan flag/state ordering translated; full scan request builders remain.
 - Rate adaptation: 11g rate lookup and peer/local HT/VHT RX bitmap intersection are translated; TLC config command packing remains.
 - Post-ALIVE rate-format selection and command status-payload checks are wired into the firmware/host-command modules.
+- Review W-20..W-36 fixes: Gen3 queue modulus and doorbell kick, RX reset/command ACK/layout/context boot corrections, bounds, and normalized upstream markers (commit recorded below).
 - Remaining per coordinator W-19: continue the driver body in `if_iwx.c` function order and integrate PCI probe before doing further net80211 work.

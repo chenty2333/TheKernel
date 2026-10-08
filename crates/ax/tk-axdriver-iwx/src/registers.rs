@@ -21,6 +21,7 @@ const HBUS_TARG_MEM_RADDR: u32 = HBUS_BASE + 0x00c;
 const HBUS_TARG_MEM_WADDR: u32 = HBUS_BASE + 0x010;
 const HBUS_TARG_MEM_WDAT: u32 = HBUS_BASE + 0x018;
 const HBUS_TARG_MEM_RDAT: u32 = HBUS_BASE + 0x01c;
+const HBUS_TARG_WRPTR: u32 = HBUS_BASE + 0x060;
 const HBUS_TARG_PRPH_WADDR: u32 = HBUS_BASE + 0x044;
 const HBUS_TARG_PRPH_RADDR: u32 = HBUS_BASE + 0x048;
 const HBUS_TARG_PRPH_WDAT: u32 = HBUS_BASE + 0x04c;
@@ -115,6 +116,16 @@ impl<B: CsrAccess> IwxRegisters<B> {
     pub fn clear_csr_bits(&mut self, offset: u32, bits: u32) {
         let value = self.bus.read32(offset);
         self.bus.write32(offset, value & !bits);
+    }
+
+    /// Publish a TX queue producer index to the hardware doorbell.
+    // upstream: if_iwx.c iwx_tx() / iwx_send_cmd() queue write-pointer publication
+    pub fn kick_tx_queue(&mut self, queue_id: u16, write_index: usize) {
+        self.bus.write32(
+            HBUS_TARG_WRPTR,
+            (u32::from(queue_id) << 16) | write_index as u32,
+        );
+        self.bus.barrier(IoBarrier::Write);
     }
 
     /// The PRPH address width changes at AX210.

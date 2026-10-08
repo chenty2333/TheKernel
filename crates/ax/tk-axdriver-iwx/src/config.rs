@@ -72,7 +72,7 @@ pub enum DeviceConfig {
 }
 
 impl DeviceConfig {
-    // upstream: if_iwxvar.h iwx_device_cfg records and firmware aliases
+    // upstream: if_iwxvar.h iwx_2ax_cfg_so()
     pub const fn firmware(self) -> FirmwareConfig {
         match self {
             Self::SoGf4Ax411 => FirmwareConfig {
@@ -248,7 +248,7 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     /// Derive subsystem fields and silicon facts exactly as `iwx_find_device_cfg()` does.
-    // upstream: if_iwx.c iwx_find_device_cfg() subsystem and CSR field extraction
+    // upstream: if_iwx.c iwx_find_device_cfg()
     pub const fn from_hardware(
         device: u16,
         subdevice: u16,

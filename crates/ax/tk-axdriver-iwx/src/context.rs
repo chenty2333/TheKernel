@@ -72,8 +72,26 @@ pub fn build_gen2_context(
     Ok(bytes)
 }
 
+/// Publish the Gen2 context DMA address and start firmware self-load.
+// upstream: if_iwx.c iwx_ctxt_info_init()
+pub fn start_gen2_context<B: crate::CsrAccess>(
+    registers: &mut crate::IwxRegisters<B>,
+    context_address: u64,
+) -> Result<(), crate::RegisterError> {
+    const CSR_CTXT_INFO_BA: u32 = 0x040;
+    const UREG_CPU_INIT_RUN: u32 = 0x00a0_5c44;
+    registers.write_csr(CSR_CTXT_INFO_BA, context_address as u32);
+    registers.write_csr(CSR_CTXT_INFO_BA + 4, (context_address >> 32) as u32);
+    registers
+        .nic_lock()
+        .map_err(|_| crate::RegisterError::Busy)?;
+    let result = registers.write_prph(UREG_CPU_INIT_RUN, 1);
+    registers.nic_unlock();
+    result
+}
+
 /// Build the Gen3 peripheral scratch object and its firmware-image map.
-// upstream: if_iwx.c iwx_ctxt_info_gen3_init() scratch initialization
+// upstream: if_iwx.c iwx_ctxt_info_gen3_init()
 pub fn build_gen3_prph_scratch(
     mac_id: u16,
     free_rbd: u64,
@@ -125,7 +143,6 @@ pub fn build_gen3_context(
 ) -> Result<Vec<u8>, ContextError> {
     let mut bytes = zeroed_context(GEN3_CONTEXT_SIZE)?;
     put_u16(&mut bytes, 0, 0)?;
-    put_u16(&mut bytes, 2, (GEN3_CONTEXT_SIZE / 4) as u16)?;
     put_u64(&mut bytes, 8, prph_info)?;
     put_u64(&mut bytes, 16, addresses.rx_status)?;
     put_u64(&mut bytes, 24, prph_info + 4096 / 2)?;
@@ -138,9 +155,47 @@ pub fn build_gen3_context(
     put_u32(
         &mut bytes,
         96,
-        u32::try_from(prph_scratch_size / 4).map_err(|_| ContextError::InvalidAddressArray)?,
+        u32::try_from(prph_scratch_size).map_err(|_| ContextError::InvalidAddressArray)?,
     )?;
     Ok(bytes)
+}
+
+/// Publish Gen3 context/IML DMA addresses and start firmware self-load.
+// upstream: if_iwx.c iwx_ctxt_info_gen3_init()
+pub fn start_gen3_context<B: crate::CsrAccess>(
+    registers: &mut crate::IwxRegisters<B>,
+    context_address: u64,
+    iml_address: u64,
+    iml_size: u32,
+) -> Result<(), crate::RegisterError> {
+    const CSR_CTXT_INFO_ADDR: u32 = 0x118;
+    const CSR_IML_DATA_ADDR: u32 = 0x120;
+    const CSR_IML_SIZE_ADDR: u32 = 0x128;
+    const CSR_CTXT_INFO_BOOT_CTRL: u32 = 0x000;
+    const CSR_AUTO_FUNC_BOOT_ENA: u32 = 1 << 1;
+    const CSR_FUNC_SCRATCH: u32 = 0x02c;
+    const CSR_FUNC_SCRATCH_INIT_VALUE: u32 = 0x0101_0101;
+    const CSR_GP_CNTRL: u32 = 0x024;
+    const CSR_GP_CNTRL_ROM_START: u32 = 1 << 7;
+    const UREG_CPU_INIT_RUN: u32 = 0x00a0_5c44;
+    registers.write_csr(CSR_CTXT_INFO_ADDR, context_address as u32);
+    registers.write_csr(CSR_CTXT_INFO_ADDR + 4, (context_address >> 32) as u32);
+    registers.write_csr(CSR_IML_DATA_ADDR, iml_address as u32);
+    registers.write_csr(CSR_IML_DATA_ADDR + 4, (iml_address >> 32) as u32);
+    registers.write_csr(CSR_IML_SIZE_ADDR, iml_size);
+    registers.set_csr_bits(CSR_CTXT_INFO_BOOT_CTRL, CSR_AUTO_FUNC_BOOT_ENA);
+    registers
+        .nic_lock()
+        .map_err(|_| crate::RegisterError::Busy)?;
+    let result = if registers.family() >= crate::DeviceFamily::Bz {
+        registers.write_csr(CSR_FUNC_SCRATCH, CSR_FUNC_SCRATCH_INIT_VALUE);
+        registers.set_csr_bits(CSR_GP_CNTRL, CSR_GP_CNTRL_ROM_START);
+        Ok(())
+    } else {
+        registers.write_umac_prph(UREG_CPU_INIT_RUN, 1)
+    };
+    registers.nic_unlock();
+    result
 }
 
 fn validate_image_counts<R: crate::DmaRegion>(
@@ -308,14 +363,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(context.len(), GEN3_CONTEXT_SIZE);
-        assert_eq!(u16::from_le_bytes(context[2..4].try_into().unwrap()), 26);
+        assert_eq!(u16::from_le_bytes(context[2..4].try_into().unwrap()), 0);
         assert_eq!(&context[16..24], &3u64.to_le_bytes());
         assert_eq!(&context[52..60], &4u64.to_le_bytes());
         assert_eq!(&context[60..68], &2u64.to_le_bytes());
         assert_eq!(&context[88..96], &0x9000u64.to_le_bytes());
         assert_eq!(
             u32::from_le_bytes(context[96..100].try_into().unwrap()),
-            415
+            PRPH_SCRATCH_SIZE as u32
         );
     }
 }

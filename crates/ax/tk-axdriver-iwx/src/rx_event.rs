@@ -118,6 +118,9 @@ pub fn process_command_response(
     if !is_command_response(packet.command_id()) {
         return Ok(false);
     }
+    if packet.total_bytes < crate::RX_PACKET_HEADER_BYTES {
+        return Err(CommandError::InvalidResponse);
+    }
     let queue = packet.command_queue_id();
     if packet.is_notification() {
         return Ok(false);

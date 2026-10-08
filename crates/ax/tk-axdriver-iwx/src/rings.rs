@@ -14,6 +14,7 @@ use crate::{DmaAllocator, DmaError, DmaRegion};
 pub const RX_MQ_RING_COUNT: usize = 512;
 pub const RX_BUFFER_BYTES: usize = 4096;
 pub const TX_RING_COUNT: usize = 256;
+pub const GEN3_MAX_TFD_QUEUE_SIZE: usize = 65_536;
 pub const TX_DESCRIPTOR_BYTES: usize = 256;
 pub const TX_BUFFER_COUNT: usize = 25;
 pub const TX_COMMAND_BYTES: usize = 324;
@@ -32,7 +33,6 @@ pub enum RingError {
     InvalidIndex,
     RingFull,
     TooManyBuffers,
-    BufferTooLarge,
     InvalidCompletion,
 }
 
@@ -67,6 +67,7 @@ impl<R: DmaRegion> RxRing<R> {
     }
 
     /// Decode a completion ring entry.
+    // upstream: if_iwx.c iwx_rx_mpdu_mq()
     pub fn completion(&self, ring_index: usize) -> Result<RxCompletion, RingError> {
         if ring_index >= RX_MQ_RING_COUNT {
             return Err(RingError::InvalidIndex);
@@ -81,6 +82,7 @@ impl<R: DmaRegion> RxRing<R> {
     }
 
     /// Copy received bytes from the RBD buffer selected by `buffer_id`.
+    // upstream: if_iwx.c iwx_rx_mpdu_mq()
     pub fn read_buffer(
         &self,
         buffer_id: u16,
@@ -115,9 +117,6 @@ impl<R: DmaRegion> RxRing<R> {
     pub fn reset(&mut self) -> Result<(), RingError> {
         self.current = 0;
         self.status.write_at(0, &[0, 0])?;
-        for index in 0..self.buffers.len() {
-            self.repost(index as u16)?;
-        }
         Ok(())
     }
 }
@@ -167,6 +166,7 @@ pub struct TxRing<R: DmaRegion> {
     pub byte_counts: R,
     pub commands: R,
     pub queue_id: u16,
+    pub max_tfd_queue_size: usize,
     pub current: usize,
     pub current_hardware: usize,
     pub tail: usize,
@@ -189,9 +189,22 @@ impl<R: DmaRegion> TxRing<R> {
     }
 
     /// Build and publish one AX210 TFD and its Gen3 byte-count entry.
-    // upstream: iwx_tx() descriptor fill + iwx_tx_update_byte_tbl()
+    // upstream: if_iwx.c iwx_tx()
     pub fn submit(&mut self, segments: &[TxSegment], byte_count: u16) -> Result<usize, RingError> {
         self.submit_inner(segments, Some(byte_count))
+    }
+
+    /// Submit a frame and ring the AX210/Gen3 HBUS hardware write-pointer.
+    // upstream: if_iwx.c iwx_tx()
+    pub fn submit_and_kick<B: crate::CsrAccess>(
+        &mut self,
+        registers: &mut crate::IwxRegisters<B>,
+        segments: &[TxSegment],
+        byte_count: u16,
+    ) -> Result<usize, RingError> {
+        let index = self.submit(segments, byte_count)?;
+        registers.kick_tx_queue(self.queue_id, self.current_hardware);
+        Ok(index)
     }
 
     /// Submit a command-queue TFD without changing the scheduler byte-count table.
@@ -201,6 +214,18 @@ impl<R: DmaRegion> TxRing<R> {
         segments: &[TxSegment],
     ) -> Result<usize, RingError> {
         self.submit_inner(segments, None)
+    }
+
+    /// Submit a host command and notify firmware without touching the byte-count table.
+    // upstream: if_iwx.c iwx_send_cmd()
+    pub fn submit_command_and_kick<B: crate::CsrAccess>(
+        &mut self,
+        registers: &mut crate::IwxRegisters<B>,
+        segments: &[TxSegment],
+    ) -> Result<usize, RingError> {
+        let index = self.submit_without_byte_count(segments)?;
+        registers.kick_tx_queue(self.queue_id, self.current_hardware);
+        Ok(index)
     }
 
     fn submit_inner(
@@ -218,9 +243,6 @@ impl<R: DmaRegion> TxRing<R> {
         let mut tfd = [0u8; TX_DESCRIPTOR_BYTES];
         tfd[..2].copy_from_slice(&(segments.len() as u16).to_le_bytes());
         for (slot, segment) in segments.iter().enumerate() {
-            if segment.length as usize > 4092 {
-                return Err(RingError::BufferTooLarge);
-            }
             let offset = 2 + slot * 10;
             tfd[offset..offset + 2].copy_from_slice(&segment.length.to_le_bytes());
             tfd[offset + 2..offset + 10].copy_from_slice(&segment.address.to_le_bytes());
@@ -232,28 +254,28 @@ impl<R: DmaRegion> TxRing<R> {
             self.byte_counts.write_at(index * 2, &entry.to_le_bytes())?;
         }
         self.current = (self.current + 1) % TX_RING_COUNT;
-        self.current_hardware = (self.current_hardware + 1) % TX_RING_COUNT;
+        self.current_hardware = (self.current_hardware + 1) % self.max_tfd_queue_size;
         self.queued += 1;
         Ok(index)
     }
 
     /// Retire descriptors up to (but excluding) the hardware producer index.
+    // upstream: if_iwx.c iwx_txq_advance()
     pub fn advance_to(&mut self, hardware_index: usize) -> Result<Vec<usize>, RingError> {
-        if hardware_index >= TX_RING_COUNT {
+        if hardware_index >= self.max_tfd_queue_size {
             return Err(RingError::InvalidIndex);
         }
         let mut completed = Vec::new();
         while self.tail_hardware != hardware_index {
-            if self.queued == 0 {
-                return Err(RingError::InvalidCompletion);
-            }
             completed
                 .try_reserve(1)
                 .map_err(|_| RingError::Dma(DmaError::AllocationFailed))?;
             completed.push(self.tail);
             self.tail = (self.tail + 1) % TX_RING_COUNT;
-            self.tail_hardware = (self.tail_hardware + 1) % TX_RING_COUNT;
-            self.queued -= 1;
+            self.tail_hardware = (self.tail_hardware + 1) % self.max_tfd_queue_size;
+            if self.queued > 0 {
+                self.queued -= 1;
+            }
         }
         Ok(completed)
     }
@@ -299,6 +321,17 @@ pub fn allocate_tx_ring<A: DmaAllocator>(
     allocator: &mut A,
     queue_id: u16,
 ) -> Result<TxRing<A::Region>, RingError> {
+    allocate_tx_ring_for(allocator, queue_id, TX_RING_COUNT)
+}
+
+pub fn allocate_tx_ring_for<A: DmaAllocator>(
+    allocator: &mut A,
+    queue_id: u16,
+    max_tfd_queue_size: usize,
+) -> Result<TxRing<A::Region>, RingError> {
+    if max_tfd_queue_size < TX_RING_COUNT || !max_tfd_queue_size.is_power_of_two() {
+        return Err(RingError::InvalidIndex);
+    }
     let descriptors = zeroed_dma(allocator, TX_RING_COUNT * TX_DESCRIPTOR_BYTES, 256)?;
     let byte_counts = zeroed_dma(allocator, TX_BC_TABLE_COUNT * 2, TX_BC_ALIGNMENT)?;
     let commands = zeroed_dma(
@@ -311,12 +344,27 @@ pub fn allocate_tx_ring<A: DmaAllocator>(
         byte_counts,
         commands,
         queue_id,
+        max_tfd_queue_size,
         current: 0,
         current_hardware: 0,
         tail: 0,
         tail_hardware: 0,
         queued: 0,
     })
+}
+
+/// Select the hardware write-pointer modulus from the device generation.
+pub fn allocate_tx_ring_for_family<A: DmaAllocator>(
+    allocator: &mut A,
+    queue_id: u16,
+    family: crate::DeviceFamily,
+) -> Result<TxRing<A::Region>, RingError> {
+    let queue_size = if family >= crate::DeviceFamily::Ax210 {
+        GEN3_MAX_TFD_QUEUE_SIZE
+    } else {
+        TX_RING_COUNT
+    };
+    allocate_tx_ring_for(allocator, queue_id, queue_size)
 }
 
 /// Compute the Gen3 scheduler entry, including the TFD fetch-chunk count.
@@ -489,5 +537,25 @@ mod tests {
         assert_eq!(tx_byte_count_entry(100, 7).unwrap(), 100 | (1 << 14));
         assert!(tx_byte_count_entry(100, 25).is_ok());
         assert_eq!(tx_byte_count_entry(100, 26), Err(RingError::TooManyBuffers));
+    }
+
+    #[test]
+    fn gen3_hardware_pointer_wrap_uses_full_queue_size() {
+        let mut alloc = Alloc(Cell::new(0x1000));
+        let mut ring =
+            allocate_tx_ring_for_family(&mut alloc, 7, crate::DeviceFamily::Ax210).unwrap();
+        ring.current_hardware = GEN3_MAX_TFD_QUEUE_SIZE - 1;
+        ring.submit(
+            &[TxSegment {
+                address: 0x2000,
+                length: 8,
+            }],
+            8,
+        )
+        .unwrap();
+        assert_eq!(ring.current_hardware, 0);
+        ring.tail_hardware = GEN3_MAX_TFD_QUEUE_SIZE - 1;
+        assert_eq!(ring.advance_to(0).unwrap(), [0]);
+        assert_eq!(ring.tail_hardware, 0);
     }
 }

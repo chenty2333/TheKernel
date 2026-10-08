@@ -132,8 +132,9 @@ pub fn encode_tx_frame(
 }
 
 /// Publish the serialized TX command and its payload segments in a hardware ring.
-// upstream: if_iwx.c iwx_tx() DMA descriptor construction and ring kick preparation
-pub fn submit_tx_frame<R: crate::DmaRegion>(
+// upstream: if_iwx.c iwx_tx()
+pub fn submit_tx_frame<B: crate::CsrAccess, R: crate::DmaRegion>(
+    registers: &mut crate::IwxRegisters<B>,
     ring: &mut TxRing<R>,
     family: DeviceFamily,
     frame: &TxFrame<'_>,
@@ -165,7 +166,7 @@ pub fn submit_tx_frame<R: crate::DmaRegion>(
         });
     }
     segments.extend_from_slice(frame.payload_segments);
-    Ok(ring.submit(&segments, encoded.byte_count)?)
+    Ok(ring.submit_and_kick(registers, &segments, encoded.byte_count)?)
 }
 
 #[cfg(test)]

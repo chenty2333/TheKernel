@@ -63,7 +63,7 @@ pub use config::{
 };
 pub use context::{
     ContextError, ContextQueueAddresses, build_gen2_context, build_gen3_context,
-    build_gen3_prph_scratch, set_gen3_pnvm,
+    build_gen3_prph_scratch, set_gen3_pnvm, start_gen2_context, start_gen3_context,
 };
 pub use dma::{
     DebugDestinationError, DebugRegisterAccess, DebugRegisterTransaction, DmaAllocator, DmaError,
@@ -116,8 +116,8 @@ pub use rate::{
 };
 pub use registers::{CsrAccess, DeviceFamily, IoBarrier, IwxRegisters, RegisterError};
 pub use rings::{
-    RingError, RxCompletion, RxRing, TxRing, TxSegment, allocate_rx_ring, allocate_tx_ring,
-    tx_byte_count_entry,
+    GEN3_MAX_TFD_QUEUE_SIZE, RingError, RxCompletion, RxRing, TxRing, TxSegment, allocate_rx_ring,
+    allocate_tx_ring, allocate_tx_ring_for, allocate_tx_ring_for_family, tx_byte_count_entry,
 };
 pub use rx::{RxMetadataError, noise_dbm, signal_strength_dbm};
 pub use rx_event::{FirmwareEvent, decode_firmware_event, process_command_response};
