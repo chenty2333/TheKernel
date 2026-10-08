@@ -32,7 +32,9 @@ requests return a multipart NLMSG_DONE when there are no wireless devices,
 which is the empty-radio path used by `iw dev` and `iw phy`. The registered-radio
 record path currently carries interface identity, station type, and valid 2.4/5
 GHz NVM frequencies with NO_IR flags. It does not yet emit legacy/HT/VHT/HE
-rates or supported ciphers. GET_REG returns the global world alpha2 value;
+MCS/capability maps or supported ciphers; the legacy 2.4/5 GHz bitrate tables
+are emitted with the matching 100-kbit/s UAPI units and short-preamble flags.
+GET_REG returns the global world alpha2 value;
 regulatory rule tables and per-phy domains are not yet emitted. GET_SCAN
 accepts a dump request for a registered interface and emits an empty multipart
 result until a scan cache is connected; it does not start scans. TRIGGER_SCAN,

@@ -33,8 +33,11 @@ const ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
 const ATTR_REG_ALPHA2: u16 = 33;
 const BAND_ATTR_FREQS: u16 = 1;
+const BAND_ATTR_RATES: u16 = 2;
 const FREQ_ATTR_FREQ: u16 = 1;
 const FREQ_ATTR_NO_IR: u16 = 3;
+const BITRATE_ATTR_RATE: u16 = 1;
+const BITRATE_ATTR_2GHZ_SHORTPREAMBLE: u16 = 2;
 const IFTYPE_STATION: u32 = 2;
 const IFTYPE_STATION_ATTR: u16 = 2;
 const NLM_F_DUMP: u16 = 0x0300;
@@ -301,6 +304,7 @@ fn wiphy_message(
                 BAND_ATTR_FREQS | NLA_F_NESTED,
                 &frequencies,
             );
+            append_supported_rates(&mut attributes, is_2ghz);
             push_attr(&mut bands, band_id | NLA_F_NESTED, &attributes);
         }
     }
@@ -308,6 +312,26 @@ fn wiphy_message(
         push_attr(&mut payload, ATTR_WIPHY_BANDS | NLA_F_NESTED, &bands);
     }
     nl80211_message(request, port_id, FAMILY_ID, payload, multipart)
+}
+
+fn append_supported_rates(band_attributes: &mut Vec<u8>, is_2ghz: bool) {
+    const RATES_2GHZ_100KBPS: [u16; 12] = [10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540];
+    const RATES_5GHZ_100KBPS: [u16; 8] = [60, 90, 120, 180, 240, 360, 480, 540];
+    let rates = if is_2ghz {
+        &RATES_2GHZ_100KBPS[..]
+    } else {
+        &RATES_5GHZ_100KBPS[..]
+    };
+    let mut nested = Vec::new();
+    for (index, rate) in rates.iter().enumerate() {
+        let mut attributes = Vec::new();
+        push_attr(&mut attributes, BITRATE_ATTR_RATE, &rate.to_ne_bytes());
+        if is_2ghz && index < 4 {
+            push_attr(&mut attributes, BITRATE_ATTR_2GHZ_SHORTPREAMBLE, &[]);
+        }
+        push_attr(&mut nested, (index + 1) as u16, &attributes);
+    }
+    push_attr(band_attributes, BAND_ATTR_RATES | NLA_F_NESTED, &nested);
 }
 
 fn nl80211_message(
@@ -516,6 +540,7 @@ mod tests {
         );
         let attrs = &message[generic + size_of::<GenlMsgHdr>()..];
         let mut frequencies = Vec::new();
+        let mut band_rates = Vec::new();
         for_each_rtattr(attrs, |kind, value| {
             if kind == ATTR_WIPHY_BANDS {
                 for_each_rtattr(value, |band, band_attributes| {
@@ -538,6 +563,17 @@ mod tests {
                                 frequencies.push((band, mhz.ok_or(AxError::InvalidInput)?, no_ir));
                                 Ok(())
                             })?;
+                        } else if band_kind == BAND_ATTR_RATES {
+                            let mut rates = Vec::new();
+                            for_each_rtattr(band_value, |_, rate_attributes| {
+                                for_each_rtattr(rate_attributes, |rate_kind, bytes| {
+                                    if rate_kind == BITRATE_ATTR_RATE {
+                                        rates.push(u16::from_ne_bytes(bytes.try_into().unwrap()));
+                                    }
+                                    Ok(())
+                                })
+                            })?;
+                            band_rates.push((band, rates));
                         }
                         Ok(())
                     })
@@ -547,6 +583,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(frequencies, [(0, 2412, false), (1, 5180, true)]);
+        assert_eq!(
+            band_rates,
+            [
+                (0, vec![10, 20, 55, 110, 60, 90, 120, 180, 240, 360, 480, 540]),
+                (1, vec![60, 90, 120, 180, 240, 360, 480, 540]),
+            ]
+        );
     }
 
     #[test]
