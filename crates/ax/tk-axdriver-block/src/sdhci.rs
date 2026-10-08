@@ -386,6 +386,8 @@ pub struct MmcExtCsd {
     pub boot_sectors: u32,
     pub rpmb_sectors: u32,
     pub erase_group_sectors: u32,
+    pub revision: u8,
+    pub cache_size_bytes: u32,
     pub power_classes: MmcPowerClasses,
 }
 
@@ -775,6 +777,9 @@ pub fn parse_ext_csd(bytes: &[u8; 512]) -> MmcExtCsd {
         boot_sectors: u32::from(bytes[226]) * 256,
         rpmb_sectors: u32::from(bytes[168]) * 256,
         erase_group_sectors: u32::from(bytes[224]) * 1024,
+        revision: bytes[192],
+        cache_size_bytes: u32::from_le_bytes([bytes[249], bytes[250], bytes[251], bytes[252]])
+            * 1024,
         power_classes: MmcPowerClasses {
             pwr_cl_52_195: bytes[200],
             pwr_cl_26_195: bytes[201],
@@ -2058,6 +2063,8 @@ pub struct SdhciDisk<I: SdhciIo> {
     ext_csd: Option<MmcExtCsd>,
     active_partition: u8,
     read_only: bool,
+    cache_enabled: bool,
+    dirty: bool,
 }
 
 impl<I: SdhciIo> SdhciDisk<I> {
@@ -2098,6 +2105,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         }
         let mut ext_csd_bytes = [0u8; 512];
         let mut ext_csd = None;
+        let mut cache_enabled = false;
         if mmc && high_capacity {
             host.command(8, 0, SD_R1 | SD_DATA, Some(&mut ext_csd_bytes), 512)?;
             let parsed = parse_ext_csd(&ext_csd_bytes);
@@ -2107,6 +2115,12 @@ impl<I: SdhciIo> SdhciDisk<I> {
             }
             if parsed.erase_group_sectors != 0 {
                 erase_group_sectors = parsed.erase_group_sectors;
+            }
+            if parsed.revision >= 6 && parsed.cache_size_bytes != 0 {
+                cache_enabled = host.mmc_switch(33, 1).is_ok();
+                if !cache_enabled {
+                    log::warn!("sdhci: eMMC cache enable failed; writes remain directly durable");
+                }
             }
             ext_csd = Some(parsed);
         }
@@ -2170,6 +2184,8 @@ impl<I: SdhciIo> SdhciDisk<I> {
             ext_csd,
             active_partition: 0,
             read_only: write_protected,
+            cache_enabled,
+            dirty: false,
         })
     }
 
@@ -2252,6 +2268,17 @@ impl<I: SdhciIo> SdhciDisk<I> {
         Ok(())
     }
 
+    // upstream: mmcsd.c mmcsd_flush_cache()
+    fn flush_cache(&mut self) -> Result<(), SdhciError> {
+        if self.cache_enabled && self.dirty {
+            self.host.mmc_switch(32, 1)?;
+            self.dirty = false;
+            Ok(())
+        } else {
+            self.wait_ready()
+        }
+    }
+
     // upstream: mmcsd.c mmcsd_rw() card-address conversion
     fn card_address(&self, lba: u64) -> Result<u32, SdhciError> {
         let address = if self.high_capacity {
@@ -2323,6 +2350,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         }
         if write {
             self.wait_ready()?;
+            self.dirty = true;
         }
         Ok(())
     }
@@ -2404,7 +2432,7 @@ impl<I: SdhciIo> crate::BlockDriverOps for SdhciPartitionDisk<I> {
         let mut disk = self.shared.lock();
         disk.select_partition(self.access)
             .map_err(map_sdhci_error)?;
-        disk.wait_ready().map_err(map_sdhci_error)
+        disk.flush_cache().map_err(map_sdhci_error)
     }
 
     fn block_capabilities(&self) -> crate::BlockCapabilities {
@@ -2477,7 +2505,7 @@ impl<I: SdhciIo> crate::BlockDriverOps for SdhciDisk<I> {
         Ok(())
     }
     fn flush(&mut self) -> crate::DevResult {
-        self.wait_ready().map_err(map_sdhci_error)
+        self.flush_cache().map_err(map_sdhci_error)
     }
 
     fn is_read_only(&self) -> bool {
@@ -2912,6 +2940,8 @@ mod tests {
         bytes[226] = 4;
         bytes[168] = 2;
         bytes[224] = 7;
+        bytes[192] = 6;
+        bytes[249] = 1;
         bytes[202] = 0xa5;
         bytes[239] = 0xb6;
         assert_eq!(
@@ -2924,6 +2954,8 @@ mod tests {
                 boot_sectors: 1024,
                 rpmb_sectors: 512,
                 erase_group_sectors: 7168,
+                revision: 6,
+                cache_size_bytes: 1024,
                 power_classes: MmcPowerClasses {
                     pwr_cl_52_360: 0xa5,
                     pwr_cl_52_360_ddr: 0xb6,
@@ -3310,6 +3342,8 @@ mod tests {
             ext_csd: None,
             active_partition: 0,
             read_only: true,
+            cache_enabled: false,
+            dirty: false,
         };
         assert!(crate::BlockDriverOps::is_read_only(&disk));
         assert!(matches!(
@@ -3344,6 +3378,8 @@ mod tests {
             }),
             active_partition: 0,
             read_only: false,
+            cache_enabled: false,
+            dirty: false,
         };
         let areas = disk.into_partition_devices(true, 0);
         assert_eq!(areas.len(), 3);
@@ -3352,6 +3388,36 @@ mod tests {
         assert_eq!(areas[2].device_name(), "mmcblk0boot1");
         assert_eq!(areas[1].num_blocks(), 4096);
         assert!(areas.iter().all(crate::BlockDriverOps::is_read_only));
+    }
+
+    #[test]
+    fn dirty_enabled_emmc_cache_flushes_ext_csd_before_clearing_dirty() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        let host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        let mut disk = SdhciDisk {
+            host,
+            rca: 1,
+            cid: MmcCid::default(),
+            csd: MmcCsd::default(),
+            scr: None,
+            sd_status: None,
+            sectors: 10,
+            high_capacity: true,
+            erase_group_sectors: 1,
+            ext_csd: None,
+            active_partition: 0,
+            read_only: false,
+            cache_enabled: true,
+            dirty: true,
+        };
+        disk.flush_cache().unwrap();
+        assert!(!disk.dirty);
+        assert_eq!(disk.host.io_mut().command >> 8, MMC_CMD_SWITCH as u16);
+        assert_eq!(
+            disk.host.io_mut().argument,
+            (3 << 24) | (32 << 16) | (1 << 8)
+        );
     }
 
     #[test]
@@ -3373,6 +3439,8 @@ mod tests {
             ext_csd: None,
             active_partition: 0,
             read_only: false,
+            cache_enabled: false,
+            dirty: false,
         };
         assert_eq!(disk.wait_ready(), Err(SdhciError::Controller(1 << 22)));
     }
