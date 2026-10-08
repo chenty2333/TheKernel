@@ -9,7 +9,12 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod iwmbt_fw;
 use alloc::collections::VecDeque;
+
+pub use iwmbt_fw::{
+    BootParams, FirmwareError, Version, VersionTlv, get_fwname, get_fwname_tlv, parse_tlv,
+};
 
 pub const AF_BLUETOOTH: i32 = 31;
 pub const BTPROTO_HCI: i32 = 1;
@@ -283,5 +288,62 @@ mod tests {
         assert_eq!(absent_device_ioctl(HCIDEVUP), Err(Error::NoDevice));
         assert_eq!(AF_BLUETOOTH, 31);
         assert_eq!(BTPROTO_HCI, 1);
+    }
+
+    #[test]
+    fn intel_firmware_tlv_and_name_selection() {
+        let mut v = VersionTlv::default();
+        parse_tlv(
+            &[
+                0, 0x10, 4, 0x12, 0x34, 0x56, 0x78, 0x11, 4, 0xef, 0xcd, 0xab, 0x90,
+            ],
+            &mut v,
+        )
+        .unwrap();
+        assert_eq!(
+            get_fwname_tlv(&v, "/lib/firmware/intel", "sfi"),
+            "/lib/firmware/intel/ibt-2841-f0de.sfi"
+        );
+        assert_eq!(
+            get_fwname(
+                &Version {
+                    hw_variant: 0x0c,
+                    ..Version::default()
+                },
+                None,
+                "intel",
+                "sfi"
+            ),
+            None
+        );
+        assert_eq!(
+            get_fwname(
+                &Version {
+                    hw_variant: 0x0c,
+                    ..Version::default()
+                },
+                Some(&BootParams { dev_revid: 42 }),
+                "intel",
+                "sfi"
+            )
+            .unwrap(),
+            "intel/ibt-12-42.sfi"
+        );
+    }
+
+    #[test]
+    fn intel_firmware_tlv_rejects_short_and_bad_status() {
+        assert_eq!(
+            parse_tlv(&[], &mut VersionTlv::default()),
+            Err(FirmwareError::TruncatedTlv)
+        );
+        assert_eq!(
+            parse_tlv(&[1], &mut VersionTlv::default()),
+            Err(FirmwareError::InvalidStatus)
+        );
+        assert_eq!(
+            parse_tlv(&[0, 0x10, 4, 1], &mut VersionTlv::default()),
+            Err(FirmwareError::TruncatedTlv)
+        );
     }
 }
