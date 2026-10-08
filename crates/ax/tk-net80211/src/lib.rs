@@ -67,8 +67,10 @@ pub use node_table::{
     alloc_node, allocation_available, find_node, free_all_nodes, free_node, setup_node,
 };
 pub use output::{
-    ELEMID_RATES, ELEMID_SSID, ELEMID_XRATES, IeError, append_extended_rates_ie, append_ssid_ie,
-    append_supported_rates_ie,
+    ELEMID_EXT_HE_CAPS, ELEMID_EXTENSION, ELEMID_HT_CAPS, ELEMID_HT_OPERATION, ELEMID_RATES,
+    ELEMID_SSID, ELEMID_VHT_CAPS, ELEMID_XRATES, IeError, append_extended_rates_ie,
+    append_he_caps_ie, append_ht_caps_ie, append_ht_operation_ie, append_ssid_ie,
+    append_supported_rates_ie, append_vht_caps_ie,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,

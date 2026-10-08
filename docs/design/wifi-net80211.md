@@ -85,3 +85,6 @@ cached scan entries.
 The iwx scan-probe DMA builder now calls this crate's SSID and legacy-rate IE
 encoders before assigning OpenBSD firmware segment boundaries, replacing the
 prior duplicate serializer for those elements.
+Output IE builders include HT/VHT/HE capability elements with the exact packed
+little-endian layouts; HT Operation uses the source reserved-zero Basic MCS
+field, while HE MCS/NSS maps follow advertised 160/80+80 width bits.
