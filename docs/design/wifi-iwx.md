@@ -141,6 +141,10 @@ NVM-derived channel map, HT/VHT rate/STBC capabilities, 5-GHz rate availability,
 and the already-attached address-refresh fast path for later interface
 publication.
 
+Init and runtime microcode now share the source ALIVE-aware ucode sequence:
+ALIVE is retained for its SKU, Gen3 PNVM selection/doorbell completion runs
+before post-ALIVE ICT setup, and the Init path then proceeds to NVM_GET_INFO.
+
 Driver peer allocation now starts from a zeroed private extension and its
 duplicate window. Background-scan completion flushes station TX, disables
 active aggregation queues, removes the source-selected RSN keys, then transfers

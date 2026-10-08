@@ -583,8 +583,8 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         firmware: &FirmwareImage,
         init_ucode: bool,
         imr_enabled: bool,
-        mut wait_for_alive: impl FnMut(&mut Self, u64) -> Result<bool, E>,
-    ) -> Result<(), ControllerError<E>> {
+        mut wait_for_alive: impl FnMut(&mut Self, u64) -> Result<Option<crate::AliveInfo>, E>,
+    ) -> Result<crate::AliveInfo, ControllerError<E>> {
         let mut images = if init_ucode {
             initialize_init_firmware_sections(&mut self.allocator, firmware)
         } else {
@@ -613,14 +613,14 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         crate::enable_firmware_load_interrupts(&mut self.registers, &mut self.interrupt_masks);
         self.publish_firmware_context(&mut images, init, imr_enabled)?;
         let alive = wait_for_alive(self, crate::FIRMWARE_ALIVE_TIMEOUT_NS);
-        if !matches!(alive, Ok(true)) {
+        if !matches!(&alive, Ok(Some(info)) if info.alive_ok) {
             images.free_paging();
         }
         iml_dma.take();
         images.free_firmware_sections();
         match alive {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(ControllerError::FirmwareNotAlive),
+            Ok(Some(info)) if info.alive_ok => Ok(info),
+            Ok(_) => Err(ControllerError::FirmwareNotAlive),
             Err(error) => Err(ControllerError::Wait(error)),
         }
     }
@@ -751,21 +751,22 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
     pub fn load_ucode_wait_alive<F, P>(
         &mut self,
         firmware: &FirmwareImage,
+        init_ucode: bool,
         external_pnvm: Option<&[u8]>,
-        sku_id: [u32; 3],
         mac_type: u16,
         rf_type: u16,
         imr_enabled: bool,
-        wait_alive: impl FnMut(&mut Self, u64) -> Result<bool, F>,
+        wait_alive: impl FnMut(&mut Self, u64) -> Result<Option<crate::AliveInfo>, F>,
         wait_pnvm: impl FnMut(&mut Self, u64) -> Result<bool, P>,
     ) -> Result<(), ControllerUcodeStartError<F, P>> {
-        self.boot_firmware(firmware, false, imr_enabled, wait_alive)
+        let alive = self
+            .boot_firmware(firmware, init_ucode, imr_enabled, wait_alive)
             .map_err(ControllerUcodeStartError::Firmware)?;
         if self.family >= DeviceFamily::Ax210 {
             self.load_pnvm(
                 firmware,
                 external_pnvm,
-                sku_id,
+                alive.sku_id.unwrap_or([0; 3]),
                 mac_type,
                 rf_type,
                 wait_pnvm,
@@ -1021,15 +1022,23 @@ mod tests {
         controller
             .load_ucode_wait_alive(
                 &firmware,
+                false,
                 None,
-                [0; 3],
                 0,
                 0,
                 false,
                 |_, timeout| {
                     assert_eq!(timeout, crate::FIRMWARE_ALIVE_TIMEOUT_NS);
                     order.borrow_mut().push(1);
-                    Ok::<_, ()>(true)
+                    Ok::<_, ()>(Some(crate::AliveInfo {
+                        notification_version: 5,
+                        status: crate::ALIVE_STATUS_OK,
+                        alive_ok: true,
+                        lmac_error_event_table: [0; 2],
+                        lmac_log_event_table: 0,
+                        umac_error_info_address: 0,
+                        sku_id: Some([0; 3]),
+                    }))
                 },
                 |_, _| {
                     order.borrow_mut().push(2);
@@ -1038,6 +1047,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(order.into_inner(), [1]);
+    }
+
+    #[test]
+    fn init_ucode_start_loads_pnvm_between_alive_and_post_alive() {
+        let section = |offset: u32, payload: &[u8]| {
+            let mut bytes = offset.to_le_bytes().to_vec();
+            bytes.extend_from_slice(payload);
+            bytes
+        };
+        let lmac = section(0x1000, &[1]);
+        let separator = section(0xffff_cccc, &[]);
+        let umac = section(0x2000, &[2]);
+        let paging_separator = section(0xaaaa_bbbb, &[]);
+        let image = test_image(&[
+            (20, &lmac),
+            (20, &separator),
+            (20, &umac),
+            (20, &paging_separator),
+            (52, &[1, 2, 3, 4]),
+        ]);
+        let firmware = FirmwareImage::parse(&image).unwrap();
+        let allocator = Allocator(Cell::new(0x600000));
+        let mut controller =
+            IwxController::attach(Bus::default(), allocator, DeviceFamily::Ax210, 0x300000, 3)
+                .unwrap();
+        let order = RefCell::new(alloc::vec::Vec::new());
+        controller
+            .load_ucode_wait_alive(
+                &firmware,
+                true,
+                None,
+                0x37,
+                0x10d,
+                false,
+                |_, timeout| {
+                    assert_eq!(timeout, crate::FIRMWARE_ALIVE_TIMEOUT_NS);
+                    order.borrow_mut().push(1);
+                    Ok::<_, ()>(Some(crate::AliveInfo {
+                        notification_version: 6,
+                        status: crate::ALIVE_STATUS_OK,
+                        alive_ok: true,
+                        lmac_error_event_table: [0; 2],
+                        lmac_log_event_table: 0,
+                        umac_error_info_address: 0,
+                        sku_id: Some([1, 2, 3]),
+                    }))
+                },
+                |_, timeout| {
+                    assert_eq!(timeout, 2_000_000_000);
+                    order.borrow_mut().push(2);
+                    Ok::<_, ()>(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(order.into_inner(), [1, 2]);
     }
 
     #[test]

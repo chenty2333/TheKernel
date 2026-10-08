@@ -180,6 +180,7 @@ struct Bdf(u8, u8, u8);
 struct AttachedDevice {
     bdf: Bdf,
     profile: AttachProfile,
+    runtime: RuntimeConfig,
     bar_base: usize,
     bar_size: usize,
     hardware_revision: u32,
@@ -200,8 +201,7 @@ enum AliveWaitError {
 enum FirmwareBootstrapError {
     Hardware(axdriver_iwx::ApmError),
     Nic(axdriver_iwx::ApmError),
-    Firmware(axdriver_iwx::ControllerError<AliveWaitError>),
-    PostAlive(axdriver_iwx::IctError),
+    FirmwareStart(axdriver_iwx::ControllerUcodeStartError<AliveWaitError, AliveWaitError>),
     Interrupt(axdriver_iwx::IctError),
     CommandEncoding(axdriver_iwx::CommandError),
     Command(axdriver_iwx::SyncCommandError<Infallible>),
@@ -258,6 +258,7 @@ fn pcie_power_registers(root: &PciRoot, bdf: DeviceFunction) -> (u16, u16) {
 fn allocate_resources(
     bdf: DeviceFunction,
     profile: AttachProfile,
+    runtime: RuntimeConfig,
     bar_base: usize,
     bar_size: usize,
     hardware_revision: u32,
@@ -289,6 +290,7 @@ fn allocate_resources(
     attached.push(AttachedDevice {
         bdf: key,
         profile,
+        runtime,
         bar_base,
         bar_size,
         hardware_revision,
@@ -303,6 +305,7 @@ fn allocate_resources(
 fn bootstrap_init_firmware(
     controller: &mut IwxController<MmioCsrAccess, PlatformDmaAllocator>,
     profile: AttachProfile,
+    runtime: RuntimeConfig,
     hardware_revision: u32,
     bundle: &FirmwareBundle,
 ) -> Result<NvmInfo, FirmwareBootstrapError> {
@@ -315,9 +318,12 @@ fn bootstrap_init_firmware(
 
     let alive_version = bundle.image.lookup_notification_version(0, 1);
     controller
-        .boot_firmware(
+        .load_ucode_wait_alive(
             &bundle.image,
             true,
+            bundle.pnvm_file.as_deref(),
+            runtime.mac_type,
+            runtime.rf_type,
             profile.imr_enabled,
             |controller, timeout| {
                 let mut elapsed = 0;
@@ -341,7 +347,38 @@ fn bootstrap_init_firmware(
                         })
                         .map_err(AliveWaitError::Receive)?;
                     if let Some(result) = alive.take() {
-                        return result.map(|info| info.alive_ok);
+                        return result.map(Some);
+                    }
+                    controller.registers.delay_us(1_000);
+                    elapsed += 1_000_000;
+                }
+                Ok(None)
+            },
+            |controller, timeout| {
+                let mut elapsed = 0;
+                while elapsed < timeout {
+                    let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+                        &mut controller.registers,
+                        &controller.interrupt_masks,
+                        None,
+                    )
+                    .map_err(AliveWaitError::Interrupt)?;
+                    let mut complete = false;
+                    controller
+                        .process_rx_notifications(|packet, _| {
+                            if packet.is_notification()
+                                && matches!(
+                                    axdriver_iwx::decode_firmware_event(packet),
+                                    axdriver_iwx::FirmwareEvent::PnvmComplete
+                                )
+                            {
+                                complete = true;
+                            }
+                            Ok::<_, Infallible>(true)
+                        })
+                        .map_err(AliveWaitError::Receive)?;
+                    if complete {
+                        return Ok(true);
                     }
                     controller.registers.delay_us(1_000);
                     elapsed += 1_000_000;
@@ -349,10 +386,7 @@ fn bootstrap_init_firmware(
                 Ok(false)
             },
         )
-        .map_err(FirmwareBootstrapError::Firmware)?;
-    controller
-        .post_alive(&bundle.image)
-        .map_err(FirmwareBootstrapError::PostAlive)?;
+        .map_err(FirmwareBootstrapError::FirmwareStart)?;
 
     let init_config = axdriver_iwx::init_extended_config_command(0, 0)
         .map_err(FirmwareBootstrapError::CommandEncoding)?;
@@ -422,7 +456,7 @@ fn bootstrap_init_firmware(
 }
 
 fn log_bootstrap_error(bdf: Bdf, error: FirmwareBootstrapError) {
-    use axdriver_iwx::ControllerError;
+    use axdriver_iwx::{ControllerError, ControllerUcodeStartError, PnvmLoadError};
 
     match error {
         FirmwareBootstrapError::Hardware(error) => {
@@ -431,33 +465,14 @@ fn log_bootstrap_error(bdf: Bdf, error: FirmwareBootstrapError) {
         FirmwareBootstrapError::Nic(error) => {
             warn!("iwx: {bdf:?}: NIC initialization failed: {error:?}")
         }
-        FirmwareBootstrapError::Firmware(error) => match error {
-            ControllerError::Attach(error) => warn!("iwx: {bdf:?}: attach failed: {error:?}"),
-            ControllerError::Hardware(error) => warn!("iwx: {bdf:?}: APM failed: {error:?}"),
-            ControllerError::Dma(error) => warn!("iwx: {bdf:?}: firmware DMA failed: {error:?}"),
-            ControllerError::Context(error) => {
-                warn!("iwx: {bdf:?}: firmware context failed: {error:?}")
-            }
-            ControllerError::Register(error) => {
-                warn!("iwx: {bdf:?}: firmware register write failed: {error:?}")
-            }
-            ControllerError::Wait(error) => match error {
-                AliveWaitError::Interrupt(error) => {
-                    warn!("iwx: {bdf:?}: ALIVE interrupt service failed: {error:?}")
-                }
-                AliveWaitError::Receive(error) => {
-                    warn!("iwx: {bdf:?}: ALIVE RX processing failed: {error:?}")
-                }
-                AliveWaitError::Alive(error) => {
-                    warn!("iwx: {bdf:?}: ALIVE notification malformed: {error:?}")
-                }
-            },
-            ControllerError::FirmwareNotAlive => {
-                warn!("iwx: {bdf:?}: firmware did not report ALIVE")
-            }
-        },
-        FirmwareBootstrapError::PostAlive(error) => {
-            warn!("iwx: {bdf:?}: post-ALIVE ICT setup failed: {error:?}")
+        FirmwareBootstrapError::FirmwareStart(ControllerUcodeStartError::Firmware(
+            ControllerError::Wait(error),
+        )) => log_alive_wait_error(bdf, error),
+        FirmwareBootstrapError::FirmwareStart(ControllerUcodeStartError::Pnvm(
+            PnvmLoadError::Wait(error),
+        )) => log_alive_wait_error(bdf, error),
+        FirmwareBootstrapError::FirmwareStart(error) => {
+            warn!("iwx: {bdf:?}: init firmware/PNVM startup failed: {error:?}")
         }
         FirmwareBootstrapError::Interrupt(error) => {
             warn!("iwx: {bdf:?}: init interrupt service failed: {error:?}")
@@ -482,6 +497,20 @@ fn log_bootstrap_error(bdf: Bdf, error: FirmwareBootstrapError) {
         }
         FirmwareBootstrapError::Stop(error) => {
             warn!("iwx: {bdf:?}: stop after init/NVM bootstrap failed: {error:?}")
+        }
+    }
+}
+
+fn log_alive_wait_error(bdf: Bdf, error: AliveWaitError) {
+    match error {
+        AliveWaitError::Interrupt(error) => {
+            warn!("iwx: {bdf:?}: firmware startup interrupt service failed: {error:?}")
+        }
+        AliveWaitError::Receive(error) => {
+            warn!("iwx: {bdf:?}: firmware startup RX processing failed: {error:?}")
+        }
+        AliveWaitError::Alive(error) => {
+            warn!("iwx: {bdf:?}: firmware ALIVE notification malformed: {error:?}")
         }
     }
 }
@@ -553,6 +582,7 @@ fn stage_rootfs_firmware() {
                     match bootstrap_init_firmware(
                         &mut device.controller,
                         device.profile,
+                        device.runtime,
                         device.hardware_revision,
                         bundle,
                     ) {
@@ -686,6 +716,7 @@ pub(crate) fn probe(
             if let Err(error) = allocate_resources(
                 bdf,
                 profile,
+                config,
                 base,
                 bar.1 as usize,
                 hardware_revision,
