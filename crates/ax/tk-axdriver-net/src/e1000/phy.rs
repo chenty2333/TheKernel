@@ -120,6 +120,7 @@ const IGP01E1000_PHY_PORT_CTRL: u8 = 0x12;
 const IGP01E1000_PSCR_AUTO_MDIX: u16 = 0x1000;
 const IGP01E1000_PSCR_FORCE_MDI_MDIX: u16 = 0x2000;
 const IGP01E1000_PSCFR_SMART_SPEED: u16 = 0x0080;
+const PHY_FORCE_LIMIT: u32 = 20;
 const IGP01E1000_PHY_PAGE_SELECT: u32 = 0x1f;
 const MAX_PHY_MULTI_PAGE_REG: u32 = 0x0f;
 const KMRNCTRLSTA_OFFSET: u32 = 0x001f_0000;
@@ -627,6 +628,28 @@ where
         configure_flow_control()?;
     }
     Ok(link)
+}
+
+/// upstream: e1000_phy.c e1000_phy_force_speed_duplex_igp()
+pub fn phy_force_speed_duplex_igp<I: E1000PhyRegisterIo>(
+    io: &mut I,
+    forced_speed_duplex: u16,
+    wait_to_complete: bool,
+    flow_control: &mut FlowControlMode,
+) -> DevResult {
+    let mut phy_control = io.read_phy_register(PHY_CONTROL)?;
+    phy_control = phy_force_speed_duplex_setup(io, flow_control, forced_speed_duplex, phy_control)?;
+    io.write_phy_register(PHY_CONTROL, phy_control)?;
+    let port_control = io.read_phy_register(IGP01E1000_PHY_PORT_CTRL)?
+        & !IGP01E1000_PSCR_AUTO_MDIX
+        & !IGP01E1000_PSCR_FORCE_MDI_MDIX;
+    io.write_phy_register(IGP01E1000_PHY_PORT_CTRL, port_control)?;
+    io.delay_us(1);
+    if wait_to_complete {
+        let _ = phy_has_link_generic(io, PHY_FORCE_LIMIT, 100_000, true)?;
+        let _ = phy_has_link_generic(io, PHY_FORCE_LIMIT, 100_000, true)?;
+    }
+    Ok(())
 }
 
 pub trait E1000PhyMdicOps: E1000RegisterIo {
@@ -1976,6 +1999,26 @@ mod tests {
                 E1000_CTRL_FRCSPD | E1000_CTRL_FRCDPX | E1000_CTRL_FD | E1000_CTRL_SPD_100
             ))
         );
+    }
+
+    #[test]
+    fn generic_igp_force_speed_duplex_disables_mdix_and_rechecks_link() {
+        let mut io = Io::default();
+        io.phy[PHY_CONTROL as usize] = MII_CR_AUTO_NEG_EN;
+        io.phy[IGP01E1000_PHY_PORT_CTRL as usize] = 0xffff;
+        io.phy[PHY_STATUS as usize] = MII_SR_LINK_STATUS;
+        let mut flow = FlowControlMode::Full;
+        phy_force_speed_duplex_igp(&mut io, ADVERTISE_100_FULL, true, &mut flow).unwrap();
+        assert_eq!(flow, FlowControlMode::None);
+        assert_eq!(
+            io.phy_writes
+                .iter()
+                .find(|(reg, _)| *reg == IGP01E1000_PHY_PORT_CTRL)
+                .unwrap()
+                .1,
+            0xffff & !IGP01E1000_PSCR_AUTO_MDIX & !IGP01E1000_PSCR_FORCE_MDI_MDIX
+        );
+        assert_eq!(io.delay, 1);
     }
 
     #[test]
