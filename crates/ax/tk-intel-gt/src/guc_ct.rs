@@ -159,6 +159,7 @@ pub enum CtError {
     Broken(u32),
     Incomplete,
     UnexpectedResponse,
+    Interrupted,
     Timeout,
     Deadlocked,
     Failure { error: u16, hint: u16 },
@@ -329,6 +330,45 @@ pub struct QueuedCtbEvent {
 /// Consumer for the action-specific GuC event handlers owned by GT/submission.
 pub trait CtEventHandler {
     fn process(&mut self, action: u16, data0: u16, payload: &[u32]) -> Result<(), CtError>;
+}
+
+/// Scheduling primitive used by the source-equivalent busy-loop sender.
+pub trait CtBusyWait {
+    /// Sleep for `milliseconds`; true means the wait was interrupted.
+    fn sleep_ms(&mut self, milliseconds: u32) -> bool;
+    fn relax(&mut self);
+}
+
+/// Retry a nonblocking CT send while it reports no room, matching the inline
+/// `intel_guc_send_busy_loop()` wrapper. `may_sleep` must reflect the caller's
+/// atomic/IRQ context; callers that cannot sleep use `relax()` instead.
+/// upstream: intel_guc.h intel_guc_send_busy_loop().
+pub fn send_busy_loop<W, F>(
+    wait: &mut W,
+    may_sleep: bool,
+    loop_on_busy: bool,
+    mut send_nonblocking: F,
+) -> Result<(), CtError>
+where
+    W: CtBusyWait,
+    F: FnMut() -> Result<(), CtError>,
+{
+    let mut sleep_period_ms = 1u32;
+    loop {
+        match send_nonblocking() {
+            Err(CtError::NoRoom) if loop_on_busy => {
+                if may_sleep {
+                    if wait.sleep_ms(sleep_period_ms) {
+                        return Err(CtError::Interrupted);
+                    }
+                    sleep_period_ms = sleep_period_ms.saturating_mul(2);
+                } else {
+                    wait.relax();
+                }
+            }
+            result => return result,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -970,6 +1010,22 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BusyWaitTrace {
+        sleeps: Vec<u32>,
+        relaxes: usize,
+        interrupt: bool,
+    }
+    impl CtBusyWait for BusyWaitTrace {
+        fn sleep_ms(&mut self, milliseconds: u32) -> bool {
+            self.sleeps.push(milliseconds);
+            self.interrupt
+        }
+        fn relax(&mut self) {
+            self.relaxes += 1;
+        }
+    }
+
     struct ClockIo(Cell<u64>);
     impl crate::GtIo for ClockIo {
         fn read(&self, offset: u32) -> Result<u32, Error> {
@@ -1268,6 +1324,37 @@ mod tests {
         assert_eq!(handler.0.len(), 2);
         assert_eq!(handler.0[1], (ACTION_TLB_INVALIDATION_DONE, 0, vec![0xbb]));
         assert_eq!(pair.process_incoming_requests(&mut handler), Ok(0));
+    }
+
+    #[test]
+    fn send_busy_loop_retries_only_busy_and_obeys_context_sleep_policy() {
+        let mut wait = BusyWaitTrace::default();
+        let mut attempts = 0;
+        send_busy_loop(&mut wait, true, true, || {
+            attempts += 1;
+            if attempts < 4 {
+                Err(CtError::NoRoom)
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 4);
+        assert_eq!(wait.sleeps, [1, 2, 4]);
+
+        let mut wait = BusyWaitTrace::default();
+        let mut attempts = 0;
+        send_busy_loop(&mut wait, false, true, || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(CtError::NoRoom)
+            } else {
+                Err(CtError::Failure { error: 1, hint: 0 })
+            }
+        })
+        .unwrap_err();
+        assert_eq!(wait.relaxes, 1);
+        assert!(wait.sleeps.is_empty());
     }
 
     #[test]
