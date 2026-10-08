@@ -263,3 +263,8 @@ software CCMP/TKIP/WEP and BIP engines are not ported; the iwx design relies on
 firmware key/cipher offload for data frames and MFP support still needs the
 hardware key/control bridge. The explicit PAE files remain with wpa_supplicant.
 See the function-count snapshot in progress-W.md for per-file marker totals.
+
+RSN-node leave cleanup is represented as explicit effects: initialize state,
+clear PMK/rekey/protection/authorized-port flags, cancel EAPOL/SA Query timers,
+delete the pairwise key, and complete rekey only when the departing peer was
+rekeying and no other rekey peers remain. The driver owns timer/key application.

@@ -432,6 +432,43 @@ pub fn leave_he_network(node: &mut crate::NodeRecord) {
     crate::clear_he_caps(&mut node.he_caps);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RsnLeaveEffects {
+    pub initialize_rsn_state: bool,
+    pub clear_rekey_flag: bool,
+    pub complete_rekey_when_no_peers: bool,
+    pub clear_pmk_flag: bool,
+    pub set_group_state_idle: bool,
+    pub cancel_eapol_timeout: bool,
+    pub cancel_sa_query_timeout: bool,
+    pub clear_retry_count: bool,
+    pub clear_txrx_protection: bool,
+    pub clear_management_protection: bool,
+    pub clear_new_ptk_flag: bool,
+    pub clear_authorized_port: bool,
+    pub delete_pairwise_key: bool,
+}
+
+/// Plan the OpenBSD RSN-node leave cleanup, including last-peer rekey completion.
+// upstream: ieee80211_node.c ieee80211_node_leave_rsn()
+pub fn leave_rsn_network(rekey_active: bool, remaining_rekey_peers: usize) -> RsnLeaveEffects {
+    RsnLeaveEffects {
+        initialize_rsn_state: true,
+        clear_rekey_flag: rekey_active,
+        complete_rekey_when_no_peers: rekey_active && remaining_rekey_peers == 0,
+        clear_pmk_flag: true,
+        set_group_state_idle: true,
+        cancel_eapol_timeout: true,
+        cancel_sa_query_timeout: true,
+        clear_retry_count: true,
+        clear_txrx_protection: true,
+        clear_management_protection: true,
+        clear_new_ptk_flag: true,
+        clear_authorized_port: true,
+        delete_pairwise_key: true,
+    }
+}
+
 /// Prefer RSN/SHA-256/CCMP while intersecting local and peer capabilities.
 // upstream: ieee80211_node.c ieee80211_choose_rsnparams()
 pub fn choose_rsn_params(
@@ -918,6 +955,19 @@ mod tests {
         assert_eq!(node.vht_caps.flags, 0);
         assert_eq!(node.he_caps.mac_caps, [0; crate::HE_MAC_CAPS_LEN]);
         assert_eq!(node.he_caps.flags, 0);
+    }
+
+    #[test]
+    fn rsn_leave_clears_protection_and_completes_only_the_final_rekey_peer() {
+        let effects = leave_rsn_network(true, 0);
+        assert!(effects.initialize_rsn_state);
+        assert!(effects.clear_rekey_flag);
+        assert!(effects.complete_rekey_when_no_peers);
+        assert!(effects.cancel_eapol_timeout && effects.cancel_sa_query_timeout);
+        assert!(effects.clear_txrx_protection && effects.clear_management_protection);
+        assert!(effects.clear_authorized_port && effects.delete_pairwise_key);
+        assert!(!leave_rsn_network(true, 1).complete_rekey_when_no_peers);
+        assert!(!leave_rsn_network(false, 0).clear_rekey_flag);
     }
 
     #[test]

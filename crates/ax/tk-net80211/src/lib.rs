@@ -70,11 +70,11 @@ pub use node::{
     ASSOCFAIL_WPA_KEY, ASSOCFAIL_WPA_PROTO, AccessPoint, BssMatchPolicy, BssSelection, CAPINFO_ESS,
     CAPINFO_IBSS, CIPHER_CCMP, CIPHER_TKIP, ESS_PSK, ESS_RSN_ON, ESS_WEP_ON, EssSelection,
     FLAG_AUTO_JOIN, HTOP0_SCO_MASK, HTOP0_SCO_SCA, HTOP0_SCO_SCB, HTOP0_SCO_SCN, HTOP0_SCO_SHIFT,
-    LOCAL_CAP_MFP, NetworkProfile, PRIVACY, PROTO_RSN, PROTO_WPA, RSN_CAP_MFPC,
+    LOCAL_CAP_MFP, NetworkProfile, PRIVACY, PROTO_RSN, PROTO_WPA, RSN_CAP_MFPC, RsnLeaveEffects,
     StationBssJoinError, StationBssJoinPlan, StationBssJoinPolicy, check_rssi, choose_bss,
     choose_rsn_params, ess_adjust_rssi, ess_calculate_score, ess_is_better, get_ess, get_rate,
-    get_rssi, join_station_bss, leave_he_network, leave_vht_network, match_bss, match_ess,
-    switch_ess, valid_40mhz_center_frequency, valid_40mhz_secondary_above,
+    get_rssi, join_station_bss, leave_he_network, leave_rsn_network, leave_vht_network, match_bss,
+    match_ess, switch_ess, valid_40mhz_center_frequency, valid_40mhz_secondary_above,
     valid_40mhz_secondary_below, valid_80mhz_center_frequency,
 };
 pub use node_caps::{
