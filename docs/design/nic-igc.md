@@ -333,3 +333,5 @@ ends up binding a part it does not understand.
   i225/i226 model.
 
 The IGC shared API now has the FreeBSD `igc_api.c` dispatch surface and I225 callback-table selection translated in `src/igc/api.rs` and `src/igc/i225.rs`. The backend trait is the boundary for the corresponding register/NVM/PHY implementations; this table selection is not yet connected to the legacy `IgcNic` probe/bring-up path. Subsequent IGC work will replace that handwritten path with these translated operations.
+
+`igc_base.c` has also been translated into `src/igc/base.rs`; its host-testable base-I/O adapter preserves the function-index semaphore masks, MTA/UTA zeroing order, management-pass-through power-down gate, and receive FIFO erratum sequence. Product binding to this translated base path remains in progress.

@@ -56,6 +56,7 @@
 //! i225 has, so far, been read zero times.
 
 pub mod api;
+pub mod base;
 pub mod bringup;
 pub mod desc;
 pub mod i225;
