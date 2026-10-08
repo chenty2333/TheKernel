@@ -4013,6 +4013,171 @@ pub fn igb_configure_queues<I: E1000RegisterIo>(
     Ok(masks)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmEnableWakeConfig {
+    pub mac: E1000MacType,
+    pub vf: bool,
+    pub has_pme_d3_hot: bool,
+    pub wol_capabilities: u32,
+    pub wol_enabled: u32,
+    pub management_enabled: bool,
+    pub wol_phy_wakeup: bool,
+    pub wol_phy_armed: bool,
+    pub suspend_link_powered_down: bool,
+    pub media: EmMediaType,
+    pub phy_igp3: bool,
+    pub multicast_count: usize,
+    pub mc_filter_type: u8,
+    pub mac_address: [u8; 6],
+}
+
+pub trait EmEnableWakeOps {
+    fn update_multicast_addresses(&mut self, count: usize) -> DevResult;
+    fn fill_wakeup_multicast_table(&mut self) -> DevResult;
+    fn restore_mac_address(&mut self, address: [u8; 6]) -> DevResult;
+    fn enable_phy_wakeup(&mut self, filters: u32) -> DevResult;
+    fn disable_phy_wakeup(&mut self) -> DevResult;
+    fn power_up_wakeup_link(&mut self) -> DevResult;
+    fn power_down_wakeup_link(&mut self) -> DevResult;
+    fn configure_sleep_low_power(&mut self, filters: u32) -> DevResult;
+    fn suspend_workarounds_ich8lan(&mut self) -> DevResult;
+    fn igp3_phy_powerdown_workaround(&mut self) -> DevResult;
+    fn disable_pcie_master(&mut self) -> DevResult;
+    fn enable_pme(&mut self);
+    fn clear_pme(&mut self);
+    fn disable_pci_busmaster(&mut self) -> DevResult;
+}
+
+/// upstream: if_em.c em_enable_wakeup()
+pub fn em_enable_wakeup<I: E1000RegisterIo, O: EmEnableWakeOps>(
+    io: &mut I,
+    ops: &mut O,
+    config: EmEnableWakeConfig,
+) -> DevResult {
+    if config.vf || !config.has_pme_d3_hot {
+        return Ok(());
+    }
+    let enabled = config.wol_enabled & config.wol_capabilities & EM_WOL_CAPABLE;
+    let manage = config.management_enabled;
+    let wuc = if manage && matches!(config.mac, E1000MacType::I82545 | E1000MacType::I82546) {
+        E1000_WUC_APME
+    } else {
+        0
+    };
+    let mut wufc = 0;
+    if enabled & EM_WOL_MAGIC_ENABLE != 0 {
+        wufc |= E1000_WUFC_MAG;
+    }
+    if enabled & EM_WOL_UNICAST != 0 {
+        wufc |= E1000_WUFC_EX;
+    }
+    if enabled & EM_WOL_MULTICAST != 0 {
+        wufc |= E1000_WUFC_MC;
+        if config.multicast_count < 128 {
+            let _ = ops.update_multicast_addresses(config.multicast_count);
+        } else if matches!(
+            config.mac,
+            E1000MacType::I82544
+                | E1000MacType::I82540
+                | E1000MacType::I82545
+                | E1000MacType::I82545Rev3
+                | E1000MacType::I82546
+                | E1000MacType::I82546Rev3
+                | E1000MacType::I82541
+                | E1000MacType::I82541Rev2
+                | E1000MacType::I82547
+                | E1000MacType::I82547Rev2
+                | E1000MacType::I82575
+                | E1000MacType::I82576
+                | E1000MacType::I82580
+        ) {
+            let _ = ops.fill_wakeup_multicast_table();
+        }
+    }
+
+    let mut saved_rctl = None;
+    let result = (|| -> DevResult {
+        if wufc == 0 {
+            if config.mac >= E1000MacType::I82544 {
+                io.write_register(E1000_WUFC, 0)?;
+                io.write_register(E1000_WUC, wuc)?;
+                io.write_register(E1000_WUS, u32::MAX)?;
+            }
+            if config.wol_phy_wakeup && config.wol_phy_armed {
+                let _ = ops.disable_phy_wakeup();
+            }
+            if manage {
+                if config.suspend_link_powered_down {
+                    let _ = ops.power_up_wakeup_link();
+                }
+                let _ = ops.configure_sleep_low_power(0);
+                ops.enable_pme();
+            } else {
+                let _ = ops.power_down_wakeup_link();
+                ops.clear_pme();
+            }
+            return Ok(());
+        }
+
+        ops.restore_mac_address(config.mac_address)?;
+        let rctl_old = io.read_register(E1000_RCTL)?;
+        saved_rctl = Some(rctl_old);
+        let mut rctl = rctl_old & !(E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_MO_3);
+        rctl |= E1000_RCTL_EN
+            | E1000_RCTL_BAM
+            | (u32::from(config.mc_filter_type) << E1000_RCTL_MO_SHIFT);
+        if wufc & E1000_WUFC_MC != 0 {
+            rctl |= E1000_RCTL_MPE;
+        }
+        io.write_register(E1000_RCTL, rctl)?;
+
+        if config.mac >= E1000MacType::I82540 {
+            let mut ctrl = io.read_register(E1000_CTRL)? | E1000_CTRL_ADVD3WUC;
+            if config.mac < E1000MacType::I82575 && !config.wol_phy_wakeup {
+                ctrl |= E1000_CTRL_EN_PHY_PWR_MGMT;
+            }
+            io.write_register(E1000_CTRL, ctrl)?;
+        }
+        if config.mac < E1000MacType::I82575
+            && matches!(
+                config.media,
+                EmMediaType::Fiber | EmMediaType::InternalSerdes
+            )
+        {
+            let ctrl_ext = io.read_register(E1000_CTRL_EXT)? | E1000_CTRL_EXT_SDP3_DATA;
+            io.write_register(E1000_CTRL_EXT, ctrl_ext)?;
+        }
+        io.write_register(E1000_WUS, u32::MAX)?;
+        let _ = ops.power_up_wakeup_link();
+        if config.mac >= E1000MacType::Ich8Lan && config.mac < E1000MacType::I82575 {
+            let _ = ops.suspend_workarounds_ich8lan();
+        }
+        if config.wol_phy_wakeup {
+            ops.enable_phy_wakeup(wufc)?;
+        } else {
+            io.write_register(E1000_WUC, wuc | E1000_WUC_PME_EN)?;
+            io.write_register(E1000_WUFC, wufc)?;
+        }
+        if config.mac < E1000MacType::I82575 && config.phy_igp3 {
+            let _ = ops.igp3_phy_powerdown_workaround();
+        }
+        let _ = ops.configure_sleep_low_power(wufc);
+        ops.enable_pme();
+        Ok(())
+    })();
+    if result.is_err() && wufc != 0 {
+        let _ = io.write_register(E1000_WUFC, 0);
+        let _ = io.write_register(E1000_WUC, wuc);
+        if let Some(rctl) = saved_rctl {
+            let _ = io.write_register(E1000_RCTL, rctl);
+        }
+        ops.clear_pme();
+    }
+    let _ = ops.disable_pcie_master();
+    let _ = ops.disable_pci_busmaster();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::collections::BTreeMap;
@@ -4217,6 +4382,77 @@ mod tests {
     impl EmWakeupNvm for WakeNvmMock {
         fn read_nvm_word(&mut self, offset: u16) -> DevResult<u16> {
             self.0.get(&offset).copied().ok_or(DevError::Io)
+        }
+    }
+
+    #[derive(Default)]
+    struct EnableWakeMock {
+        actions: Vec<&'static str>,
+        fail_phy: bool,
+        enabled_filters: u32,
+        pme_enables: usize,
+        pme_clears: usize,
+        busmaster_disables: usize,
+    }
+    impl EmEnableWakeOps for EnableWakeMock {
+        fn update_multicast_addresses(&mut self, _count: usize) -> DevResult {
+            self.actions.push("mta");
+            Ok(())
+        }
+        fn fill_wakeup_multicast_table(&mut self) -> DevResult {
+            self.actions.push("wake_mta");
+            Ok(())
+        }
+        fn restore_mac_address(&mut self, _address: [u8; 6]) -> DevResult {
+            self.actions.push("rar");
+            Ok(())
+        }
+        fn enable_phy_wakeup(&mut self, filters: u32) -> DevResult {
+            self.actions.push("phy_wake");
+            self.enabled_filters = filters;
+            if self.fail_phy {
+                Err(DevError::Io)
+            } else {
+                Ok(())
+            }
+        }
+        fn disable_phy_wakeup(&mut self) -> DevResult {
+            self.actions.push("phy_off");
+            Ok(())
+        }
+        fn power_up_wakeup_link(&mut self) -> DevResult {
+            self.actions.push("link_up");
+            Ok(())
+        }
+        fn power_down_wakeup_link(&mut self) -> DevResult {
+            self.actions.push("link_down");
+            Ok(())
+        }
+        fn configure_sleep_low_power(&mut self, _filters: u32) -> DevResult {
+            self.actions.push("sx");
+            Ok(())
+        }
+        fn suspend_workarounds_ich8lan(&mut self) -> DevResult {
+            self.actions.push("pch_suspend");
+            Ok(())
+        }
+        fn igp3_phy_powerdown_workaround(&mut self) -> DevResult {
+            self.actions.push("igp3");
+            Ok(())
+        }
+        fn disable_pcie_master(&mut self) -> DevResult {
+            self.actions.push("pcie_master_off");
+            Ok(())
+        }
+        fn enable_pme(&mut self) {
+            self.pme_enables += 1;
+        }
+        fn clear_pme(&mut self) {
+            self.pme_clears += 1;
+        }
+        fn disable_pci_busmaster(&mut self) -> DevResult {
+            self.busmaster_disables += 1;
+            Ok(())
         }
     }
     impl EmSleepPowerOps for SleepMock {
@@ -4582,5 +4818,94 @@ mod tests {
         );
         assert_eq!(quad.capabilities, EM_WOL_CAPABLE & !EM_WOL_UNICAST);
         assert_eq!(quad.quad_port_a, 1);
+    }
+
+    #[test]
+    fn wake_programming_preserves_filters_and_rolls_back_phy_failure() {
+        let mut io = RegisterMock::default();
+        io.0.insert(E1000_RCTL, E1000_RCTL_UPE | E1000_RCTL_MPE | 0x100);
+        let mut ops = EnableWakeMock::default();
+        let config = EmEnableWakeConfig {
+            mac: E1000MacType::I82540,
+            vf: false,
+            has_pme_d3_hot: true,
+            wol_capabilities: EM_WOL_CAPABLE,
+            wol_enabled: EM_WOL_MAGIC_ENABLE,
+            management_enabled: false,
+            wol_phy_wakeup: false,
+            wol_phy_armed: false,
+            suspend_link_powered_down: false,
+            media: EmMediaType::Fiber,
+            phy_igp3: false,
+            multicast_count: 0,
+            mc_filter_type: 2,
+            mac_address: [2, 1, 2, 3, 4, 5],
+        };
+        em_enable_wakeup(&mut io, &mut ops, config).unwrap();
+        assert_eq!(io.0[&E1000_WUFC], E1000_WUFC_MAG);
+        assert_eq!(io.0[&E1000_WUC], E1000_WUC_PME_EN);
+        assert_eq!(io.0[&E1000_RCTL] & (E1000_RCTL_UPE | E1000_RCTL_MPE), 0);
+        assert_ne!(io.0[&E1000_RCTL] & 0x100, 0);
+        assert_eq!(
+            io.0[&E1000_CTRL_EXT] & E1000_CTRL_EXT_SDP3_DATA,
+            E1000_CTRL_EXT_SDP3_DATA
+        );
+        assert_eq!((ops.pme_enables, ops.busmaster_disables), (1, 1));
+
+        let mut failed_io = RegisterMock::default();
+        failed_io.0.insert(E1000_RCTL, 0x1_0000 | E1000_RCTL_UPE);
+        let old_rctl = failed_io.0[&E1000_RCTL];
+        let mut failed_ops = EnableWakeMock {
+            fail_phy: true,
+            ..EnableWakeMock::default()
+        };
+        let phy_config = EmEnableWakeConfig {
+            wol_phy_wakeup: true,
+            ..config
+        };
+        assert!(em_enable_wakeup(&mut failed_io, &mut failed_ops, phy_config).is_err());
+        assert_eq!(failed_io.0[&E1000_WUFC], 0);
+        assert_eq!(failed_io.0[&E1000_WUC], 0);
+        assert_eq!(failed_io.0[&E1000_RCTL], old_rctl);
+        assert_eq!(failed_ops.pme_clears, 1);
+        assert_eq!(failed_ops.busmaster_disables, 1);
+    }
+
+    #[test]
+    fn wake_with_no_filters_powers_down_only_without_management() {
+        let mut io = RegisterMock::default();
+        let mut ops = EnableWakeMock::default();
+        let config = EmEnableWakeConfig {
+            mac: E1000MacType::I82540,
+            vf: false,
+            has_pme_d3_hot: true,
+            wol_capabilities: EM_WOL_CAPABLE,
+            wol_enabled: 0,
+            management_enabled: false,
+            wol_phy_wakeup: false,
+            wol_phy_armed: false,
+            suspend_link_powered_down: false,
+            media: EmMediaType::Copper,
+            phy_igp3: false,
+            multicast_count: 0,
+            mc_filter_type: 0,
+            mac_address: [0; 6],
+        };
+        em_enable_wakeup(&mut io, &mut ops, config).unwrap();
+        assert_eq!(io.0[&E1000_WUFC], 0);
+        assert_eq!(io.0[&E1000_WUS], u32::MAX);
+        assert!(ops.actions.contains(&"link_down"));
+        assert_eq!((ops.pme_clears, ops.busmaster_disables), (1, 1));
+
+        let mut vf_io = RegisterMock::default();
+        let mut vf_ops = EnableWakeMock::default();
+        em_enable_wakeup(
+            &mut vf_io,
+            &mut vf_ops,
+            EmEnableWakeConfig { vf: true, ..config },
+        )
+        .unwrap();
+        assert!(vf_io.0.is_empty());
+        assert!(vf_ops.actions.is_empty());
     }
 }
