@@ -268,6 +268,8 @@ pub const SDHCI_SPEC_300: u32 = 2;
 pub const SDHCI_SPEC_400: u32 = 3;
 pub const SDHCI_SPEC_410: u32 = 4;
 pub const SDHCI_SPEC_420: u32 = 5;
+pub const SDHCI_200_MAX_DIVIDER: u32 = 256;
+pub const SDHCI_300_MAX_DIVIDER: u32 = 2046;
 pub const SDHCI_HAVE_DMA: u32 = 0x01;
 pub const SDHCI_PLATFORM_TRANSFER: u32 = 0x02;
 pub const SDHCI_NON_REMOVABLE: u32 = 0x04;
@@ -572,16 +574,11 @@ impl<I: SdhciIo> SdhciHost<I> {
             return Err(SdhciError::UnsupportedClock);
         }
         self.io.write16(SDHCI_CLOCK_CONTROL as usize, 0);
-        let mut divisor = 1u32;
-        while self.base_clock_hz / divisor > target_hz && divisor < 2046 {
-            divisor <<= 1;
-        }
-        let encoded = if self.version >= SDHCI_SPEC_300 as u8 {
-            (((divisor >> 1) & SDHCI_DIVIDER_MASK) << SDHCI_DIVIDER_SHIFT)
-                | (((divisor >> 9) & SDHCI_DIVIDER_HI_MASK) << SDHCI_DIVIDER_HI_SHIFT)
-        } else {
-            ((divisor >> 1) & SDHCI_DIVIDER_MASK) << SDHCI_DIVIDER_SHIFT
-        } as u16;
+        let (divisor, encoded_divisor) =
+            calculate_clock_divider(self.base_clock_hz, target_hz, self.version);
+        let encoded = (((encoded_divisor & SDHCI_DIVIDER_MASK) << SDHCI_DIVIDER_SHIFT)
+            | (((encoded_divisor >> SDHCI_DIVIDER_MASK_LEN) & SDHCI_DIVIDER_HI_MASK)
+                << SDHCI_DIVIDER_HI_SHIFT)) as u16;
         self.io.write16(
             SDHCI_CLOCK_CONTROL as usize,
             encoded | SDHCI_CLOCK_INT_EN as u16,
@@ -943,6 +940,30 @@ impl<I: SdhciIo> SdhciHost<I> {
             self.io.delay_us(10);
         }
         Err(SdhciError::Timeout)
+    }
+}
+
+// upstream: sdhci.c sdhci_set_clock() divider selection
+fn calculate_clock_divider(base_hz: u32, target_hz: u32, version: u8) -> (u32, u32) {
+    if version >= SDHCI_SPEC_300 as u8 {
+        let divisor = if target_hz >= base_hz {
+            1
+        } else {
+            let mut divisor = 2;
+            while divisor < SDHCI_300_MAX_DIVIDER && base_hz / divisor > target_hz {
+                divisor += 2;
+            }
+            divisor.min(SDHCI_300_MAX_DIVIDER)
+        };
+        let encoded = if divisor == 1 { 0 } else { divisor >> 1 };
+        (divisor, encoded)
+    } else {
+        let mut divisor = 1;
+        while divisor < SDHCI_200_MAX_DIVIDER && base_hz / divisor > target_hz {
+            divisor <<= 1;
+        }
+        divisor = divisor.min(SDHCI_200_MAX_DIVIDER);
+        (divisor, divisor >> 1)
     }
 }
 
@@ -1636,6 +1657,13 @@ mod tests {
         assert_eq!(make_block_size(5, 512), 0x5000 | 512);
         assert_eq!(sdma_bounce_buffer_size(0), 4096);
         assert_eq!(sdma_bounce_buffer_size(5), 131_072);
+    }
+
+    #[test]
+    fn clock_divider_matches_spec_2_power_of_two_and_spec_3_even_steps() {
+        assert_eq!(calculate_clock_divider(50_000_000, 400_000, 1), (128, 64));
+        assert_eq!(calculate_clock_divider(50_000_000, 400_000, 2), (126, 63));
+        assert_eq!(calculate_clock_divider(50_000_000, 50_000_000, 3), (1, 0));
     }
 
     #[test]

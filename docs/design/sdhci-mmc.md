@@ -23,6 +23,10 @@ tuning, UHS/HS200/HS400, and the full
 upstream function set. Removable SD defaults to the safe 1-bit/25 MHz mode;
 the SD CMD6/ACMD6 helpers are present, but automatic SD bus-width/high-speed
 switching remains off because QEMU's emulated card times out those requests.
+The QEMU PCI SDHCI model (`1b36:0007`) additionally uses a local
+single-block-only mode after observed CMD18 timeouts; this local behavior is
+separate from FreeBSD's PCI quirk table. The generic write-protect callback
+follows FreeBSD's active-low PRESENT_STATE interpretation.
 Capability-gated SDMA uses a 512 KiB, 32-bit DMA bounce
 region; broken/unsupported DMA falls back to PIO. If a timeout leaves DMA
 quiescence uncertain, the region is quarantined rather than freed. User-area and any advertised boot0/boot1 areas are
