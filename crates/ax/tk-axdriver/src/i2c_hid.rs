@@ -153,6 +153,7 @@ pub struct I2cInput {
 
 impl I2cInput {
     // upstream: iichid.c iichid_probe() and iichid_attach()
+    // upstream: iichid.c iichid_attach()
     // upstream: iichid.c iichid_get_rdesc()
     fn attach(bus: usize, child: crate::i2c::AcpiI2cChild) -> DevResult<Self> {
         let address = if child.ten_bit {
@@ -467,6 +468,7 @@ impl BaseDriverOps for I2cInput {
 
 impl InputDriverOps for I2cInput {
     // upstream: iichid.c iichid_intr_start()
+    // upstream: iichid.c iichid_set_power_state()
     // upstream: hmt.c hmt_ev_open() / iichid.c iichid_set_power_state()
     fn open_input(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
@@ -478,6 +480,7 @@ impl InputDriverOps for I2cInput {
     }
 
     // upstream: iichid.c iichid_intr_stop()
+    // upstream: iichid.c iichid_set_power_state()
     // upstream: hmt.c hmt_ev_close() / iichid.c iichid_set_power_state()
     fn close_input(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
@@ -612,6 +615,7 @@ impl InputDriverOps for I2cInput {
 
 impl I2cInput {
     // upstream: iichid.c iichid_suspend()
+    // upstream: iichid.c iichid_suspend_task()
     pub fn suspend(&mut self) -> DevResult<()> {
         let state = self.state.get_mut();
         state.suspended = true;
