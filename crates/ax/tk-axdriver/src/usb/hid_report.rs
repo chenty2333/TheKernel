@@ -16,6 +16,10 @@ struct Global {
     page: u32,
     min: i32,
     max: i32,
+    physical_min: i32,
+    physical_max: i32,
+    unit: u32,
+    unit_exponent: i32,
     size: u32,
     count: u32,
     id: u8,
@@ -31,6 +35,10 @@ struct Field {
     count: u16,
     min: i32,
     max: i32,
+    physical_min: i32,
+    physical_max: i32,
+    unit: u32,
+    unit_exponent: i32,
     app: Usage,
     relative: bool,
     kind: Kind,
@@ -65,6 +73,10 @@ pub(crate) struct HidLocation {
     pub flags: u8,
     pub logical_min: i32,
     pub logical_max: i32,
+    pub physical_min: i32,
+    pub physical_max: i32,
+    pub unit: u32,
+    pub unit_exponent: i32,
 }
 struct ReportLocation {
     kind: ReportKind,
@@ -81,6 +93,10 @@ fn record_location(
     flags: u8,
     min: i32,
     max: i32,
+    physical_min: i32,
+    physical_max: i32,
+    unit: u32,
+    unit_exponent: i32,
 ) -> DevResult<()> {
     if locations.len() == MAX_LOCATIONS || bit_offset > u32::from(u16::MAX) {
         return Err(DevError::Unsupported);
@@ -96,6 +112,10 @@ fn record_location(
             flags,
             logical_min: min,
             logical_max: max,
+            physical_min,
+            physical_max,
+            unit,
+            unit_exponent,
         },
     });
     Ok(())
@@ -181,6 +201,58 @@ pub(crate) fn put_hid_udata(bytes: &mut [u8], location: HidLocation, value: u32)
     }
     true
 }
+
+// upstream: hid.c hid_item_resolution()
+pub(crate) fn hid_item_resolution(location: HidLocation) -> i32 {
+    const SCALE: [(i64, i64); 16] = [
+        (1, 1),
+        (1, 10),
+        (1, 100),
+        (1, 1000),
+        (1, 10_000),
+        (1, 100_000),
+        (1, 1_000_000),
+        (1, 10_000_000),
+        (100_000_000, 1),
+        (10_000_000, 1),
+        (1_000_000, 1),
+        (100_000, 1),
+        (10_000, 1),
+        (1000, 1),
+        (100, 1),
+        (10, 1),
+    ];
+    let (multiplier, divisor) = match location.unit {
+        0x11 => (1, 10),
+        0x13 | 0x33 => (10, 254),
+        0x12 => (1, 1),
+        0x14 => (573, 10),
+        _ => return 0,
+    };
+    if location.logical_max <= location.logical_min
+        || location.physical_max <= location.physical_min
+        || !(0..16).contains(&location.unit_exponent)
+    {
+        return 0;
+    }
+    let (scale_numerator, scale_denominator) = SCALE[location.unit_exponent as usize];
+    let Some(numerator) = (i64::from(location.logical_max) - i64::from(location.logical_min))
+        .checked_mul(multiplier)
+        .and_then(|value| value.checked_mul(scale_numerator))
+    else {
+        return 0;
+    };
+    let Some(denominator) = (i64::from(location.physical_max) - i64::from(location.physical_min))
+        .checked_mul(divisor)
+        .and_then(|value| value.checked_mul(scale_denominator))
+    else {
+        return 0;
+    };
+    if denominator <= 0 {
+        return 0;
+    }
+    i32::try_from(numerator / denominator).unwrap_or(0)
+}
 impl Report {
     pub(crate) fn parse(bytes: &[u8]) -> DevResult<Self> {
         if bytes.len() > 4096 {
@@ -239,6 +311,23 @@ impl Report {
                         i32::try_from(value).map_err(|_| DevError::Unsupported)?
                     }
                 }
+                (1, 3) => g.physical_min = signed(value, width),
+                (1, 4) => {
+                    g.physical_max = if g.physical_min < 0 {
+                        signed(value, width)
+                    } else {
+                        i32::try_from(value).map_err(|_| DevError::Unsupported)?
+                    }
+                }
+                (1, 5) => {
+                    let exponent = (value & 0x0f) as i8;
+                    g.unit_exponent = if exponent & 0x08 != 0 {
+                        i32::from(exponent - 16)
+                    } else {
+                        i32::from(exponent)
+                    };
+                }
+                (1, 6) => g.unit = value,
                 (1, 7) => g.size = value,
                 (1, 8) => {
                     if !(1..=255).contains(&value) {
@@ -336,6 +425,10 @@ impl Report {
                                     value as u8,
                                     g.min,
                                     g.max,
+                                    g.physical_min,
+                                    g.physical_max,
+                                    g.unit,
+                                    g.unit_exponent,
                                 )?;
                             }
                             let mut choices = reserved(usages.len())?;
@@ -348,6 +441,10 @@ impl Report {
                                 count: g.count as u16,
                                 min: g.min,
                                 max: g.max,
+                                physical_min: g.physical_min,
+                                physical_max: g.physical_max,
+                                unit: g.unit,
+                                unit_exponent: g.unit_exponent,
                                 app,
                                 relative: value & 4 != 0,
                                 kind: Kind::Array(choices),
@@ -371,6 +468,10 @@ impl Report {
                                     value as u8,
                                     g.min,
                                     g.max,
+                                    g.physical_min,
+                                    g.physical_max,
+                                    g.unit,
+                                    g.unit_exponent,
                                 )?;
                                 let mapped = if current_slot.is_some() {
                                     match (usage.page, usage.code) {
@@ -397,6 +498,10 @@ impl Report {
                                         count: 1,
                                         min: g.min,
                                         max: g.max,
+                                        physical_min: g.physical_min,
+                                        physical_max: g.physical_max,
+                                        unit: g.unit,
+                                        unit_exponent: g.unit_exponent,
                                         app,
                                         relative: value & 4 != 0,
                                         kind: Kind::Variable(mapped),
@@ -450,6 +555,10 @@ impl Report {
                             value as u8,
                             g.min,
                             g.max,
+                            g.physical_min,
+                            g.physical_max,
+                            g.unit,
+                            g.unit_exponent,
                         )?;
                     }
                     *at = end as u16;
@@ -549,6 +658,14 @@ impl Report {
     pub(crate) fn is_pointer(&self) -> bool {
         self.pointer
     }
+    // upstream: hid.c hid_is_mouse()
+    pub(crate) fn is_mouse(&self) -> bool {
+        self.has_collection_usage(1, 2)
+    }
+    // upstream: hid.c hid_is_keyboard()
+    pub(crate) fn is_keyboard(&self) -> bool {
+        self.has_collection_usage(1, 6)
+    }
     pub(crate) fn is_touchpad(&self) -> bool {
         self.has_collection_usage(0x0d, 0x05)
     }
@@ -647,6 +764,32 @@ impl Report {
             }
         }
         range
+    }
+    pub(crate) fn absolute_resolution(&self, code: u8) -> i32 {
+        self.fields
+            .iter()
+            .find(|field| {
+                matches!(
+                    field.kind,
+                    Kind::Variable(Mapping::Axis(3, mapped)) if mapped == u16::from(code)
+                ) || (code == 0x30 && matches!(field.kind, Kind::Variable(Mapping::MtWidth)))
+                    || (code == 0x31 && matches!(field.kind, Kind::Variable(Mapping::MtHeight)))
+            })
+            .map(|field| {
+                hid_item_resolution(HidLocation {
+                    report_id: field.id,
+                    bit_offset: field.bit,
+                    size: field.size,
+                    flags: 0,
+                    logical_min: field.min,
+                    logical_max: field.max,
+                    physical_min: field.physical_min,
+                    physical_max: field.physical_max,
+                    unit: field.unit,
+                    unit_exponent: field.unit_exponent,
+                })
+            })
+            .unwrap_or(0)
     }
     pub(crate) fn decode(&mut self, report: &[u8], events: &mut VecDeque<Event>) -> bool {
         let id = if self.ids {
@@ -1108,6 +1251,25 @@ mod tests {
         assert_eq!(packet, [1, 9]);
         assert_eq!(get_hid_data(&packet, location, false), Some(9));
         assert_eq!(get_hid_data(&[1], location, false), None);
+    }
+
+    #[test]
+    fn hid_item_resolution_matches_hid_unit_scale() {
+        let mut location = HidLocation {
+            report_id: 0,
+            bit_offset: 0,
+            size: 8,
+            flags: 0,
+            logical_min: 0,
+            logical_max: 1000,
+            physical_min: 0,
+            physical_max: 100,
+            unit: 0x11,
+            unit_exponent: 0,
+        };
+        assert_eq!(hid_item_resolution(location), 1);
+        location.unit_exponent = -1;
+        assert_eq!(hid_item_resolution(location), 0);
     }
     #[test]
     fn wheel_emits_legacy_and_high_resolution_codes() {

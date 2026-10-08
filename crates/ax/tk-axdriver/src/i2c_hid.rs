@@ -400,6 +400,12 @@ impl BaseDriverOps for I2cInput {
                 crate::hmt::Type::Touchscreen => return "I2C HID multitouch touchscreen",
             }
         }
+        if state.parser.is_keyboard() {
+            return "I2C HID keyboard";
+        }
+        if state.parser.is_mouse() {
+            return "I2C HID mouse";
+        }
         if state.parser.is_pointer() {
             "I2C HID pointer"
         } else {
@@ -477,8 +483,9 @@ impl InputDriverOps for I2cInput {
     }
     // upstream: hmt.c hmt_attach()
     fn get_abs_info(&mut self, axis: u8) -> DevResult<Option<AbsInfo>> {
+        let state = self.state.get_mut();
         if axis == 0x2f
-            && let Some(hmt) = self.state.get_mut().hmt
+            && let Some(hmt) = state.hmt
         {
             return Ok(Some(AbsInfo {
                 min: 0,
@@ -488,18 +495,15 @@ impl InputDriverOps for I2cInput {
                 res: 0,
             }));
         }
-        Ok(self
-            .state
-            .get_mut()
-            .parser
-            .absolute_range(axis)
-            .map(|(min, max)| AbsInfo {
-                min: min as u32,
-                max: max as u32,
-                fuzz: 0,
-                flat: 0,
-                res: 0,
-            }))
+        let range = state.parser.absolute_range(axis);
+        let resolution = state.parser.absolute_resolution(axis).max(0) as u32;
+        Ok(range.map(|(min, max)| AbsInfo {
+            min: min as u32,
+            max: max as u32,
+            fuzz: 0,
+            flat: 0,
+            res: resolution,
+        }))
     }
     // upstream: iichid.c iichid_intr() and hmt.c hmt_intr()
     fn read_event(&mut self) -> DevResult<Event> {
