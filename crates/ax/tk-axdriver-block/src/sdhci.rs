@@ -365,6 +365,18 @@ pub struct MmcExtCsd {
     pub erase_group_sectors: u32,
 }
 
+/// Stable identity fields decoded from SD or MMC CID.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MmcCid {
+    pub manufacturer_id: u8,
+    pub oem_id: u16,
+    pub product_name: [u8; 6],
+    pub product_revision: u8,
+    pub serial_number: u32,
+    pub manufacturing_year: u16,
+    pub manufacturing_month: u8,
+}
+
 // upstream: mmc.c mmc_read_ext_csd() decoding
 pub fn parse_ext_csd(bytes: &[u8; 512]) -> MmcExtCsd {
     MmcExtCsd {
@@ -1254,6 +1266,7 @@ fn mmc_csd_sectors(csd: SdhciResponse, high_capacity: bool) -> Result<u64, Sdhci
 pub struct SdhciDisk<I: SdhciIo> {
     host: SdhciHost<I>,
     rca: u16,
+    cid: MmcCid,
     sectors: u64,
     high_capacity: bool,
     erase_group_sectors: u32,
@@ -1270,7 +1283,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
         host.command(SD_CMD_GO_IDLE, 0, RSP_NONE, None, 0)?;
         let version2 = mmc_send_if_cond(&mut host);
         let (mmc, ocr) = mmc_idle_cards(&mut host, version2)?;
-        mmc_all_send_cid(&mut host)?;
+        let raw_cid = mmc_all_send_cid(&mut host)?;
         let high_capacity = ocr & SD_OCR_CCS != 0;
         let rca = mmc_send_relative_addr(&mut host, mmc)?;
         let csd = mmc_send_csd(&mut host, rca)?;
@@ -1329,10 +1342,16 @@ impl<I: SdhciIo> SdhciDisk<I> {
             let target = host.base_clock_hz.min(25_000_000);
             host.set_clock(target)?;
         }
+        let cid = if mmc {
+            decode_mmc_cid(raw_cid, ext_csd.is_some())
+        } else {
+            decode_sd_cid(raw_cid)
+        };
         let write_protected = host.card_write_protected();
         Ok(Self {
             host,
             rca,
+            cid,
             sectors,
             high_capacity,
             erase_group_sectors: erase_group_sectors.max(1),
@@ -1352,6 +1371,10 @@ impl<I: SdhciIo> SdhciDisk<I> {
 
     pub const fn ext_csd(&self) -> Option<MmcExtCsd> {
         self.ext_csd
+    }
+
+    pub const fn cid(&self) -> MmcCid {
+        self.cid
     }
 
     // upstream: mmcsd.c mmcsd_attach() user/boot partition publication
@@ -1708,6 +1731,41 @@ fn response_bits(response: SdhciResponse, lsb: u32, width: u32) -> u32 {
     ((raw >> lsb) & ((1u128 << width) - 1)) as u32
 }
 
+// upstream: mmc.c mmc_decode_cid_sd()
+fn decode_sd_cid(response: SdhciResponse) -> MmcCid {
+    let mut cid = MmcCid {
+        manufacturer_id: response_bits(response, 120, 8) as u8,
+        oem_id: response_bits(response, 104, 16) as u16,
+        product_revision: response_bits(response, 56, 8) as u8,
+        serial_number: response_bits(response, 24, 32),
+        manufacturing_year: (2000 + response_bits(response, 12, 8)) as u16,
+        manufacturing_month: response_bits(response, 8, 4) as u8,
+        ..MmcCid::default()
+    };
+    for (index, byte) in cid.product_name[..5].iter_mut().enumerate() {
+        *byte = response_bits(response, 96 - (index as u32 * 8), 8) as u8;
+    }
+    cid
+}
+
+// upstream: mmc.c mmc_decode_cid_mmc()
+fn decode_mmc_cid(response: SdhciResponse, ext_csd_v4_41_or_later: bool) -> MmcCid {
+    let mut cid = MmcCid {
+        manufacturer_id: response_bits(response, 120, 8) as u8,
+        oem_id: response_bits(response, 104, 8) as u16,
+        product_revision: response_bits(response, 48, 8) as u8,
+        serial_number: response_bits(response, 16, 32),
+        manufacturing_month: response_bits(response, 12, 4) as u8,
+        manufacturing_year: response_bits(response, 8, 4) as u16
+            + if ext_csd_v4_41_or_later { 2013 } else { 1997 },
+        ..MmcCid::default()
+    };
+    for (index, byte) in cid.product_name.iter_mut().enumerate() {
+        *byte = response_bits(response, 96 - (index as u32 * 8), 8) as u8;
+    }
+    cid
+}
+
 fn map_sdhci_error(error: SdhciError) -> crate::DevError {
     match error {
         SdhciError::NoCard => crate::DevError::Io,
@@ -1909,6 +1967,52 @@ mod tests {
     }
 
     #[test]
+    fn sd_and_mmc_cid_fields_follow_source_bit_ranges() {
+        let mut raw = 0u128;
+        raw |= 0x12u128 << 120;
+        raw |= 0x3456u128 << 104;
+        for (index, byte) in b"ABCDEF".iter().enumerate() {
+            raw |= u128::from(*byte) << (96 - index * 8);
+        }
+        raw |= 0x21u128 << 56;
+        raw |= 0x1234_5678u128 << 24;
+        raw |= 3u128 << 12;
+        raw |= 4u128 << 8;
+        let response = SdhciResponse([
+            (raw >> 96) as u32,
+            (raw >> 64) as u32,
+            (raw >> 32) as u32,
+            raw as u32,
+        ]);
+        let sd = decode_sd_cid(response);
+        assert_eq!(sd.manufacturer_id, 0x12);
+        assert_eq!(sd.oem_id, 0x3456);
+        assert_eq!(&sd.product_name[..5], b"ABCDE");
+        assert_eq!(sd.serial_number, 0x1234_5678);
+        assert_eq!((sd.manufacturing_year, sd.manufacturing_month), (2003, 4));
+        let mut raw_mmc = 0u128;
+        raw_mmc |= 0x12u128 << 120;
+        raw_mmc |= 0x56u128 << 104;
+        for (index, byte) in b"ABCDEF".iter().enumerate() {
+            raw_mmc |= u128::from(*byte) << (96 - index * 8);
+        }
+        raw_mmc |= 0x21u128 << 48;
+        raw_mmc |= 0x1234_5678u128 << 16;
+        raw_mmc |= 4u128 << 12;
+        raw_mmc |= 3u128 << 8;
+        let mmc_response = SdhciResponse([
+            (raw_mmc >> 96) as u32,
+            (raw_mmc >> 64) as u32,
+            (raw_mmc >> 32) as u32,
+            raw_mmc as u32,
+        ]);
+        let mmc = decode_mmc_cid(mmc_response, true);
+        assert_eq!(mmc.oem_id, 0x56);
+        assert_eq!(&mmc.product_name, b"ABCDEF");
+        assert_eq!(mmc.manufacturing_year, 2016);
+    }
+
+    #[test]
     fn host_reset_clock_and_command_response_are_bounded() {
         let mut io = MockIo::default();
         io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
@@ -2074,6 +2178,7 @@ mod tests {
         let mut disk = SdhciDisk {
             host,
             rca: 1,
+            cid: MmcCid::default(),
             sectors: 16,
             high_capacity: true,
             erase_group_sectors: 1,
@@ -2095,6 +2200,7 @@ mod tests {
         let disk = SdhciDisk {
             host,
             rca: 1,
+            cid: MmcCid::default(),
             sectors: 10_000,
             high_capacity: true,
             erase_group_sectors: 1,
@@ -2128,6 +2234,7 @@ mod tests {
         let mut disk = SdhciDisk {
             host,
             rca: 1,
+            cid: MmcCid::default(),
             sectors: 10,
             high_capacity: true,
             erase_group_sectors: 1,
