@@ -6,12 +6,13 @@
 #![forbid(unsafe_code)]
 pub mod bcs;
 pub mod cache;
-pub mod lrc;
 pub mod info;
+pub mod lrc;
 pub mod ppgtt;
-pub mod reset;
 pub mod rcs;
 pub mod rcs_page;
+pub mod reset;
+pub mod uc;
 pub mod uncore;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
