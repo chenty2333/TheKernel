@@ -651,7 +651,7 @@ const MMC_CUR_MAX: [u32; 8] = [
     1_000, 5_000, 10_000, 25_000, 35_000, 45_000, 800_000, 200_000,
 ];
 
-// upstream: mmc.c mmc_decode_csd_sd() and mmc_decode_csd_mmc()
+// Shared field decoder for the separate upstream SD and MMC CSD routines.
 pub fn decode_csd(response: SdhciResponse, mmc: bool) -> Option<MmcCsd> {
     let structure = response_bits(response, 126, 2) as u8;
     if !mmc && structure > 1 {
@@ -728,6 +728,16 @@ pub fn decode_csd(response: SdhciResponse, mmc: bool) -> Option<MmcCsd> {
     })
 }
 
+// upstream: mmc.c mmc_decode_csd_sd()
+pub fn decode_sd_csd(response: SdhciResponse) -> Option<MmcCsd> {
+    decode_csd(response, false)
+}
+
+// upstream: mmc.c mmc_decode_csd_mmc()
+pub fn decode_mmc_csd(response: SdhciResponse) -> Option<MmcCsd> {
+    decode_csd(response, true)
+}
+
 /// Format the upstream MMC card ID and serial strings used by mmcsd.
 // upstream: mmc.c mmc_format_card_id_string()
 pub fn format_card_id(cid: MmcCid, mmc: bool, high_capacity: bool) -> (String, String) {
@@ -795,7 +805,7 @@ pub const fn mmcsd_error_message(error: i32) -> &'static str {
     }
 }
 
-// upstream: mmc.c mmc_read_ext_csd() decoding
+// mmc.c mmc_discover_cards() EXT_CSD fields used by the block-device path.
 pub fn parse_ext_csd(bytes: &[u8; 512]) -> MmcExtCsd {
     MmcExtCsd {
         sectors: u32::from_le_bytes([bytes[212], bytes[213], bytes[214], bytes[215]]),
@@ -2164,7 +2174,12 @@ impl<I: SdhciIo> SdhciDisk<I> {
                 .map(|()| decode_sd_status(&raw_status));
             (scr, sd_status)
         };
-        let csd_info = decode_csd(csd, mmc).ok_or(SdhciError::InvalidTransfer)?;
+        let csd_info = if mmc {
+            decode_mmc_csd(csd)
+        } else {
+            decode_sd_csd(csd)
+        }
+        .ok_or(SdhciError::InvalidTransfer)?;
         let mut sectors = csd_info.capacity_bytes / 512;
         let mut erase_group_sectors = csd_info.erase_block_sectors;
         if let Some(status) = sd_status {
