@@ -13,11 +13,13 @@ impl AllDevices {
                     BusProbeResult::Device(dev) => {
                         info!(
                             "registered a new {:?} device at [PA:{:#x}, PA:{:#x}): {:?}",
-                            dev.device_type(),
-                            reg.0, reg.0 + reg.1,
-                            dev.device_name(),
+                            dev.device_type(), reg.0, reg.0 + reg.1, dev.device_name(),
                         );
                         self.add_device(dev);
+                        continue;
+                    }
+                    BusProbeResult::Devices(devices) => {
+                        for dev in devices { self.add_device(dev); }
                         continue;
                     }
                 }

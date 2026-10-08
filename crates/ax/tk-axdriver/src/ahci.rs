@@ -44,6 +44,7 @@ const BOUNCE_PAGES: usize = 16;
 /// Driver state is concrete for static builds and type-erased by the block
 /// device enum after PCI probe.
 /// BAR-backed AHCI register window and platform delay implementation.
+#[derive(Clone, Copy)]
 pub struct Window {
     base: usize,
     size: usize,
@@ -183,6 +184,7 @@ pub(crate) fn probe(
         id_quirk.map_or("generic AHCI", |entry| entry.name),
     );
 
+    let mut devices = alloc::vec::Vec::new();
     for index in 0..channel_count {
         if implemented_ports & (1 << index) == 0 {
             continue;
@@ -195,7 +197,7 @@ pub(crate) fn probe(
         }
         let Some(workspace) = allocate_workspace() else {
             warn!("ahci: {bdf} port {index} DMA workspace allocation failed");
-            return BusProbeResult::Claimed;
+            continue;
         };
         let mut port = PortState::new(index as u8);
         port.quirks = quirks;
@@ -205,25 +207,34 @@ pub(crate) fn probe(
         port.channel_capabilities = controller
             .io_mut()
             .read32(port_base + axdriver_block::ahci::regs::AHCI_P_CMD);
-        match AhciDisk::attach(controller, port, workspace) {
+        let port_controller = AhciController::new(
+            window,
+            controller.capabilities,
+            controller.capabilities2,
+            quirks,
+        );
+        match AhciDisk::attach(port_controller, port, workspace) {
             Ok(disk) => {
                 info!(
-                    "ahci: {bdf} port {index} /dev/sda block_size={} blocks={} polling",
+                    "ahci: {bdf} port {index} block_size={} blocks={} polling",
                     disk.block_size(),
                     disk.num_blocks()
                 );
                 #[cfg(feature = "dyn")]
-                return BusProbeResult::Device(crate::AxDeviceEnum::from_block(disk));
+                devices.push(crate::AxDeviceEnum::from_block(disk));
                 #[cfg(not(feature = "dyn"))]
-                return BusProbeResult::Device(crate::AxDeviceEnum::Block(
-                    crate::StaticBlockDevice::Ahci(alloc::boxed::Box::new(disk)),
-                ));
+                devices.push(crate::AxDeviceEnum::Block(crate::StaticBlockDevice::Ahci(
+                    alloc::boxed::Box::new(disk),
+                )));
             }
             Err(error) => {
                 warn!("ahci: {bdf} port {index} disk initialization failed: {error:?}");
-                return BusProbeResult::Claimed;
             }
         }
     }
-    BusProbeResult::Claimed
+    if devices.is_empty() {
+        BusProbeResult::Claimed
+    } else {
+        BusProbeResult::Devices(devices)
+    }
 }

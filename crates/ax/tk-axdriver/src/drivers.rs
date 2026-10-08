@@ -15,6 +15,7 @@ pub(crate) enum BusProbeResult {
     NotMatched,
     Claimed,
     Device(AxDeviceEnum),
+    Devices(alloc::vec::Vec<AxDeviceEnum>),
 }
 
 pub trait DriverProbe {
