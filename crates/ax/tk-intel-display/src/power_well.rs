@@ -158,6 +158,10 @@ pub fn hsw_wait_for_power_well_enable(
     io: &impl HswPowerWellIo,
     spec: HswWellSpec,
 ) -> Result<bool, Error> {
+    // `intel_display_power_well.c` has a `fixed_enable_delay` branch here
+    // only when the display platform is DG2 (600..1200 us). DG2 is outside the
+    // display-12/13 platform maps ported in `power_map.rs`; the descriptor bit
+    // remains there for faithful source data, but is not a runtime path here.
     io.wait_set(
         spec.registers.driver,
         state_mask(spec.index),

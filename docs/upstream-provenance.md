@@ -1054,3 +1054,7 @@ PG1, rather than PG1 alone, matching `intel_display_power_well.c`.
 `kernel/src/drm/intel/power.rs` associates HSW, ICL AUX and ICL DDI wells with
 the source's separate BIOS/driver/debug request registers; only HSW has a KVMR
 request register (`intel_display_power_well.c`, MIT, Copyright © 2022 Intel).
+
+The HSW wait helper documents the upstream `fixed_enable_delay` branch as
+DG2-only (600–1200 us); DG2 is not in the display-12/13 platform maps, while
+its descriptor flag remains faithfully represented.
