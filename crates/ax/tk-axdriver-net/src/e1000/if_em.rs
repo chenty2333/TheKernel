@@ -2083,6 +2083,240 @@ pub fn em_set_flowcntl(mode: u8) -> DevResult<u8> {
     }
 }
 
+pub trait EmWakeLinkOps {
+    fn power_up_phy(&mut self) -> DevResult;
+    fn power_up_fiber_serdes(&mut self) -> DevResult;
+    fn setup_link(&mut self) -> DevResult;
+    fn shutdown_fiber_serdes(&mut self) -> DevResult;
+    fn power_down_phy(&mut self) -> DevResult;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EmWakeLinkState {
+    pub suspend_link_powered_down: bool,
+}
+
+/// upstream: if_em.c em_power_up_wakeup_link()
+pub fn em_power_up_wakeup_link<O: EmWakeLinkOps>(
+    ops: &mut O,
+    mac: E1000MacType,
+    media: EmMediaType,
+    state: &mut EmWakeLinkState,
+) -> DevResult {
+    if mac < E1000MacType::I82575 || media == EmMediaType::Copper {
+        ops.power_up_phy()?;
+    } else {
+        ops.power_up_fiber_serdes()?;
+        ops.setup_link()?;
+    }
+    state.suspend_link_powered_down = false;
+    Ok(())
+}
+
+/// upstream: if_em.c em_power_down_wakeup_link()
+pub fn em_power_down_wakeup_link<O: EmWakeLinkOps>(
+    ops: &mut O,
+    mac: E1000MacType,
+    media: EmMediaType,
+    state: &mut EmWakeLinkState,
+) -> DevResult {
+    if mac >= E1000MacType::I82575 && media != EmMediaType::Copper {
+        ops.shutdown_fiber_serdes()?;
+    } else {
+        ops.power_down_phy()?;
+    }
+    state.suspend_link_powered_down = true;
+    Ok(())
+}
+
+pub trait EmLedOps {
+    fn setup_led(&mut self) -> DevResult;
+    fn blink_led(&mut self) -> DevResult;
+    fn led_on(&mut self) -> DevResult;
+    fn led_off(&mut self) -> DevResult;
+    fn cleanup_led(&mut self) -> DevResult;
+}
+
+/// upstream: if_em.c em_if_led_func()
+pub fn em_if_led_func<O: EmLedOps>(ops: &mut O, on: bool, internal_serdes: bool) -> DevResult {
+    if on {
+        ops.setup_led()?;
+        if internal_serdes {
+            ops.blink_led()?;
+        } else {
+            ops.led_on()?;
+        }
+    } else {
+        ops.led_off()?;
+        ops.cleanup_led()?;
+    }
+    Ok(())
+}
+
+pub trait EmNvmVectorOps {
+    fn read_nvm_word(&mut self, offset: u16) -> u16;
+    fn write_nvm_word(&mut self, offset: u16, value: u16);
+    fn update_nvm_checksum(&mut self);
+}
+
+/// upstream: if_em.c em_enable_vectors_82574()
+pub fn em_enable_vectors_82574<O: EmNvmVectorOps>(ops: &mut O) {
+    const PCIE_CTRL_WORD: u16 = 0x1b;
+    const MSIX_COUNT_MASK: u16 = 0x7 << 7;
+    let mut value = ops.read_nvm_word(PCIE_CTRL_WORD);
+    if ((value & MSIX_COUNT_MASK) >> 7) != 4 {
+        value = (value & !MSIX_COUNT_MASK) | (4 << 7);
+        ops.write_nvm_word(PCIE_CTRL_WORD, value);
+        ops.update_nvm_checksum();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IgbInterruptConfig {
+    pub msix: bool,
+    pub reset_pending: bool,
+    pub queue_mask: u32,
+    pub link_mask: u32,
+    pub reset_mask: u32,
+    pub iov_mask: u32,
+    pub fatal_mask: u32,
+    pub legacy_mask: u32,
+}
+
+pub trait IgbInterruptOps {
+    fn drain_stale_vectors(&mut self) -> DevResult;
+    fn prepare_device_reset(&mut self) -> DevResult;
+}
+
+/// upstream: if_em.c igb_if_intr_enable()
+pub fn igb_if_intr_enable<I: E1000RegisterIo, O: IgbInterruptOps>(
+    io: &mut I,
+    ops: &mut O,
+    config: IgbInterruptConfig,
+) -> DevResult {
+    if config.reset_pending {
+        return Ok(());
+    }
+    if config.msix {
+        let mask = config.queue_mask | config.link_mask;
+        let eiac = io.read_register(E1000_EIAC)? | mask;
+        io.write_register(E1000_EIAC, eiac)?;
+        let eiam = io.read_register(E1000_EIAM)? | mask;
+        io.write_register(E1000_EIAM, eiam)?;
+        ops.drain_stale_vectors()?;
+        io.write_register(E1000_EIMS, mask)?;
+        io.write_register(
+            E1000_IMS,
+            0x0000_0004 | config.reset_mask | config.iov_mask | config.fatal_mask,
+        )?;
+    } else {
+        let mask = config.legacy_mask | config.reset_mask | config.fatal_mask;
+        io.write_register(E1000_IAM, mask)?;
+        io.write_register(E1000_IMS, mask)?;
+    }
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
+
+/// upstream: if_em.c igb_if_intr_disable()
+pub fn igb_if_intr_disable<I: E1000RegisterIo, O: IgbInterruptOps>(
+    io: &mut I,
+    ops: &mut O,
+    config: IgbInterruptConfig,
+) -> DevResult {
+    ops.prepare_device_reset()?;
+    if config.msix {
+        let mask = config.queue_mask | config.link_mask;
+        let eiam = io.read_register(E1000_EIAM)? & !mask;
+        io.write_register(E1000_EIAM, eiam)?;
+        io.write_register(E1000_EIMC, mask)?;
+        let eiac = io.read_register(E1000_EIAC)? & !mask;
+        io.write_register(E1000_EIAC, eiac)?;
+    } else {
+        io.write_register(E1000_IAM, 0)?;
+    }
+    io.write_register(E1000_IMC, u32::MAX)?;
+    let _ = io.read_register(E1000_STATUS)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmSleepPowerConfig {
+    pub mac: E1000MacType,
+    pub wake_filters: u32,
+    pub suspend_link_powered_down: bool,
+    pub phy_i217: bool,
+    pub eee_disabled: bool,
+    pub eee_low_power_ability: u16,
+}
+
+pub trait EmSleepPowerOps {
+    fn enable_ulp_lpt_lp(&mut self) -> DevResult;
+    fn acquire_phy(&mut self) -> DevResult;
+    fn read_lpi_control(&mut self) -> DevResult<u16>;
+    fn read_eee_advertisement(&mut self) -> DevResult<u16>;
+    fn write_lpi_control(&mut self, value: u16) -> DevResult;
+    fn release_phy(&mut self);
+}
+
+/// upstream: if_em.c em_configure_sx_low_power()
+pub fn em_configure_sx_low_power<O: EmSleepPowerOps>(
+    ops: &mut O,
+    config: EmSleepPowerConfig,
+) -> DevResult {
+    if config.mac < E1000MacType::PchLpt
+        || config.mac >= E1000MacType::I82575
+        || config.suspend_link_powered_down
+    {
+        return Ok(());
+    }
+    if config.wake_filters != 0
+        && config.wake_filters & (E1000_WUFC_EX | E1000_WUFC_MC | E1000_WUFC_BC) == 0
+    {
+        ops.enable_ulp_lpt_lp()?;
+    }
+    if !config.phy_i217 || config.eee_disabled || config.eee_low_power_ability == 0 {
+        return Ok(());
+    }
+    ops.acquire_phy()?;
+    let update = (|| {
+        let mut lpi = ops.read_lpi_control()?;
+        let advertised = ops.read_eee_advertisement()?;
+        if advertised & config.eee_low_power_ability & (1 << 1) != 0 {
+            lpi |= 0x2000;
+        }
+        if advertised & config.eee_low_power_ability & (1 << 2) != 0 {
+            lpi |= 0x4000;
+        }
+        ops.write_lpi_control(lpi)
+    })();
+    ops.release_phy();
+    update
+}
+
+/// Cached firmware/NVM version captured while the device lock is held.
+/// upstream: if_em.c em_fw_version_locked()
+pub fn em_fw_version_locked<A: super::nvm::E1000NvmAccess>(
+    access: &mut A,
+    mac: E1000MacType,
+) -> super::nvm::E1000FwVersion {
+    if mac >= E1000MacType::I82575 {
+        return super::nvm::get_fw_version(access, mac);
+    }
+    let mut version = super::nvm::E1000FwVersion::default();
+    let Some(word) = access
+        .read_nvm_words(0x0005, 1)
+        .ok()
+        .and_then(|words| words.first().copied())
+    else {
+        return version;
+    };
+    version.eep_major = (word & 0xf000) >> 12;
+    version.eep_minor = (word & 0x0ff0) >> 4;
+    version.eep_build = word & 0x000f;
+    version
+}
+
 pub trait EmRxUnitOps {
     fn initialize_rss(&mut self) -> DevResult;
     fn initialize_advanced_rx_rings(&mut self, drop: bool) -> DevResult;
@@ -3408,6 +3642,21 @@ mod tests {
         fn invalid_tail_write(&mut self, _direction: &'static str) {}
     }
     #[derive(Default)]
+    struct IgbInterruptMock {
+        drained: usize,
+        reset_prepared: usize,
+    }
+    impl IgbInterruptOps for IgbInterruptMock {
+        fn drain_stale_vectors(&mut self) -> DevResult {
+            self.drained += 1;
+            Ok(())
+        }
+        fn prepare_device_reset(&mut self) -> DevResult {
+            self.reset_prepared += 1;
+            Ok(())
+        }
+    }
+    #[derive(Default)]
     struct PciMock(BTreeMap<u32, u16>);
     impl E1000PciConfig for PciMock {
         fn read_config_u16(&mut self, register: u32) -> Option<u16> {
@@ -3425,6 +3674,120 @@ mod tests {
     struct VlanMock {
         writes: Vec<(u32, u32)>,
         fail_remove: bool,
+    }
+
+    #[derive(Default)]
+    struct WakeMock(Vec<&'static str>);
+    impl EmWakeLinkOps for WakeMock {
+        fn power_up_phy(&mut self) -> DevResult {
+            self.0.push("up_phy");
+            Ok(())
+        }
+        fn power_up_fiber_serdes(&mut self) -> DevResult {
+            self.0.push("up_fiber");
+            Ok(())
+        }
+        fn setup_link(&mut self) -> DevResult {
+            self.0.push("setup");
+            Ok(())
+        }
+        fn shutdown_fiber_serdes(&mut self) -> DevResult {
+            self.0.push("down_fiber");
+            Ok(())
+        }
+        fn power_down_phy(&mut self) -> DevResult {
+            self.0.push("down_phy");
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct LedMock(Vec<&'static str>);
+    impl EmLedOps for LedMock {
+        fn setup_led(&mut self) -> DevResult {
+            self.0.push("setup");
+            Ok(())
+        }
+        fn blink_led(&mut self) -> DevResult {
+            self.0.push("blink");
+            Ok(())
+        }
+        fn led_on(&mut self) -> DevResult {
+            self.0.push("on");
+            Ok(())
+        }
+        fn led_off(&mut self) -> DevResult {
+            self.0.push("off");
+            Ok(())
+        }
+        fn cleanup_led(&mut self) -> DevResult {
+            self.0.push("cleanup");
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct NvmVectorMock {
+        word: u16,
+        writes: Vec<(u16, u16)>,
+        checksums: usize,
+    }
+
+    #[derive(Default)]
+    struct SleepMock {
+        ulp: usize,
+        acquired: usize,
+        released: usize,
+        lpi: u16,
+        advertisement: u16,
+    }
+
+    #[derive(Default)]
+    struct FirmwareNvmMock(BTreeMap<u16, u16>);
+    impl super::super::nvm::E1000NvmAccess for FirmwareNvmMock {
+        fn read_nvm_words(&mut self, offset: u16, words: u16) -> DevResult<alloc::vec::Vec<u16>> {
+            Ok((0..words)
+                .map(|index| self.0.get(&(offset + index)).copied().unwrap_or(0))
+                .collect())
+        }
+        fn write_nvm_words(&mut self, _offset: u16, _words: &[u16]) -> DevResult {
+            Ok(())
+        }
+    }
+    impl EmSleepPowerOps for SleepMock {
+        fn enable_ulp_lpt_lp(&mut self) -> DevResult {
+            self.ulp += 1;
+            Ok(())
+        }
+        fn acquire_phy(&mut self) -> DevResult {
+            self.acquired += 1;
+            Ok(())
+        }
+        fn read_lpi_control(&mut self) -> DevResult<u16> {
+            Ok(self.lpi)
+        }
+        fn read_eee_advertisement(&mut self) -> DevResult<u16> {
+            Ok(self.advertisement)
+        }
+        fn write_lpi_control(&mut self, value: u16) -> DevResult {
+            self.lpi = value;
+            Ok(())
+        }
+        fn release_phy(&mut self) {
+            self.released += 1;
+        }
+    }
+    impl EmNvmVectorOps for NvmVectorMock {
+        fn read_nvm_word(&mut self, _offset: u16) -> u16 {
+            self.word
+        }
+        fn write_nvm_word(&mut self, offset: u16, value: u16) {
+            self.writes.push((offset, value));
+            self.word = value;
+        }
+        fn update_nvm_checksum(&mut self) {
+            self.checksums += 1;
+        }
     }
     impl EmVlanOps for VlanMock {
         fn set_vf_vlan(&mut self, _vid: u16, add: bool) -> DevResult {
@@ -3542,5 +3905,117 @@ mod tests {
         assert_eq!(fiber.subtype, Some(EmMediaRequest::Fiber1000 { lx: true }));
         assert_eq!(em_set_flowcntl(3).unwrap(), 3);
         assert!(em_set_flowcntl(4).is_err());
+    }
+
+    #[test]
+    fn wake_link_and_led_helpers_keep_generation_order() {
+        let mut state = EmWakeLinkState {
+            suspend_link_powered_down: true,
+        };
+        let mut wake = WakeMock::default();
+        em_power_up_wakeup_link(
+            &mut wake,
+            E1000MacType::I82576,
+            EmMediaType::Fiber,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(wake.0, ["up_fiber", "setup"]);
+        assert!(!state.suspend_link_powered_down);
+        em_power_down_wakeup_link(
+            &mut wake,
+            E1000MacType::I82576,
+            EmMediaType::Fiber,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(wake.0.last(), Some(&"down_fiber"));
+        assert!(state.suspend_link_powered_down);
+
+        let mut led = LedMock::default();
+        em_if_led_func(&mut led, true, true).unwrap();
+        em_if_led_func(&mut led, false, false).unwrap();
+        assert_eq!(led.0, ["setup", "blink", "off", "cleanup"]);
+    }
+
+    #[test]
+    fn e82574_vector_nvm_update_only_changes_msix_count() {
+        let mut nvm = NvmVectorMock {
+            word: 0x0045,
+            ..NvmVectorMock::default()
+        };
+        em_enable_vectors_82574(&mut nvm);
+        assert_eq!(nvm.word, (0x0045 & !(0x7 << 7)) | (4 << 7));
+        assert_eq!(nvm.checksums, 1);
+        em_enable_vectors_82574(&mut nvm);
+        assert_eq!(nvm.checksums, 1);
+    }
+
+    #[test]
+    fn igb_interrupt_masks_preserve_other_vectors_and_reset_gate() {
+        let config = IgbInterruptConfig {
+            msix: true,
+            queue_mask: 0x3,
+            link_mask: 0x4,
+            reset_mask: 0x8,
+            iov_mask: 0x10,
+            fatal_mask: 0x20,
+            ..IgbInterruptConfig::default()
+        };
+        let mut io = RegisterMock::default();
+        io.0.insert(E1000_EIAC, 0x100);
+        io.0.insert(E1000_EIAM, 0x200);
+        let mut ops = IgbInterruptMock::default();
+        igb_if_intr_enable(&mut io, &mut ops, config).unwrap();
+        assert_eq!(io.0[&E1000_EIAC], 0x107);
+        assert_eq!(io.0[&E1000_EIAM], 0x207);
+        assert_eq!(io.0[&E1000_EIMS], 7);
+        assert_eq!(io.0[&E1000_IMS], 0x3c);
+        assert_eq!(ops.drained, 1);
+        igb_if_intr_disable(&mut io, &mut ops, config).unwrap();
+        assert_eq!(io.0[&E1000_EIAM], 0x200);
+        assert_eq!(io.0[&E1000_EIAC], 0x100);
+        assert_eq!(io.0[&E1000_EIMC], 7);
+        assert_eq!(io.0[&E1000_IMC], u32::MAX);
+        assert_eq!(ops.reset_prepared, 1);
+    }
+
+    #[test]
+    fn pch_sleep_wakeup_filters_guard_ulp_and_eee_phy_lock() {
+        let mut ops = SleepMock {
+            advertisement: 0x6,
+            ..SleepMock::default()
+        };
+        let config = EmSleepPowerConfig {
+            mac: E1000MacType::PchLpt,
+            wake_filters: E1000_WUFC_MAG,
+            suspend_link_powered_down: false,
+            phy_i217: true,
+            eee_disabled: false,
+            eee_low_power_ability: 0x6,
+        };
+        em_configure_sx_low_power(&mut ops, config).unwrap();
+        assert_eq!(ops.ulp, 1);
+        assert_eq!(ops.lpi, 0x6000);
+        assert_eq!((ops.acquired, ops.released), (1, 1));
+
+        ops.ulp = 0;
+        let directed = EmSleepPowerConfig {
+            wake_filters: E1000_WUFC_EX,
+            ..config
+        };
+        em_configure_sx_low_power(&mut ops, directed).unwrap();
+        assert_eq!(ops.ulp, 0);
+    }
+
+    #[test]
+    fn firmware_version_uses_legacy_eeprom_word_before_igb() {
+        let mut nvm = FirmwareNvmMock::default();
+        nvm.0.insert(5, 0x1234);
+        let version = em_fw_version_locked(&mut nvm, E1000MacType::I82574);
+        assert_eq!(
+            (version.eep_major, version.eep_minor, version.eep_build),
+            (1, 0x23, 4)
+        );
     }
 }
