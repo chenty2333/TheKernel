@@ -1694,15 +1694,53 @@ fn n305_guc_ads_input(
         .try_reserve_exact(engines.len().saturating_sub(1))
         .map_err(|_| Error::Refused)?;
     for engine in &engines {
-        let base = match (engine.guc_class, engine.instance) {
-            (1, 0) => 0x1c0000, // GEN11_BSD_RING_BASE, VCS0
-            (1, 2) => 0x1d0000, // GEN11_BSD3_RING_BASE, VCS2
-            (2, 0) => 0x1c8000, // GEN11_VEBOX_RING_BASE, VECS0
-            (3, 0) => 0x22000,  // BLT_RING_BASE, BCS0
-            // Render's Gen12 workaround lists are platform-specific and are
-            // not equivalent to the generic non-render engine setup below.
+        let (base, first_render_compute) = match (engine.guc_class, engine.instance) {
+            (0, 0) => (0x2000, true),    // RENDER_RING_BASE, RCS0
+            (1, 0) => (0x1c0000, false), // GEN11_BSD_RING_BASE, VCS0
+            (1, 2) => (0x1d0000, false), // GEN11_BSD3_RING_BASE, VCS2
+            (2, 0) => (0x1c8000, false), // GEN11_VEBOX_RING_BASE, VECS0
+            (3, 0) => (0x22000, false),  // BLT_RING_BASE, BCS0
             _ => continue,
         };
+        let mut workarounds = Vec::new();
+        workarounds
+            .try_reserve_exact(if first_render_compute { 4 } else { 1 })
+            .map_err(|_| Error::Refused)?;
+        workarounds.push(RegsetWorkaround {
+            offset: base + 0xc4, // RING_CMD_CCTL
+            masked: true,
+            mask: 0x3fff,
+            steering_group: 0,
+            steering_instance,
+        });
+        if first_render_compute {
+            // Gen12.0 RCS0 engine_wa_list in intel_workarounds.c:
+            // GEN12<12.55 bus-hash tuning, sampler-mode indirect-state
+            // override, and per-context preemption control.
+            workarounds.extend([
+                RegsetWorkaround {
+                    offset: 0xb004, // GEN8_GARBCNTL, clear bit 7
+                    masked: false,
+                    mask: 0,
+                    steering_group: 0,
+                    steering_instance,
+                },
+                RegsetWorkaround {
+                    offset: 0xe18c, // GEN10_SAMPLER_MODE
+                    masked: true,
+                    mask: 1, // GEN11_INDIRECT_STATE_BASE_ADDR_OVERRIDE
+                    steering_group: 0,
+                    steering_instance,
+                },
+                RegsetWorkaround {
+                    offset: 0x20e0, // GEN7_FF_SLICE_CS_CHICKEN1
+                    masked: true,
+                    mask: 1 << 14, // GEN9_FFSC_PERCTX_PREEMPT_CTRL
+                    steering_group: 0,
+                    steering_instance,
+                },
+            ]);
+        }
         let force_nonpriv_offsets: Vec<u32> = force_nonpriv_regs
             .iter()
             .map(|slot| base + 0x4d0 + slot * 4)
@@ -1711,16 +1749,10 @@ fn n305_guc_ads_input(
             ring_mode: base + 0x29c,
             ring_hws_pga: base + 0x80,
             ring_imr: base + 0xa8,
-            first_render_compute: false,
+            first_render_compute,
             ccs_mask: 0,
             rcu_mode: 0,
-            workarounds: &[RegsetWorkaround {
-                offset: base + 0xc4, // RING_CMD_CCTL
-                masked: true,
-                mask: 0x3fff,
-                steering_group: 0,
-                steering_instance,
-            }],
+            workarounds: &workarounds,
             force_nonpriv_regs: &force_nonpriv_offsets,
             mocs_regs_gen12: &mocs_regs_gen12,
             mocs_regs_gen12_55: &[],
@@ -2719,12 +2751,6 @@ pub(super) fn render_objects(
     }
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
     let guc_submission = prepare_user_engine(owner, true)?;
-    if guc_submission {
-        // The Gen12 RCS context WA currently gathers dynamic DSS/MCR register
-        // state from MMIO. Do not write RCS work behind GuC until those values
-        // are part of the registered engine/ADS inputs.
-        return Err(Error::Refused);
-    }
     if !guc_submission
         && (owner.bus.read(0x480c)? != 0
             || owner.bus.read(0x400c)? != 5
@@ -2796,9 +2822,6 @@ pub(super) fn user_objects(
     job.validate()?;
     super::super::dma::require_direct(owner.bdf).map_err(|_| Error::Refused)?;
     let guc_submission = prepare_user_engine(owner, job.render)?;
-    if guc_submission && job.render {
-        return Err(Error::Refused);
-    }
     if saved.render != job.render {
         return Err(Error::Refused);
     }
