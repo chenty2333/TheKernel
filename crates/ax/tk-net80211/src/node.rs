@@ -485,6 +485,41 @@ pub fn leave_rsn_network(rekey_active: bool, remaining_rekey_peers: usize) -> Rs
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ErpLeaveEffects {
+    pub short_slot_time: Option<bool>,
+    pub use_protection: Option<bool>,
+    pub short_preamble: Option<bool>,
+}
+
+/// Re-evaluate ERP/slot policy after the last incompatible station departs.
+// upstream: ieee80211_node.c ieee80211_node_leave_11g()
+pub fn leave_11g_network(
+    peer_short_slot: bool,
+    peer_erp: bool,
+    remaining_long_slot_peers: usize,
+    remaining_non_erp_peers: usize,
+    local_short_slot_supported: bool,
+    ibss_mode: bool,
+    local_short_preamble_supported: bool,
+) -> ErpLeaveEffects {
+    let mut effects = ErpLeaveEffects::default();
+    if !peer_short_slot
+        && remaining_long_slot_peers == 1
+        && local_short_slot_supported
+        && !ibss_mode
+    {
+        effects.short_slot_time = Some(true);
+    }
+    if !peer_erp && remaining_non_erp_peers == 1 {
+        effects.use_protection = Some(false);
+        if local_short_preamble_supported {
+            effects.short_preamble = Some(true);
+        }
+    }
+    effects
+}
+
 /// Prefer RSN/SHA-256/CCMP while intersecting local and peer capabilities.
 // upstream: ieee80211_node.c ieee80211_choose_rsnparams()
 pub fn choose_rsn_params(
@@ -996,6 +1031,26 @@ mod tests {
         assert!(effects.clear_authorized_port && effects.delete_pairwise_key);
         assert!(!leave_rsn_network(true, 1).complete_rekey_when_no_peers);
         assert!(!leave_rsn_network(false, 0).clear_rekey_flag);
+    }
+
+    #[test]
+    fn erp_leave_reenables_short_slot_and_preamble_after_last_incompatible_peer() {
+        assert_eq!(
+            leave_11g_network(false, false, 1, 1, true, false, true),
+            ErpLeaveEffects {
+                short_slot_time: Some(true),
+                use_protection: Some(false),
+                short_preamble: Some(true),
+            }
+        );
+        assert_eq!(
+            leave_11g_network(false, false, 2, 1, true, true, false),
+            ErpLeaveEffects {
+                short_slot_time: None,
+                use_protection: Some(false),
+                short_preamble: None,
+            }
+        );
     }
 
     #[test]

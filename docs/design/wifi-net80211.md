@@ -272,3 +272,8 @@ rekeying and no other rekey peers remain. The driver owns timer/key application.
 HT-node leave now clears the cached HT capability state and returns explicit
 BlockAck teardown/RX-reorder-buffer release effects; the RX queue/storage owner
 performs the actual hardware reorder cleanup.
+
+The 11g station-leave helper returns short-slot, ERP-protection and short
+preamble changes only when the departed peer was the final incompatible
+station; IBSS retains long slot time. The driver applies the returned PHY
+reconfiguration effects.
