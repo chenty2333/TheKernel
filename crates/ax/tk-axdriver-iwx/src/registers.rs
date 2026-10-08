@@ -31,6 +31,7 @@ const PRPH_READ_MODE: u32 = 3 << 24;
 pub trait CsrAccess {
     fn read32(&mut self, offset: u32) -> u32;
     fn write32(&mut self, offset: u32, value: u32);
+    fn write8(&mut self, offset: u32, value: u8);
     fn barrier(&mut self, direction: IoBarrier);
     fn delay_us(&mut self, micros: u32);
 }
@@ -94,6 +95,11 @@ impl<B: CsrAccess> IwxRegisters<B> {
     /// Write a CSR register directly through the PCI BAR.
     pub fn write_csr(&mut self, offset: u32, value: u32) {
         self.bus.write32(offset, value)
+    }
+
+    /// Write one byte to MSI-X vector-routing registers.
+    pub fn write_csr8(&mut self, offset: u32, value: u8) {
+        self.bus.write8(offset, value)
     }
 
     /// Delay through the platform-provided MMIO timing source.
@@ -343,6 +349,7 @@ mod tests {
             0
         }
         fn write32(&mut self, _offset: u32, _value: u32) {}
+        fn write8(&mut self, _offset: u32, _value: u8) {}
         fn barrier(&mut self, _direction: IoBarrier) {}
         fn delay_us(&mut self, _micros: u32) {}
     }

@@ -7,7 +7,7 @@
 
 use crate::{
     CsrAccess, DeviceFamily, InterruptMasks, IwxRegisters, RegisterError, enable_rfkill_interrupts,
-    hardware_rfkill,
+    hardware_rfkill, initialize_msix_hardware,
 };
 
 const CSR_HW_IF_CONFIG: u32 = 0x000;
@@ -187,6 +187,7 @@ pub fn start_hardware<B: CsrAccess>(
         software_reset(registers);
     }
     apm_init(registers)?;
+    initialize_msix_hardware(registers, masks);
     enable_rfkill_interrupts(registers, masks);
     Ok(hardware_rfkill(registers))
 }
@@ -212,6 +213,10 @@ mod tests {
         fn write32(&mut self, offset: u32, value: u32) {
             self.writes.push((offset, value));
             self.regs.insert(offset, value);
+        }
+        fn write8(&mut self, offset: u32, value: u8) {
+            self.writes.push((offset, u32::from(value)));
+            self.regs.insert(offset, u32::from(value));
         }
         fn barrier(&mut self, _: IoBarrier) {}
         fn delay_us(&mut self, micros: u32) {

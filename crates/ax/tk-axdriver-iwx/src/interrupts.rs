@@ -42,6 +42,18 @@ const CSR_MSIX_FH_MASK: u32 = CSR_MSIX_BASE + 0x804;
 const CSR_MSIX_HW_MASK: u32 = CSR_MSIX_BASE + 0x80c;
 const MSIX_HW_CAUSE_ALIVE: u32 = 1 << 0;
 const MSIX_HW_CAUSE_RF_KILL: u32 = 1 << 7;
+const CSR_MSIX_RX_IVAR: u32 = CSR_MSIX_BASE + 0x880;
+const CSR_MSIX_IVAR: u32 = CSR_MSIX_BASE + 0x890;
+const MSIX_CAUSE_Q0: u32 = 1 << 0;
+const MSIX_CAUSE_Q1: u32 = 1 << 1;
+const MSIX_CAUSE_D2S_CH0: u32 = 1 << 16;
+const MSIX_CAUSE_D2S_CH1: u32 = 1 << 17;
+const MSIX_CAUSE_S2D: u32 = 1 << 19;
+const MSIX_CAUSE_FH_ERR: u32 = 1 << 21;
+const MSIX_NON_AUTO_CLEAR: u8 = 1 << 7;
+const UREG_CHICK: u32 = 0x00a0_5c00;
+const UREG_CHICK_MSI_ENABLE: u32 = 1 << 24;
+const UREG_CHICK_MSIX_ENABLE: u32 = 1 << 25;
 
 /// Mutable OpenBSD mask state for the MSI/MSI-X interrupt paths.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,6 +64,72 @@ pub struct InterruptMasks {
     pub fh_mask: u32,
     pub hw_init_mask: u32,
     pub hw_mask: u32,
+}
+
+/// Program the single-vector MSI-X routing and unmask the source causes.
+// upstream: if_iwx.c iwx_conf_msix_hw()
+pub fn configure_msix_hardware<B: CsrAccess>(
+    registers: &mut IwxRegisters<B>,
+    masks: &InterruptMasks,
+    stopped: bool,
+) {
+    if !masks.msix {
+        if !stopped && registers.nic_lock().is_ok() {
+            let _ = registers.write_umac_prph_unlocked(UREG_CHICK, UREG_CHICK_MSI_ENABLE);
+            let _ = registers.nic_unlock();
+        }
+        return;
+    }
+    if !stopped && registers.nic_lock().is_ok() {
+        let _ = registers.write_umac_prph_unlocked(UREG_CHICK, UREG_CHICK_MSIX_ENABLE);
+        let _ = registers.nic_unlock();
+    }
+
+    registers.write_csr(CSR_MSIX_FH_MASK, !0);
+    registers.write_csr(CSR_MSIX_HW_MASK, !0);
+    registers.write_csr8(CSR_MSIX_RX_IVAR, MSIX_NON_AUTO_CLEAR);
+    registers.write_csr8(CSR_MSIX_RX_IVAR + 1, MSIX_NON_AUTO_CLEAR);
+    for cause in [
+        0x00, 0x01, 0x03, 0x05, 0x10, 0x11, 0x12, 0x15, 0x16, 0x17, 0x18, 0x29, 0x2a, 0x2b, 0x2d,
+        0x2e,
+    ] {
+        registers.write_csr8(CSR_MSIX_IVAR + cause, MSIX_NON_AUTO_CLEAR);
+    }
+    registers.clear_csr_bits(CSR_MSIX_FH_MASK, MSIX_CAUSE_Q0 | MSIX_CAUSE_Q1);
+    registers.clear_csr_bits(
+        CSR_MSIX_FH_MASK,
+        MSIX_CAUSE_D2S_CH0 | MSIX_CAUSE_D2S_CH1 | MSIX_CAUSE_S2D | MSIX_CAUSE_FH_ERR,
+    );
+    registers.clear_csr_bits(
+        CSR_MSIX_HW_MASK,
+        MSIX_HW_CAUSE_ALIVE
+            | (1 << 1)
+            | (1 << 2)
+            | (1 << 6)
+            | MSIX_HW_CAUSE_RF_KILL
+            | (1 << 8)
+            | (1 << 25)
+            | (1 << 5)
+            | (1 << 26)
+            | (1 << 27)
+            | (1 << 29)
+            | (1 << 30),
+    );
+}
+
+/// Program default MSI-X routing and snapshot the unmasked causes.
+// upstream: if_iwx.c iwx_init_msix_hw()
+pub fn initialize_msix_hardware<B: CsrAccess>(
+    registers: &mut IwxRegisters<B>,
+    masks: &mut InterruptMasks,
+) {
+    configure_msix_hardware(registers, masks, false);
+    if masks.msix {
+        masks.fh_init_mask = !registers.read_csr(CSR_MSIX_FH_MASK);
+        masks.fh_mask = masks.fh_init_mask;
+        masks.hw_init_mask = !registers.read_csr(CSR_MSIX_HW_MASK);
+        masks.hw_mask = masks.hw_init_mask;
+    }
 }
 
 /// Disable host interrupt delivery and acknowledge pending legacy causes.
@@ -143,6 +221,8 @@ pub fn hardware_rfkill<B: CsrAccess>(registers: &mut IwxRegisters<B>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use alloc::collections::BTreeMap;
+
     use super::*;
     use crate::IoBarrier;
 
@@ -150,6 +230,7 @@ mod tests {
     struct MockCsr {
         writes: alloc::vec::Vec<(u32, u32)>,
         gp_control: u32,
+        registers: BTreeMap<u32, u32>,
     }
 
     impl CsrAccess for MockCsr {
@@ -157,7 +238,7 @@ mod tests {
             if offset == CSR_GP_CNTRL {
                 self.gp_control
             } else {
-                0
+                *self.registers.get(&offset).unwrap_or(&0)
             }
         }
 
@@ -165,7 +246,14 @@ mod tests {
             self.writes.push((offset, value));
             if offset == CSR_GP_CNTRL {
                 self.gp_control = value;
+            } else {
+                self.registers.insert(offset, value);
             }
+        }
+
+        fn write8(&mut self, offset: u32, value: u8) {
+            self.writes.push((offset, u32::from(value)));
+            self.registers.insert(offset, u32::from(value));
         }
 
         fn barrier(&mut self, _: IoBarrier) {}
@@ -267,5 +355,41 @@ mod tests {
             Err(7)
         );
         assert_eq!(regs.into_inner().writes.last(), Some(&(CSR_INT, !0)));
+    }
+
+    #[test]
+    fn msix_routing_maps_all_causes_and_snapshots_enabled_masks() {
+        let mut regs = IwxRegisters::new(MockCsr::default(), crate::DeviceFamily::Ax210, 0);
+        let mut masks = InterruptMasks {
+            msix: true,
+            ..InterruptMasks::default()
+        };
+        initialize_msix_hardware(&mut regs, &mut masks);
+        assert_eq!(
+            masks.fh_init_mask,
+            MSIX_CAUSE_Q0
+                | MSIX_CAUSE_Q1
+                | MSIX_CAUSE_D2S_CH0
+                | MSIX_CAUSE_D2S_CH1
+                | MSIX_CAUSE_S2D
+                | MSIX_CAUSE_FH_ERR
+        );
+        assert_eq!(
+            masks.hw_init_mask & MSIX_HW_CAUSE_RF_KILL,
+            MSIX_HW_CAUSE_RF_KILL
+        );
+        let bus = regs.into_inner();
+        assert!(
+            bus.writes
+                .contains(&(CSR_MSIX_RX_IVAR, u32::from(MSIX_NON_AUTO_CLEAR)))
+        );
+        assert!(
+            bus.writes
+                .contains(&(CSR_MSIX_RX_IVAR + 1, u32::from(MSIX_NON_AUTO_CLEAR)))
+        );
+        assert!(
+            bus.writes
+                .contains(&(CSR_MSIX_IVAR + 0x2e, u32::from(MSIX_NON_AUTO_CLEAR)))
+        );
     }
 }

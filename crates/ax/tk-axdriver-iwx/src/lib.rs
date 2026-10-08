@@ -56,8 +56,9 @@ pub use init_cmd::{
     dqa_enable_command, phy_configuration_command, tx_antenna_command,
 };
 pub use interrupts::{
-    InterruptMasks, disable_interrupts, enable_firmware_load_interrupts, enable_interrupts,
-    enable_rfkill_interrupts, hardware_rfkill, start_firmware,
+    InterruptMasks, configure_msix_hardware, disable_interrupts, enable_firmware_load_interrupts,
+    enable_interrupts, enable_rfkill_interrupts, hardware_rfkill, initialize_msix_hardware,
+    start_firmware,
 };
 pub use rate::{
     MCS_TO_RATE_INDEX, RATES, Rate, TX_FLAG_COMMAND_RATE, TX_FLAG_HIGH_PRIORITY, TxRateError,
