@@ -187,3 +187,16 @@ resource adapters (`iommu_alloc_irq`, `iommu_alloc_msi_intr`,
 callbacks (`iommu_device_set_iommu_prop`, four `iommu_db_*` DDB commands).
 Page allocation, PCI discovery, APIC/IOAPIC routing, and debug registration
 remain platform-owned framework responsibilities.
+
+The QEMU VT-d topology now uses modern-only VirtIO PCI devices with
+`iommu_platform=on`; transitional devices do not advertise the platform-DMA
+feature and cannot test translated VirtIO DMA. The shared transport negotiates
+`VERSION_1` and `ACCESS_PLATFORM` whenever offered, matching the HAL's bus-DMA
+address contract. With that topology, the 2026-10-09 `intel_iommu=on` run now
+reaches the shell, lists the VirtIO block device, and sends a network packet,
+but still does not pass network acceptance: `ping 10.0.2.2` failed, and the
+post-run interface counters were TX=1/RX=0 with zero reported TX/RX errors.
+At the QEMU GDB snapshot `FSTS=0`, `GSTS=0xc4000000`, and QI head/tail both
+`0x580`; these observations do not prove whether the missing RX completion is
+DMA, an interrupt, or network-stack behavior. Translation remains opt-in and
+must not be enabled by default until block and network acceptance both pass.

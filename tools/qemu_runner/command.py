@@ -261,6 +261,14 @@ def build_qemu_command(
             command.extend(("-overcommit", "cpu-pm=on"))
         if extra_args:
             command.extend(extra_args)
+        if kernel_irqchip_split:
+            # The VT-d topology passes IOVAs through the DMA HAL. Transitional
+            # VirtIO PCI devices neither advertise ACCESS_PLATFORM nor support
+            # it; use modern-only devices and let them advertise the feature so
+            # the guest can negotiate platform DMA addresses.
+            for index, option in enumerate(command[:-1]):
+                if option == "-device" and command[index + 1].startswith("virtio-"):
+                    command[index + 1] += ",disable-legacy=on,iommu_platform=on"
         return tuple(command)
 
     raise CommandError(f"unsupported architecture: {arch}")

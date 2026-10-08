@@ -6,10 +6,12 @@ pub mod fake;
 pub mod mmio;
 pub mod pci;
 
-use crate::{PhysAddr, Result, PAGE_SIZE};
-use bitflags::{bitflags, Flags};
-use core::{fmt::Debug, ops::BitAnd, ptr::NonNull};
+use core::{fmt::Debug, ptr::NonNull};
+
+use bitflags::{Flags, bitflags};
 use log::debug;
+
+use crate::{PAGE_SIZE, PhysAddr, Result};
 
 /// A VirtIO transport layer.
 pub trait Transport {
@@ -82,17 +84,24 @@ pub trait Transport {
     /// Ref: virtio 3.1.1 Device Initialization
     ///
     /// Returns the negotiated set of features.
-    fn begin_init<F: Flags<Bits = u64> + BitAnd<Output = F> + Debug>(
-        &mut self,
-        supported_features: F,
-    ) -> F {
+    fn begin_init<F: Flags<Bits = u64> + Debug>(&mut self, supported_features: F) -> F {
         self.set_status(DeviceStatus::empty());
         self.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
 
-        let device_features = F::from_bits_truncate(self.read_device_features());
+        let device_feature_bits = self.read_device_features();
+        let device_features = F::from_bits_truncate(device_feature_bits);
         debug!("Device features: {:?}", device_features);
-        let negotiated_features = device_features & supported_features;
-        self.write_driver_features(negotiated_features.bits());
+        // This transport and HAL support modern VirtIO and platform DMA
+        // addresses (which may be IOVAs rather than guest physical addresses).
+        // Accept VERSION_1 and ACCESS_PLATFORM whenever the device offers them,
+        // even when a device-specific feature type does not name these common
+        // bits. In identity mode the HAL returns identity addresses.
+        const VERSION_1: u64 = 1 << 32;
+        const ACCESS_PLATFORM: u64 = 1 << 33;
+        let negotiated_bits =
+            device_feature_bits & (supported_features.bits() | VERSION_1 | ACCESS_PLATFORM);
+        let negotiated_features = F::from_bits_truncate(negotiated_bits);
+        self.write_driver_features(negotiated_bits);
 
         self.set_status(
             DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK,
@@ -115,6 +124,60 @@ pub trait Transport {
 
     /// Gets the pointer to the config space.
     fn config_space<T: 'static>(&self) -> Result<NonNull<T>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ptr::NonNull,
+        sync::{Arc, Mutex},
+    };
+
+    use super::{DeviceType, Transport};
+    use crate::{
+        device::common::Feature,
+        transport::fake::{FakeTransport, State},
+    };
+
+    #[test]
+    fn begin_init_accepts_access_platform_offered_by_device() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let mut config = ();
+        let mut transport = FakeTransport {
+            device_type: DeviceType::EntropySource,
+            max_queue_size: 8,
+            device_features: Feature::VERSION_1.bits() | Feature::ACCESS_PLATFORM.bits(),
+            config_space: NonNull::from(&mut config),
+            state: state.clone(),
+        };
+
+        let negotiated = transport.begin_init(Feature::empty());
+
+        assert!(negotiated.contains(Feature::VERSION_1));
+        assert!(negotiated.contains(Feature::ACCESS_PLATFORM));
+        assert_eq!(
+            state.lock().unwrap().driver_features,
+            Feature::VERSION_1.bits() | Feature::ACCESS_PLATFORM.bits()
+        );
+    }
+
+    #[test]
+    fn begin_init_does_not_claim_access_platform_when_device_lacks_it() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let mut config = ();
+        let mut transport = FakeTransport {
+            device_type: DeviceType::EntropySource,
+            max_queue_size: 8,
+            device_features: 0,
+            config_space: NonNull::from(&mut config),
+            state: state.clone(),
+        };
+
+        let negotiated = transport.begin_init(Feature::empty());
+
+        assert!(!negotiated.contains(Feature::ACCESS_PLATFORM));
+        assert_eq!(state.lock().unwrap().driver_features, 0);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

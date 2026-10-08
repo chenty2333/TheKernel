@@ -284,6 +284,29 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("-bios", command)
         self.assertNotIn("-net none", text)
 
+    def test_vtd_split_topology_uses_modern_virtio_platform_dma(self) -> None:
+        command = build_qemu_command(
+            arch="x86_64",
+            kernel=Path("kernel-x86_64.elf"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+            kernel_irqchip_split=True,
+            extra_args=("-device", "intel-iommu,intremap=on"),
+        )
+        virtio_devices = [
+            command[index + 1]
+            for index, option in enumerate(command[:-1])
+            if option == "-device" and command[index + 1].startswith("virtio-")
+        ]
+        self.assertGreaterEqual(len(virtio_devices), 3)
+        self.assertTrue(
+            all(
+                "disable-legacy=on" in device and "iommu_platform=on" in device
+                for device in virtio_devices
+            )
+        )
+        self.assertIn("intel-iommu,intremap=on", command)
+
     def test_x86_64_direct_kernel_mode_is_explicit_debug_path(self) -> None:
         command = build_qemu_command(
             arch="x86_64",
