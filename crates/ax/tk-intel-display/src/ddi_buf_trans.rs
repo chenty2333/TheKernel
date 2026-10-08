@@ -352,294 +352,359 @@ const TGL_HOBL_TABLE: DdiBufferTransTable = table(
     true,
 );
 
-/// Choose the same transition table family as i915 for display-12/13 ports.
-/// The two EDP override booleans come from VBT/panel policy, as in the caller.
-pub fn intel_ddi_buf_trans_get(
-    request: DdiBufferTransRequest,
-) -> Result<DdiBufferTransTable, Error> {
-    let is_hdmi = matches!(request.output, BufferOutput::Hdmi | BufferOutput::Dvi);
-    match (request.platform, request.phy, request.output) {
-        (Platform::AlderLakeP | Platform::AlderLakeN, BufferPhy::Combo, _) if is_hdmi => Ok(table(
-            "icl_combo_phy_trans_hdmi",
-            BufferPhy::Combo,
-            &ICL_COMBO_HDMI,
-            Some(6),
-            false,
-        )),
-        (
-            Platform::AlderLakeP | Platform::AlderLakeN,
-            BufferPhy::Combo,
-            BufferOutput::EmbeddedDisplayPort,
-        ) if request.port_clock_khz > 540_000 => Ok(table(
-            "adlp_combo_phy_trans_edp_hbr3",
-            BufferPhy::Combo,
-            &ADLP_DP_HBR2,
-            None,
-            false,
-        )),
-        (
-            Platform::AlderLakeP | Platform::AlderLakeN,
-            BufferPhy::Combo,
-            BufferOutput::EmbeddedDisplayPort,
-        ) if request.use_edp_hobl => Ok(TGL_HOBL_TABLE),
-        (
-            Platform::AlderLakeP | Platform::AlderLakeN,
-            BufferPhy::Combo,
-            BufferOutput::EmbeddedDisplayPort,
-        ) if request.use_edp_low_vswing => Ok(table(
-            "adlp_combo_phy_trans_edp_up_to_hbr2",
-            BufferPhy::Combo,
-            &ADLP_EDP_HBR2,
-            None,
-            false,
-        )),
-        (
-            Platform::AlderLakeP | Platform::AlderLakeN,
-            BufferPhy::Combo,
-            BufferOutput::EmbeddedDisplayPort | BufferOutput::DisplayPort,
-        ) if request.port_clock_khz > 270_000 => Ok(table(
-            "adlp_combo_phy_trans_dp_hbr2_hbr3",
-            BufferPhy::Combo,
-            &ADLP_DP_HBR2,
-            None,
-            false,
-        )),
-        (
-            Platform::AlderLakeP | Platform::AlderLakeN,
-            BufferPhy::Combo,
-            BufferOutput::EmbeddedDisplayPort | BufferOutput::DisplayPort,
-        ) => Ok(table(
-            "adlp_combo_phy_trans_dp_hbr",
-            BufferPhy::Combo,
-            &ADLP_DP_HBR,
-            None,
-            false,
-        )),
-        (Platform::AlderLakeP | Platform::AlderLakeN, BufferPhy::Dkl, _) if is_hdmi => Ok(table(
-            "tgl_dkl_phy_trans_hdmi",
-            BufferPhy::Dkl,
-            &TGL_DKL_HDMI,
-            Some(9),
-            false,
-        )),
-        (Platform::AlderLakeP | Platform::AlderLakeN, BufferPhy::Dkl, _)
-            if request.port_clock_khz > 270_000 =>
-        {
-            Ok(table(
-                "adlp_dkl_phy_trans_dp_hbr2_hbr3",
-                BufferPhy::Dkl,
-                &ADLP_DKL_DP_HBR2,
-                None,
-                false,
-            ))
-        }
-        (Platform::AlderLakeP | Platform::AlderLakeN, BufferPhy::Dkl, _) => Ok(table(
-            "adlp_dkl_phy_trans_dp_hbr",
-            BufferPhy::Dkl,
-            &ADLP_DKL_DP_HBR,
-            None,
-            false,
-        )),
-        (Platform::AlderLakeS, BufferPhy::Combo, _) if is_hdmi => Ok(table(
-            "icl_combo_phy_trans_hdmi",
-            BufferPhy::Combo,
-            &ICL_COMBO_HDMI,
-            Some(6),
-            false,
-        )),
-        (Platform::AlderLakeS, BufferPhy::Combo, BufferOutput::EmbeddedDisplayPort)
-            if request.port_clock_khz > 540_000 =>
-        {
-            Ok(table(
-                "adls_combo_phy_trans_edp_hbr3",
+fn is_hdmi(request: DdiBufferTransRequest) -> bool {
+    matches!(request.output, BufferOutput::Hdmi | BufferOutput::Dvi)
+}
+
+// upstream: intel_ddi_buf_trans.c tgl_get_combo_buf_trans_dp()
+fn tgl_get_combo_buf_trans_dp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 270_000 {
+        if request.tigerlake_uy {
+            table(
+                "tgl_uy_combo_phy_trans_dp_hbr2",
                 BufferPhy::Combo,
-                &ADLS_EDP_HBR3,
+                &TGL_UY_DP_HBR2,
                 None,
                 false,
-            ))
-        }
-        (Platform::AlderLakeS, BufferPhy::Combo, BufferOutput::EmbeddedDisplayPort)
-            if request.use_edp_hobl =>
-        {
-            Ok(TGL_HOBL_TABLE)
-        }
-        (Platform::AlderLakeS, BufferPhy::Combo, BufferOutput::EmbeddedDisplayPort)
-            if request.use_edp_low_vswing =>
-        {
-            Ok(table(
-                "adls_combo_phy_trans_edp_hbr2",
+            )
+        } else {
+            table(
+                "tgl_combo_phy_trans_dp_hbr2",
                 BufferPhy::Combo,
-                &ADLS_EDP_HBR2,
+                &TGL_DP_HBR2,
                 None,
                 false,
-            ))
+            )
         }
-        (
-            Platform::AlderLakeS,
-            BufferPhy::Combo,
-            BufferOutput::DisplayPort | BufferOutput::EmbeddedDisplayPort,
-        ) if request.port_clock_khz > 270_000 => Ok(table(
-            "adls_combo_phy_trans_dp_hbr2_hbr3",
-            BufferPhy::Combo,
-            &ADLS_DP_HBR2,
-            None,
-            false,
-        )),
-        (
-            Platform::AlderLakeS,
-            BufferPhy::Combo,
-            BufferOutput::DisplayPort | BufferOutput::EmbeddedDisplayPort,
-        ) => Ok(table(
+    } else {
+        table(
             "tgl_combo_phy_trans_dp_hbr",
             BufferPhy::Combo,
             &TGL_DP_HBR,
             None,
             false,
-        )),
-        (Platform::RocketLake, BufferPhy::Combo, _) if is_hdmi => Ok(table(
+        )
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c tgl_get_combo_buf_trans_edp()
+fn tgl_get_combo_buf_trans_edp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 540_000 {
+        table(
+            "icl_combo_phy_trans_dp_hbr2_edp_hbr3",
+            BufferPhy::Combo,
+            &ICL_DP_HBR2_EDP_HBR3,
+            None,
+            false,
+        )
+    } else if request.use_edp_hobl {
+        TGL_HOBL_TABLE
+    } else if request.use_edp_low_vswing {
+        table(
+            "icl_combo_phy_trans_edp_hbr2",
+            BufferPhy::Combo,
+            &ICL_EDP_HBR2,
+            None,
+            false,
+        )
+    } else {
+        tgl_get_combo_buf_trans_dp(request)
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c tgl_get_combo_buf_trans()
+fn tgl_get_combo_buf_trans(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if is_hdmi(request) {
+        table(
             "icl_combo_phy_trans_hdmi",
             BufferPhy::Combo,
             &ICL_COMBO_HDMI,
             Some(6),
             false,
-        )),
-        (Platform::RocketLake, BufferPhy::Combo, BufferOutput::EmbeddedDisplayPort)
-            if request.port_clock_khz > 540_000 =>
-        {
-            Ok(table(
-                "icl_combo_phy_trans_dp_hbr2_edp_hbr3",
-                BufferPhy::Combo,
-                &ICL_DP_HBR2_EDP_HBR3,
-                None,
-                false,
-            ))
-        }
-        (Platform::RocketLake, BufferPhy::Combo, BufferOutput::EmbeddedDisplayPort)
-            if request.use_edp_hobl =>
-        {
-            Ok(TGL_HOBL_TABLE)
-        }
-        (Platform::RocketLake, BufferPhy::Combo, BufferOutput::EmbeddedDisplayPort)
-            if request.use_edp_low_vswing =>
-        {
-            Ok(table(
-                "icl_combo_phy_trans_edp_hbr2",
-                BufferPhy::Combo,
-                &ICL_EDP_HBR2,
-                None,
-                false,
-            ))
-        }
-        (
-            Platform::RocketLake,
-            BufferPhy::Combo,
-            BufferOutput::DisplayPort | BufferOutput::EmbeddedDisplayPort,
-        ) if request.port_clock_khz > 270_000 => Ok(table(
+        )
+    } else if request.output == BufferOutput::EmbeddedDisplayPort {
+        tgl_get_combo_buf_trans_edp(request)
+    } else {
+        tgl_get_combo_buf_trans_dp(request)
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c rkl_get_combo_buf_trans_dp()
+fn rkl_get_combo_buf_trans_dp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 270_000 {
+        table(
             "rkl_combo_phy_trans_dp_hbr2_hbr3",
             BufferPhy::Combo,
             &RKL_DP_HBR2,
             None,
             false,
-        )),
-        (
-            Platform::RocketLake,
-            BufferPhy::Combo,
-            BufferOutput::DisplayPort | BufferOutput::EmbeddedDisplayPort,
-        ) => Ok(table(
+        )
+    } else {
+        table(
             "rkl_combo_phy_trans_dp_hbr",
             BufferPhy::Combo,
             &RKL_DP_HBR,
             None,
             false,
-        )),
-        (Platform::TigerLake, BufferPhy::Combo, _) if is_hdmi => Ok(table(
+        )
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c rkl_get_combo_buf_trans_edp()
+fn rkl_get_combo_buf_trans_edp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 540_000 {
+        table(
+            "icl_combo_phy_trans_dp_hbr2_edp_hbr3",
+            BufferPhy::Combo,
+            &ICL_DP_HBR2_EDP_HBR3,
+            None,
+            false,
+        )
+    } else if request.use_edp_hobl {
+        TGL_HOBL_TABLE
+    } else if request.use_edp_low_vswing {
+        table(
+            "icl_combo_phy_trans_edp_hbr2",
+            BufferPhy::Combo,
+            &ICL_EDP_HBR2,
+            None,
+            false,
+        )
+    } else {
+        rkl_get_combo_buf_trans_dp(request)
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c rkl_get_combo_buf_trans()
+fn rkl_get_combo_buf_trans(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if is_hdmi(request) {
+        table(
             "icl_combo_phy_trans_hdmi",
             BufferPhy::Combo,
             &ICL_COMBO_HDMI,
             Some(6),
             false,
-        )),
-        (Platform::TigerLake, BufferPhy::Combo, BufferOutput::EmbeddedDisplayPort)
-            if request.port_clock_khz > 540_000 =>
-        {
-            Ok(table(
-                "icl_combo_phy_trans_dp_hbr2_edp_hbr3",
-                BufferPhy::Combo,
-                &ICL_DP_HBR2_EDP_HBR3,
-                None,
-                false,
-            ))
-        }
-        (Platform::TigerLake, BufferPhy::Combo, BufferOutput::EmbeddedDisplayPort)
-            if request.use_edp_hobl =>
-        {
-            Ok(TGL_HOBL_TABLE)
-        }
-        (Platform::TigerLake, BufferPhy::Combo, BufferOutput::EmbeddedDisplayPort)
-            if request.use_edp_low_vswing =>
-        {
-            Ok(table(
-                "icl_combo_phy_trans_edp_hbr2",
-                BufferPhy::Combo,
-                &ICL_EDP_HBR2,
-                None,
-                false,
-            ))
-        }
-        (
-            Platform::TigerLake,
+        )
+    } else if request.output == BufferOutput::EmbeddedDisplayPort {
+        rkl_get_combo_buf_trans_edp(request)
+    } else {
+        rkl_get_combo_buf_trans_dp(request)
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c adls_get_combo_buf_trans_dp()
+fn adls_get_combo_buf_trans_dp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 270_000 {
+        table(
+            "adls_combo_phy_trans_dp_hbr2_hbr3",
             BufferPhy::Combo,
-            BufferOutput::DisplayPort | BufferOutput::EmbeddedDisplayPort,
-        ) if request.port_clock_khz > 270_000 && request.tigerlake_uy => Ok(table(
-            "tgl_uy_combo_phy_trans_dp_hbr2",
-            BufferPhy::Combo,
-            &TGL_UY_DP_HBR2,
+            &ADLS_DP_HBR2,
             None,
             false,
-        )),
-        (
-            Platform::TigerLake,
-            BufferPhy::Combo,
-            BufferOutput::DisplayPort | BufferOutput::EmbeddedDisplayPort,
-        ) if request.port_clock_khz > 270_000 => Ok(table(
-            "tgl_combo_phy_trans_dp_hbr2",
-            BufferPhy::Combo,
-            &TGL_DP_HBR2,
-            None,
-            false,
-        )),
-        (
-            Platform::TigerLake,
-            BufferPhy::Combo,
-            BufferOutput::DisplayPort | BufferOutput::EmbeddedDisplayPort,
-        ) => Ok(table(
+        )
+    } else {
+        table(
             "tgl_combo_phy_trans_dp_hbr",
             BufferPhy::Combo,
             &TGL_DP_HBR,
             None,
             false,
-        )),
-        (Platform::TigerLake, BufferPhy::Dkl, _) if is_hdmi => Ok(table(
-            "tgl_dkl_phy_trans_hdmi",
-            BufferPhy::Dkl,
-            &TGL_DKL_HDMI,
-            Some(9),
+        )
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c adls_get_combo_buf_trans_edp()
+fn adls_get_combo_buf_trans_edp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 540_000 {
+        table(
+            "adls_combo_phy_trans_edp_hbr3",
+            BufferPhy::Combo,
+            &ADLS_EDP_HBR3,
+            None,
             false,
-        )),
-        (Platform::TigerLake, BufferPhy::Dkl, _) if request.port_clock_khz > 270_000 => Ok(table(
+        )
+    } else if request.use_edp_hobl {
+        TGL_HOBL_TABLE
+    } else if request.use_edp_low_vswing {
+        table(
+            "adls_combo_phy_trans_edp_hbr2",
+            BufferPhy::Combo,
+            &ADLS_EDP_HBR2,
+            None,
+            false,
+        )
+    } else {
+        adls_get_combo_buf_trans_dp(request)
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c adls_get_combo_buf_trans()
+fn adls_get_combo_buf_trans(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if is_hdmi(request) {
+        table(
+            "icl_combo_phy_trans_hdmi",
+            BufferPhy::Combo,
+            &ICL_COMBO_HDMI,
+            Some(6),
+            false,
+        )
+    } else if request.output == BufferOutput::EmbeddedDisplayPort {
+        adls_get_combo_buf_trans_edp(request)
+    } else {
+        adls_get_combo_buf_trans_dp(request)
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c adlp_get_combo_buf_trans_dp()
+fn adlp_get_combo_buf_trans_dp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 270_000 {
+        table(
+            "adlp_combo_phy_trans_dp_hbr2_hbr3",
+            BufferPhy::Combo,
+            &ADLP_DP_HBR2,
+            None,
+            false,
+        )
+    } else {
+        table(
+            "adlp_combo_phy_trans_dp_hbr",
+            BufferPhy::Combo,
+            &ADLP_DP_HBR,
+            None,
+            false,
+        )
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c adlp_get_combo_buf_trans_edp()
+fn adlp_get_combo_buf_trans_edp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 540_000 {
+        table(
+            "adlp_combo_phy_trans_edp_hbr3",
+            BufferPhy::Combo,
+            &ADLP_DP_HBR2,
+            None,
+            false,
+        )
+    } else if request.use_edp_hobl {
+        TGL_HOBL_TABLE
+    } else if request.use_edp_low_vswing {
+        table(
+            "adlp_combo_phy_trans_edp_up_to_hbr2",
+            BufferPhy::Combo,
+            &ADLP_EDP_HBR2,
+            None,
+            false,
+        )
+    } else {
+        adlp_get_combo_buf_trans_dp(request)
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c adlp_get_combo_buf_trans()
+fn adlp_get_combo_buf_trans(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if is_hdmi(request) {
+        table(
+            "icl_combo_phy_trans_hdmi",
+            BufferPhy::Combo,
+            &ICL_COMBO_HDMI,
+            Some(6),
+            false,
+        )
+    } else if request.output == BufferOutput::EmbeddedDisplayPort {
+        adlp_get_combo_buf_trans_edp(request)
+    } else {
+        adlp_get_combo_buf_trans_dp(request)
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c tgl_get_dkl_buf_trans_dp()
+fn tgl_get_dkl_buf_trans_dp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 270_000 {
+        table(
             "tgl_dkl_phy_trans_dp_hbr2",
             BufferPhy::Dkl,
             &TGL_DKL_DP_HBR2,
             None,
             false,
-        )),
-        (Platform::TigerLake, BufferPhy::Dkl, _) => Ok(table(
+        )
+    } else {
+        table(
             "tgl_dkl_phy_trans_dp_hbr",
             BufferPhy::Dkl,
             &TGL_DKL_DP_HBR,
             None,
             false,
-        )),
+        )
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c tgl_get_dkl_buf_trans()
+fn tgl_get_dkl_buf_trans(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if is_hdmi(request) {
+        table(
+            "tgl_dkl_phy_trans_hdmi",
+            BufferPhy::Dkl,
+            &TGL_DKL_HDMI,
+            Some(9),
+            false,
+        )
+    } else {
+        tgl_get_dkl_buf_trans_dp(request)
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c adlp_get_dkl_buf_trans_dp()
+fn adlp_get_dkl_buf_trans_dp(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if request.port_clock_khz > 270_000 {
+        table(
+            "adlp_dkl_phy_trans_dp_hbr2_hbr3",
+            BufferPhy::Dkl,
+            &ADLP_DKL_DP_HBR2,
+            None,
+            false,
+        )
+    } else {
+        table(
+            "adlp_dkl_phy_trans_dp_hbr",
+            BufferPhy::Dkl,
+            &ADLP_DKL_DP_HBR,
+            None,
+            false,
+        )
+    }
+}
+
+// upstream: intel_ddi_buf_trans.c adlp_get_dkl_buf_trans()
+fn adlp_get_dkl_buf_trans(request: DdiBufferTransRequest) -> DdiBufferTransTable {
+    if is_hdmi(request) {
+        table(
+            "tgl_dkl_phy_trans_hdmi",
+            BufferPhy::Dkl,
+            &TGL_DKL_HDMI,
+            Some(9),
+            false,
+        )
+    } else {
+        adlp_get_dkl_buf_trans_dp(request)
+    }
+}
+
+/// Select display-12/13 table data using the source platform callback routing.
+pub fn intel_ddi_buf_trans_get(
+    request: DdiBufferTransRequest,
+) -> Result<DdiBufferTransTable, Error> {
+    match (request.platform, request.phy) {
+        (Platform::TigerLake, BufferPhy::Combo) => Ok(tgl_get_combo_buf_trans(request)),
+        (Platform::TigerLake, BufferPhy::Dkl) => Ok(tgl_get_dkl_buf_trans(request)),
+        (Platform::RocketLake, BufferPhy::Combo) => Ok(rkl_get_combo_buf_trans(request)),
+        (Platform::AlderLakeS, BufferPhy::Combo) => Ok(adls_get_combo_buf_trans(request)),
+        (Platform::AlderLakeP | Platform::AlderLakeN, BufferPhy::Combo) => {
+            Ok(adlp_get_combo_buf_trans(request))
+        }
+        (Platform::AlderLakeP | Platform::AlderLakeN, BufferPhy::Dkl) => {
+            Ok(adlp_get_dkl_buf_trans(request))
+        }
         _ => Err(Error::Refused),
     }
 }
