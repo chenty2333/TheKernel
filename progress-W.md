@@ -78,3 +78,4 @@
 - `ieee80211_input.c` station `inputm()` receive pipeline and A-MSDU validate/deaggregate paths translated and connected to Ethernet decapsulation; check/tests pass (95 tests); input.c coverage advances to 32/48 functions.
 - RX-path integration now splits negotiated A-MSDU aggregates before publishing Ethernet frames; `tk-net80211` check/tests pass (95 tests).
 - NetDriverOps now has opt-in wireless/name metadata and axnet-ng/runtime can publish a named Ethernet-compatible `wlan0` independently of primary eth0; `tk-axdriver-net`, `tk-axnet-ng`, and `tk-axruntime --features net-ng` checks pass. PCI iwx still does not return a NetDriverOps yet.
+- Sysfs exposes per-wireless-link and phy0 inventory from the axnet wireless registry, and `/dev/rfkill` emits Linux-compatible WLAN ADD records; kernel x86_64-unknown-none product-feature `cargo check` passes. RF-kill writes and a real iwx netdev/data adapter remain incomplete.

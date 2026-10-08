@@ -46,6 +46,16 @@ pub trait NetDriverOps: BaseDriverOps {
         false
     }
 
+    /// Current hardware RF-kill state, when this is a wireless interface.
+    fn rfkill_hard_blocked(&self) -> bool {
+        false
+    }
+
+    /// Current software RF-kill state, when this is a wireless interface.
+    fn rfkill_soft_blocked(&self) -> bool {
+        false
+    }
+
     /// The ethernet address of the NIC.
     fn mac_address(&self) -> EthernetAddress;
 

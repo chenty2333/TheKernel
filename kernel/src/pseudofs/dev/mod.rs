@@ -12,6 +12,7 @@ mod fb;
 pub(crate) use fb::restore_console_after_master_close;
 pub(crate) mod fuse;
 pub(crate) mod r#loop;
+pub(crate) mod rfkill;
 pub(crate) mod rtc;
 pub(crate) mod scanout;
 mod sound;
@@ -623,6 +624,16 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
             Arc::new(Random { insecure: true }),
         ),
     );
+    root.add(
+        "rfkill",
+        Device::new_with_permissions(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            DeviceId::new(10, 58),
+            NodePermission::from_bits_truncate(0o600),
+            Arc::new(rfkill::Rfkill),
+        ),
+    );
     // The FUSE transport is an OFD-owned character device: each daemon open
     // creates one independent connection which is later selected by fsopen's
     // `fd=` configuration.  It must not share state across daemon instances.
@@ -920,6 +931,18 @@ mod tests {
         let console = console.downcast::<Device>().unwrap();
         let console = console.inner().as_any().downcast_ref::<VtNode>().unwrap();
         assert!(console.0.is_active_alias());
+    }
+
+    #[test]
+    fn devfs_publishes_linux_rfkill_character_device() {
+        let devfs = new_test_devfs();
+        let root = devfs.root_dir();
+        let root = root.as_dir().unwrap();
+        let rfkill = root.lookup(FsName::new(b"rfkill")).unwrap();
+        let metadata = rfkill.metadata().unwrap();
+        assert_eq!(metadata.node_type, NodeType::CharacterDevice);
+        assert_eq!(metadata.rdev, DeviceId::new(10, 58));
+        assert_eq!(metadata.mode.bits(), 0o600);
     }
 
     #[test]

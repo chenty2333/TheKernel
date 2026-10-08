@@ -96,6 +96,8 @@ pub struct WirelessInterfaceInfo {
     pub ifindex: u32,
     pub phy_index: u32,
     pub mac_address: [u8; 6],
+    pub soft_blocked: bool,
+    pub hard_blocked: bool,
 }
 
 static WIRELESS_INTERFACES: spin::Mutex<alloc::vec::Vec<WirelessInterfaceInfo>> =
@@ -232,6 +234,8 @@ pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
         return Err(AxError::InvalidInput);
     }
     let mac_address = dev.mac_address().0;
+    let soft_blocked = dev.rfkill_soft_blocked();
+    let hard_blocked = dev.rfkill_hard_blocked();
     let stack = default_stack();
     let interface = Box::new(EthernetDevice::new(
         name.to_owned(),
@@ -253,6 +257,8 @@ pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
         ifindex,
         phy_index: 0,
         mac_address,
+        soft_blocked,
+        hard_blocked,
     });
     Ok(ifindex)
 }

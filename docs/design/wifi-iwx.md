@@ -209,3 +209,8 @@ as a second Ethernet-compatible link after rootfs-ready firmware staging. It
 registers link metadata separately from the primary `eth0`; the PCI driver
 must still provide the actual RX/TX and link-up implementation before a WLAN
 adapter is usable.
+The init-net wireless registry now backs `/sys/class/net/<wlan>/wireless`,
+`/sys/class/ieee80211/phyN/{index,macaddress}`, and a Linux-layout `/dev/rfkill`
+read stream that reports one WLAN ADD event per published wireless link.
+The current rfkill device is observational: writes remain unsupported until
+the adapter can atomically apply software-block transitions to hardware.
