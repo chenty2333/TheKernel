@@ -642,7 +642,10 @@ impl Report {
         self.mt_contacts_per_report = self
             .fields
             .iter()
-            .filter(|field| matches!(field.kind, Kind::Variable(Mapping::MtContactId)))
+            .filter(|field| {
+                field.id == location.report_id
+                    && matches!(field.kind, Kind::Variable(Mapping::MtContactId))
+            })
             .filter_map(|field| field.slot)
             .max()
             .map_or(1, |slot| usize::from(slot) + 1)
@@ -827,18 +830,19 @@ impl Report {
         // been delivered; later packets carry a zero Contact Count.
         let mut next_contacts_remaining = self.mt_contacts_remaining;
         let finish_contact_batch = if let Some(location) = self.mt_contact_count {
-            if location.report_id != id {
-                return false;
+            if location.report_id == id {
+                let Some(count) = get_hid_data(report, location, false) else {
+                    return false;
+                };
+                if count > 0 {
+                    next_contacts_remaining = usize::try_from(count).unwrap_or(32).min(32);
+                }
+                let delivered = next_contacts_remaining.min(self.mt_contacts_per_report);
+                next_contacts_remaining -= delivered;
+                next_contacts_remaining == 0
+            } else {
+                true
             }
-            let Some(count) = get_hid_data(report, location, false) else {
-                return false;
-            };
-            if count > 0 {
-                next_contacts_remaining = usize::try_from(count).unwrap_or(32).min(32);
-            }
-            let delivered = next_contacts_remaining.min(self.mt_contacts_per_report);
-            next_contacts_remaining -= delivered;
-            next_contacts_remaining == 0
         } else {
             true
         };
@@ -1137,6 +1141,40 @@ mod tests {
         assert!(!triples(&events).contains(&(0, 0, 0)));
         events.clear();
         assert!(parser.decode(&[0, 1, 8, 70, 80], &mut events));
+        assert!(triples(&events).contains(&(0, 0, 0)));
+    }
+    #[test]
+    fn contact_batch_does_not_block_other_report_ids() {
+        let mut descriptor = alloc::vec![
+            0x05, 0x0d, 0x09, 0x05, 0xa1, 1, 0x85, 1, // Touchpad, report 1
+            0x09, 0x54, 0x15, 0, 0x25, 10, 0x75, 8, 0x95, 1, 0x81, 2, // Contact Count
+            0x09, 0x22, 0xa1, 2, // Finger
+            0x09, 0x42, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // Tip
+            0x75, 7, 0x95, 1, 0x81, 3, // Padding
+            0x09, 0x51, 0x15, 0, 0x25, 31, 0x75, 8, 0x95, 1, 0x81, 2, // Contact ID
+            0x05, 1, 0x09, 0x30, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // X
+            0x09, 0x31, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x81, 2, // Y
+            0xc0, 0xc0,
+        ];
+        descriptor.extend([
+            0x05, 1, 0x09, 6, 0xa1, 1, 0x85, 2, // Keyboard, report 2
+            0x05, 7, 0x09, 4, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, // A
+            0x75, 7, 0x95, 1, 0x81, 3, 0xc0,
+        ]);
+        let mut parser = Report::parse(&descriptor).unwrap();
+        let location = parser
+            .locate_usage(ReportKind::Input, 0x0d, 0x54, 0)
+            .unwrap();
+        parser.configure_mt_contact_count(location);
+        let mut events = VecDeque::new();
+        assert!(parser.decode(&[1, 2, 1, 7, 50, 60], &mut events));
+        assert!(!triples(&events).contains(&(0, 0, 0)));
+        events.clear();
+        assert!(parser.decode(&[2, 1], &mut events));
+        assert!(triples(&events).contains(&(1, 30, 1)));
+        assert!(triples(&events).contains(&(0, 0, 0)));
+        events.clear();
+        assert!(parser.decode(&[1, 0, 1, 8, 70, 80], &mut events));
         assert!(triples(&events).contains(&(0, 0, 0)));
     }
     fn pointer(absolute: bool, id: Option<u8>) -> Vec<u8> {
