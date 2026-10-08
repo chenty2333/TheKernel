@@ -1246,6 +1246,19 @@ impl<I: SdhciIo> SdhciHost<I> {
         Ok(())
     }
 
+    // upstream: mmc.c mmc_set_timing() MMC-card path
+    fn set_mmc_timing(&mut self, timing: MmcBusTiming, target_hz: u32) -> Result<(), SdhciError> {
+        let hs_timing = match timing {
+            MmcBusTiming::Normal => 0,
+            MmcBusTiming::HighSpeed => 1,
+            // HS200/HS400 require VCCQ switching, width sequencing and
+            // tuning; do not advertise or enter them through the legacy path.
+            _ => return Err(SdhciError::UnsupportedClock),
+        };
+        self.mmc_switch(185, hs_timing)?;
+        self.set_high_speed(target_hz)
+    }
+
     /// Issue one command and optional PIO data transfer. Multi-block requests
     /// are bounded by the 16-bit SDHCI block-count register.
     // upstream: sdhci.c sdhci_generic_request()
@@ -2006,17 +2019,16 @@ impl<I: SdhciIo> SdhciDisk<I> {
                 4
             };
             mmc_set_card_bus_width(&mut host, true, rca, bus_width)?;
-            // EXT_CSD[185] (HS_TIMING) value 1 selects legacy MMC high speed.
-            // Only use it when the card advertises a 26/52 MHz timing mode.
+            // Only use the MMC high-speed timing supported by this host path;
+            // HS200/HS400 need the full VCCQ/width/tuning transition sequence.
             let card_type = ext_csd.map_or(0, |csd| csd.card_type);
             if card_type & 0x03 != 0 {
-                host.mmc_switch(185, 1)?;
                 let target = if card_type & 0x02 != 0 {
                     52_000_000
                 } else {
                     26_000_000
                 };
-                host.set_high_speed(target.min(host.base_clock_hz))?;
+                host.set_mmc_timing(MmcBusTiming::HighSpeed, target.min(host.base_clock_hz))?;
             }
             // PARTITION_CONFIG is intentionally retained for future boot/RPMB
             // child devices; the current registry exposes only user area.
@@ -2703,6 +2715,10 @@ mod tests {
         let mut host = host;
         assert_eq!(
             host.switch_signal_voltage_18v(),
+            Err(SdhciError::UnsupportedClock)
+        );
+        assert_eq!(
+            host.set_mmc_timing(MmcBusTiming::MmcHs200, 200_000_000),
             Err(SdhciError::UnsupportedClock)
         );
         assert_eq!(
