@@ -14,6 +14,7 @@ use axdriver_net::{
     NetDriverOps,
     e1000::{
         E1000Hal, E1000Nic,
+        api::{E1000MacType, set_mac_type},
         osdep::{E1000PciConfig, read_pci_cfg, write_pci_cfg},
     },
 };
@@ -134,6 +135,13 @@ pub(crate) fn probe(
     if info.vendor_id != INTEL_VENDOR_ID || !e1000_family(info.device_id) {
         return BusProbeResult::NotMatched;
     }
+    let mac_type = match set_mac_type(info.device_id) {
+        Ok(mac_type) => mac_type,
+        Err(error) => {
+            warn!("e1000: {bdf} cannot select shared MAC type: {error:?}");
+            return BusProbeResult::Claimed;
+        }
+    };
     if info.class != PCI_CLASS_NETWORK {
         return BusProbeResult::Claimed;
     }
@@ -175,7 +183,7 @@ pub(crate) fn probe(
         mmio,
         size,
         false,
-        matches!(info.device_id, 0x1502 | 0x1503),
+        matches!(mac_type, E1000MacType::Pch2Lan),
     ) {
         Ok(nic) => nic,
         Err(error) => {
