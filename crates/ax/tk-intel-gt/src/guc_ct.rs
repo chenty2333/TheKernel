@@ -117,6 +117,15 @@ pub const KLV_SELF_CFG_H2G_CTB_SIZE: u16 = 0x0904;
 pub const KLV_SELF_CFG_G2H_CTB_ADDR: u16 = 0x0905;
 pub const KLV_SELF_CFG_G2H_CTB_DESCRIPTOR_ADDR: u16 = 0x0906;
 pub const KLV_SELF_CFG_G2H_CTB_SIZE: u16 = 0x0907;
+pub const ACTION_SCHED_CONTEXT_MODE_DONE: u16 = 0x1002;
+pub const ACTION_CONTEXT_RESET_NOTIFICATION: u16 = 0x1008;
+pub const ACTION_ENGINE_FAILURE_NOTIFICATION: u16 = 0x1009;
+pub const ACTION_DEREGISTER_CONTEXT_DONE: u16 = 0x4600;
+pub const ACTION_TLB_INVALIDATION_DONE: u16 = 0x7001;
+pub const ACTION_STATE_CAPTURE_NOTIFICATION: u16 = 0x8002;
+pub const ACTION_NOTIFY_FLUSH_LOG_BUFFER_TO_FILE: u16 = 0x8003;
+pub const ACTION_NOTIFY_CRASH_DUMP_POSTED: u16 = 0x8004;
+pub const ACTION_NOTIFY_EXCEPTION: u16 = 0x8005;
 
 /// The shared descriptor is 16 dwords; only the first three are writable.
 #[repr(C)]
@@ -251,6 +260,16 @@ pub struct CtbMessage<'a> {
     pub hxg_type: HxgType,
     pub aux: u32,
     pub payload: &'a [u32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CtbEvent<'a> {
+    pub action: u16,
+    pub data0: u16,
+    pub payload: &'a [u32],
+    pub released_response_credit: u32,
+    /// TLB invalidation completion must bypass deferred event work.
+    pub process_immediately: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -667,6 +686,43 @@ impl CtbPair {
         Ok(())
     }
 
+    /// upstream: intel_guc_ct.c ct_handle_event()/ct_handle_hxg().
+    /// Responses complete their request here; events return to the IRQ owner
+    /// for immediate or deferred dispatch, after releasing reserved credits
+    /// for event classes that can otherwise deadlock H2G submission.
+    pub fn handle_incoming_message<'a>(
+        &mut self,
+        words: &'a [u32],
+    ) -> Result<Option<CtbEvent<'a>>, CtError> {
+        let message = parse_message(words)?;
+        if message.hxg_type != HxgType::Event {
+            self.handle_response(message)?;
+            return Ok(None);
+        }
+        let action = (message.aux & HXG_ACTION_MASK) as u16;
+        let data0 = ((message.aux & HXG_DATA0_MASK) >> 16) as u16;
+        let release_credit = if matches!(
+            action,
+            ACTION_SCHED_CONTEXT_MODE_DONE
+                | ACTION_DEREGISTER_CONTEXT_DONE
+                | ACTION_TLB_INVALIDATION_DONE
+        ) {
+            u32::try_from(words.len()).map_err(|_| CtError::InvalidMessage)?
+        } else {
+            0
+        };
+        if release_credit != 0 {
+            self.receive.release_response_space(release_credit)?;
+        }
+        Ok(Some(CtbEvent {
+            action,
+            data0,
+            payload: message.payload,
+            released_response_credit: release_credit,
+            process_immediately: action == ACTION_TLB_INVALIDATION_DONE,
+        }))
+    }
+
     /// Consume a completed request and release the full maximum-size G2H
     /// reservation, matching ct_send() after its wait finishes.
     pub fn finish_request(&mut self, fence: u16) -> Result<CtCompletion, CtError> {
@@ -931,6 +987,26 @@ mod tests {
             HXG_ORIGIN_GUC | HXG_TYPE_FAST_REQUEST,
         ];
         assert_eq!(parse_message(&unsupported), Err(CtError::InvalidMessage));
+    }
+
+    #[test]
+    fn ctb_event_handler_returns_action_and_releases_reserved_irq_credit() {
+        let mut pair = CtbPair::new().unwrap();
+        pair.receive.reserve_response_space(3).unwrap();
+        let words = [
+            ctb_message_header(0, 2),
+            HXG_ORIGIN_GUC | HXG_TYPE_EVENT | u32::from(ACTION_TLB_INVALIDATION_DONE),
+            0x55,
+        ];
+        let event = pair.handle_incoming_message(&words).unwrap().unwrap();
+        assert_eq!(event.action, ACTION_TLB_INVALIDATION_DONE);
+        assert_eq!(event.payload, [0x55]);
+        assert_eq!(event.released_response_credit, 3);
+        assert!(event.process_immediately);
+        assert_eq!(
+            pair.receive.available_dwords(),
+            CTB_G2H_BUFFER_SIZE as u32 / 4 - 1 - G2H_ROOM_BUFFER_SIZE as u32 / 4
+        );
     }
 
     #[test]
