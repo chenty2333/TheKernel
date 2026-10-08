@@ -211,3 +211,10 @@ buffering/gap timers are replaced by iwx's RX BAID/NSSN firmware reorder path;
 axnet; probe-request/association-request/PS-Poll handlers are AP-only (OpenBSD
 iwx defaults to station and rejects hostap mode). Exact function coverage is
 recorded in progress-W.md.
+
+OpenBSD's `ieee80211_begin_bgscan()` gates background scans on RUN state,
+scan re-entry, management timer and an authorized RSN port. The ported planner
+runs the driver callback only after those guards and returns explicit cache
+clear/background-scan effects when the callback succeeds; the timeout wrapper
+uses the same planner. The controller/firmware scan callback is still a
+separate iwx runtime integration step.

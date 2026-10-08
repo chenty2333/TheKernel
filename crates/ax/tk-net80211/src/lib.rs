@@ -152,4 +152,7 @@ pub use rx_path::{RxDataPolicy, RxDataResult, RxDropReason, receive_station_data
 pub use sa_query::{
     SaQueryError, SaQueryOutcome, SaQueryState, receive_sa_query_request, receive_sa_query_response,
 };
-pub use scan::{ScanError, ScanProgress, ScanStep, begin_scan, next_scan_channel};
+pub use scan::{
+    BackgroundScanEffects, BackgroundScanPolicy, ScanError, ScanProgress, ScanStep,
+    background_scan_timeout, begin_background_scan, begin_scan, next_scan_channel,
+};
