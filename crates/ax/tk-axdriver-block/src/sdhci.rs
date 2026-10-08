@@ -1525,6 +1525,12 @@ fn mmc_send_status<I: SdhciIo>(host: &mut SdhciHost<I>, rca: u16) -> Result<u32,
         .map(|response| response.0[0])
 }
 
+// upstream: mmc.c mmc_set_blocklen()
+fn mmc_set_blocklen<I: SdhciIo>(host: &mut SdhciHost<I>, length: u32) -> Result<(), SdhciError> {
+    host.command(SD_CMD_SET_BLOCKLEN, length, SD_R1, None, 0)?;
+    Ok(())
+}
+
 // upstream: mmc.c mmc_decode_csd() capacity fields
 /// SD card block device initialized through the generic SDHCI command path.
 pub struct SdhciDisk<I: SdhciIo> {
@@ -1596,7 +1602,7 @@ impl<I: SdhciIo> SdhciDisk<I> {
             return Err(SdhciError::InvalidTransfer);
         }
         if !high_capacity {
-            host.command(SD_CMD_SET_BLOCKLEN, 512, SD_R1, None, 0)?;
+            mmc_set_blocklen(&mut host, 512)?;
         }
         if mmc && high_capacity {
             let bus_width = if host.capabilities & SDHCI_CAN_DO_8BITBUS != 0 {
@@ -2243,6 +2249,16 @@ mod tests {
         );
         host.set_power(0).unwrap();
         assert_eq!(host.io.read8(SDHCI_POWER_CONTROL as usize), 0);
+    }
+
+    #[test]
+    fn set_blocklen_uses_cmd16_with_the_requested_length() {
+        let mut io = MockIo::default();
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        let mut host = SdhciHost::new(io, 0, 0, SDHCI_SPEC_300 as u8);
+        mmc_set_blocklen(&mut host, 512).unwrap();
+        assert_eq!(host.io.argument, 512);
+        assert_eq!(host.io.command >> 8, u16::from(SD_CMD_SET_BLOCKLEN));
     }
 
     #[test]
