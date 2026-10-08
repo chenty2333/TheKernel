@@ -214,3 +214,14 @@ The init-net wireless registry now backs `/sys/class/net/<wlan>/wireless`,
 read stream that reports one WLAN ADD event per published wireless link.
 The current rfkill device is observational: writes remain unsupported until
 the adapter can atomically apply software-block transitions to hardware.
+
+The retained controller now offers a queue-validated raw-MPDU transmit entry
+that copies upper-layer payload bytes into DMA-owned storage, serializes the
+source Gen2/Gen3 TX command and keeps that DMA region until TX completion. The
+caller must still configure a firmware queue and build the 802.11 header before
+submitting; no interface data path is advertised by this helper alone.
+The Ethernet-compatible wireless link now starts its retained regular-uCode
+controller only on an administrative transition from DOWN to UP (and requests
+stop on the reverse transition). Wireless links begin administratively DOWN;
+ordinary Ethernet devices preserve their existing UP default. The controller's
+raw-MPDU DMA submit primitive is available to the future net80211 transmitter.

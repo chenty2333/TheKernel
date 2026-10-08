@@ -56,6 +56,11 @@ pub trait NetDriverOps: BaseDriverOps {
         false
     }
 
+    /// Change administrative radio state before the interface state is published.
+    fn set_link_up(&mut self, _up: bool) -> DevResult {
+        Ok(())
+    }
+
     /// The ethernet address of the NIC.
     fn mac_address(&self) -> EthernetAddress;
 

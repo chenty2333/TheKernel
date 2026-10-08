@@ -220,6 +220,16 @@ pub trait Device: Send + Sync {
     fn interface_kind(&self) -> InterfaceKind;
     fn mtu(&self) -> usize;
 
+    /// Whether the interface should be administratively up at publication.
+    fn initial_link_up(&self) -> bool {
+        true
+    }
+
+    /// Apply a link's administrative up/down transition to a hardware owner.
+    fn set_link_up(&mut self, _up: bool) -> AxResult {
+        Ok(())
+    }
+
     fn hardware_address(&self) -> Option<[u8; 6]> {
         None
     }

@@ -633,6 +633,14 @@ impl Device for EthernetDevice {
         STANDARD_MTU
     }
 
+    fn initial_link_up(&self) -> bool {
+        !self.inner.is_wireless()
+    }
+
+    fn set_link_up(&mut self, up: bool) -> AxResult {
+        self.inner.set_link_up(up).map_err(Self::map_dev_error)
+    }
+
     fn has_rx_backlog(&self) -> bool {
         !self.quarantined && self.inner.can_receive()
     }

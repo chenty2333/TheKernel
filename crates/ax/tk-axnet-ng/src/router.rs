@@ -581,12 +581,13 @@ impl Router {
         }
         self.next_ifindex = self.next_ifindex.checked_add(1).unwrap_or(0);
         let mtu = device.mtu();
+        let up = device.initial_link_up();
         self.devices.push(device);
         self.ifindices.push(ifindex);
         self.links.push(LinkState {
             name,
             mtu,
-            up: true,
+            up,
             peer: None,
         });
         Ok(ifindex)
@@ -982,13 +983,6 @@ impl Router {
                 return Err(AxError::InvalidInput);
             }
         }
-        let link = &mut self.links[slot];
-        if let Some(name) = name {
-            link.name = name;
-        }
-        if let Some(mtu) = mtu {
-            link.mtu = mtu;
-        }
         if let Some(up) = up {
             if !up
                 && self
@@ -998,6 +992,18 @@ impl Router {
             {
                 return Err(AxError::ResourceBusy);
             }
+            if self.links[slot].up != up {
+                self.devices[slot].set_link_up(up)?;
+            }
+        }
+        let link = &mut self.links[slot];
+        if let Some(name) = name {
+            link.name = name;
+        }
+        if let Some(mtu) = mtu {
+            link.mtu = mtu;
+        }
+        if let Some(up) = up {
             if link.up && !up {
                 // The device bridge is a one-shot retained owner.  Dropping
                 // it while administratively down prevents queued ingress

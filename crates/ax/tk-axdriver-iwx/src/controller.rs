@@ -58,6 +58,15 @@ pub enum StopDeviceError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub enum ControllerTxError {
+    InvalidQueue,
+    QueueDisabled,
+    PayloadTooLarge,
+    Dma(DmaError),
+    Tx(crate::TxError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum ControllerUcodeStartError<F, P> {
     Firmware(ControllerError<F>),
     Pnvm(PnvmLoadError<P>),
@@ -576,6 +585,60 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         Ok(outcome)
     }
 
+    /// Copy one upper-layer payload into retained DMA and submit a raw 802.11 MPDU.
+    pub fn submit_data_frame(
+        &mut self,
+        queue_id: u8,
+        station_id: u8,
+        header: &[u8],
+        payload: &[u8],
+        flags: u16,
+        rate_n_flags: u32,
+        encryption_offloaded: bool,
+    ) -> Result<usize, ControllerTxError> {
+        let queue_index = usize::from(queue_id);
+        if queue_index >= self.resources.tx_queues.len() || queue_index >= 32 {
+            return Err(ControllerTxError::InvalidQueue);
+        }
+        if self.tx_queue_state.enabled_mask & (1u32 << queue_index) == 0 {
+            return Err(ControllerTxError::QueueDisabled);
+        }
+        if payload.len() > u16::MAX as usize {
+            return Err(ControllerTxError::PayloadTooLarge);
+        }
+        let mut payload_dma = self
+            .allocator
+            .allocate(payload.len().max(1))
+            .map_err(ControllerTxError::Dma)?;
+        payload_dma.write(payload).map_err(ControllerTxError::Dma)?;
+        let segments = [crate::TxSegment {
+            address: payload_dma.device_address(),
+            length: payload.len() as u16,
+        }];
+        let tx_frame = crate::TxFrame {
+            queue_id,
+            slot: station_id,
+            header,
+            payload_segments: &segments,
+            flags,
+            rate_n_flags,
+            encryption_offloaded,
+        };
+        let ring = self
+            .resources
+            .tx_queues
+            .get_mut(queue_index)
+            .ok_or(ControllerTxError::InvalidQueue)?;
+        crate::submit_tx_frame_owned(
+            &mut self.registers,
+            ring,
+            self.family,
+            &tx_frame,
+            payload_dma,
+        )
+        .map_err(ControllerTxError::Tx)
+    }
+
     /// Publish Init/regular firmware context and wait for the matching ALIVE event.
     // upstream: if_iwx.c iwx_load_firmware()
     pub fn boot_firmware<E>(
@@ -867,6 +930,22 @@ mod tests {
         fn delay_us(&mut self, _: u32) {}
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingBus(alloc::rc::Rc<RefCell<Vec<(u32, u32)>>>);
+    impl CsrAccess for RecordingBus {
+        fn read32(&mut self, _: u32) -> u32 {
+            0
+        }
+        fn write32(&mut self, offset: u32, value: u32) {
+            self.0.borrow_mut().push((offset, value));
+        }
+        fn write8(&mut self, offset: u32, value: u8) {
+            self.0.borrow_mut().push((offset, u32::from(value)));
+        }
+        fn barrier(&mut self, _: IoBarrier) {}
+        fn delay_us(&mut self, _: u32) {}
+    }
+
     #[test]
     fn controller_drains_completed_buffer_and_dispatches_notification() {
         let allocator = Allocator(Cell::new(0x100000));
@@ -1139,5 +1218,55 @@ mod tests {
         assert!(!result.consumed);
         assert_eq!(result.frames.len(), 1);
         assert!(result.ampdu_done);
+    }
+
+    #[test]
+    fn data_submit_retains_dma_and_publishes_the_selected_queue_pointer() {
+        let allocator = Allocator(Cell::new(0x400000));
+        let writes = alloc::rc::Rc::new(RefCell::new(Vec::new()));
+        let mut controller = IwxController::attach(
+            RecordingBus(writes.clone()),
+            allocator,
+            DeviceFamily::Ax210,
+            0x300000,
+            1,
+        )
+        .unwrap();
+        controller.tx_queue_state.enabled_mask = 1 << 2;
+        let header = [
+            0x08, 0x02, 0, 0, 2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 3, 0, 0,
+        ];
+        let slot = controller
+            .submit_data_frame(2, 0, &header, b"payload", 0, 0, false)
+            .unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(controller.resources.tx_queues[2].queued, 1);
+        assert!(
+            controller.resources.tx_queues[2]
+                .take_payload_buffer(slot)
+                .unwrap()
+                .is_some()
+        );
+        assert!(writes.borrow().contains(&(0x460, (2 << 16) | 1)));
+    }
+
+    #[test]
+    fn data_submit_rejects_disabled_queue_before_allocating_or_kicking() {
+        let allocator = Allocator(Cell::new(0x400000));
+        let writes = alloc::rc::Rc::new(RefCell::new(Vec::new()));
+        let mut controller = IwxController::attach(
+            RecordingBus(writes.clone()),
+            allocator,
+            DeviceFamily::Ax210,
+            0x300000,
+            1,
+        )
+        .unwrap();
+        let header = [0x08; 24];
+        assert_eq!(
+            controller.submit_data_frame(2, 0, &header, b"x", 0, 0, false),
+            Err(ControllerTxError::QueueDisabled)
+        );
+        assert!(writes.borrow().is_empty());
     }
 }

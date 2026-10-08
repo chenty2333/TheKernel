@@ -135,8 +135,8 @@ pub use control::{
     media_change, process_ioctl, watchdog_tick,
 };
 pub use controller::{
-    ControllerError, ControllerUcodeStartError, IwxController, PnvmLoadError, RxServiceError,
-    StopDeviceError, SyncCommandError,
+    ControllerError, ControllerTxError, ControllerUcodeStartError, IwxController, PnvmLoadError,
+    RxServiceError, StopDeviceError, SyncCommandError,
 };
 pub use crf::{CrfIdentity, read_crf_identity};
 pub use diagnostics::{
