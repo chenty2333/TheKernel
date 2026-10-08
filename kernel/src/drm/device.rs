@@ -440,6 +440,42 @@ impl DrmDevice {
         } else {
             0
         };
+        let mut property_blobs = BTreeMap::from([(
+            1,
+            PropertyBlob {
+                owner: None,
+                bytes: edid,
+                // The connector owns its immutable EDID for the lifetime of
+                // the device.
+                references: 1,
+                destroyed: true,
+            },
+        )]);
+        property_blobs.insert(
+            super::property::IN_FORMATS_PRIMARY_BLOB_ID,
+            PropertyBlob {
+                owner: None,
+                bytes: super::property::linear_in_formats_blob(&[
+                    super::property::FORMAT_XRGB8888,
+                    super::property::FORMAT_ARGB8888,
+                ]),
+                references: 1,
+                destroyed: true,
+            },
+        );
+        if cursor_plane_id != 0 {
+            property_blobs.insert(
+                super::property::IN_FORMATS_CURSOR_BLOB_ID,
+                PropertyBlob {
+                    owner: None,
+                    bytes: super::property::linear_in_formats_blob(&[
+                        super::property::FORMAT_ARGB8888,
+                    ]),
+                    references: 1,
+                    destroyed: true,
+                },
+            );
+        }
         Arc::new(Self {
             adapter,
             fixed_mode,
@@ -477,18 +513,8 @@ impl DrmDevice {
                         [value, value, value]
                     })
                     .collect(),
-                next_property_blob: 2,
-                property_blobs: BTreeMap::from([(
-                    1,
-                    PropertyBlob {
-                        owner: None,
-                        bytes: edid,
-                        // The connector owns its immutable EDID for the
-                        // lifetime of the device.
-                        references: 1,
-                        destroyed: true,
-                    },
-                )]),
+                next_property_blob: if cursor_plane_id == 0 { 3 } else { 4 },
+                property_blobs,
                 atomic: super::atomic::initial(&KmsResources {
                     connector: super::kms::ConnectorInfo {
                         id: connector_id,
@@ -1937,6 +1963,38 @@ mod tests {
         fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
             Ok(Fence::new(true))
         }
+    }
+
+    #[test]
+    fn primary_and_cursor_planes_publish_exact_linear_in_formats_blobs() {
+        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let state = device.state.lock();
+        let resources = &state.resources;
+        assert_eq!(
+            super::super::atomic::value_for_object(
+                resources,
+                &state.atomic,
+                resources.primary_plane_id,
+                super::super::property::PLANE_IN_FORMATS,
+            ),
+            Some(super::super::property::IN_FORMATS_PRIMARY_BLOB_ID as u64),
+        );
+        assert_eq!(
+            super::super::atomic::value_for_object(
+                resources,
+                &state.atomic,
+                resources.cursor_plane_id,
+                super::super::property::PLANE_IN_FORMATS,
+            ),
+            Some(super::super::property::IN_FORMATS_CURSOR_BLOB_ID as u64),
+        );
+        let primary = &state.property_blobs[&super::super::property::IN_FORMATS_PRIMARY_BLOB_ID];
+        let cursor = &state.property_blobs[&super::super::property::IN_FORMATS_CURSOR_BLOB_ID];
+        assert_eq!(u32::from_le_bytes(primary.bytes[8..12].try_into().unwrap()), 2);
+        assert_eq!(u64::from_le_bytes(primary.bytes[32..40].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(cursor.bytes[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(cursor.bytes[24..28].try_into().unwrap()), super::super::property::FORMAT_ARGB8888);
+        assert_eq!(u64::from_le_bytes(cursor.bytes[32..40].try_into().unwrap()), 1);
     }
 
     struct Backing;

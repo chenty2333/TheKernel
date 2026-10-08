@@ -123,6 +123,13 @@ pub fn value_for_object(
     object: u32,
     property: u32,
 ) -> Option<u64> {
+    if property == property::PLANE_IN_FORMATS {
+        return Some(if object == resources.cursor_plane_id {
+            property::IN_FORMATS_CURSOR_BLOB_ID as u64
+        } else {
+            property::IN_FORMATS_PRIMARY_BLOB_ID as u64
+        });
+    }
     if object == resources.cursor_plane_id {
         cursor_value(state, property)
     } else {
