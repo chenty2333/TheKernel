@@ -31,8 +31,8 @@ use super::{
 use crate::{
     BlockAsyncOp, BlockCapabilities, BlockCompletion, BlockCompletionDrain,
     BlockCompletionNotifier, BlockCompletionOwner, BlockCompletionStatus, BlockDriverOps,
-    BlockQueueCaps, BlockQueueRequest, BlockRange, BlockRequestHandle, BlockSegmentDirection,
-    BlockSubmitReport,
+    BlockPhysicalSegment, BlockPhysicalSgOutcome, BlockQueueCaps, BlockQueueRequest, BlockRange,
+    BlockRequestHandle, BlockSegmentDirection, BlockSubmitReport,
 };
 
 const COMMAND_LIST_BYTES: usize = 32 * AHCI_MAX_SLOTS;
@@ -188,6 +188,7 @@ pub enum AhciDiskError {
     IdentifyFailed,
     InvalidIdentifyData,
     CommandTimeout,
+    DmaMayStillBeActive,
     RequestPending,
     DeviceError(u32),
     OutOfRange,
@@ -506,6 +507,101 @@ impl<I: AhciIo> AhciDisk<I> {
         Ok(attributes.tag.is_some())
     }
 
+    /// Build a direct physical scatter-gather PRDT without copying through the
+    /// bounce buffer. The caller owns/pins every segment through completion.
+    // upstream: ahci.c ahci_dmasetprd() and ahci_dmasetupc_cb()
+    fn build_physical_sg_command(
+        &mut self,
+        request: AtaRequest,
+        segments: &[BlockPhysicalSegment],
+    ) -> Result<bool, AhciDiskError> {
+        if segments.is_empty() || segments.len() > crate::MAX_PHYSICAL_COALESCED_SG {
+            return Err(AhciDiskError::InvalidRequest);
+        }
+        let (fis, attributes) =
+            setup_register_fis(request).map_err(|_| AhciDiskError::InvalidRequest)?;
+        if !attributes.data_transfer {
+            return Err(AhciDiskError::InvalidRequest);
+        }
+        let mut bytes = 0usize;
+        let mut prd_count = 0usize;
+        for segment in segments {
+            if segment.len == 0 || segment.paddr & 1 != 0 {
+                return Err(AhciDiskError::InvalidRequest);
+            }
+            let end = segment
+                .paddr
+                .checked_add(segment.len)
+                .ok_or(AhciDiskError::InvalidRequest)?;
+            if self.controller.capabilities & AHCI_CAP_64BIT == 0 && end > u32::MAX as usize + 1 {
+                return Err(AhciDiskError::UnsupportedAddressWidth);
+            }
+            bytes = bytes
+                .checked_add(segment.len)
+                .ok_or(AhciDiskError::InvalidRequest)?;
+            prd_count = prd_count
+                .checked_add(segment.len.div_ceil(AHCI_PRD_MAX))
+                .ok_or(AhciDiskError::InvalidRequest)?;
+        }
+        let table = &self.workspace().command_table;
+        let table_capacity = table.len.saturating_sub(COMMAND_TABLE_HEADER_BYTES) / PRD_BYTES;
+        if prd_count == 0 || prd_count > table_capacity {
+            return Err(AhciDiskError::InvalidRequest);
+        }
+        let ws = self.workspace_mut();
+        // SAFETY: the command table/list are aligned owned DMA memory and the
+        // PRDT capacity and caller-pinned ranges were validated above.
+        unsafe {
+            ptr::write_bytes(ws.command_table.cpu.as_ptr(), 0, ws.command_table.len);
+            ptr::copy_nonoverlapping(fis.as_ptr(), ws.command_table.cpu.as_ptr(), fis.len());
+            let mut prd_index = 0usize;
+            for segment in segments {
+                let mut address = segment.paddr;
+                let mut remaining = segment.len;
+                while remaining != 0 {
+                    let len = remaining.min(AHCI_PRD_MAX);
+                    let prd = ws
+                        .command_table
+                        .cpu
+                        .as_ptr()
+                        .add(COMMAND_TABLE_HEADER_BYTES + prd_index * PRD_BYTES)
+                        as *mut u32;
+                    ptr::write_unaligned(prd.add(0), address as u32);
+                    ptr::write_unaligned(prd.add(1), (address as u64 >> 32) as u32);
+                    ptr::write_unaligned(prd.add(2), 0);
+                    let final_prd = prd_index + 1 == prd_count;
+                    ptr::write_unaligned(
+                        prd.add(3),
+                        ((len - 1) as u32 & (AHCI_PRD_MAX as u32 - 1))
+                            | if final_prd { AHCI_PRD_IPC } else { 0 },
+                    );
+                    address += len;
+                    remaining -= len;
+                    prd_index += 1;
+                }
+            }
+            let header = ws.command_list.cpu.as_ptr();
+            ptr::write_unaligned(
+                header as *mut u16,
+                5 | if attributes.device_reads_buffer {
+                    1 << 6
+                } else {
+                    0
+                },
+            );
+            ptr::write_unaligned(header.add(2) as *mut u16, prd_count as u16);
+            ptr::write_unaligned(header.add(4) as *mut u32, 0);
+            ptr::write_unaligned(header.add(8) as *mut u64, ws.command_table.bus);
+        }
+        debug_assert_eq!(bytes % self.geometry.block_size, 0);
+        let base = self.port.register_base();
+        self.controller.io_mut().write32(base + AHCI_P_IS, u32::MAX);
+        self.controller
+            .io_mut()
+            .write32(base + AHCI_P_SERR, u32::MAX);
+        Ok(attributes.tag.is_some())
+    }
+
     fn publish_command(&mut self, ncq: bool) {
         // Publish coherent command/bounce writes before handing slot zero to
         // the HBA. The x86 platform's DMA pages are cache coherent.
@@ -583,6 +679,13 @@ impl<I: AhciIo> AhciDisk<I> {
             return Err(AhciDiskError::RequestPending);
         }
         let ncq = self.build_command(request, data_len)?;
+        self.execute_built(ncq)
+    }
+
+    fn execute_built(&mut self, ncq: bool) -> Result<(), AhciDiskError> {
+        if !matches!(self.async_state, AsyncState::Idle) {
+            return Err(AhciDiskError::RequestPending);
+        }
         self.publish_command(ncq);
         for _ in 0..COMMAND_TIMEOUT_POLLS {
             let observed = self.controller.io_mut().interrupt_generation();
@@ -590,6 +693,7 @@ impl<I: AhciIo> AhciDisk<I> {
                 if let Err(error @ AhciDiskError::DeviceError(_)) = result {
                     if !self.recover_command_error(ncq) {
                         self.poisoned = true;
+                        return Err(AhciDiskError::DmaMayStillBeActive);
                     }
                     return Err(error);
                 }
@@ -597,8 +701,11 @@ impl<I: AhciIo> AhciDisk<I> {
             }
             self.wait_for_progress(observed);
         }
-        let _ = self.timeout_command();
-        Err(AhciDiskError::CommandTimeout)
+        if self.timeout_command() {
+            Err(AhciDiskError::CommandTimeout)
+        } else {
+            Err(AhciDiskError::DmaMayStillBeActive)
+        }
     }
 
     fn wait_for_progress(&mut self, observed: Option<u64>) {
@@ -871,6 +978,24 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
                 .ok_or(DevError::InvalidParam)?;
         }
         Ok(())
+    }
+
+    // upstream: ahci.c ahci_execute_transaction() physical DMA request path
+    unsafe fn read_block_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[BlockPhysicalSegment],
+    ) -> DevResult<BlockPhysicalSgOutcome> {
+        self.transfer_physical_sg(block_id, segments, false)
+    }
+
+    // upstream: ahci.c ahci_execute_transaction() physical DMA request path
+    unsafe fn write_block_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[BlockPhysicalSegment],
+    ) -> DevResult<BlockPhysicalSgOutcome> {
+        self.transfer_physical_sg(block_id, segments, true)
     }
 
     fn async_queue_caps(&self) -> Option<BlockQueueCaps> {
@@ -1277,12 +1402,61 @@ pub fn parse_identify(bytes: &[u8; 512]) -> Option<AtaGeometry> {
     })
 }
 
+impl<I: AhciIo> AhciDisk<I> {
+    fn transfer_physical_sg(
+        &mut self,
+        block_id: u64,
+        segments: &[BlockPhysicalSegment],
+        write: bool,
+    ) -> DevResult<BlockPhysicalSgOutcome> {
+        if !matches!(self.async_state, AsyncState::Idle) {
+            return Ok(BlockPhysicalSgOutcome::NotSubmitted);
+        }
+        let mut bytes = 0usize;
+        for segment in segments {
+            bytes = bytes
+                .checked_add(segment.len)
+                .ok_or(DevError::InvalidParam)?;
+        }
+        if bytes == 0 || !bytes.is_multiple_of(self.geometry.block_size) {
+            return Err(DevError::InvalidParam);
+        }
+        let blocks = (bytes / self.geometry.block_size) as u64;
+        if block_id
+            .checked_add(blocks)
+            .is_none_or(|end| end > self.geometry.blocks)
+        {
+            return Err(DevError::InvalidParam);
+        }
+        let sectors = match u16::try_from(blocks) {
+            Ok(sectors) => sectors,
+            Err(_) => return Ok(BlockPhysicalSgOutcome::NotSubmitted),
+        };
+        self.ensure_connected().map_err(map_error)?;
+        let request = self.data_request(block_id, sectors, write);
+        let ncq = match self.build_physical_sg_command(request, segments) {
+            Ok(ncq) => ncq,
+            Err(AhciDiskError::UnsupportedAddressWidth) => {
+                return Ok(BlockPhysicalSgOutcome::NotSubmitted);
+            }
+            Err(error) => return Err(map_error(error)),
+        };
+        match self.execute_built(ncq) {
+            Ok(()) => Ok(BlockPhysicalSgOutcome::Completed),
+            Err(AhciDiskError::DmaMayStillBeActive) => Ok(BlockPhysicalSgOutcome::Quarantined),
+            Err(error) => Err(map_error(error)),
+        }
+    }
+}
+
 fn map_error(error: AhciDiskError) -> DevError {
     match error {
         AhciDiskError::InvalidWorkspace | AhciDiskError::UnsupportedAddressWidth => {
             DevError::InvalidParam
         }
-        AhciDiskError::CommandTimeout | AhciDiskError::DeviceError(_) => DevError::Io,
+        AhciDiskError::CommandTimeout
+        | AhciDiskError::DmaMayStillBeActive
+        | AhciDiskError::DeviceError(_) => DevError::Io,
         AhciDiskError::RequestPending => DevError::ResourceBusy,
         AhciDiskError::NoDevice => DevError::Io,
         _ => DevError::BadState,
@@ -1322,6 +1496,42 @@ mod tests {
         assert!(geometry.trim);
         set_word(&mut bytes, 83, 0);
         assert_eq!(parse_identify(&bytes), None);
+    }
+
+    #[test]
+    fn physical_sg_builds_one_prd_per_pinned_range() {
+        with_fake_disk(|disk, _| {
+            let segments = [
+                BlockPhysicalSegment {
+                    paddr: 0x8000,
+                    len: 512,
+                },
+                BlockPhysicalSegment {
+                    paddr: 0x9000,
+                    len: 512,
+                },
+            ];
+            let request = disk.data_request(4, 2, false);
+            assert!(!disk.build_physical_sg_command(request, &segments).unwrap());
+            let ws = disk.workspace();
+            // SAFETY: the descriptor list was just initialized in the live
+            // test-owned DMA page and is read using aligned AHCI dword fields.
+            unsafe {
+                let header = ws.command_list.cpu.as_ptr();
+                assert_eq!(ptr::read_unaligned(header.add(2).cast::<u16>()), 2);
+                let prd = ws
+                    .command_table
+                    .cpu
+                    .as_ptr()
+                    .add(COMMAND_TABLE_HEADER_BYTES)
+                    .cast::<u32>();
+                assert_eq!(ptr::read_unaligned(prd), 0x8000);
+                assert_eq!(ptr::read_unaligned(prd.add(1)), 0);
+                assert_eq!(ptr::read_unaligned(prd.add(3)), 511);
+                assert_eq!(ptr::read_unaligned(prd.add(4)), 0x9000);
+                assert_eq!(ptr::read_unaligned(prd.add(7)), 511 | AHCI_PRD_IPC);
+            }
+        });
     }
 
     #[test]

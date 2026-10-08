@@ -11,8 +11,9 @@ storage requests to TheKernel's block-device interfaces.
 The header and early HBA routines are now represented by `AhciController` and
 `PortState`. `AhciDisk` owns an aligned command list/FIS/command table and a
 persistent DMA bounce buffer; it submits IDENTIFY DEVICE and LBA48 READ/WRITE
-DMA EXT through slot zero, supports one split-phase async request with a
-persistent bounce buffer, checks task-file errors, and implements
+DMA EXT through slot zero, accepts bounded pinned physical SG requests as
+multiple PRDs without payload copies, supports one split-phase async request
+with a persistent bounce buffer, checks task-file errors, and implements
 `BlockDriverOps` sync/async read-write, flush, and DSM/TRIM discard. FPDMA is
 used serially with tag zero when both HBA and IDENTIFY advertise NCQ; concurrent
 NCQ queue admission and multi-victim slot recovery remain untranslated.
@@ -26,10 +27,12 @@ the first identified ATA disk. AHCI is selected
 by the `tk-axdriver` default feature. The complete 317-row FreeBSD PCI
 ID/revision/name/quirk table is translated in `tk-axdriver/src/ahci/pci_ids.rs`;
 `ahci_pci_attach` selects BAR0 for the ABAR0 quirk and BAR5 otherwise. Remaining
-porting work includes MSI/MSI-X routing, enclosure management, Intel remapped
-NVMe, CAM CCB/SCSI translation, automatic block-device publication for media
-inserted into a port that was empty at boot, PCI-function removal events,
-multi-slot scheduling/recovery, and concurrent NCQ submission. An existing
+The PCI frontend now attempts MSI-X, MSI, then firmware-routed shared INTx, and
+AHCI completions acknowledge status before waking waiters. Remaining work
+includes enclosure management, Intel remapped NVMe, CAM CCB/SCSI translation,
+automatic block-device publication for media inserted into a port that was
+empty at boot, PCI-function removal events, multi-slot scheduling/recovery,
+and concurrent NCQ submission. An existing
 port returns I/O errors while absent and only resumes after IDENTIFY geometry
 and serial/model/capacity fingerprint match.
 

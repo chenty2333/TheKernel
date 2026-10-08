@@ -18,6 +18,9 @@ use core::{
     sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "shared-block")]
+use axdriver_base::BaseDriverOps;
+
 static NEXT_DISK_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 use axalloc::{UsageKind, global_allocator};
