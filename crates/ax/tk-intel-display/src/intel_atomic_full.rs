@@ -62,6 +62,15 @@ pub struct CrtcRef {
     pub new: CrtcState,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AtomicState {
+    pub handle: u64,
+    pub dpll_set: bool,
+    pub modeset: bool,
+    /// `internal` intentionally survives `intel_atomic_state_clear()`.
+    pub internal: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AtomicError {
     Invalid,
@@ -84,9 +93,12 @@ pub trait AtomicIo {
     fn blob_put(&mut self, _blob: u64) {}
     fn tunnel_get(&mut self, _tunnel: u64) {}
     fn tunnel_put(&mut self, _tunnel: u64) {}
+    fn crtc_destroy_helper(&mut self, _state: u64) {}
     fn alloc_atomic(&mut self) -> Result<u64, AtomicError> { Err(AtomicError::NoMemory) }
     fn atomic_init(&mut self, _id: u64) -> Result<(), AtomicError> { Ok(()) }
-    fn atomic_release(&mut self, _id: u64) {}
+    fn atomic_default_release(&mut self, _id: u64) {}
+    fn free_global_objects(&mut self, _id: u64) {}
+    fn free_atomic(&mut self, _id: u64) {}
     fn atomic_clear(&mut self, _id: u64) {}
     fn clear_global_state(&mut self, _id: u64) {}
     fn cleanup_inherited_tunnel_state(&mut self, _id: u64) {}
@@ -178,27 +190,34 @@ pub fn intel_crtc_free_hw_state<I: AtomicIo>(io: &mut I, state: &mut CrtcState) 
 pub fn intel_crtc_destroy_state<I: AtomicIo>(io: &mut I, state: &mut CrtcState) -> Result<(), AtomicError> {
     if state.dsb_color.is_some() { io.warn_unreleased_dsb(true); }
     if state.dsb_commit.is_some() { io.warn_unreleased_dsb(false); }
+    io.crtc_destroy_helper(state.id);
     intel_crtc_free_hw_state(io, state);
     if let Some(tunnel) = state.tunnel.take() { io.tunnel_put(tunnel); }
     Ok(())
 }
 
 // upstream: intel_atomic.c intel_atomic_state_alloc()
-pub fn intel_atomic_state_alloc<I: AtomicIo>(io: &mut I) -> Result<u64, AtomicError> {
+pub fn intel_atomic_state_alloc<I: AtomicIo>(io: &mut I) -> Result<AtomicState, AtomicError> {
     let state = io.alloc_atomic()?;
-    if let Err(error) = io.atomic_init(state) { io.atomic_release(state); return Err(error); }
-    Ok(state)
+    if let Err(error) = io.atomic_init(state) { io.free_atomic(state); return Err(error); }
+    Ok(AtomicState { handle: state, ..AtomicState::default() })
 }
 
 // upstream: intel_atomic.c intel_atomic_state_free()
-pub fn intel_atomic_state_free<I: AtomicIo>(io: &mut I, state: u64) { io.atomic_release(state); }
+pub fn intel_atomic_state_free<I: AtomicIo>(io: &mut I, state: AtomicState) {
+    io.atomic_default_release(state.handle);
+    io.free_global_objects(state.handle);
+    io.free_atomic(state.handle);
+}
 
 // upstream: intel_atomic.c intel_atomic_state_clear()
-pub fn intel_atomic_state_clear<I: AtomicIo>(io: &mut I, state: u64) {
-    io.atomic_clear(state);
-    io.clear_global_state(state);
+pub fn intel_atomic_state_clear<I: AtomicIo>(io: &mut I, state: &mut AtomicState) {
+    io.atomic_clear(state.handle);
+    io.clear_global_state(state.handle);
+    state.dpll_set = false;
+    state.modeset = false;
     // state.internal intentionally survives clear, as in i915.
-    io.cleanup_inherited_tunnel_state(state);
+    io.cleanup_inherited_tunnel_state(state.handle);
 }
 
 // upstream: intel_atomic.c intel_atomic_get_crtc_state()
@@ -226,5 +245,11 @@ mod tests {
         let state = intel_crtc_duplicate_state(&mut io, old).unwrap();
         assert_eq!(state.color_blobs, old.color_blobs);
         assert!(!state.update_pipe && !state.use_dsb);
+    }
+    #[test] fn atomic_clear_resets_dpll_modeset_but_preserves_internal() {
+        let mut io = Mock;
+        let mut state = AtomicState { handle: 9, dpll_set: true, modeset: true, internal: true };
+        intel_atomic_state_clear(&mut io, &mut state);
+        assert!(!state.dpll_set && !state.modeset && state.internal);
     }
 }
