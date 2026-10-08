@@ -197,6 +197,9 @@ const GEN12_RENDER_CLASS_REG_NAMES: [&str; 3] = [
 ];
 const GEN12_VIDEO_ENHANCE_CLASS_REG_NAMES: [&str; 4] =
     ["SFC_DONE[0]", "SFC_DONE[1]", "SFC_DONE[2]", "SFC_DONE[3]"];
+const GEN12_EXT_STEERED_OFFSETS: [u32; 2] = [0xe160, 0xe164];
+const GEN12_EXT_STEERED_NAMES: [&str; 2] = ["GEN8_SAMPLER_INSTDONE", "GEN8_ROW_INSTDONE"];
+const XEHPG_EXT_STEERED_OFFSET: u32 = 0x666c;
 
 /// Return the static Xe_LP/Gen12 register list selected by the source table.
 /// Engine-instance entries are relative to the engine MMIO base.
@@ -315,6 +318,26 @@ pub fn expand_steered_registers(
         }
     }
     Ok(registers)
+}
+
+/// Build the exact Xe_LP steered capture list, adding the XeHPG geometry
+/// register only for graphics IP 12.55 and newer.
+/// upstream: intel_guc_capture.c gen8_extregs/xehpg_extregs selection.
+pub fn gen12_steered_capture_registers(
+    steering: &[(u8, u8)],
+    graphics_ip: (u8, u8),
+) -> Result<Vec<CaptureRegister>, CaptureError> {
+    let extra = (graphics_ip >= (12, 55)).then_some(XEHPG_EXT_STEERED_OFFSET);
+    expand_steered_registers(steering, &GEN12_EXT_STEERED_OFFSETS, extra)
+}
+
+pub const fn gen12_steered_register_name(offset: u32) -> Option<&'static str> {
+    match offset {
+        0xe160 => Some(GEN12_EXT_STEERED_NAMES[0]),
+        0xe164 => Some(GEN12_EXT_STEERED_NAMES[1]),
+        XEHPG_EXT_STEERED_OFFSET => Some("XEHPG_INSTDONE_GEOM_SVG"),
+        _ => None,
+    }
 }
 
 /// Find a static list; global lists match regardless of the requested engine
@@ -653,12 +676,24 @@ pub fn format_capture_node(
         writeln!(output, "    NumRegs: {}", registers.len())
             .map_err(|_| CaptureError::InvalidBuffer)?;
         for register in registers {
-            if let Some(name) = gen12_register_name(
-                list_type as u32,
-                u32::from(node.engine_class),
-                engine_base,
-                register.offset,
-            ) {
+            let register_name = if steered_offsets.contains(&register.offset) {
+                gen12_steered_register_name(register.offset).or_else(|| {
+                    gen12_register_name(
+                        list_type as u32,
+                        u32::from(node.engine_class),
+                        engine_base,
+                        register.offset,
+                    )
+                })
+            } else {
+                gen12_register_name(
+                    list_type as u32,
+                    u32::from(node.engine_class),
+                    engine_base,
+                    register.offset,
+                )
+            };
+            if let Some(name) = register_name {
                 write!(output, "      {name}").map_err(|_| CaptureError::InvalidBuffer)?;
             } else {
                 write!(output, "      REG-0x{:08x}", register.offset)
@@ -1354,6 +1389,20 @@ mod tests {
         assert_eq!(
             regs[3].flags,
             (3 << CAPTURE_STEERING_GROUP_SHIFT) | (4 << CAPTURE_STEERING_INSTANCE_SHIFT)
+        );
+        let gen12 = gen12_steered_capture_registers(&[(0, 0)], (12, 54)).unwrap();
+        let gen12_55 = gen12_steered_capture_registers(&[(0, 0)], (12, 55)).unwrap();
+        assert_eq!(
+            gen12.iter().map(|reg| reg.offset).collect::<Vec<_>>(),
+            [0xe160, 0xe164]
+        );
+        assert_eq!(
+            gen12_55.iter().map(|reg| reg.offset).collect::<Vec<_>>(),
+            [0xe160, 0xe164, 0x666c]
+        );
+        assert_eq!(
+            gen12_steered_register_name(0x666c),
+            Some("XEHPG_INSTDONE_GEOM_SVG")
         );
     }
 
