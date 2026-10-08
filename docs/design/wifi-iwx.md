@@ -113,6 +113,9 @@ Block-ack callbacks now retain RX-start/RX-stop/TX-start TID masks, enforce the
 source BAID/TID/window and DQA gates, and dispatch deferred requests in the
 OpenBSD RX-then-TX task order. The future net80211 adapter supplies the actual
 per-peer BA state and task-enqueue callback.
+The TX BA completion callback chooses the source `fls(qenablemsk)` queue when
+no per-TID queue is assigned, only enables it once, and computes the 12-bit
+sequence window before accepting the BA session.
 
 TX queues now track occupied descriptor slots through the source consumer SSN,
 reclaim descriptor/byte-count state, retain owned payload DMA buffers until

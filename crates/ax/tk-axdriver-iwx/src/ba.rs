@@ -72,6 +72,33 @@ pub enum AmpduDisposition {
     Unchanged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxBaPeerState {
+    pub request_pending: bool,
+    pub window_size: u16,
+    pub qos_tx_sequence: [u16; MAX_TID_COUNT],
+    pub window_start: u16,
+    pub window_end: u16,
+    pub timeout_usec: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxBaStartError<E> {
+    InvalidTid,
+    InvalidQueue,
+    EnableQueue(E),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxBaStartOutcome {
+    Ignored,
+    Accepted {
+        queue_id: u8,
+        window_start: u16,
+        window_end: u16,
+    },
+}
+
 /// Queue an RX ADDBA operation for deferred net80211-task context.
 // upstream: if_iwx.c iwx_ampdu_rx_start()
 pub fn ampdu_rx_start(
@@ -177,6 +204,55 @@ pub fn run_ba_task(
         }
     }
     processed
+}
+
+/// Assign/enable a DQA aggregation queue and accept the peer's TX BA window.
+// upstream: if_iwx.c iwx_sta_tx_agg_start()
+pub fn sta_tx_agg_start<E>(
+    peer: &mut TxBaPeerState,
+    queues: &mut crate::TxQueueState,
+    aggregation_queues: &mut [u8; MAX_TID_COUNT],
+    tid: u8,
+    mut enable_queue: impl FnMut(u8, u8) -> Result<(), E>,
+) -> Result<TxBaStartOutcome, TxBaStartError<E>> {
+    let tid_index = usize::from(tid);
+    if tid_index >= MAX_TID_COUNT {
+        return Err(TxBaStartError::InvalidTid);
+    }
+    if !peer.request_pending {
+        return Ok(TxBaStartOutcome::Ignored);
+    }
+    let mut queue_id = aggregation_queues[tid_index];
+    if queue_id == 0 {
+        queue_id = (u32::BITS - queues.enabled_mask.leading_zeros()) as u8;
+    }
+    let queue_index = usize::from(queue_id);
+    if queue_index >= queues.tid.len() {
+        return Err(TxBaStartError::InvalidQueue);
+    }
+    let queue_bit = 1u32 << queue_index;
+    let queue_enabled = queues.enabled_mask & queue_bit != 0;
+    if !queue_enabled {
+        enable_queue(queue_id, tid).map_err(TxBaStartError::EnableQueue)?;
+        queues.enabled_mask |= queue_bit;
+        queues.tid[queue_index] = tid;
+        peer.window_start = 0;
+    } else {
+        peer.window_start = peer.qos_tx_sequence[tid_index];
+    }
+    peer.window_end = peer
+        .window_start
+        .wrapping_add(peer.window_size)
+        .wrapping_sub(1)
+        & 0x0fff;
+    peer.timeout_usec = 0;
+    aggregation_queues[tid_index] = queue_id;
+    peer.request_pending = false;
+    Ok(TxBaStartOutcome::Accepted {
+        queue_id,
+        window_start: peer.window_start,
+        window_end: peer.window_end,
+    })
 }
 
 impl From<CommandError> for BaError {
@@ -678,6 +754,63 @@ mod tests {
             0
         );
         assert_eq!(requests.rx_start_tid_mask, 1 << 1);
+    }
+
+    #[test]
+    fn tx_aggregation_assigns_next_dqa_queue_and_source_sequence_window() {
+        let mut peer = TxBaPeerState {
+            request_pending: true,
+            window_size: FIXED_TX_AGGREGATION_WINDOW,
+            qos_tx_sequence: [0; MAX_TID_COUNT],
+            window_start: 99,
+            window_end: 0,
+            timeout_usec: 55,
+        };
+        let mut queues = crate::TxQueueState {
+            enabled_mask: 0b11,
+            ..crate::TxQueueState::default()
+        };
+        let mut aggregation_queues = [0; MAX_TID_COUNT];
+        let mut enabled = Vec::new();
+        assert_eq!(
+            sta_tx_agg_start::<()>(
+                &mut peer,
+                &mut queues,
+                &mut aggregation_queues,
+                5,
+                |qid, tid| {
+                    enabled.push((qid, tid));
+                    Ok::<_, ()>(())
+                }
+            ),
+            Ok(TxBaStartOutcome::Accepted {
+                queue_id: 2,
+                window_start: 0,
+                window_end: 63,
+            })
+        );
+        assert_eq!(enabled, [(2, 5)]);
+        assert_eq!(queues.enabled_mask, 0b111);
+        assert_eq!(queues.tid[2], 5);
+        assert_eq!(peer.timeout_usec, 0);
+        assert_eq!(aggregation_queues[5], 2);
+
+        peer.request_pending = true;
+        peer.qos_tx_sequence[5] = 0x0fff;
+        assert_eq!(
+            sta_tx_agg_start::<()>(
+                &mut peer,
+                &mut queues,
+                &mut aggregation_queues,
+                5,
+                |_, _| { panic!("existing queue must not be re-enabled") }
+            ),
+            Ok(TxBaStartOutcome::Accepted {
+                queue_id: 2,
+                window_start: 0x0fff,
+                window_end: 62,
+            })
+        );
     }
 
     #[test]
