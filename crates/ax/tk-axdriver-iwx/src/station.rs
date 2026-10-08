@@ -16,6 +16,151 @@ pub const STA_FLG_DRAIN_FLOW: u32 = 1 << 12;
 pub const TX_FLUSH_QUEUE_LIMIT: usize = 16;
 pub const TX_FLUSH_QUEUE_INFO_BYTES: usize = 8;
 pub const TX_FLUSH_RESPONSE_BYTES: usize = 4 + TX_FLUSH_QUEUE_LIMIT * TX_FLUSH_QUEUE_INFO_BYTES;
+pub const STA_MODIFY_ADD_BA_TID: u8 = 1 << 3;
+pub const STA_MODIFY_UAPSD_ACS: u8 = 1 << 2;
+pub const STA_ID_LINK: u8 = 0;
+pub const STA_ID_MONITOR: u8 = 2;
+pub const STA_TYPE_LINK: u8 = 0;
+pub const STA_TYPE_GENERAL_PURPOSE: u8 = 1;
+pub const STA_FLAG_MAX_AGG_SIZE_SHIFT: u32 = 19;
+pub const STA_FLAG_MAX_AGG_SIZE_MASK: u32 = 0xf << STA_FLAG_MAX_AGG_SIZE_SHIFT;
+pub const STA_FLAG_AGG_DENSITY_SHIFT: u32 = 23;
+pub const STA_FLAG_AGG_DENSITY_MASK: u32 = 7 << STA_FLAG_AGG_DENSITY_SHIFT;
+pub const STA_FLAG_FAT_SHIFT: u32 = 26;
+pub const STA_FLAG_FAT_MASK: u32 = 3 << STA_FLAG_FAT_SHIFT;
+pub const STA_FLAG_MIMO_SHIFT: u32 = 28;
+pub const STA_FLAG_MIMO_MASK: u32 = 3 << STA_FLAG_MIMO_SHIFT;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StationAddConfig {
+    pub use_mld_api: bool,
+    pub monitor_mode: bool,
+    pub update: bool,
+    pub mac_id_color: u32,
+    pub address: [u8; 6],
+    pub mimo_enabled: bool,
+    pub ht: bool,
+    pub vht: bool,
+    pub ht_stream2: bool,
+    pub ht_stream3: bool,
+    pub vht_stream2: bool,
+    pub channel_allows_40mhz: bool,
+    pub peer_supports_ht40: bool,
+    pub channel_allows_80mhz: bool,
+    pub peer_supports_vht80: bool,
+    pub channel_allows_160mhz: bool,
+    pub peer_supports_vht160: bool,
+    pub ht_ampdu_exponent: u8,
+    pub vht_ampdu_exponent: u8,
+    pub ampdu_density: u8,
+    pub uapsd_node: bool,
+    pub uapsd_supported: bool,
+    pub uapsd_access_categories: u8,
+    pub uapsd_max_service_period: u8,
+}
+
+/// Build ADD_STA initialization/update fields for HT/VHT, aggregation and U-APSD.
+// upstream: if_iwx.c iwx_add_sta_cmd()
+pub fn station_add_command(
+    config: StationAddConfig,
+    slot: u8,
+    queue: u8,
+) -> Result<Option<EncodedCommand>, CommandError> {
+    if config.use_mld_api {
+        return Ok(None);
+    }
+    let mut payload = [0u8; 48];
+    payload[0] = if config.update { 1 } else { 0 };
+    payload[4..8].copy_from_slice(&config.mac_id_color.to_le_bytes());
+    let station_id = if config.monitor_mode {
+        STA_ID_MONITOR
+    } else {
+        STA_ID_LINK
+    };
+    payload[16] = station_id;
+    payload[35] = if config.monitor_mode {
+        STA_TYPE_GENERAL_PURPOSE
+    } else {
+        STA_TYPE_LINK
+    };
+    if !config.update {
+        let address = if config.monitor_mode {
+            [0; 6]
+        } else {
+            config.address
+        };
+        payload[8..14].copy_from_slice(&address);
+    }
+    let mut station_flags = 0u32;
+    let mut station_flags_mask = STA_FLAG_FAT_MASK | STA_FLAG_MIMO_MASK;
+    if config.ht {
+        station_flags_mask |= STA_FLAG_MAX_AGG_SIZE_MASK | STA_FLAG_AGG_DENSITY_MASK;
+        if config.mimo_enabled {
+            if config.vht {
+                if config.vht_stream2 {
+                    station_flags |= 1 << STA_FLAG_MIMO_SHIFT;
+                }
+            } else {
+                if config.ht_stream2 {
+                    station_flags |= 1 << STA_FLAG_MIMO_SHIFT;
+                }
+                if config.ht_stream3 {
+                    station_flags |= 2 << STA_FLAG_MIMO_SHIFT;
+                }
+            }
+        }
+        if config.channel_allows_40mhz && config.peer_supports_ht40 {
+            station_flags |= 1 << STA_FLAG_FAT_SHIFT;
+        }
+        if config.vht {
+            if config.channel_allows_160mhz && config.peer_supports_vht160 {
+                station_flags = (station_flags & !STA_FLAG_FAT_MASK) | (3 << STA_FLAG_FAT_SHIFT);
+            } else if config.channel_allows_80mhz && config.peer_supports_vht80 {
+                station_flags = (station_flags & !STA_FLAG_FAT_MASK) | (2 << STA_FLAG_FAT_SHIFT);
+            }
+        }
+        let aggregate_exponent = if config.vht {
+            config.vht_ampdu_exponent
+        } else {
+            config.ht_ampdu_exponent
+        }
+        .min(7);
+        station_flags |= u32::from(aggregate_exponent) << STA_FLAG_MAX_AGG_SIZE_SHIFT;
+        let density = match config.ampdu_density {
+            2 => 4,
+            4 => 5,
+            8 => 6,
+            16 => 7,
+            _ => 0,
+        };
+        station_flags |= density << STA_FLAG_AGG_DENSITY_SHIFT;
+    }
+    payload[20..24].copy_from_slice(&station_flags.to_le_bytes());
+    payload[24..28].copy_from_slice(&station_flags_mask.to_le_bytes());
+    if config.uapsd_node && config.uapsd_supported {
+        payload[17] = STA_MODIFY_UAPSD_ACS;
+        payload[46] = crate::uapsd_service_period(config.uapsd_max_service_period);
+        payload[47] = crate::uapsd_ac_mask(config.uapsd_access_categories);
+    }
+    let command = HostCommand {
+        id: ADD_STA_COMMAND,
+        flags: CMD_WANT_RESPONSE,
+        response_capacity: 8,
+        parts: &[&payload],
+    };
+    Ok(Some(EncodedCommand::encode(&command, slot, queue)?))
+}
+
+/// Validate the low-byte ADD_STA success status.
+// upstream: if_iwx.c iwx_add_sta_cmd()
+pub fn validate_station_add_status(response: &[u8]) -> Result<(), StationError> {
+    let status = response.get(..4).ok_or(StationError::InvalidResponse)?;
+    if u32::from_le_bytes(status.try_into().unwrap()) & 0xff == 1 {
+        Ok(())
+    } else {
+        Err(StationError::InvalidResponse)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StationError {
@@ -211,5 +356,83 @@ mod tests {
         );
         assert_eq!(result, Err(()));
         assert_eq!(*events.borrow(), [1, 2, 4, 0]);
+    }
+
+    #[test]
+    fn add_station_encodes_peer_capabilities_aggregation_and_uapsd() {
+        let config = StationAddConfig {
+            use_mld_api: false,
+            monitor_mode: false,
+            update: false,
+            mac_id_color: 0x1122_3344,
+            address: [0, 1, 2, 3, 4, 5],
+            mimo_enabled: true,
+            ht: true,
+            vht: true,
+            ht_stream2: false,
+            ht_stream3: false,
+            vht_stream2: true,
+            channel_allows_40mhz: true,
+            peer_supports_ht40: true,
+            channel_allows_80mhz: true,
+            peer_supports_vht80: true,
+            channel_allows_160mhz: false,
+            peer_supports_vht160: false,
+            ht_ampdu_exponent: 2,
+            vht_ampdu_exponent: 9,
+            ampdu_density: 8,
+            uapsd_node: true,
+            uapsd_supported: true,
+            uapsd_access_categories: crate::WMM_AC_VO | crate::WMM_AC_BE,
+            uapsd_max_service_period: crate::WMM_SP_4,
+        };
+        let command = station_add_command(config, 3, 0).unwrap().unwrap();
+        assert_eq!(command.flags, CMD_WANT_RESPONSE);
+        assert_eq!(command.bytes.len(), 56);
+        assert_eq!(&command.bytes[12..16], &0x1122_3344u32.to_le_bytes());
+        assert_eq!(&command.bytes[16..22], &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(command.bytes[24], STA_ID_LINK);
+        assert_eq!(command.bytes[25], STA_MODIFY_UAPSD_ACS);
+        let flags = u32::from_le_bytes(command.bytes[28..32].try_into().unwrap());
+        assert_eq!(flags & STA_FLAG_MIMO_MASK, 1 << STA_FLAG_MIMO_SHIFT);
+        assert_eq!((flags & STA_FLAG_FAT_MASK) >> STA_FLAG_FAT_SHIFT, 2);
+        assert_eq!(
+            (flags & STA_FLAG_MAX_AGG_SIZE_MASK) >> STA_FLAG_MAX_AGG_SIZE_SHIFT,
+            7
+        );
+        assert_eq!(
+            (flags & STA_FLAG_AGG_DENSITY_MASK) >> STA_FLAG_AGG_DENSITY_SHIFT,
+            6
+        );
+        assert_eq!(
+            &command.bytes[32..36],
+            &(STA_FLAG_FAT_MASK
+                | STA_FLAG_MIMO_MASK
+                | STA_FLAG_MAX_AGG_SIZE_MASK
+                | STA_FLAG_AGG_DENSITY_MASK)
+                .to_le_bytes()
+        );
+        assert_eq!(command.bytes[54], 4);
+        assert_eq!(
+            command.bytes[55],
+            crate::uapsd_ac_mask(config.uapsd_access_categories)
+        );
+        assert_eq!(
+            station_add_command(
+                StationAddConfig {
+                    use_mld_api: true,
+                    ..config
+                },
+                0,
+                0
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(validate_station_add_status(&1u32.to_le_bytes()), Ok(()));
+        assert_eq!(
+            validate_station_add_status(&2u32.to_le_bytes()),
+            Err(StationError::InvalidResponse)
+        );
     }
 }
