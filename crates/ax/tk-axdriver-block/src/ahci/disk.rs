@@ -211,6 +211,8 @@ impl AsyncSegment {
 #[derive(Clone, Copy)]
 struct PendingAsync {
     handle: BlockRequestHandle,
+    owner: BlockCompletionOwner,
+    cookie: u64,
     op: BlockAsyncOp,
     bytes: usize,
     segments: [AsyncSegment; MAX_ASYNC_SEGMENTS],
@@ -821,7 +823,9 @@ impl<I: AhciIo> AhciDisk<I> {
         if let Some(result) = self.sample_command(self.ncq && pending.op != BlockAsyncOp::Flush) {
             let status = match result {
                 Ok(()) => {
-                    if pending.op == BlockAsyncOp::Read {
+                    if pending.owner == BlockCompletionOwner::Ordinary
+                        && pending.op == BlockAsyncOp::Read
+                    {
                         self.copy_bounce_to_segments(pending);
                     }
                     BlockCompletionStatus::Success
@@ -837,8 +841,8 @@ impl<I: AhciIo> AhciDisk<I> {
             };
             self.async_state = AsyncState::Complete(BlockCompletion {
                 handle: pending.handle,
-                owner: BlockCompletionOwner::Ordinary,
-                cookie: pending.handle.raw,
+                owner: pending.owner,
+                cookie: pending.cookie,
                 status,
                 bytes: if status == BlockCompletionStatus::Success {
                     pending.bytes as u32
@@ -858,8 +862,8 @@ impl<I: AhciIo> AhciDisk<I> {
             self.controller.ahci_stop_fr(&self.port) && self.controller.ahci_stop(&mut self.port);
         self.async_state = AsyncState::Complete(BlockCompletion {
             handle: pending.handle,
-            owner: BlockCompletionOwner::Ordinary,
-            cookie: pending.handle.raw,
+            owner: pending.owner,
+            cookie: pending.cookie,
             status: if quiesced {
                 BlockCompletionStatus::DeviceError(0xff)
             } else {
@@ -1073,25 +1077,20 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         let cookie = raw;
         request.handle = Some(handle);
         request.cookie = Some(cookie);
-        // Physical requests complete in this bounded one-slot transaction; the
-        // typed completion still returns through the common owner/cookie route.
-        self.publish_command(ncq);
-        let result = self.execute_published(ncq);
-        let (status, completed_bytes) = match result {
-            Ok(()) => (BlockCompletionStatus::Success, bytes as u32),
-            Err(AhciDiskError::DmaMayStillBeActive) => (BlockCompletionStatus::Quarantined, 0),
-            Err(AhciDiskError::DeviceError(status)) => {
-                (BlockCompletionStatus::DeviceError(status as u8), 0)
-            }
-            Err(_) => (BlockCompletionStatus::DeviceError(0xff), 0),
-        };
-        self.async_state = AsyncState::Complete(BlockCompletion {
+        let pending = PendingAsync {
             handle,
             owner: BlockCompletionOwner::Physical,
             cookie,
-            status,
-            bytes: completed_bytes,
-        });
+            op: request.op,
+            bytes,
+            segments: [AsyncSegment::EMPTY; MAX_ASYNC_SEGMENTS],
+            segment_count: 0,
+            polls: 0,
+        };
+        // Publish the pinned physical request owner before ringing CI; the
+        // caller must retain every physical segment until this handle completes.
+        self.async_state = AsyncState::InFlight(pending);
+        self.publish_command(ncq);
         Ok(BlockSubmitReport {
             submitted: 1,
             bytes,
@@ -1196,6 +1195,8 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         let handle = BlockRequestHandle { raw };
         let pending = PendingAsync {
             handle,
+            owner: BlockCompletionOwner::Ordinary,
+            cookie: handle.raw,
             op: request.op,
             bytes,
             segments,
@@ -1676,6 +1677,7 @@ mod tests {
                 requests[0].cookie,
                 requests[0].handle.map(|handle| handle.raw)
             );
+            assert!(matches!(disk.async_state, AsyncState::InFlight(_)));
             let mut completion = [BlockCompletion {
                 handle: BlockRequestHandle::default(),
                 owner: BlockCompletionOwner::Ordinary,
