@@ -711,9 +711,9 @@ struct Native<R, T> {
 
 /// Re-read the selected TC PLL through the translated generic manager while
 /// the Native-owned pin keeps the source-mapped display/PHY domains alive.
-fn translated_tc_dpll_enabled<R: Registers, T: PollTimer>(
+fn translated_tc_dpll_readout<R: Registers, T: PollTimer>(
     native: &Native<R, T>,
-) -> Result<bool, String> {
+) -> Result<(bool, intel_display::intel_dpll_mgr_full::IntelDpllHwState), String> {
     let identity = super::shared_dpll::AdlNIdentity::verify(
         native.pci.vendor_id,
         native.pci.device_id,
@@ -732,7 +732,6 @@ fn translated_tc_dpll_enabled<R: Registers, T: PollTimer>(
             &mut power,
             (3 + native.port.index()) as usize,
         )
-        .map(|(enabled, _)| enabled)
         .map_err(|error| format!("translated shared DPLL readout refused: {error:?}"))
 }
 
@@ -1554,9 +1553,15 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
             let old_pitch = old_firmware.plane.pitch;
             let watermark = self.watermark;
             let mut display_writes_started = false;
-            let transition = translated_tc_dpll_enabled(self)
-                .and_then(|enabled| {
-                    if enabled != (old_firmware.pll.enable != 0) {
+            let transition = translated_tc_dpll_readout(self)
+                .and_then(|(enabled, manager_state)| {
+                    if enabled != (old_firmware.pll.enable != 0)
+                        || !super::shared_dpll::dkl_state_matches_source_readout(
+                            &old_firmware.pll.state,
+                            &manager_state,
+                            self.afc_startup.is_some(),
+                        )
+                    {
                         return Err(String::from(
                             "translated shared DPLL no longer matches the active before-image",
                         ));
@@ -1584,8 +1589,14 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                     let next_state =
                         capture(&self.registers, &self.power, self.port, self.afc_startup)
                             .map_err(|e| format!("TC modeset readback failed: {e:?}"))?;
-                    let manager_pll_on = translated_tc_dpll_enabled(self)?;
-                    if manager_pll_on != (next_state.pll.enable != 0) {
+                    let (manager_pll_on, manager_state) = translated_tc_dpll_readout(self)?;
+                    if manager_pll_on != (next_state.pll.enable != 0)
+                        || !super::shared_dpll::dkl_state_matches_source_readout(
+                            &next_state.pll.state,
+                            &manager_state,
+                            self.afc_startup.is_some(),
+                        )
+                    {
                         return Err(String::from(
                             "firmware and translated TC DPLL enable readouts disagree after \
                              modeset",
@@ -1671,8 +1682,14 @@ impl<R: Registers + Send + Sync, T: PollTimer + Send + Sync> DisplayAdapter for 
                             let restored =
                                 capture(&self.registers, &self.power, self.port, self.afc_startup)
                                     .map_err(|e| format!("TC rollback readback failed: {e:?}"))?;
-                            let manager_pll_on = translated_tc_dpll_enabled(self)?;
-                            if manager_pll_on != (restored.pll.enable != 0) {
+                            let (manager_pll_on, manager_state) = translated_tc_dpll_readout(self)?;
+                            if manager_pll_on != (restored.pll.enable != 0)
+                                || !super::shared_dpll::dkl_state_matches_source_readout(
+                                    &restored.pll.state,
+                                    &manager_state,
+                                    self.afc_startup.is_some(),
+                                )
+                            {
                                 return Err(String::from(
                                     "firmware and translated TC DPLL enable readouts disagree \
                                      after rollback",
@@ -1915,7 +1932,7 @@ pub(super) fn init(
                     Error::Refused
                 })?;
             let dpll_index = (3 + port.index()) as usize;
-            let (manager_pll_on, _) = shared_dpll
+            let (manager_pll_on, manager_state) = shared_dpll
                 .get_hw_state(
                     &window,
                     &super::gmbus::MonotonicTimer,
@@ -1928,7 +1945,13 @@ pub(super) fn init(
                     );
                     Error::Refused
                 })?;
-            if manager_pll_on != (first.pll.enable != 0) {
+            if manager_pll_on != (first.pll.enable != 0)
+                || !super::shared_dpll::dkl_state_matches_source_readout(
+                    &first.pll.state,
+                    &manager_state,
+                    afc_startup.is_some(),
+                )
+            {
                 axlog::warn!(
                     "intel-fastboot: firmware and translated TC DPLL enable readouts disagree: \
                      firmware={} manager={}",
@@ -2745,10 +2768,13 @@ mod tests {
     fn translated_tc_dpll_readout_matches_firmware_capture() {
         let (adapter, ..) = native();
         let firmware_enabled = adapter.state.lock().firmware.pll.enable != 0;
-        assert_eq!(
-            translated_tc_dpll_enabled(&adapter).unwrap(),
-            firmware_enabled
-        );
+        let (enabled, manager_state) = translated_tc_dpll_readout(&adapter).unwrap();
+        assert_eq!(enabled, firmware_enabled);
+        assert!(super::super::shared_dpll::dkl_state_matches_source_readout(
+            &adapter.baseline.pll.state,
+            &manager_state,
+            adapter.afc_startup.is_some(),
+        ));
     }
     #[test]
     fn translated_tc_dpll_readout_rejects_enable_bit_drift() {
@@ -2759,7 +2785,7 @@ mod tests {
         let enable = model.words.get(&0x46038).copied().unwrap();
         model.words.insert(0x46038, enable & !(1 << 31));
         drop(model);
-        assert!(!translated_tc_dpll_enabled(&adapter).unwrap());
+        assert!(!translated_tc_dpll_readout(&adapter).unwrap().0);
     }
     #[test]
     fn translated_tc_dpll_readout_refuses_lost_phy_power_pin() {
@@ -2768,7 +2794,7 @@ mod tests {
         let request = model.words.get(&0x45444).copied().unwrap();
         model.words.insert(0x45444, request & !(1 << 7));
         drop(model);
-        assert!(translated_tc_dpll_enabled(&adapter).is_err());
+        assert!(translated_tc_dpll_readout(&adapter).is_err());
     }
     #[test]
     fn already_on_power_pin_refuses_dark_and_recovers_landed_failure() {

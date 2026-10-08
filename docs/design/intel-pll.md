@@ -554,8 +554,8 @@ policy. It also adds the TBT PLL's CFGCR0/1 register declarations and
 power/enable/disable sequence from `icl_tbt_pll_enable()`/
 `icl_tbt_pll_disable()`. The combo/TBT enable adapters are still not called by
 modeset; the generic manager's selected TC1/TC2 read-only `get_hw_state`
-dispatcher is called by fastboot admission and around the restricted TC
-transaction.
+dispatcher plus source `icl_compare_hw_state` comparison are called by
+fastboot admission and around the restricted TC transaction.
 `tk-intel-display/src/dpll.rs` additionally translates the generic CRTC
 dispatch guards, stale-state clear, ±1 kHz clock-match helper, platform hook
 selection, and HSW+ DSI/PCH adjusted-dotclock path from Linux 7.2.3

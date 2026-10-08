@@ -320,6 +320,36 @@ fn manager_tc_port(port: intel_display::dkl_phy::TcPort) -> Result<dpll::TcPort,
     }
 }
 
+/// Compare the registers independently captured by the fastboot firmware
+/// readout with the common DKL fields returned by the translated shared-DPLL
+/// dispatcher. Preserve source-manager-only fields/reserved bits from the
+/// dispatched image, while comparing the documented DKL register masks.
+pub(crate) fn dkl_state_matches_source_readout(
+    firmware: &intel_display::dpll_mgr::DklPllState,
+    dispatched: &dpll::IntelDpllHwState,
+    afc_startup_override: bool,
+) -> bool {
+    let mut expected = *dispatched;
+    let actual = dispatched.icl;
+    let expected_icl = &mut expected.icl;
+    let div0_mask = 0x1f_ffff | if afc_startup_override { 7 << 25 } else { 0 };
+    let div1_mask = (31 << 16) | 0xff;
+    let ssc_mask = (7 << 29) | (0xff << 16) | (7 << 11) | (1 << 9);
+    let bias_mask = ((1 << 30) | (0x3f_ffff << 8)) & actual.mg_pll_bias_mask;
+    let tdc_mask = 0xffff & actual.mg_pll_tdc_coldst_bias_mask;
+
+    expected_icl.mg_refclkin_ctl = firmware.refclkin_ctl;
+    expected_icl.mg_clktop2_coreclkctl1 = firmware.coreclkctl1;
+    expected_icl.mg_clktop2_hsclkctl = firmware.hsclkctl;
+    expected_icl.mg_pll_div0 = (actual.mg_pll_div0 & !div0_mask) | (firmware.div0 & div0_mask);
+    expected_icl.mg_pll_div1 = (actual.mg_pll_div1 & !div1_mask) | (firmware.div1 & div1_mask);
+    expected_icl.mg_pll_ssc = (actual.mg_pll_ssc & !ssc_mask) | (firmware.ssc & ssc_mask);
+    expected_icl.mg_pll_bias = (actual.mg_pll_bias & !bias_mask) | (firmware.bias & bias_mask);
+    expected_icl.mg_pll_tdc_coldst_bias =
+        (actual.mg_pll_tdc_coldst_bias & !tdc_mask) | (firmware.tdc_coldst_bias & tdc_mask);
+    dpll::icl_compare_hw_state(&expected, dispatched)
+}
+
 fn verify_adln_pin_map(port: dpll::TcPort) -> Result<(), DpllFailure> {
     let (lane, io, aux, ddi_control, aux_control) = match port {
         dpll::TcPort::Tc1 => (
@@ -1498,6 +1528,45 @@ mod tests {
             AdlNIdentity::verify(0x1234, 0x46d0, 0),
             Err(DpllFailure::UnsupportedIdentity)
         );
+    }
+
+    #[test]
+    fn selected_dkl_readout_uses_source_comparator_for_firmware_fields() {
+        let firmware = intel_display::dpll_mgr::DklPllState {
+            dco_khz: 8_100_000,
+            refclkin_ctl: 1 << 8,
+            coreclkctl1: 3 << 8,
+            hsclkctl: (1 << 16) | (2 << 14) | (1 << 12) | (5 << 8),
+            div0: (4 << 16) | (5 << 12) | (2 << 8) | 0x7c,
+            div1: (25 << 16) | 0x26,
+            ssc: (1 << 29) | (9 << 16) | (3 << 11) | (1 << 9),
+            bias: (1 << 30) | (0x1234 << 8),
+            tdc_coldst_bias: 0x3456,
+        };
+        let mut dispatched = dpll::IntelDpllHwState::default();
+        dispatched.icl.mg_refclkin_ctl = firmware.refclkin_ctl;
+        dispatched.icl.mg_clktop2_coreclkctl1 = firmware.coreclkctl1;
+        dispatched.icl.mg_clktop2_hsclkctl = firmware.hsclkctl;
+        dispatched.icl.mg_pll_div0 = firmware.div0 | (1 << 24);
+        dispatched.icl.mg_pll_div1 = firmware.div1 | (1 << 31);
+        dispatched.icl.mg_pll_ssc = firmware.ssc | (1 << 5);
+        dispatched.icl.mg_pll_bias_mask = u32::MAX;
+        dispatched.icl.mg_pll_bias = firmware.bias | 1;
+        dispatched.icl.mg_pll_tdc_coldst_bias_mask = u32::MAX;
+        dispatched.icl.mg_pll_tdc_coldst_bias = firmware.tdc_coldst_bias | (1 << 20);
+        assert!(dkl_state_matches_source_readout(
+            &firmware,
+            &dispatched,
+            false
+        ));
+
+        let mut mismatched = dispatched;
+        mismatched.icl.mg_pll_div1 ^= 1;
+        assert!(!dkl_state_matches_source_readout(
+            &firmware,
+            &mismatched,
+            false
+        ));
     }
 
     #[test]

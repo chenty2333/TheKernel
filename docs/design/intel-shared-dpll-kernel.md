@@ -21,7 +21,8 @@ CRTC readout is invalid.
 Native fastboot now persists the manager for the KMS-device lifetime and uses
 its generic DKL `get_hw_state` dispatcher for the selected TC1/TC2 PLL during
 admission and before/after each restricted modeset, checking that its enable
-bit agrees with the independent firmware capture. This is a read-only
+bit and source-comparable masked DKL register fields agree with the independent
+firmware capture via translated `icl_compare_hw_state`. This is a read-only
 live-path integration only: atomic reservation/commit still does not use the
 manager, and `tc_modeset` owns the direct DKL enable/disable sequence. The pin
 backend revalidates held source-mapped power requests, D0,

@@ -19,8 +19,9 @@ shared-DPLL adapter now has both the original `PowerState` backend and a
 read-only fastboot-pin backend. Native fastboot persists one manager for the
 KMS lifetime and calls its generic DKL `get_hw_state` for the selected
 TC1/TC2 PLL at admission and on both sides of each restricted modeset,
-refusing if it disagrees with the firmware PLL enable readout. This wires
-source readout onto active paths but is not yet an atomic-state allocator:
+refusing if the enable bit or source-comparable masked DKL register fields
+disagree with the firmware capture (`icl_compare_hw_state`). This wires source
+readout onto active paths but is not yet an atomic-state allocator:
 TC modesets still use the restricted transaction and direct DKL
 enable/disable sequence. Type-C/MG PHY runtime
 paths and DP/Thunderbolt output call sites are also not connected. See
