@@ -22,6 +22,12 @@ const PCIE_LINK_STATUS: u32 = 0x12;
 const PCIE_LINK_SPEED_MASK: u16 = 0x000f;
 const PCIE_LINK_WIDTH_MASK: u16 = 0x03f0;
 const PCIE_LINK_WIDTH_SHIFT: u32 = 4;
+const PCIX_COMMAND_REGISTER: u32 = 0xe6;
+const PCIX_STATUS_REGISTER_HI: u32 = 0xea;
+const PCIX_COMMAND_MMRBC_MASK: u16 = 0x000c;
+const PCIX_COMMAND_MMRBC_SHIFT: u32 = 2;
+const PCIX_STATUS_HI_MMRBC_MASK: u16 = 0x0060;
+const PCIX_STATUS_HI_MMRBC_SHIFT: u32 = 5;
 const AUTO_READ_DONE_TIMEOUT_MS: usize = 10;
 const SWFW_SYNC_TIMEOUT: usize = 200;
 const MASTER_DISABLE_TIMEOUT: usize = 800;
@@ -176,6 +182,78 @@ pub fn disable_pcie_master_generic<I: E1000RegisterIo>(io: &mut I, bus_is_pcie: 
         io.delay_us(100);
     }
     Err(DevError::ResourceBusy)
+}
+
+/// upstream: e1000_mac.c e1000_pcix_mmrbc_workaround_generic()
+pub fn pcix_mmrbc_workaround_generic<P: E1000PciConfig>(
+    pci: &mut P,
+    bus_is_pcix: bool,
+) -> DevResult {
+    if !bus_is_pcix {
+        return Ok(());
+    }
+    let mut command = super::osdep::read_pci_cfg(pci, PCIX_COMMAND_REGISTER)?;
+    let status = super::osdep::read_pci_cfg(pci, PCIX_STATUS_REGISTER_HI)?;
+    let command_mmrbc = (command & PCIX_COMMAND_MMRBC_MASK) >> PCIX_COMMAND_MMRBC_SHIFT;
+    let mut status_mmrbc = (status & PCIX_STATUS_HI_MMRBC_MASK) >> PCIX_STATUS_HI_MMRBC_SHIFT;
+    if status_mmrbc == 3 {
+        status_mmrbc = 2;
+    }
+    if command_mmrbc > status_mmrbc {
+        command &= !PCIX_COMMAND_MMRBC_MASK;
+        command |= status_mmrbc << PCIX_COMMAND_MMRBC_SHIFT;
+        super::osdep::write_pci_cfg(pci, PCIX_COMMAND_REGISTER, command)?;
+    }
+    Ok(())
+}
+
+/// upstream: e1000_mac.c e1000_clear_hw_cntrs_base_generic()
+pub fn clear_hw_cntrs_base_generic<I: E1000RegisterIo>(io: &mut I) -> DevResult {
+    const COUNTERS: &[u32] = &[
+        E1000_CRCERRS,
+        E1000_SYMERRS,
+        E1000_MPC,
+        E1000_SCC,
+        E1000_ECOL,
+        E1000_MCC,
+        E1000_LATECOL,
+        E1000_COLC,
+        E1000_DC,
+        E1000_SEC,
+        E1000_RLEC,
+        E1000_XONRXC,
+        E1000_XONTXC,
+        E1000_XOFFRXC,
+        E1000_XOFFTXC,
+        E1000_FCRUC,
+        E1000_GPRC,
+        E1000_BPRC,
+        E1000_MPRC,
+        E1000_GPTC,
+        E1000_GORCL,
+        E1000_GORCH,
+        E1000_GOTCL,
+        E1000_GOTCH,
+        E1000_RNBC,
+        E1000_RUC,
+        E1000_RFC,
+        E1000_ROC,
+        E1000_RJC,
+        E1000_TORL,
+        E1000_TORH,
+        E1000_TOTL,
+        E1000_TOTH,
+        E1000_TPR,
+        E1000_TPT,
+        E1000_MPTC,
+        E1000_BPTC,
+        E1000_TLPIC,
+        E1000_RLPIC,
+    ];
+    for register in COUNTERS {
+        let _ = io.read_register(*register)?;
+    }
+    Ok(())
 }
 
 /// upstream: e1000_mac.c e1000_valid_led_default_generic()
@@ -1022,6 +1100,22 @@ mod tests {
             io.writes.last(),
             Some(&(E1000_CTRL, E1000_CTRL_GIO_MASTER_DISABLE))
         );
+    }
+
+    #[test]
+    fn generic_pcix_workaround_caps_mmrbc_and_reads_counter_latches() {
+        let mut pci = Pci::default();
+        pci.words[PCIX_COMMAND_REGISTER as usize / 2] = 3 << PCIX_COMMAND_MMRBC_SHIFT;
+        pci.words[PCIX_STATUS_REGISTER_HI as usize / 2] = 3 << PCIX_STATUS_HI_MMRBC_SHIFT;
+        pcix_mmrbc_workaround_generic(&mut pci, true).unwrap();
+        assert_eq!(
+            pci.words[PCIX_COMMAND_REGISTER as usize / 2],
+            2 << PCIX_COMMAND_MMRBC_SHIFT
+        );
+
+        let mut io = Registers::default();
+        clear_hw_cntrs_base_generic(&mut io).unwrap();
+        assert!(io.writes.is_empty());
     }
 
     #[test]
