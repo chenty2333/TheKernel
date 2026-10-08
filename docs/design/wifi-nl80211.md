@@ -56,7 +56,10 @@ not yet emitted. CONNECT admits either an open BSS or WPA2-PSK/CCMP on an
 observed RSN BSS and fails closed for unsupported AKM/cipher combinations.
 The userspace supplicant owns the EAPOL four-way handshake; NEW_KEY/SET_KEY/
 GET_KEY/DEL_KEY install software CCMP keys and GET_KEY returns the packet
-sequence without disclosing key bytes. Successful CONNECT and DISCONNECT
+sequence without disclosing key bytes. SET_PMKSA/DEL_PMKSA/FLUSH_PMKSA validate
+standard peer/PMKID attributes but do not cache key material in the kernel;
+the supplicant owns PMKSA state and supplies any selected PMKID in CONNECT IEs.
+Successful CONNECT and DISCONNECT
 queue their standard command events on the `mlme` group; CONNECT carries the
 association request/response IEs retained by the driver. GET_STATION encodes
 the associated BSSID and signed signal value from the live driver record.

@@ -315,9 +315,10 @@ The per-file source scan is against OpenBSD's `sys/net80211` files and each
 function below has a specific station-iwx boundary; these are not claimed as
 translated:
 
-- `ieee80211.c`: `ieee80211_ifattach`, `ieee80211_ifdetach`, and the three
-  `ieee80211_media_*` functions are ifnet/ifmedia registration and ioctl
-  wrappers mapped to TheKernel's netdev and nl80211 paths.
+- `ieee80211.c`: `ieee80211_ifattach`, `ieee80211_ifdetach`,
+  `ieee80211_media_init`, `ieee80211_media_change`, and
+  `ieee80211_media_status` are ifnet/ifmedia registration and ioctl wrappers
+  mapped to TheKernel's netdev and nl80211 paths.
 - `ieee80211_node.c`: `ieee80211_add_ess`, `ieee80211_del_ess`,
   `ieee80211_deselect_ess`, `ieee80211_ess_clear_wep`,
   `ieee80211_ess_clear_wpa`, `ieee80211_ess_setnwkeys`,
@@ -335,7 +336,13 @@ translated:
   or authenticator callbacks; the station iwx adapter has no AP role and its
   association response path is separate. `ieee80211_needs_auth` is the AP
   authenticator's 802.1X callback; station PAE/EAPOL belongs to
-  wpa_supplicant. `ieee80211_node_addba_request`, its AC/TID timer wrappers,
+  wpa_supplicant. `ieee80211_node_addba_request`,
+  `ieee80211_node_addba_request_ac_be_to`,
+  `ieee80211_node_addba_request_ac_bk_to`,
+  `ieee80211_node_addba_request_ac_vi_to`,
+  `ieee80211_node_addba_request_ac_vo_to`,
+  `ieee80211_node_addba_request_tid4`, `ieee80211_node_addba_request_tid5`,
+  `ieee80211_node_addba_request_tid6`, `ieee80211_node_addba_request_tid7`,
   and `ieee80211_node_trigger_addba_req` use net80211 software callouts; iwx
   uses firmware BA queues/reorder state instead. `ieee80211_ba_del` and
   `ieee80211_node_tx_flushed` are BA/callout teardown wrappers mapped to
@@ -345,16 +352,19 @@ translated:
   `ieee80211_node_free_unref_cb`, `ieee80211_node_cmp`, and
   `ieee80211_node_attach`/`detach`/`lateattach` are RB-tree, refcount, timer,
   or allocation wrappers represented by the bounded `NodeTable`, owned Rust
-  records, and driver lifetime. `ieee80211_inact_timeout` and
+  records, and driver lifetime; `ieee80211_node_detach` and
+  `ieee80211_node_lateattach` are autoconf framework methods. `ieee80211_inact_timeout` and
   `ieee80211_node_cache_timeout` are periodic OpenBSD timeout registrations;
   the iwx scan cache is aged by bounded service polling. `ieee80211_node_set_timeouts`
   is a hostap/EAPOL/SA-Query/BA timer registration wrapper. `ieee80211_release_node`
   is represented by Rust ownership/drop. `ieee80211_do_slow_print` is an
   optional rate-limited diagnostic printer.
 - `ieee80211_input.c`: `ieee80211_defrag` and `ieee80211_defrag_timeout` are
-  upstream `#ifdef notyet`; `ieee80211_input_ba`, its gap/sequence/flush
-  helpers, and `ieee80211_ba_move_window` are software reorder queues replaced
-  by iwx's hardware BAID/NSSN reorder path. `ieee80211_enqueue_data` is the
+  upstream `#ifdef notyet`; `ieee80211_input_ba`,
+  `ieee80211_input_ba_flush`, `ieee80211_input_ba_gap_skip`,
+  `ieee80211_input_ba_gap_timeout`, `ieee80211_input_ba_seq`, and
+  `ieee80211_ba_move_window` are software reorder queues replaced by iwx's
+  hardware BAID/NSSN reorder path. `ieee80211_enqueue_data` is the
   ifnet mbuf enqueue wrapper mapped to the Ethernet-compatible axnet device.
   `ieee80211_recv_assoc_req`, `ieee80211_recv_probe_req`, and
   `ieee80211_recv_pspoll` are hostap-only.
@@ -367,8 +377,11 @@ translated:
   `ieee80211_get_cts_to_self`, and `ieee80211_tx_compressed_bar` wrap the
   legacy if_start/mbuf control-frame callbacks; transmit admission/control is
   owned by iwx firmware queues and the standalone BAR encoder.
-- `ieee80211_proto.c`: `ieee80211_proto_attach`/`detach` register ifnet
-  callbacks; `ieee80211_set_link_state` maps to axnet link state.
+- `ieee80211_proto.c`: `ieee80211_proto_attach` and
+  `ieee80211_proto_detach` register ifnet callbacks;
+  `ieee80211_set_link_state` maps to axnet link state.
+  `ieee80211_rtm_80211info_task` is the OpenBSD route-socket metadata worker;
+  TheKernel publishes supported wireless state through rtnetlink and nl80211.
   `ieee80211_auth_open_confirm` is under OpenBSD's station-only exclusion and
   is AP-side confirmation. `ieee80211_setkeys`, `ieee80211_setkeysdone`,
   `ieee80211_gtk_rekey_timeout`, `ieee80211_node_gtk_rekey`,
@@ -376,8 +389,9 @@ translated:
   authenticator/rekey/timeout paths; EAPOL/SA-Query station protocol messages
   are userspace-owned or represented by station request effects.
   `ieee80211_dump_pkt` and `ieee80211_print_essid` are diagnostics.
-- `ieee80211_crypto.c`: `ieee80211_crypto_attach`/`detach` register cipher
-  methods replaced by the Rust crypto dispatcher. `ieee80211_derive_ptk`,
+- `ieee80211_crypto.c`: `ieee80211_crypto_attach` and
+  `ieee80211_crypto_detach` register cipher methods replaced by the Rust
+  crypto dispatcher and owned-context drop. `ieee80211_derive_ptk`,
   `ieee80211_derive_pmkid`, `ieee80211_pmkid_sha1`,
   `ieee80211_pmkid_sha256`, `ieee80211_eapol_key_check_mic`,
   `ieee80211_eapol_key_decrypt`, `ieee80211_eapol_key_encrypt`,

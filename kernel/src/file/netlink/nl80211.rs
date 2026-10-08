@@ -35,6 +35,9 @@ const CMD_GET_KEY: u8 = 9;
 const CMD_SET_KEY: u8 = 10;
 const CMD_NEW_KEY: u8 = 11;
 const CMD_DEL_KEY: u8 = 12;
+const CMD_SET_PMKSA: u8 = 52;
+const CMD_DEL_PMKSA: u8 = 53;
+const CMD_FLUSH_PMKSA: u8 = 54;
 const NL80211_MLME_GROUP_MASK: u32 = 1 << 3;
 const ATTR_WIPHY: u16 = 1;
 const ATTR_WIPHY_NAME: u16 = 2;
@@ -51,6 +54,7 @@ const ATTR_KEY_DEFAULT_TYPES: u16 = 110;
 const KEY_DEFAULT_TYPE_UNICAST: u16 = 1;
 const KEY_DEFAULT_TYPE_MULTICAST: u16 = 2;
 const ATTR_STA_INFO: u16 = 21;
+const ATTR_PMKID: u16 = 85;
 const ATTR_STATUS_CODE: u16 = 72;
 const ATTR_WIPHY_FREQ: u16 = 38;
 const ATTR_CONNECT_IE: u16 = 42;
@@ -267,6 +271,9 @@ pub(super) fn handle(
             | CMD_SET_KEY
             | CMD_NEW_KEY
             | CMD_DEL_KEY
+            | CMD_SET_PMKSA
+            | CMD_DEL_PMKSA
+            | CMD_FLUSH_PMKSA
     ) {
         return Err(AxError::OperationNotSupported);
     }
@@ -398,6 +405,21 @@ pub(super) fn handle(
                 key_message(header, port_id, ifindex, &key, &info),
             );
         }
+        return Ok(());
+    }
+    if matches!(request.cmd, CMD_SET_PMKSA | CMD_DEL_PMKSA | CMD_FLUSH_PMKSA) {
+        if dump {
+            return Err(AxError::InvalidInput);
+        }
+        let (ifindex, _peer, _pmkid) = parse_pmksa_request(attributes, request.cmd)?;
+        if !interfaces
+            .iter()
+            .any(|interface| interface.ifindex == ifindex)
+        {
+            return Err(AxError::NotFound);
+        }
+        // The userspace supplicant owns PMKSA and includes a cached PMKID in
+        // its next CONNECT request IE; no kernel/firmware cache is maintained.
         return Ok(());
     }
     let selectors = parse_selectors(attributes)?;
@@ -745,6 +767,38 @@ fn parse_key_request(attributes: &[u8], command: u8) -> AxResult<(u32, axnet::Wi
             default_multicast,
         },
     ))
+}
+
+fn parse_pmksa_request(
+    attributes: &[u8],
+    command: u8,
+) -> AxResult<(u32, Option<[u8; 6]>, Option<[u8; 16]>)> {
+    let mut ifindex = None;
+    let mut peer = None;
+    let mut pmkid = None;
+    for_each_rtattr(attributes, |kind, value| match kind {
+        ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
+            ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_MAC if peer.is_none() && value.len() == 6 => {
+            peer = Some(value.try_into().unwrap());
+            Ok(())
+        }
+        ATTR_PMKID if pmkid.is_none() && value.len() == 16 => {
+            pmkid = Some(value.try_into().unwrap());
+            Ok(())
+        }
+        ATTR_IFINDEX | ATTR_MAC | ATTR_PMKID => Err(AxError::InvalidInput),
+        _ => Err(AxError::OperationNotSupported),
+    })?;
+    match command {
+        CMD_SET_PMKSA if peer.is_some() && pmkid.is_some() => {}
+        CMD_DEL_PMKSA if peer.is_some() => {}
+        CMD_FLUSH_PMKSA if peer.is_none() && pmkid.is_none() => {}
+        _ => return Err(AxError::InvalidInput),
+    }
+    Ok((ifindex.ok_or(AxError::InvalidInput)?, peer, pmkid))
 }
 
 fn scan_bss_message(
@@ -1099,10 +1153,14 @@ mod tests {
         assert_eq!(CMD_SET_KEY, 10);
         assert_eq!(CMD_NEW_KEY, 11);
         assert_eq!(CMD_DEL_KEY, 12);
+        assert_eq!(CMD_SET_PMKSA, 52);
+        assert_eq!(CMD_DEL_PMKSA, 53);
+        assert_eq!(CMD_FLUSH_PMKSA, 54);
         assert_eq!(ATTR_WIPHY_FREQ, 38);
         assert_eq!(ATTR_STATUS_CODE, 72);
         assert_eq!(ATTR_REQ_IE, 77);
         assert_eq!(ATTR_RESP_IE, 78);
+        assert_eq!(ATTR_PMKID, 85);
         assert_eq!(ATTR_REG_ALPHA2, 33);
         assert_eq!(ATTR_IFINDEX, 3);
         assert_eq!(ATTR_IFNAME, 4);
@@ -1547,6 +1605,30 @@ mod tests {
         assert_eq!(parsed_default.index, 1);
         assert!(parsed_default.default_multicast);
         assert!(!parsed_default.default_unicast);
+    }
+
+    #[test]
+    fn supplicant_pmksa_updates_are_validated_but_user_space_owned() {
+        let mut set = Vec::new();
+        push_attr(&mut set, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        push_attr(&mut set, ATTR_MAC, &[2, 3, 4, 5, 6, 7]);
+        push_attr(&mut set, ATTR_PMKID, &[0x55; 16]);
+        assert_eq!(
+            parse_pmksa_request(&set, CMD_SET_PMKSA),
+            Ok((12, Some([2, 3, 4, 5, 6, 7]), Some([0x55; 16])))
+        );
+
+        let mut flush = Vec::new();
+        push_attr(&mut flush, ATTR_IFINDEX, &12u32.to_ne_bytes());
+        assert_eq!(
+            parse_pmksa_request(&flush, CMD_FLUSH_PMKSA),
+            Ok((12, None, None))
+        );
+        push_attr(&mut flush, ATTR_PMKID, &[0; 8]);
+        assert_eq!(
+            parse_pmksa_request(&flush, CMD_FLUSH_PMKSA),
+            Err(AxError::InvalidInput)
+        );
     }
 
     #[test]
