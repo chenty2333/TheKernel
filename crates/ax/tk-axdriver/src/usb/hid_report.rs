@@ -52,6 +52,7 @@ pub(crate) struct Report {
     report_sizes: [[u16; 256]; 3],
     locations: Vec<ReportLocation>,
     tlc_usages: Vec<Usage>,
+    collection_usages: Vec<(u8, Usage)>,
     ids: bool,
     // Report-ID ownership prevents a Consumer release from lifting keys held
     // by a separate keyboard report. Maximum retained owners is 1024.
@@ -278,6 +279,7 @@ impl Report {
         let mut top_level_index = 0usize;
         let mut current_tlc_index = 0u8;
         let mut tlc_usages = reserved(16)?;
+        let mut collection_usages = reserved(32)?;
         let mut current_slot = None;
         let mut next_slot = 0u8;
         let mut app = Usage::default();
@@ -388,7 +390,16 @@ impl Report {
                     if collections.is_empty() {
                         current_tlc_index =
                             u8::try_from(top_level_index).map_err(|_| DevError::Unsupported)?;
+                        tlc_usages.try_reserve(1).map_err(|_| DevError::NoMemory)?;
+                        tlc_usages.push(usages.first().copied().unwrap_or_default());
                     }
+                    collection_usages
+                        .try_reserve(1)
+                        .map_err(|_| DevError::NoMemory)?;
+                    collection_usages.push((
+                        current_tlc_index,
+                        usages.first().copied().unwrap_or_default(),
+                    ));
                     collections.push(app);
                     collection_slots.push(current_slot);
                     if matches!(value, 0 | 2)
@@ -405,8 +416,7 @@ impl Report {
                     if value == 1 {
                         app = usages.first().copied().unwrap_or_default();
                         if collections.len() == 1 {
-                            tlc_usages.try_reserve(1).map_err(|_| DevError::NoMemory)?;
-                            tlc_usages.push(app);
+                            tlc_usages[usize::from(current_tlc_index)] = app;
                         }
                         pointer |= app.page == 0x0d && matches!(app.code, 4 | 5);
                     }
@@ -616,6 +626,7 @@ impl Report {
             report_sizes,
             locations,
             tlc_usages,
+            collection_usages,
             ids,
             keys: reserved(1024)?,
             mt_tracking_ids: [-1; 32],
@@ -744,15 +755,15 @@ impl Report {
     pub(crate) fn top_level_collection_count(&self) -> u8 {
         self.tlc_usages.len().min(usize::from(u8::MAX)) as u8
     }
-    pub(crate) fn is_touchpad_in_collection(&self, tlc_index: u8) -> bool {
-        self.tlc_usages
-            .get(usize::from(tlc_index))
-            .is_some_and(|usage| usage.page == 0x0d && usage.code == 0x05)
-    }
-    pub(crate) fn is_touchscreen_in_collection(&self, tlc_index: u8) -> bool {
-        self.tlc_usages
-            .get(usize::from(tlc_index))
-            .is_some_and(|usage| usage.page == 0x0d && usage.code == 0x04)
+    pub(crate) fn has_collection_in_collection(
+        &self,
+        tlc_index: u8,
+        page: u32,
+        usage: u32,
+    ) -> bool {
+        self.collection_usages.iter().any(|(index, collection)| {
+            *index == tlc_index && collection.page == page && collection.code == usage
+        })
     }
     pub(crate) fn has_mt_tip_switch_in_collection(&self, tlc_index: u8) -> bool {
         self.fields.iter().any(|field| {

@@ -62,6 +62,11 @@ pub(super) fn locate(
     report.locate_usage_in_collection(kind, page, usage, tlc_index, usage_index)
 }
 
+// upstream: hidbus.c hidbus_is_collection()
+pub(super) fn is_collection(report: &Report, page: u32, usage: u32, tlc_index: u8) -> bool {
+    report.has_collection_in_collection(tlc_index, page, usage)
+}
+
 // upstream: hidbus.c hidbus_get_report()
 pub(super) fn get_report<T: Transport>(
     device: &mut Device<T>,

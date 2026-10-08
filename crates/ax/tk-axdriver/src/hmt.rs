@@ -34,9 +34,9 @@ impl MultiTouch {
             {
                 continue;
             }
-            let kind = if report.is_touchpad_in_collection(tlc_index) {
+            let kind = if crate::hidbus::is_collection(report, 0x0d, 0x05, tlc_index) {
                 Type::Touchpad
-            } else if report.is_touchscreen_in_collection(tlc_index) {
+            } else if crate::hidbus::is_collection(report, 0x0d, 0x04, tlc_index) {
                 Type::Touchscreen
             } else {
                 continue;
@@ -214,6 +214,8 @@ mod tests {
         ];
         let report = Report::parse(&descriptor).unwrap();
         assert_eq!(report.top_level_collection_count(), 2);
+        assert!(crate::hidbus::is_collection(&report, 1, 6, 0));
+        assert!(crate::hidbus::is_collection(&report, 0x0d, 5, 1));
         assert!(
             report
                 .locate_usage(crate::hid_report::ReportKind::Input, 7, 4, 0)

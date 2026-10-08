@@ -30,3 +30,9 @@ The HID bus adapter now exposes the source's generic `get_report`, `set_report`,
 `read`, `write`, `set_idle`, and `set_protocol` wrapper operations over the
 transport-independent I2C-HID client. These keep `hidbus` policy distinct from
 `iichid` wire commands while mapping the newbus dispatch to TheKernel methods.
+
+The parser also retains nested collection usages, so `hidbus_is_collection()`
+now resolves a collection within one TLC. HMT probing scans top-level collections
+and pins Contact ID/Tip/X/Y and feature controls to the selected touch
+collection rather than assuming a single collection or using report-global
+feature locations.
