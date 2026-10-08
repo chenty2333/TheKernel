@@ -289,6 +289,14 @@ algorithm rejects levels whose `min_ddb_alloc` does not fit the whole-buffer
 DDB and the register encoder preserves the 12-bit block/13-bit line fields.
 The old generous profile is now compiled only for tests.
 
+The firmware-preserving TC1/TC2 fastboot path does not run the mutating
+`power::bring_up` sequence. It now performs the same source PCode latency/SAGV
+reads through `read_source_watermark_config` while its already-active power
+pin is held, stores that config with the Native adapter, and refuses adapter
+publication if the required latency mailbox read fails. This avoids depending
+on the unrelated global `PowerState` which that legacy path does not create;
+it does not establish a full atomic bandwidth proof or enable SAGV itself.
+
 ### 4.3 `PLANE_WM_LINES` limit is generation-selected
 
 The active calculation calls translated `skl_wm_max_lines`: 31 below display
