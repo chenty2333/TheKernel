@@ -168,6 +168,32 @@ pub fn intel_hdmi_set_gcp_infoframe(
     Ok(true)
 }
 
+/// Fastset the HSW DRM/HDR packet only when either desired or hardware state
+/// says it is present; clear its enable before rewriting the data words.
+// upstream: intel_hdmi.c intel_hdmi_fastset_infoframes()
+pub fn intel_hdmi_fastset_infoframes(
+    io: &impl ReadoutIo,
+    pipe: Pipe,
+    drm_enabled: bool,
+    packet: Option<[u8; 32]>,
+) -> Result<(), Error> {
+    if !io.pipe_powered(pipe) || (drm_enabled && packet.is_none()) {
+        return Err(Error::Refused);
+    }
+    let ctl = pipe.transcoder_register(0x60200);
+    let mut value = io.read32(ctl)?;
+    if !drm_enabled && value & FrameType::Drm.enable_mask() == 0 {
+        return Ok(());
+    }
+    value &= !FrameType::Drm.enable_mask();
+    io.write32(ctl, value)?;
+    let _ = io.read32(ctl)?;
+    if let Some(packet) = packet {
+        hsw_write_infoframe(io, pipe, FrameType::Drm, &packet)?;
+    }
+    Ok(())
+}
+
 /// HSW frame set used by `hsw_set_infoframes()` in source ordering.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HswInfoframeSet {
@@ -407,6 +433,27 @@ mod write_tests {
         assert_eq!(writes[3].0, pipe.transcoder_register(0x60220));
         assert_eq!(writes[13].0, pipe.transcoder_register(0x602a0));
         assert_eq!(writes.last().unwrap().0, pipe.transcoder_register(0x60200));
+    }
+
+    #[test]
+    fn fastset_hdr_clears_enabled_packet_before_rewriting_or_removal() {
+        let pipe = Pipe::A;
+        let drm = FrameType::Drm.enable_mask();
+        let mock = Mock {
+            powered: true,
+            ..Mock::default()
+        };
+        mock.registers
+            .borrow_mut()
+            .insert(pipe.transcoder_register(0x60200), drm | 0x123);
+        intel_hdmi_fastset_infoframes(&mock, pipe, false, None).unwrap();
+        assert_eq!(
+            mock.writes.borrow().as_slice(),
+            &[(pipe.transcoder_register(0x60200), 0x123)]
+        );
+        mock.writes.borrow_mut().clear();
+        intel_hdmi_fastset_infoframes(&mock, pipe, false, None).unwrap();
+        assert!(mock.writes.borrow().is_empty());
     }
 
     #[test]
