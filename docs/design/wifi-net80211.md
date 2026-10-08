@@ -119,3 +119,6 @@ The station Open System AUTH branch validates state and transaction sequence,
 clears RSN protection/port/replay state before applying status, counts failed
 peers or requests trying another BSS, and advances successful AUTH to ASSOC.
 The actual user-visible EAPOL 4-way exchange remains with wpa_supplicant.
+HT/VHT/HE negotiation now validates mode/channel support, mandatory peer and
+local MCS maps, forbids WEP/TKIP for HT, and selects common SGI flags before
+recording negotiated PHY state.

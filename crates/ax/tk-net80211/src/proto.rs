@@ -43,6 +43,45 @@ pub enum ProtocolState {
     Run,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalPhyConfig {
+    pub modecaps: u32,
+    pub ht_enabled: bool,
+    pub vht_enabled: bool,
+    pub he_enabled: bool,
+    pub channel_is_2ghz: bool,
+    pub channel_is_5ghz: bool,
+    pub channel_supports_ac: bool,
+    pub channel_supports_he: bool,
+    pub station_mode: bool,
+    pub wep_enabled: bool,
+    pub rsn_enabled: bool,
+    pub ht_caps: crate::HtCapabilities,
+    pub supported_ht_mcs: [u8; 10],
+    pub vht_caps: crate::VhtCapabilities,
+    pub he_caps: crate::HeCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerPhyConfig {
+    pub ht_caps: crate::HtCapabilities,
+    pub ht_operation: crate::HtOperation,
+    pub vht_caps: crate::VhtCapabilities,
+    pub vht_operation: crate::VhtOperation,
+    pub he_caps: crate::HeCapabilities,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NegotiatedPhy {
+    pub ht: bool,
+    pub ht_sgi20: bool,
+    pub ht_sgi40: bool,
+    pub vht: bool,
+    pub vht_sgi80: bool,
+    pub vht_sgi160: bool,
+    pub he: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OpenAuthEffects {
     pub clear_protected_txrx: bool,
@@ -82,6 +121,95 @@ pub fn auth_open_station(state: &mut OpenAuthState) -> OpenAuthEffects {
     effects.new_state = Some(ProtocolState::Assoc);
     effects.new_state_reason = Some(state.auth_subtype);
     effects
+}
+
+/// Negotiate HT support, mandatory Basic MCS, encryption restrictions and SGI.
+// upstream: ieee80211_proto.c ieee80211_ht_negotiate()
+pub fn ht_negotiate(
+    local: &LocalPhyConfig,
+    peer: &PeerPhyConfig,
+    pairwise_ciphers: u32,
+) -> (bool, bool, bool) {
+    if local.modecaps & (1 << crate::PhyMode::N as u8) == 0
+        || !local.ht_enabled
+        || !crate::supports_ht(&peer.ht_caps)
+    {
+        return (false, false, false);
+    }
+    if local.station_mode {
+        for mcs in 0..77 {
+            if peer.ht_operation.basic_mcs[mcs / 8] & (1 << (mcs % 8)) != 0
+                && local.supported_ht_mcs[mcs / 8] & (1 << (mcs % 8)) == 0
+            {
+                return (false, false, false);
+            }
+        }
+    }
+    if local.wep_enabled
+        || (local.rsn_enabled
+            && pairwise_ciphers & (crate::CIPHER_USE_GROUP | crate::CIPHER_TKIP) != 0)
+    {
+        return (false, false, false);
+    }
+    (
+        true,
+        crate::supports_ht_sgi20(&peer.ht_caps) && local.ht_caps.caps & crate::HTCAP_SGI20 != 0,
+        crate::supports_ht_sgi40(&peer.ht_caps) && local.ht_caps.caps & crate::HTCAP_SGI40 != 0,
+    )
+}
+
+/// Negotiate 5-GHz VHT support and verify all peer basic MCS/NSS requirements.
+// upstream: ieee80211_proto.c ieee80211_vht_negotiate()
+pub fn vht_negotiate(local: &LocalPhyConfig, peer: &PeerPhyConfig) -> (bool, bool, bool) {
+    if local.modecaps & (1 << crate::PhyMode::Ac as u8) == 0
+        || !local.vht_enabled
+        || !local.channel_is_5ghz
+        || !local.channel_supports_ac
+        || !crate::supports_vht(&peer.vht_caps)
+    {
+        return (false, false, false);
+    }
+    if local.station_mode {
+        for nss in 0..8 {
+            let shift = nss * 2;
+            let basic = (peer.vht_operation.basic_mcs >> shift) & 3;
+            let local_rx = (local.vht_caps.rx_mcs >> shift) & 3;
+            if basic != 3 && basic > local_rx {
+                return (false, false, false);
+            }
+        }
+    }
+    (
+        true,
+        peer.vht_caps.caps & (1 << 5) != 0 && local.vht_caps.caps & (1 << 5) != 0,
+        peer.vht_caps.caps & (1 << 6) != 0 && local.vht_caps.caps & (1 << 6) != 0,
+    )
+}
+
+/// Negotiate HE only when local/peer MCS, channel, HT and HE mode all agree.
+// upstream: ieee80211_proto.c ieee80211_he_negotiate()
+pub fn he_negotiate(local: &LocalPhyConfig, peer: &PeerPhyConfig, ht_negotiated: bool) -> bool {
+    if local.modecaps & (1 << crate::PhyMode::Ax as u8) == 0
+        || !local.he_enabled
+        || !local.channel_supports_he
+        || !local.ht_enabled
+        || !ht_negotiated
+        || local.he_caps.rx_mcs_80 & 3 == 3
+        || !crate::supports_he(&peer.he_caps)
+    {
+        return false;
+    }
+    if local.station_mode {
+        for nss in 0..8 {
+            let shift = nss * 2;
+            let basic = (peer.he_caps.basic_mcs >> shift) & 3;
+            let local_rx = (local.he_caps.rx_mcs_80 >> shift) & 3;
+            if basic != 3 && basic > local_rx {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub const FIX_RATE_SORT: u32 = 0x01;
@@ -246,6 +374,94 @@ mod tests {
         );
         assert_eq!(effects.new_state, Some(ProtocolState::Assoc));
         assert_eq!(effects.new_state_reason, Some(0xb0));
+    }
+
+    fn phy_config() -> (LocalPhyConfig, PeerPhyConfig) {
+        let local = LocalPhyConfig {
+            modecaps: (1 << crate::PhyMode::N as u8)
+                | (1 << crate::PhyMode::Ac as u8)
+                | (1 << crate::PhyMode::Ax as u8),
+            ht_enabled: true,
+            vht_enabled: true,
+            he_enabled: true,
+            channel_is_2ghz: false,
+            channel_is_5ghz: true,
+            channel_supports_ac: true,
+            channel_supports_he: true,
+            station_mode: true,
+            wep_enabled: false,
+            rsn_enabled: true,
+            ht_caps: crate::HtCapabilities {
+                caps: crate::HTCAP_SGI20 | crate::HTCAP_SGI40,
+                ..Default::default()
+            },
+            supported_ht_mcs: [1; 10],
+            vht_caps: crate::VhtCapabilities {
+                caps: (1 << 5) | (1 << 6),
+                rx_mcs: 0,
+                ..Default::default()
+            },
+            he_caps: crate::HeCapabilities {
+                rx_mcs_80: 0,
+                ..Default::default()
+            },
+        };
+        let peer = PeerPhyConfig {
+            ht_caps: crate::HtCapabilities {
+                flags: crate::NODE_HTCAP,
+                rx_mcs: [1; 10],
+                caps: crate::HTCAP_SGI20 | crate::HTCAP_SGI40,
+                ..Default::default()
+            },
+            ht_operation: crate::HtOperation {
+                basic_mcs: [1; 16],
+                ..Default::default()
+            },
+            vht_caps: crate::VhtCapabilities {
+                flags: crate::NODE_VHTCAP,
+                caps: (1 << 5) | (1 << 6),
+                rx_mcs: 0,
+                ..Default::default()
+            },
+            vht_operation: crate::VhtOperation {
+                basic_mcs: 0,
+                ..Default::default()
+            },
+            he_caps: crate::HeCapabilities {
+                flags: crate::NODE_HECAP,
+                rx_mcs_80: 0,
+                basic_mcs: 0,
+                ..Default::default()
+            },
+        };
+        (local, peer)
+    }
+
+    #[test]
+    fn phy_negotiation_gates_basic_mcs_crypto_and_channel_modes() {
+        let (local, peer) = phy_config();
+        assert_eq!(
+            ht_negotiate(&local, &peer, crate::CIPHER_CCMP),
+            (true, true, true)
+        );
+        assert_eq!(vht_negotiate(&local, &peer), (true, true, true));
+        assert!(he_negotiate(&local, &peer, true));
+        let mut no_basic = local;
+        no_basic.supported_ht_mcs = [0; 10];
+        assert_eq!(
+            ht_negotiate(&no_basic, &peer, crate::CIPHER_CCMP),
+            (false, false, false)
+        );
+        let mut tkip_local = local;
+        tkip_local.rsn_enabled = true;
+        assert_eq!(
+            ht_negotiate(&tkip_local, &peer, crate::CIPHER_TKIP),
+            (false, false, false)
+        );
+        let mut no_vht = local;
+        no_vht.channel_supports_ac = false;
+        assert_eq!(vht_negotiate(&no_vht, &peer), (false, false, false));
+        assert!(!he_negotiate(&local, &peer, false));
     }
 
     #[test]

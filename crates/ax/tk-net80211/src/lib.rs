@@ -48,16 +48,17 @@ pub use node::{
     valid_40mhz_secondary_above, valid_40mhz_secondary_below, valid_80mhz_center_frequency,
 };
 pub use node_caps::{
-    HE_FIXED_CAPS_LEN, HE_MAC_CAPS_LEN, HE_MCS_NSS_80_LEN, HE_PHY_CAPS_LEN,
-    HE_PHYCAP0_CHAN_WIDTH_160_IN_5G, HE_PHYCAP0_CHAN_WIDTH_8080_IN_5G, HeCapabilities,
-    HtCapabilities, HtOperation, NODE_HE, NODE_HECAP, NODE_HT, NODE_HT_SGI20, NODE_HT_SGI40,
-    NODE_HTCAP, NODE_VHT, NODE_VHT_SGI80, NODE_VHT_SGI160, NODE_VHTCAP, VHTOP0_CHAN_WIDTH_80,
-    VHTOP0_CHAN_WIDTH_160, VHTOP0_CHAN_WIDTH_8080, VHTOP0_CHAN_WIDTH_HT, VhtCapabilities,
-    clear_he_caps, clear_ht_caps, clear_vht_caps, ht_secondary_offset, setup_he_caps,
-    setup_he_operation, setup_ht_caps, setup_ht_operation, setup_vht_caps, setup_vht_operation,
-    supports_he, supports_ht, supports_ht_chan40, supports_ht_sgi20, supports_ht_sgi40,
-    supports_vht, supports_vht_chan80, supports_vht_chan160, supports_vht_sgi80,
-    supports_vht_sgi160, vht_channel_width,
+    HE_FIXED_CAPS_LEN, HE_MAC_CAPS_LEN, HE_MCS_NSS_80_LEN, HE_MCS_SS_NOT_SUPP, HE_PHY_CAPS_LEN,
+    HE_PHYCAP0_CHAN_WIDTH_160_IN_5G, HE_PHYCAP0_CHAN_WIDTH_8080_IN_5G, HTCAP_CBW20_40, HTCAP_SGI20,
+    HTCAP_SGI40, HTOP0_CHW, HeCapabilities, HtCapabilities, HtOperation, NODE_HE, NODE_HECAP,
+    NODE_HT, NODE_HT_SGI20, NODE_HT_SGI40, NODE_HTCAP, NODE_VHT, NODE_VHT_SGI80, NODE_VHT_SGI160,
+    NODE_VHTCAP, VHT_MCS_SS_NOT_SUPP, VHTOP0_CHAN_WIDTH_80, VHTOP0_CHAN_WIDTH_160,
+    VHTOP0_CHAN_WIDTH_8080, VHTOP0_CHAN_WIDTH_HT, VhtCapabilities, VhtOperation, clear_he_caps,
+    clear_ht_caps, clear_vht_caps, ht_secondary_offset, setup_he_caps, setup_he_operation,
+    setup_ht_caps, setup_ht_operation, setup_vht_caps, setup_vht_operation, supports_he,
+    supports_ht, supports_ht_chan40, supports_ht_sgi20, supports_ht_sgi40, supports_vht,
+    supports_vht_chan80, supports_vht_chan160, supports_vht_sgi80, supports_vht_sgi160,
+    vht_channel_width,
 };
 pub use node_rates::{
     CHAN_DYN as NODE_CHAN_DYN, CHAN_OFDM as NODE_CHAN_OFDM, NODE_ERP, PeerRateState, RateIeError,
@@ -88,8 +89,9 @@ pub use output::{
 pub use proto::{
     CAP_SHORT_PREAMBLE, CAP_SHORT_SLOT, ErpState, FIX_RATE_DELETE, FIX_RATE_FIXED,
     FIX_RATE_NEGOTIATE, FIX_RATE_SORT, FLAG_SHORT_PREAMBLE, FLAG_SHORT_SLOT, FLAG_USE_PROTECTION,
-    FixRateConfig, OpenAuthEffects, OpenAuthState, ProtocolState, auth_open_station,
-    beacon_miss_threshold, fix_rate, reset_erp, set_short_slot,
+    FixRateConfig, LocalPhyConfig, NegotiatedPhy, OpenAuthEffects, OpenAuthState, PeerPhyConfig,
+    ProtocolState, auth_open_station, beacon_miss_threshold, fix_rate, he_negotiate, ht_negotiate,
+    reset_erp, set_short_slot, vht_negotiate,
 };
 pub use ra::{
     GoodputStats, HT_RATESETS, HtPeer, HtRateSet, MCS_COUNT, RA_FP_ONE, RA_FP_SHIFT,
