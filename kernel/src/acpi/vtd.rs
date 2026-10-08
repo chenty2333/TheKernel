@@ -1,5 +1,5 @@
 //! VT-d setup with a conservative shared-DMA default and experimental
-//! requester-specific domains behind `iommu_domains=on`.
+//! requester-specific domains by default (`iommu_domains=off` opts out).
 use alloc::vec::Vec;
 use core::{
     ptr::NonNull,
@@ -1207,7 +1207,7 @@ pub(super) fn init(engine: &Engine) -> Result<(), Error> {
     };
     *MANAGER.lock() = Some(manager);
     REQUESTER_DOMAINS.store(
-        axhal::boot::command_line_value("iommu_domains") == Some("on"),
+        axhal::boot::command_line_value("iommu_domains") != Some("off"),
         Ordering::Release,
     );
     MODE.store(MODE_ENABLED, Ordering::Release);

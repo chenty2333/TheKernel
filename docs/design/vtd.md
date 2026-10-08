@@ -219,7 +219,8 @@ and reached `VTD_INTREMAP_REQID_ACCEPTANCE_DONE`. This run used the conservative
 shared DMA context; it verifies the remapping-enabled boot path and disk/network
 operation, not per-device DMA isolation or physical APIC behavior.
 
-Requester-specific second-level domains are enabled with `iommu_domains=on`.
+Requester-specific second-level domains are enabled by default when DMAR is
+active; `iommu_domains=off` selects the shared compatibility domain.
 The kernel derives the DMAR PCI scope path by walking the configured ECAM
 topology and allocates a distinct DID and page table per requester; VirtIO
 queue/data mappings and NVMe queue/buffer allocations carry their PCI requester
@@ -232,7 +233,13 @@ block disk, an NVMe test disk, and VirtIO-net. The guest read an NVMe sector,
 pinged 10.0.2.2 with 0% loss, and reached `VTD_INTREMAP_REQID_ACCEPTANCE_DONE`;
 a separate isolated-mode block+net run also passed. This demonstrates the
 requester-specific path for the tested VirtIO block, NVMe, and network
-requesters on QEMU, not every platform DMA master. The standard graphics profile
-has not passed with isolated domains, and I2C/GPU/other PCI DMA clients are not
-all requester-aware; therefore keep the isolated mode opt-in rather than
-enabling it globally. No native-hardware or physical APIC validation is implied.
+requesters on QEMU, not every platform DMA master. A subsequent Q35/KVM run
+used the standard VirtIO-GPU `headless` profile with `intremap=on
+iommu_domains=on`: an injected static `drm-uapi-oracle` exercised
+`DRM_IOCTL_MODE_CREATE_DUMB`, `MAP_DUMB`, mmap/write/unmap, and destroy on
+`/dev/dri/card0`; it reported `drm.dumb_lifetime state=OK`, and the run reached
+`VTD_GPU_DMA_ACCEPTANCE_DONE` with exit 0. The associated GPU requester domain
+was installed and no VT-d fault was reported. Thus requester-specific mode is
+now default-on (`iommu_domains=off` opts out). This does not claim per-device
+coverage for DMA clients that do not provide a requester, nor native-hardware
+or physical APIC validation.

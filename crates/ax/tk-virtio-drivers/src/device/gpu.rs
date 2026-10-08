@@ -17,7 +17,7 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::{
     Error, PAGE_SIZE, Result,
-    hal::Hal,
+    hal::{BufferDirection, DmaMapping, Hal},
     queue::VirtQueue,
     transport::{SharedMemoryRegion, Transport},
     volatile::{ReadOnly, Volatile, WriteOnly, volread, volwrite},
@@ -108,6 +108,10 @@ struct Resource {
     width: u32,
     height: u32,
     backing: BackingState,
+    /// IOMMU mappings for caller-owned pages embedded in ATTACH_BACKING or
+    /// CREATE_BLOB. These remain live until a matching detach/unref ack or a
+    /// transport reset proves the host can no longer DMA them.
+    backing_mappings: Vec<DmaMapping>,
     lifecycle: ResourceLifecycle,
     backing_bytes: Option<u64>,
     kind: ResourceKind,
@@ -917,6 +921,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             width,
             height,
             backing: BackingState::Detached,
+            backing_mappings: Vec::new(),
             lifecycle: ResourceLifecycle::CreateUncertain,
             backing_bytes: Some(u64::from(width) * u64::from(height) * 4),
             kind: ResourceKind::Legacy2d,
@@ -1164,6 +1169,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             width,
             height,
             backing: BackingState::Detached,
+            backing_mappings: Vec::new(),
             lifecycle: ResourceLifecycle::CreateUncertain,
             backing_bytes: None,
             kind: ResourceKind::Render3d,
@@ -1235,6 +1241,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             width: 0,
             height: 0,
             backing: BackingState::Detached,
+            backing_mappings: Vec::new(),
             lifecycle: ResourceLifecycle::CreateUncertain,
             backing_bytes: Some(blob.size),
             kind,
@@ -1256,14 +1263,41 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             size: blob.size,
         };
         let mut request = header.as_bytes().to_vec();
-        for &(addr, length) in entries {
-            if addr == 0 || length == 0 {
+        let bytes = entries
+            .len()
+            .checked_mul(core::mem::size_of::<MemEntry>())
+            .ok_or(Error::InvalidParam)?;
+        request
+            .try_reserve_exact(bytes)
+            .map_err(|_| Error::DmaError)
+            .or_else(|error| {
                 self.forget_resource(id);
-                return Err(Error::InvalidParam);
+                Err(error)
+            })?;
+        if let Err(error) = self
+            .resource_mut(id)?
+            .backing_mappings
+            .try_reserve_exact(entries.len())
+            .map_err(|_| Error::DmaError)
+        {
+            self.forget_resource(id);
+            return Err(error);
+        }
+        let mappings = if entries.is_empty() {
+            Vec::new()
+        } else {
+            match self.map_backing_entries(entries) {
+                Ok(mappings) => mappings,
+                Err(error) => {
+                    self.forget_resource(id);
+                    return Err(error);
+                }
             }
+        };
+        for (mapping, &(_, length)) in mappings.iter().zip(entries) {
             request.extend_from_slice(
                 MemEntry {
-                    addr,
+                    addr: mapping.device as u64,
                     length,
                     _padding: 0,
                 }
@@ -1276,8 +1310,14 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             PendingControlOperation::CreateBlob(id),
             request,
         ) {
-            Ok(submission) => Ok((id, submission)),
+            Ok(submission) => {
+                self.resource_mut(id)?
+                    .backing_mappings
+                    .extend_from_slice(&mappings);
+                Ok((id, submission))
+            }
             Err(error) => {
+                self.unmap_backing_entries(&mappings);
                 self.forget_resource(id);
                 Err(error)
             }
@@ -1368,6 +1408,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             || resource.backing_bytes.is_some_and(|bytes| total < bytes)
             || resource.backing != BackingState::Detached
             || resource.lifecycle != ResourceLifecycle::Live
+            || !resource.backing_mappings.is_empty()
         {
             return Err(Error::InvalidParam);
         }
@@ -1390,22 +1431,38 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             .try_reserve_exact(bytes)
             .map_err(|_| Error::DmaError)?;
         request.extend_from_slice(header.as_bytes());
-        for &(addr, length) in entries {
+        self.resource_mut(id)?
+            .backing_mappings
+            .try_reserve_exact(entries.len())
+            .map_err(|_| Error::DmaError)?;
+        let mappings = self.map_backing_entries(entries)?;
+        for (mapping, &(_, length)) in mappings.iter().zip(entries) {
             request.extend_from_slice(
                 MemEntry {
-                    addr,
+                    addr: mapping.device as u64,
                     length,
                     _padding: 0,
                 }
                 .as_bytes(),
             );
         }
-        self.enqueue_control_submission(
+        match self.enqueue_control_submission(
             fence,
             0,
             PendingControlOperation::AttachBacking(id),
             request,
-        )
+        ) {
+            Ok(submission) => {
+                self.resource_mut(id)?
+                    .backing_mappings
+                    .extend_from_slice(&mappings);
+                Ok(submission)
+            }
+            Err(error) => {
+                self.unmap_backing_entries(&mappings);
+                Err(error)
+            }
+        }
     }
 
     pub fn submit_detach_backing(&mut self, id: ResourceId) -> Result<GpuSubmission> {
@@ -1891,10 +1948,12 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 Ok(())
             }
             PendingControlOperation::DetachBacking(resource) => {
+                self.release_resource_backing(resource)?;
                 self.resource_mut(resource)?.backing = BackingState::Detached;
                 Ok(())
             }
             PendingControlOperation::UnrefResource(resource) => {
+                self.release_resource_backing(resource)?;
                 self.forget_resource(resource);
                 Ok(())
             }
@@ -2085,6 +2144,18 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 data: GpuCompletionData::None,
             });
         }
+        // Reset completion is the only proof available that the device has
+        // stopped using resource backing addresses after an uncertain command.
+        let requester = self.control_queue.dma_requester();
+        for resource in &mut self.resources {
+            for mapping in resource.backing_mappings.drain(..).rev() {
+                // SAFETY: transport reset above quiesced all device DMA.
+                unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) };
+            }
+            resource.backing = BackingState::Detached;
+            resource.mapped = false;
+            resource.map_offset = None;
+        }
         let count = core::cmp::min(out.len(), self.terminal_control.len());
         for slot in out.iter_mut().take(count) {
             *slot = self.terminal_control.swap_remove(0);
@@ -2104,6 +2175,75 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             .find(|r| r.id == id)
             .ok_or(Error::InvalidParam)
     }
+
+    fn map_backing_entries(&self, entries: &[(u64, u32)]) -> Result<Vec<DmaMapping>> {
+        if entries.is_empty() || entries.len() > MAX_SG_ENTRIES {
+            return Err(Error::InvalidParam);
+        }
+        let requester = self.control_queue.dma_requester();
+        let mut mappings = Vec::new();
+        mappings
+            .try_reserve_exact(entries.len())
+            .map_err(|_| Error::DmaError)?;
+        for &(physical, length) in entries {
+            let length = usize::try_from(length).map_err(|_| Error::InvalidParam)?;
+            if physical == 0
+                || length == 0
+                || physical % PAGE_SIZE as u64 != 0
+                || !length.is_multiple_of(PAGE_SIZE)
+            {
+                self.unmap_backing_entries(&mappings);
+                return Err(Error::InvalidParam);
+            }
+            // SAFETY: caller keeps each physical range pinned until resource
+            // detach/unref completes; the returned mapping is retained below.
+            let mapping = match unsafe {
+                H::map_physical_for(requester, physical as usize, length, BufferDirection::Both)
+            } {
+                Ok(mapping) => mapping,
+                Err(_) => {
+                    self.unmap_backing_entries(&mappings);
+                    return Err(Error::DmaError);
+                }
+            };
+            if mapping.source as u64 != physical
+                || mapping.len != length
+                || mapping.device == 0
+                || !mapping.device.is_multiple_of(PAGE_SIZE)
+            {
+                // SAFETY: the just-created mapping must be retired before the
+                // caller is allowed to reuse its pinned source pages.
+                unsafe {
+                    H::unmap_physical_for(requester, mapping, BufferDirection::Both);
+                }
+                self.unmap_backing_entries(&mappings);
+                return Err(Error::DmaError);
+            }
+            mappings.push(mapping);
+        }
+        Ok(mappings)
+    }
+
+    fn unmap_backing_entries(&self, mappings: &[DmaMapping]) {
+        let requester = self.control_queue.dma_requester();
+        for mapping in mappings.iter().rev().copied() {
+            // SAFETY: callers invoke this only after queue publication failed,
+            // a detach/unref completion retired host access, or transport reset.
+            unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) };
+        }
+    }
+
+    fn release_resource_backing(&mut self, id: ResourceId) -> Result {
+        let requester = self.control_queue.dma_requester();
+        let resource = self.resource_mut(id)?;
+        for mapping in resource.backing_mappings.drain(..).rev() {
+            // SAFETY: detach/unref completion or transport reset proves the
+            // host no longer owns these resource pages.
+            unsafe { H::unmap_physical_for(requester, mapping, BufferDirection::Both) };
+        }
+        Ok(())
+    }
+
     fn forget_resource(&mut self, id: ResourceId) {
         if let Some(index) = self.resources.iter().position(|resource| resource.id == id) {
             self.resources.swap_remove(index);
@@ -2255,7 +2395,13 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
 }
 impl<H: Hal, T: Transport> Drop for VirtIOGpu<H, T> {
     fn drop(&mut self) {
-        if !self.pending_control.is_empty() || !self.pending_cursor.is_empty() {
+        if !self.pending_control.is_empty()
+            || !self.pending_cursor.is_empty()
+            || self
+                .resources
+                .iter()
+                .any(|resource| !resource.backing_mappings.is_empty())
+        {
             // Published descriptors may still be DMA-visible. Reset before
             // queue teardown; asynchronous resource cleanup is owned by the
             // caller before dropping the driver.
@@ -2991,5 +3137,100 @@ mod tests {
         unsafe {
             drop(Box::from_raw(config.as_ptr()));
         }
+    }
+
+    #[test]
+    fn resource_backing_mapping_lives_until_detach_ack() {
+        use alloc::{boxed::Box, sync::Arc, vec};
+        use core::ptr::NonNull;
+        use std::sync::Mutex;
+
+        use crate::{
+            hal::fake::FakeHal,
+            transport::{
+                DeviceType,
+                fake::{FakeTransport, QueueStatus, State},
+            },
+        };
+
+        let mut config = Box::new(unsafe { core::mem::zeroed::<Config>() });
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default(), QueueStatus::default()],
+            ..State::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::GPU,
+            max_queue_size: QUEUE_SIZE as u32,
+            device_features: 0,
+            config_space: NonNull::from(config.as_mut()),
+            state: state.clone(),
+        };
+        let mut gpu = VirtIOGpu::<FakeHal, _>::new(transport).unwrap();
+        let id = ResourceId(7);
+        gpu.resources.push(Resource {
+            id,
+            width: 32,
+            height: 32,
+            backing: BackingState::Detached,
+            backing_mappings: Vec::new(),
+            lifecycle: ResourceLifecycle::Live,
+            backing_bytes: Some(PAGE_SIZE as u64),
+            kind: ResourceKind::Legacy2d,
+            uuid: None,
+            mapped: false,
+            map_offset: None,
+        });
+
+        let attach = gpu
+            .submit_attach_backing_entries(id, &[(0x4000, PAGE_SIZE as u32)])
+            .unwrap();
+        assert_eq!(gpu.resource(id).unwrap().backing_mappings.len(), 1);
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE_TRANSMIT, |input| {
+                    let header = CtrlHeader::read_from_prefix(&input).unwrap();
+                    assert_eq!(header.hdr_type, Command::RESOURCE_ATTACH_BACKING);
+                    let offset = core::mem::size_of::<ResourceAttachBackingHeader>();
+                    assert_eq!(
+                        u64::from_le_bytes(input[offset..offset + 8].try_into().unwrap()),
+                        0x4000
+                    );
+                    let mut response = input[..24].to_vec();
+                    response[..4].copy_from_slice(&Command::OK_NODATA.0.to_le_bytes());
+                    response
+                })
+        );
+        let mut out = [GpuCompletion {
+            fence_id: attach.fence_id,
+            result: Err(Error::IoError),
+            data: GpuCompletionData::None,
+        }];
+        assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 1);
+        assert_eq!(out[0].result, Ok(()));
+        assert_eq!(gpu.resource(id).unwrap().backing, BackingState::Attached);
+
+        let detach = gpu.submit_detach_backing(id).unwrap();
+        assert_eq!(gpu.resource(id).unwrap().backing_mappings.len(), 1);
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE_TRANSMIT, |input| {
+                    assert_eq!(
+                        CtrlHeader::read_from_prefix(&input).unwrap().hdr_type,
+                        Command::RESOURCE_DETACH_BACKING
+                    );
+                    let mut response = input[..24].to_vec();
+                    response[..4].copy_from_slice(&Command::OK_NODATA.0.to_le_bytes());
+                    response
+                })
+        );
+        out[0].fence_id = detach.fence_id;
+        assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 1);
+        assert_eq!(out[0].result, Ok(()));
+        assert_eq!(gpu.resource(id).unwrap().backing, BackingState::Detached);
+        assert!(gpu.resource(id).unwrap().backing_mappings.is_empty());
     }
 }
