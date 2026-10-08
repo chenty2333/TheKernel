@@ -1533,14 +1533,19 @@ fn n305_guc_ads_input(
             logical_index: 0,
         },
     ]; // RCS0 + BCS0
+    // `setup_logical_ids()` compacts enabled VDBOX instances in physical map
+    // order {0, 2, 4, 6, 1, 3, 5, 7}; ADL-N's platform mask contains VCS0 and
+    // VCS2, so VCS2's GuC logical index is 1 while its physical instance is 2.
+    let mut logical_video = 0u8;
     let mut sfc_mask = 0u32;
     for instance in [0u8, 2] {
         if vdbox_mask & (1 << instance) != 0 {
             engines.push(EngineMapEntry {
                 guc_class: 1,
                 instance,
-                logical_index: instance,
+                logical_index: logical_video,
             });
+            logical_video += 1;
             // On Gen12, each enabled even physical VDBOX is attached to SFC.
             sfc_mask |= 1 << instance;
         }

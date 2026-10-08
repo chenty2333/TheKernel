@@ -1376,6 +1376,24 @@ mod tests {
                 GLOBAL_POLICY_DISABLE_ENGINE_RESET
             )
         );
+        // ADL-N exposes physical VCS0/VCS2, but upstream's logical-id map
+        // compacts these to logical 0/1 while the table retains physical IDs.
+        let video = [
+            EngineMapEntry {
+                guc_class: 1,
+                instance: 0,
+                logical_index: 0,
+            },
+            EngineMapEntry {
+                guc_class: 1,
+                instance: 2,
+                logical_index: 1,
+            },
+        ];
+        let video_masks = fill_engine_enable_masks(&video).unwrap();
+        let video_mapping = guc_mapping_table_init(&video).unwrap();
+        assert_eq!(video_masks[1], 0b0101);
+        assert_eq!(&video_mapping[1][..2], &[0, 2]);
         let mut masks = [0; GUC_MAX_ENGINE_CLASSES];
         masks[0] = 1;
         masks[4] = 2;
