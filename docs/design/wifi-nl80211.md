@@ -1,10 +1,37 @@
-# nl80211 generic-netlink boundary
+# nl80211 generic-netlink surface
 
-The family resolver advertises `nl80211` (UAPI family name/version and scan,
-regulatory, mlme, config, vendor, nan and testmode multicast groups). The
-no-radio `GET_WIPHY` and `GET_INTERFACE` dump paths terminate with an empty
-multipart `NLMSG_DONE`, which is the expected result for `iw phy` and `iw dev`
-when no radio is registered. A registered radio is deliberately not reported
-as an empty dump: concrete wiphy/interface records and command-backed state
-transitions remain to be implemented. Userland WPA handshakes remain assigned
-to unmodified wpa_supplicant rather than kernel PAE.
+## User-space command audit
+
+The reference audit uses the BSD-licensed wpa_supplicant nl80211 backend at
+Google's source mirror, revision `5460547`: `src/drivers/driver_nl80211.c`,
+`driver_nl80211_scan.c`, and `driver_nl80211_event.c`.
+
+The backend first resolves generic-netlink family `nl80211`, subscribes to the
+returned multicast groups, and queries GET_INTERFACE and GET_WIPHY. Its station
+path uses TRIGGER_SCAN followed by GET_SCAN and scan-result/scan-aborted
+notifications; connection paths use CONNECT or AUTHENTICATE/ASSOCIATE, followed
+by NEW_KEY/SET_KEY/GET_KEY/DEL_KEY as applicable. Teardown uses DISCONNECT or
+authentication/disassociation commands. Status and policy queries include
+GET_STATION and REG_GET. The event dispatch consumes scan, connect/roam,
+disconnect, auth/assoc/deauth/disassoc, MIC-failure, and regulatory events.
+The exact path varies with the selected nl80211 capability and key-management
+offload mode.
+
+Sources:
+
+- <https://android.googlesource.com/platform/external/wpa_supplicant_8/%2B/5460547/src/drivers/driver_nl80211.c>
+- <https://android.googlesource.com/platform/external/wpa_supplicant_8/%2B/5460547/src/drivers/driver_nl80211_scan.c>
+- <https://android.googlesource.com/platform/external/wpa_supplicant_8/%2B/5460547/src/drivers/driver_nl80211_event.c>
+- UAPI layouts and numeric values: Linux 7.2.3 `include/uapi/linux/nl80211.h` (ISC grant; full text in `kernel/LICENSES/ISC.txt`).
+
+## Current implementation boundary
+
+The kernel registers the family id/name and multicast-group names and encodes
+GET_INTERFACE/GET_WIPHY records from the wireless-link registry. Both dump
+requests return a multipart NLMSG_DONE when there are no wireless devices,
+which is the empty-radio path used by `iw dev` and `iw phy`. The registered-radio
+record path currently carries interface identity and station type; it does not
+yet implement bands/frequencies or the command/event operations listed above.
+It therefore does not advertise scan, connection, key, regulatory, or station
+operations as available. The required no-radio QEMU acceptance is deferred
+until the task-5 command surface is complete; no fake radio is used.
