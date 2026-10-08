@@ -9,6 +9,7 @@
 // MIT permission text: ../LICENSE-MIT. HDMI packet writes are typed and caller-owned.
 use crate::{
     Error,
+    device::Platform,
     display::{Pipe, ReadoutIo, Timings},
     hdmi_packet::{Avi, Drm, Infoframe, Spd, hdmi_infoframe_unpack},
 };
@@ -100,6 +101,79 @@ pub fn hsw_read_infoframe(
     }
     Ok(RawInfoframe { raw, kind })
 }
+/// Source BPC ceilings selected by the display version and the ADL-S 600-MHz SKU.
+// upstream: intel_hdmi.c intel_hdmi_source_max_tmds_clock()
+pub fn intel_hdmi_source_max_tmds_clock(
+    display_version: u8,
+    platform: Platform,
+    vbt_max_tmds_clock: Option<u32>,
+) -> u32 {
+    let mut max_clock = if display_version >= 13 || platform == Platform::AlderLakeS {
+        600_000
+    } else if display_version >= 10 {
+        594_000
+    } else if display_version >= 8 {
+        300_000
+    } else if display_version >= 5 {
+        225_000
+    } else {
+        165_000
+    };
+    if let Some(vbt_max) = vbt_max_tmds_clock.filter(|clock| *clock != 0) {
+        max_clock = max_clock.min(vbt_max);
+    }
+    max_clock
+}
+
+/// HDMI TMDS character rate, including YCbCr 4:2:0 and deep-color scaling.
+// upstream: intel_hdmi.c intel_hdmi_tmds_clock()
+pub fn intel_hdmi_tmds_clock(pixel_clock_khz: u32, bpc: u8, format: HdmiOutputFormat) -> u32 {
+    let clock = if format == HdmiOutputFormat::Ycbcr420 {
+        pixel_clock_khz / 2
+    } else {
+        pixel_clock_khz
+    };
+    (clock * u32::from(bpc) + 4) / 8
+}
+
+/// Whether the source hardware can generate this HDMI component depth.
+// upstream: intel_hdmi.c intel_hdmi_source_bpc_possible()
+pub const fn intel_hdmi_source_bpc_possible(display_version: u8, has_gmch: bool, bpc: u8) -> bool {
+    match bpc {
+        12 => !has_gmch,
+        10 => display_version >= 11,
+        8 => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HdmiSinkBpc {
+    pub has_hdmi_sink: bool,
+    pub y420_dc_modes: u8,
+    pub rgb444_dc_modes: u8,
+}
+
+/// Check the sink's EDID deep-color bits for RGB or YCbCr 4:2:0 output.
+// upstream: intel_hdmi.c intel_hdmi_sink_bpc_possible()
+pub const fn intel_hdmi_sink_bpc_possible(
+    sink: HdmiSinkBpc,
+    bpc: u8,
+    format: HdmiOutputFormat,
+) -> bool {
+    let is_420 = matches!(format, HdmiOutputFormat::Ycbcr420);
+    match bpc {
+        12 if !sink.has_hdmi_sink => false,
+        12 if is_420 => sink.y420_dc_modes & (1 << 1) != 0,
+        12 => sink.rgb444_dc_modes & (1 << 5) != 0,
+        10 if !sink.has_hdmi_sink => false,
+        10 if is_420 => sink.y420_dc_modes & (1 << 0) != 0,
+        10 => sink.rgb444_dc_modes & (1 << 4) != 0,
+        8 => true,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HdmiOutputFormat {
     Rgb,
@@ -463,6 +537,56 @@ mod write_tests {
             set_context_latency: 0,
             interlaced: false,
         }
+    }
+
+    #[test]
+    fn source_tmds_clock_and_source_sink_bpc_gates_match_i915() {
+        assert_eq!(
+            intel_hdmi_source_max_tmds_clock(12, Platform::TigerLake, None),
+            594_000
+        );
+        assert_eq!(
+            intel_hdmi_source_max_tmds_clock(12, Platform::AlderLakeS, Some(590_000)),
+            590_000
+        );
+        assert_eq!(
+            intel_hdmi_source_max_tmds_clock(13, Platform::AlderLakeN, Some(0)),
+            600_000
+        );
+        assert_eq!(
+            intel_hdmi_tmds_clock(148_500, 8, HdmiOutputFormat::Rgb),
+            148_500
+        );
+        assert_eq!(
+            intel_hdmi_tmds_clock(297_000, 10, HdmiOutputFormat::Ycbcr420),
+            185_625
+        );
+        assert!(!intel_hdmi_source_bpc_possible(12, true, 12));
+        assert!(intel_hdmi_source_bpc_possible(13, false, 12));
+        assert!(intel_hdmi_source_bpc_possible(12, false, 10));
+        let sink = HdmiSinkBpc {
+            has_hdmi_sink: true,
+            y420_dc_modes: 0b11,
+            rgb444_dc_modes: (1 << 4) | (1 << 5),
+        };
+        assert!(intel_hdmi_sink_bpc_possible(
+            sink,
+            12,
+            HdmiOutputFormat::Ycbcr420
+        ));
+        assert!(intel_hdmi_sink_bpc_possible(
+            sink,
+            10,
+            HdmiOutputFormat::Rgb
+        ));
+        assert!(!intel_hdmi_sink_bpc_possible(
+            HdmiSinkBpc {
+                has_hdmi_sink: false,
+                ..sink
+            },
+            10,
+            HdmiOutputFormat::Rgb
+        ));
     }
 
     #[test]

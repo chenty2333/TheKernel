@@ -661,3 +661,6 @@ Intel).
 state machine from `intel_tc.c` (MIT, Copyright © 2019 Intel); the only omitted
 applicable source function is the C pointer cast `to_tc_port()`. The complete
 MIT grant is in `LICENSE-MIT`.
+
+`tk-intel-display/src/hdmi.rs` also includes HDMI TMDS rate calculation and
+source/sink BPC gating from `intel_hdmi.c` (MIT, © 2006-2009 Intel).
