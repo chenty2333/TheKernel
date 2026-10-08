@@ -164,3 +164,6 @@ src/guc_fw.rs includes the Gen12.0 register/value portion of
 intel_guc_fw.c guc_prepare_xfer() (MIT, Copyright © 2014-2019 Intel).
 src/guc_fw.rs additionally maps intel_guc_fw.c guc_wait_ucode() default three
 one-second readiness polls; an abstract status reader replaces Linux uncore.
+src/uc.rs also ports intel_uc_fw.c intel_uc_check_file_version() major
+validation and old-minor/patch reporting for the supported no-override path
+(MIT, Copyright © 2016-2019 Intel Corporation).

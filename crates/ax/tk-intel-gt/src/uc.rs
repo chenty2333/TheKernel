@@ -59,6 +59,8 @@ pub struct CssInfo {
 pub enum FirmwareError {
     Missing,
     Css(CssError),
+    VersionRange,
+    UnexpectedVersion,
 }
 
 pub struct FirmwareImage {
@@ -80,6 +82,16 @@ pub fn load(
             continue;
         };
         let css = parse_css(&bytes, wopcm_bytes).map_err(FirmwareError::Css)?;
+        check_file_version(blob.version, css.version, false)
+            .map_err(|_| FirmwareError::UnexpectedVersion)?;
+        if kind == Kind::GuC
+            && !guc_versions_valid(
+                css.version,
+                guc_css_info(blob.version, css).submission_version,
+            )
+        {
+            return Err(FirmwareError::VersionRange);
+        }
         return Ok(FirmwareImage {
             blob: *blob,
             css,
@@ -87,6 +99,22 @@ pub fn load(
         });
     }
     Err(FirmwareError::Missing)
+}
+
+/// upstream: intel_uc_fw.c intel_uc_check_file_version()
+/// Return whether an accepted file is older than the version table entry.
+pub fn check_file_version(
+    wanted: (u8, u8, u8),
+    selected: (u8, u8, u8),
+    overridden: bool,
+) -> Result<bool, ()> {
+    if wanted.0 == 0 || selected.0 == 0 {
+        return Ok(false);
+    }
+    if selected.0 != wanted.0 {
+        return if overridden { Ok(false) } else { Err(()) };
+    }
+    Ok((selected.1, selected.2) < (wanted.1, wanted.2))
 }
 
 // upstream: intel_uc_fw.c __check_ccs_header()
@@ -163,6 +191,16 @@ fn unpack_css_version(value: u32) -> (u8, u8, u8) {
 pub struct GucCssInfo {
     pub submission_version: (u8, u8, u8),
     pub private_data_bytes: usize,
+}
+
+// upstream: intel_uc_fw.c is_ver_8bit()
+fn is_ver_8bit(version: (u8, u8, u8)) -> bool {
+    version.0 < 0xff && version.1 < 0xff && version.2 < 0xff
+}
+
+// upstream: intel_uc_fw.c guc_check_version_range()
+pub fn guc_versions_valid(firmware: (u8, u8, u8), submission: (u8, u8, u8)) -> bool {
+    is_ver_8bit(firmware) && is_ver_8bit(submission)
 }
 
 // upstream: intel_uc_fw.c guc_read_css_info()
@@ -389,5 +427,19 @@ mod tests {
         assert_eq!(guc_css_info((70, 1, 1), css).submission_version, (1, 0, 0));
         assert_eq!(guc_css_info((69, 0, 3), css).submission_version, (0, 10, 0));
         assert_eq!(guc_css_info((68, 1, 0), css).submission_version, (0, 1, 0));
+        assert!(guc_versions_valid((70, 12, 1), (2, 3, 4)));
+        assert!(!guc_versions_valid((255, 12, 1), (2, 3, 4)));
+        assert!(!guc_versions_valid((70, 12, 1), (2, 255, 4)));
+    }
+
+    #[test]
+    fn file_version_check_matches_major_and_marks_older_minor_patch() {
+        assert_eq!(
+            check_file_version((70, 12, 1), (70, 12, 1), false),
+            Ok(false)
+        );
+        assert_eq!(check_file_version((70, 12, 1), (70, 1, 1), false), Ok(true));
+        assert_eq!(check_file_version((70, 12, 1), (69, 0, 3), false), Err(()));
+        assert_eq!(check_file_version((0, 0, 0), (7, 9, 3), false), Ok(false));
     }
 }
