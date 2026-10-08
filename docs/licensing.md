@@ -527,3 +527,10 @@ libgallium from the existing same-version source/CLC/toolchain, retaining the
 Mesa/Buildroot package license obligations already registered above. No Mesa
 binary is committed. The dedicated flavor and loader check are original
 project scripts; they do not import a LinuxKPI, GPL driver body or new firmware.
+
+The optional AX211 rootfs payload stages only the linux-firmware
+`iwlwifi-so-a0-gf-a0-89.ucode` API 89 image and matching
+`iwlwifi-so-a0-gf-a0.pnvm`; it copies the upstream `LICENCE.iwlwifi_firmware`
+to `/usr/share/licenses/linux-firmware/` next to the payload's license record.
+These firmware binaries are supplied by the caller via
+`THEKERNEL_IWX_FIRMWARE_DIR` and are not checked into this repository.

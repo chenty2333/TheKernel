@@ -15,6 +15,14 @@ The `iwx_2ax_cfg_so_gf_a0` config is the AX211, one-stream (2AX), So-family GF c
 - Use userspace `wpa_supplicant` for the standard WPA four-way handshake through nl80211; avoid duplicating the PAE path in the kernel for this initial implementation.
 - Expose the station interface through `axnet-ng`, with wireless state via nl80211/sysfs/rfkill. Do not port GPL cfg80211/mac80211; implement protocol behavior from the UAPI/spec instead.
 
-## Not in this identification task
+## Firmware payload packaging
 
-No driver/protocol implementation or firmware packaging is included in this initial identification change. Firmware binary redistribution/licensing and the precise set of nl80211 operations required by `wpa_supplicant` remain to be established during the respective tasks.
+`scripts/build-iwx-firmware-payload.sh` stages only the linux-firmware API 89
+So/GF ucode and matching PNVM, validates the ucode header/API and size caps, and
+copies `LICENCE.iwlwifi_firmware` into `/usr/share/licenses/linux-firmware/`.
+`scripts/build-rootfs.sh` invokes it when `THEKERNEL_IWX_FIRMWARE_DIR` points
+to a linux-firmware checkout/package tree; firmware binaries remain external
+inputs and are not committed.
+
+The `wpa_supplicant` nl80211 command/event set and remaining full driver and
+net80211 implementation are still part of the later task items.

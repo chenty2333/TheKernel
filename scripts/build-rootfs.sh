@@ -44,6 +44,8 @@ Environment overrides:
                                 the payload itself is staged separately
   THEKERNEL_ROOTFS_TOOLS_DIR  tree of guest tools to copy into the image
   THEKERNEL_ROOTFS_SIZE_MB    image size (default: 160)
+  THEKERNEL_IWX_FIRMWARE_DIR  linux-firmware tree with AX211 API 89 ucode,
+                              PNVM and LICENCE.iwlwifi_firmware
   THEKERNEL_SOURCE_CACHE      Download cache
 EOF
 }
@@ -408,6 +410,14 @@ if [ -n "${THEKERNEL_RTL8168_FIRMWARE_DIR:-}" ]; then
     done
     install -d "$STAGE/lib/firmware/rtl_nic"
     install -m 0644 "$firmware_dir/rtl8168h-2.fw" "$firmware_dir/LICENSE.r8169" "$STAGE/lib/firmware/rtl_nic/"
+fi
+
+# The AX211 payload is opt-in and sourced from a caller-supplied linux-firmware
+# tree. Validate its API, stage only the matching So/GF files, and carry Intel's
+# firmware grant alongside them.
+if [ -n "${THEKERNEL_IWX_FIRMWARE_DIR:-}" ]; then
+    "$SCRIPT_DIR/build-iwx-firmware-payload.sh" \
+        --source-dir "$THEKERNEL_IWX_FIRMWARE_DIR" --output "$STAGE"
 fi
 
 "$SCRIPT_DIR/create-rootfs-image.sh" \
