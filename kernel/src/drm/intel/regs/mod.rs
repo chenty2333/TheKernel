@@ -982,6 +982,10 @@ pub(crate) const BUS: &[Register] = &[
     GPIO_B,
     GPIO_C,
     GPIO_D,
+    GPIO_J,
+    GPIO_K,
+    GPIO_L,
+    GPIO_M,
     SHOTPLUG_CTL_DDI,
     SDEISR,
     SOUTH_CHICKEN1,
@@ -1021,6 +1025,18 @@ pub(crate) const GPIO_C: Register =
 /// GMBUS GPIO block D, the I2C-over-GPIO fallback for DDI C (`GPIOD`).
 pub(crate) const GPIO_D: Register =
     Register::read_write("GPIOD", 0xc501c, Meaning::BusController, None);
+/// GMBUS GPIO block J, the Type-C 1 DDC fallback pair.
+pub(crate) const GPIO_J: Register =
+    Register::read_write("GPIOJ", 0xc5034, Meaning::BusController, None);
+/// GMBUS GPIO block K, the Type-C 2 DDC fallback pair.
+pub(crate) const GPIO_K: Register =
+    Register::read_write("GPIOK", 0xc5038, Meaning::BusController, None);
+/// GMBUS GPIO block L, the Type-C 3 DDC fallback pair.
+pub(crate) const GPIO_L: Register =
+    Register::read_write("GPIOL", 0xc503c, Meaning::BusController, None);
+/// GMBUS GPIO block M, the Type-C 4 DDC fallback pair.
+pub(crate) const GPIO_M: Register =
+    Register::read_write("GPIOM", 0xc5040, Meaning::BusController, None);
 
 /// DDI hotplug control, one four-bit field per DDI (`[I915]`
 /// `i915_reg.h:3078-3085`; reference §9.5).
@@ -1684,6 +1700,10 @@ mod tests {
                 "GPIOB",            // bit-banged DDC for DDI A
                 "GPIOC",            // bit-banged DDC for DDI B
                 "GPIOD",            // bit-banged DDC for DDI C
+                "GPIOJ",            // Type-C port 1 DDC fallback
+                "GPIOK",            // Type-C port 2 DDC fallback
+                "GPIOL",            // Type-C port 3 DDC fallback
+                "GPIOM",            // Type-C port 4 DDC fallback
                 "SHOTPLUG_CTL_DDI", // hotplug enable
                 "SOUTH_CHICKEN1",   // board HPD inversion, when a caller asks
             ]
@@ -1721,6 +1741,24 @@ mod tests {
             assert_eq!(register.offset(), offset, "{}", register.name());
             assert!(register.is_writable(), "{}", register.name());
             assert!(BUS.iter().any(|candidate| *candidate == register));
+        }
+    }
+
+    #[test]
+    fn gmbus_gpio_registers_cover_ddi_and_type_c_fallback_pairs() {
+        let expected = [
+            (GPIO_B, 0xc5014),
+            (GPIO_C, 0xc5018),
+            (GPIO_D, 0xc501c),
+            (GPIO_J, 0xc5034),
+            (GPIO_K, 0xc5038),
+            (GPIO_L, 0xc503c),
+            (GPIO_M, 0xc5040),
+        ];
+        for (register, offset) in expected {
+            assert_eq!(register.offset(), offset);
+            assert!(BUS.iter().any(|candidate| *candidate == register));
+            assert_eq!(register.access, Access::ReadWrite);
         }
     }
 

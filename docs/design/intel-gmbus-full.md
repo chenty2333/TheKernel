@@ -12,7 +12,7 @@ teardown.
 
 `GmbusIo` is the boundary for MMIO, delay and wait queues, IRQ state, power,
 mutexes, GPIO bit-banging and diagnostics. `kernel/src/drm/intel/gmbus_full.rs`
-implements that boundary over typed GMBUS0-5 and GPIO B/C/D registers, the
+implements that boundary over typed GMBUS0-5 and GPIO B/C/D/J/K/L/M registers, the
 GMBUS power-domain manager, and the existing polling timer. The existing
 `gmbus.rs` EDID path now invokes the translated indexed transaction for each
 block and retains EDID validation, diagnostic classification, and retry policy;
@@ -21,8 +21,10 @@ reset, force-bit policy, and source retry behavior come from the translated
 state machine. The upstream MIT grant is preserved in the module header and
 crate `LICENSE-MIT`.
 
-The adapter currently binds the N305 display-13 pin map and DDI A/B/C GPIO
-register instances. Wait-queue wakeups, GMBUS interrupts, and a delayed power
-put are unavailable in this kernel path; the adapter uses bounded polling and
-balanced synchronous power release. TC GPIO J-M and non-N305 platform pin-map
-integration remain outside this connection.
+The adapter currently binds the N305 display-13 pin map and the DDI A/B/C plus
+Type-C 1-4 GPIO register instances. The current EDID scan admits the DDI A/B/C
+pins; Type-C GPIO declarations make the source fallback addressable but do not
+enable TC probe policy. Wait-queue wakeups, GMBUS interrupts, and a delayed
+power put are unavailable in this kernel path; the adapter uses bounded
+polling and balanced synchronous power release. Non-N305 platform pin-map
+integration remains outside this connection.

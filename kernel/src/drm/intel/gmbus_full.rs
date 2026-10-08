@@ -15,7 +15,8 @@ use super::{
     POWER,
     gmbus::{Pin, PollTimer, Rate},
     regs::{
-        GMBUS0, GMBUS1, GMBUS2, GMBUS3, GMBUS4, GMBUS5, GPIO_B, GPIO_C, GPIO_D, Register, Registers,
+        GMBUS0, GMBUS1, GMBUS2, GMBUS3, GMBUS4, GMBUS5, GPIO_B, GPIO_C, GPIO_D, GPIO_J, GPIO_K,
+        GPIO_L, GPIO_M, Register, Registers,
     },
 };
 
@@ -114,6 +115,10 @@ impl<'a, R: Registers, T: PollTimer> KernelGmbusIo<'a, R, T> {
             0x5014 => Ok(GPIO_B),
             0x5018 => Ok(GPIO_C),
             0x501c => Ok(GPIO_D),
+            0x5034 => Ok(GPIO_J),
+            0x5038 => Ok(GPIO_K),
+            0x503c => Ok(GPIO_L),
+            0x5040 => Ok(GPIO_M),
             _ => Err(SourceError::Io),
         }
     }

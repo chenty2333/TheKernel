@@ -55,8 +55,8 @@
 //!   deliberately not doing; completion is polled, bounded and read back, and
 //!   `GMBUS4` is left cleared so no interrupt is asked for.
 //! * The translated `intel_gmbus_full` engine provides the GPIO bit-bang
-//!   fallback after a hardware GMBUS timeout, using the typed GPIO B/C/D
-//!   instances for the DDI A/B/C fallback pins.
+//!   fallback after a hardware GMBUS timeout, using the typed GPIO B/C/D and
+//!   J/M register instances for DDI and Type-C fallback pins.
 //! * It does not parse EDID.  [`read_edid`] returns the bytes of one validated
 //!   128-byte block; the parse belongs to `drm::modes`, which is not in this
 //!   branch yet, so this module stops at bytes and says so rather than growing
