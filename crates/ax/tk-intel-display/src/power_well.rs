@@ -402,4 +402,32 @@ mod tests {
             &[(11, 0x40 | request_mask(0)), (10, 0x80)]
         );
     }
+
+    #[test]
+    fn enabled_requires_driver_request_and_state_unless_bios_is_explicitly_allowed() {
+        let io = Fake::default();
+        let spec = HswWellSpec {
+            name: "PW_A",
+            registers: HswWellRegisters {
+                bios: 1,
+                driver: 2,
+                kvmr: None,
+                debug: 3,
+                fuse_status: 4,
+                gen8_chicken_dcpr1: 5,
+            },
+            index: 0,
+            pg: None,
+            timeout_ms: 1,
+            has_fuses: false,
+            alderlake_pw1_wa: false,
+            irq_pipe_mask: 0,
+        };
+        io.set(1, request_mask(0));
+        io.set(2, state_mask(0));
+        assert!(!hsw_power_well_enabled(&io, spec, false).unwrap());
+        assert!(hsw_power_well_enabled(&io, spec, true).unwrap());
+        io.set(2, request_mask(0) | state_mask(0));
+        assert!(hsw_power_well_enabled(&io, spec, false).unwrap());
+    }
 }

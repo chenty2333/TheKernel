@@ -1312,9 +1312,31 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
             return Ok(true);
         }
         let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
-        read(self.regs, well.register)
-            .map(|value| value & well.state_mask() != 0)
-            .map_err(|_| intel_display::Error::Unavailable(well.register.offset()))
+        let adapter = HswPowerWellAdapter { regs: self.regs };
+        intel_display::power_well::hsw_power_well_enabled(
+            &adapter,
+            intel_display::power_well::HswWellSpec {
+                name: well.name,
+                registers: intel_display::power_well::HswWellRegisters {
+                    bios: well.request_registers.bios.offset(),
+                    driver: well.register.offset(),
+                    kvmr: well.request_registers.kvmr.map(Register::offset),
+                    debug: well.request_registers.debug.offset(),
+                    fuse_status: regs::SKL_FUSE_STATUS.offset(),
+                    gen8_chicken_dcpr1: regs::GEN8_CHICKEN_DCPR_1.offset(),
+                },
+                index: well.index as u8,
+                pg: well.pg,
+                timeout_ms: well.timeout_us.div_ceil(1_000) as u16,
+                has_fuses: well.pg.is_some(),
+                alderlake_pw1_wa: matches!(
+                    self.platform,
+                    DmcPlatform::AlderLakeP | DmcPlatform::AlderLakeN
+                ) && well.pg == Some(SKL_PG1),
+                irq_pipe_mask: well.irq_pipe_mask,
+            },
+            false,
+        )
     }
 }
 

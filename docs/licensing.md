@@ -602,3 +602,7 @@ Copyright © 2022 Intel). Only the Pipe-A domain is integrated at present.
 
 The source `sanitize_disable_power_well_option()` defaulting helper is also
 translated in `tk-intel-display/src/dc_state.rs` (MIT, Copyright © 2022 Intel).
+
+`PowerDomainIo::well_is_enabled()` now delegates to the translated HSW predicate,
+which requires both the driver request and state bits on display 12/13 (MIT,
+Copyright © 2022 Intel).

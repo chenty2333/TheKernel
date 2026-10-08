@@ -1073,3 +1073,7 @@ unintegrated.
 `dc_state.rs` translates `sanitize_disable_power_well_option()` from
 `intel_display_power.c` (MIT, Copyright © 2022 Intel); negative values select
 the source default of disabling power wells.
+
+The kernel mapped power-domain enabled query calls translated
+`hsw_power_well_enabled()` and therefore tests both the driver request and
+state bits, rather than state alone (`intel_display_power_well.c`).
