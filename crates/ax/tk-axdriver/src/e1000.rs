@@ -12,7 +12,10 @@ use core::{ptr::NonNull, time::Duration};
 use axalloc::{UsageKind, global_allocator};
 use axdriver_net::{
     NetDriverOps,
-    e1000::{E1000Hal, E1000Nic, osdep::{E1000PciConfig, read_pci_cfg, write_pci_cfg}},
+    e1000::{
+        E1000Hal, E1000Nic,
+        osdep::{E1000PciConfig, read_pci_cfg, write_pci_cfg},
+    },
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
 use axhal::mem::virt_to_phys;
@@ -168,7 +171,12 @@ pub(crate) fn probe(
     let Some(mmio) = NonNull::new(mapped.as_usize() as *mut u8) else {
         return BusProbeResult::Claimed;
     };
-    let nic = match E1000Nic::<PlatformHal, RING_SIZE>::new(mmio, size) {
+    let nic = match E1000Nic::<PlatformHal, RING_SIZE>::new(
+        mmio,
+        size,
+        false,
+        matches!(info.device_id, 0x1502 | 0x1503),
+    ) {
         Ok(nic) => nic,
         Err(error) => {
             warn!(

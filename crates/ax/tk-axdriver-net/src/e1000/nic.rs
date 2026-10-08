@@ -17,7 +17,10 @@ use core::{
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 
-use super::registers::*;
+use super::{
+    osdep::{E1000RegisterIo, pcim2pci_write},
+    registers::*,
+};
 use crate::{EthernetAddress, NetBufPtr, NetDriverOps};
 
 pub const RX_BUFFER_BYTES: usize = 2048;
@@ -134,6 +137,8 @@ pub struct E1000Nic<H: E1000Hal, const QS: usize = 128> {
     mmio: NonNull<u8>,
     mmio_size: usize,
     mac: [u8; 6],
+    advanced_queues: bool,
+    pcim2pci: bool,
     rx_desc: DmaAllocation<H>,
     tx_desc: DmaAllocation<H>,
     rx_pool: BufferPool<H>,
@@ -161,7 +166,12 @@ unsafe impl<H: E1000Hal, const QS: usize> Sync for E1000Nic<H, QS> {}
 impl<H: E1000Hal, const QS: usize> E1000Nic<H, QS> {
     /// Adapt the FreeBSD attach order to TheKernel's MMIO, DMA and netdev interfaces.
     // upstream: if_em.c em_attach_pre()
-    pub fn new(mmio: NonNull<u8>, mmio_size: usize) -> DevResult<Self> {
+    pub fn new(
+        mmio: NonNull<u8>,
+        mmio_size: usize,
+        advanced_queues: bool,
+        pcim2pci: bool,
+    ) -> DevResult<Self> {
         if QS < 8 || !QS.is_power_of_two() || QS > u16::MAX as usize || mmio_size < 0x6000 {
             return Err(DevError::InvalidParam);
         }
@@ -185,6 +195,8 @@ impl<H: E1000Hal, const QS: usize> E1000Nic<H, QS> {
             mmio,
             mmio_size,
             mac,
+            advanced_queues,
+            pcim2pci,
             rx_desc,
             tx_desc,
             rx_pool,
@@ -230,6 +242,13 @@ impl<H: E1000Hal, const QS: usize> E1000Nic<H, QS> {
     }
 
     fn write(&mut self, offset: u32, value: u32) -> DevResult {
+        if self.pcim2pci && (offset == tx_desc_tail(0) || offset == rx_desc_tail(0)) {
+            return pcim2pci_write(self, offset, value);
+        }
+        self.write_raw(offset, value)
+    }
+
+    fn write_raw(&mut self, offset: u32, value: u32) -> DevResult {
         if (offset as usize)
             .checked_add(4)
             .is_none_or(|end| end > self.mmio_size)
@@ -576,6 +595,24 @@ impl<H: E1000Hal, const QS: usize> NetDriverOps for E1000Nic<H, QS> {
         let slot = self.tx_free.pop().ok_or(DevError::Again)?;
         self.tx_in_flight[slot] = true;
         Self::buffer_for(&self.tx_pool, slot, size)
+    }
+}
+
+impl<H: E1000Hal, const QS: usize> E1000RegisterIo for E1000Nic<H, QS> {
+    fn read_register(&mut self, register: u32) -> DevResult<u32> {
+        self.read(register)
+    }
+
+    fn write_register(&mut self, register: u32, value: u32) -> DevResult {
+        self.write_raw(register, value)
+    }
+
+    fn delay_us(&mut self, micros: u32) {
+        H::delay_us(micros);
+    }
+
+    fn invalid_tail_write(&mut self, direction: &'static str) {
+        log::error!("e1000: invalid {direction} tail write; queue disabled");
     }
 }
 
