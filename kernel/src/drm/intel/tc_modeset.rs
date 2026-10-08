@@ -395,7 +395,10 @@ fn source_hdmi_tmds_clock(mode: &Mode, edid_bytes: &[u8]) -> Option<u32> {
     source_hdmi_tmds_clock_with_limit(mode, sink_limit_khz)
 }
 
-fn source_hdmi_tmds_clock_with_limit(mode: &Mode, sink_limit_khz: Option<u32>) -> Option<u32> {
+pub(super) fn source_hdmi_tmds_clock_with_limit(
+    mode: &Mode,
+    sink_limit_khz: Option<u32>,
+) -> Option<u32> {
     use intel_display::intel_hdmi_full::{
         ClockLimits, HdmiMode, HdmiPortClass, OutputFormat, PortPlatform, SinkCapabilities,
         intel_hdmi_compute_clock,

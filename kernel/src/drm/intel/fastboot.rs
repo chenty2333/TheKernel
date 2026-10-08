@@ -142,11 +142,12 @@ fn firmware_4k30() -> crate::drm::modes::Mode {
 }
 
 fn native_modes(
-    edid: &[u8],
+    edid_bytes: &[u8],
     f: &Firmware,
 ) -> Result<(Vec<NativeMode>, NativeMode, NativeMode), Error> {
     use crate::drm::modes::{Edid, ModeList, collect_modes};
-    let edid = Edid::parse_lossy(edid).map_err(|_| Error::Refused)?;
+    let edid = Edid::parse_lossy(edid_bytes).map_err(|_| Error::Refused)?;
+    let sink_tmds_limit = edid.max_tmds_clock_khz();
     let mut candidates = ModeList::new();
     collect_modes(&edid, &mut candidates);
     let current_timing = firmware_timing(f)?;
@@ -167,6 +168,7 @@ fn native_modes(
         crate::drm::intel::modeset::is_reference_timing(mode)
             && mode.clock_khz == 148_500
             && cta_vic(mode) == Some(16)
+            && super::tc_modeset::source_hdmi_tmds_clock_with_limit(mode, sink_tmds_limit).is_some()
     }) {
         let target = NativeMode {
             timing: target,
@@ -2657,6 +2659,9 @@ mod tests {
         (adapter, r, array)
     }
     fn edid_with_1080p60_vic16() -> Vec<u8> {
+        edid_with_1080p60_vic16_and_max_tmds(None)
+    }
+    fn edid_with_1080p60_vic16_and_max_tmds(max_tmds_5mhz: Option<u8>) -> Vec<u8> {
         let mut edid = crate::drm::intel::gmbus::tests::valid_edid(1).to_vec();
         let base = edid.get_mut(..128).unwrap();
         let checksum = base[..127]
@@ -2667,9 +2672,17 @@ mod tests {
         let mut cta = [0u8; 128];
         cta[0] = 0x02;
         cta[1] = 0x03;
-        cta[2] = 6; // data block collection ends before the checksum
-        cta[4] = 0x41; // one-entry video data block
-        cta[5] = 16; // 1080p60 VIC 16
+        if let Some(max_tmds_5mhz) = max_tmds_5mhz {
+            cta[2] = 14; // HDMI VSDB and one-entry video block
+            cta[4] = 0x67; // 7-byte vendor-specific payload
+            cta[5..12].copy_from_slice(&[0x03, 0x0c, 0x00, 0x00, 0x00, 0x00, max_tmds_5mhz]);
+            cta[12] = 0x41; // one-entry video data block
+            cta[13] = 16; // 1080p60 VIC 16
+        } else {
+            cta[2] = 6; // data block collection ends before the checksum
+            cta[4] = 0x41; // one-entry video data block
+            cta[5] = 16; // 1080p60 VIC 16
+        }
         let checksum = cta[..127]
             .iter()
             .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
@@ -2763,6 +2776,11 @@ mod tests {
         let (modes, preferred, current) = native_modes(&edid, &unproven_baseline).unwrap();
         assert_eq!(preferred, current);
         assert_eq!(modes, vec![current], "inadmissible target stays hidden");
+
+        let capped_edid = edid_with_1080p60_vic16_and_max_tmds(Some(20)); // 100 MHz
+        let (modes, preferred, current) = native_modes(&capped_edid, &a.baseline).unwrap();
+        assert_eq!(preferred, current);
+        assert_eq!(modes, vec![current], "sink-limited target stays hidden");
     }
     #[test]
     fn translated_tc_dpll_readout_matches_firmware_capture() {
