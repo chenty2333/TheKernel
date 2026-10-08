@@ -15,9 +15,10 @@ copied.
 
 Product builds include SDHCI by default. The N305 Intel eMMC (`8086:54c4`) is
 read-only by default; `mmc.allow_write=1` is required to permit writes, and the
-block driver itself enforces the write restriction. The PCI binding does not
-yet translate controller-specific quirk tables, interrupt handling, full
-slot/card removal lifecycle, SDMA/ADMA2, 1.8V switching, tuning, UHS/HS200/HS400,
+block driver itself enforces the write restriction. The PCI binding maps the
+FreeBSD `sdhci_devices[]` IDs and their quirk bits, but does not yet implement
+all behavior attached to those quirks, interrupt handling, full slot/card
+removal lifecycle, SDMA/ADMA2, 1.8V switching, tuning, UHS/HS200/HS400,
 boot/RPMB eMMC child devices, full quirk coverage, interrupt-driven completion,
 and the full upstream function set. Only the user-area eMMC is currently
 published; EXT_CSD partition metadata is read but not exposed as devices.

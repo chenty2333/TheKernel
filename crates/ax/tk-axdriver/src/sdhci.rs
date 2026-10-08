@@ -27,6 +27,136 @@ const SDHCI_BAR_MIN_BYTES: usize = 0x100;
 const INTEL_EMMC_VID: u16 = 0x8086;
 const INTEL_EMMC_DID: u16 = 0x54c4;
 
+#[derive(Clone, Copy)]
+struct SdhciPciId {
+    id: u32,
+    quirks: u32,
+}
+
+// FreeBSD sys/dev/sdhci/sdhci_pci.c sdhci_devices[]; descriptions are omitted
+// because the PCI core owns display naming in TheKernel.
+const SDHCI_PCI_IDS: &[SdhciPciId] = &[
+    SdhciPciId {
+        id: 0x0822_1180,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_FORCE_DMA,
+    },
+    SdhciPciId {
+        id: 0xe822_1180,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_FORCE_DMA
+            | axdriver_block::sdhci::SDHCI_QUIRK_LOWER_FREQUENCY,
+    },
+    SdhciPciId {
+        id: 0xe823_1180,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_LOWER_FREQUENCY,
+    },
+    SdhciPciId {
+        id: 0x8034_104c,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_FORCE_DMA,
+    },
+    SdhciPciId {
+        id: 0x803c_104c,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_FORCE_DMA
+            | axdriver_block::sdhci::SDHCI_QUIRK_WAITFOR_RESET_ASSERTED,
+    },
+    SdhciPciId {
+        id: 0x0550_1524,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_TIMINGS,
+    },
+    SdhciPciId {
+        id: 0x0551_1524,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_TIMINGS,
+    },
+    SdhciPciId {
+        id: 0x0750_1524,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_RESET_ON_IOS
+            | axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_TIMINGS,
+    },
+    SdhciPciId {
+        id: 0x0751_1524,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_RESET_ON_IOS
+            | axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_TIMINGS,
+    },
+    SdhciPciId {
+        id: 0x4101_11ab,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_INCR_TIMEOUT_CONTROL,
+    },
+    SdhciPciId {
+        id: 0x2381_197b,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_32BIT_DMA_SIZE
+            | axdriver_block::sdhci::SDHCI_QUIRK_RESET_AFTER_REQUEST,
+    },
+    SdhciPciId {
+        id: 0x16bc_14e4,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_BCM577XX_400KHZ_CLKSRC,
+    },
+    SdhciPciId {
+        id: 0x0f14_8086,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_INTEL_POWER_UP_RESET
+            | axdriver_block::sdhci::SDHCI_QUIRK_WAIT_WHILE_BUSY
+            | axdriver_block::sdhci::SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400
+            | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN,
+    },
+    SdhciPciId {
+        id: 0x0f15_8086,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_WAIT_WHILE_BUSY
+            | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN,
+    },
+    SdhciPciId {
+        id: 0x0f50_8086,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_INTEL_POWER_UP_RESET
+            | axdriver_block::sdhci::SDHCI_QUIRK_WAIT_WHILE_BUSY
+            | axdriver_block::sdhci::SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400
+            | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN,
+    },
+    SdhciPciId {
+        id: 0x19db_8086,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_INTEL_POWER_UP_RESET
+            | axdriver_block::sdhci::SDHCI_QUIRK_WAIT_WHILE_BUSY
+            | axdriver_block::sdhci::SDHCI_QUIRK_MMC_DDR52
+            | axdriver_block::sdhci::SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400
+            | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN,
+    },
+    SdhciPciId {
+        id: 0x2294_8086,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_DATA_TIMEOUT_1MHZ
+            | axdriver_block::sdhci::SDHCI_QUIRK_INTEL_POWER_UP_RESET
+            | axdriver_block::sdhci::SDHCI_QUIRK_WAIT_WHILE_BUSY
+            | axdriver_block::sdhci::SDHCI_QUIRK_MMC_DDR52
+            | axdriver_block::sdhci::SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400
+            | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN,
+    },
+    SdhciPciId {
+        id: 0x2296_8086,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_WAIT_WHILE_BUSY
+            | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN,
+    },
+    SdhciPciId {
+        id: 0x5aca_8086,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_DMA
+            | axdriver_block::sdhci::SDHCI_QUIRK_WAIT_WHILE_BUSY
+            | axdriver_block::sdhci::SDHCI_QUIRK_SLOTTYPE_BROKEN
+            | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN,
+    },
+    SdhciPciId {
+        id: 0x5acc_8086,
+        quirks: axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_DMA
+            | axdriver_block::sdhci::SDHCI_QUIRK_INTEL_POWER_UP_RESET
+            | axdriver_block::sdhci::SDHCI_QUIRK_WAIT_WHILE_BUSY
+            | axdriver_block::sdhci::SDHCI_QUIRK_MMC_DDR52
+            | axdriver_block::sdhci::SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400
+            | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN,
+    },
+];
+
+// upstream: sdhci_pci.c sdhci_devices[] match
+fn quirks_for_device(vendor_id: u16, device_id: u16) -> u32 {
+    let id = (u32::from(device_id) << 16) | u32::from(vendor_id);
+    SDHCI_PCI_IDS
+        .iter()
+        .find(|entry| entry.id == id)
+        .map_or(0, |entry| entry.quirks)
+}
+
 struct SdhciWindow {
     base: NonNull<u8>,
     size: usize,
@@ -122,7 +252,8 @@ pub(crate) fn probe(
     let capabilities = io.read32(SDHCI_CAPABILITIES as usize);
     let capabilities2 = io.read32(SDHCI_CAPABILITIES2 as usize);
     let version = (io.read16(SDHCI_HOST_VERSION as usize) & SDHCI_SPEC_VER_MASK as u16) as u8;
-    let host = SdhciHost::new(io, capabilities, capabilities2, version);
+    let quirks = quirks_for_device(info.vendor_id, info.device_id);
+    let host = SdhciHost::new_with_quirks(io, capabilities, capabilities2, version, quirks);
     let mut disk = match SdhciDisk::attach(host) {
         Ok(disk) => disk,
         Err(error) => {
@@ -177,5 +308,24 @@ pub(crate) fn probe(
         BusProbeResult::Claimed
     } else {
         BusProbeResult::Devices(devices)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn freebsd_pci_quirks_are_selected_for_exact_controller_ids() {
+        assert_eq!(
+            quirks_for_device(0x8086, 0x5acc),
+            axdriver_block::sdhci::SDHCI_QUIRK_BROKEN_DMA
+                | axdriver_block::sdhci::SDHCI_QUIRK_INTEL_POWER_UP_RESET
+                | axdriver_block::sdhci::SDHCI_QUIRK_WAIT_WHILE_BUSY
+                | axdriver_block::sdhci::SDHCI_QUIRK_MMC_DDR52
+                | axdriver_block::sdhci::SDHCI_QUIRK_CAPS_BIT63_FOR_MMC_HS400
+                | axdriver_block::sdhci::SDHCI_QUIRK_PRESET_VALUE_BROKEN
+        );
+        assert_eq!(quirks_for_device(0x1234, 0x5678), 0);
     }
 }

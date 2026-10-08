@@ -334,11 +334,22 @@ pub struct SdhciHost<I: SdhciIo> {
     version: u8,
     base_clock_hz: u32,
     clock_hz: u32,
+    quirks: u32,
     timeout_polls: usize,
 }
 
 impl<I: SdhciIo> SdhciHost<I> {
     pub const fn new(io: I, capabilities: u32, capabilities2: u32, version: u8) -> Self {
+        Self::new_with_quirks(io, capabilities, capabilities2, version, 0)
+    }
+
+    pub const fn new_with_quirks(
+        io: I,
+        capabilities: u32,
+        capabilities2: u32,
+        version: u8,
+        quirks: u32,
+    ) -> Self {
         let base_mhz = (capabilities & SDHCI_CLOCK_V3_BASE_MASK) >> SDHCI_CLOCK_BASE_SHIFT;
         Self {
             io,
@@ -347,6 +358,7 @@ impl<I: SdhciIo> SdhciHost<I> {
             version,
             base_clock_hz: base_mhz * 1_000_000,
             clock_hz: 0,
+            quirks,
             timeout_polls: 100_000,
         }
     }
@@ -377,25 +389,49 @@ impl<I: SdhciIo> SdhciHost<I> {
             control |= SDHCI_CTRL_8BITBUS as u8;
         }
         self.io.write8(SDHCI_HOST_CONTROL as usize, control);
+        if self.quirks & SDHCI_QUIRK_RESET_ON_IOS != 0 {
+            let _ = self.reset(SDHCI_RESET_CMD as u8 | SDHCI_RESET_DATA as u8);
+        }
     }
 
     // upstream: sdhci.c sdhci_set_uhs_timing() (legacy high-speed subset)
     fn set_high_speed(&mut self, clock_hz: u32) -> Result<(), SdhciError> {
+        if self.quirks & SDHCI_QUIRK_BROKEN_TIMINGS != 0 {
+            return Err(SdhciError::UnsupportedClock);
+        }
         let mut control = self.io.read8(SDHCI_HOST_CONTROL as usize);
         control |= SDHCI_CTRL_HISPD as u8;
         self.io.write8(SDHCI_HOST_CONTROL as usize, control);
+        let clock_hz = if self.quirks & SDHCI_QUIRK_LOWER_FREQUENCY != 0 {
+            clock_hz.min(self.base_clock_hz / 2)
+        } else {
+            clock_hz
+        };
         self.set_clock(clock_hz)
     }
 
     /// Reset command/data engines and establish the initial 400 kHz clock.
     // upstream: sdhci.c sdhci_generic_reset()
     pub fn initialize(&mut self) -> Result<(), SdhciError> {
-        self.reset(SDHCI_RESET_ALL as u8)?;
+        if self.quirks & SDHCI_QUIRK_CLOCK_BEFORE_RESET != 0 {
+            self.set_clock(400_000)?;
+        }
+        if self.quirks & SDHCI_QUIRK_NO_CARD_NO_RESET == 0
+            || self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_CARD_PRESENT != 0
+        {
+            self.reset(SDHCI_RESET_ALL as u8)?;
+        }
+        if self.quirks & SDHCI_QUIRK_INTEL_POWER_UP_RESET != 0 {
+            self.reset(SDHCI_RESET_ALL as u8)?;
+        }
         self.io.write8(
             SDHCI_POWER_CONTROL as usize,
             (SDHCI_POWER_330 | SDHCI_POWER_ON) as u8,
         );
         self.set_clock(400_000)?;
+        // Use the largest host timeout exponent unless a future platform
+        // integration provides the per-card timeout derived from CSD/EXT_CSD.
+        self.io.write8(SDHCI_TIMEOUT_CONTROL as usize, 0x0e);
         self.io.write32(SDHCI_INT_STATUS as usize, u32::MAX);
         self.io.write32(
             SDHCI_INT_ENABLE as usize,
@@ -415,6 +451,19 @@ impl<I: SdhciIo> SdhciHost<I> {
 
     fn reset(&mut self, mask: u8) -> Result<(), SdhciError> {
         self.io.write8(SDHCI_SOFTWARE_RESET as usize, mask);
+        if self.quirks & SDHCI_QUIRK_WAITFOR_RESET_ASSERTED != 0 {
+            let mut asserted = false;
+            for _ in 0..self.timeout_polls {
+                if self.io.read8(SDHCI_SOFTWARE_RESET as usize) & mask != 0 {
+                    asserted = true;
+                    break;
+                }
+                self.io.delay_us(10);
+            }
+            if !asserted {
+                return Err(SdhciError::Timeout);
+            }
+        }
         for _ in 0..self.timeout_polls {
             if self.io.read8(SDHCI_SOFTWARE_RESET as usize) & mask == 0 {
                 return Ok(());
@@ -525,7 +574,15 @@ impl<I: SdhciIo> SdhciHost<I> {
                 data.as_deref_mut(),
                 block_size,
             ) {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if command_flags & SDHCI_CMD_RESP_MASK as u16
+                        == SDHCI_CMD_RESP_SHORT_BUSY as u16
+                        && self.quirks & SDHCI_QUIRK_WAIT_WHILE_BUSY != 0
+                    {
+                        self.wait_busy()?;
+                    }
+                    return Ok(response);
+                }
                 Err(error) => {
                     last_error = error;
                     // Reads and response-only commands are idempotent. Never
