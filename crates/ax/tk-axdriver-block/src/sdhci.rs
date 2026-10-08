@@ -1382,7 +1382,8 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.command(index, argument, flags, None, 0)
     }
 
-    // upstream: mmc.c mmc_app_send_scr() and mmc_app_sd_status()
+    // upstream: mmc.c mmc_app_send_scr()
+    // upstream: mmc.c mmc_app_sd_status()
     fn application_data_command(
         &mut self,
         rca: u16,
@@ -2267,6 +2268,7 @@ pub struct SdhciDisk<I: SdhciIo> {
 
 impl<I: SdhciIo> SdhciDisk<I> {
     /// Initializes an SD memory card and reads its CSD capacity.
+    // upstream: mmc.c mmc_attach()
     // upstream: mmc.c mmc_idle_cards(), mmc_send_if_cond(), mmc_send_app_op_cond(), mmc_send_op_cond(), mmc_all_send_cid(), mmc_send_relative_addr(), mmc_send_csd(), mmc_select_card()
     pub fn attach(mut host: SdhciHost<I>) -> Result<Self, SdhciError> {
         host.initialize()?;
