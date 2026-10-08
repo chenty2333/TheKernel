@@ -67,3 +67,4 @@
 - Init-uCode preinit now retains ALIVE SKU and follows the source ucode→Gen3 PNVM completion→post-ALIVE order before INIT_COMPLETE/NVM_GET_INFO; `cargo test -p tk-axdriver-iwx` passes 209 tests and `cargo test -p tk-axdriver --features n305-net` passes 13.
 - Task 3 resumed after W-19 completion: `tk-net80211/src/rssadapt.rs` translates OpenBSD `ieee80211_rssadapt.c` 5/5 functions; crate tests pass 8/8 including existing frame/RSN tests.
 - `ieee80211_input.c` beacon/probe-response receive path translated as `receive_beacon()` with per-node beacon/PHY state; `tk-net80211` checks/tests pass (69 tests); input.c coverage advances from 11/48 to 12/48 functions.
+- `ieee80211_input.c` Open System authentication response parser translated and wired to the station auth state helper; `tk-net80211` check/tests pass (72 tests); input.c coverage advances to 13/48 functions.

@@ -139,3 +139,8 @@ SSID recovery, peer PHY/QoS/RSN state updates, 5-GHz probe RSSI preference,
 and RUN-state current-BSS timer/protection/slot/DTIM effects. Interface-specific
 callbacks and counters are represented as explicit `BeaconUpdate` effects for
 the caller; peer records retain the associated node and beacon state.
+
+The station authentication receive adapter bounds-checks the management header
+and fixed algorithm/sequence/status fields, accepts only Open System
+authentication, and passes the parsed response into the translated station
+state handler; actual response transmission remains a caller effect.

@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+mod auth_rx;
 mod beacon;
 mod channel;
 mod decrypt;
@@ -24,6 +25,7 @@ mod rsn;
 mod rssadapt;
 mod scan;
 
+pub use auth_rx::{AuthRxError, AuthRxResult, receive_auth_response};
 pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{
     CHAN_2GHZ, CHAN_5GHZ, ChannelRef, ModeSelection, NET_CAP_QOS, NET_CAP_TX_AMPDU, NET_CHAN_2GHZ,
