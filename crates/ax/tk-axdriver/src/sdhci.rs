@@ -174,7 +174,7 @@ fn quirks_for_device(vendor_id: u16, device_id: u16) -> u32 {
     }
 }
 
-// upstream: sdhci_pci.c PCI_SLOT_INFO_SLOTS()/PCI_SLOT_INFO_FIRST_BAR()
+// PCI_SLOT_INFO_SLOTS()/PCI_SLOT_INFO_FIRST_BAR() macros from sdhci_pci.c.
 fn decode_slot_info(slot_info: u8) -> (usize, u8) {
     if slot_info == u8::MAX || slot_info & 0x07 > 5 {
         // Some SDHCI PCI functions omit the legacy slot-info register and
