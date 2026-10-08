@@ -1225,6 +1225,10 @@ fn mapped_hsw_well(instance: PowerWellInstance) -> Option<Well> {
     let mut well = match instance.control? {
         WellControl::IclPw1 => Some(PW_1),
         WellControl::IclPw2 => Some(PW_2),
+        WellControl::IclDdiA => Some(DDI_IO_A),
+        WellControl::IclDdiB => Some(DDI_IO_B),
+        WellControl::IclAuxA => Some(AUX_A),
+        WellControl::IclAuxB => Some(AUX_B),
         WellControl::XelpdPwA => Some(PW_A),
         WellControl::XelpdPwB => Some(PW_B),
         WellControl::XelpdPwC => Some(PW_C),
@@ -1278,7 +1282,7 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
         if instance.always_on || group.ops == WellOps::AlwaysOn {
             return Ok(());
         }
-        if group.ops != WellOps::Hsw {
+        if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
             return Err(intel_display::Error::Refused);
         }
         let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
@@ -1295,7 +1299,7 @@ impl<R: Registers> PowerDomainIo for MappedPowerWellIo<'_, R> {
         if instance.always_on || group.ops == WellOps::AlwaysOn {
             return Ok(());
         }
-        if group.ops != WellOps::Hsw {
+        if !matches!(group.ops, WellOps::Hsw | WellOps::Ddi | WellOps::Aux) {
             return Err(intel_display::Error::Refused);
         }
         let well = mapped_hsw_well(instance).ok_or(intel_display::Error::Refused)?;
@@ -2139,6 +2143,20 @@ mod tests {
             .unwrap();
         assert_eq!(pw_a.irq_pipe_mask, 1 << 0);
         assert_eq!(mapped_hsw_well(pw_a).unwrap().irq_pipe_mask, 1 << 0);
+        for (name, expected) in [
+            ("DDI_IO_A", DDI_IO_A),
+            ("DDI_IO_B", DDI_IO_B),
+            ("AUX_A", AUX_A),
+            ("AUX_B", AUX_B),
+        ] {
+            let instance = adlp
+                .iter()
+                .flat_map(|group| group.instances.iter())
+                .find(|instance| instance.name == name)
+                .copied()
+                .unwrap();
+            assert_eq!(mapped_hsw_well(instance), Some(expected), "{name}");
+        }
     }
 
     #[test]
