@@ -89,6 +89,18 @@ pub const MAX_LISTEN_BACKLOG: usize = consts::LISTEN_QUEUE_SIZE;
 
 static DEFAULT_STACK: Once<Arc<NetStack>> = Once::new();
 
+/// One published 802.11 interface backed by an Ethernet-compatible netdev.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WirelessInterfaceInfo {
+    pub name: alloc::string::String,
+    pub ifindex: u32,
+    pub phy_index: u32,
+    pub mac_address: [u8; 6],
+}
+
+static WIRELESS_INTERFACES: spin::Mutex<alloc::vec::Vec<WirelessInterfaceInfo>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
 /// Returns a reference to the default (init) network stack.
 ///
 /// Panics if [`init_network`] has not been called yet.
@@ -205,6 +217,49 @@ pub fn init_network_loopback_only() -> AxResult<Arc<NetStack>> {
     let stack = NetStack::try_new_loopback_only()?;
     DEFAULT_STACK.call_once(|| stack.clone());
     Ok(stack)
+}
+
+/// Publish an Ethernet-compatible wireless NIC as a separately named link.
+///
+/// Runtime calls this after the ordinary network stack has started and after
+/// rootfs firmware callbacks have completed, so wireless firmware and the
+/// link's RX wake owner exist before the interface becomes visible.
+pub fn register_wireless_device(dev: AxNetDevice) -> AxResult<u32> {
+    let Some(name) = dev.interface_name() else {
+        return Err(AxError::InvalidInput);
+    };
+    if !dev.is_wireless() || name.is_empty() {
+        return Err(AxError::InvalidInput);
+    }
+    let mac_address = dev.mac_address().0;
+    let stack = default_stack();
+    let interface = Box::new(EthernetDevice::new(
+        name.to_owned(),
+        dev,
+        Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0),
+    ));
+    let ifindex = stack.try_add_device(interface)?;
+    let mut interfaces = WIRELESS_INTERFACES.lock();
+    if interfaces.iter().any(|entry| entry.name == name) {
+        let _ = stack.remove_device(ifindex);
+        return Err(AxError::AlreadyExists);
+    }
+    if interfaces.try_reserve(1).is_err() {
+        let _ = stack.remove_device(ifindex);
+        return Err(AxError::NoMemory);
+    }
+    interfaces.push(WirelessInterfaceInfo {
+        name: name.to_owned(),
+        ifindex,
+        phy_index: 0,
+        mac_address,
+    });
+    Ok(ifindex)
+}
+
+/// Snapshot the wireless links published to init-net.
+pub fn wireless_interfaces() -> alloc::vec::Vec<WirelessInterfaceInfo> {
+    WIRELESS_INTERFACES.lock().clone()
 }
 
 /// Init vsock subsystem by vsock devices.

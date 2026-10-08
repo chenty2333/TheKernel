@@ -77,3 +77,4 @@
 - `ieee80211_input.c` `ieee80211_bar_tid()` agreement/PBAC checks and sequence-window effect translated; check/tests pass (90 tests); input.c coverage advances to 29/48 functions.
 - `ieee80211_input.c` station `inputm()` receive pipeline and A-MSDU validate/deaggregate paths translated and connected to Ethernet decapsulation; check/tests pass (95 tests); input.c coverage advances to 32/48 functions.
 - RX-path integration now splits negotiated A-MSDU aggregates before publishing Ethernet frames; `tk-net80211` check/tests pass (95 tests).
+- NetDriverOps now has opt-in wireless/name metadata and axnet-ng/runtime can publish a named Ethernet-compatible `wlan0` independently of primary eth0; `tk-axdriver-net`, `tk-axnet-ng`, and `tk-axruntime --features net-ng` checks pass. PCI iwx still does not return a NetDriverOps yet.

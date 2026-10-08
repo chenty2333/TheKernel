@@ -35,6 +35,17 @@ pub struct EthernetAddress(pub [u8; 6]);
 
 /// Operations that require a network device (NIC) driver to implement.
 pub trait NetDriverOps: BaseDriverOps {
+    /// Preferred init-net interface name, when the driver owns a named link.
+    /// `None` keeps the platform's existing primary-Ethernet naming policy.
+    fn interface_name(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether this Ethernet-compatible link exposes 802.11 control state.
+    fn is_wireless(&self) -> bool {
+        false
+    }
+
     /// The ethernet address of the NIC.
     fn mac_address(&self) -> EthernetAddress;
 

@@ -203,3 +203,9 @@ exports `start_runtime(DeviceFunction)` to start regular ucode, PNVM doorbell
 completion, post-ALIVE and the management queue when a future netdev requests
 if-up. The actual if-up caller, MSI-X/IRQ worker, TX/RX packet bridge and wlan0
 publication remain incomplete.
+
+The init-net handoff now accepts an explicitly named wireless `NetDriverOps`
+as a second Ethernet-compatible link after rootfs-ready firmware staging. It
+registers link metadata separately from the primary `eth0`; the PCI driver
+must still provide the actual RX/TX and link-up implementation before a WLAN
+adapter is usable.
