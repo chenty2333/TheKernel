@@ -39,9 +39,9 @@ Environment overrides:
   THEKERNEL_ROOTFS_OWNER_MODE image ownership (default: root; use preserve
                                 when fakeroot is intentionally unavailable)
   THEKERNEL_TOOLCHAIN         guest tool payload name (default: none); it
-                                selects which cases the suite contains, so it
-                                is compiled into the image, not just recorded;
-                                the payload itself is staged separately
+                                selects image-specific tests where applicable;
+                                wireless tools are copied via
+                                THEKERNEL_ROOTFS_TOOLS_DIR
   THEKERNEL_ROOTFS_TOOLS_DIR  tree of guest tools to copy into the image
   THEKERNEL_ROOTFS_SIZE_MB    image size (default: 160)
   THEKERNEL_IWX_FIRMWARE_DIR  linux-firmware tree with AX211 API 89 ucode,

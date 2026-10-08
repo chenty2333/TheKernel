@@ -38,6 +38,7 @@ fetch() {
 }
 fetch "$MINI" "$MINI_SHA" "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/$MINI" "$SOURCE_CACHE/$MINI"
 BOOTSTRAP="$BUILD_ROOT/bootstrap"
+rm -rf "$BOOTSTRAP"
 mkdir -p "$BOOTSTRAP"
 tar --no-same-owner -xzf "$SOURCE_CACHE/$MINI" -C "$BOOTSTRAP"
 APK=("$BOOTSTRAP/lib/ld-musl-x86_64.so.1" --library-path "$BOOTSTRAP/lib:$BOOTSTRAP/usr/lib" "$BOOTSTRAP/sbin/apk" --keys-dir "$BOOTSTRAP/etc/apk/keys")
@@ -50,6 +51,7 @@ done < "$REPO_ROOT/config/guest-wireless-apk-pins.tsv"
 [ ${#PACKAGES[@]} -gt 0 ] || { echo 'empty wireless package closure' >&2; exit 1; }
 "${APK[@]}" verify "${PACKAGES[@]}"
 STAGE="$BUILD_ROOT/stage"
+rm -rf "$STAGE"
 mkdir -p "$STAGE"
 "${APK[@]}" extract --no-chown --destination "$STAGE" "${PACKAGES[@]}"
 [ -x "$STAGE/usr/sbin/iw" ] && [ -x "$STAGE/sbin/wpa_supplicant" ]
