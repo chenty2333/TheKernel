@@ -82,3 +82,7 @@ Interface initialization now captures generation validation, monitor-vs-scan
 startup, and the one-second scan-state wait; shutdown drains/cancels the source
 task set before device stop and software-state reset. Multicast filter requests
 pass all groups for the active BSSID.
+
+Per-TX-queue watchdog expiry, media-change restarts, and generation-guarded
+ioctl/ENETRESET power and interface handling are mapped to callbacks so the
+driver core can bind them to TheKernel's network and task APIs.

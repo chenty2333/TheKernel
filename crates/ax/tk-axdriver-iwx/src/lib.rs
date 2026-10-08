@@ -15,6 +15,7 @@ mod channel;
 mod command;
 mod config;
 mod context;
+mod control;
 mod dma;
 mod firmware;
 mod firmware_bundle;
@@ -91,6 +92,10 @@ pub use config::{
 pub use context::{
     ContextError, ContextQueueAddresses, build_gen2_context, build_gen3_context,
     build_gen3_prph_scratch, set_gen3_pnvm, start_gen2_context, start_gen3_context,
+};
+pub use control::{
+    IoctlAction, IoctlError, IoctlKind, NetworkIoctlResult, WatchdogAction, WatchdogOutcome,
+    media_change, process_ioctl, watchdog_tick,
 };
 pub use dma::{
     DebugDestinationError, DebugRegisterAccess, DebugRegisterTransaction, DmaAllocator, DmaError,
