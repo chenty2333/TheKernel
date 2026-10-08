@@ -230,14 +230,19 @@ struct Owner {
     // Published before an ELSQ load; retained through any ambiguous reset/DMA.
     memory: Option<copy::Memory>,
     // Firmware source mapping retained if DMA completion cannot be proven.
+    #[cfg(target_os = "none")]
     uc_memory: Option<copy::UcDmaMemory>,
     // ADS GGTT VMA retained once its address has been published to GuC.
+    #[cfg(target_os = "none")]
     ads_memory: Option<copy::AdsDmaMemory>,
     // GuC log state/data VMA retained while GuC can write or read it.
+    #[cfg(target_os = "none")]
     log_memory: Option<copy::LogDmaMemory>,
     // Preallocated GuC error-capture output/cache nodes, reused after coredumps.
+    #[cfg(target_os = "none")]
     capture_nodes: Option<intel_gt::guc_capture::CaptureNodeCache>,
     // GuC CTB buffers/descriptor VMA retained while GuC may reference it.
+    #[cfg(target_os = "none")]
     ct_memory: Option<copy::CtDmaMemory>,
 }
 pub(super) mod copy;
@@ -376,6 +381,7 @@ fn load_uc_firmware() {
 /// Our audited GT register allowlist never writes those class enables or the
 /// GFX master; native jobs remain completion-polled even with display MSI.
 /// Refuse concurrent preparation/submission and retained uncertain DMA owners.
+#[cfg(target_os = "none")]
 pub(super) fn display_irq_owner_idle() -> bool {
     let Some(owner) = OWNER.try_lock() else {
         return false;
@@ -386,6 +392,12 @@ pub(super) fn display_irq_owner_idle() -> bool {
             && owner.uc_memory.is_none()
             && owner.ct_memory.is_none()
     })
+}
+
+#[cfg(not(target_os = "none"))]
+pub(super) fn display_irq_owner_idle() -> bool {
+    // This hardware GT owner only exists in the freestanding product kernel.
+    true
 }
 
 /// Capability probes use only a successfully bootstrapped, still-live owner.

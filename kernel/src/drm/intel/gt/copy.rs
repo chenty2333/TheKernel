@@ -618,6 +618,7 @@ impl LogDmaMemory {
 /// exist. The GuC must still be held in MIA reset; after any write succeeds,
 /// retain both VMA owners before firmware transfer can consume the pointers.
 /// upstream: intel_guc.c intel_guc_write_params().
+#[cfg(target_os = "none")]
 pub(super) fn write_guc_init_params(
     owner: &mut super::Owner,
     options: intel_gt::guc_config::GucOptions,
@@ -658,6 +659,7 @@ pub(super) fn write_guc_init_params(
 /// capture region, then send LOG_BUFFER_FILE_FLUSH_COMPLETE over CTB.
 /// upstream: intel_guc_submission.c intel_guc_error_capture_process_msg()
 /// + intel_guc_capture.c __guc_capture_process_output().
+#[cfg(target_os = "none")]
 pub(super) fn handle_guc_capture_notification(
     owner: &mut super::Owner,
     stats: &mut intel_gt::guc_log::LogStats,
@@ -706,6 +708,7 @@ pub(super) fn handle_guc_capture_notification(
 
 /// Workqueue-side debug-log relay snapshot and GuC flush acknowledgment.
 /// upstream: intel_guc_log.c copy_debug_logs_work()/guc_log_copy_debuglogs_for_relay().
+#[cfg(target_os = "none")]
 pub(super) fn process_guc_debug_log_flush(
     owner: &mut super::Owner,
     stats: &mut [intel_gt::guc_log::LogStats; 3],
