@@ -1009,3 +1009,4 @@ retain the latest Intel inventory, with no scanner exemptions.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): UMAC scan-abort command and foreground/background scan-state sequencing translated in `tk-axdriver-iwx/src/scan.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): aligned ICT allocation/drain/swizzle and legacy/MSI-X interrupt cause read/ack/re-enable plans translated in `tk-axdriver-iwx/src/intr.rs`.
 - OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): RX notification cursor drain, buffer completion delivery and 8-entry-aligned RFH/BZ write-pointer acknowledgement translated in `tk-axdriver-iwx/src/notif.rs`.
+- OpenBSD `sys/dev/pci/if_iwx.c` rev 1.230 and `if_iwxreg.h` (ISC): core firmware RX event classification and direct command response-to-ACK lifetime routing translated in `tk-axdriver-iwx/src/rx_event.rs`.

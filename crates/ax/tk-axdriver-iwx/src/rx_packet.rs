@@ -12,6 +12,7 @@ pub const FH_FRAME_SIZE_MASK: u32 = 0x0000_3fff;
 pub const FH_FRAME_INVALID: u32 = 0x5555_0000;
 pub const FH_FRAME_ALIGNMENT: usize = 0x40;
 pub const NOTIFICATION_ORIGIN: u8 = 0x80;
+pub const COMMAND_FAILED_MASK: u8 = 0x40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RxPacketError {
@@ -26,6 +27,7 @@ pub struct RxPacket<'a> {
     pub length_flags: u32,
     pub opcode: u8,
     pub group_id: u8,
+    pub command_failed: bool,
     pub index: u8,
     pub queue_id: u8,
     pub payload: &'a [u8],
@@ -74,7 +76,9 @@ pub fn parse_rx_packet(
         return Err(RxPacketError::InvalidLength);
     }
     let opcode = buffer[4];
-    let mut group_id = buffer[5];
+    let raw_group = buffer[5];
+    let command_failed = raw_group & COMMAND_FAILED_MASK != 0;
+    let mut group_id = raw_group & !COMMAND_FAILED_MASK;
     let index = buffer[6];
     let queue_id = buffer[7];
     let raw_code = (u32::from(group_id) << 8) | u32::from(opcode);
@@ -92,6 +96,7 @@ pub fn parse_rx_packet(
         length_flags,
         opcode,
         group_id,
+        command_failed,
         index,
         queue_id,
         payload: &buffer[RX_PACKET_HEADER_BYTES..total_bytes],
