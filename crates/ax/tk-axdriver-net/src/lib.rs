@@ -64,6 +64,26 @@ pub struct WirelessPhyCapabilities {
     pub vht: Option<WirelessVhtCapabilities>,
 }
 
+/// One foreground nl80211 scan request; an empty SSID means passive scan.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WirelessScanRequest {
+    pub ssid: alloc::vec::Vec<u8>,
+    pub frequencies_mhz: alloc::vec::Vec<u32>,
+}
+
+/// One station-mode BSS observation returned by an actual RX beacon/probe frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WirelessBssInfo {
+    pub bssid: [u8; 6],
+    pub frequency_mhz: u32,
+    pub signal_mbm: i32,
+    pub timestamp: u64,
+    pub beacon_interval: u16,
+    pub capability: u16,
+    pub information_elements: alloc::vec::Vec<u8>,
+    pub is_probe_response: bool,
+}
+
 /// Operations that require a network device (NIC) driver to implement.
 pub trait NetDriverOps: BaseDriverOps {
     /// Preferred init-net interface name, when the driver owns a named link.
@@ -100,6 +120,16 @@ pub trait NetDriverOps: BaseDriverOps {
     /// HT/VHT capabilities admitted by the radio's NVM and local antenna policy.
     fn wireless_phy_capabilities(&self) -> WirelessPhyCapabilities {
         WirelessPhyCapabilities::default()
+    }
+
+    /// Start a real hardware scan; adapters without scan control fail closed.
+    fn trigger_wireless_scan(&mut self, _request: &WirelessScanRequest) -> DevResult {
+        Err(DevError::Unsupported)
+    }
+
+    /// Snapshot BSSes parsed from received firmware RX notifications.
+    fn wireless_scan_results(&self) -> alloc::vec::Vec<WirelessBssInfo> {
+        alloc::vec::Vec::new()
     }
 
     /// Change administrative radio state before the interface state is published.
@@ -157,7 +187,6 @@ pub trait NetDriverOps: BaseDriverOps {
     fn firmware_path(&self) -> Option<&'static str> { None }
     /// Apply validated runtime firmware while there are no packet borrowers.
     fn load_firmware(&mut self, _bytes: &[u8]) -> DevResult { Err(DevError::Unsupported) }
-
 }
 
 #[cfg(feature = "rtl8125")]

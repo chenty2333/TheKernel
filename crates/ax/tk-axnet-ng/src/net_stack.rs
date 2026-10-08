@@ -1408,6 +1408,28 @@ impl NetStack {
         Ok(())
     }
 
+    /// Start a station scan through the selected wireless driver.
+    pub fn trigger_wireless_scan(
+        &self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessScanRequest,
+    ) -> AxResult {
+        self.service
+            .lock()
+            .router
+            .trigger_wireless_scan(ifindex, request)?;
+        self.poll_source.as_ref().wake();
+        Ok(())
+    }
+
+    /// Snapshot scan records retained from firmware RX beacon/probe notifications.
+    pub fn wireless_scan_results(
+        &self,
+        ifindex: u32,
+    ) -> AxResult<Vec<axdriver::prelude::WirelessBssInfo>> {
+        self.service.lock().router.wireless_scan_results(ifindex)
+    }
+
     /// Subscribes a bounded link-packet endpoint to this network namespace.
     pub fn subscribe_packets(&self, selector: PacketSelector) -> PacketResult<Arc<PacketEndpoint>> {
         self.packet_broker.subscribe(selector)
@@ -1664,7 +1686,10 @@ impl NetStack {
 
     /// No polling or queue consumption; removal cannot alias a reused name.
     pub fn interface_statistics(&self, interface_index: u32) -> Option<DeviceStats> {
-        self.service.lock().router.interface_statistics(interface_index)
+        self.service
+            .lock()
+            .router
+            .interface_statistics(interface_index)
     }
 
     /// Snapshot the interfaces currently owned by this network stack.
@@ -2987,20 +3012,34 @@ mod tests {
     fn statistics_follow_stable_ifindex_and_control_plane_rename() {
         let stack = NetStack::new_loopback_only();
         let source = packet_endpoint(&stack, PacketProtocol::All, true);
-        stack.send_packet(1, source.as_ref(), PacketSendRequest::Raw {
-            protocol: TEST_PROTOCOL, frame: &TEST_FRAME,
-        }).unwrap();
+        stack
+            .send_packet(
+                1,
+                source.as_ref(),
+                PacketSendRequest::Raw {
+                    protocol: TEST_PROTOCOL,
+                    frame: &TEST_FRAME,
+                },
+            )
+            .unwrap();
         let observed = stack.interface_statistics(1).unwrap();
         assert_eq!((observed.rx_packets, observed.tx_packets), (1, 1));
         assert_eq!((observed.rx_bytes, observed.tx_bytes), (6, 6));
-        stack.configure_link(1, Some("renamed".into()), None, None).unwrap();
+        stack
+            .configure_link(1, Some("renamed".into()), None, None)
+            .unwrap();
         assert_eq!(stack.device_stats()[0].0, "renamed");
         let service = stack.acquire_packet_service();
-        assert_eq!(service.interface_statistics(1).unwrap().rx_bytes, observed.rx_bytes);
+        assert_eq!(
+            service.interface_statistics(1).unwrap().rx_bytes,
+            observed.rx_bytes
+        );
         drop(service);
         stack.remove_device(1).unwrap();
         let replacement = stack.add_device(Box::new(LoopbackDevice::try_new().unwrap()));
-        stack.configure_link(replacement, Some("renamed".into()), None, None).unwrap();
+        stack
+            .configure_link(replacement, Some("renamed".into()), None, None)
+            .unwrap();
         assert_ne!(replacement, 1);
         assert!(stack.interface_statistics(1).is_none());
         assert_eq!(stack.interface_statistics(replacement).unwrap().rx_bytes, 0);

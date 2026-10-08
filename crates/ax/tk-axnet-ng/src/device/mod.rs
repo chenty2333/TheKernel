@@ -1,6 +1,7 @@
 use alloc::{string::String, vec::Vec};
 use core::task::Waker;
 
+use axdriver::prelude::{WirelessBssInfo, WirelessScanRequest};
 use axerrno::{AxError, AxResult};
 use axpoll::{PollRegistrationError, PollSet, RegisterError, RegistrationToken, UpdateError};
 use axsync::spin::SpinNoIrq;
@@ -240,6 +241,14 @@ pub trait Device: Send + Sync {
 
     fn set_rfkill_soft_blocked(&mut self, _blocked: bool) -> AxResult {
         Err(AxError::OperationNotSupported)
+    }
+
+    fn trigger_wireless_scan(&mut self, _request: &WirelessScanRequest) -> AxResult {
+        Err(AxError::OperationNotSupported)
+    }
+
+    fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {
+        Vec::new()
     }
 
     fn hardware_address(&self) -> Option<[u8; 6]> {

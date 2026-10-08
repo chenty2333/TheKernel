@@ -35,12 +35,19 @@ GHz NVM frequencies with NO_IR flags. Legacy 2.4/5 GHz bitrate tables and
 NVM/antenna-derived HT/VHT capability, MCS, and A-MPDU attributes are emitted;
 HE maps and supported cipher suites are not yet advertised. Rates use the
 matching 100-kbit/s UAPI units and 2.4 GHz short-preamble flags.
-The wiphy advertises a one-SSID scan limit and only the GET_WIPHY,
-GET_INTERFACE, GET_SCAN, and GET_REG commands that currently have handlers.
-GET_REG returns the global world alpha2 value;
-regulatory rule tables and per-phy domains are not yet emitted. GET_SCAN
-accepts a dump request for a registered interface and emits an empty multipart
-result until a scan cache is connected; it does not start scans. TRIGGER_SCAN,
-scan events, connection/authentication, key, station and regulatory rule
-operations remain incomplete. The required no-radio QEMU acceptance is deferred
-until the task-5 command surface is complete; no fake radio is used.
+The wiphy advertises a one-SSID scan limit and the GET_WIPHY,
+GET_INTERFACE, TRIGGER_SCAN, GET_SCAN, and GET_REG commands that currently have
+handlers. TRIGGER_SCAN validates the interface, the single-SSID limit and
+frequency list, then asks the iwx controller to send the firmware UMAC scan
+request. GET_SCAN returns only beacon/probe-response observations parsed from
+firmware RX notifications and retained by the driver's bounded station scan
+cache; it never synthesizes a BSS. The result records carry nested BSSID,
+frequency, TSF, capability, IEs, signal, and seen-status attributes.
+The cache pump currently runs while waiting for the command ACK and while a
+scan dump is queried. A multicast NEW_SCAN_RESULTS/SCAN_ABORTED producer and
+notification-driven wakeup are not yet connected, so this scan path is not yet
+sufficient for wpa_supplicant's event-driven completion loop. GET_REG returns
+the global world alpha2 value; regulatory rule tables and per-phy domains are
+not yet emitted. Connection/authentication, key, station and regulatory rule
+operations remain incomplete. The required no-radio QEMU acceptance is
+deferred until the task-5 command surface is complete; no fake radio is used.

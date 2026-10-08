@@ -21,6 +21,8 @@ const CMD_NEW_WIPHY: u8 = 3;
 pub(super) const CMD_GET_INTERFACE: u8 = 5;
 const CMD_NEW_INTERFACE: u8 = 7;
 const CMD_GET_SCAN: u8 = 32;
+const CMD_TRIGGER_SCAN: u8 = 33;
+const CMD_NEW_SCAN_RESULTS: u8 = 34;
 const CMD_GET_REG: u8 = 31;
 const ATTR_WIPHY: u16 = 1;
 const ATTR_WIPHY_NAME: u16 = 2;
@@ -28,6 +30,9 @@ const ATTR_IFINDEX: u16 = 3;
 const ATTR_IFNAME: u16 = 4;
 const ATTR_IFTYPE: u16 = 5;
 const ATTR_MAC: u16 = 6;
+const ATTR_BSS: u16 = 47;
+const ATTR_SCAN_FREQUENCIES: u16 = 44;
+const ATTR_SCAN_SSIDS: u16 = 45;
 const ATTR_WIPHY_BANDS: u16 = 22;
 const ATTR_SUPPORTED_IFTYPES: u16 = 32;
 const ATTR_MAX_NUM_SCAN_SSIDS: u16 = 43;
@@ -44,6 +49,16 @@ const BAND_ATTR_VHT_MCS_SET: u16 = 7;
 const BAND_ATTR_VHT_CAPA: u16 = 8;
 const FREQ_ATTR_FREQ: u16 = 1;
 const FREQ_ATTR_NO_IR: u16 = 3;
+const BSS_ATTR_BSSID: u16 = 1;
+const BSS_ATTR_FREQUENCY: u16 = 2;
+const BSS_ATTR_TSF: u16 = 3;
+const BSS_ATTR_BEACON_INTERVAL: u16 = 4;
+const BSS_ATTR_CAPABILITY: u16 = 5;
+const BSS_ATTR_INFORMATION_ELEMENTS: u16 = 6;
+const BSS_ATTR_SIGNAL_MBM: u16 = 7;
+const BSS_ATTR_STATUS: u16 = 8;
+const BSS_ATTR_SEEN_MS_AGO: u16 = 10;
+const BSS_STATUS_SEEN: u32 = 1;
 const BITRATE_ATTR_RATE: u16 = 1;
 const BITRATE_ATTR_2GHZ_SHORTPREAMBLE: u16 = 2;
 const IFTYPE_STATION: u32 = 2;
@@ -115,15 +130,30 @@ pub(super) fn handle(
     }
     if !matches!(
         request.cmd,
-        CMD_GET_WIPHY | CMD_GET_INTERFACE | CMD_GET_SCAN | CMD_GET_REG
+        CMD_GET_WIPHY | CMD_GET_INTERFACE | CMD_GET_SCAN | CMD_TRIGGER_SCAN | CMD_GET_REG
     ) {
         return Err(AxError::OperationNotSupported);
     }
-    let selectors = parse_selectors(&payload[size_of::<GenlMsgHdr>()..])?;
+    let attributes = &payload[size_of::<GenlMsgHdr>()..];
     let dump = header.nlmsg_flags & NLM_F_DUMP != 0;
     let interfaces = axnet::wireless_interfaces();
     let port_id = permit.port_id();
     let mut records = Vec::new();
+    if request.cmd == CMD_TRIGGER_SCAN {
+        if dump {
+            return Err(AxError::InvalidInput);
+        }
+        let (ifindex, scan) = parse_scan_request(attributes)?;
+        if !interfaces
+            .iter()
+            .any(|interface| interface.ifindex == ifindex)
+        {
+            return Err(AxError::NotFound);
+        }
+        axnet::trigger_wireless_scan(ifindex, &scan)?;
+        return Ok(());
+    }
+    let selectors = parse_selectors(attributes)?;
     match request.cmd {
         CMD_GET_REG => {
             if selectors.wiphy.is_some_and(|wiphy| {
@@ -140,7 +170,7 @@ pub(super) fn handle(
             if !dump {
                 return Err(AxError::InvalidInput);
             }
-            if !interfaces.iter().any(|interface| {
+            let scan_interface = interfaces.iter().find(|interface| {
                 selectors
                     .ifindex
                     .is_none_or(|ifindex| interface.ifindex == ifindex)
@@ -148,8 +178,15 @@ pub(super) fn handle(
                         .ifname
                         .as_deref()
                         .is_none_or(|name| interface.name == name)
-            }) {
-                return Err(AxError::NotFound);
+            });
+            let scan_interface = scan_interface.ok_or(AxError::NotFound)?;
+            for result in axnet::wireless_scan_results(scan_interface.ifindex)? {
+                records.push(scan_bss_message(
+                    header,
+                    port_id,
+                    scan_interface.ifindex,
+                    &result,
+                ));
             }
         }
         CMD_GET_INTERFACE => {
@@ -193,6 +230,100 @@ pub(super) fn handle(
         socket.enqueue_kernel_permitted(permit, empty_dump_response(header, port_id));
     }
     Ok(())
+}
+
+fn parse_scan_request(attributes: &[u8]) -> AxResult<(u32, axnet::WirelessScanRequest)> {
+    let mut ifindex = None;
+    let mut ssid = None;
+    let mut frequencies = Vec::new();
+    for_each_rtattr(attributes, |kind, value| match kind {
+        ATTR_IFINDEX if ifindex.is_none() && value.len() == 4 => {
+            ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            Ok(())
+        }
+        ATTR_SCAN_SSIDS if ssid.is_none() => {
+            let mut count = 0;
+            for_each_rtattr(value, |_, bytes| {
+                count += 1;
+                if count > 1 || bytes.len() > 32 {
+                    return Err(AxError::InvalidInput);
+                }
+                ssid = Some(bytes.to_vec());
+                Ok(())
+            })?;
+            Ok(())
+        }
+        ATTR_SCAN_FREQUENCIES => for_each_rtattr(value, |_, bytes| {
+            if bytes.len() != 4 {
+                return Err(AxError::InvalidInput);
+            }
+            let frequency = u32::from_ne_bytes(bytes.try_into().unwrap());
+            if frequency == 0 || frequencies.contains(&frequency) {
+                return Err(AxError::InvalidInput);
+            }
+            frequencies.push(frequency);
+            Ok(())
+        }),
+        ATTR_IFINDEX | ATTR_SCAN_SSIDS => Err(AxError::InvalidInput),
+        _ => Err(AxError::OperationNotSupported),
+    })?;
+    Ok((
+        ifindex.ok_or(AxError::InvalidInput)?,
+        axnet::WirelessScanRequest {
+            ssid: ssid.unwrap_or_default(),
+            frequencies_mhz: frequencies,
+        },
+    ))
+}
+
+fn scan_bss_message(
+    request: &NlMsgHdr,
+    port_id: u32,
+    ifindex: u32,
+    bss: &axnet::WirelessBssInfo,
+) -> Vec<u8> {
+    let mut payload = payload_with(&GenlMsgHdr {
+        cmd: CMD_NEW_SCAN_RESULTS,
+        version: FAMILY_VERSION,
+        reserved: 0,
+    });
+    push_attr(&mut payload, ATTR_IFINDEX, &ifindex.to_ne_bytes());
+    let mut attributes = Vec::new();
+    push_attr(&mut attributes, BSS_ATTR_BSSID, &bss.bssid);
+    push_attr(
+        &mut attributes,
+        BSS_ATTR_FREQUENCY,
+        &bss.frequency_mhz.to_ne_bytes(),
+    );
+    push_attr(&mut attributes, BSS_ATTR_TSF, &bss.timestamp.to_ne_bytes());
+    push_attr(
+        &mut attributes,
+        BSS_ATTR_BEACON_INTERVAL,
+        &bss.beacon_interval.to_ne_bytes(),
+    );
+    push_attr(
+        &mut attributes,
+        BSS_ATTR_CAPABILITY,
+        &bss.capability.to_ne_bytes(),
+    );
+    push_attr(
+        &mut attributes,
+        BSS_ATTR_INFORMATION_ELEMENTS,
+        &bss.information_elements,
+    );
+    push_attr(
+        &mut attributes,
+        BSS_ATTR_SIGNAL_MBM,
+        &bss.signal_mbm.to_ne_bytes(),
+    );
+    push_attr(
+        &mut attributes,
+        BSS_ATTR_STATUS,
+        &BSS_STATUS_SEEN.to_ne_bytes(),
+    );
+    push_attr(&mut attributes, BSS_ATTR_SEEN_MS_AGO, &0u32.to_ne_bytes());
+    push_attr(&mut payload, ATTR_BSS | NLA_F_NESTED, &attributes);
+    nl80211_message(request, port_id, FAMILY_ID, payload, true)
 }
 
 fn empty_dump_response(request: &NlMsgHdr, port_id: u32) -> Vec<u8> {
@@ -420,6 +551,8 @@ mod tests {
         assert_eq!(CMD_GET_WIPHY, 1);
         assert_eq!(CMD_GET_INTERFACE, 5);
         assert_eq!(CMD_GET_SCAN, 32);
+        assert_eq!(CMD_TRIGGER_SCAN, 33);
+        assert_eq!(CMD_NEW_SCAN_RESULTS, 34);
         assert_eq!(CMD_GET_REG, 31);
         assert_eq!(ATTR_REG_ALPHA2, 33);
         assert_eq!(ATTR_IFINDEX, 3);
@@ -728,5 +861,80 @@ mod tests {
         let mut bad_name = Vec::new();
         push_attr(&mut bad_name, ATTR_IFNAME, b"wlan0");
         assert_eq!(parse_selectors(&bad_name), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn trigger_scan_parses_nested_ssid_and_frequency_attributes() {
+        let mut ssids = Vec::new();
+        push_attr(&mut ssids, 1, b"test-net");
+        let mut frequencies = Vec::new();
+        push_attr(&mut frequencies, 1, &2412u32.to_ne_bytes());
+        push_attr(&mut frequencies, 2, &5180u32.to_ne_bytes());
+        let mut attrs = Vec::new();
+        push_attr(&mut attrs, ATTR_IFINDEX, &9u32.to_ne_bytes());
+        push_attr(&mut attrs, ATTR_SCAN_SSIDS | NLA_F_NESTED, &ssids);
+        push_attr(
+            &mut attrs,
+            ATTR_SCAN_FREQUENCIES | NLA_F_NESTED,
+            &frequencies,
+        );
+        let (ifindex, request) = parse_scan_request(&attrs).unwrap();
+        assert_eq!(ifindex, 9);
+        assert_eq!(request.ssid, b"test-net");
+        assert_eq!(request.frequencies_mhz, [2412, 5180]);
+
+        push_attr(&mut attrs, ATTR_IFINDEX, &10u32.to_ne_bytes());
+        assert_eq!(parse_scan_request(&attrs), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn scan_result_message_uses_nested_bss_uapi_fields() {
+        let request = NlMsgHdr {
+            nlmsg_len: size_of::<NlMsgHdr>() as u32,
+            nlmsg_type: FAMILY_ID,
+            nlmsg_flags: NLM_F_DUMP,
+            nlmsg_seq: 8,
+            nlmsg_pid: 22,
+        };
+        let bss = axnet::WirelessBssInfo {
+            bssid: [2, 3, 4, 5, 6, 7],
+            frequency_mhz: 2412,
+            signal_mbm: -4200,
+            timestamp: 1234,
+            beacon_interval: 100,
+            capability: 0x0431,
+            information_elements: [0, 3, b'a', b'p', b'1'].to_vec(),
+            is_probe_response: false,
+        };
+        let message = scan_bss_message(&request, 22, 9, &bss);
+        let attrs = &message[size_of::<NlMsgHdr>() + size_of::<GenlMsgHdr>()..];
+        let mut ifindex = None;
+        let mut nested_bss = None;
+        for_each_rtattr(attrs, |kind, value| {
+            if kind == ATTR_IFINDEX {
+                ifindex = Some(u32::from_ne_bytes(value.try_into().unwrap()));
+            } else if kind == ATTR_BSS {
+                nested_bss = Some(value.to_vec());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ifindex, Some(9));
+        let mut decoded = Vec::new();
+        for_each_rtattr(nested_bss.as_deref().unwrap(), |kind, value| {
+            decoded.push((kind, value.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(decoded[0], (BSS_ATTR_BSSID, bss.bssid.to_vec()));
+        assert_eq!(
+            decoded[1],
+            (BSS_ATTR_FREQUENCY, 2412u32.to_ne_bytes().to_vec())
+        );
+        assert_eq!(decoded[2], (BSS_ATTR_TSF, 1234u64.to_ne_bytes().to_vec()));
+        assert_eq!(
+            decoded[6],
+            (BSS_ATTR_SIGNAL_MBM, (-4200i32).to_ne_bytes().to_vec())
+        );
     }
 }

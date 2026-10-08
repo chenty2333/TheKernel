@@ -1028,6 +1028,32 @@ impl Router {
         self.devices[slot].set_rfkill_soft_blocked(blocked)
     }
 
+    pub(crate) fn trigger_wireless_scan(
+        &mut self,
+        ifindex: u32,
+        request: &axdriver::prelude::WirelessScanRequest,
+    ) -> AxResult {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        if !self.links[slot].up {
+            return Err(AxError::BadState);
+        }
+        self.devices[slot].trigger_wireless_scan(request)
+    }
+
+    pub(crate) fn wireless_scan_results(
+        &self,
+        ifindex: u32,
+    ) -> AxResult<Vec<axdriver::prelude::WirelessBssInfo>> {
+        let slot = self.device_slot(ifindex).ok_or(AxError::NoSuchDevice)?;
+        if !self.devices[slot].is_wireless() {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(self.devices[slot].wireless_scan_results())
+    }
+
     pub(crate) fn routes(&self) -> Vec<RouteInfo> {
         self.table
             .rules

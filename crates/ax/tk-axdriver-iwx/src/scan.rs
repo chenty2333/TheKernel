@@ -7,10 +7,140 @@
 
 use alloc::vec::Vec;
 
+use axdriver_net::WirelessBssInfo;
+
 use crate::{
     CHAN_2GHZ, CMD_ASYNC, ChannelInfo, CommandError, EncodedCommand, HostCommand,
     ProbeRequestConfig, ProbeRequestError, build_scan_probe_request, encode_scan_probe_request,
 };
+
+/// Station scan cache fed only by validated RX beacon/probe-response frames.
+pub struct ScanCache {
+    nodes: tk_net80211::NodeTable,
+    channels: Vec<ChannelInfo>,
+    active_channels: Vec<u8>,
+    results: Vec<WirelessBssInfo>,
+    local_ht_caps: u16,
+    local_vht_caps: u32,
+    local_channel_160_allowed: bool,
+}
+
+impl ScanCache {
+    pub fn new(
+        channels: Vec<ChannelInfo>,
+        local_ht_caps: u16,
+        local_vht_caps: u32,
+        local_channel_160_allowed: bool,
+    ) -> Self {
+        let active_channels = channels
+            .iter()
+            .filter(|channel| channel.flags != 0)
+            .map(|channel| channel.channel)
+            .collect();
+        Self {
+            nodes: tk_net80211::NodeTable::default(),
+            channels,
+            active_channels,
+            results: Vec::new(),
+            local_ht_caps,
+            local_vht_caps,
+            local_channel_160_allowed,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.results.clear();
+        self.nodes = tk_net80211::NodeTable::default();
+    }
+
+    pub fn results(&self) -> &[WirelessBssInfo] {
+        &self.results
+    }
+
+    /// Apply OpenBSD's station beacon parser and retain the UAPI BSS fields.
+    pub fn observe(&mut self, frame: &[u8], channel: u8, rssi_dbm: i8, timestamp: u64) -> bool {
+        const HEADER_AND_FIXED_LEN: usize = 36;
+        if frame.len() < HEADER_AND_FIXED_LEN || frame[0] & 0x0c != 0 {
+            return false;
+        }
+        let subtype = frame[0] & 0xf0;
+        if subtype != 0x80 && subtype != 0x50 {
+            return false;
+        }
+        let Some(channel_info) = self.channels.iter().find(|info| info.channel == channel) else {
+            return false;
+        };
+        let is_probe_response = subtype == 0x50;
+        let rates = if channel_info.frequency_mhz < 3000 {
+            tk_net80211::STANDARD_RATES_11G
+        } else {
+            tk_net80211::STANDARD_RATES_11A
+        };
+        let rssi = (i16::from(rssi_dbm) + 100).clamp(0, 100) as u8;
+        let policy = tk_net80211::BeaconPolicy {
+            active_channels: &self.active_channels,
+            scan_all: true,
+            background_scan: false,
+            state_scanning: true,
+            state_running: false,
+            current_channel: channel,
+            current_mode: tk_net80211::PhyMode::Auto,
+            local_ht_caps: self.local_ht_caps,
+            local_vht_caps: self.local_vht_caps,
+            local_vht_tx_max_lgi_mbps: 0,
+            local_channel_160_allowed: self.local_channel_160_allowed,
+            station_mode: true,
+            local_rsn_capable: true,
+            local_qos_enabled: true,
+            local_uapsd_enabled: false,
+            local_uapsd_access_categories: 0,
+            local_uapsd_max_service_period: 0,
+            local_rates: &rates,
+            fixed_rate: None,
+        };
+        if tk_net80211::receive_beacon(
+            &mut self.nodes,
+            frame,
+            tk_net80211::BeaconRxInfo {
+                receive_channel: Some(channel),
+                rssi,
+                timestamp,
+                is_probe_response,
+            },
+            &policy,
+            None,
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        let bssid: [u8; 6] = frame[16..22].try_into().unwrap();
+        let bss = WirelessBssInfo {
+            bssid,
+            frequency_mhz: u32::from(channel_info.frequency_mhz),
+            signal_mbm: i32::from(rssi_dbm) * 100,
+            timestamp: u64::from_le_bytes(frame[24..32].try_into().unwrap()),
+            beacon_interval: u16::from_le_bytes(frame[32..34].try_into().unwrap()),
+            capability: u16::from_le_bytes(frame[34..36].try_into().unwrap()),
+            information_elements: frame[HEADER_AND_FIXED_LEN..].to_vec(),
+            is_probe_response,
+        };
+        if let Some(existing) = self
+            .results
+            .iter_mut()
+            .find(|existing| existing.bssid == bssid && existing.frequency_mhz == bss.frequency_mhz)
+        {
+            *existing = bss;
+        } else {
+            if self.results.len() == 256 {
+                self.results.remove(0);
+            }
+            self.results.push(bss);
+        }
+        true
+    }
+}
 
 pub const LONG_GROUP: u8 = 1;
 pub const UMAC_SCAN_REQ: u8 = 0x0d;
@@ -912,5 +1042,44 @@ mod tests {
         assert!(end_scan(&mut state, || calls += 1));
         assert!(!end_scan(&mut state, || calls += 1));
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn scan_cache_validates_and_refreshes_received_beacon_frames() {
+        let mut cache = ScanCache::new(
+            alloc::vec![ChannelInfo {
+                channel: 1,
+                frequency_mhz: 2412,
+                flags: CHAN_2GHZ,
+                extended_flags: 0,
+            }],
+            0,
+            0,
+            false,
+        );
+        let bssid = [0x02, 0, 0, 0, 0, 1];
+        let mut frame = alloc::vec![0u8; 36];
+        frame[0] = 0x80;
+        frame[4..10].fill(0xff);
+        frame[10..16].copy_from_slice(&bssid);
+        frame[16..22].copy_from_slice(&bssid);
+        frame[24..32].copy_from_slice(&123u64.to_le_bytes());
+        frame[32..34].copy_from_slice(&100u16.to_le_bytes());
+        frame[34..36].copy_from_slice(&1u16.to_le_bytes());
+        frame.extend_from_slice(&[0, 3, b'a', b'p', b'1']);
+        frame.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8b, 0x96]);
+        frame.extend_from_slice(&[3, 1, 1]);
+        assert!(cache.observe(&frame, 1, -43, 9));
+        assert_eq!(cache.results().len(), 1);
+        assert_eq!(cache.results()[0].bssid, bssid);
+        assert_eq!(cache.results()[0].frequency_mhz, 2412);
+        assert_eq!(cache.results()[0].signal_mbm, -4300);
+        assert_eq!(cache.results()[0].timestamp, 123);
+        assert_eq!(cache.results()[0].information_elements, &frame[36..]);
+
+        assert!(cache.observe(&frame, 1, -55, 10));
+        assert_eq!(cache.results().len(), 1);
+        assert_eq!(cache.results()[0].signal_mbm, -5500);
+        assert!(!cache.observe(&frame, 6, -40, 11));
     }
 }

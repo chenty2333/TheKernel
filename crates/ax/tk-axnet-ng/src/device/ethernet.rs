@@ -1,4 +1,4 @@
-use alloc::{string::String, vec};
+use alloc::{string::String, vec, vec::Vec};
 use core::task::Waker;
 
 use axdriver::prelude::*;
@@ -653,6 +653,16 @@ impl Device for EthernetDevice {
         self.inner
             .set_rfkill_soft_blocked(blocked)
             .map_err(Self::map_dev_error)
+    }
+
+    fn trigger_wireless_scan(&mut self, request: &WirelessScanRequest) -> AxResult {
+        self.inner
+            .trigger_wireless_scan(request)
+            .map_err(Self::map_dev_error)
+    }
+
+    fn wireless_scan_results(&self) -> Vec<WirelessBssInfo> {
+        self.inner.wireless_scan_results()
     }
 
     fn has_rx_backlog(&self) -> bool {

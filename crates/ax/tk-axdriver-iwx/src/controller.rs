@@ -389,6 +389,24 @@ impl<B: CsrAccess, A: DmaAllocator> IwxController<B, A> {
         self.send_command_wait(&host, external, dispatch)
     }
 
+    /// Allocate temporary external DMA for large commands and retain it through the ACK wait.
+    pub fn send_encoded_command_wait_allocated<E>(
+        &mut self,
+        command: &crate::EncodedCommand,
+        dispatch: impl FnMut(&crate::RxPacket<'_>, crate::RxMbufPlan) -> Result<bool, E>,
+    ) -> Result<crate::CompletedCommand, SyncCommandError<E>> {
+        let mut external = if command.bytes.len() > crate::command::INLINE_COMMAND_BYTES {
+            Some(
+                self.allocator
+                    .allocate(command.bytes.len())
+                    .map_err(|error| SyncCommandError::Command(crate::CommandError::Dma(error)))?,
+            )
+        } else {
+            None
+        };
+        self.send_encoded_command_wait(command, external.as_mut(), dispatch)
+    }
+
     /// Send a PDU and return its firmware response status word.
     // upstream: if_iwx.c iwx_send_cmd_pdu_status()
     pub fn send_command_pdu_status<E>(

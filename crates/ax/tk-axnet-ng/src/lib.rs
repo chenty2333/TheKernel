@@ -63,7 +63,8 @@ pub use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use spin::Once;
 
 pub use axdriver::prelude::{
-    WirelessHtCapabilities, WirelessPhyCapabilities, WirelessVhtCapabilities,
+    WirelessBssInfo, WirelessHtCapabilities, WirelessPhyCapabilities, WirelessScanRequest,
+    WirelessVhtCapabilities,
 };
 
 use self::{
@@ -319,6 +320,19 @@ pub fn set_wireless_rfkill_soft_blocked(rfkill_index: u32, blocked: bool) -> AxR
         .ok_or(AxError::NoSuchDevice)?;
     interface.soft_blocked = blocked;
     Ok(())
+}
+
+/// Trigger a scan through the named init-net wireless interface.
+pub fn trigger_wireless_scan(
+    ifindex: u32,
+    request: &WirelessScanRequest,
+) -> AxResult {
+    default_stack().trigger_wireless_scan(ifindex, request)
+}
+
+/// Return BSS observations collected by the wireless driver's RX path.
+pub fn wireless_scan_results(ifindex: u32) -> AxResult<alloc::vec::Vec<WirelessBssInfo>> {
+    default_stack().wireless_scan_results(ifindex)
 }
 
 /// Init vsock subsystem by vsock devices.

@@ -305,7 +305,7 @@ pub use scan::{
     SCAN_BAND_24GHZ, SCAN_BAND_FLAG_SHIFT, SCAN_CONFIG_COMMAND, SCAN_ENABLE_CHANNEL_ORDER,
     SCAN_FRAGMENTED_LMAC_1, SCAN_FRAGMENTED_LMAC_2, SCAN_GEN_ADAPTIVE_DWELL,
     SCAN_GEN_FORCE_PASSIVE, SCAN_GEN_NOTIFY_ITER_COMPLETE, SCAN_GEN_PASS_ALL, SCAN_MAX_CHANNELS,
-    SCAN_PASSIVE_DWELL, SCAN_PASSIVE_MAX_PSD, SCAN_PRIORITY_EXT_6, ScanChannelConfig,
+    SCAN_PASSIVE_DWELL, SCAN_PASSIVE_MAX_PSD, SCAN_PRIORITY_EXT_6, ScanCache, ScanChannelConfig,
     ScanChannelConfigV5, ScanConfigError, ScanError, ScanState, UMAC_SCAN_ABORT,
     UMAC_SCAN_COMPLETE, UMAC_SCAN_REQ, UmacScanConfig, UmacScanError, UmacScanVersion, abort_scan,
     begin_background_scan, begin_foreground_scan, build_umac_scan_request, end_scan,

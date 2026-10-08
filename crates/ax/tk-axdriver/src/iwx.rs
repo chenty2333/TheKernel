@@ -16,7 +16,7 @@ use axdriver_iwx::{
     AX211_DEVICE_ID, AttachAllocationError, AttachProfile, CsrAccess, DmaAllocator, DmaError,
     DmaRegion, FirmwareBundle, FirmwareError, FirmwareImage, INTEL_VENDOR_ID, IoBarrier,
     IwxController, NvmInfo, PreinitPlan, RuntimeConfig, attach_profile, matches_pci_device,
-    preinit_plan, setup_ht_rate_capabilities, setup_vht_rate_capabilities,
+    preinit_plan,
 };
 use axdriver_net::{
     EthernetAddress, NetBuf, NetBufPool, NetBufPtr, NetDriverOps, WirelessFrequency,
@@ -34,6 +34,10 @@ const CSR_HW_RFID_TYPE_MASK: u32 = 0x00ff_f000;
 const CSR_HW_RFID_TYPE_SHIFT: u32 = 12;
 const RF_TYPE_GF: u16 = 0x10d;
 const SPECIAL_BZ_DEVICE: u16 = 0x7740;
+const IWX_SCAN_RATES_2GHZ: [u8; 12] = [
+    0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c,
+];
+const IWX_SCAN_RATES_5GHZ: [u8; 8] = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
 
 struct PlatformDmaRegion {
     cpu: NonNull<u8>,
@@ -193,6 +197,9 @@ struct AttachedDevice {
     firmware: Option<Result<FirmwareBundle, FirmwareRequestError>>,
     nvm: Option<NvmInfo>,
     preinit: Option<PreinitPlan>,
+    scan_cache: Option<axdriver_iwx::ScanCache>,
+    scan_phy: Option<axdriver_iwx::RxPhyInfo>,
+    scan_complete: bool,
     runtime_started: bool,
     interface_up: bool,
     soft_blocked: bool,
@@ -360,6 +367,24 @@ impl NetDriverOps for IwxNetDevice {
             .ok_or(DevError::BadState)?;
         device.interface_up = up;
         Ok(())
+    }
+
+    fn trigger_wireless_scan(&mut self, request: &axdriver_net::WirelessScanRequest) -> DevResult {
+        trigger_scan(self.bdf, request).map_err(|_| DevError::Io)
+    }
+
+    fn wireless_scan_results(&self) -> Vec<axdriver_net::WirelessBssInfo> {
+        let mut devices = ATTACHED_DMA.lock();
+        let Some(device) = devices.iter_mut().find(|device| device.bdf == self.bdf) else {
+            return Vec::new();
+        };
+        if device.runtime_started {
+            let _ = pump_scan_events(device);
+        }
+        device
+            .scan_cache
+            .as_ref()
+            .map_or_else(Vec::new, |cache| cache.results().to_vec())
     }
 
     fn mac_address(&self) -> EthernetAddress {
@@ -541,11 +566,149 @@ fn allocate_resources(
         firmware: None,
         nvm: None,
         preinit: None,
+        scan_cache: None,
+        scan_phy: None,
+        scan_complete: false,
         runtime_started: false,
         interface_up: false,
         soft_blocked: false,
     });
     Ok(())
+}
+
+fn trigger_scan(
+    bdf: Bdf,
+    request: &axdriver_net::WirelessScanRequest,
+) -> Result<(), RuntimeStartError> {
+    let mut devices = ATTACHED_DMA.lock();
+    let device = devices
+        .iter_mut()
+        .find(|device| device.bdf == bdf)
+        .ok_or(RuntimeStartError::DeviceNotFound)?;
+    if !device.interface_up || !device.runtime_started || device.soft_blocked {
+        return Err(RuntimeStartError::FirmwareNotReady);
+    }
+    if request.ssid.len() > 32 {
+        return Err(RuntimeStartError::Firmware);
+    }
+    let (Some(nvm), Some(Ok(bundle))) = (device.nvm.as_ref(), device.firmware.as_ref()) else {
+        return Err(RuntimeStartError::FirmwareNotReady);
+    };
+    let channels = axdriver_iwx::init_channel_map(nvm, device.profile.uhb_supported)
+        .into_iter()
+        .filter(|channel| {
+            channel.flags != 0
+                && (request.frequencies_mhz.is_empty()
+                    || request
+                        .frequencies_mhz
+                        .contains(&u32::from(channel.frequency_mhz)))
+        })
+        .collect::<Vec<_>>();
+    if channels.is_empty() {
+        return Err(RuntimeStartError::Firmware);
+    }
+    let command_version = bundle
+        .image
+        .lookup_command_version(axdriver_iwx::IWX_LONG_GROUP, axdriver_iwx::UMAC_SCAN_REQ);
+    if command_version < 14 {
+        return Err(RuntimeStartError::Firmware);
+    }
+    let probe = axdriver_iwx::ProbeRequestConfig {
+        station_address: nvm.hardware_address,
+        rates_2ghz: &IWX_SCAN_RATES_2GHZ,
+        rates_5ghz: &IWX_SCAN_RATES_5GHZ,
+        supports_5ghz: channels
+            .iter()
+            .any(|channel| channel.flags & axdriver_iwx::CHAN_2GHZ == 0),
+        include_ds_parameter: true,
+        vht_capabilities_ie: None,
+        ht_capabilities_ie: None,
+    };
+    let command = axdriver_iwx::initiate_scan_command(
+        axdriver_iwx::UmacScanConfig {
+            version: axdriver_iwx::UmacScanVersion::V14,
+            background: false,
+            channels: &channels,
+            firmware_channel_limit: bundle.image.scan_channels as usize,
+            extended_channel_version: command_version >= 17,
+            channel_flags: 0,
+            probe,
+            desired_ssid: &request.ssid,
+            slot: 0,
+            command_queue: 0,
+        },
+        command_version,
+    )
+    .map_err(|_| RuntimeStartError::Firmware)?;
+    device.scan_cache = Some(axdriver_iwx::ScanCache::new(channels, 0, 0, false));
+    device.scan_phy = None;
+    device.scan_complete = false;
+    let family = device.profile.family;
+    let (controller, cache, phy, complete) = (
+        &mut device.controller,
+        device.scan_cache.as_mut().unwrap(),
+        &mut device.scan_phy,
+        &mut device.scan_complete,
+    );
+    controller
+        .send_encoded_command_wait_allocated(&command, |packet, _| {
+            observe_scan_packet(family, cache, phy, complete, packet);
+            Ok::<_, Infallible>(true)
+        })
+        .map_err(|_| RuntimeStartError::Firmware)?;
+    Ok(())
+}
+
+fn pump_scan_events(device: &mut AttachedDevice) -> Result<(), ()> {
+    let family = device.profile.family;
+    let (controller, cache, phy, complete) = (
+        &mut device.controller,
+        device.scan_cache.as_mut().ok_or(())?,
+        &mut device.scan_phy,
+        &mut device.scan_complete,
+    );
+    let _ = axdriver_iwx::service_legacy_interrupt::<_, PlatformDmaRegion>(
+        &mut controller.registers,
+        &controller.interrupt_masks,
+        Some(&mut controller.resources.ict),
+    )
+    .map_err(|_| ())?;
+    controller
+        .process_rx_notifications(|packet, _| {
+            observe_scan_packet(family, cache, phy, complete, packet);
+            Ok::<_, Infallible>(true)
+        })
+        .map_err(|_| ())?;
+    Ok(())
+}
+
+fn observe_scan_packet(
+    family: axdriver_iwx::DeviceFamily,
+    cache: &mut axdriver_iwx::ScanCache,
+    phy: &mut Option<axdriver_iwx::RxPhyInfo>,
+    complete: &mut bool,
+    packet: &axdriver_iwx::RxPacket<'_>,
+) {
+    match axdriver_iwx::decode_firmware_event(packet) {
+        axdriver_iwx::FirmwareEvent::RxPhy(payload) => {
+            *phy = axdriver_iwx::parse_rx_phy_info(payload).ok();
+        }
+        axdriver_iwx::FirmwareEvent::RxMpdu(payload) => {
+            let Some(phy) = *phy else { return };
+            let Ok(mpdu) = axdriver_iwx::parse_rx_mpdu(payload, family, false) else {
+                return;
+            };
+            let Ok(frame) = axdriver_iwx::normalize_rx_frame(mpdu) else {
+                return;
+            };
+            let rssi = axdriver_iwx::signal_strength_dbm(family, payload)
+                .unwrap_or(-127)
+                .clamp(-127, 0) as i8;
+            cache.observe(&frame, phy.channel as u8, rssi, phy.timestamp);
+        }
+        axdriver_iwx::FirmwareEvent::ScanComplete(_) => *complete = true,
+        _ => {}
+    }
 }
 
 fn bootstrap_init_firmware(
@@ -707,6 +870,7 @@ fn start_regular_firmware(
     runtime: RuntimeConfig,
     hardware_revision: u32,
     bundle: &FirmwareBundle,
+    nvm: &NvmInfo,
 ) -> Result<(), RuntimeStartError> {
     controller
         .start_hardware(profile.integrated)
@@ -795,6 +959,30 @@ fn start_regular_firmware(
             warn!("iwx: runtime ALIVE/PNVM/post-ALIVE sequence failed: {error:?}");
             RuntimeStartError::Firmware
         })?;
+    if bundle
+        .image
+        .api_enabled(u32::from(axdriver_iwx::REDUCED_SCAN_CONFIG_API))
+    {
+        let scan_config_version = bundle.image.lookup_command_version(
+            axdriver_iwx::IWX_LONG_GROUP,
+            axdriver_iwx::SCAN_CONFIG_COMMAND,
+        );
+        let command = axdriver_iwx::reduced_scan_config_command(
+            true,
+            scan_config_version,
+            nvm.valid_tx_antennas,
+            nvm.valid_rx_antennas,
+            0,
+            0,
+        )
+        .map_err(|_| RuntimeStartError::Firmware)?;
+        controller
+            .send_encoded_command_wait(&command, None, |_, _| Ok::<_, Infallible>(true))
+            .map_err(|error| {
+                warn!("iwx: reduced scan config command failed: {error:?}");
+                RuntimeStartError::Firmware
+            })?;
+    }
     controller
         .enable_management_queue(command_version)
         .map_err(|error| {
@@ -830,6 +1018,10 @@ pub fn start_runtime(bdf: DeviceFunction) -> Result<(), RuntimeStartError> {
         device.runtime,
         device.hardware_revision,
         bundle,
+        device
+            .nvm
+            .as_ref()
+            .ok_or(RuntimeStartError::FirmwareNotReady)?,
     ) {
         Ok(()) => {
             device.runtime_started = true;
@@ -1222,7 +1414,7 @@ pub(crate) fn probe(
 
 #[cfg(test)]
 mod tests {
-    use axdriver_iwx::INTEL_VENDOR_ID;
+    use axdriver_iwx::{INTEL_VENDOR_ID, setup_ht_rate_capabilities, setup_vht_rate_capabilities};
     use axdriver_net::NetDriverOps;
 
     use super::*;
