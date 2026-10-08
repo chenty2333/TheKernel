@@ -103,6 +103,9 @@ and SA Query response layouts; the transmit BA bitmap/window advances to the
 requested 12-bit sequence while retaining the source zero-bitmap stop rule.
 Station action dispatch returns no frame for AP-only SA Query requests or
 unsupported action categories, matching the `IEEE80211_STA_ONLY` build.
+Transmit BlockAck negotiation now plans the source INIT-to-REQUESTED
+transition, token and 64-frame window, immediate/delayed policy, response
+timeout, and the optional driver-offload completion/refusal branch.
 The transmit AMPDU admission predicate additionally requires HT, local TX
 support, the active BSS peer in station mode, and RSN protection.
 Management frame helpers also encode Capability Information, DS channel and

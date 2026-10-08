@@ -9,6 +9,7 @@ extern crate alloc;
 mod assoc_rx;
 mod auth_rx;
 mod ba_rx;
+mod ba_tx;
 mod beacon;
 mod channel;
 mod decrypt;
@@ -38,6 +39,11 @@ pub use ba_rx::{
     BaRxError, BarTidOutcome, DelbaOutcome, accept_addba_request, accept_addba_response,
     apply_bar_tid, dispatch_action, receive_addba_request, receive_addba_response, receive_bar,
     receive_delba, refuse_addba_request, refuse_addba_response,
+};
+pub use ba_tx::{
+    ADD_BA_AMSDU, ADD_BA_MAX_WINDOW, ADD_BA_POLICY, ADD_BA_RESPONSE_TIMEOUT_MICROS,
+    ADD_BA_STATUS_UNSPECIFIED, ADD_BA_TID_SHIFT, ADD_BA_WINDOW_SHIFT, AddbaTxOutcome,
+    AddbaTxPolicy, TX_BA_AGREED, TX_BA_INIT, TX_BA_REQUESTED, TxBaAgreement, start_addba_request,
 };
 pub use beacon::{BeaconError, BeaconPolicy, BeaconRxInfo, BeaconUpdate, receive_beacon};
 pub use channel::{
