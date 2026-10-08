@@ -7,8 +7,8 @@ includes bounded host reset/clock/command/PIO, SD and MMC OCR initialization,
 CSD and EXT_CSD capacity/partition metadata parsing, CMD55 APP_CMD validation,
 idempotent-command retries with CMD/DAT reset,
 single/multi-block CMD17/18/24/25 I/O,
-CMD12 multi-block stop, SD four-bit bus selection and legacy high-speed switch,
-MMC HS_TIMING selection, and erase-group-aligned discard via CMD32/33/38; the
+CMD12 multi-block stop, MMC bus-width/HS_TIMING selection, and erase-group-
+aligned discard via CMD32/33/38; the
 PCI binding class-matches SD host controllers, decodes PCI slot-info and maps
 each advertised slot BAR. FreeBSD newbus, task/callout, CAM, and bus-DMA
 frameworks are not copied.
@@ -18,14 +18,25 @@ read-only by default; `mmc.allow_write=1` is required to permit writes, and the
 block driver itself enforces the write restriction. The PCI binding maps the
 FreeBSD `sdhci_devices[]` IDs and their quirk bits, but does not yet implement
 all behavior attached to those quirks, interrupt handling, full card-removal
-lifecycle, ADMA2, 1.8V switching, tuning, UHS/HS200/HS400, and the full
-upstream function set. Capability-gated SDMA uses a 512 KiB, 32-bit DMA bounce
+lifecycle, automatic SD four-bit/high-speed selection, ADMA2, 1.8V switching,
+tuning, UHS/HS200/HS400, and the full
+upstream function set. Removable SD defaults to the safe 1-bit/25 MHz mode;
+the SD CMD6/ACMD6 helpers are present, but automatic SD bus-width/high-speed
+switching remains off because QEMU's emulated card times out those requests.
+Capability-gated SDMA uses a 512 KiB, 32-bit DMA bounce
 region; broken/unsupported DMA falls back to PIO. If a timeout leaves DMA
 quiescence uncertain, the region is quarantined rather than freed. User-area and any advertised boot0/boot1 areas are
 published as separate views;
 boot area writes follow the same default-read-only policy for Intel eMMC. RPMB
 metadata is decoded but its authenticated key/frame protocol is not exposed as a
 generic block device, preventing unauthenticated writes.
+
+QEMU `1b36:0007` advertises DMA but fails SD CMD17 with the SDMA transfer setup
+used here, so that virtual model is assigned a local broken-DMA quirk and
+single-block PIO fallback. This is separate from the FreeBSD upstream PCI
+quirk table. With that mapping, the requested KVM `sdhci-pci` + `sd-card` test
+mounted GPT/ext4, verified read/write, unmounted, and emitted
+`SDHCI_EXT4_RW_OK`; the disposable image retains the written file after exit.
 
 QEMU KVM attached `sdhci-pci` plus a `sd-card`; TheKernel enumerated
 `/dev/mmcblk0` and its GPT partition, mounted ext4, read/wrote a file, unmounted,

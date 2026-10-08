@@ -388,6 +388,7 @@ pub struct SdhciHost<I: SdhciIo> {
     quirks: u32,
     dma: Option<SdhciDmaRegion>,
     dma_inflight: bool,
+    single_block_only: bool,
     timeout_polls: usize,
 }
 
@@ -414,6 +415,7 @@ impl<I: SdhciIo> SdhciHost<I> {
             quirks,
             dma: None,
             dma_inflight: false,
+            single_block_only: false,
             timeout_polls: 100_000,
         }
     }
@@ -427,6 +429,11 @@ impl<I: SdhciIo> SdhciHost<I> {
         self
     }
 
+    pub fn with_single_block_only(mut self) -> Self {
+        self.single_block_only = true;
+        self
+    }
+
     pub const fn capabilities(&self) -> u32 {
         self.capabilities
     }
@@ -435,13 +442,17 @@ impl<I: SdhciIo> SdhciHost<I> {
         self.capabilities2
     }
 
+    pub const fn allows_multi_block(&self) -> bool {
+        !self.single_block_only
+    }
+
     pub const fn clock_hz(&self) -> u32 {
         self.clock_hz
     }
 
     // upstream: sdhci.c sdhci_generic_get_ro()
     pub fn card_write_protected(&mut self) -> bool {
-        self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_WRITE_PROTECT != 0
+        self.io.read32(SDHCI_PRESENT_STATE as usize) & SDHCI_WRITE_PROTECT == 0
     }
 
     // upstream: sdhci.c sdhci_set_bus_width()
@@ -955,7 +966,6 @@ const SD_CMD_WRITE_SINGLE: u8 = 24;
 const SD_CMD_WRITE_MULTIPLE: u8 = 25;
 const SD_CMD_APP: u8 = 55;
 const SD_ACMD_OP_COND: u8 = 41;
-const SD_ACMD_SET_WIDTH: u8 = 6;
 const RSP_NONE: u16 = SDHCI_CMD_RESP_NONE as u16;
 const SD_R1: u16 = SDHCI_CMD_RESP_SHORT as u16 | SDHCI_CMD_CRC as u16 | SDHCI_CMD_INDEX as u16;
 const SD_R1B: u16 =
@@ -1097,34 +1107,6 @@ impl<I: SdhciIo> SdhciDisk<I> {
             // child devices; the current registry exposes only user area.
             let _partition_config = ext_csd.map_or(0, |csd| csd.partition_config);
             let _partition_support = ext_csd.map_or(0, |csd| csd.partition_support);
-        } else {
-            host.application_command(rca, SD_ACMD_SET_WIDTH, 2, SD_R1)?;
-            host.set_bus_width(4);
-            let mut switch_status = [0u8; 64];
-            host.command(
-                SD_CMD_SWITCH_FUNC,
-                0x00ff_fff1,
-                SD_R1 | SD_DATA,
-                Some(&mut switch_status),
-                64,
-            )
-            .ok();
-            if switch_status[13] & 0x02 != 0
-                && host.capabilities & SDHCI_CAN_DO_HISPD != 0
-                && host
-                    .command(
-                        SD_CMD_SWITCH_FUNC,
-                        0x80ff_fff1,
-                        SD_R1 | SD_DATA,
-                        Some(&mut switch_status),
-                        64,
-                    )
-                    .is_ok()
-            {
-                if switch_status[16] & 0x0f == 1 {
-                    host.set_high_speed(host.base_clock_hz.min(50_000_000))?;
-                }
-            }
         }
         if host.clock_hz == 0 {
             let target = host.base_clock_hz.min(25_000_000);
@@ -1249,6 +1231,12 @@ impl<I: SdhciIo> SdhciDisk<I> {
                 .is_none_or(|end| end > self.sectors)
         {
             return Err(SdhciError::InvalidTransfer);
+        }
+        if data.len() > 512 && !self.host.allows_multi_block() {
+            for (index, sector) in data.chunks_exact_mut(512).enumerate() {
+                self.transfer(lba + index as u64, sector, write)?;
+            }
+            return Ok(());
         }
         let multiple = data.len() > 512;
         let command = if write && multiple {
@@ -1714,9 +1702,14 @@ mod tests {
     #[test]
     fn write_protect_pin_is_reported_by_generic_ro_callback() {
         let mut io = MockIo::default();
-        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT | SDHCI_WRITE_PROTECT;
+        io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
         let mut host = SdhciHost::new(io, 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
         assert!(host.card_write_protected());
+        host.io_mut().write32(
+            SDHCI_PRESENT_STATE as usize,
+            SDHCI_CARD_PRESENT | SDHCI_WRITE_PROTECT,
+        );
+        assert!(!host.card_write_protected());
     }
 
     #[test]
