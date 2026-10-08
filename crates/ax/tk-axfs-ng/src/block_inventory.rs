@@ -76,6 +76,35 @@ pub fn block_inventory() -> Vec<BlockInventoryEntry> {
     entries
 }
 
+/// Withdraws whole disks whose driver has an authoritative absent-media
+/// snapshot. The device set is sampled without holding the topology lock while
+/// touching hardware; mounted queue claims make `remove_block_device` return
+/// Busy and are retried on the next poll.
+pub fn remove_absent_media_devices() -> usize {
+    let candidates = EXTRA_BLOCK_DEVICES
+        .get()
+        .map(|devices| {
+            devices
+                .lock()
+                .iter()
+                .filter(|entry| entry.partition.is_none())
+                .map(|entry| (entry.name.clone(), entry.device.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut removed = 0;
+    for (name, device) in candidates {
+        if device.media_presence() == Some(false) {
+            match remove_block_device(&name) {
+                Ok(()) => removed += 1,
+                Err(PartitionRescanError::Busy) => {}
+                Err(error) => log::debug!("block hot-remove {name} deferred: {error:?}"),
+            }
+        }
+    }
+    removed
+}
+
 /// Re-read one registered disk's GPT and atomically replace its partition
 /// views. The parent disk remains registered on every parse/allocation error.
 /// A mounted partition prevents replacement because its filesystem retains

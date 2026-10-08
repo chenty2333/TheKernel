@@ -1,7 +1,11 @@
 //! Linux-shaped registered block topology. Geometry is retained from GPT,
 //! never inferred from a partition-looking name. No device configuration writes.
 use alloc::{borrow::Cow, format, string::String, sync::Arc, vec::Vec};
-use core::fmt::Write;
+use core::{
+    fmt::Write,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use axfs_ng_vfs::{DeviceId, FsName, FsNameBuf, NodeType, VfsError, VfsResult};
 use axsync::Mutex;
@@ -19,6 +23,32 @@ use crate::mounts;
 lazy_static! {
     static ref BLOCK_DEVICE_HANDLES: Mutex<Vec<(String, DeviceHandle<'static, MAX_DEVICES>)>> =
         Mutex::new(Vec::new());
+}
+
+static BLOCK_MEDIA_WORKER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Starts the bounded card/link-detect poller after AXFS and uevent dispatch
+/// are available. Only drivers returning an explicit absent-media fact are
+/// affected; mounted devices remain registered until their claims are released.
+pub fn start_media_poll_worker() -> axerrno::AxResult<()> {
+    if BLOCK_MEDIA_WORKER_STARTED.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    if let Err(error) = axtask::spawn_raw(
+        || loop {
+            let removed = axfs::remove_absent_media_devices();
+            if removed != 0 {
+                info!("block hotplug: withdrew {removed} absent disk(s)");
+            }
+            let _ = axtask::sleep(Duration::from_millis(500));
+        },
+        "block_media_poll".into(),
+        axconfig::TASK_STACK_SIZE,
+    ) {
+        BLOCK_MEDIA_WORKER_STARTED.store(false, Ordering::Release);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn publish_block_uevent_device(entry: &axfs::BlockInventoryEntry) -> VfsResult<()> {

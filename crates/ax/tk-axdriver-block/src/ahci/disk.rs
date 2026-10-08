@@ -24,8 +24,8 @@ use super::{
         AHCI_CAP_64BIT, AHCI_CAP_SNCQ, AHCI_GHC, AHCI_GHC_IE, AHCI_MAX_SLOTS, AHCI_P_CI,
         AHCI_P_CLB, AHCI_P_CLBU, AHCI_P_FB, AHCI_P_FBU, AHCI_P_IE, AHCI_P_IS, AHCI_P_IX_CPD,
         AHCI_P_IX_DHR, AHCI_P_IX_HBD, AHCI_P_IX_HBF, AHCI_P_IX_IF, AHCI_P_IX_OF, AHCI_P_IX_SDB,
-        AHCI_P_IX_TFE, AHCI_P_SACT, AHCI_P_SERR, AHCI_P_TFD, AHCI_PRD_IPC, AHCI_PRD_MAX,
-        ATA_S_ERROR,
+        AHCI_P_IX_TFE, AHCI_P_SACT, AHCI_P_SERR, AHCI_P_SSTS, AHCI_P_TFD, AHCI_PRD_IPC,
+        AHCI_PRD_MAX, ATA_S_ERROR, ATA_SS_DET_MASK, ATA_SS_DET_PHY_ONLINE,
     },
 };
 use crate::{
@@ -945,6 +945,16 @@ impl<I: AhciIo> BlockDriverOps for AhciDisk<I> {
         self.geometry.block_size
     }
 
+    fn media_presence(&mut self) -> Option<bool> {
+        Some(
+            self.controller
+                .io_mut()
+                .read32(self.port.register_base() + AHCI_P_SSTS)
+                & ATA_SS_DET_MASK
+                == ATA_SS_DET_PHY_ONLINE,
+        )
+    }
+
     fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> DevResult {
         self.transfer_blocks(block_id, buf, false)
     }
@@ -1537,6 +1547,16 @@ mod tests {
                 assert_eq!(ptr::read_unaligned(prd.add(4)), 0x9000);
                 assert_eq!(ptr::read_unaligned(prd.add(7)), 511 | AHCI_PRD_IPC);
             }
+        });
+    }
+
+    #[test]
+    fn media_presence_tracks_sata_phy_detection() {
+        with_fake_disk(|disk, _| {
+            assert_eq!(disk.media_presence(), Some(true));
+            disk.controller.io_mut().registers
+                [(AHCI_OFFSET + super::super::regs::AHCI_P_SSTS) / 4] = 0;
+            assert_eq!(disk.media_presence(), Some(false));
         });
     }
 

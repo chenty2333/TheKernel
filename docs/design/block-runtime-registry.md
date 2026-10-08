@@ -13,12 +13,17 @@ and minor assignments are derived from the Linux disk spelling for AHCI,
 SDHCI/MMC, and NVMe names. Old open nodes compare a shared queue identity on
 every operation and fail after remove or same-name replacement.
 
-Registry add/remove/rescan changes now bridge into the kernel `DeviceRegistry`
-and its add/remove uevent publisher. AHCI/SDHCI hardware workers do not yet call
-the registry APIs for slot/card insertion or removal, and PCI MSI/MSI-X and INTx
-completion paths are not yet wired into these controllers. Guest-side GPT
-creation, `BLKRRPART`, ext4 formatting, mount, and read/write are exercised by
-AHCI and SDHCI QEMU smoke runs.
+Registry add/remove/rescan changes bridge into the kernel `DeviceRegistry` and
+its add/remove uevent publisher. A kernel worker now polls only block devices
+whose driver returns an authoritative media-presence fact; absent SATA links
+and SD card detect withdraw the disk and children through that shared path,
+while mounted claims defer removal. Automatic publication for media inserted
+into an empty HBA/SDHCI slot and safe re-identification of replacement cards
+remain outstanding. PCI MSI/MSI-X/INTx completion routes are wired to AHCI and
+SDHCI; AHCI MSI is exercised in QEMU, while SDHCI signal generation remains
+disabled by default because QEMU's INTx route lost command status when enabled.
+Guest-side GPT creation, `BLKRRPART`, ext4 formatting, mount, and read/write
+remain exercised by AHCI and SDHCI QEMU smoke runs.
 # PCI block completion interrupts
 
 The AHCI and SDHCI PCI frontends now admit one completion endpoint per PCI

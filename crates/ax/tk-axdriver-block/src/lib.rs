@@ -400,6 +400,12 @@ pub trait BlockDriverOps: BaseDriverOps {
         false
     }
 
+    /// Snapshot of physical media presence for removable/hotpluggable devices.
+    /// `None` means the driver cannot provide an authoritative presence fact.
+    fn media_presence(&mut self) -> Option<bool> {
+        None
+    }
+
     /// Reads blocked data from the given block.
     ///
     /// The size of the buffer may exceed the block size, in which case multiple

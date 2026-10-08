@@ -310,6 +310,22 @@ impl BlockDriverOps for StaticBlockDevice {
             Self::Usb(device) => device.is_read_only(),
         }
     }
+    fn media_presence(&mut self) -> Option<bool> {
+        match self {
+            Self::Existing(device) => device.media_presence(),
+            #[cfg(feature = "shared-block")]
+            Self::Partition(device) => device.media_presence(),
+            #[cfg(feature = "nvme")]
+            Self::Nvme(device) => device.media_presence(),
+            #[cfg(feature = "ahci-pci")]
+            Self::Ahci(device) => device.media_presence(),
+            #[cfg(feature = "sdhci-pci")]
+            Self::Sdhci(device) => device.media_presence(),
+            Self::BootModule(_) => None,
+            #[cfg(feature = "usb-xhci")]
+            Self::Usb(device) => device.media_presence(),
+        }
+    }
     fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> DevResult {
         match self {
             Self::Existing(device) => device.read_block(block_id, buf),

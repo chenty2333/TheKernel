@@ -1192,6 +1192,11 @@ impl<I: SdhciIo> SdhciHost<I> {
         true
     }
 
+    /// Card-detect snapshot for the runtime removable-media poller.
+    pub fn media_present(&mut self) -> bool {
+        self.card_present()
+    }
+
     fn reset(&mut self, mask: u8) -> Result<(), SdhciError> {
         self.io.write8(SDHCI_SOFTWARE_RESET as usize, mask);
         if self.quirks & SDHCI_QUIRK_WAITFOR_RESET_ASSERTED != 0 {
@@ -2630,6 +2635,10 @@ impl<I: SdhciIo> crate::BaseDriverOps for SdhciPartitionDisk<I> {
 }
 
 impl<I: SdhciIo> crate::BlockDriverOps for SdhciPartitionDisk<I> {
+    fn media_presence(&mut self) -> Option<bool> {
+        Some(self.shared.lock().host.media_present())
+    }
+
     fn install_completion_notifier(
         &mut self,
         notifier: Option<crate::BlockCompletionNotifier>,
@@ -3435,6 +3444,14 @@ mod tests {
         let (id, serial) = format_card_id(cid, false, false);
         assert_eq!(id, "SD SD01G 8.0 SN 0028F959 MFG 08/2008 by 3 TN");
         assert_eq!(serial, "0028F959");
+    }
+
+    #[test]
+    fn media_presence_reports_card_detect_state() {
+        let mut host = SdhciHost::new(MockIo::default(), 50 << SDHCI_CLOCK_BASE_SHIFT, 0, 3);
+        assert!(!host.media_present());
+        host.io.registers[SDHCI_PRESENT_STATE as usize / 4] = SDHCI_CARD_PRESENT;
+        assert!(host.media_present());
     }
 
     #[test]
