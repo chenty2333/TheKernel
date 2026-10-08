@@ -1901,7 +1901,7 @@ pub(super) fn init(
                     axlog::warn!("intel-fastboot: shared DPLL manager init refused: {error:?}");
                     Error::Refused
                 })?;
-            let dpll_index = 3 + port.index();
+            let dpll_index = (3 + port.index()) as usize;
             let (manager_pll_on, _) = shared_dpll
                 .get_hw_state(
                     &window,
