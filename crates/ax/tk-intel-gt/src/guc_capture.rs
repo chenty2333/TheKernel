@@ -898,6 +898,233 @@ pub fn build_capture_output_nodes(
     Ok(output)
 }
 
+struct PooledCaptureNode {
+    output: CaptureOutputNode,
+    register_buffers: [Vec<CaptureRegister>; 3],
+}
+
+impl PooledCaptureNode {
+    fn new(max_registers: usize) -> Result<Self, CaptureError> {
+        let mut register_buffers: [Vec<CaptureRegister>; 3] = core::array::from_fn(|_| Vec::new());
+        for registers in &mut register_buffers {
+            registers
+                .try_reserve_exact(max_registers)
+                .map_err(|_| CaptureError::InvalidBuffer)?;
+        }
+        Ok(Self {
+            output: CaptureOutputNode::empty(false),
+            register_buffers,
+        })
+    }
+
+    fn reset(&mut self) {
+        for index in 0..3 {
+            if let Some(mut list) = self.output.lists[index].take() {
+                list.registers.clear();
+                self.register_buffers[index] = list.registers;
+            }
+            self.register_buffers[index].clear();
+        }
+        self.output.is_partial = false;
+        self.output.engine_class = 0;
+        self.output.engine_instance = 0;
+        self.output.guc_id = 0;
+        self.output.lrca = 0;
+    }
+
+    fn set_list(&mut self, input: &CaptureList, max_registers: usize) -> Result<(), CaptureError> {
+        let index = usize::from(input.capture_type);
+        if index >= 3 {
+            return Err(CaptureError::InvalidType);
+        }
+        let count = input.registers.len().min(max_registers);
+        let registers = &mut self.register_buffers[index];
+        registers.clear();
+        if registers.capacity() < count {
+            registers
+                .try_reserve_exact(count - registers.len())
+                .map_err(|_| CaptureError::InvalidBuffer)?;
+        }
+        registers.extend_from_slice(&input.registers[..count]);
+        let registers = core::mem::take(registers);
+        self.output.lists[index] = Some(CaptureList {
+            vfid: input.vfid,
+            capture_type: input.capture_type,
+            engine_class: input.engine_class,
+            engine_instance: input.engine_instance,
+            lrca: input.lrca,
+            guc_id: input.guc_id,
+            registers,
+        });
+        Ok(())
+    }
+
+    fn copy_lists(&mut self, source: &CaptureOutputNode, keep_global: bool, keep_class: bool) {
+        self.output.is_partial = source.is_partial;
+        let keep = [keep_global, keep_class, false];
+        for index in 0..3 {
+            if !keep[index] {
+                continue;
+            }
+            let Some(list) = source.lists[index].as_ref() else {
+                continue;
+            };
+            let registers = &mut self.register_buffers[index];
+            registers.clear();
+            // Each source list was clipped to the same preallocated maximum.
+            registers.extend_from_slice(&list.registers);
+            let registers = core::mem::take(registers);
+            self.output.lists[index] = Some(CaptureList {
+                vfid: list.vfid,
+                capture_type: list.capture_type,
+                engine_class: list.engine_class,
+                engine_instance: list.engine_instance,
+                lrca: list.lrca,
+                guc_id: list.guc_id,
+                registers,
+            });
+        }
+        if keep_class {
+            self.output.engine_class = source.engine_class;
+        }
+    }
+}
+
+/// Bounded preallocated capture-node cache matching the upstream cachelist /
+/// outlist policy. When the cache is empty, the newest outlist node is reused.
+pub struct CaptureNodeCache {
+    free: Vec<PooledCaptureNode>,
+    output: Vec<PooledCaptureNode>,
+    max_registers: usize,
+}
+
+impl CaptureNodeCache {
+    /// upstream: guc_capture_create_prealloc_nodes()/guc_capture_alloc_one_node().
+    pub fn new(node_count: usize, max_registers: usize) -> Result<Self, CaptureError> {
+        if node_count == 0 || max_registers == 0 {
+            return Err(CaptureError::InvalidBuffer);
+        }
+        let mut free = Vec::new();
+        let mut output = Vec::new();
+        free.try_reserve_exact(node_count)
+            .map_err(|_| CaptureError::InvalidBuffer)?;
+        output
+            .try_reserve_exact(node_count)
+            .map_err(|_| CaptureError::InvalidBuffer)?;
+        for _ in 0..node_count {
+            free.push(PooledCaptureNode::new(max_registers)?);
+        }
+        Ok(Self {
+            free,
+            output,
+            max_registers,
+        })
+    }
+
+    /// Use the upstream cache depth and default per-node register capacity.
+    pub fn new_upstream() -> Result<Self, CaptureError> {
+        Self::new(
+            CAPTURE_PREALLOC_NODE_COUNT,
+            CAPTURE_PREALLOC_DEFAULT_REGISTERS,
+        )
+    }
+
+    /// upstream: guc_capture_get_prealloc_node(); steal newest outlist node on pressure.
+    fn take_node(&mut self) -> Option<PooledCaptureNode> {
+        let mut node = self.free.pop().or_else(|| self.output.pop())?;
+        node.reset();
+        Some(node)
+    }
+
+    /// Split and append all nodes from one GuC group without allocating node
+    /// or register arrays in the capture processing path.
+    /// upstream: intel_guc_capture.c guc_capture_extract_reglists().
+    pub fn process_group(&mut self, group: &CaptureGroup) -> Result<usize, CaptureError> {
+        let mut generated = 0usize;
+        let mut current: Option<PooledCaptureNode> = None;
+        for input in &group.lists {
+            let list_type = input.capture_type;
+            if list_type >= CAPTURE_TYPE_MAX {
+                continue;
+            }
+            let boundary = current.as_ref().and_then(|node| match list_type {
+                CAPTURE_TYPE_GLOBAL => Some((false, false)),
+                CAPTURE_TYPE_ENGINE_CLASS
+                    if node.output.lists[usize::from(CAPTURE_TYPE_ENGINE_CLASS)].is_some() =>
+                {
+                    Some((true, false))
+                }
+                CAPTURE_TYPE_ENGINE_INSTANCE
+                    if node.output.lists[usize::from(CAPTURE_TYPE_ENGINE_INSTANCE)].is_some() =>
+                {
+                    Some((true, true))
+                }
+                _ => None,
+            });
+            if let Some((keep_global, keep_class)) = boundary {
+                let old = current.take().ok_or(CaptureError::InvalidBuffer)?;
+                let Some(mut next) = self.take_node() else {
+                    self.output.push(old);
+                    return Err(CaptureError::InvalidBuffer);
+                };
+                next.output.is_partial = old.output.is_partial;
+                next.copy_lists(&old.output, keep_global, keep_class);
+                self.output.push(old);
+                generated += 1;
+                current = Some(next);
+            }
+            if current.is_none() {
+                current = Some(self.take_node().ok_or(CaptureError::InvalidBuffer)?);
+                if let Some(node) = current.as_mut() {
+                    node.output.is_partial = group.group_type == CAPTURE_GROUP_PARTIAL;
+                }
+            }
+            let node = current.as_mut().ok_or(CaptureError::InvalidBuffer)?;
+            node.set_list(input, self.max_registers)?;
+            match list_type {
+                CAPTURE_TYPE_ENGINE_CLASS => node.output.engine_class = input.engine_class,
+                CAPTURE_TYPE_ENGINE_INSTANCE => {
+                    node.output.engine_class = input.engine_class;
+                    node.output.engine_instance = input.engine_instance;
+                    node.output.lrca = input.lrca;
+                    node.output.guc_id = input.guc_id;
+                }
+                _ => {}
+            }
+        }
+        if let Some(node) = current {
+            self.output.push(node);
+            generated += 1;
+        }
+        Ok(generated)
+    }
+
+    /// upstream: intel_guc_capture_get_matching_node().
+    pub fn take_matching_node(
+        &mut self,
+        engine_guc_id: u32,
+        context_guc_id: u32,
+        context_lrca: u32,
+    ) -> Option<CaptureOutputNode> {
+        let index = self.output.iter().position(|node| {
+            is_matching_engine(&node.output, engine_guc_id, context_guc_id, context_lrca)
+        })?;
+        let mut pooled = self.output.remove(index);
+        let output = pooled.output.clone();
+        pooled.reset();
+        self.free.push(pooled);
+        Some(output)
+    }
+
+    pub fn free_len(&self) -> usize {
+        self.free.len()
+    }
+
+    pub fn output_len(&self) -> usize {
+        self.output.len()
+    }
+}
+
 /// Decode a GuC capture group. Captures remain separate, preserving their
 /// original order and metadata for the engine-reset/core-dump consumer.
 /// upstream: intel_guc_capture.c guc_capture_extract_reglists().
@@ -1196,6 +1423,68 @@ mod tests {
         assert!(nodes[1].lists[usize::from(CAPTURE_TYPE_GLOBAL)].is_some());
         assert!(nodes[1].lists[usize::from(CAPTURE_TYPE_ENGINE_CLASS)].is_some());
         assert_eq!(nodes[1].guc_id, 1);
+    }
+
+    #[test]
+    fn preallocated_capture_cache_reuses_nodes_and_clips_register_lists() {
+        let registers = vec![
+            CaptureRegister {
+                offset: 1,
+                value: 1,
+                flags: 0,
+                mask: 0,
+            },
+            CaptureRegister {
+                offset: 2,
+                value: 2,
+                flags: 0,
+                mask: 0,
+            },
+            CaptureRegister {
+                offset: 3,
+                value: 3,
+                flags: 0,
+                mask: 0,
+            },
+        ];
+        let make = |capture_type, instance| CaptureList {
+            vfid: 0,
+            capture_type,
+            engine_class: 0,
+            engine_instance: instance,
+            lrca: 0x1000 + u32::from(instance) * 0x1000,
+            guc_id: u32::from(instance),
+            registers: registers.clone(),
+        };
+        let group = CaptureGroup {
+            vfid: 0,
+            group_type: CAPTURE_GROUP_FULL,
+            lists: vec![
+                make(CAPTURE_TYPE_GLOBAL, 0),
+                make(CAPTURE_TYPE_ENGINE_CLASS, 0),
+                make(CAPTURE_TYPE_ENGINE_INSTANCE, 0),
+                make(CAPTURE_TYPE_ENGINE_INSTANCE, 1),
+            ],
+        };
+        let mut cache = CaptureNodeCache::new(3, 2).unwrap();
+        assert_eq!(cache.free_len(), 3);
+        assert_eq!(cache.process_group(&group), Ok(2));
+        assert_eq!(cache.output_len(), 2);
+        assert_eq!(cache.free_len(), 1);
+        let matched = cache
+            .take_matching_node(0 | (1 << GUC_ENGINE_INSTANCE_SHIFT), 1, 0x2001)
+            .unwrap();
+        assert_eq!(matched.guc_id, 1);
+        assert_eq!(
+            matched.lists[usize::from(CAPTURE_TYPE_ENGINE_INSTANCE)]
+                .as_ref()
+                .unwrap()
+                .registers
+                .len(),
+            2
+        );
+        assert_eq!(cache.free_len(), 2);
+        assert_eq!(cache.output_len(), 1);
     }
 
     #[test]

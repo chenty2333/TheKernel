@@ -25,7 +25,7 @@ Rust 侧复用 `kernel/src/drm/intel/{gt.rs,gt_probe.rs,gem_exec.rs,gem_context.
 
 `guc_ct.rs` 已提供同步 TLB 完成和 FIFO deferred-event dispatch adapter（分别对应上游 receive-context 路径与 incoming-request worker）、nonblocking send busy-loop、ring reset 和 firmware-running 时的显式 disable action；GuC 事件业务 handler、VMA fini/owner teardown 以及 kernel 侧 G2H interrupt/tasklet/workqueue 调用链仍未接入。
 
-`guc_capture.rs` 是 `intel_guc_capture.c` 的数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，快照 log state 并按 overflow/invalid offset 选择全环重读，保留原始 metadata/order、跳过未知 capture type，依赖引擎 reset group 将 lists 切分为节点并克隆 shared global/class data，按 GuC ID、context ID 和页对齐 LRCA 匹配/移除节点并提取 IPEHR/INSTDONE，含 Xe_LP 静态寄存器 offset/name 表、按拓扑展开 steered registers、选择 base/ext register lists，构造 page-aligned ADS list、3x overbuffer size assessment 和可独立调用的 coredump text formatter。ADS owner wire-up、真正 preallocated capture-node cache、formatter 与 coredump 的对接及 CT event caller 尚未实现。
+`guc_capture.rs` 是 `intel_guc_capture.c` 的数据面切片：按上游 ring 语义解包跨环的 group/capture/register 记录，快照 log state 并按 overflow/invalid offset 选择全环重读，保留原始 metadata/order、跳过未知 capture type，依赖引擎 reset group 将 lists 切分为节点并克隆 shared global/class data，含 1536 节点/每 list 有界寄存器池并在压力下回收 outlist 节点，按 GuC ID、context ID 和页对齐 LRCA 匹配/移除节点并提取 IPEHR/INSTDONE，含 Xe_LP 静态寄存器 offset/name 表、按拓扑展开 steered registers、选择 base/ext register lists，构造 page-aligned ADS list、3x overbuffer size assessment 和可独立调用的 coredump text formatter。ADS owner wire-up、cache node 与 CT event/coredump 真实生命周期接入仍未完成。
 
 `guc_log.rs` 已有 log sizing、overflow/read-pointer/relay snapshot 之外，补齐 control-log、force-flush 与 flush-complete 的 GuC action payload；log DMA/relay 工作线程以及 CT action callers 仍未接入。
 
