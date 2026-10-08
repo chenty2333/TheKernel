@@ -1050,6 +1050,20 @@ pub fn build_ads(input: &AdsBuildInput) -> Result<(AdsLayout, Vec<u8>), Error> {
     Ok((layout, bytes))
 }
 
+/// Reinitialize all GuC-owned ADS fields and clear private data after a GuC
+/// reset, matching the `__guc_ads_init()` + private-data reset sequence.
+/// The caller owns the pinned GGTT allocation and supplies the same runtime
+/// inputs used at initial creation.
+/// upstream: intel_guc_ads.c intel_guc_ads_reset().
+pub fn intel_guc_ads_reset(input: &AdsBuildInput, ads_blob: &mut [u8]) -> Result<AdsLayout, Error> {
+    let (layout, fresh) = build_ads(input)?;
+    if ads_blob.len() != fresh.len() {
+        return Err(Error::Refused);
+    }
+    ads_blob.copy_from_slice(&fresh);
+    Ok(layout)
+}
+
 /// upstream: intel_guc_ads.c intel_guc_engine_usage_offset().
 pub fn engine_usage_offset(base_ggtt: u32) -> Result<u32, Error> {
     if base_ggtt == 0 || base_ggtt & (PAGE_SIZE as u32 - 1) != 0 {
@@ -1354,6 +1368,10 @@ mod tests {
         bytes[layout.private_data_offset] = 0xff;
         reset_private_data(&mut bytes, layout).unwrap();
         assert_eq!(bytes[layout.private_data_offset], 0);
+        let expected = build_ads(&input).unwrap().1;
+        bytes.fill(0xa5);
+        assert_eq!(intel_guc_ads_reset(&input, &mut bytes), Ok(layout));
+        assert_eq!(bytes, expected);
     }
 
     #[test]
