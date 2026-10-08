@@ -13,6 +13,7 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
+pub use crate::intel_timeline_types_upstream::{I915Syncmap, IntelTimeline};
 use crate::{
     intel_engine_cs_upstream::{
         AtomicT, DelayedWork, IntelEngineCs, IntelGt, IntelSseu, ListHead, LlistHead, LlistNode,
@@ -654,35 +655,6 @@ const _: [(); 0] = [(); core::mem::offset_of!(TtmBufferObjectLayout, base)];
 const _: [(); 8] = [(); core::mem::align_of::<DrmI915GemObject>()];
 const _: [(); 0] = [(); core::mem::offset_of!(DrmI915GemObject, base)];
 
-#[repr(C)]
-pub struct I915Syncmap {
-    _opaque: [u8; 0],
-}
-
-#[repr(C)]
-pub struct IntelTimeline {
-    pub fence_context: u64,
-    pub seqno: u32,
-    pub mutex: Mutex,
-    pub pin_count: AtomicT,
-    pub active_count: AtomicT,
-    pub hwsp_map: *mut c_void,
-    pub hwsp_seqno: *const u32,
-    pub hwsp_ggtt: *mut I915Vma,
-    pub hwsp_offset: u32,
-    pub has_initial_breadcrumb: bool,
-    pub requests: ListHead,
-    pub last_request: I915ActiveFence,
-    pub active: I915Active,
-    pub retire: *mut IntelTimeline,
-    pub sync: *mut I915Syncmap,
-    pub link: ListHead,
-    pub gt: *mut IntelGt,
-    pub engine_link: ListHead,
-    pub kref: Kref,
-    pub rcu: RcuHead,
-}
-
 const _: [(); 64] = [(); core::mem::size_of::<DmaFence>()];
 const _: [(); 168] = [(); core::mem::size_of::<DrmMmNode>()];
 const _: [(); 8] = [(); core::mem::align_of::<DrmMmNode>()];
@@ -725,29 +697,7 @@ const _: [(); 1144] = [(); core::mem::size_of::<DrmI915GemObject>()];
 const _: [(); 688] = [(); core::mem::offset_of!(DrmI915GemObject, mm)];
 const _: [(); 912] = [(); core::mem::offset_of!(DrmI915GemObject, mm)
     + core::mem::offset_of!(I915GemObjectMm, madv_dirty)];
-const _: [(); 360] = [(); core::mem::size_of::<IntelTimeline>()];
-const _: [(); 8] = [(); core::mem::align_of::<IntelTimeline>()];
 const _: [(); 32] = [(); core::mem::size_of::<I915ActiveFence>()];
-const _: [(); 0] = [(); core::mem::offset_of!(IntelTimeline, fence_context)];
-const _: [(); 8] = [(); core::mem::offset_of!(IntelTimeline, seqno)];
-const _: [(); 16] = [(); core::mem::offset_of!(IntelTimeline, mutex)];
-const _: [(); 40] = [(); core::mem::offset_of!(IntelTimeline, pin_count)];
-const _: [(); 44] = [(); core::mem::offset_of!(IntelTimeline, active_count)];
-const _: [(); 48] = [(); core::mem::offset_of!(IntelTimeline, hwsp_map)];
-const _: [(); 56] = [(); core::mem::offset_of!(IntelTimeline, hwsp_seqno)];
-const _: [(); 64] = [(); core::mem::offset_of!(IntelTimeline, hwsp_ggtt)];
-const _: [(); 72] = [(); core::mem::offset_of!(IntelTimeline, hwsp_offset)];
-const _: [(); 76] = [(); core::mem::offset_of!(IntelTimeline, has_initial_breadcrumb)];
-const _: [(); 80] = [(); core::mem::offset_of!(IntelTimeline, requests)];
-const _: [(); 96] = [(); core::mem::offset_of!(IntelTimeline, last_request)];
-const _: [(); 128] = [(); core::mem::offset_of!(IntelTimeline, active)];
-const _: [(); 280] = [(); core::mem::offset_of!(IntelTimeline, retire)];
-const _: [(); 288] = [(); core::mem::offset_of!(IntelTimeline, sync)];
-const _: [(); 296] = [(); core::mem::offset_of!(IntelTimeline, link)];
-const _: [(); 312] = [(); core::mem::offset_of!(IntelTimeline, gt)];
-const _: [(); 320] = [(); core::mem::offset_of!(IntelTimeline, engine_link)];
-const _: [(); 336] = [(); core::mem::offset_of!(IntelTimeline, kref)];
-const _: [(); 344] = [(); core::mem::offset_of!(IntelTimeline, rcu)];
 const _: [(); 48] = [(); core::mem::size_of::<I915Priolist>()];
 const _: [(); 64] = [(); core::mem::size_of::<I915SchedNode>()];
 const _: [(); 32] = [(); core::mem::offset_of!(I915SchedNode, link)];

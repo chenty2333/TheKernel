@@ -125,6 +125,9 @@ pub mod intel_lrc_upstream;
 pub mod intel_ring;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
+pub mod intel_timeline_types_upstream;
+#[cfg(feature = "upstream-gt")]
+#[allow(unsafe_code)]
 pub mod intel_timeline_upstream;
 #[cfg(feature = "upstream-gt")]
 #[allow(unsafe_code)]
