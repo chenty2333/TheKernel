@@ -19,9 +19,12 @@ const RX_BUFFER_SIZE_4K: u32 = 4;
 const TFD_FORMAT_LONG: u32 = 1 << 8;
 const RX_CB_SIZE_POSITION: u32 = 4;
 const RX_SIZE_POSITION: u32 = 9;
-const GEN2_CONTEXT_SIZE: usize = 1792;
-const GEN3_CONTEXT_SIZE: usize = 104;
-const PRPH_SCRATCH_SIZE: usize = 1660;
+pub const GEN2_CONTEXT_BYTES: usize = 1792;
+pub const GEN3_CONTEXT_BYTES: usize = 104;
+pub const PRPH_SCRATCH_BYTES: usize = 1660;
+const GEN2_CONTEXT_SIZE: usize = GEN2_CONTEXT_BYTES;
+const GEN3_CONTEXT_SIZE: usize = GEN3_CONTEXT_BYTES;
+const PRPH_SCRATCH_SIZE: usize = PRPH_SCRATCH_BYTES;
 
 /// Inputs common to the Gen2/AX210 context-info formats.
 #[derive(Debug, Clone, Copy)]

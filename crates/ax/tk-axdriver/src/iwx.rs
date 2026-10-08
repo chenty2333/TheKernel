@@ -3,11 +3,21 @@
 //! The target hardware path is continued in `tk-axdriver-iwx`; this module
 //! wires the upstream PCI match decision into TheKernel's PCI driver walk.
 
+use alloc::vec::Vec;
+use core::{
+    ptr::NonNull,
+    sync::atomic::{Ordering, fence},
+};
+
+use axalloc::{UsageKind, global_allocator};
 use axdriver_iwx::{
-    AX211_DEVICE_ID, INTEL_VENDOR_ID, RuntimeConfig, lookup_config, matches_pci_device,
+    AX211_DEVICE_ID, AttachAllocationError, DeviceFamily, DmaAllocator, DmaError, DmaRegion,
+    INTEL_VENDOR_ID, IwxAttachResources, RuntimeConfig, allocate_attach_resources, lookup_config,
+    matches_pci_device,
 };
 use axdriver_pci::{BarInfo, DeviceFunction, DeviceFunctionInfo, PciRoot};
-use axhal::mem::phys_to_virt;
+use axhal::mem::{phys_to_virt, virt_to_phys};
+use spin::Mutex;
 
 use crate::drivers::BusProbeResult;
 
@@ -17,6 +27,101 @@ const CSR_HW_RFID_TYPE_MASK: u32 = 0x0fff_000;
 const CSR_HW_RFID_TYPE_SHIFT: u32 = 12;
 const RF_TYPE_GF: u16 = 0x10d;
 const SPECIAL_BZ_DEVICE: u16 = 0x7740;
+
+struct PlatformDmaRegion {
+    cpu: NonNull<u8>,
+    physical: u64,
+    capacity: usize,
+    pages: usize,
+}
+
+unsafe impl Send for PlatformDmaRegion {}
+
+impl DmaRegion for PlatformDmaRegion {
+    fn device_address(&self) -> u64 {
+        self.physical
+    }
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+    fn write(&mut self, bytes: &[u8]) -> Result<(), DmaError> {
+        self.write_at(0, bytes)
+    }
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), DmaError> {
+        let Some(end) = offset.checked_add(bytes.len()) else {
+            return Err(DmaError::RegionTooSmall);
+        };
+        if end > self.capacity {
+            return Err(DmaError::RegionTooSmall);
+        }
+        // SAFETY: offset/end are bounded by this live allocation.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.cpu.as_ptr().add(offset),
+                bytes.len(),
+            );
+        }
+        fence(Ordering::Release);
+        Ok(())
+    }
+    fn read_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DmaError> {
+        let Some(end) = offset.checked_add(bytes.len()) else {
+            return Err(DmaError::RegionTooSmall);
+        };
+        if end > self.capacity {
+            return Err(DmaError::RegionTooSmall);
+        }
+        fence(Ordering::Acquire);
+        // SAFETY: offset/end are bounded by this live allocation.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.cpu.as_ptr().add(offset),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PlatformDmaRegion {
+    fn drop(&mut self) {
+        global_allocator().dealloc_pages(self.cpu.as_ptr() as usize, self.pages, UsageKind::Dma);
+    }
+}
+
+struct PlatformDmaAllocator;
+impl DmaAllocator for PlatformDmaAllocator {
+    type Region = PlatformDmaRegion;
+    fn allocate(&mut self, size: usize) -> Result<Self::Region, DmaError> {
+        let pages = size.max(1).div_ceil(4096);
+        let virtual_address = global_allocator()
+            .alloc_pages(pages, 4096, UsageKind::Dma)
+            .map_err(|_| DmaError::AllocationFailed)?;
+        if virtual_address == 0 {
+            return Err(DmaError::AllocationFailed);
+        }
+        // SAFETY: the allocator returned an owned page-aligned DMA allocation.
+        unsafe {
+            core::ptr::write_bytes(virtual_address as *mut u8, 0, pages * 4096);
+        }
+        let cpu = NonNull::new(virtual_address as *mut u8).ok_or(DmaError::AllocationFailed)?;
+        let physical = virt_to_phys(virtual_address.into()).as_usize() as u64;
+        Ok(PlatformDmaRegion {
+            cpu,
+            physical,
+            capacity: size,
+            pages,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Bdf(u8, u8, u8);
+
+static ATTACHED_DMA: Mutex<Vec<(Bdf, IwxAttachResources<PlatformDmaRegion>)>> =
+    Mutex::new(Vec::new());
 
 fn pci_match_decision(vendor_id: u16, device_id: u16, rf_id: Option<u32>) -> bool {
     if !matches_pci_device(vendor_id, device_id) {
@@ -28,6 +133,39 @@ fn pci_match_decision(vendor_id: u16, device_id: u16, rf_id: Option<u32>) -> boo
     rf_id.is_some_and(|raw| {
         ((raw & CSR_HW_RFID_TYPE_MASK) >> CSR_HW_RFID_TYPE_SHIFT) as u16 == RF_TYPE_GF
     })
+}
+
+fn device_family(device_id: u16) -> Option<DeviceFamily> {
+    match device_id {
+        0x2723 | 0x02f0 | 0xa0f0 | 0x34f0 | 0x06f0 | 0x43f0 | 0x3df0 | 0x4df0 => {
+            Some(DeviceFamily::Family22000)
+        }
+        0x2725 | 0x2726 | 0x51f0 | 0x7a70 | 0x51f1 | 0x7af0 | 0x7e40 | 0x54f0 | 0x7f70 => {
+            Some(DeviceFamily::Ax210)
+        }
+        0x7740 => Some(DeviceFamily::Bz),
+        _ => None,
+    }
+}
+
+fn allocate_resources(
+    bdf: DeviceFunction,
+    family: DeviceFamily,
+) -> Result<(), AttachAllocationError> {
+    let key = Bdf(bdf.bus, bdf.device, bdf.function);
+    let mut attached = ATTACHED_DMA.lock();
+    if attached.iter().any(|(existing, _)| *existing == key) {
+        return Ok(());
+    }
+    let resources = allocate_attach_resources(&mut PlatformDmaAllocator, family)?;
+    attached.try_reserve(1).map_err(|_| {
+        AttachAllocationError::Allocation(
+            axdriver_iwx::AttachAllocationStage::ContextInfo,
+            DmaError::AllocationFailed,
+        )
+    })?;
+    attached.push((key, resources));
+    Ok(())
 }
 
 /// Apply `iwx_match()` to one PCI function, including the BZ/GF runtime RF check.
@@ -104,13 +242,21 @@ pub(crate) fn probe(
         ((rf_id >> 29) & 1) as u8,
     );
     match lookup_config(config) {
-        Some(selected) => info!(
-            "iwx: {bdf}: PCI {:#06x}:{:#06x} matched {selected:?} (subsystem {:#06x}:{:#06x})",
-            info.vendor_id,
-            info.device_id,
-            root.endpoint_subsystem_ids(bdf).0,
-            subsystem,
-        ),
+        Some(selected) => {
+            info!(
+                "iwx: {bdf}: PCI {:#06x}:{:#06x} matched {selected:?} (subsystem {:#06x}:{:#06x})",
+                info.vendor_id,
+                info.device_id,
+                root.endpoint_subsystem_ids(bdf).0,
+                subsystem,
+            );
+            if let Some(family) = device_family(info.device_id) {
+                if let Err(error) = allocate_resources(bdf, family) {
+                    warn!("iwx: {bdf}: attach DMA allocation failed: {error:?}");
+                    return BusProbeResult::Claimed;
+                }
+            }
+        }
         None => warn!("iwx: {bdf}: matched PCI function has no runtime iwx config"),
     }
     debug_assert_eq!(info.vendor_id, INTEL_VENDOR_ID);
@@ -124,6 +270,8 @@ pub(crate) fn probe(
 
 #[cfg(test)]
 mod tests {
+    use axdriver_iwx::INTEL_VENDOR_ID;
+
     use super::*;
 
     #[test]

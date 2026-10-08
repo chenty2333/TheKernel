@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod alive;
 mod apm;
+mod attach;
 mod ba;
 mod binding;
 mod bringup;
@@ -59,6 +60,10 @@ pub use apm::{
     ApmError, apm_init, apm_stop, clear_persistence_bit, force_power_gating, prepare_card_hw,
     set_hw_ready, software_reset, start_hardware,
 };
+pub use attach::{
+    AttachAllocationError, AttachAllocationStage, ICT_ALIGNMENT, ICT_BYTES, IwxAttachResources,
+    PCI_TX_QUEUE_COUNT, PRPH_INFO_BYTES, allocate_attach_resources,
+};
 pub use ba::{
     BaError, BaTimeoutAction, BarFrameRelease, INVALID_BAID, MAX_RX_BA_SESSIONS,
     RX_REORDER_TIMEOUT_MQ_USEC, ReorderBuffer, RxBaSession, RxBaTable, STATION_ID,
@@ -92,8 +97,9 @@ pub use config::{
     matches_pci_device,
 };
 pub use context::{
-    ContextError, ContextQueueAddresses, build_gen2_context, build_gen3_context,
-    build_gen3_prph_scratch, set_gen3_pnvm, start_gen2_context, start_gen3_context,
+    ContextError, ContextQueueAddresses, GEN2_CONTEXT_BYTES, GEN3_CONTEXT_BYTES,
+    PRPH_SCRATCH_BYTES, build_gen2_context, build_gen3_context, build_gen3_prph_scratch,
+    set_gen3_pnvm, start_gen2_context, start_gen3_context,
 };
 pub use control::{
     IoctlAction, IoctlError, IoctlKind, NetworkIoctlResult, WatchdogAction, WatchdogOutcome,

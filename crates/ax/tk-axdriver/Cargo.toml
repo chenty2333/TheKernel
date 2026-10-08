@@ -74,7 +74,7 @@ igc = [
     "dep:axalloc",
     "dep:axhal",
 ]
-iwx = ["net", "bus-pci", "dep:axdriver_iwx", "dep:axalloc", "dep:axhal"]
+iwx = ["net", "bus-pci", "dep:axdriver_iwx", "dep:axalloc", "dep:axhal", "dep:spin"]
 ixgbe = [
     "net",
     "axdriver_net/ixgbe",
