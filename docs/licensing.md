@@ -739,3 +739,7 @@ in Linux 7.2.3 `intel_color.c` (MIT, © 2016 Intel); its SPDX tag and crate
 `tk-intel-display/src/intel_fb_full.rs` translates all 89 framebuffer functions
 in Linux 7.2.3 `intel_fb.c` (MIT, © 2021 Intel); its SPDX tag and crate
 `LICENSE-MIT` preserve the grant.
+
+`tk-intel-display/src/intel_atomic_full.rs` translates all 15 atomic helper
+functions in Linux 7.2.3 `intel_atomic.c` (MIT, © 2015 Intel); its SPDX tag
+and crate `LICENSE-MIT` preserve the grant.
