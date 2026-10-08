@@ -96,6 +96,7 @@ pub struct SerdesLink {
 }
 
 pub trait PhyOps82571 {
+    fn delay_us(&mut self, micros: u32);
     fn read_phy(&mut self, reg: u16) -> DevResult<u16>;
     fn write_phy(&mut self, reg: u16, value: u16) -> DevResult;
     fn generic_phy_id(&mut self) -> DevResult<(u32, u32)>;
