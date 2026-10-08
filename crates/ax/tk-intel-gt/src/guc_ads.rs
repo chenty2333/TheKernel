@@ -186,6 +186,37 @@ pub struct EngineRegset {
     pub registers: Vec<MmioReg>,
 }
 
+pub const GUC_REGSET_MASKED: u32 = 1;
+pub const GUC_REGSET_NEEDS_STEERING: u32 = 1 << 1;
+pub const GUC_REGSET_STEERING_GROUP_SHIFT: u32 = 12;
+pub const GUC_REGSET_STEERING_INSTANCE_SHIFT: u32 = 20;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegsetWorkaround {
+    pub offset: u32,
+    pub masked: bool,
+    pub mask: u32,
+    pub steering_group: u8,
+    pub steering_instance: u8,
+}
+
+/// Inputs resolved from engine/MMIO and MCR topology by the GT caller; this
+/// helper preserves the source ordering, workaround encoding and dedupe rule.
+pub struct EngineRegsetInput<'a> {
+    pub ring_mode: u32,
+    pub ring_hws_pga: u32,
+    pub ring_imr: u32,
+    pub first_render_compute: bool,
+    pub ccs_mask: u32,
+    pub rcu_mode: u32,
+    pub workarounds: &'a [RegsetWorkaround],
+    pub force_nonpriv_regs: &'a [u32],
+    pub mocs_regs_gen12: &'a [u32],
+    pub mocs_regs_gen12_55: &'a [u32],
+    pub graphics_ip: (u8, u8),
+    pub eu_perf_regs: &'a [u32; 6],
+}
+
 /// Saved default LRC image used by GuC watchdog recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoldenContext {
@@ -523,6 +554,87 @@ pub fn sorted_unique_regset(registers: &[MmioReg]) -> Result<Vec<MmioReg>, Error
     }
     sorted.sort_unstable_by_key(|reg| reg.offset);
     Ok(sorted)
+}
+
+/// Assemble an engine's GuC save/restore list.
+/// upstream: intel_guc_ads.c guc_mmio_regset_init().
+pub fn guc_mmio_regset_init(input: EngineRegsetInput<'_>) -> Result<Vec<MmioReg>, Error> {
+    let mocs_count = input
+        .mocs_regs_gen12
+        .len()
+        .max(input.mocs_regs_gen12_55.len());
+    let capacity = 3usize
+        .checked_add(usize::from(
+            input.first_render_compute && input.ccs_mask != 0,
+        ))
+        .and_then(|n| n.checked_add(input.workarounds.len()))
+        .and_then(|n| n.checked_add(input.force_nonpriv_regs.len()))
+        .and_then(|n| n.checked_add(mocs_count))
+        .and_then(|n| n.checked_add(6))
+        .ok_or(Error::Refused)?;
+    let mut registers = Vec::new();
+    registers
+        .try_reserve_exact(capacity)
+        .map_err(|_| Error::Refused)?;
+
+    // Upstream order: RING_MODE_GEN7, RING_HWS_PGA, RING_IMR.
+    registers.push(reg_entry(input.ring_mode, false, 0, 0));
+    registers.push(reg_entry(input.ring_hws_pga, false, 0, 0));
+    registers.push(reg_entry(input.ring_imr, false, 0, 0));
+    if input.first_render_compute && input.ccs_mask != 0 {
+        registers.push(reg_entry(input.rcu_mode, true, 0, 0));
+    }
+
+    // Upstream uses the MCR accessor for every WA register, including plain MMIO.
+    for wa in input.workarounds {
+        registers.push(MmioReg {
+            offset: wa.offset,
+            value: 0,
+            flags: steering_flags(wa.steering_group, wa.steering_instance, wa.masked),
+            mask: wa.mask,
+        });
+    }
+    for offset in input.force_nonpriv_regs {
+        registers.push(reg_entry(*offset, false, 0, 0));
+    }
+    let mocs = if input.graphics_ip >= (12, 55) {
+        input.mocs_regs_gen12_55
+    } else {
+        input.mocs_regs_gen12
+    };
+    for offset in mocs {
+        registers.push(reg_entry(*offset, false, 0, 0));
+    }
+    // All supported target platforms are Gen12; these are MCR registers.
+    for offset in input.eu_perf_regs {
+        registers.push(steering_reg_entry(*offset, 0, 0, false));
+    }
+    sorted_unique_regset(&registers)
+}
+
+fn reg_entry(offset: u32, masked: bool, mask: u32, flags: u32) -> MmioReg {
+    MmioReg {
+        offset,
+        value: 0,
+        flags: flags | if masked { GUC_REGSET_MASKED } else { 0 },
+        mask,
+    }
+}
+
+fn steering_flags(group: u8, instance: u8, masked: bool) -> u32 {
+    (if masked { GUC_REGSET_MASKED } else { 0 })
+        | GUC_REGSET_NEEDS_STEERING
+        | (u32::from(group) << GUC_REGSET_STEERING_GROUP_SHIFT)
+        | (u32::from(instance) << GUC_REGSET_STEERING_INSTANCE_SHIFT)
+}
+
+fn steering_reg_entry(offset: u32, group: u8, instance: u8, masked: bool) -> MmioReg {
+    MmioReg {
+        offset,
+        value: 0,
+        flags: steering_flags(group, instance, masked),
+        mask: 0,
+    }
 }
 
 /// upstream: intel_guc_ads.c guc_get_capture_engine_mask().
@@ -1002,6 +1114,54 @@ mod tests {
                 logical_index: 0,
             },
         ]
+    }
+
+    #[test]
+    fn engine_regset_init_adds_source_ordered_entries_then_sorts_unique() {
+        let workarounds = [RegsetWorkaround {
+            offset: 0x300,
+            masked: true,
+            mask: 0xff,
+            steering_group: 2,
+            steering_instance: 3,
+        }];
+        let whitelist = [0x100, 0x500];
+        let mocs = [0x400];
+        let mocs_1255 = [0x401];
+        let perf = [0x600, 0x604, 0x608, 0x60c, 0x610, 0x614];
+        let regs = guc_mmio_regset_init(EngineRegsetInput {
+            ring_mode: 0x100,
+            ring_hws_pga: 0x104,
+            ring_imr: 0x108,
+            first_render_compute: true,
+            ccs_mask: 1,
+            rcu_mode: 0x10c,
+            workarounds: &workarounds,
+            force_nonpriv_regs: &whitelist,
+            mocs_regs_gen12: &mocs,
+            mocs_regs_gen12_55: &mocs_1255,
+            graphics_ip: (12, 55),
+            eu_perf_regs: &perf,
+        })
+        .unwrap();
+        let offsets: Vec<u32> = regs.iter().map(|reg| reg.offset).collect();
+        assert_eq!(
+            offsets,
+            [
+                0x100, 0x104, 0x108, 0x10c, 0x300, 0x401, 0x500, 0x600, 0x604, 0x608, 0x60c, 0x610,
+                0x614,
+            ]
+        );
+        let workaround = regs.iter().find(|reg| reg.offset == 0x300).unwrap();
+        assert_eq!(workaround.flags & GUC_REGSET_MASKED, GUC_REGSET_MASKED);
+        assert_eq!(
+            workaround.flags & GUC_REGSET_NEEDS_STEERING,
+            GUC_REGSET_NEEDS_STEERING
+        );
+        let workaround_mask = workaround.mask;
+        let first_flags = regs.iter().find(|reg| reg.offset == 0x100).unwrap().flags;
+        assert_eq!(workaround_mask, 0xff);
+        assert_eq!(first_flags, 0);
     }
 
     fn dword(bytes: &[u8], offset: usize) -> u32 {
