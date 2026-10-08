@@ -89,6 +89,95 @@ pub fn user_priority_to_access_category(
     access_category
 }
 
+/// Source EDCA high-priority TXOP limiter, measured in monotonic microseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdcaTxopLimiter {
+    count: [u8; 4],
+    started_at_us: [u64; 4],
+}
+
+impl EdcaTxopLimiter {
+    /// Apply the source per-100ms VI/VO TXOP limits, falling back to BE.
+    // upstream: ieee80211_output.c ieee80211_classify_limit()
+    pub fn classify_limit(&mut self, access_category: u8, now_us: u64) -> u8 {
+        if access_category >= 4 {
+            return AC_BE;
+        }
+        let limit = match access_category {
+            AC_VI => 4,
+            AC_VO => 2,
+            _ => 0,
+        };
+        if limit == 0 {
+            return access_category;
+        }
+        if self.count[access_category as usize] < limit {
+            if self.count[access_category as usize] == 0 {
+                self.started_at_us[access_category as usize] = now_us;
+            }
+            self.count[access_category as usize] += 1;
+        } else if now_us.saturating_sub(self.started_at_us[access_category as usize]) < 100_000 {
+            return AC_BE;
+        } else {
+            self.count[access_category as usize] = 1;
+            self.started_at_us[access_category as usize] = now_us;
+        }
+        access_category
+    }
+}
+
+/// Classify an Ethernet payload to a source 802.1D priority from VLAN PCP or IP DSCP.
+/// `vlan_tci` represents the out-of-band VLAN tag used by the source mbuf API.
+// upstream: ieee80211_output.c ieee80211_classify()
+pub fn classify_ethernet_frame(
+    limiter: &mut EdcaTxopLimiter,
+    frame: &[u8],
+    vlan_tci: Option<u16>,
+    now_us: u64,
+) -> u8 {
+    const ETH_HEADER_LEN: usize = 14;
+    const ETHERTYPE_IPV4: u16 = 0x0800;
+    const ETHERTYPE_IPV6: u16 = 0x86dd;
+    const UP_FOR_AC: [u8; 4] = [0, 1, 5, 6];
+
+    let ac = if let Some(tci) = vlan_tci {
+        user_priority_to_access_category(((tci >> 13) & 7) as u8, [false; 4], true)
+    } else {
+        let Some(ethertype_bytes) = frame.get(12..14) else {
+            return UP_FOR_AC[AC_BE as usize];
+        };
+        let ethertype = u16::from_be_bytes([ethertype_bytes[0], ethertype_bytes[1]]);
+        let ds_field = match ethertype {
+            ETHERTYPE_IPV4 => {
+                let Some(ip) = frame.get(ETH_HEADER_LEN..ETH_HEADER_LEN + 2) else {
+                    return UP_FOR_AC[AC_BE as usize];
+                };
+                if ip[0] >> 4 != 4 {
+                    return UP_FOR_AC[AC_BE as usize];
+                }
+                ip[1]
+            }
+            ETHERTYPE_IPV6 => {
+                let Some(flow) = frame.get(ETH_HEADER_LEN..ETH_HEADER_LEN + 4) else {
+                    return UP_FOR_AC[AC_BE as usize];
+                };
+                if flow[0] >> 4 != 6 {
+                    return UP_FOR_AC[AC_BE as usize];
+                }
+                ((flow[0] & 0x0f) << 4) | (flow[1] >> 4)
+            }
+            _ => return UP_FOR_AC[AC_BE as usize],
+        };
+        match ds_field & 0xfc {
+            0xe0 | 0xc0 | 0xb8 | 0xb0 => AC_VO, // CS7, CS6, EF, VA
+            0xa0 | 0x88 | 0x90 | 0x98 | 0x80 | 0x68 | 0x70 | 0x78 | 0x60 => AC_VI,
+            0x20 => AC_BK, // CS1
+            _ => AC_BE,
+        }
+    };
+    UP_FOR_AC[limiter.classify_limit(ac, now_us) as usize]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IeError {
     SsidTooLong,
@@ -992,5 +1081,42 @@ mod tests {
         let all_acm = [true; 4];
         assert_eq!(user_priority_to_access_category(0, all_acm, false), AC_BK);
         assert_eq!(user_priority_to_access_category(7, all_acm, false), AC_BK);
+    }
+
+    #[test]
+    fn ethernet_priority_uses_vlan_dscp_and_source_txop_limits() {
+        let mut limiter = EdcaTxopLimiter::default();
+        let mut ipv4 = [0u8; 34];
+        ipv4[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        ipv4[14] = 0x45;
+        for (dscp, expected_up) in [
+            (0xe0, 6), // CS7
+            (0xb8, 6), // EF
+            (0x88, 5), // AF41
+            (0x20, 1), // CS1
+            (0x04, 0), // default
+        ] {
+            ipv4[15] = dscp;
+            assert_eq!(
+                classify_ethernet_frame(&mut limiter, &ipv4, None, 0),
+                expected_up
+            );
+        }
+        assert_eq!(
+            classify_ethernet_frame(&mut limiter, &[], Some(5 << 13), 0),
+            5
+        );
+
+        // The fifth VI packet in a 100ms window falls back to best effort.
+        let mut limiter = EdcaTxopLimiter::default();
+        ipv4[15] = 0x88;
+        for n in 0..4 {
+            assert_eq!(classify_ethernet_frame(&mut limiter, &ipv4, None, n), 5);
+        }
+        assert_eq!(classify_ethernet_frame(&mut limiter, &ipv4, None, 4), 0);
+        assert_eq!(
+            classify_ethernet_frame(&mut limiter, &ipv4, None, 100_000),
+            5
+        );
     }
 }

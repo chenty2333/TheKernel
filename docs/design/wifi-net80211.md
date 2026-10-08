@@ -96,6 +96,8 @@ AC-order identifiers, congestion-window encodings, TXOP limits and station
 U-APSD AC/service-period bits.
 The output-side user-priority map and non-AP ACM downgrade loop are also
 translated; AP mode preserves the requested AC without downgrade.
+Ethernet classification maps VLAN PCP or IPv4/IPv6 DSCP into source EDCA
+classes and applies the source per-window video/voice TXOP fallback policy.
 Management frame helpers also encode Capability Information, DS channel and
 ERP NonERP/protection/Barker fields from station/AP mode, channel and local
 preamble state.
