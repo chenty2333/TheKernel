@@ -40,6 +40,9 @@ diff/report helpers); and `transcoder_ddi_func_is_enabled`,
 needed for the target modeset algorithm; the target pipe configuration and
 readout policy is represented by the translated mode-12/13 functions.
 
-The module is exported and crate-tested, but the kernel's current N305 KMS
-commit path has not yet been switched to this translated sequence; it is not
-currently evidence of a cold-start hardware modeset.
+The kernel's `modeset::preflight_mode` now invokes the translated
+`intel_mode_valid`, `intel_cpu_transcoder_mode_valid`, and
+`intel_mode_valid_max_plane_size` using the observed CDCLK and the active
+display-13 limits. The kernel's current commit/enable/disable path has not
+yet been switched to the translated atomic sequencing; this mode-admission
+integration is not evidence of a cold-start hardware modeset.
